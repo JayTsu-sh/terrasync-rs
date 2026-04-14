@@ -12,7 +12,7 @@ description: >
 
 端到端增量拷贝测试（S3 存储）。
 验证完整管线：全量 sync 建基线 → 变更源端 → 增量 sync 检测并同步变更 → 目标端扫描 → integrity-check。
-`terrasync` 本地运行（使用 `{CONFIG}`），通过网络直接访问 S3 兼容存储。
+`datasync` 本地运行（使用 `{CONFIG}`），通过网络直接访问 S3 兼容存储。
 测试数据通过 `mc`（MinIO Client）上传、变更和验证。
 
 **S3 增量特点**：
@@ -36,8 +36,8 @@ description: >
 | SOURCE_URL | `s3://{S3_AK}:{S3_SK}@{SRC_BUCKET}.{S3_HOST}/test-data` |
 | DEST_URL | `s3://{S3_AK}:{S3_SK}@{DST_BUCKET}.{S3_HOST}/test-data` |
 | CONFIG | `examples/config.toml` |
-| BINARY | `./target/debug/terrasync` |
-| CLICKHOUSE_HOST | `10.128.133.213:8123` |
+| BINARY | `./target/debug/datasync` |
+| CLICKHOUSE_HOST | `192.168.50.173:8123` |
 | SYNC_JOB_ID | `s3-incr-sync` |
 | DST_SCAN_JOB_ID | `s3-incr-sync-dst` |
 | IC_JOB_ID | `s3-incr-sync-ic` |

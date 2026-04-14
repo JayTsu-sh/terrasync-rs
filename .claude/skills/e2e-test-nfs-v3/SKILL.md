@@ -2,7 +2,7 @@
 name: e2e-test-nfs-v3
 description: >
   This skill should be used when the user asks to "run nfs v3 e2e test",
-  "test terrasync nfs v3 sync", "端到端 nfs v3 测试", "nfs v3 同步测试", "nfs v3 e2e",
+  "test datasync nfs v3 sync", "端到端 nfs v3 测试", "nfs v3 同步测试", "nfs v3 e2e",
   "run the nfs v3 e2e workflow", "test the full nfs v3 sync pipeline",
   or mentions running the full scan/sync/verify/cleanup workflow
   against the NFSv3 test environment ({SOURCE_IP} → {DEST_IP}).
@@ -12,24 +12,24 @@ description: >
 
 ## Overview
 
-End-to-end integration test workflow for terrasync against NFSv3 storage.
+End-to-end integration test workflow for datasync against NFSv3 storage.
 Validates the full pipeline: test data → scan → sync → integrity-check → verify counts → cleanup.
-`terrasync` runs **locally** (using `{CONFIG}`) and accesses NFSv3 over the network directly.
+`datasync` runs **locally** (using `{CONFIG}`) and accesses NFSv3 over the network directly.
 Test data is created and verified on the remote hosts via SSH.
 
 ## Constants
 
 | Name | Value |
 |------|-------|
-| SOURCE_IP | 10.131.9.13 |
-| DEST_IP | 10.131.9.15 |
+| SOURCE_IP | 192.168.50.173 |
+| DEST_IP | 192.168.50.23 |
 | NFS_EXPORT | `/export/nfs` |
 | EXPECTED_DIRS | 40 |
 | EXPECTED_FILES | 117 |
 | EXPECTED_SYMLINKS | 36 |
 | CONFIG | `examples/config.toml` |
-| BINARY | `./target/debug/terrasync` |
-| CLICKHOUSE_HOST | `10.128.133.213:8123` |
+| BINARY | `./target/debug/datasync` |
+| CLICKHOUSE_HOST | `192.168.50.173:8123` |
 
 NFS URL 格式：`nfs://{SOURCE_IP}{NFS_EXPORT}`，`nfs://{DEST_IP}{NFS_EXPORT}`。
 
@@ -44,7 +44,7 @@ NFS URL 格式：`nfs://{SOURCE_IP}{NFS_EXPORT}`，`nfs://{DEST_IP}{NFS_EXPORT}`
 由于 binary 尚未编译，通过 SSH 直接清理源端：
 
 ```bash
-ssh ubuntu@{SOURCE_IP} 'sudo rm -rf {NFS_EXPORT}/test-data && echo "source cleaned"'
+ssh root@{SOURCE_IP} 'sudo rm -rf {NFS_EXPORT}/test-data && echo "source cleaned"'
 ```
 
 Expected: `source cleaned`。
@@ -52,7 +52,7 @@ Expected: `source cleaned`。
 ### 0b. 清理目标端 NFS 数据（SSH）
 
 ```bash
-ssh ubuntu@{DEST_IP} 'sudo rm -rf {NFS_EXPORT}/test-data && echo "dest cleaned"'
+ssh root@{DEST_IP} 'sudo rm -rf {NFS_EXPORT}/test-data && echo "dest cleaned"'
 ```
 
 Expected: `dest cleaned`。
@@ -113,7 +113,7 @@ Expected: 编译成功，生成 `{BINARY}`，无错误输出。
 Use the Bash tool to upload the setup script:
 
 ```bash
-scp .claude/skills/nfs-v3-e2e/scripts/setup-test-data.sh ubuntu@{SOURCE_IP}:/tmp/setup-test-data.sh
+scp .claude/skills/nfs-v3-e2e/scripts/setup-test-data.sh root@{SOURCE_IP}:/tmp/setup-test-data.sh
 ```
 
 Expected: 无错误输出，scp 退出码为 0。
@@ -125,7 +125,7 @@ Expected: 无错误输出，scp 退出码为 0。
 Use the Bash tool:
 
 ```bash
-ssh ubuntu@{SOURCE_IP} 'sudo bash /tmp/setup-test-data.sh'
+ssh root@{SOURCE_IP} 'sudo bash /tmp/setup-test-data.sh'
 ```
 
 Expected output (last lines):
@@ -214,7 +214,7 @@ grep -E "ERROR|WARN" target/debug/logs/*/app.log | tail -80
 Use the Bash tool:
 
 ```bash
-ssh ubuntu@{DEST_IP} 'FIND_DIRS=$(find {NFS_EXPORT}/test-data -type d | wc -l); FIND_FILES=$(find {NFS_EXPORT}/test-data -type f | wc -l); FIND_LINKS=$(find {NFS_EXPORT}/test-data -type l | wc -l); echo "dest find: dirs=$FIND_DIRS, files=$FIND_FILES, symlinks=$FIND_LINKS"'
+ssh root@{DEST_IP} 'FIND_DIRS=$(find {NFS_EXPORT}/test-data -type d | wc -l); FIND_FILES=$(find {NFS_EXPORT}/test-data -type f | wc -l); FIND_LINKS=$(find {NFS_EXPORT}/test-data -type l | wc -l); echo "dest find: dirs=$FIND_DIRS, files=$FIND_FILES, symlinks=$FIND_LINKS"'
 ```
 
 Expected: `dirs={EXPECTED_DIRS}, files={EXPECTED_FILES}, symlinks={EXPECTED_SYMLINKS}`。

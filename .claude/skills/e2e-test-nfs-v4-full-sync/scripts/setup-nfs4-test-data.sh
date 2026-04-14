@@ -1,10 +1,10 @@
 #!/bin/bash
-# setup-nfs4-test-data.sh — 在 /export/nfs4/test-data 创建丰富的测试目录树
+# setup-nfs4-test-data.sh — 在 /export/nfsv4/test-data 创建丰富的测试目录树
 # 包含：多层目录、文件、软链接，以及不同的 mode/uid/gid/mtime 组合
 # 同时设置 NFSv4 ACL 和 named attributes（xattr）
 set -e
 
-BASE="/export/nfs4/test-data"
+BASE="/export/nfsv4/test-data"
 
 # 清理已有数据（全量重建）
 rm -rf "$BASE"
@@ -412,8 +412,8 @@ if command -v nfs4_setfacl &> /dev/null && command -v mount.nfs4 &> /dev/null; t
   if mount -t nfs4 -o vers=4.1 127.0.0.1:/ "$NFS_MNT" 2>/dev/null; then
     echo "NFS4.1 loopback mount OK at $NFS_MNT"
     # 计算从 NFS 挂载点到 BASE 的相对路径
-    # BASE=/export/nfs4/test-data, NFS export root=/, 所以 NFS 路径 = $NFS_MNT/export/nfs4/test-data
-    # 但 fsid=0 export 的根是 /export/nfs4，所以 NFS 路径 = $NFS_MNT/test-data
+    # BASE=/export/nfsv4/test-data, NFS export root=/, 所以 NFS 路径 = $NFS_MNT/export/nfsv4/test-data
+    # 但 fsid=0 export 的根是 /export/nfsv4，所以 NFS 路径 = $NFS_MNT/test-data
     NFS_BASE="$NFS_MNT/test-data"
     NFS_EXOTIC="$NFS_BASE/exotic_names"
 
@@ -452,7 +452,7 @@ fi
 # ============================================================
 # 注意：Linux nfsd 不支持 NFSv4 OPENATTR 操作（named attributes），
 # 因此通过 setfattr 在本地文件系统上设置的 user.* xattr 无法通过 NFSv4 协议远程访问。
-# 这是 Linux 内核 NFS 服务器的已知限制，非 terrasync 的 bug。
+# 这是 Linux 内核 NFS 服务器的已知限制，非 datasync 的 bug。
 # 此处仍然设置 xattr 用于验证本地文件系统层面的正确性。
 # 安装 attr 工具（如果尚未安装）
 if ! command -v setfattr &> /dev/null; then

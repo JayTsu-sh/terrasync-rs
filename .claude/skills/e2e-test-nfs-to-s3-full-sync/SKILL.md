@@ -12,7 +12,7 @@ description: >
 
 跨协议全量拷贝测试：NFS v3 源端 → S3 目标端。
 验证完整管线：NFS 测试数据创建 → 跨协议 sync → S3 目标端扫描 → integrity-check → 清理。
-`terrasync` 本地运行（使用 `{CONFIG}`），同时访问 NFS 和 S3 两种存储。
+`datasync` 本地运行（使用 `{CONFIG}`），同时访问 NFS 和 S3 两种存储。
 
 **跨协议关键差异**：
 - NFS 有 symlink（36），S3 不支持 symlink → sync 时 symlink 被**跳过**
@@ -28,7 +28,7 @@ description: >
 
 | Name | Value |
 |------|-------|
-| SOURCE_IP | 10.131.9.13 |
+| SOURCE_IP | 192.168.50.173 |
 | SOURCE_NFS_EXPORT | `/export/nfs` |
 | SOURCE_URL | `nfs://{SOURCE_IP}{SOURCE_NFS_EXPORT}` |
 | S3_AK | `H80NKRVS5DYOVE43U2HS` |
@@ -37,8 +37,8 @@ description: >
 | DST_BUCKET | `{DST_S3_BUCKET}` |
 | DEST_URL | `s3://{S3_AK}:{S3_SK}@{DST_BUCKET}.{S3_HOST}/test-data` |
 | CONFIG | `examples/config.toml` |
-| BINARY | `./target/debug/terrasync` |
-| CLICKHOUSE_HOST | `10.128.133.213:8123` |
+| BINARY | `./target/debug/datasync` |
+| CLICKHOUSE_HOST | `192.168.50.173:8123` |
 | SYNC_JOB_ID | `nfs-to-s3-sync` |
 | SRC_SCAN_JOB_ID | `nfs-to-s3-sync-src` |
 | DST_SCAN_JOB_ID | `nfs-to-s3-sync-dst` |
@@ -62,7 +62,7 @@ ClickHouse 表名：
 ### 0a. 清理源端 NFS 数据（SSH）
 
 ```bash
-ssh ubuntu@{SOURCE_IP} 'sudo rm -rf {SOURCE_NFS_EXPORT}/test-data && echo "source NFS cleaned"'
+ssh root@{SOURCE_IP} 'sudo rm -rf {SOURCE_NFS_EXPORT}/test-data && echo "source NFS cleaned"'
 ```
 
 Expected: `source NFS cleaned`。
@@ -135,13 +135,13 @@ Expected: 编译成功，生成 `{BINARY}`，无错误输出。
 ### 2a. 上传测试脚本
 
 ```bash
-scp .claude/skills/nfs-v3-e2e/scripts/setup-test-data.sh ubuntu@{SOURCE_IP}:/tmp/setup-test-data.sh
+scp .claude/skills/nfs-v3-e2e/scripts/setup-test-data.sh root@{SOURCE_IP}:/tmp/setup-test-data.sh
 ```
 
 ### 2b. 执行测试脚本
 
 ```bash
-ssh ubuntu@{SOURCE_IP} 'sudo bash /tmp/setup-test-data.sh'
+ssh root@{SOURCE_IP} 'sudo bash /tmp/setup-test-data.sh'
 ```
 
 Expected output (last lines):

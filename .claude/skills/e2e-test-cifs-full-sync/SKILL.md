@@ -14,7 +14,7 @@ description: >
 
 端到端全量拷贝测试（CIFS/SMB 存储）。
 验证完整管线：测试数据创建 → 源端扫描 → 全量同步 → 目标端验证 → integrity-check → 清理。
-`terrasync` 本地运行（使用 `{CONFIG}`），通过网络直接访问 CIFS 共享。
+`datasync` 本地运行（使用 `{CONFIG}`），通过网络直接访问 CIFS 共享。
 测试数据通过 `smbclient` 在远端共享上创建和验证。
 
 **CIFS 特点**：
@@ -38,8 +38,8 @@ description: >
 | SOURCE_URL | `smb://{SRC_CIFS_USER}:{SRC_CIFS_PASS}@{SRC_CIFS_HOST}/{SRC_CIFS_SHARE}/test-data` |
 | DEST_URL | `smb://{DST_CIFS_USER}:{DST_CIFS_PASS}@{DST_CIFS_HOST}/{DST_CIFS_SHARE}/test-data` |
 | CONFIG | `examples/config.toml` |
-| BINARY | `./target/debug/terrasync` |
-| CLICKHOUSE_HOST | `10.128.133.213:8123` |
+| BINARY | `./target/debug/datasync` |
+| CLICKHOUSE_HOST | `192.168.50.173:8123` |
 | SRC_SCAN_JOB_ID | `cifs-full-sync-src` |
 | SYNC_JOB_ID | `cifs-full-sync` |
 | DST_SCAN_JOB_ID | `cifs-full-sync-dst` |

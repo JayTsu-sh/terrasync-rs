@@ -13,17 +13,17 @@ description: >
 ## Overview
 
 端到端增量扫描测试：全量扫描建基线 → 变更文件系统（增删改+rename） → 增量扫描检测变更 → 验证 CLI 输出和 ClickHouse 数据库。
-`terrasync` 本地运行（使用 `{CONFIG}`），通过网络访问 NFSv3。测试数据和变更通过 SSH 在远端执行。
+`datasync` 本地运行（使用 `{CONFIG}`），通过网络访问 NFSv3。测试数据和变更通过 SSH 在远端执行。
 
 ## Constants
 
 | Name | Value |
 |------|-------|
-| SOURCE_IP | 10.131.9.13 |
+| SOURCE_IP | 192.168.50.173 |
 | NFS_EXPORT | `/export/nfs` |
 | CONFIG | `examples/config.toml` |
-| BINARY | `./target/debug/terrasync` |
-| CLICKHOUSE_HOST | `10.128.133.213:8123` |
+| BINARY | `./target/debug/datasync` |
+| CLICKHOUSE_HOST | `192.168.50.173:8123` |
 | JOB_ID | `nfs-v3-incr-scan` |
 | BASELINE_DIRS | 113 |
 | BASELINE_FILES | 335 |
@@ -48,7 +48,7 @@ NFS URL 格式：`nfs://{SOURCE_IP}{NFS_EXPORT}`。
 ### 0a. 清理源端 NFS 数据（SSH）
 
 ```bash
-ssh ubuntu@{SOURCE_IP} 'sudo rm -rf {NFS_EXPORT}/test-data && echo "source cleaned"'
+ssh root@{SOURCE_IP} 'sudo rm -rf {NFS_EXPORT}/test-data && echo "source cleaned"'
 ```
 
 Expected: `source cleaned`。
@@ -95,7 +95,7 @@ Expected: 无输出（空）。
 复用 e2e-test-nfs-v3 的 setup-test-data.sh：
 
 ```bash
-scp .claude/skills/e2e-test-nfs-v3/scripts/setup-test-data.sh ubuntu@{SOURCE_IP}:/tmp/setup-test-data.sh
+scp .claude/skills/e2e-test-nfs-v3/scripts/setup-test-data.sh root@{SOURCE_IP}:/tmp/setup-test-data.sh
 ```
 
 Expected: 无错误输出，scp 退出码为 0。
@@ -105,7 +105,7 @@ Expected: 无错误输出，scp 退出码为 0。
 ## Step 1b: 执行测试脚本创建基线数据（SOURCE_IP）
 
 ```bash
-ssh ubuntu@{SOURCE_IP} 'sudo bash /tmp/setup-test-data.sh'
+ssh root@{SOURCE_IP} 'sudo bash /tmp/setup-test-data.sh'
 ```
 
 Expected output (last lines):
@@ -155,13 +155,13 @@ false   true    {BASELINE_SYMLINKS}   # 软链接 = 79
 ### 3a. 上传变更脚本
 
 ```bash
-scp .claude/skills/e2e-test-nfs-v3-incremental-scan/scripts/mutate-test-data.sh ubuntu@{SOURCE_IP}:/tmp/mutate-test-data.sh
+scp .claude/skills/e2e-test-nfs-v3-incremental-scan/scripts/mutate-test-data.sh root@{SOURCE_IP}:/tmp/mutate-test-data.sh
 ```
 
 ### 3b. 执行变更
 
 ```bash
-ssh ubuntu@{SOURCE_IP} 'sudo bash /tmp/mutate-test-data.sh'
+ssh root@{SOURCE_IP} 'sudo bash /tmp/mutate-test-data.sh'
 ```
 
 Expected output (last lines):
@@ -321,7 +321,7 @@ Only proceed after all Step 4 checks pass.
 ### 5a. 清理源端 NFS（SSH）
 
 ```bash
-ssh ubuntu@{SOURCE_IP} 'sudo rm -rf {NFS_EXPORT}/test-data && echo "source cleaned"'
+ssh root@{SOURCE_IP} 'sudo rm -rf {NFS_EXPORT}/test-data && echo "source cleaned"'
 ```
 
 Expected: `source cleaned`。

@@ -16,7 +16,7 @@ description: >
 
 **与 NFS v3 的关键区别**：S3 无 `file_handle` 文件句柄，使用 `JoinStrategy::Path` 模式。rename 操作（copy+delete）被拆为 **New + Deleted**，Renamed 始终为 0。S3 不支持 symlink。
 
-`terrasync` 本地运行（使用 `{CONFIG}`），通过网络访问 S3。
+`datasync` 本地运行（使用 `{CONFIG}`），通过网络访问 S3。
 测试数据通过 `mc`（MinIO Client）上传和变更。
 
 ## Prerequisites
@@ -33,8 +33,8 @@ description: >
 | S3_HOST | `10.128.137.245:8184` |
 | S3_URL | `s3://{S3_AK}:{S3_SK}@{S3_BUCKET}.{S3_HOST}/test-data` |
 | CONFIG | `examples/config.toml` |
-| BINARY | `./target/debug/terrasync` |
-| CLICKHOUSE_HOST | `10.128.133.213:8123` |
+| BINARY | `./target/debug/datasync` |
+| CLICKHOUSE_HOST | `192.168.50.173:8123` |
 | JOB_ID | `s3-incr-scan` |
 | SANITIZED_JOB_ID | `s3_incr_scan` |
 | BASELINE_DIRS | 40 |

@@ -12,7 +12,7 @@ description: >
 
 跨协议全量拷贝测试：S3 源端 → NFS v3 目标端。
 验证完整管线：S3 测试数据上传 → 跨协议 sync → NFS 目标端扫描 → integrity-check → 清理。
-`terrasync` 本地运行（使用 `{CONFIG}`），同时访问 S3 和 NFS 两种存储。
+`datasync` 本地运行（使用 `{CONFIG}`），同时访问 S3 和 NFS 两种存储。
 
 **跨协议关键差异**：
 - S3 无 symlink，NFS 目标端也不会产生 symlink → 纯文件+目录拷贝
@@ -36,8 +36,8 @@ description: >
 | DEST_NFS_EXPORT | `{DEST_NFS_EXPORT}` |
 | DEST_URL | `nfs://{DEST_IP}{DEST_NFS_EXPORT}` |
 | CONFIG | `examples/config.toml` |
-| BINARY | `./target/debug/terrasync` |
-| CLICKHOUSE_HOST | `10.128.133.213:8123` |
+| BINARY | `./target/debug/datasync` |
+| CLICKHOUSE_HOST | `192.168.50.173:8123` |
 | SYNC_JOB_ID | `s3-to-nfs-sync` |
 | SRC_SCAN_JOB_ID | `s3-to-nfs-sync-src` |
 | DST_SCAN_JOB_ID | `s3-to-nfs-sync-dst` |
@@ -68,7 +68,7 @@ echo "source S3 cleaned"
 ### 0b. 清理 NFS 目标端（SSH）
 
 ```bash
-ssh ubuntu@{DEST_IP} 'sudo rm -rf {DEST_NFS_EXPORT}/test-data && echo "dest NFS cleaned"'
+ssh root@{DEST_IP} 'sudo rm -rf {DEST_NFS_EXPORT}/test-data && echo "dest NFS cleaned"'
 ```
 
 Expected: `dest NFS cleaned`。
@@ -197,7 +197,7 @@ grep -E "ERROR|WARN" target/debug/logs/*/app.log | tail -80
 ### 5a. find 直接计数（DEST_IP 上执行）
 
 ```bash
-ssh ubuntu@{DEST_IP} 'FIND_DIRS=$(find {DEST_NFS_EXPORT}/test-data -type d | wc -l); FIND_FILES=$(find {DEST_NFS_EXPORT}/test-data -type f | wc -l); FIND_LINKS=$(find {DEST_NFS_EXPORT}/test-data -type l | wc -l); echo "dest find: dirs=$FIND_DIRS, files=$FIND_FILES, symlinks=$FIND_LINKS"'
+ssh root@{DEST_IP} 'FIND_DIRS=$(find {DEST_NFS_EXPORT}/test-data -type d | wc -l); FIND_FILES=$(find {DEST_NFS_EXPORT}/test-data -type f | wc -l); FIND_LINKS=$(find {DEST_NFS_EXPORT}/test-data -type l | wc -l); echo "dest find: dirs=$FIND_DIRS, files=$FIND_FILES, symlinks=$FIND_LINKS"'
 ```
 
 Expected: `dirs={EXPECTED_DIRS}, files={EXPECTED_FILES}, symlinks=0`。

@@ -2,11 +2,11 @@
 # setup-test-data.sh — 创建 filter e2e 测试所需的本地测试数据
 # 创建 3 组测试目录：basic / extension / size
 # 使用方法：bash setup-test-data.sh [BASE_DIR]
-# BASE_DIR 默认为 /tmp/terrasync-filter-test
+# BASE_DIR 默认为 /tmp/datasync-filter-test
 
 set -euo pipefail
 
-BASE_DIR="${1:-/tmp/terrasync-filter-test}"
+BASE_DIR="${1:-/tmp/datasync-filter-test}"
 
 echo "=== 清理旧测试数据 ==="
 rm -rf "$BASE_DIR"

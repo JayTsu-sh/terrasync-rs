@@ -13,7 +13,7 @@ description: >
 
 端到端增量扫描测试（NFS v4.1 存储）。
 验证完整管线：全量扫描建基线 → 变更（含 ACL/xattr 变更）→ 增量扫描检测变更 → ClickHouse 表验证 → 清理。
-`terrasync` 本地运行（使用 `{CONFIG}`），通过网络直接访问 NFSv4.1。测试数据和变更通过 SSH 在远端执行。
+`datasync` 本地运行（使用 `{CONFIG}`），通过网络直接访问 NFSv4.1。测试数据和变更通过 SSH 在远端执行。
 
 **NFSv4.1 增量扫描特点**：
 - 使用 `JoinStrategy::Fh3`（file_handle 字段）— 与 NFSv3 一致
@@ -26,12 +26,12 @@ description: >
 
 | Name | Value |
 |------|-------|
-| SOURCE_IP | 10.131.9.13 |
+| SOURCE_IP | 192.168.50.173 |
 | NFS_EXPORT | `/` |
 | SOURCE_URL | `nfs://{SOURCE_IP}{NFS_EXPORT}?version=4.1` |
 | CONFIG | `examples/config.toml` |
-| BINARY | `./target/debug/terrasync` |
-| CLICKHOUSE_HOST | `10.128.133.213:8123` |
+| BINARY | `./target/debug/datasync` |
+| CLICKHOUSE_HOST | `192.168.50.173:8123` |
 | JOB_ID | `nfs-v4-incr-scan` |
 | SANITIZED_JOB_ID | `nfs_v4_incr_scan` |
 | BASE_TABLE | `base_nfs_v4_incr_scan` |
@@ -45,7 +45,7 @@ description: >
 | POST_MUTATE_SYMLINKS | 79 |
 
 **注意**：NFS v4.1 使用伪根（pseudo-root）机制，URL 中的路径必须是相对于 `fsid=0` 的 export。
-当前配置中 `/export/nfs4` 设置了 `fsid=0`，因此 NFS v4.1 URL 应使用 `/` 作为路径。
+当前配置中 `/export/nfsv4` 设置了 `fsid=0`，因此 NFS v4.1 URL 应使用 `/` 作为路径。
 
 ---
 
@@ -56,7 +56,7 @@ description: >
 ### 0a. 清理源端 NFS
 
 ```bash
-ssh ubuntu@{SOURCE_IP} 'sudo rm -rf {NFS_EXPORT}/test-data && echo "source cleaned"'
+ssh root@{SOURCE_IP} 'sudo rm -rf {NFS_EXPORT}/test-data && echo "source cleaned"'
 ```
 
 Expected: `source cleaned`。
@@ -103,7 +103,7 @@ Expected: 无输出（空）。
 复用 e2e-test-nfs-v4-full-scan 的 setup-nfs4-test-data.sh：
 
 ```bash
-scp .claude/skills/e2e-test-nfs-v4-full-scan/scripts/setup-nfs4-test-data.sh ubuntu@{SOURCE_IP}:/tmp/setup-nfs4-test-data.sh
+scp .claude/skills/e2e-test-nfs-v4-full-scan/scripts/setup-nfs4-test-data.sh root@{SOURCE_IP}:/tmp/setup-nfs4-test-data.sh
 ```
 
 Expected: 无错误输出，scp 退出码为 0。
@@ -113,7 +113,7 @@ Expected: 无错误输出，scp 退出码为 0。
 ## Step 1b: 执行测试脚本创建基线数据（SOURCE_IP）
 
 ```bash
-ssh ubuntu@{SOURCE_IP} 'sudo bash /tmp/setup-nfs4-test-data.sh'
+ssh root@{SOURCE_IP} 'sudo bash /tmp/setup-nfs4-test-data.sh'
 ```
 
 Expected output (last lines):
@@ -165,18 +165,18 @@ false   true    {BASELINE_SYMLINKS}   # 软链接 = 79
 
 ## Step 3: 执行变更脚本
 
-**注意**：使用 NFS v4 专用的变更脚本（路径为 `/export/nfs4/test-data`），不要复用 NFS v3 脚本。
+**注意**：使用 NFS v4 专用的变更脚本（路径为 `/export/nfsv4/test-data`），不要复用 NFS v3 脚本。
 
 ### 3a. 上传变更脚本
 
 ```bash
-scp .claude/skills/e2e-test-nfs-v4-incremental-scan/scripts/mutate-nfs4-test-data.sh ubuntu@{SOURCE_IP}:/tmp/mutate-nfs4-test-data.sh
+scp .claude/skills/e2e-test-nfs-v4-incremental-scan/scripts/mutate-nfs4-test-data.sh root@{SOURCE_IP}:/tmp/mutate-nfs4-test-data.sh
 ```
 
 ### 3b. 执行变更
 
 ```bash
-ssh ubuntu@{SOURCE_IP} 'sudo bash /tmp/mutate-nfs4-test-data.sh'
+ssh root@{SOURCE_IP} 'sudo bash /tmp/mutate-nfs4-test-data.sh'
 ```
 
 Expected output (last lines):
@@ -341,7 +341,7 @@ Only proceed after all Step 4 checks pass.
 ### 5a. 清理源端 NFS
 
 ```bash
-ssh ubuntu@{SOURCE_IP} 'sudo rm -rf {NFS_EXPORT}/test-data && echo "source cleaned"'
+ssh root@{SOURCE_IP} 'sudo rm -rf {NFS_EXPORT}/test-data && echo "source cleaned"'
 ```
 
 Expected: `source cleaned`。

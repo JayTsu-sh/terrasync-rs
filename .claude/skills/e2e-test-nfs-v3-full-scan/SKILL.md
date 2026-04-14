@@ -12,18 +12,18 @@ description: >
 ## Overview
 
 端到端全量扫描测试（NFS v3 存储）：创建测试数据 → 全量扫描 → 验证 CLI 输出和 ClickHouse base 表。
-`terrasync` 本地运行（使用 `{CONFIG}`），通过网络访问 NFSv3。
+`datasync` 本地运行（使用 `{CONFIG}`），通过网络访问 NFSv3。
 测试数据通过 SSH 在远端创建。
 
 ## Constants
 
 | Name | Value |
 |------|-------|
-| SOURCE_IP | 10.131.9.13 |
+| SOURCE_IP | 192.168.50.173 |
 | NFS_EXPORT | `/export/nfs` |
 | CONFIG | `examples/config.toml` |
-| BINARY | `./target/debug/terrasync` |
-| CLICKHOUSE_HOST | `10.128.133.213:8123` |
+| BINARY | `./target/debug/datasync` |
+| CLICKHOUSE_HOST | `192.168.50.173:8123` |
 | JOB_ID | `nfs-v3-full-scan` |
 | SANITIZED_JOB_ID | `nfs_v3_full_scan` |
 | EXPECTED_DIRS | 113 |
@@ -43,7 +43,7 @@ ClickHouse 表名：
 ### 0a. 清理源端 NFS 数据（SSH）
 
 ```bash
-ssh ubuntu@{SOURCE_IP} 'sudo rm -rf {NFS_EXPORT}/test-data && echo "source cleaned"'
+ssh root@{SOURCE_IP} 'sudo rm -rf {NFS_EXPORT}/test-data && echo "source cleaned"'
 ```
 
 Expected: `source cleaned`。
@@ -90,7 +90,7 @@ Expected: 无输出（空）。
 复用 nfs-v3-e2e 的 setup-test-data.sh：
 
 ```bash
-scp .claude/skills/e2e-test-nfs-v3/scripts/setup-test-data.sh ubuntu@{SOURCE_IP}:/tmp/setup-test-data.sh
+scp .claude/skills/e2e-test-nfs-v3/scripts/setup-test-data.sh root@{SOURCE_IP}:/tmp/setup-test-data.sh
 ```
 
 Expected: 无错误输出，scp 退出码为 0。
@@ -100,7 +100,7 @@ Expected: 无错误输出，scp 退出码为 0。
 ## Step 1b: 执行测试脚本创建测试数据（SOURCE_IP）
 
 ```bash
-ssh ubuntu@{SOURCE_IP} 'sudo bash /tmp/setup-test-data.sh'
+ssh root@{SOURCE_IP} 'sudo bash /tmp/setup-test-data.sh'
 ```
 
 Expected output (last lines):
@@ -173,7 +173,7 @@ Expected: `527`（{EXPECTED_DIRS}+{EXPECTED_FILES}+{EXPECTED_SYMLINKS} = 113+335
 直接对 NFS 服务端执行 `find`（需要 sudo 访问限制性目录），结果应与 ClickHouse base 表一致：
 
 ```bash
-ssh ubuntu@{SOURCE_IP} "sudo find {NFS_EXPORT}/test-data -type d | wc -l; sudo find {NFS_EXPORT}/test-data -type f | wc -l; sudo find {NFS_EXPORT}/test-data -type l | wc -l"
+ssh root@{SOURCE_IP} "sudo find {NFS_EXPORT}/test-data -type d | wc -l; sudo find {NFS_EXPORT}/test-data -type f | wc -l; sudo find {NFS_EXPORT}/test-data -type l | wc -l"
 ```
 
 Expected:
@@ -190,8 +190,8 @@ symlinks: 79
 上传并执行元数据校验脚本，对比 NFS 文件系统实际属性与 ClickHouse 数据库中的记录：
 
 ```bash
-scp .claude/skills/e2e-test-nfs-v3-full-scan/scripts/verify-metadata.sh ubuntu@{SOURCE_IP}:/tmp/verify-metadata.sh
-ssh ubuntu@{SOURCE_IP} 'sudo bash /tmp/verify-metadata.sh'
+scp .claude/skills/e2e-test-nfs-v3-full-scan/scripts/verify-metadata.sh root@{SOURCE_IP}:/tmp/verify-metadata.sh
+ssh root@{SOURCE_IP} 'sudo bash /tmp/verify-metadata.sh'
 ```
 
 脚本功能：
@@ -220,7 +220,7 @@ Mismatch: 0
 ### 3a. 清理源端 NFS（SSH）
 
 ```bash
-ssh ubuntu@{SOURCE_IP} 'sudo rm -rf {NFS_EXPORT}/test-data && echo "source cleaned"'
+ssh root@{SOURCE_IP} 'sudo rm -rf {NFS_EXPORT}/test-data && echo "source cleaned"'
 ```
 
 Expected: `source cleaned`。

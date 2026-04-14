@@ -4,7 +4,7 @@
 # 变更后：114 dirs / 333 files / 79 symlinks
 set -e
 
-BASE="/export/nfs4/test-data"
+BASE="/export/nfsv4/test-data"
 
 # 校验基线存在
 if [ ! -d "$BASE/d1" ] || [ ! -d "$BASE/d2" ] || [ ! -d "$BASE/d3" ] || [ ! -d "$BASE/d4" ]; then

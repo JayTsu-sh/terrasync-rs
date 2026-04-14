@@ -14,7 +14,7 @@ description: >
 
 端到端增量拷贝测试（NFS v3 存储）。
 验证完整管线：全量 sync 建基线 → 变更源端数据 → 增量 sync 检测并同步变更 → 目标端验证 → integrity-check → 清理。
-`terrasync` 本地运行（使用 `{CONFIG}`），通过网络直接访问 NFSv3。
+`datasync` 本地运行（使用 `{CONFIG}`），通过网络直接访问 NFSv3。
 测试数据通过 SSH 在远端创建、变更和验证。
 
 **增量 sync 机制**：当 `jobs/replicate_{SYNC_JOB_ID}/` 目录已存在时自动进入增量模式。
@@ -24,15 +24,15 @@ NFS v3 使用 `JoinStrategy::Fh3`，通过 file_handle（文件句柄哈希）�
 
 | Name | Value |
 |------|-------|
-| SOURCE_IP | 10.131.9.13 |
+| SOURCE_IP | 192.168.50.173 |
 | SOURCE_NFS_EXPORT | `/export/nfs` |
-| DEST_IP | `10.131.9.15` |
+| DEST_IP | `192.168.50.23` |
 | DEST_NFS_EXPORT | `/export/nfs` |
 | SOURCE_URL | `nfs://{SOURCE_IP}{SOURCE_NFS_EXPORT}` |
 | DEST_URL | `nfs://{DEST_IP}{DEST_NFS_EXPORT}` |
 | CONFIG | `examples/config.toml` |
-| BINARY | `./target/debug/terrasync` |
-| CLICKHOUSE_HOST | `10.128.133.213:8123` |
+| BINARY | `./target/debug/datasync` |
+| CLICKHOUSE_HOST | `192.168.50.173:8123` |
 | SYNC_JOB_ID | `nfs-v3-incr-sync` |
 | DST_SCAN_JOB_ID | `nfs-v3-incr-sync-dst` |
 | IC_JOB_ID | `nfs-v3-incr-sync-ic` |
@@ -58,7 +58,7 @@ ClickHouse 表名：
 ### 0a. 清理源端 NFS 数据（SSH）
 
 ```bash
-ssh ubuntu@{SOURCE_IP} 'sudo rm -rf {SOURCE_NFS_EXPORT}/test-data && echo "source cleaned"'
+ssh root@{SOURCE_IP} 'sudo rm -rf {SOURCE_NFS_EXPORT}/test-data && echo "source cleaned"'
 ```
 
 Expected: `source cleaned`。
@@ -66,7 +66,7 @@ Expected: `source cleaned`。
 ### 0b. 清理目标端 NFS 数据（SSH）
 
 ```bash
-ssh ubuntu@{DEST_IP} 'sudo rm -rf {DEST_NFS_EXPORT}/test-data && echo "dest cleaned"'
+ssh root@{DEST_IP} 'sudo rm -rf {DEST_NFS_EXPORT}/test-data && echo "dest cleaned"'
 ```
 
 Expected: `dest cleaned`。
@@ -119,7 +119,7 @@ Expected: 无输出（空）。
 复用 e2e-test-nfs-v3 的 setup-test-data.sh：
 
 ```bash
-scp .claude/skills/e2e-test-nfs-v3/scripts/setup-test-data.sh ubuntu@{SOURCE_IP}:/tmp/setup-test-data.sh
+scp .claude/skills/e2e-test-nfs-v3/scripts/setup-test-data.sh root@{SOURCE_IP}:/tmp/setup-test-data.sh
 ```
 
 Expected: 无错误输出，scp 退出码为 0。
@@ -129,7 +129,7 @@ Expected: 无错误输出，scp 退出码为 0。
 ## Step 2: 执行测试脚本创建数据（SOURCE_IP）
 
 ```bash
-ssh ubuntu@{SOURCE_IP} 'sudo bash /tmp/setup-test-data.sh'
+ssh root@{SOURCE_IP} 'sudo bash /tmp/setup-test-data.sh'
 ```
 
 Expected output (last lines):
@@ -198,7 +198,7 @@ false   true    {BASELINE_SYMLINKS}   # 软链接 = 36
 **注意：必须使用 `sudo`，因为测试数据包含权限受限的目录（mode 0700/0500 等），普通用户无法访问。**
 
 ```bash
-ssh ubuntu@{DEST_IP} 'sudo find {DEST_NFS_EXPORT}/test-data -type d | wc -l; sudo find {DEST_NFS_EXPORT}/test-data -type f | wc -l; sudo find {DEST_NFS_EXPORT}/test-data -type l | wc -l'
+ssh root@{DEST_IP} 'sudo find {DEST_NFS_EXPORT}/test-data -type d | wc -l; sudo find {DEST_NFS_EXPORT}/test-data -type f | wc -l; sudo find {DEST_NFS_EXPORT}/test-data -type l | wc -l'
 ```
 
 Expected: `dirs={BASELINE_DIRS}, files={BASELINE_FILES}, symlinks={BASELINE_SYMLINKS}`。
@@ -214,13 +214,13 @@ Expected: `dirs={BASELINE_DIRS}, files={BASELINE_FILES}, symlinks={BASELINE_SYML
 ### 4a. 上传变更脚本
 
 ```bash
-scp .claude/skills/e2e-test-nfs-v3-incremental-scan/scripts/mutate-test-data.sh ubuntu@{SOURCE_IP}:/tmp/mutate-test-data.sh
+scp .claude/skills/e2e-test-nfs-v3-incremental-scan/scripts/mutate-test-data.sh root@{SOURCE_IP}:/tmp/mutate-test-data.sh
 ```
 
 ### 4b. 执行变更脚本
 
 ```bash
-ssh ubuntu@{SOURCE_IP} 'sudo bash /tmp/mutate-test-data.sh'
+ssh root@{SOURCE_IP} 'sudo bash /tmp/mutate-test-data.sh'
 ```
 
 Expected output (last lines):
@@ -287,7 +287,7 @@ grep -E "ERROR|WARN" target/debug/logs/*/app.log | tail -80
 **注意：必须使用 `sudo`，因为测试数据包含权限受限的目录（mode 0700/0500 等），普通用户无法访问。**
 
 ```bash
-ssh ubuntu@{DEST_IP} 'sudo find {DEST_NFS_EXPORT}/test-data -type d | wc -l; sudo find {DEST_NFS_EXPORT}/test-data -type f | wc -l; sudo find {DEST_NFS_EXPORT}/test-data -type l | wc -l'
+ssh root@{DEST_IP} 'sudo find {DEST_NFS_EXPORT}/test-data -type d | wc -l; sudo find {DEST_NFS_EXPORT}/test-data -type f | wc -l; sudo find {DEST_NFS_EXPORT}/test-data -type l | wc -l'
 ```
 
 Expected: `dirs={POST_MUTATE_DIRS}, files={POST_MUTATE_FILES}, symlinks={POST_MUTATE_SYMLINKS}`。

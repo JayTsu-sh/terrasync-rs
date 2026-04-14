@@ -12,7 +12,7 @@ description: >
 
 端到端增量扫描测试（S3 多版本桶）。
 验证完整管线：全量扫描建基线 → 执行多版本变更 → 增量扫描检测变更 → ClickHouse 表验证 → 清理。
-`terrasync` 本地运行（使用 `{CONFIG}`），通过网络直接访问 S3 兼容存储。
+`datasync` 本地运行（使用 `{CONFIG}`），通过网络直接访问 S3 兼容存储。
 
 **多版本增量扫描的关键区别**：
 - `version_id` 参与 base 表唯一性判断（Path 策略使用 `relative_path + version_id`）
@@ -37,8 +37,8 @@ description: >
 | S3_BUCKET | `{S3_VERSIONED_BUCKET}` |
 | S3_URL | `s3://{S3_AK}:{S3_SK}@{S3_BUCKET}.{S3_HOST}/test-data` |
 | CONFIG | `examples/config.toml` |
-| BINARY | `./target/debug/terrasync` |
-| CLICKHOUSE_HOST | `10.128.133.213:8123` |
+| BINARY | `./target/debug/datasync` |
+| CLICKHOUSE_HOST | `192.168.50.173:8123` |
 | JOB_ID | `s3-ver-incr-scan` |
 | SANITIZED_JOB_ID | `s3_ver_incr_scan` |
 | BASE_TABLE | `base_s3_ver_incr_scan` |

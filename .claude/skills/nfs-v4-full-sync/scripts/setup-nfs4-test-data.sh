@@ -1,9 +1,9 @@
 #!/bin/bash
-# setup-nfs4-test-data.sh — 在 /export/nfs4/test-data 创建丰富的测试目录树
+# setup-nfs4-test-data.sh — 在 /export/nfsv4/test-data 创建丰富的测试目录树
 # 包含：多层目录、文件、软链接，以及不同的 mode/uid/gid/mtime 组合
 set -e
 
-BASE="/export/nfs4/test-data"
+BASE="/export/nfsv4/test-data"
 
 # 清理已有数据（全量重建）
 rm -rf "$BASE"

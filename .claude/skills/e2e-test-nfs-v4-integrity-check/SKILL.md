@@ -14,7 +14,7 @@ description: >
 独立一致性校验测试（NFS v4.1 存储）。
 验证 integrity-check 在多种场景下的正确性，并专门测试 ACL/xattr 复制的完整性（反向验证代码功能）：
 完全一致 → Mismatch 检测 → Missing 检测 → ACL 差异手动检测 → xattr 差异手动检测 → Auto-Fix → Quick 模式。
-`terrasync` 本地运行（使用 `{CONFIG}`），通过网络直接访问 NFSv4.1。
+`datasync` 本地运行（使用 `{CONFIG}`），通过网络直接访问 NFSv4.1。
 通过 SSH 在目标端引入文件内容差异和 ACL/xattr 差异用于验证检测能力。
 
 **测试覆盖场景**：
@@ -34,12 +34,12 @@ description: >
 |------|-------|
 | SOURCE_IP | `{NFSv4_SOURCE_IP}` |
 | DEST_IP | `{NFSv4_DEST_IP}` |
-| NFS_EXPORT | `/export/nfs4` |
+| NFS_EXPORT | `/export/nfsv4` |
 | SOURCE_URL | `nfs://{SOURCE_IP}{NFS_EXPORT}?version=4.1` |
 | DEST_URL | `nfs://{DEST_IP}{NFS_EXPORT}?version=4.1` |
 | CONFIG | `examples/config.toml` |
-| BINARY | `./target/debug/terrasync` |
-| CLICKHOUSE_HOST | `10.128.133.213:8123` |
+| BINARY | `./target/debug/datasync` |
+| CLICKHOUSE_HOST | `192.168.50.173:8123` |
 | SYNC_JOB_ID | `nfs-v4-ic-sync` |
 | IC_JOB_ID | `nfs-v4-ic-test` |
 | IC_QUICK_JOB_ID | `nfs-v4-ic-quick` |
@@ -58,7 +58,7 @@ description: >
 ### 0a. 清理源端 NFS 数据（SSH）
 
 ```bash
-ssh ubuntu@{SOURCE_IP} 'sudo rm -rf {NFS_EXPORT}/test-data && echo "source cleaned"'
+ssh root@{SOURCE_IP} 'sudo rm -rf {NFS_EXPORT}/test-data && echo "source cleaned"'
 ```
 
 Expected: `source cleaned`。
@@ -66,7 +66,7 @@ Expected: `source cleaned`。
 ### 0b. 清理目标端 NFS 数据（SSH）
 
 ```bash
-ssh ubuntu@{DEST_IP} 'sudo rm -rf {NFS_EXPORT}/test-data && echo "dest cleaned"'
+ssh root@{DEST_IP} 'sudo rm -rf {NFS_EXPORT}/test-data && echo "dest cleaned"'
 ```
 
 Expected: `dest cleaned`。
@@ -123,8 +123,8 @@ Expected: 编译成功，生成 `{BINARY}`，无错误输出。
 ### 2a. 上传并执行测试脚本
 
 ```bash
-scp .claude/skills/nfs-v4-full-sync/scripts/setup-nfs4-test-data.sh ubuntu@{SOURCE_IP}:/tmp/setup-nfs4-test-data.sh
-ssh ubuntu@{SOURCE_IP} 'sudo bash /tmp/setup-nfs4-test-data.sh'
+scp .claude/skills/nfs-v4-full-sync/scripts/setup-nfs4-test-data.sh root@{SOURCE_IP}:/tmp/setup-nfs4-test-data.sh
+ssh root@{SOURCE_IP} 'sudo bash /tmp/setup-nfs4-test-data.sh'
 ```
 
 Expected output (last lines):
@@ -141,7 +141,7 @@ OK: 数量校验通过，ACL/xattr 设置完成
 ### 2b. 验证源端 ACL 已设置
 
 ```bash
-ssh ubuntu@{SOURCE_IP} 'nfs4_getfacl {NFS_EXPORT}/test-data/{ACL_TEST_FILE}'
+ssh root@{SOURCE_IP} 'nfs4_getfacl {NFS_EXPORT}/test-data/{ACL_TEST_FILE}'
 ```
 
 Expected: 输出包含自定义 ACE（非纯默认 ACL）。记录此输出用于后续 dest 对比。
@@ -149,7 +149,7 @@ Expected: 输出包含自定义 ACE（非纯默认 ACL）。记录此输出用�
 ### 2c. 验证源端 xattr 已设置
 
 ```bash
-ssh ubuntu@{SOURCE_IP} 'getfattr -d {NFS_EXPORT}/test-data/{XATTR_TEST_FILE}'
+ssh root@{SOURCE_IP} 'getfattr -d {NFS_EXPORT}/test-data/{XATTR_TEST_FILE}'
 ```
 
 Expected: 输出包含 `user.author`、`user.version` 等 xattr 字段。记录此输出用于后续 dest 对比。
@@ -167,7 +167,7 @@ Use the Bash tool locally (timeout=120000):
 ### 2e. 目标端 find 验证
 
 ```bash
-ssh ubuntu@{DEST_IP} 'FIND_DIRS=$(find {NFS_EXPORT}/test-data -type d | wc -l); FIND_FILES=$(find {NFS_EXPORT}/test-data -type f | wc -l); FIND_LINKS=$(find {NFS_EXPORT}/test-data -type l | wc -l); echo "dest find: dirs=$FIND_DIRS, files=$FIND_FILES, symlinks=$FIND_LINKS"'
+ssh root@{DEST_IP} 'FIND_DIRS=$(find {NFS_EXPORT}/test-data -type d | wc -l); FIND_FILES=$(find {NFS_EXPORT}/test-data -type f | wc -l); FIND_LINKS=$(find {NFS_EXPORT}/test-data -type l | wc -l); echo "dest find: dirs=$FIND_DIRS, files=$FIND_FILES, symlinks=$FIND_LINKS"'
 ```
 
 Expected: `dirs={EXPECTED_DIRS}, files={EXPECTED_FILES}, symlinks={EXPECTED_SYMLINKS}`。
@@ -175,7 +175,7 @@ Expected: `dirs={EXPECTED_DIRS}, files={EXPECTED_FILES}, symlinks={EXPECTED_SYML
 ### 2f. 验证目标端 ACL 已正确复制（初始状态记录）
 
 ```bash
-ssh ubuntu@{DEST_IP} 'nfs4_getfacl {NFS_EXPORT}/test-data/{ACL_TEST_FILE}'
+ssh root@{DEST_IP} 'nfs4_getfacl {NFS_EXPORT}/test-data/{ACL_TEST_FILE}'
 ```
 
 **Verify: 输出与 2b 记录的源端 ACL 一致（自定义 ACE 均存在）。**
@@ -183,7 +183,7 @@ ssh ubuntu@{DEST_IP} 'nfs4_getfacl {NFS_EXPORT}/test-data/{ACL_TEST_FILE}'
 ### 2g. 验证目标端 xattr 已正确复制（初始状态记录）
 
 ```bash
-ssh ubuntu@{DEST_IP} 'getfattr -d {NFS_EXPORT}/test-data/{XATTR_TEST_FILE}'
+ssh root@{DEST_IP} 'getfattr -d {NFS_EXPORT}/test-data/{XATTR_TEST_FILE}'
 ```
 
 **Verify: `user.*` 字段与 2c 记录的源端 xattr 完全一致。**
@@ -241,7 +241,7 @@ Expected:
 ### 5a. 修改目标端文件内容（制造内容 Mismatch）
 
 ```bash
-ssh ubuntu@{DEST_IP} 'echo "tampered-nfs4-content-integrity-check" > {NFS_EXPORT}/test-data/d1/d1_1/file2.txt'
+ssh root@{DEST_IP} 'echo "tampered-nfs4-content-integrity-check" > {NFS_EXPORT}/test-data/d1/d1_1/file2.txt'
 ```
 
 ### 5b. Full 模式校验（应检测到 Mismatch）
@@ -275,7 +275,7 @@ Expected:
 ### 5d. 删除目标端文件（制造 Missing）
 
 ```bash
-ssh ubuntu@{DEST_IP} 'rm {NFS_EXPORT}/test-data/d2/file1.txt'
+ssh root@{DEST_IP} 'rm {NFS_EXPORT}/test-data/d2/file1.txt'
 ```
 
 ### 5e. 校验（应检测到 Missing + Mismatch）
@@ -318,7 +318,7 @@ Expected:
 ### 6b. 记录目标端当前 ACL（基准值）
 
 ```bash
-ssh ubuntu@{DEST_IP} 'nfs4_getfacl {NFS_EXPORT}/test-data/{ACL_TEST_FILE}'
+ssh root@{DEST_IP} 'nfs4_getfacl {NFS_EXPORT}/test-data/{ACL_TEST_FILE}'
 ```
 
 记录此输出，用于后续与篡改后的 ACL 对比。
@@ -326,7 +326,7 @@ ssh ubuntu@{DEST_IP} 'nfs4_getfacl {NFS_EXPORT}/test-data/{ACL_TEST_FILE}'
 ### 6c. 篡改目标端 ACL（引入 ACL 差异）
 
 ```bash
-ssh ubuntu@{DEST_IP} 'nfs4_setfacl -a "D::EVERYONE@:rw" {NFS_EXPORT}/test-data/{ACL_TEST_FILE}'
+ssh root@{DEST_IP} 'nfs4_setfacl -a "D::EVERYONE@:rw" {NFS_EXPORT}/test-data/{ACL_TEST_FILE}'
 ```
 
 此操作在目标端 ACL 中新增一条 Deny ACE，源端没有此 ACE。
@@ -334,11 +334,11 @@ ssh ubuntu@{DEST_IP} 'nfs4_setfacl -a "D::EVERYONE@:rw" {NFS_EXPORT}/test-data/{
 ### 6d. 比对源端与目标端 ACL
 
 ```bash
-ssh ubuntu@{SOURCE_IP} 'nfs4_getfacl {NFS_EXPORT}/test-data/{ACL_TEST_FILE}'
+ssh root@{SOURCE_IP} 'nfs4_getfacl {NFS_EXPORT}/test-data/{ACL_TEST_FILE}'
 ```
 
 ```bash
-ssh ubuntu@{DEST_IP} 'nfs4_getfacl {NFS_EXPORT}/test-data/{ACL_TEST_FILE}'
+ssh root@{DEST_IP} 'nfs4_getfacl {NFS_EXPORT}/test-data/{ACL_TEST_FILE}'
 ```
 
 **Verify: 两端 ACL 不一致**，目标端有额外的 Deny ACE `D::EVERYONE@:rw`，源端没有。
@@ -371,7 +371,7 @@ Expected:
 再次比对 ACL：
 
 ```bash
-ssh ubuntu@{DEST_IP} 'nfs4_getfacl {NFS_EXPORT}/test-data/{ACL_TEST_FILE}'
+ssh root@{DEST_IP} 'nfs4_getfacl {NFS_EXPORT}/test-data/{ACL_TEST_FILE}'
 ```
 
 **Verify: 目标端 ACL 恢复与源端一致（DENY ACE 已被移除或覆盖）。**
@@ -385,7 +385,7 @@ ssh ubuntu@{DEST_IP} 'nfs4_getfacl {NFS_EXPORT}/test-data/{ACL_TEST_FILE}'
 ### 7a. 记录目标端当前 xattr（基准值）
 
 ```bash
-ssh ubuntu@{DEST_IP} 'getfattr -d {NFS_EXPORT}/test-data/{XATTR_TEST_FILE}'
+ssh root@{DEST_IP} 'getfattr -d {NFS_EXPORT}/test-data/{XATTR_TEST_FILE}'
 ```
 
 记录此输出。
@@ -393,17 +393,17 @@ ssh ubuntu@{DEST_IP} 'getfattr -d {NFS_EXPORT}/test-data/{XATTR_TEST_FILE}'
 ### 7b. 篡改目标端 xattr（修改已有 xattr 值）
 
 ```bash
-ssh ubuntu@{DEST_IP} 'setfattr -n user.author -v "tampered-author" {NFS_EXPORT}/test-data/{XATTR_TEST_FILE}'
+ssh root@{DEST_IP} 'setfattr -n user.author -v "tampered-author" {NFS_EXPORT}/test-data/{XATTR_TEST_FILE}'
 ```
 
 ### 7c. 比对源端与目标端 xattr
 
 ```bash
-ssh ubuntu@{SOURCE_IP} 'getfattr -d {NFS_EXPORT}/test-data/{XATTR_TEST_FILE}'
+ssh root@{SOURCE_IP} 'getfattr -d {NFS_EXPORT}/test-data/{XATTR_TEST_FILE}'
 ```
 
 ```bash
-ssh ubuntu@{DEST_IP} 'getfattr -d {NFS_EXPORT}/test-data/{XATTR_TEST_FILE}'
+ssh root@{DEST_IP} 'getfattr -d {NFS_EXPORT}/test-data/{XATTR_TEST_FILE}'
 ```
 
 **Verify: `user.author` 值不一致**，目标端为 `tampered-author`，源端为原始值。
@@ -431,7 +431,7 @@ Expected:
 
 ```bash
 # 若 xattr 变更未触发 Changed，需先在源端 touch 文件更新 mtime
-ssh ubuntu@{SOURCE_IP} 'touch {NFS_EXPORT}/test-data/{XATTR_TEST_FILE}'
+ssh root@{SOURCE_IP} 'touch {NFS_EXPORT}/test-data/{XATTR_TEST_FILE}'
 # 然后执行增量 sync
 {BINARY} -c {CONFIG} -l trace sync --id {SYNC_JOB_ID}-xattr-fix --enable-acl "{SOURCE_URL}" "{DEST_URL}"
 ```
@@ -439,7 +439,7 @@ ssh ubuntu@{SOURCE_IP} 'touch {NFS_EXPORT}/test-data/{XATTR_TEST_FILE}'
 再次比对 xattr：
 
 ```bash
-ssh ubuntu@{DEST_IP} 'getfattr -d {NFS_EXPORT}/test-data/{XATTR_TEST_FILE}'
+ssh root@{DEST_IP} 'getfattr -d {NFS_EXPORT}/test-data/{XATTR_TEST_FILE}'
 ```
 
 **Verify: 目标端 `user.author` 恢复与源端一致（不再是 `tampered-author`）。**
@@ -451,7 +451,7 @@ ssh ubuntu@{DEST_IP} 'getfattr -d {NFS_EXPORT}/test-data/{XATTR_TEST_FILE}'
 ### 8a. 制造属性差异
 
 ```bash
-ssh ubuntu@{DEST_IP} 'chmod 777 {NFS_EXPORT}/test-data/d1/d1_1/file1.txt'
+ssh root@{DEST_IP} 'chmod 777 {NFS_EXPORT}/test-data/d1/d1_1/file1.txt'
 ```
 
 ### 8b. 确认差异存在

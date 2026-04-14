@@ -12,7 +12,7 @@ description: >
 
 端到端全量扫描测试（NFS v4.1 存储）。
 验证完整管线：测试数据创建（含 NFSv4 ACL 和 xattr）→ 全量扫描 → CLI 输出验证 → ClickHouse base 表验证 → 清理。
-`terrasync` 本地运行（使用 `{CONFIG}`），通过网络直接访问 NFSv4.1。
+`datasync` 本地运行（使用 `{CONFIG}`），通过网络直接访问 NFSv4.1。
 测试数据通过 SSH 在远端创建，同时设置 NFSv4 ACL 和 named attributes（xattr）。
 
 **NFSv4.1 vs NFSv3 关键差异**：
@@ -26,12 +26,12 @@ description: >
 
 | Name | Value |
 |------|-------|
-| SOURCE_IP | 10.131.9.13 |
+| SOURCE_IP | 192.168.50.173 |
 | NFS_EXPORT | `` |
 | SOURCE_URL | `nfs://{SOURCE_IP}{NFS_EXPORT}?version=4.1` |
 | CONFIG | `examples/config.toml` |
-| BINARY | `./target/debug/terrasync` |
-| CLICKHOUSE_HOST | `10.128.133.213:8123` |
+| BINARY | `./target/debug/datasync` |
+| CLICKHOUSE_HOST | `192.168.50.173:8123` |
 | JOB_ID | `nfs-v4-full-scan` |
 | SANITIZED_JOB_ID | `nfs_v4_full_scan` |
 | BASE_TABLE | `base_nfs_v4_full_scan` |
@@ -41,7 +41,7 @@ description: >
 | EXPECTED_SYMLINKS | 79 |
 
 **注意**：NFS v4.1 使用伪根（pseudo-root）机制，URL 中的路径必须是相对于 `fsid=0` 的 export。
-当前配置中 `/export/nfs4` 设置了 `fsid=0`，因此 NFS v4.1 URL 应使用 `/` 作为路径。
+当前配置中 `/export/nfsv4` 设置了 `fsid=0`，因此 NFS v4.1 URL 应使用 `/` 作为路径。
 
 ClickHouse 表名：
 - `base_nfs_v4_full_scan`
@@ -56,7 +56,7 @@ ClickHouse 表名：
 ### 0a. 清理源端 NFS 数据（SSH）
 
 ```bash
-ssh ubuntu@{SOURCE_IP} 'sudo rm -rf {NFS_EXPORT}/test-data && echo "source cleaned"'
+ssh root@{SOURCE_IP} 'sudo rm -rf {NFS_EXPORT}/test-data && echo "source cleaned"'
 ```
 
 Expected: `source cleaned`。
@@ -103,13 +103,13 @@ Expected: 无输出（空）。
 ### 1a. 上传脚本
 
 ```bash
-scp .claude/skills/e2e-test-nfs-v4-full-scan/scripts/setup-nfs4-test-data.sh ubuntu@{SOURCE_IP}:/tmp/setup-nfs4-test-data.sh
+scp .claude/skills/e2e-test-nfs-v4-full-scan/scripts/setup-nfs4-test-data.sh root@{SOURCE_IP}:/tmp/setup-nfs4-test-data.sh
 ```
 
 ### 1b. 执行脚本
 
 ```bash
-ssh ubuntu@{SOURCE_IP} 'sudo bash /tmp/setup-nfs4-test-data.sh'
+ssh root@{SOURCE_IP} 'sudo bash /tmp/setup-nfs4-test-data.sh'
 ```
 
 脚本功能：
@@ -202,7 +202,7 @@ Expected: `527`（{EXPECTED_DIRS}+{EXPECTED_FILES}+{EXPECTED_SYMLINKS} = 113+335
 ### 2f. 独立文件系统核查（交叉验证 ClickHouse）
 
 ```bash
-ssh ubuntu@{SOURCE_IP} "echo 'dirs:'; find {NFS_EXPORT}/test-data -mindepth 1 -type d | wc -l; echo 'files:'; find {NFS_EXPORT}/test-data -type f | wc -l; echo 'symlinks:'; find {NFS_EXPORT}/test-data -type l | wc -l"
+ssh root@{SOURCE_IP} "echo 'dirs:'; find {NFS_EXPORT}/test-data -mindepth 1 -type d | wc -l; echo 'files:'; find {NFS_EXPORT}/test-data -type f | wc -l; echo 'symlinks:'; find {NFS_EXPORT}/test-data -type l | wc -l"
 ```
 
 Expected:
@@ -239,7 +239,7 @@ grep -E "ERROR|WARN" target/debug/logs/*/app.log | tail -80
 ### 3a. 清理源端 NFS
 
 ```bash
-ssh ubuntu@{SOURCE_IP} 'sudo rm -rf {NFS_EXPORT}/test-data && echo "source cleaned"'
+ssh root@{SOURCE_IP} 'sudo rm -rf {NFS_EXPORT}/test-data && echo "source cleaned"'
 ```
 
 ### 3b. 清理 ClickHouse 表

@@ -4,8 +4,8 @@
 
 set -e
 
-BASE="/export/nfs4"
-CLICKHOUSE_HOST="10.128.133.213:8123"
+BASE="/export/nfsv4"
+CLICKHOUSE_HOST="192.168.50.173:8123"
 TABLE="base_nfs_v4_full_sync_dst"
 STATE_TABLE="state_nfs_v4_full_sync_dst"
 

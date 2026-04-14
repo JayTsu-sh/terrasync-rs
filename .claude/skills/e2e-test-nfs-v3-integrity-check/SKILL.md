@@ -13,7 +13,7 @@ description: >
 
 独立一致性校验测试（NFS v3 存储）。
 验证 integrity-check 在多种场景下的正确性：完全一致 → Mismatch 检测 → Missing 检测 → Quick 模式 → Auto-Fix 模式。
-`terrasync` 本地运行（使用 `{CONFIG}`），通过网络直接访问 NFSv3。
+`datasync` 本地运行（使用 `{CONFIG}`），通过网络直接访问 NFSv3。
 通过 SSH 在目标端引入差异用于验证检测能力。
 
 **测试覆盖四种场景**：
@@ -27,15 +27,15 @@ description: >
 
 | Name | Value |
 |------|-------|
-| SOURCE_IP | 10.131.9.13 |
+| SOURCE_IP | 192.168.50.173 |
 | SOURCE_NFS_EXPORT | `/export/nfs` |
 | DEST_IP | `{DEST_IP}` |
 | DEST_NFS_EXPORT | `{DEST_NFS_EXPORT}` |
 | SOURCE_URL | `nfs://{SOURCE_IP}{SOURCE_NFS_EXPORT}` |
 | DEST_URL | `nfs://{DEST_IP}{DEST_NFS_EXPORT}` |
 | CONFIG | `examples/config.toml` |
-| BINARY | `./target/debug/terrasync` |
-| CLICKHOUSE_HOST | `10.128.133.213:8123` |
+| BINARY | `./target/debug/datasync` |
+| CLICKHOUSE_HOST | `192.168.50.173:8123` |
 | SYNC_JOB_ID | `nfs-v3-ic-sync` |
 | IC_JOB_ID | `nfs-v3-ic-test` |
 | IC_QUICK_JOB_ID | `nfs-v3-ic-quick` |
@@ -52,7 +52,7 @@ description: >
 ### 0a. 清理源端 NFS 数据（SSH）
 
 ```bash
-ssh ubuntu@{SOURCE_IP} 'sudo rm -rf {SOURCE_NFS_EXPORT}/test-data && echo "source cleaned"'
+ssh root@{SOURCE_IP} 'sudo rm -rf {SOURCE_NFS_EXPORT}/test-data && echo "source cleaned"'
 ```
 
 Expected: `source cleaned`。
@@ -60,7 +60,7 @@ Expected: `source cleaned`。
 ### 0b. 清理目标端 NFS 数据（SSH）
 
 ```bash
-ssh ubuntu@{DEST_IP} 'sudo rm -rf {DEST_NFS_EXPORT}/test-data && echo "dest cleaned"'
+ssh root@{DEST_IP} 'sudo rm -rf {DEST_NFS_EXPORT}/test-data && echo "dest cleaned"'
 ```
 
 Expected: `dest cleaned`。
@@ -117,8 +117,8 @@ Expected: 编译成功，生成 `{BINARY}`，无错误输出。
 ### 2a. 上传并执行测试脚本
 
 ```bash
-scp .claude/skills/nfs-v3-e2e/scripts/setup-test-data.sh ubuntu@{SOURCE_IP}:/tmp/setup-test-data.sh
-ssh ubuntu@{SOURCE_IP} 'sudo bash /tmp/setup-test-data.sh'
+scp .claude/skills/nfs-v3-e2e/scripts/setup-test-data.sh root@{SOURCE_IP}:/tmp/setup-test-data.sh
+ssh root@{SOURCE_IP} 'sudo bash /tmp/setup-test-data.sh'
 ```
 
 Expected: dirs={EXPECTED_DIRS}, files={EXPECTED_FILES}, symlinks={EXPECTED_SYMLINKS}。
@@ -136,7 +136,7 @@ Use the Bash tool locally (timeout=120000):
 ### 2c. 目标端 find 验证
 
 ```bash
-ssh ubuntu@{DEST_IP} 'FIND_DIRS=$(find {DEST_NFS_EXPORT}/test-data -type d | wc -l); FIND_FILES=$(find {DEST_NFS_EXPORT}/test-data -type f | wc -l); FIND_LINKS=$(find {DEST_NFS_EXPORT}/test-data -type l | wc -l); echo "dest find: dirs=$FIND_DIRS, files=$FIND_FILES, symlinks=$FIND_LINKS"'
+ssh root@{DEST_IP} 'FIND_DIRS=$(find {DEST_NFS_EXPORT}/test-data -type d | wc -l); FIND_FILES=$(find {DEST_NFS_EXPORT}/test-data -type f | wc -l); FIND_LINKS=$(find {DEST_NFS_EXPORT}/test-data -type l | wc -l); echo "dest find: dirs=$FIND_DIRS, files=$FIND_FILES, symlinks=$FIND_LINKS"'
 ```
 
 Expected: `dirs={EXPECTED_DIRS}, files={EXPECTED_FILES}, symlinks={EXPECTED_SYMLINKS}`。
@@ -196,7 +196,7 @@ Expected:
 通过 SSH 在目标端修改文件内容（size 不变但 hash 不同需要追加不同长度的内容）：
 
 ```bash
-ssh ubuntu@{DEST_IP} 'echo "tampered-content-for-integrity-check" > {DEST_NFS_EXPORT}/test-data/d1/d1_1/file1.txt'
+ssh root@{DEST_IP} 'echo "tampered-content-for-integrity-check" > {DEST_NFS_EXPORT}/test-data/d1/d1_1/file1.txt'
 ```
 
 ### 5b. Full 模式校验（应检测到 Mismatch）
@@ -222,7 +222,7 @@ Expected:
 ### 5c. 删除目标端文件（制造 Missing）
 
 ```bash
-ssh ubuntu@{DEST_IP} 'rm {DEST_NFS_EXPORT}/test-data/d2/file1.txt'
+ssh root@{DEST_IP} 'rm {DEST_NFS_EXPORT}/test-data/d2/file1.txt'
 ```
 
 ### 5d. 校验（应检测到 Missing + Mismatch）
@@ -275,7 +275,7 @@ grep -E "ERROR|WARN" target/debug/logs/*/app.log | tail -80
 ### 6b. 再次修改目标端文件属性（制造属性 Mismatch）
 
 ```bash
-ssh ubuntu@{DEST_IP} 'chmod 777 {DEST_NFS_EXPORT}/test-data/d1/d1_1/file1.txt'
+ssh root@{DEST_IP} 'chmod 777 {DEST_NFS_EXPORT}/test-data/d1/d1_1/file1.txt'
 ```
 
 ### 6c. 执行 Auto-Fix

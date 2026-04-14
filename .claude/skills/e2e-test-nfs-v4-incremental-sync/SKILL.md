@@ -13,7 +13,7 @@ description: >
 
 端到端增量拷贝测试（NFS v4.1 存储）。
 验证完整管线：全量 sync 建基线（含 ACL/xattr）→ 变更源端数据（含 ACL/xattr 变更）→ 增量 sync 检测并同步变更 → 目标端验证（文件数量 + ACL/xattr 传播）→ integrity-check → 清理。
-`terrasync` 本地运行（使用 `{CONFIG}`），通过网络直接访问 NFSv4.1。
+`datasync` 本地运行（使用 `{CONFIG}`），通过网络直接访问 NFSv4.1。
 
 **NFSv4.1 增量 sync 关键特性**：
 - URL 加 `?version=4.1` 强制使用 NFSv4.1
@@ -28,12 +28,12 @@ description: >
 |------|-------|
 | SOURCE_IP | `{NFSv4_SOURCE_IP}` |
 | DEST_IP | `{NFSv4_DEST_IP}` |
-| NFS_EXPORT | `/export/nfs4` |
+| NFS_EXPORT | `/export/nfsv4` |
 | SOURCE_URL | `nfs://{SOURCE_IP}{NFS_EXPORT}?version=4.1` |
 | DEST_URL | `nfs://{DEST_IP}{NFS_EXPORT}?version=4.1` |
 | CONFIG | `examples/config.toml` |
-| BINARY | `./target/debug/terrasync` |
-| CLICKHOUSE_HOST | `10.128.133.213:8123` |
+| BINARY | `./target/debug/datasync` |
+| CLICKHOUSE_HOST | `192.168.50.173:8123` |
 | SYNC_JOB_ID | `nfs-v4-incr-sync` |
 | DST_SCAN_JOB_ID | `nfs-v4-incr-sync-dst` |
 | IC_JOB_ID | `nfs-v4-incr-sync-ic` |
@@ -59,7 +59,7 @@ ClickHouse 表名：
 ### 0a. 清理源端 NFS 数据（SSH）
 
 ```bash
-ssh ubuntu@{SOURCE_IP} 'sudo rm -rf {NFS_EXPORT}/test-data && echo "source cleaned"'
+ssh root@{SOURCE_IP} 'sudo rm -rf {NFS_EXPORT}/test-data && echo "source cleaned"'
 ```
 
 Expected: `source cleaned`。
@@ -67,7 +67,7 @@ Expected: `source cleaned`。
 ### 0b. 清理目标端 NFS 数据（SSH）
 
 ```bash
-ssh ubuntu@{DEST_IP} 'sudo rm -rf {NFS_EXPORT}/test-data && echo "dest cleaned"'
+ssh root@{DEST_IP} 'sudo rm -rf {NFS_EXPORT}/test-data && echo "dest cleaned"'
 ```
 
 Expected: `dest cleaned`。
@@ -124,8 +124,8 @@ Expected: 编译成功，生成 `{BINARY}`，无错误输出。
 复用 nfs-v4-full-sync 的 setup-nfs4-test-data.sh：
 
 ```bash
-scp .claude/skills/nfs-v4-full-sync/scripts/setup-nfs4-test-data.sh ubuntu@{SOURCE_IP}:/tmp/setup-nfs4-test-data.sh
-ssh ubuntu@{SOURCE_IP} 'sudo bash /tmp/setup-nfs4-test-data.sh'
+scp .claude/skills/nfs-v4-full-sync/scripts/setup-nfs4-test-data.sh root@{SOURCE_IP}:/tmp/setup-nfs4-test-data.sh
+ssh root@{SOURCE_IP} 'sudo bash /tmp/setup-nfs4-test-data.sh'
 ```
 
 Expected output (last lines):
@@ -173,7 +173,7 @@ false   true    {BASELINE_SYMLINKS}
 ### 3c. 目标端 find 计数验证
 
 ```bash
-ssh ubuntu@{DEST_IP} 'FIND_DIRS=$(find {NFS_EXPORT}/test-data -type d | wc -l); FIND_FILES=$(find {NFS_EXPORT}/test-data -type f | wc -l); FIND_LINKS=$(find {NFS_EXPORT}/test-data -type l | wc -l); echo "dest find: dirs=$FIND_DIRS, files=$FIND_FILES, symlinks=$FIND_LINKS"'
+ssh root@{DEST_IP} 'FIND_DIRS=$(find {NFS_EXPORT}/test-data -type d | wc -l); FIND_FILES=$(find {NFS_EXPORT}/test-data -type f | wc -l); FIND_LINKS=$(find {NFS_EXPORT}/test-data -type l | wc -l); echo "dest find: dirs=$FIND_DIRS, files=$FIND_FILES, symlinks=$FIND_LINKS"'
 ```
 
 Expected: `dirs={BASELINE_DIRS}, files={BASELINE_FILES}, symlinks={BASELINE_SYMLINKS}`。
@@ -181,11 +181,11 @@ Expected: `dirs={BASELINE_DIRS}, files={BASELINE_FILES}, symlinks={BASELINE_SYML
 ### 3d. 验证全量 sync 后 ACL 已正确复制到目标端
 
 ```bash
-ssh ubuntu@{SOURCE_IP} 'nfs4_getfacl {NFS_EXPORT}/test-data/d1/d1_1/file1.txt'
+ssh root@{SOURCE_IP} 'nfs4_getfacl {NFS_EXPORT}/test-data/d1/d1_1/file1.txt'
 ```
 
 ```bash
-ssh ubuntu@{DEST_IP} 'nfs4_getfacl {NFS_EXPORT}/test-data/d1/d1_1/file1.txt'
+ssh root@{DEST_IP} 'nfs4_getfacl {NFS_EXPORT}/test-data/d1/d1_1/file1.txt'
 ```
 
 **Verify: 两端 ACL 中的自定义 ACE 完全一致。**
@@ -193,11 +193,11 @@ ssh ubuntu@{DEST_IP} 'nfs4_getfacl {NFS_EXPORT}/test-data/d1/d1_1/file1.txt'
 ### 3e. 验证全量 sync 后 xattr 已正确复制到目标端
 
 ```bash
-ssh ubuntu@{SOURCE_IP} 'getfattr -d {NFS_EXPORT}/test-data/d2/d2_1/file1.txt'
+ssh root@{SOURCE_IP} 'getfattr -d {NFS_EXPORT}/test-data/d2/d2_1/file1.txt'
 ```
 
 ```bash
-ssh ubuntu@{DEST_IP} 'getfattr -d {NFS_EXPORT}/test-data/d2/d2_1/file1.txt'
+ssh root@{DEST_IP} 'getfattr -d {NFS_EXPORT}/test-data/d2/d2_1/file1.txt'
 ```
 
 **Verify: 两端 `user.*` xattr 字段完全一致。**
@@ -211,8 +211,8 @@ ssh ubuntu@{DEST_IP} 'getfattr -d {NFS_EXPORT}/test-data/d2/d2_1/file1.txt'
 使用 nfs-v4-incremental-scan 的变更脚本（包含文件系统变更 + ACL/xattr 修改）：
 
 ```bash
-scp .claude/skills/nfs-v4-incremental-scan/scripts/mutate-nfs4-test-data.sh ubuntu@{SOURCE_IP}:/tmp/mutate-nfs4-test-data.sh
-ssh ubuntu@{SOURCE_IP} 'sudo bash /tmp/mutate-nfs4-test-data.sh'
+scp .claude/skills/nfs-v4-incremental-scan/scripts/mutate-nfs4-test-data.sh root@{SOURCE_IP}:/tmp/mutate-nfs4-test-data.sh
+ssh root@{SOURCE_IP} 'sudo bash /tmp/mutate-nfs4-test-data.sh'
 ```
 
 Expected output (last lines):
@@ -282,7 +282,7 @@ grep -E "ERROR|WARN" target/debug/logs/*/app.log | tail -80
 ### 6a. find 直接计数
 
 ```bash
-ssh ubuntu@{DEST_IP} 'FIND_DIRS=$(find {NFS_EXPORT}/test-data -type d | wc -l); FIND_FILES=$(find {NFS_EXPORT}/test-data -type f | wc -l); FIND_LINKS=$(find {NFS_EXPORT}/test-data -type l | wc -l); echo "dest find: dirs=$FIND_DIRS, files=$FIND_FILES, symlinks=$FIND_LINKS"'
+ssh root@{DEST_IP} 'FIND_DIRS=$(find {NFS_EXPORT}/test-data -type d | wc -l); FIND_FILES=$(find {NFS_EXPORT}/test-data -type f | wc -l); FIND_LINKS=$(find {NFS_EXPORT}/test-data -type l | wc -l); echo "dest find: dirs=$FIND_DIRS, files=$FIND_FILES, symlinks=$FIND_LINKS"'
 ```
 
 Expected: `dirs={POST_MUTATE_DIRS}, files={POST_MUTATE_FILES}, symlinks={POST_MUTATE_SYMLINKS}`。
@@ -316,11 +316,11 @@ false   true    {POST_MUTATE_SYMLINKS}
 对变更脚本中修改过 ACL 的文件，比对源端和目标端：
 
 ```bash
-ssh ubuntu@{SOURCE_IP} 'nfs4_getfacl {NFS_EXPORT}/test-data/d1/d1_1/file1.txt'
+ssh root@{SOURCE_IP} 'nfs4_getfacl {NFS_EXPORT}/test-data/d1/d1_1/file1.txt'
 ```
 
 ```bash
-ssh ubuntu@{DEST_IP} 'nfs4_getfacl {NFS_EXPORT}/test-data/d1/d1_1/file1.txt'
+ssh root@{DEST_IP} 'nfs4_getfacl {NFS_EXPORT}/test-data/d1/d1_1/file1.txt'
 ```
 
 **Verify: 两端 ACL 完全一致（包括增量 sync 中新修改的 ACE）。**
@@ -330,11 +330,11 @@ ssh ubuntu@{DEST_IP} 'nfs4_getfacl {NFS_EXPORT}/test-data/d1/d1_1/file1.txt'
 对变更脚本中修改过 xattr 的文件，比对源端和目标端：
 
 ```bash
-ssh ubuntu@{SOURCE_IP} 'getfattr -d {NFS_EXPORT}/test-data/d2/d2_1/file1.txt'
+ssh root@{SOURCE_IP} 'getfattr -d {NFS_EXPORT}/test-data/d2/d2_1/file1.txt'
 ```
 
 ```bash
-ssh ubuntu@{DEST_IP} 'getfattr -d {NFS_EXPORT}/test-data/d2/d2_1/file1.txt'
+ssh root@{DEST_IP} 'getfattr -d {NFS_EXPORT}/test-data/d2/d2_1/file1.txt'
 ```
 
 **Verify: 两端 `user.*` xattr 字段完全一致（包括增量 sync 中新修改的值）。**

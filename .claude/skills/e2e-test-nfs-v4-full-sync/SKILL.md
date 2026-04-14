@@ -14,7 +14,7 @@ description: >
 
 端到端全量拷贝测试（NFS v4.1 存储）。
 验证完整管线：测试数据创建（含 NFSv4 ACL 和 xattr）→ 源端扫描 → 全量同步（含 ACL/xattr 复制）→ 目标端验证 → integrity-check → 清理。
-`terrasync` 本地运行（使用 `{CONFIG}`），通过网络直接访问 NFSv4.1。
+`datasync` 本地运行（使用 `{CONFIG}`），通过网络直接访问 NFSv4.1。
 测试数据通过 SSH 在远端创建和验证。
 
 **NFSv4.1 full sync 关键特性**：
@@ -28,14 +28,14 @@ description: >
 
 | Name | Value |
 |------|-------|
-| SOURCE_IP | 10.131.9.13 |
-| DEST_IP |  10.131.9.15 |
+| SOURCE_IP | 192.168.50.173 |
+| DEST_IP |  192.168.50.23 |
 | NFS_EXPORT | `/` |
 | SOURCE_URL | `nfs://{SOURCE_IP}{NFS_EXPORT}?version=4.1` |
 | DEST_URL | `nfs://{DEST_IP}{NFS_EXPORT}?version=4.1` |
 | CONFIG | `examples/config.toml` |
-| BINARY | `./target/debug/terrasync` |
-| CLICKHOUSE_HOST | `10.128.133.213:8123` |
+| BINARY | `./target/debug/datasync` |
+| CLICKHOUSE_HOST | `192.168.50.173:8123` |
 | SRC_SCAN_JOB_ID | `nfs-v4-full-sync-src` |
 | SYNC_JOB_ID | `nfs-v4-full-sync` |
 | DST_SCAN_JOB_ID | `nfs-v4-full-sync-dst` |
@@ -66,7 +66,7 @@ ClickHouse 表名：
 ### 0a. 清理源端 NFS 数据（SSH）
 
 ```bash
-ssh ubuntu@{SOURCE_IP} 'sudo rm -rf {NFS_EXPORT}/test-data && echo "source cleaned"'
+ssh root@{SOURCE_IP} 'sudo rm -rf {NFS_EXPORT}/test-data && echo "source cleaned"'
 ```
 
 Expected: `source cleaned`。
@@ -74,7 +74,7 @@ Expected: `source cleaned`。
 ### 0b. 清理目标端 NFS 数据（SSH）
 
 ```bash
-ssh ubuntu@{DEST_IP} 'sudo rm -rf {NFS_EXPORT}/test-data && echo "dest cleaned"'
+ssh root@{DEST_IP} 'sudo rm -rf {NFS_EXPORT}/test-data && echo "dest cleaned"'
 ```
 
 Expected: `dest cleaned`。
@@ -125,7 +125,7 @@ Expected: 无输出（空）。
 ## Step 1: 上传测试脚本（SOURCE_IP）
 
 ```bash
-scp .claude/skills/e2e-test-nfs-v4-full-sync/scripts/setup-nfs4-test-data.sh ubuntu@{SOURCE_IP}:/tmp/setup-nfs4-test-data.sh
+scp .claude/skills/e2e-test-nfs-v4-full-sync/scripts/setup-nfs4-test-data.sh root@{SOURCE_IP}:/tmp/setup-nfs4-test-data.sh
 ```
 
 Expected: 无错误输出，scp 退出码为 0。
@@ -135,7 +135,7 @@ Expected: 无错误输出，scp 退出码为 0。
 ## Step 2: 执行测试脚本创建数据（SOURCE_IP）
 
 ```bash
-ssh ubuntu@{SOURCE_IP} 'sudo bash /tmp/setup-nfs4-test-data.sh'
+ssh root@{SOURCE_IP} 'sudo bash /tmp/setup-nfs4-test-data.sh'
 ```
 
 脚本功能：
@@ -190,7 +190,7 @@ false   true    {EXPECTED_SYMLINKS}
 ### 3c. 验证源端 ACL 设置
 
 ```bash
-ssh ubuntu@{SOURCE_IP} 'nfs4_getfacl {NFS_EXPORT}/test-data/d1/d1_1/file1.txt'
+ssh root@{SOURCE_IP} 'nfs4_getfacl {NFS_EXPORT}/test-data/d1/d1_1/file1.txt'
 ```
 
 Expected: 输出包含自定义 ACE（非纯默认 ACL）。
@@ -198,7 +198,7 @@ Expected: 输出包含自定义 ACE（非纯默认 ACL）。
 ### 3d. 验证源端 xattr 设置
 
 ```bash
-ssh ubuntu@{SOURCE_IP} 'getfattr -d {NFS_EXPORT}/test-data/d2/d2_1/file1.txt'
+ssh root@{SOURCE_IP} 'getfattr -d {NFS_EXPORT}/test-data/d2/d2_1/file1.txt'
 ```
 
 Expected: 输出包含 `user.author`、`user.version` 等 xattr 字段。
@@ -259,7 +259,7 @@ grep -E "ERROR|WARN" target/debug/logs/*/app.log | tail -80
 **注意：必须使用 `sudo`，因为测试数据包含权限受限的目录（mode 0700/0500 等），普通用户无法访问。**
 
 ```bash
-ssh ubuntu@{DEST_IP} 'FIND_DIRS=$(sudo find {NFS_EXPORT}/test-data -type d | wc -l); FIND_FILES=$(sudo find {NFS_EXPORT}/test-data -type f | wc -l); FIND_LINKS=$(sudo find {NFS_EXPORT}/test-data -type l | wc -l); echo "dest find: dirs=$FIND_DIRS, files=$FIND_FILES, symlinks=$FIND_LINKS"'
+ssh root@{DEST_IP} 'FIND_DIRS=$(sudo find {NFS_EXPORT}/test-data -type d | wc -l); FIND_FILES=$(sudo find {NFS_EXPORT}/test-data -type f | wc -l); FIND_LINKS=$(sudo find {NFS_EXPORT}/test-data -type l | wc -l); echo "dest find: dirs=$FIND_DIRS, files=$FIND_FILES, symlinks=$FIND_LINKS"'
 ```
 
 Expected: `dirs={EXPECTED_DIRS}, files={EXPECTED_FILES}, symlinks={EXPECTED_SYMLINKS}`。
@@ -272,12 +272,12 @@ Expected: `dirs={EXPECTED_DIRS}, files={EXPECTED_FILES}, symlinks={EXPECTED_SYML
 
 ```bash
 # 获取源端 ACL
-ssh ubuntu@{SOURCE_IP} 'nfs4_getfacl {NFS_EXPORT}/test-data/d1/d1_1/file1.txt'
+ssh root@{SOURCE_IP} 'nfs4_getfacl {NFS_EXPORT}/test-data/d1/d1_1/file1.txt'
 ```
 
 ```bash
 # 获取目标端 ACL
-ssh ubuntu@{DEST_IP} 'nfs4_getfacl {NFS_EXPORT}/test-data/d1/d1_1/file1.txt'
+ssh root@{DEST_IP} 'nfs4_getfacl {NFS_EXPORT}/test-data/d1/d1_1/file1.txt'
 ```
 
 **Verify: 两端 ACL 输出中的自定义 ACE 完全一致。**
@@ -285,7 +285,7 @@ ssh ubuntu@{DEST_IP} 'nfs4_getfacl {NFS_EXPORT}/test-data/d1/d1_1/file1.txt'
 批量验证 ACL 已被复制（至少有非默认 ACE 的文件数量）：
 
 ```bash
-ssh ubuntu@{DEST_IP} 'ACL_COUNT=0; for f in $(sudo find {NFS_EXPORT}/test-data -type f | head -30); do count=$(nfs4_getfacl "$f" 2>/dev/null | grep -c "^A\|^D\|^U\|^L"); [ "$count" -gt 4 ] && ACL_COUNT=$((ACL_COUNT+1)); done; echo "Files with custom ACL: $ACL_COUNT"'
+ssh root@{DEST_IP} 'ACL_COUNT=0; for f in $(sudo find {NFS_EXPORT}/test-data -type f | head -30); do count=$(nfs4_getfacl "$f" 2>/dev/null | grep -c "^A\|^D\|^U\|^L"); [ "$count" -gt 4 ] && ACL_COUNT=$((ACL_COUNT+1)); done; echo "Files with custom ACL: $ACL_COUNT"'
 ```
 
 Expected: `Files with custom ACL: {ACL_TEST_FILES}`（至少等于源端设置的 ACL 文件数）。
@@ -296,12 +296,12 @@ Expected: `Files with custom ACL: {ACL_TEST_FILES}`（至少等于源端设置�
 
 ```bash
 # 获取源端 xattr
-ssh ubuntu@{SOURCE_IP} 'getfattr -d {NFS_EXPORT}/test-data/d2/d2_1/file1.txt'
+ssh root@{SOURCE_IP} 'getfattr -d {NFS_EXPORT}/test-data/d2/d2_1/file1.txt'
 ```
 
 ```bash
 # 获取目标端 xattr
-ssh ubuntu@{DEST_IP} 'getfattr -d {NFS_EXPORT}/test-data/d2/d2_1/file1.txt'
+ssh root@{DEST_IP} 'getfattr -d {NFS_EXPORT}/test-data/d2/d2_1/file1.txt'
 ```
 
 **Verify: 两端 xattr 输出的 `user.*` 字段完全一致。**
@@ -309,7 +309,7 @@ ssh ubuntu@{DEST_IP} 'getfattr -d {NFS_EXPORT}/test-data/d2/d2_1/file1.txt'
 批量验证 xattr 已被复制：
 
 ```bash
-ssh ubuntu@{DEST_IP} 'XATTR_COUNT=0; for f in $(sudo find {NFS_EXPORT}/test-data -type f | head -30); do count=$(getfattr -d "$f" 2>/dev/null | grep -c "^user\."); [ "$count" -gt 0 ] && XATTR_COUNT=$((XATTR_COUNT+1)); done; echo "Files with xattr: $XATTR_COUNT"'
+ssh root@{DEST_IP} 'XATTR_COUNT=0; for f in $(sudo find {NFS_EXPORT}/test-data -type f | head -30); do count=$(getfattr -d "$f" 2>/dev/null | grep -c "^user\."); [ "$count" -gt 0 ] && XATTR_COUNT=$((XATTR_COUNT+1)); done; echo "Files with xattr: $XATTR_COUNT"'
 ```
 
 Expected: `Files with xattr: {XATTR_TEST_FILES}`（至少等于源端设置 xattr 的文件数）。
@@ -361,8 +361,8 @@ false   true    {EXPECTED_SYMLINKS}
 上传并执行元数据校验脚本，对比 NFS 文件系统实际属性与 ClickHouse 数据库中的记录：
 
 ```bash
-scp .claude/skills/e2e-test-nfs-v4-full-sync/scripts/verify-metadata.sh ubuntu@{DEST_IP}:/tmp/verify-metadata.sh
-ssh ubuntu@{DEST_IP} 'sudo bash /tmp/verify-metadata.sh'
+scp .claude/skills/e2e-test-nfs-v4-full-sync/scripts/verify-metadata.sh root@{DEST_IP}:/tmp/verify-metadata.sh
+ssh root@{DEST_IP} 'sudo bash /tmp/verify-metadata.sh'
 ```
 
 脚本功能：
