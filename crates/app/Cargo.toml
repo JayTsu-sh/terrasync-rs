@@ -1,0 +1,48 @@
+[package]
+name = "app"
+version = "0.1.0"
+authors = ["jay.xu <jay.xu@lenovonetapp.com>"]
+description = "The application core code"
+edition = "2024"
+
+[features]
+duckdb = ["db/duckdb"]
+license = ["dep:licensing"]
+
+[dependencies]
+async-channel = "2"
+async-trait = "0.1.89"
+blake3 = "1.8"
+bytes = "1.11.1"
+dashmap = "6.1.0"
+db = { path = "../db" }
+futures = "0.3.32"
+indicatif = "0.18.4"
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "json"] }
+licensing = { path = "../licensing", optional = true }
+bincode = { version = "2", features = ["serde"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1.44"
+storage_v2 = { path = "../storage_v2" }
+sync-delta = { path = "../sync-delta" }
+thiserror = "2.0.18"
+tokio = { version = "1.51", features = ["full"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+transport = { path = "../transport", features = ["quic"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+utils = { path = "../utils" }
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+serial_test = "3.4.0"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = [
+    "Win32",
+    "Win32_Security",
+    "Win32_System_Threading",
+    "Win32_Foundation",
+] }

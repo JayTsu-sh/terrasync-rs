@@ -1,0 +1,32 @@
+[package]
+name = "cli"
+version = "0.1.0"
+authors = ["jay.xu <jay.xu@lenovonetapp.com>"]
+description = "CLI interface for terrasync"
+edition = "2024"
+
+[features]
+duckdb = ["app/duckdb"]
+license = ["dep:licensing", "app/license"]
+gui = ["dep:web"]
+
+[dependencies]
+app = { path = "../app" }
+licensing = { path = "../licensing", optional = true }
+storage_v2 = { path = "../storage_v2" }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+transport = { path = "../transport", features = ["quic"] }
+web = { path = "../web", optional = true }
+chrono = "0.4.44"
+tracing = "0.1.44"
+thiserror = "2.0.18"
+utils = { path = "../utils" }
+
+[dependencies.clap]
+version = "4.6.0"
+features = ["cargo", "derive"]
+
+[lints]
+workspace = true
+
+[dev-dependencies]

@@ -1,0 +1,58 @@
+[license]
+path = "license.json"     # Path to license file (relative or absolute)
+
+[log]
+# Log file rotation configuration
+max_size = 100           # Maximum size in megabytes of the log file before it gets rotated (default: 100)
+max_backups = 10         # Maximum number of old log files to retain (default: 10)
+level = "info"           # Log level: "debug", "info", "warn", "error" (default: "info")
+enable_json = false      # Enable JSON structured logging to app.json.log (default: false)
+
+[scan]
+# Scan related configuration
+concurrency = 8          # Concurrency threads for scan operation (default: 8)
+include_tags = false     # Include tags of S3 object in scan results (default: false)
+
+[sync]
+# Synchronization related configuration
+is_source_reserved = true  # Reserve the source files when syncing (default: false)
+concurrency = 8            # Concurrency level for migration operations (default: 8)
+
+[integrity_check]
+# Integrity check configuration
+concurrency = 8            # Concurrency level for integrity check operations (default: 8)
+
+[delete]
+# Delete operation configuration
+concurrency = 8            # Concurrency level for delete operations (default: 8)
+
+[database]
+# Database integration configuration
+enabled = true           # Enable Database integration (default: true)
+type = "clickhouse"          # Database type: "duckdb", "clickhouse" (default: "duckdb")
+batch_size = 800000      # Batch size for file entries. Recommended: 800000 for clickhouse and 100000 for duckdb
+
+[database.clickhouse]
+# ClickHouse specific configuration
+dsn = "http://192.168.50.137:8123"  # DSN format: http://host:port
+dial_timeout = 5          # Connection timeout (seconds)
+read_timeout = 30         # Read timeout (seconds)
+database = "default"      # Database name
+username = "default"      # Username
+password = ""             # Password
+
+[database.duckdb]
+# DuckDB specific configuration
+in_memory = false         # Use in-memory database (default: false)
+pool_size = 4             # Connection pool size (default: 4)
+
+#[database.mariadb]
+# MariaDB specific configuration (Lustre fast_scan only)
+#dsn = "mysql://root:@127.0.0.1:3306/terrasync"
+#pool_min = 2              # Min pool connections (default: 2)
+#pool_max = 10             # Max pool connections (default: 10)
+#connect_timeout = 5       # Connection timeout in seconds
+#idle_timeout = 300        # Idle connection timeout in seconds
+#sync_to_clickhouse = false # Enable async sync to ClickHouse
+#sync_interval = 60        # Sync interval in seconds
+

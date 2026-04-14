@@ -1,0 +1,102 @@
+[package]
+name = "datasync-rs"
+version = "0.1.0"
+authors = ["jay.xu <jay.xu@lenovonetapp.com>"]
+edition = "2024"
+repository = "https://github.com/JayTsu-sh/datasync-rs"
+readme = "README.md"
+license = "MIT"
+keywords = ["cli", "starter"]
+description = """
+
+"""
+
+[[bin]]
+name = "datasync"
+path = "src/main.rs"
+
+[workspace]
+members = [
+    "crates/utils",
+    "crates/cli",
+    "crates/app",
+    "crates/db",
+    "crates/storage_v2",
+    "crates/licensing",
+    "crates/web",
+    "crates/transport",
+    "crates/sync-delta",
+]
+
+[workspace.lints.rust]
+# 明确标记 unsafe 代码（NFS/Lustre FFI 处可局部 #[allow(unsafe_code)] 豁免）
+unsafe_code = "warn"
+
+[workspace.lints.clippy]
+# 整体启用 pedantic，再针对项目特点豁免噪声规则
+pedantic = { level = "warn", priority = -1 }
+
+# ── pedantic 中对本项目干扰过大的规则 ─────────────────────────────────────────
+module_name_repetitions = "allow"     # StorageError/AppError 等命名是 Rust 惯例
+must_use_candidate = "allow"          # 异步函数 + 内部 API 噪声过多
+missing_errors_doc = "allow"          # 内部 crate 不强制文档注释
+missing_panics_doc = "allow"
+wildcard_imports = "allow"            # prelude 模块需要 *
+too_many_lines = "allow"              # 异步流水线函数天然较长
+cast_possible_truncation = "allow"    # 文件大小/偏移量计算中常见
+cast_possible_wrap = "allow"
+cast_sign_loss = "allow"
+cast_precision_loss = "allow"
+significant_drop_tightening = "allow" # 异步上下文中锁生命周期管理复杂
+
+# ── 强制禁止（与 CLAUDE.md 规范一致） ─────────────────────────────────────────
+unwrap_used = "deny"
+expect_used = "deny"
+
+# ── 代码卫生警告 ───────────────────────────────────────────────────────────────
+dbg_macro = "warn"
+todo = "warn"
+unimplemented = "warn"
+
+[features]
+# 默认特性（运行 `cargo build` 时不指定任何特性时启用）
+default = ["basic"]
+
+# 基本功能（始终包含）
+basic = []
+
+# Profileing特性
+profiling = []
+
+# DuckDB特性
+duckdb = ["cli/duckdb"]
+
+# License特性
+license = ["cli/license"]
+
+# GUI 特性
+gui = ["cli/gui"]
+
+[dependencies]
+cli = { path = "crates/cli" }
+console-subscriber = "0.5.0"
+mimalloc = "0.1"
+tokio = { version = "1.51", features = ["full"] }
+
+[dev-dependencies]
+assert_cmd = "2.2.0"
+predicates = "3.1.4"
+serial_test = "3.4.0"
+
+[patch.crates-io]
+nfs-rs = { git = "https://github.com/JayTsu-sh/nfs-rs.git" }
+smb = { git = "https://github.com/JayTsu-sh/smb-rs.git" }
+
+[lints]
+workspace = true
+
+[profile.release]
+lto = "thin"
+opt-level = "s"
+strip = "symbols"
+incremental = true

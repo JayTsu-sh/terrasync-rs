@@ -1,0 +1,10 @@
+/target/
+**/*.rs.bk
+.cache
+.git/
+.github/
+.claude/
+docker/
+jobs/
+*.md
+LICENSE

@@ -1,0 +1,27 @@
+# Compatibility:
+edition = "2024"
+
+# Comments:
+normalize_comments = true
+wrap_comments = false
+comment_width = 100      # small excess is okay but prefer 80
+max_width = 120
+
+# Arguments:
+use_small_heuristics = "Default"
+fn_params_layout = "Compressed"
+overflow_delimited_expr = true
+where_single_line = true
+
+# Misc:
+inline_attribute_width = 80
+blank_lines_upper_bound = 2
+reorder_impl_items = true
+
+# Ignored files:
+ignore = []
+
+# 强制将 import 语句合并为一行，并按模块分组
+group_imports = "StdExternalCrate"
+# 指定导入分组的粒度
+imports_granularity = "Module"

@@ -1,0 +1,32 @@
+[package]
+name = "utils"
+version = "1.0.0"
+authors = ["Jay Xu <jay.xu@lenovonetapp.com>"]
+description = "Various utilities and functionalities"
+edition = "2024"
+
+[features]
+nightly = []
+termlog = []
+syslog = []
+journald = []
+
+[dependencies]
+async-channel = "2"
+config = "0.15.22"
+hex = "0.4.3"
+log = "0.4.29"
+rand = "0.10.1"
+regex = "1.12.3"
+rolling-file = "0.2"
+rust-crypto = "0.2.36"
+serde = { version = "1.0.228", features = ["derive"] }
+thiserror = "2.0.18"
+tokio = { version = "1", features = ["sync"] }
+tracing = "0.1.44"
+tracing-appender = "0.2.4"
+tracing-log = "0.2.0"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter", "json", "std"] }
+
+[lints]
+workspace = true

@@ -1,0 +1,68 @@
+version: '3.8'
+
+services:
+  clickhouse:
+    image: clickhouse/clickhouse-server
+    container_name: clickhouse
+    ports:
+      - "8123:8123"
+      - "9000:9000"
+    volumes:
+      - clickhouse_data:/var/lib/clickhouse
+
+  zookeeper:
+    image: bitnami/zookeeper
+    container_name: zookeeper
+    ports:
+      - "2181:2181"
+    environment:
+      - ALLOW_ANONYMOUS_LOGIN=yes
+
+  kafka:
+    image: bitnami/kafka
+    container_name: kafka
+    ports:
+      - "9092:9092"
+    environment:
+      - KAFKA_CFG_ZOOKEEPER_CONNECT=zookeeper:2181
+      - KAFKA_CFG_LISTENERS=PLAINTEXT://:9092
+      - KAFKA_CFG_ADVERTISED_LISTENERS=PLAINTEXT://localhost:9092
+      - ALLOW_PLAINTEXT_LISTENER=yes
+    depends_on:
+      - zookeeper
+
+  nfs-server:
+    image: erichough/nfs-server
+    container_name: nfs-server
+    privileged: true
+    ports:
+      - "111:111/tcp"
+      - "111:111/udp"
+      - "2049:2049/tcp"
+      - "2049:2049/udp"
+      - "32765:32765/tcp"
+      - "32765:32765/udp"
+      - "32767:32767/tcp"
+      - "32767:32767/udp"
+    volumes:
+      - nfs_share1:/nfs-share1
+      - nfs_share2:/nfs-share2
+    environment:
+      - NFS_EXPORT_0=/nfs-share1 *(rw,sync,no_subtree_check,no_root_squash,insecure,fsid=1)
+      - NFS_EXPORT_1=/nfs-share2 *(rw,sync,no_subtree_check,no_root_squash,insecure,fsid=2)
+    cap_add:
+      - SYS_ADMIN
+
+  rustfs:
+    image: rustfs/rustfs
+    container_name: rustfs
+    ports:
+      - "19000:9000"
+      - "19001:9001"
+    environment:
+      - RUSTFS_ACCESS_KEY=admin
+      - RUSTFS_SECRET_KEY=admin123456
+volumes:
+  clickhouse_data:
+  nfs_share1:
+  nfs_share2:

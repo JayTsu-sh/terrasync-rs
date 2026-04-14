@@ -1,0 +1,39 @@
+[log]
+max_size = 100           # Maximum size in megabytes of the log file before it gets rotated (default: 100)
+max_backups = 10         # Maximum number of old log files to retain (default: 10)
+level = "info"           # Log level: "debug", "info", "warn", "error" (default: "info")
+enable_json = false      # Enable JSON structured logging to app.json.log (default: false)
+
+[scan]
+concurrency = 8          # Concurrency threads for scan operation (default: 8)
+include_tags = true     # Include tags of S3 object in scan results (default: false)
+
+[sync]
+is_source_reserved = true   # Force overwrite existing files (default: false)
+concurrency = 8             # Concurrency level for migration operations (default: 8)
+
+[integrity_check]
+concurrency = 8             # Concurrency level for integrity check operations (default: 8)
+
+[delete]
+concurrency = 8             # Concurrency level for delete operations (default: 8)
+
+[database]
+enabled = true           # Enable Database integration
+type = "clickhouse"       # Database type: "duckdb", "clickhouse"
+batch_size = 800000       # Batch size for file entries. Recommended: 800000 for clickhouse and 100000 for duckdb
+
+[database.clickhouse]
+# ClickHouse specific configuration
+dsn = "http://10.128.133.213:8123"  # DSN format: http://host:port
+dial_timeout = 5
+read_timeout = 30
+database = "default"
+username = "default"
+password = ""
+
+[database.duckdb]
+# DuckDB specific configuration
+in_memory = false    # Use in-memory database
+pool_size = 4       # Connection pool size
+
