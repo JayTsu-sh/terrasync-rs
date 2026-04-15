@@ -6,6 +6,7 @@ use std::time::Duration;
 
 // 外部crate
 use bytes::Bytes;
+use dashmap::DashMap;
 use futures::StreamExt;
 use lazy_static::lazy_static;
 use moka::sync::Cache;
@@ -93,12 +94,28 @@ lazy_static! {
             .expire_after(DepthAwareExpiry)
             .build()
     };
+    /// nfs_url → server_id 映射表。
+    /// 相同 NFS 端点的所有 worker 共享同一 server_id，从而共享 GLOBAL_CACHE 条目，
+    /// 消除重复 LOOKUP RPC。
+    static ref SERVER_ID_REGISTRY: DashMap<String, u64> = DashMap::new();
 }
 
-/// 全局 mount 实例计数器，确保每个 NFSStorage 拥有唯一 ID。
-/// 不同 NFS 服务器即使 root_fh 字节相同（如 fsid=0 配置），
-/// 其 GLOBAL_CACHE key 也因 mount_id 不同而互不冲突。
-static NEXT_MOUNT_ID: AtomicU64 = AtomicU64::new(1);
+/// 全局 server ID 计数器，每个不同的 NFS 端点分配一个唯一 ID。
+static NEXT_SERVER_ID: AtomicU64 = AtomicU64::new(1);
+
+/// 根据 nfs_url 获取或分配 server_id。
+/// 同一端点的并发调用保证返回相同 ID（DashMap entry API 原子插入）。
+fn get_or_assign_server_id(nfs_url: &str) -> u64 {
+    if let Some(id) = SERVER_ID_REGISTRY.get(nfs_url) {
+        return *id;
+    }
+    // DashMap::entry() 持有 shard 写锁，保证只有一个 closure 被执行，
+    // 计数器仅自增一次。上方 get() 是快速路径（read lock），
+    // 在 entry 已存在时避免申请写锁，降低热路径竞争。
+    *SERVER_ID_REGISTRY
+        .entry(nfs_url.to_string())
+        .or_insert_with(|| NEXT_SERVER_ID.fetch_add(1, Ordering::Relaxed))
+}
 
 /// NFS STALE handle 重试上限。并发 mkdir/create 时 file handle 可能短暂失效，
 /// 单次重试不足以覆盖高并发场景，故允许最多 3 次重试。
@@ -277,9 +294,11 @@ pub struct NFSStorage {
     refresh_generation: Arc<AtomicU64>,
     /// 序列化 refresh 操作，确保同一时刻只有一个 worker 执行实际刷新 RPC
     refresh_lock: Arc<tokio::sync::Mutex<()>>,
-    /// 每个 mount 实例的唯一 ID，用于区分 GLOBAL_CACHE 中不同服务器的条目。
-    mount_id: u64,
-    /// 预计算的 cache key 前缀：mount_id(8B) + root_fh。
+    /// NFS 端点的唯一 ID（按 nfs_url 分配，同一端点的所有 worker 共享）。
+    /// 用于构造 GLOBAL_CACHE key 前缀，确保不同服务器的条目互不冲突，
+    /// 同时允许同一端点的 worker 复用彼此缓存，消除重复 LOOKUP RPC。
+    server_id: u64,
+    /// 预计算的 cache key 前缀：server_id(8B) + root_fh。
     /// 仅在构造和 refresh_root_fh 时更新，避免热路径每次分配 BytesMut。
     cache_root_fh: Arc<std::sync::RwLock<Bytes>>,
 }
@@ -290,10 +309,10 @@ fn root_fh_lock_err() -> StorageError {
     StorageError::OperationError("root_fh lock poisoned".to_string())
 }
 
-/// 构建 cache key 前缀：mount_id(8B) + raw_fh
-fn build_cache_root_fh(mount_id: u64, raw_fh: &Bytes) -> Bytes {
+/// 构建 cache key 前缀：server_id(8B) + raw_fh
+fn build_cache_root_fh(server_id: u64, raw_fh: &Bytes) -> Bytes {
     let mut buf = bytes::BytesMut::with_capacity(8 + raw_fh.len());
-    buf.extend_from_slice(&mount_id.to_be_bytes());
+    buf.extend_from_slice(&server_id.to_be_bytes());
     buf.extend_from_slice(raw_fh);
     buf.freeze()
 }
@@ -424,8 +443,8 @@ impl NFSStorage {
             rsize, wsize, effective_block_size
         );
 
-        let mid = NEXT_MOUNT_ID.fetch_add(1, Ordering::Relaxed);
-        let cache_fh = build_cache_root_fh(mid, &mount_fh);
+        let sid = get_or_assign_server_id(&nfs_url);
+        let cache_fh = build_cache_root_fh(sid, &mount_fh);
         let storage = NFSStorage {
             root_fh: Arc::new(std::sync::RwLock::new(mount_fh)),
             mount: Arc::new(mount),
@@ -435,7 +454,7 @@ impl NFSStorage {
             },
             refresh_generation: Arc::new(AtomicU64::new(0)),
             refresh_lock: Arc::new(tokio::sync::Mutex::new(())),
-            mount_id: mid,
+            server_id: sid,
             cache_root_fh: Arc::new(std::sync::RwLock::new(cache_fh)),
         };
 
@@ -478,13 +497,13 @@ impl NFSStorage {
         Ok(storage)
     }
 
-    /// 返回用于 GLOBAL_CACHE key 的标识符：mount_id(8B) + root_fh。
+    /// 返回用于 GLOBAL_CACHE key 的标识符：server_id(8B) + root_fh。
     /// 预计算值，clone 仅增加引用计数。
     fn get_root_fh(&self) -> Bytes {
         self.cache_root_fh.read().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
-    /// 返回真实的 NFS root file handle（用于 RPC 操作，不含 mount_id 前缀）
+    /// 返回真实的 NFS root file handle（用于 RPC 操作，不含 server_id 前缀）
     fn rpc_root_fh(&self) -> Bytes {
         self.root_fh.read().unwrap_or_else(|e| e.into_inner()).clone()
     }
@@ -504,7 +523,11 @@ impl NFSStorage {
             }
         }
 
-        let cache_fh = build_cache_root_fh(self.mount_id, &current_fh);
+        // 注意：刷新 root_fh 后本实例的 cache_root_fh 前缀随之变化。
+        // 与同 server_id 的其他 worker 暂时失去缓存共享，直到它们也完成 FH 刷新。
+        // 这是预期行为：root_fh 变化意味着服务器视角已改变，旧缓存条目需重建。
+        // 旧条目不会造成错误，仅在 TTI 到期前占用少量内存。
+        let cache_fh = build_cache_root_fh(self.server_id, &current_fh);
         *self.root_fh.write().map_err(|_| root_fh_lock_err())? = current_fh;
         *self.cache_root_fh.write().map_err(|_| root_fh_lock_err())? = cache_fh;
         info!("root_fh refreshed successfully");
@@ -562,7 +585,7 @@ impl NFSStorage {
             });
         }
 
-        // 从根目录开始（RPC 用真实 FH，缓存 key 用含 mount_id 的标识符）
+        // 从根目录开始（RPC 用真实 FH，缓存 key 用含 server_id 的标识符）
         let mut current_fh = self.rpc_root_fh();
         let mut start_index = 0;
 

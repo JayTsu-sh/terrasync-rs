@@ -100,3 +100,10 @@ lto = "thin"
 opt-level = "s"
 strip = "symbols"
 incremental = true
+
+# 火焰图专用 profile: release 级优化 + 保留调试符号
+[profile.profiling]
+inherits = "release"
+debug = 2
+strip = "none"
+lto = "thin"

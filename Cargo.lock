@@ -6257,6 +6257,7 @@ dependencies = [
  "bytes 1.11.1",
  "chrono",
  "clap",
+ "dashmap",
  "filetime",
  "futures",
  "glob",
