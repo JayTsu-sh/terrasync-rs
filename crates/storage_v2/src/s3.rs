@@ -1,5 +1,6 @@
 // 标准库
 use std::collections::{HashMap, VecDeque};
+use std::fmt;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -17,11 +18,25 @@ use aws_sdk_s3::primitives::DateTime;
 use aws_sdk_s3::types::{
     BucketVersioningStatus, CompletedPart, Delete, DeleteMarkerEntry, ObjectIdentifier, ObjectVersion,
 };
+use aws_smithy_runtime_api::client::http::{
+    HttpConnector as SdkHttpConnector, HttpConnectorFuture, SharedHttpClient, SharedHttpConnector, http_client_fn,
+};
+use aws_smithy_runtime_api::client::orchestrator::{HttpRequest as SdkHttpRequest, HttpResponse as SdkHttpResponse};
+use aws_smithy_runtime_api::client::result::ConnectorError;
+use aws_smithy_types::body::SdkBody;
 use aws_types::region::Region;
 use bytes::Bytes;
+use hyper_rustls::{HttpsConnector, HttpsConnectorBuilder};
+use hyper_util::client::legacy::Client as HyperLegacyClient;
+use hyper_util::client::legacy::connect::HttpConnector as HyperHttpConnector;
+use hyper_util::rt::TokioExecutor;
+use rustls::ClientConfig as RustlsClientConfig;
+use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
+use rustls::{DigitallySignedStruct, SignatureScheme};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, mpsc};
-use tracing::{debug, error, trace};
+use tracing::{debug, error, trace, warn};
 use url::Url;
 
 use crate::checksum::{ConsistencyCheck, HashCalculator, create_hash_calculator};
@@ -84,18 +99,21 @@ fn s3_http_scheme(scheme_str: &str) -> Result<&'static str> {
 }
 
 /// 解析不含 bucket 的 S3 端点 URL：`s3://ak:sk@host:port` 或 `s3+https://ak:sk@host:port`
-/// 返回 (access_key, secret_key, endpoint)
-fn parse_s3_endpoint_url(url: &str) -> Result<(String, String, String)> {
+/// 返回 (access_key, secret_key, endpoint, tls_skip_verify)
+fn parse_s3_endpoint_url(url: &str) -> Result<(String, String, String, bool)> {
     let (scheme_str, access_key, secret_key, host_and_port) = extract_s3_credentials(url)?;
     let http_scheme = s3_http_scheme(scheme_str)?;
+
+    // s3+https scheme 即表示跳过 TLS 证书验证（用于自签名/私有 CA 部署）
+    let tls_skip_verify = http_scheme == "https";
     let endpoint = format!("{}://{}", http_scheme, host_and_port.trim_end_matches('/'));
-    Ok((access_key, secret_key, endpoint))
+    Ok((access_key, secret_key, endpoint, tls_skip_verify))
 }
 
 // 使用url库解析S3 URL格式: s3://access_key:secret_key@bucket.host:port/prefix, s3+https://access_key:secret_key@bucket.host:port/prefix，或s3+hcp://access_key:secret_key@bucket.host:port/prefix
 // 注意：secret_key 可能包含 `+`、`/` 等特殊字符（Base64 编码），直接传给 Url::parse 会导致解析错误，
 // 因此先手动提取凭据，再用占位凭据构建安全 URL 交给 url crate 解析 host/port/path。
-fn parse_s3_url(url: &str) -> Result<(String, String, String, String, String, String, StorageType)> {
+fn parse_s3_url(url: &str) -> Result<(String, String, String, String, String, String, StorageType, bool)> {
     let (scheme_str, access_key, secret_key, host_and_path) = extract_s3_credentials(url)?;
 
     // 用占位凭据构建安全 URL，让 url crate 解析 host/port/path
@@ -114,6 +132,9 @@ fn parse_s3_url(url: &str) -> Result<(String, String, String, String, String, St
             ));
         }
     };
+
+    // s3+https scheme 即表示跳过 TLS 证书验证（用于自签名/私有 CA 部署）
+    let tls_skip_verify = http_scheme == "https";
 
     // 获取主机名
     let host = parsed_url
@@ -162,7 +183,104 @@ fn parse_s3_url(url: &str) -> Result<(String, String, String, String, String, St
         prefix,
         host_only,
         storage_type,
+        tls_skip_verify,
     ))
+}
+
+/// TLS 证书验证跳过器（用于自签名/私有 CA 证书场景，通过 s3+https:// scheme 隐式启用）
+#[derive(Debug)]
+struct NoVerifier;
+
+impl ServerCertVerifier for NoVerifier {
+    fn verify_server_cert(
+        &self, _end_entity: &CertificateDer<'_>, _intermediates: &[CertificateDer<'_>], _server_name: &ServerName<'_>,
+        _ocsp_response: &[u8], _now: UnixTime,
+    ) -> std::result::Result<ServerCertVerified, rustls::Error> {
+        Ok(ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self, _message: &[u8], _cert: &CertificateDer<'_>, _dss: &DigitallySignedStruct,
+    ) -> std::result::Result<HandshakeSignatureValid, rustls::Error> {
+        Ok(HandshakeSignatureValid::assertion())
+    }
+
+    fn verify_tls13_signature(
+        &self, _message: &[u8], _cert: &CertificateDer<'_>, _dss: &DigitallySignedStruct,
+    ) -> std::result::Result<HandshakeSignatureValid, rustls::Error> {
+        Ok(HandshakeSignatureValid::assertion())
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        // 仅列出安全的签名方案，排除已废弃的 SHA-1 系列
+        vec![
+            SignatureScheme::RSA_PKCS1_SHA256,
+            SignatureScheme::ECDSA_NISTP256_SHA256,
+            SignatureScheme::RSA_PKCS1_SHA384,
+            SignatureScheme::ECDSA_NISTP384_SHA384,
+            SignatureScheme::RSA_PKCS1_SHA512,
+            SignatureScheme::ECDSA_NISTP521_SHA512,
+            SignatureScheme::RSA_PSS_SHA256,
+            SignatureScheme::RSA_PSS_SHA384,
+            SignatureScheme::RSA_PSS_SHA512,
+            SignatureScheme::ED25519,
+            SignatureScheme::ED448,
+        ]
+    }
+}
+
+/// 跳过 TLS 验证的 SDK HTTP 连接器，包装 hyper-rustls 客户端
+#[derive(Clone)]
+struct SkipVerifyConnector {
+    inner: Arc<HyperLegacyClient<HttpsConnector<HyperHttpConnector>, SdkBody>>,
+}
+
+impl fmt::Debug for SkipVerifyConnector {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SkipVerifyConnector").finish_non_exhaustive()
+    }
+}
+
+impl SdkHttpConnector for SkipVerifyConnector {
+    fn call(&self, request: SdkHttpRequest) -> HttpConnectorFuture {
+        let client = self.inner.clone();
+        HttpConnectorFuture::new(async move {
+            let req_1x = request
+                .try_into_http1x()
+                .map_err(|e| ConnectorError::other(Box::new(e) as _, None))?;
+            let response = client
+                .request(req_1x)
+                .await
+                .map_err(|e| ConnectorError::io(Box::new(e) as _))?;
+            SdkHttpResponse::try_from(response.map(SdkBody::from_body_1_x))
+                .map_err(|e| ConnectorError::other(Box::new(e) as _, None))
+        })
+    }
+}
+
+/// 构建跳过 TLS 证书验证的 AWS SDK HTTP 客户端（s3+https:// scheme 时使用）
+fn build_skip_verify_http_client() -> Result<SharedHttpClient> {
+    // SECURITY NOTE: dangerous() 仅在用户使用 s3+https:// scheme 时调用，
+    // 跳过证书验证仅适用于受信任的私有环境（如 MinIO 自签名证书部署）
+    let tls_config = RustlsClientConfig::builder()
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(NoVerifier))
+        .with_no_client_auth();
+
+    let connector = HttpsConnectorBuilder::new()
+        .with_tls_config(tls_config)
+        .https_or_http()
+        .enable_http1()
+        .enable_http2()
+        .build();
+
+    let hyper_client: Arc<HyperLegacyClient<HttpsConnector<HyperHttpConnector>, SdkBody>> =
+        Arc::new(HyperLegacyClient::builder(TokioExecutor::new()).build(connector));
+    let skip_connector = SkipVerifyConnector { inner: hyper_client };
+
+    Ok(http_client_fn(move |_settings, _components| {
+        SharedHttpConnector::new(skip_connector.clone())
+    }))
 }
 
 const DEFAULT_BLOCK_SIZE: u64 = 5 * 1024 * 1024; // 5MiB
@@ -247,13 +365,13 @@ impl S3Storage {
     /// - `Ok(Vec<S3BucketInfo>)`：查询成功，返回桶列表
     /// - `Err(StorageError)`：查询失败，返回错误信息
     pub async fn list_buckets(url: &str) -> Result<Vec<S3BucketInfo>> {
-        let (access_key, secret_key, endpoint) = parse_s3_endpoint_url(url)?;
+        let (access_key, secret_key, endpoint, tls_skip_verify) = parse_s3_endpoint_url(url)?;
 
         let region = "us-east-1";
         let credentials = Credentials::new(&access_key, &secret_key, None, None, "s3-list-buckets");
         let credentials_provider = SharedCredentialsProvider::new(credentials);
 
-        let sdk_config = SdkConfig::builder()
+        let mut sdk_builder = SdkConfig::builder()
             .behavior_version(BehaviorVersion::latest())
             .region(Region::new(region.to_string()))
             .endpoint_url(endpoint)
@@ -264,8 +382,12 @@ impl S3Storage {
                     .operation_timeout(std::time::Duration::from_secs(30))
                     .read_timeout(std::time::Duration::from_secs(20))
                     .build(),
-            )
-            .build();
+            );
+        if tls_skip_verify {
+            warn!("S3 list_buckets: 使用 s3+https scheme，TLS 证书验证已跳过，仅用于受信任的私有环境");
+            sdk_builder = sdk_builder.http_client(build_skip_verify_http_client()?);
+        }
+        let sdk_config = sdk_builder.build();
 
         let client = Client::from_conf(
             aws_sdk_s3::config::Builder::from(&sdk_config)
@@ -295,7 +417,8 @@ impl S3Storage {
 
     pub async fn new(url: &str, block_size: Option<u64>) -> Result<Self> {
         // 解析URL
-        let (access_key, secret_key, bucket_name, endpoint, prefix, host, storage_type) = parse_s3_url(url)?;
+        let (access_key, secret_key, bucket_name, endpoint, prefix, host, storage_type, tls_skip_verify) =
+            parse_s3_url(url)?;
 
         let region = "us-east-1"; // MinIO 默认区域
 
@@ -313,7 +436,7 @@ impl S3Storage {
         let credentials_provider = SharedCredentialsProvider::new(credentials);
 
         // 构建 SDK 配置，增加超时配置以提高HTTPS连接稳定性
-        let sdk_config = SdkConfig::builder()
+        let mut sdk_builder = SdkConfig::builder()
             .behavior_version(BehaviorVersion::latest())
             .region(Region::new(region.to_string()))
             .endpoint_url(endpoint.clone())
@@ -325,8 +448,12 @@ impl S3Storage {
                     .operation_timeout(std::time::Duration::from_secs(30))
                     .read_timeout(std::time::Duration::from_secs(20))
                     .build(),
-            )
-            .build();
+            );
+        if tls_skip_verify {
+            warn!("S3 Storage::new: 使用 s3+https scheme，TLS 证书验证已跳过，仅用于受信任的私有环境");
+            sdk_builder = sdk_builder.http_client(build_skip_verify_http_client()?);
+        }
+        let sdk_config = sdk_builder.build();
 
         // 创建 S3 客户端，强制使用路径样式以支持 FQDN 和自定义域名
         // 禁用自动 checksum 计算（WhenRequired），避免 SDK 对 UploadPart 等操作
@@ -2745,7 +2872,7 @@ mod tests {
     fn test_parse_s3_url_special_chars_in_secret_key() {
         // SK 包含 + 和 /（Base64 编码常见字符）
         let url = "s3://X9HENFMKAC41MT11J14H:AsxLb0dEhjxXIlKfVnCSVhM+hjO80rbhRmPLp/UK@bucket.192.168.3.210:10444";
-        let (ak, sk, bucket, endpoint, prefix, host, storage_type) = parse_s3_url(url).unwrap();
+        let (ak, sk, bucket, endpoint, prefix, host, storage_type, _tls_skip) = parse_s3_url(url).unwrap();
         assert_eq!(ak, "X9HENFMKAC41MT11J14H");
         assert_eq!(sk, "AsxLb0dEhjxXIlKfVnCSVhM+hjO80rbhRmPLp/UK");
         assert_eq!(bucket, "bucket");
@@ -2758,7 +2885,7 @@ mod tests {
     #[test]
     fn test_parse_s3_url_normal() {
         let url = "s3://myak:mysk@mybucket.minio.example.com:9000/data/prefix";
-        let (ak, sk, bucket, endpoint, prefix, host, storage_type) = parse_s3_url(url).unwrap();
+        let (ak, sk, bucket, endpoint, prefix, host, storage_type, _tls_skip) = parse_s3_url(url).unwrap();
         assert_eq!(ak, "myak");
         assert_eq!(sk, "mysk");
         assert_eq!(bucket, "mybucket");
@@ -2771,7 +2898,7 @@ mod tests {
     #[test]
     fn test_parse_s3_url_https() {
         let url = "s3+https://ak:sk@bucket.host.com:443/prefix";
-        let (ak, sk, bucket, endpoint, _prefix, host, storage_type) = parse_s3_url(url).unwrap();
+        let (ak, sk, bucket, endpoint, _prefix, host, storage_type, _) = parse_s3_url(url).unwrap();
         assert_eq!(ak, "ak");
         assert_eq!(sk, "sk");
         assert_eq!(bucket, "bucket");
@@ -2783,7 +2910,7 @@ mod tests {
     #[test]
     fn test_parse_s3_url_no_prefix() {
         let url = "s3://ak:sk@bucket.host.com:9000";
-        let (ak, sk, bucket, endpoint, prefix, host, _) = parse_s3_url(url).unwrap();
+        let (ak, sk, bucket, endpoint, prefix, host, _, _) = parse_s3_url(url).unwrap();
         assert_eq!(ak, "ak");
         assert_eq!(sk, "sk");
         assert_eq!(bucket, "bucket");
@@ -2807,15 +2934,50 @@ mod tests {
     #[test]
     fn test_parse_s3_url_deep_prefix() {
         let url = "s3://ak:sk@bucket.host.com:9000/a/b/c";
-        let (.., prefix, _, _) = parse_s3_url(url).unwrap();
+        let (.., prefix, _, _, _) = parse_s3_url(url).unwrap();
         assert_eq!(prefix, "a/b/c/");
     }
 
     #[test]
     fn test_parse_s3_url_prefix_trailing_slash() {
         let url = "s3://ak:sk@bucket.host.com:9000/prefix/";
-        let (.., prefix, _, _) = parse_s3_url(url).unwrap();
+        let (.., prefix, _, _, _) = parse_s3_url(url).unwrap();
         assert_eq!(prefix, "prefix/");
+    }
+
+    // --- tls_skip_verify 解析测试（s3+https scheme 自动跳过 TLS 验证）---
+
+    #[test]
+    fn test_parse_s3_url_https_skips_tls() {
+        // s3+https scheme 自动启用跳过验证
+        let url = "s3+https://ak:sk@bucket.host.com:443/prefix";
+        let (.., tls_skip) = parse_s3_url(url).unwrap();
+        assert!(tls_skip);
+    }
+
+    #[test]
+    fn test_parse_s3_url_http_no_tls_skip() {
+        // s3:// (http) 不跳过验证
+        let url = "s3://ak:sk@bucket.host.com:9000/prefix";
+        let (.., tls_skip) = parse_s3_url(url).unwrap();
+        assert!(!tls_skip);
+    }
+
+    #[test]
+    fn test_parse_s3_endpoint_url_https_skips_tls() {
+        // s3+https scheme 自动启用跳过验证
+        let url = "s3+https://ak:sk@host.com:9000";
+        let (_, _, endpoint, tls_skip) = parse_s3_endpoint_url(url).unwrap();
+        assert!(tls_skip);
+        assert!(endpoint.starts_with("https://"));
+    }
+
+    #[test]
+    fn test_parse_s3_endpoint_url_http_no_tls_skip() {
+        // s3:// (http) 不跳过验证
+        let url = "s3://ak:sk@host.com:9000";
+        let (_, _, _, tls_skip) = parse_s3_endpoint_url(url).unwrap();
+        assert!(!tls_skip);
     }
 
     // --- 构造测试用 S3Storage（不连接实际 S3 服务） ---
