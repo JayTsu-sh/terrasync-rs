@@ -3088,7 +3088,7 @@ mod tests {
     #[test]
     fn test_get_file_info_with_extension() {
         let storage = make_test_storage(None);
-        let (name, ext) = storage.get_file_info("dir/file.txt");
+        let (name, ext) = S3Storage::get_file_info("dir/file.txt");
         assert_eq!(name, "file.txt");
         assert_eq!(ext, Some("txt".to_string()));
     }
@@ -3096,7 +3096,7 @@ mod tests {
     #[test]
     fn test_get_file_info_without_extension() {
         let storage = make_test_storage(None);
-        let (name, ext) = storage.get_file_info("dir/file");
+        let (name, ext) = S3Storage::get_file_info("dir/file");
         assert_eq!(name, "file");
         assert_eq!(ext, None);
     }
@@ -3104,7 +3104,7 @@ mod tests {
     #[test]
     fn test_get_file_info_compound_extension() {
         let storage = make_test_storage(None);
-        let (name, ext) = storage.get_file_info("file.tar.gz");
+        let (name, ext) = S3Storage::get_file_info("file.tar.gz");
         assert_eq!(name, "file.tar.gz");
         assert_eq!(ext, Some("gz".to_string()));
     }
@@ -3112,7 +3112,7 @@ mod tests {
     #[test]
     fn test_get_file_info_root_level() {
         let storage = make_test_storage(None);
-        let (name, ext) = storage.get_file_info("readme.md");
+        let (name, ext) = S3Storage::get_file_info("readme.md");
         assert_eq!(name, "readme.md");
         assert_eq!(ext, Some("md".to_string()));
     }

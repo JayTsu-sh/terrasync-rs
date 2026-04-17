@@ -14,7 +14,7 @@ description: >
 
 端到端全量拷贝测试（NFS v3 存储）。
 验证完整管线：测试数据创建 → 源端扫描 → 全量同步 → 目标端验证 → integrity-check → 清理。
-`datasync` 本地运行（使用 `{CONFIG}`），通过网络直接访问 NFSv3。
+`terrasync` 本地运行（使用 `{CONFIG}`），通过网络直接访问 NFSv3。
 测试数据通过 SSH 在远端创建和验证。
 
 ## Constants
@@ -27,7 +27,7 @@ description: >
 | SOURCE_URL | `nfs://{SOURCE_IP}{NFS_EXPORT}` |
 | DEST_URL | `nfs://{DEST_IP}{NFS_EXPORT}` |
 | CONFIG | `examples/config.toml` |
-| BINARY | `./target/debug/datasync` |
+| BINARY | `./target/debug/terrasync` |
 | CLICKHOUSE_HOST | `192.168.50.173:8123` |
 | SYNC_JOB_ID | `nfs-v3-full-sync` |
 | EXPECTED_DIRS | 113 |

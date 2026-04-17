@@ -13,7 +13,7 @@ description: >
 
 端到端增量拷贝测试（NFS v4.1 存储）。
 验证完整管线：全量 sync 建基线（含 ACL/xattr）→ 变更源端数据（含 ACL/xattr 变更）→ 增量 sync 检测并同步变更 → 目标端验证（文件数量 + ACL/xattr 传播）→ integrity-check → 清理。
-`datasync` 本地运行（使用 `{CONFIG}`），通过网络直接访问 NFSv4.1。
+`terrasync` 本地运行（使用 `{CONFIG}`），通过网络直接访问 NFSv4.1。
 
 **NFSv4.1 增量 sync 关键特性**：
 - URL 加 `?version=4.1` 强制使用 NFSv4.1
@@ -32,7 +32,7 @@ description: >
 | SOURCE_URL | `nfs://{SOURCE_IP}{NFS_EXPORT}?version=4.1` |
 | DEST_URL | `nfs://{DEST_IP}{NFS_EXPORT}?version=4.1` |
 | CONFIG | `examples/config.toml` |
-| BINARY | `./target/debug/datasync` |
+| BINARY | `./target/debug/terrasync` |
 | CLICKHOUSE_HOST | `192.168.50.173:8123` |
 | SYNC_JOB_ID | `nfs-v4-incr-sync` |
 | DST_SCAN_JOB_ID | `nfs-v4-incr-sync-dst` |

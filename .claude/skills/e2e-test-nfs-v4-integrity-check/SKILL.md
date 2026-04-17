@@ -14,7 +14,7 @@ description: >
 独立一致性校验测试（NFS v4.1 存储）。
 验证 integrity-check 在多种场景下的正确性，并专门测试 ACL/xattr 复制的完整性（反向验证代码功能）：
 完全一致 → Mismatch 检测 → Missing 检测 → ACL 差异手动检测 → xattr 差异手动检测 → Auto-Fix → Quick 模式。
-`datasync` 本地运行（使用 `{CONFIG}`），通过网络直接访问 NFSv4.1。
+`terrasync` 本地运行（使用 `{CONFIG}`），通过网络直接访问 NFSv4.1。
 通过 SSH 在目标端引入文件内容差异和 ACL/xattr 差异用于验证检测能力。
 
 **测试覆盖场景**：
@@ -38,7 +38,7 @@ description: >
 | SOURCE_URL | `nfs://{SOURCE_IP}{NFS_EXPORT}?version=4.1` |
 | DEST_URL | `nfs://{DEST_IP}{NFS_EXPORT}?version=4.1` |
 | CONFIG | `examples/config.toml` |
-| BINARY | `./target/debug/datasync` |
+| BINARY | `./target/debug/terrasync` |
 | CLICKHOUSE_HOST | `192.168.50.173:8123` |
 | SYNC_JOB_ID | `nfs-v4-ic-sync` |
 | IC_JOB_ID | `nfs-v4-ic-test` |

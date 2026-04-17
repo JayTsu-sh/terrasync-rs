@@ -32,7 +32,7 @@ mod clickhouse_integration_tests {
             password: None,
         };
 
-        ClickHouseDatabase::new(config, job_id)
+        ClickHouseDatabase::new(&config, job_id)
     }
 
     // 测试清理辅助函数

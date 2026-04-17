@@ -12,7 +12,7 @@ description: >
 
 端到端增量拷贝测试（CIFS/SMB 存储）。
 验证完整管线：全量 sync 建基线 → 变更源端 → 增量 sync 检测并同步变更 → 目标端扫描 → integrity-check。
-`datasync` 本地运行（使用 `{CONFIG}`），通过网络直接访问 CIFS 共享。
+`terrasync` 本地运行（使用 `{CONFIG}`），通过网络直接访问 CIFS 共享。
 测试数据通过 `smbclient` 在远端共享上创建、变更和验证。
 
 **CIFS 增量特点**：
@@ -36,7 +36,7 @@ description: >
 | SOURCE_URL | `smb://{SRC_CIFS_USER}:{SRC_CIFS_PASS}@{SRC_CIFS_HOST}/{SRC_CIFS_SHARE}/test-data` |
 | DEST_URL | `smb://{DST_CIFS_USER}:{DST_CIFS_PASS}@{DST_CIFS_HOST}/{DST_CIFS_SHARE}/test-data` |
 | CONFIG | `examples/config.toml` |
-| BINARY | `./target/debug/datasync` |
+| BINARY | `./target/debug/terrasync` |
 | CLICKHOUSE_HOST | `192.168.50.173:8123` |
 | SYNC_JOB_ID | `cifs-incr-sync` |
 | DST_SCAN_JOB_ID | `cifs-incr-sync-dst` |

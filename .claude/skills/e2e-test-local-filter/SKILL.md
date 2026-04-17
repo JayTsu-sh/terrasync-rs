@@ -23,12 +23,12 @@ description: >
 
 | Name | Value |
 |------|-------|
-| BASE_DIR | `/tmp/datasync-filter-test` |
+| BASE_DIR | `/tmp/terrasync-filter-test` |
 | CONFIG | `examples/config.toml` |
-| BINARY | `./target/debug/datasync` |
-| BASIC_URL | `/tmp/datasync-filter-test/basic` |
-| EXT_URL | `/tmp/datasync-filter-test/extension` |
-| SIZE_URL | `/tmp/datasync-filter-test/size` |
+| BINARY | `./target/debug/terrasync` |
+| BASIC_URL | `/tmp/terrasync-filter-test/basic` |
+| EXT_URL | `/tmp/terrasync-filter-test/extension` |
+| SIZE_URL | `/tmp/terrasync-filter-test/size` |
 
 测试数据集（均在 `{BASE_DIR}` 下）：
 - `basic/` — 8 文件 + 4 目录 + 2 symlinks（Linux）
@@ -56,18 +56,18 @@ CLI 输出中的统计格式（用于验证）：
 cargo build -p cli 2>&1 | tail -5
 ```
 
-Expected: 无 error，生成 `./target/debug/datasync`。
+Expected: 无 error，生成 `./target/debug/terrasync`。
 
 ### 0b. 创建测试数据
 
 ```bash
-bash .claude/skills/e2e-test-local-filter/scripts/setup-local.sh /tmp/datasync-filter-test
+bash .claude/skills/e2e-test-local-filter/scripts/setup-local.sh /tmp/terrasync-filter-test
 ```
 
 Expected（末尾输出）：
 ```
 === 测试数据创建完成 ===
-BASE_DIR: /tmp/datasync-filter-test
+BASE_DIR: /tmp/terrasync-filter-test
   basic/     — 8 文件 + 4 目录 + 2 symlinks(Linux)
   extension/ — 10 文件（.txt/.jpg/.png/.csv/.json/.log/.md/.rs/.py）
   size/      — 6 文件（<1MB / =1MB / >1MB）× 2 层目录
@@ -443,7 +443,7 @@ Expected: Regular Files=4（file8.txt + dir1/{file1,file2} + dir2/file5）, Dirs
 ## Step 9: 清理
 
 ```bash
-rm -rf /tmp/datasync-filter-test
+rm -rf /tmp/terrasync-filter-test
 find jobs -maxdepth 1 -type d -name "filter-local-*" | xargs rm -rf 2>/dev/null || true
 ```
 

@@ -12,7 +12,7 @@ description: >
 
 端到端全量扫描测试（NFS v4.1 存储）。
 验证完整管线：测试数据创建（含 NFSv4 ACL 和 xattr）→ 全量扫描 → CLI 输出验证 → ClickHouse base 表验证 → 清理。
-`datasync` 本地运行（使用 `{CONFIG}`），通过网络直接访问 NFSv4.1。
+`terrasync` 本地运行（使用 `{CONFIG}`），通过网络直接访问 NFSv4.1。
 测试数据通过 SSH 在远端创建，同时设置 NFSv4 ACL 和 named attributes（xattr）。
 
 **NFSv4.1 vs NFSv3 关键差异**：
@@ -30,7 +30,7 @@ description: >
 | NFS_EXPORT | `` |
 | SOURCE_URL | `nfs://{SOURCE_IP}{NFS_EXPORT}?version=4.1` |
 | CONFIG | `examples/config.toml` |
-| BINARY | `./target/debug/datasync` |
+| BINARY | `./target/debug/terrasync` |
 | CLICKHOUSE_HOST | `192.168.50.173:8123` |
 | JOB_ID | `nfs-v4-full-scan` |
 | SANITIZED_JOB_ID | `nfs_v4_full_scan` |

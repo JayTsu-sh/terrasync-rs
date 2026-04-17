@@ -13,7 +13,7 @@ description: >
 
 端到端增量扫描测试（NFS v4.1 存储）。
 验证完整管线：全量扫描建基线 → 变更（含 ACL/xattr 变更）→ 增量扫描检测变更 → ClickHouse 表验证 → 清理。
-`datasync` 本地运行（使用 `{CONFIG}`），通过网络直接访问 NFSv4.1。测试数据和变更通过 SSH 在远端执行。
+`terrasync` 本地运行（使用 `{CONFIG}`），通过网络直接访问 NFSv4.1。测试数据和变更通过 SSH 在远端执行。
 
 **NFSv4.1 增量扫描特点**：
 - 使用 `JoinStrategy::Fh3`（file_handle 字段）— 与 NFSv3 一致
@@ -30,7 +30,7 @@ description: >
 | NFS_EXPORT | `/` |
 | SOURCE_URL | `nfs://{SOURCE_IP}{NFS_EXPORT}?version=4.1` |
 | CONFIG | `examples/config.toml` |
-| BINARY | `./target/debug/datasync` |
+| BINARY | `./target/debug/terrasync` |
 | CLICKHOUSE_HOST | `192.168.50.173:8123` |
 | JOB_ID | `nfs-v4-incr-scan` |
 | SANITIZED_JOB_ID | `nfs_v4_incr_scan` |

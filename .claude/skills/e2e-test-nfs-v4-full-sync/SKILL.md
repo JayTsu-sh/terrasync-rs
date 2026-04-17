@@ -14,7 +14,7 @@ description: >
 
 端到端全量拷贝测试（NFS v4.1 存储）。
 验证完整管线：测试数据创建（含 NFSv4 ACL 和 xattr）→ 源端扫描 → 全量同步（含 ACL/xattr 复制）→ 目标端验证 → integrity-check → 清理。
-`datasync` 本地运行（使用 `{CONFIG}`），通过网络直接访问 NFSv4.1。
+`terrasync` 本地运行（使用 `{CONFIG}`），通过网络直接访问 NFSv4.1。
 测试数据通过 SSH 在远端创建和验证。
 
 **NFSv4.1 full sync 关键特性**：
@@ -34,7 +34,7 @@ description: >
 | SOURCE_URL | `nfs://{SOURCE_IP}{NFS_EXPORT}?version=4.1` |
 | DEST_URL | `nfs://{DEST_IP}{NFS_EXPORT}?version=4.1` |
 | CONFIG | `examples/config.toml` |
-| BINARY | `./target/debug/datasync` |
+| BINARY | `./target/debug/terrasync` |
 | CLICKHOUSE_HOST | `192.168.50.173:8123` |
 | SRC_SCAN_JOB_ID | `nfs-v4-full-sync-src` |
 | SYNC_JOB_ID | `nfs-v4-full-sync` |
@@ -317,7 +317,7 @@ Expected: `Files with custom ACL: {ACL_TEST_FILES}`（至少等于源端设置�
 
 ### 5c. 验证 xattr（named attributes）
 
-**已知限制：Linux NFSv4 服务端不通过 NFS 协议暴露 `user.*` xattr（通过本地文件系统 `getfattr` 可读，但 NFS 客户端无法访问）。因此 datasync 无法通过 NFSv4 读取 xattr，xattr 不会被复制到目标端。这不是 datasync 的 bug。**
+**已知限制：Linux NFSv4 服务端不通过 NFS 协议暴露 `user.*` xattr（通过本地文件系统 `getfattr` 可读，但 NFS 客户端无法访问）。因此 terrasync 无法通过 NFSv4 读取 xattr，xattr 不会被复制到目标端。这不是 terrasync 的 bug。**
 
 验证源端 xattr 存在（通过本地 export 路径可读）：
 

@@ -452,7 +452,7 @@ fi
 # ============================================================
 # 注意：Linux nfsd 不支持 NFSv4 OPENATTR 操作（named attributes），
 # 因此通过 setfattr 在本地文件系统上设置的 user.* xattr 无法通过 NFSv4 协议远程访问。
-# 这是 Linux 内核 NFS 服务器的已知限制，非 datasync 的 bug。
+# 这是 Linux 内核 NFS 服务器的已知限制，非 terrasync 的 bug。
 # 此处仍然设置 xattr 用于验证本地文件系统层面的正确性。
 # 安装 attr 工具（如果尚未安装）
 if ! command -v setfattr &> /dev/null; then

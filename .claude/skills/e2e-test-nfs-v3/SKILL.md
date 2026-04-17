@@ -2,7 +2,7 @@
 name: e2e-test-nfs-v3
 description: >
   This skill should be used when the user asks to "run nfs v3 e2e test",
-  "test datasync nfs v3 sync", "端到端 nfs v3 测试", "nfs v3 同步测试", "nfs v3 e2e",
+  "test terrasync nfs v3 sync", "端到端 nfs v3 测试", "nfs v3 同步测试", "nfs v3 e2e",
   "run the nfs v3 e2e workflow", "test the full nfs v3 sync pipeline",
   or mentions running the full scan/sync/verify/cleanup workflow
   against the NFSv3 test environment ({SOURCE_IP} → {DEST_IP}).
@@ -12,9 +12,9 @@ description: >
 
 ## Overview
 
-End-to-end integration test workflow for datasync against NFSv3 storage.
+End-to-end integration test workflow for terrasync against NFSv3 storage.
 Validates the full pipeline: test data → scan → sync → integrity-check → verify counts → cleanup.
-`datasync` runs **locally** (using `{CONFIG}`) and accesses NFSv3 over the network directly.
+`terrasync` runs **locally** (using `{CONFIG}`) and accesses NFSv3 over the network directly.
 Test data is created and verified on the remote hosts via SSH.
 
 ## Constants
@@ -28,7 +28,7 @@ Test data is created and verified on the remote hosts via SSH.
 | EXPECTED_FILES | 117 |
 | EXPECTED_SYMLINKS | 36 |
 | CONFIG | `examples/config.toml` |
-| BINARY | `./target/debug/datasync` |
+| BINARY | `./target/debug/terrasync` |
 | CLICKHOUSE_HOST | `192.168.50.173:8123` |
 
 NFS URL 格式：`nfs://{SOURCE_IP}{NFS_EXPORT}`，`nfs://{DEST_IP}{NFS_EXPORT}`。

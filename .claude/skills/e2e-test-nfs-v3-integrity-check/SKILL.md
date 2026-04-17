@@ -13,7 +13,7 @@ description: >
 
 独立一致性校验测试（NFS v3 存储）。
 验证 integrity-check 在多种场景下的正确性：完全一致 → Mismatch 检测 → Missing 检测 → Quick 模式 → Auto-Fix 模式。
-`datasync` 本地运行（使用 `{CONFIG}`），通过网络直接访问 NFSv3。
+`terrasync` 本地运行（使用 `{CONFIG}`），通过网络直接访问 NFSv3。
 通过 SSH 在目标端引入差异用于验证检测能力。
 
 **测试覆盖四种场景**：
@@ -34,7 +34,7 @@ description: >
 | SOURCE_URL | `nfs://{SOURCE_IP}{SOURCE_NFS_EXPORT}` |
 | DEST_URL | `nfs://{DEST_IP}{DEST_NFS_EXPORT}` |
 | CONFIG | `examples/config.toml` |
-| BINARY | `./target/debug/datasync` |
+| BINARY | `./target/debug/terrasync` |
 | CLICKHOUSE_HOST | `192.168.50.173:8123` |
 | SYNC_JOB_ID | `nfs-v3-ic-sync` |
 | IC_JOB_ID | `nfs-v3-ic-test` |

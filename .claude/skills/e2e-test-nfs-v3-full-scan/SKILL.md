@@ -12,7 +12,7 @@ description: >
 ## Overview
 
 端到端全量扫描测试（NFS v3 存储）：创建测试数据 → 全量扫描 → 验证 CLI 输出和 ClickHouse base 表。
-`datasync` 本地运行（使用 `{CONFIG}`），通过网络访问 NFSv3。
+`terrasync` 本地运行（使用 `{CONFIG}`），通过网络访问 NFSv3。
 测试数据通过 SSH 在远端创建。
 
 ## Constants
@@ -22,7 +22,7 @@ description: >
 | SOURCE_IP | 192.168.50.173 |
 | NFS_EXPORT | `/export/nfs` |
 | CONFIG | `examples/config.toml` |
-| BINARY | `./target/debug/datasync` |
+| BINARY | `./target/debug/terrasync` |
 | CLICKHOUSE_HOST | `192.168.50.173:8123` |
 | JOB_ID | `nfs-v3-full-scan` |
 | SANITIZED_JOB_ID | `nfs_v3_full_scan` |

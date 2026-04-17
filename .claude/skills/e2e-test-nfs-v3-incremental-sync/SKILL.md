@@ -14,7 +14,7 @@ description: >
 
 端到端增量拷贝测试（NFS v3 存储）。
 验证完整管线：全量 sync 建基线 → 变更源端数据 → 增量 sync 检测并同步变更 → 目标端验证 → integrity-check → 清理。
-`datasync` 本地运行（使用 `{CONFIG}`），通过网络直接访问 NFSv3。
+`terrasync` 本地运行（使用 `{CONFIG}`），通过网络直接访问 NFSv3。
 测试数据通过 SSH 在远端创建、变更和验证。
 
 **增量 sync 机制**：当 `jobs/replicate_{SYNC_JOB_ID}/` 目录已存在时自动进入增量模式。
@@ -31,7 +31,7 @@ NFS v3 使用 `JoinStrategy::Fh3`，通过 file_handle（文件句柄哈希）�
 | SOURCE_URL | `nfs://{SOURCE_IP}{SOURCE_NFS_EXPORT}` |
 | DEST_URL | `nfs://{DEST_IP}{DEST_NFS_EXPORT}` |
 | CONFIG | `examples/config.toml` |
-| BINARY | `./target/debug/datasync` |
+| BINARY | `./target/debug/terrasync` |
 | CLICKHOUSE_HOST | `192.168.50.173:8123` |
 | SYNC_JOB_ID | `nfs-v3-incr-sync` |
 | DST_SCAN_JOB_ID | `nfs-v3-incr-sync-dst` |

@@ -13,7 +13,7 @@ description: >
 ## Overview
 
 端到端增量扫描测试：全量扫描建基线 → 变更文件系统（增删改+rename） → 增量扫描检测变更 → 验证 CLI 输出和 ClickHouse 数据库。
-`datasync` 本地运行（使用 `{CONFIG}`），通过网络访问 NFSv3。测试数据和变更通过 SSH 在远端执行。
+`terrasync` 本地运行（使用 `{CONFIG}`），通过网络访问 NFSv3。测试数据和变更通过 SSH 在远端执行。
 
 ## Constants
 
@@ -22,7 +22,7 @@ description: >
 | SOURCE_IP | 192.168.50.173 |
 | NFS_EXPORT | `/export/nfs` |
 | CONFIG | `examples/config.toml` |
-| BINARY | `./target/debug/datasync` |
+| BINARY | `./target/debug/terrasync` |
 | CLICKHOUSE_HOST | `192.168.50.173:8123` |
 | JOB_ID | `nfs-v3-incr-scan` |
 | BASELINE_DIRS | 113 |

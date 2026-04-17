@@ -13,7 +13,7 @@ description: >
 
 独立一致性校验测试（S3 存储）。
 验证 integrity-check 在多种场景下的正确性：完全一致 → Quick 模式 → Mismatch 检测 → Missing 检测。
-`datasync` 本地运行（使用 `{CONFIG}`），通过网络直接访问 S3 兼容存储。
+`terrasync` 本地运行（使用 `{CONFIG}`），通过网络直接访问 S3 兼容存储。
 通过 `mc` 在目标端引入差异用于验证检测能力。
 
 **S3 integrity-check 特点**：
@@ -38,7 +38,7 @@ description: >
 | SOURCE_URL | `s3://{S3_AK}:{S3_SK}@{SRC_BUCKET}.{S3_HOST}/test-data` |
 | DEST_URL | `s3://{S3_AK}:{S3_SK}@{DST_BUCKET}.{S3_HOST}/test-data` |
 | CONFIG | `examples/config.toml` |
-| BINARY | `./target/debug/datasync` |
+| BINARY | `./target/debug/terrasync` |
 | CLICKHOUSE_HOST | `192.168.50.173:8123` |
 | SYNC_JOB_ID | `s3-ic-sync` |
 | IC_JOB_ID | `s3-ic-test` |

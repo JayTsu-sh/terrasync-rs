@@ -12,7 +12,7 @@ description: >
 
 跨协议全量拷贝测试：S3 源端 → NFS v3 目标端。
 验证完整管线：S3 测试数据上传 → 跨协议 sync → NFS 目标端扫描 → integrity-check → 清理。
-`datasync` 本地运行（使用 `{CONFIG}`），同时访问 S3 和 NFS 两种存储。
+`terrasync` 本地运行（使用 `{CONFIG}`），同时访问 S3 和 NFS 两种存储。
 
 **跨协议关键差异**：
 - S3 无 symlink，NFS 目标端也不会产生 symlink → 纯文件+目录拷贝
@@ -36,7 +36,7 @@ description: >
 | DEST_NFS_EXPORT | `{DEST_NFS_EXPORT}` |
 | DEST_URL | `nfs://{DEST_IP}{DEST_NFS_EXPORT}` |
 | CONFIG | `examples/config.toml` |
-| BINARY | `./target/debug/datasync` |
+| BINARY | `./target/debug/terrasync` |
 | CLICKHOUSE_HOST | `192.168.50.173:8123` |
 | SYNC_JOB_ID | `s3-to-nfs-sync` |
 | SRC_SCAN_JOB_ID | `s3-to-nfs-sync-src` |

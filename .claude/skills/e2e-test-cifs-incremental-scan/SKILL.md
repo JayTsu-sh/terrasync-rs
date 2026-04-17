@@ -20,7 +20,7 @@ description: >
 - **不支持 symlink**
 - rename 通过 fh3 精确识别 → Renamed（非 New+Deleted）
 
-`datasync` 本地运行（使用 `{CONFIG}`），通过网络访问 CIFS 共享。
+`terrasync` 本地运行（使用 `{CONFIG}`），通过网络访问 CIFS 共享。
 测试数据通过 `smbclient` 或挂载共享后管理。
 
 ## Constants
@@ -34,7 +34,7 @@ description: >
 | CIFS_SHARE | `{CIFS_SHARE}` |
 | CIFS_URL | `smb://{CIFS_USER}:{CIFS_PASS}@{CIFS_HOST}/{CIFS_SHARE}/test-data` |
 | CONFIG | `examples/config.toml` |
-| BINARY | `./target/debug/datasync` |
+| BINARY | `./target/debug/terrasync` |
 | CLICKHOUSE_HOST | `192.168.50.173:8123` |
 | JOB_ID | `cifs-incr-scan` |
 | SANITIZED_JOB_ID | `cifs_incr_scan` |

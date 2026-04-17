@@ -1,9 +1,9 @@
 [package]
-name = "datasync-rs"
+name = "terrasync-rs"
 version = "0.1.0"
 authors = ["jay.xu <jay.xu@lenovonetapp.com>"]
 edition = "2024"
-repository = "https://github.com/JayTsu-sh/datasync-rs"
+repository = "https://github.com/JayTsu-sh/terrasync-rs"
 readme = "README.md"
 license = "MIT"
 keywords = ["cli", "starter"]
@@ -12,7 +12,7 @@ description = """
 """
 
 [[bin]]
-name = "datasync"
+name = "terrasync"
 path = "src/main.rs"
 
 [workspace]
