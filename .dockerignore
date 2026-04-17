@@ -8,3 +8,5 @@ docker/
 jobs/
 *.md
 LICENSE
+web-ui/node_modules/
+web-ui/dist/
