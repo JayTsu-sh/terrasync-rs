@@ -1,13 +1,13 @@
 use serde::{Deserialize, Serialize};
 
-/// TaskProgress 值对象 — 实时任务进度
+/// `TaskProgress` 值对象 — 实时任务进度
 ///
-/// snapshot_json 存储 app::consumer::stats::ProgressReport 的 JSON 序列化，
+/// `snapshot_json` 存储 `app::consumer::stats::ProgressReport` 的 JSON 序列化，
 /// 避免逐列拆解 + 22 列的 mirror type 问题。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaskProgress {
     pub task_id: String,
-    /// ProgressReport 的 JSON 序列化（包含 snapshot + is_final + final_stats）
+    /// `ProgressReport` 的 JSON 序列化（包含 snapshot + `is_final` + `final_stats`）
     pub report_json: String,
     pub is_final: bool,
     pub updated_at: chrono::DateTime<chrono::Utc>,

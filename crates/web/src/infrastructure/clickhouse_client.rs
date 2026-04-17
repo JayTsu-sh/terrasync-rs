@@ -10,14 +10,14 @@ fn build_http_client(timeout_secs: u64) -> Result<reqwest::Client> {
         .map_err(|e| WebError::ConnectionTestFailed(format!("创建 HTTP 客户端失败: {e}")))
 }
 
-/// 测试 ClickHouse 连通性（`SELECT 1`）
+/// 测试 `ClickHouse` 连通性（`SELECT 1`）
 pub async fn test_connectivity(dsn: &str, username: &str, password: &str, database: &str) -> Result<()> {
     let dsn = dsn.trim_end_matches('/');
-    debug!("Testing ClickHouse connectivity: {}", dsn);
+    debug!("Testing ClickHouse connectivity: {dsn}");
 
     let client = build_http_client(5)?;
 
-    let query_url = format!("{}/?query=SELECT+1", dsn);
+    let query_url = format!("{dsn}/?query=SELECT+1");
     let resp = client
         .get(&query_url)
         .basic_auth(username, Some(password))

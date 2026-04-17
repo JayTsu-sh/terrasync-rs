@@ -1,7 +1,7 @@
 //! Block 签名计算
 //!
-//! 对 basis file（目标端已有文件）按 block_size 切分，
-//! 每个 block 计算 (rolling_checksum, BLAKE3_truncated_16) 签名对。
+//! 对 basis file（目标端已有文件）按 `block_size` 切分，
+//! 每个 block 计算 (`rolling_checksum`, `BLAKE3_truncated_16`) 签名对。
 
 use crate::BlockSignature;
 use crate::rolling::RollingChecksum;
@@ -18,7 +18,7 @@ fn blake3_truncated_16(data: &[u8]) -> [u8; 16] {
 /// 对 basis file 数据计算所有 block 的签名
 ///
 /// 返回 `Vec<BlockSignature>`，每个元素对应一个 block。
-/// 最后一个 block 可能不足 block_size（尾部 block）。
+/// 最后一个 block 可能不足 `block_size`（尾部 block）。
 pub fn compute_block_signatures(data: &[u8], block_size: u32) -> Vec<BlockSignature> {
     let bs = block_size as usize;
     if data.is_empty() || bs == 0 {

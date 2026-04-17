@@ -10,7 +10,7 @@ use crate::traits::{ReceiverTransport, SenderTransport};
 /// 单进程模式下的传输通道容量
 const DEFAULT_CHANNEL_CAPACITY: usize = 128;
 
-/// 创建一对 InProcess 传输通道（Sender 端 + Receiver 端）
+/// 创建一对 `InProcess` 传输通道（Sender 端 + Receiver 端）
 ///
 /// 内部使用两对 `async_channel`：
 /// - S→R：Sender 发送 `SenderMsg`，Receiver 接收

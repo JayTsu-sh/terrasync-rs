@@ -1,7 +1,7 @@
 //! 构建脚本模块
 //!
-//! 该构建脚本负责在Windows平台上处理DuckDB库的链接和复制操作，
-//! 确保编译过程中能正确找到和使用DuckDB静态库。
+//! 该构建脚本负责在Windows平台上处理 `DuckDB` 库的链接和复制操作，
+//! 确保编译过程中能正确找到和使用 `DuckDB` 静态库。
 
 // 标准库
 #[cfg(target_os = "windows")]
@@ -15,10 +15,10 @@ use std::path::{Path, PathBuf};
 ///
 /// 在Windows平台上执行以下操作：
 /// 1. 获取当前项目根目录
-/// 2. 构建DuckDB库的自定义路径
+/// 2. 构建 `DuckDB` 库的自定义路径
 /// 3. 向Cargo传递链接器搜索路径和库名称
 /// 4. 获取目标输出目录
-/// 5. 递归复制DuckDB库文件到目标目录
+/// 5. 递归复制 `DuckDB` 库文件到目标目录
 fn main() {
     #[cfg(target_os = "windows")]
     {

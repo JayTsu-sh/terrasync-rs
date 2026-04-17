@@ -7,8 +7,8 @@ use crate::message::{ReceiverMsg, SenderMsg};
 
 /// Sender 侧的传输接口
 ///
-/// 单进程模式：由 InProcessSenderTransport 实现（in-process channel）
-/// 双进程模式：由 QuicSenderTransport 实现（QUIC stream）
+/// 单进程模式：由 `InProcessSenderTransport` 实现（in-process channel）
+/// 双进程模式：由 `QuicSenderTransport` 实现（QUIC stream）
 #[async_trait]
 pub trait SenderTransport: Send + Sync {
     /// 发送消息给 Receiver（file list + file data）
@@ -23,8 +23,8 @@ pub trait SenderTransport: Send + Sync {
 
 /// Receiver 侧的传输接口
 ///
-/// 单进程模式：由 InProcessReceiverTransport 实现（in-process channel）
-/// 双进程模式：由 QuicReceiverTransport 实现（QUIC stream）
+/// 单进程模式：由 `InProcessReceiverTransport` 实现（in-process channel）
+/// 双进程模式：由 `QuicReceiverTransport` 实现（QUIC stream）
 #[async_trait]
 pub trait ReceiverTransport: Send + Sync {
     /// 接收 Sender 的消息（file list + file data）

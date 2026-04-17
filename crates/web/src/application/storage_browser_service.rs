@@ -23,7 +23,8 @@ pub struct NfsExportEntry {
     pub groups: Vec<String>,
 }
 
-/// 存储浏览服务，封装目录浏览、NFS 导出查询、S3 桶列表等操作
+/// 存储浏览服务，封装目录浏览、`NFS` 导出查询、`S3` 桶列表等操作
+#[derive(Default)]
 pub struct StorageBrowserService;
 
 impl StorageBrowserService {
@@ -32,7 +33,7 @@ impl StorageBrowserService {
     }
 
     /// 列出指定路径下的子目录
-    /// - `storage_url` 为 Some 时通过 storage_v2 连接远程存储
+    /// - `storage_url` 为 `Some` 时通过 `storage_v2` 连接远程存储
     /// - `storage_url` 为 None 时列出本地文件系统
     pub async fn list_dirs(&self, path: &str, storage_url: Option<&str>) -> Result<ListDirsResult> {
         if let Some(url) = storage_url {
@@ -45,7 +46,7 @@ impl StorageBrowserService {
     /// 列出 NFS 服务器的导出路径
     pub async fn list_nfs_exports(&self, server: &str, port: Option<u16>) -> Result<Vec<NfsExportEntry>> {
         let host = match port {
-            Some(p) if p != 2049 => format!("nfs://{}:{}/.", server, p),
+            Some(p) if p != 2049 => format!("nfs://{server}:{p}/."),
             _ => server.to_string(),
         };
 
@@ -64,7 +65,7 @@ impl StorageBrowserService {
         &self, server: &str, access_key: &str, secret_key: &str, use_https: bool,
     ) -> Result<Vec<S3BucketInfo>> {
         let scheme = if use_https { "s3+https" } else { "s3" };
-        let url = format!("{}://{}:{}@{}", scheme, access_key, secret_key, server);
+        let url = format!("{scheme}://{access_key}:{secret_key}@{server}");
         let buckets = S3Storage::list_buckets(&url).await?;
         Ok(buckets)
     }
@@ -122,7 +123,7 @@ impl StorageBrowserService {
             && path.as_bytes()[0].is_ascii_alphabetic()
             && path.as_bytes()[1] == b':'
         {
-            format!("{}\\", path)
+            format!("{path}\\")
         } else {
             path.to_string()
         };

@@ -130,7 +130,7 @@ impl Default for TaskConfig {
     }
 }
 
-/// MigrationTask 聚合根
+/// `MigrationTask` 聚合根
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MigrationTask {
     pub id: String,

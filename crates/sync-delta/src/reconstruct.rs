@@ -1,6 +1,6 @@
 //! 文件重建（Receiver 侧）
 //!
-//! 从 basis file 数据 + DeltaToken 序列拼接出完整的新文件。
+//! 从 basis file 数据 + `DeltaToken` 序列拼接出完整的新文件。
 //! Match token → 从 basis file 读取对应 block
 //! Data token → 使用 Sender 传来的新数据
 

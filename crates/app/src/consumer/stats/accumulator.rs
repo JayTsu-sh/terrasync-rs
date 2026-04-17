@@ -82,7 +82,7 @@ impl fmt::Display for FileSizeRange {
 pub fn calculate_time_range(mtime: i64) -> TimeRange {
     let now = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
-        .map(|d| d.as_nanos() as i64)
+        .map(|d| i64::try_from(d.as_nanos()).unwrap_or(i64::MAX))
         .unwrap_or(0);
     let time_diff = if now > mtime { now - mtime } else { 0 };
     let days = time_diff as f64 / (24u64 * 60 * 60 * 1_000_000_000) as f64;
@@ -141,7 +141,7 @@ pub fn format_bytes(bytes: f64, with_decimals: bool) -> String {
 // FullStats：Scan / Copy / IntegrityCheck 的最终统计
 // ─────────────────────────────────────────────────
 
-/// 按 dirs / regular_files / symlinks 三维度存储数量和 size
+/// 按 dirs / `regular_files` / symlinks 三维度存储数量和 size
 #[derive(Debug, Clone)]
 pub struct FullStats {
     // 三维度 count + size
@@ -307,7 +307,7 @@ impl fmt::Display for FullStats {
         writeln!(f, "   ├─ Command:    {}", self.command)?;
         writeln!(f, "   ├─ Job ID:     {}", self.job_id)?;
         writeln!(f, "   ├─ Log Path:   {}", self.log_path)?;
-        writeln!(f, "   └─ Total Time: {:.1}s", elapsed)?;
+        writeln!(f, "   └─ Total Time: {elapsed:.1}s")?;
         writeln!(f)?;
 
         writeln!(f, "  Basic Statistics:")?;
@@ -330,9 +330,9 @@ impl fmt::Display for FullStats {
             writeln!(f, "  Extended Statistics:")?;
             writeln!(f, "   ├─ Avg File Size: {:>19}", format_bytes(avg_file_size, true))?;
             writeln!(f, "   ├─ Max Name Len:  {:>15}", self.max_name_length)?;
-            writeln!(f, "   ├─ Avg Name Len:  {:>15.1}", avg_name_len)?;
+            writeln!(f, "   ├─ Avg Name Len:  {avg_name_len:>15.1}")?;
             writeln!(f, "   ├─ Max Dir Depth: {:>15}", self.max_dir_depth)?;
-            writeln!(f, "   └─ Avg Dir Depth: {:>15.1}", avg_dir_depth)?;
+            writeln!(f, "   └─ Avg Dir Depth: {avg_dir_depth:>15.1}")?;
             writeln!(f)?;
 
             fmt_time_range_table(f, &self.time_range_stats, self.total_count(), self.total_size())?;
@@ -404,7 +404,7 @@ impl ErrorStats {
 // IncrementalStats：IncrementalScan / IncrementalCopy
 // ─────────────────────────────────────────────────
 
-/// 增量操作的三维度统计辅助结构（内联字段展开到 IncrementalStats）
+/// 增量操作的三维度统计辅助结构（内联字段展开到 `IncrementalStats`）
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct DeltaCounts {
     pub dir_count: usize,
@@ -494,6 +494,20 @@ impl IncrementalStats {
 
 impl fmt::Display for IncrementalStats {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fn fmt_delta(f: &mut fmt::Formatter<'_>, label: &str, d: &DeltaCounts) -> fmt::Result {
+            writeln!(
+                f,
+                "   ├─ {:8} {:>8} total | dirs {:>6} ({}) | files {:>6} ({}) | symlinks {:>4}",
+                label,
+                d.total_count(),
+                d.dir_count,
+                format_bytes(d.dir_size as f64, true),
+                d.regular_file_count,
+                format_bytes(d.regular_file_size as f64, true),
+                d.symlink_count
+            )
+        }
+
         let elapsed = self.start_time.elapsed().as_secs_f64();
 
         writeln!(f, "{:=<80}", "")?;
@@ -503,7 +517,7 @@ impl fmt::Display for IncrementalStats {
         writeln!(f, "   ├─ Command:    {}", self.command)?;
         writeln!(f, "   ├─ Job ID:     {}", self.job_id)?;
         writeln!(f, "   ├─ Log Path:   {}", self.log_path)?;
-        writeln!(f, "   └─ Total Time: {:.1}s", elapsed)?;
+        writeln!(f, "   └─ Total Time: {elapsed:.1}s")?;
         writeln!(f)?;
 
         // Scanned 基础统计（复用 FullStats 的 Basic Statistics 部分）
@@ -520,20 +534,6 @@ impl fmt::Display for IncrementalStats {
         writeln!(f)?;
 
         // 增量统计
-        fn fmt_delta(f: &mut fmt::Formatter<'_>, label: &str, d: &DeltaCounts) -> fmt::Result {
-            writeln!(
-                f,
-                "   ├─ {:8} {:>8} total | dirs {:>6} ({}) | files {:>6} ({}) | symlinks {:>4}",
-                label,
-                d.total_count(),
-                d.dir_count,
-                format_bytes(d.dir_size as f64, true),
-                d.regular_file_count,
-                format_bytes(d.regular_file_size as f64, true),
-                d.symlink_count
-            )
-        }
-
         writeln!(f, "  Incremental Statistics:")?;
         fmt_delta(f, "New:", &self.new)?;
         fmt_delta(f, "Changed:", &self.changed)?;
@@ -572,9 +572,9 @@ impl fmt::Display for IncrementalStats {
         writeln!(f, "  Extended Statistics (Scanned):")?;
         writeln!(f, "   ├─ Avg File Size: {:>19}", format_bytes(avg_file_size, true))?;
         writeln!(f, "   ├─ Max Name Len:  {:>15}", s.max_name_length)?;
-        writeln!(f, "   ├─ Avg Name Len:  {:>15.1}", avg_name_len)?;
+        writeln!(f, "   ├─ Avg Name Len:  {avg_name_len:>15.1}")?;
         writeln!(f, "   ├─ Max Dir Depth: {:>15}", s.max_dir_depth)?;
-        writeln!(f, "   └─ Avg Dir Depth: {:>15.1}", avg_dir_depth)?;
+        writeln!(f, "   └─ Avg Dir Depth: {avg_dir_depth:>15.1}")?;
         writeln!(f)?;
 
         fmt_time_range_table(f, &s.time_range_stats, s.total_count(), s.total_size())?;
@@ -590,6 +590,7 @@ impl fmt::Display for IncrementalStats {
 // ─────────────────────────────────────────────────
 
 #[derive(Debug, Clone)]
+#[allow(clippy::large_enum_variant)]
 pub enum StatsKind {
     Full(FullStats),
     Incremental(IncrementalStats),
@@ -637,11 +638,11 @@ pub(crate) fn fmt_elapsed(elapsed: f64) -> String {
     let minutes = (seconds % 3600) / 60;
     let secs = seconds % 60;
     if hours > 0 {
-        format!("{}h{}m{}s", hours, minutes, secs)
+        format!("{hours}h{minutes}m{secs}s")
     } else if minutes > 0 {
-        format!("{}m{}s", minutes, secs)
+        format!("{minutes}m{secs}s")
     } else {
-        format!("{}s", secs)
+        format!("{secs}s")
     }
 }
 
@@ -821,16 +822,16 @@ fn fmt_file_size_range_table(
 fn fmt_top_extensions(
     f: &mut fmt::Formatter<'_>, top: Vec<(&String, &(i64, usize))>, total_regular_files: usize, total_files_size: i64,
 ) -> fmt::Result {
-    if top.is_empty() {
-        return Ok(());
-    }
-
     const C1: usize = 14;
     const C2: usize = 14;
     const C3: usize = 9;
     const C4: usize = 14;
     const C5: usize = 11;
     const C6: usize = 9;
+
+    if top.is_empty() {
+        return Ok(());
+    }
 
     writeln!(f, "  TOP 5 FILE EXTENSIONS:")?;
     writeln!(
@@ -899,17 +900,17 @@ fn fmt_pct(pct: f64) -> String {
     if pct >= 100.0 {
         "100%".to_string()
     } else {
-        format!("{:>4.1}%", pct)
+        format!("{pct:>4.1}%")
     }
 }
 
 fn fmt_error_stats(f: &mut fmt::Formatter<'_>, error_stats: &ErrorStats) -> fmt::Result {
+    const C1: usize = 14;
+    const C2: usize = 10;
+
     if error_stats.is_empty() {
         return Ok(());
     }
-
-    const C1: usize = 14;
-    const C2: usize = 10;
 
     let total = error_stats.total();
 
@@ -929,7 +930,7 @@ fn fmt_error_stats(f: &mut fmt::Formatter<'_>, error_stats: &ErrorStats) -> fmt:
         ("pack", error_stats.pack),
     ] {
         if count > 0 {
-            writeln!(f, "    │ {:<12} │ {:>8} │", label, count)?;
+            writeln!(f, "    │ {label:<12} │ {count:>8} │")?;
         }
     }
 
@@ -961,12 +962,9 @@ pub fn print_integrity_check_result(
     let total_passed = total_checked.saturating_sub(total_issues);
 
     // 结果汇总
-    println!(
-        "  Integrity Check Results:               Mode: {}, Auto-Fix: {}",
-        mode, fix_label
-    );
+    println!("  Integrity Check Results:               Mode: {mode}, Auto-Fix: {fix_label}");
     if total_issues == 0 {
-        println!("   ├─ Checked:       {:>12}", total_checked);
+        println!("   ├─ Checked:       {total_checked:>12}");
         println!("   └─ All Passed ✓");
     } else {
         let pass_pct = if total_checked > 0 {
@@ -980,7 +978,7 @@ pub fn print_integrity_check_result(
             0.0
         };
 
-        println!("   ├─ Checked:       {:>12}", total_checked);
+        println!("   ├─ Checked:       {total_checked:>12}");
         println!("   ├─ Passed:        {:>12}  ({})", total_passed, fmt_pct(pass_pct));
         println!("   └─ Issues:        {:>12}  ({})", total_issues, fmt_pct(fail_pct));
 
@@ -1017,7 +1015,7 @@ pub fn print_integrity_check_result(
                 .filter(|i| matches!(i.fix_status, FixStatus::Fixed))
                 .count();
             let unfixed = mismatch.len() - fixed;
-            println!("      └─ Auto-Fixed: {:>8}  (unfixed: {})", fixed, unfixed);
+            println!("      └─ Auto-Fixed: {fixed:>8}  (unfixed: {unfixed})");
         }
 
         println!();

@@ -1,8 +1,8 @@
 //! 消息帧协议：length-prefix framing over QUIC streams
 //!
-//! 帧格式：[4 bytes LE total_length][1 byte flags][payload]
+//! 帧格式：[4 bytes LE `total_length`][1 byte flags][payload]
 //! - flags bit 0: zstd 压缩（1=compressed, 0=raw）
-//! - total_length = 1 (flags) + payload.len()
+//! - `total_length` = 1 (flags) + `payload.len()`
 
 use bincode::config;
 use quinn::{RecvStream, SendStream};
@@ -30,12 +30,12 @@ fn bincode_config() -> impl config::Config {
 /// 将消息序列化 + 可选压缩后写入 QUIC stream
 pub async fn write_msg<T: Serialize>(stream: &mut SendStream, msg: &T) -> Result<()> {
     let raw = bincode::serde::encode_to_vec(msg, bincode_config())
-        .map_err(|e| QuicTransportError::SerializationError(format!("encode: {}", e)))?;
+        .map_err(|e| QuicTransportError::SerializationError(format!("encode: {e}")))?;
 
     let (payload, flags) = if raw.len() >= COMPRESSION_THRESHOLD {
         // zstd 压缩
         let compressed = zstd::encode_all(raw.as_slice(), ZSTD_LEVEL)
-            .map_err(|e| QuicTransportError::SerializationError(format!("zstd compress: {}", e)))?;
+            .map_err(|e| QuicTransportError::SerializationError(format!("zstd compress: {e}")))?;
         // 只在压缩后更小时使用
         if compressed.len() < raw.len() {
             (compressed, FLAG_ZSTD)
@@ -79,10 +79,9 @@ pub async fn read_msg<T: DeserializeOwned>(stream: &mut RecvStream) -> Result<Op
     }
 
     let total_len = u32::from_le_bytes(len_buf);
-    if total_len > MAX_MESSAGE_SIZE || total_len < 1 {
+    if !(1..=MAX_MESSAGE_SIZE).contains(&total_len) {
         return Err(QuicTransportError::SerializationError(format!(
-            "invalid frame size: {} bytes",
-            total_len
+            "invalid frame size: {total_len} bytes"
         )));
     }
 
@@ -104,15 +103,24 @@ pub async fn read_msg<T: DeserializeOwned>(stream: &mut RecvStream) -> Result<Op
 
     // 解压（如果压缩了）
     let raw = if flags & FLAG_ZSTD != 0 {
-        zstd::decode_all(payload.as_slice())
-            .map_err(|e| QuicTransportError::SerializationError(format!("zstd decompress: {}", e)))?
+        let decompressed = zstd::decode_all(payload.as_slice())
+            .map_err(|e| QuicTransportError::SerializationError(format!("zstd decompress: {e}")))?;
+        // 防止解压炸弹：解压后大小不得超过最大消息限制
+        if decompressed.len() > MAX_MESSAGE_SIZE as usize {
+            return Err(QuicTransportError::SerializationError(format!(
+                "decompressed size {} exceeds limit {} bytes",
+                decompressed.len(),
+                MAX_MESSAGE_SIZE
+            )));
+        }
+        decompressed
     } else {
         payload
     };
 
     // 反序列化
     let (msg, _) = bincode::serde::decode_from_slice(&raw, bincode_config())
-        .map_err(|e| QuicTransportError::SerializationError(format!("decode: {}", e)))?;
+        .map_err(|e| QuicTransportError::SerializationError(format!("decode: {e}")))?;
 
     Ok(Some(msg))
 }

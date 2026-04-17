@@ -48,7 +48,7 @@ impl EndpointRepository for SqliteEndpointRepo {
         .fetch_optional(&self.pool)
         .await?;
 
-        row.map(|r| r.try_into()).transpose()
+        row.map(TryInto::try_into).transpose()
     }
 
     async fn find_all(&self) -> Result<Vec<Endpoint>> {
@@ -58,7 +58,7 @@ impl EndpointRepository for SqliteEndpointRepo {
         .fetch_all(&self.pool)
         .await?;
 
-        rows.into_iter().map(|r| r.try_into()).collect()
+        rows.into_iter().map(TryInto::try_into).collect()
     }
 
     async fn update(&self, endpoint: &Endpoint) -> Result<()> {

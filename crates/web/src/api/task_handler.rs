@@ -1,8 +1,13 @@
+use std::net::SocketAddr;
+
 use app::consumer::ProgressReport;
 use app::consumer::stats::ProgressDetail;
 use axum::Json;
+use axum::extract::ConnectInfo;
 use axum::extract::rejection::JsonRejection;
 use axum::extract::{Path, Query, State};
+use axum::http::StatusCode;
+use axum::response::IntoResponse;
 use serde::Deserialize;
 use tracing::warn;
 
@@ -90,7 +95,8 @@ pub async fn get_execution_logs(
 ) -> Result<Json<Vec<TaskLog>>> {
     let level = query.level.and_then(|l| l.parse::<LogLevel>().ok());
     let offset = query.offset.unwrap_or(0);
-    let limit = query.limit.unwrap_or(100);
+    // 最大返回 10,000 条，防止大查询导致内存耗尽
+    let limit = query.limit.unwrap_or(100).min(10_000);
     let logs = state.task_service.get_execution_logs(&id, level, offset, limit).await?;
     Ok(Json(logs))
 }
@@ -111,7 +117,7 @@ pub async fn get_progress(State(state): State<AppState>, Path(id): Path<String>)
     Ok(Json(serde_json::json!(null)))
 }
 
-/// 将 ProgressReport 转换为前端 TaskProgressSnapshot 期望的扁平结构
+/// 将 `ProgressReport` 转换为前端 `TaskProgressSnapshot` 期望的扁平结构
 fn progress_report_to_snapshot(report: &ProgressReport) -> serde_json::Value {
     match &report.detail {
         ProgressDetail::Full {
@@ -145,10 +151,22 @@ fn progress_report_to_snapshot(report: &ProgressReport) -> serde_json::Value {
     }
 }
 
-/// 接收来自 app 层 StatisticConsumer 的进度回调
+/// 接收来自 app 层 `StatisticConsumer` 的进度回调
+///
+/// 此端点仅允许本机（127.0.0.1 / ::1）调用，防止外部进程注入虚假进度数据。
 pub async fn update_progress(
-    State(state): State<AppState>, Path(id): Path<String>, Json(report): Json<ProgressReport>,
-) -> Result<Json<()>> {
-    state.task_service.update_progress(&id, report).await?;
-    Ok(Json(()))
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(report): Json<ProgressReport>,
+) -> impl IntoResponse {
+    let ip = peer.ip();
+    if !ip.is_loopback() {
+        warn!("拒绝来自非本机地址的 update_progress 请求: {}", peer);
+        return (StatusCode::FORBIDDEN, "forbidden").into_response();
+    }
+    match state.task_service.update_progress(&id, report).await {
+        Ok(()) => Json(()).into_response(),
+        Err(e) => e.into_response(),
+    }
 }

@@ -22,19 +22,19 @@ use thiserror::Error;
 pub enum CliError {
     /// 应用错误
     ///
-    /// 当应用核心逻辑产生错误时触发，从app::error::AppError自动转换。
+    /// 当应用核心逻辑产生错误时触发，从 `app::error::AppError` 自动转换。
     #[error("{0}")]
     AppError(#[from] app::error::AppError),
 
     /// 工具错误
     ///
-    /// 当工具库产生错误时触发，从utils::error::UtilsError自动转换。
+    /// 当工具库产生错误时触发，从 `utils::error::UtilsError` 自动转换。
     #[error("{0}")]
     UtilsError(#[from] utils::error::UtilsError),
 
     /// Clap命令行解析错误
     ///
-    /// 当命令行参数解析失败时触发，从clap::Error自动转换。
+    /// 当命令行参数解析失败时触发，从 `clap::Error` 自动转换。
     #[error("{0}")]
     ClapError(#[from] clap::Error),
 
@@ -73,7 +73,7 @@ pub enum CliError {
 
     /// IO错误
     ///
-    /// 当文件或网络IO操作失败时触发，从标准库的io::Error自动转换。
+    /// 当文件或网络IO操作失败时触发，从标准库的 `io::Error` 自动转换。
     #[error("{0}")]
     IoError(#[from] std::io::Error),
 

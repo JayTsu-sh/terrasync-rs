@@ -43,7 +43,7 @@ impl std::str::FromStr for ExecutionType {
     }
 }
 
-/// TaskExecution 实体 — 任务执行历史记录
+/// `TaskExecution` 实体 — 任务执行历史记录
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaskExecution {
     pub id: String,
@@ -91,7 +91,7 @@ impl std::str::FromStr for LogLevel {
     }
 }
 
-/// TaskLog 值对象 — 任务执行日志
+/// `TaskLog` 值对象 — 任务执行日志
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaskLog {
     pub id: String,

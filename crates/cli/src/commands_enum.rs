@@ -2,8 +2,8 @@
 //!
 //! 该模块定义了CLI应用程序的各种命令枚举，包括：
 //! 1. 主命令枚举 Commands
-//! 2. ACE子命令枚举 AceCommands
-//! 3. 校验和类型枚举 IntegrityCheckType
+//! 2. ACE子命令枚举 `AceCommands`
+//! 3. 校验和类型枚举 `IntegrityCheckType`
 
 // 外部crate
 use clap::Subcommand;
@@ -96,12 +96,12 @@ pub enum Commands {
         dest_path: String,
 
         /// Enable checksum verification for files.
-        /// Also configurable in config file under [sync] enable_integrity_check
+        /// Also configurable in config file under `[sync]` `enable_integrity_check`
         #[arg(long, default_value_t = false)]
         enable_integrity_check: bool,
 
         /// Enable ACL (Windows only).
-        /// Also configurable in config file under [sync] enable_acl
+        /// Also configurable in config file under `[sync]` `enable_acl`
         #[arg(long, default_value_t = false)]
         enable_acl: bool,
 
@@ -122,8 +122,8 @@ pub enum Commands {
         #[arg(long, value_parser = validate_qos_format)]
         qos: Option<String>,
 
-        /// Peak QoS rate multiplier.
-        /// Also configurable in config file under [sync] peak_qos_rate
+        /// Peak `QoS` rate multiplier.
+        /// Also configurable in config file under `[sync]` `peak_qos_rate`
         #[arg(long, default_value_t = 2.0, value_parser = validate_peak_qos_rate)]
         peak_qos_rate: f32,
 
@@ -132,7 +132,7 @@ pub enum Commands {
         iops: Option<u32>,
 
         /// The block size to flush the data to destination storage, such as 4MiB, 16MiB, etc.
-        /// Also configurable in config file under [sync] block_size
+        /// Also configurable in config file under `[sync]` `block_size`
         #[arg(long, value_parser = validate_block_size)]
         block_size: Option<String>,
 

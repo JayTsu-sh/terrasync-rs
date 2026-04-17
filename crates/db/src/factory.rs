@@ -8,10 +8,10 @@
 
 // 标准库
 use std::sync::Arc;
+use std::sync::LazyLock;
 
 // 外部crate
 use dashmap::DashMap;
-use once_cell::sync::Lazy;
 use tracing::error;
 
 // 内部模块
@@ -28,10 +28,10 @@ pub type DatabaseCreator = fn(config: &DatabaseConfig, job_id: String) -> Result
 
 /// 数据库注册表 - 线程安全的全局映射
 /// 用于存储数据库类型名称和对应的创建函数
-static DATABASE_REGISTRY: Lazy<DashMap<String, DatabaseCreator>> = Lazy::new(|| {
+static DATABASE_REGISTRY: LazyLock<DashMap<String, DatabaseCreator>> = LazyLock::new(|| {
     let registry = DashMap::new();
     // 自动注册内置数据库类型
-    let _ = register_builtin_types(&registry);
+    register_builtin_types(&registry);
     registry
 });
 
@@ -106,8 +106,7 @@ impl DatabaseFactory {
         if let Err(e) = db_instance.ping().await {
             error!("[DatabaseFactory] Failed to connect to database: {:?}", e);
             return Err(DatabaseError::ConnectionError(format!(
-                "Failed to connect to database: {:?}",
-                e
+                "Failed to connect to database: {e:?}"
             )));
         }
 
@@ -116,7 +115,7 @@ impl DatabaseFactory {
 }
 
 // 内置类型注册函数
-fn register_builtin_types(registry: &DashMap<String, DatabaseCreator>) -> Result<()> {
+fn register_builtin_types(registry: &DashMap<String, DatabaseCreator>) {
     // Register ClickHouse
     registry.insert("clickhouse".to_string(), |config, job_id| {
         let clickhouse_config = config
@@ -139,6 +138,4 @@ fn register_builtin_types(registry: &DashMap<String, DatabaseCreator>) -> Result
         let db = DuckDBDatabase::new(duckdb_config.clone(), &job_id);
         Ok(Arc::new(db) as Arc<dyn Database>)
     });
-
-    Ok(())
 }

@@ -15,21 +15,18 @@ pub struct HCPRestClient {
 }
 
 impl HCPRestClient {
-    pub fn try_new(bucket_name: String, host: String, access_key: String, secret_access_key: String) -> Result<Self> {
+    pub fn try_new(bucket_name: String, host: String, access_key: &str, secret_access_key: &str) -> Result<Self> {
         let cookie_jar = Jar::default();
-        let base_url = format!("http://{}.{}", bucket_name, host);
+        let base_url = format!("http://{bucket_name}.{host}");
         let parsed_url = base_url
             .parse()
-            .map_err(|e| StorageError::ConfigError(format!("Invalid HCP base URL '{}': {}", base_url, e)))?;
-        cookie_jar.add_cookie_str(
-            &format!("hcp-ns-auth={}:{}", access_key, secret_access_key),
-            &parsed_url,
-        );
+            .map_err(|e| StorageError::ConfigError(format!("Invalid HCP base URL '{base_url}': {e}")))?;
+        cookie_jar.add_cookie_str(&format!("hcp-ns-auth={access_key}:{secret_access_key}"), &parsed_url);
 
         let client = Client::builder()
             .cookie_provider(Arc::new(cookie_jar))
             .build()
-            .map_err(|e| StorageError::OperationError(format!("Failed to create HCP HTTP client: {}", e)))?;
+            .map_err(|e| StorageError::OperationError(format!("Failed to create HCP HTTP client: {e}")))?;
 
         Ok(HCPRestClient {
             client,
@@ -49,7 +46,7 @@ impl HCPRestClient {
         let response = request
             .send()
             .await
-            .map_err(|e| StorageError::OperationError(format!("Failed to send request to HCP: {}", e)))?;
+            .map_err(|e| StorageError::OperationError(format!("Failed to send request to HCP: {e}")))?;
 
         if !response.status().is_success() {
             return Err(StorageError::OperationError(format!(
@@ -61,7 +58,7 @@ impl HCPRestClient {
         let body = response
             .text()
             .await
-            .map_err(|e| StorageError::OperationError(format!("Failed to read HCP response: {}", e)))?;
+            .map_err(|e| StorageError::OperationError(format!("Failed to read HCP response: {e}")))?;
 
         let tags = MetaData::parse_tags(&body);
         if tags.is_empty() {

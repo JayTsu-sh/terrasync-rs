@@ -29,14 +29,14 @@ const FILE_CHUNK_SIZE: usize = 4 * 1024 * 1024;
 
 /// 双进程全量同步 — Sender 侧入口
 ///
-/// 依次执行：QUIC 连接 → SessionConfig → Phase 1 文件列表 → Phase 2 请求处理 → Phase 3 Ack。
+/// 依次执行：QUIC 连接 → `SessionConfig` → Phase 1 文件列表 → Phase 2 请求处理 → Phase 3 Ack。
 pub(crate) async fn run(config: &SyncJobConfig, remote_addr: &str, tls_cert_bytes: Option<&[u8]>) -> Result<()> {
     info!("[Sender Remote] Connecting to Receiver at {}", remote_addr);
 
     // ── 1. 连接 QUIC ──
     let addr: SocketAddr = remote_addr
         .parse()
-        .map_err(|e| AppError::CopyError(format!("Invalid remote address '{}': {}", remote_addr, e)))?;
+        .map_err(|e| AppError::CopyError(format!("Invalid remote address '{remote_addr}': {e}")))?;
     let server_cert = tls_cert_bytes.map(|b| CertificateDer::from(b.to_vec()));
     let transport = transport::quic::connect(addr, "localhost", server_cert).await?;
     info!("[Sender Remote] Connected");
@@ -128,7 +128,7 @@ pub(crate) async fn run(config: &SyncJobConfig, remote_addr: &str, tls_cert_byte
 // Phase 1: 文件列表发送
 // ============================================================
 
-/// 遍历 walkdir_2 并按页发送给 Receiver，填充 ndx_table，返回发送的页数。
+/// 遍历 `walkdir_2` 并按页发送给 Receiver，填充 `ndx_table`，返回发送的页数。
 async fn send_file_list_phase(
     transport: &(dyn SenderTransport + 'static), walkdir_iter: &WalkDirAsyncIterator2, ndx_table: &mut NdxTable,
 ) -> Result<u64> {
@@ -155,7 +155,7 @@ async fn send_file_list_phase(
 // Phase 2: 传输请求处理
 // ============================================================
 
-/// 接收 Receiver 的 TransferRequest / DeltaTransferRequest，发送对应数据流。
+/// 接收 Receiver 的 `TransferRequest` / `DeltaTransferRequest`，发送对应数据流。
 /// 返回实际处理的传输请求数。
 async fn process_requests(
     transport: &(dyn SenderTransport + 'static), src_storage: &Arc<StorageEnum>, ndx_table: &NdxTable,
@@ -280,6 +280,7 @@ async fn handle_full_transfer(
 /// Delta 传输一个 entry：读取源文件 → 计算 delta tokens → 逐 token 发送。
 ///
 /// 返回 `Ok(true)` = 源文件读取成功并已发送，`Ok(false)` = 读取失败（已记录日志）。
+#[allow(clippy::too_many_arguments)]
 async fn handle_delta_transfer(
     transport: &(dyn SenderTransport + 'static), src_storage: &Arc<StorageEnum>, entry: &Arc<storage_v2::EntryEnum>,
     ndx: i32, block_size: u32, signatures: Vec<BlockSignature>, qos: Option<&QosManager>, enable_acl: bool,
@@ -350,15 +351,16 @@ async fn send_acl_if_enabled(
     transport: &(dyn SenderTransport + 'static), src_storage: &Arc<StorageEnum>, entry: &Arc<storage_v2::EntryEnum>,
     enable_acl: bool,
 ) {
-    if enable_acl && !entry.get_is_symlink() {
-        if let Ok(Some(acl_data)) = src_storage.get_acl_bytes(entry.get_relative_path()).await {
-            let _ = transport
-                .send(SenderMsg::SetAcl {
-                    entry: entry.clone(),
-                    acl_data: bytes::Bytes::from(acl_data),
-                })
-                .await;
-        }
+    if enable_acl
+        && !entry.get_is_symlink()
+        && let Ok(Some(acl_data)) = src_storage.get_acl_bytes(entry.get_relative_path()).await
+    {
+        let _ = transport
+            .send(SenderMsg::SetAcl {
+                entry: entry.clone(),
+                acl_data: bytes::Bytes::from(acl_data),
+            })
+            .await;
     }
 }
 
@@ -366,7 +368,7 @@ async fn send_acl_if_enabled(
 // Phase 3: Ack 收集
 // ============================================================
 
-/// 接收 Receiver 侧的 EntrySuccess / EntryError / Progress，直到 AllDone。
+/// 接收 Receiver 侧的 `EntrySuccess` / `EntryError` / `Progress`，直到 `AllDone`。
 /// 返回 `(success_count, error_count)`。
 async fn process_acks(
     transport: &(dyn SenderTransport + 'static), completed_paths: &mut HashSet<String>, checkpoint_path: &Path,
@@ -380,10 +382,10 @@ async fn process_acks(
                 success_count += 1;
                 completed_paths.insert(entry.get_relative_path().to_string_lossy().to_string());
                 // 周期性保存 checkpoint
-                if success_count % 100 == 0 {
-                    if let Ok(data) = serde_json::to_string(&completed_paths) {
-                        let _ = tokio::fs::write(checkpoint_path, data).await;
-                    }
+                if success_count.is_multiple_of(100)
+                    && let Ok(data) = serde_json::to_string(&completed_paths)
+                {
+                    let _ = tokio::fs::write(checkpoint_path, data).await;
                 }
             }
             Some(ReceiverMsg::Progress(snapshot)) => {

@@ -26,11 +26,11 @@ pub struct NdxEntry {
 /// 一整页目录内容，消费完 drop 即释放内存
 #[derive(Debug, Serialize, Deserialize)]
 pub struct DirPageResult {
-    /// 本目录的 relative_path（root 为空字符串）
+    /// 本目录的 `relative_path`（root 为空字符串）
     pub dir_path: String,
     /// 本页 NDX 范围起始（含）
     pub ndx_start: i32,
-    /// 文件 entries（已按 name 排序，NDX 从 ndx_start 连续递增）
+    /// 文件 entries（已按 name 排序，NDX 从 `ndx_start` 连续递增）
     pub files: Vec<NdxEntry>,
     /// 子目录 entries（已按 name 排序，NDX 紧接 files 之后连续递增）
     pub subdirs: Vec<NdxEntry>,
@@ -38,14 +38,14 @@ pub struct DirPageResult {
     pub gap_ndx: i32,
 }
 
-/// walkdir_2 产出的事件流（页级粒度）
+/// `walkdir_2` 产出的事件流（页级粒度）
 #[derive(Debug)]
 pub enum NdxEvent {
     /// 一整页目录内容，DFS 顺序产出
     Page(DirPageResult),
     /// 遍历过程中的 per-directory 错误（不中断整棵树）
     Error { path: String, reason: String },
-    /// 整棵树遍历完成，对应 rsync NDX_DONE = -1
+    /// 整棵树遍历完成，对应 rsync `NDX_DONE` = -1
     Done,
 }
 
@@ -87,7 +87,7 @@ impl DirHandle {
     }
 }
 
-/// 从 EntryEnum 提取后端对应的 DirHandle
+/// 从 `EntryEnum` 提取后端对应的 `DirHandle`
 ///
 /// 使用 `backend` 参数显式指定后端类型，避免隐式约定。
 pub fn extract_dir_handle(entry: &EntryEnum, root_path: &Path, backend: BackendKind) -> DirHandle {
@@ -114,7 +114,7 @@ pub fn extract_dir_handle(entry: &EntryEnum, root_path: &Path, backend: BackendK
     }
 }
 
-/// ReadRequest 携带的上下文：filter + depth 信息
+/// `ReadRequest` 携带的上下文：filter + depth 信息
 #[derive(Debug, Clone)]
 pub struct ReadContext {
     pub match_expr: Arc<Option<FilterExpression>>,
@@ -122,7 +122,7 @@ pub struct ReadContext {
     pub current_depth: usize,
     pub max_depth: usize,
     /// 是否对当前目录内的 entry 应用 filter。
-    /// false = 父目录已匹配，当前目录下所有 entry 无需过滤（对应 skip_filter=false）
+    /// false = 父目录已匹配，当前目录下所有 entry 无需过滤（对应 `skip_filter=false`）
     pub apply_filter: bool,
     /// S3 专用
     pub include_tags: bool,
@@ -134,9 +134,9 @@ pub struct ReadContext {
 pub struct SubdirEntry {
     pub entry: Arc<EntryEnum>,
     /// 是否在页面中可见（分配 NDX）。
-    /// false = 目录被 filter 跳过（skip_entry=true），但 continue_scan=true 仍需递归
+    /// false = 目录被 filter 跳过（`skip_entry=true`），但 `continue_scan=true` 仍需递归
     pub visible: bool,
-    /// 子目录内的 entry 是否需要 filter。映射自 should_skip 返回的 need_submatch。
+    /// 子目录内的 entry 是否需要 filter。映射自 `should_skip` 返回的 `need_submatch`。
     /// true = 子目录需要 filter，false = 子目录继承父目录的匹配状态（不过滤）
     pub need_filter: bool,
 }
@@ -147,7 +147,7 @@ pub struct ReadResult {
     pub dir_path: String,
     /// 排序后的文件 entries（非目录）
     pub files: Vec<Arc<EntryEnum>>,
-    /// 排序后的子目录 entries（含 visible/need_filter 标志）
+    /// 排序后的子目录 entries（含 `visible`/`need_filter` 标志）
     pub subdirs: Vec<SubdirEntry>,
     /// 读取过程中的错误
     pub errors: Vec<String>,
@@ -173,7 +173,7 @@ struct DfsFrame {
     dir_path: String,
     /// 本目录的读取结果 receiver
     read_rx: Option<oneshot::Receiver<Result<ReadResult>>>,
-    /// 所有子目录（含 visible/need_filter 标志）
+    /// 所有子目录（含 `visible`/`need_filter` 标志）
     subdirs: Vec<SubdirEntry>,
     /// 已提交预读的子目录对应的 oneshot receiver
     pending_reads: Vec<Option<oneshot::Receiver<Result<ReadResult>>>>,
@@ -198,7 +198,7 @@ impl DfsFrame {
         }
     }
 
-    /// 构建子目录的 ReadContext，传递 need_filter → apply_filter
+    /// 构建子目录的 `ReadContext`，传递 `need_filter` → `apply_filter`
     fn build_child_ctx(&self, child_idx: usize, base_ctx: &ReadContext) -> ReadContext {
         let need_filter = self.subdirs[child_idx].need_filter;
         ReadContext {
@@ -262,7 +262,7 @@ impl DfsFrame {
         }
     }
 
-    /// 通过 dir_path 的分隔符数量推算深度偏移
+    /// 通过 `dir_path` 的分隔符数量推算深度偏移
     fn depth_offset(&self) -> usize {
         if self.dir_path.is_empty() {
             1
@@ -320,29 +320,27 @@ pub async fn run_dfs_driver(
 
         // ① 首次进入：等待读取结果 + 窗口预读 + yield Page
         if !stack[frame_idx].page_sent {
-            let result = match stack[frame_idx].read_rx.take() {
-                Some(rx) => match rx.await {
-                    Ok(Ok(r)) => r,
-                    Ok(Err(e)) => {
-                        let _ = out_tx
-                            .send(NdxEvent::Error {
-                                path: stack[frame_idx].dir_path.clone(),
-                                reason: format!("{:?}", e),
-                            })
-                            .await;
-                        stack.pop();
-                        continue;
-                    }
-                    Err(_) => {
-                        error!(
-                            "[DfsDriver] oneshot receiver dropped for dir: {}",
-                            stack[frame_idx].dir_path
-                        );
-                        stack.pop();
-                        continue;
-                    }
-                },
-                None => {
+            let Some(rx) = stack[frame_idx].read_rx.take() else {
+                stack.pop();
+                continue;
+            };
+            let result = match rx.await {
+                Ok(Ok(r)) => r,
+                Ok(Err(e)) => {
+                    let _ = out_tx
+                        .send(NdxEvent::Error {
+                            path: stack[frame_idx].dir_path.clone(),
+                            reason: format!("{e:?}"),
+                        })
+                        .await;
+                    stack.pop();
+                    continue;
+                }
+                Err(_) => {
+                    error!(
+                        "[DfsDriver] oneshot receiver dropped for dir: {}",
+                        stack[frame_idx].dir_path
+                    );
                     stack.pop();
                     continue;
                 }
@@ -406,8 +404,8 @@ pub async fn run_dfs_driver(
             };
 
             // 只在有可见内容时发送 Page
-            if !files.is_empty() || !subdir_entries.is_empty() {
-                if out_tx
+            if (!files.is_empty() || !subdir_entries.is_empty())
+                && out_tx
                     .send(NdxEvent::Page(DirPageResult {
                         dir_path: stack[frame_idx].dir_path.clone(),
                         ndx_start,
@@ -417,9 +415,8 @@ pub async fn run_dfs_driver(
                     }))
                     .await
                     .is_err()
-                {
-                    return;
-                }
+            {
+                return;
             }
 
             stack[frame_idx].page_sent = true;

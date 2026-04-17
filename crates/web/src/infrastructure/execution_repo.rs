@@ -24,7 +24,7 @@ impl ExecutionRepository for SqliteExecutionRepo {
         let status = execution.status.to_string();
         let started_at = execution.started_at.to_rfc3339();
         let finished_at = execution.finished_at.map(|t| t.to_rfc3339());
-        let stats_json = execution.stats.as_ref().map(|s| serde_json::to_string(s)).transpose()?;
+        let stats_json = execution.stats.as_ref().map(serde_json::to_string).transpose()?;
 
         sqlx::query(
             "INSERT INTO task_executions (id, task_id, execution_type, status, started_at, finished_at, stats_json, error_message) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
@@ -51,7 +51,7 @@ impl ExecutionRepository for SqliteExecutionRepo {
         .fetch_all(&self.pool)
         .await?;
 
-        rows.into_iter().map(|r| r.try_into()).collect()
+        rows.into_iter().map(TryInto::try_into).collect()
     }
 
     async fn find_by_id(&self, id: &str) -> Result<Option<TaskExecution>> {
@@ -62,9 +62,10 @@ impl ExecutionRepository for SqliteExecutionRepo {
         .fetch_optional(&self.pool)
         .await?;
 
-        row.map(|r| r.try_into()).transpose()
+        row.map(TryInto::try_into).transpose()
     }
 
+    #[allow(clippy::similar_names)]
     async fn update_status(
         &self, id: &str, status: TaskStatus, stats: Option<&ExecutionStats>, error_msg: Option<&str>,
     ) -> Result<()> {
@@ -73,7 +74,7 @@ impl ExecutionRepository for SqliteExecutionRepo {
             TaskStatus::Completed | TaskStatus::Failed | TaskStatus::Cancelled => Some(chrono::Utc::now().to_rfc3339()),
             _ => None,
         };
-        let stats_json = stats.map(|s| serde_json::to_string(s)).transpose()?;
+        let stats_json = stats.map(serde_json::to_string).transpose()?;
 
         let result = sqlx::query(
             "UPDATE task_executions SET status = ?, finished_at = COALESCE(?, finished_at), stats_json = COALESCE(?, stats_json), error_message = COALESCE(?, error_message) WHERE id = ?",
@@ -181,7 +182,7 @@ impl ExecutionRepository for SqliteExecutionRepo {
                 .await?
         };
 
-        rows.into_iter().map(|r| r.try_into()).collect()
+        rows.into_iter().map(TryInto::try_into).collect()
     }
 }
 
@@ -200,12 +201,10 @@ struct ExecutionRow {
 impl TryFrom<ExecutionRow> for TaskExecution {
     type Error = WebError;
 
+    #[allow(clippy::similar_names)]
     fn try_from(row: ExecutionRow) -> Result<Self> {
-        let execution_type: ExecutionType = row
-            .execution_type
-            .parse()
-            .map_err(|e: String| WebError::ValidationError(e))?;
-        let status: TaskStatus = row.status.parse().map_err(|e: String| WebError::ValidationError(e))?;
+        let execution_type: ExecutionType = row.execution_type.parse().map_err(WebError::ValidationError)?;
+        let status: TaskStatus = row.status.parse().map_err(WebError::ValidationError)?;
         let started_at = parse_rfc3339(&row.started_at)?;
         let finished_at = row.finished_at.as_deref().map(parse_rfc3339).transpose()?;
         let stats: Option<ExecutionStats> = row.stats_json.as_deref().map(serde_json::from_str).transpose()?;
@@ -237,7 +236,7 @@ impl TryFrom<LogRow> for TaskLog {
     type Error = WebError;
 
     fn try_from(row: LogRow) -> Result<Self> {
-        let level: LogLevel = row.level.parse().map_err(|e: String| WebError::ValidationError(e))?;
+        let level: LogLevel = row.level.parse().map_err(WebError::ValidationError)?;
         let created_at = parse_rfc3339(&row.created_at)?;
 
         Ok(TaskLog {

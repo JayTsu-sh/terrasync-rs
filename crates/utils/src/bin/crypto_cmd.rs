@@ -9,7 +9,7 @@ use utils::error::{Result, UtilsError};
 
 fn main() -> Result<()> {
     let args: Vec<String> = env::args().collect();
-    println!("args: {:?}", args);
+    println!("args: {args:?}");
     // 检查命令行参数
     if args.len() < 2 {
         print_usage();
@@ -58,10 +58,10 @@ fn main() -> Result<()> {
     else if let Some(pwd) = password {
         if decrypt_mode {
             let decrypted = CryptoUtil::decrypt_password(&pwd)?;
-            println!("{}", decrypted);
+            println!("{decrypted}");
         } else {
             let encrypted = CryptoUtil::encrypt_password(&pwd)?;
-            println!("{}", encrypted);
+            println!("{encrypted}");
         }
     }
     // 无效参数组合
@@ -91,13 +91,13 @@ fn process_file(file_path: &str, decrypt_mode: bool) -> Result<()> {
     let reader = BufReader::new(file);
 
     // 创建临时文件用于写入结果
-    let temp_path = format!("{}.tmp", file_path);
+    let temp_path = format!("{file_path}.tmp");
     let temp_file = File::create(&temp_path)?;
     let mut writer = BufWriter::new(temp_file);
 
     // 匹配password字段的正则表达式
-    let password_regex = Regex::new(r#"password\s*=\s*"([^"]*)""#)
-        .map_err(|e| UtilsError::CryptoError(format!("Regex error: {}", e)))?;
+    let password_regex =
+        Regex::new(r#"password\s*=\s*"([^"]*)""#).map_err(|e| UtilsError::CryptoError(format!("Regex error: {e}")))?;
 
     // 逐行处理
     for line in reader.lines() {
@@ -106,12 +106,11 @@ fn process_file(file_path: &str, decrypt_mode: bool) -> Result<()> {
         // 查找password字段
         if let Some(captures) = password_regex.captures(&line) {
             // 检查password字段是否被注释
-            let password_start = match captures.get(0) {
-                Some(m) => m.start(),
-                None => {
-                    writeln!(writer, "{}", line)?;
-                    continue;
-                }
+            let password_start = if let Some(m) = captures.get(0) {
+                m.start()
+            } else {
+                writeln!(writer, "{line}")?;
+                continue;
             };
 
             // 提取password字段之前的内容
@@ -128,27 +127,26 @@ fn process_file(file_path: &str, decrypt_mode: bool) -> Result<()> {
                         is_commented = true;
                         break;
                     }
-                    _ => continue,
+                    _ => {}
                 }
             }
 
             if is_commented {
                 // 被注释的password不处理
-                writeln!(writer, "{}", line)?;
+                writeln!(writer, "{line}")?;
                 continue;
             }
 
-            let current_password = match captures.get(1) {
-                Some(m) => m.as_str().to_string(),
-                None => {
-                    writeln!(writer, "{}", line)?;
-                    continue;
-                }
+            let current_password = if let Some(m) = captures.get(1) {
+                m.as_str().to_string()
+            } else {
+                writeln!(writer, "{line}")?;
+                continue;
             };
 
             if current_password.is_empty() {
                 // 空密码保持不变
-                writeln!(writer, "{}", line)?;
+                writeln!(writer, "{line}")?;
                 continue;
             }
 
@@ -163,13 +161,13 @@ fn process_file(file_path: &str, decrypt_mode: bool) -> Result<()> {
             // 替换密码
             line = password_regex
                 .replace(&line, |_: &regex::Captures| {
-                    format!("password = \"{}\"", processed_password)
+                    format!("password = \"{processed_password}\"")
                 })
                 .to_string();
         }
 
         // 写入处理后的行
-        writeln!(writer, "{}", line)?;
+        writeln!(writer, "{line}")?;
     }
 
     // 刷新并关闭文件
@@ -179,6 +177,6 @@ fn process_file(file_path: &str, decrypt_mode: bool) -> Result<()> {
     // 替换原文件
     fs::rename(&temp_path, file_path)?;
 
-    println!("Successfully processed passwords in {}", file_path);
+    println!("Successfully processed passwords in {file_path}");
     Ok(())
 }

@@ -1,4 +1,4 @@
-//! 统一进度条 — 合并 FullProgressBar + IncrementalProgressBar，
+//! 统一进度条 — 合并 `FullProgressBar` + `IncrementalProgressBar`，
 //! 通过内部 `CounterSet` 枚举区分全量/增量计数器。
 //!
 //! 另保留独立的 `DirectoryMetadataProgressBar`（目录元数据同步进度）。
@@ -61,6 +61,7 @@ struct IncrCounters {
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 #[derive(Debug, Clone)]
+#[allow(clippy::struct_field_names)]
 struct RateTracker {
     last_update_time: Option<Instant>,
     last_count: u64,
@@ -72,7 +73,7 @@ struct RateTracker {
 // ProgressBar — 统一进度条
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-/// 统一进度条 — 替代 FullProgressBar + IncrementalProgressBar + ProgressBarKind
+/// 统一进度条 — 替代 `FullProgressBar` + `IncrementalProgressBar` + `ProgressBarKind`
 #[derive(Debug, Clone)]
 pub struct ProgressBar {
     pb: IndicatifBar,
@@ -84,7 +85,7 @@ pub struct ProgressBar {
 }
 
 impl ProgressBar {
-    /// 根据 JobType 创建对应的全量或增量进度条
+    /// 根据 `JobType` 创建对应的全量或增量进度条
     pub fn new(job_type: JobType) -> Self {
         let now = Instant::now();
         let counters = match job_type {
@@ -112,8 +113,18 @@ impl ProgressBar {
             }),
         };
 
+        let pb = {
+            let bar = IndicatifBar::new_spinner();
+            // 模板只解析一次；数据通过 set_message() 更新，避免每次刷新重复调用
+            // Template::from_str（火焰图中的热点）
+            if let Ok(style) = ProgressStyle::default_spinner().template("{spinner}{msg}") {
+                bar.set_style(style);
+            }
+            bar
+        };
+
         Self {
-            pb: IndicatifBar::new_spinner(),
+            pb,
             job_type,
             start_time: now,
             real_time_bytes: Arc::new(AtomicU64::new(0)),
@@ -127,7 +138,7 @@ impl ProgressBar {
         }
     }
 
-    /// 获取 real_time_bytes 原子计数器（Copy job 使用 chunk 粒度带宽）
+    /// 获取 `real_time_bytes` 原子计数器（Copy job 使用 chunk 粒度带宽）
     pub fn get_real_time_bytes_counter(&self) -> Arc<AtomicU64> {
         self.real_time_bytes.clone()
     }
@@ -217,10 +228,7 @@ impl ProgressBar {
     }
 
     fn display_full(&mut self) {
-        let c = match &self.counters {
-            CounterSet::Full(c) => c,
-            _ => return,
-        };
+        let CounterSet::Full(c) = &self.counters else { return };
 
         let total_count = c.total_count.load(Ordering::Relaxed);
         let total_file_count = c.total_file_count.load(Ordering::Relaxed);
@@ -248,22 +256,21 @@ impl ProgressBar {
         let formatted_time = fmt_elapsed(elapsed);
         let op = self.job_type.to_operation_name();
 
-        let template = match self.job_type {
+        let msg = match self.job_type {
             JobType::IntegrityCheck => format!(
-                "{{spinner}}{op} Completed: files {total_file_count} | Rate: {item_rate:.0} items/sec | Size: {formatted_size} | Rate: {formatted_size_rate}/sec | Runtime: {formatted_time}                  "
+                "{op} Completed: files {total_file_count} | Rate: {item_rate:.0} items/sec | Size: {formatted_size} | Rate: {formatted_size_rate}/sec | Runtime: {formatted_time}                  "
             ),
             _ => format!(
-                "{{spinner}}{op} Completed: total {total_count} (files {total_file_count}, dirs {total_dir_count}) | Rate: {item_rate:.0} items/sec | Size: {formatted_size} | Rate: {formatted_size_rate}/sec | Runtime: {formatted_time}                  "
+                "{op} Completed: total {total_count} (files {total_file_count}, dirs {total_dir_count}) | Rate: {item_rate:.0} items/sec | Size: {formatted_size} | Rate: {formatted_size_rate}/sec | Runtime: {formatted_time}                  "
             ),
         };
 
-        self.log_and_set_style(&template);
+        self.log_and_set_msg(&msg);
     }
 
     fn display_incremental(&mut self) {
-        let c = match &self.counters {
-            CounterSet::Incremental(c) => c,
-            _ => return,
+        let CounterSet::Incremental(c) = &self.counters else {
+            return;
         };
 
         let scanned_file = c.scanned_regular_file_count.load(Ordering::Relaxed);
@@ -299,16 +306,11 @@ impl ProgressBar {
         let op = self.job_type.to_operation_name();
         let formatted_time = fmt_elapsed(elapsed);
 
-        #[cfg(target_os = "windows")]
-        let prefix = "\r";
-        #[cfg(not(target_os = "windows"))]
-        let prefix = "";
-
-        let template = format!(
-            "{prefix}{{spinner}}{op}: scanned {scanned_count} (files {scanned_file}, dirs {scanned_dir}) | {scanned_size_fmt} | {scan_rate:.0} items/sec | {size_rate_fmt}/sec | Runtime: {formatted_time}\n         \u{21b3} New {new_count} ({new_size}) | Changed {changed_count} ({changed_size}) | Deleted {deleted_count} | Renamed {renamed_count}                  "
+        let msg = format!(
+            "{op}: scanned {scanned_count} (files {scanned_file}, dirs {scanned_dir}) | {scanned_size_fmt} | {scan_rate:.0} items/sec | {size_rate_fmt}/sec | Runtime: {formatted_time}\n         \u{21b3} New {new_count} ({new_size}) | Changed {changed_count} ({changed_size}) | Deleted {deleted_count} | Renamed {renamed_count}                  "
         );
 
-        self.log_and_set_style(&template);
+        self.log_and_set_msg(&msg);
     }
 
     /// 共享的速率计算逻辑
@@ -334,16 +336,14 @@ impl ProgressBar {
         }
     }
 
-    /// 共享的日志输出 + 样式设置
-    fn log_and_set_style(&mut self, template: &str) {
+    /// 共享的日志输出 + 进度条消息更新（模板已在 `new()` 中解析过一次，此处只更新消息内容）
+    fn log_and_set_msg(&mut self, msg: &str) {
         let now = Instant::now();
         if now.duration_since(self.rate.last_log_time).as_secs() >= LOG_INTERVAL_SECS {
-            info!("{}", template);
+            info!("{}", msg);
             self.rate.last_log_time = now;
         }
-        if let Ok(style) = ProgressStyle::default_spinner().template(template) {
-            self.pb.set_style(style);
-        }
+        self.pb.set_message(msg.to_string());
     }
 
     // ─── 生命周期 ───
@@ -439,6 +439,12 @@ impl ProgressBar {
 pub struct DirectoryMetadataProgressBar {
     pb: IndicatifBar,
     total_dir_count: Arc<AtomicU64>,
+}
+
+impl Default for DirectoryMetadataProgressBar {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl DirectoryMetadataProgressBar {

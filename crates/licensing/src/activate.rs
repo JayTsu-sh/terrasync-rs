@@ -50,11 +50,12 @@ pub fn activate_license(license_path: &Path) -> Result<()> {
 
     // 5. 哨兵检查：此机器是否已激活此 license
     let sentinel_id = sha256_hex(license.payload.license_id.as_bytes())[..16].to_string();
-    if let Some(sentinel) = read_sentinel(&license.payload.license_id)? {
-        if sentinel.fp == current_fp && sentinel.id == sentinel_id {
-            info!("This machine is already activated (sentinel exists)");
-            return Ok(());
-        }
+    if let Some(sentinel) = read_sentinel(&license.payload.license_id)?
+        && sentinel.fp == current_fp
+        && sentinel.id == sentinel_id
+    {
+        info!("This machine is already activated (sentinel exists)");
+        return Ok(());
     }
 
     match &mut license.activation {
@@ -130,7 +131,9 @@ pub fn activate_license(license_path: &Path) -> Result<()> {
     write_license_atomic(license_path, &license)?;
 
     // 7. 写入哨兵文件
-    let seal_hmac = compute_sentinel_hmac(&license.payload.license_id, &current_fp, &now)?;
+    // 使用 sentinel_id（license_id 的 SHA-256 前16位）而非明文 license_id 计算 HMAC，
+    // 与 verify_sentinel_hmac 保持一致（验证方只能访问 sentinel.id，不能访问原始 license_id）
+    let seal_hmac = compute_sentinel_hmac(&sentinel_id, &current_fp, &now)?;
     let sentinel = SentinelData {
         id: sentinel_id,
         fp: current_fp,

@@ -163,7 +163,7 @@ impl EndpointService {
         Self::test_endpoint_connectivity(&endpoint).await
     }
 
-    /// 测试端点连通性（复用于 test_connection 和 update_endpoint 保存前校验）
+    /// 测试端点连通性（复用于 `test_connection` 和 `update_endpoint` 保存前校验）
     async fn test_endpoint_connectivity(endpoint: &Endpoint) -> Result<String> {
         let url = endpoint.to_storage_url(None);
 

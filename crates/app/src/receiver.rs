@@ -34,6 +34,12 @@ pub struct ReceiverProgress {
     pub error_count: AtomicU64,
 }
 
+impl Default for ReceiverProgress {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ReceiverProgress {
     pub fn new() -> Self {
         Self {
@@ -110,7 +116,7 @@ pub async fn receiver_task(
                         if let Err(send_err) = transport
                             .send(ReceiverMsg::EntryError {
                                 entry,
-                                reason: format!("{}", e),
+                                reason: format!("{e}"),
                             })
                             .await
                         {
@@ -161,7 +167,7 @@ pub async fn receiver_task(
     Ok(())
 }
 
-/// 在 Receiver 侧执行完整的 entry 复制（对应原 process_entry）
+/// 在 Receiver 侧执行完整的 entry 复制（对应原 `process_entry`）
 ///
 /// 根据 entry 类型（目录/符号链接/文件）dispatch 到不同的存储操作。
 /// 单进程模式下 Receiver 拥有 src+dest storage，可以直接调用 `copy_file`。
@@ -182,17 +188,16 @@ pub(crate) async fn process_entry_on_receiver(
             let target_path = src_storage
                 .read_symlink(entry)
                 .await
-                .map_err(|e| AppError::CopyError(format!("Failed to read symlink {:?}: {}", relative_path, e)))?;
-            dest_storage
-                .create_symlink(entry, &target_path)
-                .await
-                .map_err(|e| AppError::CopyError(format!("Failed to create symlink {:?}: {}", relative_path, e)))?;
+                .map_err(|e| AppError::CopyError(format!("Failed to read symlink {}: {e}", relative_path.display())))?;
+            dest_storage.create_symlink(entry, &target_path).await.map_err(|e| {
+                AppError::CopyError(format!("Failed to create symlink {}: {e}", relative_path.display()))
+            })?;
 
             // 源端符号链接删除（is_source_reserved=false 时）
-            if !config.is_source_reserved {
-                if let Err(e) = src_storage.delete_file(entry).await {
-                    error!("[Receiver] Failed to remove source symlink {:?}: {}", relative_path, e);
-                }
+            if !config.is_source_reserved
+                && let Err(e) = src_storage.delete_file(entry).await
+            {
+                error!("[Receiver] Failed to remove source symlink {:?}: {}", relative_path, e);
             }
         } else {
             StorageEnum::copy_file(
@@ -205,20 +210,20 @@ pub(crate) async fn process_entry_on_receiver(
                 bytes_counter,
             )
             .await
-            .map_err(|e| AppError::CopyError(format!("Failed to copy {:?}: {}", relative_path, e)))?;
+            .map_err(|e| AppError::CopyError(format!("Failed to copy {}: {e}", relative_path.display())))?;
 
             // 设置目标文件元数据（mtime/uid/gid/mode 或 S3 mtime/tags）
-            dest_storage
-                .set_entry_metadata(entry)
-                .await
-                .map_err(|e| AppError::CopyError(format!("Failed to set metadata for {:?}: {}", relative_path, e)))?;
+            dest_storage.set_entry_metadata(entry).await.map_err(|e| {
+                AppError::CopyError(format!("Failed to set metadata for {}: {e}", relative_path.display()))
+            })?;
         }
 
         // ACL 复制（目录和文件均需要，symlink 除外）
-        if config.enable_acl && !entry.get_is_symlink() {
-            if let Err(e) = StorageEnum::copy_acl(src_storage, dest_storage, relative_path).await {
-                error!("[Receiver] Failed to copy ACL for {:?}: {}", relative_path, e);
-            }
+        if config.enable_acl
+            && !entry.get_is_symlink()
+            && let Err(e) = StorageEnum::copy_acl(src_storage, dest_storage, relative_path).await
+        {
+            error!("[Receiver] Failed to copy ACL for {:?}: {}", relative_path, e);
         }
 
         Ok(())
@@ -234,8 +239,8 @@ pub(crate) async fn process_entry_on_receiver(
 /// 双进程模式的 Receiver task（入口）
 ///
 /// 分阶段顺序协议：
-/// 1. 接收 SessionConfig
-/// 2. 接收 FilePage → DestIndex 逐页比较 → 发 TransferRequest
+/// 1. 接收 `SessionConfig`
+/// 2. 接收 `FilePage` → `DestIndex` 逐页比较 → 发 `TransferRequest`
 /// 3. 接收数据流 → 写入目标端 → 发 EntrySuccess/Error
 pub async fn receiver_task_remote(
     transport: &(dyn ReceiverTransport + 'static), dest_storage: Arc<StorageEnum>,
@@ -294,7 +299,7 @@ async fn recv_session_config(transport: &(dyn ReceiverTransport + 'static)) -> R
     }
 }
 
-/// 阶段 1：接收 FilePage → 构建 DestIndex → 发 TransferRequest / DeltaTransferRequest
+/// 阶段 1：接收 `FilePage` → 构建 `DestIndex` → 发 `TransferRequest` / `DeltaTransferRequest`
 async fn recv_file_list_phase(
     transport: &(dyn ReceiverTransport + 'static), dest_storage: &Arc<StorageEnum>, session_config: &SessionConfig,
     progress: &Arc<ReceiverProgress>,
@@ -423,7 +428,7 @@ async fn recv_file_list_phase(
 
 /// 阶段 2：接收文件数据流，写入目标端
 ///
-/// 使用 BytesMut 缓冲多 chunk 数据，FileBegin 消息重置缓冲区避免跨文件状态污染。
+/// 使用 `BytesMut` 缓冲多 chunk 数据，`FileBegin` 消息重置缓冲区避免跨文件状态污染。
 async fn recv_file_data_phase(
     transport: &(dyn ReceiverTransport + 'static), dest_storage: &Arc<StorageEnum>, session_config: &SessionConfig,
     progress: &Arc<ReceiverProgress>, mut progress_rx: MpscReceiver<ProgressSnapshot>,
@@ -440,7 +445,6 @@ async fn recv_file_data_phase(
         tokio::select! {
             Some(snapshot) = progress_rx.recv() => {
                 let _ = transport.send(ReceiverMsg::Progress(snapshot)).await;
-                continue;
             }
             msg = transport.recv() => { match msg {
             // ── 文件开始：重置缓冲区，防止跨文件状态污染 ──
@@ -469,7 +473,7 @@ async fn recv_file_data_phase(
                     Err(e) => {
                         error!("[Receiver Remote] create_symlink {:?}: {}", entry.get_relative_path(), e);
                         let _ = transport
-                            .send(ReceiverMsg::EntryError { entry, reason: format!("{}", e) })
+                            .send(ReceiverMsg::EntryError { entry, reason: format!("{e}") })
                             .await;
                     }
                 }
@@ -497,10 +501,10 @@ async fn recv_file_data_phase(
 
             // ── ACL 跨进程 ──
             Some(SenderMsg::SetAcl { entry, acl_data }) => {
-                if session_config.enable_acl {
-                    if let Err(e) = dest_storage.set_acl_bytes(entry.get_relative_path(), &acl_data).await {
-                        warn!("[Receiver Remote] set ACL {:?}: {}", entry.get_relative_path(), e);
-                    }
+                if session_config.enable_acl
+                    && let Err(e) = dest_storage.set_acl_bytes(entry.get_relative_path(), &acl_data).await
+                {
+                    warn!("[Receiver Remote] set ACL {:?}: {}", entry.get_relative_path(), e);
                 }
             }
 
@@ -517,10 +521,10 @@ async fn recv_file_data_phase(
     Ok(())
 }
 
-/// EndOfFile 处理：重建文件字节（delta 或全量） → hash 校验 → 写入目标端 → 发送 Ack
+/// `EndOfFile` 处理：重建文件字节（delta 或全量） → hash 校验 → 写入目标端 → 发送 Ack
 ///
 /// `tokens` 非空时执行 delta 重建，为空时直接使用 `file_data`。
-/// 所有非致命错误（basis 读失败、hash 不符、写入失败）均自行发送 EntryError 后返回，不向上传播。
+/// 所有非致命错误（basis 读失败、hash 不符、写入失败）均自行发送 `EntryError` 后返回，不向上传播。
 async fn handle_end_of_file(
     transport: &(dyn ReceiverTransport + 'static), dest_storage: &Arc<StorageEnum>, entry: Arc<storage_v2::EntryEnum>,
     source_hash: Option<String>, tokens: Vec<sync_delta::DeltaToken>, file_data: bytes::Bytes,
@@ -529,7 +533,9 @@ async fn handle_end_of_file(
     let relative_path = entry.get_relative_path();
 
     // 重建文件字节：delta 或全量
-    let file_bytes: bytes::Bytes = if !tokens.is_empty() {
+    let file_bytes: bytes::Bytes = if tokens.is_empty() {
+        file_data
+    } else {
         info!(
             "[Receiver Remote] Delta reconstruct {:?}: {} tokens",
             relative_path,
@@ -546,14 +552,12 @@ async fn handle_end_of_file(
                 let _ = transport
                     .send(ReceiverMsg::EntryError {
                         entry,
-                        reason: format!("{}", e),
+                        reason: format!("{e}"),
                     })
                     .await;
                 return;
             }
         }
-    } else {
-        file_data
     };
 
     // 验证 hash
@@ -589,7 +593,7 @@ async fn handle_end_of_file(
             let _ = transport
                 .send(ReceiverMsg::EntryError {
                     entry,
-                    reason: format!("{}", e),
+                    reason: format!("{e}"),
                 })
                 .await;
         }

@@ -7,7 +7,7 @@ use tracing::warn;
 /// WebSocket 进度推送端点
 ///
 /// 当前为占位实现 — 保持连接并定期发送心跳。
-/// 后续将集成 TaskRunner 的进度通道，推送 ProgressEvent。
+/// 后续将集成 `TaskRunner` 的进度通道，推送 `ProgressEvent`。
 pub async fn ws_handler(ws: WebSocketUpgrade) -> impl IntoResponse {
     ws.on_upgrade(handle_socket)
 }
@@ -20,16 +20,15 @@ async fn handle_socket(socket: WebSocket) {
         tokio::select! {
             _ = interval.tick() => {
                 let ping = serde_json::json!({ "type": "ping" });
-                if let Ok(text) = serde_json::to_string(&ping) {
-                    if sender.send(Message::Text(text.into())).await.is_err() {
-                        break;
-                    }
+                if let Ok(text) = serde_json::to_string(&ping)
+                    && sender.send(Message::Text(text.into())).await.is_err()
+                {
+                    break;
                 }
             }
             msg = receiver.next() => {
                 match msg {
-                    Some(Ok(Message::Close(_))) | None => break,
-                    Some(Err(_)) => break,
+                    Some(Ok(Message::Close(_)) | Err(_)) | None => break,
                     _ => {}
                 }
             }

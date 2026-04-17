@@ -12,7 +12,7 @@ pub async fn start_web_server(host: &str, port: u16) -> Result<()> {
     let db_pool = crate::infrastructure::db::init_database().await?;
 
     // 2. 构建应用状态
-    let app_state = crate::api::state::AppState::new(db_pool).await;
+    let app_state = crate::api::state::AppState::new(db_pool);
 
     // 3. 从 SQLite 加载已保存的配置并应用
     app_state.config_service.apply_saved_config().await;
@@ -33,7 +33,7 @@ pub async fn start_web_server(host: &str, port: u16) -> Result<()> {
     info!("TerraSync Web GUI listening on http://{}", addr);
     info!("Press Ctrl+C to stop the server");
 
-    axum::serve(listener, app)
+    axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>())
         .with_graceful_shutdown(shutdown_signal())
         .await
         .map_err(WebError::IoError)?;

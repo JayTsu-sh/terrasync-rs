@@ -163,7 +163,8 @@ impl Endpoint {
                 };
 
                 if let Some(ref pfx) = effective_prefix {
-                    url.push_str(&format!(":/{}", pfx.trim_start_matches('/')));
+                    url.push_str(":/");
+                    url.push_str(pfx.trim_start_matches('/'));
                 }
 
                 let mut params = Vec::new();
@@ -198,7 +199,8 @@ impl Endpoint {
 
                 let mut url = format!("{scheme}{access_key}:{secret_key}@{bucket}.{host}:{port}");
                 if let Some(ref pfx) = effective_prefix {
-                    url.push_str(&format!("/{}", pfx.trim_start_matches('/')));
+                    url.push('/');
+                    url.push_str(pfx.trim_start_matches('/'));
                 }
                 url
             }
@@ -217,9 +219,10 @@ impl Endpoint {
                     (None, None) => None,
                 };
 
-                let mut url = format!("smb://{}:{}@{}:{}/{}", username, password, server, port, share);
+                let mut url = format!("smb://{username}:{password}@{server}:{port}/{share}");
                 if let Some(ref pfx) = effective_prefix {
-                    url.push_str(&format!("/{}", pfx.trim_start_matches('/')));
+                    url.push('/');
+                    url.push_str(pfx.trim_start_matches('/'));
                 }
                 url
             }

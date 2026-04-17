@@ -43,20 +43,19 @@ pub fn setup_logging(job_id: Option<&str>) -> Result<()> {
     }
 
     // 防御性校验：确保 job_id 不含路径穿越字符
-    if let Some(id) = job_id {
-        if id.contains('/') || id.contains('\\') || id.contains("..") {
-            return Err(UtilsError::Other(format!(
-                "job_id contains unsafe path characters: {}",
-                id
-            )));
-        }
+    if let Some(id) = job_id
+        && (id.contains('/') || id.contains('\\') || id.contains(".."))
+    {
+        return Err(UtilsError::Other(format!(
+            "job_id contains unsafe path characters: {id}"
+        )));
     }
 
     // 初始化log到tracing的桥接（外部crate如rdkafka、aws-sdk-s3使用log crate）
-    if let Err(e) = LogTracer::init() {
-        if e.to_string() != "logger already registered" {
-            return Err(UtilsError::LoggerError(e));
-        }
+    if let Err(e) = LogTracer::init()
+        && e.to_string() != "logger already registered"
+    {
+        return Err(UtilsError::LoggerError(e));
     }
 
     // 获取日志级别
@@ -87,7 +86,7 @@ pub fn setup_logging(job_id: Option<&str>) -> Result<()> {
         RollingConditionBasic::new().daily().max_size(max_size_bytes),
         max_backups,
     )
-    .map_err(|e| UtilsError::Other(format!("Failed to create app log roller: {}", e)))?;
+    .map_err(|e| UtilsError::Other(format!("Failed to create app log roller: {e}")))?;
 
     // 创建 error.log 目录
     let error_log_dir = error_log_file_path
@@ -101,7 +100,7 @@ pub fn setup_logging(job_id: Option<&str>) -> Result<()> {
         RollingConditionBasic::new().daily().max_size(max_size_bytes),
         max_backups,
     )
-    .map_err(|e| UtilsError::Other(format!("Failed to create error log roller: {}", e)))?;
+    .map_err(|e| UtilsError::Other(format!("Failed to create error log roller: {e}")))?;
 
     // 包装为非阻塞 writer
     let (app_non_blocking, app_guard) = tracing_appender::non_blocking(app_roller);
@@ -155,7 +154,7 @@ pub fn setup_logging(job_id: Option<&str>) -> Result<()> {
             RollingConditionBasic::new().daily().max_size(max_size_bytes),
             max_backups,
         )
-        .map_err(|e| UtilsError::Other(format!("Failed to create JSON log roller: {}", e)))?;
+        .map_err(|e| UtilsError::Other(format!("Failed to create JSON log roller: {e}")))?;
 
         let (json_non_blocking, json_guard) = tracing_appender::non_blocking(json_roller);
         guards.push(json_guard);
@@ -198,7 +197,7 @@ pub fn setup_logging(job_id: Option<&str>) -> Result<()> {
     Ok(())
 }
 
-/// 获取轮转配置（max_size_bytes, max_backups）
+/// 获取轮转配置（`max_size_bytes`, `max_backups`）
 fn get_rotation_config() -> (u64, usize) {
     if let Ok(app_config) = AppConfig::fetch() {
         let max_size = app_config.log.max_size * 1024 * 1024; // MB -> bytes

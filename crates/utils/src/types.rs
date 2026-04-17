@@ -40,7 +40,7 @@ pub enum LogLevel {
     Error,
 }
 
-/// 实现Display trait，方便将LogLevel转换为字符串
+/// 实现 `Display` trait，方便将 `LogLevel` 转换为字符串
 impl std::fmt::Display for LogLevel {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         let s = match *self {
@@ -50,11 +50,11 @@ impl std::fmt::Display for LogLevel {
             LogLevel::Warn => "warn",
             LogLevel::Error => "error",
         };
-        write!(f, "{}", s)
+        write!(f, "{s}")
     }
 }
 
-/// 实现FromStr trait，方便从字符串转换为LogLevel
+/// 实现 `FromStr` trait，方便从字符串转换为 `LogLevel`
 impl FromStr for LogLevel {
     type Err = UtilsError;
 
@@ -65,7 +65,7 @@ impl FromStr for LogLevel {
             "info" => Ok(LogLevel::Info),
             "warn" => Ok(LogLevel::Warn),
             "error" => Ok(LogLevel::Error),
-            _ => Err(UtilsError::InvalidLogLevel(format!("Invalid log level: {}", s))),
+            _ => Err(UtilsError::InvalidLogLevel(format!("Invalid log level: {s}"))),
         }
     }
 }
@@ -73,7 +73,7 @@ impl FromStr for LogLevel {
 /// 将 job ID 规范化为 ClickHouse/文件系统安全的标识符
 ///
 /// 仅保留 `[a-zA-Z0-9_]`，其余字符一律替换为 `_`。
-/// 适用于 ClickHouse 表名后缀和 job 目录名。
+/// 适用于 `ClickHouse` 表名后缀和 job 目录名。
 pub fn sanitize_job_id(id: &str) -> String {
     id.chars()
         .map(|c| if c.is_ascii_alphanumeric() || c == '_' { c } else { '_' })

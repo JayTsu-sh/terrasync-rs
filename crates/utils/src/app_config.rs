@@ -152,7 +152,7 @@ fn default_license_config() -> LicenseConfig {
 }
 
 impl AppConfig {
-    /// 一步初始化配置：default_config(最低优先级) → config_file(中优先级) → build → 存入 OnceLock
+    /// 一步初始化配置：`default_config`(最低优先级) → `config_file`(中优先级) → build → 存入 `OnceLock`
     ///
     /// 调用后通过 `override_with()` 设置 CLI 参数覆盖（最高优先级），
     /// 最终通过 `fetch()` 获取配置快照。
@@ -187,7 +187,7 @@ impl AppConfig {
 
     /// CLI 参数覆盖配置值（最高优先级）
     ///
-    /// 接受闭包直接修改 AppConfig 字段，类型安全。
+    /// 接受闭包直接修改 `AppConfig` 字段，类型安全。
     /// 示例：`AppConfig::override_with(|c| c.log.level = "debug".to_string())?;`
     pub fn override_with<F>(mutator: F) -> Result<()>
     where
@@ -201,9 +201,9 @@ impl AppConfig {
         Ok(())
     }
 
-    /// 获取配置快照（clone AppConfig）
+    /// 获取配置快照（clone `AppConfig`）
     ///
-    /// 相比旧实现（每次 clone ConfigBuilder + build），开销大幅降低。
+    /// 相比旧实现（每次 clone `ConfigBuilder` + build），开销大幅降低。
     pub fn fetch() -> Result<AppConfig> {
         let lock = CONFIG
             .get()
@@ -212,7 +212,7 @@ impl AppConfig {
         Ok(r.clone())
     }
 
-    /// 校验配置值的合理性，在 init() 中 build 后调用
+    /// 校验配置值的合理性，在 `init()` 中 build 后调用
     pub fn validate(&self) -> Result<()> {
         let check_concurrency = |val: usize, name: &str| -> Result<()> {
             if val == 0 {
@@ -227,12 +227,12 @@ impl AppConfig {
         check_concurrency(self.delete.concurrency, "delete.concurrency")?;
 
         // sync 额外校验
-        if let Some(rate) = self.sync.peak_qos_rate {
-            if rate <= 0.0 {
-                return Err(UtilsError::ConfigConversionError(
-                    "sync.peak_qos_rate 必须 > 0".to_string(),
-                ));
-            }
+        if let Some(rate) = self.sync.peak_qos_rate
+            && rate <= 0.0
+        {
+            return Err(UtilsError::ConfigConversionError(
+                "sync.peak_qos_rate 必须 > 0".to_string(),
+            ));
         }
 
         // database 配置校验

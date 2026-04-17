@@ -3,7 +3,7 @@
 //! 核心输出类型，职责正交：
 //! - `ProgressReport` — 实时进度 + HTTP 回调 envelope（统一快照与回调）
 //! - `JobResult` — 任务完成后的最终返回值（scan/sync/ic 统一）
-//! - `FinalStats` — 最终分布统计（附加到 ProgressReport 的 final 回调）
+//! - `FinalStats` — 最终分布统计（附加到 `ProgressReport` 的 final 回调）
 
 use std::collections::HashMap;
 
@@ -156,7 +156,7 @@ pub struct FileSizeRangeStatEntry {
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 impl StatsKind {
-    /// 生成最终结果报告（替代 StatisticJobStats）
+    /// 生成最终结果报告（替代 `StatisticJobStats`）
     pub fn to_job_result(&self) -> JobResult {
         match self {
             StatsKind::Full(s) => JobResult {

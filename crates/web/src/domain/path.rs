@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-/// MigrationPath 实体 — 属于 Endpoint 的子路径
+/// `MigrationPath` 实体 — 属于 `Endpoint` 的子路径
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MigrationPath {
     pub id: String,

@@ -137,7 +137,7 @@ impl Clone for StorageError {
             StorageError::InvalidPath(s) => StorageError::InvalidPath(s.clone()),
             StorageError::InvalidFilterExpression(s) => StorageError::InvalidFilterExpression(s.clone()),
             StorageError::MismatchedParentheses(s) => StorageError::MismatchedParentheses(s.clone()),
-            StorageError::InvalidToken(s) => StorageError::InvalidToken(s.clone()),
+            StorageError::InvalidToken(s) => StorageError::InvalidToken(*s),
             StorageError::UnexpectedEndOfToken(s) => StorageError::UnexpectedEndOfToken(s.clone()),
             StorageError::ChecksumError(s) => StorageError::ChecksumError(s.clone()),
             StorageError::S3Error(s) => StorageError::S3Error(s.clone()),
@@ -158,5 +158,5 @@ impl Clone for StorageError {
 }
 
 /// 存储操作的结果类型别名
-/// 封装了StorageError作为错误类型
+/// 封装了 `StorageError` 作为错误类型
 pub type Result<T> = std::result::Result<T, StorageError>;

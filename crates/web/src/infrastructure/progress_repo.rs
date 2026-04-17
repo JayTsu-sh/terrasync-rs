@@ -20,13 +20,13 @@ impl SqliteProgressRepo {
 impl ProgressRepository for SqliteProgressRepo {
     async fn upsert(&self, p: &TaskProgress) -> Result<()> {
         sqlx::query(
-            r#"INSERT INTO task_progress (task_id, report_json, is_final, updated_at)
+            r"INSERT INTO task_progress (task_id, report_json, is_final, updated_at)
             VALUES (?1, ?2, ?3, ?4)
             ON CONFLICT(task_id) DO UPDATE SET
                 report_json = excluded.report_json,
                 is_final = excluded.is_final,
                 updated_at = excluded.updated_at
-            "#,
+            ",
         )
         .bind(&p.task_id)
         .bind(&p.report_json)

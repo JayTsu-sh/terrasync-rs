@@ -32,7 +32,7 @@ const APP_VERSION: &str = "3.0.0";
 /// 重新导出命令枚举类型
 pub use commands_enum::*;
 
-/// 公共API的prelude模块
+/// 公共API的 `prelude` 模块
 ///
 /// 用户可以通过 `use cli::prelude::*` 来导入最常用的类型，
 /// 简化应用开发过程中的导入语句
@@ -86,7 +86,7 @@ pub struct Cli {
     pub license: Option<PathBuf>,
 
     /// Enable JSON structured logging (outputs to app.json.log).
-    /// Also configurable in config file under [log] enable_json
+    /// Also configurable in config file under `[log]` `enable_json`
     #[arg(long, global = true)]
     pub json: bool,
 
@@ -99,7 +99,7 @@ pub struct Cli {
     command: Commands,
 }
 
-/// 从已解析的命令中提取或自动生成 job_id
+/// 从已解析的命令中提取或自动生成 `job_id`
 ///
 /// - 有 `--id` 参数：sanitize 后返回
 /// - 无 `--id` 但为 job 类命令：自动生成时间戳 ID
@@ -113,15 +113,12 @@ fn resolve_job_id(command: &Commands) -> Option<String> {
         },
         _ => return None,
     };
-    Some(raw_id.map_or_else(
-        || format!("{}", Local::now().format("%Y%m%d_%H%M%S")),
-        |s| sanitize_job_id(s),
-    ))
+    Some(raw_id.map_or_else(|| format!("{}", Local::now().format("%Y%m%d_%H%M%S")), sanitize_job_id))
 }
 
-/// 从 resolved_job_id 中获取 job_id 引用，若为 None 则返回错误
+/// 从 `resolved_job_id` 中获取 `job_id` 引用，若为 None 则返回错误
 fn require_job_id<'a>(job_id: Option<&'a str>, cmd: &str) -> error::Result<&'a str> {
-    job_id.ok_or_else(|| error::CliError::InvalidParameter(format!("{} requires job_id", cmd)))
+    job_id.ok_or_else(|| error::CliError::InvalidParameter(format!("{cmd} requires job_id")))
 }
 
 /// 命令行入口点，处理命令行参数并执行相应命令
@@ -140,7 +137,7 @@ pub async fn cli_match() -> error::Result<()> {
     // 检查版本参数（需要在 Cli::parse 前处理，避免缺少子命令时报错）
     for arg in &args {
         if arg == "-v" || arg == "--version" {
-            println!("version: {}", APP_VERSION);
+            println!("version: {APP_VERSION}");
             std::process::exit(0);
         }
     }
@@ -149,7 +146,7 @@ pub async fn cli_match() -> error::Result<()> {
 
     // 处理版本参数
     if cli.version {
-        println!("version: {}", APP_VERSION);
+        println!("version: {APP_VERSION}");
         std::process::exit(0);
     }
 
@@ -199,7 +196,7 @@ pub async fn cli_match() -> error::Result<()> {
     }
     // ========================
 
-    println!(" 🚀 Terrasync {} | (c) 2025 LenovoNetapp, Inc. \n", APP_VERSION);
+    println!(" 🚀 Terrasync {APP_VERSION} | (c) 2025 LenovoNetapp, Inc. \n");
 
     info!(" 🚀 Terrasync {} | (c) 2025 LenovoNetapp, Inc.", APP_VERSION);
 
@@ -221,7 +218,7 @@ pub async fn cli_match() -> error::Result<()> {
                 exclude,
                 raw_command_line,
             )
-            .await?
+            .await?;
         }
         Commands::Sync {
             src_path,
@@ -288,7 +285,7 @@ pub async fn cli_match() -> error::Result<()> {
                 *auto_fix,
                 raw_command_line,
             )
-            .await?
+            .await?;
         }
         #[cfg(feature = "gui")]
         Commands::Gui { host, port } => commands::gui_cmd(host, *port).await?,

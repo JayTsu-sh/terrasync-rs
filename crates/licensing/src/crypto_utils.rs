@@ -49,7 +49,7 @@ pub fn verify_signature(payload_json: &str, signature_base64: &str) -> Result<()
 
 /// 计算机器列表的 binding HMAC
 ///
-/// HMAC 密钥通过 HKDF 从 HMAC_BINDING_SECRET 和 Ed25519 签名联合派生。
+/// HMAC 密钥通过 HKDF 从 `HMAC_BINDING_SECRET` 和 Ed25519 签名联合派生。
 /// 消息为所有机器绑定信息的序列化。
 pub fn compute_binding_hmac(
     signature: &str, machines: &[MachineBinding], license_clock: Option<DateTime<Utc>>,
@@ -64,7 +64,7 @@ pub fn compute_binding_hmac(
     Ok(hex::encode(mac.finalize().into_bytes()))
 }
 
-/// 使用 HKDF 从 HMAC_BINDING_SECRET + signature 派生 HMAC 密钥
+/// 使用 HKDF 从 `HMAC_BINDING_SECRET` + signature 派生 HMAC 密钥
 fn derive_hmac_key(signature: &str) -> Result<[u8; 32]> {
     let hk = Hkdf::<Sha256>::new(Some(signature.as_bytes()), HMAC_BINDING_SECRET);
     let mut okm = [0u8; 32];

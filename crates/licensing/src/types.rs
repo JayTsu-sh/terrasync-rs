@@ -81,7 +81,7 @@ pub struct MachineBinding {
 /// 哨兵文件数据（字段名缩短，避免文件内容出现明文关键词）
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SentinelData {
-    /// license_id 的 SHA-256 前 16 位（不存明文 license_id）
+    /// `license_id` 的 SHA-256 前 16 位（不存明文 `license_id`）
     pub id: String,
     /// 机器指纹
     pub fp: String,

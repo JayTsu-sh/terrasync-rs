@@ -19,13 +19,13 @@ use thiserror::Error;
 /// 使用thiserror库实现错误处理和转换
 #[derive(Error, Debug)]
 pub enum DatabaseError {
-    /// ClickHouse数据库相关错误
-    /// 从clickhouse库的错误类型自动转换
+    /// `ClickHouse` 数据库相关错误
+    /// 从 `clickhouse` 库的错误类型自动转换
     #[error("ClickHouse error: {0}")]
     ClickHouseError(#[from] clickhouse::error::Error),
 
-    /// DuckDB数据库相关错误
-    /// DuckDB数据库操作失败时触发
+    /// `DuckDB` 数据库相关错误
+    /// `DuckDB` 数据库操作失败时触发
     #[error("DuckDB error: {0}")]
     DuckDbError(String),
 
@@ -102,5 +102,5 @@ pub enum DatabaseError {
 }
 
 /// 数据库操作的结果类型别名
-/// 封装了DatabaseError作为错误类型
+/// 封装了 `DatabaseError` 作为错误类型
 pub type Result<T> = std::result::Result<T, DatabaseError>;

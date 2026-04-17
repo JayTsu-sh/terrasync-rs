@@ -17,11 +17,12 @@ use crate::EntryEnum;
 /// - 124..136: size (octal, null-terminated)
 /// - 136..148: mtime (octal, null-terminated)
 /// - 148..156: checksum (octal + space + null)
-/// - 156:      type_flag ('0'=file, '5'=dir, '2'=symlink)
-/// - 157..257: link_name
+/// - 156:      `type_flag` ('0'=file, '5'=dir, '2'=symlink)
+/// - 157..257: `link_name`
 /// - 257..263: "ustar\0"
 /// - 263..265: "00"
 /// - 265..512: 填零
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn build_ustar_header(
     path: &str, size: u64, mtime: i64, mode: u32, uid: u32, gid: u32, type_flag: u8, link_name: &str,
 ) -> [u8; 512] {
@@ -31,13 +32,13 @@ pub(crate) fn build_ustar_header(
     write_bytes(&mut header[0..100], path.as_bytes());
 
     // mode (100..108) — octal, 7 chars + NUL
-    write_octal(&mut header[100..108], mode as u64, 7);
+    write_octal(&mut header[100..108], u64::from(mode), 7);
 
     // uid (108..116)
-    write_octal(&mut header[108..116], uid as u64, 7);
+    write_octal(&mut header[108..116], u64::from(uid), 7);
 
     // gid (116..124)
-    write_octal(&mut header[116..124], gid as u64, 7);
+    write_octal(&mut header[116..124], u64::from(gid), 7);
 
     // size (124..136) — 11 chars + NUL
     write_octal(&mut header[124..136], size, 11);
@@ -60,7 +61,7 @@ pub(crate) fn build_ustar_header(
 
     // checksum (148..156) — 先用空格填充，然后计算
     header[148..156].copy_from_slice(b"        "); // 8 spaces
-    let checksum: u64 = header.iter().map(|&b| b as u64).sum();
+    let checksum: u64 = header.iter().map(|&b| u64::from(b)).sum();
     write_octal(&mut header[148..156], checksum, 6);
     header[154] = 0; // NUL
     header[155] = b' '; // trailing space
@@ -70,7 +71,7 @@ pub(crate) fn build_ustar_header(
 
 /// 将 octal 值写入指定字段（右对齐，前置零）
 fn write_octal(field: &mut [u8], value: u64, width: usize) {
-    let s = format!("{:0>width$o}", value, width = width);
+    let s = format!("{value:0>width$o}");
     let bytes = s.as_bytes();
     let len = bytes.len().min(field.len() - 1);
     field[..len].copy_from_slice(&bytes[bytes.len() - len..]);
@@ -108,9 +109,9 @@ pub fn calculate_tar_size(entries: &[Arc<EntryEnum>]) -> u64 {
     size
 }
 
-/// 从 EntryEnum 构建 ustar header 的 Bytes
+/// 从 `EntryEnum` 构建 ustar header 的 Bytes
 ///
-/// 自动判断条目类型（目录/symlink/普通文件）并设置对应的 type_flag 和 size。
+/// 自动判断条目类型（目录/symlink/普通文件）并设置对应的 `type_flag` 和 size。
 /// `tar_internal_path` 是条目在 tar 内的相对路径。
 pub(crate) fn build_header_for_entry(entry: &EntryEnum, tar_internal_path: &str, link_target: &str) -> Bytes {
     let (type_flag, size) = if entry.get_is_dir() {
@@ -123,7 +124,7 @@ pub(crate) fn build_header_for_entry(entry: &EntryEnum, tar_internal_path: &str,
 
     // 目录路径需要以 '/' 结尾
     let path = if entry.get_is_dir() && !tar_internal_path.ends_with('/') {
-        format!("{}/", tar_internal_path)
+        format!("{tar_internal_path}/")
     } else {
         tar_internal_path.to_string()
     };
@@ -144,7 +145,7 @@ pub(crate) fn build_header_for_entry(entry: &EntryEnum, tar_internal_path: &str,
 
 /// 生成 512 字节对齐的 padding
 ///
-/// 如果 file_size 不是 512 的倍数，返回对应长度的零填充 Bytes。
+/// 如果 `file_size` 不是 512 的倍数，返回对应长度的零填充 Bytes。
 /// 如果已对齐则返回 None。
 pub(crate) fn tar_padding(file_size: u64) -> Option<Bytes> {
     let remainder = file_size % 512;

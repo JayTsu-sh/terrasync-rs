@@ -25,10 +25,7 @@ pub fn verify_license(license_path: &Path) -> Result<LicenseFile> {
 
     // 2. 初始化 LicenseClock
     let mut clock = match license.license_clock {
-        Some(persisted) => {
-            warn!("License verification failed");
-            LicenseClock::from_persisted(persisted)?
-        }
+        Some(persisted) => LicenseClock::from_persisted(persisted)?,
         None => LicenseClock::initialize(),
     };
 
@@ -131,32 +128,32 @@ pub fn quick_verify(license: &LicenseFile) -> Result<()> {
 
 /// 使用 license 时钟检查有效期
 fn check_expiry_with_clock(license: &LicenseFile, clock: &LicenseClock) -> Result<()> {
-    if let Some(expires_at) = license.payload.expires_at {
-        if clock.now() > expires_at {
-            warn!("License verification failed");
-            return Err(LicenseError::Expired {
-                expires_at: expires_at.to_rfc3339(),
-            });
-        }
+    if let Some(expires_at) = license.payload.expires_at
+        && clock.now() > expires_at
+    {
+        warn!("License verification failed");
+        return Err(LicenseError::Expired {
+            expires_at: expires_at.to_rfc3339(),
+        });
     }
     Ok(())
 }
 
 /// 检查有效期（旧格式回退，使用系统时钟）
 fn check_expiry(license: &LicenseFile) -> Result<()> {
-    if let Some(expires_at) = license.payload.expires_at {
-        if Utc::now() > expires_at {
-            return Err(LicenseError::Expired {
-                expires_at: expires_at.to_rfc3339(),
-            });
-        }
+    if let Some(expires_at) = license.payload.expires_at
+        && Utc::now() > expires_at
+    {
+        return Err(LicenseError::Expired {
+            expires_at: expires_at.to_rfc3339(),
+        });
     }
     Ok(())
 }
 
 /// HMAC 验证（兼容新旧格式）
 ///
-/// 先尝试新格式（含 license_clock），失败回退旧格式（不含 clock），
+/// 先尝试新格式（含 `license_clock`），失败回退旧格式（不含 clock），
 /// 处理升级迁移场景。
 fn verify_binding_hmac_compat(license: &LicenseFile) -> Result<()> {
     let activation = license.activation.as_ref().ok_or(LicenseError::NotActivated)?;
@@ -178,7 +175,7 @@ fn verify_binding_hmac_compat(license: &LicenseFile) -> Result<()> {
     Err(LicenseError::BindingHmacInvalid)
 }
 
-/// 更新哨兵文件的 license_clock
+/// 更新哨兵文件的 `license_clock`
 fn update_sentinel_clock(license: &LicenseFile, fingerprint: Option<&str>) -> Result<()> {
     let license_id = &license.payload.license_id;
     if let Some(sentinel) = read_sentinel(license_id)? {

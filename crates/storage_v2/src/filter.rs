@@ -9,7 +9,7 @@ use tracing::trace;
 // 内部模块
 use crate::{Result, error::StorageError};
 
-/// glob 匹配选项：require_literal_separator = true 确保 `*` 不匹配路径分隔符 `/`，
+/// glob 匹配选项：`require_literal_separator = true` 确保 `*` 不匹配路径分隔符 `/`，
 /// 只有 `**` 才能跨越目录边界。
 const GLOB_MATCH_OPTIONS: MatchOptions = MatchOptions {
     case_sensitive: true,
@@ -50,15 +50,16 @@ enum ModifiedValue {
 /// - `extension`: 文件扩展名（可选）
 ///
 /// # 返回值
-/// 返回一个三元组 (should_skip, continue_scan, check_children)，其中：
+/// 返回一个三元组 (`should_skip`, `continue_scan`, `check_children`)，其中：
 /// 1. `should_skip`: 当前条目是否应该被跳过，true表示跳过，不构建为StorageEntry
 /// 2. `continue_scan`: 是否需要继续扫描子目录（仅对目录有效），true表示继续扫描
-/// 3. `check_children`: 子目录或文件是否需要执行should_skip匹配，true表示需要进一步匹配
+/// 3. `check_children`: 子目录或文件是否需要执行`should_skip`匹配，true表示需要进一步匹配
 ///
 /// # 执行逻辑
 /// 1. 优先检查排除表达式（黑名单），匹配则跳过
 /// 2. 再检查匹配表达式（白名单），根据匹配结果决定是否跳过
 /// 3. 最后处理无匹配表达式的情况
+#[allow(clippy::too_many_arguments)]
 pub fn should_skip(
     match_expressions: Option<&FilterExpression>, exclude_expressions: Option<&FilterExpression>,
     file_name: Option<&str>, file_path: Option<&str>, file_type: Option<&str>, modified_epoch: Option<i64>,
@@ -96,7 +97,7 @@ pub fn should_skip(
         );
 
         match match_result {
-            MatchResult::Match(MatchAddon::PathMatch) | MatchResult::Match(MatchAddon::MixMatch) => {
+            MatchResult::Match(MatchAddon::PathMatch | MatchAddon::MixMatch) => {
                 // 带路径条件完整匹配黑名单，跳过当前条目，不继续扫描子目录
                 trace!(
                     "[filter::should_skip:FILTER-EXCLUDE-MATCH] 带路径条件完整匹配黑名单，跳过当前条目，停止递归: name={:?}, path={:?}",
@@ -189,7 +190,7 @@ pub fn should_skip(
                 // Always continue scanning for partial matches if it's a directory
                 return (true, is_dir, true);
             }
-            _ => { /* 过滤表达式没有白名单适用条件，继续后续流程 */ }
+            MatchResult::LazyMatch => { /* 过滤表达式没有白名单适用条件，继续后续流程 */ }
         }
     }
 
@@ -201,10 +202,10 @@ pub fn should_skip(
     (false, is_dir, true)
 }
 
-/// 检查目录名是否匹配 match_expressions 中的 DirDate 条件
+/// 检查目录名是否匹配 `match_expressions` 中的 `DirDate` 条件
 ///
-/// 仅在 packaged 模式下由 walkdir 调用。如果 match_expressions 为 None 或不包含
-/// DirDate 条件，返回 false。
+/// 仅在 packaged 模式下由 walkdir 调用。如果 `match_expressions` 为 None 或不包含
+/// `DirDate` 条件，返回 false。
 pub fn dir_matches_date_filter(match_expressions: Option<&FilterExpression>, dir_name: &str) -> bool {
     match match_expressions {
         Some(expr) => expr.has_matching_dir_date(dir_name),
@@ -235,7 +236,7 @@ pub struct FilterFieldDef {
     pub name: &'static str,
     /// 中文标签
     pub label: &'static str,
-    /// 值类型：glob, bytes, duration_or_date, enum, date
+    /// 值类型：glob, bytes, `duration_or_date`, enum, date
     pub value_type: &'static str,
     /// 该字段支持的操作符列表
     pub operators: Vec<FilterOperatorDef>,
@@ -317,6 +318,7 @@ pub fn get_filter_field_definitions() -> Vec<FilterFieldDef> {
 }
 
 /// 评估过滤表达式的辅助函数
+#[allow(clippy::too_many_arguments)]
 fn evaluate_filter(
     expr: &FilterExpression, file_name: Option<&str>, file_path: Option<&str>, file_type: Option<&str>,
     modified_epoch: Option<i64>, size: Option<u64>, extension: Option<&str>, now_epoch: i64,
@@ -416,12 +418,13 @@ impl<'a> Lexer<'a> {
                 && self.position + 3 <= self.input.len()
             {
                 // 检查前面是否有条件或右括号
-                if let Some(last_token) = tokens.last() {
-                    if matches!(last_token, Token::Condition(_) | Token::RParen) {
-                        tokens.push(Token::And);
-                        self.consume_n(3);
-                        continue;
-                    }
+                if tokens
+                    .last()
+                    .is_some_and(|t| matches!(t, Token::Condition(_) | Token::RParen))
+                {
+                    tokens.push(Token::And);
+                    self.consume_n(3);
+                    continue;
                 }
             }
 
@@ -429,19 +432,20 @@ impl<'a> Lexer<'a> {
                 && self.position + 2 <= self.input.len()
             {
                 // 检查前面是否有条件或右括号
-                if let Some(last_token) = tokens.last() {
-                    if matches!(last_token, Token::Condition(_) | Token::RParen) {
-                        tokens.push(Token::Or);
-                        self.consume_n(2);
-                        continue;
-                    }
+                if tokens
+                    .last()
+                    .is_some_and(|t| matches!(t, Token::Condition(_) | Token::RParen))
+                {
+                    tokens.push(Token::Or);
+                    self.consume_n(2);
+                    continue;
                 }
             }
 
             // 处理条件表达式
             let start_pos = self.position;
             let condition = self.read_condition();
-            if let Some(cond) = self.parse_condition(&condition)? {
+            if let Some(cond) = Self::parse_condition(&condition)? {
                 tokens.push(Token::Condition(cond));
             } else if start_pos == self.position {
                 // 如果位置没有移动，说明无法解析，跳过当前字符
@@ -485,10 +489,9 @@ impl<'a> Lexer<'a> {
                     paren_count -= 1;
                     self.consume();
                     continue;
-                } else {
-                    // 遇到右括号，条件结束
-                    break;
                 }
+                // 遇到右括号，条件结束
+                break;
             }
 
             // 检查是否遇到逻辑运算符（不在引号内且没有未匹配的括号）
@@ -500,14 +503,14 @@ impl<'a> Lexer<'a> {
                 // 检查是否到达字符串末尾
                 if self.position + 3 <= self.input.len() && &self.input[self.position..self.position + 3] == "and" {
                     let next_char = self.input.as_bytes().get(self.position + 3).map(|&b| b as char);
-                    if next_char.map_or(true, |c| c.is_whitespace() || c == ')') {
+                    if next_char.is_none_or(|c| c.is_whitespace() || c == ')') {
                         break;
                     }
                 }
 
                 if self.position + 2 <= self.input.len() && &self.input[self.position..self.position + 2] == "or" {
                     let next_char = self.input.as_bytes().get(self.position + 2).map(|&b| b as char);
-                    if next_char.map_or(true, |c| c.is_whitespace() || c == ')') {
+                    if next_char.is_none_or(|c| c.is_whitespace() || c == ')') {
                         break;
                     }
                 }
@@ -522,11 +525,7 @@ impl<'a> Lexer<'a> {
     }
 
     fn peek(&self) -> char {
-        self.input
-            .as_bytes()
-            .get(self.position)
-            .map(|&b| b as char)
-            .unwrap_or('\0')
+        self.input.as_bytes().get(self.position).map_or('\0', |&b| b as char)
     }
 
     fn peek_rest(&self) -> &str {
@@ -545,7 +544,7 @@ impl<'a> Lexer<'a> {
         self.position += n;
     }
 
-    /// 解析操作符字符串为 CompareOp 枚举
+    /// 解析操作符字符串为 `CompareOp` 枚举
     fn parse_operator(op: &str) -> Option<CompareOp> {
         match op {
             "==" => Some(CompareOp::Eq),
@@ -559,24 +558,24 @@ impl<'a> Lexer<'a> {
     }
 
     /// Parse a single filter condition
-    fn parse_condition(&self, expr: &str) -> Result<Option<FilterCondition>> {
+    fn parse_condition(expr: &str) -> Result<Option<FilterCondition>> {
         let expr = expr.trim();
 
         // Handle comparison operators
         let operators = ["==", "!=", "<=", ">=", "<", ">"];
-        for op in operators.iter() {
+        for op in &operators {
             if let Some(pos) = expr.find(op) {
                 let field = expr[..pos].trim();
                 let value = expr[pos + op.len()..].trim();
 
                 let compare_op = Self::parse_operator(op)
-                    .ok_or_else(|| StorageError::InvalidFilterExpression(format!("Unknown operator: {}", op)))?;
+                    .ok_or_else(|| StorageError::InvalidFilterExpression(format!("Unknown operator: {op}")))?;
 
                 match field {
                     "name" => {
-                        let value = self.extract_quoted_value(value, "");
+                        let value = Self::extract_quoted_value(value, "");
                         let pattern = Pattern::new(&value).map_err(|e| {
-                            StorageError::InvalidFilterExpression(format!("Invalid glob pattern '{}': {}", value, e))
+                            StorageError::InvalidFilterExpression(format!("Invalid glob pattern '{value}': {e}"))
                         })?;
                         return Ok(Some(FilterCondition::Name {
                             operator: compare_op,
@@ -584,18 +583,15 @@ impl<'a> Lexer<'a> {
                         }));
                     }
                     "path" => {
-                        let value = self.extract_quoted_value(value, "");
+                        let value = Self::extract_quoted_value(value, "");
                         let raw_value = value.trim_end_matches('/').to_string();
                         let pattern = Pattern::new(&raw_value).map_err(|e| {
-                            StorageError::InvalidFilterExpression(format!(
-                                "Invalid glob pattern '{}': {}",
-                                raw_value, e
-                            ))
+                            StorageError::InvalidFilterExpression(format!("Invalid glob pattern '{raw_value}': {e}",))
                         })?;
                         let pattern_parts: Vec<String> = raw_value
                             .split('/')
                             .filter(|s| !s.is_empty())
-                            .map(|s| s.to_string())
+                            .map(std::string::ToString::to_string)
                             .collect();
                         let pattern_depth = pattern_parts.len();
                         let has_double_wildcard = pattern_parts.iter().any(|p| p == "**");
@@ -616,12 +612,12 @@ impl<'a> Lexer<'a> {
                         }));
                     }
                     "type" => {
-                        let value = self.extract_quoted_value(value, "");
+                        let value = Self::extract_quoted_value(value, "");
                         // 验证类型值是否有效
                         if value != "file" && value != "dir" && value != "symlink" {
-                            return Err(StorageError::InvalidFilterExpression(
-                                format!("Invalid file type: {}", value).to_string(),
-                            ));
+                            return Err(StorageError::InvalidFilterExpression(format!(
+                                "Invalid file type: {value}"
+                            )));
                         }
                         return Ok(Some(FilterCondition::Type {
                             operator: compare_op,
@@ -629,7 +625,7 @@ impl<'a> Lexer<'a> {
                         }));
                     }
                     "modified" => {
-                        let modified_value = self.parse_modified_value(value, compare_op)?;
+                        let modified_value = Self::parse_modified_value(value, compare_op)?;
                         return Ok(Some(FilterCondition::Modified {
                             operator: compare_op,
                             value: modified_value,
@@ -638,16 +634,16 @@ impl<'a> Lexer<'a> {
                     "size" => {
                         let value = value
                             .parse::<u64>()
-                            .map_err(|e| StorageError::InvalidPath(format!("Failed to parse size value: {}", e)))?;
+                            .map_err(|e| StorageError::InvalidPath(format!("Failed to parse size value: {e}")))?;
                         return Ok(Some(FilterCondition::Size {
                             operator: compare_op,
                             value,
                         }));
                     }
                     "extension" => {
-                        let value = self.extract_quoted_value(value, "");
+                        let value = Self::extract_quoted_value(value, "");
                         let pattern = Pattern::new(&value).map_err(|e| {
-                            StorageError::InvalidFilterExpression(format!("Invalid glob pattern '{}': {}", value, e))
+                            StorageError::InvalidFilterExpression(format!("Invalid glob pattern '{value}': {e}"))
                         })?;
                         return Ok(Some(FilterCondition::Extension {
                             operator: compare_op,
@@ -670,7 +666,7 @@ impl<'a> Lexer<'a> {
     }
 
     /// 解析 modified 条件的值
-    fn parse_modified_value(&self, value: &str, op: CompareOp) -> Result<ModifiedValue> {
+    fn parse_modified_value(value: &str, op: CompareOp) -> Result<ModifiedValue> {
         let trimmed = value.trim();
 
         // 检查是否有引号包裹（绝对时间格式）
@@ -695,11 +691,11 @@ impl<'a> Lexer<'a> {
         }
 
         // 8位及以上纯数字（≥ 10000000）→ 紧凑日期 YYYYMMDD
-        if let Ok(num) = unquoted.parse::<i64>() {
-            if num >= 10000000 {
-                let epoch = parse_compact_date_to_epoch(unquoted)?;
-                return Ok(ModifiedValue::AbsoluteEpoch(epoch));
-            }
+        if let Ok(num) = unquoted.parse::<i64>()
+            && num >= 10_000_000
+        {
+            let epoch = parse_compact_date_to_epoch(unquoted)?;
+            return Ok(ModifiedValue::AbsoluteEpoch(epoch));
         }
 
         // 其它：相对天数（带 d 后缀或纯数字）
@@ -711,17 +707,17 @@ impl<'a> Lexer<'a> {
                     .take_while(|c| c.is_ascii_digit() || *c == '.')
                     .collect();
                 num_str.parse::<f64>().map_err(|e| {
-                    StorageError::InvalidFilterExpression(format!("Failed to parse modified value: {}", e))
+                    StorageError::InvalidFilterExpression(format!("Failed to parse modified value: {e}"))
                 })?
             } else {
                 unquoted.parse::<f64>().map_err(|e| {
-                    StorageError::InvalidFilterExpression(format!("Failed to parse modified value: {}", e))
+                    StorageError::InvalidFilterExpression(format!("Failed to parse modified value: {e}"))
                 })?
             }
         } else {
             unquoted
                 .parse::<f64>()
-                .map_err(|e| StorageError::InvalidFilterExpression(format!("Failed to parse modified value: {}", e)))?
+                .map_err(|e| StorageError::InvalidFilterExpression(format!("Failed to parse modified value: {e}")))?
         };
 
         // 相对天数不支持 == 操作符
@@ -735,12 +731,12 @@ impl<'a> Lexer<'a> {
     }
 
     /// Extract quoted string value from expression
-    fn extract_quoted_value(&self, expr: &str, prefix: &str) -> String {
-        if !prefix.is_empty() {
-            if let Some(start) = expr.find(prefix) {
-                let rest = &expr[start + prefix.len()..];
-                return self.extract_quoted_value(rest, "");
-            }
+    fn extract_quoted_value(expr: &str, prefix: &str) -> String {
+        if !prefix.is_empty()
+            && let Some(start) = expr.find(prefix)
+        {
+            let rest = &expr[start + prefix.len()..];
+            return Self::extract_quoted_value(rest, "");
         }
 
         let rest = expr.trim_start();
@@ -772,38 +768,36 @@ fn parse_date_to_epoch(s: &str) -> Result<i64> {
     let date_parts: Vec<&str> = date_part.split('-').collect();
     if date_parts.len() != 3 {
         return Err(StorageError::InvalidFilterExpression(format!(
-            "Invalid date format '{}', expected YYYY-MM-DD",
-            s
+            "Invalid date format '{s}', expected YYYY-MM-DD",
         )));
     }
 
     let year: i64 = date_parts[0]
         .parse()
-        .map_err(|_| StorageError::InvalidFilterExpression(format!("Invalid year in date '{}'", s)))?;
+        .map_err(|_| StorageError::InvalidFilterExpression(format!("Invalid year in date '{s}'")))?;
     let month: i64 = date_parts[1]
         .parse()
-        .map_err(|_| StorageError::InvalidFilterExpression(format!("Invalid month in date '{}'", s)))?;
+        .map_err(|_| StorageError::InvalidFilterExpression(format!("Invalid month in date '{s}'")))?;
     let day: i64 = date_parts[2]
         .parse()
-        .map_err(|_| StorageError::InvalidFilterExpression(format!("Invalid day in date '{}'", s)))?;
+        .map_err(|_| StorageError::InvalidFilterExpression(format!("Invalid day in date '{s}'")))?;
 
     let (hour, minute, second) = if let Some(tp) = time_part {
         let time_parts: Vec<&str> = tp.split(':').collect();
         if time_parts.len() != 3 {
             return Err(StorageError::InvalidFilterExpression(format!(
-                "Invalid time format in '{}', expected HH:MM:SS",
-                s
+                "Invalid time format in '{s}', expected HH:MM:SS"
             )));
         }
         let h: i64 = time_parts[0]
             .parse()
-            .map_err(|_| StorageError::InvalidFilterExpression(format!("Invalid hour in date '{}'", s)))?;
+            .map_err(|_| StorageError::InvalidFilterExpression(format!("Invalid hour in date '{s}'")))?;
         let m: i64 = time_parts[1]
             .parse()
-            .map_err(|_| StorageError::InvalidFilterExpression(format!("Invalid minute in date '{}'", s)))?;
+            .map_err(|_| StorageError::InvalidFilterExpression(format!("Invalid minute in date '{s}'")))?;
         let sec: i64 = time_parts[2]
             .parse()
-            .map_err(|_| StorageError::InvalidFilterExpression(format!("Invalid second in date '{}'", s)))?;
+            .map_err(|_| StorageError::InvalidFilterExpression(format!("Invalid second in date '{s}'")))?;
         (h, m, sec)
     } else {
         (0, 0, 0)
@@ -816,20 +810,19 @@ fn parse_date_to_epoch(s: &str) -> Result<i64> {
 fn parse_compact_date_to_epoch(s: &str) -> Result<i64> {
     if s.len() < 8 {
         return Err(StorageError::InvalidFilterExpression(format!(
-            "Invalid compact date format '{}', expected YYYYMMDD",
-            s
+            "Invalid compact date format '{s}', expected YYYYMMDD"
         )));
     }
 
     let year: i64 = s[..4]
         .parse()
-        .map_err(|_| StorageError::InvalidFilterExpression(format!("Invalid year in compact date '{}'", s)))?;
+        .map_err(|_| StorageError::InvalidFilterExpression(format!("Invalid year in compact date '{s}'")))?;
     let month: i64 = s[4..6]
         .parse()
-        .map_err(|_| StorageError::InvalidFilterExpression(format!("Invalid month in compact date '{}'", s)))?;
+        .map_err(|_| StorageError::InvalidFilterExpression(format!("Invalid month in compact date '{s}'")))?;
     let day: i64 = s[6..8]
         .parse()
-        .map_err(|_| StorageError::InvalidFilterExpression(format!("Invalid day in compact date '{}'", s)))?;
+        .map_err(|_| StorageError::InvalidFilterExpression(format!("Invalid day in compact date '{s}'")))?;
 
     Ok(date_to_epoch(year, month, day, 0, 0, 0))
 }
@@ -845,21 +838,21 @@ fn date_to_epoch(year: i64, month: i64, day: i64, hour: i64, minute: i64, second
     };
 
     // 从公元0年到给定日期的天数（Rata Die 算法变体）
-    let days = 365 * y + y / 4 - y / 100 + y / 400 + (m * 306 + 5) / 10 + (day - 1) - 719468;
+    let days = 365 * y + y / 4 - y / 100 + y / 400 + (m * 306 + 5) / 10 + (day - 1) - 719_468;
 
     days * 86400 + hour * 3600 + minute * 60 + second
 }
 
 /// 验证月份和日期是否有效
 fn is_valid_date(month: i64, day: i64) -> bool {
-    month >= 1 && month <= 12 && day >= 1 && day <= 31
+    (1..=12).contains(&month) && (1..=31).contains(&day)
 }
 
 /// 从目录名中提取日期，按 YYYY-MM-DD → YYYYMMDD → YYMMDD 优先级扫描
 ///
 /// 支持日期出现在目录名的开头、中间或末尾，例如：
 /// - "20240301" / "240301" / "2024-03-01"
-/// - "backup_240301" / "20240301_logs" / "project_2024-03-01_final"
+/// - `"backup_240301"` / `"20240301_logs"` / "project_2024-03-01_final"
 ///
 /// 返回提取到的日期对应的 UTC 午夜 epoch seconds，未找到有效日期则返回 None
 fn extract_date_from_dir_name(name: &str) -> Option<i64> {
@@ -870,9 +863,9 @@ fn extract_date_from_dir_name(name: &str) -> Option<i64> {
     if len >= 10 {
         for i in 0..=len - 10 {
             if bytes[i + 4] == b'-' && bytes[i + 7] == b'-' {
-                let all_digits = bytes[i..i + 4].iter().all(|b| b.is_ascii_digit())
-                    && bytes[i + 5..i + 7].iter().all(|b| b.is_ascii_digit())
-                    && bytes[i + 8..i + 10].iter().all(|b| b.is_ascii_digit());
+                let all_digits = bytes[i..i + 4].iter().all(u8::is_ascii_digit)
+                    && bytes[i + 5..i + 7].iter().all(u8::is_ascii_digit)
+                    && bytes[i + 8..i + 10].iter().all(u8::is_ascii_digit);
                 if all_digits {
                     let year = name[i..i + 4].parse::<i64>().ok()?;
                     let month = name[i + 5..i + 7].parse::<i64>().ok()?;
@@ -901,10 +894,11 @@ fn extract_date_from_dir_name(name: &str) -> Option<i64> {
                 let year = digit_str[..4].parse::<i64>().ok();
                 let month = digit_str[4..6].parse::<i64>().ok();
                 let day = digit_str[6..8].parse::<i64>().ok();
-                if let (Some(y), Some(m), Some(d)) = (year, month, day) {
-                    if y >= 1900 && is_valid_date(m, d) {
-                        return Some(date_to_epoch(y, m, d, 0, 0, 0));
-                    }
+                if let (Some(y), Some(m), Some(d)) = (year, month, day)
+                    && y >= 1900
+                    && is_valid_date(m, d)
+                {
+                    return Some(date_to_epoch(y, m, d, 0, 0, 0));
                 }
             }
 
@@ -913,10 +907,10 @@ fn extract_date_from_dir_name(name: &str) -> Option<i64> {
                 let yy = digit_str[..2].parse::<i64>().ok();
                 let month = digit_str[2..4].parse::<i64>().ok();
                 let day = digit_str[4..6].parse::<i64>().ok();
-                if let (Some(y), Some(m), Some(d)) = (yy, month, day) {
-                    if is_valid_date(m, d) {
-                        return Some(date_to_epoch(2000 + y, m, d, 0, 0, 0));
-                    }
+                if let (Some(y), Some(m), Some(d)) = (yy, month, day)
+                    && is_valid_date(m, d)
+                {
+                    return Some(date_to_epoch(2000 + y, m, d, 0, 0, 0));
                 }
             }
         } else {
@@ -927,7 +921,7 @@ fn extract_date_from_dir_name(name: &str) -> Option<i64> {
     None
 }
 
-/// 解析 dir_date 条件值为 epoch seconds
+/// 解析 `dir_date` 条件值为 epoch seconds
 ///
 /// 支持格式：
 /// - "2024-03-01" 或 '2024-03-01'（带引号 ISO 日期）
@@ -958,26 +952,24 @@ fn parse_dir_date_value(value: &str) -> Result<i64> {
 
     if digit_len == 6 {
         let yy: i64 = unquoted[..2].parse().map_err(|_| {
-            StorageError::InvalidFilterExpression(format!("Invalid dir_date value '{}': bad year", unquoted))
+            StorageError::InvalidFilterExpression(format!("Invalid dir_date value '{unquoted}': bad year"))
         })?;
         let mm: i64 = unquoted[2..4].parse().map_err(|_| {
-            StorageError::InvalidFilterExpression(format!("Invalid dir_date value '{}': bad month", unquoted))
+            StorageError::InvalidFilterExpression(format!("Invalid dir_date value '{unquoted}': bad month"))
         })?;
         let dd: i64 = unquoted[4..6].parse().map_err(|_| {
-            StorageError::InvalidFilterExpression(format!("Invalid dir_date value '{}': bad day", unquoted))
+            StorageError::InvalidFilterExpression(format!("Invalid dir_date value '{unquoted}': bad day"))
         })?;
         if !is_valid_date(mm, dd) {
             return Err(StorageError::InvalidFilterExpression(format!(
-                "Invalid dir_date value '{}': month or day out of range",
-                unquoted
+                "Invalid dir_date value '{unquoted}': month or day out of range",
             )));
         }
         return Ok(date_to_epoch(2000 + yy, mm, dd, 0, 0, 0));
     }
 
     Err(StorageError::InvalidFilterExpression(format!(
-        "Invalid dir_date value '{}', expected YYMMDD, YYYYMMDD, or YYYY-MM-DD",
-        value
+        "Invalid dir_date value '{value}', expected YYMMDD, YYYYMMDD, or YYYY-MM-DD",
     )))
 }
 
@@ -1078,7 +1070,7 @@ impl FilterParser {
                 }
             }
             Some(token) => Err(StorageError::InvalidToken(
-                format!("{:?}", token).chars().next().unwrap_or(' '),
+                format!("{token:?}").chars().next().unwrap_or(' '),
             )),
             None => Err(StorageError::UnexpectedEndOfToken(
                 "Unexpected end of filter token".to_string(),
@@ -1113,6 +1105,7 @@ impl FilterExpression {
     }
 
     /// 评估过滤表达式对文件的匹配情况
+    #[allow(clippy::too_many_arguments)]
     fn evaluate(
         &self, file_name: Option<&str>, file_path: Option<&str>, file_type: Option<&str>, modified_epoch: Option<i64>,
         size: Option<u64>, extension: Option<&str>, now_epoch: i64,
@@ -1122,7 +1115,7 @@ impl FilterExpression {
             self.root, file_name, file_path, file_type, modified_epoch, size, extension
         );
 
-        let result = self.evaluate_recursive(
+        let result = Self::evaluate_recursive(
             &self.root,
             file_name,
             file_path,
@@ -1141,12 +1134,13 @@ impl FilterExpression {
     }
 
     /// 递归评估过滤表达式树（含短路求值）
+    #[allow(clippy::too_many_arguments)]
     fn evaluate_recursive(
-        &self, ast_node: &FilterASTNode, file_name: Option<&str>, file_path: Option<&str>, file_type: Option<&str>,
+        ast_node: &FilterASTNode, file_name: Option<&str>, file_path: Option<&str>, file_type: Option<&str>,
         modified_epoch: Option<i64>, size: Option<u64>, extension: Option<&str>, now_epoch: i64,
     ) -> MatchResult {
         match ast_node {
-            FilterASTNode::Condition(condition) => self.evaluate_condition(
+            FilterASTNode::Condition(condition) => Self::evaluate_condition(
                 condition,
                 file_name,
                 file_path,
@@ -1157,7 +1151,7 @@ impl FilterExpression {
                 now_epoch,
             ),
             FilterASTNode::And(left, right) => {
-                let left_result = self.evaluate_recursive(
+                let left_result = Self::evaluate_recursive(
                     left,
                     file_name,
                     file_path,
@@ -1169,18 +1163,15 @@ impl FilterExpression {
                 );
 
                 // 短路求值：左侧 MisMatch 时直接返回
-                match &left_result {
-                    MatchResult::MisMatch(_) => {
-                        trace!(
-                            "\n[FilterExpression::evaluate_recursive] and short-circuit: left={:?} => {:?}",
-                            left, left_result
-                        );
-                        return left_result;
-                    }
-                    _ => {}
+                if let MatchResult::MisMatch(_) = &left_result {
+                    trace!(
+                        "\n[FilterExpression::evaluate_recursive] and short-circuit: left={:?} => {:?}",
+                        left, left_result
+                    );
+                    return left_result;
                 }
 
-                let right_result = self.evaluate_recursive(
+                let right_result = Self::evaluate_recursive(
                     right,
                     file_name,
                     file_path,
@@ -1203,7 +1194,7 @@ impl FilterExpression {
                 left_result & right_result
             }
             FilterASTNode::Or(left, right) => {
-                let left_result = self.evaluate_recursive(
+                let left_result = Self::evaluate_recursive(
                     left,
                     file_name,
                     file_path,
@@ -1223,7 +1214,7 @@ impl FilterExpression {
                     return left_result;
                 }
 
-                let right_result = self.evaluate_recursive(
+                let right_result = Self::evaluate_recursive(
                     right,
                     file_name,
                     file_path,
@@ -1249,21 +1240,20 @@ impl FilterExpression {
     }
 
     /// 评估单个过滤条件对文件的匹配情况
+    #[allow(clippy::too_many_arguments)]
     fn evaluate_condition(
-        &self, condition: &FilterCondition, file_name: Option<&str>, file_path: Option<&str>, file_type: Option<&str>,
+        condition: &FilterCondition, file_name: Option<&str>, file_path: Option<&str>, file_type: Option<&str>,
         modified_epoch: Option<i64>, size: Option<u64>, extension: Option<&str>, now_epoch: i64,
     ) -> MatchResult {
         match condition {
-            FilterCondition::Name { operator, pattern } => file_name
-                .map(|file_name| {
-                    let is_match = pattern.matches_with(file_name, GLOB_MATCH_OPTIONS);
-                    MatchResult::from_bool(match operator {
-                        CompareOp::Eq => is_match,
-                        CompareOp::Ne => !is_match,
-                        _ => false,
-                    })
+            FilterCondition::Name { operator, pattern } => file_name.map_or(MatchResult::LazyMatch, |file_name| {
+                let is_match = pattern.matches_with(file_name, GLOB_MATCH_OPTIONS);
+                MatchResult::from_bool(match operator {
+                    CompareOp::Eq => is_match,
+                    CompareOp::Ne => !is_match,
+                    _ => false,
                 })
-                .unwrap_or(MatchResult::LazyMatch),
+            }),
             FilterCondition::Path {
                 operator,
                 raw_value,
@@ -1272,46 +1262,42 @@ impl FilterExpression {
                 pattern_depth,
                 has_double_wildcard,
                 pattern_after_wildcard,
-            } => file_path
-                .map(|file_path| {
-                    let file_path = file_path.trim_end_matches('/');
-                    let match_result = match_path_with_pattern(
-                        file_path,
-                        file_type,
-                        pattern,
-                        raw_value,
-                        pattern_parts,
-                        *pattern_depth,
-                        *has_double_wildcard,
-                        pattern_after_wildcard,
-                    );
-                    match operator {
-                        CompareOp::Eq => match_result,
-                        CompareOp::Ne => match match_result {
-                            MatchResult::Match(MatchAddon::PathMatch) | MatchResult::Match(MatchAddon::MixMatch) => {
-                                MatchResult::MisMatch(MisMatchAddon::FullPathNotMatch)
-                            }
-                            MatchResult::Match(_) | MatchResult::PartialMatch => {
-                                MatchResult::MisMatch(MisMatchAddon::Other)
-                            }
-                            MatchResult::MisMatch(_) => MatchResult::Match(MatchAddon::PathMatch),
-                            MatchResult::LazyMatch => MatchResult::LazyMatch,
-                        },
-                        _ => MatchResult::MisMatch(MisMatchAddon::Other),
-                    }
+            } => file_path.map_or(MatchResult::LazyMatch, |file_path| {
+                let file_path = file_path.trim_end_matches('/');
+                let match_result = match_path_with_pattern(
+                    file_path,
+                    file_type,
+                    pattern,
+                    raw_value,
+                    pattern_parts,
+                    *pattern_depth,
+                    *has_double_wildcard,
+                    pattern_after_wildcard,
+                );
+                match operator {
+                    CompareOp::Eq => match_result,
+                    CompareOp::Ne => match match_result {
+                        MatchResult::Match(MatchAddon::PathMatch | MatchAddon::MixMatch) => {
+                            MatchResult::MisMatch(MisMatchAddon::FullPathNotMatch)
+                        }
+                        MatchResult::Match(_) | MatchResult::PartialMatch => {
+                            MatchResult::MisMatch(MisMatchAddon::Other)
+                        }
+                        MatchResult::MisMatch(_) => MatchResult::Match(MatchAddon::PathMatch),
+                        MatchResult::LazyMatch => MatchResult::LazyMatch,
+                    },
+                    _ => MatchResult::MisMatch(MisMatchAddon::Other),
+                }
+            }),
+            FilterCondition::Type { operator, value } => file_type.map_or(MatchResult::LazyMatch, |file_type| {
+                MatchResult::from_bool(match operator {
+                    CompareOp::Eq => file_type == value,
+                    CompareOp::Ne => file_type != value,
+                    _ => false,
                 })
-                .unwrap_or(MatchResult::LazyMatch),
-            FilterCondition::Type { operator, value } => file_type
-                .map(|file_type| {
-                    MatchResult::from_bool(match operator {
-                        CompareOp::Eq => file_type == value,
-                        CompareOp::Ne => file_type != value,
-                        _ => false,
-                    })
-                })
-                .unwrap_or(MatchResult::LazyMatch),
-            FilterCondition::Modified { operator, value } => modified_epoch
-                .map(|file_epoch| match value {
+            }),
+            FilterCondition::Modified { operator, value } => {
+                modified_epoch.map_or(MatchResult::LazyMatch, |file_epoch| match value {
                     ModifiedValue::RelativeDays(days) => {
                         let file_days = (now_epoch - file_epoch) as f64 / 86400.0;
                         MatchResult::from_bool(match operator {
@@ -1333,29 +1319,25 @@ impl FilterExpression {
                         })
                     }
                 })
-                .unwrap_or(MatchResult::LazyMatch),
-            FilterCondition::Size { operator, value } => size
-                .map(|size| {
-                    MatchResult::from_bool(match operator {
-                        CompareOp::Eq => size == *value,
-                        CompareOp::Lt => size < *value,
-                        CompareOp::Gt => size > *value,
-                        CompareOp::Le => size <= *value,
-                        CompareOp::Ge => size >= *value,
-                        _ => false,
-                    })
+            }
+            FilterCondition::Size { operator, value } => size.map_or(MatchResult::LazyMatch, |size| {
+                MatchResult::from_bool(match operator {
+                    CompareOp::Eq => size == *value,
+                    CompareOp::Lt => size < *value,
+                    CompareOp::Gt => size > *value,
+                    CompareOp::Le => size <= *value,
+                    CompareOp::Ge => size >= *value,
+                    CompareOp::Ne => false,
                 })
-                .unwrap_or(MatchResult::LazyMatch),
-            FilterCondition::Extension { operator, pattern } => extension
-                .map(|extension| {
-                    let is_match = pattern.matches_with(extension, GLOB_MATCH_OPTIONS);
-                    MatchResult::from_bool(match operator {
-                        CompareOp::Eq => is_match,
-                        CompareOp::Ne => !is_match,
-                        _ => false,
-                    })
+            }),
+            FilterCondition::Extension { operator, pattern } => extension.map_or(MatchResult::LazyMatch, |extension| {
+                let is_match = pattern.matches_with(extension, GLOB_MATCH_OPTIONS);
+                MatchResult::from_bool(match operator {
+                    CompareOp::Eq => is_match,
+                    CompareOp::Ne => !is_match,
+                    _ => false,
                 })
-                .unwrap_or(MatchResult::LazyMatch),
+            }),
             FilterCondition::DirDate { operator, epoch } => {
                 // 非目录条目：透明通过
                 if file_type != Some("dir") {
@@ -1363,9 +1345,8 @@ impl FilterExpression {
                 }
 
                 // 从目录名中提取日期
-                let dir_name = match file_name {
-                    Some(n) => n,
-                    None => return MatchResult::Match(MatchAddon::NonPathMatch),
+                let Some(dir_name) = file_name else {
+                    return MatchResult::Match(MatchAddon::NonPathMatch);
                 };
 
                 match extract_date_from_dir_name(dir_name) {
@@ -1396,22 +1377,21 @@ impl FilterExpression {
         }
     }
 
-    /// 检查目录名是否匹配 match_expressions 中的 DirDate 条件
+    /// 检查目录名是否匹配 `match_expressions` 中的 `DirDate` 条件
     ///
     /// 仅在 packaged 模式下由 walkdir 调用，用于判断一级目录是否应发射 Packaged 消息。
-    /// 递归遍历 AST，找到所有 DirDate 节点，提取目录名中的日期并比较。
+    /// 递归遍历 AST，找到所有 `DirDate` 节点，提取目录名中的日期并比较。
     ///
-    /// 返回 true 表示目录名中的日期满足至少一个 DirDate 条件。
+    /// 返回 true 表示目录名中的日期满足至少一个 `DirDate` 条件。
     pub fn has_matching_dir_date(&self, dir_name: &str) -> bool {
-        let dir_epoch = match extract_date_from_dir_name(dir_name) {
-            Some(epoch) => epoch,
-            None => return false,
+        let Some(dir_epoch) = extract_date_from_dir_name(dir_name) else {
+            return false;
         };
-        self.check_dir_date_in_node(&self.root, dir_epoch)
+        Self::check_dir_date_in_node(&self.root, dir_epoch)
     }
 
-    /// 递归检查 AST 节点中的 DirDate 条件是否匹配给定的 dir_epoch
-    fn check_dir_date_in_node(&self, node: &FilterASTNode, dir_epoch: i64) -> bool {
+    /// 递归检查 AST 节点中的 `DirDate` 条件是否匹配给定的 `dir_epoch`
+    fn check_dir_date_in_node(node: &FilterASTNode, dir_epoch: i64) -> bool {
         match node {
             FilterASTNode::Condition(FilterCondition::DirDate { operator, epoch }) => match operator {
                 CompareOp::Eq => dir_epoch / 86400 == epoch / 86400,
@@ -1423,10 +1403,10 @@ impl FilterExpression {
             },
             FilterASTNode::Condition(_) => false, // 非 DirDate 条件，忽略
             FilterASTNode::And(left, right) => {
-                self.check_dir_date_in_node(left, dir_epoch) && self.check_dir_date_in_node(right, dir_epoch)
+                Self::check_dir_date_in_node(left, dir_epoch) && Self::check_dir_date_in_node(right, dir_epoch)
             }
             FilterASTNode::Or(left, right) => {
-                self.check_dir_date_in_node(left, dir_epoch) || self.check_dir_date_in_node(right, dir_epoch)
+                Self::check_dir_date_in_node(left, dir_epoch) || Self::check_dir_date_in_node(right, dir_epoch)
             }
         }
     }
@@ -1434,16 +1414,16 @@ impl FilterExpression {
     /// 计算逻辑表达式树中的节点数量
     #[allow(dead_code)]
     fn count_nodes(&self) -> usize {
-        self.count_nodes_in_expr(&self.root)
+        Self::count_nodes_in_expr(&self.root)
     }
 
     /// 递归计算表达式树中的节点数量
     #[allow(dead_code)]
-    fn count_nodes_in_expr(&self, expr: &FilterASTNode) -> usize {
+    fn count_nodes_in_expr(expr: &FilterASTNode) -> usize {
         match expr {
             FilterASTNode::Condition(_) => 1,
             FilterASTNode::And(left, right) | FilterASTNode::Or(left, right) => {
-                1 + self.count_nodes_in_expr(left) + self.count_nodes_in_expr(right)
+                1 + Self::count_nodes_in_expr(left) + Self::count_nodes_in_expr(right)
             }
         }
     }
@@ -1451,6 +1431,7 @@ impl FilterExpression {
 
 /// 匹配附加信息枚举，用于标识匹配的类型
 #[derive(Debug, Clone, PartialEq)]
+#[allow(clippy::enum_variant_names)]
 enum MatchAddon {
     /// 只有路径条件的匹配
     PathMatch,
@@ -1483,9 +1464,9 @@ enum MatchResult {
 }
 
 impl MatchResult {
-    /// Convert a boolean to MatchResult, only applied to Path condition
-    /// - When b is true: return Match(MatchAddon::NonPathMatch)
-    /// - When b is false: return MisMatch(MisMatchAddon::Other)
+    /// Convert a boolean to `MatchResult`, only applied to Path condition
+    /// - When b is true: return `Match(MatchAddon::NonPathMatch)`
+    /// - When b is false: return `MisMatch(MisMatchAddon::Other)`
     fn from_bool(b: bool) -> Self {
         if b {
             MatchResult::Match(MatchAddon::NonPathMatch)
@@ -1500,7 +1481,7 @@ impl BitAnd for MatchResult {
 
     /// 与操作符实现
     ///
-    /// 优先级:  MisMatch > PartialMatch > Match > LazyMatch
+    /// 优先级:  `MisMatch` > `PartialMatch` > `Match` > `LazyMatch`
     /// 使用 `&` 运算符调用
     fn bitand(self, other: Self) -> Self {
         match (self, other) {
@@ -1542,7 +1523,7 @@ impl BitOr for MatchResult {
 
     /// 或操作符实现
     ///
-    /// 优先级: Match > PartialMatch > MisMatch > LazyMatch
+    /// 优先级: `Match` > `PartialMatch` > `MisMatch` > `LazyMatch`
     /// 使用 `|` 运算符调用
     fn bitor(self, other: Self) -> Self {
         match (self, other) {
@@ -1596,6 +1577,7 @@ impl BitOr for MatchResult {
 /// - `pattern_depth`: pattern 段数
 /// - `has_double_wildcard`: 是否含 **
 /// - `pattern_after_wildcard`: ** 之后的部分
+#[allow(clippy::too_many_arguments)]
 fn match_path_with_pattern(
     file_path: &str, file_type: Option<&str>, pattern: &Pattern, raw_value: &str, pattern_parts: &[String],
     pattern_depth: usize, has_double_wildcard: bool, pattern_after_wildcard: &[String],
@@ -1621,17 +1603,7 @@ fn match_path_with_pattern(
     let file_depth = file_parts.len();
 
     if file_depth > pattern_depth {
-        if !has_double_wildcard {
-            // 无 **：* 不跨 /，只有 depth=pattern_depth 的祖先可能匹配 → O(1)
-            let ancestor_path = file_parts[..pattern_depth].join("/");
-            if pattern.matches_with(&ancestor_path, GLOB_MATCH_OPTIONS) {
-                trace!(
-                    "[Filter:match_path_with_pattern] 祖先路径匹配成功: pattern_value={}, file_path={}, ancestor={}",
-                    raw_value, file_path, ancestor_path
-                );
-                return MatchResult::Match(MatchAddon::PathMatch);
-            }
-        } else {
+        if has_double_wildcard {
             // 有 **：pattern 结构为 [prefix]/**/[suffix]
             // ** 必须是独立路径分量，prefix_count + suffix_count 是祖先最小深度
             // 只需遍历 min_depth..file_depth，大幅收窄范围
@@ -1648,6 +1620,16 @@ fn match_path_with_pattern(
                     );
                     return MatchResult::Match(MatchAddon::PathMatch);
                 }
+            }
+        } else {
+            // 无 **：* 不跨 /，只有 depth=pattern_depth 的祖先可能匹配 → O(1)
+            let ancestor_path = file_parts[..pattern_depth].join("/");
+            if pattern.matches_with(&ancestor_path, GLOB_MATCH_OPTIONS) {
+                trace!(
+                    "[Filter:match_path_with_pattern] 祖先路径匹配成功: pattern_value={}, file_path={}, ancestor={}",
+                    raw_value, file_path, ancestor_path
+                );
+                return MatchResult::Match(MatchAddon::PathMatch);
             }
         }
     }
@@ -1698,37 +1680,37 @@ fn match_path_with_pattern(
     }
 
     let new_pattern = new_parts.join("/");
-    if let Ok(p) = Pattern::new(&new_pattern) {
-        if p.matches_with(file_path, GLOB_MATCH_OPTIONS) {
-            // ** 被命中且后面还有具体 pattern 时，需验证目录名是否匹配后缀
-            // 避免黑名单中 ** 开头的 pattern 过度跳过无关目录
-            if hit_double_wildcard && !pattern_after_wildcard.is_empty() {
-                if let Some(suffix) = pattern_after_wildcard.first() {
-                    if let Ok(sp) = Pattern::new(suffix) {
-                        let file_last = file_path.rsplit('/').next().unwrap_or(file_path);
-                        if sp.matches_with(file_last, GLOB_MATCH_OPTIONS) {
-                            trace!(
-                                "[Filter:match_path_with_pattern] 含有double wildcard的目录部分匹配成功(后缀匹配): pattern_value={}, file_path={}",
-                                raw_value, file_path
-                            );
-                            return MatchResult::PartialMatch;
-                        }
-                    }
+    if let Ok(p) = Pattern::new(&new_pattern)
+        && p.matches_with(file_path, GLOB_MATCH_OPTIONS)
+    {
+        // ** 被命中且后面还有具体 pattern 时，需验证目录名是否匹配后缀
+        // 避免黑名单中 ** 开头的 pattern 过度跳过无关目录
+        if hit_double_wildcard && !pattern_after_wildcard.is_empty() {
+            if let Some(suffix) = pattern_after_wildcard.first()
+                && let Ok(sp) = Pattern::new(suffix)
+            {
+                let file_last = file_path.rsplit('/').next().unwrap_or(file_path);
+                if sp.matches_with(file_last, GLOB_MATCH_OPTIONS) {
+                    trace!(
+                        "[Filter:match_path_with_pattern] 含有double wildcard的目录部分匹配成功(后缀匹配): pattern_value={}, file_path={}",
+                        raw_value, file_path
+                    );
+                    return MatchResult::PartialMatch;
                 }
-                // 不匹配后缀 → 返回 MisMatch(Other) 让黑名单不跳过，但扫描继续
-                trace!(
-                    "[Filter:match_path_with_pattern] double wildcard 后缀不匹配，返回MisMatch(Other): pattern_value={}, file_path={}",
-                    raw_value, file_path
-                );
-                return MatchResult::MisMatch(MisMatchAddon::Other);
             }
-
+            // 不匹配后缀 → 返回 MisMatch(Other) 让黑名单不跳过，但扫描继续
             trace!(
-                "[Filter:match_path_with_pattern] 目录部分匹配成功: pattern_value={}, file_path={}",
+                "[Filter:match_path_with_pattern] double wildcard 后缀不匹配，返回MisMatch(Other): pattern_value={}, file_path={}",
                 raw_value, file_path
             );
-            return MatchResult::PartialMatch;
+            return MatchResult::MisMatch(MisMatchAddon::Other);
         }
+
+        trace!(
+            "[Filter:match_path_with_pattern] 目录部分匹配成功: pattern_value={}, file_path={}",
+            raw_value, file_path
+        );
+        return MatchResult::PartialMatch;
     }
 
     // 匹配失败，返回NoMatch

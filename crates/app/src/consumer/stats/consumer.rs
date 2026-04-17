@@ -1,9 +1,9 @@
-//! StatisticConsumer ��� 统计消费者
+//! `StatisticConsumer` ��� 统计消费者
 //!
-//! 聚合 accumulator（累计统计）、progress_bar（终端进度条）、
+//! 聚合 `accumulator`（累计统计）、`progress_bar`（终端进度条）、
 //! callback（HTTP 进度回调）三个关注点，对外提供统一的 API。
 //!
-//! callback 逻辑从原 manager.rs 移入此处，��� ConsumerManager 只负责���排。
+//! callback 逻辑从原 manager.rs 移入此处，��� `ConsumerManager` 只负责���排。
 
 // 标准库
 use std::sync::Arc;
@@ -23,7 +23,7 @@ use super::report::ProgressReport;
 /// HTTP 进度回调间隔（秒）
 const CALLBACK_INTERVAL_SECS: u64 = 2;
 
-/// 统计消费者 — 替代旧 StatisticConsumer + manager.rs 中的回调逻辑
+/// 统计消费者 — 替代旧 `StatisticConsumer` + manager.rs 中的回调逻辑
 #[derive(Debug, Clone)]
 pub struct StatisticConsumer {
     pub stats: StatsKind,
@@ -33,7 +33,7 @@ pub struct StatisticConsumer {
 }
 
 impl StatisticConsumer {
-    /// 启动终端进度条（后台线程），返回 JoinHandle 供 finalize 后 join
+    /// 启动终端进度条（后台线程），返回 `JoinHandle` 供 finalize 后 join
     pub fn start_progress_bar(&self) -> std::thread::JoinHandle<()> {
         self.progress_bar.start()
     }
@@ -59,7 +59,7 @@ impl StatisticConsumer {
 
     // ─── 报告 ───
 
-    /// 构建进度报告（实时快照 + 可选 final_stats）
+    /// 构建进度报告（实时快照 + 可选 `final_stats`）
     pub fn to_report(&self, is_final: bool) -> ProgressReport {
         let mut report = self.progress_bar.to_report(self.stats.job_id());
         report.is_final = is_final;
@@ -82,10 +82,10 @@ impl StatisticConsumer {
         }
     }
 
-    /// 启动周期性 HTTP 回调任务（每 2 秒 POST ProgressReport）
+    /// 启动周期性 HTTP 回调任务（每 2 秒 POST `ProgressReport`）
     ///
-    /// 仅在配置了 callback_url 时启动。
-    /// 返回 (JoinHandle, Client) 供调用方在消息循环结束后 abort 并复用 client；无 URL 返回 None。
+    /// 仅在配置了 `callback_url` 时启动。
+    /// 返回 (`JoinHandle`, Client) 供调用方在消息循环结束后 abort 并复用 client；无 URL 返回 None。
     pub async fn start_callback_loop(
         consumer: Arc<tokio::sync::Mutex<Self>>,
     ) -> Option<(tokio::task::JoinHandle<()>, reqwest::Client)> {
@@ -126,7 +126,7 @@ impl StatisticConsumer {
 
     /// 完整运行生命周期：进度条 → 回调循环 → 消息处理 → 停止回调 → 最终回调 → finalize
     ///
-    /// 将原来散落在 ConsumerManager 里的编排逻辑收归此处，ConsumerManager 只需
+    /// 将原来散落在 `ConsumerManager` 里的编排逻辑收归此处，ConsumerManager 只需
     /// `tokio::spawn(StatisticConsumer::run(consumer, rx))` 即可。
     pub async fn run(consumer: Arc<tokio::sync::Mutex<Self>>, mut rx: mpsc::Receiver<StorageEntryMessage>) {
         let pb_handle = {
@@ -164,7 +164,7 @@ impl StatisticConsumer {
         }
     }
 
-    /// 发送最终回调（is_final=true），在消息循环结束后调用
+    /// 发送最终回调（`is_final=true`），在消息循环结束后调用
     ///
     /// 优先复用已有的 client；若无则尝试新建一个。
     pub async fn send_final_callback(consumer: &Arc<tokio::sync::Mutex<Self>>, client: Option<&reqwest::Client>) {

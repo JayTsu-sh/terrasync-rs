@@ -32,7 +32,7 @@ async fn main() {
 
     // 解析命令行参数并执行匹配的命令
     if let Err(e) = cli_match().await {
-        eprintln!("Error: {}", e);
+        eprintln!("Error: {e}");
         exit(1);
     }
 }

@@ -41,6 +41,6 @@ pub type Result<T> = std::result::Result<T, QuicTransportError>;
 
 impl From<QuicTransportError> for crate::error::TransportError {
     fn from(e: QuicTransportError) -> Self {
-        crate::error::TransportError::SendFailed(format!("{}", e))
+        crate::error::TransportError::SendFailed(format!("{e}"))
     }
 }

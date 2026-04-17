@@ -3,7 +3,7 @@
 //! 纯算法 crate，无 IO 依赖。提供：
 //! - Rolling checksum（Adler32 变体，O(1) 滑动更新）
 //! - Block 签名计算（rolling + BLAKE3 截断 16 字节）
-//! - 滑动窗口匹配（Sender 侧，生成 DeltaToken）
+//! - 滑动窗口匹配（Sender 侧，生成 `DeltaToken`）
 //! - 文件重建（Receiver 侧，basis + tokens → 新文件）
 
 pub mod matcher;
@@ -32,7 +32,7 @@ pub struct BlockSignature {
     pub strong: [u8; 16],
 }
 
-/// 计算 block size（参考 rsync：sqrt(file_size)，bounded [700, 128KB]）
+/// 计算 block size（参考 rsync：`sqrt(file_size)`，bounded \[700, 128KB\]）
 pub fn calculate_block_size(file_size: u64) -> u32 {
     let raw = (file_size as f64).sqrt() as u32;
     raw.clamp(700, 128 * 1024)

@@ -32,6 +32,7 @@ pub struct SenderWorkerConfig {
 /// 从共享的 `walkdir_iter` 拉取 entry，通过 transport 发送给 Receiver。
 /// 单进程模式：发送 `CopyEntry` 命令。
 /// 双进程模式：读取源文件数据后发送 `FileData` 流（Phase 3）。
+#[allow(clippy::too_many_arguments)]
 pub async fn sender_worker(
     worker_id: usize, walkdir_iter: utils::async_receiver::AsyncReceiver<StorageEntryMessage>,
     src_storage: Arc<StorageEnum>, dest_storage: Arc<StorageEnum>, transport: Arc<dyn SenderTransport>,
@@ -128,7 +129,7 @@ pub async fn sender_worker(
                         let _ = transport
                             .send(SenderMsg::EntryError {
                                 path: entry.get_relative_path().to_path_buf(),
-                                reason: format!("{}", e),
+                                reason: format!("{e}"),
                             })
                             .await;
                     }
@@ -154,6 +155,7 @@ pub async fn sender_worker(
 }
 
 /// 处理 S3 多版本对象：缓冲所有版本后统一发送
+#[allow(clippy::too_many_arguments)]
 async fn handle_versioned_entry(
     worker_id: usize, entry: &Arc<EntryEnum>, transport: &Arc<dyn SenderTransport>, _src_storage: &Arc<StorageEnum>,
     dest_storage: &Arc<StorageEnum>, object_buffers: &Arc<DashMap<String, Vec<Arc<EntryEnum>>>>,
@@ -164,16 +166,16 @@ async fn handle_versioned_entry(
     // 缓冲版本
     let mut collected_versions = None;
     {
-        let mut versions = object_buffers.entry(object_key.clone()).or_insert_with(Vec::new);
+        let mut versions = object_buffers.entry(object_key.clone()).or_default();
         versions.push(entry.clone());
 
-        if let Some(version_count) = entry.get_version_count() {
-            if versions.len() >= version_count as usize {
-                collected_versions = Some(versions.clone());
-                // 清理缓冲区
-                drop(versions);
-                object_buffers.remove(&object_key);
-            }
+        if let Some(version_count) = entry.get_version_count()
+            && versions.len() >= version_count as usize
+        {
+            collected_versions = Some(versions.clone());
+            // 清理缓冲区
+            drop(versions);
+            object_buffers.remove(&object_key);
         }
     }
 
@@ -196,13 +198,13 @@ async fn handle_versioned_entry(
             }
         } else {
             // 目标不支持版本化：仅发送最新版本
-            if let Some(latest) = versions.last() {
-                if let Err(e) = transport.send(SenderMsg::CopyEntry { entry: latest.clone() }).await {
-                    error!(
-                        "[Sender Worker {}] Failed to send latest version CopyEntry for {}: {}",
-                        worker_id, object_key, e
-                    );
-                }
+            if let Some(latest) = versions.last()
+                && let Err(e) = transport.send(SenderMsg::CopyEntry { entry: latest.clone() }).await
+            {
+                error!(
+                    "[Sender Worker {}] Failed to send latest version CopyEntry for {}: {}",
+                    worker_id, object_key, e
+                );
             }
         }
     }

@@ -39,7 +39,7 @@ pub mod logger;
 /// 包含应用中使用的通用类型和工具函数
 pub mod types;
 
-/// 公共API的prelude模块
+/// 公共 API 的 prelude 模块
 ///
 /// 用户可以通过 `use utils::prelude::*` 来导入最常用的类型，
 /// 简化应用开发过程中的导入语句

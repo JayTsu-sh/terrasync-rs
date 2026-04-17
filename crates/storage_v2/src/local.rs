@@ -26,7 +26,7 @@ use crate::{
     WalkDirAsyncIterator,
 };
 
-/// 从文件系统元数据构建 NASEntry
+/// 从文件系统元数据构建 `NASEntry`
 fn build_nas_entry(
     name: String, relative_path: PathBuf, extension: Option<String>, metadata: &std::fs::Metadata, is_symlink: bool,
 ) -> NASEntry {
@@ -105,16 +105,16 @@ fn build_nas_entry(
     }
 }
 
-/// 将SystemTime转换为纳秒时间戳
+/// 将 `SystemTime` 转换为纳秒时间戳
 fn system_time_to_i64(time: SystemTime) -> i64 {
     time.duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos() as i64)
         .unwrap_or(0)
 }
 
-/// 将纳秒时间戳转换为FileTime
+/// 将纳秒时间戳转换为 `FileTime`
 fn i64_to_file_time(timestamp: i64) -> FileTime {
-    let seconds = (timestamp / 1_000_000_000) as i64;
+    let seconds = timestamp / 1_000_000_000;
     let nanos = (timestamp % 1_000_000_000) as u32;
     FileTime::from_unix_time(seconds, nanos)
 }
@@ -205,6 +205,14 @@ impl LocalStorage {
         {
             let full_path = self.get_full_path(relative_path);
 
+            // 安全校验：拒绝指向绝对路径或包含 ".." 的符号链接目标，防止路径穿越
+            if target.is_absolute() || target.components().any(|c| c == std::path::Component::ParentDir) {
+                return Err(StorageError::OperationError(format!(
+                    "Unsafe symlink target rejected: {:?} (absolute paths and '..' are not allowed)",
+                    target
+                )));
+            }
+
             tokio::fs::symlink(target, &full_path).await?;
 
             // 设置文件所有者和组
@@ -220,10 +228,9 @@ impl LocalStorage {
             {
                 Ok(Ok(())) => Ok(()),
                 Ok(Err(err)) => Err(StorageError::from(err)),
-                Err(err) => Err(StorageError::from(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    format!("Task spawn failed: {:?}", err),
-                ))),
+                Err(err) => Err(StorageError::from(std::io::Error::other(format!(
+                    "Task spawn failed: {err:?}"
+                )))),
             }
         }
 
@@ -251,12 +258,12 @@ impl LocalStorage {
     }
 
     pub async fn delete_dir_all(&self, relative_path: Option<&Path>) -> Result<()> {
-        let iter = self.delete_dir_all_with_progress(relative_path, 4).await?;
+        let iter = self.delete_dir_all_with_progress(relative_path, 4)?;
         while iter.next().await.is_some() {}
         Ok(())
     }
 
-    pub async fn delete_dir_all_with_progress(
+    pub fn delete_dir_all_with_progress(
         &self, relative_path: Option<&Path>, concurrency: usize,
     ) -> Result<DeleteDirIterator> {
         let full_path = match relative_path {
@@ -265,7 +272,7 @@ impl LocalStorage {
         };
         let root_path = full_path.clone();
         let (tx, rx) = async_channel::bounded::<DeleteEvent>(1000);
-        let concurrency = concurrency.max(1).min(64);
+        let concurrency = concurrency.clamp(1, 64);
 
         tokio::task::spawn_blocking(move || {
             let pool = match rayon::ThreadPoolBuilder::new().num_threads(concurrency).build() {
@@ -325,12 +332,7 @@ impl LocalStorage {
 
                 tokio::task::spawn_blocking(move || filetime::set_file_times(&path_clone, atime, mtime))
                     .await
-                    .map_err(|err| {
-                        StorageError::from(std::io::Error::new(
-                            std::io::ErrorKind::Other,
-                            format!("Task spawn failed: {:?}", err),
-                        ))
-                    })?
+                    .map_err(|err| StorageError::from(std::io::Error::other(format!("Task spawn failed: {err:?}"))))?
                     .map_err(StorageError::from)
             }));
         }
@@ -345,10 +347,7 @@ impl LocalStorage {
                     tokio::task::spawn_blocking(move || lchown(&path_clone, Some(uid), Some(gid)))
                         .await
                         .map_err(|err| {
-                            StorageError::from(std::io::Error::new(
-                                std::io::ErrorKind::Other,
-                                format!("Task spawn failed: {:?}", err),
-                            ))
+                            StorageError::from(std::io::Error::other(format!("Task spawn failed: {err:?}")))
                         })?
                         .map_err(StorageError::from)
                 }));
@@ -373,6 +372,7 @@ impl LocalStorage {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments, clippy::unused_async)]
     pub async fn walkdir(
         &self, sub_path: Option<&Path>, depth: Option<usize>, match_expressions: Option<FilterExpression>,
         exclude_expressions: Option<FilterExpression>, concurrency: usize, packaged: bool, package_depth: usize,
@@ -413,8 +413,8 @@ impl LocalStorage {
                 let _ = tx_clone
                     .send(StorageEntryMessage::Error {
                         event: ErrorEvent::Scan,
-                        path: std::path::PathBuf::from(format!("{:?}", e)),
-                        reason: format!("{:?}", e),
+                        path: std::path::PathBuf::from(format!("{e:?}")),
+                        reason: format!("{e:?}"),
                     })
                     .await;
             }
@@ -424,6 +424,7 @@ impl LocalStorage {
     }
 
     /// 迭代式目录遍历函数，使用工作窃取队列实现高效并发
+    #[allow(clippy::too_many_arguments, clippy::ref_option)]
     async fn iterative_walkdir(
         &self, root_path: &Path, tx: async_channel::Sender<StorageEntryMessage>, max_depth: usize,
         match_expressions: &Option<FilterExpression>, exclude_expressions: &Option<FilterExpression>,
@@ -477,7 +478,8 @@ impl LocalStorage {
         Ok(())
     }
 
-    /// 处理单个目录，读取条目并过滤，发送符合条件的StorageEntry
+    /// 处理单个目录，读取条目并过滤，发送符合条件的 `StorageEntry`
+    #[allow(clippy::too_many_arguments)]
     async fn process_dir(
         &self, producer_id: usize, dir_path: PathBuf, current_depth: usize,
         tx: &async_channel::Sender<StorageEntryMessage>,
@@ -491,16 +493,13 @@ impl LocalStorage {
 
         // 遍历目录条目
         while let Some(entry) = dir_entries.next_entry().await? {
-            let file_name = match entry.file_name().to_str() {
-                Some(name) => name.to_string(),
-                None => {
-                    debug!(
-                        "[Producer {}] Skipping entry with invalid name: {:?}",
-                        producer_id,
-                        entry.file_name()
-                    );
-                    continue;
-                }
+            let Some(file_name) = entry.file_name().to_str().map(str::to_string) else {
+                debug!(
+                    "[Producer {}] Skipping entry with invalid name: {:?}",
+                    producer_id,
+                    entry.file_name()
+                );
+                continue;
             };
 
             // 跳过当前目录(".")和父目录("..")
@@ -512,23 +511,19 @@ impl LocalStorage {
             let full_path = entry.path();
 
             // 计算相对路径
-            let relative_path = match full_path.strip_prefix(&*self.root_path) {
-                Ok(path) => {
-                    // 确保相对路径不包含前导斜杠，与原始实现保持一致
-                    path.to_path_buf()
-                }
-                Err(_) => {
-                    error!("[Producer {}] Failed to strip prefix from {:?}", producer_id, full_path);
-                    let _ = tx
-                        .send(StorageEntryMessage::Error {
-                            event: ErrorEvent::Scan,
-                            path: full_path.clone(),
-                            reason: "Failed to strip prefix".to_string(),
-                        })
-                        .await;
-                    continue;
-                }
+            let Ok(relative_path) = full_path.strip_prefix(&*self.root_path) else {
+                error!("[Producer {}] Failed to strip prefix from {:?}", producer_id, full_path);
+                let _ = tx
+                    .send(StorageEntryMessage::Error {
+                        event: ErrorEvent::Scan,
+                        path: full_path.clone(),
+                        reason: "Failed to strip prefix".to_string(),
+                    })
+                    .await;
+                continue;
             };
+            // 确保相对路径不包含前导斜杠，与原始实现保持一致
+            let relative_path = relative_path.to_path_buf();
             debug!(
                 "[Producer {}] Processing entry: {:?}, skip_filter={}",
                 producer_id, relative_path, skip_filter
@@ -554,7 +549,7 @@ impl LocalStorage {
                         .send(StorageEntryMessage::Error {
                             event: ErrorEvent::Scan,
                             path: relative_path.clone(),
-                            reason: format!("Failed to get metadata: {}", e),
+                            reason: format!("Failed to get metadata: {e}"),
                         })
                         .await;
                     continue;
@@ -622,11 +617,9 @@ impl LocalStorage {
 
             if !send_packaged && skip_entry {
                 // 如果skip_entry为true，但continue_scan为true，且是目录，则继续扫描其子目录
-                if continue_scan && is_dir {
-                    if current_depth < max_depth || max_depth == 0 {
-                        ctx.push_task((full_path.clone(), current_depth + 1, need_submatch, None))
-                            .await;
-                    }
+                if continue_scan && is_dir && (current_depth < max_depth || max_depth == 0) {
+                    ctx.push_task((full_path.clone(), current_depth + 1, need_submatch, None))
+                        .await;
                 }
                 debug!("[Producer {}] Skipping entry {:?} (filter)", producer_id, relative_path);
                 continue;
@@ -634,9 +627,9 @@ impl LocalStorage {
 
             // 创建StorageEntry
             let entry = EntryEnum::NAS(build_nas_entry(
-                file_name.to_string(),
+                file_name.clone(),
                 relative_path.clone(),
-                extension.map(|ext| ext.to_string()),
+                extension.map(str::to_string),
                 &metadata,
                 is_symlink,
             ));
@@ -733,7 +726,7 @@ impl LocalStorage {
         if written != length {
             return Err(StorageError::IoError(std::io::Error::new(
                 std::io::ErrorKind::WriteZero,
-                format!("Incomplete write: expected {} bytes, wrote {} bytes", length, written),
+                format!("Incomplete write: expected {length} bytes, wrote {written} bytes"),
             )));
         }
 
@@ -789,8 +782,8 @@ impl LocalStorage {
             Err(e) => {
                 error!("Failed to open source file {:?}: {:?}", relative_path, e);
                 return Err(StorageError::OperationError(format!(
-                    "Failed to open source file {:?}: {:?}",
-                    relative_path, e
+                    "Failed to open source file {}: {e:?}",
+                    relative_path.display()
                 )));
             }
         };
@@ -880,7 +873,7 @@ impl LocalStorage {
         debug!(
             "Created destination file {:?} with mode: {:?}",
             relative_path,
-            mode.map(|m| format!("{:o}", m))
+            mode.map(|m| format!("{m:o}"))
         );
 
         let mut current_offset = 0;
@@ -955,13 +948,11 @@ impl LocalStorage {
             }
 
             let entry_full_path = entry.path();
-            let relative_path = match entry_full_path.strip_prefix(&*self.root_path) {
-                Ok(p) => p.to_path_buf(),
-                Err(_) => {
-                    errors.push(format!("Failed to strip prefix: {:?}", entry_full_path));
-                    continue;
-                }
+            let Ok(relative_path) = entry_full_path.strip_prefix(&*self.root_path) else {
+                errors.push(format!("Failed to strip prefix: {}", entry_full_path.display()));
+                continue;
             };
+            let relative_path = relative_path.to_path_buf();
 
             let metadata = match tokio::fs::symlink_metadata(&entry_full_path).await {
                 Ok(m) => m,
@@ -973,10 +964,7 @@ impl LocalStorage {
 
             let is_dir = metadata.is_dir();
             let is_symlink = entry.file_type().await.map(|ft| ft.is_symlink()).unwrap_or(false);
-            let extension_owned = relative_path
-                .extension()
-                .and_then(|e| e.to_str())
-                .map(|s| s.to_string());
+            let extension_owned = relative_path.extension().and_then(|e| e.to_str()).map(str::to_string);
 
             // 应用 filter（仅当 apply_filter=true 时）
             let (skip_entry, continue_scan, need_submatch) = if ctx.apply_filter {
@@ -1052,7 +1040,8 @@ impl LocalStorage {
         })
     }
 
-    /// walkdir_2: 目录分页遍历，DFS 顺序分配 NDX，页级输出
+    /// `walkdir_2`: 目录分页遍历，DFS 顺序分配 NDX，页级输出
+    #[allow(clippy::unused_async)]
     pub async fn walkdir_2(
         &self, sub_path: Option<&Path>, depth: Option<usize>, match_expressions: Option<crate::FilterExpression>,
         exclude_expressions: Option<crate::FilterExpression>, concurrency: usize,
@@ -1064,7 +1053,7 @@ impl LocalStorage {
             _ => (*self.root_path).clone(),
         };
 
-        let concurrency = concurrency.max(1).min(64);
+        let concurrency = concurrency.clamp(1, 64);
         let (req_tx, req_rx) = async_channel::bounded::<ReadRequest>(concurrency * 2);
         let (out_tx, out_rx) = async_channel::bounded(64);
 
@@ -1102,7 +1091,7 @@ impl LocalStorage {
 /// 注意：canonicalize 要求路径已存在
 fn normalize_local_path(path: &str) -> Result<String> {
     let canonical_path = std::fs::canonicalize(path)
-        .map_err(|e| StorageError::InvalidPath(format!("Failed to canonicalize path '{}': {}", path, e)))?;
+        .map_err(|e| StorageError::InvalidPath(format!("Failed to canonicalize path '{path}': {e}")))?;
 
     #[cfg(windows)]
     {
@@ -1147,7 +1136,7 @@ pub fn create_local_storage(path: &str, block_size: Option<u64>) -> Result<Stora
 /// Rayon 并行递归删除：后序遍历，先删文件再删目录
 fn delete_recursive(path: &Path, root: &Path, tx: &async_channel::Sender<DeleteEvent>) {
     let entries: Vec<_> = match std::fs::read_dir(path) {
-        Ok(rd) => rd.filter_map(|e| e.ok()).collect(),
+        Ok(rd) => rd.filter_map(std::result::Result::ok).collect(),
         Err(e) => {
             error!("Failed to read dir {:?}: {}", path, e);
             return;

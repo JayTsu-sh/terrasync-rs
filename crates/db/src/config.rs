@@ -3,7 +3,7 @@
 //! 该模块定义了数据库的配置结构和类型，包括：
 //! 1. 数据库类型枚举
 //! 2. 通用数据库配置
-//! 3. ClickHouse特定配置
+//! 3. `ClickHouse` 特定配置
 //! 4. DuckDB特定配置（可选）
 //! 5. 配置转换功能
 
@@ -39,14 +39,14 @@ pub struct DatabaseConfig {
     pub db_type: String,
     /// 批处理大小
     pub batch_size: u32,
-    /// ClickHouse特定配置
+    /// `ClickHouse` 特定配置
     pub clickhouse: Option<ClickHouseConfig>,
     /// DuckDB特定配置
     #[cfg(feature = "duckdb")]
     pub duckdb: Option<DuckDBConfig>,
 }
 
-/// 从utils::app_config::DatabaseConfig转换为db::config::DatabaseConfig
+/// 从 `utils::app_config::DatabaseConfig` 转换为 `db::config::DatabaseConfig`
 impl From<&AppDatabaseConfig> for DatabaseConfig {
     fn from(app_config: &AppDatabaseConfig) -> Self {
         Self {
@@ -78,11 +78,11 @@ impl DatabaseConfig {
     }
 }
 
-/// ClickHouse数据库配置结构体
-/// 包含连接ClickHouse所需的所有参数
+/// `ClickHouse` 数据库配置结构体
+/// 包含连接 `ClickHouse` 所需的所有参数
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClickHouseConfig {
-    /// ClickHouse连接字符串
+    /// `ClickHouse` 连接字符串
     pub dsn: String,
     /// 连接超时时间（秒）
     pub dial_timeout: u32,

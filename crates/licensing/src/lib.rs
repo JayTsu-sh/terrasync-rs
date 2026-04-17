@@ -27,7 +27,7 @@ pub mod sentinel;
 pub mod types;
 pub mod verify;
 
-/// 全局 License 状态（启动验证后设置，后续 quick_verify 读取）
+/// 全局 License 状态（启动验证后设置，后续 `quick_verify` 读取）
 static GLOBAL_LICENSE: OnceLock<types::LicenseFile> = OnceLock::new();
 
 /// 设置全局 License（启动验证后调用一次）

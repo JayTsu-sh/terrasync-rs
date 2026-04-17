@@ -29,13 +29,13 @@ pub enum SenderMsg {
 
     // ── 单进程模式：命令模式（Receiver 有 src+dest storage，自己执行 copy） ──
     /// 复制一个 entry（目录/符号链接/文件，Receiver 根据 entry 类型 dispatch）
-    /// Receiver 调用 process_entry(entry, src_storage, dest_storage, ...) 完成完整复制
+    /// Receiver 调用 `process_entry(entry, src_storage, dest_storage, ...)` 完成完整复制
     CopyEntry { entry: Arc<EntryEnum> },
 
     // ── 双进程模式：数据流模式（Receiver 只有 dest storage，Sender 流式发送数据） ──
-    /// 创建目录（Receiver 调用 create_dir_all + set_metadata + ACL）
+    /// 创建目录（Receiver 调用 `create_dir_all` + `set_metadata` + ACL）
     CreateDir { entry: Arc<EntryEnum> },
-    /// 创建符号链接（Sender 已读取 target，Receiver 调用 create_symlink）
+    /// 创建符号链接（Sender 已读取 target，Receiver 调用 `create_symlink`）
     CreateSymlink { entry: Arc<EntryEnum>, target: PathBuf },
     /// 文件传输开始（Receiver 用于准备写入上下文）
     FileBegin { entry: Arc<EntryEnum> },
@@ -93,7 +93,7 @@ pub enum ReceiverMsg {
     RequestsDone,
 
     // ── Entry 级别 ack（单进程 + 双进程通用） ──
-    /// Entry 写入成功（Receiver 完成写入 + set_metadata + ACL 后发送）
+    /// Entry 写入成功（Receiver 完成写入 + `set_metadata` + ACL 后发送）
     EntrySuccess { entry: Arc<EntryEnum> },
     /// Entry 写入失败
     EntryError { entry: Arc<EntryEnum>, reason: String },
@@ -124,12 +124,13 @@ pub enum ReceiverMsg {
 
 /// 会话配置，Sender 建立连接后首先发送
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[allow(clippy::struct_excessive_bools)]
 pub struct SessionConfig {
-    /// 源端存储路径（Receiver 用于创建 src_storage，CopyEntry 模式需要）
+    /// 源端存储路径（Receiver 用于创建 `src_storage`，`CopyEntry` 模式需要）
     pub src_path: String,
-    /// QoS 带宽限制（例如 "1GiB/s"）
+    /// `QoS` 带宽限制（例如 "1GiB/s"）
     pub qos: Option<String>,
-    /// QoS 峰值倍率
+    /// `QoS` 峰值倍率
     pub peak_qos_rate: f32,
     /// IOPS 限制
     pub iops: Option<u32>,
@@ -198,7 +199,7 @@ pub enum TransferDecision {
 #[derive(Debug)]
 pub enum DiskCommitMsg {
     // ── 目录/符号链接（即时完成，不需要 multi-chunk） ──
-    /// 创建目录 + set_metadata + ACL
+    /// 创建目录 + `set_metadata` + ACL
     CreateDir { entry: Arc<EntryEnum> },
     /// 创建符号链接
     CreateSymlink { entry: Arc<EntryEnum>, target: PathBuf },
@@ -210,7 +211,7 @@ pub enum DiskCommitMsg {
         data: Bytes,
         offset: u64,
     },
-    /// 文件传输结束，提交：校验 hash + set_metadata + ACL
+    /// 文件传输结束，提交：校验 hash + `set_metadata` + ACL
     FileCommit {
         entry: Arc<EntryEnum>,
         source_hash: Option<String>,
@@ -245,7 +246,7 @@ pub enum DiskCommitMsg {
 // NDX 映射表（双进程模式下 Receiver 和 Sender 各持一份）
 // ============================================================
 
-/// NDX → EntryEnum 的映射表
+/// NDX → `EntryEnum` 的映射表
 #[derive(Debug, Default)]
 pub struct NdxTable {
     entries: std::collections::HashMap<i32, Arc<EntryEnum>>,
@@ -256,7 +257,7 @@ impl NdxTable {
         Self::default()
     }
 
-    /// 从 DirPageResult 批量插入
+    /// 从 `DirPageResult` 批量插入
     pub fn ingest_page(&mut self, page: &DirPageResult) {
         for nf in &page.files {
             self.entries.insert(nf.ndx, nf.entry.clone());
@@ -286,7 +287,7 @@ impl NdxTable {
 // ============================================================
 
 /// 目标端目录索引（按页粒度构建，处理完一页后释放）
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct DestIndex {
     /// name → 目标端 EntryEnum（仅当前目录下的直接子条目）
     entries: std::collections::HashMap<String, Arc<EntryEnum>>,
@@ -296,10 +297,7 @@ pub struct DestIndex {
 
 impl DestIndex {
     pub fn new() -> Self {
-        Self {
-            entries: std::collections::HashMap::new(),
-            matched: std::collections::HashSet::new(),
-        }
+        Self::default()
     }
 
     /// 插入一个目标端条目
@@ -340,7 +338,7 @@ fn data_check(src: &EntryEnum, dest: &EntryEnum) -> bool {
     src.get_mtime() == dest.get_mtime() && src.get_size() == dest.get_size()
 }
 
-/// 元数据比较：按 EntryEnum 类型比较不同字段
+/// 元数据比较：按 `EntryEnum` 类型比较不同字段
 fn metadata_check(src: &EntryEnum, dest: &EntryEnum) -> bool {
     match (src, dest) {
         (EntryEnum::NAS(s), EntryEnum::NAS(d)) => s.mode == d.mode && s.uid == d.uid && s.gid == d.gid,

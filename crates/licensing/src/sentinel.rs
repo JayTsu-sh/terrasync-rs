@@ -13,7 +13,7 @@ use crate::types::SentinelData;
 /// 获取哨兵文件路径
 ///
 /// 路径伪装为系统运行时文件，不包含 "terrasync" / "license" / "seal" 等关键词。
-/// 文件名由 license_id 的 SHA-256 前 16 字符构成，无法从文件名反推 license。
+/// 文件名由 `license_id` 的 SHA-256 前 16 字符构成，无法从文件名反推 license。
 pub fn sentinel_path(license_id: &str) -> PathBuf {
     let hash = sha256_hex(license_id.as_bytes());
     let filename = format!(".rt_{}.dat", &hash[..16]);
@@ -69,14 +69,14 @@ pub fn verify_sentinel(
     }
 
     // 3. 时钟一致性检查：哨兵 clock 不应大于 license 文件 clock
-    if let Some(file_clock) = license_clock {
-        if sentinel.ck > file_clock {
-            warn!("License verification failed");
-            return Err(LicenseError::LicenseFileRestored {
-                sentinel_clock: sentinel.ck.to_rfc3339(),
-                license_clock: file_clock.to_rfc3339(),
-            });
-        }
+    if let Some(file_clock) = license_clock
+        && sentinel.ck > file_clock
+    {
+        warn!("License verification failed");
+        return Err(LicenseError::LicenseFileRestored {
+            sentinel_clock: sentinel.ck.to_rfc3339(),
+            license_clock: file_clock.to_rfc3339(),
+        });
     }
 
     Ok(())

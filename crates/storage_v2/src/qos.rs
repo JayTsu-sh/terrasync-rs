@@ -14,7 +14,7 @@ use tracing::debug;
 // 内部模块
 use crate::error::{Result, StorageError};
 
-/// Governor 内部的 RateLimiter 类型别名
+/// Governor 内部的 `RateLimiter` 类型别名
 type DirectRateLimiter = RateLimiter<NotKeyed, InMemoryState, DefaultClock>;
 
 /// 带宽 limiter（1 cell = 1 KB）
@@ -22,7 +22,7 @@ type BandwidthLimiter = DirectRateLimiter;
 /// IOPS limiter（1 cell = 1 op）
 type IopsLimiter = DirectRateLimiter;
 
-/// QoS 统计信息，使用原子计数器避免锁竞争
+/// `QoS` 统计信息，使用原子计数器避免锁竞争
 #[derive(Debug)]
 pub struct QosStats {
     /// 累计已传输字节数
@@ -63,7 +63,7 @@ impl QosStats {
     }
 }
 
-/// QoS 配置快照
+/// `QoS` 配置快照
 #[derive(Debug, Clone)]
 pub struct QosConfig {
     /// 带宽限制字符串（如 "200MiB/s"）
@@ -74,9 +74,9 @@ pub struct QosConfig {
     pub iops: Option<u32>,
 }
 
-/// QoS 管理器
+/// `QoS` 管理器
 ///
-/// 封装带宽和 IOPS 两个 Governor RateLimiter，支持 ArcSwap 热更新。
+/// 封装带宽和 IOPS 两个 Governor `RateLimiter`，支持 `ArcSwap` 热更新。
 /// `Clone + Send + Sync`，可直接 clone 传递，无需外层 Mutex。
 #[derive(Clone, Debug)]
 pub struct QosManager {
@@ -88,25 +88,23 @@ pub struct QosManager {
 
 /// 将字节数转换为 cells（1 cell = 1 KB），最小为 1
 fn bytes_to_cells(bytes: u64) -> NonZeroU32 {
-    let cells = ((bytes + 1023) / 1024).max(1) as u32;
+    let cells = u32::try_from(bytes.div_ceil(1024).max(1)).unwrap_or(u32::MAX);
     // cells 至少为 1，NonZeroU32::new 不会返回 None
-    NonZeroU32::new(cells.min(u32::MAX)).unwrap_or(NonZeroU32::MIN)
+    NonZeroU32::new(cells).unwrap_or(NonZeroU32::MIN)
 }
 
 /// 构建带宽 limiter
-/// 1 cell = 1 KB，速率 = base_rate_bps / 1024 cells/sec
-/// burst = base_rate * peak_rate / 1024 cells
+/// 1 cell = 1 KB，速率 = `base_rate_bps` / 1024 cells/sec
+/// burst = `base_rate` * `peak_rate` / 1024 cells
+const MIN_PEAK_RATE_BPS: u64 = 2 * 1024 * 1024; // 2MB/s
+
 fn build_bandwidth_limiter(bandwidth_str: &str, peak_rate: f32) -> Result<BandwidthLimiter> {
     let base_rate_bps = parse_bandwidth_string(bandwidth_str)?;
 
     // 检查峰值速率是否过小
-    const MIN_PEAK_RATE_BPS: u64 = 2 * 1024 * 1024; // 2MB/s
-    let peak_rate_bps = (base_rate_bps as f64 * peak_rate as f64).round() as u64;
+    let peak_rate_bps = (base_rate_bps as f64 * f64::from(peak_rate)).round() as u64;
     if peak_rate_bps < MIN_PEAK_RATE_BPS {
-        println!(
-            "警告: 峰值带宽设置过小 ({} B/s),对于大于1M的文件传输会有影响。建议至少设置为2MB/s。\n",
-            peak_rate_bps
-        );
+        println!("警告: 峰值带宽设置过小 ({peak_rate_bps} B/s),对于大于1M的文件传输会有影响。建议至少设置为2MB/s。\n");
     }
 
     // 基准速率换算为 cells/sec（1 cell = 1 KB）
@@ -144,7 +142,7 @@ fn build_iops_limiter(iops: u32) -> Result<IopsLimiter> {
 }
 
 impl QosManager {
-    /// 创建新的 QoS 管理器
+    /// 创建新的 `QoS` 管理器
     ///
     /// - `bandwidth`: 带宽限制字符串，如 "200MiB/s"，None 则不限速
     /// - `peak_rate`: 峰值速率倍数（相对于基准速率）
@@ -167,7 +165,7 @@ impl QosManager {
         };
 
         let config = QosConfig {
-            bandwidth: bandwidth.map(|s| s.to_string()),
+            bandwidth: bandwidth.map(std::string::ToString::to_string),
             peak_rate,
             iops,
         };
@@ -182,7 +180,7 @@ impl QosManager {
 
     /// 获取带宽限流（异步等待直到令牌可用）
     ///
-    /// 每个 DataChunk 在读取前调用，bytes 为 chunk 大小
+    /// 每个 `DataChunk` 在读取前调用，bytes 为 chunk 大小
     pub async fn acquire_bandwidth(&self, bytes: u64) {
         if let Some(bw) = &self.bandwidth_limiter {
             let limiter = bw.load();
@@ -221,7 +219,7 @@ impl QosManager {
 
     /// 同时获取带宽和 IOPS 限流
     ///
-    /// 在 read_data 循环内，每个 chunk 前调用此方法
+    /// 在 `read_data` 循环内，每个 chunk 前调用此方法
     pub async fn acquire(&self, bytes: u64) {
         // 并行执行两个限流（任一个阻塞时不影响另一个的计时）
         tokio::join!(self.acquire_bandwidth(bytes), self.acquire_iops());
@@ -254,7 +252,7 @@ impl QosManager {
         Ok(())
     }
 
-    /// 获取 QoS 统计信息
+    /// 获取 `QoS` 统计信息
     pub fn stats(&self) -> &QosStats {
         &self.stats
     }
@@ -264,7 +262,7 @@ impl QosManager {
         self.config.load_full()
     }
 
-    /// 是否启用了任何 QoS 限制
+    /// 是否启用了任何 `QoS` 限制
     pub fn is_enabled(&self) -> bool {
         self.bandwidth_limiter.is_some() || self.iops_limiter.is_some()
     }
@@ -296,7 +294,7 @@ pub fn divide_bandwidth(bandwidth: &Option<String>, divisor: usize) -> Option<St
     let bw_str = bandwidth.as_ref()?;
     let total_bps = parse_bandwidth_string(bw_str).ok()?;
     let per_worker_bps = total_bps / divisor.max(1) as u64;
-    Some(format!("{}b/s", per_worker_bps))
+    Some(format!("{per_worker_bps}b/s"))
 }
 
 // 解析带宽字符串，支持格式如"1GiB/s"或"200MiB/s"，大小写不敏感，数字和单位之间可带空格
@@ -323,7 +321,7 @@ pub fn parse_bandwidth_string(bandwidth: &str) -> Result<u64> {
     ];
 
     // 尝试匹配每个单位
-    for (unit, multiplier) in units.iter() {
+    for (unit, multiplier) in &units {
         if bandwidth.ends_with(unit) {
             // 提取数字部分
             let number_str = &bandwidth[0..bandwidth.len() - unit.len()];
@@ -332,13 +330,12 @@ pub fn parse_bandwidth_string(bandwidth: &str) -> Result<u64> {
                 continue;
             }
             // 解析数字
-            let number = match number_str.parse::<f64>() {
-                Ok(n) => n,
-                Err(_) => continue, // 尝试下一个单位
+            let Ok(number) = number_str.parse::<f64>() else {
+                continue; // 尝试下一个单位
             };
 
             // 计算最终的bps值
-            let bytes_per_second = (number * *multiplier as f64).round() as u64;
+            let bytes_per_second = (number * f64::from(*multiplier)).round() as u64;
             return Ok(bytes_per_second);
         }
     }

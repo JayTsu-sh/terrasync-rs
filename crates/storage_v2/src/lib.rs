@@ -48,7 +48,7 @@ pub type DeleteDirIterator = AsyncReceiver<DeleteEvent>;
 
 pub type Result<T> = std::result::Result<T, error::StorageError>;
 
-/// walkdir_2 输出的异步迭代器类型
+/// `walkdir_2` 输出的异步迭代器类型
 pub type WalkDirAsyncIterator2 = AsyncReceiver<dir_tree::NdxEvent>;
 
 /// 常量定义
@@ -302,7 +302,7 @@ pub enum StorageEntryMessage {
     Packaged(Arc<EntryEnum>),
     /// 打包完成后的 manifest 数据，由 sync worker 广播，DatabaseConsumer 消费写入数据库
     TarManifest {
-        /// .tar 文件的 relative_path
+        /// `.tar` 文件的 `relative_path`
         tar_path: String,
         /// tar 内包含的所有条目
         entries: Vec<Arc<EntryEnum>>,
@@ -355,17 +355,17 @@ pub struct NASEntry {
     #[serde(skip)]
     pub file_handle: Option<Bytes>,
 
-    /// NFSv4 ACL（仅 NFSv4+ 填充）
+    /// `NFSv4` ACL（仅 `NFSv4`+ 填充）
     #[serde(skip)]
     pub acl: Option<nfs_rs::Acl>,
 
-    /// NFSv4 owner 字符串，如 "root@localdomain"
+    /// `NFSv4` owner 字符串，如 "root@localdomain"
     pub owner: Option<String>,
 
-    /// NFSv4 owner_group 字符串
+    /// `NFSv4` `owner_group` 字符串
     pub owner_group: Option<String>,
 
-    /// Extended attributes (xattr) key-value pairs（仅 NFSv4+ 扫描时填充）
+    /// Extended attributes (xattr) key-value pairs（仅 `NFSv4`+ 扫描时填充）
     #[serde(skip)]
     pub xattrs: Option<Vec<(String, Vec<u8>)>>,
 }
@@ -374,7 +374,7 @@ impl fmt::Display for NASEntry {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "NASEntry {{")?;
         write!(f, "name: {:?}, ", self.name)?;
-        write!(f, "relative_path: {:?}, ", self.relative_path)?;
+        write!(f, "relative_path: {}, ", self.relative_path.display())?;
         write!(f, "extension: {:?}, ", self.extension)?;
         write!(f, "is_dir: {}, ", self.is_dir)?;
         write!(f, "size: {}, ", self.size)?;
@@ -389,10 +389,10 @@ impl fmt::Display for NASEntry {
         write!(f, "ino: {:?}, ", self.ino)?;
         write!(f, "file_handle: {:?}, ", self.file_handle)?;
         if let Some(ref owner) = self.owner {
-            write!(f, "owner: {:?}, ", owner)?;
+            write!(f, "owner: {owner:?}, ")?;
         }
         if let Some(ref owner_group) = self.owner_group {
-            write!(f, "owner_group: {:?}, ", owner_group)?;
+            write!(f, "owner_group: {owner_group:?}, ")?;
         }
         if let Some(ref acl) = self.acl {
             write!(f, "acl: {} aces, ", acl.aces.len())?;
@@ -483,7 +483,7 @@ pub fn days_between(now: SystemTime, time: SystemTime) -> f64 {
 
     // 将持续时间转换为天数（f64）
     let seconds = duration.as_secs() as f64;
-    let nanoseconds = duration.subsec_nanos() as f64;
+    let nanoseconds = f64::from(duration.subsec_nanos());
     let total_seconds = seconds + nanoseconds / 1_000_000_000.0;
 
     // 计算天数（一天 = 86400 秒）

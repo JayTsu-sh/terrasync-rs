@@ -33,7 +33,7 @@ impl DirectoryWalker {
             let storage = create_storage(&self.config.path, None).await?;
 
             // 从文件列表创建迭代器
-            walkdir_from_file_list(storage, file_list_path).await
+            walkdir_from_file_list(storage, file_list_path)
         } else {
             // 使用现有的walkdir扫描方式
             let depth = if self.config.depth > 0 {
@@ -49,7 +49,7 @@ impl DirectoryWalker {
             );
             let storage = create_storage(&self.config.path, None)
                 .await
-                .map_err(|e| AppError::ScanError(format!("Failed to create storage: {}", e)))?;
+                .map_err(|e| AppError::ScanError(format!("Failed to create storage: {e}")))?;
             let walkdir_iter = storage
                 .walkdir(
                     None,
@@ -62,29 +62,28 @@ impl DirectoryWalker {
                     self.config.package_depth,
                 )
                 .await
-                .map_err(|e| AppError::ScanError(format!("Failed to start walkdir: {}", e)))?;
+                .map_err(|e| AppError::ScanError(format!("Failed to start walkdir: {e}")))?;
 
             Ok(walkdir_iter)
         }
     }
 }
 
-/// 从文件列表创建WalkDirAsyncIterator
+/// 从文件列表创建 `WalkDirAsyncIterator`
 ///
-/// 该函数从文件列表中读取文件路径，然后为每个文件创建EntryEnum，
-/// 并通过WalkDirAsyncIterator返回。
+/// 该函数从文件列表中读取文件路径，然后为每个文件创建 `EntryEnum`，
+/// 并通过 `WalkDirAsyncIterator` 返回。
 ///
 /// # 参数
-/// - `storage`: storage_v2存储实例
+/// - `storage`: `storage_v2` 存储实例
 /// - `file_list_path`: 文件列表路径
 ///
 /// # 返回值
-/// - 成功时返回WalkDirAsyncIterator
-/// - 失败时返回包含错误信息的`Err`
-async fn walkdir_from_file_list(storage: StorageEnum, file_list_path: &str) -> Result<WalkDirAsyncIterator> {
+/// - 成功时返回 `WalkDirAsyncIterator`
+/// - 失败时返回包含错误信息的 `Err`
+fn walkdir_from_file_list(storage: StorageEnum, file_list_path: &str) -> Result<WalkDirAsyncIterator> {
     // 从文件中读取文件路径
-    let file =
-        File::open(file_list_path).map_err(|e| AppError::ScanError(format!("Failed to open file list: {}", e)))?;
+    let file = File::open(file_list_path).map_err(|e| AppError::ScanError(format!("Failed to open file list: {e}")))?;
     let reader = BufReader::new(file);
 
     // 创建一个迭代器，逐行读取文件并转换为PathBuf
@@ -95,7 +94,17 @@ async fn walkdir_from_file_list(storage: StorageEnum, file_list_path: &str) -> R
                 if line.is_empty() || line.starts_with('#') {
                     None // 跳过空行和注释行
                 } else {
-                    Some(Ok(PathBuf::from(line)))
+                    let path = PathBuf::from(line);
+                    // 安全校验：拒绝绝对路径和包含 ".." 的路径，防止路径穿越攻击
+                    if path.is_absolute() {
+                        error!("file_list 中包含绝对路径，已跳过: {:?}", path);
+                        return None;
+                    }
+                    if path.components().any(|c| c == std::path::Component::ParentDir) {
+                        error!("file_list 中包含 '..' 路径组件，已跳过: {:?}", path);
+                        return None;
+                    }
+                    Some(Ok(path))
                 }
             }
             Err(e) => Some(Err(e)),

@@ -10,7 +10,7 @@ use crate::error::{Result, WebError};
 /// 数据库文件默认路径
 const DEFAULT_DB_PATH: &str = "data/terrasync_web.db";
 
-/// 初始化 SQLite 数据库连接池并执行迁移
+/// 初始化 `SQLite` 数据库连接池并执行迁移
 pub async fn init_database() -> Result<SqlitePool> {
     // 确保数据目录存在
     if let Some(parent) = std::path::Path::new(DEFAULT_DB_PATH).parent() {

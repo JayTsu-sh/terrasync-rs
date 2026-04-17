@@ -21,13 +21,7 @@ fn main() {
     }
 
     // 判断是否需要重建前端
-    let needs_build = if !dist_index.exists() {
-        true
-    } else if is_source_newer_than_dist(web_ui_dir, &dist_index) {
-        true
-    } else {
-        false
-    };
+    let needs_build = !dist_index.exists() || is_source_newer_than_dist(web_ui_dir, &dist_index);
 
     if !needs_build {
         return;
@@ -65,16 +59,15 @@ fn main() {
 
 /// 检查前端源码是否比 dist/index.html 更新
 fn is_source_newer_than_dist(web_ui_dir: &Path, dist_index: &Path) -> bool {
-    let dist_mtime = match dist_index.metadata().and_then(|m| m.modified()) {
-        Ok(t) => t,
-        Err(_) => return true, // 无法获取 dist 时间，视为需要重建
+    let Ok(dist_mtime) = dist_index.metadata().and_then(|m| m.modified()) else {
+        return true; // 无法获取 dist 时间，视为需要重建
     };
 
     let src_dir = web_ui_dir.join("src");
-    if let Ok(newest) = newest_mtime_in_dir(&src_dir) {
-        if newest > dist_mtime {
-            return true;
-        }
+    if let Ok(newest) = newest_mtime_in_dir(&src_dir)
+        && newest > dist_mtime
+    {
+        return true;
     }
 
     // 检查关键配置文件
@@ -87,12 +80,11 @@ fn is_source_newer_than_dist(web_ui_dir: &Path, dist_index: &Path) -> bool {
     ];
     for name in &config_files {
         let path = web_ui_dir.join(name);
-        if let Ok(meta) = path.metadata() {
-            if let Ok(mtime) = meta.modified() {
-                if mtime > dist_mtime {
-                    return true;
-                }
-            }
+        if let Ok(meta) = path.metadata()
+            && let Ok(mtime) = meta.modified()
+            && mtime > dist_mtime
+        {
+            return true;
         }
     }
 
@@ -111,17 +103,16 @@ fn newest_mtime_in_dir(dir: &Path) -> std::io::Result<SystemTime> {
         let entry = entry?;
         let path = entry.path();
         if path.is_dir() {
-            if let Ok(t) = newest_mtime_in_dir(&path) {
-                if t > newest {
-                    newest = t;
-                }
+            if let Ok(t) = newest_mtime_in_dir(&path)
+                && t > newest
+            {
+                newest = t;
             }
-        } else if let Ok(meta) = path.metadata() {
-            if let Ok(mtime) = meta.modified() {
-                if mtime > newest {
-                    newest = mtime;
-                }
-            }
+        } else if let Ok(meta) = path.metadata()
+            && let Ok(mtime) = meta.modified()
+            && mtime > newest
+        {
+            newest = mtime;
         }
     }
 

@@ -71,7 +71,7 @@ fn read_trimmed(path: &str) -> std::io::Result<String> {
 fn get_first_physical_mac() -> std::io::Result<String> {
     let net_dir = "/sys/class/net";
     let mut entries: Vec<_> = std::fs::read_dir(net_dir)?
-        .filter_map(|e| e.ok())
+        .filter_map(std::result::Result::ok)
         .map(|e| e.file_name().to_string_lossy().to_string())
         .filter(|name| !is_virtual_interface(name))
         .collect();
@@ -160,7 +160,7 @@ fn get_first_physical_mac_windows() -> std::io::Result<String> {
 fn get_first_disk_serial_linux() -> std::io::Result<String> {
     let block_dir = "/sys/block";
     let mut disks: Vec<_> = std::fs::read_dir(block_dir)?
-        .filter_map(|e| e.ok())
+        .filter_map(std::result::Result::ok)
         .map(|e| e.file_name().to_string_lossy().to_string())
         // 仅物理磁盘（sd*, vd*, nvme*），排除 loop/ram/dm 等
         .filter(|name| {

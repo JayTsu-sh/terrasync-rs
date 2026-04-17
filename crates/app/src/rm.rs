@@ -30,7 +30,7 @@ pub async fn rm(path: &str) -> Result<()> {
     pb.enable_steady_tick(Duration::from_secs(2));
 
     let concurrency = AppConfig::fetch()?.delete.concurrency;
-    let iter = storage.delete_dir_all_with_progress(None, concurrency).await?;
+    let iter = storage.delete_dir_all_with_progress(None, concurrency)?;
 
     let mut file_count: u64 = 0;
     let mut dir_count: u64 = 0;
@@ -41,10 +41,10 @@ pub async fn rm(path: &str) -> Result<()> {
         } else {
             file_count += 1;
         }
-        pb.set_message(format!("{} 文件, {} 目录", file_count, dir_count));
+        pb.set_message(format!("{file_count} 文件, {dir_count} 目录"));
     }
 
-    pb.finish_with_message(format!("完成! 共删除 {} 文件, {} 目录", file_count, dir_count));
+    pb.finish_with_message(format!("完成! 共删除 {file_count} 文件, {dir_count} 目录"));
 
     info!("成功删除路径: {}", path);
     Ok(())

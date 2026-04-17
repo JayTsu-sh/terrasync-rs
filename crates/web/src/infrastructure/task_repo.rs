@@ -57,7 +57,7 @@ impl TaskRepository for SqliteTaskRepo {
         .fetch_optional(&self.pool)
         .await?;
 
-        row.map(|r| r.try_into()).transpose()
+        row.map(TryInto::try_into).transpose()
     }
 
     async fn find_by_endpoint_id(&self, endpoint_id: &str) -> Result<Vec<MigrationTask>> {
@@ -69,7 +69,7 @@ impl TaskRepository for SqliteTaskRepo {
         .fetch_all(&self.pool)
         .await?;
 
-        rows.into_iter().map(|r| r.try_into()).collect()
+        rows.into_iter().map(TryInto::try_into).collect()
     }
 
     async fn find_all(&self, filter: &TaskFilter) -> Result<Vec<MigrationTask>> {
@@ -103,7 +103,7 @@ impl TaskRepository for SqliteTaskRepo {
         }
 
         let rows = query.fetch_all(&self.pool).await?;
-        rows.into_iter().map(|r| r.try_into()).collect()
+        rows.into_iter().map(TryInto::try_into).collect()
     }
 
     async fn update(&self, task: &MigrationTask) -> Result<()> {
@@ -133,7 +133,7 @@ impl TaskRepository for SqliteTaskRepo {
         let (started_at_clause, finished_at_clause) = match status {
             TaskStatus::Running => (", started_at = ?", ""),
             TaskStatus::Completed | TaskStatus::Failed | TaskStatus::Cancelled => ("", ", finished_at = ?"),
-            _ => ("", ""),
+            TaskStatus::Pending => ("", ""),
         };
 
         let sql = format!(
@@ -143,13 +143,10 @@ impl TaskRepository for SqliteTaskRepo {
         let mut query = sqlx::query(&sql).bind(&status_str).bind(error_msg);
 
         match status {
-            TaskStatus::Running => {
+            TaskStatus::Running | TaskStatus::Completed | TaskStatus::Failed | TaskStatus::Cancelled => {
                 query = query.bind(&now);
             }
-            TaskStatus::Completed | TaskStatus::Failed | TaskStatus::Cancelled => {
-                query = query.bind(&now);
-            }
-            _ => {}
+            TaskStatus::Pending => {}
         }
 
         let result = query.bind(id).execute(&self.pool).await?;
@@ -194,11 +191,8 @@ impl TryFrom<TaskRow> for MigrationTask {
     type Error = WebError;
 
     fn try_from(row: TaskRow) -> Result<Self> {
-        let task_type: TaskType = row
-            .task_type
-            .parse()
-            .map_err(|e: String| WebError::ValidationError(e))?;
-        let status: TaskStatus = row.status.parse().map_err(|e: String| WebError::ValidationError(e))?;
+        let task_type: TaskType = row.task_type.parse().map_err(WebError::ValidationError)?;
+        let status: TaskStatus = row.status.parse().map_err(WebError::ValidationError)?;
         let config: TaskConfig = serde_json::from_str(&row.config_json)?;
 
         let created_at = parse_rfc3339(&row.created_at)?;

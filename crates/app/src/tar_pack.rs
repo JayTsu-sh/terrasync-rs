@@ -19,7 +19,7 @@ use crate::error::Result;
 /// 2. 调用 `StorageEnum::pack_files_to_tar()` 流式打包写入
 ///
 /// # 返回值
-/// - `tar_entry`: 合成的条目，表示目标端的 .tar 文件（变体与输入 dir_entry 一致）
+/// - `tar_entry`: 合成的条目，表示目标端的 .tar 文件（变体与输入 `dir_entry` 一致）
 /// - `manifest_list`: tar 内所有条目的列表（供后续写入 manifest 表）
 pub async fn pack_directory(
     src_storage: &StorageEnum, dest_storage: &StorageEnum, dir_entry: &EntryEnum, is_source_reserved: bool,

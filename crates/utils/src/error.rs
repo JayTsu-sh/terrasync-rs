@@ -34,7 +34,7 @@ pub enum UtilsError {
 
     /// IO错误
     ///
-    /// 当文件或网络IO操作失败时触发，从标准库的io::Error自动转换。
+    /// 当文件或网络IO操作失败时触发，从标准库的 `io::Error` 自动转换。
     #[error("IO error: {0}")]
     IoError(#[from] std::io::Error),
 
@@ -80,16 +80,16 @@ pub enum UtilsError {
 /// 封装了UtilsError作为错误类型，方便在工具库中使用。
 pub type Result<T> = std::result::Result<T, UtilsError>;
 
-/// 从PoisonError转换为UtilsError
+/// 从 `PoisonError` 转换为 `UtilsError`
 ///
-/// 当互斥锁中毒时自动转换为UtilsError::MutexPoisoned。
+/// 当互斥锁中毒时自动转换为 `UtilsError::MutexPoisoned`。
 impl<T> From<std::sync::PoisonError<T>> for UtilsError {
     fn from(_err: std::sync::PoisonError<T>) -> Self {
         UtilsError::MutexPoisoned
     }
 }
 
-/// 从String转换为UtilsError
+/// 从 `String` 转换为 `UtilsError`
 ///
 /// 方便将字符串直接转换为错误类型。
 impl From<String> for UtilsError {
@@ -107,9 +107,9 @@ impl From<&str> for UtilsError {
     }
 }
 
-/// 从Box<dyn Error>转换为UtilsError
+/// 从 `Box<dyn Error>` 转换为 `UtilsError`
 ///
-/// 方便将各种错误类型转换为统一的UtilsError。
+/// 方便将各种错误类型转换为统一的 `UtilsError`。
 impl From<Box<dyn std::error::Error + Send + Sync>> for UtilsError {
     fn from(err: Box<dyn std::error::Error + Send + Sync>) -> Self {
         UtilsError::Other(err.to_string())

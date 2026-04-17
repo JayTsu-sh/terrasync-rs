@@ -31,44 +31,42 @@ pub(crate) struct WorkerContext<T: Send> {
 impl<T: Send> WorkerContext<T> {
     /// LIFO 弹出自己栈的任务，失败则 FIFO 窃取邻居最旧（最浅）的任务
     ///
-    /// 注意：必须先将自己栈的弹出结果存入变量让 MutexGuard 立即释放，
+    /// 注意：必须先将自己栈的弹出结果存入变量让 `MutexGuard` 立即释放，
     /// 否则在窃取邻居任务时会同时持有自己栈的锁，可能导致死锁。
     pub async fn pop_task(&self) -> Option<T> {
         let own_task = self.my_stack.lock().await.pop_back();
-        match own_task {
-            Some(task) => Some(task),
-            None => {
-                for neighbor in &self.neighbor_stacks {
-                    if let Some(task) = neighbor.lock().await.pop_front() {
-                        return Some(task);
-                    }
-                }
-                None
+        if let Some(task) = own_task {
+            return Some(task);
+        }
+        for neighbor in &self.neighbor_stacks {
+            if let Some(task) = neighbor.lock().await.pop_front() {
+                return Some(task);
             }
         }
+        None
     }
 
     /// 将新任务推入自己的栈（LIFO），并递增活跃任务计数器、通知等待中的 worker
     pub async fn push_task(&self, task: T) {
         self.my_stack.lock().await.push_back(task);
-        self.active_tasks.fetch_add(1, Ordering::Relaxed);
+        self.active_tasks.fetch_add(1, Ordering::Release);
         self.notify.notify_waiters();
     }
 
     /// 标记当前 worker 开始处理任务
     pub fn begin_processing(&self) {
-        self.active_producers.fetch_add(1, Ordering::Relaxed);
+        self.active_producers.fetch_add(1, Ordering::Release);
     }
 
     /// 标记当前 worker 完成任务处理
     pub fn end_processing(&self) {
-        self.active_producers.fetch_sub(1, Ordering::Relaxed);
-        self.active_tasks.fetch_sub(1, Ordering::Relaxed);
+        self.active_producers.fetch_sub(1, Ordering::Release);
+        self.active_tasks.fetch_sub(1, Ordering::Release);
     }
 
     /// 检查是否所有任务都已完成（无活跃任务且无活跃生产者）
     pub fn is_done(&self) -> bool {
-        self.active_tasks.load(Ordering::Relaxed) == 0 && self.active_producers.load(Ordering::Relaxed) == 0
+        self.active_tasks.load(Ordering::Acquire) == 0 && self.active_producers.load(Ordering::Acquire) == 0
     }
 
     /// 等待新任务通知，超时 100μs 后返回（避免忙等，同时防止通知丢失）
@@ -83,7 +81,7 @@ impl<T: Send> WorkerContext<T> {
 ///
 /// concurrency 会被 clamp 到 [1, 64] 范围
 pub(crate) async fn create_worker_contexts<T: Send>(concurrency: usize, initial_task: T) -> Vec<WorkerContext<T>> {
-    let concurrency = concurrency.max(1).min(64);
+    let concurrency = concurrency.clamp(1, 64);
 
     let stacks: Vec<Arc<Mutex<VecDeque<T>>>> = (0..concurrency)
         .map(|_| Arc::new(Mutex::new(VecDeque::new())))

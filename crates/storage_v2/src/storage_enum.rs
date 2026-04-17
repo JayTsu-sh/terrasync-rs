@@ -44,7 +44,7 @@ impl StorageEnum {
     ///
     /// - Local: 检查根路径是否存在且可访问
     /// - NFS: 创建成功即已连通（mount 操作在构造时完成）
-    /// - S3: 执行 HeadBucket 验证 bucket 可访问性及凭据有效性
+    /// - S3: 执行 `HeadBucket` 验证 bucket 可访问性及凭据有效性
     pub async fn check_connectivity(&self) -> Result<()> {
         match self {
             StorageEnum::Local(storage) => {
@@ -71,7 +71,7 @@ impl StorageEnum {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_nanos();
-        let tmp_name = format!(".~ts_{:x}", nanos);
+        let tmp_name = format!(".~ts_{nanos:x}");
 
         match self {
             StorageEnum::Local(_) => Ok(None),
@@ -107,15 +107,15 @@ impl StorageEnum {
         match (self, entry) {
             (StorageEnum::Local(storage), EntryEnum::NAS(entry)) => storage.delete_file(&entry.relative_path).await,
             (StorageEnum::Local(storage), EntryEnum::S3(entry)) => {
-                storage.delete_file(&Path::new(&entry.relative_path)).await
+                storage.delete_file(Path::new(&entry.relative_path)).await
             }
             (StorageEnum::NFS(storage), EntryEnum::NAS(entry)) => storage.delete_file(&entry.relative_path).await,
             (StorageEnum::NFS(storage), EntryEnum::S3(entry)) => {
-                storage.delete_file(&Path::new(&entry.relative_path)).await
+                storage.delete_file(Path::new(&entry.relative_path)).await
             }
             (StorageEnum::CIFS(storage), EntryEnum::NAS(entry)) => storage.delete_file(&entry.relative_path).await,
             (StorageEnum::CIFS(storage), EntryEnum::S3(entry)) => {
-                storage.delete_file(&Path::new(&entry.relative_path)).await
+                storage.delete_file(Path::new(&entry.relative_path)).await
             }
             (StorageEnum::S3(storage), EntryEnum::S3(entry)) => {
                 let key = storage.build_full_key(&entry.relative_path);
@@ -133,19 +133,19 @@ impl StorageEnum {
             // local storage will create all dirs if it does not exist
             (StorageEnum::Local(storage), EntryEnum::NAS(entry)) => storage.create_dir_all(&entry.relative_path).await,
             (StorageEnum::Local(storage), EntryEnum::S3(entry)) => {
-                storage.create_dir_all(&Path::new(&entry.relative_path)).await
+                storage.create_dir_all(Path::new(&entry.relative_path)).await
             }
             // nfs storage will create all dirs if it deos not exist
             (StorageEnum::NFS(storage), EntryEnum::NAS(entry)) => {
                 storage.create_dir_all(&entry.relative_path).await.map(|_| ())
             }
             (StorageEnum::NFS(storage), EntryEnum::S3(entry)) => storage
-                .create_dir_all(&Path::new(&entry.relative_path))
+                .create_dir_all(Path::new(&entry.relative_path))
                 .await
                 .map(|_| ()),
             (StorageEnum::CIFS(storage), EntryEnum::NAS(entry)) => storage.create_dir_all(&entry.relative_path).await,
             (StorageEnum::CIFS(storage), EntryEnum::S3(entry)) => {
-                storage.create_dir_all(&Path::new(&entry.relative_path)).await
+                storage.create_dir_all(Path::new(&entry.relative_path)).await
             }
             // s3 storage will has no dir concept, so we just return Ok(())
             _ => Ok(()),
@@ -153,9 +153,7 @@ impl StorageEnum {
     }
 
     pub async fn delete_dir_all(&self, entry: &EntryEnum) -> Result<()> {
-        let iter = self
-            .delete_dir_all_with_progress(Some(entry.get_relative_path()), 4)
-            .await?;
+        let iter = self.delete_dir_all_with_progress(Some(entry.get_relative_path()), 4)?;
         while iter.next().await.is_some() {}
         Ok(())
     }
@@ -179,7 +177,7 @@ impl StorageEnum {
             (StorageEnum::NFS(storage), EntryEnum::NAS(entry)) => {
                 storage
                     .create_symlink(
-                        &Path::new(&entry.relative_path),
+                        Path::new(&entry.relative_path),
                         target,
                         entry.atime,
                         entry.mtime,
@@ -222,6 +220,7 @@ impl StorageEnum {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn walkdir(
         &self, sub_path: Option<&Path>, depth: Option<usize>, match_expressions: Option<FilterExpression>,
         exclude_expressions: Option<FilterExpression>, concurrency: usize, include_tags: bool, packaged: bool,
@@ -281,7 +280,7 @@ impl StorageEnum {
         }
     }
 
-    /// walkdir_2: 目录分页遍历，DFS 顺序分配 NDX，页级输出
+    /// `walkdir_2`: 目录分页遍历，DFS 顺序分配 NDX，页级输出
     pub async fn walkdir_2(
         &self, sub_path: Option<&Path>, depth: Option<usize>, match_expressions: Option<FilterExpression>,
         exclude_expressions: Option<FilterExpression>, concurrency: usize, include_tags: bool,
@@ -379,21 +378,21 @@ impl StorageEnum {
     }
 
     /// 并行删除目录下所有文件和子目录，返回进度迭代器
-    pub async fn delete_dir_all_with_progress(
+    pub fn delete_dir_all_with_progress(
         &self, relative_path: Option<&Path>, concurrency: usize,
     ) -> Result<DeleteDirIterator> {
         match self {
-            StorageEnum::Local(s) => s.delete_dir_all_with_progress(relative_path, concurrency).await,
-            StorageEnum::NFS(s) => s.delete_dir_all_with_progress(relative_path, concurrency).await,
-            StorageEnum::CIFS(s) => s.delete_dir_all_with_progress(relative_path, concurrency).await,
+            StorageEnum::Local(s) => s.delete_dir_all_with_progress(relative_path, concurrency),
+            StorageEnum::NFS(s) => s.delete_dir_all_with_progress(relative_path, concurrency),
+            StorageEnum::CIFS(s) => s.delete_dir_all_with_progress(relative_path, concurrency),
             StorageEnum::S3(s) => {
                 let key = relative_path.map(|p| path_to_s3_key(p));
-                s.delete_dir_all_with_progress(key.as_deref(), concurrency).await
+                s.delete_dir_all_with_progress(key.as_deref(), concurrency)
             }
         }
     }
 
-    /// Compute BLAKE3 hash of a file by streaming it through the storage's read_data.
+    /// Compute BLAKE3 hash of a file by streaming it through the storage's `read_data`.
     pub async fn compute_hash(&self, relative_path: &Path, size: u64) -> Result<String> {
         if size == 0 {
             return Ok(String::new());
@@ -416,17 +415,17 @@ impl StorageEnum {
         while rx.recv().await.is_some() {}
         let hasher = read_task
             .await
-            .map_err(|e| StorageError::OperationError(format!("hash task panicked: {:?}", e)))??;
-        Ok(hasher.map(|h| h.finalize()).unwrap_or_default())
+            .map_err(|e| StorageError::OperationError(format!("hash task panicked: {e:?}")))??;
+        Ok(hasher.map(ConsistencyCheck::finalize).unwrap_or_default())
     }
 
-    /// Copy a file with optional QoS rate limiting and integrity verification.
+    /// Copy a file with optional `QoS` rate limiting and integrity verification.
     ///
     /// - `qos`: if provided, bandwidth + IOPS rate limiting per-chunk (multi-chunk) or per-file (single-chunk)
     /// - `enable_integrity_check`: if true, BLAKE3 hashes of source and destination are compared
     /// - `is_source_reserved`: if true, source file is not deleted after copy (S3 only)
     ///
-    /// S3→S3 copies delegate directly to server-side CopyObject / stream_copy_to and skip
+    /// S3→S3 copies delegate directly to server-side `CopyObject` / `stream_copy_to` and skip
     /// QoS/integrity (S3 guarantees consistency internally).
     pub async fn copy_file(
         from: &StorageEnum, to: &StorageEnum, entry: &EntryEnum, qos: Option<QosManager>, enable_integrity_check: bool,
@@ -435,25 +434,25 @@ impl StorageEnum {
         let size = entry.get_size();
 
         // ── S3 → S3（无 QoS 时走原生路径；有 QoS 时 fall-through 到下方单块/多块逻辑）
-        if let (StorageEnum::S3(src), StorageEnum::S3(dst), EntryEnum::S3(e)) = (from, to, entry) {
-            if qos.is_none() {
-                let src_key = src.build_full_key(&e.relative_path);
-                let dst_key = dst.build_full_key(&e.relative_path);
-                let result = if src.endpoint == dst.endpoint {
-                    src.copy_object(src.bucket(), &src_key, dst.bucket(), &dst_key).await
-                } else {
-                    src.stream_copy_to(dst, &src_key, &dst_key, e.size, e.tags.clone())
-                        .await
-                };
-                result?;
-                if let Some(ref counter) = bytes_counter {
-                    counter.fetch_add(size, Ordering::Relaxed);
-                }
-                if !is_source_reserved {
-                    from.delete_file(entry).await?;
-                }
-                return Ok(());
+        if let (StorageEnum::S3(src), StorageEnum::S3(dst), EntryEnum::S3(e)) = (from, to, entry)
+            && qos.is_none()
+        {
+            let src_key = src.build_full_key(&e.relative_path);
+            let dst_key = dst.build_full_key(&e.relative_path);
+            let result = if src.endpoint == dst.endpoint {
+                src.copy_object(src.bucket(), &src_key, dst.bucket(), &dst_key).await
+            } else {
+                src.stream_copy_to(dst, &src_key, &dst_key, e.size, e.tags.clone())
+                    .await
+            };
+            result?;
+            if let Some(ref counter) = bytes_counter {
+                counter.fetch_add(size, Ordering::Relaxed);
             }
+            if !is_source_reserved {
+                from.delete_file(entry).await?;
+            }
+            return Ok(());
         }
 
         // ── Single-chunk ──────────────────────────────────────────────────────────
@@ -472,8 +471,7 @@ impl StorageEnum {
                 (StorageEnum::S3(s), EntryEnum::S3(e)) => s.read_file(&e.relative_path, size).await?,
                 _ => {
                     return Err(StorageError::OperationError(format!(
-                        "unsupported source/entry combination for copy: {:?}",
-                        entry
+                        "unsupported source/entry combination for copy: {entry:?}"
                     )));
                 }
             };
@@ -489,34 +487,34 @@ impl StorageEnum {
 
             match (to, entry) {
                 (StorageEnum::Local(s), EntryEnum::NAS(e)) => {
-                    s.write_file(&e.relative_path, data, e.uid, e.gid, Some(e.mode)).await?
+                    s.write_file(&e.relative_path, data, e.uid, e.gid, Some(e.mode)).await?;
                 }
                 (StorageEnum::Local(s), EntryEnum::S3(e)) => {
                     s.write_file(Path::new(&e.relative_path), data, None, None, None)
-                        .await?
+                        .await?;
                 }
                 (StorageEnum::NFS(s), EntryEnum::NAS(e)) => {
-                    s.write_file(&e.relative_path, data, e.uid, e.gid, Some(e.mode)).await?
+                    s.write_file(&e.relative_path, data, e.uid, e.gid, Some(e.mode)).await?;
                 }
                 (StorageEnum::NFS(s), EntryEnum::S3(e)) => {
                     s.write_file(Path::new(&e.relative_path), data, None, None, None)
-                        .await?
+                        .await?;
                 }
                 (StorageEnum::CIFS(s), EntryEnum::NAS(e)) => {
-                    s.write_file(&e.relative_path, data, e.uid, e.gid, Some(e.mode)).await?
+                    s.write_file(&e.relative_path, data, e.uid, e.gid, Some(e.mode)).await?;
                 }
                 (StorageEnum::CIFS(s), EntryEnum::S3(e)) => {
                     s.write_file(Path::new(&e.relative_path), data, None, None, None)
-                        .await?
+                        .await?;
                 }
                 (StorageEnum::S3(s), EntryEnum::S3(e)) => {
-                    s.write_file(&e.relative_path, data, e.mtime, e.tags.clone()).await?
+                    s.write_file(&e.relative_path, data, e.mtime, e.tags.clone()).await?;
                 }
                 (StorageEnum::S3(s), EntryEnum::NAS(e)) => {
                     s.write_file(&path_to_s3_key(&e.relative_path), data, e.mtime, None)
-                        .await?
+                        .await?;
                 }
-            };
+            }
 
             // per-chunk 带宽统计：单块路径，写完后一次性增量
             if let Some(ref counter) = bytes_counter {
@@ -565,8 +563,7 @@ impl StorageEnum {
                         .await
                 }
                 _ => Err(StorageError::OperationError(format!(
-                    "unsupported source/entry combination for multi-chunk copy: {:?}",
-                    entry_r
+                    "unsupported source/entry combination for multi-chunk copy: {entry_r:?}"
                 ))),
             }
         });
@@ -618,20 +615,18 @@ impl StorageEnum {
 
         let source_hasher = read_task
             .await
-            .map_err(|e| StorageError::OperationError(format!("read task panicked: {:?}", e)))??;
+            .map_err(|e| StorageError::OperationError(format!("read task panicked: {e:?}")))??;
         write_task
             .await
-            .map_err(|e| StorageError::OperationError(format!("write task panicked: {:?}", e)))??;
+            .map_err(|e| StorageError::OperationError(format!("write task panicked: {e:?}")))??;
 
-        if enable_integrity_check {
-            if let Some(src_h) = source_hasher {
-                let src_hash = src_h.finalize();
-                let dst_hash = to.compute_hash(entry.get_relative_path(), size).await?;
-                if src_hash != dst_hash {
-                    return Err(StorageError::OperationError(
-                        "integrity check failed: source and destination hashes differ".to_string(),
-                    ));
-                }
+        if enable_integrity_check && let Some(src_h) = source_hasher {
+            let src_hash = src_h.finalize();
+            let dst_hash = to.compute_hash(entry.get_relative_path(), size).await?;
+            if src_hash != dst_hash {
+                return Err(StorageError::OperationError(
+                    "integrity check failed: source and destination hashes differ".to_string(),
+                ));
             }
         }
 
@@ -645,7 +640,7 @@ impl StorageEnum {
     /// 将多个源端文件打包为一个 tar 文件写入目标端。
     ///
     /// 参考 `copy_file` 的 multi-chunk 管道模式：
-    /// - spawn write_task 根据目标存储类型 dispatch write_data
+    /// - spawn `write_task` 根据目标存储类型 dispatch `write_data`
     /// - 当前 task 作为 producer：遍历 entries，依次发送 ustar header + 文件数据 + padding
     /// - 最后发送 EOF marker（两个 512B 全零块）
     ///
@@ -656,8 +651,9 @@ impl StorageEnum {
     /// - `tar_path`: 目标 .tar 文件的相对路径
     /// - `tar_size`: `calculate_tar_size()` 计算的总大小（S3 用于 singlepart/multipart 决策）
     /// - `tar_mtime`: tar 文件的 mtime（通常取源端目录的 mtime）
-    /// - `qos`: 可选的 QoS 限速管理器
+    /// - `qos`: 可选的 `QoS` 限速管理器
     /// - `bytes_counter`: 可选的字节计数器
+    #[allow(clippy::too_many_arguments)]
     pub async fn pack_files_to_tar(
         from: &StorageEnum, to: &StorageEnum, entries: &[Arc<EntryEnum>], tar_path: &Path, tar_size: u64,
         tar_mtime: i64, qos: Option<QosManager>, bytes_counter: Option<Arc<AtomicU64>>,
@@ -780,7 +776,7 @@ impl StorageEnum {
                         // 等待读取任务完成并检查错误
                         read_task
                             .await
-                            .map_err(|e| StorageError::OperationError(format!("read task panicked: {:?}", e)))??;
+                            .map_err(|e| StorageError::OperationError(format!("read task panicked: {e:?}")))??;
                     }
 
                     // 发送 padding
@@ -811,7 +807,7 @@ impl StorageEnum {
         // 等待写入任务完成
         write_task
             .await
-            .map_err(|e| StorageError::OperationError(format!("tar write task panicked: {:?}", e)))??;
+            .map_err(|e| StorageError::OperationError(format!("tar write task panicked: {e:?}")))??;
 
         Ok(())
     }
@@ -824,8 +820,7 @@ impl StorageEnum {
             (StorageEnum::CIFS(s), EntryEnum::NAS(e)) => s.read_file(&e.relative_path, size).await,
             (StorageEnum::S3(s), EntryEnum::S3(e)) => s.read_file(&e.relative_path, size).await,
             _ => Err(StorageError::OperationError(format!(
-                "unsupported source/entry combination for tar read: {:?}",
-                entry
+                "unsupported source/entry combination for tar read: {entry:?}"
             ))),
         }
     }
@@ -873,8 +868,7 @@ impl StorageEnum {
             (StorageEnum::CIFS(s), EntryEnum::NAS(e)) => s.read_data(tx, &e.relative_path, size, false, qos).await,
             (StorageEnum::S3(s), EntryEnum::S3(e)) => s.read_data(tx, &e.relative_path, size, false, qos).await,
             _ => Err(StorageError::OperationError(format!(
-                "unsupported source/entry combination for tar read_data: {:?}",
-                entry
+                "unsupported source/entry combination for tar read_data: {entry:?}"
             ))),
         }
     }
@@ -897,7 +891,7 @@ impl StorageEnum {
     /// 支持组合：
     /// - Local → Local（仅 Windows，Win32 API）
     /// - CIFS → CIFS（跨平台，smb-rs 直通）
-    /// - NFS → NFS（仅当双方都支持 ACL，即 NFSv4+）
+    /// - NFS → NFS（仅当双方都支持 ACL，即 `NFSv4+`）
     /// - 跨类型或不支持的组合静默跳过
     pub async fn copy_acl(from: &StorageEnum, to: &StorageEnum, relative_path: &Path) -> Result<()> {
         match (from, to) {
@@ -932,7 +926,7 @@ impl StorageEnum {
     /// 从源端复制所有 extended attributes (xattr) 到目标端
     ///
     /// 支持组合：
-    /// - NFS → NFS（仅当双方都支持 xattr，即 NFSv4+）
+    /// - NFS → NFS（仅当双方都支持 xattr，即 `NFSv4+`）
     /// - 其他组合静默跳过
     pub async fn copy_xattr(from: &StorageEnum, to: &StorageEnum, relative_path: &Path) -> Result<()> {
         match (from, to) {
@@ -967,19 +961,18 @@ impl StorageEnum {
     pub async fn get_acl_bytes(&self, relative_path: &Path) -> Result<Option<Vec<u8>>> {
         match self {
             StorageEnum::CIFS(s) => {
+                use binrw::BinWrite;
                 let sd = s.get_security_descriptor(relative_path).await?;
                 // 用 binrw 序列化 SecurityDescriptor 为字节
                 let mut buf = std::io::Cursor::new(Vec::new());
-                use binrw::BinWrite;
                 sd.write_le(&mut buf)
-                    .map_err(|e| StorageError::OperationError(format!("serialize SD: {}", e)))?;
+                    .map_err(|e| StorageError::OperationError(format!("serialize SD: {e}")))?;
                 Ok(Some(buf.into_inner()))
             }
             StorageEnum::NFS(s) if s.supports_acl() => {
                 match s.get_acl(relative_path).await {
                     Ok(acl) if !acl.aces.is_empty() => Ok(Some(serialize_nfs_acl(&acl))),
-                    Ok(_) => Ok(None),
-                    Err(_) => Ok(None), // 不支持时静默跳过
+                    _ => Ok(None), // 空 ACL 或不支持时静默跳过
                 }
             }
             #[cfg(windows)]
@@ -999,11 +992,11 @@ impl StorageEnum {
     pub async fn set_acl_bytes(&self, relative_path: &Path, acl_data: &[u8]) -> Result<()> {
         match self {
             StorageEnum::CIFS(s) => {
+                use binrw::BinRead;
                 // 用 binrw 反序列化字节为 SecurityDescriptor
                 let mut cursor = std::io::Cursor::new(acl_data);
-                use binrw::BinRead;
                 let sd = smb::SecurityDescriptor::read_le(&mut cursor)
-                    .map_err(|e| StorageError::OperationError(format!("deserialize SD: {}", e)))?;
+                    .map_err(|e| StorageError::OperationError(format!("deserialize SD: {e}")))?;
                 s.set_security_descriptor(relative_path, &sd).await
             }
             StorageEnum::NFS(s) if s.supports_acl() => {
@@ -1065,7 +1058,7 @@ impl StorageEnum {
 // NFS ACL / xattr 二进制序列化（跨进程传输用）
 // ============================================================
 
-/// 将 NFSv4 ACL 序列化为二进制字节。
+/// 将 `NFSv4` ACL 序列化为二进制字节。
 ///
 /// 格式：`[u32 ace_count] [ace...]`
 /// 每个 ace：`[u32 type] [u32 flags] [u32 mask] [u32 who_len] [who_bytes]`
@@ -1095,7 +1088,7 @@ fn read_u32_le(cursor: &mut io::Cursor<&[u8]>, context: &str) -> Result<u32> {
     let mut buf = [0u8; 4];
     cursor
         .read_exact(&mut buf)
-        .map_err(|e| StorageError::OperationError(format!("deserialize {}: {}", context, e)))?;
+        .map_err(|e| StorageError::OperationError(format!("deserialize {context}: {e}")))?;
     Ok(u32::from_le_bytes(buf))
 }
 
@@ -1103,26 +1096,24 @@ fn read_u32_le(cursor: &mut io::Cursor<&[u8]>, context: &str) -> Result<u32> {
 fn read_bytes_checked(cursor: &mut io::Cursor<&[u8]>, len: usize, max: usize, context: &str) -> Result<Vec<u8>> {
     if len > max {
         return Err(StorageError::OperationError(format!(
-            "{} length {} exceeds maximum {}",
-            context, len, max
+            "{context} length {len} exceeds maximum {max}"
         )));
     }
     let mut buf = vec![0u8; len];
     cursor
         .read_exact(&mut buf)
-        .map_err(|e| StorageError::OperationError(format!("deserialize {}: {}", context, e)))?;
+        .map_err(|e| StorageError::OperationError(format!("deserialize {context}: {e}")))?;
     Ok(buf)
 }
 
-/// 从二进制字节反序列化 NFSv4 ACL。
+/// 从二进制字节反序列化 `NFSv4` ACL。
 fn deserialize_nfs_acl(data: &[u8]) -> Result<nfs_rs::Acl> {
     let mut cursor = io::Cursor::new(data);
 
     let count = read_u32_le(&mut cursor, "ACL count")? as usize;
     if count > MAX_ACE_COUNT {
         return Err(StorageError::OperationError(format!(
-            "ACE count {} exceeds maximum {}",
-            count, MAX_ACE_COUNT
+            "ACE count {count} exceeds maximum {MAX_ACE_COUNT}"
         )));
     }
 
@@ -1133,7 +1124,7 @@ fn deserialize_nfs_acl(data: &[u8]) -> Result<nfs_rs::Acl> {
             1 => nfs_rs::AceType::AccessDenied,
             2 => nfs_rs::AceType::SystemAudit,
             3 => nfs_rs::AceType::SystemAlarm,
-            v => return Err(StorageError::OperationError(format!("unknown ACE type: {}", v))),
+            v => return Err(StorageError::OperationError(format!("unknown ACE type: {v}"))),
         };
 
         let flags = nfs_rs::AceFlags(read_u32_le(&mut cursor, "ACE flags")?);
@@ -1142,7 +1133,7 @@ fn deserialize_nfs_acl(data: &[u8]) -> Result<nfs_rs::Acl> {
         let who_len = read_u32_le(&mut cursor, "ACE who len")? as usize;
         let who_buf = read_bytes_checked(&mut cursor, who_len, MAX_ACE_WHO_LEN, "ACE 'who'")?;
         let who = String::from_utf8(who_buf)
-            .map_err(|e| StorageError::OperationError(format!("invalid ACE who UTF-8: {}", e)))?;
+            .map_err(|e| StorageError::OperationError(format!("invalid ACE who UTF-8: {e}")))?;
 
         aces.push(nfs_rs::NfsAce {
             ace_type,
@@ -1164,8 +1155,7 @@ fn deserialize_xattr(data: &[u8]) -> Result<Vec<(String, Vec<u8>)>> {
     let count = read_u32_le(&mut cursor, "xattr count")? as usize;
     if count > MAX_XATTR_COUNT {
         return Err(StorageError::OperationError(format!(
-            "xattr count {} exceeds maximum {}",
-            count, MAX_XATTR_COUNT
+            "xattr count {count} exceeds maximum {MAX_XATTR_COUNT}"
         )));
     }
 
@@ -1174,7 +1164,7 @@ fn deserialize_xattr(data: &[u8]) -> Result<Vec<(String, Vec<u8>)>> {
         let name_len = read_u32_le(&mut cursor, "xattr name len")? as usize;
         let name_buf = read_bytes_checked(&mut cursor, name_len, MAX_XATTR_NAME_LEN, "xattr name")?;
         let name = String::from_utf8(name_buf)
-            .map_err(|e| StorageError::OperationError(format!("invalid xattr name UTF-8: {}", e)))?;
+            .map_err(|e| StorageError::OperationError(format!("invalid xattr name UTF-8: {e}")))?;
 
         let value_len = read_u32_le(&mut cursor, "xattr value len")? as usize;
         let value_buf = read_bytes_checked(&mut cursor, value_len, MAX_XATTR_VALUE_LEN, "xattr value")?;
@@ -1186,7 +1176,7 @@ fn deserialize_xattr(data: &[u8]) -> Result<Vec<(String, Vec<u8>)>> {
 }
 
 /// 将 Path 转为 S3 兼容的字符串（正斜杠分隔）。
-/// Linux 上零开销（直接返回 Cow::Borrowed），Windows 上仅在含 `\` 时分配新 String。
+/// Linux 上零开销（直接返回 `Cow::Borrowed`），Windows 上仅在含 `\` 时分配新 `String`。
 #[inline]
 fn path_to_s3_key(path: &Path) -> Cow<'_, str> {
     let s = path.to_string_lossy();

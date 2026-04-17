@@ -20,7 +20,7 @@ impl LicenseClock {
     /// 从持久化值恢复，与系统时间比较
     ///
     /// - 系统时钟 >= 持久化值 → 正常，对齐到系统时钟
-    /// - 系统时钟 < 持久化值 → 时钟回拨，返回 ClockRegression 错误
+    /// - 系统时钟 < 持久化值 → 时钟回拨，返回 `ClockRegression` 错误
     pub fn from_persisted(persisted: DateTime<Utc>) -> Result<Self> {
         let system_now = Utc::now();
         if system_now < persisted {

@@ -16,6 +16,15 @@ use crate::error::{Result, UtilsError};
 const PASSWORD_SALT_LENGTH: usize = 8;
 const ENCRYPTED_PASSWORD_LENGTH: usize = 73;
 
+/// 内置默认加密密钥（仅当 TERRASYNC_CRYPTO_KEY 环境变量未设置时使用）
+/// 生产环境应通过 TERRASYNC_CRYPTO_KEY 环境变量设置独立的密钥以提高安全性
+const DEFAULT_CRYPTO_SECRET: &str = "terrasync-secret-key";
+
+/// 获取当前有效的加密密钥
+fn crypto_secret() -> String {
+    std::env::var("TERRASYNC_CRYPTO_KEY").unwrap_or_else(|_| DEFAULT_CRYPTO_SECRET.to_string())
+}
+
 pub struct CryptoUtil;
 
 impl CryptoUtil {
@@ -61,7 +70,7 @@ impl CryptoUtil {
             encrypted_data.extend_from_slice(&buffer[..written]);
             match result {
                 BufferResult::BufferUnderflow => break,
-                BufferResult::BufferOverflow => continue,
+                BufferResult::BufferOverflow => {}
             }
         }
 
@@ -74,7 +83,7 @@ impl CryptoUtil {
     /// 解密数据
     pub fn decrypt(encrypted_data: &str, key: &[u8]) -> Result<String> {
         let encrypted_bytes =
-            hex::decode(encrypted_data).map_err(|e| UtilsError::CryptoError(format!("Hex decode error: {}", e)))?;
+            hex::decode(encrypted_data).map_err(|e| UtilsError::CryptoError(format!("Hex decode error: {e}")))?;
         if encrypted_bytes.len() < 16 {
             return Err(UtilsError::CryptoError("Invalid encrypted data".to_string()));
         }
@@ -98,11 +107,11 @@ impl CryptoUtil {
             decrypted_data.extend_from_slice(&buffer[..written]);
             match result {
                 BufferResult::BufferUnderflow => break,
-                BufferResult::BufferOverflow => continue,
+                BufferResult::BufferOverflow => {}
             }
         }
 
-        String::from_utf8(decrypted_data).map_err(|e| UtilsError::CryptoError(format!("UTF-8 decode error: {}", e)))
+        String::from_utf8(decrypted_data).map_err(|e| UtilsError::CryptoError(format!("UTF-8 decode error: {e}")))
     }
 
     /// 加密配置文件中的密码
@@ -119,7 +128,7 @@ impl CryptoUtil {
         let position = Self::generate_random_position();
 
         // 使用随机生成的盐值生成加密密钥
-        let key = Self::generate_key("terrasync-secret-key", &salt);
+        let key = Self::generate_key(&crypto_secret(), &salt);
         let mut encrypted = Self::encrypt(password, &key)?;
 
         // 在加密结果的第position位插入盐值
@@ -133,7 +142,7 @@ impl CryptoUtil {
         }
 
         // 输出格式：encryptedposition:encrypted_with_salt
-        Ok(format!("{}{}", pos, encrypted))
+        Ok(format!("{pos}{encrypted}"))
     }
 
     /// 解密配置文件中的密码
@@ -176,7 +185,7 @@ impl CryptoUtil {
         original_encrypted.push_str(&remaining_password[pos + PASSWORD_SALT_LENGTH..]);
 
         // 使用盐值生成解密密钥
-        let key = Self::generate_key("terrasync-secret-key", salt);
+        let key = Self::generate_key(&crypto_secret(), salt);
         Self::decrypt(&original_encrypted, &key)
     }
 }

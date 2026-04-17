@@ -94,8 +94,8 @@ impl ConsumerManager {
 
     /// 启动所有已注册的消费者
     ///
-    /// 为每个消费者通过 BroadcastForwarder 订阅独立的 mpsc 通道并启动异步任务。
-    /// 统计消费者通过 Arc<Mutex> 持有，任务结束时自动调用 finalize()。
+    /// 为每个消费者通过 `BroadcastForwarder` 订阅独立的 mpsc 通道并启动异步任务。
+    /// 统计消费者通过 Arc<Mutex> 持有，任务结束时自动调用 `finalize()`。
     pub async fn start_consumers(
         &mut self, broadcaster: &mut BroadcastForwarder<StorageEntryMessage>,
     ) -> Result<Vec<tokio::task::JoinHandle<Result<()>>>> {
@@ -134,7 +134,7 @@ impl ConsumerManager {
         self.stats_consumer.clone()
     }
 
-    /// 获取 per-chunk 实时字节计数器，用于在 copy_file 中每个 chunk 写入后更新带宽统计
+    /// 获取 per-chunk 实时字节计数器，用于在 `copy_file` 中每个 chunk 写入后更新带宽统计
     pub async fn get_bytes_tracker(&self) -> Option<Arc<AtomicU64>> {
         match &self.stats_consumer {
             Some(sc) => Some(sc.lock().await.get_bytes_tracker()),

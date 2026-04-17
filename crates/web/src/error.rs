@@ -4,6 +4,7 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use serde::Serialize;
 use thiserror::Error;
+use tracing::error;
 
 /// Web crate 专用错误枚举
 #[derive(Error, Debug)]
@@ -16,7 +17,7 @@ pub enum WebError {
     #[error("{0}")]
     UtilsError(#[from] utils::error::UtilsError),
 
-    /// SQLite 数据库错误
+    /// `SQLite` 数据库错误
     #[error("Database error: {0}")]
     DatabaseError(#[from] sqlx::Error),
 
@@ -113,9 +114,15 @@ impl IntoResponse for WebError {
             _ => StatusCode::INTERNAL_SERVER_ERROR,
         };
 
-        let body = ErrorResponse {
-            error: self.to_string(),
+        // 对 5xx 错误：记录详情到服务端日志，响应体只返回泛化消息，避免泄露内部信息
+        let error_msg = if status.is_server_error() {
+            error!(error = %self, status = %status, "Internal server error");
+            "Internal server error".to_string()
+        } else {
+            self.to_string()
         };
+
+        let body = ErrorResponse { error: error_msg };
 
         (status, Json(body)).into_response()
     }

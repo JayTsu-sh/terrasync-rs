@@ -26,7 +26,7 @@ pub struct HashCalculator {
 }
 
 impl ConsistencyCheck for HashCalculator {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "BLAKE3"
     }
 
@@ -43,6 +43,12 @@ impl ConsistencyCheck for HashCalculator {
     }
 }
 
+impl Default for HashCalculator {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl HashCalculator {
     pub fn new() -> Self {
         Self { hasher: Hasher::new() }
@@ -56,13 +62,11 @@ pub fn create_hash_calculator(enable_integrity_check: bool) -> Option<HashCalcul
         enable_integrity_check
     );
 
-    let source_hasher = if enable_integrity_check {
+    if enable_integrity_check {
         debug!("Checksum is enabled, creating Blake3 calculator");
         Some(HashCalculator::new())
     } else {
         debug!("Checksum is disabled, not creating calculator");
         None
-    };
-
-    source_hasher
+    }
 }

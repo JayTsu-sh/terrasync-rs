@@ -37,7 +37,7 @@ pub struct TimeEntry {
     pub count: u64,
 }
 
-/// 分析查询服务 — 从 SQLite 中 final callback 存储的 FinalStats 提取图表数据
+/// 分析查询服务 — 从 `SQLite` 中 final callback 存储的 `FinalStats` 提取图表数据
 pub struct AnalyticsService {
     progress_repo: Arc<dyn ProgressRepository>,
 }
@@ -50,7 +50,7 @@ impl AnalyticsService {
     /// 获取指定任务的分析数据（文件类型分布、大小分布、时间分布）
     ///
     /// 数据来源：`task_progress.report_json` 中 `is_final=true` 的 `FinalStats`，
-    /// 由 app 层 StatisticConsumer 通过 HTTP callback 写入。
+    /// 由 app 层 `StatisticConsumer` 通过 HTTP callback 写入。
     pub async fn get_analytics(&self, task_id: &str) -> Result<AnalyticsData> {
         let progress = self.progress_repo.find_by_task_id(task_id).await?;
 

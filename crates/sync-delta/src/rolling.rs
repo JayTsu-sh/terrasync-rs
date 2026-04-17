@@ -42,9 +42,9 @@ impl RollingChecksum {
         }
     }
 
-    /// O(1) 滑动更新：移除 old_byte，加入 new_byte
+    /// O(1) 滑动更新：移除 `old_byte`，加入 `new_byte`
     ///
-    /// 推导（window_size = n）：
+    /// 推导（`window_size` = n）：
     /// ```text
     /// a(s)   = Σ data[s+i]          for i=0..n-1
     /// b(s)   = Σ (n-i) * data[s+i]  for i=0..n-1

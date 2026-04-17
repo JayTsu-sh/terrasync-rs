@@ -28,7 +28,7 @@ pub struct AppState {
 }
 
 impl AppState {
-    pub async fn new(pool: SqlitePool) -> Self {
+    pub fn new(pool: SqlitePool) -> Self {
         let endpoint_repo = Arc::new(SqliteEndpointRepo::new(pool.clone()));
         let path_repo = Arc::new(SqlitePathRepo::new(pool.clone()));
         let task_repo = Arc::new(SqliteTaskRepo::new(pool.clone()));
