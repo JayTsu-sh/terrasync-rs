@@ -1,7 +1,6 @@
 //! Common types and utilities for database implementations
 
 use std::collections::HashMap;
-use std::hash::BuildHasher;
 use std::sync::LazyLock;
 
 use storage_v2::EntryEnum;
@@ -14,8 +13,11 @@ use crate::traits::StorageEntryRecord;
 pub enum DeletionStatus {
     /// The item was permanently deleted
     Deleted(EntryEnum),
-    /// The item was renamed, with the old and new entries
-    Renamed(EntryEnum, Box<EntryEnum>),
+    /// The item was renamed, with the old and new entries.
+    ///
+    /// 两个字段对称 box，避免 `clippy::large_enum_variant` 抱怨
+    /// （`EntryEnum` 较大，不 box 会让整个枚举的 size 被最大变体拉高）。
+    Renamed(Box<EntryEnum>, Box<EntryEnum>),
 }
 
 /// 文件扫描列名列表（不含 `version_count`）
@@ -63,9 +65,10 @@ pub static FILE_SCAN_COLUMNS_LIST_WITH_T_PREFIX: LazyLock<String> = LazyLock::ne
 /// - 1 条记录 → `Deleted`
 /// - 2 条记录 → `Renamed`（ctime 小 = from，ctime 大 = to）
 /// - 其他 → error 日志
-pub fn classify_deletion_status<S: BuildHasher>(
+#[allow(clippy::implicit_hasher)]
+pub fn classify_deletion_status(
     no_fh_records: Vec<StorageEntryRecord>, fh_records: Vec<StorageEntryRecord>,
-    fh_groups: &HashMap<String, Vec<StorageEntryRecord>, S>,
+    fh_groups: &HashMap<String, Vec<StorageEntryRecord>>,
 ) -> Vec<DeletionStatus> {
     let mut deletion_statuses: Vec<DeletionStatus> = Vec::with_capacity(no_fh_records.len() + fh_records.len());
 
@@ -90,7 +93,7 @@ pub fn classify_deletion_status<S: BuildHasher>(
                         (entries[1].to_entry_enum(), entries[0].to_entry_enum())
                     };
                     trace!("file_handle {} has 2 entries, Renamed", fh);
-                    deletion_statuses.push(DeletionStatus::Renamed(from, Box::new(to)));
+                    deletion_statuses.push(DeletionStatus::Renamed(Box::new(from), Box::new(to)));
                 }
                 Some(entries) => {
                     error!(

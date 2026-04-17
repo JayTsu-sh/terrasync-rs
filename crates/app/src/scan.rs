@@ -63,7 +63,7 @@ impl std::fmt::Display for ScanType {
 /// # 判定逻辑
 /// 1. 尝试连接数据库并查询 `base_{sanitize(job_id)}` 表是否存在
 /// 2. 数据库不可达或查询失败时，fallback 到调用方传入的 `job_dir_pre_existing`
-///    快照（在创建 job_dir 之前捕获，避免被自身的 `create_dir_all` 污染）
+///    快照（在创建 `job_dir` 之前捕获，避免被自身的 `create_dir_all` 污染）
 pub async fn determine_scan_type(db: Option<&dyn Database>, job_id: &str, job_dir_pre_existing: bool) -> ScanType {
     if let Some(db) = db {
         let table_name = db::base_table_name_for_job(job_id);
@@ -500,7 +500,7 @@ async fn run_incremental_scan(
                     }
                     DeletionStatus::Renamed(from, to) => {
                         broadcaster
-                            .broadcast(StorageEntryMessage::Renamed((Arc::new(from), Arc::new(*to))))
+                            .broadcast(StorageEntryMessage::Renamed((Arc::new(*from), Arc::new(*to))))
                             .await;
                     }
                 }

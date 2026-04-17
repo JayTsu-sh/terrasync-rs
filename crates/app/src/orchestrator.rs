@@ -207,7 +207,16 @@ impl SyncOrchestrator {
         let c = &self.config;
         let app_config = AppConfig::fetch()?;
         let db_config = db::config::DatabaseConfig::from_app_config(&app_config.database);
-        let db_instance = DatabaseFactory::new_database(&db_config, &c.job_id).await.ok();
+        // database.enabled=true 时必须成功构造；false 时忽略错误（未启用），走文件系统兜底
+        let db_instance = if app_config.database.enabled {
+            Some(
+                DatabaseFactory::new_database(&db_config, &c.job_id)
+                    .await
+                    .map_err(AppError::DatabaseError)?,
+            )
+        } else {
+            None
+        };
         let scan_type = determine_scan_type(db_instance.as_deref(), &c.job_id, c.job_dir_pre_existing).await;
 
         info!("SyncOrchestrator: determined scan_type={}", scan_type);
@@ -1040,7 +1049,7 @@ impl SyncOrchestrator {
                         }
                         DeletionStatus::Renamed(from, to) => {
                             detect_broadcaster
-                                .broadcast(StorageEntryMessage::Renamed((Arc::new(from), Arc::new(*to))))
+                                .broadcast(StorageEntryMessage::Renamed((Arc::new(*from), Arc::new(*to))))
                                 .await;
                         }
                     }
