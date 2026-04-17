@@ -7,6 +7,13 @@ data/
 jobs/
 logs/
 
+# === 性能分析产物 ===
+perf.data
+perf.data.old
+*.perf
+flamegraph-*.svg
+flamegraph.svg
+
 # === 依赖 / 缓存 ===
 .cache
 **/__pycache__
