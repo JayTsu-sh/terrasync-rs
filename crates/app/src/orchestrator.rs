@@ -1083,25 +1083,32 @@ impl SyncOrchestrator {
         Self::await_consumers(consumer_handles).await;
 
         // ── 19. Phase B：检测删除/重命名（base 表已完整） ──
-        let dest_storage_phase_b = Arc::new(create_storage(&c.dest_path, block_size.map(|s| s as u64)).await?);
-        let src_storage_phase_b = Arc::new(create_storage(&c.src_path, block_size.map(|s| s as u64)).await?);
+        // async 块 + 统一的 finalize_stats 调用，确保无论成败都打印合并报告。
+        let phase_b_result: Result<()> = async {
+            let dest_storage_phase_b = Arc::new(create_storage(&c.dest_path, block_size.map(|s| s as u64)).await?);
+            let src_storage_phase_b = Arc::new(create_storage(&c.src_path, block_size.map(|s| s as u64)).await?);
 
-        Self::apply_deletions_and_renames(
-            &*db_clone,
-            src_storage_phase_b.clone(),
-            dest_storage_phase_b.clone(),
-            is_source_reserved,
-            &consumer_manager,
-        )
+            Self::apply_deletions_and_renames(
+                &*db_clone,
+                src_storage_phase_b.clone(),
+                dest_storage_phase_b.clone(),
+                is_source_reserved,
+                &consumer_manager,
+            )
+            .await;
+
+            // ── 21. 更新目录元数据（非 S3 目标端） ──
+            if !matches!(dest_storage_phase_b.as_ref(), StorageEnum::S3(_)) {
+                Self::update_directory_metadata(database, &dest_storage_phase_b).await;
+            }
+
+            Ok(())
+        }
         .await;
 
-        // ── 20. Finalize 统计报告（Phase A New/Changed + Phase B Deleted/Renamed 合并） ──
+        // ── 20. Finalize 统计报告（无论 Phase B 成功与否都要打印合并报告） ──
         consumer_manager.finalize_stats().await;
-
-        // ── 21. 更新目录元数据（非 S3 目标端） ──
-        if !matches!(dest_storage_phase_b.as_ref(), StorageEnum::S3(_)) {
-            Self::update_directory_metadata(database, &dest_storage_phase_b).await;
-        }
+        phase_b_result.inspect_err(|e| error!("Phase B failed — reported statistics may be partial: {e}"))?;
 
         info!(
             "Incremental sync job {} completed successfully via orchestrator",
@@ -1189,7 +1196,6 @@ impl SyncOrchestrator {
         let mut batch_delete_paths: Vec<String> = Vec::new();
         let mut batch_rename_inserts: Vec<Arc<EntryEnum>> = Vec::new();
         let mut batch_rename_delete_paths: Vec<String> = Vec::new();
-        let mut incremental_msgs: Vec<StorageEntryMessage> = Vec::new();
 
         for status in deletion_iter {
             match status {
@@ -1202,24 +1208,20 @@ impl SyncOrchestrator {
                     };
                     match result {
                         Ok(()) | Err(StorageError::FileNotFound(_) | StorageError::DirectoryNotFound(_)) => {
-                            let msg = StorageEntryMessage::Deleted(entry_arc.clone());
-                            if let Some(ref sc) = consumer_manager.stats_consumer() {
-                                sc.lock().await.update_statistics(&msg);
-                            }
                             batch_delete_paths.push(entry_arc.get_relative_path().to_string_lossy().into_owned());
-                            incremental_msgs.push(msg);
+                            consumer_manager
+                                .record_phase_b(StorageEntryMessage::Deleted(entry_arc))
+                                .await;
                         }
                         Err(e) => {
                             error!("Phase B: Failed to delete {:?}: {}", entry_arc.get_relative_path(), e);
-                            let err_msg = StorageEntryMessage::Error {
-                                event: ErrorEvent::Delete,
-                                path: entry_arc.get_relative_path().to_path_buf(),
-                                reason: format!("{e}"),
-                            };
-                            if let Some(ref sc) = consumer_manager.stats_consumer() {
-                                sc.lock().await.update_statistics(&err_msg);
-                            }
-                            incremental_msgs.push(err_msg);
+                            consumer_manager
+                                .record_phase_b(StorageEntryMessage::Error {
+                                    event: ErrorEvent::Delete,
+                                    path: entry_arc.get_relative_path().to_path_buf(),
+                                    reason: format!("{e}"),
+                                })
+                                .await;
                         }
                     }
                 }
@@ -1243,13 +1245,11 @@ impl SyncOrchestrator {
 
                     match dest_op_result {
                         Ok(()) => {
-                            let msg = StorageEntryMessage::Renamed((from_arc.clone(), to_arc.clone()));
-                            if let Some(ref sc) = consumer_manager.stats_consumer() {
-                                sc.lock().await.update_statistics(&msg);
-                            }
                             batch_rename_inserts.push(to_arc.clone());
                             batch_rename_delete_paths.push(from_arc.get_relative_path().to_string_lossy().into_owned());
-                            incremental_msgs.push(msg);
+                            consumer_manager
+                                .record_phase_b(StorageEntryMessage::Renamed((from_arc, to_arc)))
+                                .await;
                         }
                         Err(e) => {
                             error!(
@@ -1258,15 +1258,13 @@ impl SyncOrchestrator {
                                 to_arc.get_relative_path(),
                                 e
                             );
-                            let err_msg = StorageEntryMessage::Error {
-                                event: ErrorEvent::Rename,
-                                path: to_arc.get_relative_path().to_path_buf(),
-                                reason: format!("{e}"),
-                            };
-                            if let Some(ref sc) = consumer_manager.stats_consumer() {
-                                sc.lock().await.update_statistics(&err_msg);
-                            }
-                            incremental_msgs.push(err_msg);
+                            consumer_manager
+                                .record_phase_b(StorageEntryMessage::Error {
+                                    event: ErrorEvent::Rename,
+                                    path: to_arc.get_relative_path().to_path_buf(),
+                                    reason: format!("{e}"),
+                                })
+                                .await;
                         }
                     }
                 }
@@ -1290,6 +1288,7 @@ impl SyncOrchestrator {
             }
         }
         // 批量写入增量记录
+        let incremental_msgs = consumer_manager.take_phase_b_buffer().await;
         if !incremental_msgs.is_empty() {
             if let Err(e) = db.batch_insert_incremental_record(&incremental_msgs).await {
                 error!("Phase B: Failed to batch insert incremental records: {}", e);

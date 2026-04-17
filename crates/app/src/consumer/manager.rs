@@ -73,6 +73,7 @@ impl ConsumerManager {
                     job_dir,
                     callback_url,
                     pb_handle: None,
+                    phase_b_buffer: Vec::with_capacity(1024),
                 },
                 JobType::IncrementalScan | JobType::IncrementalCopy => StatisticConsumer {
                     stats: StatsKind::Incremental(IncrementalStats::new(job_type.clone(), job_id, command, log_path)),
@@ -80,6 +81,7 @@ impl ConsumerManager {
                     job_dir,
                     callback_url,
                     pb_handle: None,
+                    phase_b_buffer: Vec::with_capacity(1024),
                 },
             };
             manager.stats_consumer = Some(Arc::new(Mutex::new(sc)));
@@ -138,11 +140,6 @@ impl ConsumerManager {
         Ok(handles)
     }
 
-    /// 获取统计消费者的 Arc 引用，用于在所有消费者完成后读取统计结果
-    pub fn stats_consumer(&self) -> Option<Arc<Mutex<StatisticConsumer>>> {
-        self.stats_consumer.clone()
-    }
-
     /// 获取 per-chunk 实时字节计数器，用于在 `copy_file` 中每个 chunk 写入后更新带宽统计
     pub async fn get_bytes_tracker(&self) -> Option<Arc<AtomicU64>> {
         match &self.stats_consumer {
@@ -156,10 +153,25 @@ impl ConsumerManager {
         self.consumers.len()
     }
 
-    /// 手动触发统计报告（仅在 defer_finalize=true 时有意义）
+    /// 见 [`StatisticConsumer::record_phase_b`]
+    pub async fn record_phase_b(&self, msg: StorageEntryMessage) {
+        if let Some(ref sc) = self.stats_consumer {
+            sc.lock().await.record_phase_b(msg);
+        }
+    }
+
+    /// 见 [`StatisticConsumer::take_phase_b_buffer`]；无 `stats_consumer` 时返回空 Vec
+    pub async fn take_phase_b_buffer(&self) -> Vec<StorageEntryMessage> {
+        match &self.stats_consumer {
+            Some(sc) => sc.lock().await.take_phase_b_buffer(),
+            None => Vec::new(),
+        }
+    }
+
+    /// 手动触发统计报告（仅在 `defer_finalize=true` 时有意义）。
     ///
-    /// 增量拷贝两阶段流水线：Phase A 消费者退出时跳过 finalize，
-    /// 由编排器在 Phase B 完成后调用此方法，确保 Deleted/Renamed 合并进同一份报告。
+    /// 必须在 Phase B 结束的所有成功/错误路径上调用，否则最终报告不会打印
+    /// （`StatisticConsumer::Drop` 兜底 join 显示线程，但不打印报告）。
     pub async fn finalize_stats(&self) {
         if let Some(ref sc) = self.stats_consumer {
             sc.lock().await.finalize();
