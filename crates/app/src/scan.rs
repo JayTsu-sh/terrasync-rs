@@ -12,7 +12,7 @@ use std::sync::Arc;
 // 外部crate
 use db::factory::DatabaseFactory;
 use db::traits::Database;
-use db::{DeletionStatus, INCREMENTAL_SCAN_TABLE_BASE_NAME};
+use db::{self, DeletionStatus, INCREMENTAL_SCAN_TABLE_BASE_NAME};
 use storage_v2::{EntryEnum, StorageEntryMessage, WalkDirAsyncIterator, canonicalize_path};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
@@ -58,11 +58,38 @@ impl std::fmt::Display for ScanType {
     }
 }
 
+/// 判定 ScanType：优先查数据库中 base 表是否存在，失败时 fallback 到文件系统快照
+///
+/// # 判定逻辑
+/// 1. 尝试连接数据库并查询 `base_{sanitize(job_id)}` 表是否存在
+/// 2. 数据库不可达或查询失败时，fallback 到调用方传入的 `job_dir_pre_existing`
+///    快照（在创建 job_dir 之前捕获，避免被自身的 `create_dir_all` 污染）
+pub async fn determine_scan_type(db: Option<&dyn Database>, job_id: &str, job_dir_pre_existing: bool) -> ScanType {
+    if let Some(db) = db {
+        let table_name = db::base_table_name_for_job(job_id);
+        match db.table_exists(&table_name).await {
+            Ok(true) => return ScanType::Incremental,
+            Ok(false) => return ScanType::Full,
+            Err(e) => {
+                warn!("数据库查询失败，fallback 到文件系统快照判定: {}", e);
+            }
+        }
+    }
+
+    // Fallback：调用方注入的 job_dir 预存在快照
+    if job_dir_pre_existing {
+        ScanType::Incremental
+    } else {
+        ScanType::Full
+    }
+}
+
 /// 初始化扫描流水线
 ///
 /// 根据参数初始化配置、消费者管理器、广播转发器和目录遍历器。
 ///
 /// `progress_callback_url`：HTTP 进度回调 URL，透传给 `ConsumerConfig`（web 层传入，CLI 传 `None`）
+#[allow(clippy::too_many_arguments, clippy::ref_option)]
 async fn setup_scan_pipeline(
     job_id: &str, job_dir: &str, job_type: JobType, path: &str, scan_type: ScanType, depth: u32,
     r#match: &Option<String>, exclude: &Option<String>, raw_command_line: String,
@@ -99,8 +126,7 @@ async fn setup_scan_pipeline(
         Err(e) => {
             error!("[ScanPipeline] Failed to initialize scan configuration: {}", e);
             return Err(AppError::ConfigError(format!(
-                "Failed to initialize scan configuration: {}",
-                e
+                "Failed to initialize scan configuration: {e}"
             )));
         }
     };
@@ -149,7 +175,7 @@ async fn setup_scan_pipeline(
         }
         Err(e) => {
             error!("[ScanPipeline] Start directory walker failed: {}", e);
-            return Err(AppError::ScanError(format!("Start directory walker failed: {}", e)));
+            return Err(AppError::ScanError(format!("Start directory walker failed: {e}")));
         }
     };
 
@@ -197,6 +223,7 @@ async fn shutdown_pipeline(
 /// 由 `scan` 在 `ScanType::Full` 时调用。
 /// `progress_callback_url`：透传给流水线，web 层传入，CLI 传 `None`。
 #[instrument(skip_all, fields(job_id = %job_id, scan_type = %scan_type))]
+#[allow(clippy::too_many_arguments, clippy::ref_option)]
 async fn run_full_scan(
     job_id: String, job_dir: String, scan_type: ScanType, path: &str, depth: u32, r#match: &Option<String>,
     exclude: &Option<String>, raw_command_line: String, cancel_token: Option<CancellationToken>,
@@ -239,7 +266,7 @@ async fn run_full_scan(
         let msg = if let Some(ref token) = cancel_token {
             tokio::select! {
                 msg = walkdir_iter.next() => msg,
-                _ = token.cancelled() => {
+                () = token.cancelled() => {
                     info!("[Scan] Cancelled via graceful shutdown");
                     cancelled = true;
                     None
@@ -287,6 +314,7 @@ async fn run_full_scan(
 /// 由 `scan` 在 `ScanType::Incremental` 时调用。
 /// `progress_callback_url`：透传给流水线，web 层传入，CLI 传 `None`。
 #[instrument(skip_all, fields(job_id = %job_id, scan_type = %scan_type))]
+#[allow(clippy::too_many_arguments, clippy::ref_option)]
 async fn run_incremental_scan(
     job_id: String, job_dir: String, scan_type: ScanType, path: &str, depth: u32, r#match: &Option<String>,
     exclude: &Option<String>, raw_command_line: String, cancel_token: Option<CancellationToken>,
@@ -376,7 +404,7 @@ async fn run_incremental_scan(
                     let msg = if let Some(ref token) = cancel_token {
                         tokio::select! {
                             msg = worker_walkdir_iter.next() => msg,
-                            _ = token.cancelled() => {
+                            () = token.cancelled() => {
                                 info!("Scan worker {}: Cancelled via graceful shutdown", worker_id);
                                 None
                             }
@@ -472,7 +500,7 @@ async fn run_incremental_scan(
                     }
                     DeletionStatus::Renamed(from, to) => {
                         broadcaster
-                            .broadcast(StorageEntryMessage::Renamed((Arc::new(from), Arc::new(to))))
+                            .broadcast(StorageEntryMessage::Renamed((Arc::new(from), Arc::new(*to))))
                             .await;
                     }
                 }
@@ -500,7 +528,6 @@ async fn run_incremental_scan(
 /// # 参数
 /// - `job_id`: 任务ID
 /// - `job_dir`: 任务目录
-/// - `scan_type`: 扫描类型（Full 或 Incremental）
 /// - `path`: 要扫描的路径
 /// - `depth`: 扫描深度，0表示无限深度
 /// - `r#match`: 匹配表达式
@@ -509,12 +536,14 @@ async fn run_incremental_scan(
 /// - `cancel_token`: 可选的取消令牌，触发后优雅停止扫描
 /// - `progress_callback_url`: 进度回调 URL（web 层传入，CLI 传 `None`）
 ///
+/// `ScanType` 自动判定：优先查数据库中 base 表是否存在，失败时 fallback 到文件系统。
+///
 /// # 返回值
 /// - 成功时返回 `Ok(())`
 /// - 失败时返回包含错误信息的 `Err`
-#[instrument(skip_all, fields(job_id = %job_id, scan_type = %scan_type))]
+#[allow(clippy::too_many_arguments, clippy::ref_option)]
 pub async fn scan(
-    job_id: String, job_dir: String, scan_type: ScanType, path: &str, depth: u32, r#match: &Option<String>,
+    job_id: String, job_dir: String, job_dir_pre_existing: bool, path: &str, depth: u32, r#match: &Option<String>,
     exclude: &Option<String>, raw_command_line: String, cancel_token: Option<CancellationToken>,
     progress_callback_url: Option<String>,
 ) -> Result<()> {
@@ -525,6 +554,12 @@ pub async fn scan(
             licensing::verify::quick_verify(license)?;
         }
     }
+
+    // 自动判定 ScanType：尝试连接数据库查询 base 表，失败 fallback 到文件系统
+    let app_config = AppConfig::fetch()?;
+    let db_config = db::config::DatabaseConfig::from_app_config(&app_config.database);
+    let db_instance = DatabaseFactory::new_database(&db_config, &job_id).await.ok();
+    let scan_type = determine_scan_type(db_instance.as_deref(), &job_id, job_dir_pre_existing).await;
 
     info!(
         "Starting scan: job_id={}, scan_type={}, path={}",
@@ -583,6 +618,7 @@ pub async fn scan(
 /// # 返回值
 /// - 成功时返回`Ok(())`
 /// - 失败时返回包含错误信息的`Err`
+#[allow(clippy::borrowed_box)]
 pub async fn batch_processing_to_generate_message(
     database: &Box<dyn Database>, batch: &[Arc<EntryEnum>], broadcaster: BroadcastForwarder<StorageEntryMessage>,
     is_final_batch: bool, keep_item: bool,

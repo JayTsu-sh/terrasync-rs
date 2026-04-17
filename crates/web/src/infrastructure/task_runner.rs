@@ -20,7 +20,7 @@ use crate::infrastructure::db::sanitize_job_id;
 /// 进度回调基础 URL（web 层在绑定端口后设置，CLI 模式不存在此值）
 static PROGRESS_CALLBACK_BASE_URL: OnceLock<String> = OnceLock::new();
 
-/// 由 `server.rs` 在 TcpListener 绑定成功后调用一次
+/// 由 `server.rs` 在 `TcpListener` 绑定成功后调用一次
 pub fn set_progress_callback_base_url(url: String) {
     PROGRESS_CALLBACK_BASE_URL.get_or_init(|| url);
 }
@@ -32,11 +32,11 @@ fn progress_callback_url_for(task_id: &str) -> Option<String> {
         .map(|base| format!("{}/tasks/{}/progress", base.trim_end_matches('/'), task_id))
 }
 
-/// 最大并发任务数。app::scan/sync 内部使用了非 Send 的 dyn Consumer，
+/// 最大并发任务数。`app::scan`/`sync` 内部使用了非 `Send` 的 `dyn Consumer`，
 /// 每个任务需要独立线程+独立 runtime，因此必须限制并发数以控制资源消耗。
 const MAX_CONCURRENT_TASKS: usize = 8;
 
-/// 任务执行桥接层 — 将 MigrationTask 转换为 app::scan/sync 调用
+/// 任务执行桥接层 — 将 `MigrationTask` 转换为 `app::scan`/`sync` 调用
 pub struct TaskRunner {
     task_repo: Arc<dyn TaskRepository>,
     endpoint_repo: Arc<dyn EndpointRepository>,
@@ -200,7 +200,7 @@ impl TaskRunner {
     }
 
     /// 取消正在运行的任务
-    pub async fn cancel_task(&self, task_id: &str) -> Result<()> {
+    pub fn cancel_task(&self, task_id: &str) -> Result<()> {
         if let Some((_, token)) = self.running_tasks.remove(task_id) {
             token.cancel();
             info!("Task {task_id} cancellation requested");
@@ -247,7 +247,8 @@ impl TaskRunner {
     }
 }
 
-/// 执行具体的迁移任务（调用 app 层）；统计数据由 is_final 回调写入 SQLite
+/// 执行具体的迁移任务（调用 app 层）；统计数据由 `is_final` 回调写入 `SQLite`
+#[allow(clippy::too_many_arguments)]
 async fn run_migration_task(
     task_id: &str, job_id: &str, job_dir: &str, task_type: TaskType, task_config: &TaskConfig, source_url: &str,
     dest_url: Option<&str>, cancel_token: CancellationToken, config_repo: Arc<dyn ConfigRepository>,
@@ -272,10 +273,11 @@ async fn run_migration_task(
             }
             drop_old_scan_tables(job_id).await;
 
+            // 目录刚被清空，文件系统 fallback 视为 Full
             app::scan::scan(
                 job_id.to_string(),
                 job_dir.to_string(),
-                app::scan::ScanType::Full,
+                false,
                 source_url,
                 task_config.depth,
                 &task_config.match_expr,
@@ -291,20 +293,18 @@ async fn run_migration_task(
             let dest = dest_url
                 .ok_or_else(|| WebError::ValidationError("Sync task requires destination endpoint".to_string()))?;
 
-            let scan_type = if std::path::Path::new(job_dir).exists() {
-                app::scan::ScanType::Incremental
-            } else {
-                app::scan::ScanType::Full
-            };
+            // 在调用 app 层之前 snapshot job_dir 预存在状态，用作 DB 不可达时的 fallback 信号
+            let job_dir_pre_existing = std::path::Path::new(job_dir).exists();
 
+            // ScanType 由 app 层自动判定（查数据库 base 表，fallback 文件系统快照）
             app::sync::sync(
                 job_id.to_string(),
                 job_dir.to_string(),
+                job_dir_pre_existing,
                 source_url,
                 dest,
                 task_config.enable_integrity_check,
                 task_config.enable_acl,
-                scan_type,
                 &task_config.match_expr,
                 &task_config.exclude_expr,
                 &task_config.qos,
@@ -341,11 +341,10 @@ async fn run_migration_task(
     }
 }
 
-/// 清理旧的 ClickHouse 扫描表，确保全量扫描从干净状态开始
+/// 清理旧的 `ClickHouse` 扫描表，确保全量扫描从干净状态开始
 async fn drop_old_scan_tables(job_id: &str) {
-    let app_config = match AppConfig::fetch() {
-        Ok(c) => c,
-        Err(_) => return,
+    let Ok(app_config) = AppConfig::fetch() else {
+        return;
     };
 
     if !app_config.database.enabled {
@@ -357,12 +356,11 @@ async fn drop_old_scan_tables(job_id: &str) {
     let password = app_config.database.clickhouse.password.as_deref().unwrap_or("");
     let database = &app_config.database.clickhouse.database;
 
-    let client = match reqwest::Client::builder()
+    let Ok(client) = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(10))
         .build()
-    {
-        Ok(c) => c,
-        Err(_) => return,
+    else {
+        return;
     };
 
     for table in &[
@@ -394,7 +392,7 @@ async fn drop_old_scan_tables(job_id: &str) {
     }
 }
 
-/// 从 SQLite 读取的 ClickHouse 配置
+/// 从 `SQLite` 读取的 `ClickHouse` 配置
 pub(crate) struct ChConfig {
     pub(crate) dsn: String,
     pub(crate) username: String,
@@ -403,7 +401,7 @@ pub(crate) struct ChConfig {
     pub(crate) batch_size: u32,
 }
 
-/// 从 SQLite system_config 表一次性读取所有 ClickHouse 配置
+/// 从 `SQLite` `system_config` 表一次性读取所有 `ClickHouse` 配置
 async fn load_ch_config(config_repo: &dyn ConfigRepository) -> Result<Option<ChConfig>> {
     let all = config_repo.get_all().await?;
     let get = |key: &str| -> Option<String> { all.iter().find(|(k, _)| k == key).map(|(_, v)| strip_json_quotes(v)) };
@@ -422,7 +420,7 @@ async fn load_ch_config(config_repo: &dyn ConfigRepository) -> Result<Option<ChC
     let database = get("clickhouse_database").unwrap_or_else(|| "default".to_string());
     let batch_size = get("clickhouse_batch_size")
         .and_then(|v| v.parse::<u32>().ok())
-        .unwrap_or(800000);
+        .unwrap_or(800_000);
 
     // 校验 host 合法性：仅允许合法主机名或 IP 地址
     if host.contains('/')
@@ -458,26 +456,25 @@ async fn load_ch_config(config_repo: &dyn ConfigRepository) -> Result<Option<ChC
     }))
 }
 
-/// 从 SQLite 读取 ClickHouse 配置并覆盖 AppConfig 全局配置，返回读取到的配置
+/// 从 `SQLite` 读取 `ClickHouse` 配置并覆盖 `AppConfig` 全局配置，返回读取到的配置
 ///
 /// 在以下时机调用：
 /// - 服务启动时（加载已保存的配置）
-/// - 用户通过 API 修改 ClickHouse 配置后
+/// - 用户通过 API 修改 `ClickHouse` 配置后
 /// - 任务执行前（确保使用最新配置）
 pub(crate) async fn apply_db_config_from_sqlite(config_repo: &dyn ConfigRepository) -> Result<Option<ChConfig>> {
-    let cfg = match load_ch_config(config_repo).await? {
-        Some(c) => c,
-        None => return Ok(None),
+    let Some(cfg) = load_ch_config(config_repo).await? else {
+        return Ok(None);
     };
 
     AppConfig::override_with(|c| {
         c.database.enabled = true;
         c.database.r#type = "clickhouse".to_string();
         c.database.batch_size = cfg.batch_size;
-        c.database.clickhouse.dsn = cfg.dsn.clone();
-        c.database.clickhouse.username = cfg.username.clone();
+        c.database.clickhouse.dsn.clone_from(&cfg.dsn);
+        c.database.clickhouse.username.clone_from(&cfg.username);
         c.database.clickhouse.password = Some(cfg.password.clone()).filter(|s| !s.is_empty());
-        c.database.clickhouse.database = cfg.database.clone();
+        c.database.clickhouse.database.clone_from(&cfg.database);
     })?;
 
     debug!(
@@ -488,7 +485,7 @@ pub(crate) async fn apply_db_config_from_sqlite(config_repo: &dyn ConfigReposito
     Ok(Some(cfg))
 }
 
-/// SQLite 中 value_json 存的是 JSON 值，字符串带引号（如 `"http://..."`），需要去掉
+/// `SQLite` 中 `value_json` 存的是 JSON 值，字符串带引号（如 `"http://..."`），需要去掉
 fn strip_json_quotes(s: &str) -> String {
     serde_json::from_str::<String>(s).unwrap_or_else(|_| {
         tracing::warn!(

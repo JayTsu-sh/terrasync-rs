@@ -60,7 +60,7 @@ impl StoragePair {
     /// - `concurrency`: 存储操作的并发度配置
     ///
     /// # 返回值
-    /// - 成功时返回初始化好的StoragePair实例
+    /// - 成功时返回初始化好的 `StoragePair` 实例
     /// - 失败时返回错误信息
     pub async fn new(src_path: &str, dest_path: &str, block_size: Option<usize>) -> Result<Self> {
         let block_size_u64 = block_size.map(|s| s as u64);
@@ -112,7 +112,7 @@ pub(crate) fn parse_size(size: &str) -> Result<usize> {
     ];
 
     // 尝试匹配每个单位
-    for (unit, multiplier) in units.iter() {
+    for (unit, multiplier) in &units {
         if size.ends_with(unit) {
             // 提取数字部分
             let number_str = &size[0..size.len() - unit.len()];
@@ -121,12 +121,12 @@ pub(crate) fn parse_size(size: &str) -> Result<usize> {
                 continue;
             }
             // 解析数字
-            let number = match number_str.parse::<f64>() {
-                Ok(n) => n,
-                Err(_) => continue, // 尝试下一个单位
+            let Ok(number) = number_str.parse::<f64>() else {
+                continue; // 尝试下一个单位
             };
 
             // 计算最终的bps值
+            #[allow(clippy::cast_precision_loss, clippy::cast_lossless)]
             let bytes = (number * *multiplier as f64).round() as usize;
             return Ok(bytes);
         }
@@ -164,7 +164,7 @@ pub(crate) fn parse_size(size: &str) -> Result<usize> {
 /// - `r#match`: 匹配表达式，用于过滤要复制的文件
 /// - `exclude`: 排除表达式，用于排除不需要复制的文件
 /// - `qos`: QoS配置，用于流量控制
-/// - `peak_qos_rate`: 峰值QoS速率
+/// - `peak_qos_rate`: 峰值 `QoS` 速率
 /// - `block_size`: 块大小配置
 /// - `file_list`: 可选的文件列表路径，指定只复制列表中的文件
 /// - `iops`: 可选的 IOPS 限制
@@ -177,20 +177,22 @@ pub(crate) fn parse_size(size: &str) -> Result<usize> {
 /// - 成功时返回`Ok(())`
 /// - 失败时返回包含错误信息的`Err`
 #[instrument(skip_all, fields(job_id = %job_id, src = %src_path, dest = %dest_path))]
+#[allow(clippy::too_many_arguments)]
 pub async fn sync(
-    job_id: String, job_dir: String, src_path: &str, dest_path: &str, enable_integrity_check: bool, enable_acl: bool,
-    scan_type: ScanType, r#match: &Option<String>, exclude: &Option<String>, qos: &Option<String>, peak_qos_rate: f32,
-    block_size: &Option<String>, file_list: &Option<String>, iops: Option<u32>, packaged: bool, package_depth: usize,
-    raw_command_line: String, progress_callback_url: Option<String>,
+    job_id: String, job_dir: String, job_dir_pre_existing: bool, src_path: &str, dest_path: &str,
+    enable_integrity_check: bool, enable_acl: bool, r#match: &Option<String>, exclude: &Option<String>,
+    qos: &Option<String>, peak_qos_rate: f32, block_size: &Option<String>, file_list: &Option<String>,
+    iops: Option<u32>, packaged: bool, package_depth: usize, raw_command_line: String,
+    progress_callback_url: Option<String>,
 ) -> Result<()> {
     let config = crate::config::SyncJobConfig {
         job_id,
         job_dir,
+        job_dir_pre_existing,
         src_path: src_path.to_string(),
         dest_path: dest_path.to_string(),
         enable_integrity_check,
         enable_acl,
-        scan_type,
         r#match: r#match.clone(),
         exclude: exclude.clone(),
         qos: qos.clone(),
@@ -230,7 +232,7 @@ pub async fn sync(
 /// - `r#match`: 匹配表达式，用于过滤要复制的文件
 /// - `exclude`: 排除表达式，用于排除不需要复制的文件
 /// - `qos`: QoS配置，用于流量控制
-/// - `peak_qos_rate`: 峰值QoS速率
+/// - `peak_qos_rate`: 峰值 `QoS` 速率
 /// - `block_size`: 块大小配置
 /// - `iops`: 可选的 IOPS 限制
 /// - `packaged`: 是否以打包模式处理
@@ -242,20 +244,21 @@ pub async fn sync(
 /// - 成功时返回`Ok(())`
 /// - 失败时返回包含错误信息的`Err`
 #[instrument(skip_all, fields(job_id = %job_id, src = %src_path, dest = %dest_path))]
+#[allow(clippy::too_many_arguments)]
 pub async fn incremental_sync(
-    job_id: String, job_dir: String, src_path: &str, dest_path: &str, enable_integrity_check: bool, enable_acl: bool,
-    scan_type: ScanType, r#match: &Option<String>, exclude: &Option<String>, qos: &Option<String>, peak_qos_rate: f32,
-    block_size: &Option<String>, iops: Option<u32>, packaged: bool, package_depth: usize, raw_command_line: String,
-    progress_callback_url: Option<String>,
+    job_id: String, job_dir: String, job_dir_pre_existing: bool, src_path: &str, dest_path: &str,
+    enable_integrity_check: bool, enable_acl: bool, r#match: &Option<String>, exclude: &Option<String>,
+    qos: &Option<String>, peak_qos_rate: f32, block_size: &Option<String>, iops: Option<u32>, packaged: bool,
+    package_depth: usize, raw_command_line: String, progress_callback_url: Option<String>,
 ) -> Result<()> {
     let config = crate::config::SyncJobConfig {
         job_id,
         job_dir,
+        job_dir_pre_existing,
         src_path: src_path.to_string(),
         dest_path: dest_path.to_string(),
         enable_integrity_check,
         enable_acl,
-        scan_type,
         r#match: r#match.clone(),
         exclude: exclude.clone(),
         qos: qos.clone(),
@@ -308,6 +311,7 @@ pub(crate) fn check_admin_privileges() -> Result<bool> {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn process_versioned_entry(
     entry: &Arc<EntryEnum>, src_storage: Arc<StorageEnum>, dest_storage: Arc<StorageEnum>,
     broadcaster: BroadcastForwarder<StorageEntryMessage>, qos_manager: Option<QosManager>,
@@ -320,7 +324,7 @@ pub(crate) async fn process_versioned_entry(
     // 按对象分组
     let object_key = match &**entry {
         EntryEnum::S3(s3_entry) => s3_entry.relative_path.clone(),
-        _ => {
+        EntryEnum::NAS(_) => {
             error!("Expected S3Entry for versioned processing, got {:?}", entry);
             return;
         }
@@ -350,11 +354,11 @@ pub(crate) async fn process_versioned_entry(
 
     // 启动处理任务
     let span = info_span!("version_processor", path = %object_key, object_key = %object_key);
-    let _ = tokio::spawn(async move {
+    drop(tokio::spawn(async move {
         let mut task_versions = object_versions;
 
         // 按mtime从旧到新排序版本
-        task_versions.sort_by(|a, b| a.get_mtime().cmp(&b.get_mtime()));
+        task_versions.sort_by_key(|a| a.get_mtime());
 
         trace!("Sorted versions: {:?}", task_versions);
 
@@ -391,7 +395,7 @@ pub(crate) async fn process_versioned_entry(
                 )
                 .await
                 {
-                    Ok(_) => {
+                    Ok(()) => {
                         // 记录处理成功的版本信息
                         debug!(
                             "Successfully processed versioned entry: relative_path={:?}, version_id={:?}, is_latest={}, is_delete_marker={}, mtime={:?}",
@@ -415,7 +419,7 @@ pub(crate) async fn process_versioned_entry(
                             .broadcast(StorageEntryMessage::Error {
                                 event: ErrorEvent::Copy,
                                 path: entry.get_relative_path().to_path_buf(),
-                                reason: format!("{}", e),
+                                reason: format!("{e}"),
                             })
                             .await;
                     }
@@ -445,7 +449,7 @@ pub(crate) async fn process_versioned_entry(
                 )
                 .await
                 {
-                    Ok(_) => {
+                    Ok(()) => {
                         debug!(
                             "Successfully processed latest version of object {}: version_id={:?}",
                             object_key,
@@ -459,16 +463,17 @@ pub(crate) async fn process_versioned_entry(
                             .broadcast(StorageEntryMessage::Error {
                                 event: ErrorEvent::Copy,
                                 path: object_key.clone().into(),
-                                reason: format!("{}", e),
+                                reason: format!("{e}"),
                             })
                             .await;
                     }
                 }
             }
         }
-    }.instrument(span));
+    }.instrument(span)));
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn process_entry(
     entry: &EntryEnum, src_storage: Arc<StorageEnum>, dest_storage: Arc<StorageEnum>, enable_integrity_check: bool,
     enable_acl: bool, is_source_reserved: bool, qos_manager: Option<QosManager>, bytes_counter: Option<Arc<AtomicU64>>,
@@ -488,14 +493,14 @@ pub(crate) async fn process_entry(
 
         // 创建目标目录
         match dest_storage.create_dir_all(entry).await {
-            Ok(_) => debug!("Created directory: {:?}", relative_path),
+            Ok(()) => debug!("Created directory: {:?}", relative_path),
             Err(e) => {
                 error!("Error creating directory: {:?}, {:?}", relative_path, e);
                 broadcaster
                     .broadcast(StorageEntryMessage::Error {
                         event: ErrorEvent::Copy,
                         path: relative_path.to_path_buf(),
-                        reason: format!("{}", e),
+                        reason: format!("{e}"),
                     })
                     .await;
                 // 目录创建失败，不返回错误，继续尝试设置元数据和ACL
@@ -516,7 +521,7 @@ pub(crate) async fn process_entry(
                             .broadcast(StorageEntryMessage::Error {
                                 event: ErrorEvent::SymlinkOp,
                                 path: relative_path.to_path_buf(),
-                                reason: format!("{}", e),
+                                reason: format!("{e}"),
                             })
                             .await;
                     }
@@ -528,7 +533,7 @@ pub(crate) async fn process_entry(
                     .broadcast(StorageEntryMessage::Error {
                         event: ErrorEvent::SymlinkOp,
                         path: relative_path.to_path_buf(),
-                        reason: format!("{}", e),
+                        reason: format!("{e}"),
                     })
                     .await;
             }
@@ -547,13 +552,13 @@ pub(crate) async fn process_entry(
             bytes_counter,
         )
         .await
-        .map_err(|e| AppError::CopyError(format!("Failed to copy {:?}: {}", relative_path, e)))?;
+        .map_err(|e| AppError::CopyError(format!("Failed to copy {}: {e}", relative_path.display())))?;
 
         // 设置目标文件元数据（时间戳、权限）
         dest_storage
             .set_entry_metadata(entry)
             .await
-            .map_err(|e| AppError::CopyError(format!("Failed to set metadata for {:?}: {}", relative_path, e)))?;
+            .map_err(|e| AppError::CopyError(format!("Failed to set metadata for {}: {e}", relative_path.display())))?;
 
         debug!("Copied file {:?}", relative_path);
     }
@@ -567,7 +572,7 @@ pub(crate) async fn process_entry(
                 .broadcast(StorageEntryMessage::Error {
                     event: ErrorEvent::CopyAcl,
                     path: relative_path.to_path_buf(),
-                    reason: format!("{}", err),
+                    reason: format!("{err}"),
                 })
                 .await;
         }
@@ -579,7 +584,7 @@ pub(crate) async fn process_entry(
                 .broadcast(StorageEntryMessage::Error {
                     event: ErrorEvent::CopyXattr,
                     path: relative_path.to_path_buf(),
-                    reason: format!("{}", err),
+                    reason: format!("{err}"),
                 })
                 .await;
         }
@@ -614,12 +619,12 @@ pub(crate) async fn process_rename_entry(
     .await
 }
 
-/// 执行完整性检查，验证源路径和目标路径下文件的一致性
-///
-/// 该函数负责验证源路径和目标路径下文件的完整性，确保所有文件的内容完全相同。
-/// 主要流程包括：
-/// 1. 扫描源路径下的所有文件
-/// 2. 对每个文件，计算源文件和目标文件的哈希值
+// 执行完整性检查，验证源路径和目标路径下文件的一致性
+//
+// 该函数负责验证源路径和目标路径下文件的完整性，确保所有文件的内容完全相同。
+// 主要流程包括：
+// 1. 扫描源路径下的所有文件
+// 2. 对每个文件，计算源文件和目标文件的哈希值
 // ─────────────────────────────────────────────────
 // Integrity Check 数据模型
 // ─────────────────────────────────────────────────
@@ -636,13 +641,13 @@ pub enum IssueKind {
 /// Auto-fix 结果
 #[derive(Debug, Clone)]
 pub enum FixStatus {
-    /// auto_fix 关闭，未尝试修复
+    /// `auto_fix` 关闭，未尝试修复
     NotAttempted,
     /// 修复成功，无遗留问题
     Fixed,
     /// 元数据已修，但内容（size/hash）仍不匹配
     PartiallyFixed,
-    /// set_metadata 调用失败
+    /// `set_metadata` 调用失败
     FixFailed,
 }
 
@@ -655,7 +660,7 @@ pub struct IntegrityIssue {
     pub entry_type: &'static str,
     /// Missing 或 Mismatch
     pub kind: IssueKind,
-    /// 不匹配的字段标签，例如 ["size", "mtime", "uid"]
+    /// 不匹配的字段标签，例如 `["size", "mtime", "uid"]`
     pub mismatches: Vec<String>,
     /// 修复状态
     pub fix_status: FixStatus,
@@ -677,7 +682,7 @@ fn format_entry_metadata(entry: &EntryEnum) -> String {
         entry.get_mtime(),
         entry.get_uid().map_or("-".to_string(), |v| v.to_string()),
         entry.get_gid().map_or("-".to_string(), |v| v.to_string()),
-        entry.get_mode().map_or("-".to_string(), |v| format!("{:#o}", v)),
+        entry.get_mode().map_or("-".to_string(), |v| format!("{v:#o}")),
     )
 }
 
@@ -688,27 +693,26 @@ fn collect_metadata_mismatches(src: &EntryEnum, dest: &EntryEnum, check_mode: bo
     let src_mtime = src.get_mtime();
     let dest_mtime = dest.get_mtime();
     if src_mtime != dest_mtime {
-        mismatches.push(format!("mtime: src={}, dest={}", src_mtime, dest_mtime));
+        mismatches.push(format!("mtime: src={src_mtime}, dest={dest_mtime}"));
     }
 
-    if let (Some(src_uid), Some(dest_uid)) = (src.get_uid(), dest.get_uid()) {
-        if src_uid != dest_uid {
-            mismatches.push(format!("uid: src={}, dest={}", src_uid, dest_uid));
-        }
+    if let (Some(src_uid), Some(dest_uid)) = (src.get_uid(), dest.get_uid())
+        && src_uid != dest_uid
+    {
+        mismatches.push(format!("uid: src={src_uid}, dest={dest_uid}"));
     }
 
-    if let (Some(src_gid), Some(dest_gid)) = (src.get_gid(), dest.get_gid()) {
-        if src_gid != dest_gid {
-            mismatches.push(format!("gid: src={}, dest={}", src_gid, dest_gid));
-        }
+    if let (Some(src_gid), Some(dest_gid)) = (src.get_gid(), dest.get_gid())
+        && src_gid != dest_gid
+    {
+        mismatches.push(format!("gid: src={src_gid}, dest={dest_gid}"));
     }
 
-    if check_mode {
-        if let (Some(src_mode), Some(dest_mode)) = (src.get_mode(), dest.get_mode()) {
-            if src_mode != dest_mode {
-                mismatches.push(format!("mode: src={:#o}, dest={:#o}", src_mode, dest_mode));
-            }
-        }
+    if check_mode
+        && let (Some(src_mode), Some(dest_mode)) = (src.get_mode(), dest.get_mode())
+        && src_mode != dest_mode
+    {
+        mismatches.push(format!("mode: src={src_mode:#o}, dest={dest_mode:#o}"));
     }
 
     mismatches
@@ -732,6 +736,7 @@ fn collect_metadata_mismatches(src: &EntryEnum, dest: &EntryEnum, check_mode: bo
 /// - 所有文件验证一致时返回`Ok(())`
 /// - 任何文件哈希值不匹配或发生错误时返回包含错误信息的`Err`
 #[instrument(skip_all, fields(job_id = %job_id, src = %src_path, dest = %dest_path))]
+#[allow(clippy::too_many_arguments)]
 pub async fn integrity_check(
     job_id: String, job_dir: String, src_path: &str, dest_path: &str, quick: bool, auto_fix: bool,
     raw_command_line: String, progress_callback_url: Option<String>,
@@ -765,8 +770,8 @@ pub async fn integrity_check(
         depth: 0,
         scan_type: ScanType::Full,
         concurrency: app_config.scan.concurrency,
-        r#match: "".to_string(),
-        exclude: "".to_string(),
+        r#match: String::new(),
+        exclude: String::new(),
         match_expressions: None,
         exclude_expressions: None,
         include_tags: false,
@@ -787,7 +792,7 @@ pub async fn integrity_check(
         Ok(iter) => iter,
         Err(e) => {
             error!("Failed to start directory walker: {}", e);
-            return Err(AppError::ScanError(format!("Failed to start directory walker: {}", e)));
+            return Err(AppError::ScanError(format!("Failed to start directory walker: {e}")));
         }
     };
 
@@ -844,14 +849,16 @@ pub async fn integrity_check(
                                     match dest_storage.get_metadata(relative_path).await {
                                         Ok(dest_entry) => {
                                             let dest_size = dest_entry.get_size();
-                                            let mut mismatches = if size != dest_size {
-                                                vec![format!("size: src={}, dest={}", size, dest_size)]
-                                            } else {
+                                            let mut mismatches = if size == dest_size {
                                                 Vec::new()
+                                            } else {
+                                                vec![format!("size: src={size}, dest={dest_size}")]
                                             };
                                             mismatches.extend(collect_metadata_mismatches(&entry, &dest_entry, true));
 
-                                            if !mismatches.is_empty() {
+                                            if mismatches.is_empty() {
+                                                debug!("Quick integrity check passed for {:?}", relative_path);
+                                            } else {
                                                 error!(
                                                     "Metadata mismatch for {:?}: {}\n  src:  {}\n  dest: {}",
                                                     relative_path,
@@ -916,8 +923,6 @@ pub async fn integrity_check(
                                                         fix_status: FixStatus::NotAttempted,
                                                     });
                                                 }
-                                            } else {
-                                                debug!("Quick integrity check passed for {:?}", relative_path);
                                             }
                                         }
                                         Err(e) => {
@@ -955,22 +960,22 @@ pub async fn integrity_check(
                                             match (src_hash_result, dest_hash_result) {
                                                 (Ok(src_hash), Ok(dest_hash)) => {
                                                     if src_hash != dest_hash {
-                                                        mismatches.push(format!(
-                                                            "hash: src={}, dest={}",
-                                                            src_hash, dest_hash
-                                                        ));
+                                                        mismatches
+                                                            .push(format!("hash: src={src_hash}, dest={dest_hash}",));
                                                     }
                                                 }
                                                 (Err(e), _) => {
-                                                    mismatches.push(format!("src hash error: {}", e));
+                                                    mismatches.push(format!("src hash error: {e}"));
                                                 }
                                                 (_, Err(e)) => {
-                                                    mismatches.push(format!("dest hash error: {}", e));
+                                                    mismatches.push(format!("dest hash error: {e}"));
                                                 }
                                             }
                                             mismatches.extend(collect_metadata_mismatches(&entry, &dest_entry, true));
 
-                                            if !mismatches.is_empty() {
+                                            if mismatches.is_empty() {
+                                                debug!("Integrity check passed for {:?}", relative_path);
+                                            } else {
                                                 error!(
                                                     "Integrity check failed for {:?}: {}\n  src:  {}\n  dest: {}",
                                                     relative_path,
@@ -1035,8 +1040,6 @@ pub async fn integrity_check(
                                                         fix_status: FixStatus::NotAttempted,
                                                     });
                                                 }
-                                            } else {
-                                                debug!("Integrity check passed for {:?}", relative_path);
                                             }
                                         }
                                     }
@@ -1053,7 +1056,9 @@ pub async fn integrity_check(
                                 match dest_storage.get_metadata(relative_path).await {
                                     Ok(dest_entry) => {
                                         let mismatches = collect_metadata_mismatches(&entry, &dest_entry, true);
-                                        if !mismatches.is_empty() {
+                                        if mismatches.is_empty() {
+                                            debug!("Dir integrity check passed for {:?}", relative_path);
+                                        } else {
                                             error!(
                                                 "Dir metadata mismatch for {:?}: {}\n  src:  {}\n  dest: {}",
                                                 relative_path,
@@ -1105,8 +1110,6 @@ pub async fn integrity_check(
                                                     fix_status: FixStatus::NotAttempted,
                                                 });
                                             }
-                                        } else {
-                                            debug!("Dir integrity check passed for {:?}", relative_path);
                                         }
                                     }
                                     Err(e) => {
@@ -1135,7 +1138,9 @@ pub async fn integrity_check(
                                 match dest_storage.get_metadata(relative_path).await {
                                     Ok(dest_entry) => {
                                         let mismatches = collect_metadata_mismatches(&entry, &dest_entry, false);
-                                        if !mismatches.is_empty() {
+                                        if mismatches.is_empty() {
+                                            debug!("Symlink integrity check passed for {:?}", relative_path);
+                                        } else {
                                             error!(
                                                 "Symlink metadata mismatch for {:?}: {}\n  src:  {}\n  dest: {}",
                                                 relative_path,
@@ -1187,8 +1192,6 @@ pub async fn integrity_check(
                                                     fix_status: FixStatus::NotAttempted,
                                                 });
                                             }
-                                        } else {
-                                            debug!("Symlink integrity check passed for {:?}", relative_path);
                                         }
                                     }
                                     Err(e) => {

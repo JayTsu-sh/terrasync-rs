@@ -69,12 +69,12 @@ pub mod rm;
 /// 将日期目录打包为 .tar 文件写入目标端
 pub mod tar_pack;
 
-/// 公共API的prelude模块
+/// 公共 API 的 prelude 模块
 ///
 /// 用户可以通过 `use app::prelude::*` 来导入最常用的类型，
 /// 简化应用开发过程中的导入语句
 pub mod prelude {
-    /// QoS带宽解析函数
+    /// `QoS` 带宽解析函数
     pub use storage_v2::qos::parse_bandwidth_string;
 
     /// Windows ACL相关功能（仅Windows平台可用）
@@ -91,7 +91,7 @@ pub mod prelude {
     /// 文件删除功能
     pub use crate::rm::rm;
     /// 文件扫描功能
-    pub use crate::scan::{ScanType, scan};
+    pub use crate::scan::{ScanType, determine_scan_type, scan};
     /// 文件复制功能
     pub use crate::sync::{incremental_sync, integrity_check, sync};
 }

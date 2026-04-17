@@ -1,4 +1,4 @@
-//! ClickHouse数据库实现模块
+//! `ClickHouse`数据库实现模块
 //!
 //! 提供与ClickHouse数据库交互的所有操作功能，包括表的创建、查询、插入和删除等。
 
@@ -30,8 +30,9 @@ use crate::{
     get_incremental_scan_base_table_name, get_scan_base_table_name, get_scan_state_table_name,
     get_tar_manifest_table_name,
 };
+use utils::sanitize_job_id;
 
-/// ClickHouse数据库实现
+/// `ClickHouse`数据库实现
 ///
 /// 提供与ClickHouse数据库交互的所有操作功能，包括表的创建、数据的插入、查询和删除等。
 pub struct ClickHouseDatabase {
@@ -43,7 +44,7 @@ pub struct ClickHouseDatabase {
     job_id: String,
     /// 当前使用的临时扫描表名，可选值，创建临时表时设置，删除时清空
     pub scan_temp_table_name: Option<String>,
-    /// 缓存的 scan_state 值（255 = 未缓存），避免每次 batch_insert 都查询数据库
+    /// 缓存的 `scan_state` 值（255 = 未缓存），避免每次 `batch_insert` 都查询数据库
     cached_scan_state: AtomicU8,
 }
 
@@ -54,7 +55,7 @@ pub struct ClickHouseDatabase {
 macro_rules! file_scan_base_columns {
     // 内部宏，包含基础列定义
     (@base) => {
-        r#"
+        r"
     name String,
     relative_path String,
     size UInt64,
@@ -76,7 +77,7 @@ macro_rules! file_scan_base_columns {
     version_id String,
     tags Nullable(String),
     version_count Nullable(UInt32),
-"#
+"
     };
 
     // 生成基础列定义
@@ -90,7 +91,7 @@ macro_rules! file_scan_base_columns {
     };
 }
 
-/// ClickHouse数据库实现文件扫描记录的标准列定义
+/// `ClickHouse`数据库实现文件扫描记录的标准列定义
 ///
 /// 定义了存储文件扫描结果的表结构，包含文件路径、大小、扩展名、时间戳、权限等信息。
 /// 所有相关表（主表和临时表）都使用此结构定义。
@@ -119,17 +120,17 @@ struct ExcludeRecord {
 
 /// JOIN 策略：path-based 或 file_handle-based
 ///
-/// 决定增量扫描对比查询使用 relative_path+version_id 还是 file_handle 作为 JOIN 键。
-/// 当两表的 file_handle 全为 NULL 时使用 Path 模式，否则使用 FileHandle 模式。
+/// 决定增量扫描对比查询使用 `relative_path+version_id` 还是 `file_handle` 作为 JOIN 键。
+/// 当两表的 `file_handle` 全为 NULL 时使用 Path 模式，否则使用 `FileHandle` 模式。
 enum JoinStrategy {
-    /// 基于 relative_path + version_id 的对比
+    /// 基于 `relative_path` + `version_id` 的对比
     Path,
-    /// 基于 file_handle 的对比
+    /// 基于 `file_handle` 的对比
     FileHandle,
 }
 
 impl JoinStrategy {
-    /// 根据临时表和主表的 file_handle 统计信息决定 JOIN 策略
+    /// 根据临时表和主表的 `file_handle` 统计信息决定 JOIN 策略
     fn from_file_handle_status(
         temp_non_null: usize, base_non_null: usize, base_total: usize, temp_total: usize,
     ) -> Self {
@@ -140,9 +141,9 @@ impl JoinStrategy {
         }
     }
 
-    /// 构建 detect_new SQL：temp 中存在但 base 中不存在的记录
+    /// 构建 `detect_new` SQL：temp 中存在但 base 中不存在的记录
     ///
-    /// version_count_join 和 version_count_expr 由 `generate_version_count_join_sql!` 生成
+    /// `version_count_join` 和 `version_count_expr` 由 `generate_version_count_join_sql!` 生成
     fn build_detect_new_sql(
         &self, temp: &str, base: &str, version_count_join: &str, version_count_expr: &str,
     ) -> String {
@@ -165,7 +166,7 @@ impl JoinStrategy {
         }
     }
 
-    /// 构建 detect_changed SQL：temp 与 base 都存在但 size/mtime 不同
+    /// 构建 `detect_changed` SQL：temp 与 base 都存在但 size/mtime 不同
     fn build_detect_changed_sql(&self, temp: &str, base: &str) -> String {
         let t_columns = &*FILE_SCAN_COLUMNS_LIST_WITH_T_PREFIX;
         match self {
@@ -196,9 +197,9 @@ impl JoinStrategy {
         }
     }
 
-    /// 构建 detect_deleted SQL：base 中 old-state 的记录
-    /// 使用 FINAL 确保 ReplacingMergeTree 去重后再按 current_state 过滤
-    fn build_detect_deleted_sql(&self, base: &str) -> String {
+    /// 构建 `detect_deleted` SQL：base 中 old-state 的记录
+    /// 使用 FINAL 确保 `ReplacingMergeTree` 去重后再按 `current_state` 过滤
+    fn build_detect_deleted_sql(base: &str) -> String {
         let columns = &*FILE_SCAN_COLUMNS_LIST;
         format!(
             "SELECT {columns} FROM {base} FINAL \
@@ -207,7 +208,7 @@ impl JoinStrategy {
         )
     }
 
-    /// 构建批量 file_handle 查询 SQL（优化 2）
+    /// 构建批量 `file_handle` 查询 SQL（优化 2）
     fn build_batch_fh_query_sql(base: &str, batch_size: usize) -> String {
         let columns = &*FILE_SCAN_COLUMNS_LIST;
         let placeholders = vec!["?"; batch_size].join(", ");
@@ -220,12 +221,12 @@ impl JoinStrategy {
     }
 }
 
-/// 将 StorageEntryRecord 列表转换为 EntryEnum 迭代器
+/// 将 `StorageEntryRecord` 列表转换为 `EntryEnum` 迭代器
 fn records_to_entry_iter(records: Vec<StorageEntryRecord>) -> Box<dyn Iterator<Item = EntryEnum> + Send> {
     Box::new(records.into_iter().map(|r| r.to_entry_enum()))
 }
 
-/// 构建基础 ClickHouse 客户端（含 url/database/username/password）
+/// 构建基础 `ClickHouse` 客户端（含 url/database/username/password）
 fn build_base_client(config: &ClickHouseConfig) -> Client {
     let mut client = Client::default()
         .with_url(&config.dsn)
@@ -238,10 +239,10 @@ fn build_base_client(config: &ClickHouseConfig) -> Client {
 }
 
 impl ClickHouseDatabase {
-    /// 创建新的ClickHouse数据库实例
-    pub fn new(config: ClickHouseConfig, job_id: &str) -> Self {
-        let sync_client = build_base_client(&config);
-        let async_client = build_base_client(&config)
+    /// 创建新的`ClickHouse`数据库实例
+    pub fn new(config: &ClickHouseConfig, job_id: &str) -> Self {
+        let sync_client = build_base_client(config);
+        let async_client = build_base_client(config)
             .with_option("async_insert", "1")
             .with_option("wait_for_async_insert", "1");
 
@@ -284,12 +285,11 @@ impl ClickHouseDatabase {
         })
     }
 
-    /// 创建主扫描表（ReplacingMergeTree，按 relative_path + version_id 排序）
+    /// 创建主扫描表（ReplacingMergeTree，按 `relative_path` + `version_id` 排序）
     pub async fn create_scan_base_table(&self) -> Result<()> {
         let table_name = get_scan_base_table_name(&self.job_id);
         let create_table_sql = format!(
-            "CREATE TABLE IF NOT EXISTS {} ({}) ENGINE = ReplacingMergeTree() ORDER BY (relative_path, version_id) SETTINGS allow_nullable_key = 1",
-            table_name, FILE_SCAN_COLUMNS_DEFINITION
+            "CREATE TABLE IF NOT EXISTS {table_name} ({FILE_SCAN_COLUMNS_DEFINITION}) ENGINE = ReplacingMergeTree() ORDER BY (relative_path, version_id) SETTINGS allow_nullable_key = 1"
         );
 
         info!("Creating ClickHouse scan base table: {}", table_name);
@@ -298,12 +298,11 @@ impl ClickHouseDatabase {
         Ok(())
     }
 
-    /// 创建扫描状态表（id=1, scan_state 0/1）
+    /// 创建扫描状态表（id=1, `scan_state` 0/1）
     pub async fn create_scan_state_table(&self) -> Result<()> {
         let table_name = get_scan_state_table_name(&self.job_id);
         let create_table_sql = format!(
-            "CREATE TABLE IF NOT EXISTS {} (id UInt8, scan_state UInt8) ENGINE = ReplacingMergeTree() ORDER BY id",
-            table_name
+            "CREATE TABLE IF NOT EXISTS {table_name} (id UInt8, scan_state UInt8) ENGINE = ReplacingMergeTree() ORDER BY id"
         );
 
         info!("Creating ClickHouse scan state table: {}", table_name);
@@ -312,12 +311,11 @@ impl ClickHouseDatabase {
         Ok(())
     }
 
-    /// 创建增量扫描表（按 operation_type + relative_path + create_at 排序）
+    /// 创建增量扫描表（按 `operation_type` + `relative_path` + `create_at` 排序）
     async fn create_incremental_scan_table(&self) -> Result<()> {
         let table_name = get_incremental_scan_base_table_name(&self.job_id);
         let create_table_sql = format!(
-            "CREATE TABLE IF NOT EXISTS {} ({}) ENGINE = ReplacingMergeTree() ORDER BY (operation_type, relative_path, create_at)",
-            table_name, FILE_INCREMENTAL_SCAN_COLUMNS_DEFINITION
+            "CREATE TABLE IF NOT EXISTS {table_name} ({FILE_INCREMENTAL_SCAN_COLUMNS_DEFINITION}) ENGINE = ReplacingMergeTree() ORDER BY (operation_type, relative_path, create_at)"
         );
 
         info!("Creating ClickHouse incremental scan base table: {}", table_name);
@@ -332,7 +330,7 @@ impl ClickHouseDatabase {
     async fn create_tar_manifest_table_impl(&self) -> Result<()> {
         let table_name = get_tar_manifest_table_name(&self.job_id);
         let create_table_sql = format!(
-            "CREATE TABLE IF NOT EXISTS {} (\
+            "CREATE TABLE IF NOT EXISTS {table_name} (\
                 tar_path String, \
                 entry_path String, \
                 size UInt64, \
@@ -346,8 +344,7 @@ impl ClickHouseDatabase {
                 gid Nullable(UInt32), \
                 version_id String, \
                 tags Nullable(String)\
-            ) ENGINE = ReplacingMergeTree() ORDER BY (tar_path, entry_path, version_id)",
-            table_name
+            ) ENGINE = ReplacingMergeTree() ORDER BY (tar_path, entry_path, version_id)"
         );
 
         info!("Creating ClickHouse tar manifest table: {}", table_name);
@@ -361,8 +358,7 @@ impl ClickHouseDatabase {
         // 转义 LIKE 通配符，防止 prefix 中含有 % 或 _ 匹配到计划外的表
         let escaped = prefix.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_");
         let query = format!(
-            "SELECT name FROM system.tables WHERE name LIKE '{}%' ESCAPE '\\\\' AND database = currentDatabase()",
-            escaped
+            "SELECT name FROM system.tables WHERE name LIKE '{escaped}%' ESCAPE '\\\\' AND database = currentDatabase()"
         );
 
         let table_names: Vec<String> = self
@@ -382,10 +378,22 @@ impl ClickHouseDatabase {
         Ok(dropped_tables)
     }
 
-    /// 查询 scan_state 表，返回 id=1 的 scan_state 值
+    /// 检查指定表名是否存在于当前数据库中
+    pub async fn check_table_exists(&self, table_name: &str) -> Result<bool> {
+        let count: u64 = self
+            .sync_client
+            .query("SELECT count() FROM system.tables WHERE name = ? AND database = currentDatabase()")
+            .bind(table_name)
+            .fetch_one()
+            .await
+            .map_err(|e| DatabaseError::QueryError(format!("Failed to check table existence: {e}")))?;
+        Ok(count > 0)
+    }
+
+    /// 查询 `scan_state` 表，返回 id=1 的 `scan_state` 值
     pub async fn query_scan_state(&self) -> Result<u8> {
         let table_name = get_scan_state_table_name(&self.job_id);
-        let query = format!("SELECT scan_state FROM {} FINAL WHERE id = 1", table_name);
+        let query = format!("SELECT scan_state FROM {table_name} FINAL WHERE id = 1");
 
         let scan_state = self
             .sync_client
@@ -396,13 +404,13 @@ impl ClickHouseDatabase {
                 clickhouse::error::Error::RowNotFound => {
                     DatabaseError::QueryError("No scan state record found for id=1".to_string())
                 }
-                _ => DatabaseError::QueryError(format!("Failed to query scan_state table: {}", e)),
+                _ => DatabaseError::QueryError(format!("Failed to query scan_state table: {e}")),
             })?;
 
         Ok(scan_state)
     }
 
-    /// 获取缓存的 scan_state，如果缓存为空（255）则查询数据库
+    /// 获取缓存的 `scan_state`，如果缓存为空（255）则查询数据库
     async fn get_cached_scan_state(&self) -> Result<u8> {
         let cached = self.cached_scan_state.load(Ordering::Relaxed);
         if cached != 255 {
@@ -425,10 +433,10 @@ impl ClickHouseDatabase {
         Ok(state)
     }
 
-    /// 插入或更新扫描状态（id=1，利用 ReplacingMergeTree 自动去重）
+    /// 插入或更新扫描状态（id=1，利用 `ReplacingMergeTree` 自动去重）
     pub async fn insert_scan_state(&self, scan_state: u8) -> Result<()> {
         let table_name = get_scan_state_table_name(&self.job_id);
-        let insert_sql = format!("INSERT INTO {} (id, scan_state) VALUES (?, ?)", table_name);
+        let insert_sql = format!("INSERT INTO {table_name} (id, scan_state) VALUES (?, ?)");
 
         debug!("Inserting scan state: id=1, scan_state={}", scan_state);
 
@@ -444,7 +452,7 @@ impl ClickHouseDatabase {
         Ok(())
     }
 
-    /// 通用检测方法：对比临时表与主表，按 query_builder 构建 SQL 查询符合条件的记录
+    /// 通用检测方法：对比临时表与主表，按 `query_builder` 构建 SQL 查询符合条件的记录
     async fn detect_items(
         &self, query_type: &str, query_builder: impl Fn(&str, &str, &JoinStrategy) -> String,
     ) -> Result<Vec<StorageEntryRecord>> {
@@ -473,15 +481,14 @@ impl ClickHouseDatabase {
         Ok(rows)
     }
 
-    /// 返回 (temp_total, temp_non_null, base_total, base_non_null) 用于确定 JOIN 策略
+    /// 返回 (`temp_total`, `temp_non_null`, `base_total`, `base_non_null`) 用于确定 JOIN 策略
     async fn check_file_handle_status(
         &self, temp_table_name: &str, base_table_name: &str,
     ) -> Result<(usize, usize, usize, usize)> {
         let query = format!(
             "SELECT t.total, t.non_null, b.total, b.non_null \
-             FROM (SELECT count(*) AS total, count(file_handle) AS non_null FROM {}) t \
-             CROSS JOIN (SELECT count(*) AS total, count(file_handle) AS non_null FROM {}) b",
-            temp_table_name, base_table_name
+             FROM (SELECT count(*) AS total, count(file_handle) AS non_null FROM {temp_table_name}) t \
+             CROSS JOIN (SELECT count(*) AS total, count(file_handle) AS non_null FROM {base_table_name}) b"
         );
 
         debug!(
@@ -510,7 +517,7 @@ impl ClickHouseDatabase {
         Ok((temp_total, temp_non_null, base_total, base_non_null))
     }
 
-    /// 根据 relative_path 列表批量删除指定表中的记录
+    /// 根据 `relative_path` 列表批量删除指定表中的记录
     async fn batch_delete_record(&self, table_name: &str, deleted_paths: &[String]) -> Result<()> {
         info!(
             "Batch deleting {} records from table: {}",
@@ -536,7 +543,7 @@ impl ClickHouseDatabase {
         delete_stmt
             .execute()
             .await
-            .map_err(|e| DatabaseError::QueryError(format!("Failed to batch delete base records: {}", e)))?;
+            .map_err(|e| DatabaseError::QueryError(format!("Failed to batch delete base records: {e}")))?;
 
         info!("Successfully batch deleted {} base records", deleted_paths.len());
         Ok(())
@@ -602,7 +609,7 @@ impl Database for ClickHouseDatabase {
         Box::new(new_db)
     }
 
-    /// 初始化：创建主扫描表 + 状态表，设置初始 scan_state=0
+    /// 初始化：创建主扫描表 + 状态表，设置初始 `scan_state=0`
     async fn initialize(&self) -> Result<()> {
         self.create_table(SCAN_BASE_TABLE_BASE_NAME).await?;
         self.create_table(SCAN_STATE_TABLE_BASE_NAME).await?;
@@ -629,11 +636,11 @@ impl Database for ClickHouseDatabase {
             SCAN_STATE_TABLE_BASE_NAME => self.create_scan_state_table().await,
             INCREMENTAL_SCAN_TABLE_BASE_NAME => self.create_incremental_scan_table().await,
             TAR_MANIFEST_TABLE_BASE_NAME => self.create_tar_manifest_table_impl().await,
-            _ => Err(DatabaseError::UnsupportedType(format!("Unknown table: {}", table_name))),
+            _ => Err(DatabaseError::UnsupportedType(format!("Unknown table: {table_name}"))),
         }
     }
 
-    /// 批量插入增量扫描记录（StorageEntryMessage → IncrementalStorageEntryRecord）
+    /// 批量插入增量扫描记录（StorageEntryMessage → `IncrementalStorageEntryRecord`）
     async fn batch_insert_incremental_record(&self, messages: &[StorageEntryMessage]) -> Result<()> {
         if messages.is_empty() {
             return Ok(());
@@ -643,7 +650,7 @@ impl Database for ClickHouseDatabase {
 
         let records: Vec<IncrementalStorageEntryRecord> = messages
             .iter()
-            .map(|message| IncrementalStorageEntryRecord::from_message(message))
+            .map(IncrementalStorageEntryRecord::from_message)
             .collect();
 
         let record_count = records.len();
@@ -676,8 +683,7 @@ impl Database for ClickHouseDatabase {
     async fn create_scan_temporary_table(&mut self) -> Result<()> {
         let temp_table_name = generate_scan_temp_table_name();
         let create_table_sql = format!(
-            "CREATE TABLE IF NOT EXISTS {} ({}) ENGINE = MergeTree() ORDER BY (relative_path, version_id) SETTINGS allow_nullable_key = 1",
-            temp_table_name, FILE_SCAN_COLUMNS_DEFINITION
+            "CREATE TABLE IF NOT EXISTS {temp_table_name} ({FILE_SCAN_COLUMNS_DEFINITION}) ENGINE = MergeTree() ORDER BY (relative_path, version_id) SETTINGS allow_nullable_key = 1"
         );
 
         debug!("Creating ClickHouse scan temporary table: {}", temp_table_name);
@@ -691,10 +697,10 @@ impl Database for ClickHouseDatabase {
         Ok(())
     }
 
-    /// 删除扫描临时表并清空 scan_temp_table_name
+    /// 删除扫描临时表并清空 `scan_temp_table_name`
     async fn drop_scan_temporary_table(&mut self) -> Result<()> {
         if let Some(temp_table_name) = &self.scan_temp_table_name {
-            let drop_table_sql = format!("DROP TABLE IF EXISTS {}", temp_table_name);
+            let drop_table_sql = format!("DROP TABLE IF EXISTS {temp_table_name}");
 
             debug!("Dropping ClickHouse scan temporary table: {}", temp_table_name);
             self.execute(&drop_table_sql, &[]).await?;
@@ -713,7 +719,7 @@ impl Database for ClickHouseDatabase {
 
     /// 删除指定表（IF EXISTS）
     async fn drop_table_by_name(&self, table_name: &str) -> Result<()> {
-        let drop_table_sql = format!("DROP TABLE IF EXISTS `{}`", table_name);
+        let drop_table_sql = format!("DROP TABLE IF EXISTS `{table_name}`");
         debug!("Dropping ClickHouse table: {}", table_name);
         self.execute(&drop_table_sql, &[]).await?;
         Ok(())
@@ -736,19 +742,19 @@ impl Database for ClickHouseDatabase {
         self.batch_insert(&base_table_name, records, true).await
     }
 
-    /// 更新主表中的单条记录（利用 ReplacingMergeTree 插入覆盖）
+    /// 更新主表中的单条记录（利用 `ReplacingMergeTree` 插入覆盖）
     async fn update_base_record(&self, record: &Arc<EntryEnum>) -> Result<()> {
         let base_table_name = get_scan_base_table_name(&self.job_id);
         self.batch_insert(&base_table_name, &[Arc::clone(record)], false).await
     }
 
-    /// 批量删除主表中的记录（按 relative_path）
+    /// 批量删除主表中的记录（按 `relative_path`）
     async fn batch_delete_base_record(&self, deleted_paths: &[String]) -> Result<()> {
         let table_name = get_scan_base_table_name(&self.job_id);
         self.batch_delete_record(&table_name, deleted_paths).await
     }
 
-    /// 切换 scan_state（0↔1）
+    /// 切换 `scan_state`（0↔1）
     async fn switch_scan_state(&self) -> Result<()> {
         let current_state = self.get_cached_scan_state().await?;
         let new_state = 1 - current_state;
@@ -790,10 +796,7 @@ impl Database for ClickHouseDatabase {
 
             // 1. 创建 Memory 排除表
             self.execute(
-                &format!(
-                    "CREATE TABLE {} (relative_path String, version_id String) ENGINE = Memory",
-                    exclude_table
-                ),
+                &format!("CREATE TABLE {exclude_table} (relative_path String, version_id String) ENGINE = Memory"),
                 &[],
             )
             .await?;
@@ -825,7 +828,7 @@ impl Database for ClickHouseDatabase {
             self.execute(&insert_sql, &[]).await?;
 
             // 4. 清理排除表
-            self.execute(&format!("DROP TABLE IF EXISTS {}", exclude_table), &[])
+            self.execute(&format!("DROP TABLE IF EXISTS {exclude_table}"), &[])
                 .await?;
         }
 
@@ -860,7 +863,7 @@ impl Database for ClickHouseDatabase {
         Ok(records_to_entry_iter(records))
     }
 
-    /// 检测已删除或重命名的文件（old-state 记录 + file_handle 分组判定）
+    /// 检测已删除或重命名的文件（old-state 记录 + `file_handle` 分组判定）
     async fn detect_deleted_items(&self) -> Result<Box<dyn Iterator<Item = DeletionStatus> + Send>> {
         let base_table_name = get_scan_base_table_name(&self.job_id);
 
@@ -868,7 +871,7 @@ impl Database for ClickHouseDatabase {
         debug!("During detect_deleted_items, current_state is {}", current_state);
 
         // 第一步：查询所有 old-state 记录（LIMIT 1 BY 替代 FINAL）
-        let query = JoinStrategy::Path.build_detect_deleted_sql(&base_table_name);
+        let query = JoinStrategy::build_detect_deleted_sql(&base_table_name);
 
         let rows = self
             .sync_client
@@ -876,7 +879,7 @@ impl Database for ClickHouseDatabase {
             .bind(1 - current_state)
             .fetch_all::<StorageEntryRecord>()
             .await
-            .map_err(|e| DatabaseError::QueryError(format!("Failed to query deleted files: {}", e)))?;
+            .map_err(|e| DatabaseError::QueryError(format!("Failed to query deleted files: {e}")))?;
 
         debug!("Found {} old-state entries", rows.len());
         if rows.is_empty() {
@@ -901,10 +904,10 @@ impl Database for ClickHouseDatabase {
         let mut fh_groups: HashMap<String, Vec<StorageEntryRecord>> = HashMap::new();
 
         if !fh_records.is_empty() {
-            let unique_fh_list: Vec<&str> = unique_fh_set.iter().map(|s| s.as_str()).collect();
+            const BATCH_SIZE: usize = 10_000;
+            let unique_fh_list: Vec<&str> = unique_fh_set.iter().map(String::as_str).collect();
 
             // 每批 10K 个 fh，避免 SQL 过长
-            const BATCH_SIZE: usize = 10_000;
             for chunk in unique_fh_list.chunks(BATCH_SIZE) {
                 let batch_query = JoinStrategy::build_batch_fh_query_sql(&base_table_name, chunk.len());
 
@@ -915,7 +918,7 @@ impl Database for ClickHouseDatabase {
                 let batch_rows = q
                     .fetch_all::<StorageEntryRecord>()
                     .await
-                    .map_err(|e| DatabaseError::QueryError(format!("Failed to batch query file_handle: {}", e)))?;
+                    .map_err(|e| DatabaseError::QueryError(format!("Failed to batch query file_handle: {e}")))?;
 
                 for row in batch_rows {
                     if let Some(fh) = &row.file_handle {
@@ -935,13 +938,15 @@ impl Database for ClickHouseDatabase {
 
     /// 获取指定表的记录总数（使用 FINAL 确保去重）
     async fn get_count(&self, table_name: &str) -> Result<u64> {
-        let full_table_name = format!("{}_{}", table_name, self.job_id.replace('-', "_"));
-        let query = format!("SELECT COUNT() FROM {} FINAL", full_table_name);
+        let full_table_name = format!("{}_{}", table_name, sanitize_job_id(&self.job_id));
+        let query = format!("SELECT COUNT() FROM {full_table_name} FINAL");
 
-        let count =
-            self.sync_client.query(&query).fetch_one::<u64>().await.map_err(|e| {
-                DatabaseError::QueryError(format!("Failed to get count from {}: {}", full_table_name, e))
-            })?;
+        let count = self
+            .sync_client
+            .query(&query)
+            .fetch_one::<u64>()
+            .await
+            .map_err(|e| DatabaseError::QueryError(format!("Failed to get count from {full_table_name}: {e}")))?;
 
         Ok(count)
     }
@@ -956,20 +961,20 @@ impl Database for ClickHouseDatabase {
         let mut ext_bind: Option<String> = None;
 
         if let Some(dir_val) = is_dir {
-            where_conditions.push(format!("is_dir = {}", dir_val));
+            where_conditions.push(format!("is_dir = {dir_val}"));
         }
 
         if let Some(symlink_val) = is_symlink {
-            where_conditions.push(format!("is_symlink = {}", symlink_val));
+            where_conditions.push(format!("is_symlink = {symlink_val}"));
         }
 
         if let Some(ext_val) = extension {
             where_conditions.push("ext ILIKE ?".to_string());
-            ext_bind = Some(format!("%{}", ext_val));
+            ext_bind = Some(format!("%{ext_val}"));
         }
 
         let where_clause = if where_conditions.is_empty() {
-            "".to_string()
+            String::new()
         } else {
             format!("WHERE {}", where_conditions.join(" AND "))
         };
@@ -985,7 +990,7 @@ impl Database for ClickHouseDatabase {
         }
         let mut stream = q
             .fetch::<StorageEntryRecord>()
-            .map_err(|e| DatabaseError::QueryError(format!("Failed to query storage entries: {}", e)))?;
+            .map_err(|e| DatabaseError::QueryError(format!("Failed to query storage entries: {e}")))?;
 
         while let Ok(Some(record)) = stream.next().await {
             debug!("query_storage_entry: the record {:?}", record);
@@ -994,8 +999,7 @@ impl Database for ClickHouseDatabase {
             debug!("query_storage_entry: {:?}", entry_enum);
             if let Err(err) = tx.send(entry_enum).await {
                 return Err(DatabaseError::QueryError(format!(
-                    "Failed to send storage entry: {}",
-                    err
+                    "Failed to send storage entry: {err}"
                 )));
             }
         }
@@ -1032,6 +1036,10 @@ impl Database for ClickHouseDatabase {
             table_name
         );
         Ok(())
+    }
+
+    async fn table_exists(&self, table_name: &str) -> Result<bool> {
+        self.check_table_exists(table_name).await
     }
 }
 
@@ -1370,7 +1378,7 @@ mod tests {
 
     #[test]
     fn test_detect_deleted_sql() {
-        let sql = JoinStrategy::Path.build_detect_deleted_sql("base_y");
+        let sql = JoinStrategy::build_detect_deleted_sql("base_y");
         assert!(sql.contains("FINAL"));
         assert!(sql.contains("current_state = ?"));
         assert!(!sql.contains("LIMIT 1 BY"));

@@ -50,7 +50,7 @@ pub use error::{DatabaseError, Result}; // 错误处理相关类型
 pub use factory::DatabaseFactory; // 数据库工厂类型
 pub use traits::Database; // 数据库接口类型
 
-/// 公共API的prelude模块
+/// 公共 API 的 prelude 模块
 ///
 /// 用户可以通过 `use db::prelude::*` 来导入最常用的类型，
 /// 简化应用开发过程中的导入语句
@@ -72,7 +72,7 @@ pub mod prelude {
     pub use super::{DuckDBConfig, DuckDBDatabase};
 }
 
-/// 根据job_id生成扫描基础表名
+/// 根据 `job_id` 生成扫描基础表名
 ///
 /// # 参数
 /// - `job_id`: 任务ID，用于隔离不同任务的数据
@@ -83,7 +83,7 @@ pub(crate) fn get_scan_base_table_name(job_id: &str) -> String {
     format!("{}_{}", SCAN_BASE_TABLE_BASE_NAME, sanitize_job_id(job_id))
 }
 
-/// 根据job_id生成增量扫描基础表名
+/// 根据 `job_id` 生成增量扫描基础表名
 ///
 /// # 参数
 /// - `job_id`: 任务ID，用于隔离不同任务的数据
@@ -94,7 +94,7 @@ pub(crate) fn get_incremental_scan_base_table_name(job_id: &str) -> String {
     format!("{}_{}", INCREMENTAL_SCAN_TABLE_BASE_NAME, sanitize_job_id(job_id))
 }
 
-/// 根据job_id生成扫描状态表名
+/// 根据 `job_id` 生成扫描状态表名
 ///
 /// # 参数
 /// - `job_id`: 任务ID，用于隔离不同任务的数据
@@ -105,9 +105,16 @@ pub(crate) fn get_scan_state_table_name(job_id: &str) -> String {
     format!("{}_{}", SCAN_STATE_TABLE_BASE_NAME, sanitize_job_id(job_id))
 }
 
-/// 根据job_id生成tar manifest表名
+/// 根据 `job_id` 生成 tar manifest 表名
 pub(crate) fn get_tar_manifest_table_name(job_id: &str) -> String {
     format!("{}_{}", TAR_MANIFEST_TABLE_BASE_NAME, sanitize_job_id(job_id))
+}
+
+/// 根据 `job_id` 生成 base 表的完整表名（供外部判定增量模式使用）
+///
+/// 内部调用 `sanitize_job_id` 处理特殊字符
+pub fn base_table_name_for_job(job_id: &str) -> String {
+    get_scan_base_table_name(job_id)
 }
 
 /// 生成唯一的临时扫描表名
@@ -117,5 +124,5 @@ pub(crate) fn get_tar_manifest_table_name(job_id: &str) -> String {
 /// - 唯一的临时扫描表名
 pub(crate) fn generate_scan_temp_table_name() -> String {
     let uuid = Uuid::new_v4().to_string().replace('-', "_");
-    format!("{}_{}", SCAN_TEMP_TABLE_BASE_NAME, uuid)
+    format!("{SCAN_TEMP_TABLE_BASE_NAME}_{uuid}")
 }

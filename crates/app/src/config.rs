@@ -75,23 +75,26 @@ pub struct ConsumerConfig {
     pub job_dir: String,
     pub db_config: DatabaseConfig,
     pub console_config: ConsoleConfig,
-    /// 进度回调 URL（由环境变量 TERRASYNC_PROGRESS_CALLBACK_URL 拼接而成）
+    /// 进度回调 URL（由环境变量 `TERRASYNC_PROGRESS_CALLBACK_URL` 拼接而成）
     /// 当 web 层启动任务时设置，CLI 模式下为 None
     pub progress_callback_url: Option<String>,
 }
 
 /// Sync/IncrementalSync 的统一任务配置
 ///
-/// 整合 sync()/incremental_sync() 的所有参数，供 SyncOrchestrator 使用
+/// 整合 `sync()/incremental_sync()` 的所有参数，供 `SyncOrchestrator` 使用。
+/// `scan_type` 由 `SyncOrchestrator::run()` 自动判定（查数据库 base 表，fallback 文件系统）。
 #[derive(Debug, Clone)]
 pub struct SyncJobConfig {
     pub job_id: String,
     pub job_dir: String,
+    /// job_dir 是否在本次调用前已经存在（由调用方 snapshot 注入）
+    /// 用于 app 层判定 ScanType 的文件系统 fallback（数据库不可达时）
+    pub job_dir_pre_existing: bool,
     pub src_path: String,
     pub dest_path: String,
     pub enable_integrity_check: bool,
     pub enable_acl: bool,
-    pub scan_type: ScanType,
     pub r#match: Option<String>,
     pub exclude: Option<String>,
     pub qos: Option<String>,
@@ -107,6 +110,7 @@ pub struct SyncJobConfig {
 }
 
 /// 初始化扫描配置
+#[allow(clippy::too_many_arguments)]
 pub fn initialize_scan_config(
     job_id: &str, path: &str, depth: u32, scan_type: ScanType, r#match: &Option<String>, exclude: &Option<String>,
     concurrency: usize, include_tags: bool, file_list: &Option<String>, packaged: bool, package_depth: usize,

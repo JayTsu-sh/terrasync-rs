@@ -23,6 +23,7 @@ use crate::{
     TAR_MANIFEST_TABLE_BASE_NAME, generate_scan_temp_table_name, get_incremental_scan_base_table_name,
     get_scan_base_table_name, get_scan_state_table_name, get_tar_manifest_table_name,
 };
+use utils::sanitize_job_id;
 
 /// DuckDB SQL 构建策略：基于路径 vs 基于 file_handle
 ///
@@ -591,24 +592,33 @@ impl DuckDBDatabase {
                 DatabaseError::QueryError(format!("Failed to begin transaction for batch delete: {}", e))
             })?;
 
-            for chunk in deleted_paths.chunks(BATCH_SIZE) {
-                let placeholders = vec!["?"; chunk.len()].join(", ");
-                let delete_query = format!("DELETE FROM {} WHERE relative_path IN ({})", table_name, placeholders);
+            let result = (|| -> Result<()> {
+                for chunk in deleted_paths.chunks(BATCH_SIZE) {
+                    let placeholders = vec!["?"; chunk.len()].join(", ");
+                    let delete_query = format!("DELETE FROM {} WHERE relative_path IN ({})", table_name, placeholders);
 
-                let params: Vec<Box<dyn duckdb::ToSql>> = chunk
-                    .iter()
-                    .map(|p| Box::new(p.clone()) as Box<dyn duckdb::ToSql>)
-                    .collect();
-                let param_refs: Vec<&dyn duckdb::ToSql> = params.iter().map(|p| p.as_ref()).collect();
+                    let params: Vec<Box<dyn duckdb::ToSql>> = chunk
+                        .iter()
+                        .map(|p| Box::new(p.clone()) as Box<dyn duckdb::ToSql>)
+                        .collect();
+                    let param_refs: Vec<&dyn duckdb::ToSql> = params.iter().map(|p| p.as_ref()).collect();
 
-                conn.execute(&delete_query, param_refs.as_slice()).map_err(|e| {
-                    DatabaseError::QueryError(format!(
-                        "Failed to batch delete {} records from '{}': {}",
-                        chunk.len(),
-                        table_name,
-                        e
-                    ))
-                })?;
+                    conn.execute(&delete_query, param_refs.as_slice()).map_err(|e| {
+                        DatabaseError::QueryError(format!(
+                            "Failed to batch delete {} records from '{}': {}",
+                            chunk.len(),
+                            table_name,
+                            e
+                        ))
+                    })?;
+                }
+                Ok(())
+            })();
+
+            if let Err(e) = result {
+                // DELETE 失败：回滚事务，避免部分提交
+                let _ = conn.execute("ROLLBACK TRANSACTION", []);
+                return Err(e);
             }
 
             conn.execute("COMMIT TRANSACTION", []).map_err(|e| {
@@ -1254,7 +1264,7 @@ impl Database for DuckDBDatabase {
             SCAN_BASE_TABLE_BASE_NAME => get_scan_base_table_name(&self.job_id),
             SCAN_STATE_TABLE_BASE_NAME => get_scan_state_table_name(&self.job_id),
             INCREMENTAL_SCAN_TABLE_BASE_NAME => get_incremental_scan_base_table_name(&self.job_id),
-            _ => format!("{}_{}", table_name, self.job_id.replace('-', "_")),
+            _ => format!("{}_{}", table_name, sanitize_job_id(&self.job_id)),
         };
         let query = format!("SELECT COUNT(*) FROM {}", full_table_name);
 
@@ -1308,7 +1318,7 @@ impl Database for DuckDBDatabase {
         let config = self.config.clone();
         let tx_clone = tx.clone();
 
-        let _ = tokio::task::spawn_blocking(move || {
+        tokio::task::spawn_blocking(move || {
             let path = config
                 .get_path()
                 .map_err(|e| DatabaseError::QueryError(e.to_string()))?;
@@ -1342,7 +1352,8 @@ impl Database for DuckDBDatabase {
 
             Ok(())
         })
-        .await?;
+        .await
+        .map_err(|e| DatabaseError::QueryError(format!("spawn_blocking panicked: {e}")))??;
 
         Ok(())
     }
@@ -1389,6 +1400,18 @@ impl Database for DuckDBDatabase {
                 .flush()
                 .map_err(|e| DatabaseError::QueryError(format!("Failed to flush appender: {}", e)))?;
             Ok(())
+        })
+    }
+
+    async fn table_exists(&self, table_name: &str) -> Result<bool> {
+        self.with_connection(|conn| {
+            let mut stmt = conn
+                .prepare("SELECT count(*) FROM information_schema.tables WHERE table_name = ?")
+                .map_err(|e| DatabaseError::QueryError(format!("Failed to check table existence: {}", e)))?;
+            let count: i64 = stmt
+                .query_row(params![table_name], |row| row.get(0))
+                .map_err(|e| DatabaseError::QueryError(format!("Failed to check table existence: {}", e)))?;
+            Ok(count > 0)
         })
     }
 }

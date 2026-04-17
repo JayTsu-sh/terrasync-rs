@@ -1,8 +1,9 @@
 //! Common types and utilities for database implementations
 
 use std::collections::HashMap;
+use std::hash::BuildHasher;
+use std::sync::LazyLock;
 
-use once_cell::sync::Lazy;
 use storage_v2::EntryEnum;
 use tracing::{error, trace};
 
@@ -14,57 +15,57 @@ pub enum DeletionStatus {
     /// The item was permanently deleted
     Deleted(EntryEnum),
     /// The item was renamed, with the old and new entries
-    Renamed(EntryEnum, EntryEnum),
+    Renamed(EntryEnum, Box<EntryEnum>),
 }
 
-/// 文件扫描列名列表（不含version_count）
+/// 文件扫描列名列表（不含 `version_count`）
 pub const FILE_SCAN_COLUMNS_LIST_WO_VERSIONCOUNT: &str = "name, relative_path, size, ext, ctime, mtime, atime, mode, storage_type, is_symlink, is_dir, is_regular_file, hard_links, current_state, uid, gid, ino, file_handle, version_id, tags";
 
-/// 通过FILE_SCAN_COLUMNS_LIST_WO_VERSIONCOUNT生成的完整列名列表，包含version_count
-pub static FILE_SCAN_COLUMNS_LIST: Lazy<String> =
-    Lazy::new(|| format!("{}, version_count", FILE_SCAN_COLUMNS_LIST_WO_VERSIONCOUNT));
+/// 通过 `FILE_SCAN_COLUMNS_LIST_WO_VERSIONCOUNT` 生成的完整列名列表，包含 `version_count`
+pub static FILE_SCAN_COLUMNS_LIST: LazyLock<String> =
+    LazyLock::new(|| format!("{FILE_SCAN_COLUMNS_LIST_WO_VERSIONCOUNT}, version_count"));
 
-/// 基础扫描表的占位符列表（通过FILE_SCAN_COLUMNS_LIST计算）
-pub static FILE_SCAN_COLUMNS_PLACEHOLDERS: Lazy<String> = Lazy::new(|| {
+/// 基础扫描表的占位符列表（通过 `FILE_SCAN_COLUMNS_LIST` 计算）
+pub static FILE_SCAN_COLUMNS_PLACEHOLDERS: LazyLock<String> = LazyLock::new(|| {
     let column_count = FILE_SCAN_COLUMNS_LIST.split(',').count();
     vec!["?"; column_count].join(", ")
 });
 
-/// 带表前缀"t."的完整列名列表（不含version_count）
+/// 带表前缀"t."的完整列名列表（不含 `version_count`）
 ///
 /// 用于SQL语句中的带表前缀列名列表，如SELECT语句中的表别名前缀
-pub static FILE_SCAN_COLUMNS_LIST_WO_VERSIONCOUNT_WITH_T_PREFIX: Lazy<String> = Lazy::new(|| {
+pub static FILE_SCAN_COLUMNS_LIST_WO_VERSIONCOUNT_WITH_T_PREFIX: LazyLock<String> = LazyLock::new(|| {
     FILE_SCAN_COLUMNS_LIST_WO_VERSIONCOUNT
         .split(',')
-        .map(|s| s.trim())
+        .map(str::trim)
         .filter(|s| !s.is_empty())
-        .map(|col| format!("t.{}", col))
+        .map(|col| format!("t.{col}"))
         .collect::<Vec<_>>()
         .join(", ")
 });
 
-/// 带表前缀"t."的完整列名列表（包含version_count）
+/// 带表前缀"t."的完整列名列表（包含 `version_count`）
 ///
-/// 通过FILE_SCAN_COLUMNS_LIST生成的完整列名列表，包含t.version_count
-pub static FILE_SCAN_COLUMNS_LIST_WITH_T_PREFIX: Lazy<String> = Lazy::new(|| {
+/// 通过 `FILE_SCAN_COLUMNS_LIST` 生成的完整列名列表，包含 `t.version_count`
+pub static FILE_SCAN_COLUMNS_LIST_WITH_T_PREFIX: LazyLock<String> = LazyLock::new(|| {
     FILE_SCAN_COLUMNS_LIST
         .split(',')
-        .map(|s| s.trim())
+        .map(str::trim)
         .filter(|s| !s.is_empty())
-        .map(|col| format!("t.{}", col))
+        .map(|col| format!("t.{col}"))
         .collect::<Vec<_>>()
         .join(", ")
 });
 
-/// 从 detect_deleted_items 提取的纯函数，对 file_handle 分组结果进行分类判断
+/// 从 `detect_deleted_items` 提取的纯函数，对 `file_handle` 分组结果进行分类判断
 ///
-/// 根据 fh_groups 中每个 file_handle 对应的记录数量判断是 Deleted 还是 Renamed：
-/// - 1 条记录 → Deleted
-/// - 2 条记录 → Renamed（ctime 小 = from，ctime 大 = to）
+/// 根据 `fh_groups` 中每个 `file_handle` 对应的记录数量判断是 `Deleted` 还是 `Renamed`：
+/// - 1 条记录 → `Deleted`
+/// - 2 条记录 → `Renamed`（ctime 小 = from，ctime 大 = to）
 /// - 其他 → error 日志
-pub fn classify_deletion_status(
+pub fn classify_deletion_status<S: BuildHasher>(
     no_fh_records: Vec<StorageEntryRecord>, fh_records: Vec<StorageEntryRecord>,
-    fh_groups: &HashMap<String, Vec<StorageEntryRecord>>,
+    fh_groups: &HashMap<String, Vec<StorageEntryRecord>, S>,
 ) -> Vec<DeletionStatus> {
     let mut deletion_statuses: Vec<DeletionStatus> = Vec::with_capacity(no_fh_records.len() + fh_records.len());
 
@@ -76,7 +77,7 @@ pub fn classify_deletion_status(
     // 有 file_handle → 根据 groups 判断
     for record in fh_records {
         if let Some(fh) = &record.file_handle {
-            match fh_groups.get(fh).map(|v| v.as_slice()) {
+            match fh_groups.get(fh).map(Vec::as_slice) {
                 Some(entries) if entries.len() == 1 => {
                     trace!("file_handle {} has 1 entry, Deleted", fh);
                     deletion_statuses.push(DeletionStatus::Deleted(record.to_entry_enum()));
@@ -89,7 +90,7 @@ pub fn classify_deletion_status(
                         (entries[1].to_entry_enum(), entries[0].to_entry_enum())
                     };
                     trace!("file_handle {} has 2 entries, Renamed", fh);
-                    deletion_statuses.push(DeletionStatus::Renamed(from, to));
+                    deletion_statuses.push(DeletionStatus::Renamed(from, Box::new(to)));
                 }
                 Some(entries) => {
                     error!(
@@ -113,11 +114,11 @@ pub fn classify_deletion_status(
     deletion_statuses
 }
 
-/// 生成 version_count 的 JOIN 子句和 SELECT 表达式（优化 4）
+/// 生成 `version_count` 的 JOIN 子句和 SELECT 表达式（优化 4）
 ///
-/// 返回 (join_clause, select_expr)：
-/// - join_clause: LEFT JOIN 预聚合子查询
-/// - select_expr: CASE WHEN 表达式
+/// 返回 `(join_clause, select_expr)`：
+/// - `join_clause`: LEFT JOIN 预聚合子查询
+/// - `select_expr`: CASE WHEN 表达式
 #[macro_export]
 macro_rules! generate_version_count_join_sql {
     ($base_table:expr) => {{

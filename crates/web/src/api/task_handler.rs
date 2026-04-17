@@ -155,9 +155,7 @@ fn progress_report_to_snapshot(report: &ProgressReport) -> serde_json::Value {
 ///
 /// 此端点仅允许本机（127.0.0.1 / ::1）调用，防止外部进程注入虚假进度数据。
 pub async fn update_progress(
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
-    State(state): State<AppState>,
-    Path(id): Path<String>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>, State(state): State<AppState>, Path(id): Path<String>,
     Json(report): Json<ProgressReport>,
 ) -> impl IntoResponse {
     let ip = peer.ip();

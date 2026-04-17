@@ -85,20 +85,20 @@ pub struct StorageEntryRecord {
 }
 
 impl StorageEntryRecord {
-    /// 将EntryEnum转换为StorageEntryRecord
+    /// 将 `EntryEnum` 转换为 `StorageEntryRecord`
     ///
     /// # 参数
     /// - `entry`: 存储条目对象（NAS或S3）
     /// - `current_state`: 当前扫描状态
     ///
     /// # 返回值
-    /// - 转换后的StorageEntryRecord对象
+    /// - 转换后的 `StorageEntryRecord` 对象
     pub fn from_entry_enum(entry: &EntryEnum, current_state: u8) -> Self {
         let ext = entry.get_extension().map(str::to_string);
         trace!("{:?}", entry.get_file_handle());
 
         // 将Bytes转换为hex字符串
-        let file_handle = entry.get_file_handle().map(|bytes| hex::encode(bytes));
+        let file_handle = entry.get_file_handle().map(hex::encode);
         trace!("{:?}", file_handle);
 
         // 将Vec<Tag>转换为JSON字符串
@@ -134,10 +134,10 @@ impl StorageEntryRecord {
         }
     }
 
-    /// 将StorageEntryRecord转换为EntryEnum
+    /// 将 `StorageEntryRecord` 转换为 `EntryEnum`
     ///
     /// # 返回值
-    /// - 转换后的EntryEnum对象（根据storage_type选择NAS或S3）
+    /// - 转换后的 `EntryEnum` 对象（根据 `storage_type` 选择 NAS 或 S3）
     pub fn to_entry_enum(&self) -> EntryEnum {
         // 将十六进制字符串解码为Bytes
         let file_handle = self
@@ -197,7 +197,7 @@ impl StorageEntryRecord {
 }
 
 /// 文件增量扫描记录结构体
-/// 对应FILE_INCREMENTAL_SCAN_COLUMNS_DEFINITION中的列定义
+/// 对应 `FILE_INCREMENTAL_SCAN_COLUMNS_DEFINITION` 中的列定义
 #[derive(Debug, Clone, Serialize, Deserialize, clickhouse::Row)]
 pub struct IncrementalStorageEntryRecord {
     /// 操作类型：new, changed, deleted, rename
@@ -251,13 +251,13 @@ pub struct IncrementalStorageEntryRecord {
 }
 
 impl IncrementalStorageEntryRecord {
-    /// 从StorageEntryMessage创建IncrementalStorageEntryRecord
+    /// 从 `StorageEntryMessage` 创建 `IncrementalStorageEntryRecord`
     ///
     /// # 参数
-    /// - `message`: 存储条目消息对象（来自storage_v2）
+    /// - `message`: 存储条目消息对象（来自 `storage_v2`）
     ///
     /// # 返回值
-    /// - 转换后的IncrementalStorageEntryRecord对象
+    /// - 转换后的 `IncrementalStorageEntryRecord` 对象
     pub fn from_message(message: &StorageEntryMessage) -> Self {
         // 计算当前时间戳，避免在每个分支重复计算
         let create_at = SystemTime::now()
@@ -339,14 +339,14 @@ impl IncrementalStorageEntryRecord {
                 file_handle: None,
                 version_id: String::new(),
                 create_at,
-                comment: Some(format!("[{}] {}", event, reason)),
+                comment: Some(format!("[{event}] {reason}")),
                 tags: None,
                 version_count: None,
             },
         }
     }
 
-    /// 从EntryEnum和操作类型创建IncrementalStorageEntryRecord的辅助方法
+    /// 从 `EntryEnum` 和操作类型创建 `IncrementalStorageEntryRecord` 的辅助方法
     ///
     /// # 参数
     /// - `entry`: 存储条目对象（NAS或S3）
@@ -355,10 +355,10 @@ impl IncrementalStorageEntryRecord {
     /// - `create_at`: 创建时间戳
     ///
     /// # 返回值
-    /// - 构建的IncrementalStorageEntryRecord对象
+    /// - 构建的 `IncrementalStorageEntryRecord` 对象
     fn from_entry(entry: &EntryEnum, operation_type: &str, comment: Option<String>, create_at: i64) -> Self {
         // 将Bytes转换为hex字符串
-        let file_handle = entry.get_file_handle().map(|bytes| hex::encode(bytes));
+        let file_handle = entry.get_file_handle().map(hex::encode);
 
         // 将Vec<Tag>转换为JSON字符串
         let tags = entry.get_tags().and_then(|tags| serde_json::to_string(tags).ok());
@@ -401,7 +401,7 @@ impl IncrementalStorageEntryRecord {
 /// 记录每个 .tar 文件内部包含的条目信息，兼容 NAS 和 S3 条目
 #[derive(Debug, Clone, Serialize, Deserialize, clickhouse::Row)]
 pub struct TarManifestRecord {
-    /// .tar 文件的 relative_path
+    /// .tar 文件的 `relative_path`
     pub tar_path: String,
     /// tar 内条目的相对路径
     pub entry_path: String,
@@ -430,7 +430,7 @@ pub struct TarManifestRecord {
 }
 
 impl TarManifestRecord {
-    /// 从 EntryEnum 和 tar 路径创建 TarManifestRecord
+    /// 从 `EntryEnum` 和 tar 路径创建 `TarManifestRecord`
     pub fn from_entry(entry: &EntryEnum, tar_path: &str) -> Self {
         let storage_type = match entry {
             EntryEnum::NAS(_) => "nas",
@@ -520,7 +520,7 @@ pub trait Database: Send + Sync {
     /// 批量插入数据到主表
     ///
     /// # 参数
-    /// - `records`: EntryEnum切片
+    /// - `records`: `EntryEnum` 切片
     ///
     /// # 返回值
     /// - 成功返回Ok(())
@@ -530,7 +530,7 @@ pub trait Database: Send + Sync {
     /// 更新单个主表记录
     ///
     /// # 参数
-    /// - `record`: EntryEnum引用
+    /// - `record`: `EntryEnum` 引用
     ///
     /// # 返回值
     /// - 成功返回Ok(())
@@ -543,7 +543,7 @@ pub trait Database: Send + Sync {
     /// 批量插入临时表记录
     ///
     /// # 参数
-    /// - `records`: EntryEnum切片
+    /// - `records`: `EntryEnum` 切片
     ///
     /// # 返回值
     /// - 成功返回Ok(())
@@ -553,7 +553,7 @@ pub trait Database: Send + Sync {
     /// 批量插入增量记录
     ///
     /// # 参数
-    /// - `records`: StorageEntryMessage切片（来自storage_v2）
+    /// - `records`: `StorageEntryMessage` 切片（来自 `storage_v2`）
     ///
     /// # 返回值
     /// - 成功返回Ok(())
@@ -572,7 +572,7 @@ pub trait Database: Send + Sync {
     /// 即在临时表中存在但在主表中不存在的文件
     ///
     /// # 返回值
-    /// - 成功返回包含EntryEnum迭代器的Ok
+    /// - 成功返回包含 `EntryEnum` 迭代器的 `Ok`
     /// - 失败返回错误信息
     async fn detect_new_items(&self) -> Result<Box<dyn Iterator<Item = EntryEnum> + Send>>;
 
@@ -580,7 +580,7 @@ pub trait Database: Send + Sync {
     /// 即大小或修改时间发生变化的文件
     ///
     /// # 返回值
-    /// - 成功返回包含EntryEnum迭代器的Ok
+    /// - 成功返回包含 `EntryEnum` 迭代器的 `Ok`
     /// - 失败返回错误信息
     async fn detect_changed_items(&self) -> Result<Box<dyn Iterator<Item = EntryEnum> + Send>>;
 
@@ -588,16 +588,16 @@ pub trait Database: Send + Sync {
     /// 识别出待删除的文件后，立即在数据库中批量删除这些记录
     ///
     /// # 返回值
-    /// - 成功返回包含DeletionStatus迭代器的Ok
+    /// - 成功返回包含 `DeletionStatus` 迭代器的 `Ok`
     /// - 失败返回错误信息
     async fn detect_deleted_items(&self) -> Result<Box<dyn Iterator<Item = DeletionStatus> + Send>>;
 
     /// 将临时表中的记录合并到主表中，排除指定的路径
     ///
     /// # 参数
-    /// - `excluded_paths`: 需要排除的 (relative_path, version_id) 列表
-    ///   - 增量扫描（keep_item=true）：传空切片，全量插入
-    ///   - 增量拷贝（keep_item=false）：传 new+changed 的路径，仅插入 unchanged
+    /// - `excluded_paths`: 需要排除的 (`relative_path`, `version_id`) 列表
+    ///   - 增量扫描（`keep_item=true`）：传空切片，全量插入
+    ///   - 增量拷贝（`keep_item=false`）：传 new+changed 的路径，仅插入 unchanged
     ///
     /// # 返回值
     /// - 成功返回Ok(())
@@ -636,6 +636,17 @@ pub trait Database: Send + Sync {
 
     /// 批量插入 tar manifest 记录
     async fn batch_insert_tar_manifest(&self, records: &[TarManifestRecord]) -> Result<()>;
+
+    /// 检查指定表名是否存在
+    ///
+    /// # 参数
+    /// - `table_name`: 完整的表名（如 `base_my_job`）
+    ///
+    /// # 返回值
+    /// - `Ok(true)` 表存在
+    /// - `Ok(false)` 表不存在
+    /// - `Err(...)` 查询失败
+    async fn table_exists(&self, table_name: &str) -> Result<bool>;
 }
 
 /// 为Box<dyn Database>实现Clone trait

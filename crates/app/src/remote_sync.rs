@@ -77,7 +77,7 @@ pub(crate) async fn run(config: &SyncJobConfig, remote_addr: &str, tls_cert_byte
         .await?;
 
     // ── 4. QoS 管理器 + checkpoint 加载 ──
-    let qos_manager = create_qos_manager(&config.qos, config.peak_qos_rate, config.iops);
+    let qos_manager = create_qos_manager(config.qos.as_ref(), config.peak_qos_rate, config.iops);
     let checkpoint_path = std::path::PathBuf::from(&config.job_dir).join("remote_checkpoint.json");
     let mut completed_paths = load_checkpoint(&checkpoint_path).await;
     if !completed_paths.is_empty() {

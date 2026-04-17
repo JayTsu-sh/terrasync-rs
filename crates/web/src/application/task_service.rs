@@ -79,20 +79,20 @@ impl TaskService {
 
         // Sync 和 IntegrityCheck 需要目标端点
         if req.task_type != TaskType::Scan {
-            let dep_id = req.dest_endpoint_id.as_ref().ok_or_else(|| {
+            let dest_ep_id = req.dest_endpoint_id.as_ref().ok_or_else(|| {
                 WebError::ValidationError("Destination endpoint is required for sync/integrity_check".to_string())
             })?;
-            let dp_id = req.dest_path_id.as_ref().ok_or_else(|| {
+            let dest_path_id = req.dest_path_id.as_ref().ok_or_else(|| {
                 WebError::ValidationError("Destination path is required for sync/integrity_check".to_string())
             })?;
             self.endpoint_repo
-                .find_by_id(dep_id)
+                .find_by_id(dest_ep_id)
                 .await?
-                .ok_or_else(|| WebError::EndpointNotFound(dep_id.clone()))?;
+                .ok_or_else(|| WebError::EndpointNotFound(dest_ep_id.clone()))?;
             self.path_repo
-                .find_by_id(dp_id)
+                .find_by_id(dest_path_id)
                 .await?
-                .ok_or_else(|| WebError::PathNotFound(dp_id.clone()))?;
+                .ok_or_else(|| WebError::PathNotFound(dest_path_id.clone()))?;
         }
 
         let task = MigrationTask {
@@ -141,14 +141,14 @@ impl TaskService {
         }
 
         if let Some(source_path_id) = req.source_path_id {
-            if !source_path_id.is_empty() {
+            if source_path_id.is_empty() {
+                task.source_path_id = None;
+            } else {
                 self.path_repo
                     .find_by_id(&source_path_id)
                     .await?
                     .ok_or_else(|| WebError::PathNotFound(source_path_id.clone()))?;
                 task.source_path_id = Some(source_path_id);
-            } else {
-                task.source_path_id = None;
             }
         }
 
@@ -166,7 +166,7 @@ impl TaskService {
     }
 
     pub async fn cancel_task(&self, id: &str) -> Result<()> {
-        self.task_runner.cancel_task(id).await?;
+        self.task_runner.cancel_task(id)?;
         self.task_repo.update_status(id, TaskStatus::Cancelled, None).await
     }
 
@@ -278,13 +278,13 @@ impl TaskService {
         Ok(())
     }
 
-    /// 从 SQLite 读取任务进度
+    /// 从 `SQLite` 读取任务进度
     pub async fn get_progress(&self, task_id: &str) -> Result<Option<TaskProgress>> {
         self.progress_repo.find_by_task_id(task_id).await
     }
 }
 
-/// 从 ProgressReport 提取 ExecutionStats，供写入执行记录
+/// 从 `ProgressReport` 提取 `ExecutionStats`，供写入执行记录
 fn execution_stats_from_report(report: &ProgressReport) -> ExecutionStats {
     match &report.detail {
         ProgressDetail::Full {

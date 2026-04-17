@@ -11,13 +11,12 @@
 // 标准库
 use std::fs;
 use std::net::SocketAddr;
-use std::path::Path;
 use std::sync::Arc;
 
 // 外部crate
 use app::config::SyncJobConfig;
 use app::orchestrator::SyncOrchestrator;
-use app::prelude::{ScanType, incremental_sync, integrity_check, parse_bandwidth_string, rm, scan, sync};
+use app::prelude::{integrity_check, parse_bandwidth_string, rm, scan, sync};
 use storage_v2::create_storage_for_dest;
 use tracing::info;
 use transport::quic;
@@ -46,7 +45,7 @@ pub fn validate_qos_format(s: &str) -> Result<String> {
 }
 
 /// 校验并 trim 存储路径（本地 / nfs:// / s3:// / s3+http:// / s3+https:// / s3+hcp://）
-/// 参考 storage_v2/src/storage_enum.rs 和 storage_v2/src/s3.rs 中的协议解析逻辑
+/// 参考 `storage_v2/src/storage_enum.rs` 和 `storage_v2/src/s3.rs` 中的协议解析逻辑
 pub fn validate_storage_path(s: &str) -> Result<String> {
     let s = s.trim();
     if s.is_empty() {
@@ -55,8 +54,8 @@ pub fn validate_storage_path(s: &str) -> Result<String> {
     Ok(s.to_string())
 }
 
-/// 校验 block_size 格式（复用 parse_bandwidth_string 单位解析）
-/// 提前了 app/sync.rs 中 parse_size() 的格式校验部分
+/// 校验 `block_size` 格式（复用 `parse_bandwidth_string` 单位解析）
+/// 提前了 app/sync.rs 中 `parse_size()` 的格式校验部分
 pub fn validate_block_size(s: &str) -> Result<String> {
     match parse_bandwidth_string(s) {
         Ok(_) => Ok(s.to_string()),
@@ -66,7 +65,7 @@ pub fn validate_block_size(s: &str) -> Result<String> {
     }
 }
 
-/// 校验 peak_qos_rate 范围（必须 > 0）
+/// 校验 `peak_qos_rate` 范围（必须 > 0）
 pub fn validate_peak_qos_rate(s: &str) -> Result<f32> {
     let val: f32 = s
         .parse()
@@ -90,22 +89,21 @@ pub fn validate_iops(s: &str) -> Result<u32> {
 
 // ==================== 辅助函数 ====================
 
-/// 准备job目录（job_id 已由 cli_match 中的 resolve_job_id 确定）
+/// 准备job目录（`job_id` 已由 `cli_match` 中的 `resolve_job_id` 确定）
+///
+/// 返回 `(job_dir, pre_existing)`，其中 `pre_existing` 为 `true` 表示目录在
+/// 本次 `create_dir_all` 之前已经存在，用作 app 层判定 ScanType 的
+/// 文件系统 fallback 信号（数据库不可达时使用）。
+#[allow(clippy::similar_names)]
 fn prepare_job(job_type: &str, job_id: &str) -> Result<(String, bool)> {
     let jobs_dir = "jobs";
     fs::create_dir_all(jobs_dir)?;
 
-    // 构建job目录路径
-    let job_dir = format!("{}/{}_{}", jobs_dir, job_type, job_id);
-    let job_path_exists = Path::new(&job_dir).exists();
+    let job_dir = format!("{jobs_dir}/{job_type}_{job_id}");
+    let pre_existing = fs::metadata(&job_dir).is_ok();
+    fs::create_dir_all(&job_dir)?;
 
-    // 如果是全量操作，创建目录
-    if !job_path_exists {
-        fs::create_dir_all(&job_dir)?;
-        info!("Created job directory for full {}: {}", job_type, job_dir);
-    }
-
-    Ok((job_dir, job_path_exists))
+    Ok((job_dir, pre_existing))
 }
 
 // ==================== 命令处理函数 ====================
@@ -125,18 +123,12 @@ pub async fn scan_cmd(
     let effective_match = r#match.as_ref().or(config.scan.r#match.as_ref()).cloned();
     let effective_exclude = exclude.as_ref().or(config.scan.exclude.as_ref()).cloned();
 
-    let (job_dir, job_path_exists) = prepare_job("scan", job_id)?;
+    let (job_dir, job_dir_pre_existing) = prepare_job("scan", job_id)?;
 
-    // 确定扫描类型
-    let scan_type = if job_path_exists {
-        ScanType::Incremental
-    } else {
-        ScanType::Full
-    };
     scan(
         job_id.to_string(),
         job_dir,
-        scan_type,
+        job_dir_pre_existing,
         path,
         effective_depth,
         &effective_match,
@@ -151,6 +143,7 @@ pub async fn scan_cmd(
 }
 
 /// 处理复制命令
+#[allow(clippy::too_many_arguments)]
 pub async fn sync_cmd(
     job_id: &str, src_path: &Option<String>, dest_path: &Option<String>, enable_integrity_check: bool,
     enable_acl: bool, r#match: &Option<String>, exclude: &Option<String>, qos: &Option<String>, peak_qos_rate: f32,
@@ -173,7 +166,7 @@ pub async fn sync_cmd(
     let effective_match = r#match.as_ref().or(config.scan.r#match.as_ref()).cloned();
     let effective_exclude = exclude.as_ref().or(config.scan.exclude.as_ref()).cloned();
     let effective_qos = qos.as_ref().or(config.sync.qos.as_ref()).cloned();
-    let effective_peak_qos_rate = if peak_qos_rate != 2.0 {
+    let effective_peak_qos_rate = if (peak_qos_rate - 2.0_f32).abs() > f32::EPSILON {
         peak_qos_rate
     } else {
         config.sync.peak_qos_rate.unwrap_or(2.0)
@@ -185,14 +178,7 @@ pub async fn sync_cmd(
         info!("Remote mode enabled, connecting to Receiver at {}", addr);
     }
 
-    let (job_dir, job_path_exists) = prepare_job("replicate", job_id)?;
-
-    // 确定同步类型
-    let scan_type = if job_path_exists {
-        ScanType::Incremental
-    } else {
-        ScanType::Full
-    };
+    let (job_dir, job_dir_pre_existing) = prepare_job("replicate", job_id)?;
 
     let src_path_str = src_path
         .as_ref()
@@ -214,8 +200,7 @@ pub async fn sync_cmd(
                 }
                 Err(e) => {
                     return Err(CliError::InvalidParameter(format!(
-                        "Failed to read TLS server cert '{}': {}",
-                        path, e
+                        "Failed to read TLS server cert '{path}': {e}"
                     )));
                 }
             },
@@ -225,11 +210,11 @@ pub async fn sync_cmd(
         let config = SyncJobConfig {
             job_id: job_id.to_string(),
             job_dir,
+            job_dir_pre_existing,
             src_path: src_path_str.to_string(),
             dest_path: dest_path_str.to_string(),
             enable_integrity_check: effective_enable_integrity_check,
             enable_acl: effective_enable_acl,
-            scan_type,
             r#match: effective_match,
             exclude: effective_exclude,
             qos: effective_qos,
@@ -248,54 +233,28 @@ pub async fn sync_cmd(
             .map_err(CliError::AppError);
     }
 
-    match scan_type {
-        ScanType::Incremental => {
-            info!("Starting incremental replicate");
-            incremental_sync(
-                job_id.to_string(),
-                job_dir,
-                src_path_str,
-                dest_path_str,
-                effective_enable_integrity_check,
-                effective_enable_acl,
-                scan_type,
-                &effective_match,
-                &effective_exclude,
-                &effective_qos,
-                effective_peak_qos_rate,
-                &effective_block_size,
-                iops,
-                packaged,
-                package_depth.unwrap_or(0),
-                raw_command_line,
-                None,
-            )
-            .await?;
-        }
-        ScanType::Full => {
-            sync(
-                job_id.to_string(),
-                job_dir,
-                src_path_str,
-                dest_path_str,
-                effective_enable_integrity_check,
-                effective_enable_acl,
-                scan_type,
-                &effective_match,
-                &effective_exclude,
-                &effective_qos,
-                effective_peak_qos_rate,
-                &effective_block_size,
-                file_list,
-                iops,
-                packaged,
-                package_depth.unwrap_or(0),
-                raw_command_line,
-                None,
-            )
-            .await?;
-        }
-    }
+    // ScanType 由 app 层自动判定（查数据库 base 表，fallback 文件系统）
+    sync(
+        job_id.to_string(),
+        job_dir,
+        job_dir_pre_existing,
+        src_path_str,
+        dest_path_str,
+        effective_enable_integrity_check,
+        effective_enable_acl,
+        &effective_match,
+        &effective_exclude,
+        &effective_qos,
+        effective_peak_qos_rate,
+        &effective_block_size,
+        file_list,
+        iops,
+        packaged,
+        package_depth.unwrap_or(0),
+        raw_command_line,
+        None,
+    )
+    .await?;
 
     Ok(())
 }
@@ -303,7 +262,7 @@ pub async fn sync_cmd(
 /// Show the configuration file
 pub fn config() -> Result<()> {
     let config = AppConfig::fetch()?;
-    println!("{:#?}", config);
+    println!("{config:#?}");
 
     Ok(())
 }
@@ -314,7 +273,7 @@ pub async fn ace_list_cmd(
     job_id: &str, path: &str, owner: &Option<String>, depth: u32, r#match: &Option<String>, exclude: &Option<String>,
     include_inherited: bool, raw_command_line: String,
 ) -> Result<()> {
-    let (_, _) = prepare_job("scan_ace", job_id)?;
+    let (_job_dir, _pre_existing) = prepare_job("scan_ace", job_id)?;
     let log_path = logger::get_current_app_log_path();
 
     println!("Command: {}", raw_command_line);
@@ -336,7 +295,7 @@ pub async fn ace_copy_cmd(
     job_id: &str, source_path: &str, target_path: &str, depth: u32, r#match: &Option<String>, exclude: &Option<String>,
     raw_command_line: String,
 ) -> Result<()> {
-    let (_, _) = prepare_job("copy_ace", job_id)?;
+    let (_job_dir, _pre_existing) = prepare_job("copy_ace", job_id)?;
     let log_path = logger::get_current_app_log_path();
 
     println!("Command: {}", raw_command_line);
@@ -365,7 +324,7 @@ pub async fn rm_cmd(path: &str) -> Result<()> {
 pub async fn integrity_check_cmd(
     job_id: &str, src_path: &str, dest_path: &str, quick: bool, auto_fix: bool, raw_command_line: String,
 ) -> Result<()> {
-    let (job_dir, _) = prepare_job("integrity_check", job_id)?;
+    let (job_dir, _pre_existing) = prepare_job("integrity_check", job_id)?;
 
     info!(
         "执行完整性检查命令，源路径: {}, 目标路径: {}, 快速模式: {}, 自动修复: {}",
@@ -405,7 +364,7 @@ pub async fn serve_cmd(listen: &str, dest_path: &str, tls_cert_out: &str) -> Res
     // 1. 解析监听地址
     let listen_addr: SocketAddr = listen
         .parse()
-        .map_err(|e| CliError::InvalidParameter(format!("Invalid listen address: {}", e)))?;
+        .map_err(|e| CliError::InvalidParameter(format!("Invalid listen address: {e}")))?;
 
     // 3. 创建目标端 StorageEnum
     let dest_storage = Arc::new(create_storage_for_dest(dest_path, None).await?);

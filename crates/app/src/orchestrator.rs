@@ -27,7 +27,7 @@ impl Drop for AtomicCounterGuard<'_> {
 // 外部 crate
 use dashmap::DashMap;
 use db::factory::DatabaseFactory;
-use db::{DeletionStatus, INCREMENTAL_SCAN_TABLE_BASE_NAME};
+use db::{self, DeletionStatus, INCREMENTAL_SCAN_TABLE_BASE_NAME};
 use storage_v2::error::StorageError;
 use storage_v2::qos::QosManager;
 #[cfg(windows)]
@@ -48,7 +48,7 @@ use crate::consumer::ConsumerManager;
 use crate::consumer::stats::DirectoryMetadataProgressBar;
 use crate::error::{AppError, Result};
 use crate::receiver::{ReceiverConfig, process_entry_on_receiver};
-use crate::scan::{ScanType, batch_processing_to_generate_message};
+use crate::scan::{ScanType, batch_processing_to_generate_message, determine_scan_type};
 use crate::sender::{SenderWorkerConfig, sender_worker};
 #[cfg(windows)]
 use crate::sync::check_admin_privileges;
@@ -63,17 +63,17 @@ const BROADCAST_CHANNEL_CAPACITY: usize = 1000;
 /// 大文件日志阈值（512 MiB）
 const LARGE_FILE_LOG_THRESHOLD: u64 = 512 * 1024 * 1024;
 
-/// StoragePair 创建失败后的最大重试次数
+/// `StoragePair` 创建失败后的最大重试次数
 const STORAGE_PAIR_MAX_RETRIES: usize = 3;
 
-/// 同时创建 StoragePair（NFS mount）的最大并发数。
+/// 同时创建 `StoragePair`（NFS mount）的最大并发数。
 /// 设为 2：nfs-rs 在 Windows 上绑定特权端口（<1024）时，并发量过大会导致端口
-/// 竞争和 TIME_WAIT 积累，最终 WSAEADDRINUSE；限制并发可显著降低冲突概率。
+/// 竞争和 `TIME_WAIT` 积累，最终 WSAEADDRINUSE；限制并发可显著降低冲突概率。
 const STORAGE_PAIR_MOUNT_CONCURRENCY: usize = 2;
 
 /// 等待所有 worker 完成 mount 初始化，输出存活汇总
 ///
-/// 使用 countdown latch：每个 worker mount 完成（无论成功/失败）后 done_counter +1，
+/// 使用 countdown latch：每个 worker mount 完成（无论成功/失败）后 `done_counter` +1，
 /// 等到所有 pool 的 done 计数都达到 expected 后汇总。
 async fn wait_for_mount_init(pools: &[(&AtomicUsize, &AtomicUsize, &str)], expected: usize) {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
@@ -101,7 +101,7 @@ async fn wait_for_mount_init(pools: &[(&AtomicUsize, &AtomicUsize, &str)], expec
     }
 }
 
-/// 带限流和退避重试的 StoragePair 创建
+/// 带限流和退避重试的 `StoragePair` 创建
 ///
 /// 通过 semaphore 限制同时进行 NFS mount 的并发数，
 /// 失败时指数退避重试，避免 portmapper 被突发请求打满。
@@ -111,7 +111,7 @@ async fn create_storage_pair_with_retry(
     let mut last_error = None;
 
     for attempt in 0..=STORAGE_PAIR_MAX_RETRIES {
-        let _permit = semaphore
+        let permit = semaphore
             .acquire()
             .await
             .map_err(|_| AppError::ConfigError("Mount semaphore closed".to_string()))?;
@@ -136,7 +136,7 @@ async fn create_storage_pair_with_retry(
                 );
                 last_error = Some(e);
                 // 显式释放 permit 后再进入退避等待，避免退避期间占用 mount 槽位
-                drop(_permit);
+                drop(permit);
 
                 if attempt < STORAGE_PAIR_MAX_RETRIES {
                     // 使用较长的退避：nfs-rs 绑定特权端口失败后端口进入 TIME_WAIT，
@@ -150,16 +150,15 @@ async fn create_storage_pair_with_retry(
     }
 
     Err(last_error.unwrap_or_else(|| {
-        AppError::ConfigError(format!("{}: StoragePair creation exhausted all retries", worker_label))
+        AppError::ConfigError(format!("{worker_label}: StoragePair creation exhausted all retries"))
     }))
 }
 
 /// Sync 编排器
 ///
-/// 统一管理 sync 和 incremental_sync 的执行流程。
-/// 单进程模式下通过 InProcessTransport 连接 sender 和 receiver task。
+/// 统一管理 sync 和 `incremental_sync` 的执行流程。
+/// 单进程模式下通过 `InProcessTransport` 连接 sender 和 receiver task。
 /// 双进程模式下通过 QUIC Transport 连接远端 Receiver（Phase 3）。
-
 /// Sync 模式
 enum SyncMode {
     /// 单进程：src+dest 在同一进程
@@ -201,8 +200,19 @@ impl SyncOrchestrator {
     }
 
     /// 执行 sync 管线
+    ///
+    /// `ScanType` 自动判定：查数据库 base 表是否存在，失败 fallback 到文件系统。
     pub async fn run(&self) -> Result<()> {
-        match (&self.mode, self.config.scan_type) {
+        // 自动判定 ScanType
+        let c = &self.config;
+        let app_config = AppConfig::fetch()?;
+        let db_config = db::config::DatabaseConfig::from_app_config(&app_config.database);
+        let db_instance = DatabaseFactory::new_database(&db_config, &c.job_id).await.ok();
+        let scan_type = determine_scan_type(db_instance.as_deref(), &c.job_id, c.job_dir_pre_existing).await;
+
+        info!("SyncOrchestrator: determined scan_type={}", scan_type);
+
+        match (&self.mode, scan_type) {
             (SyncMode::Local, ScanType::Full) => self.run_sync().await,
             (SyncMode::Local, ScanType::Incremental) => self.run_incremental_sync().await,
             (
@@ -249,7 +259,7 @@ impl SyncOrchestrator {
             &c.job_id,
             &c.src_path,
             0,
-            c.scan_type,
+            ScanType::Full,
             &c.r#match,
             &c.exclude,
             app_config.scan.concurrency,
@@ -302,7 +312,7 @@ impl SyncOrchestrator {
             }
         }
 
-        let qos_manager = create_qos_manager(&c.qos, c.peak_qos_rate, c.iops);
+        let qos_manager = create_qos_manager(c.qos.as_ref(), c.peak_qos_rate, c.iops);
 
         // ── 6. 原子计数器 + 统计 reporter ──
         let active_entry_counter = Arc::new(AtomicUsize::new(0));
@@ -321,7 +331,7 @@ impl SyncOrchestrator {
         // ── 7. 启动 walkdir ──
         let walkdir_iter = dir_walker::walkdir(scan_config)
             .await
-            .map_err(|e| AppError::ScanError(format!("Start directory walker failed: {}", e)))?;
+            .map_err(|e| AppError::ScanError(format!("Start directory walker failed: {e}")))?;
 
         // ── 8. 创建 Transport ──
         let (sender_transport, receiver_transport) = create_in_process_pair();
@@ -347,7 +357,7 @@ impl SyncOrchestrator {
             let rt = receiver_transport.clone();
             let src_path = c.src_path.clone();
             let dest_path = c.dest_path.clone();
-            let block_size = block_size;
+
             let cfg = receiver_config.clone();
             let qos = qos_manager.clone();
             let bt = bytes_tracker.clone();
@@ -366,7 +376,7 @@ impl SyncOrchestrator {
                         &src_path,
                         &dest_path,
                         block_size,
-                        &format!("Receiver {}", recv_id),
+                        &format!("Receiver {recv_id}"),
                     )
                     .await
                     {
@@ -406,7 +416,7 @@ impl SyncOrchestrator {
                                         bc.broadcast(StorageEntryMessage::Error {
                                             event: ErrorEvent::Copy,
                                             path: entry.get_relative_path().to_path_buf(),
-                                            reason: format!("{}", e),
+                                            reason: format!("{e}"),
                                         })
                                         .await;
                                     }
@@ -471,7 +481,7 @@ impl SyncOrchestrator {
                         &src_path,
                         &dest_path,
                         block_size,
-                        &format!("Sender {}", worker_id),
+                        &format!("Sender {worker_id}"),
                     )
                     .await
                     {
@@ -573,7 +583,7 @@ impl SyncOrchestrator {
             &c.job_id,
             &c.src_path,
             0,
-            c.scan_type,
+            ScanType::Incremental,
             &c.r#match,
             &c.exclude,
             app_config.scan.concurrency,
@@ -649,7 +659,7 @@ impl SyncOrchestrator {
         }
 
         // ── 8. QoS + 版本化对象缓冲 ──
-        let qos_manager = create_qos_manager(&c.qos, c.peak_qos_rate, c.iops);
+        let qos_manager = create_qos_manager(c.qos.as_ref(), c.peak_qos_rate, c.iops);
         let object_buffers: Arc<DashMap<String, Vec<Arc<EntryEnum>>>> = Arc::new(DashMap::new());
 
         // ── 9. 切换数据库扫描状态 ──
@@ -706,7 +716,7 @@ impl SyncOrchestrator {
                         &src_path_c,
                         &dest_path_c,
                         block_size,
-                        &format!("Handler {}", handler_id),
+                        &format!("Handler {handler_id}"),
                     )
                     .await
                     {
@@ -756,7 +766,7 @@ impl SyncOrchestrator {
                                     )
                                     .await
                                     {
-                                        Ok(_) => bc.broadcast(message.clone()).await,
+                                        Ok(()) => bc.broadcast(message.clone()).await,
                                         Err(e) => {
                                             error!(
                                                 "Handler {}: Failed to process new entry {:?}: {}",
@@ -767,7 +777,7 @@ impl SyncOrchestrator {
                                             bc.broadcast(StorageEntryMessage::Error {
                                                 event: ErrorEvent::Copy,
                                                 path: entry.get_relative_path().to_path_buf(),
-                                                reason: format!("{}", e),
+                                                reason: format!("{e}"),
                                             })
                                             .await;
                                         }
@@ -788,7 +798,7 @@ impl SyncOrchestrator {
                                 )
                                 .await
                                 {
-                                    Ok(_) => bc.broadcast(message.clone()).await,
+                                    Ok(()) => bc.broadcast(message.clone()).await,
                                     Err(e) => {
                                         error!(
                                             "Handler {}: Failed to process changed entry {:?}: {}",
@@ -799,7 +809,7 @@ impl SyncOrchestrator {
                                         bc.broadcast(StorageEntryMessage::Error {
                                             event: ErrorEvent::Copy,
                                             path: entry.get_relative_path().to_path_buf(),
-                                            reason: format!("{}", e),
+                                            reason: format!("{e}"),
                                         })
                                         .await;
                                     }
@@ -807,15 +817,15 @@ impl SyncOrchestrator {
                             }
                             StorageEntryMessage::Deleted(ref entry) => {
                                 // 删除操作幂等化：NotFound 视为成功
-                                let result = if !entry.get_is_dir() {
-                                    trace!("Deleting file: {:?}", entry.get_relative_path());
-                                    dest.delete_file(entry).await
-                                } else {
+                                let result = if entry.get_is_dir() {
                                     trace!("Deleting directory: {:?}", entry.get_relative_path());
                                     dest.delete_dir_all(entry).await
+                                } else {
+                                    trace!("Deleting file: {:?}", entry.get_relative_path());
+                                    dest.delete_file(entry).await
                                 };
                                 match result {
-                                    Ok(_) => bc.broadcast(message.clone()).await,
+                                    Ok(()) => bc.broadcast(message.clone()).await,
                                     Err(StorageError::FileNotFound(_) | StorageError::DirectoryNotFound(_)) => {
                                         trace!("Already deleted, skipping: {:?}", entry.get_relative_path());
                                         bc.broadcast(message.clone()).await;
@@ -830,14 +840,17 @@ impl SyncOrchestrator {
                                         bc.broadcast(StorageEntryMessage::Error {
                                             event: ErrorEvent::Delete,
                                             path: entry.get_relative_path().to_path_buf(),
-                                            reason: format!("{}", e),
+                                            reason: format!("{e}"),
                                         })
                                         .await;
                                     }
                                 }
                             }
                             StorageEntryMessage::Renamed((ref from_entry, ref to_entry)) => {
-                                if from_entry.get_name() != to_entry.get_name() {
+                                if from_entry.get_name() == to_entry.get_name() {
+                                    // 同名 rename（父目录移动）：直接广播
+                                    bc.broadcast(message.clone()).await;
+                                } else {
                                     match process_rename_entry(
                                         from_entry.clone(),
                                         to_entry.clone(),
@@ -847,7 +860,7 @@ impl SyncOrchestrator {
                                     )
                                     .await
                                     {
-                                        Ok(_) => bc.broadcast(message.clone()).await,
+                                        Ok(()) => bc.broadcast(message.clone()).await,
                                         Err(e) => {
                                             error!(
                                                 "Handler {}: Failed to rename {:?} to {:?}: {}",
@@ -859,14 +872,11 @@ impl SyncOrchestrator {
                                             bc.broadcast(StorageEntryMessage::Error {
                                                 event: ErrorEvent::Rename,
                                                 path: to_entry.get_relative_path().to_path_buf(),
-                                                reason: format!("{}", e),
+                                                reason: format!("{e}"),
                                             })
                                             .await;
                                         }
                                     }
-                                } else {
-                                    // 同名 rename（父目录移动）：直接广播
-                                    bc.broadcast(message.clone()).await;
                                 }
                             }
                             StorageEntryMessage::Packaged(ref entry) => {
@@ -901,7 +911,7 @@ impl SyncOrchestrator {
                                         bc.broadcast(StorageEntryMessage::Error {
                                             event: ErrorEvent::Pack,
                                             path: entry.get_relative_path().to_path_buf(),
-                                            reason: format!("{}", e),
+                                            reason: format!("{e}"),
                                         })
                                         .await;
                                     }
@@ -928,7 +938,7 @@ impl SyncOrchestrator {
         // ── 12. 启动 walkdir ──
         let walkdir_iter = dir_walker::walkdir(scan_config)
             .await
-            .map_err(|e| AppError::ScanError(format!("Start directory walker failed: {}", e)))?;
+            .map_err(|e| AppError::ScanError(format!("Start directory walker failed: {e}")))?;
 
         // ── 13. 启动 N 个 scan worker（walkdir → batch → DB compare → detect_broadcaster） ──
         let database_clone = database.clone();
@@ -1030,7 +1040,7 @@ impl SyncOrchestrator {
                         }
                         DeletionStatus::Renamed(from, to) => {
                             detect_broadcaster
-                                .broadcast(StorageEntryMessage::Renamed((Arc::new(from), Arc::new(to))))
+                                .broadcast(StorageEntryMessage::Renamed((Arc::new(from), Arc::new(*to))))
                                 .await;
                         }
                     }
@@ -1077,7 +1087,7 @@ impl SyncOrchestrator {
         Ok(())
     }
 
-    /// 双进程全量同步 — Sender 侧：walkdir_2 分页 → QUIC → Receiver 比较 + 写入
+    /// 双进程全量同步 — Sender 侧：`walkdir_2` 分页 → QUIC → Receiver 比较 + 写入
     async fn run_sync_remote(&self, remote_addr: &str, tls_cert_bytes: Option<&[u8]>) -> Result<()> {
         crate::remote_sync::run(&self.config, remote_addr, tls_cert_bytes).await
     }
@@ -1120,13 +1130,13 @@ impl SyncOrchestrator {
                     let count = entry_counter.swap(0, Ordering::Relaxed);
                     let total_size = size_counter.swap(0, Ordering::Relaxed);
                     let active_tasks = active_tokio_task_counter.load(Ordering::Relaxed);
-                    if active_tasks != copy_concurrency {
-                        warn!(
+                    if active_tasks == copy_concurrency {
+                        info!(
                             "Processed {} entries ({} bytes) in 10s, active_tasks: {}, active_entries: {}",
                             count, total_size, active_tasks, active_entries
                         );
                     } else {
-                        info!(
+                        warn!(
                             "Processed {} entries ({} bytes) in 10s, active_tasks: {}, active_entries: {}",
                             count, total_size, active_tasks, active_entries
                         );
@@ -1147,7 +1157,7 @@ impl SyncOrchestrator {
         tokio::spawn(
             async move {
                 if let Err(e) = database.query_storage_entry(Some(true), None, None, dir_tx).await {
-                    eprintln!("Failed to query storage entries: {:?}", e);
+                    eprintln!("Failed to query storage entries: {e:?}");
                 }
                 info!("Query all directories completed");
             }
@@ -1173,8 +1183,8 @@ impl SyncOrchestrator {
     }
 }
 
-/// 创建 QoS 管理器（crate 内共享，供 orchestrator 和 remote_sync 调用）
-pub(crate) fn create_qos_manager(qos: &Option<String>, peak_qos_rate: f32, iops: Option<u32>) -> Option<QosManager> {
+/// 创建 `QoS` 管理器（crate 内共享，供 orchestrator 和 `remote_sync` 调用）
+pub(crate) fn create_qos_manager(qos: Option<&String>, peak_qos_rate: f32, iops: Option<u32>) -> Option<QosManager> {
     match qos {
         Some(qos_str) => match QosManager::try_new(Some(qos_str), peak_qos_rate, iops) {
             Ok(mgr) => Some(mgr),

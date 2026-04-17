@@ -78,7 +78,7 @@ impl DatabaseFactory {
                     .ok_or_else(|| DatabaseError::ConfigError("ClickHouse configuration missing".to_owned()))?;
 
                 // 创建ClickHouse数据库实例
-                let db = ClickHouseDatabase::new(clickhouse_config.clone(), job_id);
+                let db = ClickHouseDatabase::new(clickhouse_config, job_id);
                 Box::new(db) as Box<dyn Database>
             }
             #[cfg(feature = "duckdb")]
@@ -123,7 +123,7 @@ fn register_builtin_types(registry: &DashMap<String, DatabaseCreator>) {
             .as_ref()
             .ok_or_else(|| DatabaseError::ConfigError("ClickHouse configuration missing".to_string()))?;
 
-        let db = ClickHouseDatabase::new(clickhouse_config.clone(), &job_id);
+        let db = ClickHouseDatabase::new(clickhouse_config, &job_id);
         Ok(Arc::new(db) as Arc<dyn Database>)
     });
 
