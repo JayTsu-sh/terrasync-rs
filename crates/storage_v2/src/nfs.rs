@@ -130,7 +130,17 @@ const MAX_MOUNT_PORT_ATTEMPTS: u32 = 3;
 /// mount 内层重试的初始等待时间（毫秒），指数退避：1s、2s
 const MOUNT_PORT_RETRY_INITIAL_MS: u64 = 1000;
 
-/// 检查 NFS 错误是否为可重试的错误
+/// 检查 NFS 错误是否为 NOENT（路径不存在）
+fn is_nfs_noent(err: &NfsError) -> bool {
+    match err {
+        NfsError::Nfs3(code) => matches!(code, nfs_rs::Nfs3ErrorCode::NFS3ERR_NOENT),
+        NfsError::Nfs4(code) => matches!(code, nfs_rs::Nfs4ErrorCode::NFS4ERR_NOENT),
+        NfsError::Mount(code) => matches!(code, nfs_rs::Nfs3MountErrorCode::MNT3ERR_NOENT),
+        NfsError::Io(io_err) => io_err.kind() == std::io::ErrorKind::NotFound,
+        _ => false,
+    }
+}
+
 /// 直接匹配 `nfs_rs::NfsError` 的枚举变体，避免字符串解析
 /// 包括：
 /// - `NFS3ERR_STALE`: 文件句柄失效 ("NFS3 error: invalid file handle")
@@ -671,6 +681,13 @@ impl NFSStorage {
                         invalidate_path_cache(&components, &root_fh);
                         return Box::pin(self.lookup_fh_inner(relative_path, retries + 1)).await;
                     }
+                    // NOENT 重试耗尽：路径组件确实不存在，返回 DirectoryNotFound
+                    // 这使 delete_file/delete_symlink 的调用方可将其视为幂等成功
+                    if is_nfs_noent(&e) {
+                        return Err(StorageError::DirectoryNotFound(format!(
+                            "Directory '{dirname}' not found: {e}"
+                        )));
+                    }
                     return Err(StorageError::NfsError(format!(
                         "Failed to lookup directory {dirname}: {e}"
                     )));
@@ -1192,7 +1209,7 @@ impl NFSStorage {
                 let _ = h.await;
             }
 
-            // 3. 目录按深度降序排序 → 逐个删除
+            // 3. 目录按深度降序排序 → 逐个删除（子目录）
             dir_paths.sort_by(|a, b| b.1.cmp(&a.1));
             for (path, _) in dir_paths {
                 if let Err(e) = storage.delete_dir(&path).await {
@@ -1201,6 +1218,19 @@ impl NFSStorage {
                     let _ = tx
                         .send(DeleteEvent {
                             relative_path: path,
+                            is_dir: true,
+                        })
+                        .await;
+                }
+            }
+            // 4. 删除根目录本身（walkdir 只返回其内容，不含根目录自身）
+            if let Some(root) = sub_path {
+                if let Err(e) = storage.delete_dir(&root).await {
+                    error!("Failed to delete root dir {:?}: {:?}", root, e);
+                } else {
+                    let _ = tx
+                        .send(DeleteEvent {
+                            relative_path: root,
                             is_dir: true,
                         })
                         .await;

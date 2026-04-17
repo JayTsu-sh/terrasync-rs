@@ -473,12 +473,67 @@ pub(crate) async fn process_versioned_entry(
     }.instrument(span)));
 }
 
-#[allow(clippy::too_many_arguments)]
+/// `process_entry` / `process_entry_inner` 的标志位组合
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct ProcessEntryOpts {
+    pub enable_integrity_check: bool,
+    pub enable_acl: bool,
+    pub is_source_reserved: bool,
+    /// 仅同步元数据（chmod/chown 场景），跳过 `copy_file`
+    pub skip_data_copy: bool,
+}
+
 pub(crate) async fn process_entry(
     entry: &EntryEnum, src_storage: Arc<StorageEnum>, dest_storage: Arc<StorageEnum>, enable_integrity_check: bool,
     enable_acl: bool, is_source_reserved: bool, qos_manager: Option<QosManager>, bytes_counter: Option<Arc<AtomicU64>>,
     broadcaster: &BroadcastForwarder<StorageEntryMessage>,
 ) -> Result<()> {
+    let opts = ProcessEntryOpts {
+        enable_integrity_check,
+        enable_acl,
+        is_source_reserved,
+        skip_data_copy: false,
+    };
+    process_entry_inner(
+        entry,
+        src_storage,
+        dest_storage,
+        opts,
+        qos_manager,
+        bytes_counter,
+        broadcaster,
+    )
+    .await
+}
+
+/// 仅同步元数据：mode/uid/gid 变了但 size/mtime 未变（chmod/chown），跳过 `copy_file` 以节省带宽。
+///
+/// 目录 / symlink 行为与 `process_entry` 完全一致；普通文件跳过 `copy_file`，
+/// 仍执行 `set_entry_metadata` + ACL / xattr 复制。
+pub(crate) async fn process_metadata_only_entry(
+    entry: &EntryEnum, src_storage: Arc<StorageEnum>, dest_storage: Arc<StorageEnum>, enable_acl: bool,
+    is_source_reserved: bool, broadcaster: &BroadcastForwarder<StorageEntryMessage>,
+) -> Result<()> {
+    let opts = ProcessEntryOpts {
+        enable_integrity_check: false,
+        enable_acl,
+        is_source_reserved,
+        skip_data_copy: true,
+    };
+    process_entry_inner(entry, src_storage, dest_storage, opts, None, None, broadcaster).await
+}
+
+async fn process_entry_inner(
+    entry: &EntryEnum, src_storage: Arc<StorageEnum>, dest_storage: Arc<StorageEnum>, opts: ProcessEntryOpts,
+    qos_manager: Option<QosManager>, bytes_counter: Option<Arc<AtomicU64>>,
+    broadcaster: &BroadcastForwarder<StorageEntryMessage>,
+) -> Result<()> {
+    let ProcessEntryOpts {
+        enable_integrity_check,
+        enable_acl,
+        is_source_reserved,
+        skip_data_copy,
+    } = opts;
     let relative_path = entry.get_relative_path();
     let span = info_span!("process_entry", path = %relative_path.display());
 
@@ -538,6 +593,13 @@ pub(crate) async fn process_entry(
                     .await;
             }
         }
+    } else if skip_data_copy {
+        // MetadataOnly 变更：chmod/chown 导致 mode/uid/gid 变了但内容未变，跳过 copy_file
+        trace!("Skipping data copy (metadata-only change): {:?}", relative_path);
+        dest_storage
+            .set_entry_metadata(entry)
+            .await
+            .map_err(|e| AppError::CopyError(format!("Failed to set metadata for {}: {e}", relative_path.display())))?;
     } else {
         debug!("Copying file {:?}", relative_path);
 

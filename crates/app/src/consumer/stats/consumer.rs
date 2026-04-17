@@ -1,9 +1,9 @@
-//! `StatisticConsumer` ��� 统计消费者
+//! `StatisticConsumer` — 统计消费者
 //!
 //! 聚合 `accumulator`（累计统计）、`progress_bar`（终端进度条）、
 //! callback（HTTP 进度回调）三个关注点，对外提供统一的 API。
 //!
-//! callback 逻辑从原 manager.rs 移入此处，��� `ConsumerManager` 只负责���排。
+//! callback 逻辑从原 manager.rs 移入此处，`ConsumerManager` 只负责编排。
 
 // 标准库
 use std::sync::Arc;
@@ -24,28 +24,37 @@ use super::report::ProgressReport;
 const CALLBACK_INTERVAL_SECS: u64 = 2;
 
 /// 统计消费者 — 替代旧 `StatisticConsumer` + manager.rs 中的回调逻辑
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct StatisticConsumer {
     pub stats: StatsKind,
     pub progress_bar: ProgressBar,
     pub job_dir: String,
     pub callback_url: Option<String>,
+    /// progress bar display 线程句柄。
+    /// `start_progress_bar()` 启动线程时写入，`finalize()` join 以确保正常退出。
+    pub(crate) pb_handle: Option<std::thread::JoinHandle<()>>,
 }
 
 impl StatisticConsumer {
-    /// 启动终端进度条（后台线程），返回 `JoinHandle` 供 finalize 后 join
-    pub fn start_progress_bar(&self) -> std::thread::JoinHandle<()> {
-        self.progress_bar.start()
+    /// 启动终端进度条（后台线程），并将句柄保存在 `self.pb_handle` 中。
+    pub fn start_progress_bar(&mut self) {
+        self.pb_handle = Some(self.progress_bar.start());
     }
 
-    /// 结束进度条 + 打印最终统计
+    /// 结束进度条 + 打印最终统计 + join display 线程
     pub fn finalize(&mut self) {
         self.progress_bar.finish();
         println!("\n");
         println!("{}", self.stats);
+        // join display 线程：finish() 已标记进度条完成，线程会在下次循环检查时退出
+        if let Some(handle) = self.pb_handle.take() {
+            if let Err(e) = handle.join() {
+                error!("[ProgressBar] Display thread panicked: {e:?}");
+            }
+        }
     }
 
-    /// 更新累计统计 + 进度条原子计数���
+    /// 更新累计统计 + 进度条原子计数器
     pub fn update_statistics(&mut self, message: &StorageEntryMessage) {
         trace!("Updating statistics for message: {:?}", message);
         self.stats.update_from_message(message);
@@ -69,7 +78,7 @@ impl StatisticConsumer {
         report
     }
 
-    // ─── HTTP 回调（从 manager.rs ��入）���──
+    // ─── HTTP 回调（从 manager.rs 移入）───
 
     /// 构建共享的 HTTP 客户端（带超时），供回调循环和最终回调复用
     fn build_callback_client() -> Option<reqwest::Client> {
@@ -126,13 +135,16 @@ impl StatisticConsumer {
 
     /// 完整运行生命周期：进度条 → 回调循环 → 消息处理 → 停止回调 → 最终回调 → finalize
     ///
-    /// 将原来散落在 `ConsumerManager` 里的编排逻辑收归此处，ConsumerManager 只需
-    /// `tokio::spawn(StatisticConsumer::run(consumer, rx))` 即可。
-    pub async fn run(consumer: Arc<tokio::sync::Mutex<Self>>, mut rx: mpsc::Receiver<StorageEntryMessage>) {
-        let pb_handle = {
-            let c = consumer.lock().await;
-            c.start_progress_bar()
-        };
+    /// `defer_finalize=true` 时跳过 finalize（增量拷贝两阶段流水线中，由编排器在 Phase B
+    /// 完成后手动调用 `finalize()`，确保 Deleted/Renamed 统计合并进同一份报告）。
+    /// display 线程由 `finalize()` 负责 join，与 defer 模式下的生命周期完全对齐。
+    pub async fn run(
+        consumer: Arc<tokio::sync::Mutex<Self>>, mut rx: mpsc::Receiver<StorageEntryMessage>, defer_finalize: bool,
+    ) {
+        {
+            let mut c = consumer.lock().await;
+            c.start_progress_bar();
+        }
 
         let callback = Self::start_callback_loop(consumer.clone()).await;
 
@@ -153,15 +165,15 @@ impl StatisticConsumer {
 
         Self::send_final_callback(&consumer, shared_client.as_ref()).await;
 
-        {
+        if !defer_finalize {
+            // finalize() 内部：finish() → 打印报告 → join display 线程
             let mut c = consumer.lock().await;
             c.finalize();
         }
-
-        // 等待 display 线程退出（finish 已标记 pb 完成，线程会自然结束）
-        if let Err(e) = pb_handle.join() {
-            error!("[ProgressBar] Display thread panicked: {e:?}");
-        }
+        // defer_finalize=true：run() 直接返回，display 线程继续运行（Phase B 期间
+        // progress bar 仍可更新 Deleted/Renamed 计数）。
+        // 编排器在 Phase B 完成后调用 finalize_stats() → finalize()，
+        // finalize() 负责 finish() + join，确保正确退出。
     }
 
     /// 发送最终回调（`is_final=true`），在消息循环结束后调用

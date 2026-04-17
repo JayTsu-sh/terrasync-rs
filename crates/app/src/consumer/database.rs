@@ -140,8 +140,8 @@ impl Consumer for DatabaseConsumer {
                                 .await;
                             }
                         }
-                        StorageEntryMessage::Changed(entry) => {
-                            trace!(path = %entry.get_relative_path().display(), "db: changed entry");
+                        StorageEntryMessage::Changed { entry, kind } => {
+                            trace!(path = %entry.get_relative_path().display(), kind = %kind, "db: changed entry");
 
                             // 只有在增量拷贝场景才需要更新数据库里的记录
                             // 在增量扫描场景是不需要更新记录的,是因为在临时表导入主表时就已经更新了。
@@ -151,7 +151,7 @@ impl Consumer for DatabaseConsumer {
 
                             DatabaseConsumer::batch_insert_incremental_record(
                                 db.as_ref(),
-                                &StorageEntryMessage::Changed(entry),
+                                &StorageEntryMessage::Changed { entry, kind },
                                 &mut current_message_batch,
                                 batch_size,
                             )

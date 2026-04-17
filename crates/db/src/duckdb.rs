@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicU8, Ordering};
 // 外部crate
 use async_trait;
 use duckdb::{Connection, params};
-use storage_v2::{EntryEnum, StorageEntryMessage};
+use storage_v2::{ChangeKind, EntryEnum, StorageEntryMessage};
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, trace, warn};
 
@@ -75,23 +75,51 @@ impl DuckDBJoinStrategy {
 
     /// 构建 detect_changed_items 的 SQL（DuckDB 方言）
     ///
-    /// 注意：Path 模式和 FileHandle 模式的变更检测条件不对称，必须保留原有语义
-    fn build_detect_changed_sql(&self, temp: &str, base: &str) -> String {
+    /// 根据 `ChangeKind` 生成不同 WHERE 子句，三种 kind 互斥：
+    /// - `DataOnly`：size 或 mtime 变了；mode/uid/gid 均未变
+    /// - `MetadataOnly`：size + mtime 均未变；mode/uid/gid 至少一项变了（chmod/chown）
+    /// - `Both`：内容和属性都变了
+    ///
+    /// 注意：Path 模式保留原有的 `version_id = ''` 守卫，仅在空 version_id 时比较 mtime
+    fn build_detect_changed_sql(&self, temp: &str, base: &str, kind: ChangeKind) -> String {
+        let meta_changed = "(t.mode IS DISTINCT FROM f.mode OR t.uid IS DISTINCT FROM f.uid \
+                            OR t.gid IS DISTINCT FROM f.gid)";
+        let meta_unchanged = "(t.mode IS NOT DISTINCT FROM f.mode AND t.uid IS NOT DISTINCT FROM f.uid \
+                              AND t.gid IS NOT DISTINCT FROM f.gid)";
         match self {
-            Self::Path => format!(
-                "SELECT {cols} \
-                 FROM {temp} t JOIN {base} f ON t.relative_path = f.relative_path AND t.version_id = f.version_id \
-                 WHERE (t.size != f.size OR (t.version_id = '' AND t.mtime != f.mtime)) AND f.is_dir = 0 \
-                 ORDER BY t.relative_path, t.version_id",
-                cols = *FILE_SCAN_COLUMNS_LIST_WITH_T_PREFIX,
-            ),
-            Self::FileHandle => format!(
-                "SELECT {cols} \
-                 FROM {temp} t JOIN {base} f ON t.file_handle = f.file_handle AND t.version_id = f.version_id \
-                 WHERE (t.mtime != f.mtime OR t.size != f.size) AND f.is_dir = 0 \
-                 ORDER BY t.relative_path, t.version_id",
-                cols = *FILE_SCAN_COLUMNS_LIST_WITH_T_PREFIX,
-            ),
+            Self::Path => {
+                // Path 模式：version_id 非空时只比较 size；空 version_id（NAS 场景）时同时比 mtime
+                let data_changed = "(t.size != f.size OR (t.version_id = '' AND t.mtime != f.mtime))";
+                let data_unchanged = "(t.size = f.size AND (t.version_id != '' OR t.mtime = f.mtime))";
+                let kind_filter = match kind {
+                    ChangeKind::DataOnly => format!("{data_changed} AND {meta_unchanged}"),
+                    ChangeKind::MetadataOnly => format!("{data_unchanged} AND {meta_changed}"),
+                    ChangeKind::Both => format!("{data_changed} AND {meta_changed}"),
+                };
+                format!(
+                    "SELECT {cols} \
+                     FROM {temp} t JOIN {base} f ON t.relative_path = f.relative_path AND t.version_id = f.version_id \
+                     WHERE {kind_filter} AND f.is_dir = 0 \
+                     ORDER BY t.relative_path, t.version_id",
+                    cols = *FILE_SCAN_COLUMNS_LIST_WITH_T_PREFIX,
+                )
+            }
+            Self::FileHandle => {
+                let data_changed = "(t.mtime != f.mtime OR t.size != f.size)";
+                let data_unchanged = "(t.mtime = f.mtime AND t.size = f.size)";
+                let kind_filter = match kind {
+                    ChangeKind::DataOnly => format!("{data_changed} AND {meta_unchanged}"),
+                    ChangeKind::MetadataOnly => format!("{data_unchanged} AND {meta_changed}"),
+                    ChangeKind::Both => format!("{data_changed} AND {meta_changed}"),
+                };
+                format!(
+                    "SELECT {cols} \
+                     FROM {temp} t JOIN {base} f ON t.file_handle = f.file_handle AND t.version_id = f.version_id \
+                     WHERE {kind_filter} AND f.is_dir = 0 \
+                     ORDER BY t.relative_path, t.version_id",
+                    cols = *FILE_SCAN_COLUMNS_LIST_WITH_T_PREFIX,
+                )
+            }
         }
     }
 
@@ -1147,16 +1175,31 @@ impl Database for DuckDBDatabase {
         Ok(Box::new(entries.into_iter()))
     }
 
-    /// 查询在最新扫描中内容发生变更的文件
-    async fn detect_changed_items(&self) -> Result<Box<dyn Iterator<Item = EntryEnum> + Send>> {
-        let records = self
-            .detect_items("changed", |temp_table, base_table, strategy| {
-                strategy.build_detect_changed_sql(temp_table, base_table)
-            })
-            .await?;
+    /// 查询在最新扫描中发生变更的文件，按 `ChangeKind` 分三类返回
+    async fn detect_changed_items(&self) -> Result<Box<dyn Iterator<Item = (EntryEnum, ChangeKind)> + Send>> {
+        // 三类互斥条件的查询并发执行（DuckDB 每次 with_connection 新建连接，可安全并发）
+        let (data_only, metadata_only, both) = tokio::try_join!(
+            self.detect_items("changed(data)", |temp, base, strategy| {
+                strategy.build_detect_changed_sql(temp, base, ChangeKind::DataOnly)
+            }),
+            self.detect_items("changed(meta)", |temp, base, strategy| {
+                strategy.build_detect_changed_sql(temp, base, ChangeKind::MetadataOnly)
+            }),
+            self.detect_items("changed(both)", |temp, base, strategy| {
+                strategy.build_detect_changed_sql(temp, base, ChangeKind::Both)
+            }),
+        )?;
 
-        let entries: Vec<EntryEnum> = records.into_iter().map(|record| record.to_entry_enum()).collect();
-        Ok(Box::new(entries.into_iter()))
+        let iter = data_only
+            .into_iter()
+            .map(|r| (r.to_entry_enum(), ChangeKind::DataOnly))
+            .chain(
+                metadata_only
+                    .into_iter()
+                    .map(|r| (r.to_entry_enum(), ChangeKind::MetadataOnly)),
+            )
+            .chain(both.into_iter().map(|r| (r.to_entry_enum(), ChangeKind::Both)));
+        Ok(Box::new(iter))
     }
 
     /// 查询在上一次扫描中存在但在最新扫描中缺失的文件
@@ -1479,18 +1522,59 @@ mod tests {
     }
 
     #[test]
-    fn test_detect_changed_sql_path_mode() {
-        let sql = DuckDBJoinStrategy::Path.build_detect_changed_sql("temp_abc", "base_job1");
+    fn test_detect_changed_sql_path_mode_data_only() {
+        let sql = DuckDBJoinStrategy::Path.build_detect_changed_sql("temp_abc", "base_job1", ChangeKind::DataOnly);
         assert!(sql.contains("JOIN base_job1 f ON t.relative_path = f.relative_path AND t.version_id = f.version_id"));
-        assert!(sql.contains("t.size != f.size OR (t.version_id = '' AND t.mtime != f.mtime)"));
+        assert!(sql.contains("t.size != f.size"));
+        assert!(sql.contains("t.version_id = '' AND t.mtime != f.mtime"));
+        // DataOnly 要求 mode/uid/gid 均未变
+        assert!(sql.contains("t.mode IS NOT DISTINCT FROM f.mode"));
+        assert!(sql.contains("t.uid IS NOT DISTINCT FROM f.uid"));
+        assert!(sql.contains("t.gid IS NOT DISTINCT FROM f.gid"));
     }
 
     #[test]
-    fn test_detect_changed_sql_fh_mode() {
-        let sql = DuckDBJoinStrategy::FileHandle.build_detect_changed_sql("temp_abc", "base_job1");
+    fn test_detect_changed_sql_path_mode_metadata_only() {
+        let sql = DuckDBJoinStrategy::Path.build_detect_changed_sql("temp_abc", "base_job1", ChangeKind::MetadataOnly);
+        // MetadataOnly：size 未变 + mtime 未变（受 version_id 约束）+ 属性变了
+        assert!(sql.contains("t.size = f.size"));
+        assert!(sql.contains("t.mode IS DISTINCT FROM f.mode"));
+        assert!(sql.contains("t.uid IS DISTINCT FROM f.uid"));
+        assert!(sql.contains("t.gid IS DISTINCT FROM f.gid"));
+    }
+
+    #[test]
+    fn test_detect_changed_sql_path_mode_both() {
+        let sql = DuckDBJoinStrategy::Path.build_detect_changed_sql("temp_abc", "base_job1", ChangeKind::Both);
+        assert!(sql.contains("t.size != f.size"));
+        assert!(sql.contains("t.mode IS DISTINCT FROM f.mode"));
+    }
+
+    #[test]
+    fn test_detect_changed_sql_fh_mode_data_only() {
+        let sql =
+            DuckDBJoinStrategy::FileHandle.build_detect_changed_sql("temp_abc", "base_job1", ChangeKind::DataOnly);
         assert!(sql.contains("JOIN base_job1 f ON t.file_handle = f.file_handle AND t.version_id = f.version_id"));
-        assert!(sql.contains("t.mtime != f.mtime OR t.size != f.size"));
+        assert!(sql.contains("t.mtime != f.mtime"));
+        assert!(sql.contains("t.size != f.size"));
+        assert!(sql.contains("t.mode IS NOT DISTINCT FROM f.mode"));
         assert!(!sql.contains("version_id = ''"));
+    }
+
+    #[test]
+    fn test_detect_changed_sql_fh_mode_metadata_only() {
+        let sql =
+            DuckDBJoinStrategy::FileHandle.build_detect_changed_sql("temp_abc", "base_job1", ChangeKind::MetadataOnly);
+        assert!(sql.contains("t.mtime = f.mtime"));
+        assert!(sql.contains("t.size = f.size"));
+        assert!(sql.contains("t.mode IS DISTINCT FROM f.mode"));
+    }
+
+    #[test]
+    fn test_detect_changed_sql_fh_mode_both() {
+        let sql = DuckDBJoinStrategy::FileHandle.build_detect_changed_sql("temp_abc", "base_job1", ChangeKind::Both);
+        assert!(sql.contains("t.mtime != f.mtime"));
+        assert!(sql.contains("t.mode IS DISTINCT FROM f.mode"));
     }
 
     #[test]

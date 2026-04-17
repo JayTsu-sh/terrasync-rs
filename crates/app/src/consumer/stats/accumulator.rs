@@ -483,7 +483,7 @@ impl IncrementalStats {
                 self.scanned.update(entry.as_ref());
             }
             StorageEntryMessage::New(entry) => self.new.add(entry.as_ref()),
-            StorageEntryMessage::Changed(entry) => self.changed.add(entry.as_ref()),
+            StorageEntryMessage::Changed { entry, .. } => self.changed.add(entry.as_ref()),
             StorageEntryMessage::Deleted(entry) => self.deleted.add(entry.as_ref()),
             StorageEntryMessage::Renamed((_, to_entry)) => self.renamed.add(to_entry.as_ref()),
             StorageEntryMessage::Error { event, .. } => self.error_stats.record(*event),

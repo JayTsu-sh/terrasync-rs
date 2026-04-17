@@ -27,6 +27,7 @@ impl Drop for AtomicCounterGuard<'_> {
 // 外部 crate
 use dashmap::DashMap;
 use db::factory::DatabaseFactory;
+use db::traits::Database;
 use db::{self, DeletionStatus, INCREMENTAL_SCAN_TABLE_BASE_NAME};
 use storage_v2::error::StorageError;
 use storage_v2::qos::QosManager;
@@ -54,7 +55,9 @@ use crate::sender::{SenderWorkerConfig, sender_worker};
 use crate::sync::check_admin_privileges;
 #[cfg(feature = "license")]
 use crate::sync::verify_storage_time;
-use crate::sync::{StoragePair, parse_size, process_entry, process_rename_entry, process_versioned_entry};
+use crate::sync::{
+    StoragePair, parse_size, process_entry, process_metadata_only_entry, process_rename_entry, process_versioned_entry,
+};
 use crate::{dir_walker, tar_pack};
 
 /// 广播通道容量
@@ -793,26 +796,40 @@ impl SyncOrchestrator {
                                     }
                                 }
                             }
-                            StorageEntryMessage::Changed(ref entry) => {
-                                match process_entry(
-                                    entry,
-                                    src.clone(),
-                                    dest.clone(),
-                                    enable_integrity_check,
-                                    enable_acl,
-                                    is_source_reserved,
-                                    qos.clone(),
-                                    bt.clone(),
-                                    &bc,
-                                )
-                                .await
-                                {
+                            StorageEntryMessage::Changed { ref entry, kind } => {
+                                // MetadataOnly：chmod/chown 变更，跳过 copy_file 只同步属性
+                                let result = if kind == storage_v2::ChangeKind::MetadataOnly {
+                                    process_metadata_only_entry(
+                                        entry,
+                                        src.clone(),
+                                        dest.clone(),
+                                        enable_acl,
+                                        is_source_reserved,
+                                        &bc,
+                                    )
+                                    .await
+                                } else {
+                                    process_entry(
+                                        entry,
+                                        src.clone(),
+                                        dest.clone(),
+                                        enable_integrity_check,
+                                        enable_acl,
+                                        is_source_reserved,
+                                        qos.clone(),
+                                        bt.clone(),
+                                        &bc,
+                                    )
+                                    .await
+                                };
+                                match result {
                                     Ok(()) => bc.broadcast(message.clone()).await,
                                     Err(e) => {
                                         error!(
-                                            "Handler {}: Failed to process changed entry {:?}: {}",
+                                            "Handler {}: Failed to process changed entry {:?} (kind={}): {}",
                                             handler_id,
                                             entry.get_relative_path(),
+                                            kind,
                                             e
                                         );
                                         bc.broadcast(StorageEntryMessage::Error {
@@ -1037,29 +1054,9 @@ impl SyncOrchestrator {
             }
         }
 
-        // ── 15. 检测删除/重命名 → detect_broadcaster ──
-        match db_clone.detect_deleted_items().await {
-            Ok(deletion_iter) => {
-                for status in deletion_iter {
-                    match status {
-                        DeletionStatus::Deleted(entry) => {
-                            detect_broadcaster
-                                .broadcast(StorageEntryMessage::Deleted(Arc::new(entry)))
-                                .await;
-                        }
-                        DeletionStatus::Renamed(from, to) => {
-                            detect_broadcaster
-                                .broadcast(StorageEntryMessage::Renamed((Arc::new(*from), Arc::new(*to))))
-                                .await;
-                        }
-                    }
-                }
-            }
-            Err(e) => {
-                error!("Failed to detect deleted items: {}", e);
-            }
-        }
-        // 关闭 detect_broadcaster → dispatch task 的 file_op_rx 耗尽
+        // ── 15. 关闭 detect_broadcaster → dispatch task 的 file_op_rx 耗尽 ──
+        // scan workers 已全部退出，其 detect_broadcaster clone 均已 drop；
+        // 主 detect_broadcaster clone drop 触发 dispatch task EOF。
         drop(detect_broadcaster);
 
         // ── 16. 等待 dispatch task 退出 ──
@@ -1067,7 +1064,7 @@ impl SyncOrchestrator {
             error!("Dispatch task failed: {:?}", e);
         }
 
-        // ── 17. 等待所有 handler workers 退出 ──
+        // ── 17. 等待所有 handler workers 退出（Phase A：New/Changed 拷贝完成） ──
         for handle in handler_handles {
             if let Err(e) = handle.await {
                 error!("Handler worker failed: {:?}", e);
@@ -1075,18 +1072,35 @@ impl SyncOrchestrator {
         }
         info!("All handler workers completed");
 
-        // ── 18. Cleanup ──
+        // ── 18. Cleanup（QoS）+ 关闭 broadcaster → 等待 Phase A 消费者完成 ──
+        // handler workers 已全部退出（其 bc clone 均已 drop）；
+        // 主 broadcaster clone drop → 消费者通道 EOF → DatabaseConsumer 刷入所有
+        // Phase 2 New/Changed 条目 → base 表完整。
         if let Some(ref qos_mgr) = qos_manager {
             qos_mgr.shutdown();
         }
-
         drop(broadcaster);
         Self::await_consumers(consumer_handles).await;
 
-        // ── 19. 更新目录元数据（非 S3 目标端） ──
-        let dest_storage_for_metadata = Arc::new(create_storage(&c.dest_path, block_size.map(|s| s as u64)).await?);
-        if !matches!(dest_storage_for_metadata.as_ref(), StorageEnum::S3(_)) {
-            Self::update_directory_metadata(database, &dest_storage_for_metadata).await;
+        // ── 19. Phase B：检测删除/重命名（base 表已完整） ──
+        let dest_storage_phase_b = Arc::new(create_storage(&c.dest_path, block_size.map(|s| s as u64)).await?);
+        let src_storage_phase_b = Arc::new(create_storage(&c.src_path, block_size.map(|s| s as u64)).await?);
+
+        Self::apply_deletions_and_renames(
+            &*db_clone,
+            src_storage_phase_b.clone(),
+            dest_storage_phase_b.clone(),
+            is_source_reserved,
+            &consumer_manager,
+        )
+        .await;
+
+        // ── 20. Finalize 统计报告（Phase A New/Changed + Phase B Deleted/Renamed 合并） ──
+        consumer_manager.finalize_stats().await;
+
+        // ── 21. 更新目录元数据（非 S3 目标端） ──
+        if !matches!(dest_storage_phase_b.as_ref(), StorageEnum::S3(_)) {
+            Self::update_directory_metadata(database, &dest_storage_phase_b).await;
         }
 
         info!(
@@ -1154,6 +1168,133 @@ impl SyncOrchestrator {
             }
             .instrument(span),
         )
+    }
+
+    /// Phase B：检测删除/重命名，直接操作目标端存储并批量更新数据库。
+    ///
+    /// 前置条件：base 表已含所有 Phase 2 的 New/Changed 条目（Phase A 消费者已完成刷入）。
+    /// 成功/幂等的操作写入统计；目标端错误仅记录日志，不中断流程。
+    async fn apply_deletions_and_renames(
+        db: &dyn Database, src_storage: Arc<StorageEnum>, dest_storage: Arc<StorageEnum>, is_source_reserved: bool,
+        consumer_manager: &ConsumerManager,
+    ) {
+        let deletion_iter = match db.detect_deleted_items().await {
+            Ok(iter) => iter,
+            Err(e) => {
+                error!("Failed to detect deleted items: {}", e);
+                return;
+            }
+        };
+
+        let mut batch_delete_paths: Vec<String> = Vec::new();
+        let mut batch_rename_inserts: Vec<Arc<EntryEnum>> = Vec::new();
+        let mut batch_rename_delete_paths: Vec<String> = Vec::new();
+        let mut incremental_msgs: Vec<StorageEntryMessage> = Vec::new();
+
+        for status in deletion_iter {
+            match status {
+                DeletionStatus::Deleted(entry) => {
+                    let entry_arc = Arc::new(entry);
+                    let result = if entry_arc.get_is_dir() {
+                        dest_storage.delete_dir_all(&entry_arc).await
+                    } else {
+                        dest_storage.delete_file(&entry_arc).await
+                    };
+                    match result {
+                        Ok(()) | Err(StorageError::FileNotFound(_) | StorageError::DirectoryNotFound(_)) => {
+                            let msg = StorageEntryMessage::Deleted(entry_arc.clone());
+                            if let Some(ref sc) = consumer_manager.stats_consumer() {
+                                sc.lock().await.update_statistics(&msg);
+                            }
+                            batch_delete_paths.push(entry_arc.get_relative_path().to_string_lossy().into_owned());
+                            incremental_msgs.push(msg);
+                        }
+                        Err(e) => {
+                            error!("Phase B: Failed to delete {:?}: {}", entry_arc.get_relative_path(), e);
+                            let err_msg = StorageEntryMessage::Error {
+                                event: ErrorEvent::Delete,
+                                path: entry_arc.get_relative_path().to_path_buf(),
+                                reason: format!("{e}"),
+                            };
+                            if let Some(ref sc) = consumer_manager.stats_consumer() {
+                                sc.lock().await.update_statistics(&err_msg);
+                            }
+                            incremental_msgs.push(err_msg);
+                        }
+                    }
+                }
+                DeletionStatus::Renamed(from, to) => {
+                    let from_arc = Arc::new(*from);
+                    let to_arc = Arc::new(*to);
+
+                    // 同名 rename（父目录移动）：父目录的 rename 已完成物理移动，无需额外操作
+                    let dest_op_result = if from_arc.get_name() == to_arc.get_name() {
+                        Ok(())
+                    } else {
+                        process_rename_entry(
+                            from_arc.clone(),
+                            to_arc.clone(),
+                            src_storage.clone(),
+                            dest_storage.clone(),
+                            is_source_reserved,
+                        )
+                        .await
+                    };
+
+                    match dest_op_result {
+                        Ok(()) => {
+                            let msg = StorageEntryMessage::Renamed((from_arc.clone(), to_arc.clone()));
+                            if let Some(ref sc) = consumer_manager.stats_consumer() {
+                                sc.lock().await.update_statistics(&msg);
+                            }
+                            batch_rename_inserts.push(to_arc.clone());
+                            batch_rename_delete_paths.push(from_arc.get_relative_path().to_string_lossy().into_owned());
+                            incremental_msgs.push(msg);
+                        }
+                        Err(e) => {
+                            error!(
+                                "Phase B: Failed to rename {:?} → {:?}: {}",
+                                from_arc.get_relative_path(),
+                                to_arc.get_relative_path(),
+                                e
+                            );
+                            let err_msg = StorageEntryMessage::Error {
+                                event: ErrorEvent::Rename,
+                                path: to_arc.get_relative_path().to_path_buf(),
+                                reason: format!("{e}"),
+                            };
+                            if let Some(ref sc) = consumer_manager.stats_consumer() {
+                                sc.lock().await.update_statistics(&err_msg);
+                            }
+                            incremental_msgs.push(err_msg);
+                        }
+                    }
+                }
+            }
+        }
+
+        // 批量更新 base 表
+        if !batch_delete_paths.is_empty() {
+            if let Err(e) = db.batch_delete_base_record(&batch_delete_paths).await {
+                error!("Phase B: Failed to batch delete base records: {}", e);
+            }
+        }
+        if !batch_rename_inserts.is_empty() {
+            if let Err(e) = db.batch_insert_base_record(&batch_rename_inserts).await {
+                error!("Phase B: Failed to batch insert rename base records: {}", e);
+            }
+        }
+        if !batch_rename_delete_paths.is_empty() {
+            if let Err(e) = db.batch_delete_base_record(&batch_rename_delete_paths).await {
+                error!("Phase B: Failed to batch delete rename-from base records: {}", e);
+            }
+        }
+        // 批量写入增量记录
+        if !incremental_msgs.is_empty() {
+            if let Err(e) = db.batch_insert_incremental_record(&incremental_msgs).await {
+                error!("Phase B: Failed to batch insert incremental records: {}", e);
+            }
+        }
     }
 
     /// 更新目录元数据（查询数据库，设置目标端目录的 mtime）

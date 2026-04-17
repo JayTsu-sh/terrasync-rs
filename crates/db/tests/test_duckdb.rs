@@ -470,7 +470,7 @@ mod duckdb_integration_tests {
                 item.get_version_id().unwrap_or_default().to_string(),
             ));
         }
-        for item in &changed_items {
+        for (item, _kind) in &changed_items {
             excluded.push((
                 item.get_relative_path().to_string_lossy().into_owned(),
                 item.get_version_id().unwrap_or_default().to_string(),

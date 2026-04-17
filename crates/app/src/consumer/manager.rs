@@ -26,6 +26,9 @@ pub struct ConsumerManager {
     consumers: Vec<Box<dyn Consumer>>,
     /// 统计消费者，通过 Arc<Mutex> 持有以便任务完成后读取统计结果
     stats_consumer: Option<Arc<Mutex<StatisticConsumer>>>,
+    /// 是否延迟 finalize（增量拷贝两阶段流水线：Phase A 消费者退出时不打印报告，
+    /// 由编排器在 Phase B 完成后调用 finalize_stats() 输出合并报告）
+    defer_finalize: bool,
 }
 
 impl ConsumerManager {
@@ -33,9 +36,12 @@ impl ConsumerManager {
     pub async fn new(consumer_config: &ConsumerConfig) -> Result<Self> {
         let enable_db = consumer_config.db_config.enabled;
 
+        let defer_finalize = matches!(consumer_config.job_type, JobType::IncrementalCopy);
+
         let mut manager = Self {
             consumers: Vec::new(),
             stats_consumer: None,
+            defer_finalize,
         };
 
         // 根据配置初始化数据库消费者
@@ -66,12 +72,14 @@ impl ConsumerManager {
                     progress_bar: ProgressBar::new(job_type),
                     job_dir,
                     callback_url,
+                    pb_handle: None,
                 },
                 JobType::IncrementalScan | JobType::IncrementalCopy => StatisticConsumer {
                     stats: StatsKind::Incremental(IncrementalStats::new(job_type.clone(), job_id, command, log_path)),
                     progress_bar: ProgressBar::new(job_type),
                     job_dir,
                     callback_url,
+                    pb_handle: None,
                 },
             };
             manager.stats_consumer = Some(Arc::new(Mutex::new(sc)));
@@ -113,10 +121,11 @@ impl ConsumerManager {
         if let Some(stats_consumer) = &self.stats_consumer {
             let stats_rx = broadcaster.subscribe();
             let stats_consumer_clone = stats_consumer.clone();
+            let defer = self.defer_finalize;
             let span = info_span!("consumer", kind = "statistics");
             let stats_handle = tokio::spawn(
                 async move {
-                    StatisticConsumer::run(stats_consumer_clone, stats_rx).await;
+                    StatisticConsumer::run(stats_consumer_clone, stats_rx, defer).await;
                     Ok(())
                 }
                 .instrument(span),
@@ -145,5 +154,15 @@ impl ConsumerManager {
     /// 获取已注册的消费者数量
     pub fn get_consumer_count(&self) -> usize {
         self.consumers.len()
+    }
+
+    /// 手动触发统计报告（仅在 defer_finalize=true 时有意义）
+    ///
+    /// 增量拷贝两阶段流水线：Phase A 消费者退出时跳过 finalize，
+    /// 由编排器在 Phase B 完成后调用此方法，确保 Deleted/Renamed 合并进同一份报告。
+    pub async fn finalize_stats(&self) {
+        if let Some(ref sc) = self.stats_consumer {
+            sc.lock().await.finalize();
+        }
     }
 }

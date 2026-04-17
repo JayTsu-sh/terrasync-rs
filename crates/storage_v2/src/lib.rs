@@ -283,6 +283,36 @@ impl fmt::Display for ErrorEvent {
     }
 }
 
+/// 变更的维度：用于区分内容变更、元数据变更、或两者同时变更
+///
+/// - `DataOnly`：size 或 mtime 不同（内容变了），属性 mode/uid/gid 未变 → 需 copy_file + set_metadata
+/// - `MetadataOnly`：size 和 mtime 相同，但 mode/uid/gid 至少一项不同（chmod/chown）→ 只需 set_metadata，跳过 copy_file
+/// - `Both`：内容和属性都变了 → 需 copy_file + set_metadata
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ChangeKind {
+    DataOnly,
+    MetadataOnly,
+    Both,
+}
+
+impl ChangeKind {
+    /// 对应数据库 state 列的取值，与 `db/src/traits.rs` 中 `Changed` 分支保持一致
+    #[must_use]
+    pub fn as_state_str(&self) -> &'static str {
+        match self {
+            ChangeKind::DataOnly => "data_changed",
+            ChangeKind::MetadataOnly => "metadata_changed",
+            ChangeKind::Both => "both_changed",
+        }
+    }
+}
+
+impl std::fmt::Display for ChangeKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_state_str())
+    }
+}
+
 /// 文件操作消息枚举，用于在扫描/同步过程中传递文件状态变化
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum StorageEntryMessage {
@@ -290,8 +320,8 @@ pub enum StorageEntryMessage {
     Scanned(Arc<EntryEnum>),
     /// 新增文件
     New(Arc<EntryEnum>),
-    /// 文件已变更
-    Changed(Arc<EntryEnum>),
+    /// 文件已变更（kind 区分 data/metadata/both）
+    Changed { entry: Arc<EntryEnum>, kind: ChangeKind },
     /// 文件已删除
     Deleted(Arc<EntryEnum>),
     /// 文件被重命名，(from, to)

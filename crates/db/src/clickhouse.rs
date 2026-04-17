@@ -12,7 +12,7 @@ use async_trait::async_trait;
 use clickhouse::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use storage_v2::{EntryEnum, StorageEntryMessage};
+use storage_v2::{ChangeKind, EntryEnum, StorageEntryMessage};
 use tokio::sync::mpsc;
 use tracing::{debug, info, trace, warn};
 
@@ -166,32 +166,48 @@ impl JoinStrategy {
         }
     }
 
-    /// 构建 `detect_changed` SQL：temp 与 base 都存在但 size/mtime 不同
-    fn build_detect_changed_sql(&self, temp: &str, base: &str) -> String {
+    /// 构建 `detect_changed` SQL：temp 与 base 都存在但存在变更
+    ///
+    /// 根据 `ChangeKind` 生成不同 WHERE 子句，三种 kind 互斥：
+    /// - `DataOnly`：size 或 mtime 变了；mode/uid/gid 均未变
+    /// - `MetadataOnly`：size + mtime 均未变；mode/uid/gid 至少一项变了（chmod/chown）
+    /// - `Both`：内容和属性都变了
+    fn build_detect_changed_sql(&self, temp: &str, base: &str, kind: ChangeKind) -> String {
         let t_columns = &*FILE_SCAN_COLUMNS_LIST_WITH_T_PREFIX;
+        let data_changed = "(t.size != f.size OR t.mtime != f.mtime)";
+        let data_unchanged = "(t.size = f.size AND t.mtime = f.mtime)";
+        let meta_changed = "(t.mode != f.mode OR t.uid != f.uid OR t.gid != f.gid)";
+        let meta_unchanged = "(t.mode = f.mode AND t.uid = f.uid AND t.gid = f.gid)";
+
+        let kind_filter = match kind {
+            ChangeKind::DataOnly => format!("{data_changed} AND {meta_unchanged}"),
+            ChangeKind::MetadataOnly => format!("{data_unchanged} AND {meta_changed}"),
+            ChangeKind::Both => format!("{data_changed} AND {meta_changed}"),
+        };
+
         match self {
             Self::Path => format!(
                 "SELECT {t_columns} FROM {temp} t \
-                 JOIN (SELECT relative_path, version_id, size, mtime, is_dir \
+                 JOIN (SELECT relative_path, version_id, size, mtime, mode, uid, gid, is_dir \
                        FROM {base} \
                        WHERE (relative_path, version_id) IN \
                              (SELECT relative_path, version_id FROM {temp}) \
                        ORDER BY relative_path, version_id \
                        LIMIT 1 BY (relative_path, version_id) \
                  ) f ON t.relative_path = f.relative_path AND t.version_id = f.version_id \
-                 WHERE (t.size != f.size OR t.mtime != f.mtime) AND f.is_dir = 0 \
+                 WHERE {kind_filter} AND f.is_dir = 0 \
                  ORDER BY t.relative_path, t.version_id"
             ),
             Self::FileHandle => format!(
                 "SELECT {t_columns} FROM {temp} t \
-                 JOIN (SELECT file_handle, size, mtime, is_dir \
+                 JOIN (SELECT file_handle, size, mtime, mode, uid, gid, is_dir \
                        FROM {base} \
                        WHERE file_handle IN \
                              (SELECT file_handle FROM {temp} WHERE file_handle IS NOT NULL) \
                        ORDER BY file_handle \
                        LIMIT 1 BY file_handle \
                  ) f ON t.file_handle = f.file_handle \
-                 WHERE (t.size != f.size OR t.mtime != f.mtime) AND f.is_dir = 0 \
+                 WHERE {kind_filter} AND f.is_dir = 0 \
                  ORDER BY t.relative_path, t.version_id"
             ),
         }
@@ -853,14 +869,30 @@ impl Database for ClickHouseDatabase {
         Ok(records_to_entry_iter(records))
     }
 
-    async fn detect_changed_items(&self) -> Result<Box<dyn Iterator<Item = EntryEnum> + Send>> {
-        let records = self
-            .detect_items("changed", |temp_table, base_table, strategy| {
-                strategy.build_detect_changed_sql(temp_table, base_table)
-            })
-            .await?;
+    async fn detect_changed_items(&self) -> Result<Box<dyn Iterator<Item = (EntryEnum, ChangeKind)> + Send>> {
+        // 分别查询三种变更（三类条件互斥），用 try_join! 并发执行以降低整体延迟
+        let (data_only, metadata_only, both) = tokio::try_join!(
+            self.detect_items("changed(data)", |temp, base, strategy| {
+                strategy.build_detect_changed_sql(temp, base, ChangeKind::DataOnly)
+            }),
+            self.detect_items("changed(meta)", |temp, base, strategy| {
+                strategy.build_detect_changed_sql(temp, base, ChangeKind::MetadataOnly)
+            }),
+            self.detect_items("changed(both)", |temp, base, strategy| {
+                strategy.build_detect_changed_sql(temp, base, ChangeKind::Both)
+            }),
+        )?;
 
-        Ok(records_to_entry_iter(records))
+        let iter = data_only
+            .into_iter()
+            .map(|r| (r.to_entry_enum(), ChangeKind::DataOnly))
+            .chain(
+                metadata_only
+                    .into_iter()
+                    .map(|r| (r.to_entry_enum(), ChangeKind::MetadataOnly)),
+            )
+            .chain(both.into_iter().map(|r| (r.to_entry_enum(), ChangeKind::Both)));
+        Ok(Box::new(iter))
     }
 
     /// 检测已删除或重命名的文件（old-state 记录 + `file_handle` 分组判定）
@@ -1361,19 +1393,52 @@ mod tests {
     }
 
     #[test]
-    fn test_detect_changed_sql_path_mode() {
-        let sql = JoinStrategy::Path.build_detect_changed_sql("temp_x", "base_y");
+    fn test_detect_changed_sql_path_mode_data_only() {
+        let sql = JoinStrategy::Path.build_detect_changed_sql("temp_x", "base_y", ChangeKind::DataOnly);
         assert!(sql.contains("LIMIT 1 BY (relative_path, version_id)"));
+        // DataOnly 条件：内容变了 + 属性未变
         assert!(sql.contains("t.size != f.size OR t.mtime != f.mtime"));
+        assert!(sql.contains("t.mode = f.mode AND t.uid = f.uid AND t.gid = f.gid"));
         assert!(!sql.contains("FINAL"));
     }
 
     #[test]
-    fn test_detect_changed_sql_fh_mode() {
-        let sql = JoinStrategy::FileHandle.build_detect_changed_sql("temp_x", "base_y");
+    fn test_detect_changed_sql_path_mode_metadata_only() {
+        let sql = JoinStrategy::Path.build_detect_changed_sql("temp_x", "base_y", ChangeKind::MetadataOnly);
+        // MetadataOnly 条件：内容未变 + 属性变了
+        assert!(sql.contains("t.size = f.size AND t.mtime = f.mtime"));
+        assert!(sql.contains("t.mode != f.mode OR t.uid != f.uid OR t.gid != f.gid"));
+    }
+
+    #[test]
+    fn test_detect_changed_sql_path_mode_both() {
+        let sql = JoinStrategy::Path.build_detect_changed_sql("temp_x", "base_y", ChangeKind::Both);
+        // Both 条件：内容和属性都变了
+        assert!(sql.contains("t.size != f.size OR t.mtime != f.mtime"));
+        assert!(sql.contains("t.mode != f.mode OR t.uid != f.uid OR t.gid != f.gid"));
+    }
+
+    #[test]
+    fn test_detect_changed_sql_fh_mode_data_only() {
+        let sql = JoinStrategy::FileHandle.build_detect_changed_sql("temp_x", "base_y", ChangeKind::DataOnly);
         assert!(sql.contains("LIMIT 1 BY file_handle"));
         assert!(sql.contains("t.file_handle = f.file_handle"));
-        assert!(!sql.contains("FINAL"));
+        assert!(sql.contains("t.size != f.size OR t.mtime != f.mtime"));
+        assert!(sql.contains("t.mode = f.mode AND t.uid = f.uid AND t.gid = f.gid"));
+    }
+
+    #[test]
+    fn test_detect_changed_sql_fh_mode_metadata_only() {
+        let sql = JoinStrategy::FileHandle.build_detect_changed_sql("temp_x", "base_y", ChangeKind::MetadataOnly);
+        assert!(sql.contains("t.size = f.size AND t.mtime = f.mtime"));
+        assert!(sql.contains("t.mode != f.mode OR t.uid != f.uid OR t.gid != f.gid"));
+    }
+
+    #[test]
+    fn test_detect_changed_sql_fh_mode_both() {
+        let sql = JoinStrategy::FileHandle.build_detect_changed_sql("temp_x", "base_y", ChangeKind::Both);
+        assert!(sql.contains("t.size != f.size OR t.mtime != f.mtime"));
+        assert!(sql.contains("t.mode != f.mode OR t.uid != f.uid OR t.gid != f.gid"));
     }
 
     #[test]

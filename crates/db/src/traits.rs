@@ -16,7 +16,7 @@ use std::time::{Duration, SystemTime};
 use async_trait::async_trait;
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
-use storage_v2::{EntryEnum, NASEntry, S3Entry, StorageEntryMessage};
+use storage_v2::{ChangeKind, EntryEnum, NASEntry, S3Entry, StorageEntryMessage};
 use tokio::sync::mpsc;
 use tracing::{trace, warn};
 
@@ -273,7 +273,10 @@ impl IncrementalStorageEntryRecord {
             StorageEntryMessage::Scanned(entry) => Self::from_entry(entry.as_ref(), "scanned", None, create_at),
             StorageEntryMessage::Packaged(entry) => Self::from_entry(entry.as_ref(), "packaged", None, create_at),
             StorageEntryMessage::New(entry) => Self::from_entry(entry.as_ref(), "new", None, create_at),
-            StorageEntryMessage::Changed(entry) => Self::from_entry(entry.as_ref(), "changed", None, create_at),
+            StorageEntryMessage::Changed { entry, kind } => {
+                // state 列区分三种变更：data_changed / metadata_changed / both_changed
+                Self::from_entry(entry.as_ref(), kind.as_state_str(), None, create_at)
+            }
             StorageEntryMessage::Deleted(entry) => Self::from_entry(entry.as_ref(), "deleted", None, create_at),
             StorageEntryMessage::IntegrityChecked(entry) => {
                 Self::from_entry(entry.as_ref(), "integrity_checked", None, create_at)
@@ -576,13 +579,16 @@ pub trait Database: Send + Sync {
     /// - 失败返回错误信息
     async fn detect_new_items(&self) -> Result<Box<dyn Iterator<Item = EntryEnum> + Send>>;
 
-    /// 查询在最新扫描中内容发生变更的文件
-    /// 即大小或修改时间发生变化的文件
+    /// 查询在最新扫描中发生变更的文件
+    /// 区分三种变更：
+    /// - `ChangeKind::DataOnly`：size 或 mtime 变了（内容变了），mode/uid/gid 未变
+    /// - `ChangeKind::MetadataOnly`：size + mtime 未变，但 mode/uid/gid 至少一项变了（chmod/chown）
+    /// - `ChangeKind::Both`：内容和属性都变了
     ///
     /// # 返回值
-    /// - 成功返回包含 `EntryEnum` 迭代器的 `Ok`
+    /// - 成功返回 `(EntryEnum, ChangeKind)` 迭代器
     /// - 失败返回错误信息
-    async fn detect_changed_items(&self) -> Result<Box<dyn Iterator<Item = EntryEnum> + Send>>;
+    async fn detect_changed_items(&self) -> Result<Box<dyn Iterator<Item = (EntryEnum, ChangeKind)> + Send>>;
 
     /// 查询在上一次扫描中存在但在最新扫描中缺失的文件
     /// 识别出待删除的文件后，立即在数据库中批量删除这些记录

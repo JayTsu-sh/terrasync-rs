@@ -712,22 +712,25 @@ async fn generate_storage_entry_message_events(
         Err(e) => error!("Task {} failed to query new items: {}", task_id, e),
     }
 
-    // 查询修改文件
+    // 查询修改文件（区分 Data/Metadata/Both 三种变更）
     trace!("Task {} querying changed items for {}", task_id, batch_type);
     match database.detect_changed_items().await {
         Ok(changed_items) => {
-            let items: Vec<EntryEnum> = changed_items.collect();
+            let items: Vec<(EntryEnum, storage_v2::ChangeKind)> = changed_items.collect();
             if !keep_item {
-                for item in &items {
+                for (item, _) in &items {
                     excluded_paths.push((
                         item.get_relative_path().to_string_lossy().into_owned(),
                         item.get_version_id().unwrap_or_default().to_string(),
                     ));
                 }
             }
-            for item in items {
+            for (item, kind) in items {
                 broadcaster
-                    .broadcast(StorageEntryMessage::Changed(Arc::new(item)))
+                    .broadcast(StorageEntryMessage::Changed {
+                        entry: Arc::new(item),
+                        kind,
+                    })
                     .await;
             }
         }

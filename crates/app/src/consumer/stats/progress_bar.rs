@@ -198,7 +198,7 @@ impl ProgressBar {
                 c.new_count.fetch_add(1, Ordering::Relaxed);
                 c.new_size.fetch_add(entry.get_size(), Ordering::Relaxed);
             }
-            StorageEntryMessage::Changed(entry) => {
+            StorageEntryMessage::Changed { entry, .. } => {
                 c.changed_count.fetch_add(1, Ordering::Relaxed);
                 c.changed_size.fetch_add(entry.get_size(), Ordering::Relaxed);
             }
