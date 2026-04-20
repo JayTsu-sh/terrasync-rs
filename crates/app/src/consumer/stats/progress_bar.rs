@@ -463,6 +463,8 @@ impl DirectoryMetadataProgressBar {
     }
 
     pub fn start(&self) -> std::thread::JoinHandle<()> {
+        // 首帧立即渲染，避免短任务（空 DB 或极少目录）在首个 500ms tick 之前就 finish
+        self.pb.tick();
         let progress_bar_c = self.clone();
         std::thread::spawn(move || {
             loop {

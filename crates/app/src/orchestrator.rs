@@ -1095,7 +1095,8 @@ impl SyncOrchestrator {
         let mut broadcaster_b = BroadcastForwarder::new(BROADCAST_CHANNEL_CAPACITY);
         let phase_b_handles = consumer_manager.start_consumers(&mut broadcaster_b).await?;
 
-        let phase_b_result: Result<()> = async {
+        // dest storage 提升到 async 块外，供后续 update_directory_metadata 复用，避免二次挂载
+        let phase_b_dest_storage: Result<Arc<StorageEnum>> = async {
             let dest_storage_phase_b = Arc::new(create_storage(&c.dest_path, block_size.map(|s| s as u64)).await?);
             let src_storage_phase_b = Arc::new(create_storage(&c.src_path, block_size.map(|s| s as u64)).await?);
 
@@ -1108,12 +1109,7 @@ impl SyncOrchestrator {
             )
             .await;
 
-            // ── 20. 更新目录元数据（非 S3 目标端） ──
-            if !matches!(dest_storage_phase_b.as_ref(), StorageEnum::S3(_)) {
-                Self::update_directory_metadata(database, &dest_storage_phase_b).await;
-            }
-
-            Ok(())
+            Ok(dest_storage_phase_b)
         }
         .await;
 
@@ -1126,9 +1122,15 @@ impl SyncOrchestrator {
             qos_mgr.shutdown();
         }
 
-        // ── 22. Finalize 统计报告（无论 Phase B 成功与否都要打印合并报告） ──
+        // stats spinner 必须先于目录元数据进度条收尾，避免两个 spinner 同行互相覆盖
         consumer_manager.end_lifecycle().await;
-        phase_b_result.inspect_err(|e| error!("Phase B failed — reported statistics may be partial: {e}"))?;
+
+        // ── 22. 更新目录元数据（非 S3 目标端） ──
+        let dest_storage_phase_b =
+            phase_b_dest_storage.inspect_err(|e| error!("Phase B failed — reported statistics may be partial: {e}"))?;
+        if !matches!(dest_storage_phase_b.as_ref(), StorageEnum::S3(_)) {
+            Self::update_directory_metadata(database, &dest_storage_phase_b).await;
+        }
 
         info!(
             "Incremental sync job {} completed successfully via orchestrator",

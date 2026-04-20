@@ -48,14 +48,14 @@ impl StatisticConsumer {
 
     /// 结束进度条 + 打印最终统计 + join display 线程；调用后 Drop 成为 no-op
     pub fn finalize(&mut self) {
-        self.progress_bar.finish();
+        if let Some(handle) = self.pb_handle.take() {
+            self.progress_bar.finish();
+            if let Err(e) = handle.join() {
+                error!("[ProgressBar] Display thread panicked: {e:?}");
+            }
+        }
         println!("\n");
         println!("{}", self.stats);
-        if let Some(handle) = self.pb_handle.take()
-            && let Err(e) = handle.join()
-        {
-            error!("[ProgressBar] Display thread panicked: {e:?}");
-        }
     }
 
     /// 更新累计统计 + 进度条原子计数器
