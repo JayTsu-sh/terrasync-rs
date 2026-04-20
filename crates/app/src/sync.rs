@@ -823,6 +823,7 @@ pub async fn integrity_check(
 
     // 初始化消费者管理器并启动消费者
     let mut consumer_manager = ConsumerManager::new(consumer_config.as_ref()).await?;
+    consumer_manager.begin_lifecycle().await;
     let consumer_handles = consumer_manager.start_consumers(&mut broadcaster).await?;
 
     // 初始化扫描配置（扫描并发从 scan 配置读取）
@@ -1331,6 +1332,9 @@ pub async fn integrity_check(
     } else {
         warn!("Some consumer tasks failed or panicked");
     }
+
+    // 所有 consumer 任务已退出，收尾 stats 生命周期（打印合并报告 + 发送 final 回调）
+    consumer_manager.end_lifecycle().await;
 
     // 打印 integrity check 校验结果
     let total_checked = checked_file_count + checked_dir_count + checked_symlink_count;

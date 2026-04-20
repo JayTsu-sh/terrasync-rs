@@ -298,6 +298,7 @@ impl SyncOrchestrator {
         // ── 4. 广播器 + 消费者 ──
         let mut broadcaster = BroadcastForwarder::new(BROADCAST_CHANNEL_CAPACITY);
         let mut consumer_manager = ConsumerManager::new(consumer_config.as_ref()).await?;
+        consumer_manager.begin_lifecycle().await;
         let consumer_handles = consumer_manager.start_consumers(&mut broadcaster).await?;
         let bytes_tracker = consumer_manager.get_bytes_tracker().await;
 
@@ -556,6 +557,7 @@ impl SyncOrchestrator {
 
         drop(broadcaster);
         Self::await_consumers(consumer_handles).await;
+        consumer_manager.end_lifecycle().await;
 
         // ── 14. 更新目录元数据（非 S3 目标端） ──
         let dest_storage_for_metadata = Arc::new(create_storage(&c.dest_path, block_size.map(|s| s as u64)).await?);
@@ -567,7 +569,11 @@ impl SyncOrchestrator {
         Ok(())
     }
 
-    /// 增量同步 — 双层广播管线：scan workers → DB batch → detect → handler workers → consumers
+    /// 增量同步 — 双阶段流水线：
+    /// - Phase A：scan workers → DB 比对 → handler workers 拷贝 → 通过 `broadcaster_a` 喂给 consumers
+    /// - Barrier：`drop(broadcaster_a)` + `await phase_a_handles`（base 表冲刷完毕）
+    /// - Phase B：`detect_deleted_items` → 执行 dest 物理删除/重命名 → 通过 `broadcaster_b`
+    ///   喂给同一组 consumers（`DatabaseConsumer` 自动完成 incremental 表写入 + base 表修正）
     async fn run_incremental_sync(&self) -> Result<()> {
         let c = &self.config;
 
@@ -625,11 +631,14 @@ impl SyncOrchestrator {
 
         let batch_size = consumer_config.db_config.batch_size as usize;
 
-        // ── 4. 广播器 + 消费者 ──
-        let mut broadcaster = BroadcastForwarder::new(BROADCAST_CHANNEL_CAPACITY);
+        // ── 4. 消费者管理器 + 共享生命周期（跨 Phase A/B 共用同一份统计累积） ──
         let mut consumer_manager = ConsumerManager::new(consumer_config.as_ref()).await?;
-        let consumer_handles = consumer_manager.start_consumers(&mut broadcaster).await?;
+        consumer_manager.begin_lifecycle().await;
         let bytes_tracker = consumer_manager.get_bytes_tracker().await;
+
+        // ── 4.1. Phase A 广播器 + 消费者任务 ──
+        let mut broadcaster = BroadcastForwarder::new(BROADCAST_CHANNEL_CAPACITY);
+        let consumer_handles = consumer_manager.start_consumers(&mut broadcaster).await?;
 
         // ── 5. 检测广播器 + MPMC 通道 ──
         // scan workers → detect_broadcaster → dispatch_task → async_channel(MPMC) → N handler workers → broadcaster
@@ -1072,18 +1081,20 @@ impl SyncOrchestrator {
         }
         info!("All handler workers completed");
 
-        // ── 18. Cleanup（QoS）+ 关闭 broadcaster → 等待 Phase A 消费者完成 ──
+        // ── 18. 关闭 Phase A 广播器 → 等待 Phase A 消费者完成（同步屏障） ──
         // handler workers 已全部退出（其 bc clone 均已 drop）；
         // 主 broadcaster clone drop → 消费者通道 EOF → DatabaseConsumer 刷入所有
-        // Phase 2 New/Changed 条目 → base 表完整。
-        if let Some(ref qos_mgr) = qos_manager {
-            qos_mgr.shutdown();
-        }
+        // Phase A 的 New/Changed 条目 → base 表完整，detect_deleted_items 才有完整依据。
         drop(broadcaster);
         Self::await_consumers(consumer_handles).await;
+        info!("Phase A complete; base table ready for delete/rename detection");
 
-        // ── 19. Phase B：检测删除/重命名（base 表已完整） ──
-        // async 块 + 统一的 finalize_stats 调用，确保无论成败都打印合并报告。
+        // ── 19. Phase B：在 Phase A 屏障之后，起一轮新的 broadcaster + 同一组 consumer 任务 ──
+        // `apply_deletions_and_renames` 只负责「检测 + 执行物理操作 + 广播结果消息」，
+        // DatabaseConsumer 走 Deleted/Renamed 分支自动完成 base/incremental 表的批量写入。
+        let mut broadcaster_b = BroadcastForwarder::new(BROADCAST_CHANNEL_CAPACITY);
+        let phase_b_handles = consumer_manager.start_consumers(&mut broadcaster_b).await?;
+
         let phase_b_result: Result<()> = async {
             let dest_storage_phase_b = Arc::new(create_storage(&c.dest_path, block_size.map(|s| s as u64)).await?);
             let src_storage_phase_b = Arc::new(create_storage(&c.src_path, block_size.map(|s| s as u64)).await?);
@@ -1093,11 +1104,11 @@ impl SyncOrchestrator {
                 src_storage_phase_b.clone(),
                 dest_storage_phase_b.clone(),
                 is_source_reserved,
-                &consumer_manager,
+                &broadcaster_b,
             )
             .await;
 
-            // ── 21. 更新目录元数据（非 S3 目标端） ──
+            // ── 20. 更新目录元数据（非 S3 目标端） ──
             if !matches!(dest_storage_phase_b.as_ref(), StorageEnum::S3(_)) {
                 Self::update_directory_metadata(database, &dest_storage_phase_b).await;
             }
@@ -1106,8 +1117,17 @@ impl SyncOrchestrator {
         }
         .await;
 
-        // ── 20. Finalize 统计报告（无论 Phase B 成功与否都要打印合并报告） ──
-        consumer_manager.finalize_stats().await;
+        // ── 21. 关闭 Phase B 广播器 → 等待 Phase B 消费者完成（incremental 表冲刷完毕） ──
+        drop(broadcaster_b);
+        Self::await_consumers(phase_b_handles).await;
+
+        // QoS 在两阶段都走完之后才关闭，保留 Phase B 物理操作期间的限速效果
+        if let Some(ref qos_mgr) = qos_manager {
+            qos_mgr.shutdown();
+        }
+
+        // ── 22. Finalize 统计报告（无论 Phase B 成功与否都要打印合并报告） ──
+        consumer_manager.end_lifecycle().await;
         phase_b_result.inspect_err(|e| error!("Phase B failed — reported statistics may be partial: {e}"))?;
 
         info!(
@@ -1177,13 +1197,15 @@ impl SyncOrchestrator {
         )
     }
 
-    /// Phase B：检测删除/重命名，直接操作目标端存储并批量更新数据库。
+    /// Phase B：检测删除/重命名，执行目标端物理操作，并将结果广播给下游 consumers。
     ///
-    /// 前置条件：base 表已含所有 Phase 2 的 New/Changed 条目（Phase A 消费者已完成刷入）。
-    /// 成功/幂等的操作写入统计；目标端错误仅记录日志，不中断流程。
+    /// 前置条件：base 表已含所有 Phase A 的 New/Changed 条目（Phase A 消费者已完成刷入）。
+    /// DB 写入由 [`DatabaseConsumer`](crate::consumer::DatabaseConsumer) 在收到 `Deleted` / `Renamed` /
+    /// `Error` 消息后自动完成（走和 handler workers 同一套批量重试逻辑）；本函数只负责
+    /// 「物理操作 + 广播结果消息」。目标端错误仅记录日志并广播 Error，不中断流程。
     async fn apply_deletions_and_renames(
         db: &dyn Database, src_storage: Arc<StorageEnum>, dest_storage: Arc<StorageEnum>, is_source_reserved: bool,
-        consumer_manager: &ConsumerManager,
+        broadcaster: &BroadcastForwarder<StorageEntryMessage>,
     ) {
         let deletion_iter = match db.detect_deleted_items().await {
             Ok(iter) => iter,
@@ -1192,10 +1214,6 @@ impl SyncOrchestrator {
                 return;
             }
         };
-
-        let mut batch_delete_paths: Vec<String> = Vec::new();
-        let mut batch_rename_inserts: Vec<Arc<EntryEnum>> = Vec::new();
-        let mut batch_rename_delete_paths: Vec<String> = Vec::new();
 
         for status in deletion_iter {
             match status {
@@ -1208,15 +1226,12 @@ impl SyncOrchestrator {
                     };
                     match result {
                         Ok(()) | Err(StorageError::FileNotFound(_) | StorageError::DirectoryNotFound(_)) => {
-                            batch_delete_paths.push(entry_arc.get_relative_path().to_string_lossy().into_owned());
-                            consumer_manager
-                                .record_phase_b(StorageEntryMessage::Deleted(entry_arc))
-                                .await;
+                            broadcaster.broadcast(StorageEntryMessage::Deleted(entry_arc)).await;
                         }
                         Err(e) => {
                             error!("Phase B: Failed to delete {:?}: {}", entry_arc.get_relative_path(), e);
-                            consumer_manager
-                                .record_phase_b(StorageEntryMessage::Error {
+                            broadcaster
+                                .broadcast(StorageEntryMessage::Error {
                                     event: ErrorEvent::Delete,
                                     path: entry_arc.get_relative_path().to_path_buf(),
                                     reason: format!("{e}"),
@@ -1245,10 +1260,8 @@ impl SyncOrchestrator {
 
                     match dest_op_result {
                         Ok(()) => {
-                            batch_rename_inserts.push(to_arc.clone());
-                            batch_rename_delete_paths.push(from_arc.get_relative_path().to_string_lossy().into_owned());
-                            consumer_manager
-                                .record_phase_b(StorageEntryMessage::Renamed((from_arc, to_arc)))
+                            broadcaster
+                                .broadcast(StorageEntryMessage::Renamed((from_arc, to_arc)))
                                 .await;
                         }
                         Err(e) => {
@@ -1258,8 +1271,8 @@ impl SyncOrchestrator {
                                 to_arc.get_relative_path(),
                                 e
                             );
-                            consumer_manager
-                                .record_phase_b(StorageEntryMessage::Error {
+                            broadcaster
+                                .broadcast(StorageEntryMessage::Error {
                                     event: ErrorEvent::Rename,
                                     path: to_arc.get_relative_path().to_path_buf(),
                                     reason: format!("{e}"),
@@ -1268,30 +1281,6 @@ impl SyncOrchestrator {
                         }
                     }
                 }
-            }
-        }
-
-        // 批量更新 base 表
-        if !batch_delete_paths.is_empty() {
-            if let Err(e) = db.batch_delete_base_record(&batch_delete_paths).await {
-                error!("Phase B: Failed to batch delete base records: {}", e);
-            }
-        }
-        if !batch_rename_inserts.is_empty() {
-            if let Err(e) = db.batch_insert_base_record(&batch_rename_inserts).await {
-                error!("Phase B: Failed to batch insert rename base records: {}", e);
-            }
-        }
-        if !batch_rename_delete_paths.is_empty() {
-            if let Err(e) = db.batch_delete_base_record(&batch_rename_delete_paths).await {
-                error!("Phase B: Failed to batch delete rename-from base records: {}", e);
-            }
-        }
-        // 批量写入增量记录
-        let incremental_msgs = consumer_manager.take_phase_b_buffer().await;
-        if !incremental_msgs.is_empty() {
-            if let Err(e) = db.batch_insert_incremental_record(&incremental_msgs).await {
-                error!("Phase B: Failed to batch insert incremental records: {}", e);
             }
         }
     }

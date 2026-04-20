@@ -1,4 +1,12 @@
 //! `StatisticConsumer` — 聚合累计统计、进度条、HTTP 进度回调，对外提供统一 API。
+//!
+//! 生命周期拆分为三段，便于跨阶段复用同一实例（如增量拷贝 Phase A/B 共享统计累加）：
+//! - [`StatisticConsumer::begin`]：一次性启动进度条显示线程 + HTTP 回调轮询任务
+//! - [`StatisticConsumer::process`]：消费 `StorageEntryMessage` 通道直到关闭，可重复调用
+//! - [`StatisticConsumer::end`]：一次性 abort 回调 + 发送 final 回调 + 打印合并报告
+//!
+//! 调用方目前均走 `ConsumerManager::begin_lifecycle` / `start_consumers` / `end_lifecycle`
+//! 三段式编排；不再暴露一站式 `run`。
 
 // 标准库
 use std::sync::Arc;
@@ -7,7 +15,8 @@ use std::time::Duration;
 
 // 外部crate
 use storage_v2::StorageEntryMessage;
-use tokio::sync::mpsc;
+use tokio::sync::{Mutex, mpsc};
+use tokio::task::JoinHandle;
 use tracing::{error, info, trace, warn};
 
 // 内部模块
@@ -18,6 +27,9 @@ use super::report::ProgressReport;
 /// HTTP 进度回调间隔（秒）
 const CALLBACK_INTERVAL_SECS: u64 = 2;
 
+/// 回调守卫：周期性 HTTP 回调任务句柄 + 共享的 `reqwest::Client`（`end()` 时 abort + 复用）。
+pub type CallbackGuard = (JoinHandle<()>, reqwest::Client);
+
 #[derive(Debug)]
 pub struct StatisticConsumer {
     pub stats: StatsKind,
@@ -26,8 +38,6 @@ pub struct StatisticConsumer {
     pub callback_url: Option<String>,
     /// progress bar display 线程句柄，`finalize()` join 以确保正常退出
     pub(crate) pb_handle: Option<std::thread::JoinHandle<()>>,
-    /// Phase B 增量消息缓冲，由编排器在 Phase B 结束后 drain 批量写入 `incremental_<job>` 表
-    pub(crate) phase_b_buffer: Vec<StorageEntryMessage>,
 }
 
 impl StatisticConsumer {
@@ -41,10 +51,10 @@ impl StatisticConsumer {
         self.progress_bar.finish();
         println!("\n");
         println!("{}", self.stats);
-        if let Some(handle) = self.pb_handle.take() {
-            if let Err(e) = handle.join() {
-                error!("[ProgressBar] Display thread panicked: {e:?}");
-            }
+        if let Some(handle) = self.pb_handle.take()
+            && let Err(e) = handle.join()
+        {
+            error!("[ProgressBar] Display thread panicked: {e:?}");
         }
     }
 
@@ -53,17 +63,6 @@ impl StatisticConsumer {
         trace!("Updating statistics for message: {:?}", message);
         self.stats.update_from_message(message);
         self.progress_bar.update_statistics(message);
-    }
-
-    /// Phase B 专用：更新 stats/progress bar + 缓冲消息以供批量 DB 写入
-    pub fn record_phase_b(&mut self, message: StorageEntryMessage) {
-        self.update_statistics(&message);
-        self.phase_b_buffer.push(message);
-    }
-
-    /// 取出 Phase B 缓冲，供 `batch_insert_incremental_record` 批量写入
-    pub fn take_phase_b_buffer(&mut self) -> Vec<StorageEntryMessage> {
-        std::mem::take(&mut self.phase_b_buffer)
     }
 
     /// 获取 per-chunk 实时字节计数器（Copy job 使用）
@@ -83,7 +82,7 @@ impl StatisticConsumer {
         report
     }
 
-    // ─── HTTP 回调（从 manager.rs 移入）───
+    // ─── HTTP 回调 ───
 
     /// 构建共享的 HTTP 客户端（带超时），供回调循环和最终回调复用
     fn build_callback_client() -> Option<reqwest::Client> {
@@ -99,10 +98,8 @@ impl StatisticConsumer {
     /// 启动周期性 HTTP 回调任务（每 2 秒 POST `ProgressReport`）
     ///
     /// 仅在配置了 `callback_url` 时启动。
-    /// 返回 (`JoinHandle`, Client) 供调用方在消息循环结束后 abort 并复用 client；无 URL 返回 None。
-    pub async fn start_callback_loop(
-        consumer: Arc<tokio::sync::Mutex<Self>>,
-    ) -> Option<(tokio::task::JoinHandle<()>, reqwest::Client)> {
+    /// 返回 ([`JoinHandle`], Client) 供调用方在消息循环结束后 abort 并复用 client；无 URL 返回 None。
+    pub async fn start_callback_loop(consumer: Arc<Mutex<Self>>) -> Option<CallbackGuard> {
         let url = {
             let c = consumer.lock().await;
             c.callback_url.clone()
@@ -138,45 +135,8 @@ impl StatisticConsumer {
         Some((handle, client))
     }
 
-    /// 完整运行生命周期：进度条 → 回调循环 → 消息处理 → 停止回调 → 最终回调 → finalize。
-    ///
-    /// `defer_finalize=true`：run() 返回后显示线程继续运行，编排器在 Phase B 结束后调用
-    /// `finalize_stats()` → `finalize()` 合并 Deleted/Renamed 统计并 join。
-    pub async fn run(
-        consumer: Arc<tokio::sync::Mutex<Self>>, mut rx: mpsc::Receiver<StorageEntryMessage>, defer_finalize: bool,
-    ) {
-        {
-            let mut c = consumer.lock().await;
-            c.start_progress_bar();
-        }
-
-        let callback = Self::start_callback_loop(consumer.clone()).await;
-
-        while let Some(message) = rx.recv().await {
-            // 最小化持锁时间：更新后立即释放，避免 callback loop 饥饿
-            {
-                let mut c = consumer.lock().await;
-                c.update_statistics(&message);
-            }
-        }
-
-        let shared_client = if let Some((handle, client)) = callback {
-            handle.abort();
-            Some(client)
-        } else {
-            None
-        };
-
-        Self::send_final_callback(&consumer, shared_client.as_ref()).await;
-
-        if !defer_finalize {
-            let mut c = consumer.lock().await;
-            c.finalize();
-        }
-    }
-
     /// 发送最终回调（`is_final=true`），优先复用已有 client
-    pub async fn send_final_callback(consumer: &Arc<tokio::sync::Mutex<Self>>, client: Option<&reqwest::Client>) {
+    pub async fn send_final_callback(consumer: &Arc<Mutex<Self>>, client: Option<&reqwest::Client>) {
         let (url, report) = {
             let consumer = consumer.lock().await;
             let url = consumer.callback_url.clone();
@@ -210,6 +170,43 @@ impl StatisticConsumer {
                 }
             }
         }
+    }
+
+    // ─── 生命周期拆分 ───
+
+    /// 启动一次性生命周期：进度条显示线程 + HTTP 回调轮询任务。
+    /// 与 [`end()`](Self::end) 成对调用；多阶段 pipeline 只调一次 begin。
+    pub async fn begin(consumer: Arc<Mutex<Self>>) -> Option<CallbackGuard> {
+        {
+            let mut c = consumer.lock().await;
+            c.start_progress_bar();
+        }
+        Self::start_callback_loop(consumer).await
+    }
+
+    /// 消息循环：消费 rx 直到 channel 关闭。只更新累计统计与进度条，不涉及生命周期。
+    ///
+    /// 最小化持锁时间：每条消息更新后立即释放，避免 callback loop 饥饿。
+    pub async fn process(consumer: Arc<Mutex<Self>>, mut rx: mpsc::Receiver<StorageEntryMessage>) {
+        while let Some(message) = rx.recv().await {
+            let mut c = consumer.lock().await;
+            c.update_statistics(&message);
+        }
+    }
+
+    /// 结束生命周期：abort HTTP 回调循环 → 发送 final 回调 → finalize（打印报告 + join 显示线程）。
+    pub async fn end(consumer: Arc<Mutex<Self>>, callback: Option<CallbackGuard>) {
+        let shared_client = if let Some((handle, client)) = callback {
+            handle.abort();
+            Some(client)
+        } else {
+            None
+        };
+
+        Self::send_final_callback(&consumer, shared_client.as_ref()).await;
+
+        let mut c = consumer.lock().await;
+        c.finalize();
     }
 }
 

@@ -97,7 +97,7 @@ Expected: 无输出（空）。
 ### 0d. 清理 jobs 目录
 
 ```bash
-find jobs -maxdepth 1 -type d -name "*nfs_v3_incr_sync*" | xargs rm -rf
+find jobs -maxdepth 1 -type d -name "*nfs_v3_incr_sync*" -exec rm -rf {} +
 find jobs -maxdepth 1 -type d -name "*nfs_v3_incr_sync*"
 ```
 
@@ -254,10 +254,12 @@ Expected（NFS v3 Fh3 模式，精确 rename 检测）：
 
 ```
    ├─ New:          7 total | dirs      2 | files      3 | symlinks    2
-   ├─ Changed:      2 total | dirs      0 | files      2 | symlinks    0
+   ├─ Changed:     19 total | dirs      0 | files     19 | symlinks    0
    ├─ Renamed:      7 total | dirs      1 | files      4 | symlinks    2
    └─ Deleted:      8 total | dirs      1 | files      5 | symlinks    2
 ```
+
+**Changed=19 说明**：包含 2 个内容修改文件 + 约 17 个元数据变更文件（chmod×7 + chown×7 + mtime×5 + mixed×2，部分重叠后去重约 17 条）。代码逻辑已将元数据变更（mode/uid/gid/mtime）统一纳入 Changed 统计。
 
 **Verify ERROR STATISTICS 为 0。**
 
@@ -428,7 +430,7 @@ Expected: 无输出（空）。
 ### 8d. 清理 jobs 目录
 
 ```bash
-find jobs -maxdepth 1 -type d -name "*nfs_v3_incr_sync*" | xargs rm -rf
+find jobs -maxdepth 1 -type d -name "*nfs_v3_incr_sync*" -exec rm -rf {} +
 find jobs -maxdepth 1 -type d -name "*nfs_v3_incr_sync*"
 ```
 
@@ -453,7 +455,7 @@ Expected: 无输出（空）。
 - [ ] ClickHouse base table verified after full sync (Step 3b)
 - [ ] Dest find counts match after full sync (Step 3c)
 - [ ] Source mutations applied: dirs={POST_MUTATE_DIRS}/files={POST_MUTATE_FILES}/symlinks={POST_MUTATE_SYMLINKS} (Step 4)
-- [ ] Incremental sync: new=7/changed=2/renamed=7/deleted=8 (Step 5b)
+- [ ] Incremental sync: new=7/changed=19/renamed=7/deleted=8 (Step 5b)
 - [ ] Dest find counts match: dirs={POST_MUTATE_DIRS}/files={POST_MUTATE_FILES}/symlinks={POST_MUTATE_SYMLINKS} (Step 6a)
 - [ ] Dest scan counts match (Step 6b)
 - [ ] ClickHouse dest base table verified (Step 6c)

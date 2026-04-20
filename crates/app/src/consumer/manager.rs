@@ -1,22 +1,30 @@
 //! 消费者管理器模块
 //!
 //! 该模块负责管理和协调多个消费者实例，提供统一的消息广播机制和消费者生命周期管理。
-//! 回调逻辑已移至 StatisticConsumer 内部，此处只负责编排。
+//!
+//! 生命周期拆分：
+//! - [`ConsumerManager::begin_lifecycle`] / [`ConsumerManager::end_lifecycle`] 包裹整个 pipeline，
+//!   启停进度条、HTTP 回调循环，并在最后打印合并统计报告。
+//! - [`ConsumerManager::start_consumers`] 可多次调用：增量拷贝两阶段流水线（Phase A/B）共用同一个
+//!   `StatisticConsumer` 实例，但每阶段各起一轮 `DatabaseConsumer::start` + `StatisticConsumer::process`。
+//! - 单阶段调用方（scan / sync / integrity_check）仍然只调一次 `start_consumers`。
 
 // 标准库
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 
+// 外部crate
 use storage_v2::StorageEntryMessage;
 use tokio::sync::Mutex;
-// 外部crate
 use tracing::{Instrument, debug, error, info_span, warn};
 
 // 内部模块
 use crate::broadcast::BroadcastForwarder;
 use crate::config::{ConsumerConfig, JobType};
 use crate::consumer::DatabaseConsumer;
-use crate::consumer::stats::{FullStats, IncrementalStats, ProgressBar, StatisticConsumer, StatsKind};
+use crate::consumer::stats::{
+    FullStats, IncrementalStats, ProgressBar, StatisticConsumer, StatsKind, consumer::CallbackGuard,
+};
 use crate::consumer::traits::Consumer;
 use crate::error::Result;
 
@@ -24,11 +32,10 @@ use crate::error::Result;
 pub struct ConsumerManager {
     /// 消费者列表，存储所有已注册的消费者实例
     consumers: Vec<Box<dyn Consumer>>,
-    /// 统计消费者，通过 Arc<Mutex> 持有以便任务完成后读取统计结果
+    /// 统计消费者，通过 `Arc<Mutex>` 持有以便任务完成后读取统计结果
     stats_consumer: Option<Arc<Mutex<StatisticConsumer>>>,
-    /// 是否延迟 finalize（增量拷贝两阶段流水线：Phase A 消费者退出时不打印报告，
-    /// 由编排器在 Phase B 完成后调用 finalize_stats() 输出合并报告）
-    defer_finalize: bool,
+    /// `begin_lifecycle()` 启动的周期 HTTP 回调守卫，在 `end_lifecycle()` 中 abort + 复用 client
+    callback_guard: Option<CallbackGuard>,
 }
 
 impl ConsumerManager {
@@ -36,12 +43,10 @@ impl ConsumerManager {
     pub async fn new(consumer_config: &ConsumerConfig) -> Result<Self> {
         let enable_db = consumer_config.db_config.enabled;
 
-        let defer_finalize = matches!(consumer_config.job_type, JobType::IncrementalCopy);
-
         let mut manager = Self {
             consumers: Vec::new(),
             stats_consumer: None,
-            defer_finalize,
+            callback_guard: None,
         };
 
         // 根据配置初始化数据库消费者
@@ -73,7 +78,6 @@ impl ConsumerManager {
                     job_dir,
                     callback_url,
                     pb_handle: None,
-                    phase_b_buffer: Vec::with_capacity(1024),
                 },
                 JobType::IncrementalScan | JobType::IncrementalCopy => StatisticConsumer {
                     stats: StatsKind::Incremental(IncrementalStats::new(job_type.clone(), job_id, command, log_path)),
@@ -81,7 +85,6 @@ impl ConsumerManager {
                     job_dir,
                     callback_url,
                     pb_handle: None,
-                    phase_b_buffer: Vec::with_capacity(1024),
                 },
             };
             manager.stats_consumer = Some(Arc::new(Mutex::new(sc)));
@@ -102,10 +105,21 @@ impl ConsumerManager {
         debug!("Added consumer, total consumers: {}", self.consumers.len());
     }
 
+    /// 启动一次性生命周期：进度条 + HTTP 回调循环。必须与 [`end_lifecycle`](Self::end_lifecycle) 成对调用。
+    ///
+    /// 多阶段 pipeline（如增量拷贝的 Phase A/B）只调用一次 begin + 一次 end；中间可多次
+    /// [`start_consumers`](Self::start_consumers) 为每一阶段建立独立的 consumer 任务。
+    pub async fn begin_lifecycle(&mut self) {
+        if let Some(ref sc) = self.stats_consumer {
+            self.callback_guard = StatisticConsumer::begin(sc.clone()).await;
+        }
+    }
+
     /// 启动所有已注册的消费者
     ///
-    /// 为每个消费者通过 `BroadcastForwarder` 订阅独立的 mpsc 通道并启动异步任务。
-    /// 统计消费者通过 Arc<Mutex> 持有，任务结束时自动调用 `finalize()`。
+    /// 为每个消费者通过 [`BroadcastForwarder`] 订阅独立的 mpsc 通道并启动异步任务。
+    /// 可多次调用：每次给所有 `consumers` 重新 `start()`、给 `StatisticConsumer` 订阅新 rx + 启动
+    /// [`StatisticConsumer::process`] 任务，共用同一个 `Arc<Mutex<StatisticConsumer>>` 累计统计。
     pub async fn start_consumers(
         &mut self, broadcaster: &mut BroadcastForwarder<StorageEntryMessage>,
     ) -> Result<Vec<tokio::task::JoinHandle<Result<()>>>> {
@@ -119,21 +133,20 @@ impl ConsumerManager {
             debug!("Consumer started successfully");
         }
 
-        // 统计消费者：生命周期完全由 StatisticConsumer::run() 管理
+        // 统计消费者：只负责消费消息累积统计，生命周期由 begin_lifecycle/end_lifecycle 管理
         if let Some(stats_consumer) = &self.stats_consumer {
             let stats_rx = broadcaster.subscribe();
             let stats_consumer_clone = stats_consumer.clone();
-            let defer = self.defer_finalize;
             let span = info_span!("consumer", kind = "statistics");
             let stats_handle = tokio::spawn(
                 async move {
-                    StatisticConsumer::run(stats_consumer_clone, stats_rx, defer).await;
+                    StatisticConsumer::process(stats_consumer_clone, stats_rx).await;
                     Ok(())
                 }
                 .instrument(span),
             );
             handles.push(stats_handle);
-            debug!("Statistic consumer started successfully");
+            debug!("Statistic consumer process task started successfully");
         }
 
         debug!("All consumers started successfully");
@@ -153,28 +166,25 @@ impl ConsumerManager {
         self.consumers.len()
     }
 
-    /// 见 [`StatisticConsumer::record_phase_b`]
-    pub async fn record_phase_b(&self, msg: StorageEntryMessage) {
-        if let Some(ref sc) = self.stats_consumer {
-            sc.lock().await.record_phase_b(msg);
-        }
-    }
-
-    /// 见 [`StatisticConsumer::take_phase_b_buffer`]；无 `stats_consumer` 时返回空 Vec
-    pub async fn take_phase_b_buffer(&self) -> Vec<StorageEntryMessage> {
-        match &self.stats_consumer {
-            Some(sc) => sc.lock().await.take_phase_b_buffer(),
-            None => Vec::new(),
-        }
-    }
-
-    /// 手动触发统计报告（仅在 `defer_finalize=true` 时有意义）。
+    /// 结束一次性生命周期：abort HTTP 回调 → 发送 final 回调 → finalize（打印合并统计 + join 显示线程）。
     ///
-    /// 必须在 Phase B 结束的所有成功/错误路径上调用，否则最终报告不会打印
-    /// （`StatisticConsumer::Drop` 兜底 join 显示线程，但不打印报告）。
-    pub async fn finalize_stats(&self) {
-        if let Some(ref sc) = self.stats_consumer {
-            sc.lock().await.finalize();
+    /// 必须在所有 `start_consumers` 产生的任务全部 await 完成之后调用（此时不会再有并发
+    /// `update_statistics` 触发锁竞争）。无 `stats_consumer` 时为 no-op。
+    pub async fn end_lifecycle(&mut self) {
+        if let Some(sc) = self.stats_consumer.clone() {
+            let callback = self.callback_guard.take();
+            StatisticConsumer::end(sc, callback).await;
+        }
+    }
+}
+
+/// 兜底回收 callback 回调任务：若 `end_lifecycle` 因 panic/early-return 未被调用，
+/// 这里必须 abort 掉周期性 HTTP 回调任务，避免 tokio task 泄漏（`JoinHandle` drop 不会 abort）。
+impl Drop for ConsumerManager {
+    fn drop(&mut self) {
+        if let Some((handle, _client)) = self.callback_guard.take() {
+            handle.abort();
+            warn!("ConsumerManager dropped without end_lifecycle(); aborted callback loop task");
         }
     }
 }

@@ -36,6 +36,9 @@ struct ScanPipeline {
     broadcaster: BroadcastForwarder<StorageEntryMessage>,
     consumer_handles: Vec<JoinHandle<Result<()>>>,
     walkdir_iter: WalkDirAsyncIterator,
+    /// 与 pipeline 同生命周期：`shutdown_pipeline` 在 await 完 consumer 任务后调用
+    /// `end_lifecycle()` 打印统计报告。
+    consumer_manager: ConsumerManager,
 }
 
 /// 扫描类型枚举
@@ -155,7 +158,8 @@ async fn setup_scan_pipeline(
         }
     };
 
-    // 7. 启动所有消费者
+    // 7. 启动生命周期（进度条 + HTTP 回调循环），再启动所有消费者
+    consumer_manager.begin_lifecycle().await;
     let consumer_handles = match consumer_manager.start_consumers(&mut broadcaster).await {
         Ok(handles) => {
             info!("Started {} consumers successfully", handles.len());
@@ -179,22 +183,20 @@ async fn setup_scan_pipeline(
         }
     };
 
-    // consumer_manager 在 start_consumers 后不再需要——
-    // spawned tasks 持有 Arc<Mutex<StatisticConsumer>> 的 clone
-    drop(consumer_manager);
-
     Ok(ScanPipeline {
         app_config,
         consumer_config,
         broadcaster,
         consumer_handles,
         walkdir_iter,
+        consumer_manager,
     })
 }
 
-/// 关闭流水线，等待所有消费者完成
+/// 关闭流水线，等待所有消费者完成后收尾统计生命周期
 async fn shutdown_pipeline(
     broadcaster: BroadcastForwarder<StorageEntryMessage>, consumer_handles: Vec<JoinHandle<Result<()>>>,
+    mut consumer_manager: ConsumerManager,
 ) -> bool {
     drop(broadcaster);
 
@@ -215,6 +217,10 @@ async fn shutdown_pipeline(
     if !all_successful {
         warn!("Some consumer tasks failed or panicked");
     }
+
+    // 所有 consumer 任务已退出，此时 stats_consumer 不再有并发更新，安全打印合并报告
+    consumer_manager.end_lifecycle().await;
+
     all_successful
 }
 
@@ -245,6 +251,7 @@ async fn run_full_scan(
         broadcaster,
         consumer_handles,
         walkdir_iter,
+        consumer_manager,
     } = setup_scan_pipeline(
         &job_id,
         &job_dir,
@@ -302,7 +309,7 @@ async fn run_full_scan(
         );
     }
 
-    shutdown_pipeline(broadcaster, consumer_handles).await;
+    shutdown_pipeline(broadcaster, consumer_handles, consumer_manager).await;
 
     info!("Scan job {} completed successfully", job_id);
 
@@ -336,6 +343,7 @@ async fn run_incremental_scan(
         broadcaster,
         consumer_handles,
         walkdir_iter,
+        consumer_manager,
     } = setup_scan_pipeline(
         &job_id,
         &job_dir,
@@ -513,7 +521,7 @@ async fn run_incremental_scan(
     }
     info!("Detect deleted items completed");
 
-    shutdown_pipeline(broadcaster, consumer_handles).await;
+    shutdown_pipeline(broadcaster, consumer_handles, consumer_manager).await;
 
     info!("Incremental scan job {} completed successfully", job_id);
 
