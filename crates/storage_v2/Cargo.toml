@@ -45,6 +45,7 @@ smb = "0.11"
 soft-canonicalize = "0.5.5"
 thiserror = "2.0.18"
 tokio = { version = "1.51.1", features = ["full"] }
+tokio-util = "0.7"
 url = "2.5.8"
 utils = { path = "../utils" }
 

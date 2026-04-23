@@ -6270,6 +6270,7 @@ dependencies = [
  "soft-canonicalize",
  "thiserror 2.0.18",
  "tokio",
+ "tokio-util",
  "tracing",
  "url",
  "utils",

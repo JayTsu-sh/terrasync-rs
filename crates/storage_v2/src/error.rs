@@ -61,6 +61,12 @@ pub enum StorageError {
     #[error("Checksum error: {0}")]
     ChecksumError(String),
 
+    /// 传输被调用方取消
+    /// 当调用方通过 `CancellationToken` 主动取消传输时触发。
+    /// 此错误应被视为可重试的结束状态，而非失败：上层可选择重新入队或直接放弃。
+    #[error("transfer cancelled by caller")]
+    Cancelled,
+
     /// S3存储相关错误
     /// 与S3服务交互时发生错误时触发
     #[error("S3 error: {0}")]
@@ -153,6 +159,7 @@ impl Clone for StorageError {
             StorageError::FileLockError(s) => StorageError::FileLockError(s.clone()),
             StorageError::WinAceError(s) => StorageError::WinAceError(s.clone()),
             StorageError::CifsError(s) => StorageError::CifsError(s.clone()),
+            StorageError::Cancelled => StorageError::Cancelled,
         }
     }
 }

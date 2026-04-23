@@ -6,6 +6,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use bytes::Bytes;
 use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
 #[cfg(windows)]
@@ -431,6 +432,45 @@ impl StorageEnum {
         from: &StorageEnum, to: &StorageEnum, entry: &EntryEnum, qos: Option<QosManager>, enable_integrity_check: bool,
         is_source_reserved: bool, bytes_counter: Option<Arc<AtomicU64>>,
     ) -> Result<()> {
+        // Backwards-compatible wrapper: no cancellation.
+        Self::copy_file_with_cancel(
+            from,
+            to,
+            entry,
+            qos,
+            enable_integrity_check,
+            is_source_reserved,
+            bytes_counter,
+            None,
+        )
+        .await
+    }
+
+    /// 与 [`copy_file`] 相同，但额外接受一个 [`CancellationToken`]：
+    /// - 当 token 在 chunk 边界被触发时，正在跑的 read/write 任务会被 abort，
+    ///   函数立即返回 [`StorageError::Cancelled`]。
+    /// - 已经写出的部分目标对象 **不会** 被回滚——调用方需要自己 `delete_file`
+    ///   清理（HSM copytool 通常通过 `llapi_hsm_action_end(rc=ECANCELED)` +
+    ///   后续 cleanup action 处理）。
+    /// - `cancel = None` 时行为与 [`copy_file`] 完全一致。
+    ///
+    /// 取消粒度：
+    /// - 单块路径（文件 ≤ block_size）：在 read 之前检查一次。已发起的 IO
+    ///   不会被打断。
+    /// - 多块管道：read_data / write_data 在独立 task 中运行，token 触发时通过
+    ///   `AbortHandle` 强制结束。chunk 边界响应延迟 ≤ 一个 chunk 的 IO 时间。
+    #[allow(clippy::too_many_arguments)]
+    pub async fn copy_file_with_cancel(
+        from: &StorageEnum, to: &StorageEnum, entry: &EntryEnum, qos: Option<QosManager>, enable_integrity_check: bool,
+        is_source_reserved: bool, bytes_counter: Option<Arc<AtomicU64>>, cancel: Option<CancellationToken>,
+    ) -> Result<()> {
+        // Top-of-function cancel check: avoids issuing any IO if already cancelled.
+        if let Some(ref token) = cancel
+            && token.is_cancelled()
+        {
+            return Err(StorageError::Cancelled);
+        }
+
         let size = entry.get_size();
 
         // ── S3 → S3（无 QoS 时走原生路径；有 QoS 时 fall-through 到下方单块/多块逻辑）
@@ -462,6 +502,13 @@ impl StorageEnum {
             // QoS: 带宽 + IOPS 限流
             if let Some(ref qos_mgr) = qos {
                 qos_mgr.acquire(size).await;
+            }
+
+            // QoS may have suspended us; re-check cancel before spending IO.
+            if let Some(ref token) = cancel
+                && token.is_cancelled()
+            {
+                return Err(StorageError::Cancelled);
             }
 
             let data = match (from, entry) {
@@ -613,12 +660,43 @@ impl StorageEnum {
             }
         });
 
-        let source_hasher = read_task
-            .await
+        let read_abort = read_task.abort_handle();
+        let write_abort = write_task.abort_handle();
+
+        // Race the joined IO against the cancel token (if any). On cancel we abort
+        // the spawned tasks; their JoinHandles will then resolve with a Cancelled
+        // JoinError, which we discard in favour of returning StorageError::Cancelled.
+        let join_io = async {
+            let r = read_task.await;
+            let w = write_task.await;
+            (r, w)
+        };
+
+        let (read_res, write_res) = match cancel.as_ref() {
+            Some(token) => {
+                tokio::select! {
+                    pair = join_io => pair,
+                    () = token.cancelled() => {
+                        read_abort.abort();
+                        write_abort.abort();
+                        return Err(StorageError::Cancelled);
+                    }
+                }
+            }
+            None => join_io.await,
+        };
+
+        let source_hasher = read_res
             .map_err(|e| StorageError::OperationError(format!("read task panicked: {e:?}")))??;
-        write_task
-            .await
+        write_res
             .map_err(|e| StorageError::OperationError(format!("write task panicked: {e:?}")))??;
+
+        // Final cancel check before integrity verification (which itself does IO).
+        if let Some(ref token) = cancel
+            && token.is_cancelled()
+        {
+            return Err(StorageError::Cancelled);
+        }
 
         if enable_integrity_check && let Some(src_h) = source_hasher {
             let src_hash = src_h.finalize();
