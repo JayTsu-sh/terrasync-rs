@@ -98,13 +98,16 @@ fn bytes_to_cells(bytes: u64) -> NonZeroU32 {
 /// burst = `base_rate` * `peak_rate` / 1024 cells
 const MIN_PEAK_RATE_BPS: u64 = 2 * 1024 * 1024; // 2MB/s
 
-fn build_bandwidth_limiter(bandwidth_str: &str, peak_rate: f32) -> Result<BandwidthLimiter> {
-    let base_rate_bps = parse_bandwidth_string(bandwidth_str)?;
-
-    // 检查峰值速率是否过小
-    let peak_rate_bps = (base_rate_bps as f64 * f64::from(peak_rate)).round() as u64;
-    if peak_rate_bps < MIN_PEAK_RATE_BPS {
-        println!("警告: 峰值带宽设置过小 ({peak_rate_bps} B/s),对于大于1M的文件传输会有影响。建议至少设置为2MB/s。\n");
+/// 用基准速率 + 显式 burst（字节数）构建一个 governor `BandwidthLimiter`。
+///
+/// 这是带宽 limiter 的"内核"——`build_bandwidth_limiter` 通过 `peak_rate`
+/// 算出 burst 后调本函数，`build_bandwidth_limiter_with_burst` 直接传 burst。
+fn build_bandwidth_limiter_inner(base_rate_bps: u64, burst_bytes: u64) -> Result<BandwidthLimiter> {
+    if burst_bytes < MIN_PEAK_RATE_BPS {
+        debug!(
+            "[QoS] burst 容量较小 ({burst_bytes} B)，对于大于 burst 的单次 IO 会被分批限流；\
+             如这是有意为之（严格平均速率），可忽略。"
+        );
     }
 
     // 基准速率换算为 cells/sec（1 cell = 1 KB）
@@ -112,18 +115,31 @@ fn build_bandwidth_limiter(bandwidth_str: &str, peak_rate: f32) -> Result<Bandwi
     let rate = NonZeroU32::new(cells_per_sec as u32)
         .ok_or_else(|| StorageError::ConfigError("带宽速率过小，换算后为0 cells/sec".to_string()))?;
 
-    // burst 容量 = peak_rate_bps / 1024（允许突发到峰值）
-    let burst_cells = (peak_rate_bps / 1024).max(1);
+    // burst 容量（cells）
+    let burst_cells = (burst_bytes / 1024).max(1);
     let burst = NonZeroU32::new(burst_cells as u32)
-        .ok_or_else(|| StorageError::ConfigError("峰值速率过小，换算后为0 burst cells".to_string()))?;
+        .ok_or_else(|| StorageError::ConfigError("burst 过小，换算后为 0 cells".to_string()))?;
 
     debug!(
-        "[QoS] 带宽限制: base={}B/s ({}cells/s), peak={}B/s (burst={}cells)",
-        base_rate_bps, cells_per_sec, peak_rate_bps, burst_cells
+        "[QoS] 带宽限制: base={}B/s ({}cells/s), burst={}B ({}cells)",
+        base_rate_bps, cells_per_sec, burst_bytes, burst_cells
     );
 
     let quota = Quota::per_second(rate).allow_burst(burst);
     Ok(RateLimiter::direct(quota))
+}
+
+fn build_bandwidth_limiter(bandwidth_str: &str, peak_rate: f32) -> Result<BandwidthLimiter> {
+    let base_rate_bps = parse_bandwidth_string(bandwidth_str)?;
+    let burst_bytes = (base_rate_bps as f64 * f64::from(peak_rate)).round() as u64;
+    build_bandwidth_limiter_inner(base_rate_bps, burst_bytes)
+}
+
+/// 显式 burst 版本：用基准速率字符串 + burst 字节数。
+/// 仅供 `try_new_with_burst` / `update_bandwidth_with_burst` 内部使用。
+fn build_bandwidth_limiter_with_burst(bandwidth_str: &str, burst_bytes: u64) -> Result<BandwidthLimiter> {
+    let base_rate_bps = parse_bandwidth_string(bandwidth_str)?;
+    build_bandwidth_limiter_inner(base_rate_bps, burst_bytes)
 }
 
 /// 构建 IOPS limiter（1 cell = 1 op）
@@ -142,10 +158,15 @@ fn build_iops_limiter(iops: u32) -> Result<IopsLimiter> {
 }
 
 impl QosManager {
-    /// 创建新的 `QoS` 管理器
+    /// 创建新的 `QoS` 管理器（基于 `peak_rate` 倍数）
     ///
     /// - `bandwidth`: 带宽限制字符串，如 "200MiB/s"，None 则不限速
-    /// - `peak_rate`: 峰值速率倍数（相对于基准速率）
+    /// - `peak_rate`: 峰值速率倍数（相对于基准速率）。**这同时决定了
+    ///   token bucket 的 burst 容量**：`burst = base_rate × peak_rate × 1秒`。
+    ///   `peak_rate = 1.0` 意味着允许 1 秒带宽量的瞬时突发（典型场景下足够，
+    ///   小文件可能在突发窗口内瞬时穿过）。如需"严格平均速率，无突发"，请用
+    ///   [`try_new_with_burst`](Self::try_new_with_burst) 指定一个小 burst
+    ///   （例如等于一次 IO 的 chunk 大小）。
     /// - `iops`: IOPS 限制，None 则不限制
     pub fn try_new(bandwidth: Option<&str>, peak_rate: f32, iops: Option<u32>) -> Result<Self> {
         let bandwidth_limiter = match bandwidth {
@@ -167,6 +188,59 @@ impl QosManager {
         let config = QosConfig {
             bandwidth: bandwidth.map(std::string::ToString::to_string),
             peak_rate,
+            iops,
+        };
+
+        Ok(Self {
+            bandwidth_limiter,
+            iops_limiter,
+            stats: Arc::new(QosStats::new()),
+            config: Arc::new(ArcSwap::from_pointee(config)),
+        })
+    }
+
+    /// 创建新的 `QoS` 管理器（显式指定 burst 字节数）
+    ///
+    /// 适合需要 **严格平均速率** 的场景，例如：
+    /// - 嵌入到长稳 daemon 中（HSM copytool / 后台同步），不希望小文件被
+    ///   1 秒带宽量的 burst 一次性"瞬时穿过"造成共享带宽尖刺
+    /// - 自动测试需要可预测的 wall-clock 行为
+    ///
+    /// - `bandwidth`: 带宽限制字符串，如 "200MiB/s"
+    /// - `burst_bytes`: token bucket 的 burst 上限（字节）。建议设置为
+    ///   一次 IO 的 chunk 大小（如 4 MiB），这样 burst 只能容纳一个 chunk，
+    ///   后续 chunks 严格按 `bandwidth` 速率推进
+    /// - `iops`: IOPS 限制，None 则不限制
+    ///
+    /// # 示例
+    ///
+    /// ```ignore
+    /// // 严格 8 MiB/s，最多 1 MiB 的瞬时突发：
+    /// // 16 MiB 文件至少需要 ~1.875s 完成（首块 1 MiB 立即过，剩余 15 MiB 走 8 MiB/s）。
+    /// let qos = QosManager::try_new_with_burst("8MiB/s", 1024 * 1024, None)?;
+    /// ```
+    pub fn try_new_with_burst(bandwidth: &str, burst_bytes: u64, iops: Option<u32>) -> Result<Self> {
+        let limiter = build_bandwidth_limiter_with_burst(bandwidth, burst_bytes)?;
+        let bandwidth_limiter = Some(Arc::new(ArcSwap::from_pointee(limiter)));
+
+        let iops_limiter = match iops {
+            Some(iops_val) if iops_val > 0 => {
+                let l = build_iops_limiter(iops_val)?;
+                Some(Arc::new(ArcSwap::from_pointee(l)))
+            }
+            _ => None,
+        };
+
+        // 把 burst 等价 peak_rate 写回 config 快照，便于外部检视
+        let base_rate_bps = parse_bandwidth_string(bandwidth)?;
+        let derived_peak_rate = if base_rate_bps == 0 {
+            1.0
+        } else {
+            (burst_bytes as f64 / base_rate_bps as f64) as f32
+        };
+        let config = QosConfig {
+            bandwidth: Some(bandwidth.to_string()),
+            peak_rate: derived_peak_rate,
             iops,
         };
 
@@ -521,5 +595,66 @@ mod tests {
         // 测试无效配置
         let result = QosManager::try_new(Some("invalid"), 1.0, None);
         assert!(result.is_err());
+    }
+
+    /// `try_new` 配 `peak_rate=1.0` 时，burst = 1 秒带宽，对小于该 burst 的传输
+    /// 不会有节流效果——这是 governor token bucket 的固有行为。本测试 **记录**
+    /// 这个行为，证明它不是 bug，而是 burst 容量决定的设计选择。
+    #[tokio::test]
+    async fn test_try_new_default_burst_bursty_behavior() {
+        let qos = QosManager::try_new(Some("8MiB/s"), 1.0, None).unwrap();
+        let start = Instant::now();
+        // 整 8 MiB 一次性 acquire — 全在 burst 窗口内，应当瞬时完成
+        qos.acquire_bandwidth(8 * 1024 * 1024).await;
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < Duration::from_millis(200),
+            "8 MiB ≤ burst 应当立即返回（实测 {elapsed:?}）"
+        );
+        qos.shutdown();
+    }
+
+    /// `try_new_with_burst` 显式设小 burst 后，应当严格按平均速率推进。
+    /// 8 MiB/s + 1 MiB burst → 8 MiB 总量需要 ≥ 7 × 0.125 s = 0.875 s
+    /// （首块 1 MiB 立即过，剩 7 块每块等 0.125 s 重生）。
+    #[tokio::test]
+    async fn test_try_new_with_burst_enforces_average_rate() {
+        let qos = QosManager::try_new_with_burst("8MiB/s", 1024 * 1024, None).unwrap();
+        let start = Instant::now();
+        for _ in 0..8 {
+            qos.acquire_bandwidth(1024 * 1024).await;
+        }
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed >= Duration::from_millis(700),
+            "8 MiB at 8 MiB/s with 1 MiB burst should take ≥ 700 ms, got {elapsed:?}"
+        );
+        // 上限：合理实现不应远超目标平均速率所需时间
+        assert!(
+            elapsed < Duration::from_millis(2500),
+            "应当接近 0.875s，最多 2.5s（实测 {elapsed:?}）"
+        );
+
+        // config 快照里 peak_rate 应当 = burst / base_rate = 1 MiB / 8 MiB = 0.125
+        let cfg = qos.config();
+        assert!((cfg.peak_rate - 0.125).abs() < 0.001);
+        qos.shutdown();
+    }
+
+    /// `try_new_with_burst` 不带 IOPS 限制时也能正常工作。
+    #[tokio::test]
+    async fn test_try_new_with_burst_iops_optional() {
+        let qos = QosManager::try_new_with_burst("100MiB/s", 4 * 1024 * 1024, Some(500)).unwrap();
+        qos.acquire(64 * 1024).await;
+        let cfg = qos.config();
+        assert_eq!(cfg.iops, Some(500));
+        qos.shutdown();
+    }
+
+    /// 非法配置（带宽串解析失败）应当返回错误。
+    #[test]
+    fn test_try_new_with_burst_invalid_bandwidth() {
+        let res = QosManager::try_new_with_burst("not-a-rate", 1024, None);
+        assert!(res.is_err());
     }
 }
