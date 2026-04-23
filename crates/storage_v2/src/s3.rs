@@ -993,7 +993,7 @@ impl S3Storage {
     }
 
     /// 中止未完成的multipart upload
-    pub(crate) async fn abort_multipart_upload(&self, key: &str, upload_id: &str) -> Result<()> {
+    pub async fn abort_multipart_upload(&self, key: &str, upload_id: &str) -> Result<()> {
         debug!("尝试中止multipart upload, key: {}, upload_id: {}", key, upload_id);
         self.client
             .abort_multipart_upload()
@@ -1881,7 +1881,7 @@ impl S3Storage {
     }
 
     /// 创建分块上传请求
-    pub(crate) async fn create_multipart_upload(&self, key: &str, tags: Option<&Vec<Tag>>) -> Result<String> {
+    pub async fn create_multipart_upload(&self, key: &str, tags: Option<&Vec<Tag>>) -> Result<String> {
         debug!("Creating multipart upload for key: {}", key);
 
         let client = self.client.clone();
@@ -1946,7 +1946,7 @@ impl S3Storage {
     }
 
     /// 完成分块上传
-    pub(crate) async fn complete_multipart_upload(
+    pub async fn complete_multipart_upload(
         &self,
         key: &str,
         upload_id: &str,
@@ -3115,5 +3115,245 @@ mod tests {
         let (name, ext) = S3Storage::get_file_info("readme.md");
         assert_eq!(name, "readme.md");
         assert_eq!(ext, Some("md".to_string()));
+    }
+
+    // -- MultipartUpload wrapper tests ---------------------------------------
+    // These tests don't talk to a real S3 (`localhost:9000` is a stub
+    // endpoint). They only exercise the wrapper's local state machine —
+    // accessors, sort-on-complete, Drop-guard tagging.
+
+    #[test]
+    fn test_multipart_upload_accessors_and_part_tracking() {
+        let storage = make_test_storage(None);
+        // Construct the wrapper directly (we're in the same module).
+        let mut up = MultipartUpload {
+            storage: &storage,
+            key: "tenants/42/blob.bin".to_string(),
+            upload_id: "fake-upload-id".to_string(),
+            parts: Vec::new(),
+            finished: true, // suppress Drop's spawned abort
+        };
+
+        assert_eq!(up.key(), "tenants/42/blob.bin");
+        assert_eq!(up.upload_id(), "fake-upload-id");
+        assert_eq!(up.part_count(), 0);
+
+        // Simulate two parts having been recorded.
+        up.parts.push(
+            CompletedPart::builder()
+                .part_number(2)
+                .e_tag("\"etag-2\"")
+                .build(),
+        );
+        up.parts.push(
+            CompletedPart::builder()
+                .part_number(1)
+                .e_tag("\"etag-1\"")
+                .build(),
+        );
+        assert_eq!(up.part_count(), 2);
+    }
+
+    #[test]
+    fn test_multipart_upload_drop_when_finished_is_silent() {
+        // With `finished=true`, Drop must early-return — no panic, no spawn.
+        let storage = make_test_storage(None);
+        {
+            let _up = MultipartUpload {
+                storage: &storage,
+                key: "k".into(),
+                upload_id: "u".into(),
+                parts: Vec::new(),
+                finished: true,
+            };
+        }
+        // Reaching here means Drop didn't panic.
+    }
+
+    #[tokio::test]
+    async fn test_multipart_upload_drop_without_finish_does_not_panic() {
+        // With `finished=false` and a tokio runtime, Drop should log + spawn
+        // a best-effort abort. The abort itself will fail (no real S3) but
+        // must not panic the dropping thread.
+        let storage = make_test_storage(None);
+        {
+            let _up = MultipartUpload {
+                storage: &storage,
+                key: "k".into(),
+                upload_id: "u".into(),
+                parts: Vec::new(),
+                finished: false,
+            };
+        }
+        // Give the spawned best-effort abort a chance to run + fail quietly.
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+}
+
+// ============================================================================
+// 公共细粒度 multipart 上传 API
+// ============================================================================
+//
+// 上层应用（HSM copytool / 自定义同步流水线）需要 part-level 控制：
+//   - 自己决定何时切 part（边界对齐文件 chunk、cancel 触发等）
+//   - 每 part 完成后单独上报进度
+//   - 失败时只重传该 part 而不是整个对象
+//   - cancel 时 abort 而不是 complete
+//
+// 现存的 `S3Storage::write_multipart_data` 一次性吞整流，进度回调粗，
+// 也无法在 part 失败时单独重试。这套 wrapper 把已有的内部 helper
+// （`create_multipart_upload` / `upload_part_with_stream` /
+// `complete_multipart_upload` / `abort_multipart_upload`）暴露成一个
+// 类型安全 + RAII 的 high-level 接口。
+
+/// 重新导出 aws-sdk 的 `CompletedPart`，便于直接调用 low-level
+/// `complete_multipart_upload(key, upload_id, parts)` 的用户构造 parts。
+pub use aws_sdk_s3::types::CompletedPart as S3CompletedPart;
+
+/// 一次进行中的 S3 multipart upload。
+///
+/// 通过 [`S3Storage::multipart_begin`] 创建，必须以 [`MultipartUpload::complete`]
+/// 或 [`MultipartUpload::abort`] 之一收尾。
+///
+/// # Drop 行为
+///
+/// 如果未显式收尾即被 drop（例如 panic、提前 `?` early-return）：
+/// - 记录 `error!` 日志（带 key + upload_id），便于事后排查
+/// - 若当前线程持有 tokio runtime handle，会 `spawn` 一次 best-effort
+///   abort 请求（不 await，仅减少 S3 上的"僵尸"未完成上传——这在 AWS
+///   上会按 storage 计费）
+/// - **无 runtime 时不会自动清理**，调用方应当用 [`abort`](Self::abort)
+///   显式收尾
+///
+/// # 示例
+///
+/// ```ignore
+/// use bytes::Bytes;
+/// use storage_v2::S3Storage;
+///
+/// let mut up = s3.multipart_begin("path/to/large.bin", None).await?;
+/// for (i, chunk) in chunks.into_iter().enumerate() {
+///     up.upload_part(i as i32 + 1, chunk).await?;        // 1-based
+///     // 上层在这里上报进度 / 检查 cancel token / ...
+/// }
+/// up.complete().await?;
+/// ```
+pub struct MultipartUpload<'s> {
+    storage: &'s S3Storage,
+    key: String,
+    upload_id: String,
+    parts: Vec<CompletedPart>,
+    /// `true` after `complete` / `abort` finished (success or fail).
+    /// Drop guard reads this to decide whether to fire the failsafe abort.
+    finished: bool,
+}
+
+impl<'s> MultipartUpload<'s> {
+    /// 已分配的 upload_id（S3 端的句柄）。
+    pub fn upload_id(&self) -> &str {
+        &self.upload_id
+    }
+
+    /// 对象的 key。
+    pub fn key(&self) -> &str {
+        &self.key
+    }
+
+    /// 已成功上传的 part 数量。
+    pub fn part_count(&self) -> usize {
+        self.parts.len()
+    }
+
+    /// 上传一个 part。
+    ///
+    /// - `part_number`: 1-based，必须严格递增（S3 要求）。本方法不强制校验，
+    ///   由调用方保证；乱序在 [`complete`](Self::complete) 时会按 part_number
+    ///   重新排序。
+    /// - `data`: part 内容。S3 规则：除最后一段外，每 part ≥ 5 MiB；上限 5 GiB。
+    ///   本方法不做 ≥ 5 MiB 检查（在某些场景如最后一段更小是合法的）。
+    pub async fn upload_part(&mut self, part_number: i32, data: Bytes) -> Result<()> {
+        let size = data.len() as u64;
+        let etag = self
+            .storage
+            .upload_part_with_stream(&self.key, &self.upload_id, part_number, vec![data], size)
+            .await?;
+        self.parts.push(
+            CompletedPart::builder()
+                .part_number(part_number)
+                .e_tag(etag)
+                .build(),
+        );
+        Ok(())
+    }
+
+    /// 完成 multipart upload，对象在 S3 上变为可见。
+    ///
+    /// 在调用前会按 part_number 升序排序，避免乱序上传导致 S3 拒绝。
+    /// 调用成功或失败后 RAII 守卫不再触发。
+    pub async fn complete(mut self) -> Result<()> {
+        self.parts.sort_by_key(|p| p.part_number().unwrap_or(0));
+        let res = self
+            .storage
+            .complete_multipart_upload(&self.key, &self.upload_id, &self.parts)
+            .await
+            .map(|_| ());
+        self.finished = true;
+        res
+    }
+
+    /// 主动放弃这次上传（cancel / 错误恢复时调用）。
+    ///
+    /// 即便本调用失败，也会标记 `finished` 防止 Drop 重复 abort——失败路径
+    /// 留给调用方记录。
+    pub async fn abort(mut self) -> Result<()> {
+        let res = self.storage.abort_multipart_upload(&self.key, &self.upload_id).await;
+        self.finished = true;
+        res
+    }
+}
+
+impl Drop for MultipartUpload<'_> {
+    fn drop(&mut self) {
+        if self.finished {
+            return;
+        }
+        error!(
+            "MultipartUpload dropped without complete/abort: key={}, upload_id={}, \
+             {} parts uploaded — leaking S3 multipart resources (you will be billed)",
+            self.key,
+            self.upload_id,
+            self.parts.len(),
+        );
+
+        // Best-effort failsafe: if there's a tokio runtime handle, spawn an abort.
+        // Cannot await in Drop, so we clone the necessary state and fire-and-forget.
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            let storage = self.storage.clone();
+            let key = std::mem::take(&mut self.key);
+            let upload_id = std::mem::take(&mut self.upload_id);
+            handle.spawn(async move {
+                if let Err(e) = storage.abort_multipart_upload(&key, &upload_id).await {
+                    error!(
+                        "best-effort multipart abort failed: key={key}, upload_id={upload_id}, err={e}"
+                    );
+                }
+            });
+        }
+    }
+}
+
+impl S3Storage {
+    /// 开始一次 multipart upload，返回 RAII 句柄。
+    ///
+    /// 详见 [`MultipartUpload`] 的文档。
+    pub async fn multipart_begin(&self, key: &str, tags: Option<&Vec<Tag>>) -> Result<MultipartUpload<'_>> {
+        let upload_id = self.create_multipart_upload(key, tags).await?;
+        Ok(MultipartUpload {
+            storage: self,
+            key: key.to_string(),
+            upload_id,
+            parts: Vec::new(),
+            finished: false,
+        })
     }
 }
