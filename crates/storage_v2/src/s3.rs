@@ -3139,18 +3139,10 @@ mod tests {
         assert_eq!(up.part_count(), 0);
 
         // Simulate two parts having been recorded.
-        up.parts.push(
-            CompletedPart::builder()
-                .part_number(2)
-                .e_tag("\"etag-2\"")
-                .build(),
-        );
-        up.parts.push(
-            CompletedPart::builder()
-                .part_number(1)
-                .e_tag("\"etag-1\"")
-                .build(),
-        );
+        up.parts
+            .push(CompletedPart::builder().part_number(2).e_tag("\"etag-2\"").build());
+        up.parts
+            .push(CompletedPart::builder().part_number(1).e_tag("\"etag-1\"").build());
         assert_eq!(up.part_count(), 2);
     }
 
@@ -3277,12 +3269,8 @@ impl<'s> MultipartUpload<'s> {
             .storage
             .upload_part_with_stream(&self.key, &self.upload_id, part_number, vec![data], size)
             .await?;
-        self.parts.push(
-            CompletedPart::builder()
-                .part_number(part_number)
-                .e_tag(etag)
-                .build(),
-        );
+        self.parts
+            .push(CompletedPart::builder().part_number(part_number).e_tag(etag).build());
         Ok(())
     }
 
@@ -3333,9 +3321,7 @@ impl Drop for MultipartUpload<'_> {
             let upload_id = std::mem::take(&mut self.upload_id);
             handle.spawn(async move {
                 if let Err(e) = storage.abort_multipart_upload(&key, &upload_id).await {
-                    error!(
-                        "best-effort multipart abort failed: key={key}, upload_id={upload_id}, err={e}"
-                    );
+                    error!("best-effort multipart abort failed: key={key}, upload_id={upload_id}, err={e}");
                 }
             });
         }

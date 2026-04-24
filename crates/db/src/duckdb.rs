@@ -114,7 +114,9 @@ impl DuckDBJoinStrategy {
                 };
                 format!(
                     "SELECT {cols} \
-                     FROM {temp} t JOIN {base} f ON t.file_handle = f.file_handle AND t.version_id = f.version_id \
+                     FROM {temp} t JOIN {base} f ON t.file_handle = f.file_handle \
+                       AND t.version_id = f.version_id \
+                       AND t.relative_path = f.relative_path \
                      WHERE {kind_filter} AND f.is_dir = 0 \
                      ORDER BY t.relative_path, t.version_id",
                     cols = *FILE_SCAN_COLUMNS_LIST_WITH_T_PREFIX,
@@ -1554,7 +1556,10 @@ mod tests {
     fn test_detect_changed_sql_fh_mode_data_only() {
         let sql =
             DuckDBJoinStrategy::FileHandle.build_detect_changed_sql("temp_abc", "base_job1", ChangeKind::DataOnly);
-        assert!(sql.contains("JOIN base_job1 f ON t.file_handle = f.file_handle AND t.version_id = f.version_id"));
+        // 路径等值条件：仅对路径未变的条目判 Changed，避免把 rename+changed 误判为纯 Changed
+        assert!(sql.contains("t.file_handle = f.file_handle"));
+        assert!(sql.contains("t.version_id = f.version_id"));
+        assert!(sql.contains("t.relative_path = f.relative_path"));
         assert!(sql.contains("t.mtime != f.mtime"));
         assert!(sql.contains("t.size != f.size"));
         assert!(sql.contains("t.mode IS NOT DISTINCT FROM f.mode"));

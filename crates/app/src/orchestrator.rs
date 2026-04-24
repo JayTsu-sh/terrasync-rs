@@ -4,6 +4,8 @@
 //! 通过 Transport 抽象层连接 Sender 和 Receiver，支持单进程和双进程两种模式。
 
 // 标准库
+use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
@@ -33,7 +35,7 @@ use storage_v2::error::StorageError;
 use storage_v2::qos::QosManager;
 #[cfg(windows)]
 use storage_v2::storage_enum::{StorageType, detect_storage_type};
-use storage_v2::{EntryEnum, ErrorEvent, StorageEntryMessage, StorageEnum, create_storage};
+use storage_v2::{ChangeKind, EntryEnum, ErrorEvent, StorageEntryMessage, StorageEnum, create_storage};
 use tokio::sync::{Semaphore, mpsc};
 use tokio::task::JoinHandle;
 use tracing::{Instrument, debug, error, info, info_span, trace, warn};
@@ -1106,6 +1108,9 @@ impl SyncOrchestrator {
                 dest_storage_phase_b.clone(),
                 is_source_reserved,
                 &broadcaster_b,
+                c.enable_integrity_check,
+                qos_manager.clone(),
+                bytes_tracker.clone(),
             )
             .await;
 
@@ -1202,12 +1207,77 @@ impl SyncOrchestrator {
     /// Phase B：检测删除/重命名，执行目标端物理操作，并将结果广播给下游 consumers。
     ///
     /// 前置条件：base 表已含所有 Phase A 的 New/Changed 条目（Phase A 消费者已完成刷入）。
+    /// 根据 from/to 的属性差异推断 [`ChangeKind`]。
+    /// 用于 rename 后检测文件是否同时发生了内容或元数据变更。
+    fn detect_change_kind(from: &EntryEnum, to: &EntryEnum) -> Option<ChangeKind> {
+        let data_changed = from.get_size() != to.get_size() || from.get_mtime() != to.get_mtime();
+        let meta_changed =
+            from.get_mode() != to.get_mode() || from.get_uid() != to.get_uid() || from.get_gid() != to.get_gid();
+        match (data_changed, meta_changed) {
+            (true, true) => Some(ChangeKind::Both),
+            (true, false) => Some(ChangeKind::DataOnly),
+            (false, true) => Some(ChangeKind::MetadataOnly),
+            (false, false) => None,
+        }
+    }
+
+    /// rename 成功后同步文件内容或元数据到目标端。
+    ///
+    /// 返回 `true` 表示同步成功，调用方可随后广播 `Changed` 消息。
+    #[allow(clippy::too_many_arguments)]
+    async fn sync_renamed_file_changes(
+        kind: ChangeKind, entry: &EntryEnum, src: &StorageEnum, dest: &StorageEnum, qos: Option<QosManager>,
+        integrity: bool, source_reserved: bool, bytes: Option<Arc<AtomicU64>>,
+    ) -> bool {
+        if kind != ChangeKind::MetadataOnly {
+            // 内容变更：完整拷贝文件再设置元数据
+            match StorageEnum::copy_file(src, dest, entry, qos, integrity, source_reserved, bytes).await {
+                Ok(()) => {}
+                Err(e) => {
+                    warn!(
+                        "Phase B: renamed+data-changed content copy failed for {:?}: {}",
+                        entry.get_relative_path(),
+                        e
+                    );
+                    return false;
+                }
+            }
+        }
+        // 元数据同步（DataOnly 拷贝后也需要同步 mode/uid/gid/mtime）
+        if let Err(e) = dest.set_entry_metadata(entry).await {
+            warn!(
+                "Phase B: renamed+changed metadata sync failed for {:?}: {}",
+                entry.get_relative_path(),
+                e
+            );
+            return false;
+        }
+        true
+    }
+
     /// DB 写入由 [`DatabaseConsumer`](crate::consumer::DatabaseConsumer) 在收到 `Deleted` / `Renamed` /
     /// `Error` 消息后自动完成（走和 handler workers 同一套批量重试逻辑）；本函数只负责
     /// 「物理操作 + 广播结果消息」。目标端错误仅记录日志并广播 Error，不中断流程。
+    ///
+    /// # 两遍处理设计
+    ///
+    /// **第一遍**：收集所有 `DeletionStatus`，从中提取「目录名发生变化的 rename」
+    /// 构建 `renamed_dirs` 映射（old_dir_path → new_dir_path）。
+    ///
+    /// **第二遍**：顺序执行物理操作。对每条 `Renamed(from, to)` 判断是否跳过：
+    /// - `from.name != to.name`：目录/文件本身改了名字 → 必须调用 `process_rename_entry`
+    /// - `from.name == to.name` 且 `from.parent` 在 `renamed_dirs` 中且映射到 `to.parent`：
+    ///   父目录的 NFS RENAME 已传递性地移动了这个子条目 → 跳过物理操作
+    /// - `from.name == to.name` 但父目录未在 `renamed_dirs` 中（跨父目录 move）：
+    ///   没有父目录 rename 代为处理 → 必须调用 `process_rename_entry`
+    ///
+    /// 对于 rename 成功后检测到内容或元数据也同时变化的普通文件，额外执行内容拷贝
+    /// 或元数据更新（处理「rename + data/metadata changed」复合场景）。
+    #[allow(clippy::too_many_arguments)]
     async fn apply_deletions_and_renames(
         db: &dyn Database, src_storage: Arc<StorageEnum>, dest_storage: Arc<StorageEnum>, is_source_reserved: bool,
-        broadcaster: &BroadcastForwarder<StorageEntryMessage>,
+        broadcaster: &BroadcastForwarder<StorageEntryMessage>, enable_integrity_check: bool,
+        qos_manager: Option<QosManager>, bytes_counter: Option<Arc<AtomicU64>>,
     ) {
         let deletion_iter = match db.detect_deleted_items().await {
             Ok(iter) => iter,
@@ -1217,7 +1287,28 @@ impl SyncOrchestrator {
             }
         };
 
-        for status in deletion_iter {
+        // 第一遍：一次性收集，构建「所有目录 rename」映射表。
+        // 映射语义：renamed_dirs[old_dir_path] = new_dir_path
+        // 收录所有 is_dir=true 的 Renamed 条目（包括同名跨父目录 move 如 d3/d3_4 → d4/d3_4）。
+        // 用于判断某条目的父目录是否正在被 rename，若是则子条目无需单独执行物理操作。
+        let statuses: Vec<DeletionStatus> = deletion_iter.collect();
+        let renamed_dirs: HashMap<PathBuf, PathBuf> = statuses
+            .iter()
+            .filter_map(|s| {
+                if let DeletionStatus::Renamed(from, to) = s {
+                    if from.get_is_dir() {
+                        return Some((
+                            from.get_relative_path().to_path_buf(),
+                            to.get_relative_path().to_path_buf(),
+                        ));
+                    }
+                }
+                None
+            })
+            .collect();
+
+        // 第二遍：按顺序执行物理操作
+        for status in statuses {
             match status {
                 DeletionStatus::Deleted(entry) => {
                     let entry_arc = Arc::new(entry);
@@ -1246,8 +1337,18 @@ impl SyncOrchestrator {
                     let from_arc = Arc::new(*from);
                     let to_arc = Arc::new(*to);
 
-                    // 同名 rename（父目录移动）：父目录的 rename 已完成物理移动，无需额外操作
-                    let dest_op_result = if from_arc.get_name() == to_arc.get_name() {
+                    // 父目录正在被 rename 时，NFS RENAME 已传递性地移动了子条目，无需重复操作。
+                    // from_parent 分配仅在同名情况下进行，避免对名字不同的 rename 做无效分配。
+                    let skip_physical = from_arc.get_name() == to_arc.get_name() && {
+                        let from_parent = from_arc.get_relative_path().parent().map(PathBuf::from);
+                        let to_parent = to_arc.get_relative_path().parent().map(PathBuf::from);
+                        match (from_parent, to_parent) {
+                            (Some(fp), Some(tp)) => renamed_dirs.get(&fp).is_some_and(|d| d == &tp),
+                            _ => false,
+                        }
+                    };
+
+                    let dest_op_result = if skip_physical {
                         Ok(())
                     } else {
                         process_rename_entry(
@@ -1262,6 +1363,32 @@ impl SyncOrchestrator {
 
                     match dest_op_result {
                         Ok(()) => {
+                            // Phase A 不再把路径已变的文件判为 Changed（Fix 2a），
+                            // 此处补足 rename+changed 文件的内容/元数据同步，并广播 Changed 消息供消费者统计。
+                            if !from_arc.get_is_dir() && !from_arc.get_is_symlink() {
+                                if let Some(kind) = Self::detect_change_kind(&from_arc, &to_arc) {
+                                    if Self::sync_renamed_file_changes(
+                                        kind,
+                                        &to_arc,
+                                        &src_storage,
+                                        &dest_storage,
+                                        qos_manager.clone(),
+                                        enable_integrity_check,
+                                        is_source_reserved,
+                                        bytes_counter.clone(),
+                                    )
+                                    .await
+                                    {
+                                        broadcaster
+                                            .broadcast(StorageEntryMessage::Changed {
+                                                entry: to_arc.clone(),
+                                                kind,
+                                            })
+                                            .await;
+                                    }
+                                }
+                            }
+
                             broadcaster
                                 .broadcast(StorageEntryMessage::Renamed((from_arc, to_arc)))
                                 .await;

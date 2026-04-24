@@ -132,6 +132,29 @@ touch -d "2026-04-01T00:00:00" "$BASE/special/mixed/readonly_old.txt"
 echo "MIXED ATTR: special/mixed/readonly_old.txt (mode 0444→0755, owner 1000→root, mtime→2026)"
 
 # ============================================================
+# Part 2.5: 目录路径 rename 额外场景
+# 必须放在 Part 2 之后，确保所有 attr 操作的旧路径已完成
+# ============================================================
+echo ""
+echo "--- Directory path renames (additional) ---"
+
+# ─── RENAME: 非叶目录 rename（父目录重命名，子树路径全部级联变更）───
+# d1/d1_1 含 3 个子目录（d1_1_1/d1_1_2/d1_1_3），每个子目录有 3 文件 + 1 软链接
+# d1_1 本身有 3 文件 + 1 软链接；Part 2 不引用 d1/d1_1 下任何路径
+# 路径变更总计：4 dirs + 12 files + 4 symlinks = 20 entries
+mv "$BASE/d1/d1_1" "$BASE/d1/d1_1_renamed"
+echo "RENAME: non-leaf dir (d1/d1_1 -> d1/d1_1_renamed, cascade: 3 subdirs + 12 files + 4 symlinks, 20 entries)"
+
+# ─── RENAME: 跨父目录 move（目录名不变，整棵子树移入不同父目录）───
+# d3/d3_4 → d4/d3_4，目录名保持 d3_4，仅父目录从 d3 变为 d4
+# Part 2 已完成 chown 500:500 d3/d3_4/d3_4_1/file1.txt，此处安全执行 move
+# d3_4 含 3 个子目录（d3_4_1/d3_4_2/d3_4_3），每个子目录有 3 文件 + 1 软链接
+# d3_4 本身有 3 文件 + 1 软链接
+# 路径变更总计：4 dirs + 12 files + 4 symlinks = 20 entries
+mv "$BASE/d3/d3_4" "$BASE/d4/d3_4"
+echo "RENAME: cross-parent move, name unchanged (d3/d3_4 -> d4/d3_4, cascade: 3 subdirs + 12 files + 4 symlinks, 20 entries)"
+
+# ============================================================
 # Part 3: 汇总与校验
 # ============================================================
 echo ""
@@ -142,7 +165,12 @@ echo ""
 echo "--- Structural changes ---"
 echo "New:     dirs=2,  files=3, symlinks=2  (total=7)"
 echo "Changed: dirs=0,  files=2, symlinks=0  (total=2, content modified)"
-echo "Renamed: dirs=1,  files=4, symlinks=2  (total=7)"
+echo "Renamed: dirs=9,  files=28, symlinks=10  (total=47)"
+echo "  - file rename:          dirs=0, files=1, symlinks=0"
+echo "  - symlink rename:       dirs=0, files=0, symlinks=1"
+echo "  - leaf dir rename:      dirs=1, files=3, symlinks=1  (d3/d3_1/d3_1_3)"
+echo "  - non-leaf dir rename:  dirs=4, files=12, symlinks=4  (d1/d1_1 + 3 subdirs)"
+echo "  - cross-parent move:    dirs=4, files=12, symlinks=4  (d3/d3_4 -> d4/d3_4)"
 echo "Deleted: dirs=1,  files=5, symlinks=2  (total=8)"
 echo ""
 echo "--- Attribute-only changes (no content/structure change) ---"

@@ -49,20 +49,12 @@ async fn copy_file_returns_cancelled_when_token_pre_cancelled() {
     let token = CancellationToken::new();
     token.cancel();
 
-    let res = StorageEnum::copy_file_with_cancel(
-        &src,
-        &dst,
-        &entry,
-        None,
-        false,
-        true,
-        None,
-        Some(token),
-    )
-    .await;
+    let res = StorageEnum::copy_file_with_cancel(&src, &dst, &entry, None, false, true, None, Some(token)).await;
 
-    assert!(matches!(res, Err(StorageError::Cancelled)),
-        "expected Cancelled, got {res:?}");
+    assert!(
+        matches!(res, Err(StorageError::Cancelled)),
+        "expected Cancelled, got {res:?}"
+    );
     assert!(
         dst.get_metadata(Path::new("blob.bin")).await.is_err(),
         "no destination object should have been written"
@@ -107,8 +99,10 @@ async fn copy_file_aborts_mid_transfer_on_token_cancel() {
     .await;
     let elapsed = started.elapsed();
 
-    assert!(matches!(res, Err(StorageError::Cancelled)),
-        "expected Cancelled, got {res:?}");
+    assert!(
+        matches!(res, Err(StorageError::Cancelled)),
+        "expected Cancelled, got {res:?}"
+    );
     assert!(
         elapsed < Duration::from_secs(3),
         "cancel should resolve well before unconstrained 4 s deadline (took {elapsed:?})"

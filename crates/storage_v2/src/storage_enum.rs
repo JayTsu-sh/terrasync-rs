@@ -686,10 +686,9 @@ impl StorageEnum {
             None => join_io.await,
         };
 
-        let source_hasher = read_res
-            .map_err(|e| StorageError::OperationError(format!("read task panicked: {e:?}")))??;
-        write_res
-            .map_err(|e| StorageError::OperationError(format!("write task panicked: {e:?}")))??;
+        let source_hasher =
+            read_res.map_err(|e| StorageError::OperationError(format!("read task panicked: {e:?}")))??;
+        write_res.map_err(|e| StorageError::OperationError(format!("write task panicked: {e:?}")))??;
 
         // Final cancel check before integrity verification (which itself does IO).
         if let Some(ref token) = cancel

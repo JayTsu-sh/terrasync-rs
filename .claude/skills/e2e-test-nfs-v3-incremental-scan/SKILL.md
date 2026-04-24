@@ -179,7 +179,7 @@ OK: Post-mutation counts verified
 **结构性变更**：
 - **ADD**: 2 dirs, 3 files, 2 symlinks
 - **MODIFY**: 2 files（追加/覆盖内容改变 size+mtime）
-- **RENAME**: 1 file, 1 symlink, 1 dir（含级联 3 files + 1 symlink）
+- **RENAME**: 1 file, 1 symlink, 3 dirs（leaf-dir 级联 3 files + 1 symlink；non-leaf-dir d1_1 rename 级联 3 subdirs + 12 files + 4 symlinks；cross-parent move d3_4 级联 3 subdirs + 12 files + 4 symlinks）
 - **DELETE**: 1 dir+内容（3 files + 1 symlink）, 2 files, 1 symlink
 
 **属性变更（不改内容/结构）**：
@@ -218,7 +218,7 @@ Expected Incremental Statistics:
 ```
    ├─ New:          7 total | dirs      2 | files      3 | symlinks    2
    ├─ Changed:      9 total | dirs      0 | files      9 | symlinks    0
-   ├─ Renamed:      7 total | dirs      1 | files      4 | symlinks    2
+   ├─ Renamed:     47 total | dirs      9 | files     28 | symlinks   10
    └─ Deleted:      8 total | dirs      1 | files      5 | symlinks    2
 ```
 
@@ -230,7 +230,7 @@ Expected Incremental Statistics:
   - touch mtime（special）：file_2020-01-01... + file_2026-01-01...（2 files）
   - mixed attr（含 mtime）：exec_new.sh + readonly_old.txt（2 files）
   - 注意：chmod-only / chown-only 不改 mtime，Fh3 模式**不检测**；touch dirs 已移除
-- Renamed 7 = 1 file + 1 symlink + 1 dir 级联（dir + 3 files + 1 symlink）
+- Renamed 47 = 1 file + 1 symlink + leaf-dir 级联（1 dir + 3 files + 1 symlink）+ non-leaf-dir rename（4 dirs + 12 files + 4 symlinks）+ cross-parent move（4 dirs + 12 files + 4 symlinks）
 - Deleted 8 = 1 dir(d3_3_3) + 5 files(3 in dir + 2 standalone) + 2 symlinks(1 in dir + 1 standalone)
 
 **若任意计数不符，按以下步骤排查：**
@@ -301,9 +301,9 @@ deleted true    false   1
 new     false   false   3
 new     false   true    2
 new     true    false   2
-rename  false   false   4
-rename  false   true    2
-rename  true    false   1
+rename  false   false   28
+rename  false   true    10
+rename  true    false   9
 ```
 
 **changed 计数说明**：files=9（内容变更 2 + mtime 变更 7）, dirs=2（mtime 变更）。chmod/chown 仅改 mode/uid/gid 不改 mtime，Fh3 模式不检测为 changed。
@@ -371,7 +371,7 @@ Expected: 无输出（空）。
 - [ ] ClickHouse base table verified at baseline (Step 2b)
 - [ ] Mutations applied, find verified: dirs={POST_MUTATE_DIRS}/files={POST_MUTATE_FILES}/symlinks={POST_MUTATE_SYMLINKS} (Step 3)
 - [ ] Incremental scan Scanned Statistics: dirs={POST_MUTATE_DIRS}/files={POST_MUTATE_FILES}/symlinks={POST_MUTATE_SYMLINKS} (Step 4a)
-- [ ] Incremental Statistics: new=7/changed=11/renamed=7/deleted=8 (Step 4b)
+- [ ] Incremental Statistics: new=7/changed=11/renamed=47/deleted=8 (Step 4b)
 - [ ] ClickHouse base table post-incremental: total=526 (Step 4c)
 - [ ] ClickHouse incremental table: 11 rows verified (Step 4d)
 - [ ] Environment cleaned (Step 5)

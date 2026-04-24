@@ -455,7 +455,7 @@ Expected: 无输出（空）。
 - [ ] ClickHouse base table verified after full sync (Step 3b)
 - [ ] Dest find counts match after full sync (Step 3c)
 - [ ] Source mutations applied: dirs={POST_MUTATE_DIRS}/files={POST_MUTATE_FILES}/symlinks={POST_MUTATE_SYMLINKS} (Step 4)
-- [ ] Incremental sync: new=7/changed=19/renamed=7/deleted=8 (Step 5b)
+- [ ] Incremental sync: new=7/changed=19/renamed=47/deleted=8 (Step 5b)
 - [ ] Dest find counts match: dirs={POST_MUTATE_DIRS}/files={POST_MUTATE_FILES}/symlinks={POST_MUTATE_SYMLINKS} (Step 6a)
 - [ ] Dest scan counts match (Step 6b)
 - [ ] ClickHouse dest base table verified (Step 6c)

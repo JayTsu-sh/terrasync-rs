@@ -200,13 +200,14 @@ impl JoinStrategy {
             ),
             Self::FileHandle => format!(
                 "SELECT {t_columns} FROM {temp} t \
-                 JOIN (SELECT file_handle, size, mtime, mode, uid, gid, is_dir \
+                 JOIN (SELECT file_handle, relative_path, size, mtime, mode, uid, gid, is_dir \
                        FROM {base} \
                        WHERE file_handle IN \
                              (SELECT file_handle FROM {temp} WHERE file_handle IS NOT NULL) \
-                       ORDER BY file_handle \
-                       LIMIT 1 BY file_handle \
+                       ORDER BY file_handle, relative_path \
+                       LIMIT 1 BY (file_handle, relative_path) \
                  ) f ON t.file_handle = f.file_handle \
+                   AND t.relative_path = f.relative_path \
                  WHERE {kind_filter} AND f.is_dir = 0 \
                  ORDER BY t.relative_path, t.version_id"
             ),
@@ -1421,8 +1422,10 @@ mod tests {
     #[test]
     fn test_detect_changed_sql_fh_mode_data_only() {
         let sql = JoinStrategy::FileHandle.build_detect_changed_sql("temp_x", "base_y", ChangeKind::DataOnly);
-        assert!(sql.contains("LIMIT 1 BY file_handle"));
+        // 路径等值条件：仅对路径未变的条目判 Changed，避免把 rename+changed 误判为纯 Changed
+        assert!(sql.contains("LIMIT 1 BY (file_handle, relative_path)"));
         assert!(sql.contains("t.file_handle = f.file_handle"));
+        assert!(sql.contains("t.relative_path = f.relative_path"));
         assert!(sql.contains("t.size != f.size OR t.mtime != f.mtime"));
         assert!(sql.contains("t.mode = f.mode AND t.uid = f.uid AND t.gid = f.gid"));
     }
