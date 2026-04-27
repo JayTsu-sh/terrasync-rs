@@ -16,9 +16,6 @@
 
 // 内部模块
 
-/// 通用异步 mpsc 通道接收器封装
-pub mod async_receiver;
-
 /// 应用配置管理模块
 /// 负责加载、解析和提供应用配置
 pub mod app_config;
@@ -49,8 +46,6 @@ pub use types::sanitize_job_id;
 pub mod prelude {
     /// 应用配置相关类型
     pub use crate::app_config::AppConfig;
-    /// 异步通道接收器封装
-    pub use crate::async_receiver::AsyncReceiver;
     /// 加密工具相关类型
     pub use crate::crypto::CryptoUtil;
     /// 错误处理相关类型

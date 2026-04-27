@@ -1,7 +1,7 @@
 use axum::Json;
 use axum::extract::{Path, State};
+use data_mover::S3BucketInfo;
 use serde::{Deserialize, Serialize};
-use storage_v2::S3BucketInfo;
 
 use crate::api::state::AppState;
 use crate::application::endpoint_service::{CreateEndpointRequest, UpdateEndpointRequest, UpdateEndpointResponse};

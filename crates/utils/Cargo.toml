@@ -12,7 +12,6 @@ syslog = []
 journald = []
 
 [dependencies]
-async-channel = "2"
 config = "0.15.22"
 hex = "0.4.3"
 log = "0.4.29"

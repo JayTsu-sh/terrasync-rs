@@ -13,8 +13,8 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 // 外部crate
 use dashmap::DashMap;
-use storage_v2::qos::QosManager;
-use storage_v2::{EntryEnum, ErrorEvent, StorageEntryMessage, StorageEnum, create_storage, create_storage_for_dest};
+use data_mover::qos::QosManager;
+use data_mover::{EntryEnum, ErrorEvent, StorageEntryMessage, StorageEnum, create_storage, create_storage_for_dest};
 use tokio::sync::Mutex;
 use tracing::{Instrument, debug, error, info, info_span, instrument, trace, warn};
 #[cfg(windows)]
@@ -603,7 +603,7 @@ async fn process_entry_inner(
     } else {
         debug!("Copying file {:?}", relative_path);
 
-        // 调用 storage_v2 的 copy_file（处理 QoS、完整性检查、源文件删除）
+        // 调用 data_mover 的 copy_file（处理 QoS、完整性检查、源文件删除）
         StorageEnum::copy_file(
             &src_storage,
             &dest_storage,
@@ -1360,7 +1360,7 @@ pub async fn integrity_check(
 #[cfg(feature = "license")]
 pub(crate) async fn verify_storage_time(dest_path: &str) -> Result<()> {
     use chrono::DateTime;
-    use storage_v2::storage_enum::{StorageType, detect_storage_type};
+    use data_mover::storage_enum::{StorageType, detect_storage_type};
 
     // 本地存储 mtime 等于系统时钟，无校验意义
     if matches!(detect_storage_type(dest_path), StorageType::Local) {

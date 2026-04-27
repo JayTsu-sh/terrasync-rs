@@ -15,8 +15,8 @@ use std::time::{Duration, SystemTime};
 // 外部crate
 use async_trait::async_trait;
 use bytes::Bytes;
+use data_mover::{ChangeKind, EntryEnum, NASEntry, S3Entry, StorageEntryMessage};
 use serde::{Deserialize, Serialize};
-use storage_v2::{ChangeKind, EntryEnum, NASEntry, S3Entry, StorageEntryMessage};
 use tokio::sync::mpsc;
 use tracing::{trace, warn};
 
@@ -150,7 +150,7 @@ impl StorageEntryRecord {
         let tags = self
             .tags
             .as_ref()
-            .and_then(|tags_str| serde_json::from_str::<Vec<storage_v2::Tag>>(tags_str).ok());
+            .and_then(|tags_str| serde_json::from_str::<Vec<data_mover::Tag>>(tags_str).ok());
 
         if self.storage_type == "s3" {
             EntryEnum::S3(S3Entry {
@@ -254,7 +254,7 @@ impl IncrementalStorageEntryRecord {
     /// 从 `StorageEntryMessage` 创建 `IncrementalStorageEntryRecord`
     ///
     /// # 参数
-    /// - `message`: 存储条目消息对象（来自 `storage_v2`）
+    /// - `message`: 存储条目消息对象（来自 `data_mover`）
     ///
     /// # 返回值
     /// - 转换后的 `IncrementalStorageEntryRecord` 对象
@@ -556,7 +556,7 @@ pub trait Database: Send + Sync {
     /// 批量插入增量记录
     ///
     /// # 参数
-    /// - `records`: `StorageEntryMessage` 切片（来自 `storage_v2`）
+    /// - `records`: `StorageEntryMessage` 切片（来自 `data_mover`）
     ///
     /// # 返回值
     /// - 成功返回Ok(())

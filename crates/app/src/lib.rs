@@ -75,7 +75,7 @@ pub mod tar_pack;
 /// 简化应用开发过程中的导入语句
 pub mod prelude {
     /// `QoS` 带宽解析函数
-    pub use storage_v2::qos::parse_bandwidth_string;
+    pub use data_mover::qos::parse_bandwidth_string;
 
     /// Windows ACL相关功能（仅Windows平台可用）
     #[cfg(windows)]

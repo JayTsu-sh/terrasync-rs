@@ -7,8 +7,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
+use data_mover::StorageEntryMessage;
 use indicatif::{ProgressBar as IndicatifBar, ProgressStyle};
-use storage_v2::StorageEntryMessage;
 use tracing::info;
 
 use super::accumulator::{fmt_elapsed, format_bytes};

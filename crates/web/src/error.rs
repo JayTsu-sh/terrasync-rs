@@ -75,7 +75,7 @@ pub enum WebError {
 
     /// Storage 层错误（如 NFS 查询失败）
     #[error("Storage error: {0}")]
-    StorageError(#[from] storage_v2::error::StorageError),
+    StorageError(#[from] data_mover::error::StorageError),
 
     /// 请求体 JSON 反序列化失败
     #[error("Invalid request body: {0}")]

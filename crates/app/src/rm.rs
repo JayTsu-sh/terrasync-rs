@@ -6,8 +6,8 @@
 use std::time::Duration;
 
 // 外部crate
+use data_mover::create_storage;
 use indicatif::{ProgressBar, ProgressStyle};
-use storage_v2::create_storage;
 use tracing::info;
 use utils::prelude::AppConfig;
 

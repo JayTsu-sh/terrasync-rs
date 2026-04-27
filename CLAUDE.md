@@ -48,7 +48,7 @@ Cargo workspace，crate 职责：
 | `src/` (root)  | Entry point only — calls `cli::cli_match()`                              |
 | `cli/`         | Argument parsing (clap), routes commands to `app`                        |
 | `app/`         | Core business logic: scan, sync, dir\_walker, consumers, ACE             |
-| `storage_v2/`  | Storage abstraction: NASEntry, S3Entry, StorageV2Enum, filter, qos       |
+| `data-mover`   | Storage abstraction: NASEntry, S3Entry, StorageEnum, filter, qos (external git dep) |
 | `db/`          | Database layer: ClickHouse (always), DuckDB (feature-gated)              |
 | `transport/`   | 传输层抽象：InProcess / QUIC，Sender↔Receiver 消息协议                   |
 | `sync-delta/`  | chunk 级增量算法（rsync 风格）：rolling checksum, block signature, delta  |
@@ -62,7 +62,7 @@ Cargo workspace，crate 职责：
 ```
 CLI args → cli::cli_match()
          → app::scan / app::sync / app::ace
-         → app::dir_walker (walks storage via storage_v2::StorageV2Enum)
+         → app::dir_walker (walks storage via data_mover::StorageEnum)
          → transport (InProcess/QUIC) ←→ app::receiver (双进程模式)
          → sync-delta (增量同步时的 chunk 匹配)
          → app::consumer (ConsumerManager → DatabaseConsumer, StatisticConsumer, KafkaConsumer)
@@ -71,8 +71,8 @@ CLI args → cli::cli_match()
 
 ### Key Types
 
-- **`storage_v2::{NASEntry, S3Entry}`** — 主力 entry 类型（NAS/S3 分离，类型精确）
-- **`storage_v2::storage_enum::StorageV2Enum`** — 存储枚举 dispatch（Local/NFS/S3/CIFS）
+- **`data_mover::{NASEntry, S3Entry}`** — 主力 entry 类型（NAS/S3 分离，类型精确）
+- **`data_mover::storage_enum::StorageEnum`** — 存储枚举 dispatch（Local/NFS/S3/CIFS）
 - **`transport::message::{SenderMsg, ReceiverMsg}`** — Sender↔Receiver 传输协议消息
 - **`sync_delta::DeltaToken`** — 增量差异描述（BlockRef / Literal）
 - **`db::traits::Database`** — abstraction over ClickHouse / DuckDB backends
@@ -112,11 +112,11 @@ Operations become incremental automatically when a `jobs/<job_id>/` directory al
 
 ```rust
 // ❌ 禁止 — 三层路径 / crate:: 直接出现在代码中
-let entry = storage_v2::common::NASEntry::new();
+let entry = data_mover::NASEntry::new();
 fn foo() -> crate::error::Result<()> { ... }
 
 // ✅ 正确 — 通过顶部 use 导入
-use storage_v2::common::NASEntry;
+use data_mover::NASEntry;
 use crate::error::Result;
 let entry = NASEntry::new();
 ```
@@ -188,7 +188,7 @@ use thiserror::Error;
 pub enum XxxError {
     // 包装下游 crate 错误：用 #[from] 实现自动转换
     #[error("Storage error: {0}")]
-    StorageError(#[from] storage_v2::error::StorageError),
+    StorageError(#[from] data_mover::error::StorageError),
 
     // 包装标准库错误
     #[error("IO error: {0}")]
@@ -205,7 +205,7 @@ pub enum XxxError {
 pub type Result<T> = std::result::Result<T, XxxError>;
 ```
 
-错误传播方向：`utils → storage/storage_v2 → db / kafka → app → cli / web`
+错误传播方向：`utils → data-mover → db / kafka → app → cli / web`
 
 上层 crate 通过 `#[from]` 自动包装下层错误，**不得**用 `.to_string()` 丢失类型信息后再包进 `String` 变种。
 
@@ -217,7 +217,7 @@ AppError::ScanError(storage_err.to_string())
 
 // ✅ 保留类型，用 #[from] 或 impl From<>
 #[error("Storage error: {0}")]
-StorageError(#[from] storage_v2::error::StorageError),
+StorageError(#[from] data_mover::error::StorageError),
 // 然后直接 storage_op()?  — 自动转换
 
 // ✅ 需要附加上下文时，用 map_err 包装语义变种
@@ -242,7 +242,7 @@ storage_op().map_err(|e| AppError::CopyFailed { path: path.clone(), source: e })
 - DB 写入必须批量 `batch_insert`，**禁止**循环逐条 insert
 - 限速用 `QosManager` (TokenBucket)，**禁止** `tokio::time::sleep` 粗粒度限速
 - channel 背压靠 `bounded()` 自然限流，**禁止** unbounded channel
-- 存储层优先 `storage_v2`，枚举 dispatch > `Box<dyn Storage>`
+- 存储层优先 `data_mover`，枚举 dispatch > `Box<dyn Storage>`
 - `StorageEnum` 接口尽可能复用，避免重复类似的接口
 - 热路径**禁止** `format!` / `to_string()`，应复用 buffer（`write!(&mut buf, ...)`  + `buf.clear()`）
 - 已知大小的集合必须 `Vec::with_capacity(n)`，**禁止**空 `Vec` + 循环 push 导致多次 realloc

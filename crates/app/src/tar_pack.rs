@@ -4,9 +4,9 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 
 // 内部模块
-use storage_v2::qos::QosManager;
-use storage_v2::storage_enum::StorageEnum;
-use storage_v2::{EntryEnum, NASEntry, S3Entry, StorageEntryMessage, WalkDirAsyncIterator, calculate_tar_size};
+use data_mover::qos::QosManager;
+use data_mover::storage_enum::StorageEnum;
+use data_mover::{EntryEnum, NASEntry, S3Entry, StorageEntryMessage, WalkDirAsyncIterator, calculate_tar_size};
 // 外部crate
 use tracing::{debug, info};
 

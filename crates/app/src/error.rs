@@ -12,7 +12,7 @@ use thiserror::Error;
 pub enum AppError {
     /// 存储错误
     #[error("{0}")]
-    StorageV2Error(#[from] storage_v2::error::StorageError),
+    StorageError(#[from] data_mover::error::StorageError),
 
     /// 数据库错误
     #[error("{0}")]

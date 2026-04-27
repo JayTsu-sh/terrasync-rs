@@ -34,7 +34,7 @@ mime_guess = "2"
 # Workspace 依赖
 app = { path = "../app" }
 utils = { path = "../utils" }
-storage_v2 = { path = "../storage_v2" }
+data-mover = { git = "https://github.com/JayTsu-sh/data-mover-rs.git" }
 
 [lints]
 workspace = true

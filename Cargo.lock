@@ -167,6 +167,7 @@ dependencies = [
  "blake3",
  "bytes 1.11.1",
  "dashmap",
+ "data-mover",
  "db",
  "futures",
  "indicatif",
@@ -176,7 +177,6 @@ dependencies = [
  "serde",
  "serde_json",
  "serial_test",
- "storage_v2",
  "sync-delta",
  "thiserror 2.0.18",
  "tokio",
@@ -1397,9 +1397,9 @@ dependencies = [
  "app",
  "chrono",
  "clap",
+ "data-mover",
  "licensing",
  "rustls 0.23.37",
- "storage_v2",
  "thiserror 2.0.18",
  "tracing",
  "transport",
@@ -1937,6 +1937,52 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d7a1e2f27636f116493b8b860f5546edb47c8d8f8ea73e1d2a20be88e28d1fea"
 
 [[package]]
+name = "data-mover"
+version = "0.2.0"
+source = "git+https://github.com/JayTsu-sh/data-mover-rs.git#4289a15cf09e5f773c61dc09f7f89e87a4ea5a8e"
+dependencies = [
+ "arc-swap",
+ "async-channel",
+ "async-trait",
+ "aws-config",
+ "aws-credential-types",
+ "aws-sdk-s3",
+ "aws-smithy-runtime-api",
+ "aws-smithy-types",
+ "aws-types",
+ "binrw",
+ "blake3",
+ "bytes 1.11.1",
+ "chrono",
+ "dashmap",
+ "filetime",
+ "futures",
+ "glob",
+ "governor",
+ "http-body 1.0.1",
+ "hyper-rustls 0.27.7",
+ "hyper-util",
+ "moka",
+ "nfs-rs",
+ "path-clean",
+ "quick-xml",
+ "rayon",
+ "remove_dir_all",
+ "reqwest 0.13.2",
+ "rustls 0.23.37",
+ "serde",
+ "smb",
+ "soft-canonicalize",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "url",
+ "windows",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "db"
 version = "0.2.0"
 dependencies = [
@@ -1944,12 +1990,12 @@ dependencies = [
  "bytes 1.11.1",
  "clickhouse",
  "dashmap",
+ "data-mover",
  "duckdb",
  "hex",
  "once_cell",
  "serde",
  "serde_json",
- "storage_v2",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
@@ -6230,55 +6276,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
 
 [[package]]
-name = "storage_v2"
-version = "0.2.0"
-dependencies = [
- "arc-swap",
- "async-channel",
- "async-trait",
- "aws-config",
- "aws-credential-types",
- "aws-sdk-s3",
- "aws-smithy-runtime-api",
- "aws-smithy-types",
- "aws-types",
- "binrw",
- "blake3",
- "bytes 1.11.1",
- "chrono",
- "clap",
- "dashmap",
- "filetime",
- "futures",
- "glob",
- "governor",
- "http-body 1.0.1",
- "hyper-rustls 0.27.7",
- "hyper-util",
- "indicatif",
- "lazy_static",
- "moka",
- "nfs-rs",
- "path-clean",
- "quick-xml",
- "rayon",
- "remove_dir_all",
- "reqwest 0.13.2",
- "rustls 0.23.37",
- "serde",
- "smb",
- "soft-canonicalize",
- "thiserror 2.0.18",
- "tokio",
- "tokio-util",
- "tracing",
- "url",
- "utils",
- "windows",
- "windows-sys 0.61.2",
-]
-
-[[package]]
 name = "stringprep"
 version = "0.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6863,11 +6860,11 @@ dependencies = [
  "async-trait",
  "bincode",
  "bytes 1.11.1",
+ "data-mover",
  "quinn",
  "rcgen",
  "rustls 0.23.37",
  "serde",
- "storage_v2",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
@@ -7034,7 +7031,6 @@ checksum = "06abde3611657adf66d383f00b093d7faecc7fa57071cce2578660c9f1010821"
 name = "utils"
 version = "1.0.0"
 dependencies = [
- "async-channel",
  "config",
  "hex",
  "log",
@@ -7293,6 +7289,7 @@ dependencies = [
  "axum",
  "chrono",
  "dashmap",
+ "data-mover",
  "futures-util",
  "mime_guess",
  "reqwest 0.13.2",
@@ -7300,7 +7297,6 @@ dependencies = [
  "serde",
  "serde_json",
  "sqlx",
- "storage_v2",
  "thiserror 2.0.18",
  "tokio",
  "tokio-util",

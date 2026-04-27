@@ -10,10 +10,10 @@
 use std::sync::Arc;
 
 // 外部crate
+use data_mover::{EntryEnum, StorageEntryMessage, WalkDirAsyncIterator, canonicalize_path};
 use db::factory::DatabaseFactory;
 use db::traits::Database;
 use db::{self, DeletionStatus, INCREMENTAL_SCAN_TABLE_BASE_NAME};
-use storage_v2::{EntryEnum, StorageEntryMessage, WalkDirAsyncIterator, canonicalize_path};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::{Instrument, debug, error, info, info_span, instrument, trace, warn};
@@ -724,7 +724,7 @@ async fn generate_storage_entry_message_events(
     trace!("Task {} querying changed items for {}", task_id, batch_type);
     match database.detect_changed_items().await {
         Ok(changed_items) => {
-            let items: Vec<(EntryEnum, storage_v2::ChangeKind)> = changed_items.collect();
+            let items: Vec<(EntryEnum, data_mover::ChangeKind)> = changed_items.collect();
             if !keep_item {
                 for (item, _) in &items {
                     excluded_paths.push((

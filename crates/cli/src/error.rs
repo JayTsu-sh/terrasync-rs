@@ -69,7 +69,7 @@ pub enum CliError {
 
     /// 存储层错误
     #[error("{0}")]
-    StorageError(#[from] storage_v2::error::StorageError),
+    StorageError(#[from] data_mover::error::StorageError),
 
     /// IO错误
     ///

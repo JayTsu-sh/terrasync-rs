@@ -5,8 +5,8 @@ use std::sync::atomic::{AtomicU8, Ordering};
 
 // 外部crate
 use async_trait;
+use data_mover::{ChangeKind, EntryEnum, StorageEntryMessage};
 use duckdb::{Connection, params};
-use storage_v2::{ChangeKind, EntryEnum, StorageEntryMessage};
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, trace, warn};
 

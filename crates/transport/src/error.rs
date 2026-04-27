@@ -22,7 +22,7 @@ pub enum TransportError {
 
     /// 底层存储操作错误
     #[error("Storage error: {0}")]
-    StorageError(#[from] storage_v2::error::StorageError),
+    StorageError(#[from] data_mover::error::StorageError),
 }
 
 pub type Result<T> = std::result::Result<T, TransportError>;

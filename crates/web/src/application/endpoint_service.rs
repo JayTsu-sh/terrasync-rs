@@ -167,7 +167,7 @@ impl EndpointService {
     async fn test_endpoint_connectivity(endpoint: &Endpoint) -> Result<String> {
         let url = endpoint.to_storage_url(None);
 
-        let storage = storage_v2::create_storage(&url, None)
+        let storage = data_mover::create_storage(&url, None)
             .await
             .map_err(|e| WebError::ConnectionTestFailed(e.to_string()))?;
         storage

@@ -133,7 +133,7 @@ impl Serialize for Endpoint {
 impl Endpoint {
     /// 将端点配置转换为 storage URL 格式
     ///
-    /// 生成与 `storage_v2::storage_enum::detect_storage_type()` 兼容的 URL 字符串。
+    /// 生成与 `data_mover::storage_enum::detect_storage_type()` 兼容的 URL 字符串。
     /// 可选 `sub_path` 会追加到端点基础路径后。
     pub fn to_storage_url(&self, sub_path: Option<&str>) -> String {
         match &self.config {

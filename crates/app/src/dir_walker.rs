@@ -3,8 +3,8 @@ use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
 
-use storage_v2::storage_enum::{StorageEnum, create_storage};
-use storage_v2::{ErrorEvent, StorageEntryMessage, WalkDirAsyncIterator};
+use data_mover::storage_enum::{StorageEnum, create_storage};
+use data_mover::{ErrorEvent, StorageEntryMessage, WalkDirAsyncIterator};
 // 外部crate
 use tracing::{Instrument, error, info, info_span};
 
@@ -75,7 +75,7 @@ impl DirectoryWalker {
 /// 并通过 `WalkDirAsyncIterator` 返回。
 ///
 /// # 参数
-/// - `storage`: `storage_v2` 存储实例
+/// - `storage`: `data_mover` 存储实例
 /// - `file_list_path`: 文件列表路径
 ///
 /// # 返回值
@@ -164,11 +164,11 @@ fn walkdir_from_file_list(storage: StorageEnum, file_list_path: &str) -> Result<
         .instrument(span),
     );
 
-    Ok(storage_v2::WalkDirAsyncIterator::new(rx))
+    Ok(data_mover::WalkDirAsyncIterator::new(rx))
 }
 
 /// 通用的目录遍历函数 - 作为便捷的包装器
-pub async fn walkdir(config: ScanConfig) -> Result<storage_v2::WalkDirAsyncIterator> {
+pub async fn walkdir(config: ScanConfig) -> Result<data_mover::WalkDirAsyncIterator> {
     let walker = DirectoryWalker::new(config);
     walker.walk().await
 }

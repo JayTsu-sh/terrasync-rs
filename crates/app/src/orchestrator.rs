@@ -28,14 +28,14 @@ impl Drop for AtomicCounterGuard<'_> {
 
 // 外部 crate
 use dashmap::DashMap;
+use data_mover::error::StorageError;
+use data_mover::qos::QosManager;
+#[cfg(windows)]
+use data_mover::storage_enum::{StorageType, detect_storage_type};
+use data_mover::{ChangeKind, EntryEnum, ErrorEvent, StorageEntryMessage, StorageEnum, create_storage};
 use db::factory::DatabaseFactory;
 use db::traits::Database;
 use db::{self, DeletionStatus, INCREMENTAL_SCAN_TABLE_BASE_NAME};
-use storage_v2::error::StorageError;
-use storage_v2::qos::QosManager;
-#[cfg(windows)]
-use storage_v2::storage_enum::{StorageType, detect_storage_type};
-use storage_v2::{ChangeKind, EntryEnum, ErrorEvent, StorageEntryMessage, StorageEnum, create_storage};
 use tokio::sync::{Semaphore, mpsc};
 use tokio::task::JoinHandle;
 use tracing::{Instrument, debug, error, info, info_span, trace, warn};
@@ -809,7 +809,7 @@ impl SyncOrchestrator {
                             }
                             StorageEntryMessage::Changed { ref entry, kind } => {
                                 // MetadataOnly：chmod/chown 变更，跳过 copy_file 只同步属性
-                                let result = if kind == storage_v2::ChangeKind::MetadataOnly {
+                                let result = if kind == data_mover::ChangeKind::MetadataOnly {
                                     process_metadata_only_entry(
                                         entry,
                                         src.clone(),

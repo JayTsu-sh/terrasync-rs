@@ -21,7 +21,6 @@ members = [
     "crates/cli",
     "crates/app",
     "crates/db",
-    "crates/storage_v2",
     "crates/licensing",
     "crates/web",
     "crates/transport",

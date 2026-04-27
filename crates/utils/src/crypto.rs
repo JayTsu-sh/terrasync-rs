@@ -16,8 +16,8 @@ use crate::error::{Result, UtilsError};
 const PASSWORD_SALT_LENGTH: usize = 8;
 const ENCRYPTED_PASSWORD_LENGTH: usize = 73;
 
-/// 内置默认加密密钥（仅当 TERRASYNC_CRYPTO_KEY 环境变量未设置时使用）
-/// 生产环境应通过 TERRASYNC_CRYPTO_KEY 环境变量设置独立的密钥以提高安全性
+/// 内置默认加密密钥（仅当 `TERRASYNC_CRYPTO_KEY` 环境变量未设置时使用）
+/// 生产环境应通过 `TERRASYNC_CRYPTO_KEY` 环境变量设置独立的密钥以提高安全性
 const DEFAULT_CRYPTO_SECRET: &str = "terrasync-secret-key";
 
 /// 获取当前有效的加密密钥

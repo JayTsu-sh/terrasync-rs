@@ -10,8 +10,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 // 外部 crate
 use bytes::{BufMut, BytesMut};
-use storage_v2::qos::QosManager;
-use storage_v2::{EntryEnum, StorageEnum};
+use data_mover::qos::QosManager;
+use data_mover::{EntryEnum, StorageEnum};
 use tokio::sync::mpsc::Receiver as MpscReceiver;
 use tracing::{Instrument, debug, error, info, info_span, trace, warn};
 use transport::message::{DestIndex, NdxTable, ProgressSnapshot, ReceiverMsg, SenderMsg, SessionConfig};
@@ -328,7 +328,7 @@ async fn recv_file_list_phase(
                     .await
                 {
                     while let Some(msg) = iter.next().await {
-                        if let storage_v2::StorageEntryMessage::Scanned(entry) = msg {
+                        if let data_mover::StorageEntryMessage::Scanned(entry) = msg {
                             dest_index.insert(entry);
                         }
                     }
@@ -526,7 +526,7 @@ async fn recv_file_data_phase(
 /// `tokens` 非空时执行 delta 重建，为空时直接使用 `file_data`。
 /// 所有非致命错误（basis 读失败、hash 不符、写入失败）均自行发送 `EntryError` 后返回，不向上传播。
 async fn handle_end_of_file(
-    transport: &(dyn ReceiverTransport + 'static), dest_storage: &Arc<StorageEnum>, entry: Arc<storage_v2::EntryEnum>,
+    transport: &(dyn ReceiverTransport + 'static), dest_storage: &Arc<StorageEnum>, entry: Arc<data_mover::EntryEnum>,
     source_hash: Option<String>, tokens: Vec<sync_delta::DeltaToken>, file_data: bytes::Bytes,
     progress: &Arc<ReceiverProgress>,
 ) {

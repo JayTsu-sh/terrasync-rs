@@ -10,9 +10,9 @@ mod duckdb_integration_tests {
     // 外部crate
     use bytes::Bytes;
     // 内部模块
+    use data_mover::{EntryEnum, NASEntry, S3Entry};
     use db::duckdb::DuckDBDatabase;
     use db::{Database, DeletionStatus, DuckDBConfig};
-    use storage_v2::{EntryEnum, NASEntry, S3Entry};
 
     // 使用原子计数器确保每个测试用例都有唯一的job_id
     static TEST_COUNTER: AtomicUsize = AtomicUsize::new(0);

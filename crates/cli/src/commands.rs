@@ -17,7 +17,7 @@ use std::sync::Arc;
 use app::config::SyncJobConfig;
 use app::orchestrator::SyncOrchestrator;
 use app::prelude::{integrity_check, parse_bandwidth_string, rm, scan, sync};
-use storage_v2::create_storage_for_dest;
+use data_mover::create_storage_for_dest;
 use tracing::info;
 use transport::quic;
 use utils::app_config::AppConfig;
@@ -45,7 +45,7 @@ pub fn validate_qos_format(s: &str) -> Result<String> {
 }
 
 /// 校验并 trim 存储路径（本地 / nfs:// / s3:// / s3+http:// / s3+https:// / s3+hcp://）
-/// 参考 `storage_v2/src/storage_enum.rs` 和 `storage_v2/src/s3.rs` 中的协议解析逻辑
+/// 参考 `data_mover::storage_enum` 和 `data_mover::s3` 中的协议解析逻辑
 pub fn validate_storage_path(s: &str) -> Result<String> {
     let s = s.trim();
     if s.is_empty() {

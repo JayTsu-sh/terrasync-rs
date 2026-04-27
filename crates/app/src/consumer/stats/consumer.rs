@@ -14,7 +14,7 @@ use std::sync::atomic::AtomicU64;
 use std::time::Duration;
 
 // 外部crate
-use storage_v2::StorageEntryMessage;
+use data_mover::StorageEntryMessage;
 use tokio::sync::{Mutex, mpsc};
 use tokio::task::JoinHandle;
 use tracing::{error, info, trace, warn};

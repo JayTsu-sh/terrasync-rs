@@ -6,8 +6,8 @@ use std::sync::Arc;
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 // 内部模块
-use storage_v2::dir_tree::DirPageResult;
-use storage_v2::{DataChunk, EntryEnum};
+use data_mover::dir_tree::DirPageResult;
+use data_mover::{DataChunk, EntryEnum};
 
 // ============================================================
 // Sender → Receiver 消息

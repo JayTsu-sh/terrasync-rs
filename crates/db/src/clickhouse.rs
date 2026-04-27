@@ -10,9 +10,9 @@ use std::sync::atomic::{AtomicU8, Ordering};
 // 外部crate
 use async_trait::async_trait;
 use clickhouse::Client;
+use data_mover::{ChangeKind, EntryEnum, StorageEntryMessage};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use storage_v2::{ChangeKind, EntryEnum, StorageEntryMessage};
 use tokio::sync::mpsc;
 use tracing::{debug, info, trace, warn};
 
@@ -1115,7 +1115,7 @@ mod tests {
 
     #[test]
     fn test_nas_entry_roundtrip() {
-        let nas = storage_v2::EntryEnum::NAS(storage_v2::NASEntry {
+        let nas = data_mover::EntryEnum::NAS(data_mover::NASEntry {
             name: "test.txt".to_string(),
             relative_path: PathBuf::from("dir/test.txt"),
             extension: Some("txt".to_string()),
@@ -1152,7 +1152,7 @@ mod tests {
 
     #[test]
     fn test_s3_entry_roundtrip() {
-        let s3 = storage_v2::EntryEnum::S3(storage_v2::S3Entry {
+        let s3 = data_mover::EntryEnum::S3(data_mover::S3Entry {
             name: "obj.json".to_string(),
             relative_path: "bucket/obj.json".to_string(),
             extension: Some("json".to_string()),
@@ -1177,7 +1177,7 @@ mod tests {
 
     #[test]
     fn test_nas_entry_optional_fields_none() {
-        let nas = storage_v2::EntryEnum::NAS(storage_v2::NASEntry {
+        let nas = data_mover::EntryEnum::NAS(data_mover::NASEntry {
             name: "a.txt".to_string(),
             relative_path: PathBuf::from("a.txt"),
             extension: None,
@@ -1208,7 +1208,7 @@ mod tests {
 
     #[test]
     fn test_current_state_propagation() {
-        let nas = storage_v2::EntryEnum::NAS(storage_v2::NASEntry {
+        let nas = data_mover::EntryEnum::NAS(data_mover::NASEntry {
             name: "a.txt".to_string(),
             relative_path: PathBuf::from("a.txt"),
             extension: None,

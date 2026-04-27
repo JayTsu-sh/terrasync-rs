@@ -4,10 +4,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 // 外部crate
+use data_mover::{EntryEnum, StorageEntryMessage};
 use db::error::DatabaseError;
 use db::factory::DatabaseFactory;
 use db::traits::{Database, TarManifestRecord};
-use storage_v2::{EntryEnum, StorageEntryMessage};
 use tokio::sync::mpsc;
 use tracing::{Instrument, debug, error, info, info_span, trace, warn};
 

@@ -8,11 +8,11 @@ use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Arc;
 
+use data_mover::dir_tree::NdxEvent;
+use data_mover::filter::parse_filter_expression;
+use data_mover::qos::QosManager;
+use data_mover::{DataChunk, StorageEnum, WalkDirAsyncIterator2, create_storage};
 use rustls::pki_types::CertificateDer;
-use storage_v2::dir_tree::NdxEvent;
-use storage_v2::filter::parse_filter_expression;
-use storage_v2::qos::QosManager;
-use storage_v2::{DataChunk, StorageEnum, WalkDirAsyncIterator2, create_storage};
 use tracing::{debug, error, info, warn};
 use transport::message::{BlockSignature, NdxTable, ReceiverMsg, SenderMsg, SessionConfig};
 use transport::traits::SenderTransport;
@@ -218,7 +218,7 @@ async fn process_requests(
 ///
 /// 源文件读取失败时仅记录日志，不向 Receiver 发送任何数据（Receiver 不会收到该文件的 Ack）。
 async fn handle_full_transfer(
-    transport: &(dyn SenderTransport + 'static), src_storage: &Arc<StorageEnum>, entry: &Arc<storage_v2::EntryEnum>,
+    transport: &(dyn SenderTransport + 'static), src_storage: &Arc<StorageEnum>, entry: &Arc<data_mover::EntryEnum>,
     qos: Option<&QosManager>, enable_acl: bool,
 ) -> Result<()> {
     if entry.get_is_dir() {
@@ -282,7 +282,7 @@ async fn handle_full_transfer(
 /// 返回 `Ok(true)` = 源文件读取成功并已发送，`Ok(false)` = 读取失败（已记录日志）。
 #[allow(clippy::too_many_arguments)]
 async fn handle_delta_transfer(
-    transport: &(dyn SenderTransport + 'static), src_storage: &Arc<StorageEnum>, entry: &Arc<storage_v2::EntryEnum>,
+    transport: &(dyn SenderTransport + 'static), src_storage: &Arc<StorageEnum>, entry: &Arc<data_mover::EntryEnum>,
     ndx: i32, block_size: u32, signatures: Vec<BlockSignature>, qos: Option<&QosManager>, enable_acl: bool,
 ) -> Result<bool> {
     let size = entry.get_size();
@@ -348,7 +348,7 @@ async fn handle_delta_transfer(
 
 /// ACL 跨进程传输：仅在 `enable_acl=true` 且非符号链接时发送。
 async fn send_acl_if_enabled(
-    transport: &(dyn SenderTransport + 'static), src_storage: &Arc<StorageEnum>, entry: &Arc<storage_v2::EntryEnum>,
+    transport: &(dyn SenderTransport + 'static), src_storage: &Arc<StorageEnum>, entry: &Arc<data_mover::EntryEnum>,
     enable_acl: bool,
 ) {
     if enable_acl

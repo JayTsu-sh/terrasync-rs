@@ -1,6 +1,6 @@
 use axum::Json;
+use data_mover::{FilterFieldDef, get_filter_field_definitions};
 use serde::Serialize;
-use storage_v2::{FilterFieldDef, get_filter_field_definitions};
 
 #[derive(Debug, Serialize)]
 pub struct OperatorDto {
@@ -43,7 +43,7 @@ fn to_dto(def: FilterFieldDef) -> FieldDto {
 /// GET /api/v1/filter-fields
 ///
 /// 返回后端支持的过滤条件字段与操作符定义，供前端条件构建器动态渲染。
-/// 数据来源: `storage_v2::filter::get_filter_field_definitions()`
+/// 数据来源: `data_mover::filter::get_filter_field_definitions()`
 pub async fn get_filter_fields() -> Json<FilterFieldsResponse> {
     let fields = get_filter_field_definitions().into_iter().map(to_dto).collect();
     Json(FilterFieldsResponse { fields })

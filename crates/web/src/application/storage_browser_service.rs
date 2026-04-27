@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 
-use storage_v2::{NFSStorage, S3BucketInfo, S3Storage, StorageEntryMessage, create_storage};
+use data_mover::{NFSStorage, S3BucketInfo, S3Storage, StorageEntryMessage, create_storage};
 
 use crate::error::Result;
 
@@ -33,7 +33,7 @@ impl StorageBrowserService {
     }
 
     /// 列出指定路径下的子目录
-    /// - `storage_url` 为 `Some` 时通过 `storage_v2` 连接远程存储
+    /// - `storage_url` 为 `Some` 时通过 `data_mover` 连接远程存储
     /// - `storage_url` 为 None 时列出本地文件系统
     pub async fn list_dirs(&self, path: &str, storage_url: Option<&str>) -> Result<ListDirsResult> {
         if let Some(url) = storage_url {
