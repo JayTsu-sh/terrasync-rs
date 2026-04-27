@@ -1204,23 +1204,6 @@ impl SyncOrchestrator {
         )
     }
 
-    /// Phase B：检测删除/重命名，执行目标端物理操作，并将结果广播给下游 consumers。
-    ///
-    /// 前置条件：base 表已含所有 Phase A 的 New/Changed 条目（Phase A 消费者已完成刷入）。
-    /// 根据 from/to 的属性差异推断 [`ChangeKind`]。
-    /// 用于 rename 后检测文件是否同时发生了内容或元数据变更。
-    fn detect_change_kind(from: &EntryEnum, to: &EntryEnum) -> Option<ChangeKind> {
-        let data_changed = from.get_size() != to.get_size() || from.get_mtime() != to.get_mtime();
-        let meta_changed =
-            from.get_mode() != to.get_mode() || from.get_uid() != to.get_uid() || from.get_gid() != to.get_gid();
-        match (data_changed, meta_changed) {
-            (true, true) => Some(ChangeKind::Both),
-            (true, false) => Some(ChangeKind::DataOnly),
-            (false, true) => Some(ChangeKind::MetadataOnly),
-            (false, false) => None,
-        }
-    }
-
     /// rename 成功后同步文件内容或元数据到目标端。
     ///
     /// 返回 `true` 表示同步成功，调用方可随后广播 `Changed` 消息。
@@ -1366,7 +1349,7 @@ impl SyncOrchestrator {
                             // Phase A 不再把路径已变的文件判为 Changed（Fix 2a），
                             // 此处补足 rename+changed 文件的内容/元数据同步，并广播 Changed 消息供消费者统计。
                             if !from_arc.get_is_dir() && !from_arc.get_is_symlink() {
-                                if let Some(kind) = Self::detect_change_kind(&from_arc, &to_arc) {
+                                if let Some(kind) = ChangeKind::from_entry_diff(&from_arc, &to_arc) {
                                     if Self::sync_renamed_file_changes(
                                         kind,
                                         &to_arc,

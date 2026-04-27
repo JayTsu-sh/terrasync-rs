@@ -305,6 +305,20 @@ impl ChangeKind {
             ChangeKind::Both => "both_changed",
         }
     }
+
+    /// 根据两个 entry 的属性差异推断变更类型；无变更时返回 `None`。
+    #[must_use]
+    pub fn from_entry_diff(from: &EntryEnum, to: &EntryEnum) -> Option<Self> {
+        let data_changed = from.get_size() != to.get_size() || from.get_mtime() != to.get_mtime();
+        let meta_changed =
+            from.get_mode() != to.get_mode() || from.get_uid() != to.get_uid() || from.get_gid() != to.get_gid();
+        match (data_changed, meta_changed) {
+            (true, true) => Some(Self::Both),
+            (true, false) => Some(Self::DataOnly),
+            (false, true) => Some(Self::MetadataOnly),
+            (false, false) => None,
+        }
+    }
 }
 
 impl std::fmt::Display for ChangeKind {

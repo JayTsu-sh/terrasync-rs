@@ -89,8 +89,7 @@ pub fn classify_deletion_status(
                     // `record` 来自 old-state 查询，其 relative_path 即旧路径。
                     // 用路径精确匹配 from/to，避免依赖 ctime——父目录 rename 不更新
                     // 子文件 ctime（NFS v3 行为），ctime 相等时排序不确定会导致 swap。
-                    let old_path = record.relative_path.as_str();
-                    let (from, to) = if entries[0].relative_path == old_path {
+                    let (from, to) = if entries[0].relative_path == record.relative_path.as_str() {
                         (entries[0].to_entry_enum(), entries[1].to_entry_enum())
                     } else {
                         (entries[1].to_entry_enum(), entries[0].to_entry_enum())
