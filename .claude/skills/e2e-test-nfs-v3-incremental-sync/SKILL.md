@@ -255,7 +255,7 @@ Expected（NFS v3 Fh3 模式，精确 rename 检测）：
 ```
    ├─ New:          7 total | dirs      2 | files      3 | symlinks    2
    ├─ Changed:     19 total | dirs      0 | files     19 | symlinks    0
-   ├─ Renamed:      7 total | dirs      1 | files      4 | symlinks    2
+   ├─ Renamed:     47 total | dirs      9 | files     28 | symlinks   10
    └─ Deleted:      8 total | dirs      1 | files      5 | symlinks    2
 ```
 
