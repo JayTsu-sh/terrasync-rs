@@ -78,3 +78,24 @@ Audit trail of every /project:evolve run. Records what was proposed, approved, r
 | Observed 3+ times, same pattern | learned-rules.md (via /project:evolve) |
 | In learned-rules 10+ sessions, always followed | Candidate for CLAUDE.md or rules/ |
 | Rejected during evolve | evolution-log.md (never re-proposed) |
+
+## 提升到 rules/ 的判断标准
+
+从 `learned-rules.md` 提升到 `.claude/rules/` 时，选择正确的目标文件：
+
+| 规则类型 | 目标文件 | 加载时机 |
+|---------|---------|---------|
+| Rust 编码约束（use 语句、错误处理、重构规范） | `rules/rust-patterns.md` | 始终 |
+| E2E 测试执行规范 | `rules/e2e-testing-protocol.md` | 接触 e2e-test-* 文件时 |
+| Web API 设计规范（axum handler 模式） | `rules/api-design.md` | 接触 web/src/ 文件时 |
+| 每次会话都必须知道的铁律 | `CLAUDE.md` | 每次（谨慎，保持 <200 行）|
+
+rules/ 文件格式：
+- 无 frontmatter = 始终加载
+- 有 `paths:` frontmatter = path-scoped，只在接触指定路径时加载
+
+提升流程：
+1. 在 learned-rules.md 中观察规则稳定 10+ session
+2. 运行 `/evolve` 审查，确认规则无争议
+3. 移入对应 rules/ 文件（或更新现有文件）
+4. 从 learned-rules.md 中删除（避免重复）
