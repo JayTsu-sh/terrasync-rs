@@ -28,9 +28,32 @@ description: >
 
 ## Constants
 
-> 环境变量实际值见 `.claude/skills/harness-run/.env.example`（复制为 `.env` 后填写）
+> 协议常量来源 `harness-run/scripts/protocol_constants.py`（`Cifs`）；环境变量从 `harness-run/.env` 加载。
 
+### 环境变量
+| Name | Env Key |
+|------|---------|
+| SOURCE_IP | `CIFS_SOURCE_HOST` |
+| DEST_IP | `CIFS_DEST_HOST` |
+| CLICKHOUSE_HOST | `CLICKHOUSE_HOST` |
+| BINARY | `TERRASYNC_BINARY`（default: `./target/debug/terrasync`）|
+| CONFIG | `TERRASYNC_CONFIG`（default: `examples/config.toml`）|
+
+### 协议常量（`Cifs`）
 | Name | Value |
+|------|-------|
+| CIFS_SHARE | `testshare` |
+| SOURCE_URL | `smb://{CIFS_USER}:{CIFS_PASSWORD}@{SOURCE_IP}/{CIFS_SHARE}/test-data` |
+| DEST_URL | `smb://{CIFS_USER}:{CIFS_PASSWORD}@{DEST_IP}/{CIFS_SHARE}/test-data` |
+| BASELINE_DIRS | `40` |
+| BASELINE_FILES | `117` |
+| POST_DIRS | `41` |
+| POST_FILES | `115` |
+
+### Skill 常量
+| Name | Value |
+|------|-------|
+| JOB_ID | `cifs-incr-scan` |
 |------|-------|
 | CIFS_HOST | `192.168.50.173` |
 | CIFS_PORT | `445` |

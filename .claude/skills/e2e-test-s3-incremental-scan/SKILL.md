@@ -28,29 +28,32 @@ description: >
 
 ## Constants
 
-> 环境变量实际值见 `.claude/skills/harness-run/.env.example`（复制为 `.env` 后填写）
+> 协议常量来源 `harness-run/scripts/protocol_constants.py`（`S3`）；环境变量从 `harness-run/.env` 加载。
 
+### 环境变量
+| Name | Env Key |
+|------|---------|
+| SOURCE_IP | `S3_SOURCE_IP` |
+| CLICKHOUSE_HOST | `CLICKHOUSE_HOST` |
+| S3_ACCESS_KEY | `S3_ACCESS_KEY` |
+| S3_SECRET_KEY | `S3_SECRET_KEY` |
+| BINARY | `TERRASYNC_BINARY`（default: `./target/debug/terrasync`）|
+| CONFIG | `TERRASYNC_CONFIG`（default: `examples/config.toml`）|
+
+### 协议常量（`S3`）
 | Name | Value |
 |------|-------|
-| S3_AK | `rustfsadmin` |
-| S3_SK | `rustfsadmin123` |
-| S3_BUCKET | `test-bucket` |
-| S3_HOST | `192.168.50.173:39000` |
-| S3_URL | `s3://{S3_AK}:{S3_SK}@{S3_BUCKET}.{S3_HOST}/test-data` |
-| CONFIG | `examples/config.toml` |
-| BINARY | `./target/debug/terrasync` |
-| CLICKHOUSE_HOST | `192.168.50.173:8123` |
-| JOB_ID | `s3-incr-scan` |
-| SANITIZED_JOB_ID | `s3_incr_scan` |
+| S3_BUCKET_SRC | `test-bucket` |
+| SOURCE_URL | `s3://{S3_ACCESS_KEY}:{S3_SECRET_KEY}@{S3_BUCKET_SRC}.{S3_SOURCE_IP}:39000/test-data` |
 | BASELINE_DIRS | 40 |
 | BASELINE_FILES | 117 |
-| POST_MUTATE_DIRS | 41 |
-| POST_MUTATE_FILES | 115 |
+| POST_DIRS | 41 |
+| POST_FILES | 115 |
 
-ClickHouse 表名：
-- `base_s3_incr_scan`
-- `incremental_s3_incr_scan`
-- `state_s3_incr_scan`
+### Skill 常量
+| Name | Value |
+|------|-------|
+| JOB_ID | `s3-incr-scan` |
 
 ---
 

@@ -16,12 +16,13 @@ _HARNESS = _SKILL_DIR.parent / "harness-run" / "scripts"
 sys.path.insert(0, str(_HARNESS))
 import env as envmod
 from assertions import AssertionResult, TerrasyncAssertions, build_result
+from protocol_constants import Cifs as _PC
 
 JOB_ID = "cifs-full-scan"
 SANITIZED = "cifs_full_scan"
-EXPECTED_DIRS = 40
-EXPECTED_FILES = 117
-EXPECTED_TOTAL = EXPECTED_DIRS + EXPECTED_FILES  # 157，CIFS 无 symlink
+EXPECTED_DIRS = _PC.BASELINE_DIRS
+EXPECTED_FILES = _PC.BASELINE_FILES
+EXPECTED_TOTAL = _PC.BASELINE_TOTAL
 _SETUP = Path(".claude/skills/cifs-full-scan/scripts/setup-cifs-test-data.sh")
 
 
@@ -43,12 +44,12 @@ def _cifs_url(cfg, host_key="CIFS_SOURCE_HOST", prefix="test-data"):
     user = cfg.get("CIFS_USER", "administrator")
     passwd = cfg.get("CIFS_PASS", "")
     host = cfg[host_key]
-    share = cfg.get("CIFS_SHARE", "testshare")
+    share = cfg.get("CIFS_SHARE", _PC.SHARE)
     return f"smb://{user}:{passwd}@{host}/{share}/{prefix}"
 
 
 def _cleanup(a, host, ch_host, cfg):
-    share = cfg.get("CIFS_SHARE", "testshare")
+    share = cfg.get("CIFS_SHARE", _PC.SHARE)
     user = cfg.get("CIFS_USER", "administrator")
     passwd = cfg.get("CIFS_PASS", "")
     with ThreadPoolExecutor(max_workers=3) as ex:

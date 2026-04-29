@@ -17,6 +17,7 @@ _HARNESS = _SKILL_DIR.parent / "harness-run" / "scripts"
 sys.path.insert(0, str(_HARNESS))
 import env as envmod
 from assertions import AssertionResult, TerrasyncAssertions, build_result
+from protocol_constants import S3 as _PC, NfsV3 as _NPC
 
 SYNC_JOB_ID = "nfs-to-s3-sync"
 DST_SCAN_JOB_ID = "nfs-to-s3-sync-dst"
@@ -29,7 +30,7 @@ S3_DIRS, S3_FILES = 113, 335
 
 def _nfs_url(cfg, prefix=""):
     src_ip = cfg["NFS_V3_SOURCE_IP"]
-    nfs_export = cfg.get("NFS_V3_EXPORT", "/export/nfs")
+    nfs_export = cfg.get("NFS_V3_EXPORT", _NPC.EXPORT)
     return f"nfs://{src_ip}{nfs_export}{prefix}"
 
 
@@ -37,7 +38,7 @@ def _s3_url(cfg, prefix="test-data"):
     ak, sk = cfg["S3_ACCESS_KEY"], cfg["S3_SECRET_KEY"]
     ip = cfg.get("S3_DEST_IP", cfg.get("S3_SOURCE_IP", "192.168.50.23"))
     port = cfg.get("S3_DEST_PORT", "39000")
-    bucket = cfg.get("S3_BUCKET_DST", "test-bucket")
+    bucket = cfg.get("S3_BUCKET_DST", _PC.BUCKET_DST)
     return f"s3://{ak}:{sk}@{bucket}.{ip}:{port}/{prefix}"
 
 
@@ -45,7 +46,7 @@ def _s3_cleanup_dest(a, cfg):
     ak, sk = cfg["S3_ACCESS_KEY"], cfg["S3_SECRET_KEY"]
     ip = cfg.get("S3_DEST_IP", cfg.get("S3_SOURCE_IP", "192.168.50.23"))
     port = cfg.get("S3_DEST_PORT", "39000")
-    bucket = cfg.get("S3_BUCKET_DST", "test-bucket")
+    bucket = cfg.get("S3_BUCKET_DST", _PC.BUCKET_DST)
     try:
         a.ssh_exec(ip, f"mc alias set ts3 http://localhost:{port} {ak} {sk} --api s3v4 2>/dev/null; "
                        f"mc rm --recursive --force ts3/{bucket}/test-data/ 2>/dev/null || true")
@@ -54,7 +55,7 @@ def _s3_cleanup_dest(a, cfg):
 
 
 def _cleanup(a, src_ip, ch_host, cfg):
-    nfs_export = cfg.get("NFS_V3_EXPORT", "/export/nfs")
+    nfs_export = cfg.get("NFS_V3_EXPORT", _NPC.EXPORT)
     tables = a.clickhouse_query(ch_host,
         f"SELECT name FROM system.tables WHERE database='default' AND name LIKE '%{SANITIZED}%' FORMAT TabSeparated")
     with ThreadPoolExecutor(max_workers=4) as ex:
@@ -76,7 +77,7 @@ def _cleanup(a, src_ip, ch_host, cfg):
 def _patch_s3_script(path, cfg):
     with open(path) as f: c = f.read()
     ak, sk = cfg["S3_ACCESS_KEY"], cfg["S3_SECRET_KEY"]
-    bucket = cfg.get("S3_BUCKET_DST", "test-bucket")
+    bucket = cfg.get("S3_BUCKET_DST", _PC.BUCKET_DST)
     port = cfg.get("S3_DEST_PORT", "39000")
     ip = cfg.get("S3_DEST_IP", cfg.get("S3_SOURCE_IP"))
     for o, n in [

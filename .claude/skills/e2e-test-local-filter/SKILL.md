@@ -24,13 +24,18 @@ description: >
 
 ## Constants
 
-> 环境变量实际值见 `.claude/skills/harness-run/.env.example`（复制为 `.env` 后填写）
+> 此 skill 仅使用本地文件系统，无网络协议常量。环境变量从 `harness-run/.env` 加载。
 
+### 环境变量
+| Name | Env Key |
+|------|---------|
+| BINARY | `TERRASYNC_BINARY`（default: `./target/debug/terrasync`）|
+| CONFIG | `TERRASYNC_CONFIG`（default: `examples/config.toml`）|
+
+### Skill 常量
 | Name | Value |
 |------|-------|
 | BASE_DIR | `/tmp/terrasync-filter-test` |
-| CONFIG | `examples/config.toml` |
-| BINARY | `./target/debug/terrasync` |
 | BASIC_URL | `/tmp/terrasync-filter-test/basic` |
 | EXT_URL | `/tmp/terrasync-filter-test/extension` |
 | SIZE_URL | `/tmp/terrasync-filter-test/size` |

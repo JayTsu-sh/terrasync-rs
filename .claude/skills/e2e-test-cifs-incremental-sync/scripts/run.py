@@ -17,12 +17,13 @@ _HARNESS = _SKILL_DIR.parent / "harness-run" / "scripts"
 sys.path.insert(0, str(_HARNESS))
 import env as envmod
 from assertions import AssertionResult, TerrasyncAssertions, build_result
+from protocol_constants import Cifs as _PC
 
 SYNC_JOB_ID = "cifs-incr-sync"
 DST_SCAN_JOB_ID = "cifs-incr-sync-dst"
 SANITIZED = "cifs_incr_sync"
-BASELINE_DIRS, BASELINE_FILES = 40, 117
-POST_DIRS, POST_FILES = 41, 115
+BASELINE_DIRS, BASELINE_FILES = _PC.BASELINE_DIRS, _PC.BASELINE_FILES
+POST_DIRS, POST_FILES = _PC.POST_DIRS, _PC.POST_FILES
 
 _TABLES = [
     f"base_{SANITIZED}", f"state_{SANITIZED}",
@@ -56,7 +57,7 @@ def _run_script(script_path, host, user, passwd, share):
 def _cleanup(a, cfg):
     src = cfg["CIFS_SOURCE_HOST"]; dst = cfg["CIFS_DEST_HOST"]
     user = cfg.get("CIFS_USER", "terrasync"); passwd = cfg.get("CIFS_PASS", "terrasync123")
-    share = cfg.get("CIFS_SHARE", "testshare"); ch_host = cfg["CLICKHOUSE_HOST"]
+    share = cfg.get("CIFS_SHARE", _PC.SHARE); ch_host = cfg["CLICKHOUSE_HOST"]
     with ThreadPoolExecutor(max_workers=5) as ex:
         futs = [
             ex.submit(_smb_rm, src, user, passwd, share),
@@ -84,7 +85,7 @@ def run(env=None):
 
     src = cfg["CIFS_SOURCE_HOST"]; dst = cfg["CIFS_DEST_HOST"]
     user = cfg.get("CIFS_USER", "terrasync"); passwd = cfg.get("CIFS_PASS", "terrasync123")
-    share = cfg.get("CIFS_SHARE", "testshare"); ch_host = cfg["CLICKHOUSE_HOST"]
+    share = cfg.get("CIFS_SHARE", _PC.SHARE); ch_host = cfg["CLICKHOUSE_HOST"]
     binary = cfg.get("TERRASYNC_BINARY", "./target/debug/terrasync")
     config = cfg.get("TERRASYNC_CONFIG", "examples/config.toml")
     src_url = _cifs_url(src, user, passwd, share)

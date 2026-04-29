@@ -16,24 +16,25 @@ _HARNESS = _SKILL_DIR.parent / "harness-run" / "scripts"
 sys.path.insert(0, str(_HARNESS))
 import env as envmod
 from assertions import AssertionResult, TerrasyncAssertions, build_result
+from protocol_constants import S3 as _PC, NfsV3 as _NPC
 
 SYNC_JOB_ID = "s3-to-nfs-sync"
 DST_SCAN_JOB_ID = "s3-to-nfs-sync-dst"
 SANITIZED = "s3_to_nfs_sync"
-EXPECTED_DIRS, EXPECTED_FILES = 40, 117  # S3 无 symlink，NFS 目标端也不会有
+EXPECTED_DIRS, EXPECTED_FILES = _PC.BASELINE_DIRS, _PC.BASELINE_FILES
 
 
 def _s3_url(cfg, prefix="test-data"):
     ak, sk = cfg["S3_ACCESS_KEY"], cfg["S3_SECRET_KEY"]
     ip = cfg.get("S3_SOURCE_IP", "192.168.50.173")
     port = cfg.get("S3_SOURCE_PORT", "39000")
-    bucket = cfg.get("S3_BUCKET_SRC", "test-bucket")
+    bucket = cfg.get("S3_BUCKET_SRC", _PC.BUCKET_SRC)
     return f"s3://{ak}:{sk}@{bucket}.{ip}:{port}/{prefix}"
 
 
 def _nfs_dst_url(cfg):
     dest_ip = cfg.get("NFS_V3_DEST_IP", "192.168.50.23")
-    nfs_export = cfg.get("NFS_V3_EXPORT", "/export/nfs")
+    nfs_export = cfg.get("NFS_V3_EXPORT", _NPC.EXPORT)
     return f"nfs://{dest_ip}{nfs_export}"
 
 
@@ -41,7 +42,7 @@ def _mc_cleanup_src(a, cfg):
     ak, sk = cfg["S3_ACCESS_KEY"], cfg["S3_SECRET_KEY"]
     ip = cfg.get("S3_SOURCE_IP", "192.168.50.173")
     port = cfg.get("S3_SOURCE_PORT", "39000")
-    bucket = cfg.get("S3_BUCKET_SRC", "test-bucket")
+    bucket = cfg.get("S3_BUCKET_SRC", _PC.BUCKET_SRC)
     try:
         a.ssh_exec(ip, f"mc alias set ts3 http://localhost:{port} {ak} {sk} --api s3v4 2>/dev/null; "
                        f"mc rm --recursive --force ts3/{bucket}/test-data/ 2>/dev/null || true")
@@ -50,7 +51,7 @@ def _mc_cleanup_src(a, cfg):
 
 def _cleanup(a, ch_host, cfg):
     dest_ip = cfg.get("NFS_V3_DEST_IP", "192.168.50.23")
-    nfs_export = cfg.get("NFS_V3_EXPORT", "/export/nfs")
+    nfs_export = cfg.get("NFS_V3_EXPORT", _NPC.EXPORT)
     tables = a.clickhouse_query(ch_host,
         f"SELECT name FROM system.tables WHERE database='default' AND name LIKE '%{SANITIZED}%' FORMAT TabSeparated")
     with ThreadPoolExecutor(max_workers=4) as ex:
@@ -91,7 +92,7 @@ def run(env=None):
     setup_sh = _SKILL_DIR.parent / "e2e-test-s3-incremental-scan" / "scripts" / "setup-s3-test-data.sh"
     with open(setup_sh) as f: c = f.read()
     ak, sk = cfg["S3_ACCESS_KEY"], cfg["S3_SECRET_KEY"]
-    bucket = cfg.get("S3_BUCKET_SRC", "test-bucket")
+    bucket = cfg.get("S3_BUCKET_SRC", _PC.BUCKET_SRC)
     port = cfg.get("S3_SOURCE_PORT", "39000")
     for o, n in [
         ('S3_HOST="http://10.128.137.245:8184"', f'S3_HOST="http://localhost:{port}"'),

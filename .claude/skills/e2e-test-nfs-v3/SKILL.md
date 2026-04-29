@@ -19,21 +19,31 @@ Test data is created and verified on the remote hosts via SSH.
 
 ## Constants
 
-> 环境变量实际值见 `.claude/skills/harness-run/.env.example`（复制为 `.env` 后填写）
+> 协议常量来源 `harness-run/scripts/protocol_constants.py`（`NfsV3`）；环境变量从 `harness-run/.env` 加载。
+> **注意**：此综合 skill 使用 40 dirs 小数据集，与独立 skill（full-scan 等，113 dirs）不同。
 
+### 环境变量
+| Name | Env Key |
+|------|---------|
+| SOURCE_IP | `NFS_V3_SOURCE_IP` |
+| DEST_IP | `NFS_V3_DEST_IP` |
+| CLICKHOUSE_HOST | `CLICKHOUSE_HOST` |
+| BINARY | `TERRASYNC_BINARY`（default: `./target/debug/terrasync`）|
+| CONFIG | `TERRASYNC_CONFIG`（default: `examples/config.toml`）|
+
+### 协议常量（`NfsV3`）
 | Name | Value |
 |------|-------|
-| SOURCE_IP | 192.168.50.173 |
-| DEST_IP | 192.168.50.23 |
 | NFS_EXPORT | `/export/nfs` |
-| EXPECTED_DIRS | 40 |
-| EXPECTED_FILES | 117 |
-| EXPECTED_SYMLINKS | 36 |
-| CONFIG | `examples/config.toml` |
-| BINARY | `./target/debug/terrasync` |
-| CLICKHOUSE_HOST | `192.168.50.173:8123` |
+| SOURCE_URL | `nfs://{SOURCE_IP}{NFS_EXPORT}` |
+| DEST_URL | `nfs://{DEST_IP}{NFS_EXPORT}` |
 
-NFS URL 格式：`nfs://{SOURCE_IP}{NFS_EXPORT}`，`nfs://{DEST_IP}{NFS_EXPORT}`。
+### Skill 常量（此 skill 专用小数据集）
+| Name | Value |
+|------|-------|
+| EXPECTED_DIRS | `40` |
+| EXPECTED_FILES | `117` |
+| EXPECTED_SYMLINKS | `36` |
 
 ---
 

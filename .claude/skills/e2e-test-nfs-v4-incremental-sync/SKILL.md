@@ -27,33 +27,36 @@ description: >
 
 ## Constants
 
-> 环境变量实际值见 `.claude/skills/harness-run/.env.example`（复制为 `.env` 后填写）
+> 协议常量来源 `harness-run/scripts/protocol_constants.py`（`NfsV4`）；环境变量从 `harness-run/.env` 加载。
 
+### 环境变量
+| Name | Env Key |
+|------|---------|
+| SOURCE_IP | `NFS_V4_SOURCE_IP` |
+| DEST_IP | `NFS_V4_DEST_IP` |
+| CLICKHOUSE_HOST | `CLICKHOUSE_HOST` |
+| BINARY | `TERRASYNC_BINARY`（default: `./target/debug/terrasync`）|
+| CONFIG | `TERRASYNC_CONFIG`（default: `examples/config.toml`）|
+
+### 协议常量（`NfsV4`）
 | Name | Value |
 |------|-------|
-| SOURCE_IP | `{NFSv4_SOURCE_IP}` |
-| DEST_IP | `{NFSv4_DEST_IP}` |
 | NFS_EXPORT | `/export/nfsv4` |
 | SOURCE_URL | `nfs://{SOURCE_IP}{NFS_EXPORT}?version=4.1` |
 | DEST_URL | `nfs://{DEST_IP}{NFS_EXPORT}?version=4.1` |
-| CONFIG | `examples/config.toml` |
-| BINARY | `./target/debug/terrasync` |
-| CLICKHOUSE_HOST | `192.168.50.173:8123` |
+| BASELINE_DIRS | 113 |
+| BASELINE_FILES | 335 |
+| BASELINE_SYMLINKS | 79 |
+| POST_DIRS | 114 |
+| POST_FILES | 333 |
+| POST_SYMLINKS | 79 |
+
+### Skill 常量
+| Name | Value |
+|------|-------|
 | SYNC_JOB_ID | `nfs-v4-incr-sync` |
 | DST_SCAN_JOB_ID | `nfs-v4-incr-sync-dst` |
 | IC_JOB_ID | `nfs-v4-incr-sync-ic` |
-| BASELINE_DIRS | 40 |
-| BASELINE_FILES | 117 |
-| BASELINE_SYMLINKS | 36 |
-| POST_MUTATE_DIRS | 41 |
-| POST_MUTATE_FILES | 115 |
-| POST_MUTATE_SYMLINKS | 36 |
-
-ClickHouse 表名：
-- `base_nfs_v4_incr_sync`（sync 源端扫描）
-- `state_nfs_v4_incr_sync`
-- `base_nfs_v4_incr_sync_dst`（目标端扫描）
-- `state_nfs_v4_incr_sync_dst`
 
 ---
 

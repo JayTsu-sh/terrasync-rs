@@ -16,13 +16,14 @@ sys.path.insert(0, str(_HARNESS_SCRIPTS))
 
 import env as envmod
 from assertions import AssertionResult, TerrasyncAssertions, build_result
+from protocol_constants import NfsV4 as _PC
 
 JOB_ID = "nfs-v4-full-sync"
 SANITIZED = "nfs_v4_full_sync"
-EXPECTED_DIRS = 113
-EXPECTED_FILES = 335
-EXPECTED_SYMLINKS = 79
-NFS_SERVER_PATH = "/export/nfsv4"
+EXPECTED_DIRS     = _PC.BASELINE_DIRS
+EXPECTED_FILES    = _PC.BASELINE_FILES
+EXPECTED_SYMLINKS = _PC.BASELINE_SYMLINKS
+NFS_SERVER_PATH   = _PC.EXPORT
 
 _TABLES = [
     f"base_{SANITIZED}", f"state_{SANITIZED}", f"tar_manifest_{SANITIZED}",

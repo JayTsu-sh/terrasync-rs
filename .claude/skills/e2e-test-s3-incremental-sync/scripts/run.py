@@ -10,12 +10,13 @@ _HARNESS = _SKILL_DIR.parent / "harness-run" / "scripts"
 sys.path.insert(0, str(_HARNESS))
 import env as envmod
 from assertions import AssertionResult, TerrasyncAssertions, build_result
+from protocol_constants import S3 as _PC
 
 SYNC_JOB_ID = "s3-incr-sync"
 DST_SCAN_JOB_ID = "s3-incr-sync-dst"
 SANITIZED = "s3_incr_sync"
-BASELINE_DIRS, BASELINE_FILES = 40, 117
-POST_DIRS, POST_FILES = 41, 115
+BASELINE_DIRS, BASELINE_FILES = _PC.BASELINE_DIRS, _PC.BASELINE_FILES
+POST_DIRS, POST_FILES = _PC.POST_DIRS, _PC.POST_FILES
 _SETUP = _SKILL_DIR.parent / "e2e-test-s3-incremental-scan" / "scripts" / "setup-s3-test-data.sh"
 _MUTATE = _SKILL_DIR.parent / "e2e-test-s3-incremental-scan" / "scripts" / "mutate-s3-test-data.sh"
 
@@ -52,8 +53,8 @@ def _mc_rm(a, ip, bkt, cfg, port_key="S3_SOURCE_PORT"):
 def _cleanup(a, src_ip, dest_ip, ch_host, cfg):
     with ThreadPoolExecutor(max_workers=4) as ex:
         futs = [
-            ex.submit(_mc_rm, a, src_ip, cfg.get("S3_BUCKET_SRC","test-bucket"), cfg),
-            ex.submit(_mc_rm, a, dest_ip, cfg.get("S3_BUCKET_DST","test-bucket"),
+            ex.submit(_mc_rm, a, src_ip, cfg.get("S3_BUCKET_SRC", _PC.BUCKET_SRC), cfg),
+            ex.submit(_mc_rm, a, dest_ip, cfg.get("S3_BUCKET_DST", _PC.BUCKET_DST),
                       {**cfg,"S3_SOURCE_PORT":cfg.get("S3_DEST_PORT","39000")}),
             ex.submit(a.clickhouse_drop_tables, ch_host, SANITIZED),
             ex.submit(a.run_shell_quiet,

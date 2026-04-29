@@ -10,11 +10,12 @@ _HARNESS = _SKILL_DIR.parent / "harness-run" / "scripts"
 sys.path.insert(0, str(_HARNESS))
 import env as envmod
 from assertions import AssertionResult, TerrasyncAssertions, build_result
+from protocol_constants import S3 as _PC
 
 SYNC_JOB_ID = "s3-ic-sync"
 IC_JOB_ID = "s3-ic-test"
 SANITIZED = "s3_ic"
-EXPECTED_DIRS, EXPECTED_FILES = 40, 117
+EXPECTED_DIRS, EXPECTED_FILES = _PC.BASELINE_DIRS, _PC.BASELINE_FILES
 _SETUP = _SKILL_DIR.parent / "e2e-test-s3-incremental-scan" / "scripts" / "setup-s3-test-data.sh"
 
 
@@ -26,7 +27,7 @@ def _url(cfg, ip_key, bkt_key, port_key="S3_SOURCE_PORT", prefix="test-data"):
 def _patch(path, cfg):
     with open(path) as f: c = f.read()
     ak, sk = cfg["S3_ACCESS_KEY"], cfg["S3_SECRET_KEY"]
-    bkt = cfg.get("S3_BUCKET_SRC","test-bucket"); port = cfg.get("S3_SOURCE_PORT","39000")
+    bkt = cfg.get("S3_BUCKET_SRC", _PC.BUCKET_SRC); port = cfg.get("S3_SOURCE_PORT","39000")
     for o, n in [
         ('S3_HOST="http://10.128.137.245:8184"', f'S3_HOST="http://localhost:{port}"'),
         ('S3_AK="H80NKRVS5DYOVE43U2HS"', f'S3_AK="{ak}"'),
@@ -75,8 +76,8 @@ def _check_ic(out, label, expect_pass, min_mm=0, min_ms=0):
 def _cleanup(a, src_ip, dest_ip, ch_host, cfg):
     with ThreadPoolExecutor(max_workers=4) as ex:
         futs = [
-            ex.submit(_mc_rm, a, src_ip, cfg.get("S3_BUCKET_SRC","test-bucket"), cfg),
-            ex.submit(_mc_rm, a, dest_ip, cfg.get("S3_BUCKET_DST","test-bucket"),
+            ex.submit(_mc_rm, a, src_ip, cfg.get("S3_BUCKET_SRC", _PC.BUCKET_SRC), cfg),
+            ex.submit(_mc_rm, a, dest_ip, cfg.get("S3_BUCKET_DST", _PC.BUCKET_DST),
                       {**cfg,"S3_SOURCE_PORT":cfg.get("S3_DEST_PORT","39000")}),
             ex.submit(_drop_ic_tables, a, ch_host),
             ex.submit(a.run_shell_quiet, f"find jobs -maxdepth 1 -type d -name '*{SANITIZED}*' | xargs rm -rf"),
@@ -134,7 +135,7 @@ def run(env=None):
     # 制造差异：在目标端 SSH 修改对象内容（需要通过 mc）
     ak, sk = cfg["S3_ACCESS_KEY"], cfg["S3_SECRET_KEY"]
     port = cfg.get("S3_DEST_PORT", "39000")
-    dst_bkt = cfg.get("S3_BUCKET_DST", "test-bucket")
+    dst_bkt = cfg.get("S3_BUCKET_DST", _PC.BUCKET_DST)
     try:
         a.ssh_exec(dest_ip,
                    f"mc alias set ts3d http://localhost:{port} {ak} {sk} --api s3v4 2>/dev/null; "

@@ -25,28 +25,35 @@ NFS v3 使用 `JoinStrategy::Fh3`，通过 file_handle（文件句柄哈希）�
 
 ## Constants
 
-> 环境变量实际值见 `.claude/skills/harness-run/.env.example`（复制为 `.env` 后填写）
+> 协议常量来源 `harness-run/scripts/protocol_constants.py`（`NfsV3`）；环境变量从 `harness-run/.env` 加载。
 
+### 环境变量
+| Name | Env Key |
+|------|---------|
+| SOURCE_IP | `NFS_V3_SOURCE_IP` |
+| DEST_IP | `NFS_V3_DEST_IP` |
+| CLICKHOUSE_HOST | `CLICKHOUSE_HOST` |
+| BINARY | `TERRASYNC_BINARY`（default: `./target/debug/terrasync`）|
+| CONFIG | `TERRASYNC_CONFIG`（default: `examples/config.toml`）|
+
+### 协议常量（`NfsV3`）
 | Name | Value |
 |------|-------|
-| SOURCE_IP | 192.168.50.173 |
-| SOURCE_NFS_EXPORT | `/export/nfs` |
-| DEST_IP | `192.168.50.23` |
-| DEST_NFS_EXPORT | `/export/nfs` |
-| SOURCE_URL | `nfs://{SOURCE_IP}{SOURCE_NFS_EXPORT}` |
-| DEST_URL | `nfs://{DEST_IP}{DEST_NFS_EXPORT}` |
-| CONFIG | `examples/config.toml` |
-| BINARY | `./target/debug/terrasync` |
-| CLICKHOUSE_HOST | `192.168.50.173:8123` |
-| SYNC_JOB_ID | `nfs-v3-incr-sync` |
-| DST_SCAN_JOB_ID | `nfs-v3-incr-sync-dst` |
-| IC_JOB_ID | `nfs-v3-incr-sync-ic` |
+| NFS_EXPORT | `/export/nfs` |
+| SOURCE_URL | `nfs://{SOURCE_IP}{NFS_EXPORT}` |
+| DEST_URL | `nfs://{DEST_IP}{NFS_EXPORT}` |
 | BASELINE_DIRS | 113 |
 | BASELINE_FILES | 335 |
 | BASELINE_SYMLINKS | 79 |
-| POST_MUTATE_DIRS | 114 |
-| POST_MUTATE_FILES | 333 |
-| POST_MUTATE_SYMLINKS | 79 |
+| POST_DIRS | 114 |
+| POST_FILES | 333 |
+| POST_SYMLINKS | 79 |
+
+### Skill 常量
+| Name | Value |
+|------|-------|
+| SYNC_JOB_ID | `nfs-v3-incr-sync` |
+| DST_SCAN_JOB_ID | `nfs-v3-incr-sync-dst` |
 
 ClickHouse 表名：
 - `base_nfs_v3_incr_sync`（sync 源端扫描）

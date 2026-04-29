@@ -28,27 +28,34 @@ description: >
 
 ## Constants
 
-> 环境变量实际值见 `.claude/skills/harness-run/.env.example`（复制为 `.env` 后填写）
+> 协议常量来源 `harness-run/scripts/protocol_constants.py`（`S3` + `NfsV3`）；环境变量从 `harness-run/.env` 加载。
 
+### 环境变量
+| Name | Env Key |
+|------|---------|
+| S3_AK | `S3_ACCESS_KEY` |
+| S3_SK | `S3_SECRET_KEY` |
+| S3_HOST | `S3_HOST` |
+| DEST_IP | `NFS_V3_DEST_IP` |
+| CLICKHOUSE_HOST | `CLICKHOUSE_HOST` |
+| BINARY | `TERRASYNC_BINARY`（default: `./target/debug/terrasync`）|
+| CONFIG | `TERRASYNC_CONFIG`（default: `examples/config.toml`）|
+
+### 协议常量（`S3` + `NfsV3`）
 | Name | Value |
 |------|-------|
-| S3_AK | `rustfsadmin` |
-| S3_SK | `rustfsadmin123` |
-| S3_HOST | `192.168.50.173:39000` |
-| SRC_BUCKET | `test-bucket` |
+| S3_BUCKET_SRC | `test-bucket` |
 | SOURCE_URL | `s3://{S3_AK}:{S3_SK}@{SRC_BUCKET}.{S3_HOST}/test-data` |
-| DEST_IP | `{DEST_IP}` |
-| DEST_NFS_EXPORT | `{DEST_NFS_EXPORT}` |
-| DEST_URL | `nfs://{DEST_IP}{DEST_NFS_EXPORT}` |
-| CONFIG | `examples/config.toml` |
-| BINARY | `./target/debug/terrasync` |
-| CLICKHOUSE_HOST | `192.168.50.173:8123` |
-| SYNC_JOB_ID | `s3-to-nfs-sync` |
-| SRC_SCAN_JOB_ID | `s3-to-nfs-sync-src` |
-| DST_SCAN_JOB_ID | `s3-to-nfs-sync-dst` |
-| IC_JOB_ID | `s3-to-nfs-sync-ic` |
+| NFS_EXPORT | `/export/nfs` |
+| DEST_URL | `nfs://{DEST_IP}{NFS_EXPORT}` |
 | EXPECTED_DIRS | 40 |
 | EXPECTED_FILES | 117 |
+
+### Skill 常量
+| Name | Value |
+|------|-------|
+| SYNC_JOB_ID | `s3-to-nfs-sync` |
+| DST_SCAN_JOB_ID | `s3-to-nfs-sync-dst` |
 
 ClickHouse 表名：
 - `base_s3_to_nfs_sync_src`（源端 S3 扫描）

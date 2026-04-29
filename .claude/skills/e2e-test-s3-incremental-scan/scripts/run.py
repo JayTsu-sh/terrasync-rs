@@ -19,26 +19,27 @@ sys.path.insert(0, str(_HARNESS_SCRIPTS))
 
 import env as envmod
 from assertions import AssertionResult, TerrasyncAssertions, build_result
+from protocol_constants import S3 as _PC
 
 JOB_ID = "s3-incr-scan"
 SANITIZED = "s3_incr_scan"
-BASELINE_DIRS, BASELINE_FILES = 40, 117
-POST_DIRS, POST_FILES = 41, 115
-POST_TOTAL = POST_DIRS + POST_FILES  # 156
+BASELINE_DIRS, BASELINE_FILES = _PC.BASELINE_DIRS, _PC.BASELINE_FILES
+POST_DIRS, POST_FILES = _PC.POST_DIRS, _PC.POST_FILES
+POST_TOTAL = _PC.POST_TOTAL
 
 
 def _s3_url(cfg, prefix="test-data"):
     ak, sk = cfg["S3_ACCESS_KEY"], cfg["S3_SECRET_KEY"]
     ip = cfg["S3_SOURCE_IP"]
     port = cfg.get("S3_SOURCE_PORT", "39000")
-    bucket = cfg.get("S3_BUCKET_SRC", "test-bucket")
+    bucket = cfg.get("S3_BUCKET_SRC", _PC.BUCKET_SRC)
     return f"s3://{ak}:{sk}@{bucket}.{ip}:{port}/{prefix}"
 
 
 def _mc_cmd(cfg, cmd):
     ak, sk = cfg["S3_ACCESS_KEY"], cfg["S3_SECRET_KEY"]
     port = cfg.get("S3_SOURCE_PORT", "39000")
-    bucket = cfg.get("S3_BUCKET_SRC", "test-bucket")
+    bucket = cfg.get("S3_BUCKET_SRC", _PC.BUCKET_SRC)
     return f"mc alias set ts3 http://localhost:{port} {ak} {sk} --api s3v4 2>/dev/null; {cmd.replace('{B}', bucket)}"
 
 
@@ -62,7 +63,7 @@ def _patch_script(path, cfg, bucket_key="S3_BUCKET_SRC"):
 
 
 def _cleanup(a, src_ip, ch_host, cfg):
-    bucket = cfg.get("S3_BUCKET_SRC", "test-bucket")
+    bucket = cfg.get("S3_BUCKET_SRC", _PC.BUCKET_SRC)
     ak, sk = cfg["S3_ACCESS_KEY"], cfg["S3_SECRET_KEY"]
     port = cfg.get("S3_SOURCE_PORT", "39000")
     with ThreadPoolExecutor(max_workers=3) as ex:

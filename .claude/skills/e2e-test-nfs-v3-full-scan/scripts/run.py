@@ -24,14 +24,15 @@ sys.path.insert(0, str(_HARNESS_SCRIPTS))
 
 import env as envmod
 from assertions import AssertionResult, TerrasyncAssertions, build_result
+from protocol_constants import NfsV3 as _PC
 
 # ── 测试常量 ──────────────────────────────────────────────────────────────────
 JOB_ID = "nfs-v3-full-scan"
 SANITIZED_JOB_ID = "nfs_v3_full_scan"
-EXPECTED_DIRS = 113
-EXPECTED_FILES = 335
-EXPECTED_SYMLINKS = 79
-EXPECTED_TOTAL = EXPECTED_DIRS + EXPECTED_FILES + EXPECTED_SYMLINKS  # 527
+EXPECTED_DIRS     = _PC.BASELINE_DIRS
+EXPECTED_FILES    = _PC.BASELINE_FILES
+EXPECTED_SYMLINKS = _PC.BASELINE_SYMLINKS
+EXPECTED_TOTAL    = _PC.BASELINE_TOTAL
 
 
 # ── 内部步骤 ──────────────────────────────────────────────────────────────────
@@ -203,7 +204,7 @@ def run(env: dict = None) -> dict:
 
     src_ip = cfg["NFS_V3_SOURCE_IP"]
     ch_host = cfg["CLICKHOUSE_HOST"]
-    nfs_export = cfg.get("NFS_V3_EXPORT", "/export/nfs")
+    nfs_export = cfg.get("NFS_V3_EXPORT", _PC.EXPORT)
     binary = cfg.get("TERRASYNC_BINARY", "./target/debug/terrasync")
     config = cfg.get("TERRASYNC_CONFIG", "examples/config.toml")
     ssh_user = cfg.get("SSH_USER", "root")

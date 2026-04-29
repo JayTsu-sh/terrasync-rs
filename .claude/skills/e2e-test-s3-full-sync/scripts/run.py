@@ -17,11 +17,12 @@ sys.path.insert(0, str(_HARNESS_SCRIPTS))
 
 import env as envmod
 from assertions import AssertionResult, TerrasyncAssertions, build_result
+from protocol_constants import S3 as _PC
 
 SYNC_JOB_ID = "s3-full-sync"
 DST_SCAN_JOB_ID = "s3-full-sync-dst"
 SANITIZED = "s3_full_sync"
-EXPECTED_DIRS, EXPECTED_FILES = 40, 117
+EXPECTED_DIRS, EXPECTED_FILES = _PC.BASELINE_DIRS, _PC.BASELINE_FILES
 
 _TABLES_PATTERN = "s3_full_sync"
 
@@ -46,7 +47,7 @@ def _patch_and_run(a, src_ip, sh_path, cfg):
     with open(sh_path) as f:
         content = f.read()
     ak, sk = cfg["S3_ACCESS_KEY"], cfg["S3_SECRET_KEY"]
-    bucket = cfg.get("S3_BUCKET_SRC", "test-bucket")
+    bucket = cfg.get("S3_BUCKET_SRC", _PC.BUCKET_SRC)
     port = cfg.get("S3_SOURCE_PORT", "39000")
     for old, new in [
         ('S3_HOST="http://10.128.137.245:8184"', f'S3_HOST="http://localhost:{port}"'),
@@ -67,8 +68,8 @@ def _patch_and_run(a, src_ip, sh_path, cfg):
 
 
 def _cleanup_all(a, src_ip, dest_ip, ch_host, cfg):
-    src_bucket = cfg.get("S3_BUCKET_SRC", "test-bucket")
-    dst_bucket = cfg.get("S3_BUCKET_DST", "test-bucket")
+    src_bucket = cfg.get("S3_BUCKET_SRC", _PC.BUCKET_SRC)
+    dst_bucket = cfg.get("S3_BUCKET_DST", _PC.BUCKET_DST)
     with ThreadPoolExecutor(max_workers=4) as ex:
         futs = [
             ex.submit(_mc_cleanup_remote, a, src_ip, src_bucket, cfg, "S3_SOURCE_PORT"),

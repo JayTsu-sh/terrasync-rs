@@ -29,38 +29,32 @@ description: >
 
 ## Constants
 
-> 环境变量实际值见 `.claude/skills/harness-run/.env.example`（复制为 `.env` 后填写）
+> 协议常量来源 `harness-run/scripts/protocol_constants.py`（`NfsV4`）；环境变量从 `harness-run/.env` 加载。
 
+### 环境变量
+| Name | Env Key |
+|------|---------|
+| SOURCE_IP | `NFS_V4_SOURCE_IP` |
+| DEST_IP | `NFS_V4_DEST_IP` |
+| CLICKHOUSE_HOST | `CLICKHOUSE_HOST` |
+| BINARY | `TERRASYNC_BINARY`（default: `./target/debug/terrasync`）|
+| CONFIG | `TERRASYNC_CONFIG`（default: `examples/config.toml`）|
+
+### 协议常量（`NfsV4`）
 | Name | Value |
 |------|-------|
-| SOURCE_IP | 192.168.50.173 |
-| DEST_IP |  192.168.50.23 |
-| NFS_EXPORT | `/` |
+| NFS_EXPORT | `/export/nfsv4` |
 | SOURCE_URL | `nfs://{SOURCE_IP}{NFS_EXPORT}?version=4.1` |
 | DEST_URL | `nfs://{DEST_IP}{NFS_EXPORT}?version=4.1` |
-| CONFIG | `examples/config.toml` |
-| BINARY | `./target/debug/terrasync` |
-| CLICKHOUSE_HOST | `192.168.50.173:8123` |
-| SRC_SCAN_JOB_ID | `nfs-v4-full-sync-src` |
-| SYNC_JOB_ID | `nfs-v4-full-sync` |
-| DST_SCAN_JOB_ID | `nfs-v4-full-sync-dst` |
-| IC_JOB_ID | `nfs-v4-full-sync-ic` |
 | EXPECTED_DIRS | 113 |
 | EXPECTED_FILES | 335 |
 | EXPECTED_SYMLINKS | 79 |
 | EXPECTED_TOTAL | 527 |
-| ACL_TEST_FILES | 10 |
-| XATTR_TEST_FILES | 15 |
 
-ClickHouse 表名：
-- `base_nfs_v4_full_sync_src`（源端扫描主表）
-- `state_nfs_v4_full_sync_src`
-- `base_nfs_v4_full_sync_dst`（目标端扫描主表）
-- `state_nfs_v4_full_sync_dst`
-- `base_nfs_v4_full_sync_verify_src`（清理前验证用）
-- `state_nfs_v4_full_sync_verify_src`
-- `base_nfs_v4_full_sync_verify_dst`
-- `state_nfs_v4_full_sync_verify_dst`
+### Skill 常量
+| Name | Value |
+|------|-------|
+| JOB_ID | `nfs-v4-full-sync` |
 
 ---
 

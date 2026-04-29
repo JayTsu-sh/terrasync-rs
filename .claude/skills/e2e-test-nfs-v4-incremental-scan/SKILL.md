@@ -27,30 +27,34 @@ description: >
 
 ## Constants
 
-> 环境变量实际值见 `.claude/skills/harness-run/.env.example`（复制为 `.env` 后填写）
+> 协议常量来源 `harness-run/scripts/protocol_constants.py`（`NfsV4`）；环境变量从 `harness-run/.env` 加载。
 
+### 环境变量
+| Name | Env Key |
+|------|---------|
+| SOURCE_IP | `NFS_V4_SOURCE_IP` |
+| DEST_IP | `NFS_V4_DEST_IP` |
+| CLICKHOUSE_HOST | `CLICKHOUSE_HOST` |
+| BINARY | `TERRASYNC_BINARY`（default: `./target/debug/terrasync`）|
+| CONFIG | `TERRASYNC_CONFIG`（default: `examples/config.toml`）|
+
+### 协议常量（`NfsV4`）
 | Name | Value |
 |------|-------|
-| SOURCE_IP | 192.168.50.173 |
-| NFS_EXPORT | `/` |
+| NFS_EXPORT | `/export/nfsv4` |
 | SOURCE_URL | `nfs://{SOURCE_IP}{NFS_EXPORT}?version=4.1` |
-| CONFIG | `examples/config.toml` |
-| BINARY | `./target/debug/terrasync` |
-| CLICKHOUSE_HOST | `192.168.50.173:8123` |
-| JOB_ID | `nfs-v4-incr-scan` |
-| SANITIZED_JOB_ID | `nfs_v4_incr_scan` |
-| BASE_TABLE | `base_nfs_v4_incr_scan` |
-| INCREMENTAL_TABLE | `incremental_nfs_v4_incr_scan` |
-| STATE_TABLE | `state_nfs_v4_incr_scan` |
+| DEST_URL | `nfs://{DEST_IP}{NFS_EXPORT}?version=4.1` |
 | BASELINE_DIRS | 113 |
 | BASELINE_FILES | 335 |
 | BASELINE_SYMLINKS | 79 |
-| POST_MUTATE_DIRS | 114 |
-| POST_MUTATE_FILES | 333 |
-| POST_MUTATE_SYMLINKS | 79 |
+| POST_DIRS | 114 |
+| POST_FILES | 333 |
+| POST_SYMLINKS | 79 |
 
-**注意**：NFS v4.1 使用伪根（pseudo-root）机制，URL 中的路径必须是相对于 `fsid=0` 的 export。
-当前配置中 `/export/nfsv4` 设置了 `fsid=0`，因此 NFS v4.1 URL 应使用 `/` 作为路径。
+### Skill 常量
+| Name | Value |
+|------|-------|
+| JOB_ID | `nfs-v4-incr-scan` |
 
 ---
 

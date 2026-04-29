@@ -17,12 +17,13 @@ sys.path.insert(0, str(_HARNESS_SCRIPTS))
 
 import env as envmod
 from assertions import AssertionResult, TerrasyncAssertions, build_result
+from protocol_constants import NfsV4 as _PC
 
 JOB_ID = "nfs-v4-incr-scan"
 SANITIZED = "nfs_v4_incr_scan"
-NFS_SERVER_PATH = "/export/nfsv4"
-BASELINE_DIRS, BASELINE_FILES, BASELINE_SYMLINKS = 113, 335, 79
-POST_DIRS, POST_FILES, POST_SYMLINKS = 114, 333, 79
+NFS_SERVER_PATH                               = _PC.EXPORT
+BASELINE_DIRS, BASELINE_FILES, BASELINE_SYMLINKS = _PC.BASELINE_DIRS, _PC.BASELINE_FILES, _PC.BASELINE_SYMLINKS
+POST_DIRS, POST_FILES, POST_SYMLINKS           = _PC.POST_DIRS, _PC.POST_FILES, _PC.POST_SYMLINKS
 
 
 def _cleanup(a, src_ip, ch_host, nfs_export):

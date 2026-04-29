@@ -18,12 +18,13 @@ sys.path.insert(0, str(_HARNESS_SCRIPTS))
 
 import env as envmod
 from assertions import AssertionResult, TerrasyncAssertions, build_result
+from protocol_constants import S3 as _PC
 
 JOB_ID = "s3-full-scan"
 SANITIZED = "s3_full_scan"
-EXPECTED_DIRS = 40
-EXPECTED_FILES = 117
-EXPECTED_TOTAL = EXPECTED_DIRS + EXPECTED_FILES  # 157，S3 无 symlink
+EXPECTED_DIRS = _PC.BASELINE_DIRS
+EXPECTED_FILES = _PC.BASELINE_FILES
+EXPECTED_TOTAL = _PC.BASELINE_TOTAL
 
 
 def _s3_url(cfg, ip_key="S3_SOURCE_IP", bucket_key="S3_BUCKET_SRC", prefix="test-data"):
@@ -53,7 +54,7 @@ def _s3_setup(a, src_ip, cfg, setup_sh_path):
         content = f.read()
     ak = cfg["S3_ACCESS_KEY"]
     sk = cfg["S3_SECRET_KEY"]
-    bucket = cfg.get("S3_BUCKET_SRC", "test-bucket")
+    bucket = cfg.get("S3_BUCKET_SRC", _PC.BUCKET_SRC)
     port = cfg.get("S3_SOURCE_PORT", "39000")
     replacements = {
         'S3_HOST="http://10.128.137.245:8184"': f'S3_HOST="http://localhost:{port}"',
@@ -75,7 +76,7 @@ def _s3_setup(a, src_ip, cfg, setup_sh_path):
 
 
 def _cleanup(a, src_ip, ch_host, cfg):
-    bucket = cfg.get("S3_BUCKET_SRC", "test-bucket")
+    bucket = cfg.get("S3_BUCKET_SRC", _PC.BUCKET_SRC)
     with ThreadPoolExecutor(max_workers=3) as ex:
         futs = [
             ex.submit(_mc_cleanup, a, src_ip, bucket, cfg),
@@ -159,7 +160,7 @@ def run(env: dict = None) -> dict:
         ))
 
     # 独立 S3 对象核查
-    bucket = cfg.get("S3_BUCKET_SRC", "test-bucket")
+    bucket = cfg.get("S3_BUCKET_SRC", _PC.BUCKET_SRC)
     ak = cfg["S3_ACCESS_KEY"]
     sk = cfg["S3_SECRET_KEY"]
     port = cfg.get("S3_SOURCE_PORT", "39000")

@@ -20,6 +20,7 @@ sys.path.insert(0, str(_HARNESS_SCRIPTS))
 
 import env as envmod
 from assertions import AssertionResult, TerrasyncAssertions, build_result
+from protocol_constants import NfsV3 as _PC
 
 SYNC_JOB_ID = "nfs-v3-ic-sync"
 IC_JOB_ID = "nfs-v3-ic-test"
@@ -99,7 +100,7 @@ def run(env: dict = None) -> dict:
     src_ip = cfg["NFS_V3_SOURCE_IP"]
     dest_ip = cfg["NFS_V3_DEST_IP"]
     ch_host = cfg["CLICKHOUSE_HOST"]
-    nfs_export = cfg.get("NFS_V3_EXPORT", "/export/nfs")
+    nfs_export = cfg.get("NFS_V3_EXPORT", _PC.EXPORT)
     binary = cfg.get("TERRASYNC_BINARY", "./target/debug/terrasync")
     config = cfg.get("TERRASYNC_CONFIG", "examples/config.toml")
     ssh_user = cfg.get("SSH_USER", "root")

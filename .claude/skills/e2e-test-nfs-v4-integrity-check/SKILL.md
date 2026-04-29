@@ -33,26 +33,29 @@ description: >
 
 ## Constants
 
-> 环境变量实际值见 `.claude/skills/harness-run/.env.example`（复制为 `.env` 后填写）
+> 协议常量来源 `harness-run/scripts/protocol_constants.py`（`NfsV4`）；环境变量从 `harness-run/.env` 加载。
 
+### 环境变量
+| Name | Env Key |
+|------|---------|
+| SOURCE_IP | `NFS_V4_SOURCE_IP` |
+| DEST_IP | `NFS_V4_DEST_IP` |
+| CLICKHOUSE_HOST | `CLICKHOUSE_HOST` |
+| BINARY | `TERRASYNC_BINARY`（default: `./target/debug/terrasync`）|
+| CONFIG | `TERRASYNC_CONFIG`（default: `examples/config.toml`）|
+
+### 协议常量（`NfsV4`）
 | Name | Value |
 |------|-------|
-| SOURCE_IP | `{NFSv4_SOURCE_IP}` |
-| DEST_IP | `{NFSv4_DEST_IP}` |
 | NFS_EXPORT | `/export/nfsv4` |
 | SOURCE_URL | `nfs://{SOURCE_IP}{NFS_EXPORT}?version=4.1` |
 | DEST_URL | `nfs://{DEST_IP}{NFS_EXPORT}?version=4.1` |
-| CONFIG | `examples/config.toml` |
-| BINARY | `./target/debug/terrasync` |
-| CLICKHOUSE_HOST | `192.168.50.173:8123` |
+
+### Skill 常量
+| Name | Value |
+|------|-------|
 | SYNC_JOB_ID | `nfs-v4-ic-sync` |
 | IC_JOB_ID | `nfs-v4-ic-test` |
-| IC_QUICK_JOB_ID | `nfs-v4-ic-quick` |
-| EXPECTED_DIRS | 40 |
-| EXPECTED_FILES | 117 |
-| EXPECTED_SYMLINKS | 36 |
-| ACL_TEST_FILE | `d1/d1_1/file1.txt` |
-| XATTR_TEST_FILE | `d2/d2_1/file1.txt` |
 
 ---
 

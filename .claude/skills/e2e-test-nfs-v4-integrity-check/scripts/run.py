@@ -17,11 +17,12 @@ sys.path.insert(0, str(_HARNESS_SCRIPTS))
 
 import env as envmod
 from assertions import AssertionResult, TerrasyncAssertions, build_result
+from protocol_constants import NfsV4 as _PC
 
 SYNC_JOB_ID = "nfs-v4-ic-sync"
 IC_JOB_ID = "nfs-v4-ic-test"
 SANITIZED_SYNC = "nfs_v4_ic_sync"
-NFS_SERVER_PATH = "/export/nfsv4"
+NFS_SERVER_PATH = _PC.EXPORT
 _TABLES_PATTERN = "nfs_v4_ic"
 
 

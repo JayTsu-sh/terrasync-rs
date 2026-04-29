@@ -31,34 +31,34 @@ description: >
 
 ## Constants
 
-> 环境变量实际值见 `.claude/skills/harness-run/.env.example`（复制为 `.env` 后填写）
+> 协议常量来源 `harness-run/scripts/protocol_constants.py`（`S3`）；环境变量从 `harness-run/.env` 加载。
 
+### 环境变量
+| Name | Env Key |
+|------|---------|
+| SOURCE_IP | `S3_SOURCE_IP` |
+| DEST_IP | `S3_DEST_IP` |
+| CLICKHOUSE_HOST | `CLICKHOUSE_HOST` |
+| S3_ACCESS_KEY | `S3_ACCESS_KEY` |
+| S3_SECRET_KEY | `S3_SECRET_KEY` |
+| BINARY | `TERRASYNC_BINARY`（default: `./target/debug/terrasync`）|
+| CONFIG | `TERRASYNC_CONFIG`（default: `examples/config.toml`）|
+
+### 协议常量（`S3`）
 | Name | Value |
 |------|-------|
-| S3_AK | `rustfsadmin` |
-| S3_SK | `rustfsadmin123` |
-| S3_HOST | `192.168.50.173:39000` |
-| SRC_BUCKET | `test-bucket` |
-| DST_BUCKET | `{DST_S3_BUCKET}` |
-| SOURCE_URL | `s3://{S3_AK}:{S3_SK}@{SRC_BUCKET}.{S3_HOST}/test-data` |
-| DEST_URL | `s3://{S3_AK}:{S3_SK}@{DST_BUCKET}.{S3_HOST}/test-data` |
-| CONFIG | `examples/config.toml` |
-| BINARY | `./target/debug/terrasync` |
-| CLICKHOUSE_HOST | `192.168.50.173:8123` |
-| SRC_SCAN_JOB_ID | `s3-full-sync-src` |
-| SYNC_JOB_ID | `s3-full-sync` |
-| DST_SCAN_JOB_ID | `s3-full-sync-dst` |
-| IC_JOB_ID | `s3-full-sync-ic` |
+| S3_BUCKET_SRC | `test-bucket` |
+| S3_BUCKET_DST | `test-bucket` |
+| SOURCE_URL | `s3://{S3_ACCESS_KEY}:{S3_SECRET_KEY}@{S3_BUCKET_SRC}.{S3_SOURCE_IP}:39000/test-data` |
 | EXPECTED_DIRS | 40 |
 | EXPECTED_FILES | 117 |
+| EXPECTED_TOTAL | 157 |
 
-ClickHouse 表名：
-- `base_s3_full_sync_src`（源端扫描）
-- `state_s3_full_sync_src`
-- `base_s3_full_sync_dst`（目标端扫描）
-- `state_s3_full_sync_dst`
-
-**注意**：S3 无 symlink，所有 symlink 计数始终为 0。
+### Skill 常量
+| Name | Value |
+|------|-------|
+| SYNC_JOB_ID | `s3-full-sync` |
+| DST_SCAN_JOB_ID | `s3-full-sync-dst` |
 
 ---
 

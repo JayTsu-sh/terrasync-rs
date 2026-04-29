@@ -20,20 +20,29 @@ description: >
 
 ## Constants
 
-> 环境变量实际值见 `.claude/skills/harness-run/.env.example`（复制为 `.env` 后填写）
+> 协议常量来源 `harness-run/scripts/protocol_constants.py`（`NfsV3`）；环境变量从 `harness-run/.env` 加载。
 
+### 环境变量
+| Name | Env Key |
+|------|---------|
+| SOURCE_IP | `NFS_V3_SOURCE_IP` |
+| CLICKHOUSE_HOST | `CLICKHOUSE_HOST` |
+| BINARY | `TERRASYNC_BINARY`（default: `./target/debug/terrasync`）|
+| CONFIG | `TERRASYNC_CONFIG`（default: `examples/config.toml`）|
+
+### 协议常量（`NfsV3`）
 | Name | Value |
 |------|-------|
-| SOURCE_IP | 192.168.50.173 |
 | NFS_EXPORT | `/export/nfs` |
-| CONFIG | `examples/config.toml` |
-| BINARY | `./target/debug/terrasync` |
-| CLICKHOUSE_HOST | `192.168.50.173:8123` |
-| JOB_ID | `nfs-v3-full-scan` |
-| SANITIZED_JOB_ID | `nfs_v3_full_scan` |
+| SOURCE_URL | `nfs://{SOURCE_IP}{NFS_EXPORT}` |
 | EXPECTED_DIRS | 113 |
 | EXPECTED_FILES | 335 |
 | EXPECTED_SYMLINKS | 79 |
+
+### Skill 常量
+| Name | Value |
+|------|-------|
+| JOB_ID | `nfs-v3-full-scan` |
 
 ClickHouse 表名：
 - `base_nfs_v3_full_scan`
