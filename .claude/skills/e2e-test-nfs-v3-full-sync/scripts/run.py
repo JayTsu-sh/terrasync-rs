@@ -15,7 +15,7 @@ _HARNESS_SCRIPTS = _SKILL_DIR.parent / "harness-run" / "scripts"
 sys.path.insert(0, str(_HARNESS_SCRIPTS))
 
 import env as envmod
-from assertions import AssertionResult, TerrasyncAssertions
+from assertions import AssertionResult, TerrasyncAssertions, build_result
 
 JOB_ID = "nfs-v3-full-sync"
 SANITIZED = "nfs_v3_full_sync"
@@ -140,7 +140,7 @@ def run(env: dict = None) -> dict:
     setup_r = _setup_data(a, src_ip)
     results.append(setup_r)
     if not setup_r.passed:
-        return _build_result(results, start)
+        return build_result(results, start)
 
     src_url = f"nfs://{src_ip}{nfs_export}"
     dst_url = f"nfs://{dest_ip}{nfs_export}"
@@ -155,7 +155,7 @@ def run(env: dict = None) -> dict:
                                        {"code": proc.returncode},
                                        f"✗ sync_exit_code: {proc.returncode}"))
         _cleanup(a, src_ip, dest_ip, ch_host, nfs_export)
-        return _build_result(results, start)
+        return build_result(results, start)
 
     cli_r = a.check_cli_sync_output(
         sync_out, {"dirs": EXPECTED_DIRS, "files": EXPECTED_FILES, "symlinks": EXPECTED_SYMLINKS}
@@ -176,18 +176,9 @@ def run(env: dict = None) -> dict:
 
     results.append(_verify_metadata(a, dest_ip))
     _cleanup(a, src_ip, dest_ip, ch_host, nfs_export)
-    return _build_result(results, start)
+    return build_result(results, start)
 
 
-def _build_result(results, start):
-    elapsed = round(time.monotonic() - start, 1)
-    passed = all(r.passed for r in results)
-    for r in results:
-        print(r.message)
-    print(f"\n{'PASS' if passed else 'FAIL'} ({elapsed}s)")
-    return {"passed": passed, "metrics": {"elapsed_sec": elapsed},
-            "assertions": [{"name": r.name, "passed": r.passed, "message": r.message}
-                           for r in results]}
 
 
 if __name__ == "__main__":

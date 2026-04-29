@@ -17,7 +17,7 @@ _HARNESS_SCRIPTS = _SKILL_DIR.parent / "harness-run" / "scripts"
 sys.path.insert(0, str(_HARNESS_SCRIPTS))
 
 import env as envmod
-from assertions import AssertionResult, TerrasyncAssertions
+from assertions import AssertionResult, TerrasyncAssertions, build_result
 
 JOB_ID = "s3-full-scan"
 SANITIZED = "s3_full_scan"
@@ -114,12 +114,12 @@ def run(env: dict = None) -> dict:
         out = _s3_setup(a, src_ip, cfg, setup_sh)
     except Exception as e:
         results.append(AssertionResult("setup", False, {}, {}, f"✗ setup: {e}"))
-        return _build(results, start)
+        return build_result(results, start)
     setup_ok = "OK:" in out or "OK：" in out
     results.append(AssertionResult("setup", setup_ok, {}, {},
                                    f"{'✓' if setup_ok else '✗'} s3_setup_data"))
     if not setup_ok:
-        return _build(results, start)
+        return build_result(results, start)
 
     # 全量扫描
     proc = subprocess.run(
@@ -129,7 +129,7 @@ def run(env: dict = None) -> dict:
     if proc.returncode != 0:
         results.append(AssertionResult("scan_exit", False, {}, {}, "✗ scan failed"))
         _cleanup(a, src_ip, ch_host, cfg)
-        return _build(results, start)
+        return build_result(results, start)
 
     results.append(a.check_cli_scan_output(
         scan_out, {"dirs": EXPECTED_DIRS, "files": EXPECTED_FILES}
@@ -141,7 +141,12 @@ def run(env: dict = None) -> dict:
     # state 表总行数验证
     state_q = f"SELECT scan_state FROM default.state_{SANITIZED} FINAL WHERE id=1 FORMAT TabSeparated"
     state = a.clickhouse_query(ch_host, state_q).strip()
-    if state:
+    if not state:
+        results.append(AssertionResult(
+            "state_total", False, {"scan_state": "non-empty"}, {},
+            "✗ state_total: scan_state is empty (state table not written)"
+        ))
+    else:
         count = a.clickhouse_query(
             ch_host,
             f"SELECT count(*) FROM default.base_{SANITIZED} FINAL "
@@ -175,18 +180,9 @@ def run(env: dict = None) -> dict:
         results.append(AssertionResult("s3_file_count", False, {}, {}, f"✗ s3_file_count: {e}"))
 
     _cleanup(a, src_ip, ch_host, cfg)
-    return _build(results, start)
+    return build_result(results, start)
 
 
-def _build(results, start):
-    elapsed = round(time.monotonic() - start, 1)
-    passed = all(r.passed for r in results)
-    for r in results:
-        print(r.message)
-    print(f"\n{'PASS' if passed else 'FAIL'} ({elapsed}s)")
-    return {"passed": passed, "metrics": {"elapsed_sec": elapsed},
-            "assertions": [{"name": r.name, "passed": r.passed, "message": r.message}
-                           for r in results]}
 
 
 if __name__ == "__main__":

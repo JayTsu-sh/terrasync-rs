@@ -8,7 +8,7 @@ _SKILL_DIR = Path(__file__).parent.parent
 _HARNESS = _SKILL_DIR.parent / "harness-run" / "scripts"
 sys.path.insert(0, str(_HARNESS))
 import env as envmod
-from assertions import AssertionResult, TerrasyncAssertions
+from assertions import AssertionResult, TerrasyncAssertions, build_result
 
 JOB_ID = "s3-ver-full-scan"
 SANITIZED = "s3_ver_full_scan"
@@ -70,7 +70,7 @@ def run(env=None):
     if not _mc_setup_versioned_bucket(a, src_ip, cfg):
         results.append(AssertionResult("setup_bucket", False, {}, {},
                                        "✗ setup_bucket: failed to create versioned bucket"))
-        return _b(results, start)
+        return build_result(results, start)
     results.append(AssertionResult("setup_bucket", True, {}, {}, "✓ versioned bucket created"))
 
     # 上传多版本测试数据
@@ -78,7 +78,7 @@ def run(env=None):
     if not ver_setup.exists():
         results.append(AssertionResult("setup_data", False, {}, {},
                                        f"✗ setup_data: {ver_setup} not found"))
-        return _b(results, start)
+        return build_result(results, start)
 
     with open(ver_setup) as f: content = f.read()
     ak, sk = cfg["S3_ACCESS_KEY"], cfg["S3_SECRET_KEY"]
@@ -98,7 +98,7 @@ def run(env=None):
         out = a.ssh_exec(src_ip, "bash /tmp/setup-s3-versioned.sh", timeout=300)
     except Exception as e:
         results.append(AssertionResult("setup_data", False, {}, {}, f"✗ setup_data: {e}"))
-        return _b(results, start)
+        return build_result(results, start)
     finally:
         if os.path.exists(tmp): os.unlink(tmp)
     ok = "OK:" in out or "OK：" in out or "done" in out.lower()
@@ -122,16 +122,9 @@ def run(env=None):
                                        f"{'✓' if has_data else '✗'} ch_has_data: count={count}"))
 
     _cleanup(a, src_ip, ch_host, cfg)
-    return _b(results, start)
+    return build_result(results, start)
 
 
-def _b(results, start):
-    elapsed = round(time.monotonic() - start, 1)
-    passed = all(r.passed for r in results)
-    for r in results: print(r.message)
-    print(f"\n{'PASS' if passed else 'FAIL'} ({elapsed}s)")
-    return {"passed": passed, "metrics": {"elapsed_sec": elapsed},
-            "assertions": [{"name": r.name, "passed": r.passed, "message": r.message} for r in results]}
 
 
 if __name__ == "__main__":

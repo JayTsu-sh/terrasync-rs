@@ -9,7 +9,7 @@ _SKILL_DIR = Path(__file__).parent.parent
 _HARNESS = _SKILL_DIR.parent / "harness-run" / "scripts"
 sys.path.insert(0, str(_HARNESS))
 import env as envmod
-from assertions import AssertionResult, TerrasyncAssertions
+from assertions import AssertionResult, TerrasyncAssertions, build_result
 
 SYNC_JOB_ID = "s3-ic-sync"
 IC_JOB_ID = "s3-ic-test"
@@ -108,19 +108,19 @@ def run(env=None):
         a.scp_to(tmp, src_ip, "/tmp/setup-s3-test-data.sh")
         out = a.ssh_exec(src_ip, "bash /tmp/setup-s3-test-data.sh", timeout=300)
     except Exception as e:
-        results.append(AssertionResult("setup", False, {}, {}, f"✗ setup: {e}")); return _b(results, start)
+        results.append(AssertionResult("setup", False, {}, {}, f"✗ setup: {e}")); return build_result(results, start)
     finally:
         if os.path.exists(tmp): os.unlink(tmp)
     ok = "OK:" in out or "OK：" in out
     results.append(AssertionResult("setup", ok, {}, {}, f"{'✓' if ok else '✗'} s3_setup"))
-    if not ok: return _b(results, start)
+    if not ok: return build_result(results, start)
 
     # Sync 建基线
     p = subprocess.run([binary, "-c", config, "-l", "trace", "sync", "--id", SYNC_JOB_ID, src_url, dst_url],
                        capture_output=True, text=True, timeout=600)
     if p.returncode != 0:
         results.append(AssertionResult("sync", False, {}, {}, "✗ sync failed"))
-        _cleanup(a, src_ip, dest_ip, ch_host, cfg); return _b(results, start)
+        _cleanup(a, src_ip, dest_ip, ch_host, cfg); return build_result(results, start)
     results.append(AssertionResult("sync", True, {}, {}, "✓ initial_sync"))
 
     # 场景1: Full 一致
@@ -153,16 +153,9 @@ def run(env=None):
     results.append(_check_ic(r4.stdout + r4.stderr, "detects_missing", False, min_mm=1, min_ms=1))
 
     _cleanup(a, src_ip, dest_ip, ch_host, cfg)
-    return _b(results, start)
+    return build_result(results, start)
 
 
-def _b(results, start):
-    elapsed = round(time.monotonic() - start, 1)
-    passed = all(r.passed for r in results)
-    for r in results: print(r.message)
-    print(f"\n{'PASS' if passed else 'FAIL'} ({elapsed}s)")
-    return {"passed": passed, "metrics": {"elapsed_sec": elapsed},
-            "assertions": [{"name": r.name, "passed": r.passed, "message": r.message} for r in results]}
 
 
 if __name__ == "__main__":

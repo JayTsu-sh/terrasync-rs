@@ -15,7 +15,7 @@ _HARNESS_SCRIPTS = _SKILL_DIR.parent / "harness-run" / "scripts"
 sys.path.insert(0, str(_HARNESS_SCRIPTS))
 
 import env as envmod
-from assertions import AssertionResult, TerrasyncAssertions
+from assertions import AssertionResult, TerrasyncAssertions, build_result
 
 JOB_ID = "nfs-v4-full-sync"
 SANITIZED = "nfs_v4_full_sync"
@@ -81,12 +81,12 @@ def run(env: dict = None) -> dict:
         out = a.ssh_exec(src_ip, "sudo bash /tmp/setup-nfs4-test-data.sh", timeout=120)
     except Exception as e:
         results.append(AssertionResult("setup", False, {}, {}, f"✗ setup: {e}"))
-        return _build(results, start)
+        return build_result(results, start)
     setup_ok = "OK:" in out or "OK：" in out
     results.append(AssertionResult("setup", setup_ok, {}, {},
                                    f"{'✓' if setup_ok else '✗'} setup_nfs4_test_data"))
     if not setup_ok:
-        return _build(results, start)
+        return build_result(results, start)
 
     proc = subprocess.run(
         [binary, "-c", config, "-l", "trace", "sync", "--id", JOB_ID, src_url, dst_url],
@@ -97,7 +97,7 @@ def run(env: dict = None) -> dict:
         results.append(AssertionResult("sync_exit", False, {"code": 0},
                                        {"code": proc.returncode}, "✗ sync failed"))
         _cleanup(a, src_ip, dest_ip, ch_host, nfs_export)
-        return _build(results, start)
+        return build_result(results, start)
 
     exp = {"dirs": EXPECTED_DIRS, "files": EXPECTED_FILES, "symlinks": EXPECTED_SYMLINKS}
     results.append(a.check_cli_sync_output(sync_out, exp))
@@ -147,18 +147,9 @@ def run(env: dict = None) -> dict:
                                            f"✗ metadata_verification: {e}"))
 
     _cleanup(a, src_ip, dest_ip, ch_host, nfs_export)
-    return _build(results, start)
+    return build_result(results, start)
 
 
-def _build(results, start):
-    elapsed = round(time.monotonic() - start, 1)
-    passed = all(r.passed for r in results)
-    for r in results:
-        print(r.message)
-    print(f"\n{'PASS' if passed else 'FAIL'} ({elapsed}s)")
-    return {"passed": passed, "metrics": {"elapsed_sec": elapsed},
-            "assertions": [{"name": r.name, "passed": r.passed, "message": r.message}
-                           for r in results]}
 
 
 if __name__ == "__main__":

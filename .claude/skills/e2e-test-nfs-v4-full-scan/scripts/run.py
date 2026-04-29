@@ -16,7 +16,7 @@ _HARNESS_SCRIPTS = _SKILL_DIR.parent / "harness-run" / "scripts"
 sys.path.insert(0, str(_HARNESS_SCRIPTS))
 
 import env as envmod
-from assertions import AssertionResult, TerrasyncAssertions
+from assertions import AssertionResult, TerrasyncAssertions, build_result
 
 JOB_ID = "nfs-v4-full-scan"
 SANITIZED = "nfs_v4_full_scan"
@@ -105,7 +105,7 @@ def run(env: dict = None) -> dict:
     setup_r = _setup_data(a, src_ip)
     results.append(setup_r)
     if not setup_r.passed:
-        return _build(results, start)
+        return build_result(results, start)
 
     proc = subprocess.run(
         [binary, "-c", config, "-l", "trace", "scan", "--id", JOB_ID, src_url],
@@ -117,7 +117,7 @@ def run(env: dict = None) -> dict:
         results.append(AssertionResult("scan_exit", False, {"code": 0},
                                        {"code": proc.returncode}, "✗ scan failed"))
         _cleanup(a, src_ip, ch_host)
-        return _build(results, start)
+        return build_result(results, start)
 
     results.append(a.check_cli_scan_output(
         scan_out, {"dirs": EXPECTED_DIRS, "files": EXPECTED_FILES, "symlinks": EXPECTED_SYMLINKS}
@@ -148,18 +148,9 @@ def run(env: dict = None) -> dict:
                                        f"✗ filesystem_counts: {e}"))
 
     _cleanup(a, src_ip, ch_host)
-    return _build(results, start)
+    return build_result(results, start)
 
 
-def _build(results, start):
-    elapsed = round(time.monotonic() - start, 1)
-    passed = all(r.passed for r in results)
-    for r in results:
-        print(r.message)
-    print(f"\n{'PASS' if passed else 'FAIL'} ({elapsed}s)")
-    return {"passed": passed, "metrics": {"elapsed_sec": elapsed},
-            "assertions": [{"name": r.name, "passed": r.passed, "message": r.message}
-                           for r in results]}
 
 
 if __name__ == "__main__":

@@ -16,7 +16,7 @@ _HARNESS_SCRIPTS = _SKILL_DIR.parent / "harness-run" / "scripts"
 sys.path.insert(0, str(_HARNESS_SCRIPTS))
 
 import env as envmod
-from assertions import AssertionResult, TerrasyncAssertions
+from assertions import AssertionResult, TerrasyncAssertions, build_result
 
 SYNC_JOB_ID = "nfs-v3-incr-sync"
 DST_SCAN_JOB_ID = "nfs-v3-incr-sync-dst"
@@ -115,18 +115,18 @@ def run(env: dict = None) -> dict:
     if not setup_sh.exists():
         results.append(AssertionResult("setup", False, {}, {},
                                        f"✗ setup: setup-test-data.sh not found"))
-        return _build_result(results, start)
+        return build_result(results, start)
     try:
         a.scp_to(setup_sh, src_ip, "/tmp/setup-test-data.sh")
         out = a.ssh_exec(src_ip, "sudo bash /tmp/setup-test-data.sh", timeout=120)
     except Exception as e:
         results.append(AssertionResult("setup", False, {}, {}, f"✗ setup: {e}"))
-        return _build_result(results, start)
+        return build_result(results, start)
     setup_ok = "OK:" in out or "OK：" in out
     results.append(AssertionResult("setup", setup_ok, {}, {},
                                    f"{'✓' if setup_ok else '✗'} setup_test_data"))
     if not setup_ok:
-        return _build_result(results, start)
+        return build_result(results, start)
 
     # Step 3：全量 Sync
     proc = _terrasync(binary, config, "sync", "--id", SYNC_JOB_ID, src_url, dst_url)
@@ -135,7 +135,7 @@ def run(env: dict = None) -> dict:
         results.append(AssertionResult("full_sync_exit", False, {"code": 0},
                                        {"code": proc.returncode}, "✗ full_sync: failed"))
         _cleanup(a, src_ip, dest_ip, ch_host, nfs_export)
-        return _build_result(results, start)
+        return build_result(results, start)
 
     baseline_exp = {"dirs": BASELINE_DIRS, "files": BASELINE_FILES, "symlinks": BASELINE_SYMLINKS}
     results.append(a.check_cli_sync_output(sync_out, baseline_exp))
@@ -149,20 +149,20 @@ def run(env: dict = None) -> dict:
         results.append(AssertionResult("mutate", False, {}, {},
                                        "✗ mutate: mutate-test-data.sh not found in incremental-scan"))
         _cleanup(a, src_ip, dest_ip, ch_host, nfs_export)
-        return _build_result(results, start)
+        return build_result(results, start)
     try:
         a.scp_to(mutate_sh, src_ip, "/tmp/mutate-test-data.sh")
         mut_out = a.ssh_exec(src_ip, "sudo bash /tmp/mutate-test-data.sh", timeout=120)
     except Exception as e:
         results.append(AssertionResult("mutate", False, {}, {}, f"✗ mutate: {e}"))
         _cleanup(a, src_ip, dest_ip, ch_host, nfs_export)
-        return _build_result(results, start)
+        return build_result(results, start)
     mutate_ok = "OK:" in mut_out or "OK：" in mut_out
     results.append(AssertionResult("mutate", mutate_ok, {}, {},
                                    f"{'✓' if mutate_ok else '✗'} mutate_test_data"))
     if not mutate_ok:
         _cleanup(a, src_ip, dest_ip, ch_host, nfs_export)
-        return _build_result(results, start)
+        return build_result(results, start)
 
     # Step 5：增量 Sync（同 JOB_ID，jobs/ 存在 → 自动增量）
     proc2 = _terrasync(binary, config, "sync", "--id", SYNC_JOB_ID, src_url, dst_url,
@@ -172,7 +172,7 @@ def run(env: dict = None) -> dict:
         results.append(AssertionResult("incr_sync_exit", False, {"code": 0},
                                        {"code": proc2.returncode}, "✗ incr_sync: failed"))
         _cleanup(a, src_ip, dest_ip, ch_host, nfs_export)
-        return _build_result(results, start)
+        return build_result(results, start)
 
     post_exp = {"dirs": POST_DIRS, "files": POST_FILES, "symlinks": POST_SYMLINKS}
     results.append(a.check_cli_scan_output(incr_out, post_exp))
@@ -198,18 +198,9 @@ def run(env: dict = None) -> dict:
         ))
 
     _cleanup(a, src_ip, dest_ip, ch_host, nfs_export)
-    return _build_result(results, start)
+    return build_result(results, start)
 
 
-def _build_result(results, start):
-    elapsed = round(time.monotonic() - start, 1)
-    passed = all(r.passed for r in results)
-    for r in results:
-        print(r.message)
-    print(f"\n{'PASS' if passed else 'FAIL'} ({elapsed}s)")
-    return {"passed": passed, "metrics": {"elapsed_sec": elapsed},
-            "assertions": [{"name": r.name, "passed": r.passed, "message": r.message}
-                           for r in results]}
 
 
 if __name__ == "__main__":

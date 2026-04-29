@@ -15,7 +15,7 @@ _SKILL_DIR = Path(__file__).parent.parent
 _HARNESS = _SKILL_DIR.parent / "harness-run" / "scripts"
 sys.path.insert(0, str(_HARNESS))
 import env as envmod
-from assertions import AssertionResult, TerrasyncAssertions
+from assertions import AssertionResult, TerrasyncAssertions, build_result
 
 JOB_ID = "cifs-full-scan"
 SANITIZED = "cifs_full_scan"
@@ -89,7 +89,7 @@ def run(env: dict = None) -> dict:
     if not setup_sh.exists():
         results.append(AssertionResult("setup", False, {}, {},
                                        f"✗ setup: {setup_sh} not found"))
-        return _build(results, start)
+        return build_result(results, start)
 
     proc_setup = subprocess.run(
         ["bash", str(setup_sh)], capture_output=True, text=True, timeout=120)
@@ -97,7 +97,7 @@ def run(env: dict = None) -> dict:
     results.append(AssertionResult("setup", setup_ok, {}, {},
                                    f"{'✓' if setup_ok else '✗'} cifs_setup_data"))
     if not setup_ok:
-        return _build(results, start)
+        return build_result(results, start)
 
     # 全量扫描
     proc = subprocess.run(
@@ -106,7 +106,7 @@ def run(env: dict = None) -> dict:
     if proc.returncode != 0:
         results.append(AssertionResult("scan_exit", False, {}, {}, "✗ scan failed"))
         _cleanup(a, src_host, ch_host, cfg)
-        return _build(results, start)
+        return build_result(results, start)
 
     exp = {"dirs": EXPECTED_DIRS, "files": EXPECTED_FILES}
     results.append(a.check_cli_scan_output(proc.stdout + proc.stderr, exp))
@@ -120,16 +120,9 @@ def run(env: dict = None) -> dict:
                                    f"{'✓' if fh_ok else '✗'} file_handle_populated: empty={fh_count}"))
 
     _cleanup(a, src_host, ch_host, cfg)
-    return _build(results, start)
+    return build_result(results, start)
 
 
-def _build(results, start):
-    elapsed = round(time.monotonic() - start, 1)
-    passed = all(r.passed for r in results)
-    for r in results: print(r.message)
-    print(f"\n{'PASS' if passed else 'FAIL'} ({elapsed}s)")
-    return {"passed": passed, "metrics": {"elapsed_sec": elapsed},
-            "assertions": [{"name": r.name, "passed": r.passed, "message": r.message} for r in results]}
 
 
 if __name__ == "__main__":

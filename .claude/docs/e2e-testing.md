@@ -1,6 +1,6 @@
 # E2E 测试 — 矩阵、环境与运行方式
 
-## 测试矩阵（30 个 skill）
+## 测试矩阵（25 个注册用例）
 
 ### NFS v3（5 个，串行）
 | Skill 目录 | 场景 | 超时 |
@@ -94,7 +94,7 @@ python scripts/run.py
 # PASS (52.3s)
 ```
 
-### 方式三：harness runner（Phase 2 后可用）
+### 方式三：harness runner（完整实现，推荐 CI 使用）
 
 ```bash
 python .claude/skills/harness-run/scripts/runner.py --smoke

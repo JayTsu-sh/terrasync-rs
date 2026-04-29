@@ -19,7 +19,7 @@ _HARNESS_SCRIPTS = _SKILL_DIR.parent / "harness-run" / "scripts"
 sys.path.insert(0, str(_HARNESS_SCRIPTS))
 
 import env as envmod
-from assertions import AssertionResult, TerrasyncAssertions
+from assertions import AssertionResult, TerrasyncAssertions, build_result
 
 SYNC_JOB_ID = "nfs-v3-ic-sync"
 IC_JOB_ID = "nfs-v3-ic-test"
@@ -116,18 +116,18 @@ def run(env: dict = None) -> dict:
     if not setup_sh.exists():
         results.append(AssertionResult("setup", False, {}, {},
                                        f"✗ setup: setup-test-data.sh not found"))
-        return _build_result(results, start)
+        return build_result(results, start)
     try:
         a.scp_to(setup_sh, src_ip, "/tmp/setup-test-data.sh")
         out = a.ssh_exec(src_ip, "sudo bash /tmp/setup-test-data.sh", timeout=120)
     except Exception as e:
         results.append(AssertionResult("setup", False, {}, {}, f"✗ setup: {e}"))
-        return _build_result(results, start)
+        return build_result(results, start)
     setup_ok = "OK:" in out or "OK：" in out
     results.append(AssertionResult("setup", setup_ok, {}, {},
                                    f"{'✓' if setup_ok else '✗'} setup_test_data"))
     if not setup_ok:
-        return _build_result(results, start)
+        return build_result(results, start)
 
     # Step 2b：Sync 到目标端
     proc = _terrasync(binary, config, "sync", "--id", SYNC_JOB_ID, src_url, dst_url,
@@ -136,7 +136,7 @@ def run(env: dict = None) -> dict:
         results.append(AssertionResult("initial_sync", False, {"code": 0},
                                        {"code": proc.returncode}, "✗ initial_sync: failed"))
         _cleanup(a, src_ip, dest_ip, ch_host, nfs_export)
-        return _build_result(results, start)
+        return build_result(results, start)
     results.append(AssertionResult("initial_sync", True, {}, {}, "✓ initial_sync: OK"))
 
     # Step 3：场景1 — Full 模式（应全部通过）
@@ -157,7 +157,7 @@ def run(env: dict = None) -> dict:
     except Exception as e:
         results.append(AssertionResult("tamper_mismatch", False, {}, {}, f"✗ tamper: {e}"))
         _cleanup(a, src_ip, dest_ip, ch_host, nfs_export)
-        return _build_result(results, start)
+        return build_result(results, start)
 
     # Step 5b：Full 模式（应检测到 Mismatch）
     proc5b = _terrasync(binary, config, "integrity-check", "--id", f"{IC_JOB_ID}-mismatch",
@@ -171,7 +171,7 @@ def run(env: dict = None) -> dict:
     except Exception as e:
         results.append(AssertionResult("tamper_missing", False, {}, {}, f"✗ tamper: {e}"))
         _cleanup(a, src_ip, dest_ip, ch_host, nfs_export)
-        return _build_result(results, start)
+        return build_result(results, start)
 
     # Step 5d：Full 模式（应检测到 Missing + Mismatch）
     proc5d = _terrasync(binary, config, "integrity-check", "--id", f"{IC_JOB_ID}-missing",
@@ -207,18 +207,9 @@ def run(env: dict = None) -> dict:
     results.append(_check_ic_output(proc6d.stdout + proc6d.stderr, True, "post_fix_verify"))
 
     _cleanup(a, src_ip, dest_ip, ch_host, nfs_export)
-    return _build_result(results, start)
+    return build_result(results, start)
 
 
-def _build_result(results, start):
-    elapsed = round(time.monotonic() - start, 1)
-    passed = all(r.passed for r in results)
-    for r in results:
-        print(r.message)
-    print(f"\n{'PASS' if passed else 'FAIL'} ({elapsed}s)")
-    return {"passed": passed, "metrics": {"elapsed_sec": elapsed},
-            "assertions": [{"name": r.name, "passed": r.passed, "message": r.message}
-                           for r in results]}
 
 
 if __name__ == "__main__":

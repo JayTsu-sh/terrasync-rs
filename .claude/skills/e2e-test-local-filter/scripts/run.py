@@ -13,7 +13,7 @@ _SKILL_DIR = Path(__file__).parent.parent
 _HARNESS = _SKILL_DIR.parent / "harness-run" / "scripts"
 sys.path.insert(0, str(_HARNESS))
 import env as envmod
-from assertions import AssertionResult, TerrasyncAssertions
+from assertions import AssertionResult, TerrasyncAssertions, build_result
 
 JOB_ID = "local-filter-test"
 SANITIZED = "local_filter_test"
@@ -46,7 +46,7 @@ def run(env=None):
         r = a.run_local(["bash", str(setup_sh), test_dir], timeout=60)
         results.append(AssertionResult("setup", r.passed, {}, {}, r.message))
         if not r.passed:
-            return _build(results, start)
+            return build_result(results, start)
     else:
         # 创建简单本地测试数据
         a.run_shell_quiet(f"mkdir -p {test_dir}/include_dir {test_dir}/exclude_dir")
@@ -73,16 +73,9 @@ def run(env=None):
                                        f"{'✓' if has_data else '✗'} ch_has_data: count={count}"))
 
     _cleanup(a, ch_host, test_dir)
-    return _build(results, start)
+    return build_result(results, start)
 
 
-def _build(results, start):
-    elapsed = round(time.monotonic() - start, 1)
-    passed = all(r.passed for r in results)
-    for r in results: print(r.message)
-    print(f"\n{'PASS' if passed else 'FAIL'} ({elapsed}s)")
-    return {"passed": passed, "metrics": {"elapsed_sec": elapsed},
-            "assertions": [{"name": r.name, "passed": r.passed, "message": r.message} for r in results]}
 
 
 if __name__ == "__main__":

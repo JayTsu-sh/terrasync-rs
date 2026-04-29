@@ -15,7 +15,7 @@ _HARNESS_SCRIPTS = _SKILL_DIR.parent / "harness-run" / "scripts"
 sys.path.insert(0, str(_HARNESS_SCRIPTS))
 
 import env as envmod
-from assertions import AssertionResult, TerrasyncAssertions
+from assertions import AssertionResult, TerrasyncAssertions, build_result
 
 JOB_ID = "nfs-v3-incr-scan"
 SANITIZED = "nfs_v3_incr_scan"
@@ -141,18 +141,18 @@ def run(env: dict = None) -> dict:
     if not setup_sh.exists():
         results.append(AssertionResult("setup", False, {}, {},
                                        f"✗ setup: setup-test-data.sh not found"))
-        return _build_result(results, start)
+        return build_result(results, start)
     try:
         a.scp_to(setup_sh, src_ip, "/tmp/setup-test-data.sh")
         out = a.ssh_exec(src_ip, "sudo bash /tmp/setup-test-data.sh", timeout=120)
     except Exception as e:
         results.append(AssertionResult("setup", False, {}, {}, f"✗ setup: {e}"))
-        return _build_result(results, start)
+        return build_result(results, start)
     setup_ok = "OK:" in out or "OK：" in out
     results.append(AssertionResult("setup", setup_ok, {}, {},
                                    f"{'✓' if setup_ok else '✗'} setup_test_data"))
     if not setup_ok:
-        return _build_result(results, start)
+        return build_result(results, start)
 
     # Step 2：全量扫描（建基线）
     proc = _terrasync_scan(binary, config, JOB_ID, src_ip, nfs_export)
@@ -160,7 +160,7 @@ def run(env: dict = None) -> dict:
         results.append(AssertionResult("full_scan_exit", False, {"code": 0},
                                        {"code": proc.returncode}, "✗ full_scan: failed"))
         _cleanup(a, src_ip, ch_host, nfs_export)
-        return _build_result(results, start)
+        return build_result(results, start)
 
     results.append(a.check_cli_scan_output(
         proc.stdout + proc.stderr,
@@ -177,20 +177,20 @@ def run(env: dict = None) -> dict:
         results.append(AssertionResult("mutate", False, {}, {},
                                        "✗ mutate: mutate-test-data.sh not found"))
         _cleanup(a, src_ip, ch_host, nfs_export)
-        return _build_result(results, start)
+        return build_result(results, start)
     try:
         a.scp_to(mutate_sh, src_ip, "/tmp/mutate-test-data.sh")
         mut_out = a.ssh_exec(src_ip, "sudo bash /tmp/mutate-test-data.sh", timeout=120)
     except Exception as e:
         results.append(AssertionResult("mutate", False, {}, {}, f"✗ mutate: {e}"))
         _cleanup(a, src_ip, ch_host, nfs_export)
-        return _build_result(results, start)
+        return build_result(results, start)
     mutate_ok = "OK:" in mut_out or "OK：" in mut_out
     results.append(AssertionResult("mutate", mutate_ok, {}, {},
                                    f"{'✓' if mutate_ok else '✗'} mutate_test_data"))
     if not mutate_ok:
         _cleanup(a, src_ip, ch_host, nfs_export)
-        return _build_result(results, start)
+        return build_result(results, start)
 
     # Step 4：增量扫描（同一 JOB_ID，jobs/ 目录存在 → 自动增量模式）
     proc2 = _terrasync_scan(binary, config, JOB_ID, src_ip, nfs_export)
@@ -200,7 +200,7 @@ def run(env: dict = None) -> dict:
         results.append(AssertionResult("incr_scan_exit", False, {"code": 0},
                                        {"code": proc2.returncode}, "✗ incr_scan: failed"))
         _cleanup(a, src_ip, ch_host, nfs_export)
-        return _build_result(results, start)
+        return build_result(results, start)
 
     # 4a：Scanned 统计（遍历当前文件系统）
     results.append(a.check_cli_scan_output(
@@ -245,18 +245,9 @@ def run(env: dict = None) -> dict:
         results.append(_check_incr_ch_table(a, ch_host))
 
     _cleanup(a, src_ip, ch_host, nfs_export)
-    return _build_result(results, start)
+    return build_result(results, start)
 
 
-def _build_result(results, start):
-    elapsed = round(time.monotonic() - start, 1)
-    passed = all(r.passed for r in results)
-    for r in results:
-        print(r.message)
-    print(f"\n{'PASS' if passed else 'FAIL'} ({elapsed}s)")
-    return {"passed": passed, "metrics": {"elapsed_sec": elapsed},
-            "assertions": [{"name": r.name, "passed": r.passed, "message": r.message}
-                           for r in results]}
 
 
 if __name__ == "__main__":

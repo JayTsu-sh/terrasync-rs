@@ -53,7 +53,7 @@ def write(label: str, cases: list[dict], base: str = "") -> Path:
         cid = c["id"]
         if c.get("skipped"):
             reason = c.get("skip_reason", "no run.py")
-            lines.append(f"| {cid} | ⚠ SKIP | — | *{reason}* |")
+            lines.append(f"| {cid} | ⚠ SKIP ({reason}) | — |")
             continue
         r = c["result"]
         status = "✓ PASS" if r.get("passed") else "✗ FAIL"

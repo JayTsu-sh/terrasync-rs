@@ -16,7 +16,7 @@ _SKILL_DIR = Path(__file__).parent.parent
 _HARNESS = _SKILL_DIR.parent / "harness-run" / "scripts"
 sys.path.insert(0, str(_HARNESS))
 import env as envmod
-from assertions import AssertionResult, TerrasyncAssertions
+from assertions import AssertionResult, TerrasyncAssertions, build_result
 
 SYNC_JOB_ID = "nfs-to-s3-sync"
 DST_SCAN_JOB_ID = "nfs-to-s3-sync-dst"
@@ -115,10 +115,10 @@ def run(env=None):
         out = a.ssh_exec(src_ip, "sudo bash /tmp/setup-test-data.sh", timeout=120)
     except Exception as e:
         results.append(AssertionResult("setup", False, {}, {}, f"✗ nfs_setup: {e}"))
-        return _build(results, start)
+        return build_result(results, start)
     ok = "OK:" in out or "OK：" in out
     results.append(AssertionResult("setup", ok, {}, {}, f"{'✓' if ok else '✗'} nfs_setup"))
-    if not ok: return _build(results, start)
+    if not ok: return build_result(results, start)
 
     # 跨协议 Sync: NFS → S3
     proc = subprocess.run(
@@ -129,7 +129,7 @@ def run(env=None):
     if proc.returncode != 0:
         results.append(AssertionResult("sync_exit", False, {}, {}, "✗ nfs→s3 sync failed"))
         _cleanup(a, src_ip, ch_host, cfg)
-        return _build(results, start)
+        return build_result(results, start)
     # 验证：S3 不含 symlink
     results.append(a.check_cli_sync_output(sync_out, {"dirs": S3_DIRS, "files": S3_FILES}))
 
@@ -142,16 +142,9 @@ def run(env=None):
                                            {"dirs": S3_DIRS, "files": S3_FILES}))
 
     _cleanup(a, src_ip, ch_host, cfg)
-    return _build(results, start)
+    return build_result(results, start)
 
 
-def _build(results, start):
-    elapsed = round(time.monotonic() - start, 1)
-    passed = all(r.passed for r in results)
-    for r in results: print(r.message)
-    print(f"\n{'PASS' if passed else 'FAIL'} ({elapsed}s)")
-    return {"passed": passed, "metrics": {"elapsed_sec": elapsed},
-            "assertions": [{"name": r.name, "passed": r.passed, "message": r.message} for r in results]}
 
 
 if __name__ == "__main__":

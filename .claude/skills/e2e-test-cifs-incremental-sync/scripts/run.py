@@ -16,7 +16,7 @@ _SKILL_DIR = Path(__file__).parent.parent
 _HARNESS = _SKILL_DIR.parent / "harness-run" / "scripts"
 sys.path.insert(0, str(_HARNESS))
 import env as envmod
-from assertions import AssertionResult, TerrasyncAssertions
+from assertions import AssertionResult, TerrasyncAssertions, build_result
 
 SYNC_JOB_ID = "cifs-incr-sync"
 DST_SCAN_JOB_ID = "cifs-incr-sync-dst"
@@ -98,12 +98,12 @@ def run(env=None):
     setup_sh = _SKILL_DIR.parent / "cifs-full-scan" / "scripts" / "setup-cifs-test-data.sh"
     if not setup_sh.exists():
         results.append(AssertionResult("setup", False, {}, {}, f"✗ {setup_sh} not found"))
-        return _build(results, start)
+        return build_result(results, start)
     p = _run_script(setup_sh, src, user, passwd, share)
     setup_ok = p.returncode == 0
     results.append(AssertionResult("setup", setup_ok, {}, {},
                                    f"{'✓' if setup_ok else '✗'} cifs_setup"))
-    if not setup_ok: return _build(results, start)
+    if not setup_ok: return build_result(results, start)
 
     bl = {"dirs": BASELINE_DIRS, "files": BASELINE_FILES}
 
@@ -113,7 +113,7 @@ def run(env=None):
                          capture_output=True, text=True, timeout=600)
     if proc.returncode != 0:
         results.append(AssertionResult("full_sync", False, {}, {}, "✗ full_sync failed"))
-        _cleanup(a, cfg); return _build(results, start)
+        _cleanup(a, cfg); return build_result(results, start)
     results.append(a.check_cli_sync_output(proc.stdout + proc.stderr, bl))
 
     # Mutate 源端
@@ -123,13 +123,13 @@ def run(env=None):
         mutate_sh = _SKILL_DIR.parent / "cifs-incremental-scan" / "scripts" / "mutate-cifs-test-data.sh"
     if not mutate_sh.exists():
         results.append(AssertionResult("mutate", False, {}, {}, "✗ mutate script not found"))
-        _cleanup(a, cfg); return _build(results, start)
+        _cleanup(a, cfg); return build_result(results, start)
     pm = _run_script(mutate_sh, src, user, passwd, share)
     mutate_ok = pm.returncode == 0
     results.append(AssertionResult("mutate", mutate_ok, {}, {},
                                    f"{'✓' if mutate_ok else '✗'} cifs_mutate"))
     if not mutate_ok:
-        _cleanup(a, cfg); return _build(results, start)
+        _cleanup(a, cfg); return build_result(results, start)
 
     # 增量 Sync
     proc2 = subprocess.run([binary, "-c", config, "-l", "trace", "sync",
@@ -156,16 +156,9 @@ def run(env=None):
                                        f"{'✓' if ok else '✗'} integrity_{label}"))
 
     _cleanup(a, cfg)
-    return _build(results, start)
+    return build_result(results, start)
 
 
-def _build(results, start):
-    elapsed = round(time.monotonic() - start, 1)
-    passed = all(r.passed for r in results)
-    for r in results: print(r.message)
-    print(f"\n{'PASS' if passed else 'FAIL'} ({elapsed}s)")
-    return {"passed": passed, "metrics": {"elapsed_sec": elapsed},
-            "assertions": [{"name": r.name, "passed": r.passed, "message": r.message} for r in results]}
 
 
 if __name__ == "__main__":

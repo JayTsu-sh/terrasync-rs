@@ -16,7 +16,7 @@ _HARNESS_SCRIPTS = _SKILL_DIR.parent / "harness-run" / "scripts"
 sys.path.insert(0, str(_HARNESS_SCRIPTS))
 
 import env as envmod
-from assertions import AssertionResult, TerrasyncAssertions
+from assertions import AssertionResult, TerrasyncAssertions, build_result
 
 SYNC_JOB_ID = "s3-full-sync"
 DST_SCAN_JOB_ID = "s3-full-sync-dst"
@@ -125,12 +125,12 @@ def run(env: dict = None) -> dict:
         out = _patch_and_run(a, src_ip, setup_sh, cfg)
     except Exception as e:
         results.append(AssertionResult("setup", False, {}, {}, f"✗ setup: {e}"))
-        return _build(results, start)
+        return build_result(results, start)
     setup_ok = "OK:" in out or "OK：" in out
     results.append(AssertionResult("setup", setup_ok, {}, {},
                                    f"{'✓' if setup_ok else '✗'} s3_setup"))
     if not setup_ok:
-        return _build(results, start)
+        return build_result(results, start)
 
     # 全量 Sync
     proc = subprocess.run(
@@ -141,7 +141,7 @@ def run(env: dict = None) -> dict:
     if proc.returncode != 0:
         results.append(AssertionResult("sync_exit", False, {}, {}, "✗ sync failed"))
         _cleanup_all(a, src_ip, dest_ip, ch_host, cfg)
-        return _build(results, start)
+        return build_result(results, start)
 
     exp = {"dirs": EXPECTED_DIRS, "files": EXPECTED_FILES}
     results.append(a.check_cli_sync_output(sync_out, exp))
@@ -164,18 +164,9 @@ def run(env: dict = None) -> dict:
                                    f"{'✓' if passed else '✗'} integrity_check_quick"))
 
     _cleanup_all(a, src_ip, dest_ip, ch_host, cfg)
-    return _build(results, start)
+    return build_result(results, start)
 
 
-def _build(results, start):
-    elapsed = round(time.monotonic() - start, 1)
-    passed = all(r.passed for r in results)
-    for r in results:
-        print(r.message)
-    print(f"\n{'PASS' if passed else 'FAIL'} ({elapsed}s)")
-    return {"passed": passed, "metrics": {"elapsed_sec": elapsed},
-            "assertions": [{"name": r.name, "passed": r.passed, "message": r.message}
-                           for r in results]}
 
 
 if __name__ == "__main__":

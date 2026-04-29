@@ -23,7 +23,7 @@ _HARNESS_SCRIPTS = _SKILL_DIR.parent / "harness-run" / "scripts"
 sys.path.insert(0, str(_HARNESS_SCRIPTS))
 
 import env as envmod
-from assertions import AssertionResult, TerrasyncAssertions
+from assertions import AssertionResult, TerrasyncAssertions, build_result
 
 # ── 测试常量 ──────────────────────────────────────────────────────────────────
 JOB_ID = "nfs-v3-full-scan"
@@ -219,7 +219,7 @@ def run(env: dict = None) -> dict:
     results.append(setup_r)
     if not setup_r.passed:
         _cleanup(a, src_ip, ch_host, nfs_export)
-        return _build_result(results, start)
+        return build_result(results, start)
 
     # Step 2：全量扫描
     scan_cmd = [
@@ -236,7 +236,7 @@ def run(env: dict = None) -> dict:
             f"✗ scan_exit_code: terrasync exited with {proc.returncode}"
         ))
         _cleanup(a, src_ip, ch_host, nfs_export)
-        return _build_result(results, start)
+        return build_result(results, start)
 
     # Step 2a：CLI 输出验证
     cli_r = a.check_cli_scan_output(
@@ -246,7 +246,7 @@ def run(env: dict = None) -> dict:
     results.append(cli_r)
     if not cli_r.passed:
         _cleanup(a, src_ip, ch_host, nfs_export)
-        return _build_result(results, start)
+        return build_result(results, start)
 
     # Steps 2b/2c/2d：并发验证
     with ThreadPoolExecutor(max_workers=3) as ex:
@@ -267,23 +267,9 @@ def run(env: dict = None) -> dict:
     # Step 3：清理
     _cleanup(a, src_ip, ch_host, nfs_export)
 
-    return _build_result(results, start)
+    return build_result(results, start)
 
 
-def _build_result(results: list[AssertionResult], start: float) -> dict:
-    elapsed = round(time.monotonic() - start, 1)
-    passed = all(r.passed for r in results)
-    for r in results:
-        print(r.message)
-    print(f"\n{'PASS' if passed else 'FAIL'} ({elapsed}s)")
-    return {
-        "passed": passed,
-        "metrics": {"elapsed_sec": elapsed},
-        "assertions": [
-            {"name": r.name, "passed": r.passed, "message": r.message}
-            for r in results
-        ],
-    }
 
 
 if __name__ == "__main__":

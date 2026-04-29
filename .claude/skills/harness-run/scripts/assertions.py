@@ -52,10 +52,13 @@ class TerrasyncAssertions:
     # ── ClickHouse ─────────────────────────────────────────────────────────
 
     def clickhouse_query(self, host, query, timeout=30) -> str:
-        """发送 HTTP 查询到 ClickHouse，返回原始文本。"""
+        """发送 HTTP 查询到 ClickHouse，返回原始文本。失败时抛出 RuntimeError。"""
         url = f"http://{host}/?query={urllib.parse.quote(query)}"
-        with urllib.request.urlopen(url, timeout=timeout) as resp:
-            return resp.read().decode()
+        try:
+            with urllib.request.urlopen(url, timeout=timeout) as resp:
+                return resp.read().decode()
+        except Exception as e:
+            raise RuntimeError(f"ClickHouse query failed on {host}: {e}") from e
 
     def clickhouse_drop_tables(self, host, sanitized_job_id):
         """删除 base_*, state_*, incremental_* 表（IF EXISTS，幂等）。"""
@@ -190,3 +193,21 @@ class TerrasyncAssertions:
             {"mismatches": 0}, {"mismatches": count},
             f"{'✓' if passed else '✗'} integrity_check: mismatches={count}"
         )
+
+
+def build_result(results: list, start: float) -> dict:
+    """构建标准化的 run() 返回 dict 并打印断言结果。"""
+    import time
+    elapsed = round(time.monotonic() - start, 1)
+    passed = all(r.passed for r in results)
+    for r in results:
+        print(r.message)
+    print(f"\n{'PASS' if passed else 'FAIL'} ({elapsed}s)")
+    return {
+        "passed": passed,
+        "metrics": {"elapsed_sec": elapsed},
+        "assertions": [
+            {"name": r.name, "passed": r.passed, "message": r.message}
+            for r in results
+        ],
+    }

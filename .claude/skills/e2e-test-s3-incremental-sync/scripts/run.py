@@ -9,7 +9,7 @@ _SKILL_DIR = Path(__file__).parent.parent
 _HARNESS = _SKILL_DIR.parent / "harness-run" / "scripts"
 sys.path.insert(0, str(_HARNESS))
 import env as envmod
-from assertions import AssertionResult, TerrasyncAssertions
+from assertions import AssertionResult, TerrasyncAssertions, build_result
 
 SYNC_JOB_ID = "s3-incr-sync"
 DST_SCAN_JOB_ID = "s3-incr-sync-dst"
@@ -86,19 +86,19 @@ def run(env=None):
         a.scp_to(tmp, src_ip, "/tmp/setup-s3-test-data.sh")
         out = a.ssh_exec(src_ip, "bash /tmp/setup-s3-test-data.sh", timeout=300)
     except Exception as e:
-        results.append(AssertionResult("setup", False, {}, {}, f"✗ setup: {e}")); return _b(results, start)
+        results.append(AssertionResult("setup", False, {}, {}, f"✗ setup: {e}")); return build_result(results, start)
     finally:
         if os.path.exists(tmp): os.unlink(tmp)
     ok = "OK:" in out or "OK：" in out
     results.append(AssertionResult("setup", ok, {}, {}, f"{'✓' if ok else '✗'} s3_setup"))
-    if not ok: return _b(results, start)
+    if not ok: return build_result(results, start)
 
     # 全量 Sync
     p = subprocess.run([binary, "-c", config, "-l", "trace", "sync", "--id", SYNC_JOB_ID, src_url, dst_url],
                        capture_output=True, text=True, timeout=600)
     if p.returncode != 0:
         results.append(AssertionResult("full_sync", False, {}, {}, "✗ full_sync failed"))
-        _cleanup(a, src_ip, dest_ip, ch_host, cfg); return _b(results, start)
+        _cleanup(a, src_ip, dest_ip, ch_host, cfg); return build_result(results, start)
     bl = {"dirs": BASELINE_DIRS, "files": BASELINE_FILES}
     results.append(a.check_cli_sync_output(p.stdout + p.stderr, bl))
 
@@ -109,12 +109,12 @@ def run(env=None):
         mut = a.ssh_exec(src_ip, "bash /tmp/mutate-s3-test-data.sh", timeout=120)
     except Exception as e:
         results.append(AssertionResult("mutate", False, {}, {}, f"✗ mutate: {e}"))
-        _cleanup(a, src_ip, dest_ip, ch_host, cfg); return _b(results, start)
+        _cleanup(a, src_ip, dest_ip, ch_host, cfg); return build_result(results, start)
     finally:
         if os.path.exists(tmp2): os.unlink(tmp2)
     ok2 = "OK:" in mut or "OK：" in mut
     results.append(AssertionResult("mutate", ok2, {}, {}, f"{'✓' if ok2 else '✗'} s3_mutate"))
-    if not ok2: _cleanup(a, src_ip, dest_ip, ch_host, cfg); return _b(results, start)
+    if not ok2: _cleanup(a, src_ip, dest_ip, ch_host, cfg); return build_result(results, start)
 
     # 增量 Sync
     p2 = subprocess.run([binary, "-c", config, "-l", "trace", "sync", "--id", SYNC_JOB_ID, src_url, dst_url],
@@ -136,16 +136,9 @@ def run(env=None):
     results.append(AssertionResult("integrity_quick", ok4, {}, {}, f"{'✓' if ok4 else '✗'} integrity_quick"))
 
     _cleanup(a, src_ip, dest_ip, ch_host, cfg)
-    return _b(results, start)
+    return build_result(results, start)
 
 
-def _b(results, start):
-    elapsed = round(time.monotonic() - start, 1)
-    passed = all(r.passed for r in results)
-    for r in results: print(r.message)
-    print(f"\n{'PASS' if passed else 'FAIL'} ({elapsed}s)")
-    return {"passed": passed, "metrics": {"elapsed_sec": elapsed},
-            "assertions": [{"name": r.name, "passed": r.passed, "message": r.message} for r in results]}
 
 
 if __name__ == "__main__":

@@ -8,7 +8,7 @@ _SKILL_DIR = Path(__file__).parent.parent
 _HARNESS = _SKILL_DIR.parent / "harness-run" / "scripts"
 sys.path.insert(0, str(_HARNESS))
 import env as envmod
-from assertions import AssertionResult, TerrasyncAssertions
+from assertions import AssertionResult, TerrasyncAssertions, build_result
 
 JOB_ID = "s3-ver-incr-scan"
 SANITIZED = "s3_ver_incr_scan"
@@ -65,14 +65,14 @@ def run(env=None):
     # 创建版本化 bucket 并上传测试数据
     if not _mc_setup_bucket(a, src_ip, cfg):
         results.append(AssertionResult("setup_bucket", False, {}, {}, "✗ versioned bucket setup failed"))
-        return _b(results, start)
+        return build_result(results, start)
     results.append(AssertionResult("setup_bucket", True, {}, {}, "✓ versioned bucket ready"))
 
     # 上传初始版本（使用 versioned setup script）
     ver_setup = _SKILL_DIR.parent / "s3-versioned-full-scan" / "scripts" / "setup-s3-versioned-test-data.sh"
     if not ver_setup.exists():
         results.append(AssertionResult("setup_data", False, {}, {}, f"✗ setup script not found: {ver_setup}"))
-        return _b(results, start)
+        return build_result(results, start)
 
     with open(ver_setup) as f: c = f.read()
     ak, sk = cfg["S3_ACCESS_KEY"], cfg["S3_SECRET_KEY"]
@@ -91,7 +91,7 @@ def run(env=None):
         a.ssh_exec(src_ip, "bash /tmp/setup-s3-versioned.sh", timeout=300)
     except Exception as e:
         results.append(AssertionResult("setup_data", False, {}, {}, f"✗ setup: {e}"))
-        return _b(results, start)
+        return build_result(results, start)
     finally:
         if os.path.exists(tmp): os.unlink(tmp)
     results.append(AssertionResult("setup_data", True, {}, {}, "✓ versioned test data uploaded"))
@@ -101,7 +101,7 @@ def run(env=None):
                         capture_output=True, text=True, timeout=300)
     ok1 = p1.returncode == 0
     results.append(AssertionResult("full_scan", ok1, {}, {}, f"{'✓' if ok1 else '✗'} full_scan"))
-    if not ok1: _cleanup(a, src_ip, ch_host, cfg); return _b(results, start)
+    if not ok1: _cleanup(a, src_ip, ch_host, cfg); return build_result(results, start)
 
     # 上传新版本（模拟变更）
     ver_mutate = _SKILL_DIR.parent / "s3-versioned-incremental-scan" / "scripts" / "mutate-s3-versioned-test-data.sh"
@@ -138,16 +138,9 @@ def run(env=None):
                                        f"{'✓' if has else '✗'} incr_ch_has_data: count={count}"))
 
     _cleanup(a, src_ip, ch_host, cfg)
-    return _b(results, start)
+    return build_result(results, start)
 
 
-def _b(results, start):
-    elapsed = round(time.monotonic() - start, 1)
-    passed = all(r.passed for r in results)
-    for r in results: print(r.message)
-    print(f"\n{'PASS' if passed else 'FAIL'} ({elapsed}s)")
-    return {"passed": passed, "metrics": {"elapsed_sec": elapsed},
-            "assertions": [{"name": r.name, "passed": r.passed, "message": r.message} for r in results]}
 
 
 if __name__ == "__main__":
