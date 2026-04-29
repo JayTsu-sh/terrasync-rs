@@ -23,6 +23,7 @@ flamegraph.svg
 custom_config.toml
 *.env
 .env*
+!**/.env.example
 
 # === IDE / 编辑器 ===
 .idea

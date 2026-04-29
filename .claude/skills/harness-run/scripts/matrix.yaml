@@ -1,0 +1,65 @@
+version: "1"
+
+# 测试矩阵
+# parallel: true  — suite 内各 case 并发执行
+# parallel: false — suite 内各 case 串行执行（共享存储资源时必须串行）
+# timeout: 单个 case 超时秒数
+
+suites:
+
+  # 快速冒烟：跨协议并发，约 90s
+  smoke:
+    parallel: true
+    cases:
+      - {id: nfs-v3-full-scan, skill_dir: e2e-test-nfs-v3-full-scan, timeout: 600}
+      - {id: s3-full-scan,     skill_dir: e2e-test-s3-full-scan,     timeout: 600}
+
+  # NFS v3 完整套件：共享 NFS export，串行
+  nfs-v3:
+    parallel: false
+    cases:
+      - {id: nfs-v3-full-scan,        skill_dir: e2e-test-nfs-v3-full-scan,        timeout: 600}
+      - {id: nfs-v3-full-sync,        skill_dir: e2e-test-nfs-v3-full-sync,        timeout: 900}
+      - {id: nfs-v3-incremental-scan, skill_dir: e2e-test-nfs-v3-incremental-scan, timeout: 600}
+      - {id: nfs-v3-incremental-sync, skill_dir: e2e-test-nfs-v3-incremental-sync, timeout: 1200}
+      - {id: nfs-v3-integrity-check,  skill_dir: e2e-test-nfs-v3-integrity-check,  timeout: 600}
+
+  # NFS v4 完整套件：共享 NFS4 export，串行
+  nfs-v4:
+    parallel: false
+    cases:
+      - {id: nfs-v4-full-scan,        skill_dir: e2e-test-nfs-v4-full-scan,        timeout: 600}
+      - {id: nfs-v4-full-sync,        skill_dir: e2e-test-nfs-v4-full-sync,        timeout: 900}
+      - {id: nfs-v4-incremental-scan, skill_dir: e2e-test-nfs-v4-incremental-scan, timeout: 600}
+      - {id: nfs-v4-incremental-sync, skill_dir: e2e-test-nfs-v4-incremental-sync, timeout: 1200}
+      - {id: nfs-v4-integrity-check,  skill_dir: e2e-test-nfs-v4-integrity-check,  timeout: 600}
+
+  # S3 / MinIO 套件：共享 bucket，串行
+  s3:
+    parallel: false
+    cases:
+      - {id: s3-full-scan,                  skill_dir: e2e-test-s3-full-scan,                  timeout: 600}
+      - {id: s3-full-sync,                  skill_dir: e2e-test-s3-full-sync,                  timeout: 900}
+      - {id: s3-incremental-scan,           skill_dir: e2e-test-s3-incremental-scan,           timeout: 600}
+      - {id: s3-incremental-sync,           skill_dir: e2e-test-s3-incremental-sync,           timeout: 900}
+      - {id: s3-integrity-check,            skill_dir: e2e-test-s3-integrity-check,            timeout: 600}
+      - {id: s3-versioned-full-scan,        skill_dir: e2e-test-s3-versioned-full-scan,        timeout: 600}
+      - {id: s3-versioned-incremental-scan, skill_dir: e2e-test-s3-versioned-incremental-scan, timeout: 600}
+
+  # CIFS / SMB 套件：串行
+  cifs:
+    parallel: false
+    cases:
+      - {id: cifs-full-scan,        skill_dir: e2e-test-cifs-full-scan,        timeout: 600}
+      - {id: cifs-full-sync,        skill_dir: e2e-test-cifs-full-sync,        timeout: 900}
+      - {id: cifs-incremental-scan, skill_dir: e2e-test-cifs-incremental-scan, timeout: 600}
+      - {id: cifs-incremental-sync, skill_dir: e2e-test-cifs-incremental-sync, timeout: 900}
+      - {id: cifs-integrity-check,  skill_dir: e2e-test-cifs-integrity-check,  timeout: 600}
+
+  # 跨协议：可并发（各用不同资源）
+  cross-protocol:
+    parallel: true
+    cases:
+      - {id: nfs-to-s3-full-sync, skill_dir: e2e-test-nfs-to-s3-full-sync, timeout: 900}
+      - {id: s3-to-nfs-full-sync, skill_dir: e2e-test-s3-to-nfs-full-sync, timeout: 900}
+      - {id: local-filter,        skill_dir: e2e-test-local-filter,        timeout: 300}
