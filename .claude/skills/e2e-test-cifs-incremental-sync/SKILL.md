@@ -6,6 +6,9 @@ description: >
   or mentions running the full-sync → mutate → incremental-sync → verify workflow for CIFS.
 ---
 
+> **自动化模式**：直接运行 `python scripts/run.py`（调试时才按下方步骤执行）
+
+
 # CIFS Incremental Sync Test Skill
 
 ## Overview
@@ -25,16 +28,16 @@ description: >
 
 | Name | Value |
 |------|-------|
-| SRC_CIFS_HOST | `{SRC_CIFS_HOST}` |
-| SRC_CIFS_USER | `{SRC_CIFS_USER}` |
-| SRC_CIFS_PASS | `{SRC_CIFS_PASS}` |
-| SRC_CIFS_SHARE | `{SRC_CIFS_SHARE}` |
-| DST_CIFS_HOST | `{DST_CIFS_HOST}` |
-| DST_CIFS_USER | `{DST_CIFS_USER}` |
-| DST_CIFS_PASS | `{DST_CIFS_PASS}` |
-| DST_CIFS_SHARE | `{DST_CIFS_SHARE}` |
-| SOURCE_URL | `smb://{SRC_CIFS_USER}:{SRC_CIFS_PASS}@{SRC_CIFS_HOST}/{SRC_CIFS_SHARE}/test-data` |
-| DEST_URL | `smb://{DST_CIFS_USER}:{DST_CIFS_PASS}@{DST_CIFS_HOST}/{DST_CIFS_SHARE}/test-data` |
+| SRC_CIFS_HOST | `192.168.50.173` |
+| SRC_CIFS_USER | `terrasync` |
+| SRC_CIFS_PASS | `terrasync123` |
+| SRC_CIFS_SHARE | `testshare` |
+| DST_CIFS_HOST | `192.168.50.23` |
+| DST_CIFS_USER | `terrasync` |
+| DST_CIFS_PASS | `terrasync123` |
+| DST_CIFS_SHARE | `testshare` |
+| SOURCE_URL | `smb://terrasync:terrasync123@192.168.50.173/testshare/test-data` |
+| DEST_URL | `smb://terrasync:terrasync123@192.168.50.23/testshare/test-data` |
 | CONFIG | `examples/config.toml` |
 | BINARY | `./target/debug/terrasync` |
 | CLICKHOUSE_HOST | `192.168.50.173:8123` |
@@ -63,7 +66,7 @@ ClickHouse 表名：
 ### 0a. 清理源端 CIFS 数据
 
 ```bash
-smbclient "//{SRC_CIFS_HOST}/{SRC_CIFS_SHARE}" -U "{SRC_CIFS_USER}%{SRC_CIFS_PASS}" -c "deltree test-data" 2>/dev/null || true
+smbclient "//192.168.50.173/testshare" -U "terrasync%terrasync123" -c "deltree test-data" 2>/dev/null || true
 echo "source CIFS cleaned"
 ```
 
@@ -72,7 +75,7 @@ Expected: `source CIFS cleaned`。
 ### 0b. 清理目标端 CIFS 数据
 
 ```bash
-smbclient "//{DST_CIFS_HOST}/{DST_CIFS_SHARE}" -U "{DST_CIFS_USER}%{DST_CIFS_PASS}" -c "deltree test-data" 2>/dev/null || true
+smbclient "//192.168.50.23/testshare" -U "terrasync%terrasync123" -c "deltree test-data" 2>/dev/null || true
 echo "dest CIFS cleaned"
 ```
 
@@ -171,7 +174,7 @@ Expected: `0`。
 ### 2d. 目标端 smbclient 验证
 
 ```bash
-FILE_COUNT=$(smbclient "//{DST_CIFS_HOST}/{DST_CIFS_SHARE}" -U "{DST_CIFS_USER}%{DST_CIFS_PASS}" -c "recurse ON; ls test-data/*" 2>/dev/null | grep -c "^\s")
+FILE_COUNT=$(smbclient "//192.168.50.23/testshare" -U "terrasync%terrasync123" -c "recurse ON; ls test-data/*" 2>/dev/null | grep -c "^\s")
 echo "dest CIFS files: $FILE_COUNT"
 ```
 
@@ -256,7 +259,7 @@ grep -E "ERROR|WARN" target/debug/logs/*/app.log | tail -80
 ### 6a. smbclient 直接计数
 
 ```bash
-FILE_COUNT=$(smbclient "//{DST_CIFS_HOST}/{DST_CIFS_SHARE}" -U "{DST_CIFS_USER}%{DST_CIFS_PASS}" -c "recurse ON; ls test-data/*" 2>/dev/null | grep -c "^\s")
+FILE_COUNT=$(smbclient "//192.168.50.23/testshare" -U "terrasync%terrasync123" -c "recurse ON; ls test-data/*" 2>/dev/null | grep -c "^\s")
 echo "dest CIFS files after incremental: $FILE_COUNT"
 ```
 

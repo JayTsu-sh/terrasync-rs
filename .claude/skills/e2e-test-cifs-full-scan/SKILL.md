@@ -7,6 +7,9 @@ description: >
   or mentions running the full-scan → verify workflow against the CIFS test environment.
 ---
 
+> **自动化模式**：直接运行 `python scripts/run.py`（调试时才按下方步骤执行）
+
+
 # CIFS Full Scan Test Skill
 
 ## Overview
@@ -27,12 +30,12 @@ description: >
 
 | Name | Value |
 |------|-------|
-| CIFS_HOST | `{CIFS_HOST}` |
-| CIFS_PORT | `{CIFS_PORT}` |
-| CIFS_USER | `{CIFS_USER}` |
-| CIFS_PASS | `{CIFS_PASS}` |
-| CIFS_SHARE | `{CIFS_SHARE}` |
-| CIFS_URL | `smb://{CIFS_USER}:{CIFS_PASS}@{CIFS_HOST}/{CIFS_SHARE}/test-data` |
+| CIFS_HOST | `192.168.50.173` |
+| CIFS_PORT | `445` |
+| CIFS_USER | `terrasync` |
+| CIFS_PASS | `terrasync123` |
+| CIFS_SHARE | `testshare` |
+| CIFS_URL | `smb://terrasync:terrasync123@192.168.50.173/testshare/test-data` |
 | CONFIG | `examples/config.toml` |
 | BINARY | `./target/debug/terrasync` |
 | CLICKHOUSE_HOST | `192.168.50.173:8123` |
@@ -56,14 +59,14 @@ ClickHouse 表名：
 ### 0a. 清理 CIFS 共享数据
 
 ```bash
-smbclient "//{CIFS_HOST}/{CIFS_SHARE}" -U "{CIFS_USER}%{CIFS_PASS}" -c "deltree test-data" 2>/dev/null || true
+smbclient "//192.168.50.173/testshare" -U "terrasync%terrasync123" -c "deltree test-data" 2>/dev/null || true
 echo "CIFS cleaned"
 ```
 
 验证：
 
 ```bash
-smbclient "//{CIFS_HOST}/{CIFS_SHARE}" -U "{CIFS_USER}%{CIFS_PASS}" -c "ls test-data/*" 2>/dev/null | wc -l
+smbclient "//192.168.50.173/testshare" -U "terrasync%terrasync123" -c "ls test-data/*" 2>/dev/null | wc -l
 ```
 
 Expected: `0` 或报错（目录不存在）。
@@ -184,7 +187,7 @@ Expected: `157`（{EXPECTED_DIRS}+{EXPECTED_FILES} = 40+117，CIFS 无 symlink�
 ### 4a. 清理 CIFS 共享数据
 
 ```bash
-smbclient "//{CIFS_HOST}/{CIFS_SHARE}" -U "{CIFS_USER}%{CIFS_PASS}" -c "deltree test-data" 2>/dev/null || true
+smbclient "//192.168.50.173/testshare" -U "terrasync%terrasync123" -c "deltree test-data" 2>/dev/null || true
 ```
 
 ### 4b. 清理 ClickHouse 表

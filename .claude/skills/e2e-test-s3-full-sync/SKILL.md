@@ -7,6 +7,9 @@ description: >
   or mentions running the source-scan → full-copy → dest-scan → integrity-check workflow for S3.
 ---
 
+> **自动化模式**：直接运行 `python scripts/run.py`（调试时才按下方步骤执行）
+
+
 # S3 Full Sync Test Skill
 
 ## Overview
@@ -30,10 +33,10 @@ description: >
 
 | Name | Value |
 |------|-------|
-| S3_AK | `H80NKRVS5DYOVE43U2HS` |
-| S3_SK | `FBU8xNSKujskgO2bF6ctnd7dF2IeDodmoy3q6hNk` |
-| S3_HOST | `10.128.137.245:8184` |
-| SRC_BUCKET | `mbucket-src` |
+| S3_AK | `rustfsadmin` |
+| S3_SK | `rustfsadmin123` |
+| S3_HOST | `192.168.50.173:39000` |
+| SRC_BUCKET | `test-bucket` |
 | DST_BUCKET | `{DST_S3_BUCKET}` |
 | SOURCE_URL | `s3://{S3_AK}:{S3_SK}@{SRC_BUCKET}.{S3_HOST}/test-data` |
 | DEST_URL | `s3://{S3_AK}:{S3_SK}@{DST_BUCKET}.{S3_HOST}/test-data` |

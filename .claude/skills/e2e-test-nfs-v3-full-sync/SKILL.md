@@ -8,6 +8,9 @@ description: >
   against the NFSv3 test environment ({SOURCE_IP} → {DEST_IP}).
 ---
 
+> **自动化模式**：直接运行 `python scripts/run.py`（调试时才按下方步骤执行）
+
+
 # NFS v3 Full Sync Test Skill
 
 ## Overview

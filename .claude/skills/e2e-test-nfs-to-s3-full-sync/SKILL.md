@@ -6,6 +6,9 @@ description: >
   "test nfs to s3 migration", or mentions running cross-protocol sync from NFSv3 to S3.
 ---
 
+> **自动化模式**：直接运行 `python scripts/run.py`（调试时才按下方步骤执行）
+
+
 # NFS → S3 Cross-Protocol Full Sync Test Skill
 
 ## Overview
@@ -31,9 +34,9 @@ description: >
 | SOURCE_IP | 192.168.50.173 |
 | SOURCE_NFS_EXPORT | `/export/nfs` |
 | SOURCE_URL | `nfs://{SOURCE_IP}{SOURCE_NFS_EXPORT}` |
-| S3_AK | `H80NKRVS5DYOVE43U2HS` |
-| S3_SK | `FBU8xNSKujskgO2bF6ctnd7dF2IeDodmoy3q6hNk` |
-| S3_HOST | `10.128.137.245:8184` |
+| S3_AK | `rustfsadmin` |
+| S3_SK | `rustfsadmin123` |
+| S3_HOST | `192.168.50.173:39000` |
 | DST_BUCKET | `{DST_S3_BUCKET}` |
 | DEST_URL | `s3://{S3_AK}:{S3_SK}@{DST_BUCKET}.{S3_HOST}/test-data` |
 | CONFIG | `examples/config.toml` |

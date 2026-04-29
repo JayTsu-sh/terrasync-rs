@@ -7,6 +7,9 @@ description: >
   or mentions running a standalone integrity-check between two CIFS endpoints.
 ---
 
+> **自动化模式**：直接运行 `python scripts/run.py`（调试时才按下方步骤执行）
+
+
 # CIFS Integrity Check Test Skill
 
 ## Overview
@@ -26,16 +29,16 @@ description: >
 
 | Name | Value |
 |------|-------|
-| SRC_CIFS_HOST | `{SRC_CIFS_HOST}` |
-| SRC_CIFS_USER | `{SRC_CIFS_USER}` |
-| SRC_CIFS_PASS | `{SRC_CIFS_PASS}` |
-| SRC_CIFS_SHARE | `{SRC_CIFS_SHARE}` |
-| DST_CIFS_HOST | `{DST_CIFS_HOST}` |
-| DST_CIFS_USER | `{DST_CIFS_USER}` |
-| DST_CIFS_PASS | `{DST_CIFS_PASS}` |
-| DST_CIFS_SHARE | `{DST_CIFS_SHARE}` |
-| SOURCE_URL | `smb://{SRC_CIFS_USER}:{SRC_CIFS_PASS}@{SRC_CIFS_HOST}/{SRC_CIFS_SHARE}/test-data` |
-| DEST_URL | `smb://{DST_CIFS_USER}:{DST_CIFS_PASS}@{DST_CIFS_HOST}/{DST_CIFS_SHARE}/test-data` |
+| SRC_CIFS_HOST | `192.168.50.173` |
+| SRC_CIFS_USER | `terrasync` |
+| SRC_CIFS_PASS | `terrasync123` |
+| SRC_CIFS_SHARE | `testshare` |
+| DST_CIFS_HOST | `192.168.50.23` |
+| DST_CIFS_USER | `terrasync` |
+| DST_CIFS_PASS | `terrasync123` |
+| DST_CIFS_SHARE | `testshare` |
+| SOURCE_URL | `smb://terrasync:terrasync123@192.168.50.173/testshare/test-data` |
+| DEST_URL | `smb://terrasync:terrasync123@192.168.50.23/testshare/test-data` |
 | CONFIG | `examples/config.toml` |
 | BINARY | `./target/debug/terrasync` |
 | CLICKHOUSE_HOST | `192.168.50.173:8123` |
@@ -53,7 +56,7 @@ description: >
 ### 0a. 清理源端 CIFS 数据
 
 ```bash
-smbclient "//{SRC_CIFS_HOST}/{SRC_CIFS_SHARE}" -U "{SRC_CIFS_USER}%{SRC_CIFS_PASS}" -c "deltree test-data" 2>/dev/null || true
+smbclient "//192.168.50.173/testshare" -U "terrasync%terrasync123" -c "deltree test-data" 2>/dev/null || true
 echo "source CIFS cleaned"
 ```
 
@@ -62,7 +65,7 @@ Expected: `source CIFS cleaned`。
 ### 0b. 清理目标端 CIFS 数据
 
 ```bash
-smbclient "//{DST_CIFS_HOST}/{DST_CIFS_SHARE}" -U "{DST_CIFS_USER}%{DST_CIFS_PASS}" -c "deltree test-data" 2>/dev/null || true
+smbclient "//192.168.50.23/testshare" -U "terrasync%terrasync123" -c "deltree test-data" 2>/dev/null || true
 echo "dest CIFS cleaned"
 ```
 
@@ -136,7 +139,7 @@ Use the Bash tool locally (timeout=120000):
 ### 2b. 目标端 smbclient 验证
 
 ```bash
-FILE_COUNT=$(smbclient "//{DST_CIFS_HOST}/{DST_CIFS_SHARE}" -U "{DST_CIFS_USER}%{DST_CIFS_PASS}" -c "recurse ON; ls test-data/*" 2>/dev/null | grep -c "^\s")
+FILE_COUNT=$(smbclient "//192.168.50.23/testshare" -U "terrasync%terrasync123" -c "recurse ON; ls test-data/*" 2>/dev/null | grep -c "^\s")
 echo "dest CIFS files: $FILE_COUNT"
 ```
 
@@ -172,7 +175,7 @@ Expected:
 
 ```bash
 echo "tampered-content-for-cifs-integrity-check" > /tmp/tampered_file.txt
-smbclient "//{DST_CIFS_HOST}/{DST_CIFS_SHARE}" -U "{DST_CIFS_USER}%{DST_CIFS_PASS}" -c "cd test-data/d1/d1_1; put /tmp/tampered_file.txt file1.txt"
+smbclient "//192.168.50.23/testshare" -U "terrasync%terrasync123" -c "cd test-data/d1/d1_1; put /tmp/tampered_file.txt file1.txt"
 rm /tmp/tampered_file.txt
 ```
 
@@ -199,7 +202,7 @@ Expected:
 ### 4c. 删除目标端文件（制造 Missing）
 
 ```bash
-smbclient "//{DST_CIFS_HOST}/{DST_CIFS_SHARE}" -U "{DST_CIFS_USER}%{DST_CIFS_PASS}" -c "cd test-data/d2; del file1.txt"
+smbclient "//192.168.50.23/testshare" -U "terrasync%terrasync123" -c "cd test-data/d2; del file1.txt"
 ```
 
 ### 4d. 校验（应检测到 Missing + Mismatch）

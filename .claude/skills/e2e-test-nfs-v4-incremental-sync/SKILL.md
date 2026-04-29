@@ -7,6 +7,9 @@ description: >
   or mentions running the full-sync → mutate → incremental-sync workflow against NFSv4.1 servers.
 ---
 
+> **自动化模式**：直接运行 `python scripts/run.py`（调试时才按下方步骤执行）
+
+
 # NFS v4.1 Incremental Sync Test Skill
 
 ## Overview

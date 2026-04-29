@@ -7,6 +7,9 @@ description: >
   or mentions running the full-scan workflow against a versioned S3 bucket.
 ---
 
+> **自动化模式**：直接运行 `python scripts/run.py`（调试时才按下方步骤执行）
+
+
 # S3 Versioned Full Scan Test Skill
 
 ## Overview
@@ -31,9 +34,9 @@ description: >
 
 | Name | Value |
 |------|-------|
-| S3_AK | `H80NKRVS5DYOVE43U2HS` |
-| S3_SK | `FBU8xNSKujskgO2bF6ctnd7dF2IeDodmoy3q6hNk` |
-| S3_HOST | `10.128.137.245:8184` |
+| S3_AK | `rustfsadmin` |
+| S3_SK | `rustfsadmin123` |
+| S3_HOST | `192.168.50.173:39000` |
 | S3_BUCKET | `{S3_VERSIONED_BUCKET}` |
 | S3_URL | `s3://{S3_AK}:{S3_SK}@{S3_BUCKET}.{S3_HOST}/test-data` |
 | CONFIG | `examples/config.toml` |

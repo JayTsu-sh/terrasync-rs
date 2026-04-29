@@ -7,6 +7,9 @@ description: >
   or mentions running a standalone integrity-check between two NFS endpoints.
 ---
 
+> **自动化模式**：直接运行 `python scripts/run.py`（调试时才按下方步骤执行）
+
+
 # NFS v3 Integrity Check Test Skill
 
 ## Overview

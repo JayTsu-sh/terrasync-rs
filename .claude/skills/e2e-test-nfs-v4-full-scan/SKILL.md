@@ -6,6 +6,9 @@ description: >
   or mentions running the full-scan workflow against an NFSv4.1 server.
 ---
 
+> **自动化模式**：直接运行 `python scripts/run.py`（调试时才按下方步骤执行）
+
+
 # NFS v4.1 Full Scan Test Skill
 
 ## Overview
@@ -27,7 +30,7 @@ description: >
 | Name | Value |
 |------|-------|
 | SOURCE_IP | 192.168.50.173 |
-| NFS_EXPORT | `` |
+| NFS_EXPORT | `/export/nfsv4` |
 | SOURCE_URL | `nfs://{SOURCE_IP}{NFS_EXPORT}?version=4.1` |
 | CONFIG | `examples/config.toml` |
 | BINARY | `./target/debug/terrasync` |

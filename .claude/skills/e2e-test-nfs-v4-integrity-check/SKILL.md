@@ -7,6 +7,9 @@ description: >
   or mentions running a standalone integrity-check with ACL/xattr verification between two NFSv4.1 endpoints.
 ---
 
+> **自动化模式**：直接运行 `python scripts/run.py`（调试时才按下方步骤执行）
+
+
 # NFS v4.1 Integrity Check Test Skill
 
 ## Overview

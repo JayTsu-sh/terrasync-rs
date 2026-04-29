@@ -7,6 +7,9 @@ description: >
   or mentions testing the filter (match/exclude) pipeline against local filesystem storage.
 ---
 
+> **自动化模式**：直接运行 `python scripts/run.py`（调试时才按下方步骤执行）
+
+
 # Local Filter Expression E2E Test Skill
 
 ## Overview
