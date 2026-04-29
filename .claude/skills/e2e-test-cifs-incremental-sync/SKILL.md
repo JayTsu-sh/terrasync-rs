@@ -26,6 +26,8 @@ description: >
 
 ## Constants
 
+> 环境变量实际值见 `.claude/skills/harness-run/.env.example`（复制为 `.env` 后填写）
+
 | Name | Value |
 |------|-------|
 | SRC_CIFS_HOST | `192.168.50.173` |

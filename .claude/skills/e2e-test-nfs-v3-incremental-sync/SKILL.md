@@ -25,6 +25,8 @@ NFS v3 使用 `JoinStrategy::Fh3`，通过 file_handle（文件句柄哈希）�
 
 ## Constants
 
+> 环境变量实际值见 `.claude/skills/harness-run/.env.example`（复制为 `.env` 后填写）
+
 | Name | Value |
 |------|-------|
 | SOURCE_IP | 192.168.50.173 |

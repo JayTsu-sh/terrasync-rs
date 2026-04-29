@@ -33,6 +33,23 @@ paths:
 ---
 ```
 
+## 环境配置 Single Source of Truth
+
+**唯一修改入口**：`.claude/skills/harness-run/.env.example`
+
+```
+harness-run/.env.example        ← 所有 IP、凭据、bucket 名的唯一真值
+    │
+    ├── env.py 加载（代码层）    ← run.py 自动读取，无需手动同步
+    │
+    ├── e2e-test-*/SKILL.md     ← Constants 只写变量名，不写值
+    │   "见 harness-run/.env.example"
+    │
+    └── e2e-test-*/.env.example ← 只列需要的键名（无值），指向 harness-run
+```
+
+**改一个 IP 只需改一处**：`harness-run/.env.example`，其他文件零修改。
+
 ## Skill 体系
 
 每个 skill 是一个**双模式能力包**：Claude 可交互执行，也可程序化自动运行。

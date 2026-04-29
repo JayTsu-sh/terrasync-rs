@@ -72,33 +72,32 @@ smb://terrasync:terrasync123@192.168.50.173/testshare/test-data   # 源端
 smb://terrasync:terrasync123@192.168.50.23/testshare/test-data    # 目标端
 ```
 
-## 测试环境配置
+## 测试环境配置（Single Source of Truth）
 
-| 服务 | 地址 | 用途 |
-|------|------|------|
-| NFS v3/v4 源端 | `192.168.50.173` | 扫描/同步源，含 ClickHouse |
-| NFS v3/v4 目标端 | `192.168.50.23` | 同步目标 |
-| NFS v3 export | `/export/nfs` | NFS v3 挂载点 |
-| NFS v4 export | `/export/nfsv4` | NFS v4.1 挂载点（fsid=0 伪根）|
-| S3 (rustfs) 源端 | `192.168.50.173:39000` | S3 兼容对象存储 |
-| S3 (rustfs) 目标端 | `192.168.50.23:39000` | S3 同步目标 |
-| S3 AK/SK | `rustfsadmin / rustfsadmin123` | rustfs 认证凭据 |
-| S3 bucket | `test-bucket` | 源端和目标端同名 bucket |
-| CIFS 源端 | `192.168.50.173` / `testshare` | Samba 服务器（source）|
-| CIFS 目标端 | `192.168.50.23` / `testshare` | Samba 服务器（dest）|
-| CIFS user | `terrasync / terrasync123` | Samba 测试账户 |
-| ClickHouse | `192.168.50.173:8123` | 元数据数据库 |
-| SSH user | `root` | 所有远端 SSH 操作 |
-
-## 本地配置
-
-所有 IP 通过环境变量管理，**不要**在代码或 SKILL.md 里 hardcode：
+> **所有 IP、端口、凭据、bucket 名统一在 `.claude/skills/harness-run/.env.example` 中定义。**
+> 这是唯一需要修改的地方，各 skill 的 `.env.example` 只是引用指针。
 
 ```bash
-# 复制配置模板
+# 初始化：复制并按实际环境填写
 cp .claude/skills/harness-run/.env.example .claude/skills/harness-run/.env
-# 编辑 .env 填写实际值（此文件 gitignore，不入库）
+# 编辑 .env（此文件 gitignore，不入库）
 ```
+
+主要变量：
+
+| 变量 | 说明 |
+|------|------|
+| `NFS_V3_SOURCE_IP` / `NFS_V3_DEST_IP` | NFS v3 源/目标服务器 |
+| `NFS_V3_EXPORT` / `NFS_V4_EXPORT` | NFS export 路径 |
+| `NFS_V4_SOURCE_IP` / `NFS_V4_DEST_IP` | NFS v4.1 源/目标服务器 |
+| `S3_SOURCE_IP` / `S3_DEST_IP` | S3(rustfs) 源/目标 IP |
+| `S3_SOURCE_PORT` / `S3_DEST_PORT` | S3 端口 |
+| `S3_ACCESS_KEY` / `S3_SECRET_KEY` | S3 认证凭据 |
+| `S3_BUCKET_SRC` / `S3_BUCKET_DST` | S3 bucket 名 |
+| `CIFS_SOURCE_HOST` / `CIFS_DEST_HOST` | Samba 服务器 |
+| `CIFS_SHARE` / `CIFS_USER` / `CIFS_PASS` | Samba 凭据 |
+| `CLICKHOUSE_HOST` | ClickHouse 连接地址 |
+| `TERRASYNC_BINARY` / `TERRASYNC_CONFIG` | 二进制和配置文件路径 |
 
 ## data-mover 依赖说明
 

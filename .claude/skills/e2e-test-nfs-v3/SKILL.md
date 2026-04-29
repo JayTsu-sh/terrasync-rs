@@ -19,6 +19,8 @@ Test data is created and verified on the remote hosts via SSH.
 
 ## Constants
 
+> 环境变量实际值见 `.claude/skills/harness-run/.env.example`（复制为 `.env` 后填写）
+
 | Name | Value |
 |------|-------|
 | SOURCE_IP | 192.168.50.173 |

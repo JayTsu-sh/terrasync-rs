@@ -53,20 +53,18 @@
 
 ## 环境拓扑
 
-```
-┌──────────────────────────────────────┐    ┌─────────────────────┐
-│  源端服务器 192.168.50.173            │    │  目标服务器           │
-│  NFS v3 export: /export/nfs          │    │  192.168.50.23       │
-│  NFS v4.1 export: /export/nfsv4      │    │  NFS v3/v4 目标      │
-│  S3 (rustfs): :39000  bucket=test-bucket│  │  S3 (rustfs): :39000 │
-│  CIFS (Samba): testshare             │    │  CIFS (Samba): testshare│
-│  ClickHouse: :8123                   │    └─────────────────────┘
-└──────────────────────────────────────┘
+> **IP、端口、凭据的唯一真值在 `.claude/skills/harness-run/.env.example`**，修改环境只需改该文件。
 
-凭据：
-  NFS:  root SSH（无密码）
-  S3:   rustfsadmin / rustfsadmin123
-  CIFS: terrasync / terrasync123
+```
+源端服务器 ($NFS_V3_SOURCE_IP / $NFS_V4_SOURCE_IP / $S3_SOURCE_IP / $CIFS_SOURCE_HOST)
+    → NFS v3 export: $NFS_V3_EXPORT
+    → NFS v4.1 export: $NFS_V4_EXPORT
+    → S3 (rustfs): $S3_SOURCE_IP:$S3_SOURCE_PORT  bucket=$S3_BUCKET_SRC
+    → CIFS (Samba): $CIFS_SOURCE_HOST/$CIFS_SHARE
+    → ClickHouse: $CLICKHOUSE_HOST
+
+目标服务器 ($NFS_V3_DEST_IP / $NFS_V4_DEST_IP / $S3_DEST_IP / $CIFS_DEST_HOST)
+    → NFS / S3 / CIFS 目标端（同结构）
 ```
 
 ## 运行方式
