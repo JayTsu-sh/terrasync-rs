@@ -39,25 +39,27 @@ nfs://192.168.50.173:2049/export/nfs:/data?uid=0&gid=0
   uid/gid  — 挂载用户
 ```
 
-### NFS v4
+### NFS v4.1
 ```
-nfs4://server:port/export/path:/prefix?uid=1000&gid=1000
+nfs://server/export/path?version=4.1
 
+注意：NFS v4.1 使用伪根（pseudo-root），/export/nfsv4 设置了 fsid=0
 示例（测试环境）：
-nfs4://192.168.50.173:2049/export/nfs4:/data?uid=0&gid=0
+nfs://192.168.50.173/export/nfsv4?version=4.1   # 源端
+nfs://192.168.50.23/export/nfsv4?version=4.1    # 目标端
 ```
 
-### S3 / MinIO
+### S3 / rustfs
 ```
-# HTTP（MinIO 开发环境）
+# HTTP（rustfs 测试环境）
 s3://access_key:secret_key@bucket.host:port/prefix
 
-# HTTPS（生产 S3）
-s3+https://access_key:secret_key@bucket.s3.amazonaws.com/prefix
+示例（测试环境 rustfs）：
+s3://rustfsadmin:rustfsadmin123@test-bucket.192.168.50.173:39000/test-data
+s3://rustfsadmin:rustfsadmin123@test-bucket.192.168.50.23:39000/test-data
 
-示例（测试环境 MinIO）：
-s3://minioadmin:minioadmin@mbucket-src.10.128.137.245:8184/
-s3://minioadmin:minioadmin@mbucket-dst.10.128.137.245:8184/
+# HTTPS（生产 S3 或 rustfs HTTPS 端口）
+s3+https://access_key:secret_key@bucket.host:port/prefix
 ```
 
 ### SMB / CIFS
@@ -65,10 +67,9 @@ s3://minioadmin:minioadmin@mbucket-dst.10.128.137.245:8184/
 smb://user:password@host[:port]/share[/sub/path]
 
 注意：域用户的 \ 必须编码为 %5C
-示例：smb://DOMAIN%5Cadmin:pass@192.168.50.100/testshare
-
-示例（测试环境）：
-smb://administrator:@192.168.50.100/testshare
+示例（测试环境 Samba）：
+smb://terrasync:terrasync123@192.168.50.173/testshare/test-data   # 源端
+smb://terrasync:terrasync123@192.168.50.23/testshare/test-data    # 目标端
 ```
 
 ## 测试环境配置
@@ -78,14 +79,16 @@ smb://administrator:@192.168.50.100/testshare
 | NFS v3/v4 源端 | `192.168.50.173` | 扫描/同步源，含 ClickHouse |
 | NFS v3/v4 目标端 | `192.168.50.23` | 同步目标 |
 | NFS v3 export | `/export/nfs` | NFS v3 挂载点 |
-| NFS v4 export | `/export/nfs4` | NFS v4 挂载点 |
-| S3 / MinIO | `10.128.137.245:8184` | S3 兼容存储 |
-| S3 源 bucket | `mbucket-src` | 扫描/同步源 |
-| S3 目标 bucket | `mbucket-dst` | 同步目标 |
-| CIFS | `192.168.50.100` | SMB 文件服务器 |
-| CIFS share | `testshare` | 测试共享目录 |
+| NFS v4 export | `/export/nfsv4` | NFS v4.1 挂载点（fsid=0 伪根）|
+| S3 (rustfs) 源端 | `192.168.50.173:39000` | S3 兼容对象存储 |
+| S3 (rustfs) 目标端 | `192.168.50.23:39000` | S3 同步目标 |
+| S3 AK/SK | `rustfsadmin / rustfsadmin123` | rustfs 认证凭据 |
+| S3 bucket | `test-bucket` | 源端和目标端同名 bucket |
+| CIFS 源端 | `192.168.50.173` / `testshare` | Samba 服务器（source）|
+| CIFS 目标端 | `192.168.50.23` / `testshare` | Samba 服务器（dest）|
+| CIFS user | `terrasync / terrasync123` | Samba 测试账户 |
 | ClickHouse | `192.168.50.173:8123` | 元数据数据库 |
-| SSH user | `root` | 所有远端操作 |
+| SSH user | `root` | 所有远端 SSH 操作 |
 
 ## 本地配置
 

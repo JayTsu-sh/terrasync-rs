@@ -20,7 +20,7 @@
 | `e2e-test-nfs-v4-incremental-sync` | 增量同步 | 1200s |
 | `e2e-test-nfs-v4-integrity-check` | 完整性校验 | 600s |
 
-### S3 / MinIO（7 个，串行）
+### S3 / rustfs（7 个，串行）
 | Skill 目录 | 场景 | 超时 |
 |-----------|------|-----|
 | `e2e-test-s3-full-scan` | 全量扫描 | 600s |
@@ -54,20 +54,19 @@
 ## 环境拓扑
 
 ```
-┌─────────────────────┐    ┌─────────────────────┐
-│  NFS/ClickHouse 服务器 │    │     目标服务器         │
-│  192.168.50.173     │    │  192.168.50.23       │
-│  NFS export: /export/nfs (v3) │    │  NFS mount target  │
-│  NFS export: /export/nfs4 (v4)│    └─────────────────────┘
-│  ClickHouse: :8123  │
-└─────────────────────┘
+┌──────────────────────────────────────┐    ┌─────────────────────┐
+│  源端服务器 192.168.50.173            │    │  目标服务器           │
+│  NFS v3 export: /export/nfs          │    │  192.168.50.23       │
+│  NFS v4.1 export: /export/nfsv4      │    │  NFS v3/v4 目标      │
+│  S3 (rustfs): :39000  bucket=test-bucket│  │  S3 (rustfs): :39000 │
+│  CIFS (Samba): testshare             │    │  CIFS (Samba): testshare│
+│  ClickHouse: :8123                   │    └─────────────────────┘
+└──────────────────────────────────────┘
 
-┌─────────────────────┐    ┌─────────────────────┐
-│  S3 / MinIO         │    │  CIFS / SMB          │
-│  10.128.137.245:8184│    │  192.168.50.100      │
-│  mbucket-src (源)   │    │  share: testshare    │
-│  mbucket-dst (目标) │    │  user: administrator │
-└─────────────────────┘    └─────────────────────┘
+凭据：
+  NFS:  root SSH（无密码）
+  S3:   rustfsadmin / rustfsadmin123
+  CIFS: terrasync / terrasync123
 ```
 
 ## 运行方式
@@ -81,12 +80,11 @@
 → 按步骤清理 → 构建 → 执行 → 验证
 ```
 
-### 方式二：独立 Python 运行（Phase 2 后可用）
+### 方式二：独立 Python 运行
 
 ```bash
-# 配置环境
+# 配置环境（实际 IP 已在 .env.example 中填好，直接复制）
 cp .claude/skills/harness-run/.env.example .claude/skills/harness-run/.env
-# 编辑 .env 填写实际 IP
 
 # 独立运行单个 skill
 cd .claude/skills/e2e-test-nfs-v3-full-scan
