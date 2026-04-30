@@ -325,7 +325,7 @@ async fn run_migration_task(
                 WebError::ValidationError("Integrity check requires destination endpoint".to_string())
             })?;
 
-            app::sync::integrity_check(
+            app::integrity_check::integrity_check(
                 job_id.to_string(),
                 job_dir.to_string(),
                 source_url,

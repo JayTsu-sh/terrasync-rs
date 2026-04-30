@@ -65,7 +65,7 @@ description: >
 ### 0a. 清理源端 NFS
 
 ```bash
-ssh root@{SOURCE_IP} 'sudo rm -rf {NFS_EXPORT}/test-data && echo "source cleaned"'
+ssh root@{SOURCE_IP} 'sudo find {NFS_EXPORT} -mindepth 1 -maxdepth 1 -exec rm -rf {} + && echo "source cleaned"'
 ```
 
 Expected: `source cleaned`。
@@ -350,7 +350,7 @@ Only proceed after all Step 4 checks pass.
 ### 5a. 清理源端 NFS
 
 ```bash
-ssh root@{SOURCE_IP} 'sudo rm -rf {NFS_EXPORT}/test-data && echo "source cleaned"'
+ssh root@{SOURCE_IP} 'sudo find {NFS_EXPORT} -mindepth 1 -maxdepth 1 -exec rm -rf {} + && echo "source cleaned"'
 ```
 
 Expected: `source cleaned`。

@@ -63,7 +63,7 @@ description: >
 ### 0a. 清理源端 NFS 数据（SSH）
 
 ```bash
-ssh root@{SOURCE_IP} 'sudo rm -rf {NFS_EXPORT}/test-data && echo "source cleaned"'
+ssh root@{SOURCE_IP} 'sudo find {NFS_EXPORT} -mindepth 1 -maxdepth 1 -exec rm -rf {} + && echo "source cleaned"'
 ```
 
 Expected: `source cleaned`。
@@ -246,7 +246,7 @@ grep -E "ERROR|WARN" target/debug/logs/*/app.log | tail -80
 ### 3a. 清理源端 NFS
 
 ```bash
-ssh root@{SOURCE_IP} 'sudo rm -rf {NFS_EXPORT}/test-data && echo "source cleaned"'
+ssh root@{SOURCE_IP} 'sudo find {NFS_EXPORT} -mindepth 1 -maxdepth 1 -exec rm -rf {} + && echo "source cleaned"'
 ```
 
 ### 3b. 清理 ClickHouse 表

@@ -13,6 +13,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 _SKILL_DIR = Path(__file__).parent.parent
+_PROJECT_ROOT = _SKILL_DIR.parent.parent.parent
 _HARNESS = _SKILL_DIR.parent / "harness-run" / "scripts"
 sys.path.insert(0, str(_HARNESS))
 import env as envmod
@@ -26,6 +27,8 @@ SANITIZED = "nfs_to_s3_sync"
 NFS_DIRS, NFS_FILES, NFS_SYMLINKS = 113, 335, 79
 # S3 目标端（symlink 被跳过）
 S3_DIRS, S3_FILES = 113, 335
+# S3 scan 不发出 root prefix 条目（S3 无真实根目录），故 dst scan dirs 比 NFS 源少 1
+S3_DST_SCAN_DIRS = S3_DIRS - 1
 
 
 def _nfs_url(cfg, prefix=""):
@@ -50,8 +53,8 @@ def _s3_cleanup_dest(a, cfg):
     try:
         a.ssh_exec(ip, f"mc alias set ts3 http://localhost:{port} {ak} {sk} --api s3v4 2>/dev/null; "
                        f"mc rm --recursive --force ts3/{bucket}/test-data/ 2>/dev/null || true")
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"⚠ cleanup warning: {e}", flush=True)
 
 
 def _cleanup(a, src_ip, ch_host, cfg):
@@ -61,16 +64,18 @@ def _cleanup(a, src_ip, ch_host, cfg):
     with ThreadPoolExecutor(max_workers=4) as ex:
         futs = [
             ex.submit(a.ssh_exec, src_ip,
-                      f"sudo rm -rf {nfs_export}/test-data && echo ok || true"),
+                      f"sudo find {nfs_export} -mindepth 1 -maxdepth 1 -exec rm -rf {{}} + && echo ok || true"),
             ex.submit(_s3_cleanup_dest, a, cfg),
-            *[ex.submit(a.clickhouse_query, ch_host, f"DROP TABLE IF EXISTS default.{t.strip()}")
+            *[ex.submit(a.clickhouse_execute, ch_host, f"DROP TABLE IF EXISTS default.{t.strip()}")
               for t in tables.strip().splitlines() if t.strip()],
             ex.submit(a.run_shell_quiet,
                       f"find jobs -maxdepth 1 -type d -name '*{SANITIZED}*' | xargs rm -rf"),
         ]
         for f in as_completed(futs):
             try: f.result()
-            except Exception: pass
+            except Exception as e:
+
+                print(f"⚠ cleanup warning: {e}", flush=True)
     a.run_shell_quiet("rm -rf target/debug/logs/*")
 
 
@@ -92,6 +97,7 @@ def _patch_s3_script(path, cfg):
 
 
 def run(env=None):
+    os.chdir(_PROJECT_ROOT)
     start = time.monotonic()
     cfg = envmod.load(env)
     envmod.require(cfg, "NFS_V3_SOURCE_IP", "CLICKHOUSE_HOST", "S3_ACCESS_KEY", "S3_SECRET_KEY")
@@ -140,7 +146,7 @@ def run(env=None):
          "--id", DST_SCAN_JOB_ID, s3_dst_url],
         capture_output=True, text=True, timeout=300)
     results.append(a.check_cli_scan_output(proc2.stdout + proc2.stderr,
-                                           {"dirs": S3_DIRS, "files": S3_FILES}))
+                                           {"dirs": S3_DST_SCAN_DIRS, "files": S3_FILES}))
 
     _cleanup(a, src_ip, ch_host, cfg)
     return build_result(results, start)

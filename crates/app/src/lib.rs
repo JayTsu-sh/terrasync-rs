@@ -41,6 +41,7 @@ pub mod receiver;
 /// 从 walkdir 接收 entry，通过 transport 发送给 Receiver
 pub mod sender;
 
+pub mod integrity_check;
 /// 文件复制模块
 ///
 /// 提供文件复制和增量复制的核心功能
@@ -86,6 +87,8 @@ pub mod prelude {
     pub use crate::consumer::{Consumer, ConsumerManager, DatabaseConsumer, StatisticConsumer};
     /// 错误处理类型
     pub use crate::error::{AppError, Result};
+    /// 完整性检查
+    pub use crate::integrity_check::integrity_check;
     /// Sync 编排器
     pub use crate::orchestrator::SyncOrchestrator;
     /// 文件删除功能
@@ -93,5 +96,5 @@ pub mod prelude {
     /// 文件扫描功能
     pub use crate::scan::{ScanType, determine_scan_type, scan};
     /// 文件复制功能
-    pub use crate::sync::{incremental_sync, integrity_check, sync};
+    pub use crate::sync::{incremental_sync, sync};
 }

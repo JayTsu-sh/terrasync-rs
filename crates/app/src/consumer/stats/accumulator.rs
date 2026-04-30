@@ -11,7 +11,7 @@ use tracing::trace;
 
 // 内部模块
 use crate::config::JobType;
-use crate::sync::{FixStatus, IntegrityIssue, IssueKind};
+use crate::integrity_check::{FixStatus, IntegrityIssue, IssueKind};
 
 // ─────────────────────────────────────────────────
 // 枚举：时间区间 / 文件大小区间
@@ -957,6 +957,7 @@ pub fn print_integrity_check_result(
         .iter()
         .filter(|i| matches!(i.kind, IssueKind::Mismatch))
         .collect();
+    let errors: Vec<_> = issues.iter().filter(|i| matches!(i.kind, IssueKind::Error)).collect();
 
     let total_issues = issues.len();
     let total_passed = total_checked.saturating_sub(total_issues);
@@ -982,24 +983,34 @@ pub fn print_integrity_check_result(
         println!("   ├─ Passed:        {:>12}  ({})", total_passed, fmt_pct(pass_pct));
         println!("   └─ Issues:        {:>12}  ({})", total_issues, fmt_pct(fail_pct));
 
-        // 分类明细
+        // 分类明细：连接符根据后续是否还有非空分组动态选择
+        let has_mismatch = !mismatch.is_empty();
+        let has_errors = !errors.is_empty();
+        let has_auto_fix_line = auto_fix;
+
         if !missing.is_empty() {
             let m_files = missing.iter().filter(|i| i.entry_type == "file").count();
             let m_dirs = missing.iter().filter(|i| i.entry_type == "dir").count();
             let m_symlinks = missing.iter().filter(|i| i.entry_type == "symlink").count();
+            let connector = if has_mismatch || has_errors || has_auto_fix_line {
+                "├"
+            } else {
+                "└"
+            };
             println!(
-                "      ├─ Missing:    {:>8}  (files: {}, dirs: {}, symlinks: {})",
+                "      {}─ Missing:    {:>8}  (files: {}, dirs: {}, symlinks: {})",
+                connector,
                 missing.len(),
                 m_files,
                 m_dirs,
                 m_symlinks
             );
         }
-        if !mismatch.is_empty() {
+        if has_mismatch {
             let mm_files = mismatch.iter().filter(|i| i.entry_type == "file").count();
             let mm_dirs = mismatch.iter().filter(|i| i.entry_type == "dir").count();
             let mm_symlinks = mismatch.iter().filter(|i| i.entry_type == "symlink").count();
-            let connector = if auto_fix { "├" } else { "└" };
+            let connector = if has_errors || has_auto_fix_line { "├" } else { "└" };
             println!(
                 "      {}─ Mismatch:  {:>8}  (files: {}, dirs: {}, symlinks: {})",
                 connector,
@@ -1007,6 +1018,20 @@ pub fn print_integrity_check_result(
                 mm_files,
                 mm_dirs,
                 mm_symlinks
+            );
+        }
+        if has_errors {
+            let e_files = errors.iter().filter(|i| i.entry_type == "file").count();
+            let e_dirs = errors.iter().filter(|i| i.entry_type == "dir").count();
+            let e_symlinks = errors.iter().filter(|i| i.entry_type == "symlink").count();
+            let connector = if has_auto_fix_line { "├" } else { "└" };
+            println!(
+                "      {}─ Errors:    {:>8}  (files: {}, dirs: {}, symlinks: {}) — transient NFS failures",
+                connector,
+                errors.len(),
+                e_files,
+                e_dirs,
+                e_symlinks
             );
         }
         if auto_fix {
@@ -1029,8 +1054,51 @@ pub fn print_integrity_check_result(
         if !mismatch.is_empty() {
             print_mismatch_table(&mismatch, auto_fix);
         }
+
+        // Errors 详情表格
+        if !errors.is_empty() {
+            print_errors_table(&errors);
+        }
     }
 
+    println!();
+}
+
+/// 打印 Errors 条目列表（瞬时 NFS 错误导致无法验证的条目）。
+///
+/// 与 [`print_missing_table`] 区分：Missing 是确认 ENOENT 的真缺失；
+/// Errors 是 LOOKUP 因服务端瞬时故障（NFS4ERR_DELAY 重试耗尽、连接断开等）失败，
+/// 文件可能存在，仅本次未能验证。建议人工复核或重跑 integrity-check。
+fn print_errors_table(errors: &[&IntegrityIssue]) {
+    println!("  TRANSIENT ERRORS — UNABLE TO VERIFY ({}):", errors.len());
+    println!(
+        "   (Files may exist; LOOKUP failed due to NFS server busy or connection issues. Re-run integrity-check to confirm.)"
+    );
+
+    for (idx, &entry_type) in ["file", "dir", "symlink"].iter().enumerate() {
+        let group: Vec<_> = errors.iter().filter(|i| i.entry_type == entry_type).collect();
+        if group.is_empty() {
+            continue;
+        }
+
+        let remaining_types = ["file", "dir", "symlink"][idx + 1..]
+            .iter()
+            .any(|t| errors.iter().any(|i| i.entry_type == *t));
+        let group_connector = if remaining_types { "├" } else { "└" };
+        let child_prefix = if remaining_types { "│" } else { " " };
+
+        println!(
+            "   {}─ [{}] ({})",
+            group_connector,
+            entry_type.to_uppercase(),
+            group.len()
+        );
+        for (i, issue) in group.iter().enumerate() {
+            let is_last = i == group.len() - 1;
+            let item_connector = if is_last { "└" } else { "├" };
+            println!("   {}  {}─ {}", child_prefix, item_connector, issue.path);
+        }
+    }
     println!();
 }
 

@@ -5,12 +5,14 @@ NFS v3 全量同步 e2e 测试（源端 → 目标端）。
 """
 
 import subprocess
+import os
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 _SKILL_DIR = Path(__file__).parent.parent
+_PROJECT_ROOT = _SKILL_DIR.parent.parent.parent
 _HARNESS_SCRIPTS = _SKILL_DIR.parent / "harness-run" / "scripts"
 sys.path.insert(0, str(_HARNESS_SCRIPTS))
 
@@ -37,11 +39,10 @@ def _cleanup(a, src_ip, dest_ip, ch_host, nfs_export):
     with ThreadPoolExecutor(max_workers=5) as ex:
         futs = [
             ex.submit(a.ssh_exec, src_ip,
-                      f"sudo rm -rf {nfs_export}/test-data && echo ok || true"),
+                      f"sudo find {nfs_export} -mindepth 1 -maxdepth 1 -exec rm -rf {{}} + && echo ok || true"),
             ex.submit(a.ssh_exec, dest_ip,
-                      f"sudo rm -rf {nfs_export}/test-data && echo ok || true"),
-            *[ex.submit(a.clickhouse_query, ch_host,
-                        f"DROP TABLE IF EXISTS default.{t}") for t in _TABLES],
+                      f"sudo find {nfs_export} -mindepth 1 -maxdepth 1 -exec rm -rf {{}} + && echo ok || true"),
+            *[ex.submit(a.clickhouse_execute, ch_host, f"DROP TABLE IF EXISTS default.{t}") for t in _TABLES],
             ex.submit(a.run_shell_quiet,
                       f"find jobs -maxdepth 1 -type d -name '*{SANITIZED}*' | xargs rm -rf"),
             ex.submit(a.run_shell_quiet, "rm -rf target/debug/logs/*"),
@@ -49,8 +50,8 @@ def _cleanup(a, src_ip, dest_ip, ch_host, nfs_export):
         for f in as_completed(futs):
             try:
                 f.result()
-            except Exception:
-                pass
+            except Exception as e:
+                print(f"⚠ cleanup warning: {e}", flush=True)
 
 
 def _setup_data(a, src_ip):
@@ -121,6 +122,7 @@ def _verify_metadata(a, dest_ip):
 
 
 def run(env: dict = None) -> dict:
+    os.chdir(_PROJECT_ROOT)
     start = time.monotonic()
     cfg = envmod.load(env)
     envmod.require(cfg, "NFS_V3_SOURCE_IP", "NFS_V3_DEST_IP", "CLICKHOUSE_HOST")

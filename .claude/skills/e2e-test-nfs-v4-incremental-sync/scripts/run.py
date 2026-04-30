@@ -5,6 +5,7 @@ NFS v4.1 增量同步 e2e 测试。
 """
 
 import re
+import os
 import subprocess
 import sys
 import time
@@ -12,6 +13,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 _SKILL_DIR = Path(__file__).parent.parent
+_PROJECT_ROOT = _SKILL_DIR.parent.parent.parent
 _HARNESS_SCRIPTS = _SKILL_DIR.parent / "harness-run" / "scripts"
 sys.path.insert(0, str(_HARNESS_SCRIPTS))
 
@@ -34,15 +36,14 @@ _TABLES = [
 ]
 
 
-def _cleanup(a, src_ip, dest_ip, ch_host, nfs_export):
+def _cleanup(a, src_ip, dest_ip, ch_host, nfs_server_path):
     with ThreadPoolExecutor(max_workers=5) as ex:
         futs = [
             ex.submit(a.ssh_exec, src_ip,
-                      f"sudo rm -rf {nfs_export}/test-data && echo ok || true"),
+                      f"sudo find {nfs_server_path} -mindepth 1 -maxdepth 1 -exec rm -rf {{}} + && echo ok || true"),
             ex.submit(a.ssh_exec, dest_ip,
-                      f"sudo rm -rf {nfs_export}/test-data && echo ok || true"),
-            *[ex.submit(a.clickhouse_query, ch_host,
-                        f"DROP TABLE IF EXISTS default.{t}") for t in _TABLES],
+                      f"sudo find {nfs_server_path} -mindepth 1 -maxdepth 1 -exec rm -rf {{}} + && echo ok || true"),
+            *[ex.submit(a.clickhouse_execute, ch_host, f"DROP TABLE IF EXISTS default.{t}") for t in _TABLES],
             ex.submit(a.run_shell_quiet,
                       f"find jobs -maxdepth 1 -type d -name '*{SANITIZED}*' -exec rm -rf {{}} +"),
             ex.submit(a.run_shell_quiet, "rm -rf target/debug/logs/*"),
@@ -50,11 +51,12 @@ def _cleanup(a, src_ip, dest_ip, ch_host, nfs_export):
         for f in as_completed(futs):
             try:
                 f.result()
-            except Exception:
-                pass
+            except Exception as e:
+                print(f"⚠ cleanup warning: {e}", flush=True)
 
 
 def run(env: dict = None) -> dict:
+    os.chdir(_PROJECT_ROOT)
     start = time.monotonic()
     cfg = envmod.load(env)
     envmod.require(cfg, "NFS_V4_SOURCE_IP", "NFS_V4_DEST_IP", "CLICKHOUSE_HOST")
@@ -62,17 +64,17 @@ def run(env: dict = None) -> dict:
     src_ip = cfg["NFS_V4_SOURCE_IP"]
     dest_ip = cfg["NFS_V4_DEST_IP"]
     ch_host = cfg["CLICKHOUSE_HOST"]
-    nfs_export = cfg.get("NFS_V4_EXPORT", NFS_SERVER_PATH)
+    nfs_server_path = cfg.get("NFS_V4_SERVER_PATH", NFS_SERVER_PATH)
     binary = cfg.get("TERRASYNC_BINARY", "./target/debug/terrasync")
     config = cfg.get("TERRASYNC_CONFIG", "examples/config.toml")
     ssh_user = cfg.get("SSH_USER", "root")
-    src_url = f"nfs://{src_ip}{nfs_export}?version=4.1"
-    dst_url = f"nfs://{dest_ip}{nfs_export}?version=4.1"
+    src_url = f"nfs://{src_ip}/?version=4.1"
+    dst_url = f"nfs://{dest_ip}/?version=4.1"
 
     a = TerrasyncAssertions(ssh_user=ssh_user)
     results = []
 
-    _cleanup(a, src_ip, dest_ip, ch_host, nfs_export)
+    _cleanup(a, src_ip, dest_ip, ch_host, nfs_server_path)
 
     # 创建基线数据
     setup_sh = _SKILL_DIR.parent / "e2e-test-nfs-v4-full-scan" / "scripts" / "setup-nfs4-test-data.sh"
@@ -97,7 +99,7 @@ def run(env: dict = None) -> dict:
         capture_output=True, text=True, timeout=900)
     if proc.returncode != 0:
         results.append(AssertionResult("full_sync", False, {}, {}, "✗ full_sync failed"))
-        _cleanup(a, src_ip, dest_ip, ch_host, nfs_export)
+        _cleanup(a, src_ip, dest_ip, ch_host, nfs_server_path)
         return build_result(results, start)
     results.append(a.check_cli_sync_output(proc.stdout + proc.stderr, baseline_exp))
 
@@ -108,13 +110,13 @@ def run(env: dict = None) -> dict:
         mut_out = a.ssh_exec(src_ip, "sudo bash /tmp/mutate-nfs4-test-data.sh", timeout=120)
     except Exception as e:
         results.append(AssertionResult("mutate", False, {}, {}, f"✗ mutate: {e}"))
-        _cleanup(a, src_ip, dest_ip, ch_host, nfs_export)
+        _cleanup(a, src_ip, dest_ip, ch_host, nfs_server_path)
         return build_result(results, start)
     mutate_ok = "OK:" in mut_out or "OK：" in mut_out
     results.append(AssertionResult("mutate", mutate_ok, {}, {},
                                    f"{'✓' if mutate_ok else '✗'} mutate_nfs4"))
     if not mutate_ok:
-        _cleanup(a, src_ip, dest_ip, ch_host, nfs_export)
+        _cleanup(a, src_ip, dest_ip, ch_host, nfs_server_path)
         return build_result(results, start)
 
     # 增量 Sync
@@ -143,7 +145,7 @@ def run(env: dict = None) -> dict:
         results.append(AssertionResult(f"ic_{label}", passed, {}, {},
                                        f"{'✓' if passed else '✗'} integrity_{label}"))
 
-    _cleanup(a, src_ip, dest_ip, ch_host, nfs_export)
+    _cleanup(a, src_ip, dest_ip, ch_host, nfs_server_path)
     return build_result(results, start)
 
 

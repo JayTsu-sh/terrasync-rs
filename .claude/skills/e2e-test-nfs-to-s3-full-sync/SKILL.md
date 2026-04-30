@@ -72,7 +72,7 @@ ClickHouse 表名：
 ### 0a. 清理源端 NFS 数据（SSH）
 
 ```bash
-ssh root@{SOURCE_IP} 'sudo rm -rf {SOURCE_NFS_EXPORT}/test-data && echo "source NFS cleaned"'
+ssh root@{SOURCE_IP} 'sudo find {SOURCE_NFS_EXPORT} -mindepth 1 -maxdepth 1 -exec rm -rf {} + && echo "source NFS cleaned"'
 ```
 
 Expected: `source NFS cleaned`。
@@ -220,7 +220,7 @@ grep -E "ERROR|WARN" target/debug/logs/*/app.log | tail -80
 ### 5a. mc 直接计数（目标桶）
 
 ```bash
-mc find ts3/{DST_BUCKET}/test-data/ --type f | wc -l
+mc find ts3/{DST_BUCKET}/test-data/ | wc -l
 ```
 
 Expected: `117`（文件数，不含 symlink）。

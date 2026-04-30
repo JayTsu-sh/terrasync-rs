@@ -70,7 +70,7 @@ echo "S3 cleaned"
 验证：
 
 ```bash
-mc find ts3/{S3_BUCKET}/test-data/ --type f 2>/dev/null | wc -l
+mc find ts3/{S3_BUCKET}/test-data/ 2>/dev/null | wc -l
 ```
 
 Expected: `0`。
@@ -195,7 +195,7 @@ Expected: `157`（{EXPECTED_DIRS}+{EXPECTED_FILES} = 40+117，S3 无 symlink）�
 直接通过 `mc` 统计 S3 文件对象数量，应与 ClickHouse base 表中文件计数一致：
 
 ```bash
-mc find ts3/{S3_BUCKET}/test-data/ --type f 2>/dev/null | wc -l
+mc find ts3/{S3_BUCKET}/test-data/ 2>/dev/null | wc -l
 ```
 
 Expected: `117`（与 ClickHouse base 表 files={EXPECTED_FILES} 一致）。
@@ -217,7 +217,7 @@ mc rm --recursive --force ts3/{S3_BUCKET}/test-data/ 2>/dev/null || true
 验证：
 
 ```bash
-mc find ts3/{S3_BUCKET}/test-data/ --type f 2>/dev/null | wc -l
+mc find ts3/{S3_BUCKET}/test-data/ 2>/dev/null | wc -l
 ```
 
 Expected: `0`。

@@ -169,7 +169,7 @@ OK: S3 file count verified
 ### 2b. mc 验证源端数据
 
 ```bash
-mc find ts3/{SRC_BUCKET}/test-data/ --type f | wc -l
+mc find ts3/{SRC_BUCKET}/test-data/ | wc -l
 ```
 
 Expected: `117`。
@@ -246,13 +246,13 @@ grep -E "ERROR|WARN" target/debug/logs/*/app.log | tail -80
 ### 5a. mc 直接计数（目标桶）
 
 ```bash
-mc find ts3/{DST_BUCKET}/test-data/ --type f | wc -l
+mc find ts3/{DST_BUCKET}/test-data/ | wc -l
 ```
 
 Expected: `117`。
 
 ```bash
-mc find ts3/{DST_BUCKET}/test-data/ --type d | wc -l
+mc find ts3/{DST_BUCKET}/test-data/ | wc -l
 ```
 
 Expected: 目录数与源端一致。

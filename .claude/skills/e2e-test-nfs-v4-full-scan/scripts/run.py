@@ -4,6 +4,7 @@ e2e-test-nfs-v4-full-scan/scripts/run.py
 NFS v4.1 全量扫描 e2e 测试。与 v3 的区别：URL 加 ?version=4.1，服务器路径 /export/nfsv4。
 """
 
+import os
 import re
 import subprocess
 import sys
@@ -12,6 +13,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 _SKILL_DIR = Path(__file__).parent.parent
+_PROJECT_ROOT = _SKILL_DIR.parent.parent.parent
 _HARNESS_SCRIPTS = _SKILL_DIR.parent / "harness-run" / "scripts"
 sys.path.insert(0, str(_HARNESS_SCRIPTS))
 
@@ -28,11 +30,13 @@ EXPECTED_TOTAL    = _PC.BASELINE_TOTAL
 NFS_SERVER_PATH   = _PC.EXPORT
 
 
-def _cleanup(a, src_ip, ch_host):
+def _cleanup(a, src_ip, ch_host, nfs_server_path=None):
+    if nfs_server_path is None:
+        nfs_server_path = NFS_SERVER_PATH
     with ThreadPoolExecutor(max_workers=4) as ex:
         futs = [
             ex.submit(a.ssh_exec, src_ip,
-                      f"sudo rm -rf {NFS_SERVER_PATH}/test-data && echo ok || true"),
+                      f"sudo find {nfs_server_path} -mindepth 1 -maxdepth 1 -exec rm -rf {{}} + && echo ok || true"),
             ex.submit(a.clickhouse_drop_tables, ch_host, SANITIZED),
             ex.submit(a.run_shell_quiet,
                       f"find jobs -maxdepth 1 -type d -name '*{SANITIZED}*' | xargs rm -rf"),
@@ -41,8 +45,8 @@ def _cleanup(a, src_ip, ch_host):
         for f in as_completed(futs):
             try:
                 f.result()
-            except Exception:
-                pass
+            except Exception as e:
+                print(f"⚠ cleanup warning: {e}", flush=True)
 
 
 def _setup_data(a, src_ip):
@@ -86,22 +90,24 @@ def _verify_fh_and_mode(a, ch_host) -> list[AssertionResult]:
 
 
 def run(env: dict = None) -> dict:
+    os.chdir(_PROJECT_ROOT)
     start = time.monotonic()
     cfg = envmod.load(env)
     envmod.require(cfg, "NFS_V4_SOURCE_IP", "CLICKHOUSE_HOST")
 
     src_ip = cfg["NFS_V4_SOURCE_IP"]
     ch_host = cfg["CLICKHOUSE_HOST"]
-    nfs_export = cfg.get("NFS_V4_EXPORT", NFS_SERVER_PATH)
+    nfs_server_path = cfg.get("NFS_V4_SERVER_PATH", NFS_SERVER_PATH)
+    nfs_url_path = _PC.EXPORT_URL_PATH
     binary = cfg.get("TERRASYNC_BINARY", "./target/debug/terrasync")
     config = cfg.get("TERRASYNC_CONFIG", "examples/config.toml")
     ssh_user = cfg.get("SSH_USER", "root")
 
     a = TerrasyncAssertions(ssh_user=ssh_user)
     results = []
-    src_url = f"nfs://{src_ip}{nfs_export}?version=4.1"
+    src_url = f"nfs://{src_ip}{nfs_url_path}?version=4.1"
 
-    _cleanup(a, src_ip, ch_host)
+    _cleanup(a, src_ip, ch_host, nfs_server_path)
 
     setup_r = _setup_data(a, src_ip)
     results.append(setup_r)
@@ -117,7 +123,7 @@ def run(env: dict = None) -> dict:
     if proc.returncode != 0:
         results.append(AssertionResult("scan_exit", False, {"code": 0},
                                        {"code": proc.returncode}, "✗ scan failed"))
-        _cleanup(a, src_ip, ch_host)
+        _cleanup(a, src_ip, ch_host, nfs_server_path)
         return build_result(results, start)
 
     results.append(a.check_cli_scan_output(
@@ -132,9 +138,9 @@ def run(env: dict = None) -> dict:
     # 独立文件系统核查
     try:
         fs_out = a.ssh_exec(src_ip,
-                            f"sudo find {nfs_export}/test-data -type d | wc -l; "
-                            f"sudo find {nfs_export}/test-data -type f | wc -l; "
-                            f"sudo find {nfs_export}/test-data -type l | wc -l", timeout=60)
+                            f"sudo find {nfs_server_path}/test-data -type d | wc -l; "
+                            f"sudo find {nfs_server_path}/test-data -type f | wc -l; "
+                            f"sudo find {nfs_server_path}/test-data -type l | wc -l", timeout=60)
         lines = [ln.strip() for ln in fs_out.strip().splitlines() if ln.strip()]
         if len(lines) >= 3:
             actual = {"dirs": int(lines[0]), "files": int(lines[1]), "symlinks": int(lines[2])}
@@ -148,7 +154,7 @@ def run(env: dict = None) -> dict:
         results.append(AssertionResult("filesystem_counts", False, {}, {},
                                        f"✗ filesystem_counts: {e}"))
 
-    _cleanup(a, src_ip, ch_host)
+    _cleanup(a, src_ip, ch_host, nfs_server_path)
     return build_result(results, start)
 
 

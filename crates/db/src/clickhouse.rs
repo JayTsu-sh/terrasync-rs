@@ -176,8 +176,16 @@ impl JoinStrategy {
         let t_columns = &*FILE_SCAN_COLUMNS_LIST_WITH_T_PREFIX;
         let data_changed = "(t.size != f.size OR t.mtime != f.mtime)";
         let data_unchanged = "(t.size = f.size AND t.mtime = f.mtime)";
-        let meta_changed = "(t.mode != f.mode OR t.uid != f.uid OR t.gid != f.gid)";
-        let meta_unchanged = "(t.mode = f.mode AND t.uid = f.uid AND t.gid = f.gid)";
+        // mode/uid/gid 在 S3 等协议中为 Nullable 且常常为 NULL；ClickHouse 三值逻辑下
+        // `NULL = NULL` 返回 NULL（WHERE 视为 false），会让所有 ChangeKind 都不匹配。
+        // 改用显式 NULL-safe 等价：`a = b OR (a IS NULL AND b IS NULL)`。
+        // 此形式不依赖任何 sentinel，不会把真实值（如 mode=0）误等同于 NULL，
+        // 也不依赖"两侧来自同一后端"这种隐含不变量。
+        let mode_eq = "(t.mode = f.mode OR (t.mode IS NULL AND f.mode IS NULL))";
+        let uid_eq = "(t.uid = f.uid OR (t.uid IS NULL AND f.uid IS NULL))";
+        let gid_eq = "(t.gid = f.gid OR (t.gid IS NULL AND f.gid IS NULL))";
+        let meta_changed = format!("(NOT {mode_eq} OR NOT {uid_eq} OR NOT {gid_eq})");
+        let meta_unchanged = format!("({mode_eq} AND {uid_eq} AND {gid_eq})");
 
         let kind_filter = match kind {
             ChangeKind::DataOnly => format!("{data_changed} AND {meta_unchanged}"),
@@ -1393,13 +1401,27 @@ mod tests {
         assert!(!sql.contains("FINAL"));
     }
 
+    /// 验证 NULL-safe 元数据等价比较的 SQL 形式：每个属性必须有 `IS NULL AND ... IS NULL` 兜底，
+    /// 既不依赖 sentinel（避免把真实 mode=0 与 NULL 混淆），也覆盖 ClickHouse 三值逻辑下的 NULL=NULL 漏判。
+    fn assert_null_safe_meta_clauses(sql: &str) {
+        for col in ["mode", "uid", "gid"] {
+            let clause = format!("(t.{col} IS NULL AND f.{col} IS NULL)");
+            assert!(sql.contains(&clause), "missing NULL-safe clause for `{col}`:\n{sql}");
+        }
+        // 不应再出现历史 sentinel 形式
+        assert!(
+            !sql.contains("coalesce(t.mode, 0)"),
+            "should no longer use coalesce sentinel:\n{sql}"
+        );
+    }
+
     #[test]
     fn test_detect_changed_sql_path_mode_data_only() {
         let sql = JoinStrategy::Path.build_detect_changed_sql("temp_x", "base_y", ChangeKind::DataOnly);
         assert!(sql.contains("LIMIT 1 BY (relative_path, version_id)"));
         // DataOnly 条件：内容变了 + 属性未变
         assert!(sql.contains("t.size != f.size OR t.mtime != f.mtime"));
-        assert!(sql.contains("t.mode = f.mode AND t.uid = f.uid AND t.gid = f.gid"));
+        assert_null_safe_meta_clauses(&sql);
         assert!(!sql.contains("FINAL"));
     }
 
@@ -1408,7 +1430,9 @@ mod tests {
         let sql = JoinStrategy::Path.build_detect_changed_sql("temp_x", "base_y", ChangeKind::MetadataOnly);
         // MetadataOnly 条件：内容未变 + 属性变了
         assert!(sql.contains("t.size = f.size AND t.mtime = f.mtime"));
-        assert!(sql.contains("t.mode != f.mode OR t.uid != f.uid OR t.gid != f.gid"));
+        assert_null_safe_meta_clauses(&sql);
+        // 必须出现取反形式
+        assert!(sql.contains("NOT (t.mode = f.mode"));
     }
 
     #[test]
@@ -1416,7 +1440,8 @@ mod tests {
         let sql = JoinStrategy::Path.build_detect_changed_sql("temp_x", "base_y", ChangeKind::Both);
         // Both 条件：内容和属性都变了
         assert!(sql.contains("t.size != f.size OR t.mtime != f.mtime"));
-        assert!(sql.contains("t.mode != f.mode OR t.uid != f.uid OR t.gid != f.gid"));
+        assert_null_safe_meta_clauses(&sql);
+        assert!(sql.contains("NOT (t.mode = f.mode"));
     }
 
     #[test]
@@ -1427,21 +1452,23 @@ mod tests {
         assert!(sql.contains("t.file_handle = f.file_handle"));
         assert!(sql.contains("t.relative_path = f.relative_path"));
         assert!(sql.contains("t.size != f.size OR t.mtime != f.mtime"));
-        assert!(sql.contains("t.mode = f.mode AND t.uid = f.uid AND t.gid = f.gid"));
+        assert_null_safe_meta_clauses(&sql);
     }
 
     #[test]
     fn test_detect_changed_sql_fh_mode_metadata_only() {
         let sql = JoinStrategy::FileHandle.build_detect_changed_sql("temp_x", "base_y", ChangeKind::MetadataOnly);
         assert!(sql.contains("t.size = f.size AND t.mtime = f.mtime"));
-        assert!(sql.contains("t.mode != f.mode OR t.uid != f.uid OR t.gid != f.gid"));
+        assert_null_safe_meta_clauses(&sql);
+        assert!(sql.contains("NOT (t.uid = f.uid"));
     }
 
     #[test]
     fn test_detect_changed_sql_fh_mode_both() {
         let sql = JoinStrategy::FileHandle.build_detect_changed_sql("temp_x", "base_y", ChangeKind::Both);
         assert!(sql.contains("t.size != f.size OR t.mtime != f.mtime"));
-        assert!(sql.contains("t.mode != f.mode OR t.uid != f.uid OR t.gid != f.gid"));
+        assert_null_safe_meta_clauses(&sql);
+        assert!(sql.contains("NOT (t.gid = f.gid"));
     }
 
     #[test]

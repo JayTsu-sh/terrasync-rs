@@ -5,6 +5,7 @@ import os, subprocess, sys, time
 from pathlib import Path
 
 _SKILL_DIR = Path(__file__).parent.parent
+_PROJECT_ROOT = _SKILL_DIR.parent.parent.parent
 _HARNESS = _SKILL_DIR.parent / "harness-run" / "scripts"
 sys.path.insert(0, str(_HARNESS))
 import env as envmod
@@ -43,13 +44,16 @@ def _cleanup(a, src_ip, ch_host, cfg):
     try:
         a.ssh_exec(src_ip, f"mc alias set ts3 http://localhost:{port} {ak} {sk} --api s3v4 2>/dev/null; "
                             f"mc rb --force ts3/{bucket} 2>/dev/null || true")
-    except Exception: pass
+    except Exception as e:
+
+        print(f"⚠ cleanup warning: {e}", flush=True)
     a.clickhouse_drop_tables(ch_host, SANITIZED)
     a.run_shell_quiet(f"find jobs -maxdepth 1 -type d -name '*{SANITIZED}*' | xargs rm -rf")
     a.run_shell_quiet("rm -rf target/debug/logs/*")
 
 
 def run(env=None):
+    os.chdir(_PROJECT_ROOT)
     start = time.monotonic()
     cfg = envmod.load(env)
     envmod.require(cfg, "S3_SOURCE_IP", "CLICKHOUSE_HOST", "S3_ACCESS_KEY", "S3_SECRET_KEY")
@@ -80,6 +84,7 @@ def run(env=None):
     port = cfg.get("S3_SOURCE_PORT", "39000")
     for o, n in [
         ('S3_HOST="http://10.128.137.245:8184"', f'S3_HOST="http://localhost:{port}"'),
+        ('S3_HOST="10.128.137.245:8184"', f'S3_HOST="localhost:{port}"'),
         ('S3_AK="H80NKRVS5DYOVE43U2HS"', f'S3_AK="{ak}"'),
         ('S3_SK="FBU8xNSKujskgO2bF6ctnd7dF2IeDodmoy3q6hNk"', f'S3_SK="{sk}"'),
     ]: c = c.replace(o, n)
@@ -88,7 +93,7 @@ def run(env=None):
     with open(tmp, "w") as f: f.write(c)
     try:
         a.scp_to(tmp, src_ip, "/tmp/setup-s3-versioned.sh")
-        a.ssh_exec(src_ip, "bash /tmp/setup-s3-versioned.sh", timeout=300)
+        a.ssh_exec(src_ip, f"S3_VERSIONED_BUCKET={bkt} bash /tmp/setup-s3-versioned.sh", timeout=300)
     except Exception as e:
         results.append(AssertionResult("setup_data", False, {}, {}, f"✗ setup: {e}"))
         return build_result(results, start)
@@ -109,6 +114,7 @@ def run(env=None):
         with open(ver_mutate) as f: cm = f.read()
         for o, n in [
             ('S3_HOST="http://10.128.137.245:8184"', f'S3_HOST="http://localhost:{port}"'),
+            ('S3_HOST="10.128.137.245:8184"', f'S3_HOST="localhost:{port}"'),
             ('S3_AK="H80NKRVS5DYOVE43U2HS"', f'S3_AK="{ak}"'),
             ('S3_SK="FBU8xNSKujskgO2bF6ctnd7dF2IeDodmoy3q6hNk"', f'S3_SK="{sk}"'),
         ]: cm = cm.replace(o, n)
@@ -117,8 +123,10 @@ def run(env=None):
         with open(tmp2, "w") as f: f.write(cm)
         try:
             a.scp_to(tmp2, src_ip, "/tmp/mutate-s3-versioned.sh")
-            a.ssh_exec(src_ip, "bash /tmp/mutate-s3-versioned.sh", timeout=120)
-        except Exception: pass
+            a.ssh_exec(src_ip, f"S3_VERSIONED_BUCKET={bkt} bash /tmp/mutate-s3-versioned.sh", timeout=120)
+        except Exception as e:
+
+            print(f"⚠ cleanup warning: {e}", flush=True)
         finally:
             if os.path.exists(tmp2): os.unlink(tmp2)
 

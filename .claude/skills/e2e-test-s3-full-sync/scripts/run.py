@@ -12,6 +12,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 _SKILL_DIR = Path(__file__).parent.parent
+_PROJECT_ROOT = _SKILL_DIR.parent.parent.parent
 _HARNESS_SCRIPTS = _SKILL_DIR.parent / "harness-run" / "scripts"
 sys.path.insert(0, str(_HARNESS_SCRIPTS))
 
@@ -36,11 +37,13 @@ def _mc_cleanup_remote(a, ip, bucket, cfg, port_key="S3_SOURCE_PORT"):
     ak, sk = cfg["S3_ACCESS_KEY"], cfg["S3_SECRET_KEY"]
     port = cfg.get(port_key, "39000")
     try:
+        # 幂等：确保 bucket 存在 + 清空 test-data 前缀
         a.ssh_exec(ip,
                    f"mc alias set ts3 http://localhost:{port} {ak} {sk} --api s3v4 2>/dev/null; "
+                   f"mc mb --ignore-existing ts3/{bucket} 2>/dev/null || true; "
                    f"mc rm --recursive --force ts3/{bucket}/test-data/ 2>/dev/null || true")
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"⚠ cleanup warning: {e}", flush=True)
 
 
 def _patch_and_run(a, src_ip, sh_path, cfg):
@@ -83,8 +86,8 @@ def _cleanup_all(a, src_ip, dest_ip, ch_host, cfg):
         for f in as_completed(futs):
             try:
                 f.result()
-            except Exception:
-                pass
+            except Exception as e:
+                print(f"⚠ cleanup warning: {e}", flush=True)
     a.run_shell_quiet("rm -rf target/debug/logs/*")
 
 
@@ -97,10 +100,11 @@ def _drop_sync_tables(a, ch_host):
     for t in tables.strip().splitlines():
         t = t.strip()
         if t:
-            a.clickhouse_query(ch_host, f"DROP TABLE IF EXISTS default.{t}")
+            a.clickhouse_execute(ch_host, f"DROP TABLE IF EXISTS default.{t}")
 
 
 def run(env: dict = None) -> dict:
+    os.chdir(_PROJECT_ROOT)
     start = time.monotonic()
     cfg = envmod.load(env)
     envmod.require(cfg, "S3_SOURCE_IP", "S3_DEST_IP", "CLICKHOUSE_HOST",

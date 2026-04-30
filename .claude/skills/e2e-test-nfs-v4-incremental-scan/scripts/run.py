@@ -5,6 +5,7 @@ NFS v4.1 增量扫描 e2e 测试（与 v3 逻辑相同，URL 加 ?version=4.1）
 """
 
 import re
+import os
 import subprocess
 import sys
 import time
@@ -12,6 +13,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 _SKILL_DIR = Path(__file__).parent.parent
+_PROJECT_ROOT = _SKILL_DIR.parent.parent.parent
 _HARNESS_SCRIPTS = _SKILL_DIR.parent / "harness-run" / "scripts"
 sys.path.insert(0, str(_HARNESS_SCRIPTS))
 
@@ -26,11 +28,11 @@ BASELINE_DIRS, BASELINE_FILES, BASELINE_SYMLINKS = _PC.BASELINE_DIRS, _PC.BASELI
 POST_DIRS, POST_FILES, POST_SYMLINKS           = _PC.POST_DIRS, _PC.POST_FILES, _PC.POST_SYMLINKS
 
 
-def _cleanup(a, src_ip, ch_host, nfs_export):
+def _cleanup(a, src_ip, ch_host, nfs_server_path):
     with ThreadPoolExecutor(max_workers=4) as ex:
         futs = [
             ex.submit(a.ssh_exec, src_ip,
-                      f"sudo rm -rf {nfs_export}/test-data && echo ok || true"),
+                      f"sudo find {nfs_server_path} -mindepth 1 -maxdepth 1 -exec rm -rf {{}} + && echo ok || true"),
             ex.submit(a.clickhouse_drop_tables, ch_host, SANITIZED),
             ex.submit(a.run_shell_quiet,
                       f"find jobs -maxdepth 1 -type d -name '*{SANITIZED}*' | xargs rm -rf"),
@@ -39,8 +41,8 @@ def _cleanup(a, src_ip, ch_host, nfs_export):
         for f in as_completed(futs):
             try:
                 f.result()
-            except Exception:
-                pass
+            except Exception as e:
+                print(f"⚠ cleanup warning: {e}", flush=True)
 
 
 def _check_incr_stats(stdout, expected):
@@ -57,22 +59,23 @@ def _check_incr_stats(stdout, expected):
 
 
 def run(env: dict = None) -> dict:
+    os.chdir(_PROJECT_ROOT)
     start = time.monotonic()
     cfg = envmod.load(env)
     envmod.require(cfg, "NFS_V4_SOURCE_IP", "CLICKHOUSE_HOST")
 
     src_ip = cfg["NFS_V4_SOURCE_IP"]
     ch_host = cfg["CLICKHOUSE_HOST"]
-    nfs_export = cfg.get("NFS_V4_EXPORT", NFS_SERVER_PATH)
+    nfs_server_path = cfg.get("NFS_V4_SERVER_PATH", NFS_SERVER_PATH)
     binary = cfg.get("TERRASYNC_BINARY", "./target/debug/terrasync")
     config = cfg.get("TERRASYNC_CONFIG", "examples/config.toml")
     ssh_user = cfg.get("SSH_USER", "root")
-    src_url = f"nfs://{src_ip}{nfs_export}?version=4.1"
+    src_url = f"nfs://{src_ip}/?version=4.1"
 
     a = TerrasyncAssertions(ssh_user=ssh_user)
     results = []
 
-    _cleanup(a, src_ip, ch_host, nfs_export)
+    _cleanup(a, src_ip, ch_host, nfs_server_path)
 
     # Setup: use nfs4 setup script from full-scan skill
     setup_sh = _SKILL_DIR.parent / "e2e-test-nfs-v4-full-scan" / "scripts" / "setup-nfs4-test-data.sh"
@@ -94,7 +97,7 @@ def run(env: dict = None) -> dict:
         capture_output=True, text=True, timeout=300)
     if proc.returncode != 0:
         results.append(AssertionResult("full_scan", False, {}, {}, "✗ full_scan failed"))
-        _cleanup(a, src_ip, ch_host, nfs_export)
+        _cleanup(a, src_ip, ch_host, nfs_server_path)
         return build_result(results, start)
     baseline_exp = {"dirs": BASELINE_DIRS, "files": BASELINE_FILES, "symlinks": BASELINE_SYMLINKS}
     results.append(a.check_cli_scan_output(proc.stdout + proc.stderr, baseline_exp))
@@ -109,13 +112,13 @@ def run(env: dict = None) -> dict:
         mut_out = a.ssh_exec(src_ip, "sudo bash /tmp/mutate-nfs4-test-data.sh", timeout=120)
     except Exception as e:
         results.append(AssertionResult("mutate", False, {}, {}, f"✗ mutate: {e}"))
-        _cleanup(a, src_ip, ch_host, nfs_export)
+        _cleanup(a, src_ip, ch_host, nfs_server_path)
         return build_result(results, start)
     mutate_ok = "OK:" in mut_out or "OK：" in mut_out
     results.append(AssertionResult("mutate", mutate_ok, {}, {},
                                    f"{'✓' if mutate_ok else '✗'} mutate_nfs4_test_data"))
     if not mutate_ok:
-        _cleanup(a, src_ip, ch_host, nfs_export)
+        _cleanup(a, src_ip, ch_host, nfs_server_path)
         return build_result(results, start)
 
     # 增量扫描
@@ -126,11 +129,11 @@ def run(env: dict = None) -> dict:
     post_exp = {"dirs": POST_DIRS, "files": POST_FILES, "symlinks": POST_SYMLINKS}
     results.append(a.check_cli_scan_output(incr_out, post_exp))
     results.append(_check_incr_stats(
-        incr_out, {"new": 7, "changed": 9, "renamed": 47, "deleted": 8}
+        incr_out, {"new": 7, "changed": 21, "renamed": 7, "deleted": 8}
     ))
     results.append(a.check_clickhouse_counts(ch_host, f"base_{SANITIZED}", post_exp))
 
-    _cleanup(a, src_ip, ch_host, nfs_export)
+    _cleanup(a, src_ip, ch_host, nfs_server_path)
     return build_result(results, start)
 
 

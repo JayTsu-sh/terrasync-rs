@@ -10,7 +10,7 @@
 use std::sync::Arc;
 
 // 外部crate
-use data_mover::{EntryEnum, StorageEntryMessage, WalkDirAsyncIterator, canonicalize_path};
+use data_mover::{EntryEnum, StorageEntryMessage, WalkDirAsyncIterator, canonicalize_path, redact_storage_url};
 use db::factory::DatabaseFactory;
 use db::traits::Database;
 use db::{self, DeletionStatus, INCREMENTAL_SCAN_TABLE_BASE_NAME};
@@ -20,14 +20,11 @@ use tracing::{Instrument, debug, error, info, info_span, instrument, trace, warn
 use utils::app_config::AppConfig;
 
 // 内部模块
-use crate::broadcast::BroadcastForwarder;
+use crate::broadcast::{BroadcastForwarder, DEFAULT_CHANNEL_CAPACITY};
 use crate::config::{ConsumerConfig, JobType, initialize_consumer_config, initialize_scan_config};
 use crate::consumer::ConsumerManager;
 use crate::dir_walker;
 use crate::error::{AppError, Result};
-
-/// 广播通道容量
-const BROADCAST_CHANNEL_CAPACITY: usize = 1000;
 
 /// 扫描流水线，封装已初始化的 pipeline 各组件
 struct ScanPipeline {
@@ -147,7 +144,7 @@ async fn setup_scan_pipeline(
     let consumer_config = Arc::new(consumer_config);
 
     // 5. 创建广播转发器
-    let mut broadcaster = BroadcastForwarder::new(BROADCAST_CHANNEL_CAPACITY);
+    let mut broadcaster = BroadcastForwarder::new(DEFAULT_CHANNEL_CAPACITY);
 
     // 6. 初始化消费者管理器
     let mut consumer_manager = match ConsumerManager::new(consumer_config.as_ref()).await {
@@ -239,7 +236,7 @@ async fn run_full_scan(
         "Starting full scan: job_id={}, scan_type={}, path={}, depth={}, match={}, exclude={}",
         job_id,
         scan_type,
-        path,
+        redact_storage_url(path),
         depth,
         r#match.clone().unwrap_or_default(),
         exclude.clone().unwrap_or_default(),
@@ -331,7 +328,7 @@ async fn run_incremental_scan(
         "Starting incremental scan: job_id={}, scan_type={}, path={}, depth={}, match={}, exclude={}",
         job_id,
         scan_type,
-        path,
+        redact_storage_url(path),
         depth,
         r#match.clone().unwrap_or_default(),
         exclude.clone().unwrap_or_default(),
@@ -391,7 +388,10 @@ async fn run_incremental_scan(
     };
 
     // 创建工作线程池
-    info!("Starting directory walker to incremental scan the path: {}", path);
+    info!(
+        "Starting directory walker to incremental scan the path: {}",
+        redact_storage_url(path)
+    );
     let mut worker_handles = Vec::new();
 
     for worker_id in 0..incremental_scan_concurrency {

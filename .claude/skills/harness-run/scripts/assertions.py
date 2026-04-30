@@ -52,7 +52,7 @@ class TerrasyncAssertions:
     # ── ClickHouse ─────────────────────────────────────────────────────────
 
     def clickhouse_query(self, host, query, timeout=30) -> str:
-        """发送 HTTP 查询到 ClickHouse，返回原始文本。失败时抛出 RuntimeError。"""
+        """SELECT 等只读查询（HTTP GET）。失败时抛出 RuntimeError。"""
         url = f"http://{host}/?query={urllib.parse.quote(query)}"
         try:
             with urllib.request.urlopen(url, timeout=timeout) as resp:
@@ -60,10 +60,22 @@ class TerrasyncAssertions:
         except Exception as e:
             raise RuntimeError(f"ClickHouse query failed on {host}: {e}") from e
 
+    def clickhouse_execute(self, host, query, timeout=30) -> str:
+        """DDL / 写操作（HTTP POST）。失败时抛出 RuntimeError。
+        ClickHouse 规定 GET 为只读模式，DROP/CREATE/INSERT 必须用 POST。
+        """
+        url = f"http://{host}/"
+        req = urllib.request.Request(url, data=query.encode(), method="POST")
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                return resp.read().decode()
+        except Exception as e:
+            raise RuntimeError(f"ClickHouse execute failed on {host}: {e}") from e
+
     def clickhouse_drop_tables(self, host, sanitized_job_id):
         """删除 base_*, state_*, incremental_* 表（IF EXISTS，幂等）。"""
         for prefix in ("base", "state", "incremental"):
-            self.clickhouse_query(
+            self.clickhouse_execute(
                 host, f"DROP TABLE IF EXISTS default.{prefix}_{sanitized_job_id}"
             )
 
@@ -124,26 +136,19 @@ class TerrasyncAssertions:
 
     def check_cli_sync_output(self, stdout: str, expected: dict) -> AssertionResult:
         """
-        解析 terrasync sync 输出，验证 copied/skipped/deleted 计数。
+        解析 terrasync sync 输出（Scanned Statistics 段），验证 dirs/files/symlinks 计数。
+        Sync 输出包含与 scan 同格式的 Scanned Statistics 段，复用 check_cli_scan_output。
         expected 中值为 None 的 key 跳过验证。
         """
-        actual = {}
-        for field_name in ("copied", "skipped", "deleted", "renamed"):
-            patterns = [
-                rf"{field_name}[=:\s]+(\d+)",
-                rf"(\d+)\s+{field_name}",
-            ]
-            for pat in patterns:
-                m = re.search(pat, stdout, re.IGNORECASE)
-                if m:
-                    actual[field_name] = int(m.group(1))
-                    break
-
         check = {k: v for k, v in expected.items() if v is not None}
-        passed = all(actual.get(k) == v for k, v in check.items())
+        result = self.check_cli_scan_output(stdout, check)
+        # 修正 name 让上层日志区分 sync vs scan
         return AssertionResult(
-            "cli_sync_output", passed, check, actual,
-            f"{'✓' if passed else '✗'} cli_sync_output: expected={check}, actual={actual}"
+            "cli_sync_output",
+            result.passed,
+            result.expected,
+            result.actual,
+            result.message.replace("cli_scan_output", "cli_sync_output"),
         )
 
     def check_clickhouse_counts(

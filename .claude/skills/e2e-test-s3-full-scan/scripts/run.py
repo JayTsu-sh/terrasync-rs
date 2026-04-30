@@ -13,6 +13,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 _SKILL_DIR = Path(__file__).parent.parent
+_PROJECT_ROOT = _SKILL_DIR.parent.parent.parent
 _HARNESS_SCRIPTS = _SKILL_DIR.parent / "harness-run" / "scripts"
 sys.path.insert(0, str(_HARNESS_SCRIPTS))
 
@@ -44,8 +45,8 @@ def _mc_cleanup(a, ip, bucket, cfg, prefix="test-data"):
            f"mc rm --recursive --force ts3/{bucket}/{prefix}/ 2>/dev/null || true; echo done")
     try:
         a.ssh_exec(ip, cmd)
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"⚠ cleanup warning: {e}", flush=True)
 
 
 def _s3_setup(a, src_ip, cfg, setup_sh_path):
@@ -87,12 +88,13 @@ def _cleanup(a, src_ip, ch_host, cfg):
         for f in as_completed(futs):
             try:
                 f.result()
-            except Exception:
-                pass
+            except Exception as e:
+                print(f"⚠ cleanup warning: {e}", flush=True)
     a.run_shell_quiet("rm -rf target/debug/logs/*")
 
 
 def run(env: dict = None) -> dict:
+    os.chdir(_PROJECT_ROOT)
     start = time.monotonic()
     cfg = envmod.load(env)
     envmod.require(cfg, "S3_SOURCE_IP", "CLICKHOUSE_HOST", "S3_ACCESS_KEY", "S3_SECRET_KEY")
@@ -166,7 +168,7 @@ def run(env: dict = None) -> dict:
     port = cfg.get("S3_SOURCE_PORT", "39000")
     mc_count_cmd = (
         f"mc alias set ts3 http://localhost:{port} {ak} {sk} --api s3v4 2>/dev/null; "
-        f"mc find ts3/{bucket}/test-data/ --type f 2>/dev/null | wc -l"
+        f"mc find ts3/{bucket}/test-data/ 2>/dev/null | wc -l"
     )
     try:
         count_out = a.ssh_exec(src_ip, mc_count_cmd).strip()

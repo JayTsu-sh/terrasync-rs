@@ -141,7 +141,7 @@ OK: S3 file count verified
 ### 2b. mc 验证
 
 ```bash
-mc find ts3/{SRC_BUCKET}/test-data/ --type f | wc -l
+mc find ts3/{SRC_BUCKET}/test-data/ | wc -l
 ```
 
 Expected: `117`。
@@ -176,7 +176,7 @@ true    false   {BASELINE_DIRS}       # 目录 = 40
 ### 3c. 目标端 mc 验证
 
 ```bash
-mc find ts3/{DST_BUCKET}/test-data/ --type f | wc -l
+mc find ts3/{DST_BUCKET}/test-data/ | wc -l
 ```
 
 Expected: `117`。
@@ -201,7 +201,7 @@ OK: S3 mutation verified
 ### 4b. mc 验证变更后文件数
 
 ```bash
-mc find ts3/{SRC_BUCKET}/test-data/ --type f | wc -l
+mc find ts3/{SRC_BUCKET}/test-data/ | wc -l
 ```
 
 Expected: `115`。
@@ -261,7 +261,7 @@ grep -E "ERROR|WARN" target/debug/logs/*/app.log | tail -80
 ### 6a. mc 直接计数（目标桶）
 
 ```bash
-mc find ts3/{DST_BUCKET}/test-data/ --type f | wc -l
+mc find ts3/{DST_BUCKET}/test-data/ | wc -l
 ```
 
 Expected: `115`。

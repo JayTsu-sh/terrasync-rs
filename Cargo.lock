@@ -1939,7 +1939,7 @@ checksum = "d7a1e2f27636f116493b8b860f5546edb47c8d8f8ea73e1d2a20be88e28d1fea"
 [[package]]
 name = "data-mover"
 version = "0.2.0"
-source = "git+https://github.com/JayTsu-sh/data-mover-rs.git#4289a15cf09e5f773c61dc09f7f89e87a4ea5a8e"
+source = "git+https://github.com/JayTsu-sh/data-mover-rs.git#7eb3046a83c8e286c1cb62f1f2a24f612cf1cecc"
 dependencies = [
  "arc-swap",
  "async-channel",
@@ -3808,7 +3808,7 @@ checksum = "cf5a574dadd7941adeaa71823ecba5e28331b8313fb2e1c6a5c7e5981ea53ad6"
 [[package]]
 name = "nfs-rs"
 version = "0.2.0"
-source = "git+https://github.com/JayTsu-sh/nfs-rs.git#33b8d2391c24315360c5d463028dfcf9952c70e3"
+source = "git+https://github.com/JayTsu-sh/nfs-rs.git#b6ceacb664c7f82142a067c5d23c51ab05ec0a8a"
 dependencies = [
  "async-trait",
  "byteorder",
@@ -5798,14 +5798,14 @@ dependencies = [
 
 [[package]]
 name = "smb"
-version = "0.11.1"
-source = "git+https://github.com/JayTsu-sh/smb-rs.git#f9e5a5d74c9f2c842f35f75f106f86407cb26e2c"
+version = "0.11.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5c12ddf75029c02180237fa98948bd3dea72647c08bd7d1b5fa4923491764100"
 dependencies = [
  "aead",
  "aes",
  "aes-gcm",
  "binrw",
- "bytes 1.11.1",
  "ccm",
  "cmac",
  "crypto-common 0.2.0-rc.4",
@@ -5837,8 +5837,9 @@ dependencies = [
 
 [[package]]
 name = "smb-dtyp"
-version = "0.11.1"
-source = "git+https://github.com/JayTsu-sh/smb-rs.git#f9e5a5d74c9f2c842f35f75f106f86407cb26e2c"
+version = "0.11.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "11e11570063587382275297db37dd686360fcc109d22a8d655846dc93bf4a71a"
 dependencies = [
  "binrw",
  "modular-bitfield",
@@ -5850,8 +5851,9 @@ dependencies = [
 
 [[package]]
 name = "smb-dtyp-derive"
-version = "0.11.1"
-source = "git+https://github.com/JayTsu-sh/smb-rs.git#f9e5a5d74c9f2c842f35f75f106f86407cb26e2c"
+version = "0.11.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "12fcc3a1d02a6b5a78a0380adcc9218a65bbdee515d4f60b9c90566611ef5ec8"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -5860,8 +5862,9 @@ dependencies = [
 
 [[package]]
 name = "smb-fscc"
-version = "0.11.1"
-source = "git+https://github.com/JayTsu-sh/smb-rs.git#f9e5a5d74c9f2c842f35f75f106f86407cb26e2c"
+version = "0.11.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "07ff4559d37f9c3e6b56fffa1a359a6f151337b18b9d0218161488a4a7e15685"
 dependencies = [
  "binrw",
  "modular-bitfield",
@@ -5873,8 +5876,9 @@ dependencies = [
 
 [[package]]
 name = "smb-msg"
-version = "0.11.1"
-source = "git+https://github.com/JayTsu-sh/smb-rs.git#f9e5a5d74c9f2c842f35f75f106f86407cb26e2c"
+version = "0.11.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "87b761115473b9af471c06b28e1d26b16602c97ae315c8d325b2418dedb992bf"
 dependencies = [
  "binrw",
  "modular-bitfield",
@@ -5888,8 +5892,9 @@ dependencies = [
 
 [[package]]
 name = "smb-msg-derive"
-version = "0.11.1"
-source = "git+https://github.com/JayTsu-sh/smb-rs.git#f9e5a5d74c9f2c842f35f75f106f86407cb26e2c"
+version = "0.11.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ae33ff90211b548f0ff248b511eada2623ba1693d388c363e48003a5a6be5991"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -5898,8 +5903,9 @@ dependencies = [
 
 [[package]]
 name = "smb-rpc"
-version = "0.11.1"
-source = "git+https://github.com/JayTsu-sh/smb-rs.git#f9e5a5d74c9f2c842f35f75f106f86407cb26e2c"
+version = "0.11.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "352732178153ef2379552a09cd5319fc4ce49a0837576e87eb9ac36652330a46"
 dependencies = [
  "binrw",
  "maybe-async",
@@ -5912,11 +5918,11 @@ dependencies = [
 
 [[package]]
 name = "smb-transport"
-version = "0.11.1"
-source = "git+https://github.com/JayTsu-sh/smb-rs.git#f9e5a5d74c9f2c842f35f75f106f86407cb26e2c"
+version = "0.11.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "383209d094590c95b748cf20e79e5216ec8cf458486c0253c3610dd2c36d435d"
 dependencies = [
  "binrw",
- "bytes 1.11.1",
  "futures-core",
  "futures-util",
  "log",

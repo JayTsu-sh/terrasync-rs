@@ -62,18 +62,20 @@ def _cleanup(a, cfg):
         futs = [
             ex.submit(_smb_rm, src, user, passwd, share),
             ex.submit(_smb_rm, dst, user, passwd, share),
-            *[ex.submit(a.clickhouse_query, ch_host, f"DROP TABLE IF EXISTS default.{t}")
+            *[ex.submit(a.clickhouse_execute, ch_host, f"DROP TABLE IF EXISTS default.{t}")
               for t in _TABLES],
             ex.submit(a.run_shell_quiet,
                       f"find jobs -maxdepth 1 -type d -name '*{SANITIZED}*' -exec rm -rf {{}} +"),
         ]
         for f in as_completed(futs):
             try: f.result()
-            except Exception: pass
+            except Exception as e:
+                print(f"⚠ cleanup warning: {e}", flush=True)
     a.run_shell_quiet("rm -rf target/debug/logs/*")
 
 
 def run(env=None):
+    os.chdir(_PROJECT_ROOT)
     start = time.monotonic()
     cfg = envmod.load(env)
     envmod.require(cfg, "CIFS_SOURCE_HOST", "CIFS_DEST_HOST", "CLICKHOUSE_HOST")

@@ -8,6 +8,7 @@ SKILL.md 中显示的 40/117/36 为历史遗留数值，以实际 setup-test-dat
 """
 
 import re
+import os
 import subprocess
 import sys
 import time
@@ -15,6 +16,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 _SKILL_DIR = Path(__file__).parent.parent
+_PROJECT_ROOT = _SKILL_DIR.parent.parent.parent
 _HARNESS_SCRIPTS = _SKILL_DIR.parent / "harness-run" / "scripts"
 sys.path.insert(0, str(_HARNESS_SCRIPTS))
 
@@ -33,9 +35,9 @@ def _cleanup(a, src_ip, dest_ip, ch_host, nfs_export):
     with ThreadPoolExecutor(max_workers=5) as ex:
         futs = [
             ex.submit(a.ssh_exec, src_ip,
-                      f"sudo rm -rf {nfs_export}/test-data && echo ok || true"),
+                      f"sudo find {nfs_export} -mindepth 1 -maxdepth 1 -exec rm -rf {{}} + && echo ok || true"),
             ex.submit(a.ssh_exec, dest_ip,
-                      f"sudo rm -rf {nfs_export}/test-data && echo ok || true"),
+                      f"sudo find {nfs_export} -mindepth 1 -maxdepth 1 -exec rm -rf {{}} + && echo ok || true"),
             ex.submit(_drop_all_ic_tables, a, ch_host),
             ex.submit(a.run_shell_quiet,
                       f"find jobs -maxdepth 1 -type d -name '*{_TABLES_PATTERN}*' | xargs rm -rf"),
@@ -44,8 +46,8 @@ def _cleanup(a, src_ip, dest_ip, ch_host, nfs_export):
         for f in as_completed(futs):
             try:
                 f.result()
-            except Exception:
-                pass
+            except Exception as e:
+                print(f"⚠ cleanup warning: {e}", flush=True)
 
 
 def _drop_all_ic_tables(a, ch_host):
@@ -58,7 +60,7 @@ def _drop_all_ic_tables(a, ch_host):
     for t in tables.strip().splitlines():
         t = t.strip()
         if t:
-            a.clickhouse_query(ch_host, f"DROP TABLE IF EXISTS default.{t}")
+            a.clickhouse_execute(ch_host, f"DROP TABLE IF EXISTS default.{t}")
 
 
 def _terrasync(binary, config, *args, timeout=600):
@@ -93,6 +95,7 @@ def _check_ic_output(out: str, expect_passed: bool, label: str,
 
 
 def run(env: dict = None) -> dict:
+    os.chdir(_PROJECT_ROOT)
     start = time.monotonic()
     cfg = envmod.load(env)
     envmod.require(cfg, "NFS_V3_SOURCE_IP", "NFS_V3_DEST_IP", "CLICKHOUSE_HOST")
@@ -193,8 +196,8 @@ def run(env: dict = None) -> dict:
     try:
         a.ssh_exec(dest_ip,
                    f"chmod 777 {nfs_export}/test-data/d1/d1_1/file1.txt")
-    except Exception:
-        pass  # best-effort
+    except Exception as e:
+        print(f"⚠ cleanup warning: {e}", flush=True)  # best-effort
 
     # 6c：Auto-Fix
     proc6c = _terrasync(binary, config, "integrity-check", "--id", f"{IC_JOB_ID}-fix",

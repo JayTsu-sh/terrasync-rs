@@ -12,6 +12,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 _SKILL_DIR = Path(__file__).parent.parent
+_PROJECT_ROOT = _SKILL_DIR.parent.parent.parent
 _HARNESS = _SKILL_DIR.parent / "harness-run" / "scripts"
 sys.path.insert(0, str(_HARNESS))
 import env as envmod
@@ -46,7 +47,9 @@ def _mc_cleanup_src(a, cfg):
     try:
         a.ssh_exec(ip, f"mc alias set ts3 http://localhost:{port} {ak} {sk} --api s3v4 2>/dev/null; "
                        f"mc rm --recursive --force ts3/{bucket}/test-data/ 2>/dev/null || true")
-    except Exception: pass
+    except Exception as e:
+
+        print(f"⚠ cleanup warning: {e}", flush=True)
 
 
 def _cleanup(a, ch_host, cfg):
@@ -58,19 +61,22 @@ def _cleanup(a, ch_host, cfg):
         futs = [
             ex.submit(_mc_cleanup_src, a, cfg),
             ex.submit(a.ssh_exec, dest_ip,
-                      f"sudo rm -rf {nfs_export}/test-data && echo ok || true"),
-            *[ex.submit(a.clickhouse_query, ch_host, f"DROP TABLE IF EXISTS default.{t.strip()}")
+                      f"sudo find {nfs_export} -mindepth 1 -maxdepth 1 -exec rm -rf {{}} + && echo ok || true"),
+            *[ex.submit(a.clickhouse_execute, ch_host, f"DROP TABLE IF EXISTS default.{t.strip()}")
               for t in tables.strip().splitlines() if t.strip()],
             ex.submit(a.run_shell_quiet,
                       f"find jobs -maxdepth 1 -type d -name '*{SANITIZED}*' | xargs rm -rf"),
         ]
         for f in as_completed(futs):
             try: f.result()
-            except Exception: pass
+            except Exception as e:
+
+                print(f"⚠ cleanup warning: {e}", flush=True)
     a.run_shell_quiet("rm -rf target/debug/logs/*")
 
 
 def run(env=None):
+    os.chdir(_PROJECT_ROOT)
     start = time.monotonic()
     cfg = envmod.load(env)
     envmod.require(cfg, "S3_SOURCE_IP", "CLICKHOUSE_HOST", "S3_ACCESS_KEY", "S3_SECRET_KEY")

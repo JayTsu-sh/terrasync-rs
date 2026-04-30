@@ -5,12 +5,14 @@ NFS v3 增量扫描 e2e 测试：全量建基线 → 变更 → 增量扫描 →
 """
 
 import subprocess
+import os
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 _SKILL_DIR = Path(__file__).parent.parent
+_PROJECT_ROOT = _SKILL_DIR.parent.parent.parent
 _HARNESS_SCRIPTS = _SKILL_DIR.parent / "harness-run" / "scripts"
 sys.path.insert(0, str(_HARNESS_SCRIPTS))
 
@@ -28,7 +30,7 @@ POST_TOTAL                                         = _PC.POST_TOTAL
 # 增量统计预期值（来自 SKILL.md Step 4b）
 EXPECTED_INCR = {
     "new":     {"dirs": 2,  "files": 3,  "symlinks": 2,  "total": 7},
-    "changed": {"dirs": 0,  "files": 9,  "symlinks": 0,  "total": 9},
+    "changed": {"dirs": 0,  "files": 17, "symlinks": 0,  "total": 17},
     "renamed": {"dirs": 9,  "files": 28, "symlinks": 10, "total": 47},
     "deleted": {"dirs": 1,  "files": 5,  "symlinks": 2,  "total": 8},
 }
@@ -38,7 +40,7 @@ def _cleanup(a, src_ip, ch_host, nfs_export):
     with ThreadPoolExecutor(max_workers=4) as ex:
         futs = [
             ex.submit(a.ssh_exec, src_ip,
-                      f"sudo rm -rf {nfs_export}/test-data && echo ok || true"),
+                      f"sudo find {nfs_export} -mindepth 1 -maxdepth 1 -exec rm -rf {{}} + && echo ok || true"),
             ex.submit(a.clickhouse_drop_tables, ch_host, SANITIZED),
             ex.submit(a.run_shell_quiet,
                       f"find jobs -maxdepth 1 -type d -name '*{SANITIZED}*' | xargs rm -rf"),
@@ -47,8 +49,8 @@ def _cleanup(a, src_ip, ch_host, nfs_export):
         for f in as_completed(futs):
             try:
                 f.result()
-            except Exception:
-                pass
+            except Exception as e:
+                print(f"⚠ cleanup warning: {e}", flush=True)
 
 
 def _terrasync_scan(binary, config, job_id, src_ip, nfs_export, timeout=300):
@@ -100,8 +102,9 @@ def _check_incr_ch_table(a, ch_host) -> list[AssertionResult]:
         rows[key] = int(parts[3].strip())
 
     expected_rows = {
-        ("changed", "false", "false"): 9,
-        ("changed", "true",  "false"): 2,
+        ("both_changed",     "false", "false"): 2,
+        ("data_changed",     "false", "false"): 6,
+        ("metadata_changed", "false", "false"): 9,
         ("deleted", "false", "false"): 5,
         ("deleted", "false", "true"):  2,
         ("deleted", "true",  "false"): 1,
@@ -121,6 +124,7 @@ def _check_incr_ch_table(a, ch_host) -> list[AssertionResult]:
 
 
 def run(env: dict = None) -> dict:
+    os.chdir(_PROJECT_ROOT)
     start = time.monotonic()
     cfg = envmod.load(env)
     envmod.require(cfg, "NFS_V3_SOURCE_IP", "CLICKHOUSE_HOST")

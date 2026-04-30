@@ -2,6 +2,12 @@ use futures::future::join_all;
 use tokio::sync::mpsc;
 use tracing::trace;
 
+/// 默认广播通道容量（条目数）。
+///
+/// 所有 job 类型（sync / scan / integrity-check）共享同一缺省值——之前各模块自定义
+/// 副本曾导致调整时遗漏；现统一在此处 SSOT。
+pub const DEFAULT_CHANNEL_CAPACITY: usize = 1000;
+
 #[derive(Clone)]
 pub struct BroadcastForwarder<T> {
     buffer: usize,

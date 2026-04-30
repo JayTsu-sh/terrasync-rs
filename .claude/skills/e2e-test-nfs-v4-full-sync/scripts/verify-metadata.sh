@@ -6,8 +6,8 @@ set -e
 
 BASE="/export/nfsv4"
 CLICKHOUSE_HOST="192.168.50.173:8123"
-TABLE="base_nfs_v4_full_sync_dst"
-STATE_TABLE="state_nfs_v4_full_sync_dst"
+TABLE="base_nfs_v4_full_sync"
+STATE_TABLE="state_nfs_v4_full_sync"
 
 # 获取 scan_state (current_state)
 STATE=$(curl -s "http://${CLICKHOUSE_HOST}/?query=SELECT+scan_state+FROM+default.${STATE_TABLE}+FINAL+WHERE+id%3D1+FORMAT+TabSeparated")

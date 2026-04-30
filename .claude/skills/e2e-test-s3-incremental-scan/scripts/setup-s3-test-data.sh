@@ -14,6 +14,10 @@ MC_ALIAS="ts3"
 # 配置 mc alias
 mc alias set "$MC_ALIAS" "$S3_HOST" "$S3_AK" "$S3_SK" --api S3v4
 
+# 确保 bucket 存在（幂等：已存在时静默跳过）
+mc mb --ignore-existing "${MC_ALIAS}/${S3_BUCKET}" 2>/dev/null || true
+echo "Bucket ensured: ${MC_ALIAS}/${S3_BUCKET}"
+
 # 清理已有数据
 mc rm --recursive --force "${MC_ALIAS}/${S3_BUCKET}/${S3_PREFIX}/" 2>/dev/null || true
 echo "Cleaned existing data"
@@ -63,7 +67,7 @@ mc mirror --overwrite "$BASE/" "${MC_ALIAS}/${S3_BUCKET}/${S3_PREFIX}/"
 # 清理本地临时目录
 rm -rf "$TMPDIR"
 
-# 验证 S3 上的文件数
+# 验证 S3 上的文件数（仅普通对象，排除目录 marker）
 S3_FILES=$(mc find "${MC_ALIAS}/${S3_BUCKET}/${S3_PREFIX}/" --type f 2>/dev/null | wc -l)
 echo ""
 echo "=== S3 verification ==="

@@ -27,6 +27,7 @@ def _cleanup(a, ch_host, test_dir):
 
 
 def run(env=None):
+    os.chdir(_PROJECT_ROOT)
     start = time.monotonic()
     cfg = envmod.load(env)
     envmod.require(cfg, "CLICKHOUSE_HOST")

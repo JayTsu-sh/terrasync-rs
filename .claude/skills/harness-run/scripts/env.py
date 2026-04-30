@@ -32,6 +32,15 @@ def load(env_dict=None):
             _parse(candidate, config)
             break
 
+    # 从 S3_*_HOST (ip:port) 派生 S3_*_IP（端口不覆盖，保留脚本默认值 39000）
+    for prefix in ("S3_SOURCE", "S3_DEST"):
+        host_key = f"{prefix}_HOST"
+        ip_key = f"{prefix}_IP"
+        if host_key in config and ip_key not in config:
+            host = config[host_key]
+            ip = host.split(":")[0] if ":" in host else host
+            config.setdefault(ip_key, ip)
+
     if env_dict:
         config.update({k: v for k, v in env_dict.items() if v is not None})
     return config

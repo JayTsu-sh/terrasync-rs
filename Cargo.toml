@@ -89,7 +89,6 @@ serial_test = "3.4.0"
 
 [patch.crates-io]
 nfs-rs = { git = "https://github.com/JayTsu-sh/nfs-rs.git" }
-smb = { git = "https://github.com/JayTsu-sh/smb-rs.git" }
 
 [lints]
 workspace = true

@@ -28,6 +28,11 @@ mc alias set "$MC_ALIAS" "http://${S3_HOST}" "$S3_AK" "$S3_SK" --api S3v4 >/dev/
 echo "=== Creating S3 versioned test data ==="
 echo "Bucket: ${BUCKET}, Prefix: ${PREFIX}"
 
+# ─── 清理：删除 prefix 下所有版本（含 delete markers），保证幂等 ───
+# `mc rm --recursive --force` 仅创建 delete marker；版本桶必须用 `--versions` 物理清除全部历史。
+echo "=== Cleaning all object versions under prefix ==="
+mc rm --recursive --force --versions "${MC_ALIAS}/${BUCKET}/${PREFIX}/" 2>/dev/null || true
+
 # ─── 上传基础 9 个 key（第 1 版本）───
 # 3个一级目录 × 3个二级目录 × 1个文件 = 9个 key
 echo "=== Uploading base 9 keys (v1) ==="
@@ -56,7 +61,7 @@ echo ""
 echo "=== Verifying versioned object counts ==="
 
 TOTAL=$(mc ls --versions "${MC_ALIAS}/${BUCKET}/${PREFIX}/" --recursive 2>/dev/null | wc -l)
-DELETE_MARKERS=$(mc ls --versions "${MC_ALIAS}/${BUCKET}/${PREFIX}/" --recursive 2>/dev/null | grep -c "\[DEL\]" || true)
+DELETE_MARKERS=$(mc ls --versions "${MC_ALIAS}/${BUCKET}/${PREFIX}/" --recursive 2>/dev/null | grep -cE "\[DEL\]| DEL " || true)
 LATEST_NON_DELETE=$((TOTAL - DELETE_MARKERS - 3))  # 9 base - 2 deleted + 3 v2 = 10, latest = 9 - 2(deleted) = 7
 
 echo "Total objects (all versions): $TOTAL"

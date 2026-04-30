@@ -6,6 +6,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 _SKILL_DIR = Path(__file__).parent.parent
+_PROJECT_ROOT = _SKILL_DIR.parent.parent.parent
 _HARNESS = _SKILL_DIR.parent / "harness-run" / "scripts"
 sys.path.insert(0, str(_HARNESS))
 import env as envmod
@@ -45,7 +46,9 @@ def _mc_rm(a, ip, bkt, cfg, port_key="S3_SOURCE_PORT"):
     try:
         a.ssh_exec(ip, f"mc alias set ts3 http://localhost:{port} {ak} {sk} --api s3v4 2>/dev/null; "
                        f"mc rm --recursive --force ts3/{bkt}/test-data/ 2>/dev/null || true")
-    except Exception: pass
+    except Exception as e:
+
+        print(f"⚠ cleanup warning: {e}", flush=True)
 
 
 def _drop_ic_tables(a, ch_host):
@@ -53,7 +56,7 @@ def _drop_ic_tables(a, ch_host):
         f"SELECT name FROM system.tables WHERE database='default' "
         f"AND name LIKE '%{SANITIZED}%' FORMAT TabSeparated")
     for t in tables.strip().splitlines():
-        if t.strip(): a.clickhouse_query(ch_host, f"DROP TABLE IF EXISTS default.{t.strip()}")
+        if t.strip(): a.clickhouse_execute(ch_host, f"DROP TABLE IF EXISTS default.{t.strip()}")
 
 
 def _ic(binary, config, src_url, dst_url, *args, timeout=300):
@@ -84,11 +87,14 @@ def _cleanup(a, src_ip, dest_ip, ch_host, cfg):
         ]
         for f in as_completed(futs):
             try: f.result()
-            except Exception: pass
+            except Exception as e:
+
+                print(f"⚠ cleanup warning: {e}", flush=True)
     a.run_shell_quiet("rm -rf target/debug/logs/*")
 
 
 def run(env=None):
+    os.chdir(_PROJECT_ROOT)
     start = time.monotonic()
     cfg = envmod.load(env)
     envmod.require(cfg, "S3_SOURCE_IP", "S3_DEST_IP", "CLICKHOUSE_HOST", "S3_ACCESS_KEY", "S3_SECRET_KEY")
@@ -140,7 +146,9 @@ def run(env=None):
         a.ssh_exec(dest_ip,
                    f"mc alias set ts3d http://localhost:{port} {ak} {sk} --api s3v4 2>/dev/null; "
                    f"echo 'tampered-s3-content' | mc pipe ts3d/{dst_bkt}/test-data/d1/d1_1/file1.txt")
-    except Exception: pass
+    except Exception as e:
+
+        print(f"⚠ cleanup warning: {e}", flush=True)
 
     r3 = _ic(binary, config, src_url, dst_url, "--id", f"{IC_JOB_ID}-mismatch")
     results.append(_check_ic(r3.stdout + r3.stderr, "detects_mismatch", False, min_mm=1))
@@ -148,7 +156,9 @@ def run(env=None):
     # 删除目标端对象
     try:
         a.ssh_exec(dest_ip, f"mc rm ts3d/{dst_bkt}/test-data/d2/file1.txt 2>/dev/null || true")
-    except Exception: pass
+    except Exception as e:
+
+        print(f"⚠ cleanup warning: {e}", flush=True)
 
     r4 = _ic(binary, config, src_url, dst_url, "--id", f"{IC_JOB_ID}-missing")
     results.append(_check_ic(r4.stdout + r4.stderr, "detects_missing", False, min_mm=1, min_ms=1))

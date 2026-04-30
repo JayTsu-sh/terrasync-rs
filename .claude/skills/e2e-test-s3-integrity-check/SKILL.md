@@ -142,7 +142,7 @@ Use the Bash tool locally (timeout=120000):
 ### 2b. 目标端 mc 验证
 
 ```bash
-mc find ts3/{DST_BUCKET}/test-data/ --type f | wc -l
+mc find ts3/{DST_BUCKET}/test-data/ | wc -l
 ```
 
 Expected: `117`。

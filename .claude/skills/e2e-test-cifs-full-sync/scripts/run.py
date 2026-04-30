@@ -53,7 +53,7 @@ def _drop_tables(a, ch_host):
         f"AND name LIKE '%{SANITIZED}%' FORMAT TabSeparated")
     for t in tables.strip().splitlines():
         if t.strip():
-            a.clickhouse_query(ch_host, f"DROP TABLE IF EXISTS default.{t.strip()}")
+            a.clickhouse_execute(ch_host, f"DROP TABLE IF EXISTS default.{t.strip()}")
 
 
 def _cleanup(a, cfg):
@@ -70,11 +70,13 @@ def _cleanup(a, cfg):
         ]
         for f in as_completed(futs):
             try: f.result()
-            except Exception: pass
+            except Exception as e:
+                print(f"⚠ cleanup warning: {e}", flush=True)
     a.run_shell_quiet("rm -rf target/debug/logs/*")
 
 
 def run(env=None):
+    os.chdir(_PROJECT_ROOT)
     start = time.monotonic()
     cfg = envmod.load(env)
     envmod.require(cfg, "CIFS_SOURCE_HOST", "CIFS_DEST_HOST", "CLICKHOUSE_HOST")

@@ -45,25 +45,22 @@ use transport::traits::{ReceiverTransport, SenderTransport};
 use utils::app_config::AppConfig;
 
 // 内部模块
-use crate::broadcast::BroadcastForwarder;
+use crate::broadcast::{BroadcastForwarder, DEFAULT_CHANNEL_CAPACITY};
 use crate::config::{JobType, SyncJobConfig, initialize_consumer_config, initialize_scan_config};
 use crate::consumer::ConsumerManager;
 use crate::consumer::stats::DirectoryMetadataProgressBar;
 use crate::error::{AppError, Result};
+#[cfg(feature = "license")]
+use crate::integrity_check::verify_storage_time;
 use crate::receiver::{ReceiverConfig, process_entry_on_receiver};
 use crate::scan::{ScanType, batch_processing_to_generate_message, determine_scan_type};
 use crate::sender::{SenderWorkerConfig, sender_worker};
 #[cfg(windows)]
 use crate::sync::check_admin_privileges;
-#[cfg(feature = "license")]
-use crate::sync::verify_storage_time;
 use crate::sync::{
     StoragePair, parse_size, process_entry, process_metadata_only_entry, process_rename_entry, process_versioned_entry,
 };
 use crate::{dir_walker, tar_pack};
-
-/// 广播通道容量
-const BROADCAST_CHANNEL_CAPACITY: usize = 1000;
 
 /// 大文件日志阈值（512 MiB）
 const LARGE_FILE_LOG_THRESHOLD: u64 = 512 * 1024 * 1024;
@@ -298,7 +295,7 @@ impl SyncOrchestrator {
             .map_err(AppError::DatabaseError)?;
 
         // ── 4. 广播器 + 消费者 ──
-        let mut broadcaster = BroadcastForwarder::new(BROADCAST_CHANNEL_CAPACITY);
+        let mut broadcaster = BroadcastForwarder::new(DEFAULT_CHANNEL_CAPACITY);
         let mut consumer_manager = ConsumerManager::new(consumer_config.as_ref()).await?;
         consumer_manager.begin_lifecycle().await;
         let consumer_handles = consumer_manager.start_consumers(&mut broadcaster).await?;
@@ -639,14 +636,14 @@ impl SyncOrchestrator {
         let bytes_tracker = consumer_manager.get_bytes_tracker().await;
 
         // ── 4.1. Phase A 广播器 + 消费者任务 ──
-        let mut broadcaster = BroadcastForwarder::new(BROADCAST_CHANNEL_CAPACITY);
+        let mut broadcaster = BroadcastForwarder::new(DEFAULT_CHANNEL_CAPACITY);
         let consumer_handles = consumer_manager.start_consumers(&mut broadcaster).await?;
 
         // ── 5. 检测广播器 + MPMC 通道 ──
         // scan workers → detect_broadcaster → dispatch_task → async_channel(MPMC) → N handler workers → broadcaster
-        let mut detect_broadcaster = BroadcastForwarder::<StorageEntryMessage>::new(BROADCAST_CHANNEL_CAPACITY);
+        let mut detect_broadcaster = BroadcastForwarder::<StorageEntryMessage>::new(DEFAULT_CHANNEL_CAPACITY);
         let mut file_op_rx = detect_broadcaster.subscribe();
-        let (work_tx, work_rx) = async_channel::bounded::<StorageEntryMessage>(BROADCAST_CHANNEL_CAPACITY);
+        let (work_tx, work_rx) = async_channel::bounded::<StorageEntryMessage>(DEFAULT_CHANNEL_CAPACITY);
 
         // ── 6. 并发度 + block_size ──
         let incremental_scan_concurrency = match app_config.database.r#type.as_str() {
@@ -1094,7 +1091,7 @@ impl SyncOrchestrator {
         // ── 19. Phase B：在 Phase A 屏障之后，起一轮新的 broadcaster + 同一组 consumer 任务 ──
         // `apply_deletions_and_renames` 只负责「检测 + 执行物理操作 + 广播结果消息」，
         // DatabaseConsumer 走 Deleted/Renamed 分支自动完成 base/incremental 表的批量写入。
-        let mut broadcaster_b = BroadcastForwarder::new(BROADCAST_CHANNEL_CAPACITY);
+        let mut broadcaster_b = BroadcastForwarder::new(DEFAULT_CHANNEL_CAPACITY);
         let phase_b_handles = consumer_manager.start_consumers(&mut broadcaster_b).await?;
 
         // dest storage 提升到 async 块外，供后续 update_directory_metadata 复用，避免二次挂载

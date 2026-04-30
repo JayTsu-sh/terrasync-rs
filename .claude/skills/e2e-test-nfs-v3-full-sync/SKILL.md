@@ -63,7 +63,7 @@ ClickHouse 表名：
 ### 0a. 清理源端 NFS 数据（SSH）
 
 ```bash
-ssh root@{SOURCE_IP} 'sudo rm -rf {NFS_EXPORT}/test-data && echo "source cleaned"'
+ssh root@{SOURCE_IP} 'sudo find {NFS_EXPORT} -mindepth 1 -maxdepth 1 -exec rm -rf {} + && echo "source cleaned"'
 ```
 
 Expected: `source cleaned`。
@@ -71,7 +71,7 @@ Expected: `source cleaned`。
 ### 0b. 清理目标端 NFS 数据（SSH）
 
 ```bash
-ssh root@{DEST_IP} 'sudo rm -rf {NFS_EXPORT}/test-data && echo "dest cleaned"'
+ssh root@{DEST_IP} 'sudo find {NFS_EXPORT} -mindepth 1 -maxdepth 1 -exec rm -rf {} + && echo "dest cleaned"'
 ```
 
 Expected: `dest cleaned`。

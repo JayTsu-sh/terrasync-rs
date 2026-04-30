@@ -6,12 +6,14 @@ CIFS 全量扫描 e2e 测试。
 """
 
 import subprocess
+import os
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 _SKILL_DIR = Path(__file__).parent.parent
+_PROJECT_ROOT = _SKILL_DIR.parent.parent.parent
 _HARNESS = _SKILL_DIR.parent / "harness-run" / "scripts"
 sys.path.insert(0, str(_HARNESS))
 import env as envmod
@@ -31,8 +33,8 @@ def _smb_rm(a, host, share, user, passwd, prefix="test-data"):
     try:
         a.run_local(["smbclient", f"//{host}/{share}", "-U", f"{user}%{passwd}",
                      "-c", f"deltree {prefix}"], timeout=30)
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"⚠ cleanup warning: {e}", flush=True)
 
 
 def _check_smbclient():
@@ -61,11 +63,13 @@ def _cleanup(a, host, ch_host, cfg):
         ]
         for f in as_completed(futs):
             try: f.result()
-            except Exception: pass
+            except Exception as e:
+                print(f"⚠ cleanup warning: {e}", flush=True)
     a.run_shell_quiet("rm -rf target/debug/logs/*")
 
 
 def run(env: dict = None) -> dict:
+    os.chdir(_PROJECT_ROOT)
     start = time.monotonic()
     cfg = envmod.load(env)
     envmod.require(cfg, "CIFS_SOURCE_HOST", "CLICKHOUSE_HOST")

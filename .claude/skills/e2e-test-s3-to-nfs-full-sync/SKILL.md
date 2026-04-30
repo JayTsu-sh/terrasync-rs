@@ -80,7 +80,7 @@ echo "source S3 cleaned"
 ### 0b. 清理 NFS 目标端（SSH）
 
 ```bash
-ssh root@{DEST_IP} 'sudo rm -rf {DEST_NFS_EXPORT}/test-data && echo "dest NFS cleaned"'
+ssh root@{DEST_IP} 'sudo find {DEST_NFS_EXPORT} -mindepth 1 -maxdepth 1 -exec rm -rf {} + && echo "dest NFS cleaned"'
 ```
 
 Expected: `dest NFS cleaned`。
@@ -148,7 +148,7 @@ OK: S3 file count verified
 ### 2b. mc 验证
 
 ```bash
-mc find ts3/{SRC_BUCKET}/test-data/ --type f | wc -l
+mc find ts3/{SRC_BUCKET}/test-data/ | wc -l
 ```
 
 Expected: `117`。

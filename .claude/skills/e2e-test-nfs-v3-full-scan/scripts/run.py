@@ -12,6 +12,7 @@ harness runner 调用：
 """
 
 import subprocess
+import os
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -19,6 +20,7 @@ from pathlib import Path
 
 # 加入 harness-run/scripts 到 path，使用共享库
 _SKILL_DIR = Path(__file__).parent.parent
+_PROJECT_ROOT = _SKILL_DIR.parent.parent.parent
 _HARNESS_SCRIPTS = _SKILL_DIR.parent / "harness-run" / "scripts"
 sys.path.insert(0, str(_HARNESS_SCRIPTS))
 
@@ -42,7 +44,7 @@ def _cleanup(a: TerrasyncAssertions, src_ip: str, ch_host: str, nfs_export: str)
     with ThreadPoolExecutor(max_workers=4) as ex:
         futs = [
             ex.submit(a.ssh_exec, src_ip,
-                      f"sudo rm -rf {nfs_export}/test-data && echo cleaned || true"),
+                      f"sudo find {nfs_export} -mindepth 1 -maxdepth 1 -exec rm -rf {{}} + && echo cleaned || true"),
             ex.submit(a.clickhouse_drop_tables, ch_host, SANITIZED_JOB_ID),
             ex.submit(a.run_shell_quiet,
                       f"find jobs -maxdepth 1 -type d -name '*{SANITIZED_JOB_ID}*' | xargs rm -rf"),
@@ -51,8 +53,8 @@ def _cleanup(a: TerrasyncAssertions, src_ip: str, ch_host: str, nfs_export: str)
         for f in as_completed(futs):
             try:
                 f.result()
-            except Exception:
-                pass  # 清理步骤 best-effort
+            except Exception as e:
+                print(f"⚠ cleanup warning: {e}", flush=True)  # 清理步骤 best-effort
 
 
 def _setup_test_data(a: TerrasyncAssertions, src_ip: str) -> AssertionResult:
@@ -193,11 +195,7 @@ def _verify_metadata(a: TerrasyncAssertions, src_ip: str) -> AssertionResult:
 # ── 公共接口 ──────────────────────────────────────────────────────────────────
 
 def run(env: dict = None) -> dict:
-    """
-    harness runner 调用入口。
-    env: harness runner 注入的配置 dict；独立运行时从 .env 加载。
-    返回: {"passed": bool, "metrics": {...}, "assertions": [...]}
-    """
+    os.chdir(_PROJECT_ROOT)
     start = time.monotonic()
     cfg = envmod.load(env)
     envmod.require(cfg, "NFS_V3_SOURCE_IP", "CLICKHOUSE_HOST")

@@ -5,6 +5,7 @@ NFS v4.1 完整性校验 e2e 测试（多场景）。
 """
 
 import re
+import os
 import subprocess
 import sys
 import time
@@ -12,6 +13,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 _SKILL_DIR = Path(__file__).parent.parent
+_PROJECT_ROOT = _SKILL_DIR.parent.parent.parent
 _HARNESS_SCRIPTS = _SKILL_DIR.parent / "harness-run" / "scripts"
 sys.path.insert(0, str(_HARNESS_SCRIPTS))
 
@@ -26,13 +28,13 @@ NFS_SERVER_PATH = _PC.EXPORT
 _TABLES_PATTERN = "nfs_v4_ic"
 
 
-def _cleanup(a, src_ip, dest_ip, ch_host, nfs_export):
+def _cleanup(a, src_ip, dest_ip, ch_host, nfs_server_path):
     with ThreadPoolExecutor(max_workers=5) as ex:
         futs = [
             ex.submit(a.ssh_exec, src_ip,
-                      f"sudo rm -rf {nfs_export}/test-data && echo ok || true"),
+                      f"sudo find {nfs_server_path} -mindepth 1 -maxdepth 1 -exec rm -rf {{}} + && echo ok || true"),
             ex.submit(a.ssh_exec, dest_ip,
-                      f"sudo rm -rf {nfs_export}/test-data && echo ok || true"),
+                      f"sudo find {nfs_server_path} -mindepth 1 -maxdepth 1 -exec rm -rf {{}} + && echo ok || true"),
             ex.submit(_drop_ic_tables, a, ch_host),
             ex.submit(a.run_shell_quiet,
                       f"find jobs -maxdepth 1 -type d -name '*{_TABLES_PATTERN}*' | xargs rm -rf"),
@@ -41,8 +43,8 @@ def _cleanup(a, src_ip, dest_ip, ch_host, nfs_export):
         for f in as_completed(futs):
             try:
                 f.result()
-            except Exception:
-                pass
+            except Exception as e:
+                print(f"⚠ cleanup warning: {e}", flush=True)
 
 
 def _drop_ic_tables(a, ch_host):
@@ -54,7 +56,7 @@ def _drop_ic_tables(a, ch_host):
     for t in tables.strip().splitlines():
         t = t.strip()
         if t:
-            a.clickhouse_query(ch_host, f"DROP TABLE IF EXISTS default.{t}")
+            a.clickhouse_execute(ch_host, f"DROP TABLE IF EXISTS default.{t}")
 
 
 def _ic(binary, config, src_url, dst_url, *extra_args, timeout=600):
@@ -84,6 +86,7 @@ def _check_ic(out, label, expect_pass, min_mismatch=0, min_missing=0):
 
 
 def run(env: dict = None) -> dict:
+    os.chdir(_PROJECT_ROOT)
     start = time.monotonic()
     cfg = envmod.load(env)
     envmod.require(cfg, "NFS_V4_SOURCE_IP", "NFS_V4_DEST_IP", "CLICKHOUSE_HOST")
@@ -91,17 +94,17 @@ def run(env: dict = None) -> dict:
     src_ip = cfg["NFS_V4_SOURCE_IP"]
     dest_ip = cfg["NFS_V4_DEST_IP"]
     ch_host = cfg["CLICKHOUSE_HOST"]
-    nfs_export = cfg.get("NFS_V4_EXPORT", NFS_SERVER_PATH)
+    nfs_server_path = cfg.get("NFS_V4_SERVER_PATH", NFS_SERVER_PATH)
     binary = cfg.get("TERRASYNC_BINARY", "./target/debug/terrasync")
     config = cfg.get("TERRASYNC_CONFIG", "examples/config.toml")
     ssh_user = cfg.get("SSH_USER", "root")
-    src_url = f"nfs://{src_ip}{nfs_export}?version=4.1"
-    dst_url = f"nfs://{dest_ip}{nfs_export}?version=4.1"
+    src_url = f"nfs://{src_ip}/?version=4.1"
+    dst_url = f"nfs://{dest_ip}/?version=4.1"
 
     a = TerrasyncAssertions(ssh_user=ssh_user)
     results = []
 
-    _cleanup(a, src_ip, dest_ip, ch_host, nfs_export)
+    _cleanup(a, src_ip, dest_ip, ch_host, nfs_server_path)
 
     # 创建测试数据
     setup_sh = _SKILL_DIR.parent / "e2e-test-nfs-v4-full-scan" / "scripts" / "setup-nfs4-test-data.sh"
@@ -124,7 +127,7 @@ def run(env: dict = None) -> dict:
         capture_output=True, text=True, timeout=900)
     if proc.returncode != 0:
         results.append(AssertionResult("sync", False, {}, {}, "✗ sync failed"))
-        _cleanup(a, src_ip, dest_ip, ch_host, nfs_export)
+        _cleanup(a, src_ip, dest_ip, ch_host, nfs_server_path)
         return build_result(results, start)
     results.append(AssertionResult("sync", True, {}, {}, "✓ initial_sync"))
 
@@ -139,18 +142,18 @@ def run(env: dict = None) -> dict:
     # 制造 Mismatch
     try:
         a.ssh_exec(dest_ip,
-                   f"echo 'tampered-v4' > {nfs_export}/test-data/d1/d1_1/file1.txt")
-    except Exception:
-        pass
+                   f"echo 'tampered-v4' > {nfs_server_path}/test-data/d1/d1_1/file1.txt")
+    except Exception as e:
+        print(f"⚠ cleanup warning: {e}", flush=True)
 
     r3 = _ic(binary, config, src_url, dst_url, "--id", f"{IC_JOB_ID}-mismatch")
     results.append(_check_ic(r3.stdout + r3.stderr, "detects_mismatch", False, min_mismatch=1))
 
     # 制造 Missing
     try:
-        a.ssh_exec(dest_ip, f"rm -f {nfs_export}/test-data/d2/file1.txt")
-    except Exception:
-        pass
+        a.ssh_exec(dest_ip, f"rm -f {nfs_server_path}/test-data/d2/file1.txt")
+    except Exception as e:
+        print(f"⚠ cleanup warning: {e}", flush=True)
 
     r4 = _ic(binary, config, src_url, dst_url, "--id", f"{IC_JOB_ID}-missing")
     results.append(_check_ic(r4.stdout + r4.stderr, "detects_missing", False,
@@ -161,9 +164,9 @@ def run(env: dict = None) -> dict:
                    "--id", f"{SYNC_JOB_ID}-fix", src_url, dst_url],
                    capture_output=True, timeout=900)
     try:
-        a.ssh_exec(dest_ip, f"chmod 777 {nfs_export}/test-data/d1/d1_1/file1.txt")
-    except Exception:
-        pass
+        a.ssh_exec(dest_ip, f"chmod 777 {nfs_server_path}/test-data/d1/d1_1/file1.txt")
+    except Exception as e:
+        print(f"⚠ cleanup warning: {e}", flush=True)
     r5 = _ic(binary, config, src_url, dst_url, "--id", f"{IC_JOB_ID}-fix", "--auto-fix")
     results.append(AssertionResult("auto_fix", r5.returncode == 0, {}, {},
                                    f"{'✓' if r5.returncode == 0 else '✗'} auto_fix"))
@@ -171,7 +174,7 @@ def run(env: dict = None) -> dict:
     r6 = _ic(binary, config, src_url, dst_url, "--id", f"{IC_JOB_ID}-verify")
     results.append(_check_ic(r6.stdout + r6.stderr, "post_fix_verify", True))
 
-    _cleanup(a, src_ip, dest_ip, ch_host, nfs_export)
+    _cleanup(a, src_ip, dest_ip, ch_host, nfs_server_path)
     return build_result(results, start)
 
 

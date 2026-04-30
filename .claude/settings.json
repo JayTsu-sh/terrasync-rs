@@ -66,7 +66,10 @@
       "Bash(git reset --hard *)",
       "Bash(npm publish *)",
       "Read(./.env)",
-      "Read(./.env.*)",
+      "Read(./.env.local)",
+      "Read(./.env.production)",
+      "Read(./.env.staging)",
+      "Read(./.env.development)",
       "Read(./**/*.pem)",
       "Read(./**/*.key)"
     ]

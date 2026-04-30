@@ -72,7 +72,7 @@ echo "S3 cleaned"
 验证：
 
 ```bash
-mc find ts3/{S3_BUCKET}/test-data/ --type f 2>/dev/null | wc -l
+mc find ts3/{S3_BUCKET}/test-data/ 2>/dev/null | wc -l
 ```
 
 Expected: `0`。
@@ -316,7 +316,7 @@ mc rm --recursive --force ts3/{S3_BUCKET}/test-data/ 2>/dev/null || true
 验证：
 
 ```bash
-mc find ts3/{S3_BUCKET}/test-data/ --type f 2>/dev/null | wc -l
+mc find ts3/{S3_BUCKET}/test-data/ 2>/dev/null | wc -l
 ```
 
 Expected: `0`。

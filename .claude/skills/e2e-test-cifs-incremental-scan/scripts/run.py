@@ -61,7 +61,8 @@ def _cleanup(a, cfg):
         ]
         for f in as_completed(futs):
             try: f.result()
-            except Exception: pass
+            except Exception as e:
+                print(f"⚠ cleanup warning: {e}", flush=True)
     a.run_shell_quiet("rm -rf target/debug/logs/*")
 
 
@@ -76,6 +77,7 @@ def _check_incr_stats(stdout, expected):
 
 
 def run(env=None):
+    os.chdir(_PROJECT_ROOT)
     start = time.monotonic()
     cfg = envmod.load(env)
     envmod.require(cfg, "CIFS_SOURCE_HOST", "CLICKHOUSE_HOST")
