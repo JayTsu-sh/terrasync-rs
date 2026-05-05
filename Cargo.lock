@@ -1939,6 +1939,7 @@ checksum = "d7a1e2f27636f116493b8b860f5546edb47c8d8f8ea73e1d2a20be88e28d1fea"
 [[package]]
 name = "data-mover"
 version = "0.2.0"
+source = "git+https://github.com/JayTsu-sh/data-mover-rs.git#b1b9db194bf18893f21ed2d4cb26f44163c27a23"
 dependencies = [
  "arc-swap",
  "async-channel",

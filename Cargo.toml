@@ -89,9 +89,7 @@ serial_test = "3.4.0"
 
 [patch.crates-io]
 nfs-rs = { git = "https://github.com/JayTsu-sh/nfs-rs.git" }
-
-[patch."https://github.com/JayTsu-sh/data-mover-rs.git"]
-data-mover = { path = "/root/rust/github/data-mover-rs" }
+data-mover = { git = "https://github.com/JayTsu-sh/data-mover-rs.git" }
 
 [lints]
 workspace = true
