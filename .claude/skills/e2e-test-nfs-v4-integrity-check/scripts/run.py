@@ -18,7 +18,7 @@ _HARNESS_SCRIPTS = _SKILL_DIR.parent / "harness-run" / "scripts"
 sys.path.insert(0, str(_HARNESS_SCRIPTS))
 
 import env as envmod
-from assertions import AssertionResult, TerrasyncAssertions, build_result
+from assertions import AssertionResult, TerrasyncAssertions, build_result, run_terrasync_timed
 from protocol_constants import NfsV4 as _PC
 
 SYNC_JOB_ID = "nfs-v4-ic-sync"
@@ -60,8 +60,7 @@ def _drop_ic_tables(a, ch_host):
 
 
 def _ic(binary, config, src_url, dst_url, *extra_args, timeout=600):
-    return subprocess.run(
-        [binary, "-c", config, "-l", "trace", "integrity-check",
+    return run_terrasync_timed([binary, "-c", config, "-l", "trace", "integrity-check",
          src_url, dst_url, *extra_args],
         capture_output=True, text=True, timeout=timeout)
 
@@ -121,8 +120,7 @@ def run(env: dict = None) -> dict:
         return build_result(results, start)
 
     # Sync 到目标端
-    proc = subprocess.run(
-        [binary, "-c", config, "-l", "trace", "sync",
+    proc = run_terrasync_timed([binary, "-c", config, "-l", "trace", "sync",
          "--id", SYNC_JOB_ID, src_url, dst_url],
         capture_output=True, text=True, timeout=900)
     if proc.returncode != 0:
@@ -160,7 +158,7 @@ def run(env: dict = None) -> dict:
                              min_mismatch=1, min_missing=1))
 
     # Auto-Fix：先恢复再修改属性再 fix
-    subprocess.run([binary, "-c", config, "-l", "trace", "sync",
+    run_terrasync_timed([binary, "-c", config, "-l", "trace", "sync",
                    "--id", f"{SYNC_JOB_ID}-fix", src_url, dst_url],
                    capture_output=True, timeout=900)
     try:

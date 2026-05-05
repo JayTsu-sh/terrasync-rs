@@ -121,7 +121,7 @@ Expected: 无输出（空）。
 ## Step 1: 上传测试脚本（SOURCE_IP）
 
 ```bash
-scp .claude/skills/e2e-test-nfs-v3/scripts/setup-test-data.sh root@{SOURCE_IP}:/tmp/setup-test-data.sh
+scp .claude/skills/_shared/nfs-v3/setup-test-data.sh root@{SOURCE_IP}:/tmp/setup-test-data.sh
 ```
 
 Expected: 无错误输出，scp 退出码为 0。

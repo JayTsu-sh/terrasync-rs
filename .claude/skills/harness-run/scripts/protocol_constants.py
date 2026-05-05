@@ -35,16 +35,18 @@ class NfsV4:
 
 
 class Cifs:
-    """CIFS/SMB 协议测试数据集常量。CIFS 无 symlink。"""
+    """CIFS/SMB 协议测试数据集常量。CIFS 无 symlink。
+    注：CIFS scan 与 S3 一样不把 SMB URL 根作为目录条目计数（只数 3+9+27=39 子目录）。
+    """
     SHARE = "testshare"
     # 基线
-    BASELINE_DIRS  = 40
+    BASELINE_DIRS  = 39
     BASELINE_FILES = 117
-    BASELINE_TOTAL = 157   # 40+117
+    BASELINE_TOTAL = 156   # 39+117
     # 变更后
-    POST_DIRS  = 41
+    POST_DIRS  = 40
     POST_FILES = 115
-    POST_TOTAL = 156       # 41+115
+    POST_TOTAL = 155       # 40+115
 
 
 class S3:

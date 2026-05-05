@@ -18,7 +18,7 @@ _HARNESS_SCRIPTS = _SKILL_DIR.parent / "harness-run" / "scripts"
 sys.path.insert(0, str(_HARNESS_SCRIPTS))
 
 import env as envmod
-from assertions import AssertionResult, TerrasyncAssertions, build_result
+from assertions import AssertionResult, TerrasyncAssertions, build_result, run_terrasync_timed
 from protocol_constants import NfsV3 as _PC
 
 SYNC_JOB_ID = "nfs-v3-incr-sync"
@@ -57,7 +57,7 @@ def _cleanup(a, src_ip, dest_ip, ch_host, nfs_export):
 
 
 def _terrasync(binary, config, *args, timeout=600):
-    return subprocess.run([binary, "-c", config, "-l", "trace", *args],
+    return run_terrasync_timed([binary, "-c", config, "-l", "trace", *args],
                          capture_output=True, text=True, timeout=timeout)
 
 
@@ -114,7 +114,7 @@ def run(env: dict = None) -> dict:
     _cleanup(a, src_ip, dest_ip, ch_host, nfs_export)
 
     # Step 1：创建基线数据
-    setup_sh = _SKILL_DIR.parent / "e2e-test-nfs-v3" / "scripts" / "setup-test-data.sh"
+    setup_sh = _SKILL_DIR.parent / "_shared" / "nfs-v3" / "setup-test-data.sh"
     if not setup_sh.exists():
         results.append(AssertionResult("setup", False, {}, {},
                                        f"✗ setup: setup-test-data.sh not found"))

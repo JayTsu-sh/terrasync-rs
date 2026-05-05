@@ -10,7 +10,7 @@ _PROJECT_ROOT = _SKILL_DIR.parent.parent.parent
 _HARNESS = _SKILL_DIR.parent / "harness-run" / "scripts"
 sys.path.insert(0, str(_HARNESS))
 import env as envmod
-from assertions import AssertionResult, TerrasyncAssertions, build_result
+from assertions import AssertionResult, TerrasyncAssertions, build_result, run_terrasync_timed
 from protocol_constants import S3 as _PC
 
 SYNC_JOB_ID = "s3-incr-sync"
@@ -101,7 +101,7 @@ def run(env=None):
     if not ok: return build_result(results, start)
 
     # 全量 Sync
-    p = subprocess.run([binary, "-c", config, "-l", "trace", "sync", "--id", SYNC_JOB_ID, src_url, dst_url],
+    p = run_terrasync_timed([binary, "-c", config, "-l", "trace", "sync", "--id", SYNC_JOB_ID, src_url, dst_url],
                        capture_output=True, text=True, timeout=600)
     if p.returncode != 0:
         results.append(AssertionResult("full_sync", False, {}, {}, "✗ full_sync failed"))
@@ -124,20 +124,20 @@ def run(env=None):
     if not ok2: _cleanup(a, src_ip, dest_ip, ch_host, cfg); return build_result(results, start)
 
     # 增量 Sync
-    p2 = subprocess.run([binary, "-c", config, "-l", "trace", "sync", "--id", SYNC_JOB_ID, src_url, dst_url],
+    p2 = run_terrasync_timed([binary, "-c", config, "-l", "trace", "sync", "--id", SYNC_JOB_ID, src_url, dst_url],
                         capture_output=True, text=True, timeout=600)
     incr_out = p2.stdout + p2.stderr
     post = {"dirs": POST_DIRS, "files": POST_FILES}
     results.append(a.check_cli_scan_output(incr_out, post))
 
     # 验证目标端
-    p3 = subprocess.run([binary, "-c", config, "-l", "trace", "scan", "--id", DST_SCAN_JOB_ID, dst_url],
+    p3 = run_terrasync_timed([binary, "-c", config, "-l", "trace", "scan", "--id", DST_SCAN_JOB_ID, dst_url],
                         capture_output=True, text=True, timeout=300)
     results.append(a.check_cli_scan_output(p3.stdout + p3.stderr, post))
     results.append(a.check_clickhouse_counts(ch_host, f"base_{SANITIZED}_dst", post))
 
     # Integrity Check
-    p4 = subprocess.run([binary, "-c", config, "-l", "trace", "integrity-check", src_url, dst_url, "--quick"],
+    p4 = run_terrasync_timed([binary, "-c", config, "-l", "trace", "integrity-check", src_url, dst_url, "--quick"],
                         capture_output=True, text=True, timeout=300)
     ok4 = p4.returncode == 0 and "All Passed" in (p4.stdout + p4.stderr)
     results.append(AssertionResult("integrity_quick", ok4, {}, {}, f"{'✓' if ok4 else '✗'} integrity_quick"))

@@ -9,7 +9,7 @@ _PROJECT_ROOT = _SKILL_DIR.parent.parent.parent
 _HARNESS = _SKILL_DIR.parent / "harness-run" / "scripts"
 sys.path.insert(0, str(_HARNESS))
 import env as envmod
-from assertions import AssertionResult, TerrasyncAssertions, build_result
+from assertions import AssertionResult, TerrasyncAssertions, build_result, run_terrasync_timed
 
 JOB_ID = "s3-ver-full-scan"
 SANITIZED = "s3_ver_full_scan"
@@ -115,7 +115,7 @@ def run(env=None):
                                    f"{'✓' if ok else '✗'} versioned_test_data"))
 
     # 全量扫描（versioned S3）
-    proc = subprocess.run([binary, "-c", config, "-l", "trace", "scan", "--id", JOB_ID, src_url],
+    proc = run_terrasync_timed([binary, "-c", config, "-l", "trace", "scan", "--id", JOB_ID, src_url],
                           capture_output=True, text=True, timeout=300)
     scan_out = proc.stdout + proc.stderr
     scan_ok = proc.returncode == 0

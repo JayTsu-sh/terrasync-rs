@@ -13,10 +13,11 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 _SKILL_DIR = Path(__file__).parent.parent
+_PROJECT_ROOT = _SKILL_DIR.parent.parent.parent
 _HARNESS = _SKILL_DIR.parent / "harness-run" / "scripts"
 sys.path.insert(0, str(_HARNESS))
 import env as envmod
-from assertions import AssertionResult, TerrasyncAssertions, build_result
+from assertions import AssertionResult, TerrasyncAssertions, build_result, run_terrasync_timed
 from protocol_constants import Cifs as _PC
 
 SYNC_JOB_ID = "cifs-full-sync"
@@ -109,8 +110,13 @@ def run(env=None):
                                    f"{'✓' if setup_ok else '✗'} cifs_setup: {p.stderr[-200:] if not setup_ok else ''}"))
     if not setup_ok: return build_result(results, start)
 
+    # 清理目标遗留 test-data（terrasync sync 应能自动创建目标目录，无需预创建）
+    subprocess.run(["smbclient", f"//{dst}/{share}", "-U", f"{user}%{passwd}",
+                    "-c", "deltree test-data"],
+                   capture_output=True, timeout=30)
+
     # 全量 Sync
-    proc = subprocess.run([binary, "-c", config, "-l", "trace", "sync",
+    proc = run_terrasync_timed([binary, "-c", config, "-l", "trace", "sync",
                           "--id", SYNC_JOB_ID, src_url, dst_url],
                          capture_output=True, text=True, timeout=600)
     sync_out = proc.stdout + proc.stderr
@@ -123,13 +129,13 @@ def run(env=None):
     results.append(a.check_clickhouse_counts(ch_host, f"base_{SANITIZED}", exp))
 
     # 目标端扫描验证
-    proc2 = subprocess.run([binary, "-c", config, "-l", "trace", "scan",
+    proc2 = run_terrasync_timed([binary, "-c", config, "-l", "trace", "scan",
                            "--id", DST_SCAN_JOB_ID, dst_url],
                           capture_output=True, text=True, timeout=300)
     results.append(a.check_cli_scan_output(proc2.stdout + proc2.stderr, exp))
 
     # Integrity Check
-    proc3 = subprocess.run([binary, "-c", config, "-l", "trace", "integrity-check",
+    proc3 = run_terrasync_timed([binary, "-c", config, "-l", "trace", "integrity-check",
                            src_url, dst_url, "--quick"],
                           capture_output=True, text=True, timeout=300)
     ok = proc3.returncode == 0 and "All Passed" in (proc3.stdout + proc3.stderr)

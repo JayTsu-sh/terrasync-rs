@@ -9,7 +9,7 @@ _PROJECT_ROOT = _SKILL_DIR.parent.parent.parent
 _HARNESS = _SKILL_DIR.parent / "harness-run" / "scripts"
 sys.path.insert(0, str(_HARNESS))
 import env as envmod
-from assertions import AssertionResult, TerrasyncAssertions, build_result
+from assertions import AssertionResult, TerrasyncAssertions, build_result, run_terrasync_timed
 
 JOB_ID = "s3-ver-incr-scan"
 SANITIZED = "s3_ver_incr_scan"
@@ -102,7 +102,7 @@ def run(env=None):
     results.append(AssertionResult("setup_data", True, {}, {}, "✓ versioned test data uploaded"))
 
     # 全量扫描建基线
-    p1 = subprocess.run([binary, "-c", config, "-l", "trace", "scan", "--id", JOB_ID, src_url],
+    p1 = run_terrasync_timed([binary, "-c", config, "-l", "trace", "scan", "--id", JOB_ID, src_url],
                         capture_output=True, text=True, timeout=300)
     ok1 = p1.returncode == 0
     results.append(AssertionResult("full_scan", ok1, {}, {}, f"{'✓' if ok1 else '✗'} full_scan"))
@@ -131,7 +131,7 @@ def run(env=None):
             if os.path.exists(tmp2): os.unlink(tmp2)
 
     # 增量扫描
-    p2 = subprocess.run([binary, "-c", config, "-l", "trace", "scan", "--id", JOB_ID, src_url],
+    p2 = run_terrasync_timed([binary, "-c", config, "-l", "trace", "scan", "--id", JOB_ID, src_url],
                         capture_output=True, text=True, timeout=300)
     ok2 = p2.returncode == 0
     results.append(AssertionResult("incr_scan", ok2, {}, {}, f"{'✓' if ok2 else '✗'} incr_scan"))

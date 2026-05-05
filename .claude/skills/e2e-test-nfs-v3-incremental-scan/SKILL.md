@@ -108,7 +108,7 @@ Expected: 无输出（空）。
 复用 e2e-test-nfs-v3 的 setup-test-data.sh：
 
 ```bash
-scp .claude/skills/e2e-test-nfs-v3/scripts/setup-test-data.sh root@{SOURCE_IP}:/tmp/setup-test-data.sh
+scp .claude/skills/_shared/nfs-v3/setup-test-data.sh root@{SOURCE_IP}:/tmp/setup-test-data.sh
 ```
 
 Expected: 无错误输出，scp 退出码为 0。

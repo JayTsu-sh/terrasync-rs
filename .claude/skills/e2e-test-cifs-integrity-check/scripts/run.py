@@ -13,10 +13,11 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 _SKILL_DIR = Path(__file__).parent.parent
+_PROJECT_ROOT = _SKILL_DIR.parent.parent.parent
 _HARNESS = _SKILL_DIR.parent / "harness-run" / "scripts"
 sys.path.insert(0, str(_HARNESS))
 import env as envmod
-from assertions import AssertionResult, TerrasyncAssertions, build_result
+from assertions import AssertionResult, TerrasyncAssertions, build_result, run_terrasync_timed
 from protocol_constants import Cifs as _PC
 
 SYNC_JOB_ID = "cifs-ic-sync"
@@ -75,7 +76,7 @@ def _cleanup(a, cfg):
 
 
 def _ic(binary, config, src_url, dst_url, *args, timeout=300):
-    return subprocess.run([binary, "-c", config, "-l", "trace", "integrity-check",
+    return run_terrasync_timed([binary, "-c", config, "-l", "trace", "integrity-check",
                           src_url, dst_url, *args],
                          capture_output=True, text=True, timeout=timeout)
 
@@ -129,7 +130,7 @@ def run(env=None):
     if not setup_ok: return build_result(results, start)
 
     # Sync 建基线
-    proc = subprocess.run([binary, "-c", config, "-l", "trace", "sync",
+    proc = run_terrasync_timed([binary, "-c", config, "-l", "trace", "sync",
                           "--id", SYNC_JOB_ID, src_url, dst_url],
                          capture_output=True, text=True, timeout=600)
     if proc.returncode != 0:

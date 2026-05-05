@@ -17,7 +17,7 @@ _HARNESS_SCRIPTS = _SKILL_DIR.parent / "harness-run" / "scripts"
 sys.path.insert(0, str(_HARNESS_SCRIPTS))
 
 import env as envmod
-from assertions import AssertionResult, TerrasyncAssertions, build_result
+from assertions import AssertionResult, TerrasyncAssertions, build_result, run_terrasync_timed
 from protocol_constants import NfsV4 as _PC
 
 JOB_ID = "nfs-v4-full-sync"
@@ -91,8 +91,7 @@ def run(env: dict = None) -> dict:
     if not setup_ok:
         return build_result(results, start)
 
-    proc = subprocess.run(
-        [binary, "-c", config, "-l", "trace", "sync", "--id", JOB_ID, src_url, dst_url],
+    proc = run_terrasync_timed([binary, "-c", config, "-l", "trace", "sync", "--id", JOB_ID, src_url, dst_url],
         capture_output=True, text=True, timeout=600,
     )
     sync_out = proc.stdout + proc.stderr
@@ -126,8 +125,7 @@ def run(env: dict = None) -> dict:
             results.append(f.result())
 
     # integrity-check 串行执行（避免与 dest_find SSH 并发导致 NFS4 server busy）
-    p = subprocess.run(
-        [binary, "-c", config, "-l", "trace", "integrity-check",
+    p = run_terrasync_timed([binary, "-c", config, "-l", "trace", "integrity-check",
          src_url, dst_url, "--quick"],
         capture_output=True, text=True, timeout=300)
     ic_out = p.stdout + p.stderr

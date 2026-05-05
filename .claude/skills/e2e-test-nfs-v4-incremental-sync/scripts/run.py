@@ -18,7 +18,7 @@ _HARNESS_SCRIPTS = _SKILL_DIR.parent / "harness-run" / "scripts"
 sys.path.insert(0, str(_HARNESS_SCRIPTS))
 
 import env as envmod
-from assertions import AssertionResult, TerrasyncAssertions, build_result
+from assertions import AssertionResult, TerrasyncAssertions, build_result, run_terrasync_timed
 from protocol_constants import NfsV4 as _PC
 
 SYNC_JOB_ID = "nfs-v4-incr-sync"
@@ -93,8 +93,7 @@ def run(env: dict = None) -> dict:
     baseline_exp = {"dirs": BASELINE_DIRS, "files": BASELINE_FILES, "symlinks": BASELINE_SYMLINKS}
 
     # 全量 Sync
-    proc = subprocess.run(
-        [binary, "-c", config, "-l", "trace", "sync",
+    proc = run_terrasync_timed([binary, "-c", config, "-l", "trace", "sync",
          "--id", SYNC_JOB_ID, src_url, dst_url],
         capture_output=True, text=True, timeout=900)
     if proc.returncode != 0:
@@ -120,8 +119,7 @@ def run(env: dict = None) -> dict:
         return build_result(results, start)
 
     # 增量 Sync
-    proc2 = subprocess.run(
-        [binary, "-c", config, "-l", "trace", "sync",
+    proc2 = run_terrasync_timed([binary, "-c", config, "-l", "trace", "sync",
          "--id", SYNC_JOB_ID, src_url, dst_url],
         capture_output=True, text=True, timeout=900)
     incr_out = proc2.stdout + proc2.stderr
@@ -129,16 +127,14 @@ def run(env: dict = None) -> dict:
     results.append(a.check_cli_scan_output(incr_out, post_exp))
 
     # 验证目标端
-    proc3 = subprocess.run(
-        [binary, "-c", config, "-l", "trace", "scan",
+    proc3 = run_terrasync_timed([binary, "-c", config, "-l", "trace", "scan",
          "--id", DST_SCAN_JOB_ID, dst_url],
         capture_output=True, text=True, timeout=300)
     results.append(a.check_cli_scan_output(proc3.stdout + proc3.stderr, post_exp))
 
     # Integrity Check
     for mode_flag, label in [(["--quick"], "quick"), ([], "full")]:
-        p = subprocess.run(
-            [binary, "-c", config, "-l", "trace", "integrity-check",
+        p = run_terrasync_timed([binary, "-c", config, "-l", "trace", "integrity-check",
              src_url, dst_url, *mode_flag],
             capture_output=True, text=True, timeout=600)
         passed = p.returncode == 0 and "All Passed" in (p.stdout + p.stderr)

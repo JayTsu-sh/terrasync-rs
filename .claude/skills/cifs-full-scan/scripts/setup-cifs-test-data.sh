@@ -60,14 +60,31 @@ echo "Local tree created: files=$FILES"
 echo "=== Cleaning existing data on CIFS ==="
 $SMB_CMD -c "deltree test-data" 2>/dev/null || true
 
-# ─── 将本地目录树以 tar 流上传到 CIFS ───
-echo "=== Uploading to CIFS via tar stream ==="
+# ─── 将本地目录树通过 smbclient mput 批量上传到 CIFS ───
+# 注意：旧版本用 tar -Tx 流式上传，但在某些 Samba/SELinux 配置下扩展属性失败导致 ACCESS_DENIED；
+# 改用 prompt OFF + recurse ON + mkdir + mput 的方式（不依赖 tar 元数据）。
+echo "=== Uploading to CIFS via smbclient mput ==="
 cd "$TMPDIR"
-tar cf - test-data | $SMB_CMD -Tx -
+
+# 一次性 mkdir 所有目录（递归模式）
+SMB_MK_CMD=""
+while IFS= read -r d; do
+  win_path="${d//\//\\}"
+  SMB_MK_CMD="${SMB_MK_CMD}mkdir \"${win_path}\"; "
+done < <(find test-data -type d | sort)
+$SMB_CMD -c "$SMB_MK_CMD" >/dev/null 2>&1 || true
+
+# 逐目录 mput 上传文件
+while IFS= read -r d; do
+  file_count=$(find "$d" -maxdepth 1 -type f | wc -l)
+  [ "$file_count" -eq 0 ] && continue
+  win_path="${d//\//\\}"
+  (cd "$d" && $SMB_CMD -D "$win_path" -c "prompt OFF; mput *.txt" 2>&1 | grep -v -E '^(putting|getting|Domain=|OS=|smb:)' || true)
+done < <(find test-data -type d | sort)
 
 # ─── 验证：通过 smbclient 列出文件数 ───
 echo "=== Verifying upload ==="
-FILE_COUNT=$($SMB_CMD -c "recurse ON; ls test-data\\" 2>/dev/null | grep -c '\.txt$' || true)
+FILE_COUNT=$($SMB_CMD -D "test-data" -c "recurse ON; ls" 2>/dev/null | grep -c '\.txt' || true)
 echo "CIFS files: $FILE_COUNT"
 
 if [ "$FILE_COUNT" -ne 117 ]; then

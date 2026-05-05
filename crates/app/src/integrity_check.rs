@@ -381,7 +381,12 @@ impl CheckContext {
             }
         };
 
-        let mismatches = collect_metadata_mismatches(entry, &dest_entry, true, !self.dest_storage.has_real_directory_objects());
+        let mismatches = collect_metadata_mismatches(
+            entry,
+            &dest_entry,
+            true,
+            !self.dest_storage.has_real_directory_objects(),
+        );
         if mismatches.is_empty() {
             debug!("Dir integrity check passed for {:?}", relative_path);
             return;
@@ -415,7 +420,12 @@ impl CheckContext {
             }
         };
 
-        let mismatches = collect_metadata_mismatches(entry, &dest_entry, false, !self.dest_storage.has_real_directory_objects());
+        let mismatches = collect_metadata_mismatches(
+            entry,
+            &dest_entry,
+            false,
+            !self.dest_storage.has_real_directory_objects(),
+        );
         if mismatches.is_empty() {
             debug!("Symlink integrity check passed for {:?}", relative_path);
             return;

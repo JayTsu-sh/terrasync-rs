@@ -17,7 +17,7 @@ _HARNESS_SCRIPTS = _SKILL_DIR.parent / "harness-run" / "scripts"
 sys.path.insert(0, str(_HARNESS_SCRIPTS))
 
 import env as envmod
-from assertions import AssertionResult, TerrasyncAssertions, build_result
+from assertions import AssertionResult, TerrasyncAssertions, build_result, run_terrasync_timed
 from protocol_constants import NfsV3 as _PC
 
 JOB_ID = "nfs-v3-full-sync"
@@ -55,7 +55,7 @@ def _cleanup(a, src_ip, dest_ip, ch_host, nfs_export):
 
 
 def _setup_data(a, src_ip):
-    setup_sh = _SKILL_DIR.parent / "e2e-test-nfs-v3" / "scripts" / "setup-test-data.sh"
+    setup_sh = _SKILL_DIR.parent / "_shared" / "nfs-v3" / "setup-test-data.sh"
     if not setup_sh.exists():
         return AssertionResult("setup_test_data", False, {}, {},
                                f"✗ setup_test_data: script not found: {setup_sh}")
@@ -91,8 +91,7 @@ def _verify_dest_find(a, dest_ip, nfs_export):
 def _run_integrity_check(binary, config, src_ip, dest_ip, nfs_export):
     src_url = f"nfs://{src_ip}{nfs_export}"
     dst_url = f"nfs://{dest_ip}{nfs_export}"
-    proc = subprocess.run(
-        [binary, "-c", config, "-l", "trace", "integrity-check",
+    proc = run_terrasync_timed([binary, "-c", config, "-l", "trace", "integrity-check",
          src_url, dst_url, "--quick"],
         capture_output=True, text=True, timeout=300,
     )
@@ -147,8 +146,7 @@ def run(env: dict = None) -> dict:
 
     src_url = f"nfs://{src_ip}{nfs_export}"
     dst_url = f"nfs://{dest_ip}{nfs_export}"
-    proc = subprocess.run(
-        [binary, "-c", config, "-l", "trace", "sync", "--id", JOB_ID, src_url, dst_url],
+    proc = run_terrasync_timed([binary, "-c", config, "-l", "trace", "sync", "--id", JOB_ID, src_url, dst_url],
         capture_output=True, text=True, timeout=600,
     )
     sync_out = proc.stdout + proc.stderr

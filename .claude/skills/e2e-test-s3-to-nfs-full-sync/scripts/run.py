@@ -16,7 +16,7 @@ _PROJECT_ROOT = _SKILL_DIR.parent.parent.parent
 _HARNESS = _SKILL_DIR.parent / "harness-run" / "scripts"
 sys.path.insert(0, str(_HARNESS))
 import env as envmod
-from assertions import AssertionResult, TerrasyncAssertions, build_result
+from assertions import AssertionResult, TerrasyncAssertions, build_result, run_terrasync_timed
 from protocol_constants import S3 as _PC, NfsV3 as _NPC
 
 SYNC_JOB_ID = "s3-to-nfs-sync"
@@ -121,8 +121,7 @@ def run(env=None):
     if not ok: return build_result(results, start)
 
     # 跨协议 Sync: S3 → NFS
-    proc = subprocess.run(
-        [binary, "-c", config, "-l", "trace", "sync",
+    proc = run_terrasync_timed([binary, "-c", config, "-l", "trace", "sync",
          "--id", SYNC_JOB_ID, s3_src_url, nfs_dst_url],
         capture_output=True, text=True, timeout=900)
     sync_out = proc.stdout + proc.stderr
@@ -134,8 +133,7 @@ def run(env=None):
     results.append(a.check_cli_sync_output(sync_out, exp))
 
     # 目标端 NFS 扫描验证
-    proc2 = subprocess.run(
-        [binary, "-c", config, "-l", "trace", "scan",
+    proc2 = run_terrasync_timed([binary, "-c", config, "-l", "trace", "scan",
          "--id", DST_SCAN_JOB_ID, nfs_dst_url],
         capture_output=True, text=True, timeout=300)
     results.append(a.check_cli_scan_output(proc2.stdout + proc2.stderr, exp))

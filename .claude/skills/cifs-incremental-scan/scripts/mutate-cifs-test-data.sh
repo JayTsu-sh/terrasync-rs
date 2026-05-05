@@ -43,14 +43,15 @@ echo "new-file-content-1" > "$TMPDIR/new_dir/new_file1.txt"
 mkdir -p "$TMPDIR/new_sub_dir"
 echo "new-file-content-sub" > "$TMPDIR/new_sub_dir/.keep"
 
-# 上传新目录到 d1/new_dir
-cd "$TMPDIR"
-tar cf - new_dir | $SMB_CMD -c "cd test-data\\d1" -Tx - 2>/dev/null
+# 上传新目录到 d1/new_dir（改用 mkdir + mput；tar -Tx 在某些 Samba/SELinux 下会失败）
+$SMB_CMD -c "mkdir test-data\\d1\\new_dir" 2>/dev/null || true
+(cd "$TMPDIR/new_dir" && $SMB_CMD -D "test-data\\d1\\new_dir" -c "prompt OFF; mput *.txt" >/dev/null 2>&1) || true
+
 # 上传新子目录到 d2/d2_1/new_sub_dir
 mkdir -p "$TMPDIR/ns/new_sub_dir"
 echo "new-file-content-sub" > "$TMPDIR/ns/new_sub_dir/new_file_sub.txt"
-cd "$TMPDIR/ns"
-tar cf - new_sub_dir | $SMB_CMD -c "cd test-data\\d2\\d2_1" -Tx - 2>/dev/null
+$SMB_CMD -c "mkdir test-data\\d2\\d2_1\\new_sub_dir" 2>/dev/null || true
+(cd "$TMPDIR/ns/new_sub_dir" && $SMB_CMD -D "test-data\\d2\\d2_1\\new_sub_dir" -c "prompt OFF; mput *.txt" >/dev/null 2>&1) || true
 echo "ADD: 2 new dirs (d1/new_dir with new_file1.txt, d2/d2_1/new_sub_dir)"
 
 # ─── ADD: 1 more new file (standalone) ───
@@ -92,7 +93,7 @@ echo ""
 
 # ─── 验证变更后文件数 ───
 echo "=== Post-mutation verification ==="
-FILE_COUNT=$($SMB_CMD -c "recurse ON; ls test-data\\" 2>/dev/null | grep -c '\.txt$' || true)
+FILE_COUNT=$($SMB_CMD -D "test-data" -c "recurse ON; ls" 2>/dev/null | grep -c '\.txt' || true)
 echo "Expected files: 115"
 echo "CIFS files: $FILE_COUNT"
 

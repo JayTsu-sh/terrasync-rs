@@ -200,6 +200,36 @@ class TerrasyncAssertions:
         )
 
 
+def run_terrasync_timed(cmd_list, *, label=None, timeout=300,
+                        capture_output=True, text=True, **kwargs):
+    """运行 terrasync CLI 命令并打印耗时。返回 subprocess.CompletedProcess。
+
+    自动从 cmd_list 中识别子命令（scan/sync/integrity-check/rm）作为 label；
+    若有 --id <name>，label 追加 id。可通过 label= 显式覆盖。
+    """
+    import time
+    if label is None:
+        sub = next(
+            (t for t in cmd_list if t in ("scan", "sync", "integrity-check", "rm")),
+            "terrasync",
+        )
+        label = sub
+        try:
+            idx = cmd_list.index("--id")
+            if idx + 1 < len(cmd_list):
+                label = f"{sub} {cmd_list[idx + 1]}"
+        except ValueError:
+            pass
+    start = time.monotonic()
+    proc = subprocess.run(
+        cmd_list, capture_output=capture_output, text=text,
+        timeout=timeout, **kwargs,
+    )
+    elapsed = round(time.monotonic() - start, 2)
+    print(f"[TS] {label}: {elapsed}s", flush=True)
+    return proc
+
+
 def build_result(results: list, start: float) -> dict:
     """构建标准化的 run() 返回 dict 并打印断言结果。"""
     import time

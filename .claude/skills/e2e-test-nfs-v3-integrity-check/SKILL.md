@@ -126,7 +126,7 @@ Expected: 编译成功，生成 `{BINARY}`，无错误输出。
 ### 2a. 上传并执行测试脚本
 
 ```bash
-scp .claude/skills/nfs-v3-e2e/scripts/setup-test-data.sh root@{SOURCE_IP}:/tmp/setup-test-data.sh
+scp .claude/skills/_shared/nfs-v3/setup-test-data.sh root@{SOURCE_IP}:/tmp/setup-test-data.sh
 ssh root@{SOURCE_IP} 'sudo bash /tmp/setup-test-data.sh'
 ```
 

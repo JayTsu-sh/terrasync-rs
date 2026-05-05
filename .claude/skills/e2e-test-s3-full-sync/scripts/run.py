@@ -17,7 +17,7 @@ _HARNESS_SCRIPTS = _SKILL_DIR.parent / "harness-run" / "scripts"
 sys.path.insert(0, str(_HARNESS_SCRIPTS))
 
 import env as envmod
-from assertions import AssertionResult, TerrasyncAssertions, build_result
+from assertions import AssertionResult, TerrasyncAssertions, build_result, run_terrasync_timed
 from protocol_constants import S3 as _PC
 
 SYNC_JOB_ID = "s3-full-sync"
@@ -138,8 +138,7 @@ def run(env: dict = None) -> dict:
         return build_result(results, start)
 
     # 全量 Sync
-    proc = subprocess.run(
-        [binary, "-c", config, "-l", "trace", "sync",
+    proc = run_terrasync_timed([binary, "-c", config, "-l", "trace", "sync",
          "--id", SYNC_JOB_ID, src_url, dst_url],
         capture_output=True, text=True, timeout=600)
     sync_out = proc.stdout + proc.stderr
@@ -153,15 +152,13 @@ def run(env: dict = None) -> dict:
     results.append(a.check_clickhouse_counts(ch_host, f"base_{SANITIZED}", exp))
 
     # 目标端扫描验证
-    proc2 = subprocess.run(
-        [binary, "-c", config, "-l", "trace", "scan",
+    proc2 = run_terrasync_timed([binary, "-c", config, "-l", "trace", "scan",
          "--id", DST_SCAN_JOB_ID, dst_url],
         capture_output=True, text=True, timeout=300)
     results.append(a.check_cli_scan_output(proc2.stdout + proc2.stderr, exp))
 
     # Integrity Check
-    proc3 = subprocess.run(
-        [binary, "-c", config, "-l", "trace", "integrity-check", src_url, dst_url, "--quick"],
+    proc3 = run_terrasync_timed([binary, "-c", config, "-l", "trace", "integrity-check", src_url, dst_url, "--quick"],
         capture_output=True, text=True, timeout=300)
     ic_out = proc3.stdout + proc3.stderr
     passed = proc3.returncode == 0 and "All Passed" in ic_out

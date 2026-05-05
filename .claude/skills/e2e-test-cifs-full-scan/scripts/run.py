@@ -17,7 +17,7 @@ _PROJECT_ROOT = _SKILL_DIR.parent.parent.parent
 _HARNESS = _SKILL_DIR.parent / "harness-run" / "scripts"
 sys.path.insert(0, str(_HARNESS))
 import env as envmod
-from assertions import AssertionResult, TerrasyncAssertions, build_result
+from assertions import AssertionResult, TerrasyncAssertions, build_result, run_terrasync_timed
 from protocol_constants import Cifs as _PC
 
 JOB_ID = "cifs-full-scan"
@@ -96,17 +96,26 @@ def run(env: dict = None) -> dict:
                                        f"✗ setup: {setup_sh} not found"))
         return build_result(results, start)
 
+    setup_env = os.environ.copy()
+    setup_env.update({
+        "CIFS_HOST": src_host,
+        "CIFS_SHARE": cfg.get("CIFS_SHARE", _PC.SHARE),
+        "CIFS_USER": cfg.get("CIFS_USER", "administrator"),
+        "CIFS_PASS": cfg.get("CIFS_PASS", ""),
+        "CIFS_PORT": cfg.get("CIFS_PORT", "445"),
+    })
     proc_setup = subprocess.run(
-        ["bash", str(setup_sh)], capture_output=True, text=True, timeout=120)
+        ["bash", str(setup_sh)], capture_output=True, text=True, timeout=120, env=setup_env)
     setup_ok = proc_setup.returncode == 0
-    results.append(AssertionResult("setup", setup_ok, {}, {},
-                                   f"{'✓' if setup_ok else '✗'} cifs_setup_data"))
+    msg = f"{'✓' if setup_ok else '✗'} cifs_setup_data"
+    if not setup_ok:
+        msg += f": {(proc_setup.stderr or proc_setup.stdout).strip()[-300:]}"
+    results.append(AssertionResult("setup", setup_ok, {}, {}, msg))
     if not setup_ok:
         return build_result(results, start)
 
     # 全量扫描
-    proc = subprocess.run(
-        [binary, "-c", config, "-l", "trace", "scan", "--id", JOB_ID, src_url],
+    proc = run_terrasync_timed([binary, "-c", config, "-l", "trace", "scan", "--id", JOB_ID, src_url],
         capture_output=True, text=True, timeout=300)
     if proc.returncode != 0:
         results.append(AssertionResult("scan_exit", False, {}, {}, "✗ scan failed"))

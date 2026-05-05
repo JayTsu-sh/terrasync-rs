@@ -18,7 +18,7 @@ _HARNESS_SCRIPTS = _SKILL_DIR.parent / "harness-run" / "scripts"
 sys.path.insert(0, str(_HARNESS_SCRIPTS))
 
 import env as envmod
-from assertions import AssertionResult, TerrasyncAssertions, build_result
+from assertions import AssertionResult, TerrasyncAssertions, build_result, run_terrasync_timed
 from protocol_constants import NfsV4 as _PC
 
 JOB_ID = "nfs-v4-full-scan"
@@ -114,9 +114,9 @@ def run(env: dict = None) -> dict:
     if not setup_r.passed:
         return build_result(results, start)
 
-    proc = subprocess.run(
+    proc = run_terrasync_timed(
         [binary, "-c", config, "-l", "trace", "scan", "--id", JOB_ID, src_url],
-        capture_output=True, text=True, timeout=300,
+        timeout=300,
     )
     scan_out = proc.stdout + proc.stderr
 

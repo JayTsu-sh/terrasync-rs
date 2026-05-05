@@ -13,7 +13,7 @@ _SKILL_DIR = Path(__file__).parent.parent
 _HARNESS = _SKILL_DIR.parent / "harness-run" / "scripts"
 sys.path.insert(0, str(_HARNESS))
 import env as envmod
-from assertions import AssertionResult, TerrasyncAssertions, build_result
+from assertions import AssertionResult, TerrasyncAssertions, build_result, run_terrasync_timed
 
 JOB_ID = "local-filter-test"
 SANITIZED = "local_filter_test"
@@ -56,8 +56,7 @@ def run(env=None):
         results.append(AssertionResult("setup", True, {}, {}, "✓ local test data created"))
 
     # 全量扫描（无过滤）
-    proc = subprocess.run(
-        [binary, "-c", config, "-l", "trace", "scan", "--id", JOB_ID, test_dir],
+    proc = run_terrasync_timed([binary, "-c", config, "-l", "trace", "scan", "--id", JOB_ID, test_dir],
         capture_output=True, text=True, timeout=120)
     scan_ok = proc.returncode == 0
     results.append(AssertionResult("scan_exit", scan_ok, {"code": 0}, {"code": proc.returncode},

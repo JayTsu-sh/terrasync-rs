@@ -19,7 +19,7 @@ _HARNESS_SCRIPTS = _SKILL_DIR.parent / "harness-run" / "scripts"
 sys.path.insert(0, str(_HARNESS_SCRIPTS))
 
 import env as envmod
-from assertions import AssertionResult, TerrasyncAssertions, build_result
+from assertions import AssertionResult, TerrasyncAssertions, build_result, run_terrasync_timed
 from protocol_constants import S3 as _PC
 
 JOB_ID = "s3-incr-scan"
@@ -121,8 +121,7 @@ def run(env: dict = None) -> dict:
         return build_result(results, start)
 
     # 全量扫描建基线
-    proc = subprocess.run(
-        [binary, "-c", config, "-l", "trace", "scan", "--id", JOB_ID, src_url],
+    proc = run_terrasync_timed([binary, "-c", config, "-l", "trace", "scan", "--id", JOB_ID, src_url],
         capture_output=True, text=True, timeout=300)
     if proc.returncode != 0:
         results.append(AssertionResult("full_scan", False, {}, {}, "✗ full_scan failed"))
@@ -156,8 +155,7 @@ def run(env: dict = None) -> dict:
         return build_result(results, start)
 
     # 增量扫描
-    proc2 = subprocess.run(
-        [binary, "-c", config, "-l", "trace", "scan", "--id", JOB_ID, src_url],
+    proc2 = run_terrasync_timed([binary, "-c", config, "-l", "trace", "scan", "--id", JOB_ID, src_url],
         capture_output=True, text=True, timeout=300)
     incr_out = proc2.stdout + proc2.stderr
     post_exp = {"dirs": POST_DIRS, "files": POST_FILES}

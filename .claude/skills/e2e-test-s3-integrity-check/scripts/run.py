@@ -10,7 +10,7 @@ _PROJECT_ROOT = _SKILL_DIR.parent.parent.parent
 _HARNESS = _SKILL_DIR.parent / "harness-run" / "scripts"
 sys.path.insert(0, str(_HARNESS))
 import env as envmod
-from assertions import AssertionResult, TerrasyncAssertions, build_result
+from assertions import AssertionResult, TerrasyncAssertions, build_result, run_terrasync_timed
 from protocol_constants import S3 as _PC
 
 SYNC_JOB_ID = "s3-ic-sync"
@@ -60,7 +60,7 @@ def _drop_ic_tables(a, ch_host):
 
 
 def _ic(binary, config, src_url, dst_url, *args, timeout=300):
-    return subprocess.run([binary, "-c", config, "-l", "trace", "integrity-check",
+    return run_terrasync_timed([binary, "-c", config, "-l", "trace", "integrity-check",
                           src_url, dst_url, *args], capture_output=True, text=True, timeout=timeout)
 
 
@@ -123,7 +123,7 @@ def run(env=None):
     if not ok: return build_result(results, start)
 
     # Sync 建基线
-    p = subprocess.run([binary, "-c", config, "-l", "trace", "sync", "--id", SYNC_JOB_ID, src_url, dst_url],
+    p = run_terrasync_timed([binary, "-c", config, "-l", "trace", "sync", "--id", SYNC_JOB_ID, src_url, dst_url],
                        capture_output=True, text=True, timeout=600)
     if p.returncode != 0:
         results.append(AssertionResult("sync", False, {}, {}, "✗ sync failed"))

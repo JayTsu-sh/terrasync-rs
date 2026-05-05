@@ -25,7 +25,7 @@ _HARNESS_SCRIPTS = _SKILL_DIR.parent / "harness-run" / "scripts"
 sys.path.insert(0, str(_HARNESS_SCRIPTS))
 
 import env as envmod
-from assertions import AssertionResult, TerrasyncAssertions, build_result
+from assertions import AssertionResult, TerrasyncAssertions, build_result, run_terrasync_timed
 from protocol_constants import NfsV3 as _PC
 
 # ── 测试常量 ──────────────────────────────────────────────────────────────────
@@ -59,7 +59,7 @@ def _cleanup(a: TerrasyncAssertions, src_ip: str, ch_host: str, nfs_export: str)
 
 def _setup_test_data(a: TerrasyncAssertions, src_ip: str) -> AssertionResult:
     """Steps 1a-1b：上传并执行 setup-test-data.sh。"""
-    setup_sh = _SKILL_DIR.parent / "e2e-test-nfs-v3" / "scripts" / "setup-test-data.sh"
+    setup_sh = _SKILL_DIR.parent / "_shared" / "nfs-v3" / "setup-test-data.sh"
     if not setup_sh.exists():
         return AssertionResult(
             "setup_test_data", False, {}, {},
@@ -226,7 +226,7 @@ def run(env: dict = None) -> dict:
         "scan", "--id", JOB_ID,
         f"nfs://{src_ip}{nfs_export}",
     ]
-    proc = subprocess.run(scan_cmd, capture_output=True, text=True, timeout=300)
+    proc = run_terrasync_timed(scan_cmd, timeout=300)
     scan_output = proc.stdout + proc.stderr
 
     if proc.returncode != 0:

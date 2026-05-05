@@ -15,10 +15,11 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 _SKILL_DIR = Path(__file__).parent.parent
+_PROJECT_ROOT = _SKILL_DIR.parent.parent.parent
 _HARNESS = _SKILL_DIR.parent / "harness-run" / "scripts"
 sys.path.insert(0, str(_HARNESS))
 import env as envmod
-from assertions import AssertionResult, TerrasyncAssertions, build_result
+from assertions import AssertionResult, TerrasyncAssertions, build_result, run_terrasync_timed
 from protocol_constants import Cifs as _PC
 
 JOB_ID = "cifs-incr-scan"
@@ -110,7 +111,7 @@ def run(env=None):
     if not setup_ok: return build_result(results, start)
 
     # 全量扫描（建基线）
-    proc = subprocess.run([binary, "-c", config, "-l", "trace", "scan",
+    proc = run_terrasync_timed([binary, "-c", config, "-l", "trace", "scan",
                           "--id", JOB_ID, cifs_url],
                          capture_output=True, text=True, timeout=300)
     if proc.returncode != 0:
@@ -133,7 +134,7 @@ def run(env=None):
         _cleanup(a, cfg); return build_result(results, start)
 
     # 增量扫描
-    proc2 = subprocess.run([binary, "-c", config, "-l", "trace", "scan",
+    proc2 = run_terrasync_timed([binary, "-c", config, "-l", "trace", "scan",
                            "--id", JOB_ID, cifs_url],
                           capture_output=True, text=True, timeout=300)
     incr_out = proc2.stdout + proc2.stderr
