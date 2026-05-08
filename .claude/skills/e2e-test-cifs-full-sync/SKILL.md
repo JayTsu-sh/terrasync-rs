@@ -45,7 +45,7 @@ description: >
 | CIFS_SHARE | `testshare` |
 | SOURCE_URL | `smb://{CIFS_USER}:{CIFS_PASSWORD}@{SOURCE_IP}/{CIFS_SHARE}/test-data` |
 | DEST_URL | `smb://{CIFS_USER}:{CIFS_PASSWORD}@{DEST_IP}/{CIFS_SHARE}/test-data` |
-| EXPECTED_DIRS | `40` |
+| EXPECTED_DIRS | `39` |
 | EXPECTED_FILES | `117` |
 
 ### Skill 常量
@@ -71,7 +71,7 @@ description: >
 | SYNC_JOB_ID | `cifs-full-sync` |
 | DST_SCAN_JOB_ID | `cifs-full-sync-dst` |
 | IC_JOB_ID | `cifs-full-sync-ic` |
-| EXPECTED_DIRS | 40 |
+| EXPECTED_DIRS | 39 |
 | EXPECTED_FILES | 117 |
 
 ClickHouse 表名：
@@ -168,7 +168,7 @@ bash .claude/skills/cifs-full-sync/scripts/setup-cifs-test-data.sh
 Expected output (last lines):
 
 ```
-Expected: dirs=40, files=117, symlinks=0
+Expected: dirs=39, files=117, symlinks=0
 CIFS files: 117
 OK: CIFS file count verified (dirs will be verified by scan)
 ```
@@ -202,7 +202,7 @@ Expected（两行，CIFS 无 symlink）：
 
 ```
 false   false   {EXPECTED_FILES}      # 普通文件 = 117
-true    false   {EXPECTED_DIRS}       # 目录 = 40
+true    false   {EXPECTED_DIRS}       # 目录 = 39
 ```
 
 **若任意计数不符，停止并调查。**
@@ -311,7 +311,7 @@ Expected：
 
 ```
 false   false   {EXPECTED_FILES}      # 普通文件 = 117
-true    false   {EXPECTED_DIRS}       # 目录 = 40
+true    false   {EXPECTED_DIRS}       # 目录 = 39
 ```
 
 **Verify 目标端 base 表计数与源端 base 表完全一致。**

@@ -45,7 +45,7 @@ description: >
 | CIFS_SHARE | `testshare` |
 | SOURCE_URL | `smb://{CIFS_USER}:{CIFS_PASSWORD}@{SOURCE_IP}/{CIFS_SHARE}/test-data` |
 | DEST_URL | `smb://{CIFS_USER}:{CIFS_PASSWORD}@{DEST_IP}/{CIFS_SHARE}/test-data` |
-| BASELINE_DIRS | `40` |
+| BASELINE_DIRS | `39` |
 | BASELINE_FILES | `117` |
 | POST_DIRS | `41` |
 | POST_FILES | `115` |
@@ -66,9 +66,9 @@ description: >
 | CLICKHOUSE_HOST | `192.168.50.173:8123` |
 | JOB_ID | `cifs-incr-scan` |
 | SANITIZED_JOB_ID | `cifs_incr_scan` |
-| BASELINE_DIRS | 40 |
+| BASELINE_DIRS | 39 |
 | BASELINE_FILES | 117 |
-| POST_MUTATE_DIRS | 41 |
+| POST_MUTATE_DIRS | 40 |
 | POST_MUTATE_FILES | 115 |
 
 ClickHouse 表名：
@@ -148,7 +148,7 @@ Expected：
 
 ```
 false   false   {BASELINE_FILES}      # 普通文件 = 117
-true    false   {BASELINE_DIRS}       # 目录 = 40
+true    false   {BASELINE_DIRS}       # 目录 = 39
 ```
 
 **若任意计数不符，停止并调查。**
@@ -193,14 +193,14 @@ Expected Incremental Statistics:
    ├─ New:          5 total | dirs      2 | files      3 | symlinks    0
    ├─ Changed:      2 total | dirs      0 | files      2 | symlinks    0
    ├─ Renamed:      5 total | dirs      1 | files      4 | symlinks    0
-   └─ Deleted:      7 total | dirs      1 | files      6 | symlinks    0
+   └─ Deleted:      6 total | dirs      1 | files      5 | symlinks    0
 ```
 
 **计数说明**（无 symlink 版本）：
 - New 5 = 2 dirs + 3 files（纯新增，fh3 不存在于 base）
 - Changed 2 = 2 files（内容变化）
 - Renamed 5 = 1 file + 1 dir 级联（dir + 3 files）
-- Deleted 7 = 1 dir + 3 files (d3_3_3) + 2 standalone files + 1 standalone file (from rename source already counted)
+- Deleted 6 = 1 dir + 3 files (d3_3_3) + 2 standalone files
 
 **注意**：具体 Deleted 计数取决于变更脚本的实际操作。请在第一次运行后根据实际输出调整。
 
@@ -223,7 +223,7 @@ Expected：
 
 ```
 false   false   {POST_MUTATE_FILES}      # 普通文件 = 115
-true    false   {POST_MUTATE_DIRS}       # 目录 = 41
+true    false   {POST_MUTATE_DIRS}       # 目录 = 40
 ```
 
 ```bash
@@ -231,7 +231,7 @@ true    false   {POST_MUTATE_DIRS}       # 目录 = 41
 curl -s "http://{CLICKHOUSE_HOST}/?query=SELECT+count(*)+FROM+default.base_cifs_incr_scan+FINAL+WHERE+current_state%3D${STATE}+FORMAT+TabSeparated"
 ```
 
-Expected: `156`（{POST_MUTATE_DIRS}+{POST_MUTATE_FILES} = 41+115，CIFS 无 symlink）。
+Expected: `155`（{POST_MUTATE_DIRS}+{POST_MUTATE_FILES} = 40+115，CIFS 无 symlink）。
 
 **若总行数不符，停止并调查。**
 
@@ -245,7 +245,7 @@ Expected（CIFS 无 symlink，有 rename）：
 
 ```
 changed false   false   2
-deleted false   false   6
+deleted false   false   5
 deleted true    false   1
 new     false   false   3
 new     true    false   2

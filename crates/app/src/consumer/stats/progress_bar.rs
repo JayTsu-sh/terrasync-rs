@@ -19,6 +19,19 @@ use crate::config::JobType;
 const DISPLAY_INTERVAL_SECS: u64 = 2;
 /// 进度信息写入日志的节流间隔（秒）
 const LOG_INTERVAL_SECS: u64 = 30;
+/// finish 检测粒度（毫秒）：每 100ms 检查一次，最坏 join 等待时间即为此值
+const FINISH_POLL_MS: u64 = 100;
+
+/// 分段等待直到 `is_finished` 返回 true 或超时。
+/// 将大 sleep 拆成 FINISH_POLL_MS 小段，大幅缩短 join 等待时间。
+fn sleep_interruptible(checks: u64, is_finished: impl Fn() -> bool) {
+    for _ in 0..checks {
+        std::thread::sleep(Duration::from_millis(FINISH_POLL_MS));
+        if is_finished() {
+            break;
+        }
+    }
+}
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 // CounterSet — 全量 / 增量计数器
@@ -357,7 +370,7 @@ impl ProgressBar {
                     break;
                 }
                 pb.display();
-                std::thread::sleep(Duration::from_secs(DISPLAY_INTERVAL_SECS));
+                sleep_interruptible(DISPLAY_INTERVAL_SECS * 1000 / FINISH_POLL_MS, || pb.pb.is_finished());
             }
         })
     }
@@ -463,16 +476,16 @@ impl DirectoryMetadataProgressBar {
     }
 
     pub fn start(&self) -> std::thread::JoinHandle<()> {
-        // 首帧立即渲染，避免短任务（空 DB 或极少目录）在首个 500ms tick 之前就 finish
+        // 首帧立即渲染，避免短任务（空 DB 或极少目录）在首个 tick 之前就 finish
         self.pb.tick();
         let progress_bar_c = self.clone();
         std::thread::spawn(move || {
             loop {
-                std::thread::sleep(Duration::from_millis(500));
                 if progress_bar_c.pb.is_finished() {
                     break;
                 }
                 progress_bar_c.pb.tick();
+                sleep_interruptible(5, || progress_bar_c.pb.is_finished());
             }
         })
     }

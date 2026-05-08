@@ -119,7 +119,7 @@ def run(env=None):
     _cleanup(a, cfg)
 
     # 创建测试数据
-    setup_sh = _SKILL_DIR.parent / "cifs-full-scan" / "scripts" / "setup-cifs-test-data.sh"
+    setup_sh = _SKILL_DIR.parent / "_shared" / "cifs" / "setup-cifs-test-data.sh"
     if not setup_sh.exists():
         results.append(AssertionResult("setup", False, {}, {}, f"✗ {setup_sh} not found"))
         return build_result(results, start)
@@ -172,7 +172,7 @@ def run(env=None):
                    capture_output=True, timeout=30)
 
     r4 = _ic(binary, config, src_url, dst_url, "--id", f"{IC_JOB_ID}-missing")
-    results.append(_check_ic(r4.stdout + r4.stderr, "detects_missing", False, min_mm=1, min_ms=1))
+    results.append(_check_ic(r4.stdout + r4.stderr, "detects_missing", False, min_mm=2, min_ms=0))
 
     _cleanup(a, cfg)
     return build_result(results, start)

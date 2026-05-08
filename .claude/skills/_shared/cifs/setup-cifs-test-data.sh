@@ -1,6 +1,6 @@
 #!/bin/bash
 # setup-cifs-test-data.sh — 通过 smbclient 在 CIFS 共享上创建 3x3x3 目录树
-# 结果：40 目录（含 test-data 根）/ 117 文件 / 0 软链接（CIFS 不支持）
+# 结果：39 目录 / 117 文件 / 0 软链接（CIFS 不支持）
 #
 # 依赖环境变量（必须提前 export）：
 #   CIFS_HOST  — CIFS 服务器 IP 或域名
@@ -89,10 +89,10 @@ echo "CIFS files: $FILE_COUNT"
 
 if [ "$FILE_COUNT" -ne 117 ]; then
   echo "ERROR: Expected 117 files, got $FILE_COUNT"
-  echo "Note: 40 dirs / 117 files / 0 symlinks (CIFS 不支持软链接)"
+  echo "Note: 39 dirs / 117 files / 0 symlinks (CIFS 不支持软链接)"
   exit 1
 fi
 
-echo "Expected: dirs=40, files=117, symlinks=0"
+echo "Expected: dirs=39, files=117, symlinks=0"
 echo "CIFS files: $FILE_COUNT"
 echo "OK: CIFS file count verified (dirs will be verified by scan)"

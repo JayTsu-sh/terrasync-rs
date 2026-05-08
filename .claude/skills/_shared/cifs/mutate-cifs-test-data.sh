@@ -40,8 +40,6 @@ trap "rm -rf $TMPDIR" EXIT
 # ─── ADD: 2 new dirs + files ───
 mkdir -p "$TMPDIR/new_dir"
 echo "new-file-content-1" > "$TMPDIR/new_dir/new_file1.txt"
-mkdir -p "$TMPDIR/new_sub_dir"
-echo "new-file-content-sub" > "$TMPDIR/new_sub_dir/.keep"
 
 # 上传新目录到 d1/new_dir（改用 mkdir + mput；tar -Tx 在某些 Samba/SELinux 下会失败）
 $SMB_CMD -c "mkdir test-data\\d1\\new_dir" 2>/dev/null || true

@@ -43,9 +43,9 @@ description: >
 | CIFS_SHARE | `testshare` |
 | SOURCE_URL | `smb://{CIFS_USER}:{CIFS_PASSWORD}@{SOURCE_IP}/{CIFS_SHARE}/test-data` |
 | DEST_URL | `smb://{CIFS_USER}:{CIFS_PASSWORD}@{DEST_IP}/{CIFS_SHARE}/test-data` |
-| BASELINE_DIRS | `40` |
+| BASELINE_DIRS | `39` |
 | BASELINE_FILES | `117` |
-| POST_DIRS | `41` |
+| POST_DIRS | `40` |
 | POST_FILES | `115` |
 
 ### Skill 常量
@@ -70,9 +70,9 @@ description: >
 | SYNC_JOB_ID | `cifs-incr-sync` |
 | DST_SCAN_JOB_ID | `cifs-incr-sync-dst` |
 | IC_JOB_ID | `cifs-incr-sync-ic` |
-| BASELINE_DIRS | 40 |
+| BASELINE_DIRS | 39 |
 | BASELINE_FILES | 117 |
-| POST_MUTATE_DIRS | 41 |
+| POST_MUTATE_DIRS | 40 |
 | POST_MUTATE_FILES | 115 |
 
 ClickHouse 表名：
@@ -155,7 +155,7 @@ bash .claude/skills/cifs-full-sync/scripts/setup-cifs-test-data.sh
 Expected output (last lines):
 
 ```
-Expected: dirs=40, files=117, symlinks=0
+Expected: dirs=39, files=117, symlinks=0
 CIFS files: 117
 OK: CIFS file count verified (dirs will be verified by scan)
 ```
@@ -174,7 +174,9 @@ Use the Bash tool locally (timeout=120000):
 
 **Verify: dirs={BASELINE_DIRS}, files={BASELINE_FILES}, symlinks=0, ERROR STATISTICS 为 0。**
 
-### 2b. ClickHouse 验证
+## Step 3: 验证全量 Sync 结果
+
+### 3a. ClickHouse 验证
 
 ```bash
 curl -s "http://{CLICKHOUSE_HOST}/?query=SELECT+is_dir,is_symlink,count(*)+FROM+default.base_cifs_incr_sync+FINAL+GROUP+BY+is_dir,is_symlink+FORMAT+TabSeparated"
@@ -184,10 +186,10 @@ Expected（两行，CIFS 无 symlink）：
 
 ```
 false   false   {BASELINE_FILES}      # 普通文件 = 117
-true    false   {BASELINE_DIRS}       # 目录 = 40
+true    false   {BASELINE_DIRS}       # 目录 = 39
 ```
 
-### 2c. 验证 file_handle 非空
+### 3b. 验证 file_handle 非空
 
 确认所有记录的 file_handle 均非空（增量扫描 Fh3 策略依赖此字段）：
 
@@ -197,7 +199,7 @@ curl -s "http://{CLICKHOUSE_HOST}/?query=SELECT+count(*)+FROM+default.base_cifs_
 
 Expected: `0`。
 
-### 2d. 目标端 smbclient 验证
+### 3c. 目标端 smbclient 验证
 
 ```bash
 FILE_COUNT=$(smbclient "//192.168.50.23/testshare" -U "terrasync%terrasync123" -c "recurse ON; ls test-data/*" 2>/dev/null | grep -c "^\s")
@@ -255,7 +257,7 @@ Expected（CIFS Fh3 模式，精确 rename 检测，无 symlink）：
    ├─ New:          5 total | dirs      2 | files      3 | symlinks    0
    ├─ Changed:      2 total | dirs      0 | files      2 | symlinks    0
    ├─ Renamed:      5 total | dirs      1 | files      4 | symlinks    0
-   └─ Deleted:      7 total | dirs      1 | files      6 | symlinks    0
+   └─ Deleted:      6 total | dirs      1 | files      5 | symlinks    0
 ```
 
 **Verify ERROR STATISTICS 为 0。**
@@ -310,7 +312,7 @@ Expected（两行）：
 
 ```
 false   false   {POST_MUTATE_FILES}      # 普通文件 = 115
-true    false   {POST_MUTATE_DIRS}       # 目录 = 41
+true    false   {POST_MUTATE_DIRS}       # 目录 = 40
 ```
 
 ---

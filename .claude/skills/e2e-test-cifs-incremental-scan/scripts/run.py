@@ -100,7 +100,7 @@ def run(env=None):
     _cleanup(a, cfg)
 
     # Setup 基线数据
-    setup_sh = _SKILL_DIR.parent / "cifs-full-scan" / "scripts" / "setup-cifs-test-data.sh"
+    setup_sh = _SKILL_DIR.parent / "_shared" / "cifs" / "setup-cifs-test-data.sh"
     if not setup_sh.exists():
         results.append(AssertionResult("setup", False, {}, {}, f"✗ {setup_sh} not found"))
         return build_result(results, start)
@@ -122,7 +122,7 @@ def run(env=None):
     results.append(a.check_clickhouse_counts(ch_host, f"base_{SANITIZED}", bl))
 
     # Mutate
-    mutate_sh = _SKILL_DIR.parent / "cifs-incremental-scan" / "scripts" / "mutate-cifs-test-data.sh"
+    mutate_sh = _SKILL_DIR.parent / "_shared" / "cifs" / "mutate-cifs-test-data.sh"
     if not mutate_sh.exists():
         results.append(AssertionResult("mutate", False, {}, {}, f"✗ {mutate_sh} not found"))
         _cleanup(a, cfg); return build_result(results, start)

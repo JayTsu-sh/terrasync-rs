@@ -45,9 +45,9 @@ description: >
 | CIFS_SHARE | `testshare` |
 | SOURCE_URL | `smb://{CIFS_USER}:{CIFS_PASSWORD}@{SOURCE_IP}/{CIFS_SHARE}/test-data` |
 | DEST_URL | `smb://{CIFS_USER}:{CIFS_PASSWORD}@{DEST_IP}/{CIFS_SHARE}/test-data` |
-| EXPECTED_DIRS | `40` |
+| EXPECTED_DIRS | `39` |
 | EXPECTED_FILES | `117` |
-| EXPECTED_TOTAL | `157` |
+| EXPECTED_TOTAL | `156` |
 
 ### Skill 常量
 | Name | Value |
@@ -65,7 +65,7 @@ description: >
 | CLICKHOUSE_HOST | `192.168.50.173:8123` |
 | JOB_ID | `cifs-full-scan` |
 | SANITIZED_JOB_ID | `cifs_full_scan` |
-| EXPECTED_DIRS | 40 |
+| EXPECTED_DIRS | 39 |
 | EXPECTED_FILES | 117 |
 
 ClickHouse 表名：
@@ -137,10 +137,10 @@ Expected: 无输出（空）。
 Use the Bash tool to run the setup script:
 
 ```bash
-bash .claude/skills/cifs-full-scan/scripts/setup-cifs-test-data.sh
+bash .claude/skills/_shared/cifs/setup-cifs-test-data.sh
 ```
 
-脚本需创建 3x3x3 目录树（无 symlink）：40 dirs / 117 files / 0 symlinks。
+脚本需创建 3x3x3 目录树（无 symlink）：39 dirs / 117 files / 0 symlinks。
 
 **Stop if the script exits non-zero.**
 
@@ -170,7 +170,7 @@ Expected（两行，CIFS 无 symlink）：
 
 ```
 false   false   {EXPECTED_FILES}      # 普通文件 = 117
-true    false   {EXPECTED_DIRS}       # 目录 = 40
+true    false   {EXPECTED_DIRS}       # 目录 = 39
 ```
 
 **若任意计数不符，停止并调查。**
@@ -198,7 +198,7 @@ Expected: STATE 非空。
 curl -s "http://{CLICKHOUSE_HOST}/?query=SELECT+count(*)+FROM+default.base_cifs_full_scan+FINAL+WHERE+current_state%3D${STATE}+FORMAT+TabSeparated"
 ```
 
-Expected: `157`（{EXPECTED_DIRS}+{EXPECTED_FILES} = 40+117，CIFS 无 symlink）。
+Expected: `156`（{EXPECTED_DIRS}+{EXPECTED_FILES} = 39+117，CIFS 无 symlink）。
 
 **若总行数不符，停止并调查。**
 

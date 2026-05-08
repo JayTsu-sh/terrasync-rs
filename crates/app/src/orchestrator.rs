@@ -37,7 +37,7 @@ use db::factory::DatabaseFactory;
 use db::traits::Database;
 use db::{self, DeletionStatus, INCREMENTAL_SCAN_TABLE_BASE_NAME};
 use tokio::sync::{Semaphore, mpsc};
-use tokio::task::JoinHandle;
+use tokio::task::{JoinHandle, JoinSet};
 use tracing::{Instrument, debug, error, info, info_span, trace, warn};
 use transport::in_process::create_in_process_pair;
 use transport::message::SenderMsg;
@@ -1411,16 +1411,37 @@ impl SyncOrchestrator {
             .instrument(span),
         );
 
+        // 并发回写目录 mtime：串行调用对 NFS/CIFS 延迟叠加明显（N 目录 × 网络延迟）
+        const DIR_META_CONCURRENCY: usize = 32;
+        let sem = Arc::new(Semaphore::new(DIR_META_CONCURRENCY));
+        let mut join_set = JoinSet::new();
+
+        // 注意：acquire_owned 在 spawn 之前 await，确保 join_set 中在飞任务数 ≤ DIR_META_CONCURRENCY
         while let Some(dir_entry) = dir_rx.recv().await {
-            trace!("Updating directory mtime for {:?}", dir_entry.get_relative_path());
-            if let Err(e) = dest_storage.set_entry_metadata(&dir_entry).await {
-                warn!(
-                    "Failed to update directory mtime for {:?}: {}",
-                    dir_entry.get_relative_path(),
-                    e
-                );
+            let Ok(permit) = sem.clone().acquire_owned().await else {
+                error!("Directory metadata semaphore unexpectedly closed");
+                break;
+            };
+            let dest = dest_storage.clone();
+            join_set.spawn(async move {
+                let _permit = permit;
+                trace!("Updating directory mtime for {:?}", dir_entry.get_relative_path());
+                if let Err(e) = dest.set_entry_metadata(&dir_entry).await {
+                    warn!(
+                        "Failed to update directory mtime for {:?}: {}",
+                        dir_entry.get_relative_path(),
+                        e
+                    );
+                }
+            });
+        }
+
+        while let Some(result) = join_set.join_next().await {
+            if let Err(e) = result {
+                error!("Directory metadata task panicked: {:?}", e);
+            } else {
+                metadata_pb.increment_dir_count();
             }
-            metadata_pb.increment_dir_count();
         }
 
         metadata_pb.finish();

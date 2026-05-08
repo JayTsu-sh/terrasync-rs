@@ -183,6 +183,29 @@ class TerrasyncAssertions:
             f"{'✓' if passed else '✗'} {name}: expected={expected}, actual={actual}"
         )
 
+    def check_incremental_stats(self, stdout: str, expected: dict) -> AssertionResult:
+        """验证增量 sync 分项统计（New/Changed/Renamed/Deleted total）。
+        expected: {"new": int, "changed": int, "renamed": int, "deleted": int}
+        """
+        found = {}
+        for key, label in [("new", "New"), ("changed", "Changed"),
+                            ("renamed", "Renamed"), ("deleted", "Deleted")]:
+            m = re.search(rf"[├└]─\s+{label}:\s+(\d+)\s+total", stdout)
+            if m:
+                found[key] = int(m.group(1))
+        if not found:
+            return AssertionResult(
+                "incremental_stats", False, expected, {},
+                "✗ incremental_stats: Incremental Statistics not found in output",
+            )
+        passed = all(found.get(k) == v for k, v in expected.items())
+        exp_str = ", ".join(f"{k}={v}" for k, v in sorted(expected.items()))
+        act_str = ", ".join(f"{k}={v}" for k, v in sorted(found.items()))
+        return AssertionResult(
+            "incremental_stats", passed, expected, found,
+            f"{'✓' if passed else '✗'} incremental_stats: expected={{{exp_str}}}, actual={{{act_str}}}",
+        )
+
     def check_integrity_output(self, stdout: str) -> AssertionResult:
         """验证 integrity check 输出中 mismatches == 0。"""
         m = re.search(r"[Mm]ismatch(?:es)?[:\s=]+(\d+)", stdout)
@@ -221,10 +244,18 @@ def run_terrasync_timed(cmd_list, *, label=None, timeout=300,
         except ValueError:
             pass
     start = time.monotonic()
-    proc = subprocess.run(
-        cmd_list, capture_output=capture_output, text=text,
-        timeout=timeout, **kwargs,
-    )
+    try:
+        proc = subprocess.run(
+            cmd_list, capture_output=capture_output, text=text,
+            timeout=timeout, **kwargs,
+        )
+    except subprocess.TimeoutExpired:
+        elapsed = round(time.monotonic() - start, 2)
+        print(f"[TS] {label}: TIMEOUT after {elapsed}s", flush=True)
+        return subprocess.CompletedProcess(
+            args=cmd_list, returncode=1,
+            stdout="", stderr=f"TimeoutExpired: timed out after {timeout}s\n",
+        )
     elapsed = round(time.monotonic() - start, 2)
     print(f"[TS] {label}: {elapsed}s", flush=True)
     return proc

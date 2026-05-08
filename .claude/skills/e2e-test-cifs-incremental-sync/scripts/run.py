@@ -26,14 +26,6 @@ SANITIZED = "cifs_incr_sync"
 BASELINE_DIRS, BASELINE_FILES = _PC.BASELINE_DIRS, _PC.BASELINE_FILES
 POST_DIRS, POST_FILES = _PC.POST_DIRS, _PC.POST_FILES
 
-_TABLES = [
-    f"base_{SANITIZED}", f"state_{SANITIZED}",
-    f"base_{SANITIZED}_dst", f"state_{SANITIZED}_dst",
-    f"base_{SANITIZED}_verify_src", f"state_{SANITIZED}_verify_src",
-    f"base_{SANITIZED}_verify_dst", f"state_{SANITIZED}_verify_dst",
-]
-
-
 def _check_smbclient():
     return subprocess.run(["smbclient", "--version"], capture_output=True).returncode == 0
 
@@ -55,16 +47,24 @@ def _run_script(script_path, host, user, passwd, share):
                           capture_output=True, text=True, timeout=180, env=env_vars)
 
 
+def _drop_tables(a, ch_host):
+    tables = a.clickhouse_query(ch_host,
+        f"SELECT name FROM system.tables WHERE database='default' "
+        f"AND name LIKE '%{SANITIZED}%' FORMAT TabSeparated")
+    for t in tables.strip().splitlines():
+        if t.strip():
+            a.clickhouse_execute(ch_host, f"DROP TABLE IF EXISTS default.{t.strip()}")
+
+
 def _cleanup(a, cfg):
     src = cfg["CIFS_SOURCE_HOST"]; dst = cfg["CIFS_DEST_HOST"]
     user = cfg.get("CIFS_USER", "terrasync"); passwd = cfg.get("CIFS_PASS", "terrasync123")
     share = cfg.get("CIFS_SHARE", _PC.SHARE); ch_host = cfg["CLICKHOUSE_HOST"]
-    with ThreadPoolExecutor(max_workers=5) as ex:
+    with ThreadPoolExecutor(max_workers=4) as ex:
         futs = [
             ex.submit(_smb_rm, src, user, passwd, share),
             ex.submit(_smb_rm, dst, user, passwd, share),
-            *[ex.submit(a.clickhouse_execute, ch_host, f"DROP TABLE IF EXISTS default.{t}")
-              for t in _TABLES],
+            ex.submit(_drop_tables, a, ch_host),
             ex.submit(a.run_shell_quiet,
                       f"find jobs -maxdepth 1 -type d -name '*{SANITIZED}*' -exec rm -rf {{}} +"),
         ]
@@ -99,7 +99,7 @@ def run(env=None):
     _cleanup(a, cfg)
 
     # 创建基线数据
-    setup_sh = _SKILL_DIR.parent / "cifs-full-scan" / "scripts" / "setup-cifs-test-data.sh"
+    setup_sh = _SKILL_DIR.parent / "_shared" / "cifs" / "setup-cifs-test-data.sh"
     if not setup_sh.exists():
         results.append(AssertionResult("setup", False, {}, {}, f"✗ {setup_sh} not found"))
         return build_result(results, start)
@@ -121,10 +121,7 @@ def run(env=None):
     results.append(a.check_cli_sync_output(proc.stdout + proc.stderr, bl))
 
     # Mutate 源端
-    mutate_sh = _SKILL_DIR.parent / "cifs-incremental-sync" / "scripts" / "mutate-cifs-test-data.sh"
-    if not mutate_sh.exists():
-        # fallback to cifs-incremental-scan's mutate script
-        mutate_sh = _SKILL_DIR.parent / "cifs-incremental-scan" / "scripts" / "mutate-cifs-test-data.sh"
+    mutate_sh = _SKILL_DIR.parent / "_shared" / "cifs" / "mutate-cifs-test-data.sh"
     if not mutate_sh.exists():
         results.append(AssertionResult("mutate", False, {}, {}, "✗ mutate script not found"))
         _cleanup(a, cfg); return build_result(results, start)
@@ -139,9 +136,15 @@ def run(env=None):
     proc2 = run_terrasync_timed([binary, "-c", config, "-l", "trace", "sync",
                            "--id", SYNC_JOB_ID, src_url, dst_url],
                           capture_output=True, text=True, timeout=600)
+    if proc2.returncode != 0:
+        results.append(AssertionResult("incr_sync", False, {}, {}, "✗ incr_sync failed"))
+        _cleanup(a, cfg); return build_result(results, start)
     incr_out = proc2.stdout + proc2.stderr
     post = {"dirs": POST_DIRS, "files": POST_FILES}
     results.append(a.check_cli_scan_output(incr_out, post))
+    results.append(a.check_incremental_stats(incr_out, {
+        "new": 5, "changed": 2, "renamed": 5, "deleted": 6,
+    }))
 
     # 验证目标端
     proc3 = run_terrasync_timed([binary, "-c", config, "-l", "trace", "scan",

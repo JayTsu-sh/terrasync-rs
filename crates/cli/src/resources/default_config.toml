@@ -34,7 +34,7 @@ batch_size = 800000      # Batch size for file entries. Recommended: 800000 for 
 
 [database.clickhouse]
 # ClickHouse specific configuration
-dsn = "http://192.168.50.137:8123"  # DSN format: http://host:port
+dsn = "http://localhost:8123"  # DSN format: http://host:port
 dial_timeout = 5          # Connection timeout (seconds)
 read_timeout = 30         # Read timeout (seconds)
 database = "default"      # Database name
