@@ -80,7 +80,9 @@ Local:     /path/to/dir  or  C:\path\to\dir
 NFS v3:    nfs://server:port/export/path:/prefix?uid=1000&gid=1000
 S3:        s3://access_key:secret_key@bucket.host:port/prefix
            s3+https://access_key:secret_key@bucket.host/prefix
-SMB/CIFS:  smb://user:password@host[:port]/share[/sub/path]  (\ → %5C)
+SMB/CIFS:  smb://user:password@host[:port]/share[/sub/path][?smb2_only=false]  (\ → %5C)
+           # smb2_only 默认 true（跳过 SMB1 探测帧，直接 SMB2 协商）
+           # smb2_only=false：启用多协议协商，兼容不接受直接 SMB2 的老设备
 ```
 
 ## Core Code Rules
