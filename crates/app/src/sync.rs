@@ -149,61 +149,17 @@ pub(crate) fn parse_size(size: &str) -> Result<usize> {
 /// 7. 验证文件一致性
 ///
 /// # 参数
-/// - `job_id`: 任务ID，用于标识当前复制任务
-/// - `job_dir`: 任务目录，用于存储任务相关数据
-/// - `src_path`: 源路径，指定从哪里读取文件
-/// - `dest_path`: 目标路径，指定将文件写入到哪里
-/// - `enable_integrity_check`: 是否启用完整性检查
-/// - `enable_acl`: 是否启用ACL（访问控制列表）复制
-/// - `scan_type`: 扫描类型（全量或增量）
-/// - `r#match`: 匹配表达式，用于过滤要复制的文件
-/// - `exclude`: 排除表达式，用于排除不需要复制的文件
-/// - `qos`: QoS配置，用于流量控制
-/// - `peak_qos_rate`: 峰值 `QoS` 速率
-/// - `block_size`: 块大小配置
-/// - `file_list`: 可选的文件列表路径，指定只复制列表中的文件
-/// - `iops`: 可选的 IOPS 限制
-/// - `packaged`: 是否以打包模式处理
-/// - `package_depth`: 打包深度
-/// - `raw_command_line`: 原始命令行，用于记录和调试
-/// - `progress_callback_url`: 进度回调 URL（web 层传入，CLI 传 `None`）
+/// - `config`: 同步任务的完整配置，详见 [`SyncJobConfig`](crate::config::SyncJobConfig)
 ///
 /// # 返回值
 /// - 成功时返回`Ok(())`
 /// - 失败时返回包含错误信息的`Err`
 #[instrument(skip_all, fields(
-    job_id = %job_id,
-    src = %redact_storage_url(src_path),
-    dest = %redact_storage_url(dest_path),
+    job_id = %config.job_id,
+    src = %redact_storage_url(&config.src_path),
+    dest = %redact_storage_url(&config.dest_path),
 ))]
-#[allow(clippy::too_many_arguments)]
-pub async fn sync(
-    job_id: String, job_dir: String, job_dir_pre_existing: bool, src_path: &str, dest_path: &str,
-    enable_integrity_check: bool, enable_acl: bool, r#match: &Option<String>, exclude: &Option<String>,
-    qos: &Option<String>, peak_qos_rate: f32, block_size: &Option<String>, file_list: &Option<String>,
-    iops: Option<u32>, packaged: bool, package_depth: usize, raw_command_line: String,
-    progress_callback_url: Option<String>,
-) -> Result<()> {
-    let config = crate::config::SyncJobConfig {
-        job_id,
-        job_dir,
-        job_dir_pre_existing,
-        src_path: src_path.to_string(),
-        dest_path: dest_path.to_string(),
-        enable_integrity_check,
-        enable_acl,
-        r#match: r#match.clone(),
-        exclude: exclude.clone(),
-        qos: qos.clone(),
-        peak_qos_rate,
-        block_size: block_size.clone(),
-        file_list: file_list.clone(),
-        iops,
-        packaged,
-        package_depth,
-        raw_command_line,
-        progress_callback_url,
-    };
+pub async fn sync(config: crate::config::SyncJobConfig) -> Result<()> {
     crate::orchestrator::SyncOrchestrator::new_local(config).run().await
 }
 
@@ -221,59 +177,17 @@ pub async fn sync(
 /// 8. 验证文件一致性
 ///
 /// # 参数
-/// - `job_id`: 任务ID，用于标识当前复制任务
-/// - `job_dir`: 任务目录，用于存储任务相关数据
-/// - `src_path`: 源路径，指定从哪里读取文件
-/// - `dest_path`: 目标路径，指定将文件写入到哪里
-/// - `enable_integrity_check`: 是否启用完整性检查
-/// - `enable_acl`: 是否启用ACL（访问控制列表）复制
-/// - `scan_type`: 扫描类型（全量或增量）
-/// - `r#match`: 匹配表达式，用于过滤要复制的文件
-/// - `exclude`: 排除表达式，用于排除不需要复制的文件
-/// - `qos`: QoS配置，用于流量控制
-/// - `peak_qos_rate`: 峰值 `QoS` 速率
-/// - `block_size`: 块大小配置
-/// - `iops`: 可选的 IOPS 限制
-/// - `packaged`: 是否以打包模式处理
-/// - `package_depth`: 打包深度
-/// - `raw_command_line`: 原始命令行，用于记录和调试
-/// - `progress_callback_url`: 进度回调 URL（web 层传入，CLI 传 `None`）
+/// - `config`: 同步任务的完整配置，详见 [`SyncJobConfig`](crate::config::SyncJobConfig)
 ///
 /// # 返回值
 /// - 成功时返回`Ok(())`
 /// - 失败时返回包含错误信息的`Err`
 #[instrument(skip_all, fields(
-    job_id = %job_id,
-    src = %redact_storage_url(src_path),
-    dest = %redact_storage_url(dest_path),
+    job_id = %config.job_id,
+    src = %redact_storage_url(&config.src_path),
+    dest = %redact_storage_url(&config.dest_path),
 ))]
-#[allow(clippy::too_many_arguments)]
-pub async fn incremental_sync(
-    job_id: String, job_dir: String, job_dir_pre_existing: bool, src_path: &str, dest_path: &str,
-    enable_integrity_check: bool, enable_acl: bool, r#match: &Option<String>, exclude: &Option<String>,
-    qos: &Option<String>, peak_qos_rate: f32, block_size: &Option<String>, iops: Option<u32>, packaged: bool,
-    package_depth: usize, raw_command_line: String, progress_callback_url: Option<String>,
-) -> Result<()> {
-    let config = crate::config::SyncJobConfig {
-        job_id,
-        job_dir,
-        job_dir_pre_existing,
-        src_path: src_path.to_string(),
-        dest_path: dest_path.to_string(),
-        enable_integrity_check,
-        enable_acl,
-        r#match: r#match.clone(),
-        exclude: exclude.clone(),
-        qos: qos.clone(),
-        peak_qos_rate,
-        block_size: block_size.clone(),
-        file_list: None,
-        iops,
-        packaged,
-        package_depth,
-        raw_command_line,
-        progress_callback_url,
-    };
+pub async fn incremental_sync(config: crate::config::SyncJobConfig) -> Result<()> {
     crate::orchestrator::SyncOrchestrator::new_local(config).run().await
 }
 

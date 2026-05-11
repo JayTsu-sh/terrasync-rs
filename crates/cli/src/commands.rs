@@ -189,6 +189,27 @@ pub async fn sync_cmd(
         .ok_or_else(|| CliError::InvalidParameter("dest_path is required".to_string()))?
         .as_str();
 
+    let config = SyncJobConfig {
+        job_id: job_id.to_string(),
+        job_dir,
+        job_dir_pre_existing,
+        src_path: src_path_str.to_string(),
+        dest_path: dest_path_str.to_string(),
+        enable_integrity_check: effective_enable_integrity_check,
+        enable_acl: effective_enable_acl,
+        r#match: effective_match,
+        exclude: effective_exclude,
+        qos: effective_qos,
+        peak_qos_rate: effective_peak_qos_rate,
+        block_size: effective_block_size,
+        file_list: file_list.clone(),
+        iops,
+        packaged,
+        package_depth: package_depth.unwrap_or(0),
+        raw_command_line,
+        progress_callback_url: None,
+    };
+
     // 双进程模式：通过 QUIC 连接远端 Receiver
     if let Some(remote_addr) = remote {
         // 加载服务端证书（防 MITM）
@@ -207,26 +228,6 @@ pub async fn sync_cmd(
             None => None,
         };
 
-        let config = SyncJobConfig {
-            job_id: job_id.to_string(),
-            job_dir,
-            job_dir_pre_existing,
-            src_path: src_path_str.to_string(),
-            dest_path: dest_path_str.to_string(),
-            enable_integrity_check: effective_enable_integrity_check,
-            enable_acl: effective_enable_acl,
-            r#match: effective_match,
-            exclude: effective_exclude,
-            qos: effective_qos,
-            peak_qos_rate: effective_peak_qos_rate,
-            block_size: effective_block_size,
-            file_list: file_list.clone(),
-            iops,
-            packaged,
-            package_depth: package_depth.unwrap_or(0),
-            raw_command_line,
-            progress_callback_url: None,
-        };
         return SyncOrchestrator::new_remote(config, remote_addr, tls_cert_bytes)
             .run()
             .await
@@ -234,27 +235,7 @@ pub async fn sync_cmd(
     }
 
     // ScanType 由 app 层自动判定（查数据库 base 表，fallback 文件系统）
-    sync(
-        job_id.to_string(),
-        job_dir,
-        job_dir_pre_existing,
-        src_path_str,
-        dest_path_str,
-        effective_enable_integrity_check,
-        effective_enable_acl,
-        &effective_match,
-        &effective_exclude,
-        &effective_qos,
-        effective_peak_qos_rate,
-        &effective_block_size,
-        file_list,
-        iops,
-        packaged,
-        package_depth.unwrap_or(0),
-        raw_command_line,
-        None,
-    )
-    .await?;
+    sync(config).await?;
 
     Ok(())
 }
