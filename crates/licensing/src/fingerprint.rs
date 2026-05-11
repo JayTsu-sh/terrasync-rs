@@ -103,7 +103,7 @@ fn is_virtual_interface(name: &str) -> bool {
     virtual_prefixes.iter().any(|prefix| name.starts_with(prefix))
 }
 
-/// 读取 Windows MachineGuid 注册表项
+/// 读取 Windows `MachineGuid` 注册表项
 #[cfg(target_os = "windows")]
 fn read_windows_machine_guid() -> std::io::Result<String> {
     use std::process::Command;
@@ -115,10 +115,10 @@ fn read_windows_machine_guid() -> std::io::Result<String> {
     let stdout = String::from_utf8_lossy(&output.stdout);
     // 输出格式: "    MachineGuid    REG_SZ    xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
     for line in stdout.lines() {
-        if line.contains("MachineGuid") {
-            if let Some(guid) = line.split_whitespace().last() {
-                return Ok(guid.to_string());
-            }
+        if line.contains("MachineGuid")
+            && let Some(guid) = line.split_whitespace().last()
+        {
+            return Ok(guid.to_string());
         }
     }
 

@@ -24,7 +24,7 @@ use crate::types::Payload;
 
 /// 生成 Ed25519 密钥对
 ///
-/// 返回 (private_key_bytes, public_key_bytes)
+/// 返回 (`private_key_bytes`, `public_key_bytes`)
 #[cfg(feature = "generate")]
 pub fn generate_keypair() -> ([u8; 32], [u8; 32]) {
     let signing_key = SigningKey::generate(&mut OsRng);
@@ -50,17 +50,17 @@ pub fn save_keypair(output_dir: &Path) -> Result<()> {
 
     // 保存私钥
     let private_key_path = output_dir.join("private.key");
-    fs::write(&private_key_path, &private_key)?;
+    fs::write(&private_key_path, private_key)?;
     println!("Private key saved to: {}", private_key_path.display());
 
     // 保存公钥
     let public_key_path = output_dir.join("public.key");
-    fs::write(&public_key_path, &public_key)?;
+    fs::write(&public_key_path, public_key)?;
     println!("Public key saved to: {}", public_key_path.display());
 
     // 保存 HMAC secret
     let secret_path = output_dir.join("hmac_secret.key");
-    fs::write(&secret_path, &hmac_secret)?;
+    fs::write(&secret_path, hmac_secret)?;
     println!("HMAC secret saved to: {}", secret_path.display());
 
     // 输出 Rust 代码片段
@@ -69,7 +69,7 @@ pub fn save_keypair(output_dir: &Path) -> Result<()> {
         "pub const EMBEDDED_PUBLIC_KEY: &str = \"{}\";",
         BASE64.encode(public_key)
     );
-    println!("pub const HMAC_BINDING_SECRET: &[u8; 32] = &{:?};", hmac_secret);
+    println!("pub const HMAC_BINDING_SECRET: &[u8; 32] = &{hmac_secret:?};");
     println!("\n=== End ===");
 
     Ok(())

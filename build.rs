@@ -3,6 +3,10 @@
 //! 该构建脚本负责在Windows平台上处理 `DuckDB` 库的链接和复制操作，
 //! 确保编译过程中能正确找到和使用 `DuckDB` 静态库。
 
+// 构建脚本是工具代码，缺失依赖时直接 panic 让构建终止是合理行为，
+// 豁免 workspace 全局禁用的 unwrap/expect
+#![allow(clippy::unwrap_used, clippy::expect_used)]
+
 // 标准库
 #[cfg(target_os = "windows")]
 use std::env;
@@ -10,6 +14,38 @@ use std::env;
 use std::fs;
 #[cfg(target_os = "windows")]
 use std::path::{Path, PathBuf};
+
+/// 递归复制整个目录的内容到目标位置
+///
+/// # 参数
+/// - `src`: 源目录路径
+/// - `dst`: 目标目录路径
+///
+/// # 返回值
+/// - 成功时返回`Ok(())`
+/// - 失败时返回包含错误信息的`Err`
+#[cfg(target_os = "windows")]
+fn copy_dir_all(src: &Path, dst: &Path) -> std::io::Result<()> {
+    // 如果目标目录不存在，则创建它
+    if !dst.exists() {
+        fs::create_dir_all(dst)?;
+    }
+
+    // 遍历源目录中的所有条目
+    for entry in fs::read_dir(src)? {
+        let entry = entry?;
+        let file_type = entry.file_type()?;
+
+        // 如果是目录，则递归复制
+        if file_type.is_dir() {
+            copy_dir_all(&entry.path(), &dst.join(entry.file_name()))?;
+        } else {
+            // 如果是文件，则直接复制
+            fs::copy(entry.path(), dst.join(entry.file_name()))?;
+        }
+    }
+    Ok(())
+}
 
 /// 构建脚本的主函数
 ///
@@ -43,38 +79,6 @@ fn main() {
             .nth(3) // 向上导航到目标目录
             .expect("Failed to find target directory")
             .to_path_buf();
-
-        // 递归复制文件和目录的辅助函数
-        /// 递归复制整个目录的内容到目标位置
-        ///
-        /// # 参数
-        /// - `src`: 源目录路径
-        /// - `dst`: 目标目录路径
-        ///
-        /// # 返回值
-        /// - 成功时返回`Ok(())`
-        /// - 失败时返回包含错误信息的`Err`
-        fn copy_dir_all(src: &Path, dst: &Path) -> std::io::Result<()> {
-            // 如果目标目录不存在，则创建它
-            if !dst.exists() {
-                fs::create_dir_all(dst)?;
-            }
-
-            // 遍历源目录中的所有条目
-            for entry in fs::read_dir(src)? {
-                let entry = entry?;
-                let file_type = entry.file_type()?;
-
-                // 如果是目录，则递归复制
-                if file_type.is_dir() {
-                    copy_dir_all(&entry.path(), &dst.join(entry.file_name()))?;
-                } else {
-                    // 如果是文件，则直接复制
-                    fs::copy(entry.path(), dst.join(entry.file_name()))?;
-                }
-            }
-            Ok(())
-        }
 
         // 递归复制DuckDB库文件到目标目录，确保运行时能正确找到库
         copy_dir_all(&custom_lib_path, &target_dir).expect("Failed to copy files");

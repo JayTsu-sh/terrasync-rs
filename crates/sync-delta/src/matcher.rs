@@ -144,8 +144,7 @@ mod tests {
         for token in &tokens {
             assert!(
                 matches!(token, DeltaToken::Data(_)),
-                "Should be all Data, got {:?}",
-                token
+                "Should be all Data, got {token:?}",
             );
         }
     }

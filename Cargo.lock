@@ -166,6 +166,7 @@ dependencies = [
  "bincode",
  "blake3",
  "bytes 1.11.1",
+ "chrono",
  "dashmap",
  "data-mover",
  "db",

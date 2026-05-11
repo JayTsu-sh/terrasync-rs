@@ -1,5 +1,3 @@
-#![cfg_attr(feature = "nightly", feature(backtrace))]
-
 //! 工具库模块
 //!
 //! 该模块提供了应用程序通用的工具功能，包括：
