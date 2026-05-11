@@ -1277,7 +1277,7 @@ mod tests {
                 assert_eq!(from.get_ctime(), 100);
                 assert_eq!(to.get_ctime(), 200);
             }
-            _ => panic!("Expected Renamed"),
+            DeletionStatus::Deleted(_) => panic!("Expected Renamed"),
         }
     }
 
@@ -1301,7 +1301,7 @@ mod tests {
                 assert_eq!(from.get_ctime(), 100);
                 assert_eq!(to.get_ctime(), 200);
             }
-            _ => panic!("Expected Renamed"),
+            DeletionStatus::Deleted(_) => panic!("Expected Renamed"),
         }
     }
 
@@ -1402,7 +1402,7 @@ mod tests {
     }
 
     /// 验证 NULL-safe 元数据等价比较的 SQL 形式：每个属性必须有 `IS NULL AND ... IS NULL` 兜底，
-    /// 既不依赖 sentinel（避免把真实 mode=0 与 NULL 混淆），也覆盖 ClickHouse 三值逻辑下的 NULL=NULL 漏判。
+    /// 既不依赖 sentinel（避免把真实 mode=0 与 NULL 混淆），也覆盖 `ClickHouse` 三值逻辑下的 `NULL=NULL` 漏判。
     fn assert_null_safe_meta_clauses(sql: &str) {
         for col in ["mode", "uid", "gid"] {
             let clause = format!("(t.{col} IS NULL AND f.{col} IS NULL)");

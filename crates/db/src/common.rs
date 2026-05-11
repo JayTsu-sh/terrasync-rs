@@ -9,14 +9,16 @@ use tracing::{error, trace};
 use crate::traits::StorageEntryRecord;
 
 /// Represents the status of a deleted item, either a permanent deletion or a rename
+///
+/// `Deleted` 保持不 box——这是热路径上最常见的变体，每条删除记录都会走这里，
+/// 多一次堆分配影响显著。`Renamed` 已 box 双字段以压缩枚举本体 size。
+/// 变体间仍有 size 差异，对当前用法可接受，豁免 `large_enum_variant` lint。
 #[derive(Clone, Debug)]
+#[allow(clippy::large_enum_variant)]
 pub enum DeletionStatus {
     /// The item was permanently deleted
     Deleted(EntryEnum),
     /// The item was renamed, with the old and new entries.
-    ///
-    /// 两个字段对称 box，避免 `clippy::large_enum_variant` 抱怨
-    /// （`EntryEnum` 较大，不 box 会让整个枚举的 size 被最大变体拉高）。
     Renamed(Box<EntryEnum>, Box<EntryEnum>),
 }
 

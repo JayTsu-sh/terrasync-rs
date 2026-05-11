@@ -7,13 +7,14 @@ edition = "2024"
 
 [features]
 duckdb = ["db/duckdb"]
-license = ["dep:licensing"]
+license = ["dep:licensing", "dep:chrono"]
 
 [dependencies]
 async-channel = "2"
 async-trait = "0.1.89"
 blake3 = "1.8"
 bytes = "1.11.1"
+chrono = { version = "0.4", optional = true }
 dashmap = "6.1.0"
 db = { path = "../db" }
 futures = "0.3.32"

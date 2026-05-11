@@ -3,6 +3,9 @@
 //! 运行方式：cargo test -p transport --features quic
 
 #![cfg(feature = "quic")]
+// 集成测试代码：豁免 unwrap/expect 与所有 pedantic 风格 lint
+#![allow(clippy::unwrap_used, clippy::expect_used)]
+#![allow(clippy::pedantic)]
 
 use std::net::SocketAddr;
 

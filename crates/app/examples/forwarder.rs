@@ -1,3 +1,6 @@
+// 示例代码：演示 BroadcastForwarder 用法，sample 性质豁免 unwrap deny
+#![allow(clippy::unwrap_used)]
+
 use std::time::SystemTime;
 
 use app::broadcast::BroadcastForwarder;

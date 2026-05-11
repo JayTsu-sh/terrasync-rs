@@ -6,7 +6,6 @@ description = "Various utilities and functionalities"
 edition = "2024"
 
 [features]
-nightly = []
 termlog = []
 syslog = []
 journald = []

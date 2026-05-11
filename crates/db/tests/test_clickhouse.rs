@@ -1,3 +1,6 @@
+// 集成测试代码：豁免 unwrap/expect deny
+#![allow(clippy::unwrap_used, clippy::expect_used)]
+
 #[cfg(test)]
 mod clickhouse_integration_tests {
     // 标准库

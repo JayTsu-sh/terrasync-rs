@@ -39,8 +39,6 @@ pub fn reconstruct(basis_data: &[u8], tokens: &[DeltaToken], block_size: u32) ->
 
 #[cfg(test)]
 mod tests {
-    use bytes::Bytes;
-
     use super::*;
     use crate::matcher::delta_match;
     use crate::signature::compute_block_signatures;
@@ -103,7 +101,7 @@ mod tests {
     #[test]
     fn test_large_file_partial_change() {
         // 模拟大文件中间 2KB 变更
-        let mut basis = vec![0xAA; 10000]; // 10KB, all 0xAA
+        let basis = vec![0xAA; 10000]; // 10KB, all 0xAA
         let mut source = basis.clone();
         // 修改中间 2KB
         for byte in &mut source[4000..6000] {
@@ -118,6 +116,6 @@ mod tests {
         let tokens = delta_match(&source, &sigs, 1000);
         let match_count = tokens.iter().filter(|t| matches!(t, DeltaToken::Match { .. })).count();
         // 10 blocks 中至少 7 个应该 match（中间 2 个变更 + 可能的边界 block）
-        assert!(match_count >= 7, "Expected >= 7 matches, got {}", match_count);
+        assert!(match_count >= 7, "Expected >= 7 matches, got {match_count}");
     }
 }
