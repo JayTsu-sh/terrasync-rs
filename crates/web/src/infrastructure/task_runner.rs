@@ -297,27 +297,27 @@ async fn run_migration_task(
             let job_dir_pre_existing = std::path::Path::new(job_dir).exists();
 
             // ScanType 由 app 层自动判定（查数据库 base 表，fallback 文件系统快照）
-            app::sync::sync(
-                job_id.to_string(),
-                job_dir.to_string(),
+            let config = app::config::SyncJobConfig {
+                job_id: job_id.to_string(),
+                job_dir: job_dir.to_string(),
                 job_dir_pre_existing,
-                source_url,
-                dest,
-                task_config.enable_integrity_check,
-                task_config.enable_acl,
-                &task_config.match_expr,
-                &task_config.exclude_expr,
-                &task_config.qos,
-                task_config.peak_qos_rate,
-                &task_config.block_size,
-                &None,
-                task_config.iops,
-                false,
-                0,
-                format!("gui:sync {source_url} {dest}"),
-                callback_url,
-            )
-            .await?;
+                src_path: source_url.to_string(),
+                dest_path: dest.to_string(),
+                enable_integrity_check: task_config.enable_integrity_check,
+                enable_acl: task_config.enable_acl,
+                r#match: task_config.match_expr.clone(),
+                exclude: task_config.exclude_expr.clone(),
+                qos: task_config.qos.clone(),
+                peak_qos_rate: task_config.peak_qos_rate,
+                block_size: task_config.block_size.clone(),
+                file_list: None,
+                iops: task_config.iops,
+                packaged: false,
+                package_depth: 0,
+                raw_command_line: format!("gui:sync {source_url} {dest}"),
+                progress_callback_url: callback_url,
+            };
+            app::sync::sync(config).await?;
             Ok(())
         }
         TaskType::IntegrityCheck => {
