@@ -4,13 +4,19 @@
 
 set -e
 
-BASE="/export/nfs"
-CLICKHOUSE_HOST="192.168.50.173:8123"
+BASE="${NFS_EXPORT:-/export/nfs}"
+CLICKHOUSE_HOST="${CLICKHOUSE_HOST:-192.168.50.173:8123}"
+CLICKHOUSE_USER="${CLICKHOUSE_USER:-default}"
+CLICKHOUSE_PASSWORD="${CLICKHOUSE_PASSWORD:-}"
+CURL_AUTH=""
+if [[ -n "$CLICKHOUSE_PASSWORD" ]]; then
+  CURL_AUTH="--user ${CLICKHOUSE_USER}:${CLICKHOUSE_PASSWORD}"
+fi
 TABLE="base_nfs_v3_full_sync"
 STATE_TABLE="state_nfs_v3_full_sync"
 
 # 获取 scan_state (current_state)
-STATE=$(curl -s "http://${CLICKHOUSE_HOST}/?query=SELECT+scan_state+FROM+default.${STATE_TABLE}+FINAL+WHERE+id%3D1+FORMAT+TabSeparated")
+STATE=$(curl -s $CURL_AUTH "http://${CLICKHOUSE_HOST}/?query=SELECT+scan_state+FROM+default.${STATE_TABLE}+FINAL+WHERE+id%3D1+FORMAT+TabSeparated")
 if [[ -z "$STATE" ]]; then
   echo "ERROR: scan_state is empty, state table not found"
   exit 1
@@ -22,7 +28,7 @@ echo ""
 
 # 从 ClickHouse 导出所有条目 (relative_path, uid, gid, mode, mtime)
 # mtime 存储为 DateTime64，使用 toUnixTimestamp 转换为 Unix 秒
-CH_DATA=$(curl -s "http://${CLICKHOUSE_HOST}/?query=SELECT+relative_path,uid,gid,mode,toUnixTimestamp(mtime)+FROM+default.${TABLE}+FINAL+WHERE+current_state%3D${STATE}+FORMAT+TabSeparated")
+CH_DATA=$(curl -s $CURL_AUTH "http://${CLICKHOUSE_HOST}/?query=SELECT+relative_path,uid,gid,mode,toUnixTimestamp(mtime)+FROM+default.${TABLE}+FINAL+WHERE+current_state%3D${STATE}+FORMAT+TabSeparated")
 
 TOTAL=0
 MATCHED=0

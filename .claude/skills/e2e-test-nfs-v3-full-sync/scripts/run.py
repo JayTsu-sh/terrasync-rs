@@ -11,6 +11,12 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
+# Windows GBK stdout 兼容：强制 UTF-8 输出
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8")
+if hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(encoding="utf-8")
+
 _SKILL_DIR = Path(__file__).parent.parent
 _PROJECT_ROOT = _SKILL_DIR.parent.parent.parent
 _HARNESS_SCRIPTS = _SKILL_DIR.parent / "harness-run" / "scripts"
@@ -104,14 +110,24 @@ def _run_integrity_check(binary, config, src_ip, dest_ip, nfs_export):
     )
 
 
-def _verify_metadata(a, dest_ip):
+def _verify_metadata(a, dest_ip, cfg):
     verify_sh = _SKILL_DIR / "scripts" / "verify-metadata.sh"
     if not verify_sh.exists():
         return AssertionResult("metadata_verification", False, {}, {},
                                "✗ metadata_verification: verify-metadata.sh not found")
+    ch_host = cfg.get("CLICKHOUSE_HOST", "192.168.50.173:8123")
+    ch_user = cfg.get("CLICKHOUSE_USER", "default")
+    ch_password = cfg.get("CLICKHOUSE_PASSWORD", "")
+    nfs_export = cfg.get("NFS_V3_EXPORT", "/export/nfs")
+    env_prefix = (
+        f"CLICKHOUSE_HOST={ch_host} "
+        f"CLICKHOUSE_USER={ch_user} "
+        f"CLICKHOUSE_PASSWORD={ch_password} "
+        f"NFS_EXPORT={nfs_export} "
+    )
     try:
         a.scp_to(verify_sh, dest_ip, "/tmp/verify-metadata.sh")
-        out = a.ssh_exec(dest_ip, "sudo bash /tmp/verify-metadata.sh", timeout=300)
+        out = a.ssh_exec(dest_ip, f"sudo {env_prefix} bash /tmp/verify-metadata.sh", timeout=300)
     except Exception as e:
         return AssertionResult("metadata_verification", False, {}, {},
                                f"✗ metadata_verification: {e}")
@@ -134,7 +150,11 @@ def run(env: dict = None) -> dict:
     config = cfg.get("TERRASYNC_CONFIG", "examples/config.toml")
     ssh_user = cfg.get("SSH_USER", "root")
 
-    a = TerrasyncAssertions(ssh_user=ssh_user)
+    a = TerrasyncAssertions(
+        ssh_user=ssh_user,
+        ch_user=cfg.get("CLICKHOUSE_USER", "default"),
+        ch_password=cfg.get("CLICKHOUSE_PASSWORD", ""),
+    )
     results = []
 
     _cleanup(a, src_ip, dest_ip, ch_host, nfs_export)
@@ -175,7 +195,7 @@ def run(env: dict = None) -> dict:
         for f in as_completed(futs):
             results.append(f.result())
 
-    results.append(_verify_metadata(a, dest_ip))
+    results.append(_verify_metadata(a, dest_ip, cfg))
     _cleanup(a, src_ip, dest_ip, ch_host, nfs_export)
     return build_result(results, start)
 
