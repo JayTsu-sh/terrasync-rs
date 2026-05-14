@@ -52,7 +52,7 @@ def _run_script(script_path, host, user, passwd, share):
 def _cleanup(a, cfg):
     host = cfg["CIFS_SOURCE_HOST"]
     user = cfg.get("CIFS_USER", "terrasync"); passwd = cfg.get("CIFS_PASS", "terrasync123")
-    share = cfg.get("CIFS_SHARE", _PC.SHARE); ch_host = cfg["CLICKHOUSE_HOST"]
+    share = cfg.get("CIFS_SOURCE_SHARE", _PC.SHARE); ch_host = cfg["CLICKHOUSE_HOST"]
     with ThreadPoolExecutor(max_workers=3) as ex:
         futs = [
             ex.submit(_smb_rm, host, user, passwd, share),
@@ -90,7 +90,7 @@ def run(env=None):
 
     host = cfg["CIFS_SOURCE_HOST"]
     user = cfg.get("CIFS_USER", "terrasync"); passwd = cfg.get("CIFS_PASS", "terrasync123")
-    share = cfg.get("CIFS_SHARE", _PC.SHARE); ch_host = cfg["CLICKHOUSE_HOST"]
+    share = cfg.get("CIFS_SOURCE_SHARE", _PC.SHARE); ch_host = cfg["CLICKHOUSE_HOST"]
     binary = cfg.get("TERRASYNC_BINARY", "./target/debug/terrasync")
     config = cfg.get("TERRASYNC_CONFIG", "examples/config.toml")
     cifs_url = _cifs_url(host, user, passwd, share)

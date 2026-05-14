@@ -46,12 +46,12 @@ def _cifs_url(cfg, host_key="CIFS_SOURCE_HOST", prefix="test-data"):
     user = cfg.get("CIFS_USER", "administrator")
     passwd = cfg.get("CIFS_PASS", "")
     host = cfg[host_key]
-    share = cfg.get("CIFS_SHARE", _PC.SHARE)
+    share = cfg.get("CIFS_SOURCE_SHARE", _PC.SHARE)
     return f"smb://{user}:{passwd}@{host}/{share}/{prefix}"
 
 
 def _cleanup(a, host, ch_host, cfg):
-    share = cfg.get("CIFS_SHARE", _PC.SHARE)
+    share = cfg.get("CIFS_SOURCE_SHARE", _PC.SHARE)
     user = cfg.get("CIFS_USER", "administrator")
     passwd = cfg.get("CIFS_PASS", "")
     with ThreadPoolExecutor(max_workers=3) as ex:
@@ -99,7 +99,7 @@ def run(env: dict = None) -> dict:
     setup_env = os.environ.copy()
     setup_env.update({
         "CIFS_HOST": src_host,
-        "CIFS_SHARE": cfg.get("CIFS_SHARE", _PC.SHARE),
+        "CIFS_SHARE": cfg.get("CIFS_SOURCE_SHARE", _PC.SHARE),
         "CIFS_USER": cfg.get("CIFS_USER", "administrator"),
         "CIFS_PASS": cfg.get("CIFS_PASS", ""),
         "CIFS_PORT": cfg.get("CIFS_PORT", "445"),

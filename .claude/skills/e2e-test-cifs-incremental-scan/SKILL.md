@@ -43,8 +43,8 @@ description: >
 | Name | Value |
 |------|-------|
 | CIFS_SHARE | `testshare` |
-| SOURCE_URL | `smb://{CIFS_USER}:{CIFS_PASSWORD}@{SOURCE_IP}/{CIFS_SHARE}/test-data` |
-| DEST_URL | `smb://{CIFS_USER}:{CIFS_PASSWORD}@{DEST_IP}/{CIFS_SHARE}/test-data` |
+| SOURCE_URL | `smb://{CIFS_USER}:{CIFS_PASSWORD}@{SOURCE_IP}/{CIFS_SOURCE_SHARE}/test-data` |
+| DEST_URL | `smb://{CIFS_USER}:{CIFS_PASSWORD}@{DEST_IP}/{CIFS_DEST_SHARE}/test-data` |
 | BASELINE_DIRS | `39` |
 | BASELINE_FILES | `117` |
 | POST_DIRS | `41` |
@@ -59,7 +59,7 @@ description: >
 | CIFS_PORT | `445` |
 | CIFS_USER | `terrasync` |
 | CIFS_PASS | `terrasync123` |
-| CIFS_SHARE | `testshare` |
+| CIFS_SOURCE_SHARE | `testshare` |
 | CIFS_URL | `smb://terrasync:terrasync123@192.168.50.173/testshare/test-data` |
 | CONFIG | `examples/config.toml` |
 | BINARY | `./target/debug/terrasync` |
