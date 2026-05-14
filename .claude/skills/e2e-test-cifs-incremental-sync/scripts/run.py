@@ -59,11 +59,13 @@ def _drop_tables(a, ch_host):
 def _cleanup(a, cfg):
     src = cfg["CIFS_SOURCE_HOST"]; dst = cfg["CIFS_DEST_HOST"]
     user = cfg.get("CIFS_USER", "terrasync"); passwd = cfg.get("CIFS_PASS", "terrasync123")
-    share = cfg.get("CIFS_SHARE", _PC.SHARE); ch_host = cfg["CLICKHOUSE_HOST"]
+    src_share = cfg.get("CIFS_SOURCE_SHARE", _PC.SHARE)
+    dst_share = cfg.get("CIFS_DEST_SHARE", _PC.SHARE)
+    ch_host = cfg["CLICKHOUSE_HOST"]
     with ThreadPoolExecutor(max_workers=4) as ex:
         futs = [
-            ex.submit(_smb_rm, src, user, passwd, share),
-            ex.submit(_smb_rm, dst, user, passwd, share),
+            ex.submit(_smb_rm, src, user, passwd, src_share),
+            ex.submit(_smb_rm, dst, user, passwd, dst_share),
             ex.submit(_drop_tables, a, ch_host),
             ex.submit(a.run_shell_quiet,
                       f"find jobs -maxdepth 1 -type d -name '*{SANITIZED}*' -exec rm -rf {{}} +"),
@@ -88,11 +90,13 @@ def run(env=None):
 
     src = cfg["CIFS_SOURCE_HOST"]; dst = cfg["CIFS_DEST_HOST"]
     user = cfg.get("CIFS_USER", "terrasync"); passwd = cfg.get("CIFS_PASS", "terrasync123")
-    share = cfg.get("CIFS_SHARE", _PC.SHARE); ch_host = cfg["CLICKHOUSE_HOST"]
+    src_share = cfg.get("CIFS_SOURCE_SHARE", _PC.SHARE)
+    dst_share = cfg.get("CIFS_DEST_SHARE", _PC.SHARE)
+    ch_host = cfg["CLICKHOUSE_HOST"]
     binary = cfg.get("TERRASYNC_BINARY", "./target/debug/terrasync")
     config = cfg.get("TERRASYNC_CONFIG", "examples/config.toml")
-    src_url = _cifs_url(src, user, passwd, share)
-    dst_url = _cifs_url(dst, user, passwd, share)
+    src_url = _cifs_url(src, user, passwd, src_share)
+    dst_url = _cifs_url(dst, user, passwd, dst_share)
     a = TerrasyncAssertions()
     results = []
 
@@ -103,7 +107,7 @@ def run(env=None):
     if not setup_sh.exists():
         results.append(AssertionResult("setup", False, {}, {}, f"✗ {setup_sh} not found"))
         return build_result(results, start)
-    p = _run_script(setup_sh, src, user, passwd, share)
+    p = _run_script(setup_sh, src, user, passwd, src_share)
     setup_ok = p.returncode == 0
     results.append(AssertionResult("setup", setup_ok, {}, {},
                                    f"{'✓' if setup_ok else '✗'} cifs_setup"))
@@ -125,7 +129,7 @@ def run(env=None):
     if not mutate_sh.exists():
         results.append(AssertionResult("mutate", False, {}, {}, "✗ mutate script not found"))
         _cleanup(a, cfg); return build_result(results, start)
-    pm = _run_script(mutate_sh, src, user, passwd, share)
+    pm = _run_script(mutate_sh, src, user, passwd, src_share)
     mutate_ok = pm.returncode == 0
     results.append(AssertionResult("mutate", mutate_ok, {}, {},
                                    f"{'✓' if mutate_ok else '✗'} cifs_mutate"))

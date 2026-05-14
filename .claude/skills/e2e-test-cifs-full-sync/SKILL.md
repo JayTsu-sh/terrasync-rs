@@ -43,8 +43,8 @@ description: >
 | Name | Value |
 |------|-------|
 | CIFS_SHARE | `testshare` |
-| SOURCE_URL | `smb://{CIFS_USER}:{CIFS_PASSWORD}@{SOURCE_IP}/{CIFS_SHARE}/test-data` |
-| DEST_URL | `smb://{CIFS_USER}:{CIFS_PASSWORD}@{DEST_IP}/{CIFS_SHARE}/test-data` |
+| SOURCE_URL | `smb://{CIFS_USER}:{CIFS_PASSWORD}@{SOURCE_IP}/{CIFS_SOURCE_SHARE}/test-data` |
+| DEST_URL | `smb://{CIFS_USER}:{CIFS_PASSWORD}@{DEST_IP}/{CIFS_DEST_SHARE}/test-data` |
 | EXPECTED_DIRS | `39` |
 | EXPECTED_FILES | `117` |
 
