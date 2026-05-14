@@ -4,13 +4,22 @@
 
 set -e
 
-BASE="/export/nfs"
-CLICKHOUSE_HOST="192.168.50.173:8123"
+# 不写硬编码默认值——env 必须由调用方注入（run.py 通过 SSH env prefix 传入；
+# 独立运行时手动 export，参考 .claude/skills/harness-run/.env.example）。
+# 空密码用 ${X-} 允许（无 Auth），其他用 ${X:?} 强制要求。
+BASE="${NFS_EXPORT:?NFS_EXPORT must be set (see harness-run/.env.example)}"
+CLICKHOUSE_HOST="${CLICKHOUSE_HOST:?CLICKHOUSE_HOST must be set (see harness-run/.env.example)}"
+CLICKHOUSE_USER="${CLICKHOUSE_USER:?CLICKHOUSE_USER must be set (see harness-run/.env.example)}"
+CLICKHOUSE_PASSWORD="${CLICKHOUSE_PASSWORD-}"
+CURL_AUTH=""
+if [[ -n "$CLICKHOUSE_PASSWORD" ]]; then
+  CURL_AUTH="--user ${CLICKHOUSE_USER}:${CLICKHOUSE_PASSWORD}"
+fi
 TABLE="base_nfs_v3_full_sync"
 STATE_TABLE="state_nfs_v3_full_sync"
 
 # 获取 scan_state (current_state)
-STATE=$(curl -s "http://${CLICKHOUSE_HOST}/?query=SELECT+scan_state+FROM+default.${STATE_TABLE}+FINAL+WHERE+id%3D1+FORMAT+TabSeparated")
+STATE=$(curl -s $CURL_AUTH "http://${CLICKHOUSE_HOST}/?query=SELECT+scan_state+FROM+default.${STATE_TABLE}+FINAL+WHERE+id%3D1+FORMAT+TabSeparated")
 if [[ -z "$STATE" ]]; then
   echo "ERROR: scan_state is empty, state table not found"
   exit 1
@@ -22,7 +31,7 @@ echo ""
 
 # 从 ClickHouse 导出所有条目 (relative_path, uid, gid, mode, mtime)
 # mtime 存储为 DateTime64，使用 toUnixTimestamp 转换为 Unix 秒
-CH_DATA=$(curl -s "http://${CLICKHOUSE_HOST}/?query=SELECT+relative_path,uid,gid,mode,toUnixTimestamp(mtime)+FROM+default.${TABLE}+FINAL+WHERE+current_state%3D${STATE}+FORMAT+TabSeparated")
+CH_DATA=$(curl -s $CURL_AUTH "http://${CLICKHOUSE_HOST}/?query=SELECT+relative_path,uid,gid,mode,toUnixTimestamp(mtime)+FROM+default.${TABLE}+FINAL+WHERE+current_state%3D${STATE}+FORMAT+TabSeparated")
 
 TOTAL=0
 MATCHED=0

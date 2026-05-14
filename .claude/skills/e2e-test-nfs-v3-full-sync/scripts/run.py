@@ -11,6 +11,12 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
+# Windows GBK stdout 兼容：强制 UTF-8 输出
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8")
+if hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(encoding="utf-8")
+
 _SKILL_DIR = Path(__file__).parent.parent
 _PROJECT_ROOT = _SKILL_DIR.parent.parent.parent
 _HARNESS_SCRIPTS = _SKILL_DIR.parent / "harness-run" / "scripts"
@@ -104,14 +110,27 @@ def _run_integrity_check(binary, config, src_ip, dest_ip, nfs_export):
     )
 
 
-def _verify_metadata(a, dest_ip):
+def _verify_metadata(a, dest_ip, cfg):
     verify_sh = _SKILL_DIR / "scripts" / "verify-metadata.sh"
     if not verify_sh.exists():
         return AssertionResult("metadata_verification", False, {}, {},
                                "✗ metadata_verification: verify-metadata.sh not found")
+    # 不在代码里写默认值——所有默认从 .env.example 读取（见 review #7）。
+    # CLICKHOUSE_HOST 已经在 run() 里 envmod.require() 强制过，这里直接索引；
+    # USER 在 _DEFAULTS 没有，PASSWORD 允许空，都依赖 .env.example 给出。
+    ch_host = cfg["CLICKHOUSE_HOST"]
+    ch_user = cfg["CLICKHOUSE_USER"]
+    ch_password = cfg["CLICKHOUSE_PASSWORD"]
+    nfs_export = cfg["NFS_V3_EXPORT"]
+    env_prefix = (
+        f"CLICKHOUSE_HOST={ch_host} "
+        f"CLICKHOUSE_USER={ch_user} "
+        f"CLICKHOUSE_PASSWORD={ch_password} "
+        f"NFS_EXPORT={nfs_export} "
+    )
     try:
         a.scp_to(verify_sh, dest_ip, "/tmp/verify-metadata.sh")
-        out = a.ssh_exec(dest_ip, "sudo bash /tmp/verify-metadata.sh", timeout=300)
+        out = a.ssh_exec(dest_ip, f"sudo {env_prefix} bash /tmp/verify-metadata.sh", timeout=300)
     except Exception as e:
         return AssertionResult("metadata_verification", False, {}, {},
                                f"✗ metadata_verification: {e}")
@@ -124,7 +143,10 @@ def run(env: dict = None) -> dict:
     os.chdir(_PROJECT_ROOT)
     start = time.monotonic()
     cfg = envmod.load(env)
-    envmod.require(cfg, "NFS_V3_SOURCE_IP", "NFS_V3_DEST_IP", "CLICKHOUSE_HOST")
+    # CLICKHOUSE_USER 必填；CLICKHOUSE_PASSWORD 允许空（无 Auth），用 'in cfg' 单独校验。
+    envmod.require(cfg, "NFS_V3_SOURCE_IP", "NFS_V3_DEST_IP", "CLICKHOUSE_HOST", "CLICKHOUSE_USER")
+    if "CLICKHOUSE_PASSWORD" not in cfg:
+        sys.exit("ERROR: CLICKHOUSE_PASSWORD missing in .env (set empty for no auth)")
 
     src_ip = cfg["NFS_V3_SOURCE_IP"]
     dest_ip = cfg["NFS_V3_DEST_IP"]
@@ -134,7 +156,11 @@ def run(env: dict = None) -> dict:
     config = cfg.get("TERRASYNC_CONFIG", "examples/config.toml")
     ssh_user = cfg.get("SSH_USER", "root")
 
-    a = TerrasyncAssertions(ssh_user=ssh_user)
+    a = TerrasyncAssertions(
+        ssh_user=ssh_user,
+        ch_user=cfg["CLICKHOUSE_USER"],
+        ch_password=cfg["CLICKHOUSE_PASSWORD"],
+    )
     results = []
 
     _cleanup(a, src_ip, dest_ip, ch_host, nfs_export)
@@ -175,7 +201,7 @@ def run(env: dict = None) -> dict:
         for f in as_completed(futs):
             results.append(f.result())
 
-    results.append(_verify_metadata(a, dest_ip))
+    results.append(_verify_metadata(a, dest_ip, cfg))
     _cleanup(a, src_ip, dest_ip, ch_host, nfs_export)
     return build_result(results, start)
 

@@ -59,11 +59,13 @@ def _drop_ic_tables(a, ch_host):
 def _cleanup(a, cfg):
     src = cfg["CIFS_SOURCE_HOST"]; dst = cfg.get("CIFS_DEST_HOST", src)
     user = cfg.get("CIFS_USER", "terrasync"); passwd = cfg.get("CIFS_PASS", "terrasync123")
-    share = cfg.get("CIFS_SHARE", _PC.SHARE); ch_host = cfg["CLICKHOUSE_HOST"]
+    src_share = cfg.get("CIFS_SOURCE_SHARE", _PC.SHARE)
+    dst_share = cfg.get("CIFS_DEST_SHARE", _PC.SHARE)
+    ch_host = cfg["CLICKHOUSE_HOST"]
     with ThreadPoolExecutor(max_workers=4) as ex:
         futs = [
-            ex.submit(_smb_rm, src, user, passwd, share),
-            ex.submit(_smb_rm, dst, user, passwd, share),
+            ex.submit(_smb_rm, src, user, passwd, src_share),
+            ex.submit(_smb_rm, dst, user, passwd, dst_share),
             ex.submit(_drop_ic_tables, a, ch_host),
             ex.submit(a.run_shell_quiet,
                       f"find jobs -maxdepth 1 -type d -name '*{_TABLES_PATTERN}*' | xargs rm -rf"),
@@ -108,11 +110,13 @@ def run(env=None):
 
     src = cfg["CIFS_SOURCE_HOST"]; dst = cfg["CIFS_DEST_HOST"]
     user = cfg.get("CIFS_USER", "terrasync"); passwd = cfg.get("CIFS_PASS", "terrasync123")
-    share = cfg.get("CIFS_SHARE", _PC.SHARE); ch_host = cfg["CLICKHOUSE_HOST"]
+    src_share = cfg.get("CIFS_SOURCE_SHARE", _PC.SHARE)
+    dst_share = cfg.get("CIFS_DEST_SHARE", _PC.SHARE)
+    ch_host = cfg["CLICKHOUSE_HOST"]
     binary = cfg.get("TERRASYNC_BINARY", "./target/debug/terrasync")
     config = cfg.get("TERRASYNC_CONFIG", "examples/config.toml")
-    src_url = _cifs_url(src, user, passwd, share)
-    dst_url = _cifs_url(dst, user, passwd, share)
+    src_url = _cifs_url(src, user, passwd, src_share)
+    dst_url = _cifs_url(dst, user, passwd, dst_share)
     a = TerrasyncAssertions()
     results = []
 
@@ -123,7 +127,7 @@ def run(env=None):
     if not setup_sh.exists():
         results.append(AssertionResult("setup", False, {}, {}, f"✗ {setup_sh} not found"))
         return build_result(results, start)
-    p = _run_script(setup_sh, src, user, passwd, share)
+    p = _run_script(setup_sh, src, user, passwd, src_share)
     setup_ok = p.returncode == 0
     results.append(AssertionResult("setup", setup_ok, {}, {},
                                    f"{'✓' if setup_ok else '✗'} cifs_setup"))
@@ -149,7 +153,7 @@ def run(env=None):
     # 制造 Mismatch：在目标端用 smbclient 覆盖文件
     smb_tamper = subprocess.run(
         ["bash", "-c",
-         f"echo 'tampered' | smbclient //{dst}/{share} -U {user}%{passwd} "
+         f"echo 'tampered' | smbclient //{dst}/{dst_share} -U {user}%{passwd} "
          f"-c 'put /dev/stdin test-data/d1/d1_1/file1.txt' 2>/dev/null"],
         capture_output=True, timeout=30)
     if smb_tamper.returncode != 0:
@@ -158,7 +162,7 @@ def run(env=None):
         with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False) as tf:
             tf.write("tampered-cifs-content")
             tmp = tf.name
-        subprocess.run(["smbclient", f"//{dst}/{share}", "-U", f"{user}%{passwd}",
+        subprocess.run(["smbclient", f"//{dst}/{dst_share}", "-U", f"{user}%{passwd}",
                         "-c", f"put {tmp} test-data/d1/d1_1/file1.txt"],
                        capture_output=True, timeout=30)
         os.unlink(tmp)
@@ -167,7 +171,7 @@ def run(env=None):
     results.append(_check_ic(r3.stdout + r3.stderr, "detects_mismatch", False, min_mm=1))
 
     # 制造 Missing：删除目标端文件
-    subprocess.run(["smbclient", f"//{dst}/{share}", "-U", f"{user}%{passwd}",
+    subprocess.run(["smbclient", f"//{dst}/{dst_share}", "-U", f"{user}%{passwd}",
                     "-c", "del test-data/d2/file1.txt"],
                    capture_output=True, timeout=30)
 

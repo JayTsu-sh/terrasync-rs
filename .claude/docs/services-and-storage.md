@@ -95,7 +95,7 @@ cp .claude/skills/harness-run/.env.example .claude/skills/harness-run/.env
 | `S3_ACCESS_KEY` / `S3_SECRET_KEY` | S3 认证凭据 |
 | `S3_BUCKET_SRC` / `S3_BUCKET_DST` | S3 bucket 名 |
 | `CIFS_SOURCE_HOST` / `CIFS_DEST_HOST` | Samba 服务器 |
-| `CIFS_SHARE` / `CIFS_USER` / `CIFS_PASS` | Samba 凭据 |
+| `CIFS_SOURCE_SHARE` / `CIFS_DEST_SHARE` / `CIFS_USER` / `CIFS_PASS` | Samba 凭据；源和目标 share name 可不同 |
 | `CLICKHOUSE_HOST` | ClickHouse 连接地址 |
 | `TERRASYNC_BINARY` / `TERRASYNC_CONFIG` | 二进制和配置文件路径 |
 

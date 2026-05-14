@@ -3,6 +3,7 @@ assertions.py — 共享断言库
 所有 e2e skill 的 run.py 导入本模块。
 """
 
+import base64
 import re
 import subprocess
 import urllib.request
@@ -20,8 +21,10 @@ class AssertionResult:
 
 
 class TerrasyncAssertions:
-    def __init__(self, ssh_user="root"):
+    def __init__(self, ssh_user="root", ch_user="default", ch_password=""):
         self.ssh_user = ssh_user
+        self._ch_user = ch_user
+        self._ch_password = ch_password
         self._ssh_opts = [
             "-o", "StrictHostKeyChecking=no",
             "-o", "ConnectTimeout=10",
@@ -34,7 +37,8 @@ class TerrasyncAssertions:
         """在远端执行命令，返回 stdout。失败时抛出 RuntimeError。"""
         r = subprocess.run(
             ["ssh", *self._ssh_opts, f"{self.ssh_user}@{host}", cmd],
-            capture_output=True, text=True, timeout=timeout,
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            timeout=timeout,
         )
         if r.returncode != 0:
             raise RuntimeError(f"SSH {host} failed (rc={r.returncode}): {r.stderr.strip()}")
@@ -44,18 +48,27 @@ class TerrasyncAssertions:
         """上传本地文件到远端。失败时抛出 RuntimeError。"""
         r = subprocess.run(
             ["scp", *self._ssh_opts, str(local_path), f"{self.ssh_user}@{host}:{remote_path}"],
-            capture_output=True, text=True, timeout=timeout,
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            timeout=timeout,
         )
         if r.returncode != 0:
             raise RuntimeError(f"SCP to {host}:{remote_path} failed: {r.stderr.strip()}")
 
     # ── ClickHouse ─────────────────────────────────────────────────────────
 
+    def _ch_auth_header(self) -> str:
+        """生成 HTTP Basic Auth 头部值。"""
+        creds = f"{self._ch_user}:{self._ch_password}"
+        return "Basic " + base64.b64encode(creds.encode()).decode()
+
     def clickhouse_query(self, host, query, timeout=30) -> str:
         """SELECT 等只读查询（HTTP GET）。失败时抛出 RuntimeError。"""
         url = f"http://{host}/?query={urllib.parse.quote(query)}"
+        req = urllib.request.Request(url)
+        if self._ch_user:
+            req.add_header("Authorization", self._ch_auth_header())
         try:
-            with urllib.request.urlopen(url, timeout=timeout) as resp:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
                 return resp.read().decode()
         except Exception as e:
             raise RuntimeError(f"ClickHouse query failed on {host}: {e}") from e
@@ -66,6 +79,8 @@ class TerrasyncAssertions:
         """
         url = f"http://{host}/"
         req = urllib.request.Request(url, data=query.encode(), method="POST")
+        if self._ch_user:
+            req.add_header("Authorization", self._ch_auth_header())
         try:
             with urllib.request.urlopen(req, timeout=timeout) as resp:
                 return resp.read().decode()
@@ -85,7 +100,8 @@ class TerrasyncAssertions:
         """运行本地命令，返回 AssertionResult。"""
         name = cmd_list[0] if cmd_list else "cmd"
         try:
-            r = subprocess.run(cmd_list, capture_output=True, text=True, timeout=timeout)
+            r = subprocess.run(cmd_list, capture_output=True, text=True,
+                               encoding="utf-8", errors="replace", timeout=timeout)
             passed = r.returncode == 0
             msg = f"{'✓' if passed else '✗'} {name}: exit={r.returncode}"
             if not passed and r.stderr:
@@ -247,6 +263,7 @@ def run_terrasync_timed(cmd_list, *, label=None, timeout=300,
     try:
         proc = subprocess.run(
             cmd_list, capture_output=capture_output, text=text,
+            encoding="utf-8", errors="replace",
             timeout=timeout, **kwargs,
         )
     except subprocess.TimeoutExpired:

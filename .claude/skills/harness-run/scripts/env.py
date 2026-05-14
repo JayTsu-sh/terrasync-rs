@@ -57,7 +57,7 @@ def require(config, *keys):
 
 
 def _parse(path, out):
-    with open(path) as f:
+    with open(path, encoding="utf-8") as f:
         for line in f:
             line = line.strip()
             if line and not line.startswith("#") and "=" in line:
