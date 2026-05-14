@@ -4,10 +4,13 @@
 
 set -e
 
-BASE="${NFS_EXPORT:-/export/nfs}"
-CLICKHOUSE_HOST="${CLICKHOUSE_HOST:-192.168.50.173:8123}"
-CLICKHOUSE_USER="${CLICKHOUSE_USER:-default}"
-CLICKHOUSE_PASSWORD="${CLICKHOUSE_PASSWORD:-}"
+# 不写硬编码默认值——env 必须由调用方注入（run.py 通过 SSH env prefix 传入；
+# 独立运行时手动 export，参考 .claude/skills/harness-run/.env.example）。
+# 空密码用 ${X-} 允许（无 Auth），其他用 ${X:?} 强制要求。
+BASE="${NFS_EXPORT:?NFS_EXPORT must be set (see harness-run/.env.example)}"
+CLICKHOUSE_HOST="${CLICKHOUSE_HOST:?CLICKHOUSE_HOST must be set (see harness-run/.env.example)}"
+CLICKHOUSE_USER="${CLICKHOUSE_USER:?CLICKHOUSE_USER must be set (see harness-run/.env.example)}"
+CLICKHOUSE_PASSWORD="${CLICKHOUSE_PASSWORD-}"
 CURL_AUTH=""
 if [[ -n "$CLICKHOUSE_PASSWORD" ]]; then
   CURL_AUTH="--user ${CLICKHOUSE_USER}:${CLICKHOUSE_PASSWORD}"

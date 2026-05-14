@@ -115,10 +115,13 @@ def _verify_metadata(a, dest_ip, cfg):
     if not verify_sh.exists():
         return AssertionResult("metadata_verification", False, {}, {},
                                "✗ metadata_verification: verify-metadata.sh not found")
-    ch_host = cfg.get("CLICKHOUSE_HOST", "192.168.50.173:8123")
-    ch_user = cfg.get("CLICKHOUSE_USER", "default")
-    ch_password = cfg.get("CLICKHOUSE_PASSWORD", "")
-    nfs_export = cfg.get("NFS_V3_EXPORT", "/export/nfs")
+    # 不在代码里写默认值——所有默认从 .env.example 读取（见 review #7）。
+    # CLICKHOUSE_HOST 已经在 run() 里 envmod.require() 强制过，这里直接索引；
+    # USER 在 _DEFAULTS 没有，PASSWORD 允许空，都依赖 .env.example 给出。
+    ch_host = cfg["CLICKHOUSE_HOST"]
+    ch_user = cfg["CLICKHOUSE_USER"]
+    ch_password = cfg["CLICKHOUSE_PASSWORD"]
+    nfs_export = cfg["NFS_V3_EXPORT"]
     env_prefix = (
         f"CLICKHOUSE_HOST={ch_host} "
         f"CLICKHOUSE_USER={ch_user} "
@@ -140,7 +143,10 @@ def run(env: dict = None) -> dict:
     os.chdir(_PROJECT_ROOT)
     start = time.monotonic()
     cfg = envmod.load(env)
-    envmod.require(cfg, "NFS_V3_SOURCE_IP", "NFS_V3_DEST_IP", "CLICKHOUSE_HOST")
+    # CLICKHOUSE_USER 必填；CLICKHOUSE_PASSWORD 允许空（无 Auth），用 'in cfg' 单独校验。
+    envmod.require(cfg, "NFS_V3_SOURCE_IP", "NFS_V3_DEST_IP", "CLICKHOUSE_HOST", "CLICKHOUSE_USER")
+    if "CLICKHOUSE_PASSWORD" not in cfg:
+        sys.exit("ERROR: CLICKHOUSE_PASSWORD missing in .env (set empty for no auth)")
 
     src_ip = cfg["NFS_V3_SOURCE_IP"]
     dest_ip = cfg["NFS_V3_DEST_IP"]
@@ -152,8 +158,8 @@ def run(env: dict = None) -> dict:
 
     a = TerrasyncAssertions(
         ssh_user=ssh_user,
-        ch_user=cfg.get("CLICKHOUSE_USER", "default"),
-        ch_password=cfg.get("CLICKHOUSE_PASSWORD", ""),
+        ch_user=cfg["CLICKHOUSE_USER"],
+        ch_password=cfg["CLICKHOUSE_PASSWORD"],
     )
     results = []
 
