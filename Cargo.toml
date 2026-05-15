@@ -89,6 +89,10 @@ serial_test = "3.4.0"
 
 [patch.crates-io]
 nfs-rs = { git = "https://github.com/JayTsu-sh/nfs-rs.git" }
+# Handle Lease Phase A–D + P2.b compound + code-review fix
+# (commit 04e426d on refactor/compound-set-basic-info, on the
+# JayTsu-sh fork pending upstream merge).
+smb = { git = "https://github.com/JayTsu-sh/smb-rs.git", branch = "refactor/compound-set-basic-info" }
 
 [lints]
 workspace = true
