@@ -82,8 +82,16 @@ const NON_NFS_MOUNT_CONCURRENCY: usize = 32;
 const STATS_REPORT_INTERVAL: Duration = Duration::from_secs(10);
 
 /// 根据 storage URL 返回 mount/connect 阶段的最大并发数。
+///
+/// URL scheme 比较按 RFC 3986 是 case-insensitive 的（"NFS://"、"Nfs://"
+/// 与 "nfs://" 等价），所以 prefix 比较走 ASCII 不区分大小写，避免上层
+/// 配置或 URL 解析器返回非小写时误走 NON_NFS 并发上限，进而触发 nfs-rs
+/// 特权端口 TIME_WAIT 拥塞。
 fn mount_concurrency_for(path: &str) -> usize {
-    if path.starts_with("nfs://") {
+    const NFS_PREFIX: &str = "nfs://";
+    if path.len() >= NFS_PREFIX.len()
+        && path[..NFS_PREFIX.len()].eq_ignore_ascii_case(NFS_PREFIX)
+    {
         NFS_MOUNT_CONCURRENCY
     } else {
         NON_NFS_MOUNT_CONCURRENCY
@@ -1514,6 +1522,15 @@ mod mount_concurrency_tests {
         );
         assert_eq!(mount_concurrency_for("C:\\path\\to\\dir"), NON_NFS_MOUNT_CONCURRENCY);
         assert_eq!(mount_concurrency_for("/abs/path"), NON_NFS_MOUNT_CONCURRENCY);
+    }
+
+    #[test]
+    fn nfs_scheme_is_case_insensitive() {
+        // RFC 3986: scheme is case-insensitive. Accept upper/mixed case so a
+        // config file with "NFS://…" doesn't silently bypass the portmapper guard.
+        assert_eq!(mount_concurrency_for("NFS://10.0.0.1/export"), NFS_MOUNT_CONCURRENCY);
+        assert_eq!(mount_concurrency_for("Nfs://10.0.0.1/export"), NFS_MOUNT_CONCURRENCY);
+        assert_eq!(mount_concurrency_for("nFs://10.0.0.1/export"), NFS_MOUNT_CONCURRENCY);
     }
 
     #[test]
