@@ -7,7 +7,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 
 /// RAII guard：构造时 +1，Drop 时 -1，确保计数器在 panic/early-return 时也能正确回收。
@@ -68,10 +68,32 @@ const LARGE_FILE_LOG_THRESHOLD: u64 = 512 * 1024 * 1024;
 /// `StoragePair` 创建失败后的最大重试次数
 const STORAGE_PAIR_MAX_RETRIES: usize = 3;
 
-/// 同时创建 `StoragePair`（NFS mount）的最大并发数。
+/// 同时创建 NFS `StoragePair`（mount）的最大并发数。
 /// 设为 2：nfs-rs 在 Windows 上绑定特权端口（<1024）时，并发量过大会导致端口
 /// 竞争和 `TIME_WAIT` 积累，最终 WSAEADDRINUSE；限制并发可显著降低冲突概率。
-const STORAGE_PAIR_MOUNT_CONCURRENCY: usize = 2;
+const NFS_MOUNT_CONCURRENCY: usize = 2;
+
+/// 非 NFS 协议（CIFS/SMB、S3、本地）的 mount/connect 阶段并发上限。
+/// SMB 无特权端口约束，S3 无握手开销，应远大于典型 `copy_concurrency` 以让所有 worker
+/// 的握手并行完成（SMB 协议设计支持上千客户端同时连接，不会被 server 视作压力）。
+const NON_NFS_MOUNT_CONCURRENCY: usize = 32;
+
+/// 统计 reporter 周期（首条 tick 之前若 mount 尚未完成，仅打 INFO 不打 WARN）。
+const STATS_REPORT_INTERVAL: Duration = Duration::from_secs(10);
+
+/// 根据 storage URL 返回 mount/connect 阶段的最大并发数。
+fn mount_concurrency_for(path: &str) -> usize {
+    if path.starts_with("nfs://") {
+        NFS_MOUNT_CONCURRENCY
+    } else {
+        NON_NFS_MOUNT_CONCURRENCY
+    }
+}
+
+/// 返回 src 和 dest 的 mount 并发上限的较小值（双方都受限时按更紧的那一侧走）。
+fn mount_concurrency_for_pair(src_path: &str, dest_path: &str) -> usize {
+    std::cmp::min(mount_concurrency_for(src_path), mount_concurrency_for(dest_path))
+}
 
 /// 等待所有 worker 完成 mount 初始化，输出存活汇总
 ///
@@ -331,6 +353,8 @@ impl SyncOrchestrator {
         let entry_counter = Arc::new(AtomicUsize::new(0));
         let size_counter = Arc::new(AtomicU64::new(0));
         let active_tokio_task_counter = Arc::new(AtomicUsize::new(0));
+        // mount 完成标志：reporter 在 mount 期间仅打 INFO，避免误报 WARN。
+        let mount_completed = Arc::new(AtomicBool::new(false));
 
         let stats_handle = Self::spawn_stats_reporter(
             active_entry_counter.clone(),
@@ -338,6 +362,7 @@ impl SyncOrchestrator {
             size_counter.clone(),
             active_tokio_task_counter.clone(),
             copy_concurrency,
+            mount_completed.clone(),
         );
 
         // ── 7. 启动 walkdir ──
@@ -357,7 +382,9 @@ impl SyncOrchestrator {
         });
 
         // ── 8.5. 创建 mount 限流信号量 + countdown latch 计数器（Sender + Receiver 共享） ──
-        let mount_semaphore = Arc::new(Semaphore::new(STORAGE_PAIR_MOUNT_CONCURRENCY));
+        // 容量按 storage 类型选择：仅 NFS 因 portmapper / 特权端口冲突需要限速，
+        // CIFS/SMB / S3 / 本地放开到 NON_NFS_MOUNT_CONCURRENCY 让 16 个握手并行完成。
+        let mount_semaphore = Arc::new(Semaphore::new(mount_concurrency_for_pair(&c.src_path, &c.dest_path)));
         let alive_senders = Arc::new(AtomicUsize::new(0));
         let alive_receivers = Arc::new(AtomicUsize::new(0));
         let mount_done_senders = Arc::new(AtomicUsize::new(0));
@@ -527,6 +554,8 @@ impl SyncOrchestrator {
             copy_concurrency,
         )
         .await;
+        // 通知 stats_reporter：mount 期已结束，后续 active_tasks 不足才视为异常。
+        mount_completed.store(true, Ordering::Release);
 
         // ── 11. 等待 Sender workers 完成 ──
         for handle in sender_handles {
@@ -704,7 +733,8 @@ impl SyncOrchestrator {
         );
 
         // ── 10.5. 创建 mount 限流信号量 + 完成计数器 ──
-        let mount_semaphore = Arc::new(Semaphore::new(STORAGE_PAIR_MOUNT_CONCURRENCY));
+        // 容量按 storage 类型选择（详见 sync 路径同名注释）。
+        let mount_semaphore = Arc::new(Semaphore::new(mount_concurrency_for_pair(&c.src_path, &c.dest_path)));
         let alive_handlers = Arc::new(AtomicUsize::new(0));
         let mount_done_handlers = Arc::new(AtomicUsize::new(0));
 
@@ -1170,21 +1200,26 @@ impl SyncOrchestrator {
     }
 
     /// 启动统计 reporter task
+    ///
+    /// `mount_completed` 在所有 worker 完成 mount 初始化后由 orchestrator 置位；
+    /// 之前 `active_tasks` 必然小于 `copy_concurrency`（worker 还在握手中），
+    /// 不构成异常，仅打 INFO 避免把 "Processed 0 entries in 10s" 误报为 WARN。
     fn spawn_stats_reporter(
         active_entry_counter: Arc<AtomicUsize>, entry_counter: Arc<AtomicUsize>, size_counter: Arc<AtomicU64>,
-        active_tokio_task_counter: Arc<AtomicUsize>, copy_concurrency: usize,
+        active_tokio_task_counter: Arc<AtomicUsize>, copy_concurrency: usize, mount_completed: Arc<AtomicBool>,
     ) -> JoinHandle<()> {
         let span = info_span!("stats_reporter");
         tokio::spawn(
             async move {
-                let mut interval = tokio::time::interval(Duration::from_secs(10));
+                let mut interval = tokio::time::interval(STATS_REPORT_INTERVAL);
                 loop {
                     interval.tick().await;
                     let active_entries = active_entry_counter.load(Ordering::Relaxed);
                     let count = entry_counter.swap(0, Ordering::Relaxed);
                     let total_size = size_counter.swap(0, Ordering::Relaxed);
                     let active_tasks = active_tokio_task_counter.load(Ordering::Relaxed);
-                    if active_tasks == copy_concurrency {
+                    let mount_ok = mount_completed.load(Ordering::Acquire);
+                    if active_tasks == copy_concurrency || !mount_ok {
                         info!(
                             "Processed {} entries ({} bytes) in 10s, active_tasks: {}, active_entries: {}",
                             count, total_size, active_tasks, active_entries
@@ -1448,6 +1483,59 @@ impl SyncOrchestrator {
         if let Err(e) = progress_handle.join() {
             error!("Progress bar thread panicked: {:?}", e);
         }
+    }
+}
+
+#[cfg(test)]
+mod mount_concurrency_tests {
+    use super::{NFS_MOUNT_CONCURRENCY, NON_NFS_MOUNT_CONCURRENCY, mount_concurrency_for, mount_concurrency_for_pair};
+
+    #[test]
+    fn nfs_path_uses_nfs_quota() {
+        assert_eq!(
+            mount_concurrency_for("nfs://10.0.0.1:2049/export"),
+            NFS_MOUNT_CONCURRENCY
+        );
+    }
+
+    #[test]
+    fn smb_path_uses_non_nfs_quota() {
+        assert_eq!(
+            mount_concurrency_for("smb://user:pwd@10.0.0.1/share"),
+            NON_NFS_MOUNT_CONCURRENCY
+        );
+    }
+
+    #[test]
+    fn s3_and_local_paths_use_non_nfs_quota() {
+        assert_eq!(
+            mount_concurrency_for("s3://ak:sk@bucket.host/p"),
+            NON_NFS_MOUNT_CONCURRENCY
+        );
+        assert_eq!(mount_concurrency_for("C:\\path\\to\\dir"), NON_NFS_MOUNT_CONCURRENCY);
+        assert_eq!(mount_concurrency_for("/abs/path"), NON_NFS_MOUNT_CONCURRENCY);
+    }
+
+    #[test]
+    fn pair_uses_minimum_of_both_sides() {
+        // 同协议：取该协议容量
+        assert_eq!(
+            mount_concurrency_for_pair("nfs://a/x", "nfs://b/y"),
+            NFS_MOUNT_CONCURRENCY
+        );
+        assert_eq!(
+            mount_concurrency_for_pair("smb://u:p@a/x", "smb://u:p@b/y"),
+            NON_NFS_MOUNT_CONCURRENCY
+        );
+        // 混合：取较紧的一侧（NFS）
+        assert_eq!(
+            mount_concurrency_for_pair("nfs://a/x", "smb://u:p@b/y"),
+            NFS_MOUNT_CONCURRENCY
+        );
+        assert_eq!(
+            mount_concurrency_for_pair("smb://u:p@a/x", "nfs://b/y"),
+            NFS_MOUNT_CONCURRENCY
+        );
     }
 }
 
