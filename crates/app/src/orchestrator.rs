@@ -89,9 +89,7 @@ const STATS_REPORT_INTERVAL: Duration = Duration::from_secs(10);
 /// 特权端口 TIME_WAIT 拥塞。
 fn mount_concurrency_for(path: &str) -> usize {
     const NFS_PREFIX: &str = "nfs://";
-    if path.len() >= NFS_PREFIX.len()
-        && path[..NFS_PREFIX.len()].eq_ignore_ascii_case(NFS_PREFIX)
-    {
+    if path.len() >= NFS_PREFIX.len() && path[..NFS_PREFIX.len()].eq_ignore_ascii_case(NFS_PREFIX) {
         NFS_MOUNT_CONCURRENCY
     } else {
         NON_NFS_MOUNT_CONCURRENCY
