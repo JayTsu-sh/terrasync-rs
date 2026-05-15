@@ -8405,4 +8405,4 @@ dependencies = [
 [[patch.unused]]
 name = "smb"
 version = "0.12.0"
-source = "git+https://github.com/JayTsu-sh/smb-rs.git?branch=refactor%2Fcompound-set-basic-info#04e426d1e558a5adef4c5335ece3da704561bcb3"
+source = "git+https://github.com/JayTsu-sh/smb-rs.git#40b15ae8ee466ec1ed686df03d872ef5cb369fee"
