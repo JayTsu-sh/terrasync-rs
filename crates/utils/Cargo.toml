@@ -12,16 +12,18 @@ journald = []
 
 [dependencies]
 config = "0.15.22"
-hex = "0.4.3"
+hex = { workspace = true }
 log = "0.4.29"
+# rand 0.10.1 与 licensing 的 0.8 不同；aws-sdk 等传递依赖已经引入多个 rand 版本，
+# 暂保持现状，后续单独评估统一到 0.9
 rand = "0.10.1"
 regex = "1.12.3"
 rolling-file = "0.2"
 rust-crypto = "0.2.36"
-serde = { version = "1.0.228", features = ["derive"] }
-thiserror = "2.0.18"
+serde = { workspace = true, features = ["derive"] }
+thiserror = { workspace = true }
 tokio = { version = "1", features = ["sync"] }
-tracing = "0.1.44"
+tracing = { workspace = true }
 tracing-appender = "0.2.4"
 tracing-log = "0.2.0"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "json", "std"] }

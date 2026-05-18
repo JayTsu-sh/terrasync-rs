@@ -11,16 +11,16 @@ license = ["dep:licensing", "app/license"]
 gui = ["dep:web"]
 
 [dependencies]
-app = { path = "../app" }
-licensing = { path = "../licensing", optional = true }
-data-mover = { git = "https://github.com/JayTsu-sh/data-mover-rs.git" }
-rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
-transport = { path = "../transport", features = ["quic"] }
-web = { path = "../web", optional = true }
-chrono = "0.4.44"
-tracing = "0.1.44"
-thiserror = "2.0.18"
-utils = { path = "../utils" }
+app        = { workspace = true }
+licensing  = { workspace = true, optional = true }
+data-mover = { workspace = true }
+rustls     = { workspace = true }
+transport  = { workspace = true, features = ["quic"] }
+web        = { workspace = true, optional = true }
+chrono     = { workspace = true }
+tracing    = { workspace = true }
+thiserror  = { workspace = true }
+utils      = { workspace = true }
 
 [dependencies.clap]
 version = "4.6.0"
@@ -28,5 +28,3 @@ features = ["cargo", "derive"]
 
 [lints]
 workspace = true
-
-[dev-dependencies]

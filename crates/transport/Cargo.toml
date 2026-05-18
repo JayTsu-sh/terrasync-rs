@@ -8,21 +8,21 @@ default = []
 quic = ["dep:quinn", "dep:rcgen", "dep:rustls", "dep:bincode", "dep:tracing", "dep:zstd"]
 
 [dependencies]
-async-channel = "2"
-async-trait = "0.1"
-bytes = { version = "1", features = ["serde"] }
-serde = { version = "1", features = ["derive", "rc"] }
-data-mover = { git = "https://github.com/JayTsu-sh/data-mover-rs.git" }
-thiserror = "2.0.18"
-tokio = { version = "1.51.1", features = ["sync"] }
+async-channel = { workspace = true }
+async-trait   = { workspace = true }
+bytes         = { workspace = true, features = ["serde"] }
+serde         = { workspace = true, features = ["rc"] }
+data-mover    = { workspace = true }
+thiserror     = { workspace = true }
+tokio         = { version = "1.51.1", features = ["sync"] }
 
 # QUIC 可选依赖（feature = "quic" 时启用）
-quinn = { version = "0.11", optional = true }
-rcgen = { version = "0.13", optional = true }
-rustls = { version = "0.23", default-features = false, features = ["ring", "std"], optional = true }
-bincode = { version = "2", features = ["serde"], optional = true }
-tracing = { version = "0.1", optional = true }
-zstd = { version = "0.13", optional = true }
+quinn   = { version = "0.11", optional = true }
+rcgen   = { version = "0.13", optional = true }
+rustls  = { workspace = true, optional = true }
+bincode = { workspace = true, optional = true }
+tracing = { workspace = true, optional = true }
+zstd    = { version = "0.13", optional = true }
 
 [dev-dependencies]
 tokio = { version = "1.51.1", features = ["full", "test-util"] }

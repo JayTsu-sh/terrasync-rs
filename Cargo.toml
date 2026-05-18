@@ -16,6 +16,7 @@ name = "terrasync"
 path = "src/main.rs"
 
 [workspace]
+resolver = "2"
 members = [
     "crates/utils",
     "crates/cli",
@@ -26,6 +27,53 @@ members = [
     "crates/transport",
     "crates/sync-delta",
 ]
+
+# 集中管理 workspace 共享依赖，子 crate 用 `xxx = { workspace = true }` 引用。
+# 外部 fork（data-mover）不锁 rev，跟随 main，Cargo.lock 提供可复现性。
+[workspace.dependencies]
+# 异步运行时
+tokio        = { version = "1.51", features = ["full"] }
+tokio-util   = { version = "0.7" }
+async-trait  = "0.1"
+async-channel = "2"
+futures      = "0.3"
+futures-util = "0.3"
+
+# 序列化
+serde        = { version = "1", features = ["derive"] }
+serde_json   = "1"
+bincode      = { version = "2", features = ["serde"] }
+
+# 错误 / 日志
+thiserror    = "2"
+tracing      = "0.1"
+
+# 通用工具
+bytes        = "1"
+chrono       = { version = "0.4", features = ["serde"] }
+uuid         = { version = "1", features = ["v4"] }
+dashmap      = "6.1"
+hex          = "0.4"
+blake3       = "1.8"
+
+# TLS / 加密
+rustls       = { version = "0.23", default-features = false, features = ["ring", "std"] }
+
+# HTTP 客户端
+reqwest      = { version = "0.13", default-features = false, features = ["rustls", "json"] }
+
+# 外部 fork（跟 main，靠 Cargo.lock 保证可复现）
+data-mover   = { git = "https://github.com/JayTsu-sh/data-mover-rs.git" }
+
+# 内部 path crate
+app          = { path = "crates/app" }
+cli          = { path = "crates/cli" }
+db           = { path = "crates/db" }
+licensing    = { path = "crates/licensing" }
+sync-delta   = { path = "crates/sync-delta" }
+transport    = { path = "crates/transport" }
+utils        = { path = "crates/utils" }
+web          = { path = "crates/web" }
 
 [workspace.lints.rust]
 # 明确标记 unsafe 代码（NFS/Lustre FFI 处可局部 #[allow(unsafe_code)] 豁免）
@@ -64,8 +112,8 @@ default = ["basic"]
 # 基本功能（始终包含）
 basic = []
 
-# Profileing特性
-profiling = []
+# Profiling 特性（启用 tokio-console 客户端用于性能/异步任务分析）
+profiling = ["dep:console-subscriber"]
 
 # DuckDB特性
 duckdb = ["cli/duckdb"]
@@ -77,30 +125,31 @@ license = ["cli/license"]
 gui = ["cli/gui"]
 
 [dependencies]
-cli = { path = "crates/cli" }
-console-subscriber = "0.5.0"
+cli = { workspace = true }
+console-subscriber = { version = "0.5.0", optional = true }
 mimalloc = "0.1"
-tokio = { version = "1.51", features = ["full"] }
+tokio = { workspace = true }
 
 [dev-dependencies]
 assert_cmd = "2.2.0"
 predicates = "3.1.4"
 serial_test = "3.4.0"
 
+# nfs-rs / smb 必须保留：data-mover 内部用 crates.io 写法引用它们（nfs-rs = "0.2.0"、smb = "0.12"），
+# data-mover 自身的 [patch.crates-io] 在被作为依赖引入时不生效，只有 workspace root 的 patch 才生效。
+# 这里的 patch 把 data-mover 内部的传递依赖替换为 fork 版本。
 [patch.crates-io]
 nfs-rs = { git = "https://github.com/JayTsu-sh/nfs-rs.git" }
-# Handle Lease Phase A–D + P2.b compound (PR #2 merged 2026-05-15).
-# Tracking fork main; run `cargo update -p smb` to pull the latest.
-smb = { git = "https://github.com/JayTsu-sh/smb-rs.git" }
+smb    = { git = "https://github.com/JayTsu-sh/smb-rs.git" }
 
 [lints]
 workspace = true
 
 [profile.release]
 lto = "thin"
-opt-level = "s"
+opt-level = 3
+codegen-units = 1
 strip = "symbols"
-incremental = true
 
 # 火焰图专用 profile: release 级优化 + 保留调试符号
 [profile.profiling]

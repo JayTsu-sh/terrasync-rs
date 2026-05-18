@@ -16,18 +16,19 @@ sha2 = "0.10"
 hkdf = "0.12"
 
 # 序列化
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+serde = { workspace = true }
+serde_json = { workspace = true }
 base64 = "0.22"
-hex = "0.4"
-chrono = { version = "0.4", features = ["serde"] }
+hex = { workspace = true }
+chrono = { workspace = true }
 
 # 错误处理与日志
-thiserror = "2"
-tracing = "0.1"
+thiserror = { workspace = true }
+tracing = { workspace = true }
 
 # 仅生成工具需要（feature-gated）
-uuid = { version = "1", features = ["v4"], optional = true }
+uuid = { workspace = true, optional = true }
+# rand 0.8 是 licensing 当前 OsRng/RngCore 写法所需的版本
 rand = { version = "0.8", optional = true }
 clap = { version = "4", features = ["derive"], optional = true }
 
