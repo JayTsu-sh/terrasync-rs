@@ -34,7 +34,6 @@ pub struct QuicSenderTransport {
 pub async fn connect(
     addr: SocketAddr, server_name: &str, server_cert: Option<CertificateDer<'static>>,
 ) -> Result<QuicSenderTransport> {
-    let _ = rustls::crypto::ring::default_provider().install_default();
     let client_config = if let Some(cert) = server_cert {
         cert::build_client_config_with_ca(cert)
             .map_err(|e| TransportError::SendFailed(format!("client config (ca): {e}")))?

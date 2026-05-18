@@ -31,7 +31,6 @@ pub struct QuicReceiverTransport {
 /// 返回 `(QuicReceiverTransport, Endpoint, cert_der)`：
 /// - `cert_der` 是服务端自签名证书的 DER 字节，调用方可写入文件供 Sender 侧验证（防 MITM）。
 pub async fn accept(listen_addr: SocketAddr) -> Result<(QuicReceiverTransport, quinn::Endpoint, Vec<u8>)> {
-    let _ = rustls::crypto::ring::default_provider().install_default();
     let (certs, key) = cert::generate_self_signed(&[]).map_err(|e| TransportError::RecvFailed(format!("cert: {e}")))?;
 
     // 在 certs 被 build_server_config 消费前，先保存 DER 字节

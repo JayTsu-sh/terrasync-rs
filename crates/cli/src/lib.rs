@@ -133,6 +133,11 @@ fn require_job_id<'a>(job_id: Option<&'a str>, cmd: &str) -> error::Result<&'a s
 /// - 成功时返回Ok(())
 /// - 失败时返回包含错误信息的Result
 pub async fn cli_match() -> error::Result<()> {
+    // 进程级 TLS crypto provider — 必须先于任何 RustlsClientConfig::builder() 调用：
+    // data-mover 的 s3 (s3+https 自签证书) 和 transport 的 quic 都依赖 process-wide
+    // default provider。重复 install 第二次起返回 Err 并被忽略，单一真理源在此。
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
     let args: Vec<String> = std::env::args().collect();
     // 检查版本参数（需要在 Cli::parse 前处理，避免缺少子命令时报错）
     for arg in &args {
