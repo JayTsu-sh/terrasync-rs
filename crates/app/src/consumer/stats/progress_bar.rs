@@ -23,7 +23,7 @@ const LOG_INTERVAL_SECS: u64 = 30;
 const FINISH_POLL_MS: u64 = 100;
 
 /// 分段等待直到 `is_finished` 返回 true 或超时。
-/// 将大 sleep 拆成 FINISH_POLL_MS 小段，大幅缩短 join 等待时间。
+/// 将大 sleep 拆成 `FINISH_POLL_MS` 小段，大幅缩短 join 等待时间。
 fn sleep_interruptible(checks: u64, is_finished: impl Fn() -> bool) {
     for _ in 0..checks {
         std::thread::sleep(Duration::from_millis(FINISH_POLL_MS));

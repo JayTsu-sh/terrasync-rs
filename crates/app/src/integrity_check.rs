@@ -42,7 +42,7 @@ pub enum IssueKind {
     Missing,
     /// 元数据/内容不匹配
     Mismatch,
-    /// 无法验证（瞬时 NFS 错误，如 NFS4ERR_DELAY 重试耗尽、连接断开）。
+    /// 无法验证（瞬时 NFS 错误，如 `NFS4ERR_DELAY` 重试耗尽、连接断开）。
     /// 与 `Missing` 区分：源端列出该条目，但因服务端瞬时故障无法确认目标端是否存在。
     /// 不能直接判定"缺失"——很可能文件存在，只是这次 LOOKUP 没成功。
     Error,
@@ -79,14 +79,28 @@ pub struct IntegrityIssue {
 /// integrity-check 期间针对瞬时错误的应用层重试间隔（毫秒）。
 ///
 /// 与 nfs-rs 层的 RPC 重试是**两层互补的防线**：
-/// - nfs-rs：RPC 级重试 NFS4ERR_DELAY，带 jitter，~50s 总等待。
+/// - nfs-rs：RPC 级重试 `NFS4ERR_DELAY`，带 jitter，~50s 总等待。
 /// - 应用层：单条 `get_metadata` 失败后的二次尝试，间隔更长（2s/5s/10s），
 ///   覆盖服务端因大量并发查询持续繁忙的场景（thundering herd 余波）。
 const INTEGRITY_TRANSIENT_RETRY_DELAYS_MS: [u64; 3] = [2000, 5000, 10000];
 
+/// 跨后端 mode 比较时用的掩码。
+///
+/// 不同后端返回的 mode 格式不一致：
+/// - NFSv3：原始 `fattr3.mode`，含 `S_IFREG`(0o100000)/`S_IFDIR`(0o040000) 等文件类型高位（e.g. `0o100644`）
+/// - NFSv4.1：RFC 5661 §5.8.2.16 `mode4` 仅为权限位，文件类型由独立 attr 表达（e.g. `0o644`）
+/// - Local on Unix：`MetadataExt::mode()` 返回完整 `st_mode`，含文件类型位
+/// - Local on Windows / CIFS：基于 readonly 属性合成的权限位（e.g. `0o644` / `0o755`），无类型位
+/// - S3：始终 `None`，由 `dest_is_s3` 短路跳过元数据比较
+///
+/// 直接相等比较会在混合后端 / 跨 NFS 协议版本场景下持续误报 mode 不匹配，
+/// 因此比较前用 0o777 归一化到 user/group/other 三组 rwx。
+/// 已知 trade-off：suid(0o4000)/sgid(0o2000)/sticky(0o1000) 也会被丢弃。
+const POSIX_MODE_COMPARE_MASK: u32 = 0o777;
+
 /// 判断 integrity-check 期间 dest 元数据查询失败是否为"目标确实不存在"。
 ///
-/// 仅当错误为 `FileNotFound` / `DirectoryNotFound` 时返回 true（对应 NFS4ERR_NOENT
+/// 仅当错误为 `FileNotFound` / `DirectoryNotFound` 时返回 true（对应 `NFS4ERR_NOENT`
 /// 在 data-mover 层重试耗尽后的转换结果）。其他错误（NFS 瞬时繁忙、连接断开等）
 /// 应归为 [`IssueKind::Error`]，避免误报为 `Missing`。
 fn is_truly_missing(err: &StorageError) -> bool {
@@ -126,6 +140,12 @@ async fn get_metadata_with_transient_retry(
     }
 }
 
+/// 跨后端 mode 比较：仅比较 0o777 部分，丢弃文件类型位与特殊位。
+/// 参见 [`POSIX_MODE_COMPARE_MASK`] 的注释了解 trade-off。
+fn modes_equivalent(a: u32, b: u32) -> bool {
+    a & POSIX_MODE_COMPARE_MASK == b & POSIX_MODE_COMPARE_MASK
+}
+
 /// 从 "size: src=100, dest=200" 格式的 mismatch 描述中提取标签 "size"
 fn extract_mismatch_labels(mismatches: &[String]) -> Vec<String> {
     mismatches
@@ -149,8 +169,8 @@ fn format_entry_metadata(entry: &EntryEnum) -> String {
 /// 比较两个 entry 的 mtime/uid/gid，以及可选的 mode，收集不一致描述。
 ///
 /// 当 `dest_is_s3` 为 true 时跳过全部元数据比较：
-/// - S3 的 LastModified 由服务端写入，PUT/CopyObject 都不允许客户端指定，源 mtime
-///   无法保留；S3-to-S3 sync 时 dest 的 LastModified 是 CopyObject 执行时间。
+/// - S3 的 `LastModified` 由服务端写入，PUT/`CopyObject` 都不允许客户端指定，源 mtime
+///   无法保留；S3-to-S3 sync 时 dest 的 `LastModified` 是 `CopyObject` 执行时间。
 /// - S3 对象不存在 POSIX uid/gid/mode 概念（S3Entry 中这三项始终为 None）。
 fn collect_metadata_mismatches(src: &EntryEnum, dest: &EntryEnum, check_mode: bool, dest_is_s3: bool) -> Vec<String> {
     if dest_is_s3 {
@@ -179,9 +199,13 @@ fn collect_metadata_mismatches(src: &EntryEnum, dest: &EntryEnum, check_mode: bo
 
     if check_mode
         && let (Some(src_mode), Some(dest_mode)) = (src.get_mode(), dest.get_mode())
-        && src_mode != dest_mode
+        && !modes_equivalent(src_mode, dest_mode)
     {
-        mismatches.push(format!("mode: src={src_mode:#o}, dest={dest_mode:#o}"));
+        let src_perm = src_mode & POSIX_MODE_COMPARE_MASK;
+        let dest_perm = dest_mode & POSIX_MODE_COMPARE_MASK;
+        mismatches.push(format!(
+            "mode: src={src_perm:#o} (raw {src_mode:#o}), dest={dest_perm:#o} (raw {dest_mode:#o})"
+        ));
     }
 
     mismatches
@@ -191,14 +215,14 @@ fn collect_metadata_mismatches(src: &EntryEnum, dest: &EntryEnum, check_mode: bo
 // Auto-fix 与 issue 构造辅助函数
 // ─────────────────────────────────────────────────
 
-/// 决定 mismatch 是否含「内容差异」（不可通过 set_metadata 修复）。
+/// 决定 mismatch 是否含「内容差异」（不可通过 `set_metadata` 修复）。
 fn detect_content_mismatch(mismatches: &[String]) -> bool {
     mismatches
         .iter()
         .any(|m| m.starts_with("size:") || m.starts_with("mtime:") || m.starts_with("hash") || m.contains("hash error"))
 }
 
-/// 把瞬时错误 / NotFound 错误归类为 IssueKind 并记录 error log。
+/// 把瞬时错误 / `NotFound` 错误归类为 `IssueKind` 并记录 error log。
 fn classify_lookup_error(entry_type: &'static str, relative_path: &Path, err: &StorageError) -> IssueKind {
     if is_truly_missing(err) {
         error!("{} missing in destination {:?}: {}", entry_type, relative_path, err);
@@ -212,7 +236,7 @@ fn classify_lookup_error(entry_type: &'static str, relative_path: &Path, err: &S
     }
 }
 
-/// 对单个条目尝试 auto-fix；返回最终 FixStatus 和 issue 应填充的 mismatches 标签。
+/// 对单个条目尝试 auto-fix；返回最终 `FixStatus` 和 issue 应填充的 mismatches 标签。
 async fn apply_auto_fix(
     dest_storage: &StorageEnum, relative_path: &Path, entry_type: &'static str, src: &EntryEnum,
     has_content_mismatch: bool,
@@ -225,26 +249,23 @@ async fn apply_auto_fix(
         _ => (None, None, None),
     };
 
-    match dest_storage
+    if let Err(e) = dest_storage
         .set_metadata(relative_path, atime, mtime, src.get_uid(), src.get_gid(), mode)
         .await
     {
-        Err(e) => {
-            error!("Auto-fix failed for {} {:?}: {}", entry_type, relative_path, e);
-            FixStatus::FixFailed
-        }
-        Ok(()) => {
-            info!("Auto-fix applied metadata for {} {:?}", entry_type, relative_path);
-            if has_content_mismatch {
-                FixStatus::PartiallyFixed
-            } else {
-                FixStatus::Fixed
-            }
+        error!("Auto-fix failed for {} {:?}: {}", entry_type, relative_path, e);
+        FixStatus::FixFailed
+    } else {
+        info!("Auto-fix applied metadata for {} {:?}", entry_type, relative_path);
+        if has_content_mismatch {
+            FixStatus::PartiallyFixed
+        } else {
+            FixStatus::Fixed
         }
     }
 }
 
-/// 构造一条 mismatch issue（按 auto_fix 决定 FixStatus）。
+/// 构造一条 mismatch issue（按 `auto_fix` 决定 `FixStatus`）。
 async fn build_mismatch_issue(
     dest_storage: &StorageEnum, relative_path: &Path, entry_type: &'static str, src: &EntryEnum,
     mismatches: Vec<String>, auto_fix: bool,
@@ -767,6 +788,30 @@ mod tests {
         assert!(is_truly_missing(&StorageError::FileNotFound("/tmp/x".into())));
         assert!(is_truly_missing(&StorageError::DirectoryNotFound("/tmp/x".into())));
         assert!(!is_truly_missing(&StorageError::OperationError("nfs busy".into())));
+    }
+
+    #[test]
+    fn modes_equivalent_ignores_file_type_bits() {
+        // NFSv3 / Local Unix raw st_mode vs NFSv4.1 / CIFS / Local Windows 合成权限位。
+        // 下划线分隔 <类型位>_<权限位>。
+        assert!(modes_equivalent(0o100_644, 0o000_644));
+        assert!(modes_equivalent(0o040_755, 0o000_755));
+        assert!(modes_equivalent(0o120_777, 0o000_777));
+    }
+
+    #[test]
+    fn modes_equivalent_detects_real_permission_diff() {
+        assert!(!modes_equivalent(0o100_644, 0o100_755));
+        assert!(!modes_equivalent(0o100_644, 0o000_755));
+    }
+
+    #[test]
+    fn modes_equivalent_masks_special_bits() {
+        // 已知 trade-off：0o777 掩码丢弃 suid/sgid/sticky。
+        // 此测试钉住该行为，未来若改为 0o7777 必须同步更新。
+        assert!(modes_equivalent(0o104_755, 0o100_755)); // suid bit difference ignored
+        assert!(modes_equivalent(0o102_755, 0o100_755)); // sgid bit difference ignored
+        assert!(modes_equivalent(0o101_755, 0o100_755)); // sticky bit difference ignored
     }
 
     #[test]

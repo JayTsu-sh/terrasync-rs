@@ -3186,7 +3186,7 @@ dependencies = [
  "libc",
  "percent-encoding",
  "pin-project-lite",
- "socket2 0.6.3",
+ "socket2 0.5.10",
  "tokio",
  "tower-service",
  "tracing",
@@ -3757,17 +3757,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "47e1ffaa40ddd1f3ed91f717a33c8c0ee23fff369e3aa8772b9605cc1d22f4c3"
 
 [[package]]
-name = "maybe-async"
-version = "0.2.10"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5cf92c10c7e361d6b99666ec1c6f9805b0bea2c3bd8c78dc6fe98ac5bd78db11"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 2.0.117",
-]
-
-[[package]]
 name = "md-5"
 version = "0.10.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3901,7 +3890,7 @@ checksum = "cf5a574dadd7941adeaa71823ecba5e28331b8313fb2e1c6a5c7e5981ea53ad6"
 [[package]]
 name = "nfs-rs"
 version = "0.2.0"
-source = "git+https://github.com/JayTsu-sh/nfs-rs.git#50b1d8b0fd54ad35e33b07e01df7cc79a32f238b"
+source = "git+https://github.com/JayTsu-sh/nfs-rs.git#9a618afbc0738463686d7947972e4474de9f3228"
 dependencies = [
  "async-trait",
  "byteorder",
@@ -4758,7 +4747,7 @@ dependencies = [
  "quinn-udp",
  "rustc-hash",
  "rustls 0.23.40",
- "socket2 0.6.3",
+ "socket2 0.5.10",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
@@ -4798,7 +4787,7 @@ dependencies = [
  "cfg_aliases",
  "libc",
  "once_cell",
- "socket2 0.6.3",
+ "socket2 0.5.10",
  "tracing",
  "windows-sys 0.59.0",
 ]
@@ -5942,11 +5931,12 @@ dependencies = [
 [[package]]
 name = "smb"
 version = "0.12.0"
-source = "git+https://github.com/JayTsu-sh/smb-rs.git#40b15ae8ee466ec1ed686df03d872ef5cb369fee"
+source = "git+https://github.com/JayTsu-sh/smb-rs.git#b246c1441d778c33d02994e6b7f5e6406c092973"
 dependencies = [
  "aead",
  "aes",
  "aes-gcm",
+ "arc-swap",
  "binrw",
  "bytes 1.11.1",
  "ccm",
@@ -5958,11 +5948,11 @@ dependencies = [
  "hmac 0.13.0-rc.2",
  "kbkdf",
  "lz4_flex",
- "maybe-async",
  "modular-bitfield",
  "pastey",
  "rand 0.8.6",
  "sha2 0.11.0-rc.2",
+ "siphasher",
  "smb-dtyp",
  "smb-fscc",
  "smb-msg",
@@ -5981,7 +5971,7 @@ dependencies = [
 [[package]]
 name = "smb-dtyp"
 version = "0.12.0"
-source = "git+https://github.com/JayTsu-sh/smb-rs.git#40b15ae8ee466ec1ed686df03d872ef5cb369fee"
+source = "git+https://github.com/JayTsu-sh/smb-rs.git#b246c1441d778c33d02994e6b7f5e6406c092973"
 dependencies = [
  "binrw",
  "modular-bitfield",
@@ -5994,7 +5984,7 @@ dependencies = [
 [[package]]
 name = "smb-dtyp-derive"
 version = "0.12.0"
-source = "git+https://github.com/JayTsu-sh/smb-rs.git#40b15ae8ee466ec1ed686df03d872ef5cb369fee"
+source = "git+https://github.com/JayTsu-sh/smb-rs.git#b246c1441d778c33d02994e6b7f5e6406c092973"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -6004,7 +5994,7 @@ dependencies = [
 [[package]]
 name = "smb-fscc"
 version = "0.12.0"
-source = "git+https://github.com/JayTsu-sh/smb-rs.git#40b15ae8ee466ec1ed686df03d872ef5cb369fee"
+source = "git+https://github.com/JayTsu-sh/smb-rs.git#b246c1441d778c33d02994e6b7f5e6406c092973"
 dependencies = [
  "binrw",
  "modular-bitfield",
@@ -6017,7 +6007,7 @@ dependencies = [
 [[package]]
 name = "smb-msg"
 version = "0.12.0"
-source = "git+https://github.com/JayTsu-sh/smb-rs.git#40b15ae8ee466ec1ed686df03d872ef5cb369fee"
+source = "git+https://github.com/JayTsu-sh/smb-rs.git#b246c1441d778c33d02994e6b7f5e6406c092973"
 dependencies = [
  "binrw",
  "modular-bitfield",
@@ -6032,7 +6022,7 @@ dependencies = [
 [[package]]
 name = "smb-msg-derive"
 version = "0.12.0"
-source = "git+https://github.com/JayTsu-sh/smb-rs.git#40b15ae8ee466ec1ed686df03d872ef5cb369fee"
+source = "git+https://github.com/JayTsu-sh/smb-rs.git#b246c1441d778c33d02994e6b7f5e6406c092973"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -6042,10 +6032,9 @@ dependencies = [
 [[package]]
 name = "smb-rpc"
 version = "0.12.0"
-source = "git+https://github.com/JayTsu-sh/smb-rs.git#40b15ae8ee466ec1ed686df03d872ef5cb369fee"
+source = "git+https://github.com/JayTsu-sh/smb-rs.git#b246c1441d778c33d02994e6b7f5e6406c092973"
 dependencies = [
  "binrw",
- "maybe-async",
  "modular-bitfield",
  "pastey",
  "smb-dtyp",
@@ -6056,13 +6045,12 @@ dependencies = [
 [[package]]
 name = "smb-transport"
 version = "0.12.0"
-source = "git+https://github.com/JayTsu-sh/smb-rs.git#40b15ae8ee466ec1ed686df03d872ef5cb369fee"
+source = "git+https://github.com/JayTsu-sh/smb-rs.git#b246c1441d778c33d02994e6b7f5e6406c092973"
 dependencies = [
  "binrw",
  "bytes 1.11.1",
  "futures-core",
  "futures-util",
- "maybe-async",
  "modular-bitfield",
  "pastey",
  "smb-dtyp",

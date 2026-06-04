@@ -85,8 +85,8 @@ const STATS_REPORT_INTERVAL: Duration = Duration::from_secs(10);
 ///
 /// URL scheme 比较按 RFC 3986 是 case-insensitive 的（"NFS://"、"Nfs://"
 /// 与 "nfs://" 等价），所以 prefix 比较走 ASCII 不区分大小写，避免上层
-/// 配置或 URL 解析器返回非小写时误走 NON_NFS 并发上限，进而触发 nfs-rs
-/// 特权端口 TIME_WAIT 拥塞。
+/// 配置或 URL 解析器返回非小写时误走 `NON_NFS` 并发上限，进而触发 nfs-rs
+/// 特权端口 `TIME_WAIT` 拥塞。
 fn mount_concurrency_for(path: &str) -> usize {
     const NFS_PREFIX: &str = "nfs://";
     if path.len() >= NFS_PREFIX.len() && path[..NFS_PREFIX.len()].eq_ignore_ascii_case(NFS_PREFIX) {
@@ -1283,7 +1283,7 @@ impl SyncOrchestrator {
     /// # 两遍处理设计
     ///
     /// **第一遍**：收集所有 `DeletionStatus`，从中提取「目录名发生变化的 rename」
-    /// 构建 `renamed_dirs` 映射（old_dir_path → new_dir_path）。
+    /// 构建 `renamed_dirs` 映射（`old_dir_path` → `new_dir_path`）。
     ///
     /// **第二遍**：顺序执行物理操作。对每条 `Renamed(from, to)` 判断是否跳过：
     /// - `from.name != to.name`：目录/文件本身改了名字 → 必须调用 `process_rename_entry`
@@ -1316,13 +1316,13 @@ impl SyncOrchestrator {
         let renamed_dirs: HashMap<PathBuf, PathBuf> = statuses
             .iter()
             .filter_map(|s| {
-                if let DeletionStatus::Renamed(from, to) = s {
-                    if from.get_is_dir() {
-                        return Some((
-                            from.get_relative_path().to_path_buf(),
-                            to.get_relative_path().to_path_buf(),
-                        ));
-                    }
+                if let DeletionStatus::Renamed(from, to) = s
+                    && from.get_is_dir()
+                {
+                    return Some((
+                        from.get_relative_path().to_path_buf(),
+                        to.get_relative_path().to_path_buf(),
+                    ));
                 }
                 None
             })
@@ -1386,28 +1386,27 @@ impl SyncOrchestrator {
                         Ok(()) => {
                             // Phase A 不再把路径已变的文件判为 Changed（Fix 2a），
                             // 此处补足 rename+changed 文件的内容/元数据同步，并广播 Changed 消息供消费者统计。
-                            if !from_arc.get_is_dir() && !from_arc.get_is_symlink() {
-                                if let Some(kind) = ChangeKind::from_entry_diff(&from_arc, &to_arc) {
-                                    if Self::sync_renamed_file_changes(
+                            if !from_arc.get_is_dir()
+                                && !from_arc.get_is_symlink()
+                                && let Some(kind) = ChangeKind::from_entry_diff(&from_arc, &to_arc)
+                                && Self::sync_renamed_file_changes(
+                                    kind,
+                                    &to_arc,
+                                    &src_storage,
+                                    &dest_storage,
+                                    qos_manager.clone(),
+                                    enable_integrity_check,
+                                    is_source_reserved,
+                                    bytes_counter.clone(),
+                                )
+                                .await
+                            {
+                                broadcaster
+                                    .broadcast(StorageEntryMessage::Changed {
+                                        entry: to_arc.clone(),
                                         kind,
-                                        &to_arc,
-                                        &src_storage,
-                                        &dest_storage,
-                                        qos_manager.clone(),
-                                        enable_integrity_check,
-                                        is_source_reserved,
-                                        bytes_counter.clone(),
-                                    )
-                                    .await
-                                    {
-                                        broadcaster
-                                            .broadcast(StorageEntryMessage::Changed {
-                                                entry: to_arc.clone(),
-                                                kind,
-                                            })
-                                            .await;
-                                    }
-                                }
+                                    })
+                                    .await;
                             }
 
                             broadcaster
@@ -1453,11 +1452,11 @@ impl SyncOrchestrator {
         );
 
         // 并发回写目录 mtime：串行调用对 NFS/CIFS 延迟叠加明显（N 目录 × 网络延迟）
-        const DIR_META_CONCURRENCY: usize = 32;
-        let sem = Arc::new(Semaphore::new(DIR_META_CONCURRENCY));
+        let dir_meta_concurrency: usize = 32;
+        let sem = Arc::new(Semaphore::new(dir_meta_concurrency));
         let mut join_set = JoinSet::new();
 
-        // 注意：acquire_owned 在 spawn 之前 await，确保 join_set 中在飞任务数 ≤ DIR_META_CONCURRENCY
+        // 注意：acquire_owned 在 spawn 之前 await，确保 join_set 中在飞任务数 ≤ dir_meta_concurrency
         while let Some(dir_entry) = dir_rx.recv().await {
             let Ok(permit) = sem.clone().acquire_owned().await else {
                 error!("Directory metadata semaphore unexpectedly closed");
@@ -1489,6 +1488,29 @@ impl SyncOrchestrator {
         if let Err(e) = progress_handle.join() {
             error!("Progress bar thread panicked: {:?}", e);
         }
+    }
+}
+
+/// 创建 `QoS` 管理器（crate 内共享，供 orchestrator 和 `remote_sync` 调用）
+pub(crate) fn create_qos_manager(qos: Option<&String>, peak_qos_rate: f32, iops: Option<u32>) -> Option<QosManager> {
+    match qos {
+        Some(qos_str) => match QosManager::try_new(Some(qos_str), peak_qos_rate, iops) {
+            Ok(mgr) => Some(mgr),
+            Err(e) => {
+                error!("Failed to parse QoS configuration: {}", e);
+                None
+            }
+        },
+        None => match iops {
+            Some(iops_val) if iops_val > 0 => match QosManager::try_new(None, peak_qos_rate, Some(iops_val)) {
+                Ok(mgr) => Some(mgr),
+                Err(e) => {
+                    error!("Failed to create IOPS-only QoS: {}", e);
+                    None
+                }
+            },
+            _ => None,
+        },
     }
 }
 
@@ -1551,28 +1573,5 @@ mod mount_concurrency_tests {
             mount_concurrency_for_pair("smb://u:p@a/x", "nfs://b/y"),
             NFS_MOUNT_CONCURRENCY
         );
-    }
-}
-
-/// 创建 `QoS` 管理器（crate 内共享，供 orchestrator 和 `remote_sync` 调用）
-pub(crate) fn create_qos_manager(qos: Option<&String>, peak_qos_rate: f32, iops: Option<u32>) -> Option<QosManager> {
-    match qos {
-        Some(qos_str) => match QosManager::try_new(Some(qos_str), peak_qos_rate, iops) {
-            Ok(mgr) => Some(mgr),
-            Err(e) => {
-                error!("Failed to parse QoS configuration: {}", e);
-                None
-            }
-        },
-        None => match iops {
-            Some(iops_val) if iops_val > 0 => match QosManager::try_new(None, peak_qos_rate, Some(iops_val)) {
-                Ok(mgr) => Some(mgr),
-                Err(e) => {
-                    error!("Failed to create IOPS-only QoS: {}", e);
-                    None
-                }
-            },
-            _ => None,
-        },
     }
 }

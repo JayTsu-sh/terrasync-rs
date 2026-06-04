@@ -95,6 +95,7 @@ cast_possible_wrap = "allow"
 cast_sign_loss = "allow"
 cast_precision_loss = "allow"
 significant_drop_tightening = "allow" # 异步上下文中锁生命周期管理复杂
+large_futures = "allow"               # 异步元数据/扫描路径上 future ~20KB 属正常规模，避免到处 Box::pin
 
 # ── 强制禁止（与 CLAUDE.md 规范一致） ─────────────────────────────────────────
 unwrap_used = "deny"

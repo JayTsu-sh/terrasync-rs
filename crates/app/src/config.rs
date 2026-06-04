@@ -85,11 +85,12 @@ pub struct ConsumerConfig {
 /// 整合 `sync()/incremental_sync()` 的所有参数，供 `SyncOrchestrator` 使用。
 /// `scan_type` 由 `SyncOrchestrator::run()` 自动判定（查数据库 base 表，fallback 文件系统）。
 #[derive(Debug, Clone)]
+#[allow(clippy::struct_excessive_bools)] // 配置结构按用途分组的开关集合，重构为枚举会失去可读性
 pub struct SyncJobConfig {
     pub job_id: String,
     pub job_dir: String,
-    /// job_dir 是否在本次调用前已经存在（由调用方 snapshot 注入）
-    /// 用于 app 层判定 ScanType 的文件系统 fallback（数据库不可达时）
+    /// `job_dir` 是否在本次调用前已经存在（由调用方 snapshot 注入）
+    /// 用于 app 层判定 `ScanType` 的文件系统 fallback（数据库不可达时）
     pub job_dir_pre_existing: bool,
     pub src_path: String,
     pub dest_path: String,

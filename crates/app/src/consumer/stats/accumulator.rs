@@ -1067,7 +1067,7 @@ pub fn print_integrity_check_result(
 /// 打印 Errors 条目列表（瞬时 NFS 错误导致无法验证的条目）。
 ///
 /// 与 [`print_missing_table`] 区分：Missing 是确认 ENOENT 的真缺失；
-/// Errors 是 LOOKUP 因服务端瞬时故障（NFS4ERR_DELAY 重试耗尽、连接断开等）失败，
+/// Errors 是 LOOKUP 因服务端瞬时故障（`NFS4ERR_DELAY` 重试耗尽、连接断开等）失败，
 /// 文件可能存在，仅本次未能验证。建议人工复核或重跑 integrity-check。
 fn print_errors_table(errors: &[&IntegrityIssue]) {
     println!("  TRANSIENT ERRORS — UNABLE TO VERIFY ({}):", errors.len());

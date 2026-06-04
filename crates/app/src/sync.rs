@@ -392,6 +392,7 @@ pub(crate) async fn process_versioned_entry(
 
 /// `process_entry` / `process_entry_inner` 的标志位组合
 #[derive(Debug, Clone, Copy, Default)]
+#[allow(clippy::struct_excessive_bools)] // 标志位结构按调用现场天然分组，封装为枚举会引入调用点繁杂匹配
 pub(crate) struct ProcessEntryOpts {
     pub enable_integrity_check: bool,
     pub enable_acl: bool,
@@ -400,6 +401,7 @@ pub(crate) struct ProcessEntryOpts {
     pub skip_data_copy: bool,
 }
 
+#[allow(clippy::too_many_arguments)] // 公共入口需要逐项透传调用方上下文，封装结构会破坏 API 形态
 pub(crate) async fn process_entry(
     entry: &EntryEnum, src_storage: Arc<StorageEnum>, dest_storage: Arc<StorageEnum>, enable_integrity_check: bool,
     enable_acl: bool, is_source_reserved: bool, qos_manager: Option<QosManager>, bytes_counter: Option<Arc<AtomicU64>>,
