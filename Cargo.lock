@@ -1975,7 +1975,7 @@ checksum = "a4ae5f15dda3c708c0ade84bfee31ccab44a3da4f88015ed22f63732abe300c8"
 [[package]]
 name = "data-mover"
 version = "0.2.0"
-source = "git+https://github.com/JayTsu-sh/data-mover-rs.git#7437687abe1b421bf160faa6e293ff86ce106874"
+source = "git+https://github.com/JayTsu-sh/data-mover-rs.git#ef9aaa7cd62f29f4be7bd3b72d44532cea42b98c"
 dependencies = [
  "arc-swap",
  "async-channel",
@@ -3186,7 +3186,7 @@ dependencies = [
  "libc",
  "percent-encoding",
  "pin-project-lite",
- "socket2 0.5.10",
+ "socket2 0.6.3",
  "tokio",
  "tower-service",
  "tracing",
@@ -3890,7 +3890,7 @@ checksum = "cf5a574dadd7941adeaa71823ecba5e28331b8313fb2e1c6a5c7e5981ea53ad6"
 [[package]]
 name = "nfs-rs"
 version = "0.2.0"
-source = "git+https://github.com/JayTsu-sh/nfs-rs.git#9a618afbc0738463686d7947972e4474de9f3228"
+source = "git+https://github.com/JayTsu-sh/nfs-rs.git#b726293cade0e2c1ff612f438c2e2d5d5d9b775b"
 dependencies = [
  "async-trait",
  "byteorder",
@@ -4747,7 +4747,7 @@ dependencies = [
  "quinn-udp",
  "rustc-hash",
  "rustls 0.23.40",
- "socket2 0.5.10",
+ "socket2 0.6.3",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
@@ -4787,7 +4787,7 @@ dependencies = [
  "cfg_aliases",
  "libc",
  "once_cell",
- "socket2 0.5.10",
+ "socket2 0.6.3",
  "tracing",
  "windows-sys 0.59.0",
 ]
@@ -7509,7 +7509,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.48.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
