@@ -1,0 +1,36 @@
+[log]
+max_size = 100
+max_backups = 3
+level = "info"
+enable_json = false
+
+[scan]
+concurrency = 4
+include_tags = false
+
+[sync]
+is_source_reserved = true
+concurrency = 4
+
+[integrity_check]
+concurrency = 4
+
+[delete]
+concurrency = 4
+
+[database]
+enabled = true
+type = "duckdb"
+batch_size = 100000
+
+[database.clickhouse]
+dsn = "http://127.0.0.1:8123"
+dial_timeout = 5
+read_timeout = 30
+database = "default"
+username = "default"
+password = ""
+
+[database.duckdb]
+in_memory = true
+pool_size = 4
