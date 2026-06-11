@@ -14,9 +14,7 @@ use std::sync::atomic::AtomicU64;
 // 外部crate
 use dashmap::DashMap;
 use data_mover::qos::QosManager;
-use data_mover::{
-    EntryEnum, ErrorEvent, StorageEntryMessage, StorageEnum, create_storage, redact_storage_url,
-};
+use data_mover::{EntryEnum, ErrorEvent, StorageEntryMessage, StorageEnum, create_storage, redact_storage_url};
 use tracing::{Instrument, debug, error, info, info_span, instrument, trace};
 #[cfg(windows)]
 use windows_sys::Win32::Foundation::CloseHandle;
