@@ -15,8 +15,7 @@ use std::sync::atomic::AtomicU64;
 use dashmap::DashMap;
 use data_mover::qos::QosManager;
 use data_mover::{
-    EntryEnum, ErrorEvent, StorageEntryMessage, StorageEnum, create_storage, create_storage_for_dest,
-    redact_storage_url,
+    EntryEnum, ErrorEvent, StorageEntryMessage, StorageEnum, create_storage, redact_storage_url,
 };
 use tracing::{Instrument, debug, error, info, info_span, instrument, trace};
 #[cfg(windows)]
@@ -60,9 +59,9 @@ impl StoragePair {
     pub async fn new(src_path: &str, dest_path: &str, block_size: Option<usize>) -> Result<Self> {
         let block_size_u64 = block_size.map(|s| s as u64);
         // 根据传入的src_path创建storage pool
-        let src_storage = Arc::new(create_storage(src_path, block_size_u64).await?);
+        let src_storage = Arc::new(create_storage(src_path, block_size_u64, false).await?);
         // 根据传入的dest_path创建storage pool，如果目标目录不存在则自动创建
-        let dest_storage = Arc::new(create_storage_for_dest(dest_path, block_size_u64).await?);
+        let dest_storage = Arc::new(create_storage(dest_path, block_size_u64, true).await?);
         info!("Created source and destination storage, block_size: {:?}", block_size);
 
         Ok(Self {

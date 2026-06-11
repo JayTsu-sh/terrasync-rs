@@ -61,7 +61,7 @@ pub(crate) async fn run(config: &SyncJobConfig, remote_addr: &str, tls_cert_byte
         Some(s) => Some(parse_size(s)?),
         None => None,
     };
-    let src_storage = Arc::new(create_storage(&config.src_path, block_size.map(|s| s as u64)).await?);
+    let src_storage = Arc::new(create_storage(&config.src_path, block_size.map(|s| s as u64), false).await?);
     let match_expr = config.r#match.as_deref().and_then(|e| parse_filter_expression(e).ok());
     let exclude_expr = config.exclude.as_deref().and_then(|e| parse_filter_expression(e).ok());
     let app_config = AppConfig::fetch()?;

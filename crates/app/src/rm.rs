@@ -20,7 +20,7 @@ pub async fn rm(path: &str) -> Result<()> {
 
     info!("开始删除路径: {}", path);
 
-    let storage = create_storage(path, None).await?;
+    let storage = create_storage(path, None, false).await?;
 
     let pb = ProgressBar::new_spinner();
     pb.set_style(

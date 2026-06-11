@@ -594,7 +594,7 @@ impl SyncOrchestrator {
         consumer_manager.end_lifecycle().await;
 
         // ── 14. 更新目录元数据（非 S3 目标端） ──
-        let dest_storage_for_metadata = Arc::new(create_storage(&c.dest_path, block_size.map(|s| s as u64)).await?);
+        let dest_storage_for_metadata = Arc::new(create_storage(&c.dest_path, block_size.map(|s| s as u64), false).await?);
         if !matches!(dest_storage_for_metadata.as_ref(), StorageEnum::S3(_)) {
             Self::update_directory_metadata(database, &dest_storage_for_metadata).await;
         }
@@ -1132,8 +1132,8 @@ impl SyncOrchestrator {
 
         // dest storage 提升到 async 块外，供后续 update_directory_metadata 复用，避免二次挂载
         let phase_b_dest_storage: Result<Arc<StorageEnum>> = async {
-            let dest_storage_phase_b = Arc::new(create_storage(&c.dest_path, block_size.map(|s| s as u64)).await?);
-            let src_storage_phase_b = Arc::new(create_storage(&c.src_path, block_size.map(|s| s as u64)).await?);
+            let dest_storage_phase_b = Arc::new(create_storage(&c.dest_path, block_size.map(|s| s as u64), false).await?);
+            let src_storage_phase_b = Arc::new(create_storage(&c.src_path, block_size.map(|s| s as u64), false).await?);
 
             Self::apply_deletions_and_renames(
                 &*db_clone,

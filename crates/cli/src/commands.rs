@@ -17,7 +17,7 @@ use std::sync::Arc;
 use app::config::SyncJobConfig;
 use app::orchestrator::SyncOrchestrator;
 use app::prelude::{integrity_check, parse_bandwidth_string, rm, scan, sync};
-use data_mover::create_storage_for_dest;
+use data_mover::create_storage;
 use tracing::info;
 use transport::quic;
 use utils::app_config::AppConfig;
@@ -348,7 +348,7 @@ pub async fn serve_cmd(listen: &str, dest_path: &str, tls_cert_out: &str) -> Res
         .map_err(|e| CliError::InvalidParameter(format!("Invalid listen address: {e}")))?;
 
     // 3. 创建目标端 StorageEnum
-    let dest_storage = Arc::new(create_storage_for_dest(dest_path, None).await?);
+    let dest_storage = Arc::new(create_storage(dest_path, None, true).await?);
     info!("Created destination storage for: {}", dest_path);
 
     // 4. 接受 QUIC 连接，获取服务端证书 DER

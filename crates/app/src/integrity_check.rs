@@ -587,14 +587,14 @@ pub async fn integrity_check(
         let span = info_span!("integrity_check_worker", worker_id = worker_id);
         let handle = tokio::spawn(
             async move {
-                let src_storage = match create_storage(&src_path, None).await {
+                let src_storage = match create_storage(&src_path, None, false).await {
                     Ok(s) => Arc::new(s),
                     Err(e) => {
                         error!("Worker {}: Failed to create src storage: {}", worker_id, e);
                         return;
                     }
                 };
-                let dest_storage = match create_storage(&dest_path, None).await {
+                let dest_storage = match create_storage(&dest_path, None, false).await {
                     Ok(s) => Arc::new(s),
                     Err(e) => {
                         error!("Worker {}: Failed to create dest storage: {}", worker_id, e);
@@ -711,7 +711,7 @@ pub(crate) async fn verify_storage_time(dest_path: &str) -> Result<()> {
         None => return Ok(()),
     };
 
-    let dest_storage = match create_storage(dest_path, None).await {
+    let dest_storage = match create_storage(dest_path, None, false).await {
         Ok(s) => s,
         Err(e) => {
             warn!("Storage time check: failed to create storage: {}", e);
