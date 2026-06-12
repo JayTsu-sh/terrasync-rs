@@ -1975,7 +1975,7 @@ checksum = "a4ae5f15dda3c708c0ade84bfee31ccab44a3da4f88015ed22f63732abe300c8"
 [[package]]
 name = "data-mover"
 version = "0.2.0"
-source = "git+https://github.com/JayTsu-sh/data-mover-rs.git#742df592ef7fc0702a7d244478aaf3de7a9d83c1"
+source = "git+https://github.com/JayTsu-sh/data-mover-rs.git#34e0a4ff2fce57a49565dfb6210fcc30028aaf98"
 dependencies = [
  "arc-swap",
  "async-channel",
@@ -2366,7 +2366,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -3890,7 +3890,7 @@ checksum = "cf5a574dadd7941adeaa71823ecba5e28331b8313fb2e1c6a5c7e5981ea53ad6"
 [[package]]
 name = "nfs-rs"
 version = "0.2.0"
-source = "git+https://github.com/JayTsu-sh/nfs-rs.git#de3d148e0b471692e11de729cce77a1b852f25a3"
+source = "git+https://github.com/JayTsu-sh/nfs-rs.git#d6f104ce50eec4e9ad8aa5b0205bdec2d759a31b"
 dependencies = [
  "async-trait",
  "byteorder",
@@ -3958,7 +3958,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -5386,7 +5386,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.12.1",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -5457,7 +5457,7 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -5478,7 +5478,7 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
