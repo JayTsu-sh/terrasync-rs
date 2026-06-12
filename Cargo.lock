@@ -3890,7 +3890,7 @@ checksum = "cf5a574dadd7941adeaa71823ecba5e28331b8313fb2e1c6a5c7e5981ea53ad6"
 [[package]]
 name = "nfs-rs"
 version = "0.2.0"
-source = "git+https://github.com/JayTsu-sh/nfs-rs.git#efd007e54e9eaf6dd8cfc3f4213d1ba4bee14203"
+source = "git+https://github.com/JayTsu-sh/nfs-rs.git#de3d148e0b471692e11de729cce77a1b852f25a3"
 dependencies = [
  "async-trait",
  "byteorder",
