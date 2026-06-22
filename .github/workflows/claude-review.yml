@@ -26,6 +26,7 @@ jobs:
             2. 项目规范（.claude/rules/rust-patterns.md）：禁止 unwrap/expect；use 集中顶部、路径≤两层；每个 crate 必须 thiserror 专属 Error，不得 Box<dyn Error>/String 兜底；重构不得改语义。
             3. 安全与性能：热路径 clone/Mutex、async 中的同步 IO、unbounded channel。
             按文件给出 inline review 评论；无问题则简短 approve 说明。用中文。
+          # 不限制 allowedTools —— 否则会连 Action 发 review 评论的工具一起禁掉。
+          # reviewer 的「只读」由 contents: read 权限保证（无写 token，push 不了代码）。
           claude_args: |
-            --allowedTools "Read,Grep,Glob"
             --max-turns 20
