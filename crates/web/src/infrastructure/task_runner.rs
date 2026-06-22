@@ -316,6 +316,7 @@ async fn run_migration_task(
                 package_depth: 0,
                 raw_command_line: format!("gui:sync {source_url} {dest}"),
                 progress_callback_url: callback_url,
+                no_resume: false,
             };
             app::sync::sync(config).await?;
             Ok(())

@@ -71,6 +71,11 @@ pub enum AppError {
     /// 当目录打包为 tar 文件失败时触发
     #[error("Pack error for {path}: {reason}")]
     PackError { path: String, reason: String },
+
+    /// 断点续传错误
+    /// 当字节级续传状态读写或解析失败时触发
+    #[error("Checkpoint error: {0}")]
+    CheckpointError(String),
 }
 
 /// 应用程序的结果类型别名

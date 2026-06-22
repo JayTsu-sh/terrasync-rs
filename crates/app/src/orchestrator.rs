@@ -385,6 +385,8 @@ impl SyncOrchestrator {
             enable_integrity_check: c.enable_integrity_check,
             enable_acl: c.enable_acl,
             is_source_reserved,
+            job_dir: c.job_dir.clone(),
+            no_resume: c.no_resume,
         });
 
         // ── 8.5. 创建 mount 限流信号量 + countdown latch 计数器（Sender + Receiver 共享） ──

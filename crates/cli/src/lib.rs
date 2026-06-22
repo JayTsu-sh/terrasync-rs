@@ -241,6 +241,7 @@ pub async fn cli_match() -> error::Result<()> {
             package_depth,
             remote,
             tls_server_cert,
+            no_resume,
             ..
         } => {
             commands::sync_cmd(
@@ -261,6 +262,7 @@ pub async fn cli_match() -> error::Result<()> {
                 remote,
                 tls_server_cert,
                 raw_command_line,
+                *no_resume,
             )
             .await?;
         }

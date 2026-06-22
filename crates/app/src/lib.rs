@@ -11,6 +11,11 @@ pub mod ace;
 
 pub mod broadcast;
 
+/// 字节级断点续传状态模块
+///
+/// 为多块大文件记录已落盘 offset 区间，支持中断后从未完成位置续传
+pub mod byte_resume;
+
 /// 配置管理模块
 ///
 /// 处理应用的配置初始化和管理

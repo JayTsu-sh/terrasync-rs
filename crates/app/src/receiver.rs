@@ -18,6 +18,7 @@ use transport::message::{DestIndex, NdxTable, ProgressSnapshot, ReceiverMsg, Sen
 use transport::traits::ReceiverTransport;
 
 // 内部模块
+use crate::byte_resume::{ByteResumeStore, part_path_for};
 use crate::error::{AppError, Result};
 
 // ============================================================
@@ -71,10 +72,15 @@ impl ReceiverProgress {
 }
 
 /// Receiver 运行时配置
+#[allow(clippy::struct_excessive_bools)] // 按用途分组的开关集合，重构为枚举会失去可读性
 pub struct ReceiverConfig {
     pub enable_integrity_check: bool,
     pub enable_acl: bool,
     pub is_source_reserved: bool,
+    /// 任务目录（字节级断点续传状态存于 `<job_dir>/byte_resume/`）；为空则禁用续传
+    pub job_dir: String,
+    /// 显式关闭字节级断点续传（强制整体复制）
+    pub no_resume: bool,
 }
 
 /// 单进程模式的 Receiver 主 task（R1 + R2 合一）
@@ -200,17 +206,38 @@ pub(crate) async fn process_entry_on_receiver(
                 error!("[Receiver] Failed to remove source symlink {:?}: {}", relative_path, e);
             }
         } else {
-            StorageEnum::copy_file(
-                src_storage,
-                dest_storage,
-                entry,
-                qos_manager,
-                config.enable_integrity_check,
-                config.is_source_reserved,
-                bytes_counter,
-            )
-            .await
-            .map_err(|e| AppError::CopyError(format!("Failed to copy {}: {e}", relative_path.display())))?;
+            // 多块大文件 + 非 S3 + 启用续传 → 字节级断点续传（写 .part，可中断续传）
+            let size = entry.get_size();
+            let resume_enabled = !config.no_resume
+                && !config.job_dir.is_empty()
+                && size > src_storage.block_size()
+                && !is_s3(src_storage)
+                && !is_s3(dest_storage);
+
+            if resume_enabled {
+                copy_file_with_resume(
+                    entry,
+                    src_storage,
+                    dest_storage,
+                    config,
+                    qos_manager,
+                    bytes_counter,
+                    size,
+                )
+                .await?;
+            } else {
+                StorageEnum::copy_file(
+                    src_storage,
+                    dest_storage,
+                    entry,
+                    qos_manager,
+                    config.enable_integrity_check,
+                    config.is_source_reserved,
+                    bytes_counter,
+                )
+                .await
+                .map_err(|e| AppError::CopyError(format!("Failed to copy {}: {e}", relative_path.display())))?;
+            }
 
             // 设置目标文件元数据（mtime/uid/gid/mode 或 S3 mtime/tags）
             dest_storage.set_entry_metadata(entry).await.map_err(|e| {
@@ -230,6 +257,83 @@ pub(crate) async fn process_entry_on_receiver(
     }
     .instrument(span)
     .await
+}
+
+/// 该存储是否为 S3（字节级续传不支持 S3）。
+fn is_s3(storage: &StorageEnum) -> bool {
+    matches!(storage, StorageEnum::S3(_))
+}
+
+/// 字节级断点续传复制单个大文件。
+///
+/// 加载/创建 `<job_dir>/byte_resume/` 下的进度状态，把缺失区间交给
+/// `copy_file_resumable` 续写到 `.part`；每个 chunk 落盘回调经 unbounded channel
+/// 投递到收敛 task 异步持久化区间（不阻塞写管道热路径）。
+/// 成功后清理状态文件；失败（中断）则保留状态供下次续传。
+async fn copy_file_with_resume(
+    entry: &EntryEnum, src_storage: &Arc<StorageEnum>, dest_storage: &Arc<StorageEnum>, config: &ReceiverConfig,
+    qos_manager: Option<QosManager>, bytes_counter: Option<Arc<AtomicU64>>, size: u64,
+) -> Result<()> {
+    let dest_rel = entry.get_relative_path();
+    let store = ByteResumeStore::open(
+        &config.job_dir,
+        dest_rel,
+        size,
+        entry.get_mtime(),
+        src_storage.block_size(),
+    )
+    .await?;
+    let missing = store.missing_intervals().await;
+
+    // sync 回调 → async mark_committed 的桥接：unbounded channel + 收敛 task
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<(u64, u64)>();
+    let store_task = store.clone();
+    let drain = tokio::spawn(async move {
+        while let Some((offset, len)) = rx.recv().await {
+            if let Err(e) = store_task.mark_committed(offset, len).await {
+                warn!("[Receiver] byte-resume mark_committed failed: {}", e);
+            }
+        }
+    });
+    let on_committed: data_mover::CommitCallback = Arc::new(move |offset, len| {
+        let _ = tx.send((offset, len));
+    });
+
+    let resume = data_mover::ResumeContext {
+        part_relative_path: part_path_for(dest_rel),
+        missing_intervals: missing,
+        on_committed,
+    };
+
+    let res = StorageEnum::copy_file_resumable(
+        src_storage,
+        dest_storage,
+        entry,
+        qos_manager,
+        config.enable_integrity_check,
+        config.is_source_reserved,
+        bytes_counter,
+        resume,
+    )
+    .await;
+
+    // copy_file_resumable 返回后 on_committed（持有 tx）已 drop → channel 关闭 → drain 退出
+    let _ = drain.await;
+
+    match res {
+        Ok(()) => {
+            store.finalize_done().await?;
+            Ok(())
+        }
+        Err(e) => {
+            // 中断：持久化已记录进度，保留状态与 .part 供下次续传
+            let _ = store.flush().await;
+            Err(AppError::CopyError(format!(
+                "Resumable copy failed for {}: {e}",
+                dest_rel.display()
+            )))
+        }
+    }
 }
 
 // ============================================================
