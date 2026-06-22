@@ -1,7 +1,8 @@
 name: Claude (Reviewer)
 
 # Reviewer 角色：PR 创建或更新时自动触发，Claude 按项目规范审查 diff 并留 review 评论。
-# contents: read 从机制上禁止 reviewer 改代码，与实现者角色彻底分离。
+# contents: read 从机制上禁止 reviewer 改代码，与实现者角色彻底分离；
+# 放开的 Bash 仅限 gh pr comment/diff/view，只够发评论、读 PR，不能改代码。
 on:
   pull_request:
     types: [opened, synchronize]
@@ -14,19 +15,24 @@ jobs:
       pull-requests: write   # 留 review 评论
       id-token: write        # v1 Action 走 OIDC 交换 GitHub App token，必需（不授予代码写权限）
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
-          fetch-depth: 0
+          fetch-depth: 1
       - uses: anthropics/claude-code-action@v1
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          # track_progress 启用 review 流程：建跟踪评论 + 注入完整 PR 上下文
+          track_progress: true
           prompt: |
+            REPO: ${{ github.repository }}
+            PR NUMBER: ${{ github.event.pull_request.number }}
+
             你是本仓库的资深 Rust 代码审查者（与提交者是不同角色）。审查本 PR 的 diff，重点：
             1. 正确性：逻辑错误、错误处理路径、并发/async 竞态。
             2. 项目规范（.claude/rules/rust-patterns.md）：禁止 unwrap/expect；use 集中顶部、路径≤两层；每个 crate 必须 thiserror 专属 Error，不得 Box<dyn Error>/String 兜底；重构不得改语义。
             3. 安全与性能：热路径 clone/Mutex、async 中的同步 IO、unbounded channel。
-            按文件给出 inline review 评论；无问题则简短 approve 说明。用中文。
-          # 不限制 allowedTools —— 否则会连 Action 发 review 评论的工具一起禁掉。
-          # reviewer 的「只读」由 contents: read 权限保证（无写 token，push 不了代码）。
+
+            对具体问题用 inline 评论逐行指出；整体观察或无问题用顶层评论说明。全部用中文。
+          # 显式放开发评论 / 读 PR 的工具（默认不含）；这些是 reviewer 唯一需要的写操作
           claude_args: |
-            --max-turns 20
+            --allowedTools "mcp__github_inline_comment__create_inline_comment,Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr view:*)"
