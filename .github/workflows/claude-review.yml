@@ -12,6 +12,7 @@ jobs:
     permissions:
       contents: read         # 只读 —— 从机制上禁止 reviewer 改代码
       pull-requests: write   # 留 review 评论
+      id-token: write        # v1 Action 走 OIDC 交换 GitHub App token，必需（不授予代码写权限）
     steps:
       - uses: actions/checkout@v4
         with:
