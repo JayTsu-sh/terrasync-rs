@@ -1,0 +1,30 @@
+name: Claude (Reviewer)
+
+# Reviewer 角色：PR 创建或更新时自动触发，Claude 按项目规范审查 diff 并留 review 评论。
+# contents: read 从机制上禁止 reviewer 改代码，与实现者角色彻底分离。
+on:
+  pull_request:
+    types: [opened, synchronize]
+
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read         # 只读 —— 从机制上禁止 reviewer 改代码
+      pull-requests: write   # 留 review 评论
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: anthropics/claude-code-action@v1
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          prompt: |
+            你是本仓库的资深 Rust 代码审查者（与提交者是不同角色）。审查本 PR 的 diff，重点：
+            1. 正确性：逻辑错误、错误处理路径、并发/async 竞态。
+            2. 项目规范（.claude/rules/rust-patterns.md）：禁止 unwrap/expect；use 集中顶部、路径≤两层；每个 crate 必须 thiserror 专属 Error，不得 Box<dyn Error>/String 兜底；重构不得改语义。
+            3. 安全与性能：热路径 clone/Mutex、async 中的同步 IO、unbounded channel。
+            按文件给出 inline review 评论；无问题则简短 approve 说明。用中文。
+          claude_args: |
+            --allowedTools "Read,Grep,Glob"
+            --max-turns 20
