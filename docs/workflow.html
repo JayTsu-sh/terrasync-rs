@@ -1,0 +1,404 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Issue → PR 流水线 — claude-issue-agent</title>
+<style>
+  :root{
+    --bg:#f6f7f6; --panel:#ffffff; --ink:#1d1e20; --ink-2:#5c5d5a; --ink-3:#8a8b86;
+    --line:#e4e5e1; --line-2:#d3d4cf; --radius:10px;
+    --mono:ui-monospace,SFMono-Regular,"SF Mono",Menlo,Consolas,"Liberation Mono",monospace;
+    --sans:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"PingFang SC","Microsoft YaHei",Helvetica,Arial,sans-serif;
+    /* 角色色调:谁在动作 */
+    --teal:#0f9e75;  --teal-bg:#e1f5ee;  --teal-ink:#0d6b53;
+    --amber:#ba7517; --amber-bg:#faeeda; --amber-ink:#7c4a0a;
+    --coral:#d85a30; --coral-bg:#faece7; --coral-ink:#973b1d;
+    --green:#639922; --green-bg:#eaf3de; --green-ink:#3a6a11;
+    --gray:#6f6f6a;  --gray-bg:#efeee8;  --gray-ink:#4a4a46;
+  }
+  *{box-sizing:border-box}
+  html{-webkit-text-size-adjust:100%}
+  body{
+    margin:0; background:var(--bg); color:var(--ink);
+    font-family:var(--sans); font-size:15px; line-height:1.6;
+    padding:32px 20px 56px;
+  }
+  .wrap{max-width:1080px;margin:0 auto}
+
+  /* header */
+  .eyebrow{font-family:var(--mono);font-size:11.5px;letter-spacing:.14em;text-transform:uppercase;color:var(--ink-3);margin:0 0 8px}
+  h1{font-size:29px;line-height:1.12;font-weight:600;letter-spacing:-.02em;margin:0 0 8px}
+  .lede{color:var(--ink-2);max-width:66ch;margin:0}
+  .lede code{font-family:var(--mono);font-size:.86em;background:#eceded;padding:1px 5px;border-radius:5px}
+
+  /* 执行机制三层 */
+  .mech{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:16px 18px;margin:22px 0 22px}
+  .mech h2{font-size:12px;font-family:var(--mono);letter-spacing:.1em;text-transform:uppercase;color:var(--ink-3);font-weight:500;margin:0 0 12px}
+  .layers{display:grid;gap:10px}
+  .layer{display:flex;gap:12px;align-items:flex-start;padding:11px 13px;border:1px solid var(--line);border-radius:var(--radius);background:#faf9f6}
+  .layer .lyr-no{font-family:var(--mono);font-size:12px;font-weight:700;color:#fff;background:var(--tone,var(--teal));width:22px;height:22px;border-radius:6px;display:flex;align-items:center;justify-content:center;flex:none;margin-top:1px}
+  .layer .lyr-bd{flex:1}
+  .layer .lyr-tt{font-weight:600;font-size:14px;margin:0 0 3px}
+  .layer .lyr-tt code{font-family:var(--mono);font-size:.82em;background:#eceded;padding:1px 5px;border-radius:5px}
+  .layer .lyr-ds{font-size:13px;color:var(--ink-2);margin:0}
+  .layer .lyr-ds code{font-family:var(--mono);font-size:.85em;background:#eceded;padding:1px 4px;border-radius:4px}
+  .layer .lyr-tag{font-family:var(--mono);font-size:11px;color:var(--ink-3);flex:none;white-space:nowrap;margin-top:2px}
+  @media(max-width:620px){.layer .lyr-tag{display:none}}
+
+  /* progress rail */
+  .rail{display:flex;gap:6px;margin:22px 0 26px}
+  .rail span{flex:1;height:4px;border-radius:2px;background:var(--line-2);transition:background .35s}
+  .rail span.on{background:var(--teal)}
+  .rail span.done{background:var(--green)}
+
+  .grid{display:grid;grid-template-columns:1fr;gap:22px}
+  @media(min-width:900px){.grid{grid-template-columns:300px 1fr;align-items:start}}
+
+  /* pipeline column */
+  .pipe{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:16px 16px 8px}
+  .pipe h2,.card h2{font-size:12px;font-family:var(--mono);letter-spacing:.1em;text-transform:uppercase;color:var(--ink-3);font-weight:500;margin:0 0 14px}
+  .flow{list-style:none;margin:0;padding:0;position:relative}
+  .node{position:relative;padding:0 0 4px 0}
+  .node>button{
+    width:100%;text-align:left;cursor:pointer;background:var(--panel);
+    border:1px solid var(--line);border-radius:var(--radius);padding:9px 12px;
+    display:flex;align-items:center;gap:10px;font:inherit;color:var(--ink);
+    transition:border-color .2s,background .2s,transform .2s;
+  }
+  .node>button:hover{border-color:var(--line-2)}
+  .node>button:focus-visible{outline:2px solid var(--teal);outline-offset:2px}
+  .dot{width:9px;height:9px;border-radius:50%;flex:none;background:var(--gray)}
+  .node .nm{font-weight:500}
+  .node .rolehint{margin-left:auto;font-family:var(--mono);font-size:11px;color:var(--ink-3)}
+  .connector{height:16px;width:1.5px;background:var(--line-2);margin:2px 0 2px 17px}
+
+  /* active + visited states */
+  .node.active>button{border-color:var(--tone,var(--teal));background:var(--tone-bg,var(--teal-bg));transform:translateX(2px)}
+  .node.active .dot{background:var(--tone,var(--teal))}
+  .node.active .nm{color:var(--tone-ink,var(--teal-ink))}
+  .node.visited .dot{background:var(--tone,var(--teal))}
+  .node.visited .nm{color:var(--ink)}
+
+  /* needs-info branch */
+  .branch{margin:2px 0 6px 17px;padding-left:16px;border-left:1.5px dashed var(--line-2)}
+  .branch .node>button{border-style:dashed}
+
+  /* inspector */
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:18px 20px;margin-bottom:18px}
+  .stage-head{display:flex;align-items:center;flex-wrap:wrap;gap:8px;margin-bottom:10px}
+  .stage-name{font-size:19px;font-weight:600;letter-spacing:-.01em;margin-right:2px}
+  .chip{display:inline-flex;align-items:center;gap:6px;font-family:var(--mono);font-size:11.5px;font-weight:500;padding:3px 9px;border-radius:999px;border:1px solid transparent}
+  .chip.tone{background:var(--tone-bg);color:var(--tone-ink);border-color:color-mix(in srgb,var(--tone) 30%,transparent)}
+  .actor{font-family:var(--mono);font-size:12px;color:var(--ink-2);margin:0 0 14px}
+  .stage-desc{margin:0 0 14px;color:var(--ink);max-width:64ch}
+  .cmd-label{font-family:var(--mono);font-size:11px;letter-spacing:.08em;text-transform:uppercase;color:var(--ink-3);margin:0 0 6px}
+  pre.cmd{margin:0 0 4px;background:#1c1d1f;color:#e9eae6;border-radius:var(--radius);padding:13px 14px;overflow-x:auto;font-family:var(--mono);font-size:12.5px;line-height:1.6}
+  pre.cmd .flag{color:#8fd0b6}
+  pre.cmd .cm{color:#7f8079}
+
+  /* controls */
+  .controls{display:flex;flex-wrap:wrap;gap:10px;margin-top:16px}
+  button.act{cursor:pointer;font:inherit;font-weight:500;font-size:14px;border-radius:var(--radius);padding:9px 16px;border:1px solid transparent;transition:filter .15s,background .15s}
+  button.act:focus-visible{outline:2px solid var(--ink);outline-offset:2px}
+  .btn-primary{background:var(--teal);color:#fff}
+  .btn-gate{background:var(--coral);color:#fff}
+  .btn-go{background:var(--green);color:#fff}
+  .act:hover{filter:brightness(1.06)}
+  .btn-ghost{background:transparent;border-color:var(--line-2);color:var(--ink-2)}
+  .btn-ghost:hover{background:#f0f0ec;filter:none}
+  .waiting{font-family:var(--mono);font-size:12.5px;color:var(--amber-ink);background:var(--amber-bg);border:1px solid color-mix(in srgb,var(--amber) 30%,transparent);border-radius:var(--radius);padding:8px 12px}
+  .done-note{font-family:var(--mono);font-size:12.5px;color:var(--green-ink);background:var(--green-bg);border:1px solid color-mix(in srgb,var(--green) 30%,transparent);border-radius:var(--radius);padding:8px 12px}
+  .gate-hint{font-size:12.5px;color:var(--coral-ink);margin:0 0 2px;width:100%}
+
+  /* issue thread */
+  .issue{background:var(--panel);border:1px solid var(--line);border-radius:14px;overflow:hidden}
+  .issue-top{padding:14px 18px;border-bottom:1px solid var(--line);display:flex;align-items:baseline;gap:8px;flex-wrap:wrap}
+  .issue-top .num{font-family:var(--mono);color:var(--ink-3)}
+  .issue-top .ttl{font-weight:600}
+  .issue-top .labels{margin-left:auto;display:flex;gap:6px;flex-wrap:wrap}
+  .lchip{font-family:var(--mono);font-size:11px;padding:2px 8px;border-radius:999px;background:var(--gray-bg);color:var(--gray-ink);border:1px solid var(--line-2)}
+  .lchip.teal{background:var(--teal-bg);color:var(--teal-ink);border-color:color-mix(in srgb,var(--teal) 30%,transparent)}
+  .lchip.amber{background:var(--amber-bg);color:var(--amber-ink);border-color:color-mix(in srgb,var(--amber) 30%,transparent)}
+  .lchip.coral{background:var(--coral-bg);color:var(--coral-ink);border-color:color-mix(in srgb,var(--coral) 30%,transparent)}
+  .lchip.green{background:var(--green-bg);color:var(--green-ink);border-color:color-mix(in srgb,var(--green) 30%,transparent)}
+  .thread{list-style:none;margin:0;padding:8px 0;max-height:340px;overflow-y:auto}
+  .thread li{display:flex;gap:10px;padding:7px 18px;align-items:flex-start}
+  .thread .ev-ico{font-family:var(--mono);font-size:12px;width:16px;text-align:center;color:var(--ink-3);flex:none;margin-top:1px}
+  .thread .ev-body{font-size:13.5px;color:var(--ink)}
+  .thread .ev-body .who{font-family:var(--mono);font-size:11.5px;color:var(--ink-3)}
+  .thread .ev-body code{font-family:var(--mono);font-size:12px;background:#eceded;padding:1px 5px;border-radius:5px}
+  .thread .comment{background:#faf9f6;border:1px solid var(--line);border-radius:8px;padding:8px 10px;margin-top:3px}
+  .thread .comment .h{font-weight:600;font-size:13px}
+  .thread .empty{color:var(--ink-3);font-style:italic;font-size:13.5px;padding:10px 18px}
+
+  .legend{display:flex;flex-wrap:wrap;gap:14px;margin-top:22px;font-size:12.5px;color:var(--ink-2)}
+  .legend span{display:inline-flex;align-items:center;gap:6px}
+  .legend i{width:9px;height:9px;border-radius:50%;display:inline-block}
+
+  /* 串行调度 / 父树排序 */
+  .order{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:14px 18px;margin:0 0 22px}
+  .order h2{font-size:12px;font-family:var(--mono);letter-spacing:.1em;text-transform:uppercase;color:var(--ink-3);font-weight:500;margin:0 0 8px}
+  .order p{margin:0;color:var(--ink-2);max-width:78ch;font-size:13.5px}
+  .order code{font-family:var(--mono);font-size:.85em;background:#eceded;padding:1px 5px;border-radius:5px}
+  .order .tree{font-family:var(--mono);font-size:12px;line-height:1.9;color:var(--ink-2);background:#faf9f6;border:1px solid var(--line);border-radius:var(--radius);padding:10px 12px;margin-top:12px;overflow-x:auto}
+  .order .tree>div{white-space:nowrap}
+  .order .tree b{color:var(--teal-ink);font-weight:600}
+  .order .tree .cur{color:var(--coral-ink);font-weight:600}
+  .order .tree .blocked{color:var(--ink-3)}
+  .parent-hint{font-family:var(--mono);font-size:11.5px;color:var(--amber-ink);background:var(--amber-bg);border:1px solid color-mix(in srgb,var(--amber) 30%,transparent);padding:1px 7px;border-radius:999px}
+  .fade{animation:fade .3s ease both}
+  @keyframes fade{from{opacity:0;transform:translateY(3px)}to{opacity:1;transform:none}}
+  @media(prefers-reduced-motion:reduce){*{transition:none!important;animation:none!important}}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <p class="eyebrow">claude-issue-agent · 常驻会话 · /loop 编排</p>
+    <h1>Issue → PR 流水线</h1>
+    <p class="lede">一个常驻的 Claude 会话用 <code>/loop</code> 周期轮询,会话始终存活、持续复用同一上下文。GitHub label 就是状态机:每个 tick 拉取 issue,把只读的 triage 与 worktree 里的开发派发给受限 <strong>sub-agent</strong>。唯一的人工闸门,就是给 issue 打上 <code>claude:approved</code>。点击<strong>推进</strong>,或点任意阶段查看细节。</p>
+  </header>
+
+  <section class="mech" aria-label="执行机制">
+    <h2>执行机制 · 一个常驻会话,三层协作</h2>
+    <div class="layers">
+      <div class="layer" style="--tone:var(--gray)">
+        <span class="lyr-no">1</span>
+        <div class="lyr-bd">
+          <p class="lyr-tt">驱动层 —— <code>/loop</code> 周期轮询</p>
+          <p class="lyr-ds">一个常驻的 Claude 会话,用 <code>/loop</code> 每隔几分钟触发一次;会话始终活着,持续复用同一上下文。每个 tick 只做一轮「拉取 issue → 按 label 分发」。这一层不是 skill 也不是 sub-agent,就是会话本身。</p>
+        </div>
+        <span class="lyr-tag">内置 /loop</span>
+      </div>
+      <div class="layer" style="--tone:var(--teal)">
+        <span class="lyr-no">2</span>
+        <div class="lyr-bd">
+          <p class="lyr-tt">编排层 —— 状态机 skill</p>
+          <p class="lyr-ds">唯一真相源是 GitHub label。skill 定义「什么 label → 走哪个阶段 → 加/删哪个 label」,并按父子依赖把队列排成串行计划。会话崩了重启,靠 label 自动续跑 —— 天然幂等。</p>
+        </div>
+        <span class="lyr-tag">issue-agent skill</span>
+      </div>
+      <div class="layer" style="--tone:var(--amber)">
+        <span class="lyr-no">3</span>
+        <div class="lyr-bd">
+          <p class="lyr-tt">执行层 —— 受限 sub-agent</p>
+          <p class="lyr-ds">triage 与 develop 这类重活各自跑在独立 sub-agent 里:按阶段限定工具白名单(triager 只读、developer 可写 + worktree),隔离上下文,不撑爆常驻主循环。</p>
+        </div>
+        <span class="lyr-tag">issue-triager / issue-developer</span>
+      </div>
+    </div>
+  </section>
+
+  <div class="rail" id="rail" aria-hidden="true"></div>
+
+  <section class="order" aria-label="串行调度顺序">
+    <h2>串行调度 · 一次只推进一棵父树</h2>
+    <p>Issue 之间可以有父子关系(epic → 子任务 —— 例如 epic <code>#17</code> 就列了 9 个)。编排层按依赖排序,<strong>一次把一棵父树推到底</strong>:先所有子任务、再父任务,直到整棵树都停在人工闸门上(<code>claude:approved</code> 或 PR review)。只有这时才开始下一棵树 —— 两个 epic 绝不交错进行。</p>
+    <div class="tree">
+      <div><b>epic #17</b> · rsync 双进程通信与增量传输 ├─ 协议协商 <span class="blocked">✓ 已开 PR</span> ├─ <span class="cur">远端 incremental sync ◂ 进行中</span> └─ QUIC 多路复用 待处理 → 收尾 #17 → ⏸ 人工闸门</div>
+      <div class="blocked">下一棵 ▸ 另一个 epic … 在 #17 整棵树清空前一直阻塞</div>
+    </div>
+  </section>
+
+  <div class="grid">
+    <!-- pipeline -->
+    <nav class="pipe" aria-label="阶段流程">
+      <h2>阶段</h2>
+      <ul class="flow" id="flow"></ul>
+    </nav>
+
+    <!-- inspector + issue -->
+    <div>
+      <section class="card" id="inspector" aria-live="polite"></section>
+
+      <section class="issue" aria-label="Issue 活动">
+        <div class="issue-top">
+          <span class="num">#142</span>
+          <span class="parent-hint">↳ epic #17 的子任务</span>
+          <span class="ttl">实现远端 incremental sync</span>
+          <span class="labels" id="labels"></span>
+        </div>
+        <ul class="thread" id="thread"></ul>
+      </section>
+
+      <div class="legend" aria-hidden="true">
+        <span><i style="background:var(--teal)"></i> sub-agent 执行(受限工具)</span>
+        <span><i style="background:var(--amber)"></i> 等待人工</span>
+        <span><i style="background:var(--coral)"></i> 人工闸门</span>
+        <span><i style="background:var(--green)"></i> 完成</span>
+        <span><i style="background:var(--gray)"></i> 中性</span>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+const STAGES = {
+  assigned:{name:"排队中",tone:"gray",actor:"驱动 · /loop",label:null,
+    action:'# 每个 tick 轮询一次 —— 会话在两次 tick 之间保持常驻\ngh issue list --state open --label claude:queue --json number,labels,parent\n# 按依赖排序:先把一棵父树(子任务 → 父任务)清空\n# 再碰下一棵 —— 两个 epic 绝不交错',
+    desc:"一个常驻会话用 /loop 周期触发。每个 tick 拉取带 claude:queue 的开放 issue,依据父子关系排出串行计划,一次把一棵父树推到底再切换。"},
+  triaging:{name:"triage 评估",tone:"teal",actor:"sub-agent · 只读",label:"claude:triaging",
+    action:'# 编排层派发只读 triager(工具:Read, Grep, Glob)\nAgent(subagent_type="issue-triager", issue=142)',
+    desc:"编排层把 issue 交给 issue-triager sub-agent,其工具白名单只有 Read/Grep/Glob。只读边界由框架强制,它无法改动仓库 —— 只返回判定结果,以及一份 spec 草案或待澄清的问题。"},
+  needsInfo:{name:"待补充信息",tone:"gray",actor:"编排层 → 人工",label:"claude:needs-info",
+    action:'gh issue comment 142 --body "## 需要澄清 …"',
+    desc:"triager 认为需求不清晰。编排层把它的问题发成评论,标签换成 claude:needs-info,然后跳过该 issue,直到有人回答并去掉标签 —— 重新进入 triage。"},
+  specReady:{name:"spec 就绪",tone:"amber",actor:"编排层",label:"claude:spec-ready",
+    action:'gh issue comment 142 --body "## 建议 spec …"',
+    desc:"triager 返回了结构化 spec。由于 triager 只读,由编排层把 spec 发成评论并等待。下一步就是唯一的人工闸门。"},
+  approved:{name:"已批准",tone:"coral",actor:"人工",label:"claude:approved",
+    action:'gh issue edit 142 --add-label claude:approved',
+    desc:"唯一的人工闸门。编排层从不自己加这个标签 —— 只是每个 tick 观察它是否出现。任何有写权限的人都能批准,不必是你本人。"},
+  developing:{name:"开发中",tone:"teal",actor:"sub-agent · worktree",label:"claude:developing",
+    action:'# 编排层在独立 git worktree 里派发 developer\n# (工具:Bash, Read, Write, Edit)\nAgent(subagent_type="issue-developer", isolation="worktree", issue=142)',
+    desc:"看到 claude:approved,编排层在独立 git worktree 里派发 issue-developer sub-agent。隔离的上下文让常驻主循环保持轻量,由 sub-agent 实现 spec 并让测试通过。"},
+  prOpen:{name:"PR 已开",tone:"green",actor:"编排层",label:"claude:pr-open",
+    action:'git push -u origin claude/issue-142\ngh pr create --body "… Closes #142"',
+    desc:"编排层提交、推送 worktree 分支并开 PR 关联 issue。流水线停在这里 —— 由人 review 和 merge,随后编排层推进这棵父树里的下一个 issue。"}
+};
+const SPINE = ["assigned","triaging","specReady","approved","developing","prOpen"];
+
+// 进入某阶段时施加的 label 变更 + 活动事件
+const DELTA = {
+  triaging:{add:["claude:triaging"],by:"编排层"},
+  specReady:{remove:["claude:triaging"],add:["claude:spec-ready"],by:"编排层",
+    comment:{by:"triager",h:"建议 spec",t:"目标、影响范围、方案、测试计划、验收标准。"}},
+  needsInfo:{remove:["claude:triaging"],add:["claude:needs-info"],by:"编排层",
+    comment:{by:"triager",h:"需要澄清",t:"增量检测按 mtime+size 还是强 checksum?删除 / 重命名本期是否覆盖?"}},
+  approved:{add:["claude:approved"],by:"人工",note:"@reviewer 添加了批准标签"},
+  developing:{remove:["claude:spec-ready","claude:approved"],add:["claude:developing"],by:"编排层"},
+  prOpen:{remove:["claude:developing"],add:["claude:pr-open"],by:"编排层",
+    pr:{by:"编排层",t:'已开 PR #317 · 关闭 #142'}}
+};
+const TONE_OF_LABEL = {"claude:triaging":"teal","claude:spec-ready":"amber","claude:needs-info":"gray",
+  "claude:approved":"coral","claude:developing":"teal","claude:pr-open":"green"};
+
+let cur = "assigned";
+let labels = [];          // issue 当前的 label
+let thread = [];          // 活动日志
+
+const $ = id => document.getElementById(id);
+const highlightCmd = s => s
+  .replace(/(--[a-z-]+)/g,'<span class="flag">$1</span>')
+  .replace(/(#.*$)/gm,'<span class="cm">$1</span>');
+
+function setTone(el,tone){
+  el.style.setProperty("--tone",`var(--${tone})`);
+  el.style.setProperty("--tone-bg",`var(--${tone}-bg)`);
+  el.style.setProperty("--tone-ink",`var(--${tone}-ink)`);
+}
+
+function renderFlow(){
+  const flow = $("flow"); flow.innerHTML="";
+  const idxCur = SPINE.indexOf(cur);
+  SPINE.forEach((key,i)=>{
+    const s = STAGES[key];
+    const li = document.createElement("li"); li.className="node";
+    setTone(li,s.tone);
+    if(key===cur) li.classList.add("active");
+    else if(idxCur>i || (cur==="needsInfo")) li.classList.add("visited");
+    li.innerHTML=`<button data-k="${key}"><span class="dot"></span>
+      <span class="nm">${s.name}</span><span class="rolehint">${s.actor.split(" · ")[0]}</span></button>`;
+    flow.appendChild(li);
+
+    // needs-info 分支挂在 triage 下
+    if(key==="triaging"){
+      const wrap=document.createElement("div"); wrap.className="branch";
+      const bl=document.createElement("ul"); bl.className="flow";
+      const bn=document.createElement("li"); bn.className="node"; setTone(bn,STAGES.needsInfo.tone);
+      if(cur==="needsInfo") bn.classList.add("active");
+      bn.innerHTML=`<button data-k="needsInfo"><span class="dot"></span>
+        <span class="nm">待补充信息</span><span class="rolehint">拒绝</span></button>`;
+      bl.appendChild(bn); wrap.appendChild(bl); flow.appendChild(wrap);
+    }
+    if(i<SPINE.length-1){const c=document.createElement("div");c.className="connector";flow.appendChild(c);}
+  });
+  flow.querySelectorAll("button").forEach(b=>b.onclick=()=>{cur=b.dataset.k;render();});
+}
+
+function controlsFor(key){
+  const box=document.createElement("div"); box.className="controls";
+  const mk=(txt,cls,fn)=>{const b=document.createElement("button");b.className="act "+cls;b.textContent=txt;b.onclick=fn;return b;};
+  const reset=mk("重置","btn-ghost",()=>{cur="assigned";labels=[];thread=[];render();});
+
+  if(key==="assigned")      box.append(mk("运行 triage","btn-primary",()=>go("triaging")),reset);
+  else if(key==="triaging"){box.append(mk("合理 → spec","btn-primary",()=>go("specReady")),
+                                        mk("不清晰 → 待补充","btn-ghost",()=>go("needsInfo")),reset);}
+  else if(key==="specReady"){const h=document.createElement("p");h.className="gate-hint";
+                             h.textContent="人工闸门 —— 由 reviewer 在此批准。";box.append(h,
+                             mk("添加 claude:approved","btn-gate",()=>go("approved")),reset);}
+  else if(key==="approved") box.append(mk("开始开发","btn-go",()=>go("developing")),reset);
+  else if(key==="developing")box.append(mk("开 PR","btn-go",()=>go("prOpen")),reset);
+  else if(key==="prOpen"){const n=document.createElement("div");n.className="done-note";
+                          n.textContent="PR 已开 · 合并后关闭 #142";box.append(n,reset);}
+  else if(key==="needsInfo"){const n=document.createElement("div");n.className="waiting";
+                             n.textContent="等待人工澄清需求。";box.append(n,reset);}
+  return box;
+}
+
+function renderInspector(){
+  const s=STAGES[cur], el=$("inspector"); setTone(el,s.tone);
+  el.classList.remove("fade");void el.offsetWidth;el.classList.add("fade");
+  el.innerHTML=`
+    <div class="stage-head">
+      <span class="stage-name">${s.name}</span>
+      ${s.label?`<span class="chip tone">${s.label}</span>`:`<span class="chip" style="background:var(--gray-bg);color:var(--gray-ink)">暂无标签</span>`}
+    </div>
+    <p class="actor">▸ ${s.actor}</p>
+    <p class="stage-desc">${s.desc}</p>
+    <p class="cmd-label">${cur==="assigned"?"轮询查询":cur==="approved"?"人工操作":"命令"}</p>
+    <pre class="cmd">${highlightCmd(s.action)}</pre>`;
+  el.appendChild(controlsFor(cur));
+}
+
+function renderIssue(){
+  const lb=$("labels"); lb.innerHTML = labels.length
+    ? labels.map(l=>`<span class="lchip ${TONE_OF_LABEL[l]||''}">${l}</span>`).join("")
+    : `<span class="lchip">claude:queue</span>`;
+
+  const t=$("thread");
+  if(!thread.length){t.innerHTML=`<li class="empty">暂无活动 —— 运行 triage 开始。</li>`;return;}
+  t.innerHTML = thread.map(e=>{
+    let body="";
+    if(e.type==="label+") body=`<span class="who">${e.by}</span> 添加标签 <code>${e.text}</code>`;
+    else if(e.type==="label-") body=`<span class="who">${e.by}</span> 移除标签 <code>${e.text}</code>`;
+    else if(e.type==="note") body=`<span class="who">人工</span> ${e.text}`;
+    else if(e.type==="comment") body=`<span class="who">${e.by} 评论</span><div class="comment"><div class="h">${e.h}</div>${e.t}</div>`;
+    else if(e.type==="pr") body=`<span class="who">${e.by}</span> ${e.t}`;
+    const icon={"label+":"+","label-":"–","note":"◆","comment":"❝","pr":"⇄"}[e.type];
+    return `<li class="fade"><span class="ev-ico">${icon}</span><span class="ev-body">${body}</span></li>`;
+  }).join("");
+  t.scrollTop=t.scrollHeight;
+}
+
+function renderRail(){
+  const rail=$("rail"); rail.innerHTML="";
+  const idx = cur==="needsInfo" ? 1 : SPINE.indexOf(cur);
+  SPINE.forEach((_,i)=>{const s=document.createElement("span");
+    if(i<idx) s.className="done"; else if(i===idx) s.className="on"; rail.appendChild(s);});
+}
+
+function applyDelta(key){
+  const d=DELTA[key]; if(!d) return;
+  (d.remove||[]).forEach(l=>{labels=labels.filter(x=>x!==l);thread.push({type:"label-",by:d.by,text:l});});
+  (d.add||[]).forEach(l=>{if(!labels.includes(l))labels.push(l);thread.push({type:"label+",by:d.by,text:l});});
+  if(d.note) thread.push({type:"note",text:d.note});
+  if(d.comment) thread.push({type:"comment",...d.comment});
+  if(d.pr) thread.push({type:"pr",...d.pr});
+}
+
+// 根据当前阶段,从头重放到该阶段的 label 与活动流
+// 这样直接点任意阶段节点,也能看到该阶段应有的活动,而非空列表
+function rebuildState(){
+  labels=[]; thread=[];
+  const idx=SPINE.indexOf(cur);
+  const path = cur==="needsInfo" ? ["triaging","needsInfo"] : SPINE.slice(1, idx+1);
+  path.forEach(k=>applyDelta(k));
+}
+function go(key){ cur=key; render(); }
+function render(){ rebuildState(); renderFlow(); renderRail(); renderInspector(); renderIssue(); }
+render();
+</script>
+</body>
+</html>
