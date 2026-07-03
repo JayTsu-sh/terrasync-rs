@@ -296,7 +296,7 @@ pub(crate) async fn process_versioned_entry(
                     entry.get_mtime()
                 );
 
-                // 处理条目（S3 版本化路径，续传不支持 S3 → default）
+                // 处理条目（S3 版本化路径：多版本对象续传语义未定义，保持关闭 → default）
                 match process_entry(
                     entry.as_ref(),
                     Arc::clone(&src_storage),
@@ -616,31 +616,34 @@ fn is_s3(storage: &StorageEnum) -> bool {
     matches!(storage, StorageEnum::S3(_))
 }
 
-/// 该 entry 是否应走字节级断点续传：启用 + 多块大文件 + 源/目标均非 S3。
+/// 该 entry 是否应走字节级断点续传：启用 + 多块大文件（全后端：Local/NFS/CIFS/S3）。
 ///
-/// 两端排除 S3 的原因不同：
-/// - **目标端 S3**：本质不支持——续传依赖 `.part` + `rename` + `set_file_len`
-///   （随机写 / 改名 / 截断），S3 对象存储没有这些原语。
-/// - **源端 S3**：并非本质不支持（S3 GetObject 支持 Range 读取缺失区间），仅因
-///   `copy_file_resumable` 尚未实现 S3 源的 `read_data_intervals`。当前必须排除，
-///   否则会落到 data-mover 的「unsupported source」错误分支。若日后实现 Range 读，
-///   即可放开源端 S3（目标端仍受本质限制）。
+/// - **源端 S3**：data-mover `read_data_intervals` 以 Range GET 只读缺失区间。
+/// - **目标端 S3**：走 multipart part 粒度续传——进度真值是目标端 in-progress
+///   multipart upload（ListParts 反推缺失区间），本地状态文件仅作进度参考；
+///   额外要求 size > 目标端 block_size（part 大小下限），单 part 文件续传无意义
+///   （中断即全丢），走普通拷贝即可。
+/// - **S3 多版本路径**除外：多版本对象的续传语义未定义，调用方传
+///   `ResumeOpts::default()` 保持关闭（见 versioned 拷贝路径）。
 pub(crate) fn should_resume(resume: &ResumeOpts, entry: &EntryEnum, src: &StorageEnum, dest: &StorageEnum) -> bool {
     !resume.no_resume
         && !resume.job_dir.is_empty()
         && !entry.get_is_dir()
         && !entry.get_is_symlink()
         && entry.get_size() > src.block_size()
-        && !is_s3(src)
-        && !is_s3(dest)
+        && (!is_s3(dest) || entry.get_size() > dest.block_size())
 }
 
 /// 字节级断点续传复制单个大文件（全量建 `.part` / 增量续 `.part` 共用）。
 ///
 /// 加载/创建 `<job_dir>/byte_resume/` 下的进度状态，把缺失区间交给
-/// `copy_file_resumable` 续写到 `<dest>.terrasync-part`；每个 chunk 落盘回调经
-/// unbounded channel 投递到收敛 task 异步持久化区间（不阻塞写管道热路径）。
-/// 成功后清理状态文件（rename 由 data-mover 完成）；失败（中断）保留状态与 `.part` 供续传。
+/// `copy_file_resumable`；每个 chunk 确认落盘的回调经有界 channel 投递到收敛 task
+/// 异步持久化区间（不阻塞写管道热路径）。成功后清理状态文件；失败（中断）保留状态供续传。
+///
+/// - NAS 目标端：续写到 `<dest>.terrasync-part`，完成后由 data-mover 原子 rename。
+/// - S3 目标端：multipart part 粒度续传，进度真值是目标端 in-progress upload
+///   （data-mover 以 ListParts 反推缺失区间，忽略此处传入的 `missing`）；
+///   本地状态文件仍随 part 回调更新，仅作进度参考。
 pub(crate) async fn copy_file_with_resume(
     entry: &EntryEnum, src_storage: &StorageEnum, dest_storage: &StorageEnum, enable_integrity_check: bool,
     is_source_reserved: bool, qos_manager: Option<QosManager>, bytes_counter: Option<Arc<AtomicU64>>, job_dir: &str,

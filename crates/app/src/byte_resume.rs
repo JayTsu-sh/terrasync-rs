@@ -8,6 +8,8 @@
 //! - 进度 = 已完成区间集合（多块管道乱序并发写，半截文件可能有空洞）。
 //! - 半截文件写到 `<dest>.terrasync-part`，全部补齐后由 data-mover 原子 rename。
 //! - 信任进度记录直接续：靠 commit 语义保证落盘 + 源 mtime/size 未变兜底，不重算 hash。
+//! - S3 目标端例外：进度真值是目标端 in-progress multipart upload（data-mover 以
+//!   ListParts 反推缺失区间），本状态文件仅作进度参考，不参与 S3 续传决策。
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
