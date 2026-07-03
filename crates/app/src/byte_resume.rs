@@ -34,6 +34,12 @@ pub fn part_path_for(dest_rel: &Path) -> PathBuf {
     PathBuf::from(s)
 }
 
+/// 该路径是否为续传临时文件（`.terrasync-part` 后缀）。
+/// `--delete-target` 的孤儿清理必须跳过这类文件，否则会破坏进行中的续传进度。
+pub fn is_part_file(path: &Path) -> bool {
+    path.as_os_str().to_string_lossy().ends_with(PART_SUFFIX)
+}
+
 // ============================================================
 // IntervalSet —— 有序、不相交、半开区间 [start, end) 的集合
 // ============================================================
@@ -178,7 +184,10 @@ impl ByteResumeStore {
             );
             IntervalSet::from_vec(&intervals)
         } else {
-            // 不匹配/不存在：清掉可能残留的旧状态，从零开始
+            // 不匹配/不存在：清掉可能残留的旧状态，从零开始。
+            // 目标端可能残留旧 .part，但无需主动清理：write_data_resumable 是定位写
+            // （非 append），全新状态 missing=[0,size) 会整体重写；收尾 set_file_len(size)
+            // 截掉超出部分。残留脏字节不可能存活到最终文件。
             let _ = tokio::fs::remove_file(&state_path).await;
             IntervalSet::default()
         };
@@ -250,7 +259,11 @@ impl ByteResumeStore {
         self.flush_locked(&mut inner).await
     }
 
-    /// 收尾：删除状态文件与临时文件（`.part` → 最终文件的 rename 由 data-mover 完成）。
+    /// 收尾：删除状态文件与临时文件。
+    ///
+    /// `.part` → 最终文件的 rename 由 data-mover 完成：`copy_file_resumable` 仅在
+    /// rename 成功后返回 `Ok(())`（rename 失败会返回 Err，走保留状态的续传分支），
+    /// 因此本函数被调用时 `.part` 必已不存在，无需清理。
     pub async fn finalize_done(&self) -> Result<()> {
         let _ = tokio::fs::remove_file(&self.tmp_path).await;
         match tokio::fs::remove_file(&self.state_path).await {

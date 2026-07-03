@@ -9,7 +9,7 @@
 
 // 标准库
 use std::sync::Arc;
-use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 // 外部crate
 use dashmap::DashMap;
@@ -656,8 +656,13 @@ pub(crate) async fn copy_file_with_resume(
     .await?;
     let missing = store.missing_intervals().await;
 
-    // sync 回调 → async mark_committed 的桥接：unbounded channel + 收敛 task
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<(u64, u64)>();
+    // sync 回调 → async mark_committed 的桥接：有界 channel + 收敛 task。
+    // 消息总数上界 = file_size / block_size，但 block_size 用户可配置且无下限
+    // （极小块 + TB 级文件可产生千万级消息），故用有界 channel 兜底内存。
+    // 满时 try_send 失败直接丢弃该条记录——保守安全：区间未记为已完成，
+    // 中断后续传时重拷该区间，只多传不丢数据。
+    const COMMIT_CHANNEL_CAPACITY: usize = 65536;
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<(u64, u64)>(COMMIT_CHANNEL_CAPACITY);
     let store_task = store.clone();
     let drain = tokio::spawn(async move {
         while let Some((offset, len)) = rx.recv().await {
@@ -666,8 +671,12 @@ pub(crate) async fn copy_file_with_resume(
             }
         }
     });
+    let dropped = Arc::new(AtomicU64::new(0));
+    let dropped_cb = dropped.clone();
     let on_committed: data_mover::CommitCallback = Arc::new(move |offset, len| {
-        let _ = tx.send((offset, len));
+        if tx.try_send((offset, len)).is_err() {
+            dropped_cb.fetch_add(1, Ordering::Relaxed);
+        }
     });
 
     let resume = data_mover::ResumeContext {
@@ -690,6 +699,14 @@ pub(crate) async fn copy_file_with_resume(
 
     // copy_file_resumable 返回后 on_committed（持有 tx）已 drop → channel 关闭 → drain 退出
     let _ = drain.await;
+    let dropped_count = dropped.load(Ordering::Relaxed);
+    if dropped_count > 0 {
+        warn!(
+            "byte-resume: {} 条 commit 记录因 channel 满被丢弃（{}），中断后这些区间将重拷",
+            dropped_count,
+            dest_rel.display()
+        );
+    }
 
     match res {
         Ok(()) => {

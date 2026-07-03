@@ -18,6 +18,7 @@ use transport::message::{DestIndex, NdxTable, ProgressSnapshot, ReceiverMsg, Sen
 use transport::traits::ReceiverTransport;
 
 // 内部模块
+use crate::byte_resume::is_part_file;
 use crate::error::{AppError, Result};
 use crate::sync::{ResumeOpts, copy_file_with_resume, should_resume};
 
@@ -419,6 +420,12 @@ async fn recv_file_list_phase(
                 if session_config.delete_target {
                     for orphan in dest_index.orphaned_entries() {
                         let path = orphan.get_relative_path();
+                        // 跳过续传临时文件：源端不存在同名 .terrasync-part 条目，
+                        // 会被误判为孤儿；删掉会破坏进行中的续传进度
+                        if is_part_file(path) {
+                            debug!("[Receiver Remote] Skipping in-progress part file: {:?}", path);
+                            continue;
+                        }
                         if orphan.get_is_dir() {
                             info!("[Receiver Remote] Deleting orphaned dir: {:?}", path);
                             if let Err(e) = dest_storage.delete_dir_all(orphan).await {
