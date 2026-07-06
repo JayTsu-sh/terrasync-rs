@@ -14,8 +14,9 @@ pub mod prelude {
         create_in_process_pair_with_capacity,
     };
     pub use crate::message::{
-        BlockSignature, DestIndex, DiskCommitMsg, NdxTable, ProgressSnapshot, ReceiverMsg, SenderMsg, SessionConfig,
-        TransferDecision,
+        BlockSignature, DestIndex, DiskCommitMsg, FeatureFlags, HandshakeResult, HashAlgorithm,
+        MIN_SUPPORTED_PROTOCOL_VERSION, NdxTable, PROTOCOL_VERSION, ProgressSnapshot, ProtocolHandshake, ReceiverMsg,
+        SenderMsg, SessionConfig, TransferDecision,
     };
     #[cfg(feature = "quic")]
     pub use crate::quic::{QuicReceiverTransport, QuicSenderTransport};

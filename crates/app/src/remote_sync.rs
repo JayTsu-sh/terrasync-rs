@@ -14,7 +14,10 @@ use data_mover::qos::QosManager;
 use data_mover::{DataChunk, StorageEnum, WalkDirAsyncIterator2, create_storage};
 use rustls::pki_types::CertificateDer;
 use tracing::{debug, error, info, warn};
-use transport::message::{BlockSignature, NdxTable, ReceiverMsg, SenderMsg, SessionConfig};
+use transport::error::TransportError;
+use transport::message::{
+    BlockSignature, HandshakeResult, NdxTable, ProtocolHandshake, ReceiverMsg, SenderMsg, SessionConfig,
+};
 use transport::traits::SenderTransport;
 use utils::app_config::AppConfig;
 
@@ -29,7 +32,7 @@ const FILE_CHUNK_SIZE: usize = 4 * 1024 * 1024;
 
 /// 双进程全量同步 — Sender 侧入口
 ///
-/// 依次执行：QUIC 连接 → `SessionConfig` → Phase 1 文件列表 → Phase 2 请求处理 → Phase 3 Ack。
+/// 依次执行：QUIC 连接 → 握手协商 → `SessionConfig` → Phase 1 文件列表 → Phase 2 请求处理 → Phase 3 Ack。
 pub(crate) async fn run(config: &SyncJobConfig, remote_addr: &str, tls_cert_bytes: Option<&[u8]>) -> Result<()> {
     info!("[Sender Remote] Connecting to Receiver at {}", remote_addr);
 
@@ -41,7 +44,10 @@ pub(crate) async fn run(config: &SyncJobConfig, remote_addr: &str, tls_cert_byte
     let transport = transport::quic::connect(addr, "localhost", server_cert).await?;
     info!("[Sender Remote] Connected");
 
-    // ── 2. 发送 SessionConfig ──
+    // ── 2. 握手：协商协议版本与能力，不兼容则在发送任何 FilePage/CopyEntry 前中止 ──
+    negotiate_handshake(&transport).await?;
+
+    // ── 3. 发送 SessionConfig ──
     transport
         .send(SenderMsg::SessionConfig(SessionConfig {
             src_path: config.src_path.clone(),
@@ -56,7 +62,7 @@ pub(crate) async fn run(config: &SyncJobConfig, remote_addr: &str, tls_cert_byte
         }))
         .await?;
 
-    // ── 3. 创建源端 storage + walkdir_2 ──
+    // ── 4. 创建源端 storage + walkdir_2 ──
     let block_size = match &config.block_size {
         Some(s) => Some(parse_size(s)?),
         None => None,
@@ -76,7 +82,7 @@ pub(crate) async fn run(config: &SyncJobConfig, remote_addr: &str, tls_cert_byte
         )
         .await?;
 
-    // ── 4. QoS 管理器 + checkpoint 加载 ──
+    // ── 5. QoS 管理器 + checkpoint 加载 ──
     let qos_manager = create_qos_manager(config.qos.as_ref(), config.peak_qos_rate, config.iops);
     let checkpoint_path = std::path::PathBuf::from(&config.job_dir).join("remote_checkpoint.json");
     let mut completed_paths = load_checkpoint(&checkpoint_path).await;
@@ -87,7 +93,7 @@ pub(crate) async fn run(config: &SyncJobConfig, remote_addr: &str, tls_cert_byte
         );
     }
 
-    // ── 5. Phase 1: 发送文件列表 ──
+    // ── 6. Phase 1: 发送文件列表 ──
     let mut ndx_table = NdxTable::new();
     let page_count = send_file_list_phase(&transport, &walkdir_iter, &mut ndx_table).await?;
     info!(
@@ -96,7 +102,7 @@ pub(crate) async fn run(config: &SyncJobConfig, remote_addr: &str, tls_cert_byte
         ndx_table.len()
     );
 
-    // ── 6. Phase 2: 处理传输请求 ──
+    // ── 7. Phase 2: 处理传输请求 ──
     let transfer_count = process_requests(
         &transport,
         &src_storage,
@@ -108,20 +114,48 @@ pub(crate) async fn run(config: &SyncJobConfig, remote_addr: &str, tls_cert_byte
     transport.send(SenderMsg::TransferDone).await?;
     info!("[Sender Remote] Phase 2 done, {} transfer requests", transfer_count);
 
-    // ── 7. Phase 3: 等待 Ack ──
+    // ── 8. Phase 3: 等待 Ack ──
     let (success_count, error_count) = process_acks(&transport, &mut completed_paths, &checkpoint_path).await?;
     info!(
         "[Sender Remote] Complete: {} success, {} errors",
         success_count, error_count
     );
 
-    // ── 8. Checkpoint 处理 + 清理 ──
+    // ── 9. Checkpoint 处理 + 清理 ──
     save_or_clear_checkpoint(&checkpoint_path, &completed_paths, error_count).await;
     if let Some(ref qos) = qos_manager {
         qos.shutdown();
     }
     transport.close().await?;
     Ok(())
+}
+
+// ============================================================
+// 握手：协议版本与能力协商
+// ============================================================
+
+/// 发送 `Handshake` 并等待 Receiver 的 `HandshakeAck`。
+///
+/// 不兼容时 Receiver 会回 `Rejected`，此处直接返回错误，
+/// 调用方（`run()`）不会再发送 `SessionConfig` 及后续任何 Phase 1 数据。
+async fn negotiate_handshake(transport: &(dyn SenderTransport + 'static)) -> Result<()> {
+    transport
+        .send(SenderMsg::Handshake(ProtocolHandshake::current()))
+        .await?;
+    match transport.recv().await {
+        Some(ReceiverMsg::HandshakeAck(HandshakeResult::Accepted { features })) => {
+            info!(
+                "[Sender Remote] Handshake accepted, negotiated features: {:?}",
+                features
+            );
+            Ok(())
+        }
+        Some(ReceiverMsg::HandshakeAck(HandshakeResult::Rejected { reason })) => {
+            Err(TransportError::IncompatibleProtocol { reason }.into())
+        }
+        Some(_) => Err(AppError::CopyError("Unexpected message during handshake".into())),
+        None => Err(AppError::CopyError("Transport closed during handshake".into())),
+    }
 }
 
 // ============================================================

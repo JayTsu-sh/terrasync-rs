@@ -14,7 +14,11 @@ use data_mover::qos::QosManager;
 use data_mover::{EntryEnum, StorageEnum};
 use tokio::sync::mpsc::Receiver as MpscReceiver;
 use tracing::{Instrument, debug, error, info, info_span, trace, warn};
-use transport::message::{DestIndex, NdxTable, ProgressSnapshot, ReceiverMsg, SenderMsg, SessionConfig};
+use transport::error::TransportError;
+use transport::message::{
+    DestIndex, FeatureFlags, HandshakeResult, NdxTable, ProgressSnapshot, ProtocolHandshake, ReceiverMsg, SenderMsg,
+    SessionConfig,
+};
 use transport::traits::ReceiverTransport;
 
 // 内部模块
@@ -266,13 +270,17 @@ pub(crate) async fn process_entry_on_receiver(
 /// 双进程模式的 Receiver task（入口）
 ///
 /// 分阶段顺序协议：
+/// 0. 接收 `Handshake` → 校验协议版本/能力 → 回 ack/reject（不兼容则中止）
 /// 1. 接收 `SessionConfig`
 /// 2. 接收 `FilePage` → `DestIndex` 逐页比较 → 发 `TransferRequest`
 /// 3. 接收数据流 → 写入目标端 → 发 EntrySuccess/Error
 pub async fn receiver_task_remote(
     transport: &(dyn ReceiverTransport + 'static), dest_storage: Arc<StorageEnum>,
 ) -> Result<()> {
-    info!("[Receiver Remote] Started, waiting for SessionConfig");
+    info!("[Receiver Remote] Started, waiting for Handshake");
+
+    // ── 阶段 -1: 协议握手（版本 + 能力协商），不兼容则回 reject 后立即中止 ──
+    let negotiated_features = recv_and_negotiate_handshake(transport).await?;
 
     // ── 阶段 0: 接收 SessionConfig ──
     let session_config = recv_session_config(transport).await?;
@@ -301,7 +309,14 @@ pub async fn receiver_task_remote(
     };
 
     // ── 阶段 1: 接收文件列表 → 发 TransferRequest ──
-    recv_file_list_phase(transport, &dest_storage, &session_config, &progress).await?;
+    recv_file_list_phase(
+        transport,
+        &dest_storage,
+        &session_config,
+        &negotiated_features,
+        &progress,
+    )
+    .await?;
 
     // ── 阶段 2: 接收数据流 → 写入目标端 ──
     recv_file_data_phase(transport, &dest_storage, &session_config, &progress, progress_rx).await?;
@@ -313,6 +328,38 @@ pub async fn receiver_task_remote(
     let _ = transport.send(ReceiverMsg::AllDone).await;
     info!("[Receiver Remote] Completed");
     Ok(())
+}
+
+/// 阶段 -1：等待 Sender 的 `Handshake`，校验协议版本与能力，回发 ack/reject
+///
+/// 版本不兼容时发送 `Rejected` 后立即返回错误，不进入 `SessionConfig` / 文件列表阶段，
+/// 确保拒绝发生在任何 `FilePage` / `TransferRequest` / `CopyEntry` 之前。
+async fn recv_and_negotiate_handshake(transport: &(dyn ReceiverTransport + 'static)) -> Result<FeatureFlags> {
+    loop {
+        match transport.recv().await {
+            Some(SenderMsg::Handshake(remote)) => {
+                let result = ProtocolHandshake::current().negotiate(&remote);
+                let ack = result.clone();
+                match result {
+                    HandshakeResult::Accepted { features } => {
+                        info!(
+                            "[Receiver Remote] Handshake accepted, negotiated features: {:?}",
+                            features
+                        );
+                        transport.send(ReceiverMsg::HandshakeAck(ack)).await?;
+                        return Ok(features);
+                    }
+                    HandshakeResult::Rejected { reason } => {
+                        warn!("[Receiver Remote] Handshake rejected: {}", reason);
+                        transport.send(ReceiverMsg::HandshakeAck(ack)).await?;
+                        return Err(TransportError::IncompatibleProtocol { reason }.into());
+                    }
+                }
+            }
+            Some(_) => warn!("[Receiver Remote] Expected Handshake, skipping"),
+            None => return Err(AppError::CopyError("Transport closed before Handshake".into())),
+        }
+    }
 }
 
 /// 阶段 0：等待并返回 SessionConfig，忽略非预期消息
@@ -327,9 +374,12 @@ async fn recv_session_config(transport: &(dyn ReceiverTransport + 'static)) -> R
 }
 
 /// 阶段 1：接收 `FilePage` → 构建 `DestIndex` → 发 `TransferRequest` / `DeltaTransferRequest`
+///
+/// `negotiated_features` 为握手阶段协商后的能力交集；`delta` 能力未协商成功时
+/// 即使数据不匹配也降级为全量传输（`TransferRequest`），不发送 `DeltaTransferRequest`。
 async fn recv_file_list_phase(
     transport: &(dyn ReceiverTransport + 'static), dest_storage: &Arc<StorageEnum>, session_config: &SessionConfig,
-    progress: &Arc<ReceiverProgress>,
+    negotiated_features: &FeatureFlags, progress: &Arc<ReceiverProgress>,
 ) -> Result<()> {
     info!("[Receiver Remote] Phase 1: Receiving file list");
     let mut ndx_table = NdxTable::new();
@@ -365,6 +415,10 @@ async fn recv_file_list_phase(
                 for nf in &page.files {
                     match dest_index.check(&nf.entry) {
                         transport::message::TransferDecision::FullTransfer => {
+                            let _ = transport.send(ReceiverMsg::TransferRequest { ndx: nf.ndx }).await;
+                        }
+                        transport::message::TransferDecision::DeltaTransfer if !negotiated_features.delta => {
+                            // delta 能力未协商成功（对端不支持）→ 降级为全量传输
                             let _ = transport.send(ReceiverMsg::TransferRequest { ndx: nf.ndx }).await;
                         }
                         transport::message::TransferDecision::DeltaTransfer => {
