@@ -71,10 +71,16 @@ Sender 要读到证书文件才能发起连接。
 ## 执行步骤（每步一提交）
 
 - ✅ step 0：勘察确认（读 spec/代码、手工复现 bug、确定测试与修复方案）—— 本 plan 文件即产出，随本步提交。
-- ⬜ step 1：`transport::quic` 拆分 `accept()` 为 `bind()` + `accept_connection()`；`serve_cmd` 改为
-  "bind → 写证书 → accept_connection" 顺序。验证：`cargo check -p transport -p cli`、
-  `cargo test -p transport --features quic`（3 条既有握手测试仍需全绿，证明重构未改变对外行为）。
-  再手工复现一次两进程 serve/sync，确认 cert 文件在 bind 后立即出现。
+- ✅ step 1：`transport::quic` 拆分 `accept()` 为 `bind()` + `accept_connection()`；`serve_cmd` 改为
+  "bind → 写证书 → accept_connection" 顺序。验证：`cargo check -p transport -p cli` 通过；
+  `cargo test -p transport --features quic` 6 条测试全绿（3 条握手 + 既有 roundtrip，证明重构未改变
+  对外行为）。手工复现两进程 serve/sync：bind 后 1s 内 `server.crt` 立即出现（此前需等一个连接建立，
+  永远等不到）；Sender exit 0；dest 文件与 src 一致；两端 app.log 均记录
+  `Handshake accepted, negotiated features: FeatureFlags { delta: true, ... }`。
+  （手工验证还发现：真实进程需要 `-c` 传 `[database]\nenabled = false` 才能绕开 ClickHouse 依赖，
+  且每次运行需要全新 job_id/job_dir，否则会被判定为 Incremental 而报
+  "Remote incremental sync not yet implemented" —— 这两点已写进下一步的测试实现里，通过全新 tmp
+  目录 + 全新 job_id 规避，非本 issue 修复范围内的 bug。）
 - ⬜ step 2：root 新增 `tests/remote_process_e2e.rs` + `Cargo.toml` dev-dependencies 加 `tempfile`。
   实现 happy-path 进程级测试：起 Receiver → 等 cert 文件出现（bounded 超时）→ 起 Sender →
   断言 Sender exit code 0 → 断言 dest 与 src 文件一致 → grep 双方 app.log 里的

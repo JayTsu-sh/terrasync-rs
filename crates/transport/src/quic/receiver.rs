@@ -26,11 +26,15 @@ pub struct QuicReceiverTransport {
     recv: Mutex<quinn::RecvStream>,
 }
 
-/// 监听并接受一个 QUIC 连接
+/// 生成自签名证书并 bind 一个 QUIC endpoint，立即返回（不等待任何连接）
 ///
-/// 返回 `(QuicReceiverTransport, Endpoint, cert_der)`：
-/// - `cert_der` 是服务端自签名证书的 DER 字节，调用方可写入文件供 Sender 侧验证（防 MITM）。
-pub async fn accept(listen_addr: SocketAddr) -> Result<(QuicReceiverTransport, quinn::Endpoint, Vec<u8>)> {
+/// 返回 `(Endpoint, cert_der)`：`cert_der` 是服务端自签名证书的 DER 字节。
+///
+/// 调用方应在此之后**立即**把 `cert_der` 写入文件供 Sender 侧 `--tls-server-cert` 校验，
+/// 再调用 [`accept_connection`] 等待 Sender 连接进来。若把写证书文件放在
+/// `accept_connection` 之后，会形成死锁：Sender 在发起连接前必须先读到证书文件，
+/// 而 Receiver 却要等一个连接建立后才写文件。
+pub fn bind(listen_addr: SocketAddr) -> Result<(quinn::Endpoint, Vec<u8>)> {
     let (certs, key) = cert::generate_self_signed(&[]).map_err(|e| TransportError::RecvFailed(format!("cert: {e}")))?;
 
     // 在 certs 被 build_server_config 消费前，先保存 DER 字节
@@ -47,6 +51,11 @@ pub async fn accept(listen_addr: SocketAddr) -> Result<(QuicReceiverTransport, q
         .map_err(|e| TransportError::RecvFailed(format!("local_addr: {e}")))?;
     info!("[QUIC Receiver] Listening on {}", local_addr);
 
+    Ok((endpoint, cert_der))
+}
+
+/// 在已 bind 的 endpoint 上等待并接受一个 QUIC 连接
+pub async fn accept_connection(endpoint: &quinn::Endpoint) -> Result<QuicReceiverTransport> {
     let incoming = endpoint.accept().await.ok_or(TransportError::ChannelClosed)?;
 
     let conn = incoming
@@ -60,15 +69,11 @@ pub async fn accept(listen_addr: SocketAddr) -> Result<(QuicReceiverTransport, q
         .await
         .map_err(|e| TransportError::RecvFailed(format!("accept_bi: {e}")))?;
 
-    Ok((
-        QuicReceiverTransport {
-            conn,
-            send: Mutex::new(send),
-            recv: Mutex::new(recv),
-        },
-        endpoint,
-        cert_der,
-    ))
+    Ok(QuicReceiverTransport {
+        conn,
+        send: Mutex::new(send),
+        recv: Mutex::new(recv),
+    })
 }
 
 /// 获取 Endpoint 监听的实际地址（用于测试时获取随机端口）
