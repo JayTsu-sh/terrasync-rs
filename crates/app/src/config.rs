@@ -108,6 +108,8 @@ pub struct SyncJobConfig {
     pub raw_command_line: String,
     /// 进度回调 URL（web 层注入，CLI 为 None）
     pub progress_callback_url: Option<String>,
+    /// 关闭字节级断点续传（强制整体复制大文件）
+    pub no_resume: bool,
 }
 
 /// 初始化扫描配置

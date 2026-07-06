@@ -18,7 +18,9 @@ use transport::message::{DestIndex, NdxTable, ProgressSnapshot, ReceiverMsg, Sen
 use transport::traits::ReceiverTransport;
 
 // 内部模块
+use crate::byte_resume::is_part_file;
 use crate::error::{AppError, Result};
+use crate::sync::{ResumeOpts, copy_file_with_resume, should_resume};
 
 // ============================================================
 // Receiver 进度跟踪（原子计数器，支持多 Receiver 聚合）
@@ -71,10 +73,15 @@ impl ReceiverProgress {
 }
 
 /// Receiver 运行时配置
+#[allow(clippy::struct_excessive_bools)] // 按用途分组的开关集合，重构为枚举会失去可读性
 pub struct ReceiverConfig {
     pub enable_integrity_check: bool,
     pub enable_acl: bool,
     pub is_source_reserved: bool,
+    /// 任务目录（字节级断点续传状态存于 `<job_dir>/byte_resume/`）；为空则禁用续传
+    pub job_dir: String,
+    /// 显式关闭字节级断点续传（强制整体复制）
+    pub no_resume: bool,
 }
 
 /// 单进程模式的 Receiver 主 task（R1 + R2 合一）
@@ -200,17 +207,37 @@ pub(crate) async fn process_entry_on_receiver(
                 error!("[Receiver] Failed to remove source symlink {:?}: {}", relative_path, e);
             }
         } else {
-            StorageEnum::copy_file(
-                src_storage,
-                dest_storage,
-                entry,
-                qos_manager,
-                config.enable_integrity_check,
-                config.is_source_reserved,
-                bytes_counter,
-            )
-            .await
-            .map_err(|e| AppError::CopyError(format!("Failed to copy {}: {e}", relative_path.display())))?;
+            // 全量复制：多块大文件写 .part（建立续传基础，正常结束即 rename；
+            // 中断则留 .part + 进度状态供后续增量续传）；小文件/S3 走整文件拷贝。
+            let resume = ResumeOpts {
+                job_dir: config.job_dir.clone(),
+                no_resume: config.no_resume,
+            };
+            if should_resume(&resume, entry, src_storage, dest_storage) {
+                copy_file_with_resume(
+                    entry,
+                    src_storage,
+                    dest_storage,
+                    config.enable_integrity_check,
+                    config.is_source_reserved,
+                    qos_manager,
+                    bytes_counter,
+                    &config.job_dir,
+                )
+                .await?;
+            } else {
+                StorageEnum::copy_file(
+                    src_storage,
+                    dest_storage,
+                    entry,
+                    qos_manager,
+                    config.enable_integrity_check,
+                    config.is_source_reserved,
+                    bytes_counter,
+                )
+                .await
+                .map_err(|e| AppError::CopyError(format!("Failed to copy {}: {e}", relative_path.display())))?;
+            }
 
             // 设置目标文件元数据（mtime/uid/gid/mode 或 S3 mtime/tags）
             dest_storage.set_entry_metadata(entry).await.map_err(|e| {
@@ -393,6 +420,12 @@ async fn recv_file_list_phase(
                 if session_config.delete_target {
                     for orphan in dest_index.orphaned_entries() {
                         let path = orphan.get_relative_path();
+                        // 跳过续传临时文件：源端不存在同名 .terrasync-part 条目，
+                        // 会被误判为孤儿；删掉会破坏进行中的续传进度
+                        if is_part_file(path) {
+                            debug!("[Receiver Remote] Skipping in-progress part file: {:?}", path);
+                            continue;
+                        }
                         if orphan.get_is_dir() {
                             info!("[Receiver Remote] Deleting orphaned dir: {:?}", path);
                             if let Err(e) = dest_storage.delete_dir_all(orphan).await {

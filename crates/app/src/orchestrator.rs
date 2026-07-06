@@ -58,7 +58,8 @@ use crate::sender::{SenderWorkerConfig, sender_worker};
 #[cfg(windows)]
 use crate::sync::check_admin_privileges;
 use crate::sync::{
-    StoragePair, parse_size, process_entry, process_metadata_only_entry, process_rename_entry, process_versioned_entry,
+    ResumeOpts, StoragePair, parse_size, process_entry, process_metadata_only_entry, process_rename_entry,
+    process_versioned_entry,
 };
 use crate::{dir_walker, tar_pack};
 
@@ -385,6 +386,8 @@ impl SyncOrchestrator {
             enable_integrity_check: c.enable_integrity_check,
             enable_acl: c.enable_acl,
             is_source_reserved,
+            job_dir: c.job_dir.clone(),
+            no_resume: c.no_resume,
         });
 
         // ── 8.5. 创建 mount 限流信号量 + countdown latch 计数器（Sender + Receiver 共享） ──
@@ -760,6 +763,10 @@ impl SyncOrchestrator {
             let bt = bytes_tracker.clone();
             let enable_integrity_check = c.enable_integrity_check;
             let enable_acl = c.enable_acl;
+            let resume_opts = ResumeOpts {
+                job_dir: c.job_dir.clone(),
+                no_resume: c.no_resume,
+            };
             let mount_sem = mount_semaphore.clone();
             let alive_counter = alive_handlers.clone();
             let done_counter = mount_done_handlers.clone();
@@ -820,6 +827,7 @@ impl SyncOrchestrator {
                                         qos.clone(),
                                         bt.clone(),
                                         &bc,
+                                        resume_opts.clone(),
                                     )
                                     .await
                                     {
@@ -864,6 +872,7 @@ impl SyncOrchestrator {
                                         qos.clone(),
                                         bt.clone(),
                                         &bc,
+                                        resume_opts.clone(),
                                     )
                                     .await
                                 };

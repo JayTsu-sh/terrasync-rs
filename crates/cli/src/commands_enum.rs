@@ -157,6 +157,11 @@ pub enum Commands {
         /// Copy from the Receiver's --tls-cert-out output.
         #[arg(long, value_name = "FILE", requires = "remote")]
         tls_server_cert: Option<String>,
+
+        /// Disable byte-level resume for large files (force whole-file copy).
+        /// By default an interrupted large-file transfer resumes from where it stopped.
+        #[arg(long, default_value_t = false)]
+        no_resume: bool,
     },
 
     /// Start a Receiver daemon for dual-process sync (destination side).

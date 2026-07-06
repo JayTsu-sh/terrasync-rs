@@ -9,13 +9,13 @@
 
 // 标准库
 use std::sync::Arc;
-use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 // 外部crate
 use dashmap::DashMap;
 use data_mover::qos::QosManager;
 use data_mover::{EntryEnum, ErrorEvent, StorageEntryMessage, StorageEnum, create_storage, redact_storage_url};
-use tracing::{Instrument, debug, error, info, info_span, instrument, trace};
+use tracing::{Instrument, debug, error, info, info_span, instrument, trace, warn};
 #[cfg(windows)]
 use windows_sys::Win32::Foundation::CloseHandle;
 #[cfg(windows)]
@@ -27,6 +27,7 @@ use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken}
 
 // 内部模块
 use crate::broadcast::BroadcastForwarder;
+use crate::byte_resume::{ByteResumeStore, part_path_for};
 use crate::error::{AppError, Result};
 
 /// 存储资源管理器 - 统一管理源和目标存储实例
@@ -295,7 +296,7 @@ pub(crate) async fn process_versioned_entry(
                     entry.get_mtime()
                 );
 
-                // 处理条目
+                // 处理条目（S3 版本化路径：多版本对象续传语义未定义，保持关闭 → default）
                 match process_entry(
                     entry.as_ref(),
                     Arc::clone(&src_storage),
@@ -306,6 +307,7 @@ pub(crate) async fn process_versioned_entry(
                     qos_manager.clone(),
                     bytes_counter.clone(),
                     &broadcaster,
+                    ResumeOpts::default(),
                 )
                 .await
                 {
@@ -360,6 +362,7 @@ pub(crate) async fn process_versioned_entry(
                     qos_manager.clone(),
                     bytes_counter.clone(),
                     &broadcaster,
+                    ResumeOpts::default(),
                 )
                 .await
                 {
@@ -388,7 +391,7 @@ pub(crate) async fn process_versioned_entry(
 }
 
 /// `process_entry` / `process_entry_inner` 的标志位组合
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 #[allow(clippy::struct_excessive_bools)] // 标志位结构按调用现场天然分组，封装为枚举会引入调用点繁杂匹配
 pub(crate) struct ProcessEntryOpts {
     pub enable_integrity_check: bool,
@@ -396,19 +399,22 @@ pub(crate) struct ProcessEntryOpts {
     pub is_source_reserved: bool,
     /// 仅同步元数据（chmod/chown 场景），跳过 `copy_file`
     pub skip_data_copy: bool,
+    /// 字节级断点续传参数（job_dir 为空或 no_resume 时退化为整文件拷贝）
+    pub resume: ResumeOpts,
 }
 
 #[allow(clippy::too_many_arguments)] // 公共入口需要逐项透传调用方上下文，封装结构会破坏 API 形态
 pub(crate) async fn process_entry(
     entry: &EntryEnum, src_storage: Arc<StorageEnum>, dest_storage: Arc<StorageEnum>, enable_integrity_check: bool,
     enable_acl: bool, is_source_reserved: bool, qos_manager: Option<QosManager>, bytes_counter: Option<Arc<AtomicU64>>,
-    broadcaster: &BroadcastForwarder<StorageEntryMessage>,
+    broadcaster: &BroadcastForwarder<StorageEntryMessage>, resume: ResumeOpts,
 ) -> Result<()> {
     let opts = ProcessEntryOpts {
         enable_integrity_check,
         enable_acl,
         is_source_reserved,
         skip_data_copy: false,
+        resume,
     };
     process_entry_inner(
         entry,
@@ -435,6 +441,7 @@ pub(crate) async fn process_metadata_only_entry(
         enable_acl,
         is_source_reserved,
         skip_data_copy: true,
+        resume: ResumeOpts::default(),
     };
     process_entry_inner(entry, src_storage, dest_storage, opts, None, None, broadcaster).await
 }
@@ -449,6 +456,7 @@ async fn process_entry_inner(
         enable_acl,
         is_source_reserved,
         skip_data_copy,
+        resume,
     } = opts;
     let relative_path = entry.get_relative_path();
     let span = info_span!("process_entry", path = %relative_path.display());
@@ -516,6 +524,28 @@ async fn process_entry_inner(
             .set_entry_metadata(entry)
             .await
             .map_err(|e| AppError::CopyError(format!("Failed to set metadata for {}: {e}", relative_path.display())))?;
+    } else if should_resume(&resume, entry, &src_storage, &dest_storage) {
+        // 多块大文件：字节级断点续传（全量建 .part / 增量续 .part）
+        debug!("Copying file (resumable) {:?}", relative_path);
+        copy_file_with_resume(
+            entry,
+            &src_storage,
+            &dest_storage,
+            enable_integrity_check,
+            is_source_reserved,
+            qos_manager,
+            bytes_counter,
+            &resume.job_dir,
+        )
+        .await?;
+
+        // 设置目标文件元数据（时间戳、权限）
+        dest_storage
+            .set_entry_metadata(entry)
+            .await
+            .map_err(|e| AppError::CopyError(format!("Failed to set metadata for {}: {e}", relative_path.display())))?;
+
+        debug!("Copied file (resumable) {:?}", relative_path);
     } else {
         debug!("Copying file {:?}", relative_path);
 
@@ -570,6 +600,131 @@ async fn process_entry_inner(
 
     Ok(())
     }.instrument(span).await
+}
+
+/// 字节级断点续传的可调参数（全量/增量两条路径共用）。
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ResumeOpts {
+    /// 任务目录；续传状态存于 `<job_dir>/byte_resume/`。为空则禁用续传。
+    pub job_dir: String,
+    /// 显式关闭续传（强制整文件拷贝）。
+    pub no_resume: bool,
+}
+
+/// 该存储是否为 S3。
+fn is_s3(storage: &StorageEnum) -> bool {
+    matches!(storage, StorageEnum::S3(_))
+}
+
+/// 该 entry 是否应走字节级断点续传：启用 + 多块大文件（全后端：Local/NFS/CIFS/S3）。
+///
+/// - **源端 S3**：data-mover `read_data_intervals` 以 Range GET 只读缺失区间。
+/// - **目标端 S3**：走 multipart part 粒度续传——进度真值是目标端 in-progress
+///   multipart upload（ListParts 反推缺失区间），本地状态文件仅作进度参考；
+///   额外要求 size > 目标端 block_size（part 大小下限），单 part 文件续传无意义
+///   （中断即全丢），走普通拷贝即可。
+/// - **S3 多版本路径**除外：多版本对象的续传语义未定义，调用方传
+///   `ResumeOpts::default()` 保持关闭（见 versioned 拷贝路径）。
+pub(crate) fn should_resume(resume: &ResumeOpts, entry: &EntryEnum, src: &StorageEnum, dest: &StorageEnum) -> bool {
+    !resume.no_resume
+        && !resume.job_dir.is_empty()
+        && !entry.get_is_dir()
+        && !entry.get_is_symlink()
+        && entry.get_size() > src.block_size()
+        && (!is_s3(dest) || entry.get_size() > dest.block_size())
+}
+
+/// 字节级断点续传复制单个大文件（全量建 `.part` / 增量续 `.part` 共用）。
+///
+/// 加载/创建 `<job_dir>/byte_resume/` 下的进度状态，把缺失区间交给
+/// `copy_file_resumable`；每个 chunk 确认落盘的回调经有界 channel 投递到收敛 task
+/// 异步持久化区间（不阻塞写管道热路径）。成功后清理状态文件；失败（中断）保留状态供续传。
+///
+/// - NAS 目标端：续写到 `<dest>.terrasync-part`，完成后由 data-mover 原子 rename。
+/// - S3 目标端：multipart part 粒度续传，进度真值是目标端 in-progress upload
+///   （data-mover 以 ListParts 反推缺失区间，忽略此处传入的 `missing`）；
+///   本地状态文件仍随 part 回调更新，仅作进度参考。
+pub(crate) async fn copy_file_with_resume(
+    entry: &EntryEnum, src_storage: &StorageEnum, dest_storage: &StorageEnum, enable_integrity_check: bool,
+    is_source_reserved: bool, qos_manager: Option<QosManager>, bytes_counter: Option<Arc<AtomicU64>>, job_dir: &str,
+) -> Result<()> {
+    let dest_rel = entry.get_relative_path();
+    let store = ByteResumeStore::open(
+        job_dir,
+        dest_rel,
+        entry.get_size(),
+        entry.get_mtime(),
+        src_storage.block_size(),
+    )
+    .await?;
+    let missing = store.missing_intervals().await;
+
+    // sync 回调 → async mark_committed 的桥接：有界 channel + 收敛 task。
+    // 消息总数上界 = file_size / block_size，但 block_size 用户可配置且无下限
+    // （极小块 + TB 级文件可产生千万级消息），故用有界 channel 兜底内存。
+    // 满时 try_send 失败直接丢弃该条记录——保守安全：区间未记为已完成，
+    // 中断后续传时重拷该区间，只多传不丢数据。
+    const COMMIT_CHANNEL_CAPACITY: usize = 65536;
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<(u64, u64)>(COMMIT_CHANNEL_CAPACITY);
+    let store_task = store.clone();
+    let drain = tokio::spawn(async move {
+        while let Some((offset, len)) = rx.recv().await {
+            if let Err(e) = store_task.mark_committed(offset, len).await {
+                warn!("byte-resume mark_committed failed: {}", e);
+            }
+        }
+    });
+    let dropped = Arc::new(AtomicU64::new(0));
+    let dropped_cb = dropped.clone();
+    let on_committed: data_mover::CommitCallback = Arc::new(move |offset, len| {
+        if tx.try_send((offset, len)).is_err() {
+            dropped_cb.fetch_add(1, Ordering::Relaxed);
+        }
+    });
+
+    let resume = data_mover::ResumeContext {
+        part_relative_path: part_path_for(dest_rel),
+        missing_intervals: missing,
+        on_committed,
+    };
+
+    let res = StorageEnum::copy_file_resumable(
+        src_storage,
+        dest_storage,
+        entry,
+        qos_manager,
+        enable_integrity_check,
+        is_source_reserved,
+        bytes_counter,
+        resume,
+    )
+    .await;
+
+    // copy_file_resumable 返回后 on_committed（持有 tx）已 drop → channel 关闭 → drain 退出
+    let _ = drain.await;
+    let dropped_count = dropped.load(Ordering::Relaxed);
+    if dropped_count > 0 {
+        warn!(
+            "byte-resume: {} 条 commit 记录因 channel 满被丢弃（{}），中断后这些区间将重拷",
+            dropped_count,
+            dest_rel.display()
+        );
+    }
+
+    match res {
+        Ok(()) => {
+            store.finalize_done().await?;
+            Ok(())
+        }
+        Err(e) => {
+            // 中断：持久化已记录进度，保留状态与 .part 供下次续传
+            let _ = store.flush().await;
+            Err(AppError::CopyError(format!(
+                "Resumable copy failed for {}: {e}",
+                dest_rel.display()
+            )))
+        }
+    }
 }
 
 /// 处理单个文件或目录的复制

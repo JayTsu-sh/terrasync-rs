@@ -131,10 +131,16 @@ enum JoinStrategy {
 
 impl JoinStrategy {
     /// 根据临时表和主表的 `file_handle` 统计信息决定 JOIN 策略
-    fn from_file_handle_status(
-        temp_non_null: usize, base_non_null: usize, base_total: usize, temp_total: usize,
-    ) -> Self {
-        if temp_non_null == 0 && base_non_null == 0 && base_total > 0 && temp_total > 0 {
+    ///
+    /// 策略只取决于「是否存在 file_handle」，与表是否为空无关：
+    /// 两侧都无 `file_handle`（local/S3）→ 必须用 Path（`relative_path+version_id`）；
+    /// 任一侧有 `file_handle`（NFS/CIFS）→ 用 FileHandle。
+    ///
+    /// 注意：不得用 `base_total > 0` 之类的「表非空」作为前置条件——全量拷贝中断后
+    /// 续传时 base 为空，但 local/S3 文件无 `file_handle`，若误入 FileHandle 分支，
+    /// `NULL NOT IN (...)` 会求值为 NULL 导致新增文件漏判、被静默并入 base 而不拷贝。
+    fn from_file_handle_status(temp_non_null: usize, base_non_null: usize) -> Self {
+        if temp_non_null == 0 && base_non_null == 0 {
             Self::Path
         } else {
             Self::FileHandle
@@ -487,10 +493,9 @@ impl ClickHouseDatabase {
             .ok_or_else(|| DatabaseError::UnsupportedType("Temporary table not created".to_string()))?;
         let base_table_name = get_scan_base_table_name(&self.job_id);
 
-        let (temp_total, temp_non_null, base_total, base_non_null) =
-            self.check_file_handle_status(temp_table_name, &base_table_name).await?;
+        let (temp_non_null, base_non_null) = self.check_file_handle_status(temp_table_name, &base_table_name).await?;
 
-        let strategy = JoinStrategy::from_file_handle_status(temp_non_null, base_non_null, base_total, temp_total);
+        let strategy = JoinStrategy::from_file_handle_status(temp_non_null, base_non_null);
 
         let query = query_builder(temp_table_name, &base_table_name, &strategy);
         trace!("Querying {}: {}", query_type, query);
@@ -506,14 +511,13 @@ impl ClickHouseDatabase {
         Ok(rows)
     }
 
-    /// 返回 (`temp_total`, `temp_non_null`, `base_total`, `base_non_null`) 用于确定 JOIN 策略
-    async fn check_file_handle_status(
-        &self, temp_table_name: &str, base_table_name: &str,
-    ) -> Result<(usize, usize, usize, usize)> {
+    /// 返回 (`temp_non_null`, `base_non_null`)：两表各自非 NULL `file_handle` 的数量，
+    /// 用于决定 JOIN 策略（见 `JoinStrategy::from_file_handle_status`）。
+    async fn check_file_handle_status(&self, temp_table_name: &str, base_table_name: &str) -> Result<(usize, usize)> {
         let query = format!(
-            "SELECT t.total, t.non_null, b.total, b.non_null \
-             FROM (SELECT count(*) AS total, count(file_handle) AS non_null FROM {temp_table_name}) t \
-             CROSS JOIN (SELECT count(*) AS total, count(file_handle) AS non_null FROM {base_table_name}) b"
+            "SELECT t.non_null, b.non_null \
+             FROM (SELECT count(file_handle) AS non_null FROM {temp_table_name}) t \
+             CROSS JOIN (SELECT count(file_handle) AS non_null FROM {base_table_name}) b"
         );
 
         debug!(
@@ -521,25 +525,23 @@ impl ClickHouseDatabase {
             temp_table_name, base_table_name
         );
 
-        let (tt, tn, bt, bn): (u64, u64, u64, u64) = match self.sync_client.query(&query).fetch_one().await {
+        let (tn, bn): (u64, u64) = match self.sync_client.query(&query).fetch_one().await {
             Ok(row) => row,
             Err(e) => {
-                warn!("Failed to query file_handle status: {}, defaulting to (0, 0, 0, 0)", e);
-                (0, 0, 0, 0)
+                warn!("Failed to query file_handle status: {}, defaulting to (0, 0)", e);
+                (0, 0)
             }
         };
 
-        let temp_total = tt as usize;
         let temp_non_null = tn as usize;
-        let base_total = bt as usize;
         let base_non_null = bn as usize;
 
         trace!(
-            "file_handle status - Temporary table: total={}, non_null={}; Base table: total={}, non_null={}",
-            temp_total, temp_non_null, base_total, base_non_null
+            "file_handle status - temp non_null={}, base non_null={}",
+            temp_non_null, base_non_null
         );
 
-        Ok((temp_total, temp_non_null, base_total, base_non_null))
+        Ok((temp_non_null, base_non_null))
     }
 
     /// 根据 `relative_path` 列表批量删除指定表中的记录
@@ -1362,25 +1364,26 @@ mod tests {
 
     #[test]
     fn test_join_strategy_from_file_handle_status() {
-        // 两表都无 fh，base 和 temp 都有数据 → Path
+        // 两侧都无 fh（local/S3）→ Path
         assert!(matches!(
-            JoinStrategy::from_file_handle_status(0, 0, 100, 50),
+            JoinStrategy::from_file_handle_status(0, 0),
             JoinStrategy::Path
         ));
-        // 有 fh → FileHandle
+        // 任一侧有 fh（NFS/CIFS）→ FileHandle
         assert!(matches!(
-            JoinStrategy::from_file_handle_status(10, 5, 100, 50),
+            JoinStrategy::from_file_handle_status(10, 5),
             JoinStrategy::FileHandle
         ));
-        // base 空 → FileHandle
         assert!(matches!(
-            JoinStrategy::from_file_handle_status(0, 0, 0, 50),
+            JoinStrategy::from_file_handle_status(3, 0),
             JoinStrategy::FileHandle
         ));
-        // temp 空 → FileHandle
+        // 回归：两侧都无 fh 时，无论 base/temp 是否为空都必须用 Path。
+        // 旧实现要求 base_total>0 才用 Path，导致全量中断后续传（base 空）误入
+        // FileHandle，`NULL NOT IN (...)` 漏判 local 新增文件 → 静默不拷贝。
         assert!(matches!(
-            JoinStrategy::from_file_handle_status(0, 0, 100, 0),
-            JoinStrategy::FileHandle
+            JoinStrategy::from_file_handle_status(0, 0),
+            JoinStrategy::Path
         ));
     }
 
