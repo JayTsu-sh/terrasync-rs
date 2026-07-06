@@ -115,8 +115,13 @@ Sender 要读到证书文件才能发起连接。
   timeout 判定连接结束"这一理论上仍存在、但触发概率极低的对称场景（见"范围外"说明，未在生产代码里
   处理，只在测试超时上留够余量）。验证：`cargo test -p terrasync-rs --test remote_process_e2e -- --nocapture`
   连续多次运行全部通过。
-- ⬜ step 3：收尾。`cargo fmt`、`cargo clippy -p terrasync-rs`（无新增告警）、`git status` 确认无越界
-  文件，移除本 plan 文件并单独提交。
+- ✅ step 3：收尾。`cargo fmt`（发现测试文件 2 处格式问题，已单独提交 `style(test)`）；
+  `cargo clippy -p terrasync-rs`（含 `--bin terrasync`/`--test remote_process_e2e`）与
+  `cargo clippy -p transport --features quic --all-targets` 均无新增告警（对照 pre-existing 告警行号，
+  全部落在本 issue 未改动的代码上）；`cargo test -p app`（24 通过）、
+  `cargo test -p transport --features quic`（6 通过）、
+  `cargo test -p terrasync-rs --test remote_process_e2e`（1 通过）全绿；`git status` 干净，无越界文件。
+  移除本 plan 文件并单独提交。
 
 ## 范围外（明确不做）
 - 不重造 incompatible/downgrade 负路径（已被 `quic_roundtrip.rs` 的
