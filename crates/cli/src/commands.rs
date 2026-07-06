@@ -381,6 +381,12 @@ pub async fn serve_cmd(listen: &str, dest_path: &str, tls_cert_out: &str) -> Res
         .await
         .map_err(CliError::AppError)?;
 
+    // 8. 等连接真正关闭再退出进程：write_all() 返回 Ok 只表示数据进入了 quinn 本地发送队列，
+    //    不代表已经送达对端；若这里立即 return，进程退出会连带丢弃尚未真正发出的最后几帧
+    //    （EntrySuccess/Progress/AllDone）。Sender 收到 AllDone 后会主动关闭连接，wait_idle()
+    //    等的正是这个信号；兜底走 quinn 默认 30s idle timeout，不会无限等待。
+    endpoint.wait_idle().await;
+
     info!("Receiver daemon completed");
     Ok(())
 }
