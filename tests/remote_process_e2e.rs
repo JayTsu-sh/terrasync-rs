@@ -67,8 +67,7 @@ fn populate_src_dir(dir: &Path) -> Vec<PathBuf> {
 fn assert_dest_matches_src(src_dir: &Path, dest_dir: &Path, rel_paths: &[PathBuf]) {
     for rel in rel_paths {
         let src_content = fs::read(src_dir.join(rel)).expect("read src file");
-        let dest_content =
-            fs::read(dest_dir.join(rel)).unwrap_or_else(|e| panic!("dest 缺少文件 {rel:?}: {e}"));
+        let dest_content = fs::read(dest_dir.join(rel)).unwrap_or_else(|e| panic!("dest 缺少文件 {rel:?}: {e}"));
         assert_eq!(src_content, dest_content, "dest 文件 {rel:?} 内容与 src 不一致");
     }
 }
@@ -93,8 +92,7 @@ fn wait_for_cert_file(cert_path: &Path) {
 
 /// 读取日志文件，断言其中出现握手成功的日志行。
 fn assert_handshake_accepted_in_log(log_path: &Path, who: &str) {
-    let content =
-        fs::read_to_string(log_path).unwrap_or_else(|e| panic!("读取 {who} 日志失败 {log_path:?}: {e}"));
+    let content = fs::read_to_string(log_path).unwrap_or_else(|e| panic!("读取 {who} 日志失败 {log_path:?}: {e}"));
     assert!(
         content.contains("Handshake accepted, negotiated features"),
         "{who} 日志 {log_path:?} 中未发现握手成功记录，内容:\n{content}"
