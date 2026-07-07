@@ -3,6 +3,7 @@
 pub mod cert;
 pub mod error;
 pub mod framing;
+mod mux;
 pub mod receiver;
 pub mod sender;
 

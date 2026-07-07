@@ -5,7 +5,7 @@ edition = "2024"
 
 [features]
 default = []
-quic = ["dep:quinn", "dep:rcgen", "dep:rustls", "dep:bincode", "dep:tracing", "dep:zstd"]
+quic = ["dep:quinn", "dep:rcgen", "dep:rustls", "dep:bincode", "dep:tracing", "dep:zstd", "tokio/rt"]
 
 [dependencies]
 async-channel = { workspace = true }

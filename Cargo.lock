@@ -179,6 +179,7 @@ dependencies = [
  "serde_json",
  "serial_test",
  "sync-delta",
+ "tempfile",
  "thiserror 2.0.18",
  "tokio",
  "tokio-util",

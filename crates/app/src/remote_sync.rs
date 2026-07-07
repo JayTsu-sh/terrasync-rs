@@ -2,11 +2,17 @@
 //!
 //! 将 QUIC 连接、文件列表发送、传输请求处理、Ack 收集等阶段
 //! 提取为独立函数，降低单函数复杂度并提升可读性。
+//!
+//! 握手/鉴权/`SessionConfig` 之后，文件列表发送（`send_file_list_phase`，只
+//! `send()`、从不 `recv()`）与请求处理 + Ack 收集（`process_requests_and_acks`，
+//! 唯一的 `recv()` 消费者）通过 `tokio::try_join!` 并发运行，不再是「文件列表发完
+//! 才能开始处理请求」的顺序 barrier；`NdxTable` 因此改为 `Mutex` 包裹以支持并发
+//! 读写（写者只有文件列表任务，读者只有请求处理任务，不存在二义性）。
 
 use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 
 use data_mover::dir_tree::NdxEvent;
 use data_mover::filter::parse_filter_expression;
@@ -32,8 +38,8 @@ const FILE_CHUNK_SIZE: usize = 4 * 1024 * 1024;
 
 /// 双进程全量同步 — Sender 侧入口
 ///
-/// 依次执行：QUIC 连接 → 握手协商 → Token 鉴权 → `SessionConfig` → Phase 1 文件列表 →
-/// Phase 2 请求处理 → Phase 3 Ack。
+/// 依次执行：QUIC 连接 → 握手协商 → Token 鉴权 → `SessionConfig`；随后文件列表发送与
+/// 请求处理+Ack 收集并发运行（见模块文档）。
 pub(crate) async fn run(
     config: &SyncJobConfig, remote_addr: &str, tls_cert_bytes: Option<&[u8]>, auth_token: Option<&str>,
 ) -> Result<()> {
@@ -99,29 +105,26 @@ pub(crate) async fn run(
         );
     }
 
-    // ── 6. Phase 1: 发送文件列表 ──
-    let mut ndx_table = NdxTable::new();
-    let page_count = send_file_list_phase(&transport, &walkdir_iter, &mut ndx_table).await?;
-    info!(
-        "[Sender Remote] File list sent: {} pages, {} entries",
-        page_count,
-        ndx_table.len()
-    );
-
-    // ── 7. Phase 2: 处理传输请求 ──
-    let transfer_count = process_requests(
+    // ── 6+7+8. 文件列表发送 与 请求处理+Ack收集 并发运行（流水线，无阶段 barrier） ──
+    let ndx_table = Mutex::new(NdxTable::new());
+    let file_list_fut = send_file_list_phase(&transport, &walkdir_iter, &ndx_table);
+    let requests_acks_fut = process_requests_and_acks(
         &transport,
         &src_storage,
         &ndx_table,
         qos_manager.as_ref(),
         config.enable_acl,
-    )
-    .await?;
-    transport.send(SenderMsg::TransferDone).await?;
-    info!("[Sender Remote] Phase 2 done, {} transfer requests", transfer_count);
-
-    // ── 8. Phase 3: 等待 Ack ──
-    let (success_count, error_count) = process_acks(&transport, &mut completed_paths, &checkpoint_path).await?;
+        &mut completed_paths,
+        &checkpoint_path,
+    );
+    let (page_count, (transfer_count, success_count, error_count)) =
+        tokio::try_join!(file_list_fut, requests_acks_fut)?;
+    info!(
+        "[Sender Remote] File list sent: {} pages, {} entries",
+        page_count,
+        ndx_table.lock().unwrap_or_else(PoisonError::into_inner).len()
+    );
+    info!("[Sender Remote] {} transfer requests processed", transfer_count);
     info!(
         "[Sender Remote] Complete: {} success, {} errors",
         success_count, error_count
@@ -190,19 +193,25 @@ async fn send_and_check_auth(transport: &(dyn SenderTransport + 'static), auth_t
 }
 
 // ============================================================
-// Phase 1: 文件列表发送
+// 文件列表发送（与 `process_requests_and_acks` 并发运行，见模块文档）
 // ============================================================
 
 /// 遍历 `walkdir_2` 并按页发送给 Receiver，填充 `ndx_table`，返回发送的页数。
+///
+/// 只调用 `transport.send()`、从不 `recv()`，可安全地与 `process_requests_and_acks`
+/// 并发运行（`ndx_table` 用 `Mutex` 支持并发读写：本函数是唯一的写者）。
 async fn send_file_list_phase(
-    transport: &(dyn SenderTransport + 'static), walkdir_iter: &WalkDirAsyncIterator2, ndx_table: &mut NdxTable,
+    transport: &(dyn SenderTransport + 'static), walkdir_iter: &WalkDirAsyncIterator2, ndx_table: &Mutex<NdxTable>,
 ) -> Result<u64> {
-    info!("[Sender Remote] Phase 1: Sending file list");
+    info!("[Sender Remote] Sending file list");
     let mut page_count = 0u64;
     while let Some(event) = walkdir_iter.next().await {
         match event {
             NdxEvent::Page(page) => {
-                ndx_table.ingest_page(&page);
+                ndx_table
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .ingest_page(&page);
                 page_count += 1;
                 transport.send(SenderMsg::FilePage(page)).await?;
             }
@@ -217,22 +226,39 @@ async fn send_file_list_phase(
 }
 
 // ============================================================
-// Phase 2: 传输请求处理
+// 传输请求处理 + Ack 收集（唯一的 recv() 消费者，与 `send_file_list_phase` 并发运行）
 // ============================================================
 
-/// 接收 Receiver 的 `TransferRequest` / `DeltaTransferRequest`，发送对应数据流。
-/// 返回实际处理的传输请求数。
-async fn process_requests(
-    transport: &(dyn SenderTransport + 'static), src_storage: &Arc<StorageEnum>, ndx_table: &NdxTable,
-    qos: Option<&QosManager>, enable_acl: bool,
-) -> Result<u64> {
-    info!("[Sender Remote] Phase 2: Processing transfer requests");
+/// 接收 Receiver 的 `TransferRequest`/`DeltaTransferRequest`（发送对应数据）与
+/// `EntrySuccess`/`EntryError`/`Progress`（记录 ack/进度），直到 `AllDone`。
+///
+/// 合并原先顺序执行的「请求处理」与「Ack 收集」两个阶段：拆分多路复用 stream 后，
+/// Receiver 可能在所有请求处理完之前就已经开始发送 ack/progress（两者走不同的物理
+/// stream），若仍分成两个各自独立调用 `recv()` 的阶段，晚到的 ack 会被"请求处理"
+/// 阶段的 catch-all 分支直接丢弃。合并为单一消费者循环、按 variant dispatch 后，
+/// 不再有这个丢消息风险（transport 层只暴露一个 `recv()`，见 `crates/transport/src/quic/mux.rs`）。
+///
+/// `RequestsDone` 到达时立即发送 `TransferDone`（与改造前时序一致），但循环不break，
+/// 继续处理后续到达的 ack/progress，直到收到 `AllDone`。
+/// 返回 `(transfer_count, success_count, error_count)`。
+async fn process_requests_and_acks(
+    transport: &(dyn SenderTransport + 'static), src_storage: &Arc<StorageEnum>, ndx_table: &Mutex<NdxTable>,
+    qos: Option<&QosManager>, enable_acl: bool, completed_paths: &mut HashSet<String>, checkpoint_path: &Path,
+) -> Result<(u64, u64, u64)> {
+    info!("[Sender Remote] Processing transfer requests + collecting acks");
     let mut transfer_count = 0u64;
+    let mut success_count = 0u64;
+    let mut error_count = 0u64;
     loop {
         match transport.recv().await {
             Some(ReceiverMsg::TransferRequest { ndx }) => {
-                if let Some(entry) = ndx_table.get(ndx) {
-                    handle_full_transfer(transport, src_storage, entry, qos, enable_acl).await?;
+                let entry = ndx_table
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .get(ndx)
+                    .cloned();
+                if let Some(entry) = entry {
+                    handle_full_transfer(transport, src_storage, &entry, qos, enable_acl).await?;
                     transfer_count += 1;
                 } else {
                     error!("[Sender Remote] Unknown NDX {}", ndx);
@@ -243,12 +269,17 @@ async fn process_requests(
                 block_size,
                 signatures,
             }) => {
-                if let Some(entry) = ndx_table.get(ndx) {
+                let entry = ndx_table
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .get(ndx)
+                    .cloned();
+                if let Some(entry) = entry {
                     // delta: 仅 src 读取成功时计入传输数（与原逻辑保持一致）
                     if handle_delta_transfer(
                         transport,
                         src_storage,
-                        entry,
+                        &entry,
                         ndx,
                         block_size,
                         signatures,
@@ -268,15 +299,47 @@ async fn process_requests(
                     "[Sender Remote] All requests received, {} files to transfer",
                     transfer_count
                 );
-                break;
+                transport.send(SenderMsg::TransferDone).await?;
             }
+            Some(ReceiverMsg::EntrySuccess { ref entry }) => {
+                success_count += 1;
+                completed_paths.insert(entry.get_relative_path().to_string_lossy().to_string());
+                // 周期性保存 checkpoint
+                if success_count.is_multiple_of(100)
+                    && let Ok(data) = serde_json::to_string(&completed_paths)
+                {
+                    let _ = tokio::fs::write(checkpoint_path, data).await;
+                }
+            }
+            Some(ReceiverMsg::Progress(snapshot)) => {
+                info!(
+                    "[Sender Remote] [{}] Progress: {} files ({}) transferred, {} dirs, {} skipped, {} errors, {:.1}s, {}/s",
+                    snapshot.receiver_id,
+                    snapshot.files_transferred,
+                    format_bytes(snapshot.bytes_transferred as f64, true),
+                    snapshot.dirs_created,
+                    snapshot.files_skipped,
+                    snapshot.error_count,
+                    snapshot.elapsed_secs,
+                    format_bytes(snapshot.speed_bytes_per_sec, true),
+                );
+            }
+            Some(ReceiverMsg::EntryError { entry, reason }) => {
+                error!(
+                    "[Sender Remote] Entry failed {:?}: {}",
+                    entry.get_relative_path(),
+                    reason
+                );
+                error_count += 1;
+            }
+            Some(ReceiverMsg::AllDone) => break,
             Some(other) => {
                 debug!("[Sender Remote] Ignoring message: {:?}", std::mem::discriminant(&other));
             }
-            None => return Err(AppError::CopyError("Transport closed during request phase".into())),
+            None => return Err(AppError::CopyError("Transport closed during request/ack phase".into())),
         }
     }
-    Ok(transfer_count)
+    Ok((transfer_count, success_count, error_count))
 }
 
 /// 全量传输一个 entry（目录 / 符号链接 / 文件分块）。
@@ -430,59 +493,6 @@ async fn send_acl_if_enabled(
 }
 
 // ============================================================
-// Phase 3: Ack 收集
-// ============================================================
-
-/// 接收 Receiver 侧的 `EntrySuccess` / `EntryError` / `Progress`，直到 `AllDone`。
-/// 返回 `(success_count, error_count)`。
-async fn process_acks(
-    transport: &(dyn SenderTransport + 'static), completed_paths: &mut HashSet<String>, checkpoint_path: &Path,
-) -> Result<(u64, u64)> {
-    info!("[Sender Remote] Phase 3: Waiting for acks");
-    let mut success_count = 0u64;
-    let mut error_count = 0u64;
-    loop {
-        match transport.recv().await {
-            Some(ReceiverMsg::EntrySuccess { ref entry }) => {
-                success_count += 1;
-                completed_paths.insert(entry.get_relative_path().to_string_lossy().to_string());
-                // 周期性保存 checkpoint
-                if success_count.is_multiple_of(100)
-                    && let Ok(data) = serde_json::to_string(&completed_paths)
-                {
-                    let _ = tokio::fs::write(checkpoint_path, data).await;
-                }
-            }
-            Some(ReceiverMsg::Progress(snapshot)) => {
-                info!(
-                    "[Sender Remote] [{}] Progress: {} files ({}) transferred, {} dirs, {} skipped, {} errors, {:.1}s, {}/s",
-                    snapshot.receiver_id,
-                    snapshot.files_transferred,
-                    format_bytes(snapshot.bytes_transferred as f64, true),
-                    snapshot.dirs_created,
-                    snapshot.files_skipped,
-                    snapshot.error_count,
-                    snapshot.elapsed_secs,
-                    format_bytes(snapshot.speed_bytes_per_sec, true),
-                );
-            }
-            Some(ReceiverMsg::EntryError { entry, reason }) => {
-                error!(
-                    "[Sender Remote] Entry failed {:?}: {}",
-                    entry.get_relative_path(),
-                    reason
-                );
-                error_count += 1;
-            }
-            Some(ReceiverMsg::AllDone) => break,
-            Some(_) => {}
-            None => return Err(AppError::CopyError("Transport closed during ack phase".into())),
-        }
-    }
-    Ok((success_count, error_count))
-}
-
-// ============================================================
 // Checkpoint 辅助
 // ============================================================
 
@@ -512,6 +522,111 @@ async fn save_or_clear_checkpoint(path: &Path, completed_paths: &HashSet<String>
         info!(
             "[Sender Remote] Checkpoint saved: {} entries completed",
             completed_paths.len()
+        );
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use std::fs;
+
+    use data_mover::create_storage;
+    use tempfile::tempdir;
+    use transport::in_process::create_in_process_pair;
+
+    use super::*;
+    use crate::receiver::receiver_task_remote;
+
+    /// 双端联调（in-process transport，不依赖真实 QUIC）：验证多路复用改造后的
+    /// Sender 侧「文件列表发送」与「请求处理+Ack 收集」并发路径、Receiver 侧合并
+    /// 后的单一消费者循环，端到端 dest == src，且无消息丢失（success 数与文件+目录
+    /// 总数一致、error 数为 0）。
+    #[tokio::test]
+    async fn sender_receiver_pipeline_roundtrip_in_process() {
+        let src_dir = tempdir().unwrap();
+        let dest_dir = tempdir().unwrap();
+
+        // 构造多级目录 + 若干文件，覆盖 CreateDir / 文件全量传输两条路径
+        fs::write(src_dir.path().join("a.txt"), b"hello").unwrap();
+        fs::create_dir_all(src_dir.path().join("sub")).unwrap();
+        fs::write(src_dir.path().join("sub/b.txt"), b"world, nested content").unwrap();
+        fs::create_dir_all(src_dir.path().join("sub/deeper")).unwrap();
+        fs::write(src_dir.path().join("sub/deeper/c.bin"), vec![7u8; 4096]).unwrap();
+
+        let src_storage = Arc::new(
+            create_storage(src_dir.path().to_str().unwrap(), None, false)
+                .await
+                .unwrap(),
+        );
+        let dest_storage = Arc::new(
+            create_storage(dest_dir.path().to_str().unwrap(), None, true)
+                .await
+                .unwrap(),
+        );
+
+        let walkdir_iter = src_storage.walkdir_2(None, None, None, None, 4, false).await.unwrap();
+
+        let (sender_transport, receiver_transport) = create_in_process_pair();
+
+        // Receiver 侧：调用公开入口，与生产环境走同一条代码路径
+        let receiver_handle =
+            tokio::spawn(async move { receiver_task_remote(&receiver_transport, dest_storage, None).await });
+
+        // Sender 侧：握手 + 鉴权 + SessionConfig（顺序不变），随后文件列表与请求/ack 并发
+        negotiate_handshake(&sender_transport).await.unwrap();
+        send_and_check_auth(&sender_transport, None).await.unwrap();
+        sender_transport
+            .send(SenderMsg::SessionConfig(SessionConfig {
+                src_path: src_dir.path().to_string_lossy().to_string(),
+                qos: None,
+                peak_qos_rate: 1.0,
+                iops: None,
+                enable_integrity_check: true,
+                enable_acl: false,
+                is_source_reserved: true,
+                block_size: None,
+                delete_target: false,
+            }))
+            .await
+            .unwrap();
+
+        let ndx_table = Mutex::new(NdxTable::new());
+        let mut completed_paths = HashSet::new();
+        let checkpoint_path = src_dir.path().join("unused_checkpoint.json");
+        let (page_count, (transfer_count, success_count, error_count)) = tokio::try_join!(
+            send_file_list_phase(&sender_transport, &walkdir_iter, &ndx_table),
+            process_requests_and_acks(
+                &sender_transport,
+                &src_storage,
+                &ndx_table,
+                None,
+                false,
+                &mut completed_paths,
+                &checkpoint_path,
+            )
+        )
+        .unwrap();
+
+        sender_transport.close().await.unwrap();
+        receiver_handle.await.unwrap().unwrap();
+
+        assert!(page_count >= 1, "应至少发送一页文件列表");
+        // 子目录（sub, sub/deeper）在文件列表阶段由 Receiver 直接创建，不走 TransferRequest/
+        // EntrySuccess（与改造前一致，非本 issue 改动范围）；3 个文件全部走全量传输请求。
+        assert_eq!(transfer_count, 3, "应有 3 个文件走全量传输请求");
+        assert_eq!(error_count, 0, "不应有任何 EntryError");
+        assert_eq!(success_count, 3, "3 个文件应全部收到 EntrySuccess，证明无消息丢失");
+
+        // dest == src：逐文件比对内容
+        assert_eq!(fs::read(dest_dir.path().join("a.txt")).unwrap(), b"hello");
+        assert_eq!(
+            fs::read(dest_dir.path().join("sub/b.txt")).unwrap(),
+            b"world, nested content"
+        );
+        assert_eq!(
+            fs::read(dest_dir.path().join("sub/deeper/c.bin")).unwrap(),
+            vec![7u8; 4096]
         );
     }
 }

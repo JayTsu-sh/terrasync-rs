@@ -16,11 +16,13 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 #![allow(clippy::pedantic)]
 
+use std::collections::HashSet;
 use std::fs;
 use std::io::Read;
-use std::net::TcpListener;
+use std::net::UdpSocket;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command as StdCommand, ExitStatus, Stdio};
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use assert_cmd::Command as AssertCommand;
@@ -38,10 +40,32 @@ const POLL_INTERVAL: Duration = Duration::from_millis(50);
 /// 这里留够余量避免偶发的 30s 兜底触发时被误判为异常。
 const RECEIVER_EXIT_TIMEOUT: Duration = Duration::from_secs(35);
 
-/// 在 loopback 上找一个当前空闲的端口：bind `127.0.0.1:0` 读端口后立即释放。
+/// 进程内已分配过的端口号（跨测试函数共享，避免同一 `cargo test` 进程内并发跑的
+/// 多个测试探测到同一个端口——见 `free_loopback_port` 文档）。
+static ALLOCATED_PORTS: OnceLock<Mutex<HashSet<u16>>> = OnceLock::new();
+
+/// 在 loopback 上找一个当前空闲的端口：bind `127.0.0.1:0`（UDP，QUIC 实际使用的协议）
+/// 读端口后立即释放，供后续 `serve --listen` 使用。
+///
+/// 探测与实际 bind 之间存在 TOCTOU 窗口：本文件的测试都在同一个 `cargo test` 进程内
+/// 默认并发跑（多个测试各自起 `serve`/`sync` 子进程），如果两个测试恰好在同一时刻探测，
+/// OS 有可能把刚释放的端口又分配给下一次探测，导致两个测试都以为自己拿到了独占端口、
+/// 实际却撞到同一个号——两个 QUIC server 抢同一个端口会导致连接行为不可预期，
+/// 表现为随机的长时间 hang（曾在 `correct_token_succeeds` 与
+/// `large_multi_chunk_file_mux` 并发跑时实际触发过）。用进程内共享的
+/// `ALLOCATED_PORTS` 集合去重，从根源上避免同一进程内的两个测试拿到相同端口。
 fn free_loopback_port() -> u16 {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
-    listener.local_addr().expect("read local_addr").port()
+    let allocated = ALLOCATED_PORTS.get_or_init(|| Mutex::new(HashSet::new()));
+    loop {
+        let socket = UdpSocket::bind("127.0.0.1:0").expect("bind ephemeral UDP port");
+        let port = socket.local_addr().expect("read local_addr").port();
+        drop(socket);
+        let mut guard = allocated.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if guard.insert(port) {
+            return port;
+        }
+        // 撞了进程内已分配过的端口，换一次重试
+    }
 }
 
 /// 在 `dir` 下写入若干测试文件（含多级子目录），返回相对路径列表（供后续比对）。
@@ -381,4 +405,96 @@ fn test_remote_process_e2e_wrong_token_rejected() {
         dest_entries.is_empty(),
         "鉴权失败后目标端不应有任何写入，实际发现: {dest_entries:?}"
     );
+}
+
+/// 生成 `len` 字节、与位置相关的确定性内容（避免 all-zero/重复模式掩盖 chunk 顺序或
+/// offset 错位问题——多路复用改造后大文件数据全部走独立的 `Data` stream，需要确认
+/// 跨多个 4MiB chunk 的大文件拼接结果与源文件完全一致）。
+fn deterministic_bytes(len: usize) -> Vec<u8> {
+    (0..len).map(|i| (i % 251) as u8).collect()
+}
+
+/// 多路复用主路径端到端验证（issue #20）：source 目录内含一个跨多个 4MiB chunk 的
+/// 大文件（连同若干小文件），验证全量同步后 dest 与 src 逐字节一致——证明 QUIC
+/// 多路复用改造后，大文件数据在独立的 `Data` stream 上分片发送/重组不会丢字节、
+/// 不会跨 chunk 错位，同时 file list / 请求 / progress / ack 等控制消息（走
+/// `Control`/`FileList`/`AckProgress` 其余三条 stream）不受影响，仍能与既有握手/
+/// 鉴权测试共用同一套子进程 harness 正常完成整个同步流程。
+#[test]
+fn test_remote_process_e2e_large_multi_chunk_file_mux() {
+    let tmp = tempfile::tempdir().expect("create tempdir");
+    let tmp_path = tmp.path();
+
+    let src_dir = tmp_path.join("src");
+    let dest_dir = tmp_path.join("dest");
+    fs::create_dir_all(&src_dir).expect("create src dir");
+    fs::create_dir_all(&dest_dir).expect("create dest dir");
+    let mut rel_paths = populate_src_dir(&src_dir);
+
+    // 追加一个 10MiB 大文件：FILE_CHUNK_SIZE 为 4MiB（见 crates/app/src/remote_sync.rs），
+    // 10MiB 确保跨越至少 3 个 FileData chunk。
+    const LARGE_FILE_SIZE: usize = 10 * 1024 * 1024;
+    let large_rel = PathBuf::from("large_multi_chunk.bin");
+    fs::write(src_dir.join(&large_rel), deterministic_bytes(LARGE_FILE_SIZE)).expect("write large src file");
+    rel_paths.push(large_rel);
+
+    let cert_path = tmp_path.join("server.crt");
+    let config_path = tmp_path.join("config.toml");
+    fs::write(&config_path, "[database]\nenabled = false\n").expect("write config");
+    let fake_manifest_dir = tmp_path.join("fake_manifest");
+
+    let port = free_loopback_port();
+    let listen_addr = format!("127.0.0.1:{port}");
+    let bin_path = cargo_bin("terrasync");
+
+    let mut receiver_child = StdCommand::new(&bin_path)
+        .env("CARGO_MANIFEST_DIR", &fake_manifest_dir)
+        .current_dir(tmp_path)
+        .arg("-c")
+        .arg(&config_path)
+        .arg("serve")
+        .arg("--listen")
+        .arg(&listen_addr)
+        .arg("--tls-cert-out")
+        .arg(&cert_path)
+        .arg(&dest_dir)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn receiver process");
+
+    wait_for_cert_file(&cert_path);
+
+    let mut sender_cmd = AssertCommand::new(&bin_path);
+    sender_cmd
+        .env("CARGO_MANIFEST_DIR", &fake_manifest_dir)
+        .current_dir(tmp_path)
+        .arg("-c")
+        .arg(&config_path)
+        .arg("sync")
+        .arg("--id")
+        .arg("remote_e2e_mux_large_file")
+        .arg("--remote")
+        .arg(&listen_addr)
+        .arg("--tls-server-cert")
+        .arg(&cert_path)
+        .arg(&src_dir)
+        .arg(&dest_dir);
+
+    sender_cmd.assert().success();
+
+    let receiver_status = wait_for_child_exit(&mut receiver_child, RECEIVER_EXIT_TIMEOUT);
+    let (receiver_stdout, receiver_stderr) = drain_output(&mut receiver_child);
+    match receiver_status {
+        Some(status) => assert!(
+            status.success(),
+            "Receiver 进程异常退出: {status:?}\nstdout:\n{receiver_stdout}\nstderr:\n{receiver_stderr}"
+        ),
+        None => panic!(
+            "Receiver 进程在 {RECEIVER_EXIT_TIMEOUT:?} 内未自行退出，已强制 kill。\n\
+             stdout:\n{receiver_stdout}\nstderr:\n{receiver_stderr}"
+        ),
+    }
+
+    assert_dest_matches_src(&src_dir, &dest_dir, &rel_paths);
 }

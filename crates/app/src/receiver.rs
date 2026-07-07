@@ -270,12 +270,15 @@ pub(crate) async fn process_entry_on_receiver(
 
 /// 双进程模式的 Receiver task（入口）
 ///
-/// 分阶段顺序协议：
+/// 协议阶段：
 /// 0. 接收 `Handshake` → 校验协议版本/能力 → 回 ack/reject（不兼容则中止）
 /// 0.5 接收 `Auth` → 校验 token → 回 `AuthResult`（鉴权失败则中止，不进入 `SessionConfig`）
 /// 1. 接收 `SessionConfig`
-/// 2. 接收 `FilePage` → `DestIndex` 逐页比较 → 发 `TransferRequest`
-/// 3. 接收数据流 → 写入目标端 → 发 EntrySuccess/Error
+/// 2. 接收文件列表（`FilePage` → `DestIndex` 逐页比较 → 发 `TransferRequest`）与接收数据流
+///    （写入目标端 → 发 `EntrySuccess`/`EntryError`）**合并为一个消费者循环并发处理**
+///    （`recv_file_list_and_data_phase`），不再是"文件列表收完才能开始收数据"的顺序
+///    barrier——多路复用后 Sender 可能在文件列表还没发完时就已经开始回传已确定文件的
+///    数据（两者走不同物理 stream），这里按 variant dispatch，不区分先后。
 ///
 /// `expected_token`：`serve --token` 配置的期望值；为 `None` 时跳过鉴权（向后兼容，
 /// 未配置 token 时不校验，仍需完成 `Auth` 消息交换以保持协议阶段一致）。
@@ -316,18 +319,16 @@ pub async fn receiver_task_remote(
         })
     };
 
-    // ── 阶段 1: 接收文件列表 → 发 TransferRequest ──
-    recv_file_list_phase(
+    // ── 阶段 1+2: 文件列表与数据流合并处理，无阶段 barrier（见函数入口文档） ──
+    recv_file_list_and_data_phase(
         transport,
         &dest_storage,
         &session_config,
         &negotiated_features,
         &progress,
+        progress_rx,
     )
     .await?;
-
-    // ── 阶段 2: 接收数据流 → 写入目标端 ──
-    recv_file_data_phase(transport, &dest_storage, &session_config, &progress, progress_rx).await?;
 
     // 停止进度 reporter，发最终快照 + AllDone
     progress_reporter.abort();
@@ -434,19 +435,56 @@ fn validate_relative_path(path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// 阶段 1：接收 `FilePage` → 构建 `DestIndex` → 发 `TransferRequest` / `DeltaTransferRequest`
+/// 合并处理文件列表（`FilePage` → 构建 `DestIndex` → 发 `TransferRequest`/
+/// `DeltaTransferRequest`）与文件数据流（写入目标端 → 发 `EntrySuccess`/`EntryError`），
+/// 单一消费者循环内按 variant dispatch，去掉两者之间的顺序 barrier。
+///
+/// 拆分多路复用 stream 后，Sender 可能在文件列表还没发完（`FileListDone` 之前）就已经
+/// 开始为已确定的文件发送数据（file list 与 data 走不同物理 stream，可以流水线并发），
+/// 若仍分成"先收完文件列表、再收数据"两个各自独立调用 `recv()` 的阶段，数据消息会被
+/// "文件列表"阶段的 catch-all 分支直接丢弃。合并为一个循环后不再有这个问题
+/// （transport 层只暴露一个 `recv()`，见 `crates/transport/src/quic/mux.rs`）。
+///
+/// `FileListDone` 到达时立即发送 `RequestsDone`（与改造前时序一致），但循环不 break，
+/// 继续处理后续到达的数据消息。
 ///
 /// `negotiated_features` 为握手阶段协商后的能力交集；`delta` 能力未协商成功时
 /// 即使数据不匹配也降级为全量传输（`TransferRequest`），不发送 `DeltaTransferRequest`。
-async fn recv_file_list_phase(
+/// 使用 `BytesMut` 缓冲多 chunk 数据，`FileBegin` 消息重置缓冲区避免跨文件状态污染。
+///
+/// **`TransferDone` 到达≠数据已全部收完**：`TransferDone` 走 `Control` stream，实际文件
+/// 数据走独立的 `Data` stream——多路复用后二者是完全独立的物理 stream，QUIC/我们自己的
+/// 后台 reader task 都不保证"写入更早的 stream 一定先于写入更晚的 stream 被对端处理完"，
+/// 小体积的 `TransferDone` 完全可能抢在大文件的 `FileData`/`EndOfFile` 之前就被收到并处理
+/// （两个真实子进程联调时用大文件实际触发过：收到 `TransferDone` 就直接跳出循环，丢了还在
+/// `Data` stream 上飞的文件）。因此改为显式计数：`requested_count`（发出过多少个
+/// `TransferRequest`/`DeltaTransferRequest`）与 `completed_count`（收到过多少个对应的
+/// `EndOfFile`/`CreateSymlink` 完成处理），只有二者相等**且**已经见过 `TransferDone`，
+/// 才真正结束循环。
+async fn recv_file_list_and_data_phase(
     transport: &(dyn ReceiverTransport + 'static), dest_storage: &Arc<StorageEnum>, session_config: &SessionConfig,
     negotiated_features: &FeatureFlags, progress: &Arc<ReceiverProgress>,
+    mut progress_rx: MpscReceiver<ProgressSnapshot>,
 ) -> Result<()> {
-    info!("[Receiver Remote] Phase 1: Receiving file list");
+    info!("[Receiver Remote] Receiving file list and file data (pipelined, streaming mode)");
     let mut ndx_table = NdxTable::new();
+    // delta 重建 token 缓冲
+    let mut delta_tokens: Vec<sync_delta::DeltaToken> = Vec::new();
+    // 文件数据流缓冲（BytesMut，支持多 chunk 追加，FileBegin 时清空）
+    let mut file_data_buf = BytesMut::new();
+    // TransferDone 与实际数据完成的解耦计数（见函数文档）
+    let mut requested_count: u64 = 0;
+    let mut completed_count: u64 = 0;
+    let mut transfer_done_seen = false;
 
     loop {
-        match transport.recv().await {
+        // 同时处理 transport 消息和 progress 上报
+        tokio::select! {
+            Some(snapshot) = progress_rx.recv() => {
+                let _ = transport.send(ReceiverMsg::Progress(snapshot)).await;
+            }
+            msg = transport.recv() => { match msg {
+            // ── 文件列表：FilePage → DestIndex 比较 → 发 TransferRequest/DeltaTransferRequest ──
             Some(SenderMsg::FilePage(page)) => {
                 ndx_table.ingest_page(&page);
 
@@ -477,10 +515,12 @@ async fn recv_file_list_phase(
                     match dest_index.check(&nf.entry) {
                         transport::message::TransferDecision::FullTransfer => {
                             let _ = transport.send(ReceiverMsg::TransferRequest { ndx: nf.ndx }).await;
+                            requested_count += 1;
                         }
                         transport::message::TransferDecision::DeltaTransfer if !negotiated_features.delta => {
                             // delta 能力未协商成功（对端不支持）→ 降级为全量传输
                             let _ = transport.send(ReceiverMsg::TransferRequest { ndx: nf.ndx }).await;
+                            requested_count += 1;
                         }
                         transport::message::TransferDecision::DeltaTransfer => {
                             let size = nf.entry.get_size();
@@ -503,6 +543,7 @@ async fn recv_file_list_phase(
                                             signatures: transport_sigs,
                                         })
                                         .await;
+                                    requested_count += 1;
                                 }
                                 Err(e) => {
                                     warn!(
@@ -511,6 +552,7 @@ async fn recv_file_list_phase(
                                         e
                                     );
                                     let _ = transport.send(ReceiverMsg::TransferRequest { ndx: nf.ndx }).await;
+                                    requested_count += 1;
                                 }
                             }
                         }
@@ -573,38 +615,9 @@ async fn recv_file_list_phase(
                     "[Receiver Remote] File list complete, {} entries indexed",
                     ndx_table.len()
                 );
-                break;
+                let _ = transport.send(ReceiverMsg::RequestsDone).await;
             }
-            Some(_) => {}
-            None => return Err(AppError::CopyError("Transport closed during file list".into())),
-        }
-    }
 
-    let _ = transport.send(ReceiverMsg::RequestsDone).await;
-    Ok(())
-}
-
-/// 阶段 2：接收文件数据流，写入目标端
-///
-/// 使用 `BytesMut` 缓冲多 chunk 数据，`FileBegin` 消息重置缓冲区避免跨文件状态污染。
-async fn recv_file_data_phase(
-    transport: &(dyn ReceiverTransport + 'static), dest_storage: &Arc<StorageEnum>, session_config: &SessionConfig,
-    progress: &Arc<ReceiverProgress>, mut progress_rx: MpscReceiver<ProgressSnapshot>,
-) -> Result<()> {
-    info!("[Receiver Remote] Phase 2: Receiving file data (streaming mode)");
-
-    // delta 重建 token 缓冲
-    let mut delta_tokens: Vec<sync_delta::DeltaToken> = Vec::new();
-    // 文件数据流缓冲（BytesMut，支持多 chunk 追加，FileBegin 时清空）
-    let mut file_data_buf = BytesMut::new();
-
-    loop {
-        // 同时处理 transport 消息和 progress 上报
-        tokio::select! {
-            Some(snapshot) = progress_rx.recv() => {
-                let _ = transport.send(ReceiverMsg::Progress(snapshot)).await;
-            }
-            msg = transport.recv() => { match msg {
             // ── 文件开始：重置缓冲区，防止跨文件状态污染 ──
             Some(SenderMsg::FileBegin { .. }) => {
                 file_data_buf.clear();
@@ -635,6 +648,11 @@ async fn recv_file_data_phase(
                     let _ = transport
                         .send(ReceiverMsg::EntryError { entry, reason: format!("{e}") })
                         .await;
+                    completed_count += 1;
+                    if transfer_done_seen && completed_count >= requested_count {
+                        info!("[Receiver Remote] All transfers complete");
+                        break;
+                    }
                     continue;
                 }
                 match dest_storage.create_symlink(&entry, &target).await {
@@ -648,6 +666,11 @@ async fn recv_file_data_phase(
                             .send(ReceiverMsg::EntryError { entry, reason: format!("{e}") })
                             .await;
                     }
+                }
+                completed_count += 1;
+                if transfer_done_seen && completed_count >= requested_count {
+                    info!("[Receiver Remote] All transfers complete");
+                    break;
                 }
             }
 
@@ -669,6 +692,11 @@ async fn recv_file_data_phase(
                 let tokens = std::mem::take(&mut delta_tokens);
                 let file_data = file_data_buf.split().freeze();
                 handle_end_of_file(transport, dest_storage, entry, source_hash, tokens, file_data, progress).await;
+                completed_count += 1;
+                if transfer_done_seen && completed_count >= requested_count {
+                    info!("[Receiver Remote] All transfers complete");
+                    break;
+                }
             }
 
             // ── ACL 跨进程 ──
@@ -681,11 +709,18 @@ async fn recv_file_data_phase(
             }
 
             Some(SenderMsg::TransferDone) => {
-                info!("[Receiver Remote] All transfers complete");
-                break;
+                transfer_done_seen = true;
+                debug!(
+                    "[Receiver Remote] TransferDone received ({}/{} data transfers completed so far)",
+                    completed_count, requested_count
+                );
+                if completed_count >= requested_count {
+                    info!("[Receiver Remote] All transfers complete");
+                    break;
+                }
             }
             Some(_) => {}
-            None => return Err(AppError::CopyError("Transport closed during data phase".into())),
+            None => return Err(AppError::CopyError("Transport closed during file list/data phase".into())),
         }} // close match + select! msg arm
         } // close select!
     } // close loop
