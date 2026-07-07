@@ -80,8 +80,11 @@ request/data → ack)」改造为多路复用架构，使 progress/ack/error/red
   `NdxTable` 改 `std::sync::Mutex`（写者=文件列表任务，读者=请求处理任务）。
   `cargo check -p app` + `cargo clippy -p app --no-deps`（无新增警告）+
   `cargo test -p app`（27 个既有测试全部通过，无回归）。
-- ⬜ 步骤 8：`app` 层 Receiver（`receiver.rs`）：合并 `recv_file_list_phase` + `recv_file_data_phase`
-  为 `recv_file_list_and_data_phase`，去除阶段 barrier。
+- ✅ 步骤 8：`app` 层 Receiver（`receiver.rs`）：合并 `recv_file_list_phase` + `recv_file_data_phase`
+  为 `recv_file_list_and_data_phase`，单一消费者循环内按 variant dispatch，去除阶段 barrier
+  （`FileListDone` 时发 `RequestsDone` 但不 break，继续处理数据消息直到 `TransferDone`）。
+  `cargo check -p app` + `cargo clippy -p app --no-deps`（receiver.rs 无新增警告）+
+  `cargo test -p app`（27 个既有测试全部通过）。
 - ⬜ 步骤 9：`app` 层新增测试：基于 `transport::in_process` 双端联调（Sender 侧调用 remote_sync.rs
   内部函数 + Receiver 侧调用公开的 `receiver_task_remote`），验证并发路径正确、无丢消息、
   dest==src。`cargo test -p app`。
