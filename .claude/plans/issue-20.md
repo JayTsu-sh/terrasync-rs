@@ -119,6 +119,8 @@ request/data → ack)」改造为多路复用架构，使 progress/ack/error/red
   通过，连跑 5 次全部 pass（个别 run 因 QUIC 连接收尾偶发命中 30s 空闲超时兜底导致单次耗时
   变长，但结果始终是 4/4 pass，不是新增的 flaky failure；这一兜底路径是既有测试
   `RECEIVER_EXIT_TIMEOUT=35s` 注释里本就承认并预留余量的已知特性，非本次改动引入的回归）。
-- ⬜ 步骤 11：全量验证收尾：`cargo fmt`、`cargo test -p transport --features quic`、
-  `cargo test -p app`、`cargo test -p terrasync-rs --test remote_process_e2e`（连跑 2 次）；
-  `git status` 确认无越界文件；移除本 plan 文件。
+- ✅ 步骤 11：全量验证收尾：`cargo fmt --all -- --check`（干净）、
+  `cargo test -p transport --features quic`（9 pass）、`cargo test -p app`（28 pass）、
+  `cargo test -p terrasync-rs --test remote_process_e2e`（连跑 2 次，均 4/4 pass）、
+  `cargo clippy -p transport --features quic --tests` / `-p app --tests` /
+  `-p terrasync-rs --tests`（均无新增警告）；`git status` 确认无越界文件；移除本 plan 文件。
