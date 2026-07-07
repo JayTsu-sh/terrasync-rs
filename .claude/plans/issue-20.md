@@ -53,7 +53,7 @@ request/data → ack)」改造为多路复用架构，使 progress/ack/error/red
 ## 执行步骤
 
 - ✅ 步骤 1：`crates/transport/src/error.rs` 新增 `TransportError::StreamSetupFailed` variant。
-- ⬜ 步骤 2：新增 `crates/transport/src/quic/mux.rs`（`StreamKind` 分类 + `open_mux_streams`/
+- 🔄 步骤 2：新增 `crates/transport/src/quic/mux.rs`（`StreamKind` 分类 + `open_mux_streams`/
   `accept_mux_streams` + 后台 reader task fan-in 到共享 mpsc channel），`quic/mod.rs` 注册模块。
 - ⬜ 步骤 3：改造 `QuicSenderTransport`（`sender.rs`）：4 条 stream + mux 路由 send/recv，`Drop`
   时 abort 后台 reader task。

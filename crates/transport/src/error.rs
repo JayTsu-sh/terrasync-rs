@@ -31,6 +31,10 @@ pub enum TransportError {
     /// 鉴权失败（token 缺失或与 Receiver 配置的 token 不匹配）
     #[error("Authentication failed: {reason}")]
     AuthFailed { reason: String },
+
+    /// 多路复用逻辑 stream 建立失败（QUIC `open_bi`/`accept_bi`）
+    #[error("Stream setup failed: {0}")]
+    StreamSetupFailed(String),
 }
 
 pub type Result<T> = std::result::Result<T, TransportError>;
