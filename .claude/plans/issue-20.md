@@ -18,8 +18,17 @@ request/data → ack)」改造为多路复用架构，使 progress/ack/error/red
   MetadataUpdateRequest/RequestsDone）、`Data`（CreateDir/CreateSymlink/FileBegin/FileData/
   EndOfFile/DeltaData/DeltaMatch/TarPacked/SetAcl/CopyEntry）、`AckProgress`（EntrySuccess/
   EntryError/TarSuccess/Success/Redo/Error/Progress/AllDone）三条 stream，共 4 条 bidirectional
-  QUIC stream，双端按固定顺序 `[Control, FileList, Data, AckProgress]` open_bi/accept_bi（quinn
-  保证按创建顺序 yield，顺序必须一致）。
+  QUIC stream。
+- **Stream 发起方不对称（重要踩坑记录）**：一开始设计为 Sender 固定顺序 `open_bi` 全部 4 条、
+  Receiver 固定顺序 `accept_bi` 全部 4 条，写测试时发现 `AckProgress` 永远读不到——QUIC 只有
+  **发起方**实际写数据后对端才能感知该 stream 存在（quinn `RecvStream` 文档原文："Peers are not
+  notified of streams until they or a later-numbered stream are used to send data"）。由于没有
+  任何 `SenderMsg` variant 归类到 `AckProgress`（该类别只有 `ReceiverMsg` 使用），若这条 stream
+  仍由 Sender `open_bi`，Sender 永远不会写它，Receiver 的 `accept_bi()` 会永远阻塞，Progress/Ack
+  发不出去。**修正**：`Control`/`FileList`/`Data` 仍由 Sender `open_bi`（对应 `mux::CLIENT_INITIATED`
+  固定顺序）；`AckProgress` 反过来由 **Receiver** `open_bi`、Sender 用 `accept_bi` 接——且这一步
+  不能阻塞在 `connect()` 的关键路径上（Receiver 可能要到协议后期第一次发 Progress 才会
+  `open_bi`），故用后台 task 异步接入（`mux::sender_setup` 内部 `tokio::spawn` 等 `accept_bi()`）。
 - **recv() 多路 fan-in**：`framing::read_msg`（本质是 `read_exact`）**不是 cancel-safe 的**，不能
   直接在 `tokio::select!` 里对 4 条 stream 的读操作赛跑（否则被取消的分支会丢失半读的帧，永久
   错位该 stream 的边界）。改为：每条物理 stream 由独立后台 task 串行读到完整帧后转发进一个共享
@@ -27,8 +36,9 @@ request/data → ack)」改造为多路复用架构，使 progress/ack/error/red
   实现「大文件占满 Data stream 不影响 AckProgress stream 被及时读到」。
 - **旧测试兼容**：`crates/transport/tests/quic_roundtrip.rs` 现有测试手工 `conn.accept_bi()` 一次，
   只收发 Handshake/Auth/SessionConfig/TransferDone/HandshakeAck/AuthResult/AllDone —— 这些消息全部
-  归类到 `Control`（数组第 0 位，最先 open_bi），且 quinn 保证只有被使用过的 stream 才会让对端感知
-  （更高位 stream 若从未发送数据，对端不会等到它），因此旧测试无需改动即可通过。
+  归类到 `Control`（`CLIENT_INITIATED` 数组第 0 位，最先 open_bi），因此旧测试无需改动即可通过；
+  新测试（步骤 6）里手工扮演 Receiver 的一侧，必须相应地对 `AckProgress` 改用 `open_bi()` 而非
+  `accept_bi()`，与生产端 `mux::receiver_setup` 行为一致。
 - **App 层并发化（避免"多个并发消费者抢同一个 recv()"的数据丢失/错乱风险）**：
   - Receiver（`receiver.rs`）：把 `recv_file_list_phase` + `recv_file_data_phase` **合并为一个**
     `recv_file_list_and_data_phase`，单一消费者循环内按 variant dispatch，去掉两阶段之间的
@@ -59,8 +69,12 @@ request/data → ack)」改造为多路复用架构，使 progress/ack/error/red
   改造 `QuicSenderTransport`/`QuicReceiverTransport` 用 4 条 stream + mux 路由 send/recv，`Drop`/
   `close()` 时 abort 后台 reader task；`cargo test -p transport --features quic` 现有 8 个测试
   全部通过（历史握手/鉴权测试在新 mux 架构下行为不变，证明向后兼容）。
-- ⬜ 步骤 6：`quic_roundtrip.rs` 新增多 stream 专项测试：大文件写满 Data stream（对端不读）期间，
-  AckProgress stream 的消息仍可被及时 recv() 到（`tokio::time::timeout` 断言）。
+- ✅ 步骤 6：`quic_roundtrip.rs` 新增 `test_quic_mux_large_data_stream_does_not_block_ack_progress_stream`：
+  后台任务持续往 Data stream 写不可压缩数据（8MiB，远超 quinn 默认 ~1.19MiB 单 stream 接收窗口，
+  对端故意不读触发 flow control 阻塞，用 `is_finished()==false` 断言阻塞确实发生），同时对端在
+  AckProgress stream 回一条 Progress，断言 `sender.recv()` 在 2s 超时内读到——过程中发现并修正了
+  上面记录的"stream 发起方不对称"设计问题。`cargo test -p transport --features quic` 全部 9 个
+  测试通过，连跑 2 次无 flake。
 - ⬜ 步骤 7：`app` 层 Sender（`remote_sync.rs`）：合并 `process_requests` + `process_acks` 为
   `process_requests_and_acks`，与 `send_file_list_phase` 用 `tokio::try_join!` 并发运行，
   `NdxTable` 改 `std::sync::Mutex`。

@@ -76,12 +76,11 @@ pub async fn accept_connection(endpoint: &quinn::Endpoint) -> Result<QuicReceive
 
     info!("[QUIC Receiver] Accepted connection from {}", conn.remote_address());
 
-    let (send_streams, recv_streams) = mux::accept_mux_streams(&conn).await?;
-    let (incoming_rx, reader_tasks) = mux::spawn_reader_tasks::<SenderMsg>(recv_streams);
+    let (send_streams, incoming_rx, reader_tasks) = mux::receiver_setup(&conn).await?;
 
     Ok(QuicReceiverTransport {
         conn,
-        send_streams: send_streams.into_iter().map(Mutex::new).collect(),
+        send_streams,
         incoming_rx: Mutex::new(incoming_rx),
         reader_tasks,
     })

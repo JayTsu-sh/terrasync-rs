@@ -18,6 +18,16 @@
 //! 「大数据流阻塞控制消息」的问题，与本模块要解决的目标相悖。真正的背压仍然存在于
 //! QUIC 每条 stream 各自独立的接收窗口上，无界 channel 只是避免在这之上再叠加一层
 //! 跨 stream 共享的人为瓶颈。
+//!
+//! ## Stream 发起方不对称
+//!
+//! `Control`/`FileList`/`Data` 三类由 **Sender** `open_bi`，因为 Sender 在这 3 条上都会
+//! 写消息（Receiver 在其反方向写回复：`HandshakeAck`/`AuthResult` 走 `Control` 反向，
+//! `TransferRequest` 等走 `FileList` 反向）。`AckProgress` 则反过来由 **Receiver**
+//! `open_bi`、Sender 用 `accept_bi` 接：没有任何 `SenderMsg` variant 归类到
+//! `AckProgress`，如果也让 Sender 发起（`open_bi` 却从不写），QUIC 只有发起方实际写入
+//! 数据后对端才能感知该 stream 存在（见 quinn `RecvStream` 文档），Receiver 的
+//! `accept_bi()` 就会永远等不到这条 stream 被 reveal，导致 Progress/Ack 永远发不出去。
 
 // 外部 crate
 use serde::Serialize;
@@ -46,15 +56,6 @@ pub(crate) enum StreamKind {
 }
 
 impl StreamKind {
-    /// 固定顺序：Sender `open_bi` 与 Receiver `accept_bi` 必须严格按此顺序逐一建立
-    /// （quinn 按创建顺序 yield stream，双端顺序不一致会导致消息路由错乱）
-    const ALL: [StreamKind; 4] = [
-        StreamKind::Control,
-        StreamKind::FileList,
-        StreamKind::Data,
-        StreamKind::AckProgress,
-    ];
-
     /// 作为 `Vec` 下标使用
     fn index(self) -> usize {
         match self {
@@ -66,7 +67,10 @@ impl StreamKind {
     }
 }
 
-/// `SenderMsg` 按 variant 归类到对应的逻辑 stream
+/// 由 Sender 发起（`open_bi`）的 3 类 stream，固定顺序建立
+const CLIENT_INITIATED: [StreamKind; 3] = [StreamKind::Control, StreamKind::FileList, StreamKind::Data];
+
+/// `SenderMsg` 按 variant 归类到对应的逻辑 stream（永远落在 [`CLIENT_INITIATED`] 三类之一）
 pub(crate) fn sender_stream_kind(msg: &SenderMsg) -> StreamKind {
     match msg {
         SenderMsg::Handshake(_)
@@ -111,61 +115,98 @@ pub(crate) fn receiver_stream_kind(msg: &ReceiverMsg) -> StreamKind {
     }
 }
 
-/// 按 [`StreamKind::ALL`] 固定顺序依次 `open_bi`，返回 4 条 stream 的发送/接收半部分
+/// Sender 侧建立 4 条逻辑 stream：`Control`/`FileList`/`Data` 由本端 `open_bi`；
+/// `AckProgress` 由对端（Receiver）发起，本端用 `accept_bi` 接——这一步不能阻塞在
+/// `connect()` 的关键路径上（Receiver 可能要到协议后期第一次发 `Progress`/
+/// `EntrySuccess` 才会 `open_bi`），因此放到后台 task 里异步接入，就绪后再挂到
+/// 共享 fan-in channel 上。
 ///
-/// 调用方（Sender）必须与对端 [`accept_mux_streams`] 使用相同的顺序，否则双方对
-/// 同一物理 stream 的分类理解会错位。
-pub(crate) async fn open_mux_streams(
+/// 返回：`send_streams`（长度 3，下标对应 [`CLIENT_INITIATED`]，`send()` 据此路由）、
+/// 统一的接收 channel、各 reader task 的 `JoinHandle`。
+pub(crate) async fn sender_setup(
     conn: &quinn::Connection,
-) -> Result<(Vec<quinn::SendStream>, Vec<quinn::RecvStream>)> {
-    let mut sends = Vec::with_capacity(StreamKind::ALL.len());
-    let mut recvs = Vec::with_capacity(StreamKind::ALL.len());
-    for kind in StreamKind::ALL {
+) -> Result<(
+    Vec<Mutex<quinn::SendStream>>,
+    UnboundedReceiver<ReceiverMsg>,
+    Vec<JoinHandle<()>>,
+)> {
+    let mut send_streams = Vec::with_capacity(CLIENT_INITIATED.len());
+    let mut recv_streams = Vec::with_capacity(CLIENT_INITIATED.len());
+    for kind in CLIENT_INITIATED {
         let (s, r) = conn
             .open_bi()
             .await
             .map_err(|e| TransportError::StreamSetupFailed(format!("open_bi({kind:?}): {e}")))?;
-        sends.push(s);
-        recvs.push(r);
+        send_streams.push(Mutex::new(s));
+        recv_streams.push(r);
     }
-    Ok((sends, recvs))
+
+    let (tx, rx) = mpsc::unbounded_channel::<ReceiverMsg>();
+    let mut reader_tasks = Vec::with_capacity(CLIENT_INITIATED.len() + 1);
+    for (idx, stream) in recv_streams.into_iter().enumerate() {
+        let tx = tx.clone();
+        reader_tasks.push(tokio::spawn(reader_loop::<ReceiverMsg>(
+            stream,
+            tx,
+            CLIENT_INITIATED[idx],
+        )));
+    }
+
+    let ack_conn = conn.clone();
+    reader_tasks.push(tokio::spawn(async move {
+        match ack_conn.accept_bi().await {
+            // Sender 侧永远不写 AckProgress，发送半部分保留但不使用（Drop 时正常 finish，无副作用）
+            Ok((_send_unused, recv)) => reader_loop::<ReceiverMsg>(recv, tx, StreamKind::AckProgress).await,
+            Err(e) => warn!("[QUIC mux] accept AckProgress stream failed: {e}"),
+        }
+    }));
+
+    Ok((send_streams, rx, reader_tasks))
 }
 
-/// 按 [`StreamKind::ALL`] 固定顺序依次 `accept_bi`，返回 4 条 stream 的发送/接收半部分
+/// Receiver 侧建立 4 条逻辑 stream：`Control`/`FileList`/`Data` 用 `accept_bi` 等待
+/// 对端（Sender）发起；`AckProgress` 由本端 `open_bi`（无需等待对端，立即可写）。
 ///
-/// 调用方（Receiver）必须与对端 [`open_mux_streams`] 使用相同的顺序。
-pub(crate) async fn accept_mux_streams(
+/// 返回：`send_streams`（长度 4，下标见 [`StreamKind::index`]，`send()` 据此路由）、
+/// 统一的接收 channel、各 reader task 的 `JoinHandle`。
+pub(crate) async fn receiver_setup(
     conn: &quinn::Connection,
-) -> Result<(Vec<quinn::SendStream>, Vec<quinn::RecvStream>)> {
-    let mut sends = Vec::with_capacity(StreamKind::ALL.len());
-    let mut recvs = Vec::with_capacity(StreamKind::ALL.len());
-    for kind in StreamKind::ALL {
+) -> Result<(
+    Vec<Mutex<quinn::SendStream>>,
+    UnboundedReceiver<SenderMsg>,
+    Vec<JoinHandle<()>>,
+)> {
+    let mut send_streams = Vec::with_capacity(CLIENT_INITIATED.len() + 1);
+    let mut recv_streams = Vec::with_capacity(CLIENT_INITIATED.len());
+    for kind in CLIENT_INITIATED {
         let (s, r) = conn
             .accept_bi()
             .await
             .map_err(|e| TransportError::StreamSetupFailed(format!("accept_bi({kind:?}): {e}")))?;
-        sends.push(s);
-        recvs.push(r);
+        send_streams.push(Mutex::new(s));
+        recv_streams.push(r);
     }
-    Ok((sends, recvs))
-}
 
-/// 为每条 `RecvStream` 各起一个后台 task 串行读帧，全部转发进同一个共享 `mpsc` channel
-///
-/// 返回共享的 `mpsc::UnboundedReceiver`（多路 fan-in 后的统一消息入口）与各 task 的
-/// `JoinHandle`（供调用方在 `close()`/`Drop` 时 abort，避免连接结束后残留读循环）。
-pub(crate) fn spawn_reader_tasks<T>(recv_streams: Vec<quinn::RecvStream>) -> (UnboundedReceiver<T>, Vec<JoinHandle<()>>)
-where
-    T: DeserializeOwned + Send + 'static,
-{
-    let (tx, rx) = mpsc::unbounded_channel::<T>();
-    let mut handles = Vec::with_capacity(recv_streams.len());
+    // AckProgress：本端发起，不需要等待对端；反方向没有任何 SenderMsg 会写入，
+    // 对应的 RecvStream 直接丢弃即可（Drop 会发 STOP_SENDING，但 Sender 本来就不会往这写）。
+    let (ack_send, _ack_recv_unused) = conn
+        .open_bi()
+        .await
+        .map_err(|e| TransportError::StreamSetupFailed(format!("open_bi({:?}): {e}", StreamKind::AckProgress)))?;
+    send_streams.push(Mutex::new(ack_send));
+
+    let (tx, rx) = mpsc::unbounded_channel::<SenderMsg>();
+    let mut reader_tasks = Vec::with_capacity(CLIENT_INITIATED.len());
     for (idx, stream) in recv_streams.into_iter().enumerate() {
         let tx = tx.clone();
-        let kind = StreamKind::ALL[idx];
-        handles.push(tokio::spawn(reader_loop::<T>(stream, tx, kind)));
+        reader_tasks.push(tokio::spawn(reader_loop::<SenderMsg>(
+            stream,
+            tx,
+            CLIENT_INITIATED[idx],
+        )));
     }
-    (rx, handles)
+
+    Ok((send_streams, rx, reader_tasks))
 }
 
 /// 单条物理 stream 的读循环：读到完整帧就转发进 channel，stream 结束或出错则退出

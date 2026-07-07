@@ -76,12 +76,11 @@ pub async fn connect(
 
     info!("[QUIC Sender] Connected to {}", addr);
 
-    let (send_streams, recv_streams) = mux::open_mux_streams(&conn).await?;
-    let (incoming_rx, reader_tasks) = mux::spawn_reader_tasks::<ReceiverMsg>(recv_streams);
+    let (send_streams, incoming_rx, reader_tasks) = mux::sender_setup(&conn).await?;
 
     Ok(QuicSenderTransport {
         conn,
-        send_streams: send_streams.into_iter().map(Mutex::new).collect(),
+        send_streams,
         incoming_rx: Mutex::new(incoming_rx),
         reader_tasks,
     })
