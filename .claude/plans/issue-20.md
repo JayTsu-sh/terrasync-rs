@@ -85,9 +85,13 @@ request/data → ack)」改造为多路复用架构，使 progress/ack/error/red
   （`FileListDone` 时发 `RequestsDone` 但不 break，继续处理数据消息直到 `TransferDone`）。
   `cargo check -p app` + `cargo clippy -p app --no-deps`（receiver.rs 无新增警告）+
   `cargo test -p app`（27 个既有测试全部通过）。
-- ⬜ 步骤 9：`app` 层新增测试：基于 `transport::in_process` 双端联调（Sender 侧调用 remote_sync.rs
-  内部函数 + Receiver 侧调用公开的 `receiver_task_remote`），验证并发路径正确、无丢消息、
-  dest==src。`cargo test -p app`。
+- ✅ 步骤 9：`app` 层新增测试 `remote_sync::tests::sender_receiver_pipeline_roundtrip_in_process`：
+  基于 `transport::in_process` 双端联调（Sender 侧直接调用 remote_sync.rs 内部的
+  `send_file_list_phase`/`process_requests_and_acks` + Receiver 侧调用公开的
+  `receiver_task_remote`，走真实 tempdir 本地存储），验证并发路径正确、
+  success/error 计数与文件数吻合（无丢消息）、dest==src。新增 `tempfile` dev-dependency。
+  `cargo test -p app`（28 个测试全部通过，连跑 2 次无 flake）+ `cargo clippy -p app --no-deps
+  --tests`（remote_sync.rs 无新增警告）。
 - ⬜ 步骤 10：端到端：扩展 `tests/remote_process_e2e.rs` 新增多 chunk 大文件场景（验证 mux Data
   stream 正确性，dest==src），跑 2 次确认不 flake。
 - ⬜ 步骤 11：全量验证收尾：`cargo fmt`、`cargo test -p transport --features quic`、

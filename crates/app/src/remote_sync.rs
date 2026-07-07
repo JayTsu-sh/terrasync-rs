@@ -525,3 +525,108 @@ async fn save_or_clear_checkpoint(path: &Path, completed_paths: &HashSet<String>
         );
     }
 }
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use std::fs;
+
+    use data_mover::create_storage;
+    use tempfile::tempdir;
+    use transport::in_process::create_in_process_pair;
+
+    use super::*;
+    use crate::receiver::receiver_task_remote;
+
+    /// 双端联调（in-process transport，不依赖真实 QUIC）：验证多路复用改造后的
+    /// Sender 侧「文件列表发送」与「请求处理+Ack 收集」并发路径、Receiver 侧合并
+    /// 后的单一消费者循环，端到端 dest == src，且无消息丢失（success 数与文件+目录
+    /// 总数一致、error 数为 0）。
+    #[tokio::test]
+    async fn sender_receiver_pipeline_roundtrip_in_process() {
+        let src_dir = tempdir().unwrap();
+        let dest_dir = tempdir().unwrap();
+
+        // 构造多级目录 + 若干文件，覆盖 CreateDir / 文件全量传输两条路径
+        fs::write(src_dir.path().join("a.txt"), b"hello").unwrap();
+        fs::create_dir_all(src_dir.path().join("sub")).unwrap();
+        fs::write(src_dir.path().join("sub/b.txt"), b"world, nested content").unwrap();
+        fs::create_dir_all(src_dir.path().join("sub/deeper")).unwrap();
+        fs::write(src_dir.path().join("sub/deeper/c.bin"), vec![7u8; 4096]).unwrap();
+
+        let src_storage = Arc::new(
+            create_storage(src_dir.path().to_str().unwrap(), None, false)
+                .await
+                .unwrap(),
+        );
+        let dest_storage = Arc::new(
+            create_storage(dest_dir.path().to_str().unwrap(), None, true)
+                .await
+                .unwrap(),
+        );
+
+        let walkdir_iter = src_storage.walkdir_2(None, None, None, None, 4, false).await.unwrap();
+
+        let (sender_transport, receiver_transport) = create_in_process_pair();
+
+        // Receiver 侧：调用公开入口，与生产环境走同一条代码路径
+        let receiver_handle =
+            tokio::spawn(async move { receiver_task_remote(&receiver_transport, dest_storage, None).await });
+
+        // Sender 侧：握手 + 鉴权 + SessionConfig（顺序不变），随后文件列表与请求/ack 并发
+        negotiate_handshake(&sender_transport).await.unwrap();
+        send_and_check_auth(&sender_transport, None).await.unwrap();
+        sender_transport
+            .send(SenderMsg::SessionConfig(SessionConfig {
+                src_path: src_dir.path().to_string_lossy().to_string(),
+                qos: None,
+                peak_qos_rate: 1.0,
+                iops: None,
+                enable_integrity_check: true,
+                enable_acl: false,
+                is_source_reserved: true,
+                block_size: None,
+                delete_target: false,
+            }))
+            .await
+            .unwrap();
+
+        let ndx_table = Mutex::new(NdxTable::new());
+        let mut completed_paths = HashSet::new();
+        let checkpoint_path = src_dir.path().join("unused_checkpoint.json");
+        let (page_count, (transfer_count, success_count, error_count)) = tokio::try_join!(
+            send_file_list_phase(&sender_transport, &walkdir_iter, &ndx_table),
+            process_requests_and_acks(
+                &sender_transport,
+                &src_storage,
+                &ndx_table,
+                None,
+                false,
+                &mut completed_paths,
+                &checkpoint_path,
+            )
+        )
+        .unwrap();
+
+        sender_transport.close().await.unwrap();
+        receiver_handle.await.unwrap().unwrap();
+
+        assert!(page_count >= 1, "应至少发送一页文件列表");
+        // 子目录（sub, sub/deeper）在文件列表阶段由 Receiver 直接创建，不走 TransferRequest/
+        // EntrySuccess（与改造前一致，非本 issue 改动范围）；3 个文件全部走全量传输请求。
+        assert_eq!(transfer_count, 3, "应有 3 个文件走全量传输请求");
+        assert_eq!(error_count, 0, "不应有任何 EntryError");
+        assert_eq!(success_count, 3, "3 个文件应全部收到 EntrySuccess，证明无消息丢失");
+
+        // dest == src：逐文件比对内容
+        assert_eq!(fs::read(dest_dir.path().join("a.txt")).unwrap(), b"hello");
+        assert_eq!(
+            fs::read(dest_dir.path().join("sub/b.txt")).unwrap(),
+            b"world, nested content"
+        );
+        assert_eq!(
+            fs::read(dest_dir.path().join("sub/deeper/c.bin")).unwrap(),
+            vec![7u8; 4096]
+        );
+    }
+}
