@@ -241,6 +241,7 @@ pub async fn cli_match() -> error::Result<()> {
             package_depth,
             remote,
             tls_server_cert,
+            token,
             no_resume,
             ..
         } => {
@@ -261,6 +262,7 @@ pub async fn cli_match() -> error::Result<()> {
                 *package_depth,
                 remote,
                 tls_server_cert,
+                token,
                 raw_command_line,
                 *no_resume,
             )
@@ -270,8 +272,9 @@ pub async fn cli_match() -> error::Result<()> {
             listen,
             dest_path,
             tls_cert_out,
+            token,
         } => {
-            commands::serve_cmd(listen, dest_path, tls_cert_out).await?;
+            commands::serve_cmd(listen, dest_path, tls_cert_out, token).await?;
         }
         Commands::Config => commands::config()?,
         #[cfg(feature = "license")]

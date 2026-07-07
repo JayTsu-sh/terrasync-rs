@@ -32,8 +32,11 @@ const FILE_CHUNK_SIZE: usize = 4 * 1024 * 1024;
 
 /// 双进程全量同步 — Sender 侧入口
 ///
-/// 依次执行：QUIC 连接 → 握手协商 → `SessionConfig` → Phase 1 文件列表 → Phase 2 请求处理 → Phase 3 Ack。
-pub(crate) async fn run(config: &SyncJobConfig, remote_addr: &str, tls_cert_bytes: Option<&[u8]>) -> Result<()> {
+/// 依次执行：QUIC 连接 → 握手协商 → Token 鉴权 → `SessionConfig` → Phase 1 文件列表 →
+/// Phase 2 请求处理 → Phase 3 Ack。
+pub(crate) async fn run(
+    config: &SyncJobConfig, remote_addr: &str, tls_cert_bytes: Option<&[u8]>, auth_token: Option<&str>,
+) -> Result<()> {
     info!("[Sender Remote] Connecting to Receiver at {}", remote_addr);
 
     // ── 1. 连接 QUIC ──
@@ -46,6 +49,9 @@ pub(crate) async fn run(config: &SyncJobConfig, remote_addr: &str, tls_cert_byte
 
     // ── 2. 握手：协商协议版本与能力，不兼容则在发送任何 FilePage/CopyEntry 前中止 ──
     negotiate_handshake(&transport).await?;
+
+    // ── 2.5 Token 鉴权：握手通过后、SessionConfig 之前，鉴权失败则中止连接 ──
+    send_and_check_auth(&transport, auth_token).await?;
 
     // ── 3. 发送 SessionConfig ──
     transport
@@ -155,6 +161,31 @@ async fn negotiate_handshake(transport: &(dyn SenderTransport + 'static)) -> Res
         }
         Some(_) => Err(AppError::CopyError("Unexpected message during handshake".into())),
         None => Err(AppError::CopyError("Transport closed during handshake".into())),
+    }
+}
+
+// ============================================================
+// Token 鉴权
+// ============================================================
+
+/// 发送 `Auth` 并等待 Receiver 的 `AuthResult`
+///
+/// `auth_token` 为 `None` 时发送空字符串 token（兼容 Receiver 未配置 `--token` 的场景）；
+/// 鉴权失败时直接返回错误，调用方不会再发送 `SessionConfig` 及后续任何数据。
+async fn send_and_check_auth(transport: &(dyn SenderTransport + 'static), auth_token: Option<&str>) -> Result<()> {
+    let token = auth_token.unwrap_or_default().to_string();
+    transport.send(SenderMsg::Auth { token }).await?;
+    match transport.recv().await {
+        Some(ReceiverMsg::AuthResult { ok: true, .. }) => {
+            info!("[Sender Remote] Auth accepted");
+            Ok(())
+        }
+        Some(ReceiverMsg::AuthResult { ok: false, reason }) => Err(TransportError::AuthFailed {
+            reason: reason.unwrap_or_else(|| "unknown reason".into()),
+        }
+        .into()),
+        Some(_) => Err(AppError::CopyError("Unexpected message during auth".into())),
+        None => Err(AppError::CopyError("Transport closed during auth".into())),
     }
 }
 

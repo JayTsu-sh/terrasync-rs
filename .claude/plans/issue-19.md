@@ -37,14 +37,14 @@ approved 的 v2 spec **相矛盾**（v2 明确排除该项）。按开发者协�
 ## 执行步骤
 
 - ✅ step 0: 核实 spec 版本 + 现状代码（bind/accept_connection 已拆分，确认无需重做）
-- ⬜ step 1: `transport::message` 新增 `SenderMsg::Auth { token }` + `ReceiverMsg::AuthResult { ok, reason }`；`transport::error` 新增 `TransportError::AuthFailed { reason }`
-- ⬜ step 2: `app::error` 新增 `AppError::UnsafeRelativePath { path }`；`app::receiver` 新增 `validate_relative_path(&Path) -> Result<()>` + 单元测试（合法路径 / `../` 穿越 / 绝对路径）
-- ⬜ step 3: `app::receiver::receiver_task_remote` 新增 `expected_token: Option<&str>` 参数，握手后、SessionConfig 前插入 `recv_and_check_auth`；鉴权失败发送 `AuthResult{ok:false}` 后 `close()` 并返回 `AuthFailed` 错误
-- ⬜ step 4: 在 `recv_file_list_phase`（subdirs `create_dir_all`）、`recv_file_data_phase`（`CreateDir`/`CreateSymlink`）、`handle_end_of_file` 写入前调用 `validate_relative_path`，失败发 `EntryError` 并跳过该 entry（不中断 session）
-- ⬜ step 5: `app::remote_sync::run` 新增 `token: Option<&str>` 参数，握手通过后、`SessionConfig` 前发送 `Auth` 并等待 `AuthResult`，失败返回错误不再发送 `SessionConfig`
-- ⬜ step 6: `app::orchestrator`：`SyncMode::Remote` 新增 `auth_token: Option<String>` 字段，`new_remote`/`run_sync_remote` 线传该参数
-- ⬜ step 7: CLI：`commands_enum.rs` 的 `Serve`/`Sync` 新增 `--token`（`Sync` 的 `requires = "remote"`）；`commands.rs` 的 `serve_cmd`/`sync_cmd` 线传；`lib.rs` match 分支透传
-- ⬜ step 8: `crates/transport/tests/quic_roundtrip.rs` 新增 Auth 成功/失败 roundtrip 测试
+- ✅ step 1: `transport::message` 新增 `SenderMsg::Auth { token }` + `ReceiverMsg::AuthResult { ok, reason }`；`transport::error` 新增 `TransportError::AuthFailed { reason }`
+- ✅ step 2: `app::error` 新增 `AppError::UnsafeRelativePath { path }`；`app::receiver` 新增 `validate_relative_path(&Path) -> Result<()>` + 单元测试（合法路径 / `../` 穿越 / 绝对路径）
+- ✅ step 3: `app::receiver::receiver_task_remote` 新增 `expected_token: Option<&str>` 参数，握手后、SessionConfig 前插入 `recv_and_check_auth`；鉴权失败发送 `AuthResult{ok:false}` 后 `close()` 并返回 `AuthFailed` 错误
+- ✅ step 4: 在 `recv_file_list_phase`（subdirs `create_dir_all`）、`recv_file_data_phase`（`CreateDir`/`CreateSymlink`）、`handle_end_of_file` 写入前调用 `validate_relative_path`，失败发 `EntryError` 并跳过该 entry（不中断 session）
+- ✅ step 5: `app::remote_sync::run` 新增 `token: Option<&str>` 参数，握手通过后、`SessionConfig` 前发送 `Auth` 并等待 `AuthResult`，失败返回错误不再发送 `SessionConfig`
+- ✅ step 6: `app::orchestrator`：`SyncMode::Remote` 新增 `auth_token: Option<String>` 字段，`new_remote`/`run_sync_remote` 线传该参数
+- ✅ step 7: CLI：`commands_enum.rs` 的 `Serve`/`Sync` 新增 `--token`（`Sync` 的 `requires = "remote"`）；`commands.rs` 的 `serve_cmd`/`sync_cmd` 线传；`lib.rs` match 分支透传
+- ✅ step 8: `crates/transport/tests/quic_roundtrip.rs` 新增 Auth 成功/失败 roundtrip 测试
 - ⬜ step 9: `tests/remote_process_e2e.rs` 新增进程级测试：正确 token 成功 / 错误 token 被拒（断言目标端未写入）
 - ⬜ step 10: 收尾：`cargo fmt` + 定向 `clippy` + 全量定向测试回归 + 清理 plan 文件
 

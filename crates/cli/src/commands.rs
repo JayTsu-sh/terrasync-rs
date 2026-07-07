@@ -148,8 +148,8 @@ pub async fn sync_cmd(
     job_id: &str, src_path: &Option<String>, dest_path: &Option<String>, enable_integrity_check: bool,
     enable_acl: bool, r#match: &Option<String>, exclude: &Option<String>, qos: &Option<String>, peak_qos_rate: f32,
     iops: Option<u32>, block_size: &Option<String>, file_list: &Option<String>, packaged: bool,
-    package_depth: Option<usize>, remote: &Option<String>, tls_server_cert: &Option<String>, raw_command_line: String,
-    no_resume: bool,
+    package_depth: Option<usize>, remote: &Option<String>, tls_server_cert: &Option<String>, token: &Option<String>,
+    raw_command_line: String, no_resume: bool,
 ) -> Result<()> {
     let config = AppConfig::fetch()?;
 
@@ -230,7 +230,7 @@ pub async fn sync_cmd(
             None => None,
         };
 
-        return SyncOrchestrator::new_remote(config, remote_addr, tls_cert_bytes)
+        return SyncOrchestrator::new_remote(config, remote_addr, tls_cert_bytes, token.clone())
             .run()
             .await
             .map_err(CliError::AppError);
@@ -341,7 +341,7 @@ pub async fn gui_cmd(host: &str, port: u16) -> Result<()> {
 ///
 /// 监听 QUIC 连接，接收 Sender 的分页文件列表，比较后请求传输。
 /// 生成的 TLS 证书写入 `tls_cert_out`，Sender 侧通过 `--tls-server-cert` 加载以防 MITM。
-pub async fn serve_cmd(listen: &str, dest_path: &str, tls_cert_out: &str) -> Result<()> {
+pub async fn serve_cmd(listen: &str, dest_path: &str, tls_cert_out: &str, token: &Option<String>) -> Result<()> {
     info!("Starting Receiver daemon on {}, dest: {}", listen, dest_path);
 
     // 1. 解析监听地址
@@ -377,7 +377,7 @@ pub async fn serve_cmd(listen: &str, dest_path: &str, tls_cert_out: &str) -> Res
     info!("Accepted QUIC connection");
 
     // 7. 启动双进程 receiver task
-    app::receiver::receiver_task_remote(&receiver_transport, dest_storage)
+    app::receiver::receiver_task_remote(&receiver_transport, dest_storage, token.as_deref())
         .await
         .map_err(CliError::AppError)?;
 

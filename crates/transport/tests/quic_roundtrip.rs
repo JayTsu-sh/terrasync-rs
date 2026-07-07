@@ -339,6 +339,154 @@ async fn test_quic_handshake_incompatible_version_rejected_before_phase1() {
     sender.close().await.unwrap();
 }
 
+/// Token 鉴权测试：正确 token → `AuthResult{ok:true}` → 继续收发 `SessionConfig`
+#[tokio::test]
+async fn test_quic_auth_success_then_session_config_roundtrip() {
+    install_crypto_provider();
+
+    const EXPECTED_TOKEN: &str = "s3cr3t-token";
+
+    let (server_endpoint, server_addr) = create_server_endpoint();
+    let (done_tx, done_rx) = oneshot::channel::<()>();
+
+    let receiver_handle = tokio::spawn(async move {
+        let incoming = server_endpoint.accept().await.unwrap();
+        let conn = incoming.await.unwrap();
+        let (mut send, mut recv) = conn.accept_bi().await.unwrap();
+
+        // 阶段 -0.5：Auth
+        let msg: Option<SenderMsg> = quic::framing::read_msg(&mut recv).await.ok().flatten();
+        match msg {
+            Some(SenderMsg::Auth { token }) => {
+                assert_eq!(token, EXPECTED_TOKEN, "token 应与 Sender 发送的一致");
+                quic::framing::write_msg(&mut send, &ReceiverMsg::AuthResult { ok: true, reason: None })
+                    .await
+                    .unwrap();
+            }
+            other => panic!("Expected Auth, got {:?}", other),
+        }
+
+        // 鉴权通过后才应收到 SessionConfig
+        let msg: Option<SenderMsg> = quic::framing::read_msg(&mut recv).await.ok().flatten();
+        assert!(
+            matches!(msg, Some(SenderMsg::SessionConfig(_))),
+            "Expected SessionConfig, got {:?}",
+            msg
+        );
+
+        quic::framing::write_msg(&mut send, &ReceiverMsg::AllDone)
+            .await
+            .unwrap();
+        let _ = done_rx.await;
+    });
+
+    let sender = quic::connect(server_addr, "localhost", None).await.unwrap();
+    sender
+        .send(SenderMsg::Auth {
+            token: EXPECTED_TOKEN.to_string(),
+        })
+        .await
+        .unwrap();
+
+    match sender.recv().await {
+        Some(ReceiverMsg::AuthResult { ok: true, .. }) => {}
+        other => panic!("Expected AuthResult(ok:true), got {:?}", other),
+    }
+
+    sender
+        .send(SenderMsg::SessionConfig(SessionConfig {
+            src_path: "/tmp/test".to_string(),
+            qos: None,
+            peak_qos_rate: 1.0,
+            iops: None,
+            enable_integrity_check: false,
+            enable_acl: false,
+            is_source_reserved: true,
+            block_size: None,
+            delete_target: false,
+        }))
+        .await
+        .unwrap();
+
+    let reply = sender.recv().await;
+    assert!(
+        matches!(reply, Some(ReceiverMsg::AllDone)),
+        "Expected AllDone, got {:?}",
+        reply
+    );
+
+    let _ = done_tx.send(());
+    receiver_handle.await.unwrap();
+    sender.close().await.unwrap();
+}
+
+/// Token 鉴权测试：错误 token → `AuthResult{ok:false}` → Sender 不得发送 `SessionConfig`
+#[tokio::test]
+async fn test_quic_auth_failure_rejected_before_session_config() {
+    install_crypto_provider();
+
+    const EXPECTED_TOKEN: &str = "s3cr3t-token";
+
+    let (server_endpoint, server_addr) = create_server_endpoint();
+    let (done_tx, done_rx) = oneshot::channel::<()>();
+
+    let receiver_handle = tokio::spawn(async move {
+        let incoming = server_endpoint.accept().await.unwrap();
+        let conn = incoming.await.unwrap();
+        let (mut send, mut recv) = conn.accept_bi().await.unwrap();
+
+        let msg: Option<SenderMsg> = quic::framing::read_msg(&mut recv).await.ok().flatten();
+        match msg {
+            Some(SenderMsg::Auth { token }) => {
+                assert_ne!(token, EXPECTED_TOKEN, "本测试模拟 token 不匹配的场景");
+                quic::framing::write_msg(
+                    &mut send,
+                    &ReceiverMsg::AuthResult {
+                        ok: false,
+                        reason: Some("invalid token".to_string()),
+                    },
+                )
+                .await
+                .unwrap();
+            }
+            other => panic!("Expected Auth, got {:?}", other),
+        }
+
+        // 遵守协议的 Sender 收到失败结果后不会再发送任何消息（含 SessionConfig）
+        let next = tokio::time::timeout(
+            Duration::from_millis(200),
+            quic::framing::read_msg::<SenderMsg>(&mut recv),
+        )
+        .await;
+        match next {
+            Err(_) => {}       // 超时：符合预期，Sender 未再发送任何消息
+            Ok(Ok(None)) => {} // stream 已结束：符合预期
+            Ok(other) => panic!("Sender 不应在鉴权失败后发送任何消息，收到: {:?}", other),
+        }
+
+        let _ = done_rx.await;
+    });
+
+    let sender = quic::connect(server_addr, "localhost", None).await.unwrap();
+    sender
+        .send(SenderMsg::Auth {
+            token: "wrong-token".to_string(),
+        })
+        .await
+        .unwrap();
+
+    match sender.recv().await {
+        Some(ReceiverMsg::AuthResult { ok: false, reason }) => {
+            assert!(reason.is_some(), "拒绝原因不应为空");
+        }
+        other => panic!("Expected AuthResult(ok:false), got {:?}", other),
+    }
+
+    let _ = done_tx.send(());
+    receiver_handle.await.unwrap();
+    sender.close().await.unwrap();
+}
+
 /// 握手兼容性测试：能力缺失 → 协商结果降级
 ///
 /// Receiver 本地不支持 delta（如旧版本部署）时，即使 Sender 支持，
