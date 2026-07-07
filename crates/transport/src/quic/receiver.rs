@@ -5,25 +5,36 @@ use std::net::SocketAddr;
 
 // 外部 crate
 use async_trait::async_trait;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, mpsc};
+use tokio::task::JoinHandle;
 use tracing::info;
 
 // 内部模块
 use super::cert;
-use super::framing;
+use super::mux;
 use crate::error::{Result, TransportError};
 use crate::message::{ReceiverMsg, SenderMsg};
 use crate::traits::ReceiverTransport;
 
 /// QUIC Receiver 侧传输
 ///
-/// 通过一个 bidirectional stream 与 Sender 通信：
-/// - recv 端接收 `SenderMsg`
-/// - send 端发送 `ReceiverMsg`
+/// 与 Sender 之间建立 4 条 bidirectional stream 做多路复用（控制 / 文件列表 /
+/// 数据 / ack+进度，见 `quic::mux`），大文件数据流不再阻塞 progress/ack 等控制消息：
+/// - `recv()` 从统一的 fan-in channel 读取（各 stream 由独立后台 task 读帧后转发进来）
+/// - `send()` 按 `ReceiverMsg` variant 路由到对应物理 stream
 pub struct QuicReceiverTransport {
     conn: quinn::Connection,
-    send: Mutex<quinn::SendStream>,
-    recv: Mutex<quinn::RecvStream>,
+    send_streams: Vec<Mutex<quinn::SendStream>>,
+    incoming_rx: Mutex<mpsc::Receiver<SenderMsg>>,
+    reader_tasks: Vec<JoinHandle<()>>,
+}
+
+impl Drop for QuicReceiverTransport {
+    fn drop(&mut self) {
+        for handle in &self.reader_tasks {
+            handle.abort();
+        }
+    }
 }
 
 /// 生成自签名证书并 bind 一个 QUIC endpoint，立即返回（不等待任何连接）
@@ -64,15 +75,14 @@ pub async fn accept_connection(endpoint: &quinn::Endpoint) -> Result<QuicReceive
 
     info!("[QUIC Receiver] Accepted connection from {}", conn.remote_address());
 
-    let (send, recv) = conn
-        .accept_bi()
-        .await
-        .map_err(|e| TransportError::RecvFailed(format!("accept_bi: {e}")))?;
+    let (send_streams, recv_streams) = mux::accept_mux_streams(&conn).await?;
+    let (incoming_rx, reader_tasks) = mux::spawn_reader_tasks::<SenderMsg>(recv_streams);
 
     Ok(QuicReceiverTransport {
         conn,
-        send: Mutex::new(send),
-        recv: Mutex::new(recv),
+        send_streams: send_streams.into_iter().map(Mutex::new).collect(),
+        incoming_rx: Mutex::new(incoming_rx),
+        reader_tasks,
     })
 }
 
@@ -86,19 +96,20 @@ pub fn local_addr(endpoint: &quinn::Endpoint) -> Result<SocketAddr> {
 #[async_trait]
 impl ReceiverTransport for QuicReceiverTransport {
     async fn recv(&self) -> Option<SenderMsg> {
-        let mut stream = self.recv.lock().await;
-        framing::read_msg(&mut stream).await.ok().flatten()
+        let mut rx = self.incoming_rx.lock().await;
+        rx.recv().await
     }
 
     async fn send(&self, msg: ReceiverMsg) -> Result<()> {
-        let mut stream = self.send.lock().await;
-        framing::write_msg(&mut stream, &msg)
-            .await
-            .map_err(|e| TransportError::SendFailed(format!("{e}")))
+        let kind = mux::receiver_stream_kind(&msg);
+        mux::send_routed(&self.send_streams, kind, &msg).await
     }
 
     async fn close(&self) -> Result<()> {
         self.conn.close(0u32.into(), b"done");
+        for handle in &self.reader_tasks {
+            handle.abort();
+        }
         Ok(())
     }
 }

@@ -6,25 +6,36 @@ use std::net::SocketAddr;
 // 外部 crate
 use async_trait::async_trait;
 use rustls::pki_types::CertificateDer;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, mpsc};
+use tokio::task::JoinHandle;
 use tracing::info;
 
 // 内部模块
 use super::cert;
-use super::framing;
+use super::mux;
 use crate::error::{Result, TransportError};
 use crate::message::{ReceiverMsg, SenderMsg};
 use crate::traits::SenderTransport;
 
 /// QUIC Sender 侧传输
 ///
-/// 通过一个 bidirectional stream 与 Receiver 通信：
-/// - send 端发送 `SenderMsg`
-/// - recv 端接收 `ReceiverMsg`
+/// 与 Receiver 之间建立 4 条 bidirectional stream 做多路复用（控制 / 文件列表 /
+/// 数据 / ack+进度，见 `quic::mux`），大文件数据流不再阻塞 progress/ack 等控制消息：
+/// - `send()` 按 `SenderMsg` variant 路由到对应物理 stream
+/// - `recv()` 从统一的 fan-in channel 读取（各 stream 由独立后台 task 读帧后转发进来）
 pub struct QuicSenderTransport {
     conn: quinn::Connection,
-    send: Mutex<quinn::SendStream>,
-    recv: Mutex<quinn::RecvStream>,
+    send_streams: Vec<Mutex<quinn::SendStream>>,
+    incoming_rx: Mutex<mpsc::Receiver<ReceiverMsg>>,
+    reader_tasks: Vec<JoinHandle<()>>,
+}
+
+impl Drop for QuicSenderTransport {
+    fn drop(&mut self) {
+        for handle in &self.reader_tasks {
+            handle.abort();
+        }
+    }
 }
 
 /// 连接到远端 Receiver
@@ -64,40 +75,34 @@ pub async fn connect(
 
     info!("[QUIC Sender] Connected to {}", addr);
 
-    let (send, recv) = conn
-        .open_bi()
-        .await
-        .map_err(|e| TransportError::SendFailed(format!("open_bi: {e}")))?;
+    let (send_streams, recv_streams) = mux::open_mux_streams(&conn).await?;
+    let (incoming_rx, reader_tasks) = mux::spawn_reader_tasks::<ReceiverMsg>(recv_streams);
 
     Ok(QuicSenderTransport {
         conn,
-        send: Mutex::new(send),
-        recv: Mutex::new(recv),
+        send_streams: send_streams.into_iter().map(Mutex::new).collect(),
+        incoming_rx: Mutex::new(incoming_rx),
+        reader_tasks,
     })
 }
 
 #[async_trait]
 impl SenderTransport for QuicSenderTransport {
     async fn send(&self, msg: SenderMsg) -> Result<()> {
-        let mut stream = self.send.lock().await;
-        framing::write_msg(&mut stream, &msg)
-            .await
-            .map_err(|e| TransportError::SendFailed(format!("{e}")))
+        let kind = mux::sender_stream_kind(&msg);
+        mux::send_routed(&self.send_streams, kind, &msg).await
     }
 
     async fn recv(&self) -> Option<ReceiverMsg> {
-        let mut stream = self.recv.lock().await;
-        match framing::read_msg(&mut stream).await {
-            Ok(msg) => msg,
-            Err(e) => {
-                tracing::warn!("[QuicSenderTransport] recv error: {e}");
-                None
-            }
-        }
+        let mut rx = self.incoming_rx.lock().await;
+        rx.recv().await
     }
 
     async fn close(&self) -> Result<()> {
         self.conn.close(0u32.into(), b"done");
+        for handle in &self.reader_tasks {
+            handle.abort();
+        }
         Ok(())
     }
 }

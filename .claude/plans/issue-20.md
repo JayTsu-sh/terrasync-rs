@@ -53,14 +53,12 @@ request/data → ack)」改造为多路复用架构，使 progress/ack/error/red
 ## 执行步骤
 
 - ✅ 步骤 1：`crates/transport/src/error.rs` 新增 `TransportError::StreamSetupFailed` variant。
-- 🔄 步骤 2：新增 `crates/transport/src/quic/mux.rs`（`StreamKind` 分类 + `open_mux_streams`/
-  `accept_mux_streams` + 后台 reader task fan-in 到共享 mpsc channel），`quic/mod.rs` 注册模块。
-- ⬜ 步骤 3：改造 `QuicSenderTransport`（`sender.rs`）：4 条 stream + mux 路由 send/recv，`Drop`
-  时 abort 后台 reader task。
-- ⬜ 步骤 4：改造 `QuicReceiverTransport`（`receiver.rs`）：同上（`accept_connection` 按固定顺序
-  accept 4 条 stream）。
-- ⬜ 步骤 5：`cargo test -p transport --features quic` 确认现有全部测试通过（历史握手/鉴权测试
-  在新 mux 架构下行为不变）。
+- ✅ 步骤 2-5（合并一次提交，互相耦合无法拆分为独立可编译的中间态）：新增
+  `crates/transport/src/quic/mux.rs`（`StreamKind` 分类 + `open_mux_streams`/
+  `accept_mux_streams` + 后台 reader task fan-in 到共享 mpsc channel），`quic/mod.rs` 注册模块；
+  改造 `QuicSenderTransport`/`QuicReceiverTransport` 用 4 条 stream + mux 路由 send/recv，`Drop`/
+  `close()` 时 abort 后台 reader task；`cargo test -p transport --features quic` 现有 8 个测试
+  全部通过（历史握手/鉴权测试在新 mux 架构下行为不变，证明向后兼容）。
 - ⬜ 步骤 6：`quic_roundtrip.rs` 新增多 stream 专项测试：大文件写满 Data stream（对端不读）期间，
   AckProgress stream 的消息仍可被及时 recv() 到（`tokio::time::timeout` 断言）。
 - ⬜ 步骤 7：`app` 层 Sender（`remote_sync.rs`）：合并 `process_requests` + `process_acks` 为
