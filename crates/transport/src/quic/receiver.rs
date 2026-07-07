@@ -5,7 +5,8 @@ use std::net::SocketAddr;
 
 // 外部 crate
 use async_trait::async_trait;
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::Mutex;
+use tokio::sync::mpsc::UnboundedReceiver;
 use tokio::task::JoinHandle;
 use tracing::info;
 
@@ -25,7 +26,7 @@ use crate::traits::ReceiverTransport;
 pub struct QuicReceiverTransport {
     conn: quinn::Connection,
     send_streams: Vec<Mutex<quinn::SendStream>>,
-    incoming_rx: Mutex<mpsc::Receiver<SenderMsg>>,
+    incoming_rx: Mutex<UnboundedReceiver<SenderMsg>>,
     reader_tasks: Vec<JoinHandle<()>>,
 }
 

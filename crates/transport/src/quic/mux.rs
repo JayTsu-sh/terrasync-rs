@@ -11,11 +11,19 @@
 //! `tokio::select!` 里对多条 stream 的读操作赛跑，被取消的分支会丢失已读到一半的
 //! 帧头/帧体字节，永久错位该 stream 后续的帧边界。放到独立 task 里让每条 stream
 //! 的读循环各自跑到完整帧再转发，从根源上规避这个问题。
+//!
+//! fan-in channel 用**无界** `mpsc::unbounded_channel`：若改用有界 channel，某条 stream
+//! （典型如大文件 `Data` stream）密集写入把 channel 挤满后，会反过来拖慢其它 stream 的
+//! reader task 写入 channel（有界 channel 的发送方需要排队等待可用容量），重新引入
+//! 「大数据流阻塞控制消息」的问题，与本模块要解决的目标相悖。真正的背压仍然存在于
+//! QUIC 每条 stream 各自独立的接收窗口上，无界 channel 只是避免在这之上再叠加一层
+//! 跨 stream 共享的人为瓶颈。
 
 // 外部 crate
 use serde::Serialize;
 use serde::de::DeserializeOwned;
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::Mutex;
+use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use tokio::task::JoinHandle;
 use tracing::warn;
 
@@ -23,10 +31,6 @@ use tracing::warn;
 use super::framing;
 use crate::error::{Result, TransportError};
 use crate::message::{ReceiverMsg, SenderMsg};
-
-/// 共享 mpsc channel 的容量（4 条 stream fan-in 到一个 channel，需要一定缓冲避免
-/// 某条 stream 数据密集到达时阻塞其后台 reader task）
-const INCOMING_CHANNEL_CAPACITY: usize = 256;
 
 /// 逻辑 stream 分类，每类对应一条独立的 QUIC bidirectional stream
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -148,13 +152,13 @@ pub(crate) async fn accept_mux_streams(
 
 /// 为每条 `RecvStream` 各起一个后台 task 串行读帧，全部转发进同一个共享 `mpsc` channel
 ///
-/// 返回共享的 `mpsc::Receiver`（多路 fan-in 后的统一消息入口）与各 task 的 `JoinHandle`
-/// （供调用方在 `close()`/`Drop` 时 abort，避免连接结束后残留读循环）。
-pub(crate) fn spawn_reader_tasks<T>(recv_streams: Vec<quinn::RecvStream>) -> (mpsc::Receiver<T>, Vec<JoinHandle<()>>)
+/// 返回共享的 `mpsc::UnboundedReceiver`（多路 fan-in 后的统一消息入口）与各 task 的
+/// `JoinHandle`（供调用方在 `close()`/`Drop` 时 abort，避免连接结束后残留读循环）。
+pub(crate) fn spawn_reader_tasks<T>(recv_streams: Vec<quinn::RecvStream>) -> (UnboundedReceiver<T>, Vec<JoinHandle<()>>)
 where
     T: DeserializeOwned + Send + 'static,
 {
-    let (tx, rx) = mpsc::channel::<T>(INCOMING_CHANNEL_CAPACITY);
+    let (tx, rx) = mpsc::unbounded_channel::<T>();
     let mut handles = Vec::with_capacity(recv_streams.len());
     for (idx, stream) in recv_streams.into_iter().enumerate() {
         let tx = tx.clone();
@@ -165,14 +169,14 @@ where
 }
 
 /// 单条物理 stream 的读循环：读到完整帧就转发进 channel，stream 结束或出错则退出
-async fn reader_loop<T>(mut stream: quinn::RecvStream, tx: mpsc::Sender<T>, kind: StreamKind)
+async fn reader_loop<T>(mut stream: quinn::RecvStream, tx: UnboundedSender<T>, kind: StreamKind)
 where
     T: DeserializeOwned + Send + 'static,
 {
     loop {
         match framing::read_msg::<T>(&mut stream).await {
             Ok(Some(msg)) => {
-                if tx.send(msg).await.is_err() {
+                if tx.send(msg).is_err() {
                     break;
                 }
             }
