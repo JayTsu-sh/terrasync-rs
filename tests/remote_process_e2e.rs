@@ -219,3 +219,166 @@ fn test_remote_process_e2e_handshake_and_sync() {
     assert_handshake_accepted_in_log(&sender_log, "Sender");
     assert_handshake_accepted_in_log(&receiver_log, "Receiver");
 }
+
+/// Token 鉴权测试（进程级）：Sender 携带与 Receiver 一致的 `--token` → 鉴权通过 → 全量同步成功
+#[test]
+fn test_remote_process_e2e_correct_token_succeeds() {
+    let tmp = tempfile::tempdir().expect("create tempdir");
+    let tmp_path = tmp.path();
+
+    let src_dir = tmp_path.join("src");
+    let dest_dir = tmp_path.join("dest");
+    fs::create_dir_all(&src_dir).expect("create src dir");
+    fs::create_dir_all(&dest_dir).expect("create dest dir");
+    let rel_paths = populate_src_dir(&src_dir);
+
+    let cert_path = tmp_path.join("server.crt");
+    let config_path = tmp_path.join("config.toml");
+    fs::write(&config_path, "[database]\nenabled = false\n").expect("write config");
+    let fake_manifest_dir = tmp_path.join("fake_manifest");
+
+    let port = free_loopback_port();
+    let listen_addr = format!("127.0.0.1:{port}");
+    let bin_path = cargo_bin("terrasync");
+
+    const TOKEN: &str = "correct-token-e2e";
+
+    let mut receiver_child = StdCommand::new(&bin_path)
+        .env("CARGO_MANIFEST_DIR", &fake_manifest_dir)
+        .current_dir(tmp_path)
+        .arg("-c")
+        .arg(&config_path)
+        .arg("serve")
+        .arg("--listen")
+        .arg(&listen_addr)
+        .arg("--tls-cert-out")
+        .arg(&cert_path)
+        .arg("--token")
+        .arg(TOKEN)
+        .arg(&dest_dir)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn receiver process");
+
+    wait_for_cert_file(&cert_path);
+
+    let mut sender_cmd = AssertCommand::new(&bin_path);
+    sender_cmd
+        .env("CARGO_MANIFEST_DIR", &fake_manifest_dir)
+        .current_dir(tmp_path)
+        .arg("-c")
+        .arg(&config_path)
+        .arg("sync")
+        .arg("--id")
+        .arg("remote_e2e_token_ok")
+        .arg("--remote")
+        .arg(&listen_addr)
+        .arg("--tls-server-cert")
+        .arg(&cert_path)
+        .arg("--token")
+        .arg(TOKEN)
+        .arg(&src_dir)
+        .arg(&dest_dir);
+
+    sender_cmd.assert().success();
+
+    let receiver_status = wait_for_child_exit(&mut receiver_child, RECEIVER_EXIT_TIMEOUT);
+    let (receiver_stdout, receiver_stderr) = drain_output(&mut receiver_child);
+    match receiver_status {
+        Some(status) => assert!(
+            status.success(),
+            "Receiver 进程异常退出: {status:?}\nstdout:\n{receiver_stdout}\nstderr:\n{receiver_stderr}"
+        ),
+        None => panic!(
+            "Receiver 进程在 {RECEIVER_EXIT_TIMEOUT:?} 内未自行退出，已强制 kill。\n\
+             stdout:\n{receiver_stdout}\nstderr:\n{receiver_stderr}"
+        ),
+    }
+
+    assert_dest_matches_src(&src_dir, &dest_dir, &rel_paths);
+}
+
+/// Token 鉴权测试（进程级）：Sender 携带错误 `--token` → Receiver 拒绝连接 → 未写入任何文件
+#[test]
+fn test_remote_process_e2e_wrong_token_rejected() {
+    let tmp = tempfile::tempdir().expect("create tempdir");
+    let tmp_path = tmp.path();
+
+    let src_dir = tmp_path.join("src");
+    let dest_dir = tmp_path.join("dest");
+    fs::create_dir_all(&src_dir).expect("create src dir");
+    fs::create_dir_all(&dest_dir).expect("create dest dir");
+    populate_src_dir(&src_dir);
+
+    let cert_path = tmp_path.join("server.crt");
+    let config_path = tmp_path.join("config.toml");
+    fs::write(&config_path, "[database]\nenabled = false\n").expect("write config");
+    let fake_manifest_dir = tmp_path.join("fake_manifest");
+
+    let port = free_loopback_port();
+    let listen_addr = format!("127.0.0.1:{port}");
+    let bin_path = cargo_bin("terrasync");
+
+    let mut receiver_child = StdCommand::new(&bin_path)
+        .env("CARGO_MANIFEST_DIR", &fake_manifest_dir)
+        .current_dir(tmp_path)
+        .arg("-c")
+        .arg(&config_path)
+        .arg("serve")
+        .arg("--listen")
+        .arg(&listen_addr)
+        .arg("--tls-cert-out")
+        .arg(&cert_path)
+        .arg("--token")
+        .arg("right-token")
+        .arg(&dest_dir)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn receiver process");
+
+    wait_for_cert_file(&cert_path);
+
+    // Sender 携带错误 token，预期非零退出（鉴权失败），不进入文件列表/数据阶段
+    let mut sender_cmd = AssertCommand::new(&bin_path);
+    sender_cmd
+        .env("CARGO_MANIFEST_DIR", &fake_manifest_dir)
+        .current_dir(tmp_path)
+        .arg("-c")
+        .arg(&config_path)
+        .arg("sync")
+        .arg("--id")
+        .arg("remote_e2e_token_bad")
+        .arg("--remote")
+        .arg(&listen_addr)
+        .arg("--tls-server-cert")
+        .arg(&cert_path)
+        .arg("--token")
+        .arg("wrong-token")
+        .arg(&src_dir)
+        .arg(&dest_dir);
+
+    sender_cmd.assert().failure();
+
+    // Receiver 收到非法 token 后也会以非零码退出（鉴权失败向上传播为进程错误）
+    let receiver_status = wait_for_child_exit(&mut receiver_child, RECEIVER_EXIT_TIMEOUT);
+    let (receiver_stdout, receiver_stderr) = drain_output(&mut receiver_child);
+    match receiver_status {
+        Some(status) => assert!(
+            !status.success(),
+            "Receiver 进程本应因鉴权失败以非零码退出，实际: {status:?}\nstdout:\n{receiver_stdout}\nstderr:\n{receiver_stderr}"
+        ),
+        None => panic!(
+            "Receiver 进程在 {RECEIVER_EXIT_TIMEOUT:?} 内未自行退出，已强制 kill。\n\
+             stdout:\n{receiver_stdout}\nstderr:\n{receiver_stderr}"
+        ),
+    }
+
+    // 鉴权在 SessionConfig / 文件列表阶段之前被拒绝，目标端不应出现任何同步文件
+    let dest_entries: Vec<_> = fs::read_dir(&dest_dir).expect("read dest dir").collect();
+    assert!(
+        dest_entries.is_empty(),
+        "鉴权失败后目标端不应有任何写入，实际发现: {dest_entries:?}"
+    );
+}

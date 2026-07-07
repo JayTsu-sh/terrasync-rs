@@ -45,7 +45,7 @@ approved 的 v2 spec **相矛盾**（v2 明确排除该项）。按开发者协�
 - ✅ step 6: `app::orchestrator`：`SyncMode::Remote` 新增 `auth_token: Option<String>` 字段，`new_remote`/`run_sync_remote` 线传该参数
 - ✅ step 7: CLI：`commands_enum.rs` 的 `Serve`/`Sync` 新增 `--token`（`Sync` 的 `requires = "remote"`）；`commands.rs` 的 `serve_cmd`/`sync_cmd` 线传；`lib.rs` match 分支透传
 - ✅ step 8: `crates/transport/tests/quic_roundtrip.rs` 新增 Auth 成功/失败 roundtrip 测试
-- ⬜ step 9: `tests/remote_process_e2e.rs` 新增进程级测试：正确 token 成功 / 错误 token 被拒（断言目标端未写入）
+- ✅ step 9: `tests/remote_process_e2e.rs` 新增进程级测试：正确 token 成功 / 错误 token 被拒（断言目标端未写入）
 - ⬜ step 10: 收尾：`cargo fmt` + 定向 `clippy` + 全量定向测试回归 + 清理 plan 文件
 
 ## 明确不做（按 approved v2 spec 排除）
