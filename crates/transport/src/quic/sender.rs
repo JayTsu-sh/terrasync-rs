@@ -26,7 +26,7 @@ use crate::traits::SenderTransport;
 /// - `recv()` 从统一的 fan-in channel 读取（各 stream 由独立后台 task 读帧后转发进来）
 pub struct QuicSenderTransport {
     conn: quinn::Connection,
-    send_streams: Vec<Mutex<quinn::SendStream>>,
+    send_streams: Vec<Mutex<mux::StreamSlot>>,
     incoming_rx: Mutex<UnboundedReceiver<ReceiverMsg>>,
     reader_tasks: Vec<JoinHandle<()>>,
 }

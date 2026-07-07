@@ -25,7 +25,7 @@ use crate::traits::ReceiverTransport;
 /// - `send()` 按 `ReceiverMsg` variant 路由到对应物理 stream
 pub struct QuicReceiverTransport {
     conn: quinn::Connection,
-    send_streams: Vec<Mutex<quinn::SendStream>>,
+    send_streams: Vec<Mutex<mux::StreamSlot>>,
     incoming_rx: Mutex<UnboundedReceiver<SenderMsg>>,
     reader_tasks: Vec<JoinHandle<()>>,
 }

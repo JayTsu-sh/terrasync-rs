@@ -92,8 +92,33 @@ request/data → ack)」改造为多路复用架构，使 progress/ack/error/red
   success/error 计数与文件数吻合（无丢消息）、dest==src。新增 `tempfile` dev-dependency。
   `cargo test -p app`（28 个测试全部通过，连跑 2 次无 flake）+ `cargo clippy -p app --no-deps
   --tests`（remote_sync.rs 无新增警告）。
-- ⬜ 步骤 10：端到端：扩展 `tests/remote_process_e2e.rs` 新增多 chunk 大文件场景（验证 mux Data
-  stream 正确性，dest==src），跑 2 次确认不 flake。
+- ✅ 步骤 10：端到端：扩展 `tests/remote_process_e2e.rs` 新增
+  `test_remote_process_e2e_large_multi_chunk_file_mux`（10MiB 跨多 chunk 大文件 + 既有小文件，
+  验证 mux Data stream 正确性，dest==src）。**这一步过程中用真实两进程联调暴露并修正了 2 个
+  单进程 transport 单测完全测不出来的严重 bug**（记录于此，供 review / 恢复时对齐）：
+  1. **`FileList`/`Data` 后台 accept 竞态**：`receiver_setup` 最初为 `FileList`/`Data` 各起一个
+     独立后台 task 并发 `accept_bi()`（仿照 `AckProgress` 的写法）。quinn 的"按创建顺序 yield"
+     只在同一个调用序列内成立，两个 task 并发调用时哪个拿到哪条物理 stream 完全不确定——真实
+     两进程联调时实际触发：`Data` 标签的 task 抢到了本该属于 `FileList` 的物理 stream，导致
+     `FileList` 的 `send_routed()` 永远等不到 accept 完成，死锁到 QUIC 连接 30s 空闲超时才「解开」
+     （此时数据已经乱套）。**修正**：`FileList`/`Data` 必须在同一个后台 task 里按 Sender 的
+     `open_bi()` 顺序依次 `accept_bi()`（`mux::spawn_lazy_accept_file_list_and_data`）。
+  2. **`TransferDone` 与实际数据完成解耦（更隐蔽，正确性 bug）**：`TransferDone` 走 `Control`
+     stream，真正的文件数据走独立的 `Data` stream——多路复用后二者是完全独立的物理 stream，
+     不再有"同一根 stream 严格 FIFO"的隐含顺序保证；体积很小的 `TransferDone` 完全可能抢在
+     大文件的 `FileData`/`EndOfFile` 之前被 Receiver 处理，若仍然"收到 `TransferDone` 就 break"，
+     会把还在 `Data` stream 上飞的文件直接丢弃（真实复现：4 个文件只收到 1 个）。**修正**：
+     Receiver 显式计数 `requested_count`（发出过的 `TransferRequest`/`DeltaTransferRequest` 数）
+     与 `completed_count`（收到过的对应 `EndOfFile`/`CreateSymlink` 完成数），只有二者相等
+     **且**已经见过 `TransferDone` 才真正结束循环（`recv_file_list_and_data_phase`）。
+  3. （附带）`tests/remote_process_e2e.rs::free_loopback_port` 原先用 TCP 探测端口再释放给
+     UDP（QUIC 实际协议）使用，探测协议本就不匹配，且多个测试在同一 `cargo test` 进程内并发跑时
+     有 TOCTOU 窗口可能撞到同一端口号；改为 UDP 探测 + 进程内 `ALLOCATED_PORTS` 去重集合，
+     消除这一类端口冲突（测试基础设施小改动，不影响任何测试的可观察行为）。
+  `cargo test -p terrasync-rs --test remote_process_e2e`：4 个测试（3 个既有 + 1 个新增）全部
+  通过，连跑 5 次全部 pass（个别 run 因 QUIC 连接收尾偶发命中 30s 空闲超时兜底导致单次耗时
+  变长，但结果始终是 4/4 pass，不是新增的 flaky failure；这一兜底路径是既有测试
+  `RECEIVER_EXIT_TIMEOUT=35s` 注释里本就承认并预留余量的已知特性，非本次改动引入的回归）。
 - ⬜ 步骤 11：全量验证收尾：`cargo fmt`、`cargo test -p transport --features quic`、
   `cargo test -p app`、`cargo test -p terrasync-rs --test remote_process_e2e`（连跑 2 次）；
   `git status` 确认无越界文件；移除本 plan 文件。
