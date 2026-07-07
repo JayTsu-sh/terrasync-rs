@@ -75,9 +75,11 @@ request/data → ack)」改造为多路复用架构，使 progress/ack/error/red
   AckProgress stream 回一条 Progress，断言 `sender.recv()` 在 2s 超时内读到——过程中发现并修正了
   上面记录的"stream 发起方不对称"设计问题。`cargo test -p transport --features quic` 全部 9 个
   测试通过，连跑 2 次无 flake。
-- ⬜ 步骤 7：`app` 层 Sender（`remote_sync.rs`）：合并 `process_requests` + `process_acks` 为
+- ✅ 步骤 7：`app` 层 Sender（`remote_sync.rs`）：合并 `process_requests` + `process_acks` 为
   `process_requests_and_acks`，与 `send_file_list_phase` 用 `tokio::try_join!` 并发运行，
-  `NdxTable` 改 `std::sync::Mutex`。
+  `NdxTable` 改 `std::sync::Mutex`（写者=文件列表任务，读者=请求处理任务）。
+  `cargo check -p app` + `cargo clippy -p app --no-deps`（无新增警告）+
+  `cargo test -p app`（27 个既有测试全部通过，无回归）。
 - ⬜ 步骤 8：`app` 层 Receiver（`receiver.rs`）：合并 `recv_file_list_phase` + `recv_file_data_phase`
   为 `recv_file_list_and_data_phase`，去除阶段 barrier。
 - ⬜ 步骤 9：`app` 层新增测试：基于 `transport::in_process` 双端联调（Sender 侧调用 remote_sync.rs
