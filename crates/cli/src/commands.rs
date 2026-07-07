@@ -353,11 +353,12 @@ pub async fn serve_cmd(listen: &str, dest_path: &str, tls_cert_out: &str) -> Res
     let dest_storage = Arc::new(create_storage(dest_path, None, true).await?);
     info!("Created destination storage for: {}", dest_path);
 
-    // 4. 接受 QUIC 连接，获取服务端证书 DER
-    let (receiver_transport, _endpoint, cert_der) = quic::accept(listen_addr).await?;
-    info!("Accepted QUIC connection");
+    // 4. bind QUIC endpoint，生成服务端证书 DER（不等待连接）
+    let (endpoint, cert_der) = quic::bind(listen_addr)?;
 
     // 5. 将服务端 TLS 证书写入文件（供 Sender 侧 --tls-server-cert 使用）
+    //    必须在等待连接（accept_connection）之前写入：Sender 在发起连接前就要读取该文件，
+    //    若放到连接建立之后写会形成死锁。
     if let Err(e) = std::fs::write(tls_cert_out, &cert_der) {
         tracing::warn!(
             "无法写入 TLS 证书到 '{}': {}。Sender 侧将无法验证服务端身份。",
@@ -371,10 +372,20 @@ pub async fn serve_cmd(listen: &str, dest_path: &str, tls_cert_out: &str) -> Res
         );
     }
 
-    // 6. 启动双进程 receiver task
+    // 6. 等待并接受 Sender 的 QUIC 连接
+    let receiver_transport = quic::accept_connection(&endpoint).await?;
+    info!("Accepted QUIC connection");
+
+    // 7. 启动双进程 receiver task
     app::receiver::receiver_task_remote(&receiver_transport, dest_storage)
         .await
         .map_err(CliError::AppError)?;
+
+    // 8. 等连接真正关闭再退出进程：write_all() 返回 Ok 只表示数据进入了 quinn 本地发送队列，
+    //    不代表已经送达对端；若这里立即 return，进程退出会连带丢弃尚未真正发出的最后几帧
+    //    （EntrySuccess/Progress/AllDone）。Sender 收到 AllDone 后会主动关闭连接，wait_idle()
+    //    等的正是这个信号；兜底走 quinn 默认 30s idle timeout，不会无限等待。
+    endpoint.wait_idle().await;
 
     info!("Receiver daemon completed");
     Ok(())

@@ -8,9 +8,12 @@
 #![allow(clippy::pedantic)]
 
 use std::net::SocketAddr;
+use std::time::Duration;
 
 use tokio::sync::oneshot;
-use transport::message::{ReceiverMsg, SenderMsg, SessionConfig};
+use transport::message::{
+    FeatureFlags, HandshakeResult, HashAlgorithm, ProtocolHandshake, ReceiverMsg, SenderMsg, SessionConfig,
+};
 use transport::quic;
 use transport::traits::SenderTransport;
 
@@ -177,6 +180,217 @@ async fn test_quic_session_config_roundtrip() {
         "Expected AllDone, got {:?}",
         reply
     );
+
+    let _ = done_tx.send(());
+    receiver_handle.await.unwrap();
+    sender.close().await.unwrap();
+}
+
+/// 握手兼容性测试：相同版本 → 协商成功，后续 SessionConfig 正常收发
+#[tokio::test]
+async fn test_quic_handshake_compatible_versions_roundtrip() {
+    install_crypto_provider();
+
+    let (server_endpoint, server_addr) = create_server_endpoint();
+    let (done_tx, done_rx) = oneshot::channel::<()>();
+
+    let receiver_handle = tokio::spawn(async move {
+        let incoming = server_endpoint.accept().await.unwrap();
+        let conn = incoming.await.unwrap();
+        let (mut send, mut recv) = conn.accept_bi().await.unwrap();
+
+        // 阶段 -1：握手
+        let msg: Option<SenderMsg> = quic::framing::read_msg(&mut recv).await.ok().flatten();
+        let remote_handshake = match msg {
+            Some(SenderMsg::Handshake(h)) => h,
+            other => panic!("Expected Handshake, got {:?}", other),
+        };
+        let result = ProtocolHandshake::current().negotiate(&remote_handshake);
+        assert!(
+            matches!(result, HandshakeResult::Accepted { .. }),
+            "Expected Accepted, got {:?}",
+            result
+        );
+        quic::framing::write_msg(&mut send, &ReceiverMsg::HandshakeAck(result))
+            .await
+            .unwrap();
+
+        // 阶段 0：握手通过后才应收到 SessionConfig
+        let msg: Option<SenderMsg> = quic::framing::read_msg(&mut recv).await.ok().flatten();
+        assert!(
+            matches!(msg, Some(SenderMsg::SessionConfig(_))),
+            "Expected SessionConfig, got {:?}",
+            msg
+        );
+
+        quic::framing::write_msg(&mut send, &ReceiverMsg::AllDone)
+            .await
+            .unwrap();
+        let _ = done_rx.await;
+    });
+
+    let sender = quic::connect(server_addr, "localhost", None).await.unwrap();
+    sender
+        .send(SenderMsg::Handshake(ProtocolHandshake::current()))
+        .await
+        .unwrap();
+
+    match sender.recv().await {
+        Some(ReceiverMsg::HandshakeAck(HandshakeResult::Accepted { features })) => {
+            assert!(features.delta, "双方版本一致，delta 能力应协商成功");
+        }
+        other => panic!("Expected HandshakeAck(Accepted), got {:?}", other),
+    }
+
+    // 握手通过后 Sender 才继续发送 SessionConfig（模拟真实 Sender 流程）
+    sender
+        .send(SenderMsg::SessionConfig(SessionConfig {
+            src_path: "/tmp/test".to_string(),
+            qos: None,
+            peak_qos_rate: 1.0,
+            iops: None,
+            enable_integrity_check: false,
+            enable_acl: false,
+            is_source_reserved: true,
+            block_size: None,
+            delete_target: false,
+        }))
+        .await
+        .unwrap();
+
+    let reply = sender.recv().await;
+    assert!(
+        matches!(reply, Some(ReceiverMsg::AllDone)),
+        "Expected AllDone, got {:?}",
+        reply
+    );
+
+    let _ = done_tx.send(());
+    receiver_handle.await.unwrap();
+    sender.close().await.unwrap();
+}
+
+/// 握手兼容性测试：版本不兼容 → Receiver 回 Rejected，Sender 不得发送任何 Phase 1 消息
+/// （`FilePage` / `CopyEntry` / `SessionConfig` 等），拒绝必须发生在 Phase 1 之前。
+#[tokio::test]
+async fn test_quic_handshake_incompatible_version_rejected_before_phase1() {
+    install_crypto_provider();
+
+    let (server_endpoint, server_addr) = create_server_endpoint();
+    let (done_tx, done_rx) = oneshot::channel::<()>();
+
+    let receiver_handle = tokio::spawn(async move {
+        let incoming = server_endpoint.accept().await.unwrap();
+        let conn = incoming.await.unwrap();
+        let (mut send, mut recv) = conn.accept_bi().await.unwrap();
+
+        let msg: Option<SenderMsg> = quic::framing::read_msg(&mut recv).await.ok().flatten();
+        let remote_handshake = match msg {
+            Some(SenderMsg::Handshake(h)) => h,
+            other => panic!("Expected Handshake, got {:?}", other),
+        };
+        let result = ProtocolHandshake::current().negotiate(&remote_handshake);
+        assert!(
+            matches!(result, HandshakeResult::Rejected { .. }),
+            "Expected Rejected, got {:?}",
+            result
+        );
+        quic::framing::write_msg(&mut send, &ReceiverMsg::HandshakeAck(result))
+            .await
+            .unwrap();
+
+        // 遵守协议的 Sender 收到 Rejected 后不会再发送任何消息；
+        // 带超时读取，确认 Phase 1（SessionConfig/FilePage 等）未被触发。
+        let next = tokio::time::timeout(
+            Duration::from_millis(200),
+            quic::framing::read_msg::<SenderMsg>(&mut recv),
+        )
+        .await;
+        match next {
+            Err(_) => {}       // 超时：符合预期，Sender 未再发送任何消息
+            Ok(Ok(None)) => {} // stream 已结束：符合预期
+            Ok(other) => panic!("Sender 不应在 Rejected 后发送任何 Phase 1 消息，收到: {:?}", other),
+        }
+
+        let _ = done_rx.await;
+    });
+
+    let sender = quic::connect(server_addr, "localhost", None).await.unwrap();
+
+    // 构造一个版本过旧的握手信息（低于 Receiver 的 min_supported_version），触发拒绝
+    let incompatible_handshake = ProtocolHandshake {
+        protocol_version: 0,
+        min_supported_version: 0,
+        features: FeatureFlags::current(),
+        hash_algorithm: HashAlgorithm::Blake3,
+    };
+    sender.send(SenderMsg::Handshake(incompatible_handshake)).await.unwrap();
+
+    match sender.recv().await {
+        Some(ReceiverMsg::HandshakeAck(HandshakeResult::Rejected { reason })) => {
+            assert!(!reason.is_empty(), "拒绝原因不应为空");
+        }
+        other => panic!("Expected HandshakeAck(Rejected), got {:?}", other),
+    }
+
+    // Sender 遵守协议：收到 Rejected 后不再发送 SessionConfig / FilePage，直接结束会话
+    let _ = done_tx.send(());
+    receiver_handle.await.unwrap();
+    sender.close().await.unwrap();
+}
+
+/// 握手兼容性测试：能力缺失 → 协商结果降级
+///
+/// Receiver 本地不支持 delta（如旧版本部署）时，即使 Sender 支持，
+/// 协商后的能力交集也应为 `delta: false`，Receiver 侧据此走全量传输而非 delta。
+#[tokio::test]
+async fn test_quic_handshake_missing_delta_capability_downgrades() {
+    install_crypto_provider();
+
+    let (server_endpoint, server_addr) = create_server_endpoint();
+    let (done_tx, done_rx) = oneshot::channel::<()>();
+
+    let receiver_handle = tokio::spawn(async move {
+        let incoming = server_endpoint.accept().await.unwrap();
+        let conn = incoming.await.unwrap();
+        let (mut send, mut recv) = conn.accept_bi().await.unwrap();
+
+        let msg: Option<SenderMsg> = quic::framing::read_msg(&mut recv).await.ok().flatten();
+        let remote_handshake = match msg {
+            Some(SenderMsg::Handshake(h)) => h,
+            other => panic!("Expected Handshake, got {:?}", other),
+        };
+
+        // Receiver 本地能力集：不支持 delta
+        let local_handshake = ProtocolHandshake {
+            features: FeatureFlags {
+                delta: false,
+                ..FeatureFlags::current()
+            },
+            ..ProtocolHandshake::current()
+        };
+        let result = local_handshake.negotiate(&remote_handshake);
+        quic::framing::write_msg(&mut send, &ReceiverMsg::HandshakeAck(result))
+            .await
+            .unwrap();
+
+        let _ = done_rx.await;
+    });
+
+    let sender = quic::connect(server_addr, "localhost", None).await.unwrap();
+    // Sender 声明支持完整能力集（含 delta）
+    sender
+        .send(SenderMsg::Handshake(ProtocolHandshake::current()))
+        .await
+        .unwrap();
+
+    match sender.recv().await {
+        Some(ReceiverMsg::HandshakeAck(HandshakeResult::Accepted { features })) => {
+            assert!(!features.delta, "Receiver 不支持 delta 时协商结果应降级为 false");
+            assert!(features.acl, "acl 双方均支持，协商结果应保持 true");
+        }
+        other => panic!("Expected HandshakeAck(Accepted), got {:?}", other),
+    }
 
     let _ = done_tx.send(());
     receiver_handle.await.unwrap();
