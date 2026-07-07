@@ -5,6 +5,7 @@
 //! 双进程模式下 Receiver 仅拥有 dest storage（数据流模式，Phase 3）。
 
 // 标准库
+use std::path::{Component, Path};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -271,16 +272,23 @@ pub(crate) async fn process_entry_on_receiver(
 ///
 /// 分阶段顺序协议：
 /// 0. 接收 `Handshake` → 校验协议版本/能力 → 回 ack/reject（不兼容则中止）
+/// 0.5 接收 `Auth` → 校验 token → 回 `AuthResult`（鉴权失败则中止，不进入 `SessionConfig`）
 /// 1. 接收 `SessionConfig`
 /// 2. 接收 `FilePage` → `DestIndex` 逐页比较 → 发 `TransferRequest`
 /// 3. 接收数据流 → 写入目标端 → 发 EntrySuccess/Error
+///
+/// `expected_token`：`serve --token` 配置的期望值；为 `None` 时跳过鉴权（向后兼容，
+/// 未配置 token 时不校验，仍需完成 `Auth` 消息交换以保持协议阶段一致）。
 pub async fn receiver_task_remote(
-    transport: &(dyn ReceiverTransport + 'static), dest_storage: Arc<StorageEnum>,
+    transport: &(dyn ReceiverTransport + 'static), dest_storage: Arc<StorageEnum>, expected_token: Option<&str>,
 ) -> Result<()> {
     info!("[Receiver Remote] Started, waiting for Handshake");
 
     // ── 阶段 -1: 协议握手（版本 + 能力协商），不兼容则回 reject 后立即中止 ──
     let negotiated_features = recv_and_negotiate_handshake(transport).await?;
+
+    // ── 阶段 -0.5: Token 鉴权，失败则回 AuthResult{ok:false} 并断连、中止 ──
+    recv_and_check_auth(transport, expected_token).await?;
 
     // ── 阶段 0: 接收 SessionConfig ──
     let session_config = recv_session_config(transport).await?;
@@ -362,6 +370,45 @@ async fn recv_and_negotiate_handshake(transport: &(dyn ReceiverTransport + 'stat
     }
 }
 
+/// 阶段 -0.5：等待 Sender 的 `Auth`，校验 token，回发 `AuthResult`
+///
+/// `expected_token` 为 `None` 时（Receiver 未配置 `--token`）接受任意 token，仅记录日志；
+/// 配置了 token 时必须与 Sender 提供的值完全一致，否则回复失败并 `close()` 连接，
+/// 确保鉴权失败发生在 `SessionConfig` / 文件列表 / 数据阶段之前。
+async fn recv_and_check_auth(
+    transport: &(dyn ReceiverTransport + 'static), expected_token: Option<&str>,
+) -> Result<()> {
+    loop {
+        match transport.recv().await {
+            Some(SenderMsg::Auth { token }) => {
+                let ok = match expected_token {
+                    Some(expected) => token == expected,
+                    None => true,
+                };
+                if ok {
+                    info!("[Receiver Remote] Auth accepted");
+                    transport
+                        .send(ReceiverMsg::AuthResult { ok: true, reason: None })
+                        .await?;
+                    return Ok(());
+                }
+                let reason = "invalid token".to_string();
+                warn!("[Receiver Remote] Auth rejected: {}", reason);
+                transport
+                    .send(ReceiverMsg::AuthResult {
+                        ok: false,
+                        reason: Some(reason.clone()),
+                    })
+                    .await?;
+                transport.close().await?;
+                return Err(TransportError::AuthFailed { reason }.into());
+            }
+            Some(_) => warn!("[Receiver Remote] Expected Auth, skipping"),
+            None => return Err(AppError::CopyError("Transport closed before Auth".into())),
+        }
+    }
+}
+
 /// 阶段 0：等待并返回 SessionConfig，忽略非预期消息
 async fn recv_session_config(transport: &(dyn ReceiverTransport + 'static)) -> Result<SessionConfig> {
     loop {
@@ -371,6 +418,20 @@ async fn recv_session_config(transport: &(dyn ReceiverTransport + 'static)) -> R
             None => return Err(AppError::CopyError("Transport closed before SessionConfig".into())),
         }
     }
+}
+
+/// 校验 Sender 提供的相对路径是否安全：拒绝绝对路径与含 `..` 组件的路径
+///
+/// 双进程远端模式下 Sender 不可信，若 `entry.get_relative_path()` 被恶意构造为绝对路径
+/// 或含 `..` 的路径，会导致目标端在 `dest_path` 之外写入/覆盖文件（路径穿越）。
+/// 此校验必须在所有以该路径驱动 `dest_storage` 写操作之前调用。
+fn validate_relative_path(path: &Path) -> Result<()> {
+    if path.is_absolute() || path.components().any(|c| matches!(c, Component::ParentDir)) {
+        return Err(AppError::UnsafeRelativePath {
+            path: path.to_path_buf(),
+        });
+    }
+    Ok(())
 }
 
 /// 阶段 1：接收 `FilePage` → 构建 `DestIndex` → 发 `TransferRequest` / `DeltaTransferRequest`
@@ -465,6 +526,16 @@ async fn recv_file_list_phase(
 
                 // 子目录在目标端创建
                 for ns in &page.subdirs {
+                    if let Err(e) = validate_relative_path(ns.entry.get_relative_path()) {
+                        warn!("[Receiver Remote] Rejecting unsafe subdir path: {}", e);
+                        let _ = transport
+                            .send(ReceiverMsg::EntryError {
+                                entry: ns.entry.clone(),
+                                reason: format!("{e}"),
+                            })
+                            .await;
+                        continue;
+                    }
                     if let Err(e) = dest_storage.create_dir_all(&ns.entry).await {
                         warn!("[Receiver Remote] create_dir {:?}: {}", ns.entry.get_relative_path(), e);
                     }
@@ -542,6 +613,13 @@ async fn recv_file_data_phase(
 
             // ── 数据流模式：目录 ──
             Some(SenderMsg::CreateDir { entry }) => {
+                if let Err(e) = validate_relative_path(entry.get_relative_path()) {
+                    warn!("[Receiver Remote] Rejecting unsafe relative path: {}", e);
+                    let _ = transport
+                        .send(ReceiverMsg::EntryError { entry, reason: format!("{e}") })
+                        .await;
+                    continue;
+                }
                 if let Err(e) = dest_storage.create_dir_all(&entry).await {
                     warn!("[Receiver Remote] create_dir {:?}: {}", entry.get_relative_path(), e);
                 }
@@ -552,6 +630,13 @@ async fn recv_file_data_phase(
 
             // ── 数据流模式：符号链接 ──
             Some(SenderMsg::CreateSymlink { entry, target }) => {
+                if let Err(e) = validate_relative_path(entry.get_relative_path()) {
+                    warn!("[Receiver Remote] Rejecting unsafe relative path: {}", e);
+                    let _ = transport
+                        .send(ReceiverMsg::EntryError { entry, reason: format!("{e}") })
+                        .await;
+                    continue;
+                }
                 match dest_storage.create_symlink(&entry, &target).await {
                     Ok(()) => {
                         progress.files_transferred.fetch_add(1, Ordering::Relaxed);
@@ -619,6 +704,20 @@ async fn handle_end_of_file(
 ) {
     let relative_path = entry.get_relative_path();
 
+    if let Err(e) = validate_relative_path(relative_path) {
+        warn!(
+            "[Receiver Remote] Rejecting unsafe relative path {:?}: {}",
+            relative_path, e
+        );
+        let _ = transport
+            .send(ReceiverMsg::EntryError {
+                entry,
+                reason: format!("{e}"),
+            })
+            .await;
+        return;
+    }
+
     // 重建文件字节：delta 或全量
     let file_bytes: bytes::Bytes = if tokens.is_empty() {
         file_data
@@ -684,5 +783,30 @@ async fn handle_end_of_file(
                 })
                 .await;
         }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn validate_relative_path_accepts_normal_paths() {
+        assert!(validate_relative_path(Path::new("a.txt")).is_ok());
+        assert!(validate_relative_path(Path::new("sub/deeper/b.bin")).is_ok());
+        assert!(validate_relative_path(Path::new("")).is_ok());
+    }
+
+    #[test]
+    fn validate_relative_path_rejects_parent_dir_escape() {
+        assert!(validate_relative_path(Path::new("../etc/passwd")).is_err());
+        assert!(validate_relative_path(Path::new("sub/../../escape")).is_err());
+        assert!(validate_relative_path(Path::new("..")).is_err());
+    }
+
+    #[test]
+    fn validate_relative_path_rejects_absolute_path() {
+        assert!(validate_relative_path(Path::new("/etc/passwd")).is_err());
     }
 }

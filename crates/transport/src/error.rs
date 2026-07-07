@@ -27,6 +27,10 @@ pub enum TransportError {
     /// 握手阶段协议版本或能力不兼容（Sender/Receiver 协议版本超出彼此支持范围）
     #[error("Incompatible protocol: {reason}")]
     IncompatibleProtocol { reason: String },
+
+    /// 鉴权失败（token 缺失或与 Receiver 配置的 token 不匹配）
+    #[error("Authentication failed: {reason}")]
+    AuthFailed { reason: String },
 }
 
 pub type Result<T> = std::result::Result<T, TransportError>;

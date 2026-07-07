@@ -199,6 +199,8 @@ enum SyncMode {
         remote_addr: String,
         /// 服务端 DER 证书（来自 `serve --tls-cert-out`），None 时跳过验证（输出 WARNING）
         tls_server_cert: Option<Vec<u8>>,
+        /// Token 鉴权（与 `serve --token` 配对），None 时发送空 token
+        auth_token: Option<String>,
     },
 }
 
@@ -220,12 +222,16 @@ impl SyncOrchestrator {
     ///
     /// `tls_server_cert`: 服务端 DER 证书字节（来自 `serve --tls-cert-out`），
     /// 传入 `None` 时跳过 TLS 验证（输出 WARNING）。
-    pub fn new_remote(config: SyncJobConfig, remote_addr: &str, tls_server_cert: Option<Vec<u8>>) -> Self {
+    /// `auth_token`: 与 Receiver `serve --token` 配对的鉴权 token，`None` 时发送空 token。
+    pub fn new_remote(
+        config: SyncJobConfig, remote_addr: &str, tls_server_cert: Option<Vec<u8>>, auth_token: Option<String>,
+    ) -> Self {
         Self {
             config,
             mode: SyncMode::Remote {
                 remote_addr: remote_addr.to_string(),
                 tls_server_cert,
+                auth_token,
             },
         }
     }
@@ -259,9 +265,13 @@ impl SyncOrchestrator {
                 SyncMode::Remote {
                     remote_addr,
                     tls_server_cert,
+                    auth_token,
                 },
                 ScanType::Full,
-            ) => self.run_sync_remote(remote_addr, tls_server_cert.as_deref()).await,
+            ) => {
+                self.run_sync_remote(remote_addr, tls_server_cert.as_deref(), auth_token.as_deref())
+                    .await
+            }
             (SyncMode::Remote { .. }, ScanType::Incremental) => {
                 // 双进程增量同步后续 Phase 实现
                 Err(AppError::CopyError(
@@ -1189,8 +1199,10 @@ impl SyncOrchestrator {
     }
 
     /// 双进程全量同步 — Sender 侧：`walkdir_2` 分页 → QUIC → Receiver 比较 + 写入
-    async fn run_sync_remote(&self, remote_addr: &str, tls_cert_bytes: Option<&[u8]>) -> Result<()> {
-        crate::remote_sync::run(&self.config, remote_addr, tls_cert_bytes).await
+    async fn run_sync_remote(
+        &self, remote_addr: &str, tls_cert_bytes: Option<&[u8]>, auth_token: Option<&str>,
+    ) -> Result<()> {
+        crate::remote_sync::run(&self.config, remote_addr, tls_cert_bytes, auth_token).await
     }
 
     /// 等待所有消费者 task 完成并记录结果

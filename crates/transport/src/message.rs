@@ -20,6 +20,10 @@ pub enum SenderMsg {
     /// 早于 `SessionConfig`，避免不兼容版本之间进行任何数据传输
     Handshake(ProtocolHandshake),
 
+    /// Token 鉴权：握手通过后、`SessionConfig` 之前发送，独立于 `SessionConfig`，
+    /// 便于 Receiver 在鉴权失败时第一时间拒绝连接，不进入任何会话配置/数据阶段
+    Auth { token: String },
+
     /// 会话配置（QoS、ACL、完整性校验等参数）
     SessionConfig(SessionConfig),
 
@@ -85,6 +89,10 @@ pub enum ReceiverMsg {
     /// 握手协商结果（对 `SenderMsg::Handshake` 的回复）：
     /// 兼容则携带协商后的能力交集，不兼容则携带拒绝原因
     HandshakeAck(HandshakeResult),
+
+    /// 鉴权结果（对 `SenderMsg::Auth` 的回复）：`ok` 为 false 时携带拒绝原因，
+    /// Sender 收到失败结果后应立即中止，不得发送 `SessionConfig` 及后续任何数据
+    AuthResult { ok: bool, reason: Option<String> },
 
     // ── 双进程模式：按 NDX 请求传输 ──
     /// 请求全量传输（目标文件不存在）
