@@ -12,7 +12,7 @@ use std::sync::atomic::Ordering;
 use data_mover::{CommitCallback, DataChunk, EntryEnum, StorageEnum, StreamHandle};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
-use tracing::{error, warn};
+use tracing::{debug, error, warn};
 use transport::message::{DiskCommitMsg, ReceiverMsg, SessionConfig};
 
 // 内部模块
@@ -101,23 +101,20 @@ pub async fn disk_commit_task(
                 }
             }
             DiskCommitMsg::FileChunk { entry, chunk } => {
+                // 保留 active：后续 FileCommit 仍需 join 写任务并发出那唯一的真实 EntryError。
+                // 写任务已死时每个残余 chunk 都会 send 失败，故降为 debug 避免刷屏。
                 if let Some(a) = active.as_ref()
                     && a.tx_inner.send(chunk).await.is_err()
                 {
-                    error!("[dc] write channel closed early for {:?}", entry.get_relative_path());
+                    debug!("[dc] write channel closed early for {:?}", entry.get_relative_path());
                 }
             }
             DiskCommitMsg::FileCommit { entry, source_hash } => {
                 if let Some(a) = active.take() {
                     finalize_file(&dest, &session, a, source_hash, &ack_tx, &progress).await;
                 } else {
+                    // FileBegin 失败时已发过唯一的 EntryError，这里不再重复 ack，只记日志。
                     warn!("[dc] FileCommit without active stream: {:?}", entry.get_relative_path());
-                    let _ = ack_tx
-                        .send(ReceiverMsg::EntryError {
-                            entry,
-                            reason: "no active stream".into(),
-                        })
-                        .await;
                 }
             }
             DiskCommitMsg::Shutdown => break,

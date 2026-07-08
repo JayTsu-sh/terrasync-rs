@@ -272,3 +272,25 @@ async fn dc_creates_symlink() {
         PathBuf::from("target.txt")
     );
 }
+
+// 钉死回归：裸 FileCommit（无前置 FileBegin）不产生任何 ack，也不 panic。
+// 防止 no-active 分支重新发出 EntryError（会与 FileBegin 失败路径重复 ack）。
+#[tokio::test]
+async fn dc_bare_commit_no_active_produces_no_ack() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dest = local_storage(tmp.path()).await;
+    let (entry, _b) = entry_for(tmp.path(), "ghost.bin", 1024);
+    let acks = run_dc(
+        dest,
+        session_cfg(true),
+        vec![DiskCommitMsg::FileCommit {
+            entry,
+            source_hash: Some("deadbeef".repeat(8)),
+        }],
+    )
+    .await;
+    assert!(
+        acks.is_empty(),
+        "无 active 的 FileCommit 不应产生任何 ack，实际: {acks:?}"
+    );
+}
