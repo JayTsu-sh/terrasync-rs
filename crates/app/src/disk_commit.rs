@@ -40,7 +40,7 @@ struct ActiveFile {
 /// 通过 `ack_tx` 发送 `ReceiverMsg::EntrySuccess` / `EntryError`。
 pub async fn disk_commit_task(
     dest: Arc<StorageEnum>, session: SessionConfig, mut rx: mpsc::Receiver<DiskCommitMsg>,
-    ack_tx: mpsc::Sender<ReceiverMsg>, progress: Arc<ReceiverProgress>,
+    ack_tx: mpsc::UnboundedSender<ReceiverMsg>, progress: Arc<ReceiverProgress>,
 ) -> Result<()> {
     let mut active: Option<ActiveFile> = None;
 
@@ -52,19 +52,17 @@ pub async fn disk_commit_task(
                 }
                 let _ = dest.set_entry_metadata(&entry).await;
                 progress.dirs_created.fetch_add(1, Ordering::Relaxed);
-                let _ = ack_tx.send(ReceiverMsg::EntrySuccess { entry }).await;
+                let _ = ack_tx.send(ReceiverMsg::EntrySuccess { entry });
             }
             DiskCommitMsg::CreateSymlink { entry, target } => match dest.create_symlink(&entry, &target).await {
                 Ok(()) => {
-                    let _ = ack_tx.send(ReceiverMsg::EntrySuccess { entry }).await;
+                    let _ = ack_tx.send(ReceiverMsg::EntrySuccess { entry });
                 }
                 Err(e) => {
-                    let _ = ack_tx
-                        .send(ReceiverMsg::EntryError {
-                            entry,
-                            reason: format!("{e}"),
-                        })
-                        .await;
+                    let _ = ack_tx.send(ReceiverMsg::EntryError {
+                        entry,
+                        reason: format!("{e}"),
+                    });
                 }
             },
             DiskCommitMsg::FileBegin { entry } => {
@@ -91,12 +89,10 @@ pub async fn disk_commit_task(
                     }
                     Err(e) => {
                         error!("[dc] resume_prepare {:?}: {}", entry.get_relative_path(), e);
-                        let _ = ack_tx
-                            .send(ReceiverMsg::EntryError {
-                                entry,
-                                reason: format!("{e}"),
-                            })
-                            .await;
+                        let _ = ack_tx.send(ReceiverMsg::EntryError {
+                            entry,
+                            reason: format!("{e}"),
+                        });
                     }
                 }
             }
@@ -146,7 +142,7 @@ pub async fn disk_commit_task(
 /// 任一步失败：删除 `.part` 并发送 `EntryError`。
 async fn finalize_file(
     dest: &Arc<StorageEnum>, session: &SessionConfig, a: ActiveFile, source_hash: Option<String>,
-    ack_tx: &mpsc::Sender<ReceiverMsg>, progress: &Arc<ReceiverProgress>,
+    ack_tx: &mpsc::UnboundedSender<ReceiverMsg>, progress: &Arc<ReceiverProgress>,
 ) {
     let ActiveFile {
         entry,
@@ -167,12 +163,10 @@ async fn finalize_file(
     if let Err(e) = write_result {
         error!("[dc] write {:?}: {}", entry.get_relative_path(), e);
         remove_part(dest, &entry, &part_path).await;
-        let _ = ack_tx
-            .send(ReceiverMsg::EntryError {
-                entry,
-                reason: format!("{e}"),
-            })
-            .await;
+        let _ = ack_tx.send(ReceiverMsg::EntryError {
+            entry,
+            reason: format!("{e}"),
+        });
         return;
     }
 
@@ -190,22 +184,18 @@ async fn finalize_file(
                     expected
                 );
                 remove_part(dest, &entry, &part_path).await;
-                let _ = ack_tx
-                    .send(ReceiverMsg::EntryError {
-                        entry,
-                        reason: "hash mismatch".into(),
-                    })
-                    .await;
+                let _ = ack_tx.send(ReceiverMsg::EntryError {
+                    entry,
+                    reason: "hash mismatch".into(),
+                });
                 return;
             }
             Err(e) => {
                 remove_part(dest, &entry, &part_path).await;
-                let _ = ack_tx
-                    .send(ReceiverMsg::EntryError {
-                        entry,
-                        reason: format!("hash read-back: {e}"),
-                    })
-                    .await;
+                let _ = ack_tx.send(ReceiverMsg::EntryError {
+                    entry,
+                    reason: format!("hash read-back: {e}"),
+                });
                 return;
             }
         }
@@ -215,19 +205,17 @@ async fn finalize_file(
     if let Err(e) = StorageEnum::commit_chunk_stream(dest, &entry, size, handle).await {
         error!("[dc] commit {:?}: {}", entry.get_relative_path(), e);
         remove_part(dest, &entry, &part_path).await;
-        let _ = ack_tx
-            .send(ReceiverMsg::EntryError {
-                entry,
-                reason: format!("{e}"),
-            })
-            .await;
+        let _ = ack_tx.send(ReceiverMsg::EntryError {
+            entry,
+            reason: format!("{e}"),
+        });
         return;
     }
 
     let _ = dest.set_entry_metadata(&entry).await;
     progress.files_transferred.fetch_add(1, Ordering::Relaxed);
     progress.bytes_transferred.fetch_add(size, Ordering::Relaxed);
-    let _ = ack_tx.send(ReceiverMsg::EntrySuccess { entry }).await;
+    let _ = ack_tx.send(ReceiverMsg::EntrySuccess { entry });
 }
 
 /// 删除残留的 `.part` 文件。data-mover 的删除 API 以 `EntryEnum` 为参，

@@ -147,7 +147,7 @@ fn chunkify(bytes: &[u8], chunk_size: usize) -> Vec<(u64, Bytes)> {
 // 起 disk_commit_task，喂消息，收集 ack ReceiverMsg。
 async fn run_dc(dest: Arc<StorageEnum>, session: SessionConfig, msgs: Vec<DiskCommitMsg>) -> Vec<ReceiverMsg> {
     let (dc_tx, dc_rx) = tokio::sync::mpsc::channel(16);
-    let (ack_tx, mut ack_rx) = tokio::sync::mpsc::channel(64);
+    let (ack_tx, mut ack_rx) = tokio::sync::mpsc::unbounded_channel();
     let progress = Arc::new(ReceiverProgress::new());
     let jh = tokio::spawn(disk_commit_task(dest, session, dc_rx, ack_tx, progress));
     for m in msgs {

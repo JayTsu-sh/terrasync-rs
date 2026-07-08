@@ -471,9 +471,11 @@ pub async fn recv_file_data_phase(
 ) -> Result<()> {
     info!("[Receiver Remote] Phase 2: Receiving file data (streaming)");
 
-    // disk-commit task：全量文件落盘（3 段流式），ack 经 ack_rx 回流
+    // disk-commit task：全量文件落盘（3 段流式），ack 经 ack_rx 回流。
+    // ack 通道用 unbounded：dc task 发 ack 永不 back-pressure，避免路由阻在 dc_tx.send
+    // 时不 drain ack → dc 阻在 ack_tx.send → 停止消费 dc_rx 的双向死锁。
     let (dc_tx, dc_rx) = tokio::sync::mpsc::channel::<DiskCommitMsg>(16);
-    let (ack_tx, mut ack_rx) = tokio::sync::mpsc::channel::<ReceiverMsg>(64);
+    let (ack_tx, mut ack_rx) = tokio::sync::mpsc::unbounded_channel::<ReceiverMsg>();
     let dc_join = tokio::spawn(disk_commit_task(
         dest_storage.clone(),
         session_config.clone(),
