@@ -11,6 +11,12 @@ pub mod ace;
 
 pub mod broadcast;
 
+/// 双进程模式 Receiver 落盘任务模块
+///
+/// 串行消费 `DiskCommitMsg`，用 data-mover 3 段流式 API 写入 `.part`，
+/// 提交时读回 hash 校验后原子 rename
+pub mod disk_commit;
+
 /// 字节级断点续传状态模块
 ///
 /// 为多块大文件记录已落盘 offset 区间，支持中断后从未完成位置续传
