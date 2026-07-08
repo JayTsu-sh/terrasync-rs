@@ -53,18 +53,14 @@ async fn sender_streams_file_and_sends_correct_hash() {
 
     // 收集 Sender 消息，重组文件字节
     let mut got = BytesMut::new();
-    let mut source_hash = None;
-    loop {
+    let source_hash = loop {
         match receiver_t.recv().await {
             Some(SenderMsg::FileBegin { .. }) => {}
             Some(SenderMsg::FileData { chunk, .. }) => got.extend_from_slice(&chunk.data),
-            Some(SenderMsg::EndOfFile { source_hash: h, .. }) => {
-                source_hash = h;
-                break;
-            }
+            Some(SenderMsg::EndOfFile { source_hash, .. }) => break source_hash,
             other => panic!("unexpected {other:?}"),
         }
-    }
+    };
     jh.await.unwrap().unwrap();
     assert_eq!(&got[..], &bytes[..], "重组字节应等于源文件");
     assert_eq!(source_hash.unwrap(), blake3::hash(&bytes).to_hex().to_string());
