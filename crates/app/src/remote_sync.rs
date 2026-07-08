@@ -216,7 +216,9 @@ async fn process_requests(
 /// 全量传输一个 entry（目录 / 符号链接 / 文件分块）。
 ///
 /// 符号链接读取失败时仅记录日志，不向 Receiver 发送任何数据（Receiver 不会收到该文件的 Ack）。
-/// 文件内容改为 `read_chunk_stream` 流式读取，读取失败通过 `?` 向上传播为致命错误。
+/// 文件内容改为 `read_chunk_stream` 流式读取；源读取失败时按 spec §6「记录日志 + 跳过该文件」
+/// 处理，发 `EntryError` 通知 Receiver 丢弃已收到的分片，然后 `return Ok(())` 继续后续文件，
+/// 不中断整次会话。
 pub async fn handle_full_transfer(
     transport: &(dyn SenderTransport + 'static), src_storage: &Arc<StorageEnum>, entry: &Arc<data_mover::EntryEnum>,
     qos: Option<&QosManager>, enable_integrity_check: bool, enable_acl: bool,
@@ -250,17 +252,34 @@ pub async fn handle_full_transfer(
                 })
                 .await?;
         }
-        // 读任务收尾：拿到源 hash（enable_integrity_check 时为 Some）
-        let source_hash = hash_handle
-            .await
-            .map_err(|e| AppError::CopyError(format!("read_chunk_stream join: {e}")))??
-            .map(ConsistencyCheck::finalize);
-        transport
-            .send(SenderMsg::EndOfFile {
-                entry: entry.clone(),
-                source_hash,
-            })
-            .await?;
+        // 读任务收尾：JoinError 或内层读错误统一归一为错误原因字符串
+        let read_result = match hash_handle.await {
+            Ok(inner) => inner.map_err(|e| e.to_string()),
+            Err(e) => Err(e.to_string()),
+        };
+        match read_result {
+            // 成功：拿到源 hash（enable_integrity_check 时为 Some）并收尾
+            Ok(hasher) => {
+                let source_hash = hasher.map(ConsistencyCheck::finalize);
+                transport
+                    .send(SenderMsg::EndOfFile {
+                        entry: entry.clone(),
+                        source_hash,
+                    })
+                    .await?;
+            }
+            // 读失败：记录日志 + 通知 Receiver 丢弃该文件分片，跳过（不发 ACL、不中断会话）
+            Err(reason) => {
+                error!("[Sender Remote] read file {:?}: {}", entry.get_relative_path(), reason);
+                transport
+                    .send(SenderMsg::EntryError {
+                        path: entry.get_relative_path().to_path_buf(),
+                        reason,
+                    })
+                    .await?;
+                return Ok(());
+            }
+        }
     }
     send_acl_if_enabled(transport, src_storage, entry, enable_acl).await;
     Ok(())
