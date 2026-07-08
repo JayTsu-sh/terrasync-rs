@@ -56,6 +56,7 @@ pub async fn disk_commit_task(
             }
             DiskCommitMsg::CreateSymlink { entry, target } => match dest.create_symlink(&entry, &target).await {
                 Ok(()) => {
+                    progress.files_transferred.fetch_add(1, Ordering::Relaxed);
                     let _ = ack_tx.send(ReceiverMsg::EntrySuccess { entry });
                 }
                 Err(e) => {

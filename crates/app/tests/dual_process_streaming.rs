@@ -342,3 +342,69 @@ async fn recv_phase_routes_full_files_to_disk() {
         .unwrap();
     assert_eq!(std::fs::read(tmp.path().join("d/f.bin")).unwrap(), bytes);
 }
+
+// 回归：源端缩到 0 字节的 delta 传输（无 FileBegin、无 delta token）应把目标端截为空，
+// 而非因空 token 误路由到 FileCommit（dc 无 active → no-op）保留旧内容。
+#[tokio::test]
+async fn recv_phase_empty_source_delta_truncates_dest() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dest = local_storage(tmp.path()).await;
+    let session = session_cfg(false);
+    // 预置非空目标文件（delta 传输的 basis）
+    std::fs::write(tmp.path().join("x.bin"), vec![0x11u8; 4096]).unwrap();
+    // 源端已缩到 0 字节：EndOfFile 前无 FileBegin、无 delta token
+    let (entry, _b) = entry_for(tmp.path(), "x.bin", 0);
+    let (sender_t, receiver_t) = create_in_process_pair();
+
+    let e = entry.clone();
+    let jh = tokio::spawn(async move {
+        sender_t
+            .send(SenderMsg::EndOfFile {
+                entry: e,
+                source_hash: None,
+            })
+            .await
+            .unwrap();
+        sender_t.send(SenderMsg::TransferDone).await.unwrap();
+        // 收集 Receiver 回传的 ack（channel 在 receiver_t drop 后关闭）
+        let mut acks = vec![];
+        while let Some(m) = sender_t.recv().await {
+            acks.push(m);
+        }
+        acks
+    });
+
+    let progress = Arc::new(ReceiverProgress::new());
+    let (_ptx, prx) = tokio::sync::mpsc::channel(4);
+    app::receiver::recv_file_data_phase(&receiver_t, &dest, &session, &progress, prx)
+        .await
+        .unwrap();
+    drop(receiver_t);
+    let acks = jh.await.unwrap();
+
+    // 目标文件被截为 0 字节（修复前：保留旧 4096 字节内容）
+    assert_eq!(std::fs::metadata(tmp.path().join("x.bin")).unwrap().len(), 0);
+    assert!(acks.iter().any(|a| matches!(a, ReceiverMsg::EntrySuccess { .. })));
+}
+
+// AbortFile 路径：FileBegin + 若干 FileChunk 后收到 AbortFile，应丢弃 .part、
+// 不产生最终文件、不发任何 ack（Sender 已发 EntryError，避免重复信号）。
+#[tokio::test]
+async fn dc_abort_file_drops_part_no_ack() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dest = local_storage(tmp.path()).await;
+    let (entry, bytes) = entry_for(tmp.path(), "aborted.bin", 2 * 1024 * 1024);
+    let mut msgs = vec![DiskCommitMsg::FileBegin { entry: entry.clone() }];
+    for (off, c) in chunkify(&bytes, 1 << 20) {
+        msgs.push(DiskCommitMsg::FileChunk {
+            entry: entry.clone(),
+            chunk: DataChunk { offset: off, data: c },
+        });
+    }
+    msgs.push(DiskCommitMsg::AbortFile);
+
+    let acks = run_dc(dest, session_cfg(true), msgs).await;
+    assert!(acks.is_empty(), "AbortFile 不应产生任何 ack，实际: {acks:?}");
+    assert!(!tmp.path().join("aborted.bin").exists());
+    assert!(!tmp.path().join("aborted.bin.terrasync-part").exists());
+}

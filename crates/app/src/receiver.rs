@@ -486,6 +486,10 @@ pub async fn recv_file_data_phase(
 
     // delta 重建 token 缓冲（仅 delta 路径使用，保持原样）
     let mut delta_tokens: Vec<sync_delta::DeltaToken> = Vec::new();
+    // 当前文件是否走全量路径：以是否见过 FileBegin 判定，而非 token 是否为空。
+    // 源端缩到 0 字节的 delta 传输 token 也为空且无 FileBegin，若按空 token 判定会误路由到
+    // FileCommit（dc task 无 active → no-op），导致目标端保留旧内容且不报错。
+    let mut full_active = false;
 
     loop {
         // 同时处理 transport 消息、progress 上报、disk-commit task 的 ack 回流
@@ -505,29 +509,34 @@ pub async fn recv_file_data_phase(
                 let _ = dc_tx.send(DiskCommitMsg::CreateSymlink { entry, target }).await;
             }
 
-            // ── 全量文件：FileBegin / FileData / EndOfFile(无 delta token) → disk-commit task ──
+            // ── 全量文件：FileBegin / FileData → disk-commit task ──
             Some(SenderMsg::FileBegin { entry }) => {
                 delta_tokens.clear();
+                full_active = true;
                 let _ = dc_tx.send(DiskCommitMsg::FileBegin { entry }).await;
             }
             Some(SenderMsg::FileData { entry, chunk }) => {
                 let _ = dc_tx.send(DiskCommitMsg::FileChunk { entry, chunk }).await;
             }
-            Some(SenderMsg::EndOfFile { entry, source_hash }) if delta_tokens.is_empty() => {
-                let _ = dc_tx.send(DiskCommitMsg::FileCommit { entry, source_hash }).await;
-            }
 
-            // ── delta 路径：保持原有 inline 重建逻辑不变 ──
+            // ── delta 路径：token 接收保持原有 inline 逻辑不变 ──
             Some(SenderMsg::DeltaMatch { block_index, .. }) => {
                 delta_tokens.push(sync_delta::DeltaToken::Match { block_index });
             }
             Some(SenderMsg::DeltaData { data, .. }) => {
                 delta_tokens.push(sync_delta::DeltaToken::Data(data));
             }
+
+            // ── 文件结束：见过 FileBegin → 全量 FileCommit；否则走 delta inline 重建 ──
             Some(SenderMsg::EndOfFile { entry, source_hash }) => {
-                let tokens = std::mem::take(&mut delta_tokens);
-                handle_end_of_file(transport, dest_storage, entry, source_hash, tokens, bytes::Bytes::new(), progress)
-                    .await;
+                if full_active {
+                    let _ = dc_tx.send(DiskCommitMsg::FileCommit { entry, source_hash }).await;
+                } else {
+                    let tokens = std::mem::take(&mut delta_tokens);
+                    handle_end_of_file(transport, dest_storage, entry, source_hash, tokens, bytes::Bytes::new(), progress)
+                        .await;
+                }
+                full_active = false;
             }
 
             // ── Sender 读源失败：中止 disk-commit task 当前正在写入的文件（丢弃 .part） ──
