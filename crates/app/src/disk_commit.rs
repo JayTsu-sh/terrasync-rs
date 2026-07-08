@@ -117,6 +117,22 @@ pub async fn disk_commit_task(
                     warn!("[dc] FileCommit without active stream: {:?}", entry.get_relative_path());
                 }
             }
+            DiskCommitMsg::AbortFile => {
+                // Sender 读源失败并已发出 EntryError，丢弃当前正在写入的文件：
+                // 关闭写 channel → 等写任务收尾 → 删除 .part。不再发 ack，避免与 Sender 重复信号。
+                if let Some(a) = active.take() {
+                    let ActiveFile {
+                        entry,
+                        tx_inner,
+                        write_join,
+                        part_path,
+                        ..
+                    } = a;
+                    drop(tx_inner);
+                    let _ = write_join.await;
+                    remove_part(&dest, &entry, &part_path).await;
+                }
+            }
             DiskCommitMsg::Shutdown => break,
             // delta / tar 变体不走 disk_commit task（见 receiver 路由）
             _ => {}

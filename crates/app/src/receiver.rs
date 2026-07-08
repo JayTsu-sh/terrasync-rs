@@ -9,16 +9,16 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 // 外部 crate
-use bytes::{BufMut, BytesMut};
 use data_mover::qos::QosManager;
 use data_mover::{EntryEnum, StorageEnum};
 use tokio::sync::mpsc::Receiver as MpscReceiver;
 use tracing::{Instrument, debug, error, info, info_span, trace, warn};
-use transport::message::{DestIndex, NdxTable, ProgressSnapshot, ReceiverMsg, SenderMsg, SessionConfig};
+use transport::message::{DestIndex, DiskCommitMsg, NdxTable, ProgressSnapshot, ReceiverMsg, SenderMsg, SessionConfig};
 use transport::traits::ReceiverTransport;
 
 // 内部模块
 use crate::byte_resume::is_part_file;
+use crate::disk_commit::disk_commit_task;
 use crate::error::{AppError, Result};
 use crate::sync::{ResumeOpts, copy_file_with_resume, should_resume};
 
@@ -459,77 +459,79 @@ async fn recv_file_list_phase(
     Ok(())
 }
 
-/// 阶段 2：接收文件数据流，写入目标端
+/// 阶段 2：接收文件数据流，路由到 disk-commit task 落盘
 ///
-/// 使用 `BytesMut` 缓冲多 chunk 数据，`FileBegin` 消息重置缓冲区避免跨文件状态污染。
-async fn recv_file_data_phase(
+/// 全量文件（`FileBegin`/`FileData`/`EndOfFile`-无 token）转成 `DiskCommitMsg` 交给
+/// disk-commit task 做 3 段流式写入（不再整文件缓冲进 `BytesMut`）；delta 路径
+/// （`DeltaMatch`/`DeltaData`/`EndOfFile`-带 token）保持 inline 重建不变。disk-commit
+/// task 的 ack 经本 loop 转发回 transport。`TransferDone` 后通知 task 退出并 drain 剩余 ack。
+pub async fn recv_file_data_phase(
     transport: &(dyn ReceiverTransport + 'static), dest_storage: &Arc<StorageEnum>, session_config: &SessionConfig,
     progress: &Arc<ReceiverProgress>, mut progress_rx: MpscReceiver<ProgressSnapshot>,
 ) -> Result<()> {
-    info!("[Receiver Remote] Phase 2: Receiving file data (streaming mode)");
+    info!("[Receiver Remote] Phase 2: Receiving file data (streaming)");
 
-    // delta 重建 token 缓冲
+    // disk-commit task：全量文件落盘（3 段流式），ack 经 ack_rx 回流
+    let (dc_tx, dc_rx) = tokio::sync::mpsc::channel::<DiskCommitMsg>(16);
+    let (ack_tx, mut ack_rx) = tokio::sync::mpsc::channel::<ReceiverMsg>(64);
+    let dc_join = tokio::spawn(disk_commit_task(
+        dest_storage.clone(),
+        session_config.clone(),
+        dc_rx,
+        ack_tx,
+        progress.clone(),
+    ));
+
+    // delta 重建 token 缓冲（仅 delta 路径使用，保持原样）
     let mut delta_tokens: Vec<sync_delta::DeltaToken> = Vec::new();
-    // 文件数据流缓冲（BytesMut，支持多 chunk 追加，FileBegin 时清空）
-    let mut file_data_buf = BytesMut::new();
 
     loop {
-        // 同时处理 transport 消息和 progress 上报
+        // 同时处理 transport 消息、progress 上报、disk-commit task 的 ack 回流
         tokio::select! {
             Some(snapshot) = progress_rx.recv() => {
                 let _ = transport.send(ReceiverMsg::Progress(snapshot)).await;
             }
+            Some(ack) = ack_rx.recv() => {
+                let _ = transport.send(ack).await;
+            }
             msg = transport.recv() => { match msg {
-            // ── 文件开始：重置缓冲区，防止跨文件状态污染 ──
-            Some(SenderMsg::FileBegin { .. }) => {
-                file_data_buf.clear();
-                delta_tokens.clear();
-            }
-
-            // ── 数据流模式：目录 ──
+            // ── 目录 / 符号链接：路由给 disk-commit task ──
             Some(SenderMsg::CreateDir { entry }) => {
-                if let Err(e) = dest_storage.create_dir_all(&entry).await {
-                    warn!("[Receiver Remote] create_dir {:?}: {}", entry.get_relative_path(), e);
-                }
-                let _ = dest_storage.set_entry_metadata(&entry).await;
-                progress.dirs_created.fetch_add(1, Ordering::Relaxed);
-                let _ = transport.send(ReceiverMsg::EntrySuccess { entry }).await;
+                let _ = dc_tx.send(DiskCommitMsg::CreateDir { entry }).await;
             }
-
-            // ── 数据流模式：符号链接 ──
             Some(SenderMsg::CreateSymlink { entry, target }) => {
-                match dest_storage.create_symlink(&entry, &target).await {
-                    Ok(()) => {
-                        progress.files_transferred.fetch_add(1, Ordering::Relaxed);
-                        let _ = transport.send(ReceiverMsg::EntrySuccess { entry }).await;
-                    }
-                    Err(e) => {
-                        error!("[Receiver Remote] create_symlink {:?}: {}", entry.get_relative_path(), e);
-                        let _ = transport
-                            .send(ReceiverMsg::EntryError { entry, reason: format!("{e}") })
-                            .await;
-                    }
-                }
+                let _ = dc_tx.send(DiskCommitMsg::CreateSymlink { entry, target }).await;
             }
 
-            // ── 数据流模式：文件数据块（追加到 BytesMut） ──
-            Some(SenderMsg::FileData { chunk, .. }) => {
-                file_data_buf.put_slice(&chunk.data);
+            // ── 全量文件：FileBegin / FileData / EndOfFile(无 delta token) → disk-commit task ──
+            Some(SenderMsg::FileBegin { entry }) => {
+                delta_tokens.clear();
+                let _ = dc_tx.send(DiskCommitMsg::FileBegin { entry }).await;
+            }
+            Some(SenderMsg::FileData { entry, chunk }) => {
+                let _ = dc_tx.send(DiskCommitMsg::FileChunk { entry, chunk }).await;
+            }
+            Some(SenderMsg::EndOfFile { entry, source_hash }) if delta_tokens.is_empty() => {
+                let _ = dc_tx.send(DiskCommitMsg::FileCommit { entry, source_hash }).await;
             }
 
-            // ── Delta token 接收 ──
-            Some(SenderMsg::DeltaMatch { ndx: _, block_index }) => {
+            // ── delta 路径：保持原有 inline 重建逻辑不变 ──
+            Some(SenderMsg::DeltaMatch { block_index, .. }) => {
                 delta_tokens.push(sync_delta::DeltaToken::Match { block_index });
             }
-            Some(SenderMsg::DeltaData { ndx: _, data }) => {
+            Some(SenderMsg::DeltaData { data, .. }) => {
                 delta_tokens.push(sync_delta::DeltaToken::Data(data));
             }
-
-            // ── 文件结束：校验 + 写入 ──
             Some(SenderMsg::EndOfFile { entry, source_hash }) => {
                 let tokens = std::mem::take(&mut delta_tokens);
-                let file_data = file_data_buf.split().freeze();
-                handle_end_of_file(transport, dest_storage, entry, source_hash, tokens, file_data, progress).await;
+                handle_end_of_file(transport, dest_storage, entry, source_hash, tokens, bytes::Bytes::new(), progress)
+                    .await;
+            }
+
+            // ── Sender 读源失败：中止 disk-commit task 当前正在写入的文件（丢弃 .part） ──
+            Some(SenderMsg::EntryError { path, reason }) => {
+                warn!("[Receiver Remote] Sender aborted {:?}: {}", path, reason);
+                let _ = dc_tx.send(DiskCommitMsg::AbortFile).await;
             }
 
             // ── ACL 跨进程 ──
@@ -551,6 +553,15 @@ async fn recv_file_data_phase(
         } // close select!
     } // close loop
 
+    // 收尾：通知 disk-commit task 退出 → 等其处理完积压 → drain 剩余 ack
+    let _ = dc_tx.send(DiskCommitMsg::Shutdown).await;
+    drop(dc_tx);
+    dc_join
+        .await
+        .map_err(|e| AppError::CopyError(format!("disk-commit task join: {e}")))??;
+    while let Ok(ack) = ack_rx.try_recv() {
+        let _ = transport.send(ack).await;
+    }
     Ok(())
 }
 

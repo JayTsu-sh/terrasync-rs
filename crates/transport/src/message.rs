@@ -236,6 +236,8 @@ pub enum DiskCommitMsg {
     },
 
     // ── 控制 ──
+    /// 中止当前正在写入的文件（Sender 读源失败）：丢弃 `.part`，不发 ack
+    AbortFile,
     /// 关闭 disk-commit task
     Shutdown,
 }

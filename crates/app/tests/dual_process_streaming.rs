@@ -10,7 +10,7 @@ use bytes::{Bytes, BytesMut};
 use data_mover::{DataChunk, EntryEnum, NASEntry, StorageEnum, create_storage};
 use transport::in_process::create_in_process_pair;
 use transport::message::{DiskCommitMsg, ReceiverMsg, SenderMsg, SessionConfig};
-use transport::traits::ReceiverTransport;
+use transport::traits::{ReceiverTransport, SenderTransport};
 
 // 帮助函数：在临时目录建一个 Local StorageEnum 和一个 size 字节的确定性文件，返回 (storage, entry, bytes)
 async fn local_file(dir: &std::path::Path, name: &str, size: usize) -> (Arc<StorageEnum>, Arc<EntryEnum>, Vec<u8>) {
@@ -293,4 +293,52 @@ async fn dc_bare_commit_no_active_produces_no_ack() {
         acks.is_empty(),
         "无 active 的 FileCommit 不应产生任何 ack，实际: {acks:?}"
     );
+}
+
+// recv_file_data_phase 端到端：手工扮演 Sender 发 CreateDir + FileBegin/FileData*/EndOfFile
+// + TransferDone，经 in-process pair 调 recv_file_data_phase，断言全量文件经 disk-commit
+// task 落地 + 内容正确。
+#[tokio::test]
+async fn recv_phase_routes_full_files_to_disk() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dest = local_storage(tmp.path()).await;
+    let session = session_cfg(true);
+    let (entry, bytes) = entry_for(tmp.path(), "d/f.bin", 3 * 1024 * 1024);
+    let (sender_t, receiver_t) = create_in_process_pair();
+
+    // Sender 侧脚本（先切块，避免把 bytes 移进 spawn 后无法用于断言）
+    let src_hash = blake3::hash(&bytes).to_hex().to_string();
+    let chunks = chunkify(&bytes, 1 << 20);
+    let e = entry.clone();
+    tokio::spawn(async move {
+        sender_t
+            .send(SenderMsg::CreateDir { entry: dir_entry("d") })
+            .await
+            .unwrap();
+        sender_t.send(SenderMsg::FileBegin { entry: e.clone() }).await.unwrap();
+        for (off, c) in chunks {
+            sender_t
+                .send(SenderMsg::FileData {
+                    entry: e.clone(),
+                    chunk: DataChunk { offset: off, data: c },
+                })
+                .await
+                .unwrap();
+        }
+        sender_t
+            .send(SenderMsg::EndOfFile {
+                entry: e.clone(),
+                source_hash: Some(src_hash),
+            })
+            .await
+            .unwrap();
+        sender_t.send(SenderMsg::TransferDone).await.unwrap();
+    });
+
+    let progress = Arc::new(ReceiverProgress::new());
+    let (_ptx, prx) = tokio::sync::mpsc::channel(4);
+    app::receiver::recv_file_data_phase(&receiver_t, &dest, &session, &progress, prx)
+        .await
+        .unwrap();
+    assert_eq!(std::fs::read(tmp.path().join("d/f.bin")).unwrap(), bytes);
 }
