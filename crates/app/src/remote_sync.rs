@@ -11,7 +11,7 @@ use std::sync::Arc;
 use data_mover::dir_tree::NdxEvent;
 use data_mover::filter::parse_filter_expression;
 use data_mover::qos::QosManager;
-use data_mover::{DataChunk, StorageEnum, WalkDirAsyncIterator2, create_storage};
+use data_mover::{ConsistencyCheck, StorageEnum, WalkDirAsyncIterator2, create_storage};
 use rustls::pki_types::CertificateDer;
 use tracing::{debug, error, info, warn};
 use transport::message::{BlockSignature, NdxTable, ReceiverMsg, SenderMsg, SessionConfig};
@@ -23,9 +23,6 @@ use crate::consumer::stats::format_bytes;
 use crate::error::{AppError, Result};
 use crate::orchestrator::create_qos_manager;
 use crate::sync::parse_size;
-
-/// 文件分块传输大小（4 MiB）
-const FILE_CHUNK_SIZE: usize = 4 * 1024 * 1024;
 
 /// 双进程全量同步 — Sender 侧入口
 ///
@@ -102,6 +99,7 @@ pub(crate) async fn run(config: &SyncJobConfig, remote_addr: &str, tls_cert_byte
         &src_storage,
         &ndx_table,
         qos_manager.as_ref(),
+        config.enable_integrity_check,
         config.enable_acl,
     )
     .await?;
@@ -159,7 +157,7 @@ async fn send_file_list_phase(
 /// 返回实际处理的传输请求数。
 async fn process_requests(
     transport: &(dyn SenderTransport + 'static), src_storage: &Arc<StorageEnum>, ndx_table: &NdxTable,
-    qos: Option<&QosManager>, enable_acl: bool,
+    qos: Option<&QosManager>, enable_integrity_check: bool, enable_acl: bool,
 ) -> Result<u64> {
     info!("[Sender Remote] Phase 2: Processing transfer requests");
     let mut transfer_count = 0u64;
@@ -167,7 +165,8 @@ async fn process_requests(
         match transport.recv().await {
             Some(ReceiverMsg::TransferRequest { ndx }) => {
                 if let Some(entry) = ndx_table.get(ndx) {
-                    handle_full_transfer(transport, src_storage, entry, qos, enable_acl).await?;
+                    handle_full_transfer(transport, src_storage, entry, qos, enable_integrity_check, enable_acl)
+                        .await?;
                     transfer_count += 1;
                 } else {
                     error!("[Sender Remote] Unknown NDX {}", ndx);
@@ -216,10 +215,11 @@ async fn process_requests(
 
 /// 全量传输一个 entry（目录 / 符号链接 / 文件分块）。
 ///
-/// 源文件读取失败时仅记录日志，不向 Receiver 发送任何数据（Receiver 不会收到该文件的 Ack）。
-async fn handle_full_transfer(
+/// 符号链接读取失败时仅记录日志，不向 Receiver 发送任何数据（Receiver 不会收到该文件的 Ack）。
+/// 文件内容改为 `read_chunk_stream` 流式读取，读取失败通过 `?` 向上传播为致命错误。
+pub async fn handle_full_transfer(
     transport: &(dyn SenderTransport + 'static), src_storage: &Arc<StorageEnum>, entry: &Arc<data_mover::EntryEnum>,
-    qos: Option<&QosManager>, enable_acl: bool,
+    qos: Option<&QosManager>, enable_integrity_check: bool, enable_acl: bool,
 ) -> Result<()> {
     if entry.get_is_dir() {
         transport.send(SenderMsg::CreateDir { entry: entry.clone() }).await?;
@@ -238,40 +238,29 @@ async fn handle_full_transfer(
             }
         }
     } else {
-        let size = entry.get_size();
-        match StorageEnum::read_file_from(src_storage, entry, size).await {
-            Ok(data) => {
-                let hash = blake3::hash(&data).to_hex().to_string();
-                transport.send(SenderMsg::FileBegin { entry: entry.clone() }).await?;
-                let mut offset = 0usize;
-                while offset < data.len() {
-                    let end = (offset + FILE_CHUNK_SIZE).min(data.len());
-                    let chunk = data.slice(offset..end);
-                    if let Some(q) = qos {
-                        q.acquire(chunk.len() as u64).await;
-                    }
-                    transport
-                        .send(SenderMsg::FileData {
-                            entry: entry.clone(),
-                            chunk: DataChunk {
-                                offset: offset as u64,
-                                data: chunk,
-                            },
-                        })
-                        .await?;
-                    offset = end;
-                }
-                transport
-                    .send(SenderMsg::EndOfFile {
-                        entry: entry.clone(),
-                        source_hash: Some(hash),
-                    })
-                    .await?;
-            }
-            Err(e) => {
-                error!("[Sender Remote] read file {:?}: {}", entry.get_relative_path(), e);
-            }
+        // 流式读源文件：read_chunk_stream 内部按块读 + per-chunk QoS + hash
+        let (mut rx, hash_handle) =
+            StorageEnum::read_chunk_stream(src_storage, entry, None, qos.cloned(), enable_integrity_check, 8);
+        transport.send(SenderMsg::FileBegin { entry: entry.clone() }).await?;
+        while let Some(chunk) = rx.recv().await {
+            transport
+                .send(SenderMsg::FileData {
+                    entry: entry.clone(),
+                    chunk,
+                })
+                .await?;
         }
+        // 读任务收尾：拿到源 hash（enable_integrity_check 时为 Some）
+        let source_hash = hash_handle
+            .await
+            .map_err(|e| AppError::CopyError(format!("read_chunk_stream join: {e}")))??
+            .map(ConsistencyCheck::finalize);
+        transport
+            .send(SenderMsg::EndOfFile {
+                entry: entry.clone(),
+                source_hash,
+            })
+            .await?;
     }
     send_acl_if_enabled(transport, src_storage, entry, enable_acl).await;
     Ok(())

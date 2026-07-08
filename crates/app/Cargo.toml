@@ -39,6 +39,7 @@ workspace = true
 
 [dev-dependencies]
 serial_test = "3.4.0"
+tempfile     = "3"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61.2", features = [
