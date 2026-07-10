@@ -133,6 +133,17 @@ pub(crate) async fn run(
         qos.shutdown();
     }
     transport.close().await?;
+    finalize_run_result(error_count)
+}
+
+/// `error_count>0` 时返回具名错误，使 `main.rs` 的 `exit(1)` 生效；否则 `Ok(())`。
+///
+/// ndx 级 redo 二次失败（`ReceiverMsg::Error`）与 Entry 级失败（`EntryError`）都计入
+/// `error_count`，任一存在都视为本次同步未完全成功。
+fn finalize_run_result(error_count: u64) -> Result<()> {
+    if error_count > 0 {
+        return Err(AppError::RemoteSyncFailed { errors: error_count });
+    }
     Ok(())
 }
 
@@ -255,7 +266,7 @@ async fn process_requests_and_acks(
                     .get(ndx)
                     .cloned();
                 if let Some(entry) = entry {
-                    handle_full_transfer(transport, src_storage, &entry, qos, enable_acl).await?;
+                    handle_full_transfer(transport, src_storage, &entry, ndx, qos, enable_acl).await?;
                     transfer_count += 1;
                 } else {
                     error!("[Sender Remote] Unknown NDX {}", ndx);
@@ -291,12 +302,44 @@ async fn process_requests_and_acks(
                     error!("[Sender Remote] Unknown NDX {} for delta", ndx);
                 }
             }
+            // ── ndx 级重传请求：hash 校验失败首次上报后，Receiver 要求重发。delta redo 一律
+            //    降级为全量重发——Sender 对 redo 无状态，不保留 signatures/mode ──
+            Some(ReceiverMsg::Redo { ndx }) => {
+                let entry = ndx_table
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .get(ndx)
+                    .cloned();
+                if let Some(entry) = entry {
+                    handle_full_transfer(transport, src_storage, &entry, ndx, qos, enable_acl).await?;
+                } else {
+                    error!("[Sender Remote] Unknown NDX {} for redo", ndx);
+                }
+            }
             Some(ReceiverMsg::RequestsDone) => {
                 info!(
                     "[Sender Remote] All requests received, {} files to transfer",
                     transfer_count
                 );
                 transport.send(SenderMsg::TransferDone).await?;
+            }
+            // ── ndx 级文件传输终态：与 EntrySuccess（目录/符号链接）共用同一个 success_count ──
+            Some(ReceiverMsg::Success { ndx }) => {
+                success_count += 1;
+                let entry = ndx_table
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .get(ndx)
+                    .cloned();
+                if let Some(entry) = entry {
+                    completed_paths.insert(entry.get_relative_path().to_string_lossy().to_string());
+                }
+                // 周期性保存 checkpoint
+                if success_count.is_multiple_of(100)
+                    && let Ok(data) = serde_json::to_string(&completed_paths)
+                {
+                    let _ = tokio::fs::write(checkpoint_path, data).await;
+                }
             }
             Some(ReceiverMsg::EntrySuccess { ref entry }) => {
                 success_count += 1;
@@ -329,6 +372,11 @@ async fn process_requests_and_acks(
                 );
                 error_count += 1;
             }
+            // ── ndx 级文件传输终态失败（redo 二次失败）：与 EntryError 共用同一个 error_count ──
+            Some(ReceiverMsg::Error { ndx, reason }) => {
+                error!("[Sender Remote] NDX {} failed: {}", ndx, reason);
+                error_count += 1;
+            }
             Some(ReceiverMsg::AllDone) => break,
             Some(other) => {
                 debug!("[Sender Remote] Ignoring message: {:?}", std::mem::discriminant(&other));
@@ -341,10 +389,14 @@ async fn process_requests_and_acks(
 
 /// 全量传输一个 entry（目录 / 符号链接 / 文件分块）。
 ///
+/// `ndx` 串入 `FileBegin`/`FileData`/`EndOfFile`，使 Receiver 能把校验结果关联回该 ndx
+/// （redo 决策所需，见 `receiver::decide_file_ack`）；也是 `Redo{ndx}` 重发的入口——
+/// delta redo 与首次全量传输走同一份实现。
+///
 /// 源文件读取失败时仅记录日志，不向 Receiver 发送任何数据（Receiver 不会收到该文件的 Ack）。
 async fn handle_full_transfer(
     transport: &(dyn SenderTransport + 'static), src_storage: &Arc<StorageEnum>, entry: &Arc<data_mover::EntryEnum>,
-    qos: Option<&QosManager>, enable_acl: bool,
+    ndx: i32, qos: Option<&QosManager>, enable_acl: bool,
 ) -> Result<()> {
     if entry.get_is_dir() {
         transport.send(SenderMsg::CreateDir { entry: entry.clone() }).await?;
@@ -365,10 +417,16 @@ async fn handle_full_transfer(
     } else {
         // 流式读源文件：read_chunk_stream 内部按块读 + per-chunk QoS + hash（不再整文件驻留 RAM）
         let (mut rx, hash_handle) = StorageEnum::read_chunk_stream(src_storage, entry, None, qos.cloned(), true, 8);
-        transport.send(SenderMsg::FileBegin { entry: entry.clone() }).await?;
+        transport
+            .send(SenderMsg::FileBegin {
+                ndx,
+                entry: entry.clone(),
+            })
+            .await?;
         while let Some(chunk) = rx.recv().await {
             transport
                 .send(SenderMsg::FileData {
+                    ndx,
                     entry: entry.clone(),
                     chunk,
                 })
@@ -385,6 +443,7 @@ async fn handle_full_transfer(
                 let source_hash = hasher.map(ConsistencyCheck::finalize);
                 transport
                     .send(SenderMsg::EndOfFile {
+                        ndx,
                         entry: entry.clone(),
                         source_hash,
                     })
@@ -463,6 +522,7 @@ async fn handle_delta_transfer(
     let hash = blake3::hash(&src_data).to_hex().to_string();
     transport
         .send(SenderMsg::EndOfFile {
+            ndx,
             entry: entry.clone(),
             source_hash: Some(hash),
         })
@@ -539,6 +599,21 @@ mod tests {
 
     use super::*;
     use crate::receiver::receiver_task_remote;
+
+    // ── finalize_run_result：error_count → 退出码决策纯函数单测 ──
+
+    #[test]
+    fn finalize_run_result_ok_when_no_errors() {
+        assert!(finalize_run_result(0).is_ok());
+    }
+
+    #[test]
+    fn finalize_run_result_err_when_errors_present() {
+        match finalize_run_result(3) {
+            Err(AppError::RemoteSyncFailed { errors: 3 }) => {}
+            other => panic!("expected RemoteSyncFailed{{errors: 3}}, got {other:?}"),
+        }
+    }
 
     /// 双端联调（in-process transport，不依赖真实 QUIC）：验证多路复用改造后的
     /// Sender 侧「文件列表发送」与「请求处理+Ack 收集」并发路径、Receiver 侧合并

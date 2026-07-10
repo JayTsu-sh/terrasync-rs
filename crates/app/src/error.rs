@@ -81,6 +81,11 @@ pub enum AppError {
     /// 拒绝以该路径驱动目标端写操作，防止路径穿越
     #[error("Unsafe relative path: {path:?}")]
     UnsafeRelativePath { path: PathBuf },
+
+    /// 双进程远端同步存在未恢复的失败（ndx 级 redo 二次失败后的 Error 终态）
+    /// 携带失败总数，使调用方（`main.rs`）据此以非零退出码结束进程
+    #[error("Remote sync failed: {errors} unrecovered error(s)")]
+    RemoteSyncFailed { errors: u64 },
 }
 
 /// 应用程序的结果类型别名

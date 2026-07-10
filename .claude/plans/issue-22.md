@@ -62,7 +62,7 @@
   `crates/transport/tests/quic_roundtrip.rs` 中唯一的 `SenderMsg::FileData` 构造点。
   验证：`cargo check -p transport --features quic && cargo test -p transport --features quic`。
 
-- ⬜ 步骤 3（核心行为变更，单独提交）：`crates/app` 落地 redo/ack 状态机：
+- ✅ 步骤 3（核心行为变更，单独提交）：`crates/app` 落地 redo/ack 状态机：
   - `receiver.rs`：`attempts` map + `decide_file_ack` + `handle_end_of_file` 改为返回
     `FileOutcome`（不再自行发 ack）+ 主循环按 `DcAck::Entry`/`FileOutcome` 分流。
   - `disk_commit.rs`：`ack_tx` 改为 `UnboundedSender<DcAck>`；`FileBegin` 失败、
