@@ -514,17 +514,10 @@ async fn recv_file_list_and_data_phase(
                         }
                     }
                     DcAck::FileOutcome { ndx, outcome } => {
-                        let (ack, is_terminal) = decide_file_ack(&mut attempts, ndx, outcome);
-                        if matches!(ack, ReceiverMsg::Error { .. }) {
-                            progress.error_count.fetch_add(1, Ordering::Relaxed);
-                        }
-                        let _ = transport.send(ack).await;
-                        if is_terminal {
-                            completed_count += 1;
-                            if transfer_done_seen && completed_count >= requested_count {
-                                info!("[Receiver Remote] All transfers complete");
-                                break;
-                            }
+                        if dispatch_file_outcome(transport, &mut attempts, progress, ndx, outcome).await
+                            && complete_ndx(&mut completed_count, requested_count, transfer_done_seen)
+                        {
+                            break;
                         }
                     }
                 }
@@ -747,17 +740,10 @@ async fn recv_file_list_and_data_phase(
                     let tokens = std::mem::take(&mut delta_tokens);
                     let outcome =
                         handle_end_of_file(dest_storage, &entry, source_hash, tokens, Bytes::new(), progress).await;
-                    let (ack, is_terminal) = decide_file_ack(&mut attempts, ndx, outcome);
-                    if matches!(ack, ReceiverMsg::Error { .. }) {
-                        progress.error_count.fetch_add(1, Ordering::Relaxed);
-                    }
-                    let _ = transport.send(ack).await;
-                    if is_terminal {
-                        completed_count += 1;
-                        if transfer_done_seen && completed_count >= requested_count {
-                            info!("[Receiver Remote] All transfers complete");
-                            break;
-                        }
+                    if dispatch_file_outcome(transport, &mut attempts, progress, ndx, outcome).await
+                        && complete_ndx(&mut completed_count, requested_count, transfer_done_seen)
+                    {
+                        break;
                     }
                 }
             }
@@ -811,11 +797,7 @@ async fn recv_file_list_and_data_phase(
                 let _ = transport.send(ack).await;
             }
             DcAck::FileOutcome { ndx, outcome } => {
-                let (ack, _) = decide_file_ack(&mut attempts, ndx, outcome);
-                if matches!(ack, ReceiverMsg::Error { .. }) {
-                    progress.error_count.fetch_add(1, Ordering::Relaxed);
-                }
-                let _ = transport.send(ack).await;
+                let _ = dispatch_file_outcome(transport, &mut attempts, progress, ndx, outcome).await;
             }
         }
     }
@@ -864,6 +846,32 @@ fn decide_file_ack(attempts: &mut HashMap<i32, u8>, ndx: i32, outcome: FileOutco
         }
         FileOutcome::HardError(reason) => (ReceiverMsg::Error { ndx, reason }, true),
     }
+}
+
+/// `FileOutcome` 上报的统一处理入口（dc task 全量路径 / delta inline 路径共用）：
+/// 调用 `decide_file_ack` 做 redo 决策，终态为 `Error` 时累加 `progress.error_count`，
+/// 把决策结果发回 Sender。返回 `is_terminal`，调用方据此决定是否 `complete_ndx`。
+async fn dispatch_file_outcome(
+    transport: &(dyn ReceiverTransport + 'static), attempts: &mut HashMap<i32, u8>, progress: &Arc<ReceiverProgress>,
+    ndx: i32, outcome: FileOutcome,
+) -> bool {
+    let (ack, is_terminal) = decide_file_ack(attempts, ndx, outcome);
+    if matches!(ack, ReceiverMsg::Error { .. }) {
+        progress.error_count.fetch_add(1, Ordering::Relaxed);
+    }
+    let _ = transport.send(ack).await;
+    is_terminal
+}
+
+/// 完成一次 ndx 级传输：`completed_count += 1`；若已见过 `TransferDone` 且计数打平，
+/// 返回 `true`（调用方应 break 主循环收尾）。
+fn complete_ndx(completed_count: &mut u64, requested_count: u64, transfer_done_seen: bool) -> bool {
+    *completed_count += 1;
+    if transfer_done_seen && *completed_count >= requested_count {
+        info!("[Receiver Remote] All transfers complete");
+        return true;
+    }
+    false
 }
 
 /// `EndOfFile` 处理（delta inline 路径）：重建文件字节（delta 或全量） → hash 校验 → 写入目标端
