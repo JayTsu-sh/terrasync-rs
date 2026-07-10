@@ -13,7 +13,7 @@ use data_mover::{CommitCallback, DataChunk, EntryEnum, StorageEnum, StreamHandle
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tracing::{debug, error, warn};
-use transport::message::{DiskCommitMsg, ReceiverMsg, SessionConfig};
+use transport::message::{DcAck, DiskCommitMsg, FileOutcome, ReceiverMsg, SessionConfig};
 
 // 内部模块
 use crate::byte_resume::part_path_for;
@@ -40,7 +40,7 @@ struct ActiveFile {
 /// 通过 `ack_tx` 发送 `ReceiverMsg::EntrySuccess` / `EntryError`。
 pub async fn disk_commit_task(
     dest: Arc<StorageEnum>, session: SessionConfig, mut rx: mpsc::Receiver<DiskCommitMsg>,
-    ack_tx: mpsc::UnboundedSender<ReceiverMsg>, progress: Arc<ReceiverProgress>,
+    ack_tx: mpsc::UnboundedSender<DcAck>, progress: Arc<ReceiverProgress>,
 ) -> Result<()> {
     let mut active: Option<ActiveFile> = None;
 
@@ -52,21 +52,21 @@ pub async fn disk_commit_task(
                 }
                 let _ = dest.set_entry_metadata(&entry).await;
                 progress.dirs_created.fetch_add(1, Ordering::Relaxed);
-                let _ = ack_tx.send(ReceiverMsg::EntrySuccess { entry });
+                let _ = ack_tx.send(DcAck::Entry(ReceiverMsg::EntrySuccess { entry }));
             }
             DiskCommitMsg::CreateSymlink { entry, target } => match dest.create_symlink(&entry, &target).await {
                 Ok(()) => {
                     progress.files_transferred.fetch_add(1, Ordering::Relaxed);
-                    let _ = ack_tx.send(ReceiverMsg::EntrySuccess { entry });
+                    let _ = ack_tx.send(DcAck::Entry(ReceiverMsg::EntrySuccess { entry }));
                 }
                 Err(e) => {
-                    let _ = ack_tx.send(ReceiverMsg::EntryError {
+                    let _ = ack_tx.send(DcAck::Entry(ReceiverMsg::EntryError {
                         entry,
                         reason: format!("{e}"),
-                    });
+                    }));
                 }
             },
-            DiskCommitMsg::FileBegin { entry } => {
+            DiskCommitMsg::FileBegin { ndx, entry } => {
                 let part_path = part_path_for(entry.get_relative_path());
                 match StorageEnum::resume_prepare(&dest, &entry, &part_path, false).await {
                     Ok((_missing, handle)) => {
@@ -90,15 +90,15 @@ pub async fn disk_commit_task(
                     }
                     Err(e) => {
                         error!("[dc] resume_prepare {:?}: {}", entry.get_relative_path(), e);
-                        let _ = ack_tx.send(ReceiverMsg::EntryError {
-                            entry,
-                            reason: format!("{e}"),
+                        let _ = ack_tx.send(DcAck::FileOutcome {
+                            ndx,
+                            outcome: FileOutcome::HardError(format!("{e}")),
                         });
                     }
                 }
             }
             DiskCommitMsg::FileChunk { entry, chunk } => {
-                // 保留 active：后续 FileCommit 仍需 join 写任务并发出那唯一的真实 EntryError。
+                // 保留 active：后续 FileCommit 仍需 join 写任务并上报那唯一的真实 outcome。
                 // 写任务已死时每个残余 chunk 都会 send 失败，故降为 debug 避免刷屏。
                 if let Some(a) = active.as_ref()
                     && a.tx_inner.send(chunk).await.is_err()
@@ -106,11 +106,15 @@ pub async fn disk_commit_task(
                     debug!("[dc] write channel closed early for {:?}", entry.get_relative_path());
                 }
             }
-            DiskCommitMsg::FileCommit { entry, source_hash } => {
+            DiskCommitMsg::FileCommit {
+                ndx,
+                entry,
+                source_hash,
+            } => {
                 if let Some(a) = active.take() {
-                    finalize_file(&dest, &session, a, source_hash, &ack_tx, &progress).await;
+                    finalize_file(&dest, &session, ndx, a, source_hash, &ack_tx, &progress).await;
                 } else {
-                    // FileBegin 失败时已发过唯一的 EntryError，这里不再重复 ack，只记日志。
+                    // FileBegin 失败时已上报过唯一的 outcome，这里不再重复上报，只记日志。
                     warn!("[dc] FileCommit without active stream: {:?}", entry.get_relative_path());
                 }
             }
@@ -139,11 +143,14 @@ pub async fn disk_commit_task(
 }
 
 /// 提交单个文件：关闭写 channel → 等写任务收尾 → 读回 `.part` hash 校验 →
-/// `commit_chunk_stream`（原子 rename）→ `set_metadata` → 发送 ack。
-/// 任一步失败：删除 `.part` 并发送 `EntryError`。
+/// `commit_chunk_stream`（原子 rename）→ `set_metadata` → 上报 outcome。
+///
+/// 任一步失败：删除 `.part` 并上报 `FileOutcome`（hash 不符为 `HashMismatch`，可 redo；
+/// 其余为 `HardError`，不可 redo）；是否触发 redo 由 Receiver 主 task 统一决策，本函数
+/// 不再直接发终态 `ReceiverMsg`。
 async fn finalize_file(
-    dest: &Arc<StorageEnum>, session: &SessionConfig, a: ActiveFile, source_hash: Option<String>,
-    ack_tx: &mpsc::UnboundedSender<ReceiverMsg>, progress: &Arc<ReceiverProgress>,
+    dest: &Arc<StorageEnum>, session: &SessionConfig, ndx: i32, a: ActiveFile, source_hash: Option<String>,
+    ack_tx: &mpsc::UnboundedSender<DcAck>, progress: &Arc<ReceiverProgress>,
 ) {
     let ActiveFile {
         entry,
@@ -164,9 +171,9 @@ async fn finalize_file(
     if let Err(e) = write_result {
         error!("[dc] write {:?}: {}", entry.get_relative_path(), e);
         remove_part(dest, &entry, &part_path).await;
-        let _ = ack_tx.send(ReceiverMsg::EntryError {
-            entry,
-            reason: format!("{e}"),
+        let _ = ack_tx.send(DcAck::FileOutcome {
+            ndx,
+            outcome: FileOutcome::HardError(format!("{e}")),
         });
         return;
     }
@@ -185,17 +192,17 @@ async fn finalize_file(
                     expected
                 );
                 remove_part(dest, &entry, &part_path).await;
-                let _ = ack_tx.send(ReceiverMsg::EntryError {
-                    entry,
-                    reason: "hash mismatch".into(),
+                let _ = ack_tx.send(DcAck::FileOutcome {
+                    ndx,
+                    outcome: FileOutcome::HashMismatch,
                 });
                 return;
             }
             Err(e) => {
                 remove_part(dest, &entry, &part_path).await;
-                let _ = ack_tx.send(ReceiverMsg::EntryError {
-                    entry,
-                    reason: format!("hash read-back: {e}"),
+                let _ = ack_tx.send(DcAck::FileOutcome {
+                    ndx,
+                    outcome: FileOutcome::HardError(format!("hash read-back: {e}")),
                 });
                 return;
             }
@@ -206,9 +213,9 @@ async fn finalize_file(
     if let Err(e) = StorageEnum::commit_chunk_stream(dest, &entry, size, handle).await {
         error!("[dc] commit {:?}: {}", entry.get_relative_path(), e);
         remove_part(dest, &entry, &part_path).await;
-        let _ = ack_tx.send(ReceiverMsg::EntryError {
-            entry,
-            reason: format!("{e}"),
+        let _ = ack_tx.send(DcAck::FileOutcome {
+            ndx,
+            outcome: FileOutcome::HardError(format!("{e}")),
         });
         return;
     }
@@ -216,7 +223,10 @@ async fn finalize_file(
     let _ = dest.set_entry_metadata(&entry).await;
     progress.files_transferred.fetch_add(1, Ordering::Relaxed);
     progress.bytes_transferred.fetch_add(size, Ordering::Relaxed);
-    let _ = ack_tx.send(ReceiverMsg::EntrySuccess { entry });
+    let _ = ack_tx.send(DcAck::FileOutcome {
+        ndx,
+        outcome: FileOutcome::Success,
+    });
 }
 
 /// 删除残留的 `.part` 文件。data-mover 的删除 API 以 `EntryEnum` 为参，

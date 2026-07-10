@@ -3,17 +3,8 @@
 //! 对 basis file（目标端已有文件）按 `block_size` 切分，
 //! 每个 block 计算 (`rolling_checksum`, `BLAKE3_truncated_16`) 签名对。
 
-use crate::BlockSignature;
 use crate::rolling::RollingChecksum;
-
-/// 计算 BLAKE3 并截断为 16 字节
-fn blake3_truncated_16(data: &[u8]) -> [u8; 16] {
-    let hash = blake3::hash(data);
-    let bytes = hash.as_bytes();
-    let mut result = [0u8; 16];
-    result.copy_from_slice(&bytes[..16]);
-    result
-}
+use crate::{BlockSignature, blake3_truncated};
 
 /// 对 basis file 数据计算所有 block 的签名
 ///
@@ -33,7 +24,7 @@ pub fn compute_block_signatures(data: &[u8], block_size: u32) -> Vec<BlockSignat
         let block = &data[offset..end];
 
         let rolling = RollingChecksum::checksum(block);
-        let strong = blake3_truncated_16(block);
+        let strong = blake3_truncated(block);
 
         signatures.push(BlockSignature { rolling, strong });
         offset = end;

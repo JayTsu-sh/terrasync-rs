@@ -8,7 +8,7 @@ use app::disk_commit::disk_commit_task;
 use app::receiver::ReceiverProgress;
 use bytes::Bytes;
 use data_mover::{DataChunk, EntryEnum, NASEntry, StorageEnum, create_storage};
-use transport::message::{DiskCommitMsg, ReceiverMsg, SessionConfig};
+use transport::message::{DcAck, DiskCommitMsg, FileOutcome, ReceiverMsg, SessionConfig};
 
 // ============================================================
 // disk_commit_task 测试辅助
@@ -85,8 +85,9 @@ fn chunkify(bytes: &[u8], chunk_size: usize) -> Vec<(u64, Bytes)> {
     out
 }
 
-// 起 disk_commit_task，喂消息，收集 ack ReceiverMsg。
-async fn run_dc(dest: Arc<StorageEnum>, session: SessionConfig, msgs: Vec<DiskCommitMsg>) -> Vec<ReceiverMsg> {
+// 起 disk_commit_task，喂消息，收集 ack DcAck（目录/符号链接透传 ReceiverMsg；
+// 文件传输结果为 FileOutcome，redo 决策已上移到 Receiver 主 task，dc task 只上报 outcome）。
+async fn run_dc(dest: Arc<StorageEnum>, session: SessionConfig, msgs: Vec<DiskCommitMsg>) -> Vec<DcAck> {
     let (dc_tx, dc_rx) = tokio::sync::mpsc::channel(16);
     let (ack_tx, mut ack_rx) = tokio::sync::mpsc::unbounded_channel();
     let progress = Arc::new(ReceiverProgress::new());
@@ -116,7 +117,10 @@ async fn dc_writes_full_file_and_acks_success() {
         DiskCommitMsg::CreateDir {
             entry: dir_entry("sub"),
         },
-        DiskCommitMsg::FileBegin { entry: entry.clone() },
+        DiskCommitMsg::FileBegin {
+            ndx: 0,
+            entry: entry.clone(),
+        },
     ];
     for (off, c) in chunkify(&bytes, 1 << 20) {
         msgs.push(DiskCommitMsg::FileChunk {
@@ -125,12 +129,25 @@ async fn dc_writes_full_file_and_acks_success() {
         });
     }
     msgs.push(DiskCommitMsg::FileCommit {
+        ndx: 0,
         entry: entry.clone(),
         source_hash: Some(src_hash),
     });
 
     let acks = run_dc(dest, session, msgs).await;
-    assert!(acks.iter().any(|a| matches!(a, ReceiverMsg::EntrySuccess { .. })));
+    // CreateDir：无 redo 语义，直接透传 EntrySuccess
+    assert!(
+        acks.iter()
+            .any(|a| matches!(a, DcAck::Entry(ReceiverMsg::EntrySuccess { .. })))
+    );
+    // FileCommit 校验通过：上报 FileOutcome::Success（不再是 dc task 自行发的 EntrySuccess）
+    assert!(acks.iter().any(|a| matches!(
+        a,
+        DcAck::FileOutcome {
+            ndx: 0,
+            outcome: FileOutcome::Success
+        }
+    )));
     // 最终文件内容正确
     assert_eq!(std::fs::read(tmp.path().join("sub/f.bin")).unwrap(), bytes);
     // .part 已 rename 掉
@@ -146,7 +163,10 @@ async fn dc_hash_mismatch_rejects_and_cleans_part() {
     let dest = local_storage(tmp.path()).await;
     let (entry, bytes) = entry_for(tmp.path(), "f.bin", 2 * 1024 * 1024);
     let session = session_cfg(true);
-    let mut msgs = vec![DiskCommitMsg::FileBegin { entry: entry.clone() }];
+    let mut msgs = vec![DiskCommitMsg::FileBegin {
+        ndx: 0,
+        entry: entry.clone(),
+    }];
     for (off, c) in chunkify(&bytes, 1 << 20) {
         msgs.push(DiskCommitMsg::FileChunk {
             entry: entry.clone(),
@@ -155,12 +175,20 @@ async fn dc_hash_mismatch_rejects_and_cleans_part() {
     }
     // 注入错误 hash（64 位 hex，长度对但值错）
     msgs.push(DiskCommitMsg::FileCommit {
+        ndx: 0,
         entry: entry.clone(),
         source_hash: Some("deadbeef".repeat(8)),
     });
 
     let acks = run_dc(dest, session, msgs).await;
-    assert!(acks.iter().any(|a| matches!(a, ReceiverMsg::EntryError { .. })));
+    // dc task 不再自行决定 redo/error，只如实上报 HashMismatch；由 Receiver 主 task 决策
+    assert!(acks.iter().any(|a| matches!(
+        a,
+        DcAck::FileOutcome {
+            ndx: 0,
+            outcome: FileOutcome::HashMismatch
+        }
+    )));
     // 不产生最终文件
     assert!(!tmp.path().join("f.bin").exists());
     // .part 已删除
@@ -179,15 +207,25 @@ async fn dc_zero_byte_file() {
         dest,
         session,
         vec![
-            DiskCommitMsg::FileBegin { entry: entry.clone() },
+            DiskCommitMsg::FileBegin {
+                ndx: 0,
+                entry: entry.clone(),
+            },
             DiskCommitMsg::FileCommit {
+                ndx: 0,
                 entry: entry.clone(),
                 source_hash: None,
             },
         ],
     )
     .await;
-    assert!(acks.iter().any(|a| matches!(a, ReceiverMsg::EntrySuccess { .. })));
+    assert!(acks.iter().any(|a| matches!(
+        a,
+        DcAck::FileOutcome {
+            ndx: 0,
+            outcome: FileOutcome::Success
+        }
+    )));
     assert_eq!(std::fs::metadata(tmp.path().join("empty.bin")).unwrap().len(), 0);
 }
 
@@ -205,7 +243,10 @@ async fn dc_creates_symlink() {
         }],
     )
     .await;
-    assert!(acks.iter().any(|a| matches!(a, ReceiverMsg::EntrySuccess { .. })));
+    assert!(
+        acks.iter()
+            .any(|a| matches!(a, DcAck::Entry(ReceiverMsg::EntrySuccess { .. })))
+    );
     let lm = std::fs::symlink_metadata(tmp.path().join("link.txt")).unwrap();
     assert!(lm.file_type().is_symlink());
     assert_eq!(
@@ -225,6 +266,7 @@ async fn dc_bare_commit_no_active_produces_no_ack() {
         dest,
         session_cfg(true),
         vec![DiskCommitMsg::FileCommit {
+            ndx: 0,
             entry,
             source_hash: Some("deadbeef".repeat(8)),
         }],
@@ -243,7 +285,10 @@ async fn dc_abort_file_drops_part_no_ack() {
     let tmp = tempfile::tempdir().unwrap();
     let dest = local_storage(tmp.path()).await;
     let (entry, bytes) = entry_for(tmp.path(), "aborted.bin", 2 * 1024 * 1024);
-    let mut msgs = vec![DiskCommitMsg::FileBegin { entry: entry.clone() }];
+    let mut msgs = vec![DiskCommitMsg::FileBegin {
+        ndx: 0,
+        entry: entry.clone(),
+    }];
     for (off, c) in chunkify(&bytes, 1 << 20) {
         msgs.push(DiskCommitMsg::FileChunk {
             entry: entry.clone(),

@@ -5,6 +5,7 @@
 //! 双进程模式下 Receiver 仅拥有 dest storage（数据流模式，Phase 3）。
 
 // 标准库
+use std::collections::{HashMap, HashSet};
 use std::path::{Component, Path};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -17,8 +18,8 @@ use tokio::sync::mpsc::Receiver as MpscReceiver;
 use tracing::{Instrument, debug, error, info, info_span, trace, warn};
 use transport::error::TransportError;
 use transport::message::{
-    DestIndex, DiskCommitMsg, FeatureFlags, HandshakeResult, NdxTable, ProgressSnapshot, ProtocolHandshake,
-    ReceiverMsg, SenderMsg, SessionConfig,
+    DcAck, DestIndex, DiskCommitMsg, FeatureFlags, FileOutcome, HandshakeResult, NdxTable, ProgressSnapshot,
+    ProtocolHandshake, ReceiverMsg, SenderMsg, SessionConfig,
 };
 use transport::traits::ReceiverTransport;
 
@@ -164,7 +165,7 @@ pub async fn receiver_task(
                 break;
             }
 
-            SenderMsg::EntryError { path, reason } => {
+            SenderMsg::EntryError { path, reason, .. } => {
                 error!("[Receiver] Sender reported error for {}: {}", path.display(), reason);
             }
 
@@ -468,6 +469,12 @@ async fn recv_file_list_and_data_phase(
 ) -> Result<()> {
     info!("[Receiver Remote] Receiving file list and file data (pipelined, streaming mode)");
     let mut ndx_table = NdxTable::new();
+    // ndx 级失败尝试计数（redo 决策用）：ndx → 已失败次数，见 decide_file_ack
+    let mut attempts: HashMap<i32, u8> = HashMap::new();
+    // 已终结的 ndx：redo 期间 dc task（全量路径 HardError）与 Sender 自检失败
+    // （SenderMsg::EntryError）可能各自独立上报同一 ndx 的终态，按 ndx 去重只在首次
+    // 生效，防止 completed_count 被多次计入导致主循环提前 break、丢在途文件（[1]）。
+    let mut terminated: HashSet<i32> = HashSet::new();
     // delta 重建 token 缓冲
     let mut delta_tokens: Vec<sync_delta::DeltaToken> = Vec::new();
     // TransferDone 与实际数据完成的解耦计数（见函数文档）
@@ -483,7 +490,7 @@ async fn recv_file_list_and_data_phase(
     // disk-commit task：全量文件三段流式落盘（去整文件 BytesMut）；ack 经 unbounded channel 回流，
     // 避免路由 select 阻在 dc_tx.send 时不 drain ack → dc 阻在 ack_tx.send 的双向死锁。
     let (dc_tx, dc_rx) = tokio::sync::mpsc::channel::<DiskCommitMsg>(16);
-    let (ack_tx, mut ack_rx) = tokio::sync::mpsc::unbounded_channel::<ReceiverMsg>();
+    let (ack_tx, mut ack_rx) = tokio::sync::mpsc::unbounded_channel::<DcAck>();
     let dc_join = tokio::spawn(crate::disk_commit::disk_commit_task(
         dest_storage.clone(),
         session_config.clone(),
@@ -498,13 +505,35 @@ async fn recv_file_list_and_data_phase(
             Some(snapshot) = progress_rx.recv() => {
                 let _ = transport.send(ReceiverMsg::Progress(snapshot)).await;
             }
-            // ── disk-commit task 回流的全量文件 ack（每个文件 FileCommit 成功/失败各一条）──
-            Some(ack) = ack_rx.recv() => {
-                let _ = transport.send(ack).await;
-                completed_count += 1;
-                if transfer_done_seen && completed_count >= requested_count {
-                    info!("[Receiver Remote] All transfers complete");
-                    break;
+            // ── disk-commit task 回流的 ack（目录/符号链接直接透传；全量文件 outcome
+            //    交 decide_file_ack 做统一 redo 决策）──
+            Some(dc_ack) = ack_rx.recv() => {
+                match dc_ack {
+                    DcAck::Entry(ack) => {
+                        let _ = transport.send(ack).await;
+                        completed_count += 1;
+                        if transfer_done_seen && completed_count >= requested_count {
+                            info!("[Receiver Remote] All transfers complete");
+                            break;
+                        }
+                    }
+                    DcAck::FileOutcome { ndx, outcome } => {
+                        if dispatch_file_outcome(
+                            transport,
+                            &mut attempts,
+                            &mut terminated,
+                            progress,
+                            ndx,
+                            outcome,
+                            &mut completed_count,
+                            requested_count,
+                            transfer_done_seen,
+                        )
+                        .await
+                        {
+                            break;
+                        }
+                    }
                 }
             }
             msg = transport.recv() => { match msg {
@@ -645,10 +674,10 @@ async fn recv_file_list_and_data_phase(
             }
 
             // ── 文件开始：标记走全量流式路径，交 disk-commit task 起 resume_prepare + write_chunk_stream ──
-            Some(SenderMsg::FileBegin { entry }) => {
+            Some(SenderMsg::FileBegin { ndx, entry }) => {
                 full_active = true;
                 delta_tokens.clear();
-                let _ = dc_tx.send(DiskCommitMsg::FileBegin { entry }).await;
+                let _ = dc_tx.send(DiskCommitMsg::FileBegin { ndx, entry }).await;
             }
 
             // ── 数据流模式：目录 ──
@@ -715,17 +744,37 @@ async fn recv_file_list_and_data_phase(
             }
 
             // ── 文件结束：见过 FileBegin → 全量交 disk-commit task 收尾（读回 .part hash 校验 → 原子
-            //    rename），completed_count 在 dc ack 回流时才 +1；否则走 delta inline 重建（保持原逻辑）──
-            Some(SenderMsg::EndOfFile { entry, source_hash }) => {
+            //    rename），completed_count 在 dc ack 回流时才 +1；否则走 delta inline 重建，outcome
+            //    同样交 decide_file_ack 做统一 redo 决策（与全量路径共用一份状态机）──
+            Some(SenderMsg::EndOfFile { ndx, entry, source_hash }) => {
                 if full_active {
                     full_active = false;
-                    let _ = dc_tx.send(DiskCommitMsg::FileCommit { entry, source_hash }).await;
+                    let _ = dc_tx.send(DiskCommitMsg::FileCommit { ndx, entry, source_hash }).await;
                 } else {
                     let tokens = std::mem::take(&mut delta_tokens);
-                    handle_end_of_file(transport, dest_storage, entry, source_hash, tokens, Bytes::new(), progress).await;
-                    completed_count += 1;
-                    if transfer_done_seen && completed_count >= requested_count {
-                        info!("[Receiver Remote] All transfers complete");
+                    let outcome = handle_end_of_file(
+                        dest_storage,
+                        &entry,
+                        source_hash,
+                        tokens,
+                        Bytes::new(),
+                        progress,
+                        session_config.enable_integrity_check,
+                    )
+                    .await;
+                    if dispatch_file_outcome(
+                        transport,
+                        &mut attempts,
+                        &mut terminated,
+                        progress,
+                        ndx,
+                        outcome,
+                        &mut completed_count,
+                        requested_count,
+                        transfer_done_seen,
+                    )
+                    .await
+                    {
                         break;
                     }
                 }
@@ -751,13 +800,24 @@ async fn recv_file_list_and_data_phase(
                     break;
                 }
             }
-            // ── Sender 源读失败：中止正在写入的文件（丢弃 .part，dc 不发 ack），并计一次完成 ──
-            Some(SenderMsg::EntryError { path, reason }) => {
+            // ── Sender 自检失败（源读/符号链接读失败）：中止正在写入的文件（丢弃 .part，
+            //    dc 不发 ack）。Sender 已在本地自增 error_count，这里只完成该 ndx 的
+            //    计数、不回发 ReceiverMsg::Error（避免与 Sender 自增重复）；按 ndx 去重
+            //    防止与 dc task 独立上报的终态重复计数（[1]）──
+            Some(SenderMsg::EntryError { path, reason, ndx }) => {
                 warn!("[Receiver Remote] Sender EntryError {:?}: {} — 中止该文件", path, reason);
                 full_active = false;
                 let _ = dc_tx.send(DiskCommitMsg::AbortFile).await;
-                completed_count += 1;
-                if transfer_done_seen && completed_count >= requested_count {
+                let should_break = if let Some(ndx) = ndx {
+                    record_ndx_completion(&mut terminated, ndx, &mut completed_count, requested_count, transfer_done_seen)
+                } else {
+                    // 双进程主循环下理应总带 ndx（单进程 tar 打包失败等无 ndx 场景走
+                    // receiver_task，不会到这里）；防御性兜底：仍完成一次计数，避免缺失
+                    // 关联导致 completed_count 永远打不平。
+                    completed_count += 1;
+                    transfer_done_seen && completed_count >= requested_count
+                };
+                if should_break {
                     info!("[Receiver Remote] All transfers complete");
                     break;
                 }
@@ -774,8 +834,26 @@ async fn recv_file_list_and_data_phase(
     dc_join
         .await
         .map_err(|e| AppError::CopyError(format!("disk-commit task join: {e}")))??;
-    while let Ok(ack) = ack_rx.try_recv() {
-        let _ = transport.send(ack).await;
+    while let Ok(dc_ack) = ack_rx.try_recv() {
+        match dc_ack {
+            DcAck::Entry(ack) => {
+                let _ = transport.send(ack).await;
+            }
+            DcAck::FileOutcome { ndx, outcome } => {
+                let _ = dispatch_file_outcome(
+                    transport,
+                    &mut attempts,
+                    &mut terminated,
+                    progress,
+                    ndx,
+                    outcome,
+                    &mut completed_count,
+                    requested_count,
+                    transfer_done_seen,
+                )
+                .await;
+            }
+        }
     }
 
     // 回写目录 mtime/mode：所有文件已落盘,此时设目录元数据不会再被子文件写入顶掉。
@@ -792,15 +870,97 @@ async fn recv_file_list_and_data_phase(
     Ok(())
 }
 
-/// `EndOfFile` 处理：重建文件字节（delta 或全量） → hash 校验 → 写入目标端 → 发送 Ack
+/// ndx 级文件传输 redo 决策（方案 A 的统一决策点）
 ///
-/// `tokens` 非空时执行 delta 重建，为空时直接使用 `file_data`。
-/// 所有非致命错误（basis 读失败、hash 不符、写入失败）均自行发送 `EntryError` 后返回，不向上传播。
+/// dc task（全量路径）与 `handle_end_of_file`（delta inline 路径）上报的 outcome
+/// 在此统一转换为终态/重试 ack：
+/// - 校验失败（`HashMismatch`）·首次 → `Redo{ndx}`，不计入 `completed_count`（文件仍在途）。
+/// - 校验失败·二次+ → `Error{ndx,"hash mismatch"}`，计入 `completed_count`。
+/// - 校验通过（`Success`）→ `Success{ndx}`，计入 `completed_count`。
+/// - 硬错误（`HardError`，非 hash 类）→ 直接 `Error{ndx,reason}` 终态，不 redo。
+///
+/// 返回 `(ack, is_terminal)`：`is_terminal=true` 时调用方需计入 `completed_count`。
+fn decide_file_ack(attempts: &mut HashMap<i32, u8>, ndx: i32, outcome: FileOutcome) -> (ReceiverMsg, bool) {
+    match outcome {
+        FileOutcome::Success => (ReceiverMsg::Success { ndx }, true),
+        FileOutcome::HashMismatch => {
+            let count = attempts.entry(ndx).or_insert(0);
+            *count += 1;
+            if *count >= 2 {
+                (
+                    ReceiverMsg::Error {
+                        ndx,
+                        reason: "hash mismatch".into(),
+                    },
+                    true,
+                )
+            } else {
+                (ReceiverMsg::Redo { ndx }, false)
+            }
+        }
+        FileOutcome::HardError(reason) => (ReceiverMsg::Error { ndx, reason }, true),
+    }
+}
+
+/// `FileOutcome` 上报的统一处理入口（dc task 全量路径 / delta inline 路径共用）：
+/// 调用 `decide_file_ack` 做 redo 决策；非终态（`Redo`）直接发 ack、不动
+/// `completed_count`。终态先按 `ndx` 去重（redo 期间 dc task 与 Sender 自检失败
+/// 可能各自独立上报同一 ndx 的终态，去重只在首次生效，见 [`record_ndx_completion`]）：
+/// 去重命中则连 ack 都不再发（避免 Sender 收到同一 ndx 的重复终态 ack），否则累加
+/// `progress.error_count`（若为 `Error`）、发 ack、计入 `completed_count`。
+///
+/// 返回是否应 break 主循环（`completed_count` 打平且已见过 `TransferDone`）。
+#[allow(clippy::too_many_arguments)]
+async fn dispatch_file_outcome(
+    transport: &(dyn ReceiverTransport + 'static), attempts: &mut HashMap<i32, u8>, terminated: &mut HashSet<i32>,
+    progress: &Arc<ReceiverProgress>, ndx: i32, outcome: FileOutcome, completed_count: &mut u64, requested_count: u64,
+    transfer_done_seen: bool,
+) -> bool {
+    let (ack, is_terminal) = decide_file_ack(attempts, ndx, outcome);
+    if !is_terminal {
+        let _ = transport.send(ack).await;
+        return false;
+    }
+    if terminated.contains(&ndx) {
+        debug!("[Receiver Remote] ndx {} 已终结，丢弃重复终态: {:?}", ndx, ack);
+        return false;
+    }
+    if matches!(ack, ReceiverMsg::Error { .. }) {
+        progress.error_count.fetch_add(1, Ordering::Relaxed);
+    }
+    let _ = transport.send(ack).await;
+    record_ndx_completion(terminated, ndx, completed_count, requested_count, transfer_done_seen)
+}
+
+/// ndx 首次终结时计入 `completed_count` 并判断是否应收尾 break；同一 ndx 的重复终结
+/// （已在 `terminated` 中）直接丢弃、返回 `false`，防止 redo 期间多个来源独立上报
+/// 同一 ndx 导致 `completed_count` 被多次计入、主循环提前 break 丢在途文件（[1]）。
+fn record_ndx_completion(
+    terminated: &mut HashSet<i32>, ndx: i32, completed_count: &mut u64, requested_count: u64, transfer_done_seen: bool,
+) -> bool {
+    if !terminated.insert(ndx) {
+        return false;
+    }
+    *completed_count += 1;
+    if transfer_done_seen && *completed_count >= requested_count {
+        info!("[Receiver Remote] All transfers complete");
+        return true;
+    }
+    false
+}
+
+/// `EndOfFile` 处理（delta inline 路径）：重建文件字节（delta 或全量） → hash 校验 → 写入目标端
+///
+/// `tokens` 非空时执行 delta 重建，为空时直接使用 `file_data`。返回 `FileOutcome`，不再自行
+/// 发送终态 ack —— 调用方通过 `decide_file_ack` 统一做 redo 决策（与全量路径共用一份状态机）。
+///
+/// `enable_integrity_check=false` 时跳过 hash 校验（与全量路径 `disk_commit.rs::finalize_file`
+/// 的门控行为一致），避免关闭校验后仍因 hash 不符触发多余 redo。
 async fn handle_end_of_file(
-    transport: &(dyn ReceiverTransport + 'static), dest_storage: &Arc<StorageEnum>, entry: Arc<data_mover::EntryEnum>,
-    source_hash: Option<String>, tokens: Vec<sync_delta::DeltaToken>, file_data: bytes::Bytes,
-    progress: &Arc<ReceiverProgress>,
-) {
+    dest_storage: &Arc<StorageEnum>, entry: &Arc<data_mover::EntryEnum>, source_hash: Option<String>,
+    tokens: Vec<sync_delta::DeltaToken>, file_data: bytes::Bytes, progress: &Arc<ReceiverProgress>,
+    enable_integrity_check: bool,
+) -> FileOutcome {
     let relative_path = entry.get_relative_path();
 
     if let Err(e) = validate_relative_path(relative_path) {
@@ -808,13 +968,7 @@ async fn handle_end_of_file(
             "[Receiver Remote] Rejecting unsafe relative path {:?}: {}",
             relative_path, e
         );
-        let _ = transport
-            .send(ReceiverMsg::EntryError {
-                entry,
-                reason: format!("{e}"),
-            })
-            .await;
-        return;
+        return FileOutcome::HardError(format!("{e}"));
     }
 
     // 重建文件字节：delta 或全量
@@ -827,60 +981,42 @@ async fn handle_end_of_file(
             tokens.len()
         );
         let size = entry.get_size();
-        match StorageEnum::read_file_from(dest_storage, &entry, size).await {
+        match StorageEnum::read_file_from(dest_storage, entry, size).await {
             Ok(basis_data) => {
                 let block_size = sync_delta::calculate_block_size(size);
                 bytes::Bytes::from(sync_delta::reconstruct::reconstruct(&basis_data, &tokens, block_size))
             }
             Err(e) => {
                 error!("[Receiver Remote] read basis failed {:?}: {}", relative_path, e);
-                let _ = transport
-                    .send(ReceiverMsg::EntryError {
-                        entry,
-                        reason: format!("{e}"),
-                    })
-                    .await;
-                return;
+                return FileOutcome::HardError(format!("{e}"));
             }
         }
     };
 
-    // 验证 hash
-    if let Some(ref expected_hash) = source_hash {
+    // 验证 hash（与全量路径一致：仅在 enable_integrity_check 时校验）
+    if enable_integrity_check && let Some(ref expected_hash) = source_hash {
         let actual_hash = blake3::hash(&file_bytes).to_hex().to_string();
         if &actual_hash != expected_hash {
             error!(
                 "[Receiver Remote] Hash mismatch {:?}: expected {}, got {}",
                 relative_path, expected_hash, actual_hash
             );
-            let _ = transport
-                .send(ReceiverMsg::EntryError {
-                    entry,
-                    reason: "hash mismatch".into(),
-                })
-                .await;
-            return;
+            return FileOutcome::HashMismatch;
         }
     }
 
     // 写入文件
     let data_len = file_bytes.len() as u64;
-    match StorageEnum::write_file_from_bytes(dest_storage, &entry, file_bytes).await {
+    match StorageEnum::write_file_from_bytes(dest_storage, entry, file_bytes).await {
         Ok(()) => {
-            let _ = dest_storage.set_entry_metadata(&entry).await;
+            let _ = dest_storage.set_entry_metadata(entry).await;
             progress.files_transferred.fetch_add(1, Ordering::Relaxed);
             progress.bytes_transferred.fetch_add(data_len, Ordering::Relaxed);
-            let _ = transport.send(ReceiverMsg::EntrySuccess { entry }).await;
+            FileOutcome::Success
         }
         Err(e) => {
             error!("[Receiver Remote] write failed {:?}: {}", relative_path, e);
-            progress.error_count.fetch_add(1, Ordering::Relaxed);
-            let _ = transport
-                .send(ReceiverMsg::EntryError {
-                    entry,
-                    reason: format!("{e}"),
-                })
-                .await;
+            FileOutcome::HardError(format!("{e}"))
         }
     }
 }
@@ -907,5 +1043,65 @@ mod tests {
     #[test]
     fn validate_relative_path_rejects_absolute_path() {
         assert!(validate_relative_path(Path::new("/etc/passwd")).is_err());
+    }
+
+    // ── decide_file_ack：ndx 级 redo 决策纯函数单测（方案 A 的核心状态机） ──
+
+    #[test]
+    fn decide_file_ack_success_is_terminal() {
+        let mut attempts = HashMap::new();
+        let (ack, is_terminal) = decide_file_ack(&mut attempts, 7, FileOutcome::Success);
+        assert!(matches!(ack, ReceiverMsg::Success { ndx: 7 }));
+        assert!(is_terminal);
+    }
+
+    #[test]
+    fn decide_file_ack_first_hash_mismatch_redos_and_is_not_terminal() {
+        let mut attempts = HashMap::new();
+        let (ack, is_terminal) = decide_file_ack(&mut attempts, 3, FileOutcome::HashMismatch);
+        assert!(matches!(ack, ReceiverMsg::Redo { ndx: 3 }));
+        assert!(!is_terminal);
+        assert_eq!(attempts.get(&3), Some(&1));
+    }
+
+    #[test]
+    fn decide_file_ack_second_hash_mismatch_errors_and_is_terminal() {
+        let mut attempts = HashMap::new();
+        let (first_ack, first_terminal) = decide_file_ack(&mut attempts, 3, FileOutcome::HashMismatch);
+        assert!(matches!(first_ack, ReceiverMsg::Redo { ndx: 3 }));
+        assert!(!first_terminal);
+
+        let (second_ack, second_terminal) = decide_file_ack(&mut attempts, 3, FileOutcome::HashMismatch);
+        match second_ack {
+            ReceiverMsg::Error { ndx: 3, reason } => assert_eq!(reason, "hash mismatch"),
+            other => panic!("expected Error, got {other:?}"),
+        }
+        assert!(second_terminal);
+    }
+
+    #[test]
+    fn decide_file_ack_hard_error_is_terminal_without_redo() {
+        let mut attempts = HashMap::new();
+        let (ack, is_terminal) =
+            decide_file_ack(&mut attempts, 9, FileOutcome::HardError("resume_prepare failed".into()));
+        match ack {
+            ReceiverMsg::Error { ndx: 9, reason } => assert_eq!(reason, "resume_prepare failed"),
+            other => panic!("expected Error, got {other:?}"),
+        }
+        assert!(is_terminal);
+        // 硬错误不计入 attempts（不参与 redo 计数）
+        assert!(attempts.get(&9).is_none());
+    }
+
+    #[test]
+    fn decide_file_ack_different_ndx_track_attempts_independently() {
+        let mut attempts = HashMap::new();
+        let _ = decide_file_ack(&mut attempts, 1, FileOutcome::HashMismatch);
+        let (ack, is_terminal) = decide_file_ack(&mut attempts, 2, FileOutcome::HashMismatch);
+        assert!(
+            matches!(ack, ReceiverMsg::Redo { ndx: 2 }),
+            "ndx 2 应是首次失败，与 ndx 1 互不影响"
+        );
+        assert!(!is_terminal);
     }
 }
