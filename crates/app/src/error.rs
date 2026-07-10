@@ -1,5 +1,5 @@
 // 标准库
-// 无
+use std::path::PathBuf;
 
 // 外部crate
 use thiserror::Error;
@@ -76,6 +76,11 @@ pub enum AppError {
     /// 当字节级续传状态读写或解析失败时触发
     #[error("Checkpoint error: {0}")]
     CheckpointError(String),
+
+    /// 非法相对路径（Sender 提供的相对路径为绝对路径或含 `..` 组件）
+    /// 拒绝以该路径驱动目标端写操作，防止路径穿越
+    #[error("Unsafe relative path: {path:?}")]
+    UnsafeRelativePath { path: PathBuf },
 }
 
 /// 应用程序的结果类型别名

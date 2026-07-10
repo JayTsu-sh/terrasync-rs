@@ -135,6 +135,7 @@ tokio = { workspace = true }
 assert_cmd = "2.2.0"
 predicates = "3.1.4"
 serial_test = "3.4.0"
+tempfile = "3"
 
 # nfs-rs / smb 必须保留：data-mover 内部用 crates.io 写法引用它们（nfs-rs = "0.2.0"、smb = "0.12"），
 # data-mover 自身的 [patch.crates-io] 在被作为依赖引入时不生效，只有 workspace root 的 patch 才生效。

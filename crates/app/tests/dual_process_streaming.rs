@@ -6,68 +6,9 @@ use std::sync::Arc;
 
 use app::disk_commit::disk_commit_task;
 use app::receiver::ReceiverProgress;
-use bytes::{Bytes, BytesMut};
+use bytes::Bytes;
 use data_mover::{DataChunk, EntryEnum, NASEntry, StorageEnum, create_storage};
-use transport::in_process::create_in_process_pair;
-use transport::message::{DiskCommitMsg, ReceiverMsg, SenderMsg, SessionConfig};
-use transport::traits::{ReceiverTransport, SenderTransport};
-
-// 帮助函数：在临时目录建一个 Local StorageEnum 和一个 size 字节的确定性文件，返回 (storage, entry, bytes)
-async fn local_file(dir: &std::path::Path, name: &str, size: usize) -> (Arc<StorageEnum>, Arc<EntryEnum>, Vec<u8>) {
-    let bytes = vec![0xABu8; size];
-    tokio::fs::write(dir.join(name), &bytes).await.unwrap();
-
-    let storage = create_storage(&dir.to_string_lossy(), None, false).await.unwrap();
-    let entry = EntryEnum::NAS(NASEntry {
-        name: name.to_string(),
-        relative_path: PathBuf::from(name),
-        extension: None,
-        is_dir: false,
-        size: size as u64,
-        atime: 0,
-        ctime: 0,
-        mtime: 0,
-        mode: 0o644,
-        is_symlink: false,
-        hard_links: Some(1),
-        uid: None,
-        gid: None,
-        ino: None,
-        file_handle: None,
-        acl: None,
-        owner: None,
-        owner_group: None,
-        xattrs: None,
-    });
-
-    (Arc::new(storage), Arc::new(entry), bytes)
-}
-
-#[tokio::test]
-async fn sender_streams_file_and_sends_correct_hash() {
-    let tmp = tempfile::tempdir().unwrap();
-    let (src, entry, bytes) = local_file(tmp.path(), "big.bin", 9 * 1024 * 1024).await;
-    let (sender_t, receiver_t) = create_in_process_pair();
-
-    let entry2 = entry.clone();
-    let jh = tokio::spawn(async move {
-        app::remote_sync::handle_full_transfer(&sender_t, &src, &entry2, None, true, false).await
-    });
-
-    // 收集 Sender 消息，重组文件字节
-    let mut got = BytesMut::new();
-    let source_hash = loop {
-        match receiver_t.recv().await {
-            Some(SenderMsg::FileBegin { .. }) => {}
-            Some(SenderMsg::FileData { chunk, .. }) => got.extend_from_slice(&chunk.data),
-            Some(SenderMsg::EndOfFile { source_hash, .. }) => break source_hash,
-            other => panic!("unexpected {other:?}"),
-        }
-    };
-    jh.await.unwrap().unwrap();
-    assert_eq!(&got[..], &bytes[..], "重组字节应等于源文件");
-    assert_eq!(source_hash.unwrap(), blake3::hash(&bytes).to_hex().to_string());
-}
+use transport::message::{DiskCommitMsg, ReceiverMsg, SessionConfig};
 
 // ============================================================
 // disk_commit_task 测试辅助
@@ -293,98 +234,6 @@ async fn dc_bare_commit_no_active_produces_no_ack() {
         acks.is_empty(),
         "无 active 的 FileCommit 不应产生任何 ack，实际: {acks:?}"
     );
-}
-
-// recv_file_data_phase 端到端：手工扮演 Sender 发 CreateDir + FileBegin/FileData*/EndOfFile
-// + TransferDone，经 in-process pair 调 recv_file_data_phase，断言全量文件经 disk-commit
-// task 落地 + 内容正确。
-#[tokio::test]
-async fn recv_phase_routes_full_files_to_disk() {
-    let tmp = tempfile::tempdir().unwrap();
-    let dest = local_storage(tmp.path()).await;
-    let session = session_cfg(true);
-    let (entry, bytes) = entry_for(tmp.path(), "d/f.bin", 3 * 1024 * 1024);
-    let (sender_t, receiver_t) = create_in_process_pair();
-
-    // Sender 侧脚本（先切块，避免把 bytes 移进 spawn 后无法用于断言）
-    let src_hash = blake3::hash(&bytes).to_hex().to_string();
-    let chunks = chunkify(&bytes, 1 << 20);
-    let e = entry.clone();
-    tokio::spawn(async move {
-        sender_t
-            .send(SenderMsg::CreateDir { entry: dir_entry("d") })
-            .await
-            .unwrap();
-        sender_t.send(SenderMsg::FileBegin { entry: e.clone() }).await.unwrap();
-        for (off, c) in chunks {
-            sender_t
-                .send(SenderMsg::FileData {
-                    entry: e.clone(),
-                    chunk: DataChunk { offset: off, data: c },
-                })
-                .await
-                .unwrap();
-        }
-        sender_t
-            .send(SenderMsg::EndOfFile {
-                entry: e.clone(),
-                source_hash: Some(src_hash),
-            })
-            .await
-            .unwrap();
-        sender_t.send(SenderMsg::TransferDone).await.unwrap();
-    });
-
-    let progress = Arc::new(ReceiverProgress::new());
-    let (_ptx, prx) = tokio::sync::mpsc::channel(4);
-    app::receiver::recv_file_data_phase(&receiver_t, &dest, &session, &progress, prx)
-        .await
-        .unwrap();
-    assert_eq!(std::fs::read(tmp.path().join("d/f.bin")).unwrap(), bytes);
-}
-
-// 回归：源端缩到 0 字节的 delta 传输（无 FileBegin、无 delta token）应把目标端截为空，
-// 而非因空 token 误路由到 FileCommit（dc 无 active → no-op）保留旧内容。
-#[tokio::test]
-async fn recv_phase_empty_source_delta_truncates_dest() {
-    let tmp = tempfile::tempdir().unwrap();
-    let dest = local_storage(tmp.path()).await;
-    let session = session_cfg(false);
-    // 预置非空目标文件（delta 传输的 basis）
-    std::fs::write(tmp.path().join("x.bin"), vec![0x11u8; 4096]).unwrap();
-    // 源端已缩到 0 字节：EndOfFile 前无 FileBegin、无 delta token
-    let (entry, _b) = entry_for(tmp.path(), "x.bin", 0);
-    let (sender_t, receiver_t) = create_in_process_pair();
-
-    let e = entry.clone();
-    let jh = tokio::spawn(async move {
-        sender_t
-            .send(SenderMsg::EndOfFile {
-                entry: e,
-                source_hash: None,
-            })
-            .await
-            .unwrap();
-        sender_t.send(SenderMsg::TransferDone).await.unwrap();
-        // 收集 Receiver 回传的 ack（channel 在 receiver_t drop 后关闭）
-        let mut acks = vec![];
-        while let Some(m) = sender_t.recv().await {
-            acks.push(m);
-        }
-        acks
-    });
-
-    let progress = Arc::new(ReceiverProgress::new());
-    let (_ptx, prx) = tokio::sync::mpsc::channel(4);
-    app::receiver::recv_file_data_phase(&receiver_t, &dest, &session, &progress, prx)
-        .await
-        .unwrap();
-    drop(receiver_t);
-    let acks = jh.await.unwrap();
-
-    // 目标文件被截为 0 字节（修复前：保留旧 4096 字节内容）
-    assert_eq!(std::fs::metadata(tmp.path().join("x.bin")).unwrap().len(), 0);
-    assert!(acks.iter().any(|a| matches!(a, ReceiverMsg::EntrySuccess { .. })));
 }
 
 // AbortFile 路径：FileBegin + 若干 FileChunk 后收到 AbortFile，应丢弃 .part、

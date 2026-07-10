@@ -158,6 +158,11 @@ pub enum Commands {
         #[arg(long, value_name = "FILE", requires = "remote")]
         tls_server_cert: Option<String>,
 
+        /// Auth token to present to the Receiver (must match its --token).
+        /// Only used together with --remote.
+        #[arg(long, requires = "remote")]
+        token: Option<String>,
+
         /// Disable byte-level resume for large files (force whole-file copy).
         /// By default an interrupted large-file transfer resumes from where it stopped.
         #[arg(long, default_value_t = false)]
@@ -179,6 +184,10 @@ pub enum Commands {
         /// Copy this file to the Sender side and use --tls-server-cert to prevent MITM attacks.
         #[arg(long, default_value = "server.crt")]
         tls_cert_out: String,
+
+        /// Auth token required from connecting Senders. Unset means no auth check (open access).
+        #[arg(long)]
+        token: Option<String>,
     },
 
     /// Run the scan operation

@@ -6559,6 +6559,7 @@ dependencies = [
  "mimalloc",
  "predicates",
  "serial_test",
+ "tempfile",
  "tokio",
 ]
 

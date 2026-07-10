@@ -16,6 +16,14 @@ use data_mover::{DataChunk, EntryEnum};
 /// Sender 发给 Receiver 的消息
 #[derive(Debug, Serialize, Deserialize)]
 pub enum SenderMsg {
+    /// 协议握手（协议版本 + 能力协商），Sender 建立连接后最先发送，
+    /// 早于 `SessionConfig`，避免不兼容版本之间进行任何数据传输
+    Handshake(ProtocolHandshake),
+
+    /// Token 鉴权：握手通过后、`SessionConfig` 之前发送，独立于 `SessionConfig`，
+    /// 便于 Receiver 在鉴权失败时第一时间拒绝连接，不进入任何会话配置/数据阶段
+    Auth { token: String },
+
     /// 会话配置（QoS、ACL、完整性校验等参数）
     SessionConfig(SessionConfig),
 
@@ -78,6 +86,14 @@ pub enum SenderMsg {
 /// Receiver 发给 Sender 的消息（请求 + ack 合一）
 #[derive(Debug, Serialize, Deserialize)]
 pub enum ReceiverMsg {
+    /// 握手协商结果（对 `SenderMsg::Handshake` 的回复）：
+    /// 兼容则携带协商后的能力交集，不兼容则携带拒绝原因
+    HandshakeAck(HandshakeResult),
+
+    /// 鉴权结果（对 `SenderMsg::Auth` 的回复）：`ok` 为 false 时携带拒绝原因，
+    /// Sender 收到失败结果后应立即中止，不得发送 `SessionConfig` 及后续任何数据
+    AuthResult { ok: bool, reason: Option<String> },
+
     // ── 双进程模式：按 NDX 请求传输 ──
     /// 请求全量传输（目标文件不存在）
     TransferRequest { ndx: i32 },
@@ -119,8 +135,143 @@ pub enum ReceiverMsg {
 }
 
 // ============================================================
-// 辅助类型
+// 协议版本与能力协商（握手阶段）
 // ============================================================
+
+/// 当前 binary 实现的协议版本
+///
+/// 双进程远端同步（QUIC）协议演进时递增，用于握手阶段判断新旧版本是否兼容。
+pub const PROTOCOL_VERSION: u32 = 1;
+
+/// 当前 binary 能接受的最低对端协议版本
+///
+/// 对端版本低于此值时握手拒绝，避免 bincode schema 不兼容导致反序列化失败
+/// 或部分文件已写入、部分未写入的"半执行"不一致状态。
+pub const MIN_SUPPORTED_PROTOCOL_VERSION: u32 = 1;
+
+/// 完整性校验使用的 hash 算法
+///
+/// 当前双进程远端协议硬编码使用 BLAKE3（见 `blake3::hash` 调用点），
+/// 枚举形式便于未来扩展并在握手阶段显式声明。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum HashAlgorithm {
+    #[default]
+    Blake3,
+}
+
+/// 协议特性能力标志，握手时双方各自声明本端支持的能力，取交集作为协商结果
+///
+/// `xattr` / `rename` / `compression` 当前双进程远端协议尚未实现，字段保留
+/// （reserved）以便未来扩展，协商时恒为 `false`。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[allow(clippy::struct_excessive_bools)]
+pub struct FeatureFlags {
+    /// chunk 级增量传输（`sync-delta`）
+    pub delta: bool,
+    /// ACL 跨进程传输
+    pub acl: bool,
+    /// `--delete-target`（删除目标端多余文件）
+    pub delete: bool,
+    /// 断点续传（checkpoint / 字节级 resume）
+    pub resume: bool,
+    /// 扩展属性传输（reserved，尚未实现）
+    pub xattr: bool,
+    /// 重命名检测（reserved，尚未实现）
+    pub rename: bool,
+    /// 压缩传输（reserved，尚未实现）
+    pub compression: bool,
+}
+
+impl FeatureFlags {
+    /// 当前 binary 支持的完整能力集合
+    pub fn current() -> Self {
+        Self {
+            delta: true,
+            acl: true,
+            delete: true,
+            resume: true,
+            xattr: false,
+            rename: false,
+            compression: false,
+        }
+    }
+
+    /// 与对端能力取交集，作为协商结果（双方均支持才启用）
+    #[must_use]
+    pub fn intersect(&self, remote: &Self) -> Self {
+        Self {
+            delta: self.delta && remote.delta,
+            acl: self.acl && remote.acl,
+            delete: self.delete && remote.delete,
+            resume: self.resume && remote.resume,
+            // reserved 能力当前协议未实现，协商结果恒为 false
+            xattr: false,
+            rename: false,
+            compression: false,
+        }
+    }
+}
+
+/// 协议握手信息，Sender 建立连接后最先发送（早于 `SessionConfig`）
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProtocolHandshake {
+    /// 本端协议版本
+    pub protocol_version: u32,
+    /// 本端能接受的最低对端协议版本
+    pub min_supported_version: u32,
+    /// 本端支持的能力集合
+    pub features: FeatureFlags,
+    /// 本端完整性校验使用的 hash 算法
+    pub hash_algorithm: HashAlgorithm,
+}
+
+impl ProtocolHandshake {
+    /// 构造当前 binary 的握手信息
+    pub fn current() -> Self {
+        Self {
+            protocol_version: PROTOCOL_VERSION,
+            min_supported_version: MIN_SUPPORTED_PROTOCOL_VERSION,
+            features: FeatureFlags::current(),
+            hash_algorithm: HashAlgorithm::Blake3,
+        }
+    }
+
+    /// 校验对端握手信息与本端是否兼容，返回协商结果
+    ///
+    /// 兼容规则：双方协议版本必须落在彼此声明的最低支持版本范围内。
+    /// 兼容时能力取交集；不兼容时返回拒绝原因，调用方（Receiver）应在
+    /// 发送任何 `FilePage` / `TransferRequest` / `CopyEntry` 之前中止会话。
+    pub fn negotiate(&self, remote: &ProtocolHandshake) -> HandshakeResult {
+        if remote.protocol_version < self.min_supported_version {
+            return HandshakeResult::Rejected {
+                reason: format!(
+                    "Peer protocol version {} is older than the minimum supported version {}",
+                    remote.protocol_version, self.min_supported_version
+                ),
+            };
+        }
+        if self.protocol_version < remote.min_supported_version {
+            return HandshakeResult::Rejected {
+                reason: format!(
+                    "Local protocol version {} is older than the peer's minimum supported version {}",
+                    self.protocol_version, remote.min_supported_version
+                ),
+            };
+        }
+        HandshakeResult::Accepted {
+            features: self.features.intersect(&remote.features),
+        }
+    }
+}
+
+/// 握手协商结果，Receiver 校验后回发给 Sender
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum HandshakeResult {
+    /// 版本兼容，附带协商后的能力交集
+    Accepted { features: FeatureFlags },
+    /// 版本不兼容，携带原因；Sender 收到后应立即中止，不得发送任何数据
+    Rejected { reason: String },
+}
 
 /// 会话配置，Sender 建立连接后首先发送
 #[derive(Debug, Clone, Serialize, Deserialize)]

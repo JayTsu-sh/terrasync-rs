@@ -5,20 +5,25 @@
 //! 双进程模式下 Receiver 仅拥有 dest storage（数据流模式，Phase 3）。
 
 // 标准库
+use std::path::{Component, Path};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 // 外部 crate
+use bytes::Bytes;
 use data_mover::qos::QosManager;
 use data_mover::{EntryEnum, StorageEnum};
 use tokio::sync::mpsc::Receiver as MpscReceiver;
 use tracing::{Instrument, debug, error, info, info_span, trace, warn};
-use transport::message::{DestIndex, DiskCommitMsg, NdxTable, ProgressSnapshot, ReceiverMsg, SenderMsg, SessionConfig};
+use transport::error::TransportError;
+use transport::message::{
+    DestIndex, DiskCommitMsg, FeatureFlags, HandshakeResult, NdxTable, ProgressSnapshot, ProtocolHandshake,
+    ReceiverMsg, SenderMsg, SessionConfig,
+};
 use transport::traits::ReceiverTransport;
 
 // 内部模块
 use crate::byte_resume::is_part_file;
-use crate::disk_commit::disk_commit_task;
 use crate::error::{AppError, Result};
 use crate::sync::{ResumeOpts, copy_file_with_resume, should_resume};
 
@@ -265,14 +270,28 @@ pub(crate) async fn process_entry_on_receiver(
 
 /// 双进程模式的 Receiver task（入口）
 ///
-/// 分阶段顺序协议：
+/// 协议阶段：
+/// 0. 接收 `Handshake` → 校验协议版本/能力 → 回 ack/reject（不兼容则中止）
+/// 0.5 接收 `Auth` → 校验 token → 回 `AuthResult`（鉴权失败则中止，不进入 `SessionConfig`）
 /// 1. 接收 `SessionConfig`
-/// 2. 接收 `FilePage` → `DestIndex` 逐页比较 → 发 `TransferRequest`
-/// 3. 接收数据流 → 写入目标端 → 发 EntrySuccess/Error
+/// 2. 接收文件列表（`FilePage` → `DestIndex` 逐页比较 → 发 `TransferRequest`）与接收数据流
+///    （写入目标端 → 发 `EntrySuccess`/`EntryError`）**合并为一个消费者循环并发处理**
+///    （`recv_file_list_and_data_phase`），不再是"文件列表收完才能开始收数据"的顺序
+///    barrier——多路复用后 Sender 可能在文件列表还没发完时就已经开始回传已确定文件的
+///    数据（两者走不同物理 stream），这里按 variant dispatch，不区分先后。
+///
+/// `expected_token`：`serve --token` 配置的期望值；为 `None` 时跳过鉴权（向后兼容，
+/// 未配置 token 时不校验，仍需完成 `Auth` 消息交换以保持协议阶段一致）。
 pub async fn receiver_task_remote(
-    transport: &(dyn ReceiverTransport + 'static), dest_storage: Arc<StorageEnum>,
+    transport: &(dyn ReceiverTransport + 'static), dest_storage: Arc<StorageEnum>, expected_token: Option<&str>,
 ) -> Result<()> {
-    info!("[Receiver Remote] Started, waiting for SessionConfig");
+    info!("[Receiver Remote] Started, waiting for Handshake");
+
+    // ── 阶段 -1: 协议握手（版本 + 能力协商），不兼容则回 reject 后立即中止 ──
+    let negotiated_features = recv_and_negotiate_handshake(transport).await?;
+
+    // ── 阶段 -0.5: Token 鉴权，失败则回 AuthResult{ok:false} 并断连、中止 ──
+    recv_and_check_auth(transport, expected_token).await?;
 
     // ── 阶段 0: 接收 SessionConfig ──
     let session_config = recv_session_config(transport).await?;
@@ -300,11 +319,16 @@ pub async fn receiver_task_remote(
         })
     };
 
-    // ── 阶段 1: 接收文件列表 → 发 TransferRequest ──
-    recv_file_list_phase(transport, &dest_storage, &session_config, &progress).await?;
-
-    // ── 阶段 2: 接收数据流 → 写入目标端 ──
-    recv_file_data_phase(transport, &dest_storage, &session_config, &progress, progress_rx).await?;
+    // ── 阶段 1+2: 文件列表与数据流合并处理，无阶段 barrier（见函数入口文档） ──
+    recv_file_list_and_data_phase(
+        transport,
+        &dest_storage,
+        &session_config,
+        &negotiated_features,
+        &progress,
+        progress_rx,
+    )
+    .await?;
 
     // 停止进度 reporter，发最终快照 + AllDone
     progress_reporter.abort();
@@ -313,6 +337,77 @@ pub async fn receiver_task_remote(
     let _ = transport.send(ReceiverMsg::AllDone).await;
     info!("[Receiver Remote] Completed");
     Ok(())
+}
+
+/// 阶段 -1：等待 Sender 的 `Handshake`，校验协议版本与能力，回发 ack/reject
+///
+/// 版本不兼容时发送 `Rejected` 后立即返回错误，不进入 `SessionConfig` / 文件列表阶段，
+/// 确保拒绝发生在任何 `FilePage` / `TransferRequest` / `CopyEntry` 之前。
+async fn recv_and_negotiate_handshake(transport: &(dyn ReceiverTransport + 'static)) -> Result<FeatureFlags> {
+    loop {
+        match transport.recv().await {
+            Some(SenderMsg::Handshake(remote)) => {
+                let result = ProtocolHandshake::current().negotiate(&remote);
+                let ack = result.clone();
+                match result {
+                    HandshakeResult::Accepted { features } => {
+                        info!(
+                            "[Receiver Remote] Handshake accepted, negotiated features: {:?}",
+                            features
+                        );
+                        transport.send(ReceiverMsg::HandshakeAck(ack)).await?;
+                        return Ok(features);
+                    }
+                    HandshakeResult::Rejected { reason } => {
+                        warn!("[Receiver Remote] Handshake rejected: {}", reason);
+                        transport.send(ReceiverMsg::HandshakeAck(ack)).await?;
+                        return Err(TransportError::IncompatibleProtocol { reason }.into());
+                    }
+                }
+            }
+            Some(_) => warn!("[Receiver Remote] Expected Handshake, skipping"),
+            None => return Err(AppError::CopyError("Transport closed before Handshake".into())),
+        }
+    }
+}
+
+/// 阶段 -0.5：等待 Sender 的 `Auth`，校验 token，回发 `AuthResult`
+///
+/// `expected_token` 为 `None` 时（Receiver 未配置 `--token`）接受任意 token，仅记录日志；
+/// 配置了 token 时必须与 Sender 提供的值完全一致，否则回复失败并 `close()` 连接，
+/// 确保鉴权失败发生在 `SessionConfig` / 文件列表 / 数据阶段之前。
+async fn recv_and_check_auth(
+    transport: &(dyn ReceiverTransport + 'static), expected_token: Option<&str>,
+) -> Result<()> {
+    loop {
+        match transport.recv().await {
+            Some(SenderMsg::Auth { token }) => {
+                let ok = match expected_token {
+                    Some(expected) => token == expected,
+                    None => true,
+                };
+                if ok {
+                    info!("[Receiver Remote] Auth accepted");
+                    transport
+                        .send(ReceiverMsg::AuthResult { ok: true, reason: None })
+                        .await?;
+                    return Ok(());
+                }
+                let reason = "invalid token".to_string();
+                warn!("[Receiver Remote] Auth rejected: {}", reason);
+                transport
+                    .send(ReceiverMsg::AuthResult {
+                        ok: false,
+                        reason: Some(reason.clone()),
+                    })
+                    .await?;
+                transport.close().await?;
+                return Err(TransportError::AuthFailed { reason }.into());
+            }
+            Some(_) => warn!("[Receiver Remote] Expected Auth, skipping"),
+            None => return Err(AppError::CopyError("Transport closed before Auth".into())),
+        }
+    }
 }
 
 /// 阶段 0：等待并返回 SessionConfig，忽略非预期消息
@@ -326,16 +421,91 @@ async fn recv_session_config(transport: &(dyn ReceiverTransport + 'static)) -> R
     }
 }
 
-/// 阶段 1：接收 `FilePage` → 构建 `DestIndex` → 发 `TransferRequest` / `DeltaTransferRequest`
-async fn recv_file_list_phase(
+/// 校验 Sender 提供的相对路径是否安全：拒绝绝对路径与含 `..` 组件的路径
+///
+/// 双进程远端模式下 Sender 不可信，若 `entry.get_relative_path()` 被恶意构造为绝对路径
+/// 或含 `..` 的路径，会导致目标端在 `dest_path` 之外写入/覆盖文件（路径穿越）。
+/// 此校验必须在所有以该路径驱动 `dest_storage` 写操作之前调用。
+fn validate_relative_path(path: &Path) -> Result<()> {
+    if path.is_absolute() || path.components().any(|c| matches!(c, Component::ParentDir)) {
+        return Err(AppError::UnsafeRelativePath {
+            path: path.to_path_buf(),
+        });
+    }
+    Ok(())
+}
+
+/// 合并处理文件列表（`FilePage` → 构建 `DestIndex` → 发 `TransferRequest`/
+/// `DeltaTransferRequest`）与文件数据流（写入目标端 → 发 `EntrySuccess`/`EntryError`），
+/// 单一消费者循环内按 variant dispatch，去掉两者之间的顺序 barrier。
+///
+/// 拆分多路复用 stream 后，Sender 可能在文件列表还没发完（`FileListDone` 之前）就已经
+/// 开始为已确定的文件发送数据（file list 与 data 走不同物理 stream，可以流水线并发），
+/// 若仍分成"先收完文件列表、再收数据"两个各自独立调用 `recv()` 的阶段，数据消息会被
+/// "文件列表"阶段的 catch-all 分支直接丢弃。合并为一个循环后不再有这个问题
+/// （transport 层只暴露一个 `recv()`，见 `crates/transport/src/quic/mux.rs`）。
+///
+/// `FileListDone` 到达时立即发送 `RequestsDone`（与改造前时序一致），但循环不 break，
+/// 继续处理后续到达的数据消息。
+///
+/// `negotiated_features` 为握手阶段协商后的能力交集；`delta` 能力未协商成功时
+/// 即使数据不匹配也降级为全量传输（`TransferRequest`），不发送 `DeltaTransferRequest`。
+/// 使用 `BytesMut` 缓冲多 chunk 数据，`FileBegin` 消息重置缓冲区避免跨文件状态污染。
+///
+/// **`TransferDone` 到达≠数据已全部收完**：`TransferDone` 走 `Control` stream，实际文件
+/// 数据走独立的 `Data` stream——多路复用后二者是完全独立的物理 stream，QUIC/我们自己的
+/// 后台 reader task 都不保证"写入更早的 stream 一定先于写入更晚的 stream 被对端处理完"，
+/// 小体积的 `TransferDone` 完全可能抢在大文件的 `FileData`/`EndOfFile` 之前就被收到并处理
+/// （两个真实子进程联调时用大文件实际触发过：收到 `TransferDone` 就直接跳出循环，丢了还在
+/// `Data` stream 上飞的文件）。因此改为显式计数：`requested_count`（发出过多少个
+/// `TransferRequest`/`DeltaTransferRequest`）与 `completed_count`（收到过多少个对应的
+/// `EndOfFile`/`CreateSymlink` 完成处理），只有二者相等**且**已经见过 `TransferDone`，
+/// 才真正结束循环。
+async fn recv_file_list_and_data_phase(
     transport: &(dyn ReceiverTransport + 'static), dest_storage: &Arc<StorageEnum>, session_config: &SessionConfig,
-    progress: &Arc<ReceiverProgress>,
+    negotiated_features: &FeatureFlags, progress: &Arc<ReceiverProgress>,
+    mut progress_rx: MpscReceiver<ProgressSnapshot>,
 ) -> Result<()> {
-    info!("[Receiver Remote] Phase 1: Receiving file list");
+    info!("[Receiver Remote] Receiving file list and file data (pipelined, streaming mode)");
     let mut ndx_table = NdxTable::new();
+    // delta 重建 token 缓冲
+    let mut delta_tokens: Vec<sync_delta::DeltaToken> = Vec::new();
+    // TransferDone 与实际数据完成的解耦计数（见函数文档）
+    let mut requested_count: u64 = 0;
+    let mut completed_count: u64 = 0;
+    let mut transfer_done_seen = false;
+    // 全量文件是否走 disk-commit 流式路径：以是否见过 FileBegin 判定（而非 token 是否为空），
+    // 避免源端缩到 0 字节的 delta 传输（token 空且无 FileBegin）被误判为全量。
+    let mut full_active = false;
+    // disk-commit task：全量文件三段流式落盘（去整文件 BytesMut）；ack 经 unbounded channel 回流，
+    // 避免路由 select 阻在 dc_tx.send 时不 drain ack → dc 阻在 ack_tx.send 的双向死锁。
+    let (dc_tx, dc_rx) = tokio::sync::mpsc::channel::<DiskCommitMsg>(16);
+    let (ack_tx, mut ack_rx) = tokio::sync::mpsc::unbounded_channel::<ReceiverMsg>();
+    let dc_join = tokio::spawn(crate::disk_commit::disk_commit_task(
+        dest_storage.clone(),
+        session_config.clone(),
+        dc_rx,
+        ack_tx,
+        progress.clone(),
+    ));
 
     loop {
-        match transport.recv().await {
+        // 同时处理 transport 消息和 progress 上报
+        tokio::select! {
+            Some(snapshot) = progress_rx.recv() => {
+                let _ = transport.send(ReceiverMsg::Progress(snapshot)).await;
+            }
+            // ── disk-commit task 回流的全量文件 ack（每个文件 FileCommit 成功/失败各一条）──
+            Some(ack) = ack_rx.recv() => {
+                let _ = transport.send(ack).await;
+                completed_count += 1;
+                if transfer_done_seen && completed_count >= requested_count {
+                    info!("[Receiver Remote] All transfers complete");
+                    break;
+                }
+            }
+            msg = transport.recv() => { match msg {
+            // ── 文件列表：FilePage → DestIndex 比较 → 发 TransferRequest/DeltaTransferRequest ──
             Some(SenderMsg::FilePage(page)) => {
                 ndx_table.ingest_page(&page);
 
@@ -366,6 +536,12 @@ async fn recv_file_list_phase(
                     match dest_index.check(&nf.entry) {
                         transport::message::TransferDecision::FullTransfer => {
                             let _ = transport.send(ReceiverMsg::TransferRequest { ndx: nf.ndx }).await;
+                            requested_count += 1;
+                        }
+                        transport::message::TransferDecision::DeltaTransfer if !negotiated_features.delta => {
+                            // delta 能力未协商成功（对端不支持）→ 降级为全量传输
+                            let _ = transport.send(ReceiverMsg::TransferRequest { ndx: nf.ndx }).await;
+                            requested_count += 1;
                         }
                         transport::message::TransferDecision::DeltaTransfer => {
                             let size = nf.entry.get_size();
@@ -388,6 +564,7 @@ async fn recv_file_list_phase(
                                             signatures: transport_sigs,
                                         })
                                         .await;
+                                    requested_count += 1;
                                 }
                                 Err(e) => {
                                     warn!(
@@ -396,6 +573,7 @@ async fn recv_file_list_phase(
                                         e
                                     );
                                     let _ = transport.send(ReceiverMsg::TransferRequest { ndx: nf.ndx }).await;
+                                    requested_count += 1;
                                 }
                             }
                         }
@@ -411,6 +589,16 @@ async fn recv_file_list_phase(
 
                 // 子目录在目标端创建
                 for ns in &page.subdirs {
+                    if let Err(e) = validate_relative_path(ns.entry.get_relative_path()) {
+                        warn!("[Receiver Remote] Rejecting unsafe subdir path: {}", e);
+                        let _ = transport
+                            .send(ReceiverMsg::EntryError {
+                                entry: ns.entry.clone(),
+                                reason: format!("{e}"),
+                            })
+                            .await;
+                        continue;
+                    }
                     if let Err(e) = dest_storage.create_dir_all(&ns.entry).await {
                         warn!("[Receiver Remote] create_dir {:?}: {}", ns.entry.get_relative_path(), e);
                     }
@@ -448,101 +636,94 @@ async fn recv_file_list_phase(
                     "[Receiver Remote] File list complete, {} entries indexed",
                     ndx_table.len()
                 );
-                break;
-            }
-            Some(_) => {}
-            None => return Err(AppError::CopyError("Transport closed during file list".into())),
-        }
-    }
-
-    let _ = transport.send(ReceiverMsg::RequestsDone).await;
-    Ok(())
-}
-
-/// 阶段 2：接收文件数据流，路由到 disk-commit task 落盘
-///
-/// 全量文件（`FileBegin`/`FileData`/`EndOfFile`-无 token）转成 `DiskCommitMsg` 交给
-/// disk-commit task 做 3 段流式写入（不再整文件缓冲进 `BytesMut`）；delta 路径
-/// （`DeltaMatch`/`DeltaData`/`EndOfFile`-带 token）保持 inline 重建不变。disk-commit
-/// task 的 ack 经本 loop 转发回 transport。`TransferDone` 后通知 task 退出并 drain 剩余 ack。
-pub async fn recv_file_data_phase(
-    transport: &(dyn ReceiverTransport + 'static), dest_storage: &Arc<StorageEnum>, session_config: &SessionConfig,
-    progress: &Arc<ReceiverProgress>, mut progress_rx: MpscReceiver<ProgressSnapshot>,
-) -> Result<()> {
-    info!("[Receiver Remote] Phase 2: Receiving file data (streaming)");
-
-    // disk-commit task：全量文件落盘（3 段流式），ack 经 ack_rx 回流。
-    // ack 通道用 unbounded：dc task 发 ack 永不 back-pressure，避免路由阻在 dc_tx.send
-    // 时不 drain ack → dc 阻在 ack_tx.send → 停止消费 dc_rx 的双向死锁。
-    let (dc_tx, dc_rx) = tokio::sync::mpsc::channel::<DiskCommitMsg>(16);
-    let (ack_tx, mut ack_rx) = tokio::sync::mpsc::unbounded_channel::<ReceiverMsg>();
-    let dc_join = tokio::spawn(disk_commit_task(
-        dest_storage.clone(),
-        session_config.clone(),
-        dc_rx,
-        ack_tx,
-        progress.clone(),
-    ));
-
-    // delta 重建 token 缓冲（仅 delta 路径使用，保持原样）
-    let mut delta_tokens: Vec<sync_delta::DeltaToken> = Vec::new();
-    // 当前文件是否走全量路径：以是否见过 FileBegin 判定，而非 token 是否为空。
-    // 源端缩到 0 字节的 delta 传输 token 也为空且无 FileBegin，若按空 token 判定会误路由到
-    // FileCommit（dc task 无 active → no-op），导致目标端保留旧内容且不报错。
-    let mut full_active = false;
-
-    loop {
-        // 同时处理 transport 消息、progress 上报、disk-commit task 的 ack 回流
-        tokio::select! {
-            Some(snapshot) = progress_rx.recv() => {
-                let _ = transport.send(ReceiverMsg::Progress(snapshot)).await;
-            }
-            Some(ack) = ack_rx.recv() => {
-                let _ = transport.send(ack).await;
-            }
-            msg = transport.recv() => { match msg {
-            // ── 目录 / 符号链接：路由给 disk-commit task ──
-            Some(SenderMsg::CreateDir { entry }) => {
-                let _ = dc_tx.send(DiskCommitMsg::CreateDir { entry }).await;
-            }
-            Some(SenderMsg::CreateSymlink { entry, target }) => {
-                let _ = dc_tx.send(DiskCommitMsg::CreateSymlink { entry, target }).await;
+                let _ = transport.send(ReceiverMsg::RequestsDone).await;
             }
 
-            // ── 全量文件：FileBegin / FileData → disk-commit task ──
+            // ── 文件开始：标记走全量流式路径，交 disk-commit task 起 resume_prepare + write_chunk_stream ──
             Some(SenderMsg::FileBegin { entry }) => {
-                delta_tokens.clear();
                 full_active = true;
+                delta_tokens.clear();
                 let _ = dc_tx.send(DiskCommitMsg::FileBegin { entry }).await;
             }
+
+            // ── 数据流模式：目录 ──
+            Some(SenderMsg::CreateDir { entry }) => {
+                if let Err(e) = validate_relative_path(entry.get_relative_path()) {
+                    warn!("[Receiver Remote] Rejecting unsafe relative path: {}", e);
+                    let _ = transport
+                        .send(ReceiverMsg::EntryError { entry, reason: format!("{e}") })
+                        .await;
+                    continue;
+                }
+                if let Err(e) = dest_storage.create_dir_all(&entry).await {
+                    warn!("[Receiver Remote] create_dir {:?}: {}", entry.get_relative_path(), e);
+                }
+                let _ = dest_storage.set_entry_metadata(&entry).await;
+                progress.dirs_created.fetch_add(1, Ordering::Relaxed);
+                let _ = transport.send(ReceiverMsg::EntrySuccess { entry }).await;
+            }
+
+            // ── 数据流模式：符号链接 ──
+            Some(SenderMsg::CreateSymlink { entry, target }) => {
+                if let Err(e) = validate_relative_path(entry.get_relative_path()) {
+                    warn!("[Receiver Remote] Rejecting unsafe relative path: {}", e);
+                    let _ = transport
+                        .send(ReceiverMsg::EntryError { entry, reason: format!("{e}") })
+                        .await;
+                    completed_count += 1;
+                    if transfer_done_seen && completed_count >= requested_count {
+                        info!("[Receiver Remote] All transfers complete");
+                        break;
+                    }
+                    continue;
+                }
+                match dest_storage.create_symlink(&entry, &target).await {
+                    Ok(()) => {
+                        progress.files_transferred.fetch_add(1, Ordering::Relaxed);
+                        let _ = transport.send(ReceiverMsg::EntrySuccess { entry }).await;
+                    }
+                    Err(e) => {
+                        error!("[Receiver Remote] create_symlink {:?}: {}", entry.get_relative_path(), e);
+                        let _ = transport
+                            .send(ReceiverMsg::EntryError { entry, reason: format!("{e}") })
+                            .await;
+                    }
+                }
+                completed_count += 1;
+                if transfer_done_seen && completed_count >= requested_count {
+                    info!("[Receiver Remote] All transfers complete");
+                    break;
+                }
+            }
+
+            // ── 数据流模式：文件数据块 → 转发给 disk-commit task 的 write_chunk_stream ──
             Some(SenderMsg::FileData { entry, chunk }) => {
                 let _ = dc_tx.send(DiskCommitMsg::FileChunk { entry, chunk }).await;
             }
 
-            // ── delta 路径：token 接收保持原有 inline 逻辑不变 ──
-            Some(SenderMsg::DeltaMatch { block_index, .. }) => {
+            // ── Delta token 接收 ──
+            Some(SenderMsg::DeltaMatch { ndx: _, block_index }) => {
                 delta_tokens.push(sync_delta::DeltaToken::Match { block_index });
             }
-            Some(SenderMsg::DeltaData { data, .. }) => {
+            Some(SenderMsg::DeltaData { ndx: _, data }) => {
                 delta_tokens.push(sync_delta::DeltaToken::Data(data));
             }
 
-            // ── 文件结束：见过 FileBegin → 全量 FileCommit；否则走 delta inline 重建 ──
+            // ── 文件结束：见过 FileBegin → 全量交 disk-commit task 收尾（读回 .part hash 校验 → 原子
+            //    rename），completed_count 在 dc ack 回流时才 +1；否则走 delta inline 重建（保持原逻辑）──
             Some(SenderMsg::EndOfFile { entry, source_hash }) => {
                 if full_active {
+                    full_active = false;
                     let _ = dc_tx.send(DiskCommitMsg::FileCommit { entry, source_hash }).await;
                 } else {
                     let tokens = std::mem::take(&mut delta_tokens);
-                    handle_end_of_file(transport, dest_storage, entry, source_hash, tokens, bytes::Bytes::new(), progress)
-                        .await;
+                    handle_end_of_file(transport, dest_storage, entry, source_hash, tokens, Bytes::new(), progress).await;
+                    completed_count += 1;
+                    if transfer_done_seen && completed_count >= requested_count {
+                        info!("[Receiver Remote] All transfers complete");
+                        break;
+                    }
                 }
-                full_active = false;
-            }
-
-            // ── Sender 读源失败：中止 disk-commit task 当前正在写入的文件（丢弃 .part） ──
-            Some(SenderMsg::EntryError { path, reason }) => {
-                warn!("[Receiver Remote] Sender aborted {:?}: {}", path, reason);
-                let _ = dc_tx.send(DiskCommitMsg::AbortFile).await;
             }
 
             // ── ACL 跨进程 ──
@@ -555,16 +736,34 @@ pub async fn recv_file_data_phase(
             }
 
             Some(SenderMsg::TransferDone) => {
-                info!("[Receiver Remote] All transfers complete");
-                break;
+                transfer_done_seen = true;
+                debug!(
+                    "[Receiver Remote] TransferDone received ({}/{} data transfers completed so far)",
+                    completed_count, requested_count
+                );
+                if completed_count >= requested_count {
+                    info!("[Receiver Remote] All transfers complete");
+                    break;
+                }
+            }
+            // ── Sender 源读失败：中止正在写入的文件（丢弃 .part，dc 不发 ack），并计一次完成 ──
+            Some(SenderMsg::EntryError { path, reason }) => {
+                warn!("[Receiver Remote] Sender EntryError {:?}: {} — 中止该文件", path, reason);
+                full_active = false;
+                let _ = dc_tx.send(DiskCommitMsg::AbortFile).await;
+                completed_count += 1;
+                if transfer_done_seen && completed_count >= requested_count {
+                    info!("[Receiver Remote] All transfers complete");
+                    break;
+                }
             }
             Some(_) => {}
-            None => return Err(AppError::CopyError("Transport closed during data phase".into())),
+            None => return Err(AppError::CopyError("Transport closed during file list/data phase".into())),
         }} // close match + select! msg arm
         } // close select!
     } // close loop
 
-    // 收尾：通知 disk-commit task 退出 → 等其处理完积压 → drain 剩余 ack
+    // 收尾：关闭 dc_tx → disk-commit task 处理完积压后退出；等待 join；drain 剩余 ack。
     let _ = dc_tx.send(DiskCommitMsg::Shutdown).await;
     drop(dc_tx);
     dc_join
@@ -573,6 +772,7 @@ pub async fn recv_file_data_phase(
     while let Ok(ack) = ack_rx.try_recv() {
         let _ = transport.send(ack).await;
     }
+
     Ok(())
 }
 
@@ -586,6 +786,20 @@ async fn handle_end_of_file(
     progress: &Arc<ReceiverProgress>,
 ) {
     let relative_path = entry.get_relative_path();
+
+    if let Err(e) = validate_relative_path(relative_path) {
+        warn!(
+            "[Receiver Remote] Rejecting unsafe relative path {:?}: {}",
+            relative_path, e
+        );
+        let _ = transport
+            .send(ReceiverMsg::EntryError {
+                entry,
+                reason: format!("{e}"),
+            })
+            .await;
+        return;
+    }
 
     // 重建文件字节：delta 或全量
     let file_bytes: bytes::Bytes = if tokens.is_empty() {
@@ -652,5 +866,30 @@ async fn handle_end_of_file(
                 })
                 .await;
         }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn validate_relative_path_accepts_normal_paths() {
+        assert!(validate_relative_path(Path::new("a.txt")).is_ok());
+        assert!(validate_relative_path(Path::new("sub/deeper/b.bin")).is_ok());
+        assert!(validate_relative_path(Path::new("")).is_ok());
+    }
+
+    #[test]
+    fn validate_relative_path_rejects_parent_dir_escape() {
+        assert!(validate_relative_path(Path::new("../etc/passwd")).is_err());
+        assert!(validate_relative_path(Path::new("sub/../../escape")).is_err());
+        assert!(validate_relative_path(Path::new("..")).is_err());
+    }
+
+    #[test]
+    fn validate_relative_path_rejects_absolute_path() {
+        assert!(validate_relative_path(Path::new("/etc/passwd")).is_err());
     }
 }
