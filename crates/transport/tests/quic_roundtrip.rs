@@ -661,6 +661,7 @@ async fn test_quic_mux_large_data_stream_does_not_block_ack_progress_stream() {
             };
             if flood_sender
                 .send(SenderMsg::FileData {
+                    ndx: 0,
                     entry: entry.clone(),
                     chunk,
                 })

@@ -46,11 +46,16 @@ pub enum SenderMsg {
     /// 创建符号链接（Sender 已读取 target，Receiver 调用 `create_symlink`）
     CreateSymlink { entry: Arc<EntryEnum>, target: PathBuf },
     /// 文件传输开始（Receiver 用于准备写入上下文）
-    FileBegin { entry: Arc<EntryEnum> },
+    FileBegin { ndx: i32, entry: Arc<EntryEnum> },
     /// 文件数据块
-    FileData { entry: Arc<EntryEnum>, chunk: DataChunk },
+    FileData {
+        ndx: i32,
+        entry: Arc<EntryEnum>,
+        chunk: DataChunk,
+    },
     /// 文件传输结束
     EndOfFile {
+        ndx: i32,
         entry: Arc<EntryEnum>,
         source_hash: Option<String>,
     },
@@ -357,11 +362,16 @@ pub enum DiskCommitMsg {
 
     // ── 全量文件传输（3 段流式驱动） ──
     /// 文件开始：Receiver 据此 resume_prepare + 起 write_chunk_stream
-    FileBegin { entry: Arc<EntryEnum> },
+    FileBegin { ndx: i32, entry: Arc<EntryEnum> },
     /// 文件数据块（直接转发 DataChunk 给 write_chunk_stream 的 channel）
-    FileChunk { entry: Arc<EntryEnum>, chunk: DataChunk },
+    FileChunk {
+        ndx: i32,
+        entry: Arc<EntryEnum>,
+        chunk: DataChunk,
+    },
     /// 文件传输结束，提交：读回 .part hash 校验 + set_metadata + ACL + 原子 rename
     FileCommit {
+        ndx: i32,
         entry: Arc<EntryEnum>,
         source_hash: Option<String>,
     },
@@ -391,6 +401,34 @@ pub enum DiskCommitMsg {
     AbortFile,
     /// 关闭 disk-commit task
     Shutdown,
+}
+
+// ============================================================
+// Disk-commit ack（disk-commit task / delta inline → Receiver 主 task，反向内部消息）
+// ============================================================
+
+/// disk-commit task 向 Receiver 主 task 汇报的结果
+///
+/// 目录/符号链接等无 redo 语义的 entry 直接透传终态 `ReceiverMsg`；文件传输结果
+/// （全量经 disk-commit task、delta 经 inline 路径）统一上报 `FileOutcome` + `ndx`，
+/// 由 Receiver 主 task 的单一决策点判定 `Success`/`Redo`/`Error`（方案 A）。
+#[derive(Debug)]
+pub enum DcAck {
+    /// 无 redo 语义的 entry ack（目录 / 符号链接），原样转发给 transport
+    Entry(ReceiverMsg),
+    /// 文件传输校验结果（ndx 级），交主 task 统一做 redo 决策
+    FileOutcome { ndx: i32, outcome: FileOutcome },
+}
+
+/// 文件传输校验结果，用于 Receiver 主 task 的 redo 决策
+#[derive(Debug)]
+pub enum FileOutcome {
+    /// 校验通过（或未启用完整性校验）
+    Success,
+    /// hash 校验失败，可 redo（每 ndx 至多重试一次）
+    HashMismatch,
+    /// 硬错误（basis 读失败 / 写盘失败 / `resume_prepare` 失败等，非 hash 类），不可 redo
+    HardError(String),
 }
 
 // ============================================================

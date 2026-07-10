@@ -56,7 +56,7 @@
   `blake3_truncated_16`，消除 `signature.rs`/`matcher.rs` 重复；补边界/一致性测试。
   验证：`cargo check -p sync-delta && cargo test -p sync-delta`。
 
-- ⬜ 步骤 2（协议层）：`crates/transport/src/message.rs` 给 `SenderMsg::FileBegin/
+- ✅ 步骤 2（协议层）：`crates/transport/src/message.rs` 给 `SenderMsg::FileBegin/
   FileData/EndOfFile`、`DiskCommitMsg::FileBegin/FileChunk/FileCommit` 加 `ndx: i32`；
   新增 `DcAck`/`FileOutcome` 内部消息类型（dc task → Receiver 主 task）。修复
   `crates/transport/tests/quic_roundtrip.rs` 中唯一的 `SenderMsg::FileData` 构造点。
