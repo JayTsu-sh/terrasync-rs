@@ -146,13 +146,16 @@ pub enum ReceiverMsg {
 /// 当前 binary 实现的协议版本
 ///
 /// 双进程远端同步（QUIC）协议演进时递增，用于握手阶段判断新旧版本是否兼容。
-pub const PROTOCOL_VERSION: u32 = 1;
+///
+/// 2：`SenderMsg::FileBegin/FileData/EndOfFile` 加 `ndx` 字段、`SenderMsg::EntryError`
+/// 加 `ndx: Option<i32>`（issue #22 ndx 级 redo/ack 状态机），bincode 线格式不兼容 v1。
+pub const PROTOCOL_VERSION: u32 = 2;
 
 /// 当前 binary 能接受的最低对端协议版本
 ///
 /// 对端版本低于此值时握手拒绝，避免 bincode schema 不兼容导致反序列化失败
 /// 或部分文件已写入、部分未写入的"半执行"不一致状态。
-pub const MIN_SUPPORTED_PROTOCOL_VERSION: u32 = 1;
+pub const MIN_SUPPORTED_PROTOCOL_VERSION: u32 = 2;
 
 /// 完整性校验使用的 hash 算法
 ///
@@ -534,5 +537,39 @@ fn metadata_check(src: &EntryEnum, dest: &EntryEnum) -> bool {
         (EntryEnum::S3(s), EntryEnum::S3(d)) => s.tags == d.tags,
         // 跨类型（NAS→S3 或 S3→NAS）：元数据体系不同，视为不匹配
         _ => false,
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+
+    /// v1 对端（本 PR 改动 `SenderMsg` bincode 线格式前的协议版本）握手时必须被拒绝：
+    /// `ndx` 加入 `FileBegin`/`FileData`/`EndOfFile`/`EntryError` 后 v1 与当前 v2 的
+    /// bincode schema 不兼容，接受 v1 对端会导致错位解码甚至写坏数据。
+    #[test]
+    fn negotiate_rejects_v1_peer() {
+        let current = ProtocolHandshake::current();
+        let v1_peer = ProtocolHandshake {
+            protocol_version: 1,
+            min_supported_version: 1,
+            features: FeatureFlags::current(),
+            hash_algorithm: HashAlgorithm::Blake3,
+        };
+        match current.negotiate(&v1_peer) {
+            HandshakeResult::Rejected { reason } => assert!(!reason.is_empty()),
+            other => panic!("v1 对端应被拒绝，got {other:?}"),
+        }
+    }
+
+    /// 双方均为当前版本（v2）时握手应正常通过
+    #[test]
+    fn negotiate_accepts_matching_current_peers() {
+        let current = ProtocolHandshake::current();
+        match current.negotiate(&ProtocolHandshake::current()) {
+            HandshakeResult::Accepted { .. } => {}
+            other => panic!("相同版本应握手成功，got {other:?}"),
+        }
     }
 }
