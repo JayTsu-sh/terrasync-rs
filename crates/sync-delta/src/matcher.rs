@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use bytes::Bytes;
 
 use crate::rolling::RollingChecksum;
-use crate::{BlockSignature, DeltaToken};
+use crate::{BlockSignature, DeltaToken, blake3_truncated};
 
 /// 构建 rolling checksum → block 索引的查找表
 fn build_sig_table(signatures: &[BlockSignature]) -> HashMap<u32, Vec<(u32, &BlockSignature)>> {
@@ -18,15 +18,6 @@ fn build_sig_table(signatures: &[BlockSignature]) -> HashMap<u32, Vec<(u32, &Blo
         table.entry(sig.rolling).or_default().push((idx as u32, sig));
     }
     table
-}
-
-/// 计算 BLAKE3 截断 16 字节
-fn blake3_truncated_16(data: &[u8]) -> [u8; 16] {
-    let hash = blake3::hash(data);
-    let bytes = hash.as_bytes();
-    let mut result = [0u8; 16];
-    result.copy_from_slice(&bytes[..16]);
-    result
 }
 
 /// 对源文件执行 delta 匹配
@@ -65,7 +56,7 @@ pub fn delta_match(src_data: &[u8], signatures: &[BlockSignature], block_size: u
         let mut matched = false;
         if let Some(candidates) = sig_table.get(&rolling) {
             // 慢速确认：strong checksum (BLAKE3) 匹配？
-            let strong = blake3_truncated_16(&src_data[pos..pos + bs]);
+            let strong = blake3_truncated(&src_data[pos..pos + bs]);
             for (block_idx, sig) in candidates {
                 if sig.strong == strong {
                     // 匹配！先 flush 累积的 literal data

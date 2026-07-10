@@ -52,7 +52,7 @@
 
 - ✅ 步骤 0：立计划、commit plan。
 
-- ⬜ 步骤 1（重构，单独提交）：`sync-delta` 提取 `STRONG_HASH_LEN` 常量 + 共用
+- ✅ 步骤 1（重构，单独提交）：`sync-delta` 提取 `STRONG_HASH_LEN` 常量 + 共用
   `blake3_truncated_16`，消除 `signature.rs`/`matcher.rs` 重复；补边界/一致性测试。
   验证：`cargo check -p sync-delta && cargo test -p sync-delta`。
 
