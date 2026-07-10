@@ -752,8 +752,16 @@ async fn recv_file_list_and_data_phase(
                     let _ = dc_tx.send(DiskCommitMsg::FileCommit { ndx, entry, source_hash }).await;
                 } else {
                     let tokens = std::mem::take(&mut delta_tokens);
-                    let outcome =
-                        handle_end_of_file(dest_storage, &entry, source_hash, tokens, Bytes::new(), progress).await;
+                    let outcome = handle_end_of_file(
+                        dest_storage,
+                        &entry,
+                        source_hash,
+                        tokens,
+                        Bytes::new(),
+                        progress,
+                        session_config.enable_integrity_check,
+                    )
+                    .await;
                     if dispatch_file_outcome(
                         transport,
                         &mut attempts,
@@ -945,9 +953,13 @@ fn record_ndx_completion(
 ///
 /// `tokens` 非空时执行 delta 重建，为空时直接使用 `file_data`。返回 `FileOutcome`，不再自行
 /// 发送终态 ack —— 调用方通过 `decide_file_ack` 统一做 redo 决策（与全量路径共用一份状态机）。
+///
+/// `enable_integrity_check=false` 时跳过 hash 校验（与全量路径 `disk_commit.rs::finalize_file`
+/// 的门控行为一致），避免关闭校验后仍因 hash 不符触发多余 redo。
 async fn handle_end_of_file(
     dest_storage: &Arc<StorageEnum>, entry: &Arc<data_mover::EntryEnum>, source_hash: Option<String>,
     tokens: Vec<sync_delta::DeltaToken>, file_data: bytes::Bytes, progress: &Arc<ReceiverProgress>,
+    enable_integrity_check: bool,
 ) -> FileOutcome {
     let relative_path = entry.get_relative_path();
 
@@ -981,8 +993,8 @@ async fn handle_end_of_file(
         }
     };
 
-    // 验证 hash
-    if let Some(ref expected_hash) = source_hash {
+    // 验证 hash（与全量路径一致：仅在 enable_integrity_check 时校验）
+    if enable_integrity_check && let Some(ref expected_hash) = source_hash {
         let actual_hash = blake3::hash(&file_bytes).to_hex().to_string();
         if &actual_hash != expected_hash {
             error!(

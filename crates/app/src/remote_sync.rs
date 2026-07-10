@@ -1253,4 +1253,33 @@ mod tests {
             b"should still arrive"
         );
     }
+
+    /// [5] `enable_integrity_check=false` 时 delta 重建 hash 不符不应触发 redo、
+    /// 不应导致非零退出——按原样写入（与全量路径 `disk_commit.rs::finalize_file`
+    /// 的门控行为一致）。用 `HashMismatchInjector` 篡改 hash（若未正确门控，这会被
+    /// 误判为 mismatch 触发 redo）。
+    #[tokio::test]
+    async fn delta_hash_mismatch_ignored_when_integrity_check_disabled() {
+        let src_dir = tempdir().unwrap();
+        let dest_dir = tempdir().unwrap();
+        let content = vec![b'A'; 4096];
+        fs::write(src_dir.path().join("a.txt"), &content).unwrap();
+        seed_delta_basis(dest_dir.path(), "a.txt", 4096);
+
+        let dest_storage = Arc::new(
+            create_storage(dest_dir.path().to_str().unwrap(), None, true)
+                .await
+                .unwrap(),
+        );
+        let (sender_transport, receiver_transport) = create_in_process_pair();
+        // 每次 EndOfFile 都篡改 hash（若门控生效，篡改的 hash 应被直接忽略，不触发 redo）
+        let injector = HashMismatchInjector::new(sender_transport, HashMap::from([(0, u32::MAX)]));
+
+        let (success_count, error_count) =
+            run_pipeline(&injector, receiver_transport, src_dir.path(), dest_storage, false).await;
+
+        assert_eq!(error_count, 0, "关闭完整性校验时不应因篡改的 hash 而失败");
+        assert_eq!(success_count, 1, "应直接按原样写入成功，不触发 redo");
+        assert_eq!(fs::read(dest_dir.path().join("a.txt")).unwrap(), content);
+    }
 }
