@@ -130,6 +130,8 @@ pub async fn sender_worker(
                             .send(SenderMsg::EntryError {
                                 path: entry.get_relative_path().to_path_buf(),
                                 reason: format!("{e}"),
+                                // 单进程模式：tar 打包无 ndx 概念（不走双进程 ndx 状态机）
+                                ndx: None,
                             })
                             .await;
                     }

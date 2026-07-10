@@ -75,8 +75,15 @@ pub enum SenderMsg {
     SetAcl { entry: Arc<EntryEnum>, acl_data: Bytes },
 
     // ── 控制消息 ──
-    /// Walkdir 中的错误（非致命，继续处理）
-    EntryError { path: PathBuf, reason: String },
+    /// Walkdir 中的错误（非致命，继续处理）；`ndx`：双进程远端模式下 per-ndx 传输
+    /// 失败（源读失败 / 符号链接读失败）时携带对应 ndx，供 Receiver 关联并完成该 ndx
+    /// 的计数（不重发 `ReceiverMsg::Error`，Sender 已本地自增 `error_count`）；单进程
+    /// 模式的 tar 打包失败等无 ndx 概念的场景传 `None`
+    EntryError {
+        path: PathBuf,
+        reason: String,
+        ndx: Option<i32>,
+    },
     /// 所有传输完成
     TransferDone,
 }

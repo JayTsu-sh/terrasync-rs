@@ -266,7 +266,11 @@ async fn process_requests_and_acks(
                     .get(ndx)
                     .cloned();
                 if let Some(entry) = entry {
-                    handle_full_transfer(transport, src_storage, &entry, ndx, qos, enable_acl).await?;
+                    // 源读/符号链接读失败：Sender 已发 EntryError 通知 Receiver 完成该
+                    // ndx，这里自增 error_count（Sender 自检失败由 Sender 自己计数，见 [0][3]）
+                    if !handle_full_transfer(transport, src_storage, &entry, ndx, qos, enable_acl).await? {
+                        error_count += 1;
+                    }
                     transfer_count += 1;
                 } else {
                     error!("[Sender Remote] Unknown NDX {}", ndx);
@@ -283,7 +287,8 @@ async fn process_requests_and_acks(
                     .get(ndx)
                     .cloned();
                 if let Some(entry) = entry {
-                    // delta: 仅 src 读取成功时计入传输数（与原逻辑保持一致）
+                    // delta: 仅 src 读取成功时计入传输数（与原逻辑保持一致）；读取失败已发
+                    // EntryError 通知 Receiver 完成该 ndx，这里自增 error_count（见 [2]）
                     if handle_delta_transfer(
                         transport,
                         src_storage,
@@ -297,6 +302,8 @@ async fn process_requests_and_acks(
                     .await?
                     {
                         transfer_count += 1;
+                    } else {
+                        error_count += 1;
                     }
                 } else {
                     error!("[Sender Remote] Unknown NDX {} for delta", ndx);
@@ -311,7 +318,9 @@ async fn process_requests_and_acks(
                     .get(ndx)
                     .cloned();
                 if let Some(entry) = entry {
-                    handle_full_transfer(transport, src_storage, &entry, ndx, qos, enable_acl).await?;
+                    if !handle_full_transfer(transport, src_storage, &entry, ndx, qos, enable_acl).await? {
+                        error_count += 1;
+                    }
                 } else {
                     error!("[Sender Remote] Unknown NDX {} for redo", ndx);
                 }
@@ -393,13 +402,18 @@ async fn process_requests_and_acks(
 /// （redo 决策所需，见 `receiver::decide_file_ack`）；也是 `Redo{ndx}` 重发的入口——
 /// delta redo 与首次全量传输走同一份实现。
 ///
-/// 源文件读取失败时仅记录日志，不向 Receiver 发送任何数据（Receiver 不会收到该文件的 Ack）。
+/// 返回 `Ok(true)` = 已成功发出该 entry 的数据（目录/符号链接/文件三选一）；
+/// `Ok(false)` = 源读失败（符号链接读失败 / 源文件读失败），已发送带 `ndx` 的
+/// `SenderMsg::EntryError` 通知 Receiver 完成该 ndx（Receiver 不再回发
+/// `ReceiverMsg::Error`），调用方需据此自增 `error_count`（Sender 自检失败由 Sender
+/// 自己计数，不依赖 Receiver 回传）。
 async fn handle_full_transfer(
     transport: &(dyn SenderTransport + 'static), src_storage: &Arc<StorageEnum>, entry: &Arc<data_mover::EntryEnum>,
     ndx: i32, qos: Option<&QosManager>, enable_acl: bool,
-) -> Result<()> {
-    if entry.get_is_dir() {
+) -> Result<bool> {
+    let ok = if entry.get_is_dir() {
         transport.send(SenderMsg::CreateDir { entry: entry.clone() }).await?;
+        true
     } else if entry.get_is_symlink() {
         match src_storage.read_symlink(entry).await {
             Ok(target) => {
@@ -409,9 +423,18 @@ async fn handle_full_transfer(
                         target,
                     })
                     .await?;
+                true
             }
             Err(e) => {
                 error!("[Sender Remote] read_symlink {:?}: {}", entry.get_relative_path(), e);
+                transport
+                    .send(SenderMsg::EntryError {
+                        path: entry.get_relative_path().to_path_buf(),
+                        reason: format!("{e}"),
+                        ndx: Some(ndx),
+                    })
+                    .await?;
+                false
             }
         }
     } else {
@@ -447,27 +470,33 @@ async fn handle_full_transfer(
                         source_hash,
                     })
                     .await?;
+                true
             }
-            // 读失败：记录日志 + 通知 Receiver 丢弃该文件已收分片，跳过（不发 ACL、不中断会话）
+            // 读失败：记录日志 + 通知 Receiver 丢弃该文件已收分片、完成该 ndx（不发 ACL、不中断会话）
             Err(reason) => {
                 error!("[Sender Remote] read file {:?}: {}", entry.get_relative_path(), reason);
                 transport
                     .send(SenderMsg::EntryError {
                         path: entry.get_relative_path().to_path_buf(),
                         reason,
+                        ndx: Some(ndx),
                     })
                     .await?;
-                return Ok(());
+                false
             }
         }
+    };
+    if ok {
+        send_acl_if_enabled(transport, src_storage, entry, enable_acl).await;
     }
-    send_acl_if_enabled(transport, src_storage, entry, enable_acl).await;
-    Ok(())
+    Ok(ok)
 }
 
 /// Delta 传输一个 entry：读取源文件 → 计算 delta tokens → 逐 token 发送。
 ///
-/// 返回 `Ok(true)` = 源文件读取成功并已发送，`Ok(false)` = 读取失败（已记录日志）。
+/// 返回 `Ok(true)` = 源文件读取成功并已发送；`Ok(false)` = 源读失败，已发送带 `ndx`
+/// 的 `SenderMsg::EntryError` 通知 Receiver 完成该 ndx（不留悬空请求），调用方需据此
+/// 自增 `error_count`（与 `handle_full_transfer` 语义一致）。
 #[allow(clippy::too_many_arguments)]
 async fn handle_delta_transfer(
     transport: &(dyn SenderTransport + 'static), src_storage: &Arc<StorageEnum>, entry: &Arc<data_mover::EntryEnum>,
@@ -481,6 +510,13 @@ async fn handle_delta_transfer(
                 "[Sender Remote] Failed to read source file for delta NDX {}: {}",
                 ndx, e
             );
+            transport
+                .send(SenderMsg::EntryError {
+                    path: entry.get_relative_path().to_path_buf(),
+                    reason: format!("{e}"),
+                    ndx: Some(ndx),
+                })
+                .await?;
             return Ok(false);
         }
     };
@@ -781,7 +817,7 @@ mod tests {
     /// 复用生产代码路径验证 redo 状态机。
     async fn run_pipeline(
         sender_transport: &(dyn SenderTransport + 'static), receiver_transport: InProcessReceiverTransport,
-        src_dir: &std::path::Path, dest_storage: Arc<StorageEnum>,
+        src_dir: &std::path::Path, dest_storage: Arc<StorageEnum>, enable_integrity_check: bool,
     ) -> (u64, u64) {
         let src_storage = Arc::new(create_storage(src_dir.to_str().unwrap(), None, false).await.unwrap());
         let walkdir_iter = src_storage.walkdir_2(None, None, None, None, 4, false).await.unwrap();
@@ -797,7 +833,7 @@ mod tests {
                 qos: None,
                 peak_qos_rate: 1.0,
                 iops: None,
-                enable_integrity_check: true,
+                enable_integrity_check,
                 enable_acl: false,
                 is_source_reserved: true,
                 block_size: None,
@@ -828,6 +864,65 @@ mod tests {
         (success_count, error_count)
     }
 
+    /// 与 `run_pipeline` 类似，但不用 `tokio::try_join!` 并发跑文件列表与请求处理，
+    /// 而是先完整跑完 `send_file_list_phase`（此时 `ndx_table` 已确定，size 等元数据
+    /// 已从源端读到），再执行 `disrupt`（测试在“文件列表已确定、请求处理还没开始”这个
+    /// 确定的时间点做破坏性操作，如删除源文件模拟源读失败），最后再跑
+    /// `process_requests_and_acks`。用于确定性地制造 Sender 侧源读失败场景，避免真实
+    /// 并发下的时序不确定性（见 issue #22 review [0]/[1]/[2]/[3]）。
+    async fn run_pipeline_with_disruption(
+        sender_transport: &(dyn SenderTransport + 'static), receiver_transport: InProcessReceiverTransport,
+        src_dir: &std::path::Path, dest_storage: Arc<StorageEnum>, disrupt: impl FnOnce(),
+    ) -> (u64, u64) {
+        let src_storage = Arc::new(create_storage(src_dir.to_str().unwrap(), None, false).await.unwrap());
+        let walkdir_iter = src_storage.walkdir_2(None, None, None, None, 4, false).await.unwrap();
+
+        let receiver_handle =
+            tokio::spawn(async move { receiver_task_remote(&receiver_transport, dest_storage, None).await });
+
+        negotiate_handshake(sender_transport).await.unwrap();
+        send_and_check_auth(sender_transport, None).await.unwrap();
+        sender_transport
+            .send(SenderMsg::SessionConfig(SessionConfig {
+                src_path: src_dir.to_string_lossy().to_string(),
+                qos: None,
+                peak_qos_rate: 1.0,
+                iops: None,
+                enable_integrity_check: true,
+                enable_acl: false,
+                is_source_reserved: true,
+                block_size: None,
+                delete_target: false,
+            }))
+            .await
+            .unwrap();
+
+        let ndx_table = Mutex::new(NdxTable::new());
+        send_file_list_phase(sender_transport, &walkdir_iter, &ndx_table)
+            .await
+            .unwrap();
+
+        disrupt();
+
+        let mut completed_paths = HashSet::new();
+        let checkpoint_path = src_dir.join("unused_checkpoint.json");
+        let (_transfer_count, success_count, error_count) = process_requests_and_acks(
+            sender_transport,
+            &src_storage,
+            &ndx_table,
+            None,
+            false,
+            &mut completed_paths,
+            &checkpoint_path,
+        )
+        .await
+        .unwrap();
+
+        sender_transport.close().await.unwrap();
+        receiver_handle.await.unwrap().unwrap();
+        (success_count, error_count)
+    }
+
     /// (b) 全量·一次 mismatch → Sender 收 Redo 全量重发 → Success，`finalize_run_result` Ok。
     #[tokio::test]
     async fn full_transfer_redo_recovers_on_first_hash_mismatch() {
@@ -845,7 +940,7 @@ mod tests {
         let injector = HashMismatchInjector::new(sender_transport, HashMap::from([(0, 1)]));
 
         let (success_count, error_count) =
-            run_pipeline(&injector, receiver_transport, src_dir.path(), dest_storage).await;
+            run_pipeline(&injector, receiver_transport, src_dir.path(), dest_storage, true).await;
 
         assert_eq!(error_count, 0, "首次 mismatch 应通过 redo 恢复，不应计入 error");
         assert_eq!(success_count, 1, "唯一文件应最终收到 Success{{ndx}}");
@@ -873,7 +968,7 @@ mod tests {
         let injector = HashMismatchInjector::new(sender_transport, HashMap::from([(0, 2)]));
 
         let (success_count, error_count) =
-            run_pipeline(&injector, receiver_transport, src_dir.path(), dest_storage).await;
+            run_pipeline(&injector, receiver_transport, src_dir.path(), dest_storage, true).await;
 
         assert_eq!(success_count, 0);
         assert_eq!(error_count, 1, "连续两次 mismatch 应进入 Error 终态");
@@ -913,7 +1008,7 @@ mod tests {
         let injector = HashMismatchInjector::new(sender_transport, HashMap::from([(0, 1)]));
 
         let (success_count, error_count) =
-            run_pipeline(&injector, receiver_transport, src_dir.path(), dest_storage).await;
+            run_pipeline(&injector, receiver_transport, src_dir.path(), dest_storage, true).await;
 
         assert_eq!(error_count, 0);
         assert_eq!(success_count, 1, "delta redo 降级全量重发后应最终成功");
@@ -938,7 +1033,7 @@ mod tests {
         let injector = HashMismatchInjector::new(sender_transport, HashMap::from([(0, 2)]));
 
         let (success_count, error_count) =
-            run_pipeline(&injector, receiver_transport, src_dir.path(), dest_storage).await;
+            run_pipeline(&injector, receiver_transport, src_dir.path(), dest_storage, true).await;
 
         assert_eq!(success_count, 0);
         assert_eq!(error_count, 1, "delta 降级全量重发后再次 mismatch 应进入 Error 终态");
@@ -961,13 +1056,201 @@ mod tests {
         );
         let (sender_transport, receiver_transport) = create_in_process_pair();
 
-        let (success_count, error_count) =
-            run_pipeline(&sender_transport, receiver_transport, src_dir.path(), dest_storage).await;
+        let (success_count, error_count) = run_pipeline(
+            &sender_transport,
+            receiver_transport,
+            src_dir.path(),
+            dest_storage,
+            true,
+        )
+        .await;
 
         assert_eq!(error_count, 0);
         assert_eq!(
             success_count, 3,
             "2 个文件 Success{{ndx}} + 1 个符号链接 EntrySuccess，共 3，互不重复计数"
+        );
+    }
+
+    // ============================================================
+    // Sender 自检失败 accounting 回归测试（review 轮次 #48 finding [0]/[1]/[2]/[3]）
+    //
+    // 用 `run_pipeline_with_disruption` 在“文件列表已确定、请求处理还没开始”这个
+    // 确定的时间点删除源文件（或预置目标端阻塞路径），确定性地制造 Sender 侧源读
+    // 失败 / 符号链接读失败 / Receiver 侧 resume_prepare 失败，避免真实并发下的时序
+    // 不确定性。所有断言「不 hang」的测试都用 tokio::time::timeout 包住，回归时超时
+    // 失败而不是把整个测试套 hang 死。
+    // ============================================================
+
+    /// [0] 全量源读失败：Sender 自增 error_count → `finalize_run_result` 返回 Err
+    /// （使 `main.rs` 的 exit(1) 生效），不再是原先的「仅 completed_count++、exit 0
+    /// 且目标端静默缺文件」。
+    #[tokio::test]
+    async fn full_transfer_source_read_failure_bumps_error_count() {
+        let src_dir = tempdir().unwrap();
+        let dest_dir = tempdir().unwrap();
+        let src_file = src_dir.path().join("a.txt");
+        fs::write(&src_file, b"will be deleted before Sender reads it").unwrap();
+
+        let dest_storage = Arc::new(
+            create_storage(dest_dir.path().to_str().unwrap(), None, true)
+                .await
+                .unwrap(),
+        );
+        let (sender_transport, receiver_transport) = create_in_process_pair();
+
+        let (success_count, error_count) = tokio::time::timeout(
+            Duration::from_secs(10),
+            run_pipeline_with_disruption(
+                &sender_transport,
+                receiver_transport,
+                src_dir.path(),
+                dest_storage,
+                || {
+                    fs::remove_file(&src_file).unwrap();
+                },
+            ),
+        )
+        .await
+        .expect("全量源读失败不应导致流水线 hang");
+
+        assert_eq!(success_count, 0);
+        assert_eq!(error_count, 1, "源读失败应使 Sender 自增 error_count");
+        match finalize_run_result(error_count) {
+            Err(AppError::RemoteSyncFailed { errors: 1 }) => {}
+            other => panic!("expected RemoteSyncFailed{{errors: 1}}, got {other:?}"),
+        }
+        assert!(!dest_dir.path().join("a.txt").exists(), "目标端不应静默出现该文件");
+    }
+
+    /// [2] delta 源读失败：该 ndx 正常完成（不 hang），Sender 自增 error_count →
+    /// `finalize_run_result` 返回 Err。修复前 `handle_delta_transfer` 读失败只
+    /// `return Ok(false)`、不发任何消息，Receiver 该 ndx 永不完成，两端 hang。
+    #[tokio::test]
+    async fn delta_transfer_source_read_failure_completes_ndx_without_hang() {
+        let src_dir = tempdir().unwrap();
+        let dest_dir = tempdir().unwrap();
+        let src_file = src_dir.path().join("a.txt");
+        fs::write(&src_file, vec![b'A'; 4096]).unwrap();
+        seed_delta_basis(dest_dir.path(), "a.txt", 4096);
+
+        let dest_storage = Arc::new(
+            create_storage(dest_dir.path().to_str().unwrap(), None, true)
+                .await
+                .unwrap(),
+        );
+        let (sender_transport, receiver_transport) = create_in_process_pair();
+
+        let (success_count, error_count) = tokio::time::timeout(
+            Duration::from_secs(10),
+            run_pipeline_with_disruption(
+                &sender_transport,
+                receiver_transport,
+                src_dir.path(),
+                dest_storage,
+                || {
+                    fs::remove_file(&src_file).unwrap();
+                },
+            ),
+        )
+        .await
+        .expect("delta 源读失败不应导致该 ndx 永不完成（hang）");
+
+        assert_eq!(success_count, 0);
+        assert_eq!(error_count, 1);
+        match finalize_run_result(error_count) {
+            Err(AppError::RemoteSyncFailed { errors: 1 }) => {}
+            other => panic!("expected RemoteSyncFailed{{errors: 1}}, got {other:?}"),
+        }
+    }
+
+    /// [3] 符号链接读失败：该 ndx 正常完成（不 hang），Sender 自增 error_count →
+    /// `finalize_run_result` 返回 Err。修复前 `read_symlink` 失败只记日志、不发任何
+    /// 消息，Receiver 该 ndx 永不完成，两端 hang。
+    #[tokio::test]
+    async fn symlink_read_failure_completes_ndx_without_hang() {
+        let src_dir = tempdir().unwrap();
+        let dest_dir = tempdir().unwrap();
+        let link_path = src_dir.path().join("link");
+        std::os::unix::fs::symlink("target-does-not-matter", &link_path).unwrap();
+
+        let dest_storage = Arc::new(
+            create_storage(dest_dir.path().to_str().unwrap(), None, true)
+                .await
+                .unwrap(),
+        );
+        let (sender_transport, receiver_transport) = create_in_process_pair();
+
+        let (success_count, error_count) = tokio::time::timeout(
+            Duration::from_secs(10),
+            run_pipeline_with_disruption(
+                &sender_transport,
+                receiver_transport,
+                src_dir.path(),
+                dest_storage,
+                || {
+                    fs::remove_file(&link_path).unwrap();
+                },
+            ),
+        )
+        .await
+        .expect("符号链接读失败不应导致该 ndx 永不完成（hang）");
+
+        assert_eq!(success_count, 0);
+        assert_eq!(error_count, 1);
+        match finalize_run_result(error_count) {
+            Err(AppError::RemoteSyncFailed { errors: 1 }) => {}
+            other => panic!("expected RemoteSyncFailed{{errors: 1}}, got {other:?}"),
+        }
+    }
+
+    /// [1] 同一 ndx 上「Sender 源读失败」与「Receiver resume_prepare 失败」并发触发
+    /// （预置目标端 `.terrasync-part` 路径为目录，令 dc task 的 `FileBegin` 独立上报
+    /// `HardError`；同时删除源文件令 Sender 自己的 chunk 读取也失败）：这是 redo 期间
+    /// 两个独立来源可能各自上报同一 ndx 终态的场景。修复前 completed_count 会被
+    /// 双计，导致主循环在其余在途文件（healthy.txt）到达前就提前 break、丢消息或
+    /// hang；修复后按 ndx 去重，healthy.txt 仍应正常送达、流水线不 hang。
+    #[tokio::test]
+    async fn same_ndx_double_failure_does_not_drop_inflight_files() {
+        let src_dir = tempdir().unwrap();
+        let dest_dir = tempdir().unwrap();
+        let broken_file = src_dir.path().join("broken.txt");
+        fs::write(&broken_file, b"will be deleted before Sender reads it").unwrap();
+        fs::write(src_dir.path().join("healthy.txt"), b"should still arrive").unwrap();
+        // 让 broken.txt 的 resume_prepare 必然失败（EISDIR）：预先在目标端占用它的
+        // .part 路径为目录。
+        fs::create_dir_all(dest_dir.path().join("broken.txt.terrasync-part")).unwrap();
+
+        let dest_storage = Arc::new(
+            create_storage(dest_dir.path().to_str().unwrap(), None, true)
+                .await
+                .unwrap(),
+        );
+        let (sender_transport, receiver_transport) = create_in_process_pair();
+
+        let (success_count, error_count) = tokio::time::timeout(
+            Duration::from_secs(10),
+            run_pipeline_with_disruption(
+                &sender_transport,
+                receiver_transport,
+                src_dir.path(),
+                dest_storage,
+                || {
+                    fs::remove_file(&broken_file).unwrap();
+                },
+            ),
+        )
+        .await
+        .expect("同一 ndx 的双重终态若未去重会导致 completed_count 打不平、主循环 hang");
+
+        assert_eq!(
+            success_count, 1,
+            "healthy.txt 不应因 broken.txt 的双重终态被提前 break 而丢失"
+        );
+        assert!(error_count >= 1, "broken.txt 的失败应至少被计入一次 error_count");
+        assert_eq!(
+            fs::read(dest_dir.path().join("healthy.txt")).unwrap(),
+            b"should still arrive"
         );
     }
 }

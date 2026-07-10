@@ -5,7 +5,7 @@
 //! 双进程模式下 Receiver 仅拥有 dest storage（数据流模式，Phase 3）。
 
 // 标准库
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Component, Path};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -165,7 +165,7 @@ pub async fn receiver_task(
                 break;
             }
 
-            SenderMsg::EntryError { path, reason } => {
+            SenderMsg::EntryError { path, reason, .. } => {
                 error!("[Receiver] Sender reported error for {}: {}", path.display(), reason);
             }
 
@@ -471,6 +471,10 @@ async fn recv_file_list_and_data_phase(
     let mut ndx_table = NdxTable::new();
     // ndx 级失败尝试计数（redo 决策用）：ndx → 已失败次数，见 decide_file_ack
     let mut attempts: HashMap<i32, u8> = HashMap::new();
+    // 已终结的 ndx：redo 期间 dc task（全量路径 HardError）与 Sender 自检失败
+    // （SenderMsg::EntryError）可能各自独立上报同一 ndx 的终态，按 ndx 去重只在首次
+    // 生效，防止 completed_count 被多次计入导致主循环提前 break、丢在途文件（[1]）。
+    let mut terminated: HashSet<i32> = HashSet::new();
     // delta 重建 token 缓冲
     let mut delta_tokens: Vec<sync_delta::DeltaToken> = Vec::new();
     // TransferDone 与实际数据完成的解耦计数（见函数文档）
@@ -514,8 +518,18 @@ async fn recv_file_list_and_data_phase(
                         }
                     }
                     DcAck::FileOutcome { ndx, outcome } => {
-                        if dispatch_file_outcome(transport, &mut attempts, progress, ndx, outcome).await
-                            && complete_ndx(&mut completed_count, requested_count, transfer_done_seen)
+                        if dispatch_file_outcome(
+                            transport,
+                            &mut attempts,
+                            &mut terminated,
+                            progress,
+                            ndx,
+                            outcome,
+                            &mut completed_count,
+                            requested_count,
+                            transfer_done_seen,
+                        )
+                        .await
                         {
                             break;
                         }
@@ -740,8 +754,18 @@ async fn recv_file_list_and_data_phase(
                     let tokens = std::mem::take(&mut delta_tokens);
                     let outcome =
                         handle_end_of_file(dest_storage, &entry, source_hash, tokens, Bytes::new(), progress).await;
-                    if dispatch_file_outcome(transport, &mut attempts, progress, ndx, outcome).await
-                        && complete_ndx(&mut completed_count, requested_count, transfer_done_seen)
+                    if dispatch_file_outcome(
+                        transport,
+                        &mut attempts,
+                        &mut terminated,
+                        progress,
+                        ndx,
+                        outcome,
+                        &mut completed_count,
+                        requested_count,
+                        transfer_done_seen,
+                    )
+                    .await
                     {
                         break;
                     }
@@ -768,13 +792,24 @@ async fn recv_file_list_and_data_phase(
                     break;
                 }
             }
-            // ── Sender 源读失败：中止正在写入的文件（丢弃 .part，dc 不发 ack），并计一次完成 ──
-            Some(SenderMsg::EntryError { path, reason }) => {
+            // ── Sender 自检失败（源读/符号链接读失败）：中止正在写入的文件（丢弃 .part，
+            //    dc 不发 ack）。Sender 已在本地自增 error_count，这里只完成该 ndx 的
+            //    计数、不回发 ReceiverMsg::Error（避免与 Sender 自增重复）；按 ndx 去重
+            //    防止与 dc task 独立上报的终态重复计数（[1]）──
+            Some(SenderMsg::EntryError { path, reason, ndx }) => {
                 warn!("[Receiver Remote] Sender EntryError {:?}: {} — 中止该文件", path, reason);
                 full_active = false;
                 let _ = dc_tx.send(DiskCommitMsg::AbortFile).await;
-                completed_count += 1;
-                if transfer_done_seen && completed_count >= requested_count {
+                let should_break = if let Some(ndx) = ndx {
+                    record_ndx_completion(&mut terminated, ndx, &mut completed_count, requested_count, transfer_done_seen)
+                } else {
+                    // 双进程主循环下理应总带 ndx（单进程 tar 打包失败等无 ndx 场景走
+                    // receiver_task，不会到这里）；防御性兜底：仍完成一次计数，避免缺失
+                    // 关联导致 completed_count 永远打不平。
+                    completed_count += 1;
+                    transfer_done_seen && completed_count >= requested_count
+                };
+                if should_break {
                     info!("[Receiver Remote] All transfers complete");
                     break;
                 }
@@ -797,7 +832,18 @@ async fn recv_file_list_and_data_phase(
                 let _ = transport.send(ack).await;
             }
             DcAck::FileOutcome { ndx, outcome } => {
-                let _ = dispatch_file_outcome(transport, &mut attempts, progress, ndx, outcome).await;
+                let _ = dispatch_file_outcome(
+                    transport,
+                    &mut attempts,
+                    &mut terminated,
+                    progress,
+                    ndx,
+                    outcome,
+                    &mut completed_count,
+                    requested_count,
+                    transfer_done_seen,
+                )
+                .await;
             }
         }
     }
@@ -849,23 +895,44 @@ fn decide_file_ack(attempts: &mut HashMap<i32, u8>, ndx: i32, outcome: FileOutco
 }
 
 /// `FileOutcome` 上报的统一处理入口（dc task 全量路径 / delta inline 路径共用）：
-/// 调用 `decide_file_ack` 做 redo 决策，终态为 `Error` 时累加 `progress.error_count`，
-/// 把决策结果发回 Sender。返回 `is_terminal`，调用方据此决定是否 `complete_ndx`。
+/// 调用 `decide_file_ack` 做 redo 决策；非终态（`Redo`）直接发 ack、不动
+/// `completed_count`。终态先按 `ndx` 去重（redo 期间 dc task 与 Sender 自检失败
+/// 可能各自独立上报同一 ndx 的终态，去重只在首次生效，见 [`record_ndx_completion`]）：
+/// 去重命中则连 ack 都不再发（避免 Sender 收到同一 ndx 的重复终态 ack），否则累加
+/// `progress.error_count`（若为 `Error`）、发 ack、计入 `completed_count`。
+///
+/// 返回是否应 break 主循环（`completed_count` 打平且已见过 `TransferDone`）。
+#[allow(clippy::too_many_arguments)]
 async fn dispatch_file_outcome(
-    transport: &(dyn ReceiverTransport + 'static), attempts: &mut HashMap<i32, u8>, progress: &Arc<ReceiverProgress>,
-    ndx: i32, outcome: FileOutcome,
+    transport: &(dyn ReceiverTransport + 'static), attempts: &mut HashMap<i32, u8>, terminated: &mut HashSet<i32>,
+    progress: &Arc<ReceiverProgress>, ndx: i32, outcome: FileOutcome, completed_count: &mut u64, requested_count: u64,
+    transfer_done_seen: bool,
 ) -> bool {
     let (ack, is_terminal) = decide_file_ack(attempts, ndx, outcome);
+    if !is_terminal {
+        let _ = transport.send(ack).await;
+        return false;
+    }
+    if terminated.contains(&ndx) {
+        debug!("[Receiver Remote] ndx {} 已终结，丢弃重复终态: {:?}", ndx, ack);
+        return false;
+    }
     if matches!(ack, ReceiverMsg::Error { .. }) {
         progress.error_count.fetch_add(1, Ordering::Relaxed);
     }
     let _ = transport.send(ack).await;
-    is_terminal
+    record_ndx_completion(terminated, ndx, completed_count, requested_count, transfer_done_seen)
 }
 
-/// 完成一次 ndx 级传输：`completed_count += 1`；若已见过 `TransferDone` 且计数打平，
-/// 返回 `true`（调用方应 break 主循环收尾）。
-fn complete_ndx(completed_count: &mut u64, requested_count: u64, transfer_done_seen: bool) -> bool {
+/// ndx 首次终结时计入 `completed_count` 并判断是否应收尾 break；同一 ndx 的重复终结
+/// （已在 `terminated` 中）直接丢弃、返回 `false`，防止 redo 期间多个来源独立上报
+/// 同一 ndx 导致 `completed_count` 被多次计入、主循环提前 break 丢在途文件（[1]）。
+fn record_ndx_completion(
+    terminated: &mut HashSet<i32>, ndx: i32, completed_count: &mut u64, requested_count: u64, transfer_done_seen: bool,
+) -> bool {
+    if !terminated.insert(ndx) {
+        return false;
+    }
     *completed_count += 1;
     if transfer_done_seen && *completed_count >= requested_count {
         info!("[Receiver Remote] All transfers complete");
