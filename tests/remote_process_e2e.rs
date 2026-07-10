@@ -96,6 +96,17 @@ fn assert_dest_matches_src(src_dir: &Path, dest_dir: &Path, rel_paths: &[PathBuf
     }
 }
 
+/// 读取目录 mtime（秒）。
+fn dir_mtime_secs(p: &Path) -> u64 {
+    fs::metadata(p)
+        .unwrap_or_else(|e| panic!("stat {p:?}: {e}"))
+        .modified()
+        .expect("mtime")
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("epoch")
+        .as_secs()
+}
+
 /// 轮询等待 Receiver 就绪：TLS 证书文件写盘完成即视为就绪。
 ///
 /// `serve` 进程 bind QUIC endpoint、生成自签名证书后立即写文件（见
@@ -242,6 +253,91 @@ fn test_remote_process_e2e_handshake_and_sync() {
     let receiver_log = tmp_path.join("logs").join("app.log");
     assert_handshake_accepted_in_log(&sender_log, "Sender");
     assert_handshake_accepted_in_log(&receiver_log, "Receiver");
+}
+
+/// 回归：双进程同步应保留目录 mtime。写子文件会把目标端目录 mtime 顶到 ~now，
+/// 必须在所有传输完成后回写目录元数据（对齐单进程 orchestrator 的目录 mtime 收尾）。
+#[test]
+fn test_remote_process_e2e_dir_mtime_preserved() {
+    let tmp = tempfile::tempdir().expect("create tempdir");
+    let tmp_path = tmp.path();
+
+    let src_dir = tmp_path.join("src");
+    let dest_dir = tmp_path.join("dest");
+    fs::create_dir_all(&src_dir).expect("create src dir");
+    fs::create_dir_all(&dest_dir).expect("create dest dir");
+    populate_src_dir(&src_dir);
+
+    // 写完文件后把源端目录 mtime 设成显著的过去时间，以便与"被文件写入顶到 ~now"清晰区分。
+    let dirs = ["sub", "sub/deeper"];
+    for d in dirs {
+        let status = StdCommand::new("touch")
+            .arg("-t")
+            .arg("200102030405")
+            .arg(src_dir.join(d))
+            .status()
+            .expect("touch src dir mtime");
+        assert!(status.success(), "touch {d} 失败");
+    }
+    let src_mtimes: Vec<u64> = dirs.iter().map(|d| dir_mtime_secs(&src_dir.join(d))).collect();
+
+    let cert_path = tmp_path.join("server.crt");
+    let config_path = tmp_path.join("config.toml");
+    fs::write(&config_path, "[database]\nenabled = false\n").expect("write config");
+    let fake_manifest_dir = tmp_path.join("fake_manifest");
+    let port = free_loopback_port();
+    let listen_addr = format!("127.0.0.1:{port}");
+    let bin_path = cargo_bin("terrasync");
+
+    let mut receiver_child = StdCommand::new(&bin_path)
+        .env("CARGO_MANIFEST_DIR", &fake_manifest_dir)
+        .current_dir(tmp_path)
+        .arg("-c")
+        .arg(&config_path)
+        .arg("serve")
+        .arg("--listen")
+        .arg(&listen_addr)
+        .arg("--tls-cert-out")
+        .arg(&cert_path)
+        .arg(&dest_dir)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn receiver process");
+    wait_for_cert_file(&cert_path);
+
+    let mut sender_cmd = AssertCommand::new(&bin_path);
+    sender_cmd
+        .env("CARGO_MANIFEST_DIR", &fake_manifest_dir)
+        .current_dir(tmp_path)
+        .arg("-c")
+        .arg(&config_path)
+        .arg("sync")
+        .arg("--id")
+        .arg("remote_dir_mtime_test")
+        .arg("--remote")
+        .arg(&listen_addr)
+        .arg("--tls-server-cert")
+        .arg(&cert_path)
+        .arg(&src_dir)
+        .arg(&dest_dir);
+    sender_cmd.assert().success();
+
+    let receiver_status = wait_for_child_exit(&mut receiver_child, RECEIVER_EXIT_TIMEOUT);
+    let (rout, rerr) = drain_output(&mut receiver_child);
+    assert!(
+        matches!(receiver_status, Some(s) if s.success()),
+        "Receiver 异常退出: {receiver_status:?}\nstdout:\n{rout}\nstderr:\n{rerr}"
+    );
+
+    // 目标端目录 mtime 必须与源端一致（修复前：被文件写入顶到 ~now，不等于源端过去时间）。
+    for (d, &src_m) in dirs.iter().zip(&src_mtimes) {
+        let dest_m = dir_mtime_secs(&dest_dir.join(d));
+        assert_eq!(
+            dest_m, src_m,
+            "目标端目录 {d} mtime={dest_m} 应等于源端 {src_m}（未回写则被子文件写入顶到 ~now）"
+        );
+    }
 }
 
 /// Token 鉴权测试（进程级）：Sender 携带与 Receiver 一致的 `--token` → 鉴权通过 → 全量同步成功

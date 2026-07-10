@@ -477,6 +477,9 @@ async fn recv_file_list_and_data_phase(
     // 全量文件是否走 disk-commit 流式路径：以是否见过 FileBegin 判定（而非 token 是否为空），
     // 避免源端缩到 0 字节的 delta 传输（token 空且无 FileBegin）被误判为全量。
     let mut full_active = false;
+    // 已创建的目录：所有文件传输完成后统一回写 mtime/mode(写子文件会把目录 mtime 顶到当前时间;
+    // 且 0500 等受限权限须在写完子项后才能设),对齐单进程 orchestrator 的目录 mtime 收尾。
+    let mut created_dirs: Vec<Arc<EntryEnum>> = Vec::new();
     // disk-commit task：全量文件三段流式落盘（去整文件 BytesMut）；ack 经 unbounded channel 回流，
     // 避免路由 select 阻在 dc_tx.send 时不 drain ack → dc 阻在 ack_tx.send 的双向死锁。
     let (dc_tx, dc_rx) = tokio::sync::mpsc::channel::<DiskCommitMsg>(16);
@@ -602,6 +605,8 @@ async fn recv_file_list_and_data_phase(
                     if let Err(e) = dest_storage.create_dir_all(&ns.entry).await {
                         warn!("[Receiver Remote] create_dir {:?}: {}", ns.entry.get_relative_path(), e);
                     }
+                    // 目录 mtime/mode 待所有传输完成后统一回写（见 created_dirs 声明处）
+                    created_dirs.push(ns.entry.clone());
                 }
 
                 // --delete-target: 删除目标端多余文件
@@ -771,6 +776,17 @@ async fn recv_file_list_and_data_phase(
         .map_err(|e| AppError::CopyError(format!("disk-commit task join: {e}")))??;
     while let Ok(ack) = ack_rx.try_recv() {
         let _ = transport.send(ack).await;
+    }
+
+    // 回写目录 mtime/mode：所有文件已落盘,此时设目录元数据不会再被子文件写入顶掉。
+    for dir_entry in &created_dirs {
+        if let Err(e) = dest_storage.set_entry_metadata(dir_entry).await {
+            warn!(
+                "[Receiver Remote] 回写目录元数据 {:?} 失败: {}",
+                dir_entry.get_relative_path(),
+                e
+            );
+        }
     }
 
     Ok(())
