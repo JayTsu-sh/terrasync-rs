@@ -426,7 +426,6 @@ async fn handle_full_transfer(
         while let Some(chunk) = rx.recv().await {
             transport
                 .send(SenderMsg::FileData {
-                    ndx,
                     entry: entry.clone(),
                     chunk,
                 })

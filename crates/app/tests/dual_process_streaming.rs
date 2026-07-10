@@ -124,7 +124,6 @@ async fn dc_writes_full_file_and_acks_success() {
     ];
     for (off, c) in chunkify(&bytes, 1 << 20) {
         msgs.push(DiskCommitMsg::FileChunk {
-            ndx: 0,
             entry: entry.clone(),
             chunk: DataChunk { offset: off, data: c },
         });
@@ -170,7 +169,6 @@ async fn dc_hash_mismatch_rejects_and_cleans_part() {
     }];
     for (off, c) in chunkify(&bytes, 1 << 20) {
         msgs.push(DiskCommitMsg::FileChunk {
-            ndx: 0,
             entry: entry.clone(),
             chunk: DataChunk { offset: off, data: c },
         });
@@ -293,7 +291,6 @@ async fn dc_abort_file_drops_part_no_ack() {
     }];
     for (off, c) in chunkify(&bytes, 1 << 20) {
         msgs.push(DiskCommitMsg::FileChunk {
-            ndx: 0,
             entry: entry.clone(),
             chunk: DataChunk { offset: off, data: c },
         });

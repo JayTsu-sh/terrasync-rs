@@ -47,12 +47,9 @@ pub enum SenderMsg {
     CreateSymlink { entry: Arc<EntryEnum>, target: PathBuf },
     /// 文件传输开始（Receiver 用于准备写入上下文）
     FileBegin { ndx: i32, entry: Arc<EntryEnum> },
-    /// 文件数据块
-    FileData {
-        ndx: i32,
-        entry: Arc<EntryEnum>,
-        chunk: DataChunk,
-    },
+    /// 文件数据块（不带 `ndx`：dc task 严格串行处理，同一时刻只有一个 `ActiveFile`，
+    /// 落盘路由靠 `FileBegin`/`FileCommit` 上的 `ndx` 即可确定，chunk 级 `ndx` 从未被读取）
+    FileData { entry: Arc<EntryEnum>, chunk: DataChunk },
     /// 文件传输结束
     EndOfFile {
         ndx: i32,
@@ -147,8 +144,8 @@ pub enum ReceiverMsg {
 ///
 /// 双进程远端同步（QUIC）协议演进时递增，用于握手阶段判断新旧版本是否兼容。
 ///
-/// 2：`SenderMsg::FileBegin/FileData/EndOfFile` 加 `ndx` 字段、`SenderMsg::EntryError`
-/// 加 `ndx: Option<i32>`（issue #22 ndx 级 redo/ack 状态机），bincode 线格式不兼容 v1。
+/// 2：`SenderMsg::FileBegin/EndOfFile` 加 `ndx` 字段、`SenderMsg::EntryError` 加
+/// `ndx: Option<i32>`（issue #22 ndx 级 redo/ack 状态机），bincode 线格式不兼容 v1。
 pub const PROTOCOL_VERSION: u32 = 2;
 
 /// 当前 binary 能接受的最低对端协议版本
@@ -366,12 +363,9 @@ pub enum DiskCommitMsg {
     // ── 全量文件传输（3 段流式驱动） ──
     /// 文件开始：Receiver 据此 resume_prepare + 起 write_chunk_stream
     FileBegin { ndx: i32, entry: Arc<EntryEnum> },
-    /// 文件数据块（直接转发 DataChunk 给 write_chunk_stream 的 channel）
-    FileChunk {
-        ndx: i32,
-        entry: Arc<EntryEnum>,
-        chunk: DataChunk,
-    },
+    /// 文件数据块（直接转发 DataChunk 给 write_chunk_stream 的 channel；不带 `ndx`：
+    /// dc task 严格串行，同一时刻只有一个 `ActiveFile`，从未被读取）
+    FileChunk { entry: Arc<EntryEnum>, chunk: DataChunk },
     /// 文件传输结束，提交：读回 .part hash 校验 + set_metadata + ACL + 原子 rename
     FileCommit {
         ndx: i32,
@@ -546,8 +540,8 @@ mod tests {
     use super::*;
 
     /// v1 对端（本 PR 改动 `SenderMsg` bincode 线格式前的协议版本）握手时必须被拒绝：
-    /// `ndx` 加入 `FileBegin`/`FileData`/`EndOfFile`/`EntryError` 后 v1 与当前 v2 的
-    /// bincode schema 不兼容，接受 v1 对端会导致错位解码甚至写坏数据。
+    /// `ndx` 加入 `FileBegin`/`EndOfFile`/`EntryError` 后 v1 与当前 v2 的 bincode schema
+    /// 不兼容，接受 v1 对端会导致错位解码甚至写坏数据。
     #[test]
     fn negotiate_rejects_v1_peer() {
         let current = ProtocolHandshake::current();

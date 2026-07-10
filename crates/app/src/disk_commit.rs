@@ -97,7 +97,7 @@ pub async fn disk_commit_task(
                     }
                 }
             }
-            DiskCommitMsg::FileChunk { entry, chunk, .. } => {
+            DiskCommitMsg::FileChunk { entry, chunk } => {
                 // 保留 active：后续 FileCommit 仍需 join 写任务并上报那唯一的真实 outcome。
                 // 写任务已死时每个残余 chunk 都会 send 失败，故降为 debug 避免刷屏。
                 if let Some(a) = active.as_ref()

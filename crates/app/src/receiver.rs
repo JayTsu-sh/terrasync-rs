@@ -717,8 +717,8 @@ async fn recv_file_list_and_data_phase(
             }
 
             // ── 数据流模式：文件数据块 → 转发给 disk-commit task 的 write_chunk_stream ──
-            Some(SenderMsg::FileData { ndx, entry, chunk }) => {
-                let _ = dc_tx.send(DiskCommitMsg::FileChunk { ndx, entry, chunk }).await;
+            Some(SenderMsg::FileData { entry, chunk }) => {
+                let _ = dc_tx.send(DiskCommitMsg::FileChunk { entry, chunk }).await;
             }
 
             // ── Delta token 接收 ──
