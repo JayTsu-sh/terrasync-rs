@@ -10,15 +10,15 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 // 外部 crate
-use bytes::{BufMut, BytesMut};
+use bytes::Bytes;
 use data_mover::qos::QosManager;
 use data_mover::{EntryEnum, StorageEnum};
 use tokio::sync::mpsc::Receiver as MpscReceiver;
 use tracing::{Instrument, debug, error, info, info_span, trace, warn};
 use transport::error::TransportError;
 use transport::message::{
-    DestIndex, FeatureFlags, HandshakeResult, NdxTable, ProgressSnapshot, ProtocolHandshake, ReceiverMsg, SenderMsg,
-    SessionConfig,
+    DestIndex, DiskCommitMsg, FeatureFlags, HandshakeResult, NdxTable, ProgressSnapshot, ProtocolHandshake,
+    ReceiverMsg, SenderMsg, SessionConfig,
 };
 use transport::traits::ReceiverTransport;
 
@@ -470,18 +470,39 @@ async fn recv_file_list_and_data_phase(
     let mut ndx_table = NdxTable::new();
     // delta 重建 token 缓冲
     let mut delta_tokens: Vec<sync_delta::DeltaToken> = Vec::new();
-    // 文件数据流缓冲（BytesMut，支持多 chunk 追加，FileBegin 时清空）
-    let mut file_data_buf = BytesMut::new();
     // TransferDone 与实际数据完成的解耦计数（见函数文档）
     let mut requested_count: u64 = 0;
     let mut completed_count: u64 = 0;
     let mut transfer_done_seen = false;
+    // 全量文件是否走 disk-commit 流式路径：以是否见过 FileBegin 判定（而非 token 是否为空），
+    // 避免源端缩到 0 字节的 delta 传输（token 空且无 FileBegin）被误判为全量。
+    let mut full_active = false;
+    // disk-commit task：全量文件三段流式落盘（去整文件 BytesMut）；ack 经 unbounded channel 回流，
+    // 避免路由 select 阻在 dc_tx.send 时不 drain ack → dc 阻在 ack_tx.send 的双向死锁。
+    let (dc_tx, dc_rx) = tokio::sync::mpsc::channel::<DiskCommitMsg>(16);
+    let (ack_tx, mut ack_rx) = tokio::sync::mpsc::unbounded_channel::<ReceiverMsg>();
+    let dc_join = tokio::spawn(crate::disk_commit::disk_commit_task(
+        dest_storage.clone(),
+        session_config.clone(),
+        dc_rx,
+        ack_tx,
+        progress.clone(),
+    ));
 
     loop {
         // 同时处理 transport 消息和 progress 上报
         tokio::select! {
             Some(snapshot) = progress_rx.recv() => {
                 let _ = transport.send(ReceiverMsg::Progress(snapshot)).await;
+            }
+            // ── disk-commit task 回流的全量文件 ack（每个文件 FileCommit 成功/失败各一条）──
+            Some(ack) = ack_rx.recv() => {
+                let _ = transport.send(ack).await;
+                completed_count += 1;
+                if transfer_done_seen && completed_count >= requested_count {
+                    info!("[Receiver Remote] All transfers complete");
+                    break;
+                }
             }
             msg = transport.recv() => { match msg {
             // ── 文件列表：FilePage → DestIndex 比较 → 发 TransferRequest/DeltaTransferRequest ──
@@ -618,10 +639,11 @@ async fn recv_file_list_and_data_phase(
                 let _ = transport.send(ReceiverMsg::RequestsDone).await;
             }
 
-            // ── 文件开始：重置缓冲区，防止跨文件状态污染 ──
-            Some(SenderMsg::FileBegin { .. }) => {
-                file_data_buf.clear();
+            // ── 文件开始：标记走全量流式路径，交 disk-commit task 起 resume_prepare + write_chunk_stream ──
+            Some(SenderMsg::FileBegin { entry }) => {
+                full_active = true;
                 delta_tokens.clear();
+                let _ = dc_tx.send(DiskCommitMsg::FileBegin { entry }).await;
             }
 
             // ── 数据流模式：目录 ──
@@ -674,9 +696,9 @@ async fn recv_file_list_and_data_phase(
                 }
             }
 
-            // ── 数据流模式：文件数据块（追加到 BytesMut） ──
-            Some(SenderMsg::FileData { chunk, .. }) => {
-                file_data_buf.put_slice(&chunk.data);
+            // ── 数据流模式：文件数据块 → 转发给 disk-commit task 的 write_chunk_stream ──
+            Some(SenderMsg::FileData { entry, chunk }) => {
+                let _ = dc_tx.send(DiskCommitMsg::FileChunk { entry, chunk }).await;
             }
 
             // ── Delta token 接收 ──
@@ -687,15 +709,20 @@ async fn recv_file_list_and_data_phase(
                 delta_tokens.push(sync_delta::DeltaToken::Data(data));
             }
 
-            // ── 文件结束：校验 + 写入 ──
+            // ── 文件结束：见过 FileBegin → 全量交 disk-commit task 收尾（读回 .part hash 校验 → 原子
+            //    rename），completed_count 在 dc ack 回流时才 +1；否则走 delta inline 重建（保持原逻辑）──
             Some(SenderMsg::EndOfFile { entry, source_hash }) => {
-                let tokens = std::mem::take(&mut delta_tokens);
-                let file_data = file_data_buf.split().freeze();
-                handle_end_of_file(transport, dest_storage, entry, source_hash, tokens, file_data, progress).await;
-                completed_count += 1;
-                if transfer_done_seen && completed_count >= requested_count {
-                    info!("[Receiver Remote] All transfers complete");
-                    break;
+                if full_active {
+                    full_active = false;
+                    let _ = dc_tx.send(DiskCommitMsg::FileCommit { entry, source_hash }).await;
+                } else {
+                    let tokens = std::mem::take(&mut delta_tokens);
+                    handle_end_of_file(transport, dest_storage, entry, source_hash, tokens, Bytes::new(), progress).await;
+                    completed_count += 1;
+                    if transfer_done_seen && completed_count >= requested_count {
+                        info!("[Receiver Remote] All transfers complete");
+                        break;
+                    }
                 }
             }
 
@@ -719,11 +746,32 @@ async fn recv_file_list_and_data_phase(
                     break;
                 }
             }
+            // ── Sender 源读失败：中止正在写入的文件（丢弃 .part，dc 不发 ack），并计一次完成 ──
+            Some(SenderMsg::EntryError { path, reason }) => {
+                warn!("[Receiver Remote] Sender EntryError {:?}: {} — 中止该文件", path, reason);
+                full_active = false;
+                let _ = dc_tx.send(DiskCommitMsg::AbortFile).await;
+                completed_count += 1;
+                if transfer_done_seen && completed_count >= requested_count {
+                    info!("[Receiver Remote] All transfers complete");
+                    break;
+                }
+            }
             Some(_) => {}
             None => return Err(AppError::CopyError("Transport closed during file list/data phase".into())),
         }} // close match + select! msg arm
         } // close select!
     } // close loop
+
+    // 收尾：关闭 dc_tx → disk-commit task 处理完积压后退出；等待 join；drain 剩余 ack。
+    let _ = dc_tx.send(DiskCommitMsg::Shutdown).await;
+    drop(dc_tx);
+    dc_join
+        .await
+        .map_err(|e| AppError::CopyError(format!("disk-commit task join: {e}")))??;
+    while let Ok(ack) = ack_rx.try_recv() {
+        let _ = transport.send(ack).await;
+    }
 
     Ok(())
 }

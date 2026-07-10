@@ -17,7 +17,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use data_mover::dir_tree::NdxEvent;
 use data_mover::filter::parse_filter_expression;
 use data_mover::qos::QosManager;
-use data_mover::{DataChunk, StorageEnum, WalkDirAsyncIterator2, create_storage};
+use data_mover::{ConsistencyCheck, StorageEnum, WalkDirAsyncIterator2, create_storage};
 use rustls::pki_types::CertificateDer;
 use tracing::{debug, error, info, warn};
 use transport::error::TransportError;
@@ -32,9 +32,6 @@ use crate::consumer::stats::format_bytes;
 use crate::error::{AppError, Result};
 use crate::orchestrator::create_qos_manager;
 use crate::sync::parse_size;
-
-/// 文件分块传输大小（4 MiB）
-const FILE_CHUNK_SIZE: usize = 4 * 1024 * 1024;
 
 /// 双进程全量同步 — Sender 侧入口
 ///
@@ -366,38 +363,43 @@ async fn handle_full_transfer(
             }
         }
     } else {
-        let size = entry.get_size();
-        match StorageEnum::read_file_from(src_storage, entry, size).await {
-            Ok(data) => {
-                let hash = blake3::hash(&data).to_hex().to_string();
-                transport.send(SenderMsg::FileBegin { entry: entry.clone() }).await?;
-                let mut offset = 0usize;
-                while offset < data.len() {
-                    let end = (offset + FILE_CHUNK_SIZE).min(data.len());
-                    let chunk = data.slice(offset..end);
-                    if let Some(q) = qos {
-                        q.acquire(chunk.len() as u64).await;
-                    }
-                    transport
-                        .send(SenderMsg::FileData {
-                            entry: entry.clone(),
-                            chunk: DataChunk {
-                                offset: offset as u64,
-                                data: chunk,
-                            },
-                        })
-                        .await?;
-                    offset = end;
-                }
+        // 流式读源文件：read_chunk_stream 内部按块读 + per-chunk QoS + hash（不再整文件驻留 RAM）
+        let (mut rx, hash_handle) = StorageEnum::read_chunk_stream(src_storage, entry, None, qos.cloned(), true, 8);
+        transport.send(SenderMsg::FileBegin { entry: entry.clone() }).await?;
+        while let Some(chunk) = rx.recv().await {
+            transport
+                .send(SenderMsg::FileData {
+                    entry: entry.clone(),
+                    chunk,
+                })
+                .await?;
+        }
+        // 读任务收尾：JoinError 或内层读错误统一归一为原因字符串
+        let read_result = match hash_handle.await {
+            Ok(inner) => inner.map_err(|e| e.to_string()),
+            Err(e) => Err(e.to_string()),
+        };
+        match read_result {
+            // 成功：拿到源 hash（整文件 BLAKE3 十六进制）并收尾
+            Ok(hasher) => {
+                let source_hash = hasher.map(ConsistencyCheck::finalize);
                 transport
                     .send(SenderMsg::EndOfFile {
                         entry: entry.clone(),
-                        source_hash: Some(hash),
+                        source_hash,
                     })
                     .await?;
             }
-            Err(e) => {
-                error!("[Sender Remote] read file {:?}: {}", entry.get_relative_path(), e);
+            // 读失败：记录日志 + 通知 Receiver 丢弃该文件已收分片，跳过（不发 ACL、不中断会话）
+            Err(reason) => {
+                error!("[Sender Remote] read file {:?}: {}", entry.get_relative_path(), reason);
+                transport
+                    .send(SenderMsg::EntryError {
+                        path: entry.get_relative_path().to_path_buf(),
+                        reason,
+                    })
+                    .await?;
+                return Ok(());
             }
         }
     }

@@ -355,14 +355,12 @@ pub enum DiskCommitMsg {
     /// 创建符号链接
     CreateSymlink { entry: Arc<EntryEnum>, target: PathBuf },
 
-    // ── 全量文件传输 ──
-    /// 文件数据块（含 entry 引用，receiver 据此构建写入上下文）
-    FileChunk {
-        entry: Arc<EntryEnum>,
-        data: Bytes,
-        offset: u64,
-    },
-    /// 文件传输结束，提交：校验 hash + `set_metadata` + ACL
+    // ── 全量文件传输（3 段流式驱动） ──
+    /// 文件开始：Receiver 据此 resume_prepare + 起 write_chunk_stream
+    FileBegin { entry: Arc<EntryEnum> },
+    /// 文件数据块（直接转发 DataChunk 给 write_chunk_stream 的 channel）
+    FileChunk { entry: Arc<EntryEnum>, chunk: DataChunk },
+    /// 文件传输结束，提交：读回 .part hash 校验 + set_metadata + ACL + 原子 rename
     FileCommit {
         entry: Arc<EntryEnum>,
         source_hash: Option<String>,
@@ -389,6 +387,8 @@ pub enum DiskCommitMsg {
     },
 
     // ── 控制 ──
+    /// 中止当前正在写入的文件（Sender 读源失败）：丢弃 `.part`，不发 ack
+    AbortFile,
     /// 关闭 disk-commit task
     Shutdown,
 }
