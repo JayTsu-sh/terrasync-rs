@@ -257,6 +257,10 @@ async fn process_requests_and_acks(
     let mut transfer_count = 0u64;
     let mut success_count = 0u64;
     let mut error_count = 0u64;
+    // 已计过 error_count 的 ndx：复合失败（同 ndx 源读失败 + dest 侧 resume_prepare
+    // 失败）时，Sender 自检失败与 Receiver 回传的 Error{ndx} 可能各自独立触发一次
+    // error_count += 1，按 ndx 去重只计一次（见 count_ndx_error）。
+    let mut errored_ndx: HashSet<i32> = HashSet::new();
     loop {
         match transport.recv().await {
             Some(ReceiverMsg::TransferRequest { ndx }) => {
@@ -269,7 +273,7 @@ async fn process_requests_and_acks(
                     // 源读/符号链接读失败：Sender 已发 EntryError 通知 Receiver 完成该
                     // ndx，这里自增 error_count（Sender 自检失败由 Sender 自己计数，见 [0][3]）
                     if !handle_full_transfer(transport, src_storage, &entry, ndx, qos, enable_acl).await? {
-                        error_count += 1;
+                        count_ndx_error(&mut errored_ndx, ndx, &mut error_count);
                     }
                     transfer_count += 1;
                 } else {
@@ -303,7 +307,7 @@ async fn process_requests_and_acks(
                     {
                         transfer_count += 1;
                     } else {
-                        error_count += 1;
+                        count_ndx_error(&mut errored_ndx, ndx, &mut error_count);
                     }
                 } else {
                     error!("[Sender Remote] Unknown NDX {} for delta", ndx);
@@ -319,7 +323,7 @@ async fn process_requests_and_acks(
                     .cloned();
                 if let Some(entry) = entry {
                     if !handle_full_transfer(transport, src_storage, &entry, ndx, qos, enable_acl).await? {
-                        error_count += 1;
+                        count_ndx_error(&mut errored_ndx, ndx, &mut error_count);
                     }
                 } else {
                     error!("[Sender Remote] Unknown NDX {} for redo", ndx);
@@ -376,7 +380,7 @@ async fn process_requests_and_acks(
             // ── ndx 级文件传输终态失败（redo 二次失败）：与 EntryError 共用同一个 error_count ──
             Some(ReceiverMsg::Error { ndx, reason }) => {
                 error!("[Sender Remote] NDX {} failed: {}", ndx, reason);
-                error_count += 1;
+                count_ndx_error(&mut errored_ndx, ndx, &mut error_count);
             }
             Some(ReceiverMsg::AllDone) => break,
             Some(other) => {
@@ -386,6 +390,16 @@ async fn process_requests_and_acks(
         }
     }
     Ok((transfer_count, success_count, error_count))
+}
+
+/// 同一 ndx 的失败只计一次 `error_count`：复合失败（同 ndx 源读失败 **且** dest 侧
+/// `resume_prepare` 失败）时，Sender 自检失败（`handle_full_transfer`/
+/// `handle_delta_transfer` 返回 `false`）与 Receiver 回传的 `ReceiverMsg::Error{ndx}`
+/// 可能各自独立触发一次增量；ndx 唯一对应一个文件，一个文件至多算一次错误。
+fn count_ndx_error(errored: &mut HashSet<i32>, ndx: i32, error_count: &mut u64) {
+    if errored.insert(ndx) {
+        *error_count += 1;
+    }
 }
 
 /// 记录一次成功（ndx 级 `Success` 与 Entry 级 `EntrySuccess` 共用同一份逻辑）：
@@ -1218,9 +1232,11 @@ mod tests {
     /// [1] 同一 ndx 上「Sender 源读失败」与「Receiver resume_prepare 失败」并发触发
     /// （预置目标端 `.terrasync-part` 路径为目录，令 dc task 的 `FileBegin` 独立上报
     /// `HardError`；同时删除源文件令 Sender 自己的 chunk 读取也失败）：这是 redo 期间
-    /// 两个独立来源可能各自上报同一 ndx 终态的场景。修复前 completed_count 会被
-    /// 双计，导致主循环在其余在途文件（healthy.txt）到达前就提前 break、丢消息或
-    /// hang；修复后按 ndx 去重，healthy.txt 仍应正常送达、流水线不 hang。
+    /// 两个独立来源可能各自上报同一 ndx 终态/失败的场景。修复前 Receiver 侧
+    /// completed_count 会被双计，导致主循环在其余在途文件（healthy.txt）到达前就
+    /// 提前 break、丢消息或 hang；Sender 侧 error_count 也会被复合失败双计（一次
+    /// 自检 + 一次 Receiver 回传的 Error{ndx}）。修复后两侧都按 ndx 去重：
+    /// healthy.txt 正常送达、流水线不 hang，error_count 恰好等于故意失败的文件数。
     #[tokio::test]
     async fn same_ndx_double_failure_does_not_drop_inflight_files() {
         let src_dir = tempdir().unwrap();
@@ -1258,7 +1274,13 @@ mod tests {
             success_count, 1,
             "healthy.txt 不应因 broken.txt 的双重终态被提前 break 而丢失"
         );
-        assert!(error_count >= 1, "broken.txt 的失败应至少被计入一次 error_count");
+        // broken.txt 的失败同时被 Sender 自检（源读失败）与 Receiver 回传
+        // （resume_prepare 失败的 Error{ndx}）各自独立上报一次；按 ndx 去重后
+        // error_count 应恰好等于故意失败的文件数（1），而不是被复合失败计成 2。
+        assert_eq!(
+            error_count, 1,
+            "同一 ndx 的复合失败（源读失败 + resume_prepare 失败）应只计一次 error_count"
+        );
         assert_eq!(
             fs::read(dest_dir.path().join("healthy.txt")).unwrap(),
             b"should still arrive"
