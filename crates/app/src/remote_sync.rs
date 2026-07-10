@@ -334,31 +334,23 @@ async fn process_requests_and_acks(
             }
             // ── ndx 级文件传输终态：与 EntrySuccess（目录/符号链接）共用同一个 success_count ──
             Some(ReceiverMsg::Success { ndx }) => {
-                success_count += 1;
-                let entry = ndx_table
+                let relative_path = ndx_table
                     .lock()
                     .unwrap_or_else(PoisonError::into_inner)
                     .get(ndx)
-                    .cloned();
-                if let Some(entry) = entry {
-                    completed_paths.insert(entry.get_relative_path().to_string_lossy().to_string());
-                }
-                // 周期性保存 checkpoint
-                if success_count.is_multiple_of(100)
-                    && let Ok(data) = serde_json::to_string(&completed_paths)
-                {
-                    let _ = tokio::fs::write(checkpoint_path, data).await;
-                }
+                    .map(|entry| entry.get_relative_path().to_string_lossy().to_string());
+                record_success_and_checkpoint(relative_path, &mut success_count, completed_paths, checkpoint_path)
+                    .await;
             }
             Some(ReceiverMsg::EntrySuccess { ref entry }) => {
-                success_count += 1;
-                completed_paths.insert(entry.get_relative_path().to_string_lossy().to_string());
-                // 周期性保存 checkpoint
-                if success_count.is_multiple_of(100)
-                    && let Ok(data) = serde_json::to_string(&completed_paths)
-                {
-                    let _ = tokio::fs::write(checkpoint_path, data).await;
-                }
+                let relative_path = entry.get_relative_path().to_string_lossy().to_string();
+                record_success_and_checkpoint(
+                    Some(relative_path),
+                    &mut success_count,
+                    completed_paths,
+                    checkpoint_path,
+                )
+                .await;
             }
             Some(ReceiverMsg::Progress(snapshot)) => {
                 info!(
@@ -394,6 +386,25 @@ async fn process_requests_and_acks(
         }
     }
     Ok((transfer_count, success_count, error_count))
+}
+
+/// 记录一次成功（ndx 级 `Success` 与 Entry 级 `EntrySuccess` 共用同一份逻辑）：
+/// `success_count` 无条件 `+= 1`；`relative_path` 有值时写入 `completed_paths`
+/// （`Success{ndx}` 在 `ndx_table` 查不到 entry 时为 `None`，仍计入 `success_count`
+/// 但不记录路径，与原逻辑一致）；每满 100 个周期性落盘 checkpoint。
+async fn record_success_and_checkpoint(
+    relative_path: Option<String>, success_count: &mut u64, completed_paths: &mut HashSet<String>,
+    checkpoint_path: &Path,
+) {
+    *success_count += 1;
+    if let Some(path) = relative_path {
+        completed_paths.insert(path);
+    }
+    if success_count.is_multiple_of(100)
+        && let Ok(data) = serde_json::to_string(&completed_paths)
+    {
+        let _ = tokio::fs::write(checkpoint_path, data).await;
+    }
 }
 
 /// 全量传输一个 entry（目录 / 符号链接 / 文件分块）。
