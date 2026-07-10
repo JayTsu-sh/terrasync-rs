@@ -591,11 +591,16 @@ async fn save_or_clear_checkpoint(path: &Path, completed_paths: &HashSet<String>
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
+    use std::collections::HashMap;
     use std::fs;
+    use std::fs::File;
+    use std::time::{Duration, SystemTime};
 
+    use async_trait::async_trait;
     use data_mover::create_storage;
     use tempfile::tempdir;
-    use transport::in_process::create_in_process_pair;
+    use transport::error::Result as TransportResult;
+    use transport::in_process::{InProcessReceiverTransport, InProcessSenderTransport, create_in_process_pair};
 
     use super::*;
     use crate::receiver::receiver_task_remote;
@@ -704,6 +709,266 @@ mod tests {
         assert_eq!(
             fs::read(dest_dir.path().join("sub/deeper/c.bin")).unwrap(),
             vec![7u8; 4096]
+        );
+    }
+
+    // ============================================================
+    // ndx 级 redo/ack 状态机集成测试（spec 测试计划 b–f）
+    //
+    // 用 HashMismatchInjector 包装 Sender 侧 transport，篡改特定 ndx 的
+    // `EndOfFile.source_hash`，人为制造 hash mismatch（不改动实际传输数据），
+    // 驱动真实的 Receiver 主 task 决策点（decide_file_ack）与 Sender 侧
+    // Redo/Success/Error 处理——与生产环境走同一套代码路径，只是用 in-process
+    // channel 代替真实 QUIC。
+    // ============================================================
+
+    /// 测试专用 Sender transport 包装：按 ndx 篡改 `EndOfFile.source_hash`，
+    /// 人为制造 hash mismatch，用于验证 redo 状态机。`corrupt_remaining`：
+    /// ndx → 还需损坏几次（每经过一次该 ndx 的 `EndOfFile` 递减，0 = 不再损坏）。
+    struct HashMismatchInjector {
+        inner: InProcessSenderTransport,
+        corrupt_remaining: Mutex<HashMap<i32, u32>>,
+    }
+
+    impl HashMismatchInjector {
+        fn new(inner: InProcessSenderTransport, corrupt_remaining: HashMap<i32, u32>) -> Self {
+            Self {
+                inner,
+                corrupt_remaining: Mutex::new(corrupt_remaining),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl SenderTransport for HashMismatchInjector {
+        async fn send(&self, msg: SenderMsg) -> TransportResult<()> {
+            let msg = match msg {
+                SenderMsg::EndOfFile {
+                    ndx,
+                    entry,
+                    source_hash,
+                } => {
+                    let mut remaining = self.corrupt_remaining.lock().unwrap_or_else(PoisonError::into_inner);
+                    let budget = remaining.entry(ndx).or_insert(0);
+                    let source_hash = if *budget > 0 {
+                        *budget -= 1;
+                        Some("0".repeat(64))
+                    } else {
+                        source_hash
+                    };
+                    SenderMsg::EndOfFile {
+                        ndx,
+                        entry,
+                        source_hash,
+                    }
+                }
+                other => other,
+            };
+            self.inner.send(msg).await
+        }
+
+        async fn recv(&self) -> Option<ReceiverMsg> {
+            self.inner.recv().await
+        }
+
+        async fn close(&self) -> TransportResult<()> {
+            self.inner.close().await
+        }
+    }
+
+    /// 起 Receiver（`receiver_task_remote`）+ 跑 Sender 侧握手/鉴权/`SessionConfig` +
+    /// 文件列表与请求/ack 并发处理，返回 `(success_count, error_count)`。
+    /// `sender_transport` 可传入包装过的 transport（如 `HashMismatchInjector`），
+    /// 复用生产代码路径验证 redo 状态机。
+    async fn run_pipeline(
+        sender_transport: &(dyn SenderTransport + 'static), receiver_transport: InProcessReceiverTransport,
+        src_dir: &std::path::Path, dest_storage: Arc<StorageEnum>,
+    ) -> (u64, u64) {
+        let src_storage = Arc::new(create_storage(src_dir.to_str().unwrap(), None, false).await.unwrap());
+        let walkdir_iter = src_storage.walkdir_2(None, None, None, None, 4, false).await.unwrap();
+
+        let receiver_handle =
+            tokio::spawn(async move { receiver_task_remote(&receiver_transport, dest_storage, None).await });
+
+        negotiate_handshake(sender_transport).await.unwrap();
+        send_and_check_auth(sender_transport, None).await.unwrap();
+        sender_transport
+            .send(SenderMsg::SessionConfig(SessionConfig {
+                src_path: src_dir.to_string_lossy().to_string(),
+                qos: None,
+                peak_qos_rate: 1.0,
+                iops: None,
+                enable_integrity_check: true,
+                enable_acl: false,
+                is_source_reserved: true,
+                block_size: None,
+                delete_target: false,
+            }))
+            .await
+            .unwrap();
+
+        let ndx_table = Mutex::new(NdxTable::new());
+        let mut completed_paths = HashSet::new();
+        let checkpoint_path = src_dir.join("unused_checkpoint.json");
+        let (_page_count, (_transfer_count, success_count, error_count)) = tokio::try_join!(
+            send_file_list_phase(sender_transport, &walkdir_iter, &ndx_table),
+            process_requests_and_acks(
+                sender_transport,
+                &src_storage,
+                &ndx_table,
+                None,
+                false,
+                &mut completed_paths,
+                &checkpoint_path,
+            )
+        )
+        .unwrap();
+
+        sender_transport.close().await.unwrap();
+        receiver_handle.await.unwrap().unwrap();
+        (success_count, error_count)
+    }
+
+    /// (b) 全量·一次 mismatch → Sender 收 Redo 全量重发 → Success，`finalize_run_result` Ok。
+    #[tokio::test]
+    async fn full_transfer_redo_recovers_on_first_hash_mismatch() {
+        let src_dir = tempdir().unwrap();
+        let dest_dir = tempdir().unwrap();
+        fs::write(src_dir.path().join("a.txt"), b"full transfer redo content").unwrap();
+
+        let dest_storage = Arc::new(
+            create_storage(dest_dir.path().to_str().unwrap(), None, true)
+                .await
+                .unwrap(),
+        );
+        let (sender_transport, receiver_transport) = create_in_process_pair();
+        // 唯一文件的 ndx（root 页首个 entry，可预期为 0）首次 EndOfFile 被篡改一次 hash
+        let injector = HashMismatchInjector::new(sender_transport, HashMap::from([(0, 1)]));
+
+        let (success_count, error_count) =
+            run_pipeline(&injector, receiver_transport, src_dir.path(), dest_storage).await;
+
+        assert_eq!(error_count, 0, "首次 mismatch 应通过 redo 恢复，不应计入 error");
+        assert_eq!(success_count, 1, "唯一文件应最终收到 Success{{ndx}}");
+        assert!(finalize_run_result(error_count).is_ok());
+        assert_eq!(
+            fs::read(dest_dir.path().join("a.txt")).unwrap(),
+            b"full transfer redo content"
+        );
+    }
+
+    /// (c) 全量·连续两次 mismatch → Error，`finalize_run_result` Err（退出路径）。
+    #[tokio::test]
+    async fn full_transfer_redo_second_mismatch_errors() {
+        let src_dir = tempdir().unwrap();
+        let dest_dir = tempdir().unwrap();
+        fs::write(src_dir.path().join("a.txt"), b"always corrupted content").unwrap();
+
+        let dest_storage = Arc::new(
+            create_storage(dest_dir.path().to_str().unwrap(), None, true)
+                .await
+                .unwrap(),
+        );
+        let (sender_transport, receiver_transport) = create_in_process_pair();
+        // ndx 0 两次 EndOfFile 都被篡改 → 首次 Redo，二次 Error
+        let injector = HashMismatchInjector::new(sender_transport, HashMap::from([(0, 2)]));
+
+        let (success_count, error_count) =
+            run_pipeline(&injector, receiver_transport, src_dir.path(), dest_storage).await;
+
+        assert_eq!(success_count, 0);
+        assert_eq!(error_count, 1, "连续两次 mismatch 应进入 Error 终态");
+        match finalize_run_result(error_count) {
+            Err(AppError::RemoteSyncFailed { errors: 1 }) => {}
+            other => panic!("expected RemoteSyncFailed{{errors: 1}}, got {other:?}"),
+        }
+        // .part 已清理，无残留最终文件（全量重发失败，目标端应保持无该文件）
+        assert!(!dest_dir.path().join("a.txt").exists());
+    }
+
+    /// dest 目录下预置一个与 `name` 同名、同大小但内容不同的文件，并把 mtime 拨到明确
+    /// 不同的过去时间点——保证 `DestIndex::check` 命中 `TransferDecision::DeltaTransfer`
+    /// （data_check 仅比较 mtime+size，任一不符即判定不匹配），触发 delta 传输路径。
+    fn seed_delta_basis(dest_dir: &std::path::Path, name: &str, size: usize) {
+        fs::write(dest_dir.join(name), vec![b'B'; size]).unwrap();
+        let f = File::open(dest_dir.join(name)).unwrap();
+        f.set_modified(SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000))
+            .unwrap();
+    }
+
+    /// (d) delta·一次 mismatch → Redo → Sender 降级全量重发 → Success。
+    #[tokio::test]
+    async fn delta_transfer_redo_downgrades_to_full_and_recovers() {
+        let src_dir = tempdir().unwrap();
+        let dest_dir = tempdir().unwrap();
+        let content = vec![b'A'; 4096];
+        fs::write(src_dir.path().join("a.txt"), &content).unwrap();
+        seed_delta_basis(dest_dir.path(), "a.txt", 4096);
+
+        let dest_storage = Arc::new(
+            create_storage(dest_dir.path().to_str().unwrap(), None, true)
+                .await
+                .unwrap(),
+        );
+        let (sender_transport, receiver_transport) = create_in_process_pair();
+        let injector = HashMismatchInjector::new(sender_transport, HashMap::from([(0, 1)]));
+
+        let (success_count, error_count) =
+            run_pipeline(&injector, receiver_transport, src_dir.path(), dest_storage).await;
+
+        assert_eq!(error_count, 0);
+        assert_eq!(success_count, 1, "delta redo 降级全量重发后应最终成功");
+        assert_eq!(fs::read(dest_dir.path().join("a.txt")).unwrap(), content);
+    }
+
+    /// (e) delta·连续两次 mismatch（首次 delta、redo 后降级全量再次 mismatch）→ Error。
+    #[tokio::test]
+    async fn delta_transfer_redo_second_mismatch_errors() {
+        let src_dir = tempdir().unwrap();
+        let dest_dir = tempdir().unwrap();
+        let content = vec![b'A'; 4096];
+        fs::write(src_dir.path().join("a.txt"), &content).unwrap();
+        seed_delta_basis(dest_dir.path(), "a.txt", 4096);
+
+        let dest_storage = Arc::new(
+            create_storage(dest_dir.path().to_str().unwrap(), None, true)
+                .await
+                .unwrap(),
+        );
+        let (sender_transport, receiver_transport) = create_in_process_pair();
+        let injector = HashMismatchInjector::new(sender_transport, HashMap::from([(0, 2)]));
+
+        let (success_count, error_count) =
+            run_pipeline(&injector, receiver_transport, src_dir.path(), dest_storage).await;
+
+        assert_eq!(success_count, 0);
+        assert_eq!(error_count, 1, "delta 降级全量重发后再次 mismatch 应进入 Error 终态");
+    }
+
+    /// (f) 计数不重复：文件走 `Success{ndx}`、符号链接走 `EntrySuccess`，
+    /// 共用同一个 `success_count` 但互不重复计数（无 mismatch 注入的基线场景）。
+    #[tokio::test]
+    async fn counts_do_not_double_count_across_ndx_and_entry_acks() {
+        let src_dir = tempdir().unwrap();
+        let dest_dir = tempdir().unwrap();
+        fs::write(src_dir.path().join("a.txt"), b"file one").unwrap();
+        fs::write(src_dir.path().join("b.txt"), b"file two, slightly longer").unwrap();
+        std::os::unix::fs::symlink("a.txt", src_dir.path().join("link")).unwrap();
+
+        let dest_storage = Arc::new(
+            create_storage(dest_dir.path().to_str().unwrap(), None, true)
+                .await
+                .unwrap(),
+        );
+        let (sender_transport, receiver_transport) = create_in_process_pair();
+
+        let (success_count, error_count) =
+            run_pipeline(&sender_transport, receiver_transport, src_dir.path(), dest_storage).await;
+
+        assert_eq!(error_count, 0);
+        assert_eq!(
+            success_count, 3,
+            "2 个文件 Success{{ndx}} + 1 个符号链接 EntrySuccess，共 3，互不重复计数"
         );
     }
 }

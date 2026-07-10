@@ -77,7 +77,7 @@
   验证：`cargo check -p app && cargo test -p app`（含既有
   `sender_receiver_pipeline_roundtrip_in_process` 与 `dual_process_streaming.rs` 全部通过）。
 
-- ⬜ 步骤 4（新增集成测试，spec 测试计划 b–g）：在 `remote_sync.rs` 测试模块新增
+- ✅ 步骤 4（新增集成测试，spec 测试计划 b–g）：在 `remote_sync.rs` 测试模块新增
   `CorruptingTransport`（篡改 `EndOfFile.source_hash` 制造人为 hash mismatch）+：
   - (b) 全量·一次 mismatch → Redo → Success，`finalize_run_result` Ok。
   - (c) 全量·连续两次 mismatch → Error，`finalize_run_result` Err。
