@@ -38,14 +38,14 @@ New/Changed/MetadataOnly/Skip 四类判定 —— **不存在需要新写的"远
 
 - ✅ 步骤 0：读 spec + 通读现有代码（orchestrator/message/receiver/remote_sync/
   config/consumer/stats/cli/web），确认无 blocker，立本计划。
-- ⬜ 步骤 1：协议层 —— `crates/transport/src/message.rs`：`TransferDecision` 加
+- ✅ 步骤 1：协议层 —— `crates/transport/src/message.rs`：`TransferDecision` 加
   `Serialize/Deserialize` + `Deleted` variant；`ReceiverMsg::TransferRequest` 加
   `decision` 字段；新增 `ReceiverMsg::Classified{entry, decision}`；
   `PROTOCOL_VERSION`/`MIN_SUPPORTED_PROTOCOL_VERSION` 2→3；`mux.rs` 路由新增
   `Classified` 到 `FileList` stream；message.rs 单测新增 `negotiate_rejects_v2_peer`。
-  验证：`cargo check -p transport --features quic` + `cargo test -p transport
-  --features quic --lib`。
-- ⬜ 步骤 2：orchestrator 路由塌陷 —— `crates/app/src/orchestrator.rs`：
+  验证：`cargo check -p transport --features quic`（通过）+ `cargo test -p transport
+  --features quic --lib`（3 passed，含新增 `negotiate_rejects_v2_peer`）。
+- 🔄 步骤 2：orchestrator 路由塌陷 —— `crates/app/src/orchestrator.rs`：
   `match (&self.mode, scan_type)` 改为先 match `mode`，`Remote{..}` 忽略
   `scan_type` 直调 `run_sync_remote`，删除死分支。
   验证：`cargo check -p app`。
