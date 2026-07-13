@@ -87,10 +87,11 @@ New/Changed/MetadataOnly/Skip 四类判定 —— **不存在需要新写的"远
   交错，补 `recv_skip_progress` helper 吸收。
   验证：`cargo test -p app remote_sync::tests::recv_file_list`（8 passed）+
   `cargo test -p app remote_sync::tests` 连跑 3 次（均 21 passed，无 flaky）。
-- ⬜ 步骤 8：新增 Sender 侧统计桥接单测 + 报表口径一致性测试（`remote_sync.rs` test
-  mod）：`classification_to_stats_message` 五类输入、`scanned` 累加、
-  `to_final_stats()`/`to_job_result()` 计数校验。
-  验证：`cargo test -p app remote_sync::tests`。
+- ✅ 步骤 8：新增 Sender 侧统计桥接单测 + 报表口径一致性测试（`remote_sync.rs` test
+  mod）：`classification_to_stats_message` 五类输入各自单测、混合场景验证
+  `IncrementalStats.new/changed/deleted/renamed`、`send_file_list_phase` 的
+  `scanned` 累加、`to_final_stats()`/`to_job_result()` 计数与预期逐一匹配。
+  验证：`cargo test -p app remote_sync::tests`（29 passed，含全部新增测试）。
 - ⬜ 步骤 9：新增 callback payload/频率测试（`remote_sync.rs` test mod，真实 QUIC +
   本地 mock HTTP server，验证 final 回调结构；QoS 限速确保跨越周期回调间隔）。
   验证：`cargo test -p app remote_sync::tests`。

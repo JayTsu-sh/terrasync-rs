@@ -768,8 +768,10 @@ mod tests {
     use transport::error::Result as TransportResult;
     use transport::in_process::{InProcessReceiverTransport, InProcessSenderTransport, create_in_process_pair};
     use transport::message::FeatureFlags;
+    use transport::traits::ReceiverTransport;
 
     use super::*;
+    use crate::consumer::stats::JobSummary;
     use crate::receiver::receiver_task_remote;
 
     /// 构造测试用 `Arc<AsyncMutex<StatisticConsumer>>`：不设 `callback_url`（不起 HTTP
@@ -1839,5 +1841,213 @@ mod tests {
         fs::set_permissions(dest_dir.path(), fs::Permissions::from_mode(0o755)).unwrap();
 
         finish_phase(&sender_transport, receiver_handle, &[]).await;
+    }
+
+    // ============================================================
+    // Sender 侧统计桥接正确性（issue #23 测试计划 3）：分类消息 → `update_statistics`
+    // 的翻译函数单元测试 + 报表口径一致性，不需要真实 QUIC。
+    // ============================================================
+
+    /// 构造一个仅用于测试的最小 `NASEntry`（字段值无实际语义，只满足统计消息类型要求）
+    fn dummy_entry(name: &str, is_dir: bool, size: u64) -> Arc<EntryEnum> {
+        Arc::new(EntryEnum::NAS(data_mover::NASEntry {
+            name: name.to_string(),
+            relative_path: PathBuf::from(name),
+            extension: None,
+            is_dir,
+            size,
+            atime: 0,
+            ctime: 0,
+            mtime: 0,
+            mode: 0o644,
+            is_symlink: false,
+            hard_links: None,
+            uid: None,
+            gid: None,
+            ino: None,
+            file_handle: None,
+            acl: None,
+            owner: None,
+            owner_group: None,
+            xattrs: None,
+        }))
+    }
+
+    #[test]
+    fn classification_to_stats_message_maps_full_transfer_to_new() {
+        let entry = dummy_entry("a.txt", false, 10);
+        match classification_to_stats_message(TransferDecision::FullTransfer, entry) {
+            Some(StorageEntryMessage::New(_)) => {}
+            other => panic!("expected New, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classification_to_stats_message_maps_delta_transfer_to_changed_data_only() {
+        let entry = dummy_entry("a.txt", false, 10);
+        match classification_to_stats_message(TransferDecision::DeltaTransfer, entry) {
+            Some(StorageEntryMessage::Changed {
+                kind: ChangeKind::DataOnly,
+                ..
+            }) => {}
+            other => panic!("expected Changed{{kind:DataOnly}}, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classification_to_stats_message_maps_metadata_only_to_changed_metadata_only() {
+        let entry = dummy_entry("a.txt", false, 10);
+        match classification_to_stats_message(TransferDecision::MetadataOnly, entry) {
+            Some(StorageEntryMessage::Changed {
+                kind: ChangeKind::MetadataOnly,
+                ..
+            }) => {}
+            other => panic!("expected Changed{{kind:MetadataOnly}}, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classification_to_stats_message_skip_produces_no_message() {
+        let entry = dummy_entry("a.txt", false, 10);
+        assert!(classification_to_stats_message(TransferDecision::Skip, entry).is_none());
+    }
+
+    #[test]
+    fn classification_to_stats_message_maps_deleted_to_deleted() {
+        let entry = dummy_entry("a.txt", false, 10);
+        match classification_to_stats_message(TransferDecision::Deleted, entry) {
+            Some(StorageEntryMessage::Deleted(_)) => {}
+            other => panic!("expected Deleted, got {other:?}"),
+        }
+    }
+
+    /// 五类分类输入分别落到 `IncrementalStats.new`/`changed`（含 MetadataOnly 子类）/
+    /// `deleted`，`Skip` 不产生任何计数变化；`renamed` 恒为 0（远端从不产生 Renamed）。
+    #[tokio::test]
+    async fn stats_bridging_updates_incremental_stats_new_changed_deleted() {
+        let stats_consumer = test_stats_consumer();
+        let events = [
+            (TransferDecision::FullTransfer, dummy_entry("new.txt", false, 100)),
+            (TransferDecision::DeltaTransfer, dummy_entry("changed.txt", false, 200)),
+            (TransferDecision::MetadataOnly, dummy_entry("meta.txt", false, 50)),
+            (TransferDecision::Skip, dummy_entry("skip.txt", false, 999)),
+            (TransferDecision::Deleted, dummy_entry("gone.txt", false, 30)),
+        ];
+        for (decision, entry) in events {
+            if let Some(msg) = classification_to_stats_message(decision, entry) {
+                stats_consumer.lock().await.update_statistics(&msg);
+            }
+        }
+
+        let consumer = stats_consumer.lock().await;
+        match &consumer.stats {
+            StatsKind::Incremental(s) => {
+                assert_eq!(s.new.regular_file_count, 1, "FullTransfer 应计入 new");
+                assert_eq!(s.new.regular_file_size, 100);
+                // DeltaTransfer + MetadataOnly 都落在 changed（与本地口径对齐，
+                // MetadataOnly 是 Changed 的子类型，不是独立顶层分类）
+                assert_eq!(
+                    s.changed.regular_file_count, 2,
+                    "DeltaTransfer+MetadataOnly 应合计计入 changed"
+                );
+                assert_eq!(s.changed.regular_file_size, 250);
+                assert_eq!(s.deleted.regular_file_count, 1, "Deleted 应计入 deleted");
+                assert_eq!(s.deleted.regular_file_size, 30);
+                assert_eq!(s.renamed.regular_file_count, 0, "远端从不产生 Renamed，应恒为 0");
+                // Skip 不产生任何 StorageEntryMessage，因此不应体现在 new/changed/deleted 任何一项，
+                // 上面三个断言的计数总和（1+2+1=4）已隐含验证：5 个事件中只有 Skip 未被计入。
+            }
+            other => panic!("expected StatsKind::Incremental, got {other:?}"),
+        }
+    }
+
+    /// `send_file_list_phase` 遍历 `walkdir_iter` 时随条目数正确累加 `scanned`
+    /// （不需要真实 QUIC：只驱动统计喂入，用 in-process transport 承接 `FilePage` 发送）。
+    #[tokio::test]
+    async fn send_file_list_phase_accumulates_scanned_stats() {
+        let src_dir = tempdir().unwrap();
+        fs::write(src_dir.path().join("a.txt"), b"aaa").unwrap();
+        fs::write(src_dir.path().join("b.txt"), b"bbbbb").unwrap();
+        fs::create_dir_all(src_dir.path().join("sub")).unwrap();
+        fs::write(src_dir.path().join("sub/c.txt"), b"c").unwrap();
+
+        let src_storage = Arc::new(
+            create_storage(src_dir.path().to_str().unwrap(), None, false)
+                .await
+                .unwrap(),
+        );
+        let walkdir_iter = src_storage.walkdir_2(None, None, None, None, 4, false).await.unwrap();
+        let (sender_transport, receiver_transport) = create_in_process_pair();
+        // 只消费 FilePage/FileListDone，不驱动任何写入，测试只关心 Sender 侧统计累加
+        let drain_handle = tokio::spawn(async move { while receiver_transport.recv().await.is_some() {} });
+
+        let ndx_table = Mutex::new(NdxTable::new());
+        let stats_consumer = test_stats_consumer();
+        let page_count = send_file_list_phase(&sender_transport, &walkdir_iter, &ndx_table, &stats_consumer)
+            .await
+            .unwrap();
+        assert!(page_count >= 1);
+
+        sender_transport.close().await.unwrap();
+        drop(drain_handle);
+
+        let consumer = stats_consumer.lock().await;
+        match &consumer.stats {
+            StatsKind::Incremental(s) => {
+                // 2 个顶层文件 + 1 个子目录 + 1 个子目录下文件 = 4 个 Scanned 条目
+                assert_eq!(s.scanned.regular_file_count, 3, "3 个文件应全部计入 scanned");
+                assert_eq!(s.scanned.dir_count, 1, "1 个子目录应计入 scanned");
+            }
+            other => panic!("expected StatsKind::Incremental, got {other:?}"),
+        }
+    }
+
+    /// 结构化报表与本地口径一致性：混合 New/Changed(content)/Changed(MetadataOnly)/
+    /// Skip/Deleted 场景后，`to_final_stats()`/`to_job_result()` 产出的字段值与预期
+    /// 计数逐一匹配（New/Changed 合计含 MetadataOnly、Deleted、Renamed 恒 0）。
+    #[tokio::test]
+    async fn structured_report_matches_expected_classification_counts() {
+        let stats_consumer = test_stats_consumer();
+        let events = [
+            (TransferDecision::FullTransfer, dummy_entry("n1.txt", false, 10)),
+            (TransferDecision::FullTransfer, dummy_entry("n2.txt", false, 20)),
+            (TransferDecision::DeltaTransfer, dummy_entry("c1.txt", false, 30)),
+            (TransferDecision::MetadataOnly, dummy_entry("c2.txt", false, 40)),
+            (TransferDecision::Skip, dummy_entry("s1.txt", false, 50)),
+            (TransferDecision::Deleted, dummy_entry("d1.txt", false, 60)),
+        ];
+        for (decision, entry) in events {
+            if let Some(msg) = classification_to_stats_message(decision, entry) {
+                stats_consumer.lock().await.update_statistics(&msg);
+            }
+        }
+
+        let consumer = stats_consumer.lock().await;
+        let final_stats = consumer.stats.to_final_stats();
+        let incremental = final_stats.incremental.as_ref().expect("增量报表应带 incremental 字段");
+        assert_eq!(incremental.new.regular_file_count, 2, "2 个 FullTransfer 应计入 new");
+        assert_eq!(
+            incremental.changed.regular_file_count, 2,
+            "DeltaTransfer+MetadataOnly 应合计计入 changed"
+        );
+        assert_eq!(incremental.deleted.regular_file_count, 1);
+        assert_eq!(incremental.renamed.regular_file_count, 0, "远端从不产生 Renamed");
+
+        let job_result = consumer.stats.to_job_result();
+        match job_result.summary {
+            JobSummary::Incremental {
+                new,
+                changed,
+                deleted,
+                renamed,
+                ..
+            } => {
+                assert_eq!(new.regular_file_count, 2);
+                assert_eq!(changed.regular_file_count, 2);
+                assert_eq!(deleted.regular_file_count, 1);
+                assert_eq!(renamed.regular_file_count, 0);
+            }
+            other => panic!("expected JobSummary::Incremental, got {other:?}"),
+        }
     }
 }
