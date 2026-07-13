@@ -75,10 +75,11 @@ New/Changed/MetadataOnly/Skip 四类判定 —— **不存在需要新写的"远
   验证：`cargo check -p app`（干净）+ `cargo test -p app remote_sync::`
   （13 passed）+ `cargo check -p cli -p web`（干净，确认 config.rs 加字段未破坏
   下游）。
-- ⬜ 步骤 6：新增协议层序列化测试 —— `crates/transport/tests/quic_roundtrip.rs`
-  新增 `TransferRequest{decision}`/`Classified`/`TransferDecision::Deleted`
-  真实 QUIC 往返测试。
-  验证：`cargo test -p transport --features quic --test quic_roundtrip`。
+- ✅ 步骤 6：新增协议层序列化测试 —— `crates/transport/tests/quic_roundtrip.rs`
+  新增 `test_quic_classification_messages_roundtrip`：`TransferRequest{decision}`/
+  `Classified`/`TransferDecision::Deleted` 真实 QUIC 往返测试。
+  验证：`cargo test -p transport --features quic --test quic_roundtrip`
+  （10 passed，含新增测试，无回归）。
 - ⬜ 步骤 7：新增 Receiver 分类信号正确性测试（`remote_sync.rs` test mod，双端真实
   `StorageEnum` + `receiver_task_remote`）：FullTransfer/DeltaTransfer(协商成功/降级)/
   MetadataOnly/Skip/Deleted(true/false)/删除失败。
