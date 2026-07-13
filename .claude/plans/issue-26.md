@@ -19,7 +19,7 @@ spec」（已 `claude:approved`，以此为准；2026-07-03 的旧 UNCLEAR 判�
 - ✅ 2. symlink 真实 2 进程 e2e 通过。
 - ✅ 3. resume（进程中断重跑）e2e ≥1 个通过。
 - ✅ 4. transport 异常关闭测试 ≥1 个通过（不 hang、非零退出码或明确错误）。
-- ⬜ 5. uid/gid 有断言覆盖（非 root 环境限制：无法测试"跨用户 chown 成功"，只能验证
+- ✅ 5. uid/gid 有断言覆盖（非 root 环境限制：无法测试"跨用户 chown 成功"，只能验证
       字段经 wire 正确传播且落地值与源端一致——运行进程本身的 uid/gid）。
 - ⬜ 6. packaged/tar 适用性结论写入 PR 描述：**不适用**。`crates/app/src/remote_sync.rs`
       的 Sender 侧 `walkdir_2(...)` 调用不传递 `config.packaged`/`package_depth`
@@ -89,7 +89,7 @@ ACL/xattr（#24）、Renamed（未实现）、hash 算法协商（deferred）、
       断言 Sender 在超时内非零退出、不 hang）。
       验证：`cargo test -p terrasync-rs --test remote_process_e2e receiver_killed -- --nocapture`
       （连跑 2 次确认不 flake）。
-- ⬜ 步骤 5：新增 uid/gid 断言 e2e（全量同步后断言 dest 各文件 `MetadataExt::uid()/gid()`
+- ✅ 步骤 5：新增 uid/gid 断言 e2e（全量同步后断言 dest 各文件 `MetadataExt::uid()/gid()`
       与 src 一致，注释说明非 root 环境限制）。
       验证：`cargo test -p terrasync-rs --test remote_process_e2e uid_gid -- --nocapture`。
 - ⬜ 步骤 6（可选项，spec 明确标注可选）：`crates/transport/tests/quic_roundtrip.rs`

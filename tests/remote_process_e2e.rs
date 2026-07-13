@@ -1381,3 +1381,91 @@ fn test_remote_process_e2e_receiver_killed_sender_exits_nonzero() {
         ),
     }
 }
+
+/// uid/gid 保留 e2e：全量同步后 dest 各文件的 uid/gid 应与 src 一致。
+///
+/// 非 root 开发环境下无法 `chown` 出一个与当前运行用户不同的 uid/gid 去验证"跨用户
+/// 也能正确复制"，因此本测试断言退化为"dest uid/gid == src uid/gid"（两者都等于运行
+/// 该测试进程的 euid/egid）。即便如此，仍是有意义的真实断言：它验证的是
+/// `disk_commit.rs::finalize_file`／`DiskCommitMsg::CreateDir` 里
+/// `dest.set_entry_metadata(&entry)` 用的 `entry.uid`/`entry.gid` 确实来自源端 scan、
+/// 经 wire 传输后被正确应用到目标端（而不是被链路上的某一跳意外置零/丢弃/固定为其它
+/// 值）——这条链路一旦回归就会在此处失败。真正的"跨用户 chown"需要 root/CAP_CHOWN
+/// 权限的专用环境，超出本地开发环境可执行范围。
+#[test]
+fn test_remote_process_e2e_uid_gid_preserved() {
+    let tmp = tempfile::tempdir().expect("create tempdir");
+    let tmp_path = tmp.path();
+
+    let src_dir = tmp_path.join("src");
+    let dest_dir = tmp_path.join("dest");
+    fs::create_dir_all(&src_dir).expect("create src dir");
+    fs::create_dir_all(&dest_dir).expect("create dest dir");
+    let rel_paths = populate_src_dir(&src_dir);
+
+    let cert_path = tmp_path.join("server.crt");
+    let config_path = tmp_path.join("config.toml");
+    fs::write(&config_path, "[database]\nenabled = false\n").expect("write config");
+    let fake_manifest_dir = tmp_path.join("fake_manifest");
+
+    let port = free_loopback_port();
+    let listen_addr = format!("127.0.0.1:{port}");
+    let bin_path = cargo_bin("terrasync");
+
+    let mut receiver_child = StdCommand::new(&bin_path)
+        .env("CARGO_MANIFEST_DIR", &fake_manifest_dir)
+        .current_dir(tmp_path)
+        .arg("-c")
+        .arg(&config_path)
+        .arg("serve")
+        .arg("--listen")
+        .arg(&listen_addr)
+        .arg("--tls-cert-out")
+        .arg(&cert_path)
+        .arg(&dest_dir)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn receiver process");
+    wait_for_cert_file(&cert_path);
+
+    let mut sender_cmd = AssertCommand::new(&bin_path);
+    sender_cmd
+        .env("CARGO_MANIFEST_DIR", &fake_manifest_dir)
+        .current_dir(tmp_path)
+        .arg("-c")
+        .arg(&config_path)
+        .arg("sync")
+        .arg("--id")
+        .arg("remote_uid_gid_e2e")
+        .arg("--remote")
+        .arg(&listen_addr)
+        .arg("--tls-server-cert")
+        .arg(&cert_path)
+        .arg(&src_dir)
+        .arg(&dest_dir);
+    sender_cmd.assert().success();
+
+    let receiver_status = wait_for_child_exit(&mut receiver_child, RECEIVER_EXIT_TIMEOUT);
+    let (rout, rerr) = drain_output(&mut receiver_child);
+    assert!(
+        matches!(receiver_status, Some(s) if s.success()),
+        "Receiver 异常退出: {receiver_status:?}\nstdout:\n{rout}\nstderr:\n{rerr}"
+    );
+    assert_dest_matches_src(&src_dir, &dest_dir, &rel_paths);
+
+    for rel in &rel_paths {
+        let src_meta = fs::metadata(src_dir.join(rel)).unwrap_or_else(|e| panic!("stat src {rel:?}: {e}"));
+        let dest_meta = fs::metadata(dest_dir.join(rel)).unwrap_or_else(|e| panic!("stat dest {rel:?}: {e}"));
+        assert_eq!(
+            src_meta.uid(),
+            dest_meta.uid(),
+            "dest 文件 {rel:?} uid 应与 src 一致（非 root 环境下两者都应等于运行进程 uid）"
+        );
+        assert_eq!(
+            src_meta.gid(),
+            dest_meta.gid(),
+            "dest 文件 {rel:?} gid 应与 src 一致（非 root 环境下两者都应等于运行进程 gid）"
+        );
+    }
+}
