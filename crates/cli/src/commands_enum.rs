@@ -167,6 +167,11 @@ pub enum Commands {
         /// By default an interrupted large-file transfer resumes from where it stopped.
         #[arg(long, default_value_t = false)]
         no_resume: bool,
+
+        /// Delete files/directories on the destination that no longer exist on the source.
+        /// Only effective in `--remote` (dual-process) mode.
+        #[arg(long, default_value_t = false)]
+        delete_target: bool,
     },
 
     /// Start a Receiver daemon for dual-process sync (destination side).

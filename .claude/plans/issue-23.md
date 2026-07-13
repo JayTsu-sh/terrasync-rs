@@ -57,12 +57,14 @@ New/Changed/MetadataOnly/Skip 四类判定 —— **不存在需要新写的"远
   `EntryError`（替换纯 `warn!`）。
   验证：`cargo check -p app`（receiver.rs 自身无错误；剩余 1 处
   `TransferRequest{decision}` 缺字段错误在 `remote_sync.rs`，步骤 5 修复）。
-- ⬜ 步骤 4：`--delete-target` 配置管线 —— `crates/app/src/config.rs`
+- ✅ 步骤 4：`--delete-target` 配置管线 —— `crates/app/src/config.rs`
   （`SyncJobConfig` 加 `delete_target`）、`crates/cli/src/commands_enum.rs`
   （CLI flag）、`crates/cli/src/commands.rs`（`sync_cmd` 透传）、
   `crates/cli/src/lib.rs`（解构透传）、
   `crates/web/src/infrastructure/task_runner.rs`（字面量补 `delete_target: false`）。
-  验证：`cargo check -p cli -p web -p app`。
+  验证：`cargo check -p cli`（本步骤新增代码本身无错误；唯一报错仍是
+  `remote_sync.rs` 的 `TransferRequest{decision}`，步骤 5 修复后一并核实
+  cli/web 全绿）。
 - ⬜ 步骤 5：Sender 侧结构化报表 + delete_target 透传 + progress callback ——
   `crates/app/src/remote_sync.rs`：`StatisticConsumer` 生命周期（begin/end）；
   `send_file_list_phase` 喂 `Scanned`；`process_requests_and_acks` 翻译

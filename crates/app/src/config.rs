@@ -110,6 +110,10 @@ pub struct SyncJobConfig {
     pub progress_callback_url: Option<String>,
     /// 关闭字节级断点续传（强制整体复制大文件）
     pub no_resume: bool,
+    /// `--delete-target`：仅 `--remote` 双进程模式生效，控制是否清理目标端多余文件
+    /// （目标端存在但源端已不存在的条目）。本地模式的孤儿清理由 DB diff 驱动、
+    /// 无条件执行，不受此字段影响（两套机制并存但互不干扰）。
+    pub delete_target: bool,
 }
 
 /// 初始化扫描配置
