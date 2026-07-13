@@ -92,7 +92,7 @@ ACL/xattr（#24）、Renamed（未实现）、hash 算法协商（deferred）、
 - ✅ 步骤 5：新增 uid/gid 断言 e2e（全量同步后断言 dest 各文件 `MetadataExt::uid()/gid()`
       与 src 一致，注释说明非 root 环境限制）。
       验证：`cargo test -p terrasync-rs --test remote_process_e2e uid_gid -- --nocapture`。
-- ⬜ 步骤 6（可选项，spec 明确标注可选）：`crates/transport/tests/quic_roundtrip.rs`
+- ✅ 步骤 6（可选项，spec 明确标注可选）：`crates/transport/tests/quic_roundtrip.rs`
       新增连接异常测试：Receiver 侧提前 `conn.close()`，断言 Sender
       `sender.recv()` 在超时内返回 `None` 而非 panic/hang。
       验证：`cargo test -p transport --features quic -- --nocapture`。
