@@ -20,7 +20,7 @@ use std::collections::HashSet;
 use std::fs;
 use std::io::Read;
 use std::net::UdpSocket;
-use std::os::unix::fs::MetadataExt;
+use std::os::unix::fs::{MetadataExt, symlink};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command as StdCommand, ExitStatus, Stdio};
 use std::sync::{Mutex, OnceLock};
@@ -1047,5 +1047,94 @@ fn test_remote_process_e2e_delta_sync_transfers_changed_content() {
     assert!(
         changed_total >= 1,
         "Sender 报表 Changed 计数应 ≥1（delta_target.bin 内容已变更），实际 stdout:\n{stdout}"
+    );
+}
+
+/// symlink 真实 2 进程全量同步 e2e：`populate_src_dir` 从不建 symlink（8 个既有 e2e
+/// 均未覆盖该路径，见 issue #26 triage），单独构造专属数据集验证符号链接经真实
+/// QUIC 连接走 `CreateSymlink` 完整落地——链接类型 + 目标路径字符串 + 可解引用内容。
+#[test]
+fn test_remote_process_e2e_symlink_synced() {
+    let tmp = tempfile::tempdir().expect("create tempdir");
+    let tmp_path = tmp.path();
+
+    let src_dir = tmp_path.join("src");
+    let dest_dir = tmp_path.join("dest");
+    fs::create_dir_all(&src_dir).expect("create src dir");
+    fs::create_dir_all(&dest_dir).expect("create dest dir");
+
+    fs::write(src_dir.join("target.txt"), b"symlink target content\n").expect("write target file");
+    symlink("target.txt", src_dir.join("link.txt")).expect("create src symlink");
+
+    let cert_path = tmp_path.join("server.crt");
+    let config_path = tmp_path.join("config.toml");
+    fs::write(&config_path, "[database]\nenabled = false\n").expect("write config");
+    let fake_manifest_dir = tmp_path.join("fake_manifest");
+
+    let port = free_loopback_port();
+    let listen_addr = format!("127.0.0.1:{port}");
+    let bin_path = cargo_bin("terrasync");
+
+    let mut receiver_child = StdCommand::new(&bin_path)
+        .env("CARGO_MANIFEST_DIR", &fake_manifest_dir)
+        .current_dir(tmp_path)
+        .arg("-c")
+        .arg(&config_path)
+        .arg("serve")
+        .arg("--listen")
+        .arg(&listen_addr)
+        .arg("--tls-cert-out")
+        .arg(&cert_path)
+        .arg(&dest_dir)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn receiver process");
+    wait_for_cert_file(&cert_path);
+
+    let mut sender_cmd = AssertCommand::new(&bin_path);
+    sender_cmd
+        .env("CARGO_MANIFEST_DIR", &fake_manifest_dir)
+        .current_dir(tmp_path)
+        .arg("-c")
+        .arg(&config_path)
+        .arg("sync")
+        .arg("--id")
+        .arg("remote_symlink_e2e")
+        .arg("--remote")
+        .arg(&listen_addr)
+        .arg("--tls-server-cert")
+        .arg(&cert_path)
+        .arg(&src_dir)
+        .arg(&dest_dir);
+    sender_cmd.assert().success();
+
+    let receiver_status = wait_for_child_exit(&mut receiver_child, RECEIVER_EXIT_TIMEOUT);
+    let (rout, rerr) = drain_output(&mut receiver_child);
+    assert!(
+        matches!(receiver_status, Some(s) if s.success()),
+        "Receiver 异常退出: {receiver_status:?}\nstdout:\n{rout}\nstderr:\n{rerr}"
+    );
+
+    // 目标文件内容一致
+    assert_eq!(
+        fs::read(src_dir.join("target.txt")).expect("read src target"),
+        fs::read(dest_dir.join("target.txt")).expect("read dest target"),
+    );
+
+    // dest 侧确实是符号链接（而非被解引用复制成普通文件）
+    let dest_link_meta = fs::symlink_metadata(dest_dir.join("link.txt")).expect("stat dest link.txt");
+    assert!(dest_link_meta.file_type().is_symlink(), "dest link.txt 应为符号链接");
+
+    // 链接目标字符串与 src 一致
+    assert_eq!(
+        fs::read_link(src_dir.join("link.txt")).expect("read src link target"),
+        fs::read_link(dest_dir.join("link.txt")).expect("read dest link target"),
+    );
+
+    // 解引用读取 dest 的 symlink 也能拿到正确内容
+    assert_eq!(
+        fs::read(dest_dir.join("link.txt")).expect("read dest link.txt (deref)"),
+        b"symlink target content\n"
     );
 }
