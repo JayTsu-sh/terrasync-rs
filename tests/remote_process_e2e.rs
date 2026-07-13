@@ -869,3 +869,183 @@ fn test_remote_process_e2e_delete_target_preserves_existing_subdir() {
         "预存子目录被整树删除后重传（inode 改变）——子目录不是孤儿，不得删除"
     );
 }
+
+// ============================================================
+// issue #26：补充 rsync-like 远端同步端到端测试矩阵
+// ============================================================
+
+/// 断言日志中出现 delta 能力协商成功的记录（`FeatureFlags { delta: true, ... }` 的
+/// Debug 输出片段），作为"走 `DeltaTransferRequest` 而非降级全量"的非侵入式证据之一
+/// （另一半证据见 `parse_changed_total`，两者结合见调用处注释）。
+fn assert_delta_negotiated_in_log(log_path: &Path, who: &str) {
+    let content = fs::read_to_string(log_path).unwrap_or_else(|e| panic!("读取 {who} 日志失败 {log_path:?}: {e}"));
+    assert!(
+        content.contains("delta: true"),
+        "{who} 日志 {log_path:?} 中未见 delta 能力协商成功记录（FeatureFlags.delta=true），内容:\n{content}"
+    );
+}
+
+/// 从 Sender stdout 打印的最终统计报表中解析 "Changed:" 行的 total 计数
+/// （`StatisticConsumer::finalize()` 用 `println!("{}", self.stats)` 打印
+/// `IncrementalStats::fmt`，格式形如 `"   ├─ Changed:        1 total | ..."`）。
+fn parse_changed_total(stdout: &str) -> u64 {
+    stdout
+        .lines()
+        .find(|l| l.contains("Changed:"))
+        .and_then(|l| l.split_whitespace().nth(2))
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0)
+}
+
+/// 真实 2 进程 delta sync e2e：第一轮播种 dest，第二轮改 src 文件中间一段字节
+/// （保留首尾不变，让 delta 匹配有实际意义）后重跑，断言走 `DeltaTransferRequest`
+/// 而非全量重传，且 dest 最终内容与 src 一致。
+///
+/// 不直接窥探协议内部状态（不侵入协议），改用两条独立、只读的非侵入式证据组合：
+/// 1. Sender 日志握手行含 `delta: true`——证明本次连接的 delta 能力协商成功，
+///    `receiver.rs::recv_file_list_and_data_phase` 在 `DestIndex::check()` 判定
+///    `DeltaTransfer` 时必然发送真实 `DeltaTransferRequest`（协商失败才会降级为
+///    `TransferRequest`，见该函数文档）。
+/// 2. Sender stdout 最终报表 "Changed:" 行 total ≥ 1——证明确有一个条目被判定为
+///    `TransferDecision::DeltaTransfer`（`DestIndex::check()` 对已存在但内容不同的
+///    条目恒返回 `DeltaTransfer`，与文件大小是否变化无关，见 `message.rs::check`）。
+/// 二者同时成立时，唯一自洽的解释就是该条目走了真实的 `DeltaTransferRequest` 消息。
+#[test]
+fn test_remote_process_e2e_delta_sync_transfers_changed_content() {
+    let tmp = tempfile::tempdir().expect("create tempdir");
+    let tmp_path = tmp.path();
+
+    let src_dir = tmp_path.join("src");
+    let dest_dir = tmp_path.join("dest");
+    fs::create_dir_all(&src_dir).expect("create src dir");
+    fs::create_dir_all(&dest_dir).expect("create dest dir");
+    let mut rel_paths = populate_src_dir(&src_dir);
+
+    // 专用 delta 目标文件：8000 字节，块大小算法（sqrt(size).clamp(700, 128KiB)）会
+    // 切出多个 block，足够体现"部分匹配 + 部分不匹配"的真实 delta 场景。
+    const DELTA_FILE_SIZE: usize = 8000;
+    let delta_rel = PathBuf::from("delta_target.bin");
+    let original_content = deterministic_bytes(DELTA_FILE_SIZE);
+    fs::write(src_dir.join(&delta_rel), &original_content).expect("write delta src file");
+    rel_paths.push(delta_rel.clone());
+
+    let cert_path = tmp_path.join("server.crt");
+    let config_path = tmp_path.join("config.toml");
+    fs::write(&config_path, "[database]\nenabled = false\n").expect("write config");
+    let fake_manifest_dir = tmp_path.join("fake_manifest");
+    let bin_path = cargo_bin("terrasync");
+
+    // ── 第一轮：全量播种 dest ──
+    let port = free_loopback_port();
+    let listen_addr = format!("127.0.0.1:{port}");
+    let mut receiver_child = StdCommand::new(&bin_path)
+        .env("CARGO_MANIFEST_DIR", &fake_manifest_dir)
+        .current_dir(tmp_path)
+        .arg("-c")
+        .arg(&config_path)
+        .arg("serve")
+        .arg("--listen")
+        .arg(&listen_addr)
+        .arg("--tls-cert-out")
+        .arg(&cert_path)
+        .arg(&dest_dir)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn receiver process");
+    wait_for_cert_file(&cert_path);
+
+    let mut sender_cmd = AssertCommand::new(&bin_path);
+    sender_cmd
+        .env("CARGO_MANIFEST_DIR", &fake_manifest_dir)
+        .current_dir(tmp_path)
+        .arg("-c")
+        .arg(&config_path)
+        .arg("sync")
+        .arg("--id")
+        .arg("remote_delta_seed")
+        .arg("--remote")
+        .arg(&listen_addr)
+        .arg("--tls-server-cert")
+        .arg(&cert_path)
+        .arg(&src_dir)
+        .arg(&dest_dir);
+    sender_cmd.assert().success();
+
+    let receiver_status = wait_for_child_exit(&mut receiver_child, RECEIVER_EXIT_TIMEOUT);
+    let (rout, rerr) = drain_output(&mut receiver_child);
+    assert!(
+        matches!(receiver_status, Some(s) if s.success()),
+        "第一轮 Receiver 异常退出: {receiver_status:?}\nstdout:\n{rout}\nstderr:\n{rerr}"
+    );
+    assert_dest_matches_src(&src_dir, &dest_dir, &rel_paths);
+
+    // 修改 delta_target.bin 中间一段字节（保留首尾 3000/4800 字节不变），
+    // 内容变化会连带更新 mtime，触发 DestIndex::check() 的 data_check 判定为不匹配。
+    let mut modified_content = original_content.clone();
+    for byte in &mut modified_content[3000..3200] {
+        *byte = 0xAA;
+    }
+    fs::write(src_dir.join("delta_target.bin"), &modified_content).expect("modify delta src file");
+
+    // ── 第二轮：重跑同步，delta_target.bin 应走 delta 传输 ──
+    let port = free_loopback_port();
+    let listen_addr = format!("127.0.0.1:{port}");
+    fs::remove_file(&cert_path).expect("remove old cert");
+    let mut receiver_child = StdCommand::new(&bin_path)
+        .env("CARGO_MANIFEST_DIR", &fake_manifest_dir)
+        .current_dir(tmp_path)
+        .arg("-c")
+        .arg(&config_path)
+        .arg("serve")
+        .arg("--listen")
+        .arg(&listen_addr)
+        .arg("--tls-cert-out")
+        .arg(&cert_path)
+        .arg(&dest_dir)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn receiver process");
+    wait_for_cert_file(&cert_path);
+
+    let mut sender_cmd = AssertCommand::new(&bin_path);
+    sender_cmd
+        .env("CARGO_MANIFEST_DIR", &fake_manifest_dir)
+        .current_dir(tmp_path)
+        .arg("-c")
+        .arg(&config_path)
+        .arg("sync")
+        .arg("--id")
+        .arg("remote_delta_verify")
+        .arg("--remote")
+        .arg(&listen_addr)
+        .arg("--tls-server-cert")
+        .arg(&cert_path)
+        .arg(&src_dir)
+        .arg(&dest_dir);
+    let assert = sender_cmd.assert().success();
+    let stdout = String::from_utf8_lossy(&assert.get_output().stdout).into_owned();
+
+    let receiver_status = wait_for_child_exit(&mut receiver_child, RECEIVER_EXIT_TIMEOUT);
+    let (rout, rerr) = drain_output(&mut receiver_child);
+    assert!(
+        matches!(receiver_status, Some(s) if s.success()),
+        "第二轮 Receiver 异常退出: {receiver_status:?}\nstdout:\n{rout}\nstderr:\n{rerr}"
+    );
+
+    // 内容一致性：delta 重建结果必须与源端修改后的内容逐字节相同
+    assert_dest_matches_src(&src_dir, &dest_dir, &rel_paths);
+
+    // 非侵入式证据 1：delta 能力协商成功
+    let sender_log = tmp_path.join("logs").join("remote_delta_verify").join("app.log");
+    assert_delta_negotiated_in_log(&sender_log, "Sender");
+
+    // 非侵入式证据 2：Sender 报表记录了一次 Changed（即 delta_target.bin 走了
+    // DeltaTransfer 分类，而非 Skip）
+    let changed_total = parse_changed_total(&stdout);
+    assert!(
+        changed_total >= 1,
+        "Sender 报表 Changed 计数应 ≥1（delta_target.bin 内容已变更），实际 stdout:\n{stdout}"
+    );
+}

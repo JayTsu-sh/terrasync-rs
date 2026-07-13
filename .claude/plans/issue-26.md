@@ -15,7 +15,7 @@ spec」（已 `claude:approved`，以此为准；2026-07-03 的旧 UNCLEAR 判�
 
 ## 验收标准（逐条对照，完成时勾选）
 
-- ⬜ 1. delta sync 真实 2 进程 e2e ≥1 个通过。
+- ✅ 1. delta sync 真实 2 进程 e2e ≥1 个通过。
 - ⬜ 2. symlink 真实 2 进程 e2e 通过。
 - ⬜ 3. resume（进程中断重跑）e2e ≥1 个通过。
 - ⬜ 4. transport 异常关闭测试 ≥1 个通过（不 hang、非零退出码或明确错误）。
@@ -74,7 +74,7 @@ ACL/xattr（#24）、Renamed（未实现）、hash 算法协商（deferred）、
 ## 执行步骤
 
 - ✅ 步骤 0：立计划文件（本文件），commit `chore(plan): issue-26 执行计划`。
-- ⬜ 步骤 1：`tests/remote_process_e2e.rs` 新增真实 2 进程 delta sync e2e
+- ✅ 步骤 1：`tests/remote_process_e2e.rs` 新增真实 2 进程 delta sync e2e
       （两轮同步：第一轮播种 dest，修改 src 文件中间一段字节保留首尾不变，第二轮
       断言走 `DeltaTransferRequest` 的非侵入式证据 + 最终内容一致）。
       验证：`cargo test -p terrasync-rs --test remote_process_e2e delta_sync -- --nocapture`。
