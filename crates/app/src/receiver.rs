@@ -642,6 +642,9 @@ async fn recv_file_list_and_data_phase(
 
                 // 子目录在目标端创建
                 for ns in &page.subdirs {
+                    // 源端存在该子目录 → 目标端同名条目不是孤儿（须在 orphan 扫描前登记，
+                    // 与创建成功与否无关；不登记则预存子目录被误判孤儿 → 整树误删后重传）
+                    dest_index.mark_matched(&ns.entry);
                     if let Err(e) = validate_relative_path(ns.entry.get_relative_path()) {
                         warn!("[Receiver Remote] Rejecting unsafe subdir path: {}", e);
                         let _ = transport

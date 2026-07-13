@@ -540,6 +540,15 @@ impl DestIndex {
         }
     }
 
+    /// 登记一个源端条目为已匹配（不做数据/元数据比较）
+    ///
+    /// 孤儿判定 = 目标端存在而源端不存在。`page.subdirs` 走 `create_dir_all` 路径、
+    /// 不经 `check()`，必须单独登记，否则目标端预先存在的同名子目录会被
+    /// `orphaned_entries()` 误判为孤儿而整树删除。
+    pub fn mark_matched(&mut self, src_entry: &EntryEnum) {
+        self.matched.insert(src_entry.get_name().to_string());
+    }
+
     /// 返回目标端存在但源端 file list 中不存在的条目（需删除）
     pub fn orphaned_entries(&self) -> Vec<&Arc<EntryEnum>> {
         self.entries

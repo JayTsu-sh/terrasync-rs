@@ -1809,6 +1809,58 @@ mod tests {
         );
     }
 
+    /// dest 预先存在与源端一致的子目录 + `delete_target=true` → 子目录**不是**孤儿：
+    /// 不发 `Classified{Deleted}`、不整树删除。回归：`page.subdirs` 走 `create_dir_all`
+    /// 路径、不经 `DestIndex::check()`，此前从不登记 `matched`，预存子目录被
+    /// `orphaned_entries()` 误判为孤儿 → `delete_dir_all` 整树误删后按 New 重传。
+    #[tokio::test]
+    async fn recv_file_list_delete_target_preserves_existing_subdir() {
+        let src_dir = tempdir().unwrap();
+        let dest_dir = tempdir().unwrap();
+        for dir in [src_dir.path(), dest_dir.path()] {
+            fs::create_dir_all(dir.join("sub")).unwrap();
+            fs::write(dir.join("sub/nested.txt"), b"same content").unwrap();
+            set_mtime(&dir.join("sub/nested.txt"), 1_700_000_000);
+            fs::set_permissions(dir.join("sub/nested.txt"), fs::Permissions::from_mode(0o644)).unwrap();
+        }
+
+        let dest_storage = Arc::new(
+            create_storage(dest_dir.path().to_str().unwrap(), None, true)
+                .await
+                .unwrap(),
+        );
+        let (sender_transport, receiver_handle) = spawn_receiver_and_handshake(dest_storage, true, true).await;
+
+        // 真实 walkdir 逐页下发：根页（subdirs=[sub]，files 空）+ 子页（files=[nested.txt]）
+        let src_storage = Arc::new(
+            create_storage(src_dir.path().to_str().unwrap(), None, false)
+                .await
+                .unwrap(),
+        );
+        let walkdir_iter = src_storage.walkdir_2(None, None, None, None, 4, false).await.unwrap();
+        while let Some(event) = walkdir_iter.next().await {
+            if let NdxEvent::Page(page) = event {
+                sender_transport.send(SenderMsg::FilePage(page)).await.unwrap();
+            }
+        }
+
+        // 唯一预期信号：nested.txt 完全一致 → Classified{Skip}。若子目录被误判孤儿，
+        // 这里会先收到 Classified{Deleted}（或整树误删后 nested.txt 的 TransferRequest）
+        match recv_skip_progress(&sender_transport).await {
+            Some(ReceiverMsg::Classified {
+                entry,
+                decision: TransferDecision::Skip,
+            }) => assert_eq!(entry.get_relative_path(), std::path::Path::new("sub/nested.txt")),
+            other => panic!("expected Classified{{decision:Skip}} for sub/nested.txt, got {other:?}"),
+        }
+
+        finish_phase(&sender_transport, receiver_handle, &[]).await;
+        assert!(
+            dest_dir.path().join("sub/nested.txt").exists(),
+            "预存子目录内容不得被当作孤儿删除"
+        );
+    }
+
     /// 删除失败（父目录无写权限）→ 发 `EntryError`，不发 `Classified`
     #[tokio::test]
     async fn recv_file_list_delete_failure_emits_entry_error() {
