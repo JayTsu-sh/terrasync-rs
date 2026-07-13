@@ -258,25 +258,21 @@ impl SyncOrchestrator {
 
         info!("SyncOrchestrator: determined scan_type={}", scan_type);
 
-        match (&self.mode, scan_type) {
-            (SyncMode::Local, ScanType::Full) => self.run_sync().await,
-            (SyncMode::Local, ScanType::Incremental) => self.run_incremental_sync().await,
-            (
-                SyncMode::Remote {
-                    remote_addr,
-                    tls_server_cert,
-                    auth_token,
-                },
-                ScanType::Full,
-            ) => {
+        match &self.mode {
+            SyncMode::Local => match scan_type {
+                ScanType::Full => self.run_sync().await,
+                ScanType::Incremental => self.run_incremental_sync().await,
+            },
+            // 双进程模式本就是 compare-based（DestIndex 实时比对目标端），Full/Incremental
+            // 在 wire protocol 和执行路径上是同一套代码，ScanType 对 Remote 是 no-op
+            // （issue #23：不存在需要新写的"远端增量模式"）。
+            SyncMode::Remote {
+                remote_addr,
+                tls_server_cert,
+                auth_token,
+            } => {
                 self.run_sync_remote(remote_addr, tls_server_cert.as_deref(), auth_token.as_deref())
                     .await
-            }
-            (SyncMode::Remote { .. }, ScanType::Incremental) => {
-                // 双进程增量同步后续 Phase 实现
-                Err(AppError::CopyError(
-                    "Remote incremental sync not yet implemented".into(),
-                ))
             }
         }
     }

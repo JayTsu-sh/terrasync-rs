@@ -67,7 +67,7 @@ use crate::message::{ReceiverMsg, SenderMsg};
 pub(crate) enum StreamKind {
     /// 握手 / 鉴权 / `SessionConfig` / `TransferDone` 等控制消息
     Control,
-    /// 文件列表（`FilePage` 等）+ 传输请求（`TransferRequest` 等）
+    /// 文件列表（`FilePage` 等）+ 传输请求（`TransferRequest` 等）+ 分类信号（`Classified`）
     FileList,
     /// 文件/目录/符号链接数据流
     Data,
@@ -122,6 +122,7 @@ pub(crate) fn receiver_stream_kind(msg: &ReceiverMsg) -> StreamKind {
         ReceiverMsg::TransferRequest { .. }
         | ReceiverMsg::DeltaTransferRequest { .. }
         | ReceiverMsg::MetadataUpdateRequest { .. }
+        | ReceiverMsg::Classified { .. }
         | ReceiverMsg::RequestsDone => StreamKind::FileList,
 
         ReceiverMsg::EntrySuccess { .. }

@@ -104,9 +104,12 @@ pub enum ReceiverMsg {
     AuthResult { ok: bool, reason: Option<String> },
 
     // ── 双进程模式：按 NDX 请求传输 ──
-    /// 请求全量传输（目标文件不存在）
-    TransferRequest { ndx: i32 },
-    /// 请求增量传输（目标文件存在但数据不匹配，附带 block 签名）
+    /// 请求全量传输（目标文件不存在）；`decision` 携带 `DestIndex::check()` 的原始判定
+    /// （`FullTransfer` 或降级为整份传输的 `DeltaTransfer`），供 Sender 侧统计正确分类
+    /// 为 New/Changed，不依赖 wire 动作本身推断（见 issue #23）
+    TransferRequest { ndx: i32, decision: TransferDecision },
+    /// 请求增量传输（目标文件存在但数据不匹配，附带 block 签名）；收到即视为 Changed，
+    /// 判定本身无歧义，不需要额外携带 `decision` 字段
     DeltaTransferRequest {
         ndx: i32,
         block_size: u32,
@@ -116,6 +119,16 @@ pub enum ReceiverMsg {
     MetadataUpdateRequest { ndx: i32 },
     /// 不再有新请求（所有 NDX 检查完毕）
     RequestsDone,
+
+    // ── 分类信号（MetadataOnly/Skip/Deleted）：Receiver 本地执行/判定后上行通知 Sender，
+    //    此前这三类零 wire 流量，Sender 侧无法据此驱动统计（issue #23）。用 entry 而非
+    //    ndx：orphan 条目是 Receiver 端 walkdir 出来的目标端条目，从未出现在 Sender 的
+    //    NdxTable 里，没有对应 ndx。
+    /// 分类判定通知（不产生传输请求的三类：`MetadataOnly`/`Skip`/`Deleted`）
+    Classified {
+        entry: Arc<EntryEnum>,
+        decision: TransferDecision,
+    },
 
     // ── Entry 级别 ack（单进程 + 双进程通用） ──
     /// Entry 写入成功（Receiver 完成写入 + `set_metadata` + ACL 后发送）
@@ -153,13 +166,18 @@ pub enum ReceiverMsg {
 ///
 /// 2：`SenderMsg::FileBegin/EndOfFile` 加 `ndx` 字段、`SenderMsg::EntryError` 加
 /// `ndx: Option<i32>`（issue #22 ndx 级 redo/ack 状态机），bincode 线格式不兼容 v1。
-pub const PROTOCOL_VERSION: u32 = 2;
+///
+/// 3：`ReceiverMsg::TransferRequest` 加 `decision: TransferDecision` 字段，新增
+/// `ReceiverMsg::Classified{entry, decision}` 消息（补齐 MetadataOnly/Skip/Deleted
+/// 三类此前从不上行的分类信号），`TransferDecision` 新增 `Deleted` variant 并加上
+/// `Serialize`/`Deserialize`（首次跨 wire，见 issue #23），bincode 线格式不兼容 v2。
+pub const PROTOCOL_VERSION: u32 = 3;
 
 /// 当前 binary 能接受的最低对端协议版本
 ///
 /// 对端版本低于此值时握手拒绝，避免 bincode schema 不兼容导致反序列化失败
 /// 或部分文件已写入、部分未写入的"半执行"不一致状态。
-pub const MIN_SUPPORTED_PROTOCOL_VERSION: u32 = 2;
+pub const MIN_SUPPORTED_PROTOCOL_VERSION: u32 = 3;
 
 /// 完整性校验使用的 hash 算法
 ///
@@ -342,7 +360,10 @@ pub struct ProgressSnapshot {
 }
 
 /// Receiver 侧比较决策
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// 加 `Serialize`/`Deserialize`：issue #23 起需要跨 wire 传输（`ReceiverMsg::
+/// TransferRequest`/`Classified` 携带），此前只在 Receiver 本地使用。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TransferDecision {
     /// 目标不存在 → 全量传输
     FullTransfer,
@@ -352,6 +373,9 @@ pub enum TransferDecision {
     MetadataOnly,
     /// 完全匹配 → 跳过
     Skip,
+    /// 目标端存在但源端已不存在（`--delete-target` 门控执行的删除，只在
+    /// `DestIndex::orphaned_entries()` 路径产生，`DestIndex::check()` 从不返回此值）
+    Deleted,
 }
 
 // ============================================================
@@ -516,6 +540,15 @@ impl DestIndex {
         }
     }
 
+    /// 登记一个源端条目为已匹配（不做数据/元数据比较）
+    ///
+    /// 孤儿判定 = 目标端存在而源端不存在。`page.subdirs` 走 `create_dir_all` 路径、
+    /// 不经 `check()`，必须单独登记，否则目标端预先存在的同名子目录会被
+    /// `orphaned_entries()` 误判为孤儿而整树删除。
+    pub fn mark_matched(&mut self, src_entry: &EntryEnum) {
+        self.matched.insert(src_entry.get_name().to_string());
+    }
+
     /// 返回目标端存在但源端 file list 中不存在的条目（需删除）
     pub fn orphaned_entries(&self) -> Vec<&Arc<EntryEnum>> {
         self.entries
@@ -564,7 +597,25 @@ mod tests {
         }
     }
 
-    /// 双方均为当前版本（v2）时握手应正常通过
+    /// v2 对端（issue #23 改动 `ReceiverMsg` bincode 线格式前的协议版本）握手时必须被
+    /// 拒绝：`TransferRequest` 加 `decision` 字段、新增 `Classified` 消息后，v2 与当前
+    /// v3 的 bincode schema 不兼容，接受 v2 对端会导致错位解码甚至写坏数据。
+    #[test]
+    fn negotiate_rejects_v2_peer() {
+        let current = ProtocolHandshake::current();
+        let v2_peer = ProtocolHandshake {
+            protocol_version: 2,
+            min_supported_version: 2,
+            features: FeatureFlags::current(),
+            hash_algorithm: HashAlgorithm::Blake3,
+        };
+        match current.negotiate(&v2_peer) {
+            HandshakeResult::Rejected { reason } => assert!(!reason.is_empty()),
+            other => panic!("v2 对端应被拒绝，got {other:?}"),
+        }
+    }
+
+    /// 双方均为当前版本（v3）时握手应正常通过
     #[test]
     fn negotiate_accepts_matching_current_peers() {
         let current = ProtocolHandshake::current();

@@ -17,7 +17,7 @@ use data_mover::{DataChunk, EntryEnum, NASEntry};
 use tokio::sync::oneshot;
 use transport::message::{
     FeatureFlags, HandshakeResult, HashAlgorithm, ProgressSnapshot, ProtocolHandshake, ReceiverMsg, SenderMsg,
-    SessionConfig,
+    SessionConfig, TransferDecision,
 };
 use transport::quic;
 use transport::traits::SenderTransport;
@@ -587,6 +587,93 @@ fn dummy_file_entry(name: &str) -> Arc<EntryEnum> {
         owner_group: None,
         xattrs: None,
     }))
+}
+
+/// #23 协议扩展序列化往返：`ReceiverMsg::TransferRequest{ndx, decision}` 与新增的
+/// `Classified{entry, decision}`（含新 variant `TransferDecision::Deleted`）能在真实
+/// QUIC 连接上完整往返（编码 → 传输 → 解码），验证 `TransferDecision` 新增的
+/// `Serialize`/`Deserialize` 派生与 `ReceiverMsg` 新字段/新消息的 bincode wire 兼容性。
+///
+/// 仿 `test_quic_transfer_done_roundtrip`：QUIC 流只有发起方实际写入数据后对端才能
+/// `accept_bi()` 到，先由 Sender 发一条 `Handshake`（路由到 `Control`）触发该 stream
+/// 被对端感知；测试用的手工 harness 在同一条物理 stream 上写回本测试关心的两条
+/// `ReceiverMsg`（`sender.recv()` 走完整 mux fan-in，按物理 stream 转发、不校验消息
+/// 与 stream 语义分类是否匹配，序列化正确性与路由分类是两件独立的事，此处只验证前者）。
+#[tokio::test]
+async fn test_quic_classification_messages_roundtrip() {
+    install_crypto_provider();
+
+    let (server_endpoint, server_addr) = create_server_endpoint();
+    let (done_tx, done_rx) = oneshot::channel::<()>();
+
+    let receiver_handle = tokio::spawn(async move {
+        let incoming = server_endpoint.accept().await.unwrap();
+        let conn = incoming.await.unwrap();
+        let (mut send, mut recv) = conn.accept_bi().await.unwrap();
+
+        let msg: Option<SenderMsg> = quic::framing::read_msg(&mut recv).await.ok().flatten();
+        assert!(
+            matches!(msg, Some(SenderMsg::Handshake(_))),
+            "Expected Handshake, got {:?}",
+            msg
+        );
+
+        // TransferRequest{ndx, decision}：New/Changed 复用的既有请求消息新增字段
+        quic::framing::write_msg(
+            &mut send,
+            &ReceiverMsg::TransferRequest {
+                ndx: 42,
+                decision: TransferDecision::DeltaTransfer,
+            },
+        )
+        .await
+        .unwrap();
+
+        // Classified{entry, decision: Deleted}：新增消息 + TransferDecision 新增 variant
+        let entry = dummy_file_entry("orphan.bin");
+        quic::framing::write_msg(
+            &mut send,
+            &ReceiverMsg::Classified {
+                entry,
+                decision: TransferDecision::Deleted,
+            },
+        )
+        .await
+        .unwrap();
+
+        let _ = done_rx.await;
+    });
+
+    let sender = quic::connect(server_addr, "localhost", None).await.unwrap();
+    sender
+        .send(SenderMsg::Handshake(ProtocolHandshake::current()))
+        .await
+        .unwrap();
+
+    match sender.recv().await {
+        Some(ReceiverMsg::TransferRequest {
+            ndx: 42,
+            decision: TransferDecision::DeltaTransfer,
+        }) => {}
+        other => panic!(
+            "Expected TransferRequest{{ndx:42, decision:DeltaTransfer}}, got {:?}",
+            other
+        ),
+    }
+
+    match sender.recv().await {
+        Some(ReceiverMsg::Classified {
+            entry,
+            decision: TransferDecision::Deleted,
+        }) => {
+            assert_eq!(entry.get_relative_path(), PathBuf::from("orphan.bin"));
+        }
+        other => panic!("Expected Classified{{decision:Deleted}}, got {:?}", other),
+    }
+
+    let _ = done_tx.send(());
+    receiver_handle.await.unwrap();
+    sender.close().await.unwrap();
 }
 
 /// 多路复用专项测试：大文件 `Data` stream 传输期间对端未读取（模拟大文件占满该 stream），

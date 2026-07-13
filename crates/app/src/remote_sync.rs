@@ -12,23 +12,29 @@
 use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::path::Path;
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex, PoisonError};
 
 use data_mover::dir_tree::NdxEvent;
 use data_mover::filter::parse_filter_expression;
 use data_mover::qos::QosManager;
-use data_mover::{ConsistencyCheck, StorageEnum, WalkDirAsyncIterator2, create_storage};
+use data_mover::{
+    ChangeKind, ConsistencyCheck, EntryEnum, StorageEntryMessage, StorageEnum, WalkDirAsyncIterator2, create_storage,
+};
 use rustls::pki_types::CertificateDer;
+use tokio::sync::Mutex as AsyncMutex;
 use tracing::{debug, error, info, warn};
 use transport::error::TransportError;
 use transport::message::{
     BlockSignature, HandshakeResult, NdxTable, ProtocolHandshake, ReceiverMsg, SenderMsg, SessionConfig,
+    TransferDecision,
 };
 use transport::traits::SenderTransport;
 use utils::app_config::AppConfig;
+use utils::logger;
 
-use crate::config::SyncJobConfig;
-use crate::consumer::stats::format_bytes;
+use crate::config::{JobType, SyncJobConfig};
+use crate::consumer::stats::{IncrementalStats, ProgressBar, StatisticConsumer, StatsKind, format_bytes};
 use crate::error::{AppError, Result};
 use crate::orchestrator::create_qos_manager;
 use crate::sync::parse_size;
@@ -67,9 +73,26 @@ pub(crate) async fn run(
             enable_acl: config.enable_acl,
             is_source_reserved: true,
             block_size: config.block_size.clone(),
-            delete_target: false,
+            delete_target: config.delete_target,
         }))
         .await?;
+
+    // ── 3.5 结构化统计报表（Sender 侧，复用本地 StatisticConsumer/IncrementalStats——
+    //    双进程远端不分 full/incremental，报表形状本身就是 delta 语义，与 orchestrator
+    //    的 ScanType 路由无关，统一用 JobType::IncrementalCopy）──
+    let stats_consumer = Arc::new(AsyncMutex::new(StatisticConsumer {
+        stats: StatsKind::Incremental(IncrementalStats::new(
+            JobType::IncrementalCopy,
+            config.job_id.clone(),
+            config.raw_command_line.clone(),
+            logger::get_current_app_log_path(),
+        )),
+        progress_bar: ProgressBar::new(JobType::IncrementalCopy),
+        job_dir: config.job_dir.clone(),
+        callback_url: config.progress_callback_url.clone(),
+        pb_handle: None,
+    }));
+    let callback_guard = StatisticConsumer::begin(stats_consumer.clone()).await;
 
     // ── 4. 创建源端 storage + walkdir_2 ──
     let block_size = match &config.block_size {
@@ -104,7 +127,7 @@ pub(crate) async fn run(
 
     // ── 6+7+8. 文件列表发送 与 请求处理+Ack收集 并发运行（流水线，无阶段 barrier） ──
     let ndx_table = Mutex::new(NdxTable::new());
-    let file_list_fut = send_file_list_phase(&transport, &walkdir_iter, &ndx_table);
+    let file_list_fut = send_file_list_phase(&transport, &walkdir_iter, &ndx_table, &stats_consumer);
     let requests_acks_fut = process_requests_and_acks(
         &transport,
         &src_storage,
@@ -113,6 +136,7 @@ pub(crate) async fn run(
         config.enable_acl,
         &mut completed_paths,
         &checkpoint_path,
+        &stats_consumer,
     );
     let (page_count, (transfer_count, success_count, error_count)) =
         tokio::try_join!(file_list_fut, requests_acks_fut)?;
@@ -133,6 +157,8 @@ pub(crate) async fn run(
         qos.shutdown();
     }
     transport.close().await?;
+    // 结束统计报表生命周期：abort 回调循环 → 发最终回调(is_final=true) → 打印终态报表
+    StatisticConsumer::end(stats_consumer, callback_guard).await;
     finalize_run_result(error_count)
 }
 
@@ -208,14 +234,29 @@ async fn send_and_check_auth(transport: &(dyn SenderTransport + 'static), auth_t
 ///
 /// 只调用 `transport.send()`、从不 `recv()`，可安全地与 `process_requests_and_acks`
 /// 并发运行（`ndx_table` 用 `Mutex` 支持并发读写：本函数是唯一的写者）。
+///
+/// 每页遍历到的 entry 额外喂一次 `StorageEntryMessage::Scanned`，填充
+/// `IncrementalStats.scanned`（扩展名/时间/大小分布）——Sender 本来就要完整遍历一次
+/// 源端才能生成 file list，这个遍历本身就是「Scanned」阶段的等价物，不需要额外协议
+/// 往返（远端没有独立 scan 阶段，见 issue #23）。
 async fn send_file_list_phase(
     transport: &(dyn SenderTransport + 'static), walkdir_iter: &WalkDirAsyncIterator2, ndx_table: &Mutex<NdxTable>,
+    stats_consumer: &Arc<AsyncMutex<StatisticConsumer>>,
 ) -> Result<u64> {
     info!("[Sender Remote] Sending file list");
     let mut page_count = 0u64;
     while let Some(event) = walkdir_iter.next().await {
         match event {
             NdxEvent::Page(page) => {
+                {
+                    let mut consumer = stats_consumer.lock().await;
+                    for nf in &page.files {
+                        consumer.update_statistics(&StorageEntryMessage::Scanned(nf.entry.clone()));
+                    }
+                    for ns in &page.subdirs {
+                        consumer.update_statistics(&StorageEntryMessage::Scanned(ns.entry.clone()));
+                    }
+                }
                 ndx_table
                     .lock()
                     .unwrap_or_else(PoisonError::into_inner)
@@ -248,10 +289,17 @@ async fn send_file_list_phase(
 ///
 /// `RequestsDone` 到达时立即发送 `TransferDone`（与改造前时序一致），但循环不break，
 /// 继续处理后续到达的 ack/progress，直到收到 `AllDone`。
+///
+/// `TransferRequest{decision}`/`DeltaTransferRequest`/`Classified{entry, decision}`
+/// 各自额外翻译为 `StorageEntryMessage` 喂 `stats_consumer.update_statistics()`，驱动
+/// Sender 侧结构化报表（New/Changed/MetadataOnly/Deleted，`Skip` 不产生统计，见
+/// `classification_to_stats_message`，issue #23）；`Redo{ndx}` 是重发、不是新的分类
+/// 事件，不重复计数。
 /// 返回 `(transfer_count, success_count, error_count)`。
 async fn process_requests_and_acks(
     transport: &(dyn SenderTransport + 'static), src_storage: &Arc<StorageEnum>, ndx_table: &Mutex<NdxTable>,
     qos: Option<&QosManager>, enable_acl: bool, completed_paths: &mut HashSet<String>, checkpoint_path: &Path,
+    stats_consumer: &Arc<AsyncMutex<StatisticConsumer>>,
 ) -> Result<(u64, u64, u64)> {
     info!("[Sender Remote] Processing transfer requests + collecting acks");
     let mut transfer_count = 0u64;
@@ -263,13 +311,16 @@ async fn process_requests_and_acks(
     let mut errored_ndx: HashSet<i32> = HashSet::new();
     loop {
         match transport.recv().await {
-            Some(ReceiverMsg::TransferRequest { ndx }) => {
+            Some(ReceiverMsg::TransferRequest { ndx, decision }) => {
                 let entry = ndx_table
                     .lock()
                     .unwrap_or_else(PoisonError::into_inner)
                     .get(ndx)
                     .cloned();
                 if let Some(entry) = entry {
+                    if let Some(msg) = classification_to_stats_message(decision, entry.clone()) {
+                        stats_consumer.lock().await.update_statistics(&msg);
+                    }
                     // 源读/符号链接读失败：Sender 已发 EntryError 通知 Receiver 完成该
                     // ndx，这里自增 error_count（Sender 自检失败由 Sender 自己计数，见 [0][3]）
                     if !handle_full_transfer(transport, src_storage, &entry, ndx, qos, enable_acl).await? {
@@ -291,6 +342,16 @@ async fn process_requests_and_acks(
                     .get(ndx)
                     .cloned();
                 if let Some(entry) = entry {
+                    // 收到 DeltaTransferRequest 本身即无歧义地代表 Changed，不需要额外的
+                    // decision 字段（该消息只在 DestIndex::check() 判定 DeltaTransfer 且
+                    // delta 能力协商成功时才会发出）
+                    stats_consumer
+                        .lock()
+                        .await
+                        .update_statistics(&StorageEntryMessage::Changed {
+                            entry: entry.clone(),
+                            kind: ChangeKind::DataOnly,
+                        });
                     // delta: 仅 src 读取成功时计入传输数（与原逻辑保持一致）；读取失败已发
                     // EntryError 通知 Receiver 完成该 ndx，这里自增 error_count（见 [2]）
                     if handle_delta_transfer(
@@ -311,6 +372,13 @@ async fn process_requests_and_acks(
                     }
                 } else {
                     error!("[Sender Remote] Unknown NDX {} for delta", ndx);
+                }
+            }
+            // ── 分类信号（MetadataOnly/Skip/Deleted）：Receiver 本地执行/判定后上行，
+            //    只驱动统计，不触发任何 Sender 侧动作 ──
+            Some(ReceiverMsg::Classified { entry, decision }) => {
+                if let Some(msg) = classification_to_stats_message(decision, entry) {
+                    stats_consumer.lock().await.update_statistics(&msg);
                 }
             }
             // ── ndx 级重传请求：hash 校验失败首次上报后，Receiver 要求重发。delta redo 一律
@@ -357,6 +425,13 @@ async fn process_requests_and_acks(
                 .await;
             }
             Some(ReceiverMsg::Progress(snapshot)) => {
+                // 远端写盘发生在 Receiver 侧，Sender 自己不产生 chunk 级字节计数，
+                // 复用 StatisticConsumer 的实时字节计数器承载 Receiver 汇报的进度
+                stats_consumer
+                    .lock()
+                    .await
+                    .get_bytes_tracker()
+                    .store(snapshot.bytes_transferred, Ordering::Relaxed);
                 info!(
                     "[Sender Remote] [{}] Progress: {} files ({}) transferred, {} dirs, {} skipped, {} errors, {:.1}s, {}/s",
                     snapshot.receiver_id,
@@ -399,6 +474,33 @@ async fn process_requests_and_acks(
 fn count_ndx_error(errored: &mut HashSet<i32>, ndx: i32, error_count: &mut u64) {
     if errored.insert(ndx) {
         *error_count += 1;
+    }
+}
+
+/// 把 Receiver 的分类判定翻译为 `StorageEntryMessage`，供 Sender 侧 `StatisticConsumer`
+/// 累计统计（与本地单进程管线复用同一套类型/口径，不发明新格式，见 issue #23）。
+///
+/// - `FullTransfer` → `New`；`MetadataOnly` → `Changed{kind: MetadataOnly}`（与本地口径
+///   对齐：本地模式里 MetadataOnly 本来就是 `Changed` 的子类型，不是独立顶层分类）；
+///   `Deleted` → `Deleted`。
+/// - `DeltaTransfer` → `Changed{kind: DataOnly}`：`DestIndex::check()` 只要
+///   `data_check` 不一致就判定 `DeltaTransfer`（不区分是否同时 `metadata_check` 也不
+///   一致），Sender 拿不到目标端 entry、无法像本地模式 `ChangeKind::from_entry_diff`
+///   那样精确区分 `DataOnly`/`Both`，取"表示内容变更"的那个 variant 作为口径。
+/// - `Skip` → `None`：与本地模式完全匹配的条目从不广播一致，不产生任何统计。
+fn classification_to_stats_message(decision: TransferDecision, entry: Arc<EntryEnum>) -> Option<StorageEntryMessage> {
+    match decision {
+        TransferDecision::FullTransfer => Some(StorageEntryMessage::New(entry)),
+        TransferDecision::DeltaTransfer => Some(StorageEntryMessage::Changed {
+            entry,
+            kind: ChangeKind::DataOnly,
+        }),
+        TransferDecision::MetadataOnly => Some(StorageEntryMessage::Changed {
+            entry,
+            kind: ChangeKind::MetadataOnly,
+        }),
+        TransferDecision::Skip => None,
+        TransferDecision::Deleted => Some(StorageEntryMessage::Deleted(entry)),
     }
 }
 
@@ -654,16 +756,41 @@ mod tests {
     use std::collections::HashMap;
     use std::fs;
     use std::fs::File;
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::PathBuf;
     use std::time::{Duration, SystemTime};
 
     use async_trait::async_trait;
     use data_mover::create_storage;
+    use data_mover::dir_tree::DirPageResult;
     use tempfile::tempdir;
+    use tokio::task::JoinHandle;
     use transport::error::Result as TransportResult;
     use transport::in_process::{InProcessReceiverTransport, InProcessSenderTransport, create_in_process_pair};
+    use transport::message::FeatureFlags;
+    use transport::traits::ReceiverTransport;
 
     use super::*;
+    use crate::consumer::stats::{JobSummary, ProgressDetail, ProgressReport};
     use crate::receiver::receiver_task_remote;
+
+    /// 构造测试用 `Arc<AsyncMutex<StatisticConsumer>>`：不设 `callback_url`（不起 HTTP
+    /// 回调循环），不调用 `begin()`/`end()`（这些测试只关心 `send_file_list_phase`/
+    /// `process_requests_and_acks` 本身的传输/ack 行为，不测试统计生命周期）。
+    fn test_stats_consumer() -> Arc<AsyncMutex<StatisticConsumer>> {
+        Arc::new(AsyncMutex::new(StatisticConsumer {
+            stats: StatsKind::Incremental(IncrementalStats::new(
+                JobType::IncrementalCopy,
+                "test-job".to_string(),
+                "test".to_string(),
+                String::new(),
+            )),
+            progress_bar: ProgressBar::new(JobType::IncrementalCopy),
+            job_dir: String::new(),
+            callback_url: None,
+            pb_handle: None,
+        }))
+    }
 
     // ── finalize_run_result：error_count → 退出码决策纯函数单测 ──
 
@@ -736,8 +863,9 @@ mod tests {
         let ndx_table = Mutex::new(NdxTable::new());
         let mut completed_paths = HashSet::new();
         let checkpoint_path = src_dir.path().join("unused_checkpoint.json");
+        let stats_consumer = test_stats_consumer();
         let (page_count, (transfer_count, success_count, error_count)) = tokio::try_join!(
-            send_file_list_phase(&sender_transport, &walkdir_iter, &ndx_table),
+            send_file_list_phase(&sender_transport, &walkdir_iter, &ndx_table, &stats_consumer),
             process_requests_and_acks(
                 &sender_transport,
                 &src_storage,
@@ -746,6 +874,7 @@ mod tests {
                 false,
                 &mut completed_paths,
                 &checkpoint_path,
+                &stats_consumer,
             )
         )
         .unwrap();
@@ -870,8 +999,9 @@ mod tests {
         let ndx_table = Mutex::new(NdxTable::new());
         let mut completed_paths = HashSet::new();
         let checkpoint_path = src_dir.join("unused_checkpoint.json");
+        let stats_consumer = test_stats_consumer();
         let (_page_count, (_transfer_count, success_count, error_count)) = tokio::try_join!(
-            send_file_list_phase(sender_transport, &walkdir_iter, &ndx_table),
+            send_file_list_phase(sender_transport, &walkdir_iter, &ndx_table, &stats_consumer),
             process_requests_and_acks(
                 sender_transport,
                 &src_storage,
@@ -880,6 +1010,7 @@ mod tests {
                 false,
                 &mut completed_paths,
                 &checkpoint_path,
+                &stats_consumer,
             )
         )
         .unwrap();
@@ -923,7 +1054,8 @@ mod tests {
             .unwrap();
 
         let ndx_table = Mutex::new(NdxTable::new());
-        send_file_list_phase(sender_transport, &walkdir_iter, &ndx_table)
+        let stats_consumer = test_stats_consumer();
+        send_file_list_phase(sender_transport, &walkdir_iter, &ndx_table, &stats_consumer)
             .await
             .unwrap();
 
@@ -939,6 +1071,7 @@ mod tests {
             false,
             &mut completed_paths,
             &checkpoint_path,
+            &stats_consumer,
         )
         .await
         .unwrap();
@@ -1314,5 +1447,780 @@ mod tests {
         assert_eq!(error_count, 0, "关闭完整性校验时不应因篡改的 hash 而失败");
         assert_eq!(success_count, 1, "应直接按原样写入成功，不触发 redo");
         assert_eq!(fs::read(dest_dir.path().join("a.txt")).unwrap(), content);
+    }
+
+    // ============================================================
+    // Receiver 分类信号正确性（issue #23 测试计划 2）：双端真实 StorageEnum +
+    // receiver_task_remote，验证 New/Changed(含 MetadataOnly)/Skip/Deleted 五类判定
+    // 各自产生正确的 wire 信号，且执行动作（是否传输/是否本地改元数据/是否删除）与
+    // 判定一致。
+    // ============================================================
+
+    /// 起 `receiver_task_remote` 并完成握手（`delta_enabled=false` 时构造 delta:false
+    /// 的本端能力集触发降级协商，走 `TransferRequest{decision:DeltaTransfer}` 而非
+    /// `DeltaTransferRequest`）+ 鉴权 + `SessionConfig`，返回
+    /// `(sender_transport, receiver_handle)`。
+    async fn spawn_receiver_and_handshake(
+        dest_storage: Arc<StorageEnum>, delete_target: bool, delta_enabled: bool,
+    ) -> (InProcessSenderTransport, JoinHandle<Result<()>>) {
+        let (sender_transport, receiver_transport) = create_in_process_pair();
+        let receiver_handle =
+            tokio::spawn(async move { receiver_task_remote(&receiver_transport, dest_storage, None).await });
+
+        if delta_enabled {
+            negotiate_handshake(&sender_transport).await.unwrap();
+        } else {
+            let handshake = ProtocolHandshake {
+                features: FeatureFlags {
+                    delta: false,
+                    ..FeatureFlags::current()
+                },
+                ..ProtocolHandshake::current()
+            };
+            sender_transport.send(SenderMsg::Handshake(handshake)).await.unwrap();
+            match sender_transport.recv().await {
+                Some(ReceiverMsg::HandshakeAck(HandshakeResult::Accepted { features })) => {
+                    assert!(!features.delta, "delta 应协商为 false");
+                }
+                other => panic!("expected HandshakeAck(Accepted), got {other:?}"),
+            }
+        }
+
+        send_and_check_auth(&sender_transport, None).await.unwrap();
+        sender_transport
+            .send(SenderMsg::SessionConfig(SessionConfig {
+                src_path: String::new(),
+                qos: None,
+                peak_qos_rate: 1.0,
+                iops: None,
+                enable_integrity_check: true,
+                enable_acl: false,
+                is_source_reserved: true,
+                block_size: None,
+                delete_target,
+            }))
+            .await
+            .unwrap();
+
+        (sender_transport, receiver_handle)
+    }
+
+    /// 用真实 `walkdir_2` 遍历 `dir`（测试前提：目录下恰好一个顶层文件）返回第一页 +
+    /// 该文件的 ndx。
+    async fn single_file_page(dir: &std::path::Path) -> (DirPageResult, i32) {
+        let storage = Arc::new(create_storage(dir.to_str().unwrap(), None, false).await.unwrap());
+        let walkdir_iter = storage.walkdir_2(None, None, None, None, 4, false).await.unwrap();
+        let page = match walkdir_iter.next().await {
+            Some(NdxEvent::Page(p)) => p,
+            other => panic!("expected Page, got {other:?}"),
+        };
+        assert_eq!(page.files.len(), 1, "测试前提：目录下应恰好一个顶层文件");
+        let ndx = page.files[0].ndx;
+        (page, ndx)
+    }
+
+    /// 构造一个空的根目录页（`dir_path=""`，无文件/子目录），仅用于驱动 orphan-delete
+    /// 分支（`DestIndex::orphaned_entries()`），不触发任何 `TransferRequest`。
+    fn empty_root_page() -> DirPageResult {
+        DirPageResult {
+            dir_path: String::new(),
+            ndx_start: 0,
+            files: vec![],
+            subdirs: vec![],
+            gap_ndx: -1,
+        }
+    }
+
+    /// 将 `path` 的 mtime 精确设为 `secs`（Unix 纪元秒）：`data_check` 按 mtime+size
+    /// 精确比较，两次独立 `fs::write` 之间哪怕微秒级的写入时间差都会被判定为不匹配，
+    /// 必须显式对齐 src/dest 双方的 mtime 才能可靠触发 `MetadataOnly`/`Skip`。
+    fn set_mtime(path: &std::path::Path, secs: u64) {
+        let f = File::open(path).unwrap();
+        f.set_modified(SystemTime::UNIX_EPOCH + Duration::from_secs(secs))
+            .unwrap();
+    }
+
+    /// 跳过间歇性到达的 `Progress` 快照：`receiver_task_remote` 内 `progress_reporter`
+    /// 每 5s 上报一次，`tokio::time::interval` 首个 tick 立即触发（tokio 默认行为），
+    /// 可能与本测试关心的分类信号交错到达，与断言无关，跳过后返回下一条非 `Progress`
+    /// 消息（真正非预期的消息仍会被调用方的 `other => panic!` 分支捕获，不会被此函数
+    /// 悄悄吞掉）。
+    async fn recv_skip_progress(sender_transport: &InProcessSenderTransport) -> Option<ReceiverMsg> {
+        loop {
+            match sender_transport.recv().await {
+                Some(ReceiverMsg::Progress(_)) => continue,
+                other => return other,
+            }
+        }
+    }
+
+    /// 发 `FileListDone`（消费 `RequestsDone`，若此前多出一条非预期消息会在此 panic，
+    /// 天然验证"没有额外分类信号"）→ 对 `pending_ndx` 逐个发合成 `EntryError` 完成该
+    /// ndx（测试不需要真实文件传输，只关心分类信号本身）→ `TransferDone` → drain 到
+    /// `AllDone` → `close` + `join`。
+    async fn finish_phase(
+        sender_transport: &InProcessSenderTransport, receiver_handle: JoinHandle<Result<()>>, pending_ndx: &[i32],
+    ) {
+        sender_transport.send(SenderMsg::FileListDone).await.unwrap();
+        match recv_skip_progress(sender_transport).await {
+            Some(ReceiverMsg::RequestsDone) => {}
+            other => panic!("expected RequestsDone, got {other:?}"),
+        }
+        for &ndx in pending_ndx {
+            sender_transport
+                .send(SenderMsg::EntryError {
+                    path: PathBuf::from("synthetic"),
+                    reason: "test synthetic completion".into(),
+                    ndx: Some(ndx),
+                })
+                .await
+                .unwrap();
+        }
+        sender_transport.send(SenderMsg::TransferDone).await.unwrap();
+        loop {
+            match sender_transport.recv().await {
+                Some(ReceiverMsg::AllDone) => break,
+                Some(_) => continue,
+                None => panic!("transport closed before AllDone"),
+            }
+        }
+        sender_transport.close().await.unwrap();
+        receiver_handle.await.unwrap().unwrap();
+    }
+
+    /// dest 缺失该条目 → 发 `TransferRequest{decision: FullTransfer}`，无 `Classified`
+    #[tokio::test]
+    async fn recv_file_list_full_transfer_signal() {
+        let src_dir = tempdir().unwrap();
+        let dest_dir = tempdir().unwrap();
+        fs::write(src_dir.path().join("a.txt"), b"new file").unwrap();
+
+        let dest_storage = Arc::new(
+            create_storage(dest_dir.path().to_str().unwrap(), None, true)
+                .await
+                .unwrap(),
+        );
+        let (sender_transport, receiver_handle) = spawn_receiver_and_handshake(dest_storage, false, true).await;
+
+        let (page, ndx) = single_file_page(src_dir.path()).await;
+        sender_transport.send(SenderMsg::FilePage(page)).await.unwrap();
+
+        match recv_skip_progress(&sender_transport).await {
+            Some(ReceiverMsg::TransferRequest {
+                ndx: got,
+                decision: TransferDecision::FullTransfer,
+            }) => assert_eq!(got, ndx),
+            other => panic!("expected TransferRequest{{decision:FullTransfer}}, got {other:?}"),
+        }
+
+        finish_phase(&sender_transport, receiver_handle, &[ndx]).await;
+    }
+
+    /// dest 存在但内容不同 + delta 能力未协商成功 → 降级为整份传输，但 `decision` 仍
+    /// 携带 `DeltaTransfer`（wire 动作降级，分类判定不变，供 Sender 侧统计为 Changed）
+    #[tokio::test]
+    async fn recv_file_list_delta_transfer_downgrade_signal() {
+        let src_dir = tempdir().unwrap();
+        let dest_dir = tempdir().unwrap();
+        let content = vec![b'A'; 4096];
+        fs::write(src_dir.path().join("a.txt"), &content).unwrap();
+        seed_delta_basis(dest_dir.path(), "a.txt", 4096);
+
+        let dest_storage = Arc::new(
+            create_storage(dest_dir.path().to_str().unwrap(), None, true)
+                .await
+                .unwrap(),
+        );
+        let (sender_transport, receiver_handle) = spawn_receiver_and_handshake(dest_storage, false, false).await;
+
+        let (page, ndx) = single_file_page(src_dir.path()).await;
+        sender_transport.send(SenderMsg::FilePage(page)).await.unwrap();
+
+        match recv_skip_progress(&sender_transport).await {
+            Some(ReceiverMsg::TransferRequest {
+                ndx: got,
+                decision: TransferDecision::DeltaTransfer,
+            }) => assert_eq!(got, ndx),
+            other => panic!("expected TransferRequest{{decision:DeltaTransfer}}（delta 降级）, got {other:?}"),
+        }
+
+        finish_phase(&sender_transport, receiver_handle, &[ndx]).await;
+    }
+
+    /// dest 存在但内容不同 + delta 协商成功 → 发 `DeltaTransferRequest`（回归：本消息
+    /// 本身无歧义地代表 Changed，不需要携带 `decision` 字段）
+    #[tokio::test]
+    async fn recv_file_list_delta_transfer_negotiated_signal() {
+        let src_dir = tempdir().unwrap();
+        let dest_dir = tempdir().unwrap();
+        let content = vec![b'A'; 4096];
+        fs::write(src_dir.path().join("a.txt"), &content).unwrap();
+        seed_delta_basis(dest_dir.path(), "a.txt", 4096);
+
+        let dest_storage = Arc::new(
+            create_storage(dest_dir.path().to_str().unwrap(), None, true)
+                .await
+                .unwrap(),
+        );
+        let (sender_transport, receiver_handle) = spawn_receiver_and_handshake(dest_storage, false, true).await;
+
+        let (page, ndx) = single_file_page(src_dir.path()).await;
+        sender_transport.send(SenderMsg::FilePage(page)).await.unwrap();
+
+        match recv_skip_progress(&sender_transport).await {
+            Some(ReceiverMsg::DeltaTransferRequest { ndx: got, .. }) => assert_eq!(got, ndx),
+            other => panic!("expected DeltaTransferRequest, got {other:?}"),
+        }
+
+        finish_phase(&sender_transport, receiver_handle, &[ndx]).await;
+    }
+
+    /// dest 存在，仅 mode 不同 → 本地 `set_entry_metadata` + 发
+    /// `Classified{decision:MetadataOnly}`，不产生任何传输请求
+    #[tokio::test]
+    async fn recv_file_list_metadata_only_signal() {
+        let src_dir = tempdir().unwrap();
+        let dest_dir = tempdir().unwrap();
+        fs::write(src_dir.path().join("a.txt"), b"same content").unwrap();
+        fs::write(dest_dir.path().join("a.txt"), b"same content").unwrap();
+        set_mtime(&src_dir.path().join("a.txt"), 1_700_000_000);
+        set_mtime(&dest_dir.path().join("a.txt"), 1_700_000_000);
+        // 源端 mode 与目标端不同 → metadata_check 不一致，data_check（mtime+size）一致
+        fs::set_permissions(src_dir.path().join("a.txt"), fs::Permissions::from_mode(0o640)).unwrap();
+        fs::set_permissions(dest_dir.path().join("a.txt"), fs::Permissions::from_mode(0o644)).unwrap();
+
+        let dest_storage = Arc::new(
+            create_storage(dest_dir.path().to_str().unwrap(), None, true)
+                .await
+                .unwrap(),
+        );
+        let (sender_transport, receiver_handle) = spawn_receiver_and_handshake(dest_storage, false, true).await;
+
+        let (page, _ndx) = single_file_page(src_dir.path()).await;
+        sender_transport.send(SenderMsg::FilePage(page)).await.unwrap();
+
+        match recv_skip_progress(&sender_transport).await {
+            Some(ReceiverMsg::Classified {
+                entry,
+                decision: TransferDecision::MetadataOnly,
+            }) => assert_eq!(entry.get_relative_path(), std::path::Path::new("a.txt")),
+            other => panic!("expected Classified{{decision:MetadataOnly}}, got {other:?}"),
+        }
+
+        // 本地已执行 set_entry_metadata：目标端 mode 应变为源端 mode
+        let dest_mode = fs::metadata(dest_dir.path().join("a.txt"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(dest_mode, 0o640, "MetadataOnly 应本地更新目标端 mode");
+
+        finish_phase(&sender_transport, receiver_handle, &[]).await;
+    }
+
+    /// dest 完全一致（内容+mtime+size+mode）→ 发 `Classified{decision:Skip}`，不产生
+    /// 任何传输请求，不产生任何写操作
+    #[tokio::test]
+    async fn recv_file_list_skip_signal() {
+        let src_dir = tempdir().unwrap();
+        let dest_dir = tempdir().unwrap();
+        fs::write(src_dir.path().join("a.txt"), b"identical").unwrap();
+        fs::write(dest_dir.path().join("a.txt"), b"identical").unwrap();
+        set_mtime(&src_dir.path().join("a.txt"), 1_700_000_000);
+        set_mtime(&dest_dir.path().join("a.txt"), 1_700_000_000);
+        fs::set_permissions(src_dir.path().join("a.txt"), fs::Permissions::from_mode(0o644)).unwrap();
+        fs::set_permissions(dest_dir.path().join("a.txt"), fs::Permissions::from_mode(0o644)).unwrap();
+
+        let dest_storage = Arc::new(
+            create_storage(dest_dir.path().to_str().unwrap(), None, true)
+                .await
+                .unwrap(),
+        );
+        let (sender_transport, receiver_handle) = spawn_receiver_and_handshake(dest_storage, false, true).await;
+
+        let (page, _ndx) = single_file_page(src_dir.path()).await;
+        sender_transport.send(SenderMsg::FilePage(page)).await.unwrap();
+
+        match recv_skip_progress(&sender_transport).await {
+            Some(ReceiverMsg::Classified {
+                decision: TransferDecision::Skip,
+                ..
+            }) => {}
+            other => panic!("expected Classified{{decision:Skip}}, got {other:?}"),
+        }
+
+        finish_phase(&sender_transport, receiver_handle, &[]).await;
+    }
+
+    /// `delete_target=true` + dest 孤儿 → 本地删除 + 发 `Classified{decision:Deleted}`
+    #[tokio::test]
+    async fn recv_file_list_delete_target_true_emits_classified_deleted() {
+        let dest_dir = tempdir().unwrap();
+        fs::write(dest_dir.path().join("orphan.txt"), b"stale").unwrap();
+
+        let dest_storage = Arc::new(
+            create_storage(dest_dir.path().to_str().unwrap(), None, true)
+                .await
+                .unwrap(),
+        );
+        let (sender_transport, receiver_handle) = spawn_receiver_and_handshake(dest_storage, true, true).await;
+
+        sender_transport
+            .send(SenderMsg::FilePage(empty_root_page()))
+            .await
+            .unwrap();
+
+        match recv_skip_progress(&sender_transport).await {
+            Some(ReceiverMsg::Classified {
+                entry,
+                decision: TransferDecision::Deleted,
+            }) => assert_eq!(entry.get_relative_path(), std::path::Path::new("orphan.txt")),
+            other => panic!("expected Classified{{decision:Deleted}}, got {other:?}"),
+        }
+        assert!(!dest_dir.path().join("orphan.txt").exists(), "orphan 应已被删除");
+
+        finish_phase(&sender_transport, receiver_handle, &[]).await;
+    }
+
+    /// `delete_target=false` → 孤儿不删除，无 `Classified`（`finish_phase` 内部期望
+    /// `FileListDone` 之后紧接着就是 `RequestsDone`，若中间插了 `Classified` 会在此
+    /// panic，天然验证没有多余的分类信号）
+    #[tokio::test]
+    async fn recv_file_list_delete_target_false_keeps_orphan_no_classified() {
+        let dest_dir = tempdir().unwrap();
+        fs::write(dest_dir.path().join("orphan.txt"), b"stale").unwrap();
+
+        let dest_storage = Arc::new(
+            create_storage(dest_dir.path().to_str().unwrap(), None, true)
+                .await
+                .unwrap(),
+        );
+        let (sender_transport, receiver_handle) = spawn_receiver_and_handshake(dest_storage, false, true).await;
+
+        sender_transport
+            .send(SenderMsg::FilePage(empty_root_page()))
+            .await
+            .unwrap();
+        finish_phase(&sender_transport, receiver_handle, &[]).await;
+
+        assert!(
+            dest_dir.path().join("orphan.txt").exists(),
+            "delete_target=false 时孤儿应保留"
+        );
+    }
+
+    /// dest 预先存在与源端一致的子目录 + `delete_target=true` → 子目录**不是**孤儿：
+    /// 不发 `Classified{Deleted}`、不整树删除。回归：`page.subdirs` 走 `create_dir_all`
+    /// 路径、不经 `DestIndex::check()`，此前从不登记 `matched`，预存子目录被
+    /// `orphaned_entries()` 误判为孤儿 → `delete_dir_all` 整树误删后按 New 重传。
+    #[tokio::test]
+    async fn recv_file_list_delete_target_preserves_existing_subdir() {
+        let src_dir = tempdir().unwrap();
+        let dest_dir = tempdir().unwrap();
+        for dir in [src_dir.path(), dest_dir.path()] {
+            fs::create_dir_all(dir.join("sub")).unwrap();
+            fs::write(dir.join("sub/nested.txt"), b"same content").unwrap();
+            set_mtime(&dir.join("sub/nested.txt"), 1_700_000_000);
+            fs::set_permissions(dir.join("sub/nested.txt"), fs::Permissions::from_mode(0o644)).unwrap();
+        }
+
+        let dest_storage = Arc::new(
+            create_storage(dest_dir.path().to_str().unwrap(), None, true)
+                .await
+                .unwrap(),
+        );
+        let (sender_transport, receiver_handle) = spawn_receiver_and_handshake(dest_storage, true, true).await;
+
+        // 真实 walkdir 逐页下发：根页（subdirs=[sub]，files 空）+ 子页（files=[nested.txt]）
+        let src_storage = Arc::new(
+            create_storage(src_dir.path().to_str().unwrap(), None, false)
+                .await
+                .unwrap(),
+        );
+        let walkdir_iter = src_storage.walkdir_2(None, None, None, None, 4, false).await.unwrap();
+        while let Some(event) = walkdir_iter.next().await {
+            if let NdxEvent::Page(page) = event {
+                sender_transport.send(SenderMsg::FilePage(page)).await.unwrap();
+            }
+        }
+
+        // 唯一预期信号：nested.txt 完全一致 → Classified{Skip}。若子目录被误判孤儿，
+        // 这里会先收到 Classified{Deleted}（或整树误删后 nested.txt 的 TransferRequest）
+        match recv_skip_progress(&sender_transport).await {
+            Some(ReceiverMsg::Classified {
+                entry,
+                decision: TransferDecision::Skip,
+            }) => assert_eq!(entry.get_relative_path(), std::path::Path::new("sub/nested.txt")),
+            other => panic!("expected Classified{{decision:Skip}} for sub/nested.txt, got {other:?}"),
+        }
+
+        finish_phase(&sender_transport, receiver_handle, &[]).await;
+        assert!(
+            dest_dir.path().join("sub/nested.txt").exists(),
+            "预存子目录内容不得被当作孤儿删除"
+        );
+    }
+
+    /// 删除失败（父目录无写权限）→ 发 `EntryError`，不发 `Classified`
+    #[tokio::test]
+    async fn recv_file_list_delete_failure_emits_entry_error() {
+        let dest_dir = tempdir().unwrap();
+        fs::write(dest_dir.path().join("orphan.txt"), b"stale").unwrap();
+        // unlink 需要父目录写权限；只留 r-x 制造确定性删除失败（walkdir 列目录仍可用）
+        fs::set_permissions(dest_dir.path(), fs::Permissions::from_mode(0o555)).unwrap();
+
+        let dest_storage = Arc::new(
+            create_storage(dest_dir.path().to_str().unwrap(), None, true)
+                .await
+                .unwrap(),
+        );
+        let (sender_transport, receiver_handle) = spawn_receiver_and_handshake(dest_storage, true, true).await;
+
+        sender_transport
+            .send(SenderMsg::FilePage(empty_root_page()))
+            .await
+            .unwrap();
+
+        match recv_skip_progress(&sender_transport).await {
+            Some(ReceiverMsg::EntryError { entry, reason }) => {
+                assert_eq!(entry.get_relative_path(), std::path::Path::new("orphan.txt"));
+                assert!(!reason.is_empty());
+            }
+            other => panic!("expected EntryError（删除失败）, got {other:?}"),
+        }
+
+        // 恢复权限：finish_phase 内部无需再写 dest_dir，但保险起见先复原，避免 tempdir 清理受阻
+        fs::set_permissions(dest_dir.path(), fs::Permissions::from_mode(0o755)).unwrap();
+
+        finish_phase(&sender_transport, receiver_handle, &[]).await;
+    }
+
+    // ============================================================
+    // Sender 侧统计桥接正确性（issue #23 测试计划 3）：分类消息 → `update_statistics`
+    // 的翻译函数单元测试 + 报表口径一致性，不需要真实 QUIC。
+    // ============================================================
+
+    /// 构造一个仅用于测试的最小 `NASEntry`（字段值无实际语义，只满足统计消息类型要求）
+    fn dummy_entry(name: &str, is_dir: bool, size: u64) -> Arc<EntryEnum> {
+        Arc::new(EntryEnum::NAS(data_mover::NASEntry {
+            name: name.to_string(),
+            relative_path: PathBuf::from(name),
+            extension: None,
+            is_dir,
+            size,
+            atime: 0,
+            ctime: 0,
+            mtime: 0,
+            mode: 0o644,
+            is_symlink: false,
+            hard_links: None,
+            uid: None,
+            gid: None,
+            ino: None,
+            file_handle: None,
+            acl: None,
+            owner: None,
+            owner_group: None,
+            xattrs: None,
+        }))
+    }
+
+    #[test]
+    fn classification_to_stats_message_maps_full_transfer_to_new() {
+        let entry = dummy_entry("a.txt", false, 10);
+        match classification_to_stats_message(TransferDecision::FullTransfer, entry) {
+            Some(StorageEntryMessage::New(_)) => {}
+            other => panic!("expected New, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classification_to_stats_message_maps_delta_transfer_to_changed_data_only() {
+        let entry = dummy_entry("a.txt", false, 10);
+        match classification_to_stats_message(TransferDecision::DeltaTransfer, entry) {
+            Some(StorageEntryMessage::Changed {
+                kind: ChangeKind::DataOnly,
+                ..
+            }) => {}
+            other => panic!("expected Changed{{kind:DataOnly}}, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classification_to_stats_message_maps_metadata_only_to_changed_metadata_only() {
+        let entry = dummy_entry("a.txt", false, 10);
+        match classification_to_stats_message(TransferDecision::MetadataOnly, entry) {
+            Some(StorageEntryMessage::Changed {
+                kind: ChangeKind::MetadataOnly,
+                ..
+            }) => {}
+            other => panic!("expected Changed{{kind:MetadataOnly}}, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classification_to_stats_message_skip_produces_no_message() {
+        let entry = dummy_entry("a.txt", false, 10);
+        assert!(classification_to_stats_message(TransferDecision::Skip, entry).is_none());
+    }
+
+    #[test]
+    fn classification_to_stats_message_maps_deleted_to_deleted() {
+        let entry = dummy_entry("a.txt", false, 10);
+        match classification_to_stats_message(TransferDecision::Deleted, entry) {
+            Some(StorageEntryMessage::Deleted(_)) => {}
+            other => panic!("expected Deleted, got {other:?}"),
+        }
+    }
+
+    /// 五类分类输入分别落到 `IncrementalStats.new`/`changed`（含 MetadataOnly 子类）/
+    /// `deleted`，`Skip` 不产生任何计数变化；`renamed` 恒为 0（远端从不产生 Renamed）。
+    #[tokio::test]
+    async fn stats_bridging_updates_incremental_stats_new_changed_deleted() {
+        let stats_consumer = test_stats_consumer();
+        let events = [
+            (TransferDecision::FullTransfer, dummy_entry("new.txt", false, 100)),
+            (TransferDecision::DeltaTransfer, dummy_entry("changed.txt", false, 200)),
+            (TransferDecision::MetadataOnly, dummy_entry("meta.txt", false, 50)),
+            (TransferDecision::Skip, dummy_entry("skip.txt", false, 999)),
+            (TransferDecision::Deleted, dummy_entry("gone.txt", false, 30)),
+        ];
+        for (decision, entry) in events {
+            if let Some(msg) = classification_to_stats_message(decision, entry) {
+                stats_consumer.lock().await.update_statistics(&msg);
+            }
+        }
+
+        let consumer = stats_consumer.lock().await;
+        match &consumer.stats {
+            StatsKind::Incremental(s) => {
+                assert_eq!(s.new.regular_file_count, 1, "FullTransfer 应计入 new");
+                assert_eq!(s.new.regular_file_size, 100);
+                // DeltaTransfer + MetadataOnly 都落在 changed（与本地口径对齐，
+                // MetadataOnly 是 Changed 的子类型，不是独立顶层分类）
+                assert_eq!(
+                    s.changed.regular_file_count, 2,
+                    "DeltaTransfer+MetadataOnly 应合计计入 changed"
+                );
+                assert_eq!(s.changed.regular_file_size, 250);
+                assert_eq!(s.deleted.regular_file_count, 1, "Deleted 应计入 deleted");
+                assert_eq!(s.deleted.regular_file_size, 30);
+                assert_eq!(s.renamed.regular_file_count, 0, "远端从不产生 Renamed，应恒为 0");
+                // Skip 不产生任何 StorageEntryMessage，因此不应体现在 new/changed/deleted 任何一项，
+                // 上面三个断言的计数总和（1+2+1=4）已隐含验证：5 个事件中只有 Skip 未被计入。
+            }
+            other => panic!("expected StatsKind::Incremental, got {other:?}"),
+        }
+    }
+
+    /// `send_file_list_phase` 遍历 `walkdir_iter` 时随条目数正确累加 `scanned`
+    /// （不需要真实 QUIC：只驱动统计喂入，用 in-process transport 承接 `FilePage` 发送）。
+    #[tokio::test]
+    async fn send_file_list_phase_accumulates_scanned_stats() {
+        let src_dir = tempdir().unwrap();
+        fs::write(src_dir.path().join("a.txt"), b"aaa").unwrap();
+        fs::write(src_dir.path().join("b.txt"), b"bbbbb").unwrap();
+        fs::create_dir_all(src_dir.path().join("sub")).unwrap();
+        fs::write(src_dir.path().join("sub/c.txt"), b"c").unwrap();
+
+        let src_storage = Arc::new(
+            create_storage(src_dir.path().to_str().unwrap(), None, false)
+                .await
+                .unwrap(),
+        );
+        let walkdir_iter = src_storage.walkdir_2(None, None, None, None, 4, false).await.unwrap();
+        let (sender_transport, receiver_transport) = create_in_process_pair();
+        // 只消费 FilePage/FileListDone，不驱动任何写入，测试只关心 Sender 侧统计累加
+        let drain_handle = tokio::spawn(async move { while receiver_transport.recv().await.is_some() {} });
+
+        let ndx_table = Mutex::new(NdxTable::new());
+        let stats_consumer = test_stats_consumer();
+        let page_count = send_file_list_phase(&sender_transport, &walkdir_iter, &ndx_table, &stats_consumer)
+            .await
+            .unwrap();
+        assert!(page_count >= 1);
+
+        sender_transport.close().await.unwrap();
+        drop(drain_handle);
+
+        let consumer = stats_consumer.lock().await;
+        match &consumer.stats {
+            StatsKind::Incremental(s) => {
+                // 2 个顶层文件 + 1 个子目录 + 1 个子目录下文件 = 4 个 Scanned 条目
+                assert_eq!(s.scanned.regular_file_count, 3, "3 个文件应全部计入 scanned");
+                assert_eq!(s.scanned.dir_count, 1, "1 个子目录应计入 scanned");
+            }
+            other => panic!("expected StatsKind::Incremental, got {other:?}"),
+        }
+    }
+
+    /// 结构化报表与本地口径一致性：混合 New/Changed(content)/Changed(MetadataOnly)/
+    /// Skip/Deleted 场景后，`to_final_stats()`/`to_job_result()` 产出的字段值与预期
+    /// 计数逐一匹配（New/Changed 合计含 MetadataOnly、Deleted、Renamed 恒 0）。
+    #[tokio::test]
+    async fn structured_report_matches_expected_classification_counts() {
+        let stats_consumer = test_stats_consumer();
+        let events = [
+            (TransferDecision::FullTransfer, dummy_entry("n1.txt", false, 10)),
+            (TransferDecision::FullTransfer, dummy_entry("n2.txt", false, 20)),
+            (TransferDecision::DeltaTransfer, dummy_entry("c1.txt", false, 30)),
+            (TransferDecision::MetadataOnly, dummy_entry("c2.txt", false, 40)),
+            (TransferDecision::Skip, dummy_entry("s1.txt", false, 50)),
+            (TransferDecision::Deleted, dummy_entry("d1.txt", false, 60)),
+        ];
+        for (decision, entry) in events {
+            if let Some(msg) = classification_to_stats_message(decision, entry) {
+                stats_consumer.lock().await.update_statistics(&msg);
+            }
+        }
+
+        let consumer = stats_consumer.lock().await;
+        let final_stats = consumer.stats.to_final_stats();
+        let incremental = final_stats.incremental.as_ref().expect("增量报表应带 incremental 字段");
+        assert_eq!(incremental.new.regular_file_count, 2, "2 个 FullTransfer 应计入 new");
+        assert_eq!(
+            incremental.changed.regular_file_count, 2,
+            "DeltaTransfer+MetadataOnly 应合计计入 changed"
+        );
+        assert_eq!(incremental.deleted.regular_file_count, 1);
+        assert_eq!(incremental.renamed.regular_file_count, 0, "远端从不产生 Renamed");
+
+        let job_result = consumer.stats.to_job_result();
+        match job_result.summary {
+            JobSummary::Incremental {
+                new,
+                changed,
+                deleted,
+                renamed,
+                ..
+            } => {
+                assert_eq!(new.regular_file_count, 2);
+                assert_eq!(changed.regular_file_count, 2);
+                assert_eq!(deleted.regular_file_count, 1);
+                assert_eq!(renamed.regular_file_count, 0);
+            }
+            other => panic!("expected JobSummary::Incremental, got {other:?}"),
+        }
+    }
+
+    // ============================================================
+    // callback payload/频率（issue #23 测试计划 6）
+    // ============================================================
+
+    /// 起一个最小的本地 HTTP mock server（raw TCP + 手写 HTTP/1.1 帧解析，避免引入新
+    /// 依赖），返回 `(base_url,收到的请求体集合)`。
+    async fn spawn_mock_callback_server() -> (String, Arc<AsyncMutex<Vec<String>>>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let bodies: Arc<AsyncMutex<Vec<String>>> = Arc::new(AsyncMutex::new(Vec::new()));
+        let bodies_for_server = bodies.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let bodies = bodies_for_server.clone();
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+                    let mut reader = BufReader::new(&mut stream);
+                    let mut content_length = 0usize;
+                    let mut line = String::new();
+                    loop {
+                        line.clear();
+                        match reader.read_line(&mut line).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(_) => {}
+                        }
+                        if line == "\r\n" || line == "\n" {
+                            break;
+                        }
+                        if let Some(v) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                            content_length = v.trim().parse().unwrap_or(0);
+                        }
+                    }
+                    let mut body = vec![0u8; content_length];
+                    if content_length > 0 && reader.read_exact(&mut body).await.is_err() {
+                        return;
+                    }
+                    bodies.lock().await.push(String::from_utf8_lossy(&body).to_string());
+                    let _ = stream
+                        .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                        .await;
+                });
+            }
+        });
+        (format!("http://{addr}"), bodies)
+    }
+
+    /// callback payload 结构 + 频率：`StatisticConsumer` 按 `remote_sync::run()` 的同一套
+    /// 构造方式（`JobType::IncrementalCopy`）跑一轮 begin → 喂消息 → 等待跨过一个周期
+    /// 回调间隔 → end，断言周期性(非 final) + 恰好一次 final 回调都送达，payload 结构为
+    /// `ProgressReport`/`ProgressDetail::Incremental`/`FinalStats`（与本地 `IncrementalCopy`
+    /// 任务完全同构——同一 Rust 类型，天然保证）。
+    ///
+    /// 不经真实 QUIC/`remote_sync::run()`：callback 机制完全活在 `StatisticConsumer` 内部，
+    /// 与 transport 无关；`run()` 到这里的唯一接线是一行
+    /// `callback_url: config.progress_callback_url.clone()`（类型检查即可保证正确），
+    /// 双进程整条链路已由 `tests/remote_process_e2e.rs` + 本文件的分类信号测试覆盖，
+    /// 这里只聚焦 callback 本身此前完全没有测试覆盖的行为。
+    #[tokio::test]
+    async fn statistic_consumer_progress_callback_matches_local_incremental_copy_payload() {
+        let (callback_url, bodies) = spawn_mock_callback_server().await;
+
+        let stats_consumer = Arc::new(AsyncMutex::new(StatisticConsumer {
+            stats: StatsKind::Incremental(IncrementalStats::new(
+                JobType::IncrementalCopy,
+                "callback-test".to_string(),
+                "test callback".to_string(),
+                String::new(),
+            )),
+            progress_bar: ProgressBar::new(JobType::IncrementalCopy),
+            job_dir: String::new(),
+            callback_url: Some(callback_url),
+            pb_handle: None,
+        }));
+        let callback_guard = StatisticConsumer::begin(stats_consumer.clone()).await;
+
+        {
+            let mut c = stats_consumer.lock().await;
+            c.update_statistics(&StorageEntryMessage::New(dummy_entry("a.txt", false, 10)));
+            c.update_statistics(&StorageEntryMessage::Changed {
+                entry: dummy_entry("b.txt", false, 20),
+                kind: ChangeKind::DataOnly,
+            });
+        }
+
+        // 跨过至少一个周期回调间隔（consumer.rs::CALLBACK_INTERVAL_SECS=2），确保拿到
+        // 至少一次非 final 回调（用真实 sleep 而非 QoS 限速，确定性更高、不引入 flaky 风险）
+        tokio::time::sleep(Duration::from_millis(2_200)).await;
+
+        StatisticConsumer::end(stats_consumer, callback_guard).await;
+        // 给 mock server 处理最后一次请求的时间（写响应发生在 POST 之后短暂延迟内）
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let collected = bodies.lock().await;
+        let reports: Vec<ProgressReport> = collected
+            .iter()
+            .filter_map(|b| serde_json::from_str::<ProgressReport>(b).ok())
+            .collect();
+        assert_eq!(
+            reports.len(),
+            collected.len(),
+            "所有收到的回调 body 都应能反序列化为 ProgressReport"
+        );
+
+        let non_final: Vec<_> = reports.iter().filter(|r| !r.is_final).collect();
+        let final_reports: Vec<_> = reports.iter().filter(|r| r.is_final).collect();
+        assert!(!non_final.is_empty(), "应至少收到一次周期性(非 final)回调");
+        assert_eq!(final_reports.len(), 1, "应恰好收到一次 final 回调");
+        assert!(final_reports[0].final_stats.is_some(), "final 回调应带 final_stats");
+
+        for report in &reports {
+            assert_eq!(report.job_type, "incremental_copy");
+            match &report.detail {
+                ProgressDetail::Incremental { .. } => {}
+                other => panic!("expected ProgressDetail::Incremental, got {other:?}"),
+            }
+        }
     }
 }

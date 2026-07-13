@@ -20,6 +20,7 @@ use std::collections::HashSet;
 use std::fs;
 use std::io::Read;
 use std::net::UdpSocket;
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command as StdCommand, ExitStatus, Stdio};
 use std::sync::{Mutex, OnceLock};
@@ -593,4 +594,278 @@ fn test_remote_process_e2e_large_multi_chunk_file_mux() {
     }
 
     assert_dest_matches_src(&src_dir, &dest_dir, &rel_paths);
+}
+
+/// `--delete-target`（issue #23）默认关闭：目标端存在但源端已不存在的文件应保留。
+#[test]
+fn test_remote_process_e2e_without_delete_target_keeps_orphan() {
+    let tmp = tempfile::tempdir().expect("create tempdir");
+    let tmp_path = tmp.path();
+
+    let src_dir = tmp_path.join("src");
+    let dest_dir = tmp_path.join("dest");
+    fs::create_dir_all(&src_dir).expect("create src dir");
+    fs::create_dir_all(&dest_dir).expect("create dest dir");
+    let rel_paths = populate_src_dir(&src_dir);
+    // 目标端预置一个源端不存在的孤儿文件
+    let orphan_path = dest_dir.join("orphan.txt");
+    fs::write(&orphan_path, b"stale file, should survive without --delete-target").expect("write orphan file");
+
+    let cert_path = tmp_path.join("server.crt");
+    let config_path = tmp_path.join("config.toml");
+    fs::write(&config_path, "[database]\nenabled = false\n").expect("write config");
+    let fake_manifest_dir = tmp_path.join("fake_manifest");
+
+    let port = free_loopback_port();
+    let listen_addr = format!("127.0.0.1:{port}");
+    let bin_path = cargo_bin("terrasync");
+
+    let mut receiver_child = StdCommand::new(&bin_path)
+        .env("CARGO_MANIFEST_DIR", &fake_manifest_dir)
+        .current_dir(tmp_path)
+        .arg("-c")
+        .arg(&config_path)
+        .arg("serve")
+        .arg("--listen")
+        .arg(&listen_addr)
+        .arg("--tls-cert-out")
+        .arg(&cert_path)
+        .arg(&dest_dir)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn receiver process");
+    wait_for_cert_file(&cert_path);
+
+    // Sender 不带 --delete-target（默认 false）
+    let mut sender_cmd = AssertCommand::new(&bin_path);
+    sender_cmd
+        .env("CARGO_MANIFEST_DIR", &fake_manifest_dir)
+        .current_dir(tmp_path)
+        .arg("-c")
+        .arg(&config_path)
+        .arg("sync")
+        .arg("--id")
+        .arg("remote_e2e_no_delete_target")
+        .arg("--remote")
+        .arg(&listen_addr)
+        .arg("--tls-server-cert")
+        .arg(&cert_path)
+        .arg(&src_dir)
+        .arg(&dest_dir);
+    sender_cmd.assert().success();
+
+    let receiver_status = wait_for_child_exit(&mut receiver_child, RECEIVER_EXIT_TIMEOUT);
+    let (rout, rerr) = drain_output(&mut receiver_child);
+    assert!(
+        matches!(receiver_status, Some(s) if s.success()),
+        "Receiver 异常退出: {receiver_status:?}\nstdout:\n{rout}\nstderr:\n{rerr}"
+    );
+
+    assert_dest_matches_src(&src_dir, &dest_dir, &rel_paths);
+    assert!(orphan_path.exists(), "未传 --delete-target 时，目标端孤儿文件应保留");
+}
+
+/// `--delete-target`（issue #23）传入后：目标端存在但源端已不存在的文件应被清理，
+/// 主路径覆盖 CLI flag → `SyncJobConfig.delete_target` → `SessionConfig` →
+/// Receiver orphan-delete → `Classified{Deleted}` 全链路。
+#[test]
+fn test_remote_process_e2e_delete_target_removes_orphan() {
+    let tmp = tempfile::tempdir().expect("create tempdir");
+    let tmp_path = tmp.path();
+
+    let src_dir = tmp_path.join("src");
+    let dest_dir = tmp_path.join("dest");
+    fs::create_dir_all(&src_dir).expect("create src dir");
+    fs::create_dir_all(&dest_dir).expect("create dest dir");
+    let rel_paths = populate_src_dir(&src_dir);
+    let orphan_path = dest_dir.join("orphan.txt");
+    fs::write(&orphan_path, b"stale file, should be removed with --delete-target").expect("write orphan file");
+
+    let cert_path = tmp_path.join("server.crt");
+    let config_path = tmp_path.join("config.toml");
+    fs::write(&config_path, "[database]\nenabled = false\n").expect("write config");
+    let fake_manifest_dir = tmp_path.join("fake_manifest");
+
+    let port = free_loopback_port();
+    let listen_addr = format!("127.0.0.1:{port}");
+    let bin_path = cargo_bin("terrasync");
+
+    let mut receiver_child = StdCommand::new(&bin_path)
+        .env("CARGO_MANIFEST_DIR", &fake_manifest_dir)
+        .current_dir(tmp_path)
+        .arg("-c")
+        .arg(&config_path)
+        .arg("serve")
+        .arg("--listen")
+        .arg(&listen_addr)
+        .arg("--tls-cert-out")
+        .arg(&cert_path)
+        .arg(&dest_dir)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn receiver process");
+    wait_for_cert_file(&cert_path);
+
+    let mut sender_cmd = AssertCommand::new(&bin_path);
+    sender_cmd
+        .env("CARGO_MANIFEST_DIR", &fake_manifest_dir)
+        .current_dir(tmp_path)
+        .arg("-c")
+        .arg(&config_path)
+        .arg("sync")
+        .arg("--id")
+        .arg("remote_e2e_delete_target")
+        .arg("--remote")
+        .arg(&listen_addr)
+        .arg("--tls-server-cert")
+        .arg(&cert_path)
+        .arg("--delete-target")
+        .arg(&src_dir)
+        .arg(&dest_dir);
+    sender_cmd.assert().success();
+
+    let receiver_status = wait_for_child_exit(&mut receiver_child, RECEIVER_EXIT_TIMEOUT);
+    let (rout, rerr) = drain_output(&mut receiver_child);
+    assert!(
+        matches!(receiver_status, Some(s) if s.success()),
+        "Receiver 异常退出: {receiver_status:?}\nstdout:\n{rout}\nstderr:\n{rerr}"
+    );
+
+    assert_dest_matches_src(&src_dir, &dest_dir, &rel_paths);
+    assert!(!orphan_path.exists(), "传入 --delete-target 后，目标端孤儿文件应被清理");
+}
+
+/// `--delete-target` 回归：目标端**已存在的未变更子目录**不是孤儿，不得被整树删除后
+/// 重传（`page.subdirs` 若不在 `DestIndex` 登记 matched，预存子目录会被误判孤儿 →
+/// `delete_dir_all` 整树误删，存在中断即数据丢失的窗口）。
+///
+/// 两轮真实双进程同步：第一轮（无 flag）播种 dest；第二轮 dest 加孤儿文件后带
+/// `--delete-target`。用 inode 断言"未被删除重建"——若发生误删重传，子目录内
+/// 文件的 inode 必然改变。
+#[test]
+fn test_remote_process_e2e_delete_target_preserves_existing_subdir() {
+    let tmp = tempfile::tempdir().expect("create tempdir");
+    let tmp_path = tmp.path();
+
+    let src_dir = tmp_path.join("src");
+    let dest_dir = tmp_path.join("dest");
+    fs::create_dir_all(&src_dir).expect("create src dir");
+    fs::create_dir_all(&dest_dir).expect("create dest dir");
+    let rel_paths = populate_src_dir(&src_dir);
+
+    let cert_path = tmp_path.join("server.crt");
+    let config_path = tmp_path.join("config.toml");
+    fs::write(&config_path, "[database]\nenabled = false\n").expect("write config");
+    let fake_manifest_dir = tmp_path.join("fake_manifest");
+    let bin_path = cargo_bin("terrasync");
+
+    // ── 第一轮：无 --delete-target，把含子目录的数据集播种到 dest ──
+    let port = free_loopback_port();
+    let listen_addr = format!("127.0.0.1:{port}");
+    let mut receiver_child = StdCommand::new(&bin_path)
+        .env("CARGO_MANIFEST_DIR", &fake_manifest_dir)
+        .current_dir(tmp_path)
+        .arg("-c")
+        .arg(&config_path)
+        .arg("serve")
+        .arg("--listen")
+        .arg(&listen_addr)
+        .arg("--tls-cert-out")
+        .arg(&cert_path)
+        .arg(&dest_dir)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn receiver process");
+    wait_for_cert_file(&cert_path);
+
+    let mut sender_cmd = AssertCommand::new(&bin_path);
+    sender_cmd
+        .env("CARGO_MANIFEST_DIR", &fake_manifest_dir)
+        .current_dir(tmp_path)
+        .arg("-c")
+        .arg(&config_path)
+        .arg("sync")
+        .arg("--id")
+        .arg("remote_e2e_preserve_subdir_seed")
+        .arg("--remote")
+        .arg(&listen_addr)
+        .arg("--tls-server-cert")
+        .arg(&cert_path)
+        .arg(&src_dir)
+        .arg(&dest_dir);
+    sender_cmd.assert().success();
+
+    let receiver_status = wait_for_child_exit(&mut receiver_child, RECEIVER_EXIT_TIMEOUT);
+    let (rout, rerr) = drain_output(&mut receiver_child);
+    assert!(
+        matches!(receiver_status, Some(s) if s.success()),
+        "第一轮 Receiver 异常退出: {receiver_status:?}\nstdout:\n{rout}\nstderr:\n{rerr}"
+    );
+    assert_dest_matches_src(&src_dir, &dest_dir, &rel_paths);
+
+    // dest 加孤儿文件；用 dest **之外**的硬链接钉住 sub/b.txt 的 inode：
+    // 若子目录被整树删除重传，旧 inode 被硬链接占住不会释放，新建文件必然分配
+    // 不同 inode（直接比较删除前后的 inode 号会被 ext4 的 inode 立即复用糊掉）
+    let orphan_path = dest_dir.join("orphan.txt");
+    fs::write(&orphan_path, b"stale file, should be removed").expect("write orphan file");
+    let keeper_path = tmp_path.join("keeper.link");
+    fs::hard_link(dest_dir.join("sub/b.txt"), &keeper_path).expect("hardlink sub/b.txt");
+    let ino_before = fs::metadata(&keeper_path).expect("stat keeper.link").ino();
+
+    // ── 第二轮：带 --delete-target，预存子目录必须原样保留 ──
+    let port = free_loopback_port();
+    let listen_addr = format!("127.0.0.1:{port}");
+    fs::remove_file(&cert_path).expect("remove old cert");
+    let mut receiver_child = StdCommand::new(&bin_path)
+        .env("CARGO_MANIFEST_DIR", &fake_manifest_dir)
+        .current_dir(tmp_path)
+        .arg("-c")
+        .arg(&config_path)
+        .arg("serve")
+        .arg("--listen")
+        .arg(&listen_addr)
+        .arg("--tls-cert-out")
+        .arg(&cert_path)
+        .arg(&dest_dir)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn receiver process");
+    wait_for_cert_file(&cert_path);
+
+    let mut sender_cmd = AssertCommand::new(&bin_path);
+    sender_cmd
+        .env("CARGO_MANIFEST_DIR", &fake_manifest_dir)
+        .current_dir(tmp_path)
+        .arg("-c")
+        .arg(&config_path)
+        .arg("sync")
+        .arg("--id")
+        .arg("remote_e2e_preserve_subdir")
+        .arg("--remote")
+        .arg(&listen_addr)
+        .arg("--tls-server-cert")
+        .arg(&cert_path)
+        .arg("--delete-target")
+        .arg(&src_dir)
+        .arg(&dest_dir);
+    sender_cmd.assert().success();
+
+    let receiver_status = wait_for_child_exit(&mut receiver_child, RECEIVER_EXIT_TIMEOUT);
+    let (rout, rerr) = drain_output(&mut receiver_child);
+    assert!(
+        matches!(receiver_status, Some(s) if s.success()),
+        "第二轮 Receiver 异常退出: {receiver_status:?}\nstdout:\n{rout}\nstderr:\n{rerr}"
+    );
+
+    assert_dest_matches_src(&src_dir, &dest_dir, &rel_paths);
+    assert!(!orphan_path.exists(), "孤儿文件应被 --delete-target 清理");
+    let ino_after = fs::metadata(dest_dir.join("sub/b.txt")).expect("stat sub/b.txt").ino();
+    assert_eq!(
+        ino_before, ino_after,
+        "预存子目录被整树删除后重传（inode 改变）——子目录不是孤儿，不得删除"
+    );
 }

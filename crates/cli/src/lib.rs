@@ -243,6 +243,7 @@ pub async fn cli_match() -> error::Result<()> {
             tls_server_cert,
             token,
             no_resume,
+            delete_target,
             ..
         } => {
             commands::sync_cmd(
@@ -265,6 +266,7 @@ pub async fn cli_match() -> error::Result<()> {
                 token,
                 raw_command_line,
                 *no_resume,
+                *delete_target,
             )
             .await?;
         }

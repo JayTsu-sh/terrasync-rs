@@ -317,6 +317,8 @@ async fn run_migration_task(
                 raw_command_line: format!("gui:sync {source_url} {dest}"),
                 progress_callback_url: callback_url,
                 no_resume: false,
+                // web 层是否暴露该参数为后续可选项，本次先给默认值保证编译通过
+                delete_target: false,
             };
             app::sync::sync(config).await?;
             Ok(())
