@@ -756,13 +756,18 @@ mod tests {
     use std::collections::HashMap;
     use std::fs;
     use std::fs::File;
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::PathBuf;
     use std::time::{Duration, SystemTime};
 
     use async_trait::async_trait;
     use data_mover::create_storage;
+    use data_mover::dir_tree::DirPageResult;
     use tempfile::tempdir;
+    use tokio::task::JoinHandle;
     use transport::error::Result as TransportResult;
     use transport::in_process::{InProcessReceiverTransport, InProcessSenderTransport, create_in_process_pair};
+    use transport::message::FeatureFlags;
 
     use super::*;
     use crate::receiver::receiver_task_remote;
@@ -1440,5 +1445,399 @@ mod tests {
         assert_eq!(error_count, 0, "关闭完整性校验时不应因篡改的 hash 而失败");
         assert_eq!(success_count, 1, "应直接按原样写入成功，不触发 redo");
         assert_eq!(fs::read(dest_dir.path().join("a.txt")).unwrap(), content);
+    }
+
+    // ============================================================
+    // Receiver 分类信号正确性（issue #23 测试计划 2）：双端真实 StorageEnum +
+    // receiver_task_remote，验证 New/Changed(含 MetadataOnly)/Skip/Deleted 五类判定
+    // 各自产生正确的 wire 信号，且执行动作（是否传输/是否本地改元数据/是否删除）与
+    // 判定一致。
+    // ============================================================
+
+    /// 起 `receiver_task_remote` 并完成握手（`delta_enabled=false` 时构造 delta:false
+    /// 的本端能力集触发降级协商，走 `TransferRequest{decision:DeltaTransfer}` 而非
+    /// `DeltaTransferRequest`）+ 鉴权 + `SessionConfig`，返回
+    /// `(sender_transport, receiver_handle)`。
+    async fn spawn_receiver_and_handshake(
+        dest_storage: Arc<StorageEnum>, delete_target: bool, delta_enabled: bool,
+    ) -> (InProcessSenderTransport, JoinHandle<Result<()>>) {
+        let (sender_transport, receiver_transport) = create_in_process_pair();
+        let receiver_handle =
+            tokio::spawn(async move { receiver_task_remote(&receiver_transport, dest_storage, None).await });
+
+        if delta_enabled {
+            negotiate_handshake(&sender_transport).await.unwrap();
+        } else {
+            let handshake = ProtocolHandshake {
+                features: FeatureFlags {
+                    delta: false,
+                    ..FeatureFlags::current()
+                },
+                ..ProtocolHandshake::current()
+            };
+            sender_transport.send(SenderMsg::Handshake(handshake)).await.unwrap();
+            match sender_transport.recv().await {
+                Some(ReceiverMsg::HandshakeAck(HandshakeResult::Accepted { features })) => {
+                    assert!(!features.delta, "delta 应协商为 false");
+                }
+                other => panic!("expected HandshakeAck(Accepted), got {other:?}"),
+            }
+        }
+
+        send_and_check_auth(&sender_transport, None).await.unwrap();
+        sender_transport
+            .send(SenderMsg::SessionConfig(SessionConfig {
+                src_path: String::new(),
+                qos: None,
+                peak_qos_rate: 1.0,
+                iops: None,
+                enable_integrity_check: true,
+                enable_acl: false,
+                is_source_reserved: true,
+                block_size: None,
+                delete_target,
+            }))
+            .await
+            .unwrap();
+
+        (sender_transport, receiver_handle)
+    }
+
+    /// 用真实 `walkdir_2` 遍历 `dir`（测试前提：目录下恰好一个顶层文件）返回第一页 +
+    /// 该文件的 ndx。
+    async fn single_file_page(dir: &std::path::Path) -> (DirPageResult, i32) {
+        let storage = Arc::new(create_storage(dir.to_str().unwrap(), None, false).await.unwrap());
+        let walkdir_iter = storage.walkdir_2(None, None, None, None, 4, false).await.unwrap();
+        let page = match walkdir_iter.next().await {
+            Some(NdxEvent::Page(p)) => p,
+            other => panic!("expected Page, got {other:?}"),
+        };
+        assert_eq!(page.files.len(), 1, "测试前提：目录下应恰好一个顶层文件");
+        let ndx = page.files[0].ndx;
+        (page, ndx)
+    }
+
+    /// 构造一个空的根目录页（`dir_path=""`，无文件/子目录），仅用于驱动 orphan-delete
+    /// 分支（`DestIndex::orphaned_entries()`），不触发任何 `TransferRequest`。
+    fn empty_root_page() -> DirPageResult {
+        DirPageResult {
+            dir_path: String::new(),
+            ndx_start: 0,
+            files: vec![],
+            subdirs: vec![],
+            gap_ndx: -1,
+        }
+    }
+
+    /// 将 `path` 的 mtime 精确设为 `secs`（Unix 纪元秒）：`data_check` 按 mtime+size
+    /// 精确比较，两次独立 `fs::write` 之间哪怕微秒级的写入时间差都会被判定为不匹配，
+    /// 必须显式对齐 src/dest 双方的 mtime 才能可靠触发 `MetadataOnly`/`Skip`。
+    fn set_mtime(path: &std::path::Path, secs: u64) {
+        let f = File::open(path).unwrap();
+        f.set_modified(SystemTime::UNIX_EPOCH + Duration::from_secs(secs))
+            .unwrap();
+    }
+
+    /// 跳过间歇性到达的 `Progress` 快照：`receiver_task_remote` 内 `progress_reporter`
+    /// 每 5s 上报一次，`tokio::time::interval` 首个 tick 立即触发（tokio 默认行为），
+    /// 可能与本测试关心的分类信号交错到达，与断言无关，跳过后返回下一条非 `Progress`
+    /// 消息（真正非预期的消息仍会被调用方的 `other => panic!` 分支捕获，不会被此函数
+    /// 悄悄吞掉）。
+    async fn recv_skip_progress(sender_transport: &InProcessSenderTransport) -> Option<ReceiverMsg> {
+        loop {
+            match sender_transport.recv().await {
+                Some(ReceiverMsg::Progress(_)) => continue,
+                other => return other,
+            }
+        }
+    }
+
+    /// 发 `FileListDone`（消费 `RequestsDone`，若此前多出一条非预期消息会在此 panic，
+    /// 天然验证"没有额外分类信号"）→ 对 `pending_ndx` 逐个发合成 `EntryError` 完成该
+    /// ndx（测试不需要真实文件传输，只关心分类信号本身）→ `TransferDone` → drain 到
+    /// `AllDone` → `close` + `join`。
+    async fn finish_phase(
+        sender_transport: &InProcessSenderTransport, receiver_handle: JoinHandle<Result<()>>, pending_ndx: &[i32],
+    ) {
+        sender_transport.send(SenderMsg::FileListDone).await.unwrap();
+        match recv_skip_progress(sender_transport).await {
+            Some(ReceiverMsg::RequestsDone) => {}
+            other => panic!("expected RequestsDone, got {other:?}"),
+        }
+        for &ndx in pending_ndx {
+            sender_transport
+                .send(SenderMsg::EntryError {
+                    path: PathBuf::from("synthetic"),
+                    reason: "test synthetic completion".into(),
+                    ndx: Some(ndx),
+                })
+                .await
+                .unwrap();
+        }
+        sender_transport.send(SenderMsg::TransferDone).await.unwrap();
+        loop {
+            match sender_transport.recv().await {
+                Some(ReceiverMsg::AllDone) => break,
+                Some(_) => continue,
+                None => panic!("transport closed before AllDone"),
+            }
+        }
+        sender_transport.close().await.unwrap();
+        receiver_handle.await.unwrap().unwrap();
+    }
+
+    /// dest 缺失该条目 → 发 `TransferRequest{decision: FullTransfer}`，无 `Classified`
+    #[tokio::test]
+    async fn recv_file_list_full_transfer_signal() {
+        let src_dir = tempdir().unwrap();
+        let dest_dir = tempdir().unwrap();
+        fs::write(src_dir.path().join("a.txt"), b"new file").unwrap();
+
+        let dest_storage = Arc::new(
+            create_storage(dest_dir.path().to_str().unwrap(), None, true)
+                .await
+                .unwrap(),
+        );
+        let (sender_transport, receiver_handle) = spawn_receiver_and_handshake(dest_storage, false, true).await;
+
+        let (page, ndx) = single_file_page(src_dir.path()).await;
+        sender_transport.send(SenderMsg::FilePage(page)).await.unwrap();
+
+        match recv_skip_progress(&sender_transport).await {
+            Some(ReceiverMsg::TransferRequest {
+                ndx: got,
+                decision: TransferDecision::FullTransfer,
+            }) => assert_eq!(got, ndx),
+            other => panic!("expected TransferRequest{{decision:FullTransfer}}, got {other:?}"),
+        }
+
+        finish_phase(&sender_transport, receiver_handle, &[ndx]).await;
+    }
+
+    /// dest 存在但内容不同 + delta 能力未协商成功 → 降级为整份传输，但 `decision` 仍
+    /// 携带 `DeltaTransfer`（wire 动作降级，分类判定不变，供 Sender 侧统计为 Changed）
+    #[tokio::test]
+    async fn recv_file_list_delta_transfer_downgrade_signal() {
+        let src_dir = tempdir().unwrap();
+        let dest_dir = tempdir().unwrap();
+        let content = vec![b'A'; 4096];
+        fs::write(src_dir.path().join("a.txt"), &content).unwrap();
+        seed_delta_basis(dest_dir.path(), "a.txt", 4096);
+
+        let dest_storage = Arc::new(
+            create_storage(dest_dir.path().to_str().unwrap(), None, true)
+                .await
+                .unwrap(),
+        );
+        let (sender_transport, receiver_handle) = spawn_receiver_and_handshake(dest_storage, false, false).await;
+
+        let (page, ndx) = single_file_page(src_dir.path()).await;
+        sender_transport.send(SenderMsg::FilePage(page)).await.unwrap();
+
+        match recv_skip_progress(&sender_transport).await {
+            Some(ReceiverMsg::TransferRequest {
+                ndx: got,
+                decision: TransferDecision::DeltaTransfer,
+            }) => assert_eq!(got, ndx),
+            other => panic!("expected TransferRequest{{decision:DeltaTransfer}}（delta 降级）, got {other:?}"),
+        }
+
+        finish_phase(&sender_transport, receiver_handle, &[ndx]).await;
+    }
+
+    /// dest 存在但内容不同 + delta 协商成功 → 发 `DeltaTransferRequest`（回归：本消息
+    /// 本身无歧义地代表 Changed，不需要携带 `decision` 字段）
+    #[tokio::test]
+    async fn recv_file_list_delta_transfer_negotiated_signal() {
+        let src_dir = tempdir().unwrap();
+        let dest_dir = tempdir().unwrap();
+        let content = vec![b'A'; 4096];
+        fs::write(src_dir.path().join("a.txt"), &content).unwrap();
+        seed_delta_basis(dest_dir.path(), "a.txt", 4096);
+
+        let dest_storage = Arc::new(
+            create_storage(dest_dir.path().to_str().unwrap(), None, true)
+                .await
+                .unwrap(),
+        );
+        let (sender_transport, receiver_handle) = spawn_receiver_and_handshake(dest_storage, false, true).await;
+
+        let (page, ndx) = single_file_page(src_dir.path()).await;
+        sender_transport.send(SenderMsg::FilePage(page)).await.unwrap();
+
+        match recv_skip_progress(&sender_transport).await {
+            Some(ReceiverMsg::DeltaTransferRequest { ndx: got, .. }) => assert_eq!(got, ndx),
+            other => panic!("expected DeltaTransferRequest, got {other:?}"),
+        }
+
+        finish_phase(&sender_transport, receiver_handle, &[ndx]).await;
+    }
+
+    /// dest 存在，仅 mode 不同 → 本地 `set_entry_metadata` + 发
+    /// `Classified{decision:MetadataOnly}`，不产生任何传输请求
+    #[tokio::test]
+    async fn recv_file_list_metadata_only_signal() {
+        let src_dir = tempdir().unwrap();
+        let dest_dir = tempdir().unwrap();
+        fs::write(src_dir.path().join("a.txt"), b"same content").unwrap();
+        fs::write(dest_dir.path().join("a.txt"), b"same content").unwrap();
+        set_mtime(&src_dir.path().join("a.txt"), 1_700_000_000);
+        set_mtime(&dest_dir.path().join("a.txt"), 1_700_000_000);
+        // 源端 mode 与目标端不同 → metadata_check 不一致，data_check（mtime+size）一致
+        fs::set_permissions(src_dir.path().join("a.txt"), fs::Permissions::from_mode(0o640)).unwrap();
+        fs::set_permissions(dest_dir.path().join("a.txt"), fs::Permissions::from_mode(0o644)).unwrap();
+
+        let dest_storage = Arc::new(
+            create_storage(dest_dir.path().to_str().unwrap(), None, true)
+                .await
+                .unwrap(),
+        );
+        let (sender_transport, receiver_handle) = spawn_receiver_and_handshake(dest_storage, false, true).await;
+
+        let (page, _ndx) = single_file_page(src_dir.path()).await;
+        sender_transport.send(SenderMsg::FilePage(page)).await.unwrap();
+
+        match recv_skip_progress(&sender_transport).await {
+            Some(ReceiverMsg::Classified {
+                entry,
+                decision: TransferDecision::MetadataOnly,
+            }) => assert_eq!(entry.get_relative_path(), std::path::Path::new("a.txt")),
+            other => panic!("expected Classified{{decision:MetadataOnly}}, got {other:?}"),
+        }
+
+        // 本地已执行 set_entry_metadata：目标端 mode 应变为源端 mode
+        let dest_mode = fs::metadata(dest_dir.path().join("a.txt"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(dest_mode, 0o640, "MetadataOnly 应本地更新目标端 mode");
+
+        finish_phase(&sender_transport, receiver_handle, &[]).await;
+    }
+
+    /// dest 完全一致（内容+mtime+size+mode）→ 发 `Classified{decision:Skip}`，不产生
+    /// 任何传输请求，不产生任何写操作
+    #[tokio::test]
+    async fn recv_file_list_skip_signal() {
+        let src_dir = tempdir().unwrap();
+        let dest_dir = tempdir().unwrap();
+        fs::write(src_dir.path().join("a.txt"), b"identical").unwrap();
+        fs::write(dest_dir.path().join("a.txt"), b"identical").unwrap();
+        set_mtime(&src_dir.path().join("a.txt"), 1_700_000_000);
+        set_mtime(&dest_dir.path().join("a.txt"), 1_700_000_000);
+        fs::set_permissions(src_dir.path().join("a.txt"), fs::Permissions::from_mode(0o644)).unwrap();
+        fs::set_permissions(dest_dir.path().join("a.txt"), fs::Permissions::from_mode(0o644)).unwrap();
+
+        let dest_storage = Arc::new(
+            create_storage(dest_dir.path().to_str().unwrap(), None, true)
+                .await
+                .unwrap(),
+        );
+        let (sender_transport, receiver_handle) = spawn_receiver_and_handshake(dest_storage, false, true).await;
+
+        let (page, _ndx) = single_file_page(src_dir.path()).await;
+        sender_transport.send(SenderMsg::FilePage(page)).await.unwrap();
+
+        match recv_skip_progress(&sender_transport).await {
+            Some(ReceiverMsg::Classified {
+                decision: TransferDecision::Skip,
+                ..
+            }) => {}
+            other => panic!("expected Classified{{decision:Skip}}, got {other:?}"),
+        }
+
+        finish_phase(&sender_transport, receiver_handle, &[]).await;
+    }
+
+    /// `delete_target=true` + dest 孤儿 → 本地删除 + 发 `Classified{decision:Deleted}`
+    #[tokio::test]
+    async fn recv_file_list_delete_target_true_emits_classified_deleted() {
+        let dest_dir = tempdir().unwrap();
+        fs::write(dest_dir.path().join("orphan.txt"), b"stale").unwrap();
+
+        let dest_storage = Arc::new(
+            create_storage(dest_dir.path().to_str().unwrap(), None, true)
+                .await
+                .unwrap(),
+        );
+        let (sender_transport, receiver_handle) = spawn_receiver_and_handshake(dest_storage, true, true).await;
+
+        sender_transport
+            .send(SenderMsg::FilePage(empty_root_page()))
+            .await
+            .unwrap();
+
+        match recv_skip_progress(&sender_transport).await {
+            Some(ReceiverMsg::Classified {
+                entry,
+                decision: TransferDecision::Deleted,
+            }) => assert_eq!(entry.get_relative_path(), std::path::Path::new("orphan.txt")),
+            other => panic!("expected Classified{{decision:Deleted}}, got {other:?}"),
+        }
+        assert!(!dest_dir.path().join("orphan.txt").exists(), "orphan 应已被删除");
+
+        finish_phase(&sender_transport, receiver_handle, &[]).await;
+    }
+
+    /// `delete_target=false` → 孤儿不删除，无 `Classified`（`finish_phase` 内部期望
+    /// `FileListDone` 之后紧接着就是 `RequestsDone`，若中间插了 `Classified` 会在此
+    /// panic，天然验证没有多余的分类信号）
+    #[tokio::test]
+    async fn recv_file_list_delete_target_false_keeps_orphan_no_classified() {
+        let dest_dir = tempdir().unwrap();
+        fs::write(dest_dir.path().join("orphan.txt"), b"stale").unwrap();
+
+        let dest_storage = Arc::new(
+            create_storage(dest_dir.path().to_str().unwrap(), None, true)
+                .await
+                .unwrap(),
+        );
+        let (sender_transport, receiver_handle) = spawn_receiver_and_handshake(dest_storage, false, true).await;
+
+        sender_transport
+            .send(SenderMsg::FilePage(empty_root_page()))
+            .await
+            .unwrap();
+        finish_phase(&sender_transport, receiver_handle, &[]).await;
+
+        assert!(
+            dest_dir.path().join("orphan.txt").exists(),
+            "delete_target=false 时孤儿应保留"
+        );
+    }
+
+    /// 删除失败（父目录无写权限）→ 发 `EntryError`，不发 `Classified`
+    #[tokio::test]
+    async fn recv_file_list_delete_failure_emits_entry_error() {
+        let dest_dir = tempdir().unwrap();
+        fs::write(dest_dir.path().join("orphan.txt"), b"stale").unwrap();
+        // unlink 需要父目录写权限；只留 r-x 制造确定性删除失败（walkdir 列目录仍可用）
+        fs::set_permissions(dest_dir.path(), fs::Permissions::from_mode(0o555)).unwrap();
+
+        let dest_storage = Arc::new(
+            create_storage(dest_dir.path().to_str().unwrap(), None, true)
+                .await
+                .unwrap(),
+        );
+        let (sender_transport, receiver_handle) = spawn_receiver_and_handshake(dest_storage, true, true).await;
+
+        sender_transport
+            .send(SenderMsg::FilePage(empty_root_page()))
+            .await
+            .unwrap();
+
+        match recv_skip_progress(&sender_transport).await {
+            Some(ReceiverMsg::EntryError { entry, reason }) => {
+                assert_eq!(entry.get_relative_path(), std::path::Path::new("orphan.txt"));
+                assert!(!reason.is_empty());
+            }
+            other => panic!("expected EntryError（删除失败）, got {other:?}"),
+        }
+
+        // 恢复权限：finish_phase 内部无需再写 dest_dir，但保险起见先复原，避免 tempdir 清理受阻
+        fs::set_permissions(dest_dir.path(), fs::Permissions::from_mode(0o755)).unwrap();
+
+        finish_phase(&sender_transport, receiver_handle, &[]).await;
     }
 }

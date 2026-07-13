@@ -80,10 +80,13 @@ New/Changed/MetadataOnly/Skip 四类判定 —— **不存在需要新写的"远
   `Classified`/`TransferDecision::Deleted` 真实 QUIC 往返测试。
   验证：`cargo test -p transport --features quic --test quic_roundtrip`
   （10 passed，含新增测试，无回归）。
-- ⬜ 步骤 7：新增 Receiver 分类信号正确性测试（`remote_sync.rs` test mod，双端真实
+- ✅ 步骤 7：新增 Receiver 分类信号正确性测试（`remote_sync.rs` test mod，双端真实
   `StorageEnum` + `receiver_task_remote`）：FullTransfer/DeltaTransfer(协商成功/降级)/
-  MetadataOnly/Skip/Deleted(true/false)/删除失败。
-  验证：`cargo test -p app remote_sync::tests`。
+  MetadataOnly/Skip/Deleted(true/false)/删除失败，共 8 个测试；调试过程中发现
+  `progress_reporter` 首个 tick 立即触发（`tokio::time::interval` 默认行为）会与断言
+  交错，补 `recv_skip_progress` helper 吸收。
+  验证：`cargo test -p app remote_sync::tests::recv_file_list`（8 passed）+
+  `cargo test -p app remote_sync::tests` 连跑 3 次（均 21 passed，无 flaky）。
 - ⬜ 步骤 8：新增 Sender 侧统计桥接单测 + 报表口径一致性测试（`remote_sync.rs` test
   mod）：`classification_to_stats_message` 五类输入、`scanned` 累加、
   `to_final_stats()`/`to_job_result()` 计数校验。
