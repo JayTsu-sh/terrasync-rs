@@ -594,3 +594,144 @@ fn test_remote_process_e2e_large_multi_chunk_file_mux() {
 
     assert_dest_matches_src(&src_dir, &dest_dir, &rel_paths);
 }
+
+/// `--delete-target`（issue #23）默认关闭：目标端存在但源端已不存在的文件应保留。
+#[test]
+fn test_remote_process_e2e_without_delete_target_keeps_orphan() {
+    let tmp = tempfile::tempdir().expect("create tempdir");
+    let tmp_path = tmp.path();
+
+    let src_dir = tmp_path.join("src");
+    let dest_dir = tmp_path.join("dest");
+    fs::create_dir_all(&src_dir).expect("create src dir");
+    fs::create_dir_all(&dest_dir).expect("create dest dir");
+    let rel_paths = populate_src_dir(&src_dir);
+    // 目标端预置一个源端不存在的孤儿文件
+    let orphan_path = dest_dir.join("orphan.txt");
+    fs::write(&orphan_path, b"stale file, should survive without --delete-target").expect("write orphan file");
+
+    let cert_path = tmp_path.join("server.crt");
+    let config_path = tmp_path.join("config.toml");
+    fs::write(&config_path, "[database]\nenabled = false\n").expect("write config");
+    let fake_manifest_dir = tmp_path.join("fake_manifest");
+
+    let port = free_loopback_port();
+    let listen_addr = format!("127.0.0.1:{port}");
+    let bin_path = cargo_bin("terrasync");
+
+    let mut receiver_child = StdCommand::new(&bin_path)
+        .env("CARGO_MANIFEST_DIR", &fake_manifest_dir)
+        .current_dir(tmp_path)
+        .arg("-c")
+        .arg(&config_path)
+        .arg("serve")
+        .arg("--listen")
+        .arg(&listen_addr)
+        .arg("--tls-cert-out")
+        .arg(&cert_path)
+        .arg(&dest_dir)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn receiver process");
+    wait_for_cert_file(&cert_path);
+
+    // Sender 不带 --delete-target（默认 false）
+    let mut sender_cmd = AssertCommand::new(&bin_path);
+    sender_cmd
+        .env("CARGO_MANIFEST_DIR", &fake_manifest_dir)
+        .current_dir(tmp_path)
+        .arg("-c")
+        .arg(&config_path)
+        .arg("sync")
+        .arg("--id")
+        .arg("remote_e2e_no_delete_target")
+        .arg("--remote")
+        .arg(&listen_addr)
+        .arg("--tls-server-cert")
+        .arg(&cert_path)
+        .arg(&src_dir)
+        .arg(&dest_dir);
+    sender_cmd.assert().success();
+
+    let receiver_status = wait_for_child_exit(&mut receiver_child, RECEIVER_EXIT_TIMEOUT);
+    let (rout, rerr) = drain_output(&mut receiver_child);
+    assert!(
+        matches!(receiver_status, Some(s) if s.success()),
+        "Receiver 异常退出: {receiver_status:?}\nstdout:\n{rout}\nstderr:\n{rerr}"
+    );
+
+    assert_dest_matches_src(&src_dir, &dest_dir, &rel_paths);
+    assert!(orphan_path.exists(), "未传 --delete-target 时，目标端孤儿文件应保留");
+}
+
+/// `--delete-target`（issue #23）传入后：目标端存在但源端已不存在的文件应被清理，
+/// 主路径覆盖 CLI flag → `SyncJobConfig.delete_target` → `SessionConfig` →
+/// Receiver orphan-delete → `Classified{Deleted}` 全链路。
+#[test]
+fn test_remote_process_e2e_delete_target_removes_orphan() {
+    let tmp = tempfile::tempdir().expect("create tempdir");
+    let tmp_path = tmp.path();
+
+    let src_dir = tmp_path.join("src");
+    let dest_dir = tmp_path.join("dest");
+    fs::create_dir_all(&src_dir).expect("create src dir");
+    fs::create_dir_all(&dest_dir).expect("create dest dir");
+    let rel_paths = populate_src_dir(&src_dir);
+    let orphan_path = dest_dir.join("orphan.txt");
+    fs::write(&orphan_path, b"stale file, should be removed with --delete-target").expect("write orphan file");
+
+    let cert_path = tmp_path.join("server.crt");
+    let config_path = tmp_path.join("config.toml");
+    fs::write(&config_path, "[database]\nenabled = false\n").expect("write config");
+    let fake_manifest_dir = tmp_path.join("fake_manifest");
+
+    let port = free_loopback_port();
+    let listen_addr = format!("127.0.0.1:{port}");
+    let bin_path = cargo_bin("terrasync");
+
+    let mut receiver_child = StdCommand::new(&bin_path)
+        .env("CARGO_MANIFEST_DIR", &fake_manifest_dir)
+        .current_dir(tmp_path)
+        .arg("-c")
+        .arg(&config_path)
+        .arg("serve")
+        .arg("--listen")
+        .arg(&listen_addr)
+        .arg("--tls-cert-out")
+        .arg(&cert_path)
+        .arg(&dest_dir)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn receiver process");
+    wait_for_cert_file(&cert_path);
+
+    let mut sender_cmd = AssertCommand::new(&bin_path);
+    sender_cmd
+        .env("CARGO_MANIFEST_DIR", &fake_manifest_dir)
+        .current_dir(tmp_path)
+        .arg("-c")
+        .arg(&config_path)
+        .arg("sync")
+        .arg("--id")
+        .arg("remote_e2e_delete_target")
+        .arg("--remote")
+        .arg(&listen_addr)
+        .arg("--tls-server-cert")
+        .arg(&cert_path)
+        .arg("--delete-target")
+        .arg(&src_dir)
+        .arg(&dest_dir);
+    sender_cmd.assert().success();
+
+    let receiver_status = wait_for_child_exit(&mut receiver_child, RECEIVER_EXIT_TIMEOUT);
+    let (rout, rerr) = drain_output(&mut receiver_child);
+    assert!(
+        matches!(receiver_status, Some(s) if s.success()),
+        "Receiver 异常退出: {receiver_status:?}\nstdout:\n{rout}\nstderr:\n{rerr}"
+    );
+
+    assert_dest_matches_src(&src_dir, &dest_dir, &rel_paths);
+    assert!(!orphan_path.exists(), "传入 --delete-target 后，目标端孤儿文件应被清理");
+}

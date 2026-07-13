@@ -100,8 +100,11 @@ New/Changed/MetadataOnly/Skip 四类判定 —— **不存在需要新写的"远
   callback 机制活在 `StatisticConsumer` 内部与 transport 无关，`run()` 到这里的唯一
   接线是一行字段赋值，双进程整条链路已由 `tests/remote_process_e2e.rs` + 步骤 7 覆盖。
   验证：`cargo test -p app remote_sync::tests`（30 passed）连跑 2 次，无 flaky。
-- ⬜ 步骤 10：新增 `--delete-target` 进程级 e2e —— `tests/remote_process_e2e.rs`：
-  默认不删除 / 加 flag 后删除。
-  验证：`cargo test -p terrasync-rs --test remote_process_e2e`。
+- ✅ 步骤 10：新增 `--delete-target` 进程级 e2e —— `tests/remote_process_e2e.rs`：
+  `test_remote_process_e2e_without_delete_target_keeps_orphan`（默认不删除）+
+  `test_remote_process_e2e_delete_target_removes_orphan`（加 flag 后删除，覆盖
+  CLI→SyncJobConfig→SessionConfig→Receiver orphan-delete→Classified{Deleted} 全链路）。
+  验证：`cargo test -p terrasync-rs --test remote_process_e2e` 连跑 2 次，均
+  7 passed（5 既有 + 2 新增），无 flaky。
 - ⬜ 步骤 11：收尾 —— `cargo fmt --all -- --check`、`cargo test --workspace
   --no-fail-fast`、e2e 连跑 2 次、`git status` 核对无越界文件、移除本计划文件。
