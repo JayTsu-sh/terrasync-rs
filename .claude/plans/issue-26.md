@@ -21,12 +21,12 @@ spec」（已 `claude:approved`，以此为准；2026-07-03 的旧 UNCLEAR 判�
 - ✅ 4. transport 异常关闭测试 ≥1 个通过（不 hang、非零退出码或明确错误）。
 - ✅ 5. uid/gid 有断言覆盖（非 root 环境限制：无法测试"跨用户 chown 成功"，只能验证
       字段经 wire 正确传播且落地值与源端一致——运行进程本身的 uid/gid）。
-- ⬜ 6. packaged/tar 适用性结论写入 PR 描述：**不适用**。`crates/app/src/remote_sync.rs`
+- ✅ 6. packaged/tar 适用性结论写入 PR 描述：**不适用**。`crates/app/src/remote_sync.rs`
       的 Sender 侧 `walkdir_2(...)` 调用不传递 `config.packaged`/`package_depth`
       （对照 `crates/app/src/dir_walker.rs` 单进程路径会用这两个字段驱动打包逻辑），
       `SenderMsg::TarPacked` 只在单进程 `crates/app/src/sender.rs` 里被构造/发送；
       `--remote` 模式下 `--packaged` 标志被静默忽略，未接线到双进程协议。不强行造场景。
-- ⬜ 7. `cargo test --workspace --no-fail-fast` 保持全绿。
+- ✅ 7. `cargo test --workspace --no-fail-fast` 保持全绿。
 
 ## 明确排除
 
@@ -96,7 +96,7 @@ ACL/xattr（#24）、Renamed（未实现）、hash 算法协商（deferred）、
       新增连接异常测试：Receiver 侧提前 `conn.close()`，断言 Sender
       `sender.recv()` 在超时内返回 `None` 而非 panic/hang。
       验证：`cargo test -p transport --features quic -- --nocapture`。
-- ⬜ 步骤 7：收尾——`cargo fmt --all -- --check`、
+- ✅ 步骤 7：收尾——`cargo fmt --all -- --check`、
       `cargo test -p terrasync-rs --test remote_process_e2e -- --nocapture`（全量新老用例）、
       `cargo test -p transport --features quic`、`cargo test --workspace --no-fail-fast`、
       `git status` 确认无越界文件，验收标准逐条勾选，移除本计划文件并 commit。
