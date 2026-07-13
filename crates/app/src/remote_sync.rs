@@ -12,23 +12,29 @@
 use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::path::Path;
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex, PoisonError};
 
 use data_mover::dir_tree::NdxEvent;
 use data_mover::filter::parse_filter_expression;
 use data_mover::qos::QosManager;
-use data_mover::{ConsistencyCheck, StorageEnum, WalkDirAsyncIterator2, create_storage};
+use data_mover::{
+    ChangeKind, ConsistencyCheck, EntryEnum, StorageEntryMessage, StorageEnum, WalkDirAsyncIterator2, create_storage,
+};
 use rustls::pki_types::CertificateDer;
+use tokio::sync::Mutex as AsyncMutex;
 use tracing::{debug, error, info, warn};
 use transport::error::TransportError;
 use transport::message::{
     BlockSignature, HandshakeResult, NdxTable, ProtocolHandshake, ReceiverMsg, SenderMsg, SessionConfig,
+    TransferDecision,
 };
 use transport::traits::SenderTransport;
 use utils::app_config::AppConfig;
+use utils::logger;
 
-use crate::config::SyncJobConfig;
-use crate::consumer::stats::format_bytes;
+use crate::config::{JobType, SyncJobConfig};
+use crate::consumer::stats::{IncrementalStats, ProgressBar, StatisticConsumer, StatsKind, format_bytes};
 use crate::error::{AppError, Result};
 use crate::orchestrator::create_qos_manager;
 use crate::sync::parse_size;
@@ -67,9 +73,26 @@ pub(crate) async fn run(
             enable_acl: config.enable_acl,
             is_source_reserved: true,
             block_size: config.block_size.clone(),
-            delete_target: false,
+            delete_target: config.delete_target,
         }))
         .await?;
+
+    // ── 3.5 结构化统计报表（Sender 侧，复用本地 StatisticConsumer/IncrementalStats——
+    //    双进程远端不分 full/incremental，报表形状本身就是 delta 语义，与 orchestrator
+    //    的 ScanType 路由无关，统一用 JobType::IncrementalCopy）──
+    let stats_consumer = Arc::new(AsyncMutex::new(StatisticConsumer {
+        stats: StatsKind::Incremental(IncrementalStats::new(
+            JobType::IncrementalCopy,
+            config.job_id.clone(),
+            config.raw_command_line.clone(),
+            logger::get_current_app_log_path(),
+        )),
+        progress_bar: ProgressBar::new(JobType::IncrementalCopy),
+        job_dir: config.job_dir.clone(),
+        callback_url: config.progress_callback_url.clone(),
+        pb_handle: None,
+    }));
+    let callback_guard = StatisticConsumer::begin(stats_consumer.clone()).await;
 
     // ── 4. 创建源端 storage + walkdir_2 ──
     let block_size = match &config.block_size {
@@ -104,7 +127,7 @@ pub(crate) async fn run(
 
     // ── 6+7+8. 文件列表发送 与 请求处理+Ack收集 并发运行（流水线，无阶段 barrier） ──
     let ndx_table = Mutex::new(NdxTable::new());
-    let file_list_fut = send_file_list_phase(&transport, &walkdir_iter, &ndx_table);
+    let file_list_fut = send_file_list_phase(&transport, &walkdir_iter, &ndx_table, &stats_consumer);
     let requests_acks_fut = process_requests_and_acks(
         &transport,
         &src_storage,
@@ -113,6 +136,7 @@ pub(crate) async fn run(
         config.enable_acl,
         &mut completed_paths,
         &checkpoint_path,
+        &stats_consumer,
     );
     let (page_count, (transfer_count, success_count, error_count)) =
         tokio::try_join!(file_list_fut, requests_acks_fut)?;
@@ -133,6 +157,8 @@ pub(crate) async fn run(
         qos.shutdown();
     }
     transport.close().await?;
+    // 结束统计报表生命周期：abort 回调循环 → 发最终回调(is_final=true) → 打印终态报表
+    StatisticConsumer::end(stats_consumer, callback_guard).await;
     finalize_run_result(error_count)
 }
 
@@ -208,14 +234,29 @@ async fn send_and_check_auth(transport: &(dyn SenderTransport + 'static), auth_t
 ///
 /// 只调用 `transport.send()`、从不 `recv()`，可安全地与 `process_requests_and_acks`
 /// 并发运行（`ndx_table` 用 `Mutex` 支持并发读写：本函数是唯一的写者）。
+///
+/// 每页遍历到的 entry 额外喂一次 `StorageEntryMessage::Scanned`，填充
+/// `IncrementalStats.scanned`（扩展名/时间/大小分布）——Sender 本来就要完整遍历一次
+/// 源端才能生成 file list，这个遍历本身就是「Scanned」阶段的等价物，不需要额外协议
+/// 往返（远端没有独立 scan 阶段，见 issue #23）。
 async fn send_file_list_phase(
     transport: &(dyn SenderTransport + 'static), walkdir_iter: &WalkDirAsyncIterator2, ndx_table: &Mutex<NdxTable>,
+    stats_consumer: &Arc<AsyncMutex<StatisticConsumer>>,
 ) -> Result<u64> {
     info!("[Sender Remote] Sending file list");
     let mut page_count = 0u64;
     while let Some(event) = walkdir_iter.next().await {
         match event {
             NdxEvent::Page(page) => {
+                {
+                    let mut consumer = stats_consumer.lock().await;
+                    for nf in &page.files {
+                        consumer.update_statistics(&StorageEntryMessage::Scanned(nf.entry.clone()));
+                    }
+                    for ns in &page.subdirs {
+                        consumer.update_statistics(&StorageEntryMessage::Scanned(ns.entry.clone()));
+                    }
+                }
                 ndx_table
                     .lock()
                     .unwrap_or_else(PoisonError::into_inner)
@@ -248,10 +289,17 @@ async fn send_file_list_phase(
 ///
 /// `RequestsDone` 到达时立即发送 `TransferDone`（与改造前时序一致），但循环不break，
 /// 继续处理后续到达的 ack/progress，直到收到 `AllDone`。
+///
+/// `TransferRequest{decision}`/`DeltaTransferRequest`/`Classified{entry, decision}`
+/// 各自额外翻译为 `StorageEntryMessage` 喂 `stats_consumer.update_statistics()`，驱动
+/// Sender 侧结构化报表（New/Changed/MetadataOnly/Deleted，`Skip` 不产生统计，见
+/// `classification_to_stats_message`，issue #23）；`Redo{ndx}` 是重发、不是新的分类
+/// 事件，不重复计数。
 /// 返回 `(transfer_count, success_count, error_count)`。
 async fn process_requests_and_acks(
     transport: &(dyn SenderTransport + 'static), src_storage: &Arc<StorageEnum>, ndx_table: &Mutex<NdxTable>,
     qos: Option<&QosManager>, enable_acl: bool, completed_paths: &mut HashSet<String>, checkpoint_path: &Path,
+    stats_consumer: &Arc<AsyncMutex<StatisticConsumer>>,
 ) -> Result<(u64, u64, u64)> {
     info!("[Sender Remote] Processing transfer requests + collecting acks");
     let mut transfer_count = 0u64;
@@ -263,13 +311,16 @@ async fn process_requests_and_acks(
     let mut errored_ndx: HashSet<i32> = HashSet::new();
     loop {
         match transport.recv().await {
-            Some(ReceiverMsg::TransferRequest { ndx }) => {
+            Some(ReceiverMsg::TransferRequest { ndx, decision }) => {
                 let entry = ndx_table
                     .lock()
                     .unwrap_or_else(PoisonError::into_inner)
                     .get(ndx)
                     .cloned();
                 if let Some(entry) = entry {
+                    if let Some(msg) = classification_to_stats_message(decision, entry.clone()) {
+                        stats_consumer.lock().await.update_statistics(&msg);
+                    }
                     // 源读/符号链接读失败：Sender 已发 EntryError 通知 Receiver 完成该
                     // ndx，这里自增 error_count（Sender 自检失败由 Sender 自己计数，见 [0][3]）
                     if !handle_full_transfer(transport, src_storage, &entry, ndx, qos, enable_acl).await? {
@@ -291,6 +342,16 @@ async fn process_requests_and_acks(
                     .get(ndx)
                     .cloned();
                 if let Some(entry) = entry {
+                    // 收到 DeltaTransferRequest 本身即无歧义地代表 Changed，不需要额外的
+                    // decision 字段（该消息只在 DestIndex::check() 判定 DeltaTransfer 且
+                    // delta 能力协商成功时才会发出）
+                    stats_consumer
+                        .lock()
+                        .await
+                        .update_statistics(&StorageEntryMessage::Changed {
+                            entry: entry.clone(),
+                            kind: ChangeKind::DataOnly,
+                        });
                     // delta: 仅 src 读取成功时计入传输数（与原逻辑保持一致）；读取失败已发
                     // EntryError 通知 Receiver 完成该 ndx，这里自增 error_count（见 [2]）
                     if handle_delta_transfer(
@@ -311,6 +372,13 @@ async fn process_requests_and_acks(
                     }
                 } else {
                     error!("[Sender Remote] Unknown NDX {} for delta", ndx);
+                }
+            }
+            // ── 分类信号（MetadataOnly/Skip/Deleted）：Receiver 本地执行/判定后上行，
+            //    只驱动统计，不触发任何 Sender 侧动作 ──
+            Some(ReceiverMsg::Classified { entry, decision }) => {
+                if let Some(msg) = classification_to_stats_message(decision, entry) {
+                    stats_consumer.lock().await.update_statistics(&msg);
                 }
             }
             // ── ndx 级重传请求：hash 校验失败首次上报后，Receiver 要求重发。delta redo 一律
@@ -357,6 +425,13 @@ async fn process_requests_and_acks(
                 .await;
             }
             Some(ReceiverMsg::Progress(snapshot)) => {
+                // 远端写盘发生在 Receiver 侧，Sender 自己不产生 chunk 级字节计数，
+                // 复用 StatisticConsumer 的实时字节计数器承载 Receiver 汇报的进度
+                stats_consumer
+                    .lock()
+                    .await
+                    .get_bytes_tracker()
+                    .store(snapshot.bytes_transferred, Ordering::Relaxed);
                 info!(
                     "[Sender Remote] [{}] Progress: {} files ({}) transferred, {} dirs, {} skipped, {} errors, {:.1}s, {}/s",
                     snapshot.receiver_id,
@@ -399,6 +474,33 @@ async fn process_requests_and_acks(
 fn count_ndx_error(errored: &mut HashSet<i32>, ndx: i32, error_count: &mut u64) {
     if errored.insert(ndx) {
         *error_count += 1;
+    }
+}
+
+/// 把 Receiver 的分类判定翻译为 `StorageEntryMessage`，供 Sender 侧 `StatisticConsumer`
+/// 累计统计（与本地单进程管线复用同一套类型/口径，不发明新格式，见 issue #23）。
+///
+/// - `FullTransfer` → `New`；`MetadataOnly` → `Changed{kind: MetadataOnly}`（与本地口径
+///   对齐：本地模式里 MetadataOnly 本来就是 `Changed` 的子类型，不是独立顶层分类）；
+///   `Deleted` → `Deleted`。
+/// - `DeltaTransfer` → `Changed{kind: DataOnly}`：`DestIndex::check()` 只要
+///   `data_check` 不一致就判定 `DeltaTransfer`（不区分是否同时 `metadata_check` 也不
+///   一致），Sender 拿不到目标端 entry、无法像本地模式 `ChangeKind::from_entry_diff`
+///   那样精确区分 `DataOnly`/`Both`，取"表示内容变更"的那个 variant 作为口径。
+/// - `Skip` → `None`：与本地模式完全匹配的条目从不广播一致，不产生任何统计。
+fn classification_to_stats_message(decision: TransferDecision, entry: Arc<EntryEnum>) -> Option<StorageEntryMessage> {
+    match decision {
+        TransferDecision::FullTransfer => Some(StorageEntryMessage::New(entry)),
+        TransferDecision::DeltaTransfer => Some(StorageEntryMessage::Changed {
+            entry,
+            kind: ChangeKind::DataOnly,
+        }),
+        TransferDecision::MetadataOnly => Some(StorageEntryMessage::Changed {
+            entry,
+            kind: ChangeKind::MetadataOnly,
+        }),
+        TransferDecision::Skip => None,
+        TransferDecision::Deleted => Some(StorageEntryMessage::Deleted(entry)),
     }
 }
 
@@ -665,6 +767,24 @@ mod tests {
     use super::*;
     use crate::receiver::receiver_task_remote;
 
+    /// 构造测试用 `Arc<AsyncMutex<StatisticConsumer>>`：不设 `callback_url`（不起 HTTP
+    /// 回调循环），不调用 `begin()`/`end()`（这些测试只关心 `send_file_list_phase`/
+    /// `process_requests_and_acks` 本身的传输/ack 行为，不测试统计生命周期）。
+    fn test_stats_consumer() -> Arc<AsyncMutex<StatisticConsumer>> {
+        Arc::new(AsyncMutex::new(StatisticConsumer {
+            stats: StatsKind::Incremental(IncrementalStats::new(
+                JobType::IncrementalCopy,
+                "test-job".to_string(),
+                "test".to_string(),
+                String::new(),
+            )),
+            progress_bar: ProgressBar::new(JobType::IncrementalCopy),
+            job_dir: String::new(),
+            callback_url: None,
+            pb_handle: None,
+        }))
+    }
+
     // ── finalize_run_result：error_count → 退出码决策纯函数单测 ──
 
     #[test]
@@ -736,8 +856,9 @@ mod tests {
         let ndx_table = Mutex::new(NdxTable::new());
         let mut completed_paths = HashSet::new();
         let checkpoint_path = src_dir.path().join("unused_checkpoint.json");
+        let stats_consumer = test_stats_consumer();
         let (page_count, (transfer_count, success_count, error_count)) = tokio::try_join!(
-            send_file_list_phase(&sender_transport, &walkdir_iter, &ndx_table),
+            send_file_list_phase(&sender_transport, &walkdir_iter, &ndx_table, &stats_consumer),
             process_requests_and_acks(
                 &sender_transport,
                 &src_storage,
@@ -746,6 +867,7 @@ mod tests {
                 false,
                 &mut completed_paths,
                 &checkpoint_path,
+                &stats_consumer,
             )
         )
         .unwrap();
@@ -870,8 +992,9 @@ mod tests {
         let ndx_table = Mutex::new(NdxTable::new());
         let mut completed_paths = HashSet::new();
         let checkpoint_path = src_dir.join("unused_checkpoint.json");
+        let stats_consumer = test_stats_consumer();
         let (_page_count, (_transfer_count, success_count, error_count)) = tokio::try_join!(
-            send_file_list_phase(sender_transport, &walkdir_iter, &ndx_table),
+            send_file_list_phase(sender_transport, &walkdir_iter, &ndx_table, &stats_consumer),
             process_requests_and_acks(
                 sender_transport,
                 &src_storage,
@@ -880,6 +1003,7 @@ mod tests {
                 false,
                 &mut completed_paths,
                 &checkpoint_path,
+                &stats_consumer,
             )
         )
         .unwrap();
@@ -923,7 +1047,8 @@ mod tests {
             .unwrap();
 
         let ndx_table = Mutex::new(NdxTable::new());
-        send_file_list_phase(sender_transport, &walkdir_iter, &ndx_table)
+        let stats_consumer = test_stats_consumer();
+        send_file_list_phase(sender_transport, &walkdir_iter, &ndx_table, &stats_consumer)
             .await
             .unwrap();
 
@@ -939,6 +1064,7 @@ mod tests {
             false,
             &mut completed_paths,
             &checkpoint_path,
+            &stats_consumer,
         )
         .await
         .unwrap();

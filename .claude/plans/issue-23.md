@@ -65,14 +65,16 @@ New/Changed/MetadataOnly/Skip 四类判定 —— **不存在需要新写的"远
   验证：`cargo check -p cli`（本步骤新增代码本身无错误；唯一报错仍是
   `remote_sync.rs` 的 `TransferRequest{decision}`，步骤 5 修复后一并核实
   cli/web 全绿）。
-- ⬜ 步骤 5：Sender 侧结构化报表 + delete_target 透传 + progress callback ——
+- ✅ 步骤 5：Sender 侧结构化报表 + delete_target 透传 + progress callback ——
   `crates/app/src/remote_sync.rs`：`StatisticConsumer` 生命周期（begin/end）；
   `send_file_list_phase` 喂 `Scanned`；`process_requests_and_acks` 翻译
   `TransferRequest{decision}`/`DeltaTransferRequest`/`Classified` 为
   `StorageEntryMessage` 喂 `update_statistics`；`Progress` 喂 bytes tracker；
   `SessionConfig.delete_target` 从硬编码改为 `config.delete_target`；更新既有测试
-  调用点适配新签名。
-  验证：`cargo check -p app` + `cargo test -p app remote_sync::`。
+  调用点适配新签名（新增 `test_stats_consumer()` 测试 helper）。
+  验证：`cargo check -p app`（干净）+ `cargo test -p app remote_sync::`
+  （13 passed）+ `cargo check -p cli -p web`（干净，确认 config.rs 加字段未破坏
+  下游）。
 - ⬜ 步骤 6：新增协议层序列化测试 —— `crates/transport/tests/quic_roundtrip.rs`
   新增 `TransferRequest{decision}`/`Classified`/`TransferDecision::Deleted`
   真实 QUIC 往返测试。
