@@ -51,11 +51,12 @@ New/Changed/MetadataOnly/Skip 四类判定 —— **不存在需要新写的"远
   验证：`cargo check -p app`（orchestrator.rs 自身无新增错误；剩余 4 处
   `TransferRequest{decision}` 缺字段错误是步骤 1 协议变更的预期下游影响，
   步骤 3/5 修复）。
-- 🔄 步骤 3：Receiver 分类信号 —— `crates/app/src/receiver.rs`：四个
+- ✅ 步骤 3：Receiver 分类信号 —— `crates/app/src/receiver.rs`：四个
   `TransferDecision` 分支各自补发/携带 `decision`；MetadataOnly/Skip 补发
   `Classified`；orphan-delete 循环成功发 `Classified{Deleted}`、失败发
   `EntryError`（替换纯 `warn!`）。
-  验证：`cargo check -p app` + `cargo test -p app receiver::`。
+  验证：`cargo check -p app`（receiver.rs 自身无错误；剩余 1 处
+  `TransferRequest{decision}` 缺字段错误在 `remote_sync.rs`，步骤 5 修复）。
 - ⬜ 步骤 4：`--delete-target` 配置管线 —— `crates/app/src/config.rs`
   （`SyncJobConfig` 加 `delete_target`）、`crates/cli/src/commands_enum.rs`
   （CLI flag）、`crates/cli/src/commands.rs`（`sync_cmd` 透传）、

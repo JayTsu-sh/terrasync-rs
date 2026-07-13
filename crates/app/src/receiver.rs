@@ -19,7 +19,7 @@ use tracing::{Instrument, debug, error, info, info_span, trace, warn};
 use transport::error::TransportError;
 use transport::message::{
     DcAck, DestIndex, DiskCommitMsg, FeatureFlags, FileOutcome, HandshakeResult, NdxTable, ProgressSnapshot,
-    ProtocolHandshake, ReceiverMsg, SenderMsg, SessionConfig,
+    ProtocolHandshake, ReceiverMsg, SenderMsg, SessionConfig, TransferDecision,
 };
 use transport::traits::ReceiverTransport;
 
@@ -563,19 +563,23 @@ async fn recv_file_list_and_data_phase(
                     }
                 }
 
-                // 逐文件比较 → 发 TransferRequest 或 DeltaTransferRequest
+                // 逐文件比较 → 发 TransferRequest/DeltaTransferRequest（New/Changed，前者
+                // 附带 decision 供 Sender 侧统计正确分类）或 Classified（MetadataOnly/Skip，
+                // Receiver 本地执行/判定，此前零 wire 流量，见 issue #23）
                 for nf in &page.files {
-                    match dest_index.check(&nf.entry) {
-                        transport::message::TransferDecision::FullTransfer => {
-                            let _ = transport.send(ReceiverMsg::TransferRequest { ndx: nf.ndx }).await;
+                    let decision = dest_index.check(&nf.entry);
+                    match decision {
+                        TransferDecision::FullTransfer => {
+                            let _ = transport.send(ReceiverMsg::TransferRequest { ndx: nf.ndx, decision }).await;
                             requested_count += 1;
                         }
-                        transport::message::TransferDecision::DeltaTransfer if !negotiated_features.delta => {
-                            // delta 能力未协商成功（对端不支持）→ 降级为全量传输
-                            let _ = transport.send(ReceiverMsg::TransferRequest { ndx: nf.ndx }).await;
+                        TransferDecision::DeltaTransfer if !negotiated_features.delta => {
+                            // delta 能力未协商成功（对端不支持）→ 降级为全量传输（wire 动作变了，
+                            // 分类判定不变：decision 仍是 DeltaTransfer，供 Sender 侧统计为 Changed）
+                            let _ = transport.send(ReceiverMsg::TransferRequest { ndx: nf.ndx, decision }).await;
                             requested_count += 1;
                         }
-                        transport::message::TransferDecision::DeltaTransfer => {
+                        TransferDecision::DeltaTransfer => {
                             let size = nf.entry.get_size();
                             match StorageEnum::read_file_from(dest_storage, &nf.entry, size).await {
                                 Ok(basis_data) => {
@@ -604,17 +608,34 @@ async fn recv_file_list_and_data_phase(
                                         nf.entry.get_relative_path(),
                                         e
                                     );
-                                    let _ = transport.send(ReceiverMsg::TransferRequest { ndx: nf.ndx }).await;
+                                    let _ = transport.send(ReceiverMsg::TransferRequest { ndx: nf.ndx, decision }).await;
                                     requested_count += 1;
                                 }
                             }
                         }
-                        transport::message::TransferDecision::MetadataOnly => {
+                        TransferDecision::MetadataOnly => {
                             let _ = dest_storage.set_entry_metadata(&nf.entry).await;
                             progress.metadata_only.fetch_add(1, Ordering::Relaxed);
+                            let _ = transport
+                                .send(ReceiverMsg::Classified {
+                                    entry: nf.entry.clone(),
+                                    decision,
+                                })
+                                .await;
                         }
-                        transport::message::TransferDecision::Skip => {
+                        TransferDecision::Skip => {
                             progress.files_skipped.fetch_add(1, Ordering::Relaxed);
+                            let _ = transport
+                                .send(ReceiverMsg::Classified {
+                                    entry: nf.entry.clone(),
+                                    decision,
+                                })
+                                .await;
+                        }
+                        TransferDecision::Deleted => {
+                            // DestIndex::check() 从不产生 Deleted（该分类只在下方
+                            // orphaned_entries() 路径产生）；此分支纯粹为满足 match 穷尽性检查。
+                            debug_assert!(false, "DestIndex::check() 不应返回 Deleted");
                         }
                     }
                 }
@@ -638,7 +659,8 @@ async fn recv_file_list_and_data_phase(
                     created_dirs.push(ns.entry.clone());
                 }
 
-                // --delete-target: 删除目标端多余文件
+                // --delete-target: 删除目标端多余文件；成功发 Classified{Deleted}、
+                // 失败发 EntryError（此前失败只 warn! 静默吞掉，不计入任何统计/错误数）
                 if session_config.delete_target {
                     for orphan in dest_index.orphaned_entries() {
                         let path = orphan.get_relative_path();
@@ -648,15 +670,30 @@ async fn recv_file_list_and_data_phase(
                             debug!("[Receiver Remote] Skipping in-progress part file: {:?}", path);
                             continue;
                         }
-                        if orphan.get_is_dir() {
+                        let result = if orphan.get_is_dir() {
                             info!("[Receiver Remote] Deleting orphaned dir: {:?}", path);
-                            if let Err(e) = dest_storage.delete_dir_all(orphan).await {
-                                warn!("[Receiver Remote] delete dir {:?}: {}", path, e);
-                            }
+                            dest_storage.delete_dir_all(orphan).await
                         } else {
                             info!("[Receiver Remote] Deleting orphaned file: {:?}", path);
-                            if let Err(e) = dest_storage.delete_file(orphan).await {
-                                warn!("[Receiver Remote] delete file {:?}: {}", path, e);
+                            dest_storage.delete_file(orphan).await
+                        };
+                        match result {
+                            Ok(()) => {
+                                let _ = transport
+                                    .send(ReceiverMsg::Classified {
+                                        entry: orphan.clone(),
+                                        decision: TransferDecision::Deleted,
+                                    })
+                                    .await;
+                            }
+                            Err(e) => {
+                                warn!("[Receiver Remote] delete {:?}: {}", path, e);
+                                let _ = transport
+                                    .send(ReceiverMsg::EntryError {
+                                        entry: orphan.clone(),
+                                        reason: format!("{e}"),
+                                    })
+                                    .await;
                             }
                         }
                     }
