@@ -106,5 +106,10 @@ New/Changed/MetadataOnly/Skip 四类判定 —— **不存在需要新写的"远
   CLI→SyncJobConfig→SessionConfig→Receiver orphan-delete→Classified{Deleted} 全链路）。
   验证：`cargo test -p terrasync-rs --test remote_process_e2e` 连跑 2 次，均
   7 passed（5 既有 + 2 新增），无 flaky。
-- ⬜ 步骤 11：收尾 —— `cargo fmt --all -- --check`、`cargo test --workspace
-  --no-fail-fast`、e2e 连跑 2 次、`git status` 核对无越界文件、移除本计划文件。
+- ✅ 步骤 11：收尾 —— `cargo fmt --all -- --check`（干净，exit 0）、
+  `cargo test --workspace --no-fail-fast`（全绿：app 62 + dual_process_streaming 6
+  + cli 0 + db 22（14 ClickHouse 集成测试预期 ignored，无本地 ClickHouse）+
+  duckdb 0 + licensing 0 + sync_delta 25 + terrasync bin 0 +
+  remote_process_e2e 7 + transport 3 + quic_roundtrip 10 + utils 0 +
+  crypto_cmd 0 + web 3 + 全部 doc-tests 0，0 failed）、e2e 单独连跑 2 次均
+  7 passed、`git status` 核对无越界文件、移除本计划文件。
