@@ -45,11 +45,13 @@ New/Changed/MetadataOnly/Skip 四类判定 —— **不存在需要新写的"远
   `Classified` 到 `FileList` stream；message.rs 单测新增 `negotiate_rejects_v2_peer`。
   验证：`cargo check -p transport --features quic`（通过）+ `cargo test -p transport
   --features quic --lib`（3 passed，含新增 `negotiate_rejects_v2_peer`）。
-- 🔄 步骤 2：orchestrator 路由塌陷 —— `crates/app/src/orchestrator.rs`：
+- ✅ 步骤 2：orchestrator 路由塌陷 —— `crates/app/src/orchestrator.rs`：
   `match (&self.mode, scan_type)` 改为先 match `mode`，`Remote{..}` 忽略
   `scan_type` 直调 `run_sync_remote`，删除死分支。
-  验证：`cargo check -p app`。
-- ⬜ 步骤 3：Receiver 分类信号 —— `crates/app/src/receiver.rs`：四个
+  验证：`cargo check -p app`（orchestrator.rs 自身无新增错误；剩余 4 处
+  `TransferRequest{decision}` 缺字段错误是步骤 1 协议变更的预期下游影响，
+  步骤 3/5 修复）。
+- 🔄 步骤 3：Receiver 分类信号 —— `crates/app/src/receiver.rs`：四个
   `TransferDecision` 分支各自补发/携带 `decision`；MetadataOnly/Skip 补发
   `Classified`；orphan-delete 循环成功发 `Classified{Deleted}`、失败发
   `EntryError`（替换纯 `warn!`）。
