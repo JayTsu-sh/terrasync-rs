@@ -40,6 +40,12 @@ const POLL_INTERVAL: Duration = Duration::from_millis(50);
 /// （Sender 关闭连接的那一帧理论上也可能因为进程过早退出而丢失，要靠 idle timeout 兜底），
 /// 这里留够余量避免偶发的 30s 兜底触发时被误判为异常。
 const RECEIVER_EXIT_TIMEOUT: Duration = Duration::from_secs(35);
+/// 等待 Sender 在 Receiver 被杀后检测到连接异常并退出的超时时间。
+///
+/// 实测：loopback 上 QUIC 不信任 ICMP Port Unreachable（防欺骗），Receiver 进程被
+/// SIGKILL 后 Sender 稳定要等满 quinn 默认 `max_idle_timeout`（30s）才判定连接已断
+/// （实测约 32s），比 [`RECEIVER_EXIT_TIMEOUT`] 的 35s 余量更紧，故单独给更大余量。
+const SENDER_EXIT_TIMEOUT: Duration = Duration::from_secs(45);
 
 /// 进程内已分配过的端口号（跨测试函数共享，避免同一 `cargo test` 进程内并发跑的
 /// 多个测试探测到同一个端口——见 `free_loopback_port` 文档）。
@@ -1286,4 +1292,92 @@ fn test_remote_process_e2e_resume_after_sender_kill() {
     );
 
     assert_dest_matches_src(&src_dir, &dest_dir, &rel_paths);
+}
+
+/// transport 故障注入 e2e：同步中途 kill Receiver，Sender 必须在有限时间内检测到连接
+/// 异常并以非零码退出，不能无限期 hang（`quic::mux::reader_loop` 读流出错/EOF 时各自
+/// drop 手上的 `tx` clone，四条都 drop 后 `sender.recv()` 返回 `None`；Sender 主循环
+/// 据此判定连接已断，返回 Err 而非死等）。
+///
+/// 沿用 resume 测试同样的限速手法制造中断窗口，避免"其实传完了才杀"的假阳性。
+#[test]
+fn test_remote_process_e2e_receiver_killed_sender_exits_nonzero() {
+    let tmp = tempfile::tempdir().expect("create tempdir");
+    let tmp_path = tmp.path();
+
+    let src_dir = tmp_path.join("src");
+    let dest_dir = tmp_path.join("dest");
+    fs::create_dir_all(&src_dir).expect("create src dir");
+    fs::create_dir_all(&dest_dir).expect("create dest dir");
+    populate_src_dir(&src_dir);
+
+    const LARGE_FILE_SIZE: usize = 6 * 1024 * 1024;
+    fs::write(src_dir.join("large.bin"), deterministic_bytes(LARGE_FILE_SIZE)).expect("write large src file");
+
+    let cert_path = tmp_path.join("server.crt");
+    let config_path = tmp_path.join("config.toml");
+    fs::write(&config_path, "[database]\nenabled = false\n").expect("write config");
+    let fake_manifest_dir = tmp_path.join("fake_manifest");
+    let bin_path = cargo_bin("terrasync");
+
+    let port = free_loopback_port();
+    let listen_addr = format!("127.0.0.1:{port}");
+    let mut receiver_child = StdCommand::new(&bin_path)
+        .env("CARGO_MANIFEST_DIR", &fake_manifest_dir)
+        .current_dir(tmp_path)
+        .arg("-c")
+        .arg(&config_path)
+        .arg("serve")
+        .arg("--listen")
+        .arg(&listen_addr)
+        .arg("--tls-cert-out")
+        .arg(&cert_path)
+        .arg(&dest_dir)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn receiver process");
+    wait_for_cert_file(&cert_path);
+
+    let mut sender_child = StdCommand::new(&bin_path)
+        .env("CARGO_MANIFEST_DIR", &fake_manifest_dir)
+        .current_dir(tmp_path)
+        .arg("-c")
+        .arg(&config_path)
+        .arg("sync")
+        .arg("--id")
+        .arg("remote_receiver_killed")
+        .arg("--remote")
+        .arg(&listen_addr)
+        .arg("--tls-server-cert")
+        .arg(&cert_path)
+        .arg("--qos")
+        .arg("64KiB/s")
+        .arg("--block-size")
+        .arg("64KiB")
+        .arg(&src_dir)
+        .arg(&dest_dir)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn sender process");
+
+    std::thread::sleep(Duration::from_secs(1));
+
+    // 中途强杀 Receiver：不给它优雅关闭连接的机会
+    let _ = receiver_child.kill();
+    let _ = receiver_child.wait();
+
+    let sender_status = wait_for_child_exit(&mut sender_child, SENDER_EXIT_TIMEOUT);
+    let (sout, serr) = drain_output(&mut sender_child);
+    match sender_status {
+        Some(status) => assert!(
+            !status.success(),
+            "Receiver 被杀后 Sender 应以非零码退出，实际: {status:?}\nstdout:\n{sout}\nstderr:\n{serr}"
+        ),
+        None => panic!(
+            "Sender 在 Receiver 被杀后 {SENDER_EXIT_TIMEOUT:?} 内未自行退出（疑似 hang），已强制 kill。\n\
+             stdout:\n{sout}\nstderr:\n{serr}"
+        ),
+    }
 }

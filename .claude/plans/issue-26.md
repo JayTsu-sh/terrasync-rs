@@ -18,7 +18,7 @@ spec」（已 `claude:approved`，以此为准；2026-07-03 的旧 UNCLEAR 判�
 - ✅ 1. delta sync 真实 2 进程 e2e ≥1 个通过。
 - ✅ 2. symlink 真实 2 进程 e2e 通过。
 - ✅ 3. resume（进程中断重跑）e2e ≥1 个通过。
-- ⬜ 4. transport 异常关闭测试 ≥1 个通过（不 hang、非零退出码或明确错误）。
+- ✅ 4. transport 异常关闭测试 ≥1 个通过（不 hang、非零退出码或明确错误）。
 - ⬜ 5. uid/gid 有断言覆盖（非 root 环境限制：无法测试"跨用户 chown 成功"，只能验证
       字段经 wire 正确传播且落地值与源端一致——运行进程本身的 uid/gid）。
 - ⬜ 6. packaged/tar 适用性结论写入 PR 描述：**不适用**。`crates/app/src/remote_sync.rs`
@@ -85,7 +85,7 @@ ACL/xattr（#24）、Renamed（未实现）、hash 算法协商（deferred）、
       未落盘 → 相同 src/dest 重跑（不限速）→ 断言 dest 与 src 最终一致）。
       验证：`cargo test -p terrasync-rs --test remote_process_e2e resume -- --nocapture`
       （连跑 2 次确认不 flake）。
-- ⬜ 步骤 4：新增 transport 故障注入 e2e（`--qos` 限速 + 大文件，中途 kill Receiver，
+- ✅ 步骤 4：新增 transport 故障注入 e2e（`--qos` 限速 + 大文件，中途 kill Receiver，
       断言 Sender 在超时内非零退出、不 hang）。
       验证：`cargo test -p terrasync-rs --test remote_process_e2e receiver_killed -- --nocapture`
       （连跑 2 次确认不 flake）。
