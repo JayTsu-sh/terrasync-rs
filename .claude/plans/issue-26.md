@@ -17,7 +17,7 @@ spec」（已 `claude:approved`，以此为准；2026-07-03 的旧 UNCLEAR 判�
 
 - ✅ 1. delta sync 真实 2 进程 e2e ≥1 个通过。
 - ✅ 2. symlink 真实 2 进程 e2e 通过。
-- ⬜ 3. resume（进程中断重跑）e2e ≥1 个通过。
+- ✅ 3. resume（进程中断重跑）e2e ≥1 个通过。
 - ⬜ 4. transport 异常关闭测试 ≥1 个通过（不 hang、非零退出码或明确错误）。
 - ⬜ 5. uid/gid 有断言覆盖（非 root 环境限制：无法测试"跨用户 chown 成功"，只能验证
       字段经 wire 正确传播且落地值与源端一致——运行进程本身的 uid/gid）。
@@ -81,7 +81,7 @@ ACL/xattr（#24）、Renamed（未实现）、hash 算法协商（deferred）、
 - ✅ 步骤 2：新增 symlink 真实 2 进程 e2e（专用小数据集，含 target 文件 + 相对路径
       symlink，断言 dest 侧 symlink 类型 + `read_link` 目标一致 + 内容可解引用读取）。
       验证：`cargo test -p terrasync-rs --test remote_process_e2e symlink -- --nocapture`。
-- ⬜ 步骤 3：新增 resume e2e（`--qos` 限速 + 大文件，中途 kill Sender，断言最终文件名
+- ✅ 步骤 3：新增 resume e2e（`--qos` 限速 + 大文件，中途 kill Sender，断言最终文件名
       未落盘 → 相同 src/dest 重跑（不限速）→ 断言 dest 与 src 最终一致）。
       验证：`cargo test -p terrasync-rs --test remote_process_e2e resume -- --nocapture`
       （连跑 2 次确认不 flake）。
