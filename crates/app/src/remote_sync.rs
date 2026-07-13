@@ -771,7 +771,7 @@ mod tests {
     use transport::traits::ReceiverTransport;
 
     use super::*;
-    use crate::consumer::stats::JobSummary;
+    use crate::consumer::stats::{JobSummary, ProgressDetail, ProgressReport};
     use crate::receiver::receiver_task_remote;
 
     /// 构造测试用 `Arc<AsyncMutex<StatisticConsumer>>`：不设 `callback_url`（不起 HTTP
@@ -2048,6 +2048,127 @@ mod tests {
                 assert_eq!(renamed.regular_file_count, 0);
             }
             other => panic!("expected JobSummary::Incremental, got {other:?}"),
+        }
+    }
+
+    // ============================================================
+    // callback payload/频率（issue #23 测试计划 6）
+    // ============================================================
+
+    /// 起一个最小的本地 HTTP mock server（raw TCP + 手写 HTTP/1.1 帧解析，避免引入新
+    /// 依赖），返回 `(base_url,收到的请求体集合)`。
+    async fn spawn_mock_callback_server() -> (String, Arc<AsyncMutex<Vec<String>>>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let bodies: Arc<AsyncMutex<Vec<String>>> = Arc::new(AsyncMutex::new(Vec::new()));
+        let bodies_for_server = bodies.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let bodies = bodies_for_server.clone();
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+                    let mut reader = BufReader::new(&mut stream);
+                    let mut content_length = 0usize;
+                    let mut line = String::new();
+                    loop {
+                        line.clear();
+                        match reader.read_line(&mut line).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(_) => {}
+                        }
+                        if line == "\r\n" || line == "\n" {
+                            break;
+                        }
+                        if let Some(v) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                            content_length = v.trim().parse().unwrap_or(0);
+                        }
+                    }
+                    let mut body = vec![0u8; content_length];
+                    if content_length > 0 && reader.read_exact(&mut body).await.is_err() {
+                        return;
+                    }
+                    bodies.lock().await.push(String::from_utf8_lossy(&body).to_string());
+                    let _ = stream
+                        .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                        .await;
+                });
+            }
+        });
+        (format!("http://{addr}"), bodies)
+    }
+
+    /// callback payload 结构 + 频率：`StatisticConsumer` 按 `remote_sync::run()` 的同一套
+    /// 构造方式（`JobType::IncrementalCopy`）跑一轮 begin → 喂消息 → 等待跨过一个周期
+    /// 回调间隔 → end，断言周期性(非 final) + 恰好一次 final 回调都送达，payload 结构为
+    /// `ProgressReport`/`ProgressDetail::Incremental`/`FinalStats`（与本地 `IncrementalCopy`
+    /// 任务完全同构——同一 Rust 类型，天然保证）。
+    ///
+    /// 不经真实 QUIC/`remote_sync::run()`：callback 机制完全活在 `StatisticConsumer` 内部，
+    /// 与 transport 无关；`run()` 到这里的唯一接线是一行
+    /// `callback_url: config.progress_callback_url.clone()`（类型检查即可保证正确），
+    /// 双进程整条链路已由 `tests/remote_process_e2e.rs` + 本文件的分类信号测试覆盖，
+    /// 这里只聚焦 callback 本身此前完全没有测试覆盖的行为。
+    #[tokio::test]
+    async fn statistic_consumer_progress_callback_matches_local_incremental_copy_payload() {
+        let (callback_url, bodies) = spawn_mock_callback_server().await;
+
+        let stats_consumer = Arc::new(AsyncMutex::new(StatisticConsumer {
+            stats: StatsKind::Incremental(IncrementalStats::new(
+                JobType::IncrementalCopy,
+                "callback-test".to_string(),
+                "test callback".to_string(),
+                String::new(),
+            )),
+            progress_bar: ProgressBar::new(JobType::IncrementalCopy),
+            job_dir: String::new(),
+            callback_url: Some(callback_url),
+            pb_handle: None,
+        }));
+        let callback_guard = StatisticConsumer::begin(stats_consumer.clone()).await;
+
+        {
+            let mut c = stats_consumer.lock().await;
+            c.update_statistics(&StorageEntryMessage::New(dummy_entry("a.txt", false, 10)));
+            c.update_statistics(&StorageEntryMessage::Changed {
+                entry: dummy_entry("b.txt", false, 20),
+                kind: ChangeKind::DataOnly,
+            });
+        }
+
+        // 跨过至少一个周期回调间隔（consumer.rs::CALLBACK_INTERVAL_SECS=2），确保拿到
+        // 至少一次非 final 回调（用真实 sleep 而非 QoS 限速，确定性更高、不引入 flaky 风险）
+        tokio::time::sleep(Duration::from_millis(2_200)).await;
+
+        StatisticConsumer::end(stats_consumer, callback_guard).await;
+        // 给 mock server 处理最后一次请求的时间（写响应发生在 POST 之后短暂延迟内）
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let collected = bodies.lock().await;
+        let reports: Vec<ProgressReport> = collected
+            .iter()
+            .filter_map(|b| serde_json::from_str::<ProgressReport>(b).ok())
+            .collect();
+        assert_eq!(
+            reports.len(),
+            collected.len(),
+            "所有收到的回调 body 都应能反序列化为 ProgressReport"
+        );
+
+        let non_final: Vec<_> = reports.iter().filter(|r| !r.is_final).collect();
+        let final_reports: Vec<_> = reports.iter().filter(|r| r.is_final).collect();
+        assert!(!non_final.is_empty(), "应至少收到一次周期性(非 final)回调");
+        assert_eq!(final_reports.len(), 1, "应恰好收到一次 final 回调");
+        assert!(final_reports[0].final_stats.is_some(), "final 回调应带 final_stats");
+
+        for report in &reports {
+            assert_eq!(report.job_type, "incremental_copy");
+            match &report.detail {
+                ProgressDetail::Incremental { .. } => {}
+                other => panic!("expected ProgressDetail::Incremental, got {other:?}"),
+            }
         }
     }
 }

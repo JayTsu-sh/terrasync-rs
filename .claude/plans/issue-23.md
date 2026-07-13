@@ -92,9 +92,14 @@ New/Changed/MetadataOnly/Skip 四类判定 —— **不存在需要新写的"远
   `IncrementalStats.new/changed/deleted/renamed`、`send_file_list_phase` 的
   `scanned` 累加、`to_final_stats()`/`to_job_result()` 计数与预期逐一匹配。
   验证：`cargo test -p app remote_sync::tests`（29 passed，含全部新增测试）。
-- ⬜ 步骤 9：新增 callback payload/频率测试（`remote_sync.rs` test mod，真实 QUIC +
-  本地 mock HTTP server，验证 final 回调结构；QoS 限速确保跨越周期回调间隔）。
-  验证：`cargo test -p app remote_sync::tests`。
+- ✅ 步骤 9：新增 callback payload/频率测试（`remote_sync.rs` test mod）：直接构造
+  `StatisticConsumer`（与 `remote_sync::run()` 同一套构造方式）+ 本地 mock HTTP
+  server（raw TCP 手写 HTTP/1.1 帧解析，不引入新依赖），`sleep(2.2s)` 确定性跨越
+  `CALLBACK_INTERVAL_SECS=2`，验证周期性(非 final)+恰好一次 final 回调、payload
+  为 `ProgressReport`/`ProgressDetail::Incremental`/`FinalStats`。不经真实 QUIC——
+  callback 机制活在 `StatisticConsumer` 内部与 transport 无关，`run()` 到这里的唯一
+  接线是一行字段赋值，双进程整条链路已由 `tests/remote_process_e2e.rs` + 步骤 7 覆盖。
+  验证：`cargo test -p app remote_sync::tests`（30 passed）连跑 2 次，无 flaky。
 - ⬜ 步骤 10：新增 `--delete-target` 进程级 e2e —— `tests/remote_process_e2e.rs`：
   默认不删除 / 加 flag 后删除。
   验证：`cargo test -p terrasync-rs --test remote_process_e2e`。
