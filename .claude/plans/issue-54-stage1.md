@@ -69,11 +69,10 @@ delta 路径当前 4 个整文件缓冲点之一：Receiver 为 `DeltaTransferRe
   block 的 chunk/小于 block_size 的 chunk/多次小块 push/空文件/单字节，逐字段比对
   streamed vs whole-buffer 输出）+ staging buffer 容量上界断言测试。验证：
   `cargo test -p sync-delta`（32 测全绿：原 25 + 新 7）。
-- ⬜ 步骤 3：`crates/app/src/receiver.rs` `TransferDecision::DeltaTransfer` 分支改用
+- ✅ 步骤 3：`crates/app/src/receiver.rs` `TransferDecision::DeltaTransfer` 分支改用
   `StorageEnum::read_chunk_stream` 驱动 `SignatureCalculator` 逐块喂入，替换
   `read_file_from` 整读；错误路径保持"降级全量传输"语义不变。验证：
-  `cargo check -p app` + `cargo test -p app`（delta 相关测试，如
-  `delta_transfer`/`redo` 关键字过滤）。
+  `cargo check -p app`（通过）+ `cargo test -p app delta`（13 测全绿）。
 - ⬜ 步骤 4：收尾核验 —— `cargo fmt --all -- --check`；
   `cargo test --workspace --no-fail-fast`；`cargo test --test remote_process_e2e`
   （连跑 2 次不 flake）；`git status` 确认无越界文件；移除本计划文件并单独 commit。

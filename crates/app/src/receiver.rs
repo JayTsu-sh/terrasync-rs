@@ -647,11 +647,24 @@ async fn recv_file_list_and_data_phase(
                         }
                         TransferDecision::DeltaTransfer => {
                             let size = nf.entry.get_size();
-                            match StorageEnum::read_file_from(dest_storage, &nf.entry, size).await {
-                                Ok(basis_data) => {
-                                    let block_size = sync_delta::calculate_block_size(size);
-                                    let signatures =
-                                        sync_delta::signature::compute_block_signatures(&basis_data, block_size);
+                            let block_size = sync_delta::calculate_block_size(size);
+                            // 流式读 basis file：read_chunk_stream 按块读驱动签名状态机
+                            // 逐块喂入（不再整文件驻留 RAM，见 issue #54 阶段 1）
+                            let (mut basis_rx, basis_handle) =
+                                StorageEnum::read_chunk_stream(dest_storage, &nf.entry, None, None, false, 8);
+                            let mut sig_calc = sync_delta::signature::SignatureCalculator::new(block_size);
+                            while let Some(chunk) = basis_rx.recv().await {
+                                sig_calc.push(&chunk.data);
+                            }
+                            // 读任务收尾：JoinError 或内层读错误统一归一为原因字符串（与
+                            // Sender 侧源文件流式读点一致的归一模式）
+                            let basis_read_result = match basis_handle.await {
+                                Ok(inner) => inner.map_err(|e| e.to_string()),
+                                Err(e) => Err(e.to_string()),
+                            };
+                            match basis_read_result {
+                                Ok(_) => {
+                                    let signatures = sig_calc.finish();
                                     let transport_sigs: Vec<transport::message::BlockSignature> = signatures
                                         .into_iter()
                                         .map(|s| transport::message::BlockSignature {
