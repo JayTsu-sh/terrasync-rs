@@ -73,9 +73,11 @@ delta 路径当前 4 个整文件缓冲点之一：Receiver 为 `DeltaTransferRe
   `StorageEnum::read_chunk_stream` 驱动 `SignatureCalculator` 逐块喂入，替换
   `read_file_from` 整读；错误路径保持"降级全量传输"语义不变。验证：
   `cargo check -p app`（通过）+ `cargo test -p app delta`（13 测全绿）。
-- ⬜ 步骤 4：收尾核验 —— `cargo fmt --all -- --check`；
-  `cargo test --workspace --no-fail-fast`；`cargo test --test remote_process_e2e`
-  （连跑 2 次不 flake）；`git status` 确认无越界文件；移除本计划文件并单独 commit。
+- ✅ 步骤 4：收尾核验 —— `cargo fmt --all -- --check`（干净）；
+  `cargo test --workspace --no-fail-fast`（全绿，exit 0）；
+  `cargo test --test remote_process_e2e`（连跑 2 次均 16 passed / 0 failed，不 flake）；
+  `git status` 还原越界的 `web-ui/package-lock.json` 漂移后确认无越界文件；移除本计划
+  文件并单独 commit。
 
 ## 端到端验证安排
 
