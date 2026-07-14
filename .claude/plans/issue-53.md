@@ -71,7 +71,7 @@ hash 计算之前，hash 自洽通过，拦不住）以及 `enable_integrity_che
   `delta_transfer_size_mismatch_redo_recovers_without_integrity_check`
   （`enable_integrity_check=false`，覆盖 `receiver.rs::handle_end_of_file` 路径，验证
   首次 Redo 降级全量重发恢复成功）。验证：`cargo test -p app size_mismatch -- --nocapture`。
-- ⬜ 步骤 7：收尾核验——`cargo fmt --all -- --check`；
+- ✅ 步骤 7：收尾核验——`cargo fmt --all -- --check`；
   `cargo test --workspace --no-fail-fast`（全绿，含现有 delta redo 状态机测试无回归）；
   `cargo test --test remote_process_e2e`（连跑 2 次不 flake）；`git status` 确认无越界
   文件；移除本计划文件并单独 commit。
