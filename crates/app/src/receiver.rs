@@ -1137,6 +1137,30 @@ mod tests {
     }
 
     #[test]
+    fn decide_file_ack_first_size_mismatch_redos_and_is_not_terminal() {
+        let mut attempts = HashMap::new();
+        let (ack, is_terminal) = decide_file_ack(&mut attempts, 5, FileOutcome::SizeMismatch);
+        assert!(matches!(ack, ReceiverMsg::Redo { ndx: 5 }));
+        assert!(!is_terminal);
+        assert_eq!(attempts.get(&5), Some(&1));
+    }
+
+    #[test]
+    fn decide_file_ack_second_size_mismatch_errors_and_is_terminal() {
+        let mut attempts = HashMap::new();
+        let (first_ack, first_terminal) = decide_file_ack(&mut attempts, 5, FileOutcome::SizeMismatch);
+        assert!(matches!(first_ack, ReceiverMsg::Redo { ndx: 5 }));
+        assert!(!first_terminal);
+
+        let (second_ack, second_terminal) = decide_file_ack(&mut attempts, 5, FileOutcome::SizeMismatch);
+        match second_ack {
+            ReceiverMsg::Error { ndx: 5, reason } => assert_eq!(reason, "size mismatch"),
+            other => panic!("expected Error, got {other:?}"),
+        }
+        assert!(second_terminal);
+    }
+
+    #[test]
     fn decide_file_ack_hard_error_is_terminal_without_redo() {
         let mut attempts = HashMap::new();
         let (ack, is_terminal) =

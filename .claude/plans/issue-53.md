@@ -53,7 +53,7 @@ hash 计算之前，hash 自洽通过，拦不住）以及 `enable_integrity_che
 - ✅ 步骤 3：`receiver.rs::handle_end_of_file` 加 size 断言（`file_bytes.len() as u64`
   vs `entry.get_size()`，不符返回 `FileOutcome::SizeMismatch`）。定向验证：
   `cargo check -p app`。
-- ⬜ 步骤 4：`app/receiver.rs` 单测：`decide_file_ack` 新增 `SizeMismatch` 首次 Redo /
+- ✅ 步骤 4：`app/receiver.rs` 单测：`decide_file_ack` 新增 `SizeMismatch` 首次 Redo /
   二次 Error 两个纯函数单测（参照现有 HashMismatch 单测）。验证：
   `cargo test -p app decide_file_ack -- --nocapture`。
 - ⬜ 步骤 5：`app/remote_sync.rs` 测试模块新增 `SizeTruncationInjector`（按目标文件相对
