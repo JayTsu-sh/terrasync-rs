@@ -60,7 +60,7 @@
   `validate_delta_size_threshold`）；`lib.rs` 解构透传；`commands.rs::sync_cmd` 加形参 +
   写入 `SyncJobConfig` 字面量。
   验证：`cargo check -p cli`
-- ⬜ step 5: web 层收尾 —— `task_runner.rs` 的 `SyncJobConfig` 字面量补
+- ✅ step 5: web 层收尾 —— `task_runner.rs` 的 `SyncJobConfig` 字面量补
   `delta_size_threshold: None`（同 `delete_target` 先例注释风格）。
   验证：`cargo check -p web`
 - ⬜ step 6: receiver.rs 集成测试（app 层）—— 仿 `recv_file_list_delta_transfer_downgrade_signal`

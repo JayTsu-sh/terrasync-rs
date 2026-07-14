@@ -310,6 +310,8 @@ async fn run_migration_task(
                 qos: task_config.qos.clone(),
                 peak_qos_rate: task_config.peak_qos_rate,
                 block_size: task_config.block_size.clone(),
+                // web 层是否暴露该参数为后续可选项，本次先给默认值保证编译通过（同 delete_target）
+                delta_size_threshold: None,
                 file_list: None,
                 iops: task_config.iops,
                 packaged: false,
