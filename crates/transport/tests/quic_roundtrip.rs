@@ -782,3 +782,44 @@ async fn test_quic_mux_large_data_stream_does_not_block_ack_progress_stream() {
     receiver_handle.await.unwrap();
     sender.close().await.unwrap();
 }
+
+/// 协议层连接异常测试（issue #26 可选项）：Receiver 在 Handshake 之后、任何回复之前
+/// 就主动关闭连接（模拟对端崩溃），Sender 的 `recv()` 应在有限时间内返回 `None`
+/// （连接结束），而不是 panic 或永久 hang。
+///
+/// `sender.recv()` 从统一 fan-in channel 读取（`QuicSenderTransport::recv`），该
+/// channel 由 4 条物理 stream 各自的 `reader_loop` 转发；连接关闭后每条
+/// `reader_loop` 各自在 `read_msg` 出错/EOF 时退出并 drop 手上的 `tx` clone，全部
+/// drop 完后 `UnboundedReceiver::recv()` 返回 `None`（见 `crates/transport/src/quic/mux.rs`）。
+#[tokio::test]
+async fn test_quic_sender_recv_returns_none_after_connection_dropped() {
+    install_crypto_provider();
+
+    let (server_endpoint, server_addr) = create_server_endpoint();
+
+    let receiver_handle = tokio::spawn(async move {
+        let incoming = server_endpoint.accept().await.unwrap();
+        let conn = incoming.await.unwrap();
+        let (_send, _recv) = conn.accept_bi().await.unwrap();
+
+        // 收到 Handshake 后不回复任何消息，直接主动关闭连接，模拟对端异常终止。
+        conn.close(1u32.into(), b"simulated receiver crash");
+    });
+
+    let sender = quic::connect(server_addr, "localhost", None).await.unwrap();
+    sender
+        .send(SenderMsg::Handshake(ProtocolHandshake::current()))
+        .await
+        .unwrap();
+
+    receiver_handle.await.unwrap();
+
+    let reply = tokio::time::timeout(Duration::from_secs(5), sender.recv())
+        .await
+        .expect("连接被 Receiver 侧关闭后 sender.recv() 应快速返回而不是 hang");
+    assert!(
+        reply.is_none(),
+        "连接被 Receiver 侧关闭后应返回 None，实际: {:?}",
+        reply
+    );
+}

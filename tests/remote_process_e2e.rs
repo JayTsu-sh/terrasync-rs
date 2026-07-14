@@ -20,7 +20,7 @@ use std::collections::HashSet;
 use std::fs;
 use std::io::Read;
 use std::net::UdpSocket;
-use std::os::unix::fs::MetadataExt;
+use std::os::unix::fs::{MetadataExt, symlink};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command as StdCommand, ExitStatus, Stdio};
 use std::sync::{Mutex, OnceLock};
@@ -40,6 +40,12 @@ const POLL_INTERVAL: Duration = Duration::from_millis(50);
 /// （Sender 关闭连接的那一帧理论上也可能因为进程过早退出而丢失，要靠 idle timeout 兜底），
 /// 这里留够余量避免偶发的 30s 兜底触发时被误判为异常。
 const RECEIVER_EXIT_TIMEOUT: Duration = Duration::from_secs(35);
+/// 等待 Sender 在 Receiver 被杀后检测到连接异常并退出的超时时间。
+///
+/// 实测：loopback 上 QUIC 不信任 ICMP Port Unreachable（防欺骗），Receiver 进程被
+/// SIGKILL 后 Sender 稳定要等满 quinn 默认 `max_idle_timeout`（30s）才判定连接已断
+/// （实测约 32s），比 [`RECEIVER_EXIT_TIMEOUT`] 的 35s 余量更紧，故单独给更大余量。
+const SENDER_EXIT_TIMEOUT: Duration = Duration::from_secs(45);
 
 /// 进程内已分配过的端口号（跨测试函数共享，避免同一 `cargo test` 进程内并发跑的
 /// 多个测试探测到同一个端口——见 `free_loopback_port` 文档）。
@@ -868,4 +874,598 @@ fn test_remote_process_e2e_delete_target_preserves_existing_subdir() {
         ino_before, ino_after,
         "预存子目录被整树删除后重传（inode 改变）——子目录不是孤儿，不得删除"
     );
+}
+
+// ============================================================
+// issue #26：补充 rsync-like 远端同步端到端测试矩阵
+// ============================================================
+
+/// 断言日志中出现 delta 能力协商成功的记录（`FeatureFlags { delta: true, ... }` 的
+/// Debug 输出片段），作为"走 `DeltaTransferRequest` 而非降级全量"的非侵入式证据之一
+/// （另一半证据见 `parse_changed_total`，两者结合见调用处注释）。
+fn assert_delta_negotiated_in_log(log_path: &Path, who: &str) {
+    let content = fs::read_to_string(log_path).unwrap_or_else(|e| panic!("读取 {who} 日志失败 {log_path:?}: {e}"));
+    assert!(
+        content.contains("delta: true"),
+        "{who} 日志 {log_path:?} 中未见 delta 能力协商成功记录（FeatureFlags.delta=true），内容:\n{content}"
+    );
+}
+
+/// 从 Sender stdout 打印的最终统计报表中解析 "Changed:" 行的 total 计数
+/// （`StatisticConsumer::finalize()` 用 `println!("{}", self.stats)` 打印
+/// `IncrementalStats::fmt`，格式形如 `"   ├─ Changed:        1 total | ..."`）。
+fn parse_changed_total(stdout: &str) -> u64 {
+    stdout
+        .lines()
+        .find(|l| l.contains("Changed:"))
+        .and_then(|l| l.split_whitespace().nth(2))
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0)
+}
+
+/// 真实 2 进程 delta sync e2e：第一轮播种 dest，第二轮改 src 文件中间一段字节
+/// （保留首尾不变，让 delta 匹配有实际意义）后重跑，断言走 `DeltaTransferRequest`
+/// 而非全量重传，且 dest 最终内容与 src 一致。
+///
+/// 不直接窥探协议内部状态（不侵入协议），改用两条独立、只读的非侵入式证据组合：
+/// 1. Sender 日志握手行含 `delta: true`——证明本次连接的 delta 能力协商成功，
+///    `receiver.rs::recv_file_list_and_data_phase` 在 `DestIndex::check()` 判定
+///    `DeltaTransfer` 时必然发送真实 `DeltaTransferRequest`（协商失败才会降级为
+///    `TransferRequest`，见该函数文档）。
+/// 2. Sender stdout 最终报表 "Changed:" 行 total ≥ 1——证明确有一个条目被判定为
+///    `TransferDecision::DeltaTransfer`（`DestIndex::check()` 对已存在但内容不同的
+///    条目恒返回 `DeltaTransfer`，与文件大小是否变化无关，见 `message.rs::check`）。
+/// 二者同时成立时，唯一自洽的解释就是该条目走了真实的 `DeltaTransferRequest` 消息。
+#[test]
+fn test_remote_process_e2e_delta_sync_transfers_changed_content() {
+    let tmp = tempfile::tempdir().expect("create tempdir");
+    let tmp_path = tmp.path();
+
+    let src_dir = tmp_path.join("src");
+    let dest_dir = tmp_path.join("dest");
+    fs::create_dir_all(&src_dir).expect("create src dir");
+    fs::create_dir_all(&dest_dir).expect("create dest dir");
+    let mut rel_paths = populate_src_dir(&src_dir);
+
+    // 专用 delta 目标文件：8000 字节，块大小算法（sqrt(size).clamp(700, 128KiB)）会
+    // 切出多个 block，足够体现"部分匹配 + 部分不匹配"的真实 delta 场景。
+    const DELTA_FILE_SIZE: usize = 8000;
+    let delta_rel = PathBuf::from("delta_target.bin");
+    let original_content = deterministic_bytes(DELTA_FILE_SIZE);
+    fs::write(src_dir.join(&delta_rel), &original_content).expect("write delta src file");
+    rel_paths.push(delta_rel.clone());
+
+    let cert_path = tmp_path.join("server.crt");
+    let config_path = tmp_path.join("config.toml");
+    fs::write(&config_path, "[database]\nenabled = false\n").expect("write config");
+    let fake_manifest_dir = tmp_path.join("fake_manifest");
+    let bin_path = cargo_bin("terrasync");
+
+    // ── 第一轮：全量播种 dest ──
+    let port = free_loopback_port();
+    let listen_addr = format!("127.0.0.1:{port}");
+    let mut receiver_child = StdCommand::new(&bin_path)
+        .env("CARGO_MANIFEST_DIR", &fake_manifest_dir)
+        .current_dir(tmp_path)
+        .arg("-c")
+        .arg(&config_path)
+        .arg("serve")
+        .arg("--listen")
+        .arg(&listen_addr)
+        .arg("--tls-cert-out")
+        .arg(&cert_path)
+        .arg(&dest_dir)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn receiver process");
+    wait_for_cert_file(&cert_path);
+
+    let mut sender_cmd = AssertCommand::new(&bin_path);
+    sender_cmd
+        .env("CARGO_MANIFEST_DIR", &fake_manifest_dir)
+        .current_dir(tmp_path)
+        .arg("-c")
+        .arg(&config_path)
+        .arg("sync")
+        .arg("--id")
+        .arg("remote_delta_seed")
+        .arg("--remote")
+        .arg(&listen_addr)
+        .arg("--tls-server-cert")
+        .arg(&cert_path)
+        .arg(&src_dir)
+        .arg(&dest_dir);
+    sender_cmd.assert().success();
+
+    let receiver_status = wait_for_child_exit(&mut receiver_child, RECEIVER_EXIT_TIMEOUT);
+    let (rout, rerr) = drain_output(&mut receiver_child);
+    assert!(
+        matches!(receiver_status, Some(s) if s.success()),
+        "第一轮 Receiver 异常退出: {receiver_status:?}\nstdout:\n{rout}\nstderr:\n{rerr}"
+    );
+    assert_dest_matches_src(&src_dir, &dest_dir, &rel_paths);
+
+    // 修改 delta_target.bin 中间一段字节（保留首尾 3000/4800 字节不变），
+    // 内容变化会连带更新 mtime，触发 DestIndex::check() 的 data_check 判定为不匹配。
+    let mut modified_content = original_content.clone();
+    for byte in &mut modified_content[3000..3200] {
+        *byte = 0xAA;
+    }
+    fs::write(src_dir.join("delta_target.bin"), &modified_content).expect("modify delta src file");
+
+    // ── 第二轮：重跑同步，delta_target.bin 应走 delta 传输 ──
+    let port = free_loopback_port();
+    let listen_addr = format!("127.0.0.1:{port}");
+    fs::remove_file(&cert_path).expect("remove old cert");
+    let mut receiver_child = StdCommand::new(&bin_path)
+        .env("CARGO_MANIFEST_DIR", &fake_manifest_dir)
+        .current_dir(tmp_path)
+        .arg("-c")
+        .arg(&config_path)
+        .arg("serve")
+        .arg("--listen")
+        .arg(&listen_addr)
+        .arg("--tls-cert-out")
+        .arg(&cert_path)
+        .arg(&dest_dir)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn receiver process");
+    wait_for_cert_file(&cert_path);
+
+    let mut sender_cmd = AssertCommand::new(&bin_path);
+    sender_cmd
+        .env("CARGO_MANIFEST_DIR", &fake_manifest_dir)
+        .current_dir(tmp_path)
+        .arg("-c")
+        .arg(&config_path)
+        .arg("sync")
+        .arg("--id")
+        .arg("remote_delta_verify")
+        .arg("--remote")
+        .arg(&listen_addr)
+        .arg("--tls-server-cert")
+        .arg(&cert_path)
+        .arg(&src_dir)
+        .arg(&dest_dir);
+    let assert = sender_cmd.assert().success();
+    let stdout = String::from_utf8_lossy(&assert.get_output().stdout).into_owned();
+
+    let receiver_status = wait_for_child_exit(&mut receiver_child, RECEIVER_EXIT_TIMEOUT);
+    let (rout, rerr) = drain_output(&mut receiver_child);
+    assert!(
+        matches!(receiver_status, Some(s) if s.success()),
+        "第二轮 Receiver 异常退出: {receiver_status:?}\nstdout:\n{rout}\nstderr:\n{rerr}"
+    );
+
+    // 内容一致性：delta 重建结果必须与源端修改后的内容逐字节相同
+    assert_dest_matches_src(&src_dir, &dest_dir, &rel_paths);
+
+    // 非侵入式证据 1：delta 能力协商成功
+    let sender_log = tmp_path.join("logs").join("remote_delta_verify").join("app.log");
+    assert_delta_negotiated_in_log(&sender_log, "Sender");
+
+    // 非侵入式证据 2：Sender 报表记录了一次 Changed（即 delta_target.bin 走了
+    // DeltaTransfer 分类，而非 Skip）
+    let changed_total = parse_changed_total(&stdout);
+    assert!(
+        changed_total >= 1,
+        "Sender 报表 Changed 计数应 ≥1（delta_target.bin 内容已变更），实际 stdout:\n{stdout}"
+    );
+}
+
+/// symlink 真实 2 进程全量同步 e2e：`populate_src_dir` 从不建 symlink（8 个既有 e2e
+/// 均未覆盖该路径，见 issue #26 triage），单独构造专属数据集验证符号链接经真实
+/// QUIC 连接走 `CreateSymlink` 完整落地——链接类型 + 目标路径字符串 + 可解引用内容。
+#[test]
+fn test_remote_process_e2e_symlink_synced() {
+    let tmp = tempfile::tempdir().expect("create tempdir");
+    let tmp_path = tmp.path();
+
+    let src_dir = tmp_path.join("src");
+    let dest_dir = tmp_path.join("dest");
+    fs::create_dir_all(&src_dir).expect("create src dir");
+    fs::create_dir_all(&dest_dir).expect("create dest dir");
+
+    fs::write(src_dir.join("target.txt"), b"symlink target content\n").expect("write target file");
+    symlink("target.txt", src_dir.join("link.txt")).expect("create src symlink");
+
+    let cert_path = tmp_path.join("server.crt");
+    let config_path = tmp_path.join("config.toml");
+    fs::write(&config_path, "[database]\nenabled = false\n").expect("write config");
+    let fake_manifest_dir = tmp_path.join("fake_manifest");
+
+    let port = free_loopback_port();
+    let listen_addr = format!("127.0.0.1:{port}");
+    let bin_path = cargo_bin("terrasync");
+
+    let mut receiver_child = StdCommand::new(&bin_path)
+        .env("CARGO_MANIFEST_DIR", &fake_manifest_dir)
+        .current_dir(tmp_path)
+        .arg("-c")
+        .arg(&config_path)
+        .arg("serve")
+        .arg("--listen")
+        .arg(&listen_addr)
+        .arg("--tls-cert-out")
+        .arg(&cert_path)
+        .arg(&dest_dir)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn receiver process");
+    wait_for_cert_file(&cert_path);
+
+    let mut sender_cmd = AssertCommand::new(&bin_path);
+    sender_cmd
+        .env("CARGO_MANIFEST_DIR", &fake_manifest_dir)
+        .current_dir(tmp_path)
+        .arg("-c")
+        .arg(&config_path)
+        .arg("sync")
+        .arg("--id")
+        .arg("remote_symlink_e2e")
+        .arg("--remote")
+        .arg(&listen_addr)
+        .arg("--tls-server-cert")
+        .arg(&cert_path)
+        .arg(&src_dir)
+        .arg(&dest_dir);
+    sender_cmd.assert().success();
+
+    let receiver_status = wait_for_child_exit(&mut receiver_child, RECEIVER_EXIT_TIMEOUT);
+    let (rout, rerr) = drain_output(&mut receiver_child);
+    assert!(
+        matches!(receiver_status, Some(s) if s.success()),
+        "Receiver 异常退出: {receiver_status:?}\nstdout:\n{rout}\nstderr:\n{rerr}"
+    );
+
+    // 目标文件内容一致
+    assert_eq!(
+        fs::read(src_dir.join("target.txt")).expect("read src target"),
+        fs::read(dest_dir.join("target.txt")).expect("read dest target"),
+    );
+
+    // dest 侧确实是符号链接（而非被解引用复制成普通文件）
+    let dest_link_meta = fs::symlink_metadata(dest_dir.join("link.txt")).expect("stat dest link.txt");
+    assert!(dest_link_meta.file_type().is_symlink(), "dest link.txt 应为符号链接");
+
+    // 链接目标字符串与 src 一致
+    assert_eq!(
+        fs::read_link(src_dir.join("link.txt")).expect("read src link target"),
+        fs::read_link(dest_dir.join("link.txt")).expect("read dest link target"),
+    );
+
+    // 解引用读取 dest 的 symlink 也能拿到正确内容
+    assert_eq!(
+        fs::read(dest_dir.join("link.txt")).expect("read dest link.txt (deref)"),
+        b"symlink target content\n"
+    );
+}
+
+/// resume e2e：同步中途 kill Sender，验证被中断的大文件确实未完整落盘（避免"其实第一轮
+/// 就传完了"的假阳性），随后用相同 src/dest 重跑，断言最终 dest 与 src 完全一致。
+///
+/// 用 `--qos` 限速制造足够宽的中断窗口（内容参考
+/// `crates/cli/src/commands_enum.rs` 的 `--qos` 文档 + `parse_bandwidth_string`
+/// 支持到 KiB/s），避免 sleep+kill 的时序竞争导致测试 flaky。**必须同时用
+/// `--block-size` 把单次读取粒度调小**：data-mover 的
+/// `QosManager::acquire_bandwidth` 在单次请求的 cell 数超过 burst 容量时，
+/// `governor::until_n_ready` 会立即返回 `InsufficientCapacity` 且被静默忽略
+/// （见 `qos.rs::acquire_bandwidth` 的 `let _ = limiter.until_n_ready(n).await;`），
+/// 等效于该次请求完全不限速；默认 `block_size=2MiB` 换算成的 cell 数远超小带宽下的
+/// burst 容量，会导致限速形同虚设、大文件几乎瞬间传完，因此显式收窄
+/// `--block-size` 让单次 acquire 的 cell 数落在 burst 容量以内。
+///
+/// 双进程模式的字节级续传当前未接线（`disk_commit.rs::FileBegin` 硬编码
+/// `resume_prepare(..., false)`，归 #25 处置），故重跑是整文件重传而非"断点续传"，
+/// 但这正是本 issue 验收标准要求的范围："中断重跑后最终收敛"。
+#[test]
+fn test_remote_process_e2e_resume_after_sender_kill() {
+    let tmp = tempfile::tempdir().expect("create tempdir");
+    let tmp_path = tmp.path();
+
+    let src_dir = tmp_path.join("src");
+    let dest_dir = tmp_path.join("dest");
+    fs::create_dir_all(&src_dir).expect("create src dir");
+    fs::create_dir_all(&dest_dir).expect("create dest dir");
+    let mut rel_paths = populate_src_dir(&src_dir);
+
+    // 6MiB，配合 64KiB/s 限速 + 64KiB block-size（峰值倍率默认 2.0，burst=128KiB），
+    // 1s 内最多传约 128KiB，远不足以传完整个文件，中断窗口足够宽，不依赖精确时序。
+    const LARGE_FILE_SIZE: usize = 6 * 1024 * 1024;
+    let large_rel = PathBuf::from("resume_large.bin");
+    fs::write(src_dir.join(&large_rel), deterministic_bytes(LARGE_FILE_SIZE)).expect("write large src file");
+    rel_paths.push(large_rel.clone());
+
+    let cert_path = tmp_path.join("server.crt");
+    let config_path = tmp_path.join("config.toml");
+    fs::write(&config_path, "[database]\nenabled = false\n").expect("write config");
+    let fake_manifest_dir = tmp_path.join("fake_manifest");
+    let bin_path = cargo_bin("terrasync");
+
+    // ── 第一轮：限速 + 中途 kill Sender ──
+    let port = free_loopback_port();
+    let listen_addr = format!("127.0.0.1:{port}");
+    let mut receiver_child = StdCommand::new(&bin_path)
+        .env("CARGO_MANIFEST_DIR", &fake_manifest_dir)
+        .current_dir(tmp_path)
+        .arg("-c")
+        .arg(&config_path)
+        .arg("serve")
+        .arg("--listen")
+        .arg(&listen_addr)
+        .arg("--tls-cert-out")
+        .arg(&cert_path)
+        .arg(&dest_dir)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn receiver process");
+    wait_for_cert_file(&cert_path);
+
+    let mut sender_child = StdCommand::new(&bin_path)
+        .env("CARGO_MANIFEST_DIR", &fake_manifest_dir)
+        .current_dir(tmp_path)
+        .arg("-c")
+        .arg(&config_path)
+        .arg("sync")
+        .arg("--id")
+        .arg("remote_resume_interrupted")
+        .arg("--remote")
+        .arg(&listen_addr)
+        .arg("--tls-server-cert")
+        .arg(&cert_path)
+        .arg("--qos")
+        .arg("64KiB/s")
+        .arg("--block-size")
+        .arg("64KiB")
+        .arg(&src_dir)
+        .arg(&dest_dir)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn sender process");
+
+    std::thread::sleep(Duration::from_secs(1));
+
+    // 强制中断双方：不等待优雅关闭（那是 test_remote_process_e2e_receiver_killed_* 系列
+    // 关注的场景），这里只需要制造"中断后残留不完整状态"的前置条件。
+    let _ = sender_child.kill();
+    let _ = sender_child.wait();
+    let _ = receiver_child.kill();
+    let _ = receiver_child.wait();
+
+    // 确认真的被中断了：大文件走 .terrasync-part 临时文件流式写入，只有完整收到并通过
+    // hash 校验后才会原子 rename 成最终文件名（见 disk_commit.rs::finalize_file），
+    // 限速下 1s 远不够传完 6MiB，最终文件名此时必然不存在。
+    assert!(
+        !dest_dir.join(&large_rel).exists(),
+        "大文件在被中断的第一轮不应完整落盘——测试前提不成立（可能是限速/时序假设有误）"
+    );
+
+    // ── 第二轮：相同 src/dest 重跑（不限速，加快测试），应收敛到与 src 完全一致 ──
+    let port = free_loopback_port();
+    let listen_addr = format!("127.0.0.1:{port}");
+    fs::remove_file(&cert_path).expect("remove old cert");
+    let mut receiver_child = StdCommand::new(&bin_path)
+        .env("CARGO_MANIFEST_DIR", &fake_manifest_dir)
+        .current_dir(tmp_path)
+        .arg("-c")
+        .arg(&config_path)
+        .arg("serve")
+        .arg("--listen")
+        .arg(&listen_addr)
+        .arg("--tls-cert-out")
+        .arg(&cert_path)
+        .arg(&dest_dir)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn receiver process");
+    wait_for_cert_file(&cert_path);
+
+    let mut sender_cmd = AssertCommand::new(&bin_path);
+    sender_cmd
+        .env("CARGO_MANIFEST_DIR", &fake_manifest_dir)
+        .current_dir(tmp_path)
+        .arg("-c")
+        .arg(&config_path)
+        .arg("sync")
+        .arg("--id")
+        .arg("remote_resume_rerun")
+        .arg("--remote")
+        .arg(&listen_addr)
+        .arg("--tls-server-cert")
+        .arg(&cert_path)
+        .arg(&src_dir)
+        .arg(&dest_dir);
+    sender_cmd.assert().success();
+
+    let receiver_status = wait_for_child_exit(&mut receiver_child, RECEIVER_EXIT_TIMEOUT);
+    let (rout, rerr) = drain_output(&mut receiver_child);
+    assert!(
+        matches!(receiver_status, Some(s) if s.success()),
+        "重跑 Receiver 异常退出: {receiver_status:?}\nstdout:\n{rout}\nstderr:\n{rerr}"
+    );
+
+    assert_dest_matches_src(&src_dir, &dest_dir, &rel_paths);
+}
+
+/// transport 故障注入 e2e：同步中途 kill Receiver，Sender 必须在有限时间内检测到连接
+/// 异常并以非零码退出，不能无限期 hang（`quic::mux::reader_loop` 读流出错/EOF 时各自
+/// drop 手上的 `tx` clone，四条都 drop 后 `sender.recv()` 返回 `None`；Sender 主循环
+/// 据此判定连接已断，返回 Err 而非死等）。
+///
+/// 沿用 resume 测试同样的限速手法制造中断窗口，避免"其实传完了才杀"的假阳性。
+#[test]
+fn test_remote_process_e2e_receiver_killed_sender_exits_nonzero() {
+    let tmp = tempfile::tempdir().expect("create tempdir");
+    let tmp_path = tmp.path();
+
+    let src_dir = tmp_path.join("src");
+    let dest_dir = tmp_path.join("dest");
+    fs::create_dir_all(&src_dir).expect("create src dir");
+    fs::create_dir_all(&dest_dir).expect("create dest dir");
+    populate_src_dir(&src_dir);
+
+    const LARGE_FILE_SIZE: usize = 6 * 1024 * 1024;
+    fs::write(src_dir.join("large.bin"), deterministic_bytes(LARGE_FILE_SIZE)).expect("write large src file");
+
+    let cert_path = tmp_path.join("server.crt");
+    let config_path = tmp_path.join("config.toml");
+    fs::write(&config_path, "[database]\nenabled = false\n").expect("write config");
+    let fake_manifest_dir = tmp_path.join("fake_manifest");
+    let bin_path = cargo_bin("terrasync");
+
+    let port = free_loopback_port();
+    let listen_addr = format!("127.0.0.1:{port}");
+    let mut receiver_child = StdCommand::new(&bin_path)
+        .env("CARGO_MANIFEST_DIR", &fake_manifest_dir)
+        .current_dir(tmp_path)
+        .arg("-c")
+        .arg(&config_path)
+        .arg("serve")
+        .arg("--listen")
+        .arg(&listen_addr)
+        .arg("--tls-cert-out")
+        .arg(&cert_path)
+        .arg(&dest_dir)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn receiver process");
+    wait_for_cert_file(&cert_path);
+
+    let mut sender_child = StdCommand::new(&bin_path)
+        .env("CARGO_MANIFEST_DIR", &fake_manifest_dir)
+        .current_dir(tmp_path)
+        .arg("-c")
+        .arg(&config_path)
+        .arg("sync")
+        .arg("--id")
+        .arg("remote_receiver_killed")
+        .arg("--remote")
+        .arg(&listen_addr)
+        .arg("--tls-server-cert")
+        .arg(&cert_path)
+        .arg("--qos")
+        .arg("64KiB/s")
+        .arg("--block-size")
+        .arg("64KiB")
+        .arg(&src_dir)
+        .arg(&dest_dir)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn sender process");
+
+    std::thread::sleep(Duration::from_secs(1));
+
+    // 中途强杀 Receiver：不给它优雅关闭连接的机会
+    let _ = receiver_child.kill();
+    let _ = receiver_child.wait();
+
+    let sender_status = wait_for_child_exit(&mut sender_child, SENDER_EXIT_TIMEOUT);
+    let (sout, serr) = drain_output(&mut sender_child);
+    match sender_status {
+        Some(status) => assert!(
+            !status.success(),
+            "Receiver 被杀后 Sender 应以非零码退出，实际: {status:?}\nstdout:\n{sout}\nstderr:\n{serr}"
+        ),
+        None => panic!(
+            "Sender 在 Receiver 被杀后 {SENDER_EXIT_TIMEOUT:?} 内未自行退出（疑似 hang），已强制 kill。\n\
+             stdout:\n{sout}\nstderr:\n{serr}"
+        ),
+    }
+}
+
+/// uid/gid 保留 e2e：全量同步后 dest 各文件的 uid/gid 应与 src 一致。
+///
+/// 非 root 开发环境下无法 `chown` 出一个与当前运行用户不同的 uid/gid 去验证"跨用户
+/// 也能正确复制"，因此本测试断言退化为"dest uid/gid == src uid/gid"（两者都等于运行
+/// 该测试进程的 euid/egid）。即便如此，仍是有意义的真实断言：它验证的是
+/// `disk_commit.rs::finalize_file`／`DiskCommitMsg::CreateDir` 里
+/// `dest.set_entry_metadata(&entry)` 用的 `entry.uid`/`entry.gid` 确实来自源端 scan、
+/// 经 wire 传输后被正确应用到目标端（而不是被链路上的某一跳意外置零/丢弃/固定为其它
+/// 值）——这条链路一旦回归就会在此处失败。真正的"跨用户 chown"需要 root/CAP_CHOWN
+/// 权限的专用环境，超出本地开发环境可执行范围。
+#[test]
+fn test_remote_process_e2e_uid_gid_preserved() {
+    let tmp = tempfile::tempdir().expect("create tempdir");
+    let tmp_path = tmp.path();
+
+    let src_dir = tmp_path.join("src");
+    let dest_dir = tmp_path.join("dest");
+    fs::create_dir_all(&src_dir).expect("create src dir");
+    fs::create_dir_all(&dest_dir).expect("create dest dir");
+    let rel_paths = populate_src_dir(&src_dir);
+
+    let cert_path = tmp_path.join("server.crt");
+    let config_path = tmp_path.join("config.toml");
+    fs::write(&config_path, "[database]\nenabled = false\n").expect("write config");
+    let fake_manifest_dir = tmp_path.join("fake_manifest");
+
+    let port = free_loopback_port();
+    let listen_addr = format!("127.0.0.1:{port}");
+    let bin_path = cargo_bin("terrasync");
+
+    let mut receiver_child = StdCommand::new(&bin_path)
+        .env("CARGO_MANIFEST_DIR", &fake_manifest_dir)
+        .current_dir(tmp_path)
+        .arg("-c")
+        .arg(&config_path)
+        .arg("serve")
+        .arg("--listen")
+        .arg(&listen_addr)
+        .arg("--tls-cert-out")
+        .arg(&cert_path)
+        .arg(&dest_dir)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn receiver process");
+    wait_for_cert_file(&cert_path);
+
+    let mut sender_cmd = AssertCommand::new(&bin_path);
+    sender_cmd
+        .env("CARGO_MANIFEST_DIR", &fake_manifest_dir)
+        .current_dir(tmp_path)
+        .arg("-c")
+        .arg(&config_path)
+        .arg("sync")
+        .arg("--id")
+        .arg("remote_uid_gid_e2e")
+        .arg("--remote")
+        .arg(&listen_addr)
+        .arg("--tls-server-cert")
+        .arg(&cert_path)
+        .arg(&src_dir)
+        .arg(&dest_dir);
+    sender_cmd.assert().success();
+
+    let receiver_status = wait_for_child_exit(&mut receiver_child, RECEIVER_EXIT_TIMEOUT);
+    let (rout, rerr) = drain_output(&mut receiver_child);
+    assert!(
+        matches!(receiver_status, Some(s) if s.success()),
+        "Receiver 异常退出: {receiver_status:?}\nstdout:\n{rout}\nstderr:\n{rerr}"
+    );
+    assert_dest_matches_src(&src_dir, &dest_dir, &rel_paths);
+
+    for rel in &rel_paths {
+        let src_meta = fs::metadata(src_dir.join(rel)).unwrap_or_else(|e| panic!("stat src {rel:?}: {e}"));
+        let dest_meta = fs::metadata(dest_dir.join(rel)).unwrap_or_else(|e| panic!("stat dest {rel:?}: {e}"));
+        assert_eq!(
+            src_meta.uid(),
+            dest_meta.uid(),
+            "dest 文件 {rel:?} uid 应与 src 一致（非 root 环境下两者都应等于运行进程 uid）"
+        );
+        assert_eq!(
+            src_meta.gid(),
+            dest_meta.gid(),
+            "dest 文件 {rel:?} gid 应与 src 一致（非 root 环境下两者都应等于运行进程 gid）"
+        );
+    }
 }
