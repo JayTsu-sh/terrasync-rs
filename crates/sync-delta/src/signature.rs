@@ -121,4 +121,95 @@ mod tests {
             assert_eq!(a.strong, b.strong);
         }
     }
+
+    /// 逐字段比对两组签名，`BlockSignature` 未 derive `PartialEq`，测试内手工比较
+    fn assert_signatures_eq(streamed: &[BlockSignature], whole: &[BlockSignature]) {
+        assert_eq!(streamed.len(), whole.len());
+        for (a, b) in streamed.iter().zip(whole.iter()) {
+            assert_eq!(a.rolling, b.rolling);
+            assert_eq!(a.strong, b.strong);
+        }
+    }
+
+    // ── 跨 chunk 边界等价性测试：push/finish 增量状态机 vs compute_block_signatures
+    //    整块函数，任意分片方式下输出必须逐字节等价 ──
+
+    #[test]
+    fn test_push_finish_matches_whole_when_chunk_boundary_aligns_with_block_boundary() {
+        let data: Vec<u8> = (0..40u8).collect();
+        let block_size = 8; // chunk 大小与 block_size 相同，边界完全对齐
+        let mut calc = SignatureCalculator::new(block_size);
+        for chunk in data.chunks(8) {
+            calc.push(chunk);
+        }
+        assert_signatures_eq(&calc.finish(), &compute_block_signatures(&data, block_size));
+    }
+
+    #[test]
+    fn test_push_finish_matches_whole_when_chunk_spans_multiple_blocks() {
+        let data: Vec<u8> = (0..37u8).collect();
+        let block_size = 5; // chunk 大小 12，不与 block_size 对齐，跨越多个 block 边界
+        let mut calc = SignatureCalculator::new(block_size);
+        for chunk in data.chunks(12) {
+            calc.push(chunk);
+        }
+        assert_signatures_eq(&calc.finish(), &compute_block_signatures(&data, block_size));
+    }
+
+    #[test]
+    fn test_push_finish_matches_whole_when_chunk_smaller_than_block() {
+        let data: Vec<u8> = (0..23u8).collect();
+        let block_size = 7; // chunk 大小 1，逐字节喂入，远小于 block_size
+        let mut calc = SignatureCalculator::new(block_size);
+        for byte in &data {
+            calc.push(std::slice::from_ref(byte));
+        }
+        assert_signatures_eq(&calc.finish(), &compute_block_signatures(&data, block_size));
+    }
+
+    #[test]
+    fn test_push_finish_many_small_pushes() {
+        // 多次小块 push（1000 次 3 字节）累计跨越远超单个 block 的总长度
+        let data: Vec<u8> = (0..=255u8).cycle().take(1000).collect();
+        let block_size = 64;
+        let mut calc = SignatureCalculator::new(block_size);
+        for chunk in data.chunks(3) {
+            calc.push(chunk);
+        }
+        assert_signatures_eq(&calc.finish(), &compute_block_signatures(&data, block_size));
+    }
+
+    #[test]
+    fn test_push_finish_empty_file() {
+        let mut calc = SignatureCalculator::new(1024);
+        assert!(calc.finish().is_empty());
+    }
+
+    #[test]
+    fn test_push_finish_single_byte() {
+        let data = [0x42u8];
+        let block_size = 10;
+        let mut calc = SignatureCalculator::new(block_size);
+        calc.push(&data);
+        let streamed = calc.finish();
+        assert_eq!(streamed.len(), 1);
+        assert_signatures_eq(&streamed, &compute_block_signatures(&data, block_size));
+    }
+
+    /// 构造性证明：staging buffer 容量恒为 O(block_size)，不随 push 调用次数增长
+    #[test]
+    fn test_staging_buffer_capacity_bounded_by_block_size_regardless_of_push_count() {
+        let block_size: u32 = 16;
+        let mut calc = SignatureCalculator::new(block_size);
+        for _ in 0..1000 {
+            calc.push(&[1u8, 2, 3]);
+            assert!(
+                calc.buffer.capacity() <= block_size as usize,
+                "staging buffer capacity {} exceeded block_size {}",
+                calc.buffer.capacity(),
+                block_size
+            );
+        }
+        let _ = calc.finish();
+    }
 }

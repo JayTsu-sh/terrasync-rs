@@ -65,10 +65,10 @@ delta 路径当前 4 个整文件缓冲点之一：Receiver 为 `DeltaTransferRe
 - ✅ 步骤 1：`sync-delta/src/signature.rs` 实现 `SignatureCalculator`（`new`/`push`/
   `finish`，staging buffer 容量恒为 `block_size`），`compute_block_signatures` 改写为
   薄封装。验证：`cargo test -p sync-delta`（现有 25 测零改动全绿）。
-- ⬜ 步骤 2：`sync-delta/src/signature.rs` 新增跨 chunk 边界等价性测试（对齐边界/跨
+- ✅ 步骤 2：`sync-delta/src/signature.rs` 新增跨 chunk 边界等价性测试（对齐边界/跨
   block 的 chunk/小于 block_size 的 chunk/多次小块 push/空文件/单字节，逐字段比对
   streamed vs whole-buffer 输出）+ staging buffer 容量上界断言测试。验证：
-  `cargo test -p sync-delta`。
+  `cargo test -p sync-delta`（32 测全绿：原 25 + 新 7）。
 - ⬜ 步骤 3：`crates/app/src/receiver.rs` `TransferDecision::DeltaTransfer` 分支改用
   `StorageEnum::read_chunk_stream` 驱动 `SignatureCalculator` 逐块喂入，替换
   `read_file_from` 整读；错误路径保持"降级全量传输"语义不变。验证：
