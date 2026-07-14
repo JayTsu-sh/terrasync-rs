@@ -62,7 +62,7 @@ delta 路径当前 4 个整文件缓冲点之一：Receiver 为 `DeltaTransferRe
 ## 执行步骤
 
 - ✅ 步骤 0：立计划，commit（本文件）。
-- ⬜ 步骤 1：`sync-delta/src/signature.rs` 实现 `SignatureCalculator`（`new`/`push`/
+- ✅ 步骤 1：`sync-delta/src/signature.rs` 实现 `SignatureCalculator`（`new`/`push`/
   `finish`，staging buffer 容量恒为 `block_size`），`compute_block_signatures` 改写为
   薄封装。验证：`cargo test -p sync-delta`（现有 25 测零改动全绿）。
 - ⬜ 步骤 2：`sync-delta/src/signature.rs` 新增跨 chunk 边界等价性测试（对齐边界/跨
