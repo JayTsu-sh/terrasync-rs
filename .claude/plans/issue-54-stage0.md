@@ -74,6 +74,6 @@
   `--delta-size-threshold` 设为小于修改文件大小的值，断言 dest 内容仍正确 + Receiver 日志
   出现 size 降级 info 行（非侵入式证据，同 `assert_delta_negotiated_in_log` 风格）。
   验证：`cargo test --test remote_process_e2e -- delta_size_threshold`（连跑 2 次）
-- ⬜ step 8: 收尾核验 —— `cargo fmt --all -- --check`；
+- ✅ step 8: 收尾核验 —— `cargo fmt --all -- --check`；
   `cargo test --workspace --no-fail-fast`；`cargo test --test remote_process_e2e`（8→9 项，
   连跑 2 次）；`git status` 无越界文件；移除本 plan 文件。
