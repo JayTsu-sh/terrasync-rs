@@ -42,7 +42,7 @@ hash 计算之前，hash 自洽通过，拦不住）以及 `enable_integrity_che
 
 - ✅ 步骤 0：`cargo update -p data-mover`，确认 `Cargo.lock` data-mover rev = `bb8b60b`，
   nfs-rs rev 不变（`de1e0e4`）。单独 commit。
-- ⬜ 步骤 1：`transport::message` 新增 `FileOutcome::SizeMismatch` variant + doc 注释；
+- ✅ 步骤 1：`transport::message` 新增 `FileOutcome::SizeMismatch` variant + doc 注释；
   `app/receiver.rs::decide_file_ack` 提取 `redo_or_error` helper 并接入新 variant
   （首次 Redo、二次 Error，与 HashMismatch 语义一致）。定向验证：
   `cargo check -p transport -p app`。

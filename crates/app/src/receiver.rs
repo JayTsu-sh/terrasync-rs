@@ -914,31 +914,37 @@ async fn recv_file_list_and_data_phase(
 ///
 /// dc task（全量路径）与 `handle_end_of_file`（delta inline 路径）上报的 outcome
 /// 在此统一转换为终态/重试 ack：
-/// - 校验失败（`HashMismatch`）·首次 → `Redo{ndx}`，不计入 `completed_count`（文件仍在途）。
-/// - 校验失败·二次+ → `Error{ndx,"hash mismatch"}`，计入 `completed_count`。
+/// - 校验失败（`HashMismatch`/`SizeMismatch`）·首次 → `Redo{ndx}`，不计入
+///   `completed_count`（文件仍在途）。
+/// - 校验失败·二次+ → `Error{ndx,reason}`，计入 `completed_count`。
 /// - 校验通过（`Success`）→ `Success{ndx}`，计入 `completed_count`。
-/// - 硬错误（`HardError`，非 hash 类）→ 直接 `Error{ndx,reason}` 终态，不 redo。
+/// - 硬错误（`HardError`，非校验类）→ 直接 `Error{ndx,reason}` 终态，不 redo。
 ///
 /// 返回 `(ack, is_terminal)`：`is_terminal=true` 时调用方需计入 `completed_count`。
 fn decide_file_ack(attempts: &mut HashMap<i32, u8>, ndx: i32, outcome: FileOutcome) -> (ReceiverMsg, bool) {
     match outcome {
         FileOutcome::Success => (ReceiverMsg::Success { ndx }, true),
-        FileOutcome::HashMismatch => {
-            let count = attempts.entry(ndx).or_insert(0);
-            *count += 1;
-            if *count >= 2 {
-                (
-                    ReceiverMsg::Error {
-                        ndx,
-                        reason: "hash mismatch".into(),
-                    },
-                    true,
-                )
-            } else {
-                (ReceiverMsg::Redo { ndx }, false)
-            }
-        }
+        FileOutcome::HashMismatch => redo_or_error(attempts, ndx, "hash mismatch"),
+        FileOutcome::SizeMismatch => redo_or_error(attempts, ndx, "size mismatch"),
         FileOutcome::HardError(reason) => (ReceiverMsg::Error { ndx, reason }, true),
+    }
+}
+
+/// 校验失败类 outcome（`HashMismatch`/`SizeMismatch`）共用的重试计数：同一 ndx 首次 →
+/// `Redo{ndx}`，二次+ → `Error{ndx,reason}` 终态。
+fn redo_or_error(attempts: &mut HashMap<i32, u8>, ndx: i32, reason: &str) -> (ReceiverMsg, bool) {
+    let count = attempts.entry(ndx).or_insert(0);
+    *count += 1;
+    if *count >= 2 {
+        (
+            ReceiverMsg::Error {
+                ndx,
+                reason: reason.into(),
+            },
+            true,
+        )
+    } else {
+        (ReceiverMsg::Redo { ndx }, false)
     }
 }
 
