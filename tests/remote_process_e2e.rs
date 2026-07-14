@@ -602,6 +602,96 @@ fn test_remote_process_e2e_large_multi_chunk_file_mux() {
     assert_dest_matches_src(&src_dir, &dest_dir, &rel_paths);
 }
 
+/// 应用层字节 credit 流控端到端验证（issue #59）：源目录含一个 80MiB 大文件，超过
+/// Sender 侧默认 credit 窗口（`DEFAULT_CREDIT_WINDOW_BYTES` = 64MiB），全量同步必须至少
+/// 经历一次「credit 耗尽 → 等待 Receiver `CreditGrant` → 解除阻塞继续发送」的真实
+/// pending→grant 周期才能完成——用真实双进程（而非同进程 mock）验证这条链路不会死锁、
+/// 不会超时，且开启 `--enable-integrity-check`（BLAKE3 端到端校验）确保数据经过 credit
+/// 流控后仍然完整无损（逐字节比对 + hash 双重验证）。
+#[test]
+fn test_remote_process_e2e_credit_window_large_file_no_deadlock() {
+    let tmp = tempfile::tempdir().expect("create tempdir");
+    let tmp_path = tmp.path();
+
+    let src_dir = tmp_path.join("src");
+    let dest_dir = tmp_path.join("dest");
+    fs::create_dir_all(&src_dir).expect("create src dir");
+    fs::create_dir_all(&dest_dir).expect("create dest dir");
+    let mut rel_paths = populate_src_dir(&src_dir);
+
+    // 80MiB > 64MiB 默认 credit 窗口：全量传输过程中 Sender 必然至少耗尽一次窗口，
+    // 依赖 Receiver 半窗批量 CreditGrant 才能继续，是本测试要验证的核心路径。
+    const LARGE_FILE_SIZE: usize = 80 * 1024 * 1024;
+    let large_rel = PathBuf::from("credit_window_large.bin");
+    fs::write(src_dir.join(&large_rel), deterministic_bytes(LARGE_FILE_SIZE)).expect("write large src file");
+    rel_paths.push(large_rel);
+
+    let cert_path = tmp_path.join("server.crt");
+    let config_path = tmp_path.join("config.toml");
+    fs::write(&config_path, "[database]\nenabled = false\n").expect("write config");
+    let fake_manifest_dir = tmp_path.join("fake_manifest");
+
+    let port = free_loopback_port();
+    let listen_addr = format!("127.0.0.1:{port}");
+    let bin_path = cargo_bin("terrasync");
+
+    let mut receiver_child = StdCommand::new(&bin_path)
+        .env("CARGO_MANIFEST_DIR", &fake_manifest_dir)
+        .current_dir(tmp_path)
+        .arg("-c")
+        .arg(&config_path)
+        .arg("serve")
+        .arg("--listen")
+        .arg(&listen_addr)
+        .arg("--tls-cert-out")
+        .arg(&cert_path)
+        .arg(&dest_dir)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn receiver process");
+
+    wait_for_cert_file(&cert_path);
+
+    let mut sender_cmd = AssertCommand::new(&bin_path);
+    sender_cmd
+        .env("CARGO_MANIFEST_DIR", &fake_manifest_dir)
+        .current_dir(tmp_path)
+        .arg("-c")
+        .arg(&config_path)
+        .arg("sync")
+        .arg("--id")
+        .arg("remote_e2e_credit_window_large_file")
+        .arg("--remote")
+        .arg(&listen_addr)
+        .arg("--tls-server-cert")
+        .arg(&cert_path)
+        .arg("--enable-integrity-check")
+        .arg(&src_dir)
+        .arg(&dest_dir);
+
+    // 退出码必须为 0：若 credit 记账有死锁/泄漏 bug，Sender 会挂在 send() 里直到测试
+    // 超时（assert_cmd 默认无超时，但外层 CI/harness 超时会让本用例明确失败，而不是
+    // 静默通过），不会得到 success() 断言通过的结果。
+    sender_cmd.assert().success();
+
+    let receiver_status = wait_for_child_exit(&mut receiver_child, RECEIVER_EXIT_TIMEOUT);
+    let (receiver_stdout, receiver_stderr) = drain_output(&mut receiver_child);
+    match receiver_status {
+        Some(status) => assert!(
+            status.success(),
+            "Receiver 进程异常退出: {status:?}\nstdout:\n{receiver_stdout}\nstderr:\n{receiver_stderr}"
+        ),
+        None => panic!(
+            "Receiver 进程在 {RECEIVER_EXIT_TIMEOUT:?} 内未自行退出（credit 记账若死锁会卡在这里），已强制 kill。\n\
+             stdout:\n{receiver_stdout}\nstderr:\n{receiver_stderr}"
+        ),
+    }
+
+    // 逐字节比对（含 80MiB 大文件）：credit 流控挂起/恢复的过程中数据没有丢失/错位/重复
+    assert_dest_matches_src(&src_dir, &dest_dir, &rel_paths);
+}
+
 /// `--delete-target`（issue #23）默认关闭：目标端存在但源端已不存在的文件应保留。
 #[test]
 fn test_remote_process_e2e_without_delete_target_keeps_orphan() {

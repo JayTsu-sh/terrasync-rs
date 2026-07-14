@@ -68,11 +68,27 @@ bump 到 v5）。
   `FileData`/`DeltaData` 分支累计消费并在达阈值时发 `CreditGrant`。
 - ✅ 步骤 6：`crates/transport/tests/quic_roundtrip.rs` —— 既有 8MiB flood 测试加注释确认
   量级 < 64MiB 默认窗口，语义不变质。
-- 🔄 步骤 7：`tests/remote_process_e2e.rs` —— 新增真实双进程 e2e：源目录含 >64MiB 大文件，
+- ✅ 步骤 7：`tests/remote_process_e2e.rs` —— 新增真实双进程 e2e：源目录含 >64MiB 大文件，
   `--enable-integrity-check`，断言同步成功、dest 与 src 字节一致、无死锁超时。
 - ⬜ 步骤 8：收尾 —— `cargo fmt`、`cargo test -p transport --features quic`、
   `cargo test -p app`、`cargo test -p terrasync-rs --test remote_process_e2e`（连跑 2 次）、
   `cargo test --workspace --no-fail-fast`，确认 `git status` 无越界文件，移除本计划文件。
+
+## e2e 测试发现并修复的死锁（步骤 7）
+
+真实双进程 e2e（80MiB 文件，超默认 64MiB credit 窗口）跑出真实死锁：Sender 侧唯一的
+`recv()` 消费者（`process_requests_and_acks`）与 `send()` 严格顺序运行在同一个任务里
+（内联调用 `handle_full_transfer` 发 `FileData`），不是两个并发协程。最初实现把
+`CreditGrant` 的过滤/补授放在 `QuicSenderTransport::recv()` 内部——当 `send()` 卡在
+`credit.acquire()` 等待补授时，这个任务没有机会转回去 `recv()`，永久锁死自己。
+
+修复：把 credit-grant 过滤下沉到 `connect_with_credit_window` 内部一个独立后台
+`tokio::spawn` task，从 `mux::sender_setup` 返回的原始 `incoming_rx` 里过滤
+`CreditGrant`（就地 `credit.grant()`）、转发其余消息到一个新 channel 供
+`QuicSenderTransport::recv()` 读取。该 task 完全独立于调用方是否在调 `recv()`，
+彻底消除死锁。`CreditWindow` 相应改为 `Arc<CreditWindow>`（后台 task 需要持有引用）。
+`sender.rs` 的两个真实 QUIC 单测同步简化：去掉手工 spawn 的 "drain recv()" task
+（此前用来掩盖这个设计缺陷），现在这两个单测本身就是死锁的直接回归测试。
 
 ## 关键设计决策记录（防实现漂移）
 

@@ -2,12 +2,13 @@
 
 // 标准库
 use std::net::SocketAddr;
+use std::sync::Arc;
 
 // 外部 crate
 use async_trait::async_trait;
 use rustls::pki_types::CertificateDer;
 use tokio::sync::Mutex;
-use tokio::sync::mpsc::UnboundedReceiver;
+use tokio::sync::mpsc::{self, UnboundedReceiver};
 use tokio::task::JoinHandle;
 use tracing::info;
 
@@ -25,14 +26,20 @@ use crate::traits::SenderTransport;
 /// 数据 / ack+进度，见 `quic::mux`），大文件数据流不再阻塞 progress/ack 等控制消息：
 /// - `send()` 按 `SenderMsg` variant 路由到对应物理 stream；Data 类消息（`credit_cost`
 ///   命中）发送前先扣减应用层 credit（见 `quic::credit`），不足则挂起等待 Receiver 授信
-/// - `recv()` 从统一的 fan-in channel 读取（各 stream 由独立后台 task 读帧后转发进来），
-///   拦截 `ReceiverMsg::CreditGrant` 就地补充 credit，不透传给上层调用方
+/// - `recv()` 从**已过滤掉 `CreditGrant`** 的 channel 读取，不会看到该 variant
+///
+/// `CreditGrant` 的过滤/补授不放在 `recv()` 里（见 `connect_with_credit_window` 文档
+/// 「credit-grant 过滤 task」小节）：真实调用方（`process_requests_and_acks`）是唯一的
+/// `recv()` 消费者，且在同一个循环里内联调用 `send()` 处理请求——若 `send()` 卡在
+/// `credit.acquire()` 里，这个任务就没有机会转回去 `recv()` 读到解锁自己的 `CreditGrant`，
+/// 会自己把自己锁死（两个真实子进程联调 `tests/remote_process_e2e.rs` 大文件用例时
+/// 实际触发过：Sender 单任务的 send/recv 是严格顺序的，不是两个并发协程）。
 pub struct QuicSenderTransport {
     conn: quinn::Connection,
     send_streams: Vec<Mutex<mux::StreamSlot>>,
     incoming_rx: Mutex<UnboundedReceiver<ReceiverMsg>>,
     reader_tasks: Vec<JoinHandle<()>>,
-    credit: CreditWindow,
+    credit: Arc<CreditWindow>,
 }
 
 impl Drop for QuicSenderTransport {
@@ -59,6 +66,16 @@ pub async fn connect(
 /// 测试注入口：用自定义 credit 窗口大小建立连接（生产路径固定走 [`connect`]）。
 /// 仅供 crate 内测试触发 credit 窗口耗尽/授信解阻塞路径，不对外暴露——v1 不提供配置项
 /// （见 `quic::credit` 模块文档）。
+///
+/// ## credit-grant 过滤 task
+///
+/// `mux::sender_setup` 返回的 `incoming_rx` 混杂了全部 4 类 `ReceiverMsg`（含
+/// `CreditGrant`），这里立即 spawn 一个独立后台 task 把它接管：`CreditGrant` 就地
+/// `credit.grant()` 消费掉，其余消息转发进一个新的 channel 交给 `QuicSenderTransport::
+/// recv()`（`send()` 看不到、也不需要看到 `CreditGrant`）。这个 task 完全独立于任何
+/// 调用方是否在调 `recv()`——`send()` 挂在 `credit.acquire()` 里等待补授时，正是靠这个
+/// 后台 task 持续读 AckProgress 物理 stream 才能收到并应用 grant，不依赖调用方主动
+/// 转回来 `recv()`（该假设在真实 Sender 主循环里不成立，见结构体文档）。
 pub(crate) async fn connect_with_credit_window(
     addr: SocketAddr, server_name: &str, server_cert: Option<CertificateDer<'static>>, window_bytes: u64,
 ) -> Result<QuicSenderTransport> {
@@ -92,14 +109,32 @@ pub(crate) async fn connect_with_credit_window(
 
     info!("[QUIC Sender] Connected to {}", addr);
 
-    let (send_streams, incoming_rx, reader_tasks) = mux::sender_setup(&conn).await?;
+    let (send_streams, mut raw_incoming_rx, mut reader_tasks) = mux::sender_setup(&conn).await?;
+    let credit = Arc::new(CreditWindow::new(window_bytes));
+
+    // credit-grant 过滤 task：见本函数文档。独立于调用方是否在调 recv()，持续把
+    // CreditGrant 应用到 credit 上，其余消息转发给真正暴露给调用方的 channel。
+    let (app_tx, app_rx) = mpsc::unbounded_channel::<ReceiverMsg>();
+    let filter_credit = credit.clone();
+    reader_tasks.push(tokio::spawn(async move {
+        while let Some(msg) = raw_incoming_rx.recv().await {
+            match msg {
+                ReceiverMsg::CreditGrant { bytes, .. } => filter_credit.grant(bytes),
+                other => {
+                    if app_tx.send(other).is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+    }));
 
     Ok(QuicSenderTransport {
         conn,
         send_streams,
-        incoming_rx: Mutex::new(incoming_rx),
+        incoming_rx: Mutex::new(app_rx),
         reader_tasks,
-        credit: CreditWindow::new(window_bytes),
+        credit,
     })
 }
 
@@ -115,14 +150,7 @@ impl SenderTransport for QuicSenderTransport {
 
     async fn recv(&self) -> Option<ReceiverMsg> {
         let mut rx = self.incoming_rx.lock().await;
-        loop {
-            match rx.recv().await? {
-                ReceiverMsg::CreditGrant { bytes, .. } => {
-                    self.credit.grant(bytes);
-                }
-                other => return Some(other),
-            }
-        }
+        rx.recv().await
     }
 
     async fn close(&self) -> Result<()> {
@@ -190,6 +218,11 @@ mod tests {
 
     /// 真实 QUIC：credit 窗口耗尽后 `send()` 应挂起，直到收到 `ReceiverMsg::CreditGrant`
     /// 补授足够字节才解除阻塞——这是"背压真传导回 Sender 应用层"的直接证据。
+    ///
+    /// 关键：测试期间**不**并发调用 `sender.recv()`（真实 Sender 主循环 `process_requests_
+    /// and_acks` 是唯一的 recv() 消费者，且与 send() 严格顺序执行在同一个任务里，没有
+    /// 另一个协程替它并发 recv()）——若 grant 的应用依赖调用方主动调 recv() 才生效，这里
+    /// 就会永久挂死，是死锁的直接回归测试（两个真实子进程联调大文件用例时实际触发过）。
     #[tokio::test]
     async fn send_blocks_on_exhausted_credit_until_grant_unblocks() {
         install_crypto_provider();
@@ -246,11 +279,6 @@ mod tests {
                 .unwrap(),
         );
 
-        // 后台持续 drain Sender 的 incoming channel：CreditGrant 只在 recv() 内部被拦截
-        // 生效，生产路径由 remote_sync.rs 的主循环持续调用 recv() 驱动，这里用后台 task 模拟。
-        let drain_sender = sender.clone();
-        let drain_handle = tokio::spawn(async move { while drain_sender.recv().await.is_some() {} });
-
         let entry = dummy_file_entry("big.bin");
         let chunk1 = DataChunk {
             offset: 0,
@@ -285,7 +313,6 @@ mod tests {
             .unwrap();
 
         receiver_handle.await.unwrap();
-        drain_handle.abort();
         sender.close().await.unwrap();
     }
 
@@ -331,8 +358,6 @@ mod tests {
                 .await
                 .unwrap(),
         );
-        let drain_sender = sender.clone();
-        let drain_handle = tokio::spawn(async move { while drain_sender.recv().await.is_some() {} });
 
         let entry = dummy_file_entry("big.bin");
         let chunk1 = DataChunk {
@@ -380,7 +405,6 @@ mod tests {
 
         receiver_handle.await.unwrap();
         stuck_send.abort();
-        drain_handle.abort();
         sender.close().await.unwrap();
     }
 }
