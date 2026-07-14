@@ -58,22 +58,17 @@ v1/v2 已被覆盖，不采用。
 ## 执行步骤
 
 - ✅ step 0：立计划（本文件），commit。
-- ⬜ step 1：`error.rs` 删除 `AppError::RemoteSyncFailed`；`remote_sync.rs::finalize_run_result`
-  改为恒 `Ok(())`（保留 error_count>0 时的 warn 日志）；更新受影响的既有单测断言
-  （`finalize_run_result_*` 及所有 `match finalize_run_result(...) { Err(RemoteSyncFailed...) }`
-  断言点，改为 `assert!(...is_ok())`）。
-  验证：`cargo check -p app`；`cargo test -p app finalize_run_result` +
-  `cargo test -p app --lib remote_sync::tests`。
-- ⬜ step 2：`remote_sync.rs` 新增 `entry_error_stats_message` helper + 单测；
-  `count_ndx_error` 改为返回 `bool`；4 个调用点（TransferRequest 自检失败、
-  DeltaTransferRequest 自检失败、`ReceiverMsg::EntryError`、`ReceiverMsg::Error{ndx}`）
-  补喂 `stats_consumer`；`ReceiverMsg::Error{ndx}` 处补 ndx_table 路径查找 + 合成路径兜底。
-  增强既有 pipeline 测试（`full_transfer_source_read_failure_bumps_error_count`、
-  `delta_transfer_source_read_failure_completes_ndx_without_hang`、
-  `full_transfer_redo_second_mismatch_errors`、`same_ndx_double_failure_does_not_drop_inflight_files`）
-  暴露/断言 `ErrorStats`（`run_pipeline_with_disruption` 返回值需带上 `stats_consumer`）。
-  验证：`cargo check -p app`；`cargo test -p app --lib remote_sync::tests`。
-- ⬜ step 3：`sender.rs` walkdir `Error` 分支补广播（`ref` 绑定 + `broadcaster.broadcast(msg.clone())`）；
+- ✅ step 1+2（合并执行，两者测试相互依赖，分开提交会导致中间态测试失败）：
+  `error.rs` 删除 `AppError::RemoteSyncFailed`；`remote_sync.rs::finalize_run_result`
+  改为恒 `Ok(())`（保留 error_count>0 时的 warn 日志）；更新受影响的既有单测断言；
+  新增 `entry_error_stats_message` helper + 单测；`count_ndx_error` 改为返回 `bool`；
+  4 个调用点（TransferRequest 自检失败、DeltaTransferRequest 自检失败、
+  `ReceiverMsg::EntryError`、`ReceiverMsg::Error{ndx}`）补喂 `stats_consumer`；
+  `ReceiverMsg::Error{ndx}` 处补 ndx_table 路径查找 + 合成路径兜底；增强既有 pipeline
+  测试暴露/断言 `ErrorStats`（`run_pipeline_with_disruption` 返回值带上 `stats_consumer`）。
+  验证：`cargo check -p app --tests` 通过；`cargo test -p app --lib` 69 passed 0 failed；
+  `cargo fmt -p app` 无额外改动。
+- 🔄 step 3：`sender.rs` walkdir `Error` 分支补广播（`ref` 绑定 + `broadcaster.broadcast(msg.clone())`）；
   `sender_worker` 签名新增 `broadcaster: &BroadcastForwarder<StorageEntryMessage>` 参数；
   `orchestrator.rs` L513 起 sender worker spawn 循环内 `let bc = broadcaster.clone();` +
   传参；新增 `sender.rs` 单测验证广播。

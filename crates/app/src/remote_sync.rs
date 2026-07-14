@@ -11,7 +11,7 @@
 
 use std::collections::HashSet;
 use std::net::SocketAddr;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex, PoisonError};
 
@@ -19,7 +19,8 @@ use data_mover::dir_tree::NdxEvent;
 use data_mover::filter::parse_filter_expression;
 use data_mover::qos::QosManager;
 use data_mover::{
-    ChangeKind, ConsistencyCheck, EntryEnum, StorageEntryMessage, StorageEnum, WalkDirAsyncIterator2, create_storage,
+    ChangeKind, ConsistencyCheck, EntryEnum, ErrorEvent, StorageEntryMessage, StorageEnum, WalkDirAsyncIterator2,
+    create_storage,
 };
 use rustls::pki_types::CertificateDer;
 use tokio::sync::Mutex as AsyncMutex;
@@ -162,13 +163,18 @@ pub(crate) async fn run(
     finalize_run_result(error_count)
 }
 
-/// `error_count>0` 时返回具名错误，使 `main.rs` 的 `exit(1)` 生效；否则 `Ok(())`。
+/// 双进程模式下 entry 级失败（部分或全部）不再影响进程退出码——与单进程语义对齐，
+/// 改由终态报表 ERROR STATISTICS 与 HTTP 回调 `error_count` 承载（报表驱动，见 issue
+/// #57 spec v3）。保留该函数与 `error_count>0` 时的日志，调用方（`run()`）结构不变。
 ///
 /// ndx 级 redo 二次失败（`ReceiverMsg::Error`）与 Entry 级失败（`EntryError`）都计入
-/// `error_count`，任一存在都视为本次同步未完全成功。
+/// `error_count`，任一存在都会记录日志，但不再使 `main.rs` 的 `exit(1)` 生效。
 fn finalize_run_result(error_count: u64) -> Result<()> {
     if error_count > 0 {
-        return Err(AppError::RemoteSyncFailed { errors: error_count });
+        warn!(
+            "[Sender Remote] {} entry-level error(s) occurred; see ERROR STATISTICS report (exit code unaffected)",
+            error_count
+        );
     }
     Ok(())
 }
@@ -322,9 +328,16 @@ async fn process_requests_and_acks(
                         stats_consumer.lock().await.update_statistics(&msg);
                     }
                     // 源读/符号链接读失败：Sender 已发 EntryError 通知 Receiver 完成该
-                    // ndx，这里自增 error_count（Sender 自检失败由 Sender 自己计数，见 [0][3]）
-                    if !handle_full_transfer(transport, src_storage, &entry, ndx, qos, enable_acl).await? {
-                        count_ndx_error(&mut errored_ndx, ndx, &mut error_count);
+                    // ndx，这里自增 error_count（Sender 自检失败由 Sender 自己计数，见 [0][3]）；
+                    // 同时喂入 ErrorStats，使报表如实反映该失败（issue #57）
+                    if !handle_full_transfer(transport, src_storage, &entry, ndx, qos, enable_acl).await?
+                        && count_ndx_error(&mut errored_ndx, ndx, &mut error_count)
+                    {
+                        let msg = entry_error_stats_message(
+                            entry.get_relative_path().to_path_buf(),
+                            format!("source read failed for ndx {ndx}"),
+                        );
+                        stats_consumer.lock().await.update_statistics(&msg);
                     }
                     transfer_count += 1;
                 } else {
@@ -353,7 +366,8 @@ async fn process_requests_and_acks(
                             kind: ChangeKind::DataOnly,
                         });
                     // delta: 仅 src 读取成功时计入传输数（与原逻辑保持一致）；读取失败已发
-                    // EntryError 通知 Receiver 完成该 ndx，这里自增 error_count（见 [2]）
+                    // EntryError 通知 Receiver 完成该 ndx，这里自增 error_count（见 [2]）；
+                    // 同时喂入 ErrorStats，使报表如实反映该失败（issue #57）
                     if handle_delta_transfer(
                         transport,
                         src_storage,
@@ -367,8 +381,12 @@ async fn process_requests_and_acks(
                     .await?
                     {
                         transfer_count += 1;
-                    } else {
-                        count_ndx_error(&mut errored_ndx, ndx, &mut error_count);
+                    } else if count_ndx_error(&mut errored_ndx, ndx, &mut error_count) {
+                        let msg = entry_error_stats_message(
+                            entry.get_relative_path().to_path_buf(),
+                            format!("delta source read failed for ndx {ndx}"),
+                        );
+                        stats_consumer.lock().await.update_statistics(&msg);
                     }
                 } else {
                     error!("[Sender Remote] Unknown NDX {} for delta", ndx);
@@ -445,17 +463,27 @@ async fn process_requests_and_acks(
                 );
             }
             Some(ReceiverMsg::EntryError { entry, reason }) => {
-                error!(
-                    "[Sender Remote] Entry failed {:?}: {}",
-                    entry.get_relative_path(),
-                    reason
-                );
+                let path = entry.get_relative_path().to_path_buf();
+                error!("[Sender Remote] Entry failed {:?}: {}", path, reason);
                 error_count += 1;
+                let msg = entry_error_stats_message(path, reason);
+                stats_consumer.lock().await.update_statistics(&msg);
             }
             // ── ndx 级文件传输终态失败（redo 二次失败）：与 EntryError 共用同一个 error_count ──
             Some(ReceiverMsg::Error { ndx, reason }) => {
                 error!("[Sender Remote] NDX {} failed: {}", ndx, reason);
-                count_ndx_error(&mut errored_ndx, ndx, &mut error_count);
+                if count_ndx_error(&mut errored_ndx, ndx, &mut error_count) {
+                    // ndx_table 查不到 entry 时（理论上不应发生，Sender 自己分配的 ndx）
+                    // 用合成路径兜底，确保该失败仍能计入 ErrorStats（issue #57）
+                    let path = ndx_table
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .get(ndx)
+                        .map(|entry| entry.get_relative_path().to_path_buf())
+                        .unwrap_or_else(|| PathBuf::from(format!("<ndx-{ndx}>")));
+                    let msg = entry_error_stats_message(path, reason);
+                    stats_consumer.lock().await.update_statistics(&msg);
+                }
             }
             Some(ReceiverMsg::AllDone) => break,
             Some(other) => {
@@ -471,9 +499,27 @@ async fn process_requests_and_acks(
 /// `resume_prepare` 失败）时，Sender 自检失败（`handle_full_transfer`/
 /// `handle_delta_transfer` 返回 `false`）与 Receiver 回传的 `ReceiverMsg::Error{ndx}`
 /// 可能各自独立触发一次增量；ndx 唯一对应一个文件，一个文件至多算一次错误。
-fn count_ndx_error(errored: &mut HashSet<i32>, ndx: i32, error_count: &mut u64) {
-    if errored.insert(ndx) {
+///
+/// 返回是否为本次新计数（`errored.insert(ndx)` 的结果）：调用方据此决定是否同时喂入
+/// `StorageEntryMessage::Error`，使 `ErrorStats` 与该本地 u64 计数按相同口径去重
+/// （复合失败不应被喂两次，见 issue #57）。
+fn count_ndx_error(errored: &mut HashSet<i32>, ndx: i32, error_count: &mut u64) -> bool {
+    let newly_counted = errored.insert(ndx);
+    if newly_counted {
         *error_count += 1;
+    }
+    newly_counted
+}
+
+/// 把双进程模式下 entry 级失败（Sender 自检读失败 / Receiver 回传的终态失败）翻译为
+/// `StorageEntryMessage::Error`，供 Sender 侧 `StatisticConsumer` 累计统计（模式同
+/// `classification_to_stats_message`，issue #57）。所有双进程失败来源统一归为
+/// `ErrorEvent::Copy`——均发生在传输/复制阶段，不是扫描阶段。
+fn entry_error_stats_message(path: PathBuf, reason: String) -> StorageEntryMessage {
+    StorageEntryMessage::Error {
+        event: ErrorEvent::Copy,
+        path,
+        reason,
     }
 }
 
@@ -793,7 +839,8 @@ mod tests {
         }))
     }
 
-    // ── finalize_run_result：error_count → 退出码决策纯函数单测 ──
+    // ── finalize_run_result：报表驱动，恒 Ok（issue #57 spec v3：双进程 entry 级失败不再
+    //    影响退出码，仅记录日志）──
 
     #[test]
     fn finalize_run_result_ok_when_no_errors() {
@@ -801,11 +848,11 @@ mod tests {
     }
 
     #[test]
-    fn finalize_run_result_err_when_errors_present() {
-        match finalize_run_result(3) {
-            Err(AppError::RemoteSyncFailed { errors: 3 }) => {}
-            other => panic!("expected RemoteSyncFailed{{errors: 3}}, got {other:?}"),
-        }
+    fn finalize_run_result_ok_even_when_errors_present() {
+        assert!(
+            finalize_run_result(3).is_ok(),
+            "entry 级失败不应再使 finalize_run_result 返回 Err（报表驱动，见 issue #57）"
+        );
     }
 
     /// 双端联调（in-process transport，不依赖真实 QUIC）：验证多路复用改造后的
@@ -1027,10 +1074,13 @@ mod tests {
     /// 确定的时间点做破坏性操作，如删除源文件模拟源读失败），最后再跑
     /// `process_requests_and_acks`。用于确定性地制造 Sender 侧源读失败场景，避免真实
     /// 并发下的时序不确定性（见 issue #22 review [0]/[1]/[2]/[3]）。
+    ///
+    /// 返回值带上 `stats_consumer`（issue #57）：供调用方断言 Sender 自检失败是否已
+    /// 正确喂入 `ErrorStats`（报表口径），而不只是本地 `error_count` u64。
     async fn run_pipeline_with_disruption(
         sender_transport: &(dyn SenderTransport + 'static), receiver_transport: InProcessReceiverTransport,
         src_dir: &std::path::Path, dest_storage: Arc<StorageEnum>, disrupt: impl FnOnce(),
-    ) -> (u64, u64) {
+    ) -> (Arc<AsyncMutex<StatisticConsumer>>, u64, u64) {
         let src_storage = Arc::new(create_storage(src_dir.to_str().unwrap(), None, false).await.unwrap());
         let walkdir_iter = src_storage.walkdir_2(None, None, None, None, 4, false).await.unwrap();
 
@@ -1079,7 +1129,7 @@ mod tests {
 
         sender_transport.close().await.unwrap();
         receiver_handle.await.unwrap().unwrap();
-        (success_count, error_count)
+        (stats_consumer, success_count, error_count)
     }
 
     /// (b) 全量·一次 mismatch → Sender 收 Redo 全量重发 → Success，`finalize_run_result` Ok。
@@ -1110,7 +1160,8 @@ mod tests {
         );
     }
 
-    /// (c) 全量·连续两次 mismatch → Error，`finalize_run_result` Err（退出路径）。
+    /// (c) 全量·连续两次 mismatch → Error 终态（`error_count` 计入，但 `finalize_run_result`
+    /// 报表驱动恒 Ok，不再是退出路径，见 issue #57）。
     #[tokio::test]
     async fn full_transfer_redo_second_mismatch_errors() {
         let src_dir = tempdir().unwrap();
@@ -1131,10 +1182,10 @@ mod tests {
 
         assert_eq!(success_count, 0);
         assert_eq!(error_count, 1, "连续两次 mismatch 应进入 Error 终态");
-        match finalize_run_result(error_count) {
-            Err(AppError::RemoteSyncFailed { errors: 1 }) => {}
-            other => panic!("expected RemoteSyncFailed{{errors: 1}}, got {other:?}"),
-        }
+        assert!(
+            finalize_run_result(error_count).is_ok(),
+            "entry 级失败不应再使 finalize_run_result 返回 Err"
+        );
         // .part 已清理，无残留最终文件（全量重发失败，目标端应保持无该文件）
         assert!(!dest_dir.path().join("a.txt").exists());
     }
@@ -1520,9 +1571,9 @@ mod tests {
     // 失败而不是把整个测试套 hang 死。
     // ============================================================
 
-    /// [0] 全量源读失败：Sender 自增 error_count → `finalize_run_result` 返回 Err
-    /// （使 `main.rs` 的 exit(1) 生效），不再是原先的「仅 completed_count++、exit 0
-    /// 且目标端静默缺文件」。
+    /// [0] 全量源读失败：Sender 自增 error_count，且喂入 `ErrorStats`（issue #57：报表
+    /// 驱动，`finalize_run_result` 恒 Ok，失败改由终态报表承载），不再是原先的
+    /// 「仅 completed_count++、exit 0 且目标端静默缺文件」。
     #[tokio::test]
     async fn full_transfer_source_read_failure_bumps_error_count() {
         let src_dir = tempdir().unwrap();
@@ -1537,7 +1588,7 @@ mod tests {
         );
         let (sender_transport, receiver_transport) = create_in_process_pair();
 
-        let (success_count, error_count) = tokio::time::timeout(
+        let (stats_consumer, success_count, error_count) = tokio::time::timeout(
             Duration::from_secs(10),
             run_pipeline_with_disruption(
                 &sender_transport,
@@ -1554,15 +1605,26 @@ mod tests {
 
         assert_eq!(success_count, 0);
         assert_eq!(error_count, 1, "源读失败应使 Sender 自增 error_count");
-        match finalize_run_result(error_count) {
-            Err(AppError::RemoteSyncFailed { errors: 1 }) => {}
-            other => panic!("expected RemoteSyncFailed{{errors: 1}}, got {other:?}"),
-        }
+        assert!(
+            finalize_run_result(error_count).is_ok(),
+            "entry 级失败不应再使 finalize_run_result 返回 Err"
+        );
         assert!(!dest_dir.path().join("a.txt").exists(), "目标端不应静默出现该文件");
+
+        let consumer = stats_consumer.lock().await;
+        match &consumer.stats {
+            StatsKind::Incremental(s) => {
+                assert_eq!(
+                    s.error_stats.copy, 1,
+                    "Sender 自检读失败应喂入 ErrorStats.copy（issue #57），报表才能如实反映失败"
+                );
+            }
+            other => panic!("expected StatsKind::Incremental, got {other:?}"),
+        }
     }
 
-    /// [2] delta 源读失败：该 ndx 正常完成（不 hang），Sender 自增 error_count →
-    /// `finalize_run_result` 返回 Err。修复前 `handle_delta_transfer` 读失败只
+    /// [2] delta 源读失败：该 ndx 正常完成（不 hang），Sender 自增 error_count 并喂入
+    /// `ErrorStats`（issue #57）。修复前 `handle_delta_transfer` 读失败只
     /// `return Ok(false)`、不发任何消息，Receiver 该 ndx 永不完成，两端 hang。
     #[tokio::test]
     async fn delta_transfer_source_read_failure_completes_ndx_without_hang() {
@@ -1579,7 +1641,7 @@ mod tests {
         );
         let (sender_transport, receiver_transport) = create_in_process_pair();
 
-        let (success_count, error_count) = tokio::time::timeout(
+        let (stats_consumer, success_count, error_count) = tokio::time::timeout(
             Duration::from_secs(10),
             run_pipeline_with_disruption(
                 &sender_transport,
@@ -1596,15 +1658,25 @@ mod tests {
 
         assert_eq!(success_count, 0);
         assert_eq!(error_count, 1);
-        match finalize_run_result(error_count) {
-            Err(AppError::RemoteSyncFailed { errors: 1 }) => {}
-            other => panic!("expected RemoteSyncFailed{{errors: 1}}, got {other:?}"),
+        assert!(
+            finalize_run_result(error_count).is_ok(),
+            "entry 级失败不应再使 finalize_run_result 返回 Err"
+        );
+
+        let consumer = stats_consumer.lock().await;
+        match &consumer.stats {
+            StatsKind::Incremental(s) => {
+                assert_eq!(
+                    s.error_stats.copy, 1,
+                    "delta 自检读失败应喂入 ErrorStats.copy（issue #57）"
+                );
+            }
+            other => panic!("expected StatsKind::Incremental, got {other:?}"),
         }
     }
 
-    /// [3] 符号链接读失败：该 ndx 正常完成（不 hang），Sender 自增 error_count →
-    /// `finalize_run_result` 返回 Err。修复前 `read_symlink` 失败只记日志、不发任何
-    /// 消息，Receiver 该 ndx 永不完成，两端 hang。
+    /// [3] 符号链接读失败：该 ndx 正常完成（不 hang），Sender 自增 error_count。修复前
+    /// `read_symlink` 失败只记日志、不发任何消息，Receiver 该 ndx 永不完成，两端 hang。
     #[tokio::test]
     async fn symlink_read_failure_completes_ndx_without_hang() {
         let src_dir = tempdir().unwrap();
@@ -1619,7 +1691,7 @@ mod tests {
         );
         let (sender_transport, receiver_transport) = create_in_process_pair();
 
-        let (success_count, error_count) = tokio::time::timeout(
+        let (_stats_consumer, success_count, error_count) = tokio::time::timeout(
             Duration::from_secs(10),
             run_pipeline_with_disruption(
                 &sender_transport,
@@ -1636,10 +1708,10 @@ mod tests {
 
         assert_eq!(success_count, 0);
         assert_eq!(error_count, 1);
-        match finalize_run_result(error_count) {
-            Err(AppError::RemoteSyncFailed { errors: 1 }) => {}
-            other => panic!("expected RemoteSyncFailed{{errors: 1}}, got {other:?}"),
-        }
+        assert!(
+            finalize_run_result(error_count).is_ok(),
+            "entry 级失败不应再使 finalize_run_result 返回 Err"
+        );
     }
 
     /// [1] 同一 ndx 上「Sender 源读失败」与「Receiver resume_prepare 失败」并发触发
@@ -1668,7 +1740,7 @@ mod tests {
         );
         let (sender_transport, receiver_transport) = create_in_process_pair();
 
-        let (success_count, error_count) = tokio::time::timeout(
+        let (stats_consumer, success_count, error_count) = tokio::time::timeout(
             Duration::from_secs(10),
             run_pipeline_with_disruption(
                 &sender_transport,
@@ -1698,6 +1770,21 @@ mod tests {
             fs::read(dest_dir.path().join("healthy.txt")).unwrap(),
             b"should still arrive"
         );
+
+        // 报表口径（issue #57）应与本地 error_count 去重结果一致：同一 ndx 的复合失败
+        // 只应喂入一次 ErrorStats，不应因两个独立触发源（Sender 自检 + Receiver 回传）
+        // 各喂一次而被重复计入 2。
+        let consumer = stats_consumer.lock().await;
+        match &consumer.stats {
+            StatsKind::Incremental(s) => {
+                assert_eq!(
+                    s.error_stats.total(),
+                    1,
+                    "同一 ndx 的复合失败应只喂入一次 ErrorStats（与 error_count 去重口径一致）"
+                );
+            }
+            other => panic!("expected StatsKind::Incremental, got {other:?}"),
+        }
     }
 
     /// [5] `enable_integrity_check=false` 时 delta 重建 hash 不符不应触发 redo、
@@ -2250,6 +2337,21 @@ mod tests {
         match classification_to_stats_message(TransferDecision::Deleted, entry) {
             Some(StorageEntryMessage::Deleted(_)) => {}
             other => panic!("expected Deleted, got {other:?}"),
+        }
+    }
+
+    /// `entry_error_stats_message`：双进程 entry 级失败统一映射为 `ErrorEvent::Copy`，
+    /// path/reason 原样保留（issue #57：报表补齐所依赖的翻译逻辑）。
+    #[test]
+    fn entry_error_stats_message_maps_to_copy_error_event() {
+        let path = PathBuf::from("sub/broken.txt");
+        match entry_error_stats_message(path.clone(), "boom".to_string()) {
+            StorageEntryMessage::Error { event, path: p, reason } => {
+                assert_eq!(event, ErrorEvent::Copy);
+                assert_eq!(p, path);
+                assert_eq!(reason, "boom");
+            }
+            other => panic!("expected StorageEntryMessage::Error, got {other:?}"),
         }
     }
 
