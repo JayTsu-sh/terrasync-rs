@@ -1051,8 +1051,19 @@ async fn handle_end_of_file(
         }
     }
 
-    // 写入文件
+    // size 断言（写入前，独立于 hash 校验的防线，语义同 disk_commit.rs::finalize_file——
+    // 拦截 hash 校验关闭、或 hash 基于同一份被截断数据计算而"自洽"通过（同源失明）的场景）
     let data_len = file_bytes.len() as u64;
+    let expected_size = entry.get_size();
+    if data_len != expected_size {
+        error!(
+            "[Receiver Remote] size mismatch {:?}: rebuilt={} expected={}",
+            relative_path, data_len, expected_size
+        );
+        return FileOutcome::SizeMismatch;
+    }
+
+    // 写入文件
     match StorageEnum::write_file_from_bytes(dest_storage, entry, file_bytes).await {
         Ok(()) => {
             let _ = dest_storage.set_entry_metadata(entry).await;

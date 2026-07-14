@@ -50,7 +50,7 @@ hash 计算之前，hash 自洽通过，拦不住）以及 `enable_integrity_che
   实际大小 vs `entry.get_size()`，不符发 `FileOutcome::SizeMismatch` 并 `remove_part`
   后返回；`get_metadata` 本身出错走 `HardError`，与既有 hash 读回错误处理一致）。
   定向验证：`cargo check -p app`。
-- ⬜ 步骤 3：`receiver.rs::handle_end_of_file` 加 size 断言（`file_bytes.len() as u64`
+- ✅ 步骤 3：`receiver.rs::handle_end_of_file` 加 size 断言（`file_bytes.len() as u64`
   vs `entry.get_size()`，不符返回 `FileOutcome::SizeMismatch`）。定向验证：
   `cargo check -p app`。
 - ⬜ 步骤 4：`app/receiver.rs` 单测：`decide_file_ack` 新增 `SizeMismatch` 首次 Redo /
