@@ -46,7 +46,7 @@ hash 计算之前，hash 自洽通过，拦不住）以及 `enable_integrity_che
   `app/receiver.rs::decide_file_ack` 提取 `redo_or_error` helper 并接入新 variant
   （首次 Redo、二次 Error，与 HashMismatch 语义一致）。定向验证：
   `cargo check -p transport -p app`。
-- ⬜ 步骤 2：`disk_commit.rs::finalize_file` 加 size 断言（`get_metadata(&part_path)`
+- ✅ 步骤 2：`disk_commit.rs::finalize_file` 加 size 断言（`get_metadata(&part_path)`
   实际大小 vs `entry.get_size()`，不符发 `FileOutcome::SizeMismatch` 并 `remove_part`
   后返回；`get_metadata` 本身出错走 `HardError`，与既有 hash 读回错误处理一致）。
   定向验证：`cargo check -p app`。

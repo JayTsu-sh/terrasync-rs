@@ -209,6 +209,36 @@ async fn finalize_file(
         }
     }
 
+    // size 断言（commit 前，独立于 hash 校验的防线）：`commit_chunk_stream` 内部会用
+    // `set_file_len` 把 `.part` 强制补齐/截断到声明大小再 rename，若不在此拦截，截断
+    // 的 `.part` 会被静默补零后当作"大小正确"提交（size 对、内容错）；这层拦截 hash
+    // 校验关闭、或 hash 基于同一份被截断数据计算而"自洽"通过（同源失明）的场景。
+    match dest.get_metadata(&part_path).await {
+        Ok(meta) if meta.get_size() == size => {}
+        Ok(meta) => {
+            error!(
+                "[dc] size mismatch {:?}: part={} expected={}",
+                entry.get_relative_path(),
+                meta.get_size(),
+                size
+            );
+            remove_part(dest, &entry, &part_path).await;
+            let _ = ack_tx.send(DcAck::FileOutcome {
+                ndx,
+                outcome: FileOutcome::SizeMismatch,
+            });
+            return;
+        }
+        Err(e) => {
+            remove_part(dest, &entry, &part_path).await;
+            let _ = ack_tx.send(DcAck::FileOutcome {
+                ndx,
+                outcome: FileOutcome::HardError(format!("part size read-back: {e}")),
+            });
+            return;
+        }
+    }
+
     // 原子 rename：.part → 最终文件
     if let Err(e) = StorageEnum::commit_chunk_stream(dest, &entry, size, handle).await {
         error!("[dc] commit {:?}: {}", entry.get_relative_path(), e);
