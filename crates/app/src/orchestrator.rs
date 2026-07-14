@@ -515,6 +515,7 @@ impl SyncOrchestrator {
             let src_path = c.src_path.clone();
             let dest_path = c.dest_path.clone();
             let transport = sender_transport.clone();
+            let bc = broadcaster.clone();
             let cfg = sender_config.clone();
             let qos = qos_manager.clone();
             let bt = bytes_tracker.clone();
@@ -553,7 +554,7 @@ impl SyncOrchestrator {
                     done_counter.fetch_add(1, Ordering::Release);
                     let src = storage_pair.get_src_storage().clone();
                     let dest = storage_pair.get_dest_storage().clone();
-                    sender_worker(worker_id, wi, src, dest, transport, &cfg, qos, bt, ob, aec, ec, sc).await;
+                    sender_worker(worker_id, wi, src, dest, transport, &bc, &cfg, qos, bt, ob, aec, ec, sc).await;
                 }
                 .instrument(span),
             );

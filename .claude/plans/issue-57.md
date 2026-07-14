@@ -68,12 +68,13 @@ v1/v2 已被覆盖，不采用。
   测试暴露/断言 `ErrorStats`（`run_pipeline_with_disruption` 返回值带上 `stats_consumer`）。
   验证：`cargo check -p app --tests` 通过；`cargo test -p app --lib` 69 passed 0 failed；
   `cargo fmt -p app` 无额外改动。
-- 🔄 step 3：`sender.rs` walkdir `Error` 分支补广播（`ref` 绑定 + `broadcaster.broadcast(msg.clone())`）；
+- ✅ step 3：`sender.rs` walkdir `Error` 分支补广播（`ref` 绑定 + `broadcaster.broadcast(msg.clone())`）；
   `sender_worker` 签名新增 `broadcaster: &BroadcastForwarder<StorageEntryMessage>` 参数；
   `orchestrator.rs` L513 起 sender worker spawn 循环内 `let bc = broadcaster.clone();` +
   传参；新增 `sender.rs` 单测验证广播。
-  验证：`cargo check -p app`；`cargo test -p app --lib sender::tests`。
-- ⬜ step 4：`tests/remote_process_e2e.rs` 新增双进程部分失败 e2e（chmod 0o000 触发一个文件
+  验证：`cargo check -p app --tests` 通过；`cargo test -p app --lib` 70 passed 0 failed；
+  `cargo fmt -p app` 无额外改动。
+- 🔄 step 4：`tests/remote_process_e2e.rs` 新增双进程部分失败 e2e（chmod 0o000 触发一个文件
   自检读失败，断言 exit 0 + stdout ERROR STATISTICS total 非零 + 其余文件正常同步）；
   新增 `parse_error_stats_total` stdout 解析 helper。
   验证：`cargo test -p terrasync-rs --test remote_process_e2e -- partial_failure`
