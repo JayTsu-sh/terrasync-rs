@@ -769,11 +769,6 @@ mod tests {
     fn credit_cost_ignores_delta_match_and_control_messages() {
         assert_eq!(credit_cost(&SenderMsg::DeltaMatch { ndx: 1, block_index: 0 }), None);
         assert_eq!(credit_cost(&SenderMsg::TransferDone), None);
-        assert_eq!(
-            credit_cost(&SenderMsg::Auth {
-                token: "t".to_string()
-            }),
-            None
-        );
+        assert_eq!(credit_cost(&SenderMsg::Auth { token: "t".to_string() }), None);
     }
 }
