@@ -74,6 +74,7 @@ pub(crate) async fn run(
             is_source_reserved: true,
             block_size: config.block_size.clone(),
             delete_target: config.delete_target,
+            delta_size_threshold: config.delta_size_threshold.clone(),
         }))
         .await?;
 
@@ -857,6 +858,7 @@ mod tests {
                 is_source_reserved: true,
                 block_size: None,
                 delete_target: false,
+                delta_size_threshold: None,
             }))
             .await
             .unwrap();
@@ -993,6 +995,7 @@ mod tests {
                 is_source_reserved: true,
                 block_size: None,
                 delete_target: false,
+                delta_size_threshold: None,
             }))
             .await
             .unwrap();
@@ -1050,6 +1053,7 @@ mod tests {
                 is_source_reserved: true,
                 block_size: None,
                 delete_target: false,
+                delta_size_threshold: None,
             }))
             .await
             .unwrap();
@@ -1739,9 +1743,19 @@ mod tests {
     /// 起 `receiver_task_remote` 并完成握手（`delta_enabled=false` 时构造 delta:false
     /// 的本端能力集触发降级协商，走 `TransferRequest{decision:DeltaTransfer}` 而非
     /// `DeltaTransferRequest`）+ 鉴权 + `SessionConfig`，返回
-    /// `(sender_transport, receiver_handle)`。
+    /// `(sender_transport, receiver_handle)`。`delta_size_threshold` 恒为 `None`
+    /// （receiver 侧使用默认 512MiB），需要 override 见
+    /// `spawn_receiver_and_handshake_with_threshold`。
     async fn spawn_receiver_and_handshake(
         dest_storage: Arc<StorageEnum>, delete_target: bool, delta_enabled: bool,
+    ) -> (InProcessSenderTransport, JoinHandle<Result<()>>) {
+        spawn_receiver_and_handshake_with_threshold(dest_storage, delete_target, delta_enabled, None).await
+    }
+
+    /// 同 `spawn_receiver_and_handshake`，另可指定 `delta_size_threshold`（透传给
+    /// `SessionConfig`，供 issue #54 阶段 0 的 size 门槛降级测试使用）。
+    async fn spawn_receiver_and_handshake_with_threshold(
+        dest_storage: Arc<StorageEnum>, delete_target: bool, delta_enabled: bool, delta_size_threshold: Option<String>,
     ) -> (InProcessSenderTransport, JoinHandle<Result<()>>) {
         let (sender_transport, receiver_transport) = create_in_process_pair();
         let receiver_handle =
@@ -1778,6 +1792,7 @@ mod tests {
                 is_source_reserved: true,
                 block_size: None,
                 delete_target,
+                delta_size_threshold,
             }))
             .await
             .unwrap();
@@ -1950,6 +1965,72 @@ mod tests {
         match recv_skip_progress(&sender_transport).await {
             Some(ReceiverMsg::DeltaTransferRequest { ndx: got, .. }) => assert_eq!(got, ndx),
             other => panic!("expected DeltaTransferRequest, got {other:?}"),
+        }
+
+        finish_phase(&sender_transport, receiver_handle, &[ndx]).await;
+    }
+
+    /// dest 存在但内容不同 + delta 协商成功，但文件 size 超过 `delta_size_threshold` 门槛
+    /// → 降级为整份传输，`decision` 仍携带 `DeltaTransfer`（同
+    /// `recv_file_list_delta_transfer_downgrade_signal`，触发条件不同：这里是 size 门槛而非
+    /// 能力协商失败，见 issue #54 阶段 0）
+    #[tokio::test]
+    async fn recv_file_list_delta_transfer_size_threshold_downgrade_signal() {
+        let src_dir = tempdir().unwrap();
+        let dest_dir = tempdir().unwrap();
+        let content = vec![b'A'; 4096];
+        fs::write(src_dir.path().join("a.txt"), &content).unwrap();
+        seed_delta_basis(dest_dir.path(), "a.txt", 4096);
+
+        let dest_storage = Arc::new(
+            create_storage(dest_dir.path().to_str().unwrap(), None, true)
+                .await
+                .unwrap(),
+        );
+        // 阈值 1KiB < 文件 4096 字节 → 应触发 size 门槛降级
+        let (sender_transport, receiver_handle) =
+            spawn_receiver_and_handshake_with_threshold(dest_storage, false, true, Some("1KiB".to_string())).await;
+
+        let (page, ndx) = single_file_page(src_dir.path()).await;
+        sender_transport.send(SenderMsg::FilePage(page)).await.unwrap();
+
+        match recv_skip_progress(&sender_transport).await {
+            Some(ReceiverMsg::TransferRequest {
+                ndx: got,
+                decision: TransferDecision::DeltaTransfer,
+            }) => assert_eq!(got, ndx),
+            other => panic!("expected TransferRequest{{decision:DeltaTransfer}}（size 门槛降级）, got {other:?}"),
+        }
+
+        finish_phase(&sender_transport, receiver_handle, &[ndx]).await;
+    }
+
+    /// dest 存在但内容不同 + delta 协商成功 + 文件 size 未超过 `delta_size_threshold` 门槛
+    /// → 正常走 `DeltaTransferRequest`，不受 override 阈值影响（回归：低于阈值的文件不应被
+    /// 误伤，见 issue #54 阶段 0）
+    #[tokio::test]
+    async fn recv_file_list_delta_transfer_within_size_threshold_signal() {
+        let src_dir = tempdir().unwrap();
+        let dest_dir = tempdir().unwrap();
+        let content = vec![b'A'; 4096];
+        fs::write(src_dir.path().join("a.txt"), &content).unwrap();
+        seed_delta_basis(dest_dir.path(), "a.txt", 4096);
+
+        let dest_storage = Arc::new(
+            create_storage(dest_dir.path().to_str().unwrap(), None, true)
+                .await
+                .unwrap(),
+        );
+        // 阈值 1MiB > 文件 4096 字节 → 不应触发降级
+        let (sender_transport, receiver_handle) =
+            spawn_receiver_and_handshake_with_threshold(dest_storage, false, true, Some("1MiB".to_string())).await;
+
+        let (page, ndx) = single_file_page(src_dir.path()).await;
+        sender_transport.send(SenderMsg::FilePage(page)).await.unwrap();
+
+        match recv_skip_progress(&sender_transport).await {
+            Some(ReceiverMsg::DeltaTransferRequest { ndx: got, .. }) => assert_eq!(got, ndx),
+            other => panic!("expected DeltaTransferRequest（阈值内不受影响）, got {other:?}"),
         }
 
         finish_phase(&sender_transport, receiver_handle, &[ndx]).await;

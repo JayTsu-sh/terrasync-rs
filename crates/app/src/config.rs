@@ -101,6 +101,10 @@ pub struct SyncJobConfig {
     pub qos: Option<String>,
     pub peak_qos_rate: f32,
     pub block_size: Option<String>,
+    /// delta 传输 size 门槛（例如 "512MiB"），仅 `--remote` 双进程模式生效：超过该大小的
+    /// 文件即使数据不匹配也降级为全量传输，为 `None` 时 Receiver 侧使用默认值 512MiB
+    /// （见 issue #54 阶段 0）
+    pub delta_size_threshold: Option<String>,
     pub file_list: Option<String>,
     pub iops: Option<u32>,
     pub packaged: bool,

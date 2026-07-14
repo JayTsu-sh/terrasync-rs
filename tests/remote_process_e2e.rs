@@ -1056,6 +1056,171 @@ fn test_remote_process_e2e_delta_sync_transfers_changed_content() {
     );
 }
 
+/// 断言 Receiver 日志中出现 size 门槛降级记录（`receiver.rs::recv_file_list_and_data_phase`
+/// 新增的 `exceeds delta_size_threshold` info 行），作为"该文件被降级为全量传输而非真实
+/// `DeltaTransferRequest`"的非侵入式证据（issue #54 阶段 0）。
+fn assert_delta_size_threshold_downgrade_in_log(log_path: &Path) {
+    let content = fs::read_to_string(log_path).unwrap_or_else(|e| panic!("读取 Receiver 日志失败 {log_path:?}: {e}"));
+    assert!(
+        content.contains("exceeds delta_size_threshold"),
+        "Receiver 日志 {log_path:?} 中未见 size 门槛降级记录，内容:\n{content}"
+    );
+}
+
+/// 真实 2 进程 `--delta-size-threshold` e2e：与
+/// `test_remote_process_e2e_delta_sync_transfers_changed_content` 同样的两轮播种+改内容
+/// 场景，但第二轮 Sender 传入 `--delta-size-threshold`（小于被修改文件的大小），断言该文件
+/// 走全量降级而非真实 delta 传输，且 dest 最终内容仍与 src 一致（阶段 0 主路径：门槛降级
+/// 不影响传输正确性）。
+///
+/// 非侵入式证据：Receiver 日志出现 size 门槛降级记录（`assert_delta_size_threshold_downgrade_in_log`），
+/// 证明该文件确实因 size 超阈值被降级为全量传输，而不是走 `DeltaTransferRequest`。
+#[test]
+fn test_remote_process_e2e_delta_size_threshold_downgrades_to_full() {
+    let tmp = tempfile::tempdir().expect("create tempdir");
+    let tmp_path = tmp.path();
+
+    let src_dir = tmp_path.join("src");
+    let dest_dir = tmp_path.join("dest");
+    fs::create_dir_all(&src_dir).expect("create src dir");
+    fs::create_dir_all(&dest_dir).expect("create dest dir");
+    let mut rel_paths = populate_src_dir(&src_dir);
+
+    // 8000 字节的目标文件，配合 4KiB 阈值必然超阈值触发降级
+    const DELTA_FILE_SIZE: usize = 8000;
+    let delta_rel = PathBuf::from("delta_target.bin");
+    let original_content = deterministic_bytes(DELTA_FILE_SIZE);
+    fs::write(src_dir.join(&delta_rel), &original_content).expect("write delta src file");
+    rel_paths.push(delta_rel.clone());
+
+    let cert_path = tmp_path.join("server.crt");
+    let config_path = tmp_path.join("config.toml");
+    fs::write(&config_path, "[database]\nenabled = false\n").expect("write config");
+    let fake_manifest_dir = tmp_path.join("fake_manifest");
+    let bin_path = cargo_bin("terrasync");
+
+    // ── 第一轮：全量播种 dest（不带 --delta-size-threshold，与阈值降级测试无关） ──
+    let port = free_loopback_port();
+    let listen_addr = format!("127.0.0.1:{port}");
+    let mut receiver_child = StdCommand::new(&bin_path)
+        .env("CARGO_MANIFEST_DIR", &fake_manifest_dir)
+        .current_dir(tmp_path)
+        .arg("-c")
+        .arg(&config_path)
+        .arg("serve")
+        .arg("--listen")
+        .arg(&listen_addr)
+        .arg("--tls-cert-out")
+        .arg(&cert_path)
+        .arg(&dest_dir)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn receiver process");
+    wait_for_cert_file(&cert_path);
+
+    let mut sender_cmd = AssertCommand::new(&bin_path);
+    sender_cmd
+        .env("CARGO_MANIFEST_DIR", &fake_manifest_dir)
+        .current_dir(tmp_path)
+        .arg("-c")
+        .arg(&config_path)
+        .arg("sync")
+        .arg("--id")
+        .arg("remote_delta_threshold_seed")
+        .arg("--remote")
+        .arg(&listen_addr)
+        .arg("--tls-server-cert")
+        .arg(&cert_path)
+        .arg(&src_dir)
+        .arg(&dest_dir);
+    sender_cmd.assert().success();
+
+    let receiver_status = wait_for_child_exit(&mut receiver_child, RECEIVER_EXIT_TIMEOUT);
+    let (rout, rerr) = drain_output(&mut receiver_child);
+    assert!(
+        matches!(receiver_status, Some(s) if s.success()),
+        "第一轮 Receiver 异常退出: {receiver_status:?}\nstdout:\n{rout}\nstderr:\n{rerr}"
+    );
+    assert_dest_matches_src(&src_dir, &dest_dir, &rel_paths);
+
+    // 修改 delta_target.bin 中间一段字节，触发 DestIndex::check() 判定为 DeltaTransfer
+    let mut modified_content = original_content.clone();
+    for byte in &mut modified_content[3000..3200] {
+        *byte = 0xAA;
+    }
+    fs::write(src_dir.join("delta_target.bin"), &modified_content).expect("modify delta src file");
+
+    // ── 第二轮：带 --delta-size-threshold 4KiB（< 8000 字节文件）重跑，应降级为全量 ──
+    let port = free_loopback_port();
+    let listen_addr = format!("127.0.0.1:{port}");
+    fs::remove_file(&cert_path).expect("remove old cert");
+    let mut receiver_child = StdCommand::new(&bin_path)
+        .env("CARGO_MANIFEST_DIR", &fake_manifest_dir)
+        .current_dir(tmp_path)
+        .arg("-c")
+        .arg(&config_path)
+        .arg("serve")
+        .arg("--listen")
+        .arg(&listen_addr)
+        .arg("--tls-cert-out")
+        .arg(&cert_path)
+        .arg(&dest_dir)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn receiver process");
+    wait_for_cert_file(&cert_path);
+
+    let mut sender_cmd = AssertCommand::new(&bin_path);
+    sender_cmd
+        .env("CARGO_MANIFEST_DIR", &fake_manifest_dir)
+        .current_dir(tmp_path)
+        .arg("-c")
+        .arg(&config_path)
+        .arg("sync")
+        .arg("--id")
+        .arg("remote_delta_threshold_verify")
+        .arg("--remote")
+        .arg(&listen_addr)
+        .arg("--tls-server-cert")
+        .arg(&cert_path)
+        .arg("--delta-size-threshold")
+        .arg("4KiB")
+        .arg(&src_dir)
+        .arg(&dest_dir);
+    let assert = sender_cmd.assert().success();
+    let stdout = String::from_utf8_lossy(&assert.get_output().stdout).into_owned();
+
+    let receiver_status = wait_for_child_exit(&mut receiver_child, RECEIVER_EXIT_TIMEOUT);
+    let (rout, rerr) = drain_output(&mut receiver_child);
+    assert!(
+        matches!(receiver_status, Some(s) if s.success()),
+        "第二轮 Receiver 异常退出: {receiver_status:?}\nstdout:\n{rout}\nstderr:\n{rerr}"
+    );
+
+    // 内容一致性：即使降级为全量传输，重建结果也必须与源端修改后的内容逐字节相同
+    assert_dest_matches_src(&src_dir, &dest_dir, &rel_paths);
+
+    // 非侵入式证据 1：delta 能力本身仍协商成功（证明降级是 size 门槛而非能力协商失败）
+    let sender_log = tmp_path
+        .join("logs")
+        .join("remote_delta_threshold_verify")
+        .join("app.log");
+    assert_delta_negotiated_in_log(&sender_log, "Sender");
+
+    // 非侵入式证据 2：Sender 报表记录了一次 Changed（该条目仍按 DeltaTransfer 分类统计）
+    let changed_total = parse_changed_total(&stdout);
+    assert!(
+        changed_total >= 1,
+        "Sender 报表 Changed 计数应 ≥1（delta_target.bin 内容已变更），实际 stdout:\n{stdout}"
+    );
+
+    // 非侵入式证据 3：Receiver 日志出现 size 门槛降级记录，证明确实走了全量降级而非真实 delta
+    let receiver_log = tmp_path.join("logs").join("app.log");
+    assert_delta_size_threshold_downgrade_in_log(&receiver_log);
+}
+
 /// symlink 真实 2 进程全量同步 e2e：`populate_src_dir` 从不建 symlink（8 个既有 e2e
 /// 均未覆盖该路径，见 issue #26 triage），单独构造专属数据集验证符号链接经真实
 /// QUIC 连接走 `CreateSymlink` 完整落地——链接类型 + 目标路径字符串 + 可解引用内容。

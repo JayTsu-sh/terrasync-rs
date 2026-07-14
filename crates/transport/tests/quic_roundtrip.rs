@@ -175,6 +175,7 @@ async fn test_quic_session_config_roundtrip() {
             is_source_reserved: true,
             block_size: Some("4MiB".to_string()),
             delete_target: true,
+            delta_size_threshold: None,
         }))
         .await
         .unwrap();
@@ -259,6 +260,7 @@ async fn test_quic_handshake_compatible_versions_roundtrip() {
             is_source_reserved: true,
             block_size: None,
             delete_target: false,
+            delta_size_threshold: None,
         }))
         .await
         .unwrap();
@@ -409,6 +411,7 @@ async fn test_quic_auth_success_then_session_config_roundtrip() {
             is_source_reserved: true,
             block_size: None,
             delete_target: false,
+            delta_size_threshold: None,
         }))
         .await
         .unwrap();

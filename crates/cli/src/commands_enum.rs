@@ -10,7 +10,8 @@ use clap::Subcommand;
 
 // 内部模块
 use crate::commands::{
-    validate_block_size, validate_iops, validate_peak_qos_rate, validate_qos_format, validate_storage_path,
+    validate_block_size, validate_delta_size_threshold, validate_iops, validate_peak_qos_rate, validate_qos_format,
+    validate_storage_path,
 };
 
 /// ACE子命令枚举
@@ -135,6 +136,12 @@ pub enum Commands {
         /// Also configurable in config file under `[sync]` `block_size`
         #[arg(long, value_parser = validate_block_size)]
         block_size: Option<String>,
+
+        /// Files larger than this size skip delta transfer and fall back to a full copy,
+        /// such as 512MiB, 1GiB, etc. Defaults to 512MiB. Only effective in `--remote`
+        /// (dual-process) mode.
+        #[arg(long, value_parser = validate_delta_size_threshold)]
+        delta_size_threshold: Option<String>,
 
         /// File containing list of files to sync
         #[arg(long, value_name = "FILE")]
