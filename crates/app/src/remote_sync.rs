@@ -74,6 +74,7 @@ pub(crate) async fn run(
             is_source_reserved: true,
             block_size: config.block_size.clone(),
             delete_target: config.delete_target,
+            delta_size_threshold: config.delta_size_threshold.clone(),
         }))
         .await?;
 
@@ -857,6 +858,7 @@ mod tests {
                 is_source_reserved: true,
                 block_size: None,
                 delete_target: false,
+                delta_size_threshold: None,
             }))
             .await
             .unwrap();
@@ -993,6 +995,7 @@ mod tests {
                 is_source_reserved: true,
                 block_size: None,
                 delete_target: false,
+                delta_size_threshold: None,
             }))
             .await
             .unwrap();
@@ -1050,6 +1053,7 @@ mod tests {
                 is_source_reserved: true,
                 block_size: None,
                 delete_target: false,
+                delta_size_threshold: None,
             }))
             .await
             .unwrap();
@@ -1778,6 +1782,7 @@ mod tests {
                 is_source_reserved: true,
                 block_size: None,
                 delete_target,
+                delta_size_threshold: None,
             }))
             .await
             .unwrap();

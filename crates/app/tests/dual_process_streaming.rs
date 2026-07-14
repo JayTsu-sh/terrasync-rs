@@ -70,6 +70,7 @@ fn session_cfg(integrity: bool) -> SessionConfig {
         is_source_reserved: true,
         block_size: None,
         delete_target: false,
+        delta_size_threshold: None,
     }
 }
 

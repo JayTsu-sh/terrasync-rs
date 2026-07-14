@@ -42,7 +42,7 @@
   加 `negotiate_rejects_v3_peer` 测试（仿 `negotiate_rejects_v2_peer`）；更新
   `crates/transport/tests/quic_roundtrip.rs` 3 处 `SessionConfig{}` 字面量补字段。
   验证：`cargo check -p transport && cargo test -p transport`
-- ⬜ step 2: app 层配置 —— `SyncJobConfig` 加 `delta_size_threshold: Option<String>` 字段
+- ✅ step 2: app 层配置 —— `SyncJobConfig` 加 `delta_size_threshold: Option<String>` 字段
   （`crates/app/src/config.rs`）；`remote_sync.rs::run()` 的 `SessionConfig` 构造透传该字段；
   同文件内 4 处测试 `SessionConfig{}` 字面量补 `delta_size_threshold: None`；
   `crates/app/tests/dual_process_streaming.rs::session_cfg` 补字段。
