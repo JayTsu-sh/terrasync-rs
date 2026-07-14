@@ -37,7 +37,7 @@
 
 - ✅ step 0: 立计划（本文件）+ 调研代码现状（receiver.rs DeltaTransfer 分支、SyncJobConfig/
   SessionConfig/block_size 全链路、PROTOCOL_VERSION 现状、既有 delta 降级测试风格）
-- ⬜ step 1: transport 协议层 —— `SessionConfig` 加 `delta_size_threshold: Option<String>` 字段；
+- ✅ step 1: transport 协议层 —— `SessionConfig` 加 `delta_size_threshold: Option<String>` 字段；
   `PROTOCOL_VERSION`/`MIN_SUPPORTED_PROTOCOL_VERSION` 3→4（doc 注释说明第 4 次线格式变更）；
   加 `negotiate_rejects_v3_peer` 测试（仿 `negotiate_rejects_v2_peer`）；更新
   `crates/transport/tests/quic_roundtrip.rs` 3 处 `SessionConfig{}` 字面量补字段。

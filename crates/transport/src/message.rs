@@ -171,13 +171,17 @@ pub enum ReceiverMsg {
 /// `ReceiverMsg::Classified{entry, decision}` 消息（补齐 MetadataOnly/Skip/Deleted
 /// 三类此前从不上行的分类信号），`TransferDecision` 新增 `Deleted` variant 并加上
 /// `Serialize`/`Deserialize`（首次跨 wire，见 issue #23），bincode 线格式不兼容 v2。
-pub const PROTOCOL_VERSION: u32 = 3;
+///
+/// 4：`SessionConfig` 加 `delta_size_threshold: Option<String>` 字段（超过该大小的文件即使
+/// 数据不匹配也降级为全量传输，避免 delta 重建的整文件内存缓冲，见 issue #54 阶段 0），
+/// bincode 线格式不兼容 v3。
+pub const PROTOCOL_VERSION: u32 = 4;
 
 /// 当前 binary 能接受的最低对端协议版本
 ///
 /// 对端版本低于此值时握手拒绝，避免 bincode schema 不兼容导致反序列化失败
 /// 或部分文件已写入、部分未写入的"半执行"不一致状态。
-pub const MIN_SUPPORTED_PROTOCOL_VERSION: u32 = 3;
+pub const MIN_SUPPORTED_PROTOCOL_VERSION: u32 = 4;
 
 /// 完整性校验使用的 hash 算法
 ///
@@ -325,6 +329,9 @@ pub struct SessionConfig {
     pub block_size: Option<String>,
     /// 是否启用 --delete-target（删除目标端多余文件）
     pub delete_target: bool,
+    /// delta 传输 size 门槛（例如 "512MiB"）：超过该大小的文件即使数据不匹配也降级为
+    /// 全量传输，为 `None` 时 Receiver 侧使用默认值（见 issue #54 阶段 0）
+    pub delta_size_threshold: Option<String>,
 }
 
 /// Block 签名（Receiver 计算并发给 Sender，用于 chunk 级 delta）
@@ -619,7 +626,25 @@ mod tests {
         }
     }
 
-    /// 双方均为当前版本（v3）时握手应正常通过
+    /// v3 对端（issue #54 阶段 0 改动 `SessionConfig` bincode 线格式前的协议版本）握手时
+    /// 必须被拒绝：`SessionConfig` 加 `delta_size_threshold` 字段后，v3 与当前 v4 的
+    /// bincode schema 不兼容，接受 v3 对端会导致错位解码。
+    #[test]
+    fn negotiate_rejects_v3_peer() {
+        let current = ProtocolHandshake::current();
+        let v3_peer = ProtocolHandshake {
+            protocol_version: 3,
+            min_supported_version: 3,
+            features: FeatureFlags::current(),
+            hash_algorithm: HashAlgorithm::Blake3,
+        };
+        match current.negotiate(&v3_peer) {
+            HandshakeResult::Rejected { reason } => assert!(!reason.is_empty()),
+            other => panic!("v3 对端应被拒绝，got {other:?}"),
+        }
+    }
+
+    /// 双方均为当前版本（v4）时握手应正常通过
     #[test]
     fn negotiate_accepts_matching_current_peers() {
         let current = ProtocolHandshake::current();
