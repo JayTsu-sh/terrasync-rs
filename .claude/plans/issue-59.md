@@ -70,7 +70,7 @@ bump 到 v5）。
   量级 < 64MiB 默认窗口，语义不变质。
 - ✅ 步骤 7：`tests/remote_process_e2e.rs` —— 新增真实双进程 e2e：源目录含 >64MiB 大文件，
   `--enable-integrity-check`，断言同步成功、dest 与 src 字节一致、无死锁超时。
-- ⬜ 步骤 8：收尾 —— `cargo fmt`、`cargo test -p transport --features quic`、
+- 🔄 步骤 8：收尾 —— `cargo fmt`、`cargo test -p transport --features quic`、
   `cargo test -p app`、`cargo test -p terrasync-rs --test remote_process_e2e`（连跑 2 次）、
   `cargo test --workspace --no-fail-fast`，确认 `git status` 无越界文件，移除本计划文件。
 
