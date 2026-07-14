@@ -55,7 +55,7 @@
   （供 e2e 非侵入式验证）；`mod tests` 加 `resolve_delta_size_threshold` 单测
   （默认值/合法 override/非法格式）。
   验证：`cargo check -p app && cargo test -p app --lib receiver::tests::`
-- ⬜ step 4: CLI 全链路 —— `commands_enum.rs` 加 `--delta-size-threshold` arg（doc 注明仅
+- ✅ step 4: CLI 全链路 —— `commands_enum.rs` 加 `--delta-size-threshold` arg（doc 注明仅
   `--remote` 模式生效，复用 `validate_block_size` 同款校验器或新增
   `validate_delta_size_threshold`）；`lib.rs` 解构透传；`commands.rs::sync_cmd` 加形参 +
   写入 `SyncJobConfig` 字面量。
