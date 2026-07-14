@@ -66,7 +66,7 @@ hash 计算之前，hash 自洽通过，拦不住）以及 `enable_integrity_che
   - `full_transfer_size_mismatch_redo_recovers_without_integrity_check`
     （`enable_integrity_check=false`，验证 hash 校验关闭时断言同样生效）。
   验证：`cargo test -p app size_mismatch -- --nocapture`。
-- ⬜ 步骤 6：`app/remote_sync.rs` 测试模块新增 `DeltaTruncationInjector`（按目标 ndx 丢弃
+- ✅ 步骤 6：`app/remote_sync.rs` 测试模块新增 `DeltaTruncationInjector`（按目标 ndx 丢弃
   该次传输首个 `DeltaMatch`/`DeltaData` token，不改写 hash）+ 1 个 pipeline 测试
   `delta_transfer_size_mismatch_redo_recovers_without_integrity_check`
   （`enable_integrity_check=false`，覆盖 `receiver.rs::handle_end_of_file` 路径，验证

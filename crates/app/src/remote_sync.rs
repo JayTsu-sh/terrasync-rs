@@ -1384,6 +1384,99 @@ mod tests {
         assert_eq!(error_count, 1, "delta 降级全量重发后再次 mismatch 应进入 Error 终态");
     }
 
+    /// 测试专用 Sender transport 包装：按目标 ndx 丢弃该次传输的首个 delta token
+    /// （`DeltaMatch`/`DeltaData` 之一），模拟 delta 重建路径的截断，覆盖
+    /// `receiver.rs::handle_end_of_file` 新增的 size 断言。不改写 hash——配合
+    /// `enable_integrity_check=false` 使用，验证 hash 校验关闭时 size 断言仍能独立
+    /// 拦截。`drop_remaining`：还需丢弃几次（每次目标 ndx attempt 递减，0 = 之后
+    /// 透传），语义同 `HashMismatchInjector::corrupt_remaining`。
+    struct DeltaTruncationInjector {
+        inner: InProcessSenderTransport,
+        target_ndx: i32,
+        drop_remaining: Mutex<u32>,
+        /// 本次 attempt 是否已丢弃过一个 token（丢一个即可制造截断，其余 token 照常转发）
+        dropped_this_attempt: Mutex<bool>,
+    }
+
+    impl DeltaTruncationInjector {
+        fn new(inner: InProcessSenderTransport, target_ndx: i32, drop_remaining: u32) -> Self {
+            Self {
+                inner,
+                target_ndx,
+                drop_remaining: Mutex::new(drop_remaining),
+                dropped_this_attempt: Mutex::new(false),
+            }
+        }
+
+        /// 本次 attempt 遇到的第一个 delta token 是否应丢弃（消耗一次预算），之后同一
+        /// attempt 内固定为不再丢。同步函数（无 `.await`），锁可安全跨整个函数体持有。
+        fn should_drop(&self) -> bool {
+            let mut dropped = self.dropped_this_attempt.lock().unwrap_or_else(PoisonError::into_inner);
+            if *dropped {
+                return false;
+            }
+            let mut remaining = self.drop_remaining.lock().unwrap_or_else(PoisonError::into_inner);
+            if *remaining == 0 {
+                return false;
+            }
+            *remaining -= 1;
+            *dropped = true;
+            true
+        }
+    }
+
+    #[async_trait]
+    impl SenderTransport for DeltaTruncationInjector {
+        async fn send(&self, msg: SenderMsg) -> TransportResult<()> {
+            match &msg {
+                SenderMsg::DeltaMatch { ndx, .. } | SenderMsg::DeltaData { ndx, .. } if *ndx == self.target_ndx => {
+                    if self.should_drop() {
+                        return Ok(());
+                    }
+                }
+                SenderMsg::EndOfFile { ndx, .. } if *ndx == self.target_ndx => {
+                    *self.dropped_this_attempt.lock().unwrap_or_else(PoisonError::into_inner) = false;
+                }
+                _ => {}
+            }
+            self.inner.send(msg).await
+        }
+
+        async fn recv(&self) -> Option<ReceiverMsg> {
+            self.inner.recv().await
+        }
+
+        async fn close(&self) -> TransportResult<()> {
+            self.inner.close().await
+        }
+    }
+
+    /// (i) delta·size 断言：`enable_integrity_check=false` 时丢弃一个 delta token 制造
+    /// 重建截断 → size 断言拦截（`handle_end_of_file`）→ Redo → 降级全量重发恢复成功。
+    #[tokio::test]
+    async fn delta_transfer_size_mismatch_redo_recovers_without_integrity_check() {
+        let src_dir = tempdir().unwrap();
+        let dest_dir = tempdir().unwrap();
+        let content = vec![b'A'; 4096];
+        fs::write(src_dir.path().join("a.txt"), &content).unwrap();
+        seed_delta_basis(dest_dir.path(), "a.txt", 4096);
+
+        let dest_storage = Arc::new(
+            create_storage(dest_dir.path().to_str().unwrap(), None, true)
+                .await
+                .unwrap(),
+        );
+        let (sender_transport, receiver_transport) = create_in_process_pair();
+        let injector = DeltaTruncationInjector::new(sender_transport, 0, 1);
+
+        let (success_count, error_count) =
+            run_pipeline(&injector, receiver_transport, src_dir.path(), dest_storage, false).await;
+
+        assert_eq!(error_count, 0);
+        assert_eq!(success_count, 1, "delta size mismatch redo 降级全量重发后应最终成功");
+        assert_eq!(fs::read(dest_dir.path().join("a.txt")).unwrap(), content);
+    }
+
     /// (f) 计数不重复：文件走 `Success{ndx}`、符号链接走 `EntrySuccess`，
     /// 共用同一个 `success_count` 但互不重复计数（无 mismatch 注入的基线场景）。
     #[tokio::test]
