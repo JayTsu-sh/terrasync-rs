@@ -59,11 +59,11 @@ bump 到 v5）。
   窗口耗尽挂起/授信解阻塞单测；`quic/mod.rs` 加 `pub mod credit;`。
 - ✅ 步骤 3：`crates/transport/src/quic/mux.rs` —— `receiver_stream_kind` 加 `CreditGrant` →
   `AckProgress`；模块文档改写"背压"声明。
-- 🔄 步骤 4：`crates/transport/src/quic/sender.rs` —— `QuicSenderTransport` 加 `credit` 字段；
+- ✅ 步骤 4：`crates/transport/src/quic/sender.rs` —— `QuicSenderTransport` 加 `credit` 字段；
   `connect()` 委托给 crate-internal `connect_with_credit_window(..., window_bytes)`；`send()`
   按 `credit_cost` 扣减；`recv()` 拦截 `CreditGrant` 补授后 `continue`；新增真实 QUIC 注入小
   窗口的 pending→grant unblock 测试 + 控制消息畅通测试。
-- ⬜ 步骤 5：`crates/app/src/receiver.rs` —— 引入 `transport::quic::credit::DEFAULT_CREDIT_WINDOW_BYTES`
+- 🔄 步骤 5：`crates/app/src/receiver.rs` —— 引入 `transport::quic::credit::DEFAULT_CREDIT_WINDOW_BYTES`
   算半窗阈值；`accumulate_credit` 纯函数 + 单测；`recv_file_list_and_data_phase` 的
   `FileData`/`DeltaData` 分支累计消费并在达阈值时发 `CreditGrant`。
 - ⬜ 步骤 6：`crates/transport/tests/quic_roundtrip.rs` —— 既有 8MiB flood 测试加注释确认
