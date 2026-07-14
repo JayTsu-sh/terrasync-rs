@@ -47,7 +47,7 @@
   同文件内 4 处测试 `SessionConfig{}` 字面量补 `delta_size_threshold: None`；
   `crates/app/tests/dual_process_streaming.rs::session_cfg` 补字段。
   验证：`cargo check -p app && cargo test -p app --lib remote_sync::`
-- ⬜ step 3: receiver.rs 核心逻辑 —— 加 `DEFAULT_DELTA_SIZE_THRESHOLD_BYTES`（512MiB）常量 +
+- ✅ step 3: receiver.rs 核心逻辑 —— 加 `DEFAULT_DELTA_SIZE_THRESHOLD_BYTES`（512MiB）常量 +
   `resolve_delta_size_threshold(&Option<String>) -> Result<u64>` 纯函数（复用
   `crate::sync::parse_size`，None → 默认值）；`receiver_task_remote` 解析一次并传给
   `recv_file_list_and_data_phase`；`DeltaTransfer` match 新增 size 超阈值降级分支（复用

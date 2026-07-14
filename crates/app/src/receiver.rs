@@ -26,7 +26,7 @@ use transport::traits::ReceiverTransport;
 // 内部模块
 use crate::byte_resume::is_part_file;
 use crate::error::{AppError, Result};
-use crate::sync::{ResumeOpts, copy_file_with_resume, should_resume};
+use crate::sync::{ResumeOpts, copy_file_with_resume, parse_size, should_resume};
 
 // ============================================================
 // Receiver 进度跟踪（原子计数器，支持多 Receiver 聚合）
@@ -300,6 +300,7 @@ pub async fn receiver_task_remote(
         "[Receiver Remote] SessionConfig: src_path={}, integrity={}, acl={}",
         session_config.src_path, session_config.enable_integrity_check, session_config.enable_acl
     );
+    let delta_size_threshold = resolve_delta_size_threshold(&session_config.delta_size_threshold)?;
 
     // ── 进度跟踪 ──
     let progress = Arc::new(ReceiverProgress::new());
@@ -326,6 +327,7 @@ pub async fn receiver_task_remote(
         &dest_storage,
         &session_config,
         &negotiated_features,
+        delta_size_threshold,
         &progress,
         progress_rx,
     )
@@ -422,6 +424,20 @@ async fn recv_session_config(transport: &(dyn ReceiverTransport + 'static)) -> R
     }
 }
 
+/// delta 传输 size 门槛默认值：512MiB（当前 delta 峰值内存 ≈3× 文件大小，最坏锁在 ~1.5GB，
+/// 见 issue #54 阶段 0 spec）
+const DEFAULT_DELTA_SIZE_THRESHOLD_BYTES: u64 = 512 * 1024 * 1024;
+
+/// 解析 `SessionConfig.delta_size_threshold`：`None` 时使用默认值 512MiB，`Some` 时复用
+/// `parse_size`（与 `block_size` 同款人类可读格式，如 "512MiB"）。超过该 size 的文件即使
+/// 数据不匹配也降级为全量传输（见 `recv_file_list_and_data_phase` 的 `DeltaTransfer` 分支）。
+fn resolve_delta_size_threshold(threshold: &Option<String>) -> Result<u64> {
+    match threshold {
+        Some(s) => Ok(parse_size(s)? as u64),
+        None => Ok(DEFAULT_DELTA_SIZE_THRESHOLD_BYTES),
+    }
+}
+
 /// 校验 Sender 提供的相对路径是否安全：拒绝绝对路径与含 `..` 组件的路径
 ///
 /// 双进程远端模式下 Sender 不可信，若 `entry.get_relative_path()` 被恶意构造为绝对路径
@@ -451,6 +467,8 @@ fn validate_relative_path(path: &Path) -> Result<()> {
 ///
 /// `negotiated_features` 为握手阶段协商后的能力交集；`delta` 能力未协商成功时
 /// 即使数据不匹配也降级为全量传输（`TransferRequest`），不发送 `DeltaTransferRequest`。
+/// `delta_size_threshold`（`resolve_delta_size_threshold` 解析，默认 512MiB）同理：文件
+/// size 超过该门槛时同样降级为全量传输，避免 delta 重建的整文件内存缓冲（issue #54 阶段 0）。
 /// 使用 `BytesMut` 缓冲多 chunk 数据，`FileBegin` 消息重置缓冲区避免跨文件状态污染。
 ///
 /// **`TransferDone` 到达≠数据已全部收完**：`TransferDone` 走 `Control` stream，实际文件
@@ -464,7 +482,7 @@ fn validate_relative_path(path: &Path) -> Result<()> {
 /// 才真正结束循环。
 async fn recv_file_list_and_data_phase(
     transport: &(dyn ReceiverTransport + 'static), dest_storage: &Arc<StorageEnum>, session_config: &SessionConfig,
-    negotiated_features: &FeatureFlags, progress: &Arc<ReceiverProgress>,
+    negotiated_features: &FeatureFlags, delta_size_threshold: u64, progress: &Arc<ReceiverProgress>,
     mut progress_rx: MpscReceiver<ProgressSnapshot>,
 ) -> Result<()> {
     info!("[Receiver Remote] Receiving file list and file data (pipelined, streaming mode)");
@@ -576,6 +594,19 @@ async fn recv_file_list_and_data_phase(
                         TransferDecision::DeltaTransfer if !negotiated_features.delta => {
                             // delta 能力未协商成功（对端不支持）→ 降级为全量传输（wire 动作变了，
                             // 分类判定不变：decision 仍是 DeltaTransfer，供 Sender 侧统计为 Changed）
+                            let _ = transport.send(ReceiverMsg::TransferRequest { ndx: nf.ndx, decision }).await;
+                            requested_count += 1;
+                        }
+                        TransferDecision::DeltaTransfer if nf.entry.get_size() > delta_size_threshold => {
+                            // 文件 size 超过 delta_size_threshold 门槛 → 降级为全量传输（同上，
+                            // wire 动作降级、分类判定不变），避免大文件 basis 全量读入内存 +
+                            // delta 重建峰值内存 ≈3× 文件大小的风险（issue #54 阶段 0）
+                            info!(
+                                "[Receiver Remote] {:?} size {} exceeds delta_size_threshold {} bytes, downgrading to full transfer",
+                                nf.entry.get_relative_path(),
+                                nf.entry.get_size(),
+                                delta_size_threshold
+                            );
                             let _ = transport.send(ReceiverMsg::TransferRequest { ndx: nf.ndx, decision }).await;
                             requested_count += 1;
                         }
@@ -1184,5 +1215,24 @@ mod tests {
             "ndx 2 应是首次失败，与 ndx 1 互不影响"
         );
         assert!(!is_terminal);
+    }
+
+    // ── resolve_delta_size_threshold：delta size 门槛解析（issue #54 阶段 0） ──
+
+    #[test]
+    fn resolve_delta_size_threshold_none_uses_default_512mib() {
+        let threshold = resolve_delta_size_threshold(&None).unwrap();
+        assert_eq!(threshold, 512 * 1024 * 1024);
+    }
+
+    #[test]
+    fn resolve_delta_size_threshold_parses_valid_override() {
+        let threshold = resolve_delta_size_threshold(&Some("1MiB".to_string())).unwrap();
+        assert_eq!(threshold, 1024 * 1024);
+    }
+
+    #[test]
+    fn resolve_delta_size_threshold_rejects_invalid_format() {
+        assert!(resolve_delta_size_threshold(&Some("not-a-size".to_string())).is_err());
     }
 }
