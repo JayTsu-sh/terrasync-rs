@@ -49,10 +49,12 @@ bump 到 v5）。
 
 ## 执行步骤清单
 
-- ⬜ 步骤 1：`crates/transport/src/message.rs` —— 新增 `ReceiverMsg::CreditGrant{bytes,ndx}`、
+- ✅ 步骤 1：`crates/transport/src/message.rs` —— 新增 `ReceiverMsg::CreditGrant{bytes,ndx}`、
   共享 `credit_cost(msg)`、协议 v4→v5 bump + doc、`negotiate_rejects_v4_peer` 测试、
-  `credit_cost` 纯函数单测。
-- ⬜ 步骤 2：新增 `crates/transport/src/quic/credit.rs` —— `CreditWindow`（Semaphore 封装）+
+  `credit_cost` 纯函数单测。同步在 `quic/mux.rs::receiver_stream_kind` 补上新 variant 的
+  穷尽匹配分支（`AckProgress`），否则 crate 无法编译——这是新增枚举 variant 的必然联动，
+  与后续「模块文档改写」的语义性改动分开提交（见步骤 3）。
+- 🔄 步骤 2：新增 `crates/transport/src/quic/credit.rs` —— `CreditWindow`（Semaphore 封装）+
   `DEFAULT_CREDIT_WINDOW_BYTES` + 模块文档（记账不变量/重连重置语义/与 qos.rs 对应与差异）+
   窗口耗尽挂起/授信解阻塞单测；`quic/mod.rs` 加 `pub mod credit;`。
 - ⬜ 步骤 3：`crates/transport/src/quic/mux.rs` —— `receiver_stream_kind` 加 `CreditGrant` →

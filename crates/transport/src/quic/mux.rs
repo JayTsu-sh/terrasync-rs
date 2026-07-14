@@ -132,7 +132,8 @@ pub(crate) fn receiver_stream_kind(msg: &ReceiverMsg) -> StreamKind {
         | ReceiverMsg::Redo { .. }
         | ReceiverMsg::Error { .. }
         | ReceiverMsg::Progress(_)
-        | ReceiverMsg::AllDone => StreamKind::AckProgress,
+        | ReceiverMsg::AllDone
+        | ReceiverMsg::CreditGrant { .. } => StreamKind::AckProgress,
     }
 }
 

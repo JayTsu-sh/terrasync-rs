@@ -88,6 +88,28 @@ pub enum SenderMsg {
     TransferDone,
 }
 
+/// Data 类消息的 credit 花费（应用层 payload 字节数）；非 Data 类消息返回 `None`
+/// （不受 credit 约束，控制/元数据类消息量级小，天然有界，见 issue #59）。
+///
+/// 计入：`FileData`/`DeltaData`/`TarPacked`（三者是实际会经过 QUIC `Data` 物理 stream、
+/// 承载应用层 payload 字节的消息；`TarPacked` 的双进程/QUIC 路径实际不可达——tar 打包
+/// 只发生在单进程模式，Sender 直接拥有 src+dest storage，走 in-process transport——这里
+/// 仍纳入计算是 defense-in-depth，防止未来打通该路径时悄悄绕过 credit）。
+/// 不计入：`DeltaMatch`（仅 4 字节 block 引用，量级可忽略）及所有握手/鉴权/元数据/
+/// 控制类消息。
+///
+/// Sender（`quic::sender::QuicSenderTransport::send()`）与 Receiver
+/// （`recv_file_list_and_data_phase`）共用本函数计算的口径，是记账不变量（扣减量 ==
+/// 授信量）成立的前提——两侧各自维护一份独立计算逻辑是 credit 泄漏/双计的常见 bug 来源。
+pub fn credit_cost(msg: &SenderMsg) -> Option<u64> {
+    match msg {
+        SenderMsg::FileData { chunk, .. } => Some(chunk.data.len() as u64),
+        SenderMsg::DeltaData { data, .. } => Some(data.len() as u64),
+        SenderMsg::TarPacked { tar_entry, .. } => Some(tar_entry.get_size()),
+        _ => None,
+    }
+}
+
 // ============================================================
 // Receiver → Sender 消息
 // ============================================================
@@ -154,6 +176,14 @@ pub enum ReceiverMsg {
     Progress(ProgressSnapshot),
     /// Receiver 完成所有写入
     AllDone,
+
+    // ── Credit 流控（issue #59，方案 b：应用层字节 credit）──
+    /// 补充 credit：Receiver 消费完 Data 类消息（`FileData`/`DeltaData`/`TarPacked`，
+    /// 见 `credit_cost`）累计达半窗口后批量授信，Sender 收到后为对应字节数
+    /// `add_permits`（见 `quic::credit::CreditWindow`）。`ndx` 预留给未来 per-ndx
+    /// 粒度并行化扩展点，当前实现恒为 `None`（全局窗口，不区分具体是哪个 ndx 的数据
+    /// 被消费）。
+    CreditGrant { bytes: u64, ndx: Option<i32> },
 }
 
 // ============================================================
@@ -175,13 +205,18 @@ pub enum ReceiverMsg {
 /// 4：`SessionConfig` 加 `delta_size_threshold: Option<String>` 字段（超过该大小的文件即使
 /// 数据不匹配也降级为全量传输，避免 delta 重建的整文件内存缓冲，见 issue #54 阶段 0），
 /// bincode 线格式不兼容 v3。
-pub const PROTOCOL_VERSION: u32 = 4;
+///
+/// 5：新增 `ReceiverMsg::CreditGrant{bytes, ndx}`（issue #59 应用层字节 credit 流控，
+/// 方案 b）：Sender 发送 `FileData`/`DeltaData`/`TarPacked` 前按 payload 字节数扣减
+/// credit（不足则等待对端授信），Receiver 消费后半窗批量授信补充，`ReceiverMsg`
+/// 新增 variant 导致 bincode 线格式不兼容 v4。
+pub const PROTOCOL_VERSION: u32 = 5;
 
 /// 当前 binary 能接受的最低对端协议版本
 ///
 /// 对端版本低于此值时握手拒绝，避免 bincode schema 不兼容导致反序列化失败
 /// 或部分文件已写入、部分未写入的"半执行"不一致状态。
-pub const MIN_SUPPORTED_PROTOCOL_VERSION: u32 = 4;
+pub const MIN_SUPPORTED_PROTOCOL_VERSION: u32 = 5;
 
 /// 完整性校验使用的 hash 算法
 ///
@@ -588,6 +623,8 @@ fn metadata_check(src: &EntryEnum, dest: &EntryEnum) -> bool {
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
+    use data_mover::NASEntry;
+
     use super::*;
 
     /// v1 对端（本 PR 改动 `SenderMsg` bincode 线格式前的协议版本）握手时必须被拒绝：
@@ -644,7 +681,25 @@ mod tests {
         }
     }
 
-    /// 双方均为当前版本（v4）时握手应正常通过
+    /// v4 对端（issue #59 方案 b 新增 `ReceiverMsg::CreditGrant` 前的协议版本）握手时
+    /// 必须被拒绝：新增 variant 后，v4 与当前 v5 的 bincode schema 不兼容，接受 v4
+    /// 对端会导致错位解码。
+    #[test]
+    fn negotiate_rejects_v4_peer() {
+        let current = ProtocolHandshake::current();
+        let v4_peer = ProtocolHandshake {
+            protocol_version: 4,
+            min_supported_version: 4,
+            features: FeatureFlags::current(),
+            hash_algorithm: HashAlgorithm::Blake3,
+        };
+        match current.negotiate(&v4_peer) {
+            HandshakeResult::Rejected { reason } => assert!(!reason.is_empty()),
+            other => panic!("v4 对端应被拒绝，got {other:?}"),
+        }
+    }
+
+    /// 双方均为当前版本（v5）时握手应正常通过
     #[test]
     fn negotiate_accepts_matching_current_peers() {
         let current = ProtocolHandshake::current();
@@ -652,5 +707,73 @@ mod tests {
             HandshakeResult::Accepted { .. } => {}
             other => panic!("相同版本应握手成功，got {other:?}"),
         }
+    }
+
+    // ── credit_cost：Data 类消息花费口径（issue #59） ──
+
+    fn dummy_entry_with_size(size: u64) -> Arc<EntryEnum> {
+        Arc::new(EntryEnum::NAS(NASEntry {
+            name: "f".to_string(),
+            relative_path: PathBuf::from("f"),
+            extension: None,
+            is_dir: false,
+            size,
+            atime: 0,
+            ctime: 0,
+            mtime: 0,
+            mode: 0o644,
+            is_symlink: false,
+            hard_links: None,
+            uid: None,
+            gid: None,
+            ino: None,
+            file_handle: None,
+            acl: None,
+            owner: None,
+            owner_group: None,
+            xattrs: None,
+        }))
+    }
+
+    #[test]
+    fn credit_cost_counts_file_data_by_chunk_payload_len() {
+        let msg = SenderMsg::FileData {
+            entry: dummy_entry_with_size(0),
+            chunk: DataChunk {
+                offset: 0,
+                data: Bytes::from(vec![0u8; 100]),
+            },
+        };
+        assert_eq!(credit_cost(&msg), Some(100));
+    }
+
+    #[test]
+    fn credit_cost_counts_delta_data_by_payload_len() {
+        let msg = SenderMsg::DeltaData {
+            ndx: 1,
+            data: Bytes::from(vec![0u8; 50]),
+        };
+        assert_eq!(credit_cost(&msg), Some(50));
+    }
+
+    #[test]
+    fn credit_cost_counts_tar_packed_by_entry_size() {
+        let msg = SenderMsg::TarPacked {
+            tar_entry: dummy_entry_with_size(12345),
+            manifest_entries: vec![],
+        };
+        assert_eq!(credit_cost(&msg), Some(12345));
+    }
+
+    #[test]
+    fn credit_cost_ignores_delta_match_and_control_messages() {
+        assert_eq!(credit_cost(&SenderMsg::DeltaMatch { ndx: 1, block_index: 0 }), None);
+        assert_eq!(credit_cost(&SenderMsg::TransferDone), None);
+        assert_eq!(
+            credit_cost(&SenderMsg::Auth {
+                token: "t".to_string()
+            }),
+            None
+        );
     }
 }
