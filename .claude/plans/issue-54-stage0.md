@@ -68,7 +68,7 @@
   `spawn_receiver_and_handshake_with_threshold` 包装（不改动既有 9 处调用签名），新增两个测试：
   超阈值 → `TransferRequest{decision:DeltaTransfer}`；阈值内 → `DeltaTransferRequest` 不受影响。
   验证：`cargo test -p app --lib remote_sync::tests::recv_file_list`
-- ⬜ step 7: e2e（`tests/remote_process_e2e.rs`）—— 仿
+- ✅ step 7: e2e（`tests/remote_process_e2e.rs`）—— 仿
   `test_remote_process_e2e_delta_sync_transfers_changed_content`，加
   `test_remote_process_e2e_delta_size_threshold_downgrades_to_full`：真实两进程，
   `--delta-size-threshold` 设为小于修改文件大小的值，断言 dest 内容仍正确 + Receiver 日志
