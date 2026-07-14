@@ -56,7 +56,7 @@ hash 计算之前，hash 自洽通过，拦不住）以及 `enable_integrity_che
 - ✅ 步骤 4：`app/receiver.rs` 单测：`decide_file_ack` 新增 `SizeMismatch` 首次 Redo /
   二次 Error 两个纯函数单测（参照现有 HashMismatch 单测）。验证：
   `cargo test -p app decide_file_ack -- --nocapture`。
-- ⬜ 步骤 5：`app/remote_sync.rs` 测试模块新增 `SizeTruncationInjector`（按目标文件相对
+- ✅ 步骤 5：`app/remote_sync.rs` 测试模块新增 `SizeTruncationInjector`（按目标文件相对
   路径截断首个匹配 `FileData` chunk 为一半长度并停发该 attempt 剩余 chunk，改写
   `EndOfFile.source_hash` 为对截断后转发字节重新计算的自洽 hash，复现"同源失明"）+ 两
   个 pipeline 测试：
