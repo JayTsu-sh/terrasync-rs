@@ -15,9 +15,17 @@
 //! fan-in channel 用**无界** `mpsc::unbounded_channel`：若改用有界 channel，某条 stream
 //! （典型如大文件 `Data` stream）密集写入把 channel 挤满后，会反过来拖慢其它 stream 的
 //! reader task 写入 channel（有界 channel 的发送方需要排队等待可用容量），重新引入
-//! 「大数据流阻塞控制消息」的问题，与本模块要解决的目标相悖。真正的背压仍然存在于
-//! QUIC 每条 stream 各自独立的接收窗口上，无界 channel 只是避免在这之上再叠加一层
-//! 跨 stream 共享的人为瓶颈。
+//! 「大数据流阻塞控制消息」的问题，与本模块要解决的目标相悖。
+//!
+//! Data 类消息（`FileData`/`DeltaData`/`TarPacked`）的应用层积压有界性，**不**由本模块
+//! 或 QUIC per-stream 接收窗口保证——早期版本这里曾声称"背压在 QUIC per-stream 窗口"，
+//! 该结论经核实是错误的：`reader_loop` 读到完整帧就立即转发进无界 channel，从不在
+//! QUIC 读取路径上阻塞，QUIC 窗口腾空与下游是否真正消费完全解耦（issue #59 核实）。
+//! 真正的有界性保证来自**应用层 credit 流控**（见 [`super::credit`]）：
+//! `QuicSenderTransport::send()` 对 Data 类消息在写入本模块的物理 stream 之前先扣减
+//! 等量 credit，credit 耗尽时挂起在 `send()` 内部（不占用本模块任何 channel 容量），
+//! Receiver 消费后按半窗批量补授权。因此本模块的无界 fan-in channel 是安全的：能落到
+//! 这里的 Data 消息本就已经被上一层的 credit 窗口钉在有限常量以内。
 //!
 //! ## Stream 发起方不对称 + 延迟 accept（两个真实进程联调时踩过的坑）
 //!
@@ -132,7 +140,8 @@ pub(crate) fn receiver_stream_kind(msg: &ReceiverMsg) -> StreamKind {
         | ReceiverMsg::Redo { .. }
         | ReceiverMsg::Error { .. }
         | ReceiverMsg::Progress(_)
-        | ReceiverMsg::AllDone => StreamKind::AckProgress,
+        | ReceiverMsg::AllDone
+        | ReceiverMsg::CreditGrant { .. } => StreamKind::AckProgress,
     }
 }
 

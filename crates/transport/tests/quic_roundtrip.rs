@@ -692,6 +692,12 @@ async fn test_quic_classification_messages_roundtrip() {
 ///    `sender.recv()` 应能在很短的超时内读到它，不被 `Data` stream 的阻塞拖累
 ///    ——这正是本 issue 要解决的问题：改造前只有一条 stream，`Data` 占满会直接
 ///    拖住 progress/ack 的读取。
+///
+/// issue #59 核实：本测试用 `quic::connect()`（默认 credit 窗口 `DEFAULT_CREDIT_WINDOW_
+/// BYTES` = 64MiB），flood 总量 8MiB 远小于该窗口，`sender.send()` 内部的 credit 扣减
+/// 不会被触发——测试观测到的阻塞仍然精确来自第 1 点描述的 QUIC per-stream 接收窗口
+/// （~1.19MiB），语义未因 credit 机制引入而变质。若未来这里的 flood 总量改大到接近或
+/// 超过 64MiB，则需要注意阻塞点会从"QUIC 窗口"变成"credit 窗口"，两者是不同的验证目标。
 #[tokio::test]
 async fn test_quic_mux_large_data_stream_does_not_block_ack_progress_stream() {
     install_crypto_provider();
