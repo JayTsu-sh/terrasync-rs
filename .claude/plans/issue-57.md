@@ -74,12 +74,13 @@ v1/v2 已被覆盖，不采用。
   传参；新增 `sender.rs` 单测验证广播。
   验证：`cargo check -p app --tests` 通过；`cargo test -p app --lib` 70 passed 0 failed；
   `cargo fmt -p app` 无额外改动。
-- 🔄 step 4：`tests/remote_process_e2e.rs` 新增双进程部分失败 e2e（chmod 0o000 触发一个文件
+- ✅ step 4：`tests/remote_process_e2e.rs` 新增双进程部分失败 e2e（chmod 0o000 触发一个文件
   自检读失败，断言 exit 0 + stdout ERROR STATISTICS total 非零 + 其余文件正常同步）；
   新增 `parse_error_stats_total` stdout 解析 helper。
-  验证：`cargo test -p terrasync-rs --test remote_process_e2e -- partial_failure`
-  （连跑 2 次确认不 flake）。
-- ⬜ step 5：收尾——`cargo fmt --all -- --check`；
+  验证：新测试单独连跑 3 次 pass；全量 `cargo test -p terrasync-rs --test remote_process_e2e`
+  连跑 2 次，14 passed 0 failed（含致命错误场景 wrong_token_rejected /
+  receiver_killed_sender_exits_nonzero 仍保持非零退出，未回归）。
+- 🔄 step 5：收尾——`cargo fmt --all -- --check`；
   `cargo test --workspace --no-fail-fast`（排除极慢的 `--all-features`，用默认 feature 集）；
   `cargo test -p terrasync-rs --test remote_process_e2e`（全量、连跑 2 次）；
   `git status` 核验无越界文件；移除本计划文件、单独 commit。
