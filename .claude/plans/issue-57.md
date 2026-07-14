@@ -80,7 +80,8 @@ v1/v2 已被覆盖，不采用。
   验证：新测试单独连跑 3 次 pass；全量 `cargo test -p terrasync-rs --test remote_process_e2e`
   连跑 2 次，14 passed 0 failed（含致命错误场景 wrong_token_rejected /
   receiver_killed_sender_exits_nonzero 仍保持非零退出，未回归）。
-- 🔄 step 5：收尾——`cargo fmt --all -- --check`；
-  `cargo test --workspace --no-fail-fast`（排除极慢的 `--all-features`，用默认 feature 集）；
-  `cargo test -p terrasync-rs --test remote_process_e2e`（全量、连跑 2 次）；
-  `git status` 核验无越界文件；移除本计划文件、单独 commit。
+- ✅ step 5：收尾——`cargo fmt --all -- --check` 干净；
+  `cargo test --workspace --no-fail-fast` 全绿（无 `--all-features`，默认 feature 集）；
+  `cargo test -p terrasync-rs --test remote_process_e2e` 全量连跑 2 次 14 passed 0 failed；
+  `git status` 发现 `web-ui/package-lock.json` 被 workspace 测试流程副作用改动（与本 issue
+  无关），已 `git checkout --` 还原；移除本计划文件、单独 commit。
