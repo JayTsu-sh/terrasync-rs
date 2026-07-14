@@ -914,31 +914,37 @@ async fn recv_file_list_and_data_phase(
 ///
 /// dc task（全量路径）与 `handle_end_of_file`（delta inline 路径）上报的 outcome
 /// 在此统一转换为终态/重试 ack：
-/// - 校验失败（`HashMismatch`）·首次 → `Redo{ndx}`，不计入 `completed_count`（文件仍在途）。
-/// - 校验失败·二次+ → `Error{ndx,"hash mismatch"}`，计入 `completed_count`。
+/// - 校验失败（`HashMismatch`/`SizeMismatch`）·首次 → `Redo{ndx}`，不计入
+///   `completed_count`（文件仍在途）。
+/// - 校验失败·二次+ → `Error{ndx,reason}`，计入 `completed_count`。
 /// - 校验通过（`Success`）→ `Success{ndx}`，计入 `completed_count`。
-/// - 硬错误（`HardError`，非 hash 类）→ 直接 `Error{ndx,reason}` 终态，不 redo。
+/// - 硬错误（`HardError`，非校验类）→ 直接 `Error{ndx,reason}` 终态，不 redo。
 ///
 /// 返回 `(ack, is_terminal)`：`is_terminal=true` 时调用方需计入 `completed_count`。
 fn decide_file_ack(attempts: &mut HashMap<i32, u8>, ndx: i32, outcome: FileOutcome) -> (ReceiverMsg, bool) {
     match outcome {
         FileOutcome::Success => (ReceiverMsg::Success { ndx }, true),
-        FileOutcome::HashMismatch => {
-            let count = attempts.entry(ndx).or_insert(0);
-            *count += 1;
-            if *count >= 2 {
-                (
-                    ReceiverMsg::Error {
-                        ndx,
-                        reason: "hash mismatch".into(),
-                    },
-                    true,
-                )
-            } else {
-                (ReceiverMsg::Redo { ndx }, false)
-            }
-        }
+        FileOutcome::HashMismatch => redo_or_error(attempts, ndx, "hash mismatch"),
+        FileOutcome::SizeMismatch => redo_or_error(attempts, ndx, "size mismatch"),
         FileOutcome::HardError(reason) => (ReceiverMsg::Error { ndx, reason }, true),
+    }
+}
+
+/// 校验失败类 outcome（`HashMismatch`/`SizeMismatch`）共用的重试计数：同一 ndx 首次 →
+/// `Redo{ndx}`，二次+ → `Error{ndx,reason}` 终态。
+fn redo_or_error(attempts: &mut HashMap<i32, u8>, ndx: i32, reason: &str) -> (ReceiverMsg, bool) {
+    let count = attempts.entry(ndx).or_insert(0);
+    *count += 1;
+    if *count >= 2 {
+        (
+            ReceiverMsg::Error {
+                ndx,
+                reason: reason.into(),
+            },
+            true,
+        )
+    } else {
+        (ReceiverMsg::Redo { ndx }, false)
     }
 }
 
@@ -1045,8 +1051,19 @@ async fn handle_end_of_file(
         }
     }
 
-    // 写入文件
+    // size 断言（写入前，独立于 hash 校验的防线，语义同 disk_commit.rs::finalize_file——
+    // 拦截 hash 校验关闭、或 hash 基于同一份被截断数据计算而"自洽"通过（同源失明）的场景）
     let data_len = file_bytes.len() as u64;
+    let expected_size = entry.get_size();
+    if data_len != expected_size {
+        error!(
+            "[Receiver Remote] size mismatch {:?}: rebuilt={} expected={}",
+            relative_path, data_len, expected_size
+        );
+        return FileOutcome::SizeMismatch;
+    }
+
+    // 写入文件
     match StorageEnum::write_file_from_bytes(dest_storage, entry, file_bytes).await {
         Ok(()) => {
             let _ = dest_storage.set_entry_metadata(entry).await;
@@ -1114,6 +1131,30 @@ mod tests {
         let (second_ack, second_terminal) = decide_file_ack(&mut attempts, 3, FileOutcome::HashMismatch);
         match second_ack {
             ReceiverMsg::Error { ndx: 3, reason } => assert_eq!(reason, "hash mismatch"),
+            other => panic!("expected Error, got {other:?}"),
+        }
+        assert!(second_terminal);
+    }
+
+    #[test]
+    fn decide_file_ack_first_size_mismatch_redos_and_is_not_terminal() {
+        let mut attempts = HashMap::new();
+        let (ack, is_terminal) = decide_file_ack(&mut attempts, 5, FileOutcome::SizeMismatch);
+        assert!(matches!(ack, ReceiverMsg::Redo { ndx: 5 }));
+        assert!(!is_terminal);
+        assert_eq!(attempts.get(&5), Some(&1));
+    }
+
+    #[test]
+    fn decide_file_ack_second_size_mismatch_errors_and_is_terminal() {
+        let mut attempts = HashMap::new();
+        let (first_ack, first_terminal) = decide_file_ack(&mut attempts, 5, FileOutcome::SizeMismatch);
+        assert!(matches!(first_ack, ReceiverMsg::Redo { ndx: 5 }));
+        assert!(!first_terminal);
+
+        let (second_ack, second_terminal) = decide_file_ack(&mut attempts, 5, FileOutcome::SizeMismatch);
+        match second_ack {
+            ReceiverMsg::Error { ndx: 5, reason } => assert_eq!(reason, "size mismatch"),
             other => panic!("expected Error, got {other:?}"),
         }
         assert!(second_terminal);

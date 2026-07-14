@@ -455,6 +455,10 @@ pub enum FileOutcome {
     Success,
     /// hash 校验失败，可 redo（每 ndx 至多重试一次）
     HashMismatch,
+    /// 落盘实际字节数与 entry 声明大小不符，可 redo（每 ndx 至多重试一次）。独立于 hash
+    /// 校验的防线：拦截 hash 校验关闭、或 hash 基于同一份被截断数据计算而"自洽"通过
+    /// （即 hash 无法识别的截断损坏）的场景（issue #53）
+    SizeMismatch,
     /// 硬错误（basis 读失败 / 写盘失败 / `resume_prepare` 失败等，非 hash 类），不可 redo
     HardError(String),
 }

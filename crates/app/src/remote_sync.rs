@@ -761,6 +761,7 @@ mod tests {
     use std::time::{Duration, SystemTime};
 
     use async_trait::async_trait;
+    use data_mover::DataChunk;
     use data_mover::create_storage;
     use data_mover::dir_tree::DirPageResult;
     use tempfile::tempdir;
@@ -1138,6 +1139,192 @@ mod tests {
         assert!(!dest_dir.path().join("a.txt").exists());
     }
 
+    // ============================================================
+    // size 断言（issue #53）：截断注入测试
+    //
+    // 与 HashMismatchInjector 篡改 hash 不同，这里截断实际转发的字节，验证 disk_commit.rs
+    // ::finalize_file / receiver.rs::handle_end_of_file 新增的 size 断言能独立于 hash
+    // 校验拦截截断的提交并触发 Redo。
+    // ============================================================
+
+    /// 测试专用 Sender transport 包装：按目标文件相对路径截断该文件传输中命中的首个
+    /// `FileData` chunk 为原长度一半，并丢弃本次 attempt 剩余 chunk，同时把
+    /// `EndOfFile.source_hash` 改写为对截断后实际转发字节重新计算的自洽 hash——复现
+    /// 生产环境"同源失明"场景（截断发生在 hash 计算前，hash 与截断内容自洽，hash 校验
+    /// 拦不住），用于验证 size 断言不依赖 hash 独立拦截。`FileData` 不携带 ndx，测试场景
+    /// 单文件足够，故按相对路径定位。`truncate_remaining`：还需截断几次（每次目标文件
+    /// attempt 递减，0 = 之后透传，让 redo 重发成功），语义同
+    /// `HashMismatchInjector::corrupt_remaining`。
+    struct SizeTruncationInjector {
+        inner: InProcessSenderTransport,
+        target_path: PathBuf,
+        truncate_remaining: Mutex<u32>,
+        /// 本次 attempt 是否已决定截断（`None` = 未决定；首个匹配 chunk 时决定并固定）
+        truncating_this_attempt: Mutex<Option<bool>>,
+        /// 本次 attempt 是否已发送过截断后的 chunk（发送后剩余 chunk 全部丢弃）
+        truncated_once: Mutex<bool>,
+        /// 已转发（截断后）的字节，供 `EndOfFile` 重算自洽 hash
+        forwarded: Mutex<Vec<u8>>,
+    }
+
+    impl SizeTruncationInjector {
+        fn new(inner: InProcessSenderTransport, target_path: PathBuf, truncate_remaining: u32) -> Self {
+            Self {
+                inner,
+                target_path,
+                truncate_remaining: Mutex::new(truncate_remaining),
+                truncating_this_attempt: Mutex::new(None),
+                truncated_once: Mutex::new(false),
+                forwarded: Mutex::new(Vec::new()),
+            }
+        }
+
+        /// 本次 attempt 首个匹配 chunk 时决定是否截断（消耗一次预算），之后同一
+        /// attempt 内固定；`EndOfFile` 处重置供下次 attempt（redo 重发）重新决定。
+        fn is_truncating_this_attempt(&self) -> bool {
+            let mut decided = self
+                .truncating_this_attempt
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            *decided.get_or_insert_with(|| {
+                let mut remaining = self.truncate_remaining.lock().unwrap_or_else(PoisonError::into_inner);
+                if *remaining > 0 {
+                    *remaining -= 1;
+                    true
+                } else {
+                    false
+                }
+            })
+        }
+    }
+
+    #[async_trait]
+    impl SenderTransport for SizeTruncationInjector {
+        async fn send(&self, msg: SenderMsg) -> TransportResult<()> {
+            match msg {
+                SenderMsg::FileData { entry, chunk } if entry.get_relative_path() == self.target_path.as_path() => {
+                    if !self.is_truncating_this_attempt() {
+                        return self.inner.send(SenderMsg::FileData { entry, chunk }).await;
+                    }
+                    let already_truncated = {
+                        let mut truncated_once = self.truncated_once.lock().unwrap_or_else(PoisonError::into_inner);
+                        std::mem::replace(&mut *truncated_once, true)
+                    };
+                    if already_truncated {
+                        // 已发过截断 chunk：本 attempt 剩余 chunk 全部丢弃
+                        return Ok(());
+                    }
+                    let half = chunk.data.len() / 2;
+                    let truncated_data = chunk.data.slice(0..half);
+                    self.forwarded
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .extend_from_slice(&truncated_data);
+                    self.inner
+                        .send(SenderMsg::FileData {
+                            entry,
+                            chunk: DataChunk {
+                                offset: chunk.offset,
+                                data: truncated_data,
+                            },
+                        })
+                        .await
+                }
+                SenderMsg::EndOfFile {
+                    ndx,
+                    entry,
+                    source_hash,
+                } if entry.get_relative_path() == self.target_path.as_path() => {
+                    let was_truncating = self
+                        .truncating_this_attempt
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .take()
+                        == Some(true);
+                    *self.truncated_once.lock().unwrap_or_else(PoisonError::into_inner) = false;
+                    let source_hash = if was_truncating {
+                        let forwarded =
+                            std::mem::take(&mut *self.forwarded.lock().unwrap_or_else(PoisonError::into_inner));
+                        Some(blake3::hash(&forwarded).to_hex().to_string())
+                    } else {
+                        source_hash
+                    };
+                    self.inner
+                        .send(SenderMsg::EndOfFile {
+                            ndx,
+                            entry,
+                            source_hash,
+                        })
+                        .await
+                }
+                other => self.inner.send(other).await,
+            }
+        }
+
+        async fn recv(&self) -> Option<ReceiverMsg> {
+            self.inner.recv().await
+        }
+
+        async fn close(&self) -> TransportResult<()> {
+            self.inner.close().await
+        }
+    }
+
+    /// (g) 全量·size 断言：截断 + 自洽 hash（同源失明复现）→ hash 校验通过但 size 不符
+    /// → `SizeMismatch` 触发 Redo → 全量重发恢复成功。验证 size 断言不依赖 hash 独立
+    /// 拦截截断的提交。
+    #[tokio::test]
+    async fn full_transfer_size_mismatch_redo_recovers_with_integrity_check() {
+        let src_dir = tempdir().unwrap();
+        let dest_dir = tempdir().unwrap();
+        fs::write(src_dir.path().join("a.txt"), b"full transfer size truncation content").unwrap();
+
+        let dest_storage = Arc::new(
+            create_storage(dest_dir.path().to_str().unwrap(), None, true)
+                .await
+                .unwrap(),
+        );
+        let (sender_transport, receiver_transport) = create_in_process_pair();
+        let injector = SizeTruncationInjector::new(sender_transport, PathBuf::from("a.txt"), 1);
+
+        let (success_count, error_count) =
+            run_pipeline(&injector, receiver_transport, src_dir.path(), dest_storage, true).await;
+
+        assert_eq!(error_count, 0, "首次 size mismatch 应通过 redo 恢复，不应计入 error");
+        assert_eq!(success_count, 1, "唯一文件应最终收到 Success{{ndx}}");
+        assert_eq!(
+            fs::read(dest_dir.path().join("a.txt")).unwrap(),
+            b"full transfer size truncation content"
+        );
+    }
+
+    /// (h) 全量·size 断言：`enable_integrity_check=false` 时同样生效——hash 校验完全
+    /// 跳过，size 断言仍能独立拦截截断并触发 Redo，全量重发恢复成功。
+    #[tokio::test]
+    async fn full_transfer_size_mismatch_redo_recovers_without_integrity_check() {
+        let src_dir = tempdir().unwrap();
+        let dest_dir = tempdir().unwrap();
+        fs::write(src_dir.path().join("a.txt"), b"full transfer size truncation content").unwrap();
+
+        let dest_storage = Arc::new(
+            create_storage(dest_dir.path().to_str().unwrap(), None, true)
+                .await
+                .unwrap(),
+        );
+        let (sender_transport, receiver_transport) = create_in_process_pair();
+        let injector = SizeTruncationInjector::new(sender_transport, PathBuf::from("a.txt"), 1);
+
+        let (success_count, error_count) =
+            run_pipeline(&injector, receiver_transport, src_dir.path(), dest_storage, false).await;
+
+        assert_eq!(error_count, 0);
+        assert_eq!(success_count, 1);
+        assert_eq!(
+            fs::read(dest_dir.path().join("a.txt")).unwrap(),
+            b"full transfer size truncation content"
+        );
+    }
+
     /// dest 目录下预置一个与 `name` 同名、同大小但内容不同的文件，并把 mtime 拨到明确
     /// 不同的过去时间点——保证 `DestIndex::check` 命中 `TransferDecision::DeltaTransfer`
     /// （data_check 仅比较 mtime+size，任一不符即判定不匹配），触发 delta 传输路径。
@@ -1195,6 +1382,99 @@ mod tests {
 
         assert_eq!(success_count, 0);
         assert_eq!(error_count, 1, "delta 降级全量重发后再次 mismatch 应进入 Error 终态");
+    }
+
+    /// 测试专用 Sender transport 包装：按目标 ndx 丢弃该次传输的首个 delta token
+    /// （`DeltaMatch`/`DeltaData` 之一），模拟 delta 重建路径的截断，覆盖
+    /// `receiver.rs::handle_end_of_file` 新增的 size 断言。不改写 hash——配合
+    /// `enable_integrity_check=false` 使用，验证 hash 校验关闭时 size 断言仍能独立
+    /// 拦截。`drop_remaining`：还需丢弃几次（每次目标 ndx attempt 递减，0 = 之后
+    /// 透传），语义同 `HashMismatchInjector::corrupt_remaining`。
+    struct DeltaTruncationInjector {
+        inner: InProcessSenderTransport,
+        target_ndx: i32,
+        drop_remaining: Mutex<u32>,
+        /// 本次 attempt 是否已丢弃过一个 token（丢一个即可制造截断，其余 token 照常转发）
+        dropped_this_attempt: Mutex<bool>,
+    }
+
+    impl DeltaTruncationInjector {
+        fn new(inner: InProcessSenderTransport, target_ndx: i32, drop_remaining: u32) -> Self {
+            Self {
+                inner,
+                target_ndx,
+                drop_remaining: Mutex::new(drop_remaining),
+                dropped_this_attempt: Mutex::new(false),
+            }
+        }
+
+        /// 本次 attempt 遇到的第一个 delta token 是否应丢弃（消耗一次预算），之后同一
+        /// attempt 内固定为不再丢。同步函数（无 `.await`），锁可安全跨整个函数体持有。
+        fn should_drop(&self) -> bool {
+            let mut dropped = self.dropped_this_attempt.lock().unwrap_or_else(PoisonError::into_inner);
+            if *dropped {
+                return false;
+            }
+            let mut remaining = self.drop_remaining.lock().unwrap_or_else(PoisonError::into_inner);
+            if *remaining == 0 {
+                return false;
+            }
+            *remaining -= 1;
+            *dropped = true;
+            true
+        }
+    }
+
+    #[async_trait]
+    impl SenderTransport for DeltaTruncationInjector {
+        async fn send(&self, msg: SenderMsg) -> TransportResult<()> {
+            match &msg {
+                SenderMsg::DeltaMatch { ndx, .. } | SenderMsg::DeltaData { ndx, .. } if *ndx == self.target_ndx => {
+                    if self.should_drop() {
+                        return Ok(());
+                    }
+                }
+                SenderMsg::EndOfFile { ndx, .. } if *ndx == self.target_ndx => {
+                    *self.dropped_this_attempt.lock().unwrap_or_else(PoisonError::into_inner) = false;
+                }
+                _ => {}
+            }
+            self.inner.send(msg).await
+        }
+
+        async fn recv(&self) -> Option<ReceiverMsg> {
+            self.inner.recv().await
+        }
+
+        async fn close(&self) -> TransportResult<()> {
+            self.inner.close().await
+        }
+    }
+
+    /// (i) delta·size 断言：`enable_integrity_check=false` 时丢弃一个 delta token 制造
+    /// 重建截断 → size 断言拦截（`handle_end_of_file`）→ Redo → 降级全量重发恢复成功。
+    #[tokio::test]
+    async fn delta_transfer_size_mismatch_redo_recovers_without_integrity_check() {
+        let src_dir = tempdir().unwrap();
+        let dest_dir = tempdir().unwrap();
+        let content = vec![b'A'; 4096];
+        fs::write(src_dir.path().join("a.txt"), &content).unwrap();
+        seed_delta_basis(dest_dir.path(), "a.txt", 4096);
+
+        let dest_storage = Arc::new(
+            create_storage(dest_dir.path().to_str().unwrap(), None, true)
+                .await
+                .unwrap(),
+        );
+        let (sender_transport, receiver_transport) = create_in_process_pair();
+        let injector = DeltaTruncationInjector::new(sender_transport, 0, 1);
+
+        let (success_count, error_count) =
+            run_pipeline(&injector, receiver_transport, src_dir.path(), dest_storage, false).await;
+
+        assert_eq!(error_count, 0);
+        assert_eq!(success_count, 1, "delta size mismatch redo 降级全量重发后应最终成功");
+        assert_eq!(fs::read(dest_dir.path().join("a.txt")).unwrap(), content);
     }
 
     /// (f) 计数不重复：文件走 `Success{ndx}`、符号链接走 `EntrySuccess`，
