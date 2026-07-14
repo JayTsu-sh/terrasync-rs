@@ -20,7 +20,7 @@ use std::collections::HashSet;
 use std::fs;
 use std::io::Read;
 use std::net::UdpSocket;
-use std::os::unix::fs::{MetadataExt, symlink};
+use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command as StdCommand, ExitStatus, Stdio};
 use std::sync::{Mutex, OnceLock};
@@ -1633,4 +1633,119 @@ fn test_remote_process_e2e_uid_gid_preserved() {
             "dest 文件 {rel:?} gid 应与 src 一致（非 root 环境下两者都应等于运行进程 gid）"
         );
     }
+}
+
+// ============================================================
+// issue #57：双进程退出码改报表驱动（entry 级失败 exit 0）+ 报表错误统计补齐
+// ============================================================
+
+/// 从 Sender stdout 打印的最终统计报表 `ERROR STATISTICS` 表格中解析 total 行计数
+/// （`fmt_error_stats` 用 `"    │ {:^12} │ {:>8} │"` 打印 total 行，是全文件唯一同时
+/// 出现 `│` 与字面量 "total" 的行；`ErrorStats::is_empty()` 为 true 时整个表格不打印，
+/// 此时返回 0）。
+fn parse_error_stats_total(stdout: &str) -> u64 {
+    stdout
+        .lines()
+        .find(|l| l.contains('│') && l.contains("total"))
+        .and_then(|l| {
+            l.split_whitespace()
+                .filter(|s| s.chars().all(|c| c.is_ascii_digit()))
+                .next_back()
+        })
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0)
+}
+
+/// 真实 2 进程部分失败 e2e：源目录一个文件内容不可读（`chmod 0o000`，非 root 环境下
+/// 确定性触发 Sender 自检读失败——`walkdir` 仅需目录读权限即可枚举到该文件的元数据，
+/// 真正失败的是后续的内容读取），其余文件正常。断言：
+/// 1. Sender 进程 exit 0（issue #57：entry 级失败不再影响退出码，报表驱动）；
+/// 2. Sender stdout 终态报表 `ERROR STATISTICS` total 行为 1（报表如实反映该失败，
+///    不再是此前的恒 0/仅退出码可见）；
+/// 3. 其余文件正常同步、内容一致；不可读文件未出现在 dest（该 entry 确实失败了，
+///    不是被静默跳过又假装成功）。
+#[test]
+fn test_remote_process_e2e_partial_failure_exit_zero_with_nonzero_report() {
+    let tmp = tempfile::tempdir().expect("create tempdir");
+    let tmp_path = tmp.path();
+
+    let src_dir = tmp_path.join("src");
+    let dest_dir = tmp_path.join("dest");
+    fs::create_dir_all(&src_dir).expect("create src dir");
+    fs::create_dir_all(&dest_dir).expect("create dest dir");
+    let rel_paths = populate_src_dir(&src_dir);
+
+    let unreadable_path = src_dir.join("unreadable.bin");
+    fs::write(&unreadable_path, b"content Sender will fail to read").expect("write unreadable file");
+    fs::set_permissions(&unreadable_path, fs::Permissions::from_mode(0o000)).expect("chmod 0o000");
+
+    let cert_path = tmp_path.join("server.crt");
+    let config_path = tmp_path.join("config.toml");
+    fs::write(&config_path, "[database]\nenabled = false\n").expect("write config");
+    let fake_manifest_dir = tmp_path.join("fake_manifest");
+
+    let port = free_loopback_port();
+    let listen_addr = format!("127.0.0.1:{port}");
+    let bin_path = cargo_bin("terrasync");
+
+    let mut receiver_child = StdCommand::new(&bin_path)
+        .env("CARGO_MANIFEST_DIR", &fake_manifest_dir)
+        .current_dir(tmp_path)
+        .arg("-c")
+        .arg(&config_path)
+        .arg("serve")
+        .arg("--listen")
+        .arg(&listen_addr)
+        .arg("--tls-cert-out")
+        .arg(&cert_path)
+        .arg(&dest_dir)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn receiver process");
+    wait_for_cert_file(&cert_path);
+
+    let mut sender_cmd = AssertCommand::new(&bin_path);
+    sender_cmd
+        .env("CARGO_MANIFEST_DIR", &fake_manifest_dir)
+        .current_dir(tmp_path)
+        .arg("-c")
+        .arg(&config_path)
+        .arg("sync")
+        .arg("--id")
+        .arg("remote_partial_failure_e2e")
+        .arg("--remote")
+        .arg(&listen_addr)
+        .arg("--tls-server-cert")
+        .arg(&cert_path)
+        .arg(&src_dir)
+        .arg(&dest_dir);
+
+    // 关键断言 1：即便有 entry 级失败，Sender 进程仍应 exit 0（报表驱动，issue #57）
+    let assert = sender_cmd.assert().success();
+    let stdout = String::from_utf8_lossy(&assert.get_output().stdout).into_owned();
+
+    let receiver_status = wait_for_child_exit(&mut receiver_child, RECEIVER_EXIT_TIMEOUT);
+    let (receiver_stdout, receiver_stderr) = drain_output(&mut receiver_child);
+    assert!(
+        matches!(receiver_status, Some(s) if s.success()),
+        "Receiver 进程异常退出: {receiver_status:?}\nstdout:\n{receiver_stdout}\nstderr:\n{receiver_stderr}"
+    );
+
+    // 关键断言 2：其余文件正常同步
+    assert_dest_matches_src(&src_dir, &dest_dir, &rel_paths);
+    // 不可读文件确实失败了（不是被静默跳过又假装成功）
+    assert!(
+        !dest_dir.join("unreadable.bin").exists(),
+        "读取失败的文件不应出现在 dest"
+    );
+
+    // 关键断言 3：终态报表如实反映该失败（此前 Sender 从不构造 StorageEntryMessage::Error，
+    // ERROR STATISTICS 与 HTTP 回调 error_count 恒为 0，唯一可见出口只有退出码；
+    // 本次改动后报表才是失败的机器可见来源）
+    let error_total = parse_error_stats_total(&stdout);
+    assert_eq!(
+        error_total, 1,
+        "Sender 报表 ERROR STATISTICS total 应为 1（1 个文件读取失败），实际 stdout:\n{stdout}"
+    );
 }

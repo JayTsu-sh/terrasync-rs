@@ -17,6 +17,7 @@ use transport::message::SenderMsg;
 use transport::traits::SenderTransport;
 
 // 内部模块
+use crate::broadcast::BroadcastForwarder;
 use crate::tar_pack;
 
 /// Sender worker 配置
@@ -35,7 +36,8 @@ pub struct SenderWorkerConfig {
 #[allow(clippy::too_many_arguments)]
 pub async fn sender_worker(
     worker_id: usize, walkdir_iter: data_mover::AsyncReceiver<StorageEntryMessage>, src_storage: Arc<StorageEnum>,
-    dest_storage: Arc<StorageEnum>, transport: Arc<dyn SenderTransport>, config: &SenderWorkerConfig,
+    dest_storage: Arc<StorageEnum>, transport: Arc<dyn SenderTransport>,
+    broadcaster: &BroadcastForwarder<StorageEntryMessage>, config: &SenderWorkerConfig,
     qos_manager: Option<QosManager>, bytes_tracker: Option<Arc<AtomicU64>>,
     object_buffers: Arc<DashMap<String, Vec<Arc<EntryEnum>>>>, active_entry_counter: Arc<AtomicUsize>,
     entry_counter: Arc<AtomicUsize>, size_counter: Arc<AtomicU64>,
@@ -140,13 +142,19 @@ pub async fn sender_worker(
                 active_entry_counter.fetch_sub(1, Ordering::Relaxed);
             }
 
-            StorageEntryMessage::Error { path, reason, .. } => {
+            StorageEntryMessage::Error {
+                ref path, ref reason, ..
+            } => {
                 error!(
                     "[Sender Worker {}] Walkdir error for {}: {}",
                     worker_id,
                     path.display(),
                     reason
                 );
+                // 全量模式下与增量分支（orchestrator.rs 的 scan worker）对齐：把 walkdir
+                // 扫描错误广播出去，计入 ErrorStats.scan、进 ERROR STATISTICS 报表与
+                // progress error 计数（issue #57，此前只打日志，报表恒不体现）。
+                broadcaster.broadcast(msg.clone()).await;
             }
 
             _ => {}
@@ -208,6 +216,77 @@ async fn handle_versioned_entry(
                     worker_id, object_key, e
                 );
             }
+        }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use std::path::PathBuf;
+
+    use data_mover::{AsyncReceiver, ErrorEvent, create_storage};
+    use tempfile::tempdir;
+    use transport::in_process::create_in_process_pair;
+
+    use super::*;
+
+    /// 全量模式 walkdir 扫描错误应与增量分支（`orchestrator.rs` 的 scan worker）对齐：
+    /// 广播给 `broadcaster` 订阅者，计入 `ErrorStats.scan`、进 ERROR STATISTICS 报表
+    /// （此前只打日志，报表恒不体现该错误，见 issue #57）。
+    #[tokio::test]
+    async fn sender_worker_broadcasts_walkdir_error() {
+        let (tx, rx) = async_channel::unbounded::<StorageEntryMessage>();
+        let walkdir_iter = AsyncReceiver::new(rx);
+        tx.send(StorageEntryMessage::Error {
+            event: ErrorEvent::Scan,
+            path: PathBuf::from("bad/path.txt"),
+            reason: "walkdir stat failed".to_string(),
+        })
+        .await
+        .unwrap();
+        drop(tx);
+
+        let (sender_transport, _receiver_transport) = create_in_process_pair();
+        let transport: Arc<dyn SenderTransport> = Arc::new(sender_transport);
+
+        let tmp = tempdir().unwrap();
+        let storage = Arc::new(create_storage(tmp.path().to_str().unwrap(), None, false).await.unwrap());
+
+        let config = SenderWorkerConfig {
+            enable_integrity_check: false,
+            enable_acl: false,
+            is_source_reserved: true,
+            large_file_log_threshold: u64::MAX,
+        };
+
+        let mut broadcaster = BroadcastForwarder::new(16);
+        let mut rx_bc = broadcaster.subscribe();
+
+        sender_worker(
+            0,
+            walkdir_iter,
+            storage.clone(),
+            storage,
+            transport,
+            &broadcaster,
+            &config,
+            None,
+            None,
+            Arc::new(DashMap::new()),
+            Arc::new(AtomicUsize::new(0)),
+            Arc::new(AtomicUsize::new(0)),
+            Arc::new(AtomicU64::new(0)),
+        )
+        .await;
+
+        match rx_bc.try_recv() {
+            Ok(StorageEntryMessage::Error { path, reason, event }) => {
+                assert_eq!(path, PathBuf::from("bad/path.txt"));
+                assert_eq!(reason, "walkdir stat failed");
+                assert_eq!(event, ErrorEvent::Scan);
+            }
+            other => panic!("expected broadcast StorageEntryMessage::Error, got {other:?}"),
         }
     }
 }
