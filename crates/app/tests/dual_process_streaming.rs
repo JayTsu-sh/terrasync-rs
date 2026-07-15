@@ -303,3 +303,141 @@ async fn dc_abort_file_drops_part_no_ack() {
     assert!(!tmp.path().join("aborted.bin").exists());
     assert!(!tmp.path().join("aborted.bin.terrasync-part").exists());
 }
+
+// ============================================================
+// delta 重建三段式（issue #54 阶段 3）：DeltaBegin/DeltaMatch/DeltaData/DeltaCommit
+// 直接驱动 disk_commit_task，basis block 经真实 read_chunk_stream 读取（不再是内存
+// basis_data 切片），验证与 dc 全量路径共用的三段式落盘/hash 校验/清理语义一致。
+// ============================================================
+
+// Match token（basis block）+ Data token（字面量）交错重建：basis.bin 预先落盘为旧内容，
+// DeltaCommit 后应原子替换为新内容，且 .part 被清理。
+#[tokio::test]
+async fn dc_delta_reconstructs_from_basis_and_literal_tokens() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dest = local_storage(tmp.path()).await;
+    let basis_content = b"AAAAABBBBBCCCCCDDDDD"; // 4 个 5 字节 block
+    std::fs::write(tmp.path().join("basis.bin"), basis_content).unwrap();
+
+    let new_content = b"AAAAAXXXXXCCCCCDDDDD"; // block0 命中 + 字面量替换 block1 + block2/3 命中
+    let entry = make_nas_entry("basis.bin", false, false, new_content.len() as u64, 0o644);
+    let source_hash = blake3::hash(new_content).to_hex().to_string();
+
+    let msgs = vec![
+        DiskCommitMsg::DeltaBegin {
+            ndx: 0,
+            entry: entry.clone(),
+            block_size: 5,
+        },
+        DiskCommitMsg::DeltaMatch {
+            entry: entry.clone(),
+            block_index: 0,
+        },
+        DiskCommitMsg::DeltaData {
+            entry: entry.clone(),
+            data: Bytes::from_static(b"XXXXX"),
+        },
+        DiskCommitMsg::DeltaMatch {
+            entry: entry.clone(),
+            block_index: 2,
+        },
+        DiskCommitMsg::DeltaMatch {
+            entry: entry.clone(),
+            block_index: 3,
+        },
+        DiskCommitMsg::DeltaCommit {
+            ndx: 0,
+            entry: entry.clone(),
+            source_hash: Some(source_hash),
+        },
+    ];
+
+    let acks = run_dc(dest, session_cfg(true), msgs).await;
+    assert!(acks.iter().any(|a| matches!(
+        a,
+        DcAck::FileOutcome {
+            ndx: 0,
+            outcome: FileOutcome::Success
+        }
+    )));
+    assert_eq!(std::fs::read(tmp.path().join("basis.bin")).unwrap(), new_content);
+    assert!(!tmp.path().join("basis.bin.terrasync-part").exists());
+}
+
+// 空 tokens 的 delta（源文件为空）：DeltaBegin 后直接 DeltaCommit，应产出空文件，
+// 与全量路径 dc_zero_byte_file 的空文件语义一致。
+#[tokio::test]
+async fn dc_delta_zero_tokens_produces_empty_file() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dest = local_storage(tmp.path()).await;
+    std::fs::write(tmp.path().join("shrink.bin"), b"old content here").unwrap();
+    let entry = make_nas_entry("shrink.bin", false, false, 0, 0o644);
+
+    let acks = run_dc(
+        dest,
+        session_cfg(true),
+        vec![
+            DiskCommitMsg::DeltaBegin {
+                ndx: 0,
+                entry: entry.clone(),
+                block_size: 5,
+            },
+            DiskCommitMsg::DeltaCommit {
+                ndx: 0,
+                entry: entry.clone(),
+                source_hash: None,
+            },
+        ],
+    )
+    .await;
+
+    assert!(acks.iter().any(|a| matches!(
+        a,
+        DcAck::FileOutcome {
+            ndx: 0,
+            outcome: FileOutcome::Success
+        }
+    )));
+    assert_eq!(std::fs::metadata(tmp.path().join("shrink.bin")).unwrap().len(), 0);
+}
+
+// basis 读失败（引用的 basis file 在磁盘上根本不存在）：应上报 HardError 并中止该
+// ActiveFile（丢弃 .part），不产生最终文件——钉死 push_delta_token 的错误路径。
+#[tokio::test]
+async fn dc_delta_basis_read_failure_reports_hard_error_and_cleans_part() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dest = local_storage(tmp.path()).await;
+    // 故意不落盘 "missing.bin"：resume_prepare(resume=false) 不依赖目标文件预先存在，
+    // 但 DeltaMatch 触发的 basis 区间读会因文件不存在而失败。
+    let entry = make_nas_entry("missing.bin", false, false, 10, 0o644);
+
+    let acks = run_dc(
+        dest,
+        session_cfg(true),
+        vec![
+            DiskCommitMsg::DeltaBegin {
+                ndx: 0,
+                entry: entry.clone(),
+                block_size: 5,
+            },
+            DiskCommitMsg::DeltaMatch {
+                entry: entry.clone(),
+                block_index: 0,
+            },
+        ],
+    )
+    .await;
+
+    assert!(
+        acks.iter().any(|a| matches!(
+            a,
+            DcAck::FileOutcome {
+                ndx: 0,
+                outcome: FileOutcome::HardError(_)
+            }
+        )),
+        "basis 读失败应上报 HardError，实际: {acks:?}"
+    );
+    assert!(!tmp.path().join("missing.bin").exists());
+    assert!(!tmp.path().join("missing.bin.terrasync-part").exists());
+}

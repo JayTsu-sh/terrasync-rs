@@ -52,9 +52,13 @@
      `DeltaBegin`/`DeltaMatch`/`DeltaData`/`DeltaCommit` 四个分支 + `push_delta_token`/
      `read_basis_block` helper；`finalize_file` 复用不变。`cargo check -p app` 通过（新分支
      暂无 receiver 侧调用，端到端验证随步骤 4 完成）。
-- ⬜ 4. app::receiver：移除 `delta_tokens`/`handle_end_of_file`，接入 `delta_active` +
-     `ensure_delta_active`，`DeltaMatch`/`DeltaData`/`EndOfFile` 分支改为转发 dc_tx。
-     `cargo test -p app`（含全部 delta 相关 in-process 集成测试）。
+- ✅ 4. app::receiver：移除 `delta_tokens`/`handle_end_of_file`，接入 `delta_active` +
+     `ensure_delta_active`，`DeltaMatch`/`DeltaData`/`EndOfFile` 分支改为转发 dc_tx；
+     `validate_relative_path` 提升为 `pub(crate)` 供 disk_commit.rs 的 `DeltaBegin` 复用
+     （保留原 `handle_end_of_file` 里的路径穿越防线，不随重构悄悄丢失）。新增
+     `crates/app/tests/dual_process_streaming.rs` 3 个 delta 专项测试（basis+字面量交错
+     重建、零 token 空文件、basis 读失败 HardError）。`cargo test -p app`：89 passed
+     （80 单测 + 9 dual_process_streaming 集成测试，含全部既有 delta redo/threshold 测试）。
 - ⬜ 5. 收尾：`cargo fmt`（仅本次改动文件）、`cargo test -p sync-delta` / `-p app` 全量、
      `cargo test -p terrasync-rs --test remote_process_e2e` 连跑 2 次、`git status` 检查越界
      文件、移除本 plan 文件。

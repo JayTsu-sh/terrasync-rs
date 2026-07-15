@@ -23,7 +23,7 @@ use transport::message::{DcAck, DiskCommitMsg, FileOutcome, ReceiverMsg, Session
 // 内部模块
 use crate::byte_resume::part_path_for;
 use crate::error::{AppError, Result};
-use crate::receiver::ReceiverProgress;
+use crate::receiver::{ReceiverProgress, validate_relative_path};
 
 /// 当前正在流式写入的文件上下文。
 struct ActiveFile {
@@ -143,6 +143,18 @@ pub async fn disk_commit_task(
             //    finalize_file，仅"产出待写字节"的方式不同（逐 token 经 Reconstructor 推算，
             //    Match token 按需读 basis file） ──
             DiskCommitMsg::DeltaBegin { ndx, entry, block_size } => {
+                if let Err(e) = validate_relative_path(entry.get_relative_path()) {
+                    warn!(
+                        "[dc] Rejecting unsafe relative path (delta) {:?}: {}",
+                        entry.get_relative_path(),
+                        e
+                    );
+                    let _ = ack_tx.send(DcAck::FileOutcome {
+                        ndx,
+                        outcome: FileOutcome::HardError(format!("{e}")),
+                    });
+                    continue;
+                }
                 let part_path = part_path_for(entry.get_relative_path());
                 match StorageEnum::resume_prepare(&dest, &entry, &part_path, false).await {
                     Ok((_missing, handle)) => {
