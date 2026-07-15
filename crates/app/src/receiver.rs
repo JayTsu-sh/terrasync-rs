@@ -11,9 +11,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 // 外部 crate
-use bytes::Bytes;
 use data_mover::qos::QosManager;
 use data_mover::{EntryEnum, StorageEnum};
+use tokio::sync::mpsc;
 use tokio::sync::mpsc::Receiver as MpscReceiver;
 use tracing::{Instrument, debug, error, info, info_span, trace, warn};
 use transport::error::TransportError;
@@ -468,7 +468,7 @@ fn resolve_delta_size_threshold(threshold: &Option<String>) -> Result<u64> {
 /// 双进程远端模式下 Sender 不可信，若 `entry.get_relative_path()` 被恶意构造为绝对路径
 /// 或含 `..` 的路径，会导致目标端在 `dest_path` 之外写入/覆盖文件（路径穿越）。
 /// 此校验必须在所有以该路径驱动 `dest_storage` 写操作之前调用。
-fn validate_relative_path(path: &Path) -> Result<()> {
+pub(crate) fn validate_relative_path(path: &Path) -> Result<()> {
     if path.is_absolute() || path.components().any(|c| matches!(c, Component::ParentDir)) {
         return Err(AppError::UnsafeRelativePath {
             path: path.to_path_buf(),
@@ -518,8 +518,6 @@ async fn recv_file_list_and_data_phase(
     // （SenderMsg::EntryError）可能各自独立上报同一 ndx 的终态，按 ndx 去重只在首次
     // 生效，防止 completed_count 被多次计入导致主循环提前 break、丢在途文件（[1]）。
     let mut terminated: HashSet<i32> = HashSet::new();
-    // delta 重建 token 缓冲
-    let mut delta_tokens: Vec<sync_delta::DeltaToken> = Vec::new();
     // TransferDone 与实际数据完成的解耦计数（见函数文档）
     let mut requested_count: u64 = 0;
     let mut completed_count: u64 = 0;
@@ -527,17 +525,22 @@ async fn recv_file_list_and_data_phase(
     // 全量文件是否走 disk-commit 流式路径：以是否见过 FileBegin 判定（而非 token 是否为空），
     // 避免源端缩到 0 字节的 delta 传输（token 空且无 FileBegin）被误判为全量。
     let mut full_active = false;
+    // delta 文件是否已向 disk-commit task 发过 DeltaBegin：镜像 full_active，首个属于该
+    // ndx 的 delta 数据事件（token 或 EndOfFile）才触发一次 DeltaBegin，见
+    // `ensure_delta_active` 文档（避免 FilePage 阶段流水线化发出多个
+    // DeltaTransferRequest、早于任何响应到达导致 dc_tx 收到乱序 DeltaBegin）。
+    let mut delta_active = false;
     // 已创建的目录：所有文件传输完成后统一回写 mtime/mode(写子文件会把目录 mtime 顶到当前时间;
     // 且 0500 等受限权限须在写完子项后才能设),对齐单进程 orchestrator 的目录 mtime 收尾。
     let mut created_dirs: Vec<Arc<EntryEnum>> = Vec::new();
-    // credit 累计消费（issue #59 方案 b）：FileData/DeltaData 处理完成（送 dc_tx/入
-    // delta_tokens）后累加，达半窗口阈值批量发一次 CreditGrant 并清零，见
-    // `accumulate_credit`。选"送达即补"而非"落盘才补"：时序上与落盘 ack 近似等价、
-    // 落盘 ack 通路改动更大且窗口利用率更差、dc 缓冲本身有界，三者共同构成确定的
-    // 应用层积压上界（window + dc 固定缓冲常量）。
+    // credit 累计消费（issue #59 方案 b）：FileData/DeltaData 处理完成（送 dc_tx）后累加，
+    // 达半窗口阈值批量发一次 CreditGrant 并清零，见 `accumulate_credit`。选"送达即补"而非
+    // "落盘才补"：时序上与落盘 ack 近似等价、落盘 ack 通路改动更大且窗口利用率更差、dc
+    // 缓冲本身有界，三者共同构成确定的应用层积压上界（window + dc 固定缓冲常量）。
     let mut credit_consumed: u64 = 0;
-    // disk-commit task：全量文件三段流式落盘（去整文件 BytesMut）；ack 经 unbounded channel 回流，
-    // 避免路由 select 阻在 dc_tx.send 时不 drain ack → dc 阻在 ack_tx.send 的双向死锁。
+    // disk-commit task：全量/delta 文件均三段流式落盘（去整文件 BytesMut/token Vec）；ack
+    // 经 unbounded channel 回流，避免路由 select 阻在 dc_tx.send 时不 drain ack → dc 阻在
+    // ack_tx.send 的双向死锁。
     let (dc_tx, dc_rx) = tokio::sync::mpsc::channel::<DiskCommitMsg>(16);
     let (ack_tx, mut ack_rx) = tokio::sync::mpsc::unbounded_channel::<DcAck>();
     let dc_join = tokio::spawn(crate::disk_commit::disk_commit_task(
@@ -795,7 +798,6 @@ async fn recv_file_list_and_data_phase(
             // ── 文件开始：标记走全量流式路径，交 disk-commit task 起 resume_prepare + write_chunk_stream ──
             Some(SenderMsg::FileBegin { ndx, entry }) => {
                 full_active = true;
-                delta_tokens.clear();
                 let _ = dc_tx.send(DiskCommitMsg::FileBegin { ndx, entry }).await;
             }
 
@@ -859,12 +861,23 @@ async fn recv_file_list_and_data_phase(
                 }
             }
 
-            // ── Delta token 接收 ──
-            Some(SenderMsg::DeltaMatch { ndx: _, block_index }) => {
-                delta_tokens.push(sync_delta::DeltaToken::Match { block_index });
+            // ── Delta token 接收：逐 token 转发给 disk-commit task（不再攒整文件 Vec，见
+            //    issue #54 阶段 3），首个属于该 ndx 的 token 先触发一次 DeltaBegin ──
+            Some(SenderMsg::DeltaMatch { ndx, block_index }) => {
+                if let Some(entry) = ndx_table.get(ndx).cloned() {
+                    ensure_delta_active(&dc_tx, &mut delta_active, ndx, &entry).await;
+                    let _ = dc_tx.send(DiskCommitMsg::DeltaMatch { entry, block_index }).await;
+                } else {
+                    warn!("[Receiver Remote] DeltaMatch for unknown ndx {}", ndx);
+                }
             }
-            Some(SenderMsg::DeltaData { ndx: _, data }) => {
-                delta_tokens.push(sync_delta::DeltaToken::Data(data));
+            Some(SenderMsg::DeltaData { ndx, data }) => {
+                if let Some(entry) = ndx_table.get(ndx).cloned() {
+                    ensure_delta_active(&dc_tx, &mut delta_active, ndx, &entry).await;
+                    let _ = dc_tx.send(DiskCommitMsg::DeltaData { entry, data }).await;
+                } else {
+                    warn!("[Receiver Remote] DeltaData for unknown ndx {}", ndx);
+                }
                 if let Some(bytes) = credit_delta
                     && let Some(grant) = accumulate_credit(&mut credit_consumed, bytes, CREDIT_GRANT_THRESHOLD_BYTES)
                 {
@@ -873,39 +886,17 @@ async fn recv_file_list_and_data_phase(
             }
 
             // ── 文件结束：见过 FileBegin → 全量交 disk-commit task 收尾（读回 .part hash 校验 → 原子
-            //    rename），completed_count 在 dc ack 回流时才 +1；否则走 delta inline 重建，outcome
-            //    同样交 decide_file_ack 做统一 redo 决策（与全量路径共用一份状态机）──
+            //    rename）；否则是 delta 路径（含零 token 的空文件 delta，ensure_delta_active
+            //    幂等补发 DeltaBegin），同样交 disk-commit task 三段式收尾。completed_count 统一
+            //    在 dc ack 回流时才 +1（decide_file_ack 做 redo 决策，全量/delta 共用一份状态机）──
             Some(SenderMsg::EndOfFile { ndx, entry, source_hash }) => {
                 if full_active {
                     full_active = false;
                     let _ = dc_tx.send(DiskCommitMsg::FileCommit { ndx, entry, source_hash }).await;
                 } else {
-                    let tokens = std::mem::take(&mut delta_tokens);
-                    let outcome = handle_end_of_file(
-                        dest_storage,
-                        &entry,
-                        source_hash,
-                        tokens,
-                        Bytes::new(),
-                        progress,
-                        session_config.enable_integrity_check,
-                    )
-                    .await;
-                    if dispatch_file_outcome(
-                        transport,
-                        &mut attempts,
-                        &mut terminated,
-                        progress,
-                        ndx,
-                        outcome,
-                        &mut completed_count,
-                        requested_count,
-                        transfer_done_seen,
-                    )
-                    .await
-                    {
-                        break;
-                    }
+                    ensure_delta_active(&dc_tx, &mut delta_active, ndx, &entry).await;
+                    delta_active = false;
+                    let _ = dc_tx.send(DiskCommitMsg::DeltaCommit { ndx, entry, source_hash }).await;
                 }
             }
 
@@ -936,6 +927,7 @@ async fn recv_file_list_and_data_phase(
             Some(SenderMsg::EntryError { path, reason, ndx }) => {
                 warn!("[Receiver Remote] Sender EntryError {:?}: {} — 中止该文件", path, reason);
                 full_active = false;
+                delta_active = false;
                 let _ = dc_tx.send(DiskCommitMsg::AbortFile).await;
                 let should_break = if let Some(ndx) = ndx {
                     record_ndx_completion(&mut terminated, ndx, &mut completed_count, requested_count, transfer_done_seen)
@@ -1001,8 +993,8 @@ async fn recv_file_list_and_data_phase(
 
 /// ndx 级文件传输 redo 决策（方案 A 的统一决策点）
 ///
-/// dc task（全量路径）与 `handle_end_of_file`（delta inline 路径）上报的 outcome
-/// 在此统一转换为终态/重试 ack：
+/// dc task（全量/delta 路径统一经 `disk_commit_task` 上报，见 issue #54 阶段 3）上报的
+/// outcome 在此统一转换为终态/重试 ack：
 /// - 校验失败（`HashMismatch`/`SizeMismatch`）·首次 → `Redo{ndx}`，不计入
 ///   `completed_count`（文件仍在途）。
 /// - 校验失败·二次+ → `Error{ndx,reason}`，计入 `completed_count`。
@@ -1037,7 +1029,7 @@ fn redo_or_error(attempts: &mut HashMap<i32, u8>, ndx: i32, reason: &str) -> (Re
     }
 }
 
-/// `FileOutcome` 上报的统一处理入口（dc task 全量路径 / delta inline 路径共用）：
+/// `FileOutcome` 上报的统一处理入口（dc task 全量/delta 路径共用）：
 /// 调用 `decide_file_ack` 做 redo 决策；非终态（`Redo`）直接发 ack、不动
 /// `completed_count`。终态先按 `ndx` 去重（redo 期间 dc task 与 Sender 自检失败
 /// 可能各自独立上报同一 ndx 的终态，去重只在首次生效，见 [`record_ndx_completion`]）：
@@ -1084,87 +1076,31 @@ fn record_ndx_completion(
     false
 }
 
-/// `EndOfFile` 处理（delta inline 路径）：重建文件字节（delta 或全量） → hash 校验 → 写入目标端
+/// 首个属于该 ndx 的 delta 数据事件（token 或 EndOfFile）才触发一次 `DeltaBegin`，幂等
+/// （`delta_active` 已为 `true` 时直接返回）。
 ///
-/// `tokens` 非空时执行 delta 重建，为空时直接使用 `file_data`。返回 `FileOutcome`，不再自行
-/// 发送终态 ack —— 调用方通过 `decide_file_ack` 统一做 redo 决策（与全量路径共用一份状态机）。
-///
-/// `enable_integrity_check=false` 时跳过 hash 校验（与全量路径 `disk_commit.rs::finalize_file`
-/// 的门控行为一致），避免关闭校验后仍因 hash 不符触发多余 redo。
-async fn handle_end_of_file(
-    dest_storage: &Arc<StorageEnum>, entry: &Arc<data_mover::EntryEnum>, source_hash: Option<String>,
-    tokens: Vec<sync_delta::DeltaToken>, file_data: bytes::Bytes, progress: &Arc<ReceiverProgress>,
-    enable_integrity_check: bool,
-) -> FileOutcome {
-    let relative_path = entry.get_relative_path();
-
-    if let Err(e) = validate_relative_path(relative_path) {
-        warn!(
-            "[Receiver Remote] Rejecting unsafe relative path {:?}: {}",
-            relative_path, e
-        );
-        return FileOutcome::HardError(format!("{e}"));
+/// 不能在 Receiver 发出 `DeltaTransferRequest` 时就触发：`FilePage` 阶段可能流水线化
+/// 连续发出多个 `DeltaTransferRequest`（不等待任何一个的响应），若在发送请求的同时就
+/// `DeltaBegin`，dc_tx 会收到与 Sender 实际数据流顺序不一致的 `DeltaBegin` 序列（dc
+/// task 严格串行、同一时刻只有一个 `ActiveFile`）。依据：Sender 侧
+/// `process_requests_and_acks` 单一消费者循环严格串行处理每个 ndx 的数据阶段（无并发
+/// spawn），故 Receiver 单一收消息循环里首个属于某 ndx 的 delta 数据事件必然对应"当前
+/// 正在流的文件"。
+async fn ensure_delta_active(
+    dc_tx: &mpsc::Sender<DiskCommitMsg>, delta_active: &mut bool, ndx: i32, entry: &Arc<EntryEnum>,
+) {
+    if *delta_active {
+        return;
     }
-
-    // 重建文件字节：delta 或全量
-    let file_bytes: bytes::Bytes = if tokens.is_empty() {
-        file_data
-    } else {
-        info!(
-            "[Receiver Remote] Delta reconstruct {:?}: {} tokens",
-            relative_path,
-            tokens.len()
-        );
-        let size = entry.get_size();
-        match StorageEnum::read_file_from(dest_storage, entry, size).await {
-            Ok(basis_data) => {
-                let block_size = sync_delta::calculate_block_size(size);
-                bytes::Bytes::from(sync_delta::reconstruct::reconstruct(&basis_data, &tokens, block_size))
-            }
-            Err(e) => {
-                error!("[Receiver Remote] read basis failed {:?}: {}", relative_path, e);
-                return FileOutcome::HardError(format!("{e}"));
-            }
-        }
-    };
-
-    // 验证 hash（与全量路径一致：仅在 enable_integrity_check 时校验）
-    if enable_integrity_check && let Some(ref expected_hash) = source_hash {
-        let actual_hash = blake3::hash(&file_bytes).to_hex().to_string();
-        if &actual_hash != expected_hash {
-            error!(
-                "[Receiver Remote] Hash mismatch {:?}: expected {}, got {}",
-                relative_path, expected_hash, actual_hash
-            );
-            return FileOutcome::HashMismatch;
-        }
-    }
-
-    // size 断言（写入前，独立于 hash 校验的防线，语义同 disk_commit.rs::finalize_file——
-    // 拦截 hash 校验关闭、或 hash 基于同一份被截断数据计算而"自洽"通过（同源失明）的场景）
-    let data_len = file_bytes.len() as u64;
-    let expected_size = entry.get_size();
-    if data_len != expected_size {
-        error!(
-            "[Receiver Remote] size mismatch {:?}: rebuilt={} expected={}",
-            relative_path, data_len, expected_size
-        );
-        return FileOutcome::SizeMismatch;
-    }
-
-    // 写入文件
-    match StorageEnum::write_file_from_bytes(dest_storage, entry, file_bytes).await {
-        Ok(()) => {
-            let _ = dest_storage.set_entry_metadata(entry).await;
-            progress.files_transferred.fetch_add(1, Ordering::Relaxed);
-            progress.bytes_transferred.fetch_add(data_len, Ordering::Relaxed);
-            FileOutcome::Success
-        }
-        Err(e) => {
-            error!("[Receiver Remote] write failed {:?}: {}", relative_path, e);
-            FileOutcome::HardError(format!("{e}"))
-        }
-    }
+    let block_size = sync_delta::calculate_block_size(entry.get_size());
+    let _ = dc_tx
+        .send(DiskCommitMsg::DeltaBegin {
+            ndx,
+            entry: entry.clone(),
+            block_size,
+        })
+        .await;
+    *delta_active = true;
 }
 
 #[cfg(test)]
