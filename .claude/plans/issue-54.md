@@ -51,9 +51,9 @@
   （与 `handle_full_transfer` 同构），错误路径对齐（读失败发 `EntryError`，不 hang）；
   `cargo check -p app` 通过，`cargo test -p app`：80 + 6 passed（delta 相关 13 个用例零改动
   通过，含读失败/redo 用例）。
-- ⬜ 步骤 5：收尾——`cargo fmt`（仅本次改动文件）、`cargo test -p sync-delta`、
-  `cargo test -p app`、`tests/remote_process_e2e.rs` 全量回归（跑 2 次防 flake）、
-  `git status` 检查无越界文件、移除本计划文件。
+- ✅ 步骤 5：收尾——`cargo fmt`（无格式改动）、`cargo test -p sync-delta`（42 passed）、
+  `cargo test -p app`（80+6 passed）、`cargo test -p terrasync-rs --test remote_process_e2e`
+  全量 16 个连跑 2 次均 pass（无 flake）、`git status` 无越界文件、移除本计划文件。
 
 ## 设计要点（DeltaMatcher 内部状态机）
 
