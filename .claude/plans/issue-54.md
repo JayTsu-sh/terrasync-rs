@@ -38,12 +38,12 @@
 
 - ✅ 步骤 0：读 spec、盘点现有代码（matcher.rs / signature.rs 参照模板 / rolling.rs /
   remote_sync.rs handle_delta_transfer / receiver.rs EntryError 语义），确认设计方案，立本计划。
-- 🔄 步骤 1：`sync-delta/src/matcher.rs` 新增跨 push 边界等价性测试（先写测试，此时
+- ✅ 步骤 1：`sync-delta/src/matcher.rs` 新增跨 push 边界等价性测试（先写测试，此时
   `DeltaMatcher` 尚未实现，预期编译失败/测试失败），覆盖 spec 列出的全部场景 + property 式
   固定种子随机切分对拍。
-- ⬜ 步骤 2：实现 `DeltaMatcher`（滚动窗口跨 push 状态机：carry 缓冲 + 惰性 window
+- ✅ 步骤 2：实现 `DeltaMatcher`（滚动窗口跨 push 状态机：carry 缓冲 + 惰性 window
   init/incremental update，处理不足一个 block 的暂停/续算），`delta_match` 改薄封装；跑通
-  步骤 1 全部测试 + 原有 matcher.rs 测试零改动通过。
+  步骤 1 全部测试 + 原有 matcher.rs 测试零改动通过（`cargo test -p sync-delta`：41 passed）。
 - ⬜ 步骤 3：容量上界测试（周期性命中场景下 carry/literal_buf 不随 push 次数增长）。
 - ⬜ 步骤 4：`app/src/remote_sync.rs::handle_delta_transfer` 改为 `read_chunk_stream` 驱动
   `DeltaMatcher::push`/`finish`，复用 `read_chunk_stream` 自带 hash_handle 生成 `source_hash`
