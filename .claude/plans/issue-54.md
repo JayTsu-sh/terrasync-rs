@@ -38,7 +38,7 @@
 
 - ✅ 步骤 0：读 spec、盘点现有代码（matcher.rs / signature.rs 参照模板 / rolling.rs /
   remote_sync.rs handle_delta_transfer / receiver.rs EntryError 语义），确认设计方案，立本计划。
-- ⬜ 步骤 1：`sync-delta/src/matcher.rs` 新增跨 push 边界等价性测试（先写测试，此时
+- 🔄 步骤 1：`sync-delta/src/matcher.rs` 新增跨 push 边界等价性测试（先写测试，此时
   `DeltaMatcher` 尚未实现，预期编译失败/测试失败），覆盖 spec 列出的全部场景 + property 式
   固定种子随机切分对拍。
 - ⬜ 步骤 2：实现 `DeltaMatcher`（滚动窗口跨 push 状态机：carry 缓冲 + 惰性 window
