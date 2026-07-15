@@ -46,10 +46,11 @@
   步骤 1 全部测试 + 原有 matcher.rs 测试零改动通过（`cargo test -p sync-delta`：41 passed）。
 - ✅ 步骤 3：容量上界测试（周期性命中场景下 carry/literal_buf 不随 push 次数增长，
   `cargo test -p sync-delta`：42 passed）。
-- ⬜ 步骤 4：`app/src/remote_sync.rs::handle_delta_transfer` 改为 `read_chunk_stream` 驱动
+- ✅ 步骤 4：`app/src/remote_sync.rs::handle_delta_transfer` 改为 `read_chunk_stream` 驱动
   `DeltaMatcher::push`/`finish`，复用 `read_chunk_stream` 自带 hash_handle 生成 `source_hash`
   （与 `handle_full_transfer` 同构），错误路径对齐（读失败发 `EntryError`，不 hang）；
-  `cargo test -p app` 定向验证 delta 相关测试全绿（含读失败/redo 用例零改动通过）。
+  `cargo check -p app` 通过，`cargo test -p app`：80 + 6 passed（delta 相关 13 个用例零改动
+  通过，含读失败/redo 用例）。
 - ⬜ 步骤 5：收尾——`cargo fmt`（仅本次改动文件）、`cargo test -p sync-delta`、
   `cargo test -p app`、`tests/remote_process_e2e.rs` 全量回归（跑 2 次防 flake）、
   `git status` 检查无越界文件、移除本计划文件。
