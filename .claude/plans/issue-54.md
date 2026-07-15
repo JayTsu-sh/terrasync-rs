@@ -48,9 +48,10 @@
      容量上界证明测试。`cargo test -p sync-delta`（51 passed，原有测试零改动通过）。
 - ✅ 2. transport::message：`DiskCommitMsg::DeltaBegin`/`DeltaCommit` 加 `ndx: i32` 字段
      （进程内 channel，非 wire）。`cargo check -p transport` 通过。
-- ⬜ 3. app::disk_commit：`ActiveFile` 加 `delta: Option<DeltaCtx>`；接入
+- ✅ 3. app::disk_commit：`ActiveFile` 加 `delta: Option<DeltaCtx>`；接入
      `DeltaBegin`/`DeltaMatch`/`DeltaData`/`DeltaCommit` 四个分支 + `push_delta_token`/
-     `read_basis_block` helper；`finalize_file` 复用不变。`cargo check -p app`。
+     `read_basis_block` helper；`finalize_file` 复用不变。`cargo check -p app` 通过（新分支
+     暂无 receiver 侧调用，端到端验证随步骤 4 完成）。
 - ⬜ 4. app::receiver：移除 `delta_tokens`/`handle_end_of_file`，接入 `delta_active` +
      `ensure_delta_active`，`DeltaMatch`/`DeltaData`/`EndOfFile` 分支改为转发 dc_tx。
      `cargo test -p app`（含全部 delta 相关 in-process 集成测试）。
