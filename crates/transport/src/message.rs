@@ -446,15 +446,22 @@ pub enum DiskCommitMsg {
         source_hash: Option<String>,
     },
 
-    // ── 增量传输 (delta，Phase 5) ──
-    /// 开始 delta 重建
-    DeltaBegin { entry: Arc<EntryEnum>, block_size: u32 },
+    // ── 增量传输 (delta，issue #54 阶段 3 接入) ──
+    /// 开始 delta 重建：Receiver 据此 resume_prepare + 起 write_chunk_stream（与 `FileBegin`
+    /// 同构）。`ndx`：`DeltaMatch`/`DeltaData` 消息本身不带 ndx（dc task 严格串行，同一时刻
+    /// 只有一个 `ActiveFile`），basis 读失败等 mid-stream 错误需要据此上报 outcome
+    DeltaBegin {
+        ndx: i32,
+        entry: Arc<EntryEnum>,
+        block_size: u32,
+    },
     /// Delta: 原始数据
     DeltaData { entry: Arc<EntryEnum>, data: Bytes },
     /// Delta: 引用目标端 basis file 的 block
     DeltaMatch { entry: Arc<EntryEnum>, block_index: u32 },
-    /// Delta 完成：校验 + 原子 rename
+    /// Delta 完成：读回 .part hash 校验 + 原子 rename（与 `FileCommit` 同构）
     DeltaCommit {
+        ndx: i32,
         entry: Arc<EntryEnum>,
         source_hash: Option<String>,
     },

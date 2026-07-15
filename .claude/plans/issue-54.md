@@ -46,8 +46,8 @@
 - ✅ 1. sync-delta：`Reconstructor`/`ReconstructStep`，`reconstruct()` 薄封装，等价性测试
      （纯字面量/纯匹配/交错、token 任意分组、basis 乱序/重复引用、空文件/小于一块）+
      容量上界证明测试。`cargo test -p sync-delta`（51 passed，原有测试零改动通过）。
-- ⬜ 2. transport::message：`DiskCommitMsg::DeltaBegin`/`DeltaCommit` 加 `ndx: i32` 字段
-     （进程内 channel，非 wire）。`cargo check -p transport`。
+- ✅ 2. transport::message：`DiskCommitMsg::DeltaBegin`/`DeltaCommit` 加 `ndx: i32` 字段
+     （进程内 channel，非 wire）。`cargo check -p transport` 通过。
 - ⬜ 3. app::disk_commit：`ActiveFile` 加 `delta: Option<DeltaCtx>`；接入
      `DeltaBegin`/`DeltaMatch`/`DeltaData`/`DeltaCommit` 四个分支 + `push_delta_token`/
      `read_basis_block` helper；`finalize_file` 复用不变。`cargo check -p app`。
