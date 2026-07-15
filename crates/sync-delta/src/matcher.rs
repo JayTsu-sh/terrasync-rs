@@ -415,4 +415,44 @@ mod tests {
             }
         }
     }
+
+    /// 构造性证明：稳态命中场景（basis 与 source 周期性重复同一 block 内容，中间夹一小段
+    /// 字面量）下，`carry` 与 `literal_buf` 都被周期性 flush/回收，不随 push 调用次数或
+    /// 总输入量增长——参照阶段 1 signature.rs 的容量证明测试写法。
+    #[test]
+    fn test_matcher_staging_bounded_regardless_of_push_count_with_periodic_matches() {
+        let block_size: u32 = 16;
+        let bs = block_size as usize;
+        let block_pattern: Vec<u8> = (0..bs as u8).collect();
+        // basis：单个 block 内容重复 4 次，保证签名表覆盖该内容
+        let basis = block_pattern.repeat(4);
+        let sigs = compute_block_signatures(&basis, block_size);
+
+        // source 的重复单元：一个命中 block + 5 字节不命中字面量
+        let literal_unit = b"XXXXX";
+        let mut unit = block_pattern.clone();
+        unit.extend_from_slice(literal_unit);
+
+        let mut matcher = DeltaMatcher::new(&sigs, block_size);
+        // 每个单元拆成 3 字节一 push，重复喂入 500 个单元（远超单个 block/literal 量级），
+        // 每次 push 后都断言暂存不超出各自的固有上界。
+        for _ in 0..500 {
+            for chunk in unit.chunks(3) {
+                matcher.push(chunk);
+                assert!(
+                    matcher.carry.len() <= bs,
+                    "carry 缓冲长度 {} 超出 block_size {}",
+                    matcher.carry.len(),
+                    bs
+                );
+                assert!(
+                    matcher.literal_buf.len() <= literal_unit.len(),
+                    "literal_buf 长度 {} 超出单次字面量段长度 {}（稳态命中场景下应被周期性 flush）",
+                    matcher.literal_buf.len(),
+                    literal_unit.len()
+                );
+            }
+        }
+        let _ = matcher.finish();
+    }
 }

@@ -44,7 +44,8 @@
 - ✅ 步骤 2：实现 `DeltaMatcher`（滚动窗口跨 push 状态机：carry 缓冲 + 惰性 window
   init/incremental update，处理不足一个 block 的暂停/续算），`delta_match` 改薄封装；跑通
   步骤 1 全部测试 + 原有 matcher.rs 测试零改动通过（`cargo test -p sync-delta`：41 passed）。
-- ⬜ 步骤 3：容量上界测试（周期性命中场景下 carry/literal_buf 不随 push 次数增长）。
+- ✅ 步骤 3：容量上界测试（周期性命中场景下 carry/literal_buf 不随 push 次数增长，
+  `cargo test -p sync-delta`：42 passed）。
 - ⬜ 步骤 4：`app/src/remote_sync.rs::handle_delta_transfer` 改为 `read_chunk_stream` 驱动
   `DeltaMatcher::push`/`finish`，复用 `read_chunk_stream` 自带 hash_handle 生成 `source_hash`
   （与 `handle_full_transfer` 同构），错误路径对齐（读失败发 `EntryError`，不 hang）；
