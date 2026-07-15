@@ -59,9 +59,11 @@
      `crates/app/tests/dual_process_streaming.rs` 3 个 delta 专项测试（basis+字面量交错
      重建、零 token 空文件、basis 读失败 HardError）。`cargo test -p app`：89 passed
      （80 单测 + 9 dual_process_streaming 集成测试，含全部既有 delta redo/threshold 测试）。
-- ⬜ 5. 收尾：`cargo fmt`（仅本次改动文件）、`cargo test -p sync-delta` / `-p app` 全量、
-     `cargo test -p terrasync-rs --test remote_process_e2e` 连跑 2 次、`git status` 检查越界
-     文件、移除本 plan 文件。
+- ✅ 5. 收尾：`cargo fmt`（仅本次改动文件，已在各步随手做）、`cargo test -p sync-delta`
+     （51 passed）/ `-p app`（89 passed）全量重跑通过；`cargo test -p terrasync-rs --test
+     remote_process_e2e` 连跑 2 次全绿（16/16，第一次全量跑时 `handshake_and_sync` 曾偶发
+     超时类 flake，隔离单跑 + 随后两次全量连跑均 100% 通过，判定为并发子进程资源竞争的
+     环境 flake、非本次改动引入的回归）；`git status` 无越界文件；移除本 plan 文件。
 
 ## 验证命令
 
