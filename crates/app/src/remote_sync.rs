@@ -23,6 +23,8 @@ use data_mover::{
     create_storage,
 };
 use rustls::pki_types::CertificateDer;
+use sync_delta::DeltaToken;
+use sync_delta::matcher::DeltaMatcher;
 use tokio::sync::Mutex as AsyncMutex;
 use tracing::{debug, error, info, warn};
 use transport::error::TransportError;
@@ -666,7 +668,28 @@ async fn handle_full_transfer(
     Ok(ok)
 }
 
-/// Delta 传输一个 entry：读取源文件 → 计算 delta tokens → 逐 token 发送。
+/// 逐 token 发送 `DeltaMatch`/`DeltaData` 消息（wire 协议不变）；`Data` token 走 QoS 限速，
+/// 与整片版本原有行为一致。
+async fn send_delta_tokens(
+    transport: &(dyn SenderTransport + 'static), ndx: i32, tokens: Vec<DeltaToken>, qos: Option<&QosManager>,
+) -> Result<()> {
+    for token in tokens {
+        match token {
+            DeltaToken::Match { block_index } => {
+                transport.send(SenderMsg::DeltaMatch { ndx, block_index }).await?;
+            }
+            DeltaToken::Data(data) => {
+                if let Some(q) = qos {
+                    q.acquire(data.len() as u64).await;
+                }
+                transport.send(SenderMsg::DeltaData { ndx, data }).await?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Delta 传输一个 entry：流式读源文件 → 逐 chunk 喂 `DeltaMatcher` → token 边产出边发送。
 ///
 /// 返回 `Ok(true)` = 源文件读取成功并已发送；`Ok(false)` = 源读失败，已发送带 `ndx`
 /// 的 `SenderMsg::EntryError` 通知 Receiver 完成该 ndx（不留悬空请求），调用方需据此
@@ -676,25 +699,6 @@ async fn handle_delta_transfer(
     transport: &(dyn SenderTransport + 'static), src_storage: &Arc<StorageEnum>, entry: &Arc<data_mover::EntryEnum>,
     ndx: i32, block_size: u32, signatures: Vec<BlockSignature>, qos: Option<&QosManager>, enable_acl: bool,
 ) -> Result<bool> {
-    let size = entry.get_size();
-    let src_data = match StorageEnum::read_file_from(src_storage, entry, size).await {
-        Ok(d) => d,
-        Err(e) => {
-            error!(
-                "[Sender Remote] Failed to read source file for delta NDX {}: {}",
-                ndx, e
-            );
-            transport
-                .send(SenderMsg::EntryError {
-                    path: entry.get_relative_path().to_path_buf(),
-                    reason: format!("{e}"),
-                    ndx: Some(ndx),
-                })
-                .await?;
-            return Ok(false);
-        }
-    };
-
     let delta_sigs: Vec<sync_delta::BlockSignature> = signatures
         .into_iter()
         .map(|s| sync_delta::BlockSignature {
@@ -702,47 +706,56 @@ async fn handle_delta_transfer(
             strong: s.strong,
         })
         .collect();
-    let tokens = sync_delta::matcher::delta_match(&src_data, &delta_sigs, block_size);
+    let mut matcher = DeltaMatcher::new(&delta_sigs, block_size);
+    let mut token_count = 0usize;
 
-    for token in &tokens {
-        match token {
-            sync_delta::DeltaToken::Match { block_index } => {
-                transport
-                    .send(SenderMsg::DeltaMatch {
-                        ndx,
-                        block_index: *block_index,
-                    })
-                    .await?;
-            }
-            sync_delta::DeltaToken::Data(data) => {
-                if let Some(q) = qos {
-                    q.acquire(data.len() as u64).await;
-                }
-                transport
-                    .send(SenderMsg::DeltaData {
-                        ndx,
-                        data: data.clone(),
-                    })
-                    .await?;
-            }
+    // 流式读源文件：read_chunk_stream 内部按块读 + per-chunk QoS + hash（不再整文件驻留
+    // RAM），逐 chunk 喂 DeltaMatcher，token 边产出边发送。
+    let (mut rx, hash_handle) = StorageEnum::read_chunk_stream(src_storage, entry, None, qos.cloned(), true, 8);
+    while let Some(chunk) = rx.recv().await {
+        let tokens = matcher.push(&chunk.data);
+        token_count += tokens.len();
+        send_delta_tokens(transport, ndx, tokens, qos).await?;
+    }
+    let tail_tokens = matcher.finish();
+    token_count += tail_tokens.len();
+    send_delta_tokens(transport, ndx, tail_tokens, qos).await?;
+
+    // 读任务收尾：JoinError 或内层读错误统一归一为原因字符串（与 handle_full_transfer 同构）
+    let read_result = match hash_handle.await {
+        Ok(inner) => inner.map_err(|e| e.to_string()),
+        Err(e) => Err(e.to_string()),
+    };
+    match read_result {
+        Ok(hasher) => {
+            let source_hash = hasher.map(ConsistencyCheck::finalize);
+            transport
+                .send(SenderMsg::EndOfFile {
+                    ndx,
+                    entry: entry.clone(),
+                    source_hash,
+                })
+                .await?;
+            info!(
+                "[Sender Remote] Delta transfer {:?}: {} tokens",
+                entry.get_relative_path(),
+                token_count
+            );
+            send_acl_if_enabled(transport, src_storage, entry, enable_acl).await;
+            Ok(true)
+        }
+        Err(reason) => {
+            error!("[Sender Remote] read file {:?}: {}", entry.get_relative_path(), reason);
+            transport
+                .send(SenderMsg::EntryError {
+                    path: entry.get_relative_path().to_path_buf(),
+                    reason,
+                    ndx: Some(ndx),
+                })
+                .await?;
+            Ok(false)
         }
     }
-
-    let hash = blake3::hash(&src_data).to_hex().to_string();
-    transport
-        .send(SenderMsg::EndOfFile {
-            ndx,
-            entry: entry.clone(),
-            source_hash: Some(hash),
-        })
-        .await?;
-    info!(
-        "[Sender Remote] Delta transfer {:?}: {} tokens",
-        entry.get_relative_path(),
-        tokens.len()
-    );
-    send_acl_if_enabled(transport, src_storage, entry, enable_acl).await;
-    Ok(true)
 }
 
 /// ACL 跨进程传输：仅在 `enable_acl=true` 且非符号链接时发送。

@@ -20,87 +20,149 @@ fn build_sig_table(signatures: &[BlockSignature]) -> HashMap<u32, Vec<(u32, &Blo
     table
 }
 
+/// 增量滑动窗口匹配器：逐 chunk 喂入源文件数据，内部滚动哈希窗口状态跨 `push` 调用边界
+/// 保持——字节流无论在任意位置切分，输出 token 序列都与整片 `delta_match` 完全一致。
+///
+/// 内部状态：
+/// - `carry`：待处理字节缓冲（`carry[pos..]`），数据不足一个 block 时暂停处理、等待下次
+///   `push`；已处理的前缀周期性回收，缓冲不随累计 push 次数/总字节数增长。
+/// - `window_init`：`rc` 是否已代表当前窗口 `carry[pos..pos+bs)` 的有效 checksum；push
+///   边界处数据不足以增量滑动时置 `false`，下次数据足够时重新 `rc.init`（结果与增量
+///   `update` 数学等价，只是退化为一次 O(block_size) 重算，不影响正确性）。
+/// - `literal_buf`：跨 push 累积的未匹配字节，命中 block 或 `finish()` 时整体 flush 为一个
+///   `Data` token（与整片版本语义一致：一段连续未匹配数据只产出一个 token）。
+pub struct DeltaMatcher<'a> {
+    sig_table: HashMap<u32, Vec<(u32, &'a BlockSignature)>>,
+    bs: usize,
+    carry: Vec<u8>,
+    pos: usize,
+    rc: RollingChecksum,
+    window_init: bool,
+    literal_buf: Vec<u8>,
+}
+
+impl<'a> DeltaMatcher<'a> {
+    /// 创建匹配器；`block_size == 0` 时跳过窗口逻辑（避免退化窗口切片导致越界），
+    /// 与整片 `delta_match` 的 `bs == 0` 早退分支语义一致。
+    pub fn new(signatures: &'a [BlockSignature], block_size: u32) -> Self {
+        Self {
+            sig_table: build_sig_table(signatures),
+            bs: block_size as usize,
+            carry: Vec::new(),
+            pos: 0,
+            rc: RollingChecksum::new(),
+            window_init: false,
+            literal_buf: Vec::new(),
+        }
+    }
+
+    /// 喂入一段源文件数据，返回本次调用能确定产出的 token（可能为空——数据不足一个
+    /// block 或仍在累积字面量时暂不产出，留到后续 `push`/`finish`）。
+    pub fn push(&mut self, bytes: &[u8]) -> Vec<DeltaToken> {
+        if self.bs == 0 {
+            self.literal_buf.extend_from_slice(bytes);
+            return Vec::new();
+        }
+        self.carry.extend_from_slice(bytes);
+        let tokens = self.process();
+        self.compact();
+        tokens
+    }
+
+    /// 收尾：处理 `carry` 中剩余数据（不足一个 block 的尾部整体转入字面量），
+    /// flush 剩余字面量，返回最后一批 token。
+    pub fn finish(&mut self) -> Vec<DeltaToken> {
+        let mut tokens = if self.bs != 0 { self.process() } else { Vec::new() };
+
+        if self.pos < self.carry.len() {
+            self.literal_buf.extend_from_slice(&self.carry[self.pos..]);
+        }
+        self.carry.clear();
+        self.pos = 0;
+
+        if !self.literal_buf.is_empty() {
+            tokens.push(DeltaToken::Data(Bytes::from(std::mem::take(&mut self.literal_buf))));
+        }
+        tokens
+    }
+
+    /// 回收 `carry` 已处理的前缀，保证缓冲不随累计 push 次数增长
+    fn compact(&mut self) {
+        if self.pos > 0 {
+            self.carry.drain(..self.pos);
+            self.pos = 0;
+        }
+    }
+
+    /// 在当前 `carry` 内尽可能多地产出 token；数据不足一个 block 时暂停，等待下次 push
+    fn process(&mut self) -> Vec<DeltaToken> {
+        let mut tokens = Vec::new();
+
+        while self.pos + self.bs <= self.carry.len() {
+            if !self.window_init {
+                self.rc = RollingChecksum::new();
+                self.rc.init(&self.carry[self.pos..self.pos + self.bs]);
+                self.window_init = true;
+            }
+            let rolling = self.rc.digest();
+
+            // 快速初筛：rolling checksum 匹配？
+            let mut matched = false;
+            if let Some(candidates) = self.sig_table.get(&rolling) {
+                // 慢速确认：strong checksum (BLAKE3) 匹配？
+                let strong = blake3_truncated(&self.carry[self.pos..self.pos + self.bs]);
+                for (block_idx, sig) in candidates {
+                    if sig.strong == strong {
+                        // 匹配！先 flush 累积的 literal data
+                        if !self.literal_buf.is_empty() {
+                            tokens.push(DeltaToken::Data(Bytes::from(std::mem::take(&mut self.literal_buf))));
+                        }
+                        tokens.push(DeltaToken::Match {
+                            block_index: *block_idx,
+                        });
+                        self.pos += self.bs;
+                        matched = true;
+                        // 下一个窗口惰性重新初始化（数据足够时在下次循环顶部触发）
+                        self.window_init = false;
+                        break;
+                    }
+                }
+            }
+
+            if !matched {
+                // 无匹配 → 累积当前字节为 literal
+                self.literal_buf.push(self.carry[self.pos]);
+                self.pos += 1;
+
+                // 滑动窗口更新（下一个字节可用时增量滚动；否则暂停，等下次 push 后重新
+                // init，与增量 update 数学等价）
+                if self.pos + self.bs <= self.carry.len() {
+                    let old_byte = self.carry[self.pos - 1];
+                    let new_byte = self.carry[self.pos + self.bs - 1];
+                    self.rc.update(old_byte, new_byte, self.bs as u32);
+                } else {
+                    self.window_init = false;
+                }
+            }
+        }
+
+        tokens
+    }
+}
+
 /// 对源文件执行 delta 匹配
 ///
 /// 滑动窗口扫描 `src_data`，与 `signatures`（basis file 的 block 签名）比较。
 /// 返回 `Vec<DeltaToken>`：
 /// - `Match { block_index }` — 源文件这段数据 == basis file 的某个 block
 /// - `Data(bytes)` — 源文件的新数据，需要传输
+///
+/// 薄封装：内部 `DeltaMatcher::new` + 单次 `push` + `finish`，保留原 API 供一次性持有
+/// 整文件切片的调用方使用。
 pub fn delta_match(src_data: &[u8], signatures: &[BlockSignature], block_size: u32) -> Vec<DeltaToken> {
-    let bs = block_size as usize;
-
-    // 特殊情况
-    if src_data.is_empty() {
-        return Vec::new();
-    }
-    if signatures.is_empty() || bs == 0 {
-        // 没有 basis 签名 → 全量 Data
-        return vec![DeltaToken::Data(Bytes::copy_from_slice(src_data))];
-    }
-
-    let sig_table = build_sig_table(signatures);
-    let mut tokens = Vec::new();
-    let mut literal_buf: Vec<u8> = Vec::new();
-    let mut pos = 0;
-
-    // 初始化 rolling checksum 窗口
-    let mut rc = RollingChecksum::new();
-    if src_data.len() >= bs {
-        rc.init(&src_data[..bs]);
-    }
-
-    while pos + bs <= src_data.len() {
-        let rolling = rc.digest();
-
-        // 快速初筛：rolling checksum 匹配？
-        let mut matched = false;
-        if let Some(candidates) = sig_table.get(&rolling) {
-            // 慢速确认：strong checksum (BLAKE3) 匹配？
-            let strong = blake3_truncated(&src_data[pos..pos + bs]);
-            for (block_idx, sig) in candidates {
-                if sig.strong == strong {
-                    // 匹配！先 flush 累积的 literal data
-                    if !literal_buf.is_empty() {
-                        tokens.push(DeltaToken::Data(Bytes::from(std::mem::take(&mut literal_buf))));
-                    }
-                    tokens.push(DeltaToken::Match {
-                        block_index: *block_idx,
-                    });
-                    pos += bs;
-                    matched = true;
-
-                    // 重新初始化下一个窗口
-                    if pos + bs <= src_data.len() {
-                        rc = RollingChecksum::new();
-                        rc.init(&src_data[pos..pos + bs]);
-                    }
-                    break;
-                }
-            }
-        }
-
-        if !matched {
-            // 无匹配 → 累积当前字节为 literal
-            literal_buf.push(src_data[pos]);
-            pos += 1;
-
-            // 滑动窗口更新
-            if pos + bs <= src_data.len() {
-                rc.update(src_data[pos - 1], src_data[pos + bs - 1], block_size);
-            }
-        }
-    }
-
-    // 尾部不足一个 block 的数据
-    if pos < src_data.len() {
-        literal_buf.extend_from_slice(&src_data[pos..]);
-    }
-
-    // flush 剩余 literal
-    if !literal_buf.is_empty() {
-        tokens.push(DeltaToken::Data(Bytes::from(literal_buf)));
-    }
-
+    let mut matcher = DeltaMatcher::new(signatures, block_size);
+    let mut tokens = matcher.push(src_data);
+    tokens.extend(matcher.finish());
     tokens
 }
 
@@ -190,5 +252,207 @@ mod tests {
         let tokens = delta_match(source, &[], 5);
         assert_eq!(tokens.len(), 1);
         assert!(matches!(tokens[0], DeltaToken::Data(_)));
+    }
+
+    // ── DeltaMatcher 跨 push 边界等价性测试：任意切分方式下流式输出必须与整片
+    //    delta_match 逐项相等（issue #54 阶段 2）──
+
+    /// 按 `boundaries` 切分 `data` 依次 push 给 `DeltaMatcher`，断言拼接后的 token 序列
+    /// 与整片 `delta_match(data, sigs, block_size)` 完全一致。
+    fn assert_stream_matches_whole(data: &[u8], sigs: &[BlockSignature], block_size: u32, boundaries: &[usize]) {
+        let whole = delta_match(data, sigs, block_size);
+
+        let mut matcher = DeltaMatcher::new(sigs, block_size);
+        let mut streamed = Vec::new();
+        let mut start = 0;
+        for &end in boundaries {
+            streamed.extend(matcher.push(&data[start..end]));
+            start = end;
+        }
+        streamed.extend(matcher.push(&data[start..]));
+        streamed.extend(matcher.finish());
+
+        assert_eq!(
+            streamed, whole,
+            "流式输出应与整片 delta_match 完全一致（boundaries={boundaries:?}）"
+        );
+    }
+
+    /// 构造一个真实感的 basis/source 对：block0 命中、5 字节非对齐插入字面量、
+    /// block1/block2 命中、尾部整块替换为字面量——覆盖 match/literal 混合场景。
+    fn build_mixed_case() -> (Vec<u8>, Vec<u8>, u32) {
+        let block_size = 8u32;
+        let basis = [&b"AAAAAAAA"[..], &b"BBBBBBBB"[..], &b"CCCCCCCC"[..], &b"DDDDDDDD"[..]].concat();
+        let source = [
+            &b"AAAAAAAA"[..],
+            &b"XXXXX"[..],
+            &b"BBBBBBBB"[..],
+            &b"CCCCCCCC"[..],
+            &b"YYYYYYYY"[..],
+        ]
+        .concat();
+        (basis, source, block_size)
+    }
+
+    #[test]
+    fn test_push_finish_matches_whole_split_at_token_boundary() {
+        let (basis, source, block_size) = build_mixed_case();
+        let sigs = compute_block_signatures(&basis, block_size);
+        // 恰好切在 Match → Data（8）与 Data → Match（13）的 token 边界上
+        assert_stream_matches_whole(&source, &sigs, block_size, &[8, 13, 21, 29]);
+    }
+
+    #[test]
+    fn test_push_finish_matches_whole_split_inside_window() {
+        let (basis, source, block_size) = build_mixed_case();
+        let sigs = compute_block_signatures(&basis, block_size);
+        // 在滑动窗口/block 中间切分，不与任何 token 边界对齐
+        assert_stream_matches_whole(&source, &sigs, block_size, &[3, 11, 17, 25, 33]);
+    }
+
+    #[test]
+    fn test_push_finish_matches_whole_one_byte_at_a_time() {
+        let (basis, source, block_size) = build_mixed_case();
+        let sigs = compute_block_signatures(&basis, block_size);
+        let boundaries: Vec<usize> = (1..source.len()).collect();
+        assert_stream_matches_whole(&source, &sigs, block_size, &boundaries);
+    }
+
+    #[test]
+    fn test_push_finish_matches_whole_insert_in_middle() {
+        let basis = b"AAAAABBBBB"; // 2 blocks of 5
+        let mut source = Vec::from(&b"AAAAA"[..]);
+        source.extend_from_slice(b"XXXXX"); // 插入 5 bytes
+        source.extend_from_slice(b"BBBBB");
+        let block_size = 5u32;
+        let sigs = compute_block_signatures(basis, block_size);
+        assert_stream_matches_whole(&source, &sigs, block_size, &[2, 7, 12]);
+    }
+
+    #[test]
+    fn test_push_finish_matches_whole_delete_in_middle() {
+        // basis 3 blocks，source 删除中间 block → 平移后 Match(0) + Match(2)
+        let basis = b"AAAAABBBBBCCCCC";
+        let source = b"AAAAACCCCC";
+        let block_size = 5u32;
+        let sigs = compute_block_signatures(basis, block_size);
+        assert_stream_matches_whole(source, &sigs, block_size, &[3, 7]);
+    }
+
+    #[test]
+    fn test_push_finish_matches_whole_empty_source() {
+        let sigs = compute_block_signatures(b"some data", 5);
+        assert_stream_matches_whole(&[], &sigs, 5, &[]);
+    }
+
+    #[test]
+    fn test_push_finish_matches_whole_smaller_than_one_block() {
+        let sigs = compute_block_signatures(b"AAAAABBBBB", 5);
+        assert_stream_matches_whole(b"AAA", &sigs, 5, &[1, 2]);
+    }
+
+    #[test]
+    fn test_push_finish_matches_whole_empty_basis() {
+        let source = b"new file content";
+        assert_stream_matches_whole(source, &[], 5, &[3, 9]);
+    }
+
+    /// property 式随机切分对拍（固定种子手写 LCG，避免引入 rand 依赖，与阶段 1 保持同一
+    /// "无外部依赖" 风格）：多组数据/block_size 组合下，任意切分方式的流式输出都必须与
+    /// 整片 delta_match 一致。
+    #[test]
+    fn test_push_finish_matches_whole_random_splits_fixed_seed() {
+        fn next_rand(state: &mut u64) -> u64 {
+            *state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            *state
+        }
+
+        let cases: Vec<(Vec<u8>, Vec<u8>, u32)> = vec![
+            build_mixed_case(),
+            (b"AAAAABBBBBCCCCC".to_vec(), b"AAAAACCCCC".to_vec(), 5),
+            {
+                let basis: Vec<u8> = (0..64u8).collect();
+                let source: Vec<u8> = (0..64u8).rev().collect(); // 完全不同
+                (basis, source, 8)
+            },
+        ];
+
+        let mut seed = 0x1234_5678_9abc_def0u64;
+        for (basis, source, block_size) in cases {
+            let sigs = compute_block_signatures(&basis, block_size);
+            let whole = delta_match(&source, &sigs, block_size);
+
+            for _ in 0..20 {
+                let mut boundaries: Vec<usize> = Vec::new();
+                let mut pos = 0usize;
+                while pos < source.len() {
+                    let step = 1 + (next_rand(&mut seed) as usize % 6);
+                    pos += step;
+                    if pos < source.len() {
+                        boundaries.push(pos);
+                    }
+                }
+
+                let mut matcher = DeltaMatcher::new(&sigs, block_size);
+                let mut streamed = Vec::new();
+                let mut start = 0;
+                for &end in &boundaries {
+                    streamed.extend(matcher.push(&source[start..end]));
+                    start = end;
+                }
+                streamed.extend(matcher.push(&source[start..]));
+                streamed.extend(matcher.finish());
+
+                assert_eq!(
+                    streamed,
+                    whole,
+                    "随机切分 {boundaries:?} 后流式输出应与整片一致（basis len={}, source len={}, bs={block_size}）",
+                    basis.len(),
+                    source.len()
+                );
+            }
+        }
+    }
+
+    /// 构造性证明：稳态命中场景（basis 与 source 周期性重复同一 block 内容，中间夹一小段
+    /// 字面量）下，`carry` 与 `literal_buf` 都被周期性 flush/回收，不随 push 调用次数或
+    /// 总输入量增长——参照阶段 1 signature.rs 的容量证明测试写法。
+    #[test]
+    fn test_matcher_staging_bounded_regardless_of_push_count_with_periodic_matches() {
+        let block_size: u32 = 16;
+        let bs = block_size as usize;
+        let block_pattern: Vec<u8> = (0..bs as u8).collect();
+        // basis：单个 block 内容重复 4 次，保证签名表覆盖该内容
+        let basis = block_pattern.repeat(4);
+        let sigs = compute_block_signatures(&basis, block_size);
+
+        // source 的重复单元：一个命中 block + 5 字节不命中字面量
+        let literal_unit = b"XXXXX";
+        let mut unit = block_pattern.clone();
+        unit.extend_from_slice(literal_unit);
+
+        let mut matcher = DeltaMatcher::new(&sigs, block_size);
+        // 每个单元拆成 3 字节一 push，重复喂入 500 个单元（远超单个 block/literal 量级），
+        // 每次 push 后都断言暂存不超出各自的固有上界。
+        for _ in 0..500 {
+            for chunk in unit.chunks(3) {
+                matcher.push(chunk);
+                assert!(
+                    matcher.carry.len() <= bs,
+                    "carry 缓冲长度 {} 超出 block_size {}",
+                    matcher.carry.len(),
+                    bs
+                );
+                assert!(
+                    matcher.literal_buf.len() <= literal_unit.len(),
+                    "literal_buf 长度 {} 超出单次字面量段长度 {}（稳态命中场景下应被周期性 flush）",
+                    matcher.literal_buf.len(),
+                    literal_unit.len()
+                );
+            }
+        }
+        let _ = matcher.finish();
     }
 }
