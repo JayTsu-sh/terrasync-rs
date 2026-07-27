@@ -167,7 +167,7 @@ impl SenderTransport for QuicSenderTransport {
 /// `connect_with_credit_window`（`pub(crate)`，注入自定义小窗口触发耗尽路径），只能放在
 /// crate 内部，无法用 `tests/quic_roundtrip.rs`（外部 crate，只能看到 `pub` API）覆盖。
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
+#[allow(clippy::expect_used, clippy::unwrap_used)]
 mod tests {
     use std::path::PathBuf;
     use std::sync::Arc;
