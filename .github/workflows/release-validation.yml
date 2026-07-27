@@ -1,0 +1,53 @@
+name: Release validation
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Commit or tag to validate
+        required: true
+        default: main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: terrasync-release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: [self-hosted, linux, x64, terrasync-lab, terrasync-rs]
+    environment: release
+    timeout-minutes: 360
+    env:
+      RUN_ID: release-${{ github.run_id }}-${{ github.run_attempt }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: tests/lab/health-check.sh
+      - run: tests/lab/prepare-run.sh "$RUN_ID"
+      - run: cargo test --workspace --all-features --locked --no-fail-fast
+      - run: cargo test --locked --test remote_process_e2e --no-fail-fast
+      - run: cargo build --release --all-features --locked
+      - name: Checksums
+        run: sha256sum target/release/terrasync | tee release-sha256.txt
+      - name: Build manifest
+        run: |
+          rustc --version --verbose > build-manifest.txt
+          cargo --version >> build-manifest.txt
+          uname -a >> build-manifest.txt
+          cat release-sha256.txt >> build-manifest.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: terrasync-release-validation-${{ github.run_id }}
+          path: |
+            target/release/terrasync
+            release-sha256.txt
+            build-manifest.txt
+      - name: Cleanup
+        if: always()
+        run: tests/lab/cleanup-run.sh "$RUN_ID"
