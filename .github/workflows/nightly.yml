@@ -1,0 +1,38 @@
+name: Nightly lab
+
+on:
+  schedule:
+    - cron: "40 18 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: terrasync-lab
+  cancel-in-progress: false
+
+jobs:
+  end-to-end:
+    runs-on: [self-hosted, linux, x64, terrasync-lab, terrasync-rs]
+    timeout-minutes: 180
+    env:
+      RUN_ID: nightly-${{ github.run_id }}-${{ github.run_attempt }}
+      TERRASYNC_NFS3_SOURCE: 10.10.1.12:/srv/nfs/v3
+      TERRASYNC_NFS41_SOURCE: 10.10.1.12:/srv/nfs/v4
+      TERRASYNC_NFS3_DEST: 10.10.1.13:/srv/nfs/v3
+      TERRASYNC_NFS41_DEST: 10.10.1.13:/srv/nfs/v4
+      TERRASYNC_S3_SOURCE: http://10.10.1.12:9000
+      TERRASYNC_S3_DEST: http://10.10.1.13:9000
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: tests/lab/health-check.sh
+      - run: tests/lab/prepare-run.sh "$RUN_ID"
+      - run: cargo test --workspace --locked --no-fail-fast
+      - run: cargo test --locked --test remote_process_e2e --no-fail-fast
+      - run: cargo build --release --locked
+      - name: Cleanup
+        if: always()
+        run: tests/lab/cleanup-run.sh "$RUN_ID"

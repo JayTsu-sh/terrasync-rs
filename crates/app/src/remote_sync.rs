@@ -811,7 +811,7 @@ async fn save_or_clear_checkpoint(path: &Path, completed_paths: &HashSet<String>
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
+#[allow(clippy::expect_used, clippy::unwrap_used)]
 mod tests {
     use std::collections::HashMap;
     use std::fs;

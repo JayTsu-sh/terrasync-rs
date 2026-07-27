@@ -123,7 +123,7 @@ impl CreditWindow {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
+#[allow(clippy::expect_used, clippy::unwrap_used)]
 mod tests {
     use std::sync::Arc;
     use std::time::Duration;
