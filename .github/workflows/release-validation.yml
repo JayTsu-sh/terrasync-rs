@@ -30,6 +30,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: tests/lab/health-check.sh
       - run: tests/lab/prepare-run.sh "$RUN_ID"
+      - name: Start from a clean release build
+        run: cargo clean
       - run: flock --wait 10800 /tmp/terrasync-lab-tests.lock cargo test --workspace --all-features --locked --no-fail-fast
       - run: flock --wait 10800 /tmp/terrasync-lab-tests.lock cargo test --locked --test remote_process_e2e --no-fail-fast
       - run: cargo build --release --all-features --locked
