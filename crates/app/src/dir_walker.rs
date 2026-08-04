@@ -53,13 +53,15 @@ impl DirectoryWalker {
             let walkdir_iter = storage
                 .walkdir(
                     None,
-                    depth,
-                    self.config.match_expressions.clone(),
-                    self.config.exclude_expressions.clone(),
-                    self.config.concurrency,
-                    self.config.include_tags,
-                    self.config.packaged,
-                    self.config.package_depth,
+                    data_mover::WalkOptions {
+                        depth,
+                        match_expressions: self.config.match_expressions.clone(),
+                        exclude_expressions: self.config.exclude_expressions.clone(),
+                        concurrency: self.config.concurrency,
+                        include_tags: self.config.include_tags,
+                        packaged: self.config.packaged,
+                        package_depth: self.config.package_depth,
+                    },
                 )
                 .await
                 .map_err(|e| AppError::ScanError(format!("Failed to start walkdir: {e}")))?;
@@ -136,6 +138,7 @@ fn walkdir_from_file_list(storage: StorageEnum, file_list_path: &str) -> Result<
                                 let msg = StorageEntryMessage::Error {
                                     event: ErrorEvent::Scan,
                                     path: file_path,
+                                    entry: None,
                                     reason: e.to_string(),
                                 };
                                 if let Err(e) = tx.send(msg).await {
@@ -151,6 +154,7 @@ fn walkdir_from_file_list(storage: StorageEnum, file_list_path: &str) -> Result<
                         let msg = StorageEntryMessage::Error {
                             event: ErrorEvent::Scan,
                             path: PathBuf::new(),
+                            entry: None,
                             reason: e.to_string(),
                         };
                         if let Err(e) = tx.send(msg).await {

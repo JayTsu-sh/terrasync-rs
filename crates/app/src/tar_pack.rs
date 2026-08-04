@@ -32,16 +32,7 @@ pub async fn pack_directory(
 
     // ── 阶段 1：收集子条目 + 计算 tar 大小 ──
     let iterator = src_storage
-        .walkdir(
-            Some(dir_entry.get_relative_path()),
-            None,
-            None,
-            None,
-            1,
-            false,
-            false,
-            0,
-        )
+        .walkdir(Some(dir_entry.get_relative_path()), data_mover::WalkOptions::default())
         .await?;
     let manifest_list = collect_entries(iterator).await;
 
@@ -132,7 +123,9 @@ async fn collect_entries(iterator: WalkDirAsyncIterator) -> Vec<Arc<EntryEnum>> 
             StorageEntryMessage::Scanned(entry) => {
                 entries.push(entry);
             }
-            StorageEntryMessage::Error { event, path, reason } => {
+            StorageEntryMessage::Error {
+                event, path, reason, ..
+            } => {
                 tracing::warn!("Error during sub-walkdir ({}): {:?} - {}", event, path, reason);
             }
             _ => {}

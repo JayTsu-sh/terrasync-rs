@@ -522,6 +522,7 @@ fn entry_error_stats_message(path: PathBuf, reason: String) -> StorageEntryMessa
     StorageEntryMessage::Error {
         event: ErrorEvent::Copy,
         path,
+        entry: None,
         reason,
     }
 }
@@ -2440,7 +2441,9 @@ mod tests {
     fn entry_error_stats_message_maps_to_copy_error_event() {
         let path = PathBuf::from("sub/broken.txt");
         match entry_error_stats_message(path.clone(), "boom".to_string()) {
-            StorageEntryMessage::Error { event, path: p, reason } => {
+            StorageEntryMessage::Error {
+                event, path: p, reason, ..
+            } => {
                 assert_eq!(event, ErrorEvent::Copy);
                 assert_eq!(p, path);
                 assert_eq!(reason, "boom");

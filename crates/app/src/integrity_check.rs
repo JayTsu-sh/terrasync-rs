@@ -2,17 +2,15 @@
 //!
 //! 该模块提供源/目标存储之间的一致性验证：
 //! 1. 扫描源路径全部条目
-//! 2. 对每个条目在目标端查 metadata（含瞬时错误重试）
-//! 3. 比对 size/mtime/uid/gid/mode（dest 是 S3 时跳过元数据，仅依赖 size）
-//! 4. quick 模式跳过哈希比对，full 模式做内容哈希校验
+//! 2. 由 data-mover 统一解析目标 metadata、重试并归因错误
+//! 3. 使用结构化 mismatch 比对类型、size、mtime、uid、gid、mode
+//! 4. quick 模式跳过内容读取，full 模式流式逐字节比较并报告偏移
 //! 5. 可选 auto-fix：仅修可修的元数据字段（mode/uid/gid 等）
 //!
 //! 与 [`crate::sync`] 解耦：此处不依赖 sync 主流程，仅复用通用 storage / broadcast / consumer 设施。
 //!
-//! S3 dest 的特殊性集中在三处：
-//! - [`collect_metadata_mismatches`] 通过 `dest_is_s3` 跳过全部元数据比较
-//! - quick 模式 `has_content_mismatch` 改用 `mismatches` 内容判定
-//! - 目录 entry 整体跳过 `get_metadata`，因为 S3 prefix 没有真实对象
+//! S3 目标没有真实目录对象，因此目录 entry 跳过目标 metadata 查询；文件的
+//! POSIX 元数据跳过策略由 data-mover 统一处理。
 
 use std::path::Path;
 use std::sync::Arc;
@@ -21,7 +19,10 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use data_mover::error::StorageError;
-use data_mover::{EntryEnum, StorageEntryMessage, StorageEnum, create_storage, redact_storage_url};
+use data_mover::{
+    EntryEnum, IntegrityCheck, IntegrityCheckMode, IntegrityCheckOptions, MismatchDataField, MismatchMetaField,
+    MtimePrecision, StorageEntryMessage, StorageEnum, create_storage, redact_storage_url,
+};
 use tracing::{Instrument, debug, error, info, info_span, instrument, warn};
 
 use crate::broadcast::{BroadcastForwarder, DEFAULT_CHANNEL_CAPACITY};
@@ -76,28 +77,6 @@ pub struct IntegrityIssue {
     pub fix_status: FixStatus,
 }
 
-/// integrity-check 期间针对瞬时错误的应用层重试间隔（毫秒）。
-///
-/// 与 nfs-rs 层的 RPC 重试是**两层互补的防线**：
-/// - nfs-rs：RPC 级重试 `NFS4ERR_DELAY`，带 jitter，~50s 总等待。
-/// - 应用层：单条 `get_metadata` 失败后的二次尝试，间隔更长（2s/5s/10s），
-///   覆盖服务端因大量并发查询持续繁忙的场景（thundering herd 余波）。
-const INTEGRITY_TRANSIENT_RETRY_DELAYS_MS: [u64; 3] = [2000, 5000, 10000];
-
-/// 跨后端 mode 比较时用的掩码。
-///
-/// 不同后端返回的 mode 格式不一致：
-/// - NFSv3：原始 `fattr3.mode`，含 `S_IFREG`(0o100000)/`S_IFDIR`(0o040000) 等文件类型高位（e.g. `0o100644`）
-/// - NFSv4.1：RFC 5661 §5.8.2.16 `mode4` 仅为权限位，文件类型由独立 attr 表达（e.g. `0o644`）
-/// - Local on Unix：`MetadataExt::mode()` 返回完整 `st_mode`，含文件类型位
-/// - Local on Windows / CIFS：基于 readonly 属性合成的权限位（e.g. `0o644` / `0o755`），无类型位
-/// - S3：始终 `None`，由 `dest_is_s3` 短路跳过元数据比较
-///
-/// 直接相等比较会在混合后端 / 跨 NFS 协议版本场景下持续误报 mode 不匹配，
-/// 因此比较前用 0o777 归一化到 user/group/other 三组 rwx。
-/// 已知 trade-off：suid(0o4000)/sgid(0o2000)/sticky(0o1000) 也会被丢弃。
-const POSIX_MODE_COMPARE_MASK: u32 = 0o777;
-
 /// 判断 integrity-check 期间 dest 元数据查询失败是否为"目标确实不存在"。
 ///
 /// 仅当错误为 `FileNotFound` / `DirectoryNotFound` 时返回 true（对应 `NFS4ERR_NOENT`
@@ -107,119 +86,49 @@ fn is_truly_missing(err: &StorageError) -> bool {
     matches!(err, StorageError::FileNotFound(_) | StorageError::DirectoryNotFound(_))
 }
 
-/// 带瞬时错误重试的 metadata 查询。
-///
-/// 返回路径：
-/// - `Ok(entry)`：首次或重试中成功
-/// - `Err(NotFound)`：确认对象不存在，**立即返回不重试**
-/// - `Err(other)`：所有重试耗尽后仍为瞬时错误，返回**最后一次**失败的错误
-async fn get_metadata_with_transient_retry(
-    storage: &Arc<StorageEnum>, path: &Path,
-) -> std::result::Result<EntryEnum, StorageError> {
-    let mut attempt = 0usize;
-    loop {
-        match storage.get_metadata(path).await {
-            Ok(entry) => return Ok(entry),
-            Err(e) if is_truly_missing(&e) => return Err(e),
-            Err(e) => {
-                if attempt >= INTEGRITY_TRANSIENT_RETRY_DELAYS_MS.len() {
-                    return Err(e);
-                }
-                warn!(
-                    "Transient error on get_metadata({:?}): {} — retry {}/{} after {}ms",
-                    path,
-                    e,
-                    attempt + 1,
-                    INTEGRITY_TRANSIENT_RETRY_DELAYS_MS.len(),
-                    INTEGRITY_TRANSIENT_RETRY_DELAYS_MS[attempt]
-                );
-                tokio::time::sleep(Duration::from_millis(INTEGRITY_TRANSIENT_RETRY_DELAYS_MS[attempt])).await;
-                attempt += 1;
-            }
-        }
-    }
-}
-
-/// 跨后端 mode 比较：仅比较 0o777 部分，丢弃文件类型位与特殊位。
-/// 参见 [`POSIX_MODE_COMPARE_MASK`] 的注释了解 trade-off。
-fn modes_equivalent(a: u32, b: u32) -> bool {
-    a & POSIX_MODE_COMPARE_MASK == b & POSIX_MODE_COMPARE_MASK
-}
-
-/// 从 "size: src=100, dest=200" 格式的 mismatch 描述中提取标签 "size"
-fn extract_mismatch_labels(mismatches: &[String]) -> Vec<String> {
-    mismatches
-        .iter()
-        .map(|m| m.split(':').next().unwrap_or(m.as_str()).trim().to_string())
-        .collect()
-}
-
-/// 格式化 entry 元数据，用于不一致告警日志。
-fn format_entry_metadata(entry: &EntryEnum) -> String {
-    format!(
-        "size={}, mtime={}, uid={}, gid={}, mode={}",
-        entry.get_size(),
-        entry.get_mtime(),
-        entry.get_uid().map_or("-".to_string(), |v| v.to_string()),
-        entry.get_gid().map_or("-".to_string(), |v| v.to_string()),
-        entry.get_mode().map_or("-".to_string(), |v| format!("{v:#o}")),
-    )
-}
-
-/// 比较两个 entry 的 mtime/uid/gid，以及可选的 mode，收集不一致描述。
-///
-/// 当 `dest_is_s3` 为 true 时跳过全部元数据比较：
-/// - S3 的 `LastModified` 由服务端写入，PUT/`CopyObject` 都不允许客户端指定，源 mtime
-///   无法保留；S3-to-S3 sync 时 dest 的 `LastModified` 是 `CopyObject` 执行时间。
-/// - S3 对象不存在 POSIX uid/gid/mode 概念（S3Entry 中这三项始终为 None）。
-fn collect_metadata_mismatches(src: &EntryEnum, dest: &EntryEnum, check_mode: bool, dest_is_s3: bool) -> Vec<String> {
-    if dest_is_s3 {
-        return Vec::new();
-    }
-
-    let mut mismatches = Vec::new();
-
-    let src_mtime = src.get_mtime();
-    let dest_mtime = dest.get_mtime();
-    if src_mtime != dest_mtime {
-        mismatches.push(format!("mtime: src={src_mtime}, dest={dest_mtime}"));
-    }
-
-    if let (Some(src_uid), Some(dest_uid)) = (src.get_uid(), dest.get_uid())
-        && src_uid != dest_uid
-    {
-        mismatches.push(format!("uid: src={src_uid}, dest={dest_uid}"));
-    }
-
-    if let (Some(src_gid), Some(dest_gid)) = (src.get_gid(), dest.get_gid())
-        && src_gid != dest_gid
-    {
-        mismatches.push(format!("gid: src={src_gid}, dest={dest_gid}"));
-    }
-
-    if check_mode
-        && let (Some(src_mode), Some(dest_mode)) = (src.get_mode(), dest.get_mode())
-        && !modes_equivalent(src_mode, dest_mode)
-    {
-        let src_perm = src_mode & POSIX_MODE_COMPARE_MASK;
-        let dest_perm = dest_mode & POSIX_MODE_COMPARE_MASK;
-        mismatches.push(format!(
-            "mode: src={src_perm:#o} (raw {src_mode:#o}), dest={dest_perm:#o} (raw {dest_mode:#o})"
-        ));
-    }
-
-    mismatches
-}
-
 // ─────────────────────────────────────────────────
 // Auto-fix 与 issue 构造辅助函数
 // ─────────────────────────────────────────────────
 
 /// 决定 mismatch 是否含「内容差异」（不可通过 `set_metadata` 修复）。
 fn detect_content_mismatch(mismatches: &[String]) -> bool {
-    mismatches
-        .iter()
-        .any(|m| m.starts_with("size:") || m.starts_with("mtime:") || m.starts_with("hash") || m.contains("hash error"))
+    mismatches.iter().any(|m| {
+        matches!(
+            m.as_str(),
+            "entry_kind" | "size" | "read_length" | "stream_offset" | "content" | "mtime"
+        )
+    })
+}
+
+fn structured_mismatch_labels(error: &StorageError) -> Option<Vec<String>> {
+    match error {
+        StorageError::MismatchData(fields) => Some(
+            fields
+                .iter()
+                .map(|field| match field {
+                    MismatchDataField::EntryKind { .. } => "entry_kind",
+                    MismatchDataField::Size { .. } => "size",
+                    MismatchDataField::ReadLength { .. } => "read_length",
+                    MismatchDataField::StreamOffset { .. } => "stream_offset",
+                    MismatchDataField::Content { .. } => "content",
+                })
+                .map(str::to_string)
+                .collect(),
+        ),
+        StorageError::MismatchMeta(fields) => Some(
+            fields
+                .iter()
+                .map(|field| match field {
+                    MismatchMetaField::Mtime { .. } => "mtime",
+                    MismatchMetaField::Uid { .. } => "uid",
+                    MismatchMetaField::Gid { .. } => "gid",
+                    MismatchMetaField::Mode { .. } => "mode",
+                })
+                .map(str::to_string)
+                .collect(),
+        ),
+        _ => None,
+    }
 }
 
 /// 把瞬时错误 / `NotFound` 错误归类为 `IssueKind` 并记录 error log。
@@ -270,7 +179,6 @@ async fn build_mismatch_issue(
     dest_storage: &StorageEnum, relative_path: &Path, entry_type: &'static str, src: &EntryEnum,
     mismatches: Vec<String>, auto_fix: bool,
 ) -> IntegrityIssue {
-    let labels = extract_mismatch_labels(&mismatches);
     let has_content_mismatch = detect_content_mismatch(&mismatches);
     let fix_status = if auto_fix {
         apply_auto_fix(dest_storage, relative_path, entry_type, src, has_content_mismatch).await
@@ -281,7 +189,7 @@ async fn build_mismatch_issue(
         path: relative_path.display().to_string(),
         entry_type,
         kind: IssueKind::Mismatch,
-        mismatches: labels,
+        mismatches,
         fix_status,
     }
 }
@@ -309,7 +217,7 @@ struct CheckContext {
     checked_files: Arc<AtomicUsize>,
     checked_dirs: Arc<AtomicUsize>,
     checked_symlinks: Arc<AtomicUsize>,
-    quick: bool,
+    options: IntegrityCheckOptions,
     auto_fix: bool,
 }
 
@@ -323,169 +231,78 @@ impl CheckContext {
         }
     }
 
-    /// 文件条目处理：quick 模式比 size + 元数据；full 模式额外做 hash 比对。
-    async fn process_file(&self, entry: &EntryEnum, relative_path: &Path) {
-        let dest_entry = match get_metadata_with_transient_retry(&self.dest_storage, relative_path).await {
-            Ok(e) => e,
-            Err(e) => {
-                self.push_issue(build_lookup_issue("file", relative_path, &e));
-                return;
+    async fn process_entry(&self, entry: &EntryEnum, relative_path: &Path, entry_type: &'static str) -> Option<String> {
+        match IntegrityCheck::check_with_source_entry_and_options(
+            &self.src_storage,
+            &self.dest_storage,
+            entry,
+            self.options,
+            None,
+        )
+        .await
+        {
+            Ok(()) => {
+                debug!("Integrity check passed for {:?}", relative_path);
+                None
             }
-        };
-
-        let mut mismatches = Vec::new();
-        let size = entry.get_size();
-        let dest_size = dest_entry.get_size();
-        if size != dest_size {
-            mismatches.push(format!("size: src={size}, dest={dest_size}"));
-        }
-
-        if !self.quick {
-            // 完整模式：补上 hash 比对
-            let (src_hash_result, dest_hash_result) = tokio::join!(
-                StorageEnum::compute_hash(&self.src_storage, relative_path, size),
-                StorageEnum::compute_hash(&self.dest_storage, relative_path, dest_size)
-            );
-            match (src_hash_result, dest_hash_result) {
-                (Ok(src_hash), Ok(dest_hash)) if src_hash != dest_hash => {
-                    mismatches.push(format!("hash: src={src_hash}, dest={dest_hash}"));
+            Err(error) => {
+                if let Some(labels) = structured_mismatch_labels(&error) {
+                    error!("Integrity mismatch for {:?}: {:?}", relative_path, error);
+                    let issue = build_mismatch_issue(
+                        &self.dest_storage,
+                        relative_path,
+                        entry_type,
+                        entry,
+                        labels,
+                        self.auto_fix,
+                    )
+                    .await;
+                    self.push_issue(issue);
+                    None
+                } else if matches!(error, StorageError::Cancelled) {
+                    Some("integrity check cancelled".to_string())
+                } else {
+                    self.push_issue(build_lookup_issue(entry_type, relative_path, &error));
+                    Some(error.to_string())
                 }
-                (Ok(_), Ok(_)) => {}
-                (Err(e), _) => mismatches.push(format!("src hash error: {e}")),
-                (_, Err(e)) => mismatches.push(format!("dest hash error: {e}")),
             }
         }
-
-        mismatches.extend(collect_metadata_mismatches(
-            entry,
-            &dest_entry,
-            true,
-            !self.dest_storage.has_real_directory_objects(),
-        ));
-
-        if mismatches.is_empty() {
-            debug!("Integrity check passed for {:?}", relative_path);
-        } else {
-            error!(
-                "Mismatch for {:?}: {}\n  src:  {}\n  dest: {}",
-                relative_path,
-                mismatches.join(", "),
-                format_entry_metadata(entry),
-                format_entry_metadata(&dest_entry)
-            );
-            let issue = build_mismatch_issue(
-                &self.dest_storage,
-                relative_path,
-                "file",
-                entry,
-                mismatches,
-                self.auto_fix,
-            )
-            .await;
-            self.push_issue(issue);
-        }
-    }
-
-    /// 目录条目处理：S3 dest 直接跳过；其他后端比对元数据。
-    async fn process_dir(&self, entry: &EntryEnum, relative_path: &Path) {
-        // S3 没有真实目录对象，prefix 存在性由其下文件隐式保证；
-        // 跳过 dir 元数据校验，避免 GetObject 404 误判为 transient。
-        if !self.dest_storage.has_real_directory_objects() {
-            return;
-        }
-
-        let dest_entry = match get_metadata_with_transient_retry(&self.dest_storage, relative_path).await {
-            Ok(e) => e,
-            Err(e) => {
-                self.push_issue(build_lookup_issue("dir", relative_path, &e));
-                return;
-            }
-        };
-
-        let mismatches = collect_metadata_mismatches(
-            entry,
-            &dest_entry,
-            true,
-            !self.dest_storage.has_real_directory_objects(),
-        );
-        if mismatches.is_empty() {
-            debug!("Dir integrity check passed for {:?}", relative_path);
-            return;
-        }
-        error!(
-            "Dir mismatch for {:?}: {}\n  src:  {}\n  dest: {}",
-            relative_path,
-            mismatches.join(", "),
-            format_entry_metadata(entry),
-            format_entry_metadata(&dest_entry)
-        );
-        let issue = build_mismatch_issue(
-            &self.dest_storage,
-            relative_path,
-            "dir",
-            entry,
-            mismatches,
-            self.auto_fix,
-        )
-        .await;
-        self.push_issue(issue);
-    }
-
-    /// 符号链接条目处理：mode 不参与比对（平台限制）。
-    async fn process_symlink(&self, entry: &EntryEnum, relative_path: &Path) {
-        let dest_entry = match get_metadata_with_transient_retry(&self.dest_storage, relative_path).await {
-            Ok(e) => e,
-            Err(e) => {
-                self.push_issue(build_lookup_issue("symlink", relative_path, &e));
-                return;
-            }
-        };
-
-        let mismatches = collect_metadata_mismatches(
-            entry,
-            &dest_entry,
-            false,
-            !self.dest_storage.has_real_directory_objects(),
-        );
-        if mismatches.is_empty() {
-            debug!("Symlink integrity check passed for {:?}", relative_path);
-            return;
-        }
-        error!(
-            "Symlink mismatch for {:?}: {}\n  src:  {}\n  dest: {}",
-            relative_path,
-            mismatches.join(", "),
-            format_entry_metadata(entry),
-            format_entry_metadata(&dest_entry)
-        );
-        let issue = build_mismatch_issue(
-            &self.dest_storage,
-            relative_path,
-            "symlink",
-            entry,
-            mismatches,
-            self.auto_fix,
-        )
-        .await;
-        self.push_issue(issue);
     }
 
     /// 处理一条 walkdir 消息：根据 entry 类型分派到对应 helper，并增加计数 + 广播。
     async fn dispatch(&self, entry: Arc<EntryEnum>, broadcaster: &BroadcastForwarder<StorageEntryMessage>) {
         let relative_path = entry.get_relative_path().to_path_buf();
-        if entry.get_is_symlink() {
-            self.process_symlink(entry.as_ref(), &relative_path).await;
+        let error_reason = if entry.get_is_symlink() {
+            let result = self.process_entry(entry.as_ref(), &relative_path, "symlink").await;
             self.checked_symlinks.fetch_add(1, Ordering::Relaxed);
+            result
         } else if entry.get_is_dir() {
-            self.process_dir(entry.as_ref(), &relative_path).await;
+            let result = if self.dest_storage.has_real_directory_objects() {
+                self.process_entry(entry.as_ref(), &relative_path, "dir").await
+            } else {
+                None
+            };
             self.checked_dirs.fetch_add(1, Ordering::Relaxed);
+            result
         } else {
-            self.process_file(entry.as_ref(), &relative_path).await;
+            let result = self.process_entry(entry.as_ref(), &relative_path, "file").await;
             self.checked_files.fetch_add(1, Ordering::Relaxed);
+            result
+        };
+        if let Some(reason) = error_reason {
+            broadcaster
+                .broadcast(StorageEntryMessage::Error {
+                    event: data_mover::ErrorEvent::IntegrityCheck,
+                    path: relative_path,
+                    entry: Some(entry),
+                    reason,
+                })
+                .await;
+        } else {
+            broadcaster
+                .broadcast(StorageEntryMessage::IntegrityChecked(entry))
+                .await;
         }
-        broadcaster
-            .broadcast(StorageEntryMessage::IntegrityChecked(entry))
-            .await;
     }
 }
 
@@ -503,7 +320,7 @@ impl CheckContext {
 /// - `src_path`: 源路径，指定要检查的源文件位置
 /// - `dest_path`: 目标路径，指定要检查的目标文件位置
 /// - `quick`: 是否启用快速模式（跳过内容哈希，只比对元数据）
-/// - `auto_fix`: 是否自动修复不一致的文件（重新复制）
+/// - `auto_fix`: 是否自动修复可修复的元数据；内容差异仅标记为 partially fixed
 /// - `raw_command_line`: 原始命令行，用于记录和调试
 /// - `progress_callback_url`: 进度回调 URL（web 层传入，CLI 传 `None`）
 #[instrument(skip_all, fields(
@@ -555,9 +372,20 @@ pub async fn integrity_check(
     };
 
     let check_concurrency = app_config.integrity_check.concurrency;
+    let mtime_precision = match app_config.integrity_check.mtime_precision {
+        utils::app_config::IntegrityMtimePrecision::Exact => MtimePrecision::Exact,
+        utils::app_config::IntegrityMtimePrecision::Auto => MtimePrecision::Auto,
+    };
+    let check_options = IntegrityCheckOptions::new(if quick {
+        IntegrityCheckMode::Quick
+    } else {
+        IntegrityCheckMode::Full
+    })
+    .with_mtime_precision(mtime_precision)
+    .with_mtime_tolerance(Duration::from_millis(app_config.integrity_check.mtime_tolerance_ms));
     info!(
-        "Integrity check configuration: scan_concurrency={}, check_concurrency={}",
-        app_config.scan.concurrency, check_concurrency
+        "Integrity check configuration: scan_concurrency={}, check_concurrency={}, mtime_precision={:?}, mtime_tolerance_ms={}",
+        app_config.scan.concurrency, check_concurrency, mtime_precision, app_config.integrity_check.mtime_tolerance_ms
     );
 
     let walkdir_iter = match dir_walker::walkdir(scan_config).await {
@@ -608,20 +436,30 @@ pub async fn integrity_check(
                     checked_files,
                     checked_dirs,
                     checked_symlinks,
-                    quick,
+                    options: check_options,
                     auto_fix,
                 };
 
                 while let Some(msg) = walkdir_iter.next().await {
                     match msg {
                         StorageEntryMessage::Scanned(entry) => ctx.dispatch(entry, &broadcaster).await,
-                        StorageEntryMessage::Error { path, reason, .. } => {
+                        StorageEntryMessage::Error {
+                            path, entry, reason, ..
+                        } => {
                             error!(
                                 "[IntegrityCheck] Worker {}: Walkdir error for {}: {}",
                                 worker_id,
                                 path.display(),
                                 reason
                             );
+                            broadcaster
+                                .broadcast(StorageEntryMessage::Error {
+                                    event: data_mover::ErrorEvent::IntegrityCheck,
+                                    path,
+                                    entry,
+                                    reason,
+                                })
+                                .await;
                         }
                         _ => {}
                     }
@@ -752,34 +590,32 @@ mod tests {
     use super::*;
 
     #[test]
-    fn extract_mismatch_labels_strips_values() {
-        let raw = vec![
-            "size: src=100, dest=200".to_string(),
-            "mtime: src=1000, dest=1001".to_string(),
-            "uid: src=0, dest=1000".to_string(),
-        ];
-        let labels = extract_mismatch_labels(&raw);
-        assert_eq!(labels, vec!["size", "mtime", "uid"]);
+    fn structured_data_mismatches_map_to_stable_labels() {
+        let error = StorageError::MismatchData(vec![
+            MismatchDataField::Size { src: 1, dest: 2 },
+            MismatchDataField::Content { offset: 7 },
+        ]);
+        assert_eq!(structured_mismatch_labels(&error).unwrap(), vec!["size", "content"]);
     }
 
     #[test]
-    fn extract_mismatch_labels_handles_missing_colon() {
-        let raw = vec!["just_a_word".to_string()];
-        assert_eq!(extract_mismatch_labels(&raw), vec!["just_a_word"]);
-    }
-
-    #[test]
-    fn detect_content_mismatch_recognizes_size_mtime_hash() {
-        assert!(detect_content_mismatch(&["size: src=1, dest=2".to_string()]));
-        assert!(detect_content_mismatch(&["mtime: src=1, dest=2".to_string()]));
-        assert!(detect_content_mismatch(&["hash: src=a, dest=b".to_string()]));
-        assert!(detect_content_mismatch(&["src hash error: io".to_string()]));
+    fn structured_metadata_mismatches_map_to_stable_labels() {
+        let error = StorageError::MismatchMeta(vec![
+            MismatchMetaField::Mtime { src: 1, dest: 2 },
+            MismatchMetaField::Mode {
+                src: 0o644,
+                dest: 0o755,
+            },
+        ]);
+        assert_eq!(structured_mismatch_labels(&error).unwrap(), vec!["mtime", "mode"]);
     }
 
     #[test]
     fn detect_content_mismatch_ignores_metadata_only() {
-        assert!(!detect_content_mismatch(&["uid: src=0, dest=1".to_string()]));
-        assert!(!detect_content_mismatch(&["mode: src=0o644, dest=0o755".to_string()]));
+        assert!(detect_content_mismatch(&["size".to_string()]));
+        assert!(detect_content_mismatch(&["content".to_string()]));
+        assert!(!detect_content_mismatch(&["uid".to_string()]));
+        assert!(!detect_content_mismatch(&["mode".to_string()]));
         assert!(!detect_content_mismatch(&[]));
     }
 
@@ -788,40 +624,5 @@ mod tests {
         assert!(is_truly_missing(&StorageError::FileNotFound("/tmp/x".into())));
         assert!(is_truly_missing(&StorageError::DirectoryNotFound("/tmp/x".into())));
         assert!(!is_truly_missing(&StorageError::OperationError("nfs busy".into())));
-    }
-
-    #[test]
-    fn modes_equivalent_ignores_file_type_bits() {
-        // NFSv3 / Local Unix raw st_mode vs NFSv4.1 / CIFS / Local Windows 合成权限位。
-        // 下划线分隔 <类型位>_<权限位>。
-        assert!(modes_equivalent(0o100_644, 0o000_644));
-        assert!(modes_equivalent(0o040_755, 0o000_755));
-        assert!(modes_equivalent(0o120_777, 0o000_777));
-    }
-
-    #[test]
-    fn modes_equivalent_detects_real_permission_diff() {
-        assert!(!modes_equivalent(0o100_644, 0o100_755));
-        assert!(!modes_equivalent(0o100_644, 0o000_755));
-    }
-
-    #[test]
-    fn modes_equivalent_masks_special_bits() {
-        // 已知 trade-off：0o777 掩码丢弃 suid/sgid/sticky。
-        // 此测试钉住该行为，未来若改为 0o7777 必须同步更新。
-        assert!(modes_equivalent(0o104_755, 0o100_755)); // suid bit difference ignored
-        assert!(modes_equivalent(0o102_755, 0o100_755)); // sgid bit difference ignored
-        assert!(modes_equivalent(0o101_755, 0o100_755)); // sticky bit difference ignored
-    }
-
-    #[test]
-    fn retry_delays_are_increasing() {
-        // 防回归：缩短/打乱重试间隔会失去"覆盖 thundering-herd 余波"的语义。
-        let delays = INTEGRITY_TRANSIENT_RETRY_DELAYS_MS;
-        for w in delays.windows(2) {
-            assert!(w[0] < w[1], "retry delays must be strictly increasing: {delays:?}");
-        }
-        let total: u64 = delays.iter().sum();
-        assert!(total >= 15_000, "total retry budget should be ~17s, got {total}ms");
     }
 }

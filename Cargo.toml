@@ -137,11 +137,9 @@ predicates = "3.1.4"
 serial_test = "3.4.0"
 tempfile = "3"
 
-# nfs-rs / smb 必须保留：data-mover 内部用 crates.io 写法引用它们（nfs-rs = "0.2.0"、smb = "0.12"），
-# data-mover 自身的 [patch.crates-io] 在被作为依赖引入时不生效，只有 workspace root 的 patch 才生效。
-# 这里的 patch 把 data-mover 内部的传递依赖替换为 fork 版本。
+# data-mover 内部用 crates.io 写法引用 smb；其自身的 [patch.crates-io] 在被作为依赖引入时
+# 不生效，只有 workspace root 的 patch 才生效，因此在这里保留 SMB fork。
 [patch.crates-io]
-nfs-rs = { git = "https://github.com/JayTsu-sh/nfs-rs.git" }
 smb    = { git = "https://github.com/JayTsu-sh/smb-rs.git" }
 
 [lints]

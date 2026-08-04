@@ -335,6 +335,7 @@ pub(crate) async fn process_versioned_entry(
                             .broadcast(StorageEntryMessage::Error {
                                 event: ErrorEvent::Copy,
                                 path: entry.get_relative_path().to_path_buf(),
+                                entry: Some(entry.clone()),
                                 reason: format!("{e}"),
                             })
                             .await;
@@ -380,6 +381,7 @@ pub(crate) async fn process_versioned_entry(
                             .broadcast(StorageEntryMessage::Error {
                                 event: ErrorEvent::Copy,
                                 path: object_key.clone().into(),
+                                entry: Some(entry.clone()),
                                 reason: format!("{e}"),
                             })
                             .await;
@@ -479,6 +481,7 @@ async fn process_entry_inner(
                     .broadcast(StorageEntryMessage::Error {
                         event: ErrorEvent::Copy,
                         path: relative_path.to_path_buf(),
+                        entry: Some(Arc::new(entry.clone())),
                         reason: format!("{e}"),
                     })
                     .await;
@@ -500,6 +503,7 @@ async fn process_entry_inner(
                             .broadcast(StorageEntryMessage::Error {
                                 event: ErrorEvent::SymlinkOp,
                                 path: relative_path.to_path_buf(),
+                                entry: Some(Arc::new(entry.clone())),
                                 reason: format!("{e}"),
                             })
                             .await;
@@ -512,6 +516,7 @@ async fn process_entry_inner(
                     .broadcast(StorageEntryMessage::Error {
                         event: ErrorEvent::SymlinkOp,
                         path: relative_path.to_path_buf(),
+                        entry: Some(Arc::new(entry.clone())),
                         reason: format!("{e}"),
                     })
                     .await;
@@ -580,6 +585,7 @@ async fn process_entry_inner(
                 .broadcast(StorageEntryMessage::Error {
                     event: ErrorEvent::CopyAcl,
                     path: relative_path.to_path_buf(),
+                    entry: Some(Arc::new(entry.clone())),
                     reason: format!("{err}"),
                 })
                 .await;
@@ -592,6 +598,7 @@ async fn process_entry_inner(
                 .broadcast(StorageEntryMessage::Error {
                     event: ErrorEvent::CopyXattr,
                     path: relative_path.to_path_buf(),
+                    entry: Some(Arc::new(entry.clone())),
                     reason: format!("{err}"),
                 })
                 .await;
