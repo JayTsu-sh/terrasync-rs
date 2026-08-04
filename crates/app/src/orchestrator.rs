@@ -470,6 +470,7 @@ impl SyncOrchestrator {
                                         bc.broadcast(StorageEntryMessage::Error {
                                             event: ErrorEvent::Copy,
                                             path: entry.get_relative_path().to_path_buf(),
+                                            entry: Some(entry.clone()),
                                             reason: format!("{e}"),
                                         })
                                         .await;
@@ -849,6 +850,7 @@ impl SyncOrchestrator {
                                             bc.broadcast(StorageEntryMessage::Error {
                                                 event: ErrorEvent::Copy,
                                                 path: entry.get_relative_path().to_path_buf(),
+                                                entry: Some(entry.clone()),
                                                 reason: format!("{e}"),
                                             })
                                             .await;
@@ -896,6 +898,7 @@ impl SyncOrchestrator {
                                         bc.broadcast(StorageEntryMessage::Error {
                                             event: ErrorEvent::Copy,
                                             path: entry.get_relative_path().to_path_buf(),
+                                            entry: Some(entry.clone()),
                                             reason: format!("{e}"),
                                         })
                                         .await;
@@ -927,6 +930,7 @@ impl SyncOrchestrator {
                                         bc.broadcast(StorageEntryMessage::Error {
                                             event: ErrorEvent::Delete,
                                             path: entry.get_relative_path().to_path_buf(),
+                                            entry: Some(entry.clone()),
                                             reason: format!("{e}"),
                                         })
                                         .await;
@@ -959,6 +963,7 @@ impl SyncOrchestrator {
                                             bc.broadcast(StorageEntryMessage::Error {
                                                 event: ErrorEvent::Rename,
                                                 path: to_entry.get_relative_path().to_path_buf(),
+                                                entry: Some(to_entry.clone()),
                                                 reason: format!("{e}"),
                                             })
                                             .await;
@@ -998,6 +1003,7 @@ impl SyncOrchestrator {
                                         bc.broadcast(StorageEntryMessage::Error {
                                             event: ErrorEvent::Pack,
                                             path: entry.get_relative_path().to_path_buf(),
+                                            entry: Some(entry.clone()),
                                             reason: format!("{e}"),
                                         })
                                         .await;
@@ -1368,6 +1374,7 @@ impl SyncOrchestrator {
                                 .broadcast(StorageEntryMessage::Error {
                                     event: ErrorEvent::Delete,
                                     path: entry_arc.get_relative_path().to_path_buf(),
+                                    entry: Some(entry_arc.clone()),
                                     reason: format!("{e}"),
                                 })
                                 .await;
@@ -1444,6 +1451,7 @@ impl SyncOrchestrator {
                                 .broadcast(StorageEntryMessage::Error {
                                     event: ErrorEvent::Rename,
                                     path: to_arc.get_relative_path().to_path_buf(),
+                                    entry: Some(to_arc.clone()),
                                     reason: format!("{e}"),
                                 })
                                 .await;

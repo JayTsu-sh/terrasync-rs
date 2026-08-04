@@ -82,11 +82,27 @@ pub struct SyncConfig {
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct IntegrityCheckConfig {
     pub concurrency: usize,
+    #[serde(default)]
+    pub mtime_precision: IntegrityMtimePrecision,
+    #[serde(default)]
+    pub mtime_tolerance_ms: u64,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum IntegrityMtimePrecision {
+    Exact,
+    #[default]
+    Auto,
 }
 
 impl Default for IntegrityCheckConfig {
     fn default() -> Self {
-        Self { concurrency: 8 }
+        Self {
+            concurrency: 8,
+            mtime_precision: IntegrityMtimePrecision::Auto,
+            mtime_tolerance_ms: 0,
+        }
     }
 }
 

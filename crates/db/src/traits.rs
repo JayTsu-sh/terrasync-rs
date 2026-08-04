@@ -317,7 +317,9 @@ impl IncrementalStorageEntryRecord {
             },
 
             // 错误消息记录为 error 操作类型
-            StorageEntryMessage::Error { event, path, reason } => Self {
+            StorageEntryMessage::Error {
+                event, path, reason, ..
+            } => Self {
                 operation_type: "error".to_string(),
                 name: path
                     .file_name()

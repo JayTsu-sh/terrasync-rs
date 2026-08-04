@@ -21,6 +21,8 @@ concurrency = 8            # Concurrency level for migration operations (default
 [integrity_check]
 # Integrity check configuration
 concurrency = 8            # Concurrency level for integrity check operations (default: 8)
+mtime_precision = "auto"   # "auto" normalizes backend timestamp precision; "exact" compares nanoseconds
+mtime_tolerance_ms = 0      # Additional allowed timestamp difference in milliseconds
 
 [delete]
 # Delete operation configuration
@@ -55,4 +57,3 @@ pool_size = 4             # Connection pool size (default: 4)
 #idle_timeout = 300        # Idle connection timeout in seconds
 #sync_to_clickhouse = false # Enable async sync to ClickHouse
 #sync_interval = 60        # Sync interval in seconds
-

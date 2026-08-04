@@ -368,6 +368,7 @@ pub struct ErrorStats {
     pub rename: usize,
     pub symlink_op: usize,
     pub pack: usize,
+    pub integrity_check: usize,
 }
 
 impl ErrorStats {
@@ -381,6 +382,7 @@ impl ErrorStats {
             ErrorEvent::Rename => self.rename += 1,
             ErrorEvent::SymlinkOp => self.symlink_op += 1,
             ErrorEvent::Pack => self.pack += 1,
+            ErrorEvent::IntegrityCheck => self.integrity_check += 1,
         }
     }
 
@@ -393,6 +395,7 @@ impl ErrorStats {
             + self.rename
             + self.symlink_op
             + self.pack
+            + self.integrity_check
     }
 
     pub fn is_empty(&self) -> bool {
@@ -928,6 +931,7 @@ fn fmt_error_stats(f: &mut fmt::Formatter<'_>, error_stats: &ErrorStats) -> fmt:
         ("rename", error_stats.rename),
         ("symlink_op", error_stats.symlink_op),
         ("pack", error_stats.pack),
+        ("integrity_check", error_stats.integrity_check),
     ] {
         if count > 0 {
             writeln!(f, "    │ {label:<12} │ {count:>8} │")?;

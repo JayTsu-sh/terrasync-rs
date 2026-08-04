@@ -241,6 +241,7 @@ mod tests {
         tx.send(StorageEntryMessage::Error {
             event: ErrorEvent::Scan,
             path: PathBuf::from("bad/path.txt"),
+            entry: None,
             reason: "walkdir stat failed".to_string(),
         })
         .await
@@ -281,7 +282,9 @@ mod tests {
         .await;
 
         match rx_bc.try_recv() {
-            Ok(StorageEntryMessage::Error { path, reason, event }) => {
+            Ok(StorageEntryMessage::Error {
+                path, reason, event, ..
+            }) => {
                 assert_eq!(path, PathBuf::from("bad/path.txt"));
                 assert_eq!(reason, "walkdir stat failed");
                 assert_eq!(event, ErrorEvent::Scan);

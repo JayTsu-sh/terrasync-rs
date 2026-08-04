@@ -602,13 +602,10 @@ async fn recv_file_list_and_data_phase(
                 if let Ok(iter) = dest_storage
                     .walkdir(
                         Some(std::path::Path::new(&page.dir_path)),
-                        Some(1),
-                        None,
-                        None,
-                        1,
-                        false,
-                        false,
-                        0,
+                        data_mover::WalkOptions {
+                            depth: Some(1),
+                            ..Default::default()
+                        },
                     )
                     .await
                 {

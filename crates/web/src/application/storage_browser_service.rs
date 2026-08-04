@@ -87,7 +87,13 @@ impl StorageBrowserService {
             };
 
         let iter = storage
-            .walkdir(sub_path, Some(1), None, None, 1, false, false, 0)
+            .walkdir(
+                sub_path,
+                data_mover::WalkOptions {
+                    depth: Some(1),
+                    ..Default::default()
+                },
+            )
             .await?;
 
         let mut entries = Vec::new();
