@@ -57,7 +57,8 @@ prepare_storage_root() {
     nfs3|nfs41)
       [[ "$role" == source ]] && host="$LAB_SOURCE_MGMT" || host="$LAB_DEST_MGMT"
       [[ "$backend" == nfs3 ]] && export_path="$LAB_NFS3_EXPORT" || export_path="$LAB_NFS41_EXPORT"
-      ssh_lab_root "$host" "mkdir -p '$export_path/ci/$run_id/$case_id/$role' && chmod 0777 '$export_path/ci/$run_id/$case_id/$role'"
+      ssh_lab_root "$host" \
+        "mkdir -p '$export_path/ci/$run_id/$case_id/$role' && chown '$LAB_FIXTURE_UID:$LAB_FIXTURE_GID' '$export_path/ci/$run_id/$case_id/$role' && chmod 0777 '$export_path/ci/$run_id/$case_id/$role'"
       ;;
     s3) ;;
   esac
@@ -71,7 +72,9 @@ put_fixture() {
     nfs3|nfs41)
       [[ "$role" == source ]] && host="$LAB_SOURCE_MGMT" || host="$LAB_DEST_MGMT"
       [[ "$backend" == nfs3 ]] && export_path="$LAB_NFS3_EXPORT" || export_path="$LAB_NFS41_EXPORT"
-      ssh_lab_root "$host" "cat > '$export_path/ci/$run_id/$case_id/$role/$key'" < "$file"
+      ssh_lab_root "$host" \
+        "cat > '$export_path/ci/$run_id/$case_id/$role/$key' && chown '$LAB_FIXTURE_UID:$LAB_FIXTURE_GID' '$export_path/ci/$run_id/$case_id/$role/$key'" \
+        < "$file"
       ;;
     s3)
       [[ "$role" == source ]] && host="$LAB_SOURCE_DATA" || host="$LAB_DEST_DATA"

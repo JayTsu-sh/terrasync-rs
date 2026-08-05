@@ -14,6 +14,8 @@ identifier and call `cleanup-run.sh` from an `always()` step.
 
 Management traffic uses `10.131.9.0/20`. Test data uses `10.10.1.0/24`.
 Credentials are provisioned on the self-hosted runner and must not be committed.
+NFS fixtures use UID/GID 1000 to match the non-root GitHub runner, allowing
+metadata preservation to be verified without privileged local writes.
 
 The self-hosted runner uses the same environment as `data-mover-rs`. It must
 provide `LAB_S3_ACCESS_KEY` and `LAB_S3_SECRET_KEY`, Python 3 with `boto3`, and
