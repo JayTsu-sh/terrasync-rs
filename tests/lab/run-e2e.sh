@@ -12,7 +12,8 @@ lab_root="/tmp/terrasync-lab/$run_id"
 runtime_root="$lab_root/runtime"
 fixture_root="$lab_root/fixtures"
 mkdir -p "$runtime_root" "$fixture_root"
-printf '[database]\nenabled = false\n' > "$lab_root/config.toml"
+printf '[database]\nenabled = true\ntype = "duckdb"\n\n[database.duckdb]\nin_memory = false\npool_size = 4\n' \
+  > "$lab_root/config.toml"
 
 storage_url() {
   local role="$1" backend="$2" case_id="$3" host export_path

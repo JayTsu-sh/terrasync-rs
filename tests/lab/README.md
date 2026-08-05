@@ -27,7 +27,9 @@ repeatable CI-owned suite. It runs the complete directed 4-by-4 synchronization
 matrix across Local, NFSv3, NFSv4.1, and S3, verifies every destination by
 SHA-256, and independently runs quick and full integrity checks. It also covers
 same-backend incremental synchronization and the local filter contract. The
-nightly workflow separately runs the real two-process QUIC tests.
+nightly workflow separately runs the real two-process QUIC tests. Each run uses
+the built-in DuckDB backend under its isolated temporary directory, replacing
+the external ClickHouse dependency of the former skills.
 
 The current lab has no SMB/CIFS endpoint. CIFS remains covered by unit and
 integration tests, but is intentionally not claimed as a nightly physical-lab
