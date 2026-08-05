@@ -86,7 +86,11 @@ impl StatisticConsumer {
 
     /// 构建共享的 HTTP 客户端（带超时），供回调循环和最终回调复用
     fn build_callback_client() -> Option<reqwest::Client> {
-        match reqwest::Client::builder().timeout(Duration::from_secs(10)).build() {
+        match reqwest::Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_secs(10))
+            .build()
+        {
             Ok(c) => Some(c),
             Err(e) => {
                 error!("[ProgressCallback] Failed to build HTTP client, aborting callbacks: {e}");
