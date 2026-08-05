@@ -99,7 +99,7 @@ for source_backend in "${backends[@]}"; do
     put_fixture source "$source_backend" "$case_id" "$key" "$fixture"
     prepare_storage_root destination "$destination_backend" "$case_id"
 
-    run_terrasync sync --id "lab-$case_id" --enable-integrity-check \
+    run_terrasync sync --id "lab-$case_id" \
       "$(storage_url source "$source_backend" "$case_id")" \
       "$(storage_url destination "$destination_backend" "$case_id")"
     actual_hash="$(object_hash destination "$destination_backend" "$case_id" "$key")"
@@ -133,7 +133,7 @@ for backend in "${backends[@]}"; do
     "$(storage_url source "$backend" "$case_id")" "$(storage_url destination "$backend" "$case_id")"
   put_fixture source "$backend" "$case_id" existing.txt "$changed"
   put_fixture source "$backend" "$case_id" added.txt "$added"
-  run_terrasync sync --id "lab-$case_id" --enable-integrity-check \
+  run_terrasync sync --id "lab-$case_id" \
     "$(storage_url source "$backend" "$case_id")" "$(storage_url destination "$backend" "$case_id")"
   [[ "$(object_hash destination "$backend" "$case_id" existing.txt)" == "$(sha256sum "$changed" | cut -d' ' -f1)" ]]
   [[ "$(object_hash destination "$backend" "$case_id" added.txt)" == "$(sha256sum "$added" | cut -d' ' -f1)" ]]
