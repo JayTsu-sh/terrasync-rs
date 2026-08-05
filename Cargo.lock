@@ -1976,7 +1976,7 @@ checksum = "a4ae5f15dda3c708c0ade84bfee31ccab44a3da4f88015ed22f63732abe300c8"
 [[package]]
 name = "data-mover"
 version = "0.2.0"
-source = "git+https://github.com/JayTsu-sh/data-mover-rs.git#fe2e9586908c866e075c4cad7439c7426ca75a76"
+source = "git+https://github.com/JayTsu-sh/data-mover-rs.git?rev=0b3a1f6#0b3a1f610eb68e9a6ccd1526dadac59d6b21b402"
 dependencies = [
  "arc-swap",
  "async-channel",
@@ -2003,6 +2003,7 @@ dependencies = [
  "md-5 0.10.6",
  "moka",
  "nfs-rs",
+ "num-traits",
  "parking_lot",
  "path-clean",
  "quick-xml",
@@ -2380,7 +2381,7 @@ checksum = "136d1b5283a1ab77bd9257427ffd09d8667ced0570b6f938942bc7568ed5b943"
 dependencies = [
  "cfg-if",
  "home",
- "windows-sys 0.48.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -7491,7 +7492,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.48.0",
 ]
 
 [[package]]
