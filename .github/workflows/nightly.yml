@@ -37,8 +37,9 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: tests/lab/health-check.sh
       - run: tests/lab/prepare-run.sh "$RUN_ID"
-      - run: flock --wait 10800 /tmp/terrasync-lab-tests.lock cargo test --workspace --locked --no-fail-fast
-      - run: flock --wait 10800 /tmp/terrasync-lab-tests.lock cargo test --locked --test remote_process_e2e --no-fail-fast
+      - run: flock --wait 10800 /tmp/terrasync-lab-tests.lock cargo test --workspace --exclude terrasync-rs --locked --no-fail-fast
+      - name: Remote process E2E (serial)
+        run: flock --wait 10800 /tmp/terrasync-lab-tests.lock cargo test --locked --test remote_process_e2e -- --test-threads=1
       - run: cargo clippy --workspace --all-targets --locked
       - run: cargo build --release --locked --features duckdb
       - name: Storage and integrity E2E matrix
