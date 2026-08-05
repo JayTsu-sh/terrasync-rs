@@ -11,44 +11,16 @@ CLAUDE.md              — 场景导航 + 每次会话必须知道的铁律（�
 .claude/memory/        — 跨会话积累的学习
 ```
 
-### rules/ 的两种加载模式
+### rules/ 加载模式
 
-**始终加载**（无 `paths:` frontmatter）：
+规则默认始终加载（无 `paths:` frontmatter）：
 ```
 .claude/rules/rust-patterns.md      — Rust 编码规范
 .claude/rules/api-design.md         — Web API 设计规范
 ```
 
-**Path-scoped**（只在接触特定文件时加载）：
-```
-.claude/rules/e2e-testing-protocol.md  — 只在接触 e2e-test-* 文件时加载
-```
-
-Path-scoped 规则的 frontmatter 格式：
-```yaml
----
-description: 规则说明
-paths:
-  - ".claude/skills/e2e-test-*/**"
----
-```
-
-## 环境配置 Single Source of Truth
-
-**唯一修改入口**：`.claude/skills/harness-run/.env.example`
-
-```
-harness-run/.env.example        ← 所有 IP、凭据、bucket 名的唯一真值
-    │
-    ├── env.py 加载（代码层）    ← run.py 自动读取，无需手动同步
-    │
-    ├── e2e-test-*/SKILL.md     ← Constants 只写变量名，不写值
-    │   "见 harness-run/.env.example"
-    │
-    └── e2e-test-*/.env.example ← 只列需要的键名（无值），指向 harness-run
-```
-
-**改一个 IP 只需改一处**：`harness-run/.env.example`，其他文件零修改。
+E2E 环境不再由 Claude skills 管理；统一使用 `tests/lab/` 和 Nightly workflow。
+非敏感拓扑在 `tests/lab/common.sh`，凭据由 self-hosted runner 注入。
 
 ## Skill 体系
 
@@ -72,12 +44,7 @@ harness-run/.env.example        ← 所有 IP、凭据、bucket 名的唯一真�
 - 验证步骤（预期输出）
 - 清理步骤
 
-**新建 e2e skill 步骤：**
-1. 复制 `e2e-test-nfs-v3-full-scan/` 作为模板
-2. 修改 SKILL.md 中的协议/IP/预期值
-3. 修改 `scripts/run.py` 中的具体命令和断言
-4. 创建 `.env.example`（从 `harness-run/.env.example` 抽取相关变量）
-5. 在 `harness-run/scripts/matrix.yaml` 的对应 suite 中注册
+新的 E2E 场景应加入 `tests/lab/run-e2e.sh`，并通过 Nightly workflow 验证。
 
 ## Memory 提升梯
 
@@ -113,7 +80,7 @@ docs/specs/<date>-<name>-design.md  — 设计文档（入库，团队资产）
 **只需要 Plan 的场景：**
 - Bug fix（单 crate 内）
 - 单文件优化
-- 新增 e2e skill
+- 新增或调整单个 E2E 场景
 
 **判断标准：** "改完后需要向其他人解释为什么这样设计吗？"如果是，写 Spec。
 
@@ -122,7 +89,7 @@ docs/specs/<date>-<name>-design.md  — 设计文档（入库，团队资产）
 | 任务 | 读哪里 | 怎么做 |
 |------|-------|-------|
 | 改 scan 逻辑 | `architecture.md` | 读数据流 + 增量状态机 |
-| 跑 e2e 测试 | `e2e-testing.md` | 按 SKILL.md 步骤或 `python run.py` |
+| 跑 E2E 测试 | `e2e-testing.md` | 触发 Nightly workflow |
 | 改存储驱动 | `services-and-storage.md` | 了解 StorageEnum dispatch 方式 |
 | 提交代码 | `conventions.md` | 遵循 conventional commits + 中文 |
 | 发现 Rust 违规 | `rules/rust-patterns.md` | 直接查规则细节 |

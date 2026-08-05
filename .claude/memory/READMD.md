@@ -86,7 +86,7 @@ Audit trail of every /project:evolve run. Records what was proposed, approved, r
 | 规则类型 | 目标文件 | 加载时机 |
 |---------|---------|---------|
 | Rust 编码约束（use 语句、错误处理、重构规范） | `rules/rust-patterns.md` | 始终 |
-| E2E 测试执行规范 | `rules/e2e-testing-protocol.md` | 接触 e2e-test-* 文件时 |
+| E2E 测试执行规范 | `tests/lab/README.md` | 修改 Nightly lab 时 |
 | Web API 设计规范（axum handler 模式） | `rules/api-design.md` | 接触 web/src/ 文件时 |
 | 每次会话都必须知道的铁律 | `CLAUDE.md` | 每次（谨慎，保持 <200 行）|
 

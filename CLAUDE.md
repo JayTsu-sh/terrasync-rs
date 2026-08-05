@@ -18,7 +18,7 @@ Every time. No exceptions.
 |------|-------|
 | 首次进入 / 理解代码结构 | `.claude/docs/codebase.md` |
 | 改 scan / sync 业务逻辑 | `.claude/docs/architecture.md` |
-| 跑 / 改 e2e 测试 | `.claude/docs/e2e-testing.md` |
+| 跑 / 改 E2E 测试 | `.claude/docs/e2e-testing.md`、`tests/lab/README.md` |
 | 改存储驱动 / 配置测试环境 | `.claude/docs/services-and-storage.md` |
 | 提 commit / PR | `.claude/docs/conventions.md` |
 | 改 Web UI | `.claude/docs/codebase.md`（前端章节）|
