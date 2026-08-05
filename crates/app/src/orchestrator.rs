@@ -1278,7 +1278,20 @@ impl SyncOrchestrator {
     ) -> bool {
         if kind != ChangeKind::MetadataOnly {
             // 内容变更：完整拷贝文件再设置元数据
-            match StorageEnum::copy_file(src, dest, entry, qos, integrity, source_reserved, bytes).await {
+            match StorageEnum::copy_file(
+                src,
+                dest,
+                entry,
+                data_mover::CopyOptions {
+                    qos,
+                    enable_integrity_check: integrity,
+                    is_source_reserved: source_reserved,
+                    bytes_counter: bytes,
+                    ..Default::default()
+                },
+            )
+            .await
+            {
                 Ok(()) => {}
                 Err(e) => {
                     warn!(

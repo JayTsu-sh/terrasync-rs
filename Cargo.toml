@@ -29,7 +29,6 @@ members = [
 ]
 
 # 集中管理 workspace 共享依赖，子 crate 用 `xxx = { workspace = true }` 引用。
-# 外部 fork（data-mover）不锁 rev，跟随 main，Cargo.lock 提供可复现性。
 [workspace.dependencies]
 # 异步运行时
 tokio        = { version = "1.51", features = ["full"] }

@@ -2669,9 +2669,18 @@ mod tests {
             });
         }
 
-        // 跨过至少一个周期回调间隔（consumer.rs::CALLBACK_INTERVAL_SECS=2），确保拿到
-        // 至少一次非 final 回调（用真实 sleep 而非 QoS 限速，确定性更高、不引入 flaky 风险）
-        tokio::time::sleep(Duration::from_millis(2_200)).await;
+        // 等待 mock server 确认收到周期回调。不能只 sleep 到 interval 边界后立即
+        // abort：调度繁忙时 HTTP 请求可能已经发出、但 server task 尚未来得及记录。
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if !bodies.lock().await.is_empty() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("应在超时前收到周期性回调");
 
         StatisticConsumer::end(stats_consumer, callback_guard).await;
         // 给 mock server 处理最后一次请求的时间（写响应发生在 POST 之后短暂延迟内）

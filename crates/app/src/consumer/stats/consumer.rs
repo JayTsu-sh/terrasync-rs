@@ -9,6 +9,7 @@
 //! 三段式编排；不再暴露一站式 `run`。
 
 // 标准库
+use std::net::IpAddr;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 use std::time::Duration;
@@ -84,9 +85,28 @@ impl StatisticConsumer {
 
     // ─── HTTP 回调 ───
 
-    /// 构建共享的 HTTP 客户端（带超时），供回调循环和最终回调复用
-    fn build_callback_client() -> Option<reqwest::Client> {
-        match reqwest::Client::builder().timeout(Duration::from_secs(10)).build() {
+    fn callback_is_loopback(url: &str) -> bool {
+        let Ok(parsed) = reqwest::Url::parse(url) else {
+            return false;
+        };
+        let Some(host) = parsed.host_str() else {
+            return false;
+        };
+        let address_host = host.trim_start_matches('[').trim_end_matches(']');
+        host.eq_ignore_ascii_case("localhost")
+            || address_host
+                .parse::<IpAddr>()
+                .is_ok_and(|address| address.is_loopback())
+    }
+
+    /// 构建共享的 HTTP 客户端（带超时），供回调循环和最终回调复用。
+    /// 本机回调绕过系统代理，外部回调继续遵循代理环境变量。
+    fn build_callback_client(url: &str) -> Option<reqwest::Client> {
+        let mut builder = reqwest::Client::builder().timeout(Duration::from_secs(10));
+        if Self::callback_is_loopback(url) {
+            builder = builder.no_proxy();
+        }
+        match builder.build() {
             Ok(c) => Some(c),
             Err(e) => {
                 error!("[ProgressCallback] Failed to build HTTP client, aborting callbacks: {e}");
@@ -106,7 +126,7 @@ impl StatisticConsumer {
         };
 
         let url = url?;
-        let client = Self::build_callback_client()?;
+        let client = Self::build_callback_client(&url)?;
         info!("[ProgressCallback] Starting callback loop → {url}");
         let sc = consumer.clone();
         let loop_client = client.clone();
@@ -148,7 +168,7 @@ impl StatisticConsumer {
             let owned;
             let client = match client {
                 Some(c) => c,
-                None => match Self::build_callback_client() {
+                None => match Self::build_callback_client(url) {
                     Some(c) => {
                         owned = c;
                         &owned
@@ -207,6 +227,36 @@ impl StatisticConsumer {
 
         let mut c = consumer.lock().await;
         c.finalize();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::StatisticConsumer;
+
+    #[test]
+    fn callback_proxy_bypass_is_limited_to_loopback_hosts() {
+        for url in [
+            "http://localhost:3000/callback",
+            "http://127.0.0.1:3000/callback",
+            "http://[::1]:3000/callback",
+        ] {
+            assert!(
+                StatisticConsumer::callback_is_loopback(url),
+                "expected loopback URL: {url}"
+            );
+        }
+
+        for url in [
+            "https://callbacks.example.com/progress",
+            "http://10.10.1.12:9000/callback",
+            "not a URL",
+        ] {
+            assert!(
+                !StatisticConsumer::callback_is_loopback(url),
+                "expected external URL: {url}"
+            );
+        }
     }
 }
 

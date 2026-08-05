@@ -51,8 +51,7 @@ pub async fn pack_directory(
         &tar_relative_path,
         tar_size,
         dir_mtime,
-        qos,
-        bytes_counter,
+        data_mover::TarPackOptions { qos, bytes_counter },
     )
     .await?;
 

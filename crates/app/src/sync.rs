@@ -559,10 +559,13 @@ async fn process_entry_inner(
             &src_storage,
             &dest_storage,
             entry,
-            qos_manager,
-            enable_integrity_check,
-            is_source_reserved,
-            bytes_counter,
+            data_mover::CopyOptions {
+                qos: qos_manager,
+                enable_integrity_check,
+                is_source_reserved,
+                bytes_counter,
+                ..Default::default()
+            },
         )
         .await
         .map_err(|e| AppError::CopyError(format!("Failed to copy {}: {e}", relative_path.display())))?;
@@ -699,10 +702,13 @@ pub(crate) async fn copy_file_with_resume(
         src_storage,
         dest_storage,
         entry,
-        qos_manager,
-        enable_integrity_check,
-        is_source_reserved,
-        bytes_counter,
+        data_mover::CopyOptions {
+            qos: qos_manager,
+            enable_integrity_check,
+            is_source_reserved,
+            bytes_counter,
+            ..Default::default()
+        },
         resume,
     )
     .await;

@@ -1976,7 +1976,7 @@ checksum = "a4ae5f15dda3c708c0ade84bfee31ccab44a3da4f88015ed22f63732abe300c8"
 [[package]]
 name = "data-mover"
 version = "0.2.0"
-source = "git+https://github.com/JayTsu-sh/data-mover-rs.git#fe2e9586908c866e075c4cad7439c7426ca75a76"
+source = "git+https://github.com/JayTsu-sh/data-mover-rs.git#da451207626932e11fc4b039da8eda5e798ad5fd"
 dependencies = [
  "arc-swap",
  "async-channel",
@@ -2003,6 +2003,7 @@ dependencies = [
  "md-5 0.10.6",
  "moka",
  "nfs-rs",
+ "num-traits",
  "parking_lot",
  "path-clean",
  "quick-xml",
