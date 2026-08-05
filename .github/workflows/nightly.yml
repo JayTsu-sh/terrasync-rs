@@ -27,6 +27,8 @@ jobs:
       TERRASYNC_S3_DEST: http://10.10.1.13:9000
     steps:
       - uses: actions/checkout@v5
+      - name: Configure preinstalled Rust tools
+        run: echo "/home/github-runner/.cargo/bin" >> "$GITHUB_PATH"
       - name: Verify preinstalled Rust toolchain
         run: |
           test "$(rustc --version | cut -d' ' -f2)" = "1.95.0"
