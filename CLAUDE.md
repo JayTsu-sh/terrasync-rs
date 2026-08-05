@@ -32,7 +32,6 @@ Every time. No exceptions.
 # Standard build
 cargo build                          # debug
 cargo build --release                # release
-cargo build --features duckdb        # with DuckDB
 cargo build --all-features           # all features
 
 # Cross-compile (cargo-zigbuild)
@@ -41,7 +40,6 @@ make debug                           # x86_64-unknown-linux-musl debug
 
 # Run
 cargo run -- scan --id my_scan /path/to/dir
-cargo run --features duckdb -- scan --id my_scan /path/to/dir
 
 # Tests
 cargo test --workspace --no-fail-fast
@@ -59,7 +57,7 @@ cargo fmt && cargo check
 | `cli/` | Argument parsing (clap), routes to `app` |
 | `app/` | Core business logic: scan, sync, dir_walker, consumers, ACE |
 | `data-mover` | Storage abstraction: NASEntry, S3Entry, StorageEnum, filter, qos (external git dep) |
-| `db/` | Database layer: ClickHouse (always), DuckDB (feature-gated) |
+| `db/` | Database layer: ClickHouse |
 | `transport/` | 传输层：InProcess / QUIC，Sender↔Receiver 消息协议 |
 | `sync-delta/` | chunk 级增量算法（rsync 风格）|
 | `licensing/` | 离线 license 验证（Ed25519 + 机器指纹）|

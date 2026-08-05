@@ -4,7 +4,7 @@ The lab is shared by `nfs-rs`, `data-mover-rs`, and `terrasync-rs`.
 
 | Role | Management | Data | Services |
 |---|---|---|---|
-| Controller | 10.131.9.11 | 10.10.1.11 | GitHub Actions Runner |
+| Controller | 10.131.9.11 | 10.10.1.11 | GitHub Actions Runner, ClickHouse |
 | Source | 10.131.9.12 | 10.10.1.12 | NFSv3, NFSv4.1, RustFS |
 | Destination | 10.131.9.13 | 10.10.1.13 | NFSv3, NFSv4.1, RustFS |
 | Worker | 10.131.9.14 | 10.10.1.14 | RustFS, fault injection |
@@ -28,8 +28,7 @@ matrix across Local, NFSv3, NFSv4.1, and S3, verifies every destination by
 SHA-256, and independently runs quick and full integrity checks. It also covers
 same-backend incremental synchronization and the local filter contract. The
 nightly workflow separately runs the real two-process QUIC tests. Each run uses
-the built-in DuckDB backend under its isolated temporary directory, replacing
-the external ClickHouse dependency of the former skills.
+an isolated ClickHouse database that is created and dropped for every run.
 
 The current lab has no SMB/CIFS endpoint. CIFS remains covered by unit and
 integration tests, but is intentionally not claimed as a nightly physical-lab

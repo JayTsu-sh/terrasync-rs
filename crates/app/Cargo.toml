@@ -6,7 +6,6 @@ description = "The application core code"
 edition = "2024"
 
 [features]
-duckdb = ["db/duckdb"]
 license = ["dep:licensing", "dep:chrono"]
 
 [dependencies]

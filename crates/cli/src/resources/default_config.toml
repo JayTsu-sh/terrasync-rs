@@ -31,8 +31,8 @@ concurrency = 8            # Concurrency level for delete operations (default: 8
 [database]
 # Database integration configuration
 enabled = true           # Enable Database integration (default: true)
-type = "clickhouse"          # Database type: "duckdb", "clickhouse" (default: "duckdb")
-batch_size = 800000      # Batch size for file entries. Recommended: 800000 for clickhouse and 100000 for duckdb
+type = "clickhouse"       # Only ClickHouse is supported
+batch_size = 800000       # Batch size for file entries
 
 [database.clickhouse]
 # ClickHouse specific configuration
@@ -42,11 +42,6 @@ read_timeout = 30         # Read timeout (seconds)
 database = "default"      # Database name
 username = "default"      # Username
 password = ""             # Password
-
-[database.duckdb]
-# DuckDB specific configuration
-in_memory = false         # Use in-memory database (default: false)
-pool_size = 4             # Connection pool size (default: 4)
 
 #[database.mariadb]
 # MariaDB specific configuration (Lustre fast_scan only)

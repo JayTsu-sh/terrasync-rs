@@ -128,18 +128,11 @@ pub struct ClickhouseConfig {
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
-pub struct DuckDBSQLiteConfig {
-    pub in_memory: bool,
-    pub pool_size: u32,
-}
-
-#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct DatabaseConfig {
     pub enabled: bool,
     pub r#type: String,
     pub batch_size: u32,
     pub clickhouse: ClickhouseConfig,
-    pub duckdb: DuckDBSQLiteConfig,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]

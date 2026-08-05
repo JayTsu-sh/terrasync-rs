@@ -693,10 +693,7 @@ impl SyncOrchestrator {
         let (work_tx, work_rx) = async_channel::bounded::<StorageEntryMessage>(DEFAULT_CHANNEL_CAPACITY);
 
         // ── 6. 并发度 + block_size ──
-        let incremental_scan_concurrency = match app_config.database.r#type.as_str() {
-            "duckdb" => 1, // DuckDB 串行模式避免并发写入冲突
-            _ => app_config.scan.concurrency,
-        };
+        let incremental_scan_concurrency = app_config.scan.concurrency;
 
         let block_size = match &c.block_size {
             Some(s) => Some(parse_size(s)?),

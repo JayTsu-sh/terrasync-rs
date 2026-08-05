@@ -24,4 +24,9 @@ for endpoint in \
   }
 done
 
+[[ "$(clickhouse_query 'SELECT 1')" == "1" ]] || {
+  echo "unhealthy ClickHouse endpoint: $LAB_CLICKHOUSE_DSN" >&2
+  exit 1
+}
+
 echo "terrasync lab is healthy"

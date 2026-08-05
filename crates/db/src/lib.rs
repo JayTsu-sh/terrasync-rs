@@ -2,7 +2,7 @@
 
 //! 数据库访问模块
 //!
-//! 提供统一的数据库接口抽象和多种数据库实现（ClickHouse、DuckDB）
+//! 提供统一的数据库接口抽象和 ClickHouse 数据库实现
 //! 主要功能包括表创建、数据插入、查询、差异比较等操作
 
 // 标准库
@@ -33,19 +33,10 @@ pub const SCAN_STATE_TABLE_BASE_NAME: &str = "state";
 /// Tar manifest 表的基本名称
 pub const TAR_MANIFEST_TABLE_BASE_NAME: &str = "tar_manifest";
 
-// 额外模块导出
-#[cfg(feature = "duckdb")]
-pub mod duckdb; // DuckDB数据库实现
-
 // 类型重导出，方便外部使用
 pub use clickhouse::ClickHouseDatabase; // ClickHouse数据库具体实现
 pub use common::DeletionStatus; // Common deletion status enum
-#[cfg(not(feature = "duckdb"))]
-pub use config::{ClickHouseConfig, DatabaseConfig, DatabaseType}; // 配置相关类型（不包含DuckDB）
-#[cfg(feature = "duckdb")]
-pub use config::{ClickHouseConfig, DatabaseConfig, DatabaseType, DuckDBConfig}; // 配置相关类型
-#[cfg(feature = "duckdb")]
-pub use duckdb::DuckDBDatabase; // DuckDB数据库具体实现
+pub use config::{ClickHouseConfig, DatabaseConfig, DatabaseType}; // 配置相关类型
 pub use error::{DatabaseError, Result}; // 错误处理相关类型
 pub use factory::DatabaseFactory; // 数据库工厂类型
 pub use traits::Database; // 数据库接口类型
@@ -67,9 +58,6 @@ pub mod prelude {
     pub use super::{ClickHouseConfig, DatabaseConfig, DatabaseType};
     /// 错误处理相关类型
     pub use super::{DatabaseError, Result};
-    /// DuckDB数据库具体实现（条件编译）
-    #[cfg(feature = "duckdb")]
-    pub use super::{DuckDBConfig, DuckDBDatabase};
 }
 
 /// 根据 `job_id` 生成扫描基础表名

@@ -5,6 +5,9 @@ source "$(dirname "$0")/common.sh"
 run_id="${1:?run id required}"
 validate_run_id "$run_id"
 
+database_name="$(clickhouse_database_name "$run_id")"
+clickhouse_query "DROP DATABASE IF EXISTS $database_name" || true
+
 for host in "$LAB_SOURCE_MGMT" "$LAB_DEST_MGMT" "$LAB_WORKER_MGMT"; do
   ssh_lab "$host" "rm -rf -- '/var/lib/terrasync-ci/$run_id'"
 done

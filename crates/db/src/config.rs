@@ -4,8 +4,7 @@
 //! 1. 数据库类型枚举
 //! 2. 通用数据库配置
 //! 3. `ClickHouse` 特定配置
-//! 4. DuckDB特定配置（可选）
-//! 5. 配置转换功能
+//! 4. 配置转换功能
 
 // 标准库
 // 无
@@ -15,18 +14,12 @@ use serde::{Deserialize, Serialize};
 use utils::app_config::DatabaseConfig as AppDatabaseConfig;
 
 // 内部模块
-#[cfg(feature = "duckdb")]
-use crate::error::Result;
-
 /// 数据库类型枚举
 /// 支持的数据库后端类型
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum DatabaseType {
     #[serde(rename = "clickhouse")]
     ClickHouse,
-    #[cfg(feature = "duckdb")]
-    #[serde(rename = "duckdb")]
-    DuckDB,
 }
 
 /// 数据库配置结构体
@@ -41,9 +34,6 @@ pub struct DatabaseConfig {
     pub batch_size: u32,
     /// `ClickHouse` 特定配置
     pub clickhouse: Option<ClickHouseConfig>,
-    /// DuckDB特定配置
-    #[cfg(feature = "duckdb")]
-    pub duckdb: Option<DuckDBConfig>,
 }
 
 /// 从 `utils::app_config::DatabaseConfig` 转换为 `db::config::DatabaseConfig`
@@ -60,12 +50,6 @@ impl From<&AppDatabaseConfig> for DatabaseConfig {
                 database: app_config.clickhouse.database.clone(),
                 username: app_config.clickhouse.username.clone(),
                 password: app_config.clickhouse.password.clone(),
-            }),
-            #[cfg(feature = "duckdb")]
-            duckdb: Some(DuckDBConfig {
-                in_memory: app_config.duckdb.in_memory,
-                pool_size: app_config.duckdb.pool_size,
-                job_dir: "".to_string(),
             }),
         }
     }
@@ -94,34 +78,4 @@ pub struct ClickHouseConfig {
     pub username: String,
     /// 密码（可选）
     pub password: Option<String>,
-}
-
-#[cfg(feature = "duckdb")]
-/// DuckDB数据库配置结构体
-/// 包含配置DuckDB所需的所有参数
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DuckDBConfig {
-    /// 是否使用内存模式
-    pub in_memory: bool,
-    /// 连接池大小
-    pub pool_size: u32,
-    /// 任务目录路径（用于文件模式）
-    pub job_dir: String,
-}
-
-#[cfg(feature = "duckdb")]
-impl DuckDBConfig {
-    /// 获取DuckDB数据库文件路径
-    ///
-    /// # 返回值
-    /// - 内存模式返回":memory:"
-    /// - 文件模式返回格式化的文件路径
-    pub fn get_path(&self) -> Result<String> {
-        if self.in_memory {
-            Ok(":memory:".to_string())
-        } else {
-            // 直接使用job_dir作为路径，因为它已经包含了必要的目录结构
-            Ok(format!("{}/duckdb.db", self.job_dir))
-        }
-    }
 }

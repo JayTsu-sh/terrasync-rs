@@ -12,8 +12,22 @@ lab_root="/tmp/terrasync-lab/$run_id"
 runtime_root="$lab_root/runtime"
 fixture_root="$lab_root/fixtures"
 mkdir -p "$runtime_root" "$fixture_root"
-printf '[database]\nenabled = true\ntype = "duckdb"\n\n[database.duckdb]\nin_memory = false\npool_size = 4\n' \
-  > "$lab_root/config.toml"
+database_name="$(clickhouse_database_name "$run_id")"
+clickhouse_query "CREATE DATABASE IF NOT EXISTS $database_name"
+cat > "$lab_root/config.toml" <<EOF
+[database]
+enabled = true
+type = "clickhouse"
+batch_size = 800000
+
+[database.clickhouse]
+dsn = "$LAB_CLICKHOUSE_DSN"
+dial_timeout = 5
+read_timeout = 30
+database = "$database_name"
+username = "$LAB_CLICKHOUSE_USER"
+password = "$LAB_CLICKHOUSE_PASSWORD"
+EOF
 
 storage_url() {
   local role="$1" backend="$2" case_id="$3" host export_path
@@ -140,7 +154,7 @@ for backend in "${backends[@]}"; do
   echo "$backend incremental sync verified"
 done
 
-# Preserve the former local-filter scenario without its ClickHouse dependency.
+# Preserve the former local-filter scenario.
 case_id="local-filter"
 mkdir -p "$lab_root/$case_id/source" "$lab_root/$case_id/destination"
 printf 'included\n' > "$lab_root/$case_id/source/included.txt"

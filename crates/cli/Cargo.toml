@@ -6,7 +6,6 @@ description = "CLI interface for terrasync"
 edition = "2024"
 
 [features]
-duckdb = ["app/duckdb"]
 license = ["dep:licensing", "app/license"]
 gui = ["dep:web"]
 

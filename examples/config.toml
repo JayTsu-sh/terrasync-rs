@@ -20,8 +20,8 @@ concurrency = 8             # Concurrency level for delete operations (default: 
 
 [database]
 enabled = true           # Enable Database integration
-type = "clickhouse"       # Database type: "duckdb", "clickhouse"
-batch_size = 800000       # Batch size for file entries. Recommended: 800000 for clickhouse and 100000 for duckdb
+type = "clickhouse"       # Only ClickHouse is supported
+batch_size = 800000       # Batch size for file entries
 
 [database.clickhouse]
 # ClickHouse specific configuration
@@ -31,9 +31,3 @@ read_timeout = 30
 database = "default"
 username = "default"
 password = ""
-
-[database.duckdb]
-# DuckDB specific configuration
-in_memory = false    # Use in-memory database
-pool_size = 4       # Connection pool size
-
