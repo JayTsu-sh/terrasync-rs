@@ -18,6 +18,7 @@ jobs:
     timeout-minutes: 240
     env:
       RUN_ID: nightly-${{ github.run_id }}-${{ github.run_attempt }}
+      RUSTUP_TOOLCHAIN: 1.95.0
       TERRASYNC_NFS3_SOURCE: 10.10.1.12:/srv/nfs/v3
       TERRASYNC_NFS41_SOURCE: 10.10.1.12:/srv/nfs/v4
       TERRASYNC_NFS3_DEST: 10.10.1.13:/srv/nfs/v3
@@ -26,9 +27,11 @@ jobs:
       TERRASYNC_S3_DEST: http://10.10.1.13:9000
     steps:
       - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@1.95.0
-        with:
-          components: rustfmt, clippy
+      - name: Verify preinstalled Rust toolchain
+        run: |
+          test "$(rustc --version | cut -d' ' -f2)" = "1.95.0"
+          cargo clippy --version
+          cargo fmt --version
       - uses: Swatinem/rust-cache@v2
       - run: tests/lab/health-check.sh
       - run: tests/lab/prepare-run.sh "$RUN_ID"

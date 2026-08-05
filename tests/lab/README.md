@@ -18,7 +18,9 @@ Credentials are provisioned on the self-hosted runner and must not be committed.
 The self-hosted runner uses the same environment as `data-mover-rs`. It must
 provide `LAB_S3_ACCESS_KEY` and `LAB_S3_SECRET_KEY`, Python 3 with `boto3`, and
 the `terrasync-lab` SSH key. Direct data-network traffic must bypass any system
-HTTP proxy.
+HTTP proxy. Rust 1.95.0 with Clippy and rustfmt must be preinstalled; nightly
+sets `RUSTUP_TOOLCHAIN=1.95.0` and verifies it instead of downloading tools at
+runtime.
 
 `run-e2e.sh` replaces the former protocol-specific Claude E2E skills with a
 repeatable CI-owned suite. It runs the complete directed 4-by-4 synchronization
