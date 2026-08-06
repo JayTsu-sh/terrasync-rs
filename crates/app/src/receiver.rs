@@ -13,7 +13,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 // 外部 crate
 use data_mover::qos::QosManager;
 use data_mover::{EntryEnum, StorageEnum};
-use tokio::sync::mpsc;
 use tokio::sync::mpsc::Receiver as MpscReceiver;
 use tracing::{Instrument, debug, error, info, info_span, trace, warn};
 use transport::error::TransportError;
@@ -516,11 +515,6 @@ pub(crate) async fn recv_file_list_and_data_phase(
     // ndx 级失败尝试计数（redo 决策用）：ndx → 已失败次数，见 decide_file_ack
     let mut attempts: HashMap<i32, u8> = HashMap::new();
     // ndx 终态去重与完成判断由 session ledger 统一持有。
-    // delta 文件是否已向 disk-commit task 发过 DeltaBegin：首个属于该
-    // ndx 的 delta 数据事件（token 或 EndOfFile）才触发一次 DeltaBegin，见
-    // `ensure_delta_active` 文档（避免 FilePage 阶段流水线化发出多个
-    // DeltaTransferRequest、早于任何响应到达导致 dc_tx 收到乱序 DeltaBegin）。
-    let mut delta_active = false;
     // credit 累计消费（issue #59 方案 b）：FileData/DeltaData 处理完成（送 dc_tx）后累加，
     // 达半窗口阈值批量发一次 CreditGrant 并清零，见 `accumulate_credit`。选"送达即补"而非
     // "落盘才补"：时序上与落盘 ack 近似等价、落盘 ack 通路改动更大且窗口利用率更差、dc
@@ -719,16 +713,14 @@ pub(crate) async fn recv_file_list_and_data_phase(
             //    issue #54 阶段 3），首个属于该 ndx 的 token 先触发一次 DeltaBegin ──
             Some(SenderMsg::DeltaMatch { ndx, block_index }) => {
                 if let Some(entry) = state.indexed_entry(ndx).cloned() {
-                    ensure_delta_active(&dc_tx, &mut delta_active, ndx, &entry).await;
-                    let _ = dc_tx.send(DiskCommitMsg::DeltaMatch { entry, block_index }).await;
+                    state.push_delta_match(&dc_tx, ndx, &entry, block_index).await;
                 } else {
                     warn!("[Receiver Remote] DeltaMatch for unknown ndx {}", ndx);
                 }
             }
             Some(SenderMsg::DeltaData { ndx, data }) => {
                 if let Some(entry) = state.indexed_entry(ndx).cloned() {
-                    ensure_delta_active(&dc_tx, &mut delta_active, ndx, &entry).await;
-                    let _ = dc_tx.send(DiskCommitMsg::DeltaData { entry, data }).await;
+                    state.push_delta_data(&dc_tx, ndx, &entry, data).await;
                 } else {
                     warn!("[Receiver Remote] DeltaData for unknown ndx {}", ndx);
                 }
@@ -740,14 +732,12 @@ pub(crate) async fn recv_file_list_and_data_phase(
             }
 
             // ── 文件结束：见过 FileBegin → 全量交 disk-commit task 收尾（读回 .part hash 校验 → 原子
-            //    rename）；否则是 delta 路径（含零 token 的空文件 delta，ensure_delta_active
+            //    rename）；否则是 delta 路径（含零 token 的空文件 delta，session state
             //    幂等补发 DeltaBegin），同样交 disk-commit task 三段式收尾。完成计数统一
             //    在 dc ack 回流时才 +1（decide_file_ack 做 redo 决策，全量/delta 共用一份状态机）──
             Some(SenderMsg::EndOfFile { ndx, entry, source_hash }) => {
                 if !state.commit_full(&dc_tx, ndx, &entry, &source_hash).await {
-                    ensure_delta_active(&dc_tx, &mut delta_active, ndx, &entry).await;
-                    delta_active = false;
-                    let _ = dc_tx.send(DiskCommitMsg::DeltaCommit { ndx, entry, source_hash }).await;
+                    state.commit_delta(&dc_tx, ndx, &entry, &source_hash).await;
                 }
             }
 
@@ -778,7 +768,6 @@ pub(crate) async fn recv_file_list_and_data_phase(
             //    防止与 dc task 独立上报的终态重复计数（[1]）──
             Some(SenderMsg::EntryError { path, reason, ndx }) => {
                 warn!("[Receiver Remote] Sender EntryError {:?}: {} — 中止该文件", path, reason);
-                delta_active = false;
                 state.abort_active_file(&dc_tx).await;
                 let should_break = if let Some(ndx) = ndx {
                     state.record_terminal(ndx) && state.is_complete()
@@ -886,33 +875,6 @@ async fn dispatch_file_outcome(
     }
     let _ = transport.send(ack).await;
     state.is_complete()
-}
-
-/// 首个属于该 ndx 的 delta 数据事件（token 或 EndOfFile）才触发一次 `DeltaBegin`，幂等
-/// （`delta_active` 已为 `true` 时直接返回）。
-///
-/// 不能在 Receiver 发出 `DeltaTransferRequest` 时就触发：`FilePage` 阶段可能流水线化
-/// 连续发出多个 `DeltaTransferRequest`（不等待任何一个的响应），若在发送请求的同时就
-/// `DeltaBegin`，dc_tx 会收到与 Sender 实际数据流顺序不一致的 `DeltaBegin` 序列（dc
-/// task 严格串行、同一时刻只有一个 `ActiveFile`）。依据：Sender 侧
-/// `process_requests_and_acks` 单一消费者循环严格串行处理每个 ndx 的数据阶段（无并发
-/// spawn），故 Receiver 单一收消息循环里首个属于某 ndx 的 delta 数据事件必然对应"当前
-/// 正在流的文件"。
-async fn ensure_delta_active(
-    dc_tx: &mpsc::Sender<DiskCommitMsg>, delta_active: &mut bool, ndx: i32, entry: &Arc<EntryEnum>,
-) {
-    if *delta_active {
-        return;
-    }
-    let block_size = sync_delta::calculate_block_size(entry.get_size());
-    let _ = dc_tx
-        .send(DiskCommitMsg::DeltaBegin {
-            ndx,
-            entry: entry.clone(),
-            block_size,
-        })
-        .await;
-    *delta_active = true;
 }
 
 #[cfg(test)]

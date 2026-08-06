@@ -37,6 +37,9 @@ enum ActiveTransfer {
     #[default]
     Idle,
     Full,
+    Delta {
+        ndx: i32,
+    },
 }
 
 impl TransferLedger {
@@ -312,6 +315,85 @@ impl RemoteSessionState {
         self.active_transfer = ActiveTransfer::Idle;
         let _ = dc_tx
             .send(DiskCommitMsg::FileCommit {
+                ndx,
+                entry: entry.clone(),
+                source_hash: source_hash.clone(),
+            })
+            .await;
+        true
+    }
+
+    /// Lazily starts the delta stream for `ndx`. Repeated events for the same
+    /// entry are idempotent; interleaved or full-transfer events are rejected.
+    async fn ensure_delta_active(&mut self, dc_tx: &Sender<DiskCommitMsg>, ndx: i32, entry: &Arc<EntryEnum>) -> bool {
+        match self.active_transfer {
+            ActiveTransfer::Idle => {
+                let block_size = sync_delta::calculate_block_size(entry.get_size());
+                let _ = dc_tx
+                    .send(DiskCommitMsg::DeltaBegin {
+                        ndx,
+                        entry: entry.clone(),
+                        block_size,
+                    })
+                    .await;
+                self.active_transfer = ActiveTransfer::Delta { ndx };
+                true
+            }
+            ActiveTransfer::Delta { ndx: active_ndx } if active_ndx == ndx => true,
+            ActiveTransfer::Full => {
+                warn!("[Receiver Remote] rejecting delta event while a full transfer is active");
+                false
+            }
+            ActiveTransfer::Delta { ndx: active_ndx } => {
+                warn!(
+                    "[Receiver Remote] rejecting delta event for ndx {} while ndx {} is active",
+                    ndx, active_ndx
+                );
+                false
+            }
+        }
+    }
+
+    pub(crate) async fn push_delta_match(
+        &mut self, dc_tx: &Sender<DiskCommitMsg>, ndx: i32, entry: &Arc<EntryEnum>, block_index: u32,
+    ) -> bool {
+        if !self.ensure_delta_active(dc_tx, ndx, entry).await {
+            return false;
+        }
+        let _ = dc_tx
+            .send(DiskCommitMsg::DeltaMatch {
+                entry: entry.clone(),
+                block_index,
+            })
+            .await;
+        true
+    }
+
+    pub(crate) async fn push_delta_data(
+        &mut self, dc_tx: &Sender<DiskCommitMsg>, ndx: i32, entry: &Arc<EntryEnum>, data: bytes::Bytes,
+    ) -> bool {
+        if !self.ensure_delta_active(dc_tx, ndx, entry).await {
+            return false;
+        }
+        let _ = dc_tx
+            .send(DiskCommitMsg::DeltaData {
+                entry: entry.clone(),
+                data,
+            })
+            .await;
+        true
+    }
+
+    /// Commits a delta stream, lazily beginning it when it contains zero tokens.
+    pub(crate) async fn commit_delta(
+        &mut self, dc_tx: &Sender<DiskCommitMsg>, ndx: i32, entry: &Arc<EntryEnum>, source_hash: &Option<String>,
+    ) -> bool {
+        if !self.ensure_delta_active(dc_tx, ndx, entry).await {
+            return false;
+        }
+        self.active_transfer = ActiveTransfer::Idle;
+        let _ = dc_tx
+            .send(DiskCommitMsg::DeltaCommit {
                 ndx,
                 entry: entry.clone(),
                 source_hash: source_hash.clone(),
@@ -844,5 +926,62 @@ mod tests {
 
         state.abort_active_file(&dc_tx).await;
         assert!(matches!(dc_rx.recv().await, Some(DiskCommitMsg::AbortFile)));
+    }
+
+    #[tokio::test]
+    async fn delta_state_routes_tokens_and_rejects_interleaved_indexes() {
+        let entry = nas_entry("file.txt", PathBuf::from("file.txt"), false);
+        let other = nas_entry("other.txt", PathBuf::from("other.txt"), false);
+        let (dc_tx, mut dc_rx) = mpsc::channel(8);
+        let mut state = RemoteSessionState::default();
+
+        assert!(state.push_delta_match(&dc_tx, 7, &entry, 3).await);
+        assert!(matches!(
+            dc_rx.recv().await,
+            Some(DiskCommitMsg::DeltaBegin { ndx: 7, .. })
+        ));
+        assert!(matches!(
+            dc_rx.recv().await,
+            Some(DiskCommitMsg::DeltaMatch { block_index: 3, .. })
+        ));
+
+        assert!(
+            !state
+                .push_delta_data(&dc_tx, 8, &other, Bytes::from_static(b"interleaved"))
+                .await
+        );
+        assert!(dc_rx.try_recv().is_err());
+
+        assert!(state.commit_delta(&dc_tx, 7, &entry, &None).await);
+        assert!(matches!(
+            dc_rx.recv().await,
+            Some(DiskCommitMsg::DeltaCommit { ndx: 7, .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn delta_state_lazily_begins_zero_token_commit() {
+        let entry = nas_entry("empty.txt", PathBuf::from("empty.txt"), false);
+        let (dc_tx, mut dc_rx) = mpsc::channel(8);
+        let mut state = RemoteSessionState::default();
+
+        assert!(state.commit_delta(&dc_tx, 9, &entry, &None).await);
+        assert!(matches!(
+            dc_rx.recv().await,
+            Some(DiskCommitMsg::DeltaBegin { ndx: 9, .. })
+        ));
+        assert!(matches!(
+            dc_rx.recv().await,
+            Some(DiskCommitMsg::DeltaCommit { ndx: 9, .. })
+        ));
+
+        assert!(state.begin_full(&dc_tx, 10, entry.clone()).await);
+        assert!(matches!(dc_rx.recv().await, Some(DiskCommitMsg::FileBegin { .. })));
+        assert!(
+            !state
+                .push_delta_data(&dc_tx, 10, &entry, Bytes::from_static(b"invalid"))
+                .await
+        );
+        assert!(dc_rx.try_recv().is_err());
     }
 }
