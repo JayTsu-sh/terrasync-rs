@@ -9,7 +9,10 @@ use std::sync::Arc;
 
 use data_mover::{EntryEnum, StorageEnum};
 use tokio::sync::mpsc::Receiver;
-use transport::message::{FeatureFlags, NdxTable, ProgressSnapshot, ReceiverMsg, SessionConfig, TransferDecision};
+use tracing::{info, warn};
+use transport::message::{
+    BlockSignature, FeatureFlags, NdxTable, ProgressSnapshot, ReceiverMsg, SessionConfig, TransferDecision,
+};
 use transport::traits::ReceiverTransport;
 
 use crate::error::Result;
@@ -78,10 +81,6 @@ impl RemoteSessionState {
         self.ndx_table.len()
     }
 
-    pub(crate) fn record_request(&mut self) {
-        self.ledger.record_request();
-    }
-
     /// 处理不需要 delta implementation 的基础分类。返回该分类是否已完成处理。
     pub(crate) async fn handle_base_classification(
         &mut self, transport: &(dyn ReceiverTransport + 'static), dest: &StorageEnum, progress: &ReceiverProgress,
@@ -120,6 +119,76 @@ impl RemoteSessionState {
             }
             TransferDecision::DeltaTransfer | TransferDecision::Deleted => false,
         }
+    }
+
+    /// 处理 changed entry 的 delta eligibility、basis signature 与 full fallback。
+    pub(crate) async fn handle_delta_classification(
+        &mut self, transport: &(dyn ReceiverTransport + 'static), dest: &Arc<StorageEnum>, features: &FeatureFlags,
+        delta_size_threshold: u64, ndx: i32, entry: &Arc<EntryEnum>, decision: TransferDecision,
+    ) -> bool {
+        if decision != TransferDecision::DeltaTransfer {
+            return false;
+        }
+
+        if !features.delta {
+            let _ = transport.send(ReceiverMsg::TransferRequest { ndx, decision }).await;
+            self.ledger.record_request();
+            return true;
+        }
+
+        let size = entry.get_size();
+        if size > delta_size_threshold {
+            info!(
+                "[Receiver Remote] {:?} size {} exceeds delta_size_threshold {} bytes, downgrading to full transfer",
+                entry.get_relative_path(),
+                size,
+                delta_size_threshold
+            );
+            let _ = transport.send(ReceiverMsg::TransferRequest { ndx, decision }).await;
+            self.ledger.record_request();
+            return true;
+        }
+
+        let block_size = sync_delta::calculate_block_size(size);
+        let (mut basis_rx, basis_handle) = StorageEnum::read_chunk_stream(dest, entry, None, None, false, 8);
+        let mut sig_calc = sync_delta::signature::SignatureCalculator::new(block_size);
+        while let Some(chunk) = basis_rx.recv().await {
+            sig_calc.push(&chunk.data);
+        }
+        let basis_read_result = match basis_handle.await {
+            Ok(inner) => inner.map_err(|e| e.to_string()),
+            Err(e) => Err(e.to_string()),
+        };
+
+        match basis_read_result {
+            Ok(_) => {
+                let signatures = sig_calc
+                    .finish()
+                    .into_iter()
+                    .map(|signature| BlockSignature {
+                        rolling: signature.rolling,
+                        strong: signature.strong,
+                    })
+                    .collect();
+                let _ = transport
+                    .send(ReceiverMsg::DeltaTransferRequest {
+                        ndx,
+                        block_size,
+                        signatures,
+                    })
+                    .await;
+            }
+            Err(error) => {
+                warn!(
+                    "[Receiver Remote] 读取 basis file {:?} 失败: {}, 降级全量传输",
+                    entry.get_relative_path(),
+                    error
+                );
+                let _ = transport.send(ReceiverMsg::TransferRequest { ndx, decision }).await;
+            }
+        }
+        self.ledger.record_request();
+        true
     }
 
     pub(crate) fn record_terminal(&mut self, ndx: i32) -> bool {
@@ -459,5 +528,50 @@ mod tests {
             fs::read(dest_dir.path().join("skip.txt")).unwrap(),
             b"same skip content"
         );
+    }
+
+    #[tokio::test]
+    async fn delta_basis_read_failure_falls_back_to_full_request() {
+        let src_dir = tempdir().unwrap();
+        let dest_dir = tempdir().unwrap();
+        fs::write(src_dir.path().join("changed.txt"), b"changed content").unwrap();
+        let src_storage = create_storage(src_dir.path().to_str().unwrap(), None, false)
+            .await
+            .unwrap();
+        let walk = src_storage.walkdir_2(None, None, None, None, 4, false).await.unwrap();
+        let page = match walk.next().await {
+            Some(NdxEvent::Page(page)) => page,
+            other => panic!("expected changed file page, got {other:?}"),
+        };
+        let indexed = &page.files[0];
+        let dest_storage = Arc::new(
+            create_storage(dest_dir.path().to_str().unwrap(), None, true)
+                .await
+                .unwrap(),
+        );
+        let (sender_transport, receiver_transport) = create_in_process_pair();
+        let mut state = RemoteSessionState::default();
+
+        assert!(
+            state
+                .handle_delta_classification(
+                    &receiver_transport,
+                    &dest_storage,
+                    &FeatureFlags::current(),
+                    u64::MAX,
+                    indexed.ndx,
+                    &indexed.entry,
+                    TransferDecision::DeltaTransfer,
+                )
+                .await
+        );
+        assert!(matches!(
+            sender_transport.recv().await,
+            Some(ReceiverMsg::TransferRequest {
+                ndx,
+                decision: TransferDecision::DeltaTransfer,
+            }) if ndx == indexed.ndx
+        ));
+        assert_eq!(state.counts(), (0, 1));
     }
 }

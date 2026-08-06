@@ -619,82 +619,21 @@ pub(crate) async fn recv_file_list_and_data_phase(
                     {
                         continue;
                     }
-                    match decision {
-                        TransferDecision::FullTransfer | TransferDecision::MetadataOnly | TransferDecision::Skip => {
-                            unreachable!("base classifications are handled by RemoteSessionState")
-                        }
-                        TransferDecision::DeltaTransfer if !negotiated_features.delta => {
-                            // delta 能力未协商成功（对端不支持）→ 降级为全量传输（wire 动作变了，
-                            // 分类判定不变：decision 仍是 DeltaTransfer，供 Sender 侧统计为 Changed）
-                            let _ = transport.send(ReceiverMsg::TransferRequest { ndx: nf.ndx, decision }).await;
-                            state.record_request();
-                        }
-                        TransferDecision::DeltaTransfer if nf.entry.get_size() > delta_size_threshold => {
-                            // 文件 size 超过 delta_size_threshold 门槛 → 降级为全量传输（同上，
-                            // wire 动作降级、分类判定不变），避免大文件 basis 全量读入内存 +
-                            // delta 重建峰值内存 ≈3× 文件大小的风险（issue #54 阶段 0）
-                            info!(
-                                "[Receiver Remote] {:?} size {} exceeds delta_size_threshold {} bytes, downgrading to full transfer",
-                                nf.entry.get_relative_path(),
-                                nf.entry.get_size(),
-                                delta_size_threshold
-                            );
-                            let _ = transport.send(ReceiverMsg::TransferRequest { ndx: nf.ndx, decision }).await;
-                            state.record_request();
-                        }
-                        TransferDecision::DeltaTransfer => {
-                            let size = nf.entry.get_size();
-                            let block_size = sync_delta::calculate_block_size(size);
-                            // 流式读 basis file：read_chunk_stream 按块读驱动签名状态机
-                            // 逐块喂入（不再整文件驻留 RAM，见 issue #54 阶段 1）
-                            let (mut basis_rx, basis_handle) =
-                                StorageEnum::read_chunk_stream(dest_storage, &nf.entry, None, None, false, 8);
-                            let mut sig_calc = sync_delta::signature::SignatureCalculator::new(block_size);
-                            while let Some(chunk) = basis_rx.recv().await {
-                                sig_calc.push(&chunk.data);
-                            }
-                            // 读任务收尾：JoinError 或内层读错误统一归一为原因字符串（与
-                            // Sender 侧源文件流式读点一致的归一模式）
-                            let basis_read_result = match basis_handle.await {
-                                Ok(inner) => inner.map_err(|e| e.to_string()),
-                                Err(e) => Err(e.to_string()),
-                            };
-                            match basis_read_result {
-                                Ok(_) => {
-                                    let signatures = sig_calc.finish();
-                                    let transport_sigs: Vec<transport::message::BlockSignature> = signatures
-                                        .into_iter()
-                                        .map(|s| transport::message::BlockSignature {
-                                            rolling: s.rolling,
-                                            strong: s.strong,
-                                        })
-                                        .collect();
-                                    let _ = transport
-                                        .send(ReceiverMsg::DeltaTransferRequest {
-                                            ndx: nf.ndx,
-                                            block_size,
-                                            signatures: transport_sigs,
-                                        })
-                                        .await;
-                                    state.record_request();
-                                }
-                                Err(e) => {
-                                    warn!(
-                                        "[Receiver Remote] 读取 basis file {:?} 失败: {}, 降级全量传输",
-                                        nf.entry.get_relative_path(),
-                                        e
-                                    );
-                                    let _ = transport.send(ReceiverMsg::TransferRequest { ndx: nf.ndx, decision }).await;
-                                    state.record_request();
-                                }
-                            }
-                        }
-                        TransferDecision::Deleted => {
-                            // DestIndex::check() 从不产生 Deleted（该分类只在下方
-                            // orphaned_entries() 路径产生）；此分支纯粹为满足 match 穷尽性检查。
-                            debug_assert!(false, "DestIndex::check() 不应返回 Deleted");
-                        }
+                    if state
+                        .handle_delta_classification(
+                            transport,
+                            dest_storage,
+                            negotiated_features,
+                            delta_size_threshold,
+                            nf.ndx,
+                            &nf.entry,
+                            decision,
+                        )
+                        .await
+                    {
+                        continue;
                     }
+                    debug_assert_eq!(decision, TransferDecision::Deleted, "all other classifications are handled");
                 }
 
                 // 子目录在目标端创建
