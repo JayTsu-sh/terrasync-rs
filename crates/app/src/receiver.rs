@@ -5,7 +5,7 @@
 //! 双进程模式下 Receiver 仅拥有 dest storage（数据流模式，Phase 3）。
 
 // 标准库
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::{Component, Path};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -27,7 +27,7 @@ use transport::traits::ReceiverTransport;
 // 内部模块
 use crate::byte_resume::is_part_file;
 use crate::error::{AppError, Result};
-use crate::remote_receiver_session::RemoteReceiverSession;
+use crate::remote_receiver_session::{RemoteReceiverSession, TransferLedger};
 use crate::sync::{ResumeOpts, copy_file_with_resume, parse_size, should_resume};
 
 // ============================================================
@@ -504,27 +504,20 @@ pub(crate) fn validate_relative_path(path: &Path) -> Result<()> {
 /// 后台 reader task 都不保证"写入更早的 stream 一定先于写入更晚的 stream 被对端处理完"，
 /// 小体积的 `TransferDone` 完全可能抢在大文件的 `FileData`/`EndOfFile` 之前就被收到并处理
 /// （两个真实子进程联调时用大文件实际触发过：收到 `TransferDone` 就直接跳出循环，丢了还在
-/// `Data` stream 上飞的文件）。因此改为显式计数：`requested_count`（发出过多少个
-/// `TransferRequest`/`DeltaTransferRequest`）与 `completed_count`（收到过多少个对应的
+/// `Data` stream 上飞的文件）。因此由 session ledger 记录发出过多少个
+/// `TransferRequest`/`DeltaTransferRequest`，以及收到过多少个对应的
 /// `EndOfFile`/`CreateSymlink` 完成处理），只有二者相等**且**已经见过 `TransferDone`，
 /// 才真正结束循环。
 pub(crate) async fn recv_file_list_and_data_phase(
     transport: &(dyn ReceiverTransport + 'static), dest_storage: &Arc<StorageEnum>, session_config: &SessionConfig,
     negotiated_features: &FeatureFlags, delta_size_threshold: u64, progress: &Arc<ReceiverProgress>,
-    mut progress_rx: MpscReceiver<ProgressSnapshot>,
+    mut progress_rx: MpscReceiver<ProgressSnapshot>, ledger: &mut TransferLedger,
 ) -> Result<()> {
     info!("[Receiver Remote] Receiving file list and file data (pipelined, streaming mode)");
     let mut ndx_table = NdxTable::new();
     // ndx 级失败尝试计数（redo 决策用）：ndx → 已失败次数，见 decide_file_ack
     let mut attempts: HashMap<i32, u8> = HashMap::new();
-    // 已终结的 ndx：redo 期间 dc task（全量路径 HardError）与 Sender 自检失败
-    // （SenderMsg::EntryError）可能各自独立上报同一 ndx 的终态，按 ndx 去重只在首次
-    // 生效，防止 completed_count 被多次计入导致主循环提前 break、丢在途文件（[1]）。
-    let mut terminated: HashSet<i32> = HashSet::new();
-    // TransferDone 与实际数据完成的解耦计数（见函数文档）
-    let mut requested_count: u64 = 0;
-    let mut completed_count: u64 = 0;
-    let mut transfer_done_seen = false;
+    // ndx 终态去重与完成判断由 session ledger 统一持有。
     // 全量文件是否走 disk-commit 流式路径：以是否见过 FileBegin 判定（而非 token 是否为空），
     // 避免源端缩到 0 字节的 delta 传输（token 空且无 FileBegin）被误判为全量。
     let mut full_active = false;
@@ -566,8 +559,8 @@ pub(crate) async fn recv_file_list_and_data_phase(
                 match dc_ack {
                     DcAck::Entry(ack) => {
                         let _ = transport.send(ack).await;
-                        completed_count += 1;
-                        if transfer_done_seen && completed_count >= requested_count {
+                        ledger.record_unindexed_terminal();
+                        if ledger.is_complete() {
                             info!("[Receiver Remote] All transfers complete");
                             break;
                         }
@@ -576,13 +569,10 @@ pub(crate) async fn recv_file_list_and_data_phase(
                         if dispatch_file_outcome(
                             transport,
                             &mut attempts,
-                            &mut terminated,
                             progress,
                             ndx,
                             outcome,
-                            &mut completed_count,
-                            requested_count,
-                            transfer_done_seen,
+                            ledger,
                         )
                         .await
                         {
@@ -627,13 +617,13 @@ pub(crate) async fn recv_file_list_and_data_phase(
                     match decision {
                         TransferDecision::FullTransfer => {
                             let _ = transport.send(ReceiverMsg::TransferRequest { ndx: nf.ndx, decision }).await;
-                            requested_count += 1;
+                            ledger.record_request();
                         }
                         TransferDecision::DeltaTransfer if !negotiated_features.delta => {
                             // delta 能力未协商成功（对端不支持）→ 降级为全量传输（wire 动作变了，
                             // 分类判定不变：decision 仍是 DeltaTransfer，供 Sender 侧统计为 Changed）
                             let _ = transport.send(ReceiverMsg::TransferRequest { ndx: nf.ndx, decision }).await;
-                            requested_count += 1;
+                            ledger.record_request();
                         }
                         TransferDecision::DeltaTransfer if nf.entry.get_size() > delta_size_threshold => {
                             // 文件 size 超过 delta_size_threshold 门槛 → 降级为全量传输（同上，
@@ -646,7 +636,7 @@ pub(crate) async fn recv_file_list_and_data_phase(
                                 delta_size_threshold
                             );
                             let _ = transport.send(ReceiverMsg::TransferRequest { ndx: nf.ndx, decision }).await;
-                            requested_count += 1;
+                            ledger.record_request();
                         }
                         TransferDecision::DeltaTransfer => {
                             let size = nf.entry.get_size();
@@ -682,7 +672,7 @@ pub(crate) async fn recv_file_list_and_data_phase(
                                             signatures: transport_sigs,
                                         })
                                         .await;
-                                    requested_count += 1;
+                                    ledger.record_request();
                                 }
                                 Err(e) => {
                                     warn!(
@@ -691,7 +681,7 @@ pub(crate) async fn recv_file_list_and_data_phase(
                                         e
                                     );
                                     let _ = transport.send(ReceiverMsg::TransferRequest { ndx: nf.ndx, decision }).await;
-                                    requested_count += 1;
+                                    ledger.record_request();
                                 }
                             }
                         }
@@ -825,8 +815,8 @@ pub(crate) async fn recv_file_list_and_data_phase(
                     let _ = transport
                         .send(ReceiverMsg::EntryError { entry, reason: format!("{e}") })
                         .await;
-                    completed_count += 1;
-                    if transfer_done_seen && completed_count >= requested_count {
+                    ledger.record_unindexed_terminal();
+                    if ledger.is_complete() {
                         info!("[Receiver Remote] All transfers complete");
                         break;
                     }
@@ -844,8 +834,8 @@ pub(crate) async fn recv_file_list_and_data_phase(
                             .await;
                     }
                 }
-                completed_count += 1;
-                if transfer_done_seen && completed_count >= requested_count {
+                ledger.record_unindexed_terminal();
+                if ledger.is_complete() {
                     info!("[Receiver Remote] All transfers complete");
                     break;
                 }
@@ -887,7 +877,7 @@ pub(crate) async fn recv_file_list_and_data_phase(
 
             // ── 文件结束：见过 FileBegin → 全量交 disk-commit task 收尾（读回 .part hash 校验 → 原子
             //    rename）；否则是 delta 路径（含零 token 的空文件 delta，ensure_delta_active
-            //    幂等补发 DeltaBegin），同样交 disk-commit task 三段式收尾。completed_count 统一
+            //    幂等补发 DeltaBegin），同样交 disk-commit task 三段式收尾。完成计数统一
             //    在 dc ack 回流时才 +1（decide_file_ack 做 redo 决策，全量/delta 共用一份状态机）──
             Some(SenderMsg::EndOfFile { ndx, entry, source_hash }) => {
                 if full_active {
@@ -910,12 +900,13 @@ pub(crate) async fn recv_file_list_and_data_phase(
             }
 
             Some(SenderMsg::TransferDone) => {
-                transfer_done_seen = true;
+                ledger.observe_transfer_done();
+                let (completed, requested) = ledger.counts();
                 debug!(
                     "[Receiver Remote] TransferDone received ({}/{} data transfers completed so far)",
-                    completed_count, requested_count
+                    completed, requested
                 );
-                if completed_count >= requested_count {
+                if ledger.is_complete() {
                     info!("[Receiver Remote] All transfers complete");
                     break;
                 }
@@ -930,13 +921,13 @@ pub(crate) async fn recv_file_list_and_data_phase(
                 delta_active = false;
                 let _ = dc_tx.send(DiskCommitMsg::AbortFile).await;
                 let should_break = if let Some(ndx) = ndx {
-                    record_ndx_completion(&mut terminated, ndx, &mut completed_count, requested_count, transfer_done_seen)
+                    ledger.record_terminal(ndx) && ledger.is_complete()
                 } else {
                     // 双进程主循环下理应总带 ndx（单进程 tar 打包失败等无 ndx 场景走
                     // receiver_task，不会到这里）；防御性兜底：仍完成一次计数，避免缺失
-                    // 关联导致 completed_count 永远打不平。
-                    completed_count += 1;
-                    transfer_done_seen && completed_count >= requested_count
+                    // 关联导致 session ledger 永远打不平。
+                    ledger.record_unindexed_terminal();
+                    ledger.is_complete()
                 };
                 if should_break {
                     info!("[Receiver Remote] All transfers complete");
@@ -961,18 +952,7 @@ pub(crate) async fn recv_file_list_and_data_phase(
                 let _ = transport.send(ack).await;
             }
             DcAck::FileOutcome { ndx, outcome } => {
-                let _ = dispatch_file_outcome(
-                    transport,
-                    &mut attempts,
-                    &mut terminated,
-                    progress,
-                    ndx,
-                    outcome,
-                    &mut completed_count,
-                    requested_count,
-                    transfer_done_seen,
-                )
-                .await;
+                let _ = dispatch_file_outcome(transport, &mut attempts, progress, ndx, outcome, ledger).await;
             }
         }
     }
@@ -1031,24 +1011,22 @@ fn redo_or_error(attempts: &mut HashMap<i32, u8>, ndx: i32, reason: &str) -> (Re
 
 /// `FileOutcome` 上报的统一处理入口（dc task 全量/delta 路径共用）：
 /// 调用 `decide_file_ack` 做 redo 决策；非终态（`Redo`）直接发 ack、不动
-/// `completed_count`。终态先按 `ndx` 去重（redo 期间 dc task 与 Sender 自检失败
-/// 可能各自独立上报同一 ndx 的终态，去重只在首次生效，见 [`record_ndx_completion`]）：
+/// completion ledger。终态先按 `ndx` 去重（redo 期间 dc task 与 Sender 自检失败
+/// 可能各自独立上报同一 ndx 的终态，去重只在首次生效）：
 /// 去重命中则连 ack 都不再发（避免 Sender 收到同一 ndx 的重复终态 ack），否则累加
-/// `progress.error_count`（若为 `Error`）、发 ack、计入 `completed_count`。
+/// `progress.error_count`（若为 `Error`）、发 ack、计入 ledger。
 ///
-/// 返回是否应 break 主循环（`completed_count` 打平且已见过 `TransferDone`）。
-#[allow(clippy::too_many_arguments)]
+/// 返回是否应 break 主循环（ledger 打平且已见过 `TransferDone`）。
 async fn dispatch_file_outcome(
-    transport: &(dyn ReceiverTransport + 'static), attempts: &mut HashMap<i32, u8>, terminated: &mut HashSet<i32>,
-    progress: &Arc<ReceiverProgress>, ndx: i32, outcome: FileOutcome, completed_count: &mut u64, requested_count: u64,
-    transfer_done_seen: bool,
+    transport: &(dyn ReceiverTransport + 'static), attempts: &mut HashMap<i32, u8>, progress: &Arc<ReceiverProgress>,
+    ndx: i32, outcome: FileOutcome, ledger: &mut TransferLedger,
 ) -> bool {
     let (ack, is_terminal) = decide_file_ack(attempts, ndx, outcome);
     if !is_terminal {
         let _ = transport.send(ack).await;
         return false;
     }
-    if terminated.contains(&ndx) {
+    if !ledger.record_terminal(ndx) {
         debug!("[Receiver Remote] ndx {} 已终结，丢弃重复终态: {:?}", ndx, ack);
         return false;
     }
@@ -1056,24 +1034,7 @@ async fn dispatch_file_outcome(
         progress.error_count.fetch_add(1, Ordering::Relaxed);
     }
     let _ = transport.send(ack).await;
-    record_ndx_completion(terminated, ndx, completed_count, requested_count, transfer_done_seen)
-}
-
-/// ndx 首次终结时计入 `completed_count` 并判断是否应收尾 break；同一 ndx 的重复终结
-/// （已在 `terminated` 中）直接丢弃、返回 `false`，防止 redo 期间多个来源独立上报
-/// 同一 ndx 导致 `completed_count` 被多次计入、主循环提前 break 丢在途文件（[1]）。
-fn record_ndx_completion(
-    terminated: &mut HashSet<i32>, ndx: i32, completed_count: &mut u64, requested_count: u64, transfer_done_seen: bool,
-) -> bool {
-    if !terminated.insert(ndx) {
-        return false;
-    }
-    *completed_count += 1;
-    if transfer_done_seen && *completed_count >= requested_count {
-        info!("[Receiver Remote] All transfers complete");
-        return true;
-    }
-    false
+    ledger.is_complete()
 }
 
 /// 首个属于该 ndx 的 delta 数据事件（token 或 EndOfFile）才触发一次 `DeltaBegin`，幂等

@@ -4,6 +4,7 @@
 //! `SessionConfig` 接收仍由外层负责；磁盘写入仍位于 disk-commit 内部 seam 后面。
 //! 当前实现委托既有事件循环，后续 tickets 将在此 interface 后逐步收拢会话状态。
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use data_mover::StorageEnum;
@@ -13,6 +14,49 @@ use transport::traits::ReceiverTransport;
 
 use crate::error::Result;
 use crate::receiver::{ReceiverProgress, recv_file_list_and_data_phase};
+
+/// 一次会话的请求与终态账本。
+///
+/// 所有结束判断都通过该类型完成，避免消息分支各自复制计数与 `TransferDone` 条件。
+#[derive(Debug, Default)]
+pub(crate) struct TransferLedger {
+    requested: u64,
+    completed: u64,
+    transfer_done_seen: bool,
+    terminated_ndx: HashSet<i32>,
+}
+
+impl TransferLedger {
+    pub(crate) fn record_request(&mut self) {
+        self.requested += 1;
+    }
+
+    /// 记录带 ndx 的首次终态；重复终态不改变完成计数。
+    pub(crate) fn record_terminal(&mut self, ndx: i32) -> bool {
+        if !self.terminated_ndx.insert(ndx) {
+            return false;
+        }
+        self.completed += 1;
+        true
+    }
+
+    /// 记录协议中不携带 ndx 的 entry 终态（例如符号链接）。
+    pub(crate) fn record_unindexed_terminal(&mut self) {
+        self.completed += 1;
+    }
+
+    pub(crate) fn observe_transfer_done(&mut self) {
+        self.transfer_done_seen = true;
+    }
+
+    pub(crate) fn is_complete(&self) -> bool {
+        self.transfer_done_seen && self.completed >= self.requested
+    }
+
+    pub(crate) fn counts(&self) -> (u64, u64) {
+        (self.completed, self.requested)
+    }
+}
 
 /// 一次已完成协议协商与鉴权的远端 Receiver 会话。
 pub struct RemoteReceiverSession {
@@ -41,6 +85,7 @@ impl RemoteReceiverSession {
     pub async fn run(
         self, transport: &(dyn ReceiverTransport + 'static), progress_rx: Receiver<ProgressSnapshot>,
     ) -> Result<()> {
+        let mut ledger = TransferLedger::default();
         recv_file_list_and_data_phase(
             transport,
             &self.dest_storage,
@@ -49,6 +94,7 @@ impl RemoteReceiverSession {
             self.delta_size_threshold,
             &self.progress,
             progress_rx,
+            &mut ledger,
         )
         .await
     }
@@ -206,5 +252,35 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(fs::read(dest_dir.path().join("a.txt")).unwrap(), content);
+    }
+
+    #[tokio::test]
+    async fn session_with_no_requested_transfers_finishes_after_transfer_done() {
+        let dest_dir = tempdir().unwrap();
+        let dest_storage = Arc::new(
+            create_storage(dest_dir.path().to_str().unwrap(), None, true)
+                .await
+                .unwrap(),
+        );
+        let (sender_transport, receiver_transport) = create_in_process_pair();
+        let (_progress_tx, progress_rx) = mpsc::channel(1);
+        let session = RemoteReceiverSession::new(
+            dest_storage,
+            session_config(),
+            FeatureFlags::current(),
+            u64::MAX,
+            Arc::new(ReceiverProgress::new()),
+        );
+        let session_handle = tokio::spawn(async move { session.run(&receiver_transport, progress_rx).await });
+
+        sender_transport.send(SenderMsg::FileListDone).await.unwrap();
+        assert!(matches!(sender_transport.recv().await, Some(ReceiverMsg::RequestsDone)));
+        sender_transport.send(SenderMsg::TransferDone).await.unwrap();
+
+        tokio::time::timeout(Duration::from_secs(2), session_handle)
+            .await
+            .expect("empty session should finish after TransferDone")
+            .unwrap()
+            .unwrap();
     }
 }
