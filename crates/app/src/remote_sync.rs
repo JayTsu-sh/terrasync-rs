@@ -576,7 +576,7 @@ async fn record_success_and_checkpoint(
 /// 全量传输一个 entry（目录 / 符号链接 / 文件分块）。
 ///
 /// `ndx` 串入 `FileBegin`/`FileData`/`EndOfFile`，使 Receiver 能把校验结果关联回该 ndx
-/// （redo 决策所需，见 `receiver::decide_file_ack`）；也是 `Redo{ndx}` 重发的入口——
+/// （redo 决策所需，见 Receiver session outcome policy）；也是 `Redo{ndx}` 重发的入口——
 /// delta redo 与首次全量传输走同一份实现。
 ///
 /// 返回 `Ok(true)` = 已成功发出该 entry 的数据（目录/符号链接/文件三选一）；
@@ -970,7 +970,7 @@ mod tests {
     //
     // 用 HashMismatchInjector 包装 Sender 侧 transport，篡改特定 ndx 的
     // `EndOfFile.source_hash`，人为制造 hash mismatch（不改动实际传输数据），
-    // 驱动真实的 Receiver 主 task 决策点（decide_file_ack）与 Sender 侧
+    // 驱动真实的 Receiver session outcome policy 与 Sender 侧
     // Redo/Success/Error 处理——与生产环境走同一套代码路径，只是用 in-process
     // channel 代替真实 QUIC。
     // ============================================================

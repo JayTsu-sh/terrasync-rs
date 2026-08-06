@@ -413,10 +413,7 @@ impl RemoteSessionState {
         self.abort_active_file(dc_tx).await;
         match ndx {
             Some(ndx) => self.record_terminal(ndx) && self.is_complete(),
-            None => {
-                self.record_unindexed_terminal();
-                self.is_complete()
-            }
+            None => self.complete_unindexed(),
         }
     }
 
@@ -434,8 +431,7 @@ impl RemoteSessionState {
         while let Ok(ack) = ack_rx.try_recv() {
             match ack {
                 DcAck::Entry(ack) => {
-                    let _ = transport.send(ack).await;
-                    self.record_unindexed_terminal();
+                    let _ = self.handle_entry_outcome(transport, ack).await;
                 }
                 DcAck::FileOutcome { ndx, outcome } => {
                     let _ = self.handle_file_outcome(transport, progress, ndx, outcome).await;
@@ -493,6 +489,14 @@ impl RemoteSessionState {
         self.is_complete()
     }
 
+    pub(crate) async fn handle_entry_outcome(
+        &mut self, transport: &(dyn ReceiverTransport + 'static), ack: ReceiverMsg,
+    ) -> bool {
+        let _ = transport.send(ack).await;
+        self.ledger.record_unindexed_terminal();
+        self.ledger.is_complete()
+    }
+
     fn redo_or_error(&mut self, ndx: i32, reason: &str) -> (ReceiverMsg, bool) {
         let count = self.attempts.entry(ndx).or_insert(0);
         *count += 1;
@@ -509,19 +513,21 @@ impl RemoteSessionState {
         }
     }
 
-    pub(crate) fn record_terminal(&mut self, ndx: i32) -> bool {
+    fn record_terminal(&mut self, ndx: i32) -> bool {
         self.ledger.record_terminal(ndx)
     }
 
-    pub(crate) fn record_unindexed_terminal(&mut self) {
+    pub(crate) fn complete_unindexed(&mut self) -> bool {
         self.ledger.record_unindexed_terminal();
+        self.ledger.is_complete()
     }
 
-    pub(crate) fn observe_transfer_done(&mut self) {
+    pub(crate) fn observe_transfer_done(&mut self) -> bool {
         self.ledger.observe_transfer_done();
+        self.ledger.is_complete()
     }
 
-    pub(crate) fn is_complete(&self) -> bool {
+    fn is_complete(&self) -> bool {
         self.ledger.is_complete()
     }
 

@@ -516,13 +516,11 @@ pub(crate) async fn recv_file_list_and_data_phase(
                 let _ = transport.send(ReceiverMsg::Progress(snapshot)).await;
             }
             // ── disk-commit task 回流的 ack（目录/符号链接直接透传；全量文件 outcome
-            //    交 decide_file_ack 做统一 redo 决策）──
+            //    交 session outcome policy 做统一 redo 决策）──
             Some(dc_ack) = ack_rx.recv() => {
                 match dc_ack {
                     DcAck::Entry(ack) => {
-                        let _ = transport.send(ack).await;
-                        state.record_unindexed_terminal();
-                        if state.is_complete() {
+                        if state.handle_entry_outcome(transport, ack).await {
                             info!("[Receiver Remote] All transfers complete");
                             break;
                         }
@@ -637,8 +635,7 @@ pub(crate) async fn recv_file_list_and_data_phase(
                     let _ = transport
                         .send(ReceiverMsg::EntryError { entry, reason: format!("{e}") })
                         .await;
-                    state.record_unindexed_terminal();
-                    if state.is_complete() {
+                    if state.complete_unindexed() {
                         info!("[Receiver Remote] All transfers complete");
                         break;
                     }
@@ -656,8 +653,7 @@ pub(crate) async fn recv_file_list_and_data_phase(
                             .await;
                     }
                 }
-                state.record_unindexed_terminal();
-                if state.is_complete() {
+                if state.complete_unindexed() {
                     info!("[Receiver Remote] All transfers complete");
                     break;
                 }
@@ -694,7 +690,7 @@ pub(crate) async fn recv_file_list_and_data_phase(
             // ── 文件结束：见过 FileBegin → 全量交 disk-commit task 收尾（读回 .part hash 校验 → 原子
             //    rename）；否则是 delta 路径（含零 token 的空文件 delta，session state
             //    幂等补发 DeltaBegin），同样交 disk-commit task 三段式收尾。完成计数统一
-            //    在 dc ack 回流时才 +1（decide_file_ack 做 redo 决策，全量/delta 共用一份状态机）──
+            //    在 dc ack 回流时才 +1（session outcome policy 做 redo 决策，全量/delta 共用一份状态机）──
             Some(SenderMsg::EndOfFile { ndx, entry, source_hash }) => {
                 if !state.commit_full(&dc_tx, ndx, &entry, &source_hash).await {
                     state.commit_delta(&dc_tx, ndx, &entry, &source_hash).await;
@@ -711,13 +707,13 @@ pub(crate) async fn recv_file_list_and_data_phase(
             }
 
             Some(SenderMsg::TransferDone) => {
-                state.observe_transfer_done();
+                let complete = state.observe_transfer_done();
                 let (completed, requested) = state.counts();
                 debug!(
                     "[Receiver Remote] TransferDone received ({}/{} data transfers completed so far)",
                     completed, requested
                 );
-                if state.is_complete() {
+                if complete {
                     info!("[Receiver Remote] All transfers complete");
                     break;
                 }
@@ -779,8 +775,6 @@ mod tests {
     fn validate_relative_path_rejects_absolute_path() {
         assert!(validate_relative_path(Path::new("/etc/passwd")).is_err());
     }
-
-    // ── decide_file_ack：ndx 级 redo 决策纯函数单测（方案 A 的核心状态机） ──
 
     // ── resolve_delta_size_threshold：delta size 门槛解析（issue #54 阶段 0） ──
 
