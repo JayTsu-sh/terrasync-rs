@@ -12,8 +12,8 @@ use data_mover::{DataChunk, EntryEnum, StorageEnum};
 use tokio::sync::mpsc::{Receiver, Sender};
 use tracing::{debug, info, warn};
 use transport::message::{
-    BlockSignature, DestIndex, DiskCommitMsg, FeatureFlags, FileOutcome, NdxTable, ProgressSnapshot, ReceiverMsg,
-    SessionConfig, TransferDecision,
+    BlockSignature, DcAck, DestIndex, DiskCommitMsg, FeatureFlags, FileOutcome, NdxTable, ProgressSnapshot,
+    ReceiverMsg, SessionConfig, TransferDecision,
 };
 use transport::traits::ReceiverTransport;
 
@@ -409,6 +409,43 @@ impl RemoteSessionState {
         let _ = dc_tx.send(DiskCommitMsg::AbortFile).await;
     }
 
+    pub(crate) async fn handle_source_failure(&mut self, dc_tx: &Sender<DiskCommitMsg>, ndx: Option<i32>) -> bool {
+        self.abort_active_file(dc_tx).await;
+        match ndx {
+            Some(ndx) => self.record_terminal(ndx) && self.is_complete(),
+            None => {
+                self.record_unindexed_terminal();
+                self.is_complete()
+            }
+        }
+    }
+
+    /// Stops disk commit, drains every durable outcome, then restores directory metadata.
+    pub(crate) async fn shutdown_disk_commit(
+        &mut self, dc_tx: Sender<DiskCommitMsg>, dc_join: tokio::task::JoinHandle<Result<()>>,
+        ack_rx: &mut tokio::sync::mpsc::UnboundedReceiver<DcAck>, transport: &(dyn ReceiverTransport + 'static),
+        progress: &ReceiverProgress, dest: &StorageEnum,
+    ) -> Result<()> {
+        let _ = dc_tx.send(DiskCommitMsg::Shutdown).await;
+        drop(dc_tx);
+        dc_join
+            .await
+            .map_err(|error| crate::error::AppError::CopyError(format!("disk-commit task join: {error}")))??;
+        while let Ok(ack) = ack_rx.try_recv() {
+            match ack {
+                DcAck::Entry(ack) => {
+                    let _ = transport.send(ack).await;
+                    self.record_unindexed_terminal();
+                }
+                DcAck::FileOutcome { ndx, outcome } => {
+                    let _ = self.handle_file_outcome(transport, progress, ndx, outcome).await;
+                }
+            }
+        }
+        self.finalize_directories(dest).await;
+        Ok(())
+    }
+
     /// Records bytes accepted by the disk-commit seam and emits an exact delayed
     /// credit grant once the configured threshold is reached.
     pub(crate) async fn record_data_consumed(
@@ -518,7 +555,7 @@ impl RemoteReceiverSession {
 
     /// 运行会话直到 Sender 宣告传输结束且所有已请求 entry 均获得 durable outcome。
     pub async fn run(
-        self, transport: &(dyn ReceiverTransport + 'static), progress_rx: Receiver<ProgressSnapshot>,
+        &mut self, transport: &(dyn ReceiverTransport + 'static), progress_rx: Receiver<ProgressSnapshot>,
     ) -> Result<()> {
         let mut state = RemoteSessionState::default();
         recv_file_list_and_data_phase(
@@ -532,6 +569,14 @@ impl RemoteReceiverSession {
             &mut state,
         )
         .await
+    }
+
+    /// Emits the terminal snapshot only after the session's durable shutdown completed.
+    pub async fn finish(&self, transport: &(dyn ReceiverTransport + 'static), start_time: std::time::Instant) {
+        let _ = transport
+            .send(ReceiverMsg::Progress(self.progress.snapshot(start_time)))
+            .await;
+        let _ = transport.send(ReceiverMsg::AllDone).await;
     }
 }
 
@@ -637,7 +682,7 @@ mod tests {
         progress_tx.send(progress_snapshot()).await.unwrap();
         drop(progress_tx);
 
-        let session = RemoteReceiverSession::new(
+        let mut session = RemoteReceiverSession::new(
             dest_storage,
             session_config(),
             FeatureFlags::current(),
@@ -726,7 +771,7 @@ mod tests {
         );
         let (sender_transport, receiver_transport) = create_in_process_pair();
         let (_progress_tx, progress_rx) = mpsc::channel(1);
-        let session = RemoteReceiverSession::new(
+        let mut session = RemoteReceiverSession::new(
             dest_storage,
             session_config(),
             FeatureFlags::current(),
@@ -1113,5 +1158,32 @@ mod tests {
             Some(ReceiverMsg::Error { ndx: 8, .. })
         ));
         assert!(!state.attempts.contains_key(&8));
+    }
+
+    #[tokio::test]
+    async fn finish_emits_terminal_snapshot_before_all_done() {
+        let dest_dir = tempdir().unwrap();
+        let dest = Arc::new(
+            create_storage(dest_dir.path().to_str().unwrap(), None, true)
+                .await
+                .unwrap(),
+        );
+        let progress = Arc::new(ReceiverProgress::default());
+        progress.files_transferred.store(3, Ordering::Relaxed);
+        progress.error_count.store(1, Ordering::Relaxed);
+        let session = RemoteReceiverSession::new(dest, session_config(), FeatureFlags::current(), u64::MAX, progress);
+        let (sender_transport, receiver_transport) = create_in_process_pair();
+
+        session.finish(&receiver_transport, std::time::Instant::now()).await;
+
+        assert!(matches!(
+            sender_transport.recv().await,
+            Some(ReceiverMsg::Progress(ProgressSnapshot {
+                files_transferred: 3,
+                error_count: 1,
+                ..
+            }))
+        ));
+        assert!(matches!(sender_transport.recv().await, Some(ReceiverMsg::AllDone)));
     }
 }

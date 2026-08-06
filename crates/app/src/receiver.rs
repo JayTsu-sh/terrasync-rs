@@ -324,21 +324,19 @@ pub async fn receiver_task_remote(
     };
 
     // ── 阶段 1+2: 文件列表与数据流合并处理，无阶段 barrier（见函数入口文档） ──
-    RemoteReceiverSession::new(
+    let mut session = RemoteReceiverSession::new(
         dest_storage,
         session_config,
         negotiated_features,
         delta_size_threshold,
         progress.clone(),
-    )
-    .run(transport, progress_rx)
-    .await?;
+    );
+    let run_result = session.run(transport, progress_rx).await;
 
     // 停止进度 reporter，发最终快照 + AllDone
     progress_reporter.abort();
-    let final_snapshot = progress.snapshot(start_time);
-    let _ = transport.send(ReceiverMsg::Progress(final_snapshot)).await;
-    let _ = transport.send(ReceiverMsg::AllDone).await;
+    run_result?;
+    session.finish(transport, start_time).await;
     info!("[Receiver Remote] Completed");
     Ok(())
 }
@@ -509,6 +507,7 @@ pub(crate) async fn recv_file_list_and_data_phase(
         ack_tx,
         progress.clone(),
     ));
+    let mut transport_closed = false;
 
     loop {
         // 同时处理 transport 消息和 progress 上报
@@ -729,45 +728,30 @@ pub(crate) async fn recv_file_list_and_data_phase(
             //    防止与 dc task 独立上报的终态重复计数（[1]）──
             Some(SenderMsg::EntryError { path, reason, ndx }) => {
                 warn!("[Receiver Remote] Sender EntryError {:?}: {} — 中止该文件", path, reason);
-                state.abort_active_file(&dc_tx).await;
-                let should_break = if let Some(ndx) = ndx {
-                    state.record_terminal(ndx) && state.is_complete()
-                } else {
-                    // 双进程主循环下理应总带 ndx（单进程 tar 打包失败等无 ndx 场景走
-                    // receiver_task，不会到这里）；防御性兜底：仍完成一次计数，避免缺失
-                    // 关联导致 session ledger 永远打不平。
-                    state.record_unindexed_terminal();
-                    state.is_complete()
-                };
+                let should_break = state.handle_source_failure(&dc_tx, ndx).await;
                 if should_break {
                     info!("[Receiver Remote] All transfers complete");
                     break;
                 }
             }
             Some(_) => {}
-            None => return Err(AppError::CopyError("Transport closed during file list/data phase".into())),
+            None => {
+                transport_closed = true;
+                break;
+            }
         }} // close match + select! msg arm
         } // close select!
     } // close loop
 
-    // 收尾：关闭 dc_tx → disk-commit task 处理完积压后退出；等待 join；drain 剩余 ack。
-    let _ = dc_tx.send(DiskCommitMsg::Shutdown).await;
-    drop(dc_tx);
-    dc_join
-        .await
-        .map_err(|e| AppError::CopyError(format!("disk-commit task join: {e}")))??;
-    while let Ok(dc_ack) = ack_rx.try_recv() {
-        match dc_ack {
-            DcAck::Entry(ack) => {
-                let _ = transport.send(ack).await;
-            }
-            DcAck::FileOutcome { ndx, outcome } => {
-                let _ = state.handle_file_outcome(transport, progress, ndx, outcome).await;
-            }
-        }
-    }
+    state
+        .shutdown_disk_commit(dc_tx, dc_join, &mut ack_rx, transport, progress, dest_storage)
+        .await?;
 
-    state.finalize_directories(dest_storage).await;
+    if transport_closed {
+        return Err(AppError::CopyError(
+            "Transport closed during file list/data phase".into(),
+        ));
+    }
 
     Ok(())
 }
