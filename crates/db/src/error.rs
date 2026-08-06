@@ -24,17 +24,6 @@ pub enum DatabaseError {
     #[error("ClickHouse error: {0}")]
     ClickHouseError(#[from] clickhouse::error::Error),
 
-    /// `DuckDB` 数据库相关错误
-    /// `DuckDB` 数据库操作失败时触发
-    #[error("DuckDB error: {0}")]
-    DuckDbError(String),
-
-    /// DuckDB库错误
-    /// 从duckdb库的错误类型自动转换
-    #[cfg(feature = "duckdb")]
-    #[error("DuckDB library error: {0}")]
-    DuckDbLibraryError(#[from] duckdb::Error),
-
     /// 配置错误
     /// 当数据库配置无效或不完整时触发
     #[error("Configuration error: {0}")]

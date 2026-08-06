@@ -18,7 +18,7 @@ Every time. No exceptions.
 |------|-------|
 | 首次进入 / 理解代码结构 | `.claude/docs/codebase.md` |
 | 改 scan / sync 业务逻辑 | `.claude/docs/architecture.md` |
-| 跑 / 改 e2e 测试 | `.claude/docs/e2e-testing.md` |
+| 跑 / 改 E2E 测试 | `.claude/docs/e2e-testing.md`、`tests/lab/README.md` |
 | 改存储驱动 / 配置测试环境 | `.claude/docs/services-and-storage.md` |
 | 提 commit / PR | `.claude/docs/conventions.md` |
 | 改 Web UI | `.claude/docs/codebase.md`（前端章节）|
@@ -32,7 +32,6 @@ Every time. No exceptions.
 # Standard build
 cargo build                          # debug
 cargo build --release                # release
-cargo build --features duckdb        # with DuckDB
 cargo build --all-features           # all features
 
 # Cross-compile (cargo-zigbuild)
@@ -41,7 +40,6 @@ make debug                           # x86_64-unknown-linux-musl debug
 
 # Run
 cargo run -- scan --id my_scan /path/to/dir
-cargo run --features duckdb -- scan --id my_scan /path/to/dir
 
 # Tests
 cargo test --workspace --no-fail-fast
@@ -59,7 +57,7 @@ cargo fmt && cargo check
 | `cli/` | Argument parsing (clap), routes to `app` |
 | `app/` | Core business logic: scan, sync, dir_walker, consumers, ACE |
 | `data-mover` | Storage abstraction: NASEntry, S3Entry, StorageEnum, filter, qos (external git dep) |
-| `db/` | Database layer: ClickHouse (always), DuckDB (feature-gated) |
+| `db/` | Database layer: ClickHouse |
 | `transport/` | 传输层：InProcess / QUIC，Sender↔Receiver 消息协议 |
 | `sync-delta/` | chunk 级增量算法（rsync 风格）|
 | `licensing/` | 离线 license 验证（Ed25519 + 机器指纹）|

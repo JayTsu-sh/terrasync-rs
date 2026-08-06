@@ -21,18 +21,6 @@ tokio       = { version = "1.51", features = ["sync", "rt"] }
 utils       = { workspace = true }
 uuid        = { workspace = true }
 
-[features]
-duckdb = ["dep:duckdb"]
-
-[target.'cfg(windows)'.dependencies]
-duckdb = { version = "1.10501.0", features = ["chrono"], optional = true }
-
-[target.'cfg(not(windows))'.dependencies]
-duckdb = { version = "1.10501.0", features = [
-    "chrono",
-    "bundled",
-], optional = true }
-
 [lints]
 workspace = true
 

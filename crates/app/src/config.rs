@@ -152,16 +152,7 @@ pub fn initialize_consumer_config(
     job_id: &str, job_dir: &str, job_type: JobType, raw_command_line: String, app_config: &AppConfig,
     progress_callback_url: Option<String>,
 ) -> Result<ConsumerConfig> {
-    #[cfg(feature = "duckdb")]
-    let mut db_config = db::config::DatabaseConfig::from_app_config(&app_config.database);
-    #[cfg(not(feature = "duckdb"))]
     let db_config = db::config::DatabaseConfig::from_app_config(&app_config.database);
-
-    // 设置job_dir到DuckDBSQLiteConfig
-    #[cfg(feature = "duckdb")]
-    if let Some(duckdb_config) = &mut db_config.duckdb {
-        duckdb_config.job_dir = job_dir.to_string();
-    }
 
     let consumer_config = ConsumerConfig {
         job_id: job_id.to_string(),

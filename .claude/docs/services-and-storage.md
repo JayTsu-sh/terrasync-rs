@@ -74,14 +74,9 @@ smb://terrasync:terrasync123@192.168.50.23/testshare/test-data    # 目标端
 
 ## 测试环境配置（Single Source of Truth）
 
-> **所有 IP、端口、凭据、bucket 名统一在 `.claude/skills/harness-run/.env.example` 中定义。**
-> 这是唯一需要修改的地方，各 skill 的 `.env.example` 只是引用指针。
-
-```bash
-# 初始化：复制并按实际环境填写
-cp .claude/skills/harness-run/.env.example .claude/skills/harness-run/.env
-# 编辑 .env（此文件 gitignore，不入库）
-```
+共享实验室的非敏感拓扑和默认值定义在 `tests/lab/common.sh`，凭据由
+self-hosted GitHub Actions runner 的服务环境注入，禁止提交到仓库。
+完整运行与维护说明见 `tests/lab/README.md`。
 
 主要变量：
 

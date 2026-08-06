@@ -15,9 +15,10 @@ concurrency:
 jobs:
   end-to-end:
     runs-on: [self-hosted, linux, x64, terrasync-lab, terrasync-rs]
-    timeout-minutes: 180
+    timeout-minutes: 240
     env:
       RUN_ID: nightly-${{ github.run_id }}-${{ github.run_attempt }}
+      RUSTUP_TOOLCHAIN: 1.95.0
       TERRASYNC_NFS3_SOURCE: 10.10.1.12:/srv/nfs/v3
       TERRASYNC_NFS41_SOURCE: 10.10.1.12:/srv/nfs/v4
       TERRASYNC_NFS3_DEST: 10.10.1.13:/srv/nfs/v3
@@ -26,13 +27,23 @@ jobs:
       TERRASYNC_S3_DEST: http://10.10.1.13:9000
     steps:
       - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
+      - name: Configure preinstalled Rust tools
+        run: echo "/home/github-runner/.cargo/bin" >> "$GITHUB_PATH"
+      - name: Verify preinstalled Rust toolchain
+        run: |
+          test "$(rustc --version | cut -d' ' -f2)" = "1.95.0"
+          cargo clippy --version
+          cargo fmt --version
       - uses: Swatinem/rust-cache@v2
       - run: tests/lab/health-check.sh
       - run: tests/lab/prepare-run.sh "$RUN_ID"
-      - run: flock --wait 10800 /tmp/terrasync-lab-tests.lock cargo test --workspace --locked --no-fail-fast
-      - run: flock --wait 10800 /tmp/terrasync-lab-tests.lock cargo test --locked --test remote_process_e2e --no-fail-fast
+      - run: flock --wait 10800 /tmp/terrasync-lab-tests.lock cargo test --workspace --exclude terrasync-rs --locked --no-fail-fast
+      - name: Remote process E2E (serial)
+        run: flock --wait 10800 /tmp/terrasync-lab-tests.lock cargo test --locked --test remote_process_e2e -- --test-threads=1
+      - run: cargo clippy --workspace --all-targets --locked
       - run: cargo build --release --locked
+      - name: Storage and integrity E2E matrix
+        run: flock --wait 10800 /tmp/terrasync-lab-tests.lock tests/lab/run-e2e.sh "$RUN_ID"
       - name: Cleanup
         if: always()
         run: tests/lab/cleanup-run.sh "$RUN_ID"

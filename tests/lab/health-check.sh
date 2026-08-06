@@ -16,12 +16,17 @@ for endpoint in \
   "http://$LAB_SOURCE_DATA:9000/" \
   "http://$LAB_DEST_DATA:9000/" \
   "http://$LAB_WORKER_DATA:9000/"; do
-  status="$(curl --silent --output /dev/null --write-out '%{http_code}' \
+  status="$(curl --noproxy '*' --silent --output /dev/null --write-out '%{http_code}' \
     --connect-timeout 5 --max-time 10 "$endpoint")"
   [[ "$status" =~ ^[234][0-9][0-9]$ ]] || {
     echo "unhealthy S3 endpoint: $endpoint (HTTP $status)" >&2
     exit 1
   }
 done
+
+[[ "$(clickhouse_query 'SELECT 1')" == "1" ]] || {
+  echo "unhealthy ClickHouse endpoint: $LAB_CLICKHOUSE_DSN" >&2
+  exit 1
+}
 
 echo "terrasync lab is healthy"

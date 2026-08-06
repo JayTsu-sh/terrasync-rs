@@ -20,8 +20,8 @@ concurrency = 4
 
 [database]
 enabled = true
-type = "duckdb"
-batch_size = 100000
+type = "clickhouse"
+batch_size = 800000
 
 [database.clickhouse]
 dsn = "http://127.0.0.1:8123"
@@ -30,7 +30,3 @@ read_timeout = 30
 database = "default"
 username = "default"
 password = ""
-
-[database.duckdb]
-in_memory = true
-pool_size = 4

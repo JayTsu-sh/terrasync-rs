@@ -17,8 +17,6 @@ use tracing::error;
 // 内部模块
 use crate::clickhouse::ClickHouseDatabase;
 use crate::config::DatabaseConfig;
-#[cfg(feature = "duckdb")]
-use crate::duckdb::DuckDBDatabase;
 use crate::error::{DatabaseError, Result};
 use crate::traits::Database;
 
@@ -81,18 +79,6 @@ impl DatabaseFactory {
                 let db = ClickHouseDatabase::new(clickhouse_config, job_id);
                 Box::new(db) as Box<dyn Database>
             }
-            #[cfg(feature = "duckdb")]
-            "duckdb" => {
-                // 提取DuckDB配置
-                let duckdb_config = config
-                    .duckdb
-                    .as_ref()
-                    .ok_or_else(|| DatabaseError::ConfigError("DuckDB configuration missing".to_string()))?;
-
-                // 创建DuckDB数据库实例
-                let db = DuckDBDatabase::new(duckdb_config.clone(), job_id);
-                Box::new(db) as Box<dyn Database>
-            }
             _ => {
                 // 不支持的数据库类型
                 return Err(DatabaseError::UnsupportedType(format!(
@@ -124,18 +110,6 @@ fn register_builtin_types(registry: &DashMap<String, DatabaseCreator>) {
             .ok_or_else(|| DatabaseError::ConfigError("ClickHouse configuration missing".to_string()))?;
 
         let db = ClickHouseDatabase::new(clickhouse_config, &job_id);
-        Ok(Arc::new(db) as Arc<dyn Database>)
-    });
-
-    // Register DuckDB
-    #[cfg(feature = "duckdb")]
-    registry.insert("duckdb".to_string(), |config, job_id| {
-        let duckdb_config = config
-            .duckdb
-            .as_ref()
-            .ok_or_else(|| DatabaseError::ConfigError("DuckDB configuration missing".to_string()))?;
-
-        let db = DuckDBDatabase::new(duckdb_config.clone(), &job_id);
         Ok(Arc::new(db) as Arc<dyn Database>)
     });
 }

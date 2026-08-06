@@ -115,9 +115,6 @@ basic = []
 # Profiling 特性（启用 tokio-console 客户端用于性能/异步任务分析）
 profiling = ["dep:console-subscriber"]
 
-# DuckDB特性
-duckdb = ["cli/duckdb"]
-
 # License特性
 license = ["cli/license"]
 

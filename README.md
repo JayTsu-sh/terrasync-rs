@@ -13,7 +13,7 @@ Rust Terrasync 是一个高性能的文件系统同步和扫描工具，使用Ru
 - **强大的过滤能力**：使用灵活的表达式语言过滤和排除文件
 - **配置管理**：支持通过配置文件和命令行参数自定义行为
 - **多存储协议支持**：支持本地文件系统、NFS v3/v4.1、S3兼容对象存储和SMB/CIFS共享
-- **可扩展的Feature支持**：通过Feature机制支持可选功能，如Lustre文件系统和DuckDB数据库
+- **可扩展的Feature支持**：通过 Feature 机制支持 GUI 和性能分析等可选功能
 
 ## Feature支持
 
@@ -25,7 +25,6 @@ Rust Terrasync支持通过Feature机制启用可选功能，您可以在构建�
 | ----------- | ---------------------- | ------------------------------------------------- |
 | `basic`     | 基本功能（始终包含）   | -                                                 |
 | `gui`       | 启用Web GUI管理界面    | `cli/gui` → `web`                                 |
-| `duckdb`    | 启用DuckDB数据库支持   | `cli/duckdb` → `app/duckdb` → `db/duckdb`         |
 | `profiling` | 启用性能分析支持       | -                                                 |
 
 ### 构建时启用Feature
@@ -35,12 +34,6 @@ Rust Terrasync支持通过Feature机制启用可选功能，您可以在构建�
 ```bash
 # 启用Web GUI管理界面
 cargo build --features gui
-
-# 仅启用duckdb Feature
-cargo build --features duckdb
-
-# 同时启用多个Feature
-cargo build --features gui,duckdb
 
 # 启用所有Feature
 cargo build --all-features
@@ -52,16 +45,6 @@ cargo build --all-features
 - 您可以通过修改`Cargo.toml`文件中的`default`字段来自定义默认启用的Feature
 
 ### Feature详细说明
-
-#### `duckdb` Feature
-
-- **功能**：启用DuckDB数据库支持，允许将扫描结果存储到DuckDB数据库中
-- **使用场景**：适合单机部署和小规模数据处理
-- **依赖**：需要`db` crate的`duckdb` Feature支持
-- **配置**：在配置文件中设置`[database].enabled = true`和`[database].type = "duckdb"`
-- **注意事项**：
-  - 不支持CentOS 7.9系统
-  - 必须启用`duckdb` Feature才能将数据库类型设置为"duckdb"
 
 #### `gui` Feature
 
@@ -78,11 +61,6 @@ cargo build --all-features
 # 使用gui Feature构建并启动Web管理界面
 cargo run --features gui -- gui --port 8080
 
-# 使用duckdb Feature构建并运行扫描命令
-cargo run --features duckdb -- scan --id my_scan /path/to/dir
-
-# 使用duckdb Feature构建并运行同步命令
-cargo run --features duckdb -- sync --id my_sync /source/path /destination/path
 ```
 
 ## 存储协议支持
@@ -718,9 +696,7 @@ Rust Terrasync 使用TOML格式的配置文件。配置优先级为：**CLI 命�
 - `[scan]` 下的 `depth`、`match`、`exclude`
 - `[sync]` 下的 `enable_integrity_check`、`enable_acl`、`qos`、`peak_qos_rate`、`block_size`
 
-Rust Terrasync 支持 DuckDB 和 ClickHouse 两种数据库：
-- **DuckDB**：轻量级嵌入式数据库，适合单机部署和小规模数据
-- **ClickHouse**：高性能列式数据库，适合大规模数据处理和分布式部署
+Rust Terrasync 使用 ClickHouse 存储扫描和同步状态。
 
 **ClickHouse 远程访问配置：**
 
@@ -744,7 +720,6 @@ sudo systemctl restart clickhouse-server
 
 如果启用了数据库功能（`[database].enabled = true`），您可以通过相应的客户端工具查看数据库内的信息：
 - ClickHouse CLI 客户端使用指南：[https://clickhouse.com/docs/zh/interfaces/cli](https://clickhouse.com/docs/zh/interfaces/cli)
-- DuckDB CLI 客户端使用指南：[https://duckdb.org/docs/stable/clients/cli/overview.html](https://duckdb.org/docs/stable/clients/cli/overview.html)
 
 配置示例：
 
@@ -767,9 +742,8 @@ concurrency = 7              # Concurrency level for migration
 
 [database]
 enabled = true           # Enable Database integration
-type = "clickhouse"          # Database type: "duckdb", "clickhouse"
-                           # Note: "duckdb" type requires the "duckdb" feature to be enabled
-batch_size = 800000      # Batch size for file entries. Recommended: 800000 for clickhouse and 100000 for duckdb
+type = "clickhouse"      # Only ClickHouse is supported
+batch_size = 800000      # Batch size for file entries
 
 [database.clickhouse]
 # ClickHouse specific configuration
@@ -779,11 +753,6 @@ read_timeout = 30
 database = "default"
 username = "default"
 password = ""
-
-[database.duckdb]
-# DuckDB specific configuration
-in_memory = false    # Use in-memory database
-pool_size = 4       # Connection pool size
 
 ```
 
@@ -909,7 +878,7 @@ terrasync integrity-check --id nfs_check nfs://fileserver:/share/data?uid=1000&g
 
 每个扫描、同步或ACE操作任务执行时，Rust Terrasync 会在程序运行目录下的 `jobs` 文件夹中生成对应的任务目录。任务目录具有以下重要作用：
 
-1. **存储数据库文件**：任务目录保存该任务的DuckDB数据库文件，用于记录扫描结果、同步状态和ACE操作信息。
+1. **存储任务状态**：任务目录保存任务运行时状态；扫描结果和同步状态存储在 ClickHouse 中。
 2. **增量操作依据**：任务目录作为全量操作和增量操作的评判标准。如果job目录已存在并再次执行相同id的任务，则系统会自动视为增量操作。
 
 任务目录的命名规则如下：

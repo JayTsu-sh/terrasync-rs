@@ -382,10 +382,7 @@ async fn run_incremental_scan(
     }
 
     // 获取扫描并发度
-    let incremental_scan_concurrency = match app_config.database.r#type.as_str() {
-        "duckdb" => 1,
-        _ => app_config.scan.concurrency,
-    };
+    let incremental_scan_concurrency = app_config.scan.concurrency;
 
     // 创建工作线程池
     info!(

@@ -1,11 +1,10 @@
 # 数据库工厂
 
-一个灵活的数据库工厂实现，支持多种数据库后端，并提供统一的接口。
+ClickHouse 数据库工厂及统一访问接口。
 
 ## 特性
 
-- **统一接口**：所有数据库操作使用相同的API，无论后端类型如何
-- **可扩展**：易于添加新的数据库类型
+- **统一接口**：数据库操作使用统一的异步 API
 - **类型安全**：每种数据库都有强类型配置
 - **Async/Await**：为异步Rust应用程序构建
 - **工厂模式**：创建和使用之间的清晰分离
@@ -13,7 +12,6 @@
 ## 支持的数据库
 
 - **ClickHouse**：面向分析型工作负载的列式数据库
-- **DuckDB**：高性能的嵌入式分析型数据库
 
 ## 使用方法
 
@@ -44,25 +42,6 @@ let config = DatabaseConfig {
         database: "default".to_string(),
         username: "default".to_string(),
         password: Some("password".to_string()),
-    }),
-    duckdb: None,
-};
-```
-
-#### DuckDB配置
-
-```rust
-use db::{DatabaseConfig, DuckDBSQLiteConfig};
-
-let config = DatabaseConfig {
-    enabled: true,
-    db_type: "duckdb".to_string(),
-    batch_size: 100,
-    clickhouse: None,
-    duckdb: Some(DuckDBSQLiteConfig {
-        in_memory: false,  // 内存模式或文件模式
-        pool_size: 5,      // 连接池大小
-        job_dir: "/path/to/job/dir".to_string(),  // 工作目录路径
     }),
 };
 ```
@@ -204,10 +183,7 @@ DatabaseFactory::register_database_type("custom", |config, job_id| {
 
 ## 配置
 
-每种数据库类型都有其特定的配置结构：
-
-- **ClickHouse**：连接字符串、超时设置、认证信息等
-- **DuckDB**：内存/文件模式、连接池大小、工作目录等
+ClickHouse 配置包括连接字符串、超时设置和认证信息。
 
 ## 注意事项
 
