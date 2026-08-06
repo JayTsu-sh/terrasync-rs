@@ -300,7 +300,9 @@ pub async fn receiver_task_remote(
     let session_config = recv_session_config(transport).await?;
     info!(
         "[Receiver Remote] SessionConfig: src_path={}, integrity={}, acl={}",
-        session_config.src_path, session_config.enable_integrity_check, session_config.enable_acl
+        data_mover::redact_storage_url(&session_config.src_path),
+        session_config.enable_integrity_check,
+        session_config.enable_acl
     );
     let delta_size_threshold = resolve_delta_size_threshold(&session_config.delta_size_threshold)?;
 

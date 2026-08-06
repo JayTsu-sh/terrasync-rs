@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use tracing::trace;
 
 // 内部模块
-use crate::config::JobType;
+use crate::config::{JobType, redact_command_line};
 use crate::integrity_check::{FixStatus, IntegrityIssue, IssueKind};
 
 // ─────────────────────────────────────────────────
@@ -304,7 +304,7 @@ impl fmt::Display for FullStats {
         writeln!(f, "{:^80}", "Job Completion Summary")?;
         writeln!(f, "{:=<80}", "")?;
         writeln!(f, "  Job Information:")?;
-        writeln!(f, "   ├─ Command:    {}", self.command)?;
+        writeln!(f, "   ├─ Command:    {}", redact_command_line(&self.command))?;
         writeln!(f, "   ├─ Job ID:     {}", self.job_id)?;
         writeln!(f, "   ├─ Log Path:   {}", self.log_path)?;
         writeln!(f, "   └─ Total Time: {elapsed:.1}s")?;
@@ -517,7 +517,7 @@ impl fmt::Display for IncrementalStats {
         writeln!(f, "{:^80}", "Job Completion Summary")?;
         writeln!(f, "{:=<80}", "")?;
         writeln!(f, "  Job Information:")?;
-        writeln!(f, "   ├─ Command:    {}", self.command)?;
+        writeln!(f, "   ├─ Command:    {}", redact_command_line(&self.command))?;
         writeln!(f, "   ├─ Job ID:     {}", self.job_id)?;
         writeln!(f, "   ├─ Log Path:   {}", self.log_path)?;
         writeln!(f, "   └─ Total Time: {elapsed:.1}s")?;
@@ -1193,4 +1193,24 @@ fn print_mismatch_table(mismatch: &[&IntegrityIssue], auto_fix: bool) {
         }
     }
     println!();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn completion_summary_redacts_storage_credentials_defensively() {
+        let stats = FullStats::new(
+            JobType::Copy,
+            "redaction".into(),
+            "terrasync sync /src s3://access:secret@bucket.host/prefix".into(),
+            "/tmp/app.log".into(),
+        );
+
+        let summary = stats.to_string();
+        assert!(summary.contains("s3://***:***@bucket.host/prefix"));
+        assert!(!summary.contains("access"));
+        assert!(!summary.contains("secret"));
+    }
 }

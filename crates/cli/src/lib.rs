@@ -14,6 +14,7 @@ use std::path::Path;
 use std::path::PathBuf;
 
 // 外部crate
+use app::config::redact_command_line;
 use chrono::Local;
 use clap::Parser;
 use tracing::info;
@@ -163,6 +164,7 @@ pub async fn cli_match() -> error::Result<()> {
         })
         .collect::<Vec<String>>()
         .join(" ");
+    let raw_command_line = redact_command_line(&raw_command_line);
 
     // Initialize Configuration: default_config → -c config_file → build
     let config_contents = include_str!("resources/default_config.toml");

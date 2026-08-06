@@ -3,6 +3,7 @@
 
 // 外部crate
 use data_mover::filter::{FilterExpression, parse_filter_expression};
+use data_mover::redact_storage_url;
 use db::config::DatabaseConfig;
 use tracing::{debug, info};
 use utils::app_config::AppConfig;
@@ -10,6 +11,16 @@ use utils::app_config::AppConfig;
 // 内部模块
 use crate::error::Result;
 use crate::scan::ScanType;
+
+/// Redacts credentials from storage-URL arguments embedded in a recorded command line.
+#[must_use]
+pub fn redact_command_line(command: &str) -> String {
+    command
+        .split_whitespace()
+        .map(redact_storage_url)
+        .collect::<Vec<_>>()
+        .join(" ")
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum JobType {
@@ -159,9 +170,42 @@ pub fn initialize_consumer_config(
         job_type,
         job_dir: job_dir.to_string(),
         db_config,
-        console_config: ConsoleConfig { raw_command_line },
+        console_config: ConsoleConfig {
+            raw_command_line: redact_command_line(&raw_command_line),
+        },
         progress_callback_url,
     };
     info!("Created consumer configuration: {:?}", consumer_config);
     Ok(consumer_config)
+}
+
+#[cfg(test)]
+mod redaction_tests {
+    use super::*;
+
+    #[test]
+    fn command_line_redacts_storage_credentials_and_preserves_other_arguments() {
+        let command = "terrasync sync /src s3://access:secret@bucket.host:9000/prefix --delete-target";
+        let redacted = redact_command_line(command);
+
+        assert_eq!(
+            redacted,
+            "terrasync sync /src s3://***:***@bucket.host:9000/prefix --delete-target"
+        );
+        assert!(!redacted.contains("access"));
+        assert!(!redacted.contains("secret"));
+    }
+
+    #[test]
+    fn command_line_preserves_urls_without_userinfo_and_local_paths() {
+        let command = "terrasync sync /src nfs://server:2049/export:/prefix";
+        assert_eq!(redact_command_line(command), command);
+    }
+
+    #[test]
+    fn command_line_redacts_username_even_without_password() {
+        let redacted = redact_command_line("terrasync sync /src s3://access@bucket.host/prefix");
+        assert_eq!(redacted, "terrasync sync /src s3://***:***@bucket.host/prefix");
+        assert!(!redacted.contains("access"));
+    }
 }
