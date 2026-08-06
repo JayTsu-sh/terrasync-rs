@@ -81,6 +81,7 @@ pub(crate) struct RemoteSessionState {
     ndx_table: NdxTable,
     created_dirs: Vec<Arc<EntryEnum>>,
     active_transfer: ActiveTransfer,
+    credit_consumed: u64,
 }
 
 impl RemoteSessionState {
@@ -405,6 +406,25 @@ impl RemoteSessionState {
     pub(crate) async fn abort_active_file(&mut self, dc_tx: &Sender<DiskCommitMsg>) {
         self.active_transfer = ActiveTransfer::Idle;
         let _ = dc_tx.send(DiskCommitMsg::AbortFile).await;
+    }
+
+    /// Records bytes accepted by the disk-commit seam and emits an exact delayed
+    /// credit grant once the configured threshold is reached.
+    pub(crate) async fn record_data_consumed(
+        &mut self, transport: &(dyn ReceiverTransport + 'static), bytes: u64, threshold: u64,
+    ) {
+        self.credit_consumed += bytes;
+        if self.credit_consumed < threshold {
+            return;
+        }
+        let grant = self.credit_consumed;
+        self.credit_consumed = 0;
+        let _ = transport
+            .send(ReceiverMsg::CreditGrant {
+                bytes: grant,
+                ndx: None,
+            })
+            .await;
     }
 
     pub(crate) fn record_terminal(&mut self, ndx: i32) -> bool {
@@ -983,5 +1003,24 @@ mod tests {
                 .await
         );
         assert!(dc_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn transfer_credit_delays_then_grants_exact_accumulated_bytes() {
+        let (sender_transport, receiver_transport) = create_in_process_pair();
+        let mut state = RemoteSessionState::default();
+
+        state.record_data_consumed(&receiver_transport, 6, 10).await;
+        assert_eq!(state.credit_consumed, 6);
+
+        state.record_data_consumed(&receiver_transport, 7, 10).await;
+        assert_eq!(state.credit_consumed, 0);
+        assert!(matches!(
+            sender_transport.recv().await,
+            Some(ReceiverMsg::CreditGrant { bytes: 13, ndx: None })
+        ));
+
+        state.record_data_consumed(&receiver_transport, 5, 10).await;
+        assert_eq!(state.credit_consumed, 5);
     }
 }

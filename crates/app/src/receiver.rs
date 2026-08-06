@@ -18,7 +18,7 @@ use tracing::{Instrument, debug, error, info, info_span, trace, warn};
 use transport::error::TransportError;
 use transport::message::{
     DcAck, DestIndex, DiskCommitMsg, FeatureFlags, FileOutcome, HandshakeResult, ProgressSnapshot, ProtocolHandshake,
-    ReceiverMsg, SenderMsg, SessionConfig, TransferDecision, credit_cost,
+    ReceiverMsg, SenderMsg, SessionConfig, TransferDecision,
 };
 use transport::quic::credit::DEFAULT_CREDIT_WINDOW_BYTES;
 use transport::traits::ReceiverTransport;
@@ -435,25 +435,6 @@ const DEFAULT_DELTA_SIZE_THRESHOLD_BYTES: u64 = 512 * 1024 * 1024;
 /// 共享同一个常量来源，避免两端窗口大小假设漂移。
 const CREDIT_GRANT_THRESHOLD_BYTES: u64 = DEFAULT_CREDIT_WINDOW_BYTES / 2;
 
-/// credit 累计消费达半窗口阈值时批量发放一次 grant（仿 TCP 延迟 ack）：累计 `consumed`
-/// 达到 `threshold` 才返回 `Some`，否则原地累加、返回 `None`。
-///
-/// 返回值是**实际累计的消费字节数**（而非固定的 `threshold` 常量）：消息大小通常不整除
-/// `threshold`，触发时的累计值可能略高于阈值，直接把这个精确值作为 grant 金额发出——
-/// 保证长期账目精确相等（授信总量 == 消费总量），不会因为改发恒定阈值而产生系统性
-/// drift（授信不足 = credit 泄漏，Sender 早晚耗尽窗口；授信过量 = 双计，突破记账不变量
-/// `outstanding ∈ [0, window]` 的上界）。
-fn accumulate_credit(consumed: &mut u64, delta: u64, threshold: u64) -> Option<u64> {
-    *consumed += delta;
-    if *consumed >= threshold {
-        let grant = *consumed;
-        *consumed = 0;
-        Some(grant)
-    } else {
-        None
-    }
-}
-
 /// 解析 `SessionConfig.delta_size_threshold`：`None` 时使用默认值 512MiB，`Some` 时复用
 /// `parse_size`（与 `block_size` 同款人类可读格式，如 "512MiB"）。超过该 size 的文件即使
 /// 数据不匹配也降级为全量传输（见 `recv_file_list_and_data_phase` 的 `DeltaTransfer` 分支）。
@@ -515,11 +496,10 @@ pub(crate) async fn recv_file_list_and_data_phase(
     // ndx 级失败尝试计数（redo 决策用）：ndx → 已失败次数，见 decide_file_ack
     let mut attempts: HashMap<i32, u8> = HashMap::new();
     // ndx 终态去重与完成判断由 session ledger 统一持有。
-    // credit 累计消费（issue #59 方案 b）：FileData/DeltaData 处理完成（送 dc_tx）后累加，
-    // 达半窗口阈值批量发一次 CreditGrant 并清零，见 `accumulate_credit`。选"送达即补"而非
+    // credit 累计消费由 session state 持有：FileData/DeltaData 处理完成（送 dc_tx）后累加，
+    // 达半窗口阈值批量发一次 CreditGrant 并清零。选"送达即补"而非
     // "落盘才补"：时序上与落盘 ack 近似等价、落盘 ack 通路改动更大且窗口利用率更差、dc
     // 缓冲本身有界，三者共同构成确定的应用层积压上界（window + dc 固定缓冲常量）。
-    let mut credit_consumed: u64 = 0;
     // disk-commit task：全量/delta 文件均三段流式落盘（去整文件 BytesMut/token Vec）；ack
     // 经 unbounded channel 回流，避免路由 select 阻在 dc_tx.send 时不 drain ack → dc 阻在
     // ack_tx.send 的双向死锁。
@@ -568,9 +548,6 @@ pub(crate) async fn recv_file_list_and_data_phase(
                 }
             }
             msg = transport.recv() => {
-            // credit 花费口径与 Sender 侧扣减共用同一份 credit_cost（issue #59），
-            // 在 match 移动 msg 之前算好，FileData/DeltaData 分支据此累计消费。
-            let credit_delta = msg.as_ref().and_then(credit_cost);
             match msg {
             // ── 文件列表：FilePage → DestIndex 比较 → 发 TransferRequest/DeltaTransferRequest ──
             Some(SenderMsg::FilePage(page)) => {
@@ -701,11 +678,9 @@ pub(crate) async fn recv_file_list_and_data_phase(
 
             // ── 数据流模式：文件数据块 → 转发给 disk-commit task 的 write_chunk_stream ──
             Some(SenderMsg::FileData { entry, chunk }) => {
-                state.push_full_chunk(&dc_tx, entry, chunk).await;
-                if let Some(bytes) = credit_delta
-                    && let Some(grant) = accumulate_credit(&mut credit_consumed, bytes, CREDIT_GRANT_THRESHOLD_BYTES)
-                {
-                    let _ = transport.send(ReceiverMsg::CreditGrant { bytes: grant, ndx: None }).await;
+                let bytes = chunk.data.len() as u64;
+                if state.push_full_chunk(&dc_tx, entry, chunk).await {
+                    state.record_data_consumed(transport, bytes, CREDIT_GRANT_THRESHOLD_BYTES).await;
                 }
             }
 
@@ -719,15 +694,13 @@ pub(crate) async fn recv_file_list_and_data_phase(
                 }
             }
             Some(SenderMsg::DeltaData { ndx, data }) => {
+                let bytes = data.len() as u64;
                 if let Some(entry) = state.indexed_entry(ndx).cloned() {
-                    state.push_delta_data(&dc_tx, ndx, &entry, data).await;
+                    if state.push_delta_data(&dc_tx, ndx, &entry, data).await {
+                        state.record_data_consumed(transport, bytes, CREDIT_GRANT_THRESHOLD_BYTES).await;
+                    }
                 } else {
                     warn!("[Receiver Remote] DeltaData for unknown ndx {}", ndx);
-                }
-                if let Some(bytes) = credit_delta
-                    && let Some(grant) = accumulate_credit(&mut credit_consumed, bytes, CREDIT_GRANT_THRESHOLD_BYTES)
-                {
-                    let _ = transport.send(ReceiverMsg::CreditGrant { bytes: grant, ndx: None }).await;
                 }
             }
 
@@ -1002,45 +975,6 @@ mod tests {
     #[test]
     fn resolve_delta_size_threshold_rejects_invalid_format() {
         assert!(resolve_delta_size_threshold(&Some("not-a-size".to_string())).is_err());
-    }
-
-    // ── accumulate_credit：半窗批量授信金额精确（issue #59，防双计/泄漏） ──
-
-    #[test]
-    fn accumulate_credit_below_threshold_returns_none_and_keeps_accumulating() {
-        let mut consumed = 0u64;
-        assert_eq!(accumulate_credit(&mut consumed, 3, 10), None);
-        assert_eq!(consumed, 3);
-        assert_eq!(accumulate_credit(&mut consumed, 4, 10), None);
-        assert_eq!(consumed, 7);
-    }
-
-    #[test]
-    fn accumulate_credit_exact_threshold_grants_exact_amount_and_resets() {
-        let mut consumed = 0u64;
-        assert_eq!(accumulate_credit(&mut consumed, 6, 10), None);
-        assert_eq!(accumulate_credit(&mut consumed, 4, 10), Some(10));
-        // 触发后立即清零，不残留上一轮的累计值
-        assert_eq!(consumed, 0);
-    }
-
-    #[test]
-    fn accumulate_credit_overshoot_grants_exact_accumulated_value_not_fixed_threshold() {
-        // 单条消息一步越过阈值：grant 金额应是实际累计值（13），而非固定阈值（10），
-        // 否则长期账目会产生系统性 drift（少发 3 字节 = credit 泄漏）。
-        let mut consumed = 0u64;
-        assert_eq!(accumulate_credit(&mut consumed, 13, 10), Some(13));
-        assert_eq!(consumed, 0);
-    }
-
-    #[test]
-    fn accumulate_credit_next_round_does_not_leak_previous_overshoot() {
-        // 连续两轮：第一轮越过阈值触发 grant 并清零后，第二轮的累计应从 0 重新开始，
-        // 不会把上一轮的余量（越过阈值的部分）带入下一轮（防双计）。
-        let mut consumed = 0u64;
-        assert_eq!(accumulate_credit(&mut consumed, 13, 10), Some(13));
-        assert_eq!(accumulate_credit(&mut consumed, 5, 10), None);
-        assert_eq!(consumed, 5);
     }
 
     #[test]
