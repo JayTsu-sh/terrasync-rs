@@ -27,6 +27,7 @@ use transport::traits::ReceiverTransport;
 // 内部模块
 use crate::byte_resume::is_part_file;
 use crate::error::{AppError, Result};
+use crate::remote_receiver_session::RemoteReceiverSession;
 use crate::sync::{ResumeOpts, copy_file_with_resume, parse_size, should_resume};
 
 // ============================================================
@@ -326,15 +327,14 @@ pub async fn receiver_task_remote(
     };
 
     // ── 阶段 1+2: 文件列表与数据流合并处理，无阶段 barrier（见函数入口文档） ──
-    recv_file_list_and_data_phase(
-        transport,
-        &dest_storage,
-        &session_config,
-        &negotiated_features,
+    RemoteReceiverSession::new(
+        dest_storage,
+        session_config,
+        negotiated_features,
         delta_size_threshold,
-        &progress,
-        progress_rx,
+        progress.clone(),
     )
+    .run(transport, progress_rx)
     .await?;
 
     // 停止进度 reporter，发最终快照 + AllDone
@@ -508,7 +508,7 @@ pub(crate) fn validate_relative_path(path: &Path) -> Result<()> {
 /// `TransferRequest`/`DeltaTransferRequest`）与 `completed_count`（收到过多少个对应的
 /// `EndOfFile`/`CreateSymlink` 完成处理），只有二者相等**且**已经见过 `TransferDone`，
 /// 才真正结束循环。
-async fn recv_file_list_and_data_phase(
+pub(crate) async fn recv_file_list_and_data_phase(
     transport: &(dyn ReceiverTransport + 'static), dest_storage: &Arc<StorageEnum>, session_config: &SessionConfig,
     negotiated_features: &FeatureFlags, delta_size_threshold: u64, progress: &Arc<ReceiverProgress>,
     mut progress_rx: MpscReceiver<ProgressSnapshot>,
