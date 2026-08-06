@@ -4,7 +4,7 @@
 //! `SessionConfig` 接收仍由外层负责；磁盘写入仍位于 disk-commit 内部 seam 后面。
 //! 当前实现委托既有事件循环，后续 tickets 将在此 interface 后逐步收拢会话状态。
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use data_mover::dir_tree::DirPageResult;
@@ -12,8 +12,8 @@ use data_mover::{DataChunk, EntryEnum, StorageEnum};
 use tokio::sync::mpsc::{Receiver, Sender};
 use tracing::{debug, info, warn};
 use transport::message::{
-    BlockSignature, DestIndex, DiskCommitMsg, FeatureFlags, NdxTable, ProgressSnapshot, ReceiverMsg, SessionConfig,
-    TransferDecision,
+    BlockSignature, DestIndex, DiskCommitMsg, FeatureFlags, FileOutcome, NdxTable, ProgressSnapshot, ReceiverMsg,
+    SessionConfig, TransferDecision,
 };
 use transport::traits::ReceiverTransport;
 
@@ -82,6 +82,7 @@ pub(crate) struct RemoteSessionState {
     created_dirs: Vec<Arc<EntryEnum>>,
     active_transfer: ActiveTransfer,
     credit_consumed: u64,
+    attempts: HashMap<i32, u8>,
 }
 
 impl RemoteSessionState {
@@ -425,6 +426,50 @@ impl RemoteSessionState {
                 ndx: None,
             })
             .await;
+    }
+
+    pub(crate) async fn handle_file_outcome(
+        &mut self, transport: &(dyn ReceiverTransport + 'static), progress: &ReceiverProgress, ndx: i32,
+        outcome: FileOutcome,
+    ) -> bool {
+        let (ack, terminal) = match outcome {
+            FileOutcome::Success => (ReceiverMsg::Success { ndx }, true),
+            FileOutcome::HashMismatch => self.redo_or_error(ndx, "hash mismatch"),
+            FileOutcome::SizeMismatch => self.redo_or_error(ndx, "size mismatch"),
+            FileOutcome::HardError(reason) => (ReceiverMsg::Error { ndx, reason }, true),
+        };
+        if !terminal {
+            let _ = transport.send(ack).await;
+            return false;
+        }
+        if !self.record_terminal(ndx) {
+            debug!(
+                "[Receiver Remote] ndx {} already terminated; dropping duplicate outcome",
+                ndx
+            );
+            return false;
+        }
+        if matches!(ack, ReceiverMsg::Error { .. }) {
+            progress.error_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        let _ = transport.send(ack).await;
+        self.is_complete()
+    }
+
+    fn redo_or_error(&mut self, ndx: i32, reason: &str) -> (ReceiverMsg, bool) {
+        let count = self.attempts.entry(ndx).or_insert(0);
+        *count += 1;
+        if *count == 1 {
+            (ReceiverMsg::Redo { ndx }, false)
+        } else {
+            (
+                ReceiverMsg::Error {
+                    ndx,
+                    reason: reason.into(),
+                },
+                true,
+            )
+        }
     }
 
     pub(crate) fn record_terminal(&mut self, ndx: i32) -> bool {
@@ -1022,5 +1067,51 @@ mod tests {
 
         state.record_data_consumed(&receiver_transport, 5, 10).await;
         assert_eq!(state.credit_consumed, 5);
+    }
+
+    #[tokio::test]
+    async fn file_outcomes_apply_one_retry_then_one_terminal_result() {
+        let (sender_transport, receiver_transport) = create_in_process_pair();
+        let progress = ReceiverProgress::default();
+        let mut state = RemoteSessionState::default();
+
+        assert!(
+            !state
+                .handle_file_outcome(&receiver_transport, &progress, 7, FileOutcome::HashMismatch)
+                .await
+        );
+        assert!(matches!(
+            sender_transport.recv().await,
+            Some(ReceiverMsg::Redo { ndx: 7 })
+        ));
+        assert_eq!(state.counts(), (0, 0));
+
+        assert!(
+            !state
+                .handle_file_outcome(&receiver_transport, &progress, 7, FileOutcome::SizeMismatch)
+                .await
+        );
+        assert!(matches!(
+            sender_transport.recv().await,
+            Some(ReceiverMsg::Error { ndx: 7, .. })
+        ));
+        assert_eq!(state.counts(), (1, 0));
+        assert_eq!(progress.error_count.load(Ordering::Relaxed), 1);
+
+        assert!(
+            !state
+                .handle_file_outcome(
+                    &receiver_transport,
+                    &progress,
+                    8,
+                    FileOutcome::HardError("storage".into()),
+                )
+                .await
+        );
+        assert!(matches!(
+            sender_transport.recv().await,
+            Some(ReceiverMsg::Error { ndx: 8, .. })
+        ));
+        assert!(!state.attempts.contains_key(&8));
     }
 }

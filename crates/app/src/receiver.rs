@@ -5,7 +5,6 @@
 //! 双进程模式下 Receiver 仅拥有 dest storage（数据流模式，Phase 3）。
 
 // 标准库
-use std::collections::HashMap;
 use std::path::{Component, Path};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -17,8 +16,8 @@ use tokio::sync::mpsc::Receiver as MpscReceiver;
 use tracing::{Instrument, debug, error, info, info_span, trace, warn};
 use transport::error::TransportError;
 use transport::message::{
-    DcAck, DestIndex, DiskCommitMsg, FeatureFlags, FileOutcome, HandshakeResult, ProgressSnapshot, ProtocolHandshake,
-    ReceiverMsg, SenderMsg, SessionConfig, TransferDecision,
+    DcAck, DestIndex, DiskCommitMsg, FeatureFlags, HandshakeResult, ProgressSnapshot, ProtocolHandshake, ReceiverMsg,
+    SenderMsg, SessionConfig, TransferDecision,
 };
 use transport::quic::credit::DEFAULT_CREDIT_WINDOW_BYTES;
 use transport::traits::ReceiverTransport;
@@ -493,8 +492,6 @@ pub(crate) async fn recv_file_list_and_data_phase(
     mut progress_rx: MpscReceiver<ProgressSnapshot>, state: &mut RemoteSessionState,
 ) -> Result<()> {
     info!("[Receiver Remote] Receiving file list and file data (pipelined, streaming mode)");
-    // ndx 级失败尝试计数（redo 决策用）：ndx → 已失败次数，见 decide_file_ack
-    let mut attempts: HashMap<i32, u8> = HashMap::new();
     // ndx 终态去重与完成判断由 session ledger 统一持有。
     // credit 累计消费由 session state 持有：FileData/DeltaData 处理完成（送 dc_tx）后累加，
     // 达半窗口阈值批量发一次 CreditGrant 并清零。选"送达即补"而非
@@ -532,16 +529,7 @@ pub(crate) async fn recv_file_list_and_data_phase(
                         }
                     }
                     DcAck::FileOutcome { ndx, outcome } => {
-                        if dispatch_file_outcome(
-                            transport,
-                            &mut attempts,
-                            progress,
-                            ndx,
-                            outcome,
-                            state,
-                        )
-                        .await
-                        {
+                        if state.handle_file_outcome(transport, progress, ndx, outcome).await {
                             break;
                         }
                     }
@@ -774,7 +762,7 @@ pub(crate) async fn recv_file_list_and_data_phase(
                 let _ = transport.send(ack).await;
             }
             DcAck::FileOutcome { ndx, outcome } => {
-                let _ = dispatch_file_outcome(transport, &mut attempts, progress, ndx, outcome, state).await;
+                let _ = state.handle_file_outcome(transport, progress, ndx, outcome).await;
             }
         }
     }
@@ -782,72 +770,6 @@ pub(crate) async fn recv_file_list_and_data_phase(
     state.finalize_directories(dest_storage).await;
 
     Ok(())
-}
-
-/// ndx 级文件传输 redo 决策（方案 A 的统一决策点）
-///
-/// dc task（全量/delta 路径统一经 `disk_commit_task` 上报，见 issue #54 阶段 3）上报的
-/// outcome 在此统一转换为终态/重试 ack：
-/// - 校验失败（`HashMismatch`/`SizeMismatch`）·首次 → `Redo{ndx}`，不计入
-///   `completed_count`（文件仍在途）。
-/// - 校验失败·二次+ → `Error{ndx,reason}`，计入 `completed_count`。
-/// - 校验通过（`Success`）→ `Success{ndx}`，计入 `completed_count`。
-/// - 硬错误（`HardError`，非校验类）→ 直接 `Error{ndx,reason}` 终态，不 redo。
-///
-/// 返回 `(ack, is_terminal)`：`is_terminal=true` 时调用方需计入 `completed_count`。
-fn decide_file_ack(attempts: &mut HashMap<i32, u8>, ndx: i32, outcome: FileOutcome) -> (ReceiverMsg, bool) {
-    match outcome {
-        FileOutcome::Success => (ReceiverMsg::Success { ndx }, true),
-        FileOutcome::HashMismatch => redo_or_error(attempts, ndx, "hash mismatch"),
-        FileOutcome::SizeMismatch => redo_or_error(attempts, ndx, "size mismatch"),
-        FileOutcome::HardError(reason) => (ReceiverMsg::Error { ndx, reason }, true),
-    }
-}
-
-/// 校验失败类 outcome（`HashMismatch`/`SizeMismatch`）共用的重试计数：同一 ndx 首次 →
-/// `Redo{ndx}`，二次+ → `Error{ndx,reason}` 终态。
-fn redo_or_error(attempts: &mut HashMap<i32, u8>, ndx: i32, reason: &str) -> (ReceiverMsg, bool) {
-    let count = attempts.entry(ndx).or_insert(0);
-    *count += 1;
-    if *count >= 2 {
-        (
-            ReceiverMsg::Error {
-                ndx,
-                reason: reason.into(),
-            },
-            true,
-        )
-    } else {
-        (ReceiverMsg::Redo { ndx }, false)
-    }
-}
-
-/// `FileOutcome` 上报的统一处理入口（dc task 全量/delta 路径共用）：
-/// 调用 `decide_file_ack` 做 redo 决策；非终态（`Redo`）直接发 ack、不动
-/// completion ledger。终态先按 `ndx` 去重（redo 期间 dc task 与 Sender 自检失败
-/// 可能各自独立上报同一 ndx 的终态，去重只在首次生效）：
-/// 去重命中则连 ack 都不再发（避免 Sender 收到同一 ndx 的重复终态 ack），否则累加
-/// `progress.error_count`（若为 `Error`）、发 ack、计入 ledger。
-///
-/// 返回是否应 break 主循环（ledger 打平且已见过 `TransferDone`）。
-async fn dispatch_file_outcome(
-    transport: &(dyn ReceiverTransport + 'static), attempts: &mut HashMap<i32, u8>, progress: &Arc<ReceiverProgress>,
-    ndx: i32, outcome: FileOutcome, state: &mut RemoteSessionState,
-) -> bool {
-    let (ack, is_terminal) = decide_file_ack(attempts, ndx, outcome);
-    if !is_terminal {
-        let _ = transport.send(ack).await;
-        return false;
-    }
-    if !state.record_terminal(ndx) {
-        debug!("[Receiver Remote] ndx {} 已终结，丢弃重复终态: {:?}", ndx, ack);
-        return false;
-    }
-    if matches!(ack, ReceiverMsg::Error { .. }) {
-        progress.error_count.fetch_add(1, Ordering::Relaxed);
-    }
-    let _ = transport.send(ack).await;
-    state.is_complete()
 }
 
 #[cfg(test)]
@@ -875,88 +797,6 @@ mod tests {
     }
 
     // ── decide_file_ack：ndx 级 redo 决策纯函数单测（方案 A 的核心状态机） ──
-
-    #[test]
-    fn decide_file_ack_success_is_terminal() {
-        let mut attempts = HashMap::new();
-        let (ack, is_terminal) = decide_file_ack(&mut attempts, 7, FileOutcome::Success);
-        assert!(matches!(ack, ReceiverMsg::Success { ndx: 7 }));
-        assert!(is_terminal);
-    }
-
-    #[test]
-    fn decide_file_ack_first_hash_mismatch_redos_and_is_not_terminal() {
-        let mut attempts = HashMap::new();
-        let (ack, is_terminal) = decide_file_ack(&mut attempts, 3, FileOutcome::HashMismatch);
-        assert!(matches!(ack, ReceiverMsg::Redo { ndx: 3 }));
-        assert!(!is_terminal);
-        assert_eq!(attempts.get(&3), Some(&1));
-    }
-
-    #[test]
-    fn decide_file_ack_second_hash_mismatch_errors_and_is_terminal() {
-        let mut attempts = HashMap::new();
-        let (first_ack, first_terminal) = decide_file_ack(&mut attempts, 3, FileOutcome::HashMismatch);
-        assert!(matches!(first_ack, ReceiverMsg::Redo { ndx: 3 }));
-        assert!(!first_terminal);
-
-        let (second_ack, second_terminal) = decide_file_ack(&mut attempts, 3, FileOutcome::HashMismatch);
-        match second_ack {
-            ReceiverMsg::Error { ndx: 3, reason } => assert_eq!(reason, "hash mismatch"),
-            other => panic!("expected Error, got {other:?}"),
-        }
-        assert!(second_terminal);
-    }
-
-    #[test]
-    fn decide_file_ack_first_size_mismatch_redos_and_is_not_terminal() {
-        let mut attempts = HashMap::new();
-        let (ack, is_terminal) = decide_file_ack(&mut attempts, 5, FileOutcome::SizeMismatch);
-        assert!(matches!(ack, ReceiverMsg::Redo { ndx: 5 }));
-        assert!(!is_terminal);
-        assert_eq!(attempts.get(&5), Some(&1));
-    }
-
-    #[test]
-    fn decide_file_ack_second_size_mismatch_errors_and_is_terminal() {
-        let mut attempts = HashMap::new();
-        let (first_ack, first_terminal) = decide_file_ack(&mut attempts, 5, FileOutcome::SizeMismatch);
-        assert!(matches!(first_ack, ReceiverMsg::Redo { ndx: 5 }));
-        assert!(!first_terminal);
-
-        let (second_ack, second_terminal) = decide_file_ack(&mut attempts, 5, FileOutcome::SizeMismatch);
-        match second_ack {
-            ReceiverMsg::Error { ndx: 5, reason } => assert_eq!(reason, "size mismatch"),
-            other => panic!("expected Error, got {other:?}"),
-        }
-        assert!(second_terminal);
-    }
-
-    #[test]
-    fn decide_file_ack_hard_error_is_terminal_without_redo() {
-        let mut attempts = HashMap::new();
-        let (ack, is_terminal) =
-            decide_file_ack(&mut attempts, 9, FileOutcome::HardError("resume_prepare failed".into()));
-        match ack {
-            ReceiverMsg::Error { ndx: 9, reason } => assert_eq!(reason, "resume_prepare failed"),
-            other => panic!("expected Error, got {other:?}"),
-        }
-        assert!(is_terminal);
-        // 硬错误不计入 attempts（不参与 redo 计数）
-        assert!(attempts.get(&9).is_none());
-    }
-
-    #[test]
-    fn decide_file_ack_different_ndx_track_attempts_independently() {
-        let mut attempts = HashMap::new();
-        let _ = decide_file_ack(&mut attempts, 1, FileOutcome::HashMismatch);
-        let (ack, is_terminal) = decide_file_ack(&mut attempts, 2, FileOutcome::HashMismatch);
-        assert!(
-            matches!(ack, ReceiverMsg::Redo { ndx: 2 }),
-            "ndx 2 应是首次失败，与 ndx 1 互不影响"
-        );
-        assert!(!is_terminal);
-    }
 
     // ── resolve_delta_size_threshold：delta size 门槛解析（issue #54 阶段 0） ──
 
