@@ -516,10 +516,7 @@ pub(crate) async fn recv_file_list_and_data_phase(
     // ndx 级失败尝试计数（redo 决策用）：ndx → 已失败次数，见 decide_file_ack
     let mut attempts: HashMap<i32, u8> = HashMap::new();
     // ndx 终态去重与完成判断由 session ledger 统一持有。
-    // 全量文件是否走 disk-commit 流式路径：以是否见过 FileBegin 判定（而非 token 是否为空），
-    // 避免源端缩到 0 字节的 delta 传输（token 空且无 FileBegin）被误判为全量。
-    let mut full_active = false;
-    // delta 文件是否已向 disk-commit task 发过 DeltaBegin：镜像 full_active，首个属于该
+    // delta 文件是否已向 disk-commit task 发过 DeltaBegin：首个属于该
     // ndx 的 delta 数据事件（token 或 EndOfFile）才触发一次 DeltaBegin，见
     // `ensure_delta_active` 文档（避免 FilePage 阶段流水线化发出多个
     // DeltaTransferRequest、早于任何响应到达导致 dc_tx 收到乱序 DeltaBegin）。
@@ -655,8 +652,7 @@ pub(crate) async fn recv_file_list_and_data_phase(
 
             // ── 文件开始：标记走全量流式路径，交 disk-commit task 起 resume_prepare + write_chunk_stream ──
             Some(SenderMsg::FileBegin { ndx, entry }) => {
-                full_active = true;
-                let _ = dc_tx.send(DiskCommitMsg::FileBegin { ndx, entry }).await;
+                state.begin_full(&dc_tx, ndx, entry).await;
             }
 
             // ── 数据流模式：目录 ──
@@ -711,7 +707,7 @@ pub(crate) async fn recv_file_list_and_data_phase(
 
             // ── 数据流模式：文件数据块 → 转发给 disk-commit task 的 write_chunk_stream ──
             Some(SenderMsg::FileData { entry, chunk }) => {
-                let _ = dc_tx.send(DiskCommitMsg::FileChunk { entry, chunk }).await;
+                state.push_full_chunk(&dc_tx, entry, chunk).await;
                 if let Some(bytes) = credit_delta
                     && let Some(grant) = accumulate_credit(&mut credit_consumed, bytes, CREDIT_GRANT_THRESHOLD_BYTES)
                 {
@@ -748,10 +744,7 @@ pub(crate) async fn recv_file_list_and_data_phase(
             //    幂等补发 DeltaBegin），同样交 disk-commit task 三段式收尾。完成计数统一
             //    在 dc ack 回流时才 +1（decide_file_ack 做 redo 决策，全量/delta 共用一份状态机）──
             Some(SenderMsg::EndOfFile { ndx, entry, source_hash }) => {
-                if full_active {
-                    full_active = false;
-                    let _ = dc_tx.send(DiskCommitMsg::FileCommit { ndx, entry, source_hash }).await;
-                } else {
+                if !state.commit_full(&dc_tx, ndx, &entry, &source_hash).await {
                     ensure_delta_active(&dc_tx, &mut delta_active, ndx, &entry).await;
                     delta_active = false;
                     let _ = dc_tx.send(DiskCommitMsg::DeltaCommit { ndx, entry, source_hash }).await;
@@ -785,9 +778,8 @@ pub(crate) async fn recv_file_list_and_data_phase(
             //    防止与 dc task 独立上报的终态重复计数（[1]）──
             Some(SenderMsg::EntryError { path, reason, ndx }) => {
                 warn!("[Receiver Remote] Sender EntryError {:?}: {} — 中止该文件", path, reason);
-                full_active = false;
                 delta_active = false;
-                let _ = dc_tx.send(DiskCommitMsg::AbortFile).await;
+                state.abort_active_file(&dc_tx).await;
                 let should_break = if let Some(ndx) = ndx {
                     state.record_terminal(ndx) && state.is_complete()
                 } else {

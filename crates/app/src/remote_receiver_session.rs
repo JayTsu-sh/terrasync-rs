@@ -8,11 +8,12 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use data_mover::dir_tree::DirPageResult;
-use data_mover::{EntryEnum, StorageEnum};
-use tokio::sync::mpsc::Receiver;
+use data_mover::{DataChunk, EntryEnum, StorageEnum};
+use tokio::sync::mpsc::{Receiver, Sender};
 use tracing::{debug, info, warn};
 use transport::message::{
-    BlockSignature, DestIndex, FeatureFlags, NdxTable, ProgressSnapshot, ReceiverMsg, SessionConfig, TransferDecision,
+    BlockSignature, DestIndex, DiskCommitMsg, FeatureFlags, NdxTable, ProgressSnapshot, ReceiverMsg, SessionConfig,
+    TransferDecision,
 };
 use transport::traits::ReceiverTransport;
 
@@ -29,6 +30,13 @@ struct TransferLedger {
     completed: u64,
     transfer_done_seen: bool,
     terminated_ndx: HashSet<i32>,
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+enum ActiveTransfer {
+    #[default]
+    Idle,
+    Full,
 }
 
 impl TransferLedger {
@@ -69,6 +77,7 @@ pub(crate) struct RemoteSessionState {
     ledger: TransferLedger,
     ndx_table: NdxTable,
     created_dirs: Vec<Arc<EntryEnum>>,
+    active_transfer: ActiveTransfer,
 }
 
 impl RemoteSessionState {
@@ -270,6 +279,50 @@ impl RemoteSessionState {
                 );
             }
         }
+    }
+
+    pub(crate) async fn begin_full(&mut self, dc_tx: &Sender<DiskCommitMsg>, ndx: i32, entry: Arc<EntryEnum>) -> bool {
+        if self.active_transfer != ActiveTransfer::Idle {
+            warn!("[Receiver Remote] rejecting FileBegin while another transfer is active");
+            return false;
+        }
+        self.active_transfer = ActiveTransfer::Full;
+        let _ = dc_tx.send(DiskCommitMsg::FileBegin { ndx, entry }).await;
+        true
+    }
+
+    pub(crate) async fn push_full_chunk(
+        &self, dc_tx: &Sender<DiskCommitMsg>, entry: Arc<EntryEnum>, chunk: DataChunk,
+    ) -> bool {
+        if self.active_transfer != ActiveTransfer::Full {
+            warn!("[Receiver Remote] rejecting FileData without an active full transfer");
+            return false;
+        }
+        let _ = dc_tx.send(DiskCommitMsg::FileChunk { entry, chunk }).await;
+        true
+    }
+
+    /// 提交 active full transfer；返回 false 表示该 `EndOfFile` 应由 delta 路径处理。
+    pub(crate) async fn commit_full(
+        &mut self, dc_tx: &Sender<DiskCommitMsg>, ndx: i32, entry: &Arc<EntryEnum>, source_hash: &Option<String>,
+    ) -> bool {
+        if self.active_transfer != ActiveTransfer::Full {
+            return false;
+        }
+        self.active_transfer = ActiveTransfer::Idle;
+        let _ = dc_tx
+            .send(DiskCommitMsg::FileCommit {
+                ndx,
+                entry: entry.clone(),
+                source_hash: source_hash.clone(),
+            })
+            .await;
+        true
+    }
+
+    pub(crate) async fn abort_active_file(&mut self, dc_tx: &Sender<DiskCommitMsg>) {
+        self.active_transfer = ActiveTransfer::Idle;
+        let _ = dc_tx.send(DiskCommitMsg::AbortFile).await;
     }
 
     pub(crate) fn record_terminal(&mut self, ndx: i32) -> bool {
@@ -739,5 +792,57 @@ mod tests {
             .await;
 
         assert!(dest_dir.path().join(part_name).exists());
+    }
+
+    #[tokio::test]
+    async fn full_state_routes_valid_sequence_and_rejects_malformed_order() {
+        let entry = nas_entry("file.txt", PathBuf::from("file.txt"), false);
+        let (dc_tx, mut dc_rx) = mpsc::channel(8);
+        let mut state = RemoteSessionState::default();
+
+        assert!(
+            !state
+                .push_full_chunk(
+                    &dc_tx,
+                    entry.clone(),
+                    DataChunk {
+                        offset: 0,
+                        data: Bytes::from_static(b"invalid"),
+                    },
+                )
+                .await
+        );
+        assert!(dc_rx.try_recv().is_err());
+
+        assert!(state.begin_full(&dc_tx, 7, entry.clone()).await);
+        assert!(matches!(
+            dc_rx.recv().await,
+            Some(DiskCommitMsg::FileBegin { ndx: 7, .. })
+        ));
+        assert!(!state.begin_full(&dc_tx, 8, entry.clone()).await);
+        assert!(dc_rx.try_recv().is_err());
+
+        assert!(
+            state
+                .push_full_chunk(
+                    &dc_tx,
+                    entry.clone(),
+                    DataChunk {
+                        offset: 0,
+                        data: Bytes::from_static(b"valid"),
+                    },
+                )
+                .await
+        );
+        assert!(matches!(dc_rx.recv().await, Some(DiskCommitMsg::FileChunk { .. })));
+        assert!(state.commit_full(&dc_tx, 7, &entry, &None).await);
+        assert!(matches!(
+            dc_rx.recv().await,
+            Some(DiskCommitMsg::FileCommit { ndx: 7, .. })
+        ));
+        assert!(!state.commit_full(&dc_tx, 7, &entry, &None).await);
+
+        state.abort_active_file(&dc_tx).await;
+        assert!(matches!(dc_rx.recv().await, Some(DiskCommitMsg::AbortFile)));
     }
 }
