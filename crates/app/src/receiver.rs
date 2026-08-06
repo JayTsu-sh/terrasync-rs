@@ -25,7 +25,6 @@ use transport::quic::credit::DEFAULT_CREDIT_WINDOW_BYTES;
 use transport::traits::ReceiverTransport;
 
 // 内部模块
-use crate::byte_resume::is_part_file;
 use crate::error::{AppError, Result};
 use crate::remote_receiver_session::{RemoteReceiverSession, RemoteSessionState};
 use crate::sync::{ResumeOpts, copy_file_with_resume, parse_size, should_resume};
@@ -525,9 +524,6 @@ pub(crate) async fn recv_file_list_and_data_phase(
     // `ensure_delta_active` 文档（避免 FilePage 阶段流水线化发出多个
     // DeltaTransferRequest、早于任何响应到达导致 dc_tx 收到乱序 DeltaBegin）。
     let mut delta_active = false;
-    // 已创建的目录：所有文件传输完成后统一回写 mtime/mode(写子文件会把目录 mtime 顶到当前时间;
-    // 且 0500 等受限权限须在写完子项后才能设),对齐单进程 orchestrator 的目录 mtime 收尾。
-    let mut created_dirs: Vec<Arc<EntryEnum>> = Vec::new();
     // credit 累计消费（issue #59 方案 b）：FileData/DeltaData 处理完成（送 dc_tx）后累加，
     // 达半窗口阈值批量发一次 CreditGrant 并清零，见 `accumulate_credit`。选"送达即补"而非
     // "落盘才补"：时序上与落盘 ack 近似等价、落盘 ack 通路改动更大且窗口利用率更差、dc
@@ -636,67 +632,15 @@ pub(crate) async fn recv_file_list_and_data_phase(
                     debug_assert_eq!(decision, TransferDecision::Deleted, "all other classifications are handled");
                 }
 
-                // 子目录在目标端创建
-                for ns in &page.subdirs {
-                    // 源端存在该子目录 → 目标端同名条目不是孤儿（须在 orphan 扫描前登记，
-                    // 与创建成功与否无关；不登记则预存子目录被误判孤儿 → 整树误删后重传）
-                    dest_index.mark_matched(&ns.entry);
-                    if let Err(e) = validate_relative_path(ns.entry.get_relative_path()) {
-                        warn!("[Receiver Remote] Rejecting unsafe subdir path: {}", e);
-                        let _ = transport
-                            .send(ReceiverMsg::EntryError {
-                                entry: ns.entry.clone(),
-                                reason: format!("{e}"),
-                            })
-                            .await;
-                        continue;
-                    }
-                    if let Err(e) = dest_storage.create_dir_all(&ns.entry).await {
-                        warn!("[Receiver Remote] create_dir {:?}: {}", ns.entry.get_relative_path(), e);
-                    }
-                    // 目录 mtime/mode 待所有传输完成后统一回写（见 created_dirs 声明处）
-                    created_dirs.push(ns.entry.clone());
-                }
-
-                // --delete-target: 删除目标端多余文件；成功发 Classified{Deleted}、
-                // 失败发 EntryError（此前失败只 warn! 静默吞掉，不计入任何统计/错误数）
-                if session_config.delete_target {
-                    for orphan in dest_index.orphaned_entries() {
-                        let path = orphan.get_relative_path();
-                        // 跳过续传临时文件：源端不存在同名 .terrasync-part 条目，
-                        // 会被误判为孤儿；删掉会破坏进行中的续传进度
-                        if is_part_file(path) {
-                            debug!("[Receiver Remote] Skipping in-progress part file: {:?}", path);
-                            continue;
-                        }
-                        let result = if orphan.get_is_dir() {
-                            info!("[Receiver Remote] Deleting orphaned dir: {:?}", path);
-                            dest_storage.delete_dir_all(orphan).await
-                        } else {
-                            info!("[Receiver Remote] Deleting orphaned file: {:?}", path);
-                            dest_storage.delete_file(orphan).await
-                        };
-                        match result {
-                            Ok(()) => {
-                                let _ = transport
-                                    .send(ReceiverMsg::Classified {
-                                        entry: orphan.clone(),
-                                        decision: TransferDecision::Deleted,
-                                    })
-                                    .await;
-                            }
-                            Err(e) => {
-                                warn!("[Receiver Remote] delete {:?}: {}", path, e);
-                                let _ = transport
-                                    .send(ReceiverMsg::EntryError {
-                                        entry: orphan.clone(),
-                                        reason: format!("{e}"),
-                                    })
-                                    .await;
-                            }
-                        }
-                    }
-                }
+                state
+                    .handle_directory_lifecycle(
+                        transport,
+                        dest_storage,
+                        &page,
+                        &mut dest_index,
+                        session_config.delete_target,
+                    )
+                    .await;
             }
             Some(SenderMsg::FileListError { path, reason }) => {
                 error!("[Receiver Remote] walkdir error {}: {}", path, reason);
@@ -881,16 +825,7 @@ pub(crate) async fn recv_file_list_and_data_phase(
         }
     }
 
-    // 回写目录 mtime/mode：所有文件已落盘,此时设目录元数据不会再被子文件写入顶掉。
-    for dir_entry in &created_dirs {
-        if let Err(e) = dest_storage.set_entry_metadata(dir_entry).await {
-            warn!(
-                "[Receiver Remote] 回写目录元数据 {:?} 失败: {}",
-                dir_entry.get_relative_path(),
-                e
-            );
-        }
-    }
+    state.finalize_directories(dest_storage).await;
 
     Ok(())
 }

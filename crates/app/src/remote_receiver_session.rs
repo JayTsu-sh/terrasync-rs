@@ -7,16 +7,18 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
+use data_mover::dir_tree::DirPageResult;
 use data_mover::{EntryEnum, StorageEnum};
 use tokio::sync::mpsc::Receiver;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 use transport::message::{
-    BlockSignature, FeatureFlags, NdxTable, ProgressSnapshot, ReceiverMsg, SessionConfig, TransferDecision,
+    BlockSignature, DestIndex, FeatureFlags, NdxTable, ProgressSnapshot, ReceiverMsg, SessionConfig, TransferDecision,
 };
 use transport::traits::ReceiverTransport;
 
+use crate::byte_resume::is_part_file;
 use crate::error::Result;
-use crate::receiver::{ReceiverProgress, recv_file_list_and_data_phase};
+use crate::receiver::{ReceiverProgress, recv_file_list_and_data_phase, validate_relative_path};
 
 /// 一次会话的请求与终态账本。
 ///
@@ -66,6 +68,7 @@ impl TransferLedger {
 pub(crate) struct RemoteSessionState {
     ledger: TransferLedger,
     ndx_table: NdxTable,
+    created_dirs: Vec<Arc<EntryEnum>>,
 }
 
 impl RemoteSessionState {
@@ -191,6 +194,84 @@ impl RemoteSessionState {
         true
     }
 
+    /// 处理一个文件页中的子目录与目标端 orphan，并登记会话结束时需要恢复 metadata 的目录。
+    pub(crate) async fn handle_directory_lifecycle(
+        &mut self, transport: &(dyn ReceiverTransport + 'static), dest: &StorageEnum, page: &DirPageResult,
+        dest_index: &mut DestIndex, delete_target: bool,
+    ) {
+        for subdir in &page.subdirs {
+            dest_index.mark_matched(&subdir.entry);
+            if let Err(error) = validate_relative_path(subdir.entry.get_relative_path()) {
+                warn!("[Receiver Remote] Rejecting unsafe subdir path: {}", error);
+                let _ = transport
+                    .send(ReceiverMsg::EntryError {
+                        entry: subdir.entry.clone(),
+                        reason: format!("{error}"),
+                    })
+                    .await;
+                continue;
+            }
+            if let Err(error) = dest.create_dir_all(&subdir.entry).await {
+                warn!(
+                    "[Receiver Remote] create_dir {:?}: {}",
+                    subdir.entry.get_relative_path(),
+                    error
+                );
+            }
+            self.created_dirs.push(subdir.entry.clone());
+        }
+
+        if !delete_target {
+            return;
+        }
+        for orphan in dest_index.orphaned_entries() {
+            let path = orphan.get_relative_path();
+            if is_part_file(path) {
+                debug!("[Receiver Remote] Skipping in-progress part file: {:?}", path);
+                continue;
+            }
+            let result = if orphan.get_is_dir() {
+                info!("[Receiver Remote] Deleting orphaned dir: {:?}", path);
+                dest.delete_dir_all(orphan).await
+            } else {
+                info!("[Receiver Remote] Deleting orphaned file: {:?}", path);
+                dest.delete_file(orphan).await
+            };
+            match result {
+                Ok(()) => {
+                    let _ = transport
+                        .send(ReceiverMsg::Classified {
+                            entry: orphan.clone(),
+                            decision: TransferDecision::Deleted,
+                        })
+                        .await;
+                }
+                Err(error) => {
+                    warn!("[Receiver Remote] delete {:?}: {}", path, error);
+                    let _ = transport
+                        .send(ReceiverMsg::EntryError {
+                            entry: orphan.clone(),
+                            reason: format!("{error}"),
+                        })
+                        .await;
+                }
+            }
+        }
+    }
+
+    /// 在所有文件 durable outcome 完成后恢复目录 metadata。
+    pub(crate) async fn finalize_directories(&self, dest: &StorageEnum) {
+        for entry in &self.created_dirs {
+            if let Err(error) = dest.set_entry_metadata(entry).await {
+                warn!(
+                    "[Receiver Remote] 回写目录元数据 {:?} 失败: {}",
+                    entry.get_relative_path(),
+                    error
+                );
+            }
+        }
+    }
+
     pub(crate) fn record_terminal(&mut self, ndx: i32) -> bool {
         self.ledger.record_terminal(ndx)
     }
@@ -259,12 +340,13 @@ impl RemoteReceiverSession {
 mod tests {
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
+    use std::path::PathBuf;
     use std::sync::atomic::Ordering;
     use std::time::Duration;
 
     use bytes::Bytes;
-    use data_mover::dir_tree::NdxEvent;
-    use data_mover::{DataChunk, create_storage};
+    use data_mover::dir_tree::{DirPageResult, NdxEntry, NdxEvent};
+    use data_mover::{DataChunk, NASEntry, create_storage};
     use tempfile::tempdir;
     use tokio::sync::mpsc;
     use transport::in_process::create_in_process_pair;
@@ -300,6 +382,30 @@ mod tests {
             elapsed_secs: 0.0,
             speed_bytes_per_sec: 0.0,
         }
+    }
+
+    fn nas_entry(name: &str, relative_path: PathBuf, is_dir: bool) -> Arc<EntryEnum> {
+        Arc::new(EntryEnum::NAS(NASEntry {
+            name: name.into(),
+            relative_path,
+            extension: None,
+            is_dir,
+            size: 0,
+            atime: 0,
+            ctime: 0,
+            mtime: 0,
+            mode: if is_dir { 0o755 } else { 0o644 },
+            is_symlink: false,
+            hard_links: None,
+            uid: None,
+            gid: None,
+            ino: None,
+            file_handle: None,
+            acl: None,
+            owner: None,
+            owner_group: None,
+            xattrs: None,
+        }))
     }
 
     #[tokio::test]
@@ -573,5 +679,65 @@ mod tests {
             }) if ndx == indexed.ndx
         ));
         assert_eq!(state.counts(), (0, 1));
+    }
+
+    #[tokio::test]
+    async fn unsafe_subdirectory_is_rejected_before_storage_mutation() {
+        let dest_dir = tempdir().unwrap();
+        let dest_storage = create_storage(dest_dir.path().to_str().unwrap(), None, true)
+            .await
+            .unwrap();
+        let escape_name = format!("terrasync-unsafe-{}", std::process::id());
+        let escape_path = PathBuf::from("..").join(&escape_name);
+        let page = DirPageResult {
+            dir_path: String::new(),
+            ndx_start: 0,
+            files: vec![],
+            subdirs: vec![NdxEntry {
+                ndx: 0,
+                entry: nas_entry(&escape_name, escape_path, true),
+            }],
+            gap_ndx: -1,
+        };
+        let (sender_transport, receiver_transport) = create_in_process_pair();
+        let mut state = RemoteSessionState::default();
+        let mut dest_index = DestIndex::new();
+
+        state
+            .handle_directory_lifecycle(&receiver_transport, &dest_storage, &page, &mut dest_index, false)
+            .await;
+
+        assert!(matches!(
+            sender_transport.recv().await,
+            Some(ReceiverMsg::EntryError { .. })
+        ));
+        assert!(!dest_dir.path().parent().unwrap().join(escape_name).exists());
+    }
+
+    #[tokio::test]
+    async fn orphan_part_file_is_preserved_when_target_deletion_is_enabled() {
+        let dest_dir = tempdir().unwrap();
+        let part_name = "keep.txt.terrasync-part";
+        fs::write(dest_dir.path().join(part_name), b"partial").unwrap();
+        let dest_storage = create_storage(dest_dir.path().to_str().unwrap(), None, true)
+            .await
+            .unwrap();
+        let page = DirPageResult {
+            dir_path: String::new(),
+            ndx_start: 0,
+            files: vec![],
+            subdirs: vec![],
+            gap_ndx: -1,
+        };
+        let (_sender_transport, receiver_transport) = create_in_process_pair();
+        let mut state = RemoteSessionState::default();
+        let mut dest_index = DestIndex::new();
+        dest_index.insert(nas_entry(part_name, PathBuf::from(part_name), false));
+
+        state
+            .handle_directory_lifecycle(&receiver_transport, &dest_storage, &page, &mut dest_index, true)
+            .await;
+
+        assert!(dest_dir.path().join(part_name).exists());
     }
 }
