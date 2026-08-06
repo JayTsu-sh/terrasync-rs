@@ -7,9 +7,9 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use data_mover::StorageEnum;
+use data_mover::{EntryEnum, StorageEnum};
 use tokio::sync::mpsc::Receiver;
-use transport::message::{FeatureFlags, ProgressSnapshot, SessionConfig};
+use transport::message::{FeatureFlags, NdxTable, ProgressSnapshot, ReceiverMsg, SessionConfig, TransferDecision};
 use transport::traits::ReceiverTransport;
 
 use crate::error::Result;
@@ -19,7 +19,7 @@ use crate::receiver::{ReceiverProgress, recv_file_list_and_data_phase};
 ///
 /// 所有结束判断都通过该类型完成，避免消息分支各自复制计数与 `TransferDone` 条件。
 #[derive(Debug, Default)]
-pub(crate) struct TransferLedger {
+struct TransferLedger {
     requested: u64,
     completed: u64,
     transfer_done_seen: bool,
@@ -27,12 +27,12 @@ pub(crate) struct TransferLedger {
 }
 
 impl TransferLedger {
-    pub(crate) fn record_request(&mut self) {
+    fn record_request(&mut self) {
         self.requested += 1;
     }
 
     /// 记录带 ndx 的首次终态；重复终态不改变完成计数。
-    pub(crate) fn record_terminal(&mut self, ndx: i32) -> bool {
+    fn record_terminal(&mut self, ndx: i32) -> bool {
         if !self.terminated_ndx.insert(ndx) {
             return false;
         }
@@ -41,20 +41,105 @@ impl TransferLedger {
     }
 
     /// 记录协议中不携带 ndx 的 entry 终态（例如符号链接）。
-    pub(crate) fn record_unindexed_terminal(&mut self) {
+    fn record_unindexed_terminal(&mut self) {
         self.completed += 1;
     }
 
-    pub(crate) fn observe_transfer_done(&mut self) {
+    fn observe_transfer_done(&mut self) {
         self.transfer_done_seen = true;
     }
 
-    pub(crate) fn is_complete(&self) -> bool {
+    fn is_complete(&self) -> bool {
         self.transfer_done_seen && self.completed >= self.requested
     }
 
-    pub(crate) fn counts(&self) -> (u64, u64) {
+    fn counts(&self) -> (u64, u64) {
         (self.completed, self.requested)
+    }
+}
+
+/// Receiver session 当前已迁移的协调状态。
+#[derive(Debug, Default)]
+pub(crate) struct RemoteSessionState {
+    ledger: TransferLedger,
+    ndx_table: NdxTable,
+}
+
+impl RemoteSessionState {
+    pub(crate) fn ingest_page(&mut self, page: &data_mover::dir_tree::DirPageResult) {
+        self.ndx_table.ingest_page(page);
+    }
+
+    pub(crate) fn indexed_entry(&self, ndx: i32) -> Option<&Arc<EntryEnum>> {
+        self.ndx_table.get(ndx)
+    }
+
+    pub(crate) fn indexed_len(&self) -> usize {
+        self.ndx_table.len()
+    }
+
+    pub(crate) fn record_request(&mut self) {
+        self.ledger.record_request();
+    }
+
+    /// 处理不需要 delta implementation 的基础分类。返回该分类是否已完成处理。
+    pub(crate) async fn handle_base_classification(
+        &mut self, transport: &(dyn ReceiverTransport + 'static), dest: &StorageEnum, progress: &ReceiverProgress,
+        ndx: i32, entry: &Arc<EntryEnum>, decision: TransferDecision,
+    ) -> bool {
+        match decision {
+            TransferDecision::FullTransfer => {
+                let _ = transport.send(ReceiverMsg::TransferRequest { ndx, decision }).await;
+                self.ledger.record_request();
+                true
+            }
+            TransferDecision::MetadataOnly => {
+                let _ = dest.set_entry_metadata(entry).await;
+                progress
+                    .metadata_only
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let _ = transport
+                    .send(ReceiverMsg::Classified {
+                        entry: entry.clone(),
+                        decision,
+                    })
+                    .await;
+                true
+            }
+            TransferDecision::Skip => {
+                progress
+                    .files_skipped
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let _ = transport
+                    .send(ReceiverMsg::Classified {
+                        entry: entry.clone(),
+                        decision,
+                    })
+                    .await;
+                true
+            }
+            TransferDecision::DeltaTransfer | TransferDecision::Deleted => false,
+        }
+    }
+
+    pub(crate) fn record_terminal(&mut self, ndx: i32) -> bool {
+        self.ledger.record_terminal(ndx)
+    }
+
+    pub(crate) fn record_unindexed_terminal(&mut self) {
+        self.ledger.record_unindexed_terminal();
+    }
+
+    pub(crate) fn observe_transfer_done(&mut self) {
+        self.ledger.observe_transfer_done();
+    }
+
+    pub(crate) fn is_complete(&self) -> bool {
+        self.ledger.is_complete()
+    }
+
+    pub(crate) fn counts(&self) -> (u64, u64) {
+        self.ledger.counts()
     }
 }
 
@@ -85,7 +170,7 @@ impl RemoteReceiverSession {
     pub async fn run(
         self, transport: &(dyn ReceiverTransport + 'static), progress_rx: Receiver<ProgressSnapshot>,
     ) -> Result<()> {
-        let mut ledger = TransferLedger::default();
+        let mut state = RemoteSessionState::default();
         recv_file_list_and_data_phase(
             transport,
             &self.dest_storage,
@@ -94,7 +179,7 @@ impl RemoteReceiverSession {
             self.delta_size_threshold,
             &self.progress,
             progress_rx,
-            &mut ledger,
+            &mut state,
         )
         .await
     }
@@ -104,6 +189,8 @@ impl RemoteReceiverSession {
 #[allow(clippy::expect_used, clippy::unwrap_used)]
 mod tests {
     use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+    use std::sync::atomic::Ordering;
     use std::time::Duration;
 
     use bytes::Bytes;
@@ -282,5 +369,95 @@ mod tests {
             .expect("empty session should finish after TransferDone")
             .unwrap()
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn mixed_page_base_classifications_share_session_state_and_observable_outputs() {
+        let src_dir = tempdir().unwrap();
+        let dest_dir = tempdir().unwrap();
+        fs::write(src_dir.path().join("full.txt"), b"new").unwrap();
+        fs::write(src_dir.path().join("meta.txt"), b"same meta content").unwrap();
+        fs::write(src_dir.path().join("skip.txt"), b"same skip content").unwrap();
+        fs::write(dest_dir.path().join("meta.txt"), b"same meta content").unwrap();
+        fs::write(dest_dir.path().join("skip.txt"), b"same skip content").unwrap();
+        fs::set_permissions(dest_dir.path().join("meta.txt"), fs::Permissions::from_mode(0o600)).unwrap();
+
+        let src_storage = create_storage(src_dir.path().to_str().unwrap(), None, false)
+            .await
+            .unwrap();
+        let walk = src_storage.walkdir_2(None, None, None, None, 4, false).await.unwrap();
+        let page = match walk.next().await {
+            Some(NdxEvent::Page(page)) => page,
+            other => panic!("expected mixed file page, got {other:?}"),
+        };
+        assert_eq!(page.files.len(), 3);
+
+        let dest_storage = create_storage(dest_dir.path().to_str().unwrap(), None, true)
+            .await
+            .unwrap();
+        let (sender_transport, receiver_transport) = create_in_process_pair();
+        let progress = ReceiverProgress::new();
+        let mut state = RemoteSessionState::default();
+        state.ingest_page(&page);
+
+        for indexed in &page.files {
+            let decision = match indexed.entry.get_name() {
+                "full.txt" => TransferDecision::FullTransfer,
+                "meta.txt" => TransferDecision::MetadataOnly,
+                "skip.txt" => TransferDecision::Skip,
+                other => panic!("unexpected entry {other}"),
+            };
+            assert!(
+                state
+                    .handle_base_classification(
+                        &receiver_transport,
+                        &dest_storage,
+                        &progress,
+                        indexed.ndx,
+                        &indexed.entry,
+                        decision,
+                    )
+                    .await
+            );
+        }
+
+        let mut saw_full = false;
+        let mut saw_metadata = false;
+        let mut saw_skip = false;
+        for _ in 0..3 {
+            match sender_transport.recv().await {
+                Some(ReceiverMsg::TransferRequest {
+                    decision: TransferDecision::FullTransfer,
+                    ..
+                }) => saw_full = true,
+                Some(ReceiverMsg::Classified {
+                    decision: TransferDecision::MetadataOnly,
+                    ..
+                }) => saw_metadata = true,
+                Some(ReceiverMsg::Classified {
+                    decision: TransferDecision::Skip,
+                    ..
+                }) => saw_skip = true,
+                other => panic!("unexpected base classification output: {other:?}"),
+            }
+        }
+
+        assert!(saw_full && saw_metadata && saw_skip);
+        assert_eq!(state.indexed_len(), 3);
+        assert_eq!(state.counts(), (0, 1));
+        assert_eq!(progress.metadata_only.load(Ordering::Relaxed), 1);
+        assert_eq!(progress.files_skipped.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            fs::metadata(dest_dir.path().join("meta.txt"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o644
+        );
+        assert_eq!(
+            fs::read(dest_dir.path().join("skip.txt")).unwrap(),
+            b"same skip content"
+        );
     }
 }
