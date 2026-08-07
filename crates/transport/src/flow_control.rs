@@ -206,6 +206,10 @@ impl SenderCreditState {
         }
         loop {
             let notified = self.notify.notified();
+            tokio::pin!(notified);
+            // `notify_waiters` does not retain a permit. Register before checking
+            // the ledger so grant/close cannot land between the check and await.
+            notified.as_mut().enable();
             {
                 let mut ledger = self.ledger.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
                 if ledger.closed {
@@ -216,7 +220,7 @@ impl SenderCreditState {
                     return Ok(());
                 }
             }
-            notified.await;
+            notified.as_mut().await;
         }
     }
 
