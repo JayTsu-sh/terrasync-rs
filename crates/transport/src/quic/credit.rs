@@ -65,6 +65,8 @@
 //! 不受本 issue 影响），`SenderCreditState` 管"别把 Receiver 内存打爆"（Sender 发送端，本
 //! 模块新增）。
 
+use std::sync::atomic::{AtomicUsize, Ordering};
+
 // 外部 crate
 use tokio::sync::Semaphore;
 
@@ -138,12 +140,21 @@ impl Default for ReceiverCreditState {
 /// 字节级 credit 流控窗口（issue #59 方案 b），语义与死锁防护见模块文档
 pub(crate) struct SenderCreditState {
     semaphore: Semaphore,
+    capacity: usize,
+    available: AtomicUsize,
 }
 
 /// Separates transport-internal grants from application-visible messages.
 pub(crate) enum SenderCreditOutcome {
-    Consumed,
+    Consumed(CreditGrantOutcome),
     Forward(ReceiverMsg),
+}
+
+/// Exact result of applying a grant without allowing capacity inflation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct CreditGrantOutcome {
+    pub(crate) applied: u64,
+    pub(crate) discarded: u64,
 }
 
 impl SenderCreditState {
@@ -156,6 +167,8 @@ impl SenderCreditState {
         })?;
         Ok(Self {
             semaphore: Semaphore::new(permits),
+            capacity: permits,
+            available: AtomicUsize::new(permits),
         })
     }
 
@@ -163,6 +176,13 @@ impl SenderCreditState {
     /// 后自动被唤醒——`Semaphore` 的阻塞语义结构性地保证 outstanding 不会被扣成负数，
     /// 不需要额外的原子计数器自己维护下界。
     pub(crate) async fn acquire(&self, bytes: u64) -> Result<()> {
+        let capacity = u64::try_from(self.capacity).unwrap_or(u64::MAX);
+        if bytes > capacity {
+            return Err(TransportError::CreditCostExceedsWindow {
+                cost: bytes,
+                window: capacity,
+            });
+        }
         let mut remaining = bytes;
         while remaining > 0 {
             let chunk = remaining.min(MAX_ACQUIRE_CHUNK_BYTES);
@@ -175,23 +195,39 @@ impl SenderCreditState {
                 .map_err(|e| TransportError::SendFailed(format!("credit window closed: {e}")))?;
             // 消费掉这批 permits，不归还——归还只能通过 grant() 显式补充
             permit.forget();
+            self.available.fetch_sub(n as usize, Ordering::AcqRel);
             remaining -= chunk;
         }
         Ok(())
     }
 
     /// 补授 `bytes` credit（Receiver 半窗批量授信后由 `QuicSenderTransport::recv()` 调用）
-    pub(crate) fn grant(&self, bytes: u64) {
-        let n = usize::try_from(bytes).unwrap_or(usize::MAX);
-        self.semaphore.add_permits(n);
+    pub(crate) fn grant(&self, bytes: u64) -> CreditGrantOutcome {
+        let requested = usize::try_from(bytes).unwrap_or(usize::MAX);
+        let mut current = self.available.load(Ordering::Acquire);
+        let applied = loop {
+            let applied = requested.min(self.capacity.saturating_sub(current));
+            match self
+                .available
+                .compare_exchange_weak(current, current + applied, Ordering::AcqRel, Ordering::Acquire)
+            {
+                Ok(_) => break applied,
+                Err(observed) => current = observed,
+            }
+        };
+        if applied > 0 {
+            self.semaphore.add_permits(applied);
+        }
+        let applied = u64::try_from(applied).unwrap_or(u64::MAX);
+        CreditGrantOutcome {
+            applied,
+            discarded: bytes.saturating_sub(applied),
+        }
     }
 
     pub(crate) fn apply_incoming(&self, message: ReceiverMsg) -> SenderCreditOutcome {
         match message {
-            ReceiverMsg::CreditGrant { bytes, .. } => {
-                self.grant(bytes);
-                SenderCreditOutcome::Consumed
-            }
+            ReceiverMsg::CreditGrant { bytes, .. } => SenderCreditOutcome::Consumed(self.grant(bytes)),
             message => SenderCreditOutcome::Forward(message),
         }
     }
@@ -267,7 +303,10 @@ mod tests {
 
         assert!(matches!(
             credit.apply_incoming(ReceiverMsg::CreditGrant { bytes: 4, ndx: None }),
-            SenderCreditOutcome::Consumed
+            SenderCreditOutcome::Consumed(CreditGrantOutcome {
+                applied: 0,
+                discarded: 4,
+            })
         ));
         assert!(matches!(
             credit.apply_incoming(ReceiverMsg::RequestsDone),
@@ -290,6 +329,43 @@ mod tests {
                 .await
                 .unwrap()
                 .unwrap()
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn oversized_frame_fails_without_waiting() {
+        let credit = SenderCreditState::new(8).unwrap();
+
+        assert!(matches!(
+            credit.acquire(9).await,
+            Err(TransportError::CreditCostExceedsWindow { cost: 9, window: 8 })
+        ));
+    }
+
+    #[tokio::test]
+    async fn duplicate_and_excess_grants_never_inflate_capacity() {
+        let credit = SenderCreditState::new(8).unwrap();
+        credit.acquire(8).await.unwrap();
+
+        assert_eq!(
+            credit.grant(12),
+            CreditGrantOutcome {
+                applied: 8,
+                discarded: 4,
+            }
+        );
+        assert_eq!(
+            credit.grant(8),
+            CreditGrantOutcome {
+                applied: 0,
+                discarded: 8,
+            }
+        );
+        credit.acquire(8).await.unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), credit.acquire(1))
+                .await
                 .is_err()
         );
     }

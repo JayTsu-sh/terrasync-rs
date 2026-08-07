@@ -43,6 +43,10 @@ pub enum TransportError {
     /// Accepted-byte accumulation exceeded the representable connection total.
     #[error("Credit accounting overflow")]
     CreditAccountingOverflow,
+
+    /// One serialized data frame cannot be admitted without exceeding the window.
+    #[error("Credit cost {cost} exceeds configured window {window}")]
+    CreditCostExceedsWindow { cost: u64, window: u64 },
 }
 
 pub type Result<T> = std::result::Result<T, TransportError>;

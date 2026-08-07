@@ -120,7 +120,15 @@ pub(crate) async fn connect_with_credit_window(
     reader_tasks.push(tokio::spawn(async move {
         while let Some(msg) = raw_incoming_rx.recv().await {
             match filter_credit.apply_incoming(msg) {
-                SenderCreditOutcome::Consumed => {}
+                SenderCreditOutcome::Consumed(outcome) => {
+                    if outcome.discarded > 0 {
+                        tracing::warn!(
+                            "[QUIC Sender] discarded {} excess credit bytes (applied {})",
+                            outcome.discarded,
+                            outcome.applied
+                        );
+                    }
+                }
                 SenderCreditOutcome::Forward(other) => {
                     if app_tx.send(other).is_err() {
                         break;
