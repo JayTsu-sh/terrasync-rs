@@ -17,7 +17,7 @@ use data_mover::{ConsistencyCheck, EntryEnum, StorageEnum, WalkDirAsyncIterator2
 use sync_delta::DeltaToken;
 use sync_delta::matcher::DeltaMatcher;
 use tokio::sync::Mutex as AsyncMutex;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 use transport::message::{BlockSignature, NdxTable, ProgressSnapshot, SenderMsg, TransferDecision};
 use transport::traits::SenderTransport;
 
@@ -141,9 +141,16 @@ impl<'a> RemoteSenderSession<'a> {
         }
     }
 
-    pub(super) async fn run(mut self, completed_paths: &mut HashSet<String>) -> Result<RemoteSenderSessionSummary> {
+    pub(super) async fn run(mut self) -> Result<RemoteSenderSessionSummary> {
         let ndx_table = Mutex::new(NdxTable::new());
         let mut ledger = SenderSessionLedger::new();
+        let mut completed_paths = load_checkpoint(self.deps.checkpoint_path).await;
+        if !completed_paths.is_empty() {
+            info!(
+                "[Sender Remote] Loaded checkpoint: {} entries already completed",
+                completed_paths.len()
+            );
+        }
         self.transition(RemoteSenderSessionLifecycle::RequestsOpen);
         let advertise = async {
             advertise_file_list(
@@ -162,7 +169,7 @@ impl<'a> RemoteSenderSession<'a> {
                 &ndx_table,
                 self.deps.qos,
                 self.deps.enable_acl,
-                completed_paths,
+                &mut completed_paths,
                 self.deps.checkpoint_path,
                 self.deps.stats_consumer,
                 &mut ledger,
@@ -179,6 +186,7 @@ impl<'a> RemoteSenderSession<'a> {
             }
         };
         let request_summary = ledger.finish();
+        save_or_clear_checkpoint(self.deps.checkpoint_path, &completed_paths, request_summary.error_count).await;
         if request_summary.transfer_done_sent {
             self.transition(RemoteSenderSessionLifecycle::TransferDoneSent);
         }
@@ -491,6 +499,49 @@ pub(super) fn classification_to_stats_message(
         }),
         TransferDecision::Skip => None,
         TransferDecision::Deleted => Some(StorageEntryMessage::Deleted(entry)),
+    }
+}
+
+pub(super) async fn record_success_and_checkpoint(
+    relative_path: Option<String>, ledger: &mut SenderSessionLedger, completed_paths: &mut HashSet<String>,
+    checkpoint_path: &Path,
+) {
+    let success_count = ledger.record_success();
+    if let Some(path) = relative_path {
+        completed_paths.insert(path);
+    }
+    if success_count.is_multiple_of(100)
+        && let Ok(data) = serde_json::to_string(&completed_paths)
+    {
+        let _ = tokio::fs::write(checkpoint_path, data).await;
+    }
+}
+
+async fn load_checkpoint(path: &Path) -> HashSet<String> {
+    match tokio::fs::read_to_string(path).await {
+        Ok(data) if !data.is_empty() => serde_json::from_str(&data).unwrap_or_else(|error| {
+            warn!("[Sender Remote] Checkpoint 解析失败: {error}, 将从头开始");
+            HashSet::new()
+        }),
+        Ok(_) => HashSet::new(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => HashSet::new(),
+        Err(error) => {
+            warn!("[Sender Remote] 读取 checkpoint 失败: {error}, 将从头开始");
+            HashSet::new()
+        }
+    }
+}
+
+async fn save_or_clear_checkpoint(path: &Path, completed_paths: &HashSet<String>, error_count: u64) {
+    if error_count == 0 {
+        let _ = tokio::fs::remove_file(path).await;
+        info!("[Sender Remote] Checkpoint cleared (all entries succeeded)");
+    } else if let Ok(data) = serde_json::to_string(completed_paths) {
+        let _ = tokio::fs::write(path, data).await;
+        info!(
+            "[Sender Remote] Checkpoint saved: {} entries completed",
+            completed_paths.len()
+        );
     }
 }
 

@@ -13,6 +13,7 @@ mod remote_sender_session;
 
 #[cfg(test)]
 use remote_sender_session::advertise_file_list;
+use remote_sender_session::record_success_and_checkpoint;
 use remote_sender_session::{RemoteSenderSession, RemoteSenderSessionDeps};
 use remote_sender_session::{SenderSessionLedger, SourceTransferOutcome, send_delta_transfer, send_full_transfer};
 use remote_sender_session::{apply_progress, record_classification, record_copy_error};
@@ -124,16 +125,9 @@ pub(crate) async fn run(
         )
         .await?;
 
-    // ── 5. QoS 管理器 + checkpoint 加载 ──
+    // ── 5. QoS 管理器；checkpoint lifecycle 由 negotiated session 持有 ──
     let qos_manager = create_qos_manager(config.qos.as_ref(), config.peak_qos_rate, config.iops);
     let checkpoint_path = std::path::PathBuf::from(&config.job_dir).join("remote_checkpoint.json");
-    let mut completed_paths = load_checkpoint(&checkpoint_path).await;
-    if !completed_paths.is_empty() {
-        info!(
-            "[Sender Remote] Loaded checkpoint: {} entries already completed",
-            completed_paths.len()
-        );
-    }
 
     // ── 6+7+8. 文件列表发送 与 请求处理+Ack收集 并发运行（流水线，无阶段 barrier） ──
     let summary = RemoteSenderSession::new(RemoteSenderSessionDeps {
@@ -145,7 +139,7 @@ pub(crate) async fn run(
         checkpoint_path: &checkpoint_path,
         stats_consumer: &stats_consumer,
     })
-    .run(&mut completed_paths)
+    .run()
     .await?;
     info!(
         "[Sender Remote] File list sent: {} pages, {} entries",
@@ -157,8 +151,7 @@ pub(crate) async fn run(
         summary.success_count, summary.error_count
     );
 
-    // ── 9. Checkpoint 处理 + 清理 ──
-    save_or_clear_checkpoint(&checkpoint_path, &completed_paths, summary.error_count).await;
+    // ── 9. 资源清理 ──
     if let Some(ref qos) = qos_manager {
         qos.shutdown();
     }
@@ -421,59 +414,6 @@ async fn process_requests_and_acks(
     Ok(())
 }
 
-/// 记录一次成功（ndx 级 `Success` 与 Entry 级 `EntrySuccess` 共用同一份逻辑）：
-/// `success_count` 无条件 `+= 1`；`relative_path` 有值时写入 `completed_paths`
-/// （`Success{ndx}` 在 `ndx_table` 查不到 entry 时为 `None`，仍计入 `success_count`
-/// 但不记录路径，与原逻辑一致）；每满 100 个周期性落盘 checkpoint。
-async fn record_success_and_checkpoint(
-    relative_path: Option<String>, ledger: &mut SenderSessionLedger, completed_paths: &mut HashSet<String>,
-    checkpoint_path: &Path,
-) {
-    let success_count = ledger.record_success();
-    if let Some(path) = relative_path {
-        completed_paths.insert(path);
-    }
-    if success_count.is_multiple_of(100)
-        && let Ok(data) = serde_json::to_string(&completed_paths)
-    {
-        let _ = tokio::fs::write(checkpoint_path, data).await;
-    }
-}
-
-// ============================================================
-// Checkpoint 辅助
-// ============================================================
-
-/// 加载断点续传 checkpoint；文件不存在或解析失败时返回空集合。
-async fn load_checkpoint(path: &Path) -> HashSet<String> {
-    match tokio::fs::read_to_string(path).await {
-        Ok(data) if !data.is_empty() => serde_json::from_str(&data).unwrap_or_else(|e| {
-            warn!("[Sender Remote] Checkpoint 解析失败: {}, 将从头开始", e);
-            HashSet::new()
-        }),
-        Ok(_) => HashSet::new(),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => HashSet::new(),
-        Err(e) => {
-            warn!("[Sender Remote] 读取 checkpoint 失败: {}, 将从头开始", e);
-            HashSet::new()
-        }
-    }
-}
-
-/// 全部成功时删除 checkpoint；有错误时保存已完成条目供下次断点续传。
-async fn save_or_clear_checkpoint(path: &Path, completed_paths: &HashSet<String>, error_count: u64) {
-    if error_count == 0 {
-        let _ = tokio::fs::remove_file(path).await;
-        info!("[Sender Remote] Checkpoint cleared (all entries succeeded)");
-    } else if let Ok(data) = serde_json::to_string(completed_paths) {
-        let _ = tokio::fs::write(path, data).await;
-        info!(
-            "[Sender Remote] Checkpoint saved: {} entries completed",
-            completed_paths.len()
-        );
-    }
-}
-
 #[cfg(test)]
 #[allow(clippy::expect_used, clippy::unwrap_used)]
 mod tests {
@@ -587,8 +527,8 @@ mod tests {
             .await
             .unwrap();
 
-        let mut completed_paths = HashSet::new();
-        let checkpoint_path = src_dir.path().join("unused_checkpoint.json");
+        let checkpoint_path = dest_dir.path().join("unused_checkpoint.json");
+        fs::write(&checkpoint_path, r#"["previously-completed.txt"]"#).unwrap();
         let stats_consumer = test_stats_consumer();
         let summary = RemoteSenderSession::new(RemoteSenderSessionDeps {
             transport: &sender_transport,
@@ -599,7 +539,7 @@ mod tests {
             checkpoint_path: &checkpoint_path,
             stats_consumer: &stats_consumer,
         })
-        .run(&mut completed_paths)
+        .run()
         .await
         .unwrap();
 
@@ -611,6 +551,7 @@ mod tests {
         // EntrySuccess（与改造前一致，非本 issue 改动范围）；3 个文件全部走全量传输请求。
         assert_eq!(summary.transfer_count, 3, "应有 3 个文件走全量传输请求");
         assert_eq!(summary.error_count, 0, "不应有任何 EntryError");
+        assert!(!checkpoint_path.exists(), "成功会话应清理已有 checkpoint");
         assert_eq!(
             summary.success_count, 3,
             "3 个文件应全部收到 EntrySuccess，证明无消息丢失"
@@ -647,8 +588,6 @@ mod tests {
         });
         let stats_consumer = test_stats_consumer();
         let checkpoint_path = src_dir.path().join("unused_checkpoint.json");
-        let mut completed_paths = HashSet::new();
-
         let error = RemoteSenderSession::new(RemoteSenderSessionDeps {
             transport: &sender_transport,
             src_storage: &src_storage,
@@ -658,7 +597,7 @@ mod tests {
             checkpoint_path: &checkpoint_path,
             stats_consumer: &stats_consumer,
         })
-        .run(&mut completed_paths)
+        .run()
         .await
         .unwrap_err();
         peer.await.unwrap();
@@ -768,7 +707,6 @@ mod tests {
             .await
             .unwrap();
 
-        let mut completed_paths = HashSet::new();
         let checkpoint_path = src_dir.join("unused_checkpoint.json");
         let stats_consumer = test_stats_consumer();
         let summary = RemoteSenderSession::new(RemoteSenderSessionDeps {
@@ -780,7 +718,7 @@ mod tests {
             checkpoint_path: &checkpoint_path,
             stats_consumer: &stats_consumer,
         })
-        .run(&mut completed_paths)
+        .run()
         .await
         .unwrap();
 
@@ -907,6 +845,10 @@ mod tests {
 
         assert_eq!(success_count, 0);
         assert_eq!(error_count, 1, "连续两次 mismatch 应进入 Error 终态");
+        assert!(
+            src_dir.path().join("unused_checkpoint.json").exists(),
+            "部分失败应保留 checkpoint"
+        );
         assert!(
             finalize_run_result(error_count).is_ok(),
             "entry 级失败不应再使 finalize_run_result 返回 Err"
