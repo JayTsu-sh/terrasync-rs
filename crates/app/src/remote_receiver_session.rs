@@ -610,7 +610,7 @@ impl RemoteReceiverSession {
 }
 
 #[cfg(test)]
-#[allow(clippy::expect_used, clippy::unwrap_used)]
+#[allow(clippy::expect_used, clippy::field_reassign_with_default, clippy::unwrap_used)]
 mod tests {
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
@@ -1179,6 +1179,58 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn slow_bounded_sink_stops_accepting_additional_payloads_until_capacity_returns() {
+        let entry = nas_entry("slow.bin", PathBuf::from("slow.bin"), false);
+        let (_sender_transport, receiver_transport) = create_in_process_pair();
+        let (dc_tx, mut dc_rx) = mpsc::channel(1);
+        let mut state = RemoteSessionState::default();
+        assert!(state.begin_full(&dc_tx, 1, entry.clone()).await);
+        assert!(matches!(dc_rx.recv().await, Some(DiskCommitMsg::FileBegin { .. })));
+
+        assert!(
+            state
+                .accept_full_chunk(
+                    &receiver_transport,
+                    &dc_tx,
+                    entry.clone(),
+                    DataChunk {
+                        offset: 0,
+                        data: Bytes::from_static(b"a"),
+                    },
+                )
+                .await
+        );
+
+        let blocked = tokio::spawn(async move {
+            state
+                .accept_full_chunk(
+                    &receiver_transport,
+                    &dc_tx,
+                    entry,
+                    DataChunk {
+                        offset: 1,
+                        data: Bytes::from_static(b"b"),
+                    },
+                )
+                .await
+        });
+        tokio::task::yield_now().await;
+        assert!(
+            !blocked.is_finished(),
+            "a full bounded sink must stop accepting additional payloads"
+        );
+
+        assert!(matches!(dc_rx.recv().await, Some(DiskCommitMsg::FileChunk { .. })));
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), blocked)
+                .await
+                .unwrap()
+                .unwrap()
+        );
+        assert!(matches!(dc_rx.recv().await, Some(DiskCommitMsg::FileChunk { .. })));
     }
 
     #[tokio::test]
