@@ -407,4 +407,54 @@ mod tests {
         stuck_send.abort();
         sender.close().await.unwrap();
     }
+
+    /// A new QUIC connection starts with a fresh full window; credit consumed by
+    /// the previous connection is never carried across reconnect.
+    #[tokio::test]
+    async fn reconnect_resets_consumed_credit() {
+        const TINY_WINDOW: u64 = 8;
+
+        install_crypto_provider();
+        let (server_endpoint, server_addr) = create_server_endpoint();
+        let (observed_tx, mut observed_rx) = mpsc::channel(2);
+
+        let receiver_handle = tokio::spawn(async move {
+            for _ in 0..2 {
+                let incoming = server_endpoint.accept().await.unwrap();
+                let conn = incoming.await.unwrap();
+                let (_ctrl_send, _ctrl_recv) = conn.accept_bi().await.unwrap();
+                let (_fl_send, _fl_recv) = conn.accept_bi().await.unwrap();
+                let (_data_send, mut data_recv) = conn.accept_bi().await.unwrap();
+                let (_ack_send, _ack_recv) = conn.open_bi().await.unwrap();
+
+                let message =
+                    tokio::time::timeout(Duration::from_secs(2), framing::read_msg::<SenderMsg>(&mut data_recv))
+                        .await
+                        .expect("each new connection should send with a fresh window")
+                        .unwrap();
+                assert!(matches!(message, Some(SenderMsg::FileData { .. })));
+                observed_tx.send(()).await.unwrap();
+            }
+        });
+
+        for name in ["first.bin", "second.bin"] {
+            let sender = connect_with_credit_window(server_addr, "localhost", None, TINY_WINDOW)
+                .await
+                .unwrap();
+            sender
+                .send(SenderMsg::FileData {
+                    entry: dummy_file_entry(name),
+                    chunk: DataChunk {
+                        offset: 0,
+                        data: Bytes::from_static(b"12345678"),
+                    },
+                })
+                .await
+                .unwrap();
+            observed_rx.recv().await.unwrap();
+            sender.close().await.unwrap();
+        }
+
+        receiver_handle.await.unwrap();
+    }
 }

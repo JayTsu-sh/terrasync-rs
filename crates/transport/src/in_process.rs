@@ -78,3 +78,26 @@ impl ReceiverTransport for InProcessReceiverTransport {
         Ok(())
     }
 }
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+
+    /// Characterizes the current adapter seam before #109 aligns it with QUIC:
+    /// flow-control messages are still visible to the application consumer.
+    #[tokio::test]
+    async fn credit_grant_is_currently_visible_to_in_process_sender() {
+        let (sender, receiver) = create_in_process_pair();
+
+        receiver
+            .send(ReceiverMsg::CreditGrant { bytes: 32, ndx: None })
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            sender.recv().await,
+            Some(ReceiverMsg::CreditGrant { bytes: 32, ndx: None })
+        ));
+    }
+}
