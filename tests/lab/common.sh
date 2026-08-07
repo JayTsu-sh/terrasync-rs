@@ -19,6 +19,13 @@ LAB_CLICKHOUSE_PASSWORD="${LAB_CLICKHOUSE_PASSWORD:-}"
 LAB_FIXTURE_UID="${LAB_FIXTURE_UID:-1000}"
 LAB_FIXTURE_GID="${LAB_FIXTURE_GID:-1000}"
 
+# AWS SDK/urllib3 proxy bypass matching is host based and does not consistently
+# honor the runner's CIDR entries. Keep all lab control/data traffic direct,
+# including the bucket-style hostnames constructed by run-e2e.sh.
+LAB_NO_PROXY_HOSTS="${LAB_SOURCE_MGMT},${LAB_DEST_MGMT},${LAB_WORKER_MGMT},${LAB_SOURCE_DATA},${LAB_DEST_DATA},${LAB_WORKER_DATA},${LAB_S3_BUCKET}.${LAB_SOURCE_DATA},${LAB_S3_BUCKET}.${LAB_DEST_DATA},${LAB_S3_BUCKET}.${LAB_WORKER_DATA}"
+export NO_PROXY="${NO_PROXY:+${NO_PROXY},}${LAB_NO_PROXY_HOSTS}"
+export no_proxy="$NO_PROXY"
+
 clickhouse_query() {
   curl --noproxy '*' --fail --silent --show-error \
     --user "$LAB_CLICKHOUSE_USER:$LAB_CLICKHOUSE_PASSWORD" \

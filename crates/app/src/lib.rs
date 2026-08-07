@@ -42,6 +42,12 @@ pub mod orchestrator;
 /// 将 run_sync_remote 的各阶段逻辑提取为独立函数，降低单函数复杂度
 pub mod remote_sync;
 
+/// 双进程远端同步 Receiver 会话
+///
+/// 封装一次已协商会话的生命周期；当前版本保留既有事件循环作为内部实现，
+/// 后续重构可在不扩大调用方 interface 的前提下逐步迁移会话状态。
+pub mod remote_receiver_session;
+
 /// Receiver 侧逻辑
 ///
 /// 从 transport 接收消息，在目标存储上执行写入

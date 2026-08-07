@@ -292,7 +292,9 @@ impl SyncOrchestrator {
 
         info!(
             "Starting sync via orchestrator: job_id({}), src({}), dest({})",
-            c.job_id, c.src_path, c.dest_path
+            c.job_id,
+            data_mover::redact_storage_url(&c.src_path),
+            data_mover::redact_storage_url(&c.dest_path)
         );
 
         // ── 1. 加载配置 ──
@@ -634,7 +636,9 @@ impl SyncOrchestrator {
 
         info!(
             "Starting incremental sync via orchestrator: job_id({}), src({}), dest({})",
-            c.job_id, c.src_path, c.dest_path
+            c.job_id,
+            data_mover::redact_storage_url(&c.src_path),
+            data_mover::redact_storage_url(&c.dest_path)
         );
 
         // ── 1. 加载配置 ──

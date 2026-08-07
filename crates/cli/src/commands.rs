@@ -17,7 +17,7 @@ use std::sync::Arc;
 use app::config::SyncJobConfig;
 use app::orchestrator::SyncOrchestrator;
 use app::prelude::{integrity_check, parse_bandwidth_string, rm, scan, sync};
-use data_mover::create_storage;
+use data_mover::{create_storage, redact_storage_url};
 use tracing::info;
 use transport::quic;
 use utils::app_config::AppConfig;
@@ -355,7 +355,11 @@ pub async fn gui_cmd(host: &str, port: u16) -> Result<()> {
 /// 监听 QUIC 连接，接收 Sender 的分页文件列表，比较后请求传输。
 /// 生成的 TLS 证书写入 `tls_cert_out`，Sender 侧通过 `--tls-server-cert` 加载以防 MITM。
 pub async fn serve_cmd(listen: &str, dest_path: &str, tls_cert_out: &str, token: &Option<String>) -> Result<()> {
-    info!("Starting Receiver daemon on {}, dest: {}", listen, dest_path);
+    info!(
+        "Starting Receiver daemon on {}, dest: {}",
+        listen,
+        redact_storage_url(dest_path)
+    );
 
     // 1. 解析监听地址
     let listen_addr: SocketAddr = listen
@@ -364,7 +368,7 @@ pub async fn serve_cmd(listen: &str, dest_path: &str, tls_cert_out: &str, token:
 
     // 3. 创建目标端 StorageEnum
     let dest_storage = Arc::new(create_storage(dest_path, None, true).await?);
-    info!("Created destination storage for: {}", dest_path);
+    info!("Created destination storage for: {}", redact_storage_url(dest_path));
 
     // 4. bind QUIC endpoint，生成服务端证书 DER（不等待连接）
     let (endpoint, cert_der) = quic::bind(listen_addr)?;

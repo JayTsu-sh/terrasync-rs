@@ -5,7 +5,6 @@
 //! 双进程模式下 Receiver 仅拥有 dest storage（数据流模式，Phase 3）。
 
 // 标准库
-use std::collections::{HashMap, HashSet};
 use std::path::{Component, Path};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -13,20 +12,19 @@ use std::sync::atomic::{AtomicU64, Ordering};
 // 外部 crate
 use data_mover::qos::QosManager;
 use data_mover::{EntryEnum, StorageEnum};
-use tokio::sync::mpsc;
 use tokio::sync::mpsc::Receiver as MpscReceiver;
 use tracing::{Instrument, debug, error, info, info_span, trace, warn};
 use transport::error::TransportError;
 use transport::message::{
-    DcAck, DestIndex, DiskCommitMsg, FeatureFlags, FileOutcome, HandshakeResult, NdxTable, ProgressSnapshot,
-    ProtocolHandshake, ReceiverMsg, SenderMsg, SessionConfig, TransferDecision, credit_cost,
+    DcAck, DestIndex, DiskCommitMsg, FeatureFlags, HandshakeResult, ProgressSnapshot, ProtocolHandshake, ReceiverMsg,
+    SenderMsg, SessionConfig, TransferDecision,
 };
 use transport::quic::credit::DEFAULT_CREDIT_WINDOW_BYTES;
 use transport::traits::ReceiverTransport;
 
 // 内部模块
-use crate::byte_resume::is_part_file;
 use crate::error::{AppError, Result};
+use crate::remote_receiver_session::{RemoteReceiverSession, RemoteSessionState};
 use crate::sync::{ResumeOpts, copy_file_with_resume, parse_size, should_resume};
 
 // ============================================================
@@ -302,7 +300,9 @@ pub async fn receiver_task_remote(
     let session_config = recv_session_config(transport).await?;
     info!(
         "[Receiver Remote] SessionConfig: src_path={}, integrity={}, acl={}",
-        session_config.src_path, session_config.enable_integrity_check, session_config.enable_acl
+        data_mover::redact_storage_url(&session_config.src_path),
+        session_config.enable_integrity_check,
+        session_config.enable_acl
     );
     let delta_size_threshold = resolve_delta_size_threshold(&session_config.delta_size_threshold)?;
 
@@ -326,22 +326,19 @@ pub async fn receiver_task_remote(
     };
 
     // ── 阶段 1+2: 文件列表与数据流合并处理，无阶段 barrier（见函数入口文档） ──
-    recv_file_list_and_data_phase(
-        transport,
-        &dest_storage,
-        &session_config,
-        &negotiated_features,
+    let mut session = RemoteReceiverSession::new(
+        dest_storage,
+        session_config,
+        negotiated_features,
         delta_size_threshold,
-        &progress,
-        progress_rx,
-    )
-    .await?;
+        progress.clone(),
+    );
+    let run_result = session.run(transport, progress_rx).await;
 
     // 停止进度 reporter，发最终快照 + AllDone
     progress_reporter.abort();
-    let final_snapshot = progress.snapshot(start_time);
-    let _ = transport.send(ReceiverMsg::Progress(final_snapshot)).await;
-    let _ = transport.send(ReceiverMsg::AllDone).await;
+    run_result?;
+    session.finish(transport, start_time).await;
     info!("[Receiver Remote] Completed");
     Ok(())
 }
@@ -437,25 +434,6 @@ const DEFAULT_DELTA_SIZE_THRESHOLD_BYTES: u64 = 512 * 1024 * 1024;
 /// 共享同一个常量来源，避免两端窗口大小假设漂移。
 const CREDIT_GRANT_THRESHOLD_BYTES: u64 = DEFAULT_CREDIT_WINDOW_BYTES / 2;
 
-/// credit 累计消费达半窗口阈值时批量发放一次 grant（仿 TCP 延迟 ack）：累计 `consumed`
-/// 达到 `threshold` 才返回 `Some`，否则原地累加、返回 `None`。
-///
-/// 返回值是**实际累计的消费字节数**（而非固定的 `threshold` 常量）：消息大小通常不整除
-/// `threshold`，触发时的累计值可能略高于阈值，直接把这个精确值作为 grant 金额发出——
-/// 保证长期账目精确相等（授信总量 == 消费总量），不会因为改发恒定阈值而产生系统性
-/// drift（授信不足 = credit 泄漏，Sender 早晚耗尽窗口；授信过量 = 双计，突破记账不变量
-/// `outstanding ∈ [0, window]` 的上界）。
-fn accumulate_credit(consumed: &mut u64, delta: u64, threshold: u64) -> Option<u64> {
-    *consumed += delta;
-    if *consumed >= threshold {
-        let grant = *consumed;
-        *consumed = 0;
-        Some(grant)
-    } else {
-        None
-    }
-}
-
 /// 解析 `SessionConfig.delta_size_threshold`：`None` 时使用默认值 512MiB，`Some` 时复用
 /// `parse_size`（与 `block_size` 同款人类可读格式，如 "512MiB"）。超过该 size 的文件即使
 /// 数据不匹配也降级为全量传输（见 `recv_file_list_and_data_phase` 的 `DeltaTransfer` 分支）。
@@ -504,43 +482,21 @@ pub(crate) fn validate_relative_path(path: &Path) -> Result<()> {
 /// 后台 reader task 都不保证"写入更早的 stream 一定先于写入更晚的 stream 被对端处理完"，
 /// 小体积的 `TransferDone` 完全可能抢在大文件的 `FileData`/`EndOfFile` 之前就被收到并处理
 /// （两个真实子进程联调时用大文件实际触发过：收到 `TransferDone` 就直接跳出循环，丢了还在
-/// `Data` stream 上飞的文件）。因此改为显式计数：`requested_count`（发出过多少个
-/// `TransferRequest`/`DeltaTransferRequest`）与 `completed_count`（收到过多少个对应的
+/// `Data` stream 上飞的文件）。因此由 session ledger 记录发出过多少个
+/// `TransferRequest`/`DeltaTransferRequest`，以及收到过多少个对应的
 /// `EndOfFile`/`CreateSymlink` 完成处理），只有二者相等**且**已经见过 `TransferDone`，
 /// 才真正结束循环。
-async fn recv_file_list_and_data_phase(
+pub(crate) async fn recv_file_list_and_data_phase(
     transport: &(dyn ReceiverTransport + 'static), dest_storage: &Arc<StorageEnum>, session_config: &SessionConfig,
     negotiated_features: &FeatureFlags, delta_size_threshold: u64, progress: &Arc<ReceiverProgress>,
-    mut progress_rx: MpscReceiver<ProgressSnapshot>,
+    mut progress_rx: MpscReceiver<ProgressSnapshot>, state: &mut RemoteSessionState,
 ) -> Result<()> {
     info!("[Receiver Remote] Receiving file list and file data (pipelined, streaming mode)");
-    let mut ndx_table = NdxTable::new();
-    // ndx 级失败尝试计数（redo 决策用）：ndx → 已失败次数，见 decide_file_ack
-    let mut attempts: HashMap<i32, u8> = HashMap::new();
-    // 已终结的 ndx：redo 期间 dc task（全量路径 HardError）与 Sender 自检失败
-    // （SenderMsg::EntryError）可能各自独立上报同一 ndx 的终态，按 ndx 去重只在首次
-    // 生效，防止 completed_count 被多次计入导致主循环提前 break、丢在途文件（[1]）。
-    let mut terminated: HashSet<i32> = HashSet::new();
-    // TransferDone 与实际数据完成的解耦计数（见函数文档）
-    let mut requested_count: u64 = 0;
-    let mut completed_count: u64 = 0;
-    let mut transfer_done_seen = false;
-    // 全量文件是否走 disk-commit 流式路径：以是否见过 FileBegin 判定（而非 token 是否为空），
-    // 避免源端缩到 0 字节的 delta 传输（token 空且无 FileBegin）被误判为全量。
-    let mut full_active = false;
-    // delta 文件是否已向 disk-commit task 发过 DeltaBegin：镜像 full_active，首个属于该
-    // ndx 的 delta 数据事件（token 或 EndOfFile）才触发一次 DeltaBegin，见
-    // `ensure_delta_active` 文档（避免 FilePage 阶段流水线化发出多个
-    // DeltaTransferRequest、早于任何响应到达导致 dc_tx 收到乱序 DeltaBegin）。
-    let mut delta_active = false;
-    // 已创建的目录：所有文件传输完成后统一回写 mtime/mode(写子文件会把目录 mtime 顶到当前时间;
-    // 且 0500 等受限权限须在写完子项后才能设),对齐单进程 orchestrator 的目录 mtime 收尾。
-    let mut created_dirs: Vec<Arc<EntryEnum>> = Vec::new();
-    // credit 累计消费（issue #59 方案 b）：FileData/DeltaData 处理完成（送 dc_tx）后累加，
-    // 达半窗口阈值批量发一次 CreditGrant 并清零，见 `accumulate_credit`。选"送达即补"而非
+    // ndx 终态去重与完成判断由 session ledger 统一持有。
+    // credit 累计消费由 session state 持有：FileData/DeltaData 处理完成（送 dc_tx）后累加，
+    // 达半窗口阈值批量发一次 CreditGrant 并清零。选"送达即补"而非
     // "落盘才补"：时序上与落盘 ack 近似等价、落盘 ack 通路改动更大且窗口利用率更差、dc
     // 缓冲本身有界，三者共同构成确定的应用层积压上界（window + dc 固定缓冲常量）。
-    let mut credit_consumed: u64 = 0;
     // disk-commit task：全量/delta 文件均三段流式落盘（去整文件 BytesMut/token Vec）；ack
     // 经 unbounded channel 回流，避免路由 select 阻在 dc_tx.send 时不 drain ack → dc 阻在
     // ack_tx.send 的双向死锁。
@@ -553,6 +509,7 @@ async fn recv_file_list_and_data_phase(
         ack_tx,
         progress.clone(),
     ));
+    let mut transport_closed = false;
 
     loop {
         // 同时处理 transport 消息和 progress 上报
@@ -561,44 +518,27 @@ async fn recv_file_list_and_data_phase(
                 let _ = transport.send(ReceiverMsg::Progress(snapshot)).await;
             }
             // ── disk-commit task 回流的 ack（目录/符号链接直接透传；全量文件 outcome
-            //    交 decide_file_ack 做统一 redo 决策）──
+            //    交 session outcome policy 做统一 redo 决策）──
             Some(dc_ack) = ack_rx.recv() => {
                 match dc_ack {
                     DcAck::Entry(ack) => {
-                        let _ = transport.send(ack).await;
-                        completed_count += 1;
-                        if transfer_done_seen && completed_count >= requested_count {
+                        if state.handle_entry_outcome(transport, ack).await {
                             info!("[Receiver Remote] All transfers complete");
                             break;
                         }
                     }
                     DcAck::FileOutcome { ndx, outcome } => {
-                        if dispatch_file_outcome(
-                            transport,
-                            &mut attempts,
-                            &mut terminated,
-                            progress,
-                            ndx,
-                            outcome,
-                            &mut completed_count,
-                            requested_count,
-                            transfer_done_seen,
-                        )
-                        .await
-                        {
+                        if state.handle_file_outcome(transport, progress, ndx, outcome).await {
                             break;
                         }
                     }
                 }
             }
             msg = transport.recv() => {
-            // credit 花费口径与 Sender 侧扣减共用同一份 credit_cost（issue #59），
-            // 在 match 移动 msg 之前算好，FileData/DeltaData 分支据此累计消费。
-            let credit_delta = msg.as_ref().and_then(credit_cost);
             match msg {
             // ── 文件列表：FilePage → DestIndex 比较 → 发 TransferRequest/DeltaTransferRequest ──
             Some(SenderMsg::FilePage(page)) => {
-                ndx_table.ingest_page(&page);
+                state.ingest_page(&page);
 
                 // 构建该目录的 DestIndex（walkdir 目标端 depth=1）
                 let mut dest_index = DestIndex::new();
@@ -624,165 +564,38 @@ async fn recv_file_list_and_data_phase(
                 // Receiver 本地执行/判定，此前零 wire 流量，见 issue #23）
                 for nf in &page.files {
                     let decision = dest_index.check(&nf.entry);
-                    match decision {
-                        TransferDecision::FullTransfer => {
-                            let _ = transport.send(ReceiverMsg::TransferRequest { ndx: nf.ndx, decision }).await;
-                            requested_count += 1;
-                        }
-                        TransferDecision::DeltaTransfer if !negotiated_features.delta => {
-                            // delta 能力未协商成功（对端不支持）→ 降级为全量传输（wire 动作变了，
-                            // 分类判定不变：decision 仍是 DeltaTransfer，供 Sender 侧统计为 Changed）
-                            let _ = transport.send(ReceiverMsg::TransferRequest { ndx: nf.ndx, decision }).await;
-                            requested_count += 1;
-                        }
-                        TransferDecision::DeltaTransfer if nf.entry.get_size() > delta_size_threshold => {
-                            // 文件 size 超过 delta_size_threshold 门槛 → 降级为全量传输（同上，
-                            // wire 动作降级、分类判定不变），避免大文件 basis 全量读入内存 +
-                            // delta 重建峰值内存 ≈3× 文件大小的风险（issue #54 阶段 0）
-                            info!(
-                                "[Receiver Remote] {:?} size {} exceeds delta_size_threshold {} bytes, downgrading to full transfer",
-                                nf.entry.get_relative_path(),
-                                nf.entry.get_size(),
-                                delta_size_threshold
-                            );
-                            let _ = transport.send(ReceiverMsg::TransferRequest { ndx: nf.ndx, decision }).await;
-                            requested_count += 1;
-                        }
-                        TransferDecision::DeltaTransfer => {
-                            let size = nf.entry.get_size();
-                            let block_size = sync_delta::calculate_block_size(size);
-                            // 流式读 basis file：read_chunk_stream 按块读驱动签名状态机
-                            // 逐块喂入（不再整文件驻留 RAM，见 issue #54 阶段 1）
-                            let (mut basis_rx, basis_handle) =
-                                StorageEnum::read_chunk_stream(dest_storage, &nf.entry, None, None, false, 8);
-                            let mut sig_calc = sync_delta::signature::SignatureCalculator::new(block_size);
-                            while let Some(chunk) = basis_rx.recv().await {
-                                sig_calc.push(&chunk.data);
-                            }
-                            // 读任务收尾：JoinError 或内层读错误统一归一为原因字符串（与
-                            // Sender 侧源文件流式读点一致的归一模式）
-                            let basis_read_result = match basis_handle.await {
-                                Ok(inner) => inner.map_err(|e| e.to_string()),
-                                Err(e) => Err(e.to_string()),
-                            };
-                            match basis_read_result {
-                                Ok(_) => {
-                                    let signatures = sig_calc.finish();
-                                    let transport_sigs: Vec<transport::message::BlockSignature> = signatures
-                                        .into_iter()
-                                        .map(|s| transport::message::BlockSignature {
-                                            rolling: s.rolling,
-                                            strong: s.strong,
-                                        })
-                                        .collect();
-                                    let _ = transport
-                                        .send(ReceiverMsg::DeltaTransferRequest {
-                                            ndx: nf.ndx,
-                                            block_size,
-                                            signatures: transport_sigs,
-                                        })
-                                        .await;
-                                    requested_count += 1;
-                                }
-                                Err(e) => {
-                                    warn!(
-                                        "[Receiver Remote] 读取 basis file {:?} 失败: {}, 降级全量传输",
-                                        nf.entry.get_relative_path(),
-                                        e
-                                    );
-                                    let _ = transport.send(ReceiverMsg::TransferRequest { ndx: nf.ndx, decision }).await;
-                                    requested_count += 1;
-                                }
-                            }
-                        }
-                        TransferDecision::MetadataOnly => {
-                            let _ = dest_storage.set_entry_metadata(&nf.entry).await;
-                            progress.metadata_only.fetch_add(1, Ordering::Relaxed);
-                            let _ = transport
-                                .send(ReceiverMsg::Classified {
-                                    entry: nf.entry.clone(),
-                                    decision,
-                                })
-                                .await;
-                        }
-                        TransferDecision::Skip => {
-                            progress.files_skipped.fetch_add(1, Ordering::Relaxed);
-                            let _ = transport
-                                .send(ReceiverMsg::Classified {
-                                    entry: nf.entry.clone(),
-                                    decision,
-                                })
-                                .await;
-                        }
-                        TransferDecision::Deleted => {
-                            // DestIndex::check() 从不产生 Deleted（该分类只在下方
-                            // orphaned_entries() 路径产生）；此分支纯粹为满足 match 穷尽性检查。
-                            debug_assert!(false, "DestIndex::check() 不应返回 Deleted");
-                        }
-                    }
-                }
-
-                // 子目录在目标端创建
-                for ns in &page.subdirs {
-                    // 源端存在该子目录 → 目标端同名条目不是孤儿（须在 orphan 扫描前登记，
-                    // 与创建成功与否无关；不登记则预存子目录被误判孤儿 → 整树误删后重传）
-                    dest_index.mark_matched(&ns.entry);
-                    if let Err(e) = validate_relative_path(ns.entry.get_relative_path()) {
-                        warn!("[Receiver Remote] Rejecting unsafe subdir path: {}", e);
-                        let _ = transport
-                            .send(ReceiverMsg::EntryError {
-                                entry: ns.entry.clone(),
-                                reason: format!("{e}"),
-                            })
-                            .await;
+                    if state
+                        .handle_base_classification(transport, dest_storage, progress, nf.ndx, &nf.entry, decision)
+                        .await
+                    {
                         continue;
                     }
-                    if let Err(e) = dest_storage.create_dir_all(&ns.entry).await {
-                        warn!("[Receiver Remote] create_dir {:?}: {}", ns.entry.get_relative_path(), e);
+                    if state
+                        .handle_delta_classification(
+                            transport,
+                            dest_storage,
+                            negotiated_features,
+                            delta_size_threshold,
+                            nf.ndx,
+                            &nf.entry,
+                            decision,
+                        )
+                        .await
+                    {
+                        continue;
                     }
-                    // 目录 mtime/mode 待所有传输完成后统一回写（见 created_dirs 声明处）
-                    created_dirs.push(ns.entry.clone());
+                    debug_assert_eq!(decision, TransferDecision::Deleted, "all other classifications are handled");
                 }
 
-                // --delete-target: 删除目标端多余文件；成功发 Classified{Deleted}、
-                // 失败发 EntryError（此前失败只 warn! 静默吞掉，不计入任何统计/错误数）
-                if session_config.delete_target {
-                    for orphan in dest_index.orphaned_entries() {
-                        let path = orphan.get_relative_path();
-                        // 跳过续传临时文件：源端不存在同名 .terrasync-part 条目，
-                        // 会被误判为孤儿；删掉会破坏进行中的续传进度
-                        if is_part_file(path) {
-                            debug!("[Receiver Remote] Skipping in-progress part file: {:?}", path);
-                            continue;
-                        }
-                        let result = if orphan.get_is_dir() {
-                            info!("[Receiver Remote] Deleting orphaned dir: {:?}", path);
-                            dest_storage.delete_dir_all(orphan).await
-                        } else {
-                            info!("[Receiver Remote] Deleting orphaned file: {:?}", path);
-                            dest_storage.delete_file(orphan).await
-                        };
-                        match result {
-                            Ok(()) => {
-                                let _ = transport
-                                    .send(ReceiverMsg::Classified {
-                                        entry: orphan.clone(),
-                                        decision: TransferDecision::Deleted,
-                                    })
-                                    .await;
-                            }
-                            Err(e) => {
-                                warn!("[Receiver Remote] delete {:?}: {}", path, e);
-                                let _ = transport
-                                    .send(ReceiverMsg::EntryError {
-                                        entry: orphan.clone(),
-                                        reason: format!("{e}"),
-                                    })
-                                    .await;
-                            }
-                        }
-                    }
-                }
+                state
+                    .handle_directory_lifecycle(
+                        transport,
+                        dest_storage,
+                        &page,
+                        &mut dest_index,
+                        session_config.delete_target,
+                    )
+                    .await;
             }
             Some(SenderMsg::FileListError { path, reason }) => {
                 error!("[Receiver Remote] walkdir error {}: {}", path, reason);
@@ -790,15 +603,14 @@ async fn recv_file_list_and_data_phase(
             Some(SenderMsg::FileListDone) => {
                 info!(
                     "[Receiver Remote] File list complete, {} entries indexed",
-                    ndx_table.len()
+                    state.indexed_len()
                 );
                 let _ = transport.send(ReceiverMsg::RequestsDone).await;
             }
 
             // ── 文件开始：标记走全量流式路径，交 disk-commit task 起 resume_prepare + write_chunk_stream ──
             Some(SenderMsg::FileBegin { ndx, entry }) => {
-                full_active = true;
-                let _ = dc_tx.send(DiskCommitMsg::FileBegin { ndx, entry }).await;
+                state.begin_full(&dc_tx, ndx, entry).await;
             }
 
             // ── 数据流模式：目录 ──
@@ -825,8 +637,7 @@ async fn recv_file_list_and_data_phase(
                     let _ = transport
                         .send(ReceiverMsg::EntryError { entry, reason: format!("{e}") })
                         .await;
-                    completed_count += 1;
-                    if transfer_done_seen && completed_count >= requested_count {
+                    if state.complete_unindexed() {
                         info!("[Receiver Remote] All transfers complete");
                         break;
                     }
@@ -844,8 +655,7 @@ async fn recv_file_list_and_data_phase(
                             .await;
                     }
                 }
-                completed_count += 1;
-                if transfer_done_seen && completed_count >= requested_count {
+                if state.complete_unindexed() {
                     info!("[Receiver Remote] All transfers complete");
                     break;
                 }
@@ -853,50 +663,39 @@ async fn recv_file_list_and_data_phase(
 
             // ── 数据流模式：文件数据块 → 转发给 disk-commit task 的 write_chunk_stream ──
             Some(SenderMsg::FileData { entry, chunk }) => {
-                let _ = dc_tx.send(DiskCommitMsg::FileChunk { entry, chunk }).await;
-                if let Some(bytes) = credit_delta
-                    && let Some(grant) = accumulate_credit(&mut credit_consumed, bytes, CREDIT_GRANT_THRESHOLD_BYTES)
-                {
-                    let _ = transport.send(ReceiverMsg::CreditGrant { bytes: grant, ndx: None }).await;
+                let bytes = chunk.data.len() as u64;
+                if state.push_full_chunk(&dc_tx, entry, chunk).await {
+                    state.record_data_consumed(transport, bytes, CREDIT_GRANT_THRESHOLD_BYTES).await;
                 }
             }
 
             // ── Delta token 接收：逐 token 转发给 disk-commit task（不再攒整文件 Vec，见
             //    issue #54 阶段 3），首个属于该 ndx 的 token 先触发一次 DeltaBegin ──
             Some(SenderMsg::DeltaMatch { ndx, block_index }) => {
-                if let Some(entry) = ndx_table.get(ndx).cloned() {
-                    ensure_delta_active(&dc_tx, &mut delta_active, ndx, &entry).await;
-                    let _ = dc_tx.send(DiskCommitMsg::DeltaMatch { entry, block_index }).await;
+                if let Some(entry) = state.indexed_entry(ndx).cloned() {
+                    state.push_delta_match(&dc_tx, ndx, &entry, block_index).await;
                 } else {
                     warn!("[Receiver Remote] DeltaMatch for unknown ndx {}", ndx);
                 }
             }
             Some(SenderMsg::DeltaData { ndx, data }) => {
-                if let Some(entry) = ndx_table.get(ndx).cloned() {
-                    ensure_delta_active(&dc_tx, &mut delta_active, ndx, &entry).await;
-                    let _ = dc_tx.send(DiskCommitMsg::DeltaData { entry, data }).await;
+                let bytes = data.len() as u64;
+                if let Some(entry) = state.indexed_entry(ndx).cloned() {
+                    if state.push_delta_data(&dc_tx, ndx, &entry, data).await {
+                        state.record_data_consumed(transport, bytes, CREDIT_GRANT_THRESHOLD_BYTES).await;
+                    }
                 } else {
                     warn!("[Receiver Remote] DeltaData for unknown ndx {}", ndx);
-                }
-                if let Some(bytes) = credit_delta
-                    && let Some(grant) = accumulate_credit(&mut credit_consumed, bytes, CREDIT_GRANT_THRESHOLD_BYTES)
-                {
-                    let _ = transport.send(ReceiverMsg::CreditGrant { bytes: grant, ndx: None }).await;
                 }
             }
 
             // ── 文件结束：见过 FileBegin → 全量交 disk-commit task 收尾（读回 .part hash 校验 → 原子
-            //    rename）；否则是 delta 路径（含零 token 的空文件 delta，ensure_delta_active
-            //    幂等补发 DeltaBegin），同样交 disk-commit task 三段式收尾。completed_count 统一
-            //    在 dc ack 回流时才 +1（decide_file_ack 做 redo 决策，全量/delta 共用一份状态机）──
+            //    rename）；否则是 delta 路径（含零 token 的空文件 delta，session state
+            //    幂等补发 DeltaBegin），同样交 disk-commit task 三段式收尾。完成计数统一
+            //    在 dc ack 回流时才 +1（session outcome policy 做 redo 决策，全量/delta 共用一份状态机）──
             Some(SenderMsg::EndOfFile { ndx, entry, source_hash }) => {
-                if full_active {
-                    full_active = false;
-                    let _ = dc_tx.send(DiskCommitMsg::FileCommit { ndx, entry, source_hash }).await;
-                } else {
-                    ensure_delta_active(&dc_tx, &mut delta_active, ndx, &entry).await;
-                    delta_active = false;
-                    let _ = dc_tx.send(DiskCommitMsg::DeltaCommit { ndx, entry, source_hash }).await;
+                if !state.commit_full(&dc_tx, ndx, &entry, &source_hash).await {
+                    state.commit_delta(&dc_tx, ndx, &entry, &source_hash).await;
                 }
             }
 
@@ -910,12 +709,13 @@ async fn recv_file_list_and_data_phase(
             }
 
             Some(SenderMsg::TransferDone) => {
-                transfer_done_seen = true;
+                let complete = state.observe_transfer_done();
+                let (completed, requested) = state.counts();
                 debug!(
                     "[Receiver Remote] TransferDone received ({}/{} data transfers completed so far)",
-                    completed_count, requested_count
+                    completed, requested
                 );
-                if completed_count >= requested_count {
+                if complete {
                     info!("[Receiver Remote] All transfers complete");
                     break;
                 }
@@ -926,181 +726,32 @@ async fn recv_file_list_and_data_phase(
             //    防止与 dc task 独立上报的终态重复计数（[1]）──
             Some(SenderMsg::EntryError { path, reason, ndx }) => {
                 warn!("[Receiver Remote] Sender EntryError {:?}: {} — 中止该文件", path, reason);
-                full_active = false;
-                delta_active = false;
-                let _ = dc_tx.send(DiskCommitMsg::AbortFile).await;
-                let should_break = if let Some(ndx) = ndx {
-                    record_ndx_completion(&mut terminated, ndx, &mut completed_count, requested_count, transfer_done_seen)
-                } else {
-                    // 双进程主循环下理应总带 ndx（单进程 tar 打包失败等无 ndx 场景走
-                    // receiver_task，不会到这里）；防御性兜底：仍完成一次计数，避免缺失
-                    // 关联导致 completed_count 永远打不平。
-                    completed_count += 1;
-                    transfer_done_seen && completed_count >= requested_count
-                };
+                let should_break = state.handle_source_failure(&dc_tx, ndx).await;
                 if should_break {
                     info!("[Receiver Remote] All transfers complete");
                     break;
                 }
             }
             Some(_) => {}
-            None => return Err(AppError::CopyError("Transport closed during file list/data phase".into())),
+            None => {
+                transport_closed = true;
+                break;
+            }
         }} // close match + select! msg arm
         } // close select!
     } // close loop
 
-    // 收尾：关闭 dc_tx → disk-commit task 处理完积压后退出；等待 join；drain 剩余 ack。
-    let _ = dc_tx.send(DiskCommitMsg::Shutdown).await;
-    drop(dc_tx);
-    dc_join
-        .await
-        .map_err(|e| AppError::CopyError(format!("disk-commit task join: {e}")))??;
-    while let Ok(dc_ack) = ack_rx.try_recv() {
-        match dc_ack {
-            DcAck::Entry(ack) => {
-                let _ = transport.send(ack).await;
-            }
-            DcAck::FileOutcome { ndx, outcome } => {
-                let _ = dispatch_file_outcome(
-                    transport,
-                    &mut attempts,
-                    &mut terminated,
-                    progress,
-                    ndx,
-                    outcome,
-                    &mut completed_count,
-                    requested_count,
-                    transfer_done_seen,
-                )
-                .await;
-            }
-        }
-    }
+    state
+        .shutdown_disk_commit(dc_tx, dc_join, &mut ack_rx, transport, progress, dest_storage)
+        .await?;
 
-    // 回写目录 mtime/mode：所有文件已落盘,此时设目录元数据不会再被子文件写入顶掉。
-    for dir_entry in &created_dirs {
-        if let Err(e) = dest_storage.set_entry_metadata(dir_entry).await {
-            warn!(
-                "[Receiver Remote] 回写目录元数据 {:?} 失败: {}",
-                dir_entry.get_relative_path(),
-                e
-            );
-        }
+    if transport_closed {
+        return Err(AppError::CopyError(
+            "Transport closed during file list/data phase".into(),
+        ));
     }
 
     Ok(())
-}
-
-/// ndx 级文件传输 redo 决策（方案 A 的统一决策点）
-///
-/// dc task（全量/delta 路径统一经 `disk_commit_task` 上报，见 issue #54 阶段 3）上报的
-/// outcome 在此统一转换为终态/重试 ack：
-/// - 校验失败（`HashMismatch`/`SizeMismatch`）·首次 → `Redo{ndx}`，不计入
-///   `completed_count`（文件仍在途）。
-/// - 校验失败·二次+ → `Error{ndx,reason}`，计入 `completed_count`。
-/// - 校验通过（`Success`）→ `Success{ndx}`，计入 `completed_count`。
-/// - 硬错误（`HardError`，非校验类）→ 直接 `Error{ndx,reason}` 终态，不 redo。
-///
-/// 返回 `(ack, is_terminal)`：`is_terminal=true` 时调用方需计入 `completed_count`。
-fn decide_file_ack(attempts: &mut HashMap<i32, u8>, ndx: i32, outcome: FileOutcome) -> (ReceiverMsg, bool) {
-    match outcome {
-        FileOutcome::Success => (ReceiverMsg::Success { ndx }, true),
-        FileOutcome::HashMismatch => redo_or_error(attempts, ndx, "hash mismatch"),
-        FileOutcome::SizeMismatch => redo_or_error(attempts, ndx, "size mismatch"),
-        FileOutcome::HardError(reason) => (ReceiverMsg::Error { ndx, reason }, true),
-    }
-}
-
-/// 校验失败类 outcome（`HashMismatch`/`SizeMismatch`）共用的重试计数：同一 ndx 首次 →
-/// `Redo{ndx}`，二次+ → `Error{ndx,reason}` 终态。
-fn redo_or_error(attempts: &mut HashMap<i32, u8>, ndx: i32, reason: &str) -> (ReceiverMsg, bool) {
-    let count = attempts.entry(ndx).or_insert(0);
-    *count += 1;
-    if *count >= 2 {
-        (
-            ReceiverMsg::Error {
-                ndx,
-                reason: reason.into(),
-            },
-            true,
-        )
-    } else {
-        (ReceiverMsg::Redo { ndx }, false)
-    }
-}
-
-/// `FileOutcome` 上报的统一处理入口（dc task 全量/delta 路径共用）：
-/// 调用 `decide_file_ack` 做 redo 决策；非终态（`Redo`）直接发 ack、不动
-/// `completed_count`。终态先按 `ndx` 去重（redo 期间 dc task 与 Sender 自检失败
-/// 可能各自独立上报同一 ndx 的终态，去重只在首次生效，见 [`record_ndx_completion`]）：
-/// 去重命中则连 ack 都不再发（避免 Sender 收到同一 ndx 的重复终态 ack），否则累加
-/// `progress.error_count`（若为 `Error`）、发 ack、计入 `completed_count`。
-///
-/// 返回是否应 break 主循环（`completed_count` 打平且已见过 `TransferDone`）。
-#[allow(clippy::too_many_arguments)]
-async fn dispatch_file_outcome(
-    transport: &(dyn ReceiverTransport + 'static), attempts: &mut HashMap<i32, u8>, terminated: &mut HashSet<i32>,
-    progress: &Arc<ReceiverProgress>, ndx: i32, outcome: FileOutcome, completed_count: &mut u64, requested_count: u64,
-    transfer_done_seen: bool,
-) -> bool {
-    let (ack, is_terminal) = decide_file_ack(attempts, ndx, outcome);
-    if !is_terminal {
-        let _ = transport.send(ack).await;
-        return false;
-    }
-    if terminated.contains(&ndx) {
-        debug!("[Receiver Remote] ndx {} 已终结，丢弃重复终态: {:?}", ndx, ack);
-        return false;
-    }
-    if matches!(ack, ReceiverMsg::Error { .. }) {
-        progress.error_count.fetch_add(1, Ordering::Relaxed);
-    }
-    let _ = transport.send(ack).await;
-    record_ndx_completion(terminated, ndx, completed_count, requested_count, transfer_done_seen)
-}
-
-/// ndx 首次终结时计入 `completed_count` 并判断是否应收尾 break；同一 ndx 的重复终结
-/// （已在 `terminated` 中）直接丢弃、返回 `false`，防止 redo 期间多个来源独立上报
-/// 同一 ndx 导致 `completed_count` 被多次计入、主循环提前 break 丢在途文件（[1]）。
-fn record_ndx_completion(
-    terminated: &mut HashSet<i32>, ndx: i32, completed_count: &mut u64, requested_count: u64, transfer_done_seen: bool,
-) -> bool {
-    if !terminated.insert(ndx) {
-        return false;
-    }
-    *completed_count += 1;
-    if transfer_done_seen && *completed_count >= requested_count {
-        info!("[Receiver Remote] All transfers complete");
-        return true;
-    }
-    false
-}
-
-/// 首个属于该 ndx 的 delta 数据事件（token 或 EndOfFile）才触发一次 `DeltaBegin`，幂等
-/// （`delta_active` 已为 `true` 时直接返回）。
-///
-/// 不能在 Receiver 发出 `DeltaTransferRequest` 时就触发：`FilePage` 阶段可能流水线化
-/// 连续发出多个 `DeltaTransferRequest`（不等待任何一个的响应），若在发送请求的同时就
-/// `DeltaBegin`，dc_tx 会收到与 Sender 实际数据流顺序不一致的 `DeltaBegin` 序列（dc
-/// task 严格串行、同一时刻只有一个 `ActiveFile`）。依据：Sender 侧
-/// `process_requests_and_acks` 单一消费者循环严格串行处理每个 ndx 的数据阶段（无并发
-/// spawn），故 Receiver 单一收消息循环里首个属于某 ndx 的 delta 数据事件必然对应"当前
-/// 正在流的文件"。
-async fn ensure_delta_active(
-    dc_tx: &mpsc::Sender<DiskCommitMsg>, delta_active: &mut bool, ndx: i32, entry: &Arc<EntryEnum>,
-) {
-    if *delta_active {
-        return;
-    }
-    let block_size = sync_delta::calculate_block_size(entry.get_size());
-    let _ = dc_tx
-        .send(DiskCommitMsg::DeltaBegin {
-            ndx,
-            entry: entry.clone(),
-            block_size,
-        })
-        .await;
-    *delta_active = true;
 }
 
 #[cfg(test)]
@@ -1127,90 +778,6 @@ mod tests {
         assert!(validate_relative_path(Path::new("/etc/passwd")).is_err());
     }
 
-    // ── decide_file_ack：ndx 级 redo 决策纯函数单测（方案 A 的核心状态机） ──
-
-    #[test]
-    fn decide_file_ack_success_is_terminal() {
-        let mut attempts = HashMap::new();
-        let (ack, is_terminal) = decide_file_ack(&mut attempts, 7, FileOutcome::Success);
-        assert!(matches!(ack, ReceiverMsg::Success { ndx: 7 }));
-        assert!(is_terminal);
-    }
-
-    #[test]
-    fn decide_file_ack_first_hash_mismatch_redos_and_is_not_terminal() {
-        let mut attempts = HashMap::new();
-        let (ack, is_terminal) = decide_file_ack(&mut attempts, 3, FileOutcome::HashMismatch);
-        assert!(matches!(ack, ReceiverMsg::Redo { ndx: 3 }));
-        assert!(!is_terminal);
-        assert_eq!(attempts.get(&3), Some(&1));
-    }
-
-    #[test]
-    fn decide_file_ack_second_hash_mismatch_errors_and_is_terminal() {
-        let mut attempts = HashMap::new();
-        let (first_ack, first_terminal) = decide_file_ack(&mut attempts, 3, FileOutcome::HashMismatch);
-        assert!(matches!(first_ack, ReceiverMsg::Redo { ndx: 3 }));
-        assert!(!first_terminal);
-
-        let (second_ack, second_terminal) = decide_file_ack(&mut attempts, 3, FileOutcome::HashMismatch);
-        match second_ack {
-            ReceiverMsg::Error { ndx: 3, reason } => assert_eq!(reason, "hash mismatch"),
-            other => panic!("expected Error, got {other:?}"),
-        }
-        assert!(second_terminal);
-    }
-
-    #[test]
-    fn decide_file_ack_first_size_mismatch_redos_and_is_not_terminal() {
-        let mut attempts = HashMap::new();
-        let (ack, is_terminal) = decide_file_ack(&mut attempts, 5, FileOutcome::SizeMismatch);
-        assert!(matches!(ack, ReceiverMsg::Redo { ndx: 5 }));
-        assert!(!is_terminal);
-        assert_eq!(attempts.get(&5), Some(&1));
-    }
-
-    #[test]
-    fn decide_file_ack_second_size_mismatch_errors_and_is_terminal() {
-        let mut attempts = HashMap::new();
-        let (first_ack, first_terminal) = decide_file_ack(&mut attempts, 5, FileOutcome::SizeMismatch);
-        assert!(matches!(first_ack, ReceiverMsg::Redo { ndx: 5 }));
-        assert!(!first_terminal);
-
-        let (second_ack, second_terminal) = decide_file_ack(&mut attempts, 5, FileOutcome::SizeMismatch);
-        match second_ack {
-            ReceiverMsg::Error { ndx: 5, reason } => assert_eq!(reason, "size mismatch"),
-            other => panic!("expected Error, got {other:?}"),
-        }
-        assert!(second_terminal);
-    }
-
-    #[test]
-    fn decide_file_ack_hard_error_is_terminal_without_redo() {
-        let mut attempts = HashMap::new();
-        let (ack, is_terminal) =
-            decide_file_ack(&mut attempts, 9, FileOutcome::HardError("resume_prepare failed".into()));
-        match ack {
-            ReceiverMsg::Error { ndx: 9, reason } => assert_eq!(reason, "resume_prepare failed"),
-            other => panic!("expected Error, got {other:?}"),
-        }
-        assert!(is_terminal);
-        // 硬错误不计入 attempts（不参与 redo 计数）
-        assert!(attempts.get(&9).is_none());
-    }
-
-    #[test]
-    fn decide_file_ack_different_ndx_track_attempts_independently() {
-        let mut attempts = HashMap::new();
-        let _ = decide_file_ack(&mut attempts, 1, FileOutcome::HashMismatch);
-        let (ack, is_terminal) = decide_file_ack(&mut attempts, 2, FileOutcome::HashMismatch);
-        assert!(
-            matches!(ack, ReceiverMsg::Redo { ndx: 2 }),
-            "ndx 2 应是首次失败，与 ndx 1 互不影响"
-        );
-        assert!(!is_terminal);
-    }
-
     // ── resolve_delta_size_threshold：delta size 门槛解析（issue #54 阶段 0） ──
 
     #[test]
@@ -1228,45 +795,6 @@ mod tests {
     #[test]
     fn resolve_delta_size_threshold_rejects_invalid_format() {
         assert!(resolve_delta_size_threshold(&Some("not-a-size".to_string())).is_err());
-    }
-
-    // ── accumulate_credit：半窗批量授信金额精确（issue #59，防双计/泄漏） ──
-
-    #[test]
-    fn accumulate_credit_below_threshold_returns_none_and_keeps_accumulating() {
-        let mut consumed = 0u64;
-        assert_eq!(accumulate_credit(&mut consumed, 3, 10), None);
-        assert_eq!(consumed, 3);
-        assert_eq!(accumulate_credit(&mut consumed, 4, 10), None);
-        assert_eq!(consumed, 7);
-    }
-
-    #[test]
-    fn accumulate_credit_exact_threshold_grants_exact_amount_and_resets() {
-        let mut consumed = 0u64;
-        assert_eq!(accumulate_credit(&mut consumed, 6, 10), None);
-        assert_eq!(accumulate_credit(&mut consumed, 4, 10), Some(10));
-        // 触发后立即清零，不残留上一轮的累计值
-        assert_eq!(consumed, 0);
-    }
-
-    #[test]
-    fn accumulate_credit_overshoot_grants_exact_accumulated_value_not_fixed_threshold() {
-        // 单条消息一步越过阈值：grant 金额应是实际累计值（13），而非固定阈值（10），
-        // 否则长期账目会产生系统性 drift（少发 3 字节 = credit 泄漏）。
-        let mut consumed = 0u64;
-        assert_eq!(accumulate_credit(&mut consumed, 13, 10), Some(13));
-        assert_eq!(consumed, 0);
-    }
-
-    #[test]
-    fn accumulate_credit_next_round_does_not_leak_previous_overshoot() {
-        // 连续两轮：第一轮越过阈值触发 grant 并清零后，第二轮的累计应从 0 重新开始，
-        // 不会把上一轮的余量（越过阈值的部分）带入下一轮（防双计）。
-        let mut consumed = 0u64;
-        assert_eq!(accumulate_credit(&mut consumed, 13, 10), Some(13));
-        assert_eq!(accumulate_credit(&mut consumed, 5, 10), None);
-        assert_eq!(consumed, 5);
     }
 
     #[test]
