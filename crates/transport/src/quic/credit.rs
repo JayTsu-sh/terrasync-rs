@@ -10,9 +10,9 @@
 //!
 //! ## 设计：字节级 credit 窗口
 //!
-//! [`CreditWindow`] 用 `tokio::sync::Semaphore` 实现一个全局字节配额：Sender 每发送一条
+//! [`SenderCreditState`] 用 `tokio::sync::Semaphore` 实现一个全局字节配额：Sender 每发送一条
 //! Data 类消息前先按其 payload 字节数 `acquire_many` 等量 permits（不足则挂起），成功后
-//! 立即 `forget`（消费，不归还）；Receiver 消费完等量字节后调用 [`CreditWindow::grant`]
+//! 立即 `forget`（消费，不归还）；Receiver 消费完等量字节后调用 [`SenderCreditState::grant`]
 //! （内部 `add_permits`）补充。`Semaphore` 的阻塞语义结构性地保证 outstanding（已发未
 //! 授信的字节数）不会超过窗口大小，也不可能被并发扣成负数——不需要手搓锁或原子计数器
 //! 自己维护上下界。
@@ -37,8 +37,8 @@
 //!
 //! ## 重连即重置语义
 //!
-//! [`CreditWindow`] 是 `QuicSenderTransport` 的内部字段，随连接对象一起创建/销毁；断线
-//! 重连会创建全新的 `QuicSenderTransport`（含全新的 `CreditWindow`，满窗口重新开始）。
+//! [`SenderCreditState`] 是 `QuicSenderTransport` 的内部字段，随连接对象一起创建/销毁；断线
+//! 重连会创建全新的 `QuicSenderTransport`（含全新的 `SenderCreditState`，满窗口重新开始）。
 //! **不做持久化**——这是有意为之：credit 窗口描述的是"当前这条连接上，Sender 已发但
 //! Receiver 尚未确认消费的字节数"，连接断开的瞬间这个状态本身就已经失去意义（在途的
 //! 数据要么从未到达 Receiver、要么到达了但 ack 没能传回来），沿用旧窗口状态毫无依据。
@@ -48,21 +48,21 @@
 //!
 //! 两者用法形似（`acquire(cost).await` 挂起在调用点、外部补充后自动唤醒），但控制的
 //! 物理量不同，不能互相替代：
-//! - 控制目标：`QosManager` 管**速率**（bytes/秒）；`CreditWindow` 管**在途量**
+//! - 控制目标：`QosManager` 管**速率**（bytes/秒）；`SenderCreditState` 管**在途量**
 //!   （已发但未确认消费的字节数）。
 //! - 令牌补充驱动源：`QosManager` 靠**时钟**（固定速率 × 流逝时间，本地自动补充，
-//!   不需要对端反馈）；`CreditWindow` 靠**对端消费反馈**（Receiver 消费后显式
+//!   不需要对端反馈）；`SenderCreditState` 靠**对端消费反馈**（Receiver 消费后显式
 //!   `grant()`）。
 //! - Receiver 完全停摆时的行为：`QosManager` 照常按时补令牌、照常放行——积压 =
-//!   速率 × 停摆时长，仍然无界；`CreditWindow` 授信停止 → 窗口耗尽 → Sender 停发，
+//!   速率 × 停摆时长，仍然无界；`SenderCreditState` 授信停止 → 窗口耗尽 → Sender 停发，
 //!   积压钉死在窗口值。
 //!
-//! `QosManager` 回答"我可以发多快"，`CreditWindow` 回答"我可以有多少字节在外面没被
+//! `QosManager` 回答"我可以发多快"，`SenderCreditState` 回答"我可以有多少字节在外面没被
 //! 消化"——前者是开环限速，后者是闭环流控，只有后者能解决"Receiver 消费停摆导致
 //! 积压无界"的问题（governor 的 API 本身也没有"由外部事件补充令牌"的模式，硬套上去
 //! 等于把时钟补充关掉、只剩计数器语义，那就是 `Semaphore` 本身，不如直接用
 //! `Semaphore`）。两者正交、继续共存：`QosManager` 管"别把网络/源端打满"（Sender 读端，
-//! 不受本 issue 影响），`CreditWindow` 管"别把 Receiver 内存打爆"（Sender 发送端，本
+//! 不受本 issue 影响），`SenderCreditState` 管"别把 Receiver 内存打爆"（Sender 发送端，本
 //! 模块新增）。
 
 // 外部 crate
@@ -70,6 +70,7 @@ use tokio::sync::Semaphore;
 
 // 内部模块
 use crate::error::{Result, TransportError};
+use crate::message::ReceiverMsg;
 
 /// 默认 credit 窗口：64 MiB（BDP 依据见模块文档）
 pub const DEFAULT_CREDIT_WINDOW_BYTES: u64 = 64 * 1024 * 1024;
@@ -79,19 +80,70 @@ pub const DEFAULT_CREDIT_WINDOW_BYTES: u64 = 64 * 1024 * 1024;
 /// `acquire_many` 顺序申请，避免 `u64 -> u32` 转换截断。
 const MAX_ACQUIRE_CHUNK_BYTES: u64 = u32::MAX as u64;
 
+/// Receiver-side result of recording data accepted by the bounded sink.
+#[derive(Debug)]
+#[allow(dead_code, reason = "wired into the Receiver adapter by follow-up ticket #107")]
+pub(crate) enum ReceiverCreditOutcome {
+    Pending,
+    Grant(ReceiverMsg),
+}
+
+/// Authoritative Receiver-side delayed-grant ledger for one connection.
+#[allow(dead_code, reason = "wired into the Receiver adapter by follow-up ticket #107")]
+pub(crate) struct ReceiverCreditState {
+    grant_threshold: u64,
+    accepted_pending: u64,
+}
+
+#[allow(dead_code, reason = "wired into the Receiver adapter by follow-up ticket #107")]
+impl ReceiverCreditState {
+    /// Uses the existing half-window delayed-grant policy.
+    pub(crate) fn new(window_bytes: u64) -> Result<Self> {
+        validate_window(window_bytes)?;
+        Ok(Self {
+            grant_threshold: (window_bytes / 2).max(1),
+            accepted_pending: 0,
+        })
+    }
+
+    /// Records bytes only after the bounded disk-commit seam accepts them.
+    pub(crate) fn record_accepted(&mut self, bytes: u64) -> Result<ReceiverCreditOutcome> {
+        self.accepted_pending = self
+            .accepted_pending
+            .checked_add(bytes)
+            .ok_or(TransportError::CreditAccountingOverflow)?;
+        if self.accepted_pending < self.grant_threshold {
+            return Ok(ReceiverCreditOutcome::Pending);
+        }
+        let bytes = std::mem::take(&mut self.accepted_pending);
+        Ok(ReceiverCreditOutcome::Grant(ReceiverMsg::CreditGrant {
+            bytes,
+            ndx: None,
+        }))
+    }
+
+    /// Drops connection-local accounting when a connection is replaced.
+    pub(crate) fn reset(&mut self) {
+        self.accepted_pending = 0;
+    }
+}
+
 /// 字节级 credit 流控窗口（issue #59 方案 b），语义与死锁防护见模块文档
-pub(crate) struct CreditWindow {
+pub(crate) struct SenderCreditState {
     semaphore: Semaphore,
 }
 
-impl CreditWindow {
+impl SenderCreditState {
     /// 用指定窗口大小构造；生产路径固定使用 [`DEFAULT_CREDIT_WINDOW_BYTES`]
     /// （见 `quic::sender::connect`），测试注入更小的窗口以触发阻塞/授信路径。
-    pub(crate) fn new(window_bytes: u64) -> Self {
-        let permits = usize::try_from(window_bytes).unwrap_or(usize::MAX);
-        Self {
+    pub(crate) fn new(window_bytes: u64) -> Result<Self> {
+        validate_window(window_bytes)?;
+        let permits = usize::try_from(window_bytes).map_err(|error| TransportError::InvalidCreditConfiguration {
+            reason: format!("window cannot be represented by this runtime: {error}"),
+        })?;
+        Ok(Self {
             semaphore: Semaphore::new(permits),
-        }
+        })
     }
 
     /// 扣减 `bytes` credit：窗口内余量不足时挂起，直到 [`Self::grant`] 补充足够的 permits
@@ -122,6 +174,16 @@ impl CreditWindow {
     }
 }
 
+fn validate_window(window_bytes: u64) -> Result<()> {
+    let runtime_limit = u64::try_from(Semaphore::MAX_PERMITS).unwrap_or(u64::MAX);
+    if window_bytes == 0 || window_bytes > runtime_limit {
+        return Err(TransportError::InvalidCreditConfiguration {
+            reason: format!("window must be within 1..={runtime_limit} bytes, got {window_bytes}"),
+        });
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 #[allow(clippy::expect_used, clippy::unwrap_used)]
 mod tests {
@@ -130,11 +192,52 @@ mod tests {
 
     use super::*;
 
+    #[test]
+    fn receiver_credit_batches_at_half_window_and_resets() {
+        let mut credit = ReceiverCreditState::new(20).unwrap();
+
+        assert!(matches!(
+            credit.record_accepted(6).unwrap(),
+            ReceiverCreditOutcome::Pending
+        ));
+        assert!(matches!(
+            credit.record_accepted(7).unwrap(),
+            ReceiverCreditOutcome::Grant(ReceiverMsg::CreditGrant { bytes: 13, ndx: None })
+        ));
+        assert!(matches!(
+            credit.record_accepted(5).unwrap(),
+            ReceiverCreditOutcome::Pending
+        ));
+
+        credit.reset();
+
+        assert!(matches!(
+            credit.record_accepted(5).unwrap(),
+            ReceiverCreditOutcome::Pending
+        ));
+    }
+
+    #[test]
+    fn credit_configuration_rejects_zero_capacity() {
+        assert!(matches!(
+            ReceiverCreditState::new(0),
+            Err(TransportError::InvalidCreditConfiguration { .. })
+        ));
+    }
+
+    #[test]
+    fn credit_configuration_rejects_capacity_above_runtime_limit() {
+        assert!(matches!(
+            ReceiverCreditState::new(u64::MAX),
+            Err(TransportError::InvalidCreditConfiguration { .. })
+        ));
+    }
+
     /// 窗口耗尽后 `acquire()` 应挂起，直到 `grant()` 补充足够 permits 才被唤醒——这是
     /// credit 机制"死锁防护"的直接证据：不存在能让 outstanding 突破窗口上限的代码路径。
     #[tokio::test]
     async fn acquire_blocks_when_window_exhausted_and_unblocks_after_grant() {
-        let window = Arc::new(CreditWindow::new(10));
+        let window = Arc::new(SenderCreditState::new(10).unwrap());
 
         // 耗尽全部 10 字节窗口，应立即成功（首次 acquire 不应阻塞）
         window.acquire(10).await.unwrap();

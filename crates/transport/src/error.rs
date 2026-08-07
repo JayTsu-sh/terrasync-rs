@@ -35,6 +35,14 @@ pub enum TransportError {
     /// 多路复用逻辑 stream 建立失败（QUIC `open_bi`/`accept_bi`）
     #[error("Stream setup failed: {0}")]
     StreamSetupFailed(String),
+
+    /// Credit window configuration cannot be represented safely by the runtime.
+    #[error("Invalid credit configuration: {reason}")]
+    InvalidCreditConfiguration { reason: String },
+
+    /// Accepted-byte accumulation exceeded the representable connection total.
+    #[error("Credit accounting overflow")]
+    CreditAccountingOverflow,
 }
 
 pub type Result<T> = std::result::Result<T, TransportError>;

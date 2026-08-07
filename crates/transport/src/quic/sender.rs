@@ -14,7 +14,7 @@ use tracing::info;
 
 // 内部模块
 use super::cert;
-use super::credit::{CreditWindow, DEFAULT_CREDIT_WINDOW_BYTES};
+use super::credit::{DEFAULT_CREDIT_WINDOW_BYTES, SenderCreditState};
 use super::mux;
 use crate::error::{Result, TransportError};
 use crate::message::{ReceiverMsg, SenderMsg, credit_cost};
@@ -39,7 +39,7 @@ pub struct QuicSenderTransport {
     send_streams: Vec<Mutex<mux::StreamSlot>>,
     incoming_rx: Mutex<UnboundedReceiver<ReceiverMsg>>,
     reader_tasks: Vec<JoinHandle<()>>,
-    credit: Arc<CreditWindow>,
+    credit: Arc<SenderCreditState>,
 }
 
 impl Drop for QuicSenderTransport {
@@ -110,7 +110,7 @@ pub(crate) async fn connect_with_credit_window(
     info!("[QUIC Sender] Connected to {}", addr);
 
     let (send_streams, mut raw_incoming_rx, mut reader_tasks) = mux::sender_setup(&conn).await?;
-    let credit = Arc::new(CreditWindow::new(window_bytes));
+    let credit = Arc::new(SenderCreditState::new(window_bytes)?);
 
     // credit-grant 过滤 task：见本函数文档。独立于调用方是否在调 recv()，持续把
     // CreditGrant 应用到 credit 上，其余消息转发给真正暴露给调用方的 channel。
