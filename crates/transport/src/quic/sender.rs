@@ -14,9 +14,9 @@ use tracing::info;
 
 // 内部模块
 use super::cert;
-use super::credit::{DEFAULT_CREDIT_WINDOW_BYTES, SenderCreditOutcome, SenderCreditState};
 use super::mux;
 use crate::error::{Result, TransportError};
+use crate::flow_control::{DEFAULT_CREDIT_WINDOW_BYTES, SenderCreditOutcome, SenderCreditState};
 use crate::message::{ReceiverMsg, SenderMsg, credit_cost};
 use crate::traits::SenderTransport;
 
@@ -25,7 +25,7 @@ use crate::traits::SenderTransport;
 /// 与 Receiver 之间建立 4 条 bidirectional stream 做多路复用（控制 / 文件列表 /
 /// 数据 / ack+进度，见 `quic::mux`），大文件数据流不再阻塞 progress/ack 等控制消息：
 /// - `send()` 按 `SenderMsg` variant 路由到对应物理 stream；Data 类消息（`credit_cost`
-///   命中）发送前先扣减应用层 credit（见 `quic::credit`），不足则挂起等待 Receiver 授信
+///   命中）发送前先扣减应用层 credit（见 `flow_control`），不足则挂起等待 Receiver 授信
 /// - `recv()` 从**已过滤掉 `CreditGrant`** 的 channel 读取，不会看到该 variant
 ///
 /// `CreditGrant` 的过滤/补授不放在 `recv()` 里（见 `connect_with_credit_window` 文档
@@ -56,7 +56,7 @@ impl Drop for QuicSenderTransport {
 /// - `server_cert`: 服务端 DER 证书（来自 `serve --tls-cert-out`），用于验证服务端身份。
 ///   `None` 时跳过验证（仅限内部可信网络，会打印 WARNING）。
 ///
-/// credit 窗口固定使用 `DEFAULT_CREDIT_WINDOW_BYTES`（v1 不提供配置项，见 `quic::credit`
+/// credit 窗口固定使用 `DEFAULT_CREDIT_WINDOW_BYTES`（v1 不提供配置项，见 `flow_control`
 /// 模块文档）；测试注入自定义窗口见 crate 内的 `connect_with_credit_window`。
 pub async fn connect(
     addr: SocketAddr, server_name: &str, server_cert: Option<CertificateDer<'static>>,
@@ -66,7 +66,7 @@ pub async fn connect(
 
 /// 测试注入口：用自定义 credit 窗口大小建立连接（生产路径固定走 [`connect`]）。
 /// 仅供 crate 内测试触发 credit 窗口耗尽/授信解阻塞路径，不对外暴露——v1 不提供配置项
-/// （见 `quic::credit` 模块文档）。
+/// （见 `flow_control` 模块文档）。
 ///
 /// ## credit-grant 过滤 task
 ///
@@ -136,6 +136,7 @@ pub(crate) async fn connect_with_credit_window(
                 }
             }
         }
+        filter_credit.close();
     }));
 
     Ok(QuicSenderTransport {

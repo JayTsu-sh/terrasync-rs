@@ -487,7 +487,7 @@ pub(crate) async fn recv_file_list_and_data_phase(
 ) -> Result<()> {
     info!("[Receiver Remote] Receiving file list and file data (pipelined, streaming mode)");
     // ndx 终态去重与完成判断由 session ledger 统一持有。
-    // credit 策略由 transport::quic::credit 的 ReceiverCreditState 持有。此循环只通过
+    // credit 策略由 transport::flow_control 的 ReceiverCreditState 持有。此循环只通过
     // session 的 accept_full_chunk/accept_delta_data 报告 bounded dc_tx 已接受 payload；
     // 阈值、累计量和 CreditGrant 构造不再属于应用层。
     // disk-commit task：全量/delta 文件均三段流式落盘（去整文件 BytesMut/token Vec）；ack
@@ -656,7 +656,7 @@ pub(crate) async fn recv_file_list_and_data_phase(
 
             // ── 数据流模式：文件数据块 → 转发给 disk-commit task 的 write_chunk_stream ──
             Some(SenderMsg::FileData { entry, chunk }) => {
-                state.accept_full_chunk(transport, &dc_tx, entry, chunk).await;
+                state.accept_full_chunk(transport, &dc_tx, entry, chunk).await?;
             }
 
             // ── Delta token 接收：逐 token 转发给 disk-commit task（不再攒整文件 Vec，见
@@ -670,7 +670,7 @@ pub(crate) async fn recv_file_list_and_data_phase(
             }
             Some(SenderMsg::DeltaData { ndx, data }) => {
                 if let Some(entry) = state.indexed_entry(ndx).cloned() {
-                    state.accept_delta_data(transport, &dc_tx, ndx, &entry, data).await;
+                    state.accept_delta_data(transport, &dc_tx, ndx, &entry, data).await?;
                 } else {
                     warn!("[Receiver Remote] DeltaData for unknown ndx {}", ndx);
                 }

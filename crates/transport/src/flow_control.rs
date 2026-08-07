@@ -1,4 +1,4 @@
-//! 应用层字节 credit 流控（issue #59，方案 b）
+//! 传输无关的应用层字节 credit 流控（issue #59，方案 b）
 //!
 //! ## 要解决的问题
 //!
@@ -14,8 +14,8 @@
 //! Data 类消息前先按其 payload 字节数 `acquire_many` 等量 permits（不足则挂起），成功后
 //! 立即 `forget`（消费，不归还）；Receiver 消费完等量字节后调用 [`SenderCreditState::grant`]
 //! （内部 `add_permits`）补充。`Semaphore` 的阻塞语义结构性地保证 outstanding（已发未
-//! 授信的字节数）不会超过窗口大小，也不可能被并发扣成负数——不需要手搓锁或原子计数器
-//! 自己维护上下界。
+//! 授信的字节数）不会超过窗口大小，也不可能被并发扣成负数。一个短临界区只串行化 grant，
+//! semaphore 本身仍是唯一容量账本，不另设可能漂移的原子镜像。
 //!
 //! [`DEFAULT_CREDIT_WINDOW_BYTES`] = 64MiB：以 BDP（bandwidth-delay product）为依据，
 //! 10 Gbps 链路 × ~50ms 典型 RTT ≈ 62.5MB，凑整到 64MiB，确保窗口本身足够大、不会成为
@@ -31,7 +31,8 @@
 //! - 下界（`outstanding >= 0`，即不会被扣成负数）由 `Semaphore::acquire_many` 的阻塞
 //!   语义结构性保证——permits 不足时调用方直接挂起，不存在"扣减到负值"的代码路径。
 //! - 上界（`outstanding <= window`）由两端共同结构性保证：Receiver 只在 bounded
-//!   disk-commit seam 接受 payload 后累计授信；Sender 通过原子容量账本把重复、恶意或
+//!   disk-commit seam 接受 payload 后累计授信；Sender 以 semaphore 自身为唯一容量账本，
+//!   并在串行化的 grant 临界区把重复、恶意或
 //!   竞态产生的超额 grant 截断到配置窗口，绝不让 semaphore 膨胀超过容量。
 //!
 //! ## 重连即重置语义
@@ -76,7 +77,7 @@
 //! 散落到 Sender/Receiver adapters 与应用 session；这正是该深模块通过 deletion test 的
 //! 依据。测试应断言阻塞、恢复、消息可见性和 typed terminal outcome，而非 semaphore permits。
 
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Mutex;
 
 // 外部 crate
 use tokio::sync::Semaphore;
@@ -84,6 +85,7 @@ use tokio::sync::Semaphore;
 // 内部模块
 use crate::error::{Result, TransportError};
 use crate::message::ReceiverMsg;
+use crate::traits::ReceiverTransport;
 
 /// 默认 credit 窗口：64 MiB（BDP 依据见模块文档）
 pub const DEFAULT_CREDIT_WINDOW_BYTES: u64 = 64 * 1024 * 1024;
@@ -95,7 +97,7 @@ const MAX_ACQUIRE_CHUNK_BYTES: u64 = u32::MAX as u64;
 
 /// Receiver-side result of recording data accepted by the bounded sink.
 #[derive(Debug)]
-pub enum ReceiverCreditOutcome {
+enum ReceiverCreditOutcome {
     Pending,
     Grant(ReceiverMsg),
 }
@@ -118,7 +120,7 @@ impl ReceiverCreditState {
     }
 
     /// Records bytes only after the bounded disk-commit seam accepts them.
-    pub fn record_accepted(&mut self, bytes: u64) -> Result<ReceiverCreditOutcome> {
+    fn record_accepted(&mut self, bytes: u64) -> Result<ReceiverCreditOutcome> {
         self.accepted_pending = self
             .accepted_pending
             .checked_add(bytes)
@@ -131,6 +133,14 @@ impl ReceiverCreditState {
             bytes,
             ndx: None,
         }))
+    }
+
+    /// Records a bounded-sink acceptance and owns delivery of any resulting wire grant.
+    pub async fn accepted(&mut self, transport: &(dyn ReceiverTransport + 'static), bytes: u64) -> Result<()> {
+        if let ReceiverCreditOutcome::Grant(message) = self.record_accepted(bytes)? {
+            transport.send(message).await?;
+        }
+        Ok(())
     }
 
     /// Drops connection-local accounting when a connection is replaced.
@@ -152,7 +162,7 @@ impl Default for ReceiverCreditState {
 pub(crate) struct SenderCreditState {
     semaphore: Semaphore,
     capacity: usize,
-    available: AtomicUsize,
+    grant_lock: Mutex<()>,
 }
 
 /// Separates transport-internal grants from application-visible messages.
@@ -179,7 +189,7 @@ impl SenderCreditState {
         Ok(Self {
             semaphore: Semaphore::new(permits),
             capacity: permits,
-            available: AtomicUsize::new(permits),
+            grant_lock: Mutex::new(()),
         })
     }
 
@@ -206,7 +216,6 @@ impl SenderCreditState {
                 .map_err(|e| TransportError::SendFailed(format!("credit window closed: {e}")))?;
             // 消费掉这批 permits，不归还——归还只能通过 grant() 显式补充
             permit.forget();
-            self.available.fetch_sub(n as usize, Ordering::AcqRel);
             remaining -= chunk;
         }
         Ok(())
@@ -214,18 +223,9 @@ impl SenderCreditState {
 
     /// 补授 `bytes` credit（Receiver 半窗批量授信后由 `QuicSenderTransport::recv()` 调用）
     pub(crate) fn grant(&self, bytes: u64) -> CreditGrantOutcome {
+        let _guard = self.grant_lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         let requested = usize::try_from(bytes).unwrap_or(usize::MAX);
-        let mut current = self.available.load(Ordering::Acquire);
-        let applied = loop {
-            let applied = requested.min(self.capacity.saturating_sub(current));
-            match self
-                .available
-                .compare_exchange_weak(current, current + applied, Ordering::AcqRel, Ordering::Acquire)
-            {
-                Ok(_) => break applied,
-                Err(observed) => current = observed,
-            }
-        };
+        let applied = requested.min(self.capacity.saturating_sub(self.semaphore.available_permits()));
         if applied > 0 {
             self.semaphore.add_permits(applied);
         }
@@ -268,7 +268,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn receiver_credit_batches_at_half_window_and_resets() {
+    fn receiver_credit_batches_at_half_window_and_discards_terminal_residual() {
         let mut credit = ReceiverCreditState::new(20).unwrap();
 
         assert!(matches!(
@@ -290,6 +290,24 @@ mod tests {
             credit.record_accepted(5).unwrap(),
             ReceiverCreditOutcome::Pending
         ));
+    }
+
+    #[test]
+    fn zero_bytes_never_produces_a_grant() {
+        let mut receiver = ReceiverCreditState::new(2).unwrap();
+        assert!(matches!(
+            receiver.record_accepted(0).unwrap(),
+            ReceiverCreditOutcome::Pending
+        ));
+
+        let sender = SenderCreditState::new(2).unwrap();
+        assert_eq!(
+            sender.grant(0),
+            CreditGrantOutcome {
+                applied: 0,
+                discarded: 0,
+            }
+        );
     }
 
     #[test]
@@ -379,6 +397,24 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn concurrent_grants_share_the_semaphore_as_the_single_capacity_ledger() {
+        let credit = Arc::new(SenderCreditState::new(8).unwrap());
+        credit.acquire(8).await.unwrap();
+
+        let first = credit.clone();
+        let second = credit.clone();
+        let (first, second) = tokio::join!(
+            tokio::task::spawn_blocking(move || first.grant(8)),
+            tokio::task::spawn_blocking(move || second.grant(u64::MAX)),
+        );
+        let first = first.unwrap();
+        let second = second.unwrap();
+
+        assert_eq!(first.applied + second.applied, 8);
+        assert_eq!(credit.semaphore.available_permits(), 8);
     }
 
     /// 窗口耗尽后 `acquire()` 应挂起，直到 `grant()` 补充足够 permits 才被唤醒——这是

@@ -11,11 +11,11 @@ use data_mover::dir_tree::DirPageResult;
 use data_mover::{DataChunk, EntryEnum, StorageEnum};
 use tokio::sync::mpsc::{Receiver, Sender};
 use tracing::{debug, info, warn};
+use transport::flow_control::ReceiverCreditState;
 use transport::message::{
     BlockSignature, DcAck, DestIndex, DiskCommitMsg, FeatureFlags, FileOutcome, NdxTable, ProgressSnapshot,
     ReceiverMsg, SessionConfig, TransferDecision,
 };
-use transport::quic::credit::{ReceiverCreditOutcome, ReceiverCreditState};
 use transport::traits::ReceiverTransport;
 
 use crate::byte_resume::is_part_file;
@@ -310,13 +310,13 @@ impl RemoteSessionState {
     pub(crate) async fn accept_full_chunk(
         &mut self, transport: &(dyn ReceiverTransport + 'static), dc_tx: &Sender<DiskCommitMsg>, entry: Arc<EntryEnum>,
         chunk: DataChunk,
-    ) -> bool {
+    ) -> Result<bool> {
         let bytes = chunk.data.len() as u64;
         if !self.push_full_chunk(dc_tx, entry, chunk).await {
-            return false;
+            return Ok(false);
         }
-        self.record_data_consumed(transport, bytes).await;
-        true
+        self.credit.accepted(transport, bytes).await?;
+        Ok(true)
     }
 
     /// 提交 active full transfer；返回 false 表示该 `EndOfFile` 应由 delta 路径处理。
@@ -403,13 +403,13 @@ impl RemoteSessionState {
     pub(crate) async fn accept_delta_data(
         &mut self, transport: &(dyn ReceiverTransport + 'static), dc_tx: &Sender<DiskCommitMsg>, ndx: i32,
         entry: &Arc<EntryEnum>, data: bytes::Bytes,
-    ) -> bool {
+    ) -> Result<bool> {
         let bytes = data.len() as u64;
         if !self.push_delta_data(dc_tx, ndx, entry, data).await {
-            return false;
+            return Ok(false);
         }
-        self.record_data_consumed(transport, bytes).await;
-        true
+        self.credit.accepted(transport, bytes).await?;
+        Ok(true)
     }
 
     /// Commits a delta stream, lazily beginning it when it contains zero tokens.
@@ -466,16 +466,6 @@ impl RemoteSessionState {
         }
         self.finalize_directories(dest).await;
         Ok(())
-    }
-
-    /// Records bytes accepted by the disk-commit seam and emits an exact delayed
-    /// credit grant once the configured threshold is reached.
-    async fn record_data_consumed(&mut self, transport: &(dyn ReceiverTransport + 'static), bytes: u64) {
-        if let Ok(ReceiverCreditOutcome::Grant(message)) = self.credit.record_accepted(bytes) {
-            // Grant delivery remains best-effort. A broken connection is handled by
-            // the surrounding receive loop and terminates the session deterministically.
-            let _ = transport.send(message).await;
-        }
     }
 
     /// Residual delayed credit is connection-local and no longer useful after
@@ -1136,6 +1126,7 @@ mod tests {
             state
                 .accept_delta_data(&receiver_transport, &dc_tx, 7, &entry, Bytes::from_static(b"ab"),)
                 .await
+                .unwrap()
         );
         assert!(matches!(
             dc_rx.recv().await,
@@ -1173,6 +1164,7 @@ mod tests {
                     },
                 )
                 .await
+                .unwrap()
         );
         assert!(
             tokio::time::timeout(Duration::from_millis(20), sender_transport.recv())
@@ -1202,6 +1194,7 @@ mod tests {
                     },
                 )
                 .await
+                .unwrap()
         );
 
         let blocked = tokio::spawn(async move {
@@ -1227,6 +1220,7 @@ mod tests {
         assert!(
             tokio::time::timeout(Duration::from_secs(1), blocked)
                 .await
+                .unwrap()
                 .unwrap()
                 .unwrap()
         );
