@@ -44,6 +44,14 @@ pub enum AppError {
     #[error("Copy error: {0}")]
     CopyError(String),
 
+    /// 单文件落盘阶段失败，并保留原始 typed error chain。
+    #[error("File commit {stage}: {source}")]
+    FileCommitStage {
+        stage: &'static str,
+        #[source]
+        source: Box<AppError>,
+    },
+
     /// 配置错误
     #[error("Configuration error: {0}")]
     ConfigError(String),

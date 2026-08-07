@@ -16,6 +16,7 @@ pub mod broadcast;
 /// 串行消费 `DiskCommitMsg`，用 data-mover 3 段流式 API 写入 `.part`，
 /// 提交时读回 hash 校验后原子 rename
 pub mod disk_commit;
+mod file_commit;
 
 /// 字节级断点续传状态模块
 ///
