@@ -9,6 +9,10 @@
 //! 才能开始处理请求」的顺序 barrier；`NdxTable` 因此改为 `Mutex` 包裹以支持并发
 //! 读写（写者只有文件列表任务，读者只有请求处理任务，不存在二义性）。
 
+mod remote_sender_session;
+
+use remote_sender_session::{RemoteSenderSession, RemoteSenderSessionDeps};
+
 use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -130,40 +134,36 @@ pub(crate) async fn run(
     }
 
     // ── 6+7+8. 文件列表发送 与 请求处理+Ack收集 并发运行（流水线，无阶段 barrier） ──
-    let ndx_table = Mutex::new(NdxTable::new());
-    let file_list_fut = send_file_list_phase(&transport, &walkdir_iter, &ndx_table, &stats_consumer);
-    let requests_acks_fut = process_requests_and_acks(
-        &transport,
-        &src_storage,
-        &ndx_table,
-        qos_manager.as_ref(),
-        config.enable_acl,
-        &mut completed_paths,
-        &checkpoint_path,
-        &stats_consumer,
-    );
-    let (page_count, (transfer_count, success_count, error_count)) =
-        tokio::try_join!(file_list_fut, requests_acks_fut)?;
+    let summary = RemoteSenderSession::new(RemoteSenderSessionDeps {
+        transport: &transport,
+        src_storage: &src_storage,
+        walkdir_iter: &walkdir_iter,
+        qos: qos_manager.as_ref(),
+        enable_acl: config.enable_acl,
+        checkpoint_path: &checkpoint_path,
+        stats_consumer: &stats_consumer,
+    })
+    .run(&mut completed_paths)
+    .await?;
     info!(
         "[Sender Remote] File list sent: {} pages, {} entries",
-        page_count,
-        ndx_table.lock().unwrap_or_else(PoisonError::into_inner).len()
+        summary.page_count, summary.advertised_entries
     );
-    info!("[Sender Remote] {} transfer requests processed", transfer_count);
+    info!("[Sender Remote] {} transfer requests processed", summary.transfer_count);
     info!(
         "[Sender Remote] Complete: {} success, {} errors",
-        success_count, error_count
+        summary.success_count, summary.error_count
     );
 
     // ── 9. Checkpoint 处理 + 清理 ──
-    save_or_clear_checkpoint(&checkpoint_path, &completed_paths, error_count).await;
+    save_or_clear_checkpoint(&checkpoint_path, &completed_paths, summary.error_count).await;
     if let Some(ref qos) = qos_manager {
         qos.shutdown();
     }
     transport.close().await?;
     // 结束统计报表生命周期：abort 回调循环 → 发最终回调(is_final=true) → 打印终态报表
     StatisticConsumer::end(stats_consumer, callback_guard).await;
-    finalize_run_result(error_count)
+    finalize_run_result(summary.error_count)
 }
 
 /// 双进程模式下 entry 级失败（部分或全部）不再影响进程退出码——与单进程语义对齐，
@@ -924,34 +924,34 @@ mod tests {
             .await
             .unwrap();
 
-        let ndx_table = Mutex::new(NdxTable::new());
         let mut completed_paths = HashSet::new();
         let checkpoint_path = src_dir.path().join("unused_checkpoint.json");
         let stats_consumer = test_stats_consumer();
-        let (page_count, (transfer_count, success_count, error_count)) = tokio::try_join!(
-            send_file_list_phase(&sender_transport, &walkdir_iter, &ndx_table, &stats_consumer),
-            process_requests_and_acks(
-                &sender_transport,
-                &src_storage,
-                &ndx_table,
-                None,
-                false,
-                &mut completed_paths,
-                &checkpoint_path,
-                &stats_consumer,
-            )
-        )
+        let summary = RemoteSenderSession::new(RemoteSenderSessionDeps {
+            transport: &sender_transport,
+            src_storage: &src_storage,
+            walkdir_iter: &walkdir_iter,
+            qos: None,
+            enable_acl: false,
+            checkpoint_path: &checkpoint_path,
+            stats_consumer: &stats_consumer,
+        })
+        .run(&mut completed_paths)
+        .await
         .unwrap();
 
         sender_transport.close().await.unwrap();
         receiver_handle.await.unwrap().unwrap();
 
-        assert!(page_count >= 1, "应至少发送一页文件列表");
+        assert!(summary.page_count >= 1, "应至少发送一页文件列表");
         // 子目录（sub, sub/deeper）在文件列表阶段由 Receiver 直接创建，不走 TransferRequest/
         // EntrySuccess（与改造前一致，非本 issue 改动范围）；3 个文件全部走全量传输请求。
-        assert_eq!(transfer_count, 3, "应有 3 个文件走全量传输请求");
-        assert_eq!(error_count, 0, "不应有任何 EntryError");
-        assert_eq!(success_count, 3, "3 个文件应全部收到 EntrySuccess，证明无消息丢失");
+        assert_eq!(summary.transfer_count, 3, "应有 3 个文件走全量传输请求");
+        assert_eq!(summary.error_count, 0, "不应有任何 EntryError");
+        assert_eq!(
+            summary.success_count, 3,
+            "3 个文件应全部收到 EntrySuccess，证明无消息丢失"
+        );
 
         // dest == src：逐文件比对内容
         assert_eq!(fs::read(dest_dir.path().join("a.txt")).unwrap(), b"hello");
