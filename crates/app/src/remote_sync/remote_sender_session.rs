@@ -12,9 +12,11 @@ use data_mover::StorageEntryMessage;
 use data_mover::dir_tree::NdxEvent;
 use data_mover::qos::QosManager;
 use data_mover::{ConsistencyCheck, EntryEnum, StorageEnum, WalkDirAsyncIterator2};
+use sync_delta::DeltaToken;
+use sync_delta::matcher::DeltaMatcher;
 use tokio::sync::Mutex as AsyncMutex;
 use tracing::{error, info};
-use transport::message::{NdxTable, SenderMsg};
+use transport::message::{BlockSignature, NdxTable, SenderMsg};
 use transport::traits::SenderTransport;
 
 use super::{AppError, Result, StatisticConsumer, process_requests_and_acks};
@@ -279,6 +281,84 @@ pub(super) async fn send_acl_if_enabled(
             })
             .await;
     }
+}
+
+/// Delta source stream：matcher 与 token emission 都由 session implementation 持有。
+pub(super) async fn send_delta_transfer(
+    transport: &(dyn SenderTransport + 'static), src_storage: &Arc<StorageEnum>, entry: &Arc<EntryEnum>, ndx: i32,
+    block_size: u32, signatures: Vec<BlockSignature>, qos: Option<&QosManager>, enable_acl: bool,
+) -> Result<SourceTransferOutcome> {
+    let signatures = signatures
+        .into_iter()
+        .map(|signature| sync_delta::BlockSignature {
+            rolling: signature.rolling,
+            strong: signature.strong,
+        })
+        .collect::<Vec<_>>();
+    let mut matcher = DeltaMatcher::new(&signatures, block_size);
+    let mut token_count = 0usize;
+    let (mut chunks, read_join) = StorageEnum::read_chunk_stream(src_storage, entry, None, qos.cloned(), true, 8);
+    while let Some(chunk) = chunks.recv().await {
+        let tokens = matcher.push(&chunk.data);
+        token_count += tokens.len();
+        send_delta_tokens(transport, ndx, tokens, qos).await?;
+    }
+    let tokens = matcher.finish();
+    token_count += tokens.len();
+    send_delta_tokens(transport, ndx, tokens, qos).await?;
+
+    let read_result = match read_join.await {
+        Ok(inner) => inner.map_err(|error| error.to_string()),
+        Err(error) => Err(error.to_string()),
+    };
+    match read_result {
+        Ok(hasher) => {
+            transport
+                .send(SenderMsg::EndOfFile {
+                    ndx,
+                    entry: entry.clone(),
+                    source_hash: hasher.map(ConsistencyCheck::finalize),
+                })
+                .await?;
+            info!(
+                "[Sender Remote] Delta transfer {:?}: {} tokens",
+                entry.get_relative_path(),
+                token_count
+            );
+            send_acl_if_enabled(transport, src_storage, entry, enable_acl).await;
+            Ok(SourceTransferOutcome::Sent)
+        }
+        Err(reason) => {
+            error!("[Sender Remote] read file {:?}: {reason}", entry.get_relative_path());
+            transport
+                .send(SenderMsg::EntryError {
+                    path: entry.get_relative_path().to_path_buf(),
+                    reason,
+                    ndx: Some(ndx),
+                })
+                .await?;
+            Ok(SourceTransferOutcome::SourceFailed)
+        }
+    }
+}
+
+async fn send_delta_tokens(
+    transport: &(dyn SenderTransport + 'static), ndx: i32, tokens: Vec<DeltaToken>, qos: Option<&QosManager>,
+) -> Result<()> {
+    for token in tokens {
+        match token {
+            DeltaToken::Match { block_index } => {
+                transport.send(SenderMsg::DeltaMatch { ndx, block_index }).await?;
+            }
+            DeltaToken::Data(data) => {
+                if let Some(qos) = qos {
+                    qos.acquire(data.len() as u64).await;
+                }
+                transport.send(SenderMsg::DeltaData { ndx, data }).await?;
+            }
+        }
+    }
+    Ok(())
 }
 
 fn stage_error(stage: &'static str, source: AppError) -> AppError {

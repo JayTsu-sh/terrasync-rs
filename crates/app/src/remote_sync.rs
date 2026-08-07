@@ -14,7 +14,7 @@ mod remote_sender_session;
 #[cfg(test)]
 use remote_sender_session::advertise_file_list;
 use remote_sender_session::{RemoteSenderSession, RemoteSenderSessionDeps};
-use remote_sender_session::{SourceTransferOutcome, send_acl_if_enabled, send_full_transfer};
+use remote_sender_session::{SourceTransferOutcome, send_delta_transfer, send_full_transfer};
 
 use std::collections::HashSet;
 use std::net::SocketAddr;
@@ -26,18 +26,13 @@ use std::sync::{Arc, Mutex, PoisonError};
 use data_mover::dir_tree::NdxEvent;
 use data_mover::filter::parse_filter_expression;
 use data_mover::qos::QosManager;
-use data_mover::{
-    ChangeKind, ConsistencyCheck, EntryEnum, ErrorEvent, StorageEntryMessage, StorageEnum, create_storage,
-};
+use data_mover::{ChangeKind, EntryEnum, ErrorEvent, StorageEntryMessage, StorageEnum, create_storage};
 use rustls::pki_types::CertificateDer;
-use sync_delta::DeltaToken;
-use sync_delta::matcher::DeltaMatcher;
 use tokio::sync::Mutex as AsyncMutex;
 use tracing::{debug, error, info, warn};
 use transport::error::TransportError;
 use transport::message::{
-    BlockSignature, HandshakeResult, NdxTable, ProtocolHandshake, ReceiverMsg, SenderMsg, SessionConfig,
-    TransferDecision,
+    HandshakeResult, NdxTable, ProtocolHandshake, ReceiverMsg, SenderMsg, SessionConfig, TransferDecision,
 };
 use transport::traits::SenderTransport;
 use utils::app_config::AppConfig;
@@ -329,18 +324,20 @@ async fn process_requests_and_acks(
                     // delta: 仅 src 读取成功时计入传输数（与原逻辑保持一致）；读取失败已发
                     // EntryError 通知 Receiver 完成该 ndx，这里自增 error_count（见 [2]）；
                     // 同时喂入 ErrorStats，使报表如实反映该失败（issue #57）
-                    if handle_delta_transfer(
-                        transport,
-                        src_storage,
-                        &entry,
-                        ndx,
-                        block_size,
-                        signatures,
-                        qos,
-                        enable_acl,
-                    )
-                    .await?
-                    {
+                    if matches!(
+                        send_delta_transfer(
+                            transport,
+                            src_storage,
+                            &entry,
+                            ndx,
+                            block_size,
+                            signatures,
+                            qos,
+                            enable_acl,
+                        )
+                        .await?,
+                        SourceTransferOutcome::Sent
+                    ) {
                         transfer_count += 1;
                     } else if count_ndx_error(&mut errored_ndx, ndx, &mut error_count) {
                         let msg = entry_error_stats_message(
@@ -475,8 +472,8 @@ struct RequestAckSummary {
 }
 
 /// 同一 ndx 的失败只计一次 `error_count`：复合失败（同 ndx 源读失败 **且** dest 侧
-/// `resume_prepare` 失败）时，Sender 自检失败（`handle_full_transfer`/
-/// `handle_delta_transfer` 返回 `false`）与 Receiver 回传的 `ReceiverMsg::Error{ndx}`
+/// `resume_prepare` 失败）时，Sender 自检失败（full/delta source operation 返回
+/// `SourceFailed`）与 Receiver 回传的 `ReceiverMsg::Error{ndx}`
 /// 可能各自独立触发一次增量；ndx 唯一对应一个文件，一个文件至多算一次错误。
 ///
 /// 返回是否为本次新计数（`errored.insert(ndx)` 的结果）：调用方据此决定是否同时喂入
@@ -546,96 +543,6 @@ async fn record_success_and_checkpoint(
         && let Ok(data) = serde_json::to_string(&completed_paths)
     {
         let _ = tokio::fs::write(checkpoint_path, data).await;
-    }
-}
-
-/// 逐 token 发送 `DeltaMatch`/`DeltaData` 消息（wire 协议不变）；`Data` token 走 QoS 限速，
-/// 与整片版本原有行为一致。
-async fn send_delta_tokens(
-    transport: &(dyn SenderTransport + 'static), ndx: i32, tokens: Vec<DeltaToken>, qos: Option<&QosManager>,
-) -> Result<()> {
-    for token in tokens {
-        match token {
-            DeltaToken::Match { block_index } => {
-                transport.send(SenderMsg::DeltaMatch { ndx, block_index }).await?;
-            }
-            DeltaToken::Data(data) => {
-                if let Some(q) = qos {
-                    q.acquire(data.len() as u64).await;
-                }
-                transport.send(SenderMsg::DeltaData { ndx, data }).await?;
-            }
-        }
-    }
-    Ok(())
-}
-
-/// Delta 传输一个 entry：流式读源文件 → 逐 chunk 喂 `DeltaMatcher` → token 边产出边发送。
-///
-/// 返回 `Ok(true)` = 源文件读取成功并已发送；`Ok(false)` = 源读失败，已发送带 `ndx`
-/// 的 `SenderMsg::EntryError` 通知 Receiver 完成该 ndx（不留悬空请求），调用方需据此
-/// 自增 `error_count`（与 `handle_full_transfer` 语义一致）。
-#[allow(clippy::too_many_arguments)]
-async fn handle_delta_transfer(
-    transport: &(dyn SenderTransport + 'static), src_storage: &Arc<StorageEnum>, entry: &Arc<data_mover::EntryEnum>,
-    ndx: i32, block_size: u32, signatures: Vec<BlockSignature>, qos: Option<&QosManager>, enable_acl: bool,
-) -> Result<bool> {
-    let delta_sigs: Vec<sync_delta::BlockSignature> = signatures
-        .into_iter()
-        .map(|s| sync_delta::BlockSignature {
-            rolling: s.rolling,
-            strong: s.strong,
-        })
-        .collect();
-    let mut matcher = DeltaMatcher::new(&delta_sigs, block_size);
-    let mut token_count = 0usize;
-
-    // 流式读源文件：read_chunk_stream 内部按块读 + per-chunk QoS + hash（不再整文件驻留
-    // RAM），逐 chunk 喂 DeltaMatcher，token 边产出边发送。
-    let (mut rx, hash_handle) = StorageEnum::read_chunk_stream(src_storage, entry, None, qos.cloned(), true, 8);
-    while let Some(chunk) = rx.recv().await {
-        let tokens = matcher.push(&chunk.data);
-        token_count += tokens.len();
-        send_delta_tokens(transport, ndx, tokens, qos).await?;
-    }
-    let tail_tokens = matcher.finish();
-    token_count += tail_tokens.len();
-    send_delta_tokens(transport, ndx, tail_tokens, qos).await?;
-
-    // 读任务收尾：JoinError 或内层读错误统一归一为原因字符串（与 handle_full_transfer 同构）
-    let read_result = match hash_handle.await {
-        Ok(inner) => inner.map_err(|e| e.to_string()),
-        Err(e) => Err(e.to_string()),
-    };
-    match read_result {
-        Ok(hasher) => {
-            let source_hash = hasher.map(ConsistencyCheck::finalize);
-            transport
-                .send(SenderMsg::EndOfFile {
-                    ndx,
-                    entry: entry.clone(),
-                    source_hash,
-                })
-                .await?;
-            info!(
-                "[Sender Remote] Delta transfer {:?}: {} tokens",
-                entry.get_relative_path(),
-                token_count
-            );
-            send_acl_if_enabled(transport, src_storage, entry, enable_acl).await;
-            Ok(true)
-        }
-        Err(reason) => {
-            error!("[Sender Remote] read file {:?}: {}", entry.get_relative_path(), reason);
-            transport
-                .send(SenderMsg::EntryError {
-                    path: entry.get_relative_path().to_path_buf(),
-                    reason,
-                    ndx: Some(ndx),
-                })
-                .await?;
-            Ok(false)
-        }
     }
 }
 
