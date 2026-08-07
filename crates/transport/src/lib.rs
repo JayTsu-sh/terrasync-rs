@@ -1,4 +1,5 @@
 pub mod error;
+pub mod flow_control;
 pub mod in_process;
 pub mod message;
 pub mod traits;

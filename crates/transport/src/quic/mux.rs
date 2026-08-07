@@ -21,7 +21,7 @@
 //! 或 QUIC per-stream 接收窗口保证——早期版本这里曾声称"背压在 QUIC per-stream 窗口"，
 //! 该结论经核实是错误的：`reader_loop` 读到完整帧就立即转发进无界 channel，从不在
 //! QUIC 读取路径上阻塞，QUIC 窗口腾空与下游是否真正消费完全解耦（issue #59 核实）。
-//! 真正的有界性保证来自**应用层 credit 流控**（见 [`super::credit`]）：
+//! 真正的有界性保证来自**应用层 credit 流控**（见 [`crate::flow_control`]）：
 //! `QuicSenderTransport::send()` 对 Data 类消息在写入本模块的物理 stream 之前先扣减
 //! 等量 credit，credit 耗尽时挂起在 `send()` 内部（不占用本模块任何 channel 容量），
 //! Receiver 消费后按半窗批量补授权。因此本模块的无界 fan-in channel 是安全的：能落到

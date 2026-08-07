@@ -11,6 +11,7 @@ use data_mover::dir_tree::DirPageResult;
 use data_mover::{DataChunk, EntryEnum, StorageEnum};
 use tokio::sync::mpsc::{Receiver, Sender};
 use tracing::{debug, info, warn};
+use transport::flow_control::ReceiverCreditState;
 use transport::message::{
     BlockSignature, DcAck, DestIndex, DiskCommitMsg, FeatureFlags, FileOutcome, NdxTable, ProgressSnapshot,
     ReceiverMsg, SessionConfig, TransferDecision,
@@ -81,7 +82,7 @@ pub(crate) struct RemoteSessionState {
     ndx_table: NdxTable,
     created_dirs: Vec<Arc<EntryEnum>>,
     active_transfer: ActiveTransfer,
-    credit_consumed: u64,
+    credit: ReceiverCreditState,
     attempts: HashMap<i32, u8>,
 }
 
@@ -296,15 +297,26 @@ impl RemoteSessionState {
         true
     }
 
-    pub(crate) async fn push_full_chunk(
-        &self, dc_tx: &Sender<DiskCommitMsg>, entry: Arc<EntryEnum>, chunk: DataChunk,
-    ) -> bool {
+    async fn push_full_chunk(&self, dc_tx: &Sender<DiskCommitMsg>, entry: Arc<EntryEnum>, chunk: DataChunk) -> bool {
         if self.active_transfer != ActiveTransfer::Full {
             warn!("[Receiver Remote] rejecting FileData without an active full transfer");
             return false;
         }
-        let _ = dc_tx.send(DiskCommitMsg::FileChunk { entry, chunk }).await;
-        true
+        dc_tx.send(DiskCommitMsg::FileChunk { entry, chunk }).await.is_ok()
+    }
+
+    /// Accepts one full-data chunk at the bounded disk-commit seam and returns
+    /// credit only after that enqueue succeeds.
+    pub(crate) async fn accept_full_chunk(
+        &mut self, transport: &(dyn ReceiverTransport + 'static), dc_tx: &Sender<DiskCommitMsg>, entry: Arc<EntryEnum>,
+        chunk: DataChunk,
+    ) -> Result<bool> {
+        let bytes = chunk.data.len() as u64;
+        if !self.push_full_chunk(dc_tx, entry, chunk).await {
+            return Ok(false);
+        }
+        self.credit.accepted(transport, bytes).await?;
+        Ok(true)
     }
 
     /// 提交 active full transfer；返回 false 表示该 `EndOfFile` 应由 delta 路径处理。
@@ -371,19 +383,33 @@ impl RemoteSessionState {
         true
     }
 
-    pub(crate) async fn push_delta_data(
+    async fn push_delta_data(
         &mut self, dc_tx: &Sender<DiskCommitMsg>, ndx: i32, entry: &Arc<EntryEnum>, data: bytes::Bytes,
     ) -> bool {
         if !self.ensure_delta_active(dc_tx, ndx, entry).await {
             return false;
         }
-        let _ = dc_tx
+        dc_tx
             .send(DiskCommitMsg::DeltaData {
                 entry: entry.clone(),
                 data,
             })
-            .await;
-        true
+            .await
+            .is_ok()
+    }
+
+    /// Accepts delta literal data through the same bounded-sink credit transition
+    /// as full-file chunks. Match tokens intentionally carry no byte credit.
+    pub(crate) async fn accept_delta_data(
+        &mut self, transport: &(dyn ReceiverTransport + 'static), dc_tx: &Sender<DiskCommitMsg>, ndx: i32,
+        entry: &Arc<EntryEnum>, data: bytes::Bytes,
+    ) -> Result<bool> {
+        let bytes = data.len() as u64;
+        if !self.push_delta_data(dc_tx, ndx, entry, data).await {
+            return Ok(false);
+        }
+        self.credit.accepted(transport, bytes).await?;
+        Ok(true)
     }
 
     /// Commits a delta stream, lazily beginning it when it contains zero tokens.
@@ -442,23 +468,10 @@ impl RemoteSessionState {
         Ok(())
     }
 
-    /// Records bytes accepted by the disk-commit seam and emits an exact delayed
-    /// credit grant once the configured threshold is reached.
-    pub(crate) async fn record_data_consumed(
-        &mut self, transport: &(dyn ReceiverTransport + 'static), bytes: u64, threshold: u64,
-    ) {
-        self.credit_consumed += bytes;
-        if self.credit_consumed < threshold {
-            return;
-        }
-        let grant = self.credit_consumed;
-        self.credit_consumed = 0;
-        let _ = transport
-            .send(ReceiverMsg::CreditGrant {
-                bytes: grant,
-                ndx: None,
-            })
-            .await;
+    /// Residual delayed credit is connection-local and no longer useful after
+    /// the receive loop terminates; explicitly discard it on every terminal path.
+    pub(crate) fn discard_residual_credit(&mut self) {
+        self.credit.reset();
     }
 
     pub(crate) async fn handle_file_outcome(
@@ -587,7 +600,7 @@ impl RemoteReceiverSession {
 }
 
 #[cfg(test)]
-#[allow(clippy::expect_used, clippy::unwrap_used)]
+#[allow(clippy::expect_used, clippy::field_reassign_with_default, clippy::unwrap_used)]
 mod tests {
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
@@ -1102,22 +1115,116 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn transfer_credit_delays_then_grants_exact_accumulated_bytes() {
+    async fn accepted_delta_literal_uses_the_same_credit_transition_as_full_data() {
+        let entry = nas_entry("delta.txt", PathBuf::from("delta.txt"), false);
         let (sender_transport, receiver_transport) = create_in_process_pair();
+        let (dc_tx, mut dc_rx) = mpsc::channel(2);
         let mut state = RemoteSessionState::default();
+        state.credit = ReceiverCreditState::new(4).unwrap();
 
-        state.record_data_consumed(&receiver_transport, 6, 10).await;
-        assert_eq!(state.credit_consumed, 6);
-
-        state.record_data_consumed(&receiver_transport, 7, 10).await;
-        assert_eq!(state.credit_consumed, 0);
+        assert!(
+            state
+                .accept_delta_data(&receiver_transport, &dc_tx, 7, &entry, Bytes::from_static(b"ab"),)
+                .await
+                .unwrap()
+        );
         assert!(matches!(
-            sender_transport.recv().await,
-            Some(ReceiverMsg::CreditGrant { bytes: 13, ndx: None })
+            dc_rx.recv().await,
+            Some(DiskCommitMsg::DeltaBegin { ndx: 7, .. })
         ));
+        assert!(matches!(dc_rx.recv().await, Some(DiskCommitMsg::DeltaData { .. })));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), sender_transport.recv())
+                .await
+                .is_err(),
+            "flow-control grants must not escape the in-process adapter"
+        );
+    }
 
-        state.record_data_consumed(&receiver_transport, 5, 10).await;
-        assert_eq!(state.credit_consumed, 5);
+    #[tokio::test]
+    async fn failed_full_chunk_enqueue_returns_no_credit() {
+        let entry = nas_entry("file.txt", PathBuf::from("file.txt"), false);
+        let (sender_transport, receiver_transport) = create_in_process_pair();
+        let (dc_tx, mut dc_rx) = mpsc::channel(1);
+        let mut state = RemoteSessionState::default();
+        state.credit = ReceiverCreditState::new(2).unwrap();
+        assert!(state.begin_full(&dc_tx, 1, entry.clone()).await);
+        assert!(matches!(dc_rx.recv().await, Some(DiskCommitMsg::FileBegin { .. })));
+        drop(dc_rx);
+
+        assert!(
+            !state
+                .accept_full_chunk(
+                    &receiver_transport,
+                    &dc_tx,
+                    entry,
+                    DataChunk {
+                        offset: 0,
+                        data: Bytes::from_static(b"ab"),
+                    },
+                )
+                .await
+                .unwrap()
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), sender_transport.recv())
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn slow_bounded_sink_stops_accepting_additional_payloads_until_capacity_returns() {
+        let entry = nas_entry("slow.bin", PathBuf::from("slow.bin"), false);
+        let (_sender_transport, receiver_transport) = create_in_process_pair();
+        let (dc_tx, mut dc_rx) = mpsc::channel(1);
+        let mut state = RemoteSessionState::default();
+        assert!(state.begin_full(&dc_tx, 1, entry.clone()).await);
+        assert!(matches!(dc_rx.recv().await, Some(DiskCommitMsg::FileBegin { .. })));
+
+        assert!(
+            state
+                .accept_full_chunk(
+                    &receiver_transport,
+                    &dc_tx,
+                    entry.clone(),
+                    DataChunk {
+                        offset: 0,
+                        data: Bytes::from_static(b"a"),
+                    },
+                )
+                .await
+                .unwrap()
+        );
+
+        let blocked = tokio::spawn(async move {
+            state
+                .accept_full_chunk(
+                    &receiver_transport,
+                    &dc_tx,
+                    entry,
+                    DataChunk {
+                        offset: 1,
+                        data: Bytes::from_static(b"b"),
+                    },
+                )
+                .await
+        });
+        tokio::task::yield_now().await;
+        assert!(
+            !blocked.is_finished(),
+            "a full bounded sink must stop accepting additional payloads"
+        );
+
+        assert!(matches!(dc_rx.recv().await, Some(DiskCommitMsg::FileChunk { .. })));
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), blocked)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap()
+        );
+        assert!(matches!(dc_rx.recv().await, Some(DiskCommitMsg::FileChunk { .. })));
     }
 
     #[tokio::test]

@@ -14,9 +14,9 @@ use tracing::info;
 
 // 内部模块
 use super::cert;
-use super::credit::{CreditWindow, DEFAULT_CREDIT_WINDOW_BYTES};
 use super::mux;
 use crate::error::{Result, TransportError};
+use crate::flow_control::{DEFAULT_CREDIT_WINDOW_BYTES, SenderCreditOutcome, SenderCreditState};
 use crate::message::{ReceiverMsg, SenderMsg, credit_cost};
 use crate::traits::SenderTransport;
 
@@ -25,7 +25,7 @@ use crate::traits::SenderTransport;
 /// 与 Receiver 之间建立 4 条 bidirectional stream 做多路复用（控制 / 文件列表 /
 /// 数据 / ack+进度，见 `quic::mux`），大文件数据流不再阻塞 progress/ack 等控制消息：
 /// - `send()` 按 `SenderMsg` variant 路由到对应物理 stream；Data 类消息（`credit_cost`
-///   命中）发送前先扣减应用层 credit（见 `quic::credit`），不足则挂起等待 Receiver 授信
+///   命中）发送前先扣减应用层 credit（见 `flow_control`），不足则挂起等待 Receiver 授信
 /// - `recv()` 从**已过滤掉 `CreditGrant`** 的 channel 读取，不会看到该 variant
 ///
 /// `CreditGrant` 的过滤/补授不放在 `recv()` 里（见 `connect_with_credit_window` 文档
@@ -39,11 +39,12 @@ pub struct QuicSenderTransport {
     send_streams: Vec<Mutex<mux::StreamSlot>>,
     incoming_rx: Mutex<UnboundedReceiver<ReceiverMsg>>,
     reader_tasks: Vec<JoinHandle<()>>,
-    credit: Arc<CreditWindow>,
+    credit: Arc<SenderCreditState>,
 }
 
 impl Drop for QuicSenderTransport {
     fn drop(&mut self) {
+        self.credit.close();
         for handle in &self.reader_tasks {
             handle.abort();
         }
@@ -55,7 +56,7 @@ impl Drop for QuicSenderTransport {
 /// - `server_cert`: 服务端 DER 证书（来自 `serve --tls-cert-out`），用于验证服务端身份。
 ///   `None` 时跳过验证（仅限内部可信网络，会打印 WARNING）。
 ///
-/// credit 窗口固定使用 `DEFAULT_CREDIT_WINDOW_BYTES`（v1 不提供配置项，见 `quic::credit`
+/// credit 窗口固定使用 `DEFAULT_CREDIT_WINDOW_BYTES`（v1 不提供配置项，见 `flow_control`
 /// 模块文档）；测试注入自定义窗口见 crate 内的 `connect_with_credit_window`。
 pub async fn connect(
     addr: SocketAddr, server_name: &str, server_cert: Option<CertificateDer<'static>>,
@@ -65,7 +66,7 @@ pub async fn connect(
 
 /// 测试注入口：用自定义 credit 窗口大小建立连接（生产路径固定走 [`connect`]）。
 /// 仅供 crate 内测试触发 credit 窗口耗尽/授信解阻塞路径，不对外暴露——v1 不提供配置项
-/// （见 `quic::credit` 模块文档）。
+/// （见 `flow_control` 模块文档）。
 ///
 /// ## credit-grant 过滤 task
 ///
@@ -110,7 +111,7 @@ pub(crate) async fn connect_with_credit_window(
     info!("[QUIC Sender] Connected to {}", addr);
 
     let (send_streams, mut raw_incoming_rx, mut reader_tasks) = mux::sender_setup(&conn).await?;
-    let credit = Arc::new(CreditWindow::new(window_bytes));
+    let credit = Arc::new(SenderCreditState::new(window_bytes)?);
 
     // credit-grant 过滤 task：见本函数文档。独立于调用方是否在调 recv()，持续把
     // CreditGrant 应用到 credit 上，其余消息转发给真正暴露给调用方的 channel。
@@ -118,15 +119,24 @@ pub(crate) async fn connect_with_credit_window(
     let filter_credit = credit.clone();
     reader_tasks.push(tokio::spawn(async move {
         while let Some(msg) = raw_incoming_rx.recv().await {
-            match msg {
-                ReceiverMsg::CreditGrant { bytes, .. } => filter_credit.grant(bytes),
-                other => {
+            match filter_credit.apply_incoming(msg) {
+                SenderCreditOutcome::Consumed(outcome) => {
+                    if outcome.discarded > 0 {
+                        tracing::warn!(
+                            "[QUIC Sender] discarded {} excess credit bytes (applied {})",
+                            outcome.discarded,
+                            outcome.applied
+                        );
+                    }
+                }
+                SenderCreditOutcome::Forward(other) => {
                     if app_tx.send(other).is_err() {
                         break;
                     }
                 }
             }
         }
+        filter_credit.close();
     }));
 
     Ok(QuicSenderTransport {
@@ -154,6 +164,7 @@ impl SenderTransport for QuicSenderTransport {
     }
 
     async fn close(&self) -> Result<()> {
+        self.credit.close();
         self.conn.close(0u32.into(), b"done");
         for handle in &self.reader_tasks {
             handle.abort();
@@ -406,5 +417,103 @@ mod tests {
         receiver_handle.await.unwrap();
         stuck_send.abort();
         sender.close().await.unwrap();
+    }
+
+    /// A new QUIC connection starts with a fresh full window; credit consumed by
+    /// the previous connection is never carried across reconnect.
+    #[tokio::test]
+    async fn reconnect_resets_consumed_credit() {
+        const TINY_WINDOW: u64 = 8;
+
+        install_crypto_provider();
+        let (server_endpoint, server_addr) = create_server_endpoint();
+        let (observed_tx, mut observed_rx) = mpsc::channel(2);
+
+        let receiver_handle = tokio::spawn(async move {
+            for _ in 0..2 {
+                let incoming = server_endpoint.accept().await.unwrap();
+                let conn = incoming.await.unwrap();
+                let (_ctrl_send, _ctrl_recv) = conn.accept_bi().await.unwrap();
+                let (_fl_send, _fl_recv) = conn.accept_bi().await.unwrap();
+                let (_data_send, mut data_recv) = conn.accept_bi().await.unwrap();
+                let (_ack_send, _ack_recv) = conn.open_bi().await.unwrap();
+
+                let message =
+                    tokio::time::timeout(Duration::from_secs(2), framing::read_msg::<SenderMsg>(&mut data_recv))
+                        .await
+                        .expect("each new connection should send with a fresh window")
+                        .unwrap();
+                assert!(matches!(message, Some(SenderMsg::FileData { .. })));
+                observed_tx.send(()).await.unwrap();
+            }
+        });
+
+        for name in ["first.bin", "second.bin"] {
+            let sender = connect_with_credit_window(server_addr, "localhost", None, TINY_WINDOW)
+                .await
+                .unwrap();
+            sender
+                .send(SenderMsg::FileData {
+                    entry: dummy_file_entry(name),
+                    chunk: DataChunk {
+                        offset: 0,
+                        data: Bytes::from_static(b"12345678"),
+                    },
+                })
+                .await
+                .unwrap();
+            observed_rx.recv().await.unwrap();
+            sender.close().await.unwrap();
+        }
+
+        receiver_handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn peer_disconnect_releases_send_waiting_for_credit() {
+        install_crypto_provider();
+        const TINY_WINDOW: u64 = 8;
+        let (server_endpoint, server_addr) = create_server_endpoint();
+
+        let receiver_handle = tokio::spawn(async move {
+            let incoming = server_endpoint.accept().await.unwrap();
+            let conn = incoming.await.unwrap();
+            let (_ctrl_send, _ctrl_recv) = conn.accept_bi().await.unwrap();
+            let (_fl_send, _fl_recv) = conn.accept_bi().await.unwrap();
+            let (_data_send, mut data_recv) = conn.accept_bi().await.unwrap();
+            let (_ack_send, _ack_recv) = conn.open_bi().await.unwrap();
+            let message = framing::read_msg::<SenderMsg>(&mut data_recv).await.unwrap();
+            assert!(matches!(message, Some(SenderMsg::FileData { .. })));
+            conn.close(0u32.into(), b"test peer shutdown");
+        });
+
+        let sender = connect_with_credit_window(server_addr, "localhost", None, TINY_WINDOW)
+            .await
+            .unwrap();
+        sender
+            .send(SenderMsg::FileData {
+                entry: dummy_file_entry("first.bin"),
+                chunk: DataChunk {
+                    offset: 0,
+                    data: Bytes::from_static(b"12345678"),
+                },
+            })
+            .await
+            .unwrap();
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            sender.send(SenderMsg::FileData {
+                entry: dummy_file_entry("blocked.bin"),
+                chunk: DataChunk {
+                    offset: 0,
+                    data: Bytes::from_static(b"12345678"),
+                },
+            }),
+        )
+        .await
+        .expect("peer disconnect must wake a send blocked on credit");
+        assert!(result.is_err());
+        receiver_handle.await.unwrap();
     }
 }

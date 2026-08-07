@@ -1,7 +1,6 @@
 //! QUIC 传输层实现（feature = "quic" 时编译）
 
 pub mod cert;
-pub mod credit;
 pub mod error;
 pub mod framing;
 mod mux;

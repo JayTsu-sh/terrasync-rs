@@ -180,7 +180,7 @@ pub enum ReceiverMsg {
     // ── Credit 流控（issue #59，方案 b：应用层字节 credit）──
     /// 补充 credit：Receiver 消费完 Data 类消息（`FileData`/`DeltaData`/`TarPacked`，
     /// 见 `credit_cost`）累计达半窗口后批量授信，Sender 收到后为对应字节数
-    /// `add_permits`（见 `quic::credit::CreditWindow`）。`ndx` 预留给未来 per-ndx
+    /// `add_permits`（见 `flow_control::SenderCreditState`）。`ndx` 预留给未来 per-ndx
     /// 粒度并行化扩展点，当前实现恒为 `None`（全局窗口，不区分具体是哪个 ndx 的数据
     /// 被消费）。
     CreditGrant { bytes: u64, ndx: Option<i32> },
