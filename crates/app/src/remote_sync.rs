@@ -467,6 +467,50 @@ mod tests {
         peer.await.unwrap();
     }
 
+    #[tokio::test]
+    async fn negotiated_sender_session_rejects_all_done_before_transfer_done() {
+        let src_dir = tempdir().unwrap();
+        let src_storage = Arc::new(
+            create_storage(src_dir.path().to_str().unwrap(), None, false)
+                .await
+                .unwrap(),
+        );
+        let walkdir_iter = src_storage.walkdir_2(None, None, None, None, 1, false).await.unwrap();
+        let (sender_transport, receiver_transport) = create_in_process_pair();
+        let peer = tokio::spawn(async move {
+            while let Some(message) = receiver_transport.recv().await {
+                if matches!(message, SenderMsg::FileListDone) {
+                    break;
+                }
+            }
+            receiver_transport.send(ReceiverMsg::AllDone).await.unwrap();
+        });
+        let checkpoint_path = src_dir.path().join("unused_checkpoint.json");
+        let stats_consumer = test_stats_consumer();
+
+        let error = RemoteSenderSession::new(RemoteSenderSessionDeps {
+            transport: &sender_transport,
+            src_storage: &src_storage,
+            walkdir_iter: &walkdir_iter,
+            qos: None,
+            enable_acl: false,
+            checkpoint_path: &checkpoint_path,
+            stats_consumer: &stats_consumer,
+        })
+        .run()
+        .await
+        .unwrap_err();
+        peer.await.unwrap();
+
+        assert!(matches!(
+            error,
+            AppError::SenderSessionStage {
+                stage: "requests/acks",
+                source,
+            } if matches!(*source, AppError::CopyError(ref reason) if reason.contains("AllDone"))
+        ));
+    }
+
     // ============================================================
     // ndx 级 redo/ack 状态机集成测试（spec 测试计划 b–f）
     //

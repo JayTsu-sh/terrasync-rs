@@ -48,7 +48,6 @@ pub(super) struct RemoteSenderSessionSummary {
 /// 协商完成后的单个 Remote Sender 会话。
 pub(super) struct RemoteSenderSession<'a> {
     deps: RemoteSenderSessionDeps<'a>,
-    lifecycle: RemoteSenderSessionLifecycle,
 }
 
 /// source-transfer operation 的 typed terminal fact。
@@ -64,14 +63,29 @@ pub(super) struct SenderSessionLedger {
     success_count: u64,
     error_count: u64,
     errored_ndx: HashSet<i32>,
-    transfer_done_sent: bool,
+    lifecycle: RemoteSenderSessionLifecycle,
 }
 
 pub(super) struct RequestAckSummary {
     pub(super) transfer_count: u64,
     pub(super) success_count: u64,
     pub(super) error_count: u64,
-    pub(super) transfer_done_sent: bool,
+}
+
+struct SourceTransferContext<'a> {
+    transport: &'a dyn SenderTransport,
+    src_storage: &'a Arc<StorageEnum>,
+    qos: Option<&'a QosManager>,
+    enable_acl: bool,
+}
+
+struct RequestLoopContext<'a> {
+    source: SourceTransferContext<'a>,
+    ndx_table: &'a Mutex<NdxTable>,
+    completed_paths: &'a mut HashSet<String>,
+    checkpoint_path: &'a Path,
+    stats_consumer: &'a Arc<AsyncMutex<StatisticConsumer>>,
+    ledger: &'a mut SenderSessionLedger,
 }
 
 impl SenderSessionLedger {
@@ -81,7 +95,7 @@ impl SenderSessionLedger {
             success_count: 0,
             error_count: 0,
             errored_ndx: HashSet::new(),
-            transfer_done_sent: false,
+            lifecycle: RemoteSenderSessionLifecycle::Advertising,
         }
     }
 
@@ -110,8 +124,25 @@ impl SenderSessionLedger {
         true
     }
 
-    pub(super) fn mark_transfer_done_sent(&mut self) {
-        self.transfer_done_sent = true;
+    fn transition(&mut self, next: RemoteSenderSessionLifecycle) {
+        debug_assert!(matches!(
+            (self.lifecycle, next),
+            (
+                RemoteSenderSessionLifecycle::Advertising,
+                RemoteSenderSessionLifecycle::RequestsOpen
+            ) | (
+                RemoteSenderSessionLifecycle::RequestsOpen,
+                RemoteSenderSessionLifecycle::TransferDoneSent
+            ) | (
+                RemoteSenderSessionLifecycle::TransferDoneSent,
+                RemoteSenderSessionLifecycle::Completed
+            ) | (_, RemoteSenderSessionLifecycle::Failed)
+        ));
+        self.lifecycle = next;
+    }
+
+    fn transfer_done_sent(&self) -> bool {
+        self.lifecycle == RemoteSenderSessionLifecycle::TransferDoneSent
     }
 
     pub(super) fn finish(self) -> RequestAckSummary {
@@ -119,7 +150,6 @@ impl SenderSessionLedger {
             transfer_count: self.transfer_count,
             success_count: self.success_count,
             error_count: self.error_count,
-            transfer_done_sent: self.transfer_done_sent,
         }
     }
 }
@@ -135,13 +165,10 @@ enum RemoteSenderSessionLifecycle {
 
 impl<'a> RemoteSenderSession<'a> {
     pub(super) fn new(deps: RemoteSenderSessionDeps<'a>) -> Self {
-        Self {
-            deps,
-            lifecycle: RemoteSenderSessionLifecycle::Advertising,
-        }
+        Self { deps }
     }
 
-    pub(super) async fn run(mut self) -> Result<RemoteSenderSessionSummary> {
+    pub(super) async fn run(self) -> Result<RemoteSenderSessionSummary> {
         let ndx_table = Mutex::new(NdxTable::new());
         let mut ledger = SenderSessionLedger::new();
         let mut completed_paths = load_checkpoint(self.deps.checkpoint_path).await;
@@ -151,7 +178,7 @@ impl<'a> RemoteSenderSession<'a> {
                 completed_paths.len()
             );
         }
-        self.transition(RemoteSenderSessionLifecycle::RequestsOpen);
+        ledger.transition(RemoteSenderSessionLifecycle::RequestsOpen);
         let advertise = async {
             advertise_file_list(
                 self.deps.transport,
@@ -163,17 +190,19 @@ impl<'a> RemoteSenderSession<'a> {
             .map_err(|source| stage_error("advertising", source))
         };
         let requests = async {
-            process_requests_and_acks(
-                self.deps.transport,
-                self.deps.src_storage,
-                &ndx_table,
-                self.deps.qos,
-                self.deps.enable_acl,
-                &mut completed_paths,
-                self.deps.checkpoint_path,
-                self.deps.stats_consumer,
-                &mut ledger,
-            )
+            process_requests_and_acks(RequestLoopContext {
+                source: SourceTransferContext {
+                    transport: self.deps.transport,
+                    src_storage: self.deps.src_storage,
+                    qos: self.deps.qos,
+                    enable_acl: self.deps.enable_acl,
+                },
+                ndx_table: &ndx_table,
+                completed_paths: &mut completed_paths,
+                checkpoint_path: self.deps.checkpoint_path,
+                stats_consumer: self.deps.stats_consumer,
+                ledger: &mut ledger,
+            })
             .await
             .map_err(|source| stage_error("requests/acks", source))
         };
@@ -181,16 +210,12 @@ impl<'a> RemoteSenderSession<'a> {
         let (page_count, ()) = match joined {
             Ok(result) => result,
             Err(error) => {
-                self.transition(RemoteSenderSessionLifecycle::Failed);
+                ledger.transition(RemoteSenderSessionLifecycle::Failed);
                 return Err(error);
             }
         };
         let request_summary = ledger.finish();
         save_or_clear_checkpoint(self.deps.checkpoint_path, &completed_paths, request_summary.error_count).await;
-        if request_summary.transfer_done_sent {
-            self.transition(RemoteSenderSessionLifecycle::TransferDoneSent);
-        }
-        self.transition(RemoteSenderSessionLifecycle::Completed);
 
         Ok(RemoteSenderSessionSummary {
             page_count,
@@ -202,28 +227,6 @@ impl<'a> RemoteSenderSession<'a> {
             success_count: request_summary.success_count,
             error_count: request_summary.error_count,
         })
-    }
-
-    fn transition(&mut self, next: RemoteSenderSessionLifecycle) {
-        debug_assert!(matches!(
-            (self.lifecycle, next),
-            (
-                RemoteSenderSessionLifecycle::Advertising,
-                RemoteSenderSessionLifecycle::RequestsOpen | RemoteSenderSessionLifecycle::Failed
-            ) | (
-                RemoteSenderSessionLifecycle::RequestsOpen,
-                RemoteSenderSessionLifecycle::TransferDoneSent
-                    | RemoteSenderSessionLifecycle::Completed
-                    | RemoteSenderSessionLifecycle::Failed
-            ) | (
-                RemoteSenderSessionLifecycle::TransferDoneSent,
-                RemoteSenderSessionLifecycle::Completed | RemoteSenderSessionLifecycle::Failed
-            ) | (
-                RemoteSenderSessionLifecycle::Completed,
-                RemoteSenderSessionLifecycle::Failed
-            )
-        ));
-        self.lifecycle = next;
     }
 }
 
@@ -365,14 +368,16 @@ pub(super) async fn send_acl_if_enabled(
 }
 
 /// Delta source stream：matcher 与 token emission 都由 session implementation 持有。
-#[allow(
-    clippy::too_many_arguments,
-    reason = "internal transition receives one decoded delta request"
-)]
-pub(super) async fn send_delta_transfer(
-    transport: &dyn SenderTransport, src_storage: &Arc<StorageEnum>, entry: &Arc<EntryEnum>, ndx: i32, block_size: u32,
-    signatures: Vec<BlockSignature>, qos: Option<&QosManager>, enable_acl: bool,
+async fn send_delta_transfer(
+    context: &SourceTransferContext<'_>, entry: &Arc<EntryEnum>, ndx: i32, block_size: u32,
+    signatures: Vec<BlockSignature>,
 ) -> Result<SourceTransferOutcome> {
+    let SourceTransferContext {
+        transport,
+        src_storage,
+        qos,
+        enable_acl,
+    } = context;
     let signatures = signatures
         .into_iter()
         .map(|signature| sync_delta::BlockSignature {
@@ -386,11 +391,11 @@ pub(super) async fn send_delta_transfer(
     while let Some(chunk) = chunks.recv().await {
         let tokens = matcher.push(&chunk.data);
         token_count += tokens.len();
-        send_delta_tokens(transport, ndx, tokens, qos).await?;
+        send_delta_tokens(*transport, ndx, tokens, *qos).await?;
     }
     let tokens = matcher.finish();
     token_count += tokens.len();
-    send_delta_tokens(transport, ndx, tokens, qos).await?;
+    send_delta_tokens(*transport, ndx, tokens, *qos).await?;
 
     let read_result = match read_join.await {
         Ok(inner) => inner.map_err(|error| error.to_string()),
@@ -410,7 +415,7 @@ pub(super) async fn send_delta_transfer(
                 entry.get_relative_path(),
                 token_count
             );
-            send_acl_if_enabled(transport, src_storage, entry, enable_acl).await;
+            send_acl_if_enabled(*transport, src_storage, entry, *enable_acl).await;
             Ok(SourceTransferOutcome::Sent)
         }
         Err(reason) => {
@@ -447,15 +452,21 @@ async fn send_delta_tokens(
 }
 
 /// 唯一的 Receiver-message consumer；完成协议与所有 terminal transitions 在此收口。
-#[allow(
-    clippy::too_many_arguments,
-    reason = "internal loop owns the complete negotiated-session context"
-)]
-pub(super) async fn process_requests_and_acks(
-    transport: &dyn SenderTransport, src_storage: &Arc<StorageEnum>, ndx_table: &Mutex<NdxTable>,
-    qos: Option<&QosManager>, enable_acl: bool, completed_paths: &mut HashSet<String>, checkpoint_path: &Path,
-    stats_consumer: &Arc<AsyncMutex<StatisticConsumer>>, ledger: &mut SenderSessionLedger,
-) -> Result<()> {
+async fn process_requests_and_acks(context: RequestLoopContext<'_>) -> Result<()> {
+    let RequestLoopContext {
+        source,
+        ndx_table,
+        completed_paths,
+        checkpoint_path,
+        stats_consumer,
+        ledger,
+    } = context;
+    let SourceTransferContext {
+        transport,
+        src_storage,
+        qos,
+        enable_acl,
+    } = &source;
     info!("[Sender Remote] Processing transfer requests + collecting acks");
     loop {
         match transport.recv().await {
@@ -468,7 +479,7 @@ pub(super) async fn process_requests_and_acks(
                 if let Some(entry) = entry {
                     record_classification(stats_consumer, decision, entry.clone()).await;
                     if matches!(
-                        send_full_transfer(transport, src_storage, &entry, ndx, qos, enable_acl).await?,
+                        send_full_transfer(*transport, src_storage, &entry, ndx, *qos, *enable_acl).await?,
                         SourceTransferOutcome::SourceFailed
                     ) && ledger.record_indexed_error(ndx)
                     {
@@ -497,17 +508,7 @@ pub(super) async fn process_requests_and_acks(
                 if let Some(entry) = entry {
                     record_classification(stats_consumer, TransferDecision::DeltaTransfer, entry.clone()).await;
                     if matches!(
-                        send_delta_transfer(
-                            transport,
-                            src_storage,
-                            &entry,
-                            ndx,
-                            block_size,
-                            signatures,
-                            qos,
-                            enable_acl,
-                        )
-                        .await?,
+                        send_delta_transfer(&source, &entry, ndx, block_size, signatures).await?,
                         SourceTransferOutcome::Sent
                     ) {
                         ledger.record_transfer();
@@ -534,7 +535,7 @@ pub(super) async fn process_requests_and_acks(
                     .cloned();
                 if let Some(entry) = entry {
                     if matches!(
-                        send_full_transfer(transport, src_storage, &entry, ndx, qos, enable_acl).await?,
+                        send_full_transfer(*transport, src_storage, &entry, ndx, *qos, *enable_acl).await?,
                         SourceTransferOutcome::SourceFailed
                     ) {
                         ledger.record_indexed_error(ndx);
@@ -544,13 +545,13 @@ pub(super) async fn process_requests_and_acks(
                 }
             }
             Some(ReceiverMsg::RequestsDone) => {
-                if !ledger.transfer_done_sent {
+                if !ledger.transfer_done_sent() {
                     info!(
                         "[Sender Remote] All requests received, {} files to transfer",
                         ledger.transfer_count()
                     );
                     transport.send(SenderMsg::TransferDone).await?;
-                    ledger.mark_transfer_done_sent();
+                    ledger.transition(RemoteSenderSessionLifecycle::TransferDoneSent);
                 }
             }
             Some(ReceiverMsg::Success { ndx }) => {
@@ -591,7 +592,15 @@ pub(super) async fn process_requests_and_acks(
                     record_copy_error(stats_consumer, path, reason).await;
                 }
             }
-            Some(ReceiverMsg::AllDone) => break,
+            Some(ReceiverMsg::AllDone) => {
+                if !ledger.transfer_done_sent() {
+                    return Err(AppError::CopyError(
+                        "Received AllDone before RequestsDone/TransferDone".into(),
+                    ));
+                }
+                ledger.transition(RemoteSenderSessionLifecycle::Completed);
+                break;
+            }
             Some(other) => {
                 debug!("[Sender Remote] Ignoring message: {:?}", std::mem::discriminant(&other));
             }
