@@ -133,6 +133,12 @@ pub(crate) struct SenderCreditState {
     semaphore: Semaphore,
 }
 
+/// Separates transport-internal grants from application-visible messages.
+pub(crate) enum SenderCreditOutcome {
+    Consumed,
+    Forward(ReceiverMsg),
+}
+
 impl SenderCreditState {
     /// 用指定窗口大小构造；生产路径固定使用 [`DEFAULT_CREDIT_WINDOW_BYTES`]
     /// （见 `quic::sender::connect`），测试注入更小的窗口以触发阻塞/授信路径。
@@ -171,6 +177,21 @@ impl SenderCreditState {
     pub(crate) fn grant(&self, bytes: u64) {
         let n = usize::try_from(bytes).unwrap_or(usize::MAX);
         self.semaphore.add_permits(n);
+    }
+
+    pub(crate) fn apply_incoming(&self, message: ReceiverMsg) -> SenderCreditOutcome {
+        match message {
+            ReceiverMsg::CreditGrant { bytes, .. } => {
+                self.grant(bytes);
+                SenderCreditOutcome::Consumed
+            }
+            message => SenderCreditOutcome::Forward(message),
+        }
+    }
+
+    /// Wakes every pending acquire with an error during connection shutdown.
+    pub(crate) fn close(&self) {
+        self.semaphore.close();
     }
 }
 
@@ -231,6 +252,39 @@ mod tests {
             ReceiverCreditState::new(u64::MAX),
             Err(TransportError::InvalidCreditConfiguration { .. })
         ));
+    }
+
+    #[test]
+    fn sender_credit_consumes_grants_and_forwards_application_messages() {
+        let credit = SenderCreditState::new(10).unwrap();
+
+        assert!(matches!(
+            credit.apply_incoming(ReceiverMsg::CreditGrant { bytes: 4, ndx: None }),
+            SenderCreditOutcome::Consumed
+        ));
+        assert!(matches!(
+            credit.apply_incoming(ReceiverMsg::RequestsDone),
+            SenderCreditOutcome::Forward(ReceiverMsg::RequestsDone)
+        ));
+    }
+
+    #[tokio::test]
+    async fn sender_credit_close_releases_pending_acquire_with_error() {
+        let credit = Arc::new(SenderCreditState::new(1).unwrap());
+        credit.acquire(1).await.unwrap();
+        let waiting_credit = credit.clone();
+        let waiting = tokio::spawn(async move { waiting_credit.acquire(1).await });
+        tokio::task::yield_now().await;
+
+        credit.close();
+
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), waiting)
+                .await
+                .unwrap()
+                .unwrap()
+                .is_err()
+        );
     }
 
     /// 窗口耗尽后 `acquire()` 应挂起，直到 `grant()` 补充足够 permits 才被唤醒——这是

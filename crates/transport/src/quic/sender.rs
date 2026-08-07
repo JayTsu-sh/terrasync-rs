@@ -14,7 +14,7 @@ use tracing::info;
 
 // 内部模块
 use super::cert;
-use super::credit::{DEFAULT_CREDIT_WINDOW_BYTES, SenderCreditState};
+use super::credit::{DEFAULT_CREDIT_WINDOW_BYTES, SenderCreditOutcome, SenderCreditState};
 use super::mux;
 use crate::error::{Result, TransportError};
 use crate::message::{ReceiverMsg, SenderMsg, credit_cost};
@@ -44,6 +44,7 @@ pub struct QuicSenderTransport {
 
 impl Drop for QuicSenderTransport {
     fn drop(&mut self) {
+        self.credit.close();
         for handle in &self.reader_tasks {
             handle.abort();
         }
@@ -118,9 +119,9 @@ pub(crate) async fn connect_with_credit_window(
     let filter_credit = credit.clone();
     reader_tasks.push(tokio::spawn(async move {
         while let Some(msg) = raw_incoming_rx.recv().await {
-            match msg {
-                ReceiverMsg::CreditGrant { bytes, .. } => filter_credit.grant(bytes),
-                other => {
+            match filter_credit.apply_incoming(msg) {
+                SenderCreditOutcome::Consumed => {}
+                SenderCreditOutcome::Forward(other) => {
                     if app_tx.send(other).is_err() {
                         break;
                     }
@@ -154,6 +155,7 @@ impl SenderTransport for QuicSenderTransport {
     }
 
     async fn close(&self) -> Result<()> {
+        self.credit.close();
         self.conn.close(0u32.into(), b"done");
         for handle in &self.reader_tasks {
             handle.abort();
