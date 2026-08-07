@@ -14,6 +14,7 @@ mod remote_sender_session;
 #[cfg(test)]
 use remote_sender_session::advertise_file_list;
 use remote_sender_session::{RemoteSenderSession, RemoteSenderSessionDeps};
+use remote_sender_session::{SourceTransferOutcome, send_acl_if_enabled, send_full_transfer};
 
 use std::collections::HashSet;
 use std::net::SocketAddr;
@@ -288,8 +289,10 @@ async fn process_requests_and_acks(
                     // 源读/符号链接读失败：Sender 已发 EntryError 通知 Receiver 完成该
                     // ndx，这里自增 error_count（Sender 自检失败由 Sender 自己计数，见 [0][3]）；
                     // 同时喂入 ErrorStats，使报表如实反映该失败（issue #57）
-                    if !handle_full_transfer(transport, src_storage, &entry, ndx, qos, enable_acl).await?
-                        && count_ndx_error(&mut errored_ndx, ndx, &mut error_count)
+                    if matches!(
+                        send_full_transfer(transport, src_storage, &entry, ndx, qos, enable_acl).await?,
+                        SourceTransferOutcome::SourceFailed
+                    ) && count_ndx_error(&mut errored_ndx, ndx, &mut error_count)
                     {
                         let msg = entry_error_stats_message(
                             entry.get_relative_path().to_path_buf(),
@@ -366,7 +369,10 @@ async fn process_requests_and_acks(
                     .get(ndx)
                     .cloned();
                 if let Some(entry) = entry {
-                    if !handle_full_transfer(transport, src_storage, &entry, ndx, qos, enable_acl).await? {
+                    if matches!(
+                        send_full_transfer(transport, src_storage, &entry, ndx, qos, enable_acl).await?,
+                        SourceTransferOutcome::SourceFailed
+                    ) {
                         count_ndx_error(&mut errored_ndx, ndx, &mut error_count);
                     }
                 } else {
@@ -543,102 +549,6 @@ async fn record_success_and_checkpoint(
     }
 }
 
-/// 全量传输一个 entry（目录 / 符号链接 / 文件分块）。
-///
-/// `ndx` 串入 `FileBegin`/`FileData`/`EndOfFile`，使 Receiver 能把校验结果关联回该 ndx
-/// （redo 决策所需，见 Receiver session outcome policy）；也是 `Redo{ndx}` 重发的入口——
-/// delta redo 与首次全量传输走同一份实现。
-///
-/// 返回 `Ok(true)` = 已成功发出该 entry 的数据（目录/符号链接/文件三选一）；
-/// `Ok(false)` = 源读失败（符号链接读失败 / 源文件读失败），已发送带 `ndx` 的
-/// `SenderMsg::EntryError` 通知 Receiver 完成该 ndx（Receiver 不再回发
-/// `ReceiverMsg::Error`），调用方需据此自增 `error_count`（Sender 自检失败由 Sender
-/// 自己计数，不依赖 Receiver 回传）。
-async fn handle_full_transfer(
-    transport: &(dyn SenderTransport + 'static), src_storage: &Arc<StorageEnum>, entry: &Arc<data_mover::EntryEnum>,
-    ndx: i32, qos: Option<&QosManager>, enable_acl: bool,
-) -> Result<bool> {
-    let ok = if entry.get_is_dir() {
-        transport.send(SenderMsg::CreateDir { entry: entry.clone() }).await?;
-        true
-    } else if entry.get_is_symlink() {
-        match src_storage.read_symlink(entry).await {
-            Ok(target) => {
-                transport
-                    .send(SenderMsg::CreateSymlink {
-                        entry: entry.clone(),
-                        target,
-                    })
-                    .await?;
-                true
-            }
-            Err(e) => {
-                error!("[Sender Remote] read_symlink {:?}: {}", entry.get_relative_path(), e);
-                transport
-                    .send(SenderMsg::EntryError {
-                        path: entry.get_relative_path().to_path_buf(),
-                        reason: format!("{e}"),
-                        ndx: Some(ndx),
-                    })
-                    .await?;
-                false
-            }
-        }
-    } else {
-        // 流式读源文件：read_chunk_stream 内部按块读 + per-chunk QoS + hash（不再整文件驻留 RAM）
-        let (mut rx, hash_handle) = StorageEnum::read_chunk_stream(src_storage, entry, None, qos.cloned(), true, 8);
-        transport
-            .send(SenderMsg::FileBegin {
-                ndx,
-                entry: entry.clone(),
-            })
-            .await?;
-        while let Some(chunk) = rx.recv().await {
-            transport
-                .send(SenderMsg::FileData {
-                    entry: entry.clone(),
-                    chunk,
-                })
-                .await?;
-        }
-        // 读任务收尾：JoinError 或内层读错误统一归一为原因字符串
-        let read_result = match hash_handle.await {
-            Ok(inner) => inner.map_err(|e| e.to_string()),
-            Err(e) => Err(e.to_string()),
-        };
-        match read_result {
-            // 成功：拿到源 hash（整文件 BLAKE3 十六进制）并收尾
-            Ok(hasher) => {
-                let source_hash = hasher.map(ConsistencyCheck::finalize);
-                transport
-                    .send(SenderMsg::EndOfFile {
-                        ndx,
-                        entry: entry.clone(),
-                        source_hash,
-                    })
-                    .await?;
-                true
-            }
-            // 读失败：记录日志 + 通知 Receiver 丢弃该文件已收分片、完成该 ndx（不发 ACL、不中断会话）
-            Err(reason) => {
-                error!("[Sender Remote] read file {:?}: {}", entry.get_relative_path(), reason);
-                transport
-                    .send(SenderMsg::EntryError {
-                        path: entry.get_relative_path().to_path_buf(),
-                        reason,
-                        ndx: Some(ndx),
-                    })
-                    .await?;
-                false
-            }
-        }
-    };
-    if ok {
-        send_acl_if_enabled(transport, src_storage, entry, enable_acl).await;
-    }
-    Ok(ok)
-}
-
 /// 逐 token 发送 `DeltaMatch`/`DeltaData` 消息（wire 协议不变）；`Data` token 走 QoS 限速，
 /// 与整片版本原有行为一致。
 async fn send_delta_tokens(
@@ -726,24 +636,6 @@ async fn handle_delta_transfer(
                 .await?;
             Ok(false)
         }
-    }
-}
-
-/// ACL 跨进程传输：仅在 `enable_acl=true` 且非符号链接时发送。
-async fn send_acl_if_enabled(
-    transport: &(dyn SenderTransport + 'static), src_storage: &Arc<StorageEnum>, entry: &Arc<data_mover::EntryEnum>,
-    enable_acl: bool,
-) {
-    if enable_acl
-        && !entry.get_is_symlink()
-        && let Ok(Some(acl_data)) = src_storage.get_acl_bytes(entry.get_relative_path()).await
-    {
-        let _ = transport
-            .send(SenderMsg::SetAcl {
-                entry: entry.clone(),
-                acl_data: bytes::Bytes::from(acl_data),
-            })
-            .await;
     }
 }
 

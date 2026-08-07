@@ -11,9 +11,9 @@ use std::sync::{Arc, Mutex, PoisonError};
 use data_mover::StorageEntryMessage;
 use data_mover::dir_tree::NdxEvent;
 use data_mover::qos::QosManager;
-use data_mover::{StorageEnum, WalkDirAsyncIterator2};
+use data_mover::{ConsistencyCheck, EntryEnum, StorageEnum, WalkDirAsyncIterator2};
 use tokio::sync::Mutex as AsyncMutex;
-use tracing::info;
+use tracing::{error, info};
 use transport::message::{NdxTable, SenderMsg};
 use transport::traits::SenderTransport;
 
@@ -44,6 +44,13 @@ pub(super) struct RemoteSenderSessionSummary {
 pub(super) struct RemoteSenderSession<'a> {
     deps: RemoteSenderSessionDeps<'a>,
     lifecycle: RemoteSenderSessionLifecycle,
+}
+
+/// source-transfer operation 的 typed terminal fact。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum SourceTransferOutcome {
+    Sent,
+    SourceFailed,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -173,6 +180,105 @@ pub(super) async fn advertise_file_list(
     }
     transport.send(SenderMsg::FileListDone).await?;
     Ok(page_count)
+}
+
+/// 发送一个 full entry；目录、符号链接和 bounded file stream 共用一个 typed outcome。
+pub(super) async fn send_full_transfer(
+    transport: &(dyn SenderTransport + 'static), src_storage: &Arc<StorageEnum>, entry: &Arc<EntryEnum>, ndx: i32,
+    qos: Option<&QosManager>, enable_acl: bool,
+) -> Result<SourceTransferOutcome> {
+    let outcome = if entry.get_is_dir() {
+        transport.send(SenderMsg::CreateDir { entry: entry.clone() }).await?;
+        SourceTransferOutcome::Sent
+    } else if entry.get_is_symlink() {
+        match src_storage.read_symlink(entry).await {
+            Ok(target) => {
+                transport
+                    .send(SenderMsg::CreateSymlink {
+                        entry: entry.clone(),
+                        target,
+                    })
+                    .await?;
+                SourceTransferOutcome::Sent
+            }
+            Err(error) => {
+                error!("[Sender Remote] read_symlink {:?}: {error}", entry.get_relative_path());
+                transport
+                    .send(SenderMsg::EntryError {
+                        path: entry.get_relative_path().to_path_buf(),
+                        reason: error.to_string(),
+                        ndx: Some(ndx),
+                    })
+                    .await?;
+                SourceTransferOutcome::SourceFailed
+            }
+        }
+    } else {
+        let (mut chunks, read_join) = StorageEnum::read_chunk_stream(src_storage, entry, None, qos.cloned(), true, 8);
+        transport
+            .send(SenderMsg::FileBegin {
+                ndx,
+                entry: entry.clone(),
+            })
+            .await?;
+        while let Some(chunk) = chunks.recv().await {
+            transport
+                .send(SenderMsg::FileData {
+                    entry: entry.clone(),
+                    chunk,
+                })
+                .await?;
+        }
+        let read_result = match read_join.await {
+            Ok(inner) => inner.map_err(|error| error.to_string()),
+            Err(error) => Err(error.to_string()),
+        };
+        match read_result {
+            Ok(hasher) => {
+                transport
+                    .send(SenderMsg::EndOfFile {
+                        ndx,
+                        entry: entry.clone(),
+                        source_hash: hasher.map(ConsistencyCheck::finalize),
+                    })
+                    .await?;
+                SourceTransferOutcome::Sent
+            }
+            Err(reason) => {
+                error!("[Sender Remote] read file {:?}: {reason}", entry.get_relative_path());
+                transport
+                    .send(SenderMsg::EntryError {
+                        path: entry.get_relative_path().to_path_buf(),
+                        reason,
+                        ndx: Some(ndx),
+                    })
+                    .await?;
+                SourceTransferOutcome::SourceFailed
+            }
+        }
+    };
+    if outcome == SourceTransferOutcome::Sent {
+        send_acl_if_enabled(transport, src_storage, entry, enable_acl).await;
+    }
+    Ok(outcome)
+}
+
+/// ACL 跨进程传输：仅在启用且 entry 不是符号链接时发送。
+pub(super) async fn send_acl_if_enabled(
+    transport: &(dyn SenderTransport + 'static), src_storage: &Arc<StorageEnum>, entry: &Arc<EntryEnum>,
+    enable_acl: bool,
+) {
+    if enable_acl
+        && !entry.get_is_symlink()
+        && let Ok(Some(acl_data)) = src_storage.get_acl_bytes(entry.get_relative_path()).await
+    {
+        let _ = transport
+            .send(SenderMsg::SetAcl {
+                entry: entry.clone(),
+                acl_data: bytes::Bytes::from(acl_data),
+            })
+            .await;
+    }
 }
 
 fn stage_error(stage: &'static str, source: AppError) -> AppError {
