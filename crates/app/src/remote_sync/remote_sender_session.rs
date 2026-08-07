@@ -17,11 +17,11 @@ use data_mover::{ConsistencyCheck, EntryEnum, StorageEnum, WalkDirAsyncIterator2
 use sync_delta::DeltaToken;
 use sync_delta::matcher::DeltaMatcher;
 use tokio::sync::Mutex as AsyncMutex;
-use tracing::{error, info, warn};
-use transport::message::{BlockSignature, NdxTable, ProgressSnapshot, SenderMsg, TransferDecision};
+use tracing::{debug, error, info, warn};
+use transport::message::{BlockSignature, NdxTable, ProgressSnapshot, ReceiverMsg, SenderMsg, TransferDecision};
 use transport::traits::SenderTransport;
 
-use super::{AppError, Result, StatisticConsumer, process_requests_and_acks};
+use super::{AppError, Result, StatisticConsumer};
 use crate::consumer::stats::format_bytes;
 
 /// 构造 negotiated session 所需的既有 adapter 与配置。
@@ -436,6 +436,155 @@ async fn send_delta_tokens(
                 }
                 transport.send(SenderMsg::DeltaData { ndx, data }).await?;
             }
+        }
+    }
+    Ok(())
+}
+
+/// 唯一的 Receiver-message consumer；完成协议与所有 terminal transitions 在此收口。
+pub(super) async fn process_requests_and_acks(
+    transport: &(dyn SenderTransport + 'static), src_storage: &Arc<StorageEnum>, ndx_table: &Mutex<NdxTable>,
+    qos: Option<&QosManager>, enable_acl: bool, completed_paths: &mut HashSet<String>, checkpoint_path: &Path,
+    stats_consumer: &Arc<AsyncMutex<StatisticConsumer>>, ledger: &mut SenderSessionLedger,
+) -> Result<()> {
+    info!("[Sender Remote] Processing transfer requests + collecting acks");
+    loop {
+        match transport.recv().await {
+            Some(ReceiverMsg::TransferRequest { ndx, decision }) => {
+                let entry = ndx_table
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .get(ndx)
+                    .cloned();
+                if let Some(entry) = entry {
+                    record_classification(stats_consumer, decision, entry.clone()).await;
+                    if matches!(
+                        send_full_transfer(transport, src_storage, &entry, ndx, qos, enable_acl).await?,
+                        SourceTransferOutcome::SourceFailed
+                    ) && ledger.record_indexed_error(ndx)
+                    {
+                        record_copy_error(
+                            stats_consumer,
+                            entry.get_relative_path().to_path_buf(),
+                            format!("source read failed for ndx {ndx}"),
+                        )
+                        .await;
+                    }
+                    ledger.record_transfer();
+                } else {
+                    error!("[Sender Remote] Unknown NDX {ndx}");
+                }
+            }
+            Some(ReceiverMsg::DeltaTransferRequest {
+                ndx,
+                block_size,
+                signatures,
+            }) => {
+                let entry = ndx_table
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .get(ndx)
+                    .cloned();
+                if let Some(entry) = entry {
+                    record_classification(stats_consumer, TransferDecision::DeltaTransfer, entry.clone()).await;
+                    if matches!(
+                        send_delta_transfer(
+                            transport,
+                            src_storage,
+                            &entry,
+                            ndx,
+                            block_size,
+                            signatures,
+                            qos,
+                            enable_acl,
+                        )
+                        .await?,
+                        SourceTransferOutcome::Sent
+                    ) {
+                        ledger.record_transfer();
+                    } else if ledger.record_indexed_error(ndx) {
+                        record_copy_error(
+                            stats_consumer,
+                            entry.get_relative_path().to_path_buf(),
+                            format!("delta source read failed for ndx {ndx}"),
+                        )
+                        .await;
+                    }
+                } else {
+                    error!("[Sender Remote] Unknown NDX {ndx} for delta");
+                }
+            }
+            Some(ReceiverMsg::Classified { entry, decision }) => {
+                record_classification(stats_consumer, decision, entry).await;
+            }
+            Some(ReceiverMsg::Redo { ndx }) => {
+                let entry = ndx_table
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .get(ndx)
+                    .cloned();
+                if let Some(entry) = entry {
+                    if matches!(
+                        send_full_transfer(transport, src_storage, &entry, ndx, qos, enable_acl).await?,
+                        SourceTransferOutcome::SourceFailed
+                    ) {
+                        ledger.record_indexed_error(ndx);
+                    }
+                } else {
+                    error!("[Sender Remote] Unknown NDX {ndx} for redo");
+                }
+            }
+            Some(ReceiverMsg::RequestsDone) => {
+                if !ledger.transfer_done_sent {
+                    info!(
+                        "[Sender Remote] All requests received, {} files to transfer",
+                        ledger.transfer_count()
+                    );
+                    transport.send(SenderMsg::TransferDone).await?;
+                    ledger.mark_transfer_done_sent();
+                }
+            }
+            Some(ReceiverMsg::Success { ndx }) => {
+                let relative_path = ndx_table
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .get(ndx)
+                    .map(|entry| entry.get_relative_path().to_string_lossy().to_string());
+                record_success_and_checkpoint(relative_path, ledger, completed_paths, checkpoint_path).await;
+            }
+            Some(ReceiverMsg::EntrySuccess { ref entry }) => {
+                record_success_and_checkpoint(
+                    Some(entry.get_relative_path().to_string_lossy().to_string()),
+                    ledger,
+                    completed_paths,
+                    checkpoint_path,
+                )
+                .await;
+            }
+            Some(ReceiverMsg::Progress(snapshot)) => apply_progress(stats_consumer, snapshot).await,
+            Some(ReceiverMsg::EntryError { entry, reason }) => {
+                let path = entry.get_relative_path().to_path_buf();
+                error!("[Sender Remote] Entry failed {path:?}: {reason}");
+                ledger.record_entry_error();
+                record_copy_error(stats_consumer, path, reason).await;
+            }
+            Some(ReceiverMsg::Error { ndx, reason }) => {
+                error!("[Sender Remote] NDX {ndx} failed: {reason}");
+                if ledger.record_indexed_error(ndx) {
+                    let path = ndx_table
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .get(ndx)
+                        .map(|entry| entry.get_relative_path().to_path_buf())
+                        .unwrap_or_else(|| PathBuf::from(format!("<ndx-{ndx}>")));
+                    record_copy_error(stats_consumer, path, reason).await;
+                }
+            }
+            Some(ReceiverMsg::AllDone) => break,
+            Some(other) => {
+                debug!("[Sender Remote] Ignoring message: {:?}", std::mem::discriminant(&other));
+            }
+            None => return Err(AppError::CopyError("Transport closed during request/ack phase".into())),
         }
     }
     Ok(())

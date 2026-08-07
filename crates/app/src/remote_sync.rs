@@ -13,32 +13,44 @@ mod remote_sender_session;
 
 #[cfg(test)]
 use remote_sender_session::advertise_file_list;
+#[cfg(test)]
 use remote_sender_session::record_success_and_checkpoint;
 use remote_sender_session::{RemoteSenderSession, RemoteSenderSessionDeps};
+#[cfg(test)]
 use remote_sender_session::{SenderSessionLedger, SourceTransferOutcome, send_delta_transfer, send_full_transfer};
+#[cfg(test)]
 use remote_sender_session::{apply_progress, record_classification, record_copy_error};
 #[cfg(test)]
 use remote_sender_session::{classification_to_stats_message, entry_error_stats_message};
 
+#[cfg(test)]
 use std::collections::HashSet;
 use std::net::SocketAddr;
+#[cfg(test)]
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::Arc;
+#[cfg(test)]
+use std::sync::{Mutex, PoisonError};
 
+#[cfg(test)]
+use data_mover::StorageEnum;
+use data_mover::create_storage;
 #[cfg(test)]
 use data_mover::dir_tree::NdxEvent;
 use data_mover::filter::parse_filter_expression;
+#[cfg(test)]
 use data_mover::qos::QosManager;
 #[cfg(test)]
 use data_mover::{ChangeKind, EntryEnum, ErrorEvent, StorageEntryMessage};
-use data_mover::{StorageEnum, create_storage};
 use rustls::pki_types::CertificateDer;
 use tokio::sync::Mutex as AsyncMutex;
-use tracing::{debug, error, info, warn};
+#[cfg(test)]
+use tracing::{debug, error};
+use tracing::{info, warn};
 use transport::error::TransportError;
-use transport::message::{
-    HandshakeResult, NdxTable, ProtocolHandshake, ReceiverMsg, SenderMsg, SessionConfig, TransferDecision,
-};
+use transport::message::{HandshakeResult, ProtocolHandshake, ReceiverMsg, SenderMsg, SessionConfig};
+#[cfg(test)]
+use transport::message::{NdxTable, TransferDecision};
 use transport::traits::SenderTransport;
 use utils::app_config::AppConfig;
 use utils::logger;
@@ -252,6 +264,7 @@ async fn send_and_check_auth(transport: &(dyn SenderTransport + 'static), auth_t
 /// `classification_to_stats_message`，issue #23）；`Redo{ndx}` 是重发、不是新的分类
 /// 事件，不重复计数。
 /// 返回 `(transfer_count, success_count, error_count)`。
+#[cfg(test)]
 async fn process_requests_and_acks(
     transport: &(dyn SenderTransport + 'static), src_storage: &Arc<StorageEnum>, ndx_table: &Mutex<NdxTable>,
     qos: Option<&QosManager>, enable_acl: bool, completed_paths: &mut HashSet<String>, checkpoint_path: &Path,
@@ -609,6 +622,51 @@ mod tests {
                 source,
             } if matches!(*source, AppError::CopyError(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn negotiated_sender_session_sends_transfer_done_once_for_duplicate_requests_done() {
+        let src_dir = tempdir().unwrap();
+        let src_storage = Arc::new(
+            create_storage(src_dir.path().to_str().unwrap(), None, false)
+                .await
+                .unwrap(),
+        );
+        let walkdir_iter = src_storage.walkdir_2(None, None, None, None, 1, false).await.unwrap();
+        let (sender_transport, receiver_transport) = create_in_process_pair();
+        let peer = tokio::spawn(async move {
+            while let Some(message) = receiver_transport.recv().await {
+                if matches!(message, SenderMsg::FileListDone) {
+                    break;
+                }
+            }
+            receiver_transport.send(ReceiverMsg::RequestsDone).await.unwrap();
+            receiver_transport.send(ReceiverMsg::RequestsDone).await.unwrap();
+            assert!(matches!(receiver_transport.recv().await, Some(SenderMsg::TransferDone)));
+            assert!(
+                tokio::time::timeout(Duration::from_millis(50), receiver_transport.recv())
+                    .await
+                    .is_err(),
+                "duplicate RequestsDone must not emit duplicate TransferDone"
+            );
+            receiver_transport.send(ReceiverMsg::AllDone).await.unwrap();
+        });
+        let checkpoint_path = src_dir.path().join("unused_checkpoint.json");
+        let stats_consumer = test_stats_consumer();
+
+        RemoteSenderSession::new(RemoteSenderSessionDeps {
+            transport: &sender_transport,
+            src_storage: &src_storage,
+            walkdir_iter: &walkdir_iter,
+            qos: None,
+            enable_acl: false,
+            checkpoint_path: &checkpoint_path,
+            stats_consumer: &stats_consumer,
+        })
+        .run()
+        .await
+        .unwrap();
+        peer.await.unwrap();
     }
 
     // ============================================================
