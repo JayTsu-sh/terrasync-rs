@@ -3,6 +3,7 @@
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 
 use app::disk_commit::disk_commit_task;
 use app::receiver::ReceiverProgress;
@@ -89,21 +90,29 @@ fn chunkify(bytes: &[u8], chunk_size: usize) -> Vec<(u64, Bytes)> {
 // 起 disk_commit_task，喂消息，收集 ack DcAck（目录/符号链接透传 ReceiverMsg；
 // 文件传输结果为 FileOutcome，redo 决策已上移到 Receiver 主 task，dc task 只上报 outcome）。
 async fn run_dc(dest: Arc<StorageEnum>, session: SessionConfig, msgs: Vec<DiskCommitMsg>) -> Vec<DcAck> {
+    run_dc_inner(dest, session, msgs, true).await.0
+}
+
+async fn run_dc_inner(
+    dest: Arc<StorageEnum>, session: SessionConfig, msgs: Vec<DiskCommitMsg>, explicit_shutdown: bool,
+) -> (Vec<DcAck>, Arc<ReceiverProgress>) {
     let (dc_tx, dc_rx) = tokio::sync::mpsc::channel(16);
     let (ack_tx, mut ack_rx) = tokio::sync::mpsc::unbounded_channel();
     let progress = Arc::new(ReceiverProgress::new());
-    let jh = tokio::spawn(disk_commit_task(dest, session, dc_rx, ack_tx, progress));
+    let jh = tokio::spawn(disk_commit_task(dest, session, dc_rx, ack_tx, progress.clone()));
     for m in msgs {
         dc_tx.send(m).await.unwrap();
     }
-    dc_tx.send(DiskCommitMsg::Shutdown).await.unwrap();
+    if explicit_shutdown {
+        dc_tx.send(DiskCommitMsg::Shutdown).await.unwrap();
+    }
     drop(dc_tx);
     jh.await.unwrap().unwrap();
     let mut acks = vec![];
     while let Ok(a) = ack_rx.try_recv() {
         acks.push(a);
     }
-    acks
+    (acks, progress)
 }
 
 #[tokio::test]
@@ -194,6 +203,46 @@ async fn dc_hash_mismatch_rejects_and_cleans_part() {
     assert!(!tmp.path().join("f.bin").exists());
     // .part 已删除
     assert!(!tmp.path().join("f.bin.terrasync-part").exists());
+}
+
+#[tokio::test]
+async fn dc_size_mismatch_without_integrity_rejects_and_cleans_part() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dest = local_storage(tmp.path()).await;
+    let entry = make_nas_entry("truncated.bin", false, false, 4096, 0o644);
+    let acks = run_dc(
+        dest,
+        session_cfg(false),
+        vec![
+            DiskCommitMsg::FileBegin {
+                ndx: 3,
+                entry: entry.clone(),
+            },
+            DiskCommitMsg::FileChunk {
+                entry: entry.clone(),
+                chunk: DataChunk {
+                    offset: 0,
+                    data: Bytes::from_static(b"short"),
+                },
+            },
+            DiskCommitMsg::FileCommit {
+                ndx: 3,
+                entry,
+                source_hash: None,
+            },
+        ],
+    )
+    .await;
+
+    assert!(acks.iter().any(|ack| matches!(
+        ack,
+        DcAck::FileOutcome {
+            ndx: 3,
+            outcome: FileOutcome::SizeMismatch
+        }
+    )));
+    assert!(!tmp.path().join("truncated.bin").exists());
+    assert!(!tmp.path().join("truncated.bin.terrasync-part").exists());
 }
 
 #[tokio::test]
@@ -302,6 +351,443 @@ async fn dc_abort_file_drops_part_no_ack() {
     assert!(acks.is_empty(), "AbortFile 不应产生任何 ack，实际: {acks:?}");
     assert!(!tmp.path().join("aborted.bin").exists());
     assert!(!tmp.path().join("aborted.bin.terrasync-part").exists());
+}
+
+// Shutdown 与显式 abort 一样拥有 active writer：disk-commit task 返回前必须
+// settle writer 并删除暂存数据。
+#[tokio::test]
+async fn dc_shutdown_active_file_cleans_part_no_ack() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dest = local_storage(tmp.path()).await;
+    let (entry, bytes) = entry_for(tmp.path(), "shutdown.bin", 2 * 1024 * 1024);
+    let mut msgs = vec![DiskCommitMsg::FileBegin {
+        ndx: 0,
+        entry: entry.clone(),
+    }];
+    for (off, data) in chunkify(&bytes, 1 << 20) {
+        msgs.push(DiskCommitMsg::FileChunk {
+            entry: entry.clone(),
+            chunk: DataChunk { offset: off, data },
+        });
+    }
+
+    let acks = run_dc(dest, session_cfg(true), msgs).await;
+    assert!(acks.is_empty(), "shutdown must not invent a file outcome: {acks:?}");
+    assert!(!tmp.path().join("shutdown.bin").exists());
+    assert!(!tmp.path().join("shutdown.bin.terrasync-part").exists());
+}
+
+#[tokio::test]
+async fn dc_channel_close_settles_and_cleans_active_file() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dest = local_storage(tmp.path()).await;
+    let (entry, bytes) = entry_for(tmp.path(), "channel-close.bin", 1024);
+    let (acks, _progress) = run_dc_inner(
+        dest,
+        session_cfg(true),
+        vec![
+            DiskCommitMsg::FileBegin {
+                ndx: 0,
+                entry: entry.clone(),
+            },
+            DiskCommitMsg::FileChunk {
+                entry,
+                chunk: DataChunk {
+                    offset: 0,
+                    data: Bytes::from(bytes),
+                },
+            },
+        ],
+        false,
+    )
+    .await;
+
+    assert!(acks.is_empty());
+    assert!(!tmp.path().join("channel-close.bin").exists());
+    assert!(!tmp.path().join("channel-close.bin.terrasync-part").exists());
+}
+
+#[tokio::test]
+async fn dc_progress_counts_only_successful_commit() {
+    let success_tmp = tempfile::tempdir().unwrap();
+    let success_dest = local_storage(success_tmp.path()).await;
+    let success_entry = make_nas_entry("success.bin", false, false, 4, 0o644);
+    let (_acks, success_progress) = run_dc_inner(
+        success_dest,
+        session_cfg(false),
+        vec![
+            DiskCommitMsg::FileBegin {
+                ndx: 1,
+                entry: success_entry.clone(),
+            },
+            DiskCommitMsg::FileChunk {
+                entry: success_entry.clone(),
+                chunk: DataChunk {
+                    offset: 0,
+                    data: Bytes::from_static(b"done"),
+                },
+            },
+            DiskCommitMsg::FileCommit {
+                ndx: 1,
+                entry: success_entry,
+                source_hash: None,
+            },
+        ],
+        true,
+    )
+    .await;
+    assert_eq!(success_progress.files_transferred.load(Ordering::Relaxed), 1);
+    assert_eq!(success_progress.bytes_transferred.load(Ordering::Relaxed), 4);
+
+    let failed_tmp = tempfile::tempdir().unwrap();
+    let failed_dest = local_storage(failed_tmp.path()).await;
+    let failed_entry = make_nas_entry("failed.bin", false, false, 8, 0o644);
+    let (_acks, failed_progress) = run_dc_inner(
+        failed_dest,
+        session_cfg(false),
+        vec![
+            DiskCommitMsg::FileBegin {
+                ndx: 2,
+                entry: failed_entry.clone(),
+            },
+            DiskCommitMsg::FileChunk {
+                entry: failed_entry.clone(),
+                chunk: DataChunk {
+                    offset: 0,
+                    data: Bytes::from_static(b"short"),
+                },
+            },
+            DiskCommitMsg::FileCommit {
+                ndx: 2,
+                entry: failed_entry,
+                source_hash: None,
+            },
+        ],
+        true,
+    )
+    .await;
+    assert_eq!(failed_progress.files_transferred.load(Ordering::Relaxed), 0);
+    assert_eq!(failed_progress.bytes_transferred.load(Ordering::Relaxed), 0);
+}
+
+#[tokio::test]
+async fn dc_second_begin_does_not_replace_active_file() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dest = local_storage(tmp.path()).await;
+    let (first, first_bytes) = entry_for(tmp.path(), "first.bin", 1024);
+    let (second, _second_bytes) = entry_for(tmp.path(), "second.bin", 512);
+    let source_hash = blake3::hash(&first_bytes).to_hex().to_string();
+
+    let acks = run_dc(
+        dest,
+        session_cfg(true),
+        vec![
+            DiskCommitMsg::FileBegin {
+                ndx: 1,
+                entry: first.clone(),
+            },
+            DiskCommitMsg::FileChunk {
+                entry: first.clone(),
+                chunk: DataChunk {
+                    offset: 0,
+                    data: Bytes::from(first_bytes.clone()),
+                },
+            },
+            DiskCommitMsg::FileBegin { ndx: 2, entry: second },
+            DiskCommitMsg::FileCommit {
+                ndx: 1,
+                entry: first,
+                source_hash: Some(source_hash),
+            },
+        ],
+    )
+    .await;
+
+    assert!(acks.iter().any(|ack| matches!(
+        ack,
+        DcAck::FileOutcome {
+            ndx: 1,
+            outcome: FileOutcome::Success
+        }
+    )));
+    assert_eq!(std::fs::read(tmp.path().join("first.bin")).unwrap(), first_bytes);
+    assert!(!tmp.path().join("first.bin.terrasync-part").exists());
+    assert!(!tmp.path().join("second.bin.terrasync-part").exists());
+}
+
+#[tokio::test]
+async fn dc_delta_commit_does_not_commit_full_active_file() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dest = local_storage(tmp.path()).await;
+    let (entry, bytes) = entry_for(tmp.path(), "mode-mismatch.bin", 1024);
+    let source_hash = blake3::hash(&bytes).to_hex().to_string();
+
+    let acks = run_dc(
+        dest,
+        session_cfg(true),
+        vec![
+            DiskCommitMsg::FileBegin {
+                ndx: 1,
+                entry: entry.clone(),
+            },
+            DiskCommitMsg::FileChunk {
+                entry: entry.clone(),
+                chunk: DataChunk {
+                    offset: 0,
+                    data: Bytes::from(bytes),
+                },
+            },
+            DiskCommitMsg::DeltaCommit {
+                ndx: 1,
+                entry,
+                source_hash: Some(source_hash),
+            },
+        ],
+    )
+    .await;
+
+    assert!(
+        acks.is_empty(),
+        "mode-mismatched commit must not produce an outcome: {acks:?}"
+    );
+    assert!(!tmp.path().join("mode-mismatch.bin").exists());
+    assert!(!tmp.path().join("mode-mismatch.bin.terrasync-part").exists());
+}
+
+#[tokio::test]
+async fn dc_delta_token_for_another_entry_does_not_mutate_active_file() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dest = local_storage(tmp.path()).await;
+    let active = make_nas_entry("active.bin", false, false, 5, 0o644);
+    let other = make_nas_entry("other.bin", false, false, 5, 0o644);
+
+    let acks = run_dc(
+        dest,
+        session_cfg(false),
+        vec![
+            DiskCommitMsg::DeltaBegin {
+                ndx: 7,
+                entry: active.clone(),
+                block_size: 5,
+            },
+            DiskCommitMsg::DeltaData {
+                entry: other,
+                data: Bytes::from_static(b"wrong"),
+            },
+            DiskCommitMsg::DeltaCommit {
+                ndx: 7,
+                entry: active,
+                source_hash: None,
+            },
+        ],
+    )
+    .await;
+
+    assert!(acks.iter().any(|ack| matches!(
+        ack,
+        DcAck::FileOutcome {
+            ndx: 7,
+            outcome: FileOutcome::SizeMismatch
+        }
+    )));
+    assert!(!tmp.path().join("active.bin").exists());
+    assert!(!tmp.path().join("active.bin.terrasync-part").exists());
+}
+
+#[tokio::test]
+async fn dc_mode_mismatched_data_does_not_mutate_active_file() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dest = local_storage(tmp.path()).await;
+    let full = make_nas_entry("full.bin", false, false, 4, 0o644);
+    let delta = make_nas_entry("delta.bin", false, false, 5, 0o644);
+
+    let (acks, progress) = run_dc_inner(
+        dest,
+        session_cfg(false),
+        vec![
+            DiskCommitMsg::FileBegin {
+                ndx: 1,
+                entry: full.clone(),
+            },
+            DiskCommitMsg::DeltaData {
+                entry: full.clone(),
+                data: Bytes::from_static(b"wrong"),
+            },
+            DiskCommitMsg::FileChunk {
+                entry: full.clone(),
+                chunk: DataChunk {
+                    offset: 0,
+                    data: Bytes::from_static(b"full"),
+                },
+            },
+            DiskCommitMsg::FileCommit {
+                ndx: 1,
+                entry: full,
+                source_hash: None,
+            },
+            DiskCommitMsg::DeltaBegin {
+                ndx: 2,
+                entry: delta.clone(),
+                block_size: 5,
+            },
+            DiskCommitMsg::FileChunk {
+                entry: delta.clone(),
+                chunk: DataChunk {
+                    offset: 0,
+                    data: Bytes::from_static(b"wrong"),
+                },
+            },
+            DiskCommitMsg::DeltaData {
+                entry: delta.clone(),
+                data: Bytes::from_static(b"delta"),
+            },
+            DiskCommitMsg::DeltaCommit {
+                ndx: 2,
+                entry: delta,
+                source_hash: None,
+            },
+        ],
+        true,
+    )
+    .await;
+
+    assert_eq!(
+        acks.iter()
+            .filter(|ack| matches!(
+                ack,
+                DcAck::FileOutcome {
+                    outcome: FileOutcome::Success,
+                    ..
+                }
+            ))
+            .count(),
+        2
+    );
+    assert_eq!(std::fs::read(tmp.path().join("full.bin")).unwrap(), b"full");
+    assert_eq!(std::fs::read(tmp.path().join("delta.bin")).unwrap(), b"delta");
+    assert_eq!(progress.files_transferred.load(Ordering::Relaxed), 2);
+    assert_eq!(progress.bytes_transferred.load(Ordering::Relaxed), 9);
+    for path in ["full.bin", "delta.bin"] {
+        let metadata = std::fs::metadata(tmp.path().join(path)).unwrap();
+        assert_eq!(metadata.permissions().mode() & 0o777, 0o644);
+        assert!(!tmp.path().join(format!("{path}.terrasync-part")).exists());
+    }
+}
+
+#[tokio::test]
+async fn dc_abort_during_delta_cleans_part_without_outcome() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dest = local_storage(tmp.path()).await;
+    let entry = make_nas_entry("delta-abort.bin", false, false, 5, 0o644);
+    let acks = run_dc(
+        dest,
+        session_cfg(false),
+        vec![
+            DiskCommitMsg::DeltaBegin {
+                ndx: 5,
+                entry: entry.clone(),
+                block_size: 5,
+            },
+            DiskCommitMsg::DeltaData {
+                entry,
+                data: Bytes::from_static(b"delta"),
+            },
+            DiskCommitMsg::AbortFile,
+        ],
+    )
+    .await;
+    assert!(acks.is_empty());
+    assert!(!tmp.path().join("delta-abort.bin").exists());
+    assert!(!tmp.path().join("delta-abort.bin.terrasync-part").exists());
+}
+
+#[tokio::test]
+async fn dc_commands_without_begin_and_duplicate_commit_do_not_duplicate_outcomes() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dest = local_storage(tmp.path()).await;
+    let entry = make_nas_entry("once.bin", false, false, 4, 0o644);
+    let acks = run_dc(
+        dest,
+        session_cfg(false),
+        vec![
+            DiskCommitMsg::FileChunk {
+                entry: entry.clone(),
+                chunk: DataChunk {
+                    offset: 0,
+                    data: Bytes::from_static(b"drop"),
+                },
+            },
+            DiskCommitMsg::FileCommit {
+                ndx: 4,
+                entry: entry.clone(),
+                source_hash: None,
+            },
+            DiskCommitMsg::FileBegin {
+                ndx: 4,
+                entry: entry.clone(),
+            },
+            DiskCommitMsg::FileChunk {
+                entry: entry.clone(),
+                chunk: DataChunk {
+                    offset: 0,
+                    data: Bytes::from_static(b"once"),
+                },
+            },
+            DiskCommitMsg::FileCommit {
+                ndx: 4,
+                entry: entry.clone(),
+                source_hash: None,
+            },
+            DiskCommitMsg::FileCommit {
+                ndx: 4,
+                entry,
+                source_hash: None,
+            },
+        ],
+    )
+    .await;
+
+    assert_eq!(acks.len(), 1);
+    assert!(matches!(
+        &acks[0],
+        DcAck::FileOutcome {
+            ndx: 4,
+            outcome: FileOutcome::Success
+        }
+    ));
+}
+
+#[tokio::test]
+async fn dc_failed_begin_then_commit_reports_one_outcome() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dest = local_storage(tmp.path()).await;
+    let entry = make_nas_entry("../escape.bin", false, false, 4, 0o644);
+    let acks = run_dc(
+        dest,
+        session_cfg(false),
+        vec![
+            DiskCommitMsg::FileBegin {
+                ndx: 9,
+                entry: entry.clone(),
+            },
+            DiskCommitMsg::FileCommit {
+                ndx: 9,
+                entry,
+                source_hash: None,
+            },
+        ],
+    )
+    .await;
+
+    assert_eq!(acks.len(), 1);
+    assert!(matches!(
+        &acks[0],
+        DcAck::FileOutcome {
+            ndx: 9,
+            outcome: FileOutcome::HardError(_)
+        }
+    ));
+    assert!(!tmp.path().parent().unwrap().join("escape.bin").exists());
 }
 
 // ============================================================
@@ -424,6 +910,15 @@ async fn dc_delta_basis_read_failure_reports_hard_error_and_cleans_part() {
                 entry: entry.clone(),
                 block_index: 0,
             },
+            DiskCommitMsg::DeltaData {
+                entry: entry.clone(),
+                data: Bytes::from_static(b"ignored"),
+            },
+            DiskCommitMsg::DeltaCommit {
+                ndx: 0,
+                entry: entry.clone(),
+                source_hash: None,
+            },
         ],
     )
     .await;
@@ -438,6 +933,7 @@ async fn dc_delta_basis_read_failure_reports_hard_error_and_cleans_part() {
         )),
         "basis 读失败应上报 HardError，实际: {acks:?}"
     );
+    assert_eq!(acks.len(), 1, "失败后的残余命令不得产生重复 outcome");
     assert!(!tmp.path().join("missing.bin").exists());
     assert!(!tmp.path().join("missing.bin.terrasync-part").exists());
 }
