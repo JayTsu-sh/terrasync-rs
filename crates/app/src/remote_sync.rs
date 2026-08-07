@@ -14,7 +14,7 @@ mod remote_sender_session;
 #[cfg(test)]
 use remote_sender_session::advertise_file_list;
 use remote_sender_session::{RemoteSenderSession, RemoteSenderSessionDeps};
-use remote_sender_session::{SourceTransferOutcome, send_delta_transfer, send_full_transfer};
+use remote_sender_session::{SenderSessionLedger, SourceTransferOutcome, send_delta_transfer, send_full_transfer};
 
 use std::collections::HashSet;
 use std::net::SocketAddr;
@@ -258,17 +258,9 @@ async fn send_and_check_auth(transport: &(dyn SenderTransport + 'static), auth_t
 async fn process_requests_and_acks(
     transport: &(dyn SenderTransport + 'static), src_storage: &Arc<StorageEnum>, ndx_table: &Mutex<NdxTable>,
     qos: Option<&QosManager>, enable_acl: bool, completed_paths: &mut HashSet<String>, checkpoint_path: &Path,
-    stats_consumer: &Arc<AsyncMutex<StatisticConsumer>>,
-) -> Result<RequestAckSummary> {
+    stats_consumer: &Arc<AsyncMutex<StatisticConsumer>>, ledger: &mut SenderSessionLedger,
+) -> Result<()> {
     info!("[Sender Remote] Processing transfer requests + collecting acks");
-    let mut transfer_count = 0u64;
-    let mut success_count = 0u64;
-    let mut error_count = 0u64;
-    let mut transfer_done_sent = false;
-    // 已计过 error_count 的 ndx：复合失败（同 ndx 源读失败 + dest 侧 resume_prepare
-    // 失败）时，Sender 自检失败与 Receiver 回传的 Error{ndx} 可能各自独立触发一次
-    // error_count += 1，按 ndx 去重只计一次（见 count_ndx_error）。
-    let mut errored_ndx: HashSet<i32> = HashSet::new();
     loop {
         match transport.recv().await {
             Some(ReceiverMsg::TransferRequest { ndx, decision }) => {
@@ -287,7 +279,7 @@ async fn process_requests_and_acks(
                     if matches!(
                         send_full_transfer(transport, src_storage, &entry, ndx, qos, enable_acl).await?,
                         SourceTransferOutcome::SourceFailed
-                    ) && count_ndx_error(&mut errored_ndx, ndx, &mut error_count)
+                    ) && ledger.record_indexed_error(ndx)
                     {
                         let msg = entry_error_stats_message(
                             entry.get_relative_path().to_path_buf(),
@@ -295,7 +287,7 @@ async fn process_requests_and_acks(
                         );
                         stats_consumer.lock().await.update_statistics(&msg);
                     }
-                    transfer_count += 1;
+                    ledger.record_transfer();
                 } else {
                     error!("[Sender Remote] Unknown NDX {}", ndx);
                 }
@@ -338,8 +330,8 @@ async fn process_requests_and_acks(
                         .await?,
                         SourceTransferOutcome::Sent
                     ) {
-                        transfer_count += 1;
-                    } else if count_ndx_error(&mut errored_ndx, ndx, &mut error_count) {
+                        ledger.record_transfer();
+                    } else if ledger.record_indexed_error(ndx) {
                         let msg = entry_error_stats_message(
                             entry.get_relative_path().to_path_buf(),
                             format!("delta source read failed for ndx {ndx}"),
@@ -370,7 +362,7 @@ async fn process_requests_and_acks(
                         send_full_transfer(transport, src_storage, &entry, ndx, qos, enable_acl).await?,
                         SourceTransferOutcome::SourceFailed
                     ) {
-                        count_ndx_error(&mut errored_ndx, ndx, &mut error_count);
+                        ledger.record_indexed_error(ndx);
                     }
                 } else {
                     error!("[Sender Remote] Unknown NDX {} for redo", ndx);
@@ -379,10 +371,10 @@ async fn process_requests_and_acks(
             Some(ReceiverMsg::RequestsDone) => {
                 info!(
                     "[Sender Remote] All requests received, {} files to transfer",
-                    transfer_count
+                    ledger.transfer_count()
                 );
                 transport.send(SenderMsg::TransferDone).await?;
-                transfer_done_sent = true;
+                ledger.mark_transfer_done_sent();
             }
             // ── ndx 级文件传输终态：与 EntrySuccess（目录/符号链接）共用同一个 success_count ──
             Some(ReceiverMsg::Success { ndx }) => {
@@ -391,18 +383,11 @@ async fn process_requests_and_acks(
                     .unwrap_or_else(PoisonError::into_inner)
                     .get(ndx)
                     .map(|entry| entry.get_relative_path().to_string_lossy().to_string());
-                record_success_and_checkpoint(relative_path, &mut success_count, completed_paths, checkpoint_path)
-                    .await;
+                record_success_and_checkpoint(relative_path, ledger, completed_paths, checkpoint_path).await;
             }
             Some(ReceiverMsg::EntrySuccess { ref entry }) => {
                 let relative_path = entry.get_relative_path().to_string_lossy().to_string();
-                record_success_and_checkpoint(
-                    Some(relative_path),
-                    &mut success_count,
-                    completed_paths,
-                    checkpoint_path,
-                )
-                .await;
+                record_success_and_checkpoint(Some(relative_path), ledger, completed_paths, checkpoint_path).await;
             }
             Some(ReceiverMsg::Progress(snapshot)) => {
                 // 远端写盘发生在 Receiver 侧，Sender 自己不产生 chunk 级字节计数，
@@ -427,14 +412,14 @@ async fn process_requests_and_acks(
             Some(ReceiverMsg::EntryError { entry, reason }) => {
                 let path = entry.get_relative_path().to_path_buf();
                 error!("[Sender Remote] Entry failed {:?}: {}", path, reason);
-                error_count += 1;
+                ledger.record_entry_error();
                 let msg = entry_error_stats_message(path, reason);
                 stats_consumer.lock().await.update_statistics(&msg);
             }
             // ── ndx 级文件传输终态失败（redo 二次失败）：与 EntryError 共用同一个 error_count ──
             Some(ReceiverMsg::Error { ndx, reason }) => {
                 error!("[Sender Remote] NDX {} failed: {}", ndx, reason);
-                if count_ndx_error(&mut errored_ndx, ndx, &mut error_count) {
+                if ledger.record_indexed_error(ndx) {
                     // ndx_table 查不到 entry 时（理论上不应发生，Sender 自己分配的 ndx）
                     // 用合成路径兜底，确保该失败仍能计入 ErrorStats（issue #57）
                     let path = ndx_table
@@ -454,37 +439,7 @@ async fn process_requests_and_acks(
             None => return Err(AppError::CopyError("Transport closed during request/ack phase".into())),
         }
     }
-    Ok(RequestAckSummary {
-        transfer_count,
-        success_count,
-        error_count,
-        transfer_done_sent,
-    })
-}
-
-/// 旧 request/ack loop 交还给 negotiated session 的 typed facts。
-/// 状态所有权已在 session；各消息分支会在后续 tickets 逐步迁入同一模块。
-struct RequestAckSummary {
-    transfer_count: u64,
-    success_count: u64,
-    error_count: u64,
-    transfer_done_sent: bool,
-}
-
-/// 同一 ndx 的失败只计一次 `error_count`：复合失败（同 ndx 源读失败 **且** dest 侧
-/// `resume_prepare` 失败）时，Sender 自检失败（full/delta source operation 返回
-/// `SourceFailed`）与 Receiver 回传的 `ReceiverMsg::Error{ndx}`
-/// 可能各自独立触发一次增量；ndx 唯一对应一个文件，一个文件至多算一次错误。
-///
-/// 返回是否为本次新计数（`errored.insert(ndx)` 的结果）：调用方据此决定是否同时喂入
-/// `StorageEntryMessage::Error`，使 `ErrorStats` 与该本地 u64 计数按相同口径去重
-/// （复合失败不应被喂两次，见 issue #57）。
-fn count_ndx_error(errored: &mut HashSet<i32>, ndx: i32, error_count: &mut u64) -> bool {
-    let newly_counted = errored.insert(ndx);
-    if newly_counted {
-        *error_count += 1;
-    }
-    newly_counted
+    Ok(())
 }
 
 /// 把双进程模式下 entry 级失败（Sender 自检读失败 / Receiver 回传的终态失败）翻译为
@@ -532,10 +487,10 @@ fn classification_to_stats_message(decision: TransferDecision, entry: Arc<EntryE
 /// （`Success{ndx}` 在 `ndx_table` 查不到 entry 时为 `None`，仍计入 `success_count`
 /// 但不记录路径，与原逻辑一致）；每满 100 个周期性落盘 checkpoint。
 async fn record_success_and_checkpoint(
-    relative_path: Option<String>, success_count: &mut u64, completed_paths: &mut HashSet<String>,
+    relative_path: Option<String>, ledger: &mut SenderSessionLedger, completed_paths: &mut HashSet<String>,
     checkpoint_path: &Path,
 ) {
-    *success_count += 1;
+    let success_count = ledger.record_success();
     if let Some(path) = relative_path {
         completed_paths.insert(path);
     }
@@ -942,7 +897,8 @@ mod tests {
 
         let mut completed_paths = HashSet::new();
         let checkpoint_path = src_dir.join("unused_checkpoint.json");
-        let summary = process_requests_and_acks(
+        let mut ledger = SenderSessionLedger::new();
+        process_requests_and_acks(
             sender_transport,
             &src_storage,
             &ndx_table,
@@ -951,9 +907,11 @@ mod tests {
             &mut completed_paths,
             &checkpoint_path,
             &stats_consumer,
+            &mut ledger,
         )
         .await
         .unwrap();
+        let summary = ledger.finish();
 
         sender_transport.close().await.unwrap();
         receiver_handle.await.unwrap().unwrap();

@@ -55,6 +55,72 @@ pub(super) enum SourceTransferOutcome {
     SourceFailed,
 }
 
+/// negotiated session 的 authoritative request/terminal ledger。
+pub(super) struct SenderSessionLedger {
+    transfer_count: u64,
+    success_count: u64,
+    error_count: u64,
+    errored_ndx: HashSet<i32>,
+    transfer_done_sent: bool,
+}
+
+pub(super) struct RequestAckSummary {
+    pub(super) transfer_count: u64,
+    pub(super) success_count: u64,
+    pub(super) error_count: u64,
+    pub(super) transfer_done_sent: bool,
+}
+
+impl SenderSessionLedger {
+    pub(super) fn new() -> Self {
+        Self {
+            transfer_count: 0,
+            success_count: 0,
+            error_count: 0,
+            errored_ndx: HashSet::new(),
+            transfer_done_sent: false,
+        }
+    }
+
+    pub(super) fn record_transfer(&mut self) {
+        self.transfer_count += 1;
+    }
+
+    pub(super) fn transfer_count(&self) -> u64 {
+        self.transfer_count
+    }
+
+    pub(super) fn record_success(&mut self) -> u64 {
+        self.success_count += 1;
+        self.success_count
+    }
+
+    pub(super) fn record_entry_error(&mut self) {
+        self.error_count += 1;
+    }
+
+    pub(super) fn record_indexed_error(&mut self, ndx: i32) -> bool {
+        if !self.errored_ndx.insert(ndx) {
+            return false;
+        }
+        self.error_count += 1;
+        true
+    }
+
+    pub(super) fn mark_transfer_done_sent(&mut self) {
+        self.transfer_done_sent = true;
+    }
+
+    pub(super) fn finish(self) -> RequestAckSummary {
+        RequestAckSummary {
+            transfer_count: self.transfer_count,
+            success_count: self.success_count,
+            error_count: self.error_count,
+            transfer_done_sent: self.transfer_done_sent,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RemoteSenderSessionLifecycle {
     Advertising,
@@ -74,6 +140,7 @@ impl<'a> RemoteSenderSession<'a> {
 
     pub(super) async fn run(mut self, completed_paths: &mut HashSet<String>) -> Result<RemoteSenderSessionSummary> {
         let ndx_table = Mutex::new(NdxTable::new());
+        let mut ledger = SenderSessionLedger::new();
         self.transition(RemoteSenderSessionLifecycle::RequestsOpen);
         let advertise = async {
             advertise_file_list(
@@ -95,18 +162,20 @@ impl<'a> RemoteSenderSession<'a> {
                 completed_paths,
                 self.deps.checkpoint_path,
                 self.deps.stats_consumer,
+                &mut ledger,
             )
             .await
             .map_err(|source| stage_error("requests/acks", source))
         };
         let joined = tokio::try_join!(advertise, requests);
-        let (page_count, request_summary) = match joined {
+        let (page_count, ()) = match joined {
             Ok(result) => result,
             Err(error) => {
                 self.transition(RemoteSenderSessionLifecycle::Failed);
                 return Err(error);
             }
         };
+        let request_summary = ledger.finish();
         if request_summary.transfer_done_sent {
             self.transition(RemoteSenderSessionLifecycle::TransferDoneSent);
         }
