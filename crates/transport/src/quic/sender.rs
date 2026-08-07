@@ -468,4 +468,52 @@ mod tests {
 
         receiver_handle.await.unwrap();
     }
+
+    #[tokio::test]
+    async fn peer_disconnect_releases_send_waiting_for_credit() {
+        install_crypto_provider();
+        const TINY_WINDOW: u64 = 8;
+        let (server_endpoint, server_addr) = create_server_endpoint();
+
+        let receiver_handle = tokio::spawn(async move {
+            let incoming = server_endpoint.accept().await.unwrap();
+            let conn = incoming.await.unwrap();
+            let (_ctrl_send, _ctrl_recv) = conn.accept_bi().await.unwrap();
+            let (_fl_send, _fl_recv) = conn.accept_bi().await.unwrap();
+            let (_data_send, mut data_recv) = conn.accept_bi().await.unwrap();
+            let (_ack_send, _ack_recv) = conn.open_bi().await.unwrap();
+            let message = framing::read_msg::<SenderMsg>(&mut data_recv).await.unwrap();
+            assert!(matches!(message, Some(SenderMsg::FileData { .. })));
+            conn.close(0u32.into(), b"test peer shutdown");
+        });
+
+        let sender = connect_with_credit_window(server_addr, "localhost", None, TINY_WINDOW)
+            .await
+            .unwrap();
+        sender
+            .send(SenderMsg::FileData {
+                entry: dummy_file_entry("first.bin"),
+                chunk: DataChunk {
+                    offset: 0,
+                    data: Bytes::from_static(b"12345678"),
+                },
+            })
+            .await
+            .unwrap();
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            sender.send(SenderMsg::FileData {
+                entry: dummy_file_entry("blocked.bin"),
+                chunk: DataChunk {
+                    offset: 0,
+                    data: Bytes::from_static(b"12345678"),
+                },
+            }),
+        )
+        .await
+        .expect("peer disconnect must wake a send blocked on credit");
+        assert!(result.is_err());
+        receiver_handle.await.unwrap();
+    }
 }
