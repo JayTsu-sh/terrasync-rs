@@ -3,41 +3,43 @@
 //! 将 QUIC 连接、文件列表发送、传输请求处理、Ack 收集等阶段
 //! 提取为独立函数，降低单函数复杂度并提升可读性。
 //!
-//! 握手/鉴权/`SessionConfig` 之后，文件列表发送（`send_file_list_phase`，只
-//! `send()`、从不 `recv()`）与请求处理 + Ack 收集（`process_requests_and_acks`，
-//! 唯一的 `recv()` 消费者）通过 `tokio::try_join!` 并发运行，不再是「文件列表发完
-//! 才能开始处理请求」的顺序 barrier；`NdxTable` 因此改为 `Mutex` 包裹以支持并发
-//! 读写（写者只有文件列表任务，读者只有请求处理任务，不存在二义性）。
+//! 握手/鉴权/`SessionConfig` 之后，完整生命周期由 `RemoteSenderSession` 持有：
+//! advertising 与 request/ack consumer 并发运行，避免文件列表 barrier；唯一的
+//! `recv()` consumer、index correlation、source transfer、reporting、checkpoint 和
+//! terminal protocol 都隐藏在 session interface 后面。
 
-use std::collections::HashSet;
+mod remote_sender_session;
+
+use remote_sender_session::{RemoteSenderSession, RemoteSenderSessionDeps};
+#[cfg(test)]
+use remote_sender_session::{classification_to_stats_message, entry_error_stats_message};
+
 use std::net::SocketAddr;
-use std::path::{Path, PathBuf};
-use std::sync::atomic::Ordering;
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::Arc;
+#[cfg(test)]
+use std::sync::{Mutex, PoisonError};
 
+#[cfg(test)]
+use data_mover::StorageEnum;
+use data_mover::create_storage;
+#[cfg(test)]
 use data_mover::dir_tree::NdxEvent;
 use data_mover::filter::parse_filter_expression;
-use data_mover::qos::QosManager;
-use data_mover::{
-    ChangeKind, ConsistencyCheck, EntryEnum, ErrorEvent, StorageEntryMessage, StorageEnum, WalkDirAsyncIterator2,
-    create_storage,
-};
+#[cfg(test)]
+use data_mover::{ChangeKind, EntryEnum, ErrorEvent, StorageEntryMessage};
 use rustls::pki_types::CertificateDer;
-use sync_delta::DeltaToken;
-use sync_delta::matcher::DeltaMatcher;
 use tokio::sync::Mutex as AsyncMutex;
-use tracing::{debug, error, info, warn};
+use tracing::{info, warn};
 use transport::error::TransportError;
-use transport::message::{
-    BlockSignature, HandshakeResult, NdxTable, ProtocolHandshake, ReceiverMsg, SenderMsg, SessionConfig,
-    TransferDecision,
-};
+#[cfg(test)]
+use transport::message::TransferDecision;
+use transport::message::{HandshakeResult, ProtocolHandshake, ReceiverMsg, SenderMsg, SessionConfig};
 use transport::traits::SenderTransport;
 use utils::app_config::AppConfig;
 use utils::logger;
 
 use crate::config::{JobType, SyncJobConfig};
-use crate::consumer::stats::{IncrementalStats, ProgressBar, StatisticConsumer, StatsKind, format_bytes};
+use crate::consumer::stats::{IncrementalStats, ProgressBar, StatisticConsumer, StatsKind};
 use crate::error::{AppError, Result};
 use crate::orchestrator::create_qos_manager;
 use crate::sync::parse_size;
@@ -118,52 +120,40 @@ pub(crate) async fn run(
         )
         .await?;
 
-    // ── 5. QoS 管理器 + checkpoint 加载 ──
+    // ── 5. QoS 管理器；checkpoint lifecycle 由 negotiated session 持有 ──
     let qos_manager = create_qos_manager(config.qos.as_ref(), config.peak_qos_rate, config.iops);
     let checkpoint_path = std::path::PathBuf::from(&config.job_dir).join("remote_checkpoint.json");
-    let mut completed_paths = load_checkpoint(&checkpoint_path).await;
-    if !completed_paths.is_empty() {
-        info!(
-            "[Sender Remote] Loaded checkpoint: {} entries already completed",
-            completed_paths.len()
-        );
-    }
 
     // ── 6+7+8. 文件列表发送 与 请求处理+Ack收集 并发运行（流水线，无阶段 barrier） ──
-    let ndx_table = Mutex::new(NdxTable::new());
-    let file_list_fut = send_file_list_phase(&transport, &walkdir_iter, &ndx_table, &stats_consumer);
-    let requests_acks_fut = process_requests_and_acks(
-        &transport,
-        &src_storage,
-        &ndx_table,
-        qos_manager.as_ref(),
-        config.enable_acl,
-        &mut completed_paths,
-        &checkpoint_path,
-        &stats_consumer,
-    );
-    let (page_count, (transfer_count, success_count, error_count)) =
-        tokio::try_join!(file_list_fut, requests_acks_fut)?;
+    let summary = RemoteSenderSession::new(RemoteSenderSessionDeps {
+        transport: &transport,
+        src_storage: &src_storage,
+        walkdir_iter: &walkdir_iter,
+        qos: qos_manager.as_ref(),
+        enable_acl: config.enable_acl,
+        checkpoint_path: &checkpoint_path,
+        stats_consumer: &stats_consumer,
+    })
+    .run()
+    .await?;
     info!(
         "[Sender Remote] File list sent: {} pages, {} entries",
-        page_count,
-        ndx_table.lock().unwrap_or_else(PoisonError::into_inner).len()
+        summary.page_count, summary.advertised_entries
     );
-    info!("[Sender Remote] {} transfer requests processed", transfer_count);
+    info!("[Sender Remote] {} transfer requests processed", summary.transfer_count);
     info!(
         "[Sender Remote] Complete: {} success, {} errors",
-        success_count, error_count
+        summary.success_count, summary.error_count
     );
 
-    // ── 9. Checkpoint 处理 + 清理 ──
-    save_or_clear_checkpoint(&checkpoint_path, &completed_paths, error_count).await;
+    // ── 9. 资源清理 ──
     if let Some(ref qos) = qos_manager {
         qos.shutdown();
     }
     transport.close().await?;
     // 结束统计报表生命周期：abort 回调循环 → 发最终回调(is_final=true) → 打印终态报表
     StatisticConsumer::end(stats_consumer, callback_guard).await;
-    finalize_run_result(error_count)
+    finalize_run_result(summary.error_count)
 }
 
 /// 双进程模式下 entry 级失败（部分或全部）不再影响进程退出码——与单进程语义对齐，
@@ -232,582 +222,6 @@ async fn send_and_check_auth(transport: &(dyn SenderTransport + 'static), auth_t
         .into()),
         Some(_) => Err(AppError::CopyError("Unexpected message during auth".into())),
         None => Err(AppError::CopyError("Transport closed during auth".into())),
-    }
-}
-
-// ============================================================
-// 文件列表发送（与 `process_requests_and_acks` 并发运行，见模块文档）
-// ============================================================
-
-/// 遍历 `walkdir_2` 并按页发送给 Receiver，填充 `ndx_table`，返回发送的页数。
-///
-/// 只调用 `transport.send()`、从不 `recv()`，可安全地与 `process_requests_and_acks`
-/// 并发运行（`ndx_table` 用 `Mutex` 支持并发读写：本函数是唯一的写者）。
-///
-/// 每页遍历到的 entry 额外喂一次 `StorageEntryMessage::Scanned`，填充
-/// `IncrementalStats.scanned`（扩展名/时间/大小分布）——Sender 本来就要完整遍历一次
-/// 源端才能生成 file list，这个遍历本身就是「Scanned」阶段的等价物，不需要额外协议
-/// 往返（远端没有独立 scan 阶段，见 issue #23）。
-async fn send_file_list_phase(
-    transport: &(dyn SenderTransport + 'static), walkdir_iter: &WalkDirAsyncIterator2, ndx_table: &Mutex<NdxTable>,
-    stats_consumer: &Arc<AsyncMutex<StatisticConsumer>>,
-) -> Result<u64> {
-    info!("[Sender Remote] Sending file list");
-    let mut page_count = 0u64;
-    while let Some(event) = walkdir_iter.next().await {
-        match event {
-            NdxEvent::Page(page) => {
-                {
-                    let mut consumer = stats_consumer.lock().await;
-                    for nf in &page.files {
-                        consumer.update_statistics(&StorageEntryMessage::Scanned(nf.entry.clone()));
-                    }
-                    for ns in &page.subdirs {
-                        consumer.update_statistics(&StorageEntryMessage::Scanned(ns.entry.clone()));
-                    }
-                }
-                ndx_table
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .ingest_page(&page);
-                page_count += 1;
-                transport.send(SenderMsg::FilePage(page)).await?;
-            }
-            NdxEvent::Error { path, reason } => {
-                transport.send(SenderMsg::FileListError { path, reason }).await?;
-            }
-            NdxEvent::Done => break,
-        }
-    }
-    transport.send(SenderMsg::FileListDone).await?;
-    Ok(page_count)
-}
-
-// ============================================================
-// 传输请求处理 + Ack 收集（唯一的 recv() 消费者，与 `send_file_list_phase` 并发运行）
-// ============================================================
-
-/// 接收 Receiver 的 `TransferRequest`/`DeltaTransferRequest`（发送对应数据）与
-/// `EntrySuccess`/`EntryError`/`Progress`（记录 ack/进度），直到 `AllDone`。
-///
-/// 合并原先顺序执行的「请求处理」与「Ack 收集」两个阶段：拆分多路复用 stream 后，
-/// Receiver 可能在所有请求处理完之前就已经开始发送 ack/progress（两者走不同的物理
-/// stream），若仍分成两个各自独立调用 `recv()` 的阶段，晚到的 ack 会被"请求处理"
-/// 阶段的 catch-all 分支直接丢弃。合并为单一消费者循环、按 variant dispatch 后，
-/// 不再有这个丢消息风险（transport 层只暴露一个 `recv()`，见 `crates/transport/src/quic/mux.rs`）。
-///
-/// `RequestsDone` 到达时立即发送 `TransferDone`（与改造前时序一致），但循环不break，
-/// 继续处理后续到达的 ack/progress，直到收到 `AllDone`。
-///
-/// `TransferRequest{decision}`/`DeltaTransferRequest`/`Classified{entry, decision}`
-/// 各自额外翻译为 `StorageEntryMessage` 喂 `stats_consumer.update_statistics()`，驱动
-/// Sender 侧结构化报表（New/Changed/MetadataOnly/Deleted，`Skip` 不产生统计，见
-/// `classification_to_stats_message`，issue #23）；`Redo{ndx}` 是重发、不是新的分类
-/// 事件，不重复计数。
-/// 返回 `(transfer_count, success_count, error_count)`。
-async fn process_requests_and_acks(
-    transport: &(dyn SenderTransport + 'static), src_storage: &Arc<StorageEnum>, ndx_table: &Mutex<NdxTable>,
-    qos: Option<&QosManager>, enable_acl: bool, completed_paths: &mut HashSet<String>, checkpoint_path: &Path,
-    stats_consumer: &Arc<AsyncMutex<StatisticConsumer>>,
-) -> Result<(u64, u64, u64)> {
-    info!("[Sender Remote] Processing transfer requests + collecting acks");
-    let mut transfer_count = 0u64;
-    let mut success_count = 0u64;
-    let mut error_count = 0u64;
-    // 已计过 error_count 的 ndx：复合失败（同 ndx 源读失败 + dest 侧 resume_prepare
-    // 失败）时，Sender 自检失败与 Receiver 回传的 Error{ndx} 可能各自独立触发一次
-    // error_count += 1，按 ndx 去重只计一次（见 count_ndx_error）。
-    let mut errored_ndx: HashSet<i32> = HashSet::new();
-    loop {
-        match transport.recv().await {
-            Some(ReceiverMsg::TransferRequest { ndx, decision }) => {
-                let entry = ndx_table
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .get(ndx)
-                    .cloned();
-                if let Some(entry) = entry {
-                    if let Some(msg) = classification_to_stats_message(decision, entry.clone()) {
-                        stats_consumer.lock().await.update_statistics(&msg);
-                    }
-                    // 源读/符号链接读失败：Sender 已发 EntryError 通知 Receiver 完成该
-                    // ndx，这里自增 error_count（Sender 自检失败由 Sender 自己计数，见 [0][3]）；
-                    // 同时喂入 ErrorStats，使报表如实反映该失败（issue #57）
-                    if !handle_full_transfer(transport, src_storage, &entry, ndx, qos, enable_acl).await?
-                        && count_ndx_error(&mut errored_ndx, ndx, &mut error_count)
-                    {
-                        let msg = entry_error_stats_message(
-                            entry.get_relative_path().to_path_buf(),
-                            format!("source read failed for ndx {ndx}"),
-                        );
-                        stats_consumer.lock().await.update_statistics(&msg);
-                    }
-                    transfer_count += 1;
-                } else {
-                    error!("[Sender Remote] Unknown NDX {}", ndx);
-                }
-            }
-            Some(ReceiverMsg::DeltaTransferRequest {
-                ndx,
-                block_size,
-                signatures,
-            }) => {
-                let entry = ndx_table
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .get(ndx)
-                    .cloned();
-                if let Some(entry) = entry {
-                    // 收到 DeltaTransferRequest 本身即无歧义地代表 Changed，不需要额外的
-                    // decision 字段（该消息只在 DestIndex::check() 判定 DeltaTransfer 且
-                    // delta 能力协商成功时才会发出）
-                    stats_consumer
-                        .lock()
-                        .await
-                        .update_statistics(&StorageEntryMessage::Changed {
-                            entry: entry.clone(),
-                            kind: ChangeKind::DataOnly,
-                        });
-                    // delta: 仅 src 读取成功时计入传输数（与原逻辑保持一致）；读取失败已发
-                    // EntryError 通知 Receiver 完成该 ndx，这里自增 error_count（见 [2]）；
-                    // 同时喂入 ErrorStats，使报表如实反映该失败（issue #57）
-                    if handle_delta_transfer(
-                        transport,
-                        src_storage,
-                        &entry,
-                        ndx,
-                        block_size,
-                        signatures,
-                        qos,
-                        enable_acl,
-                    )
-                    .await?
-                    {
-                        transfer_count += 1;
-                    } else if count_ndx_error(&mut errored_ndx, ndx, &mut error_count) {
-                        let msg = entry_error_stats_message(
-                            entry.get_relative_path().to_path_buf(),
-                            format!("delta source read failed for ndx {ndx}"),
-                        );
-                        stats_consumer.lock().await.update_statistics(&msg);
-                    }
-                } else {
-                    error!("[Sender Remote] Unknown NDX {} for delta", ndx);
-                }
-            }
-            // ── 分类信号（MetadataOnly/Skip/Deleted）：Receiver 本地执行/判定后上行，
-            //    只驱动统计，不触发任何 Sender 侧动作 ──
-            Some(ReceiverMsg::Classified { entry, decision }) => {
-                if let Some(msg) = classification_to_stats_message(decision, entry) {
-                    stats_consumer.lock().await.update_statistics(&msg);
-                }
-            }
-            // ── ndx 级重传请求：hash 校验失败首次上报后，Receiver 要求重发。delta redo 一律
-            //    降级为全量重发——Sender 对 redo 无状态，不保留 signatures/mode ──
-            Some(ReceiverMsg::Redo { ndx }) => {
-                let entry = ndx_table
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .get(ndx)
-                    .cloned();
-                if let Some(entry) = entry {
-                    if !handle_full_transfer(transport, src_storage, &entry, ndx, qos, enable_acl).await? {
-                        count_ndx_error(&mut errored_ndx, ndx, &mut error_count);
-                    }
-                } else {
-                    error!("[Sender Remote] Unknown NDX {} for redo", ndx);
-                }
-            }
-            Some(ReceiverMsg::RequestsDone) => {
-                info!(
-                    "[Sender Remote] All requests received, {} files to transfer",
-                    transfer_count
-                );
-                transport.send(SenderMsg::TransferDone).await?;
-            }
-            // ── ndx 级文件传输终态：与 EntrySuccess（目录/符号链接）共用同一个 success_count ──
-            Some(ReceiverMsg::Success { ndx }) => {
-                let relative_path = ndx_table
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .get(ndx)
-                    .map(|entry| entry.get_relative_path().to_string_lossy().to_string());
-                record_success_and_checkpoint(relative_path, &mut success_count, completed_paths, checkpoint_path)
-                    .await;
-            }
-            Some(ReceiverMsg::EntrySuccess { ref entry }) => {
-                let relative_path = entry.get_relative_path().to_string_lossy().to_string();
-                record_success_and_checkpoint(
-                    Some(relative_path),
-                    &mut success_count,
-                    completed_paths,
-                    checkpoint_path,
-                )
-                .await;
-            }
-            Some(ReceiverMsg::Progress(snapshot)) => {
-                // 远端写盘发生在 Receiver 侧，Sender 自己不产生 chunk 级字节计数，
-                // 复用 StatisticConsumer 的实时字节计数器承载 Receiver 汇报的进度
-                stats_consumer
-                    .lock()
-                    .await
-                    .get_bytes_tracker()
-                    .store(snapshot.bytes_transferred, Ordering::Relaxed);
-                info!(
-                    "[Sender Remote] [{}] Progress: {} files ({}) transferred, {} dirs, {} skipped, {} errors, {:.1}s, {}/s",
-                    snapshot.receiver_id,
-                    snapshot.files_transferred,
-                    format_bytes(snapshot.bytes_transferred as f64, true),
-                    snapshot.dirs_created,
-                    snapshot.files_skipped,
-                    snapshot.error_count,
-                    snapshot.elapsed_secs,
-                    format_bytes(snapshot.speed_bytes_per_sec, true),
-                );
-            }
-            Some(ReceiverMsg::EntryError { entry, reason }) => {
-                let path = entry.get_relative_path().to_path_buf();
-                error!("[Sender Remote] Entry failed {:?}: {}", path, reason);
-                error_count += 1;
-                let msg = entry_error_stats_message(path, reason);
-                stats_consumer.lock().await.update_statistics(&msg);
-            }
-            // ── ndx 级文件传输终态失败（redo 二次失败）：与 EntryError 共用同一个 error_count ──
-            Some(ReceiverMsg::Error { ndx, reason }) => {
-                error!("[Sender Remote] NDX {} failed: {}", ndx, reason);
-                if count_ndx_error(&mut errored_ndx, ndx, &mut error_count) {
-                    // ndx_table 查不到 entry 时（理论上不应发生，Sender 自己分配的 ndx）
-                    // 用合成路径兜底，确保该失败仍能计入 ErrorStats（issue #57）
-                    let path = ndx_table
-                        .lock()
-                        .unwrap_or_else(PoisonError::into_inner)
-                        .get(ndx)
-                        .map(|entry| entry.get_relative_path().to_path_buf())
-                        .unwrap_or_else(|| PathBuf::from(format!("<ndx-{ndx}>")));
-                    let msg = entry_error_stats_message(path, reason);
-                    stats_consumer.lock().await.update_statistics(&msg);
-                }
-            }
-            Some(ReceiverMsg::AllDone) => break,
-            Some(other) => {
-                debug!("[Sender Remote] Ignoring message: {:?}", std::mem::discriminant(&other));
-            }
-            None => return Err(AppError::CopyError("Transport closed during request/ack phase".into())),
-        }
-    }
-    Ok((transfer_count, success_count, error_count))
-}
-
-/// 同一 ndx 的失败只计一次 `error_count`：复合失败（同 ndx 源读失败 **且** dest 侧
-/// `resume_prepare` 失败）时，Sender 自检失败（`handle_full_transfer`/
-/// `handle_delta_transfer` 返回 `false`）与 Receiver 回传的 `ReceiverMsg::Error{ndx}`
-/// 可能各自独立触发一次增量；ndx 唯一对应一个文件，一个文件至多算一次错误。
-///
-/// 返回是否为本次新计数（`errored.insert(ndx)` 的结果）：调用方据此决定是否同时喂入
-/// `StorageEntryMessage::Error`，使 `ErrorStats` 与该本地 u64 计数按相同口径去重
-/// （复合失败不应被喂两次，见 issue #57）。
-fn count_ndx_error(errored: &mut HashSet<i32>, ndx: i32, error_count: &mut u64) -> bool {
-    let newly_counted = errored.insert(ndx);
-    if newly_counted {
-        *error_count += 1;
-    }
-    newly_counted
-}
-
-/// 把双进程模式下 entry 级失败（Sender 自检读失败 / Receiver 回传的终态失败）翻译为
-/// `StorageEntryMessage::Error`，供 Sender 侧 `StatisticConsumer` 累计统计（模式同
-/// `classification_to_stats_message`，issue #57）。所有双进程失败来源统一归为
-/// `ErrorEvent::Copy`——均发生在传输/复制阶段，不是扫描阶段。
-fn entry_error_stats_message(path: PathBuf, reason: String) -> StorageEntryMessage {
-    StorageEntryMessage::Error {
-        event: ErrorEvent::Copy,
-        path,
-        entry: None,
-        reason,
-    }
-}
-
-/// 把 Receiver 的分类判定翻译为 `StorageEntryMessage`，供 Sender 侧 `StatisticConsumer`
-/// 累计统计（与本地单进程管线复用同一套类型/口径，不发明新格式，见 issue #23）。
-///
-/// - `FullTransfer` → `New`；`MetadataOnly` → `Changed{kind: MetadataOnly}`（与本地口径
-///   对齐：本地模式里 MetadataOnly 本来就是 `Changed` 的子类型，不是独立顶层分类）；
-///   `Deleted` → `Deleted`。
-/// - `DeltaTransfer` → `Changed{kind: DataOnly}`：`DestIndex::check()` 只要
-///   `data_check` 不一致就判定 `DeltaTransfer`（不区分是否同时 `metadata_check` 也不
-///   一致），Sender 拿不到目标端 entry、无法像本地模式 `ChangeKind::from_entry_diff`
-///   那样精确区分 `DataOnly`/`Both`，取"表示内容变更"的那个 variant 作为口径。
-/// - `Skip` → `None`：与本地模式完全匹配的条目从不广播一致，不产生任何统计。
-fn classification_to_stats_message(decision: TransferDecision, entry: Arc<EntryEnum>) -> Option<StorageEntryMessage> {
-    match decision {
-        TransferDecision::FullTransfer => Some(StorageEntryMessage::New(entry)),
-        TransferDecision::DeltaTransfer => Some(StorageEntryMessage::Changed {
-            entry,
-            kind: ChangeKind::DataOnly,
-        }),
-        TransferDecision::MetadataOnly => Some(StorageEntryMessage::Changed {
-            entry,
-            kind: ChangeKind::MetadataOnly,
-        }),
-        TransferDecision::Skip => None,
-        TransferDecision::Deleted => Some(StorageEntryMessage::Deleted(entry)),
-    }
-}
-
-/// 记录一次成功（ndx 级 `Success` 与 Entry 级 `EntrySuccess` 共用同一份逻辑）：
-/// `success_count` 无条件 `+= 1`；`relative_path` 有值时写入 `completed_paths`
-/// （`Success{ndx}` 在 `ndx_table` 查不到 entry 时为 `None`，仍计入 `success_count`
-/// 但不记录路径，与原逻辑一致）；每满 100 个周期性落盘 checkpoint。
-async fn record_success_and_checkpoint(
-    relative_path: Option<String>, success_count: &mut u64, completed_paths: &mut HashSet<String>,
-    checkpoint_path: &Path,
-) {
-    *success_count += 1;
-    if let Some(path) = relative_path {
-        completed_paths.insert(path);
-    }
-    if success_count.is_multiple_of(100)
-        && let Ok(data) = serde_json::to_string(&completed_paths)
-    {
-        let _ = tokio::fs::write(checkpoint_path, data).await;
-    }
-}
-
-/// 全量传输一个 entry（目录 / 符号链接 / 文件分块）。
-///
-/// `ndx` 串入 `FileBegin`/`FileData`/`EndOfFile`，使 Receiver 能把校验结果关联回该 ndx
-/// （redo 决策所需，见 Receiver session outcome policy）；也是 `Redo{ndx}` 重发的入口——
-/// delta redo 与首次全量传输走同一份实现。
-///
-/// 返回 `Ok(true)` = 已成功发出该 entry 的数据（目录/符号链接/文件三选一）；
-/// `Ok(false)` = 源读失败（符号链接读失败 / 源文件读失败），已发送带 `ndx` 的
-/// `SenderMsg::EntryError` 通知 Receiver 完成该 ndx（Receiver 不再回发
-/// `ReceiverMsg::Error`），调用方需据此自增 `error_count`（Sender 自检失败由 Sender
-/// 自己计数，不依赖 Receiver 回传）。
-async fn handle_full_transfer(
-    transport: &(dyn SenderTransport + 'static), src_storage: &Arc<StorageEnum>, entry: &Arc<data_mover::EntryEnum>,
-    ndx: i32, qos: Option<&QosManager>, enable_acl: bool,
-) -> Result<bool> {
-    let ok = if entry.get_is_dir() {
-        transport.send(SenderMsg::CreateDir { entry: entry.clone() }).await?;
-        true
-    } else if entry.get_is_symlink() {
-        match src_storage.read_symlink(entry).await {
-            Ok(target) => {
-                transport
-                    .send(SenderMsg::CreateSymlink {
-                        entry: entry.clone(),
-                        target,
-                    })
-                    .await?;
-                true
-            }
-            Err(e) => {
-                error!("[Sender Remote] read_symlink {:?}: {}", entry.get_relative_path(), e);
-                transport
-                    .send(SenderMsg::EntryError {
-                        path: entry.get_relative_path().to_path_buf(),
-                        reason: format!("{e}"),
-                        ndx: Some(ndx),
-                    })
-                    .await?;
-                false
-            }
-        }
-    } else {
-        // 流式读源文件：read_chunk_stream 内部按块读 + per-chunk QoS + hash（不再整文件驻留 RAM）
-        let (mut rx, hash_handle) = StorageEnum::read_chunk_stream(src_storage, entry, None, qos.cloned(), true, 8);
-        transport
-            .send(SenderMsg::FileBegin {
-                ndx,
-                entry: entry.clone(),
-            })
-            .await?;
-        while let Some(chunk) = rx.recv().await {
-            transport
-                .send(SenderMsg::FileData {
-                    entry: entry.clone(),
-                    chunk,
-                })
-                .await?;
-        }
-        // 读任务收尾：JoinError 或内层读错误统一归一为原因字符串
-        let read_result = match hash_handle.await {
-            Ok(inner) => inner.map_err(|e| e.to_string()),
-            Err(e) => Err(e.to_string()),
-        };
-        match read_result {
-            // 成功：拿到源 hash（整文件 BLAKE3 十六进制）并收尾
-            Ok(hasher) => {
-                let source_hash = hasher.map(ConsistencyCheck::finalize);
-                transport
-                    .send(SenderMsg::EndOfFile {
-                        ndx,
-                        entry: entry.clone(),
-                        source_hash,
-                    })
-                    .await?;
-                true
-            }
-            // 读失败：记录日志 + 通知 Receiver 丢弃该文件已收分片、完成该 ndx（不发 ACL、不中断会话）
-            Err(reason) => {
-                error!("[Sender Remote] read file {:?}: {}", entry.get_relative_path(), reason);
-                transport
-                    .send(SenderMsg::EntryError {
-                        path: entry.get_relative_path().to_path_buf(),
-                        reason,
-                        ndx: Some(ndx),
-                    })
-                    .await?;
-                false
-            }
-        }
-    };
-    if ok {
-        send_acl_if_enabled(transport, src_storage, entry, enable_acl).await;
-    }
-    Ok(ok)
-}
-
-/// 逐 token 发送 `DeltaMatch`/`DeltaData` 消息（wire 协议不变）；`Data` token 走 QoS 限速，
-/// 与整片版本原有行为一致。
-async fn send_delta_tokens(
-    transport: &(dyn SenderTransport + 'static), ndx: i32, tokens: Vec<DeltaToken>, qos: Option<&QosManager>,
-) -> Result<()> {
-    for token in tokens {
-        match token {
-            DeltaToken::Match { block_index } => {
-                transport.send(SenderMsg::DeltaMatch { ndx, block_index }).await?;
-            }
-            DeltaToken::Data(data) => {
-                if let Some(q) = qos {
-                    q.acquire(data.len() as u64).await;
-                }
-                transport.send(SenderMsg::DeltaData { ndx, data }).await?;
-            }
-        }
-    }
-    Ok(())
-}
-
-/// Delta 传输一个 entry：流式读源文件 → 逐 chunk 喂 `DeltaMatcher` → token 边产出边发送。
-///
-/// 返回 `Ok(true)` = 源文件读取成功并已发送；`Ok(false)` = 源读失败，已发送带 `ndx`
-/// 的 `SenderMsg::EntryError` 通知 Receiver 完成该 ndx（不留悬空请求），调用方需据此
-/// 自增 `error_count`（与 `handle_full_transfer` 语义一致）。
-#[allow(clippy::too_many_arguments)]
-async fn handle_delta_transfer(
-    transport: &(dyn SenderTransport + 'static), src_storage: &Arc<StorageEnum>, entry: &Arc<data_mover::EntryEnum>,
-    ndx: i32, block_size: u32, signatures: Vec<BlockSignature>, qos: Option<&QosManager>, enable_acl: bool,
-) -> Result<bool> {
-    let delta_sigs: Vec<sync_delta::BlockSignature> = signatures
-        .into_iter()
-        .map(|s| sync_delta::BlockSignature {
-            rolling: s.rolling,
-            strong: s.strong,
-        })
-        .collect();
-    let mut matcher = DeltaMatcher::new(&delta_sigs, block_size);
-    let mut token_count = 0usize;
-
-    // 流式读源文件：read_chunk_stream 内部按块读 + per-chunk QoS + hash（不再整文件驻留
-    // RAM），逐 chunk 喂 DeltaMatcher，token 边产出边发送。
-    let (mut rx, hash_handle) = StorageEnum::read_chunk_stream(src_storage, entry, None, qos.cloned(), true, 8);
-    while let Some(chunk) = rx.recv().await {
-        let tokens = matcher.push(&chunk.data);
-        token_count += tokens.len();
-        send_delta_tokens(transport, ndx, tokens, qos).await?;
-    }
-    let tail_tokens = matcher.finish();
-    token_count += tail_tokens.len();
-    send_delta_tokens(transport, ndx, tail_tokens, qos).await?;
-
-    // 读任务收尾：JoinError 或内层读错误统一归一为原因字符串（与 handle_full_transfer 同构）
-    let read_result = match hash_handle.await {
-        Ok(inner) => inner.map_err(|e| e.to_string()),
-        Err(e) => Err(e.to_string()),
-    };
-    match read_result {
-        Ok(hasher) => {
-            let source_hash = hasher.map(ConsistencyCheck::finalize);
-            transport
-                .send(SenderMsg::EndOfFile {
-                    ndx,
-                    entry: entry.clone(),
-                    source_hash,
-                })
-                .await?;
-            info!(
-                "[Sender Remote] Delta transfer {:?}: {} tokens",
-                entry.get_relative_path(),
-                token_count
-            );
-            send_acl_if_enabled(transport, src_storage, entry, enable_acl).await;
-            Ok(true)
-        }
-        Err(reason) => {
-            error!("[Sender Remote] read file {:?}: {}", entry.get_relative_path(), reason);
-            transport
-                .send(SenderMsg::EntryError {
-                    path: entry.get_relative_path().to_path_buf(),
-                    reason,
-                    ndx: Some(ndx),
-                })
-                .await?;
-            Ok(false)
-        }
-    }
-}
-
-/// ACL 跨进程传输：仅在 `enable_acl=true` 且非符号链接时发送。
-async fn send_acl_if_enabled(
-    transport: &(dyn SenderTransport + 'static), src_storage: &Arc<StorageEnum>, entry: &Arc<data_mover::EntryEnum>,
-    enable_acl: bool,
-) {
-    if enable_acl
-        && !entry.get_is_symlink()
-        && let Ok(Some(acl_data)) = src_storage.get_acl_bytes(entry.get_relative_path()).await
-    {
-        let _ = transport
-            .send(SenderMsg::SetAcl {
-                entry: entry.clone(),
-                acl_data: bytes::Bytes::from(acl_data),
-            })
-            .await;
-    }
-}
-
-// ============================================================
-// Checkpoint 辅助
-// ============================================================
-
-/// 加载断点续传 checkpoint；文件不存在或解析失败时返回空集合。
-async fn load_checkpoint(path: &Path) -> HashSet<String> {
-    match tokio::fs::read_to_string(path).await {
-        Ok(data) if !data.is_empty() => serde_json::from_str(&data).unwrap_or_else(|e| {
-            warn!("[Sender Remote] Checkpoint 解析失败: {}, 将从头开始", e);
-            HashSet::new()
-        }),
-        Ok(_) => HashSet::new(),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => HashSet::new(),
-        Err(e) => {
-            warn!("[Sender Remote] 读取 checkpoint 失败: {}, 将从头开始", e);
-            HashSet::new()
-        }
-    }
-}
-
-/// 全部成功时删除 checkpoint；有错误时保存已完成条目供下次断点续传。
-async fn save_or_clear_checkpoint(path: &Path, completed_paths: &HashSet<String>, error_count: u64) {
-    if error_count == 0 {
-        let _ = tokio::fs::remove_file(path).await;
-        info!("[Sender Remote] Checkpoint cleared (all entries succeeded)");
-    } else if let Ok(data) = serde_json::to_string(completed_paths) {
-        let _ = tokio::fs::write(path, data).await;
-        info!(
-            "[Sender Remote] Checkpoint saved: {} entries completed",
-            completed_paths.len()
-        );
     }
 }
 
@@ -924,34 +338,35 @@ mod tests {
             .await
             .unwrap();
 
-        let ndx_table = Mutex::new(NdxTable::new());
-        let mut completed_paths = HashSet::new();
-        let checkpoint_path = src_dir.path().join("unused_checkpoint.json");
+        let checkpoint_path = dest_dir.path().join("unused_checkpoint.json");
+        fs::write(&checkpoint_path, r#"["previously-completed.txt"]"#).unwrap();
         let stats_consumer = test_stats_consumer();
-        let (page_count, (transfer_count, success_count, error_count)) = tokio::try_join!(
-            send_file_list_phase(&sender_transport, &walkdir_iter, &ndx_table, &stats_consumer),
-            process_requests_and_acks(
-                &sender_transport,
-                &src_storage,
-                &ndx_table,
-                None,
-                false,
-                &mut completed_paths,
-                &checkpoint_path,
-                &stats_consumer,
-            )
-        )
+        let summary = RemoteSenderSession::new(RemoteSenderSessionDeps {
+            transport: &sender_transport,
+            src_storage: &src_storage,
+            walkdir_iter: &walkdir_iter,
+            qos: None,
+            enable_acl: false,
+            checkpoint_path: &checkpoint_path,
+            stats_consumer: &stats_consumer,
+        })
+        .run()
+        .await
         .unwrap();
 
         sender_transport.close().await.unwrap();
         receiver_handle.await.unwrap().unwrap();
 
-        assert!(page_count >= 1, "应至少发送一页文件列表");
+        assert!(summary.page_count >= 1, "应至少发送一页文件列表");
         // 子目录（sub, sub/deeper）在文件列表阶段由 Receiver 直接创建，不走 TransferRequest/
         // EntrySuccess（与改造前一致，非本 issue 改动范围）；3 个文件全部走全量传输请求。
-        assert_eq!(transfer_count, 3, "应有 3 个文件走全量传输请求");
-        assert_eq!(error_count, 0, "不应有任何 EntryError");
-        assert_eq!(success_count, 3, "3 个文件应全部收到 EntrySuccess，证明无消息丢失");
+        assert_eq!(summary.transfer_count, 3, "应有 3 个文件走全量传输请求");
+        assert_eq!(summary.error_count, 0, "不应有任何 EntryError");
+        assert!(!checkpoint_path.exists(), "成功会话应清理已有 checkpoint");
+        assert_eq!(
+            summary.success_count, 3,
+            "3 个文件应全部收到 EntrySuccess，证明无消息丢失"
+        );
 
         // dest == src：逐文件比对内容
         assert_eq!(fs::read(dest_dir.path().join("a.txt")).unwrap(), b"hello");
@@ -963,6 +378,137 @@ mod tests {
             fs::read(dest_dir.path().join("sub/deeper/c.bin")).unwrap(),
             vec![7u8; 4096]
         );
+    }
+
+    #[tokio::test]
+    async fn negotiated_sender_session_reports_typed_failure_when_peer_closes_before_all_done() {
+        let src_dir = tempdir().unwrap();
+        let src_storage = Arc::new(
+            create_storage(src_dir.path().to_str().unwrap(), None, false)
+                .await
+                .unwrap(),
+        );
+        let walkdir_iter = src_storage.walkdir_2(None, None, None, None, 1, false).await.unwrap();
+        let (sender_transport, receiver_transport) = create_in_process_pair();
+        let peer = tokio::spawn(async move {
+            while let Some(message) = receiver_transport.recv().await {
+                if matches!(message, SenderMsg::FileListDone) {
+                    break;
+                }
+            }
+        });
+        let stats_consumer = test_stats_consumer();
+        let checkpoint_path = src_dir.path().join("unused_checkpoint.json");
+        let error = RemoteSenderSession::new(RemoteSenderSessionDeps {
+            transport: &sender_transport,
+            src_storage: &src_storage,
+            walkdir_iter: &walkdir_iter,
+            qos: None,
+            enable_acl: false,
+            checkpoint_path: &checkpoint_path,
+            stats_consumer: &stats_consumer,
+        })
+        .run()
+        .await
+        .unwrap_err();
+        peer.await.unwrap();
+
+        assert!(matches!(
+            error,
+            AppError::SenderSessionStage {
+                stage: "requests/acks",
+                source,
+            } if matches!(*source, AppError::CopyError(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn negotiated_sender_session_sends_transfer_done_once_for_duplicate_requests_done() {
+        let src_dir = tempdir().unwrap();
+        let src_storage = Arc::new(
+            create_storage(src_dir.path().to_str().unwrap(), None, false)
+                .await
+                .unwrap(),
+        );
+        let walkdir_iter = src_storage.walkdir_2(None, None, None, None, 1, false).await.unwrap();
+        let (sender_transport, receiver_transport) = create_in_process_pair();
+        let peer = tokio::spawn(async move {
+            while let Some(message) = receiver_transport.recv().await {
+                if matches!(message, SenderMsg::FileListDone) {
+                    break;
+                }
+            }
+            receiver_transport.send(ReceiverMsg::RequestsDone).await.unwrap();
+            receiver_transport.send(ReceiverMsg::RequestsDone).await.unwrap();
+            assert!(matches!(receiver_transport.recv().await, Some(SenderMsg::TransferDone)));
+            assert!(
+                tokio::time::timeout(Duration::from_millis(50), receiver_transport.recv())
+                    .await
+                    .is_err(),
+                "duplicate RequestsDone must not emit duplicate TransferDone"
+            );
+            receiver_transport.send(ReceiverMsg::AllDone).await.unwrap();
+        });
+        let checkpoint_path = src_dir.path().join("unused_checkpoint.json");
+        let stats_consumer = test_stats_consumer();
+
+        RemoteSenderSession::new(RemoteSenderSessionDeps {
+            transport: &sender_transport,
+            src_storage: &src_storage,
+            walkdir_iter: &walkdir_iter,
+            qos: None,
+            enable_acl: false,
+            checkpoint_path: &checkpoint_path,
+            stats_consumer: &stats_consumer,
+        })
+        .run()
+        .await
+        .unwrap();
+        peer.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn negotiated_sender_session_rejects_all_done_before_transfer_done() {
+        let src_dir = tempdir().unwrap();
+        let src_storage = Arc::new(
+            create_storage(src_dir.path().to_str().unwrap(), None, false)
+                .await
+                .unwrap(),
+        );
+        let walkdir_iter = src_storage.walkdir_2(None, None, None, None, 1, false).await.unwrap();
+        let (sender_transport, receiver_transport) = create_in_process_pair();
+        let peer = tokio::spawn(async move {
+            while let Some(message) = receiver_transport.recv().await {
+                if matches!(message, SenderMsg::FileListDone) {
+                    break;
+                }
+            }
+            receiver_transport.send(ReceiverMsg::AllDone).await.unwrap();
+        });
+        let checkpoint_path = src_dir.path().join("unused_checkpoint.json");
+        let stats_consumer = test_stats_consumer();
+
+        let error = RemoteSenderSession::new(RemoteSenderSessionDeps {
+            transport: &sender_transport,
+            src_storage: &src_storage,
+            walkdir_iter: &walkdir_iter,
+            qos: None,
+            enable_acl: false,
+            checkpoint_path: &checkpoint_path,
+            stats_consumer: &stats_consumer,
+        })
+        .run()
+        .await
+        .unwrap_err();
+        peer.await.unwrap();
+
+        assert!(matches!(
+            error,
+            AppError::SenderSessionStage {
+                stage: "requests/acks",
+                source,
+            } if matches!(*source, AppError::CopyError(ref reason) if reason.contains("AllDone"))
+        ));
     }
 
     // ============================================================
@@ -1029,6 +575,36 @@ mod tests {
         }
     }
 
+    /// 在首个实际 transfer request 交给 Sender session 前执行一次故障注入。
+    /// 这是测试 transport adapter，不暴露 session 私有阶段，也不恢复旧 phase seam。
+    struct DisruptOnFirstRequest<'a> {
+        inner: &'a dyn SenderTransport,
+        disrupt: Mutex<Option<Box<dyn FnOnce() + Send + 'a>>>,
+    }
+
+    #[async_trait]
+    impl SenderTransport for DisruptOnFirstRequest<'_> {
+        async fn send(&self, msg: SenderMsg) -> TransportResult<()> {
+            self.inner.send(msg).await
+        }
+
+        async fn recv(&self) -> Option<ReceiverMsg> {
+            let message = self.inner.recv().await;
+            if matches!(
+                message,
+                Some(ReceiverMsg::TransferRequest { .. } | ReceiverMsg::DeltaTransferRequest { .. })
+            ) && let Some(disrupt) = self.disrupt.lock().unwrap_or_else(PoisonError::into_inner).take()
+            {
+                disrupt();
+            }
+            message
+        }
+
+        async fn close(&self) -> TransportResult<()> {
+            self.inner.close().await
+        }
+    }
+
     /// 起 Receiver（`receiver_task_remote`）+ 跑 Sender 侧握手/鉴权/`SessionConfig` +
     /// 文件列表与请求/ack 并发处理，返回 `(success_count, error_count)`。
     /// `sender_transport` 可传入包装过的 transport（如 `HashMismatchInjector`），
@@ -1061,28 +637,24 @@ mod tests {
             .await
             .unwrap();
 
-        let ndx_table = Mutex::new(NdxTable::new());
-        let mut completed_paths = HashSet::new();
         let checkpoint_path = src_dir.join("unused_checkpoint.json");
         let stats_consumer = test_stats_consumer();
-        let (_page_count, (_transfer_count, success_count, error_count)) = tokio::try_join!(
-            send_file_list_phase(sender_transport, &walkdir_iter, &ndx_table, &stats_consumer),
-            process_requests_and_acks(
-                sender_transport,
-                &src_storage,
-                &ndx_table,
-                None,
-                false,
-                &mut completed_paths,
-                &checkpoint_path,
-                &stats_consumer,
-            )
-        )
+        let summary = RemoteSenderSession::new(RemoteSenderSessionDeps {
+            transport: sender_transport,
+            src_storage: &src_storage,
+            walkdir_iter: &walkdir_iter,
+            qos: None,
+            enable_acl: false,
+            checkpoint_path: &checkpoint_path,
+            stats_consumer: &stats_consumer,
+        })
+        .run()
+        .await
         .unwrap();
 
         sender_transport.close().await.unwrap();
         receiver_handle.await.unwrap().unwrap();
-        (success_count, error_count)
+        (summary.success_count, summary.error_count)
     }
 
     /// 与 `run_pipeline` 类似，但不用 `tokio::try_join!` 并发跑文件列表与请求处理，
@@ -1094,9 +666,9 @@ mod tests {
     ///
     /// 返回值带上 `stats_consumer`（issue #57）：供调用方断言 Sender 自检失败是否已
     /// 正确喂入 `ErrorStats`（报表口径），而不只是本地 `error_count` u64。
-    async fn run_pipeline_with_disruption(
-        sender_transport: &(dyn SenderTransport + 'static), receiver_transport: InProcessReceiverTransport,
-        src_dir: &std::path::Path, dest_storage: Arc<StorageEnum>, disrupt: impl FnOnce(),
+    async fn run_pipeline_with_disruption<'a>(
+        sender_transport: &'a (dyn SenderTransport + 'static), receiver_transport: InProcessReceiverTransport,
+        src_dir: &std::path::Path, dest_storage: Arc<StorageEnum>, disrupt: impl FnOnce() + Send + 'a,
     ) -> (Arc<AsyncMutex<StatisticConsumer>>, u64, u64) {
         let src_storage = Arc::new(create_storage(src_dir.to_str().unwrap(), None, false).await.unwrap());
         let walkdir_iter = src_storage.walkdir_2(None, None, None, None, 4, false).await.unwrap();
@@ -1122,32 +694,28 @@ mod tests {
             .await
             .unwrap();
 
-        let ndx_table = Mutex::new(NdxTable::new());
         let stats_consumer = test_stats_consumer();
-        send_file_list_phase(sender_transport, &walkdir_iter, &ndx_table, &stats_consumer)
-            .await
-            .unwrap();
-
-        disrupt();
-
-        let mut completed_paths = HashSet::new();
         let checkpoint_path = src_dir.join("unused_checkpoint.json");
-        let (_transfer_count, success_count, error_count) = process_requests_and_acks(
-            sender_transport,
-            &src_storage,
-            &ndx_table,
-            None,
-            false,
-            &mut completed_paths,
-            &checkpoint_path,
-            &stats_consumer,
-        )
+        let disrupting_transport = DisruptOnFirstRequest {
+            inner: sender_transport,
+            disrupt: Mutex::new(Some(Box::new(disrupt))),
+        };
+        let summary = RemoteSenderSession::new(RemoteSenderSessionDeps {
+            transport: &disrupting_transport,
+            src_storage: &src_storage,
+            walkdir_iter: &walkdir_iter,
+            qos: None,
+            enable_acl: false,
+            checkpoint_path: &checkpoint_path,
+            stats_consumer: &stats_consumer,
+        })
+        .run()
         .await
         .unwrap();
 
         sender_transport.close().await.unwrap();
         receiver_handle.await.unwrap().unwrap();
-        (stats_consumer, success_count, error_count)
+        (stats_consumer, summary.success_count, summary.error_count)
     }
 
     /// (b) 全量·一次 mismatch → Sender 收 Redo 全量重发 → Success，`finalize_run_result` Ok。
@@ -1200,6 +768,10 @@ mod tests {
 
         assert_eq!(success_count, 0);
         assert_eq!(error_count, 1, "连续两次 mismatch 应进入 Error 终态");
+        assert!(
+            src_dir.path().join("unused_checkpoint.json").exists(),
+            "部分失败应保留 checkpoint"
+        );
         assert!(
             finalize_run_result(error_count).is_ok(),
             "entry 级失败不应再使 finalize_run_result 返回 Err"
@@ -2491,48 +2063,6 @@ mod tests {
             other => panic!("expected StatsKind::Incremental, got {other:?}"),
         }
     }
-
-    /// `send_file_list_phase` 遍历 `walkdir_iter` 时随条目数正确累加 `scanned`
-    /// （不需要真实 QUIC：只驱动统计喂入，用 in-process transport 承接 `FilePage` 发送）。
-    #[tokio::test]
-    async fn send_file_list_phase_accumulates_scanned_stats() {
-        let src_dir = tempdir().unwrap();
-        fs::write(src_dir.path().join("a.txt"), b"aaa").unwrap();
-        fs::write(src_dir.path().join("b.txt"), b"bbbbb").unwrap();
-        fs::create_dir_all(src_dir.path().join("sub")).unwrap();
-        fs::write(src_dir.path().join("sub/c.txt"), b"c").unwrap();
-
-        let src_storage = Arc::new(
-            create_storage(src_dir.path().to_str().unwrap(), None, false)
-                .await
-                .unwrap(),
-        );
-        let walkdir_iter = src_storage.walkdir_2(None, None, None, None, 4, false).await.unwrap();
-        let (sender_transport, receiver_transport) = create_in_process_pair();
-        // 只消费 FilePage/FileListDone，不驱动任何写入，测试只关心 Sender 侧统计累加
-        let drain_handle = tokio::spawn(async move { while receiver_transport.recv().await.is_some() {} });
-
-        let ndx_table = Mutex::new(NdxTable::new());
-        let stats_consumer = test_stats_consumer();
-        let page_count = send_file_list_phase(&sender_transport, &walkdir_iter, &ndx_table, &stats_consumer)
-            .await
-            .unwrap();
-        assert!(page_count >= 1);
-
-        sender_transport.close().await.unwrap();
-        drop(drain_handle);
-
-        let consumer = stats_consumer.lock().await;
-        match &consumer.stats {
-            StatsKind::Incremental(s) => {
-                // 2 个顶层文件 + 1 个子目录 + 1 个子目录下文件 = 4 个 Scanned 条目
-                assert_eq!(s.scanned.regular_file_count, 3, "3 个文件应全部计入 scanned");
-                assert_eq!(s.scanned.dir_count, 1, "1 个子目录应计入 scanned");
-            }
-            other => panic!("expected StatsKind::Incremental, got {other:?}"),
-        }
-    }
-
     /// 结构化报表与本地口径一致性：混合 New/Changed(content)/Changed(MetadataOnly)/
     /// Skip/Deleted 场景后，`to_final_stats()`/`to_job_result()` 产出的字段值与预期
     /// 计数逐一匹配（New/Changed 合计含 MetadataOnly、Deleted、Renamed 恒 0）。
