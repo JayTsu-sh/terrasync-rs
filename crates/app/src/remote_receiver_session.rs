@@ -11,7 +11,7 @@ use data_mover::dir_tree::DirPageResult;
 use data_mover::{DataChunk, EntryEnum, StorageEnum};
 use tokio::sync::mpsc::{Receiver, Sender};
 use tracing::{debug, info, warn};
-use transport::flow_control::ReceiverCreditState;
+use transport::flow_control::{ReceiverCreditState, payload_credit_cost};
 use transport::message::{
     BlockSignature, DcAck, DestIndex, DiskCommitMsg, FeatureFlags, FileOutcome, NdxTable, ProgressSnapshot,
     ReceiverMsg, SessionConfig, TransferDecision,
@@ -311,7 +311,7 @@ impl RemoteSessionState {
         &mut self, transport: &(dyn ReceiverTransport + 'static), dc_tx: &Sender<DiskCommitMsg>, entry: Arc<EntryEnum>,
         chunk: DataChunk,
     ) -> Result<bool> {
-        let bytes = chunk.data.len() as u64;
+        let bytes = payload_credit_cost(&chunk.data);
         if !self.push_full_chunk(dc_tx, entry, chunk).await {
             return Ok(false);
         }
@@ -404,7 +404,7 @@ impl RemoteSessionState {
         &mut self, transport: &(dyn ReceiverTransport + 'static), dc_tx: &Sender<DiskCommitMsg>, ndx: i32,
         entry: &Arc<EntryEnum>, data: bytes::Bytes,
     ) -> Result<bool> {
-        let bytes = data.len() as u64;
+        let bytes = payload_credit_cost(&data);
         if !self.push_delta_data(dc_tx, ndx, entry, data).await {
             return Ok(false);
         }
@@ -608,16 +608,39 @@ mod tests {
     use std::sync::atomic::Ordering;
     use std::time::Duration;
 
+    use async_trait::async_trait;
     use bytes::Bytes;
     use data_mover::dir_tree::{DirPageResult, NdxEntry, NdxEvent};
     use data_mover::{DataChunk, NASEntry, create_storage};
     use tempfile::tempdir;
-    use tokio::sync::mpsc;
+    use tokio::sync::{Mutex as TokioMutex, mpsc};
+    use transport::error::Result as TransportResult;
     use transport::in_process::create_in_process_pair;
     use transport::message::{ReceiverMsg, SenderMsg, TransferDecision};
-    use transport::traits::SenderTransport;
+    use transport::traits::{ReceiverTransport, SenderTransport};
 
     use super::*;
+
+    struct RecordingReceiverTransport {
+        incoming: TokioMutex<mpsc::Receiver<SenderMsg>>,
+        sent: TokioMutex<Vec<ReceiverMsg>>,
+    }
+
+    #[async_trait]
+    impl ReceiverTransport for RecordingReceiverTransport {
+        async fn recv(&self) -> Option<SenderMsg> {
+            self.incoming.lock().await.recv().await
+        }
+
+        async fn send(&self, message: ReceiverMsg) -> TransportResult<()> {
+            self.sent.lock().await.push(message);
+            Ok(())
+        }
+
+        async fn close(&self) -> TransportResult<()> {
+            Ok(())
+        }
+    }
 
     fn session_config() -> SessionConfig {
         SessionConfig {
@@ -646,6 +669,68 @@ mod tests {
             elapsed_secs: 0.0,
             speed_bytes_per_sec: 0.0,
         }
+    }
+
+    async fn assert_terminal_path_discards_residual(normal_completion: bool) {
+        let dest_dir = tempdir().unwrap();
+        let dest = Arc::new(
+            create_storage(dest_dir.path().to_str().unwrap(), None, true)
+                .await
+                .unwrap(),
+        );
+        let (incoming_tx, incoming_rx) = mpsc::channel(1);
+        if normal_completion {
+            incoming_tx.send(SenderMsg::TransferDone).await.unwrap();
+        }
+        drop(incoming_tx);
+        let transport = RecordingReceiverTransport {
+            incoming: TokioMutex::new(incoming_rx),
+            sent: TokioMutex::new(Vec::new()),
+        };
+        let progress = Arc::new(ReceiverProgress::new());
+        let (_progress_tx, progress_rx) = mpsc::channel(1);
+        let mut state = RemoteSessionState::default();
+        state.credit = ReceiverCreditState::new(8).unwrap();
+        state.credit.accepted(&transport, 1).await.unwrap();
+
+        let result = recv_file_list_and_data_phase(
+            &transport,
+            &dest,
+            &session_config(),
+            &FeatureFlags::current(),
+            u64::MAX,
+            &progress,
+            progress_rx,
+            &mut state,
+        )
+        .await;
+        if normal_completion {
+            result.unwrap();
+        } else {
+            assert!(result.is_err());
+        }
+
+        // 1 residual byte must have been discarded. Otherwise 1 + 3 reaches
+        // the half-window threshold and emits a CreditGrant here.
+        state.credit.accepted(&transport, 3).await.unwrap();
+        assert!(
+            !transport
+                .sent
+                .lock()
+                .await
+                .iter()
+                .any(|message| matches!(message, ReceiverMsg::CreditGrant { .. }))
+        );
+    }
+
+    #[tokio::test]
+    async fn normal_completion_discards_residual_credit() {
+        assert_terminal_path_discards_residual(true).await;
+    }
+
+    #[tokio::test]
+    async fn abrupt_close_discards_residual_credit() {
+        assert_terminal_path_discards_residual(false).await;
     }
 
     fn nas_entry(name: &str, relative_path: PathBuf, is_dir: bool) -> Arc<EntryEnum> {

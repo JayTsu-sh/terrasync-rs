@@ -80,13 +80,28 @@ use tokio::sync::Notify;
 
 // 内部模块
 use crate::error::{Result, TransportError};
-use crate::message::ReceiverMsg;
+use crate::message::{ReceiverMsg, SenderMsg};
 use crate::traits::ReceiverTransport;
 
 /// 默认 credit 窗口：64 MiB（BDP 依据见模块文档）
 pub const DEFAULT_CREDIT_WINDOW_BYTES: u64 = 64 * 1024 * 1024;
 
 const MAX_CREDIT_WINDOW_BYTES: u64 = u32::MAX as u64;
+
+/// Authoritative cost for an accepted full/delta payload.
+pub fn payload_credit_cost(payload: &[u8]) -> u64 {
+    payload.len() as u64
+}
+
+/// Data-message credit cost; control and metadata messages are outside the data window.
+pub fn credit_cost(message: &SenderMsg) -> Option<u64> {
+    match message {
+        SenderMsg::FileData { chunk, .. } => Some(payload_credit_cost(&chunk.data)),
+        SenderMsg::DeltaData { data, .. } => Some(payload_credit_cost(data)),
+        SenderMsg::TarPacked { tar_entry, .. } => Some(tar_entry.get_size()),
+        _ => None,
+    }
+}
 
 /// Receiver-side result of recording data accepted by the bounded sink.
 #[derive(Debug)]
@@ -269,10 +284,75 @@ fn validate_window(window_bytes: u64) -> Result<()> {
 #[cfg(test)]
 #[allow(clippy::expect_used, clippy::unwrap_used)]
 mod tests {
+    use std::path::PathBuf;
     use std::sync::Arc;
     use std::time::Duration;
 
+    use bytes::Bytes;
+    use data_mover::{DataChunk, EntryEnum, NASEntry};
+
     use super::*;
+
+    fn dummy_entry_with_size(size: u64) -> Arc<EntryEnum> {
+        Arc::new(EntryEnum::NAS(NASEntry {
+            name: "f".to_string(),
+            relative_path: PathBuf::from("f"),
+            extension: None,
+            is_dir: false,
+            size,
+            atime: 0,
+            ctime: 0,
+            mtime: 0,
+            mode: 0o644,
+            is_symlink: false,
+            hard_links: None,
+            uid: None,
+            gid: None,
+            ino: None,
+            file_handle: None,
+            acl: None,
+            owner: None,
+            owner_group: None,
+            xattrs: None,
+        }))
+    }
+
+    #[test]
+    fn credit_cost_counts_file_data_by_chunk_payload_len() {
+        let message = SenderMsg::FileData {
+            entry: dummy_entry_with_size(0),
+            chunk: DataChunk {
+                offset: 0,
+                data: Bytes::from(vec![0u8; 100]),
+            },
+        };
+        assert_eq!(credit_cost(&message), Some(100));
+    }
+
+    #[test]
+    fn credit_cost_counts_delta_data_by_payload_len() {
+        let message = SenderMsg::DeltaData {
+            ndx: 1,
+            data: Bytes::from(vec![0u8; 50]),
+        };
+        assert_eq!(credit_cost(&message), Some(50));
+    }
+
+    #[test]
+    fn credit_cost_counts_tar_packed_by_entry_size() {
+        let message = SenderMsg::TarPacked {
+            tar_entry: dummy_entry_with_size(12345),
+            manifest_entries: vec![],
+        };
+        assert_eq!(credit_cost(&message), Some(12345));
+    }
+
+    #[test]
+    fn credit_cost_ignores_delta_match_and_control_messages() {
+        assert_eq!(credit_cost(&SenderMsg::DeltaMatch { ndx: 1, block_index: 0 }), None);
+        assert_eq!(credit_cost(&SenderMsg::TransferDone), None);
+        assert_eq!(credit_cost(&SenderMsg::Auth { token: "t".to_string() }), None);
+    }
 
     #[test]
     fn receiver_credit_batches_at_half_window_and_discards_terminal_residual() {
