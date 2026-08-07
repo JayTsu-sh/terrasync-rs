@@ -26,7 +26,7 @@ use crate::consumer::stats::format_bytes;
 
 /// 构造 negotiated session 所需的既有 adapter 与配置。
 pub(super) struct RemoteSenderSessionDeps<'a> {
-    pub(super) transport: &'a (dyn SenderTransport + 'static),
+    pub(super) transport: &'a dyn SenderTransport,
     pub(super) src_storage: &'a Arc<StorageEnum>,
     pub(super) walkdir_iter: &'a WalkDirAsyncIterator2,
     pub(super) qos: Option<&'a QosManager>,
@@ -209,17 +209,19 @@ impl<'a> RemoteSenderSession<'a> {
             (self.lifecycle, next),
             (
                 RemoteSenderSessionLifecycle::Advertising,
-                RemoteSenderSessionLifecycle::RequestsOpen
+                RemoteSenderSessionLifecycle::RequestsOpen | RemoteSenderSessionLifecycle::Failed
             ) | (
                 RemoteSenderSessionLifecycle::RequestsOpen,
                 RemoteSenderSessionLifecycle::TransferDoneSent
+                    | RemoteSenderSessionLifecycle::Completed
+                    | RemoteSenderSessionLifecycle::Failed
             ) | (
                 RemoteSenderSessionLifecycle::TransferDoneSent,
-                RemoteSenderSessionLifecycle::Completed
+                RemoteSenderSessionLifecycle::Completed | RemoteSenderSessionLifecycle::Failed
             ) | (
-                RemoteSenderSessionLifecycle::RequestsOpen,
-                RemoteSenderSessionLifecycle::Completed
-            ) | (_, RemoteSenderSessionLifecycle::Failed)
+                RemoteSenderSessionLifecycle::Completed,
+                RemoteSenderSessionLifecycle::Failed
+            )
         ));
         self.lifecycle = next;
     }
@@ -230,7 +232,7 @@ impl<'a> RemoteSenderSession<'a> {
 /// 这是 session implementation 的内部操作；生产调用者只使用
 /// [`RemoteSenderSession::run`]。
 pub(super) async fn advertise_file_list(
-    transport: &(dyn SenderTransport + 'static), walkdir_iter: &WalkDirAsyncIterator2, ndx_table: &Mutex<NdxTable>,
+    transport: &dyn SenderTransport, walkdir_iter: &WalkDirAsyncIterator2, ndx_table: &Mutex<NdxTable>,
     stats_consumer: &Arc<AsyncMutex<StatisticConsumer>>,
 ) -> Result<u64> {
     info!("[Sender Remote] Sending file list");
@@ -266,7 +268,7 @@ pub(super) async fn advertise_file_list(
 
 /// 发送一个 full entry；目录、符号链接和 bounded file stream 共用一个 typed outcome。
 pub(super) async fn send_full_transfer(
-    transport: &(dyn SenderTransport + 'static), src_storage: &Arc<StorageEnum>, entry: &Arc<EntryEnum>, ndx: i32,
+    transport: &dyn SenderTransport, src_storage: &Arc<StorageEnum>, entry: &Arc<EntryEnum>, ndx: i32,
     qos: Option<&QosManager>, enable_acl: bool,
 ) -> Result<SourceTransferOutcome> {
     let outcome = if entry.get_is_dir() {
@@ -347,8 +349,7 @@ pub(super) async fn send_full_transfer(
 
 /// ACL 跨进程传输：仅在启用且 entry 不是符号链接时发送。
 pub(super) async fn send_acl_if_enabled(
-    transport: &(dyn SenderTransport + 'static), src_storage: &Arc<StorageEnum>, entry: &Arc<EntryEnum>,
-    enable_acl: bool,
+    transport: &dyn SenderTransport, src_storage: &Arc<StorageEnum>, entry: &Arc<EntryEnum>, enable_acl: bool,
 ) {
     if enable_acl
         && !entry.get_is_symlink()
@@ -364,9 +365,13 @@ pub(super) async fn send_acl_if_enabled(
 }
 
 /// Delta source stream：matcher 与 token emission 都由 session implementation 持有。
+#[allow(
+    clippy::too_many_arguments,
+    reason = "internal transition receives one decoded delta request"
+)]
 pub(super) async fn send_delta_transfer(
-    transport: &(dyn SenderTransport + 'static), src_storage: &Arc<StorageEnum>, entry: &Arc<EntryEnum>, ndx: i32,
-    block_size: u32, signatures: Vec<BlockSignature>, qos: Option<&QosManager>, enable_acl: bool,
+    transport: &dyn SenderTransport, src_storage: &Arc<StorageEnum>, entry: &Arc<EntryEnum>, ndx: i32, block_size: u32,
+    signatures: Vec<BlockSignature>, qos: Option<&QosManager>, enable_acl: bool,
 ) -> Result<SourceTransferOutcome> {
     let signatures = signatures
         .into_iter()
@@ -423,7 +428,7 @@ pub(super) async fn send_delta_transfer(
 }
 
 async fn send_delta_tokens(
-    transport: &(dyn SenderTransport + 'static), ndx: i32, tokens: Vec<DeltaToken>, qos: Option<&QosManager>,
+    transport: &dyn SenderTransport, ndx: i32, tokens: Vec<DeltaToken>, qos: Option<&QosManager>,
 ) -> Result<()> {
     for token in tokens {
         match token {
@@ -442,8 +447,12 @@ async fn send_delta_tokens(
 }
 
 /// 唯一的 Receiver-message consumer；完成协议与所有 terminal transitions 在此收口。
+#[allow(
+    clippy::too_many_arguments,
+    reason = "internal loop owns the complete negotiated-session context"
+)]
 pub(super) async fn process_requests_and_acks(
-    transport: &(dyn SenderTransport + 'static), src_storage: &Arc<StorageEnum>, ndx_table: &Mutex<NdxTable>,
+    transport: &dyn SenderTransport, src_storage: &Arc<StorageEnum>, ndx_table: &Mutex<NdxTable>,
     qos: Option<&QosManager>, enable_acl: bool, completed_paths: &mut HashSet<String>, checkpoint_path: &Path,
     stats_consumer: &Arc<AsyncMutex<StatisticConsumer>>, ledger: &mut SenderSessionLedger,
 ) -> Result<()> {
@@ -575,8 +584,10 @@ pub(super) async fn process_requests_and_acks(
                         .lock()
                         .unwrap_or_else(PoisonError::into_inner)
                         .get(ndx)
-                        .map(|entry| entry.get_relative_path().to_path_buf())
-                        .unwrap_or_else(|| PathBuf::from(format!("<ndx-{ndx}>")));
+                        .map_or_else(
+                            || PathBuf::from(format!("<ndx-{ndx}>")),
+                            |entry| entry.get_relative_path().to_path_buf(),
+                        );
                     record_copy_error(stats_consumer, path, reason).await;
                 }
             }

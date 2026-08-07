@@ -3,31 +3,18 @@
 //! 将 QUIC 连接、文件列表发送、传输请求处理、Ack 收集等阶段
 //! 提取为独立函数，降低单函数复杂度并提升可读性。
 //!
-//! 握手/鉴权/`SessionConfig` 之后，文件列表发送（session advertising，只
-//! `send()`、从不 `recv()`）与请求处理 + Ack 收集（`process_requests_and_acks`，
-//! 唯一的 `recv()` 消费者）通过 `tokio::try_join!` 并发运行，不再是「文件列表发完
-//! 才能开始处理请求」的顺序 barrier；`NdxTable` 因此改为 `Mutex` 包裹以支持并发
-//! 读写（写者只有文件列表任务，读者只有请求处理任务，不存在二义性）。
+//! 握手/鉴权/`SessionConfig` 之后，完整生命周期由 `RemoteSenderSession` 持有：
+//! advertising 与 request/ack consumer 并发运行，避免文件列表 barrier；唯一的
+//! `recv()` consumer、index correlation、source transfer、reporting、checkpoint 和
+//! terminal protocol 都隐藏在 session interface 后面。
 
 mod remote_sender_session;
 
-#[cfg(test)]
-use remote_sender_session::advertise_file_list;
-#[cfg(test)]
-use remote_sender_session::record_success_and_checkpoint;
 use remote_sender_session::{RemoteSenderSession, RemoteSenderSessionDeps};
-#[cfg(test)]
-use remote_sender_session::{SenderSessionLedger, SourceTransferOutcome, send_delta_transfer, send_full_transfer};
-#[cfg(test)]
-use remote_sender_session::{apply_progress, record_classification, record_copy_error};
 #[cfg(test)]
 use remote_sender_session::{classification_to_stats_message, entry_error_stats_message};
 
-#[cfg(test)]
-use std::collections::HashSet;
 use std::net::SocketAddr;
-#[cfg(test)]
-use std::path::{Path, PathBuf};
 use std::sync::Arc;
 #[cfg(test)]
 use std::sync::{Mutex, PoisonError};
@@ -39,18 +26,14 @@ use data_mover::create_storage;
 use data_mover::dir_tree::NdxEvent;
 use data_mover::filter::parse_filter_expression;
 #[cfg(test)]
-use data_mover::qos::QosManager;
-#[cfg(test)]
 use data_mover::{ChangeKind, EntryEnum, ErrorEvent, StorageEntryMessage};
 use rustls::pki_types::CertificateDer;
 use tokio::sync::Mutex as AsyncMutex;
-#[cfg(test)]
-use tracing::{debug, error};
 use tracing::{info, warn};
 use transport::error::TransportError;
-use transport::message::{HandshakeResult, ProtocolHandshake, ReceiverMsg, SenderMsg, SessionConfig};
 #[cfg(test)]
-use transport::message::{NdxTable, TransferDecision};
+use transport::message::TransferDecision;
+use transport::message::{HandshakeResult, ProtocolHandshake, ReceiverMsg, SenderMsg, SessionConfig};
 use transport::traits::SenderTransport;
 use utils::app_config::AppConfig;
 use utils::logger;
@@ -240,191 +223,6 @@ async fn send_and_check_auth(transport: &(dyn SenderTransport + 'static), auth_t
         Some(_) => Err(AppError::CopyError("Unexpected message during auth".into())),
         None => Err(AppError::CopyError("Transport closed during auth".into())),
     }
-}
-
-// ============================================================
-// 传输请求处理 + Ack 收集（唯一的 recv() 消费者，与 session advertising 并发运行）
-// ============================================================
-
-/// 接收 Receiver 的 `TransferRequest`/`DeltaTransferRequest`（发送对应数据）与
-/// `EntrySuccess`/`EntryError`/`Progress`（记录 ack/进度），直到 `AllDone`。
-///
-/// 合并原先顺序执行的「请求处理」与「Ack 收集」两个阶段：拆分多路复用 stream 后，
-/// Receiver 可能在所有请求处理完之前就已经开始发送 ack/progress（两者走不同的物理
-/// stream），若仍分成两个各自独立调用 `recv()` 的阶段，晚到的 ack 会被"请求处理"
-/// 阶段的 catch-all 分支直接丢弃。合并为单一消费者循环、按 variant dispatch 后，
-/// 不再有这个丢消息风险（transport 层只暴露一个 `recv()`，见 `crates/transport/src/quic/mux.rs`）。
-///
-/// `RequestsDone` 到达时立即发送 `TransferDone`（与改造前时序一致），但循环不break，
-/// 继续处理后续到达的 ack/progress，直到收到 `AllDone`。
-///
-/// `TransferRequest{decision}`/`DeltaTransferRequest`/`Classified{entry, decision}`
-/// 各自额外翻译为 `StorageEntryMessage` 喂 `stats_consumer.update_statistics()`，驱动
-/// Sender 侧结构化报表（New/Changed/MetadataOnly/Deleted，`Skip` 不产生统计，见
-/// `classification_to_stats_message`，issue #23）；`Redo{ndx}` 是重发、不是新的分类
-/// 事件，不重复计数。
-/// 返回 `(transfer_count, success_count, error_count)`。
-#[cfg(test)]
-async fn process_requests_and_acks(
-    transport: &(dyn SenderTransport + 'static), src_storage: &Arc<StorageEnum>, ndx_table: &Mutex<NdxTable>,
-    qos: Option<&QosManager>, enable_acl: bool, completed_paths: &mut HashSet<String>, checkpoint_path: &Path,
-    stats_consumer: &Arc<AsyncMutex<StatisticConsumer>>, ledger: &mut SenderSessionLedger,
-) -> Result<()> {
-    info!("[Sender Remote] Processing transfer requests + collecting acks");
-    loop {
-        match transport.recv().await {
-            Some(ReceiverMsg::TransferRequest { ndx, decision }) => {
-                let entry = ndx_table
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .get(ndx)
-                    .cloned();
-                if let Some(entry) = entry {
-                    record_classification(stats_consumer, decision, entry.clone()).await;
-                    // 源读/符号链接读失败：Sender 已发 EntryError 通知 Receiver 完成该
-                    // ndx，这里自增 error_count（Sender 自检失败由 Sender 自己计数，见 [0][3]）；
-                    // 同时喂入 ErrorStats，使报表如实反映该失败（issue #57）
-                    if matches!(
-                        send_full_transfer(transport, src_storage, &entry, ndx, qos, enable_acl).await?,
-                        SourceTransferOutcome::SourceFailed
-                    ) && ledger.record_indexed_error(ndx)
-                    {
-                        record_copy_error(
-                            stats_consumer,
-                            entry.get_relative_path().to_path_buf(),
-                            format!("source read failed for ndx {ndx}"),
-                        )
-                        .await;
-                    }
-                    ledger.record_transfer();
-                } else {
-                    error!("[Sender Remote] Unknown NDX {}", ndx);
-                }
-            }
-            Some(ReceiverMsg::DeltaTransferRequest {
-                ndx,
-                block_size,
-                signatures,
-            }) => {
-                let entry = ndx_table
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .get(ndx)
-                    .cloned();
-                if let Some(entry) = entry {
-                    // 收到 DeltaTransferRequest 本身即无歧义地代表 Changed，不需要额外的
-                    // decision 字段（该消息只在 DestIndex::check() 判定 DeltaTransfer 且
-                    // delta 能力协商成功时才会发出）
-                    record_classification(stats_consumer, TransferDecision::DeltaTransfer, entry.clone()).await;
-                    // delta: 仅 src 读取成功时计入传输数（与原逻辑保持一致）；读取失败已发
-                    // EntryError 通知 Receiver 完成该 ndx，这里自增 error_count（见 [2]）；
-                    // 同时喂入 ErrorStats，使报表如实反映该失败（issue #57）
-                    if matches!(
-                        send_delta_transfer(
-                            transport,
-                            src_storage,
-                            &entry,
-                            ndx,
-                            block_size,
-                            signatures,
-                            qos,
-                            enable_acl,
-                        )
-                        .await?,
-                        SourceTransferOutcome::Sent
-                    ) {
-                        ledger.record_transfer();
-                    } else if ledger.record_indexed_error(ndx) {
-                        record_copy_error(
-                            stats_consumer,
-                            entry.get_relative_path().to_path_buf(),
-                            format!("delta source read failed for ndx {ndx}"),
-                        )
-                        .await;
-                    }
-                } else {
-                    error!("[Sender Remote] Unknown NDX {} for delta", ndx);
-                }
-            }
-            // ── 分类信号（MetadataOnly/Skip/Deleted）：Receiver 本地执行/判定后上行，
-            //    只驱动统计，不触发任何 Sender 侧动作 ──
-            Some(ReceiverMsg::Classified { entry, decision }) => {
-                record_classification(stats_consumer, decision, entry).await;
-            }
-            // ── ndx 级重传请求：hash 校验失败首次上报后，Receiver 要求重发。delta redo 一律
-            //    降级为全量重发——Sender 对 redo 无状态，不保留 signatures/mode ──
-            Some(ReceiverMsg::Redo { ndx }) => {
-                let entry = ndx_table
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .get(ndx)
-                    .cloned();
-                if let Some(entry) = entry {
-                    if matches!(
-                        send_full_transfer(transport, src_storage, &entry, ndx, qos, enable_acl).await?,
-                        SourceTransferOutcome::SourceFailed
-                    ) {
-                        ledger.record_indexed_error(ndx);
-                    }
-                } else {
-                    error!("[Sender Remote] Unknown NDX {} for redo", ndx);
-                }
-            }
-            Some(ReceiverMsg::RequestsDone) => {
-                info!(
-                    "[Sender Remote] All requests received, {} files to transfer",
-                    ledger.transfer_count()
-                );
-                transport.send(SenderMsg::TransferDone).await?;
-                ledger.mark_transfer_done_sent();
-            }
-            // ── ndx 级文件传输终态：与 EntrySuccess（目录/符号链接）共用同一个 success_count ──
-            Some(ReceiverMsg::Success { ndx }) => {
-                let relative_path = ndx_table
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .get(ndx)
-                    .map(|entry| entry.get_relative_path().to_string_lossy().to_string());
-                record_success_and_checkpoint(relative_path, ledger, completed_paths, checkpoint_path).await;
-            }
-            Some(ReceiverMsg::EntrySuccess { ref entry }) => {
-                let relative_path = entry.get_relative_path().to_string_lossy().to_string();
-                record_success_and_checkpoint(Some(relative_path), ledger, completed_paths, checkpoint_path).await;
-            }
-            Some(ReceiverMsg::Progress(snapshot)) => {
-                // 远端写盘发生在 Receiver 侧，Sender 自己不产生 chunk 级字节计数，
-                // 复用 StatisticConsumer 的实时字节计数器承载 Receiver 汇报的进度
-                apply_progress(stats_consumer, snapshot).await;
-            }
-            Some(ReceiverMsg::EntryError { entry, reason }) => {
-                let path = entry.get_relative_path().to_path_buf();
-                error!("[Sender Remote] Entry failed {:?}: {}", path, reason);
-                ledger.record_entry_error();
-                record_copy_error(stats_consumer, path, reason).await;
-            }
-            // ── ndx 级文件传输终态失败（redo 二次失败）：与 EntryError 共用同一个 error_count ──
-            Some(ReceiverMsg::Error { ndx, reason }) => {
-                error!("[Sender Remote] NDX {} failed: {}", ndx, reason);
-                if ledger.record_indexed_error(ndx) {
-                    // ndx_table 查不到 entry 时（理论上不应发生，Sender 自己分配的 ndx）
-                    // 用合成路径兜底，确保该失败仍能计入 ErrorStats（issue #57）
-                    let path = ndx_table
-                        .lock()
-                        .unwrap_or_else(PoisonError::into_inner)
-                        .get(ndx)
-                        .map(|entry| entry.get_relative_path().to_path_buf())
-                        .unwrap_or_else(|| PathBuf::from(format!("<ndx-{ndx}>")));
-                    record_copy_error(stats_consumer, path, reason).await;
-                }
-            }
-            Some(ReceiverMsg::AllDone) => break,
-            Some(other) => {
-                debug!("[Sender Remote] Ignoring message: {:?}", std::mem::discriminant(&other));
-            }
-            None => return Err(AppError::CopyError("Transport closed during request/ack phase".into())),
-        }
-    }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -733,6 +531,36 @@ mod tests {
         }
     }
 
+    /// 在首个实际 transfer request 交给 Sender session 前执行一次故障注入。
+    /// 这是测试 transport adapter，不暴露 session 私有阶段，也不恢复旧 phase seam。
+    struct DisruptOnFirstRequest<'a> {
+        inner: &'a dyn SenderTransport,
+        disrupt: Mutex<Option<Box<dyn FnOnce() + Send + 'a>>>,
+    }
+
+    #[async_trait]
+    impl SenderTransport for DisruptOnFirstRequest<'_> {
+        async fn send(&self, msg: SenderMsg) -> TransportResult<()> {
+            self.inner.send(msg).await
+        }
+
+        async fn recv(&self) -> Option<ReceiverMsg> {
+            let message = self.inner.recv().await;
+            if matches!(
+                message,
+                Some(ReceiverMsg::TransferRequest { .. } | ReceiverMsg::DeltaTransferRequest { .. })
+            ) && let Some(disrupt) = self.disrupt.lock().unwrap_or_else(PoisonError::into_inner).take()
+            {
+                disrupt();
+            }
+            message
+        }
+
+        async fn close(&self) -> TransportResult<()> {
+            self.inner.close().await
+        }
+    }
+
     /// 起 Receiver（`receiver_task_remote`）+ 跑 Sender 侧握手/鉴权/`SessionConfig` +
     /// 文件列表与请求/ack 并发处理，返回 `(success_count, error_count)`。
     /// `sender_transport` 可传入包装过的 transport（如 `HashMismatchInjector`），
@@ -794,9 +622,9 @@ mod tests {
     ///
     /// 返回值带上 `stats_consumer`（issue #57）：供调用方断言 Sender 自检失败是否已
     /// 正确喂入 `ErrorStats`（报表口径），而不只是本地 `error_count` u64。
-    async fn run_pipeline_with_disruption(
-        sender_transport: &(dyn SenderTransport + 'static), receiver_transport: InProcessReceiverTransport,
-        src_dir: &std::path::Path, dest_storage: Arc<StorageEnum>, disrupt: impl FnOnce(),
+    async fn run_pipeline_with_disruption<'a>(
+        sender_transport: &'a (dyn SenderTransport + 'static), receiver_transport: InProcessReceiverTransport,
+        src_dir: &std::path::Path, dest_storage: Arc<StorageEnum>, disrupt: impl FnOnce() + Send + 'a,
     ) -> (Arc<AsyncMutex<StatisticConsumer>>, u64, u64) {
         let src_storage = Arc::new(create_storage(src_dir.to_str().unwrap(), None, false).await.unwrap());
         let walkdir_iter = src_storage.walkdir_2(None, None, None, None, 4, false).await.unwrap();
@@ -822,31 +650,24 @@ mod tests {
             .await
             .unwrap();
 
-        let ndx_table = Mutex::new(NdxTable::new());
         let stats_consumer = test_stats_consumer();
-        advertise_file_list(sender_transport, &walkdir_iter, &ndx_table, &stats_consumer)
-            .await
-            .unwrap();
-
-        disrupt();
-
-        let mut completed_paths = HashSet::new();
         let checkpoint_path = src_dir.join("unused_checkpoint.json");
-        let mut ledger = SenderSessionLedger::new();
-        process_requests_and_acks(
-            sender_transport,
-            &src_storage,
-            &ndx_table,
-            None,
-            false,
-            &mut completed_paths,
-            &checkpoint_path,
-            &stats_consumer,
-            &mut ledger,
-        )
+        let disrupting_transport = DisruptOnFirstRequest {
+            inner: sender_transport,
+            disrupt: Mutex::new(Some(Box::new(disrupt))),
+        };
+        let summary = RemoteSenderSession::new(RemoteSenderSessionDeps {
+            transport: &disrupting_transport,
+            src_storage: &src_storage,
+            walkdir_iter: &walkdir_iter,
+            qos: None,
+            enable_acl: false,
+            checkpoint_path: &checkpoint_path,
+            stats_consumer: &stats_consumer,
+        })
+        .run()
         .await
         .unwrap();
-        let summary = ledger.finish();
 
         sender_transport.close().await.unwrap();
         receiver_handle.await.unwrap().unwrap();
@@ -2198,48 +2019,6 @@ mod tests {
             other => panic!("expected StatsKind::Incremental, got {other:?}"),
         }
     }
-
-    /// `send_file_list_phase` 遍历 `walkdir_iter` 时随条目数正确累加 `scanned`
-    /// （不需要真实 QUIC：只驱动统计喂入，用 in-process transport 承接 `FilePage` 发送）。
-    #[tokio::test]
-    async fn send_file_list_phase_accumulates_scanned_stats() {
-        let src_dir = tempdir().unwrap();
-        fs::write(src_dir.path().join("a.txt"), b"aaa").unwrap();
-        fs::write(src_dir.path().join("b.txt"), b"bbbbb").unwrap();
-        fs::create_dir_all(src_dir.path().join("sub")).unwrap();
-        fs::write(src_dir.path().join("sub/c.txt"), b"c").unwrap();
-
-        let src_storage = Arc::new(
-            create_storage(src_dir.path().to_str().unwrap(), None, false)
-                .await
-                .unwrap(),
-        );
-        let walkdir_iter = src_storage.walkdir_2(None, None, None, None, 4, false).await.unwrap();
-        let (sender_transport, receiver_transport) = create_in_process_pair();
-        // 只消费 FilePage/FileListDone，不驱动任何写入，测试只关心 Sender 侧统计累加
-        let drain_handle = tokio::spawn(async move { while receiver_transport.recv().await.is_some() {} });
-
-        let ndx_table = Mutex::new(NdxTable::new());
-        let stats_consumer = test_stats_consumer();
-        let page_count = advertise_file_list(&sender_transport, &walkdir_iter, &ndx_table, &stats_consumer)
-            .await
-            .unwrap();
-        assert!(page_count >= 1);
-
-        sender_transport.close().await.unwrap();
-        drop(drain_handle);
-
-        let consumer = stats_consumer.lock().await;
-        match &consumer.stats {
-            StatsKind::Incremental(s) => {
-                // 2 个顶层文件 + 1 个子目录 + 1 个子目录下文件 = 4 个 Scanned 条目
-                assert_eq!(s.scanned.regular_file_count, 3, "3 个文件应全部计入 scanned");
-                assert_eq!(s.scanned.dir_count, 1, "1 个子目录应计入 scanned");
-            }
-            other => panic!("expected StatsKind::Incremental, got {other:?}"),
-        }
-    }
-
     /// 结构化报表与本地口径一致性：混合 New/Changed(content)/Changed(MetadataOnly)/
     /// Skip/Deleted 场景后，`to_final_stats()`/`to_job_result()` 产出的字段值与预期
     /// 计数逐一匹配（New/Changed 合计含 MetadataOnly、Deleted、Renamed 恒 0）。
