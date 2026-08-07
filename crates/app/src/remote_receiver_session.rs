@@ -470,7 +470,7 @@ impl RemoteSessionState {
 
     /// Records bytes accepted by the disk-commit seam and emits an exact delayed
     /// credit grant once the configured threshold is reached.
-    pub(crate) async fn record_data_consumed(&mut self, transport: &(dyn ReceiverTransport + 'static), bytes: u64) {
+    async fn record_data_consumed(&mut self, transport: &(dyn ReceiverTransport + 'static), bytes: u64) {
         if let Ok(ReceiverCreditOutcome::Grant(message)) = self.credit.record_accepted(bytes) {
             // Grant delivery remains best-effort. A broken connection is handled by
             // the surrounding receive loop and terminates the session deterministically.

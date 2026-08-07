@@ -30,10 +30,9 @@
 //! 归还的字节数）：
 //! - 下界（`outstanding >= 0`，即不会被扣成负数）由 `Semaphore::acquire_many` 的阻塞
 //!   语义结构性保证——permits 不足时调用方直接挂起，不存在"扣减到负值"的代码路径。
-//! - 上界（`outstanding <= window`）由 Receiver 侧的授信金额直接对应其消费字节数保证：
-//!   Receiver 单线程顺序处理消息（`recv_file_list_and_data_phase` 是单一消费者循环，
-//!   无并发 worker 竞争消费同一份计数），每消费一条 Data 消息就累计其字节数，从不重复
-//!   计数（无双计路径），因此 `grant()` 的金额恒等于真实消费量，不会超发。
+//! - 上界（`outstanding <= window`）由两端共同结构性保证：Receiver 只在 bounded
+//!   disk-commit seam 接受 payload 后累计授信；Sender 通过原子容量账本把重复、恶意或
+//!   竞态产生的超额 grant 截断到配置窗口，绝不让 semaphore 膨胀超过容量。
 //!
 //! ## 重连即重置语义
 //!
@@ -64,6 +63,18 @@
 //! `Semaphore`）。两者正交、继续共存：`QosManager` 管"别把网络/源端打满"（Sender 读端，
 //! 不受本 issue 影响），`SenderCreditState` 管"别把 Receiver 内存打爆"（Sender 发送端，本
 //! 模块新增）。
+//!
+//! ## 所有权与 adapter 语义
+//!
+//! 本模块是闭环策略的唯一所有者：`ReceiverCreditState` 把 bounded disk-commit seam 的
+//! 成功接受转换为延迟 grant；`SenderCreditState` 扣减窗口、内部消费 grant、限制容量并在
+//! close 时唤醒等待者。QUIC adapter 传输真实 grant；in-process adapter 依靠自身 bounded
+//! channel 提供背压并过滤 wire-level grant。两种 adapter 都不会把 `CreditGrant` 暴露给
+//! Remote Sender session。
+//!
+//! 删除本模块会迫使 cost、接受时机、批量阈值、窗口容量、grant 过滤、重连和关闭规则重新
+//! 散落到 Sender/Receiver adapters 与应用 session；这正是该深模块通过 deletion test 的
+//! 依据。测试应断言阻塞、恢复、消息可见性和 typed terminal outcome，而非 semaphore permits。
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 

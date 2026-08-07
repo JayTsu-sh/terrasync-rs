@@ -487,10 +487,9 @@ pub(crate) async fn recv_file_list_and_data_phase(
 ) -> Result<()> {
     info!("[Receiver Remote] Receiving file list and file data (pipelined, streaming mode)");
     // ndx 终态去重与完成判断由 session ledger 统一持有。
-    // credit 累计消费由 session state 持有：FileData/DeltaData 处理完成（送 dc_tx）后累加，
-    // 达半窗口阈值批量发一次 CreditGrant 并清零。选"送达即补"而非
-    // "落盘才补"：时序上与落盘 ack 近似等价、落盘 ack 通路改动更大且窗口利用率更差、dc
-    // 缓冲本身有界，三者共同构成确定的应用层积压上界（window + dc 固定缓冲常量）。
+    // credit 策略由 transport::quic::credit 的 ReceiverCreditState 持有。此循环只通过
+    // session 的 accept_full_chunk/accept_delta_data 报告 bounded dc_tx 已接受 payload；
+    // 阈值、累计量和 CreditGrant 构造不再属于应用层。
     // disk-commit task：全量/delta 文件均三段流式落盘（去整文件 BytesMut/token Vec）；ack
     // 经 unbounded channel 回流，避免路由 select 阻在 dc_tx.send 时不 drain ack → dc 阻在
     // ack_tx.send 的双向死锁。
