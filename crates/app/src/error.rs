@@ -52,6 +52,14 @@ pub enum AppError {
         source: Box<AppError>,
     },
 
+    /// Remote Sender negotiated session 的阶段化失败，保留原始 typed error chain。
+    #[error("Remote Sender session {stage}: {source}")]
+    SenderSessionStage {
+        stage: &'static str,
+        #[source]
+        source: Box<AppError>,
+    },
+
     /// 配置错误
     #[error("Configuration error: {0}")]
     ConfigError(String),

@@ -309,11 +309,12 @@ async fn process_requests_and_acks(
     transport: &(dyn SenderTransport + 'static), src_storage: &Arc<StorageEnum>, ndx_table: &Mutex<NdxTable>,
     qos: Option<&QosManager>, enable_acl: bool, completed_paths: &mut HashSet<String>, checkpoint_path: &Path,
     stats_consumer: &Arc<AsyncMutex<StatisticConsumer>>,
-) -> Result<(u64, u64, u64)> {
+) -> Result<RequestAckSummary> {
     info!("[Sender Remote] Processing transfer requests + collecting acks");
     let mut transfer_count = 0u64;
     let mut success_count = 0u64;
     let mut error_count = 0u64;
+    let mut transfer_done_sent = false;
     // 已计过 error_count 的 ndx：复合失败（同 ndx 源读失败 + dest 侧 resume_prepare
     // 失败）时，Sender 自检失败与 Receiver 回传的 Error{ndx} 可能各自独立触发一次
     // error_count += 1，按 ndx 去重只计一次（见 count_ndx_error）。
@@ -424,6 +425,7 @@ async fn process_requests_and_acks(
                     transfer_count
                 );
                 transport.send(SenderMsg::TransferDone).await?;
+                transfer_done_sent = true;
             }
             // ── ndx 级文件传输终态：与 EntrySuccess（目录/符号链接）共用同一个 success_count ──
             Some(ReceiverMsg::Success { ndx }) => {
@@ -495,7 +497,21 @@ async fn process_requests_and_acks(
             None => return Err(AppError::CopyError("Transport closed during request/ack phase".into())),
         }
     }
-    Ok((transfer_count, success_count, error_count))
+    Ok(RequestAckSummary {
+        transfer_count,
+        success_count,
+        error_count,
+        transfer_done_sent,
+    })
+}
+
+/// 旧 request/ack loop 交还给 negotiated session 的 typed facts。
+/// 状态所有权已在 session；各消息分支会在后续 tickets 逐步迁入同一模块。
+struct RequestAckSummary {
+    transfer_count: u64,
+    success_count: u64,
+    error_count: u64,
+    transfer_done_sent: bool,
 }
 
 /// 同一 ndx 的失败只计一次 `error_count`：复合失败（同 ndx 源读失败 **且** dest 侧
@@ -965,6 +981,50 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn negotiated_sender_session_reports_typed_failure_when_peer_closes_before_all_done() {
+        let src_dir = tempdir().unwrap();
+        let src_storage = Arc::new(
+            create_storage(src_dir.path().to_str().unwrap(), None, false)
+                .await
+                .unwrap(),
+        );
+        let walkdir_iter = src_storage.walkdir_2(None, None, None, None, 1, false).await.unwrap();
+        let (sender_transport, receiver_transport) = create_in_process_pair();
+        let peer = tokio::spawn(async move {
+            while let Some(message) = receiver_transport.recv().await {
+                if matches!(message, SenderMsg::FileListDone) {
+                    break;
+                }
+            }
+        });
+        let stats_consumer = test_stats_consumer();
+        let checkpoint_path = src_dir.path().join("unused_checkpoint.json");
+        let mut completed_paths = HashSet::new();
+
+        let error = RemoteSenderSession::new(RemoteSenderSessionDeps {
+            transport: &sender_transport,
+            src_storage: &src_storage,
+            walkdir_iter: &walkdir_iter,
+            qos: None,
+            enable_acl: false,
+            checkpoint_path: &checkpoint_path,
+            stats_consumer: &stats_consumer,
+        })
+        .run(&mut completed_paths)
+        .await
+        .unwrap_err();
+        peer.await.unwrap();
+
+        assert!(matches!(
+            error,
+            AppError::SenderSessionStage {
+                stage: "requests/acks",
+                source,
+            } if matches!(*source, AppError::CopyError(_))
+        ));
+    }
+
     // ============================================================
     // ndx 级 redo/ack 状态机集成测试（spec 测试计划 b–f）
     //
@@ -1061,28 +1121,25 @@ mod tests {
             .await
             .unwrap();
 
-        let ndx_table = Mutex::new(NdxTable::new());
         let mut completed_paths = HashSet::new();
         let checkpoint_path = src_dir.join("unused_checkpoint.json");
         let stats_consumer = test_stats_consumer();
-        let (_page_count, (_transfer_count, success_count, error_count)) = tokio::try_join!(
-            send_file_list_phase(sender_transport, &walkdir_iter, &ndx_table, &stats_consumer),
-            process_requests_and_acks(
-                sender_transport,
-                &src_storage,
-                &ndx_table,
-                None,
-                false,
-                &mut completed_paths,
-                &checkpoint_path,
-                &stats_consumer,
-            )
-        )
+        let summary = RemoteSenderSession::new(RemoteSenderSessionDeps {
+            transport: sender_transport,
+            src_storage: &src_storage,
+            walkdir_iter: &walkdir_iter,
+            qos: None,
+            enable_acl: false,
+            checkpoint_path: &checkpoint_path,
+            stats_consumer: &stats_consumer,
+        })
+        .run(&mut completed_paths)
+        .await
         .unwrap();
 
         sender_transport.close().await.unwrap();
         receiver_handle.await.unwrap().unwrap();
-        (success_count, error_count)
+        (summary.success_count, summary.error_count)
     }
 
     /// 与 `run_pipeline` 类似，但不用 `tokio::try_join!` 并发跑文件列表与请求处理，
@@ -1132,7 +1189,7 @@ mod tests {
 
         let mut completed_paths = HashSet::new();
         let checkpoint_path = src_dir.join("unused_checkpoint.json");
-        let (_transfer_count, success_count, error_count) = process_requests_and_acks(
+        let summary = process_requests_and_acks(
             sender_transport,
             &src_storage,
             &ndx_table,
@@ -1147,7 +1204,7 @@ mod tests {
 
         sender_transport.close().await.unwrap();
         receiver_handle.await.unwrap().unwrap();
-        (stats_consumer, success_count, error_count)
+        (stats_consumer, summary.success_count, summary.error_count)
     }
 
     /// (b) 全量·一次 mismatch → Sender 收 Redo 全量重发 → Success，`finalize_run_result` Ok。
