@@ -383,18 +383,32 @@ impl RemoteSessionState {
         true
     }
 
-    pub(crate) async fn push_delta_data(
+    async fn push_delta_data(
         &mut self, dc_tx: &Sender<DiskCommitMsg>, ndx: i32, entry: &Arc<EntryEnum>, data: bytes::Bytes,
     ) -> bool {
         if !self.ensure_delta_active(dc_tx, ndx, entry).await {
             return false;
         }
-        let _ = dc_tx
+        dc_tx
             .send(DiskCommitMsg::DeltaData {
                 entry: entry.clone(),
                 data,
             })
-            .await;
+            .await
+            .is_ok()
+    }
+
+    /// Accepts delta literal data through the same bounded-sink credit transition
+    /// as full-file chunks. Match tokens intentionally carry no byte credit.
+    pub(crate) async fn accept_delta_data(
+        &mut self, transport: &(dyn ReceiverTransport + 'static), dc_tx: &Sender<DiskCommitMsg>, ndx: i32,
+        entry: &Arc<EntryEnum>, data: bytes::Bytes,
+    ) -> bool {
+        let bytes = data.len() as u64;
+        if !self.push_delta_data(dc_tx, ndx, entry, data).await {
+            return false;
+        }
+        self.record_data_consumed(transport, bytes).await;
         true
     }
 
@@ -462,6 +476,12 @@ impl RemoteSessionState {
             // the surrounding receive loop and terminates the session deterministically.
             let _ = transport.send(message).await;
         }
+    }
+
+    /// Residual delayed credit is connection-local and no longer useful after
+    /// the receive loop terminates; explicitly discard it on every terminal path.
+    pub(crate) fn discard_residual_credit(&mut self) {
+        self.credit.reset();
     }
 
     pub(crate) async fn handle_file_outcome(
@@ -1129,6 +1149,30 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn accepted_delta_literal_uses_the_same_credit_transition_as_full_data() {
+        let entry = nas_entry("delta.txt", PathBuf::from("delta.txt"), false);
+        let (sender_transport, receiver_transport) = create_in_process_pair();
+        let (dc_tx, mut dc_rx) = mpsc::channel(2);
+        let mut state = RemoteSessionState::default();
+        state.credit = ReceiverCreditState::new(4).unwrap();
+
+        assert!(
+            state
+                .accept_delta_data(&receiver_transport, &dc_tx, 7, &entry, Bytes::from_static(b"ab"),)
+                .await
+        );
+        assert!(matches!(
+            dc_rx.recv().await,
+            Some(DiskCommitMsg::DeltaBegin { ndx: 7, .. })
+        ));
+        assert!(matches!(dc_rx.recv().await, Some(DiskCommitMsg::DeltaData { .. })));
+        assert!(matches!(
+            sender_transport.recv().await,
+            Some(ReceiverMsg::CreditGrant { bytes: 2, ndx: None })
+        ));
     }
 
     #[tokio::test]

@@ -670,11 +670,8 @@ pub(crate) async fn recv_file_list_and_data_phase(
                 }
             }
             Some(SenderMsg::DeltaData { ndx, data }) => {
-                let bytes = data.len() as u64;
                 if let Some(entry) = state.indexed_entry(ndx).cloned() {
-                    if state.push_delta_data(&dc_tx, ndx, &entry, data).await {
-                        state.record_data_consumed(transport, bytes).await;
-                    }
+                    state.accept_delta_data(transport, &dc_tx, ndx, &entry, data).await;
                 } else {
                     warn!("[Receiver Remote] DeltaData for unknown ndx {}", ndx);
                 }
@@ -735,6 +732,7 @@ pub(crate) async fn recv_file_list_and_data_phase(
     state
         .shutdown_disk_commit(dc_tx, dc_join, &mut ack_rx, transport, progress, dest_storage)
         .await?;
+    state.discard_residual_credit();
 
     if transport_closed {
         return Err(AppError::CopyError(
