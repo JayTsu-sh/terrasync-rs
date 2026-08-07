@@ -1125,33 +1125,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn transfer_credit_delays_then_grants_exact_accumulated_bytes() {
-        let (sender_transport, receiver_transport) = create_in_process_pair();
-        let mut state = RemoteSessionState::default();
-        state.credit = ReceiverCreditState::new(20).unwrap();
-
-        state.record_data_consumed(&receiver_transport, 6).await;
-        assert!(
-            tokio::time::timeout(Duration::from_millis(20), sender_transport.recv())
-                .await
-                .is_err()
-        );
-
-        state.record_data_consumed(&receiver_transport, 7).await;
-        assert!(matches!(
-            sender_transport.recv().await,
-            Some(ReceiverMsg::CreditGrant { bytes: 13, ndx: None })
-        ));
-
-        state.record_data_consumed(&receiver_transport, 5).await;
-        assert!(
-            tokio::time::timeout(Duration::from_millis(20), sender_transport.recv())
-                .await
-                .is_err()
-        );
-    }
-
-    #[tokio::test]
     async fn accepted_delta_literal_uses_the_same_credit_transition_as_full_data() {
         let entry = nas_entry("delta.txt", PathBuf::from("delta.txt"), false);
         let (sender_transport, receiver_transport) = create_in_process_pair();
@@ -1169,10 +1142,12 @@ mod tests {
             Some(DiskCommitMsg::DeltaBegin { ndx: 7, .. })
         ));
         assert!(matches!(dc_rx.recv().await, Some(DiskCommitMsg::DeltaData { .. })));
-        assert!(matches!(
-            sender_transport.recv().await,
-            Some(ReceiverMsg::CreditGrant { bytes: 2, ndx: None })
-        ));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), sender_transport.recv())
+                .await
+                .is_err(),
+            "flow-control grants must not escape the in-process adapter"
+        );
     }
 
     #[tokio::test]

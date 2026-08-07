@@ -44,7 +44,12 @@ impl SenderTransport for InProcessSenderTransport {
     }
 
     async fn recv(&self) -> Option<ReceiverMsg> {
-        self.r2s_rx.recv().await.ok()
+        loop {
+            match self.r2s_rx.recv().await.ok()? {
+                ReceiverMsg::CreditGrant { .. } => {}
+                message => return Some(message),
+            }
+        }
     }
 
     async fn close(&self) -> Result<()> {
@@ -84,20 +89,18 @@ impl ReceiverTransport for InProcessReceiverTransport {
 mod tests {
     use super::*;
 
-    /// Characterizes the current adapter seam before #109 aligns it with QUIC:
-    /// flow-control messages are still visible to the application consumer.
+    /// In-process backpressure comes from its bounded data channel, but wire-level
+    /// grants remain transport-internal just as they are for QUIC.
     #[tokio::test]
-    async fn credit_grant_is_currently_visible_to_in_process_sender() {
+    async fn credit_grant_is_consumed_before_in_process_application_messages() {
         let (sender, receiver) = create_in_process_pair();
 
         receiver
             .send(ReceiverMsg::CreditGrant { bytes: 32, ndx: None })
             .await
             .unwrap();
+        receiver.send(ReceiverMsg::RequestsDone).await.unwrap();
 
-        assert!(matches!(
-            sender.recv().await,
-            Some(ReceiverMsg::CreditGrant { bytes: 32, ndx: None })
-        ));
+        assert!(matches!(sender.recv().await, Some(ReceiverMsg::RequestsDone)));
     }
 }
