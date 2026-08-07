@@ -88,28 +88,6 @@ pub enum SenderMsg {
     TransferDone,
 }
 
-/// Data 类消息的 credit 花费（应用层 payload 字节数）；非 Data 类消息返回 `None`
-/// （不受 credit 约束，控制/元数据类消息量级小，天然有界，见 issue #59）。
-///
-/// 计入：`FileData`/`DeltaData`/`TarPacked`（三者是实际会经过 QUIC `Data` 物理 stream、
-/// 承载应用层 payload 字节的消息；`TarPacked` 的双进程/QUIC 路径实际不可达——tar 打包
-/// 只发生在单进程模式，Sender 直接拥有 src+dest storage，走 in-process transport——这里
-/// 仍纳入计算是 defense-in-depth，防止未来打通该路径时悄悄绕过 credit）。
-/// 不计入：`DeltaMatch`（仅 4 字节 block 引用，量级可忽略）及所有握手/鉴权/元数据/
-/// 控制类消息。
-///
-/// Sender（`quic::sender::QuicSenderTransport::send()`）与 Receiver
-/// （`recv_file_list_and_data_phase`）共用本函数计算的口径，是记账不变量（扣减量 ==
-/// 授信量）成立的前提——两侧各自维护一份独立计算逻辑是 credit 泄漏/双计的常见 bug 来源。
-pub fn credit_cost(msg: &SenderMsg) -> Option<u64> {
-    match msg {
-        SenderMsg::FileData { chunk, .. } => Some(chunk.data.len() as u64),
-        SenderMsg::DeltaData { data, .. } => Some(data.len() as u64),
-        SenderMsg::TarPacked { tar_entry, .. } => Some(tar_entry.get_size()),
-        _ => None,
-    }
-}
-
 // ============================================================
 // Receiver → Sender 消息
 // ============================================================
@@ -179,8 +157,8 @@ pub enum ReceiverMsg {
 
     // ── Credit 流控（issue #59，方案 b：应用层字节 credit）──
     /// 补充 credit：Receiver 消费完 Data 类消息（`FileData`/`DeltaData`/`TarPacked`，
-    /// 见 `credit_cost`）累计达半窗口后批量授信，Sender 收到后为对应字节数
-    /// `add_permits`（见 `flow_control::SenderCreditState`）。`ndx` 预留给未来 per-ndx
+    /// 见 `flow_control::credit_cost`）累计达半窗口后批量授信，Sender 收到后更新对应字节数的
+    /// 权威账本（见 `flow_control::SenderCreditState`）。`ndx` 预留给未来 per-ndx
     /// 粒度并行化扩展点，当前实现恒为 `None`（全局窗口，不区分具体是哪个 ndx 的数据
     /// 被消费）。
     CreditGrant { bytes: u64, ndx: Option<i32> },
@@ -630,8 +608,6 @@ fn metadata_check(src: &EntryEnum, dest: &EntryEnum) -> bool {
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
-    use data_mover::NASEntry;
-
     use super::*;
 
     /// v1 对端（本 PR 改动 `SenderMsg` bincode 线格式前的协议版本）握手时必须被拒绝：
@@ -714,68 +690,5 @@ mod tests {
             HandshakeResult::Accepted { .. } => {}
             other => panic!("相同版本应握手成功，got {other:?}"),
         }
-    }
-
-    // ── credit_cost：Data 类消息花费口径（issue #59） ──
-
-    fn dummy_entry_with_size(size: u64) -> Arc<EntryEnum> {
-        Arc::new(EntryEnum::NAS(NASEntry {
-            name: "f".to_string(),
-            relative_path: PathBuf::from("f"),
-            extension: None,
-            is_dir: false,
-            size,
-            atime: 0,
-            ctime: 0,
-            mtime: 0,
-            mode: 0o644,
-            is_symlink: false,
-            hard_links: None,
-            uid: None,
-            gid: None,
-            ino: None,
-            file_handle: None,
-            acl: None,
-            owner: None,
-            owner_group: None,
-            xattrs: None,
-        }))
-    }
-
-    #[test]
-    fn credit_cost_counts_file_data_by_chunk_payload_len() {
-        let msg = SenderMsg::FileData {
-            entry: dummy_entry_with_size(0),
-            chunk: DataChunk {
-                offset: 0,
-                data: Bytes::from(vec![0u8; 100]),
-            },
-        };
-        assert_eq!(credit_cost(&msg), Some(100));
-    }
-
-    #[test]
-    fn credit_cost_counts_delta_data_by_payload_len() {
-        let msg = SenderMsg::DeltaData {
-            ndx: 1,
-            data: Bytes::from(vec![0u8; 50]),
-        };
-        assert_eq!(credit_cost(&msg), Some(50));
-    }
-
-    #[test]
-    fn credit_cost_counts_tar_packed_by_entry_size() {
-        let msg = SenderMsg::TarPacked {
-            tar_entry: dummy_entry_with_size(12345),
-            manifest_entries: vec![],
-        };
-        assert_eq!(credit_cost(&msg), Some(12345));
-    }
-
-    #[test]
-    fn credit_cost_ignores_delta_match_and_control_messages() {
-        assert_eq!(credit_cost(&SenderMsg::DeltaMatch { ndx: 1, block_index: 0 }), None);
-        assert_eq!(credit_cost(&SenderMsg::TransferDone), None);
-        assert_eq!(credit_cost(&SenderMsg::Auth { token: "t".to_string() }), None);
     }
 }

@@ -728,10 +728,13 @@ pub(crate) async fn recv_file_list_and_data_phase(
         } // close select!
     } // close loop
 
-    state
+    let shutdown_result = state
         .shutdown_disk_commit(dc_tx, dc_join, &mut ack_rx, transport, progress, dest_storage)
-        .await?;
+        .await;
+    // Connection-local residual credit is meaningless after every terminal path,
+    // including a disk-commit shutdown failure.
     state.discard_residual_credit();
+    shutdown_result?;
 
     if transport_closed {
         return Err(AppError::CopyError(
