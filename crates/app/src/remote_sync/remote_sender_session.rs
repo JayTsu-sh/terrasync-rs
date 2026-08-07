@@ -6,20 +6,23 @@
 
 use std::collections::HashSet;
 use std::path::Path;
+use std::path::PathBuf;
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex, PoisonError};
 
-use data_mover::StorageEntryMessage;
 use data_mover::dir_tree::NdxEvent;
 use data_mover::qos::QosManager;
+use data_mover::{ChangeKind, ErrorEvent, StorageEntryMessage};
 use data_mover::{ConsistencyCheck, EntryEnum, StorageEnum, WalkDirAsyncIterator2};
 use sync_delta::DeltaToken;
 use sync_delta::matcher::DeltaMatcher;
 use tokio::sync::Mutex as AsyncMutex;
 use tracing::{error, info};
-use transport::message::{BlockSignature, NdxTable, SenderMsg};
+use transport::message::{BlockSignature, NdxTable, ProgressSnapshot, SenderMsg, TransferDecision};
 use transport::traits::SenderTransport;
 
 use super::{AppError, Result, StatisticConsumer, process_requests_and_acks};
+use crate::consumer::stats::format_bytes;
 
 /// 构造 negotiated session 所需的既有 adapter 与配置。
 pub(super) struct RemoteSenderSessionDeps<'a> {
@@ -428,6 +431,67 @@ async fn send_delta_tokens(
         }
     }
     Ok(())
+}
+
+pub(super) async fn record_classification(
+    stats_consumer: &Arc<AsyncMutex<StatisticConsumer>>, decision: TransferDecision, entry: Arc<EntryEnum>,
+) {
+    if let Some(message) = classification_to_stats_message(decision, entry) {
+        stats_consumer.lock().await.update_statistics(&message);
+    }
+}
+
+pub(super) async fn record_copy_error(
+    stats_consumer: &Arc<AsyncMutex<StatisticConsumer>>, path: PathBuf, reason: String,
+) {
+    let message = entry_error_stats_message(path, reason);
+    stats_consumer.lock().await.update_statistics(&message);
+}
+
+pub(super) async fn apply_progress(stats_consumer: &Arc<AsyncMutex<StatisticConsumer>>, snapshot: ProgressSnapshot) {
+    stats_consumer
+        .lock()
+        .await
+        .get_bytes_tracker()
+        .store(snapshot.bytes_transferred, Ordering::Relaxed);
+    info!(
+        "[Sender Remote] [{}] Progress: {} files ({}) transferred, {} dirs, {} skipped, {} errors, {:.1}s, {}/s",
+        snapshot.receiver_id,
+        snapshot.files_transferred,
+        format_bytes(snapshot.bytes_transferred as f64, true),
+        snapshot.dirs_created,
+        snapshot.files_skipped,
+        snapshot.error_count,
+        snapshot.elapsed_secs,
+        format_bytes(snapshot.speed_bytes_per_sec, true),
+    );
+}
+
+pub(super) fn entry_error_stats_message(path: PathBuf, reason: String) -> StorageEntryMessage {
+    StorageEntryMessage::Error {
+        event: ErrorEvent::Copy,
+        path,
+        entry: None,
+        reason,
+    }
+}
+
+pub(super) fn classification_to_stats_message(
+    decision: TransferDecision, entry: Arc<EntryEnum>,
+) -> Option<StorageEntryMessage> {
+    match decision {
+        TransferDecision::FullTransfer => Some(StorageEntryMessage::New(entry)),
+        TransferDecision::DeltaTransfer => Some(StorageEntryMessage::Changed {
+            entry,
+            kind: ChangeKind::DataOnly,
+        }),
+        TransferDecision::MetadataOnly => Some(StorageEntryMessage::Changed {
+            entry,
+            kind: ChangeKind::MetadataOnly,
+        }),
+        TransferDecision::Skip => None,
+        TransferDecision::Deleted => Some(StorageEntryMessage::Deleted(entry)),
+    }
 }
 
 fn stage_error(stage: &'static str, source: AppError) -> AppError {

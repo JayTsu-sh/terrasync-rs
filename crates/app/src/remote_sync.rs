@@ -15,18 +15,22 @@ mod remote_sender_session;
 use remote_sender_session::advertise_file_list;
 use remote_sender_session::{RemoteSenderSession, RemoteSenderSessionDeps};
 use remote_sender_session::{SenderSessionLedger, SourceTransferOutcome, send_delta_transfer, send_full_transfer};
+use remote_sender_session::{apply_progress, record_classification, record_copy_error};
+#[cfg(test)]
+use remote_sender_session::{classification_to_stats_message, entry_error_stats_message};
 
 use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex, PoisonError};
 
 #[cfg(test)]
 use data_mover::dir_tree::NdxEvent;
 use data_mover::filter::parse_filter_expression;
 use data_mover::qos::QosManager;
-use data_mover::{ChangeKind, EntryEnum, ErrorEvent, StorageEntryMessage, StorageEnum, create_storage};
+#[cfg(test)]
+use data_mover::{ChangeKind, EntryEnum, ErrorEvent, StorageEntryMessage};
+use data_mover::{StorageEnum, create_storage};
 use rustls::pki_types::CertificateDer;
 use tokio::sync::Mutex as AsyncMutex;
 use tracing::{debug, error, info, warn};
@@ -39,7 +43,7 @@ use utils::app_config::AppConfig;
 use utils::logger;
 
 use crate::config::{JobType, SyncJobConfig};
-use crate::consumer::stats::{IncrementalStats, ProgressBar, StatisticConsumer, StatsKind, format_bytes};
+use crate::consumer::stats::{IncrementalStats, ProgressBar, StatisticConsumer, StatsKind};
 use crate::error::{AppError, Result};
 use crate::orchestrator::create_qos_manager;
 use crate::sync::parse_size;
@@ -270,9 +274,7 @@ async fn process_requests_and_acks(
                     .get(ndx)
                     .cloned();
                 if let Some(entry) = entry {
-                    if let Some(msg) = classification_to_stats_message(decision, entry.clone()) {
-                        stats_consumer.lock().await.update_statistics(&msg);
-                    }
+                    record_classification(stats_consumer, decision, entry.clone()).await;
                     // 源读/符号链接读失败：Sender 已发 EntryError 通知 Receiver 完成该
                     // ndx，这里自增 error_count（Sender 自检失败由 Sender 自己计数，见 [0][3]）；
                     // 同时喂入 ErrorStats，使报表如实反映该失败（issue #57）
@@ -281,11 +283,12 @@ async fn process_requests_and_acks(
                         SourceTransferOutcome::SourceFailed
                     ) && ledger.record_indexed_error(ndx)
                     {
-                        let msg = entry_error_stats_message(
+                        record_copy_error(
+                            stats_consumer,
                             entry.get_relative_path().to_path_buf(),
                             format!("source read failed for ndx {ndx}"),
-                        );
-                        stats_consumer.lock().await.update_statistics(&msg);
+                        )
+                        .await;
                     }
                     ledger.record_transfer();
                 } else {
@@ -306,13 +309,7 @@ async fn process_requests_and_acks(
                     // 收到 DeltaTransferRequest 本身即无歧义地代表 Changed，不需要额外的
                     // decision 字段（该消息只在 DestIndex::check() 判定 DeltaTransfer 且
                     // delta 能力协商成功时才会发出）
-                    stats_consumer
-                        .lock()
-                        .await
-                        .update_statistics(&StorageEntryMessage::Changed {
-                            entry: entry.clone(),
-                            kind: ChangeKind::DataOnly,
-                        });
+                    record_classification(stats_consumer, TransferDecision::DeltaTransfer, entry.clone()).await;
                     // delta: 仅 src 读取成功时计入传输数（与原逻辑保持一致）；读取失败已发
                     // EntryError 通知 Receiver 完成该 ndx，这里自增 error_count（见 [2]）；
                     // 同时喂入 ErrorStats，使报表如实反映该失败（issue #57）
@@ -332,11 +329,12 @@ async fn process_requests_and_acks(
                     ) {
                         ledger.record_transfer();
                     } else if ledger.record_indexed_error(ndx) {
-                        let msg = entry_error_stats_message(
+                        record_copy_error(
+                            stats_consumer,
                             entry.get_relative_path().to_path_buf(),
                             format!("delta source read failed for ndx {ndx}"),
-                        );
-                        stats_consumer.lock().await.update_statistics(&msg);
+                        )
+                        .await;
                     }
                 } else {
                     error!("[Sender Remote] Unknown NDX {} for delta", ndx);
@@ -345,9 +343,7 @@ async fn process_requests_and_acks(
             // ── 分类信号（MetadataOnly/Skip/Deleted）：Receiver 本地执行/判定后上行，
             //    只驱动统计，不触发任何 Sender 侧动作 ──
             Some(ReceiverMsg::Classified { entry, decision }) => {
-                if let Some(msg) = classification_to_stats_message(decision, entry) {
-                    stats_consumer.lock().await.update_statistics(&msg);
-                }
+                record_classification(stats_consumer, decision, entry).await;
             }
             // ── ndx 级重传请求：hash 校验失败首次上报后，Receiver 要求重发。delta redo 一律
             //    降级为全量重发——Sender 对 redo 无状态，不保留 signatures/mode ──
@@ -392,29 +388,13 @@ async fn process_requests_and_acks(
             Some(ReceiverMsg::Progress(snapshot)) => {
                 // 远端写盘发生在 Receiver 侧，Sender 自己不产生 chunk 级字节计数，
                 // 复用 StatisticConsumer 的实时字节计数器承载 Receiver 汇报的进度
-                stats_consumer
-                    .lock()
-                    .await
-                    .get_bytes_tracker()
-                    .store(snapshot.bytes_transferred, Ordering::Relaxed);
-                info!(
-                    "[Sender Remote] [{}] Progress: {} files ({}) transferred, {} dirs, {} skipped, {} errors, {:.1}s, {}/s",
-                    snapshot.receiver_id,
-                    snapshot.files_transferred,
-                    format_bytes(snapshot.bytes_transferred as f64, true),
-                    snapshot.dirs_created,
-                    snapshot.files_skipped,
-                    snapshot.error_count,
-                    snapshot.elapsed_secs,
-                    format_bytes(snapshot.speed_bytes_per_sec, true),
-                );
+                apply_progress(stats_consumer, snapshot).await;
             }
             Some(ReceiverMsg::EntryError { entry, reason }) => {
                 let path = entry.get_relative_path().to_path_buf();
                 error!("[Sender Remote] Entry failed {:?}: {}", path, reason);
                 ledger.record_entry_error();
-                let msg = entry_error_stats_message(path, reason);
-                stats_consumer.lock().await.update_statistics(&msg);
+                record_copy_error(stats_consumer, path, reason).await;
             }
             // ── ndx 级文件传输终态失败（redo 二次失败）：与 EntryError 共用同一个 error_count ──
             Some(ReceiverMsg::Error { ndx, reason }) => {
@@ -428,8 +408,7 @@ async fn process_requests_and_acks(
                         .get(ndx)
                         .map(|entry| entry.get_relative_path().to_path_buf())
                         .unwrap_or_else(|| PathBuf::from(format!("<ndx-{ndx}>")));
-                    let msg = entry_error_stats_message(path, reason);
-                    stats_consumer.lock().await.update_statistics(&msg);
+                    record_copy_error(stats_consumer, path, reason).await;
                 }
             }
             Some(ReceiverMsg::AllDone) => break,
@@ -440,46 +419,6 @@ async fn process_requests_and_acks(
         }
     }
     Ok(())
-}
-
-/// 把双进程模式下 entry 级失败（Sender 自检读失败 / Receiver 回传的终态失败）翻译为
-/// `StorageEntryMessage::Error`，供 Sender 侧 `StatisticConsumer` 累计统计（模式同
-/// `classification_to_stats_message`，issue #57）。所有双进程失败来源统一归为
-/// `ErrorEvent::Copy`——均发生在传输/复制阶段，不是扫描阶段。
-fn entry_error_stats_message(path: PathBuf, reason: String) -> StorageEntryMessage {
-    StorageEntryMessage::Error {
-        event: ErrorEvent::Copy,
-        path,
-        entry: None,
-        reason,
-    }
-}
-
-/// 把 Receiver 的分类判定翻译为 `StorageEntryMessage`，供 Sender 侧 `StatisticConsumer`
-/// 累计统计（与本地单进程管线复用同一套类型/口径，不发明新格式，见 issue #23）。
-///
-/// - `FullTransfer` → `New`；`MetadataOnly` → `Changed{kind: MetadataOnly}`（与本地口径
-///   对齐：本地模式里 MetadataOnly 本来就是 `Changed` 的子类型，不是独立顶层分类）；
-///   `Deleted` → `Deleted`。
-/// - `DeltaTransfer` → `Changed{kind: DataOnly}`：`DestIndex::check()` 只要
-///   `data_check` 不一致就判定 `DeltaTransfer`（不区分是否同时 `metadata_check` 也不
-///   一致），Sender 拿不到目标端 entry、无法像本地模式 `ChangeKind::from_entry_diff`
-///   那样精确区分 `DataOnly`/`Both`，取"表示内容变更"的那个 variant 作为口径。
-/// - `Skip` → `None`：与本地模式完全匹配的条目从不广播一致，不产生任何统计。
-fn classification_to_stats_message(decision: TransferDecision, entry: Arc<EntryEnum>) -> Option<StorageEntryMessage> {
-    match decision {
-        TransferDecision::FullTransfer => Some(StorageEntryMessage::New(entry)),
-        TransferDecision::DeltaTransfer => Some(StorageEntryMessage::Changed {
-            entry,
-            kind: ChangeKind::DataOnly,
-        }),
-        TransferDecision::MetadataOnly => Some(StorageEntryMessage::Changed {
-            entry,
-            kind: ChangeKind::MetadataOnly,
-        }),
-        TransferDecision::Skip => None,
-        TransferDecision::Deleted => Some(StorageEntryMessage::Deleted(entry)),
-    }
 }
 
 /// 记录一次成功（ndx 级 `Success` 与 Entry 级 `EntrySuccess` 共用同一份逻辑）：
