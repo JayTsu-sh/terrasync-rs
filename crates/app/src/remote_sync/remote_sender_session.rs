@@ -6,15 +6,18 @@
 
 use std::collections::HashSet;
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError};
 
+use data_mover::StorageEntryMessage;
+use data_mover::dir_tree::NdxEvent;
 use data_mover::qos::QosManager;
 use data_mover::{StorageEnum, WalkDirAsyncIterator2};
 use tokio::sync::Mutex as AsyncMutex;
-use transport::message::NdxTable;
+use tracing::info;
+use transport::message::{NdxTable, SenderMsg};
 use transport::traits::SenderTransport;
 
-use super::{AppError, Result, StatisticConsumer, process_requests_and_acks, send_file_list_phase};
+use super::{AppError, Result, StatisticConsumer, process_requests_and_acks};
 
 /// 构造 negotiated session 所需的既有 adapter 与配置。
 pub(super) struct RemoteSenderSessionDeps<'a> {
@@ -64,7 +67,7 @@ impl<'a> RemoteSenderSession<'a> {
         let ndx_table = Mutex::new(NdxTable::new());
         self.transition(RemoteSenderSessionLifecycle::RequestsOpen);
         let advertise = async {
-            send_file_list_phase(
+            advertise_file_list(
                 self.deps.transport,
                 self.deps.walkdir_iter,
                 &ndx_table,
@@ -131,6 +134,45 @@ impl<'a> RemoteSenderSession<'a> {
         ));
         self.lifecycle = next;
     }
+}
+
+/// 发布文件列表并建立本会话唯一的 index correlation ledger。
+///
+/// 这是 session implementation 的内部操作；生产调用者只使用
+/// [`RemoteSenderSession::run`]。
+pub(super) async fn advertise_file_list(
+    transport: &(dyn SenderTransport + 'static), walkdir_iter: &WalkDirAsyncIterator2, ndx_table: &Mutex<NdxTable>,
+    stats_consumer: &Arc<AsyncMutex<StatisticConsumer>>,
+) -> Result<u64> {
+    info!("[Sender Remote] Sending file list");
+    let mut page_count = 0u64;
+    while let Some(event) = walkdir_iter.next().await {
+        match event {
+            NdxEvent::Page(page) => {
+                {
+                    let mut consumer = stats_consumer.lock().await;
+                    for file in &page.files {
+                        consumer.update_statistics(&StorageEntryMessage::Scanned(file.entry.clone()));
+                    }
+                    for directory in &page.subdirs {
+                        consumer.update_statistics(&StorageEntryMessage::Scanned(directory.entry.clone()));
+                    }
+                }
+                ndx_table
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .ingest_page(&page);
+                page_count += 1;
+                transport.send(SenderMsg::FilePage(page)).await?;
+            }
+            NdxEvent::Error { path, reason } => {
+                transport.send(SenderMsg::FileListError { path, reason }).await?;
+            }
+            NdxEvent::Done => break,
+        }
+    }
+    transport.send(SenderMsg::FileListDone).await?;
+    Ok(page_count)
 }
 
 fn stage_error(stage: &'static str, source: AppError) -> AppError {

@@ -3,7 +3,7 @@
 //! 将 QUIC 连接、文件列表发送、传输请求处理、Ack 收集等阶段
 //! 提取为独立函数，降低单函数复杂度并提升可读性。
 //!
-//! 握手/鉴权/`SessionConfig` 之后，文件列表发送（`send_file_list_phase`，只
+//! 握手/鉴权/`SessionConfig` 之后，文件列表发送（session advertising，只
 //! `send()`、从不 `recv()`）与请求处理 + Ack 收集（`process_requests_and_acks`，
 //! 唯一的 `recv()` 消费者）通过 `tokio::try_join!` 并发运行，不再是「文件列表发完
 //! 才能开始处理请求」的顺序 barrier；`NdxTable` 因此改为 `Mutex` 包裹以支持并发
@@ -11,6 +11,8 @@
 
 mod remote_sender_session;
 
+#[cfg(test)]
+use remote_sender_session::advertise_file_list;
 use remote_sender_session::{RemoteSenderSession, RemoteSenderSessionDeps};
 
 use std::collections::HashSet;
@@ -19,12 +21,12 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex, PoisonError};
 
+#[cfg(test)]
 use data_mover::dir_tree::NdxEvent;
 use data_mover::filter::parse_filter_expression;
 use data_mover::qos::QosManager;
 use data_mover::{
-    ChangeKind, ConsistencyCheck, EntryEnum, ErrorEvent, StorageEntryMessage, StorageEnum, WalkDirAsyncIterator2,
-    create_storage,
+    ChangeKind, ConsistencyCheck, EntryEnum, ErrorEvent, StorageEntryMessage, StorageEnum, create_storage,
 };
 use rustls::pki_types::CertificateDer;
 use sync_delta::DeltaToken;
@@ -236,55 +238,7 @@ async fn send_and_check_auth(transport: &(dyn SenderTransport + 'static), auth_t
 }
 
 // ============================================================
-// 文件列表发送（与 `process_requests_and_acks` 并发运行，见模块文档）
-// ============================================================
-
-/// 遍历 `walkdir_2` 并按页发送给 Receiver，填充 `ndx_table`，返回发送的页数。
-///
-/// 只调用 `transport.send()`、从不 `recv()`，可安全地与 `process_requests_and_acks`
-/// 并发运行（`ndx_table` 用 `Mutex` 支持并发读写：本函数是唯一的写者）。
-///
-/// 每页遍历到的 entry 额外喂一次 `StorageEntryMessage::Scanned`，填充
-/// `IncrementalStats.scanned`（扩展名/时间/大小分布）——Sender 本来就要完整遍历一次
-/// 源端才能生成 file list，这个遍历本身就是「Scanned」阶段的等价物，不需要额外协议
-/// 往返（远端没有独立 scan 阶段，见 issue #23）。
-async fn send_file_list_phase(
-    transport: &(dyn SenderTransport + 'static), walkdir_iter: &WalkDirAsyncIterator2, ndx_table: &Mutex<NdxTable>,
-    stats_consumer: &Arc<AsyncMutex<StatisticConsumer>>,
-) -> Result<u64> {
-    info!("[Sender Remote] Sending file list");
-    let mut page_count = 0u64;
-    while let Some(event) = walkdir_iter.next().await {
-        match event {
-            NdxEvent::Page(page) => {
-                {
-                    let mut consumer = stats_consumer.lock().await;
-                    for nf in &page.files {
-                        consumer.update_statistics(&StorageEntryMessage::Scanned(nf.entry.clone()));
-                    }
-                    for ns in &page.subdirs {
-                        consumer.update_statistics(&StorageEntryMessage::Scanned(ns.entry.clone()));
-                    }
-                }
-                ndx_table
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .ingest_page(&page);
-                page_count += 1;
-                transport.send(SenderMsg::FilePage(page)).await?;
-            }
-            NdxEvent::Error { path, reason } => {
-                transport.send(SenderMsg::FileListError { path, reason }).await?;
-            }
-            NdxEvent::Done => break,
-        }
-    }
-    transport.send(SenderMsg::FileListDone).await?;
-    Ok(page_count)
-}
-
-// ============================================================
-// 传输请求处理 + Ack 收集（唯一的 recv() 消费者，与 `send_file_list_phase` 并发运行）
+// 传输请求处理 + Ack 收集（唯一的 recv() 消费者，与 session advertising 并发运行）
 // ============================================================
 
 /// 接收 Receiver 的 `TransferRequest`/`DeltaTransferRequest`（发送对应数据）与
@@ -1181,7 +1135,7 @@ mod tests {
 
         let ndx_table = Mutex::new(NdxTable::new());
         let stats_consumer = test_stats_consumer();
-        send_file_list_phase(sender_transport, &walkdir_iter, &ndx_table, &stats_consumer)
+        advertise_file_list(sender_transport, &walkdir_iter, &ndx_table, &stats_consumer)
             .await
             .unwrap();
 
@@ -2571,7 +2525,7 @@ mod tests {
 
         let ndx_table = Mutex::new(NdxTable::new());
         let stats_consumer = test_stats_consumer();
-        let page_count = send_file_list_phase(&sender_transport, &walkdir_iter, &ndx_table, &stats_consumer)
+        let page_count = advertise_file_list(&sender_transport, &walkdir_iter, &ndx_table, &stats_consumer)
             .await
             .unwrap();
         assert!(page_count >= 1);
