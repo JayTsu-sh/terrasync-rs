@@ -19,7 +19,6 @@ use transport::message::{
     DcAck, DestIndex, DiskCommitMsg, FeatureFlags, HandshakeResult, ProgressSnapshot, ProtocolHandshake, ReceiverMsg,
     SenderMsg, SessionConfig, TransferDecision,
 };
-use transport::quic::credit::DEFAULT_CREDIT_WINDOW_BYTES;
 use transport::traits::ReceiverTransport;
 
 // 内部模块
@@ -429,11 +428,6 @@ async fn recv_session_config(transport: &(dyn ReceiverTransport + 'static)) -> R
 /// 见 issue #54 阶段 0 spec）
 const DEFAULT_DELTA_SIZE_THRESHOLD_BYTES: u64 = 512 * 1024 * 1024;
 
-/// credit 批量授信阈值：半个 credit 窗口（issue #59 方案 b，仿 TCP 延迟 ack，避免逐帧
-/// 授信的开销与慢链路授信限速）。与 Sender 侧 `quic::credit::DEFAULT_CREDIT_WINDOW_BYTES`
-/// 共享同一个常量来源，避免两端窗口大小假设漂移。
-const CREDIT_GRANT_THRESHOLD_BYTES: u64 = DEFAULT_CREDIT_WINDOW_BYTES / 2;
-
 /// 解析 `SessionConfig.delta_size_threshold`：`None` 时使用默认值 512MiB，`Some` 时复用
 /// `parse_size`（与 `block_size` 同款人类可读格式，如 "512MiB"）。超过该 size 的文件即使
 /// 数据不匹配也降级为全量传输（见 `recv_file_list_and_data_phase` 的 `DeltaTransfer` 分支）。
@@ -663,10 +657,7 @@ pub(crate) async fn recv_file_list_and_data_phase(
 
             // ── 数据流模式：文件数据块 → 转发给 disk-commit task 的 write_chunk_stream ──
             Some(SenderMsg::FileData { entry, chunk }) => {
-                let bytes = chunk.data.len() as u64;
-                if state.push_full_chunk(&dc_tx, entry, chunk).await {
-                    state.record_data_consumed(transport, bytes, CREDIT_GRANT_THRESHOLD_BYTES).await;
-                }
+                state.accept_full_chunk(transport, &dc_tx, entry, chunk).await;
             }
 
             // ── Delta token 接收：逐 token 转发给 disk-commit task（不再攒整文件 Vec，见
@@ -682,7 +673,7 @@ pub(crate) async fn recv_file_list_and_data_phase(
                 let bytes = data.len() as u64;
                 if let Some(entry) = state.indexed_entry(ndx).cloned() {
                     if state.push_delta_data(&dc_tx, ndx, &entry, data).await {
-                        state.record_data_consumed(transport, bytes, CREDIT_GRANT_THRESHOLD_BYTES).await;
+                        state.record_data_consumed(transport, bytes).await;
                     }
                 } else {
                     warn!("[Receiver Remote] DeltaData for unknown ndx {}", ndx);
@@ -795,10 +786,5 @@ mod tests {
     #[test]
     fn resolve_delta_size_threshold_rejects_invalid_format() {
         assert!(resolve_delta_size_threshold(&Some("not-a-size".to_string())).is_err());
-    }
-
-    #[test]
-    fn credit_grant_threshold_is_half_of_default_credit_window() {
-        assert_eq!(CREDIT_GRANT_THRESHOLD_BYTES, DEFAULT_CREDIT_WINDOW_BYTES / 2);
     }
 }

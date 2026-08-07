@@ -15,6 +15,7 @@ use transport::message::{
     BlockSignature, DcAck, DestIndex, DiskCommitMsg, FeatureFlags, FileOutcome, NdxTable, ProgressSnapshot,
     ReceiverMsg, SessionConfig, TransferDecision,
 };
+use transport::quic::credit::{ReceiverCreditOutcome, ReceiverCreditState};
 use transport::traits::ReceiverTransport;
 
 use crate::byte_resume::is_part_file;
@@ -81,7 +82,7 @@ pub(crate) struct RemoteSessionState {
     ndx_table: NdxTable,
     created_dirs: Vec<Arc<EntryEnum>>,
     active_transfer: ActiveTransfer,
-    credit_consumed: u64,
+    credit: ReceiverCreditState,
     attempts: HashMap<i32, u8>,
 }
 
@@ -296,14 +297,25 @@ impl RemoteSessionState {
         true
     }
 
-    pub(crate) async fn push_full_chunk(
-        &self, dc_tx: &Sender<DiskCommitMsg>, entry: Arc<EntryEnum>, chunk: DataChunk,
-    ) -> bool {
+    async fn push_full_chunk(&self, dc_tx: &Sender<DiskCommitMsg>, entry: Arc<EntryEnum>, chunk: DataChunk) -> bool {
         if self.active_transfer != ActiveTransfer::Full {
             warn!("[Receiver Remote] rejecting FileData without an active full transfer");
             return false;
         }
-        let _ = dc_tx.send(DiskCommitMsg::FileChunk { entry, chunk }).await;
+        dc_tx.send(DiskCommitMsg::FileChunk { entry, chunk }).await.is_ok()
+    }
+
+    /// Accepts one full-data chunk at the bounded disk-commit seam and returns
+    /// credit only after that enqueue succeeds.
+    pub(crate) async fn accept_full_chunk(
+        &mut self, transport: &(dyn ReceiverTransport + 'static), dc_tx: &Sender<DiskCommitMsg>, entry: Arc<EntryEnum>,
+        chunk: DataChunk,
+    ) -> bool {
+        let bytes = chunk.data.len() as u64;
+        if !self.push_full_chunk(dc_tx, entry, chunk).await {
+            return false;
+        }
+        self.record_data_consumed(transport, bytes).await;
         true
     }
 
@@ -444,21 +456,12 @@ impl RemoteSessionState {
 
     /// Records bytes accepted by the disk-commit seam and emits an exact delayed
     /// credit grant once the configured threshold is reached.
-    pub(crate) async fn record_data_consumed(
-        &mut self, transport: &(dyn ReceiverTransport + 'static), bytes: u64, threshold: u64,
-    ) {
-        self.credit_consumed += bytes;
-        if self.credit_consumed < threshold {
-            return;
+    pub(crate) async fn record_data_consumed(&mut self, transport: &(dyn ReceiverTransport + 'static), bytes: u64) {
+        if let Ok(ReceiverCreditOutcome::Grant(message)) = self.credit.record_accepted(bytes) {
+            // Grant delivery remains best-effort. A broken connection is handled by
+            // the surrounding receive loop and terminates the session deterministically.
+            let _ = transport.send(message).await;
         }
-        let grant = self.credit_consumed;
-        self.credit_consumed = 0;
-        let _ = transport
-            .send(ReceiverMsg::CreditGrant {
-                bytes: grant,
-                ndx: None,
-            })
-            .await;
     }
 
     pub(crate) async fn handle_file_outcome(
@@ -1105,19 +1108,58 @@ mod tests {
     async fn transfer_credit_delays_then_grants_exact_accumulated_bytes() {
         let (sender_transport, receiver_transport) = create_in_process_pair();
         let mut state = RemoteSessionState::default();
+        state.credit = ReceiverCreditState::new(20).unwrap();
 
-        state.record_data_consumed(&receiver_transport, 6, 10).await;
-        assert_eq!(state.credit_consumed, 6);
+        state.record_data_consumed(&receiver_transport, 6).await;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), sender_transport.recv())
+                .await
+                .is_err()
+        );
 
-        state.record_data_consumed(&receiver_transport, 7, 10).await;
-        assert_eq!(state.credit_consumed, 0);
+        state.record_data_consumed(&receiver_transport, 7).await;
         assert!(matches!(
             sender_transport.recv().await,
             Some(ReceiverMsg::CreditGrant { bytes: 13, ndx: None })
         ));
 
-        state.record_data_consumed(&receiver_transport, 5, 10).await;
-        assert_eq!(state.credit_consumed, 5);
+        state.record_data_consumed(&receiver_transport, 5).await;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), sender_transport.recv())
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_full_chunk_enqueue_returns_no_credit() {
+        let entry = nas_entry("file.txt", PathBuf::from("file.txt"), false);
+        let (sender_transport, receiver_transport) = create_in_process_pair();
+        let (dc_tx, mut dc_rx) = mpsc::channel(1);
+        let mut state = RemoteSessionState::default();
+        state.credit = ReceiverCreditState::new(2).unwrap();
+        assert!(state.begin_full(&dc_tx, 1, entry.clone()).await);
+        assert!(matches!(dc_rx.recv().await, Some(DiskCommitMsg::FileBegin { .. })));
+        drop(dc_rx);
+
+        assert!(
+            !state
+                .accept_full_chunk(
+                    &receiver_transport,
+                    &dc_tx,
+                    entry,
+                    DataChunk {
+                        offset: 0,
+                        data: Bytes::from_static(b"ab"),
+                    },
+                )
+                .await
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), sender_transport.recv())
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]

@@ -82,23 +82,21 @@ const MAX_ACQUIRE_CHUNK_BYTES: u64 = u32::MAX as u64;
 
 /// Receiver-side result of recording data accepted by the bounded sink.
 #[derive(Debug)]
-#[allow(dead_code, reason = "wired into the Receiver adapter by follow-up ticket #107")]
-pub(crate) enum ReceiverCreditOutcome {
+pub enum ReceiverCreditOutcome {
     Pending,
     Grant(ReceiverMsg),
 }
 
 /// Authoritative Receiver-side delayed-grant ledger for one connection.
-#[allow(dead_code, reason = "wired into the Receiver adapter by follow-up ticket #107")]
-pub(crate) struct ReceiverCreditState {
+#[derive(Debug)]
+pub struct ReceiverCreditState {
     grant_threshold: u64,
     accepted_pending: u64,
 }
 
-#[allow(dead_code, reason = "wired into the Receiver adapter by follow-up ticket #107")]
 impl ReceiverCreditState {
     /// Uses the existing half-window delayed-grant policy.
-    pub(crate) fn new(window_bytes: u64) -> Result<Self> {
+    pub fn new(window_bytes: u64) -> Result<Self> {
         validate_window(window_bytes)?;
         Ok(Self {
             grant_threshold: (window_bytes / 2).max(1),
@@ -107,7 +105,7 @@ impl ReceiverCreditState {
     }
 
     /// Records bytes only after the bounded disk-commit seam accepts them.
-    pub(crate) fn record_accepted(&mut self, bytes: u64) -> Result<ReceiverCreditOutcome> {
+    pub fn record_accepted(&mut self, bytes: u64) -> Result<ReceiverCreditOutcome> {
         self.accepted_pending = self
             .accepted_pending
             .checked_add(bytes)
@@ -123,8 +121,17 @@ impl ReceiverCreditState {
     }
 
     /// Drops connection-local accounting when a connection is replaced.
-    pub(crate) fn reset(&mut self) {
+    pub fn reset(&mut self) {
         self.accepted_pending = 0;
+    }
+}
+
+impl Default for ReceiverCreditState {
+    fn default() -> Self {
+        Self {
+            grant_threshold: DEFAULT_CREDIT_WINDOW_BYTES / 2,
+            accepted_pending: 0,
+        }
     }
 }
 
