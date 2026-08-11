@@ -421,24 +421,20 @@ impl ClickHouseDatabase {
         Ok(count > 0)
     }
 
-    /// 查询 `scan_state` 表，返回 id=1 的 `scan_state` 值
-    pub async fn query_scan_state(&self) -> Result<u8> {
+    /// 查询 `scan_state` 表，返回 id=1 的 `scan_state` 值。
+    ///
+    /// `Ok(None)` 仅表示表存在但没有状态行；查询、连接等数据库错误会原样上抛。
+    pub async fn query_scan_state(&self) -> Result<Option<u8>> {
         let table_name = get_scan_state_table_name(&self.job_id);
         let query = format!("SELECT scan_state FROM {table_name} FINAL WHERE id = 1");
 
-        let scan_state = self
-            .sync_client
-            .query(&query)
-            .fetch_one::<u8>()
-            .await
-            .map_err(|e| match e {
-                clickhouse::error::Error::RowNotFound => {
-                    DatabaseError::QueryError("No scan state record found for id=1".to_string())
-                }
-                _ => DatabaseError::QueryError(format!("Failed to query scan_state table: {e}")),
-            })?;
-
-        Ok(scan_state)
+        match self.sync_client.query(&query).fetch_one::<u8>().await {
+            Ok(scan_state) => Ok(Some(scan_state)),
+            Err(clickhouse::error::Error::RowNotFound) => Ok(None),
+            Err(e) => Err(DatabaseError::QueryError(format!(
+                "Failed to query scan_state table: {e}"
+            ))),
+        }
     }
 
     /// 获取缓存的 `scan_state`，如果缓存为空（255）则查询数据库
@@ -447,19 +443,7 @@ impl ClickHouseDatabase {
         if cached != 255 {
             return Ok(cached);
         }
-        let state = match self.query_scan_state().await {
-            Ok(s) => s,
-            Err(e) => {
-                // state 表不存在时降级为默认值 0。
-                // get_cached_scan_state 仅在首次 batch_insert 时调用（后续用缓存），
-                // 若 DB 真的不可用，后续 batch_insert 本身会报错，此处宽松处理可接受。
-                debug!(
-                    "Failed to query scan_state (table may not exist), using default 0: {}",
-                    e
-                );
-                0
-            }
-        };
+        let state = self.query_scan_state().await?.unwrap_or(0);
         self.cached_scan_state.store(state, Ordering::Relaxed);
         Ok(state)
     }
@@ -910,7 +894,7 @@ impl Database for ClickHouseDatabase {
     async fn detect_deleted_items(&self) -> Result<Box<dyn Iterator<Item = DeletionStatus> + Send>> {
         let base_table_name = get_scan_base_table_name(&self.job_id);
 
-        let current_state = self.query_scan_state().await?;
+        let current_state = self.query_scan_state().await?.unwrap_or(0);
         debug!("During detect_deleted_items, current_state is {}", current_state);
 
         // 第一步：查询所有 old-state 记录（LIMIT 1 BY 替代 FINAL）

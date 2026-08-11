@@ -11,6 +11,7 @@ mod clickhouse_integration_tests {
 
     // 外部crate
     use bytes::Bytes;
+    use clickhouse::Client;
     // 内部模块
     use data_mover::{EntryEnum, NASEntry, S3Entry};
     use db::clickhouse::ClickHouseDatabase;
@@ -27,15 +28,98 @@ mod clickhouse_integration_tests {
 
     fn setup_test_db_with_job_id(job_id: &str) -> ClickHouseDatabase {
         let config = ClickHouseConfig {
-            dsn: "http://10.128.133.213:8123".to_string(),
+            dsn: std::env::var("LAB_CLICKHOUSE_DSN").unwrap_or_else(|_| "http://10.131.9.11:8123".to_string()),
             dial_timeout: 10,
             read_timeout: 30,
-            database: "default".to_string(),
-            username: "default".to_string(),
-            password: None,
+            database: std::env::var("LAB_CLICKHOUSE_DATABASE").unwrap_or_else(|_| "default".to_string()),
+            username: std::env::var("LAB_CLICKHOUSE_USER").unwrap_or_else(|_| "default".to_string()),
+            password: std::env::var("LAB_CLICKHOUSE_PASSWORD")
+                .ok()
+                .filter(|value| !value.is_empty()),
         };
 
         ClickHouseDatabase::new(&config, job_id)
+    }
+
+    fn lab_clickhouse_config(database: String) -> ClickHouseConfig {
+        ClickHouseConfig {
+            dsn: std::env::var("LAB_CLICKHOUSE_DSN").unwrap_or_else(|_| "http://10.131.9.11:8123".to_string()),
+            dial_timeout: 10,
+            read_timeout: 30,
+            database,
+            username: std::env::var("LAB_CLICKHOUSE_USER").unwrap_or_else(|_| "default".to_string()),
+            password: std::env::var("LAB_CLICKHOUSE_PASSWORD")
+                .ok()
+                .filter(|value| !value.is_empty()),
+        }
+    }
+
+    fn clickhouse_client(config: &ClickHouseConfig) -> Client {
+        let mut client = Client::default()
+            .with_url(&config.dsn)
+            .with_database(config.database.clone())
+            .with_user(config.username.clone());
+        if let Some(password) = &config.password {
+            client = client.with_password(password);
+        }
+        client
+    }
+
+    struct IsolatedDatabase {
+        name: String,
+        active: bool,
+    }
+
+    impl IsolatedDatabase {
+        async fn cleanup(mut self) {
+            self.active = false;
+            cleanup_isolated_database(&self.name).await.unwrap();
+        }
+    }
+
+    impl Drop for IsolatedDatabase {
+        fn drop(&mut self) {
+            if !self.active {
+                return;
+            }
+            let database = self.name.clone();
+            let _ = std::thread::spawn(move || {
+                let Ok(runtime) = tokio::runtime::Builder::new_current_thread().enable_all().build() else {
+                    return;
+                };
+                let _ = runtime.block_on(cleanup_isolated_database(&database));
+            })
+            .join();
+        }
+    }
+
+    async fn setup_isolated_state_db(prefix: &str) -> (ClickHouseDatabase, ClickHouseConfig, IsolatedDatabase) {
+        let database = generate_unique_job_id(prefix);
+        let admin_config = lab_clickhouse_config("default".to_string());
+        clickhouse_client(&admin_config)
+            .query(&format!("CREATE DATABASE `{database}`"))
+            .execute()
+            .await
+            .unwrap();
+
+        let config = lab_clickhouse_config(database.clone());
+        let db = ClickHouseDatabase::new(&config, "state_test");
+        (
+            db,
+            config,
+            IsolatedDatabase {
+                name: database,
+                active: true,
+            },
+        )
+    }
+
+    async fn cleanup_isolated_database(database: &str) -> std::result::Result<(), clickhouse::error::Error> {
+        let config = lab_clickhouse_config("default".to_string());
+        clickhouse_client(&config)
+            .query(&format!("DROP DATABASE IF EXISTS `{database}`"))
+            .execute()
+            .await
     }
 
     // 测试清理辅助函数
@@ -108,6 +192,95 @@ mod clickhouse_integration_tests {
     }
 
     // ═══ 2.1 基础 CRUD ═══
+
+    #[tokio::test]
+    #[ignore = "requires lab ClickHouse"]
+    async fn query_scan_state_returns_none_when_state_table_is_empty() {
+        let (db, _, database) = setup_isolated_state_db("state_empty").await;
+        db.create_scan_state_table().await.unwrap();
+
+        assert_eq!(db.query_scan_state().await.unwrap(), None);
+
+        database.cleanup().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires lab ClickHouse"]
+    async fn query_scan_state_returns_persisted_zero_and_one_from_new_adapters() {
+        let (db, config, database) = setup_isolated_state_db("state_values").await;
+        db.create_scan_state_table().await.unwrap();
+        db.insert_scan_state(0).await.unwrap();
+
+        let fresh_db = ClickHouseDatabase::new(&config, "state_test");
+        assert_eq!(fresh_db.query_scan_state().await.unwrap(), Some(0));
+
+        db.insert_scan_state(1).await.unwrap();
+        let fresh_db = ClickHouseDatabase::new(&config, "state_test");
+        assert_eq!(fresh_db.query_scan_state().await.unwrap(), Some(1));
+
+        database.cleanup().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires lab ClickHouse"]
+    async fn query_scan_state_preserves_missing_table_as_database_error() {
+        let (db, _, database) = setup_isolated_state_db("state_missing_table").await;
+
+        let error = db.query_scan_state().await.unwrap_err();
+        assert!(matches!(error, db::error::DatabaseError::QueryError(_)));
+
+        database.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn query_scan_state_preserves_connection_error() {
+        let config = ClickHouseConfig {
+            dsn: "http://127.0.0.1:1".to_string(),
+            dial_timeout: 1,
+            read_timeout: 1,
+            database: "default".to_string(),
+            username: "default".to_string(),
+            password: None,
+        };
+        let db = ClickHouseDatabase::new(&config, "unreachable");
+
+        let error = db.query_scan_state().await.unwrap_err();
+        assert!(matches!(error, db::error::DatabaseError::QueryError(_)));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires lab ClickHouse"]
+    async fn query_scan_state_preserves_authentication_error() {
+        let mut config = lab_clickhouse_config("default".to_string());
+        config.password = Some("definitely-wrong-password".to_string());
+        let db = ClickHouseDatabase::new(&config, "auth_failure");
+
+        let error = db.query_scan_state().await.unwrap_err();
+        assert!(matches!(error, db::error::DatabaseError::QueryError(_)));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires lab ClickHouse"]
+    async fn failed_query_does_not_create_default_state() {
+        let (db, config, database) = setup_isolated_state_db("state_recovery").await;
+        let record = Arc::new(make_nas("recovery.dat", 7, 1_700_000_000, None));
+
+        assert!(db.batch_insert_base_record(&[record.clone()]).await.is_err());
+
+        db.create_scan_state_table().await.unwrap();
+        db.create_scan_base_table().await.unwrap();
+        db.insert_scan_state(1).await.unwrap();
+        db.batch_insert_base_record(&[record]).await.unwrap();
+
+        let stored_state = clickhouse_client(&config)
+            .query("SELECT current_state FROM base_state_test FINAL WHERE relative_path = 'recovery.dat'")
+            .fetch_one::<u8>()
+            .await
+            .unwrap();
+        assert_eq!(stored_state, 1, "失败查询不得把默认状态 0 写入缓存");
+
+        database.cleanup().await;
+    }
 
     #[tokio::test]
     #[ignore]
