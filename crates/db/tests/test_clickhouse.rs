@@ -561,6 +561,188 @@ mod clickhouse_integration_tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires lab ClickHouse"]
+    async fn independent_adapter_batch_uses_shared_working_generation() {
+        let (adapter_a, config, job_id, database) = setup_isolated_state_db("shared_adapter_batch").await;
+        adapter_a.initialize().await.unwrap();
+        assert_eq!(adapter_a.begin_scan_generation().await.unwrap(), 1);
+
+        let mut adapter_b = ClickHouseDatabase::new(&config, &job_id);
+        let record = Arc::new(make_nas("shared.dat", 13, 1_700_000_000, None));
+        adapter_b.batch_insert_base_record(&[record]).await.unwrap();
+        let client = clickhouse_client(&config);
+        let current_state = client
+            .query(&format!(
+                "SELECT current_state FROM base_{job_id} FINAL WHERE relative_path = 'shared.dat'"
+            ))
+            .fetch_one::<u8>()
+            .await
+            .unwrap();
+        assert_eq!(current_state, 1);
+
+        adapter_b.create_scan_temporary_table().await.unwrap();
+        let temp_table = adapter_b.scan_temp_table_name.clone().unwrap();
+        let temp_record = Arc::new(make_nas("shared-temp.dat", 19, 1_700_000_001, None));
+        adapter_b.batch_insert_temp_record(&[temp_record]).await.unwrap();
+        let temp_state = client
+            .query(&format!(
+                "SELECT current_state FROM {temp_table} WHERE relative_path = 'shared-temp.dat'"
+            ))
+            .fetch_one::<u8>()
+            .await
+            .unwrap();
+        assert_eq!(temp_state, 1);
+
+        database.cleanup().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires lab ClickHouse"]
+    async fn cloned_adapter_uses_shared_working_generation() {
+        let (adapter, config, job_id, database) = setup_isolated_state_db("shared_clone_batch").await;
+        adapter.initialize().await.unwrap();
+        let cloned = adapter.clone_box();
+        assert_eq!(adapter.begin_scan_generation().await.unwrap(), 1);
+
+        let record = Arc::new(make_nas("cloned.dat", 17, 1_700_000_000, None));
+        cloned.batch_insert_base_record(&[record]).await.unwrap();
+        let current_state = clickhouse_client(&config)
+            .query(&format!(
+                "SELECT current_state FROM base_{job_id} FINAL WHERE relative_path = 'cloned.dat'"
+            ))
+            .fetch_one::<u8>()
+            .await
+            .unwrap();
+        assert_eq!(current_state, 1);
+
+        database.cleanup().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires lab ClickHouse"]
+    async fn shared_adapters_commit_once_across_concurrent_and_repeated_calls() {
+        let (adapter_a, config, job_id, database) = setup_isolated_state_db("shared_commit").await;
+        adapter_a.initialize().await.unwrap();
+        assert_eq!(adapter_a.begin_scan_generation().await.unwrap(), 1);
+        let adapter_b = ClickHouseDatabase::new(&config, &job_id);
+        let adapter_c = ClickHouseDatabase::new(&config, &job_id);
+        let client = clickhouse_client(&config);
+        let rows_before = client
+            .query(&format!("SELECT count() FROM state_{job_id}"))
+            .fetch_one::<u64>()
+            .await
+            .unwrap();
+
+        let (commit_b, commit_c) = tokio::join!(adapter_b.commit_scan_generation(), adapter_c.commit_scan_generation());
+        commit_b.unwrap();
+        commit_c.unwrap();
+        adapter_a.commit_scan_generation().await.unwrap();
+
+        let rows_after = client
+            .query(&format!("SELECT count() FROM state_{job_id}"))
+            .fetch_one::<u64>()
+            .await
+            .unwrap();
+        assert_eq!(rows_after, rows_before + 1);
+        assert_eq!(adapter_a.query_scan_state().await.unwrap(), Some(1));
+
+        database.cleanup().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires lab ClickHouse"]
+    async fn failed_begin_clears_shared_working_generation_for_every_adapter() {
+        let (adapter_a, config, job_id, database) = setup_isolated_state_db("shared_failed_begin").await;
+        adapter_a.initialize().await.unwrap();
+        assert_eq!(adapter_a.begin_scan_generation().await.unwrap(), 1);
+        let adapter_b = ClickHouseDatabase::new(&config, &job_id);
+        adapter_b.drop_table_by_name(&format!("state_{job_id}")).await.unwrap();
+
+        assert!(matches!(
+            adapter_b.begin_scan_generation().await.unwrap_err(),
+            DatabaseError::QueryError(_)
+        ));
+        assert!(matches!(
+            adapter_a.commit_scan_generation().await.unwrap_err(),
+            DatabaseError::TransactionError(_)
+        ));
+
+        database.cleanup().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires lab ClickHouse"]
+    async fn shared_lifecycle_is_isolated_by_job_and_reclaimed_after_last_adapter_drops() {
+        let (adapter_a, config, job_id, database) = setup_isolated_state_db("shared_isolation").await;
+        adapter_a.initialize().await.unwrap();
+        assert_eq!(adapter_a.begin_scan_generation().await.unwrap(), 1);
+
+        let other_job_id = generate_unique_job_id("other_job");
+        let other_job = ClickHouseDatabase::new(&config, &other_job_id);
+        other_job.initialize().await.unwrap();
+        assert!(matches!(
+            other_job.commit_scan_generation().await.unwrap_err(),
+            DatabaseError::TransactionError(_)
+        ));
+
+        drop(adapter_a);
+        let recreated = ClickHouseDatabase::new(&config, &job_id);
+        assert!(matches!(
+            recreated.commit_scan_generation().await.unwrap_err(),
+            DatabaseError::TransactionError(_)
+        ));
+        assert_eq!(recreated.query_scan_state().await.unwrap(), Some(0));
+
+        database.cleanup().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires lab ClickHouse"]
+    async fn successful_rebegin_overwrites_stale_shared_working_from_persisted_state() {
+        let (adapter_a, config, job_id, database) = setup_isolated_state_db("shared_rebegin").await;
+        adapter_a.initialize().await.unwrap();
+        assert_eq!(adapter_a.begin_scan_generation().await.unwrap(), 1);
+        adapter_a.insert_scan_state(1).await.unwrap();
+
+        let adapter_b = ClickHouseDatabase::new(&config, &job_id);
+        assert_eq!(adapter_b.begin_scan_generation().await.unwrap(), 0);
+        let record = Arc::new(make_nas("rebegin.dat", 23, 1_700_000_000, None));
+        adapter_a.batch_insert_base_record(&[record]).await.unwrap();
+        let current_state = clickhouse_client(&config)
+            .query(&format!(
+                "SELECT current_state FROM base_{job_id} FINAL WHERE relative_path = 'rebegin.dat'"
+            ))
+            .fetch_one::<u8>()
+            .await
+            .unwrap();
+        assert_eq!(current_state, 0);
+
+        database.cleanup().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires lab ClickHouse"]
+    async fn shared_lifecycle_is_isolated_by_database_for_the_same_job() {
+        let (_, config_a, _, database_a) = setup_isolated_state_db("shared_database_a").await;
+        let (_, config_b, _, database_b) = setup_isolated_state_db("shared_database_b").await;
+        let job_id = generate_unique_job_id("same_job");
+        let adapter_a = ClickHouseDatabase::new(&config_a, &job_id);
+        let adapter_b = ClickHouseDatabase::new(&config_b, &job_id);
+        adapter_a.initialize().await.unwrap();
+        adapter_b.initialize().await.unwrap();
+
+        assert_eq!(adapter_a.begin_scan_generation().await.unwrap(), 1);
+        assert!(matches!(
+            adapter_b.commit_scan_generation().await.unwrap_err(),
+            DatabaseError::TransactionError(_)
+        ));
+        assert_eq!(adapter_b.query_scan_state().await.unwrap(), Some(0));
+
+        database_a.cleanup().await;
+        database_b.cleanup().await;
+    }
+
+    #[tokio::test]
     #[ignore]
     async fn test_initialize_creates_tables() {
         let job_id = generate_unique_job_id("init");
