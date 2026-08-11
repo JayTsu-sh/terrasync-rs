@@ -199,7 +199,11 @@ async fn list_directory_security_info(
 ) -> Result<()> {
     // 加载应用配置
     let app_config = AppConfig::fetch()?;
-    debug!("Loaded application configuration: {:?}", app_config);
+    debug!(
+        scan_concurrency = app_config.scan.concurrency,
+        database_enabled = app_config.database.enabled,
+        "Loaded non-sensitive application configuration summary"
+    );
 
     // 初始化ScanConfig
     let scan_config = initialize_scan_config(

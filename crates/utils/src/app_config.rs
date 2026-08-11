@@ -117,7 +117,7 @@ impl Default for DeleteConfig {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
+#[derive(Serialize, Deserialize, Clone)]
 pub struct ClickhouseConfig {
     pub dsn: String,
     pub dial_timeout: u32,
@@ -125,6 +125,19 @@ pub struct ClickhouseConfig {
     pub database: String,
     pub username: String,
     pub password: Option<String>,
+}
+
+impl fmt::Debug for ClickhouseConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ClickhouseConfig")
+            .field("dsn", &"[REDACTED]")
+            .field("dial_timeout", &self.dial_timeout)
+            .field("read_timeout", &self.read_timeout)
+            .field("database", &self.database)
+            .field("username", &self.username)
+            .field("password", &self.password.as_ref().map(|_| "[REDACTED]"))
+            .finish()
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -294,5 +307,28 @@ impl TryFrom<Config> for AppConfig {
         }
 
         Ok(app_config)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn clickhouse_debug_redacts_password() {
+        let config = ClickhouseConfig {
+            dsn: "http://dsn-user:dsn-secret@clickhouse.internal".to_string(),
+            dial_timeout: 10,
+            read_timeout: 30,
+            database: "terrasync".to_string(),
+            username: "writer".to_string(),
+            password: Some("decrypted-secret".to_string()),
+        };
+
+        let debug = format!("{config:?}");
+
+        assert!(debug.contains("[REDACTED]"));
+        assert!(!debug.contains("decrypted-secret"));
+        assert!(!debug.contains("dsn-secret"));
     }
 }
