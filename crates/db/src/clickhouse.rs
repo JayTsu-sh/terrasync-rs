@@ -620,11 +620,13 @@ impl Database for ClickHouseDatabase {
         Box::new(new_db)
     }
 
-    /// 初始化：创建主扫描表 + 状态表，设置初始 `scan_state=0`
+    /// 初始化：创建主扫描表 + 状态表，仅在状态缺失时设置初始 `scan_state=0`
     async fn initialize(&self) -> Result<()> {
         self.create_table(SCAN_BASE_TABLE_BASE_NAME).await?;
         self.create_table(SCAN_STATE_TABLE_BASE_NAME).await?;
-        self.insert_scan_state(0).await?;
+        if self.query_scan_state().await?.is_none() {
+            self.insert_scan_state(0).await?;
+        }
         Ok(())
     }
 
