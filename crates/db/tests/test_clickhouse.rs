@@ -15,7 +15,7 @@ mod clickhouse_integration_tests {
     // 内部模块
     use data_mover::{EntryEnum, NASEntry, S3Entry};
     use db::clickhouse::ClickHouseDatabase;
-    use db::{ClickHouseConfig, Database, DeletionStatus};
+    use db::{ClickHouseConfig, Database, DatabaseError, DeletionStatus};
 
     // 使用原子计数器确保每个测试用例都有唯一的job_id
     static TEST_COUNTER: AtomicUsize = AtomicUsize::new(0);
@@ -93,8 +93,9 @@ mod clickhouse_integration_tests {
         }
     }
 
-    async fn setup_isolated_state_db(prefix: &str) -> (ClickHouseDatabase, ClickHouseConfig, IsolatedDatabase) {
+    async fn setup_isolated_state_db(prefix: &str) -> (ClickHouseDatabase, ClickHouseConfig, String, IsolatedDatabase) {
         let database = generate_unique_job_id(prefix);
+        let job_id = generate_unique_job_id("state_job");
         let admin_config = lab_clickhouse_config("default".to_string());
         clickhouse_client(&admin_config)
             .query(&format!("CREATE DATABASE `{database}`"))
@@ -103,10 +104,11 @@ mod clickhouse_integration_tests {
             .unwrap();
 
         let config = lab_clickhouse_config(database.clone());
-        let db = ClickHouseDatabase::new(&config, "state_test");
+        let db = ClickHouseDatabase::new(&config, &job_id);
         (
             db,
             config,
+            job_id,
             IsolatedDatabase {
                 name: database,
                 active: true,
@@ -123,7 +125,7 @@ mod clickhouse_integration_tests {
     }
 
     // 测试清理辅助函数
-    async fn cleanup_test_tables(db: &ClickHouseDatabase, job_id: &str) -> Result<(), db::error::DatabaseError> {
+    async fn cleanup_test_tables(db: &ClickHouseDatabase, job_id: &str) -> Result<(), DatabaseError> {
         let base_table = format!("{}_{}", db::SCAN_BASE_TABLE_BASE_NAME, job_id);
         let state_table = format!("{}_{}", db::SCAN_STATE_TABLE_BASE_NAME, job_id);
         let incremental_table = format!("{}_{}", db::INCREMENTAL_SCAN_TABLE_BASE_NAME, job_id);
@@ -196,7 +198,7 @@ mod clickhouse_integration_tests {
     #[tokio::test]
     #[ignore = "requires lab ClickHouse"]
     async fn query_scan_state_returns_none_when_state_table_is_empty() {
-        let (db, _, database) = setup_isolated_state_db("state_empty").await;
+        let (db, _, _, database) = setup_isolated_state_db("state_empty").await;
         db.create_scan_state_table().await.unwrap();
 
         assert_eq!(db.query_scan_state().await.unwrap(), None);
@@ -207,15 +209,15 @@ mod clickhouse_integration_tests {
     #[tokio::test]
     #[ignore = "requires lab ClickHouse"]
     async fn query_scan_state_returns_persisted_zero_and_one_from_new_adapters() {
-        let (db, config, database) = setup_isolated_state_db("state_values").await;
+        let (db, config, job_id, database) = setup_isolated_state_db("state_values").await;
         db.create_scan_state_table().await.unwrap();
         db.insert_scan_state(0).await.unwrap();
 
-        let fresh_db = ClickHouseDatabase::new(&config, "state_test");
+        let fresh_db = ClickHouseDatabase::new(&config, &job_id);
         assert_eq!(fresh_db.query_scan_state().await.unwrap(), Some(0));
 
         db.insert_scan_state(1).await.unwrap();
-        let fresh_db = ClickHouseDatabase::new(&config, "state_test");
+        let fresh_db = ClickHouseDatabase::new(&config, &job_id);
         assert_eq!(fresh_db.query_scan_state().await.unwrap(), Some(1));
 
         database.cleanup().await;
@@ -224,10 +226,10 @@ mod clickhouse_integration_tests {
     #[tokio::test]
     #[ignore = "requires lab ClickHouse"]
     async fn query_scan_state_preserves_missing_table_as_database_error() {
-        let (db, _, database) = setup_isolated_state_db("state_missing_table").await;
+        let (db, _, _, database) = setup_isolated_state_db("state_missing_table").await;
 
         let error = db.query_scan_state().await.unwrap_err();
-        assert!(matches!(error, db::error::DatabaseError::QueryError(_)));
+        assert!(matches!(error, DatabaseError::QueryError(_)));
 
         database.cleanup().await;
     }
@@ -245,7 +247,7 @@ mod clickhouse_integration_tests {
         let db = ClickHouseDatabase::new(&config, "unreachable");
 
         let error = db.query_scan_state().await.unwrap_err();
-        assert!(matches!(error, db::error::DatabaseError::QueryError(_)));
+        assert!(matches!(error, DatabaseError::QueryError(_)));
     }
 
     #[tokio::test]
@@ -256,13 +258,13 @@ mod clickhouse_integration_tests {
         let db = ClickHouseDatabase::new(&config, "auth_failure");
 
         let error = db.query_scan_state().await.unwrap_err();
-        assert!(matches!(error, db::error::DatabaseError::QueryError(_)));
+        assert!(matches!(error, DatabaseError::QueryError(_)));
     }
 
     #[tokio::test]
     #[ignore = "requires lab ClickHouse"]
     async fn failed_query_does_not_create_default_state() {
-        let (db, config, database) = setup_isolated_state_db("state_recovery").await;
+        let (db, config, job_id, database) = setup_isolated_state_db("state_recovery").await;
         let record = Arc::new(make_nas("recovery.dat", 7, 1_700_000_000, None));
 
         assert!(db.batch_insert_base_record(&[record.clone()]).await.is_err());
@@ -273,11 +275,90 @@ mod clickhouse_integration_tests {
         db.batch_insert_base_record(&[record]).await.unwrap();
 
         let stored_state = clickhouse_client(&config)
-            .query("SELECT current_state FROM base_state_test FINAL WHERE relative_path = 'recovery.dat'")
+            .query(&format!(
+                "SELECT current_state FROM base_{job_id} FINAL WHERE relative_path = 'recovery.dat'"
+            ))
             .fetch_one::<u8>()
             .await
             .unwrap();
         assert_eq!(stored_state, 1, "失败查询不得把默认状态 0 写入缓存");
+
+        database.cleanup().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires lab ClickHouse"]
+    async fn initialize_preserves_existing_generation_one_without_appending_state() {
+        let (db, config, job_id, database) = setup_isolated_state_db("initialize_existing_one").await;
+        db.create_scan_state_table().await.unwrap();
+        db.insert_scan_state(1).await.unwrap();
+
+        let fresh_db = ClickHouseDatabase::new(&config, &job_id);
+        fresh_db.initialize().await.unwrap();
+
+        assert_eq!(fresh_db.query_scan_state().await.unwrap(), Some(1));
+        let physical_rows = clickhouse_client(&config)
+            .query(&format!("SELECT count() FROM state_{job_id}"))
+            .fetch_one::<u64>()
+            .await
+            .unwrap();
+        assert_eq!(physical_rows, 1, "已有 generation 时初始化不得追加默认状态");
+
+        database.cleanup().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires lab ClickHouse"]
+    async fn initialize_creates_one_zero_state_and_is_idempotent_across_adapters() {
+        let (db, config, job_id, database) = setup_isolated_state_db("initialize_empty").await;
+
+        db.initialize().await.unwrap();
+        let fresh_db = ClickHouseDatabase::new(&config, &job_id);
+        assert_eq!(fresh_db.query_scan_state().await.unwrap(), Some(0));
+
+        fresh_db.initialize().await.unwrap();
+        let newest_db = ClickHouseDatabase::new(&config, &job_id);
+        assert_eq!(newest_db.query_scan_state().await.unwrap(), Some(0));
+        let physical_rows = clickhouse_client(&config)
+            .query(&format!("SELECT count() FROM state_{job_id}"))
+            .fetch_one::<u64>()
+            .await
+            .unwrap();
+        assert_eq!(physical_rows, 1, "重复初始化不得追加 generation 0");
+
+        database.cleanup().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires lab ClickHouse"]
+    async fn initialize_propagates_state_decode_error_without_writing_default() {
+        let (db, config, job_id, database) = setup_isolated_state_db("initialize_invalid_state").await;
+        let client = clickhouse_client(&config);
+        client
+            .query(&format!(
+                "CREATE TABLE state_{job_id} (id UInt8, scan_state String) \
+                 ENGINE = ReplacingMergeTree() ORDER BY id"
+            ))
+            .execute()
+            .await
+            .unwrap();
+        client
+            .query(&format!(
+                "INSERT INTO state_{job_id} (id, scan_state) VALUES (1, 'broken')"
+            ))
+            .execute()
+            .await
+            .unwrap();
+
+        let error = db.initialize().await.unwrap_err();
+        assert!(matches!(error, DatabaseError::QueryError(_)));
+
+        let stored_values = client
+            .query(&format!("SELECT scan_state FROM state_{job_id} FINAL WHERE id = 1"))
+            .fetch_all::<String>()
+            .await
+            .unwrap();
+        assert_eq!(stored_values, vec!["broken"]);
 
         database.cleanup().await;
     }
