@@ -72,8 +72,8 @@ mod clickhouse_integration_tests {
 
     impl IsolatedDatabase {
         async fn cleanup(mut self) {
-            cleanup_isolated_database(&self.name).await;
             self.active = false;
+            cleanup_isolated_database(&self.name).await.unwrap();
         }
     }
 
@@ -83,15 +83,13 @@ mod clickhouse_integration_tests {
                 return;
             }
             let database = self.name.clone();
-            std::thread::spawn(move || {
-                tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .unwrap()
-                    .block_on(cleanup_isolated_database(&database));
+            let _ = std::thread::spawn(move || {
+                let Ok(runtime) = tokio::runtime::Builder::new_current_thread().enable_all().build() else {
+                    return;
+                };
+                let _ = runtime.block_on(cleanup_isolated_database(&database));
             })
-            .join()
-            .unwrap();
+            .join();
         }
     }
 
@@ -116,13 +114,12 @@ mod clickhouse_integration_tests {
         )
     }
 
-    async fn cleanup_isolated_database(database: &str) {
+    async fn cleanup_isolated_database(database: &str) -> std::result::Result<(), clickhouse::error::Error> {
         let config = lab_clickhouse_config("default".to_string());
         clickhouse_client(&config)
             .query(&format!("DROP DATABASE IF EXISTS `{database}`"))
             .execute()
             .await
-            .unwrap();
     }
 
     // 测试清理辅助函数
