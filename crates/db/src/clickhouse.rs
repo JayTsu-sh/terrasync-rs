@@ -4,8 +4,8 @@
 
 // 标准库
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::{Arc, Mutex as StdMutex, OnceLock, Weak};
 
 // 外部crate
 use async_trait::async_trait;
@@ -46,14 +46,45 @@ pub struct ClickHouseDatabase {
     pub scan_temp_table_name: Option<String>,
     /// 缓存的 `scan_state` 值（255 = 未缓存），避免每次 `batch_insert` 都查询数据库
     cached_scan_state: AtomicU8,
-    /// 当前 adapter 的 scan generation 生命周期
-    generation_lifecycle: Mutex<ScanGenerationLifecycle>,
+    /// 同一 ClickHouse 身份与 job 共享的 scan generation 生命周期
+    generation_lifecycle: Arc<Mutex<ScanGenerationLifecycle>>,
 }
 
 #[derive(Default)]
 struct ScanGenerationLifecycle {
     working: Option<u8>,
     committed: bool,
+}
+
+#[derive(Clone, Eq, Hash, PartialEq)]
+struct GenerationLifecycleKey {
+    dsn: String,
+    database: String,
+    username: String,
+    job_id: String,
+}
+
+type SharedGenerationLifecycle = Arc<Mutex<ScanGenerationLifecycle>>;
+type GenerationLifecycleRegistry = HashMap<GenerationLifecycleKey, Weak<Mutex<ScanGenerationLifecycle>>>;
+
+static GENERATION_LIFECYCLES: OnceLock<StdMutex<GenerationLifecycleRegistry>> = OnceLock::new();
+
+fn shared_generation_lifecycle(config: &ClickHouseConfig, job_id: &str) -> SharedGenerationLifecycle {
+    let key = GenerationLifecycleKey {
+        dsn: config.dsn.clone(),
+        database: config.database.clone(),
+        username: config.username.clone(),
+        job_id: sanitize_job_id(job_id),
+    };
+    let registry = GENERATION_LIFECYCLES.get_or_init(|| StdMutex::new(HashMap::new()));
+    let mut registry = registry.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    registry.retain(|_, lifecycle| lifecycle.strong_count() > 0);
+    if let Some(lifecycle) = registry.get(&key).and_then(Weak::upgrade) {
+        return lifecycle;
+    }
+    let lifecycle = Arc::new(Mutex::new(ScanGenerationLifecycle::default()));
+    registry.insert(key, Arc::downgrade(&lifecycle));
+    lifecycle
 }
 
 /// 生成文件扫描列定义的宏
@@ -291,7 +322,7 @@ impl ClickHouseDatabase {
             job_id: job_id.to_string(),
             scan_temp_table_name: None,
             cached_scan_state: AtomicU8::new(255),
-            generation_lifecycle: Mutex::new(ScanGenerationLifecycle::default()),
+            generation_lifecycle: shared_generation_lifecycle(config, job_id),
         }
     }
 
@@ -628,7 +659,7 @@ impl Database for ClickHouseDatabase {
             job_id: self.job_id.clone(),
             scan_temp_table_name: self.scan_temp_table_name.clone(),
             cached_scan_state: AtomicU8::new(self.cached_scan_state.load(Ordering::Relaxed)),
-            generation_lifecycle: Mutex::new(ScanGenerationLifecycle::default()),
+            generation_lifecycle: Arc::clone(&self.generation_lifecycle),
         };
 
         Box::new(new_db)
