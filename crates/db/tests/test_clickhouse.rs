@@ -215,10 +215,187 @@ mod clickhouse_integration_tests {
 
         let fresh_db = ClickHouseDatabase::new(&config, &job_id);
         assert_eq!(fresh_db.query_scan_state().await.unwrap(), Some(0));
+        assert_eq!(fresh_db.begin_scan_generation().await.unwrap(), 1);
 
         db.insert_scan_state(1).await.unwrap();
         let fresh_db = ClickHouseDatabase::new(&config, &job_id);
         assert_eq!(fresh_db.query_scan_state().await.unwrap(), Some(1));
+
+        database.cleanup().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires lab ClickHouse"]
+    async fn begin_from_committed_one_returns_zero_without_persisting() {
+        let (db, config, job_id, database) = setup_isolated_state_db("begin_one").await;
+        db.create_scan_base_table().await.unwrap();
+        db.create_scan_state_table().await.unwrap();
+        db.insert_scan_state(1).await.unwrap();
+
+        assert_eq!(db.begin_scan_generation().await.unwrap(), 0);
+        let fresh_db = ClickHouseDatabase::new(&config, &job_id);
+        assert_eq!(fresh_db.query_scan_state().await.unwrap(), Some(1));
+
+        database.cleanup().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires lab ClickHouse"]
+    async fn uncommitted_adapter_retry_reuses_working_generation() {
+        let (adapter_a, config, job_id, database) = setup_isolated_state_db("begin_retry").await;
+        adapter_a.initialize().await.unwrap();
+        assert_eq!(adapter_a.begin_scan_generation().await.unwrap(), 1);
+        drop(adapter_a);
+
+        let adapter_b = ClickHouseDatabase::new(&config, &job_id);
+        assert_eq!(adapter_b.begin_scan_generation().await.unwrap(), 1);
+        drop(adapter_b);
+        let adapter_c = ClickHouseDatabase::new(&config, &job_id);
+        assert_eq!(adapter_c.query_scan_state().await.unwrap(), Some(0));
+        let physical_rows = clickhouse_client(&config)
+            .query(&format!("SELECT count() FROM state_{job_id}"))
+            .fetch_one::<u64>()
+            .await
+            .unwrap();
+        assert_eq!(physical_rows, 1);
+
+        database.cleanup().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires lab ClickHouse"]
+    async fn begun_batch_uses_working_generation_and_commit_is_idempotent() {
+        let (mut db, config, job_id, database) = setup_isolated_state_db("begin_batch_commit").await;
+        db.initialize().await.unwrap();
+        assert_eq!(db.begin_scan_generation().await.unwrap(), 1);
+
+        let record = Arc::new(make_nas("working.dat", 9, 1_700_000_000, None));
+        db.batch_insert_base_record(&[record]).await.unwrap();
+        let client = clickhouse_client(&config);
+        let stamped_generation = client
+            .query(&format!(
+                "SELECT current_state FROM base_{job_id} FINAL WHERE relative_path = 'working.dat'"
+            ))
+            .fetch_one::<u8>()
+            .await
+            .unwrap();
+        assert_eq!(stamped_generation, 1);
+        db.create_scan_temporary_table().await.unwrap();
+        let temp_table = db.scan_temp_table_name.clone().unwrap();
+        let temp_record = Arc::new(make_nas("temp-working.dat", 11, 1_700_000_001, None));
+        db.batch_insert_temp_record(&[temp_record]).await.unwrap();
+        let temp_generation = client
+            .query(&format!(
+                "SELECT current_state FROM {temp_table} WHERE relative_path = 'temp-working.dat'"
+            ))
+            .fetch_one::<u8>()
+            .await
+            .unwrap();
+        assert_eq!(temp_generation, 1);
+        let fresh_db = ClickHouseDatabase::new(&config, &job_id);
+        assert_eq!(fresh_db.query_scan_state().await.unwrap(), Some(0));
+
+        let rows_before_commit = client
+            .query(&format!("SELECT count() FROM state_{job_id}"))
+            .fetch_one::<u64>()
+            .await
+            .unwrap();
+        let (first_commit, second_commit) = tokio::join!(db.commit_scan_generation(), db.commit_scan_generation());
+        first_commit.unwrap();
+        second_commit.unwrap();
+        assert_eq!(fresh_db.query_scan_state().await.unwrap(), Some(1));
+        let rows_after_commit = client
+            .query(&format!("SELECT count() FROM state_{job_id}"))
+            .fetch_one::<u64>()
+            .await
+            .unwrap();
+        assert_eq!(rows_after_commit, rows_before_commit + 1);
+        db.commit_scan_generation().await.unwrap();
+        let rows_after_repeat = client
+            .query(&format!("SELECT count() FROM state_{job_id}"))
+            .fetch_one::<u64>()
+            .await
+            .unwrap();
+        assert_eq!(rows_after_repeat, rows_after_commit);
+
+        database.cleanup().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires lab ClickHouse"]
+    async fn commit_before_begin_is_rejected_without_persisting() {
+        let (db, config, job_id, database) = setup_isolated_state_db("commit_without_begin").await;
+        db.initialize().await.unwrap();
+
+        let error = db.commit_scan_generation().await.unwrap_err();
+        assert!(matches!(error, DatabaseError::TransactionError(_)));
+        let fresh_db = ClickHouseDatabase::new(&config, &job_id);
+        assert_eq!(fresh_db.query_scan_state().await.unwrap(), Some(0));
+        let physical_rows = clickhouse_client(&config)
+            .query(&format!("SELECT count() FROM state_{job_id}"))
+            .fetch_one::<u64>()
+            .await
+            .unwrap();
+        assert_eq!(physical_rows, 1);
+
+        database.cleanup().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires lab ClickHouse"]
+    async fn invalid_persisted_generation_rejects_begin_and_commit() {
+        let (db, config, job_id, database) = setup_isolated_state_db("begin_invalid_generation").await;
+        db.create_scan_state_table().await.unwrap();
+        db.insert_scan_state(2).await.unwrap();
+
+        let error = db.begin_scan_generation().await.unwrap_err();
+        assert!(matches!(error, DatabaseError::ConversionError(_)));
+        let error = db.commit_scan_generation().await.unwrap_err();
+        assert!(matches!(error, DatabaseError::TransactionError(_)));
+        let fresh_db = ClickHouseDatabase::new(&config, &job_id);
+        assert_eq!(fresh_db.query_scan_state().await.unwrap(), Some(2));
+
+        database.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn failed_begin_does_not_enable_commit() {
+        let config = ClickHouseConfig {
+            dsn: "http://127.0.0.1:1".to_string(),
+            dial_timeout: 1,
+            read_timeout: 1,
+            database: "default".to_string(),
+            username: "default".to_string(),
+            password: None,
+        };
+        let db = ClickHouseDatabase::new(&config, "failed_begin");
+
+        assert!(matches!(
+            db.begin_scan_generation().await.unwrap_err(),
+            DatabaseError::QueryError(_)
+        ));
+        assert!(matches!(
+            db.commit_scan_generation().await.unwrap_err(),
+            DatabaseError::TransactionError(_)
+        ));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires lab ClickHouse"]
+    async fn failed_rebegin_clears_previous_working_generation() {
+        let (db, _, job_id, database) = setup_isolated_state_db("failed_rebegin").await;
+        db.initialize().await.unwrap();
+        assert_eq!(db.begin_scan_generation().await.unwrap(), 1);
+        db.drop_table_by_name(&format!("state_{job_id}")).await.unwrap();
+
+        assert!(matches!(
+            db.begin_scan_generation().await.unwrap_err(),
+            DatabaseError::QueryError(_)
+        ));
+        assert!(matches!(
+            db.commit_scan_generation().await.unwrap_err(),
+            DatabaseError::TransactionError(_)
+        ));
 
         database.cleanup().await;
     }
@@ -359,6 +536,26 @@ mod clickhouse_integration_tests {
             .await
             .unwrap();
         assert_eq!(stored_values, vec!["broken"]);
+
+        database.cleanup().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires lab ClickHouse"]
+    async fn begin_from_committed_zero_returns_one_without_persisting() {
+        let (db, config, job_id, database) = setup_isolated_state_db("begin_zero").await;
+        db.initialize().await.unwrap();
+
+        assert_eq!(db.begin_scan_generation().await.unwrap(), 1);
+
+        let fresh_db = ClickHouseDatabase::new(&config, &job_id);
+        assert_eq!(fresh_db.query_scan_state().await.unwrap(), Some(0));
+        let physical_rows = clickhouse_client(&config)
+            .query(&format!("SELECT count() FROM state_{job_id}"))
+            .fetch_one::<u64>()
+            .await
+            .unwrap();
+        assert_eq!(physical_rows, 1);
 
         database.cleanup().await;
     }

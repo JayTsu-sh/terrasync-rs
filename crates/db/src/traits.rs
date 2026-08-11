@@ -573,6 +573,12 @@ pub trait Database: Send + Sync {
     /// - 失败返回错误信息
     async fn switch_scan_state(&self) -> Result<()>;
 
+    /// 从持久 generation 开始一轮扫描，但不持久化 working generation
+    async fn begin_scan_generation(&self) -> Result<u8>;
+
+    /// 提交本轮 begin 得到的 working generation
+    async fn commit_scan_generation(&self) -> Result<()>;
+
     /// 查询在最新扫描中新增的文件
     /// 即在临时表中存在但在主表中不存在的文件
     ///
