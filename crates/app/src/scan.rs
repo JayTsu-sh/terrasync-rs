@@ -97,7 +97,11 @@ async fn setup_scan_pipeline(
 ) -> Result<ScanPipeline> {
     // 1. 加载应用配置
     let app_config = AppConfig::fetch()?;
-    debug!("[ScanPipeline] Loaded application configuration: {:?}", app_config);
+    debug!(
+        scan_concurrency = app_config.scan.concurrency,
+        database_enabled = app_config.database.enabled,
+        "[ScanPipeline] Loaded non-sensitive application configuration summary"
+    );
 
     // 2. 规范化路径
     let src_path = canonicalize_path(path)?;
@@ -568,7 +572,9 @@ pub async fn scan(
 
     info!(
         "Starting scan: job_id={}, scan_type={}, path={}",
-        job_id, scan_type, path
+        job_id,
+        scan_type,
+        redact_storage_url(path)
     );
     match scan_type {
         ScanType::Full => {
