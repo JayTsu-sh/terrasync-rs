@@ -13,7 +13,7 @@ use clickhouse::Client;
 use data_mover::{ChangeKind, EntryEnum, StorageEntryMessage};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use tokio::sync::mpsc;
+use tokio::sync::{Mutex, mpsc};
 use tracing::{debug, info, trace, warn};
 
 // 内部模块
@@ -46,6 +46,14 @@ pub struct ClickHouseDatabase {
     pub scan_temp_table_name: Option<String>,
     /// 缓存的 `scan_state` 值（255 = 未缓存），避免每次 `batch_insert` 都查询数据库
     cached_scan_state: AtomicU8,
+    /// 当前 adapter 的 scan generation 生命周期
+    generation_lifecycle: Mutex<ScanGenerationLifecycle>,
+}
+
+#[derive(Default)]
+struct ScanGenerationLifecycle {
+    working: Option<u8>,
+    committed: bool,
 }
 
 /// 生成文件扫描列定义的宏
@@ -283,6 +291,7 @@ impl ClickHouseDatabase {
             job_id: job_id.to_string(),
             scan_temp_table_name: None,
             cached_scan_state: AtomicU8::new(255),
+            generation_lifecycle: Mutex::new(ScanGenerationLifecycle::default()),
         }
     }
 
@@ -439,6 +448,10 @@ impl ClickHouseDatabase {
 
     /// 获取缓存的 `scan_state`，如果缓存为空（255）则查询数据库
     async fn get_cached_scan_state(&self) -> Result<u8> {
+        let working = self.generation_lifecycle.lock().await.working;
+        if let Some(working) = working {
+            return Ok(working);
+        }
         let cached = self.cached_scan_state.load(Ordering::Relaxed);
         if cached != 255 {
             return Ok(cached);
@@ -615,6 +628,7 @@ impl Database for ClickHouseDatabase {
             job_id: self.job_id.clone(),
             scan_temp_table_name: self.scan_temp_table_name.clone(),
             cached_scan_state: AtomicU8::new(self.cached_scan_state.load(Ordering::Relaxed)),
+            generation_lifecycle: Mutex::new(ScanGenerationLifecycle::default()),
         };
 
         Box::new(new_db)
@@ -777,6 +791,36 @@ impl Database for ClickHouseDatabase {
 
         debug!("Switched scan state: {} -> {}", current_state, new_state);
 
+        Ok(())
+    }
+
+    async fn begin_scan_generation(&self) -> Result<u8> {
+        let mut lifecycle = self.generation_lifecycle.lock().await;
+        *lifecycle = ScanGenerationLifecycle::default();
+        let committed = self.query_scan_state().await?.ok_or_else(|| {
+            DatabaseError::TransactionError("Cannot begin scan generation before initialization".to_string())
+        })?;
+        if committed > 1 {
+            return Err(DatabaseError::ConversionError(format!(
+                "Invalid committed scan generation {committed}; expected 0 or 1"
+            )));
+        }
+        let working = 1 - committed;
+        lifecycle.working = Some(working);
+        Ok(working)
+    }
+
+    async fn commit_scan_generation(&self) -> Result<()> {
+        let mut lifecycle = self.generation_lifecycle.lock().await;
+        let working = lifecycle
+            .working
+            .ok_or_else(|| DatabaseError::TransactionError("Cannot commit scan generation before begin".to_string()))?;
+        if lifecycle.committed {
+            return Ok(());
+        }
+        self.insert_scan_state(working).await?;
+        self.cached_scan_state.store(working, Ordering::Relaxed);
+        lifecycle.committed = true;
         Ok(())
     }
 
