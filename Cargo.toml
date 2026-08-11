@@ -118,6 +118,9 @@ profiling = ["dep:console-subscriber"]
 # License特性
 license = ["cli/license"]
 
+# 仅供物理 lab 构建使用；默认生产二进制不包含故障注入入口。
+lab-fault-injection = ["cli/lab-fault-injection"]
+
 # GUI 特性
 gui = ["cli/gui"]
 

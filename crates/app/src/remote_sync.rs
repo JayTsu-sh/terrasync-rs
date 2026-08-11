@@ -100,6 +100,7 @@ pub(crate) async fn run(
         progress_bar: ProgressBar::new(JobType::IncrementalCopy),
         job_dir: config.job_dir.clone(),
         callback_url: config.progress_callback_url.clone(),
+        generation_committed: None,
         pb_handle: None,
     }));
     let callback_guard = StatisticConsumer::begin(stats_consumer.clone()).await;
@@ -268,6 +269,7 @@ mod tests {
             progress_bar: ProgressBar::new(JobType::IncrementalCopy),
             job_dir: String::new(),
             callback_url: None,
+            generation_committed: None,
             pb_handle: None,
         }))
     }
@@ -2197,6 +2199,7 @@ mod tests {
             progress_bar: ProgressBar::new(JobType::IncrementalCopy),
             job_dir: String::new(),
             callback_url: Some(callback_url),
+            generation_committed: None,
             pb_handle: None,
         }));
         let callback_guard = StatisticConsumer::begin(stats_consumer.clone()).await;

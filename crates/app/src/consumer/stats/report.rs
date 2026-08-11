@@ -58,6 +58,8 @@ pub struct ProgressReport {
     pub detail: ProgressDetail,
     pub is_final: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub generation_committed: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub final_stats: Option<FinalStats>,
 }
 

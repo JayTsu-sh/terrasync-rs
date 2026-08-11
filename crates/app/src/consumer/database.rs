@@ -21,6 +21,34 @@ const MAX_RETRY_ATTEMPTS: u32 = 3;
 /// 初始退避间隔（毫秒）
 const INITIAL_BACKOFF_MS: u64 = 100;
 
+#[derive(Default)]
+struct DatabaseFailures(usize);
+
+impl DatabaseFailures {
+    fn record_entries(&mut self, count: usize) {
+        self.0 += count;
+    }
+
+    fn record_operation(&mut self) {
+        self.0 += 1;
+    }
+
+    fn count(&self) -> usize {
+        self.0
+    }
+}
+
+fn database_consumer_result(job_type: &JobType, failures: &DatabaseFailures) -> Result<()> {
+    if *job_type != JobType::IncrementalScan || failures.count() == 0 {
+        Ok(())
+    } else {
+        Err(crate::error::AppError::ConsumerError(format!(
+            "Database consumer drained with {} failed operations",
+            failures.count()
+        )))
+    }
+}
+
 /// 带重试和指数退避的数据库批量操作辅助函数
 ///
 /// 在失败时按指数退避策略重试（100ms → 200ms → 400ms），重试耗尽后返回最后一次的错误。
@@ -93,7 +121,7 @@ impl Consumer for DatabaseConsumer {
                 let mut current_insert_entry_batch: Vec<Arc<EntryEnum>> = Vec::with_capacity(batch_size as usize);
                 let mut current_delete_entry_batch: Vec<String> = Vec::with_capacity(batch_size as usize);
                 let mut processed_count = 0;
-                let mut processed_errors: usize = 0;
+                let mut processed_errors = DatabaseFailures::default();
 
                 while let Some(message) = receiver.recv().await {
                     match message {
@@ -136,6 +164,7 @@ impl Consumer for DatabaseConsumer {
                                     &StorageEntryMessage::New(entry),
                                     &mut current_message_batch,
                                     batch_size,
+                                    &mut processed_errors,
                                 )
                                 .await;
                             }
@@ -146,7 +175,7 @@ impl Consumer for DatabaseConsumer {
                             // 只有在增量拷贝场景才需要更新数据库里的记录
                             // 在增量扫描场景是不需要更新记录的,是因为在临时表导入主表时就已经更新了。
                             if job_type == JobType::IncrementalCopy {
-                                DatabaseConsumer::update_base_record(db.as_ref(), &entry).await;
+                                DatabaseConsumer::update_base_record(db.as_ref(), &entry, &mut processed_errors).await;
                             }
 
                             DatabaseConsumer::batch_insert_incremental_record(
@@ -154,6 +183,7 @@ impl Consumer for DatabaseConsumer {
                                 &StorageEntryMessage::Changed { entry, kind },
                                 &mut current_message_batch,
                                 batch_size,
+                                &mut processed_errors,
                             )
                             .await;
                         }
@@ -174,6 +204,7 @@ impl Consumer for DatabaseConsumer {
                                 &from_entry,
                                 &mut current_delete_entry_batch,
                                 batch_size,
+                                &mut processed_errors,
                             )
                             .await;
 
@@ -182,6 +213,7 @@ impl Consumer for DatabaseConsumer {
                                 &StorageEntryMessage::Renamed((from_entry, to_entry)),
                                 &mut current_message_batch,
                                 batch_size,
+                                &mut processed_errors,
                             )
                             .await;
                         }
@@ -193,6 +225,7 @@ impl Consumer for DatabaseConsumer {
                                 &entry,
                                 &mut current_delete_entry_batch,
                                 batch_size,
+                                &mut processed_errors,
                             )
                             .await;
 
@@ -201,6 +234,7 @@ impl Consumer for DatabaseConsumer {
                                 &StorageEntryMessage::Deleted(entry),
                                 &mut current_message_batch,
                                 batch_size,
+                                &mut processed_errors,
                             )
                             .await;
                         }
@@ -221,6 +255,7 @@ impl Consumer for DatabaseConsumer {
                             })
                             .await
                             {
+                                processed_errors.record_operation();
                                 error!(
                                     "[DatabaseConsumer] Failed to insert tar manifest for {} after {} retries: {}",
                                     tar_path, MAX_RETRY_ATTEMPTS, e
@@ -248,28 +283,44 @@ impl Consumer for DatabaseConsumer {
                         "[DatabaseConsumer] Flushing {} remaining base insertion records",
                         current_insert_entry_batch.len()
                     );
-                    DatabaseConsumer::finalize_insert_base_record(db.as_ref(), &mut current_insert_entry_batch).await;
+                    DatabaseConsumer::finalize_insert_base_record(
+                        db.as_ref(),
+                        &mut current_insert_entry_batch,
+                        &mut processed_errors,
+                    )
+                    .await;
                 }
                 if !current_delete_entry_batch.is_empty() {
                     debug!(
                         "[DatabaseConsumer] Flushing {} remaining base deletion records",
                         current_delete_entry_batch.len()
                     );
-                    DatabaseConsumer::finalize_delete_base_record(db.as_ref(), &mut current_delete_entry_batch).await;
+                    DatabaseConsumer::finalize_delete_base_record(
+                        db.as_ref(),
+                        &mut current_delete_entry_batch,
+                        &mut processed_errors,
+                    )
+                    .await;
                 }
                 if !current_message_batch.is_empty() {
                     debug!(
                         "[DatabaseConsumer] Flushing {} remaining incremental records",
                         current_message_batch.len()
                     );
-                    DatabaseConsumer::finalize_insert_incremental_record(db.as_ref(), &mut current_message_batch).await;
+                    DatabaseConsumer::finalize_insert_incremental_record(
+                        db.as_ref(),
+                        &mut current_message_batch,
+                        &mut processed_errors,
+                    )
+                    .await;
                 }
 
                 info!(
                     "[DatabaseConsumer] Consumer task completed, total processed: {}, processed error: {}",
-                    processed_count, processed_errors
+                    processed_count,
+                    processed_errors.count()
                 );
-                Ok(())
+                database_consumer_result(&job_type, &processed_errors)
             }
             .instrument(span),
         );
@@ -358,9 +409,9 @@ impl DatabaseConsumer {
     /// * `database` - 数据库实例引用
     /// * `current_batch` - 当前批次的记录，新记录会被添加到这里
     /// * `batch_size` - 批量插入的大小阈值
-    pub async fn batch_insert_base_record(
+    async fn batch_insert_base_record(
         database: &dyn Database, entry: &Arc<EntryEnum>, current_batch: &mut Vec<Arc<EntryEnum>>, batch_size: u32,
-        processed_errors: &mut usize,
+        processed_errors: &mut DatabaseFailures,
     ) {
         current_batch.push(entry.clone());
 
@@ -375,7 +426,7 @@ impl DatabaseConsumer {
             if let Err(e) =
                 retry_batch_operation("insert_base", || database.batch_insert_base_record(current_batch)).await
             {
-                *processed_errors += batch_len;
+                processed_errors.record_entries(batch_len);
                 error!(
                     "[DatabaseConsumer] Failed to insert batch after {} retries, discarding {} records: {}",
                     MAX_RETRY_ATTEMPTS, batch_len, e
@@ -395,7 +446,9 @@ impl DatabaseConsumer {
     /// # 参数
     /// * `database` - 数据库实例引用
     /// * `current_batch` - 当前批次的记录，处理后会被清空
-    pub async fn finalize_insert_base_record(database: &dyn Database, current_batch: &mut Vec<Arc<EntryEnum>>) {
+    async fn finalize_insert_base_record(
+        database: &dyn Database, current_batch: &mut Vec<Arc<EntryEnum>>, processed_errors: &mut DatabaseFailures,
+    ) {
         if current_batch.is_empty() {
             info!("[DatabaseConsumer] No remaining records to flush");
         } else {
@@ -409,6 +462,7 @@ impl DatabaseConsumer {
             })
             .await
             {
+                processed_errors.record_entries(current_batch.len());
                 error!(
                     "[DatabaseConsumer] Failed to insert final batch after {} retries, discarding {} records: {}",
                     MAX_RETRY_ATTEMPTS,
@@ -429,7 +483,9 @@ impl DatabaseConsumer {
     /// # 参数
     /// * `database` - 数据库实例引用
     /// * `current_batch` - 当前批次的记录，处理后会被清空
-    pub async fn finalize_delete_base_record(database: &dyn Database, current_batch: &mut Vec<String>) {
+    async fn finalize_delete_base_record(
+        database: &dyn Database, current_batch: &mut Vec<String>, processed_errors: &mut DatabaseFailures,
+    ) {
         if current_batch.is_empty() {
             info!("[DatabaseConsumer] No remaining records to flush");
         } else {
@@ -444,6 +500,7 @@ impl DatabaseConsumer {
             })
             .await
             {
+                processed_errors.record_entries(current_batch.len());
                 error!(
                     "[DatabaseConsumer] Failed to delete final batch after {} retries, discarding {} records: {}",
                     MAX_RETRY_ATTEMPTS,
@@ -457,8 +514,9 @@ impl DatabaseConsumer {
         }
     }
 
-    pub async fn batch_delete_base_record(
+    async fn batch_delete_base_record(
         database: &dyn Database, entry: &Arc<EntryEnum>, current_batch: &mut Vec<String>, batch_size: u32,
+        processed_errors: &mut DatabaseFailures,
     ) {
         current_batch.push(entry.get_relative_path().to_string_lossy().to_string());
 
@@ -473,6 +531,7 @@ impl DatabaseConsumer {
             if let Err(e) =
                 retry_batch_operation("delete_base", || database.batch_delete_base_record(current_batch)).await
             {
+                processed_errors.record_entries(batch_len);
                 error!(
                     "[DatabaseConsumer] Failed to delete base batch after {} retries, discarding {} records: {}",
                     MAX_RETRY_ATTEMPTS, batch_len, e
@@ -494,9 +553,9 @@ impl DatabaseConsumer {
     /// * `database` - 数据库实例引用
     /// * `current_batch` - 当前批次的记录，新记录会被添加到这里
     /// * `batch_size` - 批量插入的大小阈值
-    pub async fn batch_insert_incremental_record(
+    async fn batch_insert_incremental_record(
         database: &dyn Database, message: &StorageEntryMessage, current_batch: &mut Vec<StorageEntryMessage>,
-        batch_size: u32,
+        batch_size: u32, processed_errors: &mut DatabaseFailures,
     ) {
         current_batch.push(message.clone());
 
@@ -513,6 +572,7 @@ impl DatabaseConsumer {
             })
             .await
             {
+                processed_errors.record_entries(batch_len);
                 error!(
                     "[DatabaseConsumer] Failed to insert incremental batch after {} retries, discarding {} records: {}",
                     MAX_RETRY_ATTEMPTS, batch_len, e
@@ -532,8 +592,8 @@ impl DatabaseConsumer {
     /// # 参数
     /// * `database` - 数据库实例引用
     /// * `current_batch` - 当前批次的记录，处理后会被清空
-    pub async fn finalize_insert_incremental_record(
-        database: &dyn Database, current_batch: &mut Vec<StorageEntryMessage>,
+    async fn finalize_insert_incremental_record(
+        database: &dyn Database, current_batch: &mut Vec<StorageEntryMessage>, processed_errors: &mut DatabaseFailures,
     ) {
         if current_batch.is_empty() {
             info!("[DatabaseConsumer] No remaining incremental records to flush");
@@ -548,6 +608,7 @@ impl DatabaseConsumer {
             })
             .await
             {
+                processed_errors.record_entries(current_batch.len());
                 error!(
                     "[DatabaseConsumer] Failed to insert final incremental batch after {} retries, discarding {} records: {}",
                     MAX_RETRY_ATTEMPTS,
@@ -561,11 +622,30 @@ impl DatabaseConsumer {
         }
     }
 
-    pub async fn update_base_record(database: &dyn Database, entry: &Arc<EntryEnum>) {
+    async fn update_base_record(
+        database: &dyn Database, entry: &Arc<EntryEnum>, processed_errors: &mut DatabaseFailures,
+    ) {
         if let Err(e) = database.update_base_record(entry).await {
+            processed_errors.record_operation();
             error!("[DatabaseConsumer] Failed to update base record: {}", e);
         } else {
             debug!("[DatabaseConsumer] Base record updated successfully");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{DatabaseFailures, database_consumer_result};
+    use crate::config::JobType;
+
+    #[test]
+    fn database_consumer_returns_error_after_draining_recorded_failures() {
+        let mut failures = DatabaseFailures::default();
+        assert!(database_consumer_result(&JobType::IncrementalScan, &failures).is_ok());
+
+        failures.record_entries(2);
+        assert!(database_consumer_result(&JobType::IncrementalScan, &failures).is_err());
+        assert!(database_consumer_result(&JobType::IncrementalCopy, &failures).is_ok());
     }
 }

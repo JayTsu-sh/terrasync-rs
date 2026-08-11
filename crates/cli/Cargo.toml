@@ -8,6 +8,7 @@ edition = "2024"
 [features]
 license = ["dep:licensing", "app/license"]
 gui = ["dep:web"]
+lab-fault-injection = ["app/lab-fault-injection"]
 
 [dependencies]
 app        = { workspace = true }

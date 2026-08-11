@@ -10,11 +10,12 @@
 //! - 单阶段调用方（scan / sync / integrity_check）仍然只调一次 `start_consumers`。
 
 // 标准库
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 
 // 外部crate
-use data_mover::StorageEntryMessage;
+use data_mover::{ErrorEvent, StorageEntryMessage};
 use tokio::sync::Mutex;
 use tracing::{Instrument, debug, error, info_span, warn};
 
@@ -77,6 +78,7 @@ impl ConsumerManager {
                     progress_bar: ProgressBar::new(job_type),
                     job_dir,
                     callback_url,
+                    generation_committed: None,
                     pb_handle: None,
                 },
                 JobType::IncrementalScan | JobType::IncrementalCopy => StatisticConsumer {
@@ -84,6 +86,7 @@ impl ConsumerManager {
                     progress_bar: ProgressBar::new(job_type),
                     job_dir,
                     callback_url,
+                    generation_committed: None,
                     pb_handle: None,
                 },
             };
@@ -164,6 +167,29 @@ impl ConsumerManager {
     /// 获取已注册的消费者数量
     pub fn get_consumer_count(&self) -> usize {
         self.consumers.len()
+    }
+
+    /// 在 consumer 任务已经退出后，把任务级失败写入同一份最终统计。
+    pub async fn record_task_failures(&self, failures: &[String]) {
+        let Some(stats_consumer) = &self.stats_consumer else {
+            return;
+        };
+        let mut stats_consumer = stats_consumer.lock().await;
+        for reason in failures {
+            stats_consumer.update_statistics(&StorageEntryMessage::Error {
+                event: ErrorEvent::Scan,
+                path: PathBuf::new(),
+                entry: None,
+                reason: reason.clone(),
+            });
+        }
+    }
+
+    /// 设置纯增量扫描在最终回调中暴露的 generation 提交分类。
+    pub async fn set_generation_committed(&self, committed: bool) {
+        if let Some(stats_consumer) = &self.stats_consumer {
+            stats_consumer.lock().await.generation_committed = Some(committed);
+        }
     }
 
     /// 结束一次性生命周期：abort HTTP 回调 → 发送 final 回调 → finalize（打印合并统计 + join 显示线程）。

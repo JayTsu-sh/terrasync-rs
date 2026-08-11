@@ -439,6 +439,7 @@ impl ProgressBar {
             speed_bytes_per_sec: speed,
             detail,
             is_final: false,
+            generation_committed: None,
             final_stats: None,
         }
     }

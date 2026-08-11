@@ -37,6 +37,8 @@ pub struct StatisticConsumer {
     pub progress_bar: ProgressBar,
     pub job_dir: String,
     pub callback_url: Option<String>,
+    /// 纯增量扫描的 generation 是否成功提交；其他任务保持 `None`。
+    pub generation_committed: Option<bool>,
     /// progress bar display 线程句柄，`finalize()` join 以确保正常退出
     pub(crate) pb_handle: Option<std::thread::JoinHandle<()>>,
 }
@@ -77,6 +79,7 @@ impl StatisticConsumer {
     pub fn to_report(&self, is_final: bool) -> ProgressReport {
         let mut report = self.progress_bar.to_report(self.stats.job_id());
         report.is_final = is_final;
+        report.generation_committed = self.generation_committed;
         if is_final {
             report.final_stats = Some(self.stats.to_final_stats());
         }
@@ -233,6 +236,8 @@ impl StatisticConsumer {
 #[cfg(test)]
 mod tests {
     use super::StatisticConsumer;
+    use crate::config::JobType;
+    use crate::consumer::stats::{IncrementalStats, ProgressBar, StatsKind};
 
     #[test]
     fn callback_proxy_bypass_is_limited_to_loopback_hosts() {
@@ -257,6 +262,27 @@ mod tests {
                 "expected external URL: {url}"
             );
         }
+    }
+
+    #[test]
+    fn final_report_exposes_incremental_scan_generation_commit_status() {
+        let mut consumer = StatisticConsumer {
+            stats: StatsKind::Incremental(IncrementalStats::new(
+                JobType::IncrementalScan,
+                "scan-job".to_string(),
+                "scan".to_string(),
+                String::new(),
+            )),
+            progress_bar: ProgressBar::new(JobType::IncrementalScan),
+            job_dir: String::new(),
+            callback_url: None,
+            generation_committed: Some(false),
+            pb_handle: None,
+        };
+
+        assert_eq!(consumer.to_report(true).generation_committed, Some(false));
+        consumer.generation_committed = Some(true);
+        assert_eq!(consumer.to_report(true).generation_committed, Some(true));
     }
 }
 
