@@ -28,6 +28,7 @@ use std::time::{Duration, Instant};
 
 use assert_cmd::Command as AssertCommand;
 use assert_cmd::cargo::cargo_bin;
+use serial_test::serial;
 
 /// 轮询等待 Receiver 写入 TLS 证书文件的超时时间
 const READY_TIMEOUT: Duration = Duration::from_secs(10);
@@ -171,6 +172,7 @@ fn drain_output(child: &mut Child) -> (String, String) {
 }
 
 #[test]
+#[serial]
 fn test_remote_process_e2e_handshake_and_sync() {
     let tmp = tempfile::tempdir().expect("create tempdir");
     let tmp_path = tmp.path();
@@ -185,7 +187,11 @@ fn test_remote_process_e2e_handshake_and_sync() {
     let config_path = tmp_path.join("config.toml");
     // 绕开 ClickHouse 依赖：双进程 remote 模式本身不落库，只有 orchestrator 顶层为判定
     // ScanType 会在 database.enabled=true 时构造真实 Database 连接，测试环境没有 ClickHouse。
-    fs::write(&config_path, "[database]\nenabled = false\n").expect("write config");
+    fs::write(
+        &config_path,
+        "[database]\nenabled = false\n\n[scan]\nconcurrency = 1\ninclude_tags = false\n",
+    )
+    .expect("write config");
 
     // 让日志 / jobs 目录落在本次测试专属的 tmp 目录内：
     // utils::logger::setup_logging 在 CARGO_MANIFEST_DIR 存在时，用它的父目录作为日志根目录。
@@ -265,6 +271,7 @@ fn test_remote_process_e2e_handshake_and_sync() {
 /// 回归：双进程同步应保留目录 mtime。写子文件会把目标端目录 mtime 顶到 ~now，
 /// 必须在所有传输完成后回写目录元数据（对齐单进程 orchestrator 的目录 mtime 收尾）。
 #[test]
+#[serial]
 fn test_remote_process_e2e_dir_mtime_preserved() {
     let tmp = tempfile::tempdir().expect("create tempdir");
     let tmp_path = tmp.path();
@@ -349,6 +356,7 @@ fn test_remote_process_e2e_dir_mtime_preserved() {
 
 /// Token 鉴权测试（进程级）：Sender 携带与 Receiver 一致的 `--token` → 鉴权通过 → 全量同步成功
 #[test]
+#[serial]
 fn test_remote_process_e2e_correct_token_succeeds() {
     let tmp = tempfile::tempdir().expect("create tempdir");
     let tmp_path = tmp.path();
@@ -428,6 +436,7 @@ fn test_remote_process_e2e_correct_token_succeeds() {
 
 /// Token 鉴权测试（进程级）：Sender 携带错误 `--token` → Receiver 拒绝连接 → 未写入任何文件
 #[test]
+#[serial]
 fn test_remote_process_e2e_wrong_token_rejected() {
     let tmp = tempfile::tempdir().expect("create tempdir");
     let tmp_path = tmp.path();
@@ -524,6 +533,7 @@ fn deterministic_bytes(len: usize) -> Vec<u8> {
 /// `Control`/`FileList`/`AckProgress` 其余三条 stream）不受影响，仍能与既有握手/
 /// 鉴权测试共用同一套子进程 harness 正常完成整个同步流程。
 #[test]
+#[serial]
 fn test_remote_process_e2e_large_multi_chunk_file_mux() {
     let tmp = tempfile::tempdir().expect("create tempdir");
     let tmp_path = tmp.path();
@@ -609,6 +619,7 @@ fn test_remote_process_e2e_large_multi_chunk_file_mux() {
 /// 不会超时，且开启 `--enable-integrity-check`（BLAKE3 端到端校验）确保数据经过 credit
 /// 流控后仍然完整无损（逐字节比对 + hash 双重验证）。
 #[test]
+#[serial]
 fn test_remote_process_e2e_credit_window_large_file_no_deadlock() {
     let tmp = tempfile::tempdir().expect("create tempdir");
     let tmp_path = tmp.path();
@@ -694,6 +705,7 @@ fn test_remote_process_e2e_credit_window_large_file_no_deadlock() {
 
 /// `--delete-target`（issue #23）默认关闭：目标端存在但源端已不存在的文件应保留。
 #[test]
+#[serial]
 fn test_remote_process_e2e_without_delete_target_keeps_orphan() {
     let tmp = tempfile::tempdir().expect("create tempdir");
     let tmp_path = tmp.path();
@@ -766,6 +778,7 @@ fn test_remote_process_e2e_without_delete_target_keeps_orphan() {
 /// 主路径覆盖 CLI flag → `SyncJobConfig.delete_target` → `SessionConfig` →
 /// Receiver orphan-delete → `Classified{Deleted}` 全链路。
 #[test]
+#[serial]
 fn test_remote_process_e2e_delete_target_removes_orphan() {
     let tmp = tempfile::tempdir().expect("create tempdir");
     let tmp_path = tmp.path();
@@ -841,6 +854,7 @@ fn test_remote_process_e2e_delete_target_removes_orphan() {
 /// `--delete-target`。用 inode 断言"未被删除重建"——若发生误删重传，子目录内
 /// 文件的 inode 必然改变。
 #[test]
+#[serial]
 fn test_remote_process_e2e_delete_target_preserves_existing_subdir() {
     let tmp = tempfile::tempdir().expect("create tempdir");
     let tmp_path = tmp.path();
@@ -1007,6 +1021,7 @@ fn parse_changed_total(stdout: &str) -> u64 {
 ///    条目恒返回 `DeltaTransfer`，与文件大小是否变化无关，见 `message.rs::check`）。
 /// 二者同时成立时，唯一自洽的解释就是该条目走了真实的 `DeltaTransferRequest` 消息。
 #[test]
+#[serial]
 fn test_remote_process_e2e_delta_sync_transfers_changed_content() {
     let tmp = tempfile::tempdir().expect("create tempdir");
     let tmp_path = tmp.path();
@@ -1166,6 +1181,7 @@ fn assert_delta_size_threshold_downgrade_in_log(log_path: &Path) {
 /// 非侵入式证据：Receiver 日志出现 size 门槛降级记录（`assert_delta_size_threshold_downgrade_in_log`），
 /// 证明该文件确实因 size 超阈值被降级为全量传输，而不是走 `DeltaTransferRequest`。
 #[test]
+#[serial]
 fn test_remote_process_e2e_delta_size_threshold_downgrades_to_full() {
     let tmp = tempfile::tempdir().expect("create tempdir");
     let tmp_path = tmp.path();
@@ -1315,6 +1331,7 @@ fn test_remote_process_e2e_delta_size_threshold_downgrades_to_full() {
 /// 均未覆盖该路径，见 issue #26 triage），单独构造专属数据集验证符号链接经真实
 /// QUIC 连接走 `CreateSymlink` 完整落地——链接类型 + 目标路径字符串 + 可解引用内容。
 #[test]
+#[serial]
 fn test_remote_process_e2e_symlink_synced() {
     let tmp = tempfile::tempdir().expect("create tempdir");
     let tmp_path = tmp.path();
@@ -1418,6 +1435,7 @@ fn test_remote_process_e2e_symlink_synced() {
 /// `resume_prepare(..., false)`，归 #25 处置），故重跑是整文件重传而非"断点续传"，
 /// 但这正是本 issue 验收标准要求的范围："中断重跑后最终收敛"。
 #[test]
+#[serial]
 fn test_remote_process_e2e_resume_after_sender_kill() {
     let tmp = tempfile::tempdir().expect("create tempdir");
     let tmp_path = tmp.path();
@@ -1556,6 +1574,7 @@ fn test_remote_process_e2e_resume_after_sender_kill() {
 ///
 /// 沿用 resume 测试同样的限速手法制造中断窗口，避免"其实传完了才杀"的假阳性。
 #[test]
+#[serial]
 fn test_remote_process_e2e_receiver_killed_sender_exits_nonzero() {
     let tmp = tempfile::tempdir().expect("create tempdir");
     let tmp_path = tmp.path();
@@ -1648,6 +1667,7 @@ fn test_remote_process_e2e_receiver_killed_sender_exits_nonzero() {
 /// 值）——这条链路一旦回归就会在此处失败。真正的"跨用户 chown"需要 root/CAP_CHOWN
 /// 权限的专用环境，超出本地开发环境可执行范围。
 #[test]
+#[serial]
 fn test_remote_process_e2e_uid_gid_preserved() {
     let tmp = tempfile::tempdir().expect("create tempdir");
     let tmp_path = tmp.path();
@@ -1755,6 +1775,7 @@ fn parse_error_stats_total(stdout: &str) -> u64 {
 /// 3. 其余文件正常同步、内容一致；不可读文件未出现在 dest（该 entry 确实失败了，
 ///    不是被静默跳过又假装成功）。
 #[test]
+#[serial]
 fn test_remote_process_e2e_partial_failure_exit_zero_with_nonzero_report() {
     let tmp = tempfile::tempdir().expect("create tempdir");
     let tmp_path = tmp.path();
