@@ -32,6 +32,8 @@ use tokio::sync::Mutex as AsyncMutex;
 use tracing::{info, warn};
 use transport::error::TransportError;
 #[cfg(test)]
+use transport::message::DestIndex;
+#[cfg(test)]
 use transport::message::TransferDecision;
 use transport::message::{HandshakeResult, ProtocolHandshake, ReceiverMsg, SenderMsg, SessionConfig};
 use transport::traits::SenderTransport;
@@ -42,6 +44,8 @@ use crate::config::{JobType, SyncJobConfig};
 use crate::consumer::stats::{IncrementalStats, ProgressBar, StatisticConsumer, StatsKind};
 use crate::error::{AppError, Result};
 use crate::orchestrator::create_qos_manager;
+#[cfg(test)]
+use crate::remote_receiver_session::RemoteSessionState;
 use crate::sync::parse_size;
 
 /// 双进程全量同步 — Sender 侧入口
@@ -1895,25 +1899,33 @@ mod tests {
         );
     }
 
-    /// 删除失败（父目录无写权限）→ 发 `EntryError`，不发 `Classified`
+    /// 删除失败（storage root 在索引后变成普通文件）→ 发 `EntryError`，不发 `Classified`。
+    /// 不使用 Unix 权限位造错，因为 root/CAP_DAC_OVERRIDE 可以绕过目录写权限。
     #[tokio::test]
     async fn recv_file_list_delete_failure_emits_entry_error() {
         let dest_dir = tempdir().unwrap();
-        fs::write(dest_dir.path().join("orphan.txt"), b"stale").unwrap();
-        // unlink 需要父目录写权限；只留 r-x 制造确定性删除失败（walkdir 列目录仍可用）
-        fs::set_permissions(dest_dir.path(), fs::Permissions::from_mode(0o555)).unwrap();
+        let root = dest_dir.path().to_path_buf();
+        let dest_storage = create_storage(root.to_str().unwrap(), None, true).await.unwrap();
+        let orphan = dummy_entry("orphan.txt", false, 5);
+        let mut dest_index = DestIndex::new();
+        dest_index.insert(orphan);
 
-        let dest_storage = Arc::new(
-            create_storage(dest_dir.path().to_str().unwrap(), None, true)
-                .await
-                .unwrap(),
-        );
-        let (sender_transport, receiver_handle) = spawn_receiver_and_handshake(dest_storage, true, true).await;
+        // DestIndex 已持有 orphan；把 root 从目录替换成普通文件后，真实 local storage
+        // 删除 root/orphan.txt 会稳定返回 NotADirectory，与执行测试的 uid/capability 无关。
+        fs::remove_dir(&root).unwrap();
+        fs::write(&root, b"not a directory").unwrap();
 
-        sender_transport
-            .send(SenderMsg::FilePage(empty_root_page()))
-            .await
-            .unwrap();
+        let (sender_transport, receiver_transport) = create_in_process_pair();
+        let mut state = RemoteSessionState::default();
+        state
+            .handle_directory_lifecycle(
+                &receiver_transport,
+                &dest_storage,
+                &empty_root_page(),
+                &mut dest_index,
+                true,
+            )
+            .await;
 
         match recv_skip_progress(&sender_transport).await {
             Some(ReceiverMsg::EntryError { entry, reason }) => {
@@ -1923,10 +1935,9 @@ mod tests {
             other => panic!("expected EntryError（删除失败）, got {other:?}"),
         }
 
-        // 恢复权限：finish_phase 内部无需再写 dest_dir，但保险起见先复原，避免 tempdir 清理受阻
-        fs::set_permissions(dest_dir.path(), fs::Permissions::from_mode(0o755)).unwrap();
-
-        finish_phase(&sender_transport, receiver_handle, &[]).await;
+        // 恢复 TempDir 的目录形态，确保清理不依赖平台对“根路径变成文件”的处理。
+        fs::remove_file(&root).unwrap();
+        fs::create_dir(&root).unwrap();
     }
 
     // ============================================================
