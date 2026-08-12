@@ -1816,15 +1816,17 @@ fn test_remote_process_e2e_partial_failure_exit_zero_with_nonzero_report() {
         .expect("spawn receiver process");
     wait_for_cert_file(&cert_path);
 
-    let mut sender_cmd = if fs::metadata(tmp_path).expect("stat temporary root").uid() == 0 {
-        let mut command = AssertCommand::new("setpriv");
+    let sender_process = if fs::metadata(tmp_path).expect("stat temporary root").uid() == 0 {
+        let mut command = StdCommand::new("setpriv");
         command
             .arg("--bounding-set=-dac_override,-dac_read_search")
             .arg(&bin_path);
         command
     } else {
-        AssertCommand::new(&bin_path)
+        StdCommand::new(&bin_path)
     };
+    let mut sender_cmd = AssertCommand::from_std(sender_process);
+    sender_cmd.timeout(Duration::from_secs(60));
     sender_cmd
         .env("CARGO_MANIFEST_DIR", &fake_manifest_dir)
         .current_dir(tmp_path)
