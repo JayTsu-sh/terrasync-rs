@@ -264,6 +264,40 @@ mod clickhouse_integration_tests {
 
     #[tokio::test]
     #[ignore = "requires lab ClickHouse"]
+    async fn retry_rebases_uncommitted_rows_before_detecting_deletions() {
+        let (adapter_a, config, job_id, database) = setup_isolated_state_db("retry_rebase").await;
+        adapter_a.initialize().await.unwrap();
+        let survivor = Arc::new(make_nas("survivor.dat", 10, 1_700_000_000, None));
+        let deleted = Arc::new(make_nas("deleted.dat", 20, 1_700_000_000, None));
+        adapter_a
+            .batch_insert_base_record(&[Arc::clone(&survivor), Arc::clone(&deleted)])
+            .await
+            .unwrap();
+
+        assert_eq!(adapter_a.begin_scan_generation().await.unwrap(), 1);
+        adapter_a
+            .batch_insert_base_record(&[Arc::clone(&survivor), Arc::clone(&deleted)])
+            .await
+            .unwrap();
+        drop(adapter_a);
+
+        let adapter_b = ClickHouseDatabase::new(&config, &job_id);
+        assert_eq!(adapter_b.begin_scan_generation().await.unwrap(), 1);
+        adapter_b.batch_insert_base_record(&[survivor]).await.unwrap();
+        let detected: Vec<_> = adapter_b.detect_deleted_items().await.unwrap().collect();
+
+        assert_eq!(detected.len(), 1);
+        assert!(matches!(
+            &detected[0],
+            DeletionStatus::Deleted(entry) if entry.get_relative_path() == PathBuf::from("deleted.dat")
+        ));
+        assert_eq!(adapter_b.query_scan_state().await.unwrap(), Some(0));
+
+        database.cleanup().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires lab ClickHouse"]
     async fn begun_batch_uses_working_generation_and_commit_is_idempotent() {
         let (mut db, config, job_id, database) = setup_isolated_state_db("begin_batch_commit").await;
         db.initialize().await.unwrap();

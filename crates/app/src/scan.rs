@@ -7,10 +7,14 @@
 //! 4. 与数据库的交互，用于增量扫描
 
 // 标准库
+use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 // 外部crate
-use data_mover::{EntryEnum, StorageEntryMessage, WalkDirAsyncIterator, canonicalize_path, redact_storage_url};
+use data_mover::{
+    EntryEnum, ErrorEvent, StorageEntryMessage, WalkDirAsyncIterator, canonicalize_path, redact_storage_url,
+};
 use db::factory::DatabaseFactory;
 use db::traits::Database;
 use db::{self, DeletionStatus, INCREMENTAL_SCAN_TABLE_BASE_NAME};
@@ -25,6 +29,73 @@ use crate::config::{ConsumerConfig, JobType, initialize_consumer_config, initial
 use crate::consumer::ConsumerManager;
 use crate::dir_walker;
 use crate::error::{AppError, Result};
+
+/// 一轮纯增量扫描的安全状态。
+///
+/// 失败只关闭删除与 generation 提交闸门；worker 仍负责排空已经接收的工作。
+#[derive(Clone)]
+struct IncrementalScanSafety {
+    snapshot_complete: Arc<AtomicBool>,
+    cancellation_reported: Arc<AtomicBool>,
+}
+
+impl IncrementalScanSafety {
+    fn new() -> Self {
+        Self {
+            snapshot_complete: Arc::new(AtomicBool::new(true)),
+            cancellation_reported: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    fn record_failure(&self) {
+        self.snapshot_complete.store(false, Ordering::Release);
+    }
+
+    /// 返回 `true` 表示调用方应发送本轮唯一一条取消统计消息。
+    fn record_cancellation(&self) -> bool {
+        self.record_failure();
+        !self.cancellation_reported.swap(true, Ordering::AcqRel)
+    }
+
+    fn can_detect_deletions(&self) -> bool {
+        self.snapshot_complete.load(Ordering::Acquire)
+    }
+
+    fn can_commit_generation(&self) -> bool {
+        self.snapshot_complete.load(Ordering::Acquire)
+    }
+}
+
+#[derive(Debug)]
+enum GenerationCommitOutcome {
+    Committed,
+    Blocked,
+}
+
+async fn finalize_scan_generation(
+    database: &dyn Database, safety: &IncrementalScanSafety,
+) -> db::Result<GenerationCommitOutcome> {
+    if !safety.can_commit_generation() {
+        return Ok(GenerationCommitOutcome::Blocked);
+    }
+    database.commit_scan_generation().await?;
+    Ok(GenerationCommitOutcome::Committed)
+}
+
+async fn report_incremental_scan_failure(
+    safety: &IncrementalScanSafety, broadcaster: &BroadcastForwarder<StorageEntryMessage>, reason: String,
+) {
+    safety.record_failure();
+    error!("{}", reason);
+    broadcaster
+        .broadcast(StorageEntryMessage::Error {
+            event: ErrorEvent::Scan,
+            path: PathBuf::new(),
+            entry: None,
+            reason,
+        })
+        .await;
+}
 
 /// 扫描流水线，封装已初始化的 pipeline 各组件
 struct ScanPipeline {
@@ -194,32 +265,60 @@ async fn setup_scan_pipeline(
     })
 }
 
-/// 关闭流水线，等待所有消费者完成后收尾统计生命周期
-async fn shutdown_pipeline(
-    broadcaster: BroadcastForwarder<StorageEntryMessage>, consumer_handles: Vec<JoinHandle<Result<()>>>,
-    mut consumer_manager: ConsumerManager,
-) -> bool {
-    drop(broadcaster);
+struct DrainedPipeline {
+    all_successful: bool,
+    consumer_manager: ConsumerManager,
+}
 
-    let mut all_successful = true;
+async fn await_consumer_tasks(consumer_handles: Vec<JoinHandle<Result<()>>>) -> Vec<String> {
+    let mut task_failures = Vec::new();
     for (i, handle) in consumer_handles.into_iter().enumerate() {
         match handle.await {
             Ok(Ok(())) => debug!("Consumer task #{} completed successfully", i),
             Ok(Err(e)) => {
                 error!("Consumer task #{} failed: {}", i, e);
-                all_successful = false;
+                task_failures.push(format!("Consumer task #{i} failed: {e}"));
             }
             Err(e) => {
                 error!("Consumer task #{} panicked: {:?}", i, e);
-                all_successful = false;
+                task_failures.push(format!("Consumer task #{i} panicked: {e}"));
             }
         }
     }
+    task_failures
+}
+
+/// 关闭广播并等待所有消费者排空，但暂不结束统计生命周期。
+async fn drain_pipeline(
+    broadcaster: BroadcastForwarder<StorageEntryMessage>, consumer_handles: Vec<JoinHandle<Result<()>>>,
+    consumer_manager: ConsumerManager,
+) -> DrainedPipeline {
+    drop(broadcaster);
+
+    let task_failures = await_consumer_tasks(consumer_handles).await;
+    let all_successful = task_failures.is_empty();
     if !all_successful {
         warn!("Some consumer tasks failed or panicked");
     }
 
-    // 所有 consumer 任务已退出，此时 stats_consumer 不再有并发更新，安全打印合并报告
+    // 所有 consumer 任务已退出，此时可安全补记任务级失败。
+    consumer_manager.record_task_failures(&task_failures).await;
+
+    DrainedPipeline {
+        all_successful,
+        consumer_manager,
+    }
+}
+
+/// 关闭流水线，等待所有消费者完成后收尾统计生命周期。
+async fn shutdown_pipeline(
+    broadcaster: BroadcastForwarder<StorageEntryMessage>, consumer_handles: Vec<JoinHandle<Result<()>>>,
+    consumer_manager: ConsumerManager,
+) -> bool {
+    let DrainedPipeline {
+        all_successful,
+        mut consumer_manager,
+    } = drain_pipeline(broadcaster, consumer_handles, consumer_manager).await;
     consumer_manager.end_lifecycle().await;
 
     all_successful
@@ -367,22 +466,40 @@ async fn run_incremental_scan(
         }
         Err(e) => {
             error!("[DatabaseConsumer] Failed to initialize database: {}", e);
+            shutdown_pipeline(broadcaster, consumer_handles, consumer_manager).await;
             return Err(AppError::DatabaseError(e));
         }
     };
 
     if let Err(e) = database.create_table(INCREMENTAL_SCAN_TABLE_BASE_NAME).await {
+        shutdown_pipeline(broadcaster, consumer_handles, consumer_manager).await;
         return Err(AppError::DatabaseError(e));
     }
 
     let batch_size = consumer_config.db_config.batch_size as usize;
     debug!("Using batch size: {}", batch_size);
 
-    // 切换数据库扫描状态
+    // 从持久 generation 开始本轮工作；working generation 仅保存在共享生命周期中。
     let db_clone = database.clone();
-    if let Err(e) = db_clone.switch_scan_state().await {
-        error!("Failed to switch scan state: {}", e);
-        return Err(AppError::DatabaseError(e));
+    let working_generation = match db_clone.begin_scan_generation().await {
+        Ok(generation) => generation,
+        Err(e) => {
+            error!("Failed to begin scan generation: {}", e);
+            shutdown_pipeline(broadcaster, consumer_handles, consumer_manager).await;
+            return Err(AppError::DatabaseError(e));
+        }
+    };
+    info!(working_generation, "Incremental scan generation begun");
+    let safety = IncrementalScanSafety::new();
+
+    #[cfg(feature = "lab-fault-injection")]
+    if std::env::var_os("TERRASYNC_LAB_INJECT_INCREMENTAL_SCAN_FAILURE_AFTER_BEGIN").is_some() {
+        report_incremental_scan_failure(
+            &safety,
+            &broadcaster,
+            "Lab injected incremental scan failure after generation begin".to_string(),
+        )
+        .await;
     }
 
     // 获取扫描并发度
@@ -400,6 +517,7 @@ async fn run_incremental_scan(
         let database = database.clone();
         let broadcaster = broadcaster.clone();
         let cancel_token = cancel_token.clone();
+        let safety = safety.clone();
 
         let span = info_span!("scan_worker", worker_id = worker_id);
         let handle = tokio::spawn(
@@ -415,6 +533,14 @@ async fn run_incremental_scan(
                             msg = worker_walkdir_iter.next() => msg,
                             () = token.cancelled() => {
                                 info!("Scan worker {}: Cancelled via graceful shutdown", worker_id);
+                                if safety.record_cancellation() {
+                                    broadcaster.broadcast(StorageEntryMessage::Error {
+                                        event: ErrorEvent::Scan,
+                                        path: PathBuf::new(),
+                                        entry: None,
+                                        reason: "Incremental scan cancelled".to_string(),
+                                    }).await;
+                                }
                                 None
                             }
                         }
@@ -436,15 +562,27 @@ async fn run_incremental_scan(
                                 let batch = std::mem::take(&mut current_batch);
                                 let db = database.clone();
                                 let broadcaster = broadcaster.clone();
+                                let safety = safety.clone();
                                 let batch_span = info_span!("batch_process");
                                 let task = tokio::spawn(
                                     async move {
-                                        if let Err(e) =
-                                            batch_processing_to_generate_message(&db, &batch, broadcaster, false, true)
-                                                .await
-                                        {
-                                            error!("Failed to process batch: {}", e);
+                                        let result = batch_processing_to_generate_message(
+                                            &db,
+                                            &batch,
+                                            broadcaster.clone(),
+                                            false,
+                                            true,
+                                        )
+                                        .await;
+                                        if let Err(ref e) = result {
+                                            report_incremental_scan_failure(
+                                                &safety,
+                                                &broadcaster,
+                                                format!("Incremental scan batch failed: {e}"),
+                                            )
+                                            .await;
                                         }
+                                        result
                                     }
                                     .instrument(batch_span),
                                 );
@@ -454,6 +592,7 @@ async fn run_incremental_scan(
                         StorageEntryMessage::Error {
                             ref path, ref reason, ..
                         } => {
+                            safety.record_failure();
                             error!(
                                 "Scan worker {}: Walkdir error for {}: {}",
                                 worker_id,
@@ -470,15 +609,28 @@ async fn run_incremental_scan(
 
                 if !current_batch.is_empty() {
                     let db = database.clone();
-                    if let Err(e) =
-                        batch_processing_to_generate_message(&db, &current_batch, broadcaster, true, true).await
-                    {
-                        error!("Scan worker {}: Failed to process final batch: {}", worker_id, e);
+                    let result =
+                        batch_processing_to_generate_message(&db, &current_batch, broadcaster.clone(), true, true)
+                            .await;
+                    if let Err(e) = result {
+                        report_incremental_scan_failure(
+                            &safety,
+                            &broadcaster,
+                            format!("Scan worker {worker_id}: incremental scan final batch failed: {e}"),
+                        )
+                        .await;
                     }
                 }
 
                 for task in processing_tasks {
-                    let _ = task.await;
+                    if let Err(e) = task.await {
+                        report_incremental_scan_failure(
+                            &safety,
+                            &broadcaster,
+                            format!("Incremental scan batch task failed: {e}"),
+                        )
+                        .await;
+                    }
                 }
 
                 info!("Scan worker {}: Completed processing", worker_id);
@@ -492,37 +644,75 @@ async fn run_incremental_scan(
     // 等待所有工作线程完成
     for handle in worker_handles {
         if let Err(e) = handle.await {
-            error!("Scan worker failed: {:?}", e);
+            report_incremental_scan_failure(&safety, &broadcaster, format!("Incremental scan worker failed: {e}"))
+                .await;
         }
     }
     info!("Scan results processor completed");
 
     // 检测已删除条目并直接广播
-    match db_clone.detect_deleted_items().await {
-        Ok(deletion_iter) => {
-            for status in deletion_iter {
-                match status {
-                    DeletionStatus::Deleted(entry) => {
-                        broadcaster
-                            .broadcast(StorageEntryMessage::Deleted(Arc::new(entry)))
-                            .await;
-                    }
-                    DeletionStatus::Renamed(from, to) => {
-                        broadcaster
-                            .broadcast(StorageEntryMessage::Renamed((Arc::new(*from), Arc::new(*to))))
-                            .await;
+    if safety.can_detect_deletions() {
+        match db_clone.detect_deleted_items().await {
+            Ok(deletion_iter) => {
+                for status in deletion_iter {
+                    match status {
+                        DeletionStatus::Deleted(entry) => {
+                            broadcaster
+                                .broadcast(StorageEntryMessage::Deleted(Arc::new(entry)))
+                                .await;
+                        }
+                        DeletionStatus::Renamed(from, to) => {
+                            broadcaster
+                                .broadcast(StorageEntryMessage::Renamed((Arc::new(*from), Arc::new(*to))))
+                                .await;
+                        }
                     }
                 }
             }
+            Err(e) => {
+                report_incremental_scan_failure(
+                    &safety,
+                    &broadcaster,
+                    format!("Incremental scan deletion detection failed: {e}"),
+                )
+                .await;
+            }
+        }
+        info!("Detect deleted items completed");
+    } else {
+        warn!("Skipping delete/rename detection because the incremental snapshot is incomplete");
+    }
+
+    let DrainedPipeline {
+        all_successful: consumers_successful,
+        mut consumer_manager,
+    } = drain_pipeline(broadcaster, consumer_handles, consumer_manager).await;
+    if !consumers_successful {
+        safety.record_failure();
+    }
+
+    match finalize_scan_generation(db_clone.as_ref(), &safety).await {
+        Ok(GenerationCommitOutcome::Committed) => {
+            consumer_manager.set_generation_committed(true).await;
+            info!(working_generation, "Incremental scan generation committed");
+        }
+        Ok(GenerationCommitOutcome::Blocked) => {
+            consumer_manager.set_generation_committed(false).await;
+            consumer_manager.end_lifecycle().await;
+            return Err(AppError::ScanError(
+                "Incremental scan completed with failures; generation was not committed".to_string(),
+            ));
         }
         Err(e) => {
-            error!("[IncrementalScan] Failed to detect deleted items: {}", e);
+            consumer_manager
+                .record_task_failures(&[format!("Incremental scan generation commit failed: {e}")])
+                .await;
+            consumer_manager.set_generation_committed(false).await;
+            consumer_manager.end_lifecycle().await;
             return Err(AppError::DatabaseError(e));
         }
     }
-    info!("Detect deleted items completed");
-
-    shutdown_pipeline(broadcaster, consumer_handles, consumer_manager).await;
+    consumer_manager.end_lifecycle().await;
 
     info!("Incremental scan job {} completed successfully", job_id);
 
@@ -646,14 +836,15 @@ pub async fn batch_processing_to_generate_message(
     }
 
     // 使用现有的generate_storage_entry_message_events辅助函数生成事件
-    generate_storage_entry_message_events(0, &mut db_mut, broadcaster, is_final_batch, keep_item).await;
+    let generation_result =
+        generate_storage_entry_message_events(0, &mut db_mut, broadcaster, is_final_batch, keep_item).await;
 
     // 清理临时表
     trace!("Dropping temporary table for batch processing");
-    if let Err(e) = db_mut.drop_scan_temporary_table().await {
-        error!("Failed to drop temporary table: {}", e);
-        // 不返回错误，因为主要工作已经完成
-    }
+    let cleanup_result = db_mut.drop_scan_temporary_table().await;
+
+    generation_result?;
+    cleanup_result.map_err(AppError::DatabaseError)?;
 
     Ok(())
 }
@@ -697,7 +888,7 @@ async fn batch_insert_temp_record(
 async fn generate_storage_entry_message_events(
     task_id: usize, database: &mut Box<dyn Database>, broadcaster: BroadcastForwarder<StorageEntryMessage>,
     is_final_batch: bool, keep_item: bool,
-) {
+) -> Result<()> {
     // 根据是否是最后一批数据，设置不同的日志消息
     let batch_type = if is_final_batch { "final batch" } else { "batch" };
 
@@ -705,47 +896,39 @@ async fn generate_storage_entry_message_events(
 
     // 查询新增文件
     trace!("Task {} querying new items for {}", task_id, batch_type);
-    match database.detect_new_items().await {
-        Ok(new_items) => {
-            let items: Vec<EntryEnum> = new_items.collect();
-            if !keep_item {
-                for item in &items {
-                    excluded_paths.push((
-                        item.get_relative_path().to_string_lossy().into_owned(),
-                        item.get_version_id().unwrap_or_default().to_string(),
-                    ));
-                }
-            }
-            for item in items {
-                broadcaster.broadcast(StorageEntryMessage::New(Arc::new(item))).await;
-            }
+    let new_items = database.detect_new_items().await.map_err(AppError::DatabaseError)?;
+    let items: Vec<EntryEnum> = new_items.collect();
+    if !keep_item {
+        for item in &items {
+            excluded_paths.push((
+                item.get_relative_path().to_string_lossy().into_owned(),
+                item.get_version_id().unwrap_or_default().to_string(),
+            ));
         }
-        Err(e) => error!("Task {} failed to query new items: {}", task_id, e),
+    }
+    for item in items {
+        broadcaster.broadcast(StorageEntryMessage::New(Arc::new(item))).await;
     }
 
     // 查询修改文件（区分 Data/Metadata/Both 三种变更）
     trace!("Task {} querying changed items for {}", task_id, batch_type);
-    match database.detect_changed_items().await {
-        Ok(changed_items) => {
-            let items: Vec<(EntryEnum, data_mover::ChangeKind)> = changed_items.collect();
-            if !keep_item {
-                for (item, _) in &items {
-                    excluded_paths.push((
-                        item.get_relative_path().to_string_lossy().into_owned(),
-                        item.get_version_id().unwrap_or_default().to_string(),
-                    ));
-                }
-            }
-            for (item, kind) in items {
-                broadcaster
-                    .broadcast(StorageEntryMessage::Changed {
-                        entry: Arc::new(item),
-                        kind,
-                    })
-                    .await;
-            }
+    let changed_items = database.detect_changed_items().await.map_err(AppError::DatabaseError)?;
+    let items: Vec<(EntryEnum, data_mover::ChangeKind)> = changed_items.collect();
+    if !keep_item {
+        for (item, _) in &items {
+            excluded_paths.push((
+                item.get_relative_path().to_string_lossy().into_owned(),
+                item.get_version_id().unwrap_or_default().to_string(),
+            ));
         }
-        Err(e) => error!("Task {} failed to query changed items: {}", task_id, e),
+    }
+    for (item, kind) in items {
+        broadcaster
+            .broadcast(StorageEntryMessage::Changed {
+                entry: Arc::new(item),
+                kind,
+            })
+            .await;
     }
 
     // 将临时表数据插入到主表（带排除过滤）
@@ -755,7 +938,359 @@ async fn generate_storage_entry_message_events(
         batch_type,
         excluded_paths.len()
     );
-    if let Err(e) = database.insert_temp_to_base_table(&excluded_paths).await {
-        error!("Task {} failed to insert temporary table to base table: {}", task_id, e);
+    database
+        .insert_temp_to_base_table(&excluded_paths)
+        .await
+        .map_err(AppError::DatabaseError)?;
+
+    Ok(())
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use std::path::PathBuf;
+    use std::sync::atomic::AtomicU8;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    use async_trait::async_trait;
+    use data_mover::{ChangeKind, EntryEnum, StorageEntryMessage};
+    use db::error::DatabaseError;
+    use db::traits::{Database, TarManifestRecord};
+    use db::{DeletionStatus, Result as DatabaseResult};
+    use tokio::sync::mpsc;
+
+    use super::{
+        GenerationCommitOutcome, IncrementalScanSafety, await_consumer_tasks, batch_processing_to_generate_message,
+        finalize_scan_generation,
+    };
+    use crate::error::AppError;
+
+    #[derive(Clone, Copy)]
+    enum ScanDatabaseFault {
+        BatchInsertOnce,
+        DetectNew,
+        DetectChanged,
+        Commit,
+    }
+
+    #[derive(Clone)]
+    struct FaultDatabase {
+        fault: ScanDatabaseFault,
+        fired: Arc<AtomicBool>,
+        calls: Arc<Mutex<Vec<&'static str>>>,
+        committed_generation: Arc<AtomicU8>,
+        working_generation: Arc<AtomicU8>,
+    }
+
+    fn fault_database(fault: ScanDatabaseFault) -> Box<dyn Database> {
+        fault_database_with_calls(fault).0
+    }
+
+    fn fault_database_with_calls(fault: ScanDatabaseFault) -> (Box<dyn Database>, Arc<Mutex<Vec<&'static str>>>) {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let database = FaultDatabase {
+            fault,
+            fired: Arc::new(AtomicBool::new(false)),
+            calls: Arc::clone(&calls),
+            committed_generation: Arc::new(AtomicU8::new(0)),
+            working_generation: Arc::new(AtomicU8::new(u8::MAX)),
+        };
+        (Box::new(database), calls)
+    }
+
+    fn dummy_entry(name: &str) -> EntryEnum {
+        EntryEnum::NAS(data_mover::NASEntry {
+            name: name.to_string(),
+            relative_path: PathBuf::from(name),
+            extension: None,
+            is_dir: false,
+            size: 1,
+            atime: 0,
+            ctime: 0,
+            mtime: 0,
+            mode: 0o644,
+            is_symlink: false,
+            hard_links: None,
+            uid: None,
+            gid: None,
+            ino: None,
+            file_handle: None,
+            acl: None,
+            owner: None,
+            owner_group: None,
+            xattrs: None,
+        })
+    }
+
+    impl FaultDatabase {
+        fn record(&self, call: &'static str) {
+            self.calls.lock().unwrap().push(call);
+        }
+
+        fn fires_once(&self, fault: ScanDatabaseFault) -> bool {
+            std::mem::discriminant(&self.fault) == std::mem::discriminant(&fault)
+                && !self.fired.swap(true, Ordering::AcqRel)
+        }
+    }
+
+    #[async_trait]
+    impl Database for FaultDatabase {
+        fn clone_box(&self) -> Box<dyn Database> {
+            Box::new(self.clone())
+        }
+
+        async fn initialize(&self) -> DatabaseResult<()> {
+            Ok(())
+        }
+        async fn ping(&self) -> DatabaseResult<()> {
+            Ok(())
+        }
+        async fn create_table(&self, _table_name: &str) -> DatabaseResult<()> {
+            Ok(())
+        }
+        async fn create_scan_temporary_table(&mut self) -> DatabaseResult<()> {
+            self.record("create_temp");
+            Ok(())
+        }
+        async fn drop_scan_temporary_table(&mut self) -> DatabaseResult<()> {
+            self.record("drop_temp");
+            Ok(())
+        }
+        async fn drop_table_by_name(&self, _table_name: &str) -> DatabaseResult<()> {
+            Ok(())
+        }
+        async fn batch_insert_base_record(&self, _records: &[Arc<EntryEnum>]) -> DatabaseResult<()> {
+            Ok(())
+        }
+        async fn update_base_record(&self, _record: &Arc<EntryEnum>) -> DatabaseResult<()> {
+            Ok(())
+        }
+        async fn batch_delete_base_record(&self, _deleted_paths: &[String]) -> DatabaseResult<()> {
+            Ok(())
+        }
+        async fn batch_insert_temp_record(&self, _records: &[Arc<EntryEnum>]) -> DatabaseResult<()> {
+            self.record("insert_temp");
+            if self.fires_once(ScanDatabaseFault::BatchInsertOnce) {
+                return Err(DatabaseError::QueryError("injected batch insert failure".into()));
+            }
+            Ok(())
+        }
+        async fn batch_insert_incremental_record(&self, _records: &[StorageEntryMessage]) -> DatabaseResult<()> {
+            Ok(())
+        }
+        async fn switch_scan_state(&self) -> DatabaseResult<()> {
+            Ok(())
+        }
+        async fn begin_scan_generation(&self) -> DatabaseResult<u8> {
+            let working = 1 - self.committed_generation.load(Ordering::Acquire);
+            self.working_generation.store(working, Ordering::Release);
+            Ok(working)
+        }
+        async fn commit_scan_generation(&self) -> DatabaseResult<()> {
+            self.record("commit");
+            if matches!(self.fault, ScanDatabaseFault::Commit) {
+                return Err(DatabaseError::QueryError("injected generation commit failure".into()));
+            }
+            let working = self.working_generation.load(Ordering::Acquire);
+            self.committed_generation.store(working, Ordering::Release);
+            Ok(())
+        }
+
+        async fn detect_new_items(&self) -> DatabaseResult<Box<dyn Iterator<Item = EntryEnum> + Send>> {
+            self.record("detect_new");
+            match self.fault {
+                ScanDatabaseFault::DetectNew => Err(DatabaseError::QueryError("injected new detection failure".into())),
+                ScanDatabaseFault::DetectChanged => Ok(Box::new(vec![dummy_entry("new.txt")].into_iter())),
+                ScanDatabaseFault::BatchInsertOnce | ScanDatabaseFault::Commit => Ok(Box::new(std::iter::empty())),
+            }
+        }
+
+        async fn detect_changed_items(
+            &self,
+        ) -> DatabaseResult<Box<dyn Iterator<Item = (EntryEnum, ChangeKind)> + Send>> {
+            self.record("detect_changed");
+            if matches!(self.fault, ScanDatabaseFault::DetectChanged) {
+                return Err(DatabaseError::QueryError("injected changed detection failure".into()));
+            }
+            Ok(Box::new(std::iter::empty()))
+        }
+
+        async fn detect_deleted_items(&self) -> DatabaseResult<Box<dyn Iterator<Item = DeletionStatus> + Send>> {
+            Ok(Box::new(std::iter::empty()))
+        }
+
+        async fn insert_temp_to_base_table(&self, _excluded_paths: &[(String, String)]) -> DatabaseResult<()> {
+            self.record("merge_temp");
+            Ok(())
+        }
+        async fn get_count(&self, _table_name: &str) -> DatabaseResult<u64> {
+            Ok(0)
+        }
+        async fn query_storage_entry(
+            &self, _is_dir: Option<bool>, _is_symlink: Option<bool>, _extension: Option<String>,
+            _tx: mpsc::Sender<EntryEnum>,
+        ) -> DatabaseResult<()> {
+            Ok(())
+        }
+        async fn create_tar_manifest_table(&self) -> DatabaseResult<()> {
+            Ok(())
+        }
+        async fn batch_insert_tar_manifest(&self, _records: &[TarManifestRecord]) -> DatabaseResult<()> {
+            Ok(())
+        }
+        async fn table_exists(&self, _table_name: &str) -> DatabaseResult<bool> {
+            Ok(true)
+        }
+    }
+
+    #[test]
+    fn incremental_scan_failure_closes_delete_and_commit_gates() {
+        let safety = IncrementalScanSafety::new();
+        assert!(safety.can_detect_deletions());
+        assert!(safety.can_commit_generation());
+
+        safety.record_failure();
+
+        assert!(!safety.can_detect_deletions());
+        assert!(!safety.can_commit_generation());
+    }
+
+    #[test]
+    fn incremental_scan_cancellation_is_reported_once_across_workers() {
+        let safety = IncrementalScanSafety::new();
+
+        assert!(safety.record_cancellation());
+        assert!(!safety.record_cancellation());
+        assert!(!safety.can_detect_deletions());
+        assert!(!safety.can_commit_generation());
+    }
+
+    #[tokio::test]
+    async fn new_detection_failure_is_returned_without_emitting_delta_events() {
+        let database = fault_database(ScanDatabaseFault::DetectNew);
+        let mut broadcaster = crate::broadcast::BroadcastForwarder::new(8);
+        let mut events = broadcaster.subscribe();
+
+        let result = batch_processing_to_generate_message(&database, &[], broadcaster, true, true).await;
+
+        assert!(result.is_err());
+        assert!(events.recv().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn failed_batch_does_not_prevent_a_later_batch_from_finishing() {
+        let (database, calls) = fault_database_with_calls(ScanDatabaseFault::BatchInsertOnce);
+        let broadcaster = crate::broadcast::BroadcastForwarder::new(8);
+
+        let first = batch_processing_to_generate_message(&database, &[], broadcaster.clone(), false, true).await;
+        let second = batch_processing_to_generate_message(&database, &[], broadcaster, true, true).await;
+
+        assert!(first.is_err());
+        assert!(second.is_ok());
+        assert_eq!(
+            *calls.lock().unwrap(),
+            vec![
+                "create_temp",
+                "insert_temp",
+                "drop_temp",
+                "create_temp",
+                "insert_temp",
+                "detect_new",
+                "detect_changed",
+                "merge_temp",
+                "drop_temp"
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn changed_detection_failure_preserves_new_output_and_skips_merge() {
+        let (database, calls) = fault_database_with_calls(ScanDatabaseFault::DetectChanged);
+        let mut broadcaster = crate::broadcast::BroadcastForwarder::new(8);
+        let mut events = broadcaster.subscribe();
+
+        let result = batch_processing_to_generate_message(&database, &[], broadcaster, true, true).await;
+        let event = events.recv().await;
+
+        assert!(result.is_err());
+        assert!(matches!(event, Some(StorageEntryMessage::New(_))));
+        assert!(events.recv().await.is_none());
+        assert_eq!(
+            *calls.lock().unwrap(),
+            vec![
+                "create_temp",
+                "insert_temp",
+                "detect_new",
+                "detect_changed",
+                "drop_temp"
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn consumer_failure_and_panic_are_collected_after_all_consumers_finish() {
+        let later_consumer_finished = Arc::new(AtomicBool::new(false));
+        let finished = Arc::clone(&later_consumer_finished);
+        let handles = vec![
+            tokio::spawn(async { Err(AppError::ScanError("injected consumer flush failure".into())) }),
+            tokio::spawn(async { panic!("injected consumer panic") }),
+            tokio::spawn(async move {
+                finished.store(true, Ordering::Release);
+                Ok(())
+            }),
+        ];
+
+        let failures = await_consumer_tasks(handles).await;
+
+        assert!(later_consumer_finished.load(Ordering::Acquire));
+        assert_eq!(failures.len(), 2);
+        assert!(failures[0].contains("flush failure"));
+        assert!(failures[1].contains("panicked"));
+    }
+
+    #[tokio::test]
+    async fn commit_failure_is_distinct_from_a_safety_gate_block() {
+        let database = fault_database(ScanDatabaseFault::Commit);
+        let safe = IncrementalScanSafety::new();
+
+        let commit_error = finalize_scan_generation(database.as_ref(), &safe).await.unwrap_err();
+        assert!(commit_error.to_string().contains("commit failure"));
+
+        let blocked = IncrementalScanSafety::new();
+        blocked.record_failure();
+        let outcome = finalize_scan_generation(database.as_ref(), &blocked).await.unwrap();
+        assert!(matches!(outcome, GenerationCommitOutcome::Blocked));
+    }
+
+    #[tokio::test]
+    async fn cancellation_after_begin_retries_the_same_working_generation() {
+        let database = fault_database(ScanDatabaseFault::BatchInsertOnce);
+        assert_eq!(database.begin_scan_generation().await.unwrap(), 1);
+
+        let safety = IncrementalScanSafety::new();
+        assert!(safety.record_cancellation());
+        assert!(matches!(
+            finalize_scan_generation(database.as_ref(), &safety).await.unwrap(),
+            GenerationCommitOutcome::Blocked
+        ));
+
+        assert_eq!(database.begin_scan_generation().await.unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn successful_finalize_advances_generation_once() {
+        let database = fault_database(ScanDatabaseFault::BatchInsertOnce);
+        assert_eq!(database.begin_scan_generation().await.unwrap(), 1);
+
+        assert!(matches!(
+            finalize_scan_generation(database.as_ref(), &IncrementalScanSafety::new())
+                .await
+                .unwrap(),
+            GenerationCommitOutcome::Committed
+        ));
+
+        assert_eq!(database.begin_scan_generation().await.unwrap(), 0);
     }
 }

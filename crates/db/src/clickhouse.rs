@@ -511,6 +511,26 @@ impl ClickHouseDatabase {
         Ok(())
     }
 
+    /// 将上次未提交的 working 快照重新标记为 committed，作为同 generation 重试的基线。
+    ///
+    /// `ReplacingMergeTree` 可能已合并掉更早的 committed 物理行，不能通过删除 working 行恢复；
+    /// 同步 mutation 原地回标可保留失败轮已安全写入的条目，并让重试正确识别之后的缺失项。
+    async fn rebase_uncommitted_generation(&self, committed: u8, working: u8) -> Result<()> {
+        let base_table_name = get_scan_base_table_name(&self.job_id);
+        if !self.table_exists(&base_table_name).await? {
+            return Ok(());
+        }
+        self.execute(
+            &format!(
+                "ALTER TABLE {base_table_name} UPDATE current_state = ? \
+                 WHERE current_state = ? SETTINGS mutations_sync = 2"
+            ),
+            &[Value::from(committed), Value::from(working)],
+        )
+        .await?;
+        Ok(())
+    }
+
     /// 通用检测方法：对比临时表与主表，按 `query_builder` 构建 SQL 查询符合条件的记录
     async fn detect_items(
         &self, query_type: &str, query_builder: impl Fn(&str, &str, &JoinStrategy) -> String,
@@ -837,6 +857,7 @@ impl Database for ClickHouseDatabase {
             )));
         }
         let working = 1 - committed;
+        self.rebase_uncommitted_generation(committed, working).await?;
         lifecycle.working = Some(working);
         Ok(working)
     }
@@ -971,7 +992,9 @@ impl Database for ClickHouseDatabase {
     async fn detect_deleted_items(&self) -> Result<Box<dyn Iterator<Item = DeletionStatus> + Send>> {
         let base_table_name = get_scan_base_table_name(&self.job_id);
 
-        let current_state = self.query_scan_state().await?.unwrap_or(0);
+        // begin 之后必须使用共享生命周期中的 working generation；持久 state 只有 commit
+        // 成功后才推进，直接读取它会把本轮 working 记录误判为 old-state 并全部删除。
+        let current_state = self.get_cached_scan_state().await?;
         debug!("During detect_deleted_items, current_state is {}", current_state);
 
         // 第一步：查询所有 old-state 记录（LIMIT 1 BY 替代 FINAL）
