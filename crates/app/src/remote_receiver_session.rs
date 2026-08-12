@@ -37,7 +37,9 @@ struct TransferLedger {
 enum ActiveTransfer {
     #[default]
     Idle,
-    Full,
+    Full {
+        ndx: i32,
+    },
     Delta {
         ndx: i32,
     },
@@ -288,17 +290,21 @@ impl RemoteSessionState {
     }
 
     pub(crate) async fn begin_full(&mut self, dc_tx: &Sender<DiskCommitMsg>, ndx: i32, entry: Arc<EntryEnum>) -> bool {
+        if self.ledger.terminated_ndx.contains(&ndx) {
+            debug!("[Receiver Remote] dropping late FileBegin for terminated ndx {}", ndx);
+            return false;
+        }
         if self.active_transfer != ActiveTransfer::Idle {
             warn!("[Receiver Remote] rejecting FileBegin while another transfer is active");
             return false;
         }
-        self.active_transfer = ActiveTransfer::Full;
+        self.active_transfer = ActiveTransfer::Full { ndx };
         let _ = dc_tx.send(DiskCommitMsg::FileBegin { ndx, entry }).await;
         true
     }
 
     async fn push_full_chunk(&self, dc_tx: &Sender<DiskCommitMsg>, entry: Arc<EntryEnum>, chunk: DataChunk) -> bool {
-        if self.active_transfer != ActiveTransfer::Full {
+        if !matches!(self.active_transfer, ActiveTransfer::Full { .. }) {
             warn!("[Receiver Remote] rejecting FileData without an active full transfer");
             return false;
         }
@@ -323,7 +329,9 @@ impl RemoteSessionState {
     pub(crate) async fn commit_full(
         &mut self, dc_tx: &Sender<DiskCommitMsg>, ndx: i32, entry: &Arc<EntryEnum>, source_hash: &Option<String>,
     ) -> bool {
-        if self.active_transfer != ActiveTransfer::Full {
+        if self.ledger.terminated_ndx.contains(&ndx)
+            || !matches!(self.active_transfer, ActiveTransfer::Full { ndx: active_ndx } if active_ndx == ndx)
+        {
             return false;
         }
         self.active_transfer = ActiveTransfer::Idle;
@@ -340,6 +348,10 @@ impl RemoteSessionState {
     /// Lazily starts the delta stream for `ndx`. Repeated events for the same
     /// entry are idempotent; interleaved or full-transfer events are rejected.
     async fn ensure_delta_active(&mut self, dc_tx: &Sender<DiskCommitMsg>, ndx: i32, entry: &Arc<EntryEnum>) -> bool {
+        if self.ledger.terminated_ndx.contains(&ndx) {
+            debug!("[Receiver Remote] dropping late delta event for terminated ndx {}", ndx);
+            return false;
+        }
         match self.active_transfer {
             ActiveTransfer::Idle => {
                 let block_size = sync_delta::calculate_block_size(entry.get_size());
@@ -354,7 +366,7 @@ impl RemoteSessionState {
                 true
             }
             ActiveTransfer::Delta { ndx: active_ndx } if active_ndx == ndx => true,
-            ActiveTransfer::Full => {
+            ActiveTransfer::Full { .. } => {
                 warn!("[Receiver Remote] rejecting delta event while a full transfer is active");
                 false
             }
@@ -436,10 +448,22 @@ impl RemoteSessionState {
     }
 
     pub(crate) async fn handle_source_failure(&mut self, dc_tx: &Sender<DiskCommitMsg>, ndx: Option<i32>) -> bool {
-        self.abort_active_file(dc_tx).await;
         match ndx {
-            Some(ndx) => self.record_terminal(ndx) && self.is_complete(),
-            None => self.complete_unindexed(),
+            Some(ndx) => {
+                let first_terminal = self.record_terminal(ndx);
+                if matches!(
+                    self.active_transfer,
+                    ActiveTransfer::Full { ndx: active_ndx } | ActiveTransfer::Delta { ndx: active_ndx }
+                        if active_ndx == ndx
+                ) {
+                    self.abort_active_file(dc_tx).await;
+                }
+                first_terminal && self.is_complete()
+            }
+            None => {
+                self.abort_active_file(dc_tx).await;
+                self.complete_unindexed()
+            }
         }
     }
 
@@ -1356,6 +1380,32 @@ mod tests {
             Some(ReceiverMsg::Error { ndx: 8, .. })
         ));
         assert!(!state.attempts.contains_key(&8));
+    }
+
+    #[tokio::test]
+    async fn source_failure_before_file_begin_drops_late_data_stream() {
+        let (dc_tx, mut dc_rx) = mpsc::channel(4);
+        let mut state = RemoteSessionState::default();
+        let ndx = 7;
+        state.ledger.record_request();
+
+        // QUIC control stream may deliver EntryError before the data stream's FileBegin.
+        assert!(!state.handle_source_failure(&dc_tx, Some(ndx)).await);
+        assert_eq!(state.counts(), (1, 1));
+        assert!(
+            dc_rx.try_recv().is_err(),
+            "idle source failure must not enqueue a stray abort"
+        );
+
+        let entry = nas_entry("late.bin", PathBuf::from("late.bin"), false);
+        assert!(!state.begin_full(&dc_tx, ndx, entry.clone()).await);
+        assert!(!state.commit_delta(&dc_tx, ndx, &entry, &None).await);
+        assert!(
+            dc_rx.try_recv().is_err(),
+            "late data messages for a terminated ndx must be dropped"
+        );
+
+        assert!(state.observe_transfer_done());
     }
 
     #[tokio::test]
