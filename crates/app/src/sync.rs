@@ -58,9 +58,11 @@ impl StoragePair {
     pub async fn new(src_path: &str, dest_path: &str, block_size: Option<usize>) -> Result<Self> {
         let block_size_u64 = block_size.map(|s| s as u64);
         // 根据传入的src_path创建storage pool
-        let src_storage = Arc::new(create_storage(src_path, block_size_u64, false).await?);
+        let src_storage =
+            Arc::new(create_storage(src_path, data_mover::CreateStorageOptions::new(block_size_u64, false)).await?);
         // 根据传入的dest_path创建storage pool，如果目标目录不存在则自动创建
-        let dest_storage = Arc::new(create_storage(dest_path, block_size_u64, true).await?);
+        let dest_storage =
+            Arc::new(create_storage(dest_path, data_mover::CreateStorageOptions::new(block_size_u64, true)).await?);
         info!("Created source and destination storage, block_size: {:?}", block_size);
 
         Ok(Self {
@@ -241,6 +243,10 @@ pub(crate) async fn process_versioned_entry(
         EntryEnum::S3(s3_entry) => s3_entry.relative_path.clone(),
         EntryEnum::NAS(_) => {
             error!("Expected S3Entry for versioned processing, got {:?}", entry);
+            return;
+        }
+        EntryEnum::HDFS(_) => {
+            error!("Expected S3Entry for versioned processing, got HDFS entry");
             return;
         }
     };
@@ -529,6 +535,29 @@ async fn process_entry_inner(
             .set_entry_metadata(entry)
             .await
             .map_err(|e| AppError::CopyError(format!("Failed to set metadata for {}: {e}", relative_path.display())))?;
+    } else if matches!(dest_storage.as_ref(), StorageEnum::HDFS(_)) {
+        let hdfs = crate::file_copy::HdfsCopyContext::from_job(&resume.job_id, resume.no_resume)?
+            ;
+        let recorder = CommitRecorder::start(&resume.job_dir, entry, src_storage.block_size()).await?;
+        let hdfs = hdfs.with_commit_callback(recorder.callback());
+        let result = crate::file_copy::copy_file(
+            &src_storage,
+            &dest_storage,
+            entry,
+            data_mover::CopyOptions {
+                qos: qos_manager,
+                enable_integrity_check,
+                is_source_reserved,
+                bytes_counter,
+                ..Default::default()
+            },
+            Some(&hdfs),
+        )
+        .await
+        .map(|_| ())
+        .map_err(|e| AppError::CopyError(format!("Failed to copy {}: {e}", relative_path.display())));
+        recorder.finish(result).await?;
+        debug!("Copied file through HDFS recoverable lifecycle {:?}", relative_path);
     } else if should_resume(&resume, entry, &src_storage, &dest_storage) {
         // 多块大文件：字节级断点续传（全量建 .part / 增量续 .part）
         debug!("Copying file (resumable) {:?}", relative_path);
@@ -615,10 +644,176 @@ async fn process_entry_inner(
 /// 字节级断点续传的可调参数（全量/增量两条路径共用）。
 #[derive(Debug, Clone, Default)]
 pub(crate) struct ResumeOpts {
+    /// 持久化任务身份；HDFS 用它绑定跨进程可恢复状态。
+    pub job_id: String,
     /// 任务目录；续传状态存于 `<job_dir>/byte_resume/`。为空则禁用续传。
     pub job_dir: String,
     /// 显式关闭续传（强制整文件拷贝）。
     pub no_resume: bool,
+}
+
+pub(crate) struct CommitRecorder {
+    store: Arc<ByteResumeStore>,
+    callback: data_mover::CommitCallback,
+    drain: tokio::task::JoinHandle<()>,
+    shutdown: tokio::sync::oneshot::Sender<()>,
+    dropped: Arc<AtomicU64>,
+    path: std::path::PathBuf,
+}
+
+impl CommitRecorder {
+    pub(crate) async fn start(job_dir: &str, entry: &EntryEnum, block_size: u64) -> Result<Self> {
+        if job_dir.trim().is_empty() {
+            return Err(AppError::ConfigError(
+                "recoverable copy requires a persistent job directory".to_string(),
+            ));
+        }
+        let path = entry.get_relative_path().to_path_buf();
+        let store = ByteResumeStore::open(job_dir, &path, entry.get_size(), entry.get_mtime(), block_size).await?;
+        const CAPACITY: usize = 65_536;
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<(u64, u64)>(CAPACITY);
+        let store_task = store.clone();
+        let (shutdown, mut shutdown_rx) = tokio::sync::oneshot::channel();
+        let drain = tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = &mut shutdown_rx => {
+                        rx.close();
+                        while let Some((offset, length)) = rx.recv().await {
+                            if let Err(error) = store_task.mark_committed(offset, length).await {
+                                warn!("byte-resume mark_committed failed: {error}");
+                            }
+                        }
+                        break;
+                    }
+                    message = rx.recv() => match message {
+                        Some((offset, length)) => {
+                            if let Err(error) = store_task.mark_committed(offset, length).await {
+                                warn!("byte-resume mark_committed failed: {error}");
+                            }
+                        }
+                        None => break,
+                    }
+                }
+            }
+        });
+        let dropped = Arc::new(AtomicU64::new(0));
+        let callback_dropped = dropped.clone();
+        let callback = Arc::new(move |offset, length| {
+            if tx.try_send((offset, length)).is_err() {
+                callback_dropped.fetch_add(1, Ordering::Relaxed);
+            }
+        });
+        Ok(Self {
+            store,
+            callback,
+            drain,
+            shutdown,
+            dropped,
+            path,
+        })
+    }
+
+    pub(crate) fn callback(&self) -> data_mover::CommitCallback {
+        self.callback.clone()
+    }
+
+    pub(crate) async fn finish(self, result: Result<()>) -> Result<()> {
+        drop(self.callback);
+        let _ = self.shutdown.send(());
+        let _ = self.drain.await;
+        let dropped = self.dropped.load(Ordering::Relaxed);
+        if dropped > 0 {
+            warn!(
+                "byte-resume: {dropped} commit records were dropped for {}; retry remains conservative",
+                self.path.display()
+            );
+        }
+        match result {
+            Ok(()) => self.store.finalize_done().await,
+            Err(error) => {
+                let _ = self.store.flush().await;
+                Err(error)
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::items_after_test_module)]
+mod commit_recorder_tests {
+    use std::path::Path;
+    use std::time::Duration;
+
+    use data_mover::{CreateStorageOptions, create_storage};
+
+    use super::CommitRecorder;
+
+    #[tokio::test]
+    async fn finish_does_not_wait_for_external_callback_clones() {
+        let source_root = tempfile::tempdir().unwrap_or_else(|error| panic!("source tempdir: {error}"));
+        let job_root = tempfile::tempdir().unwrap_or_else(|error| panic!("job tempdir: {error}"));
+        tokio::fs::write(source_root.path().join("payload.bin"), b"payload")
+            .await
+            .unwrap_or_else(|error| panic!("write source: {error}"));
+        let source = create_storage(
+            source_root
+                .path()
+                .to_str()
+                .unwrap_or_else(|| panic!("source path is not UTF-8")),
+            CreateStorageOptions::new(None, false),
+        )
+        .await
+        .unwrap_or_else(|error| panic!("create source storage: {error}"));
+        let entry = source
+            .get_metadata(Path::new("payload.bin"))
+            .await
+            .unwrap_or_else(|error| panic!("source metadata: {error}"));
+        let recorder = CommitRecorder::start(
+            job_root
+                .path()
+                .to_str()
+                .unwrap_or_else(|| panic!("job path is not UTF-8")),
+            &entry,
+            4,
+        )
+        .await
+        .unwrap_or_else(|error| panic!("start recorder: {error}"));
+        let external_callback = recorder.callback();
+        external_callback(0, 4);
+
+        tokio::time::timeout(Duration::from_secs(1), recorder.finish(Ok(())))
+            .await
+            .unwrap_or_else(|error| panic!("finish must use explicit shutdown: {error}"))
+            .unwrap_or_else(|error| panic!("finish recorder: {error}"));
+
+        drop(external_callback);
+    }
+
+    #[tokio::test]
+    async fn start_rejects_missing_persistent_job_directory() {
+        let source_root = tempfile::tempdir().unwrap_or_else(|error| panic!("source tempdir: {error}"));
+        tokio::fs::write(source_root.path().join("payload.bin"), b"payload")
+            .await
+            .unwrap_or_else(|error| panic!("write source: {error}"));
+        let source = create_storage(
+            source_root
+                .path()
+                .to_str()
+                .unwrap_or_else(|| panic!("source path is not UTF-8")),
+            CreateStorageOptions::new(None, false),
+        )
+        .await
+        .unwrap_or_else(|error| panic!("create source storage: {error}"));
+        let entry = source
+            .get_metadata(Path::new("payload.bin"))
+            .await
+            .unwrap_or_else(|error| panic!("source metadata: {error}"));
+
+        assert!(CommitRecorder::start("", &entry, 4).await.is_err());
+        assert!(CommitRecorder::start("   ", &entry, 4).await.is_err());
+    }
 }
 
 /// 该存储是否为 S3。
@@ -659,43 +854,13 @@ pub(crate) async fn copy_file_with_resume(
     is_source_reserved: bool, qos_manager: Option<QosManager>, bytes_counter: Option<Arc<AtomicU64>>, job_dir: &str,
 ) -> Result<()> {
     let dest_rel = entry.get_relative_path();
-    let store = ByteResumeStore::open(
-        job_dir,
-        dest_rel,
-        entry.get_size(),
-        entry.get_mtime(),
-        src_storage.block_size(),
-    )
-    .await?;
-    let missing = store.missing_intervals().await;
-
-    // sync 回调 → async mark_committed 的桥接：有界 channel + 收敛 task。
-    // 消息总数上界 = file_size / block_size，但 block_size 用户可配置且无下限
-    // （极小块 + TB 级文件可产生千万级消息），故用有界 channel 兜底内存。
-    // 满时 try_send 失败直接丢弃该条记录——保守安全：区间未记为已完成，
-    // 中断后续传时重拷该区间，只多传不丢数据。
-    const COMMIT_CHANNEL_CAPACITY: usize = 65536;
-    let (tx, mut rx) = tokio::sync::mpsc::channel::<(u64, u64)>(COMMIT_CHANNEL_CAPACITY);
-    let store_task = store.clone();
-    let drain = tokio::spawn(async move {
-        while let Some((offset, len)) = rx.recv().await {
-            if let Err(e) = store_task.mark_committed(offset, len).await {
-                warn!("byte-resume mark_committed failed: {}", e);
-            }
-        }
-    });
-    let dropped = Arc::new(AtomicU64::new(0));
-    let dropped_cb = dropped.clone();
-    let on_committed: data_mover::CommitCallback = Arc::new(move |offset, len| {
-        if tx.try_send((offset, len)).is_err() {
-            dropped_cb.fetch_add(1, Ordering::Relaxed);
-        }
-    });
+    let recorder = CommitRecorder::start(job_dir, entry, src_storage.block_size()).await?;
+    let missing = recorder.store.missing_intervals().await;
 
     let resume = data_mover::ResumeContext {
         part_relative_path: part_path_for(dest_rel),
         missing_intervals: missing,
-        on_committed,
+        on_committed: recorder.callback(),
     };
 
     let res = StorageEnum::copy_file_resumable(
@@ -713,31 +878,9 @@ pub(crate) async fn copy_file_with_resume(
     )
     .await;
 
-    // copy_file_resumable 返回后 on_committed（持有 tx）已 drop → channel 关闭 → drain 退出
-    let _ = drain.await;
-    let dropped_count = dropped.load(Ordering::Relaxed);
-    if dropped_count > 0 {
-        warn!(
-            "byte-resume: {} 条 commit 记录因 channel 满被丢弃（{}），中断后这些区间将重拷",
-            dropped_count,
-            dest_rel.display()
-        );
-    }
-
-    match res {
-        Ok(()) => {
-            store.finalize_done().await?;
-            Ok(())
-        }
-        Err(e) => {
-            // 中断：持久化已记录进度，保留状态与 .part 供下次续传
-            let _ = store.flush().await;
-            Err(AppError::CopyError(format!(
-                "Resumable copy failed for {}: {e}",
-                dest_rel.display()
-            )))
-        }
-    }
+    let result =
+        res.map_err(|error| AppError::CopyError(format!("Resumable copy failed for {}: {error}", dest_rel.display())));
+    recorder.finish(result).await
 }
 
 /// 处理单个文件或目录的复制

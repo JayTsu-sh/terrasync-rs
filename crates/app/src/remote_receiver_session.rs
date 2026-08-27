@@ -635,7 +635,9 @@ mod tests {
     use async_trait::async_trait;
     use bytes::Bytes;
     use data_mover::dir_tree::{DirPageResult, NdxEntry, NdxEvent};
-    use data_mover::{DataChunk, NASEntry, create_storage};
+    use data_mover::{DataChunk, NASEntry};
+
+    use crate::storage_factory::create_storage;
     use tempfile::tempdir;
     use tokio::sync::{Mutex as TokioMutex, mpsc};
     use transport::error::Result as TransportResult;

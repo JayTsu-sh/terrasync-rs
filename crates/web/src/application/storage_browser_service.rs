@@ -71,7 +71,7 @@ impl StorageBrowserService {
     }
 
     async fn list_remote_dirs(&self, url: &str, path: &str) -> Result<ListDirsResult> {
-        let storage = create_storage(url, None, false).await?;
+        let storage = create_storage(url, data_mover::CreateStorageOptions::new(None, false)).await?;
         let path_str = if path.is_empty() {
             "/".to_string()
         } else {

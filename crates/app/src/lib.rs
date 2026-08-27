@@ -17,6 +17,8 @@ pub mod broadcast;
 /// 提交时读回 hash 校验后原子 rename
 pub mod disk_commit;
 mod file_commit;
+mod file_copy;
+mod storage_factory;
 
 /// 字节级断点续传状态模块
 ///

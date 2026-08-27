@@ -24,7 +24,7 @@ use transport::traits::ReceiverTransport;
 // 内部模块
 use crate::error::{AppError, Result};
 use crate::remote_receiver_session::{RemoteReceiverSession, RemoteSessionState};
-use crate::sync::{ResumeOpts, copy_file_with_resume, parse_size, should_resume};
+use crate::sync::{CommitRecorder, ResumeOpts, copy_file_with_resume, parse_size, should_resume};
 
 // ============================================================
 // Receiver 进度跟踪（原子计数器，支持多 Receiver 聚合）
@@ -79,6 +79,7 @@ impl ReceiverProgress {
 /// Receiver 运行时配置
 #[allow(clippy::struct_excessive_bools)] // 按用途分组的开关集合，重构为枚举会失去可读性
 pub struct ReceiverConfig {
+    pub job_id: String,
     pub enable_integrity_check: bool,
     pub enable_acl: bool,
     pub is_source_reserved: bool,
@@ -214,10 +215,35 @@ pub(crate) async fn process_entry_on_receiver(
             // 全量复制：多块大文件写 .part（建立续传基础，正常结束即 rename；
             // 中断则留 .part + 进度状态供后续增量续传）；小文件/S3 走整文件拷贝。
             let resume = ResumeOpts {
+                job_id: config.job_id.clone(),
                 job_dir: config.job_dir.clone(),
                 no_resume: config.no_resume,
             };
-            if should_resume(&resume, entry, src_storage, dest_storage) {
+            let metadata = if matches!(dest_storage.as_ref(), StorageEnum::HDFS(_)) {
+                let hdfs = crate::file_copy::HdfsCopyContext::from_job(&config.job_id, config.no_resume)?;
+                let recorder = CommitRecorder::start(&config.job_dir, entry, src_storage.block_size()).await?;
+                let hdfs = hdfs.with_commit_callback(recorder.callback());
+                let result = crate::file_copy::copy_file(
+                    src_storage,
+                    dest_storage,
+                    entry,
+                    data_mover::CopyOptions {
+                        qos: qos_manager,
+                        enable_integrity_check: config.enable_integrity_check,
+                        is_source_reserved: config.is_source_reserved,
+                        bytes_counter,
+                        ..Default::default()
+                    },
+                    Some(&hdfs),
+                )
+                .await;
+                let metadata = result
+                    .as_ref()
+                    .copied()
+                    .unwrap_or(crate::file_copy::MetadataApplication::DataMover);
+                recorder.finish(result.map(|_| ())).await?;
+                metadata
+            } else if should_resume(&resume, entry, src_storage, dest_storage) {
                 copy_file_with_resume(
                     entry,
                     src_storage,
@@ -229,8 +255,9 @@ pub(crate) async fn process_entry_on_receiver(
                     &config.job_dir,
                 )
                 .await?;
+                crate::file_copy::MetadataApplication::Caller
             } else {
-                StorageEnum::copy_file(
+                crate::file_copy::copy_file(
                     src_storage,
                     dest_storage,
                     entry,
@@ -241,15 +268,18 @@ pub(crate) async fn process_entry_on_receiver(
                         bytes_counter,
                         ..Default::default()
                     },
+                    None,
                 )
                 .await
-                .map_err(|e| AppError::CopyError(format!("Failed to copy {}: {e}", relative_path.display())))?;
-            }
+                .map_err(|e| AppError::CopyError(format!("Failed to copy {}: {e}", relative_path.display())))?
+            };
 
             // 设置目标文件元数据（mtime/uid/gid/mode 或 S3 mtime/tags）
-            dest_storage.set_entry_metadata(entry).await.map_err(|e| {
-                AppError::CopyError(format!("Failed to set metadata for {}: {e}", relative_path.display()))
-            })?;
+            if metadata == crate::file_copy::MetadataApplication::Caller {
+                dest_storage.set_entry_metadata(entry).await.map_err(|e| {
+                    AppError::CopyError(format!("Failed to set metadata for {}: {e}", relative_path.display()))
+                })?;
+            }
         }
 
         // ACL 复制（目录和文件均需要，symlink 除外）

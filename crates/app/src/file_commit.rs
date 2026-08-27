@@ -470,6 +470,7 @@ fn part_entry_of(entry: &EntryEnum, part_path: &Path) -> EntryEnum {
     match &mut part {
         EntryEnum::NAS(e) => e.relative_path = part_path.to_path_buf(),
         EntryEnum::S3(e) => e.relative_path = part_path.to_string_lossy().into_owned(),
+        EntryEnum::HDFS(e) => e.relative_path = part_path.to_path_buf(),
     }
     part
 }

@@ -19,9 +19,9 @@ use std::sync::Arc;
 #[cfg(test)]
 use std::sync::{Mutex, PoisonError};
 
+use crate::storage_factory::create_storage;
 #[cfg(test)]
 use data_mover::StorageEnum;
-use data_mover::create_storage;
 #[cfg(test)]
 use data_mover::dir_tree::NdxEvent;
 use data_mover::filter::parse_filter_expression;
@@ -240,9 +240,9 @@ mod tests {
     use std::path::PathBuf;
     use std::time::{Duration, SystemTime};
 
+    use crate::storage_factory::create_storage;
     use async_trait::async_trait;
     use data_mover::DataChunk;
-    use data_mover::create_storage;
     use data_mover::dir_tree::DirPageResult;
     use tempfile::tempdir;
     use tokio::task::JoinHandle;
