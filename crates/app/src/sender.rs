@@ -225,7 +225,9 @@ async fn handle_versioned_entry(
 mod tests {
     use std::path::PathBuf;
 
-    use data_mover::{AsyncReceiver, ErrorEvent, create_storage};
+    use data_mover::{AsyncReceiver, ErrorEvent};
+
+    use crate::storage_factory::create_storage;
     use tempfile::tempdir;
     use transport::in_process::create_in_process_pair;
 

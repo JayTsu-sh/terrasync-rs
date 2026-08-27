@@ -123,6 +123,8 @@ fn structured_mismatch_labels(error: &StorageError) -> Option<Vec<String>> {
                     MismatchMetaField::Uid { .. } => "uid",
                     MismatchMetaField::Gid { .. } => "gid",
                     MismatchMetaField::Mode { .. } => "mode",
+                    MismatchMetaField::HdfsOwner { .. } => "hdfs_owner",
+                    MismatchMetaField::HdfsGroup { .. } => "hdfs_group",
                 })
                 .map(str::to_string)
                 .collect(),
@@ -415,20 +417,22 @@ pub async fn integrity_check(
         let span = info_span!("integrity_check_worker", worker_id = worker_id);
         let handle = tokio::spawn(
             async move {
-                let src_storage = match create_storage(&src_path, None, false).await {
-                    Ok(s) => Arc::new(s),
-                    Err(e) => {
-                        error!("Worker {}: Failed to create src storage: {}", worker_id, e);
-                        return;
-                    }
-                };
-                let dest_storage = match create_storage(&dest_path, None, false).await {
-                    Ok(s) => Arc::new(s),
-                    Err(e) => {
-                        error!("Worker {}: Failed to create dest storage: {}", worker_id, e);
-                        return;
-                    }
-                };
+                let src_storage =
+                    match create_storage(&src_path, data_mover::CreateStorageOptions::new(None, false)).await {
+                        Ok(s) => Arc::new(s),
+                        Err(e) => {
+                            error!("Worker {}: Failed to create src storage: {}", worker_id, e);
+                            return;
+                        }
+                    };
+                let dest_storage =
+                    match create_storage(&dest_path, data_mover::CreateStorageOptions::new(None, false)).await {
+                        Ok(s) => Arc::new(s),
+                        Err(e) => {
+                            error!("Worker {}: Failed to create dest storage: {}", worker_id, e);
+                            return;
+                        }
+                    };
                 let ctx = CheckContext {
                     src_storage,
                     dest_storage,

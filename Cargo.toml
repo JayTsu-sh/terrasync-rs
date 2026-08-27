@@ -62,7 +62,7 @@ rustls       = { version = "0.23", default-features = false, features = ["ring",
 reqwest      = { version = "0.13", default-features = false, features = ["rustls", "json"] }
 
 # 外部 fork（跟 main，靠 Cargo.lock 保证可复现）
-data-mover   = { git = "https://github.com/JayTsu-sh/data-mover-rs.git" }
+data-mover   = { git = "https://github.com/JayTsu-sh/data-mover-rs.git", rev = "220110da382ab213c1d5c9c99d98a3d3bafd55bd" }
 
 # 内部 path crate
 app          = { path = "crates/app" }

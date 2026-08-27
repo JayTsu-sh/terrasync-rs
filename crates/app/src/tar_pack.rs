@@ -103,6 +103,16 @@ pub async fn pack_directory(
             is_delete_marker: false,
             version_count: None,
         }),
+        EntryEnum::HDFS(entry) => {
+            let mut tar = entry.clone();
+            tar.name = tar_name;
+            tar.relative_path = tar_relative_path;
+            tar.extension = Some("tar".to_string());
+            tar.is_dir = false;
+            tar.size = tar_size;
+            tar.mtime = dir_mtime;
+            EntryEnum::HDFS(tar)
+        }
     };
 
     // 删除源端目录（如果不保留）

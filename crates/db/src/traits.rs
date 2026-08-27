@@ -107,6 +107,7 @@ impl StorageEntryRecord {
         let storage_type = match entry {
             EntryEnum::NAS(_) => "nas",
             EntryEnum::S3(_) => "s3",
+            EntryEnum::HDFS(_) => "hdfs",
         };
 
         StorageEntryRecord {
@@ -371,6 +372,7 @@ impl IncrementalStorageEntryRecord {
         let storage_type = match entry {
             EntryEnum::NAS(_) => "nas",
             EntryEnum::S3(_) => "s3",
+            EntryEnum::HDFS(_) => "hdfs",
         };
 
         Self {
@@ -440,6 +442,7 @@ impl TarManifestRecord {
         let storage_type = match entry {
             EntryEnum::NAS(_) => "nas",
             EntryEnum::S3(_) => "s3",
+            EntryEnum::HDFS(_) => "hdfs",
         };
         let tags = entry.get_tags().and_then(|tags| serde_json::to_string(tags).ok());
 

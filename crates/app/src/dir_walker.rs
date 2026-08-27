@@ -30,7 +30,7 @@ impl DirectoryWalker {
             info!("Using file list from: {}", file_list_path);
 
             // 创建存储实例
-            let storage = create_storage(&self.config.path, None, false).await?;
+            let storage = create_storage(&self.config.path, data_mover::CreateStorageOptions::new(None, false)).await?;
 
             // 从文件列表创建迭代器
             walkdir_from_file_list(storage, file_list_path)
@@ -47,7 +47,7 @@ impl DirectoryWalker {
                 "Attempting to create storage for directory walk with concurrency: {}, path: {}",
                 self.config.concurrency, self.config.path
             );
-            let storage = create_storage(&self.config.path, None, false)
+            let storage = create_storage(&self.config.path, data_mover::CreateStorageOptions::new(None, false))
                 .await
                 .map_err(|e| AppError::ScanError(format!("Failed to create storage: {e}")))?;
             let walkdir_iter = storage

@@ -58,8 +58,8 @@ use crate::sender::{SenderWorkerConfig, sender_worker};
 #[cfg(windows)]
 use crate::sync::check_admin_privileges;
 use crate::sync::{
-    ResumeOpts, StoragePair, parse_size, process_entry, process_metadata_only_entry, process_rename_entry,
-    process_versioned_entry,
+    CommitRecorder, ResumeOpts, StoragePair, parse_size, process_entry, process_metadata_only_entry,
+    process_rename_entry, process_versioned_entry,
 };
 use crate::{dir_walker, tar_pack};
 
@@ -391,6 +391,7 @@ impl SyncOrchestrator {
         let receiver_transport = Arc::new(receiver_transport);
 
         let receiver_config = Arc::new(ReceiverConfig {
+            job_id: c.job_id.clone(),
             enable_integrity_check: c.enable_integrity_check,
             enable_acl: c.enable_acl,
             is_source_reserved,
@@ -607,8 +608,13 @@ impl SyncOrchestrator {
         consumer_manager.end_lifecycle().await;
 
         // ── 14. 更新目录元数据（非 S3 目标端） ──
-        let dest_storage_for_metadata =
-            Arc::new(create_storage(&c.dest_path, block_size.map(|s| s as u64), false).await?);
+        let dest_storage_for_metadata = Arc::new(
+            create_storage(
+                &c.dest_path,
+                data_mover::CreateStorageOptions::new(block_size.map(|s| s as u64), false),
+            )
+            .await?,
+        );
         if !matches!(dest_storage_for_metadata.as_ref(), StorageEnum::S3(_)) {
             Self::update_directory_metadata(database, &dest_storage_for_metadata).await;
         }
@@ -773,6 +779,7 @@ impl SyncOrchestrator {
             let enable_integrity_check = c.enable_integrity_check;
             let enable_acl = c.enable_acl;
             let resume_opts = ResumeOpts {
+                job_id: c.job_id.clone(),
                 job_dir: c.job_dir.clone(),
                 no_resume: c.no_resume,
             };
@@ -1156,9 +1163,20 @@ impl SyncOrchestrator {
 
         // dest storage 提升到 async 块外，供后续 update_directory_metadata 复用，避免二次挂载
         let phase_b_dest_storage: Result<Arc<StorageEnum>> = async {
-            let dest_storage_phase_b =
-                Arc::new(create_storage(&c.dest_path, block_size.map(|s| s as u64), false).await?);
-            let src_storage_phase_b = Arc::new(create_storage(&c.src_path, block_size.map(|s| s as u64), false).await?);
+            let dest_storage_phase_b = Arc::new(
+                create_storage(
+                    &c.dest_path,
+                    data_mover::CreateStorageOptions::new(block_size.map(|s| s as u64), false),
+                )
+                .await?,
+            );
+            let src_storage_phase_b = Arc::new(
+                create_storage(
+                    &c.src_path,
+                    data_mover::CreateStorageOptions::new(block_size.map(|s| s as u64), false),
+                )
+                .await?,
+            );
 
             Self::apply_deletions_and_renames(
                 &*db_clone,
@@ -1169,6 +1187,9 @@ impl SyncOrchestrator {
                 c.enable_integrity_check,
                 qos_manager.clone(),
                 bytes_tracker.clone(),
+                &c.job_id,
+                &c.job_dir,
+                c.no_resume,
             )
             .await;
 
@@ -1275,11 +1296,40 @@ impl SyncOrchestrator {
     #[allow(clippy::too_many_arguments)]
     async fn sync_renamed_file_changes(
         kind: ChangeKind, entry: &EntryEnum, src: &StorageEnum, dest: &StorageEnum, qos: Option<QosManager>,
-        integrity: bool, source_reserved: bool, bytes: Option<Arc<AtomicU64>>,
+        integrity: bool, source_reserved: bool, bytes: Option<Arc<AtomicU64>>, job_id: &str, job_dir: &str,
+        no_resume: bool,
     ) -> bool {
+        let mut metadata_applied = false;
         if kind != ChangeKind::MetadataOnly {
             // 内容变更：完整拷贝文件再设置元数据
-            match StorageEnum::copy_file(
+            let hdfs = if matches!(dest, StorageEnum::HDFS(_)) {
+                match crate::file_copy::HdfsCopyContext::from_job(job_id, no_resume) {
+                    Ok(context) => Some(context),
+                    Err(error) => {
+                        warn!("Phase B: invalid HDFS recovery identity: {error}");
+                        return false;
+                    }
+                }
+            } else {
+                None
+            };
+            let recorder = if hdfs.is_some() {
+                match CommitRecorder::start(job_dir, entry, src.block_size()).await {
+                    Ok(recorder) => Some(recorder),
+                    Err(error) => {
+                        warn!("Phase B: cannot start HDFS progress recorder: {error}");
+                        return false;
+                    }
+                }
+            } else {
+                None
+            };
+            let hdfs = hdfs.map(|context| {
+                recorder.as_ref().map_or(context.clone(), |recorder| {
+                    context.with_commit_callback(recorder.callback())
+                })
+            });
+            let copy_result = crate::file_copy::copy_file(
                 src,
                 dest,
                 entry,
@@ -1290,10 +1340,21 @@ impl SyncOrchestrator {
                     bytes_counter: bytes,
                     ..Default::default()
                 },
+                hdfs.as_ref(),
             )
-            .await
-            {
-                Ok(()) => {}
+            .await;
+            let copy_result = if let Some(recorder) = recorder {
+                let metadata = copy_result.as_ref().ok().copied();
+                match recorder.finish(copy_result.map(|_| ())).await {
+                    Ok(()) => Ok(metadata.unwrap_or(crate::file_copy::MetadataApplication::DataMover)),
+                    Err(error) => Err(error),
+                }
+            } else {
+                copy_result
+            };
+            match copy_result {
+                Ok(crate::file_copy::MetadataApplication::DataMover) => metadata_applied = true,
+                Ok(crate::file_copy::MetadataApplication::Caller) => {}
                 Err(e) => {
                     warn!(
                         "Phase B: renamed+data-changed content copy failed for {:?}: {}",
@@ -1305,7 +1366,7 @@ impl SyncOrchestrator {
             }
         }
         // 元数据同步（DataOnly 拷贝后也需要同步 mode/uid/gid/mtime）
-        if let Err(e) = dest.set_entry_metadata(entry).await {
+        if !metadata_applied && let Err(e) = dest.set_entry_metadata(entry).await {
             warn!(
                 "Phase B: renamed+changed metadata sync failed for {:?}: {}",
                 entry.get_relative_path(),
@@ -1338,7 +1399,8 @@ impl SyncOrchestrator {
     async fn apply_deletions_and_renames(
         db: &dyn Database, src_storage: Arc<StorageEnum>, dest_storage: Arc<StorageEnum>, is_source_reserved: bool,
         broadcaster: &BroadcastForwarder<StorageEntryMessage>, enable_integrity_check: bool,
-        qos_manager: Option<QosManager>, bytes_counter: Option<Arc<AtomicU64>>,
+        qos_manager: Option<QosManager>, bytes_counter: Option<Arc<AtomicU64>>, job_id: &str, job_dir: &str,
+        no_resume: bool,
     ) {
         let deletion_iter = match db.detect_deleted_items().await {
             Ok(iter) => iter,
@@ -1439,6 +1501,9 @@ impl SyncOrchestrator {
                                     enable_integrity_check,
                                     is_source_reserved,
                                     bytes_counter.clone(),
+                                    job_id,
+                                    job_dir,
+                                    no_resume,
                                 )
                                 .await
                             {

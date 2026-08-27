@@ -367,7 +367,7 @@ pub async fn serve_cmd(listen: &str, dest_path: &str, tls_cert_out: &str, token:
         .map_err(|e| CliError::InvalidParameter(format!("Invalid listen address: {e}")))?;
 
     // 3. 创建目标端 StorageEnum
-    let dest_storage = Arc::new(create_storage(dest_path, None, true).await?);
+    let dest_storage = Arc::new(create_storage(dest_path, data_mover::CreateStorageOptions::new(None, true)).await?);
     info!("Created destination storage for: {}", redact_storage_url(dest_path));
 
     // 4. bind QUIC endpoint，生成服务端证书 DER（不等待连接）

@@ -17,7 +17,12 @@ use transport::message::{DcAck, DiskCommitMsg, FileOutcome, ReceiverMsg, Session
 
 // 在 dir 上建一个 Local StorageEnum（不写任何数据文件）。
 async fn local_storage(dir: &std::path::Path) -> Arc<StorageEnum> {
-    let storage = create_storage(&dir.to_string_lossy(), None, false).await.unwrap();
+    let storage = create_storage(
+        &dir.to_string_lossy(),
+        data_mover::CreateStorageOptions::new(None, false),
+    )
+    .await
+    .unwrap();
     Arc::new(storage)
 }
 
