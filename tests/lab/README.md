@@ -8,6 +8,8 @@ The lab is shared by `nfs-rs`, `data-mover-rs`, and `terrasync-rs`.
 | Source | 10.131.9.12 | 10.10.1.12 | NFSv3, NFSv4.1, RustFS |
 | Destination | 10.131.9.13 | 10.10.1.13 | NFSv3, NFSv4.1, RustFS |
 | Worker | 10.131.9.14 | 10.10.1.14 | RustFS, fault injection |
+| HDFS NameNodes | 10.131.9.30, 10.131.9.33 | - | HDFS HA, Kerberos |
+| HDFS DataNodes | 10.131.9.31, 10.131.9.32 | - | HDFS data plane |
 
 Every run must call `prepare-run.sh` with a unique `nightly-*` or `release-*`
 identifier and call `cleanup-run.sh` from an `always()` step.
@@ -31,6 +33,18 @@ SHA-256, and independently runs quick and full integrity checks. It also covers
 same-backend incremental synchronization and the local filter contract. The
 nightly workflow separately runs the real two-process QUIC tests. Each run uses
 an isolated ClickHouse database that is created and dropped for every run.
+
+`run-hdfs-e2e.sh` certifies the pinned `data-mover` revision against the HA,
+Kerberos-protected HDFS cluster. The runner provides `LAB_HDFS_LOCATION`,
+`LAB_HDFS_ADMIN_USER`, `LAB_HDFS_CONFIG_DIR`, and `LAB_HDFS_KEYTAB`. It covers
+HDFS-to-HDFS copy and full integrity in both single-process and separate QUIC
+sender/receiver modes. The sender receives source credentials only and the
+receiver destination credentials only. Missing source configuration and an
+invalid keytab are negative gates, including a secret-leak assertion. All HDFS
+paths, ClickHouse databases, copied keytabs, credential caches, and generated
+0600 configs are scoped to the run id and removed by the exit trap. The JSON
+artifact follows `tests/lab/evidence-matrix.json` and records both exact commit
+identities.
 
 The current lab has no SMB/CIFS endpoint. CIFS remains covered by unit and
 integration tests, but is intentionally not claimed as a nightly physical-lab

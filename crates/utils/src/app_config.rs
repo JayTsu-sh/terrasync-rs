@@ -7,8 +7,9 @@
 //! 4. 配置验证
 
 // 标准库
+use std::collections::HashMap;
 use std::fmt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{OnceLock, RwLock};
 
 // 外部crate
@@ -153,6 +154,103 @@ pub struct LicenseConfig {
     pub path: String,
 }
 
+#[derive(Clone, Default, Serialize, Deserialize)]
+pub struct HdfsKerberosConfig {
+    #[serde(default)]
+    pub principal: Option<String>,
+    #[serde(default)]
+    pub keytab: Option<PathBuf>,
+    #[serde(default)]
+    pub cache: Option<String>,
+}
+
+impl fmt::Debug for HdfsKerberosConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("HdfsKerberosConfig")
+            .field("principal", &self.principal)
+            .field("keytab", &self.keytab.as_ref().map(|_| "<redacted>"))
+            .field("cache", &self.cache.as_ref().map(|_| "<redacted>"))
+            .finish()
+    }
+}
+
+#[derive(Clone, Default, Serialize, Deserialize)]
+pub struct HdfsClientConfig {
+    #[serde(default)]
+    pub config_dir: Option<PathBuf>,
+    #[serde(default)]
+    pub overrides: HashMap<String, String>,
+    #[serde(default)]
+    pub kerberos: Option<HdfsKerberosConfig>,
+}
+
+impl fmt::Debug for HdfsClientConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let override_keys = self.overrides.keys().collect::<Vec<_>>();
+        f.debug_struct("HdfsClientConfig")
+            .field("config_dir", &self.config_dir)
+            .field("override_keys", &override_keys)
+            .field("kerberos", &self.kerberos)
+            .finish()
+    }
+}
+
+impl HdfsClientConfig {
+    fn validate(&self, field: &str) -> Result<()> {
+        if self.config_dir.as_ref().is_some_and(|path| path.as_os_str().is_empty()) {
+            return Err(UtilsError::ConfigConversionError(format!(
+                "{field}.config_dir 不能为空"
+            )));
+        }
+        if self
+            .overrides
+            .iter()
+            .any(|(key, value)| key.trim().is_empty() || value.trim().is_empty())
+        {
+            return Err(UtilsError::ConfigConversionError(format!(
+                "{field}.overrides 不能包含空键或空值"
+            )));
+        }
+        if let Some(kerberos) = &self.kerberos {
+            if kerberos.principal.as_ref().is_some_and(|value| value.trim().is_empty()) {
+                return Err(UtilsError::ConfigConversionError(format!(
+                    "{field}.kerberos.principal 不能为空"
+                )));
+            }
+            if kerberos.keytab.as_ref().is_some_and(|path| path.as_os_str().is_empty()) {
+                return Err(UtilsError::ConfigConversionError(format!(
+                    "{field}.kerberos.keytab 不能为空"
+                )));
+            }
+            if kerberos.cache.as_ref().is_some_and(|value| value.trim().is_empty()) {
+                return Err(UtilsError::ConfigConversionError(format!(
+                    "{field}.kerberos.cache 不能为空"
+                )));
+            }
+            if kerberos.keytab.is_none() && kerberos.cache.is_none() {
+                return Err(UtilsError::ConfigConversionError(format!(
+                    "{field}.kerberos 必须配置 keytab 或 cache"
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct StorageRoleConfig {
+    #[serde(default)]
+    pub hdfs: Option<HdfsClientConfig>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct StorageConfig {
+    #[serde(default)]
+    pub source: StorageRoleConfig,
+    #[serde(default)]
+    pub destination: StorageRoleConfig,
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct AppConfig {
     pub log: LogConfig,
@@ -165,6 +263,8 @@ pub struct AppConfig {
     pub delete: DeleteConfig,
     #[serde(default = "default_license_config")]
     pub license: LicenseConfig,
+    #[serde(default)]
+    pub storage: StorageConfig,
 }
 
 fn default_license_config() -> LicenseConfig {
@@ -276,6 +376,13 @@ impl AppConfig {
             return Err(UtilsError::ConfigConversionError("log.max_size 必须 > 0".to_string()));
         }
 
+        if let Some(hdfs) = &self.storage.source.hdfs {
+            hdfs.validate("storage.source.hdfs")?;
+        }
+        if let Some(hdfs) = &self.storage.destination.hdfs {
+            hdfs.validate("storage.destination.hdfs")?;
+        }
+
         Ok(())
     }
 }
@@ -299,6 +406,7 @@ impl TryFrom<Config> for AppConfig {
             license: config
                 .get::<LicenseConfig>("license")
                 .unwrap_or_else(|_| default_license_config()),
+            storage: config.get::<StorageConfig>("storage").unwrap_or_default(),
         };
 
         // 解密ClickHouse密码
@@ -311,8 +419,78 @@ impl TryFrom<Config> for AppConfig {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    const BASE_CONFIG: &str = r#"
+[log]
+max_size = 10
+max_backups = 2
+level = "info"
+
+[scan]
+concurrency = 4
+include_tags = false
+
+[sync]
+is_source_reserved = true
+concurrency = 4
+
+[database]
+enabled = false
+type = "clickhouse"
+batch_size = 100
+
+[database.clickhouse]
+dsn = "http://localhost:8123"
+dial_timeout = 10
+read_timeout = 30
+database = "default"
+username = "default"
+"#;
+
+    #[test]
+    fn storage_hdfs_config_is_role_scoped_and_redacted() {
+        let source_secret = "/secrets/source.keytab";
+        let destination_secret = "FILE:/secrets/destination.ccache";
+        let contents = format!(
+            "{BASE_CONFIG}\n[storage.source.hdfs]\nconfig_dir = \"/etc/hadoop/source\"\n\
+             [storage.source.hdfs.kerberos]\nkeytab = \"{source_secret}\"\n\
+             [storage.destination.hdfs]\nconfig_dir = \"/etc/hadoop/destination\"\n\
+             [storage.destination.hdfs.kerberos]\ncache = \"{destination_secret}\"\n"
+        );
+        let raw = Config::builder()
+            .add_source(File::from_str(&contents, FileFormat::Toml))
+            .build()
+            .unwrap();
+        let config = AppConfig::try_from(raw).unwrap();
+
+        assert_eq!(
+            config.storage.source.hdfs.as_ref().unwrap().config_dir.as_deref(),
+            Some(Path::new("/etc/hadoop/source"))
+        );
+        assert_eq!(
+            config.storage.destination.hdfs.as_ref().unwrap().config_dir.as_deref(),
+            Some(Path::new("/etc/hadoop/destination"))
+        );
+        let debug = format!("{:?}", config.storage);
+        assert!(!debug.contains(source_secret));
+        assert!(!debug.contains(destination_secret));
+        assert!(debug.contains("<redacted>"));
+    }
+
+    #[test]
+    fn storage_config_defaults_to_no_backend_credentials() {
+        let raw = Config::builder()
+            .add_source(File::from_str(BASE_CONFIG, FileFormat::Toml))
+            .build()
+            .unwrap();
+        let config = AppConfig::try_from(raw).unwrap();
+
+        assert!(config.storage.source.hdfs.is_none());
+        assert!(config.storage.destination.hdfs.is_none());
+    }
 
     #[test]
     fn clickhouse_debug_redacts_password() {
@@ -330,5 +508,40 @@ mod tests {
         assert!(debug.contains("[REDACTED]"));
         assert!(!debug.contains("decrypted-secret"));
         assert!(!debug.contains("dsn-secret"));
+    }
+
+    #[test]
+    fn hdfs_kerberos_requires_a_non_empty_credential_source() {
+        let contents =
+            format!("{BASE_CONFIG}\n[storage.source.hdfs.kerberos]\nprincipal = \"hdfs/user@EXAMPLE.COM\"\n");
+        let raw = Config::builder()
+            .add_source(File::from_str(&contents, FileFormat::Toml))
+            .build()
+            .unwrap();
+        let config = AppConfig::try_from(raw).unwrap();
+
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("storage.source.hdfs.kerberos"));
+        assert!(!error.contains("hdfs/user@EXAMPLE.COM"));
+    }
+
+    #[test]
+    fn hdfs_validation_never_echoes_secret_values() {
+        let secret_keytab = "/private/a-very-secret.keytab";
+        let contents = format!(
+            "{BASE_CONFIG}\n[storage.destination.hdfs]\nconfig_dir = \"/etc/hadoop\"\n\
+             [storage.destination.hdfs.overrides]\nfs_defaultFS = \"secret-namenode.internal\"\n\
+             [storage.destination.hdfs.kerberos]\nprincipal = \"\"\nkeytab = \"{secret_keytab}\"\n"
+        );
+        let raw = Config::builder()
+            .add_source(File::from_str(&contents, FileFormat::Toml))
+            .build()
+            .unwrap();
+        let config = AppConfig::try_from(raw).unwrap();
+
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("storage.destination.hdfs.kerberos.principal"));
+        assert!(!error.contains(secret_keytab));
+        assert!(!error.contains("secret-namenode.internal"));
     }
 }

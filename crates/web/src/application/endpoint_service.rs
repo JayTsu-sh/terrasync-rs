@@ -2,6 +2,8 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
+use app::storage_factory::{StorageRole, create_storage_for_role};
+
 use crate::domain::endpoint::{Endpoint, EndpointConfig, EndpointType};
 use crate::domain::repository::{EndpointRepository, TaskRepository};
 use crate::domain::task::TaskStatus;
@@ -167,13 +169,13 @@ impl EndpointService {
     async fn test_endpoint_connectivity(endpoint: &Endpoint) -> Result<String> {
         let url = endpoint.to_storage_url(None);
 
-        let storage = data_mover::create_storage(&url, data_mover::CreateStorageOptions::new(None, false))
+        let storage = create_storage_for_role(&url, None, false, StorageRole::Source)
             .await
-            .map_err(|e| WebError::ConnectionTestFailed(e.to_string()))?;
+            .map_err(WebError::EndpointAppConnectionFailed)?;
         storage
             .check_connectivity()
             .await
-            .map_err(|e| WebError::ConnectionTestFailed(e.to_string()))?;
+            .map_err(WebError::EndpointStorageConnectionFailed)?;
 
         Ok("Connection successful".to_string())
     }

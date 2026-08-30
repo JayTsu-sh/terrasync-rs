@@ -19,7 +19,7 @@ use std::sync::Arc;
 #[cfg(test)]
 use std::sync::{Mutex, PoisonError};
 
-use crate::storage_factory::create_storage;
+use crate::storage_factory::{StorageRole, create_storage_for_role};
 #[cfg(test)]
 use data_mover::StorageEnum;
 #[cfg(test)]
@@ -110,7 +110,15 @@ pub(crate) async fn run(
         Some(s) => Some(parse_size(s)?),
         None => None,
     };
-    let src_storage = Arc::new(create_storage(&config.src_path, block_size.map(|s| s as u64), false).await?);
+    let src_storage = Arc::new(
+        create_storage_for_role(
+            &config.src_path,
+            block_size.map(|s| s as u64),
+            false,
+            StorageRole::Source,
+        )
+        .await?,
+    );
     let match_expr = config.r#match.as_deref().and_then(|e| parse_filter_expression(e).ok());
     let exclude_expr = config.exclude.as_deref().and_then(|e| parse_filter_expression(e).ok());
     let app_config = AppConfig::fetch()?;
@@ -240,7 +248,7 @@ mod tests {
     use std::path::PathBuf;
     use std::time::{Duration, SystemTime};
 
-    use crate::storage_factory::create_storage;
+    use crate::storage_factory::{StorageRole, create_storage_for_role};
     use async_trait::async_trait;
     use data_mover::DataChunk;
     use data_mover::dir_tree::DirPageResult;
@@ -252,6 +260,15 @@ mod tests {
     use transport::traits::ReceiverTransport;
 
     use super::*;
+
+    async fn create_storage(path: &str, block_size: Option<u64>, ensure_dir: bool) -> Result<StorageEnum> {
+        let role = if ensure_dir {
+            StorageRole::Destination
+        } else {
+            StorageRole::Source
+        };
+        create_storage_for_role(path, block_size, ensure_dir, role).await
+    }
     use crate::consumer::stats::{JobSummary, ProgressDetail, ProgressReport};
     use crate::receiver::receiver_task_remote;
 

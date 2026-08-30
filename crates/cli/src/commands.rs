@@ -17,7 +17,8 @@ use std::sync::Arc;
 use app::config::SyncJobConfig;
 use app::orchestrator::SyncOrchestrator;
 use app::prelude::{integrity_check, parse_bandwidth_string, rm, scan, sync};
-use data_mover::{create_storage, redact_storage_url};
+use app::storage_factory::{StorageRole, create_storage_for_role};
+use data_mover::redact_storage_url;
 use tracing::info;
 use transport::quic;
 use utils::app_config::AppConfig;
@@ -367,7 +368,7 @@ pub async fn serve_cmd(listen: &str, dest_path: &str, tls_cert_out: &str, token:
         .map_err(|e| CliError::InvalidParameter(format!("Invalid listen address: {e}")))?;
 
     // 3. 创建目标端 StorageEnum
-    let dest_storage = Arc::new(create_storage(dest_path, data_mover::CreateStorageOptions::new(None, true)).await?);
+    let dest_storage = Arc::new(create_storage_for_role(dest_path, None, true, StorageRole::Destination).await?);
     info!("Created destination storage for: {}", redact_storage_url(dest_path));
 
     // 4. bind QUIC endpoint，生成服务端证书 DER（不等待连接）

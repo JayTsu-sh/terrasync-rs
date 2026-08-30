@@ -227,11 +227,17 @@ mod tests {
 
     use data_mover::{AsyncReceiver, ErrorEvent};
 
-    use crate::storage_factory::create_storage;
+    use crate::storage_factory::{StorageRole, create_storage_for_role};
     use tempfile::tempdir;
     use transport::in_process::create_in_process_pair;
 
     use super::*;
+
+    async fn create_storage(
+        path: &str, block_size: Option<u64>, _ensure_dir: bool,
+    ) -> crate::error::Result<StorageEnum> {
+        create_storage_for_role(path, block_size, false, StorageRole::Source).await
+    }
 
     /// 全量模式 walkdir 扫描错误应与增量分支（`orchestrator.rs` 的 scan worker）对齐：
     /// 广播给 `broadcaster` 订阅者，计入 `ErrorStats.scan`、进 ERROR STATISTICS 报表

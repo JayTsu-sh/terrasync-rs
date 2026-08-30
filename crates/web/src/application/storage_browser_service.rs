@@ -1,6 +1,7 @@
 use std::path::{Path, PathBuf};
 
-use data_mover::{NFSStorage, S3BucketInfo, S3Storage, StorageEntryMessage, create_storage};
+use app::storage_factory::{StorageRole, create_storage_for_role};
+use data_mover::{NFSStorage, S3BucketInfo, S3Storage, StorageEntryMessage};
 
 use crate::error::Result;
 
@@ -71,7 +72,7 @@ impl StorageBrowserService {
     }
 
     async fn list_remote_dirs(&self, url: &str, path: &str) -> Result<ListDirsResult> {
-        let storage = create_storage(url, data_mover::CreateStorageOptions::new(None, false)).await?;
+        let storage = create_storage_for_role(url, None, false, StorageRole::Source).await?;
         let path_str = if path.is_empty() {
             "/".to_string()
         } else {

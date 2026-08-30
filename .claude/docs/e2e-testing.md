@@ -9,6 +9,8 @@ Nightly 包含：
 - 每个方向的 SHA-256、quick integrity 和 full integrity 验证
 - 各后端增量同步和本地过滤场景
 - 独立的双进程 QUIC E2E
+- HDFS HA + Kerberos 单进程/双进程拷贝与 full integrity
+- HDFS 缺失配置、无效凭据及错误信息不泄密负例
 - 每次运行独立的 ClickHouse 数据库及自动清理
 
 手动执行应通过 GitHub Actions 的 `workflow_dispatch` 触发。实验室拓扑、

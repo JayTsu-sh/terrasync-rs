@@ -21,7 +21,7 @@ use std::time::Duration;
 use data_mover::error::StorageError;
 use data_mover::{
     EntryEnum, IntegrityCheck, IntegrityCheckMode, IntegrityCheckOptions, MismatchDataField, MismatchMetaField,
-    MtimePrecision, StorageEntryMessage, StorageEnum, create_storage, redact_storage_url,
+    MtimePrecision, StorageEntryMessage, StorageEnum, redact_storage_url,
 };
 use tracing::{Instrument, debug, error, info, info_span, instrument, warn};
 
@@ -31,6 +31,7 @@ use crate::consumer::ConsumerManager;
 use crate::dir_walker;
 use crate::error::{AppError, Result};
 use crate::scan::ScanType;
+use crate::storage_factory::{StorageRole, create_storage_for_role};
 
 // ─────────────────────────────────────────────────
 // Integrity Check 数据模型
@@ -417,16 +418,15 @@ pub async fn integrity_check(
         let span = info_span!("integrity_check_worker", worker_id = worker_id);
         let handle = tokio::spawn(
             async move {
-                let src_storage =
-                    match create_storage(&src_path, data_mover::CreateStorageOptions::new(None, false)).await {
-                        Ok(s) => Arc::new(s),
-                        Err(e) => {
-                            error!("Worker {}: Failed to create src storage: {}", worker_id, e);
-                            return;
-                        }
-                    };
+                let src_storage = match create_storage_for_role(&src_path, None, false, StorageRole::Source).await {
+                    Ok(s) => Arc::new(s),
+                    Err(e) => {
+                        error!("Worker {}: Failed to create src storage: {}", worker_id, e);
+                        return;
+                    }
+                };
                 let dest_storage =
-                    match create_storage(&dest_path, data_mover::CreateStorageOptions::new(None, false)).await {
+                    match create_storage_for_role(&dest_path, None, false, StorageRole::Destination).await {
                         Ok(s) => Arc::new(s),
                         Err(e) => {
                             error!("Worker {}: Failed to create dest storage: {}", worker_id, e);
@@ -553,7 +553,7 @@ pub(crate) async fn verify_storage_time(dest_path: &str) -> Result<()> {
         None => return Ok(()),
     };
 
-    let dest_storage = match create_storage(dest_path, None, false).await {
+    let dest_storage = match create_storage_for_role(dest_path, None, false, StorageRole::Destination).await {
         Ok(s) => s,
         Err(e) => {
             warn!("Storage time check: failed to create storage: {}", e);

@@ -13,6 +13,10 @@ LAB_WORKER_DATA="${LAB_WORKER_DATA:-10.10.1.14}"
 LAB_NFS3_EXPORT="${LAB_NFS3_EXPORT:-/srv/nfs/v3}"
 LAB_NFS41_EXPORT="${LAB_NFS41_EXPORT:-/srv/nfs/v4}"
 LAB_S3_BUCKET="${LAB_S3_BUCKET:-terrasync-ci}"
+LAB_HDFS_LOCATION="${LAB_HDFS_LOCATION:-hdfs://root@10.131.9.30:9000/}"
+LAB_HDFS_ADMIN_USER="${LAB_HDFS_ADMIN_USER:-hdfs/hdfs-namenode@HDFS.LOCAL}"
+LAB_HDFS_CONFIG_DIR="${LAB_HDFS_CONFIG_DIR:-}"
+LAB_HDFS_KEYTAB="${LAB_HDFS_KEYTAB:-}"
 LAB_CLICKHOUSE_DSN="${LAB_CLICKHOUSE_DSN:-http://10.131.9.11:8123}"
 LAB_CLICKHOUSE_USER="${LAB_CLICKHOUSE_USER:-default}"
 LAB_CLICKHOUSE_PASSWORD="${LAB_CLICKHOUSE_PASSWORD:-}"
@@ -40,6 +44,36 @@ clickhouse_database_name() {
 require_s3_credentials() {
   : "${LAB_S3_ACCESS_KEY:?LAB_S3_ACCESS_KEY is required}"
   : "${LAB_S3_SECRET_KEY:?LAB_S3_SECRET_KEY is required}"
+}
+
+require_hdfs_credentials() {
+  : "${LAB_HDFS_CONFIG_DIR:?LAB_HDFS_CONFIG_DIR is required}"
+  : "${LAB_HDFS_KEYTAB:?LAB_HDFS_KEYTAB is required}"
+  [[ -r "$LAB_HDFS_CONFIG_DIR/core-site.xml" && -r "$LAB_HDFS_CONFIG_DIR/hdfs-site.xml" ]] || {
+    echo "LAB_HDFS_CONFIG_DIR must contain readable core-site.xml and hdfs-site.xml" >&2
+    return 2
+  }
+  [[ -r "$LAB_HDFS_KEYTAB" ]] || {
+    echo "LAB_HDFS_KEYTAB is not readable" >&2
+    return 2
+  }
+}
+
+hdfs_run_root() {
+  local run_id="$1"
+  validate_run_id "$run_id"
+  python3 - "$LAB_HDFS_LOCATION" "$LAB_HDFS_ADMIN_USER" "$run_id" <<'PY'
+import sys
+import urllib.parse
+
+location, admin_user, run_id = sys.argv[1:]
+parsed = urllib.parse.urlsplit(location)
+if parsed.scheme != "hdfs" or parsed.password is not None or parsed.hostname is None:
+    raise SystemExit("LAB_HDFS_LOCATION must be a password-free HDFS URL")
+user = urllib.parse.quote(admin_user, safe="")
+authority = parsed.hostname if parsed.port is None else f"{parsed.hostname}:{parsed.port}"
+print(f"hdfs://{user}@{authority}/tmp/terrasync-nightly/{run_id}/hdfs")
+PY
 }
 
 ssh_lab() {

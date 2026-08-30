@@ -637,7 +637,7 @@ mod tests {
     use data_mover::dir_tree::{DirPageResult, NdxEntry, NdxEvent};
     use data_mover::{DataChunk, NASEntry};
 
-    use crate::storage_factory::create_storage;
+    use crate::storage_factory::{StorageRole, create_storage_for_role};
     use tempfile::tempdir;
     use tokio::sync::{Mutex as TokioMutex, mpsc};
     use transport::error::Result as TransportResult;
@@ -646,6 +646,15 @@ mod tests {
     use transport::traits::{ReceiverTransport, SenderTransport};
 
     use super::*;
+
+    async fn create_storage(path: &str, block_size: Option<u64>, ensure_dir: bool) -> Result<StorageEnum> {
+        let role = if ensure_dir {
+            StorageRole::Destination
+        } else {
+            StorageRole::Source
+        };
+        create_storage_for_role(path, block_size, ensure_dir, role).await
+    }
 
     struct RecordingReceiverTransport {
         incoming: TokioMutex<mpsc::Receiver<SenderMsg>>,

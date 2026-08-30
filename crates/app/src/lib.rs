@@ -18,7 +18,7 @@ pub mod broadcast;
 pub mod disk_commit;
 mod file_commit;
 mod file_copy;
-mod storage_factory;
+pub mod storage_factory;
 
 /// 字节级断点续传状态模块
 ///

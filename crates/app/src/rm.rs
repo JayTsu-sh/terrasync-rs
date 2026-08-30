@@ -6,10 +6,11 @@
 use std::time::Duration;
 
 // 外部crate
-use data_mover::create_storage;
 use indicatif::{ProgressBar, ProgressStyle};
 use tracing::info;
 use utils::prelude::AppConfig;
+
+use crate::storage_factory::{StorageRole, create_storage_for_role};
 
 // 内部模块
 use crate::error::Result;
@@ -20,7 +21,7 @@ pub async fn rm(path: &str) -> Result<()> {
 
     info!("开始删除路径: {}", path);
 
-    let storage = create_storage(path, data_mover::CreateStorageOptions::new(None, false)).await?;
+    let storage = create_storage_for_role(path, None, false, StorageRole::Destination).await?;
 
     let pb = ProgressBar::new_spinner();
     pb.set_style(

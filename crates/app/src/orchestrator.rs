@@ -32,7 +32,7 @@ use data_mover::error::StorageError;
 use data_mover::qos::QosManager;
 #[cfg(windows)]
 use data_mover::storage_enum::{StorageType, detect_storage_type};
-use data_mover::{ChangeKind, EntryEnum, ErrorEvent, StorageEntryMessage, StorageEnum, create_storage};
+use data_mover::{ChangeKind, EntryEnum, ErrorEvent, StorageEntryMessage, StorageEnum};
 use db::factory::DatabaseFactory;
 use db::traits::Database;
 use db::{self, DeletionStatus, INCREMENTAL_SCAN_TABLE_BASE_NAME};
@@ -55,6 +55,7 @@ use crate::integrity_check::verify_storage_time;
 use crate::receiver::{ReceiverConfig, process_entry_on_receiver};
 use crate::scan::{ScanType, batch_processing_to_generate_message, determine_scan_type};
 use crate::sender::{SenderWorkerConfig, sender_worker};
+use crate::storage_factory::{StorageRole, create_storage_for_role};
 #[cfg(windows)]
 use crate::sync::check_admin_privileges;
 use crate::sync::{
@@ -609,9 +610,11 @@ impl SyncOrchestrator {
 
         // ── 14. 更新目录元数据（非 S3 目标端） ──
         let dest_storage_for_metadata = Arc::new(
-            create_storage(
+            create_storage_for_role(
                 &c.dest_path,
-                data_mover::CreateStorageOptions::new(block_size.map(|s| s as u64), false),
+                block_size.map(|s| s as u64),
+                false,
+                StorageRole::Destination,
             )
             .await?,
         );
@@ -1164,18 +1167,16 @@ impl SyncOrchestrator {
         // dest storage 提升到 async 块外，供后续 update_directory_metadata 复用，避免二次挂载
         let phase_b_dest_storage: Result<Arc<StorageEnum>> = async {
             let dest_storage_phase_b = Arc::new(
-                create_storage(
+                create_storage_for_role(
                     &c.dest_path,
-                    data_mover::CreateStorageOptions::new(block_size.map(|s| s as u64), false),
+                    block_size.map(|s| s as u64),
+                    false,
+                    StorageRole::Destination,
                 )
                 .await?,
             );
             let src_storage_phase_b = Arc::new(
-                create_storage(
-                    &c.src_path,
-                    data_mover::CreateStorageOptions::new(block_size.map(|s| s as u64), false),
-                )
-                .await?,
+                create_storage_for_role(&c.src_path, block_size.map(|s| s as u64), false, StorageRole::Source).await?,
             );
 
             Self::apply_deletions_and_renames(

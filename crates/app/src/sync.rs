@@ -14,7 +14,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 // 外部crate
 use dashmap::DashMap;
 use data_mover::qos::QosManager;
-use data_mover::{EntryEnum, ErrorEvent, StorageEntryMessage, StorageEnum, create_storage, redact_storage_url};
+use data_mover::{EntryEnum, ErrorEvent, StorageEntryMessage, StorageEnum, redact_storage_url};
 use tracing::{Instrument, debug, error, info, info_span, instrument, trace, warn};
 #[cfg(windows)]
 use windows_sys::Win32::Foundation::CloseHandle;
@@ -29,6 +29,7 @@ use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken}
 use crate::broadcast::BroadcastForwarder;
 use crate::byte_resume::{ByteResumeStore, part_path_for};
 use crate::error::{AppError, Result};
+use crate::storage_factory::{StorageRole, create_storage_for_role};
 
 /// 存储资源管理器 - 统一管理源和目标存储实例
 ///
@@ -59,10 +60,10 @@ impl StoragePair {
         let block_size_u64 = block_size.map(|s| s as u64);
         // 根据传入的src_path创建storage pool
         let src_storage =
-            Arc::new(create_storage(src_path, data_mover::CreateStorageOptions::new(block_size_u64, false)).await?);
+            Arc::new(create_storage_for_role(src_path, block_size_u64, false, StorageRole::Source).await?);
         // 根据传入的dest_path创建storage pool，如果目标目录不存在则自动创建
         let dest_storage =
-            Arc::new(create_storage(dest_path, data_mover::CreateStorageOptions::new(block_size_u64, true)).await?);
+            Arc::new(create_storage_for_role(dest_path, block_size_u64, true, StorageRole::Destination).await?);
         info!("Created source and destination storage, block_size: {:?}", block_size);
 
         Ok(Self {

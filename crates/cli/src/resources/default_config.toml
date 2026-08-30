@@ -28,6 +28,14 @@ mtime_tolerance_ms = 0      # Additional allowed timestamp difference in millise
 # Delete operation configuration
 concurrency = 8            # Concurrency level for delete operations (default: 8)
 
+# HDFS client state is role-scoped. Add `[storage.source.hdfs]` and/or
+# `[storage.destination.hdfs]` only when an hdfs:// location is used.
+# config_dir = "/etc/hadoop/conf"
+# [storage.source.hdfs.kerberos]
+# principal = "hdfs/user@REALM"
+# keytab = "/run/secrets/source.keytab"
+# cache = "FILE:/run/terrasync/source.ccache"
+
 [database]
 # Database integration configuration
 enabled = true           # Enable Database integration (default: true)

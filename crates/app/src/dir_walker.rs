@@ -3,7 +3,7 @@ use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
 
-use data_mover::storage_enum::{StorageEnum, create_storage};
+use data_mover::storage_enum::StorageEnum;
 use data_mover::{ErrorEvent, StorageEntryMessage, WalkDirAsyncIterator};
 // 外部crate
 use tracing::{Instrument, error, info, info_span};
@@ -11,6 +11,7 @@ use tracing::{Instrument, error, info, info_span};
 // 内部模块
 use crate::config::ScanConfig;
 use crate::error::{AppError, Result};
+use crate::storage_factory::{StorageRole, create_storage_for_role};
 
 /// 目录遍历器 - 提供通用的目录遍历功能
 pub struct DirectoryWalker {
@@ -30,7 +31,7 @@ impl DirectoryWalker {
             info!("Using file list from: {}", file_list_path);
 
             // 创建存储实例
-            let storage = create_storage(&self.config.path, data_mover::CreateStorageOptions::new(None, false)).await?;
+            let storage = create_storage_for_role(&self.config.path, None, false, StorageRole::Source).await?;
 
             // 从文件列表创建迭代器
             walkdir_from_file_list(storage, file_list_path)
@@ -47,7 +48,7 @@ impl DirectoryWalker {
                 "Attempting to create storage for directory walk with concurrency: {}, path: {}",
                 self.config.concurrency, self.config.path
             );
-            let storage = create_storage(&self.config.path, data_mover::CreateStorageOptions::new(None, false))
+            let storage = create_storage_for_role(&self.config.path, None, false, StorageRole::Source)
                 .await
                 .map_err(|e| AppError::ScanError(format!("Failed to create storage: {e}")))?;
             let walkdir_iter = storage
