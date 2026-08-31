@@ -10,6 +10,21 @@ use thiserror::Error;
 /// 应用程序的专用错误枚举
 #[derive(Error, Debug)]
 pub enum AppError {
+    /// 中立 traversal 的 session/runtime 终态失败。
+    #[error("Traversal terminal failure: {0}")]
+    TraversalTerminal(#[from] data_mover::traversal::TraversalTerminalFailure),
+
+    /// traversal 有 entry 级失败，因此快照不完整。
+    #[error("Observation scan incomplete after {entry_failures} entry failures")]
+    ObservationScanIncomplete { entry_failures: u64 },
+
+    /// traversal completion evidence 与实际投影条目数不一致。
+    #[error("Observation scan count mismatch: projected {projected}, traversal reported {reported}")]
+    ObservationScanCountMismatch { projected: u64, reported: u64 },
+
+    /// traversal 在完整证据前被取消。
+    #[error("Observation scan cancelled")]
+    ObservationScanCancelled,
     /// 存储错误
     #[error("{0}")]
     StorageError(#[from] data_mover::error::StorageError),

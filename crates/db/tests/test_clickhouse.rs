@@ -247,6 +247,8 @@ mod clickhouse_integration_tests {
     async fn observation_snapshot_round_trips_through_the_single_scan_table() {
         let (mut db, _, _, database) = setup_isolated_state_db("observation_snapshot").await;
         db.create_scan_base_table().await.unwrap();
+        db.create_scan_state_table().await.unwrap();
+        db.insert_scan_state(0).await.unwrap();
         let backend = BackendIdentity::new(BackendKind::Local, "clickhouse-fixture").unwrap();
         let source = SourceIdentity::new(backend, IdentityStrength::PathScoped, b"nested/file").unwrap();
         let entry = ObservedEntry::new(
@@ -265,7 +267,7 @@ mod clickhouse_integration_tests {
 
         assert_eq!(stored, entry);
 
-        db.create_scan_temporary_table().await.unwrap();
+        db.begin_observation_snapshot().await.unwrap();
         let changed_backend = BackendIdentity::new(BackendKind::Local, "clickhouse-fixture").unwrap();
         let changed_source =
             SourceIdentity::new(changed_backend, IdentityStrength::PathScoped, b"nested/file").unwrap();
@@ -282,7 +284,15 @@ mod clickhouse_integration_tests {
             .await
             .unwrap();
 
-        assert_eq!(db.detect_changed_observations().await.unwrap(), vec![changed]);
+        assert_eq!(db.detect_changed_observations().await.unwrap(), vec![changed.clone()]);
+        assert_eq!(db.publish_observation_snapshot().await.unwrap(), 0);
+        assert_eq!(db.query_scan_state().await.unwrap(), Some(1));
+        assert_eq!(db.load_observation(&record.identity_key).await.unwrap(), Some(changed));
+
+        db.begin_observation_snapshot().await.unwrap();
+        assert_eq!(db.publish_observation_snapshot().await.unwrap(), 1);
+        assert_eq!(db.query_scan_state().await.unwrap(), Some(0));
+        assert_eq!(db.load_observation(&record.identity_key).await.unwrap(), None);
         database.cleanup().await;
     }
 

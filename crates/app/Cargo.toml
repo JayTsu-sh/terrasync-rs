@@ -38,6 +38,7 @@ utils         = { workspace = true }
 workspace = true
 
 [dev-dependencies]
+clickhouse = "0.14.2"
 serial_test = "3.4.0"
 tempfile = "3"
 

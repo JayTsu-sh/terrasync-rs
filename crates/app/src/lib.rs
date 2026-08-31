@@ -35,6 +35,7 @@ pub mod config;
 /// 负责管理不同类型的消费者，如存储条目消费者和统计消费者
 pub mod consumer;
 
+pub mod observation_scan;
 /// Sync 编排器模块
 ///
 /// SyncOrchestrator 封装 sync/incremental_sync 的核心逻辑

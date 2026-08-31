@@ -56,6 +56,7 @@ pub struct ClickHouseDatabase {
 struct ScanGenerationLifecycle {
     working: Option<u8>,
     committed: bool,
+    observation_publication_ambiguous: bool,
 }
 
 #[derive(Clone, Eq, Hash, PartialEq)]
@@ -398,6 +399,116 @@ impl ClickHouseDatabase {
             .into_iter()
             .map(|record| record.reconstruct())
             .collect()
+    }
+
+    /// 创建与 base 表结构完全一致的 observation snapshot staging 表。
+    ///
+    /// # Errors
+    /// base 表不存在或 `ClickHouse` 拒绝建表时返回数据库错误。
+    pub async fn begin_observation_snapshot(&mut self) -> Result<u8> {
+        if self.generation_lifecycle.lock().await.observation_publication_ambiguous {
+            return Err(DatabaseError::TransactionError(
+                "cannot begin observation snapshot while a previous EXCHANGE outcome is ambiguous".to_string(),
+            ));
+        }
+        if self.scan_temp_table_name.is_some() {
+            self.drop_scan_temporary_table().await?;
+        }
+        let generation = Database::begin_scan_generation(self).await?;
+        let temp = generate_scan_temp_table_name();
+        let base = get_scan_base_table_name(&self.job_id);
+        if let Err(error) = self.execute(&format!("CREATE TABLE {temp} AS {base}"), &[]).await {
+            *self.generation_lifecycle.lock().await = ScanGenerationLifecycle::default();
+            return Err(error);
+        }
+        self.scan_temp_table_name = Some(temp);
+        Ok(generation)
+    }
+
+    /// 原子交换完整 observation snapshot，并返回消失 identity 的数量。
+    ///
+    /// # Errors
+    /// staging 不存在、计数、交换或旧 snapshot 清理失败时返回数据库错误。
+    pub async fn publish_observation_snapshot(&mut self) -> Result<u64> {
+        let temp = self
+            .scan_temp_table_name
+            .clone()
+            .ok_or_else(|| DatabaseError::TableNotFound("observation snapshot staging".to_string()))?;
+        let base = get_scan_base_table_name(&self.job_id);
+        let deleted = match self
+            .sync_client
+            .query(&format!(
+                "SELECT count() FROM {base} WHERE identity_key != '' AND identity_key NOT IN \
+                 (SELECT identity_key FROM {temp})"
+            ))
+            .fetch_one::<u64>()
+            .await
+            .map_err(DatabaseError::ClickHouseError)
+        {
+            Ok(deleted) => deleted,
+            Err(error) => {
+                self.abort_observation_snapshot().await?;
+                return Err(error);
+            }
+        };
+        if let Err(error) = self.execute(&format!("EXCHANGE TABLES {base} AND {temp}"), &[]).await {
+            self.generation_lifecycle.lock().await.observation_publication_ambiguous = true;
+            return Err(DatabaseError::TransactionError(format!(
+                "observation snapshot EXCHANGE outcome is ambiguous: {error}"
+            )));
+        }
+        if let Err(commit_error) = Database::commit_scan_generation(self).await {
+            let working = self.generation_lifecycle.lock().await.working.ok_or_else(|| {
+                DatabaseError::TransactionError("observation publication lost its working generation".to_string())
+            })?;
+            match self.query_scan_state().await {
+                Ok(Some(persisted)) if persisted == working => {
+                    self.cached_scan_state.store(working, Ordering::Relaxed);
+                    self.generation_lifecycle.lock().await.committed = true;
+                    warn!("Recovered an ambiguous generation commit from persisted state: {commit_error}");
+                }
+                Ok(Some(_)) => {
+                    if let Err(rollback_error) = self.execute(&format!("EXCHANGE TABLES {base} AND {temp}"), &[]).await
+                    {
+                        self.generation_lifecycle.lock().await.observation_publication_ambiguous = true;
+                        return Err(DatabaseError::TransactionError(format!(
+                            "generation commit failed ({commit_error}); snapshot rollback also failed ({rollback_error})"
+                        )));
+                    }
+                    *self.generation_lifecycle.lock().await = ScanGenerationLifecycle::default();
+                    if let Err(error) = self.drop_scan_temporary_table().await {
+                        warn!("Rolled back observation publication but deferred staging cleanup for {temp}: {error}");
+                    }
+                    return Err(commit_error);
+                }
+                Ok(None) | Err(_) => {
+                    self.generation_lifecycle.lock().await.observation_publication_ambiguous = true;
+                    return Err(DatabaseError::TransactionError(format!(
+                        "generation commit outcome is ambiguous after snapshot exchange: {commit_error}"
+                    )));
+                }
+            }
+        }
+        if let Err(error) = self.execute(&format!("DROP TABLE {temp}"), &[]).await {
+            warn!("Committed observation snapshot but deferred retired table cleanup for {temp}: {error}");
+        } else {
+            self.scan_temp_table_name = None;
+        }
+        Ok(deleted)
+    }
+
+    /// 丢弃未完成的 observation snapshot staging。
+    ///
+    /// # Errors
+    /// `ClickHouse` 拒绝清理时返回数据库错误。
+    pub async fn abort_observation_snapshot(&mut self) -> Result<()> {
+        if self.generation_lifecycle.lock().await.observation_publication_ambiguous {
+            return Err(DatabaseError::TransactionError(
+                "refusing to delete observation rollback table while EXCHANGE outcome is ambiguous".to_string(),
+            ));
+        }
+        *self.generation_lifecycle.lock().await = ScanGenerationLifecycle::default();
+        Database::drop_scan_temporary_table(self).await
     }
 
     /// 按持久 identity key 读取并仅通过 opaque codec 重建 observation。
@@ -872,6 +983,11 @@ impl Database for ClickHouseDatabase {
 
     /// 删除扫描临时表并清空 `scan_temp_table_name`
     async fn drop_scan_temporary_table(&mut self) -> Result<()> {
+        if self.generation_lifecycle.lock().await.observation_publication_ambiguous {
+            return Err(DatabaseError::TransactionError(
+                "refusing to drop scan temporary table while EXCHANGE outcome is ambiguous".to_string(),
+            ));
+        }
         if let Some(temp_table_name) = &self.scan_temp_table_name {
             let drop_table_sql = format!("DROP TABLE IF EXISTS {temp_table_name}");
 
@@ -942,6 +1058,11 @@ impl Database for ClickHouseDatabase {
 
     async fn begin_scan_generation(&self) -> Result<u8> {
         let mut lifecycle = self.generation_lifecycle.lock().await;
+        if lifecycle.observation_publication_ambiguous {
+            return Err(DatabaseError::TransactionError(
+                "cannot begin scan generation while observation EXCHANGE outcome is ambiguous".to_string(),
+            ));
+        }
         *lifecycle = ScanGenerationLifecycle::default();
         let committed = self.query_scan_state().await?.ok_or_else(|| {
             DatabaseError::TransactionError("Cannot begin scan generation before initialization".to_string())
@@ -1691,5 +1812,43 @@ mod tests {
         assert!(join_clause.contains("GROUP BY relative_path"));
         assert!(select_expr.contains("CASE WHEN"));
         assert!(select_expr.contains("COALESCE"));
+    }
+
+    #[tokio::test]
+    async fn ambiguous_exchange_blocks_begin_and_destructive_abort() {
+        let config = ClickHouseConfig {
+            dsn: "http://127.0.0.1:1".to_string(),
+            dial_timeout: 1,
+            read_timeout: 1,
+            database: "default".to_string(),
+            username: "default".to_string(),
+            password: None,
+        };
+        let mut database = ClickHouseDatabase::new(&config, "ambiguous_exchange");
+        let mut second_handle = ClickHouseDatabase::new(&config, "ambiguous_exchange");
+        database.scan_temp_table_name = Some("rollback_table".to_string());
+        database
+            .generation_lifecycle
+            .lock()
+            .await
+            .observation_publication_ambiguous = true;
+
+        assert!(matches!(
+            database.begin_observation_snapshot().await,
+            Err(DatabaseError::TransactionError(_))
+        ));
+        assert!(matches!(
+            database.abort_observation_snapshot().await,
+            Err(DatabaseError::TransactionError(_))
+        ));
+        assert_eq!(database.scan_temp_table_name.as_deref(), Some("rollback_table"));
+        assert!(matches!(
+            second_handle.begin_observation_snapshot().await,
+            Err(DatabaseError::TransactionError(_))
+        ));
+        assert!(matches!(
+            Database::drop_scan_temporary_table(&mut second_handle).await,
+            Err(DatabaseError::TransactionError(_))
+        ));
     }
 }

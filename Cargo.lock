@@ -129,7 +129,7 @@ version = "1.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "40c48f72fd53cd289104fc64099abca73db4166ad86ea0b4341abe65af83dadc"
 dependencies = [
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -159,6 +159,7 @@ dependencies = [
  "blake3",
  "bytes 1.12.1",
  "chrono",
+ "clickhouse",
  "dashmap",
  "data-mover",
  "db",
@@ -1758,7 +1759,7 @@ checksum = "4583a4551df46e2792f82ceeac45e850d2e2d5debba0b91f102385cda5b11f06"
 [[package]]
 name = "data-mover"
 version = "0.2.0"
-source = "git+https://github.com/JayTsu-sh/data-mover-rs.git?rev=d3670a899b65f6e1ada435ae1b1f3e2d4d40e7d1#d3670a899b65f6e1ada435ae1b1f3e2d4d40e7d1"
+source = "git+https://github.com/JayTsu-sh/data-mover-rs.git?rev=7c75796d26e1d221999640e6ed51a0be4c53d6c9#7c75796d26e1d221999640e6ed51a0be4c53d6c9"
 dependencies = [
  "arc-swap",
  "async-channel",
