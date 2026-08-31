@@ -5,25 +5,59 @@
 
 use std::collections::HashMap;
 use std::env;
-use std::error::Error;
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
 
 use app::local_transfer::{LocalTransferConfig, LocalTransferSink, run_local_transfer};
 use async_trait::async_trait;
 use data_mover::HdfsConfig;
+use data_mover::error::StorageError;
 use data_mover::model::{
-    BackendIdentity, BackendKind, EntryKind, IdentityStrength, ObservedEntry, SourceIdentity, StoragePath,
+    BackendIdentity, BackendKind, EntryKind, IdentityStrength, ModelValueError, ObservedEntry, SourceIdentity,
+    StoragePath,
 };
 use data_mover::storage::{
-    BackendConfig, CifsBackendConfig, ExistingDestinationPolicy, HdfsBackendConfig, LocalBackendConfig,
-    NfsBackendConfig, S3BackendConfig, connect_backend,
+    BackendConfig, BackendConnectError, CifsBackendConfig, ExistingDestinationPolicy, HdfsBackendConfig,
+    LocalBackendConfig, NfsBackendConfig, S3BackendConfig, connect_backend,
 };
-use data_mover::transfer::{InflightLimits, RecoveryPolicy, TransferFailure, TransferOutcome};
+use data_mover::transfer::{InflightLimits, RecoveryPolicy, TransferFailure, TransferOutcome, TransferValueError};
 use data_mover::traversal::{TraversalCompletion, TraversalItem, TraversalOutcome, TraversalSession};
+use thiserror::Error;
 use tokio_util::sync::CancellationToken;
 
 const PAYLOAD: &str = "payload.bin";
+
+#[derive(Debug, Error)]
+enum MatrixError {
+    #[error("matrix environment variable {name} must not be blank")]
+    MissingConfiguration { name: &'static str },
+    #[error("matrix endpoint role must be source or destination")]
+    UnknownEndpointRole,
+    #[error("matrix profile is not one of the supported lab profiles")]
+    UnknownProfile,
+    #[error(
+        "usage: single_process_matrix SOURCE_PROFILE SOURCE_ROLE SOURCE_ROOT DESTINATION_PROFILE DESTINATION_ROLE DESTINATION_ROOT JOB_ID"
+    )]
+    Usage,
+    #[error("matrix transfer did not complete exactly one file without failures")]
+    TransferFailed,
+    #[error("non-zero matrix transfer limit is required")]
+    InvalidLimit,
+    #[error(transparent)]
+    Environment(#[from] env::VarError),
+    #[error(transparent)]
+    Model(#[from] ModelValueError),
+    #[error(transparent)]
+    Storage(#[from] StorageError),
+    #[error(transparent)]
+    BackendConnect(#[from] BackendConnectError),
+    #[error(transparent)]
+    TransferValue(#[from] TransferValueError),
+    #[error(transparent)]
+    Application(#[from] app::error::AppError),
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
+}
 
 struct Sink {
     failures: usize,
@@ -42,41 +76,41 @@ impl LocalTransferSink for Sink {
     }
 }
 
-fn required(name: &str) -> Result<String, Box<dyn Error>> {
+fn required(name: &'static str) -> Result<String, MatrixError> {
     let value = env::var(name)?;
     if value.trim().is_empty() {
-        return Err(format!("{name} must not be blank").into());
+        return Err(MatrixError::MissingConfiguration { name });
     }
     Ok(value)
 }
 
-fn role_host(role: &str) -> Result<String, Box<dyn Error>> {
+fn role_host(role: &str) -> Result<String, MatrixError> {
     match role {
         "source" => required("LAB_SOURCE_DATA"),
         "destination" => required("LAB_DEST_DATA"),
-        _ => Err(format!("unknown endpoint role: {role}").into()),
+        _ => Err(MatrixError::UnknownEndpointRole),
     }
 }
 
-fn profile_kind(profile: &str) -> Result<BackendKind, Box<dyn Error>> {
+fn profile_kind(profile: &str) -> Result<BackendKind, MatrixError> {
     match profile {
         "local" => Ok(BackendKind::Local),
         "nfs3" | "nfs40" | "nfs41" => Ok(BackendKind::Nfs),
         "cifs_fas2750" => Ok(BackendKind::Cifs),
         "s3_standard" | "s3_dxn" => Ok(BackendKind::S3),
         "hdfs" => Ok(BackendKind::Hdfs),
-        _ => Err(format!("unknown profile: {profile}").into()),
+        _ => Err(MatrixError::UnknownProfile),
     }
 }
 
-fn identity(profile: &str, role: &str, root: &str) -> Result<BackendIdentity, Box<dyn Error>> {
+fn identity(profile: &str, role: &str, root: &str) -> Result<BackendIdentity, MatrixError> {
     Ok(BackendIdentity::new(
         profile_kind(profile)?,
         format!("lab/{profile}/{role}/{root}"),
     )?)
 }
 
-fn hdfs_client(role: &str) -> Result<HdfsConfig, Box<dyn Error>> {
+fn hdfs_client(role: &str) -> Result<HdfsConfig, MatrixError> {
     let config_dir = env::var("LAB_HDFS_CONFIG_DIR")
         .ok()
         .filter(|value| !value.is_empty())
@@ -86,7 +120,7 @@ fn hdfs_client(role: &str) -> Result<HdfsConfig, Box<dyn Error>> {
     let cache = required(match role {
         "source" => "LAB_HDFS_SOURCE_CCACHE",
         "destination" => "LAB_HDFS_DESTINATION_CCACHE",
-        _ => return Err(format!("unknown endpoint role: {role}").into()),
+        _ => return Err(MatrixError::UnknownEndpointRole),
     })?;
     Ok(HdfsConfig {
         config_dir,
@@ -99,13 +133,13 @@ fn hdfs_client(role: &str) -> Result<HdfsConfig, Box<dyn Error>> {
     })
 }
 
-async fn connect(profile: &str, role: &str, root: &str) -> Result<data_mover::storage::Storage, Box<dyn Error>> {
+async fn connect(profile: &str, role: &str, root: &str) -> Result<data_mover::storage::Storage, MatrixError> {
     let backend = identity(profile, role, root)?;
     let config = match profile {
         "local" => BackendConfig::Local(LocalBackendConfig {
             root: PathBuf::from(root),
             identity: backend,
-            write_concurrency: NonZeroUsize::new(2).ok_or("non-zero")?,
+            write_concurrency: NonZeroUsize::new(2).ok_or(MatrixError::InvalidLimit)?,
         }),
         "nfs3" | "nfs40" | "nfs41" => BackendConfig::Nfs(NfsBackendConfig {
             url: root.to_owned(),
@@ -117,7 +151,7 @@ async fn connect(profile: &str, role: &str, root: &str) -> Result<data_mover::st
             server: match role {
                 "source" => required("LAB_CIFS_SOURCE_DATA")?,
                 "destination" => required("LAB_CIFS_DEST_DATA")?,
-                _ => return Err(format!("unknown endpoint role: {role}").into()),
+                _ => return Err(MatrixError::UnknownEndpointRole),
             },
             share: required("LAB_CIFS_SHARE")?,
             root: Some(root.to_owned()),
@@ -154,15 +188,15 @@ async fn connect(profile: &str, role: &str, root: &str) -> Result<data_mover::st
             block_size: None,
             ensure_dir: true,
         }),
-        _ => return Err(format!("unknown profile: {profile}").into()),
+        _ => return Err(MatrixError::UnknownProfile),
     };
     Ok(connect_backend(config).await?)
 }
 
 async fn session(
     source: &BackendIdentity, size: Option<u64>, cancel: CancellationToken,
-) -> Result<TraversalSession, Box<dyn Error>> {
-    let (producer, session) = TraversalSession::bounded(NonZeroUsize::new(1).ok_or("non-zero")?, cancel);
+) -> Result<TraversalSession, MatrixError> {
+    let (producer, session) = TraversalSession::bounded(NonZeroUsize::new(1).ok_or(MatrixError::InvalidLimit)?, cancel);
     let observed = ObservedEntry::new(
         StoragePath::new(PAYLOAD)?,
         EntryKind::File,
@@ -181,10 +215,10 @@ async fn session(
 }
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn Error>> {
+async fn main() -> Result<(), MatrixError> {
     let args = env::args().skip(1).collect::<Vec<_>>();
     if args.len() != 7 {
-        return Err("usage: single_process_matrix SOURCE_PROFILE SOURCE_ROLE SOURCE_ROOT DESTINATION_PROFILE DESTINATION_ROLE DESTINATION_ROOT JOB_ID".into());
+        return Err(MatrixError::Usage);
     }
     let (source_profile, source_role, source_root, destination_profile, destination_role, destination_root, job) =
         (&args[0], &args[1], &args[2], &args[3], &args[4], &args[5], &args[6]);
@@ -203,7 +237,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             source,
             destination,
             inflight: InflightLimits::new(4, 4 * 1024 * 1024, 1)?,
-            max_concurrent_files: NonZeroUsize::new(1).ok_or("non-zero")?,
+            max_concurrent_files: NonZeroUsize::new(1).ok_or(MatrixError::InvalidLimit)?,
             existing_destination: ExistingDestinationPolicy::Overwrite,
             recovery_policy: RecoveryPolicy::ResumeOrRestart,
             cancel,
@@ -212,11 +246,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     )
     .await?;
     if report.completed_files != 1 || sink.failures != 0 {
-        return Err(format!(
-            "single-process transfer failed: completed={}, failures={}",
-            report.completed_files, sink.failures
-        )
-        .into());
+        return Err(MatrixError::TransferFailed);
     }
     Ok(())
 }
