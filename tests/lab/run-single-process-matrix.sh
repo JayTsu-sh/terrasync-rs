@@ -59,10 +59,19 @@ profile_root_url() {
 }
 
 storage_url() {
-  local role="$1" profile="$2" cell="$3"
+  local role="$1" profile="$2" cell="$3" root path query
+  root="$(profile_root_url "$role" "$profile")"
   case "$profile" in
     local) printf '%s/%s/%s' "$lab_root" "$cell" "$role" ;;
-    *) printf '%s/%s/%s' "$(profile_root_url "$role" "$profile")" "$cell" "$role" ;;
+    # NFS options are encoded in a query string.  The configured namespace
+    # must remain in the path portion; appending it after `?` corrupts the
+    # final option value (for example, noresvport=true/local__nfs3/source).
+    nfs3|nfs40|nfs41)
+      path="${root%%\?*}"
+      query="${root#*\?}"
+      printf '%s/%s/%s?%s' "$path" "$cell" "$role" "$query"
+      ;;
+    *) printf '%s/%s/%s' "$root" "$cell" "$role" ;;
   esac
 }
 

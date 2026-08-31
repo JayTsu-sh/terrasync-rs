@@ -89,6 +89,9 @@ class SingleProcessMatrixTest(unittest.TestCase):
         self.assertIn('mkdir -p "$source_root"', runner)
         self.assertIn('if [[ "$destination" == "local" ]]; then', runner)
         self.assertIn('mkdir -p "$destination_root"', runner)
+        self.assertIn('nfs3|nfs40|nfs41)', runner)
+        self.assertIn("path=\"${root%%\\?*}\"", runner)
+        self.assertIn("printf '%s/%s/%s?%s'", runner)
         self.assertTrue(VALIDATOR_PATH.stat().st_mode & 0o111)
         self.assertTrue((ROOT / "tests" / "lab" / "run-single-process-matrix.sh").stat().st_mode & 0o111)
 
