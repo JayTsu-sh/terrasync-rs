@@ -29,6 +29,10 @@ jobs:
       LAB_HDFS_ADMIN_USER: hdfs/terrasync-runner@HDFS.LOCAL
       LAB_HDFS_CONFIG_DIR: /var/lib/data-mover-lab/hadoop
       LAB_HDFS_KEYTAB: /var/lib/data-mover-lab/terrasync-runner.keytab
+      LAB_CIFS_USERNAME: ${{ secrets.LAB_CIFS_USERNAME }}
+      LAB_CIFS_PASSWORD: ${{ secrets.LAB_CIFS_PASSWORD }}
+      LAB_DXN_S3_ACCESS_KEY: ${{ secrets.LAB_DXN_S3_ACCESS_KEY }}
+      LAB_DXN_S3_SECRET_KEY: ${{ secrets.LAB_DXN_S3_SECRET_KEY }}
     steps:
       - uses: actions/checkout@v5
       - name: Configure preinstalled Rust tools
@@ -42,12 +46,23 @@ jobs:
       - run: tests/lab/health-check.sh
       - run: tests/lab/prepare-run.sh "$RUN_ID"
       - run: flock --wait 10800 /tmp/terrasync-lab-tests.lock cargo test --workspace --exclude terrasync-rs --locked --no-fail-fast
+      - name: TS-SINGLE matrix contract
+        run: python3 -m unittest tests/test_single_process_matrix.py
       - name: Remote process E2E (serial)
         run: flock --wait 10800 /tmp/terrasync-lab-tests.lock cargo test --locked --test remote_process_e2e -- --test-threads=1
       - run: cargo clippy --workspace --all-targets --locked
       - run: cargo build --release --locked --features lab-fault-injection
       - name: Storage and integrity E2E matrix
         run: flock --wait 10800 /tmp/terrasync-lab-tests.lock tests/lab/run-e2e.sh "$RUN_ID"
+      - name: TS-SINGLE 64-cell matrix
+        run: flock --wait 10800 /tmp/terrasync-lab-tests.lock tests/lab/run-single-process-matrix.sh "$RUN_ID"
+      - name: Upload TS-SINGLE matrix evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: single-process-matrix-${{ env.RUN_ID }}
+          path: ${{ runner.temp }}/terrasync-harness-results/${{ env.RUN_ID }}-single-process
+          if-no-files-found: error
       - name: HDFS single and remote process E2E
         run: flock --wait 10800 /tmp/terrasync-lab-tests.lock tests/lab/run-hdfs-e2e.sh "$RUN_ID"
       - name: Upload HDFS certification evidence

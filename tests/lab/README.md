@@ -26,9 +26,17 @@ HTTP proxy. Rust 1.95.0 with Clippy and rustfmt must be preinstalled; nightly
 sets `RUSTUP_TOOLCHAIN=1.95.0` and verifies it instead of downloading tools at
 runtime.
 
-`run-e2e.sh` replaces the former protocol-specific Claude E2E skills with a
-repeatable CI-owned suite. It runs the complete directed 4-by-4 synchronization
-matrix across Local, NFSv3, NFSv4.1, and S3, verifies every destination by
+The `TS-SINGLE` matrix additionally requires CI-only `LAB_CIFS_USERNAME`,
+`LAB_CIFS_PASSWORD`, `LAB_DXN_S3_ACCESS_KEY`, and `LAB_DXN_S3_SECRET_KEY`.
+The FAS2750 share defaults to `ontap_lisaauto_cifs`; all values can be
+overridden by runner-only `LAB_*` settings and must never enter logs or reports.
+Its writable lab root is `ci/terrasync-data-mover` by default
+(`LAB_CIFS_WRITABLE_ROOT`), rather than the share root. This is required because
+the FAS volume uses UNIX security style and the SMB user receives ordinary
+`Change` permissions, not ownership or ACL-administration rights.
+
+`run-e2e.sh` retains the directed 4-by-4 compatibility suite across Local,
+NFSv3, NFSv4.1, and standard S3, verifies every destination by
 SHA-256, and independently runs quick and full integrity checks. It also covers
 same-backend incremental synchronization and the local filter contract. The
 nightly workflow separately runs the real two-process QUIC tests. Each run uses
@@ -46,7 +54,12 @@ paths, ClickHouse databases, copied keytabs, credential caches, and generated
 artifact follows `tests/lab/evidence-matrix.json` and records both exact commit
 identities.
 
-The current lab has no SMB/CIFS endpoint. CIFS remains covered by unit and
-integration tests, but is intentionally not claimed as a nightly physical-lab
-backend. Add source and destination Samba services before adding CIFS to this
-matrix.
+`run-single-process-matrix.sh` is the authoritative `TS-SINGLE` evidence gate.
+It emits 64 independent cell records for Local, NFSv3, NFSv4.0, NFSv4.1,
+FAS2750 CIFS, standard S3, DXN S3, and HDFS. Every cell preloads its source,
+runs the protocol-neutral `Storage + run_local_transfer` single-process path,
+verifies every stream with copy-time BLAKE3, reads the destination back, and
+records the exact terrasync and data-mover commits. This runner intentionally
+does not route through the legacy URL-dispatching CLI. FAS2750 and DXN
+credentials are CI secrets; reports contain only profile-level environment
+fingerprints.

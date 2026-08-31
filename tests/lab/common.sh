@@ -11,8 +11,16 @@ LAB_SOURCE_DATA="${LAB_SOURCE_DATA:-10.10.1.12}"
 LAB_DEST_DATA="${LAB_DEST_DATA:-10.10.1.13}"
 LAB_WORKER_DATA="${LAB_WORKER_DATA:-10.10.1.14}"
 LAB_NFS3_EXPORT="${LAB_NFS3_EXPORT:-/srv/nfs/v3}"
+LAB_NFS40_DATA="${LAB_NFS40_DATA:-10.131.7.201}"
+LAB_NFS40_EXPORT="${LAB_NFS40_EXPORT:-/jay_nfs}"
 LAB_NFS41_EXPORT="${LAB_NFS41_EXPORT:-/srv/nfs/v4}"
 LAB_S3_BUCKET="${LAB_S3_BUCKET:-terrasync-ci}"
+LAB_CIFS_SOURCE_DATA="${LAB_CIFS_SOURCE_DATA:-10.128.61.200}"
+LAB_CIFS_DEST_DATA="${LAB_CIFS_DEST_DATA:-10.128.61.201}"
+LAB_CIFS_SHARE="${LAB_CIFS_SHARE:-ontap_lisaauto_cifs}"
+LAB_CIFS_WRITABLE_ROOT="${LAB_CIFS_WRITABLE_ROOT:-ci/terrasync-data-mover}"
+LAB_DXN_S3_ENDPOINT="${LAB_DXN_S3_ENDPOINT:-http://10.131.7.201:8184}"
+LAB_DXN_S3_BUCKET="${LAB_DXN_S3_BUCKET:-test-agent-s3-bucket-202608301331}"
 LAB_HDFS_LOCATION="${LAB_HDFS_LOCATION:-hdfs://root@10.131.9.30:9000/}"
 LAB_HDFS_ADMIN_USER="${LAB_HDFS_ADMIN_USER:-hdfs/hdfs-namenode@HDFS.LOCAL}"
 LAB_HDFS_CONFIG_DIR="${LAB_HDFS_CONFIG_DIR:-}"
@@ -26,7 +34,7 @@ LAB_FIXTURE_GID="${LAB_FIXTURE_GID:-1000}"
 # AWS SDK/urllib3 proxy bypass matching is host based and does not consistently
 # honor the runner's CIDR entries. Keep all lab control/data traffic direct,
 # including the bucket-style hostnames constructed by run-e2e.sh.
-LAB_NO_PROXY_HOSTS="${LAB_SOURCE_MGMT},${LAB_DEST_MGMT},${LAB_WORKER_MGMT},${LAB_SOURCE_DATA},${LAB_DEST_DATA},${LAB_WORKER_DATA},${LAB_S3_BUCKET}.${LAB_SOURCE_DATA},${LAB_S3_BUCKET}.${LAB_DEST_DATA},${LAB_S3_BUCKET}.${LAB_WORKER_DATA}"
+LAB_NO_PROXY_HOSTS="${LAB_SOURCE_MGMT},${LAB_DEST_MGMT},${LAB_WORKER_MGMT},${LAB_SOURCE_DATA},${LAB_DEST_DATA},${LAB_WORKER_DATA},${LAB_NFS40_DATA},${LAB_CIFS_SOURCE_DATA},${LAB_CIFS_DEST_DATA},${LAB_S3_BUCKET}.${LAB_SOURCE_DATA},${LAB_S3_BUCKET}.${LAB_DEST_DATA},${LAB_S3_BUCKET}.${LAB_WORKER_DATA}"
 export NO_PROXY="${NO_PROXY:+${NO_PROXY},}${LAB_NO_PROXY_HOSTS}"
 export no_proxy="$NO_PROXY"
 
@@ -42,6 +50,28 @@ clickhouse_database_name() {
 }
 
 require_s3_credentials() {
+  if [[ -z "${LAB_S3_ACCESS_KEY:-}" || -z "${LAB_S3_SECRET_KEY:-}" ]]; then
+    local -a source_credentials destination_credentials
+    mapfile -t source_credentials < <(
+      ssh_lab_root "$LAB_SOURCE_MGMT" \
+        ". /etc/default/rustfs; printf '%s\\n%s\\n' \"\$RUSTFS_ACCESS_KEY\" \"\$RUSTFS_SECRET_KEY\""
+    )
+    mapfile -t destination_credentials < <(
+      ssh_lab_root "$LAB_DEST_MGMT" \
+        ". /etc/default/rustfs; printf '%s\\n%s\\n' \"\$RUSTFS_ACCESS_KEY\" \"\$RUSTFS_SECRET_KEY\""
+    )
+    [[ "${#source_credentials[@]}" == 2 && "${#destination_credentials[@]}" == 2 ]] || {
+      echo "failed to load complete RustFS credentials" >&2
+      return 2
+    }
+    [[ "${source_credentials[0]}" == "${destination_credentials[0]}" &&
+      "${source_credentials[1]}" == "${destination_credentials[1]}" ]] || {
+      echo "source and destination RustFS credentials differ" >&2
+      return 2
+    }
+    export LAB_S3_ACCESS_KEY="${source_credentials[0]}"
+    export LAB_S3_SECRET_KEY="${source_credentials[1]}"
+  fi
   : "${LAB_S3_ACCESS_KEY:?LAB_S3_ACCESS_KEY is required}"
   : "${LAB_S3_SECRET_KEY:?LAB_S3_SECRET_KEY is required}"
 }
@@ -57,6 +87,15 @@ require_hdfs_credentials() {
     echo "LAB_HDFS_KEYTAB is not readable" >&2
     return 2
   }
+}
+
+require_single_matrix_credentials() {
+  require_s3_credentials
+  require_hdfs_credentials
+  : "${LAB_CIFS_USERNAME:?LAB_CIFS_USERNAME is required}"
+  : "${LAB_CIFS_PASSWORD:?LAB_CIFS_PASSWORD is required}"
+  : "${LAB_DXN_S3_ACCESS_KEY:?LAB_DXN_S3_ACCESS_KEY is required}"
+  : "${LAB_DXN_S3_SECRET_KEY:?LAB_DXN_S3_SECRET_KEY is required}"
 }
 
 hdfs_run_root() {
