@@ -14,6 +14,17 @@ pub enum AppError {
     #[error("Traversal terminal failure: {0}")]
     TraversalTerminal(#[from] data_mover::traversal::TraversalTerminalFailure),
 
+    /// traversal completion evidence 与本地 transfer queue 实际消费数量不一致。
+    #[error(
+        "Traversal count mismatch: consumed {consumed_entries} entries/{consumed_failures} failures, reported {reported_entries} entries/{reported_failures} failures"
+    )]
+    TraversalCountMismatch {
+        consumed_entries: u64,
+        reported_entries: u64,
+        consumed_failures: u64,
+        reported_failures: u64,
+    },
+
     /// traversal 有 entry 级失败，因此快照不完整。
     #[error("Observation scan incomplete after {entry_failures} entry failures")]
     ObservationScanIncomplete { entry_failures: u64 },
