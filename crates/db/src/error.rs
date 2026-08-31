@@ -10,6 +10,7 @@
 // 无
 
 // 外部crate
+use data_mover::model::SnapshotDecodeError;
 use thiserror::Error;
 
 // 内部模块
@@ -19,6 +20,13 @@ use thiserror::Error;
 /// 使用thiserror库实现错误处理和转换
 #[derive(Error, Debug)]
 pub enum DatabaseError {
+    /// data-mover 拒绝数据库中损坏或未知版本的 opaque observation snapshot。
+    #[error("Observation snapshot codec error: {0}")]
+    SnapshotDecode(#[from] SnapshotDecodeError),
+
+    /// 可查询列与同一行的 opaque snapshot 不一致。
+    #[error("Observation query projection mismatch in field {field}")]
+    ObservationProjectionMismatch { field: &'static str },
     /// `ClickHouse` 数据库相关错误
     /// 从 `clickhouse` 库的错误类型自动转换
     #[error("ClickHouse error: {0}")]

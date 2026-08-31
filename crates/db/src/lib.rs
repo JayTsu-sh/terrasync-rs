@@ -2,7 +2,7 @@
 
 //! 数据库访问模块
 //!
-//! 提供统一的数据库接口抽象和 ClickHouse 数据库实现
+//! 提供统一的数据库接口抽象和 `ClickHouse` 数据库实现
 //! 主要功能包括表创建、数据插入、查询、差异比较等操作
 
 // 标准库
@@ -19,6 +19,7 @@ pub mod common; // Common types and utilities
 pub mod config; // 数据库配置定义
 pub mod error; // 错误处理
 pub mod factory; // 数据库工厂，用于创建不同类型的数据库实例
+pub mod observation_record;
 pub mod traits; // 数据库接口定义
 
 // 共享的表名常量
@@ -39,6 +40,7 @@ pub use common::DeletionStatus; // Common deletion status enum
 pub use config::{ClickHouseConfig, DatabaseConfig, DatabaseType}; // 配置相关类型
 pub use error::{DatabaseError, Result}; // 错误处理相关类型
 pub use factory::DatabaseFactory; // 数据库工厂类型
+pub use observation_record::{OBSERVATION_IDENTITY_JOIN_CLAUSE, ObservedEntryRecord};
 pub use traits::Database; // 数据库接口类型
 
 /// 公共 API 的 prelude 模块
@@ -58,6 +60,7 @@ pub mod prelude {
     pub use super::{ClickHouseConfig, DatabaseConfig, DatabaseType};
     /// 错误处理相关类型
     pub use super::{DatabaseError, Result};
+    pub use super::{OBSERVATION_IDENTITY_JOIN_CLAUSE, ObservedEntryRecord};
 }
 
 /// 根据 `job_id` 生成扫描基础表名

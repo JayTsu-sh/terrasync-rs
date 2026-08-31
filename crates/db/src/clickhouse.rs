@@ -10,6 +10,7 @@ use std::sync::{Arc, Mutex as StdMutex, OnceLock, Weak};
 // 外部crate
 use async_trait::async_trait;
 use clickhouse::Client;
+use data_mover::model::ObservedEntry;
 use data_mover::{ChangeKind, EntryEnum, StorageEntryMessage};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -23,6 +24,7 @@ use crate::common::{
 };
 use crate::config::ClickHouseConfig;
 use crate::error::{DatabaseError, Result};
+use crate::observation_record::{OBSERVATION_IDENTITY_JOIN_CLAUSE, ObservedEntryRecord};
 use crate::traits::{Database, IncrementalStorageEntryRecord, QueryResult, StorageEntryRecord, TarManifestRecord};
 use crate::{
     INCREMENTAL_SCAN_TABLE_BASE_NAME, SCAN_BASE_TABLE_BASE_NAME, SCAN_STATE_TABLE_BASE_NAME,
@@ -46,7 +48,7 @@ pub struct ClickHouseDatabase {
     pub scan_temp_table_name: Option<String>,
     /// 缓存的 `scan_state` 值（255 = 未缓存），避免每次 `batch_insert` 都查询数据库
     cached_scan_state: AtomicU8,
-    /// 同一 ClickHouse 身份与 job 共享的 scan generation 生命周期
+    /// 同一 `ClickHouse` 身份与 job 共享的 scan generation 生命周期
     generation_lifecycle: Arc<Mutex<ScanGenerationLifecycle>>,
 }
 
@@ -95,27 +97,34 @@ macro_rules! file_scan_base_columns {
     // 内部宏，包含基础列定义
     (@base) => {
         r"
-    name String,
+    name String DEFAULT '',
     relative_path String,
     size UInt64,
-    ext Nullable(String),
-    ctime DateTime64(9),
-    mtime DateTime64(9),
-    atime DateTime64(9),
-    mode Nullable(UInt32),
-    storage_type String,
-    is_symlink Bool,
-    is_dir Bool,
-    is_regular_file Bool,
-    hard_links UInt32,
+    ext Nullable(String) DEFAULT NULL,
+    ctime DateTime64(9) DEFAULT 0,
+    mtime DateTime64(9) DEFAULT 0,
+    atime DateTime64(9) DEFAULT 0,
+    mode Nullable(UInt32) DEFAULT NULL,
+    storage_type String DEFAULT '',
+    is_symlink Bool DEFAULT 0,
+    is_dir Bool DEFAULT 0,
+    is_regular_file Bool DEFAULT 0,
+    hard_links UInt32 DEFAULT 0,
     current_state UInt8,
-    uid Nullable(UInt32),
-    gid Nullable(UInt32),
-    ino Nullable(UInt64),
-    file_handle Nullable(String),
-    version_id String,
-    tags Nullable(String),
-    version_count Nullable(UInt32),
+    uid Nullable(UInt32) DEFAULT NULL,
+    gid Nullable(UInt32) DEFAULT NULL,
+    ino Nullable(UInt64) DEFAULT NULL,
+    file_handle Nullable(String) DEFAULT NULL,
+    version_id String DEFAULT '',
+    tags Nullable(String) DEFAULT NULL,
+    version_count Nullable(UInt32) DEFAULT NULL,
+    identity_key String DEFAULT '',
+    backend_kind String DEFAULT '',
+    entry_kind String DEFAULT '',
+    size_observed Bool DEFAULT 0,
+    modified_unix_nanos Nullable(Int128) DEFAULT NULL,
+    entry_snapshot Array(UInt8) DEFAULT [],
+    INDEX identity_key_idx identity_key TYPE bloom_filter GRANULARITY 1,
 "
     };
 
@@ -134,7 +143,7 @@ macro_rules! file_scan_base_columns {
 ///
 /// 定义了存储文件扫描结果的表结构，包含文件路径、大小、扩展名、时间戳、权限等信息。
 /// 所有相关表（主表和临时表）都使用此结构定义。
-const FILE_SCAN_COLUMNS_DEFINITION: &str = file_scan_base_columns!();
+pub(crate) const FILE_SCAN_COLUMNS_DEFINITION: &str = file_scan_base_columns!();
 
 /// 文件增量扫描记录的标准列定义
 ///
@@ -171,12 +180,12 @@ enum JoinStrategy {
 impl JoinStrategy {
     /// 根据临时表和主表的 `file_handle` 统计信息决定 JOIN 策略
     ///
-    /// 策略只取决于「是否存在 file_handle」，与表是否为空无关：
+    /// 策略只取决于「是否存在 `file_handle`」，与表是否为空无关：
     /// 两侧都无 `file_handle`（local/S3）→ 必须用 Path（`relative_path+version_id`）；
-    /// 任一侧有 `file_handle`（NFS/CIFS）→ 用 FileHandle。
+    /// 任一侧有 `file_handle`（NFS/CIFS）→ 用 `FileHandle`。
     ///
     /// 注意：不得用 `base_total > 0` 之类的「表非空」作为前置条件——全量拷贝中断后
-    /// 续传时 base 为空，但 local/S3 文件无 `file_handle`，若误入 FileHandle 分支，
+    /// 续传时 base 为空，但 local/S3 文件无 `file_handle`，若误入 `FileHandle` 分支，
     /// `NULL NOT IN (...)` 会求值为 NULL 导致新增文件漏判、被静默并入 base 而不拷贝。
     fn from_file_handle_status(temp_non_null: usize, base_non_null: usize) -> Self {
         if temp_non_null == 0 && base_non_null == 0 {
@@ -324,6 +333,92 @@ impl ClickHouseDatabase {
             cached_scan_state: AtomicU8::new(255),
             generation_lifecycle: shared_generation_lifecycle(config, job_id),
         }
+    }
+
+    /// 将 data-mover observation projection 写入当前 job 的同一张 base 大表。
+    ///
+    /// # Errors
+    /// `ClickHouse` 拒绝 schema 或写入时返回数据库错误。
+    pub async fn batch_insert_observations(&self, records: &[ObservedEntryRecord]) -> Result<()> {
+        self.insert_observations(&get_scan_base_table_name(&self.job_id), records)
+            .await
+    }
+
+    /// 将 observation projection 写入当前扫描临时表。
+    ///
+    /// # Errors
+    /// 尚未创建临时表或 `ClickHouse` 拒绝写入时返回数据库错误。
+    pub async fn batch_insert_temp_observations(&self, records: &[ObservedEntryRecord]) -> Result<()> {
+        let table_name = self
+            .scan_temp_table_name
+            .as_ref()
+            .ok_or_else(|| DatabaseError::TableNotFound("scan temporary table".to_string()))?;
+        self.insert_observations(table_name, records).await
+    }
+
+    async fn insert_observations(&self, table_name: &str, records: &[ObservedEntryRecord]) -> Result<()> {
+        if records.is_empty() {
+            return Ok(());
+        }
+        let mut insert = self
+            .async_client
+            .insert::<ObservedEntryRecord>(table_name)
+            .await
+            .map_err(DatabaseError::ClickHouseError)?;
+        for record in records {
+            insert.write(record).await.map_err(DatabaseError::ClickHouseError)?;
+        }
+        insert.end().await.map_err(DatabaseError::ClickHouseError)
+    }
+
+    /// 用中立 identity key JOIN 临时观察与基线，返回查询投影发生变化的观察。
+    ///
+    /// # Errors
+    /// 临时表不存在、查询失败、snapshot 异常或投影不一致时返回 typed error。
+    pub async fn detect_changed_observations(&self) -> Result<Vec<ObservedEntry>> {
+        let temp = self
+            .scan_temp_table_name
+            .as_ref()
+            .ok_or_else(|| DatabaseError::TableNotFound("scan temporary table".to_string()))?;
+        let base = get_scan_base_table_name(&self.job_id);
+        let columns = "t.identity_key, t.relative_path, t.backend_kind, t.entry_kind, t.size, \
+                       t.size_observed, t.modified_unix_nanos, t.current_state, t.entry_snapshot";
+        let query = format!(
+            "SELECT {columns} FROM {temp} t INNER JOIN {base} b ON {OBSERVATION_IDENTITY_JOIN_CLAUSE} \
+             WHERE t.relative_path != b.relative_path OR t.entry_kind != b.entry_kind \
+                OR t.size != b.size OR t.size_observed != b.size_observed \
+                OR NOT isNotDistinctFrom(t.modified_unix_nanos, b.modified_unix_nanos) \
+             ORDER BY t.identity_key"
+        );
+        self.sync_client
+            .query(&query)
+            .fetch_all::<ObservedEntryRecord>()
+            .await
+            .map_err(DatabaseError::ClickHouseError)?
+            .into_iter()
+            .map(|record| record.reconstruct())
+            .collect()
+    }
+
+    /// 按持久 identity key 读取并仅通过 opaque codec 重建 observation。
+    ///
+    /// # Errors
+    /// 查询失败、snapshot 异常或查询投影不一致时返回 typed error。
+    pub async fn load_observation(&self, identity_key: &str) -> Result<Option<ObservedEntry>> {
+        let table_name = get_scan_base_table_name(&self.job_id);
+        let query = format!(
+            "SELECT identity_key, relative_path, backend_kind, entry_kind, size, size_observed, \
+             modified_unix_nanos, current_state, entry_snapshot FROM {table_name} \
+             WHERE identity_key = ? LIMIT 1"
+        );
+        let record = self
+            .sync_client
+            .query(&query)
+            .bind(identity_key)
+            .fetch_optional::<ObservedEntryRecord>()
+            .await
+            .map_err(DatabaseError::ClickHouseError)?;
+        record.map(|value| value.reconstruct()).transpose()
     }
 
     /// 执行SQL语句，支持参数化查询

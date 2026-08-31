@@ -13,9 +13,12 @@ mod clickhouse_integration_tests {
     use bytes::Bytes;
     use clickhouse::Client;
     // 内部模块
+    use data_mover::model::{
+        BackendIdentity, BackendKind, EntryKind, IdentityStrength, ObservedEntry, SourceIdentity, StoragePath,
+    };
     use data_mover::{EntryEnum, NASEntry, S3Entry};
     use db::clickhouse::ClickHouseDatabase;
-    use db::{ClickHouseConfig, Database, DatabaseError, DeletionStatus};
+    use db::{ClickHouseConfig, Database, DatabaseError, DeletionStatus, ObservedEntryRecord};
 
     // 使用原子计数器确保每个测试用例都有唯一的job_id
     static TEST_COUNTER: AtomicUsize = AtomicUsize::new(0);
@@ -236,6 +239,50 @@ mod clickhouse_integration_tests {
         let fresh_db = ClickHouseDatabase::new(&config, &job_id);
         assert_eq!(fresh_db.query_scan_state().await.unwrap(), Some(1));
 
+        database.cleanup().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires lab ClickHouse"]
+    async fn observation_snapshot_round_trips_through_the_single_scan_table() {
+        let (mut db, _, _, database) = setup_isolated_state_db("observation_snapshot").await;
+        db.create_scan_base_table().await.unwrap();
+        let backend = BackendIdentity::new(BackendKind::Local, "clickhouse-fixture").unwrap();
+        let source = SourceIdentity::new(backend, IdentityStrength::PathScoped, b"nested/file").unwrap();
+        let entry = ObservedEntry::new(
+            StoragePath::new("nested/file").unwrap(),
+            EntryKind::File,
+            Some(4096),
+            None,
+            source,
+        )
+        .unwrap();
+        let record = ObservedEntryRecord::capture(&entry, 1);
+        db.batch_insert_observations(std::slice::from_ref(&record))
+            .await
+            .unwrap();
+        let stored = db.load_observation(&record.identity_key).await.unwrap().unwrap();
+
+        assert_eq!(stored, entry);
+
+        db.create_scan_temporary_table().await.unwrap();
+        let changed_backend = BackendIdentity::new(BackendKind::Local, "clickhouse-fixture").unwrap();
+        let changed_source =
+            SourceIdentity::new(changed_backend, IdentityStrength::PathScoped, b"nested/file").unwrap();
+        let changed = ObservedEntry::new(
+            StoragePath::new("nested/file").unwrap(),
+            EntryKind::File,
+            Some(8192),
+            None,
+            changed_source,
+        )
+        .unwrap();
+        let changed_record = ObservedEntryRecord::capture(&changed, 0);
+        db.batch_insert_temp_observations(std::slice::from_ref(&changed_record))
+            .await
+            .unwrap();
+
+        assert_eq!(db.detect_changed_observations().await.unwrap(), vec![changed]);
         database.cleanup().await;
     }
 
