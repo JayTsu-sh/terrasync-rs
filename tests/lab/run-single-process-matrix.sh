@@ -122,6 +122,18 @@ PY
   expected="$(sha256sum "$fixture" | cut -d' ' -f1)"
   source_root="$(storage_url source "$source" "$cell")"
   destination_root="$(storage_url destination "$destination" "$cell")"
+
+  # The local backend treats its configured root as an existing storage
+  # directory.  Remote backends establish their own namespace during
+  # connection, but the local endpoints used by cells containing `local`
+  # must exist before the matrix driver connects them.
+  if [[ "$source" == "local" ]]; then
+    mkdir -p "$source_root"
+  fi
+  if [[ "$destination" == "local" ]]; then
+    mkdir -p "$destination_root"
+  fi
+
   artifact="$results_root/$cell.json"
   started="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 

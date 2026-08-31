@@ -85,6 +85,10 @@ class SingleProcessMatrixTest(unittest.TestCase):
         self.assertNotIn("run_terrasync integrity-check", runner)
         self.assertIn("single_process_matrix", runner)
         self.assertNotIn("terrasync rm", runner)
+        self.assertIn('if [[ "$source" == "local" ]]; then', runner)
+        self.assertIn('mkdir -p "$source_root"', runner)
+        self.assertIn('if [[ "$destination" == "local" ]]; then', runner)
+        self.assertIn('mkdir -p "$destination_root"', runner)
         self.assertTrue(VALIDATOR_PATH.stat().st_mode & 0o111)
         self.assertTrue((ROOT / "tests" / "lab" / "run-single-process-matrix.sh").stat().st_mode & 0o111)
 
