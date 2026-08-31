@@ -36,9 +36,9 @@ trap cleanup EXIT
 mkdir -p "$runtime_root" "$results_root"
 export LAB_HDFS_SOURCE_CCACHE="FILE:$runtime_root/source.ccache"
 export LAB_HDFS_DESTINATION_CCACHE="FILE:$runtime_root/destination.ccache"
-if [[ ! -x "$binary" ]]; then
-  cargo build --release --locked --manifest-path "$repo_root/Cargo.toml" -p app --example single_process_matrix
-fi
+# Evidence is attributed to the current checkout and locked dependency graph. Rebuilding is
+# mandatory: accepting an executable left by another checkout would forge those commit identities.
+cargo build --release --locked --manifest-path "$repo_root/Cargo.toml" -p app --example single_process_matrix
 
 profile_root_url() {
   local role="$1" profile="$2" host prefix
