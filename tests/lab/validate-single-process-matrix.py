@@ -17,6 +17,7 @@ PROFILES = (
     "s3_dxn",
     "hdfs",
 )
+DEFERRED_PROFILES = ("cifs_fas2750",)
 SHA = re.compile(r"^[0-9a-f]{40}$")
 CELL_FIELDS = (
     "gate_id",
@@ -46,10 +47,22 @@ def validate_report(report):
     if not str(report.get("run_id", "")).strip():
         raise ValueError("run_id is required")
 
+    deferred = tuple(report.get("deferred_profiles", ()))
+    profiles = tuple(report.get("profiles", PROFILES))
+    if deferred:
+        if deferred != DEFERRED_PROFILES:
+            raise ValueError("only the explicitly deferred CIFS profile is permitted")
+        expected_profiles = tuple(profile for profile in PROFILES if profile not in deferred)
+        if profiles != expected_profiles:
+            raise ValueError("deferred profile report has an invalid active profile set")
+    elif profiles != PROFILES:
+        raise ValueError("non-default profile set requires an explicit deferred profile")
+
     cells = report.get("cells")
-    if not isinstance(cells, list) or len(cells) != 64:
-        raise ValueError("report must contain exactly 64 cells")
-    expected = {(source, destination) for source in PROFILES for destination in PROFILES}
+    expected_count = len(profiles) ** 2
+    if not isinstance(cells, list) or len(cells) != expected_count:
+        raise ValueError(f"report must contain exactly {expected_count} cells")
+    expected = {(source, destination) for source in profiles for destination in profiles}
     actual = set()
     artifact_identities = set()
     for index, cell in enumerate(cells):
@@ -89,7 +102,11 @@ def main(argv):
     if len(argv) != 2:
         raise SystemExit("usage: validate-single-process-matrix.py REPORT.json")
     validate(Path(argv[1]))
-    print("terrasync single-process matrix: 8 profiles, 64 independent cells")
+    deferred = report.get("deferred_profiles", [])
+    print(
+        f"terrasync single-process matrix: {len(report.get('profiles', PROFILES))} profiles, "
+        f"{len(report['cells'])} independent cells, deferred={','.join(deferred) or 'none'}"
+    )
 
 
 if __name__ == "__main__":

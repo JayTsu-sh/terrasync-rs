@@ -5,7 +5,18 @@ source "$(dirname "$0")/common.sh"
 
 run_id="${1:?run id required}"
 validate_run_id "$run_id"
-require_single_matrix_credentials
+profiles=(local nfs3 nfs40 nfs41 cifs_fas2750 s3_standard s3_dxn hdfs)
+deferred_profiles=()
+cifs_enabled=true
+if [[ "${TS_SINGLE_DEFER_CIFS:-false}" == true ]]; then
+  # Temporary lab policy: exercise every non-CIFS direction while FAS2750
+  # root provisioning is deferred. The evidence validator records this as a
+  # 49-cell degraded run, never as the full 64-cell acceptance gate.
+  profiles=(local nfs3 nfs40 nfs41 s3_standard s3_dxn hdfs)
+  deferred_profiles=(cifs_fas2750)
+  cifs_enabled=false
+fi
+require_single_matrix_credentials "$cifs_enabled"
 
 # The matrix driver is a separate process.  Export explicit, already-validated lab endpoints
 # and credentials rather than reconstructing them from a legacy storage URL in its argv.
@@ -23,7 +34,6 @@ runtime_root="$lab_root/runtime"
 results_root="${RUNNER_TEMP:-/tmp}/terrasync-harness-results/$run_id-single-process"
 aggregate="$results_root/matrix.json"
 hdfs_root="$(hdfs_run_root "$run_id")/single-process-matrix"
-profiles=(local nfs3 nfs40 nfs41 cifs_fas2750 s3_standard s3_dxn hdfs)
 
 cleanup() {
   local status="$?"
@@ -174,9 +184,11 @@ done
 
 terrasync_commit="$(git -C "$repo_root" rev-parse HEAD)"
 data_mover_commit="$(sed -n 's/.*data-mover-rs\.git?rev=\([0-9a-f]*\)#.*/\1/p' "$repo_root/Cargo.lock" | head -1)"
-python3 - "$aggregate" "$results_root" "$run_id" "$terrasync_commit" "$data_mover_commit" <<'PY'
+profiles_csv="$(IFS=,; printf '%s' "${profiles[*]}")"
+deferred_profiles_csv="$(IFS=,; printf '%s' "${deferred_profiles[*]}")"
+python3 - "$aggregate" "$results_root" "$run_id" "$terrasync_commit" "$data_mover_commit" "$profiles_csv" "$deferred_profiles_csv" <<'PY'
 import glob, json, os, sys
-output, root, run_id, terrasync, data_mover = sys.argv[1:]
+output, root, run_id, terrasync, data_mover, profiles, deferred_profiles = sys.argv[1:]
 cells = []
 for path in sorted(glob.glob(os.path.join(root, "*__*.json"))):
     with open(path, encoding="utf-8") as handle:
@@ -188,6 +200,8 @@ report = {
     "dependency_commits": {"data-mover-rs": data_mover},
     "run_id": run_id,
     "mode": "terrasync_single_process",
+    "profiles": profiles.split(",") if profiles else [],
+    "deferred_profiles": deferred_profiles.split(",") if deferred_profiles else [],
     "cells": cells,
 }
 with open(output, "w", encoding="utf-8") as handle:
@@ -195,4 +209,4 @@ with open(output, "w", encoding="utf-8") as handle:
     handle.write("\n")
 PY
 python3 "$(dirname "$0")/validate-single-process-matrix.py" "$aggregate"
-echo "TS-SINGLE 64-cell matrix passed: $aggregate"
+echo "TS-SINGLE ${#profiles[@]}-profile matrix passed: $aggregate"

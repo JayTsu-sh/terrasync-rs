@@ -63,3 +63,9 @@ records the exact terrasync and data-mover commits. This runner intentionally
 does not route through the legacy URL-dispatching CLI. FAS2750 and DXN
 credentials are CI secrets; reports contain only profile-level environment
 fingerprints.
+
+While FAS2750 CIFS root provisioning is explicitly deferred, nightly sets
+`TS_SINGLE_DEFER_CIFS=true`. This emits and validates the 49-cell product of
+the remaining seven profiles, with `cifs_fas2750` recorded in
+`deferred_profiles`; it is not a substitute for the 64-cell acceptance gate.
+Release validation remains on the full matrix.

@@ -90,10 +90,13 @@ require_hdfs_credentials() {
 }
 
 require_single_matrix_credentials() {
+  local cifs_enabled="${1:-true}"
   require_s3_credentials
   require_hdfs_credentials
-  : "${LAB_CIFS_USERNAME:?LAB_CIFS_USERNAME is required}"
-  : "${LAB_CIFS_PASSWORD:?LAB_CIFS_PASSWORD is required}"
+  if [[ "$cifs_enabled" == true ]]; then
+    : "${LAB_CIFS_USERNAME:?LAB_CIFS_USERNAME is required}"
+    : "${LAB_CIFS_PASSWORD:?LAB_CIFS_PASSWORD is required}"
+  fi
   : "${LAB_DXN_S3_ACCESS_KEY:?LAB_DXN_S3_ACCESS_KEY is required}"
   : "${LAB_DXN_S3_SECRET_KEY:?LAB_DXN_S3_SECRET_KEY is required}"
 }

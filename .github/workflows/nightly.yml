@@ -54,7 +54,9 @@ jobs:
       - run: cargo build --release --locked --features lab-fault-injection
       - name: Storage and integrity E2E matrix
         run: flock --wait 10800 /tmp/terrasync-lab-tests.lock tests/lab/run-e2e.sh "$RUN_ID"
-      - name: TS-SINGLE 64-cell matrix
+      - name: TS-SINGLE 49-cell matrix (CIFS deferred)
+        env:
+          TS_SINGLE_DEFER_CIFS: "true"
         run: flock --wait 10800 /tmp/terrasync-lab-tests.lock tests/lab/run-single-process-matrix.sh "$RUN_ID"
       - name: Upload TS-SINGLE matrix evidence
         if: always()

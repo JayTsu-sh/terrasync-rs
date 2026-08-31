@@ -67,6 +67,30 @@ class SingleProcessMatrixTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "exact commit"):
             self.validator.validate_report(report)
 
+    def test_explicit_cifs_deferral_allows_only_the_non_cifs_product(self):
+        report = self.report()
+        active_profiles = [profile for profile in self.profiles if profile != "cifs_fas2750"]
+        report["profiles"] = active_profiles
+        report["deferred_profiles"] = ["cifs_fas2750"]
+        report["cells"] = [
+            cell
+            for cell in report["cells"]
+            if cell["source_profile"] in active_profiles and cell["destination_profile"] in active_profiles
+        ]
+        self.validator.validate_report(report)
+
+    def test_subset_without_explicit_cifs_deferral_is_rejected(self):
+        report = self.report()
+        active_profiles = [profile for profile in self.profiles if profile != "cifs_fas2750"]
+        report["profiles"] = active_profiles
+        report["cells"] = [
+            cell
+            for cell in report["cells"]
+            if cell["source_profile"] in active_profiles and cell["destination_profile"] in active_profiles
+        ]
+        with self.assertRaisesRegex(ValueError, "explicit deferred profile"):
+            self.validator.validate_report(report)
+
     def test_each_cell_requires_independent_artifact_identity(self):
         report = self.report()
         report["cells"][1]["artifact_links"] = report["cells"][0]["artifact_links"]
@@ -92,6 +116,9 @@ class SingleProcessMatrixTest(unittest.TestCase):
         self.assertIn('nfs3|nfs40|nfs41)', runner)
         self.assertIn("path=\"${root%%\\?*}\"", runner)
         self.assertIn("printf '%s/%s/%s?%s'", runner)
+        self.assertIn("TS_SINGLE_DEFER_CIFS", runner)
+        self.assertIn("deferred_profiles", runner)
+        self.assertIn("TS-SINGLE 49-cell matrix (CIFS deferred)", workflow)
         self.assertTrue(VALIDATOR_PATH.stat().st_mode & 0o111)
         self.assertTrue((ROOT / "tests" / "lab" / "run-single-process-matrix.sh").stat().st_mode & 0o111)
 
