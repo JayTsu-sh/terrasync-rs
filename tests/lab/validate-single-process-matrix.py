@@ -101,7 +101,7 @@ def validate(path):
 def main(argv):
     if len(argv) != 2:
         raise SystemExit("usage: validate-single-process-matrix.py REPORT.json")
-    validate(Path(argv[1]))
+    report = validate(Path(argv[1]))
     deferred = report.get("deferred_profiles", [])
     print(
         f"terrasync single-process matrix: {len(report.get('profiles', PROFILES))} profiles, "

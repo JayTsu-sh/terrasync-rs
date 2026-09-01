@@ -1,6 +1,8 @@
 import importlib.util
 import json
 import pathlib
+import subprocess
+import sys
 import tempfile
 import unittest
 
@@ -90,6 +92,27 @@ class SingleProcessMatrixTest(unittest.TestCase):
         ]
         with self.assertRaisesRegex(ValueError, "explicit deferred profile"):
             self.validator.validate_report(report)
+
+    def test_validator_cli_reports_explicit_cifs_deferral(self):
+        report = self.report()
+        active_profiles = [profile for profile in self.profiles if profile != "cifs_fas2750"]
+        report["profiles"] = active_profiles
+        report["deferred_profiles"] = ["cifs_fas2750"]
+        report["cells"] = [
+            cell
+            for cell in report["cells"]
+            if cell["source_profile"] in active_profiles and cell["destination_profile"] in active_profiles
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            path = pathlib.Path(directory) / "report.json"
+            path.write_text(json.dumps(report), encoding="utf-8")
+            result = subprocess.run(
+                [sys.executable, str(VALIDATOR_PATH), str(path)],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+        self.assertIn("7 profiles, 49 independent cells, deferred=cifs_fas2750", result.stdout)
 
     def test_each_cell_requires_independent_artifact_identity(self):
         report = self.report()
