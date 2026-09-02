@@ -16,11 +16,12 @@ use bytes::Bytes;
 use data_mover::{DataChunk, EntryEnum, NASEntry};
 use tokio::sync::oneshot;
 use transport::message::{
-    FeatureFlags, HandshakeResult, HashAlgorithm, ProgressSnapshot, ProtocolHandshake, ReceiverMsg, SenderMsg,
-    SessionConfig, TransferDecision,
+    AdvertisedObservation, AdvertisementEvent, AdvertisementTerminal, FeatureFlags, HandshakeResult, HashAlgorithm,
+    ObservationPage, ProgressSnapshot, ProtocolHandshake, ReceiverMsg, RemoteDestinationEvent, RemoteSourceEvent,
+    RemoteTransferTerminal, SenderMsg, SessionConfig, SessionNdx, SourceQosSnapshot, TransferDecision,
 };
 use transport::quic;
-use transport::traits::SenderTransport;
+use transport::traits::{ReceiverTransport, SenderTransport};
 
 fn install_crypto_provider() {
     let _ = rustls::crypto::ring::default_provider().install_default();
@@ -76,6 +77,271 @@ async fn test_quic_transfer_done_roundtrip() {
 
     // 通知 receiver 可以退出了
     let _ = done_tx.send(());
+    receiver_handle.await.unwrap();
+    sender.close().await.unwrap();
+}
+
+/// 新 remote advertisement 在真实 QUIC FileList stream 上保持 opaque bytes、NDX 与 terminal。
+#[tokio::test]
+async fn test_quic_opaque_advertisement_roundtrip() {
+    install_crypto_provider();
+
+    let (endpoint, cert) = quic::bind("[::1]:0".parse().unwrap()).unwrap();
+    let server_addr = quic::receiver::local_addr(&endpoint).unwrap();
+    let receiver_handle = tokio::spawn(async move {
+        let receiver = quic::accept_connection(&endpoint).await.unwrap();
+        let first = receiver.recv().await.unwrap();
+        let SenderMsg::Advertisement(AdvertisementEvent::Page(page)) = first else {
+            panic!("expected opaque advertisement page, got {first:?}")
+        };
+        assert_eq!(page.sequence, 7);
+        assert_eq!(page.entries[0].ndx, SessionNdx(42));
+        assert_eq!(page.entries[0].snapshot, vec![0, 1, 2, 255]);
+        assert!(matches!(
+            receiver.recv().await,
+            Some(SenderMsg::Advertisement(AdvertisementEvent::Terminal(
+                AdvertisementTerminal::Completed {
+                    observed_entries: 1,
+                    entry_failures: 0
+                }
+            )))
+        ));
+        receiver.close().await.unwrap();
+    });
+
+    let sender = quic::connect(server_addr, "localhost", Some(quic::CertificateDer::from(cert)))
+        .await
+        .unwrap();
+    sender
+        .send(SenderMsg::Advertisement(AdvertisementEvent::Page(ObservationPage {
+            sequence: 7,
+            entries: vec![AdvertisedObservation {
+                ndx: SessionNdx(42),
+                snapshot: vec![0, 1, 2, 255],
+            }],
+        })))
+        .await
+        .unwrap();
+    sender
+        .send(SenderMsg::Advertisement(AdvertisementEvent::Terminal(
+            AdvertisementTerminal::Completed {
+                observed_entries: 1,
+                entry_failures: 0,
+            },
+        )))
+        .await
+        .unwrap();
+
+    receiver_handle.await.unwrap();
+    sender.close().await.unwrap();
+}
+
+/// Expert transfer 的 offer/request 走 FileList，payload/evidence 在同一 Data stream 保序。
+#[tokio::test]
+async fn test_quic_expert_transfer_negotiation_payload_and_evidence_roundtrip() {
+    install_crypto_provider();
+
+    let (endpoint, cert) = quic::bind("[::1]:0".parse().unwrap()).unwrap();
+    let server_addr = quic::receiver::local_addr(&endpoint).unwrap();
+    let (terminal_seen_tx, terminal_seen_rx) = oneshot::channel();
+    let receiver_handle = tokio::spawn(async move {
+        let receiver = quic::accept_connection(&endpoint).await.unwrap();
+        let Some(SenderMsg::Handshake(remote_handshake)) = receiver.recv().await else {
+            panic!("expected protocol handshake before expert transfer")
+        };
+        receiver
+            .send(ReceiverMsg::HandshakeAck(
+                ProtocolHandshake::current().negotiate(&remote_handshake),
+            ))
+            .await
+            .unwrap();
+        assert!(matches!(
+            receiver.recv().await,
+            Some(SenderMsg::Advertisement(AdvertisementEvent::Page(page)))
+                if page.entries.first().is_some_and(|entry| entry.ndx == SessionNdx(9))
+        ));
+        assert!(matches!(
+            receiver.recv().await,
+            Some(SenderMsg::Advertisement(AdvertisementEvent::Terminal(
+                AdvertisementTerminal::Completed {
+                    observed_entries: 1,
+                    entry_failures: 0,
+                }
+            )))
+        ));
+        receiver
+            .send(ReceiverMsg::RemoteDestination(
+                RemoteDestinationEvent::TransferRequested { ndx: SessionNdx(9) },
+            ))
+            .await
+            .unwrap();
+        assert!(matches!(
+            receiver.recv().await,
+            Some(SenderMsg::RemoteSource(RemoteSourceEvent::Offer {
+                ndx: SessionNdx(9),
+                source_size: 7,
+                maximum_chunk_bytes: 4,
+                identity_key,
+            })) if identity_key == [3; 32]
+        ));
+        receiver
+            .send(ReceiverMsg::RemoteDestination(
+                RemoteDestinationEvent::PayloadRequested {
+                    ndx: SessionNdx(9),
+                    durable_prefix: 3,
+                    maximum_chunk_bytes: 2,
+                },
+            ))
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            receiver.recv().await,
+            Some(SenderMsg::RemoteSource(RemoteSourceEvent::Payload {
+                ndx: SessionNdx(9),
+                offset: 3,
+                data,
+            })) if data == Bytes::from_static(b"de")
+        ));
+        assert!(matches!(
+            receiver.recv().await,
+            Some(SenderMsg::RemoteSource(RemoteSourceEvent::Payload {
+                ndx: SessionNdx(9),
+                offset: 5,
+                data,
+            })) if data == Bytes::from_static(b"fg")
+        ));
+        assert!(matches!(
+            receiver.recv().await,
+            Some(SenderMsg::RemoteSource(RemoteSourceEvent::Completed {
+                ndx: SessionNdx(9),
+                source_size: 7,
+                blake3,
+                identity_key,
+                source_qos: SourceQosSnapshot {
+                    logical_bytes: 7,
+                    client_streamed_shaped_bytes: 7,
+                    native_bytes: 0,
+                    source_read_operations: 2,
+                    native_requests: 0,
+                    native_payload_shaped: false,
+                },
+            })) if blake3 == [5; 32] && identity_key == [3; 32]
+        ));
+        receiver
+            .send(ReceiverMsg::RemoteDestination(RemoteDestinationEvent::Terminal(
+                RemoteTransferTerminal::Completed {
+                    ndx: SessionNdx(9),
+                    transferred_bytes: 7,
+                    blake3: [5; 32],
+                },
+            )))
+            .await
+            .unwrap();
+        let _ = terminal_seen_rx.await;
+        receiver.close().await.unwrap();
+    });
+
+    let sender = quic::connect(server_addr, "localhost", Some(quic::CertificateDer::from(cert)))
+        .await
+        .unwrap();
+    sender
+        .send(SenderMsg::Handshake(ProtocolHandshake::current()))
+        .await
+        .unwrap();
+    assert!(matches!(
+        sender.recv().await,
+        Some(ReceiverMsg::HandshakeAck(HandshakeResult::Accepted { .. }))
+    ));
+    sender
+        .send(SenderMsg::Advertisement(AdvertisementEvent::Page(ObservationPage {
+            sequence: 0,
+            entries: vec![AdvertisedObservation {
+                ndx: SessionNdx(9),
+                snapshot: vec![1],
+            }],
+        })))
+        .await
+        .unwrap();
+    sender
+        .send(SenderMsg::Advertisement(AdvertisementEvent::Terminal(
+            AdvertisementTerminal::Completed {
+                observed_entries: 1,
+                entry_failures: 0,
+            },
+        )))
+        .await
+        .unwrap();
+    assert!(matches!(
+        sender.recv().await,
+        Some(ReceiverMsg::RemoteDestination(
+            RemoteDestinationEvent::TransferRequested { ndx: SessionNdx(9) }
+        ))
+    ));
+    sender
+        .send(SenderMsg::RemoteSource(RemoteSourceEvent::Offer {
+            ndx: SessionNdx(9),
+            source_size: 7,
+            maximum_chunk_bytes: 4,
+            identity_key: [3; 32],
+        }))
+        .await
+        .unwrap();
+    assert!(matches!(
+        sender.recv().await,
+        Some(ReceiverMsg::RemoteDestination(
+            RemoteDestinationEvent::PayloadRequested {
+                ndx: SessionNdx(9),
+                durable_prefix: 3,
+                maximum_chunk_bytes: 2,
+            }
+        ))
+    ));
+    sender
+        .send(SenderMsg::RemoteSource(RemoteSourceEvent::Payload {
+            ndx: SessionNdx(9),
+            offset: 3,
+            data: Bytes::from_static(b"de"),
+        }))
+        .await
+        .unwrap();
+    sender
+        .send(SenderMsg::RemoteSource(RemoteSourceEvent::Payload {
+            ndx: SessionNdx(9),
+            offset: 5,
+            data: Bytes::from_static(b"fg"),
+        }))
+        .await
+        .unwrap();
+    sender
+        .send(SenderMsg::RemoteSource(RemoteSourceEvent::Completed {
+            ndx: SessionNdx(9),
+            source_size: 7,
+            blake3: [5; 32],
+            identity_key: [3; 32],
+            source_qos: SourceQosSnapshot {
+                logical_bytes: 7,
+                client_streamed_shaped_bytes: 7,
+                native_bytes: 0,
+                source_read_operations: 2,
+                native_requests: 0,
+                native_payload_shaped: false,
+            },
+        }))
+        .await
+        .unwrap();
+    assert!(matches!(
+        sender.recv().await,
+        Some(ReceiverMsg::RemoteDestination(RemoteDestinationEvent::Terminal(
+            RemoteTransferTerminal::Completed {
+                ndx: SessionNdx(9),
+                transferred_bytes: 7,
+                blake3,
+            }
+        ))) if blake3 == [5; 32]
+    ));
+    let _ = terminal_seen_tx.send(());
+
     receiver_handle.await.unwrap();
     sender.close().await.unwrap();
 }

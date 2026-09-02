@@ -20,6 +20,7 @@ pub mod config; // 数据库配置定义
 pub mod error; // 错误处理
 pub mod factory; // 数据库工厂，用于创建不同类型的数据库实例
 pub mod observation_record;
+mod recovery_state;
 pub mod traits; // 数据库接口定义
 
 // 共享的表名常量
@@ -41,6 +42,7 @@ pub use config::{ClickHouseConfig, DatabaseConfig, DatabaseType}; // 配置相�
 pub use error::{DatabaseError, Result}; // 错误处理相关类型
 pub use factory::DatabaseFactory; // 数据库工厂类型
 pub use observation_record::{OBSERVATION_IDENTITY_JOIN_CLAUSE, ObservedEntryRecord};
+pub use recovery_state::{RecoveryAttemptId, RecoveryAttemptRegistration};
 pub use traits::Database; // 数据库接口类型
 
 /// 公共 API 的 prelude 模块
@@ -61,6 +63,7 @@ pub mod prelude {
     /// 错误处理相关类型
     pub use super::{DatabaseError, Result};
     pub use super::{OBSERVATION_IDENTITY_JOIN_CLAUSE, ObservedEntryRecord};
+    pub use super::{RecoveryAttemptId, RecoveryAttemptRegistration};
 }
 
 /// 根据 `job_id` 生成扫描基础表名

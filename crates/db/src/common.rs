@@ -130,7 +130,7 @@ pub fn classify_deletion_status(
 macro_rules! generate_version_count_join_sql {
     ($base_table:expr) => {{
         let join_clause = format!(
-            "LEFT JOIN (SELECT relative_path, count() as cnt FROM {} GROUP BY relative_path) as vc \
+            "LEFT JOIN (SELECT relative_path, count() as cnt FROM {} WHERE row_kind = 0 GROUP BY relative_path) as vc \
              ON t.relative_path = vc.relative_path",
             $base_table
         );

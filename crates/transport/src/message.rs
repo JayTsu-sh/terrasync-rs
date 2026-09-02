@@ -9,6 +9,188 @@ use serde::{Deserialize, Serialize};
 use data_mover::dir_tree::DirPageResult;
 use data_mover::{DataChunk, EntryEnum};
 
+/// 会话内临时分配的观察索引。它只用于一次 negotiated session 的关联，不能持久化。
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
+pub struct SessionNdx(pub u64);
+
+/// 远端文件列表中的一个 opaque observation。
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct AdvertisedObservation {
+    pub ndx: SessionNdx,
+    pub snapshot: Vec<u8>,
+}
+
+/// 有界的远端 observation 页。
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ObservationPage {
+    pub sequence: u64,
+    pub entries: Vec<AdvertisedObservation>,
+}
+
+/// 线上的失败范围；entry failure 不终止遍历，session/runtime failure 会终止。
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum AdvertisementFailureScope {
+    Entry,
+    BackendSession,
+    Runtime,
+}
+
+/// data-mover traversal failure 的产品 wire 投影，不携带协议私有事实。
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct AdvertisementFailure {
+    pub scope: AdvertisementFailureScope,
+    pub path: Option<String>,
+    pub identity: Option<[u8; 32]>,
+    pub operation: Option<String>,
+    pub class: Option<String>,
+    pub transience: Option<String>,
+    pub diagnostic: String,
+}
+
+/// `FileList` 的唯一终止消息。只有 `Completed` 可以作为完整广告证据。
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum AdvertisementTerminal {
+    Completed {
+        observed_entries: u64,
+        entry_failures: u64,
+    },
+    Cancelled {
+        observed_entries: u64,
+        entry_failures: u64,
+    },
+    Failed {
+        observed_entries: u64,
+        entry_failures: u64,
+        failure: AdvertisementFailure,
+    },
+}
+
+/// 新 remote-advertisement seam 的有序输出。
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum AdvertisementEvent {
+    Page(ObservationPage),
+    EntryFailure(AdvertisementFailure),
+    Terminal(AdvertisementTerminal),
+}
+
+/// Source-read work accounting transported as immutable completion evidence.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SourceQosSnapshot {
+    pub logical_bytes: u64,
+    pub client_streamed_shaped_bytes: u64,
+    pub native_bytes: u64,
+    pub source_read_operations: u64,
+    pub native_requests: u64,
+    pub native_payload_shaped: bool,
+}
+
+/// Stable wire projection of data-mover transfer phases.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum RemoteTransferPhase {
+    Preflight,
+    Describe,
+    Prepare,
+    RecoveryRegistration,
+    RecoveryCompletion,
+    Transfer,
+    Checkpoint,
+    Verify,
+    Publish,
+    Metadata,
+}
+
+/// Stable wire projection of the side responsible for a transfer failure.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum RemoteTransferSide {
+    Source,
+    Destination,
+    Orchestration,
+}
+
+/// Mutually exclusive staged-state ownership reported to the peer.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum RemoteStageDisposition {
+    None,
+    UnpublishedEphemeral,
+    Recoverable,
+    PublishedCleanupPending,
+}
+
+/// Typed, non-secret failure evidence sent to the peer without backend-private state.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct RemoteTransferFailure {
+    pub phase: RemoteTransferPhase,
+    pub side: RemoteTransferSide,
+    pub stage: RemoteStageDisposition,
+    pub final_destination_changed: bool,
+    pub source_qos: SourceQosSnapshot,
+    pub diagnostic: String,
+}
+
+/// Ordered source-side events for one remote expert transfer.
+///
+/// `Offer` is routed on `FileList`; `Payload` and `Completed` share the `Data`
+/// stream so completion evidence cannot overtake payload bytes.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum RemoteSourceEvent {
+    Offer {
+        ndx: SessionNdx,
+        source_size: u64,
+        maximum_chunk_bytes: u64,
+        identity_key: [u8; 32],
+    },
+    Payload {
+        ndx: SessionNdx,
+        offset: u64,
+        data: Bytes,
+    },
+    Completed {
+        ndx: SessionNdx,
+        source_size: u64,
+        blake3: [u8; 32],
+        identity_key: [u8; 32],
+        source_qos: SourceQosSnapshot,
+    },
+    Failed {
+        ndx: SessionNdx,
+        failure: RemoteTransferFailure,
+    },
+    Cancelled {
+        ndx: SessionNdx,
+    },
+}
+
+/// Destination-side negotiation events for one remote expert transfer.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum RemoteDestinationEvent {
+    TransferRequested {
+        ndx: SessionNdx,
+    },
+    PayloadRequested {
+        ndx: SessionNdx,
+        durable_prefix: u64,
+        maximum_chunk_bytes: u64,
+    },
+    Terminal(RemoteTransferTerminal),
+}
+
+/// Destination publication terminal for one NDX.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum RemoteTransferTerminal {
+    Completed {
+        ndx: SessionNdx,
+        transferred_bytes: u64,
+        blake3: [u8; 32],
+    },
+    Failed {
+        ndx: SessionNdx,
+        failure: RemoteTransferFailure,
+    },
+    Cancelled {
+        ndx: SessionNdx,
+    },
+}
+
 // ============================================================
 // Sender → Receiver 消息
 // ============================================================
@@ -86,6 +268,12 @@ pub enum SenderMsg {
     },
     /// 所有传输完成
     TransferDone,
+
+    /// 新架构的 remote-advertisement 事件；page、entry failure 与 terminal 共用有序流。
+    Advertisement(AdvertisementEvent),
+
+    /// 新架构的跨进程 source offer、payload 与完成证据。
+    RemoteSource(RemoteSourceEvent),
 }
 
 // ============================================================
@@ -162,6 +350,9 @@ pub enum ReceiverMsg {
     /// 粒度并行化扩展点，当前实现恒为 `None`（全局窗口，不区分具体是哪个 ndx 的数据
     /// 被消费）。
     CreditGrant { bytes: u64, ndx: Option<i32> },
+
+    /// 新架构的跨进程 destination 恢复偏移与 chunk 协商。
+    RemoteDestination(RemoteDestinationEvent),
 }
 
 // ============================================================
@@ -188,13 +379,21 @@ pub enum ReceiverMsg {
 /// 方案 b）：Sender 发送 `FileData`/`DeltaData`/`TarPacked` 前按 payload 字节数扣减
 /// credit（不足则等待对端授信），Receiver 消费后半窗批量授信补充，`ReceiverMsg`
 /// 新增 variant 导致 bincode 线格式不兼容 v4。
-pub const PROTOCOL_VERSION: u32 = 5;
+///
+/// 6：新增 opaque observation advertisement 事件；NDX 改为 session-local，FileList
+/// 以单一 terminal event 结束。新旧 wire 不兼容，不提供双协议解码。
+///
+/// 7：新增 remote expert transfer 的 source offer、durable-prefix/chunk 协商、带 offset
+/// payload 与 source evidence。新旧 wire 不兼容，不提供双协议解码。
+///
+/// 8：remote expert terminal 新增 staged metadata phase。新旧 wire 不兼容，不提供双协议解码。
+pub const PROTOCOL_VERSION: u32 = 8;
 
 /// 当前 binary 能接受的最低对端协议版本
 ///
 /// 对端版本低于此值时握手拒绝，避免 bincode schema 不兼容导致反序列化失败
 /// 或部分文件已写入、部分未写入的"半执行"不一致状态。
-pub const MIN_SUPPORTED_PROTOCOL_VERSION: u32 = 5;
+pub const MIN_SUPPORTED_PROTOCOL_VERSION: u32 = 8;
 
 /// 完整性校验使用的 hash 算法
 ///
@@ -682,7 +881,55 @@ mod tests {
         }
     }
 
-    /// 双方均为当前版本（v5）时握手应正常通过
+    /// v5 对端尚不知道 opaque advertisement variant，因此必须被拒绝。
+    #[test]
+    fn negotiate_rejects_v5_peer() {
+        let current = ProtocolHandshake::current();
+        let v5_peer = ProtocolHandshake {
+            protocol_version: 5,
+            min_supported_version: 5,
+            features: FeatureFlags::current(),
+            hash_algorithm: HashAlgorithm::Blake3,
+        };
+        match current.negotiate(&v5_peer) {
+            HandshakeResult::Rejected { reason } => assert!(!reason.is_empty()),
+            other @ HandshakeResult::Accepted { .. } => panic!("v5 对端应被拒绝，got {other:?}"),
+        }
+    }
+
+    /// v6 对端尚不知道 remote expert transfer variants，因此必须被拒绝。
+    #[test]
+    fn negotiate_rejects_v6_peer() {
+        let current = ProtocolHandshake::current();
+        let v6_peer = ProtocolHandshake {
+            protocol_version: 6,
+            min_supported_version: 6,
+            features: FeatureFlags::current(),
+            hash_algorithm: HashAlgorithm::Blake3,
+        };
+        match current.negotiate(&v6_peer) {
+            HandshakeResult::Rejected { reason } => assert!(!reason.is_empty()),
+            other @ HandshakeResult::Accepted { .. } => panic!("v6 对端应被拒绝，got {other:?}"),
+        }
+    }
+
+    /// v7 对端尚不知道 staged metadata terminal phase，因此必须被拒绝。
+    #[test]
+    fn negotiate_rejects_v7_peer() {
+        let current = ProtocolHandshake::current();
+        let v7_peer = ProtocolHandshake {
+            protocol_version: 7,
+            min_supported_version: 7,
+            features: FeatureFlags::current(),
+            hash_algorithm: HashAlgorithm::Blake3,
+        };
+        match current.negotiate(&v7_peer) {
+            HandshakeResult::Rejected { reason } => assert!(!reason.is_empty()),
+            other @ HandshakeResult::Accepted { .. } => panic!("v7 对端应被拒绝，got {other:?}"),
+        }
+    }
+
+    /// 双方均为当前版本（v8）时握手应正常通过。
     #[test]
     fn negotiate_accepts_matching_current_peers() {
         let current = ProtocolHandshake::current();

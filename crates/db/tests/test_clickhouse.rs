@@ -16,9 +16,11 @@ mod clickhouse_integration_tests {
     use data_mover::model::{
         BackendIdentity, BackendKind, EntryKind, IdentityStrength, ObservedEntry, SourceIdentity, StoragePath,
     };
+    use data_mover::storage::RecoveryIdentity;
+    use data_mover::transfer::RecoveryRegistrationFailure;
     use data_mover::{EntryEnum, NASEntry, S3Entry};
     use db::clickhouse::ClickHouseDatabase;
-    use db::{ClickHouseConfig, Database, DatabaseError, DeletionStatus, ObservedEntryRecord};
+    use db::{ClickHouseConfig, Database, DatabaseError, DeletionStatus, ObservedEntryRecord, RecoveryAttemptId};
 
     // 使用原子计数器确保每个测试用例都有唯一的job_id
     static TEST_COUNTER: AtomicUsize = AtomicUsize::new(0);
@@ -293,6 +295,85 @@ mod clickhouse_integration_tests {
         assert_eq!(db.publish_observation_snapshot().await.unwrap(), 1);
         assert_eq!(db.query_scan_state().await.unwrap(), Some(0));
         assert_eq!(db.load_observation(&record.identity_key).await.unwrap(), None);
+        database.cleanup().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires lab ClickHouse"]
+    async fn recovery_registration_is_durable_and_rejects_a_stale_attempt() {
+        let (mut db, _, _, database) = setup_isolated_state_db("recovery_registration").await;
+        db.create_scan_base_table().await.unwrap();
+        db.create_scan_state_table().await.unwrap();
+        db.insert_scan_state(0).await.unwrap();
+        let backend = BackendIdentity::new(BackendKind::Local, "clickhouse-fixture").unwrap();
+        let source = SourceIdentity::new(backend, IdentityStrength::PathScoped, b"large.bin").unwrap();
+        let entry = ObservedEntry::new(
+            StoragePath::new("large.bin").unwrap(),
+            EntryKind::File,
+            Some(512 * 1024 * 1024),
+            None,
+            source,
+        )
+        .unwrap();
+        let record = ObservedEntryRecord::capture(&entry, 1);
+        db.batch_insert_observations(std::slice::from_ref(&record))
+            .await
+            .unwrap();
+
+        let first_attempt = RecoveryAttemptId::new(7, "worker-a").unwrap();
+        let first = db
+            .open_recovery_attempt(entry.identity_key(), first_attempt.clone())
+            .await
+            .unwrap();
+        let identity = RecoveryIdentity::from_bytes(&b"opaque-local-stage"[..]).unwrap();
+        first.registrar().register(identity.clone()).await.unwrap();
+
+        let resumed = db
+            .open_recovery_attempt(entry.identity_key(), first_attempt)
+            .await
+            .unwrap();
+        assert_eq!(resumed.identity(), Some(&identity));
+        assert_eq!(resumed.claim(), first.claim());
+
+        db.begin_observation_snapshot().await.unwrap();
+        db.batch_insert_temp_observations(std::slice::from_ref(&record))
+            .await
+            .unwrap();
+        assert_eq!(db.publish_observation_snapshot().await.unwrap(), 0);
+        let after_snapshot = db
+            .open_recovery_attempt(entry.identity_key(), RecoveryAttemptId::new(7, "worker-a").unwrap())
+            .await
+            .unwrap();
+        assert_eq!(after_snapshot.identity(), Some(&identity));
+        assert_eq!(after_snapshot.claim(), first.claim());
+
+        let newer_attempt = RecoveryAttemptId::new(8, "worker-b").unwrap();
+        let newer = db
+            .open_recovery_attempt(entry.identity_key(), newer_attempt.clone())
+            .await
+            .unwrap();
+        assert_eq!(newer.identity(), Some(&identity));
+        assert_ne!(newer.claim(), first.claim());
+        assert_eq!(
+            first.registrar().register(identity).await,
+            Err(RecoveryRegistrationFailure::Rejected)
+        );
+
+        db.complete_recovery_attempt(entry.identity_key(), &newer_attempt)
+            .await
+            .unwrap();
+        assert!(matches!(
+            db.open_recovery_attempt(entry.identity_key(), newer_attempt).await,
+            Err(DatabaseError::RecoveryAttemptCompleted)
+        ));
+
+        let after_completion = db
+            .open_recovery_attempt(entry.identity_key(), RecoveryAttemptId::new(9, "worker-c").unwrap())
+            .await
+            .unwrap();
+        assert_eq!(after_completion.identity(), None);
+        assert_ne!(after_completion.claim(), newer.claim());
+
         database.cleanup().await;
     }
 

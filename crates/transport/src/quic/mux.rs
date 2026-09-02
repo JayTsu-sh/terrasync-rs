@@ -107,7 +107,11 @@ pub(crate) fn sender_stream_kind(msg: &SenderMsg) -> StreamKind {
         | SenderMsg::TransferDone
         | SenderMsg::EntryError { .. } => StreamKind::Control,
 
-        SenderMsg::FilePage(_) | SenderMsg::FileListError { .. } | SenderMsg::FileListDone => StreamKind::FileList,
+        SenderMsg::FilePage(_)
+        | SenderMsg::FileListError { .. }
+        | SenderMsg::FileListDone
+        | SenderMsg::Advertisement(_)
+        | SenderMsg::RemoteSource(crate::message::RemoteSourceEvent::Offer { .. }) => StreamKind::FileList,
 
         SenderMsg::CopyEntry { .. }
         | SenderMsg::CreateDir { .. }
@@ -118,7 +122,13 @@ pub(crate) fn sender_stream_kind(msg: &SenderMsg) -> StreamKind {
         | SenderMsg::DeltaData { .. }
         | SenderMsg::DeltaMatch { .. }
         | SenderMsg::TarPacked { .. }
-        | SenderMsg::SetAcl { .. } => StreamKind::Data,
+        | SenderMsg::SetAcl { .. }
+        | SenderMsg::RemoteSource(
+            crate::message::RemoteSourceEvent::Payload { .. }
+            | crate::message::RemoteSourceEvent::Completed { .. }
+            | crate::message::RemoteSourceEvent::Failed { .. }
+            | crate::message::RemoteSourceEvent::Cancelled { .. },
+        ) => StreamKind::Data,
     }
 }
 
@@ -131,7 +141,11 @@ pub(crate) fn receiver_stream_kind(msg: &ReceiverMsg) -> StreamKind {
         | ReceiverMsg::DeltaTransferRequest { .. }
         | ReceiverMsg::MetadataUpdateRequest { .. }
         | ReceiverMsg::Classified { .. }
-        | ReceiverMsg::RequestsDone => StreamKind::FileList,
+        | ReceiverMsg::RequestsDone
+        | ReceiverMsg::RemoteDestination(
+            crate::message::RemoteDestinationEvent::TransferRequested { .. }
+            | crate::message::RemoteDestinationEvent::PayloadRequested { .. },
+        ) => StreamKind::FileList,
 
         ReceiverMsg::EntrySuccess { .. }
         | ReceiverMsg::EntryError { .. }
@@ -141,7 +155,10 @@ pub(crate) fn receiver_stream_kind(msg: &ReceiverMsg) -> StreamKind {
         | ReceiverMsg::Error { .. }
         | ReceiverMsg::Progress(_)
         | ReceiverMsg::AllDone
-        | ReceiverMsg::CreditGrant { .. } => StreamKind::AckProgress,
+        | ReceiverMsg::CreditGrant { .. }
+        | ReceiverMsg::RemoteDestination(crate::message::RemoteDestinationEvent::Terminal(_)) => {
+            StreamKind::AckProgress
+        }
     }
 }
 

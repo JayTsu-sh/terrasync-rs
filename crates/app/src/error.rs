@@ -36,6 +36,70 @@ pub enum AppError {
     /// traversal 在完整证据前被取消。
     #[error("Observation scan cancelled")]
     ObservationScanCancelled,
+
+    /// remote advertisement 在完整 traversal evidence 前被取消。
+    #[error("Remote advertisement cancelled after {observed_entries} entries and {entry_failures} entry failures")]
+    RemoteAdvertisementCancelled { observed_entries: u64, entry_failures: u64 },
+
+    /// remote advertisement 实际投影数与 traversal completion evidence 不一致。
+    #[error(
+        "Remote advertisement count mismatch: projected {projected_entries} entries/{projected_failures} failures, reported {reported_entries} entries/{reported_failures} failures"
+    )]
+    RemoteAdvertisementCountMismatch {
+        projected_entries: u64,
+        projected_failures: u64,
+        reported_entries: u64,
+        reported_failures: u64,
+    },
+
+    /// remote advertisement wire 违反分页、NDX、snapshot 或 terminal 合同。
+    #[error("Remote advertisement protocol error: {reason}")]
+    RemoteAdvertisementProtocol { reason: String },
+
+    /// 对端以失败 terminal 结束 remote advertisement。
+    #[error("Remote advertisement peer failed: {diagnostic}")]
+    RemoteAdvertisementPeerFailed { diagnostic: String },
+
+    /// remote expert transfer 收到错误 NDX、offset、chunk 或消息顺序。
+    #[error("Remote expert transfer {ndx} protocol error: {reason}")]
+    RemoteExpertTransferProtocol { ndx: u64, reason: String },
+
+    /// data-mover expert half 的 typed failure；保留 stage 清理/恢复所有权。
+    #[error("Remote expert transfer {ndx}: {source}")]
+    RemoteExpertTransferFailure {
+        ndx: u64,
+        #[source]
+        source: data_mover::transfer::TransferFailure,
+    },
+
+    /// peer 通过结构化 terminal 报告的 expert transfer 失败。
+    #[error("Remote expert peer transfer {ndx} failed: {failure:?}")]
+    RemoteExpertPeerFailure {
+        ndx: u64,
+        failure: transport::message::RemoteTransferFailure,
+    },
+
+    /// peer 在完成 evidence 前取消了 expert transfer。
+    #[error("Remote expert peer transfer {ndx} was cancelled")]
+    RemoteExpertPeerCancelled { ndx: u64 },
+
+    /// FinalDestination 已发布，但应用恢复完成事件未能持久化。
+    #[error("Remote expert transfer {ndx} recovery completion persistence failed: {source}")]
+    RemoteExpertRecoveryCompletion {
+        ndx: u64,
+        source_qos: data_mover::storage::SourceQosStats,
+        #[source]
+        source: Box<AppError>,
+    },
+
+    /// 远端 payload 中断，同时保留目标端 unpublished stage 的清理/恢复所有权。
+    #[error("Remote expert transfer {ndx} payload interrupted: {peer}; destination: {destination}")]
+    RemoteExpertPayloadInterrupted {
+        ndx: u64,
+        peer: Box<AppError>,
+        #[source]
+        destination: data_mover::transfer::TransferFailure,
+    },
     /// 存储错误
     #[error("{0}")]
     StorageError(#[from] data_mover::error::StorageError),

@@ -6,9 +6,13 @@
 use std::collections::HashMap;
 use std::env;
 use std::num::NonZeroUsize;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
-use app::local_transfer::{LocalTransferConfig, LocalTransferSink, run_local_transfer};
+use app::local_transfer::{
+    EntryRecoveryState, LocalTransferConfig, LocalTransferSink, RecoveryRegistration, run_local_transfer,
+};
 use async_trait::async_trait;
 use data_mover::HdfsConfig;
 use data_mover::error::StorageError;
@@ -18,14 +22,20 @@ use data_mover::model::{
 };
 use data_mover::storage::{
     BackendConfig, BackendConnectError, CifsBackendConfig, ExistingDestinationPolicy, HdfsBackendConfig,
-    LocalBackendConfig, NfsBackendConfig, S3BackendConfig, connect_backend,
+    LocalBackendConfig, NfsBackendConfig, RecoveryIdentity, S3BackendConfig, connect_backend,
 };
-use data_mover::transfer::{InflightLimits, RecoveryPolicy, TransferFailure, TransferOutcome, TransferValueError};
+use data_mover::transfer::{
+    InflightLimits, RecoveryRegistrar, RecoveryRegistrationFailure, Resumability, TransferFailure, TransferOutcome,
+    TransferValueError,
+};
 use data_mover::traversal::{TraversalCompletion, TraversalItem, TraversalOutcome, TraversalSession};
 use thiserror::Error;
+use tokio::io::AsyncWriteExt;
 use tokio_util::sync::CancellationToken;
+use utils::sanitize_job_id;
 
 const PAYLOAD: &str = "payload.bin";
+const RECOVERY_MAGIC: &[u8; 8] = b"TSRCV001";
 
 #[derive(Debug, Error)]
 enum MatrixError {
@@ -63,17 +73,119 @@ struct Sink {
     failures: usize,
 }
 
+struct FileRecoveryState {
+    path: PathBuf,
+}
+
+struct FileRecoveryRegistrar {
+    path: PathBuf,
+    claim: [u8; 32],
+}
+
+#[async_trait]
+impl RecoveryRegistrar for FileRecoveryRegistrar {
+    async fn register(&self, identity: RecoveryIdentity) -> std::result::Result<(), RecoveryRegistrationFailure> {
+        persist_recovery_state(&self.path, self.claim, Some(identity.as_bytes()))
+            .await
+            .map_err(|_| RecoveryRegistrationFailure::unavailable())
+    }
+}
+
+#[async_trait]
+impl EntryRecoveryState for FileRecoveryState {
+    async fn open(&self, _entry: &ObservedEntry) -> app::error::Result<RecoveryRegistration> {
+        let (claim, identity) = match tokio::fs::read(&self.path).await {
+            Ok(bytes) => decode_recovery_state(&bytes)?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let claim = new_recovery_claim(&self.path)?;
+                persist_recovery_state(&self.path, claim, None).await?;
+                (claim, None)
+            }
+            Err(error) => return Err(error.into()),
+        };
+        Ok(RecoveryRegistration::new(
+            identity,
+            claim,
+            Arc::new(FileRecoveryRegistrar {
+                path: self.path.clone(),
+                claim,
+            }),
+        ))
+    }
+
+    async fn completed(&self, _entry: &ObservedEntry) -> app::error::Result<()> {
+        match tokio::fs::remove_file(&self.path).await {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error.into()),
+        }
+    }
+}
+
 #[async_trait]
 impl LocalTransferSink for Sink {
-    async fn completed(&mut self, _entry: ObservedEntry, _outcome: TransferOutcome) {}
-
-    async fn entry_failed(&mut self, _failure: data_mover::model::EntryOperationFailure) {
-        self.failures += 1;
+    async fn completed(&mut self, _entry: ObservedEntry, _outcome: TransferOutcome) -> app::error::Result<()> {
+        Ok(())
     }
 
-    async fn transfer_failed(&mut self, _entry: ObservedEntry, _failure: TransferFailure) {
+    async fn entry_failed(&mut self, _failure: data_mover::model::EntryOperationFailure) -> app::error::Result<()> {
         self.failures += 1;
+        Ok(())
     }
+
+    async fn transfer_failed(&mut self, _entry: ObservedEntry, _failure: TransferFailure) -> app::error::Result<()> {
+        self.failures += 1;
+        Ok(())
+    }
+}
+
+fn decode_recovery_state(bytes: &[u8]) -> app::error::Result<([u8; 32], Option<RecoveryIdentity>)> {
+    if bytes.len() < 40 || &bytes[..8] != RECOVERY_MAGIC {
+        return Err(app::error::AppError::ConfigError(
+            "invalid matrix recovery state".to_string(),
+        ));
+    }
+    let claim = bytes[8..40]
+        .try_into()
+        .map_err(|_| app::error::AppError::ConfigError("invalid matrix recovery claim".to_string()))?;
+    let identity = if bytes.len() == 40 {
+        None
+    } else {
+        Some(
+            RecoveryIdentity::from_bytes(bytes[40..].to_vec())
+                .map_err(|error| app::error::AppError::ConfigError(error.to_string()))?,
+        )
+    };
+    Ok((claim, identity))
+}
+
+fn new_recovery_claim(path: &Path) -> std::io::Result<[u8; 32]> {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(std::io::Error::other)?;
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"terrasync/matrix-recovery-claim/v1\0");
+    hasher.update(path.as_os_str().as_encoded_bytes());
+    hasher.update(&std::process::id().to_le_bytes());
+    hasher.update(&now.as_nanos().to_le_bytes());
+    Ok(*hasher.finalize().as_bytes())
+}
+
+async fn persist_recovery_state(path: &Path, claim: [u8; 32], identity: Option<&[u8]>) -> std::io::Result<()> {
+    let temporary = path.with_extension("tmp");
+    let mut file = tokio::fs::File::create(&temporary).await?;
+    file.write_all(RECOVERY_MAGIC).await?;
+    file.write_all(&claim).await?;
+    if let Some(identity) = identity {
+        file.write_all(identity).await?;
+    }
+    file.sync_all().await?;
+    drop(file);
+    tokio::fs::rename(&temporary, path).await?;
+    if let Some(parent) = path.parent() {
+        tokio::fs::File::open(parent).await?.sync_all().await?;
+    }
+    Ok(())
 }
 
 fn required(name: &'static str) -> Result<String, MatrixError> {
@@ -139,6 +251,7 @@ async fn connect(profile: &str, role: &str, root: &str) -> Result<data_mover::st
         "local" => BackendConfig::Local(LocalBackendConfig {
             root: PathBuf::from(root),
             identity: backend,
+            read_concurrency: NonZeroUsize::new(2).ok_or(MatrixError::InvalidLimit)?,
             write_concurrency: NonZeroUsize::new(2).ok_or(MatrixError::InvalidLimit)?,
         }),
         "nfs3" | "nfs40" | "nfs41" => BackendConfig::Nfs(NfsBackendConfig {
@@ -229,6 +342,9 @@ async fn main() -> Result<(), MatrixError> {
         .then(|| std::fs::metadata(PathBuf::from(source_root).join(PAYLOAD)).map(|metadata| metadata.len()))
         .transpose()?;
     let cancel = CancellationToken::new();
+    let recovery = Arc::new(FileRecoveryState {
+        path: env::temp_dir().join(format!("terrasync-{}-{PAYLOAD}.recovery", sanitize_job_id(job))),
+    });
     let mut sink = Sink { failures: 0 };
     let report = run_local_transfer(
         session(&source_id, size, cancel.clone()).await?,
@@ -239,7 +355,8 @@ async fn main() -> Result<(), MatrixError> {
             inflight: InflightLimits::new(4, 4 * 1024 * 1024, 1)?,
             max_concurrent_files: NonZeroUsize::new(1).ok_or(MatrixError::InvalidLimit)?,
             existing_destination: ExistingDestinationPolicy::Overwrite,
-            recovery_policy: RecoveryPolicy::ResumeOrRestart,
+            resumability: Resumability::Enabled,
+            recovery: Some(recovery),
             cancel,
         },
         &mut sink,

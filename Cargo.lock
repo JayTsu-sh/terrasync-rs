@@ -1759,7 +1759,7 @@ checksum = "4583a4551df46e2792f82ceeac45e850d2e2d5debba0b91f102385cda5b11f06"
 [[package]]
 name = "data-mover"
 version = "0.2.0"
-source = "git+https://github.com/JayTsu-sh/data-mover-rs.git?rev=76fdb81738df32a85284a974e1fea7570590a2b9#76fdb81738df32a85284a974e1fea7570590a2b9"
+source = "git+https://github.com/JayTsu-sh/data-mover-rs.git?rev=d76ff5cbe1ac439ea71d16a4f158d55f310a1b45#d76ff5cbe1ac439ea71d16a4f158d55f310a1b45"
 dependencies = [
  "arc-swap",
  "async-channel",
@@ -7195,7 +7195,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.48.0",
 ]
 
 [[package]]

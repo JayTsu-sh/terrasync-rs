@@ -150,6 +150,12 @@ mod tests {
             "size_observed Bool",
             "modified_unix_nanos Nullable(Int128)",
             "entry_snapshot Array(UInt8)",
+            "row_kind UInt8",
+            "recovery_attempt_order UInt64",
+            "recovery_attempt_id String",
+            "recovery_event_order UInt8",
+            "recovery_claim String",
+            "recovery_identity Array(UInt8)",
             "INDEX identity_key_idx identity_key TYPE bloom_filter",
         ] {
             assert!(FILE_SCAN_COLUMNS_DEFINITION.contains(column));

@@ -15,9 +15,12 @@ pub mod prelude {
         create_in_process_pair_with_capacity,
     };
     pub use crate::message::{
-        BlockSignature, DestIndex, DiskCommitMsg, FeatureFlags, HandshakeResult, HashAlgorithm,
-        MIN_SUPPORTED_PROTOCOL_VERSION, NdxTable, PROTOCOL_VERSION, ProgressSnapshot, ProtocolHandshake, ReceiverMsg,
-        SenderMsg, SessionConfig, TransferDecision,
+        AdvertisedObservation, AdvertisementEvent, AdvertisementFailure, AdvertisementFailureScope,
+        AdvertisementTerminal, BlockSignature, DestIndex, DiskCommitMsg, FeatureFlags, HandshakeResult, HashAlgorithm,
+        MIN_SUPPORTED_PROTOCOL_VERSION, NdxTable, ObservationPage, PROTOCOL_VERSION, ProgressSnapshot,
+        ProtocolHandshake, ReceiverMsg, RemoteDestinationEvent, RemoteSourceEvent, RemoteStageDisposition,
+        RemoteTransferFailure, RemoteTransferPhase, RemoteTransferSide, RemoteTransferTerminal, SenderMsg,
+        SessionConfig, SessionNdx, SourceQosSnapshot, TransferDecision,
     };
     #[cfg(feature = "quic")]
     pub use crate::quic::{QuicReceiverTransport, QuicSenderTransport};

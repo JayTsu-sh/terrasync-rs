@@ -53,6 +53,12 @@ pub mod remote_sync;
 /// 后续重构可在不扩大调用方 interface 的前提下逐步迁移会话状态。
 pub mod remote_receiver_session;
 
+/// 双进程 remote advertisement：opaque snapshot paging 与 session-local NDX。
+pub mod remote_advertisement;
+
+/// 双进程 expert transfer：NDX 协商、恢复偏移、流式 payload 与唯一完成证据。
+pub mod remote_expert_transfer;
+
 /// Receiver 侧逻辑
 ///
 /// 从 transport 接收消息，在目标存储上执行写入

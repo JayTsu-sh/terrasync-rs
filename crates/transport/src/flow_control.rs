@@ -99,6 +99,9 @@ pub fn credit_cost(message: &SenderMsg) -> Option<u64> {
         SenderMsg::FileData { chunk, .. } => Some(payload_credit_cost(&chunk.data)),
         SenderMsg::DeltaData { data, .. } => Some(payload_credit_cost(data)),
         SenderMsg::TarPacked { tar_entry, .. } => Some(tar_entry.get_size()),
+        SenderMsg::RemoteSource(crate::message::RemoteSourceEvent::Payload { data, .. }) => {
+            Some(payload_credit_cost(data))
+        }
         _ => None,
     }
 }
@@ -149,6 +152,19 @@ impl ReceiverCreditState {
             transport.send(message).await?;
         }
         Ok(())
+    }
+
+    /// Returns sub-threshold credit at a per-transfer terminal while retaining the connection.
+    pub async fn flush(&mut self, transport: &(dyn ReceiverTransport + 'static)) -> Result<()> {
+        if let Some(message) = self.take_pending_grant() {
+            transport.send(message).await?;
+        }
+        Ok(())
+    }
+
+    fn take_pending_grant(&mut self) -> Option<ReceiverMsg> {
+        let bytes = std::mem::take(&mut self.accepted_pending);
+        (bytes > 0).then_some(ReceiverMsg::CreditGrant { bytes, ndx: None })
     }
 
     /// Drops connection-local accounting when a connection is replaced.
@@ -377,6 +393,20 @@ mod tests {
             credit.record_accepted(5).unwrap(),
             ReceiverCreditOutcome::Pending
         ));
+    }
+
+    #[test]
+    fn receiver_credit_exposes_subthreshold_grant_at_transfer_terminal() {
+        let mut credit = ReceiverCreditState::new(20).unwrap();
+        assert!(matches!(
+            credit.record_accepted(6).unwrap(),
+            ReceiverCreditOutcome::Pending
+        ));
+        assert!(matches!(
+            credit.take_pending_grant(),
+            Some(ReceiverMsg::CreditGrant { bytes: 6, ndx: None })
+        ));
+        assert!(credit.take_pending_grant().is_none());
     }
 
     #[test]
