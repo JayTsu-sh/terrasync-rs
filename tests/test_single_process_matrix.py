@@ -145,6 +145,15 @@ class SingleProcessMatrixTest(unittest.TestCase):
         self.assertTrue(VALIDATOR_PATH.stat().st_mode & 0o111)
         self.assertTrue((ROOT / "tests" / "lab" / "run-single-process-matrix.sh").stat().st_mode & 0o111)
 
+    def test_hdfs_defaults_use_the_kerberos_ha_nameservice(self):
+        common = (ROOT / "tests" / "lab" / "common.sh").read_text(encoding="utf-8")
+        self.assertIn(
+            "hdfs://hdfs%2Fterrasync-runner%40HDFS.LOCAL@hdfs-ha/",
+            common,
+        )
+        self.assertIn("hdfs/terrasync-runner@HDFS.LOCAL", common)
+        self.assertNotIn("hdfs://root@10.131.9.30:9000/", common)
+
 
 if __name__ == "__main__":
     unittest.main()
