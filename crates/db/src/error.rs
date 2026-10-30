@@ -28,9 +28,6 @@ pub enum DatabaseError {
     #[error("Observation query projection mismatch in field {field}")]
     ObservationProjectionMismatch { field: &'static str },
 
-    /// 已完成的 attempt 不能再次取得 recovery claim 并重新执行 payload。
-    #[error("Recovery attempt is already completed")]
-    RecoveryAttemptCompleted,
     /// `ClickHouse` 数据库相关错误
     /// 从 `clickhouse` 库的错误类型自动转换
     #[error("ClickHouse error: {0}")]

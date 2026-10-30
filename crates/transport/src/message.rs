@@ -6,8 +6,8 @@ use std::sync::Arc;
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 // 内部模块
-use data_mover::dir_tree::DirPageResult;
-use data_mover::{DataChunk, EntryEnum};
+use storage_adapter::dir_tree::DirPageResult;
+use storage_adapter::{DataChunk, EntryEnum};
 
 /// 会话内临时分配的观察索引。它只用于一次 negotiated session 的关联，不能持久化。
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
@@ -387,13 +387,13 @@ pub enum ReceiverMsg {
 /// payload 与 source evidence。新旧 wire 不兼容，不提供双协议解码。
 ///
 /// 8：remote expert terminal 新增 staged metadata phase。新旧 wire 不兼容，不提供双协议解码。
-pub const PROTOCOL_VERSION: u32 = 8;
+pub const PROTOCOL_VERSION: u32 = 9;
 
 /// 当前 binary 能接受的最低对端协议版本
 ///
 /// 对端版本低于此值时握手拒绝，避免 bincode schema 不兼容导致反序列化失败
 /// 或部分文件已写入、部分未写入的"半执行"不一致状态。
-pub const MIN_SUPPORTED_PROTOCOL_VERSION: u32 = 8;
+pub const MIN_SUPPORTED_PROTOCOL_VERSION: u32 = 9;
 
 /// 完整性校验使用的 hash 算法
 ///
@@ -929,7 +929,16 @@ mod tests {
         }
     }
 
-    /// 双方均为当前版本（v8）时握手应正常通过。
+    #[test]
+    fn negotiate_rejects_v8_snapshot_and_acl_encoding() {
+        let current = ProtocolHandshake::current();
+        let mut old = ProtocolHandshake::current();
+        old.protocol_version = 8;
+        old.min_supported_version = 8;
+        assert!(matches!(current.negotiate(&old), HandshakeResult::Rejected { .. }));
+    }
+
+    /// 双方均为当前版本（v9）时握手应正常通过。
     #[test]
     fn negotiate_accepts_matching_current_peers() {
         let current = ProtocolHandshake::current();

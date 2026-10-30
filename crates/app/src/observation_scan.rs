@@ -97,11 +97,20 @@ impl Projection {
     fn push(&mut self, item: TraversalItem) -> Option<Vec<ObservedEntryRecord>> {
         match item {
             TraversalItem::Entry(entry) => {
+                if entry
+                    .history()
+                    .is_some_and(|history| history.segment() != 0 || !history.is_complete())
+                {
+                    self.report.entry_failures += 1;
+                    return None;
+                }
                 self.report.observed_entries += 1;
                 self.report.observed_bytes += entry.size().unwrap_or_default();
                 self.batch.push(ObservedEntryRecord::capture(&entry, self.generation));
             }
-            TraversalItem::EntryFailure(_) => self.report.entry_failures += 1,
+            TraversalItem::Failure(_) | TraversalItem::ObservationFailure(_) => self.report.entry_failures += 1,
+            TraversalItem::DirectoryListed(_) | TraversalItem::Checkpoint(_) => {}
+            _ => self.report.entry_failures += 1,
         }
         (self.batch.len() == self.batch_size).then(|| std::mem::take(&mut self.batch))
     }
@@ -117,18 +126,21 @@ impl Projection {
             sink.abort_generation().await?;
             return Err(AppError::ObservationScanCancelled);
         };
-        let failures = self.report.entry_failures.max(completion.entry_failures);
+        let failures = self
+            .report
+            .entry_failures
+            .max(completion.totals.failed_children + completion.totals.listing_failures);
         if failures > 0 {
             sink.abort_generation().await?;
             return Err(AppError::ObservationScanIncomplete {
                 entry_failures: failures,
             });
         }
-        if self.report.observed_entries != completion.observed_entries {
+        if self.report.observed_entries != completion.totals.emitted {
             sink.abort_generation().await?;
             return Err(AppError::ObservationScanCountMismatch {
                 projected: self.report.observed_entries,
-                reported: completion.observed_entries,
+                reported: completion.totals.emitted,
             });
         }
         self.report.deleted_entries = sink.publish_generation().await?;
@@ -139,6 +151,13 @@ impl Projection {
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
+    fn completion(entries: u64, failures: u64) -> data_mover::traversal::TraversalCompletion {
+        let mut totals = data_mover::traversal::ScanTotals::default();
+        totals.emitted = entries;
+        totals.failed_children = failures;
+        data_mover::traversal::TraversalCompletion::new(totals)
+    }
+
     use std::sync::Mutex;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -147,7 +166,6 @@ mod tests {
         BackendIdentity, BackendKind, EntryKind, FailureClass, IdentityStrength, Operation, SourceIdentity,
         StoragePath, Transience,
     };
-    use data_mover::traversal::TraversalCompletion;
 
     use super::*;
 
@@ -195,7 +213,7 @@ mod tests {
     }
 
     fn failure() -> TraversalItem {
-        TraversalItem::EntryFailure(
+        TraversalItem::Failure(Box::new(data_mover::traversal::ScanFailure::child(
             data_mover::model::EntryOperationFailure::new(
                 StoragePath::new("denied").unwrap(),
                 Operation::Observe,
@@ -204,7 +222,7 @@ mod tests {
                 "denied",
             )
             .unwrap(),
-        )
+        )))
     }
 
     #[tokio::test]
@@ -215,13 +233,7 @@ mod tests {
         let batch = projection.push(entry("b", 5)).unwrap();
         sink.write_batch(&batch).await.unwrap();
         let report = projection
-            .finish(
-                TraversalOutcome::Completed(TraversalCompletion {
-                    observed_entries: 2,
-                    entry_failures: 0,
-                }),
-                &mut sink,
-            )
+            .finish(TraversalOutcome::Completed(completion(2, 0)), &mut sink)
             .await
             .unwrap();
         assert_eq!(report.observed_bytes, 8);
@@ -238,10 +250,7 @@ mod tests {
         let producer_task = tokio::spawn(async move {
             producer.send(entry("a", 3)).await.unwrap();
             producer.send(entry("b", 5)).await.unwrap();
-            producer.finish(Ok(TraversalOutcome::Completed(TraversalCompletion {
-                observed_entries: 2,
-                entry_failures: 0,
-            })));
+            producer.finish(Ok(TraversalOutcome::Completed(completion(2, 0))));
         });
         let mut sink = Sink::default();
 
@@ -262,13 +271,7 @@ mod tests {
         let mut projection = Projection::new(1, 2);
         assert!(projection.push(failure()).is_none());
         let error = projection
-            .finish(
-                TraversalOutcome::Completed(TraversalCompletion {
-                    observed_entries: 0,
-                    entry_failures: 1,
-                }),
-                &mut sink,
-            )
+            .finish(TraversalOutcome::Completed(completion(0, 1)), &mut sink)
             .await
             .unwrap_err();
         assert!(matches!(
@@ -295,13 +298,7 @@ mod tests {
         let mut projection = Projection::new(1, 2);
         assert!(projection.push(entry("a", 3)).is_none());
         let error = projection
-            .finish(
-                TraversalOutcome::Completed(TraversalCompletion {
-                    observed_entries: 2,
-                    entry_failures: 0,
-                }),
-                &mut sink,
-            )
+            .finish(TraversalOutcome::Completed(completion(2, 0)), &mut sink)
             .await
             .unwrap_err();
         assert!(matches!(error, AppError::ObservationScanCountMismatch { .. }));
@@ -315,13 +312,7 @@ mod tests {
             ..Sink::default()
         };
         let error = Projection::new(1, 2)
-            .finish(
-                TraversalOutcome::Completed(TraversalCompletion {
-                    observed_entries: 0,
-                    entry_failures: 0,
-                }),
-                &mut sink,
-            )
+            .finish(TraversalOutcome::Completed(completion(0, 0)), &mut sink)
             .await
             .unwrap_err();
         assert!(matches!(error, AppError::DatabaseError(_)));
@@ -363,10 +354,7 @@ mod tests {
             tokio_util::sync::CancellationToken::new(),
         );
         producer.send(entry("persisted", 7)).await.unwrap();
-        producer.finish(Ok(TraversalOutcome::Completed(TraversalCompletion {
-            observed_entries: 1,
-            entry_failures: 0,
-        })));
+        producer.finish(Ok(TraversalOutcome::Completed(completion(1, 0))));
         let report = project_pure_scan(session, &mut sink, NonZeroUsize::new(1).unwrap())
             .await
             .unwrap();
@@ -377,10 +365,7 @@ mod tests {
             NonZeroUsize::new(1).unwrap(),
             tokio_util::sync::CancellationToken::new(),
         );
-        producer.finish(Ok(TraversalOutcome::Completed(TraversalCompletion {
-            observed_entries: 0,
-            entry_failures: 0,
-        })));
+        producer.finish(Ok(TraversalOutcome::Completed(completion(0, 0))));
         let report = project_pure_scan(session, &mut sink, NonZeroUsize::new(1).unwrap())
             .await
             .unwrap();

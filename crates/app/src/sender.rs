@@ -10,8 +10,8 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 // 外部 crate
 use dashmap::DashMap;
-use data_mover::qos::QosManager;
-use data_mover::{EntryEnum, StorageEntryMessage, StorageEnum};
+use storage_adapter::qos::QosManager;
+use storage_adapter::{EntryEnum, StorageEntryMessage, StorageEnum};
 use tracing::{error, info};
 use transport::message::SenderMsg;
 use transport::traits::SenderTransport;
@@ -35,7 +35,7 @@ pub struct SenderWorkerConfig {
 /// 双进程模式：读取源文件数据后发送 `FileData` 流（Phase 3）。
 #[allow(clippy::too_many_arguments)]
 pub async fn sender_worker(
-    worker_id: usize, walkdir_iter: data_mover::AsyncReceiver<StorageEntryMessage>, src_storage: Arc<StorageEnum>,
+    worker_id: usize, walkdir_iter: storage_adapter::AsyncReceiver<StorageEntryMessage>, src_storage: Arc<StorageEnum>,
     dest_storage: Arc<StorageEnum>, transport: Arc<dyn SenderTransport>,
     broadcaster: &BroadcastForwarder<StorageEntryMessage>, config: &SenderWorkerConfig,
     qos_manager: Option<QosManager>, bytes_tracker: Option<Arc<AtomicU64>>,
@@ -225,7 +225,7 @@ async fn handle_versioned_entry(
 mod tests {
     use std::path::PathBuf;
 
-    use data_mover::{AsyncReceiver, ErrorEvent};
+    use storage_adapter::{AsyncReceiver, ErrorEvent};
 
     use crate::storage_factory::{StorageRole, create_storage_for_role};
     use tempfile::tempdir;

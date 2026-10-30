@@ -22,7 +22,7 @@ pub enum TransportError {
 
     /// 底层存储操作错误
     #[error("Storage error: {0}")]
-    StorageError(#[from] data_mover::error::StorageError),
+    StorageError(#[from] storage_adapter::error::StorageError),
 
     /// 握手阶段协议版本或能力不兼容（Sender/Receiver 协议版本超出彼此支持范围）
     #[error("Incompatible protocol: {reason}")]

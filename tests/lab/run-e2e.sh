@@ -7,7 +7,9 @@ validate_run_id "$run_id"
 require_s3_credentials
 
 repo_root="$(cd "$(dirname "$0")/../.." && pwd)"
-binary="$repo_root/target/release/terrasync"
+target_root="$(cargo metadata --format-version 1 --no-deps --manifest-path "$repo_root/Cargo.toml" | \
+  python3 -c 'import json,sys; print(json.load(sys.stdin)["target_directory"])')"
+binary="${TERRASYNC_BINARY:-$target_root/release/terrasync}"
 lab_root="/tmp/terrasync-lab/$run_id"
 runtime_root="$lab_root/runtime"
 fixture_root="$lab_root/fixtures"

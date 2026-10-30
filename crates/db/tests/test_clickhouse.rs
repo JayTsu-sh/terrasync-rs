@@ -16,11 +16,9 @@ mod clickhouse_integration_tests {
     use data_mover::model::{
         BackendIdentity, BackendKind, EntryKind, IdentityStrength, ObservedEntry, SourceIdentity, StoragePath,
     };
-    use data_mover::storage::RecoveryIdentity;
-    use data_mover::transfer::RecoveryRegistrationFailure;
-    use data_mover::{EntryEnum, NASEntry, S3Entry};
     use db::clickhouse::ClickHouseDatabase;
-    use db::{ClickHouseConfig, Database, DatabaseError, DeletionStatus, ObservedEntryRecord, RecoveryAttemptId};
+    use db::{ClickHouseConfig, Database, DatabaseError, DeletionStatus, ObservedEntryRecord};
+    use storage_adapter::{EntryEnum, NASEntry, S3Entry};
 
     // 使用原子计数器确保每个测试用例都有唯一的job_id
     static TEST_COUNTER: AtomicUsize = AtomicUsize::new(0);
@@ -160,7 +158,7 @@ mod clickhouse_integration_tests {
             atime: mtime,
             ctime: mtime,
             mtime,
-            mode: 0o644,
+            mode: Some(0o644),
             is_symlink: false,
             hard_links: Some(1),
             uid: Some(1000),
@@ -189,6 +187,126 @@ mod clickhouse_integration_tests {
             version_count: None,
             is_dir: false,
         })
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a real ClickHouse service"]
+    async fn scan_resume_persists_cursor_generation_and_idempotent_events() {
+        use db::clickhouse::scan_resume::{ABANDONED, FINALIZING, RUNNING, ScanResumeState};
+        use storage_adapter::StorageEntryMessage;
+        let (database, config, job, cleanup) = setup_isolated_state_db("resume_state").await;
+        database.initialize().await.unwrap();
+        database
+            .create_table(db::INCREMENTAL_SCAN_TABLE_BASE_NAME)
+            .await
+            .unwrap();
+        let generation = database.begin_scan_generation().await.unwrap();
+        let mut state = ScanResumeState {
+            id: 1,
+            schema_version: 1,
+            version: 1,
+            request_key: "binding".into(),
+            generation,
+            incremental: true,
+            phase: RUNNING,
+            event_time: 123_456_789,
+            observed_entries: 10,
+            checkpoint: vec![1, 2, 3],
+        };
+        assert!(database.load_resume_state().await.unwrap().is_none());
+        database.save_resume_state(&state).await.unwrap();
+        drop(database);
+        let database = ClickHouseDatabase::new(&config, &job);
+        let loaded = database.load_resume_state().await.unwrap().unwrap();
+        assert_eq!(loaded.checkpoint, state.checkpoint);
+        assert!(!database.restore_resume_generation(&loaded).await.unwrap());
+        let event = StorageEntryMessage::New(Arc::new(make_nas("file", 3, 0, None)));
+        database
+            .write_resume_events(&[event.clone()], state.event_time)
+            .await
+            .unwrap();
+        database.write_resume_events(&[event], state.event_time).await.unwrap();
+        let count = clickhouse_client(&config)
+            .query(&format!(
+                "SELECT count() FROM incremental_{} FINAL",
+                utils::sanitize_job_id(&job)
+            ))
+            .fetch_one::<u64>()
+            .await
+            .unwrap();
+        assert_eq!(count, 1);
+        let versions = [
+            StorageEntryMessage::New(Arc::new(make_s3("history-key", 1, 0, Some("v1")))),
+            StorageEntryMessage::New(Arc::new(make_s3("history-key", 2, 0, Some("v2")))),
+        ];
+        database.write_resume_events(&versions, state.event_time).await.unwrap();
+        database
+            .write_resume_events(&versions[1..], state.event_time)
+            .await
+            .unwrap();
+        let version_count = clickhouse_client(&config)
+            .query(&format!(
+                "SELECT count() FROM incremental_{} FINAL WHERE relative_path='history-key'",
+                utils::sanitize_job_id(&job)
+            ))
+            .fetch_one::<u64>()
+            .await
+            .unwrap();
+        assert_eq!(version_count, 2, "S3 versions must not collapse or duplicate on replay");
+        let large: Vec<_> = (0..600)
+            .map(|index| {
+                StorageEntryMessage::New(Arc::new(make_nas(
+                    &format!("bulk_{index}_{}", "x".repeat(1024)),
+                    1,
+                    0,
+                    None,
+                )))
+            })
+            .collect();
+        database.write_resume_events(&large, state.event_time).await.unwrap();
+        database
+            .write_resume_events(&large[300..], state.event_time)
+            .await
+            .unwrap();
+        let count = clickhouse_client(&config)
+            .query(&format!(
+                "SELECT count() FROM incremental_{} FINAL WHERE startsWith(relative_path, 'bulk_')",
+                utils::sanitize_job_id(&job)
+            ))
+            .fetch_one::<u64>()
+            .await
+            .unwrap();
+        assert_eq!(
+            count, 600,
+            "large batches must use bounded SQL and replay without duplicates"
+        );
+        let entries: Vec<_> = large
+            .iter()
+            .filter_map(|message| match message {
+                StorageEntryMessage::New(entry) => Some(entry.clone()),
+                _ => None,
+            })
+            .collect();
+        database.write_resume_base_records(&entries).await.unwrap();
+        let paths: Vec<_> = entries
+            .iter()
+            .map(|entry| entry.get_relative_path().to_string_lossy().into_owned())
+            .collect();
+        database.delete_resume_paths(&paths).await.unwrap();
+        assert_eq!(database.get_count(db::SCAN_BASE_TABLE_BASE_NAME).await.unwrap(), 0);
+        assert!(database.resume_event_epoch(0).await.unwrap() > state.event_time);
+        state.phase = FINALIZING;
+        state.advance().unwrap();
+        database.save_resume_state(&state).await.unwrap();
+        database.commit_scan_generation().await.unwrap();
+        drop(database);
+        let database = ClickHouseDatabase::new(&config, &job);
+        assert!(database.restore_resume_generation(&state).await.unwrap());
+        database.abandon_scan_resume().await.unwrap();
+        let abandoned = database.load_resume_state().await.unwrap().unwrap();
+        assert_eq!(abandoned.phase, ABANDONED);
+        assert!(abandoned.checkpoint.is_empty());
+        cleanup.cleanup().await;
     }
 
     /// 批量生成 NASEntry（用于模拟大 base 表场景）
@@ -265,7 +383,11 @@ mod clickhouse_integration_tests {
         db.batch_insert_observations(std::slice::from_ref(&record))
             .await
             .unwrap();
-        let stored = db.load_observation(&record.identity_key).await.unwrap().unwrap();
+        let stored = db
+            .load_observation(&record.identity_key, entry.source_identity().backend())
+            .await
+            .unwrap()
+            .unwrap();
 
         assert_eq!(stored, entry);
 
@@ -286,94 +408,30 @@ mod clickhouse_integration_tests {
             .await
             .unwrap();
 
-        assert_eq!(db.detect_changed_observations().await.unwrap(), vec![changed.clone()]);
+        assert_eq!(
+            db.detect_changed_observations(entry.source_identity().backend())
+                .await
+                .unwrap(),
+            vec![changed.clone()]
+        );
         assert_eq!(db.publish_observation_snapshot().await.unwrap(), 0);
         assert_eq!(db.query_scan_state().await.unwrap(), Some(1));
-        assert_eq!(db.load_observation(&record.identity_key).await.unwrap(), Some(changed));
+        assert_eq!(
+            db.load_observation(&record.identity_key, entry.source_identity().backend())
+                .await
+                .unwrap(),
+            Some(changed)
+        );
 
         db.begin_observation_snapshot().await.unwrap();
         assert_eq!(db.publish_observation_snapshot().await.unwrap(), 1);
         assert_eq!(db.query_scan_state().await.unwrap(), Some(0));
-        assert_eq!(db.load_observation(&record.identity_key).await.unwrap(), None);
-        database.cleanup().await;
-    }
-
-    #[tokio::test]
-    #[ignore = "requires lab ClickHouse"]
-    async fn recovery_registration_is_durable_and_rejects_a_stale_attempt() {
-        let (mut db, _, _, database) = setup_isolated_state_db("recovery_registration").await;
-        db.create_scan_base_table().await.unwrap();
-        db.create_scan_state_table().await.unwrap();
-        db.insert_scan_state(0).await.unwrap();
-        let backend = BackendIdentity::new(BackendKind::Local, "clickhouse-fixture").unwrap();
-        let source = SourceIdentity::new(backend, IdentityStrength::PathScoped, b"large.bin").unwrap();
-        let entry = ObservedEntry::new(
-            StoragePath::new("large.bin").unwrap(),
-            EntryKind::File,
-            Some(512 * 1024 * 1024),
-            None,
-            source,
-        )
-        .unwrap();
-        let record = ObservedEntryRecord::capture(&entry, 1);
-        db.batch_insert_observations(std::slice::from_ref(&record))
-            .await
-            .unwrap();
-
-        let first_attempt = RecoveryAttemptId::new(7, "worker-a").unwrap();
-        let first = db
-            .open_recovery_attempt(entry.identity_key(), first_attempt.clone())
-            .await
-            .unwrap();
-        let identity = RecoveryIdentity::from_bytes(&b"opaque-local-stage"[..]).unwrap();
-        first.registrar().register(identity.clone()).await.unwrap();
-
-        let resumed = db
-            .open_recovery_attempt(entry.identity_key(), first_attempt)
-            .await
-            .unwrap();
-        assert_eq!(resumed.identity(), Some(&identity));
-        assert_eq!(resumed.claim(), first.claim());
-
-        db.begin_observation_snapshot().await.unwrap();
-        db.batch_insert_temp_observations(std::slice::from_ref(&record))
-            .await
-            .unwrap();
-        assert_eq!(db.publish_observation_snapshot().await.unwrap(), 0);
-        let after_snapshot = db
-            .open_recovery_attempt(entry.identity_key(), RecoveryAttemptId::new(7, "worker-a").unwrap())
-            .await
-            .unwrap();
-        assert_eq!(after_snapshot.identity(), Some(&identity));
-        assert_eq!(after_snapshot.claim(), first.claim());
-
-        let newer_attempt = RecoveryAttemptId::new(8, "worker-b").unwrap();
-        let newer = db
-            .open_recovery_attempt(entry.identity_key(), newer_attempt.clone())
-            .await
-            .unwrap();
-        assert_eq!(newer.identity(), Some(&identity));
-        assert_ne!(newer.claim(), first.claim());
         assert_eq!(
-            first.registrar().register(identity).await,
-            Err(RecoveryRegistrationFailure::Rejected)
+            db.load_observation(&record.identity_key, entry.source_identity().backend())
+                .await
+                .unwrap(),
+            None
         );
-
-        db.complete_recovery_attempt(entry.identity_key(), &newer_attempt)
-            .await
-            .unwrap();
-        assert!(matches!(
-            db.open_recovery_attempt(entry.identity_key(), newer_attempt).await,
-            Err(DatabaseError::RecoveryAttemptCompleted)
-        ));
-
-        let after_completion = db
-            .open_recovery_attempt(entry.identity_key(), RecoveryAttemptId::new(9, "worker-c").unwrap())
-            .await
-            .unwrap();
-        assert_eq!(after_completion.identity(), None);
-        assert_ne!(after_completion.claim(), newer.claim());
-
         database.cleanup().await;
     }
 

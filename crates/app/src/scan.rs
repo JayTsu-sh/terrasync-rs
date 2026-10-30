@@ -12,12 +12,12 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 // 外部crate
-use data_mover::{
-    EntryEnum, ErrorEvent, StorageEntryMessage, WalkDirAsyncIterator, canonicalize_path, redact_storage_url,
-};
 use db::factory::DatabaseFactory;
 use db::traits::Database;
 use db::{self, DeletionStatus, INCREMENTAL_SCAN_TABLE_BASE_NAME};
+use storage_adapter::{
+    EntryEnum, ErrorEvent, StorageEntryMessage, WalkDirAsyncIterator, canonicalize_path, redact_storage_url,
+};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::{Instrument, debug, error, info, info_span, instrument, trace, warn};
@@ -758,6 +758,9 @@ pub async fn scan(
     let app_config = AppConfig::fetch()?;
     let db_config = db::config::DatabaseConfig::from_app_config(&app_config.database);
     let db_instance = DatabaseFactory::new_database(&db_config, &job_id).await.ok();
+    if let Some(database) = &db_instance {
+        database.abandon_scan_resume().await?;
+    }
     let scan_type = determine_scan_type(db_instance.as_deref(), &job_id, job_dir_pre_existing).await;
 
     info!(
@@ -913,7 +916,7 @@ async fn generate_storage_entry_message_events(
     // 查询修改文件（区分 Data/Metadata/Both 三种变更）
     trace!("Task {} querying changed items for {}", task_id, batch_type);
     let changed_items = database.detect_changed_items().await.map_err(AppError::DatabaseError)?;
-    let items: Vec<(EntryEnum, data_mover::ChangeKind)> = changed_items.collect();
+    let items: Vec<(EntryEnum, storage_adapter::ChangeKind)> = changed_items.collect();
     if !keep_item {
         for (item, _) in &items {
             excluded_paths.push((
@@ -955,10 +958,10 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use async_trait::async_trait;
-    use data_mover::{ChangeKind, EntryEnum, StorageEntryMessage};
     use db::error::DatabaseError;
     use db::traits::{Database, TarManifestRecord};
     use db::{DeletionStatus, Result as DatabaseResult};
+    use storage_adapter::{ChangeKind, EntryEnum, StorageEntryMessage};
     use tokio::sync::mpsc;
 
     use super::{
@@ -1001,7 +1004,7 @@ mod tests {
     }
 
     fn dummy_entry(name: &str) -> EntryEnum {
-        EntryEnum::NAS(data_mover::NASEntry {
+        EntryEnum::NAS(storage_adapter::NASEntry {
             name: name.to_string(),
             relative_path: PathBuf::from(name),
             extension: None,
@@ -1010,7 +1013,7 @@ mod tests {
             atime: 0,
             ctime: 0,
             mtime: 0,
-            mode: 0o644,
+            mode: Some(0o644),
             is_symlink: false,
             hard_links: None,
             uid: None,

@@ -13,8 +13,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 // 外部crate
 use dashmap::DashMap;
-use data_mover::qos::QosManager;
-use data_mover::{EntryEnum, ErrorEvent, StorageEntryMessage, StorageEnum, redact_storage_url};
+use storage_adapter::qos::QosManager;
+use storage_adapter::{EntryEnum, ErrorEvent, StorageEntryMessage, StorageEnum, redact_storage_url};
 use tracing::{Instrument, debug, error, info, info_span, instrument, trace, warn};
 #[cfg(windows)]
 use windows_sys::Win32::Foundation::CloseHandle;
@@ -284,7 +284,7 @@ pub(crate) async fn process_versioned_entry(
 
         trace!("Sorted versions: {:?}", task_versions);
 
-        if dest_storage.is_bucket_versioned() {
+        if matches!(dest_storage.is_bucket_versioned().await, Ok(true)) {
             let version_count = task_versions.len() as u32;
             debug!("Processing object {} with {} versions", object_key, version_count);
 
@@ -545,7 +545,7 @@ async fn process_entry_inner(
             &src_storage,
             &dest_storage,
             entry,
-            data_mover::CopyOptions {
+            storage_adapter::CopyOptions {
                 qos: qos_manager,
                 enable_integrity_check,
                 is_source_reserved,
@@ -574,11 +574,7 @@ async fn process_entry_inner(
         )
         .await?;
 
-        // 设置目标文件元数据（时间戳、权限）
-        dest_storage
-            .set_entry_metadata(entry)
-            .await
-            .map_err(|e| AppError::CopyError(format!("Failed to set metadata for {}: {e}", relative_path.display())))?;
+        // data-mover applies negotiated metadata before publishing the file.
 
         debug!("Copied file (resumable) {:?}", relative_path);
     } else {
@@ -589,7 +585,7 @@ async fn process_entry_inner(
             &src_storage,
             &dest_storage,
             entry,
-            data_mover::CopyOptions {
+            storage_adapter::CopyOptions {
                 qos: qos_manager,
                 enable_integrity_check,
                 is_source_reserved,
@@ -600,11 +596,7 @@ async fn process_entry_inner(
         .await
         .map_err(|e| AppError::CopyError(format!("Failed to copy {}: {e}", relative_path.display())))?;
 
-        // 设置目标文件元数据（时间戳、权限）
-        dest_storage
-            .set_entry_metadata(entry)
-            .await
-            .map_err(|e| AppError::CopyError(format!("Failed to set metadata for {}: {e}", relative_path.display())))?;
+        // data-mover applies negotiated metadata before publishing the file.
 
         debug!("Copied file {:?}", relative_path);
     }
@@ -655,7 +647,7 @@ pub(crate) struct ResumeOpts {
 
 pub(crate) struct CommitRecorder {
     store: Arc<ByteResumeStore>,
-    callback: data_mover::CommitCallback,
+    callback: storage_adapter::CommitCallback,
     drain: tokio::task::JoinHandle<()>,
     shutdown: tokio::sync::oneshot::Sender<()>,
     dropped: Arc<AtomicU64>,
@@ -716,7 +708,7 @@ impl CommitRecorder {
         })
     }
 
-    pub(crate) fn callback(&self) -> data_mover::CommitCallback {
+    pub(crate) fn callback(&self) -> storage_adapter::CommitCallback {
         self.callback.clone()
     }
 
@@ -747,7 +739,7 @@ mod commit_recorder_tests {
     use std::path::Path;
     use std::time::Duration;
 
-    use data_mover::{CreateStorageOptions, create_storage};
+    use storage_adapter::{CreateStorageOptions, create_storage};
 
     use super::CommitRecorder;
 
@@ -858,7 +850,7 @@ pub(crate) async fn copy_file_with_resume(
     let recorder = CommitRecorder::start(job_dir, entry, src_storage.block_size()).await?;
     let missing = recorder.store.missing_intervals().await;
 
-    let resume = data_mover::ResumeContext {
+    let resume = storage_adapter::ResumeContext {
         part_relative_path: part_path_for(dest_rel),
         missing_intervals: missing,
         on_committed: recorder.callback(),
@@ -868,7 +860,7 @@ pub(crate) async fn copy_file_with_resume(
         src_storage,
         dest_storage,
         entry,
-        data_mover::CopyOptions {
+        storage_adapter::CopyOptions {
             qos: qos_manager,
             enable_integrity_check,
             is_source_reserved,

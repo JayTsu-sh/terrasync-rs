@@ -1,4 +1,4 @@
-use data_mover::{
+use storage_adapter::{
     BackendConfig, CreateStorageOptions, HdfsConfig, HdfsKerberosCredentials, StorageEnum, StorageType,
     detect_storage_type,
 };
@@ -54,7 +54,7 @@ pub async fn create_storage_for_role(
     } else {
         StorageConfig::default()
     };
-    Ok(data_mover::create_storage(
+    Ok(storage_adapter::create_storage(
         path,
         create_storage_options(storage_type, block_size, ensure_dir, role, &storage)?,
     )
@@ -67,7 +67,7 @@ mod tests {
     use std::collections::HashMap;
     use std::path::PathBuf;
 
-    use data_mover::{BackendConfig, StorageType};
+    use storage_adapter::{BackendConfig, StorageType};
     use utils::app_config::{HdfsClientConfig, HdfsKerberosConfig, StorageConfig, StorageRoleConfig};
 
     use super::{StorageRole, create_storage_options};

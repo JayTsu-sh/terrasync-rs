@@ -10,10 +10,10 @@ use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex, PoisonError};
 
-use data_mover::dir_tree::NdxEvent;
-use data_mover::qos::QosManager;
-use data_mover::{ChangeKind, ErrorEvent, StorageEntryMessage};
-use data_mover::{ConsistencyCheck, EntryEnum, StorageEnum, WalkDirAsyncIterator2};
+use storage_adapter::dir_tree::NdxEvent;
+use storage_adapter::qos::QosManager;
+use storage_adapter::{ChangeKind, ErrorEvent, StorageEntryMessage};
+use storage_adapter::{ConsistencyCheck, EntryEnum, StorageEnum, WalkDirAsyncIterator2};
 use sync_delta::DeltaToken;
 use sync_delta::matcher::DeltaMatcher;
 use tokio::sync::Mutex as AsyncMutex;

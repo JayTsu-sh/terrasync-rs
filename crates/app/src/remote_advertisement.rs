@@ -98,6 +98,7 @@ pub struct RemoteAdvertisementSummary {
 
 /// Receiver 侧的增量 validator；只保留页号、NDX 与计数，不访问 storage backend。
 pub struct RemoteAdvertisementReceiver {
+    backend: data_mover::model::BackendIdentity,
     maximum_page_entries: usize,
     expected_page: u64,
     expected_ndx: u64,
@@ -107,8 +108,9 @@ pub struct RemoteAdvertisementReceiver {
 
 impl RemoteAdvertisementReceiver {
     #[must_use]
-    pub fn new(maximum_page_entries: NonZeroUsize) -> Self {
+    pub fn new(maximum_page_entries: NonZeroUsize, backend: data_mover::model::BackendIdentity) -> Self {
         Self {
+            backend,
             maximum_page_entries: maximum_page_entries.get(),
             expected_page: 0,
             expected_ndx: 0,
@@ -149,7 +151,7 @@ impl RemoteAdvertisementReceiver {
                             self.expected_ndx, advertised.ndx.0
                         )));
                     }
-                    let entry = ObservedEntry::decode_snapshot(&advertised.snapshot)
+                    let entry = ObservedEntry::decode_snapshot(&advertised.snapshot, &self.backend)
                         .map_err(|error| protocol_error(error.to_string()))?;
                     entries.push((advertised.ndx, entry));
                     self.expected_ndx = self
@@ -287,15 +289,17 @@ pub async fn advertise_remote(
                     sink.send(AdvertisementEvent::Page(page)).await?;
                 }
             }
-            TraversalItem::EntryFailure(failure) => {
+            TraversalItem::Failure(failure) => {
                 if let Some(page) = projection.take_page() {
                     sink.send(AdvertisementEvent::Page(page)).await?;
                 }
                 projection.entry_failures += 1;
-                let failure = project_entry_failure(&failure);
+                let failure = project_entry_failure(&failure.failure);
                 projection.failures.push(failure.clone());
                 sink.send(AdvertisementEvent::EntryFailure(failure)).await?;
             }
+            TraversalItem::DirectoryListed(_) | TraversalItem::Checkpoint(_) => {}
+            item => return Err(protocol_error(format!("unsupported traversal event: {item:?}"))),
         }
     }
     if let Some(page) = projection.take_page() {
@@ -304,14 +308,14 @@ pub async fn advertise_remote(
 
     match session.finish().await {
         Ok(TraversalOutcome::Completed(completion)) => {
-            if projection.observed_entries != completion.observed_entries
-                || projection.entry_failures != completion.entry_failures
+            if projection.observed_entries != completion.totals.emitted
+                || projection.entry_failures != (completion.totals.failed_children + completion.totals.listing_failures)
             {
                 let error = AppError::RemoteAdvertisementCountMismatch {
                     projected_entries: projection.observed_entries,
                     projected_failures: projection.entry_failures,
-                    reported_entries: completion.observed_entries,
-                    reported_failures: completion.entry_failures,
+                    reported_entries: completion.totals.emitted,
+                    reported_failures: (completion.totals.failed_children + completion.totals.listing_failures),
                 };
                 sink.send(AdvertisementEvent::Terminal(AdvertisementTerminal::Failed {
                     observed_entries: projection.observed_entries,
@@ -416,9 +420,7 @@ fn project_entry_failure(failure: &EntryOperationFailure) -> AdvertisementFailur
     AdvertisementFailure {
         scope: AdvertisementFailureScope::Entry,
         path: Some(failure.path().as_str().to_string()),
-        identity: failure
-            .identity()
-            .map(data_mover::model::EntryFailureIdentity::as_bytes),
+        identity: None,
         operation: Some(format!("{:?}", failure.operation())),
         class: Some(format!("{:?}", failure.class())),
         transience: Some(format!("{:?}", failure.transience())),
@@ -429,7 +431,7 @@ fn project_entry_failure(failure: &EntryOperationFailure) -> AdvertisementFailur
 fn project_terminal_failure(failure: &TraversalTerminalFailure) -> AdvertisementFailure {
     match failure {
         TraversalTerminalFailure::Session(failure) => project_backend_failure(failure),
-        TraversalTerminalFailure::Internal => runtime_failure("traversal runtime failed".to_string()),
+        _ => runtime_failure(failure.to_string()),
     }
 }
 
@@ -460,13 +462,20 @@ fn runtime_failure(diagnostic: String) -> AdvertisementFailure {
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
+    fn completion(entries: u64, failures: u64) -> data_mover::traversal::TraversalCompletion {
+        let mut totals = data_mover::traversal::ScanTotals::default();
+        totals.emitted = entries;
+        totals.failed_children = failures;
+        data_mover::traversal::TraversalCompletion::new(totals)
+    }
+
     use std::sync::{Arc, Mutex};
 
     use data_mover::model::{
         BackendIdentity, BackendKind, EntryKind, FailureClass, IdentityStrength, Operation, SourceIdentity,
         StoragePath, Transience,
     };
-    use data_mover::traversal::{TraversalCompletion, TraversalItem, TraversalOutcome, TraversalTerminalFailure};
+    use data_mover::traversal::{TraversalItem, TraversalOutcome, TraversalTerminalFailure};
     use tokio_util::sync::CancellationToken;
     use transport::message::{AdvertisementFailureScope, AdvertisementTerminal};
     use transport::traits::ReceiverTransport;
@@ -502,7 +511,7 @@ mod tests {
     }
 
     fn failure(path: &str) -> TraversalItem {
-        TraversalItem::EntryFailure(
+        TraversalItem::Failure(Box::new(data_mover::traversal::ScanFailure::child(
             data_mover::model::EntryOperationFailure::new(
                 StoragePath::new(path).unwrap(),
                 Operation::Observe,
@@ -511,7 +520,7 @@ mod tests {
                 "denied",
             )
             .unwrap(),
-        )
+        )))
     }
 
     #[tokio::test]
@@ -521,10 +530,7 @@ mod tests {
             for (path, size) in [("a", 1), ("b", 2), ("c", 3)] {
                 producer.send(entry(path, size)).await.unwrap();
             }
-            producer.finish(Ok(TraversalOutcome::Completed(TraversalCompletion {
-                observed_entries: 3,
-                entry_failures: 0,
-            })));
+            producer.finish(Ok(TraversalOutcome::Completed(completion(3, 0))));
         });
         let mut sink = Sink::default();
 
@@ -544,10 +550,13 @@ mod tests {
         assert_eq!(first.entries.len(), 2);
         assert_eq!(first.entries[0].ndx, SessionNdx(0));
         assert_eq!(
-            ObservedEntry::decode_snapshot(&first.entries[0].snapshot)
-                .unwrap()
-                .path()
-                .as_str(),
+            ObservedEntry::decode_snapshot(
+                &first.entries[0].snapshot,
+                &BackendIdentity::new(BackendKind::Local, "remote-fixture").unwrap()
+            )
+            .unwrap()
+            .path()
+            .as_str(),
             "a"
         );
         assert!(matches!(
@@ -566,10 +575,7 @@ mod tests {
             producer.send(entry("before", 1)).await.unwrap();
             producer.send(failure("denied")).await.unwrap();
             producer.send(entry("after", 2)).await.unwrap();
-            producer.finish(Ok(TraversalOutcome::Completed(TraversalCompletion {
-                observed_entries: 2,
-                entry_failures: 1,
-            })));
+            producer.finish(Ok(TraversalOutcome::Completed(completion(2, 1))));
         });
         let mut sink = Sink::default();
 
@@ -652,10 +658,7 @@ mod tests {
     #[tokio::test]
     async fn inconsistent_completion_evidence_sends_failed_terminal() {
         let (producer, session) = TraversalSession::bounded(NonZeroUsize::new(1).unwrap(), CancellationToken::new());
-        producer.finish(Ok(TraversalOutcome::Completed(TraversalCompletion {
-            observed_entries: 1,
-            entry_failures: 0,
-        })));
+        producer.finish(Ok(TraversalOutcome::Completed(completion(1, 0))));
         let mut sink = Sink::default();
 
         let error = advertise_remote(session, NonZeroUsize::new(1).unwrap(), &mut sink)
@@ -679,10 +682,7 @@ mod tests {
         let producer_task = tokio::spawn(async move {
             producer.send(entry("a", 1)).await.unwrap();
             producer.send(entry("b", 2)).await.unwrap();
-            producer.finish(Ok(TraversalOutcome::Completed(TraversalCompletion {
-                observed_entries: 2,
-                entry_failures: 0,
-            })));
+            producer.finish(Ok(TraversalOutcome::Completed(completion(2, 0))));
         });
         let (sender, receiver) = transport::in_process::create_in_process_pair_with_capacity(1);
         let advertise_task = tokio::spawn(async move {
@@ -718,11 +718,11 @@ mod tests {
     fn receiver_reconstructs_only_from_opaque_snapshots_and_validates_terminal() {
         let a = match entry("a", 1) {
             TraversalItem::Entry(entry) => *entry,
-            TraversalItem::EntryFailure(_) => unreachable!(),
+            _ => unreachable!(),
         };
         let b = match entry("b", 2) {
             TraversalItem::Entry(entry) => *entry,
-            TraversalItem::EntryFailure(_) => unreachable!(),
+            _ => unreachable!(),
         };
         let events = vec![
             AdvertisementEvent::Page(ObservationPage {
@@ -744,9 +744,12 @@ mod tests {
             }),
         ];
 
-        let received = RemoteAdvertisementReceiver::new(NonZeroUsize::new(2).unwrap())
-            .receive(events)
-            .unwrap();
+        let received = RemoteAdvertisementReceiver::new(
+            NonZeroUsize::new(2).unwrap(),
+            BackendIdentity::new(BackendKind::Local, "remote-fixture").unwrap(),
+        )
+        .receive(events)
+        .unwrap();
 
         assert_eq!(received.get(SessionNdx(0)).unwrap(), &a);
         assert_eq!(received.get(SessionNdx(1)).unwrap(), &b);
@@ -757,9 +760,12 @@ mod tests {
     fn receiver_yields_a_bounded_page_before_file_list_terminal() {
         let observed = match entry("early", 1) {
             TraversalItem::Entry(entry) => *entry,
-            TraversalItem::EntryFailure(_) => unreachable!(),
+            _ => unreachable!(),
         };
-        let mut receiver = RemoteAdvertisementReceiver::new(NonZeroUsize::new(1).unwrap());
+        let mut receiver = RemoteAdvertisementReceiver::new(
+            NonZeroUsize::new(1).unwrap(),
+            BackendIdentity::new(BackendKind::Local, "remote-fixture").unwrap(),
+        );
 
         let receipt = receiver
             .accept(AdvertisementEvent::Page(ObservationPage {
@@ -794,13 +800,18 @@ mod tests {
     fn receiver_rejects_invalid_snapshot_sequence_and_completion_evidence() {
         let observed = match entry("a", 1) {
             TraversalItem::Entry(entry) => *entry,
-            TraversalItem::EntryFailure(_) => unreachable!(),
+            _ => unreachable!(),
         };
         let valid = AdvertisedObservation {
             ndx: SessionNdx(0),
             snapshot: observed.encode_snapshot().as_bytes().to_vec(),
         };
-        let receiver = || RemoteAdvertisementReceiver::new(NonZeroUsize::new(2).unwrap());
+        let receiver = || {
+            RemoteAdvertisementReceiver::new(
+                NonZeroUsize::new(2).unwrap(),
+                BackendIdentity::new(BackendKind::Local, "remote-fixture").unwrap(),
+            )
+        };
 
         let malformed = receiver()
             .receive([

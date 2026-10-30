@@ -8,7 +8,7 @@ use std::sync::atomic::Ordering;
 use app::disk_commit::disk_commit_task;
 use app::receiver::ReceiverProgress;
 use bytes::Bytes;
-use data_mover::{DataChunk, EntryEnum, NASEntry, StorageEnum, create_storage};
+use storage_adapter::{DataChunk, EntryEnum, NASEntry, StorageEnum, create_storage};
 use transport::message::{DcAck, DiskCommitMsg, FileOutcome, ReceiverMsg, SessionConfig};
 
 // ============================================================
@@ -19,7 +19,7 @@ use transport::message::{DcAck, DiskCommitMsg, FileOutcome, ReceiverMsg, Session
 async fn local_storage(dir: &std::path::Path) -> Arc<StorageEnum> {
     let storage = create_storage(
         &dir.to_string_lossy(),
-        data_mover::CreateStorageOptions::new(None, false),
+        storage_adapter::CreateStorageOptions::new(None, false),
     )
     .await
     .unwrap();
@@ -37,7 +37,7 @@ fn make_nas_entry(name: &str, is_dir: bool, is_symlink: bool, size: u64, mode: u
         atime: 0,
         ctime: 0,
         mtime: 0,
-        mode,
+        mode: Some(mode),
         is_symlink,
         hard_links: Some(1),
         uid: None,

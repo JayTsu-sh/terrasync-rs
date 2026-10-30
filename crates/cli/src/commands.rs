@@ -18,7 +18,7 @@ use app::config::SyncJobConfig;
 use app::orchestrator::SyncOrchestrator;
 use app::prelude::{integrity_check, parse_bandwidth_string, rm, scan, sync};
 use app::storage_factory::{StorageRole, create_storage_for_role};
-use data_mover::redact_storage_url;
+use storage_adapter::redact_storage_url;
 use tracing::info;
 use transport::quic;
 use utils::app_config::AppConfig;
@@ -45,8 +45,8 @@ pub fn validate_qos_format(s: &str) -> Result<String> {
     }
 }
 
-/// 校验并 trim 存储路径（本地 / nfs:// / s3:// / s3+http:// / s3+https:// / s3+hcp://）
-/// 参考 `data_mover::storage_enum` 和 `data_mover::s3` 中的协议解析逻辑
+/// 校验并 trim 存储路径（本地 / nfs:// / smb:// / hdfs:// / s3:// / s3+https://）
+/// 参考 `storage_adapter::storage_enum` 和 `data_mover::storage::config::s3` 中的协议解析逻辑
 pub fn validate_storage_path(s: &str) -> Result<String> {
     let s = s.trim();
     if s.is_empty() {
@@ -122,7 +122,8 @@ fn prepare_job(job_type: &str, job_id: &str) -> Result<(String, bool)> {
 
 /// 处理扫描命令
 pub async fn scan_cmd(
-    job_id: &str, path: &str, depth: u32, r#match: &Option<String>, exclude: &Option<String>, raw_command_line: String,
+    job_id: &str, path: &str, depth: u32, r#match: &Option<String>, exclude: &Option<String>, resume: bool,
+    raw_command_line: String,
 ) -> Result<()> {
     let config = AppConfig::fetch()?;
 
@@ -136,6 +137,29 @@ pub async fn scan_cmd(
     let effective_exclude = exclude.as_ref().or(config.scan.exclude.as_ref()).cloned();
 
     let (job_dir, job_dir_pre_existing) = prepare_job("scan", job_id)?;
+
+    if resume {
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let signal_cancel = cancel.clone();
+        let signal = tokio::spawn(async move {
+            if tokio::signal::ctrl_c().await.is_ok() {
+                signal_cancel.cancel();
+            }
+        });
+        let result = app::scan_resume::scan_with_resume(
+            job_id,
+            &job_dir,
+            path,
+            effective_depth,
+            &effective_match,
+            &effective_exclude,
+            raw_command_line,
+            cancel,
+        )
+        .await;
+        signal.abort();
+        return result.map_err(Into::into);
+    }
 
     scan(
         job_id.to_string(),

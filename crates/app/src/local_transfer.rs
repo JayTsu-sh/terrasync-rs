@@ -1,22 +1,17 @@
 //! Protocol-neutral, bounded in-process transfer orchestration.
 
-use std::num::NonZeroUsize;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-
 use async_trait::async_trait;
 use data_mover::model::{EntryKind, EntryOperationFailure, ObservedEntry};
-use data_mover::storage::{ExistingDestinationPolicy, RecoveryIdentity, Storage};
+use data_mover::storage::Storage;
 use data_mover::transfer::{
-    InflightLimits, RecoveryContext, RecoveryProvider, RecoveryRegistrar, RecoveryRegistrationFailure, Resumability,
-    TransferFailure, TransferIdentity, TransferOutcome, TransferRequest, transfer,
+    TransferFailure, TransferIdentity, TransferOutcome, TransferPolicy, TransferRequest, transfer,
 };
 use data_mover::traversal::{TraversalItem, TraversalOutcome, TraversalSession};
+use std::num::NonZeroUsize;
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
 use crate::error::{AppError, Result};
-use db::{ClickHouseDatabase, RecoveryAttemptId};
 
 /// Inputs shared by all files admitted from one traversal.
 #[derive(Clone)]
@@ -24,108 +19,11 @@ pub struct LocalTransferConfig {
     pub job_identity: String,
     pub source: Storage,
     pub destination: Storage,
-    pub inflight: InflightLimits,
+
     pub max_concurrent_files: NonZeroUsize,
-    pub existing_destination: ExistingDestinationPolicy,
-    pub resumability: Resumability,
-    pub recovery: Option<Arc<dyn EntryRecoveryState>>,
+
+    pub transfer_policy: TransferPolicy,
     pub cancel: CancellationToken,
-}
-
-/// Caller-owned recovery state for one observed entry and one transfer attempt.
-pub struct RecoveryRegistration {
-    identity: Option<RecoveryIdentity>,
-    claim: [u8; 32],
-    registrar: Arc<dyn RecoveryRegistrar>,
-}
-
-impl RecoveryRegistration {
-    #[must_use]
-    pub fn new(identity: Option<RecoveryIdentity>, claim: [u8; 32], registrar: Arc<dyn RecoveryRegistrar>) -> Self {
-        Self {
-            identity,
-            claim,
-            registrar,
-        }
-    }
-
-    fn into_context(self) -> RecoveryContext {
-        RecoveryContext::new(self.identity, self.claim, self.registrar)
-    }
-}
-
-struct LazyEntryRecoveryProvider {
-    store: Arc<dyn EntryRecoveryState>,
-    entry: ObservedEntry,
-    opened: Arc<AtomicBool>,
-}
-
-pub(crate) fn lazy_entry_recovery_provider(
-    store: Arc<dyn EntryRecoveryState>, entry: ObservedEntry,
-) -> (Arc<dyn RecoveryProvider>, Arc<AtomicBool>) {
-    let opened = Arc::new(AtomicBool::new(false));
-    let provider = Arc::new(LazyEntryRecoveryProvider {
-        store,
-        entry,
-        opened: Arc::clone(&opened),
-    });
-    (provider as Arc<dyn RecoveryProvider>, opened)
-}
-
-#[async_trait]
-impl RecoveryProvider for LazyEntryRecoveryProvider {
-    async fn open(&self) -> std::result::Result<RecoveryContext, RecoveryRegistrationFailure> {
-        let registration = self.store.open(&self.entry).await.map_err(|error| match error {
-            AppError::DatabaseError(
-                db::DatabaseError::ConcurrencyError(_) | db::DatabaseError::RecoveryAttemptCompleted,
-            ) => RecoveryRegistrationFailure::Rejected,
-            _ => RecoveryRegistrationFailure::Unavailable,
-        })?;
-        self.opened.store(true, Ordering::Release);
-        Ok(registration.into_context())
-    }
-}
-
-/// Entry-scoped recovery lifecycle owned by the application persistence layer.
-#[async_trait]
-pub trait EntryRecoveryState: Send + Sync {
-    async fn open(&self, entry: &ObservedEntry) -> Result<RecoveryRegistration>;
-    async fn completed(&self, entry: &ObservedEntry) -> Result<()>;
-}
-
-/// `ClickHouse` adapter that keeps recovery state in the job's observation big table.
-pub struct ClickHouseEntryRecovery {
-    database: Arc<ClickHouseDatabase>,
-    attempt: RecoveryAttemptId,
-}
-
-impl ClickHouseEntryRecovery {
-    #[must_use]
-    pub fn new(database: Arc<ClickHouseDatabase>, attempt: RecoveryAttemptId) -> Self {
-        Self { database, attempt }
-    }
-}
-
-#[async_trait]
-impl EntryRecoveryState for ClickHouseEntryRecovery {
-    async fn open(&self, entry: &ObservedEntry) -> Result<RecoveryRegistration> {
-        let durable = self
-            .database
-            .open_recovery_attempt(entry.identity_key(), self.attempt.clone())
-            .await?;
-        Ok(RecoveryRegistration::new(
-            durable.identity().cloned(),
-            durable.claim(),
-            durable.registrar(),
-        ))
-    }
-
-    async fn completed(&self, entry: &ObservedEntry) -> Result<()> {
-        self.database
-            .complete_recovery_attempt(entry.identity_key(), &self.attempt)
-            .await?;
-        Ok(())
-    }
 }
 
 /// Transfer results remain typed and owned until the application records a recovery decision.
@@ -148,11 +46,7 @@ pub struct LocalTransferReport {
     pub cancelled: bool,
 }
 
-type Attempt = (
-    ObservedEntry,
-    Arc<AtomicBool>,
-    std::result::Result<TransferOutcome, TransferFailure>,
-);
+type Attempt = (ObservedEntry, std::result::Result<TransferOutcome, TransferFailure>);
 
 /// Drains a bounded traversal into the unified data-mover transfer API.
 ///
@@ -163,7 +57,6 @@ pub async fn run_local_transfer(
     mut session: TraversalSession, config: LocalTransferConfig, sink: &mut dyn LocalTransferSink,
 ) -> Result<LocalTransferReport> {
     validate_job_identity(&config.job_identity)?;
-    validate_recovery_configuration(&config)?;
     let mut report = LocalTransferReport::default();
     let mut attempts = JoinSet::<Attempt>::new();
 
@@ -181,7 +74,7 @@ pub async fn run_local_transfer(
                         return drain_after_error(error, &config, &mut attempts, sink, &mut report).await;
                     }
                 }
-                let (request, recovery_opened) = match request_for(&config, &entry) {
+                let request = match request_for(&config, &entry) {
                     Ok(request) => request,
                     Err(error) => {
                         return drain_after_error(error, &config, &mut attempts, sink, &mut report).await;
@@ -189,15 +82,26 @@ pub async fn run_local_transfer(
                 };
                 attempts.spawn(async move {
                     let result = transfer(request).await;
-                    (entry, recovery_opened, result)
+                    (entry, result)
                 });
                 report.peak_inflight_files = report.peak_inflight_files.max(attempts.len());
             }
-            TraversalItem::EntryFailure(failure) => {
+            TraversalItem::Failure(failure) => {
                 report.entry_failures += 1;
-                if let Err(error) = sink.entry_failed(failure).await {
+                if let Err(error) = sink.entry_failed(failure.failure).await {
                     return drain_after_error(error, &config, &mut attempts, sink, &mut report).await;
                 }
+            }
+            TraversalItem::DirectoryListed(_) | TraversalItem::Checkpoint(_) => {}
+            item => {
+                return drain_after_error(
+                    AppError::ConfigError(format!("unsupported traversal event: {item:?}")),
+                    &config,
+                    &mut attempts,
+                    sink,
+                    &mut report,
+                )
+                .await;
             }
         }
     }
@@ -210,14 +114,14 @@ pub async fn run_local_transfer(
     match session.finish().await? {
         TraversalOutcome::Cancelled => report.cancelled = true,
         TraversalOutcome::Completed(completion) => {
-            if completion.observed_entries != report.observed_entries
-                || completion.entry_failures != report.entry_failures
+            if completion.totals.emitted != report.observed_entries
+                || (completion.totals.failed_children + completion.totals.listing_failures) != report.entry_failures
             {
                 return Err(AppError::TraversalCountMismatch {
                     consumed_entries: report.observed_entries,
-                    reported_entries: completion.observed_entries,
+                    reported_entries: completion.totals.emitted,
                     consumed_failures: report.entry_failures,
-                    reported_failures: completion.entry_failures,
+                    reported_failures: (completion.totals.failed_children + completion.totals.listing_failures),
                 });
             }
         }
@@ -225,49 +129,28 @@ pub async fn run_local_transfer(
     Ok(report)
 }
 
-fn request_for(config: &LocalTransferConfig, entry: &ObservedEntry) -> Result<(TransferRequest, Arc<AtomicBool>)> {
-    let identity = TransferIdentity::new(format!(
+fn request_for(config: &LocalTransferConfig, entry: &ObservedEntry) -> Result<TransferRequest> {
+    let identity = TransferIdentity::from_label(format!(
         "{}:{}",
         config.job_identity,
         encode_identity(entry.identity_key().as_bytes())
     ))
     .map_err(|error| AppError::ConfigError(error.to_string()))?;
-    let request = TransferRequest::new(
-        identity,
+    let request = TransferRequest::from_observation(
         config.source.clone(),
-        entry.path().clone(),
+        entry.clone(),
         config.destination.clone(),
-        entry.path().clone(),
-        config.inflight,
         config.cancel.clone(),
     )
-    .with_existing_destination_policy(config.existing_destination);
-    let (provider, opened) = config.recovery.as_ref().map_or_else(
-        || (None, Arc::new(AtomicBool::new(false))),
-        |store| {
-            let (provider, opened) = lazy_entry_recovery_provider(Arc::clone(store), entry.clone());
-            (Some(provider), opened)
-        },
-    );
-    Ok((request.with_recovery(config.resumability, provider), opened))
+    .map_err(|error| AppError::ConfigError(error.to_string()))?
+    .with_identity_override(identity);
+    Ok(request.with_transfer_policy(config.transfer_policy))
 }
 
 fn validate_job_identity(identity: &str) -> Result<()> {
-    TransferIdentity::new(format!("{identity}:{}", "0".repeat(64)))
+    TransferIdentity::from_label(format!("{identity}:{}", "0".repeat(64)))
         .map(|_| ())
         .map_err(|error| AppError::ConfigError(error.to_string()))
-}
-
-fn validate_recovery_configuration(config: &LocalTransferConfig) -> Result<()> {
-    match (config.resumability, config.recovery.is_some()) {
-        (Resumability::Enabled, false) => Err(AppError::ConfigError(
-            "enabled resumability requires entry recovery persistence".to_string(),
-        )),
-        (Resumability::Disabled, true) => Err(AppError::ConfigError(
-            "disabled resumability cannot accept entry recovery persistence".to_string(),
-        )),
-        _ => Ok(()),
-    }
 }
 
 async fn drain_after_error(
@@ -292,22 +175,17 @@ fn encode_identity(bytes: &[u8]) -> String {
 }
 
 async fn settle_one(
-    attempts: &mut JoinSet<Attempt>, config: &LocalTransferConfig, sink: &mut dyn LocalTransferSink,
+    attempts: &mut JoinSet<Attempt>, _config: &LocalTransferConfig, sink: &mut dyn LocalTransferSink,
     report: &mut LocalTransferReport,
 ) -> Result<()> {
     let Some(attempt) = attempts.join_next().await else {
         return Ok(());
     };
-    let (entry, recovery_opened, outcome) = attempt?;
+    let (entry, outcome) = attempt?;
     match outcome {
         Ok(outcome) => {
             report.completed_files += 1;
             report.transferred_bytes += outcome.transferred_bytes;
-            if recovery_opened.load(Ordering::Acquire)
-                && let Some(recovery) = &config.recovery
-            {
-                recovery.completed(&entry).await?;
-            }
             sink.completed(entry, outcome).await?;
         }
         Err(failure) => {
@@ -321,17 +199,18 @@ async fn settle_one(
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
-    use std::path::Path;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::{Arc, Mutex};
+    fn completion(entries: u64, failures: u64) -> data_mover::traversal::TraversalCompletion {
+        let mut totals = data_mover::traversal::ScanTotals::default();
+        totals.emitted = entries;
+        totals.failed_children = failures;
+        data_mover::traversal::TraversalCompletion::new(totals)
+    }
 
-    use data_mover::model::{
-        BackendIdentity, BackendKind, FailureClass, IdentityStrength, Operation, SourceIdentity, StoragePath,
-        Transience,
-    };
+    use std::path::Path;
+
+    use data_mover::model::{FailureClass, IdentityStrength, Operation, SourceIdentity, StoragePath, Transience};
     use data_mover::storage::{BackendConfig, LocalBackendConfig, connect_backend};
-    use data_mover::transfer::RecoveryRegistrationFailure;
-    use data_mover::traversal::{TraversalCompletion, TraversalProducer};
+    use data_mover::traversal::TraversalProducer;
     use tempfile::TempDir;
 
     use super::*;
@@ -342,52 +221,6 @@ mod tests {
         entry_failures: usize,
         transfer_failures: Vec<TransferFailure>,
         fail_completion: bool,
-    }
-
-    #[derive(Default)]
-    struct Recovery {
-        lookups: AtomicUsize,
-        completions: AtomicUsize,
-        identity: Mutex<Option<RecoveryIdentity>>,
-        claim: [u8; 32],
-        registrations: Arc<Mutex<Vec<RecoveryIdentity>>>,
-    }
-
-    struct SinkRecoveryRegistrar {
-        registrations: Arc<Mutex<Vec<RecoveryIdentity>>>,
-    }
-
-    #[async_trait]
-    impl RecoveryRegistrar for SinkRecoveryRegistrar {
-        async fn register(&self, identity: RecoveryIdentity) -> std::result::Result<(), RecoveryRegistrationFailure> {
-            self.registrations
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .push(identity);
-            Ok(())
-        }
-    }
-
-    #[async_trait]
-    impl EntryRecoveryState for Recovery {
-        async fn open(&self, _entry: &ObservedEntry) -> Result<RecoveryRegistration> {
-            self.lookups.fetch_add(1, Ordering::Relaxed);
-            Ok(RecoveryRegistration::new(
-                self.identity
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .clone(),
-                self.claim,
-                Arc::new(SinkRecoveryRegistrar {
-                    registrations: Arc::clone(&self.registrations),
-                }),
-            ))
-        }
-
-        async fn completed(&self, _entry: &ObservedEntry) -> Result<()> {
-            self.completions.fetch_add(1, Ordering::Relaxed);
-            Ok(())
-        }
     }
 
     #[async_trait]
@@ -411,10 +244,13 @@ mod tests {
         }
     }
 
-    async fn storage(root: &Path, name: &str) -> Storage {
+    async fn storage(root: &Path, _name: &str) -> Storage {
         connect_backend(BackendConfig::Local(LocalBackendConfig {
+            rename_context: None,
+            read_chunk_bytes: None,
+            write_chunk_bytes: None,
             root: root.to_path_buf(),
-            identity: BackendIdentity::new(BackendKind::Local, name).unwrap(),
+
             read_concurrency: NonZeroUsize::new(2).unwrap(),
             write_concurrency: NonZeroUsize::new(2).unwrap(),
         }))
@@ -422,9 +258,17 @@ mod tests {
         .unwrap()
     }
 
-    fn entry(path: &str, size: u64) -> TraversalItem {
-        let backend = BackendIdentity::new(BackendKind::Local, "observed-source").unwrap();
-        let identity = SourceIdentity::new(backend, IdentityStrength::PathScoped, path).unwrap();
+    async fn entry(root: &Path, path: &str, size: u64) -> TraversalItem {
+        let source = storage(root, "source").await;
+        let identity = match source
+            .read_source()
+            .unwrap()
+            .describe(&StoragePath::new(path).unwrap())
+            .await
+        {
+            Ok(descriptor) => descriptor.source_identity,
+            Err(_) => SourceIdentity::new(source.identity().clone(), IdentityStrength::PathScoped, path).unwrap(),
+        };
         TraversalItem::Entry(Box::new(
             ObservedEntry::new(
                 StoragePath::new(path).unwrap(),
@@ -438,7 +282,7 @@ mod tests {
     }
 
     fn entry_failure(path: &str) -> TraversalItem {
-        TraversalItem::EntryFailure(
+        TraversalItem::Failure(Box::new(data_mover::traversal::ScanFailure::child(
             EntryOperationFailure::new(
                 StoragePath::new(path).unwrap(),
                 Operation::Observe,
@@ -447,7 +291,7 @@ mod tests {
                 "denied",
             )
             .unwrap(),
-        )
+        )))
     }
 
     fn session(items: Vec<TraversalItem>, outcome: TraversalOutcome) -> TraversalSession {
@@ -464,22 +308,17 @@ mod tests {
         producer.finish(Ok(outcome));
     }
 
-    async fn config(source: &Path, destination: &Path, maximum: usize) -> (LocalTransferConfig, Arc<Recovery>) {
-        let recovery = Arc::new(Recovery::default());
-        (
-            LocalTransferConfig {
-                job_identity: "job-147".to_owned(),
-                source: storage(source, "source").await,
-                destination: storage(destination, "destination").await,
-                inflight: InflightLimits::new(2, 128 * 1024, 2).unwrap(),
-                max_concurrent_files: NonZeroUsize::new(maximum).unwrap(),
-                existing_destination: ExistingDestinationPolicy::default(),
-                resumability: Resumability::Enabled,
-                recovery: Some(recovery.clone()),
-                cancel: CancellationToken::new(),
-            },
-            recovery,
-        )
+    async fn config(source: &Path, destination: &Path, maximum: usize) -> LocalTransferConfig {
+        LocalTransferConfig {
+            job_identity: "job-147".to_owned(),
+            source: storage(source, "source").await,
+            destination: storage(destination, "destination").await,
+
+            max_concurrent_files: NonZeroUsize::new(maximum).unwrap(),
+
+            transfer_policy: TransferPolicy::Checkpointed,
+            cancel: CancellationToken::new(),
+        }
     }
 
     #[tokio::test]
@@ -489,15 +328,12 @@ mod tests {
         std::fs::write(source.path().join("a"), b"alpha").unwrap();
         std::fs::write(source.path().join("b"), b"beta").unwrap();
         let session = session(
-            vec![entry("a", 5), entry("b", 4)],
-            TraversalOutcome::Completed(TraversalCompletion {
-                observed_entries: 2,
-                entry_failures: 0,
-            }),
+            vec![entry(source.path(), "a", 5).await, entry(source.path(), "b", 4).await],
+            TraversalOutcome::Completed(completion(2, 0)),
         );
         let mut sink = Sink::default();
 
-        let (config, recovery) = config(source.path(), destination.path(), 1).await;
+        let config = config(source.path(), destination.path(), 1).await;
         let report = run_local_transfer(session, config, &mut sink).await.unwrap();
 
         assert_eq!(report.completed_files, 2);
@@ -505,39 +341,24 @@ mod tests {
         assert_eq!(report.peak_inflight_files, 1);
         assert_eq!(std::fs::read(destination.path().join("a")).unwrap(), b"alpha");
         assert_eq!(std::fs::read(destination.path().join("b")).unwrap(), b"beta");
-        assert_eq!(recovery.lookups.load(Ordering::Relaxed), 0);
-        assert_eq!(recovery.completions.load(Ordering::Relaxed), 0);
     }
 
     #[tokio::test]
-    async fn durably_registers_recoverable_stage_before_large_file_transfer() {
+    async fn forwards_checkpoint_policy_for_large_file_transfer() {
         let source = TempDir::new().unwrap();
         let destination = TempDir::new().unwrap();
         let payload = vec![0x5a; 128 * 1024 + 1];
         std::fs::write(source.path().join("large"), &payload).unwrap();
         let session = session(
-            vec![entry("large", payload.len() as u64)],
-            TraversalOutcome::Completed(TraversalCompletion {
-                observed_entries: 1,
-                entry_failures: 0,
-            }),
+            vec![entry(source.path(), "large", payload.len() as u64).await],
+            TraversalOutcome::Completed(completion(1, 0)),
         );
         let mut sink = Sink::default();
 
-        let (config, recovery) = config(source.path(), destination.path(), 1).await;
+        let config = config(source.path(), destination.path(), 1).await;
         let report = run_local_transfer(session, config, &mut sink).await.unwrap();
 
         assert_eq!(report.completed_files, 1);
-        assert_eq!(recovery.lookups.load(Ordering::Relaxed), 1);
-        assert_eq!(
-            recovery
-                .registrations
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .len(),
-            1
-        );
-        assert_eq!(recovery.completions.load(Ordering::Relaxed), 1);
         assert_eq!(std::fs::read(destination.path().join("large")).unwrap(), payload);
     }
 
@@ -546,15 +367,12 @@ mod tests {
         let source = TempDir::new().unwrap();
         let destination = TempDir::new().unwrap();
         let session = session(
-            vec![entry_failure("denied"), entry("missing", 1)],
-            TraversalOutcome::Completed(TraversalCompletion {
-                observed_entries: 1,
-                entry_failures: 1,
-            }),
+            vec![entry_failure("denied"), entry(source.path(), "missing", 1).await],
+            TraversalOutcome::Completed(completion(1, 1)),
         );
         let mut sink = Sink::default();
 
-        let report = run_local_transfer(session, config(source.path(), destination.path(), 2).await.0, &mut sink)
+        let report = run_local_transfer(session, config(source.path(), destination.path(), 2).await, &mut sink)
             .await
             .unwrap();
 
@@ -571,7 +389,7 @@ mod tests {
         let mut sink = Sink::default();
         let report = run_local_transfer(
             session(Vec::new(), TraversalOutcome::Cancelled),
-            config(source.path(), destination.path(), 1).await.0,
+            config(source.path(), destination.path(), 1).await,
             &mut sink,
         )
         .await
@@ -586,13 +404,10 @@ mod tests {
         let destination = TempDir::new().unwrap();
         std::fs::write(source.path().join("cancelled"), b"payload").unwrap();
         let session = session(
-            vec![entry("cancelled", 7)],
-            TraversalOutcome::Completed(TraversalCompletion {
-                observed_entries: 1,
-                entry_failures: 0,
-            }),
+            vec![entry(source.path(), "cancelled", 7).await],
+            TraversalOutcome::Completed(completion(1, 0)),
         );
-        let (config, recovery) = config(source.path(), destination.path(), 1).await;
+        let config = config(source.path(), destination.path(), 1).await;
         config.cancel.cancel();
         let mut sink = Sink::default();
 
@@ -600,39 +415,7 @@ mod tests {
 
         assert_eq!(report.transfer_failures, 1);
         assert_eq!(sink.transfer_failures.len(), 1);
-        assert_eq!(recovery.lookups.load(Ordering::Relaxed), 0);
         assert!(!destination.path().join("cancelled").exists());
-    }
-
-    #[tokio::test]
-    async fn forwards_persisted_recovery_identity_to_unified_transfer() {
-        let source = TempDir::new().unwrap();
-        let destination = TempDir::new().unwrap();
-        let payload = vec![0x6d; 128 * 1024 + 1];
-        std::fs::write(source.path().join("recover"), &payload).unwrap();
-        let session = session(
-            vec![entry("recover", payload.len() as u64)],
-            TraversalOutcome::Completed(TraversalCompletion {
-                observed_entries: 1,
-                entry_failures: 0,
-            }),
-        );
-        let (mut config, _) = config(source.path(), destination.path(), 1).await;
-        config.resumability = Resumability::Enabled;
-        let recovery = Arc::new(Recovery {
-            identity: Mutex::new(Some(RecoveryIdentity::from_bytes(&b"invalid-stage"[..]).unwrap())),
-            claim: [0x5a; 32],
-            ..Recovery::default()
-        });
-        config.recovery = Some(recovery.clone());
-        let mut sink = Sink::default();
-
-        let report = run_local_transfer(session, config, &mut sink).await.unwrap();
-
-        assert_eq!(recovery.lookups.load(Ordering::Relaxed), 1);
-        assert_eq!(report.transfer_failures, 1);
-        assert_eq!(sink.transfer_failures.len(), 1);
-        assert!(!destination.path().join("recover").exists());
     }
 
     #[tokio::test]
@@ -641,14 +424,8 @@ mod tests {
         let destination = TempDir::new().unwrap();
         let mut sink = Sink::default();
         let error = run_local_transfer(
-            session(
-                Vec::new(),
-                TraversalOutcome::Completed(TraversalCompletion {
-                    observed_entries: 1,
-                    entry_failures: 0,
-                }),
-            ),
-            config(source.path(), destination.path(), 1).await.0,
+            session(Vec::new(), TraversalOutcome::Completed(completion(1, 0))),
+            config(source.path(), destination.path(), 1).await,
             &mut sink,
         )
         .await
@@ -662,18 +439,15 @@ mod tests {
         let destination = TempDir::new().unwrap();
         std::fs::write(source.path().join("committed"), b"payload").unwrap();
         let session = session(
-            vec![entry("committed", 7)],
-            TraversalOutcome::Completed(TraversalCompletion {
-                observed_entries: 1,
-                entry_failures: 0,
-            }),
+            vec![entry(source.path(), "committed", 7).await],
+            TraversalOutcome::Completed(completion(1, 0)),
         );
         let mut sink = Sink {
             fail_completion: true,
             ..Sink::default()
         };
 
-        let error = run_local_transfer(session, config(source.path(), destination.path(), 1).await.0, &mut sink)
+        let error = run_local_transfer(session, config(source.path(), destination.path(), 1).await, &mut sink)
             .await
             .unwrap_err();
 

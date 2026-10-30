@@ -7,8 +7,8 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use data_mover::dir_tree::DirPageResult;
-use data_mover::{DataChunk, EntryEnum, StorageEnum};
+use storage_adapter::dir_tree::DirPageResult;
+use storage_adapter::{DataChunk, EntryEnum, StorageEnum};
 use tokio::sync::mpsc::{Receiver, Sender};
 use tracing::{debug, info, warn};
 use transport::flow_control::{ReceiverCreditState, payload_credit_cost};
@@ -89,7 +89,7 @@ pub(crate) struct RemoteSessionState {
 }
 
 impl RemoteSessionState {
-    pub(crate) fn ingest_page(&mut self, page: &data_mover::dir_tree::DirPageResult) {
+    pub(crate) fn ingest_page(&mut self, page: &storage_adapter::dir_tree::DirPageResult) {
         self.ndx_table.ingest_page(page);
     }
 
@@ -634,8 +634,8 @@ mod tests {
 
     use async_trait::async_trait;
     use bytes::Bytes;
-    use data_mover::dir_tree::{DirPageResult, NdxEntry, NdxEvent};
-    use data_mover::{DataChunk, NASEntry};
+    use storage_adapter::dir_tree::{DirPageResult, NdxEntry, NdxEvent};
+    use storage_adapter::{DataChunk, NASEntry};
 
     use crate::storage_factory::{StorageRole, create_storage_for_role};
     use tempfile::tempdir;
@@ -778,7 +778,7 @@ mod tests {
             atime: 0,
             ctime: 0,
             mtime: 0,
-            mode: if is_dir { 0o755 } else { 0o644 },
+            mode: Some(if is_dir { 0o755 } else { 0o644 }),
             is_symlink: false,
             hard_links: None,
             uid: None,

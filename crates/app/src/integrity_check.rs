@@ -18,8 +18,8 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
-use data_mover::error::StorageError;
-use data_mover::{
+use storage_adapter::error::StorageError;
+use storage_adapter::{
     EntryEnum, IntegrityCheck, IntegrityCheckMode, IntegrityCheckOptions, MismatchDataField, MismatchMetaField,
     MtimePrecision, StorageEntryMessage, StorageEnum, redact_storage_url,
 };
@@ -295,7 +295,7 @@ impl CheckContext {
         if let Some(reason) = error_reason {
             broadcaster
                 .broadcast(StorageEntryMessage::Error {
-                    event: data_mover::ErrorEvent::IntegrityCheck,
+                    event: storage_adapter::ErrorEvent::IntegrityCheck,
                     path: relative_path,
                     entry: Some(entry),
                     reason,
@@ -458,7 +458,7 @@ pub async fn integrity_check(
                             );
                             broadcaster
                                 .broadcast(StorageEntryMessage::Error {
-                                    event: data_mover::ErrorEvent::IntegrityCheck,
+                                    event: storage_adapter::ErrorEvent::IntegrityCheck,
                                     path,
                                     entry,
                                     reason,
@@ -537,7 +537,7 @@ pub async fn integrity_check(
 #[cfg(feature = "license")]
 pub(crate) async fn verify_storage_time(dest_path: &str) -> Result<()> {
     use chrono::DateTime;
-    use data_mover::storage_enum::{StorageType, detect_storage_type};
+    use storage_adapter::storage_enum::{StorageType, detect_storage_type};
 
     if matches!(detect_storage_type(dest_path), StorageType::Local) {
         return Ok(());

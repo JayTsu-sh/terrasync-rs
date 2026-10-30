@@ -229,9 +229,10 @@ CLI 命令行参数 > -c 配置文件 > 内置默认配置
 
 **S3兼容对象存储**：使用 `s3://access_key:secret_key@bucket.host:port/prefix` 或 `s3+https://access_key:secret_key@bucket.host:port/prefix` 格式
 - `s3://` 默认为HTTP协议
-- `s3+http://` 明确使用HTTP协议
 - `s3+https://` 明确使用HTTPS协议
-- `s3+hcp://` 用于HCP（Hitachi Content Platform）兼容存储
+- StorageGRID / DXN / ONTAP 使用查询参数 `?compat=sg` / `?compat=dxn` / `?compat=ontap`；HCP 使用标准 S3。
+- HTTPS 默认验证服务端证书；自签名服务可配置信任 CA，或显式使用 `?tls_verify=false`。
+- 已移除 `s3+http://`、`s3+sg://`、`s3+dxn://`、`s3+hcp://` 等旧 scheme。
 - bucket 是对象桶名，host是主机名，port是端口号，prefix是可选的前缀路径。
 - 示例：`s3://AKIAIOSFODNN7EXAMPLE:wJalrXUtnFEMI/K7MDENG/bucket.example.com:9000/data`
 
@@ -289,6 +290,7 @@ terrasync scan [OPTIONS] <PATH>
 <path>                   要扫描的目录路径
 
 -i, --id <ID>            扫描作业的唯一标识符（可选）
+    --resume            启用检查点并恢复同一作业的未完成扫描；必须显式提供 --id，且启用 ClickHouse
 -d, --depth <DEPTH>      扫描深度级别（0表示无限深度）[默认: 0]。也可在配置文件 [scan] depth 中设置
 -m, --match <EXPRESSION> 过滤表达式，用于匹配文件/目录。也可在配置文件 [scan] match 中设置。示例: 'modified<0.5 and "ntap" in name and type==file'
 -e, --exclude <EXPRESSION> 排除表达式，用于排除文件/目录。也可在配置文件 [scan] exclude 中设置。示例: 'name=="target" or name==".git"'
@@ -297,7 +299,31 @@ terrasync scan [OPTIONS] <PATH>
 **增量扫描功能：**
 - 当使用相同的作业ID再次执行扫描时，系统会自动执行增量扫描
 - 增量扫描仅处理上次扫描后新增,修改,删除和rename（仅支持nfs客户端扫描）的文件，显著提高扫描效率
-- 系统通过检查jobs目录下是否存在对应作业ID的目录来判断是否执行增量扫描
+- 系统优先通过 ClickHouse 中该作业的基础表判定扫描类型，数据库不可用时才回退到 jobs 目录
+
+**断点续扫：**
+
+首次执行和恢复时均使用 `--resume`，保持相同的 `--id`、源路径、深度、过滤条件和标签配置：
+
+```bash
+terrasync -c config.toml scan --id archive_scan --resume /mnt/archive
+# Ctrl+C 暂停或进程中断后，使用同一命令继续
+terrasync -c config.toml scan --id archive_scan --resume /mnt/archive
+```
+
+断点保存在同一 ClickHouse 数据库的 `scan_resume_<job_id>` 表，包含不透明遍历游标、
+参数指纹、working generation、阶段和进度；不在本机保存第二份恢复游标。
+默认每分钟保存一次，Ctrl+C 会排空已产生的结果并保存最终检查点。
+检查点到来前的结果及增量事件全部确认落库后才推进游标。进程崩溃后，当前目录可能重新列举，
+基础记录和增量事件会幂等去重，包括同一 S3 key 的不同版本。
+未完整扫描时不会执行删除检测或提交 generation；全量和增量扫描都可以恢复。
+
+已完成的作业再次加 `--resume` 会开始新一轮增量扫描；省略该参数会放弃旧断点并重新扫描。
+未启用 ClickHouse 时不能使用此选项。相同任务不要并发运行。
+续扫不是文件系统快照：若中断期间源目录发生大范围变化，建议省略 `--resume` 重新扫描。
+
+使用 `tests/lab/verify-scan-resume-completeness.py --help` 查看首次扫描与续扫结果并集的复验方式；
+验证报告输出到命令指定的 `--work-dir`，不随代码提交。
 
 #### sync - 同步文件（支持增量同步、支持分布式同步）
 
@@ -1061,3 +1087,20 @@ python tools/log_analyzer.py --app /tmp/app.json.log --error /tmp/error.log -o /
 ## 支持
 
 如有问题或建议，请联系项目维护者。
+
+### data-mover 0.4 适配说明
+
+依赖固定到主分支提交 `4149575e91fe392ee853725e110d6c1be9c6b562`。
+`crates/storage-adapter` 持有 TerraSync 的数据库和 wire 数据投影，存储操作使用
+`connect_backend`、遍历角色及统一 transfer/expert 引擎；恢复进度由目标存储负责。
+旧 `.terrasync-part` 和本地 offset 记录不能授权新引擎恢复。
+
+远端协议升级到 v9，Sender 和 Receiver 需同时升级。SMB URL 不再接受
+`smb2_only` 查询参数。观察快照解码需要提供对应连接的 `BackendIdentity`；
+旧版本快照会返回版本错误，需要重新扫描生成。增量扫描过渡代按路径比较，
+不会把旧驱动句柄当作新的中立 identity key。
+
+未知 POSIX mode 在数据库和 wire 投影中保持为空，真实 `000` 权限仍会保留。
+文件元数据由传输引擎在发布前协商应用；目录及仅属性更新按目标存储能力处理。
+真实环境可使用 `tests/lab/run-e2e.sh`、`tests/lab/run-hdfs-e2e.sh` 和完整性专项脚本复验，
+验证报告保留在本地测试目录。

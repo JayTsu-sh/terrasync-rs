@@ -83,15 +83,6 @@ pub enum AppError {
     #[error("Remote expert peer transfer {ndx} was cancelled")]
     RemoteExpertPeerCancelled { ndx: u64 },
 
-    /// FinalDestination 已发布，但应用恢复完成事件未能持久化。
-    #[error("Remote expert transfer {ndx} recovery completion persistence failed: {source}")]
-    RemoteExpertRecoveryCompletion {
-        ndx: u64,
-        source_qos: data_mover::storage::SourceQosStats,
-        #[source]
-        source: Box<AppError>,
-    },
-
     /// 远端 payload 中断，同时保留目标端 unpublished stage 的清理/恢复所有权。
     #[error("Remote expert transfer {ndx} payload interrupted: {peer}; destination: {destination}")]
     RemoteExpertPayloadInterrupted {
@@ -102,7 +93,7 @@ pub enum AppError {
     },
     /// 存储错误
     #[error("{0}")]
-    StorageError(#[from] data_mover::error::StorageError),
+    StorageError(#[from] storage_adapter::error::StorageError),
 
     /// 数据库错误
     #[error("{0}")]

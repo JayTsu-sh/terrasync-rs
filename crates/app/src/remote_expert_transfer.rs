@@ -1,15 +1,14 @@
 //! Remote expert-transfer orchestration.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 
 use bytes::Bytes;
 use data_mover::metadata::MetadataPlan;
 use data_mover::model::{EntryIdentityKey, ObservedEntry, StoragePath};
-use data_mover::storage::{ExistingDestinationPolicy, SourceQosGroup, SourceQosStats, Storage};
+use data_mover::storage::{SourceQosGroup, SourceQosStats, Storage};
 use data_mover::transfer::{
     ExpertDestinationRequest, ExpertDestinationSession, ExpertSourceEvidence, ExpertSourceRequest, ExpertSourceSession,
-    InflightLimits, RecoveryProvider, Resumability, TransferIdentity, TransferOutcome, TransferPhase, TransferSide,
+    TransferIdentity, TransferOutcome, TransferPhase, TransferPolicy, TransferSide,
 };
 use futures::stream;
 use tokio_util::sync::CancellationToken;
@@ -21,15 +20,13 @@ use transport::message::{
 use transport::traits::{ReceiverTransport, SenderTransport};
 
 use crate::error::{AppError, Result};
-use crate::local_transfer::{EntryRecoveryState, lazy_entry_recovery_provider};
 
 /// Source-process inputs for one selected advertised observation.
 pub struct RemoteExpertSourceRequest {
     ndx: SessionNdx,
-    identity: TransferIdentity,
     source: Storage,
     observation: ObservedEntry,
-    inflight: InflightLimits,
+
     cancel: CancellationToken,
     source_qos: Option<SourceQosGroup>,
 }
@@ -37,15 +34,14 @@ pub struct RemoteExpertSourceRequest {
 impl RemoteExpertSourceRequest {
     #[must_use]
     pub fn new(
-        ndx: SessionNdx, identity: TransferIdentity, source: Storage, observation: ObservedEntry,
-        inflight: InflightLimits, cancel: CancellationToken,
+        ndx: SessionNdx, _identity: TransferIdentity, source: Storage, observation: ObservedEntry,
+        cancel: CancellationToken,
     ) -> Self {
         Self {
             ndx,
-            identity,
             source,
             observation,
-            inflight,
+
             cancel,
             source_qos: None,
         }
@@ -65,11 +61,10 @@ pub struct RemoteExpertDestinationRequest {
     observation: ObservedEntry,
     destination: Storage,
     final_path: StoragePath,
-    inflight: InflightLimits,
+
     cancel: CancellationToken,
-    existing_destination: ExistingDestinationPolicy,
-    resumability: Resumability,
-    recovery: Option<Arc<dyn EntryRecoveryState>>,
+
+    transfer_policy: TransferPolicy,
     metadata_plan: Option<MetadataPlan>,
 }
 
@@ -77,7 +72,7 @@ impl RemoteExpertDestinationRequest {
     #[must_use]
     pub fn new(
         ndx: SessionNdx, identity: TransferIdentity, observation: ObservedEntry, destination: Storage,
-        final_path: StoragePath, inflight: InflightLimits, cancel: CancellationToken,
+        final_path: StoragePath, cancel: CancellationToken,
     ) -> Self {
         Self {
             ndx,
@@ -85,25 +80,17 @@ impl RemoteExpertDestinationRequest {
             observation,
             destination,
             final_path,
-            inflight,
+
             cancel,
-            existing_destination: ExistingDestinationPolicy::default(),
-            resumability: Resumability::default(),
-            recovery: None,
+
+            transfer_policy: TransferPolicy::default(),
             metadata_plan: None,
         }
     }
 
     #[must_use]
-    pub fn with_existing_destination_policy(mut self, policy: ExistingDestinationPolicy) -> Self {
-        self.existing_destination = policy;
-        self
-    }
-
-    #[must_use]
-    pub fn with_recovery(mut self, resumability: Resumability, recovery: Option<Arc<dyn EntryRecoveryState>>) -> Self {
-        self.resumability = resumability;
-        self.recovery = recovery;
+    pub const fn with_transfer_policy(mut self, policy: TransferPolicy) -> Self {
+        self.transfer_policy = policy;
         self
     }
 
@@ -151,13 +138,7 @@ async fn serve_remote_source_inner(
     transport: Arc<dyn SenderTransport>, request: RemoteExpertSourceRequest,
 ) -> Result<RemoteExpertSourceReport> {
     expect_transfer_request(transport.recv().await, request.ndx)?;
-    let mut source_request = ExpertSourceRequest::new(
-        request.identity,
-        request.source,
-        request.observation,
-        request.inflight,
-        request.cancel,
-    );
+    let mut source_request = ExpertSourceRequest::new(request.source, request.observation, request.cancel);
     if let Some(source_qos) = request.source_qos {
         source_request = source_request.with_source_qos(source_qos);
     }
@@ -249,7 +230,6 @@ pub async fn receive_remote_destination(
 async fn receive_remote_destination_inner(
     transport: Arc<dyn ReceiverTransport>, request: RemoteExpertDestinationRequest,
 ) -> Result<TransferOutcome> {
-    validate_recovery(&request)?;
     transport
         .send(ReceiverMsg::RemoteDestination(
             RemoteDestinationEvent::TransferRequested { ndx: request.ndx },
@@ -257,18 +237,15 @@ async fn receive_remote_destination_inner(
         .await?;
     let (source_size, source_chunk) = expect_offer(transport.recv().await, request.ndx, &request.observation)?;
     let identity_key = request.observation.identity_key();
-    let (provider, recovery_opened) = recovery_provider(&request);
     let mut destination_request = ExpertDestinationRequest::new(
-        request.identity,
         request.observation.clone(),
         source_chunk,
         request.destination,
         request.final_path,
-        request.inflight,
         request.cancel,
     )
-    .with_existing_destination_policy(request.existing_destination)
-    .with_recovery(request.resumability, provider);
+    .with_identity_override(request.identity)
+    .with_transfer_policy(request.transfer_policy);
     if let Some(plan) = request.metadata_plan.clone() {
         destination_request = destination_request.with_metadata_plan(plan);
     }
@@ -321,24 +298,14 @@ async fn receive_remote_destination_inner(
         .complete(evidence)
         .await
         .map_err(|source| transfer_failure(request.ndx, source))?;
-    if recovery_opened.load(Ordering::Acquire)
-        && let Some(recovery) = request.recovery
-    {
-        recovery
-            .completed(&request.observation)
-            .await
-            .map_err(|source| AppError::RemoteExpertRecoveryCompletion {
-                ndx: request.ndx.0,
-                source_qos: outcome.source_qos,
-                source: Box::new(source),
-            })?;
-    }
     transport
         .send(ReceiverMsg::RemoteDestination(RemoteDestinationEvent::Terminal(
             RemoteTransferTerminal::Completed {
                 ndx: request.ndx,
                 transferred_bytes: outcome.transferred_bytes,
-                blake3: outcome.blake3,
+                blake3: outcome
+                    .blake3
+                    .ok_or_else(|| protocol(request.ndx, "completed expert transfer has no digest"))?,
             },
         )))
         .await?;
@@ -530,28 +497,6 @@ async fn receive_payload(
     }
 }
 
-fn recovery_provider(request: &RemoteExpertDestinationRequest) -> (Option<Arc<dyn RecoveryProvider>>, Arc<AtomicBool>) {
-    request.recovery.as_ref().map_or_else(
-        || (None, Arc::new(AtomicBool::new(false))),
-        |store| {
-            let (provider, opened) = lazy_entry_recovery_provider(Arc::clone(store), request.observation.clone());
-            (Some(provider), opened)
-        },
-    )
-}
-
-fn validate_recovery(request: &RemoteExpertDestinationRequest) -> Result<()> {
-    match (request.resumability, request.recovery.is_some()) {
-        (Resumability::Enabled, false) => Err(AppError::ConfigError(
-            "enabled remote resumability requires entry recovery persistence".to_string(),
-        )),
-        (Resumability::Disabled, true) => Err(AppError::ConfigError(
-            "disabled remote resumability cannot accept entry recovery persistence".to_string(),
-        )),
-        _ => Ok(()),
-    }
-}
-
 fn split_bytes(bytes: &Bytes, maximum: usize) -> Vec<Bytes> {
     let mut parts = Vec::with_capacity(bytes.len().div_ceil(maximum));
     let mut start = 0;
@@ -600,7 +545,6 @@ fn project_failure(failure: &data_mover::transfer::TransferFailure) -> RemoteTra
             TransferPhase::Preflight => RemoteTransferPhase::Preflight,
             TransferPhase::Describe => RemoteTransferPhase::Describe,
             TransferPhase::Prepare => RemoteTransferPhase::Prepare,
-            TransferPhase::RecoveryRegistration => RemoteTransferPhase::RecoveryRegistration,
             TransferPhase::Transfer => RemoteTransferPhase::Transfer,
             TransferPhase::Checkpoint => RemoteTransferPhase::Checkpoint,
             TransferPhase::Verify => RemoteTransferPhase::Verify,
@@ -622,14 +566,6 @@ fn project_failure(failure: &data_mover::transfer::TransferFailure) -> RemoteTra
 fn project_destination_failure(error: &AppError) -> Option<RemoteTransferFailure> {
     match error {
         AppError::RemoteExpertTransferFailure { source, .. } => Some(project_failure(source)),
-        AppError::RemoteExpertRecoveryCompletion { source_qos, source, .. } => Some(RemoteTransferFailure {
-            phase: RemoteTransferPhase::RecoveryCompletion,
-            side: RemoteTransferSide::Orchestration,
-            stage: RemoteStageDisposition::None,
-            final_destination_changed: true,
-            source_qos: qos_to_wire(*source_qos),
-            diagnostic: source.to_string(),
-        }),
         AppError::RemoteExpertPayloadInterrupted { destination, .. } => Some(project_failure(destination)),
         _ => None,
     }
@@ -656,7 +592,6 @@ mod tests {
     use std::collections::VecDeque;
     use std::num::NonZeroUsize;
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 
     use bytes::Bytes;
@@ -664,13 +599,11 @@ mod tests {
         AclTarget, ApplicationOutcome, MetadataPlanRequest, MetadataPolicies, MetadataTarget, OwnershipTarget,
         TimestampTargetCapability, ValueTarget, compile_metadata_plan,
     };
-    use data_mover::model::{BackendIdentity, BackendKind, ObservedEntry, StoragePath};
+    use data_mover::model::{ObservedEntry, StoragePath};
     use data_mover::storage::{
-        BackendConfig, LocalBackendConfig, PreflightPolicy, SourceQosGroup, SourceQosPolicy, Storage, connect_backend,
+        BackendConfig, LocalBackendConfig, SourceQosGroup, SourceQosPolicy, Storage, connect_backend,
     };
-    use data_mover::transfer::{
-        InflightLimits, RecoveryRegistrar, RecoveryRegistrationFailure, Resumability, TransferIdentity,
-    };
+    use data_mover::transfer::{TransferIdentity, TransferPolicy};
     use tempfile::tempdir;
     use tokio_util::sync::CancellationToken;
     use transport::message::{
@@ -684,7 +617,6 @@ mod tests {
     use super::{
         RemoteExpertDestinationRequest, RemoteExpertSourceRequest, receive_remote_destination, serve_remote_source,
     };
-    use crate::local_transfer::{EntryRecoveryState, RecoveryRegistration};
 
     type TestResult<T = ()> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
@@ -707,10 +639,13 @@ mod tests {
         }
     }
 
-    async fn local_storage(root: &std::path::Path, stable_id: &str) -> TestResult<Storage> {
+    async fn local_storage(root: &std::path::Path, _stable_id: &str) -> TestResult<Storage> {
         Ok(connect_backend(BackendConfig::Local(LocalBackendConfig {
+            rename_context: None,
+            read_chunk_bytes: None,
+            write_chunk_bytes: None,
             root: root.to_path_buf(),
-            identity: BackendIdentity::new(BackendKind::Local, stable_id)?,
+
             read_concurrency: NonZeroUsize::new(2).ok_or("read concurrency")?,
             write_concurrency: NonZeroUsize::new(2).ok_or("write concurrency")?,
         }))
@@ -718,7 +653,7 @@ mod tests {
     }
 
     async fn observe(storage: &Storage, path: &str) -> TestResult<ObservedEntry> {
-        let source = storage.read_source(&PreflightPolicy::production())?;
+        let source = storage.read_source()?;
         let descriptor = source.describe(&StoragePath::new(path)?).await?;
         Ok(ObservedEntry::new(
             descriptor.path,
@@ -752,7 +687,7 @@ mod tests {
             policies: MetadataPolicies::default(),
             principal_mapper: None,
         })?;
-        let identity = TransferIdentity::new("remote-expert-capacity-one")?;
+        let identity = TransferIdentity::from_label("remote-expert-capacity-one")?;
         let cancel = CancellationToken::new();
         let (sender_transport, receiver_transport) = create_in_process_pair_with_capacity(1);
 
@@ -763,7 +698,6 @@ mod tests {
                 identity.clone(),
                 source,
                 observation.clone(),
-                InflightLimits::new(2, 256 * 1024, 2)?,
                 cancel.clone(),
             )
             .with_source_qos(SourceQosGroup::new(SourceQosPolicy::new(None, 32 * 1024, None)?)),
@@ -776,10 +710,9 @@ mod tests {
                 observation,
                 destination,
                 StoragePath::new("copied.bin")?,
-                InflightLimits::new(2, 64 * 1024, 2)?,
                 cancel,
             )
-            .with_recovery(Resumability::Disabled, None)
+            .with_transfer_policy(TransferPolicy::AtomicReplace)
             .with_metadata_plan(metadata_plan),
         ));
 
@@ -799,7 +732,7 @@ mod tests {
                 .iter()
                 .all(|item| item.outcome == ApplicationOutcome::OmittedByPolicy)
         }));
-        assert_eq!(destination_outcome.blake3, *blake3::hash(&payload).as_bytes());
+        assert_eq!(destination_outcome.blake3, Some(*blake3::hash(&payload).as_bytes()));
         assert_eq!(
             tokio::fs::read(destination_root.path().join("copied.bin")).await?,
             payload
@@ -816,8 +749,8 @@ mod tests {
         let destination = local_storage(destination_root.path(), "remote-changed-destination").await?;
         let observation = observe(&source, "changed.bin").await?;
         tokio::fs::write(source_root.path().join("changed.bin"), b"changed-after-advertisement").await?;
-        let identity = TransferIdentity::new("remote-source-changed")?;
-        let limits = InflightLimits::new(1, 64 * 1024, 1)?;
+        let identity = TransferIdentity::from_label("remote-source-changed")?;
+
         let cancel = CancellationToken::new();
         let (sender_transport, receiver_transport) = create_in_process_pair_with_capacity(1);
         let mut source_task = tokio::spawn(serve_remote_source(
@@ -827,7 +760,6 @@ mod tests {
                 identity.clone(),
                 source,
                 observation.clone(),
-                limits,
                 cancel.clone(),
             ),
         ));
@@ -839,10 +771,9 @@ mod tests {
                 observation,
                 destination,
                 StoragePath::new("must-not-exist.bin")?,
-                limits,
                 cancel,
             )
-            .with_recovery(Resumability::Disabled, None),
+            .with_transfer_policy(TransferPolicy::AtomicReplace),
         ));
 
         let completed = tokio::time::timeout(Duration::from_secs(2), async {
@@ -873,8 +804,8 @@ mod tests {
         let source = local_storage(source_root.path(), "remote-cancel-source").await?;
         let destination = local_storage(destination_root.path(), "remote-cancel-destination").await?;
         let observation = observe(&source, "cancelled.bin").await?;
-        let identity = TransferIdentity::new("remote-cancelled")?;
-        let limits = InflightLimits::new(1, 64 * 1024, 1)?;
+        let identity = TransferIdentity::from_label("remote-cancelled")?;
+
         let cancel = CancellationToken::new();
         cancel.cancel();
         let (sender_transport, receiver_transport) = create_in_process_pair_with_capacity(1);
@@ -885,7 +816,6 @@ mod tests {
                 identity.clone(),
                 source,
                 observation.clone(),
-                limits,
                 cancel.clone(),
             ),
         ));
@@ -897,10 +827,9 @@ mod tests {
                 observation,
                 destination,
                 StoragePath::new("cancelled-output.bin")?,
-                limits,
                 cancel,
             )
-            .with_recovery(Resumability::Disabled, None),
+            .with_transfer_policy(TransferPolicy::AtomicReplace),
         ));
 
         let (source_result, destination_result) = tokio::time::timeout(Duration::from_secs(2), async {
@@ -916,51 +845,8 @@ mod tests {
         Ok(())
     }
 
-    #[derive(Default)]
-    struct RecoveryCounts {
-        opened: AtomicUsize,
-        registered: AtomicUsize,
-        completed: AtomicUsize,
-    }
-
-    struct TestRecoveryRegistrar(Arc<RecoveryCounts>);
-
-    #[async_trait::async_trait]
-    impl RecoveryRegistrar for TestRecoveryRegistrar {
-        async fn register(
-            &self, _identity: data_mover::storage::RecoveryIdentity,
-        ) -> std::result::Result<(), RecoveryRegistrationFailure> {
-            self.0.registered.fetch_add(1, Ordering::SeqCst);
-            Ok(())
-        }
-    }
-
-    struct TestRecoveryState {
-        counts: Arc<RecoveryCounts>,
-        completion_fails: bool,
-    }
-
-    #[async_trait::async_trait]
-    impl EntryRecoveryState for TestRecoveryState {
-        async fn open(&self, _entry: &ObservedEntry) -> crate::error::Result<RecoveryRegistration> {
-            self.counts.opened.fetch_add(1, Ordering::SeqCst);
-            let registrar: Arc<dyn RecoveryRegistrar> = Arc::new(TestRecoveryRegistrar(Arc::clone(&self.counts)));
-            Ok(RecoveryRegistration::new(None, [7; 32], registrar))
-        }
-
-        async fn completed(&self, _entry: &ObservedEntry) -> crate::error::Result<()> {
-            if self.completion_fails {
-                return Err(crate::error::AppError::CheckpointError(
-                    "injected durable completion failure".to_string(),
-                ));
-            }
-            self.counts.completed.fetch_add(1, Ordering::SeqCst);
-            Ok(())
-        }
-    }
-
     #[tokio::test]
-    async fn recoverable_remote_transfer_registers_before_payload_and_completes_after_publish() -> TestResult {
+    async fn checkpointed_remote_transfer_publishes_without_application_recovery_state() -> TestResult {
         let source_root = tempdir()?;
         let destination_root = tempdir()?;
         let payload = vec![0x6d; 192 * 1024 + 3];
@@ -968,14 +854,9 @@ mod tests {
         let source = local_storage(source_root.path(), "remote-recovery-source").await?;
         let destination = local_storage(destination_root.path(), "remote-recovery-destination").await?;
         let observation = observe(&source, "recoverable.bin").await?;
-        let identity = TransferIdentity::new("remote-recovery")?;
-        let limits = InflightLimits::new(1, 64 * 1024, 1)?;
+        let identity = TransferIdentity::from_label("remote-recovery")?;
+
         let cancel = CancellationToken::new();
-        let counts = Arc::new(RecoveryCounts::default());
-        let recovery: Arc<dyn EntryRecoveryState> = Arc::new(TestRecoveryState {
-            counts: Arc::clone(&counts),
-            completion_fails: false,
-        });
         let (sender_transport, receiver_transport) = create_in_process_pair_with_capacity(1);
 
         let source_task = tokio::spawn(serve_remote_source(
@@ -985,7 +866,6 @@ mod tests {
                 identity.clone(),
                 source,
                 observation.clone(),
-                limits,
                 cancel.clone(),
             ),
         ));
@@ -997,82 +877,16 @@ mod tests {
                 observation,
                 destination,
                 StoragePath::new("recovered.bin")?,
-                limits,
                 cancel,
             )
-            .with_recovery(Resumability::Enabled, Some(recovery)),
+            .with_transfer_policy(TransferPolicy::Checkpointed),
         ));
         let (source_result, destination_result) = tokio::join!(source_task, destination_task);
         source_result??;
         destination_result??;
 
-        assert_eq!(counts.opened.load(Ordering::SeqCst), 1);
-        assert_eq!(counts.registered.load(Ordering::SeqCst), 1);
-        assert_eq!(counts.completed.load(Ordering::SeqCst), 1);
         assert_eq!(
             tokio::fs::read(destination_root.path().join("recovered.bin")).await?,
-            payload
-        );
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn durable_completion_failure_reaches_source_after_publication() -> TestResult {
-        let source_root = tempdir()?;
-        let destination_root = tempdir()?;
-        let payload = vec![0x2a; 128 * 1024 + 1];
-        tokio::fs::write(source_root.path().join("completion.bin"), &payload).await?;
-        let source = local_storage(source_root.path(), "remote-completion-source").await?;
-        let destination = local_storage(destination_root.path(), "remote-completion-destination").await?;
-        let observation = observe(&source, "completion.bin").await?;
-        let identity = TransferIdentity::new("remote-completion-failure")?;
-        let limits = InflightLimits::new(1, 64 * 1024, 1)?;
-        let cancel = CancellationToken::new();
-        let counts = Arc::new(RecoveryCounts::default());
-        let recovery: Arc<dyn EntryRecoveryState> = Arc::new(TestRecoveryState {
-            counts,
-            completion_fails: true,
-        });
-        let (sender_transport, receiver_transport) = create_in_process_pair_with_capacity(1);
-        let source_task = tokio::spawn(serve_remote_source(
-            Arc::new(sender_transport),
-            RemoteExpertSourceRequest::new(
-                SessionNdx(18),
-                identity.clone(),
-                source,
-                observation.clone(),
-                limits,
-                cancel.clone(),
-            ),
-        ));
-        let destination_task = tokio::spawn(receive_remote_destination(
-            Arc::new(receiver_transport),
-            RemoteExpertDestinationRequest::new(
-                SessionNdx(18),
-                identity,
-                observation,
-                destination,
-                StoragePath::new("published-but-unrecorded.bin")?,
-                limits,
-                cancel,
-            )
-            .with_recovery(Resumability::Enabled, Some(recovery)),
-        ));
-
-        let (source_result, destination_result) = tokio::time::timeout(Duration::from_secs(2), async {
-            tokio::join!(source_task, destination_task)
-        })
-        .await?;
-        let Err(source_error) = source_result? else {
-            panic!("source must observe destination terminal failure")
-        };
-        let crate::error::AppError::RemoteExpertPeerFailure { failure, .. } = source_error else {
-            panic!("source received the wrong terminal failure")
-        };
-        assert!(failure.final_destination_changed);
-        assert!(destination_result?.is_err());
-        assert_eq!(
-            tokio::fs::read(destination_root.path().join("published-but-unrecorded.bin")).await?,
             payload
         );
         Ok(())
@@ -1087,11 +901,6 @@ mod tests {
         let source = local_storage(source_root.path(), "remote-interrupted-source").await?;
         let destination = local_storage(destination_root.path(), "remote-interrupted-destination").await?;
         let observation = observe(&source, "interrupted.bin").await?;
-        let counts = Arc::new(RecoveryCounts::default());
-        let recovery: Arc<dyn EntryRecoveryState> = Arc::new(TestRecoveryState {
-            counts,
-            completion_fails: false,
-        });
         let peer_failure = transport::message::RemoteTransferFailure {
             phase: transport::message::RemoteTransferPhase::Transfer,
             side: transport::message::RemoteTransferSide::Source,
@@ -1124,14 +933,13 @@ mod tests {
             transport,
             RemoteExpertDestinationRequest::new(
                 SessionNdx(22),
-                TransferIdentity::new("remote-interrupted")?,
+                TransferIdentity::from_label("remote-interrupted")?,
                 observation,
                 destination,
                 StoragePath::new("interrupted-output.bin")?,
-                InflightLimits::new(1, 64 * 1024, 1)?,
                 CancellationToken::new(),
             )
-            .with_recovery(Resumability::Enabled, Some(recovery)),
+            .with_transfer_policy(TransferPolicy::Checkpointed),
         )
         .await;
         let Err(crate::error::AppError::RemoteExpertPayloadInterrupted { peer, destination, .. }) = result else {
@@ -1154,8 +962,8 @@ mod tests {
         let destination = local_storage(destination_root.path(), "remote-quic-destination").await?;
         let observation = observe(&source, "quic.bin").await?;
         let snapshot = observation.encode_snapshot().as_bytes().to_vec();
-        let identity = TransferIdentity::new("remote-real-quic")?;
-        let limits = InflightLimits::new(2, 128 * 1024, 2)?;
+        let identity = TransferIdentity::from_label("remote-real-quic")?;
+
         let cancel = CancellationToken::new();
 
         let (endpoint, cert) = quic::bind("[::1]:0".parse()?)?;
@@ -1213,7 +1021,6 @@ mod tests {
                 identity.clone(),
                 source,
                 observation.clone(),
-                limits,
                 cancel.clone(),
             ),
         ));
@@ -1225,10 +1032,9 @@ mod tests {
                 observation,
                 destination,
                 StoragePath::new("quic-output.bin")?,
-                limits,
                 cancel,
             )
-            .with_recovery(Resumability::Disabled, None),
+            .with_transfer_policy(TransferPolicy::AtomicReplace),
         ));
         source_task.await??;
         destination_task.await??;

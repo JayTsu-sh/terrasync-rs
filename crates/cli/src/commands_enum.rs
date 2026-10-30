@@ -208,6 +208,11 @@ pub enum Commands {
         #[arg(short, long)]
         id: Option<String>,
 
+        /// Enable checkpoints and resume an interrupted scan with the same --id.
+        /// Requires ClickHouse; use this flag on both the initial and resumed invocation.
+        #[arg(long, requires = "id")]
+        resume: bool,
+
         /// Scan depth level (0 for infinite).
         /// Also configurable in config file under [scan] depth
         #[arg(short, long, default_value = "0")]

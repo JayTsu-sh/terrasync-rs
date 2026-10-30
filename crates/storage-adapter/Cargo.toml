@@ -1,0 +1,27 @@
+[package]
+name = "storage-adapter"
+version = "0.1.0"
+edition = "2024"
+license = "MIT AND Apache-2.0"
+
+[dependencies]
+data-mover = { workspace = true }
+async-channel = { workspace = true }
+async-trait = { workspace = true }
+blake3 = { workspace = true }
+bytes = { workspace = true, features = ["serde"] }
+chrono = { workspace = true }
+futures = { workspace = true }
+serde = { workspace = true, features = ["rc"] }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+tracing = { workspace = true }
+soft-canonicalize = "0.5"
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints]
+workspace = true

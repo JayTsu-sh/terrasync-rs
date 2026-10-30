@@ -13,8 +13,8 @@ pub mod broadcast;
 
 /// 双进程模式 Receiver 落盘任务模块
 ///
-/// 串行消费 `DiskCommitMsg`，用 data-mover 3 段流式 API 写入 `.part`，
-/// 提交时读回 hash 校验后原子 rename
+/// 串行消费 `DiskCommitMsg`，通过 expert destination 流式写入受控 stage，
+/// 提交时由引擎读回校验并发布
 pub mod disk_commit;
 mod file_commit;
 mod file_copy;
@@ -41,6 +41,7 @@ pub mod observation_scan;
 ///
 /// SyncOrchestrator 封装 sync/incremental_sync 的核心逻辑
 pub mod orchestrator;
+pub mod scan_resume;
 
 /// 双进程远端同步（Sender 侧）
 ///
@@ -104,7 +105,7 @@ pub mod tar_pack;
 /// 简化应用开发过程中的导入语句
 pub mod prelude {
     /// `QoS` 带宽解析函数
-    pub use data_mover::qos::parse_bandwidth_string;
+    pub use storage_adapter::qos::parse_bandwidth_string;
 
     /// Windows ACL相关功能（仅Windows平台可用）
     #[cfg(windows)]

@@ -185,7 +185,7 @@ mod tests {
     use std::time::Duration;
 
     use bytes::Bytes;
-    use data_mover::{DataChunk, EntryEnum, NASEntry};
+    use storage_adapter::{DataChunk, EntryEnum, NASEntry};
 
     use super::*;
     use crate::quic::framing;
@@ -213,7 +213,7 @@ mod tests {
             atime: 0,
             ctime: 0,
             mtime: 0,
-            mode: 0o644,
+            mode: Some(0o644),
             is_symlink: false,
             hard_links: None,
             uid: None,

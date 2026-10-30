@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
-use data_mover::hdfs::HdfsResumeMode;
-use data_mover::{CommitCallback, CopyOptions, EntryEnum, HdfsRecoverableCopyOptions, StorageEnum};
+use storage_adapter::hdfs::HdfsResumeMode;
+use storage_adapter::{CommitCallback, CopyOptions, EntryEnum, HdfsRecoverableCopyOptions, StorageEnum};
 
 use crate::error::{AppError, Result};
 
@@ -52,7 +52,6 @@ impl HdfsCopyContext {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum MetadataApplication {
-    Caller,
     DataMover,
 }
 
@@ -68,15 +67,15 @@ pub(crate) async fn copy_file(
         return Ok(MetadataApplication::DataMover);
     }
     StorageEnum::copy_file(from, to, entry, options).await?;
-    Ok(MetadataApplication::Caller)
+    Ok(MetadataApplication::DataMover)
 }
 
 #[cfg(test)]
 mod tests {
     use std::path::Path;
 
-    use data_mover::hdfs::HdfsResumeMode;
-    use data_mover::{CreateStorageOptions, StorageEnum, create_storage};
+    use storage_adapter::hdfs::HdfsResumeMode;
+    use storage_adapter::{CreateStorageOptions, StorageEnum, create_storage};
 
     use super::HdfsCopyContext;
 
@@ -115,7 +114,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn non_hdfs_destination_keeps_the_legacy_copy_route() {
+    async fn ordinary_copy_applies_metadata_inside_data_mover() {
         let source_root = tempfile::tempdir().unwrap_or_else(|error| panic!("source tempdir: {error}"));
         let destination_root = tempfile::tempdir().unwrap_or_else(|error| panic!("destination tempdir: {error}"));
         tokio::fs::write(source_root.path().join("payload.bin"), b"legacy route")
@@ -144,11 +143,17 @@ mod tests {
             .await
             .unwrap_or_else(|error| panic!("source metadata: {error}"));
 
-        let metadata = super::copy_file(&source, &destination, &entry, data_mover::CopyOptions::default(), None)
-            .await
-            .unwrap_or_else(|error| panic!("legacy local copy: {error}"));
+        let metadata = super::copy_file(
+            &source,
+            &destination,
+            &entry,
+            storage_adapter::CopyOptions::default(),
+            None,
+        )
+        .await
+        .unwrap_or_else(|error| panic!("legacy local copy: {error}"));
 
-        assert_eq!(metadata, super::MetadataApplication::Caller);
+        assert_eq!(metadata, super::MetadataApplication::DataMover);
         assert!(matches!(destination, StorageEnum::Local(_)));
         assert_eq!(
             tokio::fs::read(destination_root.path().join("payload.bin"))

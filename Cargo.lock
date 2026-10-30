@@ -64,15 +64,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "aligned"
-version = "0.4.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ee4508988c62edf04abd8d92897fca0c2995d907ce1dfeaf369dac3716a40685"
-dependencies = [
- "as-slice",
-]
-
-[[package]]
 name = "allocator-api2"
 version = "0.2.21"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -171,6 +162,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serial_test",
+ "storage-adapter",
  "sync-delta",
  "tempfile",
  "thiserror 2.0.20",
@@ -208,15 +200,6 @@ name = "arrayvec"
 version = "0.7.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d3fb67a6e08acf24fdeccbac2cb6ac4305825bd1f117462e0e6f2f193345ad56"
-
-[[package]]
-name = "as-slice"
-version = "0.2.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "516b6b4f0e40d50dcda9365d53964ec74560ad4284da2e7fc97122cd83174516"
-dependencies = [
- "stable_deref_trait",
-]
 
 [[package]]
 name = "assert_cmd"
@@ -1217,7 +1200,10 @@ dependencies = [
  "data-mover",
  "licensing",
  "rustls 0.23.40",
+ "storage-adapter",
  "thiserror 2.0.20",
+ "tokio",
+ "tokio-util",
  "tracing",
  "transport",
  "utils",
@@ -1444,35 +1430,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "cookie"
-version = "0.18.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1a373e3602691c3cdea496d2f0ee5935151e6168fe87739483c463db1b2f2f87"
-dependencies = [
- "percent-encoding",
- "time 0.3.55",
- "version_check",
-]
-
-[[package]]
-name = "cookie_store"
-version = "0.22.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "15b2c103cf610ec6cae3da84a766285b42fd16aad564758459e6ecf128c75206"
-dependencies = [
- "cookie",
- "document-features",
- "idna",
- "log",
- "publicsuffix",
- "serde",
- "serde_derive",
- "serde_json",
- "time 0.3.55",
- "url",
-]
-
-[[package]]
 name = "core-foundation"
 version = "0.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1552,16 +1509,6 @@ version = "0.5.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d85363c37faeca707aef026efa9f3b34d077bce547e48f770770625c6013679e"
 dependencies = [
- "crossbeam-utils",
-]
-
-[[package]]
-name = "crossbeam-deque"
-version = "0.8.7"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5181e0de7b61eb03a81e347d6dd8797bae9da5146707b51077e2d71a54ec0ceb"
-dependencies = [
- "crossbeam-epoch",
  "crossbeam-utils",
 ]
 
@@ -1702,12 +1649,12 @@ dependencies = [
 
 [[package]]
 name = "curve25519-dalek"
-version = "5.0.0-pre.6"
+version = "5.0.0-rc.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "335f1947f241137a14106b6f5acc5918a5ede29c9d71d3f2cb1678d5075d9fc3"
+checksum = "c906a87e53a36ff795d72e06e8162a83c5436e3ea89e942a9cb9fc083f0a384f"
 dependencies = [
  "cfg-if",
- "cpufeatures 0.2.17",
+ "cpufeatures 0.3.0",
  "curve25519-dalek-derive",
  "digest 0.11.3",
  "fiat-crypto 0.3.0",
@@ -1725,15 +1672,6 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.119",
-]
-
-[[package]]
-name = "cvt"
-version = "0.1.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d2ae9bf77fbf2d39ef573205d554d87e86c12f1994e9ea335b0651b9b278bcf1"
-dependencies = [
- "cfg-if",
 ]
 
 [[package]]
@@ -1758,11 +1696,134 @@ checksum = "4583a4551df46e2792f82ceeac45e850d2e2d5debba0b91f102385cda5b11f06"
 
 [[package]]
 name = "data-mover"
-version = "0.2.0"
-source = "git+https://github.com/JayTsu-sh/data-mover-rs.git?rev=d76ff5cbe1ac439ea71d16a4f158d55f310a1b45#d76ff5cbe1ac439ea71d16a4f158d55f310a1b45"
+version = "0.4.0"
+source = "git+https://github.com/JayTsu-sh/data-mover-rs.git?rev=4149575e91fe392ee853725e110d6c1be9c6b562#4149575e91fe392ee853725e110d6c1be9c6b562"
 dependencies = [
- "arc-swap",
- "async-channel",
+ "aws-config",
+ "aws-credential-types",
+ "aws-sdk-s3",
+ "aws-smithy-runtime-api",
+ "aws-smithy-types",
+ "aws-types",
+ "data-mover-acl",
+ "data-mover-backend-cifs",
+ "data-mover-backend-hdfs",
+ "data-mover-backend-local",
+ "data-mover-backend-nfs",
+ "data-mover-backend-s3",
+ "data-mover-integrity",
+ "data-mover-metadata",
+ "data-mover-model",
+ "data-mover-storage-core",
+ "data-mover-transfer",
+ "data-mover-traversal",
+ "hdfs-native",
+ "nfs-rs",
+ "smb",
+]
+
+[[package]]
+name = "data-mover-acl"
+version = "0.4.0"
+source = "git+https://github.com/JayTsu-sh/data-mover-rs.git?rev=4149575e91fe392ee853725e110d6c1be9c6b562#4149575e91fe392ee853725e110d6c1be9c6b562"
+dependencies = [
+ "data-mover-model",
+ "thiserror 2.0.20",
+]
+
+[[package]]
+name = "data-mover-backend-cifs"
+version = "0.4.0"
+source = "git+https://github.com/JayTsu-sh/data-mover-rs.git?rev=4149575e91fe392ee853725e110d6c1be9c6b562#4149575e91fe392ee853725e110d6c1be9c6b562"
+dependencies = [
+ "async-trait",
+ "binrw",
+ "blake3",
+ "bytes 1.12.1",
+ "data-mover-acl",
+ "data-mover-model",
+ "data-mover-storage-core",
+ "futures",
+ "smb",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "url",
+ "uuid",
+]
+
+[[package]]
+name = "data-mover-backend-hdfs"
+version = "0.4.0"
+source = "git+https://github.com/JayTsu-sh/data-mover-rs.git?rev=4149575e91fe392ee853725e110d6c1be9c6b562#4149575e91fe392ee853725e110d6c1be9c6b562"
+dependencies = [
+ "async-trait",
+ "blake3",
+ "bytes 1.12.1",
+ "data-mover-model",
+ "data-mover-storage-core",
+ "futures",
+ "hdfs-native",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "data-mover-backend-local"
+version = "0.4.0"
+source = "git+https://github.com/JayTsu-sh/data-mover-rs.git?rev=4149575e91fe392ee853725e110d6c1be9c6b562#4149575e91fe392ee853725e110d6c1be9c6b562"
+dependencies = [
+ "async-trait",
+ "blake3",
+ "bytes 1.12.1",
+ "cap-primitives",
+ "cap-std",
+ "data-mover-acl",
+ "data-mover-model",
+ "data-mover-storage-core",
+ "filetime",
+ "futures",
+ "libc",
+ "rustix",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "windows",
+ "windows-sys 0.61.2",
+ "xattr",
+]
+
+[[package]]
+name = "data-mover-backend-nfs"
+version = "0.4.0"
+source = "git+https://github.com/JayTsu-sh/data-mover-rs.git?rev=4149575e91fe392ee853725e110d6c1be9c6b562#4149575e91fe392ee853725e110d6c1be9c6b562"
+dependencies = [
+ "async-trait",
+ "blake3",
+ "bytes 1.12.1",
+ "dashmap",
+ "data-mover-acl",
+ "data-mover-model",
+ "data-mover-storage-core",
+ "futures",
+ "moka",
+ "nfs-rs",
+ "path-clean",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "url",
+ "uuid",
+ "xattr",
+]
+
+[[package]]
+name = "data-mover-backend-s3"
+version = "0.4.0"
+source = "git+https://github.com/JayTsu-sh/data-mover-rs.git?rev=4149575e91fe392ee853725e110d6c1be9c6b562#4149575e91fe392ee853725e110d6c1be9c6b562"
+dependencies = [
  "async-trait",
  "aws-config",
  "aws-credential-types",
@@ -1771,45 +1832,128 @@ dependencies = [
  "aws-smithy-types",
  "aws-types",
  "base64",
- "binrw",
  "blake3",
  "bytes 1.12.1",
- "cap-std",
- "chrono",
- "dashmap",
- "filetime",
+ "data-mover-model",
+ "data-mover-storage-core",
  "futures",
- "glob",
- "governor",
- "hdfs-native",
  "http-body 1.1.0",
  "hyper-rustls 0.27.9",
  "hyper-util",
  "md-5 0.10.6",
- "moka",
- "nfs-rs",
- "num-traits",
- "parking_lot",
- "path-clean",
  "percent-encoding",
  "quick-xml",
- "rayon",
- "remove_dir_all",
- "reqwest 0.13.4",
  "rustls 0.23.40",
  "serde",
- "smb 0.12.0 (git+https://github.com/JayTsu-sh/smb-rs.git?rev=d8291b3a3157b026074ab6b0f305dfd99af17f1e)",
- "smb 0.12.0 (git+https://github.com/JayTsu-sh/smb-rs.git)",
- "soft-canonicalize",
- "thiserror 2.0.20",
  "tokio",
  "tokio-util",
  "tracing",
  "url",
  "uuid",
- "windows",
+]
+
+[[package]]
+name = "data-mover-integrity"
+version = "0.4.0"
+source = "git+https://github.com/JayTsu-sh/data-mover-rs.git?rev=4149575e91fe392ee853725e110d6c1be9c6b562#4149575e91fe392ee853725e110d6c1be9c6b562"
+dependencies = [
+ "async-trait",
+ "blake3",
+ "bytes 1.12.1",
+ "data-mover-acl",
+ "data-mover-model",
+ "data-mover-storage-core",
+ "futures",
+ "tokio",
+ "tokio-util",
+]
+
+[[package]]
+name = "data-mover-metadata"
+version = "0.4.0"
+source = "git+https://github.com/JayTsu-sh/data-mover-rs.git?rev=4149575e91fe392ee853725e110d6c1be9c6b562#4149575e91fe392ee853725e110d6c1be9c6b562"
+dependencies = [
+ "async-trait",
+ "blake3",
+ "bytes 1.12.1",
+ "data-mover-acl",
+ "data-mover-model",
+ "data-mover-storage-core",
+ "tokio",
+ "tokio-util",
+]
+
+[[package]]
+name = "data-mover-model"
+version = "0.4.0"
+source = "git+https://github.com/JayTsu-sh/data-mover-rs.git?rev=4149575e91fe392ee853725e110d6c1be9c6b562#4149575e91fe392ee853725e110d6c1be9c6b562"
+dependencies = [
+ "blake3",
+]
+
+[[package]]
+name = "data-mover-storage-core"
+version = "0.4.0"
+source = "git+https://github.com/JayTsu-sh/data-mover-rs.git?rev=4149575e91fe392ee853725e110d6c1be9c6b562#4149575e91fe392ee853725e110d6c1be9c6b562"
+dependencies = [
+ "arc-swap",
+ "async-trait",
+ "base64",
+ "blake3",
+ "bytes 1.12.1",
+ "cap-std",
+ "data-mover-model",
+ "filetime",
+ "futures",
+ "governor",
+ "num-traits",
+ "percent-encoding",
+ "quick-xml",
+ "serde",
+ "thiserror 2.0.20",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "url",
  "windows-sys 0.61.2",
- "xattr",
+]
+
+[[package]]
+name = "data-mover-transfer"
+version = "0.4.0"
+source = "git+https://github.com/JayTsu-sh/data-mover-rs.git?rev=4149575e91fe392ee853725e110d6c1be9c6b562#4149575e91fe392ee853725e110d6c1be9c6b562"
+dependencies = [
+ "async-trait",
+ "blake3",
+ "bytes 1.12.1",
+ "data-mover-metadata",
+ "data-mover-model",
+ "data-mover-storage-core",
+ "futures",
+ "md-5 0.10.6",
+ "thiserror 2.0.20",
+ "tokio",
+ "tokio-util",
+ "uuid",
+]
+
+[[package]]
+name = "data-mover-traversal"
+version = "0.4.0"
+source = "git+https://github.com/JayTsu-sh/data-mover-rs.git?rev=4149575e91fe392ee853725e110d6c1be9c6b562#4149575e91fe392ee853725e110d6c1be9c6b562"
+dependencies = [
+ "async-trait",
+ "blake3",
+ "bytes 1.12.1",
+ "data-mover-model",
+ "data-mover-storage-core",
+ "futures",
+ "glob",
+ "num-traits",
+ "parking_lot",
+ "tokio",
+ "tokio-util",
+ "tracing",
 ]
 
 [[package]]
@@ -1825,6 +1969,7 @@ dependencies = [
  "once_cell",
  "serde",
  "serde_json",
+ "storage-adapter",
  "thiserror 2.0.20",
  "tokio",
  "tracing",
@@ -1941,15 +2086,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "document-features"
-version = "0.2.12"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d4b8a88685455ed29a21542a33abd9cb6510b6b129abadabdcef0f4c55bc8f61"
-dependencies = [
- "litrs",
-]
-
-[[package]]
 name = "dotenvy"
 version = "0.15.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1977,15 +2113,15 @@ dependencies = [
 
 [[package]]
 name = "ecdsa"
-version = "0.17.0-rc.17"
+version = "0.17.0-rc.22"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dc4bf51f0534ed6e59a0f2f26272b64ba55c470133f8424c2adfd1c4d59d9988"
+checksum = "b7c72d1455753a703ad4b90ed2a759f2bc4562024a303176439cf6e593b5ade4"
 dependencies = [
  "der 0.8.1",
  "digest 0.11.3",
- "elliptic-curve 0.14.0-rc.31",
- "rfc6979 0.5.0-rc.5",
- "signature 3.0.0-rc.10",
+ "elliptic-curve 0.14.1",
+ "rfc6979 0.6.0-pre.0",
+ "signature 3.0.0",
  "spki 0.8.0",
  "zeroize",
 ]
@@ -2002,12 +2138,11 @@ dependencies = [
 
 [[package]]
 name = "ed25519"
-version = "3.0.0-rc.4"
+version = "3.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c6e914c7c52decb085cea910552e24c63ac019e3ab8bf001ff736da9a9d9d890"
+checksum = "29fcf32e6c73d1079f83ab4d782de2d81620346a5f38c6237a86a22f8368980a"
 dependencies = [
- "pkcs8 0.11.0-rc.11",
- "signature 3.0.0-rc.10",
+ "signature 3.0.0",
 ]
 
 [[package]]
@@ -2027,12 +2162,12 @@ dependencies = [
 
 [[package]]
 name = "ed25519-dalek"
-version = "3.0.0-pre.6"
+version = "3.0.0-rc.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "053618a4c3d3bc24f188aa660ae75a46eeab74ef07fb415c61431e5e7cd4749b"
+checksum = "1685663e23882cd8517dcbcb1c23a6ebff4433c22dfb681d760219b62cd1b849"
 dependencies = [
- "curve25519-dalek 5.0.0-pre.6",
- "ed25519 3.0.0-rc.4",
+ "curve25519-dalek 5.0.0-rc.1",
+ "ed25519 3.0.0",
  "rand_core 0.10.1",
  "sha2 0.11.0",
  "subtle",
@@ -2070,22 +2205,21 @@ dependencies = [
 
 [[package]]
 name = "elliptic-curve"
-version = "0.14.0-rc.31"
+version = "0.14.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b148a81cede8f4023248f980cffdf7611c46f2add469c6980e815b7c5b764ba5"
+checksum = "9d65aa39b3a5c1c9c1b745c9a019234bb7a21b77abcb4f4d266d706e2d577d65"
 dependencies = [
  "base16ct 1.0.0",
  "crypto-bigint 0.7.5",
  "crypto-common 0.2.2",
  "digest 0.11.3",
+ "ff 0.14.0",
+ "group 0.14.0",
  "hkdf 0.13.0",
  "hybrid-array",
- "once_cell",
  "pem-rfc7468 1.0.0",
- "pkcs8 0.11.0-rc.11",
+ "pkcs8 0.11.0",
  "rand_core 0.10.1",
- "rustcrypto-ff",
- "rustcrypto-group",
  "sec1 0.8.1",
  "subtle",
  "zeroize",
@@ -2206,11 +2340,11 @@ dependencies = [
 
 [[package]]
 name = "ff"
-version = "0.14.0-pre.0"
+version = "0.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d42dd26f5790eda47c1a2158ea4120e32c35ddc9a7743c98a292accc01b54ef3"
+checksum = "a1f686ab92a9fb0eaf188f6c6c87b89490baa6fdb0db4544ba4dc47f7942489f"
 dependencies = [
- "rand_core 0.9.5",
+ "rand_core 0.10.1",
  "subtle",
 ]
 
@@ -2308,20 +2442,6 @@ dependencies = [
  "io-lifetimes 2.0.4",
  "rustix",
  "windows-sys 0.59.0",
-]
-
-[[package]]
-name = "fs_at"
-version = "0.2.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "14af6c9694ea25db25baa2a1788703b9e7c6648dcaeeebeb98f7561b5384c036"
-dependencies = [
- "aligned",
- "cfg-if",
- "cvt",
- "libc",
- "nix",
- "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -2584,12 +2704,12 @@ dependencies = [
 
 [[package]]
 name = "group"
-version = "0.14.0-pre.0"
+version = "0.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1ff6a0b2dd4b981b1ae9e3e6830ab146771f3660d31d57bafd9018805a91b0f1"
+checksum = "7fd1a1c7a5206c5b7a3f5a0d7ccd3ff85d0c8f5133d62a02680255b0004af5f4"
 dependencies = [
- "ff 0.14.0-pre.0",
- "rand_core 0.9.5",
+ "ff 0.14.0",
+ "rand_core 0.10.1",
  "subtle",
 ]
 
@@ -2690,8 +2810,8 @@ dependencies = [
 
 [[package]]
 name = "hdfs-native"
-version = "0.14.5"
-source = "git+https://github.com/Kimahriman/hdfs-native?branch=master#c3be836e629de03a138f0303220f06df97e222b4"
+version = "0.14.6"
+source = "git+https://github.com/kimahriman/hdfs-native?rev=695fc47e9f88804e39bba1d30bf128e66da9b8d6#695fc47e9f88804e39bba1d30bf128e66da9b8d6"
 dependencies = [
  "aes",
  "base64",
@@ -2723,6 +2843,7 @@ dependencies = [
  "socket2 0.6.5",
  "thiserror 2.0.20",
  "tokio",
+ "tokio-util",
  "url",
  "uuid",
  "whoami 2.1.3",
@@ -3419,12 +3540,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "47d9d19d1d6efa0109d2f65ff4c85cddd50bd572e5a00127ab10987290bcefae"
 
 [[package]]
-name = "litrs"
-version = "1.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "11d3d7f243d5c5a8b9bb5d6dd2b1602c0cb0b9db1621bafc7ed66e35ff9fe092"
-
-[[package]]
 name = "lock_api"
 version = "0.4.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3624,9 +3739,9 @@ checksum = "cf5a574dadd7941adeaa71823ecba5e28331b8313fb2e1c6a5c7e5981ea53ad6"
 
 [[package]]
 name = "nfs-rs"
-version = "0.5.8"
+version = "0.9.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8a414b30e2cbd1f0570b65957d46c66d9ea048efdbd47e31f67043de639e5fcd"
+checksum = "a6f42f81b8aca4d68fb1df680178ce0013e37ff1983436e61e4466563632abe5"
 dependencies = [
  "async-trait",
  "byteorder",
@@ -3635,6 +3750,7 @@ dependencies = [
  "futures",
  "nix",
  "path-clean",
+ "percent-encoding",
  "rand 0.9.5",
  "serde_json",
  "socket2 0.5.10",
@@ -3676,15 +3792,6 @@ name = "normalize-line-endings"
 version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "61807f77802ff30975e01f4f071c8ba10c022052f98b3294119f3e615d13e5be"
-
-[[package]]
-name = "normpath"
-version = "1.5.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b9985ef7269fa99f3b12437bb698381da2428743ab90f20393f399fa14cab21a"
-dependencies = [
- "windows-sys 0.61.2",
-]
 
 [[package]]
 name = "nu-ansi-term"
@@ -3849,42 +3956,42 @@ dependencies = [
 
 [[package]]
 name = "p256"
-version = "0.14.0-rc.9"
+version = "0.14.0-rc.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8b97e3bf0465157ae90975ff52dbeb1362ba618924878c9f74c25baa27a65f9a"
+checksum = "c855a8d2ffd346aa03122626f22e96e3aa75e3bfe64e6bf6cb82f71821ed6ae7"
 dependencies = [
- "ecdsa 0.17.0-rc.17",
- "elliptic-curve 0.14.0-rc.31",
+ "ecdsa 0.17.0-rc.22",
+ "elliptic-curve 0.14.1",
  "primefield",
- "primeorder 0.14.0-rc.9",
+ "primeorder 0.14.0-rc.14",
  "sha2 0.11.0",
 ]
 
 [[package]]
 name = "p384"
-version = "0.14.0-rc.9"
+version = "0.14.0-rc.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "437f30ebcb1e16ff48acead5f08bd69fbcdbc82421687bb48af5c315a0bfab03"
+checksum = "62941b68907ddf996ac20f0debf700c236ccc3d874637731a93c631129ca042f"
 dependencies = [
- "ecdsa 0.17.0-rc.17",
- "elliptic-curve 0.14.0-rc.31",
+ "ecdsa 0.17.0-rc.22",
+ "elliptic-curve 0.14.1",
  "fiat-crypto 0.3.0",
  "primefield",
- "primeorder 0.14.0-rc.9",
+ "primeorder 0.14.0-rc.14",
  "sha2 0.11.0",
 ]
 
 [[package]]
 name = "p521"
-version = "0.14.0-rc.9"
+version = "0.14.0-rc.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4e9fd792bab86ecf6249561752fb5a413511f999887107dd054bbda5143743d7"
+checksum = "0dd6f2fe6e76c8d5e8828e92aafa463777d1e72e70b78acc724214757e92479a"
 dependencies = [
  "base16ct 1.0.0",
- "ecdsa 0.17.0-rc.17",
- "elliptic-curve 0.14.0-rc.31",
+ "ecdsa 0.17.0-rc.22",
+ "elliptic-curve 0.14.1",
  "primefield",
- "primeorder 0.14.0-rc.9",
+ "primeorder 0.14.0-rc.14",
  "sha2 0.11.0",
 ]
 
@@ -4035,38 +4142,31 @@ dependencies = [
 
 [[package]]
 name = "picky"
-version = "7.0.0-rc.23"
+version = "7.0.0-rc.25"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "be8b243c0a8e59483c7b0f746aed1c1719245692a92e9a35693f9edb88a0b712"
+checksum = "c1ae9cd78eb1d61be4790713d28368cf71c844218fcd91542768805423f02666"
 dependencies = [
  "base64",
  "crypto-bigint 0.7.5",
  "crypto-common 0.2.2",
- "curve25519-dalek 5.0.0-pre.6",
+ "curve25519-dalek 5.0.0-rc.1",
  "digest 0.11.3",
- "ecdsa 0.17.0-rc.17",
- "ed25519 3.0.0-rc.4",
- "ed25519-dalek 3.0.0-pre.6",
- "elliptic-curve 0.14.0-rc.31",
- "ff 0.14.0-pre.0",
- "group 0.14.0-pre.0",
+ "ecdsa 0.17.0-rc.22",
+ "ed25519-dalek 3.0.0-rc.1",
  "hex",
  "inout",
  "md-5 0.11.0",
- "p256 0.14.0-rc.9",
+ "p256 0.14.0-rc.14",
  "p384",
  "p521",
  "picky-asn1",
  "picky-asn1-der",
  "picky-asn1-x509",
  "pkcs1 0.8.0-rc.4",
- "pkcs8 0.11.0-rc.11",
- "primefield",
- "primeorder 0.14.0-rc.9",
+ "primeorder 0.14.0-rc.14",
  "rand 0.10.2",
  "rand_core 0.10.1",
- "rfc6979 0.5.0-rc.5",
- "rsa 0.10.0-rc.17",
+ "rsa 0.10.0-rc.18",
  "rustcrypto-ff",
  "rustcrypto-ff_derive",
  "rustcrypto-group",
@@ -4074,7 +4174,6 @@ dependencies = [
  "sha1 0.11.0",
  "sha2 0.11.0",
  "sha3",
- "signature 3.0.0-rc.10",
  "thiserror 2.0.20",
  "x25519-dalek",
  "zeroize",
@@ -4213,9 +4312,9 @@ dependencies = [
 
 [[package]]
 name = "pkcs8"
-version = "0.11.0-rc.11"
+version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "12922b6296c06eb741b02d7b5161e3aaa22864af38dfa025a1a3ba3f68c84577"
+checksum = "451913da69c775a56034ea8d9003d27ee8948e12443eae7c038ba100a4f21cb7"
 dependencies = [
  "der 0.8.1",
  "spki 0.8.0",
@@ -4316,14 +4415,14 @@ dependencies = [
 
 [[package]]
 name = "primefield"
-version = "0.14.0-rc.9"
+version = "0.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1b52e6ee42db392378a95622b463c9740631171d1efce43fa445a569c1600cb6"
+checksum = "c555a6e4eb7d4e158fcb028c835c3b8642206ddc279b5c6b202ef9a8bdb592f4"
 dependencies = [
  "crypto-bigint 0.7.5",
  "crypto-common 0.2.2",
+ "ff 0.14.0",
  "rand_core 0.10.1",
- "rustcrypto-ff",
  "subtle",
  "zeroize",
 ]
@@ -4339,11 +4438,14 @@ dependencies = [
 
 [[package]]
 name = "primeorder"
-version = "0.14.0-rc.9"
+version = "0.14.0-rc.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0556580e42c19833f5d232aca11a7687a503ee41f937b54f5ae1d50fc2a6a36a"
+checksum = "4e56e6d67fdf5744e9e245ae571450fe584b91f5af261d0e40163b618e53a1f6"
 dependencies = [
- "elliptic-curve 0.14.0-rc.31",
+ "elliptic-curve 0.14.1",
+ "once_cell",
+ "primefield",
+ "serdect",
 ]
 
 [[package]]
@@ -4391,22 +4493,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f94967dc7688f3054c7fac87473ffae4cc4c3904800e2d9f5b857246d8963b0a"
 dependencies = [
  "prost",
-]
-
-[[package]]
-name = "psl-types"
-version = "2.0.11"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "33cb294fe86a74cbcf50d4445b37da762029549ebeea341421c7c70370f86cac"
-
-[[package]]
-name = "publicsuffix"
-version = "2.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6f42ea446cab60335f76979ec15e12619a2165b5ae2c12166bef27d283a9fadf"
-dependencies = [
- "idna",
- "psl-types",
 ]
 
 [[package]]
@@ -4653,26 +4739,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "rayon"
-version = "1.12.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fb39b166781f92d482534ef4b4b1b2568f42613b53e5b6c160e24cfbfa30926d"
-dependencies = [
- "either",
- "rayon-core",
-]
-
-[[package]]
-name = "rayon-core"
-version = "1.13.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "22e18b0f0062d30d4230b2e85ff77fdfe4326feb054b9783a3460d8435c8ab91"
-dependencies = [
- "crossbeam-deque",
- "crossbeam-utils",
-]
-
-[[package]]
 name = "rcgen"
 version = "0.13.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4748,21 +4814,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 
 [[package]]
-name = "remove_dir_all"
-version = "1.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "808cc0b475acf76adf36f08ca49429b12aad9f678cb56143d5b3cb49b9a1dd08"
-dependencies = [
- "cfg-if",
- "cvt",
- "fs_at",
- "libc",
- "normpath",
- "rayon",
- "windows-sys 0.59.0",
-]
-
-[[package]]
 name = "reqwest"
 version = "0.12.28"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4810,8 +4861,6 @@ checksum = "219c5811de6525e5416c7d5d53bb656d3afdbc6c5af816e0802bcfa42dbdc1c3"
 dependencies = [
  "base64",
  "bytes 1.12.1",
- "cookie",
- "cookie_store",
  "futures-core",
  "http 1.5.0",
  "http-body 1.1.0",
@@ -4853,12 +4902,12 @@ dependencies = [
 
 [[package]]
 name = "rfc6979"
-version = "0.5.0-rc.5"
+version = "0.6.0-pre.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "23a3127ee32baec36af75b4107082d9bd823501ec14a4e016be4b6b37faa74ae"
+checksum = "9935425142ac6e252364413291d96c8bc9898d0876a801824c7af4eae397b689"
 dependencies = [
+ "ctutils",
  "hmac 0.13.0",
- "subtle",
 ]
 
 [[package]]
@@ -4929,18 +4978,18 @@ dependencies = [
 
 [[package]]
 name = "rsa"
-version = "0.10.0-rc.17"
+version = "0.10.0-rc.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "87ed3e93fc7e473e464b9726f4759659e72bc8665e4b8ea227547024f416d905"
+checksum = "30b2aa4ba0d89f73d1e332df05be0eeab8840351c36ca5654341dfdb57bb3caf"
 dependencies = [
  "const-oid 0.10.2",
  "crypto-bigint 0.7.5",
  "crypto-primes",
  "digest 0.11.3",
  "pkcs1 0.8.0-rc.4",
- "pkcs8 0.11.0-rc.11",
+ "pkcs8 0.11.0",
  "rand_core 0.10.1",
- "signature 3.0.0-rc.10",
+ "signature 3.0.0",
  "spki 0.8.0",
  "zeroize",
 ]
@@ -5476,12 +5525,13 @@ dependencies = [
 
 [[package]]
 name = "sha3"
-version = "0.11.0"
+version = "0.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "be176f1a57ce4e3d31c1a166222d9768de5954f811601fb7ca06fc8203905ce1"
+checksum = "bc9bad02c26382724b2d2692c6f179285e4b54eeecd7968f52a50059c3c11759"
 dependencies = [
  "digest 0.11.3",
  "keccak",
+ "sponge-cursor",
 ]
 
 [[package]]
@@ -5521,9 +5571,9 @@ dependencies = [
 
 [[package]]
 name = "signature"
-version = "3.0.0-rc.10"
+version = "3.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7f1880df446116126965eeec169136b2e0251dba37c6223bcc819569550edea3"
+checksum = "28d567dcbaf0049cb8ac2608a76cd95ff9e4412e1899d389ee400918ca7537f5"
 dependencies = [
  "digest 0.11.3",
  "rand_core 0.10.1",
@@ -5574,8 +5624,8 @@ dependencies = [
 
 [[package]]
 name = "smb"
-version = "0.12.0"
-source = "git+https://github.com/JayTsu-sh/smb-rs.git?rev=d8291b3a3157b026074ab6b0f305dfd99af17f1e#d8291b3a3157b026074ab6b0f305dfd99af17f1e"
+version = "0.14.0"
+source = "git+https://github.com/JayTsu-sh/smb-rs.git?rev=2649a0bbd615c23d64faca0053e969288694e034#2649a0bbd615c23d64faca0053e969288694e034"
 dependencies = [
  "aead",
  "aes",
@@ -5596,11 +5646,11 @@ dependencies = [
  "rand 0.8.8",
  "sha2 0.11.0",
  "siphasher",
- "smb-dtyp 0.12.0 (git+https://github.com/JayTsu-sh/smb-rs.git?rev=d8291b3a3157b026074ab6b0f305dfd99af17f1e)",
- "smb-fscc 0.12.0 (git+https://github.com/JayTsu-sh/smb-rs.git?rev=d8291b3a3157b026074ab6b0f305dfd99af17f1e)",
- "smb-msg 0.12.0 (git+https://github.com/JayTsu-sh/smb-rs.git?rev=d8291b3a3157b026074ab6b0f305dfd99af17f1e)",
- "smb-rpc 0.12.0 (git+https://github.com/JayTsu-sh/smb-rs.git?rev=d8291b3a3157b026074ab6b0f305dfd99af17f1e)",
- "smb-transport 0.12.0 (git+https://github.com/JayTsu-sh/smb-rs.git?rev=d8291b3a3157b026074ab6b0f305dfd99af17f1e)",
+ "smb-dtyp",
+ "smb-fscc",
+ "smb-msg",
+ "smb-rpc",
+ "smb-transport",
  "sspi",
  "thiserror 2.0.20",
  "time 0.3.55",
@@ -5613,85 +5663,22 @@ dependencies = [
 ]
 
 [[package]]
-name = "smb"
-version = "0.12.0"
-source = "git+https://github.com/JayTsu-sh/smb-rs.git#c3ecf0007a5477cfd954d4e6dda65c7abd765e71"
-dependencies = [
- "aead",
- "aes",
- "aes-gcm",
- "arc-swap",
- "binrw",
- "bytes 1.12.1",
- "ccm",
- "cmac",
- "crypto-common 0.2.2",
- "futures",
- "futures-core",
- "futures-util",
- "hmac 0.13.0",
- "kbkdf",
- "lz4_flex",
- "modular-bitfield",
- "pastey 0.1.1",
- "rand 0.8.8",
- "sha2 0.11.0",
- "siphasher",
- "smb-dtyp 0.12.0 (git+https://github.com/JayTsu-sh/smb-rs.git)",
- "smb-fscc 0.12.0 (git+https://github.com/JayTsu-sh/smb-rs.git)",
- "smb-msg 0.12.0 (git+https://github.com/JayTsu-sh/smb-rs.git)",
- "smb-rpc 0.12.0 (git+https://github.com/JayTsu-sh/smb-rs.git)",
- "smb-transport 0.12.0 (git+https://github.com/JayTsu-sh/smb-rs.git)",
- "sspi",
- "thiserror 2.0.20",
- "time 0.3.55",
- "tokio",
- "tokio-stream",
- "tokio-util",
- "tracing",
- "url",
-]
-
-[[package]]
 name = "smb-dtyp"
-version = "0.12.0"
-source = "git+https://github.com/JayTsu-sh/smb-rs.git?rev=d8291b3a3157b026074ab6b0f305dfd99af17f1e#d8291b3a3157b026074ab6b0f305dfd99af17f1e"
+version = "0.14.0"
+source = "git+https://github.com/JayTsu-sh/smb-rs.git?rev=2649a0bbd615c23d64faca0053e969288694e034#2649a0bbd615c23d64faca0053e969288694e034"
 dependencies = [
  "binrw",
  "modular-bitfield",
  "pastey 0.1.1",
  "rand 0.8.8",
- "smb-dtyp-derive 0.12.0 (git+https://github.com/JayTsu-sh/smb-rs.git?rev=d8291b3a3157b026074ab6b0f305dfd99af17f1e)",
- "time 0.3.55",
-]
-
-[[package]]
-name = "smb-dtyp"
-version = "0.12.0"
-source = "git+https://github.com/JayTsu-sh/smb-rs.git#c3ecf0007a5477cfd954d4e6dda65c7abd765e71"
-dependencies = [
- "binrw",
- "modular-bitfield",
- "pastey 0.1.1",
- "rand 0.8.8",
- "smb-dtyp-derive 0.12.0 (git+https://github.com/JayTsu-sh/smb-rs.git)",
+ "smb-dtyp-derive",
  "time 0.3.55",
 ]
 
 [[package]]
 name = "smb-dtyp-derive"
-version = "0.12.0"
-source = "git+https://github.com/JayTsu-sh/smb-rs.git?rev=d8291b3a3157b026074ab6b0f305dfd99af17f1e#d8291b3a3157b026074ab6b0f305dfd99af17f1e"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 2.0.119",
-]
-
-[[package]]
-name = "smb-dtyp-derive"
-version = "0.12.0"
-source = "git+https://github.com/JayTsu-sh/smb-rs.git#c3ecf0007a5477cfd954d4e6dda65c7abd765e71"
+version = "0.14.0"
+source = "git+https://github.com/JayTsu-sh/smb-rs.git?rev=2649a0bbd615c23d64faca0053e969288694e034#2649a0bbd615c23d64faca0053e969288694e034"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -5700,75 +5687,37 @@ dependencies = [
 
 [[package]]
 name = "smb-fscc"
-version = "0.12.0"
-source = "git+https://github.com/JayTsu-sh/smb-rs.git?rev=d8291b3a3157b026074ab6b0f305dfd99af17f1e#d8291b3a3157b026074ab6b0f305dfd99af17f1e"
+version = "0.14.0"
+source = "git+https://github.com/JayTsu-sh/smb-rs.git?rev=2649a0bbd615c23d64faca0053e969288694e034#2649a0bbd615c23d64faca0053e969288694e034"
 dependencies = [
  "binrw",
  "modular-bitfield",
  "pastey 0.1.1",
- "smb-dtyp 0.12.0 (git+https://github.com/JayTsu-sh/smb-rs.git?rev=d8291b3a3157b026074ab6b0f305dfd99af17f1e)",
- "thiserror 2.0.20",
- "time 0.3.55",
-]
-
-[[package]]
-name = "smb-fscc"
-version = "0.12.0"
-source = "git+https://github.com/JayTsu-sh/smb-rs.git#c3ecf0007a5477cfd954d4e6dda65c7abd765e71"
-dependencies = [
- "binrw",
- "modular-bitfield",
- "pastey 0.1.1",
- "smb-dtyp 0.12.0 (git+https://github.com/JayTsu-sh/smb-rs.git)",
+ "smb-dtyp",
  "thiserror 2.0.20",
  "time 0.3.55",
 ]
 
 [[package]]
 name = "smb-msg"
-version = "0.12.0"
-source = "git+https://github.com/JayTsu-sh/smb-rs.git?rev=d8291b3a3157b026074ab6b0f305dfd99af17f1e#d8291b3a3157b026074ab6b0f305dfd99af17f1e"
+version = "0.14.0"
+source = "git+https://github.com/JayTsu-sh/smb-rs.git?rev=2649a0bbd615c23d64faca0053e969288694e034#2649a0bbd615c23d64faca0053e969288694e034"
 dependencies = [
  "binrw",
  "bytes 1.12.1",
  "modular-bitfield",
  "pastey 0.1.1",
- "smb-dtyp 0.12.0 (git+https://github.com/JayTsu-sh/smb-rs.git?rev=d8291b3a3157b026074ab6b0f305dfd99af17f1e)",
- "smb-fscc 0.12.0 (git+https://github.com/JayTsu-sh/smb-rs.git?rev=d8291b3a3157b026074ab6b0f305dfd99af17f1e)",
- "smb-msg-derive 0.12.0 (git+https://github.com/JayTsu-sh/smb-rs.git?rev=d8291b3a3157b026074ab6b0f305dfd99af17f1e)",
- "thiserror 2.0.20",
- "time 0.3.55",
-]
-
-[[package]]
-name = "smb-msg"
-version = "0.12.0"
-source = "git+https://github.com/JayTsu-sh/smb-rs.git#c3ecf0007a5477cfd954d4e6dda65c7abd765e71"
-dependencies = [
- "binrw",
- "modular-bitfield",
- "pastey 0.1.1",
- "smb-dtyp 0.12.0 (git+https://github.com/JayTsu-sh/smb-rs.git)",
- "smb-fscc 0.12.0 (git+https://github.com/JayTsu-sh/smb-rs.git)",
- "smb-msg-derive 0.12.0 (git+https://github.com/JayTsu-sh/smb-rs.git)",
+ "smb-dtyp",
+ "smb-fscc",
+ "smb-msg-derive",
  "thiserror 2.0.20",
  "time 0.3.55",
 ]
 
 [[package]]
 name = "smb-msg-derive"
-version = "0.12.0"
-source = "git+https://github.com/JayTsu-sh/smb-rs.git?rev=d8291b3a3157b026074ab6b0f305dfd99af17f1e#d8291b3a3157b026074ab6b0f305dfd99af17f1e"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 2.0.119",
-]
-
-[[package]]
-name = "smb-msg-derive"
-version = "0.12.0"
-source = "git+https://github.com/JayTsu-sh/smb-rs.git#c3ecf0007a5477cfd954d4e6dda65c7abd765e71"
+version = "0.14.0"
+source = "git+https://github.com/JayTsu-sh/smb-rs.git?rev=2649a0bbd615c23d64faca0053e969288694e034#2649a0bbd615c23d64faca0053e969288694e034"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -5777,34 +5726,21 @@ dependencies = [
 
 [[package]]
 name = "smb-rpc"
-version = "0.12.0"
-source = "git+https://github.com/JayTsu-sh/smb-rs.git?rev=d8291b3a3157b026074ab6b0f305dfd99af17f1e#d8291b3a3157b026074ab6b0f305dfd99af17f1e"
+version = "0.14.0"
+source = "git+https://github.com/JayTsu-sh/smb-rs.git?rev=2649a0bbd615c23d64faca0053e969288694e034#2649a0bbd615c23d64faca0053e969288694e034"
 dependencies = [
  "binrw",
  "modular-bitfield",
  "pastey 0.1.1",
- "smb-dtyp 0.12.0 (git+https://github.com/JayTsu-sh/smb-rs.git?rev=d8291b3a3157b026074ab6b0f305dfd99af17f1e)",
- "thiserror 2.0.20",
- "time 0.3.55",
-]
-
-[[package]]
-name = "smb-rpc"
-version = "0.12.0"
-source = "git+https://github.com/JayTsu-sh/smb-rs.git#c3ecf0007a5477cfd954d4e6dda65c7abd765e71"
-dependencies = [
- "binrw",
- "modular-bitfield",
- "pastey 0.1.1",
- "smb-dtyp 0.12.0 (git+https://github.com/JayTsu-sh/smb-rs.git)",
+ "smb-dtyp",
  "thiserror 2.0.20",
  "time 0.3.55",
 ]
 
 [[package]]
 name = "smb-transport"
-version = "0.12.0"
-source = "git+https://github.com/JayTsu-sh/smb-rs.git?rev=d8291b3a3157b026074ab6b0f305dfd99af17f1e#d8291b3a3157b026074ab6b0f305dfd99af17f1e"
+version = "0.14.0"
+source = "git+https://github.com/JayTsu-sh/smb-rs.git?rev=2649a0bbd615c23d64faca0053e969288694e034#2649a0bbd615c23d64faca0053e969288694e034"
 dependencies = [
  "binrw",
  "bytes 1.12.1",
@@ -5812,26 +5748,7 @@ dependencies = [
  "futures-util",
  "modular-bitfield",
  "pastey 0.1.1",
- "smb-dtyp 0.12.0 (git+https://github.com/JayTsu-sh/smb-rs.git?rev=d8291b3a3157b026074ab6b0f305dfd99af17f1e)",
- "thiserror 2.0.20",
- "time 0.3.55",
- "tokio",
- "tokio-util",
- "tracing",
-]
-
-[[package]]
-name = "smb-transport"
-version = "0.12.0"
-source = "git+https://github.com/JayTsu-sh/smb-rs.git#c3ecf0007a5477cfd954d4e6dda65c7abd765e71"
-dependencies = [
- "binrw",
- "bytes 1.12.1",
- "futures-core",
- "futures-util",
- "modular-bitfield",
- "pastey 0.1.1",
- "smb-dtyp 0.12.0 (git+https://github.com/JayTsu-sh/smb-rs.git)",
+ "smb-dtyp",
  "thiserror 2.0.20",
  "time 0.3.55",
  "tokio",
@@ -5911,6 +5828,12 @@ dependencies = [
  "base64ct",
  "der 0.8.1",
 ]
+
+[[package]]
+name = "sponge-cursor"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3a0219bd7d979d58245a4f41f695e1ac9f8befdffadd7f61f1bae9e39abc6620"
 
 [[package]]
 name = "sqlx"
@@ -6102,9 +6025,9 @@ dependencies = [
 
 [[package]]
 name = "sspi"
-version = "0.20.1"
+version = "0.21.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "97633af5c4bfee2d6e51690007533f7c25e826a819d64f89ed8b63f96052573c"
+checksum = "5c3bd2a45e7e24fd72eba100ced3fd847e05fe4657d7f067eb06d1a894f0d4e5"
 dependencies = [
  "async-dnssd",
  "async-recursion",
@@ -6114,19 +6037,17 @@ dependencies = [
  "cfg-if",
  "crypto-bigint 0.7.5",
  "crypto-mac",
- "curve25519-dalek 5.0.0-pre.6",
- "ed25519-dalek 3.0.0-pre.6",
- "ff 0.14.0-pre.0",
+ "curve25519-dalek 5.0.0-rc.1",
+ "ed25519-dalek 3.0.0-rc.1",
  "futures",
  "getrandom 0.3.4",
- "group 0.14.0-pre.0",
  "hmac 0.13.0",
  "md-5 0.11.0",
  "md4",
  "num-derive",
  "num-traits",
  "oid",
- "p256 0.14.0-rc.9",
+ "p256 0.14.0-rc.14",
  "p384",
  "p521",
  "picky",
@@ -6135,13 +6056,11 @@ dependencies = [
  "picky-asn1-x509",
  "picky-krb",
  "pkcs1 0.8.0-rc.4",
- "pkcs8 0.11.0-rc.11",
- "primefield",
- "primeorder 0.14.0-rc.9",
+ "primeorder 0.14.0-rc.14",
  "rand 0.10.2",
  "rand_core 0.10.1",
  "reqwest 0.12.28",
- "rsa 0.10.0-rc.17",
+ "rsa 0.10.0-rc.18",
  "rustcrypto-ff",
  "rustcrypto-ff_derive",
  "rustcrypto-group",
@@ -6149,7 +6068,6 @@ dependencies = [
  "serde",
  "sha1 0.11.0",
  "sha2 0.11.0",
- "signature 3.0.0-rc.10",
  "time 0.3.55",
  "tokio",
  "tracing",
@@ -6172,6 +6090,27 @@ name = "static_assertions"
 version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
+
+[[package]]
+name = "storage-adapter"
+version = "0.1.0"
+dependencies = [
+ "async-channel",
+ "async-trait",
+ "blake3",
+ "bytes 1.12.1",
+ "chrono",
+ "data-mover",
+ "futures",
+ "serde",
+ "serde_json",
+ "soft-canonicalize",
+ "tempfile",
+ "thiserror 2.0.20",
+ "tokio",
+ "tokio-util",
+ "tracing",
+]
 
 [[package]]
 name = "stringprep"
@@ -6750,6 +6689,7 @@ dependencies = [
  "rcgen",
  "rustls 0.23.40",
  "serde",
+ "storage-adapter",
  "thiserror 2.0.20",
  "tokio",
  "tracing",
@@ -7106,6 +7046,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sqlx",
+ "storage-adapter",
  "thiserror 2.0.20",
  "tokio",
  "tokio-util",
@@ -7195,7 +7136,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.48.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -7598,11 +7539,11 @@ dependencies = [
 
 [[package]]
 name = "x25519-dalek"
-version = "3.0.0-pre.6"
+version = "3.0.0-rc.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b3d5d6ff67acd3945b933e592bfa7143db4fcbb2f871754b6b9fbd7847fc5aea"
+checksum = "eee64e8620caa64914d669b1f68f858aaff54e2d0f9ad3b30a613b58a1baa83e"
 dependencies = [
- "curve25519-dalek 5.0.0-pre.6",
+ "curve25519-dalek 5.0.0-rc.1",
  "rand_core 0.10.1",
  "zeroize",
 ]

@@ -10,12 +10,10 @@ use std::sync::{Arc, Mutex as StdMutex, OnceLock, Weak};
 // 外部crate
 use async_trait::async_trait;
 use clickhouse::Client;
-use data_mover::model::{EntryIdentityKey, ObservedEntry};
-use data_mover::storage::RecoveryIdentity;
-use data_mover::transfer::{RecoveryRegistrar, RecoveryRegistrationFailure};
-use data_mover::{ChangeKind, EntryEnum, StorageEntryMessage};
+use data_mover::model::ObservedEntry;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use storage_adapter::{ChangeKind, EntryEnum, StorageEntryMessage};
 use tokio::sync::{Mutex, mpsc};
 use tracing::{debug, info, trace, warn};
 
@@ -27,7 +25,6 @@ use crate::common::{
 use crate::config::ClickHouseConfig;
 use crate::error::{DatabaseError, Result};
 use crate::observation_record::{OBSERVATION_IDENTITY_JOIN_CLAUSE, ObservedEntryRecord};
-use crate::recovery_state::{RecoveryAttemptId, RecoveryAttemptRegistration};
 use crate::traits::{Database, IncrementalStorageEntryRecord, QueryResult, StorageEntryRecord, TarManifestRecord};
 use crate::{
     INCREMENTAL_SCAN_TABLE_BASE_NAME, SCAN_BASE_TABLE_BASE_NAME, SCAN_STATE_TABLE_BASE_NAME,
@@ -36,6 +33,8 @@ use crate::{
     get_tar_manifest_table_name,
 };
 use utils::sanitize_job_id;
+
+pub mod scan_resume;
 
 /// `ClickHouse`数据库实现
 ///
@@ -128,7 +127,7 @@ macro_rules! file_scan_base_columns {
     size_observed Bool DEFAULT 0,
     modified_unix_nanos Nullable(Int128) DEFAULT NULL,
     entry_snapshot Array(UInt8) DEFAULT [],
-    INDEX identity_key_idx identity_key TYPE bloom_filter GRANULARITY 1,
+    INDEX identity_key_idx identity_key TYPE bloom_filter GRANULARITY 1
 "
     };
 
@@ -147,17 +146,7 @@ macro_rules! file_scan_base_columns {
 ///
 /// 定义了存储文件扫描结果的表结构，包含文件路径、大小、扩展名、时间戳、权限等信息。
 /// 所有相关表（主表和临时表）都使用此结构定义。
-pub(crate) const FILE_SCAN_COLUMNS_DEFINITION: &str = file_scan_base_columns!(
-    "",
-    r#"
-    row_kind UInt8 DEFAULT 0,
-    recovery_attempt_order UInt64 DEFAULT 0,
-    recovery_attempt_id String DEFAULT '',
-    recovery_event_order UInt8 DEFAULT 0,
-    recovery_claim String DEFAULT '',
-    recovery_identity Array(UInt8) DEFAULT [],
-"#
-);
+pub(crate) const FILE_SCAN_COLUMNS_DEFINITION: &str = file_scan_base_columns!();
 
 /// 文件增量扫描记录的标准列定义
 ///
@@ -168,7 +157,7 @@ const FILE_INCREMENTAL_SCAN_COLUMNS_DEFINITION: &str = file_scan_base_columns!(
     operation_type String,
 "#,
     r#"
-    create_at DateTime64(9),
+    ,create_at DateTime64(9),
     comment Nullable(String),
 "#
 );
@@ -180,62 +169,7 @@ struct ExcludeRecord {
     version_id: String,
 }
 
-const OBSERVATION_ROW: u8 = 0;
-const RECOVERY_ROW: u8 = 1;
-const RECOVERY_CLAIMED: u8 = 0;
-const RECOVERY_REGISTERED: u8 = 1;
-const RECOVERY_COMPLETED: u8 = 2;
-
-#[derive(Clone, clickhouse::Row, Deserialize, Serialize)]
-struct RecoveryEventRecord {
-    row_kind: u8,
-    relative_path: String,
-    size: u64,
-    current_state: u8,
-    identity_key: String,
-    recovery_attempt_order: u64,
-    recovery_attempt_id: String,
-    recovery_event_order: u8,
-    recovery_claim: String,
-    recovery_identity: Vec<u8>,
-}
-
-impl RecoveryEventRecord {
-    fn attempt_id(&self) -> RecoveryAttemptId {
-        RecoveryAttemptId {
-            order: self.recovery_attempt_order,
-            id: self.recovery_attempt_id.clone(),
-        }
-    }
-
-    fn claim(&self) -> Result<[u8; 32]> {
-        let bytes = hex::decode(&self.recovery_claim)
-            .map_err(|error| DatabaseError::ConversionError(format!("invalid recovery claim: {error}")))?;
-        bytes.try_into().map_err(|bytes: Vec<u8>| {
-            DatabaseError::ConversionError(format!("invalid recovery claim length {}", bytes.len()))
-        })
-    }
-
-    fn identity(&self) -> Result<Option<RecoveryIdentity>> {
-        if self.recovery_identity.is_empty() {
-            Ok(None)
-        } else {
-            RecoveryIdentity::from_bytes(self.recovery_identity.clone())
-                .map(Some)
-                .map_err(|error| DatabaseError::ConversionError(format!("invalid recovery identity: {error}")))
-        }
-    }
-}
-
-struct ClickHouseRecoveryRegistrar {
-    client: Client,
-    table_name: String,
-    identity_key: String,
-    attempt: RecoveryAttemptId,
-    claim: [u8; 32],
-}
-
-/// JOIN 策略：path-based 或 file_handle-based
+/// JOIN/// JOIN 策略：path-based 或 file_handle-based
 ///
 /// 决定增量扫描对比查询使用 `relative_path+version_id` 还是 `file_handle` 作为 JOIN 键。
 /// 当两表的 `file_handle` 全为 NULL 时使用 Path 模式，否则使用 `FileHandle` 模式。
@@ -276,14 +210,14 @@ impl JoinStrategy {
                 "SELECT {columns}, {version_count_expr} FROM {temp} as t \
                  {version_count_join} \
                  WHERE (t.relative_path, t.version_id) NOT IN \
-                 (SELECT relative_path, version_id FROM {base} WHERE row_kind = 0) \
+                 (SELECT relative_path, version_id FROM {base}) \
                  ORDER BY t.relative_path, t.version_id"
             ),
             Self::FileHandle => format!(
                 "SELECT {columns}, {version_count_expr} FROM {temp} as t \
                  {version_count_join} \
                  WHERE t.file_handle NOT IN \
-                 (SELECT file_handle FROM {base} WHERE row_kind = 0 AND file_handle IS NOT NULL) \
+                 (SELECT file_handle FROM {base} WHERE file_handle IS NOT NULL) \
                  ORDER BY t.relative_path, t.version_id"
             ),
         }
@@ -321,7 +255,7 @@ impl JoinStrategy {
                 "SELECT {t_columns} FROM {temp} t \
                  JOIN (SELECT relative_path, version_id, size, mtime, mode, uid, gid, is_dir \
                        FROM {base} \
-                       WHERE row_kind = 0 AND (relative_path, version_id) IN \
+                       WHERE (relative_path, version_id) IN \
                              (SELECT relative_path, version_id FROM {temp}) \
                        ORDER BY relative_path, version_id \
                        LIMIT 1 BY (relative_path, version_id) \
@@ -333,7 +267,7 @@ impl JoinStrategy {
                 "SELECT {t_columns} FROM {temp} t \
                  JOIN (SELECT file_handle, relative_path, size, mtime, mode, uid, gid, is_dir \
                        FROM {base} \
-                       WHERE row_kind = 0 AND file_handle IN \
+                       WHERE file_handle IN \
                              (SELECT file_handle FROM {temp} WHERE file_handle IS NOT NULL) \
                        ORDER BY file_handle, relative_path \
                        LIMIT 1 BY (file_handle, relative_path) \
@@ -351,7 +285,7 @@ impl JoinStrategy {
         let columns = &*FILE_SCAN_COLUMNS_LIST;
         format!(
             "SELECT {columns} FROM {base} FINAL \
-             WHERE row_kind = 0 AND current_state = ? \
+             WHERE current_state = ? \
              ORDER BY relative_path, version_id"
         )
     }
@@ -362,7 +296,7 @@ impl JoinStrategy {
         let placeholders = vec!["?"; batch_size].join(", ");
         format!(
             "SELECT {columns} FROM {base} \
-             WHERE row_kind = 0 AND file_handle IN ({placeholders}) \
+             WHERE file_handle IN ({placeholders}) \
              ORDER BY file_handle, ctime, version_id \
              LIMIT 1 BY (relative_path, version_id)"
         )
@@ -386,106 +320,6 @@ fn build_base_client(config: &ClickHouseConfig) -> Client {
     client
 }
 
-async fn load_recovery_event(
-    client: &Client, table_name: &str, identity_key: &str,
-) -> Result<Option<RecoveryEventRecord>> {
-    client
-        .query(&format!(
-            "SELECT row_kind, relative_path, size, current_state, identity_key, recovery_attempt_order, \
-             recovery_attempt_id, recovery_event_order, recovery_claim, recovery_identity \
-             FROM {table_name} FINAL WHERE row_kind = ? AND identity_key = ? \
-             ORDER BY recovery_attempt_order DESC, recovery_attempt_id DESC, recovery_event_order DESC LIMIT 1"
-        ))
-        .bind(RECOVERY_ROW)
-        .bind(identity_key)
-        .fetch_optional::<RecoveryEventRecord>()
-        .await
-        .map_err(DatabaseError::ClickHouseError)
-}
-
-async fn insert_recovery_event(client: &Client, table_name: &str, event: &RecoveryEventRecord) -> Result<()> {
-    let mut insert = client
-        .insert::<RecoveryEventRecord>(table_name)
-        .await
-        .map_err(DatabaseError::ClickHouseError)?;
-    insert.write(event).await.map_err(DatabaseError::ClickHouseError)?;
-    insert.end().await.map_err(DatabaseError::ClickHouseError)
-}
-
-fn new_recovery_claim() -> [u8; 32] {
-    let first = uuid::Uuid::new_v4();
-    let second = uuid::Uuid::new_v4();
-    let mut claim = [0; 32];
-    claim[..16].copy_from_slice(first.as_bytes());
-    claim[16..].copy_from_slice(second.as_bytes());
-    claim
-}
-
-fn registration_failure(error: &DatabaseError) -> RecoveryRegistrationFailure {
-    match error {
-        DatabaseError::ConcurrencyError(_) | DatabaseError::ConversionError(_) => RecoveryRegistrationFailure::Rejected,
-        _ => RecoveryRegistrationFailure::Unavailable,
-    }
-}
-
-#[async_trait]
-impl RecoveryRegistrar for ClickHouseRecoveryRegistrar {
-    async fn register(&self, identity: RecoveryIdentity) -> std::result::Result<(), RecoveryRegistrationFailure> {
-        let current = load_recovery_event(&self.client, &self.table_name, &self.identity_key)
-            .await
-            .map_err(|error| registration_failure(&error))?
-            .ok_or(RecoveryRegistrationFailure::Rejected)?;
-        if current.attempt_id() != self.attempt
-            || current.claim().map_err(|error| registration_failure(&error))? != self.claim
-            || current.recovery_event_order == RECOVERY_COMPLETED
-        {
-            return Err(RecoveryRegistrationFailure::Rejected);
-        }
-        if current.recovery_event_order == RECOVERY_REGISTERED {
-            return if current
-                .identity()
-                .map_err(|error| registration_failure(&error))?
-                .as_ref()
-                == Some(&identity)
-            {
-                Ok(())
-            } else {
-                Err(RecoveryRegistrationFailure::Rejected)
-            };
-        }
-        let event = RecoveryEventRecord {
-            row_kind: RECOVERY_ROW,
-            relative_path: String::new(),
-            size: 0,
-            current_state: 0,
-            identity_key: self.identity_key.clone(),
-            recovery_attempt_order: self.attempt.order,
-            recovery_attempt_id: self.attempt.id.clone(),
-            recovery_event_order: RECOVERY_REGISTERED,
-            recovery_claim: hex::encode(self.claim),
-            recovery_identity: identity.as_bytes().to_vec(),
-        };
-        insert_recovery_event(&self.client, &self.table_name, &event)
-            .await
-            .map_err(|error| registration_failure(&error))?;
-        let persisted = load_recovery_event(&self.client, &self.table_name, &self.identity_key)
-            .await
-            .map_err(|error| registration_failure(&error))?
-            .ok_or(RecoveryRegistrationFailure::Unavailable)?;
-        if persisted.attempt_id() != self.attempt
-            || persisted.claim().map_err(|error| registration_failure(&error))? != self.claim
-            || persisted
-                .identity()
-                .map_err(|error| registration_failure(&error))?
-                .as_ref()
-                != Some(&identity)
-        {
-            return Err(RecoveryRegistrationFailure::Rejected);
-        }
-        Ok(())
-    }
-}
-
 impl ClickHouseDatabase {
     /// 创建新的`ClickHouse`数据库实例
     pub fn new(config: &ClickHouseConfig, job_id: &str) -> Self {
@@ -504,147 +338,7 @@ impl ClickHouseDatabase {
         }
     }
 
-    /// Opens or reopens one caller-ordered recovery attempt for an observed entry.
-    ///
-    /// A retry with the same attempt identity receives the persisted claim. A newer attempt
-    /// inherits the last registered opaque backend identity but receives a different claim.
-    /// Attempts older than the current `(order, id)` are rejected.
-    ///
-    /// # Errors
-    /// The entry must exist in the observation projection and the attempt must not be stale.
-    pub async fn open_recovery_attempt(
-        &self, entry_key: EntryIdentityKey, attempt: RecoveryAttemptId,
-    ) -> Result<RecoveryAttemptRegistration> {
-        let table_name = get_scan_base_table_name(&self.job_id);
-        let identity_key = hex::encode(entry_key.as_bytes());
-        let observation_exists = self
-            .sync_client
-            .query(&format!(
-                "SELECT count() FROM {table_name} FINAL WHERE row_kind = ? AND identity_key = ?"
-            ))
-            .bind(OBSERVATION_ROW)
-            .bind(&identity_key)
-            .fetch_one::<u64>()
-            .await
-            .map_err(DatabaseError::ClickHouseError)?;
-        if observation_exists == 0 {
-            return Err(DatabaseError::TableNotFound(format!(
-                "observation identity {identity_key}"
-            )));
-        }
-
-        let current = load_recovery_event(&self.sync_client, &table_name, &identity_key).await?;
-        let (identity, claim) = match current {
-            Some(current) if current.attempt_id() > attempt => {
-                return Err(DatabaseError::ConcurrencyError(
-                    "recovery attempt is older than the current owner".to_string(),
-                ));
-            }
-            Some(current) if current.attempt_id() == attempt => {
-                if current.recovery_event_order == RECOVERY_COMPLETED {
-                    return Err(DatabaseError::RecoveryAttemptCompleted);
-                }
-                (current.identity()?, current.claim()?)
-            }
-            current => {
-                let identity = match current.as_ref() {
-                    Some(value) if value.recovery_event_order == RECOVERY_COMPLETED => None,
-                    Some(value) => value.identity()?,
-                    None => None,
-                };
-                let claim = new_recovery_claim();
-                let event = RecoveryEventRecord {
-                    row_kind: RECOVERY_ROW,
-                    relative_path: String::new(),
-                    size: 0,
-                    current_state: 0,
-                    identity_key: identity_key.clone(),
-                    recovery_attempt_order: attempt.order,
-                    recovery_attempt_id: attempt.id.clone(),
-                    recovery_event_order: RECOVERY_CLAIMED,
-                    recovery_claim: hex::encode(claim),
-                    recovery_identity: identity
-                        .as_ref()
-                        .map_or_else(Vec::new, |value| value.as_bytes().to_vec()),
-                };
-                insert_recovery_event(&self.sync_client, &table_name, &event).await?;
-                let persisted = load_recovery_event(&self.sync_client, &table_name, &identity_key)
-                    .await?
-                    .ok_or_else(|| {
-                        DatabaseError::ConcurrencyError("recovery claim was not visible after insert".to_string())
-                    })?;
-                if persisted.attempt_id() != attempt || persisted.claim()? != claim {
-                    return Err(DatabaseError::ConcurrencyError(
-                        "recovery claim lost to a competing attempt".to_string(),
-                    ));
-                }
-                (persisted.identity()?, claim)
-            }
-        };
-
-        Ok(RecoveryAttemptRegistration {
-            identity,
-            claim,
-            registrar: Arc::new(ClickHouseRecoveryRegistrar {
-                client: self.sync_client.clone(),
-                table_name,
-                identity_key,
-                attempt,
-                claim,
-            }),
-        })
-    }
-
-    /// Marks the currently-owned recovery attempt complete and clears its reusable identity.
-    ///
-    /// The operation is idempotent for the current attempt. An older or unrelated attempt cannot
-    /// clear the current owner's state.
-    ///
-    /// # Errors
-    /// Missing and stale attempts are rejected; persistence failures are returned unchanged.
-    pub async fn complete_recovery_attempt(
-        &self, entry_key: EntryIdentityKey, attempt: &RecoveryAttemptId,
-    ) -> Result<()> {
-        let table_name = get_scan_base_table_name(&self.job_id);
-        let identity_key = hex::encode(entry_key.as_bytes());
-        let current = load_recovery_event(&self.sync_client, &table_name, &identity_key)
-            .await?
-            .ok_or_else(|| DatabaseError::ConcurrencyError("recovery attempt is not open".to_string()))?;
-        if current.attempt_id() != *attempt {
-            return Err(DatabaseError::ConcurrencyError(
-                "recovery completion does not own the current attempt".to_string(),
-            ));
-        }
-        if current.recovery_event_order == RECOVERY_COMPLETED {
-            return Ok(());
-        }
-        let event = RecoveryEventRecord {
-            row_kind: RECOVERY_ROW,
-            relative_path: String::new(),
-            size: 0,
-            current_state: 0,
-            identity_key: identity_key.clone(),
-            recovery_attempt_order: attempt.order,
-            recovery_attempt_id: attempt.id.clone(),
-            recovery_event_order: RECOVERY_COMPLETED,
-            recovery_claim: current.recovery_claim,
-            recovery_identity: Vec::new(),
-        };
-        insert_recovery_event(&self.sync_client, &table_name, &event).await?;
-        let persisted = load_recovery_event(&self.sync_client, &table_name, &identity_key)
-            .await?
-            .ok_or_else(|| {
-                DatabaseError::ConcurrencyError("recovery completion was not visible after insert".to_string())
-            })?;
-        if persisted.attempt_id() != *attempt || persisted.recovery_event_order != RECOVERY_COMPLETED {
-            return Err(DatabaseError::ConcurrencyError(
-                "recovery completion lost to a competing attempt".to_string(),
-            ));
-        }
-        Ok(())
-    }
-
-    /// 将 data-mover observation projection 写入当前 job 的同一张 base 大表。
+    /// 将 data-mover observation    /// 将 data-mover observation projection 写入当前 job 的同一张 base 大表。
     ///
     /// # Errors
     /// `ClickHouse` 拒绝 schema 或写入时返回数据库错误。
@@ -684,7 +378,9 @@ impl ClickHouseDatabase {
     ///
     /// # Errors
     /// 临时表不存在、查询失败、snapshot 异常或投影不一致时返回 typed error。
-    pub async fn detect_changed_observations(&self) -> Result<Vec<ObservedEntry>> {
+    pub async fn detect_changed_observations(
+        &self, backend: &data_mover::model::BackendIdentity,
+    ) -> Result<Vec<ObservedEntry>> {
         let temp = self
             .scan_temp_table_name
             .as_ref()
@@ -694,7 +390,7 @@ impl ClickHouseDatabase {
                        t.size_observed, t.modified_unix_nanos, t.current_state, t.entry_snapshot";
         let query = format!(
             "SELECT {columns} FROM {temp} t INNER JOIN {base} b ON {OBSERVATION_IDENTITY_JOIN_CLAUSE} \
-             WHERE t.row_kind = 0 AND b.row_kind = 0 AND (t.relative_path != b.relative_path OR t.entry_kind != b.entry_kind \
+             WHERE (t.relative_path != b.relative_path OR t.entry_kind != b.entry_kind \
                 OR t.size != b.size OR t.size_observed != b.size_observed \
                 OR NOT isNotDistinctFrom(t.modified_unix_nanos, b.modified_unix_nanos)) \
              ORDER BY t.identity_key"
@@ -705,7 +401,7 @@ impl ClickHouseDatabase {
             .await
             .map_err(DatabaseError::ClickHouseError)?
             .into_iter()
-            .map(|record| record.reconstruct())
+            .map(|record| record.reconstruct(backend))
             .collect()
     }
 
@@ -746,8 +442,8 @@ impl ClickHouseDatabase {
         let deleted = match self
             .sync_client
             .query(&format!(
-                "SELECT count() FROM {base} WHERE row_kind = 0 AND identity_key != '' AND identity_key NOT IN \
-                 (SELECT identity_key FROM {temp} WHERE row_kind = 0)"
+                "SELECT count() FROM {base} WHERE identity_key != '' AND identity_key NOT IN \
+                 (SELECT identity_key FROM {temp})"
             ))
             .fetch_one::<u64>()
             .await
@@ -759,22 +455,6 @@ impl ClickHouseDatabase {
                 return Err(error);
             }
         };
-        if let Err(error) = self
-            .execute(
-                &format!(
-                    "INSERT INTO {temp} (row_kind, relative_path, size, current_state, identity_key, \
-                     recovery_attempt_order, recovery_attempt_id, recovery_event_order, recovery_claim, \
-                     recovery_identity) SELECT row_kind, relative_path, size, current_state, identity_key, \
-                     recovery_attempt_order, recovery_attempt_id, recovery_event_order, recovery_claim, \
-                     recovery_identity FROM {base} WHERE row_kind = 1"
-                ),
-                &[],
-            )
-            .await
-        {
-            self.abort_observation_snapshot().await?;
-            return Err(error);
-        }
         if let Err(error) = self.execute(&format!("EXCHANGE TABLES {base} AND {temp}"), &[]).await {
             self.generation_lifecycle.lock().await.observation_publication_ambiguous = true;
             return Err(DatabaseError::TransactionError(format!(
@@ -839,12 +519,14 @@ impl ClickHouseDatabase {
     ///
     /// # Errors
     /// 查询失败、snapshot 异常或查询投影不一致时返回 typed error。
-    pub async fn load_observation(&self, identity_key: &str) -> Result<Option<ObservedEntry>> {
+    pub async fn load_observation(
+        &self, identity_key: &str, backend: &data_mover::model::BackendIdentity,
+    ) -> Result<Option<ObservedEntry>> {
         let table_name = get_scan_base_table_name(&self.job_id);
         let query = format!(
             "SELECT identity_key, relative_path, backend_kind, entry_kind, size, size_observed, \
              modified_unix_nanos, current_state, entry_snapshot FROM {table_name} \
-             WHERE row_kind = 0 AND identity_key = ? LIMIT 1"
+             WHERE identity_key = ? LIMIT 1"
         );
         let record = self
             .sync_client
@@ -853,7 +535,7 @@ impl ClickHouseDatabase {
             .fetch_optional::<ObservedEntryRecord>()
             .await
             .map_err(DatabaseError::ClickHouseError)?;
-        record.map(|value| value.reconstruct()).transpose()
+        record.map(|value| value.reconstruct(backend)).transpose()
     }
 
     /// 执行SQL语句，支持参数化查询
@@ -890,7 +572,7 @@ impl ClickHouseDatabase {
     pub async fn create_scan_base_table(&self) -> Result<()> {
         let table_name = get_scan_base_table_name(&self.job_id);
         let create_table_sql = format!(
-            "CREATE TABLE IF NOT EXISTS {table_name} ({FILE_SCAN_COLUMNS_DEFINITION}) ENGINE = ReplacingMergeTree() ORDER BY (row_kind, relative_path, version_id, identity_key, recovery_attempt_order, recovery_attempt_id, recovery_event_order) SETTINGS allow_nullable_key = 1"
+            "CREATE TABLE IF NOT EXISTS {table_name} ({FILE_SCAN_COLUMNS_DEFINITION}) ENGINE = ReplacingMergeTree() ORDER BY (relative_path, version_id, identity_key) SETTINGS allow_nullable_key = 1"
         );
 
         info!("Creating ClickHouse scan base table: {}", table_name);
@@ -1053,7 +735,7 @@ impl ClickHouseDatabase {
         self.execute(
             &format!(
                 "ALTER TABLE {base_table_name} UPDATE current_state = ? \
-                 WHERE row_kind = 0 AND current_state = ? SETTINGS mutations_sync = 2"
+                 WHERE current_state = ? SETTINGS mutations_sync = 2"
             ),
             &[Value::from(committed), Value::from(working)],
         )
@@ -1094,8 +776,8 @@ impl ClickHouseDatabase {
     async fn check_file_handle_status(&self, temp_table_name: &str, base_table_name: &str) -> Result<(usize, usize)> {
         let query = format!(
             "SELECT t.non_null, b.non_null \
-             FROM (SELECT count(file_handle) AS non_null FROM {temp_table_name} WHERE row_kind = 0) t \
-             CROSS JOIN (SELECT count(file_handle) AS non_null FROM {base_table_name} WHERE row_kind = 0) b"
+             FROM (SELECT if(countIf(file_handle IS NOT NULL AND NOT startsWith(file_handle, '54534934')) = 0, count(file_handle), 0) AS non_null FROM {temp_table_name}) t \
+             CROSS JOIN (SELECT if(countIf(file_handle IS NOT NULL AND NOT startsWith(file_handle, '54534934')) = 0, count(file_handle), 0) AS non_null FROM {base_table_name}) b"
         );
 
         debug!(
@@ -1111,8 +793,12 @@ impl ClickHouseDatabase {
             }
         };
 
-        let temp_non_null = tn as usize;
-        let base_non_null = bn as usize;
+        // 旧驱动句柄与新的中立 identity key 不可混用；升级过渡代按路径比较。
+        let (temp_non_null, base_non_null) = if tn == 0 || bn == 0 {
+            (0, 0)
+        } else {
+            (tn as usize, bn as usize)
+        };
 
         trace!(
             "file_handle status - temp non_null={}, base non_null={}",
@@ -1291,7 +977,7 @@ impl Database for ClickHouseDatabase {
     async fn create_scan_temporary_table(&mut self) -> Result<()> {
         let temp_table_name = generate_scan_temp_table_name();
         let create_table_sql = format!(
-            "CREATE TABLE IF NOT EXISTS {temp_table_name} ({FILE_SCAN_COLUMNS_DEFINITION}) ENGINE = MergeTree() ORDER BY (row_kind, relative_path, version_id, identity_key, recovery_attempt_order, recovery_attempt_id, recovery_event_order) SETTINGS allow_nullable_key = 1"
+            "CREATE TABLE IF NOT EXISTS {temp_table_name} ({FILE_SCAN_COLUMNS_DEFINITION}) ENGINE = MergeTree() ORDER BY (relative_path, version_id, identity_key) SETTINGS allow_nullable_key = 1"
         );
 
         debug!("Creating ClickHouse scan temporary table: {}", temp_table_name);
@@ -1381,6 +1067,7 @@ impl Database for ClickHouseDatabase {
     }
 
     async fn begin_scan_generation(&self) -> Result<u8> {
+        self.invalidate_resume_state().await?;
         let mut lifecycle = self.generation_lifecycle.lock().await;
         if lifecycle.observation_publication_ambiguous {
             return Err(DatabaseError::TransactionError(
@@ -1414,6 +1101,10 @@ impl Database for ClickHouseDatabase {
         self.cached_scan_state.store(working, Ordering::Relaxed);
         lifecycle.committed = true;
         Ok(())
+    }
+
+    async fn abandon_scan_resume(&self) -> Result<()> {
+        self.invalidate_resume_state().await
     }
 
     /// 将临时表记录合并到主表（INSERT INTO SELECT），可排除指定路径
@@ -1606,12 +1297,7 @@ impl Database for ClickHouseDatabase {
     /// 获取指定表的记录总数（使用 FINAL 确保去重）
     async fn get_count(&self, table_name: &str) -> Result<u64> {
         let full_table_name = format!("{}_{}", table_name, sanitize_job_id(&self.job_id));
-        let row_filter = if table_name == SCAN_BASE_TABLE_BASE_NAME {
-            " WHERE row_kind = 0"
-        } else {
-            ""
-        };
-        let query = format!("SELECT COUNT() FROM {full_table_name} FINAL{row_filter}");
+        let query = format!("SELECT COUNT() FROM {full_table_name} FINAL");
 
         let count = self
             .sync_client
@@ -1645,8 +1331,11 @@ impl Database for ClickHouseDatabase {
             ext_bind = Some(format!("%{ext_val}"));
         }
 
-        where_conditions.insert(0, "row_kind = 0".to_string());
-        let where_clause = format!("WHERE {}", where_conditions.join(" AND "));
+        let where_clause = if where_conditions.is_empty() {
+            String::new()
+        } else {
+            format!("WHERE {}", where_conditions.join(" AND "))
+        };
 
         let query = format!(
             "SELECT {} FROM {} FINAL {}",
@@ -1716,9 +1405,6 @@ impl Database for ClickHouseDatabase {
 mod tests {
     use std::path::PathBuf;
 
-    use clickhouse::test;
-    use data_mover::model::{BackendIdentity, BackendKind, EntryKind, IdentityStrength, SourceIdentity, StoragePath};
-
     use super::*;
     use crate::common::DeletionStatus;
     use crate::traits::StorageEntryRecord;
@@ -1754,7 +1440,7 @@ mod tests {
 
     #[test]
     fn test_nas_entry_roundtrip() {
-        let nas = data_mover::EntryEnum::NAS(data_mover::NASEntry {
+        let nas = storage_adapter::EntryEnum::NAS(storage_adapter::NASEntry {
             name: "test.txt".to_string(),
             relative_path: PathBuf::from("dir/test.txt"),
             extension: Some("txt".to_string()),
@@ -1763,7 +1449,7 @@ mod tests {
             atime: 100,
             ctime: 200,
             mtime: 300,
-            mode: 0o755,
+            mode: Some(0o755),
             is_symlink: false,
             hard_links: Some(2),
             uid: Some(1000),
@@ -1791,7 +1477,7 @@ mod tests {
 
     #[test]
     fn test_s3_entry_roundtrip() {
-        let s3 = data_mover::EntryEnum::S3(data_mover::S3Entry {
+        let s3 = storage_adapter::EntryEnum::S3(storage_adapter::S3Entry {
             name: "obj.json".to_string(),
             relative_path: "bucket/obj.json".to_string(),
             extension: Some("json".to_string()),
@@ -1816,7 +1502,7 @@ mod tests {
 
     #[test]
     fn test_nas_entry_optional_fields_none() {
-        let nas = data_mover::EntryEnum::NAS(data_mover::NASEntry {
+        let nas = storage_adapter::EntryEnum::NAS(storage_adapter::NASEntry {
             name: "a.txt".to_string(),
             relative_path: PathBuf::from("a.txt"),
             extension: None,
@@ -1825,7 +1511,7 @@ mod tests {
             atime: 0,
             ctime: 0,
             mtime: 0,
-            mode: 0,
+            mode: None,
             is_symlink: false,
             hard_links: None,
             uid: None,
@@ -1840,14 +1526,16 @@ mod tests {
 
         let record = StorageEntryRecord::from_entry_enum(&nas, 0);
         assert_eq!(record.file_handle, None);
+        assert_eq!(record.mode, None);
 
         let back = record.to_entry_enum();
         assert_eq!(back.get_file_handle(), None);
+        assert_eq!(back.get_mode(), None);
     }
 
     #[test]
     fn test_current_state_propagation() {
-        let nas = data_mover::EntryEnum::NAS(data_mover::NASEntry {
+        let nas = storage_adapter::EntryEnum::NAS(storage_adapter::NASEntry {
             name: "a.txt".to_string(),
             relative_path: PathBuf::from("a.txt"),
             extension: None,
@@ -1856,7 +1544,7 @@ mod tests {
             atime: 0,
             ctime: 0,
             mtime: 0,
-            mode: 0o644,
+            mode: Some(0o644),
             is_symlink: false,
             hard_links: Some(1),
             uid: None,
@@ -2020,7 +1708,7 @@ mod tests {
     fn test_detect_new_sql_path_mode() {
         let (vc_join, vc_expr) = generate_version_count_join_sql!("base_y");
         let sql = JoinStrategy::Path.build_detect_new_sql("temp_x", "base_y", &vc_join, &vc_expr);
-        assert!(sql.contains("NOT IN (SELECT relative_path, version_id FROM base_y WHERE row_kind = 0)"));
+        assert!(sql.contains("NOT IN (SELECT relative_path, version_id FROM base_y)"));
         assert!(sql.contains("FROM temp_x"));
         assert!(!sql.contains("FINAL"));
     }
@@ -2030,7 +1718,7 @@ mod tests {
         let (vc_join, vc_expr) = generate_version_count_join_sql!("base_y");
         let sql = JoinStrategy::FileHandle.build_detect_new_sql("temp_x", "base_y", &vc_join, &vc_expr);
         assert!(sql.contains("file_handle NOT IN"));
-        assert!(sql.contains("FROM base_y WHERE row_kind = 0 AND file_handle IS NOT NULL"));
+        assert!(sql.contains("FROM base_y WHERE file_handle IS NOT NULL"));
         assert!(!sql.contains("FINAL"));
     }
 
@@ -2108,7 +1796,7 @@ mod tests {
     fn test_detect_deleted_sql() {
         let sql = JoinStrategy::build_detect_deleted_sql("base_y");
         assert!(sql.contains("FINAL"));
-        assert!(sql.contains("row_kind = 0 AND current_state = ?"));
+        assert!(sql.contains("current_state = ?"));
         assert!(!sql.contains("LIMIT 1 BY"));
     }
 
@@ -2116,7 +1804,6 @@ mod tests {
     fn test_batch_fh_query_sql() {
         let sql = JoinStrategy::build_batch_fh_query_sql("base_y", 3);
         assert!(sql.contains("file_handle IN (?, ?, ?)"));
-        assert!(sql.contains("row_kind = 0"));
         assert!(sql.contains("LIMIT 1 BY (relative_path, version_id)"));
         assert!(!sql.contains("FINAL"));
     }
@@ -2140,118 +1827,10 @@ mod tests {
         let (join_clause, select_expr) = generate_version_count_join_sql!("base_job1");
         assert!(join_clause.contains("base_job1"));
         assert!(join_clause.contains("LEFT JOIN"));
-        assert!(join_clause.contains("WHERE row_kind = 0"));
+        assert!(!join_clause.contains("row_kind"));
         assert!(join_clause.contains("GROUP BY relative_path"));
         assert!(select_expr.contains("CASE WHEN"));
         assert!(select_expr.contains("COALESCE"));
-    }
-
-    #[tokio::test]
-    async fn public_recovery_seam_reopens_a_claim_and_rejects_a_stale_registrar()
-    -> std::result::Result<(), Box<dyn std::error::Error>> {
-        let mock = test::Mock::new();
-        let config = ClickHouseConfig {
-            dsn: mock.url().to_string(),
-            dial_timeout: 1,
-            read_timeout: 1,
-            database: "default".to_string(),
-            username: "default".to_string(),
-            password: None,
-        };
-        let database = ClickHouseDatabase::new(&config, "recovery_mock");
-        let backend = BackendIdentity::new(BackendKind::Local, "fixture")?;
-        let source = SourceIdentity::new(backend, IdentityStrength::PathScoped, b"large.bin")?;
-        let entry = ObservedEntry::new(
-            StoragePath::new("large.bin")?,
-            EntryKind::File,
-            Some(512 * 1024 * 1024),
-            None,
-            source,
-        )?;
-        let attempt = RecoveryAttemptId::new(7, "worker-a")?;
-        let claim = [0x2a; 32];
-        let claimed = RecoveryEventRecord {
-            row_kind: RECOVERY_ROW,
-            relative_path: String::new(),
-            size: 0,
-            current_state: 0,
-            identity_key: hex::encode(entry.identity_key().as_bytes()),
-            recovery_attempt_order: attempt.order,
-            recovery_attempt_id: attempt.id.clone(),
-            recovery_event_order: RECOVERY_CLAIMED,
-            recovery_claim: hex::encode(claim),
-            recovery_identity: Vec::new(),
-        };
-        mock.add(test::handlers::provide([1_u64]));
-        mock.add(test::handlers::provide([claimed.clone()]));
-
-        let registration = database
-            .open_recovery_attempt(entry.identity_key(), attempt.clone())
-            .await?;
-        assert_eq!(registration.claim(), claim);
-        assert_eq!(registration.identity(), None);
-
-        let identity = RecoveryIdentity::from_bytes(&b"opaque-local-stage"[..])?;
-        let registered = RecoveryEventRecord {
-            recovery_event_order: RECOVERY_REGISTERED,
-            recovery_identity: identity.as_bytes().to_vec(),
-            ..claimed.clone()
-        };
-        mock.add(test::handlers::provide([claimed]));
-        let inserted = mock.add(test::handlers::record::<RecoveryEventRecord>());
-        mock.add(test::handlers::provide([registered.clone()]));
-
-        registration.registrar().register(identity.clone()).await?;
-        let inserted: Vec<RecoveryEventRecord> = inserted.collect().await;
-        assert_eq!(inserted.len(), 1);
-        assert_eq!(inserted[0].recovery_identity, identity.as_bytes().to_vec());
-
-        mock.add(test::handlers::provide([registered.clone()]));
-        registration.registrar().register(identity.clone()).await?;
-
-        mock.add(test::handlers::provide([registered.clone()]));
-        let conflicting = RecoveryIdentity::from_bytes(&b"different-stage"[..])?;
-        assert_eq!(
-            registration.registrar().register(conflicting).await,
-            Err(RecoveryRegistrationFailure::Rejected)
-        );
-
-        let completed = RecoveryEventRecord {
-            recovery_event_order: RECOVERY_COMPLETED,
-            recovery_identity: Vec::new(),
-            ..registered.clone()
-        };
-        mock.add(test::handlers::provide([registered.clone()]));
-        let completion_insert = mock.add(test::handlers::record::<RecoveryEventRecord>());
-        mock.add(test::handlers::provide([completed.clone()]));
-        database
-            .complete_recovery_attempt(entry.identity_key(), &attempt)
-            .await?;
-        let completion_insert: Vec<RecoveryEventRecord> = completion_insert.collect().await;
-        assert_eq!(completion_insert.len(), 1);
-        assert!(completion_insert[0].recovery_identity.is_empty());
-
-        mock.add(test::handlers::provide([1_u64]));
-        mock.add(test::handlers::provide([completed]));
-        assert!(matches!(
-            database
-                .open_recovery_attempt(entry.identity_key(), attempt.clone())
-                .await,
-            Err(DatabaseError::RecoveryAttemptCompleted)
-        ));
-
-        let newer = RecoveryEventRecord {
-            recovery_attempt_order: 8,
-            recovery_attempt_id: "worker-b".to_string(),
-            recovery_claim: hex::encode([0x3b; 32]),
-            ..registered
-        };
-        mock.add(test::handlers::provide([newer]));
-        assert_eq!(
-            registration.registrar().register(identity).await,
-            Err(RecoveryRegistrationFailure::Rejected)
-        );
-        Ok(())
     }
 
     #[tokio::test]

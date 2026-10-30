@@ -6,7 +6,7 @@
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
-use data_mover::StorageEnum;
+use storage_adapter::StorageEnum;
 use sync_delta::DeltaToken;
 use tokio::sync::mpsc;
 use tracing::warn;

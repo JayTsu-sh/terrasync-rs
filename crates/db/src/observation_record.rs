@@ -37,8 +37,8 @@ impl ObservedEntryRecord {
     ///
     /// # Errors
     /// snapshot 损坏、版本未知或查询列与 snapshot 不一致时返回 typed error。
-    pub fn reconstruct(&self) -> Result<ObservedEntry> {
-        let entry = ObservedEntry::decode_snapshot(&self.entry_snapshot)?;
+    pub fn reconstruct(&self, backend: &data_mover::model::BackendIdentity) -> Result<ObservedEntry> {
+        let entry = ObservedEntry::decode_snapshot(&self.entry_snapshot, backend)?;
         self.validate_projection(&entry)?;
         Ok(entry)
     }
@@ -104,7 +104,7 @@ mod tests {
         let entry = observed("nested/file.bin", b"nested/file.bin");
         let record = ObservedEntryRecord::capture(&entry, 7);
 
-        let rebuilt = record.reconstruct().unwrap();
+        let rebuilt = record.reconstruct(entry.source_identity().backend()).unwrap();
 
         assert_eq!(rebuilt, entry);
         assert_eq!(record.relative_path, "nested/file.bin");
@@ -114,21 +114,34 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_from_another_backend_is_rejected() {
+        let entry = observed("file", b"file");
+        let record = ObservedEntryRecord::capture(&entry, 1);
+        let other = BackendIdentity::new(BackendKind::Local, "other-root").unwrap();
+        assert!(matches!(
+            record.reconstruct(&other),
+            Err(crate::DatabaseError::SnapshotDecode(_))
+        ));
+    }
+
+    #[test]
     fn malformed_snapshot_is_a_typed_codec_failure() {
-        let mut record = ObservedEntryRecord::capture(&observed("file", b"file"), 1);
+        let entry = observed("file", b"file");
+        let mut record = ObservedEntryRecord::capture(&entry, 1);
         record.entry_snapshot[0] ^= 0xff;
 
-        let error = record.reconstruct().unwrap_err();
+        let error = record.reconstruct(entry.source_identity().backend()).unwrap_err();
 
         assert!(matches!(error, crate::DatabaseError::SnapshotDecode(_)));
     }
 
     #[test]
     fn snapshot_that_disagrees_with_query_columns_is_rejected() {
-        let mut record = ObservedEntryRecord::capture(&observed("file", b"file"), 1);
+        let entry = observed("file", b"file");
+        let mut record = ObservedEntryRecord::capture(&entry, 1);
         record.relative_path = "other".to_string();
 
-        let error = record.reconstruct().unwrap_err();
+        let error = record.reconstruct(entry.source_identity().backend()).unwrap_err();
 
         assert!(matches!(
             error,
@@ -150,12 +163,6 @@ mod tests {
             "size_observed Bool",
             "modified_unix_nanos Nullable(Int128)",
             "entry_snapshot Array(UInt8)",
-            "row_kind UInt8",
-            "recovery_attempt_order UInt64",
-            "recovery_attempt_id String",
-            "recovery_event_order UInt8",
-            "recovery_claim String",
-            "recovery_identity Array(UInt8)",
             "INDEX identity_key_idx identity_key TYPE bloom_filter",
         ] {
             assert!(FILE_SCAN_COLUMNS_DEFINITION.contains(column));

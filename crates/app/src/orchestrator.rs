@@ -28,14 +28,14 @@ impl Drop for AtomicCounterGuard<'_> {
 
 // 外部 crate
 use dashmap::DashMap;
-use data_mover::error::StorageError;
-use data_mover::qos::QosManager;
-#[cfg(windows)]
-use data_mover::storage_enum::{StorageType, detect_storage_type};
-use data_mover::{ChangeKind, EntryEnum, ErrorEvent, StorageEntryMessage, StorageEnum};
 use db::factory::DatabaseFactory;
 use db::traits::Database;
 use db::{self, DeletionStatus, INCREMENTAL_SCAN_TABLE_BASE_NAME};
+use storage_adapter::error::StorageError;
+use storage_adapter::qos::QosManager;
+#[cfg(windows)]
+use storage_adapter::storage_enum::{StorageType, detect_storage_type};
+use storage_adapter::{ChangeKind, EntryEnum, ErrorEvent, StorageEntryMessage, StorageEnum};
 use tokio::sync::{Semaphore, mpsc};
 use tokio::task::{JoinHandle, JoinSet};
 use tracing::{Instrument, debug, error, info, info_span, trace, warn};
@@ -294,8 +294,8 @@ impl SyncOrchestrator {
         info!(
             "Starting sync via orchestrator: job_id({}), src({}), dest({})",
             c.job_id,
-            data_mover::redact_storage_url(&c.src_path),
-            data_mover::redact_storage_url(&c.dest_path)
+            storage_adapter::redact_storage_url(&c.src_path),
+            storage_adapter::redact_storage_url(&c.dest_path)
         );
 
         // ── 1. 加载配置 ──
@@ -646,8 +646,8 @@ impl SyncOrchestrator {
         info!(
             "Starting incremental sync via orchestrator: job_id({}), src({}), dest({})",
             c.job_id,
-            data_mover::redact_storage_url(&c.src_path),
-            data_mover::redact_storage_url(&c.dest_path)
+            storage_adapter::redact_storage_url(&c.src_path),
+            storage_adapter::redact_storage_url(&c.dest_path)
         );
 
         // ── 1. 加载配置 ──
@@ -871,7 +871,7 @@ impl SyncOrchestrator {
                             }
                             StorageEntryMessage::Changed { ref entry, kind } => {
                                 // MetadataOnly：chmod/chown 变更，跳过 copy_file 只同步属性
-                                let result = if kind == data_mover::ChangeKind::MetadataOnly {
+                                let result = if kind == storage_adapter::ChangeKind::MetadataOnly {
                                     process_metadata_only_entry(
                                         entry,
                                         src.clone(),
@@ -1334,7 +1334,7 @@ impl SyncOrchestrator {
                 src,
                 dest,
                 entry,
-                data_mover::CopyOptions {
+                storage_adapter::CopyOptions {
                     qos,
                     enable_integrity_check: integrity,
                     is_source_reserved: source_reserved,
@@ -1355,7 +1355,6 @@ impl SyncOrchestrator {
             };
             match copy_result {
                 Ok(crate::file_copy::MetadataApplication::DataMover) => metadata_applied = true,
-                Ok(crate::file_copy::MetadataApplication::Caller) => {}
                 Err(e) => {
                     warn!(
                         "Phase B: renamed+data-changed content copy failed for {:?}: {}",

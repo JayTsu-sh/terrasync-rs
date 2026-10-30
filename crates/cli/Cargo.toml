@@ -11,6 +11,7 @@ gui = ["dep:web"]
 lab-fault-injection = ["app/lab-fault-injection"]
 
 [dependencies]
+storage-adapter = { workspace = true }
 app        = { workspace = true }
 licensing  = { workspace = true, optional = true }
 data-mover = { workspace = true }
@@ -21,6 +22,8 @@ chrono     = { workspace = true }
 tracing    = { workspace = true }
 thiserror  = { workspace = true }
 utils      = { workspace = true }
+tokio      = { workspace = true }
+tokio-util = { workspace = true }
 
 [dependencies.clap]
 version = "4.6.0"

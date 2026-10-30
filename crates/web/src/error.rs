@@ -71,7 +71,7 @@ pub enum WebError {
 
     /// 端点存储连通性检查失败，保留类型化错误链供服务端诊断。
     #[error("Endpoint storage connection failed")]
-    EndpointStorageConnectionFailed(#[source] data_mover::error::StorageError),
+    EndpointStorageConnectionFailed(#[source] storage_adapter::error::StorageError),
 
     /// WebSocket 错误
     #[error("WebSocket error: {0}")]
@@ -83,7 +83,7 @@ pub enum WebError {
 
     /// Storage 层错误（如 NFS 查询失败）
     #[error("Storage error: {0}")]
-    StorageError(#[from] data_mover::error::StorageError),
+    StorageError(#[from] storage_adapter::error::StorageError),
 
     /// 请求体 JSON 反序列化失败
     #[error("Invalid request body: {0}")]

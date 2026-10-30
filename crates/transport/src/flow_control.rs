@@ -40,7 +40,7 @@
 //! 数据要么从未到达 Receiver、要么到达了但 ack 没能传回来），沿用旧窗口状态毫无依据。
 //! 后续实现者不要为了"优化重连体验"给这里加持久化——那是解决一个不存在的问题。
 //!
-//! ## 与 `data_mover::qos::QosManager` 的关系
+//! ## 与 `storage_adapter::qos::QosManager` 的关系
 //!
 //! 两者用法形似（`acquire(cost).await` 挂起在调用点、外部补充后自动唤醒），但控制的
 //! 物理量不同，不能互相替代：
@@ -305,7 +305,7 @@ mod tests {
     use std::time::Duration;
 
     use bytes::Bytes;
-    use data_mover::{DataChunk, EntryEnum, NASEntry};
+    use storage_adapter::{DataChunk, EntryEnum, NASEntry};
 
     use super::*;
 
@@ -319,7 +319,7 @@ mod tests {
             atime: 0,
             ctime: 0,
             mtime: 0,
-            mode: 0o644,
+            mode: Some(0o644),
             is_symlink: false,
             hard_links: None,
             uid: None,

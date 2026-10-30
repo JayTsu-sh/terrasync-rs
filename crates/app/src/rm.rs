@@ -31,7 +31,7 @@ pub async fn rm(path: &str) -> Result<()> {
     pb.enable_steady_tick(Duration::from_secs(2));
 
     let concurrency = AppConfig::fetch()?.delete.concurrency;
-    let iter = storage.delete_dir_all_with_progress(None, concurrency)?;
+    let iter = storage.delete_dir_all_with_progress(None, concurrency).await?;
 
     let mut file_count: u64 = 0;
     let mut dir_count: u64 = 0;

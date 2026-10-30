@@ -13,7 +13,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
-use data_mover::{DataChunk, EntryEnum, NASEntry};
+use storage_adapter::{DataChunk, EntryEnum, NASEntry};
 use tokio::sync::oneshot;
 use transport::message::{
     AdvertisedObservation, AdvertisementEvent, AdvertisementTerminal, FeatureFlags, HandshakeResult, HashAlgorithm,
@@ -844,7 +844,7 @@ fn dummy_file_entry(name: &str) -> Arc<EntryEnum> {
         atime: 0,
         ctime: 0,
         mtime: 0,
-        mode: 0o644,
+        mode: Some(0o644),
         is_symlink: false,
         hard_links: None,
         uid: None,

@@ -1,18 +1,15 @@
 //! Receiver 单文件落盘生命周期：消费 full/delta 文件命令，
-//! 对全量文件用 data-mover 3 段 API（`resume_prepare` / `write_chunk_stream` /
-//! `commit_chunk_stream`）流式写入 `.part`，`FileCommit` 时读回 `.part` hash
-//! 校验后原子 rename。目录/符号链接即时完成。delta 文件复用同一套三段式：逐 token
-//! 经 `Reconstructor` 推算出待写字节（`Data` token 直接可写，`Match` token 按需
-//! `read_chunk_stream` 区间读 basis file），写入同一个 `write_chunk_stream` channel。
+//! 通过存储适配层驱动 expert destination 的 prepare、write、complete 生命周期。
+//! 接收完成后先校验长度及源摘要，再由引擎读回校验并发布；目录和符号链接即时完成。
+//! delta token 经 Reconstructor 重建，basis 区间通过源角色读取。
 
 // 标准库
-use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 // 外部 crate
 use bytes::{Bytes, BytesMut};
-use data_mover::{CommitCallback, DataChunk, EntryEnum, StorageEnum, StreamHandle};
+use storage_adapter::{CommitCallback, DataChunk, EntryEnum, StorageEnum, StreamHandle};
 use sync_delta::DeltaToken;
 use sync_delta::reconstruct::{ReconstructStep, Reconstructor};
 use tokio::sync::mpsc;
@@ -21,7 +18,6 @@ use tracing::{debug, error, warn};
 use transport::message::{DcAck, FileOutcome, SessionConfig};
 
 // 内部模块
-use crate::byte_resume::part_path_for;
 use crate::error::{AppError, Result};
 use crate::receiver::{ReceiverProgress, validate_relative_path};
 
@@ -34,11 +30,9 @@ struct ActiveFile {
     /// 向 `write_chunk_stream` 内部 channel 转发数据块的发送端
     tx_inner: mpsc::Sender<DataChunk>,
     /// 后台写任务句柄，channel 关闭后收尾并返回结果
-    write_join: JoinHandle<data_mover::error::Result<()>>,
-    /// 提交时用于 rename 的 stream handle（write 任务持有其 clone）
+    write_join: JoinHandle<storage_adapter::error::Result<()>>,
+    /// expert destination 的会话状态（write 任务持有其 clone）
     handle: StreamHandle,
-    /// `.part` 临时文件的目标端相对路径
-    part_path: PathBuf,
     /// 文件总大小（提交时 `set_file_len` + hash 校验用）
     size: u64,
     /// 权威 transfer mode；delta 状态只存在于 delta variant 中。
@@ -143,9 +137,8 @@ impl FileCommitter {
             return;
         }
 
-        let part_path = part_path_for(entry.get_relative_path());
-        match StorageEnum::resume_prepare(&self.dest, &entry, &part_path, false).await {
-            Ok((_missing, handle)) => {
+        match StorageEnum::prepare_stream(&self.dest, &entry).await {
+            Ok(handle) => {
                 let (tx_inner, rx_inner) = mpsc::channel::<DataChunk>(8);
                 let dest = self.dest.clone();
                 let writer_entry = entry.clone();
@@ -167,7 +160,6 @@ impl FileCommitter {
                     tx_inner,
                     write_join,
                     handle,
-                    part_path,
                     size,
                     mode,
                 };
@@ -177,7 +169,7 @@ impl FileCommitter {
                 };
             }
             Err(error) => {
-                error!("[dc] resume_prepare {:?}: {error}", entry.get_relative_path());
+                error!("[dc] prepare_stream {:?}: {error}", entry.get_relative_path());
                 self.state = FileCommitState::Failed;
                 self.report(ndx, CommitOutcome::HardError(AppError::from(error)));
             }
@@ -312,12 +304,8 @@ impl FileCommitter {
     }
 }
 
-/// 提交单个文件：关闭写 channel → 等写任务收尾 → 读回 `.part` hash 校验 →
-/// `commit_chunk_stream`（原子 rename）→ `set_metadata` → 上报 outcome。
-///
-/// 任一步失败：删除 `.part` 并上报 `FileOutcome`（hash 不符为 `HashMismatch`，可 redo；
-/// 其余为 `HardError`，不可 redo）；是否触发 redo 由 Receiver 主 task 统一决策，本函数
-/// 不再直接发终态 `ReceiverMsg`。
+/// 关闭输入后校验长度和源摘要，再由 expert 引擎校验目标并发布。
+/// 失败由会话清理其拥有的 stage，上报 outcome 后由 Receiver 决定是否 redo。
 async fn finalize_file(
     dest: &Arc<StorageEnum>, session: &SessionConfig, a: ActiveFile, source_hash: Option<String>,
     progress: &Arc<ReceiverProgress>,
@@ -327,7 +315,6 @@ async fn finalize_file(
         tx_inner,
         write_join,
         handle,
-        part_path,
         size,
         ..
     } = a;
@@ -341,59 +328,30 @@ async fn finalize_file(
     };
     if let Err(e) = write_result {
         error!("[dc] write {:?}: {}", entry.get_relative_path(), e);
-        remove_part(dest, &entry, &part_path).await;
+        let _ = handle.discard().await;
+        let received = handle.received_size().await;
+        if received > size || (handle.input_ended().await && received < size) {
+            return CommitOutcome::SizeMismatch;
+        }
         return CommitOutcome::HardError(e);
     }
 
-    // 读回 .part hash 校验（verify-before-rename）
+    // 数据长度及源端摘要先校验；目标端读回校验由 expert complete 负责。
+    if handle.received_size().await != size {
+        let _ = handle.discard().await;
+        return CommitOutcome::SizeMismatch;
+    }
     if session.enable_integrity_check
         && let Some(expected) = source_hash.as_ref()
+        && &handle.received_hash().await != expected
     {
-        match dest.compute_hash(&part_path, size).await {
-            Ok(actual) if &actual == expected => {}
-            Ok(actual) => {
-                error!(
-                    "[dc] hash mismatch {:?}: {} != {}",
-                    entry.get_relative_path(),
-                    actual,
-                    expected
-                );
-                remove_part(dest, &entry, &part_path).await;
-                return CommitOutcome::HashMismatch;
-            }
-            Err(e) => {
-                remove_part(dest, &entry, &part_path).await;
-                return stage_error("hash read-back", AppError::from(e));
-            }
-        }
+        let _ = handle.discard().await;
+        return CommitOutcome::HashMismatch;
     }
 
-    // size 断言（commit 前，独立于 hash 校验的防线）：`commit_chunk_stream` 内部会用
-    // `set_file_len` 把 `.part` 强制补齐/截断到声明大小再 rename，若不在此拦截，截断
-    // 的 `.part` 会被静默补零后当作"大小正确"提交（size 对、内容错）；这层拦截 hash
-    // 校验关闭、或 hash 基于同一份被截断数据计算而"自洽"通过（同源失明）的场景。
-    match dest.get_metadata(&part_path).await {
-        Ok(meta) if meta.get_size() == size => {}
-        Ok(meta) => {
-            error!(
-                "[dc] size mismatch {:?}: part={} expected={}",
-                entry.get_relative_path(),
-                meta.get_size(),
-                size
-            );
-            remove_part(dest, &entry, &part_path).await;
-            return CommitOutcome::SizeMismatch;
-        }
-        Err(e) => {
-            remove_part(dest, &entry, &part_path).await;
-            return stage_error("part size read-back", AppError::from(e));
-        }
-    }
-
-    // 原子 rename：.part → 最终文件
+    // 引擎完成读回校验与发布。
     if let Err(e) = StorageEnum::commit_chunk_stream(dest, &entry, size, handle).await {
         error!("[dc] commit {:?}: {}", entry.get_relative_path(), e);
-        remove_part(dest, &entry, &part_path).await;
         return CommitOutcome::HardError(AppError::from(e));
     }
 
@@ -410,20 +368,19 @@ async fn finalize_file(
 ///
 /// `entry` 取自消息本身（而非 `active` 内部，因为 `active` 可能为 `None`/非 delta 时
 /// 仍需用于日志），实际 basis 读用 `active.entry`（`DeltaBegin` 时已固定，权威来源）。
-/// basis 读失败视为该文件的 `HardError`，中止当前 `ActiveFile`（丢弃 `.part`，语义同
+/// basis 读失败视为该文件的 `HardError`，中止当前 `ActiveFile`（清理当前 stage，语义同
 /// `AbortFile`）——中止后残余 token 因 `active` 已为 `None` 被静默丢弃，与 `FileChunk`
 /// 的"写 channel 已关闭"降噪处理同构。
-async fn settle_and_remove(dest: &StorageEnum, active: ActiveFile) {
+async fn settle_and_remove(_dest: &StorageEnum, active: ActiveFile) {
     let ActiveFile {
-        entry,
         tx_inner,
         write_join,
-        part_path,
+        handle,
         ..
     } = active;
     drop(tx_inner);
     let _ = write_join.await;
-    remove_part(dest, &entry, &part_path).await;
+    let _ = handle.discard().await;
 }
 
 fn stage_error(stage: &'static str, source: AppError) -> CommitOutcome {
@@ -454,25 +411,6 @@ async fn read_basis_block(dest: &Arc<StorageEnum>, entry: &Arc<EntryEnum>, offse
         Ok(Err(e)) => Err(AppError::from(e)),
         Err(join_err) => Err(AppError::from(join_err)),
     }
-}
-
-/// 删除残留的 `.part` 文件。data-mover 的删除 API 以 `EntryEnum` 为参，
-/// 故用原 entry 派生一个指向 `.part` 相对路径的临时 entry 再删。失败忽略
-/// （清理是尽力而为，`.part` 后缀不会污染最终结果）。
-async fn remove_part(dest: &StorageEnum, entry: &EntryEnum, part_path: &Path) {
-    let part_entry = part_entry_of(entry, part_path);
-    let _ = dest.delete_file(&part_entry).await;
-}
-
-/// 由原 entry 克隆出一个 `relative_path` 指向 `.part` 的 entry（仅用于删除 `.part`）。
-fn part_entry_of(entry: &EntryEnum, part_path: &Path) -> EntryEnum {
-    let mut part = entry.clone();
-    match &mut part {
-        EntryEnum::NAS(e) => e.relative_path = part_path.to_path_buf(),
-        EntryEnum::S3(e) => e.relative_path = part_path.to_string_lossy().into_owned(),
-        EntryEnum::HDFS(e) => e.relative_path = part_path.to_path_buf(),
-    }
-    part
 }
 
 /// `disk_commit` task 不做逐 chunk 进度回调，提交回调为空操作。
