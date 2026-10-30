@@ -1,6 +1,22 @@
-# Remote Expert Transfer v8
+# Remote Expert Transfer v8 设计
 
-## Seam
+**日期：** 2026-09-02
+
+**状态：** Implemented
+
+## 问题
+
+远端传输需要在两个进程间协商有界 payload，并在目标发布前完成内容验证和元数据应用。
+恢复状态、失败后的 stage 所有权与 wire 终态必须保持一致。
+
+## 方案
+
+Terrasync 负责会话协商和消息顺序，通过 data-mover 的 expert source/destination halves
+执行实际存储操作；内容、元数据和恢复证据共同控制最终发布。
+
+## 接口设计
+
+### Seam
 
 Terrasync owns two deep entry-scoped interfaces:
 
@@ -15,7 +31,7 @@ Terrasync owns two deep entry-scoped interfaces:
 Both interfaces use data-mover's expert source/destination halves. They never inspect a backend
 kind, protocol handle, backend fact, recovery identity, or metadata encoding.
 
-## Ordered protocol
+### Ordered protocol
 
 ```text
 handshake
@@ -36,7 +52,7 @@ FileList by sending advertisement; a transfer cannot run before the Control-stre
 Protocol v8 adds the staged-metadata terminal phase and is intentionally incompatible with v7 and
 earlier.
 
-## Boundedness and chunk negotiation
+### Boundedness and chunk negotiation
 
 The source emits chunks no larger than its backend/inflight offer. Terrasync zero-copy slices an
 offered chunk when the destination negotiated a smaller limit. The destination limit is also
@@ -46,7 +62,7 @@ Payload enters a capacity-one destination channel before Receiver returns byte c
 connection ledger batches normal grants and flushes sub-threshold residual credit at each transfer
 terminal; many small files therefore cannot leak the connection's available window.
 
-## Recovery and failures
+### Recovery and failures
 
 Only transfers larger than one negotiated chunk open application recovery persistence. A recovered
 durable prefix is backend-observed, not caller-reported. The source hashes the complete logical file
@@ -60,7 +76,7 @@ If a peer fails mid-payload, the local error retains both peer evidence and the 
 persistence fails after publication, the peer terminal explicitly reports that
 `final_destination_changed` is true.
 
-## Metadata gate
+### Metadata gate
 
 The destination already reconstructed the exact `ObservedEntry` from its opaque snapshot. It must
 compile metadata semantics from those captured observations and an explicit target profile; it must
@@ -79,7 +95,12 @@ partial family report through the data-mover failure. `VerifyOrSkip` is rejected
 the plan contains mutations, because retaining an existing content-equivalent object would discard
 the metadata already applied to the new stage.
 
-## Executable evidence
+## 影响范围
+
+涉及 `app::remote_expert_transfer`、transport 的远端消息、QUIC stream 路由和额度管理。
+data-mover 持有 source/destination expert 会话与私有 stage；协议兼容性见上述有序协议约定。
+
+## 验证方式
 
 - capacity-one Local-to-Local transfer with unequal source/destination chunk ceilings;
 - source QoS evidence round-trip;

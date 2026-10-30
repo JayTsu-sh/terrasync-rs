@@ -3,13 +3,27 @@
 **日期：** 2026-09-01
 **状态：** Implemented
 
+## 问题
+
+远端接收方需要有序、可验证且有界的文件列表，同时必须保留中立观察，避免依赖后端私有事实。
+遍历的取消、局部失败与成功终态也必须在 wire 上区分。
+
+## 方案
+
+通过有界 observation 页、会话内 NDX 和唯一 terminal 投影 traversal 结果，并逐事件验证。
+
 ## 边界
 
 data-mover 只提供 bounded `TraversalSession`、中立 `ObservedEntry` 和 opaque snapshot codec。
 terrasync 拥有远端分页、session-local NDX、wire failure projection、QUIC FileList stream 和
 terminal protocol。NDX 不写数据库或 checkpoint，也不能跨 negotiated session 复用。
 
-## 发送侧
+## 接口设计
+
+`advertise_remote` 对接 `RemoteAdvertisementSink`；接收方通过
+`RemoteAdvertisementReceiver::accept` 获取单页、entry failure 或完成摘要。
+
+### 发送侧
 
 `advertise_remote` 按 traversal 顺序消费 entry 与 entry failure：
 
@@ -20,7 +34,7 @@ terminal protocol。NDX 不写数据库或 checkpoint，也不能跨 negotiated 
 - traversal 的 Completed、Cancelled、backend-session failure 和 runtime failure 都映射为唯一 terminal；
 - Completed 的 entry/failure 计数必须与实际 projection 一致。
 
-## 接收侧
+### 接收侧
 
 `RemoteAdvertisementReceiver::accept` 是增量 validator。它验证 page sequence、连续 NDX、页
 上限、snapshot codec 和 terminal 计数。每页验证后立即返回 `AdvertisementReceipt::Page`，自身
@@ -35,7 +49,12 @@ terminal protocol。NDX 不写数据库或 checkpoint，也不能跨 negotiated 
 提供 v5 双解码或旧 `DirPageResult` 到新 snapshot 页的兼容转换。旧 remote 编排路径将在 #152
 移除，新 expert transfer 的消费接线属于 #145。
 
-## 验证
+## 影响范围
+
+涉及 `app::remote_advertisement`、transport 消息类型及 QUIC FileList 路由。
+协议版本和旧远端编排的兼容边界见上节；数据库与后端事实编码不属于此接口。
+
+## 验证方式
 
 - opaque snapshot round-trip 且无 backend refetch；
 - session-local NDX 与 page sequence 连续；

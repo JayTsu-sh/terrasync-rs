@@ -1,3 +1,4 @@
+use data_mover::model::BackendIdentity;
 use data_mover::model::{EntryKind, ObservedEntry, StorageTimestamp};
 use serde::{Deserialize, Serialize};
 
@@ -37,7 +38,7 @@ impl ObservedEntryRecord {
     ///
     /// # Errors
     /// snapshot 损坏、版本未知或查询列与 snapshot 不一致时返回 typed error。
-    pub fn reconstruct(&self, backend: &data_mover::model::BackendIdentity) -> Result<ObservedEntry> {
+    pub fn reconstruct(&self, backend: &BackendIdentity) -> Result<ObservedEntry> {
         let entry = ObservedEntry::decode_snapshot(&self.entry_snapshot, backend)?;
         self.validate_projection(&entry)?;
         Ok(entry)
@@ -86,6 +87,7 @@ pub const OBSERVATION_IDENTITY_JOIN_CLAUSE: &str = "t.identity_key = b.identity_
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
+    use crate::error::DatabaseError;
     use data_mover::model::{
         BackendIdentity, BackendKind, EntryKind, IdentityStrength, ObservedEntry, SourceIdentity, StoragePath,
     };
@@ -120,7 +122,7 @@ mod tests {
         let other = BackendIdentity::new(BackendKind::Local, "other-root").unwrap();
         assert!(matches!(
             record.reconstruct(&other),
-            Err(crate::DatabaseError::SnapshotDecode(_))
+            Err(DatabaseError::SnapshotDecode(_))
         ));
     }
 
@@ -132,7 +134,7 @@ mod tests {
 
         let error = record.reconstruct(entry.source_identity().backend()).unwrap_err();
 
-        assert!(matches!(error, crate::DatabaseError::SnapshotDecode(_)));
+        assert!(matches!(error, DatabaseError::SnapshotDecode(_)));
     }
 
     #[test]
@@ -143,10 +145,7 @@ mod tests {
 
         let error = record.reconstruct(entry.source_identity().backend()).unwrap_err();
 
-        assert!(matches!(
-            error,
-            crate::DatabaseError::ObservationProjectionMismatch { .. }
-        ));
+        assert!(matches!(error, DatabaseError::ObservationProjectionMismatch { .. }));
     }
 
     #[test]

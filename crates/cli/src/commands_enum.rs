@@ -208,8 +208,8 @@ pub enum Commands {
         #[arg(short, long)]
         id: Option<String>,
 
-        /// Enable checkpoints and resume an interrupted scan with the same --id.
-        /// Requires ClickHouse; use this flag on both the initial and resumed invocation.
+        /// 启用检查点，并使用同一 --id 恢复中断的扫描。
+        /// 需要 ClickHouse；首次及恢复调用均须传入该参数。
         #[arg(long, requires = "id")]
         resume: bool,
 

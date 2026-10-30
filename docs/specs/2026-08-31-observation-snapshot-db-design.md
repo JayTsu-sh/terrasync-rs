@@ -25,6 +25,17 @@ facts，也没有后端 refetch fallback。
 独占 claim、checkpoint 清理和重新上传都由 data-mover 的 transfer 模块处理，ClickHouse 扫描表
 不参与 copy attempt 生命周期。
 
+## 接口设计
+
+`ObservedEntryRecord::capture` 生成查询投影和 opaque snapshot；`reconstruct` 通过 data-mover
+codec 解码并校验投影。数据库提供 observation 批量写入、identity 比较和完整观察读取接口，
+以 `OBSERVATION_IDENTITY_JOIN_CLAUSE` 统一 identity JOIN 条件。
+
+## 影响范围
+
+涉及 `db` 的 ClickHouse schema、observation record 和读取接口，以及 `app` 的扫描投影消费方。
+snapshot 编码和解码继续由 data-mover 提供。
+
 ## 兼容边界
 
 不迁移历史 ClickHouse schema 或历史行。启用新 projection 前重建对应 job 表；代码不维护双

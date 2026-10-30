@@ -58,6 +58,7 @@
 //! [`spawn_lazy_accept_file_list_and_data`]。
 
 // 外部 crate
+use crate::message::{RemoteDestinationEvent, RemoteSourceEvent};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
@@ -111,7 +112,7 @@ pub(crate) fn sender_stream_kind(msg: &SenderMsg) -> StreamKind {
         | SenderMsg::FileListError { .. }
         | SenderMsg::FileListDone
         | SenderMsg::Advertisement(_)
-        | SenderMsg::RemoteSource(crate::message::RemoteSourceEvent::Offer { .. }) => StreamKind::FileList,
+        | SenderMsg::RemoteSource(RemoteSourceEvent::Offer { .. }) => StreamKind::FileList,
 
         SenderMsg::CopyEntry { .. }
         | SenderMsg::CreateDir { .. }
@@ -124,10 +125,10 @@ pub(crate) fn sender_stream_kind(msg: &SenderMsg) -> StreamKind {
         | SenderMsg::TarPacked { .. }
         | SenderMsg::SetAcl { .. }
         | SenderMsg::RemoteSource(
-            crate::message::RemoteSourceEvent::Payload { .. }
-            | crate::message::RemoteSourceEvent::Completed { .. }
-            | crate::message::RemoteSourceEvent::Failed { .. }
-            | crate::message::RemoteSourceEvent::Cancelled { .. },
+            RemoteSourceEvent::Payload { .. }
+            | RemoteSourceEvent::Completed { .. }
+            | RemoteSourceEvent::Failed { .. }
+            | RemoteSourceEvent::Cancelled { .. },
         ) => StreamKind::Data,
     }
 }
@@ -143,8 +144,7 @@ pub(crate) fn receiver_stream_kind(msg: &ReceiverMsg) -> StreamKind {
         | ReceiverMsg::Classified { .. }
         | ReceiverMsg::RequestsDone
         | ReceiverMsg::RemoteDestination(
-            crate::message::RemoteDestinationEvent::TransferRequested { .. }
-            | crate::message::RemoteDestinationEvent::PayloadRequested { .. },
+            RemoteDestinationEvent::TransferRequested { .. } | RemoteDestinationEvent::PayloadRequested { .. },
         ) => StreamKind::FileList,
 
         ReceiverMsg::EntrySuccess { .. }
@@ -156,9 +156,7 @@ pub(crate) fn receiver_stream_kind(msg: &ReceiverMsg) -> StreamKind {
         | ReceiverMsg::Progress(_)
         | ReceiverMsg::AllDone
         | ReceiverMsg::CreditGrant { .. }
-        | ReceiverMsg::RemoteDestination(crate::message::RemoteDestinationEvent::Terminal(_)) => {
-            StreamKind::AckProgress
-        }
+        | ReceiverMsg::RemoteDestination(RemoteDestinationEvent::Terminal(_)) => StreamKind::AckProgress,
     }
 }
 

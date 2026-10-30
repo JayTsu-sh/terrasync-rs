@@ -73,7 +73,7 @@ pub enum AdvertisementEvent {
     Terminal(AdvertisementTerminal),
 }
 
-/// Source-read work accounting transported as immutable completion evidence.
+/// 作为不可变完成证据传输的源读取统计。
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct SourceQosSnapshot {
     pub logical_bytes: u64,
@@ -84,7 +84,7 @@ pub struct SourceQosSnapshot {
     pub native_payload_shaped: bool,
 }
 
-/// Stable wire projection of data-mover transfer phases.
+/// data-mover 传输阶段的稳定 wire 投影。
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum RemoteTransferPhase {
     Preflight,
@@ -99,7 +99,7 @@ pub enum RemoteTransferPhase {
     Metadata,
 }
 
-/// Stable wire projection of the side responsible for a transfer failure.
+/// 传输失败责任方的稳定 wire 投影。
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum RemoteTransferSide {
     Source,
@@ -107,7 +107,7 @@ pub enum RemoteTransferSide {
     Orchestration,
 }
 
-/// Mutually exclusive staged-state ownership reported to the peer.
+/// 向对端报告的互斥 stage 状态所有权。
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum RemoteStageDisposition {
     None,
@@ -116,7 +116,7 @@ pub enum RemoteStageDisposition {
     PublishedCleanupPending,
 }
 
-/// Typed, non-secret failure evidence sent to the peer without backend-private state.
+/// 发给对端的类型化非敏感失败证据，不包含后端私有状态。
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct RemoteTransferFailure {
     pub phase: RemoteTransferPhase,
@@ -127,10 +127,10 @@ pub struct RemoteTransferFailure {
     pub diagnostic: String,
 }
 
-/// Ordered source-side events for one remote expert transfer.
+/// 单次远端 expert 传输的有序源侧事件。
 ///
-/// `Offer` is routed on `FileList`; `Payload` and `Completed` share the `Data`
-/// stream so completion evidence cannot overtake payload bytes.
+/// `Offer` 走 `FileList`；`Payload` 和 `Completed` 共用 `Data` 流，
+/// 确保完成证据不会先于数据字节到达。
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum RemoteSourceEvent {
     Offer {
@@ -160,7 +160,7 @@ pub enum RemoteSourceEvent {
     },
 }
 
-/// Destination-side negotiation events for one remote expert transfer.
+/// 单次远端 expert 传输的目标侧协商事件。
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum RemoteDestinationEvent {
     TransferRequested {
@@ -174,7 +174,7 @@ pub enum RemoteDestinationEvent {
     Terminal(RemoteTransferTerminal),
 }
 
-/// Destination publication terminal for one NDX.
+/// 单个 NDX 的目标发布终态。
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum RemoteTransferTerminal {
     Completed {

@@ -223,6 +223,7 @@ async fn handle_versioned_entry(
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
+    use crate::error::Result;
     use std::path::PathBuf;
 
     use storage_adapter::{AsyncReceiver, ErrorEvent};
@@ -233,9 +234,7 @@ mod tests {
 
     use super::*;
 
-    async fn create_storage(
-        path: &str, block_size: Option<u64>, _ensure_dir: bool,
-    ) -> crate::error::Result<StorageEnum> {
+    async fn create_storage(path: &str, block_size: Option<u64>, _ensure_dir: bool) -> Result<StorageEnum> {
         create_storage_for_role(path, block_size, false, StorageRole::Source).await
     }
 

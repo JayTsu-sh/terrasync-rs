@@ -6,7 +6,7 @@
 /// 通道关闭（所有发送端 drop）时 [`next`](AsyncReceiver::next) 返回 `None`，
 /// 可作为流式迭代的自然终止信号。
 ///
-/// # Thread Safety
+/// # 线程安全
 ///
 /// `AsyncReceiver<T>` 可在线程间 Send + Sync（与 `async_channel::Receiver` 一致）。
 pub struct AsyncReceiver<T> {

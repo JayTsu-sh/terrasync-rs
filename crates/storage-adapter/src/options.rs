@@ -1,4 +1,4 @@
-//! Public option and backend-configuration types used by storage orchestration.
+//! 存储编排使用的公共选项和后端配置类型。
 
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
@@ -49,10 +49,9 @@ pub struct TarPackOptions {
     pub bytes_counter: Option<Arc<AtomicU64>>,
 }
 
-/// Backend-specific creation configuration.
+/// 后端专属的创建配置。
 ///
-/// Concrete variants are added only when a backend has explicit configuration
-/// that does not belong in the storage location or common creation options.
+/// 仅当后端有不属于存储地址或公共创建选项的显式配置时，才增加对应变体。
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub enum BackendConfig {
     #[default]
@@ -60,7 +59,7 @@ pub enum BackendConfig {
     Hdfs(HdfsConfig),
 }
 
-/// Typed options used by the unified storage factory.
+/// 统一存储工厂使用的类型化选项。
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct CreateStorageOptions {
     pub block_size: Option<u64>,

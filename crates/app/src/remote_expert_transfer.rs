@@ -1,16 +1,17 @@
-//! Remote expert-transfer orchestration.
+//! 远端 expert 传输编排。
 
 use std::sync::Arc;
 
 use bytes::Bytes;
 use data_mover::metadata::MetadataPlan;
 use data_mover::model::{EntryIdentityKey, ObservedEntry, StoragePath};
-use data_mover::storage::{SourceQosGroup, SourceQosStats, Storage};
+use data_mover::storage::{ByteStream, SourceQosGroup, SourceQosStats, Storage, StorageRoleFailure};
 use data_mover::transfer::{
     ExpertDestinationRequest, ExpertDestinationSession, ExpertSourceEvidence, ExpertSourceRequest, ExpertSourceSession,
-    TransferIdentity, TransferOutcome, TransferPhase, TransferPolicy, TransferSide,
+    TransferFailure, TransferIdentity, TransferOutcome, TransferPhase, TransferPolicy, TransferSide,
 };
 use futures::stream;
+use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use transport::flow_control::{DEFAULT_CREDIT_WINDOW_BYTES, ReceiverCreditState, payload_credit_cost};
 use transport::message::{
@@ -21,7 +22,7 @@ use transport::traits::{ReceiverTransport, SenderTransport};
 
 use crate::error::{AppError, Result};
 
-/// Source-process inputs for one selected advertised observation.
+/// 源进程处理一个已选广告观察所需的输入。
 pub struct RemoteExpertSourceRequest {
     ndx: SessionNdx,
     source: Storage,
@@ -54,7 +55,7 @@ impl RemoteExpertSourceRequest {
     }
 }
 
-/// Destination-process inputs for one selected advertised observation.
+/// 目标进程处理一个已选广告观察所需的输入。
 pub struct RemoteExpertDestinationRequest {
     ndx: SessionNdx,
     identity: TransferIdentity,
@@ -94,7 +95,7 @@ impl RemoteExpertDestinationRequest {
         self
     }
 
-    /// Supplies metadata semantics compiled from the advertised observation before target I/O.
+    /// 在目标 I/O 前提供从广告观察编译的元数据语义。
     #[must_use]
     pub fn with_metadata_plan(mut self, plan: MetadataPlan) -> Self {
         self.metadata_plan = Some(plan);
@@ -102,14 +103,14 @@ impl RemoteExpertDestinationRequest {
     }
 }
 
-/// Completed source-side accounting for a remote transfer.
+/// 远端传输完成时的源侧统计。
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RemoteExpertSourceReport {
     pub transferred_bytes: u64,
     pub source_qos: SourceQosStats,
 }
 
-/// Serves one receiver-selected NDX and streams only bytes after its durable prefix.
+/// 处理接收方选中的一个 NDX，只流式发送持久化前缀之后的字节。
 pub async fn serve_remote_source(
     transport: Arc<dyn SenderTransport>, request: RemoteExpertSourceRequest,
 ) -> Result<RemoteExpertSourceReport> {
@@ -201,7 +202,7 @@ async fn serve_remote_source_inner(
     })
 }
 
-/// Receives one source stream into a staged destination, verifies it, then publishes it.
+/// 将一个源数据流写入目标 stage，验证成功后发布。
 pub async fn receive_remote_destination(
     transport: Arc<dyn ReceiverTransport>, request: RemoteExpertDestinationRequest,
 ) -> Result<TransferOutcome> {
@@ -267,8 +268,8 @@ async fn receive_remote_destination_inner(
         ))
         .await?;
 
-    let (tx, rx) = tokio::sync::mpsc::channel(1);
-    let wire_stream: data_mover::storage::ByteStream = Box::pin(stream::unfold(rx, |mut rx| async move {
+    let (tx, rx) = mpsc::channel(1);
+    let wire_stream: ByteStream = Box::pin(stream::unfold(rx, |mut rx| async move {
         rx.recv().await.map(|item| (item, rx))
     }));
     let write = destination.write(wire_stream);
@@ -427,7 +428,7 @@ fn validate_offer(
 async fn receive_payload(
     transport: Arc<dyn ReceiverTransport>, ndx: SessionNdx, source_size: u64, durable_prefix: u64,
     maximum_chunk_bytes: usize, identity_key: EntryIdentityKey,
-    tx: tokio::sync::mpsc::Sender<std::result::Result<Bytes, data_mover::storage::StorageRoleFailure>>,
+    tx: mpsc::Sender<std::result::Result<Bytes, StorageRoleFailure>>,
 ) -> Result<ExpertSourceEvidence> {
     let mut expected_offset = durable_prefix;
     let mut credit = ReceiverCreditState::default();
@@ -530,7 +531,7 @@ fn qos_from_wire(stats: SourceQosSnapshot) -> SourceQosStats {
     }
 }
 
-fn project_failure(failure: &data_mover::transfer::TransferFailure) -> RemoteTransferFailure {
+fn project_failure(failure: &TransferFailure) -> RemoteTransferFailure {
     let stage = if failure.has_pending_cleanup() {
         RemoteStageDisposition::PublishedCleanupPending
     } else if failure.has_recoverable_stage() {
@@ -582,13 +583,24 @@ fn protocol(ndx: SessionNdx, reason: impl Into<String>) -> AppError {
     }
 }
 
-fn transfer_failure(ndx: SessionNdx, source: data_mover::transfer::TransferFailure) -> AppError {
+fn transfer_failure(ndx: SessionNdx, source: TransferFailure) -> AppError {
     AppError::RemoteExpertTransferFailure { ndx: ndx.0, source }
 }
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
+    use crate::error::AppError;
+    use rustls::crypto::ring::default_provider;
+    use rustls::pki_types::CertificateDer;
+    use tokio::sync::Mutex;
+    use tokio::{fs, time};
+    use transport::error::Result as TransportResult;
+    use transport::message::{
+        RemoteStageDisposition, RemoteTransferFailure, RemoteTransferPhase, RemoteTransferSide, SourceQosSnapshot,
+    };
+    use transport::quic::receiver::local_addr;
+
     use std::collections::VecDeque;
     use std::num::NonZeroUsize;
     use std::sync::Arc;
@@ -612,7 +624,7 @@ mod tests {
     };
     use transport::prelude::create_in_process_pair_with_capacity;
     use transport::quic;
-    use transport::traits::{ReceiverTransport as _, SenderTransport as _};
+    use transport::traits::{ReceiverTransport, SenderTransport};
 
     use super::{
         RemoteExpertDestinationRequest, RemoteExpertSourceRequest, receive_remote_destination, serve_remote_source,
@@ -621,20 +633,20 @@ mod tests {
     type TestResult<T = ()> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
     struct ScriptedReceiver {
-        incoming: tokio::sync::Mutex<VecDeque<SenderMsg>>,
+        incoming: Mutex<VecDeque<SenderMsg>>,
     }
 
     #[async_trait::async_trait]
-    impl transport::traits::ReceiverTransport for ScriptedReceiver {
+    impl ReceiverTransport for ScriptedReceiver {
         async fn recv(&self) -> Option<SenderMsg> {
             self.incoming.lock().await.pop_front()
         }
 
-        async fn send(&self, _msg: ReceiverMsg) -> transport::error::Result<()> {
+        async fn send(&self, _msg: ReceiverMsg) -> TransportResult<()> {
             Ok(())
         }
 
-        async fn close(&self) -> transport::error::Result<()> {
+        async fn close(&self) -> TransportResult<()> {
             Ok(())
         }
     }
@@ -671,7 +683,7 @@ mod tests {
         let payload = (0..(256 * 1024 + 7))
             .map(|index| (index % 251) as u8)
             .collect::<Vec<_>>();
-        tokio::fs::write(source_root.path().join("payload.bin"), &payload).await?;
+        fs::write(source_root.path().join("payload.bin"), &payload).await?;
         let source = local_storage(source_root.path(), "remote-expert-source").await?;
         let destination = local_storage(destination_root.path(), "remote-expert-destination").await?;
         let observation = observe(&source, "payload.bin").await?;
@@ -733,10 +745,7 @@ mod tests {
                 .all(|item| item.outcome == ApplicationOutcome::OmittedByPolicy)
         }));
         assert_eq!(destination_outcome.blake3, Some(*blake3::hash(&payload).as_bytes()));
-        assert_eq!(
-            tokio::fs::read(destination_root.path().join("copied.bin")).await?,
-            payload
-        );
+        assert_eq!(fs::read(destination_root.path().join("copied.bin")).await?, payload);
         Ok(())
     }
 
@@ -744,11 +753,11 @@ mod tests {
     async fn source_change_fails_both_processes_without_waiting_for_payload() -> TestResult {
         let source_root = tempdir()?;
         let destination_root = tempdir()?;
-        tokio::fs::write(source_root.path().join("changed.bin"), b"advertised").await?;
+        fs::write(source_root.path().join("changed.bin"), b"advertised").await?;
         let source = local_storage(source_root.path(), "remote-changed-source").await?;
         let destination = local_storage(destination_root.path(), "remote-changed-destination").await?;
         let observation = observe(&source, "changed.bin").await?;
-        tokio::fs::write(source_root.path().join("changed.bin"), b"changed-after-advertisement").await?;
+        fs::write(source_root.path().join("changed.bin"), b"changed-after-advertisement").await?;
         let identity = TransferIdentity::from_label("remote-source-changed")?;
 
         let cancel = CancellationToken::new();
@@ -776,7 +785,7 @@ mod tests {
             .with_transfer_policy(TransferPolicy::AtomicReplace),
         ));
 
-        let completed = tokio::time::timeout(Duration::from_secs(2), async {
+        let completed = time::timeout(Duration::from_secs(2), async {
             let source_result = (&mut source_task).await;
             let destination_result = (&mut destination_task).await;
             (source_result, destination_result)
@@ -790,7 +799,7 @@ mod tests {
         assert!(source_result?.is_err());
         assert!(matches!(
             destination_result?,
-            Err(crate::error::AppError::RemoteExpertPeerFailure { ndx: 8, .. })
+            Err(AppError::RemoteExpertPeerFailure { ndx: 8, .. })
         ));
         assert!(!destination_root.path().join("must-not-exist.bin").exists());
         Ok(())
@@ -800,7 +809,7 @@ mod tests {
     async fn cancellation_is_a_typed_peer_terminal_and_never_publishes() -> TestResult {
         let source_root = tempdir()?;
         let destination_root = tempdir()?;
-        tokio::fs::write(source_root.path().join("cancelled.bin"), vec![1; 128 * 1024]).await?;
+        fs::write(source_root.path().join("cancelled.bin"), vec![1; 128 * 1024]).await?;
         let source = local_storage(source_root.path(), "remote-cancel-source").await?;
         let destination = local_storage(destination_root.path(), "remote-cancel-destination").await?;
         let observation = observe(&source, "cancelled.bin").await?;
@@ -832,14 +841,14 @@ mod tests {
             .with_transfer_policy(TransferPolicy::AtomicReplace),
         ));
 
-        let (source_result, destination_result) = tokio::time::timeout(Duration::from_secs(2), async {
+        let (source_result, destination_result) = time::timeout(Duration::from_secs(2), async {
             tokio::join!(source_task, destination_task)
         })
         .await?;
         assert!(source_result?.is_err());
         assert!(matches!(
             destination_result?,
-            Err(crate::error::AppError::RemoteExpertPeerCancelled { ndx: 12 })
+            Err(AppError::RemoteExpertPeerCancelled { ndx: 12 })
         ));
         assert!(!destination_root.path().join("cancelled-output.bin").exists());
         Ok(())
@@ -850,7 +859,7 @@ mod tests {
         let source_root = tempdir()?;
         let destination_root = tempdir()?;
         let payload = vec![0x6d; 192 * 1024 + 3];
-        tokio::fs::write(source_root.path().join("recoverable.bin"), &payload).await?;
+        fs::write(source_root.path().join("recoverable.bin"), &payload).await?;
         let source = local_storage(source_root.path(), "remote-recovery-source").await?;
         let destination = local_storage(destination_root.path(), "remote-recovery-destination").await?;
         let observation = observe(&source, "recoverable.bin").await?;
@@ -885,10 +894,7 @@ mod tests {
         source_result??;
         destination_result??;
 
-        assert_eq!(
-            tokio::fs::read(destination_root.path().join("recovered.bin")).await?,
-            payload
-        );
+        assert_eq!(fs::read(destination_root.path().join("recovered.bin")).await?, payload);
         Ok(())
     }
 
@@ -897,20 +903,20 @@ mod tests {
         let source_root = tempdir()?;
         let destination_root = tempdir()?;
         let payload = vec![0x55; 128 * 1024 + 1];
-        tokio::fs::write(source_root.path().join("interrupted.bin"), &payload).await?;
+        fs::write(source_root.path().join("interrupted.bin"), &payload).await?;
         let source = local_storage(source_root.path(), "remote-interrupted-source").await?;
         let destination = local_storage(destination_root.path(), "remote-interrupted-destination").await?;
         let observation = observe(&source, "interrupted.bin").await?;
-        let peer_failure = transport::message::RemoteTransferFailure {
-            phase: transport::message::RemoteTransferPhase::Transfer,
-            side: transport::message::RemoteTransferSide::Source,
-            stage: transport::message::RemoteStageDisposition::None,
+        let peer_failure = RemoteTransferFailure {
+            phase: RemoteTransferPhase::Transfer,
+            side: RemoteTransferSide::Source,
+            stage: RemoteStageDisposition::None,
             final_destination_changed: false,
-            source_qos: transport::message::SourceQosSnapshot::default(),
+            source_qos: SourceQosSnapshot::default(),
             diagnostic: "injected source read failure".to_string(),
         };
-        let transport: Arc<dyn transport::traits::ReceiverTransport> = Arc::new(ScriptedReceiver {
-            incoming: tokio::sync::Mutex::new(VecDeque::from([
+        let transport: Arc<dyn ReceiverTransport> = Arc::new(ScriptedReceiver {
+            incoming: Mutex::new(VecDeque::from([
                 SenderMsg::RemoteSource(RemoteSourceEvent::Offer {
                     ndx: SessionNdx(22),
                     source_size: payload.len() as u64,
@@ -942,10 +948,10 @@ mod tests {
             .with_transfer_policy(TransferPolicy::Checkpointed),
         )
         .await;
-        let Err(crate::error::AppError::RemoteExpertPayloadInterrupted { peer, destination, .. }) = result else {
+        let Err(AppError::RemoteExpertPayloadInterrupted { peer, destination, .. }) = result else {
             panic!("mid-payload failure must retain both peer and destination errors")
         };
-        assert!(matches!(*peer, crate::error::AppError::RemoteExpertPeerFailure { .. }));
+        assert!(matches!(*peer, AppError::RemoteExpertPeerFailure { .. }));
         assert!(destination.has_recoverable_stage());
         assert!(!destination_root.path().join("interrupted-output.bin").exists());
         Ok(())
@@ -953,11 +959,11 @@ mod tests {
 
     #[tokio::test]
     async fn real_quic_runs_the_same_local_expert_state_machine() -> TestResult {
-        let _ = rustls::crypto::ring::default_provider().install_default();
+        let _ = default_provider().install_default();
         let source_root = tempdir()?;
         let destination_root = tempdir()?;
         let payload = vec![0x3c; 160 * 1024 + 11];
-        tokio::fs::write(source_root.path().join("quic.bin"), &payload).await?;
+        fs::write(source_root.path().join("quic.bin"), &payload).await?;
         let source = local_storage(source_root.path(), "remote-quic-source").await?;
         let destination = local_storage(destination_root.path(), "remote-quic-destination").await?;
         let observation = observe(&source, "quic.bin").await?;
@@ -967,9 +973,9 @@ mod tests {
         let cancel = CancellationToken::new();
 
         let (endpoint, cert) = quic::bind("[::1]:0".parse()?)?;
-        let address = quic::receiver::local_addr(&endpoint)?;
+        let address = local_addr(&endpoint)?;
         let accept = tokio::spawn(async move { quic::accept_connection(&endpoint).await });
-        let sender = quic::connect(address, "localhost", Some(quic::CertificateDer::from(cert))).await?;
+        let sender = quic::connect(address, "localhost", Some(CertificateDer::from(cert))).await?;
         sender.send(SenderMsg::Handshake(ProtocolHandshake::current())).await?;
         let receiver = accept.await??;
         let Some(SenderMsg::Handshake(remote_handshake)) = receiver.recv().await else {
@@ -1012,8 +1018,8 @@ mod tests {
             )))
         ));
 
-        let sender: Arc<dyn transport::traits::SenderTransport> = Arc::new(sender);
-        let receiver: Arc<dyn transport::traits::ReceiverTransport> = Arc::new(receiver);
+        let sender: Arc<dyn SenderTransport> = Arc::new(sender);
+        let receiver: Arc<dyn ReceiverTransport> = Arc::new(receiver);
         let source_task = tokio::spawn(serve_remote_source(
             Arc::clone(&sender),
             RemoteExpertSourceRequest::new(
@@ -1039,7 +1045,7 @@ mod tests {
         source_task.await??;
         destination_task.await??;
         assert_eq!(
-            tokio::fs::read(destination_root.path().join("quic-output.bin")).await?,
+            fs::read(destination_root.path().join("quic-output.bin")).await?,
             payload
         );
         sender.close().await?;

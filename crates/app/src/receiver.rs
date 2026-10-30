@@ -5,9 +5,11 @@
 //! 双进程模式下 Receiver 仅拥有 dest storage（数据流模式，Phase 3）。
 
 // 标准库
+use crate::file_copy::{HdfsCopyContext, MetadataApplication, copy_file};
 use std::path::{Component, Path};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use storage_adapter::StorageEntryMessage;
 
 // 外部 crate
 use storage_adapter::qos::QosManager;
@@ -220,10 +222,10 @@ pub(crate) async fn process_entry_on_receiver(
                 no_resume: config.no_resume,
             };
             if matches!(dest_storage.as_ref(), StorageEnum::HDFS(_)) {
-                let hdfs = crate::file_copy::HdfsCopyContext::from_job(&config.job_id, config.no_resume)?;
+                let hdfs = HdfsCopyContext::from_job(&config.job_id, config.no_resume)?;
                 let recorder = CommitRecorder::start(&config.job_dir, entry, src_storage.block_size()).await?;
                 let hdfs = hdfs.with_commit_callback(recorder.callback());
-                let result = crate::file_copy::copy_file(
+                let result = copy_file(
                     src_storage,
                     dest_storage,
                     entry,
@@ -237,10 +239,7 @@ pub(crate) async fn process_entry_on_receiver(
                     Some(&hdfs),
                 )
                 .await;
-                let metadata = result
-                    .as_ref()
-                    .copied()
-                    .unwrap_or(crate::file_copy::MetadataApplication::DataMover);
+                let metadata = result.as_ref().copied().unwrap_or(MetadataApplication::DataMover);
                 recorder.finish(result.map(|_| ())).await?;
                 metadata
             } else if should_resume(&resume, entry, src_storage, dest_storage) {
@@ -255,9 +254,9 @@ pub(crate) async fn process_entry_on_receiver(
                     &config.job_dir,
                 )
                 .await?;
-                crate::file_copy::MetadataApplication::DataMover
+                MetadataApplication::DataMover
             } else {
-                crate::file_copy::copy_file(
+                copy_file(
                     src_storage,
                     dest_storage,
                     entry,
@@ -274,7 +273,7 @@ pub(crate) async fn process_entry_on_receiver(
                 .map_err(|e| AppError::CopyError(format!("Failed to copy {}: {e}", relative_path.display())))?
             };
 
-            // Ordinary and checkpointed transfers apply negotiated metadata before publication.
+            // 普通传输和检查点传输都在发布前应用协商后的元数据。
         }
 
         // ACL 复制（目录和文件均需要，symlink 除外）
@@ -571,7 +570,7 @@ pub(crate) async fn recv_file_list_and_data_phase(
                     .await
                 {
                     while let Some(msg) = iter.next().await {
-                        if let storage_adapter::StorageEntryMessage::Scanned(entry) = msg {
+                        if let StorageEntryMessage::Scanned(entry) = msg {
                             dest_index.insert(entry);
                         }
                     }

@@ -582,7 +582,7 @@ pub trait Database: Send + Sync {
     /// 提交本轮 begin 得到的 working generation
     async fn commit_scan_generation(&self) -> Result<()>;
 
-    /// A fresh scan must invalidate any previous cursor for the same job.
+    /// 新扫描必须使同一 job 的旧游标失效。
     async fn abandon_scan_resume(&self) -> Result<()> {
         Ok(())
     }

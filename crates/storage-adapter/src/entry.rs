@@ -1,6 +1,7 @@
 //! TerraSync 数据库及 wire 使用的数据投影；不承担存储 IO。
 // 数据结构源自 data-mover d76ff5c（Apache-2.0）。
 use bytes::Bytes;
+use data_mover::model::AclMetadata;
 use serde::{Deserialize, Serialize};
 use std::{
     fmt,
@@ -218,16 +219,16 @@ impl EntryEnum {
     }
 }
 
-/// HDFS-native metadata without invented NAS or object-store semantics.
+/// HDFS 原生元数据，不附加 NAS 或对象存储语义。
 #[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
 pub struct HDFSEntry {
     pub name: String,
     pub relative_path: PathBuf,
     pub is_dir: bool,
     pub size: u64,
-    /// Nanoseconds since the Unix epoch.
+    /// 自 Unix epoch 起经过的纳秒数。
     pub mtime: i64,
-    /// Nanoseconds since the Unix epoch.
+    /// 自 Unix epoch 起经过的纳秒数。
     pub atime: i64,
     pub mode: Option<u32>,
     pub owner: String,
@@ -396,7 +397,7 @@ pub struct NASEntry {
 
     /// `NFSv4` ACL（仅 `NFSv4`+ 填充）
     #[serde(skip)]
-    pub acl: Option<data_mover::model::AclMetadata>,
+    pub acl: Option<AclMetadata>,
 
     /// `NFSv4` owner 字符串，如 "root@localdomain"
     pub owner: Option<String>,

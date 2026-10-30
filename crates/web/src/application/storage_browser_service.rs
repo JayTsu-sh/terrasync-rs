@@ -1,4 +1,6 @@
+use data_mover::storage::{list_buckets, list_exports};
 use std::path::{Path, PathBuf};
+use storage_adapter::StorageError;
 
 use app::storage_factory::{StorageRole, create_storage_for_role};
 use storage_adapter::{S3BucketInfo, StorageEntryMessage};
@@ -51,9 +53,7 @@ impl StorageBrowserService {
             _ => server.to_string(),
         };
 
-        let exports = data_mover::storage::list_exports(&host)
-            .await
-            .map_err(storage_adapter::StorageError::from)?;
+        let exports = list_exports(&host).await.map_err(StorageError::from)?;
         Ok(exports
             .into_iter()
             .map(|e| NfsExportEntry {
@@ -69,9 +69,7 @@ impl StorageBrowserService {
     ) -> Result<Vec<S3BucketInfo>> {
         let scheme = if use_https { "s3+https" } else { "s3" };
         let url = format!("{scheme}://{access_key}:{secret_key}@{server}");
-        let buckets = data_mover::storage::list_buckets(&url)
-            .await
-            .map_err(storage_adapter::StorageError::from)?;
+        let buckets = list_buckets(&url).await.map_err(StorageError::from)?;
         Ok(buckets)
     }
 

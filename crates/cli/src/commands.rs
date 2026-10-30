@@ -9,9 +9,12 @@
 //! 6. 参数校验函数
 
 // 标准库
+use app::scan_resume::scan_with_resume;
 use std::fs;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use tokio::signal::ctrl_c;
+use tokio_util::sync::CancellationToken;
 
 // 外部crate
 use app::config::SyncJobConfig;
@@ -139,14 +142,14 @@ pub async fn scan_cmd(
     let (job_dir, job_dir_pre_existing) = prepare_job("scan", job_id)?;
 
     if resume {
-        let cancel = tokio_util::sync::CancellationToken::new();
+        let cancel = CancellationToken::new();
         let signal_cancel = cancel.clone();
         let signal = tokio::spawn(async move {
-            if tokio::signal::ctrl_c().await.is_ok() {
+            if ctrl_c().await.is_ok() {
                 signal_cancel.cancel();
             }
         });
-        let result = app::scan_resume::scan_with_resume(
+        let result = scan_with_resume(
             job_id,
             &job_dir,
             path,

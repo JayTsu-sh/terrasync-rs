@@ -3,11 +3,25 @@
 **日期：** 2026-08-31  
 **状态：** Implemented
 
+## 问题
+
+扫描流中的局部成功不能证明完整快照；若直接发布部分观察，取消或失败会造成错误的删除判断。
+产品层需要在完整遍历证据与全部批次持久化成功后统一发布扫描结果。
+
+## 方案
+
+以 bounded traversal、批量 staging 写入和原子 snapshot 发布组成独立的纯观察扫描流程。
+
 ## 数据流
 
 `project_pure_scan` 直接消费 data-mover 的 bounded `TraversalSession`。每个成功的
 `ObservedEntry` 被编码成 #140 定义的同表 query projection 与 opaque snapshot；entry failure
 只计入失败统计，不伪造成 entry，也不会终止对剩余 stream 的排空。
+
+## 接口设计
+
+`project_pure_scan` 接收 `TraversalSession`、批次大小及 `ObservationScanSink`。
+sink 封装 generation 开始、批次写入、完整发布与中止操作；扫描结果返回观察、失败及删除统计。
 
 ## 完整性和发布
 
@@ -37,7 +51,12 @@ destructive abort，保留 base 与 rollback table，直到外部核对表身份
 data-mover storage facade 的最终入口切换不属于 projection；旧扫描编排的删除在后续历史路径清理票
 中移除。
 
-## 验证
+## 影响范围
+
+涉及 `app::observation_scan` 与 `db::ClickHouseDatabase` 的 observation snapshot 生命周期。
+存储协议及 snapshot codec 仍由 data-mover 实现；既有扫描入口的清理边界见上节。
+
+## 验证方式
 
 - bounded batch 与成功统计；
 - 公开 bounded `TraversalSession` 到真实 ClickHouse sink 的完整发布与删除；

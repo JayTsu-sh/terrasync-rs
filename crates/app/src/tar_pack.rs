@@ -2,6 +2,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
+use storage_adapter::WalkOptions;
 
 // 内部模块
 use storage_adapter::qos::QosManager;
@@ -32,10 +33,7 @@ pub async fn pack_directory(
 
     // ── 阶段 1：收集子条目 + 计算 tar 大小 ──
     let iterator = src_storage
-        .walkdir(
-            Some(dir_entry.get_relative_path()),
-            storage_adapter::WalkOptions::default(),
-        )
+        .walkdir(Some(dir_entry.get_relative_path()), WalkOptions::default())
         .await?;
     let manifest_list = collect_entries(iterator).await;
 

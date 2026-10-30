@@ -1,7 +1,16 @@
+use crate::connected::path;
+use crate::error::operation;
+use crate::projection::nanos;
 use crate::{EntryEnum, Result, StorageEnum, StorageError};
+use data_mover::integrity::MtimePrecision as NativeMtimePrecision;
+use data_mover::integrity::{
+    self, IntegrityDifference, IntegrityMode, IntegrityOptions, IntegrityPlan, IntegrityRequest,
+};
+use data_mover::model::EntryKind;
+use data_mover::storage::PrincipalIdentity;
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
-/// Entry type used in structured integrity-check mismatches.
+/// 结构化完整性差异中的条目类型。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IntegrityEntryKind {
     File,
@@ -9,14 +18,14 @@ pub enum IntegrityEntryKind {
     Symlink,
 }
 
-/// Side of an integrity comparison that returned an unexpected byte count.
+/// 完整性比较中返回非预期字节数的一侧。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IntegritySide {
     Source,
     Destination,
 }
 
-/// Structured content mismatches reported by an independent integrity check.
+/// 独立完整性检查报告的结构化内容差异。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MismatchDataField {
     EntryKind {
@@ -42,7 +51,7 @@ pub enum MismatchDataField {
     },
 }
 
-/// Structured POSIX metadata mismatches reported by an integrity check.
+/// 完整性检查报告的结构化 POSIX 元数据差异。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MismatchMetaField {
     Mtime { src: i64, dest: i64 },
@@ -53,26 +62,26 @@ pub enum MismatchMetaField {
     HdfsGroup { src: String, dest: String },
 }
 
-/// Amount of data validation performed by [`IntegrityCheck`].
+/// [`IntegrityCheck`] 执行的数据验证范围。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IntegrityCheckMode {
-    /// Compare entry type, size, and supported metadata without reading file data.
+    /// 比较条目类型、大小及支持的元数据，不读取文件内容。
     Quick,
-    /// Perform all quick checks and compare file data as aligned byte streams.
+    /// 执行全部快速检查，再按对齐的字节流比较文件内容。
     Full,
 }
 
-/// How modification timestamps are normalized before comparison.
+/// 比较前对修改时间戳的规范化方式。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum MtimePrecision {
-    /// Compare the original nanosecond timestamps.
+    /// 比较原始纳秒时间戳。
     #[default]
     Exact,
-    /// Infer each timestamp's apparent precision and compare at the coarser one.
+    /// 推断每个时间戳的精度，并按较粗精度比较。
     Auto,
 }
 
-/// Options controlling an independent integrity check.
+/// 控制独立完整性检查的选项。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct IntegrityCheckOptions {
     pub mode: IntegrityCheckMode,
@@ -103,7 +112,7 @@ impl IntegrityCheckOptions {
     }
 }
 
-/// Stateless independent integrity checker.
+/// 无状态的独立完整性检查器。
 pub struct IntegrityCheck;
 
 impl IntegrityCheck {
@@ -111,10 +120,7 @@ impl IntegrityCheck {
         src: &StorageEnum, dest: &StorageEnum, entry: &EntryEnum, options: IntegrityCheckOptions,
         cancel: Option<&CancellationToken>,
     ) -> Result<()> {
-        use data_mover::integrity::{
-            self, IntegrityDifference, IntegrityMode, IntegrityOptions, IntegrityPlan, IntegrityRequest,
-        };
-        let p = crate::connected::path(entry.get_relative_path())?;
+        let p = path(entry.get_relative_path())?;
         let report = integrity::compare(IntegrityRequest {
             source: src.storage().clone(),
             source_path: p.clone(),
@@ -127,8 +133,8 @@ impl IntegrityCheck {
                     IntegrityCheckMode::Full => IntegrityMode::Content,
                 },
                 mtime_precision: match options.mtime_precision {
-                    MtimePrecision::Exact => integrity::MtimePrecision::Exact,
-                    MtimePrecision::Auto => integrity::MtimePrecision::Coarsest,
+                    MtimePrecision::Exact => NativeMtimePrecision::Exact,
+                    MtimePrecision::Auto => NativeMtimePrecision::Coarsest,
                 },
                 mtime_tolerance: options.mtime_tolerance,
             },
@@ -145,7 +151,7 @@ impl IntegrityCheck {
                         entry.get_relative_path().display().to_string(),
                     ));
                 }
-                // Directory allocation sizes are filesystem-specific, not payload lengths.
+                // 目录分配大小取决于文件系统，不代表内容长度。
                 IntegrityDifference::Size { .. } if entry.get_is_dir() => {}
                 IntegrityDifference::Size { source, destination } => data.push(MismatchDataField::Size {
                     src: source.unwrap_or(0),
@@ -157,8 +163,8 @@ impl IntegrityCheck {
                     dest: kind(*destination),
                 }),
                 IntegrityDifference::Modified { source, destination } => metadata.push(MismatchMetaField::Mtime {
-                    src: crate::projection::nanos(*source),
-                    dest: crate::projection::nanos(*destination),
+                    src: nanos(*source),
+                    dest: nanos(*destination),
                 }),
                 IntegrityDifference::Permissions { source, destination } => {
                     if let (Some(src), Some(dest)) = (source.mode, destination.mode) {
@@ -166,7 +172,6 @@ impl IntegrityCheck {
                             metadata.push(MismatchMetaField::Mode { src, dest });
                         }
                     }
-                    use data_mover::storage::PrincipalIdentity;
                     if let (Some(PrincipalIdentity::Numeric(src)), Some(PrincipalIdentity::Numeric(dest))) =
                         (&source.owner, &destination.owner)
                     {
@@ -183,9 +188,7 @@ impl IntegrityCheck {
                     }
                 }
                 _ => {
-                    return Err(crate::error::operation(format!(
-                        "unsupported integrity difference: {difference:?}"
-                    )));
+                    return Err(operation(format!("unsupported integrity difference: {difference:?}")));
                 }
             }
         }
@@ -198,10 +201,10 @@ impl IntegrityCheck {
         Ok(())
     }
 }
-fn kind(value: data_mover::model::EntryKind) -> IntegrityEntryKind {
+fn kind(value: EntryKind) -> IntegrityEntryKind {
     match value {
-        data_mover::model::EntryKind::Directory => IntegrityEntryKind::Directory,
-        data_mover::model::EntryKind::Symlink => IntegrityEntryKind::Symlink,
+        EntryKind::Directory => IntegrityEntryKind::Directory,
+        EntryKind::Symlink => IntegrityEntryKind::Symlink,
         _ => IntegrityEntryKind::File,
     }
 }

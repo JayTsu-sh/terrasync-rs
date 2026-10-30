@@ -8,8 +8,11 @@
 //! 5. 重试机制集成
 
 // 标准库
+use crate::file_copy::{HdfsCopyContext, copy_file};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use tokio::sync::{mpsc, oneshot};
+use tokio::task::JoinHandle;
 
 // 外部crate
 use dashmap::DashMap;
@@ -537,11 +540,11 @@ async fn process_entry_inner(
             .await
             .map_err(|e| AppError::CopyError(format!("Failed to set metadata for {}: {e}", relative_path.display())))?;
     } else if matches!(dest_storage.as_ref(), StorageEnum::HDFS(_)) {
-        let hdfs = crate::file_copy::HdfsCopyContext::from_job(&resume.job_id, resume.no_resume)?
+        let hdfs = HdfsCopyContext::from_job(&resume.job_id, resume.no_resume)?
             ;
         let recorder = CommitRecorder::start(&resume.job_dir, entry, src_storage.block_size()).await?;
         let hdfs = hdfs.with_commit_callback(recorder.callback());
-        let result = crate::file_copy::copy_file(
+        let result = copy_file(
             &src_storage,
             &dest_storage,
             entry,
@@ -574,7 +577,7 @@ async fn process_entry_inner(
         )
         .await?;
 
-        // data-mover applies negotiated metadata before publishing the file.
+        // data-mover 在发布文件前应用协商后的元数据。
 
         debug!("Copied file (resumable) {:?}", relative_path);
     } else {
@@ -596,7 +599,7 @@ async fn process_entry_inner(
         .await
         .map_err(|e| AppError::CopyError(format!("Failed to copy {}: {e}", relative_path.display())))?;
 
-        // data-mover applies negotiated metadata before publishing the file.
+        // data-mover 在发布文件前应用协商后的元数据。
 
         debug!("Copied file {:?}", relative_path);
     }
@@ -648,8 +651,8 @@ pub(crate) struct ResumeOpts {
 pub(crate) struct CommitRecorder {
     store: Arc<ByteResumeStore>,
     callback: storage_adapter::CommitCallback,
-    drain: tokio::task::JoinHandle<()>,
-    shutdown: tokio::sync::oneshot::Sender<()>,
+    drain: JoinHandle<()>,
+    shutdown: oneshot::Sender<()>,
     dropped: Arc<AtomicU64>,
     path: std::path::PathBuf,
 }
@@ -664,9 +667,9 @@ impl CommitRecorder {
         let path = entry.get_relative_path().to_path_buf();
         let store = ByteResumeStore::open(job_dir, &path, entry.get_size(), entry.get_mtime(), block_size).await?;
         const CAPACITY: usize = 65_536;
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<(u64, u64)>(CAPACITY);
+        let (tx, mut rx) = mpsc::channel::<(u64, u64)>(CAPACITY);
         let store_task = store.clone();
-        let (shutdown, mut shutdown_rx) = tokio::sync::oneshot::channel();
+        let (shutdown, mut shutdown_rx) = oneshot::channel();
         let drain = tokio::spawn(async move {
             loop {
                 tokio::select! {

@@ -169,7 +169,7 @@ fn walkdir_from_file_list(storage: StorageEnum, file_list_path: &str) -> Result<
         .instrument(span),
     );
 
-    Ok(storage_adapter::WalkDirAsyncIterator::new(rx))
+    Ok(WalkDirAsyncIterator::new(rx))
 }
 
 /// 通用的目录遍历函数 - 作为便捷的包装器

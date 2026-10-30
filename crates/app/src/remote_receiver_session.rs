@@ -89,7 +89,7 @@ pub(crate) struct RemoteSessionState {
 }
 
 impl RemoteSessionState {
-    pub(crate) fn ingest_page(&mut self, page: &storage_adapter::dir_tree::DirPageResult) {
+    pub(crate) fn ingest_page(&mut self, page: &DirPageResult) {
         self.ndx_table.ingest_page(page);
     }
 

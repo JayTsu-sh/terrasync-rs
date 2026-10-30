@@ -20,7 +20,7 @@ pub struct ObservationScanReport {
 pub trait ObservationScanSink: Send + Sync {
     async fn begin_generation(&mut self) -> db::Result<u8>;
     async fn write_batch(&self, records: &[ObservedEntryRecord]) -> db::Result<()>;
-    /// Publishes atomically or performs its own safe rollback before returning an error.
+    /// 原子发布；发生错误时在返回前自行安全回滚。
     async fn publish_generation(&mut self) -> db::Result<u64>;
     async fn abort_generation(&mut self) -> db::Result<()>;
 }
@@ -151,11 +151,16 @@ impl Projection {
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
-    fn completion(entries: u64, failures: u64) -> data_mover::traversal::TraversalCompletion {
-        let mut totals = data_mover::traversal::ScanTotals::default();
+    use data_mover::model::{EntryOperationFailure, ObservedEntry};
+    use data_mover::traversal::{ScanFailure, ScanTotals, TraversalCompletion};
+    use db::DatabaseError;
+    use tokio_util::sync::CancellationToken;
+
+    fn completion(entries: u64, failures: u64) -> TraversalCompletion {
+        let mut totals = ScanTotals::default();
         totals.emitted = entries;
         totals.failed_children = failures;
-        data_mover::traversal::TraversalCompletion::new(totals)
+        TraversalCompletion::new(totals)
     }
 
     use std::sync::Mutex;
@@ -188,7 +193,7 @@ mod tests {
         async fn publish_generation(&mut self) -> db::Result<u64> {
             self.events.lock().unwrap().push("publish");
             if self.fail_publish {
-                return Err(db::DatabaseError::QueryError("publish failed".to_string()));
+                return Err(DatabaseError::QueryError("publish failed".to_string()));
             }
             Ok(2)
         }
@@ -201,7 +206,7 @@ mod tests {
     fn entry(path: &str, size: u64) -> TraversalItem {
         let backend = BackendIdentity::new(BackendKind::Local, "fixture").unwrap();
         let identity = SourceIdentity::new(backend, IdentityStrength::PathScoped, path).unwrap();
-        let observed = data_mover::model::ObservedEntry::new(
+        let observed = ObservedEntry::new(
             StoragePath::new(path).unwrap(),
             EntryKind::File,
             Some(size),
@@ -213,8 +218,8 @@ mod tests {
     }
 
     fn failure() -> TraversalItem {
-        TraversalItem::Failure(Box::new(data_mover::traversal::ScanFailure::child(
-            data_mover::model::EntryOperationFailure::new(
+        TraversalItem::Failure(Box::new(ScanFailure::child(
+            EntryOperationFailure::new(
                 StoragePath::new("denied").unwrap(),
                 Operation::Observe,
                 FailureClass::PermissionDenied,
@@ -243,10 +248,7 @@ mod tests {
 
     #[tokio::test]
     async fn public_seam_drains_bounded_session_and_publishes_complete_snapshot() {
-        let (producer, session) = data_mover::traversal::TraversalSession::bounded(
-            NonZeroUsize::new(1).unwrap(),
-            tokio_util::sync::CancellationToken::new(),
-        );
+        let (producer, session) = TraversalSession::bounded(NonZeroUsize::new(1).unwrap(), CancellationToken::new());
         let producer_task = tokio::spawn(async move {
             producer.send(entry("a", 3)).await.unwrap();
             producer.send(entry("b", 5)).await.unwrap();
@@ -349,10 +351,7 @@ mod tests {
         let mut sink = ClickHouseDatabase::new(&config, "public_seam");
         sink.initialize().await.unwrap();
 
-        let (producer, session) = TraversalSession::bounded(
-            NonZeroUsize::new(1).unwrap(),
-            tokio_util::sync::CancellationToken::new(),
-        );
+        let (producer, session) = TraversalSession::bounded(NonZeroUsize::new(1).unwrap(), CancellationToken::new());
         producer.send(entry("persisted", 7)).await.unwrap();
         producer.finish(Ok(TraversalOutcome::Completed(completion(1, 0))));
         let report = project_pure_scan(session, &mut sink, NonZeroUsize::new(1).unwrap())
@@ -361,10 +360,7 @@ mod tests {
         assert_eq!(report.observed_entries, 1);
         assert_eq!(sink.query_scan_state().await.unwrap(), Some(1));
 
-        let (producer, session) = TraversalSession::bounded(
-            NonZeroUsize::new(1).unwrap(),
-            tokio_util::sync::CancellationToken::new(),
-        );
+        let (producer, session) = TraversalSession::bounded(NonZeroUsize::new(1).unwrap(), CancellationToken::new());
         producer.finish(Ok(TraversalOutcome::Completed(completion(0, 0))));
         let report = project_pure_scan(session, &mut sink, NonZeroUsize::new(1).unwrap())
             .await

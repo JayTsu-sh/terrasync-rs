@@ -1,3 +1,5 @@
+use crate::connected::path;
+use crate::streaming::source_qos;
 use crate::*;
 use data_mover::tar_pack::{self, TarRequest};
 use std::{
@@ -17,12 +19,12 @@ impl StorageEnum {
             source: source.roles.clone(),
             destination: destination.roles.clone(),
             entries: observations,
-            final_path: crate::connected::path(final_path)?,
+            final_path: path(final_path)?,
             cancel: Default::default(),
             source_qos: options
                 .qos
                 .as_ref()
-                .map(|q| crate::streaming::source_qos(q, source.block_size))
+                .map(|q| source_qos(q, source.block_size))
                 .transpose()?,
         };
         let outcome = tar_pack::pack(request).await?;

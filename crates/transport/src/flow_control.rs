@@ -73,6 +73,7 @@
 //! 散落到 Sender/Receiver adapters 与应用 session；这正是该深模块通过 deletion test 的
 //! 依据。测试应断言阻塞、恢复、消息可见性和 typed terminal outcome，而非内部计数值。
 
+use crate::message::RemoteSourceEvent;
 use std::sync::Mutex;
 
 // 外部 crate
@@ -99,9 +100,7 @@ pub fn credit_cost(message: &SenderMsg) -> Option<u64> {
         SenderMsg::FileData { chunk, .. } => Some(payload_credit_cost(&chunk.data)),
         SenderMsg::DeltaData { data, .. } => Some(payload_credit_cost(data)),
         SenderMsg::TarPacked { tar_entry, .. } => Some(tar_entry.get_size()),
-        SenderMsg::RemoteSource(crate::message::RemoteSourceEvent::Payload { data, .. }) => {
-            Some(payload_credit_cost(data))
-        }
+        SenderMsg::RemoteSource(RemoteSourceEvent::Payload { data, .. }) => Some(payload_credit_cost(data)),
         _ => None,
     }
 }
@@ -154,7 +153,7 @@ impl ReceiverCreditState {
         Ok(())
     }
 
-    /// Returns sub-threshold credit at a per-transfer terminal while retaining the connection.
+    /// 在单次传输终态返还未达阈值的额度，并保留连接。
     pub async fn flush(&mut self, transport: &(dyn ReceiverTransport + 'static)) -> Result<()> {
         if let Some(message) = self.take_pending_grant() {
             transport.send(message).await?;
