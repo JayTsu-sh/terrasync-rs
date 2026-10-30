@@ -10,6 +10,7 @@ license = ["dep:licensing", "dep:chrono"]
 lab-fault-injection = []
 
 [dependencies]
+storage-adapter = { workspace = true }
 async-channel = { workspace = true }
 async-trait   = { workspace = true }
 blake3        = { workspace = true }
@@ -38,6 +39,7 @@ utils         = { workspace = true }
 workspace = true
 
 [dev-dependencies]
+clickhouse = "0.14.2"
 serial_test = "3.4.0"
 tempfile = "3"
 

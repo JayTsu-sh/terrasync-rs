@@ -4,6 +4,7 @@
 //! 通过 Transport 抽象层连接 Sender 和 Receiver，支持单进程和双进程两种模式。
 
 // 标准库
+use crate::file_copy::{HdfsCopyContext, MetadataApplication, copy_file};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -28,14 +29,13 @@ impl Drop for AtomicCounterGuard<'_> {
 
 // 外部 crate
 use dashmap::DashMap;
-use data_mover::error::StorageError;
-use data_mover::qos::QosManager;
-#[cfg(windows)]
-use data_mover::storage_enum::{StorageType, detect_storage_type};
-use data_mover::{ChangeKind, EntryEnum, ErrorEvent, StorageEntryMessage, StorageEnum, create_storage};
 use db::factory::DatabaseFactory;
 use db::traits::Database;
 use db::{self, DeletionStatus, INCREMENTAL_SCAN_TABLE_BASE_NAME};
+use storage_adapter::qos::QosManager;
+#[cfg(windows)]
+use storage_adapter::storage_enum::{StorageType, detect_storage_type};
+use storage_adapter::{ChangeKind, EntryEnum, ErrorEvent, StorageEntryMessage, StorageEnum};
 use tokio::sync::{Semaphore, mpsc};
 use tokio::task::{JoinHandle, JoinSet};
 use tracing::{Instrument, debug, error, info, info_span, trace, warn};
@@ -55,6 +55,7 @@ use crate::integrity_check::verify_storage_time;
 use crate::receiver::{ReceiverConfig, process_entry_on_receiver};
 use crate::scan::{ScanType, batch_processing_to_generate_message, determine_scan_type};
 use crate::sender::{SenderWorkerConfig, sender_worker};
+use crate::storage_factory::{StorageRole, create_storage_for_role};
 #[cfg(windows)]
 use crate::sync::check_admin_privileges;
 use crate::sync::{
@@ -293,8 +294,8 @@ impl SyncOrchestrator {
         info!(
             "Starting sync via orchestrator: job_id({}), src({}), dest({})",
             c.job_id,
-            data_mover::redact_storage_url(&c.src_path),
-            data_mover::redact_storage_url(&c.dest_path)
+            storage_adapter::redact_storage_url(&c.src_path),
+            storage_adapter::redact_storage_url(&c.dest_path)
         );
 
         // ── 1. 加载配置 ──
@@ -609,9 +610,11 @@ impl SyncOrchestrator {
 
         // ── 14. 更新目录元数据（非 S3 目标端） ──
         let dest_storage_for_metadata = Arc::new(
-            create_storage(
+            create_storage_for_role(
                 &c.dest_path,
-                data_mover::CreateStorageOptions::new(block_size.map(|s| s as u64), false),
+                block_size.map(|s| s as u64),
+                false,
+                StorageRole::Destination,
             )
             .await?,
         );
@@ -643,8 +646,8 @@ impl SyncOrchestrator {
         info!(
             "Starting incremental sync via orchestrator: job_id({}), src({}), dest({})",
             c.job_id,
-            data_mover::redact_storage_url(&c.src_path),
-            data_mover::redact_storage_url(&c.dest_path)
+            storage_adapter::redact_storage_url(&c.src_path),
+            storage_adapter::redact_storage_url(&c.dest_path)
         );
 
         // ── 1. 加载配置 ──
@@ -868,7 +871,7 @@ impl SyncOrchestrator {
                             }
                             StorageEntryMessage::Changed { ref entry, kind } => {
                                 // MetadataOnly：chmod/chown 变更，跳过 copy_file 只同步属性
-                                let result = if kind == data_mover::ChangeKind::MetadataOnly {
+                                let result = if kind == ChangeKind::MetadataOnly {
                                     process_metadata_only_entry(
                                         entry,
                                         src.clone(),
@@ -924,7 +927,7 @@ impl SyncOrchestrator {
                                 };
                                 match result {
                                     Ok(()) => bc.broadcast(message.clone()).await,
-                                    Err(StorageError::FileNotFound(_) | StorageError::DirectoryNotFound(_)) => {
+                                    Err(error) if error.is_not_found() => {
                                         trace!("Already deleted, skipping: {:?}", entry.get_relative_path());
                                         bc.broadcast(message.clone()).await;
                                     }
@@ -1164,18 +1167,16 @@ impl SyncOrchestrator {
         // dest storage 提升到 async 块外，供后续 update_directory_metadata 复用，避免二次挂载
         let phase_b_dest_storage: Result<Arc<StorageEnum>> = async {
             let dest_storage_phase_b = Arc::new(
-                create_storage(
+                create_storage_for_role(
                     &c.dest_path,
-                    data_mover::CreateStorageOptions::new(block_size.map(|s| s as u64), false),
+                    block_size.map(|s| s as u64),
+                    false,
+                    StorageRole::Destination,
                 )
                 .await?,
             );
             let src_storage_phase_b = Arc::new(
-                create_storage(
-                    &c.src_path,
-                    data_mover::CreateStorageOptions::new(block_size.map(|s| s as u64), false),
-                )
-                .await?,
+                create_storage_for_role(&c.src_path, block_size.map(|s| s as u64), false, StorageRole::Source).await?,
             );
 
             Self::apply_deletions_and_renames(
@@ -1303,7 +1304,7 @@ impl SyncOrchestrator {
         if kind != ChangeKind::MetadataOnly {
             // 内容变更：完整拷贝文件再设置元数据
             let hdfs = if matches!(dest, StorageEnum::HDFS(_)) {
-                match crate::file_copy::HdfsCopyContext::from_job(job_id, no_resume) {
+                match HdfsCopyContext::from_job(job_id, no_resume) {
                     Ok(context) => Some(context),
                     Err(error) => {
                         warn!("Phase B: invalid HDFS recovery identity: {error}");
@@ -1329,11 +1330,11 @@ impl SyncOrchestrator {
                     context.with_commit_callback(recorder.callback())
                 })
             });
-            let copy_result = crate::file_copy::copy_file(
+            let copy_result = copy_file(
                 src,
                 dest,
                 entry,
-                data_mover::CopyOptions {
+                storage_adapter::CopyOptions {
                     qos,
                     enable_integrity_check: integrity,
                     is_source_reserved: source_reserved,
@@ -1346,15 +1347,14 @@ impl SyncOrchestrator {
             let copy_result = if let Some(recorder) = recorder {
                 let metadata = copy_result.as_ref().ok().copied();
                 match recorder.finish(copy_result.map(|_| ())).await {
-                    Ok(()) => Ok(metadata.unwrap_or(crate::file_copy::MetadataApplication::DataMover)),
+                    Ok(()) => Ok(metadata.unwrap_or(MetadataApplication::DataMover)),
                     Err(error) => Err(error),
                 }
             } else {
                 copy_result
             };
             match copy_result {
-                Ok(crate::file_copy::MetadataApplication::DataMover) => metadata_applied = true,
-                Ok(crate::file_copy::MetadataApplication::Caller) => {}
+                Ok(MetadataApplication::DataMover) => metadata_applied = true,
                 Err(e) => {
                     warn!(
                         "Phase B: renamed+data-changed content copy failed for {:?}: {}",
@@ -1441,7 +1441,10 @@ impl SyncOrchestrator {
                         dest_storage.delete_file(&entry_arc).await
                     };
                     match result {
-                        Ok(()) | Err(StorageError::FileNotFound(_) | StorageError::DirectoryNotFound(_)) => {
+                        Ok(()) => {
+                            broadcaster.broadcast(StorageEntryMessage::Deleted(entry_arc)).await;
+                        }
+                        Err(error) if error.is_not_found() => {
                             broadcaster.broadcast(StorageEntryMessage::Deleted(entry_arc)).await;
                         }
                         Err(e) => {

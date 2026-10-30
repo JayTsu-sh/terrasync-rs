@@ -4,6 +4,7 @@ version = "0.2.0"
 edition = "2024"
 
 [dependencies]
+storage-adapter = { workspace = true }
 async-trait = { workspace = true }
 bytes       = { workspace = true }
 # 主依赖不带 test-util，避免测试辅助代码进入生产二进制

@@ -8,13 +8,16 @@
 //! 5. 重试机制集成
 
 // 标准库
+use crate::file_copy::{HdfsCopyContext, copy_file};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use tokio::sync::{mpsc, oneshot};
+use tokio::task::JoinHandle;
 
 // 外部crate
 use dashmap::DashMap;
-use data_mover::qos::QosManager;
-use data_mover::{EntryEnum, ErrorEvent, StorageEntryMessage, StorageEnum, create_storage, redact_storage_url};
+use storage_adapter::qos::QosManager;
+use storage_adapter::{EntryEnum, ErrorEvent, StorageEntryMessage, StorageEnum, redact_storage_url};
 use tracing::{Instrument, debug, error, info, info_span, instrument, trace, warn};
 #[cfg(windows)]
 use windows_sys::Win32::Foundation::CloseHandle;
@@ -29,6 +32,7 @@ use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken}
 use crate::broadcast::BroadcastForwarder;
 use crate::byte_resume::{ByteResumeStore, part_path_for};
 use crate::error::{AppError, Result};
+use crate::storage_factory::{StorageRole, create_storage_for_role};
 
 /// 存储资源管理器 - 统一管理源和目标存储实例
 ///
@@ -59,10 +63,10 @@ impl StoragePair {
         let block_size_u64 = block_size.map(|s| s as u64);
         // 根据传入的src_path创建storage pool
         let src_storage =
-            Arc::new(create_storage(src_path, data_mover::CreateStorageOptions::new(block_size_u64, false)).await?);
+            Arc::new(create_storage_for_role(src_path, block_size_u64, false, StorageRole::Source).await?);
         // 根据传入的dest_path创建storage pool，如果目标目录不存在则自动创建
         let dest_storage =
-            Arc::new(create_storage(dest_path, data_mover::CreateStorageOptions::new(block_size_u64, true)).await?);
+            Arc::new(create_storage_for_role(dest_path, block_size_u64, true, StorageRole::Destination).await?);
         info!("Created source and destination storage, block_size: {:?}", block_size);
 
         Ok(Self {
@@ -283,7 +287,7 @@ pub(crate) async fn process_versioned_entry(
 
         trace!("Sorted versions: {:?}", task_versions);
 
-        if dest_storage.is_bucket_versioned() {
+        if matches!(dest_storage.is_bucket_versioned().await, Ok(true)) {
             let version_count = task_versions.len() as u32;
             debug!("Processing object {} with {} versions", object_key, version_count);
 
@@ -536,15 +540,15 @@ async fn process_entry_inner(
             .await
             .map_err(|e| AppError::CopyError(format!("Failed to set metadata for {}: {e}", relative_path.display())))?;
     } else if matches!(dest_storage.as_ref(), StorageEnum::HDFS(_)) {
-        let hdfs = crate::file_copy::HdfsCopyContext::from_job(&resume.job_id, resume.no_resume)?
+        let hdfs = HdfsCopyContext::from_job(&resume.job_id, resume.no_resume)?
             ;
         let recorder = CommitRecorder::start(&resume.job_dir, entry, src_storage.block_size()).await?;
         let hdfs = hdfs.with_commit_callback(recorder.callback());
-        let result = crate::file_copy::copy_file(
+        let result = copy_file(
             &src_storage,
             &dest_storage,
             entry,
-            data_mover::CopyOptions {
+            storage_adapter::CopyOptions {
                 qos: qos_manager,
                 enable_integrity_check,
                 is_source_reserved,
@@ -573,11 +577,7 @@ async fn process_entry_inner(
         )
         .await?;
 
-        // 设置目标文件元数据（时间戳、权限）
-        dest_storage
-            .set_entry_metadata(entry)
-            .await
-            .map_err(|e| AppError::CopyError(format!("Failed to set metadata for {}: {e}", relative_path.display())))?;
+        // data-mover 在发布文件前应用协商后的元数据。
 
         debug!("Copied file (resumable) {:?}", relative_path);
     } else {
@@ -588,7 +588,7 @@ async fn process_entry_inner(
             &src_storage,
             &dest_storage,
             entry,
-            data_mover::CopyOptions {
+            storage_adapter::CopyOptions {
                 qos: qos_manager,
                 enable_integrity_check,
                 is_source_reserved,
@@ -599,11 +599,7 @@ async fn process_entry_inner(
         .await
         .map_err(|e| AppError::CopyError(format!("Failed to copy {}: {e}", relative_path.display())))?;
 
-        // 设置目标文件元数据（时间戳、权限）
-        dest_storage
-            .set_entry_metadata(entry)
-            .await
-            .map_err(|e| AppError::CopyError(format!("Failed to set metadata for {}: {e}", relative_path.display())))?;
+        // data-mover 在发布文件前应用协商后的元数据。
 
         debug!("Copied file {:?}", relative_path);
     }
@@ -654,9 +650,9 @@ pub(crate) struct ResumeOpts {
 
 pub(crate) struct CommitRecorder {
     store: Arc<ByteResumeStore>,
-    callback: data_mover::CommitCallback,
-    drain: tokio::task::JoinHandle<()>,
-    shutdown: tokio::sync::oneshot::Sender<()>,
+    callback: storage_adapter::CommitCallback,
+    drain: JoinHandle<()>,
+    shutdown: oneshot::Sender<()>,
     dropped: Arc<AtomicU64>,
     path: std::path::PathBuf,
 }
@@ -671,9 +667,9 @@ impl CommitRecorder {
         let path = entry.get_relative_path().to_path_buf();
         let store = ByteResumeStore::open(job_dir, &path, entry.get_size(), entry.get_mtime(), block_size).await?;
         const CAPACITY: usize = 65_536;
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<(u64, u64)>(CAPACITY);
+        let (tx, mut rx) = mpsc::channel::<(u64, u64)>(CAPACITY);
         let store_task = store.clone();
-        let (shutdown, mut shutdown_rx) = tokio::sync::oneshot::channel();
+        let (shutdown, mut shutdown_rx) = oneshot::channel();
         let drain = tokio::spawn(async move {
             loop {
                 tokio::select! {
@@ -715,7 +711,7 @@ impl CommitRecorder {
         })
     }
 
-    pub(crate) fn callback(&self) -> data_mover::CommitCallback {
+    pub(crate) fn callback(&self) -> storage_adapter::CommitCallback {
         self.callback.clone()
     }
 
@@ -746,7 +742,7 @@ mod commit_recorder_tests {
     use std::path::Path;
     use std::time::Duration;
 
-    use data_mover::{CreateStorageOptions, create_storage};
+    use storage_adapter::{CreateStorageOptions, create_storage};
 
     use super::CommitRecorder;
 
@@ -857,7 +853,7 @@ pub(crate) async fn copy_file_with_resume(
     let recorder = CommitRecorder::start(job_dir, entry, src_storage.block_size()).await?;
     let missing = recorder.store.missing_intervals().await;
 
-    let resume = data_mover::ResumeContext {
+    let resume = storage_adapter::ResumeContext {
         part_relative_path: part_path_for(dest_rel),
         missing_intervals: missing,
         on_committed: recorder.callback(),
@@ -867,7 +863,7 @@ pub(crate) async fn copy_file_with_resume(
         src_storage,
         dest_storage,
         entry,
-        data_mover::CopyOptions {
+        storage_adapter::CopyOptions {
             qos: qos_manager,
             enable_integrity_check,
             is_source_reserved,

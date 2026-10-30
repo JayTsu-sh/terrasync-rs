@@ -1,8 +1,24 @@
 // 标准库
+use std::fs::TryLockError;
+use std::num::TryFromIntError;
 use std::path::PathBuf;
+use std::time::SystemTimeError;
 
 // 外部crate
+use data_mover::error::StorageError as DataMoverStorageError;
+use data_mover::model::SnapshotDecodeError;
+use data_mover::transfer::{TransferFailure, TransferValueError};
+use data_mover::traversal::TraversalTerminalFailure;
+use db::error::DatabaseError;
+#[cfg(feature = "license")]
+use licensing::error::LicenseError;
+use serde_json::Error as JsonError;
+use storage_adapter::error::StorageError;
 use thiserror::Error;
+use tokio::task::JoinError;
+use transport::error::TransportError;
+use transport::message::{RemoteTransferFailure, SessionNdx};
+use utils::error::UtilsError;
 
 // 内部模块
 // 无
@@ -10,26 +26,140 @@ use thiserror::Error;
 /// 应用程序的专用错误枚举
 #[derive(Error, Debug)]
 pub enum AppError {
+    /// 中立 traversal 的 session/runtime 终态失败。
+    #[error("Traversal terminal failure: {0}")]
+    TraversalTerminal(#[from] TraversalTerminalFailure),
+
+    /// 传输请求或身份值无效，保留上游校验错误。
+    #[error("Transfer value error: {0}")]
+    TransferValue(#[from] TransferValueError),
+
+    /// 扫描过滤条件解析失败，保留上游错误类型。
+    #[error("Scan filter error: {0}")]
+    ScanFilter(#[from] DataMoverStorageError),
+
+    /// 扫描选项无法编码为检查点请求标识。
+    #[error("Scan request encoding error: {0}")]
+    ScanRequestEncoding(#[from] JsonError),
+
+    /// 系统时间早于 Unix epoch，无法生成扫描事件时间。
+    #[error("Scan clock error: {0}")]
+    ScanClock(#[from] SystemTimeError),
+
+    /// 扫描事件时间超出持久化整数范围。
+    #[error("Scan timestamp conversion error: {0}")]
+    ScanTimestampConversion(#[from] TryFromIntError),
+
+    /// 扫描 job 锁获取失败，保留锁竞争或底层 I/O 原因。
+    #[error("Cannot lock scan job {job_id}: {source}")]
+    ScanJobLock {
+        job_id: String,
+        #[source]
+        source: TryLockError,
+    },
+
+    /// traversal completion evidence 与本地 transfer queue 实际消费数量不一致。
+    #[error(
+        "Traversal count mismatch: consumed {consumed_entries} entries/{consumed_failures} failures, reported {reported_entries} entries/{reported_failures} failures"
+    )]
+    TraversalCountMismatch {
+        consumed_entries: u64,
+        reported_entries: u64,
+        consumed_failures: u64,
+        reported_failures: u64,
+    },
+
+    /// traversal 有 entry 级失败，因此快照不完整。
+    #[error("Observation scan incomplete after {entry_failures} entry failures")]
+    ObservationScanIncomplete { entry_failures: u64 },
+
+    /// traversal completion evidence 与实际投影条目数不一致。
+    #[error("Observation scan count mismatch: projected {projected}, traversal reported {reported}")]
+    ObservationScanCountMismatch { projected: u64, reported: u64 },
+
+    /// traversal 在完整证据前被取消。
+    #[error("Observation scan cancelled")]
+    ObservationScanCancelled,
+
+    /// remote advertisement 在完整 traversal evidence 前被取消。
+    #[error("Remote advertisement cancelled after {observed_entries} entries and {entry_failures} entry failures")]
+    RemoteAdvertisementCancelled { observed_entries: u64, entry_failures: u64 },
+
+    /// remote advertisement 实际投影数与 traversal completion evidence 不一致。
+    #[error(
+        "Remote advertisement count mismatch: projected {projected_entries} entries/{projected_failures} failures, reported {reported_entries} entries/{reported_failures} failures"
+    )]
+    RemoteAdvertisementCountMismatch {
+        projected_entries: u64,
+        projected_failures: u64,
+        reported_entries: u64,
+        reported_failures: u64,
+    },
+
+    /// remote advertisement wire 违反分页、NDX、snapshot 或 terminal 合同。
+    #[error("Remote advertisement protocol error: {reason}")]
+    RemoteAdvertisementProtocol { reason: String },
+
+    /// 广告中的 opaque snapshot 无法解码，保留 codec 原始错误。
+    #[error("Remote advertisement snapshot {ndx:?} decode failed: {source}")]
+    RemoteAdvertisementSnapshotDecode {
+        ndx: SessionNdx,
+        #[source]
+        source: SnapshotDecodeError,
+    },
+
+    /// 对端以失败 terminal 结束 remote advertisement。
+    #[error("Remote advertisement peer failed: {diagnostic}")]
+    RemoteAdvertisementPeerFailed { diagnostic: String },
+
+    /// remote expert transfer 收到错误 NDX、offset、chunk 或消息顺序。
+    #[error("Remote expert transfer {ndx} protocol error: {reason}")]
+    RemoteExpertTransferProtocol { ndx: u64, reason: String },
+
+    /// data-mover expert half 的 typed failure；保留 stage 清理/恢复所有权。
+    #[error("Remote expert transfer {ndx}: {source}")]
+    RemoteExpertTransferFailure {
+        ndx: u64,
+        #[source]
+        source: TransferFailure,
+    },
+
+    /// peer 通过结构化 terminal 报告的 expert transfer 失败。
+    #[error("Remote expert peer transfer {ndx} failed: {failure:?}")]
+    RemoteExpertPeerFailure { ndx: u64, failure: RemoteTransferFailure },
+
+    /// peer 在完成 evidence 前取消了 expert transfer。
+    #[error("Remote expert peer transfer {ndx} was cancelled")]
+    RemoteExpertPeerCancelled { ndx: u64 },
+
+    /// 远端 payload 中断，同时保留目标端 unpublished stage 的清理/恢复所有权。
+    #[error("Remote expert transfer {ndx} payload interrupted: {peer}; destination: {destination}")]
+    RemoteExpertPayloadInterrupted {
+        ndx: u64,
+        peer: Box<AppError>,
+        #[source]
+        destination: TransferFailure,
+    },
     /// 存储错误
     #[error("{0}")]
-    StorageError(#[from] data_mover::error::StorageError),
+    StorageError(#[from] StorageError),
 
     /// 数据库错误
     #[error("{0}")]
-    DatabaseError(#[from] db::error::DatabaseError),
+    DatabaseError(#[from] DatabaseError),
 
     /// 工具错误
     #[error("{0}")]
-    UtilsError(#[from] utils::error::UtilsError),
+    UtilsError(#[from] UtilsError),
 
     /// License 验证错误
     #[cfg(feature = "license")]
     #[error("{0}")]
-    LicenseError(#[from] licensing::error::LicenseError),
+    LicenseError(#[from] LicenseError),
 
     /// Transport 层错误
     #[error("{0}")]
-    TransportError(#[from] transport::error::TransportError),
+    TransportError(#[from] TransportError),
 
     /// IO错误
     /// 当IO操作失败时触发
@@ -66,7 +196,7 @@ pub enum AppError {
 
     /// 任务执行错误
     #[error("Task join error: {0}")]
-    TaskJoinError(#[from] tokio::task::JoinError),
+    TaskJoinError(#[from] JoinError),
 
     /// 消费者错误
     /// 当消费者操作失败时触发

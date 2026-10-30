@@ -10,6 +10,7 @@
 // 无
 
 // 外部crate
+use storage_adapter::error::StorageError;
 use thiserror::Error;
 
 // 内部模块
@@ -69,7 +70,7 @@ pub enum CliError {
 
     /// 存储层错误
     #[error("{0}")]
-    StorageError(#[from] data_mover::error::StorageError),
+    StorageError(#[from] StorageError),
 
     /// IO错误
     ///

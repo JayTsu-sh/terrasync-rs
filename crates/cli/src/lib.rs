@@ -33,6 +33,30 @@ const APP_VERSION: &str = "3.0.0";
 /// 重新导出命令枚举类型
 pub use commands_enum::*;
 
+#[cfg(test)]
+mod scan_resume_cli_tests {
+    use super::*;
+
+    #[test]
+    fn resume_requires_an_explicit_job_identity() {
+        assert!(Cli::try_parse_from(["terrasync", "scan", "--resume", "."]).is_err());
+        let parsed = Cli::try_parse_from(["terrasync", "scan", "--id", "job", "--resume", "."]);
+        assert!(matches!(
+            parsed.map(|cli| cli.command),
+            Ok(Commands::Scan { resume: true, .. })
+        ));
+    }
+
+    #[test]
+    fn ordinary_scan_remains_opt_in() {
+        let parsed = Cli::try_parse_from(["terrasync", "scan", "."]);
+        assert!(matches!(
+            parsed.map(|cli| cli.command),
+            Ok(Commands::Scan { resume: false, .. })
+        ));
+    }
+}
+
 /// 公共API的 `prelude` 模块
 ///
 /// 用户可以通过 `use cli::prelude::*` 来导入最常用的类型，
@@ -215,6 +239,7 @@ pub async fn cli_match() -> error::Result<()> {
             path,
             r#match,
             exclude,
+            resume,
             ..
         } => {
             commands::scan_cmd(
@@ -223,6 +248,7 @@ pub async fn cli_match() -> error::Result<()> {
                 *depth,
                 r#match,
                 exclude,
+                *resume,
                 raw_command_line,
             )
             .await?;

@@ -58,6 +58,7 @@
 //! [`spawn_lazy_accept_file_list_and_data`]。
 
 // 外部 crate
+use crate::message::{RemoteDestinationEvent, RemoteSourceEvent};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
@@ -107,7 +108,11 @@ pub(crate) fn sender_stream_kind(msg: &SenderMsg) -> StreamKind {
         | SenderMsg::TransferDone
         | SenderMsg::EntryError { .. } => StreamKind::Control,
 
-        SenderMsg::FilePage(_) | SenderMsg::FileListError { .. } | SenderMsg::FileListDone => StreamKind::FileList,
+        SenderMsg::FilePage(_)
+        | SenderMsg::FileListError { .. }
+        | SenderMsg::FileListDone
+        | SenderMsg::Advertisement(_)
+        | SenderMsg::RemoteSource(RemoteSourceEvent::Offer { .. }) => StreamKind::FileList,
 
         SenderMsg::CopyEntry { .. }
         | SenderMsg::CreateDir { .. }
@@ -118,7 +123,13 @@ pub(crate) fn sender_stream_kind(msg: &SenderMsg) -> StreamKind {
         | SenderMsg::DeltaData { .. }
         | SenderMsg::DeltaMatch { .. }
         | SenderMsg::TarPacked { .. }
-        | SenderMsg::SetAcl { .. } => StreamKind::Data,
+        | SenderMsg::SetAcl { .. }
+        | SenderMsg::RemoteSource(
+            RemoteSourceEvent::Payload { .. }
+            | RemoteSourceEvent::Completed { .. }
+            | RemoteSourceEvent::Failed { .. }
+            | RemoteSourceEvent::Cancelled { .. },
+        ) => StreamKind::Data,
     }
 }
 
@@ -131,7 +142,10 @@ pub(crate) fn receiver_stream_kind(msg: &ReceiverMsg) -> StreamKind {
         | ReceiverMsg::DeltaTransferRequest { .. }
         | ReceiverMsg::MetadataUpdateRequest { .. }
         | ReceiverMsg::Classified { .. }
-        | ReceiverMsg::RequestsDone => StreamKind::FileList,
+        | ReceiverMsg::RequestsDone
+        | ReceiverMsg::RemoteDestination(
+            RemoteDestinationEvent::TransferRequested { .. } | RemoteDestinationEvent::PayloadRequested { .. },
+        ) => StreamKind::FileList,
 
         ReceiverMsg::EntrySuccess { .. }
         | ReceiverMsg::EntryError { .. }
@@ -141,7 +155,8 @@ pub(crate) fn receiver_stream_kind(msg: &ReceiverMsg) -> StreamKind {
         | ReceiverMsg::Error { .. }
         | ReceiverMsg::Progress(_)
         | ReceiverMsg::AllDone
-        | ReceiverMsg::CreditGrant { .. } => StreamKind::AckProgress,
+        | ReceiverMsg::CreditGrant { .. }
+        | ReceiverMsg::RemoteDestination(RemoteDestinationEvent::Terminal(_)) => StreamKind::AckProgress,
     }
 }
 

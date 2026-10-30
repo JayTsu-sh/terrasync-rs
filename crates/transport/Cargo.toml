@@ -8,6 +8,7 @@ default = []
 quic = ["dep:quinn", "dep:rcgen", "dep:rustls", "dep:bincode", "dep:tracing", "dep:zstd", "tokio/rt"]
 
 [dependencies]
+storage-adapter = { workspace = true }
 async-channel = { workspace = true }
 async-trait   = { workspace = true }
 bytes         = { workspace = true, features = ["serde"] }

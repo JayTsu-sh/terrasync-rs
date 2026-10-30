@@ -1,8 +1,10 @@
+use app::error::AppError;
 use axum::Json;
 use axum::extract::rejection::JsonRejection;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use serde::Serialize;
+use storage_adapter::error::StorageError;
 use thiserror::Error;
 use tracing::error;
 
@@ -11,7 +13,7 @@ use tracing::error;
 pub enum WebError {
     /// App 层错误
     #[error("{0}")]
-    AppError(#[from] app::error::AppError),
+    AppError(#[from] AppError),
 
     /// 工具错误
     #[error("{0}")]
@@ -65,6 +67,14 @@ pub enum WebError {
     #[error("Connection test failed: {0}")]
     ConnectionTestFailed(String),
 
+    /// 端点 backend 构造失败，保留类型化错误链供服务端诊断。
+    #[error("Endpoint connection setup failed")]
+    EndpointAppConnectionFailed(#[source] AppError),
+
+    /// 端点存储连通性检查失败，保留类型化错误链供服务端诊断。
+    #[error("Endpoint storage connection failed")]
+    EndpointStorageConnectionFailed(#[source] StorageError),
+
     /// WebSocket 错误
     #[error("WebSocket error: {0}")]
     WebSocketError(String),
@@ -75,7 +85,7 @@ pub enum WebError {
 
     /// Storage 层错误（如 NFS 查询失败）
     #[error("Storage error: {0}")]
-    StorageError(#[from] data_mover::error::StorageError),
+    StorageError(#[from] StorageError),
 
     /// 请求体 JSON 反序列化失败
     #[error("Invalid request body: {0}")]
@@ -109,7 +119,9 @@ impl IntoResponse for WebError {
 
             WebError::EndpointInUseByRunningTask(_) | WebError::DuplicateName { .. } => StatusCode::CONFLICT,
 
-            WebError::ConnectionTestFailed(_) => StatusCode::BAD_GATEWAY,
+            WebError::ConnectionTestFailed(_)
+            | WebError::EndpointAppConnectionFailed(_)
+            | WebError::EndpointStorageConnectionFailed(_) => StatusCode::BAD_GATEWAY,
 
             _ => StatusCode::INTERNAL_SERVER_ERROR,
         };

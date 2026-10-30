@@ -13,12 +13,12 @@ pub mod broadcast;
 
 /// 双进程模式 Receiver 落盘任务模块
 ///
-/// 串行消费 `DiskCommitMsg`，用 data-mover 3 段流式 API 写入 `.part`，
-/// 提交时读回 hash 校验后原子 rename
+/// 串行消费 `DiskCommitMsg`，通过 expert destination 流式写入受控 stage，
+/// 提交时由引擎读回校验并发布
 pub mod disk_commit;
 mod file_commit;
 mod file_copy;
-mod storage_factory;
+pub mod storage_factory;
 
 /// 字节级断点续传状态模块
 ///
@@ -35,10 +35,13 @@ pub mod config;
 /// 负责管理不同类型的消费者，如存储条目消费者和统计消费者
 pub mod consumer;
 
+pub mod local_transfer;
+pub mod observation_scan;
 /// Sync 编排器模块
 ///
 /// SyncOrchestrator 封装 sync/incremental_sync 的核心逻辑
 pub mod orchestrator;
+pub mod scan_resume;
 
 /// 双进程远端同步（Sender 侧）
 ///
@@ -50,6 +53,12 @@ pub mod remote_sync;
 /// 封装一次已协商会话的生命周期；当前版本保留既有事件循环作为内部实现，
 /// 后续重构可在不扩大调用方 interface 的前提下逐步迁移会话状态。
 pub mod remote_receiver_session;
+
+/// 双进程 remote advertisement：opaque snapshot paging 与 session-local NDX。
+pub mod remote_advertisement;
+
+/// 双进程 expert transfer：NDX 协商、恢复偏移、流式 payload 与唯一完成证据。
+pub mod remote_expert_transfer;
 
 /// Receiver 侧逻辑
 ///
@@ -96,7 +105,7 @@ pub mod tar_pack;
 /// 简化应用开发过程中的导入语句
 pub mod prelude {
     /// `QoS` 带宽解析函数
-    pub use data_mover::qos::parse_bandwidth_string;
+    pub use storage_adapter::qos::parse_bandwidth_string;
 
     /// Windows ACL相关功能（仅Windows平台可用）
     #[cfg(windows)]

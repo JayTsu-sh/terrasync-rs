@@ -15,8 +15,8 @@ use std::time::{Duration, SystemTime};
 // 外部crate
 use async_trait::async_trait;
 use bytes::Bytes;
-use data_mover::{ChangeKind, EntryEnum, NASEntry, S3Entry, StorageEntryMessage};
 use serde::{Deserialize, Serialize};
+use storage_adapter::{ChangeKind, EntryEnum, NASEntry, S3Entry, StorageEntryMessage};
 use tokio::sync::mpsc;
 use tracing::{trace, warn};
 
@@ -151,7 +151,7 @@ impl StorageEntryRecord {
         let tags = self
             .tags
             .as_ref()
-            .and_then(|tags_str| serde_json::from_str::<Vec<data_mover::Tag>>(tags_str).ok());
+            .and_then(|tags_str| serde_json::from_str::<Vec<storage_adapter::Tag>>(tags_str).ok());
 
         if self.storage_type == "s3" {
             EntryEnum::S3(S3Entry {
@@ -181,7 +181,7 @@ impl StorageEntryRecord {
                 atime: self.atime,
                 ctime: self.ctime,
                 mtime: self.mtime,
-                mode: self.mode.unwrap_or(0),
+                mode: self.mode,
                 is_symlink: self.is_symlink,
                 hard_links: Some(self.hard_links),
                 file_handle,
@@ -581,6 +581,11 @@ pub trait Database: Send + Sync {
 
     /// 提交本轮 begin 得到的 working generation
     async fn commit_scan_generation(&self) -> Result<()>;
+
+    /// 新扫描必须使同一 job 的旧游标失效。
+    async fn abandon_scan_resume(&self) -> Result<()> {
+        Ok(())
+    }
 
     /// 查询在最新扫描中新增的文件
     /// 即在临时表中存在但在主表中不存在的文件

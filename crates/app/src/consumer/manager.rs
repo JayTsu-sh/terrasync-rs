@@ -15,7 +15,7 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 
 // 外部crate
-use data_mover::{ErrorEvent, StorageEntryMessage};
+use storage_adapter::{ErrorEvent, StorageEntryMessage};
 use tokio::sync::Mutex;
 use tracing::{Instrument, debug, error, info_span, warn};
 

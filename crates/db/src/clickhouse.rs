@@ -3,6 +3,7 @@
 //! 提供与ClickHouse数据库交互的所有操作功能，包括表的创建、查询、插入和删除等。
 
 // 标准库
+use data_mover::model::BackendIdentity;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock, Weak};
@@ -10,9 +11,10 @@ use std::sync::{Arc, Mutex as StdMutex, OnceLock, Weak};
 // 外部crate
 use async_trait::async_trait;
 use clickhouse::Client;
-use data_mover::{ChangeKind, EntryEnum, StorageEntryMessage};
+use data_mover::model::ObservedEntry;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use storage_adapter::{ChangeKind, EntryEnum, StorageEntryMessage};
 use tokio::sync::{Mutex, mpsc};
 use tracing::{debug, info, trace, warn};
 
@@ -23,6 +25,7 @@ use crate::common::{
 };
 use crate::config::ClickHouseConfig;
 use crate::error::{DatabaseError, Result};
+use crate::observation_record::{OBSERVATION_IDENTITY_JOIN_CLAUSE, ObservedEntryRecord};
 use crate::traits::{Database, IncrementalStorageEntryRecord, QueryResult, StorageEntryRecord, TarManifestRecord};
 use crate::{
     INCREMENTAL_SCAN_TABLE_BASE_NAME, SCAN_BASE_TABLE_BASE_NAME, SCAN_STATE_TABLE_BASE_NAME,
@@ -31,6 +34,8 @@ use crate::{
     get_tar_manifest_table_name,
 };
 use utils::sanitize_job_id;
+
+pub mod scan_resume;
 
 /// `ClickHouse`数据库实现
 ///
@@ -46,7 +51,7 @@ pub struct ClickHouseDatabase {
     pub scan_temp_table_name: Option<String>,
     /// 缓存的 `scan_state` 值（255 = 未缓存），避免每次 `batch_insert` 都查询数据库
     cached_scan_state: AtomicU8,
-    /// 同一 ClickHouse 身份与 job 共享的 scan generation 生命周期
+    /// 同一 `ClickHouse` 身份与 job 共享的 scan generation 生命周期
     generation_lifecycle: Arc<Mutex<ScanGenerationLifecycle>>,
 }
 
@@ -54,6 +59,7 @@ pub struct ClickHouseDatabase {
 struct ScanGenerationLifecycle {
     working: Option<u8>,
     committed: bool,
+    observation_publication_ambiguous: bool,
 }
 
 #[derive(Clone, Eq, Hash, PartialEq)]
@@ -95,27 +101,34 @@ macro_rules! file_scan_base_columns {
     // 内部宏，包含基础列定义
     (@base) => {
         r"
-    name String,
+    name String DEFAULT '',
     relative_path String,
     size UInt64,
-    ext Nullable(String),
-    ctime DateTime64(9),
-    mtime DateTime64(9),
-    atime DateTime64(9),
-    mode Nullable(UInt32),
-    storage_type String,
-    is_symlink Bool,
-    is_dir Bool,
-    is_regular_file Bool,
-    hard_links UInt32,
+    ext Nullable(String) DEFAULT NULL,
+    ctime DateTime64(9) DEFAULT 0,
+    mtime DateTime64(9) DEFAULT 0,
+    atime DateTime64(9) DEFAULT 0,
+    mode Nullable(UInt32) DEFAULT NULL,
+    storage_type String DEFAULT '',
+    is_symlink Bool DEFAULT 0,
+    is_dir Bool DEFAULT 0,
+    is_regular_file Bool DEFAULT 0,
+    hard_links UInt32 DEFAULT 0,
     current_state UInt8,
-    uid Nullable(UInt32),
-    gid Nullable(UInt32),
-    ino Nullable(UInt64),
-    file_handle Nullable(String),
-    version_id String,
-    tags Nullable(String),
-    version_count Nullable(UInt32),
+    uid Nullable(UInt32) DEFAULT NULL,
+    gid Nullable(UInt32) DEFAULT NULL,
+    ino Nullable(UInt64) DEFAULT NULL,
+    file_handle Nullable(String) DEFAULT NULL,
+    version_id String DEFAULT '',
+    tags Nullable(String) DEFAULT NULL,
+    version_count Nullable(UInt32) DEFAULT NULL,
+    identity_key String DEFAULT '',
+    backend_kind String DEFAULT '',
+    entry_kind String DEFAULT '',
+    size_observed Bool DEFAULT 0,
+    modified_unix_nanos Nullable(Int128) DEFAULT NULL,
+    entry_snapshot Array(UInt8) DEFAULT [],
+    INDEX identity_key_idx identity_key TYPE bloom_filter GRANULARITY 1
 "
     };
 
@@ -134,7 +147,7 @@ macro_rules! file_scan_base_columns {
 ///
 /// 定义了存储文件扫描结果的表结构，包含文件路径、大小、扩展名、时间戳、权限等信息。
 /// 所有相关表（主表和临时表）都使用此结构定义。
-const FILE_SCAN_COLUMNS_DEFINITION: &str = file_scan_base_columns!();
+pub(crate) const FILE_SCAN_COLUMNS_DEFINITION: &str = file_scan_base_columns!();
 
 /// 文件增量扫描记录的标准列定义
 ///
@@ -145,7 +158,7 @@ const FILE_INCREMENTAL_SCAN_COLUMNS_DEFINITION: &str = file_scan_base_columns!(
     operation_type String,
 "#,
     r#"
-    create_at DateTime64(9),
+    ,create_at DateTime64(9),
     comment Nullable(String),
 "#
 );
@@ -157,7 +170,7 @@ struct ExcludeRecord {
     version_id: String,
 }
 
-/// JOIN 策略：path-based 或 file_handle-based
+/// JOIN/// JOIN 策略：path-based 或 file_handle-based
 ///
 /// 决定增量扫描对比查询使用 `relative_path+version_id` 还是 `file_handle` 作为 JOIN 键。
 /// 当两表的 `file_handle` 全为 NULL 时使用 Path 模式，否则使用 `FileHandle` 模式。
@@ -171,12 +184,12 @@ enum JoinStrategy {
 impl JoinStrategy {
     /// 根据临时表和主表的 `file_handle` 统计信息决定 JOIN 策略
     ///
-    /// 策略只取决于「是否存在 file_handle」，与表是否为空无关：
+    /// 策略只取决于「是否存在 `file_handle`」，与表是否为空无关：
     /// 两侧都无 `file_handle`（local/S3）→ 必须用 Path（`relative_path+version_id`）；
-    /// 任一侧有 `file_handle`（NFS/CIFS）→ 用 FileHandle。
+    /// 任一侧有 `file_handle`（NFS/CIFS）→ 用 `FileHandle`。
     ///
     /// 注意：不得用 `base_total > 0` 之类的「表非空」作为前置条件——全量拷贝中断后
-    /// 续传时 base 为空，但 local/S3 文件无 `file_handle`，若误入 FileHandle 分支，
+    /// 续传时 base 为空，但 local/S3 文件无 `file_handle`，若误入 `FileHandle` 分支，
     /// `NULL NOT IN (...)` 会求值为 NULL 导致新增文件漏判、被静默并入 base 而不拷贝。
     fn from_file_handle_status(temp_non_null: usize, base_non_null: usize) -> Self {
         if temp_non_null == 0 && base_non_null == 0 {
@@ -326,6 +339,213 @@ impl ClickHouseDatabase {
         }
     }
 
+    /// 将 data-mover observation    /// 将 data-mover observation projection 写入当前 job 的同一张 base 大表。
+    ///
+    /// # Errors
+    /// `ClickHouse` 拒绝 schema 或写入时返回数据库错误。
+    pub async fn batch_insert_observations(&self, records: &[ObservedEntryRecord]) -> Result<()> {
+        self.insert_observations(&get_scan_base_table_name(&self.job_id), records)
+            .await
+    }
+
+    /// 将 observation projection 写入当前扫描临时表。
+    ///
+    /// # Errors
+    /// 尚未创建临时表或 `ClickHouse` 拒绝写入时返回数据库错误。
+    pub async fn batch_insert_temp_observations(&self, records: &[ObservedEntryRecord]) -> Result<()> {
+        let table_name = self
+            .scan_temp_table_name
+            .as_ref()
+            .ok_or_else(|| DatabaseError::TableNotFound("scan temporary table".to_string()))?;
+        self.insert_observations(table_name, records).await
+    }
+
+    async fn insert_observations(&self, table_name: &str, records: &[ObservedEntryRecord]) -> Result<()> {
+        if records.is_empty() {
+            return Ok(());
+        }
+        let mut insert = self
+            .async_client
+            .insert::<ObservedEntryRecord>(table_name)
+            .await
+            .map_err(DatabaseError::ClickHouseError)?;
+        for record in records {
+            insert.write(record).await.map_err(DatabaseError::ClickHouseError)?;
+        }
+        insert.end().await.map_err(DatabaseError::ClickHouseError)
+    }
+
+    /// 用中立 identity key JOIN 临时观察与基线，返回查询投影发生变化的观察。
+    ///
+    /// # Errors
+    /// 临时表不存在、查询失败、snapshot 异常或投影不一致时返回 typed error。
+    pub async fn detect_changed_observations(&self, backend: &BackendIdentity) -> Result<Vec<ObservedEntry>> {
+        let temp = self
+            .scan_temp_table_name
+            .as_ref()
+            .ok_or_else(|| DatabaseError::TableNotFound("scan temporary table".to_string()))?;
+        let base = get_scan_base_table_name(&self.job_id);
+        let columns = "t.identity_key, t.relative_path, t.backend_kind, t.entry_kind, t.size, \
+                       t.size_observed, t.modified_unix_nanos, t.current_state, t.entry_snapshot";
+        let query = format!(
+            "SELECT {columns} FROM {temp} t INNER JOIN {base} b ON {OBSERVATION_IDENTITY_JOIN_CLAUSE} \
+             WHERE (t.relative_path != b.relative_path OR t.entry_kind != b.entry_kind \
+                OR t.size != b.size OR t.size_observed != b.size_observed \
+                OR NOT isNotDistinctFrom(t.modified_unix_nanos, b.modified_unix_nanos)) \
+             ORDER BY t.identity_key"
+        );
+        self.sync_client
+            .query(&query)
+            .fetch_all::<ObservedEntryRecord>()
+            .await
+            .map_err(DatabaseError::ClickHouseError)?
+            .into_iter()
+            .map(|record| record.reconstruct(backend))
+            .collect()
+    }
+
+    /// 创建与 base 表结构完全一致的 observation snapshot staging 表。
+    ///
+    /// # Errors
+    /// base 表不存在或 `ClickHouse` 拒绝建表时返回数据库错误。
+    pub async fn begin_observation_snapshot(&mut self) -> Result<u8> {
+        if self.generation_lifecycle.lock().await.observation_publication_ambiguous {
+            return Err(DatabaseError::TransactionError(
+                "cannot begin observation snapshot while a previous EXCHANGE outcome is ambiguous".to_string(),
+            ));
+        }
+        if self.scan_temp_table_name.is_some() {
+            self.drop_scan_temporary_table().await?;
+        }
+        let generation = Database::begin_scan_generation(self).await?;
+        let temp = generate_scan_temp_table_name();
+        let base = get_scan_base_table_name(&self.job_id);
+        if let Err(error) = self.execute(&format!("CREATE TABLE {temp} AS {base}"), &[]).await {
+            *self.generation_lifecycle.lock().await = ScanGenerationLifecycle::default();
+            return Err(error);
+        }
+        self.scan_temp_table_name = Some(temp);
+        Ok(generation)
+    }
+
+    /// 原子交换完整 observation snapshot，并返回消失 identity 的数量。
+    ///
+    /// # Errors
+    /// staging 不存在、计数、交换或旧 snapshot 清理失败时返回数据库错误。
+    pub async fn publish_observation_snapshot(&mut self) -> Result<u64> {
+        let temp = self
+            .scan_temp_table_name
+            .clone()
+            .ok_or_else(|| DatabaseError::TableNotFound("observation snapshot staging".to_string()))?;
+        let base = get_scan_base_table_name(&self.job_id);
+        let deleted = match self
+            .sync_client
+            .query(&format!(
+                "SELECT count() FROM {base} WHERE identity_key != '' AND identity_key NOT IN \
+                 (SELECT identity_key FROM {temp})"
+            ))
+            .fetch_one::<u64>()
+            .await
+            .map_err(DatabaseError::ClickHouseError)
+        {
+            Ok(deleted) => deleted,
+            Err(error) => {
+                if let Err(abort) = self.abort_observation_snapshot().await {
+                    return Err(DatabaseError::ObservationAbortFailed {
+                        source: Box::new(error),
+                        abort: Box::new(abort),
+                    });
+                }
+                return Err(error);
+            }
+        };
+        if let Err(error) = self.execute(&format!("EXCHANGE TABLES {base} AND {temp}"), &[]).await {
+            self.generation_lifecycle.lock().await.observation_publication_ambiguous = true;
+            return Err(DatabaseError::ObservationExchangeAmbiguous {
+                source: Box::new(error),
+            });
+        }
+        if let Err(commit_error) = Database::commit_scan_generation(self).await {
+            let Some(working) = self.generation_lifecycle.lock().await.working else {
+                return Err(DatabaseError::ObservationGenerationLost {
+                    source: Box::new(commit_error),
+                });
+            };
+            match self.query_scan_state().await {
+                Ok(Some(persisted)) if persisted == working => {
+                    self.cached_scan_state.store(working, Ordering::Relaxed);
+                    self.generation_lifecycle.lock().await.committed = true;
+                    warn!("Recovered an ambiguous generation commit from persisted state: {commit_error}");
+                }
+                Ok(Some(_)) => {
+                    if let Err(rollback_error) = self.execute(&format!("EXCHANGE TABLES {base} AND {temp}"), &[]).await
+                    {
+                        self.generation_lifecycle.lock().await.observation_publication_ambiguous = true;
+                        return Err(DatabaseError::ObservationRollbackFailed {
+                            commit: Box::new(commit_error),
+                            rollback: Box::new(rollback_error),
+                        });
+                    }
+                    *self.generation_lifecycle.lock().await = ScanGenerationLifecycle::default();
+                    if let Err(error) = self.drop_scan_temporary_table().await {
+                        warn!("Rolled back observation publication but deferred staging cleanup for {temp}: {error}");
+                    }
+                    return Err(commit_error);
+                }
+                result @ (Ok(None) | Err(_)) => {
+                    self.generation_lifecycle.lock().await.observation_publication_ambiguous = true;
+                    return Err(DatabaseError::ObservationCommitAmbiguous {
+                        commit: Box::new(commit_error),
+                        verification: result.err().map(Box::new),
+                    });
+                }
+            }
+        }
+        if let Err(error) = self.execute(&format!("DROP TABLE {temp}"), &[]).await {
+            warn!("Committed observation snapshot but deferred retired table cleanup for {temp}: {error}");
+        } else {
+            self.scan_temp_table_name = None;
+        }
+        Ok(deleted)
+    }
+
+    /// 丢弃未完成的 observation snapshot staging。
+    ///
+    /// # Errors
+    /// `ClickHouse` 拒绝清理时返回数据库错误。
+    pub async fn abort_observation_snapshot(&mut self) -> Result<()> {
+        if self.generation_lifecycle.lock().await.observation_publication_ambiguous {
+            return Err(DatabaseError::TransactionError(
+                "refusing to delete observation rollback table while EXCHANGE outcome is ambiguous".to_string(),
+            ));
+        }
+        *self.generation_lifecycle.lock().await = ScanGenerationLifecycle::default();
+        Database::drop_scan_temporary_table(self).await
+    }
+
+    /// 按持久 identity key 读取并仅通过 opaque codec 重建 observation。
+    ///
+    /// # Errors
+    /// 查询失败、snapshot 异常或查询投影不一致时返回 typed error。
+    pub async fn load_observation(
+        &self, identity_key: &str, backend: &BackendIdentity,
+    ) -> Result<Option<ObservedEntry>> {
+        let table_name = get_scan_base_table_name(&self.job_id);
+        let query = format!(
+            "SELECT identity_key, relative_path, backend_kind, entry_kind, size, size_observed, \
+             modified_unix_nanos, current_state, entry_snapshot FROM {table_name} \
+             WHERE identity_key = ? LIMIT 1"
+        );
+        let record = self
+            .sync_client
+            .query(&query)
+            .bind(identity_key)
+            .fetch_optional::<ObservedEntryRecord>()
+            .await
+            .map_err(DatabaseError::ClickHouseError)?;
+        record.map(|value| value.reconstruct(backend)).transpose()
+    }
+
     /// 执行SQL语句，支持参数化查询
     ///
     /// 注意：由于ClickHouse execute API的限制，当前无法获取受影响的行数
@@ -360,7 +580,7 @@ impl ClickHouseDatabase {
     pub async fn create_scan_base_table(&self) -> Result<()> {
         let table_name = get_scan_base_table_name(&self.job_id);
         let create_table_sql = format!(
-            "CREATE TABLE IF NOT EXISTS {table_name} ({FILE_SCAN_COLUMNS_DEFINITION}) ENGINE = ReplacingMergeTree() ORDER BY (relative_path, version_id) SETTINGS allow_nullable_key = 1"
+            "CREATE TABLE IF NOT EXISTS {table_name} ({FILE_SCAN_COLUMNS_DEFINITION}) ENGINE = ReplacingMergeTree() ORDER BY (relative_path, version_id, identity_key) SETTINGS allow_nullable_key = 1"
         );
 
         info!("Creating ClickHouse scan base table: {}", table_name);
@@ -564,8 +784,8 @@ impl ClickHouseDatabase {
     async fn check_file_handle_status(&self, temp_table_name: &str, base_table_name: &str) -> Result<(usize, usize)> {
         let query = format!(
             "SELECT t.non_null, b.non_null \
-             FROM (SELECT count(file_handle) AS non_null FROM {temp_table_name}) t \
-             CROSS JOIN (SELECT count(file_handle) AS non_null FROM {base_table_name}) b"
+             FROM (SELECT if(countIf(file_handle IS NOT NULL AND NOT startsWith(file_handle, '54534934')) = 0, count(file_handle), 0) AS non_null FROM {temp_table_name}) t \
+             CROSS JOIN (SELECT if(countIf(file_handle IS NOT NULL AND NOT startsWith(file_handle, '54534934')) = 0, count(file_handle), 0) AS non_null FROM {base_table_name}) b"
         );
 
         debug!(
@@ -581,8 +801,12 @@ impl ClickHouseDatabase {
             }
         };
 
-        let temp_non_null = tn as usize;
-        let base_non_null = bn as usize;
+        // 旧驱动句柄与新的中立 identity key 不可混用；升级过渡代按路径比较。
+        let (temp_non_null, base_non_null) = if tn == 0 || bn == 0 {
+            (0, 0)
+        } else {
+            (tn as usize, bn as usize)
+        };
 
         trace!(
             "file_handle status - temp non_null={}, base non_null={}",
@@ -761,7 +985,7 @@ impl Database for ClickHouseDatabase {
     async fn create_scan_temporary_table(&mut self) -> Result<()> {
         let temp_table_name = generate_scan_temp_table_name();
         let create_table_sql = format!(
-            "CREATE TABLE IF NOT EXISTS {temp_table_name} ({FILE_SCAN_COLUMNS_DEFINITION}) ENGINE = MergeTree() ORDER BY (relative_path, version_id) SETTINGS allow_nullable_key = 1"
+            "CREATE TABLE IF NOT EXISTS {temp_table_name} ({FILE_SCAN_COLUMNS_DEFINITION}) ENGINE = MergeTree() ORDER BY (relative_path, version_id, identity_key) SETTINGS allow_nullable_key = 1"
         );
 
         debug!("Creating ClickHouse scan temporary table: {}", temp_table_name);
@@ -777,6 +1001,11 @@ impl Database for ClickHouseDatabase {
 
     /// 删除扫描临时表并清空 `scan_temp_table_name`
     async fn drop_scan_temporary_table(&mut self) -> Result<()> {
+        if self.generation_lifecycle.lock().await.observation_publication_ambiguous {
+            return Err(DatabaseError::TransactionError(
+                "refusing to drop scan temporary table while EXCHANGE outcome is ambiguous".to_string(),
+            ));
+        }
         if let Some(temp_table_name) = &self.scan_temp_table_name {
             let drop_table_sql = format!("DROP TABLE IF EXISTS {temp_table_name}");
 
@@ -846,7 +1075,13 @@ impl Database for ClickHouseDatabase {
     }
 
     async fn begin_scan_generation(&self) -> Result<u8> {
+        self.invalidate_resume_state().await?;
         let mut lifecycle = self.generation_lifecycle.lock().await;
+        if lifecycle.observation_publication_ambiguous {
+            return Err(DatabaseError::TransactionError(
+                "cannot begin scan generation while observation EXCHANGE outcome is ambiguous".to_string(),
+            ));
+        }
         *lifecycle = ScanGenerationLifecycle::default();
         let committed = self.query_scan_state().await?.ok_or_else(|| {
             DatabaseError::TransactionError("Cannot begin scan generation before initialization".to_string())
@@ -874,6 +1109,10 @@ impl Database for ClickHouseDatabase {
         self.cached_scan_state.store(working, Ordering::Relaxed);
         lifecycle.committed = true;
         Ok(())
+    }
+
+    async fn abandon_scan_resume(&self) -> Result<()> {
+        self.invalidate_resume_state().await
     }
 
     /// 将临时表记录合并到主表（INSERT INTO SELECT），可排除指定路径
@@ -1173,6 +1412,7 @@ impl Database for ClickHouseDatabase {
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
+    use storage_adapter::{NASEntry, S3Entry};
 
     use super::*;
     use crate::common::DeletionStatus;
@@ -1209,7 +1449,7 @@ mod tests {
 
     #[test]
     fn test_nas_entry_roundtrip() {
-        let nas = data_mover::EntryEnum::NAS(data_mover::NASEntry {
+        let nas = EntryEnum::NAS(NASEntry {
             name: "test.txt".to_string(),
             relative_path: PathBuf::from("dir/test.txt"),
             extension: Some("txt".to_string()),
@@ -1218,7 +1458,7 @@ mod tests {
             atime: 100,
             ctime: 200,
             mtime: 300,
-            mode: 0o755,
+            mode: Some(0o755),
             is_symlink: false,
             hard_links: Some(2),
             uid: Some(1000),
@@ -1246,7 +1486,7 @@ mod tests {
 
     #[test]
     fn test_s3_entry_roundtrip() {
-        let s3 = data_mover::EntryEnum::S3(data_mover::S3Entry {
+        let s3 = EntryEnum::S3(S3Entry {
             name: "obj.json".to_string(),
             relative_path: "bucket/obj.json".to_string(),
             extension: Some("json".to_string()),
@@ -1271,7 +1511,7 @@ mod tests {
 
     #[test]
     fn test_nas_entry_optional_fields_none() {
-        let nas = data_mover::EntryEnum::NAS(data_mover::NASEntry {
+        let nas = EntryEnum::NAS(NASEntry {
             name: "a.txt".to_string(),
             relative_path: PathBuf::from("a.txt"),
             extension: None,
@@ -1280,7 +1520,7 @@ mod tests {
             atime: 0,
             ctime: 0,
             mtime: 0,
-            mode: 0,
+            mode: None,
             is_symlink: false,
             hard_links: None,
             uid: None,
@@ -1295,14 +1535,16 @@ mod tests {
 
         let record = StorageEntryRecord::from_entry_enum(&nas, 0);
         assert_eq!(record.file_handle, None);
+        assert_eq!(record.mode, None);
 
         let back = record.to_entry_enum();
         assert_eq!(back.get_file_handle(), None);
+        assert_eq!(back.get_mode(), None);
     }
 
     #[test]
     fn test_current_state_propagation() {
-        let nas = data_mover::EntryEnum::NAS(data_mover::NASEntry {
+        let nas = EntryEnum::NAS(NASEntry {
             name: "a.txt".to_string(),
             relative_path: PathBuf::from("a.txt"),
             extension: None,
@@ -1311,7 +1553,7 @@ mod tests {
             atime: 0,
             ctime: 0,
             mtime: 0,
-            mode: 0o644,
+            mode: Some(0o644),
             is_symlink: false,
             hard_links: Some(1),
             uid: None,
@@ -1485,6 +1727,7 @@ mod tests {
         let (vc_join, vc_expr) = generate_version_count_join_sql!("base_y");
         let sql = JoinStrategy::FileHandle.build_detect_new_sql("temp_x", "base_y", &vc_join, &vc_expr);
         assert!(sql.contains("file_handle NOT IN"));
+        assert!(sql.contains("FROM base_y WHERE file_handle IS NOT NULL"));
         assert!(!sql.contains("FINAL"));
     }
 
@@ -1593,8 +1836,47 @@ mod tests {
         let (join_clause, select_expr) = generate_version_count_join_sql!("base_job1");
         assert!(join_clause.contains("base_job1"));
         assert!(join_clause.contains("LEFT JOIN"));
+        assert!(!join_clause.contains("row_kind"));
         assert!(join_clause.contains("GROUP BY relative_path"));
         assert!(select_expr.contains("CASE WHEN"));
         assert!(select_expr.contains("COALESCE"));
+    }
+
+    #[tokio::test]
+    async fn ambiguous_exchange_blocks_begin_and_destructive_abort() {
+        let config = ClickHouseConfig {
+            dsn: "http://127.0.0.1:1".to_string(),
+            dial_timeout: 1,
+            read_timeout: 1,
+            database: "default".to_string(),
+            username: "default".to_string(),
+            password: None,
+        };
+        let mut database = ClickHouseDatabase::new(&config, "ambiguous_exchange");
+        let mut second_handle = ClickHouseDatabase::new(&config, "ambiguous_exchange");
+        database.scan_temp_table_name = Some("rollback_table".to_string());
+        database
+            .generation_lifecycle
+            .lock()
+            .await
+            .observation_publication_ambiguous = true;
+
+        assert!(matches!(
+            database.begin_observation_snapshot().await,
+            Err(DatabaseError::TransactionError(_))
+        ));
+        assert!(matches!(
+            database.abort_observation_snapshot().await,
+            Err(DatabaseError::TransactionError(_))
+        ));
+        assert_eq!(database.scan_temp_table_name.as_deref(), Some("rollback_table"));
+        assert!(matches!(
+            second_handle.begin_observation_snapshot().await,
+            Err(DatabaseError::TransactionError(_))
+        ));
+        assert!(matches!(
+            Database::drop_scan_temporary_table(&mut second_handle).await,
+            Err(DatabaseError::TransactionError(_))
+        ));
     }
 }

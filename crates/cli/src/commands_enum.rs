@@ -208,6 +208,11 @@ pub enum Commands {
         #[arg(short, long)]
         id: Option<String>,
 
+        /// 启用检查点，并使用同一 --id 恢复中断的扫描。
+        /// 需要 ClickHouse；首次及恢复调用均须传入该参数。
+        #[arg(long, requires = "id")]
+        resume: bool,
+
         /// Scan depth level (0 for infinite).
         /// Also configurable in config file under [scan] depth
         #[arg(short, long, default_value = "0")]

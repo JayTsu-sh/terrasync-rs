@@ -7,8 +7,8 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use data_mover::dir_tree::DirPageResult;
-use data_mover::{DataChunk, EntryEnum, StorageEnum};
+use storage_adapter::dir_tree::DirPageResult;
+use storage_adapter::{DataChunk, EntryEnum, StorageEnum};
 use tokio::sync::mpsc::{Receiver, Sender};
 use tracing::{debug, info, warn};
 use transport::flow_control::{ReceiverCreditState, payload_credit_cost};
@@ -89,7 +89,7 @@ pub(crate) struct RemoteSessionState {
 }
 
 impl RemoteSessionState {
-    pub(crate) fn ingest_page(&mut self, page: &data_mover::dir_tree::DirPageResult) {
+    pub(crate) fn ingest_page(&mut self, page: &DirPageResult) {
         self.ndx_table.ingest_page(page);
     }
 
@@ -634,10 +634,10 @@ mod tests {
 
     use async_trait::async_trait;
     use bytes::Bytes;
-    use data_mover::dir_tree::{DirPageResult, NdxEntry, NdxEvent};
-    use data_mover::{DataChunk, NASEntry};
+    use storage_adapter::dir_tree::{DirPageResult, NdxEntry, NdxEvent};
+    use storage_adapter::{DataChunk, NASEntry};
 
-    use crate::storage_factory::create_storage;
+    use crate::storage_factory::{StorageRole, create_storage_for_role};
     use tempfile::tempdir;
     use tokio::sync::{Mutex as TokioMutex, mpsc};
     use transport::error::Result as TransportResult;
@@ -646,6 +646,15 @@ mod tests {
     use transport::traits::{ReceiverTransport, SenderTransport};
 
     use super::*;
+
+    async fn create_storage(path: &str, block_size: Option<u64>, ensure_dir: bool) -> Result<StorageEnum> {
+        let role = if ensure_dir {
+            StorageRole::Destination
+        } else {
+            StorageRole::Source
+        };
+        create_storage_for_role(path, block_size, ensure_dir, role).await
+    }
 
     struct RecordingReceiverTransport {
         incoming: TokioMutex<mpsc::Receiver<SenderMsg>>,
@@ -769,7 +778,7 @@ mod tests {
             atime: 0,
             ctime: 0,
             mtime: 0,
-            mode: if is_dir { 0o755 } else { 0o644 },
+            mode: Some(if is_dir { 0o755 } else { 0o644 }),
             is_symlink: false,
             hard_links: None,
             uid: None,

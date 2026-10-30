@@ -11,6 +11,7 @@ pub enum StorageEnum {
     Nfs(NfsStorage),        // v3 和 v4 共用，协议通过 URL 区分
     S3(S3Storage),
     Cifs(CifsStorage),
+    Hdfs(HdfsStorage),
 }
 ```
 
@@ -72,6 +73,17 @@ smb://terrasync:terrasync123@192.168.50.173/testshare/test-data   # 源端
 smb://terrasync:terrasync123@192.168.50.23/testshare/test-data    # 目标端
 ```
 
+### HDFS
+```
+hdfs://[user-info@]nameservice/path
+```
+
+HDFS 客户端配置按角色位于 `storage.source.hdfs` 和
+`storage.destination.hdfs`，可配置 `config_dir`、Hadoop override，以及
+Kerberos `principal` 与 `keytab`/`cache`。单进程按源/目标分别取值；
+双进程发送端只需 source，接收端只需 destination。凭据不得写入
+日志或提交到仓库。
+
 ## 测试环境配置（Single Source of Truth）
 
 共享实验室的非敏感拓扑和默认值定义在 `tests/lab/common.sh`，凭据由
@@ -92,6 +104,10 @@ self-hosted GitHub Actions runner 的服务环境注入，禁止提交到仓库�
 | `CIFS_SOURCE_HOST` / `CIFS_DEST_HOST` | Samba 服务器 |
 | `CIFS_SOURCE_SHARE` / `CIFS_DEST_SHARE` / `CIFS_USER` / `CIFS_PASS` | Samba 凭据；源和目标 share name 可不同 |
 | `CLICKHOUSE_HOST` | ClickHouse 连接地址 |
+| `LAB_HDFS_LOCATION` | HDFS HA URL |
+| `LAB_HDFS_ADMIN_USER` | 真实门禁使用的 Kerberos principal |
+| `LAB_HDFS_CONFIG_DIR` | `core-site.xml`/`hdfs-site.xml` 目录 |
+| `LAB_HDFS_KEYTAB` | runner 上预置的 keytab（禁止提交） |
 | `TERRASYNC_BINARY` / `TERRASYNC_CONFIG` | 二进制和配置文件路径 |
 
 ## data-mover 依赖说明

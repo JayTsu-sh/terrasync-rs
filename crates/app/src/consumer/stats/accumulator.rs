@@ -5,8 +5,8 @@ use std::path::Path;
 use std::time::{Instant, SystemTime};
 
 // 外部crate
-use data_mover::{ErrorEvent, StorageEntryMessage};
 use serde::{Deserialize, Serialize};
+use storage_adapter::{ErrorEvent, StorageEntryMessage};
 use tracing::trace;
 
 // 内部模块
@@ -217,7 +217,7 @@ impl FullStats {
     }
 
     /// 根据 entry 类型更新对应维度的统计
-    pub fn update(&mut self, entry: &data_mover::EntryEnum) {
+    pub fn update(&mut self, entry: &storage_adapter::EntryEnum) {
         let size = entry.get_size() as i64;
         let name_len = entry.get_name().len();
 
@@ -431,7 +431,7 @@ impl DeltaCounts {
         self.dir_size + self.regular_file_size + self.symlink_size
     }
 
-    pub fn add(&mut self, entry: &data_mover::EntryEnum) {
+    pub fn add(&mut self, entry: &storage_adapter::EntryEnum) {
         let size = entry.get_size() as i64;
         if entry.get_is_dir() {
             self.dir_count += 1;

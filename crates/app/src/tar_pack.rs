@@ -2,11 +2,12 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
+use storage_adapter::WalkOptions;
 
 // 内部模块
-use data_mover::qos::QosManager;
-use data_mover::storage_enum::StorageEnum;
-use data_mover::{EntryEnum, NASEntry, S3Entry, StorageEntryMessage, WalkDirAsyncIterator, calculate_tar_size};
+use storage_adapter::qos::QosManager;
+use storage_adapter::storage_enum::StorageEnum;
+use storage_adapter::{EntryEnum, NASEntry, S3Entry, StorageEntryMessage, WalkDirAsyncIterator};
 // 外部crate
 use tracing::{debug, info};
 
@@ -32,26 +33,23 @@ pub async fn pack_directory(
 
     // ── 阶段 1：收集子条目 + 计算 tar 大小 ──
     let iterator = src_storage
-        .walkdir(Some(dir_entry.get_relative_path()), data_mover::WalkOptions::default())
+        .walkdir(Some(dir_entry.get_relative_path()), WalkOptions::default())
         .await?;
     let manifest_list = collect_entries(iterator).await;
 
     debug!("Collected {} entries for packing {:?}", manifest_list.len(), dir_path);
 
-    let tar_size = calculate_tar_size(&manifest_list);
-
     // 构造 .tar 文件路径
     let tar_relative_path = PathBuf::from(format!("{}.tar", dir_path.to_string_lossy()));
 
     // ── 阶段 2：流式打包写入 ──
-    StorageEnum::pack_files_to_tar(
+    let tar_size = StorageEnum::pack_files_to_tar(
         src_storage,
         dest_storage,
         &manifest_list,
         &tar_relative_path,
-        tar_size,
         dir_mtime,
-        data_mover::TarPackOptions { qos, bytes_counter },
+        storage_adapter::TarPackOptions { qos, bytes_counter },
     )
     .await?;
 
@@ -78,7 +76,7 @@ pub async fn pack_directory(
             atime: dir_mtime,
             ctime: dir_mtime,
             mtime: dir_mtime,
-            mode: dir_entry.get_mode().unwrap_or(0),
+            mode: dir_entry.get_mode(),
             is_symlink: false,
             hard_links: None,
             uid: dir_entry.get_uid(),

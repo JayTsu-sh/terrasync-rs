@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 use std::sync::LazyLock;
 
-use data_mover::EntryEnum;
+use storage_adapter::EntryEnum;
 use tracing::{error, trace};
 
 use crate::traits::StorageEntryRecord;

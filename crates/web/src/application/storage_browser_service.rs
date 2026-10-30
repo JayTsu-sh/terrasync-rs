@@ -1,6 +1,9 @@
+use data_mover::storage::{list_buckets, list_exports};
 use std::path::{Path, PathBuf};
+use storage_adapter::StorageError;
 
-use data_mover::{NFSStorage, S3BucketInfo, S3Storage, StorageEntryMessage, create_storage};
+use app::storage_factory::{StorageRole, create_storage_for_role};
+use storage_adapter::{S3BucketInfo, StorageEntryMessage};
 
 use crate::error::Result;
 
@@ -50,7 +53,7 @@ impl StorageBrowserService {
             _ => server.to_string(),
         };
 
-        let exports = NFSStorage::list_exports(&host).await?;
+        let exports = list_exports(&host).await.map_err(StorageError::from)?;
         Ok(exports
             .into_iter()
             .map(|e| NfsExportEntry {
@@ -66,12 +69,12 @@ impl StorageBrowserService {
     ) -> Result<Vec<S3BucketInfo>> {
         let scheme = if use_https { "s3+https" } else { "s3" };
         let url = format!("{scheme}://{access_key}:{secret_key}@{server}");
-        let buckets = S3Storage::list_buckets(&url).await?;
+        let buckets = list_buckets(&url).await.map_err(StorageError::from)?;
         Ok(buckets)
     }
 
     async fn list_remote_dirs(&self, url: &str, path: &str) -> Result<ListDirsResult> {
-        let storage = create_storage(url, data_mover::CreateStorageOptions::new(None, false)).await?;
+        let storage = create_storage_for_role(url, None, false, StorageRole::Source).await?;
         let path_str = if path.is_empty() {
             "/".to_string()
         } else {
@@ -89,7 +92,7 @@ impl StorageBrowserService {
         let iter = storage
             .walkdir(
                 sub_path,
-                data_mover::WalkOptions {
+                storage_adapter::WalkOptions {
                     depth: Some(1),
                     ..Default::default()
                 },

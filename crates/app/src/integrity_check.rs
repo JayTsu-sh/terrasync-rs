@@ -12,16 +12,21 @@
 //! S3 目标没有真实目录对象，因此目录 entry 跳过目标 metadata 查询；文件的
 //! POSIX 元数据跳过策略由 data-mover 统一处理。
 
+#[cfg(feature = "license")]
+use chrono::DateTime;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
+use storage_adapter::ErrorEvent;
+#[cfg(feature = "license")]
+use storage_adapter::storage_enum::{StorageType, detect_storage_type};
 
-use data_mover::error::StorageError;
-use data_mover::{
+use storage_adapter::error::StorageError;
+use storage_adapter::{
     EntryEnum, IntegrityCheck, IntegrityCheckMode, IntegrityCheckOptions, MismatchDataField, MismatchMetaField,
-    MtimePrecision, StorageEntryMessage, StorageEnum, create_storage, redact_storage_url,
+    MtimePrecision, StorageEntryMessage, StorageEnum, redact_storage_url,
 };
 use tracing::{Instrument, debug, error, info, info_span, instrument, warn};
 
@@ -31,6 +36,7 @@ use crate::consumer::ConsumerManager;
 use crate::dir_walker;
 use crate::error::{AppError, Result};
 use crate::scan::ScanType;
+use crate::storage_factory::{StorageRole, create_storage_for_role};
 
 // ─────────────────────────────────────────────────
 // Integrity Check 数据模型
@@ -79,11 +85,11 @@ pub struct IntegrityIssue {
 
 /// 判断 integrity-check 期间 dest 元数据查询失败是否为"目标确实不存在"。
 ///
-/// 仅当错误为 `FileNotFound` / `DirectoryNotFound` 时返回 true（对应 `NFS4ERR_NOENT`
-/// 在 data-mover 层重试耗尽后的转换结果）。其他错误（NFS 瞬时繁忙、连接断开等）
+/// 旧 `FileNotFound` / `DirectoryNotFound` 和角色原始错误中的 `NotFound` 均视为缺失。
+/// 其他错误（NFS 瞬时繁忙、连接断开等）
 /// 应归为 [`IssueKind::Error`]，避免误报为 `Missing`。
 fn is_truly_missing(err: &StorageError) -> bool {
-    matches!(err, StorageError::FileNotFound(_) | StorageError::DirectoryNotFound(_))
+    err.is_not_found()
 }
 
 // ─────────────────────────────────────────────────
@@ -261,7 +267,7 @@ impl CheckContext {
                     .await;
                     self.push_issue(issue);
                     None
-                } else if matches!(error, StorageError::Cancelled) {
+                } else if error.is_cancelled() {
                     Some("integrity check cancelled".to_string())
                 } else {
                     self.push_issue(build_lookup_issue(entry_type, relative_path, &error));
@@ -294,7 +300,7 @@ impl CheckContext {
         if let Some(reason) = error_reason {
             broadcaster
                 .broadcast(StorageEntryMessage::Error {
-                    event: data_mover::ErrorEvent::IntegrityCheck,
+                    event: ErrorEvent::IntegrityCheck,
                     path: relative_path,
                     entry: Some(entry),
                     reason,
@@ -417,16 +423,15 @@ pub async fn integrity_check(
         let span = info_span!("integrity_check_worker", worker_id = worker_id);
         let handle = tokio::spawn(
             async move {
-                let src_storage =
-                    match create_storage(&src_path, data_mover::CreateStorageOptions::new(None, false)).await {
-                        Ok(s) => Arc::new(s),
-                        Err(e) => {
-                            error!("Worker {}: Failed to create src storage: {}", worker_id, e);
-                            return;
-                        }
-                    };
+                let src_storage = match create_storage_for_role(&src_path, None, false, StorageRole::Source).await {
+                    Ok(s) => Arc::new(s),
+                    Err(e) => {
+                        error!("Worker {}: Failed to create src storage: {}", worker_id, e);
+                        return;
+                    }
+                };
                 let dest_storage =
-                    match create_storage(&dest_path, data_mover::CreateStorageOptions::new(None, false)).await {
+                    match create_storage_for_role(&dest_path, None, false, StorageRole::Destination).await {
                         Ok(s) => Arc::new(s),
                         Err(e) => {
                             error!("Worker {}: Failed to create dest storage: {}", worker_id, e);
@@ -458,7 +463,7 @@ pub async fn integrity_check(
                             );
                             broadcaster
                                 .broadcast(StorageEntryMessage::Error {
-                                    event: data_mover::ErrorEvent::IntegrityCheck,
+                                    event: ErrorEvent::IntegrityCheck,
                                     path,
                                     entry,
                                     reason,
@@ -536,9 +541,6 @@ pub async fn integrity_check(
 /// 仅对远程存储（NFS/S3/CIFS）启用，本地存储自动跳过。
 #[cfg(feature = "license")]
 pub(crate) async fn verify_storage_time(dest_path: &str) -> Result<()> {
-    use chrono::DateTime;
-    use data_mover::storage_enum::{StorageType, detect_storage_type};
-
     if matches!(detect_storage_type(dest_path), StorageType::Local) {
         return Ok(());
     }
@@ -553,7 +555,7 @@ pub(crate) async fn verify_storage_time(dest_path: &str) -> Result<()> {
         None => return Ok(()),
     };
 
-    let dest_storage = match create_storage(dest_path, None, false).await {
+    let dest_storage = match create_storage_for_role(dest_path, None, false, StorageRole::Destination).await {
         Ok(s) => s,
         Err(e) => {
             warn!("Storage time check: failed to create storage: {}", e);
@@ -591,6 +593,9 @@ pub(crate) async fn verify_storage_time(dest_path: &str) -> Result<()> {
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
+    use data_mover::model::{EntryOperationFailure, FailureClass, Operation, StoragePath, Transience};
+    use data_mover::storage::StorageRoleFailure;
+
     use super::*;
 
     #[test]
@@ -628,5 +633,19 @@ mod tests {
         assert!(is_truly_missing(&StorageError::FileNotFound("/tmp/x".into())));
         assert!(is_truly_missing(&StorageError::DirectoryNotFound("/tmp/x".into())));
         assert!(!is_truly_missing(&StorageError::OperationError("nfs busy".into())));
+        for (class, missing) in [(FailureClass::NotFound, true), (FailureClass::PermissionDenied, false)] {
+            let native = EntryOperationFailure::new(
+                StoragePath::new("file").unwrap(),
+                Operation::Observe,
+                class,
+                Transience::Permanent,
+                "native role failure",
+            )
+            .unwrap();
+            assert_eq!(
+                is_truly_missing(&StorageError::Role(StorageRoleFailure::Entry(native))),
+                missing
+            );
+        }
     }
 }

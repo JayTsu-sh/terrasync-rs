@@ -10,8 +10,8 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 // 外部 crate
 use dashmap::DashMap;
-use data_mover::qos::QosManager;
-use data_mover::{EntryEnum, StorageEntryMessage, StorageEnum};
+use storage_adapter::qos::QosManager;
+use storage_adapter::{EntryEnum, StorageEntryMessage, StorageEnum};
 use tracing::{error, info};
 use transport::message::SenderMsg;
 use transport::traits::SenderTransport;
@@ -35,7 +35,7 @@ pub struct SenderWorkerConfig {
 /// 双进程模式：读取源文件数据后发送 `FileData` 流（Phase 3）。
 #[allow(clippy::too_many_arguments)]
 pub async fn sender_worker(
-    worker_id: usize, walkdir_iter: data_mover::AsyncReceiver<StorageEntryMessage>, src_storage: Arc<StorageEnum>,
+    worker_id: usize, walkdir_iter: storage_adapter::AsyncReceiver<StorageEntryMessage>, src_storage: Arc<StorageEnum>,
     dest_storage: Arc<StorageEnum>, transport: Arc<dyn SenderTransport>,
     broadcaster: &BroadcastForwarder<StorageEntryMessage>, config: &SenderWorkerConfig,
     qos_manager: Option<QosManager>, bytes_tracker: Option<Arc<AtomicU64>>,
@@ -223,15 +223,20 @@ async fn handle_versioned_entry(
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
+    use crate::error::Result;
     use std::path::PathBuf;
 
-    use data_mover::{AsyncReceiver, ErrorEvent};
+    use storage_adapter::{AsyncReceiver, ErrorEvent};
 
-    use crate::storage_factory::create_storage;
+    use crate::storage_factory::{StorageRole, create_storage_for_role};
     use tempfile::tempdir;
     use transport::in_process::create_in_process_pair;
 
     use super::*;
+
+    async fn create_storage(path: &str, block_size: Option<u64>, _ensure_dir: bool) -> Result<StorageEnum> {
+        create_storage_for_role(path, block_size, false, StorageRole::Source).await
+    }
 
     /// 全量模式 walkdir 扫描错误应与增量分支（`orchestrator.rs` 的 scan worker）对齐：
     /// 广播给 `broadcaster` 订阅者，计入 `ErrorStats.scan`、进 ERROR STATISTICS 报表

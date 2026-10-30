@@ -1,0 +1,17 @@
+{
+  "schema_version": 1,
+  "suite": "terrasync-hdfs-certification",
+  "script": "tests/lab/run-hdfs-e2e.sh",
+  "dependency_identity": "Cargo.lock data-mover git source exact commit",
+  "required_gates": [
+    "negative_missing_source_config",
+    "negative_invalid_credentials_secret_safe",
+    "single_process_hdfs_to_hdfs",
+    "remote_process_hdfs_to_hdfs"
+  ],
+  "required_role_isolation": {
+    "sender_config_roles": ["source"],
+    "receiver_config_roles": ["destination"]
+  },
+  "artifact_pattern": "*-hdfs.json"
+}

@@ -2,8 +2,10 @@
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use data_mover::StorageEntryMessage;
-use data_mover::acl::{AceType, PermissionEntry, PermissionMapping, SecurityInfo, copy_acl, get_security_info};
+use data_mover::storage::windows_acl::{
+    AceType, PermissionEntry, PermissionMapping, SecurityInfo, copy_acl, get_security_info,
+};
+use storage_adapter::StorageEntryMessage;
 // 外部crate
 use tracing::{debug, error, info};
 use utils::app_config::AppConfig;

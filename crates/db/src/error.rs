@@ -10,6 +10,7 @@
 // 无
 
 // 外部crate
+use data_mover::model::SnapshotDecodeError;
 use thiserror::Error;
 
 // 内部模块
@@ -19,6 +20,52 @@ use thiserror::Error;
 /// 使用thiserror库实现错误处理和转换
 #[derive(Error, Debug)]
 pub enum DatabaseError {
+    /// data-mover 拒绝数据库中损坏或未知版本的 opaque observation snapshot。
+    #[error("Observation snapshot codec error: {0}")]
+    SnapshotDecode(#[from] SnapshotDecodeError),
+
+    /// 可查询列与同一行的 opaque snapshot 不一致。
+    #[error("Observation query projection mismatch in field {field}")]
+    ObservationProjectionMismatch { field: &'static str },
+
+    /// 查询失败后中止 staging 也失败，保留两次失败的类型。
+    #[error("Observation publication failed: {source}; staging abort also failed: {abort}")]
+    ObservationAbortFailed {
+        #[source]
+        source: Box<DatabaseError>,
+        abort: Box<DatabaseError>,
+    },
+
+    /// EXCHANGE 返回错误，无法确认 snapshot 是否已经交换。
+    #[error("Observation snapshot EXCHANGE outcome is ambiguous: {source}")]
+    ObservationExchangeAmbiguous {
+        #[source]
+        source: Box<DatabaseError>,
+    },
+
+    /// generation 提交失败后工作代状态丢失，保留提交错误。
+    #[error("Observation publication lost its working generation after commit failed: {source}")]
+    ObservationGenerationLost {
+        #[source]
+        source: Box<DatabaseError>,
+    },
+
+    /// generation 提交及反向交换均失败，保留提交和回滚错误。
+    #[error("Generation commit failed ({commit}); snapshot rollback also failed ({rollback})")]
+    ObservationRollbackFailed {
+        #[source]
+        commit: Box<DatabaseError>,
+        rollback: Box<DatabaseError>,
+    },
+
+    /// 无法确认 generation 提交结果；检查状态失败时也保留该错误。
+    #[error("Generation commit outcome is ambiguous after snapshot exchange: {commit}; state query: {verification:?}")]
+    ObservationCommitAmbiguous {
+        #[source]
+        commit: Box<DatabaseError>,
+        verification: Option<Box<DatabaseError>>,
+    },
+
     /// `ClickHouse` 数据库相关错误
     /// 从 `clickhouse` 库的错误类型自动转换
     #[error("ClickHouse error: {0}")]

@@ -40,7 +40,7 @@
 //! 数据要么从未到达 Receiver、要么到达了但 ack 没能传回来），沿用旧窗口状态毫无依据。
 //! 后续实现者不要为了"优化重连体验"给这里加持久化——那是解决一个不存在的问题。
 //!
-//! ## 与 `data_mover::qos::QosManager` 的关系
+//! ## 与 `storage_adapter::qos::QosManager` 的关系
 //!
 //! 两者用法形似（`acquire(cost).await` 挂起在调用点、外部补充后自动唤醒），但控制的
 //! 物理量不同，不能互相替代：
@@ -73,6 +73,7 @@
 //! 散落到 Sender/Receiver adapters 与应用 session；这正是该深模块通过 deletion test 的
 //! 依据。测试应断言阻塞、恢复、消息可见性和 typed terminal outcome，而非内部计数值。
 
+use crate::message::RemoteSourceEvent;
 use std::sync::Mutex;
 
 // 外部 crate
@@ -99,6 +100,7 @@ pub fn credit_cost(message: &SenderMsg) -> Option<u64> {
         SenderMsg::FileData { chunk, .. } => Some(payload_credit_cost(&chunk.data)),
         SenderMsg::DeltaData { data, .. } => Some(payload_credit_cost(data)),
         SenderMsg::TarPacked { tar_entry, .. } => Some(tar_entry.get_size()),
+        SenderMsg::RemoteSource(RemoteSourceEvent::Payload { data, .. }) => Some(payload_credit_cost(data)),
         _ => None,
     }
 }
@@ -149,6 +151,19 @@ impl ReceiverCreditState {
             transport.send(message).await?;
         }
         Ok(())
+    }
+
+    /// 在单次传输终态返还未达阈值的额度，并保留连接。
+    pub async fn flush(&mut self, transport: &(dyn ReceiverTransport + 'static)) -> Result<()> {
+        if let Some(message) = self.take_pending_grant() {
+            transport.send(message).await?;
+        }
+        Ok(())
+    }
+
+    fn take_pending_grant(&mut self) -> Option<ReceiverMsg> {
+        let bytes = std::mem::take(&mut self.accepted_pending);
+        (bytes > 0).then_some(ReceiverMsg::CreditGrant { bytes, ndx: None })
     }
 
     /// Drops connection-local accounting when a connection is replaced.
@@ -289,7 +304,7 @@ mod tests {
     use std::time::Duration;
 
     use bytes::Bytes;
-    use data_mover::{DataChunk, EntryEnum, NASEntry};
+    use storage_adapter::{DataChunk, EntryEnum, NASEntry};
 
     use super::*;
 
@@ -303,7 +318,7 @@ mod tests {
             atime: 0,
             ctime: 0,
             mtime: 0,
-            mode: 0o644,
+            mode: Some(0o644),
             is_symlink: false,
             hard_links: None,
             uid: None,
@@ -377,6 +392,20 @@ mod tests {
             credit.record_accepted(5).unwrap(),
             ReceiverCreditOutcome::Pending
         ));
+    }
+
+    #[test]
+    fn receiver_credit_exposes_subthreshold_grant_at_transfer_terminal() {
+        let mut credit = ReceiverCreditState::new(20).unwrap();
+        assert!(matches!(
+            credit.record_accepted(6).unwrap(),
+            ReceiverCreditOutcome::Pending
+        ));
+        assert!(matches!(
+            credit.take_pending_grant(),
+            Some(ReceiverMsg::CreditGrant { bytes: 6, ndx: None })
+        ));
+        assert!(credit.take_pending_grant().is_none());
     }
 
     #[test]

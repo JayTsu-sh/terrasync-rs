@@ -19,15 +19,15 @@ use std::sync::Arc;
 #[cfg(test)]
 use std::sync::{Mutex, PoisonError};
 
-use crate::storage_factory::create_storage;
-#[cfg(test)]
-use data_mover::StorageEnum;
-#[cfg(test)]
-use data_mover::dir_tree::NdxEvent;
-use data_mover::filter::parse_filter_expression;
-#[cfg(test)]
-use data_mover::{ChangeKind, EntryEnum, ErrorEvent, StorageEntryMessage};
+use crate::storage_factory::{StorageRole, create_storage_for_role};
 use rustls::pki_types::CertificateDer;
+#[cfg(test)]
+use storage_adapter::StorageEnum;
+#[cfg(test)]
+use storage_adapter::dir_tree::NdxEvent;
+use storage_adapter::filter::parse_filter_expression;
+#[cfg(test)]
+use storage_adapter::{ChangeKind, EntryEnum, ErrorEvent, StorageEntryMessage};
 use tokio::sync::Mutex as AsyncMutex;
 use tracing::{info, warn};
 use transport::error::TransportError;
@@ -110,7 +110,15 @@ pub(crate) async fn run(
         Some(s) => Some(parse_size(s)?),
         None => None,
     };
-    let src_storage = Arc::new(create_storage(&config.src_path, block_size.map(|s| s as u64), false).await?);
+    let src_storage = Arc::new(
+        create_storage_for_role(
+            &config.src_path,
+            block_size.map(|s| s as u64),
+            false,
+            StorageRole::Source,
+        )
+        .await?,
+    );
     let match_expr = config.r#match.as_deref().and_then(|e| parse_filter_expression(e).ok());
     let exclude_expr = config.exclude.as_deref().and_then(|e| parse_filter_expression(e).ok());
     let app_config = AppConfig::fetch()?;
@@ -240,10 +248,10 @@ mod tests {
     use std::path::PathBuf;
     use std::time::{Duration, SystemTime};
 
-    use crate::storage_factory::create_storage;
+    use crate::storage_factory::{StorageRole, create_storage_for_role};
     use async_trait::async_trait;
-    use data_mover::DataChunk;
-    use data_mover::dir_tree::DirPageResult;
+    use storage_adapter::DataChunk;
+    use storage_adapter::dir_tree::DirPageResult;
     use tempfile::tempdir;
     use tokio::task::JoinHandle;
     use transport::error::Result as TransportResult;
@@ -252,6 +260,15 @@ mod tests {
     use transport::traits::ReceiverTransport;
 
     use super::*;
+
+    async fn create_storage(path: &str, block_size: Option<u64>, ensure_dir: bool) -> Result<StorageEnum> {
+        let role = if ensure_dir {
+            StorageRole::Destination
+        } else {
+            StorageRole::Source
+        };
+        create_storage_for_role(path, block_size, ensure_dir, role).await
+    }
     use crate::consumer::stats::{JobSummary, ProgressDetail, ProgressReport};
     use crate::receiver::receiver_task_remote;
 
@@ -1949,7 +1966,7 @@ mod tests {
 
     /// 构造一个仅用于测试的最小 `NASEntry`（字段值无实际语义，只满足统计消息类型要求）
     fn dummy_entry(name: &str, is_dir: bool, size: u64) -> Arc<EntryEnum> {
-        Arc::new(EntryEnum::NAS(data_mover::NASEntry {
+        Arc::new(EntryEnum::NAS(storage_adapter::NASEntry {
             name: name.to_string(),
             relative_path: PathBuf::from(name),
             extension: None,
@@ -1958,7 +1975,7 @@ mod tests {
             atime: 0,
             ctime: 0,
             mtime: 0,
-            mode: 0o644,
+            mode: Some(0o644),
             is_symlink: false,
             hard_links: None,
             uid: None,
