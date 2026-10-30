@@ -10,6 +10,7 @@ use std::path::{Component, Path};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use storage_adapter::StorageEntryMessage;
+use storage_adapter::TransferMode;
 
 // 外部 crate
 use storage_adapter::qos::QosManager;
@@ -87,8 +88,8 @@ pub struct ReceiverConfig {
     pub is_source_reserved: bool,
     /// 任务目录（字节级断点续传状态存于 `<job_dir>/byte_resume/`）；为空则禁用续传
     pub job_dir: String,
-    /// 显式关闭字节级断点续传（强制整体复制）
-    pub no_resume: bool,
+    /// 显式选定的写入模式。
+    pub transfer_mode: TransferMode,
 }
 
 /// 单进程模式的 Receiver 主 task（R1 + R2 合一）
@@ -214,22 +215,28 @@ pub(crate) async fn process_entry_on_receiver(
                 error!("[Receiver] Failed to remove source symlink {:?}: {}", relative_path, e);
             }
         } else {
-            // 全量复制：多块大文件写 .part（建立续传基础，正常结束即 rename；
-            // 中断则留 .part + 进度状态供后续增量续传）；小文件/S3 走整文件拷贝。
+            // 所有文件使用同一显式策略；检查点及原子发布由上游管理。
             let resume = ResumeOpts {
                 job_id: config.job_id.clone(),
                 job_dir: config.job_dir.clone(),
-                no_resume: config.no_resume,
+                transfer_mode: config.transfer_mode,
             };
             if matches!(dest_storage.as_ref(), StorageEnum::HDFS(_)) {
-                let hdfs = HdfsCopyContext::from_job(&config.job_id, config.no_resume)?;
-                let recorder = CommitRecorder::start(&config.job_dir, entry, src_storage.block_size()).await?;
-                let hdfs = hdfs.with_commit_callback(recorder.callback());
+                let hdfs = HdfsCopyContext::from_job(&config.job_id, config.transfer_mode)?;
+                let recorder = if config.transfer_mode == TransferMode::Checkpoint {
+                    Some(CommitRecorder::start(&config.job_dir, entry, src_storage.block_size()).await?)
+                } else {
+                    None
+                };
+                let hdfs = recorder
+                    .as_ref()
+                    .map_or(hdfs.clone(), |recorder| hdfs.with_commit_callback(recorder.callback()));
                 let result = copy_file(
                     src_storage,
                     dest_storage,
                     entry,
                     storage_adapter::CopyOptions {
+                        transfer_mode: config.transfer_mode,
                         qos: qos_manager,
                         enable_integrity_check: config.enable_integrity_check,
                         is_source_reserved: config.is_source_reserved,
@@ -240,7 +247,11 @@ pub(crate) async fn process_entry_on_receiver(
                 )
                 .await;
                 let metadata = result.as_ref().copied().unwrap_or(MetadataApplication::DataMover);
-                recorder.finish(result.map(|_| ())).await?;
+                if let Some(recorder) = recorder {
+                    recorder.finish(result.map(|_| ())).await?;
+                } else {
+                    result?;
+                }
                 metadata
             } else if should_resume(&resume, entry, src_storage, dest_storage) {
                 copy_file_with_resume(
@@ -261,6 +272,7 @@ pub(crate) async fn process_entry_on_receiver(
                     dest_storage,
                     entry,
                     storage_adapter::CopyOptions {
+                        transfer_mode: config.transfer_mode,
                         qos: qos_manager,
                         enable_integrity_check: config.enable_integrity_check,
                         is_source_reserved: config.is_source_reserved,
@@ -327,7 +339,12 @@ pub async fn receiver_task_remote(
         session_config.enable_integrity_check,
         session_config.enable_acl
     );
-    let delta_size_threshold = resolve_delta_size_threshold(&session_config.delta_size_threshold)?;
+    let delta_size_threshold =
+        if session_config.transfer_mode == TransferMode::Direct && session_config.delta_size_threshold.is_none() {
+            u64::MAX
+        } else {
+            resolve_delta_size_threshold(&session_config.delta_size_threshold)?
+        };
 
     // ── 进度跟踪 ──
     let progress = Arc::new(ReceiverProgress::new());

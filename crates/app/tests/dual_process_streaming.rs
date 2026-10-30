@@ -4,6 +4,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
+use storage_adapter::TransferMode;
 
 use app::disk_commit::disk_commit_task;
 use app::receiver::ReceiverProgress;
@@ -67,6 +68,7 @@ fn dir_entry(name: &str) -> Arc<EntryEnum> {
 // 构造 SessionConfig，仅关心 enable_integrity_check，其余取默认。
 fn session_cfg(integrity: bool) -> SessionConfig {
     SessionConfig {
+        transfer_mode: TransferMode::Atomic,
         src_path: String::new(),
         qos: None,
         peak_qos_rate: 1.0,
@@ -805,54 +807,68 @@ async fn dc_failed_begin_then_commit_reports_one_outcome() {
 // DeltaCommit 后应原子替换为新内容，且 .part 被清理。
 #[tokio::test]
 async fn dc_delta_reconstructs_from_basis_and_literal_tokens() {
-    let tmp = tempfile::tempdir().unwrap();
-    let dest = local_storage(tmp.path()).await;
-    let basis_content = b"AAAAABBBBBCCCCCDDDDD"; // 4 个 5 字节 block
-    std::fs::write(tmp.path().join("basis.bin"), basis_content).unwrap();
+    for mode in [TransferMode::Atomic, TransferMode::Checkpoint, TransferMode::Direct] {
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = local_storage(tmp.path()).await;
+        let basis_content = b"AAAAABBBBBCCCCCDDDDD"; // 4 个 5 字节 block
+        std::fs::write(tmp.path().join("basis.bin"), basis_content).unwrap();
 
-    let new_content = b"AAAAAXXXXXCCCCCDDDDD"; // block0 命中 + 字面量替换 block1 + block2/3 命中
-    let entry = make_nas_entry("basis.bin", false, false, new_content.len() as u64, 0o644);
-    let source_hash = blake3::hash(new_content).to_hex().to_string();
+        std::fs::hard_link(tmp.path().join("basis.bin"), tmp.path().join("old-basis.bin")).unwrap();
 
-    let msgs = vec![
-        DiskCommitMsg::DeltaBegin {
-            ndx: 0,
-            entry: entry.clone(),
-            block_size: 5,
-        },
-        DiskCommitMsg::DeltaMatch {
-            entry: entry.clone(),
-            block_index: 0,
-        },
-        DiskCommitMsg::DeltaData {
-            entry: entry.clone(),
-            data: Bytes::from_static(b"XXXXX"),
-        },
-        DiskCommitMsg::DeltaMatch {
-            entry: entry.clone(),
-            block_index: 2,
-        },
-        DiskCommitMsg::DeltaMatch {
-            entry: entry.clone(),
-            block_index: 3,
-        },
-        DiskCommitMsg::DeltaCommit {
-            ndx: 0,
-            entry: entry.clone(),
-            source_hash: Some(source_hash),
-        },
-    ];
+        let new_content = b"AAAAAXXXXXCCCCCDDDDD"; // block0 命中 + 字面量替换 block1 + block2/3 命中
+        let entry = make_nas_entry("basis.bin", false, false, new_content.len() as u64, 0o644);
+        let source_hash = blake3::hash(new_content).to_hex().to_string();
 
-    let acks = run_dc(dest, session_cfg(true), msgs).await;
-    assert!(acks.iter().any(|a| matches!(
-        a,
-        DcAck::FileOutcome {
-            ndx: 0,
-            outcome: FileOutcome::Success
-        }
-    )));
-    assert_eq!(std::fs::read(tmp.path().join("basis.bin")).unwrap(), new_content);
-    assert!(!tmp.path().join("basis.bin.terrasync-part").exists());
+        let msgs = vec![
+            DiskCommitMsg::DeltaBegin {
+                ndx: 0,
+                entry: entry.clone(),
+                block_size: 5,
+            },
+            DiskCommitMsg::DeltaMatch {
+                entry: entry.clone(),
+                block_index: 0,
+            },
+            DiskCommitMsg::DeltaData {
+                entry: entry.clone(),
+                data: Bytes::from_static(b"XXXXX"),
+            },
+            DiskCommitMsg::DeltaMatch {
+                entry: entry.clone(),
+                block_index: 2,
+            },
+            DiskCommitMsg::DeltaMatch {
+                entry: entry.clone(),
+                block_index: 3,
+            },
+            DiskCommitMsg::DeltaCommit {
+                ndx: 0,
+                entry: entry.clone(),
+                source_hash: Some(source_hash),
+            },
+        ];
+
+        let mut session = session_cfg(true);
+        session.transfer_mode = mode;
+        let acks = run_dc(dest, session, msgs).await;
+        assert!(acks.iter().any(|a| matches!(
+            a,
+            DcAck::FileOutcome {
+                ndx: 0,
+                outcome: FileOutcome::Success
+            }
+        )));
+        assert_eq!(std::fs::read(tmp.path().join("basis.bin")).unwrap(), new_content);
+        assert!(!tmp.path().join("basis.bin.terrasync-part").exists());
+        assert_eq!(
+            std::fs::read(tmp.path().join("old-basis.bin")).unwrap(),
+            if mode == TransferMode::Direct {
+                new_content
+            } else {
+                basis_content
+            }
+        );
+    }
 }
 
 // 空 tokens 的 delta（源文件为空）：DeltaBegin 后直接 DeltaCommit，应产出空文件，

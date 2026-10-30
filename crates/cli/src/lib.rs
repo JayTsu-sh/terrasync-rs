@@ -271,7 +271,8 @@ pub async fn cli_match() -> error::Result<()> {
             remote,
             tls_server_cert,
             token,
-            no_resume,
+            resume,
+            in_place,
             delete_target,
             ..
         } => {
@@ -295,7 +296,8 @@ pub async fn cli_match() -> error::Result<()> {
                 tls_server_cert,
                 token,
                 raw_command_line,
-                *no_resume,
+                *resume,
+                *in_place,
                 *delete_target,
             )
             .await?;
@@ -420,4 +422,30 @@ fn resolve_license_path(cli_license: Option<&Path>) -> error::Result<PathBuf> {
             "license.json not found (checked --license, config, exe dir, cwd)".to_string(),
         ),
     ))
+}
+
+#[cfg(test)]
+mod sync_transfer_mode_tests {
+    use super::*;
+    use clap::Parser;
+    use storage_adapter::TransferMode;
+
+    #[test]
+    fn sync_flags_select_direct_atomic_and_checkpoint_with_resume_priority() {
+        for (flags, expected) in [
+            (vec![], TransferMode::Direct),
+            (vec!["--in-place"], TransferMode::Atomic),
+            (vec!["--resume"], TransferMode::Checkpoint),
+            (vec!["--in-place", "--resume"], TransferMode::Checkpoint),
+            (vec!["--resume", "--in-place"], TransferMode::Checkpoint),
+        ] {
+            let mut args = vec!["terrasync", "sync", "--id", "job", "/src", "/dest"];
+            args.extend(flags);
+            let cli = Cli::try_parse_from(args).unwrap_or_else(|error| panic!("invalid sync flags: {error}"));
+            let Commands::Sync { resume, in_place, .. } = cli.command else {
+                panic!("expected sync");
+            };
+            assert_eq!(TransferMode::from_flags(resume, in_place), expected);
+        }
+    }
 }

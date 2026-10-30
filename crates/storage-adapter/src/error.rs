@@ -2,21 +2,29 @@ use data_mover::error::StorageError as NativeStorageError;
 use std::error::Error as StdError;
 use tokio::task::JoinError;
 
-use crate::{MismatchDataField, MismatchMetaField};
+use crate::{MismatchDataField, MismatchMetaField, TransferMode};
 use data_mover::{
     metadata::{ApplicationFailureKind, MetadataApplicationFailure, MetadataApplicationReport, MetadataPlanError},
-    model::{EntryOperationFailure, FailureClass, MetadataFamily, ModelValueError, StoragePath},
+    model::{BackendKind, EntryOperationFailure, FailureClass, MetadataFamily, ModelValueError, StoragePath},
     probes::ProbeFailure,
     storage::{
         BackendConnectError, CapabilityUnavailable, CreateDirectoryAllFailure, DeleteTreeTerminalFailure,
         SourceQosStats, SourceQosValueError, StorageRoleFailure,
     },
     tar_pack::TarFailure,
-    transfer::{MoveFailure, TransferFailure, TransferPhase, TransferSide, TransferValueError},
+    transfer::{DirectPatchError, MoveFailure, TransferFailure, TransferPhase, TransferSide, TransferValueError},
     traversal::{FailureScope, ObservationFailure, TraversalConfigurationError, TraversalTerminalFailure},
 };
 #[derive(Debug, thiserror::Error)]
 pub enum StorageError {
+    #[error("{backend:?} backend does not support {mode:?} transfer mode: {reason}")]
+    UnsupportedTransferMode {
+        backend: BackendKind,
+        mode: TransferMode,
+        reason: &'static str,
+    },
+    #[error(transparent)]
+    DirectPatch(#[from] DirectPatchError),
     #[error(transparent)]
     Upstream(#[from] NativeStorageError),
     #[error("Storage operation error: {0}")]

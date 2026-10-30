@@ -1,6 +1,7 @@
 // 标准库
 use std::path::PathBuf;
 use std::sync::Arc;
+use storage_adapter::TransferMode;
 
 // 外部 crate
 use bytes::Bytes;
@@ -387,13 +388,13 @@ pub enum ReceiverMsg {
 /// payload 与 source evidence。新旧 wire 不兼容，不提供双协议解码。
 ///
 /// 8：remote expert terminal 新增 staged metadata phase。新旧 wire 不兼容，不提供双协议解码。
-pub const PROTOCOL_VERSION: u32 = 9;
+pub const PROTOCOL_VERSION: u32 = 10;
 
 /// 当前 binary 能接受的最低对端协议版本
 ///
 /// 对端版本低于此值时握手拒绝，避免 bincode schema 不兼容导致反序列化失败
 /// 或部分文件已写入、部分未写入的"半执行"不一致状态。
-pub const MIN_SUPPORTED_PROTOCOL_VERSION: u32 = 9;
+pub const MIN_SUPPORTED_PROTOCOL_VERSION: u32 = 10;
 
 /// 完整性校验使用的 hash 算法
 ///
@@ -523,6 +524,8 @@ pub enum HandshakeResult {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[allow(clippy::struct_excessive_bools)]
 pub struct SessionConfig {
+    /// 文件写入模式，接收端不得自动降级。
+    pub transfer_mode: TransferMode,
     /// 源端存储路径（Receiver 用于创建 `src_storage`，`CopyEntry` 模式需要）
     pub src_path: String,
     /// `QoS` 带宽限制（例如 "1GiB/s"）
@@ -938,7 +941,7 @@ mod tests {
         assert!(matches!(current.negotiate(&old), HandshakeResult::Rejected { .. }));
     }
 
-    /// 双方均为当前版本（v9）时握手应正常通过。
+    /// 双方均为当前版本（v10）时握手应正常通过。
     #[test]
     fn negotiate_accepts_matching_current_peers() {
         let current = ProtocolHandshake::current();

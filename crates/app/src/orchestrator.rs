@@ -10,6 +10,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
+use storage_adapter::TransferMode;
 
 /// RAII guard：构造时 +1，Drop 时 -1，确保计数器在 panic/early-return 时也能正确回收。
 struct AtomicCounterGuard<'a>(&'a AtomicUsize);
@@ -243,6 +244,20 @@ impl SyncOrchestrator {
     pub async fn run(&self) -> Result<()> {
         // 自动判定 ScanType
         let c = &self.config;
+        info!(transfer_mode = ?c.transfer_mode, "Sync transfer mode selected");
+        if c.packaged && c.transfer_mode != TransferMode::Atomic {
+            return Err(AppError::ConfigError(
+                "Packaged sync supports only Atomic mode; use --in-place".into(),
+            ));
+        }
+        match self.mode {
+            SyncMode::Local => {
+                let destination = create_storage_for_role(&c.dest_path, None, true, StorageRole::Destination).await?;
+                destination.validate_transfer_mode(c.transfer_mode)?;
+            }
+            SyncMode::Remote { .. } => {}
+        }
+
         let app_config = AppConfig::fetch()?;
         let db_config = db::config::DatabaseConfig::from_app_config(&app_config.database);
         // database.enabled=true 时必须成功构造；false 时忽略错误（未启用），走文件系统兜底
@@ -397,7 +412,7 @@ impl SyncOrchestrator {
             enable_acl: c.enable_acl,
             is_source_reserved,
             job_dir: c.job_dir.clone(),
-            no_resume: c.no_resume,
+            transfer_mode: c.transfer_mode,
         });
 
         // ── 8.5. 创建 mount 限流信号量 + countdown latch 计数器（Sender + Receiver 共享） ──
@@ -784,7 +799,7 @@ impl SyncOrchestrator {
             let resume_opts = ResumeOpts {
                 job_id: c.job_id.clone(),
                 job_dir: c.job_dir.clone(),
-                no_resume: c.no_resume,
+                transfer_mode: c.transfer_mode,
             };
             let mount_sem = mount_semaphore.clone();
             let alive_counter = alive_handlers.clone();
@@ -833,6 +848,7 @@ impl SyncOrchestrator {
                                         enable_acl,
                                         is_source_reserved,
                                         bt.clone(),
+                                        resume_opts.clone(),
                                     )
                                     .await;
                                 } else {
@@ -1190,7 +1206,7 @@ impl SyncOrchestrator {
                 bytes_tracker.clone(),
                 &c.job_id,
                 &c.job_dir,
-                c.no_resume,
+                c.transfer_mode,
             )
             .await;
 
@@ -1298,13 +1314,13 @@ impl SyncOrchestrator {
     async fn sync_renamed_file_changes(
         kind: ChangeKind, entry: &EntryEnum, src: &StorageEnum, dest: &StorageEnum, qos: Option<QosManager>,
         integrity: bool, source_reserved: bool, bytes: Option<Arc<AtomicU64>>, job_id: &str, job_dir: &str,
-        no_resume: bool,
+        transfer_mode: TransferMode,
     ) -> bool {
         let mut metadata_applied = false;
         if kind != ChangeKind::MetadataOnly {
             // 内容变更：完整拷贝文件再设置元数据
             let hdfs = if matches!(dest, StorageEnum::HDFS(_)) {
-                match HdfsCopyContext::from_job(job_id, no_resume) {
+                match HdfsCopyContext::from_job(job_id, transfer_mode) {
                     Ok(context) => Some(context),
                     Err(error) => {
                         warn!("Phase B: invalid HDFS recovery identity: {error}");
@@ -1314,7 +1330,7 @@ impl SyncOrchestrator {
             } else {
                 None
             };
-            let recorder = if hdfs.is_some() {
+            let recorder = if hdfs.is_some() && transfer_mode == TransferMode::Checkpoint {
                 match CommitRecorder::start(job_dir, entry, src.block_size()).await {
                     Ok(recorder) => Some(recorder),
                     Err(error) => {
@@ -1335,6 +1351,7 @@ impl SyncOrchestrator {
                 dest,
                 entry,
                 storage_adapter::CopyOptions {
+                    transfer_mode: transfer_mode,
                     qos,
                     enable_integrity_check: integrity,
                     is_source_reserved: source_reserved,
@@ -1400,7 +1417,7 @@ impl SyncOrchestrator {
         db: &dyn Database, src_storage: Arc<StorageEnum>, dest_storage: Arc<StorageEnum>, is_source_reserved: bool,
         broadcaster: &BroadcastForwarder<StorageEntryMessage>, enable_integrity_check: bool,
         qos_manager: Option<QosManager>, bytes_counter: Option<Arc<AtomicU64>>, job_id: &str, job_dir: &str,
-        no_resume: bool,
+        transfer_mode: TransferMode,
     ) {
         let deletion_iter = match db.detect_deleted_items().await {
             Ok(iter) => iter,
@@ -1506,7 +1523,7 @@ impl SyncOrchestrator {
                                     bytes_counter.clone(),
                                     job_id,
                                     job_dir,
-                                    no_resume,
+                                    transfer_mode,
                                 )
                                 .await
                             {

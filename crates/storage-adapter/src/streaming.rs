@@ -12,17 +12,18 @@ use data_mover::{
     },
     model::*,
     storage::{
-        self, ByteStream, CopiedOwnershipTarget, CopiedTimestampTarget, CopiedValueTarget, SourceQosGroup,
-        SourceQosPolicy,
+        self, ByteStream, CopiedOwnershipTarget, CopiedTimestampTarget, CopiedValueTarget, SourceDescriptor,
+        SourceQosGroup, SourceQosPolicy,
     },
     transfer::{
-        ExpertDestinationRequest, ExpertDestinationSession, ExpertDestinationTransferred, ExpertSourceEvidence,
-        TransferFailure, TransferPolicy,
+        DirectPatchChunk, DirectPatchInput, DirectPatchSession, ExpertDestinationRequest, ExpertDestinationSession,
+        ExpertDestinationTransferred, ExpertSourceEvidence, TransferFailure,
     },
 };
-use futures::{StreamExt, stream};
+use futures::{Stream, StreamExt, stream};
 use moka::sync::Cache;
 use qos::{QosConfig, QosManager, parse_bandwidth_string};
+use std::pin::Pin;
 use std::{
     path::Path,
     sync::{Arc, Mutex, OnceLock, Weak},
@@ -33,6 +34,8 @@ use tokio::{
     task::JoinHandle,
 };
 use tokio_util::sync::CancellationToken;
+
+type Input = Pin<Box<dyn Stream<Item = StreamChunk> + Send>>;
 
 pub trait ConsistencyCheck {
     fn finalize(self) -> String;
@@ -247,8 +250,26 @@ fn captured<T>(value: Option<T>) -> MetadataObservation<T> {
     })
 }
 
+/// basis 提示只由 Receiver 的重建器产生；同位置引用已读取并计入完整摘要。
+pub struct StreamChunk {
+    pub chunk: DataChunk,
+    pub unchanged_basis: bool,
+}
+impl From<DataChunk> for StreamChunk {
+    fn from(chunk: DataChunk) -> Self {
+        Self {
+            chunk,
+            unchanged_basis: false,
+        }
+    }
+}
+
 struct WriteState {
     session: Option<ExpertDestinationSession>,
+    direct: Option<DirectPatchSession>,
+    written_bytes: u64,
+    mode: TransferMode,
+    resume_offset: u64,
     transferred: Option<ExpertDestinationTransferred>,
     digest: [u8; 32],
     bytes: u64,
@@ -261,6 +282,9 @@ struct WriteState {
 #[derive(Clone)]
 pub struct StreamHandle(Arc<AsyncMutex<WriteState>>);
 impl StreamHandle {
+    pub async fn written_bytes(&self) -> u64 {
+        self.0.lock().await.written_bytes
+    }
     pub async fn received_size(&self) -> u64 {
         self.0.lock().await.bytes
     }
@@ -272,8 +296,11 @@ impl StreamHandle {
     }
     pub async fn discard(&self) -> Result<()> {
         let mut state = self.0.lock().await;
+        state.direct.take();
         if let Some(session) = state.session.take() {
-            session.discard().await?;
+            if state.mode != TransferMode::Checkpoint {
+                session.discard().await?;
+            }
         }
         if let Some(transferred) = state.transferred.take() {
             state.cancel.cancel();
@@ -284,7 +311,9 @@ impl StreamHandle {
                 source_qos: Default::default(),
             };
             if let Err(failure) = transferred.complete(evidence).await {
-                failure.discard_stage().await?;
+                if state.mode != TransferMode::Checkpoint {
+                    failure.discard_stage().await?;
+                }
             }
         }
         Ok(())
@@ -292,10 +321,15 @@ impl StreamHandle {
 }
 impl StorageEnum {
     pub async fn prepare_stream(dest: &Self, entry: &EntryEnum) -> Result<StreamHandle> {
+        Self::prepare_stream_with_mode(dest, entry, TransferMode::Atomic).await
+    }
+
+    pub async fn prepare_stream_with_mode(dest: &Self, entry: &EntryEnum, mode: TransferMode) -> Result<StreamHandle> {
+        dest.validate_stream_transfer_mode(mode)?;
         let p = path(entry.get_relative_path())?;
-        // 旧 wire 不携带 opaque observation；该产品会话只接受从零写入，不能授权恢复。
+        // wire 元数据固定本轮源描述；目标检查点由上游绑定并校验，传输仍接收全量摘要证据。
         let identity = SourceIdentity::new(
-            BackendIdentity::new(BackendKind::Local, "terrasync-wire-v9")?,
+            BackendIdentity::new(BackendKind::Local, "terrasync-wire-v10")?,
             IdentityStrength::PathScoped,
             blake3::hash(p.as_str().as_bytes()).as_bytes(),
         )?;
@@ -322,21 +356,41 @@ impl StorageEnum {
                 }
             }
         });
-        let session = ExpertDestinationSession::prepare(
-            ExpertDestinationRequest::new(
-                observed,
-                dest.block_size as usize,
-                dest.roles.clone(),
+        let (session, direct, resume_offset) = if mode == TransferMode::Direct {
+            let source = SourceDescriptor::new(
                 p,
-                cancel.clone(),
+                EntryKind::File,
+                Some(entry.get_size()),
+                observed.source_identity().clone(),
+            );
+            (
+                None,
+                Some(DirectPatchSession::prepare(dest.roles.clone(), source, metadata_plan).await?),
+                0,
             )
-            .with_transfer_policy(TransferPolicy::AtomicReplace)
-            .with_metadata_plan(metadata_plan)
-            .with_write_observer(progress),
-        )
-        .await?;
+        } else {
+            let session = ExpertDestinationSession::prepare(
+                ExpertDestinationRequest::new(
+                    observed.clone(),
+                    dest.block_size as usize,
+                    dest.roles.clone(),
+                    p.clone(),
+                    cancel.clone(),
+                )
+                .with_transfer_policy(mode.policy())
+                .with_metadata_plan(metadata_plan)
+                .with_write_observer(progress),
+            )
+            .await?;
+            let offset = session.write_offset();
+            (Some(session), None, offset)
+        };
         let state = WriteState {
-            session: Some(session),
+            session,
+            direct,
+            written_bytes: 0,
+            mode,
+            resume_offset,
             transferred: None,
             digest: *blake3::hash(&[]).as_bytes(),
             bytes: 0,
@@ -352,37 +406,73 @@ impl StorageEnum {
         _dest: &Self, _entry: &EntryEnum, rx: mpsc::Receiver<DataChunk>, handle: &StreamHandle,
         _qos: Option<QosManager>, on_committed: CommitCallback,
     ) -> Result<()> {
-        let session = {
+        let input: Input = Box::pin(stream::unfold(rx, |mut rx| async {
+            rx.recv().await.map(|chunk| (StreamChunk::from(chunk), rx))
+        }));
+        Self::write_input(input, handle, on_committed).await
+    }
+
+    pub async fn write_planned_stream(rx: mpsc::Receiver<StreamChunk>, handle: &StreamHandle) -> Result<()> {
+        let input: Input = Box::pin(stream::unfold(rx, |mut rx| async {
+            rx.recv().await.map(|chunk| (chunk, rx))
+        }));
+        Self::write_input(input, handle, Arc::new(|_, _| {})).await
+    }
+
+    async fn write_input(incoming: Input, handle: &StreamHandle, on_committed: CommitCallback) -> Result<()> {
+        let direct = handle.0.lock().await.direct.take();
+        if let Some(mut direct) = direct {
+            let mut input: DirectPatchInput = Box::pin(incoming.map(|input| DirectPatchChunk {
+                offset: input.chunk.offset,
+                data: input.chunk.data,
+                unchanged_basis: input.unchanged_basis,
+            }));
+            let result = direct.receive(&mut input).await;
+            let progress = direct.progress();
+            let mut state = handle.0.lock().await;
+            state.bytes = progress.bytes;
+            state.digest = progress.blake3;
+            state.input_ended = progress.ended;
+            state.direct = Some(direct);
+            return result.map_err(StorageError::from);
+        }
+        let (session, mode, resume_offset) = {
             let mut state = handle.0.lock().await;
             *state.observer.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(on_committed);
-            state
-                .session
-                .take()
-                .ok_or_else(|| operation("writer already started"))?
+            (
+                state
+                    .session
+                    .take()
+                    .ok_or_else(|| operation("writer already started"))?,
+                state.mode,
+                state.resume_offset,
+            )
         };
         let stats = Arc::new(Mutex::new((0u64, Hasher::new(), false)));
         let tally = stats.clone();
-        let input: ByteStream = Box::pin(stream::unfold((rx, false), move |(mut rx, failed)| {
+        let input: ByteStream = Box::pin(stream::unfold((incoming, false), move |(mut rx, failed)| {
             let stats = stats.clone();
             async move {
                 if failed {
                     return None;
                 }
-                let chunk = match rx.recv().await {
-                    Some(chunk) => chunk,
-                    None => {
-                        stats.lock().unwrap_or_else(std::sync::PoisonError::into_inner).2 = true;
-                        return None;
-                    }
-                };
-                let result = {
+                let result = loop {
+                    let chunk = match rx.next().await {
+                        Some(input) => input.chunk,
+                        None => {
+                            stats.lock().unwrap_or_else(std::sync::PoisonError::into_inner).2 = true;
+                            return None;
+                        }
+                    };
                     let mut tally = stats.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                     if chunk.offset != tally.0 {
-                        Err(role_failure("non-contiguous payload"))
-                    } else {
-                        tally.0 += chunk.data.len() as u64;
-                        tally.1.update(&chunk.data);
-                        Ok(chunk.data)
+                        break Err(role_failure("non-contiguous payload"));
+                    }
+                    tally.0 += chunk.data.len() as u64;
+                    tally.1.update(&chunk.data);
+                    let skip = resume_offset.saturating_sub(chunk.offset).min(chunk.data.len() as u64) as usize;
+                    if skip < chunk.data.len() {
+                        break Ok(chunk.data.slice(skip..));
                     }
                 };
                 let failed = result.is_err();
@@ -403,11 +493,15 @@ impl StorageEnum {
                 state.transferred = Some(transferred);
                 Ok(())
             }
-            Err(failure) => Err(cleanup_stream_failure(failure).await),
+            Err(failure) => Err(cleanup_stream_failure(failure, mode).await),
         }
     }
     pub async fn commit_chunk_stream(_dest: &Self, _entry: &EntryEnum, _size: u64, handle: StreamHandle) -> Result<()> {
         let mut state = handle.0.lock().await;
+        if let Some(direct) = state.direct.take() {
+            state.written_bytes = direct.complete().await?;
+            return Ok(());
+        }
         let evidence = ExpertSourceEvidence {
             source_size: state.size,
             blake3: state.digest,
@@ -425,12 +519,15 @@ impl StorageEnum {
             .await;
         match result {
             Ok(_) => Ok(()),
-            Err(failure) => Err(cleanup_stream_failure(failure).await),
+            Err(failure) => Err(cleanup_stream_failure(failure, state.mode).await),
         }
     }
 }
-/// AtomicReplace 不保留恢复状态；公开诊断先复制，随后由原始失败清理其拥有的 stage。
-async fn cleanup_stream_failure(failure: TransferFailure) -> StorageError {
+/// Checkpoint 保留未发布状态；Atomic 先复制结构化诊断，再清理原始失败持有的 stage。
+async fn cleanup_stream_failure(failure: TransferFailure, mode: TransferMode) -> StorageError {
+    if mode == TransferMode::Checkpoint && failure.has_unpublished_stage() {
+        return failure.into();
+    }
     let mut diagnostic = StreamTransferDiagnostic::capture(&failure);
     diagnostic.cleanup_failure = if failure.has_pending_cleanup() {
         failure.cleanup_published_stage().await.err()
@@ -442,7 +539,7 @@ async fn cleanup_stream_failure(failure: TransferFailure) -> StorageError {
     StorageError::StreamTransfer(Box::new(diagnostic))
 }
 
-fn role_failure(message: &str) -> storage::StorageRoleFailure {
+pub(crate) fn role_failure(message: &str) -> storage::StorageRoleFailure {
     StorageRoleFailure::Entry(
         EntryOperationFailure::new(
             StoragePath::root(),

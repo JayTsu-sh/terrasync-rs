@@ -34,6 +34,8 @@ fn build_sig_table(signatures: &[BlockSignature]) -> HashMap<u32, Vec<(u32, &Blo
 pub struct DeltaMatcher<'a> {
     sig_table: HashMap<u32, Vec<(u32, &'a BlockSignature)>>,
     bs: usize,
+    signatures: &'a [BlockSignature],
+    consumed: u64,
     carry: Vec<u8>,
     pos: usize,
     rc: RollingChecksum,
@@ -48,6 +50,8 @@ impl<'a> DeltaMatcher<'a> {
         Self {
             sig_table: build_sig_table(signatures),
             bs: block_size as usize,
+            signatures,
+            consumed: 0,
             carry: Vec::new(),
             pos: 0,
             rc: RollingChecksum::new(),
@@ -81,14 +85,21 @@ impl<'a> DeltaMatcher<'a> {
         self.pos = 0;
 
         if !self.literal_buf.is_empty() {
-            tokens.push(DeltaToken::Data(Bytes::from(std::mem::take(&mut self.literal_buf))));
+            let data = Bytes::from(std::mem::take(&mut self.literal_buf));
+            for start in (0..data.len()).step_by(1024 * 1024) {
+                tokens.push(DeltaToken::Data(
+                    data.slice(start..(start + 1024 * 1024).min(data.len())),
+                ));
+            }
         }
+
         tokens
     }
 
     /// 回收 `carry` 已处理的前缀，保证缓冲不随累计 push 次数增长
     fn compact(&mut self) {
         if self.pos > 0 {
+            self.consumed += self.pos as u64;
             self.carry.drain(..self.pos);
             self.pos = 0;
         }
@@ -111,27 +122,41 @@ impl<'a> DeltaMatcher<'a> {
             if let Some(candidates) = self.sig_table.get(&rolling) {
                 // 慢速确认：strong checksum (BLAKE3) 匹配？
                 let strong = blake3_truncated(&self.carry[self.pos..self.pos + self.bs]);
-                for (block_idx, sig) in candidates {
-                    if sig.strong == strong {
-                        // 匹配！先 flush 累积的 literal data
-                        if !self.literal_buf.is_empty() {
-                            tokens.push(DeltaToken::Data(Bytes::from(std::mem::take(&mut self.literal_buf))));
-                        }
-                        tokens.push(DeltaToken::Match {
-                            block_index: *block_idx,
-                        });
-                        self.pos += self.bs;
-                        matched = true;
-                        // 下一个窗口惰性重新初始化（数据足够时在下次循环顶部触发）
-                        self.window_init = false;
-                        break;
+                // 重复内容优先引用同位置 basis，避免原地 delta 把未变化区间当作移动块。
+                let position = self.consumed + self.pos as u64;
+                let preferred = (position % self.bs as u64 == 0)
+                    .then(|| u32::try_from(position / self.bs as u64).ok())
+                    .flatten()
+                    .filter(|index| {
+                        self.signatures
+                            .get(*index as usize)
+                            .is_some_and(|sig| sig.rolling == rolling && sig.strong == strong)
+                    });
+                let selected = preferred.or_else(|| {
+                    candidates
+                        .iter()
+                        .find(|(_, sig)| sig.strong == strong)
+                        .map(|(index, _)| *index)
+                });
+                if let Some(block_idx) = selected {
+                    // 匹配！先 flush 累积的 literal data
+                    if !self.literal_buf.is_empty() {
+                        tokens.push(DeltaToken::Data(Bytes::from(std::mem::take(&mut self.literal_buf))));
                     }
+                    tokens.push(DeltaToken::Match { block_index: block_idx });
+                    self.pos += self.bs;
+                    matched = true;
+                    // 下一个窗口惰性重新初始化（数据足够时在下次循环顶部触发）
+                    self.window_init = false;
                 }
             }
 
             if !matched {
                 // 无匹配 → 累积当前字节为 literal
                 self.literal_buf.push(self.carry[self.pos]);
+                if self.literal_buf.len() >= 1024 * 1024 {
+                    tokens.push(DeltaToken::Data(Bytes::from(std::mem::take(&mut self.literal_buf))));
+                }
                 self.pos += 1;
 
                 // 滑动窗口更新（下一个字节可用时增量滚动；否则暂停，等下次 push 后重新
@@ -454,5 +479,49 @@ mod tests {
             }
         }
         let _ = matcher.finish();
+    }
+}
+
+#[cfg(test)]
+mod inplace_tests {
+    use super::*;
+    use crate::signature::compute_block_signatures;
+
+    #[test]
+    fn duplicate_blocks_prefer_the_same_position_across_input_boundaries() {
+        let data = vec![0; 4 * 4096];
+        let signatures = compute_block_signatures(&data, 4096);
+        let mut matcher = DeltaMatcher::new(&signatures, 4096);
+        let mut tokens = Vec::new();
+        for chunk in data.chunks(777) {
+            tokens.extend(matcher.push(chunk));
+        }
+        tokens.extend(matcher.finish());
+        assert_eq!(
+            tokens,
+            (0..4)
+                .map(|block_index| DeltaToken::Match { block_index })
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn large_changed_regions_have_bounded_literals() {
+        let data = vec![0x47; 3 * 1024 * 1024 + 13];
+        let mut matcher = DeltaMatcher::new(&[], 700);
+        let mut tokens = Vec::new();
+        for chunk in data.chunks(65536) {
+            tokens.extend(matcher.push(chunk));
+        }
+        tokens.extend(matcher.finish());
+        let mut total = 0;
+        for token in tokens {
+            let DeltaToken::Data(bytes) = token else {
+                panic!("unexpected match");
+            };
+            assert!(bytes.len() <= 1024 * 1024);
+            total += bytes.len();
+        }
+        assert_eq!(total, data.len());
     }
 }

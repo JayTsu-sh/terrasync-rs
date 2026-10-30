@@ -11,6 +11,7 @@
 use crate::file_copy::{HdfsCopyContext, copy_file};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use storage_adapter::TransferMode;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 
@@ -237,7 +238,7 @@ pub(crate) async fn process_versioned_entry(
     entry: &Arc<EntryEnum>, src_storage: Arc<StorageEnum>, dest_storage: Arc<StorageEnum>,
     broadcaster: BroadcastForwarder<StorageEntryMessage>, qos_manager: Option<QosManager>,
     object_buffers: Arc<DashMap<String, Vec<Arc<EntryEnum>>>>, enable_integrity_check: bool, enable_acl: bool,
-    is_source_reserved: bool, bytes_counter: Option<Arc<AtomicU64>>,
+    is_source_reserved: bool, bytes_counter: Option<Arc<AtomicU64>>, resume: ResumeOpts,
 ) {
     // 版本化对象，使用per-object缓冲区机制
     trace!("Processing versioned entry with buffer: {:?}", entry);
@@ -306,7 +307,7 @@ pub(crate) async fn process_versioned_entry(
                     entry.get_mtime()
                 );
 
-                // 处理条目（S3 版本化路径：多版本对象续传语义未定义，保持关闭 → default）
+                // 每个源版本都使用同一显式策略，上游请求固定对应的 version_id。
                 match process_entry(
                     entry.as_ref(),
                     Arc::clone(&src_storage),
@@ -317,7 +318,7 @@ pub(crate) async fn process_versioned_entry(
                     qos_manager.clone(),
                     bytes_counter.clone(),
                     &broadcaster,
-                    ResumeOpts::default(),
+                    resume.clone(),
                 )
                 .await
                 {
@@ -373,7 +374,7 @@ pub(crate) async fn process_versioned_entry(
                     qos_manager.clone(),
                     bytes_counter.clone(),
                     &broadcaster,
-                    ResumeOpts::default(),
+                    resume.clone(),
                 )
                 .await
                 {
@@ -411,7 +412,7 @@ pub(crate) struct ProcessEntryOpts {
     pub is_source_reserved: bool,
     /// 仅同步元数据（chmod/chown 场景），跳过 `copy_file`
     pub skip_data_copy: bool,
-    /// 字节级断点续传参数（job_dir 为空或 no_resume 时退化为整文件拷贝）
+    /// 本次同步的写入模式与恢复上下文。
     pub resume: ResumeOpts,
 }
 
@@ -540,15 +541,17 @@ async fn process_entry_inner(
             .await
             .map_err(|e| AppError::CopyError(format!("Failed to set metadata for {}: {e}", relative_path.display())))?;
     } else if matches!(dest_storage.as_ref(), StorageEnum::HDFS(_)) {
-        let hdfs = HdfsCopyContext::from_job(&resume.job_id, resume.no_resume)?
-            ;
-        let recorder = CommitRecorder::start(&resume.job_dir, entry, src_storage.block_size()).await?;
-        let hdfs = hdfs.with_commit_callback(recorder.callback());
+        let hdfs = HdfsCopyContext::from_job(&resume.job_id, resume.transfer_mode)?;
+        let recorder = if resume.transfer_mode == TransferMode::Checkpoint {
+            Some(CommitRecorder::start(&resume.job_dir, entry, src_storage.block_size()).await?)
+        } else { None };
+        let hdfs = recorder.as_ref().map_or(hdfs.clone(), |recorder| hdfs.with_commit_callback(recorder.callback()));
         let result = copy_file(
             &src_storage,
             &dest_storage,
             entry,
             storage_adapter::CopyOptions {
+                transfer_mode: resume.transfer_mode,
                 qos: qos_manager,
                 enable_integrity_check,
                 is_source_reserved,
@@ -560,7 +563,7 @@ async fn process_entry_inner(
         .await
         .map(|_| ())
         .map_err(|e| AppError::CopyError(format!("Failed to copy {}: {e}", relative_path.display())));
-        recorder.finish(result).await?;
+        if let Some(recorder) = recorder { recorder.finish(result).await?; } else { result?; }
         debug!("Copied file through HDFS recoverable lifecycle {:?}", relative_path);
     } else if should_resume(&resume, entry, &src_storage, &dest_storage) {
         // 多块大文件：字节级断点续传（全量建 .part / 增量续 .part）
@@ -589,6 +592,7 @@ async fn process_entry_inner(
             &dest_storage,
             entry,
             storage_adapter::CopyOptions {
+                transfer_mode: resume.transfer_mode,
                 qos: qos_manager,
                 enable_integrity_check,
                 is_source_reserved,
@@ -644,8 +648,8 @@ pub(crate) struct ResumeOpts {
     pub job_id: String,
     /// 任务目录；续传状态存于 `<job_dir>/byte_resume/`。为空则禁用续传。
     pub job_dir: String,
-    /// 显式关闭续传（强制整文件拷贝）。
-    pub no_resume: bool,
+    /// 显式选定的写入模式。
+    pub transfer_mode: TransferMode,
 }
 
 pub(crate) struct CommitRecorder {
@@ -824,10 +828,9 @@ fn is_s3(storage: &StorageEnum) -> bool {
 ///   multipart upload（ListParts 反推缺失区间），本地状态文件仅作进度参考；
 ///   额外要求 size > 目标端 block_size（part 大小下限），单 part 文件续传无意义
 ///   （中断即全丢），走普通拷贝即可。
-/// - **S3 多版本路径**除外：多版本对象的续传语义未定义，调用方传
-///   `ResumeOpts::default()` 保持关闭（见 versioned 拷贝路径）。
+/// - **S3 多版本路径**：版本化源固定 version_id，并遵循同一显式策略。
 pub(crate) fn should_resume(resume: &ResumeOpts, entry: &EntryEnum, src: &StorageEnum, dest: &StorageEnum) -> bool {
-    !resume.no_resume
+    resume.transfer_mode == TransferMode::Checkpoint
         && !resume.job_dir.is_empty()
         && !entry.get_is_dir()
         && !entry.get_is_symlink()
@@ -864,6 +867,7 @@ pub(crate) async fn copy_file_with_resume(
         dest_storage,
         entry,
         storage_adapter::CopyOptions {
+            transfer_mode: TransferMode::Checkpoint,
             qos: qos_manager,
             enable_integrity_check,
             is_source_reserved,

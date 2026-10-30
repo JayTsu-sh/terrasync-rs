@@ -2,7 +2,7 @@ use crate::*;
 use crate::{connected::path, streaming::source_qos};
 use data_mover::{
     model::SourceVersion,
-    transfer::{self, ReadBackVerification, TransferIdentity, TransferPolicy, TransferRequest},
+    transfer::{self, ReadBackVerification, TransferIdentity, TransferRequest},
 };
 use std::sync::atomic::Ordering;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -10,6 +10,7 @@ pub enum HdfsResumeMode {
     Auto,
     Restart,
     Require,
+    Direct,
 }
 pub struct HdfsRecoverableCopyOptions {
     identity: String,
@@ -39,6 +40,13 @@ impl StorageEnum {
                 "the current transfer API does not support require-resume; use automatic destination recovery".into(),
             ));
         }
+        let mode = match recovery.mode {
+            HdfsResumeMode::Auto => TransferMode::Checkpoint,
+            HdfsResumeMode::Restart => TransferMode::Atomic,
+            HdfsResumeMode::Direct => TransferMode::Direct,
+            HdfsResumeMode::Require => unreachable!("require-resume was rejected"),
+        };
+        destination.validate_transfer_mode(mode)?;
         let mut request = TransferRequest::new(
             source.roles.clone(),
             path(entry.get_relative_path())?,
@@ -46,11 +54,7 @@ impl StorageEnum {
             options.cancel.unwrap_or_default(),
         )
         .with_identity_override(TransferIdentity::from_label(recovery.identity).map_err(StorageError::from)?)
-        .with_transfer_policy(if recovery.mode == HdfsResumeMode::Restart {
-            TransferPolicy::AtomicReplace
-        } else {
-            TransferPolicy::Checkpointed
-        });
+        .with_transfer_policy(mode.policy());
         if let Some(version) = entry.get_version_id() {
             request = request.with_source_version(SourceVersion::Id(version.into()));
         }
