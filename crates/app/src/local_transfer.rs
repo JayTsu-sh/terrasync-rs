@@ -1,4 +1,4 @@
-//! Protocol-neutral, bounded in-process transfer orchestration.
+//! 与协议无关的有界进程内传输编排。
 
 use async_trait::async_trait;
 use data_mover::model::{EntryKind, EntryOperationFailure, ObservedEntry};
@@ -13,7 +13,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::error::{AppError, Result};
 
-/// Inputs shared by all files admitted from one traversal.
+/// 同一次遍历中所有接收文件共用的输入。
 #[derive(Clone)]
 pub struct LocalTransferConfig {
     pub job_identity: String,
@@ -26,7 +26,7 @@ pub struct LocalTransferConfig {
     pub cancel: CancellationToken,
 }
 
-/// Transfer results remain typed and owned until the application records a recovery decision.
+/// 应用记录恢复决定前，传输结果保留类型及所有权。
 #[async_trait]
 pub trait LocalTransferSink: Send {
     async fn completed(&mut self, entry: ObservedEntry, outcome: TransferOutcome) -> Result<()>;
@@ -48,11 +48,10 @@ pub struct LocalTransferReport {
 
 type Attempt = (ObservedEntry, std::result::Result<TransferOutcome, TransferFailure>);
 
-/// Drains a bounded traversal into the unified data-mover transfer API.
+/// 排空有界遍历，并通过统一 data-mover transfer API 执行传输。
 ///
-/// Source and destination are independent `Storage` values. This layer neither inspects their
-/// protocols nor dispatches on backend pairs. Namespace and metadata work for non-files belongs
-/// to their dedicated workflow and is reported as skipped here.
+/// 源和目标是独立的 `Storage` 值；本层不检查协议，也不按后端组合分派。
+/// 非文件条目的命名空间和元数据操作由专属流程处理，此处统计为跳过。
 pub async fn run_local_transfer(
     mut session: TraversalSession, config: LocalTransferConfig, sink: &mut dyn LocalTransferSink,
 ) -> Result<LocalTransferReport> {
@@ -134,15 +133,13 @@ fn request_for(config: &LocalTransferConfig, entry: &ObservedEntry) -> Result<Tr
         "{}:{}",
         config.job_identity,
         encode_identity(entry.identity_key().as_bytes())
-    ))
-    .map_err(|error| AppError::ConfigError(error.to_string()))?;
+    ))?;
     let request = TransferRequest::from_observation(
         config.source.clone(),
         entry.clone(),
         config.destination.clone(),
         config.cancel.clone(),
-    )
-    .map_err(|error| AppError::ConfigError(error.to_string()))?
+    )?
     .with_identity_override(identity);
     Ok(request.with_transfer_policy(config.transfer_policy))
 }
@@ -150,7 +147,7 @@ fn request_for(config: &LocalTransferConfig, entry: &ObservedEntry) -> Result<Tr
 fn validate_job_identity(identity: &str) -> Result<()> {
     TransferIdentity::from_label(format!("{identity}:{}", "0".repeat(64)))
         .map(|_| ())
-        .map_err(|error| AppError::ConfigError(error.to_string()))
+        .map_err(AppError::from)
 }
 
 async fn drain_after_error(
@@ -199,11 +196,13 @@ async fn settle_one(
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
-    fn completion(entries: u64, failures: u64) -> data_mover::traversal::TraversalCompletion {
-        let mut totals = data_mover::traversal::ScanTotals::default();
+    use data_mover::traversal::{ScanFailure, ScanTotals, TraversalCompletion};
+
+    fn completion(entries: u64, failures: u64) -> TraversalCompletion {
+        let mut totals = ScanTotals::default();
         totals.emitted = entries;
         totals.failed_children = failures;
-        data_mover::traversal::TraversalCompletion::new(totals)
+        TraversalCompletion::new(totals)
     }
 
     use std::path::Path;
@@ -282,7 +281,7 @@ mod tests {
     }
 
     fn entry_failure(path: &str) -> TraversalItem {
-        TraversalItem::Failure(Box::new(data_mover::traversal::ScanFailure::child(
+        TraversalItem::Failure(Box::new(ScanFailure::child(
             EntryOperationFailure::new(
                 StoragePath::new(path).unwrap(),
                 Operation::Observe,

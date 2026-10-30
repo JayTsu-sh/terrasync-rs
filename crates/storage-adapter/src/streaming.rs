@@ -1,20 +1,37 @@
-use crate::{error::operation, *};
+use crate::{
+    connected::{path, timestamp},
+    error::{StreamTransferDiagnostic, operation},
+    *,
+};
+use blake3::{Hash, Hasher};
+use data_mover::storage::{StorageRoleFailure, WriteProgress, WriteProgressObserver};
 use data_mover::{
+    metadata::{
+        AclTarget, MetadataPlan, MetadataPlanRequest, MetadataPolicies, MetadataPolicy, MetadataTarget,
+        OwnershipTarget, TimestampTarget, TimestampTargetCapability, ValueTarget, compile_copied_metadata_plan,
+    },
     model::*,
-    storage::{self, ByteStream, SourceQosGroup, SourceQosPolicy},
+    storage::{
+        self, ByteStream, CopiedOwnershipTarget, CopiedTimestampTarget, CopiedValueTarget, SourceQosGroup,
+        SourceQosPolicy,
+    },
     transfer::{
         ExpertDestinationRequest, ExpertDestinationSession, ExpertDestinationTransferred, ExpertSourceEvidence,
-        TransferPolicy,
+        TransferFailure, TransferPolicy,
     },
 };
-use futures::StreamExt;
+use futures::{StreamExt, stream};
+use moka::sync::Cache;
+use qos::{QosConfig, QosManager, parse_bandwidth_string};
 use std::{
-    collections::HashMap,
     path::Path,
     sync::{Arc, Mutex, OnceLock, Weak},
     time::Duration,
 };
-use tokio::{sync::mpsc, task::JoinHandle};
+use tokio::{
+    sync::{Mutex as AsyncMutex, mpsc},
+    task::JoinHandle,
+};
 use tokio_util::sync::CancellationToken;
 
 pub trait ConsistencyCheck {
@@ -27,28 +44,22 @@ impl ConsistencyCheck for HashCalculator {
         self.0.finalize().to_hex().to_string()
     }
 }
-pub(crate) fn source_qos(qos: &qos::QosManager, maximum: u64) -> Result<SourceQosGroup> {
-    type Groups = HashMap<usize, (Weak<qos::QosConfig>, SourceQosGroup)>;
-    static GROUPS: OnceLock<Mutex<Groups>> = OnceLock::new();
+pub(crate) fn source_qos(qos: &QosManager, maximum: u64) -> Result<SourceQosGroup> {
+    type Groups = Cache<usize, (Weak<QosConfig>, SourceQosGroup)>;
+    static GROUPS: OnceLock<Groups> = OnceLock::new();
     let config = qos.config();
     let key = Arc::as_ptr(&config) as usize;
-    let mut groups = GROUPS
-        .get_or_init(Mutex::default)
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    groups.retain(|_, (owner, _)| owner.strong_count() > 0);
+    let groups = GROUPS.get_or_init(|| Cache::builder().support_invalidation_closures().build());
+    // 配置释放后移除预算；活跃配置的预算不能被容量或时间驱逐。
+    let _ = groups.invalidate_entries_if(|_, (owner, _)| owner.strong_count() == 0);
     if let Some((_, group)) = groups.get(&key) {
-        return Ok(group.clone());
+        return Ok(group);
     }
-    let bandwidth = config
-        .bandwidth
-        .as_deref()
-        .map(qos::parse_bandwidth_string)
-        .transpose()?;
+    let bandwidth = config.bandwidth.as_deref().map(parse_bandwidth_string).transpose()?;
     let hard = config
         .hard_bandwidth
         .as_deref()
-        .map(qos::parse_bandwidth_string)
+        .map(parse_bandwidth_string)
         .transpose()?;
     let policy = SourceQosPolicy::new(
         bandwidth.map(|soft| {
@@ -67,23 +78,22 @@ pub(crate) fn source_qos(qos: &qos::QosManager, maximum: u64) -> Result<SourceQo
                 config.iops_peak_duration.unwrap_or(Duration::ZERO),
             )
         }),
-    )
-    .map_err(operation)?;
-    let group = SourceQosGroup::new(policy);
-    groups.insert(key, (Arc::downgrade(&config), group.clone()));
+    )?;
+    // get_with 合并并发初始化，确保相同配置始终共用一个限流预算。
+    let (_, group) = groups.get_with(key, || (Arc::downgrade(&config), SourceQosGroup::new(policy)));
     Ok(group)
 }
 impl StorageEnum {
     pub fn read_chunk_stream(
-        storage: &Self, entry: &EntryEnum, intervals: Option<Vec<(u64, u64)>>, qos: Option<qos::QosManager>,
-        hash: bool, capacity: usize,
+        storage: &Self, entry: &EntryEnum, intervals: Option<Vec<(u64, u64)>>, qos: Option<QosManager>, hash: bool,
+        capacity: usize,
     ) -> (mpsc::Receiver<DataChunk>, JoinHandle<Result<Option<HashCalculator>>>) {
         let storage = storage.clone();
         let entry = entry.clone();
         let (tx, rx) = mpsc::channel(capacity.max(1));
         let task = tokio::spawn(async move {
             let source = storage.roles.read_source()?;
-            let p = crate::connected::path(entry.get_relative_path())?;
+            let p = path(entry.get_relative_path())?;
             let version = entry
                 .get_version_id()
                 .map_or(SourceVersion::Current, |v| SourceVersion::Id(v.into()));
@@ -143,6 +153,100 @@ impl StorageEnum {
         (rx, task)
     }
 }
+/// 从 wire 已捕获的值编译计划；不回读源端，也不修改最终路径。
+fn stream_metadata_plan(destination: &ConnectedStorage, entry: &EntryEnum) -> Result<MetadataPlan> {
+    let staged = destination.roles.staged_destination()?;
+    let target = staged.copied_metadata_target();
+    let mode = entry.get_mode().map(|value| value & 0o7777);
+    let ownership = match (entry.get_uid(), entry.get_gid(), mode) {
+        (Some(uid), Some(gid), Some(mode)) => Some(OwnershipMode { uid, gid, mode }),
+        _ => None,
+    };
+    let owner_permitted = ownership.is_none_or(|owner| staged.may_set_owner(owner.uid, owner.gid));
+    let tags = entry
+        .get_tags()
+        .map(|tags| {
+            tags.iter()
+                .map(|tag| ObjectTag::new(tag.key.clone(), tag.value.clone()))
+                .collect::<std::result::Result<Vec<_>, _>>()
+        })
+        .transpose()?;
+    let observations = MetadataObservations::new(
+        MetadataObservation::NotRequested,
+        MetadataObservation::NotRequested,
+        captured(tags),
+        captured(ownership),
+        captured(Some(TimestampMetadata {
+            accessed: Some(timestamp(entry.get_atime())),
+            modified: Some(timestamp(entry.get_mtime())),
+            created: None,
+        })),
+    )?;
+    let ownership_target = match target.map(|target| target.ownership) {
+        Some(CopiedOwnershipTarget::Numeric) if owner_permitted => OwnershipTarget::Numeric,
+        Some(CopiedOwnershipTarget::Numeric) => OwnershipTarget::NotPermitted,
+        Some(CopiedOwnershipTarget::ModeOnly) => OwnershipTarget::ModeOnly,
+        _ => OwnershipTarget::NotApplicable,
+    };
+    let timestamps = match target.map(|target| target.timestamps) {
+        Some(CopiedTimestampTarget::Stored(precision)) => TimestampTargetCapability::Supported(TimestampTarget {
+            precision,
+            accessed: true,
+            modified: true,
+            created: false,
+        }),
+        _ => TimestampTargetCapability::Unsupported,
+    };
+    let policies = MetadataPolicies::default()
+        .with_ownership_mode(
+            if ownership.is_some() && owner_permitted && ownership_target == OwnershipTarget::Numeric {
+                MetadataPolicy::RequireExact
+            } else if ownership.is_none() && mode.is_none() {
+                MetadataPolicy::BestEffort
+            } else {
+                MetadataPolicy::AllowKnownLoss
+            },
+        )
+        .with_timestamps(if matches!(timestamps, TimestampTargetCapability::Supported(_)) {
+            MetadataPolicy::AllowKnownLoss
+        } else {
+            MetadataPolicy::BestEffort
+        })
+        .with_tags(if entry.get_tags().is_some() {
+            MetadataPolicy::BestEffort
+        } else {
+            MetadataPolicy::Omit
+        });
+    Ok(compile_copied_metadata_plan(
+        &MetadataPlanRequest {
+            observations: &observations,
+            target: MetadataTarget {
+                acl: AclTarget::NotApplicable,
+                xattrs: ValueTarget::NotApplicable,
+                tags: if target.is_some_and(|target| target.tags == CopiedValueTarget::Supported) {
+                    ValueTarget::Supported
+                } else {
+                    ValueTarget::Unsupported
+                },
+                ownership_mode: ownership_target,
+                timestamps,
+            },
+            policies,
+            principal_mapper: None,
+        },
+        ownership.is_none().then_some(mode).flatten(),
+        false,
+        false,
+    )?)
+}
+
+fn captured<T>(value: Option<T>) -> MetadataObservation<T> {
+    value.map_or(MetadataObservation::NotRequested, |value| MetadataObservation::Value {
+        value,
+        provenance: MetadataProvenance::Inline,
+    })
+}
+
 struct WriteState {
     session: Option<ExpertDestinationSession>,
     transferred: Option<ExpertDestinationTransferred>,
@@ -155,7 +259,7 @@ struct WriteState {
     observer: Arc<Mutex<Option<CommitCallback>>>,
 }
 #[derive(Clone)]
-pub struct StreamHandle(Arc<tokio::sync::Mutex<WriteState>>);
+pub struct StreamHandle(Arc<AsyncMutex<WriteState>>);
 impl StreamHandle {
     pub async fn received_size(&self) -> u64 {
         self.0.lock().await.bytes
@@ -164,9 +268,7 @@ impl StreamHandle {
         self.0.lock().await.input_ended
     }
     pub async fn received_hash(&self) -> String {
-        blake3::Hash::from_bytes(self.0.lock().await.digest)
-            .to_hex()
-            .to_string()
+        Hash::from_bytes(self.0.lock().await.digest).to_hex().to_string()
     }
     pub async fn discard(&self) -> Result<()> {
         let mut state = self.0.lock().await;
@@ -190,7 +292,7 @@ impl StreamHandle {
 }
 impl StorageEnum {
     pub async fn prepare_stream(dest: &Self, entry: &EntryEnum) -> Result<StreamHandle> {
-        let p = crate::connected::path(entry.get_relative_path())?;
+        let p = path(entry.get_relative_path())?;
         // 旧 wire 不携带 opaque observation；该产品会话只接受从零写入，不能授权恢复。
         let identity = SourceIdentity::new(
             BackendIdentity::new(BackendKind::Local, "terrasync-wire-v9")?,
@@ -201,15 +303,16 @@ impl StorageEnum {
             p.clone(),
             EntryKind::File,
             Some(entry.get_size()),
-            Some(crate::connected::timestamp(entry.get_mtime())),
+            Some(timestamp(entry.get_mtime())),
             identity,
         )?;
+        let metadata_plan = stream_metadata_plan(dest, entry)?;
         let identity_key = observed.identity_key();
         let cancel = CancellationToken::new();
         let observer = Arc::new(Mutex::new(None::<CommitCallback>));
         let callback = observer.clone();
-        let progress = storage::WriteProgressObserver::new(move |event| {
-            if let storage::WriteProgress::Confirmed { offset, bytes } = event {
+        let progress = WriteProgressObserver::new(move |event| {
+            if let WriteProgress::Confirmed { offset, bytes } = event {
                 let callback = callback
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -228,6 +331,7 @@ impl StorageEnum {
                 cancel.clone(),
             )
             .with_transfer_policy(TransferPolicy::AtomicReplace)
+            .with_metadata_plan(metadata_plan)
             .with_write_observer(progress),
         )
         .await?;
@@ -242,11 +346,11 @@ impl StorageEnum {
             cancel,
             observer,
         };
-        Ok(StreamHandle(Arc::new(tokio::sync::Mutex::new(state))))
+        Ok(StreamHandle(Arc::new(AsyncMutex::new(state))))
     }
     pub async fn write_chunk_stream(
         _dest: &Self, _entry: &EntryEnum, rx: mpsc::Receiver<DataChunk>, handle: &StreamHandle,
-        _qos: Option<qos::QosManager>, on_committed: CommitCallback,
+        _qos: Option<QosManager>, on_committed: CommitCallback,
     ) -> Result<()> {
         let session = {
             let mut state = handle.0.lock().await;
@@ -256,9 +360,9 @@ impl StorageEnum {
                 .take()
                 .ok_or_else(|| operation("writer already started"))?
         };
-        let stats = Arc::new(Mutex::new((0u64, blake3::Hasher::new(), false)));
+        let stats = Arc::new(Mutex::new((0u64, Hasher::new(), false)));
         let tally = stats.clone();
-        let input: ByteStream = Box::pin(futures::stream::unfold((rx, false), move |(mut rx, failed)| {
+        let input: ByteStream = Box::pin(stream::unfold((rx, false), move |(mut rx, failed)| {
             let stats = stats.clone();
             async move {
                 if failed {
@@ -299,11 +403,7 @@ impl StorageEnum {
                 state.transferred = Some(transferred);
                 Ok(())
             }
-            Err(failure) => {
-                let message = failure.to_string();
-                failure.discard_stage().await?;
-                Err(operation(message))
-            }
+            Err(failure) => Err(cleanup_stream_failure(failure).await),
         }
     }
     pub async fn commit_chunk_stream(_dest: &Self, _entry: &EntryEnum, _size: u64, handle: StreamHandle) -> Result<()> {
@@ -325,20 +425,25 @@ impl StorageEnum {
             .await;
         match result {
             Ok(_) => Ok(()),
-            Err(failure) => {
-                let message = failure.to_string();
-                if failure.has_pending_cleanup() {
-                    failure.cleanup_published_stage().await?;
-                } else {
-                    failure.discard_stage().await?;
-                }
-                Err(operation(message))
-            }
+            Err(failure) => Err(cleanup_stream_failure(failure).await),
         }
     }
 }
+/// AtomicReplace 不保留恢复状态；公开诊断先复制，随后由原始失败清理其拥有的 stage。
+async fn cleanup_stream_failure(failure: TransferFailure) -> StorageError {
+    let mut diagnostic = StreamTransferDiagnostic::capture(&failure);
+    diagnostic.cleanup_failure = if failure.has_pending_cleanup() {
+        failure.cleanup_published_stage().await.err()
+    } else if failure.has_unpublished_stage() {
+        failure.discard_stage().await.err()
+    } else {
+        None
+    };
+    StorageError::StreamTransfer(Box::new(diagnostic))
+}
+
 fn role_failure(message: &str) -> storage::StorageRoleFailure {
-    storage::StorageRoleFailure::Entry(
+    StorageRoleFailure::Entry(
         EntryOperationFailure::new(
             StoragePath::root(),
             Operation::Write,
@@ -346,13 +451,13 @@ fn role_failure(message: &str) -> storage::StorageRoleFailure {
             Transience::Permanent,
             message,
         )
-        .unwrap_or_else(|_| unreachable!("static diagnostic")),
+        .unwrap_or_else(|_| unreachable!("固定诊断")),
     )
 }
 impl ConnectedStorage {
     pub async fn compute_hash(&self, p: &Path, _size: u64) -> Result<String> {
         let source = self.roles.read_source()?;
-        let p = crate::connected::path(p)?;
+        let p = path(p)?;
         let desc = source.describe(&p).await?;
         let mut stream = source
             .read(storage::ReadRequest {
@@ -367,10 +472,14 @@ impl ConnectedStorage {
                 version: SourceVersion::Current,
             })
             .await?;
-        let mut hasher = blake3::Hasher::new();
+        let mut hasher = Hasher::new();
         while let Some(bytes) = stream.next().await {
             hasher.update(&bytes?);
         }
         Ok(hasher.finalize().to_hex().to_string())
     }
 }
+
+#[cfg(test)]
+#[path = "streaming_metadata_tests.rs"]
+mod tests;

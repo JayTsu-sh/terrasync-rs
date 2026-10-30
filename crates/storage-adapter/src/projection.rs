@@ -1,8 +1,9 @@
+use crate::connected::path;
 use crate::{error::operation, *};
 use bytes::Bytes;
 use data_mover::{
     model::{observation::PrivateBackendEntryFacts, *},
-    storage::{InlineOwnership, SourceDescriptor},
+    storage::{InlineOwnership, PrincipalIdentity, SourceDescriptor},
 };
 use std::path::PathBuf;
 
@@ -65,10 +66,10 @@ impl ConnectedStorage {
         let EntryEnum::HDFS(entry) = entry else { return Ok(()) };
         let permissions = self.roles.metadata()?.permissions(descriptor).await?;
         entry.mode = permissions.mode;
-        if let Some(data_mover::storage::PrincipalIdentity::Named(owner)) = permissions.owner {
+        if let Some(PrincipalIdentity::Named(owner)) = permissions.owner {
             entry.owner = owner;
         }
-        if let Some(data_mover::storage::PrincipalIdentity::Named(group)) = permissions.group {
+        if let Some(PrincipalIdentity::Named(group)) = permissions.group {
             entry.group = group;
         }
         Ok(())
@@ -79,8 +80,8 @@ impl ConnectedStorage {
     ) -> Result<Vec<EntryEnum>> {
         let mut entries = histories.push(observed)?;
         if let PrivateBackendEntryFacts::Hdfs(facts) = observed.backend_facts() {
-            // Forward opaque backend facts to their role; HDFS answers permissions from the
-            // listing facts without a second stat or a numeric principal mapping.
+            // 将 opaque 后端事实交给对应角色；HDFS 从 listing 事实获取权限，
+            // 不执行第二次 stat，也不映射数字主体。
             let descriptor = SourceDescriptor::new(
                 observed.path().clone(),
                 observed.kind(),
@@ -95,7 +96,7 @@ impl ConnectedStorage {
         Ok(entries)
     }
     pub(crate) async fn observe(&self, value: &std::path::Path) -> Result<ObservedEntry> {
-        let p = crate::connected::path(value)?;
+        let p = path(value)?;
         let descriptor = self.roles.read_source()?.describe(&p).await?;
         let metadata = self
             .roles
@@ -132,7 +133,7 @@ pub(crate) fn project(entry: &ObservedEntry) -> EntryEnum {
     let atime = nanos(timestamps.and_then(|v| v.accessed));
     let ownership = entry.metadata().ownership_mode().value();
     let mode = ownership.map(|v| v.mode);
-    if entry.backend_kind() == data_mover::model::BackendKind::S3 {
+    if entry.backend_kind() == BackendKind::S3 {
         EntryEnum::S3(S3Entry {
             name,
             relative_path: entry.path().as_str().into(),
@@ -153,7 +154,7 @@ pub(crate) fn project(entry: &ObservedEntry) -> EntryEnum {
             version_count: None,
             is_dir: entry.kind() == EntryKind::Directory,
         })
-    } else if entry.backend_kind() == data_mover::model::BackendKind::Hdfs {
+    } else if entry.backend_kind() == BackendKind::Hdfs {
         EntryEnum::HDFS(HDFSEntry {
             name,
             relative_path: p,
@@ -184,7 +185,7 @@ pub(crate) fn project(entry: &ObservedEntry) -> EntryEnum {
             uid: ownership.map(|v| v.uid),
             gid: ownership.map(|v| v.gid),
             ino: None,
-            file_handle: if entry.backend_kind() == data_mover::model::BackendKind::Local {
+            file_handle: if entry.backend_kind() == BackendKind::Local {
                 None
             } else {
                 entry.source_identity().stable_bytes().map(|_| {
@@ -223,10 +224,10 @@ pub(crate) fn encode_acl(value: &AclMetadata) -> Result<Vec<u8>> {
     bincode_encode(&wire)
 }
 fn bincode_encode(value: &WireAcl) -> Result<Vec<u8>> {
-    serde_json::to_vec(value).map_err(operation)
+    serde_json::to_vec(value).map_err(StorageError::from)
 }
 pub(crate) fn decode_acl(bytes: &[u8]) -> Result<AclMetadata> {
-    let wire: WireAcl = serde_json::from_slice(bytes).map_err(operation)?;
+    let wire: WireAcl = serde_json::from_slice(bytes).map_err(StorageError::from)?;
     match wire.encoding {
         0 => Ok(AclMetadata::new_posix(wire.access, wire.default)?),
         1 => Ok(AclMetadata::new(AclEncoding::NfsV4, wire.access.unwrap_or_default())?),
@@ -299,7 +300,7 @@ impl HistoryProjection {
         if !history.is_complete() {
             return Ok(Vec::new());
         }
-        let count = u32::try_from(self.entries.len()).map_err(operation)?;
+        let count = u32::try_from(self.entries.len()).map_err(StorageError::from)?;
         for entry in &mut self.entries {
             entry.set_version_count(count);
         }

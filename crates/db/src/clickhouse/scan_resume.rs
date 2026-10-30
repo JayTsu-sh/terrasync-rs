@@ -1,10 +1,17 @@
-//! Durable scan cursors. Result/event writes are acknowledged before advancing this row.
+//! 持久化扫描游标：结果与事件写入确认后才能推进游标。
 use super::*;
+use clickhouse::error::Error as ClickHouseError;
 
 pub const RUNNING: u8 = 0;
 pub const FINALIZING: u8 = 1;
 pub const COMPLETED: u8 = 2;
 pub const ABANDONED: u8 = 3;
+
+#[derive(Serialize, clickhouse::Row)]
+struct ResumeDeleteKey {
+    relative_path: String,
+    version_id: String,
+}
 
 #[derive(Serialize, clickhouse::Row)]
 struct ResumeEventPath {
@@ -20,7 +27,7 @@ pub struct ScanResumeState {
     pub generation: u8,
     pub incremental: bool,
     pub phase: u8,
-    /// Exclusive lower timestamp bound for this scan round's idempotent event journal.
+    /// 本轮幂等事件日志的时间戳下界，不包含边界。
     pub event_time: i64,
     pub observed_entries: u64,
     pub checkpoint: Vec<u8>,
@@ -89,7 +96,7 @@ impl ClickHouseDatabase {
                 row.validate_envelope()?;
                 Ok(Some(row))
             }
-            Err(clickhouse::error::Error::RowNotFound) => Ok(None),
+            Err(ClickHouseError::RowNotFound) => Ok(None),
             Err(error) => Err(error.into()),
         }
     }
@@ -147,7 +154,7 @@ impl ClickHouseDatabase {
     }
 
     pub async fn cleanup_resume_batch(&self) -> Result<()> {
-        for prefix in ["scan_resume_batch", "scan_resume_event_keys"] {
+        for prefix in ["scan_resume_batch", "scan_resume_event_keys", "scan_resume_delete_keys"] {
             self.execute(
                 &format!("DROP TABLE IF EXISTS {prefix}_{}", sanitize_job_id(&self.job_id)),
                 &[],
@@ -157,8 +164,8 @@ impl ClickHouseDatabase {
         Ok(())
     }
 
-    /// Restore the existing working generation instead of rebasing already-scanned rows.
-    /// `true` means the final generation commit succeeded before the previous process died.
+    /// 恢复现有工作代次，保留已扫描条目的代次。
+    /// 返回 true 表示前一个进程退出前已提交最终代次。
     pub async fn restore_resume_generation(&self, state: &ScanResumeState) -> Result<bool> {
         let committed = self
             .query_scan_state()
@@ -183,7 +190,7 @@ impl ClickHouseDatabase {
         Ok(false)
     }
 
-    /// Start strictly after older events even if the runner's clock moved backwards.
+    /// 即使运行节点时钟回拨，本轮也从历史事件之后开始。
     pub async fn resume_event_epoch(&self, now: i64) -> Result<i64> {
         let table = get_incremental_scan_base_table_name(&self.job_id);
         if !self.check_table_exists(&table).await? {
@@ -202,18 +209,35 @@ impl ClickHouseDatabase {
         ))
     }
 
-    pub async fn delete_resume_paths(&self, paths: &[String]) -> Result<()> {
-        if paths.is_empty() {
+    /// 以路径与版本联合键删除，避免删除历史版本时误删同名的存活版本。
+    pub async fn delete_resume_entries(&self, entries: &[(String, String)]) -> Result<()> {
+        if entries.is_empty() {
             return Ok(());
         }
-        let keys = self.write_resume_keys(paths.iter().cloned().collect()).await?;
+        let keys = format!("scan_resume_delete_keys_{}", sanitize_job_id(&self.job_id));
+        self.execute(
+            &format!("CREATE TABLE IF NOT EXISTS {keys} (relative_path String, version_id String) ENGINE = Memory"),
+            &[],
+        )
+        .await?;
+        self.execute(&format!("TRUNCATE TABLE {keys}"), &[]).await?;
+        let mut insert = self.sync_client.insert::<ResumeDeleteKey>(&keys).await?;
+        for (relative_path, version_id) in entries {
+            insert
+                .write(&ResumeDeleteKey {
+                    relative_path: relative_path.clone(),
+                    version_id: version_id.clone(),
+                })
+                .await?;
+        }
+        insert.end().await?;
         let base = get_scan_base_table_name(&self.job_id);
-        // The next batch may replace the key table only after this mutation finishes.
+        // 等待 mutation 完成后才能覆盖下一个批次的辅助键表。
         self.sync_client
             .clone()
             .with_option("lightweight_deletes_sync", "1")
             .query(&format!(
-                "DELETE FROM {base} WHERE relative_path IN (SELECT relative_path FROM {keys})"
+                "DELETE FROM {base} WHERE (relative_path, version_id) IN (SELECT relative_path, version_id FROM {keys})"
             ))
             .execute()
             .await?;
@@ -236,8 +260,7 @@ impl ClickHouseDatabase {
         Ok(keys)
     }
 
-    /// Events precede base updates. Replays reuse existing timestamps, while distinct S3
-    /// versions get distinct keys in the legacy (operation, path, create_at) sorting key.
+    /// 事件先于基表更新；重放复用已有时间戳，不同 S3 版本在原排序键中保持独立。
     pub async fn write_resume_events(&self, messages: &[StorageEntryMessage], event_time: i64) -> Result<()> {
         if messages.is_empty() {
             return Ok(());
@@ -247,7 +270,7 @@ impl ClickHouseDatabase {
             .iter()
             .map(|message| IncrementalStorageEntryRecord::from_message(message).relative_path)
             .collect();
-        // RowBinary keys avoid an enormous SQL IN literal with production-sized scan batches.
+        // 使用 RowBinary 辅助键表，避免大批次生成超长 SQL IN 字面量。
         let keys = self.write_resume_keys(paths).await?;
         let existing = self
             .sync_client

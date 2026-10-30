@@ -1,14 +1,35 @@
-use crate::{error::operation, *};
+use crate::{
+    error::operation,
+    options::BackendConfig as ProductBackendConfig,
+    projection::{decode_acl, encode_acl},
+    streaming::source_qos,
+    *,
+};
+use data_mover::storage::{
+    BackendConfig as NativeBackendConfig, CifsBackendConfig, CopiedAclTarget, HdfsBackendConfig, LocalBackendConfig,
+    NfsBackendConfig, S3BackendConfig, StorageRoleFailure,
+};
 use data_mover::{
+    TransferConcurrency,
+    metadata::{
+        AclTarget, MetadataPlanRequest, MetadataPolicies, MetadataPolicy, MetadataTarget, OwnershipTarget,
+        TimestampTargetCapability, ValueTarget, compile_copied_metadata_plan,
+    },
     model::*,
-    storage::{self, MetadataMutation, Storage},
+    probes::{check_connectivity, probe_server_time},
+    storage::{self, CopiedOwnershipTarget, CopiedTimestampTarget, MetadataMutation, Storage},
     transfer::{self, ReadBackVerification, TransferPolicy, TransferRequest},
 };
+#[cfg(unix)]
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
+#[cfg(windows)]
+use std::os::windows::ffi::{OsStrExt, OsStringExt};
 use std::{
     num::NonZeroUsize,
     path::{Path, PathBuf},
     sync::atomic::Ordering,
 };
+use tokio::fs::create_dir_all;
 use tokio_util::sync::CancellationToken;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -64,14 +85,11 @@ pub async fn create_storage(path: &str, options: CreateStorageOptions) -> Result
         StorageType::Local => {
             let root = PathBuf::from(path);
             if options.ensure_dir {
-                tokio::fs::create_dir_all(&root).await?;
+                create_dir_all(&root).await?;
             }
-            let concurrency = data_mover::TransferConcurrency::from_env(
-                BackendKind::Local,
-                data_mover::TransferConcurrency::defaults(4, 2),
-            )
-            .map_err(operation)?;
-            storage::BackendConfig::Local(storage::LocalBackendConfig {
+            let concurrency = TransferConcurrency::from_env(BackendKind::Local, TransferConcurrency::defaults(4, 2))
+                .map_err(StorageError::from)?;
+            NativeBackendConfig::Local(LocalBackendConfig {
                 root,
                 rename_context: None,
                 read_concurrency: NonZeroUsize::new(concurrency.read())
@@ -82,29 +100,29 @@ pub async fn create_storage(path: &str, options: CreateStorageOptions) -> Result
                 write_chunk_bytes: options.block_size.and_then(|v| NonZeroUsize::new(v as usize)),
             })
         }
-        StorageType::Nfs => storage::BackendConfig::Nfs(storage::NfsBackendConfig {
+        StorageType::Nfs => NativeBackendConfig::Nfs(NfsBackendConfig {
             url: path.into(),
             block_size: options.block_size,
             ensure_dir: options.ensure_dir,
             transfer_concurrency: None,
         }),
-        StorageType::S3 => storage::BackendConfig::S3(storage::S3BackendConfig {
+        StorageType::S3 => NativeBackendConfig::S3(S3BackendConfig {
             url: path.into(),
             block_size: options.block_size,
             single_put_threshold: None,
         }),
         StorageType::Cifs => {
-            let mut config = storage::CifsBackendConfig::from_url(path).map_err(operation)?;
+            let mut config = CifsBackendConfig::from_url(path).map_err(StorageError::from)?;
             config.ensure_dir = options.ensure_dir;
-            storage::BackendConfig::Cifs(config)
+            NativeBackendConfig::Cifs(config)
         }
         StorageType::Hdfs => {
-            let crate::BackendConfig::Hdfs(client) = options.backend else {
+            let ProductBackendConfig::Hdfs(client) = options.backend else {
                 return Err(StorageError::ConfigError(
                     "HDFS requires explicit client configuration".into(),
                 ));
             };
-            storage::BackendConfig::Hdfs(storage::HdfsBackendConfig {
+            NativeBackendConfig::Hdfs(HdfsBackendConfig {
                 location: path.into(),
                 client,
                 block_size: options.block_size,
@@ -113,7 +131,7 @@ pub async fn create_storage(path: &str, options: CreateStorageOptions) -> Result
         }
     };
     let connected = ConnectedStorage {
-        roles: storage::connect_backend(config).await.map_err(operation)?,
+        roles: storage::connect_backend(config).await.map_err(StorageError::from)?,
         block_size,
     };
     Ok(match kind {
@@ -154,14 +172,12 @@ impl ConnectedStorage {
         Ok(self.roles.staged_destination()?.keeps_history().await?)
     }
     pub async fn check_connectivity(&self) -> Result<()> {
-        data_mover::probes::check_connectivity(&self.roles)
-            .await
-            .map_err(operation)
+        check_connectivity(&self.roles).await.map_err(StorageError::from)
     }
     pub async fn probe_server_time(&self) -> Result<Option<i64>> {
-        Ok(data_mover::probes::probe_server_time(&self.roles)
+        Ok(probe_server_time(&self.roles)
             .await
-            .map_err(operation)?
+            .map_err(StorageError::from)?
             .map(|v| (v.unix_nanos() / 1_000_000_000) as i64))
     }
     pub async fn get_metadata(&self, value: &Path) -> Result<EntryEnum> {
@@ -171,7 +187,7 @@ impl ConnectedStorage {
     pub async fn create_dir_all(&self, entry: &EntryEnum) -> Result<()> {
         storage::create_directory_all(&self.roles, &path(entry.get_relative_path())?)
             .await
-            .map_err(operation)
+            .map_err(StorageError::from)
     }
     pub async fn rename(&self, from: &Path, to: &Path) -> Result<()> {
         Ok(self.roles.namespace()?.rename(&path(from)?, &path(to)?).await?)
@@ -191,12 +207,10 @@ impl ConnectedStorage {
             .await?;
         #[cfg(unix)]
         {
-            use std::os::unix::ffi::OsStringExt;
             Ok(std::ffi::OsString::from_vec(target.as_bytes().to_vec()).into())
         }
         #[cfg(windows)]
         {
-            use std::os::windows::ffi::OsStringExt;
             if target.encoding() == SymlinkTargetEncoding::WindowsWide {
                 let wide: Vec<_> = target
                     .as_bytes()
@@ -205,7 +219,9 @@ impl ConnectedStorage {
                     .collect();
                 Ok(std::ffi::OsString::from_wide(&wide).into())
             } else {
-                Ok(String::from_utf8(target.as_bytes().to_vec()).map_err(operation)?.into())
+                Ok(String::from_utf8(target.as_bytes().to_vec())
+                    .map_err(StorageError::from)?
+                    .into())
             }
         }
     }
@@ -214,22 +230,18 @@ impl ConnectedStorage {
         if let Some(parent) = entry.get_relative_path().parent() {
             storage::create_directory_all(&self.roles, &path(parent)?)
                 .await
-                .map_err(operation)?;
+                .map_err(StorageError::from)?;
         }
         // 旧产品支持用链接替换已有目录项；角色接口显式要求调用方删除。
         match self.roles.namespace()?.stat(&name).await {
             Ok(_) => self.roles.namespace()?.delete(&name).await?,
-            Err(storage::StorageRoleFailure::Entry(e)) if e.class() == FailureClass::NotFound => {}
+            Err(StorageRoleFailure::Entry(e)) if e.class() == FailureClass::NotFound => {}
             Err(e) => return Err(e.into()),
         }
         #[cfg(unix)]
-        let bytes = {
-            use std::os::unix::ffi::OsStrExt;
-            target.as_os_str().as_bytes().to_vec()
-        };
+        let bytes = { target.as_os_str().as_bytes().to_vec() };
         #[cfg(windows)]
         let bytes = {
-            use std::os::windows::ffi::OsStrExt;
             target
                 .as_os_str()
                 .encode_wide()
@@ -259,7 +271,6 @@ impl ConnectedStorage {
         &self, value: &Path, atime: Option<i64>, mtime: Option<i64>, uid: Option<u32>, gid: Option<u32>,
         mode: Option<u32>,
     ) -> Result<()> {
-        use storage::{CopiedOwnershipTarget, CopiedTimestampTarget};
         let destination = self.roles.staged_destination()?;
         let capabilities = destination
             .copied_metadata_target()
@@ -267,7 +278,7 @@ impl ConnectedStorage {
         let metadata = self.roles.metadata()?;
         let p = path(value)?;
         let cancel = CancellationToken::new();
-        // Legacy NAS modes include file-type bits; the role mutation accepts permission bits.
+        // 旧 NAS mode 包含文件类型位；角色层的修改接口只接受权限位。
         let mode = mode.map(|value| value & 0o7777);
         if let (CopiedOwnershipTarget::Numeric, Some(uid), Some(gid), Some(mode)) =
             (capabilities.ownership, uid, gid, mode)
@@ -330,10 +341,10 @@ impl ConnectedStorage {
                 ObservationPlan::default().with_acl(ObservationMode::BestEffort),
             )
             .await?;
-        facts.acl().value().map(crate::projection::encode_acl).transpose()
+        facts.acl().value().map(encode_acl).transpose()
     }
     pub async fn set_acl_bytes(&self, value: &Path, bytes: &[u8]) -> Result<()> {
-        let acl = crate::projection::decode_acl(bytes)?;
+        let acl = decode_acl(bytes)?;
         self.apply_acl(value, acl).await
     }
 }
@@ -360,7 +371,7 @@ impl StorageEnum {
             ReadBackVerification::Disabled
         });
         if let Some(qos) = options.qos {
-            request = request.with_source_qos(crate::streaming::source_qos(&qos, from.block_size)?);
+            request = request.with_source_qos(source_qos(&qos, from.block_size)?);
         }
         let outcome = if options.is_source_reserved {
             transfer::transfer(request).await?
@@ -383,13 +394,16 @@ impl StorageEnum {
             options.cancel.unwrap_or_default(),
         )
         .with_transfer_policy(TransferPolicy::Checkpointed);
+        if let Some(version) = entry.get_version_id() {
+            request = request.with_source_version(SourceVersion::Id(version.into()));
+        }
         request = request.with_read_back_verification(if options.enable_integrity_check {
             ReadBackVerification::Enabled
         } else {
             ReadBackVerification::Disabled
         });
         if let Some(qos) = options.qos {
-            request = request.with_source_qos(crate::streaming::source_qos(&qos, from.block_size)?);
+            request = request.with_source_qos(source_qos(&qos, from.block_size)?);
         }
         let outcome = if options.is_source_reserved {
             transfer::transfer(request).await?
@@ -433,13 +447,9 @@ impl StorageEnum {
 impl ConnectedStorage {
     /// 在当前目标的 ACL 能力下先编译映射，不能把另一协议的原生字节直接写入。
     pub(crate) async fn apply_acl(&self, value: &Path, acl: AclMetadata) -> Result<()> {
-        use data_mover::metadata::{
-            AclTarget, MetadataPlanRequest, MetadataPolicies, MetadataPolicy, MetadataTarget, OwnershipTarget,
-            TimestampTargetCapability, ValueTarget, compile_copied_metadata_plan,
-        };
         let target = self.roles.staged_destination()?.copied_metadata_target();
         let acl_target = match target.map(|v| v.acl) {
-            Some(storage::CopiedAclTarget::Encoding(encoding)) => AclTarget::Encoding(encoding),
+            Some(CopiedAclTarget::Encoding(encoding)) => AclTarget::Encoding(encoding),
             _ => AclTarget::Unsupported,
         };
         let observations = MetadataObservations::new(
@@ -469,10 +479,10 @@ impl ConnectedStorage {
             false,
             true,
         )
-        .map_err(operation)?;
+        .map_err(StorageError::from)?;
         plan.apply(&*self.roles.metadata()?, &path(value)?, CancellationToken::new())
             .await
-            .map_err(operation)?;
+            .map_err(StorageError::from)?;
         Ok(())
     }
 }

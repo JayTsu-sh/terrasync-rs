@@ -3,8 +3,10 @@
 //! data-mover 只产生 bounded `TraversalSession`；本模块分配 session-local NDX、分页
 //! opaque snapshot，并把 entry failure 与唯一 terminal evidence 投影到 transport wire。
 
+use data_mover::model::BackendIdentity;
 use std::collections::HashMap;
 use std::num::NonZeroUsize;
+use transport::message::SenderMsg;
 
 use async_trait::async_trait;
 use data_mover::model::{BackendSessionFailure, EntryOperationFailure, ObservedEntry};
@@ -37,9 +39,7 @@ impl<'a> TransportAdvertisementSink<'a> {
 #[async_trait]
 impl RemoteAdvertisementSink for TransportAdvertisementSink<'_> {
     async fn send(&mut self, event: AdvertisementEvent) -> Result<()> {
-        self.transport
-            .send(transport::message::SenderMsg::Advertisement(event))
-            .await?;
+        self.transport.send(SenderMsg::Advertisement(event)).await?;
         Ok(())
     }
 }
@@ -98,7 +98,7 @@ pub struct RemoteAdvertisementSummary {
 
 /// Receiver 侧的增量 validator；只保留页号、NDX 与计数，不访问 storage backend。
 pub struct RemoteAdvertisementReceiver {
-    backend: data_mover::model::BackendIdentity,
+    backend: BackendIdentity,
     maximum_page_entries: usize,
     expected_page: u64,
     expected_ndx: u64,
@@ -108,7 +108,7 @@ pub struct RemoteAdvertisementReceiver {
 
 impl RemoteAdvertisementReceiver {
     #[must_use]
-    pub fn new(maximum_page_entries: NonZeroUsize, backend: data_mover::model::BackendIdentity) -> Self {
+    pub fn new(maximum_page_entries: NonZeroUsize, backend: BackendIdentity) -> Self {
         Self {
             backend,
             maximum_page_entries: maximum_page_entries.get(),
@@ -151,8 +151,13 @@ impl RemoteAdvertisementReceiver {
                             self.expected_ndx, advertised.ndx.0
                         )));
                     }
-                    let entry = ObservedEntry::decode_snapshot(&advertised.snapshot, &self.backend)
-                        .map_err(|error| protocol_error(error.to_string()))?;
+                    let entry =
+                        ObservedEntry::decode_snapshot(&advertised.snapshot, &self.backend).map_err(|source| {
+                            AppError::RemoteAdvertisementSnapshotDecode {
+                                ndx: advertised.ndx,
+                                source,
+                            }
+                        })?;
                     entries.push((advertised.ndx, entry));
                     self.expected_ndx = self
                         .expected_ndx
@@ -462,11 +467,15 @@ fn runtime_failure(diagnostic: String) -> AdvertisementFailure {
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
-    fn completion(entries: u64, failures: u64) -> data_mover::traversal::TraversalCompletion {
-        let mut totals = data_mover::traversal::ScanTotals::default();
+    use data_mover::traversal::{ScanFailure, ScanTotals, TraversalCompletion};
+    use tokio::task::yield_now;
+    use transport::in_process::create_in_process_pair_with_capacity;
+
+    fn completion(entries: u64, failures: u64) -> TraversalCompletion {
+        let mut totals = ScanTotals::default();
         totals.emitted = entries;
         totals.failed_children = failures;
-        data_mover::traversal::TraversalCompletion::new(totals)
+        TraversalCompletion::new(totals)
     }
 
     use std::sync::{Arc, Mutex};
@@ -511,8 +520,8 @@ mod tests {
     }
 
     fn failure(path: &str) -> TraversalItem {
-        TraversalItem::Failure(Box::new(data_mover::traversal::ScanFailure::child(
-            data_mover::model::EntryOperationFailure::new(
+        TraversalItem::Failure(Box::new(ScanFailure::child(
+            EntryOperationFailure::new(
                 StoragePath::new(path).unwrap(),
                 Operation::Observe,
                 FailureClass::PermissionDenied,
@@ -617,7 +626,7 @@ mod tests {
 
         assert!(matches!(
             error,
-            crate::error::AppError::RemoteAdvertisementCancelled {
+            AppError::RemoteAdvertisementCancelled {
                 observed_entries: 0,
                 entry_failures: 0
             }
@@ -632,7 +641,7 @@ mod tests {
     async fn backend_session_failure_is_terminal_and_keeps_failure_scope() {
         let (producer, session) = TraversalSession::bounded(NonZeroUsize::new(1).unwrap(), CancellationToken::new());
         producer.finish(Err(TraversalTerminalFailure::Session(
-            data_mover::model::BackendSessionFailure::new(
+            BackendSessionFailure::new(
                 Operation::Traverse,
                 FailureClass::Connectivity,
                 Transience::Transient,
@@ -646,7 +655,7 @@ mod tests {
             .await
             .unwrap_err();
 
-        assert!(matches!(error, crate::error::AppError::TraversalTerminal(_)));
+        assert!(matches!(error, AppError::TraversalTerminal(_)));
         assert!(matches!(
             sink.events.lock().unwrap().last(),
             Some(AdvertisementEvent::Terminal(AdvertisementTerminal::Failed { failure, .. }))
@@ -665,10 +674,7 @@ mod tests {
             .await
             .unwrap_err();
 
-        assert!(matches!(
-            error,
-            crate::error::AppError::RemoteAdvertisementCountMismatch { .. }
-        ));
+        assert!(matches!(error, AppError::RemoteAdvertisementCountMismatch { .. }));
         assert!(matches!(
             sink.events.lock().unwrap().last(),
             Some(AdvertisementEvent::Terminal(AdvertisementTerminal::Failed { failure, .. }))
@@ -684,30 +690,30 @@ mod tests {
             producer.send(entry("b", 2)).await.unwrap();
             producer.finish(Ok(TraversalOutcome::Completed(completion(2, 0))));
         });
-        let (sender, receiver) = transport::in_process::create_in_process_pair_with_capacity(1);
+        let (sender, receiver) = create_in_process_pair_with_capacity(1);
         let advertise_task = tokio::spawn(async move {
             let mut sink = TransportAdvertisementSink::new(&sender);
             advertise_remote(session, NonZeroUsize::new(1).unwrap(), &mut sink).await
         });
 
-        tokio::task::yield_now().await;
+        yield_now().await;
         assert!(!advertise_task.is_finished());
         assert!(matches!(
             receiver.recv().await,
-            Some(transport::message::SenderMsg::Advertisement(AdvertisementEvent::Page(page)))
+            Some(SenderMsg::Advertisement(AdvertisementEvent::Page(page)))
                 if page.sequence == 0
         ));
         assert!(!advertise_task.is_finished());
         assert!(matches!(
             receiver.recv().await,
-            Some(transport::message::SenderMsg::Advertisement(AdvertisementEvent::Page(page)))
+            Some(SenderMsg::Advertisement(AdvertisementEvent::Page(page)))
                 if page.sequence == 1
         ));
         assert!(matches!(
             receiver.recv().await,
-            Some(transport::message::SenderMsg::Advertisement(
-                AdvertisementEvent::Terminal(AdvertisementTerminal::Completed { .. })
-            ))
+            Some(SenderMsg::Advertisement(AdvertisementEvent::Terminal(
+                AdvertisementTerminal::Completed { .. }
+            )))
         ));
         let result = advertise_task.await.unwrap().unwrap();
         producer_task.await.unwrap();
@@ -828,10 +834,7 @@ mod tests {
                 }),
             ])
             .unwrap_err();
-        assert!(matches!(
-            malformed,
-            crate::error::AppError::RemoteAdvertisementProtocol { .. }
-        ));
+        assert!(matches!(malformed, AppError::RemoteAdvertisementSnapshotDecode { .. }));
 
         let out_of_sequence = receiver()
             .receive([
@@ -845,10 +848,7 @@ mod tests {
                 }),
             ])
             .unwrap_err();
-        assert!(matches!(
-            out_of_sequence,
-            crate::error::AppError::RemoteAdvertisementProtocol { .. }
-        ));
+        assert!(matches!(out_of_sequence, AppError::RemoteAdvertisementProtocol { .. }));
 
         let false_completion = receiver()
             .receive([
@@ -864,7 +864,7 @@ mod tests {
             .unwrap_err();
         assert!(matches!(
             false_completion,
-            crate::error::AppError::RemoteAdvertisementCountMismatch { .. }
+            AppError::RemoteAdvertisementCountMismatch { .. }
         ));
 
         let missing_terminal = receiver()
@@ -873,9 +873,6 @@ mod tests {
                 entries: vec![valid],
             })])
             .unwrap_err();
-        assert!(matches!(
-            missing_terminal,
-            crate::error::AppError::RemoteAdvertisementProtocol { .. }
-        ));
+        assert!(matches!(missing_terminal, AppError::RemoteAdvertisementProtocol { .. }));
     }
 }

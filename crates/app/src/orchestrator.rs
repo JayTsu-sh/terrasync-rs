@@ -4,6 +4,7 @@
 //! 通过 Transport 抽象层连接 Sender 和 Receiver，支持单进程和双进程两种模式。
 
 // 标准库
+use crate::file_copy::{HdfsCopyContext, MetadataApplication, copy_file};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -31,7 +32,6 @@ use dashmap::DashMap;
 use db::factory::DatabaseFactory;
 use db::traits::Database;
 use db::{self, DeletionStatus, INCREMENTAL_SCAN_TABLE_BASE_NAME};
-use storage_adapter::error::StorageError;
 use storage_adapter::qos::QosManager;
 #[cfg(windows)]
 use storage_adapter::storage_enum::{StorageType, detect_storage_type};
@@ -871,7 +871,7 @@ impl SyncOrchestrator {
                             }
                             StorageEntryMessage::Changed { ref entry, kind } => {
                                 // MetadataOnly：chmod/chown 变更，跳过 copy_file 只同步属性
-                                let result = if kind == storage_adapter::ChangeKind::MetadataOnly {
+                                let result = if kind == ChangeKind::MetadataOnly {
                                     process_metadata_only_entry(
                                         entry,
                                         src.clone(),
@@ -927,7 +927,7 @@ impl SyncOrchestrator {
                                 };
                                 match result {
                                     Ok(()) => bc.broadcast(message.clone()).await,
-                                    Err(StorageError::FileNotFound(_) | StorageError::DirectoryNotFound(_)) => {
+                                    Err(error) if error.is_not_found() => {
                                         trace!("Already deleted, skipping: {:?}", entry.get_relative_path());
                                         bc.broadcast(message.clone()).await;
                                     }
@@ -1304,7 +1304,7 @@ impl SyncOrchestrator {
         if kind != ChangeKind::MetadataOnly {
             // 内容变更：完整拷贝文件再设置元数据
             let hdfs = if matches!(dest, StorageEnum::HDFS(_)) {
-                match crate::file_copy::HdfsCopyContext::from_job(job_id, no_resume) {
+                match HdfsCopyContext::from_job(job_id, no_resume) {
                     Ok(context) => Some(context),
                     Err(error) => {
                         warn!("Phase B: invalid HDFS recovery identity: {error}");
@@ -1330,7 +1330,7 @@ impl SyncOrchestrator {
                     context.with_commit_callback(recorder.callback())
                 })
             });
-            let copy_result = crate::file_copy::copy_file(
+            let copy_result = copy_file(
                 src,
                 dest,
                 entry,
@@ -1347,14 +1347,14 @@ impl SyncOrchestrator {
             let copy_result = if let Some(recorder) = recorder {
                 let metadata = copy_result.as_ref().ok().copied();
                 match recorder.finish(copy_result.map(|_| ())).await {
-                    Ok(()) => Ok(metadata.unwrap_or(crate::file_copy::MetadataApplication::DataMover)),
+                    Ok(()) => Ok(metadata.unwrap_or(MetadataApplication::DataMover)),
                     Err(error) => Err(error),
                 }
             } else {
                 copy_result
             };
             match copy_result {
-                Ok(crate::file_copy::MetadataApplication::DataMover) => metadata_applied = true,
+                Ok(MetadataApplication::DataMover) => metadata_applied = true,
                 Err(e) => {
                     warn!(
                         "Phase B: renamed+data-changed content copy failed for {:?}: {}",
@@ -1441,7 +1441,10 @@ impl SyncOrchestrator {
                         dest_storage.delete_file(&entry_arc).await
                     };
                     match result {
-                        Ok(()) | Err(StorageError::FileNotFound(_) | StorageError::DirectoryNotFound(_)) => {
+                        Ok(()) => {
+                            broadcaster.broadcast(StorageEntryMessage::Deleted(entry_arc)).await;
+                        }
+                        Err(error) if error.is_not_found() => {
                             broadcaster.broadcast(StorageEntryMessage::Deleted(entry_arc)).await;
                         }
                         Err(e) => {

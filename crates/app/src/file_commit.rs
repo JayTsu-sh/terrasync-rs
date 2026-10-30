@@ -9,6 +9,7 @@ use std::sync::atomic::Ordering;
 
 // 外部 crate
 use bytes::{Bytes, BytesMut};
+use storage_adapter::error::Result as StorageResult;
 use storage_adapter::{CommitCallback, DataChunk, EntryEnum, StorageEnum, StreamHandle};
 use sync_delta::DeltaToken;
 use sync_delta::reconstruct::{ReconstructStep, Reconstructor};
@@ -25,15 +26,15 @@ use crate::receiver::{ReceiverProgress, validate_relative_path};
 struct ActiveFile {
     /// Receiver 请求索引，在完整落盘生命周期中保持权威关联。
     ndx: i32,
-    /// 目标端文件 entry（提交 rename 的目标 + `set_metadata` 依据）
+    /// 目标端文件 entry（最终路径及暂存元数据计划的依据）
     entry: Arc<EntryEnum>,
     /// 向 `write_chunk_stream` 内部 channel 转发数据块的发送端
     tx_inner: mpsc::Sender<DataChunk>,
     /// 后台写任务句柄，channel 关闭后收尾并返回结果
-    write_join: JoinHandle<storage_adapter::error::Result<()>>,
+    write_join: JoinHandle<StorageResult<()>>,
     /// expert destination 的会话状态（write 任务持有其 clone）
     handle: StreamHandle,
-    /// 文件总大小（提交时 `set_file_len` + hash 校验用）
+    /// 声明的文件总大小（输入长度及摘要校验用）
     size: u64,
     /// 权威 transfer mode；delta 状态只存在于 delta variant 中。
     mode: ActiveFileMode,
@@ -355,9 +356,6 @@ async fn finalize_file(
         return CommitOutcome::HardError(AppError::from(e));
     }
 
-    if let Err(error) = dest.set_entry_metadata(&entry).await {
-        return stage_error("metadata commit", AppError::from(error));
-    }
     progress.files_transferred.fetch_add(1, Ordering::Relaxed);
     progress.bytes_transferred.fetch_add(size, Ordering::Relaxed);
     CommitOutcome::Success

@@ -3,6 +3,7 @@
 //! 提供与ClickHouse数据库交互的所有操作功能，包括表的创建、查询、插入和删除等。
 
 // 标准库
+use data_mover::model::BackendIdentity;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock, Weak};
@@ -378,9 +379,7 @@ impl ClickHouseDatabase {
     ///
     /// # Errors
     /// 临时表不存在、查询失败、snapshot 异常或投影不一致时返回 typed error。
-    pub async fn detect_changed_observations(
-        &self, backend: &data_mover::model::BackendIdentity,
-    ) -> Result<Vec<ObservedEntry>> {
+    pub async fn detect_changed_observations(&self, backend: &BackendIdentity) -> Result<Vec<ObservedEntry>> {
         let temp = self
             .scan_temp_table_name
             .as_ref()
@@ -451,20 +450,27 @@ impl ClickHouseDatabase {
         {
             Ok(deleted) => deleted,
             Err(error) => {
-                self.abort_observation_snapshot().await?;
+                if let Err(abort) = self.abort_observation_snapshot().await {
+                    return Err(DatabaseError::ObservationAbortFailed {
+                        source: Box::new(error),
+                        abort: Box::new(abort),
+                    });
+                }
                 return Err(error);
             }
         };
         if let Err(error) = self.execute(&format!("EXCHANGE TABLES {base} AND {temp}"), &[]).await {
             self.generation_lifecycle.lock().await.observation_publication_ambiguous = true;
-            return Err(DatabaseError::TransactionError(format!(
-                "observation snapshot EXCHANGE outcome is ambiguous: {error}"
-            )));
+            return Err(DatabaseError::ObservationExchangeAmbiguous {
+                source: Box::new(error),
+            });
         }
         if let Err(commit_error) = Database::commit_scan_generation(self).await {
-            let working = self.generation_lifecycle.lock().await.working.ok_or_else(|| {
-                DatabaseError::TransactionError("observation publication lost its working generation".to_string())
-            })?;
+            let Some(working) = self.generation_lifecycle.lock().await.working else {
+                return Err(DatabaseError::ObservationGenerationLost {
+                    source: Box::new(commit_error),
+                });
+            };
             match self.query_scan_state().await {
                 Ok(Some(persisted)) if persisted == working => {
                     self.cached_scan_state.store(working, Ordering::Relaxed);
@@ -475,9 +481,10 @@ impl ClickHouseDatabase {
                     if let Err(rollback_error) = self.execute(&format!("EXCHANGE TABLES {base} AND {temp}"), &[]).await
                     {
                         self.generation_lifecycle.lock().await.observation_publication_ambiguous = true;
-                        return Err(DatabaseError::TransactionError(format!(
-                            "generation commit failed ({commit_error}); snapshot rollback also failed ({rollback_error})"
-                        )));
+                        return Err(DatabaseError::ObservationRollbackFailed {
+                            commit: Box::new(commit_error),
+                            rollback: Box::new(rollback_error),
+                        });
                     }
                     *self.generation_lifecycle.lock().await = ScanGenerationLifecycle::default();
                     if let Err(error) = self.drop_scan_temporary_table().await {
@@ -485,11 +492,12 @@ impl ClickHouseDatabase {
                     }
                     return Err(commit_error);
                 }
-                Ok(None) | Err(_) => {
+                result @ (Ok(None) | Err(_)) => {
                     self.generation_lifecycle.lock().await.observation_publication_ambiguous = true;
-                    return Err(DatabaseError::TransactionError(format!(
-                        "generation commit outcome is ambiguous after snapshot exchange: {commit_error}"
-                    )));
+                    return Err(DatabaseError::ObservationCommitAmbiguous {
+                        commit: Box::new(commit_error),
+                        verification: result.err().map(Box::new),
+                    });
                 }
             }
         }
@@ -520,7 +528,7 @@ impl ClickHouseDatabase {
     /// # Errors
     /// 查询失败、snapshot 异常或查询投影不一致时返回 typed error。
     pub async fn load_observation(
-        &self, identity_key: &str, backend: &data_mover::model::BackendIdentity,
+        &self, identity_key: &str, backend: &BackendIdentity,
     ) -> Result<Option<ObservedEntry>> {
         let table_name = get_scan_base_table_name(&self.job_id);
         let query = format!(
@@ -1404,6 +1412,7 @@ impl Database for ClickHouseDatabase {
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
+    use storage_adapter::{NASEntry, S3Entry};
 
     use super::*;
     use crate::common::DeletionStatus;
@@ -1440,7 +1449,7 @@ mod tests {
 
     #[test]
     fn test_nas_entry_roundtrip() {
-        let nas = storage_adapter::EntryEnum::NAS(storage_adapter::NASEntry {
+        let nas = EntryEnum::NAS(NASEntry {
             name: "test.txt".to_string(),
             relative_path: PathBuf::from("dir/test.txt"),
             extension: Some("txt".to_string()),
@@ -1477,7 +1486,7 @@ mod tests {
 
     #[test]
     fn test_s3_entry_roundtrip() {
-        let s3 = storage_adapter::EntryEnum::S3(storage_adapter::S3Entry {
+        let s3 = EntryEnum::S3(S3Entry {
             name: "obj.json".to_string(),
             relative_path: "bucket/obj.json".to_string(),
             extension: Some("json".to_string()),
@@ -1502,7 +1511,7 @@ mod tests {
 
     #[test]
     fn test_nas_entry_optional_fields_none() {
-        let nas = storage_adapter::EntryEnum::NAS(storage_adapter::NASEntry {
+        let nas = EntryEnum::NAS(NASEntry {
             name: "a.txt".to_string(),
             relative_path: PathBuf::from("a.txt"),
             extension: None,
@@ -1535,7 +1544,7 @@ mod tests {
 
     #[test]
     fn test_current_state_propagation() {
-        let nas = storage_adapter::EntryEnum::NAS(storage_adapter::NASEntry {
+        let nas = EntryEnum::NAS(NASEntry {
             name: "a.txt".to_string(),
             relative_path: PathBuf::from("a.txt"),
             extension: None,

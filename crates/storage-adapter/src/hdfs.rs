@@ -1,5 +1,10 @@
-use crate::{error::operation, *};
-use data_mover::transfer::{TransferIdentity, TransferPolicy, TransferRequest};
+use crate::*;
+use crate::{connected::path, streaming::source_qos};
+use data_mover::{
+    model::SourceVersion,
+    transfer::{self, ReadBackVerification, TransferIdentity, TransferPolicy, TransferRequest},
+};
+use std::sync::atomic::Ordering;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum HdfsResumeMode {
     Auto,
@@ -36,31 +41,34 @@ impl StorageEnum {
         }
         let mut request = TransferRequest::new(
             source.roles.clone(),
-            crate::connected::path(entry.get_relative_path())?,
+            path(entry.get_relative_path())?,
             destination.roles.clone(),
             options.cancel.unwrap_or_default(),
         )
-        .with_identity_override(TransferIdentity::from_label(recovery.identity).map_err(operation)?)
+        .with_identity_override(TransferIdentity::from_label(recovery.identity).map_err(StorageError::from)?)
         .with_transfer_policy(if recovery.mode == HdfsResumeMode::Restart {
             TransferPolicy::AtomicReplace
         } else {
             TransferPolicy::Checkpointed
         });
+        if let Some(version) = entry.get_version_id() {
+            request = request.with_source_version(SourceVersion::Id(version.into()));
+        }
         if let Some(qos) = options.qos {
-            request = request.with_source_qos(crate::streaming::source_qos(&qos, source.block_size)?);
+            request = request.with_source_qos(source_qos(&qos, source.block_size)?);
         }
         request = request.with_read_back_verification(if options.enable_integrity_check {
-            data_mover::transfer::ReadBackVerification::Enabled
+            ReadBackVerification::Enabled
         } else {
-            data_mover::transfer::ReadBackVerification::Disabled
+            ReadBackVerification::Disabled
         });
         let result = if options.is_source_reserved {
-            data_mover::transfer::transfer(request).await?
+            transfer::transfer(request).await?
         } else {
-            data_mover::transfer::move_file(request).await?
+            transfer::move_file(request).await?
         };
         if let Some(counter) = options.bytes_counter {
-            counter.fetch_add(result.transferred_bytes, std::sync::atomic::Ordering::Relaxed);
+            counter.fetch_add(result.transferred_bytes, Ordering::Relaxed);
         }
         (recovery.callback)(0, entry.get_size());
         Ok(())

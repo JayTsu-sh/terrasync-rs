@@ -292,8 +292,32 @@ mod clickhouse_integration_tests {
             .iter()
             .map(|entry| entry.get_relative_path().to_string_lossy().into_owned())
             .collect();
-        database.delete_resume_paths(&paths).await.unwrap();
+        database
+            .delete_resume_entries(&paths.into_iter().map(|path| (path, String::new())).collect::<Vec<_>>())
+            .await
+            .unwrap();
         assert_eq!(database.get_count(db::SCAN_BASE_TABLE_BASE_NAME).await.unwrap(), 0);
+        // 同 key 删除一个历史版本，必须保留另一个存活版本，重放删除也必须幂等。
+        let history = vec![
+            Arc::new(make_s3("history-key", 1, 0, Some("v1"))),
+            Arc::new(make_s3("history-key", 2, 0, Some("v2"))),
+        ];
+        database.write_resume_base_records(&history).await.unwrap();
+        for _ in 0..2 {
+            database
+                .delete_resume_entries(&[("history-key".into(), "v1".into())])
+                .await
+                .unwrap();
+        }
+        let remaining = clickhouse_client(&config)
+            .query(&format!(
+                "SELECT version_id FROM base_{} FINAL WHERE relative_path='history-key'",
+                utils::sanitize_job_id(&job)
+            ))
+            .fetch_all::<String>()
+            .await
+            .unwrap();
+        assert_eq!(remaining, vec!["v2"]);
         assert!(database.resume_event_epoch(0).await.unwrap() > state.event_time);
         state.phase = FINALIZING;
         state.advance().unwrap();

@@ -19,6 +19,7 @@ tokio = { workspace = true }
 tokio-util = { workspace = true }
 tracing = { workspace = true }
 soft-canonicalize = "0.5"
+moka = { version = "0.12", features = ["sync"] }
 
 [dev-dependencies]
 tempfile = "3"

@@ -1,4 +1,5 @@
-//! Checkpointed scans: one acknowledged result/event writer, then an opaque cursor in ClickHouse.
+//! 检查点扫描：先确认结果与事件持久化，再将 opaque 游标写入 ClickHouse。
+use db::DatabaseConfig;
 use std::{
     fs::OpenOptions,
     num::NonZeroUsize,
@@ -7,9 +8,17 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+use data_mover::traversal::{Resumable, TraversalOutcome};
 use db::clickhouse::scan_resume::{COMPLETED, FINALIZING, RUNNING, ScanResumeState};
 use db::{ClickHouseDatabase, Database, DeletionStatus, INCREMENTAL_SCAN_TABLE_BASE_NAME};
-use storage_adapter::{EntryEnum, ErrorEvent, ResumableScanItem, StorageEntryMessage, WalkOptions, canonicalize_path};
+#[cfg(feature = "license")]
+use licensing::verify::quick_verify;
+use storage_adapter::filter::parse_filter_expression;
+use storage_adapter::{
+    EntryEnum, ErrorEvent, ResumableScanItem, StorageEntryMessage, StorageEnum, WalkOptions, canonicalize_path,
+};
+#[cfg(feature = "lab-fault-injection")]
+use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 use utils::app_config::AppConfig;
@@ -29,7 +38,7 @@ pub async fn scan_with_resume(
 ) -> Result<()> {
     #[cfg(feature = "license")]
     if let Ok(license) = licensing::get_global_license() {
-        licensing::verify::quick_verify(license)?;
+        quick_verify(license)?;
     }
     let config = AppConfig::fetch()?;
     if !config.database.enabled || config.database.r#type != "clickhouse" {
@@ -42,27 +51,20 @@ pub async fn scan_with_resume(
         .truncate(false)
         .write(true)
         .open(Path::new(job_dir).join("scan-resume.lock"))?;
-    lease
-        .try_lock()
-        .map_err(|error| AppError::ScanError(format!("Cannot lock scan job: {error}")))?;
+    lease.try_lock().map_err(|source| AppError::ScanJobLock {
+        job_id: job_id.into(),
+        source,
+    })?;
     let storage = create_storage_for_role(&canonicalize_path(path)?, None, false, StorageRole::Source).await?;
     let options = WalkOptions {
         depth: NonZeroUsize::new(depth as usize).map(NonZeroUsize::get),
-        match_expressions: include
-            .as_deref()
-            .map(storage_adapter::filter::parse_filter_expression)
-            .transpose()
-            .map_err(|error| AppError::ConfigError(error.to_string()))?,
-        exclude_expressions: exclude
-            .as_deref()
-            .map(storage_adapter::filter::parse_filter_expression)
-            .transpose()
-            .map_err(|error| AppError::ConfigError(error.to_string()))?,
+        match_expressions: include.as_deref().map(parse_filter_expression).transpose()?,
+        exclude_expressions: exclude.as_deref().map(parse_filter_expression).transpose()?,
         concurrency: config.scan.concurrency,
         include_tags: config.scan.include_tags,
         ..Default::default()
     };
-    // No credentials are stored: only the digest of source identity and effective scan options.
+    // 只持久化源身份和有效扫描选项的摘要，不保存凭据。
     let identity = storage.storage().identity();
     let request_key = request_key(
         identity.kind().as_str(),
@@ -72,7 +74,7 @@ pub async fn scan_with_resume(
         exclude,
         options.include_tags,
     )?;
-    let database_config = db::DatabaseConfig::from_app_config(&config.database);
+    let database_config = DatabaseConfig::from_app_config(&config.database);
     let mut database = ClickHouseDatabase::new(
         database_config
             .clickhouse
@@ -111,13 +113,7 @@ pub async fn scan_with_resume(
         let incremental = database.table_exists(&db::base_table_name_for_job(job_id)).await?;
         database.initialize().await?;
         let generation = database.begin_scan_generation().await?;
-        let now = i64::try_from(
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map_err(|error| AppError::ScanError(error.to_string()))?
-                .as_nanos(),
-        )
-        .map_err(|error| AppError::ScanError(error.to_string()))?;
+        let now = i64::try_from(SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos())?;
         let event_time = database.resume_event_epoch(now).await?;
         let mut fresh = ScanResumeState {
             id: 1,
@@ -145,7 +141,7 @@ pub async fn scan_with_resume(
         JobType::Scan
     };
     let mut consumer_config = initialize_consumer_config(job_id, job_dir, kind, command, &config, None)?;
-    // This pipeline owns database acknowledgements. The manager only consumes statistics.
+    // 本管道负责数据库持久化确认；manager 只消费统计信息。
     consumer_config.db_config.enabled = false;
     let mut consumers = ConsumerManager::new(&consumer_config).await?;
     consumers.begin_lifecycle().await;
@@ -173,7 +169,7 @@ pub async fn scan_with_resume(
     }
     drop(broadcaster);
     for handle in handles {
-        handle.await.map_err(|error| AppError::ScanError(error.to_string()))??;
+        handle.await??;
     }
     consumers.set_generation_committed(result.is_ok()).await;
     consumers.end_lifecycle().await;
@@ -184,8 +180,7 @@ pub async fn scan_with_resume(
 fn request_key(
     kind: &str, identity: &str, depth: u32, include: &Option<String>, exclude: &Option<String>, tags: bool,
 ) -> Result<String> {
-    let bytes = serde_json::to_vec(&(1, kind, identity, depth, include, exclude, tags))
-        .map_err(|error| AppError::ConfigError(error.to_string()))?;
+    let bytes = serde_json::to_vec(&(1, kind, identity, depth, include, exclude, tags))?;
     Ok(blake3::hash(&bytes).to_hex().to_string())
 }
 
@@ -196,14 +191,13 @@ fn checkpoint_interval() -> Duration {
     {
         return Duration::from_millis(value);
     }
-    data_mover::traversal::Resumable::DEFAULT_EVERY
+    Resumable::DEFAULT_EVERY
 }
 
 #[allow(clippy::too_many_arguments)]
 async fn run(
-    storage: &storage_adapter::StorageEnum, options: &WalkOptions, database: &mut ClickHouseDatabase,
-    state: &mut ScanResumeState, broadcaster: &BroadcastForwarder<StorageEntryMessage>, batch_size: usize,
-    cancel: CancellationToken,
+    storage: &StorageEnum, options: &WalkOptions, database: &mut ClickHouseDatabase, state: &mut ScanResumeState,
+    broadcaster: &BroadcastForwarder<StorageEntryMessage>, batch_size: usize, cancel: CancellationToken,
 ) -> Result<()> {
     if state.phase == RUNNING {
         let mut scan = storage.resumable_scan(
@@ -230,7 +224,7 @@ async fn run(
                     }
                 }
                 Ok(ResumableScanItem::Checkpoint(checkpoint)) => {
-                    // Advancing a cursor is forbidden until every preceding row/event is durable.
+                    // 前序条目和事件全部持久化后，才能推进游标。
                     flush_batch(database, state, broadcaster, &mut batch).await?;
                     state.checkpoint = checkpoint;
                     state.observed_entries = observed;
@@ -245,7 +239,7 @@ async fn run(
                     if let Ok(value) = std::env::var("TERRASYNC_LAB_SCAN_PAUSE_AFTER_CHECKPOINT_MS")
                         && let Ok(value) = value.parse::<u64>()
                     {
-                        tokio::time::sleep(Duration::from_millis(value)).await;
+                        sleep(Duration::from_millis(value)).await;
                     }
                     #[cfg(feature = "lab-fault-injection")]
                     if std::env::var_os("TERRASYNC_LAB_SCAN_STOP_AFTER_CHECKPOINT").is_some() {
@@ -264,7 +258,7 @@ async fn run(
         flush_batch(database, state, broadcaster, &mut batch).await?;
         let outcome = scan.finish().await?;
         match outcome {
-            data_mover::traversal::TraversalOutcome::Completed(completion)
+            TraversalOutcome::Completed(completion)
                 if completion.totals.failed_children == 0 && completion.totals.listing_failures == 0 => {}
             _ => {
                 return Err(AppError::ScanError(
@@ -360,16 +354,17 @@ async fn flush_deletions(
     events: &mut Vec<StorageEntryMessage>,
 ) -> Result<()> {
     database.write_resume_events(events, state.event_time).await?;
-    let paths: Vec<String> = events
+    let keys: Vec<(String, String)> = events
         .iter()
         .filter_map(|event| match event {
-            StorageEntryMessage::Deleted(entry) | StorageEntryMessage::Renamed((entry, _)) => {
-                Some(entry.get_relative_path().to_string_lossy().into_owned())
-            }
+            StorageEntryMessage::Deleted(entry) | StorageEntryMessage::Renamed((entry, _)) => Some((
+                entry.get_relative_path().to_string_lossy().into_owned(),
+                entry.get_version_id().unwrap_or_default().to_owned(),
+            )),
             _ => None,
         })
         .collect();
-    database.delete_resume_paths(&paths).await?;
+    database.delete_resume_entries(&keys).await?;
     for event in events.drain(..) {
         broadcaster.broadcast(event).await;
     }
