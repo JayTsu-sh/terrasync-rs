@@ -148,8 +148,8 @@ done
 printf 'terrasync-hdfs-%s\n' "$run_id" > "$fixture_root/payload.txt"
 expected_hash="$(sha256sum "$fixture_root/payload.txt" | cut -d' ' -f1)"
 
-run_with_config "$single_config" sync --id "hdfs-preload-$run_id" "$fixture_root" "$hdfs_source"
-run_with_config "$single_config" sync --id "hdfs-single-$run_id" --enable-integrity-check \
+run_with_config "$single_config" sync --resume --id "hdfs-preload-$run_id" "$fixture_root" "$hdfs_source"
+run_with_config "$single_config" sync --resume --id "hdfs-single-$run_id" --enable-integrity-check \
   "$hdfs_source" "$hdfs_single_destination"
 run_with_config "$single_config" integrity-check --id "hdfs-single-integrity-$run_id" \
   "$hdfs_source" "$hdfs_single_destination"
@@ -169,7 +169,7 @@ for _ in $(seq 1 100); do
 done
 [[ -s "$receiver_cert" ]]
 
-run_with_config "$sender_config" sync --id "hdfs-remote-$run_id" --enable-integrity-check \
+run_with_config "$sender_config" sync --resume --id "hdfs-remote-$run_id" --enable-integrity-check \
   --remote 127.0.0.1:19876 --tls-server-cert "$receiver_cert" --token "$run_id" \
   "$hdfs_source" "$hdfs_remote_destination"
 wait "$receiver_pid"

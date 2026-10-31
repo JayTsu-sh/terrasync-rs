@@ -159,6 +159,39 @@ pub(crate) fn timestamp(value: i64) -> StorageTimestamp {
         .unwrap_or_else(|_| unreachable!("nanoseconds are always aligned"))
 }
 impl ConnectedStorage {
+    pub fn validate_transfer_mode(&self, mode: TransferMode) -> Result<()> {
+        let destination = self.roles.staged_destination()?;
+        let reason = match mode {
+            TransferMode::Direct if !destination.supports_direct() => {
+                Some("direct writes are unavailable; select --resume or --in-place")
+            }
+            TransferMode::Checkpoint if !destination.resumable_at_destination() => {
+                Some("destination checkpoints are unavailable; select --in-place or a supported backend")
+            }
+            _ => None,
+        };
+        if let Some(reason) = reason {
+            return Err(StorageError::UnsupportedTransferMode {
+                backend: self.roles.kind(),
+                mode,
+                reason,
+            });
+        }
+        Ok(())
+    }
+
+    pub fn validate_stream_transfer_mode(&self, mode: TransferMode) -> Result<()> {
+        self.validate_transfer_mode(mode)?;
+        if mode == TransferMode::Direct && !self.roles.staged_destination()?.supports_sparse_patch() {
+            return Err(StorageError::UnsupportedTransferMode {
+                backend: self.roles.kind(),
+                mode,
+                reason: "remote Direct requires sparse patch support; use --resume or --in-place",
+            });
+        }
+        Ok(())
+    }
+
     pub fn storage(&self) -> &Storage {
         &self.roles
     }
@@ -350,6 +383,7 @@ impl ConnectedStorage {
 }
 impl StorageEnum {
     pub async fn copy_file(from: &Self, to: &Self, entry: &EntryEnum, options: CopyOptions) -> Result<()> {
+        to.validate_transfer_mode(options.transfer_mode)?;
         let p = path(entry.get_relative_path())?;
         if entry.get_is_delete_marker() {
             transfer::write_delete_marker(to.roles.clone(), p, options.cancel.unwrap_or_default()).await?;
@@ -361,7 +395,7 @@ impl StorageEnum {
             to.roles.clone(),
             options.cancel.unwrap_or_default(),
         )
-        .with_transfer_policy(TransferPolicy::AtomicReplace);
+        .with_transfer_policy(options.transfer_mode.policy());
         if let Some(version) = entry.get_version_id() {
             request = request.with_source_version(SourceVersion::Id(version.into()));
         }
@@ -386,6 +420,7 @@ impl StorageEnum {
     pub async fn copy_file_resumable(
         from: &Self, to: &Self, entry: &EntryEnum, options: CopyOptions, _resume: ResumeContext,
     ) -> Result<()> {
+        to.validate_transfer_mode(TransferMode::Checkpoint)?;
         // 恢复权威在目标端；不再信任应用的 .part 路径或本地 offset 记录。
         let mut request = TransferRequest::new(
             from.roles.clone(),

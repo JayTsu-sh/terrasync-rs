@@ -233,6 +233,7 @@ fn test_remote_process_e2e_handshake_and_sync() {
         .arg("sync")
         .arg("--id")
         .arg("remote_e2e_test")
+        .arg("--in-place")
         .arg("--remote")
         .arg(&listen_addr)
         .arg("--tls-server-cert")
@@ -329,6 +330,7 @@ fn test_remote_process_e2e_dir_mtime_preserved() {
         .arg("sync")
         .arg("--id")
         .arg("remote_dir_mtime_test")
+        .arg("--in-place")
         .arg("--remote")
         .arg(&listen_addr)
         .arg("--tls-server-cert")
@@ -407,6 +409,7 @@ fn test_remote_process_e2e_correct_token_succeeds() {
         .arg("sync")
         .arg("--id")
         .arg("remote_e2e_token_ok")
+        .arg("--in-place")
         .arg("--remote")
         .arg(&listen_addr)
         .arg("--tls-server-cert")
@@ -486,6 +489,7 @@ fn test_remote_process_e2e_wrong_token_rejected() {
         .arg("sync")
         .arg("--id")
         .arg("remote_e2e_token_bad")
+        .arg("--in-place")
         .arg("--remote")
         .arg(&listen_addr)
         .arg("--tls-server-cert")
@@ -587,6 +591,7 @@ fn test_remote_process_e2e_large_multi_chunk_file_mux() {
         .arg("sync")
         .arg("--id")
         .arg("remote_e2e_mux_large_file")
+        .arg("--in-place")
         .arg("--remote")
         .arg(&listen_addr)
         .arg("--tls-server-cert")
@@ -673,6 +678,7 @@ fn test_remote_process_e2e_credit_window_large_file_no_deadlock() {
         .arg("sync")
         .arg("--id")
         .arg("remote_e2e_credit_window_large_file")
+        .arg("--in-place")
         .arg("--remote")
         .arg(&listen_addr)
         .arg("--tls-server-cert")
@@ -755,6 +761,7 @@ fn test_remote_process_e2e_without_delete_target_keeps_orphan() {
         .arg("sync")
         .arg("--id")
         .arg("remote_e2e_no_delete_target")
+        .arg("--in-place")
         .arg("--remote")
         .arg(&listen_addr)
         .arg("--tls-server-cert")
@@ -826,6 +833,7 @@ fn test_remote_process_e2e_delete_target_removes_orphan() {
         .arg("sync")
         .arg("--id")
         .arg("remote_e2e_delete_target")
+        .arg("--in-place")
         .arg("--remote")
         .arg(&listen_addr)
         .arg("--tls-server-cert")
@@ -900,6 +908,7 @@ fn test_remote_process_e2e_delete_target_preserves_existing_subdir() {
         .arg("sync")
         .arg("--id")
         .arg("remote_e2e_preserve_subdir_seed")
+        .arg("--in-place")
         .arg("--remote")
         .arg(&listen_addr)
         .arg("--tls-server-cert")
@@ -955,6 +964,7 @@ fn test_remote_process_e2e_delete_target_preserves_existing_subdir() {
         .arg("sync")
         .arg("--id")
         .arg("remote_e2e_preserve_subdir")
+        .arg("--in-place")
         .arg("--remote")
         .arg(&listen_addr)
         .arg("--tls-server-cert")
@@ -1023,142 +1033,160 @@ fn parse_changed_total(stdout: &str) -> u64 {
 #[test]
 #[serial]
 fn test_remote_process_e2e_delta_sync_transfers_changed_content() {
-    let tmp = tempfile::tempdir().expect("create tempdir");
-    let tmp_path = tmp.path();
+    let modes: [&[&str]; 3] = [&["--in-place"], &["--resume"], &[]];
+    for flags in modes {
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let tmp_path = tmp.path();
 
-    let src_dir = tmp_path.join("src");
-    let dest_dir = tmp_path.join("dest");
-    fs::create_dir_all(&src_dir).expect("create src dir");
-    fs::create_dir_all(&dest_dir).expect("create dest dir");
-    let mut rel_paths = populate_src_dir(&src_dir);
+        let src_dir = tmp_path.join("src");
+        let dest_dir = tmp_path.join("dest");
+        fs::create_dir_all(&src_dir).expect("create src dir");
+        fs::create_dir_all(&dest_dir).expect("create dest dir");
+        let mut rel_paths = populate_src_dir(&src_dir);
 
-    // 专用 delta 目标文件：8000 字节，块大小算法（sqrt(size).clamp(700, 128KiB)）会
-    // 切出多个 block，足够体现"部分匹配 + 部分不匹配"的真实 delta 场景。
-    const DELTA_FILE_SIZE: usize = 8000;
-    let delta_rel = PathBuf::from("delta_target.bin");
-    let original_content = deterministic_bytes(DELTA_FILE_SIZE);
-    fs::write(src_dir.join(&delta_rel), &original_content).expect("write delta src file");
-    rel_paths.push(delta_rel.clone());
+        // 专用 delta 目标文件：8000 字节，块大小算法（sqrt(size).clamp(700, 128KiB)）会
+        // 切出多个 block，足够体现"部分匹配 + 部分不匹配"的真实 delta 场景。
+        const DELTA_FILE_SIZE: usize = 8000;
+        let delta_rel = PathBuf::from("delta_target.bin");
+        let original_content = deterministic_bytes(DELTA_FILE_SIZE);
+        fs::write(src_dir.join(&delta_rel), &original_content).expect("write delta src file");
+        rel_paths.push(delta_rel.clone());
 
-    let cert_path = tmp_path.join("server.crt");
-    let config_path = tmp_path.join("config.toml");
-    fs::write(&config_path, "[database]\nenabled = false\n").expect("write config");
-    let fake_manifest_dir = tmp_path.join("fake_manifest");
-    let bin_path = cargo_bin("terrasync");
+        let cert_path = tmp_path.join("server.crt");
+        let config_path = tmp_path.join("config.toml");
+        fs::write(&config_path, "[database]\nenabled = false\n").expect("write config");
+        let fake_manifest_dir = tmp_path.join("fake_manifest");
+        let bin_path = cargo_bin("terrasync");
 
-    // ── 第一轮：全量播种 dest ──
-    let port = free_loopback_port();
-    let listen_addr = format!("127.0.0.1:{port}");
-    let mut receiver_child = StdCommand::new(&bin_path)
-        .env("CARGO_MANIFEST_DIR", &fake_manifest_dir)
-        .current_dir(tmp_path)
-        .arg("-c")
-        .arg(&config_path)
-        .arg("serve")
-        .arg("--listen")
-        .arg(&listen_addr)
-        .arg("--tls-cert-out")
-        .arg(&cert_path)
-        .arg(&dest_dir)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("spawn receiver process");
-    wait_for_cert_file(&cert_path);
+        // ── 第一轮：全量播种 dest ──
+        let port = free_loopback_port();
+        let listen_addr = format!("127.0.0.1:{port}");
+        let mut receiver_child = StdCommand::new(&bin_path)
+            .env("CARGO_MANIFEST_DIR", &fake_manifest_dir)
+            .current_dir(tmp_path)
+            .arg("-c")
+            .arg(&config_path)
+            .arg("serve")
+            .arg("--listen")
+            .arg(&listen_addr)
+            .arg("--tls-cert-out")
+            .arg(&cert_path)
+            .arg(&dest_dir)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn receiver process");
+        wait_for_cert_file(&cert_path);
 
-    let mut sender_cmd = AssertCommand::new(&bin_path);
-    sender_cmd
-        .env("CARGO_MANIFEST_DIR", &fake_manifest_dir)
-        .current_dir(tmp_path)
-        .arg("-c")
-        .arg(&config_path)
-        .arg("sync")
-        .arg("--id")
-        .arg("remote_delta_seed")
-        .arg("--remote")
-        .arg(&listen_addr)
-        .arg("--tls-server-cert")
-        .arg(&cert_path)
-        .arg(&src_dir)
-        .arg(&dest_dir);
-    sender_cmd.assert().success();
+        let mut sender_cmd = AssertCommand::new(&bin_path);
+        sender_cmd
+            .env("CARGO_MANIFEST_DIR", &fake_manifest_dir)
+            .current_dir(tmp_path)
+            .arg("-c")
+            .arg(&config_path)
+            .arg("sync")
+            .arg("--id")
+            .arg("remote_delta_seed")
+            .arg("--in-place")
+            .arg("--remote")
+            .arg(&listen_addr)
+            .arg("--tls-server-cert")
+            .arg(&cert_path)
+            .arg(&src_dir)
+            .arg(&dest_dir);
+        sender_cmd.assert().success();
 
-    let receiver_status = wait_for_child_exit(&mut receiver_child, RECEIVER_EXIT_TIMEOUT);
-    let (rout, rerr) = drain_output(&mut receiver_child);
-    assert!(
-        matches!(receiver_status, Some(s) if s.success()),
-        "第一轮 Receiver 异常退出: {receiver_status:?}\nstdout:\n{rout}\nstderr:\n{rerr}"
-    );
-    assert_dest_matches_src(&src_dir, &dest_dir, &rel_paths);
+        let receiver_status = wait_for_child_exit(&mut receiver_child, RECEIVER_EXIT_TIMEOUT);
+        let (rout, rerr) = drain_output(&mut receiver_child);
+        assert!(
+            matches!(receiver_status, Some(s) if s.success()),
+            "第一轮 Receiver 异常退出: {receiver_status:?}\nstdout:\n{rout}\nstderr:\n{rerr}"
+        );
+        assert_dest_matches_src(&src_dir, &dest_dir, &rel_paths);
 
-    // 修改 delta_target.bin 中间一段字节（保留首尾 3000/4800 字节不变），
-    // 内容变化会连带更新 mtime，触发 DestIndex::check() 的 data_check 判定为不匹配。
-    let mut modified_content = original_content.clone();
-    for byte in &mut modified_content[3000..3200] {
-        *byte = 0xAA;
+        let original_inode = fs::metadata(dest_dir.join(&delta_rel)).expect("basis metadata").ino();
+        let alias = tmp_path.join("basis_alias");
+        fs::hard_link(dest_dir.join(&delta_rel), &alias).expect("basis hard link");
+
+        // 修改 delta_target.bin 中间一段字节（保留首尾 3000/4800 字节不变），
+        // 内容变化会连带更新 mtime，触发 DestIndex::check() 的 data_check 判定为不匹配。
+        let mut modified_content = original_content.clone();
+        for byte in &mut modified_content[3000..3200] {
+            *byte = 0xAA;
+        }
+        fs::write(src_dir.join("delta_target.bin"), &modified_content).expect("modify delta src file");
+
+        // ── 第二轮：重跑同步，delta_target.bin 应走 delta 传输 ──
+        let port = free_loopback_port();
+        let listen_addr = format!("127.0.0.1:{port}");
+        fs::remove_file(&cert_path).expect("remove old cert");
+        let mut receiver_child = StdCommand::new(&bin_path)
+            .env("CARGO_MANIFEST_DIR", &fake_manifest_dir)
+            .current_dir(tmp_path)
+            .arg("-c")
+            .arg(&config_path)
+            .arg("serve")
+            .arg("--listen")
+            .arg(&listen_addr)
+            .arg("--tls-cert-out")
+            .arg(&cert_path)
+            .arg(&dest_dir)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn receiver process");
+        wait_for_cert_file(&cert_path);
+
+        let mut sender_cmd = AssertCommand::new(&bin_path);
+        sender_cmd
+            .env("CARGO_MANIFEST_DIR", &fake_manifest_dir)
+            .current_dir(tmp_path)
+            .arg("-c")
+            .arg(&config_path)
+            .arg("sync")
+            .arg("--id")
+            .arg("remote_delta_verify")
+            .args(flags)
+            .arg("--remote")
+            .arg(&listen_addr)
+            .arg("--tls-server-cert")
+            .arg(&cert_path)
+            .arg(&src_dir)
+            .arg(&dest_dir);
+        let assert = sender_cmd.assert().success();
+        let stdout = String::from_utf8_lossy(&assert.get_output().stdout).into_owned();
+
+        let receiver_status = wait_for_child_exit(&mut receiver_child, RECEIVER_EXIT_TIMEOUT);
+        let (rout, rerr) = drain_output(&mut receiver_child);
+        assert!(
+            matches!(receiver_status, Some(s) if s.success()),
+            "第二轮 Receiver 异常退出: {receiver_status:?}\nstdout:\n{rout}\nstderr:\n{rerr}"
+        );
+
+        // 内容一致性：delta 重建结果必须与源端修改后的内容逐字节相同
+        assert_dest_matches_src(&src_dir, &dest_dir, &rel_paths);
+
+        // 非侵入式证据 1：delta 能力协商成功
+        let sender_log = tmp_path.join("logs").join("remote_delta_verify").join("app.log");
+        assert_delta_negotiated_in_log(&sender_log, "Sender");
+
+        // 非侵入式证据 2：Sender 报表记录了一次 Changed（即 delta_target.bin 走了
+        // DeltaTransfer 分类，而非 Skip）
+        let changed_total = parse_changed_total(&stdout);
+        assert!(
+            changed_total >= 1,
+            "Sender 报表 Changed 计数应 ≥1（delta_target.bin 内容已变更），实际 stdout:\n{stdout}"
+        );
+        let direct = flags.is_empty();
+        assert_eq!(
+            fs::metadata(dest_dir.join(&delta_rel)).expect("updated metadata").ino() == original_inode,
+            direct
+        );
+        assert_eq!(
+            fs::read(alias).expect("read alias"),
+            if direct { modified_content } else { original_content }
+        );
     }
-    fs::write(src_dir.join("delta_target.bin"), &modified_content).expect("modify delta src file");
-
-    // ── 第二轮：重跑同步，delta_target.bin 应走 delta 传输 ──
-    let port = free_loopback_port();
-    let listen_addr = format!("127.0.0.1:{port}");
-    fs::remove_file(&cert_path).expect("remove old cert");
-    let mut receiver_child = StdCommand::new(&bin_path)
-        .env("CARGO_MANIFEST_DIR", &fake_manifest_dir)
-        .current_dir(tmp_path)
-        .arg("-c")
-        .arg(&config_path)
-        .arg("serve")
-        .arg("--listen")
-        .arg(&listen_addr)
-        .arg("--tls-cert-out")
-        .arg(&cert_path)
-        .arg(&dest_dir)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("spawn receiver process");
-    wait_for_cert_file(&cert_path);
-
-    let mut sender_cmd = AssertCommand::new(&bin_path);
-    sender_cmd
-        .env("CARGO_MANIFEST_DIR", &fake_manifest_dir)
-        .current_dir(tmp_path)
-        .arg("-c")
-        .arg(&config_path)
-        .arg("sync")
-        .arg("--id")
-        .arg("remote_delta_verify")
-        .arg("--remote")
-        .arg(&listen_addr)
-        .arg("--tls-server-cert")
-        .arg(&cert_path)
-        .arg(&src_dir)
-        .arg(&dest_dir);
-    let assert = sender_cmd.assert().success();
-    let stdout = String::from_utf8_lossy(&assert.get_output().stdout).into_owned();
-
-    let receiver_status = wait_for_child_exit(&mut receiver_child, RECEIVER_EXIT_TIMEOUT);
-    let (rout, rerr) = drain_output(&mut receiver_child);
-    assert!(
-        matches!(receiver_status, Some(s) if s.success()),
-        "第二轮 Receiver 异常退出: {receiver_status:?}\nstdout:\n{rout}\nstderr:\n{rerr}"
-    );
-
-    // 内容一致性：delta 重建结果必须与源端修改后的内容逐字节相同
-    assert_dest_matches_src(&src_dir, &dest_dir, &rel_paths);
-
-    // 非侵入式证据 1：delta 能力协商成功
-    let sender_log = tmp_path.join("logs").join("remote_delta_verify").join("app.log");
-    assert_delta_negotiated_in_log(&sender_log, "Sender");
-
-    // 非侵入式证据 2：Sender 报表记录了一次 Changed（即 delta_target.bin 走了
-    // DeltaTransfer 分类，而非 Skip）
-    let changed_total = parse_changed_total(&stdout);
-    assert!(
-        changed_total >= 1,
-        "Sender 报表 Changed 计数应 ≥1（delta_target.bin 内容已变更），实际 stdout:\n{stdout}"
-    );
 }
 
 /// 断言 Receiver 日志中出现 size 门槛降级记录（`receiver.rs::recv_file_list_and_data_phase`
@@ -1234,6 +1262,7 @@ fn test_remote_process_e2e_delta_size_threshold_downgrades_to_full() {
         .arg("sync")
         .arg("--id")
         .arg("remote_delta_threshold_seed")
+        .arg("--in-place")
         .arg("--remote")
         .arg(&listen_addr)
         .arg("--tls-server-cert")
@@ -1287,6 +1316,7 @@ fn test_remote_process_e2e_delta_size_threshold_downgrades_to_full() {
         .arg("sync")
         .arg("--id")
         .arg("remote_delta_threshold_verify")
+        .arg("--in-place")
         .arg("--remote")
         .arg(&listen_addr)
         .arg("--tls-server-cert")
@@ -1379,6 +1409,7 @@ fn test_remote_process_e2e_symlink_synced() {
         .arg("sync")
         .arg("--id")
         .arg("remote_symlink_e2e")
+        .arg("--in-place")
         .arg("--remote")
         .arg(&listen_addr)
         .arg("--tls-server-cert")
@@ -1431,9 +1462,7 @@ fn test_remote_process_e2e_symlink_synced() {
 /// burst 容量，会导致限速形同虚设、大文件几乎瞬间传完，因此显式收窄
 /// `--block-size` 让单次 acquire 的 cell 数落在 burst 容量以内。
 ///
-/// 双进程模式的字节级续传当前未接线（`disk_commit.rs::FileBegin` 硬编码
-/// `resume_prepare(..., false)`，归 #25 处置），故重跑是整文件重传而非"断点续传"，
-/// 但这正是本 issue 验收标准要求的范围："中断重跑后最终收敛"。
+/// 显式启用 Checkpoint；中断后重新发送源字节计算全量摘要，目标端复用已确认前缀。
 #[test]
 #[serial]
 fn test_remote_process_e2e_resume_after_sender_kill() {
@@ -1487,6 +1516,7 @@ fn test_remote_process_e2e_resume_after_sender_kill() {
         .arg("sync")
         .arg("--id")
         .arg("remote_resume_interrupted")
+        .arg("--resume")
         .arg("--remote")
         .arg(&listen_addr)
         .arg("--tls-server-cert")
@@ -1549,6 +1579,7 @@ fn test_remote_process_e2e_resume_after_sender_kill() {
         .arg("sync")
         .arg("--id")
         .arg("remote_resume_rerun")
+        .arg("--resume")
         .arg("--remote")
         .arg(&listen_addr)
         .arg("--tls-server-cert")
@@ -1621,6 +1652,7 @@ fn test_remote_process_e2e_receiver_killed_sender_exits_nonzero() {
         .arg("sync")
         .arg("--id")
         .arg("remote_receiver_killed")
+        .arg("--in-place")
         .arg("--remote")
         .arg(&listen_addr)
         .arg("--tls-server-cert")
@@ -1713,6 +1745,7 @@ fn test_remote_process_e2e_uid_gid_preserved() {
         .arg("sync")
         .arg("--id")
         .arg("remote_uid_gid_e2e")
+        .arg("--in-place")
         .arg("--remote")
         .arg(&listen_addr)
         .arg("--tls-server-cert")
@@ -1835,6 +1868,7 @@ fn test_remote_process_e2e_partial_failure_exit_zero_with_nonzero_report() {
         .arg("sync")
         .arg("--id")
         .arg("remote_partial_failure_e2e")
+        .arg("--in-place")
         .arg("--remote")
         .arg(&listen_addr)
         .arg("--tls-server-cert")

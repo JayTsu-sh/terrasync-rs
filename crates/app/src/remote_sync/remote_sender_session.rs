@@ -578,6 +578,9 @@ async fn process_requests_and_acks(context: RequestLoopContext<'_>) -> Result<()
                 ledger.record_entry_error();
                 record_copy_error(stats_consumer, path, reason).await;
             }
+            Some(ReceiverMsg::Error { ndx, reason }) if ndx < 0 => {
+                return Err(AppError::CopyError(reason));
+            }
             Some(ReceiverMsg::Error { ndx, reason }) => {
                 error!("[Sender Remote] NDX {ndx} failed: {reason}");
                 if ledger.record_indexed_error(ndx) {

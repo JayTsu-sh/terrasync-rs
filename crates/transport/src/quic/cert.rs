@@ -5,8 +5,9 @@
 
 use std::sync::Arc;
 
-use quinn::{ClientConfig, ServerConfig};
+use quinn::{ClientConfig, ServerConfig, TransportConfig};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+use std::time::Duration;
 
 use super::error::{QuicTransportError, Result};
 
@@ -33,8 +34,9 @@ pub fn generate_self_signed(extra_sans: &[&str]) -> Result<(Vec<CertificateDer<'
 
 /// 构建 quinn ServerConfig（使用自签名证书）
 pub fn build_server_config(certs: Vec<CertificateDer<'static>>, key: PrivateKeyDer<'static>) -> Result<ServerConfig> {
-    let server_config = ServerConfig::with_single_cert(certs, key)
+    let mut server_config = ServerConfig::with_single_cert(certs, key)
         .map_err(|e| QuicTransportError::TlsError(format!("server config: {e}")))?;
+    server_config.transport_config(transfer_transport_config());
     Ok(server_config)
 }
 
@@ -47,10 +49,11 @@ pub fn build_client_config_insecure() -> Result<ClientConfig> {
         .with_custom_certificate_verifier(Arc::new(SkipServerVerification))
         .with_no_client_auth();
 
-    let client_config = ClientConfig::new(Arc::new(
+    let mut client_config = ClientConfig::new(Arc::new(
         quinn::crypto::rustls::QuicClientConfig::try_from(crypto)
             .map_err(|e| QuicTransportError::TlsError(format!("client config: {e}")))?,
     ));
+    client_config.transport_config(transfer_transport_config());
     Ok(client_config)
 }
 
@@ -67,10 +70,11 @@ pub fn build_client_config_with_ca(server_cert: CertificateDer<'static>) -> Resu
         .with_root_certificates(root_store)
         .with_no_client_auth();
 
-    let client_config = ClientConfig::new(Arc::new(
+    let mut client_config = ClientConfig::new(Arc::new(
         quinn::crypto::rustls::QuicClientConfig::try_from(crypto)
             .map_err(|e| QuicTransportError::TlsError(format!("client config: {e}")))?,
     ));
+    client_config.transport_config(transfer_transport_config());
     Ok(client_config)
 }
 
@@ -132,10 +136,11 @@ pub fn build_client_config_mtls(
         .with_client_auth_cert(client_certs, client_key)
         .map_err(|e| QuicTransportError::TlsError(format!("client auth cert: {e}")))?;
 
-    let client_config = ClientConfig::new(Arc::new(
+    let mut client_config = ClientConfig::new(Arc::new(
         quinn::crypto::rustls::QuicClientConfig::try_from(crypto)
             .map_err(|e| QuicTransportError::TlsError(format!("quic client config: {e}")))?,
     ));
+    client_config.transport_config(transfer_transport_config());
     Ok(client_config)
 }
 
@@ -160,9 +165,17 @@ pub fn build_server_config_mtls(
         .with_single_cert(server_certs, server_key)
         .map_err(|e| QuicTransportError::TlsError(format!("server config: {e}")))?;
 
-    let server_config = ServerConfig::with_crypto(Arc::new(
+    let mut server_config = ServerConfig::with_crypto(Arc::new(
         quinn::crypto::rustls::QuicServerConfig::try_from(server_crypto)
             .map_err(|e| QuicTransportError::TlsError(format!("quic server config: {e}")))?,
     ));
+    server_config.transport_config(transfer_transport_config());
     Ok(server_config)
+}
+
+/// 大文件签名、校验阶段可能长时间没有业务数据，由 QUIC 保活维持连接。
+fn transfer_transport_config() -> Arc<TransportConfig> {
+    let mut config = TransportConfig::default();
+    config.keep_alive_interval(Some(Duration::from_secs(5)));
+    Arc::new(config)
 }

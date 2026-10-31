@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use storage_adapter::hdfs::HdfsResumeMode;
-use storage_adapter::{CommitCallback, CopyOptions, EntryEnum, HdfsRecoverableCopyOptions, StorageEnum};
+use storage_adapter::{CommitCallback, CopyOptions, EntryEnum, HdfsRecoverableCopyOptions, StorageEnum, TransferMode};
 
 use crate::error::{AppError, Result};
 
@@ -14,11 +14,11 @@ pub(crate) struct HdfsCopyContext {
 }
 
 impl HdfsCopyContext {
-    pub(crate) fn from_job(job_id: &str, no_resume: bool) -> Result<Self> {
-        let resume_mode = if no_resume {
-            HdfsResumeMode::Restart
-        } else {
-            HdfsResumeMode::Auto
+    pub(crate) fn from_job(job_id: &str, mode: TransferMode) -> Result<Self> {
+        let resume_mode = match mode {
+            TransferMode::Checkpoint => HdfsResumeMode::Auto,
+            TransferMode::Atomic => HdfsResumeMode::Restart,
+            TransferMode::Direct => HdfsResumeMode::Direct,
         };
         Self::with_mode(job_id, resume_mode)
     }
@@ -79,14 +79,14 @@ mod tests {
     use storage_adapter::hdfs::HdfsResumeMode;
     use storage_adapter::{CreateStorageOptions, StorageEnum, create_storage};
 
-    use super::{HdfsCopyContext, MetadataApplication};
+    use super::{HdfsCopyContext, MetadataApplication, TransferMode};
     use storage_adapter::CopyOptions;
 
     #[test]
-    fn hdfs_context_defaults_to_auto_and_keeps_stable_job_identity() {
-        let first = HdfsCopyContext::from_job("persistent-job", false)
+    fn checkpoint_mode_keeps_stable_job_identity_and_uses_auto_recovery() {
+        let first = HdfsCopyContext::from_job("persistent-job", TransferMode::Checkpoint)
             .unwrap_or_else(|error| panic!("valid job identity rejected: {error}"));
-        let restarted = HdfsCopyContext::from_job("persistent-job", false)
+        let restarted = HdfsCopyContext::from_job("persistent-job", TransferMode::Checkpoint)
             .unwrap_or_else(|error| panic!("valid job identity rejected: {error}"));
 
         assert_eq!(first.transfer_identity(), "persistent-job");
@@ -95,17 +95,24 @@ mod tests {
     }
 
     #[test]
-    fn legacy_no_resume_maps_to_hdfs_restart() {
-        let context = HdfsCopyContext::from_job("persistent-job", true)
+    fn atomic_mode_maps_to_hdfs_restart() {
+        let context = HdfsCopyContext::from_job("persistent-job", TransferMode::Atomic)
             .unwrap_or_else(|error| panic!("valid job identity rejected: {error}"));
 
         assert_eq!(context.resume_mode(), HdfsResumeMode::Restart);
     }
 
     #[test]
+    fn direct_mode_does_not_use_hdfs_recovery() {
+        let context = HdfsCopyContext::from_job("persistent-job", TransferMode::Direct)
+            .unwrap_or_else(|error| panic!("valid Direct context rejected: {error}"));
+        assert_eq!(context.resume_mode(), HdfsResumeMode::Direct);
+    }
+
+    #[test]
     fn hdfs_context_rejects_missing_stable_job_identity() {
-        assert!(HdfsCopyContext::from_job("", false).is_err());
-        assert!(HdfsCopyContext::from_job("   ", false).is_err());
+        assert!(HdfsCopyContext::from_job("", TransferMode::Checkpoint).is_err());
+        assert!(HdfsCopyContext::from_job("   ", TransferMode::Checkpoint).is_err());
     }
 
     #[test]

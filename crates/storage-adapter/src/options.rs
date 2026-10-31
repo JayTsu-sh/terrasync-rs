@@ -3,6 +3,8 @@
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 
+use data_mover::transfer::TransferPolicy;
+use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
 
 use crate::filter::FilterExpression;
@@ -34,8 +36,38 @@ impl Default for WalkOptions {
     }
 }
 
+/// sync 的显式写入模式，原样传递给上游，不按文件大小或后端静默降级。
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub enum TransferMode {
+    Checkpoint,
+    #[default]
+    Atomic,
+    Direct,
+}
+
+impl TransferMode {
+    pub const fn from_flags(resume: bool, in_place: bool) -> Self {
+        if resume {
+            Self::Checkpoint
+        } else if in_place {
+            Self::Atomic
+        } else {
+            Self::Direct
+        }
+    }
+
+    pub const fn policy(self) -> TransferPolicy {
+        match self {
+            Self::Checkpoint => TransferPolicy::Checkpointed,
+            Self::Atomic => TransferPolicy::AtomicReplace,
+            Self::Direct => TransferPolicy::Direct,
+        }
+    }
+}
+
 #[derive(Clone, Default)]
 pub struct CopyOptions {
+    pub transfer_mode: TransferMode,
     pub qos: Option<QosManager>,
     pub enable_integrity_check: bool,
     pub is_source_reserved: bool,

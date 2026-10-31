@@ -23,23 +23,27 @@ impl RollingChecksum {
 
     /// 对一段数据计算初始 checksum
     pub fn checksum(data: &[u8]) -> u32 {
-        let mut a: u32 = 0;
-        let mut b: u32 = 0;
-        for &byte in data {
-            a = (a + u32::from(byte)) % MODULUS;
-            b = (b + a) % MODULUS;
-        }
+        let (a, b) = Self::sums(data);
         (b << 16) | a
     }
 
-    /// 初始化窗口
+    /// 初始化窗口。
     pub fn init(&mut self, data: &[u8]) {
-        self.a = 0;
-        self.b = 0;
-        for &byte in data {
-            self.a = (self.a + u32::from(byte)) % MODULUS;
-            self.b = (self.b + self.a) % MODULUS;
+        (self.a, self.b) = Self::sums(data);
+    }
+
+    /// 5552 个最大字节累加也不溢出 u32，按批取模保持原 checksum 不变。
+    fn sums(data: &[u8]) -> (u32, u32) {
+        let (mut a, mut b) = (0u32, 0u32);
+        for chunk in data.chunks(5552) {
+            for &byte in chunk {
+                a += u32::from(byte);
+                b += a;
+            }
+            a %= MODULUS;
+            b %= MODULUS;
         }
+        (a, b)
     }
 
     /// O(1) 滑动更新：移除 `old_byte`，加入 `new_byte`
@@ -119,5 +123,24 @@ mod tests {
         rc.update(b'a', b'e', 4);
 
         assert_eq!(rc.digest(), expected);
+    }
+}
+
+#[cfg(test)]
+mod batch_tests {
+    use super::*;
+    #[test]
+    fn batched_sums_equal_the_original_algorithm_at_overflow_boundaries() {
+        for size in [0, 1, 5551, 5552, 5553, 11104, 128 * 1024 + 13] {
+            for pattern in [0, 1, 127, 255] {
+                let bytes = vec![pattern; size];
+                let (mut a, mut b) = (0, 0);
+                for &byte in &bytes {
+                    a = (a + u32::from(byte)) % MODULUS;
+                    b = (b + a) % MODULUS;
+                }
+                assert_eq!(RollingChecksum::checksum(&bytes), (b << 16) | a);
+            }
+        }
     }
 }

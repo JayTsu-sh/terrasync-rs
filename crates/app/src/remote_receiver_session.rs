@@ -6,6 +6,8 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+#[cfg(test)]
+use storage_adapter::TransferMode;
 
 use storage_adapter::dir_tree::DirPageResult;
 use storage_adapter::{DataChunk, EntryEnum, StorageEnum};
@@ -679,6 +681,7 @@ mod tests {
 
     fn session_config() -> SessionConfig {
         SessionConfig {
+            transfer_mode: TransferMode::Atomic,
             src_path: String::new(),
             qos: None,
             peak_qos_rate: 1.0,

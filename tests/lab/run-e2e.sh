@@ -118,7 +118,7 @@ for source_backend in "${backends[@]}"; do
     put_fixture source "$source_backend" "$case_id" "$key" "$fixture"
     prepare_storage_root destination "$destination_backend" "$case_id"
 
-    run_terrasync sync --id "lab-$case_id" \
+    run_terrasync sync --resume --id "lab-$case_id" \
       "$(storage_url source "$source_backend" "$case_id")" \
       "$(storage_url destination "$destination_backend" "$case_id")"
     actual_hash="$(object_hash destination "$destination_backend" "$case_id" "$key")"
@@ -148,11 +148,11 @@ for backend in "${backends[@]}"; do
   printf 'added-%s\n' "$backend" > "$added"
   put_fixture source "$backend" "$case_id" existing.txt "$original"
   prepare_storage_root destination "$backend" "$case_id"
-  run_terrasync sync --id "lab-$case_id" \
+  run_terrasync sync --resume --id "lab-$case_id" \
     "$(storage_url source "$backend" "$case_id")" "$(storage_url destination "$backend" "$case_id")"
   put_fixture source "$backend" "$case_id" existing.txt "$changed"
   put_fixture source "$backend" "$case_id" added.txt "$added"
-  run_terrasync sync --id "lab-$case_id" \
+  run_terrasync sync --resume --id "lab-$case_id" \
     "$(storage_url source "$backend" "$case_id")" "$(storage_url destination "$backend" "$case_id")"
   [[ "$(object_hash destination "$backend" "$case_id" existing.txt)" == "$(sha256sum "$changed" | cut -d' ' -f1)" ]]
   [[ "$(object_hash destination "$backend" "$case_id" added.txt)" == "$(sha256sum "$added" | cut -d' ' -f1)" ]]
@@ -267,7 +267,7 @@ case_id="local-filter"
 mkdir -p "$lab_root/$case_id/source" "$lab_root/$case_id/destination"
 printf 'included\n' > "$lab_root/$case_id/source/included.txt"
 printf 'excluded\n' > "$lab_root/$case_id/source/excluded.txt"
-run_terrasync sync --id lab-local-filter --exclude 'name=="excluded.txt"' \
+run_terrasync sync --resume --id lab-local-filter --exclude 'name=="excluded.txt"' \
   "$lab_root/$case_id/source" "$lab_root/$case_id/destination"
 test -f "$lab_root/$case_id/destination/included.txt"
 test ! -e "$lab_root/$case_id/destination/excluded.txt"

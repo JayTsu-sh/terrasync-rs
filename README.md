@@ -1090,12 +1090,12 @@ python tools/log_analyzer.py --app /tmp/app.json.log --error /tmp/error.log -o /
 
 ### data-mover 0.4 适配说明
 
-依赖固定到主分支提交 `4149575e91fe392ee853725e110d6c1be9c6b562`。
+依赖固定到主分支提交 `4781406a7cbe1f7e8b6cc31c3f08e9c4a3bb396a`。
 `crates/storage-adapter` 持有 TerraSync 的数据库和 wire 数据投影，存储操作使用
 `connect_backend`、遍历角色及统一 transfer/expert 引擎；恢复进度由目标存储负责。
 旧 `.terrasync-part` 和本地 offset 记录不能授权新引擎恢复。
 
-远端协议升级到 v9，Sender 和 Receiver 需同时升级。SMB URL 不再接受
+远端协议升级到 v10，Sender 和 Receiver 需同时升级。SMB URL 不再接受
 `smb2_only` 查询参数。观察快照解码需要提供对应连接的 `BackendIdentity`；
 旧版本快照会返回版本错误，需要重新扫描生成。增量扫描过渡代按路径比较，
 不会把旧驱动句柄当作新的中立 identity key。
@@ -1104,3 +1104,37 @@ python tools/log_analyzer.py --app /tmp/app.json.log --error /tmp/error.log -o /
 文件元数据由传输引擎在发布前协商应用；目录及仅属性更新按目标存储能力处理。
 真实环境可使用 `tests/lab/run-e2e.sh`、`tests/lab/run-hdfs-e2e.sh` 和完整性专项脚本复验，
 验证报告保留在本地测试目录。
+
+### sync 文件写入模式
+
+| 参数 | data-mover 策略 | 行为 |
+|------|----------------|------|
+| `--resume`（优先级最高） | Checkpointed | 保留目标端可恢复检查点；小文件可能按上游门槛省略检查点 |
+| 仅 `--in-place` | AtomicReplace | 重建到 staging，完成校验后原子发布，不保留恢复检查点 |
+| 两者都不指定 | Direct | 直接写最终目标；失败可能留下部分内容 |
+
+这里的 `--in-place` 按产品约定选择 Atomic，并非直接改写旧目标。
+模式贯穿全量同步、增量新增/变更以及 rename 后的内容重拷贝；后端能力不足时明确报错，不自动降级。
+旧 `--no-resume` 仅作为兼容参数接受，不再开启默认续传；不能与 `--resume` 同用。
+Web 发起的任务继续显式使用 Checkpoint，不受 CLI 默认值调整影响。
+
+双进程 `--remote` 会把模式传给 Receiver。当前 Direct 稀疏补丁支持 Unix Local 目标；
+其他 backend 必须实现上游的 `supports_sparse_patch`/`patch_direct`，否则明确报错，
+可显式改用 `--in-place` 或 `--resume`。协议 v10 要求两端同时升级。
+`--packaged` 的 tar API 固定 Atomic，因此需指定 `--in-place`；其他模式明确报错。
+
+已有完整目标后的 Direct delta 会先消费所有 basis 引用，只暂存不同区间，校验完整输入和
+basis 版本后才原地改写。相同位置的 Match 不写入，连续引用合并读取；重复块优先选择
+同位置引用。增长、缩短、移动和重叠引用均按最终输出区间处理。补丁实际写入字节数会记入日志。
+输入暂存和 backend 文件句柄均由 data-mover 持有，Unix 输入暂存立即 unlink，进程中断不会留下 spool。
+网络接收阶段中断不改旧目标；应用补丁期间失败可能留下部分更新，重跑时须重新生成 basis 签名。
+Direct 不提供 Atomic 的回滚或其他进程并发写隔离保证。
+
+Direct 默认不受原有 512MiB delta 门槛限制；显式 `--delta-size-threshold` 仍有效。
+Atomic/Checkpoint 保留原默认门槛。delta 的网络传输只包括变化字节及未变块引用，但签名和完整校验
+仍可能读取整文件。Checkpoint 保留目标端前缀；当前双进程 wire 重跑会重放数据或 delta token
+计算完整摘要，不代表网络字节级续传。
+
+可以用 `tests/lab/verify-direct-delta.py --binary /path/to/terrasync --work-dir /tmp/direct-delta`
+复验真实 QUIC 的 20GiB/10MiB 场景。脚本使用稀疏 fixture，校验 SHA-256、inode 和后端实际写入量；
+时间结果受缓存和稀疏文件影响，不作为物理磁盘性能结论。

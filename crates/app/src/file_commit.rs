@@ -10,7 +10,7 @@ use std::sync::atomic::Ordering;
 // 外部 crate
 use bytes::{Bytes, BytesMut};
 use storage_adapter::error::Result as StorageResult;
-use storage_adapter::{CommitCallback, DataChunk, EntryEnum, StorageEnum, StreamHandle};
+use storage_adapter::{DataChunk, EntryEnum, StorageEnum, StreamChunk, StreamHandle};
 use sync_delta::DeltaToken;
 use sync_delta::reconstruct::{ReconstructStep, Reconstructor};
 use tokio::sync::mpsc;
@@ -29,7 +29,7 @@ struct ActiveFile {
     /// 目标端文件 entry（最终路径及暂存元数据计划的依据）
     entry: Arc<EntryEnum>,
     /// 向 `write_chunk_stream` 内部 channel 转发数据块的发送端
-    tx_inner: mpsc::Sender<DataChunk>,
+    tx_inner: mpsc::Sender<StreamChunk>,
     /// 后台写任务句柄，channel 关闭后收尾并返回结果
     write_join: JoinHandle<StorageResult<()>>,
     /// expert destination 的会话状态（write 任务持有其 clone）
@@ -83,6 +83,7 @@ struct DeltaCtx {
     /// 已写入输出流的字节数：下一个 `DataChunk` 的 offset（与 basis 偏移无关，
     /// 由 token 到达顺序单调递增）
     write_pos: u64,
+    pending_basis: Option<(u64, u32, u64)>,
 }
 
 /// 持有 disk-commit 接受的单个文件完整落盘生命周期。
@@ -138,21 +139,31 @@ impl FileCommitter {
             return;
         }
 
-        match StorageEnum::prepare_stream(&self.dest, &entry).await {
+        let basis_size = if delta_block_size.is_some() {
+            match self.dest.get_metadata(entry.get_relative_path()).await {
+                Ok(basis) => basis.get_size(),
+                Err(error) if error.is_not_found() => entry.get_size(),
+                Err(error) => {
+                    self.state = FileCommitState::Failed;
+                    self.report(ndx, stage_error("basis describe", error.into()));
+                    return;
+                }
+            }
+        } else {
+            0
+        };
+        match StorageEnum::prepare_stream_with_mode(&self.dest, &entry, self.session.transfer_mode).await {
             Ok(handle) => {
-                let (tx_inner, rx_inner) = mpsc::channel::<DataChunk>(8);
-                let dest = self.dest.clone();
-                let writer_entry = entry.clone();
+                let (tx_inner, rx_inner) = mpsc::channel::<StreamChunk>(8);
                 let writer_handle = handle.clone();
-                let write_join = tokio::spawn(async move {
-                    StorageEnum::write_chunk_stream(&dest, &writer_entry, rx_inner, &writer_handle, None, noop_commit())
-                        .await
-                });
+                let write_join =
+                    tokio::spawn(async move { StorageEnum::write_planned_stream(rx_inner, &writer_handle).await });
                 let size = entry.get_size();
                 let mode = delta_block_size.map_or(ActiveFileMode::Full, |block_size| {
                     ActiveFileMode::Delta(DeltaCtx {
-                        reconstructor: Reconstructor::new(block_size, size),
+                        reconstructor: Reconstructor::new(block_size, basis_size),
                         write_pos: 0,
+                        pending_basis: None,
                     })
                 });
                 let active = ActiveFile {
@@ -186,7 +197,7 @@ impl FileCommitter {
             debug!("[dc] rejecting full chunk for non-matching active stream");
             return;
         }
-        if active.tx_inner.send(chunk).await.is_err() {
+        if active.tx_inner.send(StreamChunk::from(chunk)).await.is_err() {
             debug!("[dc] write channel closed early for {:?}", entry.get_relative_path());
         }
     }
@@ -212,41 +223,41 @@ impl FileCommitter {
             return;
         };
 
-        let data = match delta.reconstructor.push(&token) {
-            ReconstructStep::Ready(bytes) => bytes,
-            ReconstructStep::NeedBasis { len: 0, .. } => Bytes::new(),
-            ReconstructStep::NeedBasis { offset, len } => {
-                match read_basis_block(&self.dest, &active.entry, offset, len).await {
-                    Ok(bytes) => bytes,
-                    Err(error) => {
-                        error!("[dc] delta basis read {:?}: {error}", active.entry.get_relative_path());
-                        if let FileCommitState::DeltaActive(active) =
-                            std::mem::replace(&mut self.state, FileCommitState::Failed)
-                        {
-                            settle_and_remove(&self.dest, active).await;
-                        }
-                        self.report(ndx, stage_error("basis read", error));
-                        return;
-                    }
-                }
+        let step = delta.reconstructor.push(&token);
+        if let ReconstructStep::NeedBasis { offset, len } = step {
+            if let Some((start, pending_len, _)) = &mut delta.pending_basis
+                && *start + u64::from(*pending_len) == offset
+                && u64::from(*pending_len) + u64::from(len) <= 2 * 1024 * 1024
+            {
+                *pending_len += len;
+                delta.write_pos += u64::from(len);
+                return;
             }
+        }
+        if let Err(error) = flush_basis(&self.dest, active).await {
+            let previous = std::mem::replace(&mut self.state, FileCommitState::Failed);
+            if let FileCommitState::DeltaActive(active) = previous {
+                settle_and_remove(&self.dest, active).await;
+            }
+            self.report(ndx, stage_error("basis read", error));
+            return;
+        }
+        let ActiveFileMode::Delta(delta) = &mut active.mode else {
+            return;
         };
-
-        let write_offset = delta.write_pos;
-        delta.write_pos += data.len() as u64;
-        if active
-            .tx_inner
-            .send(DataChunk {
-                offset: write_offset,
-                data,
-            })
-            .await
-            .is_err()
-        {
-            debug!(
-                "[dc] delta write channel closed early for {:?}",
-                active.entry.get_relative_path()
-            );
+        match step {
+            ReconstructStep::NeedBasis { offset, len } => {
+                delta.pending_basis = Some((offset, len, delta.write_pos));
+                delta.write_pos += u64::from(len);
+            }
+            ReconstructStep::Ready(data) => {
+                let offset = delta.write_pos;
+                delta.write_pos += data.len() as u64;
+                let _ = active
+                    .tx_inner
+                    .send(StreamChunk::from(DataChunk { offset, data }))
+                    .await;
+            }
         }
     }
 
@@ -266,6 +277,16 @@ impl FileCommitter {
                 "[dc] rejecting commit for non-matching active stream: {:?}",
                 entry.get_relative_path()
             );
+            return;
+        }
+        if let FileCommitState::DeltaActive(active) = &mut self.state
+            && let Err(error) = flush_basis(&self.dest, active).await
+        {
+            let previous = std::mem::replace(&mut self.state, FileCommitState::Failed);
+            if let FileCommitState::DeltaActive(active) = previous {
+                settle_and_remove(&self.dest, active).await;
+            }
+            self.report(ndx, stage_error("basis read", error));
             return;
         }
         let previous = std::mem::replace(&mut self.state, FileCommitState::Committing);
@@ -411,7 +432,25 @@ async fn read_basis_block(dest: &Arc<StorageEnum>, entry: &Arc<EntryEnum>, offse
     }
 }
 
-/// `disk_commit` task 不做逐 chunk 进度回调，提交回调为空操作。
-fn noop_commit() -> CommitCallback {
-    Arc::new(|_off, _len| {})
+/// 连续的 basis 引用合并为有界读取，避免大文件逐块反复打开和描述目标。
+async fn flush_basis(dest: &Arc<StorageEnum>, active: &mut ActiveFile) -> Result<()> {
+    let ActiveFileMode::Delta(delta) = &mut active.mode else {
+        return Ok(());
+    };
+    let Some((offset, len, write_offset)) = delta.pending_basis.take() else {
+        return Ok(());
+    };
+    let data = read_basis_block(dest, &active.entry, offset, len).await?;
+    active
+        .tx_inner
+        .send(StreamChunk {
+            chunk: DataChunk {
+                offset: write_offset,
+                data,
+            },
+            unchanged_basis: offset == write_offset,
+        })
+        .await
+        .map_err(|_| AppError::CopyError("Delta destination writer closed".into()))?;
+    Ok(())
 }

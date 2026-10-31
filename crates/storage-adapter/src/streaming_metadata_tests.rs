@@ -23,11 +23,16 @@ struct MetadataProbe {
     fail: bool,
     called: AtomicBool,
     cleanup_failure: AtomicBool,
+    resumable: AtomicBool,
     tags: Mutex<Vec<ObjectTag>>,
 }
 
 #[async_trait]
 impl StagedDestination for MetadataProbe {
+    fn resumable_at_destination(&self) -> bool {
+        self.resumable.load(Ordering::SeqCst)
+    }
+
     fn copied_metadata_target(&self) -> Option<CopiedMetadataTarget> {
         let mut target = self.inner.copied_metadata_target().unwrap();
         target.tags = CopiedValueTarget::Supported;
@@ -105,6 +110,7 @@ async fn destination(fail: bool) -> (TempDir, StorageEnum, Arc<MetadataProbe>) {
         fail,
         called: AtomicBool::new(false),
         cleanup_failure: AtomicBool::new(false),
+        resumable: AtomicBool::new(true),
         tags: Mutex::default(),
     });
     let roles = StorageBuilder::new(local.identity().clone(), local.capabilities().clone())
@@ -263,4 +269,119 @@ async fn stream_keeps_primary_metadata_error_when_cleanup_also_fails() {
         error => panic!("expected primary error and cleanup evidence: {error:?}"),
     }
     assert_eq!(std::fs::read(root.path().join("file")).unwrap(), b"old");
+}
+
+#[tokio::test]
+async fn unsupported_modes_fail_before_destination_mutation() {
+    let (root, destination, probe) = destination(false).await;
+    let entry = destination.get_metadata(Path::new("file")).await.unwrap();
+    for mode in [TransferMode::Direct, TransferMode::Checkpoint] {
+        probe.resumable.store(false, Ordering::SeqCst);
+        let error = StorageEnum::copy_file(
+            &destination,
+            &destination,
+            &entry,
+            CopyOptions {
+                transfer_mode: mode,
+                is_source_reserved: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(error, StorageError::UnsupportedTransferMode { mode: rejected, .. } if rejected == mode));
+        assert_eq!(std::fs::read(root.path().join("file")).unwrap(), b"old");
+        assert!(!probe.called.load(Ordering::SeqCst));
+    }
+    assert!(destination.validate_transfer_mode(TransferMode::Atomic).is_ok());
+}
+
+/// 上游 Local 的生产恢复门槛为 256 MiB；使用共享 chunk 控制内存，验证真实前缀复用。
+#[tokio::test]
+async fn checkpoint_stream_reuses_partial_prefix_and_verifies_full_payload() {
+    use std::io::Read;
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(root.path().join("file"), b"old").unwrap();
+    let destination = create_storage(
+        root.path().to_str().unwrap(),
+        CreateStorageOptions::new(Some(64 * 1024), false),
+    )
+    .await
+    .unwrap();
+    let mut entry = destination.get_metadata(Path::new("file")).await.unwrap();
+    let size = 256 * 1024 * 1024 + 17;
+    if let EntryEnum::NAS(ref mut file) = entry {
+        file.size = size;
+    }
+    let first = StorageEnum::prepare_stream_with_mode(&destination, &entry, TransferMode::Checkpoint)
+        .await
+        .unwrap();
+    let (tx, rx) = mpsc::channel(2);
+    let prefix = 1024 * 1024 + 3;
+    tx.send(DataChunk {
+        offset: 0,
+        data: Bytes::from(vec![b'A'; prefix]),
+    })
+    .await
+    .unwrap();
+    drop(tx);
+    let error = StorageEnum::write_chunk_stream(&destination, &entry, rx, &first, None, Arc::new(|_, _| {}))
+        .await
+        .unwrap_err();
+    assert!(matches!(error, StorageError::Transfer(_)), "{error:?}");
+    drop(error);
+    first.discard().await.unwrap();
+    drop(first);
+    assert_eq!(std::fs::read(root.path().join("file")).unwrap(), b"old");
+
+    let resumed = StorageEnum::prepare_stream_with_mode(&destination, &entry, TransferMode::Checkpoint)
+        .await
+        .unwrap();
+    assert_eq!(resumed.0.lock().await.resume_offset, prefix as u64);
+    let (tx, rx) = mpsc::channel(4);
+    let writer_handle = resumed.clone();
+    let writer_dest = destination.clone();
+    let writer_entry = entry.clone();
+    let writer = tokio::spawn(async move {
+        StorageEnum::write_chunk_stream(
+            &writer_dest,
+            &writer_entry,
+            rx,
+            &writer_handle,
+            None,
+            Arc::new(|_, _| {}),
+        )
+        .await
+    });
+    let chunk = Bytes::from(vec![b'A'; 64 * 1024]);
+    let mut expected = Hasher::new();
+    let mut offset = 0;
+    while offset < size {
+        let data = chunk.slice(..((size - offset).min(chunk.len() as u64) as usize));
+        expected.update(&data);
+        tx.send(DataChunk {
+            offset,
+            data: data.clone(),
+        })
+        .await
+        .unwrap();
+        offset += data.len() as u64;
+    }
+    drop(tx);
+    writer.await.unwrap().unwrap();
+    StorageEnum::commit_chunk_stream(&destination, &entry, size, resumed)
+        .await
+        .unwrap();
+    assert_eq!(std::fs::metadata(root.path().join("file")).unwrap().len(), size);
+    let mut reader = std::fs::File::open(root.path().join("file")).unwrap();
+    let mut buffer = vec![0; 64 * 1024];
+    let mut actual = Hasher::new();
+    loop {
+        let n = reader.read(&mut buffer).unwrap();
+        if n == 0 {
+            break;
+        }
+        actual.update(&buffer[..n]);
+    }
+    assert_eq!(actual.finalize(), expected.finalize());
 }

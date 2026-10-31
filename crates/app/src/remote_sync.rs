@@ -13,6 +13,8 @@ mod remote_sender_session;
 use remote_sender_session::{RemoteSenderSession, RemoteSenderSessionDeps};
 #[cfg(test)]
 use remote_sender_session::{classification_to_stats_message, entry_error_stats_message};
+#[cfg(test)]
+use storage_adapter::TransferMode;
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -74,6 +76,7 @@ pub(crate) async fn run(
     // ── 3. 发送 SessionConfig ──
     transport
         .send(SenderMsg::SessionConfig(SessionConfig {
+            transfer_mode: config.transfer_mode,
             src_path: config.src_path.clone(),
             qos: config.qos.clone(),
             peak_qos_rate: config.peak_qos_rate,
@@ -347,6 +350,7 @@ mod tests {
         send_and_check_auth(&sender_transport, None).await.unwrap();
         sender_transport
             .send(SenderMsg::SessionConfig(SessionConfig {
+                transfer_mode: TransferMode::Atomic,
                 src_path: src_dir.path().to_string_lossy().to_string(),
                 qos: None,
                 peak_qos_rate: 1.0,
@@ -646,6 +650,7 @@ mod tests {
         send_and_check_auth(sender_transport, None).await.unwrap();
         sender_transport
             .send(SenderMsg::SessionConfig(SessionConfig {
+                transfer_mode: TransferMode::Atomic,
                 src_path: src_dir.to_string_lossy().to_string(),
                 qos: None,
                 peak_qos_rate: 1.0,
@@ -703,6 +708,7 @@ mod tests {
         send_and_check_auth(sender_transport, None).await.unwrap();
         sender_transport
             .send(SenderMsg::SessionConfig(SessionConfig {
+                transfer_mode: TransferMode::Atomic,
                 src_path: src_dir.to_string_lossy().to_string(),
                 qos: None,
                 peak_qos_rate: 1.0,
@@ -1479,6 +1485,7 @@ mod tests {
         send_and_check_auth(&sender_transport, None).await.unwrap();
         sender_transport
             .send(SenderMsg::SessionConfig(SessionConfig {
+                transfer_mode: TransferMode::Atomic,
                 src_path: String::new(),
                 qos: None,
                 peak_qos_rate: 1.0,
