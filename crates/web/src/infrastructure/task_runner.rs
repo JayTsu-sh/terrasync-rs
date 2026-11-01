@@ -1,9 +1,11 @@
 use std::sync::{Arc, OnceLock};
 use storage_adapter::TransferMode;
 
+use app::error::AppError;
 use app::scan_resume::{clear_cluster_scan, scan_execution_is_incremental, scan_with_resume_settings};
 use dashmap::{DashMap, mapref::entry::Entry};
 use std::time::Duration;
+use tokio::select;
 use tokio::sync::Semaphore;
 use tokio::time::{sleep, timeout};
 use tokio_util::sync::CancellationToken;
@@ -317,12 +319,18 @@ async fn run_migration_task(
     dest_url: Option<&str>, cancel_token: CancellationToken, config_repo: Arc<dyn ConfigRepository>,
 ) -> Result<()> {
     // 从 SQLite 读取 ClickHouse 配置，覆盖 AppConfig 全局配置并校验连通性
-    let ch_cfg = apply_db_config_from_sqlite(config_repo.as_ref())
-        .await?
-        .ok_or_else(|| WebError::ConnectionTestFailed("ClickHouse 未配置".to_string()))?;
-    clickhouse_client::test_connectivity(&ch_cfg.dsn, &ch_cfg.username, &ch_cfg.password, &ch_cfg.database)
-        .await
-        .map_err(|_| WebError::ConnectionTestFailed("请先在设置中检查 ClickHouse 数据库配置".to_string()))?;
+    let ch_cfg = select! {
+        biased;
+        _=cancel_token.cancelled()=>return Err(AppError::ObservationScanCancelled.into()),
+        config=apply_db_config_from_sqlite(config_repo.as_ref())=>config?,
+    }
+    .ok_or_else(|| WebError::ConnectionTestFailed("ClickHouse 未配置".to_string()))?;
+    select! {
+        biased;
+        _=cancel_token.cancelled()=>return Err(AppError::ObservationScanCancelled.into()),
+        result=clickhouse_client::test_connectivity(&ch_cfg.dsn, &ch_cfg.username, &ch_cfg.password, &ch_cfg.database)=>
+            result.map_err(|_| WebError::ConnectionTestFailed("请先在设置中检查 ClickHouse 数据库配置".to_string()))?,
+    }
 
     let callback_url = progress_callback_url_for(task_id);
 

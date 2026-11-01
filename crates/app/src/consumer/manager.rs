@@ -458,6 +458,13 @@ impl ConsumerManager {
             StatisticConsumer::end(sc, callback).await;
         }
     }
+
+    pub(crate) async fn end_cancelled_lifecycle(&mut self) {
+        if let Some(sc) = self.stats_consumer.clone() {
+            let callback = self.callback_guard.take();
+            StatisticConsumer::end_cancelled(sc, callback).await;
+        }
+    }
 }
 
 /// 兜底回收 callback 回调任务：若 `end_lifecycle` 因 panic/early-return 未被调用，

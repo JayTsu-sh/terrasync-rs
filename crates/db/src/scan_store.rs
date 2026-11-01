@@ -10,6 +10,9 @@ use data_mover::model::ObservedEntry;
 use std::sync::Arc;
 use storage_adapter::observed_scan::ObservedScanEvent;
 
+pub(crate) mod queries;
+pub use queries::{ScanQueryCancellation, with_scan_cancellation};
+
 enum Store {
     Single(ClickHouseDatabase),
     Cluster(ClusterScanStore),
@@ -61,6 +64,7 @@ impl ScanFinalEvent {
 pub struct ScanStore {
     inner: Store,
     job_id: String,
+    queries: ScanQueryCancellation,
 }
 
 macro_rules! delegate {
@@ -77,20 +81,30 @@ impl ScanStore {
             Store::Cluster(store) => Some(Self {
                 inner: Store::Cluster(store.batch_writer()),
                 job_id: self.job_id.clone(),
+                queries: self.queries.clone(),
             }),
             Store::Single(_) => None,
         }
     }
 
     pub fn new(config: &ClickHouseConfig, cluster: Option<&str>, job_id: &str) -> Result<Self> {
-        let inner = match cluster.filter(|value| !value.is_empty()) {
+        let queries = ScanQueryCancellation::new(config, cluster)?;
+        let mut inner = match cluster.filter(|value| !value.is_empty()) {
             Some(cluster) => Store::Cluster(ClusterScanStore::new(config, cluster, job_id)?),
             None => Store::Single(ClickHouseDatabase::new(config, job_id)),
         };
+        match &mut inner {
+            Store::Single(store) => store.tag_scan_queries(queries.comment()),
+            Store::Cluster(store) => store.tag_scan_queries(queries.comment()),
+        }
         Ok(Self {
             inner,
             job_id: job_id.into(),
+            queries,
         })
+    }
+    pub fn query_cancellation(&self) -> ScanQueryCancellation {
+        self.queries.clone()
     }
     pub async fn initialize(&self) -> Result<()> {
         match &self.inner {

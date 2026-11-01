@@ -51,9 +51,10 @@ impl ConnectedStorage {
         &self, options: &WalkOptions, checkpoint: Option<Vec<u8>>, cancel: CancellationToken,
         every: std::time::Duration,
     ) -> Result<ResumableScan> {
+        let cancel = cancel.child_token();
         let mut request = self
             .traversal_request(None, options, false)?
-            .cancel(cancel)
+            .cancel(cancel.clone())
             .resumable(Resumable::On { every });
         if let Some(bytes) = checkpoint {
             request = request.resume_from(Checkpoint::from_bytes(bytes.into()));
@@ -61,6 +62,7 @@ impl ConnectedStorage {
         Ok(ResumableScan {
             session: StorageTraversalSource::new(&self.roles)?.traverse(request),
             history: None,
+            cancel,
         })
     }
     pub async fn walkdir(&self, sub: Option<&Path>, options: WalkOptions) -> Result<WalkDirAsyncIterator> {
@@ -370,9 +372,16 @@ pub enum ResumableScanItem {
 pub struct ResumableScan {
     session: TraversalSession,
     history: Option<(String, u32)>,
+    cancel: CancellationToken,
 }
 
 impl ResumableScan {
+    /// 放弃未确认的尾部条目，等待遍历真正停止；不把取消时的部分历史当成完成证据。
+    pub async fn stop(mut self) -> Result<TraversalOutcome> {
+        self.cancel.cancel();
+        while self.session.next_item().await.is_some() {}
+        self.session.finish().await.map_err(StorageError::from)
+    }
     pub async fn next(&mut self) -> Option<Result<ResumableScanItem>> {
         while let Some(item) = self.session.next_item().await {
             match item {
@@ -412,10 +421,12 @@ impl ResumableScan {
     }
 
     pub async fn finish(self) -> Result<TraversalOutcome> {
-        if self.history.is_some() {
+        let partial = self.history.is_some();
+        let outcome = self.session.finish().await.map_err(StorageError::from)?;
+        if partial {
             return Err(operation("scan ended with an incomplete version history"));
         }
-        self.session.finish().await.map_err(StorageError::from)
+        Ok(outcome)
     }
 }
 pub type DeleteDirIterator = AsyncReceiver<DeleteEvent>;
@@ -500,4 +511,43 @@ fn date_name(name: &str) -> bool {
                     .is_some_and(|value| NaiveDate::parse_from_str(value, format).is_ok())
             })
     })
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod stopping_tests {
+    use super::*;
+    use data_mover::traversal::TraversalTerminalFailure;
+    use std::{
+        num::NonZeroUsize,
+        sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        },
+    };
+    use tokio::time::{Duration, sleep};
+
+    #[tokio::test]
+    async fn stopping_partial_history_waits_for_the_source_without_cancelling_its_parent() {
+        let parent = CancellationToken::new();
+        let cancel = parent.child_token();
+        let (producer, session) = TraversalSession::bounded(NonZeroUsize::new(1).unwrap(), cancel.clone());
+        let scan = ResumableScan {
+            session,
+            history: Some(("partial-history".into(), 1)),
+            cancel: cancel.clone(),
+        };
+        let finished = Arc::new(AtomicBool::new(false));
+        let flag = finished.clone();
+        let source = tokio::spawn(async move {
+            cancel.cancelled().await;
+            sleep(Duration::from_millis(10)).await;
+            flag.store(true, Ordering::SeqCst);
+            producer.finish(Err(TraversalTerminalFailure::Internal));
+        });
+        assert!(scan.stop().await.is_err());
+        assert!(finished.load(Ordering::SeqCst));
+        assert!(!parent.is_cancelled());
+        source.await.unwrap();
+    }
 }

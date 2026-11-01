@@ -9,6 +9,7 @@ use storage_adapter::observed_scan::{ObservedScanEvent, ObservedView};
 
 impl ClickHouseDatabase {
     pub(crate) async fn write_native_keys(&self, entries: &[Arc<ObservedEntry>]) -> Result<()> {
+        check_scan_cancellation()?;
         if entries.is_empty() {
             return Ok(());
         }
@@ -43,6 +44,7 @@ impl ClickHouseDatabase {
         })
     }
     pub(crate) async fn write_native(&self, entries: &[Arc<ObservedEntry>], temporary: bool) -> Result<()> {
+        check_scan_cancellation()?;
         if entries.is_empty() {
             return Ok(());
         }

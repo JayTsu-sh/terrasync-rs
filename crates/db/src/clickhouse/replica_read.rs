@@ -1,14 +1,17 @@
 //! 保留原有一致性设置；副本尚未到达已确认 quorum 时切换副本重试读取。
+use crate::{
+    error::Result,
+    scan_store::queries::{check_scan_cancellation, scan_retry_delay},
+};
 use clickhouse::{
     RowOwned, RowRead,
-    error::{Error, Result},
+    error::{Error, Result as ClickHouseResult},
     query::Query,
 };
 use std::{
     future::Future,
     time::{Duration, Instant},
 };
-use tokio::time::sleep;
 use tracing::warn;
 
 pub(crate) trait QuorumRead {
@@ -28,11 +31,12 @@ impl QuorumRead for Query {
 async fn read<T, F, Fut>(query: Query, mut operation: F) -> Result<T>
 where
     F: FnMut(Query) -> Fut,
-    Fut: Future<Output = Result<T>>,
+    Fut: Future<Output = ClickHouseResult<T>>,
 {
     let started = Instant::now();
     let mut retrying = false;
     loop {
+        check_scan_cancellation()?;
         let request = if retrying {
             query.clone().with_option("load_balancing", "random")
         } else {
@@ -48,9 +52,9 @@ where
                     );
                 }
                 retrying = true;
-                sleep(Duration::from_millis(50)).await;
+                scan_retry_delay(Duration::from_millis(50)).await?;
             }
-            result => return result,
+            result => return Ok(result?),
         }
     }
 }
@@ -59,12 +63,34 @@ where
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+    use crate::{DatabaseError, scan_store::with_scan_cancellation};
     use clickhouse::{Client, Compression};
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
         net::TcpListener,
         task::JoinHandle,
+        time::timeout,
     };
+    use tokio_util::sync::CancellationToken;
+
+    #[tokio::test]
+    async fn cancellation_during_replica_backoff_does_not_issue_another_request() {
+        let (url, server) = server(vec![(500, b"Code: 289. REPLICA_IS_NOT_IN_QUORUM".to_vec())]).await;
+        let client = Client::default()
+            .with_url(url)
+            .with_validation(false)
+            .with_compression(Compression::None);
+        let cancel = CancellationToken::new();
+        let token = cancel.clone();
+        let request = tokio::spawn(async move {
+            with_scan_cancellation(token, client.query("SELECT 42").fetch_quorum_one::<u64>()).await
+        });
+        let requests = server.await.unwrap();
+        cancel.cancel();
+        let result = timeout(Duration::from_millis(200), request).await.unwrap().unwrap();
+        assert!(matches!(result, Err(DatabaseError::ScanCancelled)));
+        assert_eq!(requests.len(), 1);
+    }
 
     async fn server(responses: Vec<(u16, Vec<u8>)>) -> (String, JoinHandle<Vec<String>>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();

@@ -27,6 +27,7 @@ use crate::common::{
 use crate::config::ClickHouseConfig;
 use crate::error::{DatabaseError, Result};
 use crate::observation_record::{OBSERVATION_IDENTITY_JOIN_CLAUSE, ObservedEntryRecord};
+use crate::scan_store::queries::check_scan_cancellation;
 use crate::traits::{Database, IncrementalStorageEntryRecord, QueryResult, StorageEntryRecord, TarManifestRecord};
 use crate::{
     INCREMENTAL_SCAN_TABLE_BASE_NAME, SCAN_BASE_TABLE_BASE_NAME, SCAN_STATE_TABLE_BASE_NAME,
@@ -59,6 +60,13 @@ pub struct ClickHouseDatabase {
     resume_base_has_typed_handles: Option<bool>,
     /// 同一 `ClickHouse` 身份与 job 共享的 scan generation 生命周期
     generation_lifecycle: Arc<Mutex<ScanGenerationLifecycle>>,
+}
+
+impl ClickHouseDatabase {
+    pub(crate) fn tag_scan_queries(&mut self, comment: &str) {
+        self.sync_client = self.sync_client.clone().with_option("log_comment", comment);
+        self.async_client = self.async_client.clone().with_option("log_comment", comment);
+    }
 }
 
 #[derive(Default)]
@@ -557,6 +565,7 @@ impl ClickHouseDatabase {
     ///
     /// 注意：由于ClickHouse execute API的限制，当前无法获取受影响的行数
     pub(crate) async fn execute(&self, sql: &str, params: &[Value]) -> Result<QueryResult> {
+        check_scan_cancellation()?;
         debug!("Executing ClickHouse statement: {}", sql);
 
         let mut query = self.sync_client.query(sql);

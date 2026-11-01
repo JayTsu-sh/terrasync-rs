@@ -17,8 +17,9 @@ serde       = { workspace = true }
 serde_json  = { workspace = true }
 data-mover  = { workspace = true }
 thiserror   = { workspace = true }
-# db 实际只用 tokio::sync::mpsc 和 tokio::task::{spawn_blocking, JoinError}
-tokio       = { version = "1.51", features = ["sync", "rt"] }
+# 查询取消与副本重试使用任务局部上下文、定时器和有界通道。
+tokio       = { version = "1.51", features = ["sync", "rt", "macros", "time"] }
+tokio-util  = { workspace = true, features = ["rt"] }
 utils       = { workspace = true }
 uuid        = { workspace = true }
 smol_str    = { workspace = true }

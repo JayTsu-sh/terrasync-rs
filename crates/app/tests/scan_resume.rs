@@ -135,7 +135,7 @@ async fn count(database: &TestDatabase, sql: &str) -> Result<u64> {
     Ok(database.query(sql).fetch_one::<u64>().await?)
 }
 
-async fn interrupt_after_checkpoint(mut scan: ScanCommand, database: &TestDatabase) -> Result {
+async fn interrupt_after_checkpoint(mut scan: ScanCommand, database: &TestDatabase, graceful: bool) -> Result {
     let previous_version = database
         .query("SELECT version FROM scan_resume_resume_case FINAL")
         .fetch_one::<u64>()
@@ -169,8 +169,30 @@ async fn interrupt_after_checkpoint(mut scan: ScanCommand, database: &TestDataba
         }
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
-    process.0.kill()?;
-    assert!(!process.0.wait()?.success());
+    if graceful {
+        let started = Instant::now();
+        assert!(
+            Command::new("kill")
+                .args(["-INT", &process.0.id().to_string()])
+                .status()?
+                .success()
+        );
+        loop {
+            if let Some(status) = process.0.try_wait()? {
+                assert!(!status.success());
+                break;
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(2),
+                "scan did not cancel within two seconds"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        eprintln!("Graceful scan cancellation: {:.3}s", started.elapsed().as_secs_f64());
+    } else {
+        process.0.kill()?;
+        assert!(!process.0.wait()?.success());
+    }
     Ok(())
 }
 
@@ -284,7 +306,12 @@ async fn killed_scan_resumes_full_and_incremental_without_skips_or_duplicate_eve
             "[database]\nenabled=true\ntype=\"clickhouse\"\nbatch_size=16\n[database.clickhouse]\ndsn={dsn}\ndatabase=\"{name}\"\nusername={user}\npassword={password}\n{cluster_setting}[scan]\nconcurrency=1\n"
         ),
     )?;
-    interrupt_after_checkpoint(command(work.path(), &config, &source, "full-interrupted")?, &database).await?;
+    interrupt_after_checkpoint(
+        command(work.path(), &config, &source, "full-interrupted")?,
+        &database,
+        false,
+    )
+    .await?;
     let full_round: (bool, u8, i64) = database
         .query("SELECT incremental,generation,event_time FROM scan_resume_resume_case FINAL")
         .fetch_one()
@@ -304,6 +331,7 @@ async fn killed_scan_resumes_full_and_incremental_without_skips_or_duplicate_eve
     interrupt_after_checkpoint(
         command(work.path(), &config, &source, "full-resume-interrupted")?,
         &database,
+        true,
     )
     .await?;
     assert_cumulative_observations(&database).await?;
@@ -338,6 +366,7 @@ async fn killed_scan_resumes_full_and_incremental_without_skips_or_duplicate_eve
     interrupt_after_checkpoint(
         command(work.path(), &config, &source, "incremental-interrupted")?,
         &database,
+        false,
     )
     .await?;
     let incremental_round: (bool, u8, i64) = database
@@ -369,6 +398,7 @@ async fn killed_scan_resumes_full_and_incremental_without_skips_or_duplicate_eve
     interrupt_after_checkpoint(
         command(work.path(), &config, &source, "incremental-resume-interrupted")?,
         &database,
+        true,
     )
     .await?;
     assert_cumulative_observations(&database).await?;

@@ -2,12 +2,36 @@
 use super::*;
 use crate::clickhouse::scan_resume::{COMPLETED, RUNNING};
 use crate::scan_store::ScanFinalEvent;
+use crate::scan_store::with_scan_cancellation;
 use data_mover::model::{
     BackendIdentity, BackendKind, EntryKind, IdentityStrength, ObservedEntry, SourceIdentity, StoragePath,
 };
+use std::sync::atomic::AtomicUsize;
 use storage_adapter::ChangeKind;
 use storage_adapter::observed_scan::ObservedScanEvent;
 use tokio::{sync::Barrier, task::JoinSet};
+use tokio_util::sync::CancellationToken;
+
+#[tokio::test]
+async fn cancelled_quorum_write_does_not_start_another_attempt() {
+    let cancel = CancellationToken::new();
+    let attempts = AtomicUsize::new(0);
+    let result = with_scan_cancellation(
+        cancel.clone(),
+        retry_quorum(|| {
+            attempts.fetch_add(1, Ordering::SeqCst);
+            cancel.cancel();
+            async {
+                Err(DatabaseError::ClickHouseError(ClickHouseError::BadResponse(
+                    "UNSATISFIED_QUORUM_FOR_PREVIOUS_WRITE".into(),
+                )))
+            }
+        }),
+    )
+    .await;
+    assert!(matches!(result, Err(DatabaseError::ScanCancelled)));
+    assert_eq!(attempts.load(Ordering::SeqCst), 1);
+}
 
 struct DatabaseGuard {
     config: ClickHouseConfig,

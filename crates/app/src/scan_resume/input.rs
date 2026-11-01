@@ -2,14 +2,17 @@
 use crate::error::{AppError, Result};
 use data_mover::traversal::TraversalOutcome;
 use storage_adapter::{ResumableScan, ResumableScanItem};
-use tokio::sync::mpsc;
-use tokio_util::task::AbortOnDropHandle;
+use tokio::sync::mpsc::error::TrySendError;
+use tokio::{select, sync::mpsc};
+use tokio_util::{sync::CancellationToken, task::AbortOnDropHandle};
 
 pub(super) enum ScanInput {
     Direct(Option<ResumableScan>),
+    Finishing(Option<AbortOnDropHandle<Result<TraversalOutcome>>>),
     Prefetched {
         receiver: mpsc::Receiver<ResumableScanItem>,
         reader: Option<AbortOnDropHandle<Result<TraversalOutcome>>>,
+        discard: CancellationToken,
     },
 }
 
@@ -19,18 +22,49 @@ impl ScanInput {
             return Self::Direct(Some(source));
         };
         let (sender, receiver) = mpsc::channel(capacity.max(1));
+        let discard = CancellationToken::new();
+        let stop = discard.clone();
         let reader = AbortOnDropHandle::new(tokio::spawn(async move {
-            while let Some(item) = source.next().await {
-                sender
-                    .send(item?)
-                    .await
-                    .map_err(|_| AppError::ConsumerError("Scan traversal consumer stopped".into()))?;
+            loop {
+                if stop.is_cancelled() {
+                    return source.stop().await.map_err(AppError::from);
+                }
+                let item = source.next().await;
+                if stop.is_cancelled() {
+                    return source.stop().await.map_err(AppError::from);
+                }
+                let item = match item {
+                    None => break,
+                    Some(Ok(item)) => item,
+                    Some(Err(error)) => {
+                        let _ = source.stop().await;
+                        return Err(error.into());
+                    }
+                };
+                // 队列有空位时沿用同步快路径，仅背压时注册取消等待。
+                let item = match sender.try_send(item) {
+                    Ok(()) => continue,
+                    Err(TrySendError::Full(item)) => item,
+                    Err(TrySendError::Closed(_)) => {
+                        let _ = source.stop().await;
+                        return Err(AppError::ConsumerError("Scan traversal consumer stopped".into()));
+                    }
+                };
+                select! {
+                    biased;
+                    _=stop.cancelled()=>return source.stop().await.map_err(AppError::from),
+                    result=sender.send(item)=>if result.is_err(){
+                        let _=source.stop().await;
+                        return Err(AppError::ConsumerError("Scan traversal consumer stopped".into()));
+                    }
+                }
             }
             source.finish().await.map_err(AppError::from)
         }));
         Self::Prefetched {
             receiver,
             reader: Some(reader),
+            discard,
         }
     }
 
@@ -38,28 +72,52 @@ impl ScanInput {
         match self {
             Self::Direct(Some(source)) => source.next().await.map(|item| item.map_err(AppError::from)),
             Self::Direct(None) => None,
+            Self::Finishing(_) => None,
             Self::Prefetched { receiver, .. } => receiver.recv().await.map(Ok),
         }
     }
 
     pub(super) async fn finish(&mut self) -> Result<TraversalOutcome> {
+        if let Self::Direct(source) = self {
+            let source = source.take().ok_or_else(missing_outcome)?;
+            *self = Self::Finishing(Some(AbortOnDropHandle::new(tokio::spawn(async move {
+                source.finish().await.map_err(AppError::from)
+            }))));
+        }
         match self {
-            Self::Direct(source) => source
-                .take()
-                .ok_or_else(missing_outcome)?
-                .finish()
-                .await
-                .map_err(AppError::from),
-            Self::Prefetched { reader, .. } => reader.take().ok_or_else(missing_outcome)?.await?,
+            Self::Direct(_) => Err(missing_outcome()),
+            Self::Prefetched { reader, .. } | Self::Finishing(reader) => {
+                // await 时保留所有权；finish future 被取消后，stop 仍能等待同一个任务。
+                let result = reader.as_mut().ok_or_else(missing_outcome)?.await;
+                reader.take();
+                result?
+            }
         }
     }
 
     pub(super) async fn stop(&mut self) {
-        if let Self::Prefetched { reader, .. } = self
-            && let Some(reader) = reader.take()
-        {
-            reader.abort();
-            let _ = reader.await;
+        match self {
+            Self::Direct(source) => {
+                if let Some(source) = source.take() {
+                    let _ = source.stop().await;
+                }
+            }
+            Self::Finishing(reader) => {
+                if let Some(reader) = reader.take() {
+                    let _ = reader.await;
+                }
+            }
+            Self::Prefetched {
+                reader,
+                receiver,
+                discard,
+            } => {
+                discard.cancel();
+                receiver.close();
+                if let Some(reader) = reader.take() {
+                    let _ = reader.await;
+                }
+            }
         }
     }
 }
@@ -72,14 +130,42 @@ fn missing_outcome() -> AppError {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
-    use std::{
-        future::pending,
-        sync::{
-            Arc,
-            atomic::{AtomicBool, Ordering},
-        },
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
     };
-    use tokio::sync::oneshot;
+    use tokio::{
+        sync::{Notify, oneshot},
+        time::{Duration, timeout},
+    };
+
+    #[tokio::test]
+    async fn interrupted_finish_retains_the_reader_until_stop_has_joined_it() {
+        let release = Arc::new(Notify::new());
+        let allow = release.clone();
+        let dropped = Arc::new(AtomicBool::new(false));
+        let flag = dropped.clone();
+        let (sender, receiver) = mpsc::channel(1);
+        let reader = AbortOnDropHandle::new(tokio::spawn(async move {
+            let _sender = sender;
+            let _guard = Dropped(flag);
+            allow.notified().await;
+            Err(AppError::ObservationScanCancelled)
+        }));
+        let mut input = ScanInput::Prefetched {
+            receiver,
+            reader: Some(reader),
+            discard: CancellationToken::new(),
+        };
+        assert!(timeout(Duration::from_millis(10), input.finish()).await.is_err());
+        let stopping = input.stop();
+        tokio::pin!(stopping);
+        assert!(timeout(Duration::from_millis(10), &mut stopping).await.is_err());
+        assert!(!dropped.load(Ordering::SeqCst));
+        release.notify_one();
+        stopping.await;
+        assert!(dropped.load(Ordering::SeqCst));
+    }
 
     #[tokio::test]
     async fn buffered_items_keep_order_and_reader_failure_is_not_completion() {
@@ -92,6 +178,7 @@ mod tests {
         let mut input = ScanInput::Prefetched {
             receiver,
             reader: Some(reader),
+            discard: CancellationToken::new(),
         };
         for expected in [1, 2] {
             assert!(
@@ -115,15 +202,19 @@ mod tests {
         let dropped = Arc::new(AtomicBool::new(false));
         let flag = dropped.clone();
         let (started, ready) = oneshot::channel();
+        let discard = CancellationToken::new();
+        let stop = discard.clone();
         let reader = AbortOnDropHandle::new(tokio::spawn(async move {
             let _sender = sender;
             let _guard = Dropped(flag);
             started.send(()).unwrap();
-            pending::<Result<TraversalOutcome>>().await
+            stop.cancelled().await;
+            Err(AppError::ObservationScanCancelled)
         }));
         let mut input = ScanInput::Prefetched {
             receiver,
             reader: Some(reader),
+            discard,
         };
         ready.await.unwrap();
         input.stop().await;
