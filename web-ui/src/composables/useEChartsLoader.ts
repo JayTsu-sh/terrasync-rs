@@ -5,13 +5,14 @@ import { defineAsyncComponent } from 'vue'
  */
 export const VChart = defineAsyncComponent(async () => {
   const { use } = await import('echarts/core')
-  const { PieChart, BarChart } = await import('echarts/charts')
+  const { PieChart, BarChart, TreemapChart } = await import('echarts/charts')
   const { TitleComponent, TooltipComponent, LegendComponent, GridComponent, GraphicComponent } =
     await import('echarts/components')
   const { CanvasRenderer } = await import('echarts/renderers')
   use([
     PieChart,
     BarChart,
+    TreemapChart,
     TitleComponent,
     TooltipComponent,
     LegendComponent,

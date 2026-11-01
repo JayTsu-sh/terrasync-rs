@@ -131,7 +131,7 @@ impl TaskRepository for SqliteTaskRepo {
         let now = chrono::Utc::now().to_rfc3339();
 
         let (started_at_clause, finished_at_clause) = match status {
-            TaskStatus::Running => (", started_at = ?", ""),
+            TaskStatus::Running => (", started_at = ?", ", finished_at = NULL"),
             TaskStatus::Completed | TaskStatus::Failed | TaskStatus::Cancelled => ("", ", finished_at = ?"),
             TaskStatus::Pending => ("", ""),
         };

@@ -1,3 +1,4 @@
+pub mod analysis;
 pub mod endpoint;
 pub mod execution;
 pub mod path;

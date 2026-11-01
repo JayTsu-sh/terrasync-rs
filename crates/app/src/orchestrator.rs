@@ -316,7 +316,7 @@ impl SyncOrchestrator {
         // ── 1. 加载配置 ──
         let app_config = AppConfig::fetch()?;
         let is_source_reserved = app_config.sync.is_source_reserved;
-        let copy_concurrency = app_config.sync.concurrency;
+        let copy_concurrency = c.concurrency.unwrap_or(app_config.sync.concurrency);
 
         // ── 2. 初始化扫描配置 ──
         let scan_config = initialize_scan_config(
@@ -326,7 +326,7 @@ impl SyncOrchestrator {
             ScanType::Full,
             &c.r#match,
             &c.exclude,
-            app_config.scan.concurrency,
+            c.concurrency.unwrap_or(app_config.scan.concurrency),
             app_config.scan.include_tags,
             &c.file_list,
             c.packaged,
@@ -668,7 +668,7 @@ impl SyncOrchestrator {
         // ── 1. 加载配置 ──
         let app_config = AppConfig::fetch()?;
         let is_source_reserved = app_config.sync.is_source_reserved;
-        let copy_concurrency = app_config.sync.concurrency;
+        let copy_concurrency = c.concurrency.unwrap_or(app_config.sync.concurrency);
 
         // ── 2. 初始化扫描配置（增量不支持 file_list） ──
         let scan_config = initialize_scan_config(
@@ -678,7 +678,7 @@ impl SyncOrchestrator {
             ScanType::Incremental,
             &c.r#match,
             &c.exclude,
-            app_config.scan.concurrency,
+            c.concurrency.unwrap_or(app_config.scan.concurrency),
             app_config.scan.include_tags,
             &None,
             c.packaged,
@@ -721,7 +721,7 @@ impl SyncOrchestrator {
         let (work_tx, work_rx) = async_channel::bounded::<StorageEntryMessage>(DEFAULT_CHANNEL_CAPACITY);
 
         // ── 6. 并发度 + block_size ──
-        let incremental_scan_concurrency = app_config.scan.concurrency;
+        let incremental_scan_concurrency = c.concurrency.unwrap_or(app_config.scan.concurrency);
 
         let block_size = match &c.block_size {
             Some(s) => Some(parse_size(s)?),

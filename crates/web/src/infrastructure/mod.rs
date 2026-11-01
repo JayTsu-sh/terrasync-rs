@@ -1,3 +1,4 @@
+pub mod analysis_repo;
 pub mod clickhouse_client;
 pub mod config_repo;
 pub mod db;

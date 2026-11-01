@@ -1,8 +1,11 @@
 use std::sync::{Arc, OnceLock};
 use storage_adapter::TransferMode;
 
-use dashmap::DashMap;
+use app::scan_resume::{clear_cluster_scan, scan_execution_is_incremental, scan_with_resume_settings};
+use dashmap::{DashMap, mapref::entry::Entry};
+use std::time::Duration;
 use tokio::sync::Semaphore;
+use tokio::time::{sleep, timeout};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info};
 use utils::app_config::AppConfig;
@@ -44,8 +47,28 @@ pub struct TaskRunner {
     path_repo: Arc<dyn PathRepository>,
     execution_repo: Arc<dyn ExecutionRepository>,
     config_repo: Arc<dyn ConfigRepository>,
-    running_tasks: DashMap<String, CancellationToken>,
+    running_tasks: Arc<DashMap<String, CancellationToken>>,
     concurrency_limit: Arc<Semaphore>,
+}
+
+struct RunningTaskGuard {
+    task_id: String,
+    tasks: Arc<DashMap<String, CancellationToken>>,
+}
+impl Drop for RunningTaskGuard {
+    fn drop(&mut self) {
+        self.tasks.remove(&self.task_id);
+    }
+}
+
+fn task_outcome(result: &Result<()>, cancel: &CancellationToken) -> (TaskStatus, Option<String>) {
+    if cancel.is_cancelled() {
+        return (TaskStatus::Cancelled, None);
+    }
+    match result {
+        Ok(()) => (TaskStatus::Completed, None),
+        Err(error) => (TaskStatus::Failed, Some(error.to_string())),
+    }
 }
 
 impl TaskRunner {
@@ -60,7 +83,7 @@ impl TaskRunner {
             path_repo,
             execution_repo,
             config_repo,
-            running_tasks: DashMap::new(),
+            running_tasks: Arc::new(DashMap::new()),
             concurrency_limit: Arc::new(Semaphore::new(MAX_CONCURRENT_TASKS)),
         }
     }
@@ -73,6 +96,23 @@ impl TaskRunner {
                 operation: "start".to_string(),
             });
         }
+
+        let cancel_token = CancellationToken::new();
+        match self.running_tasks.entry(task.id.clone()) {
+            Entry::Vacant(slot) => {
+                slot.insert(cancel_token.clone());
+            }
+            Entry::Occupied(_) => {
+                return Err(WebError::InvalidTaskState {
+                    status: "running or saving checkpoint".into(),
+                    operation: "start".into(),
+                });
+            }
+        }
+        let task_guard = RunningTaskGuard {
+            task_id: task.id.clone(),
+            tasks: self.running_tasks.clone(),
+        };
 
         // 检查并发限制：在创建执行记录前获取许可
         let permit = self.concurrency_limit.clone().try_acquire_owned().map_err(|_| {
@@ -96,10 +136,16 @@ impl TaskRunner {
             None
         };
 
-        // 判断是全量还是增量（根据 job 目录是否存在）
+        // 扫描从检查点读取本轮类型；迁移任务沿用原来的目录判定。
         let job_id = sanitize_job_id(&task.id);
         let job_dir = format!("jobs/{job_id}");
-        let execution_type = if std::path::Path::new(&job_dir).exists() {
+        let incremental = if task.task_type == TaskType::Scan {
+            apply_db_config_from_sqlite(self.config_repo.as_ref()).await?;
+            !task.config.reset_scan_on_start && scan_execution_is_incremental(&job_id).await?
+        } else {
+            std::path::Path::new(&job_dir).exists()
+        };
+        let execution_type = if incremental {
             ExecutionType::Incremental
         } else {
             ExecutionType::Full
@@ -123,15 +169,12 @@ impl TaskRunner {
             .update_status(&task.id, TaskStatus::Running, None)
             .await?;
 
-        // 创建取消令牌
-        let cancel_token = CancellationToken::new();
-        self.running_tasks.insert(task.id.clone(), cancel_token.clone());
-
         // 在后台 spawn 任务执行
         let task_id = task.id.clone();
         let execution_id = execution.id.clone();
         let task_type = task.task_type.clone();
         let task_config = task.config.clone();
+        let mut task_for_run = task.clone();
 
         let source_url = source_endpoint.to_storage_url(source_path.as_ref().map(|p| p.sub_path.as_str()));
         let dest_url = dest_info.as_ref().map(|(ep, p)| ep.to_storage_url(Some(&p.sub_path)));
@@ -139,44 +182,49 @@ impl TaskRunner {
         let task_repo = self.task_repo.clone();
         let execution_repo = self.execution_repo.clone();
         let config_repo = self.config_repo.clone();
-        let running_tasks = self.running_tasks.clone();
 
         // app::scan/sync 内部使用了非 Send 的 dyn Consumer，
         // 无法直接 tokio::spawn。在独立线程+独立 runtime 中执行。
         std::thread::spawn(move || {
             // permit 在线程结束时自动 drop，释放并发许可
             let _permit = permit;
+            let _task_guard = task_guard;
             let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build();
             let rt = match rt {
                 Ok(rt) => rt,
                 Err(e) => {
                     error!("Failed to create runtime for task {task_id}: {e}");
-                    running_tasks.remove(&task_id);
                     return;
                 }
             };
 
             rt.block_on(async move {
-                let result = run_migration_task(
-                    &task_id,
-                    &job_id,
-                    &job_dir,
-                    task_type,
-                    &task_config,
-                    &source_url,
-                    dest_url.as_deref(),
-                    cancel_token,
-                    config_repo,
-                )
+                let result = async {
+                    if task_for_run.task_type == TaskType::Scan && task_for_run.config.reset_scan_on_start {
+                        apply_db_config_from_sqlite(config_repo.as_ref()).await?;
+                        drop_scan_tables(&job_id).await?;
+                        task_for_run.config.reset_scan_on_start = false;
+                        task_repo.update(&task_for_run).await?;
+                    }
+                    run_migration_task(
+                        &task_id,
+                        &job_id,
+                        &job_dir,
+                        task_type,
+                        &task_config,
+                        &source_url,
+                        dest_url.as_deref(),
+                        cancel_token.child_token(),
+                        config_repo,
+                    )
+                    .await
+                }
                 .await;
 
-                let (final_status, error_msg) = match result {
-                    Ok(()) => (TaskStatus::Completed, None),
-                    Err(e) => {
-                        error!("Task {task_id} failed: {e}");
-                        (TaskStatus::Failed, Some(e.to_string()))
-                    }
-                };
+                let (final_status, error_msg) = task_outcome(&result, &cancel_token);
+                if let Some(message) = &error_msg {
+                    error!("Task {task_id} failed: {message}");
+                }
 
                 if let Err(e) = task_repo
                     .update_status(&task_id, final_status.clone(), error_msg.as_deref())
@@ -192,8 +240,6 @@ impl TaskRunner {
                 {
                     error!("Failed to update execution status: {e}");
                 }
-
-                running_tasks.remove(&task_id);
             });
         });
 
@@ -202,7 +248,7 @@ impl TaskRunner {
 
     /// 取消正在运行的任务
     pub fn cancel_task(&self, task_id: &str) -> Result<()> {
-        if let Some((_, token)) = self.running_tasks.remove(task_id) {
+        if let Some(token) = self.running_tasks.get(task_id) {
             token.cancel();
             info!("Task {task_id} cancellation requested");
             Ok(())
@@ -226,6 +272,22 @@ impl TaskRunner {
         }
 
         drop_old_scan_tables(&job_id).await;
+    }
+
+    pub async fn pause_all_and_wait(&self) {
+        for token in self.running_tasks.iter() {
+            token.value().cancel();
+        }
+        if timeout(Duration::from_secs(60), async {
+            while !self.running_tasks.is_empty() {
+                sleep(Duration::from_millis(100)).await;
+            }
+        })
+        .await
+        .is_err()
+        {
+            error!("Task shutdown timed out; persisted scan checkpoints remain resumable");
+        }
     }
 
     /// 检查任务是否正在运行
@@ -266,26 +328,17 @@ async fn run_migration_task(
 
     match task_type {
         TaskType::Scan => {
-            // 纯扫描：强制全量，清理旧数据
-            match std::fs::remove_dir_all(job_dir) {
-                Ok(()) => info!("[TaskRunner] Removed old job dir for fresh full scan: {}", job_dir),
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => error!("[TaskRunner] Failed to remove job dir {}: {e}", job_dir),
-            }
-            drop_old_scan_tables(job_id).await;
-
-            // 目录刚被清空，文件系统 fallback 视为 Full
-            app::scan::scan(
-                job_id.to_string(),
-                job_dir.to_string(),
-                false,
+            scan_with_resume_settings(
+                job_id,
+                job_dir,
                 source_url,
                 task_config.depth,
                 &task_config.match_expr,
                 &task_config.exclude_expr,
                 format!("gui:scan {source_url}"),
-                Some(cancel_token.clone()),
+                cancel_token,
                 callback_url,
+                task_config.concurrency,
             )
             .await?;
             Ok(())
@@ -322,6 +375,7 @@ async fn run_migration_task(
                 transfer_mode: TransferMode::Checkpoint,
                 // web 层是否暴露该参数为后续可选项，本次先给默认值保证编译通过
                 delete_target: false,
+                concurrency: task_config.concurrency,
             };
             app::sync::sync(config).await?;
             Ok(())
@@ -331,7 +385,7 @@ async fn run_migration_task(
                 WebError::ValidationError("Integrity check requires destination endpoint".to_string())
             })?;
 
-            app::integrity_check::integrity_check(
+            app::integrity_check::integrity_check_with_concurrency(
                 job_id.to_string(),
                 job_dir.to_string(),
                 source_url,
@@ -340,6 +394,7 @@ async fn run_migration_task(
                 false,
                 format!("gui:integrity_check {source_url} {dest}"),
                 callback_url,
+                task_config.concurrency,
             )
             .await?;
             Ok(())
@@ -349,57 +404,60 @@ async fn run_migration_task(
 
 /// 清理旧的 `ClickHouse` 扫描表，确保全量扫描从干净状态开始
 async fn drop_old_scan_tables(job_id: &str) {
-    let Ok(app_config) = AppConfig::fetch() else {
-        return;
-    };
-
-    if !app_config.database.enabled {
-        return;
+    if let Err(error) = drop_scan_tables(job_id).await {
+        error!(%error, "Failed to remove scan data");
     }
+}
 
-    let dsn = app_config.database.clickhouse.dsn.trim_end_matches('/');
-    let username = &app_config.database.clickhouse.username;
-    let password = app_config.database.clickhouse.password.as_deref().unwrap_or("");
-    let database = &app_config.database.clickhouse.database;
-
-    let Ok(client) = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(10))
+async fn drop_scan_tables(job_id: &str) -> Result<()> {
+    let app_config = AppConfig::fetch()?;
+    if !app_config.database.enabled {
+        return Err(WebError::ValidationError("ClickHouse 未配置".into()));
+    }
+    if app_config
+        .database
+        .clickhouse
+        .cluster
+        .as_ref()
+        .is_some_and(|value| !value.is_empty())
+    {
+        clear_cluster_scan(job_id).await?;
+        return Ok(());
+    }
+    let cfg = &app_config.database.clickhouse;
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(30))
         .build()
-    else {
-        return;
-    };
-
-    for table in &[
-        format!("base_{job_id}"),
-        format!("scan_state_{job_id}"),
-        format!("incremental_{job_id}"),
+        .map_err(|_| WebError::ValidationError("无法初始化数据库连接".into()))?;
+    for prefix in [
+        "base",
+        "state",
+        "scan_state",
+        "incremental",
+        "scan_resume",
+        "scan_resume_batch",
+        "scan_resume_event_keys",
+        "scan_resume_delete_keys",
     ] {
-        let query = format!("DROP TABLE IF EXISTS `{table}`");
-        let url = format!("{dsn}/");
-        let result = client
-            .post(&url)
-            .basic_auth(username, Some(password))
-            .header("X-ClickHouse-Database", database)
-            .body(query)
+        let table = format!("{prefix}_{job_id}");
+        let response = client
+            .post(format!("{}/", cfg.dsn.trim_end_matches('/')))
+            .basic_auth(&cfg.username, cfg.password.as_deref())
+            .header("X-ClickHouse-Database", &cfg.database)
+            .body(format!("DROP TABLE IF EXISTS `{table}`"))
             .send()
-            .await;
-        match result {
-            Ok(resp) if resp.status().is_success() => {
-                info!("[TaskRunner] Dropped ClickHouse table: {}", table);
-            }
-            Ok(resp) => {
-                let body = resp.text().await.unwrap_or_default();
-                error!("[TaskRunner] Failed to drop table {}: {}", table, body);
-            }
-            Err(e) => {
-                error!("[TaskRunner] Failed to drop table {}: {}", table, e);
-            }
+            .await
+            .map_err(|_| WebError::ValidationError("清理旧扫描失败，请检查数据库连接后重试".into()))?;
+        if !response.status().is_success() {
+            return Err(WebError::ValidationError("清理旧扫描失败，未启动新扫描".into()));
         }
     }
+    Ok(())
 }
 
 /// 从 `SQLite` 读取的 `ClickHouse` 配置
 pub(crate) struct ChConfig {
+    pub(crate) cluster: Option<String>,
     pub(crate) dsn: String,
     pub(crate) username: String,
     pub(crate) password: String,
@@ -408,7 +466,7 @@ pub(crate) struct ChConfig {
 }
 
 /// 从 `SQLite` `system_config` 表一次性读取所有 `ClickHouse` 配置
-async fn load_ch_config(config_repo: &dyn ConfigRepository) -> Result<Option<ChConfig>> {
+pub(crate) async fn load_ch_config(config_repo: &dyn ConfigRepository) -> Result<Option<ChConfig>> {
     let all = config_repo.get_all().await?;
     let get = |key: &str| -> Option<String> { all.iter().find(|(k, _)| k == key).map(|(_, v)| strip_json_quotes(v)) };
 
@@ -452,8 +510,20 @@ async fn load_ch_config(config_repo: &dyn ConfigRepository) -> Result<Option<ChC
             "clickhouse_user 包含非法字符: {username}"
         )));
     }
+    let cluster = get("clickhouse_cluster")
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    if cluster
+        .as_ref()
+        .is_some_and(|name| !name.bytes().all(|ch| ch.is_ascii_alphanumeric() || ch == b'_'))
+    {
+        return Err(WebError::ValidationError(
+            "ClickHouse 集群名称只能包含字母、数字和下划线".into(),
+        ));
+    }
     let dsn = format!("http://{host}:{port}");
     Ok(Some(ChConfig {
+        cluster,
         dsn,
         username,
         password,
@@ -481,6 +551,7 @@ pub(crate) async fn apply_db_config_from_sqlite(config_repo: &dyn ConfigReposito
         c.database.clickhouse.username.clone_from(&cfg.username);
         c.database.clickhouse.password = Some(cfg.password.clone()).filter(|s| !s.is_empty());
         c.database.clickhouse.database.clone_from(&cfg.database);
+        c.database.clickhouse.cluster.clone_from(&cfg.cluster);
     })?;
 
     debug!(
@@ -500,4 +571,34 @@ fn strip_json_quotes(s: &str) -> String {
         );
         s.to_string()
     })
+}
+
+#[cfg(test)]
+mod resume_tests {
+    use super::*;
+
+    #[test]
+    fn user_pause_cannot_be_reported_as_completed_or_failed() {
+        let token = CancellationToken::new();
+        token.cancel();
+        assert_eq!(task_outcome(&Ok(()), &token).0, TaskStatus::Cancelled);
+        let failure = Err(WebError::ValidationError("scan paused".into()));
+        assert_eq!(task_outcome(&failure, &token).0, TaskStatus::Cancelled);
+        assert_eq!(task_outcome(&failure, &CancellationToken::new()).0, TaskStatus::Failed);
+    }
+
+    #[test]
+    fn active_slot_is_shared_until_the_worker_finishes_draining() {
+        let tasks = Arc::new(DashMap::new());
+        let token = CancellationToken::new();
+        tasks.insert("scan".into(), token.clone());
+        let guard = RunningTaskGuard {
+            task_id: "scan".into(),
+            tasks: tasks.clone(),
+        };
+        token.cancel();
+        assert!(tasks.contains_key("scan"));
+        drop(guard);
+        assert!(!tasks.contains_key("scan"));
+    }
 }

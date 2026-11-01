@@ -25,7 +25,8 @@ const configItems = computed<ConfigItem[]>(() => {
     items.push({ label: 'IOPS 限速', value: props.task.config.iops ? String(props.task.config.iops) : '不限制' })
     items.push({ label: 'Block Size', value: props.task.config.block_size || '自适应' })
   }
-  items.push({ label: '并发度', value: String(props.task.config.concurrency ?? 8) })
+  items.push({ label: '并发度', value: props.task.config.concurrency == null ? '使用全局设置' : String(props.task.config.concurrency) })
+  if (props.task.task_type === 'scan') items.push({ label: '扫描深度', value: props.task.config.depth ? String(props.task.config.depth) : '不限' })
   if (showAdvanced.value) {
     items.push({ label: '完整性检查', value: props.task.config.enable_integrity_check ? '是' : '否' })
   }
@@ -37,6 +38,7 @@ const configItems = computed<ConfigItem[]>(() => {
   <NCard>
     <template #header>任务配置</template>
 
+    <div v-if="task.config.reset_scan_on_start" class="mb-4 text-sm text-amber-600">扫描条件已更新，下次执行将重新扫描。</div>
     <!-- ⚠️ 非默认: bg-gray-50 只读区域视觉区分 -->
     <div class="bg-gray-50 rounded-lg p-5">
       <div class="grid grid-cols-2 gap-4">

@@ -11,7 +11,7 @@ import {
 import { useRouter, useRoute } from 'vue-router'
 import { h, computed } from 'vue'
 import type { MenuOption, GlobalThemeOverrides } from 'naive-ui'
-import { ServerOutline, ListOutline, SettingsOutline } from '@vicons/ionicons5'
+import { ServerOutline, ListOutline, SettingsOutline, PieChartOutline } from '@vicons/ionicons5'
 import { NIcon } from 'naive-ui'
 
 const router = useRouter()
@@ -97,6 +97,11 @@ const menuOptions: MenuOption[] = [
     icon: renderIcon(ListOutline),
   },
   {
+    label: '数据分析',
+    key: '/analysis',
+    icon: renderIcon(PieChartOutline),
+  },
+  {
     label: '系统设置',
     key: '/settings',
     icon: renderIcon(SettingsOutline),
@@ -107,6 +112,7 @@ const activeKey = computed(() => {
   const path = route.path
   if (path.startsWith('/endpoints')) return '/endpoints'
   if (path.startsWith('/tasks')) return '/tasks'
+  if (path.startsWith('/analysis')) return '/analysis'
   if (path.startsWith('/settings')) return '/settings'
   return path
 })

@@ -9,11 +9,13 @@ use std::time::{Duration, Instant};
 
 use indicatif::{ProgressBar as IndicatifBar, ProgressStyle};
 use storage_adapter::StorageEntryMessage;
+use storage_adapter::observed_scan::EntryStatistics;
 use tracing::info;
 
 use super::accumulator::{fmt_elapsed, format_bytes};
 use super::report::{ProgressDetail, ProgressReport};
 use crate::config::JobType;
+use crate::error::{AppError, Result};
 
 /// 进度条 display 线程刷新间隔（秒）
 const DISPLAY_INTERVAL_SECS: u64 = 2;
@@ -98,6 +100,75 @@ pub struct ProgressBar {
 }
 
 impl ProgressBar {
+    pub fn restore(&mut self, report: &ProgressReport) -> Result<()> {
+        let duration = Duration::try_from_secs_f64(report.elapsed_secs)
+            .map_err(|_| AppError::ConfigError("Invalid saved scan duration".into()))?;
+        self.start_time = Instant::now().checked_sub(duration).unwrap_or_else(Instant::now);
+        match (&self.counters, &report.detail) {
+            (
+                CounterSet::Full(c),
+                ProgressDetail::Full {
+                    scanned_files,
+                    scanned_dirs,
+                    total_bytes,
+                    transferred_bytes,
+                    error_count,
+                },
+            ) => {
+                for (counter, value) in [
+                    (&c.total_file_count, *scanned_files),
+                    (&c.total_dir_count, *scanned_dirs),
+                    (&c.total_count, scanned_files.saturating_add(*scanned_dirs)),
+                    (&c.total_size, *total_bytes),
+                    (&c.error_count, *error_count),
+                    (&self.real_time_bytes, *transferred_bytes),
+                ] {
+                    counter.store(value, Ordering::Relaxed);
+                }
+            }
+            (
+                CounterSet::Incremental(c),
+                ProgressDetail::Incremental {
+                    scanned_files,
+                    scanned_dirs,
+                    scanned_symlinks,
+                    scanned_size,
+                    transferred_bytes,
+                    error_count,
+                    new_count,
+                    new_size,
+                    changed_count,
+                    changed_size,
+                    deleted_count,
+                    deleted_size,
+                    renamed_count,
+                    renamed_size,
+                },
+            ) => {
+                for (counter, value) in [
+                    (&c.scanned_regular_file_count, *scanned_files),
+                    (&c.scanned_dir_count, *scanned_dirs),
+                    (&c.scanned_symlink_count, *scanned_symlinks),
+                    (&c.scanned_size, *scanned_size),
+                    (&c.error_count, *error_count),
+                    (&c.new_count, *new_count),
+                    (&c.new_size, *new_size),
+                    (&c.changed_count, *changed_count),
+                    (&c.changed_size, *changed_size),
+                    (&c.deleted_count, *deleted_count),
+                    (&c.deleted_size, *deleted_size),
+                    (&c.renamed_count, *renamed_count),
+                    (&c.renamed_size, *renamed_size),
+                    (&self.real_time_bytes, *transferred_bytes),
+                ] {
+                    counter.store(value, Ordering::Relaxed);
+                }
+            }
+            _ => return Err(AppError::ConfigError("Saved scan progress kind differs".into())),
+        }
+        Ok(())
+    }
+
     /// 根据 `JobType` 创建对应的全量或增量进度条
     pub fn new(job_type: JobType) -> Self {
         let now = Instant::now();
@@ -163,6 +234,43 @@ impl ProgressBar {
         match &self.counters {
             CounterSet::Full(c) => Self::update_full(c, message),
             CounterSet::Incremental(c) => Self::update_incremental(c, message),
+        }
+    }
+
+    /// 原生扫描只读取统计事实，不构造兼容条目。
+    pub fn update_observed(&self, operation: &str, entry: &impl EntryStatistics) {
+        match &self.counters {
+            CounterSet::Full(c) if operation == "scanned" => {
+                if entry.get_is_dir() {
+                    c.total_dir_count.fetch_add(1, Ordering::Relaxed);
+                } else {
+                    c.total_file_count.fetch_add(1, Ordering::Relaxed);
+                }
+                c.total_count.fetch_add(1, Ordering::Relaxed);
+                c.total_size.fetch_add(entry.get_size(), Ordering::Relaxed);
+            }
+            CounterSet::Incremental(c) => {
+                if operation == "scanned" {
+                    if entry.get_is_dir() {
+                        c.scanned_dir_count.fetch_add(1, Ordering::Relaxed);
+                    } else if entry.get_is_symlink() {
+                        c.scanned_symlink_count.fetch_add(1, Ordering::Relaxed);
+                    } else {
+                        c.scanned_regular_file_count.fetch_add(1, Ordering::Relaxed);
+                    }
+                    c.scanned_size.fetch_add(entry.get_size(), Ordering::Relaxed);
+                } else {
+                    let (count, size) = match operation {
+                        "new" => (&c.new_count, &c.new_size),
+                        "deleted" => (&c.deleted_count, &c.deleted_size),
+                        "rename" => (&c.renamed_count, &c.renamed_size),
+                        _ => (&c.changed_count, &c.changed_size),
+                    };
+                    count.fetch_add(1, Ordering::Relaxed);
+                    size.fetch_add(entry.get_size(), Ordering::Relaxed);
+                }
+            }
+            _ => {}
         }
     }
 

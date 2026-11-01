@@ -8,6 +8,7 @@ import TaskConfigPanel from '../components/TaskConfigPanel.vue'
 import TaskEditModal from '../components/TaskEditModal.vue'
 import ScanAnalysis from '../components/ScanAnalysis.vue'
 import ExecutionLogViewer from '../components/ExecutionLogViewer.vue'
+import type { MigrationTask } from '../api/tasks'
 import { useTaskDetail } from '../composables/useTaskDetail'
 
 const route = useRoute()
@@ -86,7 +87,7 @@ async function onStart() {
 async function onCancel() {
   try {
     await handleCancel()
-    message.success('任务已取消')
+    message.success(task.value?.task_type === 'scan' ? '已发送取消请求，扫描进度会保留' : '已发送取消请求')
   } catch (e: any) {
     message.error(e.message)
   }
@@ -110,8 +111,10 @@ function onDelete() {
   })
 }
 
-function onConfigSaved() {
-  loadData()
+async function onConfigSaved(updated: MigrationTask) {
+  task.value = updated
+  activeTab.value = 'overview'
+  await loadData()
 }
 
 onMounted(loadData)

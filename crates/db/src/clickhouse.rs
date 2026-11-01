@@ -36,6 +36,8 @@ use crate::{
 use utils::sanitize_job_id;
 
 pub mod scan_resume;
+mod scan_resume_batch;
+pub mod scan_resume_statistics;
 
 /// `ClickHouse`数据库实现
 ///
@@ -51,6 +53,8 @@ pub struct ClickHouseDatabase {
     pub scan_temp_table_name: Option<String>,
     /// 缓存的 `scan_state` 值（255 = 未缓存），避免每次 `batch_insert` 都查询数据库
     cached_scan_state: AtomicU8,
+    /// 每次扫描实例只检查一次旧基线的身份格式，避免每批全表统计。
+    resume_base_has_typed_handles: Option<bool>,
     /// 同一 `ClickHouse` 身份与 job 共享的 scan generation 生命周期
     generation_lifecycle: Arc<Mutex<ScanGenerationLifecycle>>,
 }
@@ -153,7 +157,7 @@ pub(crate) const FILE_SCAN_COLUMNS_DEFINITION: &str = file_scan_base_columns!();
 ///
 /// 定义了存储文件增量扫描结果的表结构，包含操作类型、文件路径、大小、扩展名、时间戳、权限等信息。
 /// 增量扫描表使用此结构定义。
-const FILE_INCREMENTAL_SCAN_COLUMNS_DEFINITION: &str = file_scan_base_columns!(
+pub(crate) const FILE_INCREMENTAL_SCAN_COLUMNS_DEFINITION: &str = file_scan_base_columns!(
     r#"
     operation_type String,
 "#,
@@ -310,7 +314,7 @@ fn records_to_entry_iter(records: Vec<StorageEntryRecord>) -> Box<dyn Iterator<I
 }
 
 /// 构建基础 `ClickHouse` 客户端（含 url/database/username/password）
-fn build_base_client(config: &ClickHouseConfig) -> Client {
+pub(crate) fn build_base_client(config: &ClickHouseConfig) -> Client {
     let mut client = Client::default()
         .with_url(&config.dsn)
         .with_database(config.database.clone())
@@ -335,6 +339,7 @@ impl ClickHouseDatabase {
             job_id: job_id.to_string(),
             scan_temp_table_name: None,
             cached_scan_state: AtomicU8::new(255),
+            resume_base_has_typed_handles: None,
             generation_lifecycle: shared_generation_lifecycle(config, job_id),
         }
     }
@@ -903,6 +908,7 @@ impl Database for ClickHouseDatabase {
             job_id: self.job_id.clone(),
             scan_temp_table_name: self.scan_temp_table_name.clone(),
             cached_scan_state: AtomicU8::new(self.cached_scan_state.load(Ordering::Relaxed)),
+            resume_base_has_typed_handles: self.resume_base_has_typed_handles,
             generation_lifecycle: Arc::clone(&self.generation_lifecycle),
         };
 
@@ -1880,3 +1886,5 @@ mod tests {
         ));
     }
 }
+
+mod native;

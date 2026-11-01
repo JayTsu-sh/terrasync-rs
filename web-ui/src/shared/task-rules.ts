@@ -14,9 +14,9 @@ export const TASK_ACTIONS = {
 export type ListAction = { label: string; key: string; color: string }
 
 /** 根据状态返回列表页该显示的操作列表 */
-export function getListActions(status: TaskStatus): ListAction[] {
+export function getListActions(status: TaskStatus, taskType?: string): ListAction[] {
   const actions: ListAction[] = [{ label: '详情', key: 'detail', color: 'text-blue-500' }]
-  if (TASK_ACTIONS.canStart(status)) actions.push({ label: '启动', key: 'start', color: 'text-green-500' })
+  if (TASK_ACTIONS.canStart(status)) actions.push({ label: taskType === 'scan' && ['cancelled', 'failed'].includes(status) ? '继续扫描' : '启动', key: 'start', color: 'text-green-500' })
   if (TASK_ACTIONS.canCancel(status)) actions.push({ label: '取消', key: 'cancel', color: 'text-yellow-500' })
   if (TASK_ACTIONS.canDelete(status)) actions.push({ label: '删除', key: 'delete', color: 'text-red-500' })
   return actions

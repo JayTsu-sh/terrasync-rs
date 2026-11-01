@@ -1,7 +1,7 @@
 //! Real CLI termination and restart against ClickHouse.
 #![cfg(feature = "lab-fault-injection")]
 
-use clickhouse::Client;
+use clickhouse::{Client, query::Query};
 use std::{
     collections::BTreeSet,
     fs,
@@ -12,7 +12,7 @@ use std::{
 
 type Result<T = ()> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
-fn client(database: &str) -> Client {
+fn client(database: &str) -> TestDatabase {
     let mut value = Client::default()
         .with_url(std::env::var("LAB_CLICKHOUSE_DSN").unwrap_or_else(|_| "http://10.131.9.11:8123".into()))
         .with_database(database)
@@ -20,7 +20,51 @@ fn client(database: &str) -> Client {
     if let Ok(password) = std::env::var("LAB_CLICKHOUSE_PASSWORD") {
         value = value.with_password(password);
     }
-    value
+    if std::env::var("LAB_CLICKHOUSE_CLUSTER").is_ok() {
+        value = value
+            .with_option("select_sequential_consistency", "1")
+            .with_option("insert_quorum_parallel", "0")
+            .with_option("prefer_localhost_replica", "0")
+            .with_option("load_balancing", "in_order");
+    }
+    TestDatabase(value)
+}
+
+struct TestDatabase(Client);
+impl TestDatabase {
+    fn query(&self, sql: &str) -> Query {
+        let Ok(cluster) = std::env::var("LAB_CLICKHOUSE_CLUSTER") else {
+            return self.0.query(sql);
+        };
+        assert!(cluster.bytes().all(|byte| byte.is_ascii_alphanumeric() || byte == b'_'));
+        let mut sql = sql.to_string();
+        if sql.starts_with("CREATE DATABASE") || sql.starts_with("DROP DATABASE") {
+            sql.push_str(&format!(" ON CLUSTER {cluster}"));
+        } else if sql.contains("system.tables") && sql.contains("name='incremental_resume_case'") {
+            sql = "SELECT count() FROM incremental FINAL WHERE job_id='resume_case'".into();
+        } else {
+            for (legacy, shared) in [
+                ("base_resume_case", "base"),
+                ("incremental_resume_case", "incremental"),
+                ("scan_resume_resume_case", "scan_resume"),
+                ("state_resume_case", "state"),
+            ] {
+                let source = format!("FROM {legacy} FINAL");
+                sql = sql.replace(
+                    &format!("{source} WHERE "),
+                    &format!("FROM {shared} FINAL WHERE job_id='resume_case' AND "),
+                );
+                sql = sql.replace(&source, &format!("FROM {shared} FINAL WHERE job_id='resume_case'"));
+            }
+            if sql.contains("toUInt64(scan_state)") {
+                sql = format!(
+                    "SELECT ifNull(({}),toUInt64(0))",
+                    sql.replace("scan_state", "generation")
+                );
+            }
+        }
+        self.0.query(&sql)
+    }
 }
 
 struct DatabaseGuard(String);
@@ -87,11 +131,16 @@ fn command(root: &Path, config: &Path, source: &Path, name: &str) -> Result<Scan
     Ok(ScanCommand { command, log })
 }
 
-async fn count(database: &Client, sql: &str) -> Result<u64> {
+async fn count(database: &TestDatabase, sql: &str) -> Result<u64> {
     Ok(database.query(sql).fetch_one::<u64>().await?)
 }
 
-async fn interrupt_after_checkpoint(mut scan: ScanCommand, database: &Client) -> Result {
+async fn interrupt_after_checkpoint(mut scan: ScanCommand, database: &TestDatabase) -> Result {
+    let previous_version = database
+        .query("SELECT version FROM scan_resume_resume_case FINAL")
+        .fetch_one::<u64>()
+        .await
+        .unwrap_or_default();
     scan.command
         .env("TERRASYNC_LAB_SCAN_PAUSE_AFTER_CHECKPOINT_MS", "10000");
     let mut process = ChildGuard(scan.command.spawn()?);
@@ -107,13 +156,14 @@ async fn interrupt_after_checkpoint(mut scan: ScanCommand, database: &Client) ->
             "scan exited early: {}",
             fs::read_to_string(&scan.log)?
         );
-        if let Ok((entries, phase, cursor)) = database
-            .query("SELECT observed_entries, phase, notEmpty(checkpoint) FROM scan_resume_resume_case FINAL")
-            .fetch_one::<(u64, u8, u8)>()
+        if let Ok((entries, phase, cursor, version)) = database
+            .query("SELECT observed_entries, phase, notEmpty(checkpoint), version FROM scan_resume_resume_case FINAL")
+            .fetch_one::<(u64, u8, u8, u64)>()
             .await
             && entries > 0
             && phase == 0
             && cursor == 1
+            && version > previous_version
         {
             break;
         }
@@ -142,7 +192,27 @@ async fn complete(mut scan: ScanCommand) -> Result {
     Ok(())
 }
 
-async fn assert_paths(database: &Client, source: &Path) -> Result {
+async fn assert_cumulative_observations(database: &TestDatabase) -> Result {
+    let (observed, saved): (u64, String) = database
+        .query("SELECT observed_entries,statistics FROM scan_resume_resume_case FINAL")
+        .fetch_one()
+        .await?;
+    let attempt: serde_json::Value = serde_json::from_str(&saved)?;
+    let attempt = attempt[0]
+        .get("Full")
+        .or_else(|| attempt[0].get("Incremental").and_then(|value| value.get("scanned")))
+        .ok_or("missing scanned statistics")?;
+    let attempt_entries = attempt["dir_count"].as_u64().ok_or("missing directory count")?
+        + attempt["regular_file_count"].as_u64().ok_or("missing file count")?
+        + attempt["symlink_count"].as_u64().ok_or("missing symlink count")?;
+    assert_eq!(
+        attempt_entries, observed,
+        "live resume statistics must include the previous checkpoint plus new observations"
+    );
+    Ok(())
+}
+
+async fn assert_paths(database: &TestDatabase, source: &Path) -> Result {
     let rows = database
         .query("SELECT relative_path FROM base_resume_case FINAL")
         .fetch_all::<String>()
@@ -150,6 +220,28 @@ async fn assert_paths(database: &Client, source: &Path) -> Result {
     let actual: BTreeSet<_> = rows.iter().cloned().collect();
     assert_eq!(rows.len(), actual.len(), "duplicate base rows");
     assert_eq!(actual, paths(source)?);
+    let raw = database
+        .query("SELECT statistics FROM scan_resume_resume_case FINAL")
+        .fetch_one::<String>()
+        .await?;
+    let snapshot: serde_json::Value = serde_json::from_str(&raw)?;
+    let stats = snapshot[0]
+        .get("Full")
+        .or_else(|| snapshot[0].get("Incremental").and_then(|value| value.get("scanned")))
+        .ok_or("missing durable statistics")?;
+    let files = count(database, "SELECT countIf(is_dir=0) FROM base_resume_case FINAL").await?;
+    let dirs = count(database, "SELECT countIf(is_dir=1) FROM base_resume_case FINAL").await?;
+    assert_eq!(
+        stats["regular_file_count"].as_u64(),
+        Some(files),
+        "resume stats kind={:?}; file count mismatch",
+        snapshot[0].as_object().map(|value| value.keys().collect::<Vec<_>>())
+    );
+    assert_eq!(
+        stats["dir_count"].as_u64(),
+        Some(dirs),
+        "resume must not double-count replayed directories"
+    );
     Ok(())
 }
 
@@ -183,13 +275,21 @@ async fn killed_scan_resumes_full_and_incremental_without_skips_or_duplicate_eve
     )?;
     let user = serde_json::to_string(&std::env::var("LAB_CLICKHOUSE_USER").unwrap_or_else(|_| "default".into()))?;
     let password = serde_json::to_string(&std::env::var("LAB_CLICKHOUSE_PASSWORD").unwrap_or_default())?;
+    let cluster_setting = std::env::var("LAB_CLICKHOUSE_CLUSTER")
+        .map(|value| format!("cluster={value:?}\n"))
+        .unwrap_or_default();
     fs::write(
         &config,
         format!(
-            "[database]\nenabled=true\ntype=\"clickhouse\"\nbatch_size=16\n[database.clickhouse]\ndsn={dsn}\ndatabase=\"{name}\"\nusername={user}\npassword={password}\n[scan]\nconcurrency=1\n"
+            "[database]\nenabled=true\ntype=\"clickhouse\"\nbatch_size=16\n[database.clickhouse]\ndsn={dsn}\ndatabase=\"{name}\"\nusername={user}\npassword={password}\n{cluster_setting}[scan]\nconcurrency=1\n"
         ),
     )?;
     interrupt_after_checkpoint(command(work.path(), &config, &source, "full-interrupted")?, &database).await?;
+    let full_round: (bool, u8, i64) = database
+        .query("SELECT incremental,generation,event_time FROM scan_resume_resume_case FINAL")
+        .fetch_one()
+        .await?;
+    assert!(!full_round.0, "an interrupted first scan must remain full");
     assert_eq!(
         count(&database, "SELECT toUInt64(scan_state) FROM state_resume_case FINAL").await?,
         0
@@ -201,7 +301,27 @@ async fn killed_scan_resumes_full_and_incremental_without_skips_or_duplicate_eve
         before,
         count(&database, "SELECT version FROM scan_resume_resume_case FINAL").await?
     );
+    interrupt_after_checkpoint(
+        command(work.path(), &config, &source, "full-resume-interrupted")?,
+        &database,
+    )
+    .await?;
+    assert_cumulative_observations(&database).await?;
     complete(command(work.path(), &config, &source, "full-resumed")?).await?;
+    let resumed_full: (bool, u8, i64) = database
+        .query("SELECT incremental,generation,event_time FROM scan_resume_resume_case FINAL")
+        .fetch_one()
+        .await?;
+    assert_eq!(resumed_full, full_round, "full resume must preserve its round and type");
+    assert_eq!(
+        count(
+            &database,
+            "SELECT count() FROM system.tables WHERE database=currentDatabase() AND name='incremental_resume_case'"
+        )
+        .await?,
+        0,
+        "full scans must not generate incremental events"
+    );
     assert_paths(&database, &source).await?;
     assert_eq!(
         count(&database, "SELECT toUInt64(scan_state) FROM state_resume_case FINAL").await?,
@@ -220,6 +340,12 @@ async fn killed_scan_resumes_full_and_incremental_without_skips_or_duplicate_eve
         &database,
     )
     .await?;
+    let incremental_round: (bool, u8, i64) = database
+        .query("SELECT incremental,generation,event_time FROM scan_resume_resume_case FINAL")
+        .fetch_one()
+        .await?;
+    assert!(incremental_round.0, "only a completed full scan can become incremental");
+    assert_ne!(incremental_round.2, full_round.2);
     assert_eq!(
         count(&database, "SELECT toUInt64(scan_state) FROM state_resume_case FINAL").await?,
         1
@@ -240,7 +366,21 @@ async fn killed_scan_resumes_full_and_incremental_without_skips_or_duplicate_eve
         .await?,
         0
     );
+    interrupt_after_checkpoint(
+        command(work.path(), &config, &source, "incremental-resume-interrupted")?,
+        &database,
+    )
+    .await?;
+    assert_cumulative_observations(&database).await?;
     complete(command(work.path(), &config, &source, "incremental-resumed")?).await?;
+    let resumed_incremental: (bool, u8, i64) = database
+        .query("SELECT incremental,generation,event_time FROM scan_resume_resume_case FINAL")
+        .fetch_one()
+        .await?;
+    assert_eq!(
+        resumed_incremental, incremental_round,
+        "incremental resume must preserve its round and type"
+    );
     assert_paths(&database, &source).await?;
     assert_eq!(
         count(

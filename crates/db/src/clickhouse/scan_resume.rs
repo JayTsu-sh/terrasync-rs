@@ -31,6 +31,7 @@ pub struct ScanResumeState {
     pub event_time: i64,
     pub observed_entries: u64,
     pub checkpoint: Vec<u8>,
+    pub statistics: String,
 }
 
 impl ScanResumeState {
@@ -77,9 +78,14 @@ impl ClickHouseDatabase {
             &format!(
                 "CREATE TABLE IF NOT EXISTS {table} (id UInt8, schema_version UInt8, version UInt64, \
              request_key String, generation UInt8, incremental Bool, phase UInt8, event_time Int64, \
-             observed_entries UInt64, checkpoint Array(UInt8)) \
+             observed_entries UInt64, checkpoint Array(UInt8), statistics String DEFAULT '') \
              ENGINE = ReplacingMergeTree(version) ORDER BY id"
             ),
+            &[],
+        )
+        .await?;
+        self.execute(
+            &format!("ALTER TABLE {table} ADD COLUMN IF NOT EXISTS statistics String DEFAULT ''"),
             &[],
         )
         .await?;
@@ -87,7 +93,7 @@ impl ClickHouseDatabase {
             .sync_client
             .query(&format!(
                 "SELECT id, schema_version, version, request_key, generation, incremental, phase, \
-             event_time, observed_entries, checkpoint FROM {table} ORDER BY version DESC LIMIT 1"
+             event_time, observed_entries, checkpoint, statistics FROM {table} ORDER BY version DESC LIMIT 1"
             ))
             .fetch_one::<ScanResumeState>()
             .await
@@ -244,7 +250,7 @@ impl ClickHouseDatabase {
         Ok(())
     }
 
-    async fn write_resume_keys(&self, paths: HashSet<String>) -> Result<String> {
+    pub(super) async fn write_resume_keys(&self, paths: HashSet<String>) -> Result<String> {
         let keys = format!("scan_resume_event_keys_{}", sanitize_job_id(&self.job_id));
         self.execute(
             &format!("CREATE TABLE IF NOT EXISTS {keys} (relative_path String) ENGINE = Memory"),
@@ -333,6 +339,7 @@ mod tests {
             event_time: 42,
             observed_entries: 100,
             checkpoint: vec![1, 2, 3],
+            statistics: String::new(),
         }
     }
 
@@ -354,5 +361,27 @@ mod tests {
         value.version = u64::MAX;
         assert!(value.advance().is_err());
         Ok(())
+    }
+}
+
+impl ClickHouseDatabase {
+    /// 纯读取执行类型；未完成全量即使已有 job 目录也仍是全量续扫。
+    pub async fn resume_execution_is_incremental(&self) -> Result<bool> {
+        if self.check_table_exists(&self.resume_table()).await? {
+            match self
+                .sync_client
+                .query(&format!(
+                    "SELECT incremental,phase FROM {} FINAL WHERE id=1",
+                    self.resume_table()
+                ))
+                .fetch_one::<(bool, u8)>()
+                .await
+            {
+                Ok((incremental, phase)) if phase == RUNNING || phase == FINALIZING => return Ok(incremental),
+                Ok(_) | Err(ClickHouseError::RowNotFound) => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        self.check_table_exists(&get_scan_base_table_name(&self.job_id)).await
     }
 }

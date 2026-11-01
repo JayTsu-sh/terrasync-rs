@@ -14,6 +14,7 @@ export interface TaskConfig {
   block_size?: string
   iops?: number
   concurrency?: number
+  reset_scan_on_start?: boolean
 }
 
 export interface MigrationTask {

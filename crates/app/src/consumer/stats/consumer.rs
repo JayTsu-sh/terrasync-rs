@@ -15,7 +15,9 @@ use std::sync::atomic::AtomicU64;
 use std::time::Duration;
 
 // 外部crate
+use data_mover::model::ObservedEntry;
 use storage_adapter::StorageEntryMessage;
+use storage_adapter::observed_scan::{EntryStatistics, ObservedScanEvent, ObservedView};
 use tokio::sync::{Mutex, mpsc};
 use tokio::task::JoinHandle;
 use tracing::{error, info, trace, warn};
@@ -62,6 +64,30 @@ impl StatisticConsumer {
     }
 
     /// 更新累计统计 + 进度条原子计数器
+    pub fn update_observed_entry(&mut self, entry: &ObservedEntry) {
+        for view in ObservedView::all(entry) {
+            match &mut self.stats {
+                StatsKind::Full(stats) => stats.update(&view),
+                StatsKind::Incremental(stats) => stats.scanned.update(&view),
+            }
+            self.progress_bar.update_observed("scanned", &view);
+        }
+    }
+    pub fn update_observed_event(&mut self, event: &ObservedScanEvent) {
+        self.update_recorded_event(event.operation(), &event.item().view());
+    }
+    pub fn update_recorded_event(&mut self, operation: &str, entry: &impl EntryStatistics) {
+        if let StatsKind::Incremental(stats) = &mut self.stats {
+            match operation {
+                "new" => stats.new.add(entry),
+                "deleted" => stats.deleted.add(entry),
+                "rename" => stats.renamed.add(entry),
+                _ => stats.changed.add(entry),
+            }
+        }
+        self.progress_bar.update_observed(operation, entry);
+    }
+
     pub fn update_statistics(&mut self, message: &StorageEntryMessage) {
         trace!("Updating statistics for message: {:?}", message);
         self.stats.update_from_message(message);

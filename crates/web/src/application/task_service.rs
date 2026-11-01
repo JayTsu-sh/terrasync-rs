@@ -125,6 +125,7 @@ impl TaskService {
             });
         }
 
+        let old = task.clone();
         if let Some(name) = req.name {
             if name.trim().is_empty() {
                 return Err(WebError::ValidationError("Task name cannot be empty".to_string()));
@@ -137,6 +138,9 @@ impl TaskService {
                 .find_by_id(&source_endpoint_id)
                 .await?
                 .ok_or_else(|| WebError::EndpointNotFound(source_endpoint_id.clone()))?;
+            if task.source_endpoint_id != source_endpoint_id {
+                task.source_path_id = None;
+            }
             task.source_endpoint_id = source_endpoint_id;
         }
 
@@ -152,8 +156,19 @@ impl TaskService {
             }
         }
 
-        if let Some(config) = req.config {
+        if let Some(mut config) = req.config {
+            validate_task_config(&config)?;
+            config.reset_scan_on_start = old.config.reset_scan_on_start;
             task.config = config;
+        }
+        if task.task_type == TaskType::Scan
+            && (old.source_endpoint_id != task.source_endpoint_id
+                || old.source_path_id != task.source_path_id
+                || old.config.depth != task.config.depth
+                || old.config.match_expr != task.config.match_expr
+                || old.config.exclude_expr != task.config.exclude_expr)
+        {
+            task.config.reset_scan_on_start = true;
         }
 
         self.task_repo.update(&task).await?;
@@ -167,7 +182,11 @@ impl TaskService {
 
     pub async fn cancel_task(&self, id: &str) -> Result<()> {
         self.task_runner.cancel_task(id)?;
-        self.task_repo.update_status(id, TaskStatus::Cancelled, None).await
+        Ok(())
+    }
+
+    pub async fn pause_all_and_wait(&self) {
+        self.task_runner.pause_all_and_wait().await;
     }
 
     pub async fn get_task(&self, id: &str) -> Result<MigrationTask> {
@@ -284,6 +303,13 @@ impl TaskService {
     }
 }
 
+fn validate_task_config(config: &TaskConfig) -> Result<()> {
+    if config.concurrency.is_some_and(|value| !(1..=128).contains(&value)) {
+        return Err(WebError::ValidationError("并发度必须为 1 到 128".into()));
+    }
+    Ok(())
+}
+
 /// 从 `ProgressReport` 提取 `ExecutionStats`，供写入执行记录
 fn execution_stats_from_report(report: &ProgressReport) -> ExecutionStats {
     match &report.detail {
@@ -318,5 +344,108 @@ fn execution_stats_from_report(report: &ProgressReport) -> ExecutionStats {
             duration_secs: report.elapsed_secs,
             avg_speed_bytes_per_sec: report.speed_bytes_per_sec,
         },
+    }
+}
+
+#[cfg(test)]
+mod configuration_tests {
+    use super::*;
+    use crate::api::state::AppState;
+    use crate::application::endpoint_service::CreateEndpointRequest;
+    use crate::domain::endpoint::{EndpointConfig, EndpointType};
+    use sqlx::sqlite::SqlitePoolOptions;
+
+    #[tokio::test]
+    async fn edited_config_survives_reload_and_only_semantic_changes_restart_scan() -> Result<()> {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await?;
+        sqlx::raw_sql(include_str!("../migrations/001_init.sql"))
+            .execute(&pool)
+            .await?;
+        let app = AppState::new(pool.clone());
+        let ep = app
+            .endpoint_service
+            .create_endpoint(CreateEndpointRequest {
+                name: "config source".into(),
+                endpoint_type: EndpointType::Local,
+                config: EndpointConfig::Local {
+                    path: "/tmp/config-test".into(),
+                },
+            })
+            .await?;
+        let task = app
+            .task_service
+            .create_task(CreateTaskRequest {
+                name: "config scan".into(),
+                task_type: TaskType::Scan,
+                source_endpoint_id: ep.id,
+                source_path_id: None,
+                dest_endpoint_id: None,
+                dest_path_id: None,
+                config: TaskConfig {
+                    concurrency: Some(8),
+                    depth: 1,
+                    ..Default::default()
+                },
+            })
+            .await?;
+        let update = |config| UpdateTaskRequest {
+            name: None,
+            source_endpoint_id: None,
+            source_path_id: None,
+            config: Some(config),
+        };
+        let changed = app
+            .task_service
+            .update_task(
+                &task.id,
+                update(TaskConfig {
+                    concurrency: Some(32),
+                    ..task.config.clone()
+                }),
+            )
+            .await?;
+        assert!(
+            !changed.config.reset_scan_on_start,
+            "tuning concurrency must retain resume checkpoint"
+        );
+        let fresh = AppState::new(pool);
+        let loaded = fresh.task_service.get_task(&task.id).await?;
+        assert_eq!(loaded.config.concurrency, Some(32));
+        assert_eq!(loaded.config.depth, 1);
+        let changed = fresh
+            .task_service
+            .update_task(
+                &task.id,
+                update(TaskConfig {
+                    depth: 2,
+                    ..loaded.config.clone()
+                }),
+            )
+            .await?;
+        assert!(
+            changed.config.reset_scan_on_start,
+            "new scan scope must use a fresh baseline"
+        );
+        assert!(
+            fresh
+                .task_service
+                .update_task(
+                    &task.id,
+                    update(TaskConfig {
+                        concurrency: Some(0),
+                        ..changed.config
+                    })
+                )
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            fresh.task_service.get_task(&task.id).await?.config.concurrency,
+            Some(32)
+        );
+        Ok(())
     }
 }

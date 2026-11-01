@@ -6,8 +6,10 @@ use crate::application::analytics_service::AnalyticsService;
 use crate::application::config_service::ConfigService;
 use crate::application::endpoint_service::EndpointService;
 use crate::application::path_service::PathService;
+use crate::application::storage_analysis_service::StorageAnalysisService;
 use crate::application::storage_browser_service::StorageBrowserService;
 use crate::application::task_service::TaskService;
+use crate::infrastructure::analysis_repo::ClickHouseAnalysisRepo;
 use crate::infrastructure::config_repo::SqliteConfigRepo;
 use crate::infrastructure::endpoint_repo::SqliteEndpointRepo;
 use crate::infrastructure::execution_repo::SqliteExecutionRepo;
@@ -25,6 +27,7 @@ pub struct AppState {
     pub analytics_service: Arc<AnalyticsService>,
     pub config_service: Arc<ConfigService>,
     pub storage_browser_service: Arc<StorageBrowserService>,
+    pub storage_analysis_service: Arc<StorageAnalysisService>,
 }
 
 impl AppState {
@@ -35,6 +38,14 @@ impl AppState {
         let execution_repo = Arc::new(SqliteExecutionRepo::new(pool.clone()));
         let progress_repo = Arc::new(SqliteProgressRepo::new(pool.clone()));
         let config_repo = Arc::new(SqliteConfigRepo::new(pool.clone()));
+
+        let storage_analysis_service = Arc::new(StorageAnalysisService::new(
+            Arc::new(ClickHouseAnalysisRepo::new(config_repo.clone())),
+            task_repo.clone(),
+            path_repo.clone(),
+            endpoint_repo.clone(),
+            progress_repo.clone(),
+        ));
 
         let task_runner = Arc::new(TaskRunner::new(
             task_repo.clone(),
@@ -65,6 +76,7 @@ impl AppState {
             analytics_service,
             config_service,
             storage_browser_service,
+            storage_analysis_service,
         }
     }
 }

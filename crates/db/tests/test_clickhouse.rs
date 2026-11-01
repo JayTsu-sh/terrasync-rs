@@ -212,6 +212,7 @@ mod clickhouse_integration_tests {
             event_time: 123_456_789,
             observed_entries: 10,
             checkpoint: vec![1, 2, 3],
+            statistics: String::new(),
         };
         assert!(database.load_resume_state().await.unwrap().is_none());
         database.save_resume_state(&state).await.unwrap();

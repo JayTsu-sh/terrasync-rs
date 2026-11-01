@@ -8,8 +8,11 @@ use crate::error::{Result, WebError};
 ///
 /// 服务器会监听 Ctrl+C 信号进行优雅关闭。
 pub async fn start_web_server(host: &str, port: u16) -> Result<()> {
+    let _database_lease = crate::infrastructure::db::lock_database()?;
     // 1. 初始化 SQLite 数据库
     let db_pool = crate::infrastructure::db::init_database().await?;
+
+    crate::infrastructure::db::recover_interrupted_tasks(&db_pool).await?;
 
     // 2. 构建应用状态
     let app_state = crate::api::state::AppState::new(db_pool);
@@ -18,7 +21,7 @@ pub async fn start_web_server(host: &str, port: u16) -> Result<()> {
     app_state.config_service.apply_saved_config().await;
 
     // 4. 构建路由
-    let app = crate::api::router::build_router(app_state, port);
+    let app = crate::api::router::build_router(app_state.clone(), port);
 
     // 5. 绑定地址并启动服务
     let addr: SocketAddr = format!("{host}:{port}")
@@ -34,7 +37,10 @@ pub async fn start_web_server(host: &str, port: u16) -> Result<()> {
     info!("Press Ctrl+C to stop the server");
 
     axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>())
-        .with_graceful_shutdown(shutdown_signal())
+        .with_graceful_shutdown(async move {
+            shutdown_signal().await;
+            app_state.task_service.pause_all_and_wait().await;
+        })
         .await
         .map_err(WebError::IoError)?;
 

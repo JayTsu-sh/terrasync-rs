@@ -1,7 +1,7 @@
 import { ref, computed, watch } from 'vue'
 import type { Endpoint } from '../api/endpoints'
 import { getEndpoint, testConnection } from '../api/endpoints'
-import { createTask, startTask, deleteTask, cancelTask, listTasks, listExecutions, getTaskProgress } from '../api/tasks'
+import { createTask, startTask, cancelTask, listTasks, listExecutions, getTaskProgress } from '../api/tasks'
 import type { MigrationTask, TaskExecution, ExecutionStats, TaskProgressSnapshot } from '../api/tasks'
 import { createPath, listPaths } from '../api/paths'
 import { getTaskAnalytics } from '../api/analytics'
@@ -60,7 +60,7 @@ export function useEndpointDetail(id: string) {
     try {
       const allTasks = await listTasks()
       const endpointTasks = allTasks
-        .filter((t) => t.source_endpoint_id === id)
+        .filter((t) => t.source_endpoint_id === id && t.task_type === 'scan')
         .sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime())
 
       latestScanTask.value = endpointTasks[0] || null
@@ -135,12 +135,7 @@ export function useEndpointDetail(id: string) {
       let path = paths.find((p) => p.sub_path === '/')
       if (!path) path = await createPath(id, { sub_path: '/' })
 
-      if (latestScanTask.value && !['pending', 'running'].includes(latestScanTask.value.status)) {
-        await deleteTask(latestScanTask.value.id)
-        latestScanTask.value = null
-      }
-
-      if (latestScanTask.value && latestScanTask.value.status === 'pending') {
+      if (latestScanTask.value && latestScanTask.value.status !== 'running') {
         await startTask(latestScanTask.value.id)
       } else {
         const task = await createTask({

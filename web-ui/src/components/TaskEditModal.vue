@@ -26,7 +26,7 @@ const props = defineProps<{
 
 const emit = defineEmits<{
   'update:show': [value: boolean]
-  saved: []
+  saved: [task: MigrationTask]
 }>()
 
 const message = useMessage()
@@ -66,9 +66,9 @@ watch(
 async function onSubmit() {
   if (!props.task) return
   try {
-    await handleSubmit(props.task.id)
+    const updated = await handleSubmit(props.task.id)
     message.success('任务已更新')
-    emit('saved')
+    emit('saved', updated)
     emit('update:show', false)
   } catch (e: any) {
     if (e instanceof ValidationError) {
@@ -173,6 +173,10 @@ function destLabel(): string {
             <NCheckbox v-model:checked="form.enable_integrity_check" />
           </NFormItem>
 
+          <NFormItem v-if="task?.task_type === 'scan'" label="扫描深度">
+            <NInputNumber v-model:value="form.depth" :min="0" :show-button="false" class="w-full" />
+            <template #feedback>0 表示不限深度</template>
+          </NFormItem>
           <NFormItem label="并发度">
             <NInputNumber v-model:value="form.concurrency" :min="1" :max="128" :show-button="false" class="w-full" />
           </NFormItem>
@@ -187,6 +191,9 @@ function destLabel(): string {
         />
       </div>
 
+      <div v-if="task?.task_type === 'scan'" class="px-6 pb-4 text-xs text-gray-500">
+        修改扫描位置、深度或筛选条件后，下次执行将重新扫描；只修改并发度可继续已有进度。
+      </div>
       <!-- Footer -->
       <div class="flex justify-end gap-3 px-6 py-4 border-t border-gray-100">
         <NButton @click="emit('update:show', false)">取消</NButton>

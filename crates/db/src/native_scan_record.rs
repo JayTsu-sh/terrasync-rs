@@ -1,0 +1,430 @@
+//! 原生扫描的数据库行投影；只在 SQL 序列化处展开事实，运行时保留 ObservedEntry。
+#[cfg(test)]
+use crate::error::DatabaseError;
+use crate::{
+    error::Result,
+    traits::{IncrementalStorageEntryRecord, StorageEntryRecord},
+};
+#[cfg(test)]
+use data_mover::model::{BackendIdentity, IdentityStrength, RecordKind, SourceIdentity, StoragePath, VersionRecord};
+use data_mover::model::{
+    BackendKind, EntryKind, EntrySnapshot, HistoryOrder, ObjectHistory, ObservedEntry, StorageTimestamp,
+};
+use serde::{Serialize, Serializer};
+use std::collections::HashMap;
+#[cfg(test)]
+use std::sync::Arc;
+use storage_adapter::Tag;
+#[cfg(test)]
+use storage_adapter::observed_scan::ObservedItem;
+use storage_adapter::observed_scan::{EntryStatistics, ObservedScanEvent, ObservedView, timestamp_nanos};
+
+pub(crate) const OBSERVED_COLUMNS: &str = "name,relative_path,size,ext,ctime,mtime,atime,mode,storage_type,is_symlink,is_dir,is_regular_file,hard_links,current_state,uid,gid,ino,file_handle,version_id,tags,version_count,identity_key,backend_kind,entry_kind,size_observed,modified_unix_nanos,entry_snapshot";
+#[derive(Clone, Debug, Serialize, clickhouse::Row)]
+pub(crate) struct NativeScanRecord {
+    pub name: String,
+    pub relative_path: String,
+    pub size: u64,
+    pub ext: Option<String>,
+    pub ctime: i64,
+    pub mtime: i64,
+    pub atime: i64,
+    pub mode: Option<u32>,
+    pub storage_type: &'static str,
+    pub is_symlink: bool,
+    pub is_dir: bool,
+    pub is_regular_file: bool,
+    pub hard_links: u32,
+    pub current_state: u8,
+    pub uid: Option<u32>,
+    pub gid: Option<u32>,
+    pub ino: Option<u64>,
+    pub file_handle: Option<String>,
+    pub version_id: String,
+    pub tags: Option<String>,
+    pub version_count: Option<u32>,
+    pub identity_key: String,
+    pub backend_kind: &'static str,
+    pub entry_kind: &'static str,
+    pub size_observed: bool,
+    pub modified_unix_nanos: Option<i128>,
+    #[serde(serialize_with = "serialize_snapshot")]
+    pub entry_snapshot: EntrySnapshot,
+}
+pub(crate) fn serialize_snapshot<S: Serializer>(
+    snapshot: &EntrySnapshot, serializer: S,
+) -> std::result::Result<S::Ok, S::Error> {
+    // RowBinary 的 Array(UInt8) 与字节串均为 varint 长度 + 原始字节。
+    // 专用批量 insert 使用已验证的固定列布局，避免逐字节 serde 分派和类型检查。
+    serializer.serialize_bytes(snapshot.as_bytes())
+}
+impl NativeScanRecord {
+    pub(crate) fn capture(view: ObservedView<'_>, generation: u8) -> Result<Self> {
+        let entry = view.entry;
+        let ownership = view.metadata().ownership_mode().value();
+        let timestamps = view.metadata().timestamps().value();
+        let kind = match entry.kind() {
+            EntryKind::File => "file",
+            EntryKind::Directory => "directory",
+            EntryKind::Symlink => "symlink",
+            EntryKind::Special(_) => "special",
+        };
+        let tags = view.metadata().tags().value().map(|tags| {
+            tags.iter()
+                .map(|tag| Tag {
+                    key: tag.key().into(),
+                    value: tag.value().into(),
+                })
+                .collect::<Vec<_>>()
+        });
+        let selected;
+        let snapshot_entry = if let Some(record) = view.version() {
+            // 每个 SQL 版本行仅保存自身 snapshot，避免长历史平方级复制。
+            selected = ObservedEntry::new(
+                entry.path().clone(),
+                entry.kind(),
+                record.size(),
+                record.modified(),
+                record.identity().clone(),
+            )?
+            .with_metadata(view.metadata().clone())
+            .with_history(Some(Box::new(ObjectHistory::whole(
+                vec![record.clone()],
+                entry.history().map_or(HistoryOrder::Server, |h| h.order()),
+            )?)))?;
+            &selected
+        } else {
+            entry
+        };
+        let modified = snapshot_entry.modified().map(StorageTimestamp::unix_nanos);
+        Ok(Self {
+            name: view.get_name().into(),
+            relative_path: view.path(),
+            size: view.get_size(),
+            ext: view.get_extension().map(str::to_owned),
+            ctime: timestamp_nanos(timestamps.and_then(|t| t.created)),
+            mtime: view.get_mtime(),
+            atime: timestamp_nanos(timestamps.and_then(|t| t.accessed)),
+            mode: ownership.map(|o| o.mode),
+            storage_type: match entry.backend_kind() {
+                BackendKind::S3 => "s3",
+                BackendKind::Hdfs => "hdfs",
+                _ => "nas",
+            }
+            .into(),
+            is_symlink: view.get_is_symlink(),
+            is_dir: view.get_is_dir(),
+            is_regular_file: !view.get_is_dir() && !view.get_is_symlink(),
+            hard_links: 1,
+            current_state: generation,
+            uid: ownership.map(|o| o.uid),
+            gid: ownership.map(|o| o.gid),
+            ino: None,
+            file_handle: view.file_handle(),
+            version_id: view.version_id().into(),
+            tags: tags.as_ref().map(serde_json::to_string).transpose()?,
+            version_count: entry.history().map(|h| h.records().len().min(u32::MAX as usize) as u32),
+            identity_key: hex::encode(snapshot_entry.identity_key().as_bytes()),
+            backend_kind: entry.backend_kind().as_str().into(),
+            entry_kind: kind.into(),
+            size_observed: snapshot_entry.size().is_some(),
+            modified_unix_nanos: modified,
+            entry_snapshot: snapshot_entry.try_encode_snapshot()?,
+        })
+    }
+    #[cfg(test)]
+    pub(crate) fn observed(&self, backend: &BackendIdentity) -> Result<ObservedItem> {
+        let entry = ObservedEntry::decode_snapshot(self.entry_snapshot.as_bytes(), backend)?;
+        let version_index = entry.history().map(|_| 0);
+        let view = ObservedView {
+            entry: &entry,
+            version_index,
+        };
+        if hex::encode(entry.identity_key().as_bytes()) != self.identity_key
+            || view.path() != self.relative_path
+            || view.version_id() != self.version_id
+            || view.get_size() != self.size
+        {
+            return Err(DatabaseError::ObservationProjectionMismatch {
+                field: "identity/path/version/size",
+            });
+        }
+        Ok(ObservedItem {
+            entry: Arc::new(entry),
+            version_index,
+        })
+    }
+    pub(crate) fn legacy(self) -> StorageEntryRecord {
+        StorageEntryRecord {
+            name: self.name,
+            relative_path: self.relative_path,
+            size: self.size,
+            ext: self.ext,
+            ctime: self.ctime,
+            mtime: self.mtime,
+            atime: self.atime,
+            mode: self.mode,
+            storage_type: self.storage_type.into(),
+            is_symlink: self.is_symlink,
+            is_dir: self.is_dir,
+            is_regular_file: self.is_regular_file,
+            hard_links: self.hard_links,
+            current_state: self.current_state,
+            uid: self.uid,
+            gid: self.gid,
+            ino: self.ino,
+            file_handle: self.file_handle,
+            version_id: self.version_id,
+            tags: self.tags,
+            version_count: self.version_count,
+        }
+    }
+}
+
+pub(crate) fn event_records(events: &[ObservedScanEvent], time: i64) -> Result<Vec<IncrementalStorageEntryRecord>> {
+    let mut added: HashMap<String, u32> = HashMap::new();
+    for event in events {
+        if let ObservedScanEvent::New(item) = event
+            && item.version_index.is_some()
+        {
+            let count = added.entry(item.view().path()).or_default();
+            *count = count.saturating_add(1);
+        }
+    }
+    events
+        .iter()
+        .map(|event| {
+            let mut record = event_record(event, time)?;
+            if matches!(event, ObservedScanEvent::New(_)) && record.version_count.is_some() {
+                record.version_count = added.get(&record.relative_path).copied();
+            }
+            Ok(record)
+        })
+        .collect()
+}
+
+pub(crate) fn event_record(event: &ObservedScanEvent, event_time: i64) -> Result<IncrementalStorageEntryRecord> {
+    let record = NativeScanRecord::capture(event.item().view(), 0)?.legacy();
+    Ok(incremental_record(
+        record,
+        event.operation(),
+        match event {
+            ObservedScanEvent::Renamed { from, .. } => Some(from.view().path()),
+            _ => None,
+        },
+        event_time,
+    ))
+}
+
+pub(crate) fn incremental_record(
+    record: StorageEntryRecord, operation: &str, comment: Option<String>, event_time: i64,
+) -> IncrementalStorageEntryRecord {
+    IncrementalStorageEntryRecord {
+        operation_type: operation.into(),
+        create_at: event_time,
+        comment,
+        name: record.name,
+        relative_path: record.relative_path,
+        size: record.size,
+        ext: record.ext,
+        ctime: record.ctime,
+        mtime: record.mtime,
+        atime: record.atime,
+        mode: record.mode,
+        storage_type: record.storage_type,
+        is_symlink: record.is_symlink,
+        is_dir: record.is_dir,
+        is_regular_file: record.is_regular_file,
+        hard_links: record.hard_links,
+        current_state: record.current_state,
+        uid: record.uid,
+        gid: record.gid,
+        ino: record.ino,
+        file_handle: record.file_handle,
+        version_id: record.version_id,
+        tags: record.tags,
+        version_count: record.version_count,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use data_mover::model::{
+        AclMetadata, MetadataObservation, MetadataObservations, MetadataProvenance, OwnershipMode, TimePrecision,
+    };
+    #[test]
+    fn native_row_roundtrips_identity_acl_and_metadata_without_projection_loss() -> Result<()> {
+        let backend = BackendIdentity::new(BackendKind::Nfs, "native-fixture")?;
+        let identity = SourceIdentity::new(
+            backend.clone(),
+            IdentityStrength::StableWithinBackend,
+            b"native-file-handle",
+        )?;
+        let metadata = MetadataObservations::new(
+            MetadataObservation::Value {
+                value: AclMetadata::new_posix(Some(vec![1, 2, 3]), None)?,
+                provenance: MetadataProvenance::Inline,
+            },
+            MetadataObservation::NotRequested,
+            MetadataObservation::NotRequested,
+            MetadataObservation::Value {
+                value: OwnershipMode {
+                    uid: 100,
+                    gid: 200,
+                    mode: 0o640,
+                },
+                provenance: MetadataProvenance::Inline,
+            },
+            MetadataObservation::NotRequested,
+        )?;
+        let entry = ObservedEntry::new(
+            StoragePath::new("dir/file.bin")?,
+            EntryKind::File,
+            Some(17),
+            Some(StorageTimestamp::new(1_000_000_001, TimePrecision::Nanoseconds)?),
+            identity,
+        )?
+        .with_metadata(metadata);
+        let record = NativeScanRecord::capture(
+            ObservedView {
+                entry: &entry,
+                version_index: None,
+            },
+            1,
+        )?;
+        assert_eq!(record.mode, Some(0o640));
+        assert_eq!(record.uid, Some(100));
+        assert!(
+            record
+                .file_handle
+                .as_ref()
+                .is_some_and(|key| key.starts_with("54534934"))
+        );
+        assert_eq!(*record.observed(&backend)?.entry, entry);
+        let mut corrupt = record.clone();
+        corrupt.relative_path = "other".into();
+        assert!(corrupt.observed(&backend).is_err());
+        let other = BackendIdentity::new(BackendKind::Nfs, "other")?;
+        assert!(record.observed(&other).is_err());
+        Ok(())
+    }
+    #[test]
+    fn native_history_preserves_each_version_null_and_delete_marker() -> Result<()> {
+        let backend = BackendIdentity::new(BackendKind::S3, "native-history")?;
+        let identity = SourceIdentity::new(backend.clone(), IdentityStrength::PathScoped, b"key")?;
+        let records = vec![
+            VersionRecord::from_listing(
+                "null",
+                false,
+                RecordKind::Object {
+                    size: 17,
+                    etag: "etag".into(),
+                    modified: None,
+                },
+                identity.clone(),
+            )?,
+            VersionRecord::from_listing(
+                "deleted",
+                true,
+                RecordKind::DeleteMarker { modified: None },
+                identity.clone(),
+            )?,
+        ];
+        let entry = ObservedEntry::new(StoragePath::new("key")?, EntryKind::File, None, None, identity)?
+            .with_history(Some(Box::new(ObjectHistory::whole(records, HistoryOrder::Server)?)))?;
+        let rows = ObservedView::all(&entry)
+            .map(|view| NativeScanRecord::capture(view, 1))
+            .collect::<Result<Vec<_>>>()?;
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].version_id, "null");
+        assert_eq!(rows[0].size, 17);
+        assert_eq!(rows[1].version_id, "deleted");
+        assert_eq!(rows[0].version_count, Some(2));
+        let marker = rows[1].observed(&backend)?;
+        assert!(marker.view().version().is_some_and(VersionRecord::is_delete_marker));
+        assert_eq!(marker.view().version_id(), "deleted");
+        let entry = Arc::new(entry);
+        let new = ObservedScanEvent::New(ObservedItem {
+            entry,
+            version_index: Some(1),
+        });
+        let events = event_records(&[new], 9)?;
+        assert_eq!(
+            events[0].version_count,
+            Some(1),
+            "incremental events count only newly observed versions"
+        );
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod wire_tests {
+    use super::*;
+    use clickhouse::{
+        Client,
+        test::{Mock, handlers},
+    };
+    use serde::Deserialize;
+    use std::time::Instant;
+    #[derive(Serialize, clickhouse::Row)]
+    struct WriteRow {
+        before: u64,
+        #[serde(serialize_with = "serialize_snapshot")]
+        entry_snapshot: EntrySnapshot,
+        after: i128,
+    }
+    #[derive(Deserialize, clickhouse::Row)]
+    struct ReadRow {
+        before: u64,
+        entry_snapshot: Vec<u8>,
+        after: i128,
+    }
+    async fn exercise(count: u64) -> Result<()> {
+        let backend = BackendIdentity::new(BackendKind::Nfs, "wire-bulk")?;
+        let identity = SourceIdentity::new(backend.clone(), IdentityStrength::StableWithinBackend, b"native-id")?;
+        let entry = ObservedEntry::new(
+            StoragePath::new("wire/entry")?,
+            EntryKind::File,
+            Some(17),
+            None,
+            identity,
+        )?;
+        let row = WriteRow {
+            before: 127,
+            entry_snapshot: entry.try_encode_snapshot()?,
+            after: -9,
+        };
+        let mock = Mock::new();
+        let recorded = mock.add(handlers::record::<ReadRow>());
+        let client = Client::default().with_url(mock.url()).with_validation(false);
+        let start = Instant::now();
+        let mut insert = client.insert::<WriteRow>("snapshot_wire_fixture").await?;
+        for _ in 0..count {
+            insert.write(&row).await?;
+        }
+        insert.end().await?;
+        eprintln!(
+            "native snapshot RowBinary: {count} rows in {:.3}s",
+            start.elapsed().as_secs_f64()
+        );
+        let rows: Vec<ReadRow> = recorded.collect().await;
+        assert_eq!(rows.len(), count as usize);
+        for read in rows {
+            assert_eq!((read.before, read.after), (127, -9));
+            assert_eq!(read.entry_snapshot, row.entry_snapshot.as_bytes());
+            assert_eq!(ObservedEntry::decode_snapshot(&read.entry_snapshot, &backend)?, entry);
+        }
+        Ok(())
+    }
+    #[tokio::test]
+    async fn snapshot_rowbinary_matches_array_u8_wire_layout() -> Result<()> {
+        exercise(3).await
+    }
+    #[tokio::test]
+    #[ignore = "manual CPU probe for native snapshot serialization"]
+    async fn snapshot_serialization_cpu_probe() -> Result<()> {
+        exercise(200_000).await
+    }
+}

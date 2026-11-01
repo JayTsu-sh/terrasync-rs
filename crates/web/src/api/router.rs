@@ -43,6 +43,7 @@ pub fn build_router(state: AppState, port: u16) -> Router {
         )
         // 任务分析
         .route("/tasks/{id}/analytics", get(analytics_handler::get_analytics))
+        .route("/tasks/{id}/analysis/tree", get(analytics_handler::get_tree))
         // 执行历史
         .route("/tasks/{id}/executions", get(task_handler::list_executions))
         .route("/executions/{id}", get(task_handler::get_execution))

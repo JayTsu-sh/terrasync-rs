@@ -120,6 +120,9 @@ impl Default for DeleteConfig {
 
 #[derive(Serialize, Deserialize, Clone)]
 pub struct ClickhouseConfig {
+    /// 集群名称；留空保持单机模式。
+    #[serde(default)]
+    pub cluster: Option<String>,
     pub dsn: String,
     pub dial_timeout: u32,
     pub read_timeout: u32,
@@ -495,6 +498,7 @@ username = "default"
     #[test]
     fn clickhouse_debug_redacts_password() {
         let config = ClickhouseConfig {
+            cluster: None,
             dsn: "http://dsn-user:dsn-secret@clickhouse.internal".to_string(),
             dial_timeout: 10,
             read_timeout: 30,

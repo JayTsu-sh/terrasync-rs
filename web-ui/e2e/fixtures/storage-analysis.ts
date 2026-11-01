@@ -1,0 +1,98 @@
+// 浏览器测试使用的扫描明细；产品页面始终请求真实分析接口。
+const GiB = 1024 ** 3
+
+export const analysisRoot = {
+  task_id: 't-done',
+  path: '',
+  source_path: '/data/project',
+  scanned_at: '2026-10-31T06:00:00Z',
+  is_partial: false,
+  total_bytes: 100 * GiB,
+  file_count: 17502,
+  directory_count: 156,
+  children: [
+    {
+      path: 'projects',
+      name: 'projects',
+      kind: 'directory',
+      bytes: 42 * GiB,
+      file_count: 9600,
+      directory_count: 85,
+      modified_at: '2026-10-30T12:00:00Z',
+    },
+    {
+      path: 'archive',
+      name: 'archive',
+      kind: 'directory',
+      bytes: 28 * GiB,
+      file_count: 3200,
+      directory_count: 24,
+      modified_at: '2023-01-01T00:00:00Z',
+    },
+    {
+      path: 'media',
+      name: 'media',
+      kind: 'directory',
+      bytes: 16 * GiB,
+      file_count: 1200,
+      directory_count: 18,
+      modified_at: '2026-09-15T00:00:00Z',
+    },
+    {
+      path: 'datasets',
+      name: 'datasets',
+      kind: 'directory',
+      bytes: 8 * GiB,
+      file_count: 2400,
+      directory_count: 14,
+      modified_at: '2025-01-15T00:00:00Z',
+    },
+    {
+      path: 'backup.tar',
+      name: 'backup.tar',
+      kind: 'file',
+      bytes: 4 * GiB,
+      file_count: 1,
+      directory_count: 0,
+      modified_at: '2026-08-15T00:00:00Z',
+    },
+    {
+      path: 'empty.txt',
+      name: 'empty.txt',
+      kind: 'file',
+      bytes: 0,
+      file_count: 1,
+      directory_count: 0,
+      modified_at: null,
+    },
+    { path: '', name: '其他', kind: 'other', bytes: 2 * GiB, file_count: 1100, directory_count: 15, modified_at: null },
+  ],
+}
+
+export const analysisProjects = {
+  ...analysisRoot,
+  path: 'projects',
+  total_bytes: 42 * GiB,
+  file_count: 9600,
+  directory_count: 85,
+  children: [
+    {
+      path: 'projects/research',
+      name: 'research',
+      kind: 'directory',
+      bytes: 30 * GiB,
+      file_count: 7200,
+      directory_count: 60,
+      modified_at: '2026-10-30T12:00:00Z',
+    },
+    {
+      path: 'projects/app',
+      name: 'app',
+      kind: 'directory',
+      bytes: 12 * GiB,
+      file_count: 2400,
+      directory_count: 24,
+      modified_at: '2026-10-01T12:00:00Z',
+    },
+  ],
+}

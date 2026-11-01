@@ -28,6 +28,11 @@ const router = createRouter({
       component: () => import('../views/TaskDetail.vue'),
     },
     {
+      path: '/analysis',
+      name: 'DataAnalysis',
+      component: () => import('../views/DataAnalysis.vue'),
+    },
+    {
       path: '/settings',
       name: 'SystemSettings',
       component: () => import('../views/SystemSettings.vue'),

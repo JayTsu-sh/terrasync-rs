@@ -4,6 +4,7 @@ mod archive;
 mod connected;
 mod entry;
 pub mod hdfs;
+pub mod observed_scan;
 mod options;
 pub use hdfs::HdfsRecoverableCopyOptions;
 pub mod async_receiver;

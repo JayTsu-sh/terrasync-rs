@@ -6,6 +6,7 @@ use std::time::{Instant, SystemTime};
 
 // 外部crate
 use serde::{Deserialize, Serialize};
+use storage_adapter::observed_scan::EntryStatistics;
 use storage_adapter::{ErrorEvent, StorageEntryMessage};
 use tracing::trace;
 
@@ -17,7 +18,7 @@ use crate::integrity_check::{FixStatus, IntegrityIssue, IssueKind};
 // 枚举：时间区间 / 文件大小区间
 // ─────────────────────────────────────────────────
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum TimeRange {
     WithinDay,       // 一天以内
     DayToWeek,       // 大于一天到一周内
@@ -40,7 +41,7 @@ impl fmt::Display for TimeRange {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum FileSizeRange {
     LessThan4K,
     Between4KAnd64K,
@@ -142,7 +143,7 @@ pub fn format_bytes(bytes: f64, with_decimals: bool) -> String {
 // ─────────────────────────────────────────────────
 
 /// 按 dirs / `regular_files` / symlinks 三维度存储数量和 size
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FullStats {
     // 三维度 count + size
     pub dir_count: usize,
@@ -167,10 +168,13 @@ pub struct FullStats {
     pub error_stats: ErrorStats,
 
     // 元数据
+    #[serde(skip)]
     pub command: String,
     pub job_id: String,
     pub job_type: JobType,
+    #[serde(skip)]
     pub log_path: String,
+    #[serde(skip, default = "Instant::now")]
     pub start_time: Instant,
 }
 
@@ -217,7 +221,7 @@ impl FullStats {
     }
 
     /// 根据 entry 类型更新对应维度的统计
-    pub fn update(&mut self, entry: &storage_adapter::EntryEnum) {
+    pub fn update(&mut self, entry: &impl EntryStatistics) {
         let size = entry.get_size() as i64;
         let name_len = entry.get_name().len();
 
@@ -431,7 +435,7 @@ impl DeltaCounts {
         self.dir_size + self.regular_file_size + self.symlink_size
     }
 
-    pub fn add(&mut self, entry: &storage_adapter::EntryEnum) {
+    pub fn add(&mut self, entry: &impl EntryStatistics) {
         let size = entry.get_size() as i64;
         if entry.get_is_dir() {
             self.dir_count += 1;
@@ -446,7 +450,7 @@ impl DeltaCounts {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IncrementalStats {
     pub scanned: FullStats,
     pub new: DeltaCounts,
@@ -454,10 +458,13 @@ pub struct IncrementalStats {
     pub deleted: DeltaCounts,
     pub renamed: DeltaCounts,
     pub error_stats: ErrorStats,
+    #[serde(skip)]
     pub command: String,
     pub job_id: String,
     pub job_type: JobType,
+    #[serde(skip)]
     pub log_path: String,
+    #[serde(skip, default = "Instant::now")]
     pub start_time: Instant,
 }
 
@@ -592,7 +599,7 @@ impl fmt::Display for IncrementalStats {
 // StatsKind 枚举
 // ─────────────────────────────────────────────────
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[allow(clippy::large_enum_variant)]
 pub enum StatsKind {
     Full(FullStats),
