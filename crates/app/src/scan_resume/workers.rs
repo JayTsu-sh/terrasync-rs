@@ -20,7 +20,7 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 use tracing::info;
 
-const WORKERS: usize = 4;
+pub(super) const WORKERS: usize = 4;
 
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn consume(

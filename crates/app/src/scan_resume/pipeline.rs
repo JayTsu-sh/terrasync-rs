@@ -1,5 +1,5 @@
 //! 扫描分发及检查点协调。数据库批次 B 写入时，下一批 A 在有界队列中积累。
-use super::{flush_batch, workers};
+use super::{flush_batch, input::ScanInput, workers};
 use crate::{
     consumer::{
         ConsumerManager, ScanStatistics,
@@ -41,6 +41,8 @@ pub(super) async fn consume(
     let (control_tx, control_rx) = mpsc::channel(1);
     // 结构化并发：任一分支失败都等待消费者退出，不遗留后台写入任务。
     let writer_state = state.clone();
+    let template = writer_state.incremental.then(|| database.batch_writer()).flatten();
+    let prefetch_capacity = template.as_ref().map(|_| batch_size.saturating_mul(workers::WORKERS));
     let mut producer_state = state.clone();
     let producer_statistics = statistics.scan_statistics();
     let count_statistics = producer_statistics.clone();
@@ -54,6 +56,7 @@ pub(super) async fn consume(
             forwarder,
             control_tx,
             producer_cancel,
+            prefetch_capacity,
         )
         .await;
         (producer_state, result)
@@ -62,7 +65,6 @@ pub(super) async fn consume(
         count(&count_statistics, stat_rx).await;
     }));
     let writer_statistics = statistics.scan_statistics();
-    let template = writer_state.incremental.then(|| database.batch_writer()).flatten();
     let writer = async {
         let result = if let Some(template) = template {
             workers::consume(
@@ -160,7 +162,21 @@ async fn save(control: &mpsc::Sender<SaveState>, state: &ScanResumeState) -> Res
         .map_err(|_| AppError::ConsumerError("ClickHouse checkpoint was not acknowledged".into()))
 }
 async fn produce(
-    mut source: ResumableScan, state: &mut ScanResumeState, statistics: &ScanStatistics,
+    source: ResumableScan, state: &mut ScanResumeState, statistics: &ScanStatistics,
+    forwarder: ObservedForwarder<Entries>, control: mpsc::Sender<SaveState>, cancel: CancellationToken,
+    prefetch_capacity: Option<usize>,
+) -> Result<()> {
+    let mut input = ScanInput::new(source, prefetch_capacity);
+    let result = produce_items(&mut input, state, statistics, forwarder, control, cancel.clone()).await;
+    if result.is_err() {
+        cancel.cancel();
+        input.stop().await;
+    }
+    result
+}
+
+async fn produce_items(
+    source: &mut ScanInput, state: &mut ScanResumeState, statistics: &ScanStatistics,
     forwarder: ObservedForwarder<Entries>, control: mpsc::Sender<SaveState>, cancel: CancellationToken,
 ) -> Result<()> {
     let mut pending = Vec::with_capacity(DISPATCH_BATCH);
@@ -207,7 +223,7 @@ async fn produce(
             }
             Err(error) => {
                 cancel.cancel();
-                return Err(error.into());
+                return Err(error);
             }
         }
     }

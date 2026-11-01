@@ -27,6 +27,7 @@ use crate::{
     storage_factory::{StorageRole, create_storage_for_role},
 };
 
+mod input;
 mod pipeline;
 mod workers;
 
