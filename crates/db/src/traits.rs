@@ -23,6 +23,7 @@ use tracing::{trace, warn};
 // 内部模块
 use crate::common::DeletionStatus;
 use crate::error::Result;
+use storage_adapter::observed_scan::EntryStatistics;
 
 /// 查询结果结构体
 /// 包含查询返回的行数据、受影响的行数和最后插入的ID
@@ -676,5 +677,29 @@ pub trait Database: Send + Sync {
 impl Clone for Box<dyn Database> {
     fn clone(&self) -> Self {
         (**self).clone_box()
+    }
+}
+
+impl EntryStatistics for StorageEntryRecord {
+    fn get_size(&self) -> u64 {
+        self.size
+    }
+    fn get_name(&self) -> &str {
+        &self.name
+    }
+    fn get_relative_path(&self) -> &std::path::Path {
+        std::path::Path::new(&self.relative_path)
+    }
+    fn get_extension(&self) -> Option<&str> {
+        self.ext.as_deref()
+    }
+    fn get_is_dir(&self) -> bool {
+        self.is_dir
+    }
+    fn get_is_symlink(&self) -> bool {
+        self.is_symlink
+    }
+    fn get_mtime(&self) -> i64 {
+        self.mtime
     }
 }

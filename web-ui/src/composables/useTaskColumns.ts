@@ -32,7 +32,7 @@ export function useTaskColumns(callbacks: {
       key: 'actions',
       width: 160,
       render: (row) => {
-        const actions = getListActions(row.status as TaskStatus)
+        const actions = getListActions(row.status as TaskStatus, row.task_type)
         // ⚠️ 非默认: 语义颜色(蓝详情/绿启动/黄取消/红删除) + cursor-pointer
         const links = actions.map((a) =>
           h('span', { class: `${a.color} cursor-pointer`, onClick: () => actionHandlers[a.key](row) }, a.label),

@@ -42,7 +42,7 @@ const status = computed(() => props.task.status as TaskStatus)
       <div class="flex items-center gap-2">
         <span class="text-xs text-gray-300">创建 {{ new Date(task.created_at).toLocaleString() }}</span>
         <NButton v-if="TASK_ACTIONS.canEdit(status)" size="small" @click="emit('edit')">编辑</NButton>
-        <NButton v-if="TASK_ACTIONS.canStart(status)" type="success" size="small" @click="emit('start')">启动</NButton>
+        <NButton v-if="TASK_ACTIONS.canStart(status)" type="success" size="small" @click="emit('start')">{{ task.task_type === 'scan' && ['cancelled', 'failed'].includes(status) ? '继续扫描' : '启动' }}</NButton>
         <NButton v-if="TASK_ACTIONS.canCancel(status)" size="small" @click="emit('cancel')">取消</NButton>
         <NButton v-if="TASK_ACTIONS.canDelete(status)" type="error" size="small" @click="emit('delete')">删除</NButton>
       </div>
@@ -53,8 +53,9 @@ const status = computed(() => props.task.status as TaskStatus)
       <div class="flex items-center justify-center gap-4">
         <EndpointCard :endpoint="sourceEndpoint" />
         <!-- ⚠️ 非默认: text-gray-300 装饰性箭头 -->
-        <NIcon :size="24" class="text-gray-300 shrink-0"><ArrowForward /></NIcon>
+        <NIcon v-if="task.task_type !== 'scan'" :size="24" class="text-gray-300 shrink-0"><ArrowForward /></NIcon>
         <EndpointCard
+          v-if="task.task_type !== 'scan'"
           :endpoint="destEndpoint"
           :placeholder="destEndpoint ? undefined : { label: '无需目标', description: `${taskTypeLabel} 任务` }"
         />

@@ -20,6 +20,14 @@ use thiserror::Error;
 /// 使用thiserror库实现错误处理和转换
 #[derive(Error, Debug)]
 pub enum DatabaseError {
+    #[error("System clock is before the epoch: {0}")]
+    SystemClock(#[from] std::time::SystemTimeError),
+    #[error("Integer conversion failed: {0}")]
+    IntegerConversion(#[from] std::num::TryFromIntError),
+    #[error("Invalid native scan observation: {0}")]
+    ObservationModel(#[from] data_mover::model::ModelValueError),
+    #[error("Observation tag serialization failed: {0}")]
+    ObservationJson(#[from] serde_json::Error),
     /// data-mover 拒绝数据库中损坏或未知版本的 opaque observation snapshot。
     #[error("Observation snapshot codec error: {0}")]
     SnapshotDecode(#[from] SnapshotDecodeError),

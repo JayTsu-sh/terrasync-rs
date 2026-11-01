@@ -16,7 +16,7 @@ test.describe('EndpointDetail 操作按钮', () => {
     await expect(page.getByRole('button', { name: '测试连接' })).toBeVisible()
   })
 
-  test('显示扫描启动按钮', async ({ page }) => {
+  test('显示启动扫描按钮', async ({ page }) => {
     await setupApiMocks(page)
     await page.goto('/endpoints/ep-nfs-1')
 

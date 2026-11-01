@@ -20,7 +20,7 @@ export interface MockOverrides {
  */
 export async function setupApiMocks(page: Page, overrides?: MockOverrides) {
   const endpoints = overrides?.endpoints ?? mockEndpoints
-  const tasks = overrides?.tasks ?? mockAllTasks
+  const tasks = (overrides?.tasks ?? mockAllTasks).map(task => ({ ...task, config: { ...task.config } }))
   const paths = overrides?.paths ?? mockPaths
   const executions = overrides?.executions ?? mockExecutions
 
@@ -137,7 +137,9 @@ export async function setupApiMocks(page: Page, overrides?: MockOverrides) {
       await route.fulfill({ json: task ?? tasks[0] })
     } else if (method === 'PUT') {
       const body = JSON.parse(route.request().postData() || '{}')
-      await route.fulfill({ json: { ...task, ...body, config: { ...task?.config, ...body.config } } })
+      const updated = { ...task, ...body, config: { ...task?.config, ...body.config } }
+      if (task) Object.assign(task, updated)
+      await route.fulfill({ json: updated })
     } else if (method === 'DELETE') {
       await route.fulfill({ status: 200, json: {} })
     } else {

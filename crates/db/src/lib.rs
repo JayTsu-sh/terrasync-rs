@@ -14,12 +14,15 @@ use uuid::Uuid;
 
 // 内部模块
 // 公共模块导出
+mod cluster_scan;
+pub use cluster_scan::clear_cluster_scan_data;
 pub mod clickhouse; // ClickHouse数据库实现
 pub mod common; // Common types and utilities
 pub mod config; // 数据库配置定义
 pub mod error; // 错误处理
 pub mod factory; // 数据库工厂，用于创建不同类型的数据库实例
 pub mod observation_record;
+pub mod scan_store;
 pub mod traits; // 数据库接口定义
 
 // 共享的表名常量
@@ -117,3 +120,7 @@ pub(crate) fn generate_scan_temp_table_name() -> String {
     let uuid = Uuid::new_v4().to_string().replace('-', "_");
     format!("{SCAN_TEMP_TABLE_BASE_NAME}_{uuid}")
 }
+
+mod native_scan_record;
+
+mod native_scan;

@@ -8,44 +8,78 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use data_mover::traversal::{Resumable, TraversalOutcome};
-use db::clickhouse::scan_resume::{COMPLETED, FINALIZING, RUNNING, ScanResumeState};
-use db::{ClickHouseDatabase, Database, DeletionStatus, INCREMENTAL_SCAN_TABLE_BASE_NAME};
+use data_mover::model::ObservedEntry;
+use data_mover::traversal::Resumable;
+use db::clickhouse::scan_resume::{COMPLETED, RUNNING, ScanResumeState};
+use db::scan_store::{ScanFinalEvent, ScanStore};
 #[cfg(feature = "license")]
 use licensing::verify::quick_verify;
 use storage_adapter::filter::parse_filter_expression;
-use storage_adapter::{
-    EntryEnum, ErrorEvent, ResumableScanItem, StorageEntryMessage, StorageEnum, WalkOptions, canonicalize_path,
-};
-#[cfg(feature = "lab-fault-injection")]
-use tokio::time::sleep;
+use storage_adapter::{ErrorEvent, StorageEntryMessage, StorageEnum, WalkOptions, canonicalize_path};
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 use utils::app_config::AppConfig;
 
 use crate::{
-    broadcast::{BroadcastForwarder, DEFAULT_CHANNEL_CAPACITY},
     config::{JobType, initialize_consumer_config},
     consumer::ConsumerManager,
     error::{AppError, Result},
     storage_factory::{StorageRole, create_storage_for_role},
 };
 
+mod pipeline;
+
 #[allow(clippy::too_many_arguments, clippy::ref_option)]
 pub async fn scan_with_resume(
     job_id: &str, job_dir: &str, path: &str, depth: u32, include: &Option<String>, exclude: &Option<String>,
     command: String, cancel: CancellationToken,
 ) -> Result<()> {
+    scan_with_resume_and_progress(job_id, job_dir, path, depth, include, exclude, command, cancel, None).await
+}
+
+#[allow(clippy::too_many_arguments, clippy::ref_option)]
+pub async fn scan_with_resume_and_progress(
+    job_id: &str, job_dir: &str, path: &str, depth: u32, include: &Option<String>, exclude: &Option<String>,
+    command: String, cancel: CancellationToken, callback_url: Option<String>,
+) -> Result<()> {
+    scan_with_resume_settings(
+        job_id,
+        job_dir,
+        path,
+        depth,
+        include,
+        exclude,
+        command,
+        cancel,
+        callback_url,
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments, clippy::ref_option)]
+pub async fn scan_with_resume_settings(
+    job_id: &str, job_dir: &str, path: &str, depth: u32, include: &Option<String>, exclude: &Option<String>,
+    command: String, cancel: CancellationToken, callback_url: Option<String>, concurrency: Option<usize>,
+) -> Result<()> {
     #[cfg(feature = "license")]
     if let Ok(license) = licensing::get_global_license() {
         quick_verify(license)?;
     }
-    let config = AppConfig::fetch()?;
+    let mut config = AppConfig::fetch()?;
+    if let Some(value) = concurrency {
+        if value == 0 {
+            return Err(AppError::ConfigError("scan concurrency must be positive".into()));
+        }
+        config.scan.concurrency = value;
+    }
+    info!(concurrency = config.scan.concurrency, "Using scan task concurrency");
     if !config.database.enabled || config.database.r#type != "clickhouse" {
         return Err(AppError::ConfigError(
             "scan --resume requires enabled ClickHouse storage".into(),
         ));
     }
+    tokio::fs::create_dir_all(job_dir).await?;
     let lease = OpenOptions::new()
         .create(true)
         .truncate(false)
@@ -75,18 +109,20 @@ pub async fn scan_with_resume(
         options.include_tags,
     )?;
     let database_config = DatabaseConfig::from_app_config(&config.database);
-    let mut database = ClickHouseDatabase::new(
+    let mut database = ScanStore::new(
         database_config
             .clickhouse
             .as_ref()
             .ok_or_else(|| AppError::ConfigError("ClickHouse configuration missing".into()))?,
+        config.database.clickhouse.cluster.as_deref(),
         job_id,
-    );
+    )?;
     database.ping().await?;
     let old = database.load_resume_state().await?;
+    let mut already_committed = false;
     let mut state = if let Some(state) = old.as_ref().filter(|state| state.active()) {
         state.validate(&request_key)?;
-        if !database.table_exists(&db::base_table_name_for_job(job_id)).await? {
+        if !database.results_exist().await? {
             return Err(AppError::ScanError(
                 "Saved scan results are missing; refusing to resume".into(),
             ));
@@ -101,7 +137,7 @@ pub async fn scan_with_resume(
                 warn!(%error, "Completed scan; deferred batch-table cleanup");
             }
             info!("Recovered the previous scan's completed generation commit");
-            return Ok(());
+            already_committed = true;
         }
         info!(
             entries = state.observed_entries,
@@ -110,7 +146,7 @@ pub async fn scan_with_resume(
         );
         state.clone()
     } else {
-        let incremental = database.table_exists(&db::base_table_name_for_job(job_id)).await?;
+        let incremental = database.has_baseline().await?;
         database.initialize().await?;
         let generation = database.begin_scan_generation().await?;
         let now = i64::try_from(SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos())?;
@@ -126,6 +162,7 @@ pub async fn scan_with_resume(
             event_time,
             observed_entries: 0,
             checkpoint: Vec::new(),
+            statistics: String::new(),
         };
         fresh.advance()?;
         database.save_resume_state(&fresh).await?;
@@ -133,43 +170,45 @@ pub async fn scan_with_resume(
         fresh
     };
     if state.incremental {
-        database.create_table(INCREMENTAL_SCAN_TABLE_BASE_NAME).await?;
+        database.prepare_incremental().await?;
     }
     let kind = if state.incremental {
         JobType::IncrementalScan
     } else {
         JobType::Scan
     };
-    let mut consumer_config = initialize_consumer_config(job_id, job_dir, kind, command, &config, None)?;
+    let mut consumer_config = initialize_consumer_config(job_id, job_dir, kind, command, &config, callback_url)?;
     // 本管道负责数据库持久化确认；manager 只消费统计信息。
     consumer_config.db_config.enabled = false;
     let mut consumers = ConsumerManager::new(&consumer_config).await?;
+    // 续扫展示上次确认检查点的累计统计，再叠加本次实际扫描流；整轮完成后校准去重。
+    consumers.restore_statistics(&state.statistics).await?;
     consumers.begin_lifecycle().await;
-    let mut broadcaster = BroadcastForwarder::new(DEFAULT_CHANNEL_CAPACITY);
-    let handles = consumers.start_consumers(&mut broadcaster).await?;
-    let result = run(
-        &storage,
-        &options,
-        &mut database,
-        &mut state,
-        &broadcaster,
-        config.database.batch_size.max(1) as usize,
-        cancel,
-    )
-    .await;
-    if let Err(error) = &result {
-        broadcaster
-            .broadcast(StorageEntryMessage::Error {
+    let result = if already_committed {
+        Ok(())
+    } else {
+        run(
+            &storage,
+            &options,
+            &mut database,
+            &mut state,
+            &consumers,
+            config.database.batch_size.max(1) as usize,
+            cancel.child_token(),
+        )
+        .await
+    };
+    if let Err(error) = &result
+        && !cancel.is_cancelled()
+    {
+        consumers
+            .record_statistics([StorageEntryMessage::Error {
                 event: ErrorEvent::Scan,
                 path: Default::default(),
                 entry: None,
                 reason: error.to_string(),
-            })
+            }])
             .await;
-    }
-    drop(broadcaster);
-    for handle in handles {
-        handle.await??;
     }
     consumers.set_generation_committed(result.is_ok()).await;
     consumers.end_lifecycle().await;
@@ -196,85 +235,33 @@ fn checkpoint_interval() -> Duration {
 
 #[allow(clippy::too_many_arguments)]
 async fn run(
-    storage: &StorageEnum, options: &WalkOptions, database: &mut ClickHouseDatabase, state: &mut ScanResumeState,
-    broadcaster: &BroadcastForwarder<StorageEntryMessage>, batch_size: usize, cancel: CancellationToken,
+    storage: &StorageEnum, options: &WalkOptions, database: &mut ScanStore, state: &mut ScanResumeState,
+    consumers: &ConsumerManager, batch_size: usize, cancel: CancellationToken,
 ) -> Result<()> {
     if state.phase == RUNNING {
-        let mut scan = storage.resumable_scan(
+        let source = storage.resumable_scan(
             options,
             (!state.checkpoint.is_empty()).then(|| state.checkpoint.clone()),
             cancel.clone(),
             checkpoint_interval(),
         )?;
-        let mut batch = Vec::with_capacity(batch_size);
-        let mut failure = None;
-        let mut observed = state.observed_entries;
-        while let Some(item) = scan.next().await {
-            if failure.is_some() {
-                continue;
-            }
-            match item {
-                Ok(ResumableScanItem::Entries(entries)) => {
-                    for entry in entries {
-                        observed = observed.saturating_add(1);
-                        batch.push(Arc::new(entry));
-                        if batch.len() >= batch_size {
-                            flush_batch(database, state, broadcaster, &mut batch).await?;
-                        }
-                    }
-                }
-                Ok(ResumableScanItem::Checkpoint(checkpoint)) => {
-                    // 前序条目和事件全部持久化后，才能推进游标。
-                    flush_batch(database, state, broadcaster, &mut batch).await?;
-                    state.checkpoint = checkpoint;
-                    state.observed_entries = observed;
-                    state.advance()?;
-                    database.save_resume_state(state).await?;
-                    info!(
-                        version = state.version,
-                        entries = observed,
-                        "Scan checkpoint saved in ClickHouse"
-                    );
-                    #[cfg(feature = "lab-fault-injection")]
-                    if let Ok(value) = std::env::var("TERRASYNC_LAB_SCAN_PAUSE_AFTER_CHECKPOINT_MS")
-                        && let Ok(value) = value.parse::<u64>()
-                    {
-                        sleep(Duration::from_millis(value)).await;
-                    }
-                    #[cfg(feature = "lab-fault-injection")]
-                    if std::env::var_os("TERRASYNC_LAB_SCAN_STOP_AFTER_CHECKPOINT").is_some() {
-                        cancel.cancel();
-                    }
-                }
-                Err(error) => {
-                    failure = Some(error);
-                    cancel.cancel();
-                }
-            }
-        }
-        if let Some(error) = failure {
-            return Err(error.into());
-        }
-        flush_batch(database, state, broadcaster, &mut batch).await?;
-        let outcome = scan.finish().await?;
-        match outcome {
-            TraversalOutcome::Completed(completion)
-                if completion.totals.failed_children == 0 && completion.totals.listing_failures == 0 => {}
-            _ => {
-                return Err(AppError::ScanError(
-                    "Scan paused or incomplete; checkpoint retained, generation not committed".into(),
-                ));
-            }
-        }
-        state.phase = FINALIZING;
-        state.observed_entries = observed;
-        state.advance()?;
-        database.save_resume_state(state).await?;
+        pipeline::consume(source, database, state, consumers, batch_size, cancel).await?;
     }
     if state.incremental {
-        finalize_deletions(database, state, broadcaster, batch_size).await?;
+        finalize_events(database, state, consumers, batch_size).await?;
     }
+    consumers
+        .reconcile_scan_statistics(
+            database
+                .resume_statistics(state.generation, state.incremental.then_some(state.event_time))
+                .await?,
+        )
+        .await;
+    state.statistics = consumers.statistics_checkpoint().await?;
+    state.advance()?;
+    database.save_resume_state(state).await?;
     database.commit_scan_generation().await?;
+    state.statistics = consumers.statistics_checkpoint().await?;
     state.phase = COMPLETED;
     state.checkpoint.clear();
     state.advance()?;
@@ -286,31 +273,18 @@ async fn run(
 }
 
 async fn flush_batch(
-    database: &mut ClickHouseDatabase, state: &ScanResumeState, broadcaster: &BroadcastForwarder<StorageEntryMessage>,
-    batch: &mut Vec<Arc<EntryEnum>>,
+    database: &mut ScanStore, state: &ScanResumeState, consumers: &ConsumerManager, batch: &mut Vec<Arc<ObservedEntry>>,
 ) -> Result<()> {
     if batch.is_empty() {
         return Ok(());
     }
+    // 与 base 的主键顺序一致；排序只调整本批落盘顺序，不改变检查点推进边界。
+    batch.sort_unstable_by(|a, b| a.path().as_str().cmp(b.path().as_str()));
     let mut events = Vec::new();
     if state.incremental {
         database.begin_resume_batch().await?;
-        database.write_resume_temp_records(batch).await?;
-        events.extend(
-            database
-                .detect_new_items()
-                .await?
-                .map(|entry| StorageEntryMessage::New(Arc::new(entry))),
-        );
-        events.extend(
-            database
-                .detect_changed_items()
-                .await?
-                .map(|(entry, kind)| StorageEntryMessage::Changed {
-                    entry: Arc::new(entry),
-                    kind,
-                }),
-        );
+        database.write_observations(batch, true).await?;
+        events = database.detect_resume_batch_events(batch).await?;
         database.write_resume_events(&events, state.event_time).await?;
         #[cfg(feature = "lab-fault-injection")]
         if !events.is_empty() && std::env::var_os("TERRASYNC_LAB_SCAN_FAIL_AFTER_EVENTS").is_some() {
@@ -318,56 +292,39 @@ async fn flush_batch(
                 "Lab failure after durable events, before base update".into(),
             ));
         }
-        database.insert_temp_to_base_table(&[]).await?;
+        database.merge_observations().await?;
     } else {
-        database.write_resume_base_records(batch).await?;
+        database.write_observations(batch, false).await?;
     }
-    for entry in batch.drain(..) {
-        broadcaster.broadcast(StorageEntryMessage::Scanned(entry)).await;
-    }
-    for event in events {
-        broadcaster.broadcast(event).await;
-    }
+    consumers.record_observed_events(&events).await;
+    batch.clear();
     Ok(())
 }
 
-async fn finalize_deletions(
-    database: &ClickHouseDatabase, state: &ScanResumeState, broadcaster: &BroadcastForwarder<StorageEntryMessage>,
-    batch_size: usize,
+async fn finalize_events(
+    database: &ScanStore, state: &ScanResumeState, consumers: &ConsumerManager, batch_size: usize,
 ) -> Result<()> {
-    let deleted = database.detect_deleted_items().await?;
+    let deleted = database.resolve_final_events(state.event_time).await?;
     let mut events = Vec::with_capacity(batch_size);
     for entry in deleted {
-        events.push(match entry {
-            DeletionStatus::Deleted(entry) => StorageEntryMessage::Deleted(Arc::new(entry)),
-            DeletionStatus::Renamed(from, to) => StorageEntryMessage::Renamed((Arc::new(*from), Arc::new(*to))),
-        });
+        events.push(entry);
         if events.len() >= batch_size {
-            flush_deletions(database, state, broadcaster, &mut events).await?;
+            flush_final_events(database, state, consumers, &mut events).await?;
         }
     }
-    flush_deletions(database, state, broadcaster, &mut events).await
+    flush_final_events(database, state, consumers, &mut events).await?;
+    database.cleanup_candidates(state.event_time).await?;
+    Ok(())
 }
 
-async fn flush_deletions(
-    database: &ClickHouseDatabase, state: &ScanResumeState, broadcaster: &BroadcastForwarder<StorageEntryMessage>,
-    events: &mut Vec<StorageEntryMessage>,
+async fn flush_final_events(
+    database: &ScanStore, state: &ScanResumeState, consumers: &ConsumerManager, events: &mut Vec<ScanFinalEvent>,
 ) -> Result<()> {
-    database.write_resume_events(events, state.event_time).await?;
-    let keys: Vec<(String, String)> = events
-        .iter()
-        .filter_map(|event| match event {
-            StorageEntryMessage::Deleted(entry) | StorageEntryMessage::Renamed((entry, _)) => Some((
-                entry.get_relative_path().to_string_lossy().into_owned(),
-                entry.get_version_id().unwrap_or_default().to_owned(),
-            )),
-            _ => None,
-        })
-        .collect();
+    database.write_final_events(events, state.event_time).await?;
+    let keys: Vec<_> = events.iter().filter_map(ScanFinalEvent::deletion_key).collect();
     database.delete_resume_entries(&keys).await?;
-    for event in events.drain(..) {
-        broadcaster.broadcast(event).await;
-    }
+    consumers.record_final_events(events).await;
+    events.clear();
     Ok(())
 }
 
@@ -387,4 +344,41 @@ mod tests {
         assert_ne!(key, request_key("local", "root", 0, &None, &None, true)?);
         Ok(())
     }
+}
+
+/// 清理集群中一个扫描作业的数据分区，保留共享表和其他作业。
+pub async fn clear_cluster_scan(job_id: &str) -> Result<()> {
+    let config = AppConfig::fetch()?;
+    let cluster = config
+        .database
+        .clickhouse
+        .cluster
+        .as_deref()
+        .ok_or_else(|| AppError::ConfigError("ClickHouse cluster is not configured".into()))?;
+    let db_config = DatabaseConfig::from_app_config(&config.database);
+    db::clear_cluster_scan_data(
+        db_config
+            .clickhouse
+            .as_ref()
+            .ok_or_else(|| AppError::ConfigError("ClickHouse configuration missing".into()))?,
+        cluster,
+        job_id,
+    )
+    .await?;
+    Ok(())
+}
+
+/// 根据持久化轮次识别执行类型，不能用作业目录是否存在来区分全量续扫和增量。
+pub async fn scan_execution_is_incremental(job_id: &str) -> Result<bool> {
+    let config = AppConfig::fetch()?;
+    let database = DatabaseConfig::from_app_config(&config.database);
+    let store = ScanStore::new(
+        database
+            .clickhouse
+            .as_ref()
+            .ok_or_else(|| AppError::ConfigError("ClickHouse configuration missing".into()))?,
+        config.database.clickhouse.cluster.as_deref(),
+        job_id,
+    )?;
+    Ok(store.resume_execution_is_incremental().await?)
 }

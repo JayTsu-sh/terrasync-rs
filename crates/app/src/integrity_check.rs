@@ -341,13 +341,36 @@ pub async fn integrity_check(
     job_id: String, job_dir: String, src_path: &str, dest_path: &str, quick: bool, auto_fix: bool,
     raw_command_line: String, progress_callback_url: Option<String>,
 ) -> Result<()> {
+    integrity_check_with_concurrency(
+        job_id,
+        job_dir,
+        src_path,
+        dest_path,
+        quick,
+        auto_fix,
+        raw_command_line,
+        progress_callback_url,
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn integrity_check_with_concurrency(
+    job_id: String, job_dir: String, src_path: &str, dest_path: &str, quick: bool, auto_fix: bool,
+    raw_command_line: String, progress_callback_url: Option<String>, concurrency: Option<usize>,
+) -> Result<()> {
     info!(
         "Starting integrity check between {} and {}",
         redact_storage_url(src_path),
         redact_storage_url(dest_path)
     );
 
-    let app_config = utils::app_config::AppConfig::fetch()?;
+    let mut app_config = utils::app_config::AppConfig::fetch()?;
+    if let Some(value) = concurrency {
+        app_config.scan.concurrency = value;
+        app_config.integrity_check.concurrency = value;
+    }
 
     let consumer_config = Arc::new(initialize_consumer_config(
         &job_id,

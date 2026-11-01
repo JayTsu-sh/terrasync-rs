@@ -55,6 +55,8 @@ uuid         = { version = "1", features = ["v4"] }
 dashmap      = "6.1"
 hex          = "0.4"
 blake3       = "1.8"
+smol_str     = "0.3"
+rustc-hash   = "2.1"
 
 # TLS / 加密
 rustls       = { version = "0.23", default-features = false, features = ["ring", "std"] }

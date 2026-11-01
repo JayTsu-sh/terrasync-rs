@@ -108,6 +108,10 @@ pub struct TaskConfig {
     pub block_size: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub iops: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub concurrency: Option<usize>,
+    #[serde(default)]
+    pub reset_scan_on_start: bool,
 }
 
 fn default_peak_qos_rate() -> f32 {
@@ -126,6 +130,8 @@ impl Default for TaskConfig {
             peak_qos_rate: 2.0,
             block_size: None,
             iops: None,
+            concurrency: None,
+            reset_scan_on_start: false,
         }
     }
 }
@@ -159,4 +165,16 @@ pub struct MigrationTask {
 pub struct TaskFilter {
     pub status: Option<TaskStatus>,
     pub task_type: Option<TaskType>,
+}
+
+#[cfg(test)]
+mod config_tests {
+    use super::*;
+    #[test]
+    fn concurrency_survives_config_roundtrip() -> Result<(), serde_json::Error> {
+        let config: TaskConfig = serde_json::from_value(serde_json::json!({"concurrency":32,"depth":3}))?;
+        let saved = serde_json::to_value(&config)?;
+        assert_eq!(saved.get("concurrency"), Some(&serde_json::json!(32)));
+        Ok(())
+    }
 }

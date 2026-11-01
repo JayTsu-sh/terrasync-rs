@@ -4,6 +4,7 @@ use storage_adapter::TransferMode;
 
 // 外部crate
 use db::config::DatabaseConfig;
+use serde::{Deserialize, Serialize};
 use storage_adapter::filter::{FilterExpression, parse_filter_expression};
 use storage_adapter::redact_storage_url;
 use tracing::{debug, info};
@@ -23,7 +24,7 @@ pub fn redact_command_line(command: &str) -> String {
         .join(" ")
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum JobType {
     Scan,
     IncrementalScan, // 增量扫描
@@ -130,6 +131,7 @@ pub struct SyncJobConfig {
     /// （目标端存在但源端已不存在的条目）。本地模式的孤儿清理由 DB diff 驱动、
     /// 无条件执行，不受此字段影响（两套机制并存但互不干扰）。
     pub delete_target: bool,
+    pub concurrency: Option<usize>,
 }
 
 /// 初始化扫描配置

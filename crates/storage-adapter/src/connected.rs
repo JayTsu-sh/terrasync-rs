@@ -6,8 +6,8 @@ use crate::{
     *,
 };
 use data_mover::storage::{
-    BackendConfig as NativeBackendConfig, CifsBackendConfig, CopiedAclTarget, HdfsBackendConfig, LocalBackendConfig,
-    NfsBackendConfig, S3BackendConfig, StorageRoleFailure,
+    BackendConfig as NativeBackendConfig, CifsBackendConfig, CopiedAclTarget, HdfsBackendConfig, ListRequest,
+    LocalBackendConfig, NfsBackendConfig, S3BackendConfig, StorageRoleFailure,
 };
 use data_mover::{
     TransferConcurrency,
@@ -20,6 +20,7 @@ use data_mover::{
     storage::{self, CopiedOwnershipTarget, CopiedTimestampTarget, MetadataMutation, Storage},
     transfer::{self, ReadBackVerification, TransferPolicy, TransferRequest},
 };
+use futures::StreamExt;
 #[cfg(unix)]
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 #[cfg(windows)]
@@ -31,6 +32,10 @@ use std::{
 };
 use tokio::fs::create_dir_all;
 use tokio_util::sync::CancellationToken;
+
+#[cfg(test)]
+#[path = "connected_tests.rs"]
+mod tests;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StorageType {
@@ -205,6 +210,17 @@ impl ConnectedStorage {
         Ok(self.roles.staged_destination()?.keeps_history().await?)
     }
     pub async fn check_connectivity(&self) -> Result<()> {
+        // 当前 NFS 角色拒绝根路径 stat；使用与扫描相同的只读枚举验证真实访问。
+        // 只读取一小页，取消剩余分页，避免测试连接遍历整个共享目录。
+        if self.roles.kind() == BackendKind::Nfs {
+            let cancel = CancellationToken::new();
+            let request = ListRequest::new(StoragePath::root(), cancel.clone())
+                .with_page_hint(NonZeroUsize::MIN.saturating_add(15));
+            let mut listing = self.roles.namespace()?.list(request);
+            let result = listing.next().await.transpose().map(|_| ()).map_err(StorageError::from);
+            cancel.cancel();
+            return result;
+        }
         check_connectivity(&self.roles).await.map_err(StorageError::from)
     }
     pub async fn probe_server_time(&self) -> Result<Option<i64>> {

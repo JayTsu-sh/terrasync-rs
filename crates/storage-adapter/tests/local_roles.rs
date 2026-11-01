@@ -43,11 +43,9 @@ async fn opaque_scan_checkpoint_survives_reconnection_without_skipping_entries()
     let mut saved = None;
     while let Some(item) = scan.next().await {
         match item? {
-            ResumableScanItem::Entries(entries) => seen.extend(
-                entries
-                    .iter()
-                    .map(|entry| entry.get_relative_path().to_string_lossy().into_owned()),
-            ),
+            ResumableScanItem::Entry(entry) => {
+                seen.insert(entry.path().as_str().to_owned());
+            }
             ResumableScanItem::Checkpoint(bytes) if !seen.is_empty() => {
                 saved = Some(bytes);
                 break;
@@ -66,12 +64,8 @@ async fn opaque_scan_checkpoint_survives_reconnection_without_skipping_entries()
         Duration::ZERO,
     )?;
     while let Some(item) = resumed.next().await {
-        if let ResumableScanItem::Entries(entries) = item? {
-            seen.extend(
-                entries
-                    .iter()
-                    .map(|entry| entry.get_relative_path().to_string_lossy().into_owned()),
-            );
+        if let ResumableScanItem::Entry(entry) = item? {
+            seen.insert(entry.path().as_str().to_owned());
         }
     }
     assert!(matches!(

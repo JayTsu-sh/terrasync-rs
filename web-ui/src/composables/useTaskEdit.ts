@@ -27,7 +27,13 @@ export function useTaskEdit() {
     block_size: '',
     iops: undefined as number | undefined,
     concurrency: 8,
+    depth: 0,
   })
+
+  const originalConfig = ref<TaskConfig>({})
+  const originalSource = ref<string | null>(null)
+  let originalIncludes = ''
+  let originalExcludes = ''
 
   const includeGroups = ref<ConditionGroup[]>([])
   const excludeGroups = ref<ConditionGroup[]>([])
@@ -50,6 +56,8 @@ export function useTaskEdit() {
   const sourcePlaceholder = computed(() => (form.value.task_type === 'scan' ? '选择扫描目标' : '选择源迁移目标'))
 
   function populateForm(task: MigrationTask) {
+    originalConfig.value = { ...task.config }
+    originalSource.value = task.source_endpoint_id
     form.value = {
       name: task.name,
       task_type: task.task_type,
@@ -60,9 +68,12 @@ export function useTaskEdit() {
       block_size: task.config.block_size || '',
       iops: task.config.iops,
       concurrency: task.config.concurrency ?? 8,
+      depth: task.config.depth ?? 0,
     }
     includeGroups.value = deserializeConditionGroups(task.config.match_expr || '')
     excludeGroups.value = deserializeConditionGroups(task.config.exclude_expr || '')
+    originalIncludes = JSON.stringify(includeGroups.value)
+    originalExcludes = JSON.stringify(excludeGroups.value)
   }
 
   async function fetchData() {
@@ -75,10 +86,16 @@ export function useTaskEdit() {
     if (!form.value.name) throw new ValidationError('请填写任务名称')
     if (!form.value.source_endpoint_id) throw new ValidationError('请选择源端点')
 
-    const matchExpr = showFilter.value ? serializeConditionGroups(includeGroups.value) : ''
-    const excludeExpr = showFilter.value ? serializeConditionGroups(excludeGroups.value) : ''
+    const matchExpr = JSON.stringify(includeGroups.value) === originalIncludes
+      ? originalConfig.value.match_expr || ''
+      : showFilter.value ? serializeConditionGroups(includeGroups.value) : ''
+    const excludeExpr = JSON.stringify(excludeGroups.value) === originalExcludes
+      ? originalConfig.value.exclude_expr || ''
+      : showFilter.value ? serializeConditionGroups(excludeGroups.value) : ''
 
     const config: TaskConfig = {
+      ...originalConfig.value,
+      depth: form.value.depth ?? 0,
       match_expr: matchExpr || undefined,
       exclude_expr: excludeExpr || undefined,
       enable_integrity_check: form.value.enable_integrity_check,
@@ -93,6 +110,7 @@ export function useTaskEdit() {
       return await updateTask(taskId, {
         name: form.value.name,
         source_endpoint_id: form.value.source_endpoint_id!,
+        ...(form.value.source_endpoint_id !== originalSource.value ? { source_path_id: '' } : {}),
         config,
       })
     } finally {

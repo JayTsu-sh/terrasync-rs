@@ -11,6 +11,7 @@ use std::sync::{Arc, Mutex as StdMutex, OnceLock, Weak};
 // 外部crate
 use async_trait::async_trait;
 use clickhouse::Client;
+use clickhouse::error::Error as ClickHouseError;
 use data_mover::model::ObservedEntry;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -36,6 +37,8 @@ use crate::{
 use utils::sanitize_job_id;
 
 pub mod scan_resume;
+mod scan_resume_batch;
+pub mod scan_resume_statistics;
 
 /// `ClickHouse`数据库实现
 ///
@@ -51,6 +54,8 @@ pub struct ClickHouseDatabase {
     pub scan_temp_table_name: Option<String>,
     /// 缓存的 `scan_state` 值（255 = 未缓存），避免每次 `batch_insert` 都查询数据库
     cached_scan_state: AtomicU8,
+    /// 每次扫描实例只检查一次旧基线的身份格式，避免每批全表统计。
+    resume_base_has_typed_handles: Option<bool>,
     /// 同一 `ClickHouse` 身份与 job 共享的 scan generation 生命周期
     generation_lifecycle: Arc<Mutex<ScanGenerationLifecycle>>,
 }
@@ -153,7 +158,7 @@ pub(crate) const FILE_SCAN_COLUMNS_DEFINITION: &str = file_scan_base_columns!();
 ///
 /// 定义了存储文件增量扫描结果的表结构，包含操作类型、文件路径、大小、扩展名、时间戳、权限等信息。
 /// 增量扫描表使用此结构定义。
-const FILE_INCREMENTAL_SCAN_COLUMNS_DEFINITION: &str = file_scan_base_columns!(
+pub(crate) const FILE_INCREMENTAL_SCAN_COLUMNS_DEFINITION: &str = file_scan_base_columns!(
     r#"
     operation_type String,
 "#,
@@ -310,7 +315,7 @@ fn records_to_entry_iter(records: Vec<StorageEntryRecord>) -> Box<dyn Iterator<I
 }
 
 /// 构建基础 `ClickHouse` 客户端（含 url/database/username/password）
-fn build_base_client(config: &ClickHouseConfig) -> Client {
+pub(crate) fn build_base_client(config: &ClickHouseConfig) -> Client {
     let mut client = Client::default()
         .with_url(&config.dsn)
         .with_database(config.database.clone())
@@ -335,6 +340,7 @@ impl ClickHouseDatabase {
             job_id: job_id.to_string(),
             scan_temp_table_name: None,
             cached_scan_state: AtomicU8::new(255),
+            resume_base_has_typed_handles: None,
             generation_lifecycle: shared_generation_lifecycle(config, job_id),
         }
     }
@@ -593,13 +599,44 @@ impl ClickHouseDatabase {
     pub async fn create_scan_state_table(&self) -> Result<()> {
         let table_name = get_scan_state_table_name(&self.job_id);
         let create_table_sql = format!(
-            "CREATE TABLE IF NOT EXISTS {table_name} (id UInt8, scan_state UInt8) ENGINE = ReplacingMergeTree() ORDER BY id"
+            "CREATE TABLE IF NOT EXISTS {table_name} (id UInt8, scan_state UInt8, baseline_committed Bool DEFAULT true) ENGINE = ReplacingMergeTree() ORDER BY id"
         );
 
         info!("Creating ClickHouse scan state table: {}", table_name);
         self.execute(&create_table_sql, &[]).await?;
+        self.ensure_baseline_committed_column().await?;
 
         Ok(())
+    }
+
+    async fn ensure_baseline_committed_column(&self) -> Result<()> {
+        let table = get_scan_state_table_name(&self.job_id);
+        // 兼容旧状态行的已有基线；新任务在首次成功提交前显式写入 false。
+        self.execute(
+            &format!("ALTER TABLE {table} ADD COLUMN IF NOT EXISTS baseline_committed Bool DEFAULT true"),
+            &[],
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// 建表不代表首次全量已完成，只有成功提交代次才发布基线。
+    pub async fn has_committed_baseline(&self) -> Result<bool> {
+        let table = get_scan_state_table_name(&self.job_id);
+        if !self.check_table_exists(&table).await? {
+            return Ok(false);
+        }
+        self.ensure_baseline_committed_column().await?;
+        match self
+            .sync_client
+            .query(&format!("SELECT baseline_committed FROM {table} FINAL WHERE id=1"))
+            .fetch_one::<bool>()
+            .await
+        {
+            Ok(committed) => Ok(committed),
+            Err(ClickHouseError::RowNotFound) => Ok(false),
+            Err(error) => Err(error.into()),
+        }
     }
 
     /// 创建增量扫描表（按 `operation_type` + `relative_path` + `create_at` 排序）
@@ -690,7 +727,7 @@ impl ClickHouseDatabase {
 
         match self.sync_client.query(&query).fetch_one::<u8>().await {
             Ok(scan_state) => Ok(Some(scan_state)),
-            Err(clickhouse::error::Error::RowNotFound) => Ok(None),
+            Err(ClickHouseError::RowNotFound) => Ok(None),
             Err(e) => Err(DatabaseError::QueryError(format!(
                 "Failed to query scan_state table: {e}"
             ))),
@@ -714,8 +751,13 @@ impl ClickHouseDatabase {
 
     /// 插入或更新扫描状态（id=1，利用 `ReplacingMergeTree` 自动去重）
     pub async fn insert_scan_state(&self, scan_state: u8) -> Result<()> {
+        self.ensure_baseline_committed_column().await?;
+        self.insert_scan_state_with_baseline(scan_state, true).await
+    }
+
+    async fn insert_scan_state_with_baseline(&self, scan_state: u8, baseline_committed: bool) -> Result<()> {
         let table_name = get_scan_state_table_name(&self.job_id);
-        let insert_sql = format!("INSERT INTO {table_name} (id, scan_state) VALUES (?, ?)");
+        let insert_sql = format!("INSERT INTO {table_name} (id, scan_state, baseline_committed) VALUES (?, ?, ?)");
 
         debug!("Inserting scan state: id=1, scan_state={}", scan_state);
 
@@ -723,6 +765,7 @@ impl ClickHouseDatabase {
             .query(&insert_sql)
             .bind(1u8)
             .bind(scan_state)
+            .bind(baseline_committed)
             .execute()
             .await
             .map_err(DatabaseError::ClickHouseError)?;
@@ -903,6 +946,7 @@ impl Database for ClickHouseDatabase {
             job_id: self.job_id.clone(),
             scan_temp_table_name: self.scan_temp_table_name.clone(),
             cached_scan_state: AtomicU8::new(self.cached_scan_state.load(Ordering::Relaxed)),
+            resume_base_has_typed_handles: self.resume_base_has_typed_handles,
             generation_lifecycle: Arc::clone(&self.generation_lifecycle),
         };
 
@@ -914,7 +958,7 @@ impl Database for ClickHouseDatabase {
         self.create_table(SCAN_BASE_TABLE_BASE_NAME).await?;
         self.create_table(SCAN_STATE_TABLE_BASE_NAME).await?;
         if self.query_scan_state().await?.is_none() {
-            self.insert_scan_state(0).await?;
+            self.insert_scan_state_with_baseline(0, false).await?;
         }
         Ok(())
     }
@@ -1880,3 +1924,8 @@ mod tests {
         ));
     }
 }
+
+mod native;
+
+#[cfg(test)]
+mod baseline_tests;

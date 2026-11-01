@@ -252,6 +252,7 @@ pub async fn sync_cmd(
         progress_callback_url: None,
         transfer_mode: TransferMode::from_flags(resume, in_place),
         delete_target,
+        concurrency: None,
     };
 
     // 双进程模式：通过 QUIC 连接远端 Receiver

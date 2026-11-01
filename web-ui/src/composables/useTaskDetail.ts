@@ -47,7 +47,7 @@ export function useTaskDetail(id: string, options?: TaskDetailOptions) {
       const exec = executions.value.find((e) => e.id === expandedExecutionId.value)
       return exec?.stats || null
     }
-    const completed = executions.value.findLast((e) => e.status === 'completed' && e.stats)
+    const completed = executions.value.find((e) => e.stats)
     return completed?.stats || null
   })
   const taskTypeLabel = computed(() => {
@@ -73,7 +73,7 @@ export function useTaskDetail(id: string, options?: TaskDetailOptions) {
         if (prevStatus === 'running') {
           executions.value = await listExecutions(id)
           // 任务刚完成，自动跳转到最新执行的报告
-          const latestWithStats = executions.value.findLast((e) => e.stats)
+          const latestWithStats = executions.value.find((e) => e.stats)
           if (latestWithStats) expandedExecutionId.value = latestWithStats.id
           if (task.value.status === 'completed') loadAnalytics()
         }
@@ -254,7 +254,7 @@ export function useTaskDetail(id: string, options?: TaskDetailOptions) {
 
     // 页面加载时自动展开最新有 stats 的执行
     if (!expandedExecutionId.value) {
-      const latestWithStats = execs.findLast((e) => e.stats)
+      const latestWithStats = execs.find((e) => e.stats)
       if (latestWithStats) expandedExecutionId.value = latestWithStats.id
     }
 

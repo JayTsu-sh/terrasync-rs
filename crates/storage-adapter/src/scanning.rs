@@ -5,7 +5,7 @@ use crate::{dir_tree::*, error::operation, *};
 use chrono::NaiveDate;
 use data_mover::{
     DslTraversalFilter,
-    model::{EntryKind, EntryOperationFailure, MetadataObservations, MetadataRequirements},
+    model::{EntryKind, EntryOperationFailure, MetadataObservations, MetadataRequirements, ObservedEntry},
     storage::{
         DeleteTreeItem, DeleteTreeOutcome, DeleteTreeRequest, DeleteTreeTerminalFailure, StorageRoleFailure,
         delete_tree,
@@ -60,8 +60,7 @@ impl ConnectedStorage {
         }
         Ok(ResumableScan {
             session: StorageTraversalSource::new(&self.roles)?.traverse(request),
-            connected: self.clone(),
-            histories: HistoryProjection::default(),
+            history: None,
         })
     }
     pub async fn walkdir(&self, sub: Option<&Path>, options: WalkOptions) -> Result<WalkDirAsyncIterator> {
@@ -364,14 +363,13 @@ enum DeleteEventFailure {
 
 /// 按交付顺序返回产品条目及其 opaque 遍历检查点。
 pub enum ResumableScanItem {
-    Entries(Vec<EntryEnum>),
+    Entry(Box<ObservedEntry>),
     Checkpoint(Vec<u8>),
 }
 
 pub struct ResumableScan {
     session: TraversalSession,
-    connected: ConnectedStorage,
-    histories: HistoryProjection,
+    history: Option<(String, u32)>,
 }
 
 impl ResumableScan {
@@ -379,14 +377,21 @@ impl ResumableScan {
         while let Some(item) = self.session.next_item().await {
             match item {
                 TraversalItem::Entry(entry) => {
-                    match self.connected.project_history(&entry, &mut self.histories).await {
-                        Ok(entries) if entries.is_empty() => continue,
-                        Ok(entries) => return Some(Ok(ResumableScanItem::Entries(entries))),
-                        Err(error) => return Some(Err(error)),
+                    if let Some(history) = entry.history() {
+                        let expected = self.history.get_or_insert_with(|| (entry.path().as_str().into(), 0));
+                        if expected.0 != entry.path().as_str() || expected.1 != history.segment() {
+                            return Some(Err(operation("out-of-order object history")));
+                        }
+                        expected.1 = expected.1.saturating_add(1);
+                        if history.is_complete() {
+                            self.history = None;
+                        }
+                    } else if self.history.is_some() {
+                        return Some(Err(operation("interrupted object history")));
                     }
+                    return Some(Ok(ResumableScanItem::Entry(entry)));
                 }
-                // 尚未完成的历史记录还未交给持久化 sink。
-                TraversalItem::Checkpoint(checkpoint) if self.histories.is_complete() => {
+                TraversalItem::Checkpoint(checkpoint) if self.history.is_none() => {
                     return Some(Ok(ResumableScanItem::Checkpoint(checkpoint.as_bytes().to_vec())));
                 }
                 TraversalItem::Failure(failure) => {
@@ -407,7 +412,7 @@ impl ResumableScan {
     }
 
     pub async fn finish(self) -> Result<TraversalOutcome> {
-        if !self.histories.is_complete() {
+        if self.history.is_some() {
             return Err(operation("scan ended with an incomplete version history"));
         }
         self.session.finish().await.map_err(StorageError::from)

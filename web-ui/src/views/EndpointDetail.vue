@@ -1,6 +1,6 @@
 <script setup lang="ts">
-import { computed, onMounted } from 'vue'
-import { useRoute } from 'vue-router'
+import { computed, defineAsyncComponent, onMounted } from 'vue'
+import { useRoute, useRouter } from 'vue-router'
 import { NButton, NTag, useMessage } from 'naive-ui'
 import BackLink from '../components/BackLink.vue'
 import ScanAnalysis from '../components/ScanAnalysis.vue'
@@ -8,8 +8,10 @@ import EditEndpointModal from '../components/EditEndpointModal.vue'
 import { useEndpointDetail } from '../composables/useEndpointDetail'
 
 const route = useRoute()
+const router = useRouter()
 const id = route.params.id as string
 const message = useMessage()
+const StorageExplorer = defineAsyncComponent(() => import('../components/StorageExplorer.vue'))
 
 const {
   endpoint,
@@ -125,7 +127,7 @@ async function onScan() {
 async function onCancelScan() {
   try {
     await handleCancelScan()
-    message.success('已发送取消请求')
+    message.success('已发送取消请求，扫描进度会保留')
   } catch (e: any) {
     message.error(e.message || '取消扫描失败')
   }
@@ -156,10 +158,18 @@ onMounted(loadData)
           <div class="text-xs text-gray-400 mt-1">{{ timeDisplay }}</div>
         </div>
         <div class="flex items-center gap-2">
+          <NButton
+            v-if="latestScanTask && !['pending', 'running'].includes(latestScanTask.status)"
+            size="small"
+            @click="router.push({ path: '/analysis', query: { task: latestScanTask.id } })"
+            >数据分析</NButton
+          >
           <NButton v-if="isScanning" type="error" size="small" :loading="cancelling" @click="onCancelScan"
             >取消扫描</NButton
           >
-          <NButton v-else type="primary" size="small" :loading="scanning" @click="onScan">扫描启动</NButton>
+          <NButton v-else type="primary" size="small" :loading="scanning" @click="onScan">{{
+            latestScanTask && ['cancelled', 'failed'].includes(latestScanTask.status) ? '继续扫描' : '启动扫描'
+          }}</NButton>
           <NButton size="small" @click="showEditModal = true">编辑</NButton>
           <NButton size="small" @click="onTest">测试连接</NButton>
         </div>
@@ -180,6 +190,14 @@ onMounted(loadData)
         </div>
       </div>
     </div>
+
+    <!-- 完成扫描后直接呈现目录探索，入口不再仅藏于任务标签。 -->
+    <StorageExplorer
+      v-if="latestScanTask?.task_type === 'scan' && latestScanTask.status === 'completed'"
+      :key="`${latestScanTask.id}:${latestScanTask.finished_at}`"
+      :task-id="latestScanTask.id"
+      class="mb-5"
+    />
 
     <!-- Scan Analysis -->
     <div v-if="latestScanTask" class="bg-white border border-gray-200 rounded-lg shadow-sm overflow-hidden">
