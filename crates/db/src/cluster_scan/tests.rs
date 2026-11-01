@@ -7,6 +7,7 @@ use data_mover::model::{
 };
 use storage_adapter::ChangeKind;
 use storage_adapter::observed_scan::ObservedScanEvent;
+use tokio::{sync::Barrier, task::JoinSet};
 
 struct DatabaseGuard {
     config: ClickHouseConfig,
@@ -485,6 +486,55 @@ async fn apply_native_key_batch(store: &mut ClusterScanStore, entries: &[Arc<Obs
     let events = store.compare_native(entries).await?;
     store.events_native(&events, time).await?;
     store.write_native(entries, false).await
+}
+
+#[tokio::test]
+#[ignore = "requires a real multi-shard ClickHouse cluster"]
+async fn cluster_native_parallel_unchanged_batches_never_create_candidates() -> Result<()> {
+    let (config, _admin, _guard, cluster, epoch) = fixture().await?;
+    let store = ClusterScanStore::new(&config, &cluster, "parallel_unchanged")?;
+    store.load_resume_state().await?;
+    store.save_resume_state(&state(epoch, false, 1)).await?;
+    let entries = (0..40_000)
+        .map(|index| {
+            let key = format!("path/{index:08}");
+            native_entry(&key, 17, Some(key.as_bytes()))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    store.write_native(&entries, false).await?;
+    store.commit_scan_generation().await?;
+    store.save_resume_state(&state(epoch + 10, true, 0)).await?;
+    let barrier = Arc::new(Barrier::new(4));
+    let mut workers: JoinSet<Result<()>> = JoinSet::new();
+    for worker in 0..4 {
+        let mut writer = store.batch_writer();
+        let entries: Vec<_> = entries.iter().skip(worker).step_by(4).cloned().collect();
+        let barrier = Arc::clone(&barrier);
+        workers.spawn(async move {
+            for round in 0..64 {
+                // 每次写入独立 epoch，避免服务端幂等去重使并发压力退化为空写入。
+                writer
+                    .epoch
+                    .store(epoch as u64 + 20 + round * 4 + worker as u64, Ordering::Relaxed);
+                writer.begin_resume_batch().await?;
+                writer.write_native_keys(&entries).await?;
+                barrier.wait().await;
+                let events = writer.compare_native(&entries).await?;
+                assert!(
+                    events.is_empty(),
+                    "unchanged batch produced {} events in worker {worker}, round {round}",
+                    events.len()
+                );
+                writer.write_native(&entries, false).await?;
+            }
+            Ok(())
+        });
+    }
+    while let Some(worker) = workers.join_next().await {
+        worker??;
+    }
+    store.cleanup_resume_batch().await?;
+    Ok(())
 }
 
 #[tokio::test]
