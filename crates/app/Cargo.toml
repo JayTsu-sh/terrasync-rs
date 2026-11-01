@@ -21,6 +21,7 @@ db            = { workspace = true }
 futures       = { workspace = true }
 indicatif     = "0.18.4"
 reqwest       = { workspace = true }
+rustc-hash    = { workspace = true }
 licensing     = { workspace = true, optional = true }
 bincode       = { workspace = true }
 serde         = { workspace = true }

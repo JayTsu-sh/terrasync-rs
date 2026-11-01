@@ -45,22 +45,54 @@ pub struct ConsumerManager {
     callback_guard: Option<CallbackGuard>,
 }
 
-impl ConsumerManager {
-    pub async fn record_observations(&self, entries: &[Arc<ObservedEntry>]) {
-        if let Some(sc) = &self.stats_consumer {
+/// 扫描工作任务共享统计状态，不持有生命周期守卫或其他消费者。
+#[derive(Clone)]
+pub(crate) struct ScanStatistics {
+    inner: Option<Arc<Mutex<StatisticConsumer>>>,
+}
+
+impl ScanStatistics {
+    pub(crate) async fn record_observed_events(&self, events: &[ObservedScanEvent]) {
+        if let Some(sc) = &self.inner {
+            let mut sc = sc.lock().await;
+            for event in events {
+                sc.update_observed_event(event);
+            }
+        }
+    }
+
+    pub(crate) async fn record_observations(&self, entries: &[Arc<ObservedEntry>]) {
+        if let Some(sc) = &self.inner {
             let mut sc = sc.lock().await;
             for entry in entries {
                 sc.update_observed_entry(entry);
             }
         }
     }
-    pub async fn record_observed_events(&self, events: &[ObservedScanEvent]) {
-        if let Some(sc) = &self.stats_consumer {
-            let mut sc = sc.lock().await;
-            for event in events {
-                sc.update_observed_event(event);
+
+    pub(crate) async fn statistics_checkpoint(&self) -> Result<String> {
+        match &self.inner {
+            Some(sc) => {
+                let sc = sc.lock().await;
+                Ok(serde_json::to_string(&(&sc.stats, sc.to_report(false)))?)
             }
+            None => Ok(String::new()),
         }
+    }
+}
+
+impl ConsumerManager {
+    pub(crate) fn scan_statistics(&self) -> ScanStatistics {
+        ScanStatistics {
+            inner: self.stats_consumer.clone(),
+        }
+    }
+
+    pub async fn record_observations(&self, entries: &[Arc<ObservedEntry>]) {
+        self.scan_statistics().record_observations(entries).await;
+    }
+    pub async fn record_observed_events(&self, events: &[ObservedScanEvent]) {
+        self.scan_statistics().record_observed_events(events).await;
     }
     pub async fn record_final_events(&self, events: &[ScanFinalEvent]) {
         if let Some(sc) = &self.stats_consumer {
@@ -226,13 +258,7 @@ impl ConsumerManager {
     }
 
     pub async fn statistics_checkpoint(&self) -> Result<String> {
-        match &self.stats_consumer {
-            Some(sc) => {
-                let sc = sc.lock().await;
-                Ok(serde_json::to_string(&(&sc.stats, sc.to_report(false)))?)
-            }
-            None => Ok(String::new()),
-        }
+        self.scan_statistics().statistics_checkpoint().await
     }
 
     pub async fn restore_statistics(&self, saved: &str) -> Result<()> {

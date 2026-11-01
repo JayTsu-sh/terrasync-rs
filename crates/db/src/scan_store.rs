@@ -71,6 +71,17 @@ macro_rules! delegate {
     )*};
 }
 impl ScanStore {
+    /// 集群批次独享临时分区，连接池与扫描轮次共享；单机保留串行兼容路径。
+    pub fn batch_writer(&self) -> Option<Self> {
+        match &self.inner {
+            Store::Cluster(store) => Some(Self {
+                inner: Store::Cluster(store.batch_writer()),
+                job_id: self.job_id.clone(),
+            }),
+            Store::Single(_) => None,
+        }
+    }
+
     pub fn new(config: &ClickHouseConfig, cluster: Option<&str>, job_id: &str) -> Result<Self> {
         let inner = match cluster.filter(|value| !value.is_empty()) {
             Some(cluster) => Store::Cluster(ClusterScanStore::new(config, cluster, job_id)?),
@@ -123,6 +134,12 @@ impl ScanStore {
         match &self.inner {
             Store::Single(store) => store.write_native(entries, temporary).await,
             Store::Cluster(store) => store.write_native(entries, temporary).await,
+        }
+    }
+    pub async fn write_observation_keys(&self, entries: &[Arc<ObservedEntry>]) -> Result<()> {
+        match &self.inner {
+            Store::Single(store) => store.write_native_keys(entries).await,
+            Store::Cluster(store) => store.write_native_keys(entries).await,
         }
     }
     pub async fn write_resume_events(&self, events: &[ObservedScanEvent], time: i64) -> Result<()> {

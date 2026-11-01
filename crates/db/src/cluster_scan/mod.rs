@@ -5,6 +5,7 @@ use std::future::Future;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use tokio::sync::Mutex;
 use tokio::time::sleep;
 
 use clickhouse::Client;
@@ -33,6 +34,18 @@ mod compare;
 mod record;
 mod statistics;
 
+static NEXT_BATCH_ID: AtomicU64 = AtomicU64::new(0);
+
+fn next_batch_id() -> Result<u64> {
+    let now = u64::try_from(SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos())?;
+    let previous = NEXT_BATCH_ID
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |previous| {
+            previous.checked_add(1).map(|next| next.max(now))
+        })
+        .map_err(|_| DatabaseError::ConversionError("Scan batch identifier overflow".into()))?;
+    Ok(now.max(previous + 1))
+}
+
 pub(crate) struct ClusterScanStore {
     client: Client,
     cluster: String,
@@ -41,6 +54,15 @@ pub(crate) struct ClusterScanStore {
     epoch: AtomicU64,
     generation: AtomicU8,
     batch_id: u64,
+    writes: Arc<NativeWriteGates>,
+}
+
+/// 同一作业内的顺序 quorum 写入按表协调，避免并行 worker 重传整批数据。
+#[derive(Default)]
+struct NativeWriteGates {
+    base: Mutex<()>,
+    temporary: Mutex<()>,
+    events: Mutex<()>,
 }
 
 #[derive(Serialize, Deserialize, clickhouse::Row)]
@@ -89,6 +111,19 @@ where
 }
 
 impl ClusterScanStore {
+    pub(crate) fn batch_writer(&self) -> Self {
+        Self {
+            client: self.client.clone(),
+            cluster: self.cluster.clone(),
+            database: self.database.clone(),
+            job_id: self.job_id.clone(),
+            epoch: AtomicU64::new(self.epoch.load(Ordering::Relaxed)),
+            generation: AtomicU8::new(self.generation.load(Ordering::Relaxed)),
+            batch_id: 0,
+            writes: Arc::clone(&self.writes),
+        }
+    }
+
     pub(crate) fn new(config: &ClickHouseConfig, cluster: &str, job_id: &str) -> Result<Self> {
         identifier(cluster)?;
         identifier(&config.database)?;
@@ -112,6 +147,7 @@ impl ClusterScanStore {
             epoch: AtomicU64::new(0),
             generation: AtomicU8::new(0),
             batch_id: 0,
+            writes: Arc::new(NativeWriteGates::default()),
         })
     }
 
@@ -458,7 +494,7 @@ impl ClusterScanStore {
 
     pub(crate) async fn begin_resume_batch(&mut self) -> Result<()> {
         self.drop_batch().await?;
-        self.batch_id = u64::try_from(SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos())?;
+        self.batch_id = next_batch_id()?;
         Ok(())
     }
     #[cfg(test)]
