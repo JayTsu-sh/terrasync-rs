@@ -36,6 +36,7 @@ use crate::{
 };
 use utils::sanitize_job_id;
 
+pub(crate) mod replica_read;
 pub mod scan_resume;
 mod scan_resume_batch;
 pub mod scan_resume_statistics;

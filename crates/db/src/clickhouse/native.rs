@@ -1,6 +1,6 @@
 use super::*;
 use crate::native_scan::NativeScanAccess;
-use crate::native_scan_record::{NativeScanRecord, OBSERVED_COLUMNS, event_records};
+use crate::native_scan_record::{NativeScanKey, NativeScanRecord, OBSERVED_COLUMNS, event_records};
 use crate::native_scan_record::{final_event_records, incremental_record};
 use crate::scan_store::ScanFinalEvent;
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -8,6 +8,22 @@ use smol_str::SmolStr;
 use storage_adapter::observed_scan::{ObservedScanEvent, ObservedView};
 
 impl ClickHouseDatabase {
+    pub(crate) async fn write_native_keys(&self, entries: &[Arc<ObservedEntry>]) -> Result<()> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+        let access = self.native_access().await?;
+        let client = self.sync_client.clone().with_validation(false);
+        let mut insert = client.insert::<NativeScanKey>(&access.stage).await?;
+        for entry in entries {
+            for view in ObservedView::all(entry) {
+                insert.write(&NativeScanKey::capture(view)).await?;
+            }
+        }
+        insert.end().await?;
+        Ok(())
+    }
+
     async fn native_access(&self) -> Result<NativeScanAccess<'_>> {
         Ok(NativeScanAccess {
             client: &self.sync_client,

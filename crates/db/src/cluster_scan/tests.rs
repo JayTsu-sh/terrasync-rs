@@ -7,6 +7,7 @@ use data_mover::model::{
 };
 use storage_adapter::ChangeKind;
 use storage_adapter::observed_scan::ObservedScanEvent;
+use tokio::{sync::Barrier, task::JoinSet};
 
 struct DatabaseGuard {
     config: ClickHouseConfig,
@@ -397,6 +398,251 @@ fn native_entry(path: &str, size: u64, stable: Option<&[u8]>) -> Result<Arc<Obse
         None,
         identity,
     )?))
+}
+
+#[tokio::test]
+#[ignore = "requires a real multi-shard ClickHouse cluster"]
+async fn cluster_native_key_stage_replays_events_before_direct_base_write() -> Result<()> {
+    let (config, _admin, _guard, cluster, epoch) = fixture().await?;
+    let mut store = ClusterScanStore::new(&config, &cluster, "native_keys")?;
+    store.load_resume_state().await?;
+    let mut full = state(epoch, false, 1);
+    store.save_resume_state(&full).await?;
+    store
+        .write_native(
+            &[
+                native_entry("same", 10, None)?,
+                native_entry("changed", 20, None)?,
+                native_entry("old", 30, Some(b"rename"))?,
+            ],
+            false,
+        )
+        .await?;
+    full.phase = FINALIZING;
+    full.version += 1;
+    store.save_resume_state(&full).await?;
+    store.commit_scan_generation().await?;
+    let incremental = state(epoch + 10, true, 0);
+    store.save_resume_state(&incremental).await?;
+    let entries = vec![
+        native_entry("same", 10, None)?,
+        native_entry("changed", 21, None)?,
+        native_entry("added", 1, None)?,
+        native_entry("renamed", 30, Some(b"rename"))?,
+    ];
+    store.begin_resume_batch().await?;
+    store.write_native_keys(&entries).await?;
+    let snapshots: u64 = store
+        .client
+        .query("SELECT sum(length(entry_snapshot)) FROM scan_resume_batch WHERE job_id='native_keys'")
+        .fetch_one()
+        .await?;
+    assert_eq!(snapshots, 0);
+    let events = store.compare_native(&entries).await?;
+    assert_eq!(events.len(), 3);
+    store.events_native(&events, incremental.event_time).await?;
+    let old_size: u64 = store
+        .client
+        .query("SELECT size FROM base FINAL WHERE job_id='native_keys' AND relative_path='changed'")
+        .fetch_one()
+        .await?;
+    assert_eq!(old_size, 20);
+
+    // 模拟事件已持久化、base 尚未更新时重启；检查点之前的批次必须可幂等重放。
+    let mut resumed = ClusterScanStore::new(&config, &cluster, "native_keys")?;
+    let loaded = resumed.load_resume_state().await?;
+    assert!(loaded.is_some_and(|saved| saved.incremental && saved.event_time == incremental.event_time));
+    resumed.begin_resume_batch().await?;
+    resumed.write_native_keys(&entries).await?;
+    let replayed = resumed.compare_native(&entries).await?;
+    assert_eq!(replayed.len(), events.len());
+    resumed.events_native(&replayed, incremental.event_time).await?;
+    resumed.write_native(&entries, false).await?;
+    assert!(resumed.compare_native(&entries).await?.is_empty());
+    let final_events = resumed.resolve_final_events_native(incremental.event_time).await?;
+    assert_eq!(final_events.len(), 1);
+    assert!(
+        matches!(&final_events[0], ScanFinalEvent::Renamed { from_path, to, .. } if from_path=="old" && to.relative_path=="renamed")
+    );
+    resumed
+        .write_final_events_native(&final_events, incremental.event_time)
+        .await?;
+    let keys: Vec<_> = final_events.iter().filter_map(ScanFinalEvent::deletion_key).collect();
+    resumed.delete_resume_entries(&keys).await?;
+    let rows = resumed.client.query("SELECT relative_path,entry_snapshot,identity_key FROM base FINAL WHERE job_id='native_keys' AND is_deleted=0 ORDER BY relative_path").fetch_all::<NativeSnapshotRow>().await?;
+    assert_eq!(rows.len(), entries.len());
+    for row in rows {
+        let observation = ObservedEntry::decode_snapshot(&row.entry_snapshot, entries[0].source_identity().backend())?;
+        assert!(entries.iter().any(|entry| entry.as_ref() == &observation));
+    }
+    let changes: u64 = resumed.client.query("SELECT count() FROM incremental FINAL WHERE job_id='native_keys' AND operation_type IN ('new','data_changed','rename')").fetch_one().await?;
+    assert_eq!(changes, 3);
+    Ok(())
+}
+
+async fn apply_native_key_batch(store: &mut ClusterScanStore, entries: &[Arc<ObservedEntry>], time: i64) -> Result<()> {
+    store.begin_resume_batch().await?;
+    store.write_native_keys(entries).await?;
+    let events = store.compare_native(entries).await?;
+    store.events_native(&events, time).await?;
+    store.write_native(entries, false).await
+}
+
+#[tokio::test]
+#[ignore = "requires a real multi-shard ClickHouse cluster"]
+async fn cluster_native_parallel_unchanged_batches_never_create_candidates() -> Result<()> {
+    let (config, _admin, _guard, cluster, epoch) = fixture().await?;
+    let store = ClusterScanStore::new(&config, &cluster, "parallel_unchanged")?;
+    store.load_resume_state().await?;
+    store.save_resume_state(&state(epoch, false, 1)).await?;
+    let entries = (0..40_000)
+        .map(|index| {
+            let key = format!("path/{index:08}");
+            native_entry(&key, 17, Some(key.as_bytes()))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    store.write_native(&entries, false).await?;
+    store.commit_scan_generation().await?;
+    store.save_resume_state(&state(epoch + 10, true, 0)).await?;
+    let barrier = Arc::new(Barrier::new(4));
+    let mut workers: JoinSet<Result<()>> = JoinSet::new();
+    for worker in 0..4 {
+        let mut writer = store.batch_writer();
+        let entries: Vec<_> = entries.iter().skip(worker).step_by(4).cloned().collect();
+        let barrier = Arc::clone(&barrier);
+        workers.spawn(async move {
+            for round in 0..64 {
+                // 每次写入独立 epoch，避免服务端幂等去重使并发压力退化为空写入。
+                writer
+                    .epoch
+                    .store(epoch as u64 + 20 + round * 4 + worker as u64, Ordering::Relaxed);
+                writer.begin_resume_batch().await?;
+                writer.write_native_keys(&entries).await?;
+                barrier.wait().await;
+                let events = writer.compare_native(&entries).await?;
+                assert!(
+                    events.is_empty(),
+                    "unchanged batch produced {} events in worker {worker}, round {round}",
+                    events.len()
+                );
+                writer.write_native(&entries, false).await?;
+            }
+            Ok(())
+        });
+    }
+    while let Some(worker) = workers.join_next().await {
+        worker??;
+    }
+    store.cleanup_resume_batch().await?;
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires a real multi-shard ClickHouse cluster"]
+async fn cluster_native_parallel_batches_preserve_reused_paths_and_hardlinks() -> Result<()> {
+    let (config, _admin, _guard, cluster, epoch) = fixture().await?;
+    let mut store = ClusterScanStore::new(&config, &cluster, "parallel_native")?;
+    store.load_resume_state().await?;
+    let mut full = state(epoch, false, 1);
+    store.save_resume_state(&full).await?;
+    store
+        .write_native(
+            &[
+                native_entry("reuse", 10, Some(b"old-object"))?,
+                native_entry("rename_old", 30, Some(b"rename"))?,
+                native_entry("keep_link", 40, Some(b"hardlink"))?,
+                native_entry("remove_link", 40, Some(b"hardlink"))?,
+            ],
+            false,
+        )
+        .await?;
+    full.phase = FINALIZING;
+    full.version += 1;
+    store.save_resume_state(&full).await?;
+    store.commit_scan_generation().await?;
+    let incremental = state(epoch + 10, true, 0);
+    store.save_resume_state(&incremental).await?;
+    let first = vec![
+        native_entry("reuse", 11, Some(b"replacement"))?,
+        native_entry("keep_link", 40, Some(b"hardlink"))?,
+        native_entry("added", 3, Some(b"new-object"))?,
+    ];
+    let second = vec![
+        native_entry("rename_new", 30, Some(b"rename"))?,
+        native_entry("rescued", 10, Some(b"old-object"))?,
+        native_entry("new_link", 40, Some(b"hardlink"))?,
+    ];
+    let mut a = store.batch_writer();
+    let mut b = store.batch_writer();
+    let (first_result, second_result) = tokio::join!(
+        apply_native_key_batch(&mut a, &first, incremental.event_time),
+        apply_native_key_batch(&mut b, &second, incremental.event_time),
+    );
+    first_result?;
+    second_result?;
+    assert_ne!(a.batch_id, b.batch_id);
+    let events = store.resolve_final_events_native(incremental.event_time).await?;
+    assert_eq!(events.len(), 4);
+    assert!(events.iter().any(|event|matches!(event,ScanFinalEvent::Renamed{from_path,to,..} if from_path=="reuse" && to.relative_path=="rescued")));
+    assert!(events.iter().any(|event|matches!(event,ScanFinalEvent::Renamed{from_path,to,..} if from_path=="rename_old" && to.relative_path=="rename_new")));
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event,ScanFinalEvent::Added(row) if row.relative_path=="new_link"))
+    );
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event,ScanFinalEvent::Deleted(row) if row.relative_path=="remove_link"))
+    );
+    store.write_final_events_native(&events, incremental.event_time).await?;
+    let keys: Vec<_> = events.iter().filter_map(ScanFinalEvent::deletion_key).collect();
+    store.delete_resume_entries(&keys).await?;
+    let rows = store.client.query("SELECT relative_path,entry_snapshot,identity_key FROM base FINAL WHERE job_id='parallel_native' AND is_deleted=0").fetch_all::<NativeSnapshotRow>().await?;
+    assert_eq!(rows.len(), first.len() + second.len());
+    for row in rows {
+        let observation = ObservedEntry::decode_snapshot(&row.entry_snapshot, first[0].source_identity().backend())?;
+        assert!(first.iter().chain(&second).any(|entry| entry.as_ref() == &observation));
+    }
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires a real multi-shard ClickHouse cluster"]
+async fn cluster_native_replayed_path_restoring_original_identity_is_not_deleted() -> Result<()> {
+    let (config, _admin, _guard, cluster, epoch) = fixture().await?;
+    let mut store = ClusterScanStore::new(&config, &cluster, "restored_identity")?;
+    store.load_resume_state().await?;
+    let mut full = state(epoch, false, 1);
+    store.save_resume_state(&full).await?;
+    store
+        .write_native(&[native_entry("p", 10, Some(b"original"))?], false)
+        .await?;
+    full.phase = FINALIZING;
+    full.version += 1;
+    store.save_resume_state(&full).await?;
+    store.commit_scan_generation().await?;
+    let incremental = state(epoch + 10, true, 0);
+    store.save_resume_state(&incremental).await?;
+    let entries = vec![
+        native_entry("p", 10, Some(b"temporary"))?,
+        native_entry("p", 10, Some(b"original"))?,
+    ];
+    store.begin_resume_batch().await?;
+    store.write_native_keys(&entries).await?;
+    let events = store.compare_native(&entries).await?;
+    store.events_native(&events, incremental.event_time).await?;
+    store.write_native(&entries, false).await?;
+    let final_events = store.resolve_final_events_native(incremental.event_time).await?;
+    assert!(
+        final_events.is_empty(),
+        "restored original identity must not generate a deletion"
+    );
+    assert!(
+        events.is_empty(),
+        "the final same-key observation matches the original baseline"
+    );
+    Ok(())
 }
 
 #[tokio::test]

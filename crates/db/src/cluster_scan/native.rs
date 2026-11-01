@@ -1,14 +1,51 @@
 use super::record::ClusterNativeScanRecord;
 use super::*;
 use crate::native_scan::NativeScanAccess;
-use crate::native_scan_record::{NativeScanRecord, OBSERVED_COLUMNS, event_records};
+use crate::native_scan_record::{NativeScanKey, NativeScanRecord, OBSERVED_COLUMNS, event_records};
 use crate::native_scan_record::{final_event_records, incremental_record};
 use crate::scan_store::ScanFinalEvent;
 use crate::traits::IncrementalStorageEntryRecord;
 use data_mover::model::ObservedEntry;
 use storage_adapter::observed_scan::{ObservedScanEvent, ObservedView};
 
+#[derive(Serialize, clickhouse::Row)]
+struct ClusterNativeScanKey {
+    job_id: String,
+    batch_id: u64,
+    relative_path: String,
+    version_id: String,
+    file_handle: Option<String>,
+}
+
 impl ClusterScanStore {
+    pub(crate) async fn write_native_keys(&self, entries: &[Arc<ObservedEntry>]) -> Result<()> {
+        let _guard = self.writes.temporary.lock().await;
+        retry_quorum(|| async {
+            if entries.is_empty() {
+                return Ok(());
+            }
+            let client = self.client.clone().with_validation(false);
+            let mut insert = client.insert::<ClusterNativeScanKey>("scan_resume_batch").await?;
+            for entry in entries {
+                for view in ObservedView::all(entry) {
+                    let key = NativeScanKey::capture(view);
+                    insert
+                        .write(&ClusterNativeScanKey {
+                            job_id: self.job_id.clone(),
+                            batch_id: self.batch_id,
+                            relative_path: key.relative_path,
+                            version_id: key.version_id,
+                            file_handle: key.file_handle,
+                        })
+                        .await?;
+                }
+            }
+            insert.end().await?;
+            Ok(())
+        })
+        .await
+    }
+
     fn native_access(&self) -> Result<NativeScanAccess<'_>> {
         let database = identifier(&self.database)?;
         Ok(NativeScanAccess {
@@ -30,6 +67,12 @@ impl ClusterScanStore {
         })
     }
     pub(crate) async fn write_native(&self, entries: &[Arc<ObservedEntry>], temporary: bool) -> Result<()> {
+        let gate = if temporary {
+            &self.writes.temporary
+        } else {
+            &self.writes.base
+        };
+        let _guard = gate.lock().await;
         retry_quorum(|| async {
             if entries.is_empty() {
                 return Ok(());
@@ -80,6 +123,7 @@ impl ClusterScanStore {
         Ok(())
     }
     pub(crate) async fn merge_native(&self) -> Result<()> {
+        let _guard = self.writes.base.lock().await;
         retry_quorum(||async {
             let database=identifier(&self.database)?;
             self.client.query(&format!("INSERT INTO {database}.base (job_id,epoch,ver,{OBSERVED_COLUMNS}) SELECT job_id,epoch,ver,{OBSERVED_COLUMNS} FROM {database}.scan_resume_batch WHERE job_id=? AND batch_id=?")).bind(&self.job_id).bind(self.batch_id).execute().await?;
@@ -95,6 +139,7 @@ impl ClusterScanStore {
         self.write_native_events(records, time).await
     }
     async fn write_native_events(&self, records: Vec<IncrementalStorageEntryRecord>, time: i64) -> Result<()> {
+        let _guard = self.writes.events.lock().await;
         retry_quorum(|| async {
             if records.is_empty() {
                 return Ok(());

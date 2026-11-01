@@ -203,6 +203,9 @@ pub enum AppError {
     #[error("Consumer error: {0}")]
     ConsumerError(String),
 
+    #[error("Required database scan worker stopped before acknowledgement")]
+    ScanWorkerStopped,
+
     /// 路径不存在错误
     /// 当指定路径不存在时触发
     #[error("Path not exist error: {0}")]

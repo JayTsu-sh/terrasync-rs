@@ -23,6 +23,7 @@ pub mod traits;
 
 pub use database::DatabaseConsumer;
 pub use manager::ConsumerManager;
+pub(crate) use manager::ScanStatistics;
 pub use stats::{JobResult, ProgressReport, StatisticConsumer};
 pub use traits::Consumer;
 

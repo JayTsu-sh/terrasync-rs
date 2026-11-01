@@ -22,12 +22,14 @@ use utils::app_config::AppConfig;
 
 use crate::{
     config::{JobType, initialize_consumer_config},
-    consumer::ConsumerManager,
+    consumer::{ConsumerManager, ScanStatistics},
     error::{AppError, Result},
     storage_factory::{StorageRole, create_storage_for_role},
 };
 
+mod input;
 mod pipeline;
+mod workers;
 
 #[allow(clippy::too_many_arguments, clippy::ref_option)]
 pub async fn scan_with_resume(
@@ -273,17 +275,17 @@ async fn run(
 }
 
 async fn flush_batch(
-    database: &mut ScanStore, state: &ScanResumeState, consumers: &ConsumerManager, batch: &mut Vec<Arc<ObservedEntry>>,
+    database: &mut ScanStore, state: &ScanResumeState, consumers: &ScanStatistics, batch: &mut Vec<Arc<ObservedEntry>>,
 ) -> Result<()> {
     if batch.is_empty() {
         return Ok(());
     }
     // 与 base 的主键顺序一致；排序只调整本批落盘顺序，不改变检查点推进边界。
-    batch.sort_unstable_by(|a, b| a.path().as_str().cmp(b.path().as_str()));
+    sort_batch(batch);
     let mut events = Vec::new();
     if state.incremental {
         database.begin_resume_batch().await?;
-        database.write_observations(batch, true).await?;
+        database.write_observation_keys(batch).await?;
         events = database.detect_resume_batch_events(batch).await?;
         database.write_resume_events(&events, state.event_time).await?;
         #[cfg(feature = "lab-fault-injection")]
@@ -292,13 +294,18 @@ async fn flush_batch(
                 "Lab failure after durable events, before base update".into(),
             ));
         }
-        database.merge_observations().await?;
+        database.write_observations(batch, false).await?;
     } else {
         database.write_observations(batch, false).await?;
     }
     consumers.record_observed_events(&events).await;
     batch.clear();
     Ok(())
+}
+
+fn sort_batch(batch: &mut [Arc<ObservedEntry>]) {
+    // 相同路径保留源交付顺序，保证重放或路径复用时最后观察到的记录生效。
+    batch.sort_by(|a, b| a.path().as_str().cmp(b.path().as_str()));
 }
 
 async fn finalize_events(
@@ -331,6 +338,47 @@ async fn flush_final_events(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use data_mover::model::{BackendIdentity, BackendKind, EntryKind, IdentityStrength, SourceIdentity, StoragePath};
+
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn batch_sort_preserves_delivery_order_when_a_path_is_replayed() {
+        let backend = BackendIdentity::new(BackendKind::Nfs, "replayed-path").unwrap();
+        let mut batch: Vec<_> = (0_u64..1000)
+            .map(|index| {
+                let path = if index % 2 == 0 { "a" } else { "b" };
+                let identity = SourceIdentity::new(
+                    backend.clone(),
+                    IdentityStrength::StableWithinBackend,
+                    index.to_le_bytes(),
+                )
+                .unwrap();
+                Arc::new(
+                    ObservedEntry::new(
+                        StoragePath::new(path).unwrap(),
+                        EntryKind::File,
+                        Some(index),
+                        None,
+                        identity,
+                    )
+                    .unwrap(),
+                )
+            })
+            .collect();
+        sort_batch(&mut batch);
+        for path in ["a", "b"] {
+            let observed: Vec<_> = batch
+                .iter()
+                .filter(|entry| entry.path().as_str() == path)
+                .map(|entry| entry.size().unwrap())
+                .collect();
+            assert!(
+                observed.windows(2).all(|pair| pair[0] < pair[1]),
+                "same-path observations changed order"
+            );
+        }
+    }
+
     #[test]
     fn binds_source_depth_filters_and_tag_policy_but_not_secrets_in_plaintext() -> Result<()> {
         let key = request_key("local", "root", 0, &None, &None, false)?;

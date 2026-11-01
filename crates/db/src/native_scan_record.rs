@@ -22,6 +22,24 @@ use storage_adapter::observed_scan::ObservedItem;
 use storage_adapter::observed_scan::{EntryStatistics, ObservedScanEvent, ObservedView, timestamp_nanos};
 
 pub(crate) const OBSERVED_COLUMNS: &str = "name,relative_path,size,ext,ctime,mtime,atime,mode,storage_type,is_symlink,is_dir,is_regular_file,hard_links,current_state,uid,gid,ino,file_handle,version_id,tags,version_count,identity_key,backend_kind,entry_kind,size_observed,modified_unix_nanos,entry_snapshot";
+
+/// 比较集合只传输主键和身份；完整观察在事件持久化后直接写入 base。
+#[derive(Serialize, clickhouse::Row)]
+pub(crate) struct NativeScanKey {
+    pub relative_path: String,
+    pub version_id: String,
+    pub file_handle: Option<String>,
+}
+impl NativeScanKey {
+    pub(crate) fn capture(view: ObservedView<'_>) -> Self {
+        Self {
+            relative_path: view.path(),
+            version_id: view.version_id().into(),
+            file_handle: view.file_handle(),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, clickhouse::Row)]
 pub(crate) struct NativeScanRecord {
     pub name: String,

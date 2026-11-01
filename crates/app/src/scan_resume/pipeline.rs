@@ -1,8 +1,8 @@
 //! 扫描分发及检查点协调。数据库批次 B 写入时，下一批 A 在有界队列中积累。
-use super::flush_batch;
+use super::{flush_batch, input::ScanInput, workers};
 use crate::{
     consumer::{
-        ConsumerManager,
+        ConsumerManager, ScanStatistics,
         observed::{Delivery, ObservedForwarder},
     },
     error::{AppError, Result},
@@ -21,14 +21,14 @@ use tokio::{
     sync::{mpsc, oneshot},
     time::{MissedTickBehavior, interval},
 };
-use tokio_util::sync::CancellationToken;
+use tokio_util::{sync::CancellationToken, task::AbortOnDropHandle};
 use tracing::info;
 
-const DISPATCH_BATCH: usize = 256;
-type Entries = Arc<[Arc<ObservedEntry>]>;
-struct SaveState {
-    state: ScanResumeState,
-    ack: oneshot::Sender<()>,
+pub(super) const DISPATCH_BATCH: usize = 256;
+pub(super) type Entries = Arc<[Arc<ObservedEntry>]>;
+pub(super) struct SaveState {
+    pub(super) state: ScanResumeState,
+    pub(super) ack: oneshot::Sender<()>,
 }
 
 pub(super) async fn consume(
@@ -41,21 +41,69 @@ pub(super) async fn consume(
     let (control_tx, control_rx) = mpsc::channel(1);
     // 结构化并发：任一分支失败都等待消费者退出，不遗留后台写入任务。
     let writer_state = state.clone();
-    let producer = produce(source, state, statistics, forwarder, control_tx, cancel.clone());
+    let template = writer_state.incremental.then(|| database.batch_writer()).flatten();
+    let prefetch_capacity = template.as_ref().map(|_| batch_size.saturating_mul(workers::WORKERS));
+    let mut producer_state = state.clone();
+    let producer_statistics = statistics.scan_statistics();
+    let count_statistics = producer_statistics.clone();
+    let producer_cancel = cancel.clone();
+    // SQL 行编码不能占住遍历生产者所在任务；退出时仍等待写入与统计屏障。
+    let traversal_task = AbortOnDropHandle::new(tokio::spawn(async move {
+        let result = produce(
+            source,
+            &mut producer_state,
+            &producer_statistics,
+            forwarder,
+            control_tx,
+            producer_cancel,
+            prefetch_capacity,
+        )
+        .await;
+        (producer_state, result)
+    }));
+    let statistics_task = AbortOnDropHandle::new(tokio::spawn(async move {
+        count(&count_statistics, stat_rx).await;
+    }));
+    let writer_statistics = statistics.scan_statistics();
     let writer = async {
-        let result = write(database, writer_state, statistics, db_rx, control_rx, batch_size).await;
+        let result = if let Some(template) = template {
+            workers::consume(
+                database,
+                template,
+                writer_state,
+                writer_statistics,
+                db_rx,
+                control_rx,
+                batch_size,
+                cancel.clone(),
+            )
+            .await
+        } else {
+            write(
+                database,
+                writer_state,
+                &writer_statistics,
+                db_rx,
+                control_rx,
+                batch_size,
+            )
+            .await
+        };
         if result.is_err() {
             cancel.cancel();
         }
         result
     };
     // producer 独占可变 state；writer 只需要运行初始值，禁止跨检查点共享可变游标。
-    let (produced, written, ()) = tokio::join!(producer, writer, count(statistics, stat_rx));
-    written?;
-    produced
+    let (traversal_result, persisted, statistics_result) = tokio::join!(traversal_task, writer, statistics_task);
+    statistics_result?;
+    let (producer_state, traversal_outcome) = traversal_result?;
+    *state = producer_state;
+    persisted?;
+    traversal_outcome
 }
 
-async fn count(statistics: &ConsumerManager, mut receiver: mpsc::Receiver<Delivery<Entries>>) {
+async fn count(statistics: &ScanStatistics, mut receiver: mpsc::Receiver<Delivery<Entries>>) {
     while let Some(message) = receiver.recv().await {
         match message {
             Delivery::Data(entries) => statistics.record_observations(&entries).await,
@@ -66,7 +114,7 @@ async fn count(statistics: &ConsumerManager, mut receiver: mpsc::Receiver<Delive
     }
 }
 async fn write(
-    database: &mut ScanStore, state: ScanResumeState, statistics: &ConsumerManager,
+    database: &mut ScanStore, state: ScanResumeState, statistics: &ScanStatistics,
     mut receiver: mpsc::Receiver<Delivery<Entries>>, mut control: mpsc::Receiver<SaveState>, batch_size: usize,
 ) -> Result<()> {
     let mut batch = Vec::with_capacity(batch_size);
@@ -114,7 +162,21 @@ async fn save(control: &mpsc::Sender<SaveState>, state: &ScanResumeState) -> Res
         .map_err(|_| AppError::ConsumerError("ClickHouse checkpoint was not acknowledged".into()))
 }
 async fn produce(
-    mut source: ResumableScan, state: &mut ScanResumeState, statistics: &ConsumerManager,
+    source: ResumableScan, state: &mut ScanResumeState, statistics: &ScanStatistics,
+    forwarder: ObservedForwarder<Entries>, control: mpsc::Sender<SaveState>, cancel: CancellationToken,
+    prefetch_capacity: Option<usize>,
+) -> Result<()> {
+    let mut input = ScanInput::new(source, prefetch_capacity);
+    let result = produce_items(&mut input, state, statistics, forwarder, control, cancel.clone()).await;
+    if result.is_err() {
+        cancel.cancel();
+        input.stop().await;
+    }
+    result
+}
+
+async fn produce_items(
+    source: &mut ScanInput, state: &mut ScanResumeState, statistics: &ScanStatistics,
     forwarder: ObservedForwarder<Entries>, control: mpsc::Sender<SaveState>, cancel: CancellationToken,
 ) -> Result<()> {
     let mut pending = Vec::with_capacity(DISPATCH_BATCH);
@@ -161,7 +223,7 @@ async fn produce(
             }
             Err(error) => {
                 cancel.cancel();
-                return Err(error.into());
+                return Err(error);
             }
         }
     }

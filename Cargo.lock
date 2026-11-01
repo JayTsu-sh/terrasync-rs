@@ -158,6 +158,7 @@ dependencies = [
  "indicatif",
  "licensing",
  "reqwest 0.13.4",
+ "rustc-hash",
  "rustls 0.23.40",
  "serde",
  "serde_json",
