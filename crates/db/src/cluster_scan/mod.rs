@@ -1,5 +1,6 @@
 //! 共享表的集群扫描存储。所有读写在这里绑定 job_id，业务层不拼接集群 SQL。
 use crate::clickhouse::replica_read::QuorumRead;
+use crate::scan_store::queries::{ScanExecute, check_scan_cancellation, scan_retry_delay};
 #[cfg(test)]
 use std::collections::HashMap;
 use std::future::Future;
@@ -7,7 +8,6 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::Mutex;
-use tokio::time::sleep;
 
 use clickhouse::Client;
 use clickhouse::error::Error as ClickHouseError;
@@ -82,7 +82,7 @@ struct EntryKey {
     version_id: String,
 }
 
-fn identifier(value: &str) -> Result<String> {
+pub(crate) fn identifier(value: &str) -> Result<String> {
     if value.is_empty() || !value.bytes().all(|ch| ch.is_ascii_alphanumeric() || ch == b'_') {
         return Err(DatabaseError::ConfigError(
             "ClickHouse cluster/database identifiers must contain only letters, digits and underscores".into(),
@@ -99,12 +99,13 @@ where
 {
     let start = Instant::now();
     loop {
+        check_scan_cancellation()?;
         match operation().await {
             Err(DatabaseError::ClickHouseError(ClickHouseError::BadResponse(ref message)))
                 if message.contains("UNSATISFIED_QUORUM_FOR_PREVIOUS_WRITE")
                     && start.elapsed() < Duration::from_secs(30) =>
             {
-                sleep(Duration::from_millis(50)).await;
+                scan_retry_delay(Duration::from_millis(50)).await?;
             }
             result => return result,
         }
@@ -112,6 +113,9 @@ where
 }
 
 impl ClusterScanStore {
+    pub(crate) fn tag_scan_queries(&mut self, comment: &str) {
+        self.client = self.client.clone().with_option("log_comment", comment);
+    }
     pub(crate) fn batch_writer(&self) -> Self {
         Self {
             client: self.client.clone(),
@@ -178,8 +182,8 @@ impl ClusterScanStore {
         let sql = format!(
             "CREATE TABLE IF NOT EXISTS {database}.{local} ON CLUSTER {cluster} ({columns}) ENGINE = {engine}('{path}', '{{replica}}') PARTITION BY {partition} ORDER BY {order} SETTINGS allow_nullable_key=1"
         );
-        self.client.query(&sql).execute().await?;
-        self.client.query(&format!("CREATE TABLE IF NOT EXISTS {database}.{name} ON CLUSTER {cluster} AS {database}.{local} ENGINE = Distributed({cluster}, {database}, {local}, cityHash64(job_id))")).execute().await?;
+        self.client.query(&sql).execute_scan().await?;
+        self.client.query(&format!("CREATE TABLE IF NOT EXISTS {database}.{name} ON CLUSTER {cluster} AS {database}.{local} ENGINE = Distributed({cluster}, {database}, {local}, cityHash64(job_id))")).execute_scan().await?;
         Ok(())
     }
 
@@ -258,8 +262,8 @@ impl ClusterScanStore {
         let local = format!("{name}_local");
         let deleted = if tombstones { ",is_deleted" } else { "" };
         let path = format!("/clickhouse/terrasync/{}/{local}/{{shard}}", self.database);
-        self.client.query(&format!("CREATE TABLE IF NOT EXISTS {database}.{local} ON CLUSTER {cluster} ({columns}) ENGINE = ReplicatedReplacingMergeTree('{path}','{{replica}}',ver{deleted}) PARTITION BY {partition} ORDER BY {order} SETTINGS allow_nullable_key=1")).execute().await?;
-        self.client.query(&format!("CREATE TABLE IF NOT EXISTS {database}.{name} ON CLUSTER {cluster} AS {database}.{local} ENGINE = Distributed({cluster},{database},{local},cityHash64(job_id))")).execute().await?;
+        self.client.query(&format!("CREATE TABLE IF NOT EXISTS {database}.{local} ON CLUSTER {cluster} ({columns}) ENGINE = ReplicatedReplacingMergeTree('{path}','{{replica}}',ver{deleted}) PARTITION BY {partition} ORDER BY {order} SETTINGS allow_nullable_key=1")).execute_scan().await?;
+        self.client.query(&format!("CREATE TABLE IF NOT EXISTS {database}.{name} ON CLUSTER {cluster} AS {database}.{local} ENGINE = Distributed({cluster},{database},{local},cityHash64(job_id))")).execute_scan().await?;
         Ok(())
     }
 
@@ -268,8 +272,8 @@ impl ClusterScanStore {
         let cluster = identifier(&self.cluster)?;
         let database = identifier(&self.database)?;
         let path = format!("/clickhouse/terrasync/{}/scan_resume_local/{{shard}}", self.database);
-        self.client.query(&format!("CREATE TABLE IF NOT EXISTS {database}.scan_resume_local ON CLUSTER {cluster} ({columns}) ENGINE = ReplicatedReplacingMergeTree('{path}','{{replica}}',version) PARTITION BY job_id ORDER BY job_id")).execute().await?;
-        self.client.query(&format!("CREATE TABLE IF NOT EXISTS {database}.scan_resume ON CLUSTER {cluster} AS {database}.scan_resume_local ENGINE = Distributed({cluster},{database},scan_resume_local,cityHash64(job_id))")).execute().await?;
+        self.client.query(&format!("CREATE TABLE IF NOT EXISTS {database}.scan_resume_local ON CLUSTER {cluster} ({columns}) ENGINE = ReplicatedReplacingMergeTree('{path}','{{replica}}',version) PARTITION BY job_id ORDER BY job_id")).execute_scan().await?;
+        self.client.query(&format!("CREATE TABLE IF NOT EXISTS {database}.scan_resume ON CLUSTER {cluster} AS {database}.scan_resume_local ENGINE = Distributed({cluster},{database},scan_resume_local,cityHash64(job_id))")).execute_scan().await?;
         Ok(())
     }
 
@@ -291,7 +295,7 @@ impl ClusterScanStore {
                         "ALTER TABLE {database}.{table} ON CLUSTER {cluster} DROP PARTITION ?"
                     ))
                     .bind(&self.job_id)
-                    .execute()
+                    .execute_scan()
                     .await?;
             }
         }
@@ -327,7 +331,7 @@ impl ClusterScanStore {
                     ))
                     .bind(&self.job_id)
                     .bind(batch)
-                    .execute()
+                    .execute_scan()
                     .await?;
             }
         }
@@ -348,8 +352,8 @@ impl ClusterScanStore {
                 self.epoch.store(state.event_time as u64, Ordering::Relaxed);
                 Ok(Some(state))
             }
-            Err(ClickHouseError::RowNotFound) => Ok(None),
-            Err(e) => Err(e.into()),
+            Err(DatabaseError::ClickHouseError(ClickHouseError::RowNotFound)) => Ok(None),
+            Err(e) => Err(e),
         }
     }
 
@@ -379,8 +383,8 @@ impl ClusterScanStore {
             .await
         {
             Ok(row) => Ok(Some(row)),
-            Err(ClickHouseError::RowNotFound) => Ok(None),
-            Err(e) => Err(e.into()),
+            Err(DatabaseError::ClickHouseError(ClickHouseError::RowNotFound)) => Ok(None),
+            Err(e) => Err(e),
         }
     }
     pub(crate) async fn resume_execution_is_incremental(&self) -> Result<bool> {
@@ -404,8 +408,8 @@ impl ClusterScanStore {
             .await
         {
             Ok((incremental, phase)) if phase <= FINALIZING => return Ok(incremental),
-            Ok(_) | Err(ClickHouseError::RowNotFound) => {}
-            Err(error) => return Err(error.into()),
+            Ok(_) | Err(DatabaseError::ClickHouseError(ClickHouseError::RowNotFound)) => {}
+            Err(error) => return Err(error),
         }
         self.has_baseline().await
     }
@@ -536,7 +540,7 @@ impl ClusterScanStore {
 
         let database = identifier(&self.database)?;
         let columns = &*FILE_SCAN_COLUMNS_LIST;
-        self.client.query(&format!("INSERT INTO {database}.base (job_id,epoch,ver,{columns}) SELECT job_id,epoch,ver,{columns} FROM {database}.scan_resume_batch WHERE job_id=? AND batch_id=?")).bind(&self.job_id).bind(self.batch_id).execute().await?;
+        self.client.query(&format!("INSERT INTO {database}.base (job_id,epoch,ver,{columns}) SELECT job_id,epoch,ver,{columns} FROM {database}.scan_resume_batch WHERE job_id=? AND batch_id=?")).bind(&self.job_id).bind(self.batch_id).execute_scan().await?;
         Ok(())
 
         }).await
@@ -580,7 +584,7 @@ impl ClusterScanStore {
                 ))
                 .bind(&self.job_id)
                 .bind(self.batch_id)
-                .execute()
+                .execute_scan()
                 .await?;
         }
         Ok(())
@@ -668,7 +672,7 @@ impl ClusterScanStore {
         }
         insert.end().await?;
         let columns = &*FILE_SCAN_COLUMNS_LIST;
-        self.client.query(&format!("INSERT INTO {database}.base (job_id,epoch,ver,is_deleted,{columns}) SELECT job_id,?,fromUnixTimestamp64Nano(?),1,{columns} FROM {database}.base FINAL WHERE job_id=? AND is_deleted=0 AND epoch!=? AND (relative_path,version_id) IN (SELECT relative_path,version_id FROM {database}.scan_resume_keys WHERE job_id=? AND batch_id=?)")).bind(self.epoch.load(Ordering::Relaxed)).bind(self.epoch.load(Ordering::Relaxed) as i64).bind(&self.job_id).bind(self.epoch.load(Ordering::Relaxed)).bind(&self.job_id).bind(keys_id).execute().await?;
+        self.client.query(&format!("INSERT INTO {database}.base (job_id,epoch,ver,is_deleted,{columns}) SELECT job_id,?,fromUnixTimestamp64Nano(?),1,{columns} FROM {database}.base FINAL WHERE job_id=? AND is_deleted=0 AND epoch!=? AND (relative_path,version_id) IN (SELECT relative_path,version_id FROM {database}.scan_resume_keys WHERE job_id=? AND batch_id=?)")).bind(self.epoch.load(Ordering::Relaxed)).bind(self.epoch.load(Ordering::Relaxed) as i64).bind(&self.job_id).bind(self.epoch.load(Ordering::Relaxed)).bind(&self.job_id).bind(keys_id).execute_scan().await?;
         self.client
             .query(&format!(
                 "ALTER TABLE {database}.scan_resume_keys_local ON CLUSTER {} DROP PARTITION (?,?)",
@@ -676,7 +680,7 @@ impl ClusterScanStore {
             ))
             .bind(&self.job_id)
             .bind(keys_id)
-            .execute()
+            .execute_scan()
             .await?;
         Ok(())
 

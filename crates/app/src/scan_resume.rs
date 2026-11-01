@@ -8,6 +8,7 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+use self::cancellation::ScanCancellation;
 use data_mover::model::ObservedEntry;
 use data_mover::traversal::Resumable;
 use db::clickhouse::scan_resume::{COMPLETED, RUNNING, ScanResumeState};
@@ -16,6 +17,7 @@ use db::scan_store::{ScanFinalEvent, ScanStore};
 use licensing::verify::quick_verify;
 use storage_adapter::filter::parse_filter_expression;
 use storage_adapter::{ErrorEvent, StorageEntryMessage, StorageEnum, WalkOptions, canonicalize_path};
+use tokio::select;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 use utils::app_config::AppConfig;
@@ -27,6 +29,7 @@ use crate::{
     storage_factory::{StorageRole, create_storage_for_role},
 };
 
+mod cancellation;
 mod input;
 mod pipeline;
 mod workers;
@@ -91,7 +94,12 @@ pub async fn scan_with_resume_settings(
         job_id: job_id.into(),
         source,
     })?;
-    let storage = create_storage_for_role(&canonicalize_path(path)?, None, false, StorageRole::Source).await?;
+    let source = canonicalize_path(path)?;
+    let storage = select! {
+        biased;
+        _=cancel.cancelled()=>return Err(AppError::ObservationScanCancelled),
+        storage=create_storage_for_role(&source, None, false, StorageRole::Source)=>storage?,
+    };
     let options = WalkOptions {
         depth: NonZeroUsize::new(depth as usize).map(NonZeroUsize::get),
         match_expressions: include.as_deref().map(parse_filter_expression).transpose()?,
@@ -119,103 +127,117 @@ pub async fn scan_with_resume_settings(
         config.database.clickhouse.cluster.as_deref(),
         job_id,
     )?;
-    database.ping().await?;
-    let old = database.load_resume_state().await?;
-    let mut already_committed = false;
-    let mut state = if let Some(state) = old.as_ref().filter(|state| state.active()) {
-        state.validate(&request_key)?;
-        if !database.results_exist().await? {
-            return Err(AppError::ScanError(
-                "Saved scan results are missing; refusing to resume".into(),
-            ));
-        }
-        if database.restore_resume_generation(state).await? {
-            let mut completed = state.clone();
-            completed.phase = COMPLETED;
-            completed.checkpoint.clear();
-            completed.advance()?;
-            database.save_resume_state(&completed).await?;
-            if let Err(error) = database.cleanup_resume_batch().await {
-                warn!(%error, "Completed scan; deferred batch-table cleanup");
+    let queries = database.query_cancellation();
+    let cancellation = ScanCancellation::new(cancel.clone());
+    cancellation::scope(queries, cancellation.clone(), async {
+        cancellation.check()?;
+        cancellation.operation(database.ping()).await?;
+        cancellation.check()?;
+        let old = cancellation.operation(database.load_resume_state()).await?;
+        cancellation.check()?;
+        let mut already_committed = false;
+        let mut state = if let Some(state) = old.as_ref().filter(|state| state.active()) {
+            state.validate(&request_key)?;
+            if !cancellation.operation(database.results_exist()).await? {
+                return Err(AppError::ScanError(
+                    "Saved scan results are missing; refusing to resume".into(),
+                ));
             }
-            info!("Recovered the previous scan's completed generation commit");
-            already_committed = true;
-        }
-        info!(
-            entries = state.observed_entries,
-            checkpoint = !state.checkpoint.is_empty(),
-            "Resuming scan from acknowledged ClickHouse progress"
-        );
-        state.clone()
-    } else {
-        let incremental = database.has_baseline().await?;
-        database.initialize().await?;
-        let generation = database.begin_scan_generation().await?;
-        let now = i64::try_from(SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos())?;
-        let event_time = database.resume_event_epoch(now).await?;
-        let mut fresh = ScanResumeState {
-            id: 1,
-            schema_version: 1,
-            version: old.as_ref().map_or(0, |value| value.version),
-            request_key,
-            generation,
-            incremental,
-            phase: RUNNING,
-            event_time,
-            observed_entries: 0,
-            checkpoint: Vec::new(),
-            statistics: String::new(),
+            if cancellation
+                .operation(database.restore_resume_generation(state))
+                .await?
+            {
+                let mut completed = state.clone();
+                completed.phase = COMPLETED;
+                completed.checkpoint.clear();
+                completed.advance()?;
+                cancellation.operation(database.save_resume_state(&completed)).await?;
+                if let Err(error) = cancellation.operation(database.cleanup_resume_batch()).await {
+                    warn!(%error, "Completed scan; deferred batch-table cleanup");
+                }
+                info!("Recovered the previous scan's completed generation commit");
+                already_committed = true;
+            }
+            info!(
+                entries = state.observed_entries,
+                checkpoint = !state.checkpoint.is_empty(),
+                "Resuming scan from acknowledged ClickHouse progress"
+            );
+            state.clone()
+        } else {
+            let incremental = cancellation.operation(database.has_baseline()).await?;
+            cancellation.operation(database.initialize()).await?;
+            let generation = cancellation.operation(database.begin_scan_generation()).await?;
+            let now = i64::try_from(SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos())?;
+            let event_time = cancellation.operation(database.resume_event_epoch(now)).await?;
+            let mut fresh = ScanResumeState {
+                id: 1,
+                schema_version: 1,
+                version: old.as_ref().map_or(0, |value| value.version),
+                request_key,
+                generation,
+                incremental,
+                phase: RUNNING,
+                event_time,
+                observed_entries: 0,
+                checkpoint: Vec::new(),
+                statistics: String::new(),
+            };
+            fresh.advance()?;
+            cancellation.operation(database.save_resume_state(&fresh)).await?;
+            info!("Starting a scan with durable ClickHouse checkpoints");
+            fresh
         };
-        fresh.advance()?;
-        database.save_resume_state(&fresh).await?;
-        info!("Starting a scan with durable ClickHouse checkpoints");
-        fresh
-    };
-    if state.incremental {
-        database.prepare_incremental().await?;
-    }
-    let kind = if state.incremental {
-        JobType::IncrementalScan
-    } else {
-        JobType::Scan
-    };
-    let mut consumer_config = initialize_consumer_config(job_id, job_dir, kind, command, &config, callback_url)?;
-    // 本管道负责数据库持久化确认；manager 只消费统计信息。
-    consumer_config.db_config.enabled = false;
-    let mut consumers = ConsumerManager::new(&consumer_config).await?;
-    // 续扫展示上次确认检查点的累计统计，再叠加本次实际扫描流；整轮完成后校准去重。
-    consumers.restore_statistics(&state.statistics).await?;
-    consumers.begin_lifecycle().await;
-    let result = if already_committed {
-        Ok(())
-    } else {
-        run(
-            &storage,
-            &options,
-            &mut database,
-            &mut state,
-            &consumers,
-            config.database.batch_size.max(1) as usize,
-            cancel.child_token(),
-        )
-        .await
-    };
-    if let Err(error) = &result
-        && !cancel.is_cancelled()
-    {
-        consumers
-            .record_statistics([StorageEntryMessage::Error {
-                event: ErrorEvent::Scan,
-                path: Default::default(),
-                entry: None,
-                reason: error.to_string(),
-            }])
-            .await;
-    }
-    consumers.set_generation_committed(result.is_ok()).await;
-    consumers.end_lifecycle().await;
-    drop(lease);
-    result
+        if state.incremental {
+            cancellation.operation(database.prepare_incremental()).await?;
+        }
+        let kind = if state.incremental {
+            JobType::IncrementalScan
+        } else {
+            JobType::Scan
+        };
+        let mut consumer_config = initialize_consumer_config(job_id, job_dir, kind, command, &config, callback_url)?;
+        // 本管道负责数据库持久化确认；manager 只消费统计信息。
+        consumer_config.db_config.enabled = false;
+        let mut consumers = ConsumerManager::new(&consumer_config).await?;
+        // 续扫展示上次确认检查点的累计统计，再叠加本次实际扫描流；整轮完成后校准去重。
+        consumers.restore_statistics(&state.statistics).await?;
+        consumers.begin_lifecycle().await;
+        let result = if already_committed {
+            Ok(())
+        } else {
+            run(
+                &storage,
+                &options,
+                &mut database,
+                &mut state,
+                &consumers,
+                config.database.batch_size.max(1) as usize,
+                cancellation.child(),
+            )
+            .await
+        };
+        if let Err(error) = &result
+            && !cancel.is_cancelled()
+        {
+            consumers
+                .record_statistics([StorageEntryMessage::Error {
+                    event: ErrorEvent::Scan,
+                    path: Default::default(),
+                    entry: None,
+                    reason: error.to_string(),
+                }])
+                .await;
+        }
+        consumers.set_generation_committed(result.is_ok()).await;
+        if cancel.is_cancelled() {
+            consumers.end_cancelled_lifecycle().await;
+        } else {
+            consumers.end_lifecycle().await;
+        }
+        result
+    })
+    .await
 }
 
 fn request_key(
@@ -238,37 +260,44 @@ fn checkpoint_interval() -> Duration {
 #[allow(clippy::too_many_arguments)]
 async fn run(
     storage: &StorageEnum, options: &WalkOptions, database: &mut ScanStore, state: &mut ScanResumeState,
-    consumers: &ConsumerManager, batch_size: usize, cancel: CancellationToken,
+    consumers: &ConsumerManager, batch_size: usize, cancel: ScanCancellation,
 ) -> Result<()> {
     if state.phase == RUNNING {
         let source = storage.resumable_scan(
             options,
             (!state.checkpoint.is_empty()).then(|| state.checkpoint.clone()),
-            cancel.clone(),
+            cancel.token().clone(),
             checkpoint_interval(),
         )?;
-        pipeline::consume(source, database, state, consumers, batch_size, cancel).await?;
+        pipeline::consume(source, database, state, consumers, batch_size, cancel.clone()).await?;
     }
+    cancel.check()?;
     if state.incremental {
-        finalize_events(database, state, consumers, batch_size).await?;
+        cancel
+            .operation(finalize_events(database, state, consumers, batch_size, &cancel))
+            .await?;
     }
+    cancel.check()?;
     consumers
         .reconcile_scan_statistics(
-            database
-                .resume_statistics(state.generation, state.incremental.then_some(state.event_time))
+            cancel
+                .operation(database.resume_statistics(state.generation, state.incremental.then_some(state.event_time)))
                 .await?,
         )
         .await;
+    cancel.check()?;
     state.statistics = consumers.statistics_checkpoint().await?;
     state.advance()?;
-    database.save_resume_state(state).await?;
-    database.commit_scan_generation().await?;
+    cancel.operation(database.save_resume_state(state)).await?;
+    cancel.check()?;
+    cancel.operation(database.commit_scan_generation()).await?;
+    cancel.check()?;
     state.statistics = consumers.statistics_checkpoint().await?;
     state.phase = COMPLETED;
     state.checkpoint.clear();
     state.advance()?;
-    database.save_resume_state(state).await?;
-    if let Err(error) = database.cleanup_resume_batch().await {
+    cancel.operation(database.save_resume_state(state)).await?;
+    if let Err(error) = cancel.operation(database.cleanup_resume_batch()).await {
         warn!(%error, "Completed scan; deferred batch-table cleanup");
     }
     Ok(())
@@ -276,18 +305,25 @@ async fn run(
 
 async fn flush_batch(
     database: &mut ScanStore, state: &ScanResumeState, consumers: &ScanStatistics, batch: &mut Vec<Arc<ObservedEntry>>,
+    cancel: &ScanCancellation,
 ) -> Result<()> {
+    cancel.check()?;
     if batch.is_empty() {
         return Ok(());
     }
     // 与 base 的主键顺序一致；排序只调整本批落盘顺序，不改变检查点推进边界。
     sort_batch(batch);
+    cancel.check()?;
     let mut events = Vec::new();
     if state.incremental {
         database.begin_resume_batch().await?;
+        cancel.check()?;
         database.write_observation_keys(batch).await?;
+        cancel.check()?;
         events = database.detect_resume_batch_events(batch).await?;
+        cancel.check()?;
         database.write_resume_events(&events, state.event_time).await?;
+        cancel.check()?;
         #[cfg(feature = "lab-fault-injection")]
         if !events.is_empty() && std::env::var_os("TERRASYNC_LAB_SCAN_FAIL_AFTER_EVENTS").is_some() {
             return Err(AppError::ScanError(
@@ -296,6 +332,7 @@ async fn flush_batch(
         }
         database.write_observations(batch, false).await?;
     } else {
+        cancel.check()?;
         database.write_observations(batch, false).await?;
     }
     consumers.record_observed_events(&events).await;
@@ -310,24 +347,30 @@ fn sort_batch(batch: &mut [Arc<ObservedEntry>]) {
 
 async fn finalize_events(
     database: &ScanStore, state: &ScanResumeState, consumers: &ConsumerManager, batch_size: usize,
+    cancel: &ScanCancellation,
 ) -> Result<()> {
     let deleted = database.resolve_final_events(state.event_time).await?;
     let mut events = Vec::with_capacity(batch_size);
     for entry in deleted {
+        cancel.check()?;
         events.push(entry);
         if events.len() >= batch_size {
-            flush_final_events(database, state, consumers, &mut events).await?;
+            flush_final_events(database, state, consumers, &mut events, cancel).await?;
         }
     }
-    flush_final_events(database, state, consumers, &mut events).await?;
+    flush_final_events(database, state, consumers, &mut events, cancel).await?;
+    cancel.check()?;
     database.cleanup_candidates(state.event_time).await?;
     Ok(())
 }
 
 async fn flush_final_events(
     database: &ScanStore, state: &ScanResumeState, consumers: &ConsumerManager, events: &mut Vec<ScanFinalEvent>,
+    cancel: &ScanCancellation,
 ) -> Result<()> {
+    cancel.check()?;
     database.write_final_events(events, state.event_time).await?;
+    cancel.check()?;
     let keys: Vec<_> = events.iter().filter_map(ScanFinalEvent::deletion_key).collect();
     database.delete_resume_entries(&keys).await?;
     consumers.record_final_events(events).await;

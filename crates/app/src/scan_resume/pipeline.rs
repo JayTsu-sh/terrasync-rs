@@ -1,5 +1,5 @@
 //! 扫描分发及检查点协调。数据库批次 B 写入时，下一批 A 在有界队列中积累。
-use super::{flush_batch, input::ScanInput, workers};
+use super::{cancellation::ScanCancellation, flush_batch, input::ScanInput, workers};
 use crate::{
     consumer::{
         ConsumerManager, ScanStatistics,
@@ -21,7 +21,7 @@ use tokio::{
     sync::{mpsc, oneshot},
     time::{MissedTickBehavior, interval},
 };
-use tokio_util::{sync::CancellationToken, task::AbortOnDropHandle};
+use tokio_util::task::AbortOnDropHandle;
 use tracing::info;
 
 pub(super) const DISPATCH_BATCH: usize = 256;
@@ -33,7 +33,7 @@ pub(super) struct SaveState {
 
 pub(super) async fn consume(
     source: ResumableScan, database: &mut ScanStore, state: &mut ScanResumeState, statistics: &ConsumerManager,
-    batch_size: usize, cancel: CancellationToken,
+    batch_size: usize, cancel: ScanCancellation,
 ) -> Result<()> {
     let mut forwarder = ObservedForwarder::<Entries>::new();
     let db_rx = forwarder.subscribe("clickhouse", batch_size.div_ceil(DISPATCH_BATCH));
@@ -79,15 +79,17 @@ pub(super) async fn consume(
             )
             .await
         } else {
-            write(
-                database,
-                writer_state,
-                &writer_statistics,
-                db_rx,
-                control_rx,
-                batch_size,
-            )
-            .await
+            cancel
+                .operation(write(
+                    database,
+                    writer_state,
+                    &writer_statistics,
+                    db_rx,
+                    control_rx,
+                    batch_size,
+                    &cancel,
+                ))
+                .await
         };
         if result.is_err() {
             cancel.cancel();
@@ -99,8 +101,39 @@ pub(super) async fn consume(
     statistics_result?;
     let (producer_state, traversal_outcome) = traversal_result?;
     *state = producer_state;
-    persisted?;
-    traversal_outcome
+    merge_outcomes(persisted, traversal_outcome)
+}
+
+fn merge_outcomes(persisted: Result<()>, traversal: Result<()>) -> Result<()> {
+    match persisted {
+        Err(AppError::ObservationScanCancelled | AppError::ScanWorkerStopped) if traversal.is_err() => traversal,
+        persisted => {
+            persisted?;
+            traversal
+        }
+    }
+}
+
+#[cfg(test)]
+mod outcome_tests {
+    use super::*;
+    use db::DatabaseError;
+
+    #[test]
+    fn source_failure_is_not_masked_by_the_resulting_worker_cancellation() {
+        let result = merge_outcomes(
+            Err(AppError::ObservationScanCancelled),
+            Err(AppError::ScanError("source failed".into())),
+        );
+        assert!(matches!(result, Err(AppError::ScanError(message)) if message=="source failed"));
+        let result = merge_outcomes(
+            Err(AppError::DatabaseError(DatabaseError::ConfigError(
+                "database failed".into(),
+            ))),
+            Err(AppError::ObservationScanCancelled),
+        );
+        assert!(matches!(result, Err(AppError::DatabaseError(_))));
+    }
 }
 
 async fn count(statistics: &ScanStatistics, mut receiver: mpsc::Receiver<Delivery<Entries>>) {
@@ -116,11 +149,14 @@ async fn count(statistics: &ScanStatistics, mut receiver: mpsc::Receiver<Deliver
 async fn write(
     database: &mut ScanStore, state: ScanResumeState, statistics: &ScanStatistics,
     mut receiver: mpsc::Receiver<Delivery<Entries>>, mut control: mpsc::Receiver<SaveState>, batch_size: usize,
+    cancel: &ScanCancellation,
 ) -> Result<()> {
     let mut batch = Vec::with_capacity(batch_size);
     let mut control_open = true;
     loop {
         select! {
+            biased;
+            _=cancel.cancelled()=>return Err(AppError::ObservationScanCancelled),
             command=control.recv(),if control_open=>match command {
                 Some(command)=>{database.save_resume_state(&command.state).await?;let _=command.ack.send(());}
                 None=>control_open=false,
@@ -129,18 +165,18 @@ async fn write(
                 Some(Delivery::Data(entries))=>{
                     for entry in entries.iter() {
                         batch.push(Arc::clone(entry));
-                        if batch.len()>=batch_size{flush_batch(database,&state,statistics,&mut batch).await?;}
+                        if batch.len()>=batch_size{flush_batch(database,&state,statistics,&mut batch,cancel).await?;}
                     }
                 }
                 Some(Delivery::Barrier(ack))=>{
-                    flush_batch(database,&state,statistics,&mut batch).await?;
+                    flush_batch(database,&state,statistics,&mut batch,cancel).await?;
                     let _=ack.send(());
                 }
                 None=>break,
             }
         }
     }
-    flush_batch(database, &state, statistics, &mut batch).await
+    flush_batch(database, &state, statistics, &mut batch, cancel).await
 }
 async fn deliver(forwarder: &ObservedForwarder<Entries>, pending: &mut Vec<Arc<ObservedEntry>>) -> Result<()> {
     if !pending.is_empty() {
@@ -163,11 +199,15 @@ async fn save(control: &mpsc::Sender<SaveState>, state: &ScanResumeState) -> Res
 }
 async fn produce(
     source: ResumableScan, state: &mut ScanResumeState, statistics: &ScanStatistics,
-    forwarder: ObservedForwarder<Entries>, control: mpsc::Sender<SaveState>, cancel: CancellationToken,
+    forwarder: ObservedForwarder<Entries>, control: mpsc::Sender<SaveState>, cancel: ScanCancellation,
     prefetch_capacity: Option<usize>,
 ) -> Result<()> {
     let mut input = ScanInput::new(source, prefetch_capacity);
-    let result = produce_items(&mut input, state, statistics, forwarder, control, cancel.clone()).await;
+    let result = select! {
+        biased;
+        _=cancel.cancelled()=>Err(AppError::ObservationScanCancelled),
+        result=produce_items(&mut input, state, statistics, forwarder, control, cancel.clone())=>result,
+    };
     if result.is_err() {
         cancel.cancel();
         input.stop().await;
@@ -177,7 +217,7 @@ async fn produce(
 
 async fn produce_items(
     source: &mut ScanInput, state: &mut ScanResumeState, statistics: &ScanStatistics,
-    forwarder: ObservedForwarder<Entries>, control: mpsc::Sender<SaveState>, cancel: CancellationToken,
+    forwarder: ObservedForwarder<Entries>, control: mpsc::Sender<SaveState>, cancel: ScanCancellation,
 ) -> Result<()> {
     let mut pending = Vec::with_capacity(DISPATCH_BATCH);
     let mut observed = state.observed_entries;

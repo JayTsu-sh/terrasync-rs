@@ -20,6 +20,7 @@ use storage_adapter::StorageEntryMessage;
 use storage_adapter::observed_scan::{EntryStatistics, ObservedScanEvent, ObservedView};
 use tokio::sync::{Mutex, mpsc};
 use tokio::task::JoinHandle;
+use tokio::time::timeout;
 use tracing::{error, info, trace, warn};
 
 // 内部模块
@@ -248,14 +249,30 @@ impl StatisticConsumer {
 
     /// 结束生命周期：abort HTTP 回调循环 → 发送 final 回调 → finalize（打印报告 + join 显示线程）。
     pub async fn end(consumer: Arc<Mutex<Self>>, callback: Option<CallbackGuard>) {
+        Self::end_with_budget(consumer, callback, None).await;
+    }
+
+    pub(crate) async fn end_cancelled(consumer: Arc<Mutex<Self>>, callback: Option<CallbackGuard>) {
+        Self::end_with_budget(consumer, callback, Some(Duration::from_millis(500))).await;
+    }
+
+    async fn end_with_budget(consumer: Arc<Mutex<Self>>, callback: Option<CallbackGuard>, budget: Option<Duration>) {
         let shared_client = if let Some((handle, client)) = callback {
             handle.abort();
+            let _ = handle.await;
             Some(client)
         } else {
             None
         };
 
-        Self::send_final_callback(&consumer, shared_client.as_ref()).await;
+        let callback = Self::send_final_callback(&consumer, shared_client.as_ref());
+        if let Some(budget) = budget {
+            if timeout(budget, callback).await.is_err() {
+                warn!("[ProgressCallback] Cancelled scan final report exceeded its time budget");
+            }
+        } else {
+            callback.await;
+        }
 
         let mut c = consumer.lock().await;
         c.finalize();
@@ -266,7 +283,48 @@ impl StatisticConsumer {
 mod tests {
     use super::StatisticConsumer;
     use crate::config::JobType;
-    use crate::consumer::stats::{IncrementalStats, ProgressBar, StatsKind};
+    use crate::consumer::stats::{FullStats, IncrementalStats, ProgressBar, StatsKind};
+    use crate::error::Result;
+    use std::{
+        future::pending,
+        sync::Arc,
+        time::{Duration, Instant},
+    };
+    use tokio::{net::TcpListener, sync::Mutex};
+
+    #[tokio::test]
+    async fn cancelled_lifecycle_does_not_wait_for_a_stalled_final_callback() -> Result<()> {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let address = listener.local_addr()?;
+        let stalled = tokio::spawn(async move {
+            let _connection = listener.accept().await;
+            pending::<()>().await;
+        });
+        let consumer = Arc::new(Mutex::new(StatisticConsumer {
+            stats: StatsKind::Full(FullStats::new(
+                JobType::Scan,
+                "cancel_fixture".into(),
+                String::new(),
+                String::new(),
+            )),
+            progress_bar: ProgressBar::new(JobType::Scan),
+            job_dir: String::new(),
+            callback_url: Some(format!("http://{address}/progress")),
+            generation_committed: Some(false),
+            pb_handle: None,
+        }));
+        consumer.lock().await.start_progress_bar();
+        let started = Instant::now();
+        StatisticConsumer::end_cancelled(consumer.clone(), None).await;
+        stalled.abort();
+        let _ = stalled.await;
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(
+            consumer.lock().await.pb_handle.is_none(),
+            "display thread must also be joined"
+        );
+        Ok(())
+    }
 
     #[test]
     fn callback_proxy_bypass_is_limited_to_loopback_hosts() {

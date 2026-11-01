@@ -1,0 +1,122 @@
+//! 用执行实例独有的标记停止查询，不依赖任务名、数据库名或数据库用户。
+use crate::{ClickHouseConfig, DatabaseError, Result, clickhouse::build_base_client, cluster_scan::identifier};
+use clickhouse::{Client, error::Error, query::Query};
+use std::{future::Future, time::Duration};
+use tokio::{select, time::sleep};
+use tokio_util::sync::CancellationToken;
+use uuid::Uuid;
+
+tokio::task_local! {
+    static SCAN_CANCELLATION: CancellationToken;
+}
+
+/// 仅作用于当前执行 future；并发 worker 各自进入此作用域，不影响其他任务。
+pub async fn with_scan_cancellation<T>(cancel: CancellationToken, work: impl Future<Output = T>) -> T {
+    SCAN_CANCELLATION.scope(cancel, work).await
+}
+
+pub(crate) fn check_scan_cancellation() -> Result<()> {
+    if SCAN_CANCELLATION
+        .try_with(CancellationToken::is_cancelled)
+        .unwrap_or(false)
+    {
+        Err(DatabaseError::ScanCancelled)
+    } else {
+        Ok(())
+    }
+}
+
+pub(crate) async fn scan_retry_delay(duration: Duration) -> Result<()> {
+    if let Ok(cancel) = SCAN_CANCELLATION.try_with(Clone::clone) {
+        select! {
+            biased;
+            _=cancel.cancelled()=>Err(DatabaseError::ScanCancelled),
+            _=sleep(duration)=>Ok(()),
+        }
+    } else {
+        sleep(duration).await;
+        Ok(())
+    }
+}
+
+pub(crate) trait ScanExecute {
+    async fn execute_scan(self) -> Result<()>;
+}
+
+impl ScanExecute for Query {
+    async fn execute_scan(self) -> Result<()> {
+        check_scan_cancellation()?;
+        Ok(self.execute().await?)
+    }
+}
+
+#[derive(Clone)]
+pub struct ScanQueryCancellation {
+    client: Client,
+    comment: String,
+    cluster: Option<String>,
+}
+
+impl ScanQueryCancellation {
+    pub(super) fn new(config: &ClickHouseConfig, cluster: Option<&str>) -> Result<Self> {
+        Ok(Self {
+            client: build_base_client(config),
+            comment: format!("terrasync-scan-{}", Uuid::new_v4()),
+            cluster: cluster.filter(|value| !value.is_empty()).map(identifier).transpose()?,
+        })
+    }
+
+    pub(super) fn comment(&self) -> &str {
+        &self.comment
+    }
+
+    /// 终止当前已注册的查询；调用方仍须等待所有已发出的请求返回，空匹配不构成完成证据。
+    pub async fn cancel(&self) -> Result<()> {
+        let cluster = self
+            .cluster
+            .as_ref()
+            .map_or(String::new(), |name| format!(" ON CLUSTER {name}"));
+        let result = self
+            .client
+            .query(&format!("KILL QUERY{cluster} WHERE Settings['log_comment']=? SYNC"))
+            .bind(&self.comment)
+            .execute()
+            .await;
+        match result {
+            // 不同版本对于空匹配的行为不同；没有查询需要停止也是成功。
+            Err(Error::BadResponse(message)) if message.contains("NOTHING_TO_KILL") => Ok(()),
+            result => Ok(result?),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clickhouse::test::{Mock, handlers};
+
+    #[tokio::test]
+    async fn cancellation_is_scoped_to_one_execution_and_all_replicas() -> Result<()> {
+        let mock = Mock::new();
+        let config = ClickHouseConfig {
+            dsn: mock.url().into(),
+            database: "fixture".into(),
+            username: "default".into(),
+            password: None,
+            dial_timeout: 1,
+            read_timeout: 1,
+        };
+        let first = ScanQueryCancellation::new(&config, Some("clickhouse"))?;
+        let other = ScanQueryCancellation::new(&config, Some("clickhouse"))?;
+        assert_ne!(first.comment(), other.comment());
+        let captured = mock.add(handlers::record_ddl());
+        first.cancel().await?;
+        let query = captured.query().await;
+        assert!(query.contains("ON CLUSTER `clickhouse`"));
+        assert!(query.contains(first.comment()));
+        assert!(!query.contains(other.comment()));
+        assert!(query.contains("Settings['log_comment']="));
+        assert!(query.ends_with("SYNC"));
+        Ok(())
+    }
+}

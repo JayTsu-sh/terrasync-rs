@@ -119,14 +119,14 @@ impl ClusterScanStore {
     pub(crate) async fn cleanup_candidates(&self, time: i64) -> Result<()> {
         let database = identifier(&self.database)?;
         let cluster = identifier(&self.cluster)?;
-        self.client.clone().with_option("mutations_sync","2").query(&format!("ALTER TABLE {database}.incremental_local ON CLUSTER {cluster} DELETE WHERE job_id=? AND epoch=? AND operation_type IN ('candidate_new','displaced_old')")).bind(&self.job_id).bind(time as u64).execute().await?;
+        self.client.clone().with_option("mutations_sync","2").query(&format!("ALTER TABLE {database}.incremental_local ON CLUSTER {cluster} DELETE WHERE job_id=? AND epoch=? AND operation_type IN ('candidate_new','displaced_old')")).bind(&self.job_id).bind(time as u64).execute_scan().await?;
         Ok(())
     }
     pub(crate) async fn merge_native(&self) -> Result<()> {
         let _guard = self.writes.base.lock().await;
         retry_quorum(||async {
             let database=identifier(&self.database)?;
-            self.client.query(&format!("INSERT INTO {database}.base (job_id,epoch,ver,{OBSERVED_COLUMNS}) SELECT job_id,epoch,ver,{OBSERVED_COLUMNS} FROM {database}.scan_resume_batch WHERE job_id=? AND batch_id=?")).bind(&self.job_id).bind(self.batch_id).execute().await?;
+            self.client.query(&format!("INSERT INTO {database}.base (job_id,epoch,ver,{OBSERVED_COLUMNS}) SELECT job_id,epoch,ver,{OBSERVED_COLUMNS} FROM {database}.scan_resume_batch WHERE job_id=? AND batch_id=?")).bind(&self.job_id).bind(self.batch_id).execute_scan().await?;
             Ok(())
         }).await
     }

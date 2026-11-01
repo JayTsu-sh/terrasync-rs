@@ -20,6 +20,8 @@ use thiserror::Error;
 /// 使用thiserror库实现错误处理和转换
 #[derive(Error, Debug)]
 pub enum DatabaseError {
+    #[error("Scan database operation cancelled before starting another request")]
+    ScanCancelled,
     #[error("System clock is before the epoch: {0}")]
     SystemClock(#[from] std::time::SystemTimeError),
     #[error("Integer conversion failed: {0}")]
