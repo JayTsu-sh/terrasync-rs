@@ -1,4 +1,5 @@
 //! 共享表的集群扫描存储。所有读写在这里绑定 job_id，业务层不拼接集群 SQL。
+use crate::clickhouse::replica_read::QuorumRead;
 #[cfg(test)]
 use std::collections::HashMap;
 use std::future::Future;
@@ -152,12 +153,12 @@ impl ClusterScanStore {
     }
 
     pub(crate) async fn ping(&self) -> Result<()> {
-        self.client.query("SELECT 1").fetch_one::<u8>().await?;
+        self.client.query("SELECT 1").fetch_quorum_one::<u8>().await?;
         let count: u64 = self
             .client
             .query("SELECT count() FROM system.clusters WHERE cluster=?")
             .bind(&self.cluster)
-            .fetch_one()
+            .fetch_quorum_one()
             .await?;
         if count == 0 {
             return Err(DatabaseError::ConfigError(
@@ -187,7 +188,7 @@ impl ClusterScanStore {
             .client
             .query("SELECT name FROM system.columns WHERE database=? AND table='base_local'")
             .bind(&self.database)
-            .fetch_all::<String>()
+            .fetch_quorum_all::<String>()
             .await?;
         if !columns.is_empty()
             && !["job_id", "epoch", "batch_id", "current_state", "is_deleted"]
@@ -282,7 +283,7 @@ impl ClusterScanStore {
                 .bind(&self.cluster)
                 .bind(&self.database)
                 .bind(table)
-                .fetch_one()
+                .fetch_quorum_one()
                 .await?;
             if exists > 0 {
                 self.client
@@ -306,7 +307,7 @@ impl ClusterScanStore {
                 .query("SELECT count() FROM system.tables WHERE database=? AND name=?")
                 .bind(&self.database)
                 .bind(table)
-                .fetch_one()
+                .fetch_quorum_one()
                 .await?;
             if exists == 0 {
                 continue;
@@ -317,7 +318,7 @@ impl ClusterScanStore {
                     "SELECT DISTINCT batch_id FROM {database}.{table} WHERE job_id=?"
                 ))
                 .bind(&self.job_id)
-                .fetch_all::<u64>()
+                .fetch_quorum_all::<u64>()
                 .await?;
             for batch in batches {
                 self.client
@@ -337,7 +338,7 @@ impl ClusterScanStore {
         let database = identifier(&self.database)?;
         self.initialize().await?;
         self.cleanup_abandoned_batches().await?;
-        let row=self.client.query(&format!("SELECT id,schema_version,version,request_key,generation,incremental,phase,event_time,observed_entries,checkpoint,statistics FROM {database}.scan_resume FINAL WHERE job_id=?")).bind(&self.job_id).fetch_one::<ScanResumeState>().await;
+        let row=self.client.query(&format!("SELECT id,schema_version,version,request_key,generation,incremental,phase,event_time,observed_entries,checkpoint,statistics FROM {database}.scan_resume FINAL WHERE job_id=?")).bind(&self.job_id).fetch_quorum_one::<ScanResumeState>().await;
         match row {
             Ok(state) => {
                 state.validate(&state.request_key)?;
@@ -374,7 +375,7 @@ impl ClusterScanStore {
                 "SELECT job_id,generation,epoch,ver FROM {database}.state FINAL WHERE job_id=?"
             ))
             .bind(&self.job_id)
-            .fetch_one::<CommittedScan>()
+            .fetch_quorum_one::<CommittedScan>()
             .await
         {
             Ok(row) => Ok(Some(row)),
@@ -388,7 +389,7 @@ impl ClusterScanStore {
             .client
             .query("SELECT count() FROM system.tables WHERE database=? AND name='scan_resume'")
             .bind(&self.database)
-            .fetch_one()
+            .fetch_quorum_one()
             .await?;
         if exists == 0 {
             return Ok(false);
@@ -399,7 +400,7 @@ impl ClusterScanStore {
                 "SELECT incremental,phase FROM {database}.scan_resume FINAL WHERE job_id=?"
             ))
             .bind(&self.job_id)
-            .fetch_one::<(bool, u8)>()
+            .fetch_quorum_one::<(bool, u8)>()
             .await
         {
             Ok((incremental, phase)) if phase <= FINALIZING => return Ok(incremental),
@@ -420,7 +421,7 @@ impl ClusterScanStore {
                 "SELECT count() FROM {database}.scan_resume FINAL WHERE job_id=?"
             ))
             .bind(&self.job_id)
-            .fetch_one()
+            .fetch_quorum_one()
             .await?;
         Ok(count > 0)
     }
@@ -457,7 +458,7 @@ impl ClusterScanStore {
                     "SELECT generation FROM {database}.scan_resume FINAL WHERE job_id=?"
                 ))
                 .bind(&self.job_id)
-                .fetch_one()
+                .fetch_quorum_one()
                 .await?;
             let mut insert = self.client.insert::<CommittedScan>("state").await?;
             insert
@@ -481,7 +482,7 @@ impl ClusterScanStore {
                 "SELECT ifNull(max(event_time),0) FROM {database}.scan_resume FINAL WHERE job_id=?"
             ))
             .bind(&self.job_id)
-            .fetch_one()
+            .fetch_quorum_one()
             .await?;
         Ok(now.max(
             last.checked_add(1)
@@ -599,7 +600,7 @@ impl ClusterScanStore {
             ))
             .bind(&self.job_id)
             .bind(self.epoch.load(Ordering::Relaxed))
-            .fetch_all::<StorageEntryRecord>()
+            .fetch_quorum_all::<StorageEntryRecord>()
             .await?;
         let mut no_handles = Vec::new();
         let mut handles = Vec::new();
@@ -628,7 +629,7 @@ impl ClusterScanStore {
                 ))
                 .bind(&self.job_id)
                 .bind(&keys)
-                .fetch_all::<StorageEntryRecord>()
+                .fetch_quorum_all::<StorageEntryRecord>()
                 .await?;
             for row in rows {
                 if let Some(handle) = &row.file_handle {

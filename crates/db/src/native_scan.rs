@@ -1,4 +1,5 @@
 //! 单机与集群共用的原生扫描比较：限定本批主键，保留后端身份补查和旧基线兼容。
+use crate::clickhouse::replica_read::QuorumRead;
 use crate::scan_store::ScanFinalEvent;
 use crate::{
     common::FILE_SCAN_COLUMNS_LIST,
@@ -100,7 +101,7 @@ impl NativeScanAccess<'_> {
             .query(&sql)
             .bind(&paths[0])
             .bind(&paths[paths.len() - 1])
-            .fetch_all::<Baseline>()
+            .fetch_quorum_all::<Baseline>()
             .await?;
         let mut events = Vec::new();
         let mut absent = Vec::new();
@@ -165,7 +166,7 @@ impl NativeScanAccess<'_> {
                 lookup
             };
             let existing: FxHashSet<SmolStr> = lookup
-                .fetch_all::<String>()
+                .fetch_quorum_all::<String>()
                 .await?
                 .into_iter()
                 .map(SmolStr::new)
@@ -184,7 +185,7 @@ impl NativeScanAccess<'_> {
                 .map(|name| format!("b.{}", name.trim()))
                 .collect::<Vec<_>>()
                 .join(",");
-            self.client.query(&format!("SELECT {columns} FROM (SELECT {} FROM {} {} WHERE {} AND {} AND NOT ({}) AND relative_path BETWEEN ? AND ? AND (relative_path,version_id) IN (SELECT relative_path,version_id FROM {} WHERE {})) AS b INNER JOIN (SELECT relative_path,version_id,file_handle FROM {} WHERE {}) AS s USING(relative_path,version_id) WHERE b.file_handle IS NOT NULL AND startsWith(b.file_handle,'54534934') AND s.file_handle IS NOT NULL AND b.file_handle!=s.file_handle LIMIT 1 BY b.relative_path,b.version_id",*FILE_SCAN_COLUMNS_LIST,self.base,self.final_clause,self.scope,self.live,self.active,self.stage,self.stage_scope,self.stage,self.stage_scope)).bind(&paths[0]).bind(&paths[paths.len()-1]).fetch_all::<StorageEntryRecord>().await?
+            self.client.query(&format!("SELECT {columns} FROM (SELECT {} FROM {} {} WHERE {} AND {} AND NOT ({}) AND relative_path BETWEEN ? AND ? AND (relative_path,version_id) IN (SELECT relative_path,version_id FROM {} WHERE {})) AS b INNER JOIN (SELECT relative_path,version_id,file_handle FROM {} WHERE {}) AS s USING(relative_path,version_id) WHERE b.file_handle IS NOT NULL AND startsWith(b.file_handle,'54534934') AND s.file_handle IS NOT NULL AND b.file_handle!=s.file_handle LIMIT 1 BY b.relative_path,b.version_id",*FILE_SCAN_COLUMNS_LIST,self.base,self.final_clause,self.scope,self.live,self.active,self.stage,self.stage_scope,self.stage,self.stage_scope)).bind(&paths[0]).bind(&paths[paths.len()-1]).fetch_quorum_all::<StorageEntryRecord>().await?
         } else {
             Vec::new()
         };
@@ -192,7 +193,7 @@ impl NativeScanAccess<'_> {
     }
     pub async fn final_events(&self, time: i64) -> Result<Vec<ScanFinalEvent>> {
         let columns = &*FILE_SCAN_COLUMNS_LIST;
-        let mut old=self.client.query(&format!("SELECT {columns} FROM {} {} WHERE {} AND {} AND NOT ({}) ORDER BY relative_path,version_id LIMIT 1 BY relative_path,version_id",self.base,self.final_clause,self.scope,self.live,self.active)).fetch_all::<StorageEntryRecord>().await?;
+        let mut old=self.client.query(&format!("SELECT {columns} FROM {} {} WHERE {} AND {} AND NOT ({}) ORDER BY relative_path,version_id LIMIT 1 BY relative_path,version_id",self.base,self.final_clause,self.scope,self.live,self.active)).fetch_quorum_all::<StorageEntryRecord>().await?;
         let event_scope = format!("{} AND toUnixTimestamp64Nano(create_at)>={time}", self.scope);
         let displaced = self
             .client
@@ -200,7 +201,7 @@ impl NativeScanAccess<'_> {
                 "SELECT {columns} FROM {} FINAL WHERE {event_scope} AND operation_type='displaced_old'",
                 self.events
             ))
-            .fetch_all::<StorageEntryRecord>()
+            .fetch_quorum_all::<StorageEntryRecord>()
             .await?;
         let mut known: FxHashSet<_> = old
             .iter()
@@ -219,7 +220,7 @@ impl NativeScanAccess<'_> {
                 row.file_handle.as_ref().map(SmolStr::new),
             ))
         }));
-        let candidates=self.client.query(&format!("SELECT {columns} FROM {} {} WHERE {} AND {} AND {} AND (relative_path,version_id) IN (SELECT relative_path,version_id FROM {} FINAL WHERE {event_scope} AND operation_type='candidate_new') ORDER BY relative_path,version_id LIMIT 1 BY relative_path,version_id",self.base,self.final_clause,self.scope,self.live,self.active,self.events)).fetch_all::<StorageEntryRecord>().await?;
+        let candidates=self.client.query(&format!("SELECT {columns} FROM {} {} WHERE {} AND {} AND {} AND (relative_path,version_id) IN (SELECT relative_path,version_id FROM {} FINAL WHERE {event_scope} AND operation_type='candidate_new') ORDER BY relative_path,version_id LIMIT 1 BY relative_path,version_id",self.base,self.final_clause,self.scope,self.live,self.active,self.events)).fetch_quorum_all::<StorageEntryRecord>().await?;
         if candidates.is_empty() {
             return Ok(old.into_iter().map(ScanFinalEvent::Deleted).collect());
         }
@@ -233,9 +234,9 @@ impl NativeScanAccess<'_> {
         let handles: Vec<_> = handles.iter().map(SmolStr::as_str).collect();
         // TSI4 摘要固定 72 字符；分块把绑定后的 SQL 限在默认查询长度预算内。
         for keys in handles.chunks(512) {
-            let rows=self.client.query(&format!("SELECT assumeNotNull(file_handle),count() FROM {} {} WHERE {} AND {} AND {} AND file_handle IN ? GROUP BY file_handle",self.base,self.final_clause,self.scope,self.live,self.active)).bind(keys).fetch_all::<(String,u64)>().await?;
+            let rows=self.client.query(&format!("SELECT assumeNotNull(file_handle),count() FROM {} {} WHERE {} AND {} AND {} AND file_handle IN ? GROUP BY file_handle",self.base,self.final_clause,self.scope,self.live,self.active)).bind(keys).fetch_quorum_all::<(String,u64)>().await?;
             counts.extend(rows.into_iter().map(|(handle, count)| (SmolStr::new(handle), count)));
-            history.extend(self.client.query(&format!("SELECT operation_type,relative_path,version_id,file_handle,comment FROM {} FINAL WHERE {event_scope} AND operation_type IN ('new','deleted','rename') AND file_handle IN ?",self.events)).bind(keys).fetch_all::<FinalHistory>().await?);
+            history.extend(self.client.query(&format!("SELECT operation_type,relative_path,version_id,file_handle,comment FROM {} FINAL WHERE {event_scope} AND operation_type IN ('new','deleted','rename') AND file_handle IN ?",self.events)).bind(keys).fetch_quorum_all::<FinalHistory>().await?);
         }
         resolve_final_events(old, candidates, &history, &counts)
     }
