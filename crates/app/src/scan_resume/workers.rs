@@ -56,7 +56,8 @@ pub(super) async fn consume(
         let completed = completed.map_err(AppError::from).and_then(|result| result);
         if let Err(error) = completed {
             cancel.cancel();
-            if result.is_ok() {
+            // 队列关闭只是 worker 失败的后果，优先返回实际数据库或处理错误。
+            if result.is_ok() || matches!(result, Err(AppError::ScanWorkerStopped)) {
                 result = Err(error);
             }
         }
@@ -180,7 +181,7 @@ async fn work(
 }
 
 fn worker_stopped() -> AppError {
-    AppError::ConsumerError("Required database scan worker stopped before acknowledgement".into())
+    AppError::ScanWorkerStopped
 }
 
 #[cfg(test)]
