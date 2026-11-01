@@ -4,6 +4,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use chrono::DateTime;
+use reqwest::Client;
 use serde::Deserialize;
 use tracing::warn;
 
@@ -31,10 +32,10 @@ impl AnalysisRepository for ClickHouseAnalysisRepo {
         let config = load_ch_config(self.config_repo.as_ref())
             .await?
             .ok_or_else(|| WebError::AnalysisUnavailable("请先配置 ClickHouse，再读取扫描明细".to_string()))?;
-        let client = reqwest::Client::builder()
+        let client = Client::builder()
             .timeout(Duration::from_secs(30))
             .build()
-            .map_err(|e| WebError::ConnectionTestFailed(e.to_string()))?;
+            .map_err(analysis_request_failed)?;
         let cluster_mode = config.cluster.is_some();
         let table = if cluster_mode {
             "base".to_string()
@@ -90,10 +91,17 @@ struct ColumnRow {
     name: String,
 }
 
-async fn query(client: &reqwest::Client, config: &ChConfig, sql: &str, parameters: &[(&str, &str)]) -> Result<String> {
-    let mut url = reqwest::Url::parse(config.dsn.trim_end_matches('/'))
-        .map_err(|e| WebError::ConnectionTestFailed(e.to_string()))?;
-    url.query_pairs_mut()
+async fn query(client: &Client, config: &ChConfig, sql: &str, parameters: &[(&str, &str)]) -> Result<String> {
+    let mut request = client
+        .post(config.dsn.trim_end_matches('/'))
+        .basic_auth(&config.username, Some(&config.password))
+        .header("X-ClickHouse-Database", &config.database)
+        .body(sql.to_string())
+        .build()
+        .map_err(analysis_request_failed)?;
+    request
+        .url_mut()
+        .query_pairs_mut()
         .extend_pairs(parameters.iter().copied())
         .extend_pairs([
             ("output_format_json_quote_64bit_integers", "0"),
@@ -101,14 +109,7 @@ async fn query(client: &reqwest::Client, config: &ChConfig, sql: &str, parameter
             ("max_result_rows", "501"),
             ("max_result_bytes", "8388608"),
         ]);
-    let response = client
-        .post(url)
-        .basic_auth(&config.username, Some(&config.password))
-        .header("X-ClickHouse-Database", &config.database)
-        .body(sql.to_string())
-        .send()
-        .await
-        .map_err(|e| WebError::ConnectionTestFailed(e.to_string()))?;
+    let response = client.execute(request).await.map_err(analysis_request_failed)?;
     if !response.status().is_success() {
         let status = response.status();
         let body = response.text().await.unwrap_or_default();
@@ -118,10 +119,14 @@ async fn query(client: &reqwest::Client, config: &ChConfig, sql: &str, parameter
             "无法读取扫描明细，请检查数据库连接或重新执行扫描".to_string(),
         ));
     }
-    response
-        .text()
-        .await
-        .map_err(|e| WebError::ConnectionTestFailed(e.to_string()))
+    response.text().await.map_err(analysis_request_failed)
+}
+
+fn analysis_request_failed(source: reqwest::Error) -> WebError {
+    WebError::ClickHouseRequestFailed {
+        message: "无法读取扫描明细，请检查数据库连接或重新执行扫描",
+        source,
+    }
 }
 
 /// 仅从数据库取 limit + 1 个汇总桶；长尾在数据库内合并，保持容量/数量守恒。
@@ -227,10 +232,27 @@ fn decode_nodes(body: &str) -> Result<Vec<AnalysisNode>> {
 
 #[cfg(test)]
 mod tests {
+    use reqwest::Client;
     use std::process::Command;
 
-    use super::{children_query, decode_nodes};
+    use super::{children_query, decode_nodes, query};
     use crate::domain::analysis::AnalysisMetric;
+    use crate::error::WebError;
+    use crate::infrastructure::task_runner::ChConfig;
+
+    #[tokio::test]
+    async fn invalid_query_url_preserves_typed_http_failure() {
+        let config = ChConfig {
+            cluster: None,
+            dsn: "http://[invalid-private-host".into(),
+            username: "private-user".into(),
+            password: "private-password".into(),
+            database: "default".into(),
+            batch_size: 1_000,
+        };
+        let result = query(&Client::new(), &config, "SELECT 1", &[]).await;
+        assert!(matches!(result, Err(WebError::ClickHouseRequestFailed { .. })));
+    }
 
     #[test]
     fn keeps_bound_path_parameters_and_limits_both_schema_variants() {

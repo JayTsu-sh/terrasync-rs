@@ -1,6 +1,7 @@
 //! 原生扫描的数据库行投影；只在 SQL 序列化处展开事实，运行时保留 ObservedEntry。
 #[cfg(test)]
 use crate::error::DatabaseError;
+use crate::scan_store::ScanFinalEvent;
 use crate::{
     error::Result,
     traits::{IncrementalStorageEntryRecord, StorageEntryRecord},
@@ -10,8 +11,9 @@ use data_mover::model::{BackendIdentity, IdentityStrength, RecordKind, SourceIde
 use data_mover::model::{
     BackendKind, EntryKind, EntrySnapshot, HistoryOrder, ObjectHistory, ObservedEntry, StorageTimestamp,
 };
+use rustc_hash::FxHashMap;
 use serde::{Serialize, Serializer};
-use std::collections::HashMap;
+use smol_str::SmolStr;
 #[cfg(test)]
 use std::sync::Arc;
 use storage_adapter::Tag;
@@ -182,12 +184,12 @@ impl NativeScanRecord {
 }
 
 pub(crate) fn event_records(events: &[ObservedScanEvent], time: i64) -> Result<Vec<IncrementalStorageEntryRecord>> {
-    let mut added: HashMap<String, u32> = HashMap::new();
+    let mut added: FxHashMap<SmolStr, u32> = FxHashMap::default();
     for event in events {
         if let ObservedScanEvent::New(item) = event
             && item.version_index.is_some()
         {
-            let count = added.entry(item.view().path()).or_default();
+            let count = added.entry(SmolStr::new(item.view().path())).or_default();
             *count = count.saturating_add(1);
         }
     }
@@ -196,7 +198,7 @@ pub(crate) fn event_records(events: &[ObservedScanEvent], time: i64) -> Result<V
         .map(|event| {
             let mut record = event_record(event, time)?;
             if matches!(event, ObservedScanEvent::New(_)) && record.version_count.is_some() {
-                record.version_count = added.get(&record.relative_path).copied();
+                record.version_count = added.get(record.relative_path.as_str()).copied();
             }
             Ok(record)
         })
@@ -214,6 +216,13 @@ pub(crate) fn event_record(event: &ObservedScanEvent, event_time: i64) -> Result
         },
         event_time,
     ))
+}
+
+pub(crate) fn final_event_records(events: &[ScanFinalEvent], time: i64) -> Vec<IncrementalStorageEntryRecord> {
+    events
+        .iter()
+        .map(|event| incremental_record(event.item().clone(), event.operation(), event.previous_path(), time))
+        .collect()
 }
 
 pub(crate) fn incremental_record(

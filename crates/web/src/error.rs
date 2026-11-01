@@ -77,6 +77,14 @@ pub enum WebError {
     #[error("Connection test failed: {0}")]
     ConnectionTestFailed(String),
 
+    /// 保留数据库 HTTP 错误链；响应只展示固定提示。
+    #[error("{message}")]
+    ClickHouseRequestFailed {
+        message: &'static str,
+        #[source]
+        source: reqwest::Error,
+    },
+
     /// 端点 backend 构造失败，保留类型化错误链供服务端诊断。
     #[error("Endpoint connection setup failed")]
     EndpointAppConnectionFailed(#[source] AppError),
@@ -164,6 +172,7 @@ impl IntoResponse for WebError {
             | WebError::AnalysisUnavailable(_) => StatusCode::CONFLICT,
 
             WebError::ConnectionTestFailed(_)
+            | WebError::ClickHouseRequestFailed { .. }
             | WebError::EndpointAppConnectionFailed(_)
             | WebError::EndpointStorageConnectionFailed(_) => StatusCode::BAD_GATEWAY,
 
@@ -179,7 +188,10 @@ impl IntoResponse for WebError {
             _ => None,
         };
         // 可预期的连接失败提供安全提示；其他 5xx 仍隐藏内部错误。
-        let error_msg = if let Some(class) = connection_error {
+        let error_msg = if let WebError::ClickHouseRequestFailed { message, source } = &self {
+            error!(error = ?source, status = %status, "ClickHouse request failed");
+            (*message).to_string()
+        } else if let Some(class) = connection_error {
             error!(failure_class = ?class, status = %status, "Endpoint connection test failed");
             connection_failure_message(class).to_string()
         } else if status.is_server_error() {
@@ -202,8 +214,29 @@ mod tests {
     use data_mover::model::{EntryOperationFailure, FailureClass, Operation, StoragePath, Transience};
     use data_mover::probes::{ProbeError, ProbeFailure};
     use data_mover::storage::StorageRoleFailure;
+    use reqwest::Client;
+    use std::error::Error as StdError;
 
     type TestResult = std::result::Result<(), Box<dyn std::error::Error + Send + Sync>>;
+
+    #[tokio::test]
+    async fn clickhouse_http_error_keeps_its_source_and_only_returns_safe_context() -> TestResult {
+        let Err(source) = Client::new().get("http://[private-host").build() else {
+            panic!("invalid URL must fail before sending a request");
+        };
+        let error = WebError::ClickHouseRequestFailed {
+            message: "清理旧扫描失败，请检查数据库连接后重试",
+            source,
+        };
+        assert!(StdError::source(&error).is_some());
+        let response = error.into_response();
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        let body = to_bytes(response.into_body(), 4096).await?;
+        let value: serde_json::Value = serde_json::from_slice(&body)?;
+        assert_eq!(value["error"], "清理旧扫描失败，请检查数据库连接后重试");
+        assert!(!String::from_utf8_lossy(&body).contains("private-host"));
+        Ok(())
+    }
 
     #[tokio::test]
     async fn connection_test_returns_safe_actionable_failure() -> TestResult {

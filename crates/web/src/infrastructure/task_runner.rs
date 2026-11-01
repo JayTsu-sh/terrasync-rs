@@ -428,7 +428,10 @@ async fn drop_scan_tables(job_id: &str) -> Result<()> {
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
         .build()
-        .map_err(|_| WebError::ValidationError("无法初始化数据库连接".into()))?;
+        .map_err(|source| WebError::ClickHouseRequestFailed {
+            message: "无法初始化数据库连接",
+            source,
+        })?;
     for prefix in [
         "base",
         "state",
@@ -447,7 +450,10 @@ async fn drop_scan_tables(job_id: &str) -> Result<()> {
             .body(format!("DROP TABLE IF EXISTS `{table}`"))
             .send()
             .await
-            .map_err(|_| WebError::ValidationError("清理旧扫描失败，请检查数据库连接后重试".into()))?;
+            .map_err(|source| WebError::ClickHouseRequestFailed {
+                message: "清理旧扫描失败，请检查数据库连接后重试",
+                source,
+            })?;
         if !response.status().is_success() {
             return Err(WebError::ValidationError("清理旧扫描失败，未启动新扫描".into()));
         }

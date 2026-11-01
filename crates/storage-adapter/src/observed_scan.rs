@@ -165,20 +165,29 @@ pub fn timestamp_nanos(time: Option<StorageTimestamp>) -> i64 {
 #[derive(Clone, Debug)]
 pub enum ObservedScanEvent {
     New(ObservedItem),
-    Changed { item: ObservedItem, kind: ChangeKind },
+    /// 稳定身份已存在，整轮结束后再区分重命名和新增硬链接。
+    Candidate(ObservedItem),
+    Changed {
+        item: ObservedItem,
+        kind: ChangeKind,
+    },
     Deleted(ObservedItem),
-    Renamed { from: ObservedItem, to: ObservedItem },
+    Renamed {
+        from: ObservedItem,
+        to: ObservedItem,
+    },
 }
 impl ObservedScanEvent {
     pub fn item(&self) -> &ObservedItem {
         match self {
-            Self::New(item) | Self::Changed { item, .. } | Self::Deleted(item) => item,
+            Self::Candidate(item) | Self::New(item) | Self::Changed { item, .. } | Self::Deleted(item) => item,
             Self::Renamed { to, .. } => to,
         }
     }
     pub fn operation(&self) -> &'static str {
         match self {
             Self::New(_) => "new",
+            Self::Candidate(_) => "candidate_new",
             Self::Changed { kind, .. } => kind.as_state_str(),
             Self::Deleted(_) => "deleted",
             Self::Renamed { .. } => "rename",

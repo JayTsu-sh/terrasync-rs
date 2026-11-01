@@ -21,6 +21,8 @@ thiserror   = { workspace = true }
 tokio       = { version = "1.51", features = ["sync", "rt"] }
 utils       = { workspace = true }
 uuid        = { workspace = true }
+smol_str    = { workspace = true }
+rustc-hash  = { workspace = true }
 
 [lints]
 workspace = true

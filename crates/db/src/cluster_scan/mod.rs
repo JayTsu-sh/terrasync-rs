@@ -458,13 +458,7 @@ impl ClusterScanStore {
 
     pub(crate) async fn begin_resume_batch(&mut self) -> Result<()> {
         self.drop_batch().await?;
-        self.batch_id = u64::try_from(
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map_err(|e| DatabaseError::ConversionError(e.to_string()))?
-                .as_nanos(),
-        )
-        .map_err(|e| DatabaseError::ConversionError(e.to_string()))?;
+        self.batch_id = u64::try_from(SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos())?;
         Ok(())
     }
     #[cfg(test)]
@@ -620,10 +614,10 @@ impl ClusterScanStore {
         let keys_id = u64::try_from(
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
-                .map_err(|e| DatabaseError::ConversionError(e.to_string()))?
+                ?
                 .as_nanos(),
         )
-        .map_err(|e| DatabaseError::ConversionError(e.to_string()))?;
+        ?;
         let mut insert = self.client.insert::<EntryKey>("scan_resume_keys").await?;
         for (path, version) in entries {
             insert
@@ -637,7 +631,7 @@ impl ClusterScanStore {
         }
         insert.end().await?;
         let columns = &*FILE_SCAN_COLUMNS_LIST;
-        self.client.query(&format!("INSERT INTO {database}.base (job_id,epoch,ver,is_deleted,{columns}) SELECT job_id,?,fromUnixTimestamp64Nano(?),1,{columns} FROM {database}.base FINAL WHERE job_id=? AND is_deleted=0 AND (relative_path,version_id) IN (SELECT relative_path,version_id FROM {database}.scan_resume_keys WHERE job_id=? AND batch_id=?)")).bind(self.epoch.load(Ordering::Relaxed)).bind(self.epoch.load(Ordering::Relaxed) as i64).bind(&self.job_id).bind(&self.job_id).bind(keys_id).execute().await?;
+        self.client.query(&format!("INSERT INTO {database}.base (job_id,epoch,ver,is_deleted,{columns}) SELECT job_id,?,fromUnixTimestamp64Nano(?),1,{columns} FROM {database}.base FINAL WHERE job_id=? AND is_deleted=0 AND epoch!=? AND (relative_path,version_id) IN (SELECT relative_path,version_id FROM {database}.scan_resume_keys WHERE job_id=? AND batch_id=?)")).bind(self.epoch.load(Ordering::Relaxed)).bind(self.epoch.load(Ordering::Relaxed) as i64).bind(&self.job_id).bind(self.epoch.load(Ordering::Relaxed)).bind(&self.job_id).bind(keys_id).execute().await?;
         self.client
             .query(&format!(
                 "ALTER TABLE {database}.scan_resume_keys_local ON CLUSTER {} DROP PARTITION (?,?)",

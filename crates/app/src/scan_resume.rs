@@ -11,7 +11,7 @@ use std::{
 use data_mover::model::ObservedEntry;
 use data_mover::traversal::Resumable;
 use db::clickhouse::scan_resume::{COMPLETED, RUNNING, ScanResumeState};
-use db::scan_store::{ScanDeletion, ScanStore};
+use db::scan_store::{ScanFinalEvent, ScanStore};
 #[cfg(feature = "license")]
 use licensing::verify::quick_verify;
 use storage_adapter::filter::parse_filter_expression;
@@ -248,7 +248,7 @@ async fn run(
         pipeline::consume(source, database, state, consumers, batch_size, cancel).await?;
     }
     if state.incremental {
-        finalize_deletions(database, state, consumers, batch_size).await?;
+        finalize_events(database, state, consumers, batch_size).await?;
     }
     consumers
         .reconcile_scan_statistics(
@@ -301,30 +301,29 @@ async fn flush_batch(
     Ok(())
 }
 
-async fn finalize_deletions(
+async fn finalize_events(
     database: &ScanStore, state: &ScanResumeState, consumers: &ConsumerManager, batch_size: usize,
 ) -> Result<()> {
-    let deleted = database.detect_deleted_items().await?;
+    let deleted = database.resolve_final_events(state.event_time).await?;
     let mut events = Vec::with_capacity(batch_size);
     for entry in deleted {
         events.push(entry);
         if events.len() >= batch_size {
-            flush_deletions(database, state, consumers, &mut events).await?;
+            flush_final_events(database, state, consumers, &mut events).await?;
         }
     }
-    flush_deletions(database, state, consumers, &mut events).await
+    flush_final_events(database, state, consumers, &mut events).await?;
+    database.cleanup_candidates(state.event_time).await?;
+    Ok(())
 }
 
-async fn flush_deletions(
-    database: &ScanStore, state: &ScanResumeState, consumers: &ConsumerManager, events: &mut Vec<ScanDeletion>,
+async fn flush_final_events(
+    database: &ScanStore, state: &ScanResumeState, consumers: &ConsumerManager, events: &mut Vec<ScanFinalEvent>,
 ) -> Result<()> {
-    database.write_deletions(events, state.event_time).await?;
-    let keys: Vec<_> = events
-        .iter()
-        .map(|event| (event.from.relative_path.clone(), event.from.version_id.clone()))
-        .collect();
+    database.write_final_events(events, state.event_time).await?;
+    let keys: Vec<_> = events.iter().filter_map(ScanFinalEvent::deletion_key).collect();
     database.delete_resume_entries(&keys).await?;
-    consumers.record_scan_deletions(events).await;
+    consumers.record_final_events(events).await;
     events.clear();
     Ok(())
 }

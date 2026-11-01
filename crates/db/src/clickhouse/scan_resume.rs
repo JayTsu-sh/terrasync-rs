@@ -14,8 +14,8 @@ struct ResumeDeleteKey {
 }
 
 #[derive(Serialize, clickhouse::Row)]
-struct ResumeEventPath {
-    relative_path: String,
+struct ResumeEventPath<'a> {
+    relative_path: &'a str,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, clickhouse::Row)]
@@ -217,6 +217,13 @@ impl ClickHouseDatabase {
 
     /// 以路径与版本联合键删除，避免删除历史版本时误删同名的存活版本。
     pub async fn delete_resume_entries(&self, entries: &[(String, String)]) -> Result<()> {
+        self.delete_scan_entries(entries, None).await
+    }
+    pub(crate) async fn delete_previous_scan_entries(&self, entries: &[(String, String)]) -> Result<()> {
+        self.delete_scan_entries(entries, Some(self.get_cached_scan_state().await?))
+            .await
+    }
+    async fn delete_scan_entries(&self, entries: &[(String, String)], working: Option<u8>) -> Result<()> {
         if entries.is_empty() {
             return Ok(());
         }
@@ -238,19 +245,20 @@ impl ClickHouseDatabase {
         }
         insert.end().await?;
         let base = get_scan_base_table_name(&self.job_id);
+        let previous = working.map_or_else(String::new, |generation| format!("current_state != {generation} AND "));
         // 等待 mutation 完成后才能覆盖下一个批次的辅助键表。
         self.sync_client
             .clone()
             .with_option("lightweight_deletes_sync", "1")
             .query(&format!(
-                "DELETE FROM {base} WHERE (relative_path, version_id) IN (SELECT relative_path, version_id FROM {keys})"
+                "DELETE FROM {base} WHERE {previous}(relative_path, version_id) IN (SELECT relative_path, version_id FROM {keys})"
             ))
             .execute()
             .await?;
         Ok(())
     }
 
-    pub(super) async fn write_resume_keys(&self, paths: HashSet<String>) -> Result<String> {
+    pub(super) async fn write_resume_keys<S: AsRef<str>>(&self, paths: impl IntoIterator<Item = S>) -> Result<String> {
         let keys = format!("scan_resume_event_keys_{}", sanitize_job_id(&self.job_id));
         self.execute(
             &format!("CREATE TABLE IF NOT EXISTS {keys} (relative_path String) ENGINE = Memory"),
@@ -260,7 +268,11 @@ impl ClickHouseDatabase {
         self.execute(&format!("TRUNCATE TABLE {keys}"), &[]).await?;
         let mut insert = self.sync_client.insert::<ResumeEventPath>(&keys).await?;
         for path in paths {
-            insert.write(&ResumeEventPath { relative_path: path }).await?;
+            insert
+                .write(&ResumeEventPath {
+                    relative_path: path.as_ref(),
+                })
+                .await?;
         }
         insert.end().await?;
         Ok(keys)
@@ -365,7 +377,7 @@ mod tests {
 }
 
 impl ClickHouseDatabase {
-    /// 纯读取执行类型；未完成全量即使已有 job 目录也仍是全量续扫。
+    /// 未完成全量即使已有 job 目录或 base 表也仍是全量续扫。
     pub async fn resume_execution_is_incremental(&self) -> Result<bool> {
         if self.check_table_exists(&self.resume_table()).await? {
             match self
@@ -382,6 +394,6 @@ impl ClickHouseDatabase {
                 Err(error) => return Err(error.into()),
             }
         }
-        self.check_table_exists(&get_scan_base_table_name(&self.job_id)).await
+        self.has_committed_baseline().await
     }
 }

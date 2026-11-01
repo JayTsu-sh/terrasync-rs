@@ -15,10 +15,7 @@ impl ClusterScanStore {
             .fetch_one::<ScanResumeSummary>().await?;
         let extensions = self.client.query(&format!("SELECT lower(ifNull(ext,'')), toInt64(sum(size)), count() {scope} AND {regular} AND ext IS NOT NULL GROUP BY lower(ifNull(ext,''))"))
             .fetch_all::<(String,i64,u64)>().await?;
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_err(|e| DatabaseError::ConversionError(e.to_string()))?
-            .as_nanos();
+        let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
         let ages = self.client.query(&format!("SELECT toUInt8(multiIf(toUnixTimestamp64Nano(mtime)>{now}-86400000000000,0,toUnixTimestamp64Nano(mtime)>{now}-604800000000000,1,toUnixTimestamp64Nano(mtime)>{now}-2592000000000000,2,toUnixTimestamp64Nano(mtime)>{now}-15552000000000000,3,toUnixTimestamp64Nano(mtime)>{now}-31536000000000000,4,5)) AS bucket, toInt64(sum(size)), count() {scope} GROUP BY bucket"))
             .fetch_all::<(u8,i64,u64)>().await?;
         let sizes = self.client.query(&format!("SELECT toUInt8(multiIf(size<4096,0,size<65536,1,size<131072,2,size<262144,3,size<524288,4,size<1048576,5,size<2097152,6,size<16777216,7,size<67108864,8,size<134217728,9,size<536870912,10,11)) AS bucket, toInt64(sum(size)), count() {scope} AND {regular} GROUP BY bucket"))

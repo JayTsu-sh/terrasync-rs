@@ -1,6 +1,7 @@
 //! 真正经过六个副本的读写，验证共享表不会跨 job 比较或删除。
 use super::*;
 use crate::clickhouse::scan_resume::{COMPLETED, RUNNING};
+use crate::scan_store::ScanFinalEvent;
 use data_mover::model::{
     BackendIdentity, BackendKind, EntryKind, IdentityStrength, ObservedEntry, SourceIdentity, StoragePath,
 };
@@ -434,7 +435,20 @@ async fn cluster_shared_native_observations_roundtrip_merge_replay_and_legacy_ba
     ];
     store.write_native(&entries, true).await?;
     let events = store.compare_native(&entries).await?;
-    assert_eq!(events.len(), 2);
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| !matches!(event, ObservedScanEvent::Candidate(_)))
+            .count(),
+        2
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event, ObservedScanEvent::Candidate(_)))
+            .count(),
+        1
+    );
     assert!(
         events
             .iter()
@@ -444,17 +458,13 @@ async fn cluster_shared_native_observations_roundtrip_merge_replay_and_legacy_ba
     store.events_native(&events, incremental.event_time).await?;
     store.merge_native().await?;
     assert!(store.compare_native(&entries).await?.is_empty());
-    let deleted = store.delete_native().await?;
+    let deleted = store.resolve_final_events_native(incremental.event_time).await?;
     assert_eq!(deleted.len(), 3);
-    assert!(
-        deleted.iter().any(|event| event.from.relative_path == "a/old"
-            && event.to.as_ref().is_some_and(|to| to.relative_path == "z/new"))
-    );
-    store.deletions_native(&deleted, incremental.event_time).await?;
-    let keys: Vec<_> = deleted
-        .iter()
-        .map(|event| (event.from.relative_path.clone(), event.from.version_id.clone()))
-        .collect();
+    assert!(deleted.iter().any(|event|matches!(event,ScanFinalEvent::Renamed{from_path,to,..} if from_path=="a/old" && to.relative_path=="z/new")));
+    store
+        .write_final_events_native(&deleted, incremental.event_time)
+        .await?;
+    let keys: Vec<_> = deleted.iter().filter_map(ScanFinalEvent::deletion_key).collect();
     store.delete_resume_entries(&keys).await?;
     let rows=store.client.query("SELECT relative_path,entry_snapshot,identity_key FROM base FINAL WHERE job_id='native_a' AND is_deleted=0 ORDER BY relative_path").fetch_all::<NativeSnapshotRow>().await?;
     assert_eq!(rows.len(), 4);
@@ -463,6 +473,7 @@ async fn cluster_shared_native_observations_roundtrip_merge_replay_and_legacy_ba
         assert_eq!(entry.path().as_str(), row.relative_path);
         assert_eq!(hex::encode(entry.identity_key().as_bytes()), row.identity_key);
     }
+    store.cleanup_candidates(incremental.event_time).await?;
     let event_count: u64 = store
         .client
         .query("SELECT count() FROM incremental FINAL WHERE job_id='native_a'")
@@ -486,6 +497,201 @@ async fn cluster_shared_native_observations_roundtrip_merge_replay_and_legacy_ba
         .fetch_one()
         .await?;
     assert_eq!(other_size, 999);
+    store.cleanup_resume_batch().await?;
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires a real multi-shard ClickHouse cluster"]
+async fn cluster_shared_native_hardlinks_survive_finalization_replay() -> Result<()> {
+    let (config, _admin, _guard, cluster, epoch) = fixture().await?;
+    let mut store = ClusterScanStore::new(&config, &cluster, "native_links")?;
+    store.load_resume_state().await?;
+    store.save_resume_state(&state(epoch, false, 1)).await?;
+    store
+        .write_native(
+            &[
+                native_entry("a", 1, Some(b"shared"))?,
+                native_entry("b", 1, Some(b"shared"))?,
+                native_entry("c", 1, Some(b"shared"))?,
+            ],
+            false,
+        )
+        .await?;
+    let round = epoch + 10;
+    store.save_resume_state(&state(round, true, 0)).await?;
+    store.begin_resume_batch().await?;
+    let entries = vec![
+        native_entry("a", 1, Some(b"shared"))?,
+        native_entry("new", 1, Some(b"shared"))?,
+    ];
+    store.write_native(&entries, true).await?;
+    let events = store.compare_native(&entries).await?;
+    assert!(matches!(events.as_slice(), [ObservedScanEvent::Candidate(_)]));
+    store.events_native(&events, round).await?;
+    store.merge_native().await?;
+    let final_events = store.resolve_final_events_native(round).await?;
+    assert_eq!(final_events.len(), 3);
+    assert!(!final_events.iter().any(|event| event.operation() == "rename"));
+    let first: Vec<_> = final_events
+        .iter()
+        .filter(|event| event.operation() == "new" || event.deletion_key().is_some_and(|(path, _)| path == "b"))
+        .cloned()
+        .collect();
+    store.write_final_events_native(&first, round).await?;
+    let keys: Vec<_> = first.iter().filter_map(ScanFinalEvent::deletion_key).collect();
+    store.delete_resume_entries(&keys).await?;
+    // 模拟只删掉一条旧别名后中断；重启仍是新增链接和删除，不能漂移成 rename。
+    let replay = store.resolve_final_events_native(round).await?;
+    assert_eq!(replay.len(), 2);
+    assert!(!replay.iter().any(|event| event.operation() == "rename"));
+    store.write_final_events_native(&replay, round).await?;
+    let keys: Vec<_> = replay.iter().filter_map(ScanFinalEvent::deletion_key).collect();
+    store.delete_resume_entries(&keys).await?;
+    store.cleanup_candidates(round).await?;
+    assert!(store.resolve_final_events_native(round).await?.is_empty());
+    let summary = store.resume_statistics(0, Some(round)).await?;
+    assert_eq!(summary.summary.files, 2);
+    let count: u64 = store
+        .client
+        .query("SELECT count() FROM incremental FINAL WHERE job_id='native_links'")
+        .fetch_one()
+        .await?;
+    assert_eq!(count, 3);
+    // 两个剩余别名同时消失：都必须删除，不能互相当成 rename 的目标。
+    store.save_resume_state(&state(round + 10, true, 1)).await?;
+    let removed = store.resolve_final_events_native(round + 10).await?;
+    assert_eq!(removed.len(), 2);
+    assert!(removed.iter().all(|event| event.operation() == "deleted"));
+    store.cleanup_resume_batch().await?;
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires a real multi-shard ClickHouse cluster"]
+async fn cluster_shared_native_large_identity_lookup_keeps_sql_bounded() -> Result<()> {
+    let (config, _admin, _guard, cluster, epoch) = fixture().await?;
+    let mut store = ClusterScanStore::new(&config, &cluster, "native_bounded")?;
+    store.load_resume_state().await?;
+    store.save_resume_state(&state(epoch, false, 1)).await?;
+    let mut initial = vec![native_entry("old", 1, Some(b"old-identity"))?];
+    initial.extend(
+        (0..1_000)
+            .map(|n| native_entry(&format!("old/{n:04}"), 1, Some(format!("identity-{n}").as_bytes())))
+            .collect::<Result<Vec<_>>>()?,
+    );
+    store.write_native(&initial, false).await?;
+    store.save_resume_state(&state(epoch + 10, true, 0)).await?;
+    store.begin_resume_batch().await?;
+    let entries = (0..1_000)
+        .map(|n| native_entry(&format!("new/{n:04}"), 1, Some(format!("new-identity-{n}").as_bytes())))
+        .collect::<Result<Vec<_>>>()?;
+    store.write_native(&entries, true).await?;
+    store.client = store.client.clone().with_option("max_query_size", "50000");
+    let events = store.compare_native(&entries).await?;
+    assert_eq!(events.len(), 1_000);
+    assert!(events.iter().all(|event| matches!(event, ObservedScanEvent::New(_))));
+    store.begin_resume_batch().await?;
+    let renamed = (0..1_000)
+        .map(|n| native_entry(&format!("renamed/{n:04}"), 1, Some(format!("identity-{n}").as_bytes())))
+        .collect::<Result<Vec<_>>>()?;
+    store.write_native(&renamed, true).await?;
+    let candidates = store.compare_native(&renamed).await?;
+    assert_eq!(candidates.len(), 1_000);
+    assert!(
+        candidates
+            .iter()
+            .all(|event| matches!(event, ObservedScanEvent::Candidate(_)))
+    );
+    store.events_native(&candidates, epoch + 10).await?;
+    store.merge_native().await?;
+    let final_events = store.resolve_final_events_native(epoch + 10).await?;
+    assert_eq!(
+        final_events
+            .iter()
+            .filter(|event| event.operation() == "rename")
+            .count(),
+        1_000
+    );
+    assert_eq!(
+        final_events
+            .iter()
+            .filter(|event| event.operation() == "deleted")
+            .count(),
+        1
+    );
+    store.cleanup_resume_batch().await?;
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires a real multi-shard ClickHouse cluster"]
+async fn cluster_shared_native_rename_keeps_recreated_source_path() -> Result<()> {
+    let (config, _admin, _guard, cluster, epoch) = fixture().await?;
+    let mut store = ClusterScanStore::new(&config, &cluster, "native_reused")?;
+    store.load_resume_state().await?;
+    store.save_resume_state(&state(epoch, false, 1)).await?;
+    store
+        .write_native(&[native_entry("a", 17, Some(b"original"))?], false)
+        .await?;
+    let round = epoch + 10;
+    store.save_resume_state(&state(round, true, 0)).await?;
+    store.begin_resume_batch().await?;
+    let entries = vec![
+        native_entry("a", 29, Some(b"replacement"))?,
+        native_entry("b", 17, Some(b"original"))?,
+    ];
+    let mut events = Vec::new();
+    // 先覆盖 a，再在后一批观察 b；判定不能依赖两个路径恰好落在同批。
+    for entry in entries {
+        store.begin_resume_batch().await?;
+        let batch = vec![entry];
+        store.write_native(&batch, true).await?;
+        let batch_events = store.compare_native(&batch).await?;
+        store.events_native(&batch_events, round).await?;
+        store.merge_native().await?;
+        events.extend(batch_events);
+    }
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event, ObservedScanEvent::New(_)))
+            .count(),
+        1
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event, ObservedScanEvent::Candidate(_)))
+            .count(),
+        1
+    );
+    // 原路径已被新身份覆盖；旧事实必须仍可从已确认日志恢复。
+    let final_events = store.resolve_final_events_native(round).await?;
+    assert!(
+        matches!(final_events.as_slice(),[ScanFinalEvent::Renamed{from_path,to,..}] if from_path=="a" && to.relative_path=="b")
+    );
+    store.write_final_events_native(&final_events, round).await?;
+    let keys: Vec<_> = final_events.iter().filter_map(ScanFinalEvent::deletion_key).collect();
+    store.delete_resume_entries(&keys).await?;
+    let current=store.client.query("SELECT relative_path,size FROM base FINAL WHERE job_id='native_reused' AND is_deleted=0 ORDER BY relative_path").fetch_all::<(String,u64)>().await?;
+    assert_eq!(
+        current,
+        vec![("a".into(), 29), ("b".into(), 17)],
+        "old source cleanup must not remove its replacement"
+    );
+    // 最终化中断后重放同一决定，公开事件不重复。
+    let replay = store.resolve_final_events_native(round).await?;
+    store.write_final_events_native(&replay, round).await?;
+    store.delete_resume_entries(&keys).await?;
+    store.cleanup_candidates(round).await?;
+    assert!(store.resolve_final_events_native(round).await?.is_empty());
+    let count: u64 = store
+        .client
+        .query("SELECT count() FROM incremental FINAL WHERE job_id='native_reused'")
+        .fetch_one()
+        .await?;
+    assert_eq!(count, 2);
     store.cleanup_resume_batch().await?;
     Ok(())
 }

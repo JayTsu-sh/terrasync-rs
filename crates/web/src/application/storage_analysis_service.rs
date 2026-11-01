@@ -4,7 +4,9 @@ use app::consumer::stats::report::ProgressReport;
 
 use crate::domain::analysis::{AnalysisRepository, AnalysisTreeQuery, StorageAnalysis};
 use crate::domain::endpoint::EndpointConfig;
-use crate::domain::repository::{EndpointRepository, PathRepository, ProgressRepository, TaskRepository};
+use crate::domain::repository::{
+    EndpointRepository, ExecutionRepository, PathRepository, ProgressRepository, TaskRepository,
+};
 use crate::domain::task::{TaskStatus, TaskType};
 use crate::error::{Result, WebError};
 
@@ -14,13 +16,14 @@ pub struct StorageAnalysisService {
     path_repo: Arc<dyn PathRepository>,
     endpoint_repo: Arc<dyn EndpointRepository>,
     progress_repo: Arc<dyn ProgressRepository>,
+    execution_repo: Arc<dyn ExecutionRepository>,
 }
 
 impl StorageAnalysisService {
     pub fn new(
         analysis_repo: Arc<dyn AnalysisRepository>, task_repo: Arc<dyn TaskRepository>,
         path_repo: Arc<dyn PathRepository>, endpoint_repo: Arc<dyn EndpointRepository>,
-        progress_repo: Arc<dyn ProgressRepository>,
+        progress_repo: Arc<dyn ProgressRepository>, execution_repo: Arc<dyn ExecutionRepository>,
     ) -> Self {
         Self {
             analysis_repo,
@@ -28,6 +31,7 @@ impl StorageAnalysisService {
             path_repo,
             endpoint_repo,
             progress_repo,
+            execution_repo,
         }
     }
 
@@ -38,7 +42,7 @@ impl StorageAnalysisService {
             .find_by_id(task_id)
             .await?
             .ok_or_else(|| WebError::TaskNotFound(task_id.to_string()))?;
-        if task.task_type != TaskType::Scan || task.status == TaskStatus::Pending {
+        if task.task_type != TaskType::Scan || task.status == TaskStatus::Pending || task.config.reset_scan_on_start {
             return Err(WebError::AnalysisUnavailable(
                 "请先执行扫描任务，再查看目录数据分析".to_string(),
             ));
@@ -48,6 +52,19 @@ impl StorageAnalysisService {
             .find_by_id(&task.source_endpoint_id)
             .await?
             .ok_or_else(|| WebError::EndpointNotFound(task.source_endpoint_id.clone()))?;
+        let executions = self.execution_repo.find_by_task_id(task_id).await?;
+        // 失败重启会推进 task.started_at；必须以真实成功执行绑定旧基线的源配置。
+        // 首次未完成扫描则保守绑定最早一次执行，避免重试替旧的部分数据改名。
+        let source_execution = executions
+            .iter()
+            .filter(|execution| execution.status == TaskStatus::Completed)
+            .max_by_key(|execution| execution.started_at)
+            .or_else(|| executions.iter().min_by_key(|execution| execution.started_at));
+        if source_execution.is_none_or(|execution| endpoint.updated_at > execution.started_at) {
+            return Err(WebError::AnalysisUnavailable(
+                "扫描源配置已变更或无法确认，请重新完成扫描后查看目录数据分析".to_string(),
+            ));
+        }
         // 展示扫描范围，不返回含密码的 storage URL。
         let base = match &endpoint.config {
             EndpointConfig::Local { path } => path.clone(),
@@ -58,7 +75,17 @@ impl StorageAnalysisService {
             EndpointConfig::Cifs { share, prefix, .. } => join_path(share, prefix.as_deref()),
         };
         let sub_path = if let Some(path_id) = &task.source_path_id {
-            self.path_repo.find_by_id(path_id).await?.map(|p| p.sub_path)
+            let selected = self
+                .path_repo
+                .find_by_id(path_id)
+                .await?
+                .ok_or_else(|| WebError::PathNotFound(path_id.clone()))?;
+            if selected.endpoint_id != endpoint.id {
+                return Err(WebError::AnalysisUnavailable(
+                    "扫描子路径不属于当前源端点，请检查任务配置".to_string(),
+                ));
+            }
+            Some(selected.sub_path)
         } else {
             None
         };
@@ -69,9 +96,20 @@ impl StorageAnalysisService {
             .find_by_id(task_id)
             .await?
             .ok_or_else(|| WebError::TaskNotFound(task_id.to_string()))?;
-        if current.started_at != task.started_at || current.status != task.status {
+        if current.started_at != task.started_at || current.status != task.status || current.config.reset_scan_on_start
+        {
             return Err(WebError::AnalysisUnavailable(
                 "扫描结果正在更新，请刷新后重试".to_string(),
+            ));
+        }
+        if self
+            .endpoint_repo
+            .find_by_id(&endpoint.id)
+            .await?
+            .is_none_or(|current| current.updated_at != endpoint.updated_at)
+        {
+            return Err(WebError::AnalysisUnavailable(
+                "扫描源配置正在更新，请刷新后重试".to_string(),
             ));
         }
         let total_bytes = children.iter().map(|child| child.bytes).sum();
@@ -119,9 +157,12 @@ mod tests {
     use sqlx::sqlite::SqlitePoolOptions;
 
     use super::StorageAnalysisService;
+    use crate::api::state::AppState;
+    use crate::application::task_service::UpdateTaskRequest;
     use crate::domain::analysis::{AnalysisMetric, AnalysisNode, AnalysisRepository, AnalysisTreeQuery};
     use crate::error::{Result, WebError};
     use crate::infrastructure::endpoint_repo::SqliteEndpointRepo;
+    use crate::infrastructure::execution_repo::SqliteExecutionRepo;
     use crate::infrastructure::path_repo::SqlitePathRepo;
     use crate::infrastructure::progress_repo::SqliteProgressRepo;
     use crate::infrastructure::task_repo::SqliteTaskRepo;
@@ -144,6 +185,12 @@ mod tests {
     }
 
     async fn fixture(status: &str, task_type: &str, expected_files: u64) -> StorageAnalysisService {
+        fixture_with_pool(status, task_type, expected_files).await.0
+    }
+
+    async fn fixture_with_pool(
+        status: &str, task_type: &str, expected_files: u64,
+    ) -> (StorageAnalysisService, sqlx::SqlitePool) {
         let pool = SqlitePoolOptions::new()
             .max_connections(1)
             .connect("sqlite::memory:")
@@ -158,6 +205,10 @@ mod tests {
             .execute(&pool).await.unwrap();
         sqlx::query("INSERT INTO migration_tasks (id,name,task_type,source_endpoint_id,config_json,status,created_at) VALUES ('task','scan',?,'endpoint','{}',?,'2026-10-31T00:00:00Z')")
             .bind(task_type).bind(status).execute(&pool).await.unwrap();
+        if status != "pending" {
+            sqlx::query("INSERT INTO task_executions (id,task_id,execution_type,status,started_at) VALUES ('original','task','full',?,'2026-10-31T01:00:00Z')")
+                .bind(status).execute(&pool).await.unwrap();
+        }
         let report = serde_json::json!({
             "job_id":"task", "job_type":"scan", "elapsed_secs":1, "speed_bytes_per_sec":0,
             "detail":{"kind":"Full","scanned_files":expected_files,"scanned_dirs":1,"total_bytes":123,"transferred_bytes":0,"error_count":0},
@@ -170,13 +221,110 @@ mod tests {
             .execute(&pool)
             .await
             .unwrap();
-        StorageAnalysisService::new(
+        let service = StorageAnalysisService::new(
             Arc::new(FixtureAnalysis),
             Arc::new(SqliteTaskRepo::new(pool.clone())),
             Arc::new(SqlitePathRepo::new(pool.clone())),
             Arc::new(SqliteEndpointRepo::new(pool.clone())),
-            Arc::new(SqliteProgressRepo::new(pool)),
-        )
+            Arc::new(SqliteProgressRepo::new(pool.clone())),
+            Arc::new(SqliteExecutionRepo::new(pool.clone())),
+        );
+        (service, pool)
+    }
+
+    #[tokio::test]
+    async fn semantic_source_edits_hide_old_analysis_until_rerun() {
+        let (service, pool) = fixture_with_pool("completed", "scan", 2).await;
+        sqlx::query("INSERT INTO migration_paths (id,endpoint_id,sub_path,created_at) VALUES ('new-path','endpoint','other-team','2026-11-01T00:00:00Z')")
+            .execute(&pool).await.unwrap();
+        let app = AppState::new(pool);
+        let task = app
+            .task_service
+            .update_task(
+                "task",
+                UpdateTaskRequest {
+                    name: None,
+                    source_endpoint_id: None,
+                    source_path_id: Some("new-path".into()),
+                    config: None,
+                },
+            )
+            .await
+            .unwrap();
+        assert!(task.config.reset_scan_on_start);
+        assert!(matches!(
+            service.get_tree("task", &AnalysisTreeQuery::default()).await,
+            Err(WebError::AnalysisUnavailable(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn endpoint_edit_is_not_validated_by_a_failed_restart() {
+        let (service, pool) = fixture_with_pool("completed", "scan", 2).await;
+        sqlx::query("UPDATE endpoints SET config_json=replace(config_json,'archive','different-bucket'), updated_at='2026-10-31T02:00:00Z' WHERE id='endpoint'")
+            .execute(&pool).await.unwrap();
+        sqlx::query("UPDATE migration_tasks SET status='failed', started_at='2026-10-31T03:00:00Z' WHERE id='task'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO task_executions (id,task_id,execution_type,status,started_at) VALUES ('retry','task','incremental','failed','2026-10-31T03:00:00Z')")
+            .execute(&pool).await.unwrap();
+        assert!(matches!(
+            service.get_tree("task", &AnalysisTreeQuery::default()).await,
+            Err(WebError::AnalysisUnavailable(_))
+        ));
+        // 真正完成新一轮后，原有执行历史无需迁移即可证明新配置已被扫描。
+        sqlx::query("UPDATE task_executions SET status='completed' WHERE id='retry'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let result = service.get_tree("task", &AnalysisTreeQuery::default()).await.unwrap();
+        assert_eq!(result.source_path, "different-bucket/team");
+    }
+
+    #[tokio::test]
+    async fn uncompleted_retry_keeps_analysis_of_unchanged_completed_source() {
+        let (service, pool) = fixture_with_pool("completed", "scan", 2).await;
+        sqlx::query("INSERT INTO task_executions (id,task_id,execution_type,status,started_at) VALUES ('retry','task','incremental','failed','2026-10-31T03:00:00Z')")
+            .execute(&pool).await.unwrap();
+        assert_eq!(
+            service
+                .get_tree("task", &AnalysisTreeQuery::default())
+                .await
+                .unwrap()
+                .source_path,
+            "archive/team"
+        );
+    }
+
+    #[tokio::test]
+    async fn first_partial_scan_cannot_be_relabeled_by_an_endpoint_edit_and_retry() {
+        let (service, pool) = fixture_with_pool("failed", "scan", 2).await;
+        sqlx::query("UPDATE endpoints SET updated_at='2026-10-31T02:00:00Z' WHERE id='endpoint'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO task_executions (id,task_id,execution_type,status,started_at) VALUES ('retry','task','full','failed','2026-10-31T03:00:00Z')")
+            .execute(&pool).await.unwrap();
+        assert!(matches!(
+            service.get_tree("task", &AnalysisTreeQuery::default()).await,
+            Err(WebError::AnalysisUnavailable(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn missing_selected_path_does_not_relabel_the_scan_as_endpoint_root() {
+        let (service, pool) = fixture_with_pool("completed", "scan", 2).await;
+        // 模拟从旧数据库导入的悬空路径引用。
+        sqlx::query("PRAGMA foreign_keys=OFF").execute(&pool).await.unwrap();
+        sqlx::query("UPDATE migration_tasks SET source_path_id='missing-path' WHERE id='task'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert!(matches!(
+            service.get_tree("task", &AnalysisTreeQuery::default()).await,
+            Err(WebError::PathNotFound(_))
+        ));
     }
 
     #[tokio::test]

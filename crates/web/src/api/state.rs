@@ -45,6 +45,7 @@ impl AppState {
             path_repo.clone(),
             endpoint_repo.clone(),
             progress_repo.clone(),
+            execution_repo.clone(),
         ));
 
         let task_runner = Arc::new(TaskRunner::new(

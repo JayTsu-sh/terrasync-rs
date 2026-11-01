@@ -11,6 +11,7 @@ use std::sync::{Arc, Mutex as StdMutex, OnceLock, Weak};
 // 外部crate
 use async_trait::async_trait;
 use clickhouse::Client;
+use clickhouse::error::Error as ClickHouseError;
 use data_mover::model::ObservedEntry;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -598,13 +599,44 @@ impl ClickHouseDatabase {
     pub async fn create_scan_state_table(&self) -> Result<()> {
         let table_name = get_scan_state_table_name(&self.job_id);
         let create_table_sql = format!(
-            "CREATE TABLE IF NOT EXISTS {table_name} (id UInt8, scan_state UInt8) ENGINE = ReplacingMergeTree() ORDER BY id"
+            "CREATE TABLE IF NOT EXISTS {table_name} (id UInt8, scan_state UInt8, baseline_committed Bool DEFAULT true) ENGINE = ReplacingMergeTree() ORDER BY id"
         );
 
         info!("Creating ClickHouse scan state table: {}", table_name);
         self.execute(&create_table_sql, &[]).await?;
+        self.ensure_baseline_committed_column().await?;
 
         Ok(())
+    }
+
+    async fn ensure_baseline_committed_column(&self) -> Result<()> {
+        let table = get_scan_state_table_name(&self.job_id);
+        // 兼容旧状态行的已有基线；新任务在首次成功提交前显式写入 false。
+        self.execute(
+            &format!("ALTER TABLE {table} ADD COLUMN IF NOT EXISTS baseline_committed Bool DEFAULT true"),
+            &[],
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// 建表不代表首次全量已完成，只有成功提交代次才发布基线。
+    pub async fn has_committed_baseline(&self) -> Result<bool> {
+        let table = get_scan_state_table_name(&self.job_id);
+        if !self.check_table_exists(&table).await? {
+            return Ok(false);
+        }
+        self.ensure_baseline_committed_column().await?;
+        match self
+            .sync_client
+            .query(&format!("SELECT baseline_committed FROM {table} FINAL WHERE id=1"))
+            .fetch_one::<bool>()
+            .await
+        {
+            Ok(committed) => Ok(committed),
+            Err(ClickHouseError::RowNotFound) => Ok(false),
+            Err(error) => Err(error.into()),
+        }
     }
 
     /// 创建增量扫描表（按 `operation_type` + `relative_path` + `create_at` 排序）
@@ -695,7 +727,7 @@ impl ClickHouseDatabase {
 
         match self.sync_client.query(&query).fetch_one::<u8>().await {
             Ok(scan_state) => Ok(Some(scan_state)),
-            Err(clickhouse::error::Error::RowNotFound) => Ok(None),
+            Err(ClickHouseError::RowNotFound) => Ok(None),
             Err(e) => Err(DatabaseError::QueryError(format!(
                 "Failed to query scan_state table: {e}"
             ))),
@@ -719,8 +751,13 @@ impl ClickHouseDatabase {
 
     /// 插入或更新扫描状态（id=1，利用 `ReplacingMergeTree` 自动去重）
     pub async fn insert_scan_state(&self, scan_state: u8) -> Result<()> {
+        self.ensure_baseline_committed_column().await?;
+        self.insert_scan_state_with_baseline(scan_state, true).await
+    }
+
+    async fn insert_scan_state_with_baseline(&self, scan_state: u8, baseline_committed: bool) -> Result<()> {
         let table_name = get_scan_state_table_name(&self.job_id);
-        let insert_sql = format!("INSERT INTO {table_name} (id, scan_state) VALUES (?, ?)");
+        let insert_sql = format!("INSERT INTO {table_name} (id, scan_state, baseline_committed) VALUES (?, ?, ?)");
 
         debug!("Inserting scan state: id=1, scan_state={}", scan_state);
 
@@ -728,6 +765,7 @@ impl ClickHouseDatabase {
             .query(&insert_sql)
             .bind(1u8)
             .bind(scan_state)
+            .bind(baseline_committed)
             .execute()
             .await
             .map_err(DatabaseError::ClickHouseError)?;
@@ -920,7 +958,7 @@ impl Database for ClickHouseDatabase {
         self.create_table(SCAN_BASE_TABLE_BASE_NAME).await?;
         self.create_table(SCAN_STATE_TABLE_BASE_NAME).await?;
         if self.query_scan_state().await?.is_none() {
-            self.insert_scan_state(0).await?;
+            self.insert_scan_state_with_baseline(0, false).await?;
         }
         Ok(())
     }
@@ -1888,3 +1926,6 @@ mod tests {
 }
 
 mod native;
+
+#[cfg(test)]
+mod baseline_tests;

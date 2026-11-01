@@ -14,17 +14,47 @@ enum Store {
     Single(ClickHouseDatabase),
     Cluster(ClusterScanStore),
 }
-/// 删除来自数据库已有行，直接保留查询事实；旧行没有 snapshot 时也不伪造原生身份或链接目标。
-pub struct ScanDeletion {
-    pub from: StorageEntryRecord,
-    pub to: Option<StorageEntryRecord>,
+/// 数据库派生的轮次最终事件，保留实际查询事实，不伪造原生身份或链接目标。
+#[derive(Clone, Debug)]
+pub enum ScanFinalEvent {
+    Added(StorageEntryRecord),
+    Deleted(StorageEntryRecord),
+    Renamed {
+        from_path: String,
+        from_version: String,
+        to: StorageEntryRecord,
+    },
 }
-impl ScanDeletion {
+impl ScanFinalEvent {
     pub fn item(&self) -> &StorageEntryRecord {
-        self.to.as_ref().unwrap_or(&self.from)
+        match self {
+            Self::Added(row) | Self::Deleted(row) => row,
+            Self::Renamed { to, .. } => to,
+        }
     }
     pub fn operation(&self) -> &'static str {
-        if self.to.is_some() { "rename" } else { "deleted" }
+        match self {
+            Self::Added(_) => "new",
+            Self::Deleted(_) => "deleted",
+            Self::Renamed { .. } => "rename",
+        }
+    }
+    pub fn previous_path(&self) -> Option<String> {
+        match self {
+            Self::Renamed { from_path, .. } => Some(from_path.clone()),
+            _ => None,
+        }
+    }
+    pub fn deletion_key(&self) -> Option<(String, String)> {
+        match self {
+            Self::Added(_) => None,
+            Self::Deleted(row) => Some((row.relative_path.clone(), row.version_id.clone())),
+            Self::Renamed {
+                from_path,
+                from_version,
+                ..
+            } => Some((from_path.clone(), from_version.clone())),
+        }
     }
 }
 
@@ -65,7 +95,7 @@ impl ScanStore {
     }
     pub async fn has_baseline(&self) -> Result<bool> {
         match &self.inner {
-            Store::Single(store) => store.table_exists(&base_table_name_for_job(&self.job_id)).await,
+            Store::Single(store) => store.has_committed_baseline().await,
             Store::Cluster(store) => store.has_baseline().await,
         }
     }
@@ -101,16 +131,28 @@ impl ScanStore {
             Store::Cluster(store) => store.events_native(events, time).await,
         }
     }
-    pub async fn detect_deleted_items(&self) -> Result<Vec<ScanDeletion>> {
+    pub async fn resolve_final_events(&self, time: i64) -> Result<Vec<ScanFinalEvent>> {
         match &self.inner {
-            Store::Single(store) => store.delete_native().await,
-            Store::Cluster(store) => store.delete_native().await,
+            Store::Single(store) => store.resolve_final_events_native(time).await,
+            Store::Cluster(store) => store.resolve_final_events_native(time).await,
         }
     }
-    pub async fn write_deletions(&self, events: &[ScanDeletion], time: i64) -> Result<()> {
+    pub async fn write_final_events(&self, events: &[ScanFinalEvent], time: i64) -> Result<()> {
         match &self.inner {
-            Store::Single(store) => store.deletions_native(events, time).await,
-            Store::Cluster(store) => store.deletions_native(events, time).await,
+            Store::Single(store) => store.write_final_events_native(events, time).await,
+            Store::Cluster(store) => store.write_final_events_native(events, time).await,
+        }
+    }
+    pub async fn delete_resume_entries(&self, entries: &[(String, String)]) -> Result<()> {
+        match &self.inner {
+            Store::Single(store) => store.delete_previous_scan_entries(entries).await,
+            Store::Cluster(store) => store.delete_resume_entries(entries).await,
+        }
+    }
+    pub async fn cleanup_candidates(&self, time: i64) -> Result<()> {
+        match &self.inner {
+            Store::Single(store) => store.cleanup_candidates(time).await,
+            Store::Cluster(store) => store.cleanup_candidates(time).await,
         }
     }
     pub async fn merge_observations(&self) -> Result<()> {
@@ -134,7 +176,7 @@ impl ScanStore {
 
 
 
-        delete_resume_entries(entries:&[(String,String)])->Result<()>;
+
         resume_statistics(generation:u8,event_time:Option<i64>)->Result<ScanResumeStatistics>;
     }
 }

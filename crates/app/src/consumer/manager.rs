@@ -33,7 +33,7 @@ use crate::consumer::stats::{
 use crate::consumer::traits::Consumer;
 use crate::error::{AppError, Result};
 use db::clickhouse::scan_resume_statistics::ScanResumeStatistics;
-use db::scan_store::ScanDeletion;
+use db::scan_store::ScanFinalEvent;
 
 /// 消费者管理器 - 负责创建、启动和管理多个消费者实例
 pub struct ConsumerManager {
@@ -62,7 +62,7 @@ impl ConsumerManager {
             }
         }
     }
-    pub async fn record_scan_deletions(&self, events: &[ScanDeletion]) {
+    pub async fn record_final_events(&self, events: &[ScanFinalEvent]) {
         if let Some(sc) = &self.stats_consumer {
             let mut sc = sc.lock().await;
             for event in events {

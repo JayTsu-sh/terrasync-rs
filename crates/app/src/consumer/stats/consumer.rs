@@ -74,6 +74,9 @@ impl StatisticConsumer {
         }
     }
     pub fn update_observed_event(&mut self, event: &ObservedScanEvent) {
+        if matches!(event, ObservedScanEvent::Candidate(_)) {
+            return;
+        }
         self.update_recorded_event(event.operation(), &event.item().view());
     }
     pub fn update_recorded_event(&mut self, operation: &str, entry: &impl EntryStatistics) {

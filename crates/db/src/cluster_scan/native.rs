@@ -1,9 +1,9 @@
 use super::record::ClusterNativeScanRecord;
 use super::*;
 use crate::native_scan::NativeScanAccess;
-use crate::native_scan_record::incremental_record;
 use crate::native_scan_record::{NativeScanRecord, OBSERVED_COLUMNS, event_records};
-use crate::scan_store::ScanDeletion;
+use crate::native_scan_record::{final_event_records, incremental_record};
+use crate::scan_store::ScanFinalEvent;
 use crate::traits::IncrementalStorageEntryRecord;
 use data_mover::model::ObservedEntry;
 use storage_adapter::observed_scan::{ObservedScanEvent, ObservedView};
@@ -15,6 +15,12 @@ impl ClusterScanStore {
             client: &self.client,
             base: format!("{database}.base"),
             stage: format!("{database}.scan_resume_batch"),
+            events: format!("{database}.incremental"),
+            events_round: format!(
+                "job_id='{}' AND epoch={}",
+                self.job_id,
+                self.epoch.load(Ordering::Relaxed)
+            ),
             scope: format!("job_id='{}'", self.job_id),
             stage_scope: format!("job_id='{}' AND batch_id={}", self.job_id, self.batch_id),
             active: format!("epoch={}", self.epoch.load(Ordering::Relaxed)),
@@ -52,10 +58,26 @@ impl ClusterScanStore {
         .await
     }
     pub(crate) async fn compare_native(&mut self, entries: &[Arc<ObservedEntry>]) -> Result<Vec<ObservedScanEvent>> {
-        self.native_access()?.compare(entries).await
+        let compared = self.native_access()?.compare(entries).await?;
+        if !compared.displaced.is_empty() {
+            let time = self.epoch.load(Ordering::Relaxed) as i64;
+            let records = compared
+                .displaced
+                .into_iter()
+                .map(|row| incremental_record(row, "displaced_old", None, time))
+                .collect();
+            self.write_native_events(records, time).await?;
+        }
+        Ok(compared.events)
     }
-    pub(crate) async fn delete_native(&self) -> Result<Vec<ScanDeletion>> {
-        self.native_access()?.deleted().await
+    pub(crate) async fn resolve_final_events_native(&self, time: i64) -> Result<Vec<ScanFinalEvent>> {
+        self.native_access()?.final_events(time).await
+    }
+    pub(crate) async fn cleanup_candidates(&self, time: i64) -> Result<()> {
+        let database = identifier(&self.database)?;
+        let cluster = identifier(&self.cluster)?;
+        self.client.clone().with_option("mutations_sync","2").query(&format!("ALTER TABLE {database}.incremental_local ON CLUSTER {cluster} DELETE WHERE job_id=? AND epoch=? AND operation_type IN ('candidate_new','displaced_old')")).bind(&self.job_id).bind(time as u64).execute().await?;
+        Ok(())
     }
     pub(crate) async fn merge_native(&self) -> Result<()> {
         retry_quorum(||async {
@@ -68,18 +90,8 @@ impl ClusterScanStore {
         let records = event_records(events, time)?;
         self.write_native_events(records, time).await
     }
-    pub(crate) async fn deletions_native(&self, events: &[ScanDeletion], time: i64) -> Result<()> {
-        let records = events
-            .iter()
-            .map(|event| {
-                incremental_record(
-                    event.item().clone(),
-                    event.operation(),
-                    event.to.as_ref().map(|_| event.from.relative_path.clone()),
-                    time,
-                )
-            })
-            .collect();
+    pub(crate) async fn write_final_events_native(&self, events: &[ScanFinalEvent], time: i64) -> Result<()> {
+        let records = final_event_records(events, time);
         self.write_native_events(records, time).await
     }
     async fn write_native_events(&self, records: Vec<IncrementalStorageEntryRecord>, time: i64) -> Result<()> {
