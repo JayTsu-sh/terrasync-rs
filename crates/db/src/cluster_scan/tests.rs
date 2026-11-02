@@ -5,6 +5,7 @@ use crate::scan_store::ScanFinalEvent;
 use crate::scan_store::with_scan_cancellation;
 use data_mover::model::{
     BackendIdentity, BackendKind, EntryKind, IdentityStrength, ObservedEntry, SourceIdentity, StoragePath,
+    StorageTimestamp, SymlinkTarget, SymlinkTargetEncoding, TimePrecision,
 };
 use std::sync::atomic::AtomicUsize;
 use storage_adapter::ChangeKind;
@@ -962,6 +963,170 @@ async fn cluster_shared_native_rename_keeps_recreated_source_path() -> Result<()
         .fetch_one()
         .await?;
     assert_eq!(count, 2);
+    store.cleanup_resume_batch().await?;
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires a real multi-shard ClickHouse cluster"]
+async fn aggregate_statistics_keep_unique_rows_histograms_and_job_scope() -> Result<()> {
+    let (config, _admin, _guard, cluster, epoch) = fixture().await?;
+    let store = ClusterScanStore::new(&config, &cluster, "aggregate_stats")?;
+    store.initialize().await?;
+    store.save_resume_state(&state(epoch, false, 0)).await?;
+    let mut entries = vec![
+        native_entry("a.TXT", 1, None)?,
+        native_entry("b.txt", 4096, None)?,
+        native_entry("no-extension", 65536, None)?,
+    ];
+    let backend = entries[0].source_identity().backend().clone();
+    for (path, kind, size) in [
+        ("nested/dir", EntryKind::Directory, 1024),
+        ("link", EntryKind::Symlink, 0),
+    ] {
+        let identity = SourceIdentity::new(backend.clone(), IdentityStrength::PathScoped, path.as_bytes())?;
+        let entry = if kind == EntryKind::Symlink {
+            ObservedEntry::new_symlink(
+                StoragePath::new(path)?,
+                None,
+                identity,
+                SymlinkTarget::new(SymlinkTargetEncoding::UnixBytes, b"target".to_vec())?,
+            )?
+        } else {
+            ObservedEntry::new(StoragePath::new(path)?, kind, Some(size), None, identity)?
+        };
+        entries.push(Arc::new(entry));
+    }
+    store.write_native(&entries, false).await?;
+    store.write_native(&entries, false).await?;
+    let other = ClusterScanStore::new(&config, &cluster, "other_stats")?;
+    other.save_resume_state(&state(epoch, false, 0)).await?;
+    other
+        .write_native(&[native_entry("other.txt", 999999, None)?], false)
+        .await?;
+    let statistics = store.resume_statistics(0, None).await?;
+    assert_eq!((statistics.summary.files, statistics.summary.file_bytes), (3, 69633));
+    assert_eq!((statistics.summary.dirs, statistics.summary.dir_bytes), (1, 1024));
+    assert_eq!((statistics.summary.links, statistics.summary.link_bytes), (1, 0));
+    assert_eq!((statistics.summary.total_depth, statistics.summary.max_depth), (2, 2));
+    assert_eq!(
+        (statistics.summary.total_name_length, statistics.summary.max_name_length),
+        (29, 12)
+    );
+    assert_eq!(statistics.extensions, vec![("txt".into(), 4097, 2)]);
+    assert_eq!(statistics.ages, vec![(5, 70657, 5)]);
+    assert_eq!(statistics.sizes, vec![(0, 1, 1), (1, 4096, 1), (2, 65536, 1)]);
+    assert!(statistics.events.is_empty());
+
+    // 新轮次只汇总当前 epoch，未被再次观察的旧路径不能混入实时校准。
+    store.save_resume_state(&state(epoch + 10, true, 1)).await?;
+    store.write_native(&entries[..1], false).await?;
+    let next = store.resume_statistics(0, None).await?;
+    assert_eq!(
+        (next.summary.files, next.summary.file_bytes, next.summary.dirs),
+        (1, 1, 0)
+    );
+    assert_eq!(next.extensions, vec![("txt".into(), 1, 1)]);
+    let empty = ClusterScanStore::new(&config, &cluster, "empty_stats")?;
+    empty.save_resume_state(&state(epoch + 20, false, 0)).await?;
+    let empty = empty.resume_statistics(0, None).await?;
+    assert_eq!(
+        (empty.summary.files, empty.summary.dirs, empty.summary.links),
+        (0, 0, 0)
+    );
+    assert!(empty.extensions.is_empty() && empty.ages.is_empty() && empty.sizes.is_empty());
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires a real multi-shard ClickHouse cluster"]
+async fn aggregate_statistics_cover_every_size_and_age_bucket() -> Result<()> {
+    let (config, _admin, _guard, cluster, epoch) = fixture().await?;
+    let store = ClusterScanStore::new(&config, &cluster, "histogram_stats")?;
+    store.initialize().await?;
+    store.save_resume_state(&state(epoch, false, 0)).await?;
+    let backend = BackendIdentity::new(BackendKind::Nfs, "histogram-fixture")?;
+    let sizes = [
+        0_u64, 4096, 65536, 131072, 262144, 524288, 1048576, 2097152, 16777216, 67108864, 134217728, 536870912,
+    ];
+    let days = [0_i128, 3, 14, 90, 270, 730];
+    let mut entries = Vec::with_capacity(sizes.len());
+    for (index, size) in sizes.into_iter().enumerate() {
+        let path = format!("bucket_{index}.dat");
+        let identity = SourceIdentity::new(backend.clone(), IdentityStrength::PathScoped, path.as_bytes())?;
+        let modified = StorageTimestamp::new(
+            i128::from(epoch) - days[index % days.len()] * 86400000000000,
+            TimePrecision::Nanoseconds,
+        )?;
+        entries.push(Arc::new(ObservedEntry::new(
+            StoragePath::new(path)?,
+            EntryKind::File,
+            Some(size),
+            Some(modified),
+            identity,
+        )?));
+    }
+    store.write_native(&entries, false).await?;
+    let statistics = store.resume_statistics(0, None).await?;
+    let expected_sizes: Vec<_> = sizes
+        .into_iter()
+        .enumerate()
+        .map(|(bucket, size)| (bucket as u8, size as i64, 1))
+        .collect();
+    assert_eq!(statistics.sizes, expected_sizes);
+    let expected_ages: Vec<_> = (0..6)
+        .map(|bucket| (bucket as u8, (sizes[bucket] + sizes[bucket + 6]) as i64, 2))
+        .collect();
+    assert_eq!(statistics.ages, expected_ages);
+    assert_eq!(
+        statistics.extensions,
+        vec![("dat".into(), sizes.iter().sum::<u64>() as i64, 12)]
+    );
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires a real multi-shard ClickHouse cluster"]
+async fn cluster_native_path_scoped_unchanged_batches_never_create_events() -> Result<()> {
+    let (config, _admin, _guard, cluster, epoch) = fixture().await?;
+    let store = ClusterScanStore::new(&config, &cluster, "path_scoped_unchanged")?;
+    store.load_resume_state().await?;
+    store.save_resume_state(&state(epoch, false, 1)).await?;
+    let entries = (0..1_024)
+        .map(|index| {
+            let key = format!("path/{index:08}");
+            native_entry(&key, 17, None)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    store.write_native(&entries, false).await?;
+    store.commit_scan_generation().await?;
+    store.save_resume_state(&state(epoch + 10, true, 0)).await?;
+    let mut workers: JoinSet<Result<()>> = JoinSet::new();
+    for worker in 0..4 {
+        let mut writer = store.batch_writer();
+        let entries: Vec<_> = entries.iter().skip(worker).step_by(4).cloned().collect();
+        workers.spawn(async move {
+            for round in 0..128 {
+                // 每次写入独立 epoch，避免服务端幂等去重使并发压力退化为空写入。
+                writer
+                    .epoch
+                    .store(epoch as u64 + 20 + round * 4 + worker as u64, Ordering::Relaxed);
+                writer.begin_resume_batch().await?;
+                writer.write_native_keys(&entries).await?;
+                let events = writer.compare_native(&entries).await?;
+                assert!(
+                    events.is_empty(),
+                    "unchanged batch produced {} events in worker {worker}, round {round}",
+                    events.len()
+                );
+                writer.write_native(&entries, false).await?;
+            }
+            Ok(())
+        });
+    }
+    while let Some(worker) = workers.join_next().await {
+        worker??;
+    }
     store.cleanup_resume_batch().await?;
     Ok(())
 }

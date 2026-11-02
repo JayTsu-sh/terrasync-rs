@@ -96,6 +96,7 @@ impl NativeScanAccess<'_> {
         let by_path = baseline_index(&rows);
         let mut events = Vec::new();
         let mut absent = Vec::new();
+        let mut path_only = Vec::new();
         let mut has_displaced = false;
         for entry in entries {
             for item in ObservedItem::all(entry) {
@@ -117,11 +118,33 @@ impl NativeScanAccess<'_> {
                     if let Some(handle) = view.file_handle() {
                         absent.push((item, handle));
                     } else {
-                        events.push(ObservedScanEvent::New(item));
+                        path_only.push(item);
+                    }
+                } else {
+                    path_only.push(item);
+                }
+            }
+        }
+        if !path_only.is_empty() {
+            let checked = self
+                .confirm_paths(&path_only, &paths[0], &paths[paths.len() - 1])
+                .await?;
+            let checked = baseline_index(&checked);
+            let mut recovered = 0;
+            for item in path_only {
+                let view = item.view();
+                let path = view.path();
+                if let Some(old) = checked.get(&(path.as_str(), view.version_id())) {
+                    recovered += 1;
+                    if let Some(kind) = old.change(&item) {
+                        events.push(ObservedScanEvent::Changed { item, kind });
                     }
                 } else {
                     events.push(ObservedScanEvent::New(item));
                 }
+            }
+            if recovered > 0 {
+                warn!(recovered, "Recovered baseline paths without stable identity handles");
             }
         }
         if !absent.is_empty() {
@@ -202,6 +225,46 @@ impl NativeScanAccess<'_> {
         };
         Ok(ComparedBatch { events, displaced })
     }
+    async fn confirm_paths(&self, missing: &[ObservedItem], first: &str, last: &str) -> Result<Vec<Baseline>> {
+        // 大集合沿用已落库的键集合；小集合直接绑定，避免复核仍依赖暂存集合的可见性。
+        if missing.len() > 256 {
+            return self.baselines(first, last, false).await;
+        }
+        let keys: Vec<_> = missing
+            .iter()
+            .map(|item| {
+                let view = item.view();
+                (view.path(), view.version_id().to_owned())
+            })
+            .collect();
+        let mut rows = Vec::new();
+        let mut start = 0;
+        while start < keys.len() {
+            let mut end = start;
+            let mut bytes = 0_usize;
+            while end < keys.len() {
+                // SQL 字符串转义最多翻倍，限制每次绑定的字节预算而非只限制条数。
+                let next = keys[end]
+                    .0
+                    .len()
+                    .saturating_add(keys[end].1.len())
+                    .saturating_mul(2)
+                    .saturating_add(16);
+                if bytes.saturating_add(next) > 16_384 {
+                    break;
+                }
+                bytes += next;
+                end += 1;
+            }
+            if end == start {
+                return self.baselines(first, last, false).await;
+            }
+            rows.extend(self.client.query(&format!("SELECT relative_path,version_id,size,mtime,mode,uid,gid,is_dir,false AS identity_changed,NOT ({}) AS previous_generation FROM {} {} WHERE {} AND {} AND (relative_path,version_id) IN ? ORDER BY relative_path,version_id LIMIT 1 BY relative_path,version_id",self.active,self.base,self.final_clause,self.scope,self.live))
+                .bind(&keys[start..end]).fetch_quorum_all::<Baseline>().await?);
+            start = end;
+        }
+        Ok(rows)
+    }
     async fn baselines(&self, first: &str, last: &str, by_handle: bool) -> Result<Vec<Baseline>> {
         let key = "(relative_path,version_id)";
         let identity_changed = if by_handle {
@@ -226,7 +289,22 @@ impl NativeScanAccess<'_> {
     }
     pub async fn final_events(&self, time: i64) -> Result<Vec<ScanFinalEvent>> {
         let columns = &*FILE_SCAN_COLUMNS_LIST;
-        let mut old=self.client.query(&format!("SELECT {columns} FROM {} {} WHERE {} AND {} AND NOT ({}) ORDER BY relative_path,version_id LIMIT 1 BY relative_path,version_id",self.base,self.final_clause,self.scope,self.live,self.active)).fetch_quorum_all::<StorageEntryRecord>().await?;
+        // 无删除的常见轮次只读去重所需列，避免解压整轮旧条目的全部元数据。
+        let has_old = self
+            .client
+            .query(&format!(
+                "SELECT count() FROM (SELECT 1 FROM {} {} WHERE {} AND {} AND NOT ({}) LIMIT 1)",
+                self.base, self.final_clause, self.scope, self.live, self.active
+            ))
+            .fetch_quorum_one::<u64>()
+            .await?
+            != 0;
+        let mut old = if has_old {
+            self.client.query(&format!("SELECT {columns} FROM {} {} WHERE {} AND {} AND NOT ({}) ORDER BY relative_path,version_id LIMIT 1 BY relative_path,version_id",self.base,self.final_clause,self.scope,self.live,self.active))
+                .fetch_quorum_all::<StorageEntryRecord>().await?
+        } else {
+            Vec::new()
+        };
         let event_scope = format!("{} AND toUnixTimestamp64Nano(create_at)>={time}", self.scope);
         let displaced = self
             .client
@@ -447,6 +525,44 @@ mod tests {
         }
     }
     #[tokio::test]
+    async fn unchanged_round_does_not_fetch_unused_deletion_metadata() -> Result<()> {
+        let mock = Mock::new();
+        mock.add(handlers::provide([0_u64]));
+        mock.add(handlers::provide(Vec::<StorageEntryRecord>::new()));
+        mock.add(handlers::provide(Vec::<StorageEntryRecord>::new()));
+        let client = Client::default().with_url(mock.url()).with_validation(false);
+        assert!(access(&client).final_events(1).await?.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn deletion_probe_keeps_missing_paths_and_displaced_history() -> Result<()> {
+        for old_in_base in [true, false] {
+            let mock = Mock::new();
+            mock.add(handlers::provide([u64::from(old_in_base)]));
+            if old_in_base {
+                mock.add(handlers::provide([row("old")?]));
+                mock.add(handlers::provide(Vec::<StorageEntryRecord>::new()));
+            } else {
+                mock.add(handlers::provide([row("old")?]));
+            }
+            mock.add(handlers::provide(Vec::<StorageEntryRecord>::new()));
+            let client = Client::default().with_url(mock.url()).with_validation(false);
+            let events = access(&client).final_events(1).await?;
+            assert!(matches!(events.as_slice(), [ScanFinalEvent::Deleted(entry)] if entry.relative_path == "old"));
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn deletion_probe_failure_is_not_an_empty_round() {
+        let mock = Mock::new();
+        mock.add(handlers::exception(7));
+        let client = Client::default().with_url(mock.url()).with_validation(false);
+        assert!(access(&client).final_events(1).await.is_err());
+    }
+
+    #[tokio::test]
     async fn unordered_baseline_rows_do_not_create_false_new_entries() -> Result<()> {
         let entries = ["a", "b", "c"]
             .into_iter()
@@ -466,6 +582,42 @@ mod tests {
         );
         Ok(())
     }
+    #[tokio::test]
+    async fn path_scoped_misses_are_confirmed_without_the_staging_set() -> Result<()> {
+        let entry = Arc::new(observation("unchanged", IdentityStrength::PathScoped)?);
+        let mock = Mock::new();
+        mock.add(handlers::provide(Vec::<Baseline>::new()));
+        mock.add(handlers::provide([baseline(&entry)?]));
+        let client = Client::default().with_url(mock.url()).with_validation(false);
+        let result = access(&client).compare(&[entry]).await?;
+        assert!(
+            result.events.is_empty(),
+            "a briefly missing path cannot become a durable false New event"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn path_confirmation_preserves_real_new_and_changed_entries() -> Result<()> {
+        let entry = Arc::new(observation("changed", IdentityStrength::PathScoped)?);
+        let mut old = baseline(&entry)?;
+        old.size += 1;
+        let mock = Mock::new();
+        mock.add(handlers::provide(Vec::<Baseline>::new()));
+        mock.add(handlers::provide([old]));
+        let client = Client::default().with_url(mock.url()).with_validation(false);
+        let result = access(&client).compare(std::slice::from_ref(&entry)).await?;
+        assert!(matches!(result.events.as_slice(), [ObservedScanEvent::Changed { .. }]));
+
+        let mock = Mock::new();
+        mock.add(handlers::provide(Vec::<Baseline>::new()));
+        mock.add(handlers::provide(Vec::<Baseline>::new()));
+        let client = Client::default().with_url(mock.url()).with_validation(false);
+        let result = access(&client).compare(&[entry]).await?;
+        assert!(matches!(result.events.as_slice(), [ObservedScanEvent::New(_)]));
+        Ok(())
+    }
+
     #[tokio::test]
     async fn matching_identity_rechecks_a_missing_path_before_creating_a_candidate() -> Result<()> {
         let entry = Arc::new(observation("unchanged", IdentityStrength::StableWithinBackend)?);
