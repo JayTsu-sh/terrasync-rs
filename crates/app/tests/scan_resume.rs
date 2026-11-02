@@ -202,6 +202,12 @@ async fn complete(mut scan: ScanCommand) -> Result {
     loop {
         if let Some(status) = process.0.try_wait()? {
             assert!(status.success(), "scan failed: {}", fs::read_to_string(&scan.log)?);
+            for line in fs::read_to_string(&scan.log)?
+                .lines()
+                .filter(|line| line.contains("Recovered baseline paths"))
+            {
+                eprintln!("baseline confirmation: {line}");
+            }
             break;
         }
         assert!(
@@ -482,9 +488,8 @@ async fn killed_scan_resumes_full_and_incremental_without_skips_or_duplicate_eve
         count(&database, "SELECT toUInt64(scan_state) FROM state_resume_case FINAL").await?,
         0
     );
-    assert_eq!(
-        count(&database, "SELECT count() FROM incremental_resume_case FINAL").await?,
-        4
-    );
+    let final_events = database.query("SELECT operation_type,relative_path,toUnixTimestamp64Nano(create_at),ifNull(comment,'') FROM incremental_resume_case FINAL ORDER BY create_at,operation_type,relative_path")
+        .fetch_all::<(String,String,i64,String)>().await?;
+    assert_eq!(final_events.len(), 4, "unexpected durable events: {final_events:?}");
     Ok(())
 }
