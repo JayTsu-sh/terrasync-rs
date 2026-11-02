@@ -34,7 +34,7 @@ const { columns } = useTaskColumns({
   onCancel: async (id) => {
     try {
       await cancelTask(id)
-      message.success('任务已取消')
+      message.success('任务已停止')
       await fetchTasks()
     } catch (e: any) {
       message.error(e.message)
