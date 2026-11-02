@@ -226,7 +226,22 @@ impl NativeScanAccess<'_> {
     }
     pub async fn final_events(&self, time: i64) -> Result<Vec<ScanFinalEvent>> {
         let columns = &*FILE_SCAN_COLUMNS_LIST;
-        let mut old=self.client.query(&format!("SELECT {columns} FROM {} {} WHERE {} AND {} AND NOT ({}) ORDER BY relative_path,version_id LIMIT 1 BY relative_path,version_id",self.base,self.final_clause,self.scope,self.live,self.active)).fetch_quorum_all::<StorageEntryRecord>().await?;
+        // 无删除的常见轮次只读去重所需列，避免解压整轮旧条目的全部元数据。
+        let has_old = self
+            .client
+            .query(&format!(
+                "SELECT count() FROM (SELECT 1 FROM {} {} WHERE {} AND {} AND NOT ({}) LIMIT 1)",
+                self.base, self.final_clause, self.scope, self.live, self.active
+            ))
+            .fetch_quorum_one::<u64>()
+            .await?
+            != 0;
+        let mut old = if has_old {
+            self.client.query(&format!("SELECT {columns} FROM {} {} WHERE {} AND {} AND NOT ({}) ORDER BY relative_path,version_id LIMIT 1 BY relative_path,version_id",self.base,self.final_clause,self.scope,self.live,self.active))
+                .fetch_quorum_all::<StorageEntryRecord>().await?
+        } else {
+            Vec::new()
+        };
         let event_scope = format!("{} AND toUnixTimestamp64Nano(create_at)>={time}", self.scope);
         let displaced = self
             .client
@@ -446,6 +461,44 @@ mod tests {
             typed_handles: true,
         }
     }
+    #[tokio::test]
+    async fn unchanged_round_does_not_fetch_unused_deletion_metadata() -> Result<()> {
+        let mock = Mock::new();
+        mock.add(handlers::provide([0_u64]));
+        mock.add(handlers::provide(Vec::<StorageEntryRecord>::new()));
+        mock.add(handlers::provide(Vec::<StorageEntryRecord>::new()));
+        let client = Client::default().with_url(mock.url()).with_validation(false);
+        assert!(access(&client).final_events(1).await?.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn deletion_probe_keeps_missing_paths_and_displaced_history() -> Result<()> {
+        for old_in_base in [true, false] {
+            let mock = Mock::new();
+            mock.add(handlers::provide([u64::from(old_in_base)]));
+            if old_in_base {
+                mock.add(handlers::provide([row("old")?]));
+                mock.add(handlers::provide(Vec::<StorageEntryRecord>::new()));
+            } else {
+                mock.add(handlers::provide([row("old")?]));
+            }
+            mock.add(handlers::provide(Vec::<StorageEntryRecord>::new()));
+            let client = Client::default().with_url(mock.url()).with_validation(false);
+            let events = access(&client).final_events(1).await?;
+            assert!(matches!(events.as_slice(), [ScanFinalEvent::Deleted(entry)] if entry.relative_path == "old"));
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn deletion_probe_failure_is_not_an_empty_round() {
+        let mock = Mock::new();
+        mock.add(handlers::exception(7));
+        let client = Client::default().with_url(mock.url()).with_validation(false);
+        assert!(access(&client).final_events(1).await.is_err());
+    }
+
     #[tokio::test]
     async fn unordered_baseline_rows_do_not_create_false_new_entries() -> Result<()> {
         let entries = ["a", "b", "c"]

@@ -5,7 +5,7 @@ use crate::scan_store::ScanFinalEvent;
 use crate::scan_store::with_scan_cancellation;
 use data_mover::model::{
     BackendIdentity, BackendKind, EntryKind, IdentityStrength, ObservedEntry, SourceIdentity, StoragePath,
-    SymlinkTarget, SymlinkTargetEncoding,
+    StorageTimestamp, SymlinkTarget, SymlinkTargetEncoding, TimePrecision,
 };
 use std::sync::atomic::AtomicUsize;
 use storage_adapter::ChangeKind;
@@ -1035,5 +1035,52 @@ async fn aggregate_statistics_keep_unique_rows_histograms_and_job_scope() -> Res
         (0, 0, 0)
     );
     assert!(empty.extensions.is_empty() && empty.ages.is_empty() && empty.sizes.is_empty());
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires a real multi-shard ClickHouse cluster"]
+async fn aggregate_statistics_cover_every_size_and_age_bucket() -> Result<()> {
+    let (config, _admin, _guard, cluster, epoch) = fixture().await?;
+    let store = ClusterScanStore::new(&config, &cluster, "histogram_stats")?;
+    store.initialize().await?;
+    store.save_resume_state(&state(epoch, false, 0)).await?;
+    let backend = BackendIdentity::new(BackendKind::Nfs, "histogram-fixture")?;
+    let sizes = [
+        0_u64, 4096, 65536, 131072, 262144, 524288, 1048576, 2097152, 16777216, 67108864, 134217728, 536870912,
+    ];
+    let days = [0_i128, 3, 14, 90, 270, 730];
+    let mut entries = Vec::with_capacity(sizes.len());
+    for (index, size) in sizes.into_iter().enumerate() {
+        let path = format!("bucket_{index}.dat");
+        let identity = SourceIdentity::new(backend.clone(), IdentityStrength::PathScoped, path.as_bytes())?;
+        let modified = StorageTimestamp::new(
+            i128::from(epoch) - days[index % days.len()] * 86400000000000,
+            TimePrecision::Nanoseconds,
+        )?;
+        entries.push(Arc::new(ObservedEntry::new(
+            StoragePath::new(path)?,
+            EntryKind::File,
+            Some(size),
+            Some(modified),
+            identity,
+        )?));
+    }
+    store.write_native(&entries, false).await?;
+    let statistics = store.resume_statistics(0, None).await?;
+    let expected_sizes: Vec<_> = sizes
+        .into_iter()
+        .enumerate()
+        .map(|(bucket, size)| (bucket as u8, size as i64, 1))
+        .collect();
+    assert_eq!(statistics.sizes, expected_sizes);
+    let expected_ages: Vec<_> = (0..6)
+        .map(|bucket| (bucket as u8, (sizes[bucket] + sizes[bucket + 6]) as i64, 2))
+        .collect();
+    assert_eq!(statistics.ages, expected_ages);
+    assert_eq!(
+        statistics.extensions,
+        vec![("dat".into(), sizes.iter().sum::<u64>() as i64, 12)]
+    );
     Ok(())
 }

@@ -2,6 +2,7 @@
 use db::DatabaseConfig;
 use std::{
     fs::OpenOptions,
+    mem::take,
     num::NonZeroUsize,
     path::Path,
     sync::Arc,
@@ -17,7 +18,7 @@ use db::scan_store::{ScanFinalEvent, ScanStore};
 use licensing::verify::quick_verify;
 use storage_adapter::filter::parse_filter_expression;
 use storage_adapter::{ErrorEvent, StorageEntryMessage, StorageEnum, WalkOptions, canonicalize_path};
-use tokio::select;
+use tokio::{select, task::spawn_blocking};
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 use utils::app_config::AppConfig;
@@ -312,7 +313,26 @@ async fn flush_batch(
         return Ok(());
     }
     // 与 base 的主键顺序一致；排序只调整本批落盘顺序，不改变检查点推进边界。
-    sort_batch(batch);
+    if batch.len() >= 4096 {
+        // 大批次排序独占 CPU，将其移出 Tokio 的遍历与网络调度线程。
+        let mut sorting = take(batch);
+        let mut sorted = spawn_blocking(move || {
+            sort_batch(&mut sorting);
+            sorting
+        });
+        *batch = select! {
+            biased;
+            ()=cancel.cancelled()=>{
+                // 排队中的计算可撤销，已经运行的计算仍等待退出。
+                sorted.abort();
+                let _=sorted.await;
+                return Err(AppError::ObservationScanCancelled);
+            }
+            result=&mut sorted=>result?,
+        };
+    } else {
+        sort_batch(batch);
+    }
     cancel.check()?;
     let mut events = Vec::new();
     if state.incremental {

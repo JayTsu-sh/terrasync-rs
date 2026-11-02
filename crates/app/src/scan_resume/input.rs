@@ -44,9 +44,27 @@ impl ScanInput {
     /// 一次取走已就绪的小批次；源端等待时立即交付尾部，不等待凑满批次。
     /// 每次 poll 内要么不取条目，要么返回整批，因此外层定时器取消等待不会丢条目。
     pub(super) async fn next_batch(&mut self, limit: usize) -> Option<ScanBatch> {
+        if let Self::Prefetched {
+            receiver,
+            current,
+            permit,
+            ..
+        } = self
+            && limit >= PREFETCH_CHUNK
+            && current.len() == 0
+            && receiver.len() <= 1
+        {
+            // 稳态直接移交原缓冲区，避免为每个源端小批次再次分配和逐项 poll。
+            permit.take();
+            let batch = receiver.recv().await?;
+            return Some(ScanBatch {
+                items: batch.items,
+                failure: None,
+            });
+        }
         poll_fn(|cx| {
             let mut batch = ScanBatch {
-                items: Vec::with_capacity(limit.max(1)),
+                items: Vec::with_capacity(limit.clamp(1, 16)),
                 failure: None,
             };
             loop {
@@ -273,14 +291,15 @@ mod tests {
             reader: None,
             discard: CancellationToken::new(),
         };
-        for marker in [1, 2] {
-            sender
-                .send(buffered(vec![ResumableScanItem::Checkpoint(vec![marker])]))
-                .await
-                .unwrap();
-        }
+        sender
+            .send(buffered(vec![
+                ResumableScanItem::Checkpoint(vec![1]),
+                ResumableScanItem::Checkpoint(vec![2]),
+            ]))
+            .await
+            .unwrap();
         // 尾部两项已就绪，不能因上限为八项而等待仍未到达的源端数据。
-        let batch = timeout(Duration::from_millis(200), input.next_batch(8))
+        let batch = timeout(Duration::from_millis(200), input.next_batch(PREFETCH_CHUNK))
             .await
             .unwrap()
             .unwrap();
@@ -289,11 +308,15 @@ mod tests {
             .into_iter()
             .map(|item| match item {
                 ResumableScanItem::Checkpoint(bytes) => bytes[0],
-                _ => panic!("unexpected entry"),
+                ResumableScanItem::Entry(_) => panic!("unexpected entry"),
             })
             .collect();
         assert_eq!(markers, [1, 2]);
-        assert!(timeout(Duration::from_millis(10), input.next_batch(8)).await.is_err());
+        assert!(
+            timeout(Duration::from_millis(10), input.next_batch(PREFETCH_CHUNK))
+                .await
+                .is_err()
+        );
         for marker in [3, 4] {
             sender
                 .send(buffered(vec![ResumableScanItem::Checkpoint(vec![marker])]))
