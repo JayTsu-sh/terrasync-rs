@@ -42,7 +42,7 @@ pub(super) async fn consume(
     // 结构化并发：任一分支失败都等待消费者退出，不遗留后台写入任务。
     let writer_state = state.clone();
     let template = writer_state.incremental.then(|| database.batch_writer()).flatten();
-    let prefetch_capacity = template.as_ref().map(|_| batch_size.saturating_mul(workers::WORKERS));
+    let prefetch_capacity = Some(batch_size.saturating_mul(workers::WORKERS));
     let mut producer_state = state.clone();
     let producer_statistics = statistics.scan_statistics();
     let count_statistics = producer_statistics.clone();
@@ -225,46 +225,48 @@ async fn produce_items(
     tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
     loop {
         let item = select! {
-            item=source.next()=>item,
+            item=source.next_batch(DISPATCH_BATCH)=>item,
             _=tick.tick(),if !pending.is_empty()=>{deliver(&forwarder,&mut pending).await?;continue;}
         };
-        let Some(item) = item else { break };
-        match item {
-            Ok(ResumableScanItem::Entry(entry)) => {
-                observed = observed.saturating_add(entry.history().map_or(1, |h| h.records().len() as u64));
-                pending.push(Arc::from(entry));
-                if pending.len() >= DISPATCH_BATCH {
+        let Some(batch) = item else { break };
+        for item in batch.items {
+            match item {
+                ResumableScanItem::Entry(entry) => {
+                    observed = observed.saturating_add(entry.history().map_or(1, |h| h.records().len() as u64));
+                    pending.push(Arc::from(entry));
+                    if pending.len() >= DISPATCH_BATCH {
+                        deliver(&forwarder, &mut pending).await?;
+                    }
+                }
+                ResumableScanItem::Checkpoint(checkpoint) => {
                     deliver(&forwarder, &mut pending).await?;
+                    forwarder.barrier().await?;
+                    state.statistics = statistics.statistics_checkpoint().await?;
+                    state.checkpoint = checkpoint;
+                    state.observed_entries = observed;
+                    state.advance()?;
+                    save(&control, state).await?;
+                    info!(
+                        version = state.version,
+                        entries = observed,
+                        "Scan checkpoint acknowledged by all consumers"
+                    );
+                    #[cfg(feature = "lab-fault-injection")]
+                    if let Ok(value) = std::env::var("TERRASYNC_LAB_SCAN_PAUSE_AFTER_CHECKPOINT_MS")
+                        && let Ok(value) = value.parse::<u64>()
+                    {
+                        sleep(Duration::from_millis(value)).await;
+                    }
+                    #[cfg(feature = "lab-fault-injection")]
+                    if std::env::var_os("TERRASYNC_LAB_SCAN_STOP_AFTER_CHECKPOINT").is_some() {
+                        cancel.cancel();
+                    }
                 }
             }
-            Ok(ResumableScanItem::Checkpoint(checkpoint)) => {
-                deliver(&forwarder, &mut pending).await?;
-                forwarder.barrier().await?;
-                state.statistics = statistics.statistics_checkpoint().await?;
-                state.checkpoint = checkpoint;
-                state.observed_entries = observed;
-                state.advance()?;
-                save(&control, state).await?;
-                info!(
-                    version = state.version,
-                    entries = observed,
-                    "Scan checkpoint acknowledged by all consumers"
-                );
-                #[cfg(feature = "lab-fault-injection")]
-                if let Ok(value) = std::env::var("TERRASYNC_LAB_SCAN_PAUSE_AFTER_CHECKPOINT_MS")
-                    && let Ok(value) = value.parse::<u64>()
-                {
-                    sleep(Duration::from_millis(value)).await;
-                }
-                #[cfg(feature = "lab-fault-injection")]
-                if std::env::var_os("TERRASYNC_LAB_SCAN_STOP_AFTER_CHECKPOINT").is_some() {
-                    cancel.cancel();
-                }
-            }
-            Err(error) => {
-                cancel.cancel();
-                return Err(error);
-            }
+        }
+        if let Some(error) = batch.failure {
+            cancel.cancel();
+            return Err(error);
         }
     }
     deliver(&forwarder, &mut pending).await?;
