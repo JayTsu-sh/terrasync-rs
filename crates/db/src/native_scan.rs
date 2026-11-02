@@ -606,7 +606,7 @@ mod tests {
         mock.add(handlers::provide(Vec::<Baseline>::new()));
         mock.add(handlers::provide([old]));
         let client = Client::default().with_url(mock.url()).with_validation(false);
-        let result = access(&client).compare(&[entry.clone()]).await?;
+        let result = access(&client).compare(std::slice::from_ref(&entry)).await?;
         assert!(matches!(result.events.as_slice(), [ObservedScanEvent::Changed { .. }]));
 
         let mock = Mock::new();
