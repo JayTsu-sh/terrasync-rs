@@ -21,6 +21,8 @@ export interface MockOverrides {
 export async function setupApiMocks(page: Page, overrides?: MockOverrides) {
   const endpoints = overrides?.endpoints ?? mockEndpoints
   const tasks = (overrides?.tasks ?? mockAllTasks).map(task => ({ ...task, config: { ...task.config } }))
+  const endpointTasks = Object.values(overrides?.tasksByEndpoint ?? {}).flat()
+    .map(task => ({ ...task, config: { ...task.config } }))
   const paths = overrides?.paths ?? mockPaths
   const executions = overrides?.executions ?? mockExecutions
 
@@ -100,7 +102,7 @@ export async function setupApiMocks(page: Page, overrides?: MockOverrides) {
       // 支持按 endpoint 过滤（EndpointDetail 场景）
       if (overrides?.tasksByEndpoint) {
         // 如果有 endpoint 维度的 override，按 source_endpoint_id 匹配
-        const allByEp = Object.values(overrides.tasksByEndpoint).flat()
+        const allByEp = endpointTasks
         if (typeFilter) {
           await route.fulfill({ json: allByEp.filter(t => t.task_type === typeFilter) })
           return
@@ -131,7 +133,7 @@ export async function setupApiMocks(page: Page, overrides?: MockOverrides) {
     const method = route.request().method()
     const url = route.request().url()
     const id = url.split('/tasks/')[1]?.split('?')[0]
-    const task = tasks.find(t => t.id === id)
+    const task = endpointTasks.find(t => t.id === id) ?? tasks.find(t => t.id === id)
 
     if (method === 'GET') {
       await route.fulfill({ json: task ?? tasks[0] })
@@ -149,6 +151,11 @@ export async function setupApiMocks(page: Page, overrides?: MockOverrides) {
 
   // Task start / cancel
   await page.route(/\/api\/v1\/tasks\/[^/]+\/(start|cancel)$/, async (route: Route) => {
+    if (route.request().url().endsWith('/cancel')) {
+      const id = new URL(route.request().url()).pathname.split('/').at(-2)
+      const task = endpointTasks.find(t => t.id === id) ?? tasks.find(t => t.id === id)
+      if (task) task.status = 'cancelled'
+    }
     await route.fulfill({ json: 'ok' })
   })
 

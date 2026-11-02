@@ -126,6 +126,14 @@ export async function startTask(id: string): Promise<string> {
 export async function cancelTask(id: string): Promise<void> {
   const res = await fetch(`${BASE}/tasks/${id}/cancel`, { method: 'POST' })
   await throwIfError(res)
+  // POST 仅确认请求已接收；等到真实终态再让调用方刷新，避免读到 running 后空等三秒轮询。
+  // 这里只查单个任务状态，不重复加载执行历史、进度或 ClickHouse 分析。
+  for (let attempt = 0; attempt < 150; attempt++) {
+    const task = await getTask(id)
+    if (['cancelled', 'completed', 'failed'].includes(task.status)) return
+    await new Promise<void>((resolve) => setTimeout(resolve, 200))
+  }
+  throw new Error('取消请求已发送，但任务尚未停止，请稍后刷新状态')
 }
 
 export async function listExecutions(taskId: string): Promise<TaskExecution[]> {

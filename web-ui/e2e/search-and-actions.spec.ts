@@ -149,7 +149,7 @@ test.describe('任务操作反馈', () => {
     const row = page.locator('tr', { has: page.getByText('scan-running') })
     await row.getByText('取消', { exact: true }).click()
 
-    await expect(page.locator('.n-message')).toContainText('已取消')
+    await expect(page.locator('.n-message')).toContainText('任务已停止')
   })
 })
 
