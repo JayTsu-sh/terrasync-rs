@@ -6,6 +6,7 @@ use std::{
     pin::pin,
     sync::Arc,
     task::Poll,
+    time::Duration,
     vec::IntoIter,
 };
 use storage_adapter::{ResumableScan, ResumableScanItem};
@@ -13,6 +14,8 @@ use tokio::sync::mpsc::error::TrySendError;
 use tokio::{
     select,
     sync::{OwnedSemaphorePermit, Semaphore, mpsc},
+    task::unconstrained,
+    time::sleep,
 };
 use tokio_util::{sync::CancellationToken, task::AbortOnDropHandle};
 
@@ -41,6 +44,35 @@ pub(super) enum ScanInput {
 }
 
 impl ScanInput {
+    async fn prefetch_chunk(&mut self, limit: usize) -> Option<ScanBatch> {
+        let limit = limit.clamp(1, PREFETCH_CHUNK);
+        let mut batch = ScanBatch {
+            items: Vec::with_capacity(limit),
+            failure: None,
+        };
+        let deadline = sleep(Duration::from_millis(100));
+        tokio::pin!(deadline);
+        loop {
+            let part = select! {
+                // 有限读取减少就绪数据的中途让出；整个读取仍受外层停止分支控制。
+                part=unconstrained(self.next_batch(limit-batch.items.len()))=>part,
+                ()=&mut deadline, if !batch.items.is_empty()=>return Some(batch),
+            };
+            let Some(mut part) = part else {
+                return (!batch.items.is_empty()).then_some(batch);
+            };
+            let checkpoint = part
+                .items
+                .iter()
+                .any(|item| matches!(item, ResumableScanItem::Checkpoint(_)));
+            batch.items.append(&mut part.items);
+            batch.failure = part.failure;
+            // 检查点及失败前缀立即发送，绝不等待下一批条目来凑满。
+            if checkpoint || batch.failure.is_some() || batch.items.len() >= limit {
+                return Some(batch);
+            }
+        }
+    }
     /// 一次取走已就绪的小批次；源端等待时立即交付尾部，不等待凑满批次。
     /// 每次 poll 内要么不取条目，要么返回整批，因此外层定时器取消等待不会丢条目。
     pub(super) async fn next_batch(&mut self, limit: usize) -> Option<ScanBatch> {
@@ -107,7 +139,7 @@ impl ScanInput {
                         source.stop().await;
                         return Err(AppError::ObservationScanCancelled);
                     }
-                    items=source.next_batch(PREFETCH_CHUNK.min(capacity))=>items,
+                    items=source.prefetch_chunk(PREFETCH_CHUNK.min(capacity))=>items,
                 };
                 let Some(ScanBatch { items: batch, failure }) = items else {
                     break;
@@ -236,6 +268,9 @@ fn missing_outcome() -> AppError {
 mod tests {
     use super::*;
     use crate::storage_factory::{StorageRole, create_storage_for_role};
+    use data_mover::model::{
+        BackendIdentity, BackendKind, EntryKind, IdentityStrength, ObservedEntry, SourceIdentity, StoragePath,
+    };
     use std::sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -279,6 +314,55 @@ mod tests {
         let room = Arc::new(Semaphore::new(items.len()));
         let permit = room.try_acquire_many_owned(items.len() as u32).unwrap();
         PrefetchedBatch { items, permit }
+    }
+
+    #[tokio::test]
+    async fn prefetch_coalesces_small_batches_but_flushes_the_tail_and_checkpoints() {
+        let backend = BackendIdentity::new(BackendKind::Local, "prefetch-test").unwrap();
+        let identity = SourceIdentity::new(backend, IdentityStrength::PathScoped, b"file").unwrap();
+        let entry = ObservedEntry::new(
+            StoragePath::new("file").unwrap(),
+            EntryKind::File,
+            Some(1),
+            None,
+            identity,
+        )
+        .unwrap();
+        let (sender, receiver) = mpsc::channel(4);
+        let mut input = ScanInput::Prefetched {
+            receiver,
+            current: Vec::new().into_iter(),
+            permit: None,
+            reader: None,
+            discard: CancellationToken::new(),
+        };
+        sender
+            .send(buffered(vec![ResumableScanItem::Entry(Box::new(entry.clone()))]))
+            .await
+            .unwrap();
+        {
+            let chunk = input.prefetch_chunk(PREFETCH_CHUNK);
+            tokio::pin!(chunk);
+            assert!(
+                timeout(Duration::from_millis(20), &mut chunk).await.is_err(),
+                "partial data should wait briefly for coalescing"
+            );
+            sender
+                .send(buffered(vec![ResumableScanItem::Entry(Box::new(entry))]))
+                .await
+                .unwrap();
+            let batch = timeout(Duration::from_millis(200), &mut chunk).await.unwrap().unwrap();
+            assert_eq!(batch.items.len(), 2);
+        }
+        sender
+            .send(buffered(vec![ResumableScanItem::Checkpoint(vec![9])]))
+            .await
+            .unwrap();
+        let batch = timeout(Duration::from_millis(20), input.prefetch_chunk(PREFETCH_CHUNK))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(&batch.items[0], ResumableScanItem::Checkpoint(bytes) if bytes == &[9]));
     }
 
     #[tokio::test]
