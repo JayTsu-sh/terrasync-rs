@@ -1,4 +1,4 @@
-//! 单机与集群共用的原生扫描比较：限定本批主键，保留后端身份补查和旧基线兼容。
+//! 单机与集群共用的原生扫描比较：限定本批主键并复核后端身份归属。
 use crate::clickhouse::replica_read::QuorumRead;
 use crate::scan_metadata::ScanMetadataHash;
 use crate::scan_store::ScanFinalEvent;
@@ -8,18 +8,44 @@ use crate::{
     error::{DatabaseError, Result},
     traits::StorageEntryRecord,
 };
-use clickhouse::{Client, query::Query};
+use clickhouse::{Client, query::Query, sql::Bind};
 use data_mover::model::ObservedEntry;
 use rustc_hash::{FxHashMap, FxHashSet};
 use serde::Deserialize;
 use smol_str::SmolStr;
-use std::sync::Arc;
+use std::{fmt, sync::Arc};
 use storage_adapter::{
     ChangeKind,
     observed_scan::{EntryStatistics, ObservedItem, ObservedScanEvent, ObservedView},
 };
 use tokio::task::yield_now;
 use tracing::warn;
+
+const SPARSE_KEY_BYTES: usize = 16_384;
+
+struct BoundBytes(usize);
+impl fmt::Write for BoundBytes {
+    fn write_str(&mut self, text: &str) -> fmt::Result {
+        self.0 = self.0.checked_add(text.len()).ok_or(fmt::Error)?;
+        Ok(())
+    }
+}
+
+fn sparse_key_group_end(keys: &[impl Bind], start: usize) -> Result<usize> {
+    let mut end = start;
+    let mut bytes = 2_usize; // 数组的左右定界符。
+    while end < keys.len() {
+        let mut encoded = BoundBytes(0);
+        keys[end].write(&mut encoded).map_err(DatabaseError::ConversionError)?;
+        let next = encoded.0.saturating_add(usize::from(end > start));
+        if bytes.saturating_add(next) > SPARSE_KEY_BYTES {
+            break;
+        }
+        bytes += next;
+        end += 1;
+    }
+    Ok(end)
+}
 
 pub(crate) struct NativeScanAccess<'a> {
     pub client: &'a Client,
@@ -263,22 +289,8 @@ impl NativeScanAccess<'_> {
         let mut rows = Vec::new();
         let mut start = 0;
         while start < keys.len() {
-            let mut end = start;
-            let mut bytes = 0_usize;
-            while end < keys.len() {
-                // SQL 字符串转义最多翻倍，限制每次绑定的字节预算而非只限制条数。
-                let next = keys[end]
-                    .0
-                    .len()
-                    .saturating_add(keys[end].1.len())
-                    .saturating_mul(2)
-                    .saturating_add(16);
-                if bytes.saturating_add(next) > 16_384 {
-                    break;
-                }
-                bytes += next;
-                end += 1;
-            }
+            // 用 client 同一个 SQL 编码器计量实际转义字节，保持原上限并减少无效分块。
+            let end = sparse_key_group_end(&keys, start)?;
             if end == start {
                 return self.baselines(first, last, by_handle).await;
             }
@@ -618,6 +630,43 @@ mod tests {
             typed_handles: true,
         }
     }
+    #[test]
+    fn sparse_keys_use_actual_client_encoding_with_the_original_byte_limit() -> Result<()> {
+        let ordinary: Vec<_> = (0..240)
+            .map(|index| (format!("d000/d000/d000/d000/d000/file{index:06}.dat"), String::new()))
+            .collect();
+        assert_eq!(sparse_key_group_end(&ordinary, 0)?, ordinary.len());
+        let escaped: Vec<_> = (0..400)
+            .map(|index| {
+                (
+                    format!("目录/{}'\\\n{index}", "wide".repeat(20)),
+                    "version'\\".to_owned(),
+                )
+            })
+            .collect();
+        let mut start = 0;
+        while start < escaped.len() {
+            let end = sparse_key_group_end(&escaped, start)?;
+            assert!(end > start);
+            let mut encoded = String::new();
+            (&escaped[start..end])
+                .write(&mut encoded)
+                .map_err(DatabaseError::ConversionError)?;
+            assert!(encoded.len() <= SPARSE_KEY_BYTES);
+            if end < escaped.len() {
+                encoded.clear();
+                (&escaped[start..end + 1])
+                    .write(&mut encoded)
+                    .map_err(DatabaseError::ConversionError)?;
+                assert!(encoded.len() > SPARSE_KEY_BYTES);
+            }
+            start = end;
+        }
+        let oversized = [("x".repeat(SPARSE_KEY_BYTES), String::new())];
+        assert_eq!(sparse_key_group_end(&oversized, 0)?, 0);
+        Ok(())
+    }
+
     #[tokio::test]
     async fn unchanged_round_does_not_fetch_unused_deletion_metadata() -> Result<()> {
         let mock = Mock::new();

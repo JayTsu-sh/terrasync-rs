@@ -356,6 +356,7 @@ impl ScanCuts {
             .bind(&self.prefix)
             .fetch_all::<String>()
             .await?;
+        let mut statements = Vec::new();
         for table in tables {
             if keep
                 .iter()
@@ -363,14 +364,30 @@ impl ScanCuts {
             {
                 continue;
             }
-            self.client
-                .query(&format!(
-                    "DROP TABLE IF EXISTS {}{} SYNC",
-                    self.qualified(&table)?,
-                    self.on_cluster()?
-                ))
-                .execute_scan()
-                .await?;
+            statements.push(format!(
+                "DROP TABLE IF EXISTS {}{} SYNC",
+                self.qualified(&table)?,
+                self.on_cluster()?
+            ));
+        }
+        // 这些表已无 manifest 引用，最多四个独立 DROP 并行；任一失败也等待同组全部结束。
+        for group in statements.chunks(4) {
+            let (first, second, third, fourth) = tokio::join!(
+                self.drop_snapshot(group.first()),
+                self.drop_snapshot(group.get(1)),
+                self.drop_snapshot(group.get(2)),
+                self.drop_snapshot(group.get(3)),
+            );
+            first?;
+            second?;
+            third?;
+            fourth?;
+        }
+        Ok(())
+    }
+    async fn drop_snapshot(&self, statement: Option<&String>) -> Result<()> {
+        if let Some(statement) = statement {
+            self.client.query(statement).execute_scan().await?;
         }
         Ok(())
     }

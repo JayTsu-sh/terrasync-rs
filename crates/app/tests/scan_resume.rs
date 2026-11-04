@@ -573,9 +573,32 @@ async fn finalized_full_scan_reuses_its_sealed_metadata_after_pod_loss() -> Resu
     let mut first = command(work.path(), &config, &source, "failed-after-source-seal")?;
     first
         .command
-        .env("TERRASYNC_LAB_SCAN_CHECKPOINT_EVERY_MS", "60000")
-        .env("TERRASYNC_LAB_SCAN_FAIL_AFTER_FINALIZING", "1");
-    assert!(!first.command.status()?.success());
+        // 功能测试强制完整目录边界到期；短扫描成功结束时 SDK 不额外发送最终 checkpoint。
+        .env("TERRASYNC_LAB_SCAN_CHECKPOINT_EVERY_MS", "0")
+        .env("TERRASYNC_LAB_SCAN_FAIL_AFTER_FINALIZING", "1")
+        .env("TERRASYNC_LAB_SCAN_PAUSE_AFTER_CHECKPOINT_MS", "3000");
+    let mut first = ChildGuard(first.command.spawn()?);
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let checkpoint_cut = loop {
+        let current = database
+            .query("SELECT phase,checkpoint_snapshot,observed_entries FROM scan_resume_resume_case FINAL")
+            .fetch_one::<(u8, String, u64)>()
+            .await;
+        if let Ok((phase, token, entries)) = &current
+            && *phase == 0
+            && *entries == 512
+        {
+            break token.clone();
+        }
+        assert!(Instant::now() < deadline, "final checkpoint was not observed");
+        assert!(
+            first.0.try_wait()?.is_none(),
+            "scan exited before its final checkpoint was observed: {current:?}; {}",
+            fs::read_to_string(work.path().join("failed-after-source-seal.log"))?
+        );
+        sleep(Duration::from_millis(20)).await;
+    };
+    assert!(!first.0.wait()?.success());
     let (phase, sealed, observed): (u8, String, u64) = database
         .query("SELECT phase,checkpoint_snapshot,observed_entries FROM scan_resume_resume_case FINAL")
         .fetch_one()
@@ -583,6 +606,10 @@ async fn finalized_full_scan_reuses_its_sealed_metadata_after_pod_loss() -> Resu
     assert_eq!(phase, 1);
     assert!(!sealed.is_empty());
     assert_eq!(observed, 512);
+    assert_eq!(
+        sealed, checkpoint_cut,
+        "FINALIZING must reuse a final checkpoint with no subsequent observation writes"
+    );
     let metadata = "SELECT toJSONString(tuple(*)) FROM base_resume_case FINAL ORDER BY relative_path,version_id";
     let before = database.query(metadata).fetch_all::<String>().await?;
     assert_eq!(before.len(), 512);
@@ -620,6 +647,98 @@ async fn finalized_full_scan_reuses_its_sealed_metadata_after_pod_loss() -> Resu
         .await?,
         1
     );
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires ClickHouse and TERRASYNC_TEST_BINARY built with lab-fault-injection"]
+async fn observations_after_an_acknowledged_checkpoint_require_a_new_metadata_cut() -> Result {
+    let name = format!(
+        "ts_scan_cut_updates_{}",
+        SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos()
+    );
+    client("default")
+        .query(&format!("CREATE DATABASE {name}"))
+        .execute()
+        .await?;
+    let _guard = DatabaseGuard(name.clone());
+    let database = client(&name);
+    let work = tempfile::tempdir()?;
+    let source = work.path().join("source");
+    fs::create_dir(&source)?;
+    for directory in 0..30 {
+        let path = source.join(format!("dir{directory}"));
+        fs::create_dir(&path)?;
+        for file in 0..13 {
+            fs::write(path.join(format!("file{file}")), b"facts")?;
+        }
+    }
+    for file in 0..170 {
+        fs::write(source.join(format!("root-file{file}")), b"facts")?;
+    }
+    let total = paths(&source)?.len() as u64;
+    let config = work.path().join("config.toml");
+    write_scan_config(&config, &name, 8)?;
+    let mut scan = command(work.path(), &config, &source, "all-directory-checkpoints")?;
+    scan.command
+        .env("TERRASYNC_LAB_SCAN_CHECKPOINT_EVERY_MS", "0")
+        .env("TERRASYNC_LAB_SCAN_FAIL_AFTER_FINALIZING", "1")
+        .env("TERRASYNC_LAB_SCAN_PAUSE_AFTER_CHECKPOINT_MS", "300");
+    let mut process = ChildGuard(scan.command.spawn()?);
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let previous_cut = loop {
+        if let Ok((phase, token, entries)) = database
+            .query("SELECT phase,checkpoint_snapshot,observed_entries FROM scan_resume_resume_case FINAL")
+            .fetch_one::<(u8, String, u64)>()
+            .await
+            && phase == 0
+            && entries > 0
+            && entries < total
+        {
+            eprintln!("Confirmed middle checkpoint: {entries}/{total}");
+            break token;
+        }
+        assert!(Instant::now() < deadline, "middle checkpoint was not observed");
+        assert!(
+            process.0.try_wait()?.is_none(),
+            "scan exited before a middle checkpoint: {}",
+            fs::read_to_string(&scan.log)?
+        );
+        sleep(Duration::from_millis(20)).await;
+    };
+    assert!(!process.0.wait()?.success());
+    let (phase, token, observed): (u8, String, u64) = database
+        .query("SELECT phase,checkpoint_snapshot,observed_entries FROM scan_resume_resume_case FINAL")
+        .fetch_one()
+        .await?;
+    assert_eq!((phase, observed), (1, total));
+    assert_ne!(token, previous_cut, "later observations require a new metadata cut");
+    let names = database
+        .query("SELECT name FROM system.tables WHERE database=? AND endsWith(name,?)")
+        .bind(&name)
+        .bind(format!("_{token}_base"))
+        .fetch_all::<String>()
+        .await?;
+    assert_eq!(names.len(), 1);
+    let table = &names[0];
+    assert!(table.bytes().all(|byte| byte.is_ascii_alphanumeric() || byte == b'_'));
+    assert_eq!(
+        database
+            .0
+            .query(&format!("SELECT count() FROM {table} FINAL"))
+            .fetch_one::<u64>()
+            .await?,
+        observed
+    );
+    discard_pod_local_state(work.path(), "all-directory-checkpoints")?;
+    complete(command(
+        work.path(),
+        &config,
+        &source,
+        "recover-last-directory-checkpoint",
+    )?)
+    .await?;
+    assert_paths(&database, &source).await?;
     Ok(())
 }
 

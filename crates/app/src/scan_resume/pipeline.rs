@@ -34,18 +34,25 @@ use tracing::info;
 
 pub(super) const DISPATCH_BATCH: usize = 256;
 pub(super) type Entries = Arc<[Arc<ObservedEntry>]>;
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum SaveAction {
+    Capture,
+    Restore,
+    ManifestOnly,
+}
+
 pub(super) struct SaveState {
     pub(super) state: ScanResumeState,
-    pub(super) restore: bool,
+    pub(super) action: SaveAction,
     pub(super) ack: oneshot::Sender<ScanResumeState>,
 }
 
 impl SaveState {
     pub(super) async fn execute(mut self, database: &ScanStore) -> Result<()> {
-        if self.restore {
-            database.restore_scan_checkpoint(&self.state).await?;
-        } else {
-            database.seal_resume_state(&mut self.state).await?;
+        match self.action {
+            SaveAction::Restore => database.restore_scan_checkpoint(&self.state).await?,
+            SaveAction::Capture => database.seal_resume_state(&mut self.state).await?,
+            SaveAction::ManifestOnly => database.save_resume_state(&self.state).await?,
         }
         let _ = self.ack.send(self.state);
         Ok(())
@@ -263,12 +270,12 @@ async fn deliver(forwarder: &ObservedForwarder<Entries>, pending: &mut Vec<Arc<O
     }
     Ok(())
 }
-async fn save(control: &mpsc::Sender<SaveState>, state: &mut ScanResumeState, restore: bool) -> Result<()> {
+async fn save(control: &mpsc::Sender<SaveState>, state: &mut ScanResumeState, action: SaveAction) -> Result<()> {
     let (tx, rx) = oneshot::channel();
     control
         .send(SaveState {
             state: state.clone(),
-            restore,
+            action,
             ack: tx,
         })
         .await
@@ -307,6 +314,8 @@ async fn produce_items(
     mut progress: ScanProgress,
 ) -> Result<()> {
     let mut pending = Vec::with_capacity(DISPATCH_BATCH);
+    // 仅在写入屏障和快照确认后置真；后续实际观察一旦交付，就必须重新封存事实。
+    let mut snapshot_matches_facts = false;
     let mut tick = interval(Duration::from_millis(100));
     tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
     loop {
@@ -324,11 +333,13 @@ async fn produce_items(
                 ResumableScanItem::Resumed(event) => {
                     pending.clear();
                     cancel.interrupt(forwarder.barrier()).await??;
-                    cancel.interrupt(save(&control, state, true)).await??;
+                    cancel.interrupt(save(&control, state, SaveAction::Restore)).await??;
+                    snapshot_matches_facts = true;
                     progress.resumed(&event, statistics).await?;
                     statistics.restore_scan_event_counts(&state.statistics).await?;
                 }
                 ResumableScanItem::Entry(entry) => {
+                    snapshot_matches_facts = false;
                     pending.push(Arc::from(entry));
                     if pending.len() >= DISPATCH_BATCH {
                         cancel.interrupt(deliver(&forwarder, &mut pending)).await??;
@@ -348,7 +359,13 @@ async fn produce_items(
                     state.observed_entries = prefix.scanned.total();
                     state.advance()?;
                     state.statistics = statistics.checkpoint_for_scan_prefix(&prefix).await?;
-                    cancel.interrupt(save(&control, state, false)).await??;
+                    let action = if snapshot_matches_facts {
+                        SaveAction::ManifestOnly
+                    } else {
+                        SaveAction::Capture
+                    };
+                    cancel.interrupt(save(&control, state, action)).await??;
+                    snapshot_matches_facts = true;
                     progress.confirm(checkpoint);
                     info!(
                         version = state.version,
@@ -389,7 +406,13 @@ async fn produce_items(
     state.observed_entries = statistics.scanned_entries().await;
     state.advance()?;
     state.statistics = statistics.statistics_checkpoint().await?;
-    cancel.interrupt(save(&control, state, false)).await??;
+    // 最后一次 checkpoint 后没有新观察时，只更新 FINALIZING 统计和阶段，复用已确认事实。
+    let action = if snapshot_matches_facts {
+        SaveAction::ManifestOnly
+    } else {
+        SaveAction::Capture
+    };
+    cancel.interrupt(save(&control, state, action)).await??;
     #[cfg(feature = "lab-fault-injection")]
     if std::env::var_os("TERRASYNC_LAB_SCAN_FAIL_AFTER_FINALIZING").is_some() {
         return Err(AppError::ScanError(
