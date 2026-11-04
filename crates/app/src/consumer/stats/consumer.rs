@@ -15,7 +15,7 @@ use std::sync::atomic::AtomicU64;
 use std::time::Duration;
 
 // 外部crate
-use data_mover::model::ObservedEntry;
+use data_mover::model::{EntryKind, ObservedEntry};
 use reqwest::Response;
 use storage_adapter::StorageEntryMessage;
 use storage_adapter::observed_scan::{EntryStatistics, ObservedScanEvent, ObservedView};
@@ -77,18 +77,41 @@ impl StatisticConsumer {
 
     /// 更新累计统计 + 进度条原子计数器
     pub fn update_observed_entry(&mut self, entry: &ObservedEntry) {
+        if let Some(scan) = &self.scan_snapshot {
+            if scan.replayed_directory_listings == 0 && entry.history().is_none() {
+                let statistics = match &mut self.stats {
+                    StatsKind::Full(value) => value,
+                    StatsKind::Incremental(value) => &mut value.scanned,
+                };
+                for view in ObservedView::all(entry) {
+                    statistics.update_distributions(&view, entry.kind() == EntryKind::File);
+                }
+            }
+            return;
+        }
         for view in ObservedView::all(entry) {
             match &mut self.stats {
                 StatsKind::Full(stats) => stats.update(&view),
                 StatsKind::Incremental(stats) => stats.scanned.update(&view),
             }
-            if self.scan_snapshot.is_none() {
-                self.progress_bar.update_observed("scanned", &view);
-            }
+            self.progress_bar.update_observed("scanned", &view);
         }
     }
-    pub(crate) fn sync_scan_progress(&self) {
+    pub(crate) fn sync_scan_progress(&mut self) {
         if let Some(scan) = &self.scan_snapshot {
+            let statistics = match &mut self.stats {
+                StatsKind::Full(value) => value,
+                StatsKind::Incremental(value) => &mut value.scanned,
+            };
+            statistics.dir_count = scan.counts.retained.directories as usize;
+            statistics.regular_file_count = scan.counts.retained.regular_files as usize;
+            statistics.symlink_count = scan.counts.retained.symlinks as usize;
+            statistics.regular_file_size = scan.counts.regular_file_bytes as i64;
+            if scan.replayed_directory_listings > 0 && !scan.distributions_reconciled {
+                statistics.extension_stats.clear();
+                statistics.time_range_stats.clear();
+                statistics.file_size_range_stats.clear();
+            }
             self.progress_bar.update_scan(scan);
         }
     }
@@ -182,17 +205,15 @@ impl StatisticConsumer {
                 final_stats.regular_files = scan.counts.retained.regular_files as usize;
                 final_stats.symlinks = scan.counts.retained.symlinks as usize;
                 final_stats.regular_file_size = scan.counts.regular_file_bytes as i64;
-                if scan.counts.versions > 0
-                    || scan.counts.delete_markers > 0
-                    || (scan.replayed_directory_listings > 0 && !scan.distributions_reconciled)
-                {
+                if !scan.distributions_reconciled || scan.counts.versions > 0 || scan.counts.delete_markers > 0 {
                     final_stats.dir_size = None;
                     final_stats.symlink_size = None;
                 }
                 let ordinary = scan.counts.retained.directories
                     + scan.counts.retained.regular_files
                     + scan.counts.retained.symlinks;
-                if scan.counts.versions > 0
+                if !scan.complete
+                    || scan.counts.versions > 0
                     || scan.counts.delete_markers > 0
                     || ordinary != scan.counts.retained.total()
                     || (scan.replayed_directory_listings > 0 && !scan.distributions_reconciled)

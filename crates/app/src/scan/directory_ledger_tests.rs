@@ -6,8 +6,12 @@ use crate::{
     consumer::{ConsumerManager, stats::ProgressDetail},
     storage_factory::{StorageRole, create_storage_for_role},
 };
-use data_mover::{model::StoragePath, traversal::EntryKindCounts};
+use data_mover::{
+    model::{BackendIdentity, BackendKind, EntryKind, IdentityStrength, ObservedEntry, SourceIdentity, StoragePath},
+    traversal::EntryKindCounts,
+};
 use db::DatabaseConfig;
+use std::sync::Arc;
 
 async fn manager() -> Result<ConsumerManager> {
     let config = ConsumerConfig {
@@ -85,6 +89,20 @@ async fn checkpoint_200_interrupted_300_resumes_to_1000_without_counting_replay(
         statistics.raw_progress().await.unwrap().detail,
         ProgressDetail::Full { scanned_files: 200, .. }
     ));
+    // 原始交付流绝不能修改任何扫描标量；计数只能来自目录确认事实。
+    let backend = BackendIdentity::new(BackendKind::Local, "replay-fixture").unwrap();
+    let identity = SourceIdentity::new(backend, IdentityStrength::PathScoped, b"file").unwrap();
+    let entry = ObservedEntry::new(
+        StoragePath::new("file").unwrap(),
+        EntryKind::File,
+        Some(10),
+        None,
+        identity,
+    )
+    .unwrap();
+    resumed.record_observations(&vec![Arc::new(entry); 1000]).await;
+    let durable: serde_json::Value = serde_json::from_str(&resumed.statistics_checkpoint().await?)?;
+    assert_eq!(durable["stats"]["Full"]["regular_file_count"].as_u64(), Some(200));
     // 模拟从持久库加载已确认的目录贡献；本地 SQLite 已完全丢失。
     let mut ledger = DirectoryLedger::new(None, 2).await?;
     sqlx::query("INSERT INTO contributions VALUES ('',?,1,0,0)")

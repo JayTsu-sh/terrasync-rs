@@ -244,24 +244,28 @@ impl FullStats {
         } else {
             self.regular_file_count += 1;
             self.regular_file_size += size;
-            // 扩展名统计
-            if let Some(ext) = entry.get_extension() {
-                let e = self.extension_stats.entry(ext.to_lowercase()).or_insert((0, 0));
-                e.0 += size;
-                e.1 += 1;
-            }
-            // 文件大小分布
-            let range = calculate_file_size_range(entry.get_size());
-            let r = self.file_size_range_stats.entry(range).or_insert((0, 0));
-            r.0 += size;
-            r.1 += 1;
         }
+        self.update_distributions(entry, !entry.get_is_dir() && !entry.get_is_symlink());
+    }
 
-        // 修改时间分布（所有条目）
-        let tr = calculate_time_range(entry.get_mtime());
-        let t = self.time_range_stats.entry(tr).or_insert((0, 0));
-        t.0 += size;
-        t.1 += 1;
+    /// 扫描标量只取目录确认快照；此处只观察可选分布，不再累加条目数。
+    pub(crate) fn update_distributions(&mut self, entry: &impl EntryStatistics, regular: bool) {
+        let size = entry.get_size() as i64;
+        if regular {
+            if let Some(ext) = entry.get_extension() {
+                let value = self.extension_stats.entry(ext.to_lowercase()).or_insert((0, 0));
+                value.0 += size;
+                value.1 += 1;
+            }
+            let range = calculate_file_size_range(entry.get_size());
+            let value = self.file_size_range_stats.entry(range).or_insert((0, 0));
+            value.0 += size;
+            value.1 += 1;
+        }
+        let range = calculate_time_range(entry.get_mtime());
+        let value = self.time_range_stats.entry(range).or_insert((0, 0));
+        value.0 += size;
+        value.1 += 1;
     }
 
     pub fn update_from_message(&mut self, message: &StorageEntryMessage) {
