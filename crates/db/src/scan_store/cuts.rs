@@ -1,5 +1,8 @@
 //! 扫描检查点的不可变元数据快照。先确认 base/events，最后提交引用二者的 manifest。
 //! 所有暂存均位于 ClickHouse；恢复两表可重试，恢复结束前不得开始新的扫描写入。
+#[cfg(test)]
+mod tests;
+
 use super::queries::{ScanExecute, check_scan_cancellation, job_query_prefix, scan_retry_delay};
 use crate::clickhouse::{replica_read::QuorumRead, scan_resume::FINALIZING};
 use crate::{ClickHouseConfig, DatabaseError, Result, clickhouse::build_base_client, cluster_scan::identifier};
@@ -132,11 +135,17 @@ impl ScanCuts {
     pub(super) async fn capture(&self) -> Result<String> {
         self.await_prior_operations().await?;
         let token = Uuid::new_v4().simple().to_string();
-        for events in [false, true] {
-            let cut = self.name(&token, events)?;
-            let source = self.source(events);
-            self.clone_table(&source, &cut, events).await?;
-        }
+        let base = self.name(&token, false)?;
+        let events = self.name(&token, true)?;
+        let source_base = self.source(false);
+        let source_events = self.source(true);
+        // writer 已排空，两个独立事实表可以并行复制；两者都结束后才允许发布同一 token。
+        let (base_result, events_result) = tokio::join!(
+            self.clone_table(&source_base, &base, false),
+            self.clone_table(&source_events, &events, true),
+        );
+        base_result?;
+        events_result?;
         Ok(token)
     }
 

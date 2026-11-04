@@ -82,8 +82,8 @@ pub(super) async fn consume(
     let template = writer_state.incremental.then(|| database.batch_writer()).flatten();
     // 预读跟随实际写入并行度；全量和单机增量的串行写入只分配一个 worker 的预算。
     let writer_workers = if template.is_some() { workers::WORKERS } else { 1 };
-    // 增量比较和持久化屏障更长，用三个有界 worker 窗口覆盖在途批次及确认等待。
-    let windows = if state.incremental { 3 } else { 1 };
+    // 增量比较和目录块确认会暂停下游，用三个有界窗口覆盖在途批次及确认等待。
+    let windows = if state.incremental || resume { 3 } else { 1 };
     let prefetch_capacity = Some(batch_size.saturating_mul(writer_workers).saturating_mul(windows));
     let mut producer_state = state.clone();
     let producer_statistics = statistics.scan_statistics();
