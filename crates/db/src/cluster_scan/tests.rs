@@ -33,6 +33,43 @@ fn mock_schema_store(mock: &Mock) -> Result<ClusterScanStore> {
 }
 
 #[tokio::test]
+async fn ordinary_batch_releases_only_its_staging_partition() -> Result<()> {
+    let mock = Mock::new();
+    let statement = mock.add(handlers::record_ddl());
+    let mut store = mock_schema_store(&mock)?;
+    store.batch_id = 41;
+    store.begin_resume_batch().await?;
+    let query = statement.query().await;
+    assert!(query.contains("scan_resume_batch_local"));
+    assert!(query.contains("41"));
+    assert!(!query.contains("scan_resume_keys_local"));
+    assert_ne!(store.batch_id, 41);
+    Ok(())
+}
+
+#[tokio::test]
+async fn empty_events_do_not_wait_for_an_unrelated_quorum_gate() -> Result<()> {
+    let mock = Mock::new();
+    let store = mock_schema_store(&mock)?;
+    let _in_flight = store.writes.events.lock().await;
+    tokio::time::timeout(std::time::Duration::from_millis(100), store.events_native(&[], 17))
+        .await
+        .map_err(|error| DatabaseError::TransactionError(error.to_string()))??;
+    Ok(())
+}
+
+#[tokio::test]
+async fn cancelled_empty_events_still_report_cancellation() -> Result<()> {
+    let mock = Mock::new();
+    let store = mock_schema_store(&mock)?;
+    let cancel = CancellationToken::new();
+    cancel.cancel();
+    let result = with_scan_cancellation(cancel, store.events_native(&[], 17)).await;
+    assert!(matches!(result, Err(DatabaseError::ScanCancelled)));
+    Ok(())
+}
+
+#[tokio::test]
 async fn schema_initialization_is_shared_by_concurrent_store_and_writer_calls() -> Result<()> {
     let mock = Mock::new();
     mock.add(handlers::provide::<String>([]));

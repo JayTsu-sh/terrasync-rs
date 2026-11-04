@@ -1,10 +1,19 @@
 //! 对真实单机或集群验证扫描元数据的 cut 恢复和 job 隔离。
 use clickhouse::{Client, sql::Identifier};
+use data_mover::model::{
+    BackendIdentity, BackendKind, EntryKind, IdentityStrength, ObservedEntry, SourceIdentity, SpecialFileKind,
+    StoragePath, SymlinkTarget, SymlinkTargetEncoding,
+};
 use db::{
     ClickHouseConfig, DatabaseConfig, DatabaseFactory, Result,
     clickhouse::scan_resume::{RUNNING, ScanResumeState},
     scan_store::ScanStore,
 };
+use std::{
+    sync::Arc,
+    time::{SystemTime, UNIX_EPOCH},
+};
+use storage_adapter::observed_scan::{ObservedItem, ObservedScanEvent};
 use utils::app_config::ClickHouseMode;
 use uuid::Uuid;
 
@@ -272,5 +281,102 @@ async fn exercise(fixture: &Fixture) -> Result<()> {
     empty_store.restore_scan_checkpoint(&empty_state).await?;
     assert!(fixture.rows("base", "empty_job").await?.is_empty());
     assert_eq!(fixture.rows("base", "scan_b").await?, ["unrelated"]);
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires an isolated writable ClickHouse database"]
+async fn special_entries_remain_persisted_without_inflating_regular_statistics() -> Result<()> {
+    let fixture = Fixture::new().await?;
+    let result = exercise_special_statistics(&fixture).await;
+    let cleanup = fixture.cleanup().await;
+    result?;
+    cleanup
+}
+
+async fn exercise_special_statistics(fixture: &Fixture) -> Result<()> {
+    let store = fixture.store("special_types").await?;
+    let epoch = i64::try_from(SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos())?;
+    let state = ScanResumeState {
+        id: 1,
+        schema_version: 1,
+        version: 1,
+        request_key: "typed-statistics".into(),
+        generation: 1,
+        incremental: true,
+        phase: RUNNING,
+        event_time: epoch,
+        observed_entries: 0,
+        checkpoint: vec![],
+        statistics: String::new(),
+        baseline_snapshot: String::new(),
+        checkpoint_snapshot: String::new(),
+    };
+    store.save_resume_state(&state).await?;
+    store.begin_scan_generation().await?;
+    let backend = BackendIdentity::new(BackendKind::Nfs, "special-statistics")?;
+    let mut entries = Vec::new();
+    for (index, kind) in [
+        EntryKind::File,
+        EntryKind::Directory,
+        EntryKind::Symlink,
+        EntryKind::Special(SpecialFileKind::BlockDevice),
+        EntryKind::Special(SpecialFileKind::CharacterDevice),
+        EntryKind::Special(SpecialFileKind::Fifo),
+        EntryKind::Special(SpecialFileKind::Socket),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let path = format!("entry_{index}.dat");
+        let identity = SourceIdentity::new(backend.clone(), IdentityStrength::StableWithinBackend, path.as_bytes())?;
+        let entry = if kind == EntryKind::Symlink {
+            ObservedEntry::new_symlink(
+                StoragePath::new(path)?,
+                None,
+                identity,
+                SymlinkTarget::new(SymlinkTargetEncoding::UnixBytes, b"target".to_vec())?,
+            )?
+        } else {
+            ObservedEntry::new(StoragePath::new(path)?, kind, Some(17), None, identity)?
+        };
+        entries.push(Arc::new(entry));
+    }
+    store.write_observations(&entries, false).await?;
+    let events = entries
+        .into_iter()
+        .map(|entry| {
+            ObservedScanEvent::New(ObservedItem {
+                entry,
+                version_index: None,
+            })
+        })
+        .collect::<Vec<_>>();
+    store.write_resume_events(&events, epoch).await?;
+    let statistics = store.resume_statistics(1, Some(epoch)).await?;
+    assert_eq!((statistics.summary.files, statistics.summary.file_bytes), (1, 17));
+    assert_eq!((statistics.summary.dirs, statistics.summary.links), (1, 1));
+    assert_eq!(statistics.sizes.iter().map(|(_, _, count)| count).sum::<u64>(), 1);
+    assert_eq!(statistics.events.iter().map(|event| event.entries).sum::<u64>(), 7);
+    assert_eq!(
+        statistics
+            .events
+            .iter()
+            .filter(|event| !event.is_dir && !event.is_symlink && !event.is_regular_file)
+            .map(|event| event.entries)
+            .sum::<u64>(),
+        4
+    );
+    for table in ["base", "incremental"] {
+        let actual = fixture
+            .client
+            .query(&format!(
+                "SELECT count(),countIf(is_regular_file) FROM {} FINAL",
+                fixture.table(table, "special_types")
+            ))
+            .fetch_one::<(u64, u64)>()
+            .await?;
+        assert_eq!(actual, (7, 1), "all typed entries must remain in persisted facts");
+    }
     Ok(())
 }

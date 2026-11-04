@@ -1,6 +1,6 @@
 //! 整轮完成后统一校准，实时扫描不查询数据库去重。
 use super::*;
-use crate::clickhouse::scan_resume_statistics::{ScanEventStatistics, ScanResumeSummary};
+use crate::clickhouse::scan_resume_statistics::{ScanEventStatistics, ScanEventSummary, ScanResumeSummary};
 
 impl ClusterScanStore {
     pub(crate) async fn resume_statistics(
@@ -10,7 +10,7 @@ impl ClusterScanStore {
         let epoch = self.epoch.load(Ordering::Relaxed);
         let job = &self.job_id;
         let scope = format!("FROM {database}.base FINAL WHERE job_id='{job}' AND epoch={epoch} AND is_deleted=0");
-        let regular = "NOT is_dir AND NOT is_symlink";
+        let regular = "is_regular_file";
         let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
         // 在同一个去重结果上汇总分布，避免对五千万条 base 重复执行四次 FINAL。
         let totals = self.client.query(&format!("WITH toUInt8(multiIf(toUnixTimestamp64Nano(mtime)>{now}-86400000000000,0,toUnixTimestamp64Nano(mtime)>{now}-604800000000000,1,toUnixTimestamp64Nano(mtime)>{now}-2592000000000000,2,toUnixTimestamp64Nano(mtime)>{now}-15552000000000000,3,toUnixTimestamp64Nano(mtime)>{now}-31536000000000000,4,5)) AS age_bucket, toUInt8(multiIf(size<4096,0,size<65536,1,size<131072,2,size<262144,3,size<524288,4,size<1048576,5,size<2097152,6,size<16777216,7,size<67108864,8,size<134217728,9,size<536870912,10,11)) AS size_bucket SELECT countIf(is_dir) AS dirs, toInt64(sumIf(size,is_dir)) AS dir_bytes, countIf({regular}) AS files, toInt64(sumIf(size,{regular})) AS file_bytes, countIf(NOT is_dir AND is_symlink) AS links, toInt64(sumIf(size,NOT is_dir AND is_symlink)) AS link_bytes, toInt64(sumIf(countMatches(relative_path,'/')+1,is_dir)) AS total_depth, toUInt64(maxIf(countMatches(relative_path,'/')+1,is_dir)) AS max_depth, toInt64(sum(length(name))) AS total_name_length, toUInt64(max(length(name))) AS max_name_length, sumMapIf([lower(ifNull(ext,''))],[toInt64(size)],[toUInt64(1)],{regular} AND ext IS NOT NULL) AS extensions, tuple(CAST(range(6),'Array(UInt8)'),sumResample(0,6,1)(toInt64(size),age_bucket),sumResample(0,6,1)(toUInt64(1),age_bucket)) AS ages, tuple(CAST(range(12),'Array(UInt8)'),sumResample(0,12,1)(if({regular},toInt64(size),toInt64(0)),size_bucket),sumResample(0,12,1)(toUInt64({regular}),size_bucket)) AS sizes {scope}"))
@@ -26,8 +26,8 @@ impl ClusterScanStore {
         let database = identifier(&self.database)?;
         let job = &self.job_id;
         let events_table = format!("{database}.incremental");
-        self.client.query(&format!("SELECT operation_type,is_dir,is_symlink,count(),toInt64(sum(size)) FROM {events_table} FINAL WHERE job_id='{job}' AND epoch={epoch} AND toUnixTimestamp64Nano(create_at)>=? GROUP BY operation_type,is_dir,is_symlink"))
-            .bind(epoch).fetch_quorum_all::<(String,bool,bool,u64,i64)>().await
+        self.client.query(&format!("SELECT operation_type,is_dir,is_symlink,is_regular_file,count() AS entries,toInt64(sum(size)) AS bytes FROM {events_table} FINAL WHERE job_id='{job}' AND epoch={epoch} AND toUnixTimestamp64Nano(create_at)>=? GROUP BY operation_type,is_dir,is_symlink,is_regular_file"))
+            .bind(epoch).fetch_quorum_all::<ScanEventSummary>().await
     }
 }
 
@@ -51,7 +51,7 @@ struct ScanAggregateRow {
 }
 
 impl ScanAggregateRow {
-    fn statistics(self, events: Vec<(String, bool, bool, u64, i64)>) -> ScanResumeStatistics {
+    fn statistics(self, events: ScanEventStatistics) -> ScanResumeStatistics {
         ScanResumeStatistics {
             summary: ScanResumeSummary {
                 dirs: self.dirs,

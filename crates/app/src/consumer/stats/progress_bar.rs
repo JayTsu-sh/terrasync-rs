@@ -310,7 +310,7 @@ impl ProgressBar {
                         c.scanned_dir_count.fetch_add(1, Ordering::Relaxed);
                     } else if entry.get_is_symlink() {
                         c.scanned_symlink_count.fetch_add(1, Ordering::Relaxed);
-                    } else {
+                    } else if entry.get_is_regular_file() {
                         c.scanned_regular_file_count.fetch_add(1, Ordering::Relaxed);
                     }
                     c.scanned_size.fetch_add(entry.get_size(), Ordering::Relaxed);

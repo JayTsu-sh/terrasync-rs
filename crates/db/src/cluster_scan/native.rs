@@ -157,11 +157,12 @@ impl ClusterScanStore {
         self.write_native_events(records, time).await
     }
     async fn write_native_events(&self, records: Vec<IncrementalStorageEntryRecord>, time: i64) -> Result<()> {
+        check_scan_cancellation()?;
+        if records.is_empty() {
+            return Ok(());
+        }
         let _guard = self.writes.events.lock().await;
         retry_quorum(|| async {
-            if records.is_empty() {
-                return Ok(());
-            }
             let mut insert = self
                 .client
                 .insert::<ClusterIncrementalStorageEntryRecord>("incremental")
@@ -169,9 +170,9 @@ impl ClusterScanStore {
             for record in &records {
                 insert
                     .write(&ClusterIncrementalStorageEntryRecord::new(
-                        self.job_id.clone(),
+                        &self.job_id,
                         time as u64,
-                        record.clone(),
+                        record,
                     ))
                     .await?;
             }

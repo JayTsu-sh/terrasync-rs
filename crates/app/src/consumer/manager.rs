@@ -247,23 +247,28 @@ impl ConsumerManager {
                 incremental.changed = Default::default();
                 incremental.deleted = Default::default();
                 incremental.renamed = Default::default();
-                for (operation, directory, symlink, count, size) in values.events {
-                    let target = match operation.as_str() {
+                for event in values.events {
+                    let count = event.entries as usize;
+                    let size = event.bytes;
+                    let target = match event.operation_type.as_str() {
                         "new" => &mut incremental.new,
                         "data_changed" | "metadata_changed" | "both_changed" => &mut incremental.changed,
                         "deleted" => &mut incremental.deleted,
                         "rename" => &mut incremental.renamed,
                         _ => continue,
                     };
-                    if directory {
-                        target.dir_count += count as usize;
+                    if event.is_dir {
+                        target.dir_count += count;
                         target.dir_size += size;
-                    } else if symlink {
-                        target.symlink_count += count as usize;
+                    } else if event.is_symlink {
+                        target.symlink_count += count;
                         target.symlink_size += size;
-                    } else {
-                        target.regular_file_count += count as usize;
+                    } else if event.is_regular_file {
+                        target.regular_file_count += count;
                         target.regular_file_size += size;
+                    } else {
+                        target.other_entry_count += count;
+                        target.other_entry_size += size;
                     }
                 }
                 Some((
@@ -620,6 +625,124 @@ impl Drop for ConsumerManager {
 mod resume_tests {
     use super::*;
     use crate::consumer::stats::ProgressDetail;
+    use db::clickhouse::scan_resume_statistics::{ScanEventSummary, ScanResumeSummary};
+    use db::traits::StorageEntryRecord;
+
+    #[tokio::test]
+    async fn reconciled_special_events_keep_callback_totals_and_checkpoint_counts() -> Result<()> {
+        let stats = StatisticConsumer {
+            stats: StatsKind::Incremental(IncrementalStats::new(
+                JobType::IncrementalScan,
+                "special".into(),
+                String::new(),
+                String::new(),
+            )),
+            progress_bar: ProgressBar::new(JobType::IncrementalScan),
+            job_dir: String::new(),
+            callback_url: None,
+            generation_committed: None,
+            pb_handle: None,
+            scan_snapshot: None,
+            callback: Default::default(),
+        };
+        let manager = ConsumerManager {
+            consumers: vec![],
+            stats_consumer: Some(Arc::new(Mutex::new(stats))),
+            callback_guard: None,
+        };
+        let special: StorageEntryRecord = serde_json::from_value(serde_json::json!({
+            "name":"fifo", "relative_path":"fifo", "size":0, "ext":null, "ctime":0, "mtime":0, "atime":0,
+            "mode":null, "storage_type":"nas", "is_symlink":false, "is_dir":false, "is_regular_file":false,
+            "hard_links":1, "current_state":0, "uid":null, "gid":null, "ino":null, "file_handle":null,
+            "version_id":"", "tags":null, "version_count":null
+        }))?;
+        manager
+            .record_final_events(&[
+                ScanFinalEvent::Added(special.clone()),
+                ScanFinalEvent::Deleted(special.clone()),
+                ScanFinalEvent::Renamed {
+                    from_path: "old_fifo".into(),
+                    from_version: String::new(),
+                    to: special,
+                },
+            ])
+            .await;
+        {
+            let stats = manager
+                .stats_consumer
+                .as_ref()
+                .ok_or_else(|| AppError::ConfigError("missing statistics".into()))?
+                .lock()
+                .await;
+            let StatsKind::Incremental(values) = &stats.stats else {
+                return Err(AppError::ConfigError("wrong statistics kind".into()));
+            };
+            for delta in [&values.new, &values.deleted, &values.renamed] {
+                assert_eq!(
+                    (delta.total_count(), delta.regular_file_count, delta.other_entry_count),
+                    (1, 0, 1)
+                );
+            }
+        }
+        let values = ScanResumeStatistics {
+            summary: ScanResumeSummary {
+                dirs: 0,
+                dir_bytes: 0,
+                files: 0,
+                file_bytes: 0,
+                links: 0,
+                link_bytes: 0,
+                total_depth: 0,
+                max_depth: 0,
+                total_name_length: 0,
+                max_name_length: 0,
+            },
+            extensions: vec![],
+            ages: vec![],
+            sizes: vec![],
+            events: [
+                (true, false, false, 1),
+                (false, true, false, 1),
+                (false, false, true, 1),
+                (false, false, false, 4),
+            ]
+            .into_iter()
+            .map(|(is_dir, is_symlink, is_regular_file, entries)| ScanEventSummary {
+                operation_type: "new".into(),
+                is_dir,
+                is_symlink,
+                is_regular_file,
+                entries,
+                bytes: 0,
+            })
+            .collect(),
+        };
+        manager.reconcile_scan_statistics(values).await;
+        let checkpoint = manager.statistics_checkpoint().await?;
+        manager.restore_statistics(&checkpoint).await?;
+        let stats = manager
+            .stats_consumer
+            .as_ref()
+            .ok_or_else(|| AppError::ConfigError("missing statistics".into()))?
+            .lock()
+            .await;
+        assert!(matches!(
+            stats.to_report(true).detail,
+            ProgressDetail::Incremental { new_count: 7, .. }
+        ));
+        let StatsKind::Incremental(values) = &stats.stats else {
+            return Err(AppError::ConfigError("wrong statistics kind".into()));
+        };
+        assert_eq!(
+            (
+                values.new.total_count(),
+                values.new.regular_file_count,
+                values.new.other_entry_count
+            ),
+            (7, 1, 4)
+        );
+        Ok(())
+    }
 
     #[tokio::test]
     async fn statistics_checkpoint_restores_counts_without_replaying_old_messages() -> Result<()> {

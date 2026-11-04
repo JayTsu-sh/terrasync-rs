@@ -118,10 +118,7 @@ impl StatisticConsumer {
                 StatsKind::Full(value) => value,
                 StatsKind::Incremental(value) => &mut value.scanned,
             };
-            statistics.dir_count = scan.counts.retained.directories as usize;
-            statistics.regular_file_count = scan.counts.retained.regular_files as usize;
-            statistics.symlink_count = scan.counts.retained.symlinks as usize;
-            statistics.regular_file_size = scan.counts.regular_file_bytes as i64;
+            statistics.set_scan_counts(&scan.counts);
             if !scan.distributions_complete && !scan.distributions_reconciled {
                 statistics.extension_stats.clear();
                 statistics.time_range_stats.clear();

@@ -575,9 +575,9 @@ impl ClusterScanStore {
                 record.create_at = event_time;
                 insert
                     .write(&ClusterIncrementalStorageEntryRecord::new(
-                        self.job_id.clone(),
+                        &self.job_id,
                         event_time as u64,
-                        record,
+                        &record,
                     ))
                     .await?;
             }
@@ -592,16 +592,15 @@ impl ClusterScanStore {
             return Ok(());
         }
         let cluster = identifier(&self.cluster)?;
-        for table in ["scan_resume_batch_local", "scan_resume_keys_local"] {
-            self.client
-                .query(&format!(
-                    "ALTER TABLE {database}.{table} ON CLUSTER {cluster} DROP PARTITION (?,?)"
-                ))
-                .bind(&self.job_id)
-                .bind(self.batch_id)
-                .execute_scan()
-                .await?;
-        }
+        // 本批只持有 batch 分区；删除 keys 使用独立编号并由删除操作清理。
+        self.client
+            .query(&format!(
+                "ALTER TABLE {database}.scan_resume_batch_local ON CLUSTER {cluster} DROP PARTITION (?,?)"
+            ))
+            .bind(&self.job_id)
+            .bind(self.batch_id)
+            .execute_scan()
+            .await?;
         Ok(())
     }
     pub(crate) async fn cleanup_resume_batch(&self) -> Result<()> {

@@ -15,6 +15,7 @@ pub trait EntryStatistics {
     fn get_extension(&self) -> Option<&str>;
     fn get_is_dir(&self) -> bool;
     fn get_is_symlink(&self) -> bool;
+    fn get_is_regular_file(&self) -> bool;
     fn get_mtime(&self) -> i64;
 }
 impl EntryStatistics for EntryEnum {
@@ -35,6 +36,9 @@ impl EntryStatistics for EntryEnum {
     }
     fn get_is_symlink(&self) -> bool {
         self.get_is_symlink()
+    }
+    fn get_is_regular_file(&self) -> bool {
+        self.get_is_regular_file()
     }
     fn get_mtime(&self) -> i64 {
         self.get_mtime()
@@ -145,6 +149,9 @@ impl EntryStatistics for ObservedView<'_> {
     }
     fn get_is_symlink(&self) -> bool {
         self.entry.kind() == EntryKind::Symlink
+    }
+    fn get_is_regular_file(&self) -> bool {
+        self.entry.kind() == EntryKind::File
     }
     fn get_mtime(&self) -> i64 {
         let modified = self.version().map_or_else(
