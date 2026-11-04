@@ -52,17 +52,15 @@ pub(super) async fn run(request: ScanRequest<'_>, config: AppConfig) -> Result<(
     let result = consume(&iterator, &forwarder, &cancel).await;
     iterator.close();
     drop(forwarder);
-    let failures = finish_consumers(handles, &cancel).await;
+    let consumers = finish_consumers(handles, &cancel).await;
     let result = if request.cancel.is_cancelled() {
         Err(AppError::ObservationScanCancelled)
     } else if let Some(error) = iterator.take_error() {
         Err(error.into())
     } else if result.is_err() {
         result
-    } else if failures.is_empty() {
-        Ok(())
     } else {
-        Err(AppError::ConsumerError("Scan consumer failed".into()))
+        consumers
     };
     if let Err(error) = &result
         && !request.cancel.is_cancelled()
@@ -87,8 +85,8 @@ async fn consume(
     Ok(())
 }
 
-async fn finish_consumers(handles: Vec<JoinHandle<Result<()>>>, cancel: &ScanCancellation) -> Vec<String> {
-    let mut failures = Vec::new();
+async fn finish_consumers(handles: Vec<JoinHandle<Result<()>>>, cancel: &ScanCancellation) -> Result<()> {
+    let mut failure = None;
     for mut handle in handles {
         let result = tokio::select! {
             biased;
@@ -98,20 +96,62 @@ async fn finish_consumers(handles: Vec<JoinHandle<Result<()>>>, cancel: &ScanCan
         match result {
             Ok(Ok(())) => {}
             Err(error) if error.is_cancelled() && cancel.token().is_cancelled() => {}
-            Ok(Err(error)) => failures.push(error.to_string()),
-            Err(error) => failures.push(format!("Scan consumer panicked: {error}")),
+            Ok(Err(error)) => {
+                failure.get_or_insert(error);
+            }
+            Err(error) => {
+                failure.get_or_insert(error.into());
+            }
         }
     }
-    failures
+    failure.map_or(Ok(()), Err)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::future::pending;
+    use std::io::{Error as IoError, ErrorKind};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Duration;
     use storage_adapter::{AsyncReceiver, ErrorEvent};
     use tokio::time::{sleep, timeout};
     use tokio_util::sync::CancellationToken;
+
+    #[tokio::test]
+    async fn consumer_failure_keeps_type_and_drains_later_tasks() {
+        let completed = Arc::new(AtomicBool::new(false));
+        let done = completed.clone();
+        let failed = tokio::spawn(async { Err(AppError::IoError(IoError::from(ErrorKind::TimedOut))) });
+        let later = tokio::spawn(async move {
+            sleep(Duration::from_millis(20)).await;
+            done.store(true, Ordering::Release);
+            Ok(())
+        });
+        let cancel = ScanCancellation::new(CancellationToken::new());
+        let result = finish_consumers(vec![failed, later], &cancel).await;
+        assert!(matches!(result, Err(AppError::IoError(error)) if error.kind() == ErrorKind::TimedOut));
+        assert!(completed.load(Ordering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn consumer_panic_preserves_join_error() {
+        let handle = tokio::spawn(async { panic!("consumer regression fixture") });
+        let cancel = ScanCancellation::new(CancellationToken::new());
+        assert!(
+            matches!(finish_consumers(vec![handle], &cancel).await, Err(AppError::TaskJoinError(error)) if error.is_panic())
+        );
+    }
+
+    #[tokio::test]
+    async fn cancellation_drains_aborted_consumers() {
+        let handle = tokio::spawn(async { pending::<Result<()>>().await });
+        let user = CancellationToken::new();
+        user.cancel();
+        let cancel = ScanCancellation::new(user);
+        assert!(finish_consumers(vec![handle], &cancel).await.is_ok());
+    }
 
     #[tokio::test]
     async fn cancellation_interrupts_output_backpressure() -> Result<()> {
