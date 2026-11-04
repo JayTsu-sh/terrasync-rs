@@ -37,8 +37,8 @@ use storage_adapter::qos::QosManager;
 #[cfg(windows)]
 use storage_adapter::storage_enum::{StorageType, detect_storage_type};
 use storage_adapter::{ChangeKind, EntryEnum, ErrorEvent, StorageEntryMessage, StorageEnum};
-use tokio::sync::{Semaphore, mpsc};
-use tokio::task::{JoinHandle, JoinSet};
+use tokio::sync::Semaphore;
+use tokio::task::JoinHandle;
 use tracing::{Instrument, error, info, info_span, trace, warn};
 use transport::in_process::create_in_process_pair;
 use transport::message::SenderMsg;
@@ -49,7 +49,7 @@ use utils::app_config::AppConfig;
 use crate::broadcast::{BroadcastForwarder, DEFAULT_CHANNEL_CAPACITY};
 use crate::config::{JobType, SyncJobConfig, initialize_consumer_config, initialize_scan_config};
 use crate::consumer::ConsumerManager;
-use crate::consumer::stats::DirectoryMetadataProgressBar;
+use crate::copy_completion;
 use crate::copy_execution::{CopyLease, begin_copy_catalogue};
 use crate::error::{AppError, Result};
 #[cfg(feature = "license")]
@@ -242,7 +242,7 @@ impl SyncOrchestrator {
 
     /// 执行 sync 管线
     ///
-    /// `ScanType` 自动判定：查数据库 base 表是否存在，失败 fallback 到文件系统。
+    /// 根据已提交数据库基线和复制策略选择；启用数据库时构造失败直接上报。
     pub async fn run(&self) -> Result<()> {
         // 自动判定 ScanType
         let c = &self.config;
@@ -643,42 +643,32 @@ impl SyncOrchestrator {
                 "Incomplete object history; copy cannot commit".into(),
             ))
         };
-        let result = match source_result
-            .and(senders_result)
-            .and(receivers_result)
-            .and(consumers_result)
-            .and(history_result)
-        {
-            Ok(()) => {
-                if let Some(database) = &database {
-                    database.commit_scan_generation().await.map_err(AppError::from)
-                } else {
-                    Ok(())
-                }
+        let result: Result<()> = async {
+            source_result
+                .and(senders_result)
+                .and(receivers_result)
+                .and(consumers_result)
+                .and(history_result)?;
+            if let Some(database) = &database {
+                let destination = Arc::new(
+                    create_storage_for_role(
+                        &c.dest_path,
+                        block_size.map(|size| size as u64),
+                        false,
+                        StorageRole::Destination,
+                    )
+                    .await?,
+                );
+                copy_completion::complete(database.clone(), destination).await?;
             }
-            Err(error) => Err(error),
-        };
+            Ok(())
+        }
+        .await;
         if let Err(error) = &result {
             consumer_manager.record_task_failures(&[error.to_string()]).await;
         }
         consumer_manager.end_lifecycle().await;
         result?;
-
-        // ── 14. 更新目录元数据（非 S3 目标端） ──
-        let dest_storage_for_metadata = Arc::new(
-            create_storage_for_role(
-                &c.dest_path,
-                block_size.map(|s| s as u64),
-                false,
-                StorageRole::Destination,
-            )
-            .await?,
-        );
-        if !matches!(dest_storage_for_metadata.as_ref(), StorageEnum::S3(_))
-            && let Some(database) = database
-        {
-            Self::update_directory_metadata(database, &dest_storage_for_metadata).await;
-        }
 
         info!("Copy job {} completed successfully via orchestrator", c.job_id);
         Ok(())
@@ -1285,23 +1275,17 @@ impl SyncOrchestrator {
             qos_mgr.shutdown();
         }
 
-        let result = match phase_b_dest_storage.and_then(|dest| phase_b_consumers.map(|()| dest)) {
-            Ok(dest) => database
-                .commit_scan_generation()
-                .await
-                .map(|()| dest)
-                .map_err(AppError::from),
-            Err(error) => Err(error),
-        };
+        let result: Result<()> = async {
+            let destination = phase_b_dest_storage?;
+            phase_b_consumers?;
+            copy_completion::complete(database.clone(), destination).await
+        }
+        .await;
         if let Err(error) = &result {
             consumer_manager.record_task_failures(&[error.to_string()]).await;
         }
-        // stats spinner 必须先于目录元数据进度条收尾。
         consumer_manager.end_lifecycle().await;
-        let dest_storage_phase_b = result?;
-        if !matches!(dest_storage_phase_b.as_ref(), StorageEnum::S3(_)) {
-            Self::update_directory_metadata(database.clone(), &dest_storage_phase_b).await;
-        }
+        result?;
 
         info!(
             "Incremental sync job {} completed successfully via orchestrator",
@@ -1601,62 +1585,6 @@ impl SyncOrchestrator {
         match failure {
             Some(error) => Err(error),
             None => Ok(()),
-        }
-    }
-
-    /// 更新目录元数据（查询数据库，设置目标端目录的 mtime）
-    async fn update_directory_metadata(database: Box<dyn db::traits::Database>, dest_storage: &Arc<StorageEnum>) {
-        let mut metadata_pb = DirectoryMetadataProgressBar::new();
-        let progress_handle = metadata_pb.start();
-
-        let (dir_tx, mut dir_rx) = mpsc::channel::<EntryEnum>(1000);
-        let span = info_span!("db_query");
-        tokio::spawn(
-            async move {
-                if let Err(e) = database.query_storage_entry(Some(true), None, None, dir_tx).await {
-                    eprintln!("Failed to query storage entries: {e:?}");
-                }
-                info!("Query all directories completed");
-            }
-            .instrument(span),
-        );
-
-        // 并发回写目录 mtime：串行调用对 NFS/CIFS 延迟叠加明显（N 目录 × 网络延迟）
-        let dir_meta_concurrency: usize = 32;
-        let sem = Arc::new(Semaphore::new(dir_meta_concurrency));
-        let mut join_set = JoinSet::new();
-
-        // 注意：acquire_owned 在 spawn 之前 await，确保 join_set 中在飞任务数 ≤ dir_meta_concurrency
-        while let Some(dir_entry) = dir_rx.recv().await {
-            let Ok(permit) = sem.clone().acquire_owned().await else {
-                error!("Directory metadata semaphore unexpectedly closed");
-                break;
-            };
-            let dest = dest_storage.clone();
-            join_set.spawn(async move {
-                let _permit = permit;
-                trace!("Updating directory mtime for {:?}", dir_entry.get_relative_path());
-                if let Err(e) = dest.set_entry_metadata(&dir_entry).await {
-                    warn!(
-                        "Failed to update directory mtime for {:?}: {}",
-                        dir_entry.get_relative_path(),
-                        e
-                    );
-                }
-            });
-        }
-
-        while let Some(result) = join_set.join_next().await {
-            if let Err(e) = result {
-                error!("Directory metadata task panicked: {:?}", e);
-            } else {
-                metadata_pb.increment_dir_count();
-            }
-        }
-
-        metadata_pb.finish();
-        if let Err(e) = progress_handle.join() {
-            error!("Progress bar thread panicked: {:?}", e);
         }
     }
 }

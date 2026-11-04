@@ -35,6 +35,7 @@ pub mod config;
 /// 负责管理不同类型的消费者，如存储条目消费者和统计消费者
 pub mod consumer;
 
+mod copy_completion;
 mod copy_execution;
 pub mod local_transfer;
 pub mod observation_scan;
