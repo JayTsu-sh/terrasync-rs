@@ -245,6 +245,22 @@ async fn assert_cumulative_observations(database: &TestDatabase) -> Result {
         "checkpoint count must be the unique cumulative logical scan count"
     );
     assert!(observed <= 1000, "checkpoint must never add replayed entries");
+    let scalar = checkpoint["stats"]
+        .get("Full")
+        .or_else(|| {
+            checkpoint["stats"]
+                .get("Incremental")
+                .and_then(|value| value.get("scanned"))
+        })
+        .ok_or("missing confirmed scalar statistics")?;
+    let scalar_total = scalar["dir_count"].as_u64().ok_or("missing directories")?
+        + scalar["regular_file_count"].as_u64().ok_or("missing files")?
+        + scalar["symlink_count"].as_u64().ok_or("missing symlinks")?;
+    assert_eq!(
+        scalar_total, observed,
+        "raw replay must not alter durable scalar counts"
+    );
+    eprintln!("Confirmed checkpoint: logical={observed}, durable scalar={scalar_total}; Pod local state discarded");
     assert_eq!(scan["filtered_entries"].as_u64(), Some(0));
     assert_eq!(scan["retained_entries"].as_u64(), Some(observed));
     Ok(())
@@ -258,6 +274,12 @@ async fn assert_paths(database: &TestDatabase, source: &Path) -> Result {
     let actual: BTreeSet<_> = rows.iter().cloned().collect();
     assert_eq!(rows.len(), actual.len(), "duplicate base rows");
     assert_eq!(actual, paths(source)?);
+    eprintln!(
+        "Actual source paths={}, unique database paths={}, physical rows={}",
+        actual.len(),
+        actual.len(),
+        rows.len()
+    );
     let raw = database
         .query("SELECT statistics FROM scan_resume_resume_case FINAL")
         .fetch_one::<String>()
