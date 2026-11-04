@@ -32,7 +32,8 @@ CREATE TABLE IF NOT EXISTS migration_tasks (
     created_at         TEXT NOT NULL DEFAULT (datetime('now')),
     started_at         TEXT,
     finished_at        TEXT,
-    error_message      TEXT
+    error_message      TEXT,
+    storage_error_json TEXT
 );
 
 -- 任务实时进度（ProgressReport 整体存入 report_json）
@@ -52,7 +53,8 @@ CREATE TABLE IF NOT EXISTS task_executions (
     started_at     TEXT NOT NULL DEFAULT (datetime('now')),
     finished_at    TEXT,
     stats_json     TEXT,
-    error_message  TEXT
+    error_message  TEXT,
+    storage_error_json TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_executions_task_id ON task_executions(task_id);
 

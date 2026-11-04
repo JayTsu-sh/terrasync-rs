@@ -3,21 +3,36 @@ use super::*;
 use crate::native_scan::NativeScanAccess;
 use crate::native_scan_record::{NativeScanKey, NativeScanRecord, OBSERVED_COLUMNS, event_records};
 use crate::native_scan_record::{final_event_records, incremental_record};
+use crate::scan_metadata::{CandidateMetadataCache, missing_hash_columns};
 use crate::scan_store::ScanFinalEvent;
 use crate::traits::IncrementalStorageEntryRecord;
 use data_mover::model::ObservedEntry;
+use std::borrow::Cow;
 use storage_adapter::observed_scan::{ObservedScanEvent, ObservedView};
 
 #[derive(Serialize, clickhouse::Row)]
-struct ClusterNativeScanKey {
-    job_id: String,
+struct ClusterNativeScanKey<'a> {
+    job_id: &'a str,
     batch_id: u64,
-    relative_path: String,
-    version_id: String,
+    relative_path: Cow<'a, str>,
+    version_id: &'a str,
     file_handle: Option<String>,
 }
 
 impl ClusterScanStore {
+    pub(crate) async fn prepare_native_schema(&self) -> Result<()> {
+        let database = identifier(&self.database)?;
+        let cluster = identifier(&self.cluster)?;
+        let tables: Vec<_> = ["base", "scan_resume_batch"]
+            .into_iter()
+            .flat_map(|name| [name.to_owned(), format!("{name}_local")])
+            .collect();
+        for table in missing_hash_columns(&self.client, &tables).await? {
+            self.client.query(&format!("ALTER TABLE {database}.{table} ON CLUSTER {cluster} ADD COLUMN IF NOT EXISTS metadata_hash Nullable(String) DEFAULT NULL"))
+                .execute_scan().await?;
+        }
+        Ok(())
+    }
     pub(crate) async fn write_native_keys(&self, entries: &[Arc<ObservedEntry>]) -> Result<()> {
         let _guard = self.writes.temporary.lock().await;
         retry_quorum(|| async {
@@ -31,7 +46,7 @@ impl ClusterScanStore {
                     let key = NativeScanKey::capture(view);
                     insert
                         .write(&ClusterNativeScanKey {
-                            job_id: self.job_id.clone(),
+                            job_id: &self.job_id,
                             batch_id: self.batch_id,
                             relative_path: key.relative_path,
                             version_id: key.version_id,
@@ -53,11 +68,6 @@ impl ClusterScanStore {
             base: format!("{database}.base"),
             stage: format!("{database}.scan_resume_batch"),
             events: format!("{database}.incremental"),
-            events_round: format!(
-                "job_id='{}' AND epoch={}",
-                self.job_id,
-                self.epoch.load(Ordering::Relaxed)
-            ),
             scope: format!("job_id='{}'", self.job_id),
             stage_scope: format!("job_id='{}' AND batch_id={}", self.job_id, self.batch_id),
             active: format!("epoch={}", self.epoch.load(Ordering::Relaxed)),
@@ -67,6 +77,13 @@ impl ClusterScanStore {
         })
     }
     pub(crate) async fn write_native(&self, entries: &[Arc<ObservedEntry>], temporary: bool) -> Result<()> {
+        self.write_native_candidates(entries, temporary, &[]).await
+    }
+
+    pub(crate) async fn write_native_candidates(
+        &self, entries: &[Arc<ObservedEntry>], temporary: bool, candidates: &[ObservedScanEvent],
+    ) -> Result<()> {
+        let cache = CandidateMetadataCache::new(candidates).await?;
         let gate = if temporary {
             &self.writes.temporary
         } else {
@@ -84,7 +101,8 @@ impl ClusterScanStore {
             let mut insert = client.insert::<ClusterNativeScanRecord>(table).await?;
             for entry in entries {
                 for view in ObservedView::all(entry) {
-                    let record = NativeScanRecord::capture(view, self.generation.load(Ordering::Relaxed))?;
+                    let mut record = NativeScanRecord::capture(view, self.generation.load(Ordering::Relaxed))?;
+                    cache.apply(&mut record);
                     insert
                         .write(&ClusterNativeScanRecord::new(
                             self.job_id.clone(),

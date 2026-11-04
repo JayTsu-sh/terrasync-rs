@@ -12,12 +12,16 @@ mod clickhouse_integration_tests {
     // 外部crate
     use bytes::Bytes;
     use clickhouse::Client;
+    use clickhouse::error::Error as ClickHouseError;
     // 内部模块
     use data_mover::model::{
         BackendIdentity, BackendKind, EntryKind, IdentityStrength, ObservedEntry, SourceIdentity, StoragePath,
     };
     use db::clickhouse::ClickHouseDatabase;
+    use db::clickhouse::scan_resume::ScanResumeState;
+    use db::scan_store::{ScanFinalEvent, ScanStore};
     use db::{ClickHouseConfig, Database, DatabaseError, DeletionStatus, ObservedEntryRecord};
+    use storage_adapter::observed_scan::{ObservedItem, ObservedScanEvent};
     use storage_adapter::{EntryEnum, NASEntry, S3Entry};
 
     // 使用原子计数器确保每个测试用例都有唯一的job_id
@@ -31,6 +35,8 @@ mod clickhouse_integration_tests {
 
     fn setup_test_db_with_job_id(job_id: &str) -> ClickHouseDatabase {
         let config = ClickHouseConfig {
+            mode: Default::default(),
+            cluster: None,
             dsn: std::env::var("LAB_CLICKHOUSE_DSN").unwrap_or_else(|_| "http://10.131.9.11:8123".to_string()),
             dial_timeout: 10,
             read_timeout: 30,
@@ -41,11 +47,13 @@ mod clickhouse_integration_tests {
                 .filter(|value| !value.is_empty()),
         };
 
-        ClickHouseDatabase::new(&config, job_id)
+        ClickHouseDatabase::new(&config, job_id).unwrap()
     }
 
     fn lab_clickhouse_config(database: String) -> ClickHouseConfig {
         ClickHouseConfig {
+            mode: Default::default(),
+            cluster: None,
             dsn: std::env::var("LAB_CLICKHOUSE_DSN").unwrap_or_else(|_| "http://10.131.9.11:8123".to_string()),
             dial_timeout: 10,
             read_timeout: 30,
@@ -107,7 +115,7 @@ mod clickhouse_integration_tests {
             .unwrap();
 
         let config = lab_clickhouse_config(database.clone());
-        let db = ClickHouseDatabase::new(&config, &job_id);
+        let db = ClickHouseDatabase::new(&config, &job_id).unwrap();
         (
             db,
             config,
@@ -217,7 +225,7 @@ mod clickhouse_integration_tests {
         assert!(database.load_resume_state().await.unwrap().is_none());
         database.save_resume_state(&state).await.unwrap();
         drop(database);
-        let database = ClickHouseDatabase::new(&config, &job);
+        let database = ClickHouseDatabase::new(&config, &job).unwrap();
         let loaded = database.load_resume_state().await.unwrap().unwrap();
         assert_eq!(loaded.checkpoint, state.checkpoint);
         assert!(!database.restore_resume_generation(&loaded).await.unwrap());
@@ -325,12 +333,258 @@ mod clickhouse_integration_tests {
         database.save_resume_state(&state).await.unwrap();
         database.commit_scan_generation().await.unwrap();
         drop(database);
-        let database = ClickHouseDatabase::new(&config, &job);
+        let database = ClickHouseDatabase::new(&config, &job).unwrap();
         assert!(database.restore_resume_generation(&state).await.unwrap());
         database.abandon_scan_resume().await.unwrap();
         let abandoned = database.load_resume_state().await.unwrap().unwrap();
         assert_eq!(abandoned.phase, ABANDONED);
         assert!(abandoned.checkpoint.is_empty());
+        cleanup.cleanup().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires lab ClickHouse"]
+    async fn native_single_candidate_cache_keeps_current_content_and_deletions() {
+        let (_database, config, job, cleanup) = setup_isolated_state_db("candidate_cache").await;
+        let store = ScanStore::new(&config, &job).unwrap();
+        store.initialize().await.unwrap();
+        store.prepare_incremental().await.unwrap();
+        store.load_resume_state().await.unwrap();
+        store.prepare_native_schema().await.unwrap();
+        let generation = store.begin_scan_generation().await.unwrap();
+        let state = ScanResumeState {
+            id: 1,
+            schema_version: 1,
+            version: 1,
+            request_key: "cache".into(),
+            generation,
+            incremental: true,
+            phase: 0,
+            event_time: 10,
+            observed_entries: 0,
+            checkpoint: Vec::new(),
+            statistics: String::new(),
+        };
+        store.save_resume_state(&state).await.unwrap();
+        let backend = BackendIdentity::new(BackendKind::Nfs, "single-cache").unwrap();
+        let observation = |size| {
+            Arc::new(
+                ObservedEntry::new(
+                    StoragePath::new("added").unwrap(),
+                    EntryKind::File,
+                    Some(size),
+                    None,
+                    SourceIdentity::new(backend.clone(), IdentityStrength::StableWithinBackend, b"cache-id").unwrap(),
+                )
+                .unwrap(),
+            )
+        };
+        let added = observation(17);
+        let candidates = [ObservedScanEvent::Candidate(ObservedItem {
+            entry: added.clone(),
+            version_index: None,
+        })];
+        store.write_resume_events(&candidates, 10).await.unwrap();
+        store.write_candidate_observations(&[added], &candidates).await.unwrap();
+        let hash = clickhouse_client(&config)
+            .query(&format!(
+                "SELECT metadata_hash FROM {} FINAL WHERE relative_path='added'",
+                db::base_table_name_for_job(&job)
+            ))
+            .fetch_one::<Option<String>>()
+            .await
+            .unwrap();
+        assert!(hash.is_some_and(|digest| digest.len() == 64));
+        let events = store.resolve_final_events(10).await.unwrap();
+        assert!(
+            matches!(events.as_slice(),[ScanFinalEvent::Added(row)] if row.size==17 && row.current_state==generation)
+        );
+        store
+            .write_candidate_observations(&[observation(99)], &candidates)
+            .await
+            .unwrap();
+        let events = store.resolve_final_events(10).await.unwrap();
+        assert!(matches!(events.as_slice(),[ScanFinalEvent::Added(row)] if row.size==99));
+        store.write_observations(&[observation(99)], false).await.unwrap();
+        let hash = clickhouse_client(&config)
+            .query(&format!(
+                "SELECT metadata_hash FROM {} FINAL WHERE relative_path='added'",
+                db::base_table_name_for_job(&job)
+            ))
+            .fetch_one::<Option<String>>()
+            .await
+            .unwrap();
+        assert!(hash.is_none(), "非候选原生写入必须清空旧摘要");
+        let events = store.resolve_final_events(10).await.unwrap();
+        assert!(matches!(events.as_slice(),[ScanFinalEvent::Added(row)] if row.size==99));
+        clickhouse_client(&config)
+            .with_option("mutations_sync", "2")
+            .query(&format!(
+                "ALTER TABLE {} DELETE WHERE relative_path='added'",
+                db::base_table_name_for_job(&job)
+            ))
+            .execute()
+            .await
+            .unwrap();
+        assert!(store.resolve_final_events(10).await.unwrap().is_empty());
+        cleanup.cleanup().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires lab ClickHouse"]
+    async fn native_single_candidate_cache_upgrades_existing_tables() {
+        let (_database, config, job, cleanup) = setup_isolated_state_db("cache_schema").await;
+        let mut store = ScanStore::new(&config, &job).unwrap();
+        store.initialize().await.unwrap();
+        store.prepare_incremental().await.unwrap();
+        store.begin_resume_batch().await.unwrap();
+        let client = clickhouse_client(&config);
+        let tables = client
+            .query("SELECT table FROM system.columns WHERE database=currentDatabase() AND name='metadata_hash'")
+            .fetch_all::<String>()
+            .await
+            .unwrap();
+        assert_eq!(tables.len(), 3);
+        for table in tables {
+            client
+                .query(&format!("ALTER TABLE {table} DROP COLUMN metadata_hash"))
+                .execute()
+                .await
+                .unwrap();
+        }
+        store.prepare_native_schema().await.unwrap();
+        let count = client
+            .query("SELECT count() FROM system.columns WHERE database=currentDatabase() AND name='metadata_hash'")
+            .fetch_one::<u64>()
+            .await
+            .unwrap();
+        assert_eq!(count, 2);
+        cleanup.cleanup().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires lab ClickHouse"]
+    async fn native_single_key_prefilters_keep_rename_addition_and_deletion_facts() {
+        let (_database, config, job, cleanup) = setup_isolated_state_db("native_key_filter").await;
+        let backend = BackendIdentity::new(BackendKind::Nfs, "single-native-keys").unwrap();
+        let observation = |path: &str, size: u64, identity: &[u8]| {
+            Arc::new(
+                ObservedEntry::new(
+                    StoragePath::new(path).unwrap(),
+                    EntryKind::File,
+                    Some(size),
+                    None,
+                    SourceIdentity::new(backend.clone(), IdentityStrength::StableWithinBackend, identity).unwrap(),
+                )
+                .unwrap(),
+            )
+        };
+        let mut store = ScanStore::new(&config, &job).unwrap();
+        store.initialize().await.unwrap();
+        store.prepare_incremental().await.unwrap();
+        store.load_resume_state().await.unwrap();
+        let mut state = ScanResumeState {
+            id: 1,
+            schema_version: 1,
+            version: 1,
+            request_key: "native-single".into(),
+            generation: store.begin_scan_generation().await.unwrap(),
+            incremental: false,
+            phase: 0,
+            event_time: 10,
+            observed_entries: 0,
+            checkpoint: Vec::new(),
+            statistics: String::new(),
+        };
+        store.save_resume_state(&state).await.unwrap();
+        store
+            .write_observations(
+                &[
+                    observation("old", 17, b"rename"),
+                    observation("gone", 23, b"deleted"),
+                    observation("keep", 1, b"keep"),
+                ],
+                false,
+            )
+            .await
+            .unwrap();
+        state.phase = 1;
+        state.advance().unwrap();
+        store.save_resume_state(&state).await.unwrap();
+        store.commit_scan_generation().await.unwrap();
+        state.generation = store.begin_scan_generation().await.unwrap();
+        state.incremental = true;
+        state.phase = 0;
+        state.event_time = 20;
+        state.advance().unwrap();
+        store.save_resume_state(&state).await.unwrap();
+        let current = vec![
+            observation("renamed", 17, b"rename"),
+            observation("added", 2, b"new"),
+            observation("keep", 1, b"keep"),
+        ];
+        store.begin_resume_batch().await.unwrap();
+        store.write_observation_keys(&current).await.unwrap();
+        let events = store.detect_resume_batch_events(&current).await.unwrap();
+        store.write_resume_events(&events, state.event_time).await.unwrap();
+        store.write_observations(&current, false).await.unwrap();
+        state.phase = 1;
+        state.advance().unwrap();
+        store.save_resume_state(&state).await.unwrap();
+        let before_finalize = store.resume_statistics(state.generation, None).await.unwrap();
+        let final_events = store.resolve_final_events(state.event_time).await.unwrap();
+        assert_eq!(final_events.len(), 3);
+        assert!(final_events.iter().any(|event|matches!(event,ScanFinalEvent::Renamed{from_path,to,..} if from_path=="old" && to.relative_path=="renamed" && to.size==17)));
+        assert!(
+            final_events.iter().any(
+                |event| matches!(event,ScanFinalEvent::Added(item) if item.relative_path=="added" && item.size==2)
+            )
+        );
+        assert!(
+            final_events.iter().any(
+                |event| matches!(event,ScanFinalEvent::Deleted(item) if item.relative_path=="gone" && item.size==23)
+            )
+        );
+        store.write_final_events(&final_events, state.event_time).await.unwrap();
+        let keys: Vec<_> = final_events.iter().filter_map(ScanFinalEvent::deletion_key).collect();
+        store.delete_resume_entries(&keys).await.unwrap();
+        store.cleanup_candidates(state.event_time).await.unwrap();
+        assert!(store.resolve_final_events(state.event_time).await.unwrap().is_empty());
+        let rows = clickhouse_client(&config)
+            .query(&format!(
+                "SELECT relative_path,size FROM base_{} FINAL ORDER BY relative_path",
+                utils::sanitize_job_id(&job)
+            ))
+            .fetch_all::<(String, u64)>()
+            .await
+            .unwrap();
+        assert_eq!(
+            rows,
+            vec![("added".into(), 2), ("keep".into(), 1), ("renamed".into(), 17)]
+        );
+        assert_eq!(
+            store
+                .resume_statistics(state.generation, Some(state.event_time))
+                .await
+                .unwrap()
+                .summary
+                .files,
+            3
+        );
+        let after_finalize = store
+            .resume_statistics(state.generation, Some(state.event_time))
+            .await
+            .unwrap();
+        assert_eq!(before_finalize.summary, after_finalize.summary);
+        assert_eq!(before_finalize.extensions, after_finalize.extensions);
+        assert_eq!(before_finalize.ages, after_finalize.ages);
+        assert_eq!(before_finalize.sizes, after_finalize.sizes);
+        assert_eq!(
+            store.resume_event_statistics(state.event_time).await.unwrap(),
+            after_finalize.events
+        );
+        store.commit_scan_generation().await.unwrap();
+        store.cleanup_resume_batch().await.unwrap();
         cleanup.cleanup().await;
     }
 
@@ -361,12 +615,12 @@ mod clickhouse_integration_tests {
         db.create_scan_state_table().await.unwrap();
         db.insert_scan_state(0).await.unwrap();
 
-        let fresh_db = ClickHouseDatabase::new(&config, &job_id);
+        let fresh_db = ClickHouseDatabase::new(&config, &job_id).unwrap();
         assert_eq!(fresh_db.query_scan_state().await.unwrap(), Some(0));
         assert_eq!(fresh_db.begin_scan_generation().await.unwrap(), 1);
 
         db.insert_scan_state(1).await.unwrap();
-        let fresh_db = ClickHouseDatabase::new(&config, &job_id);
+        let fresh_db = ClickHouseDatabase::new(&config, &job_id).unwrap();
         assert_eq!(fresh_db.query_scan_state().await.unwrap(), Some(1));
 
         database.cleanup().await;
@@ -381,10 +635,110 @@ mod clickhouse_integration_tests {
         db.insert_scan_state(1).await.unwrap();
 
         assert_eq!(db.begin_scan_generation().await.unwrap(), 0);
-        let fresh_db = ClickHouseDatabase::new(&config, &job_id);
+        let fresh_db = ClickHouseDatabase::new(&config, &job_id).unwrap();
         assert_eq!(fresh_db.query_scan_state().await.unwrap(), Some(1));
 
         database.cleanup().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires lab ClickHouse"]
+    async fn an_identity_sorted_scan_table_is_rejected_without_removing_its_records() {
+        let (database, config, job, isolated) = setup_isolated_state_db("old_identity_key").await;
+        let table = format!("base_{job}");
+        let client = clickhouse_client(&config);
+        client.query(&format!("CREATE TABLE {table} (relative_path String,version_id String,identity_key String,size UInt64) ENGINE=ReplacingMergeTree ORDER BY(relative_path,version_id,identity_key)")).execute().await.unwrap();
+        client
+            .query(&format!("INSERT INTO {table} VALUES ('kept','','old-source',4096)"))
+            .execute()
+            .await
+            .unwrap();
+        database.load_resume_state().await.unwrap();
+        let state = ScanResumeState {
+            id: 1,
+            schema_version: 1,
+            version: 1,
+            request_key: "old-active".into(),
+            generation: 1,
+            incremental: false,
+            phase: 0,
+            event_time: 123,
+            observed_entries: 1,
+            checkpoint: vec![1],
+            statistics: String::new(),
+        };
+        database.save_resume_state(&state).await.unwrap();
+        let saved = database.load_resume_state().await.unwrap().unwrap();
+        assert!(saved.active());
+        let resumed_error = database.restore_resume_generation(&saved).await.unwrap_err();
+        assert!(
+            matches!(resumed_error, DatabaseError::ConfigError(message) if message.contains("clear this scan job"))
+        );
+        let error = database.create_scan_base_table().await.unwrap_err();
+        assert!(matches!(error, DatabaseError::ConfigError(message) if message.contains("clear this scan job")));
+        assert_eq!(
+            client
+                .query(&format!("SELECT count() FROM {table} FINAL"))
+                .fetch_one::<u64>()
+                .await
+                .unwrap(),
+            1
+        );
+        isolated.cleanup().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires lab ClickHouse"]
+    async fn a_replaced_source_identity_does_not_duplicate_the_current_path() {
+        let (database, config, job, isolated) = setup_isolated_state_db("replaced_identity").await;
+        database.create_scan_base_table().await.unwrap();
+        database.create_scan_state_table().await.unwrap();
+        database.insert_scan_state(0).await.unwrap();
+        let backend = BackendIdentity::new(BackendKind::Cifs, "identity-reconnect-fixture").unwrap();
+        let mut observations = Vec::new();
+        for (identity, size) in [(b"original".as_slice(), 4096), (b"replacement".as_slice(), 8192)] {
+            let source = SourceIdentity::new(backend.clone(), IdentityStrength::StableWithinBackend, identity).unwrap();
+            let entry = ObservedEntry::new(
+                StoragePath::new("nested/file").unwrap(),
+                EntryKind::File,
+                Some(size),
+                None,
+                source,
+            )
+            .unwrap();
+            let record = ObservedEntryRecord::capture(&entry, 1);
+            database
+                .batch_insert_observations(std::slice::from_ref(&record))
+                .await
+                .unwrap();
+            observations.push((entry, record));
+        }
+        let table = format!("base_{job}");
+        let rows = clickhouse_client(&config)
+            .query(&format!("SELECT count(),sum(size) FROM {table} FINAL"))
+            .fetch_one::<(u64, u64)>()
+            .await
+            .unwrap();
+        assert_eq!(
+            rows,
+            (1, 8192),
+            "one live path/version must keep the latest observation after identity changes"
+        );
+        assert_eq!(
+            database
+                .load_observation(&observations[1].1.identity_key, &backend)
+                .await
+                .unwrap(),
+            Some(observations[1].0.clone())
+        );
+        assert!(
+            database
+                .load_observation(&observations[0].1.identity_key, &backend)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        isolated.cleanup().await;
     }
 
     #[tokio::test]
@@ -468,10 +822,10 @@ mod clickhouse_integration_tests {
         assert_eq!(adapter_a.begin_scan_generation().await.unwrap(), 1);
         drop(adapter_a);
 
-        let adapter_b = ClickHouseDatabase::new(&config, &job_id);
+        let adapter_b = ClickHouseDatabase::new(&config, &job_id).unwrap();
         assert_eq!(adapter_b.begin_scan_generation().await.unwrap(), 1);
         drop(adapter_b);
-        let adapter_c = ClickHouseDatabase::new(&config, &job_id);
+        let adapter_c = ClickHouseDatabase::new(&config, &job_id).unwrap();
         assert_eq!(adapter_c.query_scan_state().await.unwrap(), Some(0));
         let physical_rows = clickhouse_client(&config)
             .query(&format!("SELECT count() FROM state_{job_id}"))
@@ -502,7 +856,7 @@ mod clickhouse_integration_tests {
             .unwrap();
         drop(adapter_a);
 
-        let adapter_b = ClickHouseDatabase::new(&config, &job_id);
+        let adapter_b = ClickHouseDatabase::new(&config, &job_id).unwrap();
         assert_eq!(adapter_b.begin_scan_generation().await.unwrap(), 1);
         adapter_b.batch_insert_base_record(&[survivor]).await.unwrap();
         let detected: Vec<_> = adapter_b.detect_deleted_items().await.unwrap().collect();
@@ -547,7 +901,7 @@ mod clickhouse_integration_tests {
             .await
             .unwrap();
         assert_eq!(temp_generation, 1);
-        let fresh_db = ClickHouseDatabase::new(&config, &job_id);
+        let fresh_db = ClickHouseDatabase::new(&config, &job_id).unwrap();
         assert_eq!(fresh_db.query_scan_state().await.unwrap(), Some(0));
 
         let rows_before_commit = client
@@ -584,7 +938,7 @@ mod clickhouse_integration_tests {
 
         let error = db.commit_scan_generation().await.unwrap_err();
         assert!(matches!(error, DatabaseError::TransactionError(_)));
-        let fresh_db = ClickHouseDatabase::new(&config, &job_id);
+        let fresh_db = ClickHouseDatabase::new(&config, &job_id).unwrap();
         assert_eq!(fresh_db.query_scan_state().await.unwrap(), Some(0));
         let physical_rows = clickhouse_client(&config)
             .query(&format!("SELECT count() FROM state_{job_id}"))
@@ -607,7 +961,7 @@ mod clickhouse_integration_tests {
         assert!(matches!(error, DatabaseError::ConversionError(_)));
         let error = db.commit_scan_generation().await.unwrap_err();
         assert!(matches!(error, DatabaseError::TransactionError(_)));
-        let fresh_db = ClickHouseDatabase::new(&config, &job_id);
+        let fresh_db = ClickHouseDatabase::new(&config, &job_id).unwrap();
         assert_eq!(fresh_db.query_scan_state().await.unwrap(), Some(2));
 
         database.cleanup().await;
@@ -616,6 +970,8 @@ mod clickhouse_integration_tests {
     #[tokio::test]
     async fn failed_begin_does_not_enable_commit() {
         let config = ClickHouseConfig {
+            mode: Default::default(),
+            cluster: None,
             dsn: "http://127.0.0.1:1".to_string(),
             dial_timeout: 1,
             read_timeout: 1,
@@ -623,11 +979,11 @@ mod clickhouse_integration_tests {
             username: "default".to_string(),
             password: None,
         };
-        let db = ClickHouseDatabase::new(&config, "failed_begin");
+        let db = ClickHouseDatabase::new(&config, "failed_begin").unwrap();
 
         assert!(matches!(
             db.begin_scan_generation().await.unwrap_err(),
-            DatabaseError::QueryError(_)
+            DatabaseError::ClickHouseError(ClickHouseError::Network(_))
         ));
         assert!(matches!(
             db.commit_scan_generation().await.unwrap_err(),
@@ -645,7 +1001,7 @@ mod clickhouse_integration_tests {
 
         assert!(matches!(
             db.begin_scan_generation().await.unwrap_err(),
-            DatabaseError::QueryError(_)
+            DatabaseError::ClickHouseError(ClickHouseError::BadResponse(ref message)) if message.contains("UNKNOWN_TABLE")
         ));
         assert!(matches!(
             db.commit_scan_generation().await.unwrap_err(),
@@ -661,7 +1017,9 @@ mod clickhouse_integration_tests {
         let (db, _, _, database) = setup_isolated_state_db("state_missing_table").await;
 
         let error = db.query_scan_state().await.unwrap_err();
-        assert!(matches!(error, DatabaseError::QueryError(_)));
+        assert!(
+            matches!(error, DatabaseError::ClickHouseError(ClickHouseError::BadResponse(ref message)) if message.contains("UNKNOWN_TABLE"))
+        );
 
         database.cleanup().await;
     }
@@ -669,6 +1027,8 @@ mod clickhouse_integration_tests {
     #[tokio::test]
     async fn query_scan_state_preserves_connection_error() {
         let config = ClickHouseConfig {
+            mode: Default::default(),
+            cluster: None,
             dsn: "http://127.0.0.1:1".to_string(),
             dial_timeout: 1,
             read_timeout: 1,
@@ -676,10 +1036,13 @@ mod clickhouse_integration_tests {
             username: "default".to_string(),
             password: None,
         };
-        let db = ClickHouseDatabase::new(&config, "unreachable");
+        let db = ClickHouseDatabase::new(&config, "unreachable").unwrap();
 
         let error = db.query_scan_state().await.unwrap_err();
-        assert!(matches!(error, DatabaseError::QueryError(_)));
+        assert!(matches!(
+            error,
+            DatabaseError::ClickHouseError(ClickHouseError::Network(_))
+        ));
     }
 
     #[tokio::test]
@@ -687,10 +1050,12 @@ mod clickhouse_integration_tests {
     async fn query_scan_state_preserves_authentication_error() {
         let mut config = lab_clickhouse_config("default".to_string());
         config.password = Some("definitely-wrong-password".to_string());
-        let db = ClickHouseDatabase::new(&config, "auth_failure");
+        let db = ClickHouseDatabase::new(&config, "auth_failure").unwrap();
 
         let error = db.query_scan_state().await.unwrap_err();
-        assert!(matches!(error, DatabaseError::QueryError(_)));
+        assert!(
+            matches!(error, DatabaseError::ClickHouseError(ClickHouseError::BadResponse(ref message)) if message.contains("AUTHENTICATION_FAILED") || message.contains("REQUIRED_PASSWORD"))
+        );
     }
 
     #[tokio::test]
@@ -725,7 +1090,7 @@ mod clickhouse_integration_tests {
         db.create_scan_state_table().await.unwrap();
         db.insert_scan_state(1).await.unwrap();
 
-        let fresh_db = ClickHouseDatabase::new(&config, &job_id);
+        let fresh_db = ClickHouseDatabase::new(&config, &job_id).unwrap();
         fresh_db.initialize().await.unwrap();
 
         assert_eq!(fresh_db.query_scan_state().await.unwrap(), Some(1));
@@ -745,11 +1110,11 @@ mod clickhouse_integration_tests {
         let (db, config, job_id, database) = setup_isolated_state_db("initialize_empty").await;
 
         db.initialize().await.unwrap();
-        let fresh_db = ClickHouseDatabase::new(&config, &job_id);
+        let fresh_db = ClickHouseDatabase::new(&config, &job_id).unwrap();
         assert_eq!(fresh_db.query_scan_state().await.unwrap(), Some(0));
 
         fresh_db.initialize().await.unwrap();
-        let newest_db = ClickHouseDatabase::new(&config, &job_id);
+        let newest_db = ClickHouseDatabase::new(&config, &job_id).unwrap();
         assert_eq!(newest_db.query_scan_state().await.unwrap(), Some(0));
         let physical_rows = clickhouse_client(&config)
             .query(&format!("SELECT count() FROM state_{job_id}"))
@@ -783,7 +1148,10 @@ mod clickhouse_integration_tests {
             .unwrap();
 
         let error = db.initialize().await.unwrap_err();
-        assert!(matches!(error, DatabaseError::QueryError(_)));
+        assert!(matches!(
+            error,
+            DatabaseError::ClickHouseError(ClickHouseError::SchemaMismatch(_))
+        ));
 
         let stored_values = client
             .query(&format!("SELECT scan_state FROM state_{job_id} FINAL WHERE id = 1"))
@@ -803,7 +1171,7 @@ mod clickhouse_integration_tests {
 
         assert_eq!(db.begin_scan_generation().await.unwrap(), 1);
 
-        let fresh_db = ClickHouseDatabase::new(&config, &job_id);
+        let fresh_db = ClickHouseDatabase::new(&config, &job_id).unwrap();
         assert_eq!(fresh_db.query_scan_state().await.unwrap(), Some(0));
         let physical_rows = clickhouse_client(&config)
             .query(&format!("SELECT count() FROM state_{job_id}"))
@@ -822,7 +1190,7 @@ mod clickhouse_integration_tests {
         adapter_a.initialize().await.unwrap();
         assert_eq!(adapter_a.begin_scan_generation().await.unwrap(), 1);
 
-        let mut adapter_b = ClickHouseDatabase::new(&config, &job_id);
+        let mut adapter_b = ClickHouseDatabase::new(&config, &job_id).unwrap();
         let record = Arc::new(make_nas("shared.dat", 13, 1_700_000_000, None));
         adapter_b.batch_insert_base_record(&[record]).await.unwrap();
         let client = clickhouse_client(&config);
@@ -879,8 +1247,8 @@ mod clickhouse_integration_tests {
         let (adapter_a, config, job_id, database) = setup_isolated_state_db("shared_commit").await;
         adapter_a.initialize().await.unwrap();
         assert_eq!(adapter_a.begin_scan_generation().await.unwrap(), 1);
-        let adapter_b = ClickHouseDatabase::new(&config, &job_id);
-        let adapter_c = ClickHouseDatabase::new(&config, &job_id);
+        let adapter_b = ClickHouseDatabase::new(&config, &job_id).unwrap();
+        let adapter_c = ClickHouseDatabase::new(&config, &job_id).unwrap();
         let client = clickhouse_client(&config);
         let rows_before = client
             .query(&format!("SELECT count() FROM state_{job_id}"))
@@ -910,12 +1278,12 @@ mod clickhouse_integration_tests {
         let (adapter_a, config, job_id, database) = setup_isolated_state_db("shared_failed_begin").await;
         adapter_a.initialize().await.unwrap();
         assert_eq!(adapter_a.begin_scan_generation().await.unwrap(), 1);
-        let adapter_b = ClickHouseDatabase::new(&config, &job_id);
+        let adapter_b = ClickHouseDatabase::new(&config, &job_id).unwrap();
         adapter_b.drop_table_by_name(&format!("state_{job_id}")).await.unwrap();
 
         assert!(matches!(
             adapter_b.begin_scan_generation().await.unwrap_err(),
-            DatabaseError::QueryError(_)
+            DatabaseError::ClickHouseError(ClickHouseError::BadResponse(ref message)) if message.contains("UNKNOWN_TABLE")
         ));
         assert!(matches!(
             adapter_a.commit_scan_generation().await.unwrap_err(),
@@ -933,7 +1301,7 @@ mod clickhouse_integration_tests {
         assert_eq!(adapter_a.begin_scan_generation().await.unwrap(), 1);
 
         let other_job_id = generate_unique_job_id("other_job");
-        let other_job = ClickHouseDatabase::new(&config, &other_job_id);
+        let other_job = ClickHouseDatabase::new(&config, &other_job_id).unwrap();
         other_job.initialize().await.unwrap();
         assert!(matches!(
             other_job.commit_scan_generation().await.unwrap_err(),
@@ -941,7 +1309,7 @@ mod clickhouse_integration_tests {
         ));
 
         drop(adapter_a);
-        let recreated = ClickHouseDatabase::new(&config, &job_id);
+        let recreated = ClickHouseDatabase::new(&config, &job_id).unwrap();
         assert!(matches!(
             recreated.commit_scan_generation().await.unwrap_err(),
             DatabaseError::TransactionError(_)
@@ -959,7 +1327,7 @@ mod clickhouse_integration_tests {
         assert_eq!(adapter_a.begin_scan_generation().await.unwrap(), 1);
         adapter_a.insert_scan_state(1).await.unwrap();
 
-        let adapter_b = ClickHouseDatabase::new(&config, &job_id);
+        let adapter_b = ClickHouseDatabase::new(&config, &job_id).unwrap();
         assert_eq!(adapter_b.begin_scan_generation().await.unwrap(), 0);
         let record = Arc::new(make_nas("rebegin.dat", 23, 1_700_000_000, None));
         adapter_a.batch_insert_base_record(&[record]).await.unwrap();
@@ -981,8 +1349,8 @@ mod clickhouse_integration_tests {
         let (_, config_a, _, database_a) = setup_isolated_state_db("shared_database_a").await;
         let (_, config_b, _, database_b) = setup_isolated_state_db("shared_database_b").await;
         let job_id = generate_unique_job_id("same_job");
-        let adapter_a = ClickHouseDatabase::new(&config_a, &job_id);
-        let adapter_b = ClickHouseDatabase::new(&config_b, &job_id);
+        let adapter_a = ClickHouseDatabase::new(&config_a, &job_id).unwrap();
+        let adapter_b = ClickHouseDatabase::new(&config_b, &job_id).unwrap();
         adapter_a.initialize().await.unwrap();
         adapter_b.initialize().await.unwrap();
 
@@ -1164,8 +1532,9 @@ mod clickhouse_integration_tests {
         let base_batch = make_nas_batch("dir", 1000, 1000000);
         db.batch_insert_base_record(&base_batch).await.unwrap();
 
-        // switch_scan_state
-        db.switch_scan_state().await.unwrap();
+        // begin_copy_generation
+        db.insert_scan_state(0).await.unwrap();
+        db.begin_copy_generation("catalogue-fixture-v1").await.unwrap();
 
         // 第二轮: temp 插入 990 条（10 条消失）
         db.create_scan_temporary_table().await.unwrap();
@@ -1296,8 +1665,9 @@ mod clickhouse_integration_tests {
         let base_batch = make_nas_batch("dir", 1000, 1000000);
         db.batch_insert_base_record(&base_batch).await.unwrap();
 
-        // switch_scan_state
-        db.switch_scan_state().await.unwrap();
+        // begin_copy_generation
+        db.insert_scan_state(0).await.unwrap();
+        db.begin_copy_generation("catalogue-fixture-v1").await.unwrap();
 
         // 第二轮：temp 100 条（80 已有其中 5 变更 + 20 新增）
         db.create_scan_temporary_table().await.unwrap();
@@ -1346,7 +1716,8 @@ mod clickhouse_integration_tests {
         let base_batch = make_nas_batch("dir", 1000, 1000000);
         db.batch_insert_base_record(&base_batch).await.unwrap();
 
-        db.switch_scan_state().await.unwrap();
+        db.insert_scan_state(0).await.unwrap();
+        db.begin_copy_generation("catalogue-fixture-v1").await.unwrap();
 
         // 第二轮
         db.create_scan_temporary_table().await.unwrap();

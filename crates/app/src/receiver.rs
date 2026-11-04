@@ -6,11 +6,12 @@
 
 // 标准库
 use crate::file_copy::{HdfsCopyContext, MetadataApplication, copy_file};
+use data_mover::model::FailureClass;
 use std::path::{Component, Path};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use storage_adapter::StorageEntryMessage;
 use storage_adapter::TransferMode;
+use storage_adapter::{StorageEntryMessage, StorageError};
 
 // 外部 crate
 use storage_adapter::qos::QosManager;
@@ -493,10 +494,47 @@ pub(crate) fn validate_relative_path(path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// 目标端枚举失败时，不能据此判定文件缺失或需要删除。
+async fn read_destination_index(storage: &StorageEnum, directory: &str) -> Result<DestIndex> {
+    let mut index = DestIndex::new();
+    let iterator = match storage
+        .walkdir(
+            Some(Path::new(directory)),
+            storage_adapter::WalkOptions {
+                depth: Some(1),
+                ..Default::default()
+            },
+        )
+        .await
+    {
+        Ok(iterator) => iterator,
+        Err(error) if error.is_not_found() => return Ok(index),
+        Err(error) => return Err(error.into()),
+    };
+    let mut observed = false;
+    while let Some(message) = iterator.next().await {
+        if let StorageEntryMessage::Scanned(entry) = message {
+            observed = true;
+            index.insert(entry);
+        }
+    }
+    if let Some(error) = iterator.take_error() {
+        let missing_root = matches!(&error,
+            StorageError::TraversalEntry { path, source, .. }
+                if path.as_str() == directory && source.class() == FailureClass::NotFound);
+        if !observed && (missing_root || error.is_not_found()) {
+            return Ok(index);
+        }
+        return Err(error.into());
+    }
+    Ok(index)
+}
+
 /// 合并处理文件列表（`FilePage` → 构建 `DestIndex` → 发 `TransferRequest`/
 /// `DeltaTransferRequest`）与文件数据流（写入目标端 → 发 `EntrySuccess`/`EntryError`），
 /// 单一消费者循环内按 variant dispatch，去掉两者之间的顺序 barrier。
 ///
+
 /// 拆分多路复用 stream 后，Sender 可能在文件列表还没发完（`FileListDone` 之前）就已经
 /// 开始为已确定的文件发送数据（file list 与 data 走不同物理 stream，可以流水线并发），
 /// 若仍分成"先收完文件列表、再收数据"两个各自独立调用 `recv()` 的阶段，数据消息会被
@@ -544,6 +582,7 @@ pub(crate) async fn recv_file_list_and_data_phase(
         progress.clone(),
     ));
     let mut transport_closed = false;
+    let mut enumeration_failure = None;
 
     loop {
         // 同时处理 transport 消息和 progress 上报
@@ -574,24 +613,13 @@ pub(crate) async fn recv_file_list_and_data_phase(
             Some(SenderMsg::FilePage(page)) => {
                 state.ingest_page(&page);
 
-                // 构建该目录的 DestIndex（walkdir 目标端 depth=1）
-                let mut dest_index = DestIndex::new();
-                if let Ok(iter) = dest_storage
-                    .walkdir(
-                        Some(std::path::Path::new(&page.dir_path)),
-                        storage_adapter::WalkOptions {
-                            depth: Some(1),
-                            ..Default::default()
-                        },
-                    )
-                    .await
-                {
-                    while let Some(msg) = iter.next().await {
-                        if let StorageEntryMessage::Scanned(entry) = msg {
-                            dest_index.insert(entry);
-                        }
+                let mut dest_index = match read_destination_index(dest_storage, &page.dir_path).await {
+                    Ok(index) => index,
+                    Err(error) => {
+                        enumeration_failure = Some(error);
+                        break;
                     }
-                }
+                };
 
                 // 逐文件比较 → 发 TransferRequest/DeltaTransferRequest（New/Changed，前者
                 // 附带 decision 供 Sender 侧统计正确分类）或 Classified（MetadataOnly/Skip，
@@ -632,7 +660,8 @@ pub(crate) async fn recv_file_list_and_data_phase(
                     .await;
             }
             Some(SenderMsg::FileListError { path, reason }) => {
-                error!("[Receiver Remote] walkdir error {}: {}", path, reason);
+                enumeration_failure = Some(AppError::CopyError(format!("Source listing failed at {path}: {reason}")));
+                break;
             }
             Some(SenderMsg::FileListDone) => {
                 info!(
@@ -769,12 +798,27 @@ pub(crate) async fn recv_file_list_and_data_phase(
         } // close select!
     } // close loop
 
+    if enumeration_failure.is_some() || transport_closed {
+        if enumeration_failure.is_some() {
+            progress.error_count.fetch_add(1, Ordering::Relaxed);
+        }
+        // 先通知对端停止，再收尾已开始的磁盘任务；失败不能触发目录完成元数据。
+        let _ = transport.close().await;
+        state.abort_active_file(&dc_tx).await;
+        state.discard_directory_metadata();
+    }
     let shutdown_result = state
         .shutdown_disk_commit(dc_tx, dc_join, &mut ack_rx, transport, progress, dest_storage)
         .await;
     // Connection-local residual credit is meaningless after every terminal path,
     // including a disk-commit shutdown failure.
     state.discard_residual_credit();
+    if let Some(error) = enumeration_failure {
+        if let Err(cleanup_error) = shutdown_result {
+            warn!(%cleanup_error, "disk cleanup failed after enumeration failure");
+        }
+        return Err(error);
+    }
     shutdown_result?;
 
     if transport_closed {
@@ -790,6 +834,97 @@ pub(crate) async fn recv_file_list_and_data_phase(
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+    use crate::storage_factory::{StorageRole, create_storage_for_role};
+    use storage_adapter::dir_tree::DirPageResult;
+    use tokio::{
+        fs,
+        sync::mpsc,
+        time::{Duration, timeout},
+    };
+    use transport::{in_process::create_in_process_pair, traits::SenderTransport};
+
+    #[tokio::test]
+    async fn destination_index_distinguishes_a_missing_directory_from_a_failed_listing() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        fs::write(root.path().join("not-a-directory"), b"preserve").await?;
+        let storage =
+            create_storage_for_role(root.path().to_str().unwrap(), None, false, StorageRole::Destination).await?;
+        assert!(read_destination_index(&storage, "not-a-directory").await.is_err());
+        assert!(
+            read_destination_index(&storage, "missing")
+                .await?
+                .orphaned_entries()
+                .is_empty()
+        );
+        assert_eq!(fs::read(root.path().join("not-a-directory")).await?, b"preserve");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn failed_source_or_destination_enumeration_closes_the_session_without_success() -> Result<()> {
+        for source_failure in [true, false] {
+            let root = tempfile::tempdir()?;
+            fs::write(root.path().join("not-a-directory"), b"preserve").await?;
+            let storage = Arc::new(
+                create_storage_for_role(root.path().to_str().unwrap(), None, false, StorageRole::Destination).await?,
+            );
+            let (sender, receiver) = create_in_process_pair();
+            let message = if source_failure {
+                SenderMsg::FileListError {
+                    path: "source".into(),
+                    reason: "forced source listing error".into(),
+                }
+            } else {
+                SenderMsg::FilePage(DirPageResult {
+                    dir_path: "not-a-directory".into(),
+                    ndx_start: 0,
+                    files: Vec::new(),
+                    subdirs: Vec::new(),
+                    gap_ndx: -1,
+                })
+            };
+            sender.send(message).await?;
+            let config = SessionConfig {
+                transfer_mode: TransferMode::Atomic,
+                src_path: "source".into(),
+                qos: None,
+                peak_qos_rate: 1.0,
+                iops: None,
+                enable_integrity_check: false,
+                enable_acl: false,
+                is_source_reserved: true,
+                block_size: None,
+                delete_target: true,
+                delta_size_threshold: None,
+            };
+            let progress = Arc::new(ReceiverProgress::new());
+            let (_progress_tx, progress_rx) = mpsc::channel(1);
+            let mut state = RemoteSessionState::default();
+            let result = timeout(
+                Duration::from_secs(1),
+                recv_file_list_and_data_phase(
+                    &receiver,
+                    &storage,
+                    &config,
+                    &FeatureFlags::current(),
+                    DEFAULT_DELTA_SIZE_THRESHOLD_BYTES,
+                    &progress,
+                    progress_rx,
+                    &mut state,
+                ),
+            )
+            .await
+            .unwrap();
+            assert!(result.is_err());
+            assert_eq!(progress.error_count.load(Ordering::Relaxed), 1);
+            assert!(
+                timeout(Duration::from_secs(1), sender.recv()).await.unwrap().is_none(),
+                "failed enumeration must close the peer without success messages"
+            );
+            assert_eq!(fs::read(root.path().join("not-a-directory")).await?, b"preserve");
+        }
+        Ok(())
+    }
 
     #[test]
     fn validate_relative_path_accepts_normal_paths() {

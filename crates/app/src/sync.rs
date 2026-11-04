@@ -239,7 +239,7 @@ pub(crate) async fn process_versioned_entry(
     broadcaster: BroadcastForwarder<StorageEntryMessage>, qos_manager: Option<QosManager>,
     object_buffers: Arc<DashMap<String, Vec<Arc<EntryEnum>>>>, enable_integrity_check: bool, enable_acl: bool,
     is_source_reserved: bool, bytes_counter: Option<Arc<AtomicU64>>, resume: ResumeOpts,
-) {
+) -> Result<()> {
     // 版本化对象，使用per-object缓冲区机制
     trace!("Processing versioned entry with buffer: {:?}", entry);
 
@@ -248,11 +248,11 @@ pub(crate) async fn process_versioned_entry(
         EntryEnum::S3(s3_entry) => s3_entry.relative_path.clone(),
         EntryEnum::NAS(_) => {
             error!("Expected S3Entry for versioned processing, got {:?}", entry);
-            return;
+            return Err(AppError::CopyError("Versioned processing requires an S3 entry".into()));
         }
         EntryEnum::HDFS(_) => {
             error!("Expected S3Entry for versioned processing, got HDFS entry");
-            return;
+            return Err(AppError::CopyError("Versioned processing requires an S3 entry".into()));
         }
     };
 
@@ -266,7 +266,7 @@ pub(crate) async fn process_versioned_entry(
         let total = entry.get_version_count().unwrap_or(1) as usize;
         if entry_ref.len() < total {
             // 未集齐，drop RefMut 自动释放锁
-            return;
+            return Ok(());
         }
 
         // 集齐 → 在持锁期间 take 走数据（留空 Vec）
@@ -278,9 +278,10 @@ pub(crate) async fn process_versioned_entry(
     // 已集齐所有版本，开始处理
     trace!("All versions of object {} collected, starting processing", object_key);
 
-    // 启动处理任务
+    // 当前 handler 等待版本组完成，阶段屏障必须覆盖实际复制及错误。
     let span = info_span!("version_processor", path = %object_key, object_key = %object_key);
-    drop(tokio::spawn(async move {
+    async move {
+        let mut failure = None;
         let mut task_versions = object_versions;
 
         // 按mtime从旧到新排序版本
@@ -288,7 +289,7 @@ pub(crate) async fn process_versioned_entry(
 
         trace!("Sorted versions: {:?}", task_versions);
 
-        if matches!(dest_storage.is_bucket_versioned().await, Ok(true)) {
+        if dest_storage.is_bucket_versioned().await? {
             let version_count = task_versions.len() as u32;
             debug!("Processing object {} with {} versions", object_key, version_count);
 
@@ -350,6 +351,7 @@ pub(crate) async fn process_versioned_entry(
                                 reason: format!("{e}"),
                             })
                             .await;
+                        failure.get_or_insert(e);
                     }
                 }
             }
@@ -396,11 +398,13 @@ pub(crate) async fn process_versioned_entry(
                                 reason: format!("{e}"),
                             })
                             .await;
+                        failure.get_or_insert(e);
                     }
                 }
             }
         }
-    }.instrument(span)));
+        match failure { Some(error) => Err(error), None => Ok(()) }
+    }.instrument(span).await
 }
 
 /// `process_entry` / `process_entry_inner` 的标志位组合
@@ -496,7 +500,7 @@ async fn process_entry_inner(
                         reason: format!("{e}"),
                     })
                     .await;
-                // 目录创建失败，不返回错误，继续尝试设置元数据和ACL
+                return Err(e.into());
             }
         }
 
@@ -518,6 +522,7 @@ async fn process_entry_inner(
                                 reason: format!("{e}"),
                             })
                             .await;
+                        return Err(e.into());
                     }
                 }
             }
@@ -531,6 +536,7 @@ async fn process_entry_inner(
                         reason: format!("{e}"),
                     })
                     .await;
+                return Err(e.into());
             }
         }
     } else if skip_data_copy {
@@ -538,8 +544,7 @@ async fn process_entry_inner(
         trace!("Skipping data copy (metadata-only change): {:?}", relative_path);
         dest_storage
             .set_entry_metadata(entry)
-            .await
-            .map_err(|e| AppError::CopyError(format!("Failed to set metadata for {}: {e}", relative_path.display())))?;
+            .await?;
     } else if matches!(dest_storage.as_ref(), StorageEnum::HDFS(_)) {
         let hdfs = HdfsCopyContext::from_job(&resume.job_id, resume.transfer_mode)?;
         let recorder = if resume.transfer_mode == TransferMode::Checkpoint {
@@ -561,8 +566,7 @@ async fn process_entry_inner(
             Some(&hdfs),
         )
         .await
-        .map(|_| ())
-        .map_err(|e| AppError::CopyError(format!("Failed to copy {}: {e}", relative_path.display())));
+        .map(|_| ());
         if let Some(recorder) = recorder { recorder.finish(result).await?; } else { result?; }
         debug!("Copied file through HDFS recoverable lifecycle {:?}", relative_path);
     } else if should_resume(&resume, entry, &src_storage, &dest_storage) {
@@ -600,8 +604,7 @@ async fn process_entry_inner(
                 ..Default::default()
             },
         )
-        .await
-        .map_err(|e| AppError::CopyError(format!("Failed to copy {}: {e}", relative_path.display())))?;
+        .await?;
 
         // data-mover 在发布文件前应用协商后的元数据。
 
@@ -621,6 +624,7 @@ async fn process_entry_inner(
                     reason: format!("{err}"),
                 })
                 .await;
+            return Err(err.into());
         }
 
         // xattr 复制（仅 NFSv4.1→NFSv4.1，其他组合静默跳过）
@@ -634,6 +638,7 @@ async fn process_entry_inner(
                     reason: format!("{err}"),
                 })
                 .await;
+            return Err(err.into());
         }
     }
 
@@ -878,8 +883,7 @@ pub(crate) async fn copy_file_with_resume(
     )
     .await;
 
-    let result =
-        res.map_err(|error| AppError::CopyError(format!("Resumable copy failed for {}: {error}", dest_rel.display())));
+    let result = res.map_err(AppError::from);
     recorder.finish(result).await
 }
 

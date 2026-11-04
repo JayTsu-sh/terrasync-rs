@@ -465,6 +465,15 @@ impl TarManifestRecord {
     }
 }
 
+/// 复制目录轮次是否需要重放未确认的目标操作。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CopyGenerationStatus {
+    /// 首轮或上一轮全部确认成功，沿用正常增量比较。
+    Fresh,
+    /// 上轮复制没有确认完成，必须重放源项或由调用方拒绝不安全的恢复。
+    Recovering,
+}
+
 /// 数据库通用接口
 /// 定义所有数据库后端需要实现的方法
 #[async_trait]
@@ -569,13 +578,12 @@ pub trait Database: Send + Sync {
     /// - 失败返回错误信息
     async fn batch_insert_incremental_record(&self, records: &[StorageEntryMessage]) -> Result<()>;
 
-    /// 切换扫描状态
-    /// 在增量扫描时使用，用于标记新旧数据
+    /// 开始复制元数据轮次，绑定不含凭据的恢复计划摘要。
     ///
     /// # 返回值
-    /// - 成功返回Ok(())
+    /// - Fresh 表示正常比较；Recovering 要求调用方确认目标允许安全重放
     /// - 失败返回错误信息
-    async fn switch_scan_state(&self) -> Result<()>;
+    async fn begin_copy_generation(&self, request_key: &str) -> Result<CopyGenerationStatus>;
 
     /// 从持久 generation 开始一轮扫描，但不持久化 working generation
     async fn begin_scan_generation(&self) -> Result<u8>;

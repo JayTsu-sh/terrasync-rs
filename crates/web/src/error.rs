@@ -22,6 +22,10 @@ pub enum WebError {
     #[error("{0}")]
     UtilsError(#[from] utils::error::UtilsError),
 
+    /// ClickHouse 部署配置无效；保留类型化原因，并向设置界面返回可修正的提示。
+    #[error("{0}")]
+    ClickHouseConfigInvalid(#[source] utils::error::UtilsError),
+
     /// `SQLite` 数据库错误
     #[error("Database error: {0}")]
     DatabaseError(#[from] sqlx::Error),
@@ -145,6 +149,7 @@ fn connection_failure_message(class: Option<FailureClass>) -> &'static str {
         Some(FailureClass::PermissionDenied) => "连接测试失败：没有访问权限，请检查共享目录权限和用户身份",
         Some(FailureClass::Authentication) => "连接测试失败：认证失败，请检查账号和凭据",
         Some(FailureClass::Connectivity) => "连接测试失败：无法连接存储服务器，请检查网络、地址和端口",
+        Some(FailureClass::Timeout) => "连接测试失败：存储服务器响应超时，请检查网络和存储服务状态",
         Some(FailureClass::NotFound) => "连接测试失败：共享路径不存在，请检查共享路径和前缀配置",
         Some(FailureClass::InvalidInput) => "连接测试失败：存储探测参数无效，请检查路径配置",
         Some(FailureClass::Unsupported) => "连接测试失败：存储服务不支持当前探测操作",
@@ -163,9 +168,10 @@ impl IntoResponse for WebError {
             | WebError::TaskNotFound(_)
             | WebError::ExecutionNotFound(_) => StatusCode::NOT_FOUND,
 
-            WebError::ValidationError(_) | WebError::InvalidTaskState { .. } | WebError::JsonRejectionError(_) => {
-                StatusCode::BAD_REQUEST
-            }
+            WebError::ValidationError(_)
+            | WebError::ClickHouseConfigInvalid(_)
+            | WebError::InvalidTaskState { .. }
+            | WebError::JsonRejectionError(_) => StatusCode::BAD_REQUEST,
 
             WebError::EndpointInUseByRunningTask(_)
             | WebError::DuplicateName { .. }

@@ -1,3 +1,4 @@
+use super::storage_failure::StorageFailureDetail;
 use serde::{Deserialize, Serialize};
 
 /// 任务类型枚举
@@ -158,6 +159,8 @@ pub struct MigrationTask {
     pub finished_at: Option<chrono::DateTime<chrono::Utc>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error_message: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub storage_error: Option<StorageFailureDetail>,
 }
 
 /// 任务列表过滤条件

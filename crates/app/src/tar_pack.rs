@@ -11,7 +11,7 @@ use storage_adapter::{EntryEnum, NASEntry, S3Entry, StorageEntryMessage, WalkDir
 // 外部crate
 use tracing::{debug, info};
 
-use crate::error::Result;
+use crate::error::{AppError, Result};
 
 /// 将源端目录打包为 .tar 文件写入目标端
 ///
@@ -35,7 +35,7 @@ pub async fn pack_directory(
     let iterator = src_storage
         .walkdir(Some(dir_entry.get_relative_path()), WalkOptions::default())
         .await?;
-    let manifest_list = collect_entries(iterator).await;
+    let manifest_list = collect_entries(iterator).await?;
 
     debug!("Collected {} entries for packing {:?}", manifest_list.len(), dir_path);
 
@@ -123,8 +123,9 @@ pub async fn pack_directory(
 }
 
 /// 从 walkdir 迭代器收集所有条目
-async fn collect_entries(iterator: WalkDirAsyncIterator) -> Vec<Arc<EntryEnum>> {
+async fn collect_entries(iterator: WalkDirAsyncIterator) -> Result<Vec<Arc<EntryEnum>>> {
     let mut entries = Vec::new();
+    let mut enumeration_error = None;
     while let Some(message) = iterator.next().await {
         match message {
             StorageEntryMessage::Scanned(entry) => {
@@ -133,10 +134,44 @@ async fn collect_entries(iterator: WalkDirAsyncIterator) -> Vec<Arc<EntryEnum>> 
             StorageEntryMessage::Error {
                 event, path, reason, ..
             } => {
-                tracing::warn!("Error during sub-walkdir ({}): {:?} - {}", event, path, reason);
+                enumeration_error.get_or_insert_with(|| {
+                    AppError::ScanError(format!(
+                        "Subdirectory enumeration failed ({event}) at {}: {reason}",
+                        path.display()
+                    ))
+                });
             }
             _ => {}
         }
     }
-    entries
+    if let Some(error) = iterator.take_error() {
+        return Err(error.into());
+    }
+    if let Some(error) = enumeration_error {
+        return Err(error);
+    }
+    Ok(entries)
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+    use storage_adapter::{AsyncReceiver, ErrorEvent};
+
+    #[tokio::test]
+    async fn an_enumeration_error_cannot_become_a_successful_tar_manifest() {
+        let (sender, receiver) = async_channel::bounded(1);
+        sender
+            .send(StorageEntryMessage::Error {
+                event: ErrorEvent::Scan,
+                path: "unreadable".into(),
+                entry: None,
+                reason: "listing interrupted".into(),
+            })
+            .await
+            .unwrap();
+        drop(sender);
+        assert!(collect_entries(AsyncReceiver::new(receiver)).await.is_err());
+    }
 }

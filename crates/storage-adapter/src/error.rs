@@ -2,7 +2,7 @@ use data_mover::error::StorageError as NativeStorageError;
 use std::error::Error as StdError;
 use tokio::task::JoinError;
 
-use crate::{MismatchDataField, MismatchMetaField, TransferMode};
+use crate::{MismatchDataField, MismatchMetaField, RemoteScanFailure, TransferMode};
 use data_mover::{
     metadata::{ApplicationFailureKind, MetadataApplicationFailure, MetadataApplicationReport, MetadataPlanError},
     model::{BackendKind, EntryOperationFailure, FailureClass, MetadataFamily, ModelValueError, StoragePath},
@@ -13,10 +13,16 @@ use data_mover::{
     },
     tar_pack::TarFailure,
     transfer::{DirectPatchError, MoveFailure, TransferFailure, TransferPhase, TransferSide, TransferValueError},
-    traversal::{FailureScope, ObservationFailure, TraversalConfigurationError, TraversalTerminalFailure},
+    traversal::{
+        FailureScope, ObservationFailure, ScanSetupError, TraversalConfigurationError, TraversalTerminalFailure,
+    },
 };
 #[derive(Debug, thiserror::Error)]
 pub enum StorageError {
+    #[error(transparent)]
+    ScanSetup(#[from] ScanSetupError),
+    #[error(transparent)]
+    RemoteScan(#[from] Box<RemoteScanFailure>),
     #[error("{backend:?} backend does not support {mode:?} transfer mode: {reason}")]
     UnsupportedTransferMode {
         backend: BackendKind,
@@ -171,5 +177,11 @@ impl StreamTransferDiagnostic {
             refusal: failure.metadata_refusal(),
             cleanup_failure: None,
         }
+    }
+}
+
+impl From<RemoteScanFailure> for StorageError {
+    fn from(failure: RemoteScanFailure) -> Self {
+        Self::RemoteScan(Box::new(failure))
     }
 }

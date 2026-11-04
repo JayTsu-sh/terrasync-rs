@@ -43,14 +43,7 @@ impl From<&AppDatabaseConfig> for DatabaseConfig {
             enabled: app_config.enabled,
             db_type: app_config.r#type.clone(),
             batch_size: app_config.batch_size,
-            clickhouse: Some(ClickHouseConfig {
-                dsn: app_config.clickhouse.dsn.clone(),
-                dial_timeout: app_config.clickhouse.dial_timeout,
-                read_timeout: app_config.clickhouse.read_timeout,
-                database: app_config.clickhouse.database.clone(),
-                username: app_config.clickhouse.username.clone(),
-                password: app_config.clickhouse.password.clone(),
-            }),
+            clickhouse: Some(app_config.clickhouse.clone()),
         }
     }
 }
@@ -62,20 +55,5 @@ impl DatabaseConfig {
     }
 }
 
-/// `ClickHouse` 数据库配置结构体
-/// 包含连接 `ClickHouse` 所需的所有参数
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ClickHouseConfig {
-    /// `ClickHouse` 连接字符串
-    pub dsn: String,
-    /// 连接超时时间（秒）
-    pub dial_timeout: u32,
-    /// 读取超时时间（秒）
-    pub read_timeout: u32,
-    /// 数据库名称
-    pub database: String,
-    /// 用户名
-    pub username: String,
-    /// 密码（可选）
-    pub password: Option<String>,
-}
+// 使用同一连接及部署配置，避免转换时丢失模式或集群名称。
+pub use utils::app_config::ClickhouseConfig as ClickHouseConfig;

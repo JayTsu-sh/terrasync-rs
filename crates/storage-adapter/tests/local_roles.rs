@@ -1,10 +1,13 @@
 use bytes::Bytes;
+use data_mover::traversal::TraversalOutcome;
 use std::{path::Path, sync::Arc};
+use storage_adapter::filter::parse_filter_expression;
 use storage_adapter::{
     CopyOptions, CreateStorageOptions, DataChunk, EntryEnum, StorageEntryMessage, StorageEnum, TarPackOptions,
     WalkOptions, create_storage,
 };
 use tempfile::TempDir;
+use tokio::fs::{create_dir_all, write};
 
 async fn local(root: &Path) -> storage_adapter::Result<StorageEnum> {
     create_storage(
@@ -338,5 +341,38 @@ async fn observed_zero_mode_is_preserved_instead_of_becoming_unknown() -> TestRe
     let storage = local(root.path()).await?;
     let entry = storage.get_metadata(Path::new("zero-mode")).await?;
     assert_eq!(entry.get_mode().map(|mode| mode & 0o7777), Some(0));
+    Ok(())
+}
+
+#[tokio::test]
+async fn packaged_scan_can_use_the_checkpoint_contract_required_for_network_recovery() -> TestResult {
+    use std::{collections::BTreeSet, time::Duration};
+    use storage_adapter::ResumableScanItem;
+    use tokio_util::sync::CancellationToken;
+    let root = TempDir::new()?;
+    create_dir_all(root.path().join("archive/20250101/child")).await?;
+    write(root.path().join("archive/20250101/child/data"), b"payload").await?;
+    let storage = local(root.path()).await?;
+    let options = WalkOptions {
+        packaged: true,
+        match_expressions: Some(parse_filter_expression("dir_date <= 20260101")?),
+        ..Default::default()
+    };
+    let mut scan = storage.resumable_scan(&options, None, CancellationToken::new(), Duration::ZERO)?;
+    let mut paths = BTreeSet::new();
+    while let Some(item) = scan.next().await {
+        if let ResumableScanItem::Entry(entry) = item? {
+            paths.insert(Path::new(entry.path().as_str()).to_owned());
+        }
+    }
+    assert!(matches!(scan.finish().await?, TraversalOutcome::Completed(_)));
+    assert_eq!(
+        paths,
+        [
+            Path::new("archive").to_owned(),
+            Path::new("archive/20250101").to_owned()
+        ]
+        .into()
+    );
     Ok(())
 }

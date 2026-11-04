@@ -12,6 +12,11 @@ const activeTab = ref<'db' | 'log'>('db')
 
 const dsn = ref('http://localhost:8123')
 const clickhouseDatabase = ref('default')
+const clickhouseMode = ref<'single' | 'cluster'>('single')
+const clickhouseModeOptions = [
+  { label: '单机', value: 'single' },
+  { label: '集群', value: 'cluster' },
+]
 const clickhouseCluster = ref('')
 const clickhouseUser = ref('default')
 const clickhousePassword = ref('')
@@ -51,6 +56,7 @@ async function fetchSettings() {
     clickhouseUser.value = (configMap.get('clickhouse_user') as string) || 'default'
     clickhousePassword.value = (configMap.get('clickhouse_password') as string) || ''
     clickhouseDatabase.value = (configMap.get('clickhouse_database') as string) || 'default'
+    clickhouseMode.value = configMap.get('clickhouse_mode') === 'cluster' ? 'cluster' : 'single'
     clickhouseCluster.value = (configMap.get('clickhouse_cluster') as string) || ''
     clickhouseBatchSize.value = (configMap.get('clickhouse_batch_size') as number) || 100000
     logLevel.value = (configMap.get('log_level') as string) || 'info'
@@ -71,7 +77,8 @@ async function handleSave() {
       { key: 'clickhouse_user', value: clickhouseUser.value },
       { key: 'clickhouse_password', value: clickhousePassword.value },
       { key: 'clickhouse_database', value: clickhouseDatabase.value },
-      { key: 'clickhouse_cluster', value: clickhouseCluster.value.trim() },
+      { key: 'clickhouse_mode', value: clickhouseMode.value },
+      { key: 'clickhouse_cluster', value: clickhouseMode.value === 'cluster' ? clickhouseCluster.value.trim() : '' },
       { key: 'clickhouse_batch_size', value: clickhouseBatchSize.value },
       { key: 'log_level', value: logLevel.value },
     ])
@@ -163,7 +170,8 @@ onMounted(async () => {
           </NFormItem>
           <NFormItem label="DSN"><NInput v-model:value="dsn" placeholder="http://localhost:8123" /></NFormItem>
           <NFormItem label="数据库名"><NInput v-model:value="clickhouseDatabase" placeholder="default" /></NFormItem>
-          <NFormItem label="集群名称"><NInput v-model:value="clickhouseCluster" placeholder="留空为单机模式，例如 clickhouse" /></NFormItem>
+          <NFormItem label="部署模式"><NSelect v-model:value="clickhouseMode" :options="clickhouseModeOptions" /></NFormItem>
+          <NFormItem v-if="clickhouseMode === 'cluster'" label="集群名称"><NInput v-model:value="clickhouseCluster" placeholder="必填，例如 clickhouse" /></NFormItem>
           <NFormItem label="用户名"><NInput v-model:value="clickhouseUser" placeholder="default" /></NFormItem>
           <NFormItem label="密码"
             ><NInput

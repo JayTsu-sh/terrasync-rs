@@ -9,7 +9,7 @@
 //! 6. 参数校验函数
 
 // 标准库
-use app::scan_resume::scan_with_resume;
+use app::scan::ScanRequest;
 use std::fs;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -140,46 +140,32 @@ pub async fn scan_cmd(
     let effective_match = r#match.as_ref().or(config.scan.r#match.as_ref()).cloned();
     let effective_exclude = exclude.as_ref().or(config.scan.exclude.as_ref()).cloned();
 
-    let (job_dir, job_dir_pre_existing) = prepare_job("scan", job_id)?;
-
-    if resume {
-        let cancel = CancellationToken::new();
-        let signal_cancel = cancel.clone();
-        let signal = tokio::spawn(async move {
-            if ctrl_c().await.is_ok() {
-                signal_cancel.cancel();
-            }
-        });
-        let result = scan_with_resume(
-            job_id,
-            &job_dir,
-            path,
-            effective_depth,
-            &effective_match,
-            &effective_exclude,
-            raw_command_line,
-            cancel,
-        )
-        .await;
-        signal.abort();
-        return result.map_err(Into::into);
+    if resume && !config.database.enabled {
+        return Err(CliError::InvalidParameter("扫描 --resume 需要启用 ClickHouse".into()));
     }
-
-    scan(
-        job_id.to_string(),
-        job_dir,
-        job_dir_pre_existing,
+    let (job_dir, _) = prepare_job("scan", job_id)?;
+    let cancel = CancellationToken::new();
+    let signal_cancel = cancel.clone();
+    let signal = tokio::spawn(async move {
+        if ctrl_c().await.is_ok() {
+            signal_cancel.cancel();
+        }
+    });
+    let result = scan(ScanRequest {
+        job_id,
+        job_dir: &job_dir,
         path,
-        effective_depth,
-        &effective_match,
-        &effective_exclude,
-        raw_command_line,
-        None,
-        None,
-    )
-    .await?;
-
-    Ok(())
+        depth: effective_depth,
+        include: &effective_match,
+        exclude: &effective_exclude,
+        command: raw_command_line,
+        cancel,
+        callback_url: None,
+        concurrency: None,
+    })
+    .await;
+    signal.abort();
+    result.map_err(Into::into)
 }
 
 /// 处理复制命令

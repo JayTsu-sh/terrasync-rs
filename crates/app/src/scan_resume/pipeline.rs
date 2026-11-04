@@ -1,5 +1,6 @@
 //! 扫描分发及检查点协调。数据库批次 B 写入时，下一批 A 在有界队列中积累。
-use super::{cancellation::ScanCancellation, flush_batch, input::ScanInput, workers};
+use super::{flush_batch, input::ScanInput, workers};
+use crate::scan::cancellation::ScanCancellation;
 use crate::{
     consumer::{
         ConsumerManager, ScanStatistics,
@@ -12,8 +13,11 @@ use db::{
     clickhouse::scan_resume::{FINALIZING, ScanResumeState},
     scan_store::ScanStore,
 };
-use std::{sync::Arc, time::Duration};
-use storage_adapter::{ResumableScan, ResumableScanItem};
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
+use storage_adapter::{RemoteScanFailure, ResumableScan, ResumableScanItem, StorageError};
 #[cfg(feature = "lab-fault-injection")]
 use tokio::time::sleep;
 use tokio::{
@@ -35,6 +39,9 @@ pub(super) async fn consume(
     source: ResumableScan, database: &mut ScanStore, state: &mut ScanResumeState, statistics: &ConsumerManager,
     batch_size: usize, cancel: ScanCancellation,
 ) -> Result<()> {
+    let failure = source.failure_signal();
+    // 独立于数据库/输出背压停止查询；只监听防抖耗尽后的最终故障，闪断不会取消扫描。
+    let _failure_watch = cancel.watch_storage_failure(failure.clone());
     let mut forwarder = ObservedForwarder::<Entries>::new();
     let db_rx = forwarder.subscribe("clickhouse", batch_size.div_ceil(DISPATCH_BATCH));
     let stat_rx = forwarder.subscribe("statistics", 8);
@@ -42,7 +49,11 @@ pub(super) async fn consume(
     // 结构化并发：任一分支失败都等待消费者退出，不遗留后台写入任务。
     let writer_state = state.clone();
     let template = writer_state.incremental.then(|| database.batch_writer()).flatten();
-    let prefetch_capacity = Some(batch_size.saturating_mul(workers::WORKERS));
+    // 预读跟随实际写入并行度；全量和单机增量的串行写入只分配一个 worker 的预算。
+    let writer_workers = if template.is_some() { workers::WORKERS } else { 1 };
+    // 增量比较和持久化屏障更长，用三个有界 worker 窗口覆盖在途批次及确认等待。
+    let windows = if state.incremental { 3 } else { 1 };
+    let prefetch_capacity = Some(batch_size.saturating_mul(writer_workers).saturating_mul(windows));
     let mut producer_state = state.clone();
     let producer_statistics = statistics.scan_statistics();
     let count_statistics = producer_statistics.clone();
@@ -101,10 +112,17 @@ pub(super) async fn consume(
     statistics_result?;
     let (producer_state, traversal_outcome) = traversal_result?;
     *state = producer_state;
-    merge_outcomes(persisted, traversal_outcome)
+    merge_outcomes(persisted, traversal_outcome, failure.failure())
 }
 
-fn merge_outcomes(persisted: Result<()>, traversal: Result<()>) -> Result<()> {
+fn merge_outcomes(persisted: Result<()>, traversal: Result<()>, failure: Option<RemoteScanFailure>) -> Result<()> {
+    if matches!(
+        &persisted,
+        Ok(()) | Err(AppError::ObservationScanCancelled | AppError::ScanWorkerStopped)
+    ) && let Some(failure) = failure
+    {
+        return Err(StorageError::from(failure).into());
+    }
     match persisted {
         Err(AppError::ObservationScanCancelled | AppError::ScanWorkerStopped) if traversal.is_err() => traversal,
         persisted => {
@@ -124,6 +142,7 @@ mod outcome_tests {
         let result = merge_outcomes(
             Err(AppError::ObservationScanCancelled),
             Err(AppError::ScanError("source failed".into())),
+            None,
         );
         assert!(matches!(result, Err(AppError::ScanError(message)) if message=="source failed"));
         let result = merge_outcomes(
@@ -131,8 +150,31 @@ mod outcome_tests {
                 "database failed".into(),
             ))),
             Err(AppError::ObservationScanCancelled),
+            None,
         );
         assert!(matches!(result, Err(AppError::DatabaseError(_))));
+    }
+    #[test]
+    fn final_storage_failure_is_not_relabelled_by_query_cancellation() {
+        use data_mover::model::{BackendKind, Operation, StoragePath};
+        use storage_adapter::RemoteScanFailureKind;
+        let failure = RemoteScanFailure {
+            backend: BackendKind::Cifs,
+            operation: Operation::Traverse,
+            path: StoragePath::root(),
+            kind: RemoteScanFailureKind::ConnectionLost,
+            operation_timeout: Duration::from_secs(30),
+            source: None,
+        };
+        let result = merge_outcomes(
+            Err(AppError::ObservationScanCancelled),
+            Err(AppError::ConsumerError("writer stopped".into())),
+            Some(failure),
+        );
+        assert!(
+            matches!(result, Err(AppError::StorageError(StorageError::RemoteScan(failure)))
+            if failure.kind == RemoteScanFailureKind::ConnectionLost)
+        );
     }
 }
 
@@ -240,7 +282,11 @@ async fn produce_items(
                 }
                 ResumableScanItem::Checkpoint(checkpoint) => {
                     deliver(&forwarder, &mut pending).await?;
+                    let before = source.prefetched_batches();
+                    let started = Instant::now();
                     forwarder.barrier().await?;
+                    info!(barrier_ms=started.elapsed().as_millis(),prefetched_batches_before=?before,
+                        prefetched_batches_after=?source.prefetched_batches(),"Scan checkpoint consumer barrier finished");
                     state.statistics = statistics.statistics_checkpoint().await?;
                     state.checkpoint = checkpoint;
                     state.observed_entries = observed;

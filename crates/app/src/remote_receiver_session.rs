@@ -278,6 +278,11 @@ impl RemoteSessionState {
         }
     }
 
+    /// 枚举失败时放弃待回写的目录元数据，避免将不完整任务视为完成。
+    pub(crate) fn discard_directory_metadata(&mut self) {
+        self.created_dirs.clear();
+    }
+
     /// 在所有文件 durable outcome 完成后恢复目录 metadata。
     pub(crate) async fn finalize_directories(&self, dest: &StorageEnum) {
         for entry in &self.created_dirs {

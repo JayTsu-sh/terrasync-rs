@@ -1,3 +1,4 @@
+use crate::domain::storage_failure::StorageFailureDetail;
 use async_trait::async_trait;
 use sqlx::SqlitePool;
 
@@ -27,7 +28,7 @@ impl TaskRepository for SqliteTaskRepo {
         let finished_at = task.finished_at.map(|t| t.to_rfc3339());
 
         sqlx::query(
-            "INSERT INTO migration_tasks (id, name, task_type, source_endpoint_id, source_path_id, dest_endpoint_id, dest_path_id, config_json, status, created_at, started_at, finished_at, error_message) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO migration_tasks (id, name, task_type, source_endpoint_id, source_path_id, dest_endpoint_id, dest_path_id, config_json, status, created_at, started_at, finished_at, error_message, storage_error_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&task.id)
         .bind(&task.name)
@@ -42,6 +43,7 @@ impl TaskRepository for SqliteTaskRepo {
         .bind(&started_at)
         .bind(&finished_at)
         .bind(&task.error_message)
+        .bind(task.storage_error.as_ref().map(serde_json::to_string).transpose()?)
         .execute(&self.pool)
         .await
         .map_err(|e| map_unique_violation(e, "Task", &task.name))?;
@@ -51,7 +53,7 @@ impl TaskRepository for SqliteTaskRepo {
 
     async fn find_by_id(&self, id: &str) -> Result<Option<MigrationTask>> {
         let row = sqlx::query_as::<_, TaskRow>(
-            "SELECT id, name, task_type, source_endpoint_id, source_path_id, dest_endpoint_id, dest_path_id, config_json, status, created_at, started_at, finished_at, error_message FROM migration_tasks WHERE id = ?",
+            "SELECT id, name, task_type, source_endpoint_id, source_path_id, dest_endpoint_id, dest_path_id, config_json, status, created_at, started_at, finished_at, error_message, storage_error_json FROM migration_tasks WHERE id = ?",
         )
         .bind(id)
         .fetch_optional(&self.pool)
@@ -62,7 +64,7 @@ impl TaskRepository for SqliteTaskRepo {
 
     async fn find_by_endpoint_id(&self, endpoint_id: &str) -> Result<Vec<MigrationTask>> {
         let rows = sqlx::query_as::<_, TaskRow>(
-            "SELECT id, name, task_type, source_endpoint_id, source_path_id, dest_endpoint_id, dest_path_id, config_json, status, created_at, started_at, finished_at, error_message FROM migration_tasks WHERE source_endpoint_id = ? OR dest_endpoint_id = ?",
+            "SELECT id, name, task_type, source_endpoint_id, source_path_id, dest_endpoint_id, dest_path_id, config_json, status, created_at, started_at, finished_at, error_message, storage_error_json FROM migration_tasks WHERE source_endpoint_id = ? OR dest_endpoint_id = ?",
         )
         .bind(endpoint_id)
         .bind(endpoint_id)
@@ -73,7 +75,7 @@ impl TaskRepository for SqliteTaskRepo {
     }
 
     async fn find_all(&self, filter: &TaskFilter) -> Result<Vec<MigrationTask>> {
-        let base = "SELECT id, name, task_type, source_endpoint_id, source_path_id, dest_endpoint_id, dest_path_id, config_json, status, created_at, started_at, finished_at, error_message FROM migration_tasks";
+        let base = "SELECT id, name, task_type, source_endpoint_id, source_path_id, dest_endpoint_id, dest_path_id, config_json, status, created_at, started_at, finished_at, error_message, storage_error_json FROM migration_tasks";
 
         let (sql, status_val, task_type_val) = match (&filter.status, &filter.task_type) {
             (Some(s), Some(t)) => (
@@ -126,7 +128,9 @@ impl TaskRepository for SqliteTaskRepo {
         Ok(())
     }
 
-    async fn update_status(&self, id: &str, status: TaskStatus, error_msg: Option<&str>) -> Result<()> {
+    async fn update_status(
+        &self, id: &str, status: TaskStatus, error_msg: Option<&str>, storage_error: Option<&StorageFailureDetail>,
+    ) -> Result<()> {
         let status_str = status.to_string();
         let now = chrono::Utc::now().to_rfc3339();
 
@@ -137,10 +141,13 @@ impl TaskRepository for SqliteTaskRepo {
         };
 
         let sql = format!(
-            "UPDATE migration_tasks SET status = ?, error_message = ?{started_at_clause}{finished_at_clause} WHERE id = ?"
+            "UPDATE migration_tasks SET status = ?, error_message = ?, storage_error_json = ?{started_at_clause}{finished_at_clause} WHERE id = ?"
         );
 
-        let mut query = sqlx::query(&sql).bind(&status_str).bind(error_msg);
+        let mut query = sqlx::query(&sql)
+            .bind(&status_str)
+            .bind(error_msg)
+            .bind(storage_error.map(serde_json::to_string).transpose()?);
 
         match status {
             TaskStatus::Running | TaskStatus::Completed | TaskStatus::Failed | TaskStatus::Cancelled => {
@@ -185,6 +192,7 @@ struct TaskRow {
     started_at: Option<String>,
     finished_at: Option<String>,
     error_message: Option<String>,
+    storage_error_json: Option<String>,
 }
 
 impl TryFrom<TaskRow> for MigrationTask {
@@ -213,6 +221,11 @@ impl TryFrom<TaskRow> for MigrationTask {
             started_at,
             finished_at,
             error_message: row.error_message,
+            storage_error: row
+                .storage_error_json
+                .as_deref()
+                .map(serde_json::from_str)
+                .transpose()?,
         })
     }
 }

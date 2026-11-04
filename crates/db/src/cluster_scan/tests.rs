@@ -9,7 +9,7 @@ use data_mover::model::{
 };
 use std::sync::atomic::AtomicUsize;
 use storage_adapter::ChangeKind;
-use storage_adapter::observed_scan::ObservedScanEvent;
+use storage_adapter::observed_scan::{ObservedItem, ObservedScanEvent};
 use tokio::{sync::Barrier, task::JoinSet};
 use tokio_util::sync::CancellationToken;
 
@@ -111,6 +111,8 @@ async fn fixture() -> Result<(ClickHouseConfig, Client, DatabaseGuard, String, i
     .map_err(|e| DatabaseError::ConfigError(e.to_string()))?;
     let name = format!("ts_cluster_scan_{epoch}");
     let config = ClickHouseConfig {
+        mode: Default::default(),
+        cluster: None,
         dsn: std::env::var("LAB_CLICKHOUSE_DSN").unwrap_or_else(|_| "http://127.0.0.1:8123".into()),
         database: name.clone(),
         username: std::env::var("LAB_CLICKHOUSE_USER").unwrap_or_else(|_| "default".into()),
@@ -427,6 +429,111 @@ fn native_entry(path: &str, size: u64, stable: Option<&[u8]>) -> Result<Arc<Obse
 
 #[tokio::test]
 #[ignore = "requires a real multi-shard ClickHouse cluster"]
+async fn cluster_native_candidate_cache_rechecks_content_state_and_tombstones() -> Result<()> {
+    let (config, _admin, _guard, cluster, epoch) = fixture().await?;
+    let store = ClusterScanStore::new(&config, &cluster, "candidate_cache")?;
+    store.load_resume_state().await?;
+    store.save_resume_state(&state(epoch, true, 1)).await?;
+    let added = native_entry("added", 17, Some(b"cache-id"))?;
+    let candidate = |entry: Arc<ObservedEntry>| {
+        ObservedScanEvent::Candidate(ObservedItem {
+            entry,
+            version_index: None,
+        })
+    };
+    let candidates = [candidate(added.clone())];
+    store.events_native(&candidates, epoch).await?;
+    store.write_native_candidates(&[added], false, &candidates).await?;
+    let hash = store
+        .client
+        .query("SELECT metadata_hash FROM base FINAL WHERE job_id='candidate_cache' AND relative_path='added'")
+        .fetch_one::<Option<String>>()
+        .await?;
+    assert!(hash.is_some_and(|digest| digest.len() == 64));
+    let events = store.resolve_final_events_native(epoch).await?;
+    assert!(matches!(events.as_slice(), [ScanFinalEvent::Added(row)] if row.size==17 && row.current_state==1));
+
+    // 同一轮再次观察到不同内容，缓存必须让位于当前基线。
+    store
+        .write_native_candidates(&[native_entry("added", 99, Some(b"cache-id"))?], false, &candidates)
+        .await?;
+    let events = store.resolve_final_events_native(epoch).await?;
+    assert!(matches!(events.as_slice(), [ScanFinalEvent::Added(row)] if row.size==99));
+    store
+        .write_native(&[native_entry("added", 99, Some(b"cache-id"))?], false)
+        .await?;
+    let hash = store
+        .client
+        .query("SELECT metadata_hash FROM base FINAL WHERE job_id='candidate_cache' AND relative_path='added'")
+        .fetch_one::<Option<String>>()
+        .await?;
+    assert!(hash.is_none(), "非候选原生写入必须清空旧摘要");
+    let events = store.resolve_final_events_native(epoch).await?;
+    assert!(matches!(events.as_slice(), [ScanFinalEvent::Added(row)] if row.size==99));
+    store.write_resume_base_records(&[entry("added", 123, None)]).await?;
+    let hash = store
+        .client
+        .query("SELECT metadata_hash FROM base FINAL WHERE job_id='candidate_cache' AND relative_path='added'")
+        .fetch_one::<Option<String>>()
+        .await?;
+    assert!(hash.is_none(), "普通写入必须清空缓存摘要");
+    let events = store.resolve_final_events_native(epoch).await?;
+    assert!(matches!(events.as_slice(), [ScanFinalEvent::Added(row)] if row.size==123));
+
+    store.cleanup_candidates(epoch).await?;
+    let doomed = native_entry("doomed", 7, Some(b"doomed-id"))?;
+    let candidates = [candidate(doomed.clone())];
+    store.events_native(&candidates, epoch).await?;
+    store.write_native_candidates(&[doomed], false, &candidates).await?;
+    let columns = &*FILE_SCAN_COLUMNS_LIST;
+    store.client.query(&format!("INSERT INTO base (job_id,epoch,ver,is_deleted,{columns}) SELECT job_id,epoch,fromUnixTimestamp64Nano(?),1,{columns} FROM base FINAL WHERE job_id='candidate_cache' AND relative_path='doomed'"))
+        .bind(epoch+1).execute_scan().await?;
+    let live: u64 = store
+        .client
+        .query("SELECT count() FROM base FINAL WHERE job_id='candidate_cache' AND relative_path='doomed'")
+        .fetch_quorum_one()
+        .await?;
+    assert_eq!(live, 0, "测试墓碑必须覆盖基线行");
+    assert!(
+        store.resolve_final_events_native(epoch).await?.is_empty(),
+        "缓存不能复活最新墓碑隐藏的旧行"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires a real multi-shard ClickHouse cluster"]
+async fn cluster_native_candidate_cache_upgrades_local_and_distributed_columns() -> Result<()> {
+    let (config, _admin, _guard, cluster, _) = fixture().await?;
+    let store = ClusterScanStore::new(&config, &cluster, "cache_schema")?;
+    store.load_resume_state().await?;
+    let database = identifier(&config.database)?;
+    let cluster = identifier(&cluster)?;
+    let tables = ["base", "base_local", "scan_resume_batch", "scan_resume_batch_local"];
+    for table in tables {
+        store
+            .client
+            .query(&format!(
+                "ALTER TABLE {database}.{table} ON CLUSTER {cluster} DROP COLUMN metadata_hash"
+            ))
+            .execute_scan()
+            .await?;
+    }
+    store.prepare_native_schema().await?;
+    let columns:u64 = store.client.query("SELECT count() FROM clusterAllReplicas(?,system.columns) WHERE database=? AND table IN ? AND name='metadata_hash'")
+        .bind(&store.cluster).bind(&config.database).bind(tables).fetch_one().await?;
+    let nodes: u64 = store
+        .client
+        .query("SELECT count() FROM clusterAllReplicas(?,system.one)")
+        .bind(&store.cluster)
+        .fetch_one()
+        .await?;
+    assert_eq!(columns, nodes * 4);
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires a real multi-shard ClickHouse cluster"]
 async fn cluster_native_key_stage_replays_events_before_direct_base_write() -> Result<()> {
     let (config, _admin, _guard, cluster, epoch) = fixture().await?;
     let mut store = ClusterScanStore::new(&config, &cluster, "native_keys")?;
@@ -566,7 +673,7 @@ async fn cluster_native_parallel_unchanged_batches_never_create_candidates() -> 
 #[ignore = "requires a real multi-shard ClickHouse cluster"]
 async fn cluster_native_parallel_batches_preserve_reused_paths_and_hardlinks() -> Result<()> {
     let (config, _admin, _guard, cluster, epoch) = fixture().await?;
-    let mut store = ClusterScanStore::new(&config, &cluster, "parallel_native")?;
+    let store = ClusterScanStore::new(&config, &cluster, "parallel_native")?;
     store.load_resume_state().await?;
     let mut full = state(epoch, false, 1);
     store.save_resume_state(&full).await?;
@@ -606,8 +713,16 @@ async fn cluster_native_parallel_batches_preserve_reused_paths_and_hardlinks() -
     first_result?;
     second_result?;
     assert_ne!(a.batch_id, b.batch_id);
+    let before_finalize = store.resume_statistics(incremental.generation, None).await?;
     let events = store.resolve_final_events_native(incremental.event_time).await?;
-    assert_eq!(events.len(), 4);
+    assert_eq!(events.len(), 6);
+    for path in ["reuse", "added"] {
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event,ScanFinalEvent::Added(row) if row.relative_path==path))
+        );
+    }
     assert!(events.iter().any(|event|matches!(event,ScanFinalEvent::Renamed{from_path,to,..} if from_path=="reuse" && to.relative_path=="rescued")));
     assert!(events.iter().any(|event|matches!(event,ScanFinalEvent::Renamed{from_path,to,..} if from_path=="rename_old" && to.relative_path=="rename_new")));
     assert!(
@@ -623,6 +738,17 @@ async fn cluster_native_parallel_batches_preserve_reused_paths_and_hardlinks() -
     store.write_final_events_native(&events, incremental.event_time).await?;
     let keys: Vec<_> = events.iter().filter_map(ScanFinalEvent::deletion_key).collect();
     store.delete_resume_entries(&keys).await?;
+    let after_finalize = store
+        .resume_statistics(incremental.generation, Some(incremental.event_time))
+        .await?;
+    assert_eq!(before_finalize.summary, after_finalize.summary);
+    assert_eq!(before_finalize.extensions, after_finalize.extensions);
+    assert_eq!(before_finalize.ages, after_finalize.ages);
+    assert_eq!(before_finalize.sizes, after_finalize.sizes);
+    assert_eq!(
+        store.resume_event_statistics(incremental.event_time).await?,
+        after_finalize.events
+    );
     let rows = store.client.query("SELECT relative_path,entry_snapshot,identity_key FROM base FINAL WHERE job_id='parallel_native' AND is_deleted=0").fetch_all::<NativeSnapshotRow>().await?;
     assert_eq!(rows.len(), first.len() + second.len());
     for row in rows {
@@ -861,7 +987,11 @@ async fn cluster_shared_native_large_identity_lookup_keeps_sql_bounded() -> Resu
     store.client = store.client.clone().with_option("max_query_size", "50000");
     let events = store.compare_native(&entries).await?;
     assert_eq!(events.len(), 1_000);
-    assert!(events.iter().all(|event| matches!(event, ObservedScanEvent::New(_))));
+    assert!(
+        events
+            .iter()
+            .all(|event| matches!(event, ObservedScanEvent::Candidate(_)))
+    );
     store.begin_resume_batch().await?;
     let renamed = (0..1_000)
         .map(|n| native_entry(&format!("renamed/{n:04}"), 1, Some(format!("identity-{n}").as_bytes())))
@@ -928,19 +1058,25 @@ async fn cluster_shared_native_rename_keeps_recreated_source_path() -> Result<()
             .iter()
             .filter(|event| matches!(event, ObservedScanEvent::New(_)))
             .count(),
-        1
+        0
     );
     assert_eq!(
         events
             .iter()
             .filter(|event| matches!(event, ObservedScanEvent::Candidate(_)))
             .count(),
-        1
+        2
     );
     // 原路径已被新身份覆盖；旧事实必须仍可从已确认日志恢复。
     let final_events = store.resolve_final_events_native(round).await?;
+    assert!(final_events.iter().any(
+        |event| matches!(event,ScanFinalEvent::Renamed{from_path,to,..} if from_path=="a" && to.relative_path=="b")
+    ));
+    assert_eq!(final_events.len(), 2);
     assert!(
-        matches!(final_events.as_slice(),[ScanFinalEvent::Renamed{from_path,to,..}] if from_path=="a" && to.relative_path=="b")
+        final_events
+            .iter()
+            .any(|event| matches!(event,ScanFinalEvent::Added(item) if item.relative_path=="a"))
     );
     store.write_final_events_native(&final_events, round).await?;
     let keys: Vec<_> = final_events.iter().filter_map(ScanFinalEvent::deletion_key).collect();
@@ -1128,5 +1264,86 @@ async fn cluster_native_path_scoped_unchanged_batches_never_create_events() -> R
         worker??;
     }
     store.cleanup_resume_batch().await?;
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires a real multi-shard ClickHouse cluster"]
+async fn cluster_native_key_prefilter_never_revives_a_tombstoned_identity() -> Result<()> {
+    let (config, _admin, _guard, cluster, epoch) = fixture().await?;
+    let mut store = ClusterScanStore::new(&config, &cluster, "native_tombstone")?;
+    store.load_resume_state().await?;
+    store.save_resume_state(&state(epoch, false, 1)).await?;
+    store
+        .write_native(&[native_entry("reused", 17, Some(b"old-object"))?], false)
+        .await?;
+    let removed_round = epoch + 10;
+    store.save_resume_state(&state(removed_round, true, 0)).await?;
+    let deleted = store.resolve_final_events_native(removed_round).await?;
+    assert!(matches!(deleted.as_slice(),[ScanFinalEvent::Deleted(item)] if item.relative_path=="reused"));
+    store.write_final_events_native(&deleted, removed_round).await?;
+    let keys: Vec<_> = deleted.iter().filter_map(ScanFinalEvent::deletion_key).collect();
+    store.delete_resume_entries(&keys).await?;
+
+    let round = epoch + 20;
+    store.save_resume_state(&state(round, true, 1)).await?;
+    store.begin_resume_batch().await?;
+    let current = vec![native_entry("reused", 29, Some(b"new-object"))?];
+    store.write_native_keys(&current).await?;
+    let events = store.compare_native(&current).await?;
+    assert!(matches!(events.as_slice(), [ObservedScanEvent::Candidate(_)]));
+    store.events_native(&events, round).await?;
+    store.write_native(&current, false).await?;
+    let final_events = store.resolve_final_events_native(round).await?;
+    assert!(
+        matches!(final_events.as_slice(),[ScanFinalEvent::Added(item)] if item.relative_path=="reused" && item.size==29),
+        "the superseded live row behind a tombstone must not create another deletion"
+    );
+    let rows = store
+        .client
+        .query("SELECT relative_path,size FROM base FINAL WHERE job_id='native_tombstone' AND is_deleted=0")
+        .fetch_all::<(String, u64)>()
+        .await?;
+    assert_eq!(rows, vec![("reused".into(), 29)]);
+    store.cleanup_resume_batch().await?;
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires a real multi-shard ClickHouse cluster"]
+async fn cluster_native_partial_candidate_cleanup_does_not_invent_a_deleted_rename_source() -> Result<()> {
+    let (config, _admin, _guard, cluster, epoch) = fixture().await?;
+    let mut store = ClusterScanStore::new(&config, &cluster, "partial_cleanup")?;
+    store.load_resume_state().await?;
+    store.save_resume_state(&state(epoch, false, 1)).await?;
+    store
+        .write_native(&[native_entry("a", 1, Some(b"original"))?], false)
+        .await?;
+    let round = epoch + 10;
+    store.save_resume_state(&state(round, true, 0)).await?;
+    store.begin_resume_batch().await?;
+    let current = vec![
+        native_entry("a", 2, Some(b"replacement"))?,
+        native_entry("b", 1, Some(b"original"))?,
+    ];
+    store.write_native_keys(&current).await?;
+    let events = store.compare_native(&current).await?;
+    store.events_native(&events, round).await?;
+    store.write_native(&current, false).await?;
+    let final_events = store.resolve_final_events_native(round).await?;
+    assert_eq!(final_events.len(), 2);
+    store.write_final_events_native(&final_events, round).await?;
+    let keys: Vec<_> = final_events.iter().filter_map(ScanFinalEvent::deletion_key).collect();
+    store.delete_resume_entries(&keys).await?;
+    // 模拟清理候选的部分 mutation 已完成，旧身份事实所在 part 尚未清理就中断。
+    store.client.clone().with_option("mutations_sync","2").query(&format!("ALTER TABLE {}.incremental_local ON CLUSTER {} DELETE WHERE job_id='partial_cleanup' AND epoch=? AND operation_type='candidate_new'",identifier(&store.database)?,identifier(&store.cluster)?)).bind(round as u64).execute().await?;
+    let replay = store.resolve_final_events_native(round).await?;
+    assert!(
+        replay.is_empty(),
+        "a recorded rename cannot become a new deletion when only displaced facts survive cleanup"
+    );
+    let rows=store.client.query("SELECT relative_path,size FROM base FINAL WHERE job_id='partial_cleanup' AND is_deleted=0 ORDER BY relative_path").fetch_all::<(String,u64)>().await?;
+    assert_eq!(rows, vec![("a".into(), 2), ("b".into(), 1)]);
+    store.cleanup_candidates(round).await?;
     Ok(())
 }

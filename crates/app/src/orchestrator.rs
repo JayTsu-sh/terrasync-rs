@@ -39,7 +39,7 @@ use storage_adapter::storage_enum::{StorageType, detect_storage_type};
 use storage_adapter::{ChangeKind, EntryEnum, ErrorEvent, StorageEntryMessage, StorageEnum};
 use tokio::sync::{Semaphore, mpsc};
 use tokio::task::{JoinHandle, JoinSet};
-use tracing::{Instrument, debug, error, info, info_span, trace, warn};
+use tracing::{Instrument, error, info, info_span, trace, warn};
 use transport::in_process::create_in_process_pair;
 use transport::message::SenderMsg;
 use transport::traits::{ReceiverTransport, SenderTransport};
@@ -50,11 +50,12 @@ use crate::broadcast::{BroadcastForwarder, DEFAULT_CHANNEL_CAPACITY};
 use crate::config::{JobType, SyncJobConfig, initialize_consumer_config, initialize_scan_config};
 use crate::consumer::ConsumerManager;
 use crate::consumer::stats::DirectoryMetadataProgressBar;
+use crate::copy_execution::{CopyLease, begin_copy_catalogue};
 use crate::error::{AppError, Result};
 #[cfg(feature = "license")]
 use crate::integrity_check::verify_storage_time;
 use crate::receiver::{ReceiverConfig, process_entry_on_receiver};
-use crate::scan::{ScanType, batch_processing_to_generate_message, determine_scan_type};
+use crate::scan::ScanType;
 use crate::sender::{SenderWorkerConfig, sender_worker};
 use crate::storage_factory::{StorageRole, create_storage_for_role};
 #[cfg(windows)]
@@ -63,6 +64,7 @@ use crate::sync::{
     CommitRecorder, ResumeOpts, StoragePair, parse_size, process_entry, process_metadata_only_entry,
     process_rename_entry, process_versioned_entry,
 };
+use crate::sync_catalog::{batch_processing_to_generate_message, determine_sync_type, finish_phase};
 use crate::{dir_walker, tar_pack};
 
 /// 大文件日志阈值（512 MiB）
@@ -270,7 +272,11 @@ impl SyncOrchestrator {
         } else {
             None
         };
-        let scan_type = determine_scan_type(db_instance.as_deref(), &c.job_id, c.job_dir_pre_existing).await;
+        let scan_type = if !app_config.database.enabled || !app_config.sync.is_source_reserved {
+            ScanType::Full
+        } else {
+            determine_sync_type(db_instance.as_deref(), &c.job_id, c.job_dir_pre_existing).await
+        };
 
         info!("SyncOrchestrator: determined scan_type={}", scan_type);
 
@@ -315,8 +321,14 @@ impl SyncOrchestrator {
 
         // ── 1. 加载配置 ──
         let app_config = AppConfig::fetch()?;
+        let _lease = CopyLease::acquire(&app_config.database.clickhouse, c)?;
         let is_source_reserved = app_config.sync.is_source_reserved;
         let copy_concurrency = c.concurrency.unwrap_or(app_config.sync.concurrency);
+
+        let block_size = match &c.block_size {
+            Some(s) => Some(parse_size(s)?),
+            None => None,
+        };
 
         // ── 2. 初始化扫描配置 ──
         let scan_config = initialize_scan_config(
@@ -343,9 +355,17 @@ impl SyncOrchestrator {
             c.progress_callback_url.clone(),
         )?);
 
-        let database = DatabaseFactory::new_database(&consumer_config.db_config, &c.job_id)
-            .await
-            .map_err(AppError::DatabaseError)?;
+        let database = if consumer_config.db_config.enabled {
+            let database = DatabaseFactory::new_database(&consumer_config.db_config, &c.job_id).await?;
+            database.initialize().await?;
+            begin_copy_catalogue(database.as_ref(), c, block_size, is_source_reserved).await?;
+            Some(database)
+        } else {
+            None
+        };
+
+        // 先建立枚举，再启动后台消费者；连接失败时没有待收尾的 worker。
+        let walkdir_iter = dir_walker::walkdir(scan_config).await?;
 
         // ── 4. 广播器 + 消费者 ──
         let mut broadcaster = BroadcastForwarder::new(DEFAULT_CHANNEL_CAPACITY);
@@ -355,10 +375,6 @@ impl SyncOrchestrator {
         let bytes_tracker = consumer_manager.get_bytes_tracker().await;
 
         // ── 5. 解析 block_size + QoS ──
-        let block_size = match &c.block_size {
-            Some(s) => Some(parse_size(s)?),
-            None => None,
-        };
 
         // Windows 管理员权限检查
         #[cfg(windows)]
@@ -395,11 +411,6 @@ impl SyncOrchestrator {
             copy_concurrency,
             mount_completed.clone(),
         );
-
-        // ── 7. 启动 walkdir ──
-        let walkdir_iter = dir_walker::walkdir(scan_config)
-            .await
-            .map_err(|e| AppError::ScanError(format!("Start directory walker failed: {e}")))?;
 
         // ── 8. 创建 Transport ──
         let (sender_transport, receiver_transport) = create_in_process_pair();
@@ -460,7 +471,7 @@ impl SyncOrchestrator {
                                 recv_id, e
                             );
                             done_counter.fetch_add(1, Ordering::Release);
-                            return;
+                            return Err(e);
                         }
                     };
                     alive_counter.fetch_add(1, Ordering::Relaxed);
@@ -469,6 +480,7 @@ impl SyncOrchestrator {
                     let dest = storage_pair.get_dest_storage().clone();
 
                     // 从 transport 拉消息处理（MPMC，N 个 worker 竞争消费）
+                    let mut failure = None;
                     while let Some(msg) = rt.recv().await {
                         match msg {
                             SenderMsg::CopyEntry { entry } => {
@@ -493,6 +505,7 @@ impl SyncOrchestrator {
                                             reason: format!("{e}"),
                                         })
                                         .await;
+                                        failure.get_or_insert(e);
                                     }
                                 }
                             }
@@ -513,11 +526,18 @@ impl SyncOrchestrator {
                     }
                     // recv() 返回 None 时自然退出（sender_transport 被 drop 后 channel 关闭）
                     info!("Receiver {}: Completed", recv_id);
+                    match failure {
+                        Some(error) => Err(error),
+                        None => Ok(()),
+                    }
                 }
                 .instrument(span),
             );
             receiver_handles.push(handle);
         }
+
+        // 只有实际 worker 持有接收端；全部挂载失败时生产端能收到关闭错误。
+        drop(receiver_transport);
 
         // ── 10. 启动 N 个 Sender worker（S1） ──
         let sender_config = Arc::new(SenderWorkerConfig {
@@ -567,14 +587,14 @@ impl SyncOrchestrator {
                                 worker_id, e
                             );
                             done_counter.fetch_add(1, Ordering::Release);
-                            return;
+                            return Err(e);
                         }
                     };
                     alive_counter.fetch_add(1, Ordering::Relaxed);
                     done_counter.fetch_add(1, Ordering::Release);
                     let src = storage_pair.get_src_storage().clone();
                     let dest = storage_pair.get_dest_storage().clone();
-                    sender_worker(worker_id, wi, src, dest, transport, &bc, &cfg, qos, bt, ob, aec, ec, sc).await;
+                    sender_worker(worker_id, wi, src, dest, transport, &bc, &cfg, qos, bt, ob, aec, ec, sc).await
                 }
                 .instrument(span),
             );
@@ -594,11 +614,8 @@ impl SyncOrchestrator {
         mount_completed.store(true, Ordering::Release);
 
         // ── 11. 等待 Sender workers 完成 ──
-        for handle in sender_handles {
-            if let Err(e) = handle.await {
-                error!("Sender worker task failed: {:?}", e);
-            }
-        }
+        let senders_result = finish_phase(sender_handles).await;
+        walkdir_iter.close();
 
         // ── 12. 关闭管线（和原始 sync_inner 一致） ──
         // Sender workers 全部完成 → 不再发 CopyEntry
@@ -606,22 +623,46 @@ impl SyncOrchestrator {
         drop(sender_transport);
 
         // 等所有 Receiver worker 退出（退出时 broadcaster clone 也 drop）
-        for handle in receiver_handles {
-            if let Err(e) = handle.await {
-                error!("Receiver worker panicked: {:?}", e);
-            }
-        }
+        let receivers_result = finish_phase(receiver_handles).await;
 
         // ── 13. Cleanup ──
         stats_handle.abort();
+        let _ = stats_handle.await;
 
         if let Some(ref qos_mgr) = qos_manager {
             qos_mgr.shutdown();
         }
 
         drop(broadcaster);
-        Self::await_consumers(consumer_handles).await;
+        let consumers_result = finish_phase(consumer_handles).await;
+        let source_result = walkdir_iter.take_error().map_or(Ok(()), |error| Err(error.into()));
+        let history_result = if object_buffers.is_empty() {
+            Ok(())
+        } else {
+            Err(AppError::CopyError(
+                "Incomplete object history; copy cannot commit".into(),
+            ))
+        };
+        let result = match source_result
+            .and(senders_result)
+            .and(receivers_result)
+            .and(consumers_result)
+            .and(history_result)
+        {
+            Ok(()) => {
+                if let Some(database) = &database {
+                    database.commit_scan_generation().await.map_err(AppError::from)
+                } else {
+                    Ok(())
+                }
+            }
+            Err(error) => Err(error),
+        };
+        if let Err(error) = &result {
+            consumer_manager.record_task_failures(&[error.to_string()]).await;
+        }
         consumer_manager.end_lifecycle().await;
+        result?;
 
         // ── 14. 更新目录元数据（非 S3 目标端） ──
         let dest_storage_for_metadata = Arc::new(
@@ -633,7 +674,9 @@ impl SyncOrchestrator {
             )
             .await?,
         );
-        if !matches!(dest_storage_for_metadata.as_ref(), StorageEnum::S3(_)) {
+        if !matches!(dest_storage_for_metadata.as_ref(), StorageEnum::S3(_))
+            && let Some(database) = database
+        {
             Self::update_directory_metadata(database, &dest_storage_for_metadata).await;
         }
 
@@ -667,8 +710,14 @@ impl SyncOrchestrator {
 
         // ── 1. 加载配置 ──
         let app_config = AppConfig::fetch()?;
+        let _lease = CopyLease::acquire(&app_config.database.clickhouse, c)?;
         let is_source_reserved = app_config.sync.is_source_reserved;
         let copy_concurrency = c.concurrency.unwrap_or(app_config.sync.concurrency);
+
+        let block_size = match &c.block_size {
+            Some(s) => Some(parse_size(s)?),
+            None => None,
+        };
 
         // ── 2. 初始化扫描配置（增量不支持 file_list） ──
         let scan_config = initialize_scan_config(
@@ -703,7 +752,12 @@ impl SyncOrchestrator {
             return Err(AppError::DatabaseError(e));
         }
 
+        begin_copy_catalogue(database.as_ref(), c, block_size, is_source_reserved).await?;
+
         let batch_size = consumer_config.db_config.batch_size as usize;
+
+        // 枚举初始化失败时尚未启动 Phase A 的后台任务。
+        let walkdir_iter = dir_walker::walkdir(scan_config).await?;
 
         // ── 4. 消费者管理器 + 共享生命周期（跨 Phase A/B 共用同一份统计累积） ──
         let mut consumer_manager = ConsumerManager::new(consumer_config.as_ref()).await?;
@@ -722,11 +776,6 @@ impl SyncOrchestrator {
 
         // ── 6. 并发度 + block_size ──
         let incremental_scan_concurrency = c.concurrency.unwrap_or(app_config.scan.concurrency);
-
-        let block_size = match &c.block_size {
-            Some(s) => Some(parse_size(s)?),
-            None => None,
-        };
 
         info!(
             "Using scan concurrency: {}, copy concurrency: {}, block_size: {:?}",
@@ -754,23 +803,19 @@ impl SyncOrchestrator {
         let qos_manager = create_qos_manager(c.qos.as_ref(), c.peak_qos_rate, c.iops);
         let object_buffers: Arc<DashMap<String, Vec<Arc<EntryEnum>>>> = Arc::new(DashMap::new());
 
-        // ── 9. 切换数据库扫描状态 ──
-        let db_clone = database.clone();
-        if let Err(e) = db_clone.switch_scan_state().await {
-            error!("Failed to switch scan state: {}", e);
-            return Err(AppError::DatabaseError(e));
-        }
-
         // ── 10. 启动 dispatch task：detect_broadcaster → async_channel（MPMC） ──
         let dispatch_span = info_span!("inc_dispatch");
-        let dispatch_handle: JoinHandle<()> = tokio::spawn(
+        let dispatch_handle: JoinHandle<Result<()>> = tokio::spawn(
             async move {
                 while let Some(msg) = file_op_rx.recv().await {
                     if work_tx.send(msg).await.is_err() {
-                        break; // 所有 handler worker 已退出
+                        return Err(AppError::ConsumerError(
+                            "Incremental sync handler channel closed".into(),
+                        ));
                     }
                 }
                 info!("Dispatch task completed");
+                Ok(())
             }
             .instrument(dispatch_span),
         );
@@ -825,7 +870,7 @@ impl SyncOrchestrator {
                                 handler_id, e
                             );
                             done_counter.fetch_add(1, Ordering::Release);
-                            return;
+                            return Err(e);
                         }
                     };
                     alive_counter.fetch_add(1, Ordering::Relaxed);
@@ -833,11 +878,12 @@ impl SyncOrchestrator {
                     let src = storage_pair.get_src_storage().clone();
                     let dest = storage_pair.get_dest_storage().clone();
 
+                    let mut failure: Option<AppError> = None;
                     while let Ok(message) = rx.recv().await {
                         match message {
                             StorageEntryMessage::New(ref entry) => {
                                 if entry.get_version_id().is_some() {
-                                    process_versioned_entry(
+                                    if let Err(error) = process_versioned_entry(
                                         entry,
                                         src.clone(),
                                         dest.clone(),
@@ -850,7 +896,10 @@ impl SyncOrchestrator {
                                         bt.clone(),
                                         resume_opts.clone(),
                                     )
-                                    .await;
+                                    .await
+                                    {
+                                        failure.get_or_insert(error);
+                                    }
                                 } else {
                                     match process_entry(
                                         entry,
@@ -881,6 +930,7 @@ impl SyncOrchestrator {
                                                 reason: format!("{e}"),
                                             })
                                             .await;
+                                            failure.get_or_insert(e.into());
                                         }
                                     }
                                 }
@@ -929,6 +979,7 @@ impl SyncOrchestrator {
                                             reason: format!("{e}"),
                                         })
                                         .await;
+                                        failure.get_or_insert(e.into());
                                     }
                                 }
                             }
@@ -961,6 +1012,7 @@ impl SyncOrchestrator {
                                             reason: format!("{e}"),
                                         })
                                         .await;
+                                        failure.get_or_insert(e.into());
                                     }
                                 }
                             }
@@ -994,6 +1046,7 @@ impl SyncOrchestrator {
                                                 reason: format!("{e}"),
                                             })
                                             .await;
+                                            failure.get_or_insert(e.into());
                                         }
                                     }
                                 }
@@ -1034,6 +1087,7 @@ impl SyncOrchestrator {
                                             reason: format!("{e}"),
                                         })
                                         .await;
+                                        failure.get_or_insert(e.into());
                                     }
                                 }
                             }
@@ -1044,6 +1098,10 @@ impl SyncOrchestrator {
                     }
 
                     info!("Handler worker {} completed", handler_id);
+                    match failure {
+                        Some(error) => Err(error),
+                        None => Ok(()),
+                    }
                 }
                 .instrument(span),
             );
@@ -1054,11 +1112,6 @@ impl SyncOrchestrator {
 
         // ── 11.5. 等待所有 handler worker 完成 mount 初始化，输出存活汇总 ──
         wait_for_mount_init(&[(&mount_done_handlers, &alive_handlers, "Handler")], copy_concurrency).await;
-
-        // ── 12. 启动 walkdir ──
-        let walkdir_iter = dir_walker::walkdir(scan_config)
-            .await
-            .map_err(|e| AppError::ScanError(format!("Start directory walker failed: {e}")))?;
 
         // ── 13. 启动 N 个 scan worker（walkdir → batch → DB compare → detect_broadcaster） ──
         let database_clone = database.clone();
@@ -1093,17 +1146,14 @@ impl SyncOrchestrator {
                                     let batch = std::mem::take(&mut current_batch);
                                     let db = database_clone.clone();
 
-                                    if let Err(e) = batch_processing_to_generate_message(
+                                    batch_processing_to_generate_message(
                                         &db,
                                         &batch,
                                         detect_broadcaster.clone(),
                                         false,
                                         false,
                                     )
-                                    .await
-                                    {
-                                        error!("Failed to process batch: {}", e);
-                                    }
+                                    .await?;
                                 }
                             }
                             StorageEntryMessage::Error {
@@ -1126,14 +1176,11 @@ impl SyncOrchestrator {
                         let db = database_clone.clone();
                         let batch = current_batch;
 
-                        if let Err(e) =
-                            batch_processing_to_generate_message(&db, &batch, detect_broadcaster, true, false).await
-                        {
-                            error!("Scan worker {}: Failed to process final batch: {}", worker_id, e);
-                        }
+                        batch_processing_to_generate_message(&db, &batch, detect_broadcaster, true, false).await?;
                     }
 
                     info!("Scan worker {}: Completed processing", worker_id);
+                    Ok(())
                 }
                 .instrument(span),
             );
@@ -1142,28 +1189,20 @@ impl SyncOrchestrator {
         }
 
         // ── 14. 等待 scan workers 完成 ──
-        for handle in scan_worker_handles {
-            if let Err(e) = handle.await {
-                error!("Scan worker failed: {:?}", e);
-            }
-        }
+        let scan_result = finish_phase(scan_worker_handles).await;
+        walkdir_iter.close();
 
         // ── 15. 关闭 detect_broadcaster → dispatch task 的 file_op_rx 耗尽 ──
         // scan workers 已全部退出，其 detect_broadcaster clone 均已 drop；
         // 主 detect_broadcaster clone drop 触发 dispatch task EOF。
         drop(detect_broadcaster);
 
-        // ── 16. 等待 dispatch task 退出 ──
-        if let Err(e) = dispatch_handle.await {
-            error!("Dispatch task failed: {:?}", e);
-        }
-
-        // ── 17. 等待所有 handler workers 退出（Phase A：New/Changed 拷贝完成） ──
-        for handle in handler_handles {
-            if let Err(e) = handle.await {
-                error!("Handler worker failed: {:?}", e);
-            }
-        }
+        // ── 16. 等待 dispatch 与 handler 全部结束，再检查阶段结果 ──
+        let dispatch_result = match dispatch_handle.await {
+            Ok(result) => result,
+            Err(error) => Err(error.into()),
+        };
+        let handler_result = finish_phase(handler_handles).await;
         info!("All handler workers completed");
 
         // ── 18. 关闭 Phase A 广播器 → 等待 Phase A 消费者完成（同步屏障） ──
@@ -1171,7 +1210,30 @@ impl SyncOrchestrator {
         // 主 broadcaster clone drop → 消费者通道 EOF → DatabaseConsumer 刷入所有
         // Phase A 的 New/Changed 条目 → base 表完整，detect_deleted_items 才有完整依据。
         drop(broadcaster);
-        Self::await_consumers(consumer_handles).await;
+        let durable_result = finish_phase(consumer_handles).await;
+        let enumeration_result = walkdir_iter.take_error().map_or(Ok(()), |error| Err(error.into()));
+        // 未完整比对或未持久化的条目不能作为删除依据。
+        let history_result = if object_buffers.is_empty() {
+            Ok(())
+        } else {
+            Err(AppError::CopyError(
+                "Incomplete object history; refusing deletion phase".into(),
+            ))
+        };
+        let phase_a = enumeration_result
+            .and(scan_result)
+            .and(handler_result)
+            .and(durable_result)
+            .and(dispatch_result)
+            .and(history_result);
+        if let Err(error) = phase_a {
+            if let Some(ref qos_mgr) = qos_manager {
+                qos_mgr.shutdown();
+            }
+            consumer_manager.record_task_failures(&[error.to_string()]).await;
+            consumer_manager.end_lifecycle().await;
+            return Err(error);
+        }
         info!("Phase A complete; base table ready for delete/rename detection");
 
         // ── 19. Phase B：在 Phase A 屏障之后，起一轮新的 broadcaster + 同一组 consumer 任务 ──
@@ -1196,7 +1258,7 @@ impl SyncOrchestrator {
             );
 
             Self::apply_deletions_and_renames(
-                &*db_clone,
+                database.as_ref(),
                 src_storage_phase_b.clone(),
                 dest_storage_phase_b.clone(),
                 is_source_reserved,
@@ -1208,7 +1270,7 @@ impl SyncOrchestrator {
                 &c.job_dir,
                 c.transfer_mode,
             )
-            .await;
+            .await?;
 
             Ok(dest_storage_phase_b)
         }
@@ -1216,21 +1278,29 @@ impl SyncOrchestrator {
 
         // ── 21. 关闭 Phase B 广播器 → 等待 Phase B 消费者完成（incremental 表冲刷完毕） ──
         drop(broadcaster_b);
-        Self::await_consumers(phase_b_handles).await;
+        let phase_b_consumers = finish_phase(phase_b_handles).await;
 
         // QoS 在两阶段都走完之后才关闭，保留 Phase B 物理操作期间的限速效果
         if let Some(ref qos_mgr) = qos_manager {
             qos_mgr.shutdown();
         }
 
-        // stats spinner 必须先于目录元数据进度条收尾，避免两个 spinner 同行互相覆盖
+        let result = match phase_b_dest_storage.and_then(|dest| phase_b_consumers.map(|()| dest)) {
+            Ok(dest) => database
+                .commit_scan_generation()
+                .await
+                .map(|()| dest)
+                .map_err(AppError::from),
+            Err(error) => Err(error),
+        };
+        if let Err(error) = &result {
+            consumer_manager.record_task_failures(&[error.to_string()]).await;
+        }
+        // stats spinner 必须先于目录元数据进度条收尾。
         consumer_manager.end_lifecycle().await;
-
-        // ── 22. 更新目录元数据（非 S3 目标端） ──
-        let dest_storage_phase_b =
-            phase_b_dest_storage.inspect_err(|e| error!("Phase B failed — reported statistics may be partial: {e}"))?;
+        let dest_storage_phase_b = result?;
         if !matches!(dest_storage_phase_b.as_ref(), StorageEnum::S3(_)) {
-            Self::update_directory_metadata(database, &dest_storage_phase_b).await;
+            Self::update_directory_metadata(database.clone(), &dest_storage_phase_b).await;
         }
 
         info!(
@@ -1245,29 +1315,6 @@ impl SyncOrchestrator {
         &self, remote_addr: &str, tls_cert_bytes: Option<&[u8]>, auth_token: Option<&str>,
     ) -> Result<()> {
         crate::remote_sync::run(&self.config, remote_addr, tls_cert_bytes, auth_token).await
-    }
-
-    /// 等待所有消费者 task 完成并记录结果
-    async fn await_consumers(consumer_handles: Vec<JoinHandle<Result<()>>>) {
-        let mut all_successful = true;
-        for handle in consumer_handles {
-            match handle.await {
-                Ok(Ok(())) => debug!("Consumer task completed successfully"),
-                Ok(Err(e)) => {
-                    error!("Consumer task failed: {}", e);
-                    all_successful = false;
-                }
-                Err(e) => {
-                    error!("Consumer task panicked: {}", e);
-                    all_successful = false;
-                }
-            }
-        }
-        if all_successful {
-            info!("All consumer tasks completed successfully");
-        } else {
-            warn!("Some consumer tasks failed or panicked");
-        }
     }
 
     /// 启动统计 reporter task
@@ -1307,37 +1354,22 @@ impl SyncOrchestrator {
         )
     }
 
-    /// rename 成功后同步文件内容或元数据到目标端。
-    ///
-    /// 返回 `true` 表示同步成功，调用方可随后广播 `Changed` 消息。
+    /// rename 后的内容与元数据必须完成，才能确认该条目的新状态。
     #[allow(clippy::too_many_arguments)]
     async fn sync_renamed_file_changes(
         kind: ChangeKind, entry: &EntryEnum, src: &StorageEnum, dest: &StorageEnum, qos: Option<QosManager>,
         integrity: bool, source_reserved: bool, bytes: Option<Arc<AtomicU64>>, job_id: &str, job_dir: &str,
         transfer_mode: TransferMode,
-    ) -> bool {
+    ) -> Result<()> {
         let mut metadata_applied = false;
         if kind != ChangeKind::MetadataOnly {
-            // 内容变更：完整拷贝文件再设置元数据
             let hdfs = if matches!(dest, StorageEnum::HDFS(_)) {
-                match HdfsCopyContext::from_job(job_id, transfer_mode) {
-                    Ok(context) => Some(context),
-                    Err(error) => {
-                        warn!("Phase B: invalid HDFS recovery identity: {error}");
-                        return false;
-                    }
-                }
+                Some(HdfsCopyContext::from_job(job_id, transfer_mode)?)
             } else {
                 None
             };
             let recorder = if hdfs.is_some() && transfer_mode == TransferMode::Checkpoint {
-                match CommitRecorder::start(job_dir, entry, src.block_size()).await {
-                    Ok(recorder) => Some(recorder),
-                    Err(error) => {
-                        warn!("Phase B: cannot start HDFS progress recorder: {error}");
-                        return false;
-                    }
-                }
+                Some(CommitRecorder::start(job_dir, entry, src.block_size()).await?)
             } else {
                 None
             };
@@ -1346,12 +1378,12 @@ impl SyncOrchestrator {
                     context.with_commit_callback(recorder.callback())
                 })
             });
-            let copy_result = copy_file(
+            let result = copy_file(
                 src,
                 dest,
                 entry,
                 storage_adapter::CopyOptions {
-                    transfer_mode: transfer_mode,
+                    transfer_mode,
                     qos,
                     enable_integrity_check: integrity,
                     is_source_reserved: source_reserved,
@@ -1361,42 +1393,24 @@ impl SyncOrchestrator {
                 hdfs.as_ref(),
             )
             .await;
-            let copy_result = if let Some(recorder) = recorder {
-                let metadata = copy_result.as_ref().ok().copied();
-                match recorder.finish(copy_result.map(|_| ())).await {
-                    Ok(()) => Ok(metadata.unwrap_or(MetadataApplication::DataMover)),
-                    Err(error) => Err(error),
-                }
+            let metadata = if let Some(recorder) = recorder {
+                let metadata = result.as_ref().ok().copied();
+                recorder.finish(result.map(|_| ())).await?;
+                metadata.unwrap_or(MetadataApplication::DataMover)
             } else {
-                copy_result
+                result?
             };
-            match copy_result {
-                Ok(MetadataApplication::DataMover) => metadata_applied = true,
-                Err(e) => {
-                    warn!(
-                        "Phase B: renamed+data-changed content copy failed for {:?}: {}",
-                        entry.get_relative_path(),
-                        e
-                    );
-                    return false;
-                }
-            }
+            metadata_applied = matches!(metadata, MetadataApplication::DataMover);
         }
-        // 元数据同步（DataOnly 拷贝后也需要同步 mode/uid/gid/mtime）
-        if !metadata_applied && let Err(e) = dest.set_entry_metadata(entry).await {
-            warn!(
-                "Phase B: renamed+changed metadata sync failed for {:?}: {}",
-                entry.get_relative_path(),
-                e
-            );
-            return false;
+        if !metadata_applied {
+            dest.set_entry_metadata(entry).await?;
         }
-        true
+        Ok(())
     }
 
     /// DB 写入由 [`DatabaseConsumer`](crate::consumer::DatabaseConsumer) 在收到 `Deleted` / `Renamed` /
     /// `Error` 消息后自动完成（走和 handler workers 同一套批量重试逻辑）；本函数只负责
-    /// 「物理操作 + 广播结果消息」。目标端错误仅记录日志并广播 Error，不中断流程。
+    /// 「物理操作 + 广播结果消息」。保留首个类型化错误，处理完当前阶段后返回。
     ///
     /// # 两遍处理设计
     ///
@@ -1418,14 +1432,9 @@ impl SyncOrchestrator {
         broadcaster: &BroadcastForwarder<StorageEntryMessage>, enable_integrity_check: bool,
         qos_manager: Option<QosManager>, bytes_counter: Option<Arc<AtomicU64>>, job_id: &str, job_dir: &str,
         transfer_mode: TransferMode,
-    ) {
-        let deletion_iter = match db.detect_deleted_items().await {
-            Ok(iter) => iter,
-            Err(e) => {
-                error!("Failed to detect deleted items: {}", e);
-                return;
-            }
-        };
+    ) -> Result<()> {
+        let deletion_iter = db.detect_deleted_items().await?;
+        let mut failure: Option<AppError> = None;
 
         // 第一遍：一次性收集，构建「所有目录 rename」映射表。
         // 映射语义：renamed_dirs[old_dir_path] = new_dir_path
@@ -1474,6 +1483,7 @@ impl SyncOrchestrator {
                                     reason: format!("{e}"),
                                 })
                                 .await;
+                            failure.get_or_insert(e.into());
                         }
                     }
                 }
@@ -1500,7 +1510,7 @@ impl SyncOrchestrator {
                             to_arc.clone(),
                             src_storage.clone(),
                             dest_storage.clone(),
-                            is_source_reserved,
+                            true,
                         )
                         .await
                     };
@@ -1512,21 +1522,33 @@ impl SyncOrchestrator {
                             if !from_arc.get_is_dir()
                                 && !from_arc.get_is_symlink()
                                 && let Some(kind) = ChangeKind::from_entry_diff(&from_arc, &to_arc)
-                                && Self::sync_renamed_file_changes(
+                            {
+                                let result = Self::sync_renamed_file_changes(
                                     kind,
                                     &to_arc,
                                     &src_storage,
                                     &dest_storage,
                                     qos_manager.clone(),
                                     enable_integrity_check,
-                                    is_source_reserved,
+                                    true,
                                     bytes_counter.clone(),
                                     job_id,
                                     job_dir,
                                     transfer_mode,
                                 )
-                                .await
-                            {
+                                .await;
+                                if let Err(error) = result {
+                                    broadcaster
+                                        .broadcast(StorageEntryMessage::Error {
+                                            event: ErrorEvent::Copy,
+                                            path: to_arc.get_relative_path().to_path_buf(),
+                                            entry: Some(to_arc.clone()),
+                                            reason: error.to_string(),
+                                        })
+                                        .await;
+                                    failure.get_or_insert(error);
+                                    continue;
+                                }
                                 broadcaster
                                     .broadcast(StorageEntryMessage::Changed {
                                         entry: to_arc.clone(),
@@ -1535,6 +1557,22 @@ impl SyncOrchestrator {
                                     .await;
                             }
 
+                            if !is_source_reserved {
+                                if let Err(error) = src_storage.delete_file(&to_arc).await
+                                    && !error.is_not_found()
+                                {
+                                    broadcaster
+                                        .broadcast(StorageEntryMessage::Error {
+                                            event: ErrorEvent::Delete,
+                                            path: to_arc.get_relative_path().to_path_buf(),
+                                            entry: Some(to_arc.clone()),
+                                            reason: error.to_string(),
+                                        })
+                                        .await;
+                                    failure.get_or_insert(error.into());
+                                    continue;
+                                }
+                            }
                             broadcaster
                                 .broadcast(StorageEntryMessage::Renamed((from_arc, to_arc)))
                                 .await;
@@ -1554,10 +1592,15 @@ impl SyncOrchestrator {
                                     reason: format!("{e}"),
                                 })
                                 .await;
+                            failure.get_or_insert(e.into());
                         }
                     }
                 }
             }
+        }
+        match failure {
+            Some(error) => Err(error),
+            None => Ok(()),
         }
     }
 

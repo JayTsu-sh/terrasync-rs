@@ -109,6 +109,7 @@ impl TaskService {
             started_at: None,
             finished_at: None,
             error_message: None,
+            storage_error: None,
         };
 
         self.task_repo.save(&task).await?;
@@ -284,7 +285,7 @@ impl TaskService {
                 );
                 // status 传 Running 保持不变，COALESCE 确保 finished_at/error_message 不被清除
                 self.execution_repo
-                    .update_status(&exec.id, TaskStatus::Running, Some(&stats), None)
+                    .update_status(&exec.id, TaskStatus::Running, Some(&stats), None, None)
                     .await?;
             } else {
                 warn!(
@@ -330,13 +331,14 @@ fn execution_stats_from_report(report: &ProgressReport) -> ExecutionStats {
         },
         ProgressDetail::Incremental {
             scanned_files,
+            scanned_symlinks,
             scanned_dirs,
             scanned_size,
             transferred_bytes,
             error_count,
             ..
         } => ExecutionStats {
-            scanned_files: *scanned_files,
+            scanned_files: scanned_files.saturating_add(*scanned_symlinks),
             scanned_dirs: *scanned_dirs,
             total_bytes: *scanned_size,
             transferred_bytes: *transferred_bytes,
@@ -354,6 +356,23 @@ mod configuration_tests {
     use crate::application::endpoint_service::CreateEndpointRequest;
     use crate::domain::endpoint::{EndpointConfig, EndpointType};
     use sqlx::sqlite::SqlitePoolOptions;
+
+    #[test]
+    fn execution_summary_includes_incremental_symlinks() -> Result<()> {
+        let report: ProgressReport = serde_json::from_value(serde_json::json!({
+            "job_id":"links", "job_type":"IncrementalScan", "elapsed_secs":1.0,
+            "speed_bytes_per_sec":0.0, "is_final":true,
+            "detail":{"kind":"Incremental", "scanned_files":10, "scanned_dirs":2,
+                "scanned_symlinks":4, "scanned_size":0, "transferred_bytes":0,
+                "error_count":0, "new_count":0, "new_size":0, "changed_count":0,
+                "changed_size":0, "deleted_count":0, "deleted_size":0,
+                "renamed_count":0, "renamed_size":0}
+        }))?;
+        let stats = execution_stats_from_report(&report);
+        assert_eq!(stats.scanned_files, 14);
+        assert_eq!(stats.scanned_dirs, 2);
+        Ok(())
+    }
 
     #[tokio::test]
     async fn edited_config_survives_reload_and_only_semantic_changes_restart_scan() -> Result<()> {

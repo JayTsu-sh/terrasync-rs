@@ -17,6 +17,15 @@ export interface TaskConfig {
   reset_scan_on_start?: boolean
 }
 
+export interface StorageFailureDetail {
+  code: 'storage_connection_lost' | 'storage_operation_timeout'
+  backend: string
+  operation: string
+  path: string
+  retryable: boolean
+  operation_timeout_secs: number
+}
+
 export interface MigrationTask {
   id: string
   name: string
@@ -31,6 +40,7 @@ export interface MigrationTask {
   started_at?: string
   finished_at?: string
   error_message?: string
+  storage_error?: StorageFailureDetail
 }
 
 export interface TaskExecution {
@@ -42,6 +52,7 @@ export interface TaskExecution {
   finished_at?: string
   stats?: ExecutionStats
   error_message?: string
+  storage_error?: StorageFailureDetail
 }
 
 export interface ExecutionStats {

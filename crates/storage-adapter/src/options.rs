@@ -13,6 +13,10 @@ use data_mover::storage::HdfsConfig;
 
 #[derive(Debug, Clone)]
 pub struct WalkOptions {
+    /// 单个远程存储操作的等待上限；独立于自动恢复，不包含消费者背压。
+    pub operation_timeout: Option<std::time::Duration>,
+    /// 调用方显式选择的故障恢复窗口；None 直接报告失败，不自动重连。
+    pub recovery_window: Option<std::time::Duration>,
     pub depth: Option<usize>,
     pub match_expressions: Option<FilterExpression>,
     pub exclude_expressions: Option<FilterExpression>,
@@ -25,6 +29,8 @@ pub struct WalkOptions {
 impl Default for WalkOptions {
     fn default() -> Self {
         Self {
+            operation_timeout: None,
+            recovery_window: None,
             depth: None,
             match_expressions: None,
             exclude_expressions: None,

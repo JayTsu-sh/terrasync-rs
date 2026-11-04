@@ -691,9 +691,4 @@ impl ClusterScanStore {
 #[cfg(test)]
 mod tests;
 
-/// 仅清理指定任务的共享表分区；不删除共享表，也不影响其他任务。
-pub async fn clear_cluster_scan_data(config: &ClickHouseConfig, cluster: &str, job_id: &str) -> Result<()> {
-    ClusterScanStore::new(config, cluster, job_id)?.clear_job().await
-}
-
 mod native;

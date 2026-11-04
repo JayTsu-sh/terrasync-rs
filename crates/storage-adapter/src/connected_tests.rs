@@ -59,6 +59,7 @@ fn nfs(
     .namespace(namespace)
     .build()?;
     Ok(ConnectedStorage {
+        reconnect_config: None,
         roles,
         block_size: 4096,
     })

@@ -2,6 +2,7 @@
 use crate::{ChangeKind, EntryEnum};
 use data_mover::model::{BackendKind, EntryKind, MetadataObservations, ObservedEntry, StorageTimestamp, VersionRecord};
 use std::{
+    borrow::Cow,
     path::Path,
     sync::{Arc, OnceLock},
 };
@@ -79,15 +80,19 @@ impl<'a> ObservedView<'a> {
         self.version_index
             .and_then(|index| self.entry.history()?.records().get(index))
     }
-    pub fn version_id(&self) -> &str {
+    pub fn version_id(&self) -> &'a str {
         self.version()
             .map_or("", |record| record.version_id().unwrap_or("null"))
     }
     pub fn path(&self) -> String {
+        self.sql_path().into_owned()
+    }
+    /// 普通路径借用原生观察；历史目录对象的 SQL 键保留尾部斜线。
+    pub fn sql_path(&self) -> Cow<'a, str> {
         if self.version().is_some() && self.entry.kind() == EntryKind::Directory {
-            format!("{}/", self.entry.path().as_str())
+            Cow::Owned(format!("{}/", self.entry.path().as_str()))
         } else {
-            self.entry.path().as_str().to_owned()
+            Cow::Borrowed(self.entry.path().as_str())
         }
     }
     pub fn file_handle(&self) -> Option<String> {
@@ -165,7 +170,7 @@ pub fn timestamp_nanos(time: Option<StorageTimestamp>) -> i64 {
 #[derive(Clone, Debug)]
 pub enum ObservedScanEvent {
     New(ObservedItem),
-    /// 稳定身份已存在，整轮结束后再区分重命名和新增硬链接。
+    /// 带身份的路径未确认匹配；整轮结束后再区分新增、重命名和新增硬链接。
     Candidate(ObservedItem),
     Changed {
         item: ObservedItem,
@@ -192,5 +197,60 @@ impl ObservedScanEvent {
             Self::Deleted(_) => "deleted",
             Self::Renamed { .. } => "rename",
         }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod path_tests {
+    use super::*;
+    use data_mover::model::{
+        BackendIdentity, HistoryOrder, IdentityStrength, ObjectHistory, RecordKind, SourceIdentity, StoragePath,
+    };
+
+    #[test]
+    fn borrowed_projection_keeps_regular_and_versioned_directory_sql_keys() {
+        let backend = BackendIdentity::new(BackendKind::S3, "sql-path-fixture").unwrap();
+        let identity = SourceIdentity::new(backend, IdentityStrength::PathScoped, b"folder").unwrap();
+        let history = ObjectHistory::whole(
+            vec![
+                VersionRecord::from_listing(
+                    "v1",
+                    true,
+                    RecordKind::Object {
+                        size: 0,
+                        etag: "etag".into(),
+                        modified: None,
+                    },
+                    identity.clone(),
+                )
+                .unwrap(),
+            ],
+            HistoryOrder::Server,
+        )
+        .unwrap();
+        let directory = ObservedEntry::new(
+            StoragePath::new("folder").unwrap(),
+            EntryKind::Directory,
+            None,
+            None,
+            identity,
+        )
+        .unwrap()
+        .with_history(Some(Box::new(history)))
+        .unwrap();
+        let current = ObservedView {
+            entry: &directory,
+            version_index: None,
+        };
+        let historical = ObservedView {
+            entry: &directory,
+            version_index: Some(0),
+        };
+        assert_eq!(current.sql_path(), "folder");
+        assert_eq!(current.path(), "folder");
+        assert_eq!(historical.sql_path(), "folder/");
+        assert_eq!(historical.path(), "folder/");
+        assert_eq!(historical.version_id(), "v1");
     }
 }

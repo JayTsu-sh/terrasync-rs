@@ -1,3 +1,4 @@
+use crate::domain::storage_failure::StorageFailureDetail;
 use async_trait::async_trait;
 use sqlx::SqlitePool;
 
@@ -27,7 +28,7 @@ impl ExecutionRepository for SqliteExecutionRepo {
         let stats_json = execution.stats.as_ref().map(serde_json::to_string).transpose()?;
 
         sqlx::query(
-            "INSERT INTO task_executions (id, task_id, execution_type, status, started_at, finished_at, stats_json, error_message) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO task_executions (id, task_id, execution_type, status, started_at, finished_at, stats_json, error_message, storage_error_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&execution.id)
         .bind(&execution.task_id)
@@ -37,6 +38,7 @@ impl ExecutionRepository for SqliteExecutionRepo {
         .bind(&finished_at)
         .bind(&stats_json)
         .bind(&execution.error_message)
+        .bind(execution.storage_error.as_ref().map(serde_json::to_string).transpose()?)
         .execute(&self.pool)
         .await?;
 
@@ -45,7 +47,7 @@ impl ExecutionRepository for SqliteExecutionRepo {
 
     async fn find_by_task_id(&self, task_id: &str) -> Result<Vec<TaskExecution>> {
         let rows = sqlx::query_as::<_, ExecutionRow>(
-            "SELECT id, task_id, execution_type, status, started_at, finished_at, stats_json, error_message FROM task_executions WHERE task_id = ? ORDER BY started_at DESC",
+            "SELECT id, task_id, execution_type, status, started_at, finished_at, stats_json, error_message, storage_error_json FROM task_executions WHERE task_id = ? ORDER BY started_at DESC",
         )
         .bind(task_id)
         .fetch_all(&self.pool)
@@ -56,7 +58,7 @@ impl ExecutionRepository for SqliteExecutionRepo {
 
     async fn find_by_id(&self, id: &str) -> Result<Option<TaskExecution>> {
         let row = sqlx::query_as::<_, ExecutionRow>(
-            "SELECT id, task_id, execution_type, status, started_at, finished_at, stats_json, error_message FROM task_executions WHERE id = ?",
+            "SELECT id, task_id, execution_type, status, started_at, finished_at, stats_json, error_message, storage_error_json FROM task_executions WHERE id = ?",
         )
         .bind(id)
         .fetch_optional(&self.pool)
@@ -68,6 +70,7 @@ impl ExecutionRepository for SqliteExecutionRepo {
     #[allow(clippy::similar_names)]
     async fn update_status(
         &self, id: &str, status: TaskStatus, stats: Option<&ExecutionStats>, error_msg: Option<&str>,
+        storage_error: Option<&StorageFailureDetail>,
     ) -> Result<()> {
         let status_str = status.to_string();
         let finished_at = match status {
@@ -77,12 +80,13 @@ impl ExecutionRepository for SqliteExecutionRepo {
         let stats_json = stats.map(serde_json::to_string).transpose()?;
 
         let result = sqlx::query(
-            "UPDATE task_executions SET status = ?, finished_at = COALESCE(?, finished_at), stats_json = COALESCE(?, stats_json), error_message = COALESCE(?, error_message) WHERE id = ?",
+            "UPDATE task_executions SET status = ?, finished_at = COALESCE(?, finished_at), stats_json = COALESCE(?, stats_json), error_message = COALESCE(?, error_message), storage_error_json = COALESCE(?, storage_error_json) WHERE id = ?",
         )
         .bind(&status_str)
         .bind(&finished_at)
         .bind(&stats_json)
         .bind(error_msg)
+        .bind(storage_error.map(serde_json::to_string).transpose()?)
         .bind(id)
         .execute(&self.pool)
         .await?;
@@ -196,6 +200,7 @@ struct ExecutionRow {
     finished_at: Option<String>,
     stats_json: Option<String>,
     error_message: Option<String>,
+    storage_error_json: Option<String>,
 }
 
 impl TryFrom<ExecutionRow> for TaskExecution {
@@ -218,6 +223,11 @@ impl TryFrom<ExecutionRow> for TaskExecution {
             finished_at,
             stats,
             error_message: row.error_message,
+            storage_error: row
+                .storage_error_json
+                .as_deref()
+                .map(serde_json::from_str)
+                .transpose()?,
         })
     }
 }

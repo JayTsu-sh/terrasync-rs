@@ -62,6 +62,7 @@ pub fn detect_storage_type(path: &str) -> StorageType {
 pub struct ConnectedStorage {
     pub(crate) roles: Storage,
     pub(crate) block_size: u64,
+    pub(crate) reconnect_config: Option<std::sync::Arc<NativeBackendConfig>>,
 }
 /// 变体仅服务产品层策略判断；各操作统一借用连接的角色，无后端复制实现。
 #[derive(Clone)]
@@ -135,9 +136,12 @@ pub async fn create_storage(path: &str, options: CreateStorageOptions) -> Result
             })
         }
     };
+    let reconnect_config = (kind != StorageType::Local).then(|| std::sync::Arc::new(config.clone()));
+    let roles = storage::connect_backend(config).await.map_err(StorageError::from)?;
     let connected = ConnectedStorage {
-        roles: storage::connect_backend(config).await.map_err(StorageError::from)?,
+        roles,
         block_size,
+        reconnect_config,
     };
     Ok(match kind {
         StorageType::Local => StorageEnum::Local(connected),

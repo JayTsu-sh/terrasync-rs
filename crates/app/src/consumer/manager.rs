@@ -308,15 +308,9 @@ impl ConsumerManager {
 
         // 根据配置初始化数据库消费者
         if enable_db {
-            match DatabaseConsumer::try_new(consumer_config).await {
-                Ok(db_consumer) => {
-                    manager.add_consumer(Box::new(db_consumer));
-                    debug!("Database consumer initialized successfully");
-                }
-                Err(e) => {
-                    error!("Failed to initialize database consumer: {}", e);
-                }
-            }
+            let consumer = DatabaseConsumer::try_new(consumer_config).await?;
+            manager.add_consumer(Box::new(consumer));
+            debug!("Database consumer initialized successfully");
         }
 
         // 根据 JobType 初始化对应的统计消费者

@@ -381,11 +381,6 @@ pub async fn integrity_check_with_concurrency(
         progress_callback_url,
     )?);
 
-    let mut broadcaster = BroadcastForwarder::new(DEFAULT_CHANNEL_CAPACITY);
-    let mut consumer_manager = ConsumerManager::new(consumer_config.as_ref()).await?;
-    consumer_manager.begin_lifecycle().await;
-    let consumer_handles = consumer_manager.start_consumers(&mut broadcaster).await?;
-
     let scan_config = ScanConfig {
         job_id: job_id.clone(),
         path: src_path.to_string(),
@@ -423,9 +418,14 @@ pub async fn integrity_check_with_concurrency(
         Ok(iter) => iter,
         Err(e) => {
             error!("Failed to start directory walker: {}", e);
-            return Err(AppError::ScanError(format!("Failed to start directory walker: {e}")));
+            return Err(e);
         }
     };
+
+    let mut broadcaster = BroadcastForwarder::new(DEFAULT_CHANNEL_CAPACITY);
+    let mut consumer_manager = ConsumerManager::new(consumer_config.as_ref()).await?;
+    consumer_manager.begin_lifecycle().await;
+    let consumer_handles = consumer_manager.start_consumers(&mut broadcaster).await?;
 
     let issues: Arc<Mutex<Vec<IntegrityIssue>>> = Arc::new(Mutex::new(Vec::new()));
     let checked_files = Arc::new(AtomicUsize::new(0));
@@ -541,6 +541,9 @@ pub async fn integrity_check_with_concurrency(
     }
 
     consumer_manager.end_lifecycle().await;
+    if let Some(error) = walkdir_iter.take_error() {
+        return Err(error.into());
+    }
 
     let total_checked = checked_file_count + checked_dir_count + checked_symlink_count;
     crate::consumer::stats::print_integrity_check_result(

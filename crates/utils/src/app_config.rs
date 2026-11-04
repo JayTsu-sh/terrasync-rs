@@ -34,6 +34,12 @@ pub struct LogConfig {
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct ScanConfig {
+    /// 每次远程存储操作的时限；不包含统计、数据库写入与消费者背压。
+    #[serde(default = "default_scan_operation_timeout_secs")]
+    pub operation_timeout_secs: u64,
+    /// 连接故障后自动恢复扫描的窗口；耗尽后才报告失败。
+    #[serde(default = "default_scan_recovery_window_secs")]
+    pub recovery_window_secs: u64,
     pub concurrency: usize,
     pub include_tags: bool,
     #[serde(default)]
@@ -42,6 +48,14 @@ pub struct ScanConfig {
     pub r#match: Option<String>,
     #[serde(default)]
     pub exclude: Option<String>,
+}
+
+const fn default_scan_recovery_window_secs() -> u64 {
+    3
+}
+
+const fn default_scan_operation_timeout_secs() -> u64 {
+    30
 }
 
 // 定义一致性校验类型枚举
@@ -118,9 +132,22 @@ impl Default for DeleteConfig {
     }
 }
 
+/// 部署模式只在数据库初始化时解析，业务层不根据集群名推断模式。
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ClickHouseMode {
+    #[default]
+    Single,
+    Cluster,
+}
+
+pub const DEFAULT_DATABASE_BATCH_SIZE: u32 = 100_000;
+
 #[derive(Serialize, Deserialize, Clone)]
 pub struct ClickhouseConfig {
-    /// 集群名称；留空保持单机模式。
+    #[serde(default)]
+    pub mode: ClickHouseMode,
+    /// 集群模式的名称；单机模式不使用此参数。
     #[serde(default)]
     pub cluster: Option<String>,
     pub dsn: String,
@@ -131,9 +158,31 @@ pub struct ClickhouseConfig {
     pub password: Option<String>,
 }
 
+impl ClickhouseConfig {
+    pub fn cluster_name(&self) -> Result<Option<&str>> {
+        let name = self.cluster.as_deref().map(str::trim).filter(|name| !name.is_empty());
+        match (self.mode, name) {
+            (ClickHouseMode::Single, None) => Ok(None),
+            (ClickHouseMode::Cluster, Some(name))
+                if name.bytes().all(|byte| byte.is_ascii_alphanumeric() || byte == b'_') =>
+            {
+                Ok(Some(name))
+            }
+            (ClickHouseMode::Single, Some(_)) => Err(UtilsError::ConfigConversionError(
+                "ClickHouse single 模式不能配置 cluster 名称".into(),
+            )),
+            _ => Err(UtilsError::ConfigConversionError(
+                "ClickHouse cluster 模式必须配置有效的 cluster 名称（字母、数字、下划线）".into(),
+            )),
+        }
+    }
+}
+
 impl fmt::Debug for ClickhouseConfig {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ClickhouseConfig")
+            .field("mode", &self.mode)
+            .field("cluster", &self.cluster)
             .field("dsn", &"[REDACTED]")
             .field("dial_timeout", &self.dial_timeout)
             .field("read_timeout", &self.read_timeout)
@@ -347,6 +396,16 @@ impl AppConfig {
             }
         };
         check_concurrency(self.scan.concurrency, "scan.concurrency")?;
+        if self.scan.recovery_window_secs == 0 {
+            return Err(UtilsError::ConfigConversionError(
+                "scan.recovery_window_secs 必须 > 0".into(),
+            ));
+        }
+        if self.scan.operation_timeout_secs == 0 {
+            return Err(UtilsError::ConfigConversionError(
+                "scan.operation_timeout_secs 必须 > 0".into(),
+            ));
+        }
         check_concurrency(self.sync.concurrency, "sync.concurrency")?;
         check_concurrency(self.integrity_check.concurrency, "integrity_check.concurrency")?;
         check_concurrency(self.delete.concurrency, "delete.concurrency")?;
@@ -362,6 +421,7 @@ impl AppConfig {
 
         // database 配置校验
         if self.database.enabled {
+            self.database.clickhouse.cluster_name()?;
             if self.database.batch_size == 0 {
                 return Err(UtilsError::ConfigConversionError(
                     "database.batch_size 必须 > 0".to_string(),
@@ -496,8 +556,39 @@ username = "default"
     }
 
     #[test]
+    fn embedded_clickhouse_defaults_and_explicit_modes_are_validated() {
+        let raw = Config::builder()
+            .add_source(File::from_str(
+                include_str!("../../cli/src/resources/default_config.toml"),
+                FileFormat::Toml,
+            ))
+            .build()
+            .unwrap();
+        let mut config = AppConfig::try_from(raw).unwrap();
+        assert_eq!(config.database.batch_size, DEFAULT_DATABASE_BATCH_SIZE);
+        assert_eq!(config.database.clickhouse.mode, ClickHouseMode::Single);
+        config.database.enabled = true;
+        assert!(config.validate().is_ok());
+        config.database.clickhouse.cluster = Some("test_cluster".into());
+        assert!(config.validate().is_err());
+        config.database.clickhouse.mode = ClickHouseMode::Cluster;
+        assert!(config.validate().is_ok());
+        for name in ["", " ", "x;DROP", "x/y"] {
+            config.database.clickhouse.cluster = Some(name.into());
+            assert!(config.validate().is_err());
+        }
+        let invalid = BASE_CONFIG.replace("[database.clickhouse]", "[database.clickhouse]\nmode = \"typo\"");
+        let raw = Config::builder()
+            .add_source(File::from_str(&invalid, FileFormat::Toml))
+            .build()
+            .unwrap();
+        assert!(AppConfig::try_from(raw).is_err());
+    }
+
+    #[test]
     fn clickhouse_debug_redacts_password() {
         let config = ClickhouseConfig {
+            mode: Default::default(),
             cluster: None,
             dsn: "http://dsn-user:dsn-secret@clickhouse.internal".to_string(),
             dial_timeout: 10,
