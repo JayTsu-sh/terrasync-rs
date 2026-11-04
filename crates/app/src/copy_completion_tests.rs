@@ -1,5 +1,6 @@
 use super::*;
 use crate::storage_factory::{StorageRole, create_storage_for_role};
+use clickhouse::Client;
 use db::clickhouse::ClickHouseDatabase;
 use db::{ClickHouseConfig, CopyGenerationStatus, DatabaseError};
 use std::future::pending;
@@ -144,7 +145,7 @@ async fn isolated_generation_case(mode: ClickHouseMode) -> Result<()> {
         password: std::env::var("LAB_CLICKHOUSE_PASSWORD").ok().filter(|s| !s.is_empty()),
     };
     config.cluster_name()?;
-    let mut admin = clickhouse::Client::default()
+    let mut admin = Client::default()
         .with_url(&config.dsn)
         .with_user(&config.username);
     if let Some(password) = &config.password {
