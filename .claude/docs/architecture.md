@@ -52,7 +52,7 @@ CLI 和 GUI 调用同一 `scan(ScanRequest)`。启用 ClickHouse 时首次全量
 
 扫描统一消费原生观察及 `DirectoryStatistics`，不落库扫描也使用该输入。data-mover 只返回每次目录列举的直属孩子绝对统计，不决定产品计数的持久化。`scan::statistics` 定义公共快照：scanned、filtered、retained、failed、vanished 按目录、普通文件、软链接、四类特殊文件和 unknown 分类；S3 key 只计一次，历史版本及删除标记另计。排除且不下钻的剪枝目录及子树不进入这些 entry 数，也不为统计补扫。能力声明随报告返回，unsupported/not_applicable 与实际零值分开。大小未知单独计数，逻辑文件字节不混入目录和链接元数据大小。
 
-`EntryStatistics` 的各实现显式提供普通文件判断：原生 `ObservedView` 使用 typed kind，数据库记录读取持久化标记，旧 `EntryEnum` 保留兼容模型的既有语义。公共统计的 `other_entry_count` 保存其余类型，完整扫描和增量变化总数均包含它们；特殊文件的细分类别由扫描快照提供。数据库事件汇总保留全部条目，并明确返回普通文件标记，最终化事件和恢复后的统计校准使用同一分类规则。新增统计字段有反序列化默认值，但这不修正旧版已经错误保存的 Special 类型标记；这类旧基线或旧最终化状态若需要精确分类，应使用新任务全量重建，不能把历史错误当作已经自动校正。
+`EntryStatistics` 的各实现显式提供普通文件判断：原生 `ObservedView` 使用 typed kind，数据库记录读取持久化标记。公共统计的 `other_entry_count` 保存其余类型，完整扫描和增量变化总数均包含它们；特殊文件的细分类别由扫描快照提供。数据库事件汇总保留全部条目，并明确返回普通文件标记，最终化事件和恢复后的统计校准使用同一分类规则。数据模型与接口按 [agent.md](../../agent.md) 中的首次开发阶段约定维护。
 
 扫描是否可续扫由首次运行的 `--resume` 或 GUI `scan_resume` 明确选择；不由启用数据库自动推断。可续扫使用 Blocks，普通扫描使用 Unordered。Blocks 的 periodic/final checkpoint 都只出现在完整目录块边界；平铺大目录即使超过60秒也不推进检查点。已经交付但未被 checkpoint 确认的完整块与部分块同属未确认尾部，恢复时一并回退，不按已看到的 Complete 事件自行推进。data-mover 在旧 attempt 结束后有序发出 `Resumed`，携带实际选择的 opaque checkpoint；TerraSync 校验其与已确认统计一致，只回退扫描计数及可重放事件计数，异常累计、当前恢复状态、诊断发件箱及 ACK 不回退。Unordered 的闪断恢复从根重新扫描，先清本 attempt 的扫描贡献。
 
