@@ -389,5 +389,12 @@ async fn produce_items(
     state.observed_entries = statistics.scanned_entries().await;
     state.advance()?;
     state.statistics = statistics.statistics_checkpoint().await?;
-    cancel.interrupt(save(&control, state, false)).await?
+    cancel.interrupt(save(&control, state, false)).await??;
+    #[cfg(feature = "lab-fault-injection")]
+    if std::env::var_os("TERRASYNC_LAB_SCAN_FAIL_AFTER_FINALIZING").is_some() {
+        return Err(AppError::ScanError(
+            "Lab failure after durable FINALIZING snapshot".into(),
+        ));
+    }
+    Ok(())
 }

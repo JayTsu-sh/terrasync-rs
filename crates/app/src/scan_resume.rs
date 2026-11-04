@@ -278,7 +278,12 @@ async fn run(
     cancel.check()?;
     state.statistics = consumers.statistics_checkpoint().await?;
     state.advance()?;
-    cancel.operation(database.seal_resume_state(state)).await?;
+    if state.incremental {
+        cancel.operation(database.seal_resume_state(state)).await?;
+    } else {
+        // 全量汇总只读；源末屏障已确认 FINALIZING 快照，只更新统计 manifest。
+        cancel.operation(database.save_resume_state(state)).await?;
+    }
     cancel.check()?;
     cancel.operation(database.commit_scan_generation()).await?;
     cancel.check()?;

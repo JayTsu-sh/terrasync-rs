@@ -133,6 +133,7 @@ fn command_for_mode(root: &Path, config: &Path, source: &Path, name: &str, resum
         .env_remove("TERRASYNC_LAB_SCAN_PAUSE_AFTER_CHECKPOINT_MS")
         .env_remove("TERRASYNC_LAB_SCAN_STOP_AFTER_CHECKPOINT")
         .env_remove("TERRASYNC_LAB_SCAN_FAIL_AFTER_EVENTS")
+        .env_remove("TERRASYNC_LAB_SCAN_FAIL_AFTER_FINALIZING")
         .stdout(Stdio::from(output.try_clone()?))
         .stderr(Stdio::from(output));
     if resume {
@@ -544,6 +545,80 @@ async fn assert_paths(database: &TestDatabase, source: &Path) -> Result {
         stats["dir_count"].as_u64(),
         Some(dirs),
         "resume must not double-count replayed directories"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires ClickHouse and TERRASYNC_TEST_BINARY built with lab-fault-injection"]
+async fn finalized_full_scan_reuses_its_sealed_metadata_after_pod_loss() -> Result {
+    let name = format!(
+        "ts_scan_finalizing_{}",
+        SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos()
+    );
+    client("default")
+        .query(&format!("CREATE DATABASE {name}"))
+        .execute()
+        .await?;
+    let _guard = DatabaseGuard(name.clone());
+    let database = client(&name);
+    let work = tempfile::tempdir()?;
+    let source = work.path().join("source");
+    fs::create_dir(&source)?;
+    for number in 0..512 {
+        fs::write(source.join(format!("file{number:04}")), b"sealed")?;
+    }
+    let config = work.path().join("config.toml");
+    write_scan_config(&config, &name, 1024)?;
+    let mut first = command(work.path(), &config, &source, "failed-after-source-seal")?;
+    first
+        .command
+        .env("TERRASYNC_LAB_SCAN_CHECKPOINT_EVERY_MS", "60000")
+        .env("TERRASYNC_LAB_SCAN_FAIL_AFTER_FINALIZING", "1");
+    assert!(!first.command.status()?.success());
+    let (phase, sealed, observed): (u8, String, u64) = database
+        .query("SELECT phase,checkpoint_snapshot,observed_entries FROM scan_resume_resume_case FINAL")
+        .fetch_one()
+        .await?;
+    assert_eq!(phase, 1);
+    assert!(!sealed.is_empty());
+    assert_eq!(observed, 512);
+    let metadata = "SELECT toJSONString(tuple(*)) FROM base_resume_case FINAL ORDER BY relative_path,version_id";
+    let before = database.query(metadata).fetch_all::<String>().await?;
+    assert_eq!(before.len(), 512);
+    // 枚举已完成：恢复 FINALIZING 必须发布封存事实，新变化留给下一轮。
+    fs::write(source.join("file0000"), b"modified-after-source-completion")?;
+    fs::write(source.join("late-file"), b"late")?;
+    discard_pod_local_state(work.path(), "finalizing")?;
+    complete(command(work.path(), &config, &source, "recover-source-seal")?).await?;
+    let (phase, resumed, observed): (u8, String, u64) = database
+        .query("SELECT phase,checkpoint_snapshot,observed_entries FROM scan_resume_resume_case FINAL")
+        .fetch_one()
+        .await?;
+    assert_eq!(phase, 2);
+    assert_eq!(
+        resumed, sealed,
+        "read-only full finalization must retain its acknowledged metadata cut"
+    );
+    assert_eq!(observed, 512);
+    assert_eq!(database.query(metadata).fetch_all::<String>().await?, before);
+    complete(command(work.path(), &config, &source, "next-round-after-source-seal")?).await?;
+    assert_paths(&database, &source).await?;
+    assert_eq!(
+        count(
+            &database,
+            "SELECT count() FROM incremental_resume_case FINAL WHERE operation_type='new'"
+        )
+        .await?,
+        1
+    );
+    assert_eq!(
+        count(
+            &database,
+            "SELECT count() FROM incremental_resume_case FINAL WHERE operation_type='data_changed'"
+        )
+        .await?,
+        1
     );
     Ok(())
 }
