@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Verify first-pass ∪ resumed-pass output against an independent source manifest.
+"""Verify confirmed directory-block prefixes and the final independent source manifest.
 
-Uses a real CLI and ClickHouse. Merge suspension is scoped to each disposable test
-table, making its physical parts a reliable per-attempt output ledger. Production
-code is not instrumented. --binary must be built with lab-fault-injection.
+Uses a real CLI and disposable ClickHouse tables. Checkpoints may be shortened for
+this functional test; its timings are not performance evidence. Production code is
+not instrumented. --binary must be built with lab-fault-injection.
 """
 import argparse
 import hashlib
@@ -132,8 +132,7 @@ class Case:
         self.session.auth = (os.environ.get("LAB_CLICKHOUSE_USER", "default"),
                              os.environ.get("LAB_CLICKHOUSE_PASSWORD", ""))
         self.process = None
-        self.parts = set()
-        self.union = {}
+        self.confirmed = {}
         self.attempts = []
         self.started = datetime.now(timezone.utc).isoformat()
 
@@ -200,7 +199,8 @@ class Case:
 
     def state(self):
         values = self.rows("SELECT version, observed_entries, length(checkpoint) AS checkpoint_bytes, phase, "
-                           "generation, incremental FROM " + self.database + ".scan_resume_union_case FINAL")
+                           "generation, incremental, checkpoint_snapshot, statistics FROM " +
+                           self.database + ".scan_resume_union_case FINAL")
         return values[0] if values else {}
 
     def wait_and_kill(self, fraction):
@@ -226,51 +226,62 @@ class Case:
         assert status == -9
         return status
 
-    def quiesce(self):
-        self.query("SYSTEM STOP MERGES " + self.table)
-        deadline = time.monotonic() + 30
-        while True:
-            merges = int(self.query("SELECT count() FROM system.merges WHERE database='" + self.database +
-                                    "' AND table='base_union_case'"))
-            inserts = int(self.query("SELECT count() FROM system.processes WHERE current_database='" +
-                                     self.database + "' AND startsWith(query,'INSERT')"))
-            if merges == 0 and inserts == 0:
-                break
-            if time.monotonic() >= deadline:
-                raise TimeoutError("writes/merges did not quiesce")
-            time.sleep(.03)
-
     def capture(self, number, status):
-        self.quiesce()
-        raw = self.rows("SELECT relative_path, is_dir, is_symlink, is_regular_file, size, _part AS part_name FROM " + self.table)
-        current_parts = {row["part_name"] for row in raw}
-        assert self.parts <= current_parts, "an earlier attempt's immutable parts disappeared"
-        newly_written = [row for row in raw if row["part_name"] not in self.parts]
-        current = project(newly_written)
-        overlap = len(current.keys() & self.union.keys())
-        new_paths = len(current.keys() - self.union.keys())
-        files = {path for path, value in current.items() if value["kind"] == "file"}
-        previous_files = {path for path, value in self.union.items() if value["kind"] == "file"}
-        new_files = len(files - previous_files)
-        overlapping_files = len(files & previous_files)
-        self.union.update(current)
-        self.parts = current_parts
-        write_rows(self.work / f"attempt-{number}-records.jsonl", newly_written)
         state = self.state()
-        state["committed_generation"] = int(self.query("SELECT scan_state FROM " + self.database + ".state_union_case FINAL"))
-        self.attempts.append({
-            "attempt": number, "exit_code": status, "physical_rows_written": len(newly_written),
-            "unique_paths_written": len(current), "regular_files_written": sum(v["kind"] == "file" for v in current.values()),
-            "overlap_with_earlier_attempts": overlap, "new_paths": new_paths,
-            "new_regular_files": new_files, "overlapping_regular_files": overlapping_files,
-            "cumulative_unique_paths": len(self.union), "state": state,
-            "attempt_manifest_sha256": digest(current),
-        })
-        if status == -9:
-            assert state["phase"] == 0 and state["incremental"] is False
-            assert state["committed_generation"] == 0
+        raw_statistics = state.pop("statistics")
+        scan = json.loads(raw_statistics)["report"]["scan"] if raw_statistics else None
+        if status == 0:
+            # 完成后 cut 可以被正常回收；最终事实以已发布的 working 表为准。
+            assert state["phase"] == 2
+            table = self.table
         else:
-            assert status == 0 and state["phase"] == 2 and state["committed_generation"] == 1
+            assert status == -9 and state["phase"] == 0
+            token = state["checkpoint_snapshot"]
+            assert re.fullmatch(r"[0-9a-f]{32}", token), "invalid confirmed snapshot token"
+            # 只定位 manifest 引用的快照，不从 working 表的物理 part 推算观察或重放。
+            tables = self.rows("SELECT name FROM system.tables WHERE database='" + self.database +
+                               "' AND endsWith(name, '_" + token + "_base')")
+            assert len(tables) == 1, "confirmed snapshot is missing or ambiguous"
+            name = tables[0]["name"]
+            assert re.fullmatch(r"[a-z0-9_]+", name)
+            table = self.database + "." + name
+        rows = self.rows("SELECT relative_path, is_dir, is_symlink, is_regular_file, size FROM " + table + " FINAL")
+        confirmed = project(rows)
+        assert len(rows) == len(confirmed), "duplicate confirmed paths"
+        assert all(confirmed.get(path) == value for path, value in self.confirmed.items()), "confirmed prefix regressed"
+        assert all(self.expected.get(path) == value for path, value in confirmed.items()), "confirmed snapshot differs from source"
+        assert int(state["observed_entries"]) == len(confirmed)
+        if scan is None:
+            # 初始 manifest 尚无统计报告；零游标、零标量和真实空 cut 必须同时成立。
+            assert status == -9 and state["phase"] == 0
+            assert int(state["checkpoint_bytes"]) == 0 and not confirmed
+        else:
+            assert scan["scanned_entries"] == scan["retained_entries"] == len(confirmed)
+            assert scan["filtered_entries"] == 0
+            expected_types = {name: 0 for name in ["directories", "regular_files", "symlinks",
+                              "block_devices", "character_devices", "fifos", "sockets", "unknown"]}
+            for value in confirmed.values():
+                expected_types[{"directory": "directories", "file": "regular_files",
+                                "symlink": "symlinks"}[value["kind"]]] += 1
+            assert scan["counts"]["scanned"] == scan["counts"]["retained"] == expected_types
+            assert not any(scan["counts"]["filtered"].values())
+            assert scan["counts"]["regular_file_bytes"] == sum(
+                value["size"] for value in confirmed.values() if value["kind"] == "file")
+        state["committed_generation"] = int(self.query("SELECT scan_state FROM " + self.database +
+                                                       ".state_union_case FINAL"))
+        write_rows(self.work / f"attempt-{number}-confirmed-records.jsonl", rows)
+        self.attempts.append({"attempt": number, "exit_code": status, "state": state,
+                              "confirmed_entries": len(confirmed), "scan": scan,
+                              "confirmed_manifest_sha256": digest(confirmed)})
+        self.confirmed = confirmed
+        if status == -9:
+            assert state["incremental"] is False and state["committed_generation"] == 0
+            assert scan is None or not scan["complete"]
+            if self.name == "local-flat":
+                assert int(state["checkpoint_bytes"]) == 0 and not confirmed
+        else:
+            assert state["committed_generation"] == 1
+            assert scan is not None and scan["complete"] and confirmed == self.expected
 
     def run(self):
         self.prepare()
@@ -279,7 +290,7 @@ class Case:
         for number, fraction in enumerate(fractions, 1):
             self.start(number)
             self.capture(number, self.wait_and_kill(fraction))
-            print(self.name, "interruption", number, "durable paths", len(self.union), flush=True)
+            print(self.name, "interruption", number, "confirmed paths", len(self.confirmed), flush=True)
         self.start(len(fractions) + 1)
         status = self.process.wait(timeout=180)
         self.process = None
@@ -287,21 +298,20 @@ class Case:
         final_rows = self.rows("SELECT relative_path, is_dir, is_symlink, is_regular_file, size FROM " + self.table + " FINAL")
         final = project(final_rows)
         write_rows(self.work / "final-records.jsonl", final_rows)
-        missing = sorted(self.expected.keys() - self.union.keys())
-        extra = sorted(self.union.keys() - self.expected.keys())
-        mismatches = sorted(path for path in self.expected.keys() & self.union.keys()
-                            if self.expected[path] != self.union[path])
+        missing = sorted(self.expected.keys() - final.keys())
+        extra = sorted(final.keys() - self.expected.keys())
+        mismatches = sorted(path for path in self.expected.keys() & final.keys()
+                            if self.expected[path] != final[path])
         result = {"name": self.name, "source_regular_files": self.expected_files,
                   "source_entries": len(self.expected), "attempts": self.attempts,
-                  "union_entries": len(self.union), "missing_paths": missing, "extra_paths": extra,
+                  "confirmed_entries": len(self.confirmed), "missing_paths": missing, "extra_paths": extra,
                   "type_or_size_mismatches": mismatches,
                   "final_duplicates": len(final_rows) - len(final),
-                  "source_manifest_sha256": digest(self.expected), "union_manifest_sha256": digest(self.union),
+                  "source_manifest_sha256": digest(self.expected), "confirmed_manifest_sha256": digest(self.confirmed),
                   "final_manifest_sha256": digest(final), "started_at_utc": self.started}
         result["source_unchanged"] = self.source_manifest() == self.expected
-        result["union_regular_files"] = sum(value["kind"] == "file" for value in self.union.values())
         result["final_regular_files"] = sum(value["kind"] == "file" for value in final.values())
-        result["passed"] = (self.union == self.expected == final and len(final_rows) == len(final)
+        result["passed"] = (self.confirmed == self.expected == final and len(final_rows) == len(final)
                             and result["source_unchanged"])
         return result
 
@@ -338,8 +348,9 @@ def main():
     if "nfs41" in cases and args.ssh_key is None:
         parser.error("--ssh-key or LAB_SSH_KEY is required for NFS")
     report = {"run_id": args.run_id, "binary_sha256": hashlib.file_digest(args.binary.open("rb"), "sha256").hexdigest(),
-              "invariant": "first_attempt_output UNION all_resumed_attempt_outputs = independent_source_manifest = final_database",
-              "method": "Per-attempt durable records are identified by immutable ClickHouse physical parts; merges are stopped only on disposable test tables.",
+              "invariant": "confirmed_prefix = referenced_snapshot = checkpoint_statistics; final_database = independent_source_manifest = final_statistics",
+              "method": "Inspect immutable snapshots referenced by acknowledged manifests; allow unconfirmed working tails to disappear during recovery. Never infer replay or attempt output from physical parts.",
+              "functional_only": True,
               "cases": []}
     for name in cases:
         case = Case(args, name)
