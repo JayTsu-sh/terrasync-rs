@@ -263,7 +263,7 @@ impl DirectoryStatisticsStore {
 }
 
 async fn checkpoint(index: usize) -> Result<()> {
-    if index % 1024 == 0 {
+    if index.is_multiple_of(1024) {
         check_scan_cancellation()?;
         yield_now().await;
         check_scan_cancellation()?;

@@ -49,7 +49,7 @@ pub(super) async fn run(request: ScanRequest<'_>, config: AppConfig) -> Result<(
         .initialize_scan_statistics(&storage, options.include_tags, None)
         .await?;
     let statistics = manager.scan_statistics();
-    let _recovery_progress = statistics.watch_recovery(source.recovery_status());
+    let recovery_progress = statistics.watch_recovery(source.recovery_status()).await;
     let mut ledger = DirectoryLedger::new(None, 1).await?;
     manager.begin_lifecycle().await;
     let result = consume_observed(&mut source, &statistics, &mut ledger, &cancel).await;
@@ -69,6 +69,9 @@ pub(super) async fn run(request: ScanRequest<'_>, config: AppConfig) -> Result<(
             Err(error)
         }
     };
+    if let Some(progress) = recovery_progress {
+        progress.finish().await;
+    }
     let result = if request.cancel.is_cancelled() {
         Err(AppError::ObservationScanCancelled)
     } else if let Some(error) = failure.failure() {

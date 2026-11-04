@@ -31,9 +31,18 @@ pub(crate) enum SavedStatistics {
     Previous((StatsKind, ProgressReport)),
 }
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ScanRuntimePhase {
+    #[default]
+    Running,
+    Recovering,
+    Failed,
+}
+
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct ScanRuntimeState {
-    pub state: String,
+    pub state: ScanRuntimePhase,
     pub network_faults: u64,
     pub recovery_attempts: u64,
     pub successful_recoveries: u64,
@@ -77,7 +86,7 @@ impl Default for CallbackState {
                 sequence: 0,
             },
             runtime: ScanRuntimeState {
-                state: "running".into(),
+                state: ScanRuntimePhase::Running,
                 ..Default::default()
             },
             journal: None,

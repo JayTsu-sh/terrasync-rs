@@ -115,7 +115,7 @@ export interface ScanSnapshot {
 export type StatisticSupport = 'supported' | 'unsupported' | 'not_applicable' | 'unknown'
 
 export interface ScanRuntimeState {
-  state: string
+  state: 'running' | 'recovering' | 'failed'
   network_faults: number
   recovery_attempts: number
   successful_recoveries: number

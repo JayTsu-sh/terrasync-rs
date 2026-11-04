@@ -3,7 +3,7 @@
 use super::*;
 use crate::{
     config::{ConsoleConfig, ConsumerConfig, JobType},
-    consumer::ConsumerManager,
+    consumer::{ConsumerManager, stats::ProgressDetail},
     storage_factory::{StorageRole, create_storage_for_role},
 };
 use data_mover::{model::StoragePath, traversal::EntryKindCounts};
@@ -81,6 +81,10 @@ async fn checkpoint_200_interrupted_300_resumes_to_1000_without_counting_replay(
     resumed.restore_statistics(&checkpoint).await?;
     let statistics = resumed.scan_statistics();
     assert_eq!(statistics.snapshot().await.unwrap().scanned_entries, 200);
+    assert!(matches!(
+        statistics.raw_progress().await.unwrap().detail,
+        ProgressDetail::Full { scanned_files: 200, .. }
+    ));
     // 模拟从持久库加载已确认的目录贡献；本地 SQLite 已完全丢失。
     let mut ledger = DirectoryLedger::new(None, 2).await?;
     sqlx::query("INSERT INTO contributions VALUES ('',?,1,0,0)")
@@ -101,6 +105,13 @@ async fn checkpoint_200_interrupted_300_resumes_to_1000_without_counting_replay(
     assert_eq!(snapshot.retained_entries, 1000);
     assert_eq!(snapshot.filtered_entries, 0);
     assert_eq!(snapshot.counts.regular_file_bytes, 10_000);
+    assert!(matches!(
+        statistics.raw_progress().await.unwrap().detail,
+        ProgressDetail::Full {
+            scanned_files: 1000,
+            ..
+        }
+    ));
     Ok(())
 }
 

@@ -1,9 +1,11 @@
 //! 回调接收事务：明细去重独立于进度排序，提交后才能返回批次 ACK。
 
-use std::cmp::Ordering;
+use std::{cmp::Ordering, collections::BTreeMap};
 
-use app::consumer::stats::diagnostics::{CallbackAck, CallbackIdentity, DiagnosticBatch, MAX_DIAGNOSTIC_BATCH_EVENTS};
-use sqlx::{Sqlite, Transaction};
+use app::consumer::stats::diagnostics::{
+    CallbackAck, CallbackIdentity, DiagnosticBatch, DiagnosticEvent, MAX_DIAGNOSTIC_BATCH_EVENTS,
+};
+use sqlx::{QueryBuilder, Sqlite, Transaction};
 
 use crate::domain::progress::{ProgressReceipt, ProgressSubmission};
 use crate::error::{Result, WebError};
@@ -132,24 +134,7 @@ async fn store_batch(transaction: &mut Transaction<'_, Sqlite>, task_id: &str, b
             Err(invalid_callback())
         };
     }
-    for event in &sanitized.events {
-        let event_json = serde_json::to_string(event)?;
-        let existing: Option<String> =
-            sqlx::query_scalar("SELECT event_json FROM task_diagnostic_events WHERE task_id=? AND event_id=?")
-                .bind(task_id)
-                .bind(&event.event_id)
-                .fetch_optional(&mut **transaction)
-                .await?;
-        if existing.as_ref().is_some_and(|existing| existing != &event_json) {
-            return Err(invalid_callback());
-        }
-        sqlx::query("INSERT OR IGNORE INTO task_diagnostic_events(task_id,event_id,event_json) VALUES (?,?,?)")
-            .bind(task_id)
-            .bind(&event.event_id)
-            .bind(event_json)
-            .execute(&mut **transaction)
-            .await?;
-    }
+    store_events(transaction, task_id, &sanitized.events).await?;
     sqlx::query("INSERT INTO task_diagnostic_batches(task_id,batch_id,batch_json) VALUES (?,?,?)")
         .bind(task_id)
         .bind(&batch.batch_id)
@@ -164,6 +149,46 @@ async fn store_batch(transaction: &mut Transaction<'_, Sqlite>, task_id: &str, b
     let total = parse_omitted(omitted.as_deref())?.saturating_add(batch.omitted_count);
     sqlx::query("INSERT INTO task_diagnostic_summary(task_id,omitted_count) VALUES (?,?) ON CONFLICT(task_id) DO UPDATE SET omitted_count=excluded.omitted_count")
         .bind(task_id).bind(total.to_string()).execute(&mut **transaction).await?;
+    Ok(())
+}
+
+async fn store_events(
+    transaction: &mut Transaction<'_, Sqlite>, task_id: &str, incoming: &[DiagnosticEvent],
+) -> Result<()> {
+    if incoming.is_empty() {
+        return Ok(());
+    }
+    let mut events = BTreeMap::new();
+    for event in incoming {
+        let json = serde_json::to_string(event)?;
+        if events
+            .insert(event.event_id.as_str(), json.clone())
+            .is_some_and(|existing| existing != json)
+        {
+            return Err(invalid_callback());
+        }
+    }
+    let mut select = QueryBuilder::new("SELECT event_id,event_json FROM task_diagnostic_events WHERE task_id=");
+    select.push_bind(task_id).push(" AND event_id IN (");
+    let mut ids = select.separated(",");
+    for id in events.keys() {
+        ids.push_bind(*id);
+    }
+    ids.push_unseparated(")");
+    let existing = select
+        .build_query_as::<(String, String)>()
+        .fetch_all(&mut **transaction)
+        .await?;
+    for (id, json) in existing {
+        if events.get(id.as_str()) != Some(&json) {
+            return Err(invalid_callback());
+        }
+    }
+    let mut insert = QueryBuilder::new("INSERT OR IGNORE INTO task_diagnostic_events(task_id,event_id,event_json) ");
+    insert.push_values(events.iter(), |mut row, (id, json)| {
+        row.push_bind(task_id).push_bind(*id).push_bind(json);
+    });
+    insert.build().execute(&mut **transaction).await?;
     Ok(())
 }
 

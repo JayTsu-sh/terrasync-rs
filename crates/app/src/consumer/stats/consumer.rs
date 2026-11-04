@@ -26,7 +26,7 @@ use tracing::{error, info, trace, warn};
 
 // 内部模块
 use super::accumulator::StatsKind;
-use super::callback_state::{CallbackState, errors};
+use super::callback_state::{CallbackState, ScanRuntimePhase, errors};
 use super::diagnostics::{CallbackAck, safe_diagnostic_text};
 use super::progress_bar::ProgressBar;
 use super::report::ProgressDetail;
@@ -82,7 +82,14 @@ impl StatisticConsumer {
                 StatsKind::Full(stats) => stats.update(&view),
                 StatsKind::Incremental(stats) => stats.scanned.update(&view),
             }
-            self.progress_bar.update_observed("scanned", &view);
+            if self.scan_snapshot.is_none() {
+                self.progress_bar.update_observed("scanned", &view);
+            }
+        }
+    }
+    pub(crate) fn sync_scan_progress(&self) {
+        if let Some(scan) = &self.scan_snapshot {
+            self.progress_bar.update_scan(scan);
         }
     }
     pub fn update_observed_event(&mut self, event: &ObservedScanEvent) {
@@ -116,7 +123,7 @@ impl StatisticConsumer {
                 .outbox
                 .enqueue("operation", &format!("{event:?}"), &reason, path.to_str());
             self.callback.runtime.current_error = Some(reason);
-            self.callback.runtime.state = "failed".into();
+            self.callback.runtime.state = ScanRuntimePhase::Failed;
         }
     }
 

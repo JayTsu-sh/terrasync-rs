@@ -13,15 +13,27 @@ use sqlx::{
 };
 use std::collections::BTreeMap;
 use tempfile::{Builder, TempDir};
+use tracing::info;
 
 const BATCH_SIZE: usize = 256;
 
 pub(crate) struct DirectoryLedger {
     connection: SqliteConnection,
-    _directory: TempDir,
+    directory: TempDir,
     pending: Vec<DirectoryStatistics>,
     baseline: Option<(DirectoryStatisticsStore, i64, u64)>,
     cut: u64,
+}
+
+impl Drop for DirectoryLedger {
+    fn drop(&mut self) {
+        if let Ok(metadata) = self.directory.path().join("contributions.sqlite").metadata() {
+            info!(
+                statistics_cache_bytes = metadata.len(),
+                "Temporary scan statistics cache released"
+            );
+        }
+    }
 }
 
 #[cfg(test)]
@@ -47,7 +59,7 @@ impl DirectoryLedger {
             .await?;
         Ok(Self {
             connection,
-            _directory: directory,
+            directory,
             pending: Vec::with_capacity(BATCH_SIZE),
             baseline,
             cut,

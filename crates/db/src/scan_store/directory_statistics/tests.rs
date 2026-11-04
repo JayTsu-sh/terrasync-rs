@@ -6,6 +6,7 @@ use crate::clickhouse::replica_read::tests::server;
 use crate::scan_store::{ScanStore, with_scan_cancellation};
 use clickhouse::test::{Mock, handlers};
 use tokio_util::sync::CancellationToken;
+use utils::app_config::ClickHouseMode;
 
 fn client(mock: &Mock) -> Client {
     Client::default().with_url(mock.url()).with_validation(false)
@@ -115,7 +116,7 @@ async fn failed_native_reset_does_not_delete_the_directory_ledger_first() -> Res
     let first_drop = mock.add(handlers::record_ddl());
     mock.add(handlers::exception(16));
     let config = ClickHouseConfig {
-        mode: Default::default(),
+        mode: ClickHouseMode::default(),
         cluster: None,
         dsn: mock.url().into(),
         database: "fixture".into(),

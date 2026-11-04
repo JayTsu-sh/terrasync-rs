@@ -113,11 +113,13 @@ struct ScanCommand {
     log: PathBuf,
 }
 fn command(root: &Path, config: &Path, source: &Path, name: &str) -> Result<ScanCommand> {
+    fs::create_dir_all(root.join("tmp"))?;
     let mut command = Command::new(std::env::var("TERRASYNC_TEST_BINARY")?);
     let log = root.join(format!("{name}.log"));
     let output = fs::File::create(&log)?;
     command
         .current_dir(root)
+        .env("TMPDIR", root.join("tmp"))
         .arg("-c")
         .arg(config)
         .args(["scan", "--id", "resume_case", "--resume"])
@@ -129,6 +131,16 @@ fn command(root: &Path, config: &Path, source: &Path, name: &str) -> Result<Scan
         .stdout(Stdio::from(output.try_clone()?))
         .stderr(Stdio::from(output));
     Ok(ScanCommand { command, log })
+}
+
+fn discard_pod_local_state(root: &Path, phase: &str) -> Result {
+    for name in ["jobs", "tmp"] {
+        let path = root.join(name);
+        if path.exists() {
+            fs::rename(path, root.join(format!("old-pod-{phase}-{name}")))?;
+        }
+    }
+    Ok(())
 }
 
 async fn count(database: &TestDatabase, sql: &str) -> Result<u64> {
@@ -232,6 +244,7 @@ async fn assert_cumulative_observations(database: &TestDatabase) -> Result {
         Some(observed),
         "checkpoint count must be the unique cumulative logical scan count"
     );
+    assert!(observed <= 1000, "checkpoint must never add replayed entries");
     assert_eq!(scan["filtered_entries"].as_u64(), Some(0));
     assert_eq!(scan["retained_entries"].as_u64(), Some(observed));
     Ok(())
@@ -305,11 +318,15 @@ async fn killed_scan_resumes_full_and_incremental_without_skips_or_duplicate_eve
     for index in 0..30 {
         let dir = source.join(format!("dir{index:03}"));
         fs::create_dir(&dir)?;
-        for number in 0..3 {
+        for number in 0..if index < 20 { 27 } else { 26 } {
             fs::write(dir.join(format!("file{number}")), b"value")?;
         }
     }
     fs::write(source.join("victim"), b"will be deleted")?;
+    for number in 0..169 {
+        fs::write(source.join(format!("root-file{number}")), b"value")?;
+    }
+    assert_eq!(paths(&source)?.len(), 1000);
     let config = work.path().join("config.toml");
     let dsn = serde_json::to_string(
         &std::env::var("LAB_CLICKHOUSE_DSN").unwrap_or_else(|_| "http://10.131.9.11:8123".into()),
@@ -347,6 +364,7 @@ async fn killed_scan_resumes_full_and_incremental_without_skips_or_duplicate_eve
         before,
         count(&database, "SELECT version FROM scan_resume_resume_case FINAL").await?
     );
+    discard_pod_local_state(work.path(), "full-hard")?;
     interrupt_after_checkpoint(
         command(work.path(), &config, &source, "full-resume-interrupted")?,
         &database,
@@ -354,6 +372,7 @@ async fn killed_scan_resumes_full_and_incremental_without_skips_or_duplicate_eve
     )
     .await?;
     assert_cumulative_observations(&database).await?;
+    discard_pod_local_state(work.path(), "full-graceful")?;
     complete(command(work.path(), &config, &source, "full-resumed")?).await?;
     let resumed_full: (bool, u8, i64) = database
         .query("SELECT incremental,generation,event_time FROM scan_resume_resume_case FINAL")
@@ -414,6 +433,7 @@ async fn killed_scan_resumes_full_and_incremental_without_skips_or_duplicate_eve
         .await?,
         0
     );
+    discard_pod_local_state(work.path(), "incremental-hard")?;
     interrupt_after_checkpoint(
         command(work.path(), &config, &source, "incremental-resume-interrupted")?,
         &database,
@@ -421,6 +441,7 @@ async fn killed_scan_resumes_full_and_incremental_without_skips_or_duplicate_eve
     )
     .await?;
     assert_cumulative_observations(&database).await?;
+    discard_pod_local_state(work.path(), "incremental-graceful")?;
     complete(command(work.path(), &config, &source, "incremental-resumed")?).await?;
     let resumed_incremental: (bool, u8, i64) = database
         .query("SELECT incremental,generation,event_time FROM scan_resume_resume_case FINAL")

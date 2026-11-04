@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 
 use super::accumulator::{DeltaCounts, ErrorStats, FileSizeRange, StatsKind, TimeRange};
-pub use super::callback_state::ScanRuntimeState;
+pub use super::callback_state::{ScanRuntimePhase, ScanRuntimeState};
 use super::diagnostics::{CallbackIdentity, DiagnosticBatch};
 use crate::config::JobType;
 pub use crate::scan::statistics::ScanSnapshot;

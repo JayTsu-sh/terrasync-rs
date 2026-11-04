@@ -24,7 +24,7 @@ use tracing::{Instrument, debug, error, info_span, warn};
 
 // 内部模块
 use super::stats::callback_state::{SavedStatistics, StatisticsCheckpoint};
-use super::stats::diagnostics::safe_diagnostic_text;
+use super::stats::recovery_progress::RecoveryProgress;
 use crate::broadcast::BroadcastForwarder;
 use crate::config::{ConsumerConfig, JobType};
 use crate::consumer::DatabaseConsumer;
@@ -37,10 +37,9 @@ use crate::consumer::stats::{
 use crate::consumer::traits::Consumer;
 use crate::error::{AppError, Result};
 use crate::scan::statistics::{ScanCapabilities, ScanCounts, ScanSnapshot};
-use data_mover::traversal::{TraversalRecoveryState, TraversalRecoveryStatus};
+use data_mover::traversal::TraversalRecoveryStatus;
 use db::clickhouse::scan_resume_statistics::ScanResumeStatistics;
 use db::scan_store::ScanFinalEvent;
-use tokio_util::task::AbortOnDropHandle;
 
 /// 消费者管理器 - 负责创建、启动和管理多个消费者实例
 pub struct ConsumerManager {
@@ -59,63 +58,24 @@ pub(crate) struct ScanStatistics {
 }
 
 impl ScanStatistics {
+    #[cfg(test)]
+    pub(crate) async fn raw_progress(&self) -> Option<ProgressReport> {
+        match &self.inner {
+            Some(sc) => {
+                let sc = sc.lock().await;
+                Some(sc.progress_bar.to_report(sc.stats.job_id()))
+            }
+            None => None,
+        }
+    }
     pub(crate) async fn snapshot(&self) -> Option<ScanSnapshot> {
         match &self.inner {
             Some(sc) => sc.lock().await.scan_snapshot.clone(),
             None => None,
         }
     }
-    pub(crate) fn watch_recovery(&self, status: Option<&TraversalRecoveryStatus>) -> Option<AbortOnDropHandle<()>> {
-        let mut receiver = status?.subscribe();
-        let consumer = self.inner.clone()?;
-        Some(AbortOnDropHandle::new(tokio::spawn(async move {
-            let mut attempts = 0;
-            let mut recoveries = 0;
-            loop {
-                let state = receiver.borrow_and_update().clone();
-                {
-                    let mut consumer = consumer.lock().await;
-                    let callback = &mut consumer.callback;
-                    match state {
-                        TraversalRecoveryState::Running { recoveries: current } => {
-                            callback.runtime.successful_recoveries = callback
-                                .runtime
-                                .successful_recoveries
-                                .saturating_add(current.saturating_sub(recoveries));
-                            recoveries = current;
-                            attempts = 0;
-                            callback.runtime.state = "running".into();
-                            callback.runtime.current_error = None;
-                        }
-                        TraversalRecoveryState::Recovering { first_failure, attempt } => {
-                            if callback.runtime.state != "recovering" {
-                                callback.runtime.network_faults = callback.runtime.network_faults.saturating_add(1);
-                                callback.outbox.enqueue(
-                                    "storage",
-                                    "network_recovering",
-                                    &first_failure.to_string(),
-                                    Some(first_failure.path.as_str()),
-                                );
-                            }
-                            callback.runtime.recovery_attempts = callback
-                                .runtime
-                                .recovery_attempts
-                                .saturating_add(attempt.saturating_sub(attempts));
-                            attempts = attempt;
-                            callback.runtime.state = "recovering".into();
-                            callback.runtime.current_error = Some(safe_diagnostic_text(&first_failure.to_string()));
-                        }
-                        TraversalRecoveryState::Failed { failure } => {
-                            callback.runtime.state = "failed".into();
-                            callback.runtime.current_error = Some(safe_diagnostic_text(&failure.to_string()));
-                        }
-                    }
-                }
-                if receiver.changed().await.is_err() {
-                    break;
-                }
-            }
-        })))
+    pub(crate) async fn watch_recovery(&self, status: Option<&TraversalRecoveryStatus>) -> Option<RecoveryProgress> {
+        Some(RecoveryProgress::start(self.inner.clone()?, status?.clone()).await)
     }
     pub(crate) async fn replace_directory_contributions(&self, changes: &[(ScanCounts, ScanCounts)], replayed: u64) {
         if let Some(sc) = &self.inner {
@@ -126,6 +86,7 @@ impl ScanStatistics {
                     snapshot.replace(old, new);
                 }
             }
+            sc.sync_scan_progress();
         }
     }
 
@@ -198,6 +159,7 @@ impl ConsumerManager {
             if sc.scan_snapshot.is_none() {
                 sc.scan_snapshot = Some(ScanSnapshot::new(ScanCapabilities::from_storage(storage, tags)));
             }
+            sc.sync_scan_progress();
         }
         Ok(())
     }
@@ -376,6 +338,7 @@ impl ConsumerManager {
             if let Err(error) = sc.progress_bar.restore(&report) {
                 error!(%error, "Failed to reconcile scan progress");
             }
+            sc.sync_scan_progress();
         }
     }
 
@@ -421,6 +384,7 @@ impl ConsumerManager {
             sc.progress_bar.restore(&report)?;
             sc.scan_snapshot = report.scan;
             sc.stats = stats;
+            sc.sync_scan_progress();
             if let Some(callback) = callback {
                 sc.callback.restore_checkpoint(callback)?;
             }

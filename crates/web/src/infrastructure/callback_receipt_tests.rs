@@ -413,3 +413,31 @@ async fn callback_http_failure_retries_same_batch_and_only_acknowledges_committe
         .unwrap();
     assert_eq!(count, 1);
 }
+
+#[tokio::test]
+async fn a_conflicting_event_id_inside_one_batch_rolls_back_all_details() -> Result<()> {
+    let (pool, repo) = fixture().await?;
+    let identity = identity("round", "attempt", 1, 2, 1);
+    let mut batch = batch(&identity);
+    let mut conflict = batch.events[0].clone();
+    conflict.message = "a different actual event".into();
+    batch.events.push(conflict);
+    assert!(
+        repo.receive(ProgressSubmission {
+            progress: &progress("conflict", false),
+            identity: Some(&identity),
+            diagnostics: Some(&batch),
+            execution_id: Some("execution"),
+            final_stats: None,
+        })
+        .await
+        .is_err()
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT count() FROM task_diagnostic_events")
+            .fetch_one(&pool)
+            .await?,
+        0
+    );
+    Ok(())
+}

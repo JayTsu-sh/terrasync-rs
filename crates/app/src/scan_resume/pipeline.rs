@@ -67,7 +67,7 @@ pub(super) async fn consume(
     let prefetch_capacity = Some(batch_size.saturating_mul(writer_workers).saturating_mul(windows));
     let mut producer_state = state.clone();
     let producer_statistics = statistics.scan_statistics();
-    let _recovery_progress = producer_statistics.watch_recovery(source.recovery_status());
+    let recovery_progress = producer_statistics.watch_recovery(source.recovery_status()).await;
     let count_statistics = producer_statistics.clone();
     let producer_cancel = cancel.clone();
     // SQL 行编码不能占住遍历生产者所在任务；退出时仍等待写入与统计屏障。
@@ -123,6 +123,9 @@ pub(super) async fn consume(
     };
     // producer 独占可变 state；writer 只需要运行初始值，禁止跨检查点共享可变游标。
     let (traversal_result, persisted, statistics_result) = tokio::join!(traversal_task, writer, statistics_task);
+    if let Some(progress) = recovery_progress {
+        progress.finish().await;
+    }
     statistics_result?;
     let (producer_state, traversal_outcome) = traversal_result?;
     *state = producer_state;
