@@ -3,6 +3,7 @@ use super::*;
 use crate::clickhouse::scan_resume::{COMPLETED, RUNNING};
 use crate::scan_store::ScanFinalEvent;
 use crate::scan_store::with_scan_cancellation;
+use clickhouse::test::{Mock, handlers};
 use data_mover::model::{
     BackendIdentity, BackendKind, EntryKind, IdentityStrength, ObservedEntry, SourceIdentity, StoragePath,
     StorageTimestamp, SymlinkTarget, SymlinkTargetEncoding, TimePrecision,
@@ -10,8 +11,60 @@ use data_mover::model::{
 use std::sync::atomic::AtomicUsize;
 use storage_adapter::ChangeKind;
 use storage_adapter::observed_scan::{ObservedItem, ObservedScanEvent};
-use tokio::{sync::Barrier, task::JoinSet};
+use tokio::{join, sync::Barrier, task::JoinSet};
 use tokio_util::sync::CancellationToken;
+use utils::app_config::ClickHouseMode;
+
+fn mock_schema_store(mock: &Mock) -> Result<ClusterScanStore> {
+    ClusterScanStore::new(
+        &ClickHouseConfig {
+            mode: ClickHouseMode::Cluster,
+            cluster: Some("clickhouse".into()),
+            dsn: mock.url().into(),
+            database: "schema_once".into(),
+            username: "default".into(),
+            password: None,
+            dial_timeout: 1,
+            read_timeout: 1,
+        },
+        "clickhouse",
+        "job",
+    )
+}
+
+#[tokio::test]
+async fn schema_initialization_is_shared_by_concurrent_store_and_writer_calls() -> Result<()> {
+    let mock = Mock::new();
+    mock.add(handlers::provide::<String>([]));
+    let statements: Vec<_> = (0..16).map(|_| mock.add(handlers::record_ddl())).collect();
+    let store = mock_schema_store(&mock)?;
+    let writer = store.batch_writer();
+    let (first, concurrent) = join!(store.initialize(), writer.initialize());
+    first?;
+    concurrent?;
+    store.initialize().await?;
+    writer.initialize().await?;
+    for statement in statements {
+        assert!(statement.query().await.contains("ON CLUSTER `clickhouse`"));
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn schema_initialization_failure_can_retry_before_becoming_ready() -> Result<()> {
+    let mock = Mock::new();
+    mock.add(handlers::provide::<String>([]));
+    mock.add(handlers::exception(42));
+    let store = mock_schema_store(&mock)?;
+    assert!(store.initialize().await.is_err());
+    mock.add(handlers::provide::<String>([]));
+    for _ in 0..16 {
+        mock.add(handlers::record_ddl());
+    }
+    store.initialize().await?;
+    store.batch_writer().initialize().await?;
+    Ok(())
+}
 
 #[tokio::test]
 async fn cancelled_quorum_write_does_not_start_another_attempt() {

@@ -7,7 +7,7 @@ use std::future::Future;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, OnceCell};
 
 use clickhouse::Client;
 use clickhouse::error::Error as ClickHouseError;
@@ -56,6 +56,7 @@ pub(crate) struct ClusterScanStore {
     generation: AtomicU8,
     batch_id: u64,
     writes: Arc<NativeWriteGates>,
+    schema_ready: Arc<OnceCell<()>>,
 }
 
 /// 同一作业内的顺序 quorum 写入按表协调，避免并行 worker 重传整批数据。
@@ -126,6 +127,7 @@ impl ClusterScanStore {
             generation: AtomicU8::new(self.generation.load(Ordering::Relaxed)),
             batch_id: 0,
             writes: Arc::clone(&self.writes),
+            schema_ready: Arc::clone(&self.schema_ready),
         }
     }
 
@@ -143,6 +145,7 @@ impl ClusterScanStore {
             .with_option("skip_unavailable_shards", "0")
             .with_option("optimize_skip_unused_shards", "1")
             .with_option("distributed_product_mode", "local")
+            .with_option("distributed_ddl_output_mode", "throw")
             .with_option("distributed_ddl_task_timeout", "60");
         Ok(Self {
             client,
@@ -153,6 +156,7 @@ impl ClusterScanStore {
             generation: AtomicU8::new(0),
             batch_id: 0,
             writes: Arc::new(NativeWriteGates::default()),
+            schema_ready: Arc::new(OnceCell::new()),
         })
     }
 
@@ -188,6 +192,12 @@ impl ClusterScanStore {
     }
 
     pub(crate) async fn initialize(&self) -> Result<()> {
+        // 同一执行及其 writer 共享就绪状态；失败不缓存，后续调用仍可重试。
+        self.schema_ready.get_or_try_init(|| self.initialize_schema()).await?;
+        Ok(())
+    }
+
+    async fn initialize_schema(&self) -> Result<()> {
         let columns = self
             .client
             .query("SELECT name FROM system.columns WHERE database=? AND table='base_local'")
