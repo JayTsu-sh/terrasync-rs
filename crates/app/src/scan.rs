@@ -7,6 +7,9 @@ use tokio_util::sync::CancellationToken;
 use utils::app_config::AppConfig;
 
 pub(crate) mod cancellation;
+pub(crate) mod directory_ledger;
+mod directory_ledger_codec;
+pub(crate) mod statistics;
 mod stream;
 
 #[derive(Debug, Clone, Copy, PartialEq)]

@@ -376,6 +376,20 @@ pub struct ErrorStats {
 }
 
 impl ErrorStats {
+    pub(crate) fn merge_cumulative(&mut self, other: &Self) {
+        macro_rules! fields { ($($field:ident),*) => { $(self.$field = self.$field.max(other.$field);)* }; }
+        fields!(
+            scan,
+            copy,
+            copy_acl,
+            copy_xattr,
+            delete,
+            rename,
+            symlink_op,
+            pack,
+            integrity_check
+        );
+    }
     pub fn record(&mut self, event: ErrorEvent) {
         match event {
             ErrorEvent::Scan => self.scan += 1,

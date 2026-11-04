@@ -34,10 +34,15 @@ pub fn set_progress_callback_base_url(url: String) {
 }
 
 /// 构造指定任务的完整回调 URL
-fn progress_callback_url_for(task_id: &str) -> Option<String> {
-    PROGRESS_CALLBACK_BASE_URL
-        .get()
-        .map(|base| format!("{}/tasks/{}/progress", base.trim_end_matches('/'), task_id))
+fn progress_callback_url_for(task_id: &str, execution_id: &str) -> Option<String> {
+    PROGRESS_CALLBACK_BASE_URL.get().map(|base| {
+        format!(
+            "{}/tasks/{}/progress?execution_id={}",
+            base.trim_end_matches('/'),
+            task_id,
+            execution_id
+        )
+    })
 }
 
 /// 最大并发任务数。`app::scan`/`sync` 内部使用了非 `Send` 的 `dyn Consumer`，
@@ -213,6 +218,7 @@ impl TaskRunner {
                     }
                     run_migration_task(
                         &task_id,
+                        &execution_id,
                         &job_id,
                         &job_dir,
                         task_type,
@@ -339,8 +345,8 @@ impl TaskRunner {
 /// 执行具体的迁移任务（调用 app 层）；统计数据由 `is_final` 回调写入 `SQLite`
 #[allow(clippy::too_many_arguments)]
 async fn run_migration_task(
-    task_id: &str, job_id: &str, job_dir: &str, task_type: TaskType, task_config: &TaskConfig, source_url: &str,
-    dest_url: Option<&str>, cancel_token: CancellationToken, config_repo: Arc<dyn ConfigRepository>,
+    task_id: &str, execution_id: &str, job_id: &str, job_dir: &str, task_type: TaskType, task_config: &TaskConfig,
+    source_url: &str, dest_url: Option<&str>, cancel_token: CancellationToken, config_repo: Arc<dyn ConfigRepository>,
 ) -> Result<()> {
     // 从 SQLite 读取 ClickHouse 配置，覆盖 AppConfig 全局配置并校验连通性
     let ch_cfg = select! {
@@ -356,7 +362,7 @@ async fn run_migration_task(
             result.map_err(|_| WebError::ConnectionTestFailed("请先在设置中检查 ClickHouse 数据库配置".to_string()))?,
     }
 
-    let callback_url = progress_callback_url_for(task_id);
+    let callback_url = progress_callback_url_for(task_id, execution_id);
 
     match task_type {
         TaskType::Scan => {

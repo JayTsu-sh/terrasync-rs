@@ -35,14 +35,16 @@ rustls        = { workspace = true }
 transport     = { workspace = true, features = ["quic"] }
 tokio-util    = { workspace = true, features = ["rt"] }
 utils         = { workspace = true }
+uuid          = { workspace = true }
+sqlx          = { version = "0.8", features = ["runtime-tokio", "sqlite"] }
+tempfile      = "3"
 
 [lints]
 workspace = true
 
 [dev-dependencies]
-clickhouse = "0.14.2"
+clickhouse = { version = "0.14.2", features = ["test-util"] }
 serial_test = "3.4.0"
-tempfile = "3"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61.2", features = [

@@ -225,18 +225,15 @@ async fn assert_cumulative_observations(database: &TestDatabase) -> Result {
         .query("SELECT observed_entries,statistics FROM scan_resume_resume_case FINAL")
         .fetch_one()
         .await?;
-    let attempt: serde_json::Value = serde_json::from_str(&saved)?;
-    let attempt = attempt[0]
-        .get("Full")
-        .or_else(|| attempt[0].get("Incremental").and_then(|value| value.get("scanned")))
-        .ok_or("missing scanned statistics")?;
-    let attempt_entries = attempt["dir_count"].as_u64().ok_or("missing directory count")?
-        + attempt["regular_file_count"].as_u64().ok_or("missing file count")?
-        + attempt["symlink_count"].as_u64().ok_or("missing symlink count")?;
+    let checkpoint: serde_json::Value = serde_json::from_str(&saved)?;
+    let scan = &checkpoint["report"]["scan"];
     assert_eq!(
-        attempt_entries, observed,
-        "live resume statistics must include the previous checkpoint plus new observations"
+        scan["scanned_entries"].as_u64(),
+        Some(observed),
+        "checkpoint count must be the unique cumulative logical scan count"
     );
+    assert_eq!(scan["filtered_entries"].as_u64(), Some(0));
+    assert_eq!(scan["retained_entries"].as_u64(), Some(observed));
     Ok(())
 }
 
@@ -253,17 +250,33 @@ async fn assert_paths(database: &TestDatabase, source: &Path) -> Result {
         .fetch_one::<String>()
         .await?;
     let snapshot: serde_json::Value = serde_json::from_str(&raw)?;
-    let stats = snapshot[0]
+    let stats = snapshot["stats"]
         .get("Full")
-        .or_else(|| snapshot[0].get("Incremental").and_then(|value| value.get("scanned")))
+        .or_else(|| {
+            snapshot["stats"]
+                .get("Incremental")
+                .and_then(|value| value.get("scanned"))
+        })
         .ok_or("missing durable statistics")?;
+    assert_eq!(
+        snapshot["report"]["scan"]["scanned_entries"].as_u64(),
+        Some(actual.len() as u64)
+    );
+    assert_eq!(
+        snapshot["report"]["scan"]["retained_entries"].as_u64(),
+        Some(actual.len() as u64)
+    );
+    assert_eq!(snapshot["report"]["scan"]["filtered_entries"].as_u64(), Some(0));
+    assert_eq!(snapshot["report"]["scan"]["complete"].as_bool(), Some(true));
     let files = count(database, "SELECT countIf(is_dir=0) FROM base_resume_case FINAL").await?;
     let dirs = count(database, "SELECT countIf(is_dir=1) FROM base_resume_case FINAL").await?;
     assert_eq!(
         stats["regular_file_count"].as_u64(),
         Some(files),
         "resume stats kind={:?}; file count mismatch",
-        snapshot[0].as_object().map(|value| value.keys().collect::<Vec<_>>())
+        snapshot["stats"]
+            .as_object()
+            .map(|value| value.keys().collect::<Vec<_>>())
     );
     assert_eq!(
         stats["dir_count"].as_u64(),

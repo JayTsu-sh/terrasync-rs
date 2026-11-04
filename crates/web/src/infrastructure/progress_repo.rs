@@ -1,7 +1,8 @@
 use async_trait::async_trait;
 use sqlx::{Row, SqlitePool};
 
-use crate::domain::progress::TaskProgress;
+use super::callback_receipt;
+use crate::domain::progress::{DiagnosticPage, ProgressReceipt, ProgressSubmission, TaskProgress};
 use crate::domain::repository::ProgressRepository;
 use crate::error::Result;
 use crate::infrastructure::db::parse_rfc3339;
@@ -18,24 +19,39 @@ impl SqliteProgressRepo {
 
 #[async_trait]
 impl ProgressRepository for SqliteProgressRepo {
-    async fn upsert(&self, p: &TaskProgress) -> Result<()> {
-        sqlx::query(
-            r"INSERT INTO task_progress (task_id, report_json, is_final, updated_at)
-            VALUES (?1, ?2, ?3, ?4)
-            ON CONFLICT(task_id) DO UPDATE SET
-                report_json = excluded.report_json,
-                is_final = excluded.is_final,
-                updated_at = excluded.updated_at
-            ",
-        )
-        .bind(&p.task_id)
-        .bind(&p.report_json)
-        .bind(p.is_final)
-        .bind(p.updated_at.to_rfc3339())
-        .execute(&self.pool)
-        .await?;
+    async fn receive(&self, submission: ProgressSubmission<'_>) -> Result<ProgressReceipt> {
+        let mut transaction = self.pool.begin().await?;
+        let receipt = callback_receipt::receive(&mut transaction, submission).await?;
+        transaction.commit().await?;
+        Ok(receipt)
+    }
 
-        Ok(())
+    async fn diagnostics(&self, task_id: &str, offset: u32, limit: u32) -> Result<DiagnosticPage> {
+        let limit = limit.clamp(1, 100);
+        let rows: Vec<String> = sqlx::query_scalar(
+            "SELECT event_json FROM task_diagnostic_events WHERE task_id=? ORDER BY rowid LIMIT ? OFFSET ?",
+        )
+        .bind(task_id)
+        .bind(limit + 1)
+        .bind(offset)
+        .fetch_all(&self.pool)
+        .await?;
+        let next_offset = (rows.len() > limit as usize).then(|| offset.saturating_add(limit));
+        let events = rows
+            .into_iter()
+            .take(limit as usize)
+            .map(|json| serde_json::from_str(&json))
+            .collect::<std::result::Result<_, _>>()?;
+        let omitted: Option<String> =
+            sqlx::query_scalar("SELECT omitted_count FROM task_diagnostic_summary WHERE task_id=?")
+                .bind(task_id)
+                .fetch_optional(&self.pool)
+                .await?;
+        Ok(DiagnosticPage {
+            events,
+            omitted_count: callback_receipt::parse_omitted(omitted.as_deref())?,
+            next_offset,
+        })
     }
 
     async fn find_by_task_id(&self, task_id: &str) -> Result<Option<TaskProgress>> {

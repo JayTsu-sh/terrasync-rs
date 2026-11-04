@@ -425,7 +425,7 @@ mod tests {
             .into_iter()
             .map(|item| match item {
                 ResumableScanItem::Checkpoint(bytes) => bytes[0],
-                ResumableScanItem::Entry(_) => panic!("unexpected entry"),
+                ResumableScanItem::Entry(_) | ResumableScanItem::Statistics(_) => panic!("unexpected entry"),
             })
             .collect();
         assert_eq!(markers, [1, 2]);

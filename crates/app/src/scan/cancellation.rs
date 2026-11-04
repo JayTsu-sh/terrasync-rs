@@ -115,7 +115,10 @@ pub(crate) async fn scope<T>(
 mod tests {
     use super::*;
     use clickhouse::Client;
-    use db::{ClickHouseConfig, DatabaseError, scan_store::ScanStore};
+    use db::{
+        ClickHouseConfig, DatabaseError,
+        scan_store::{ScanDirectoryStatisticsRow, ScanStore},
+    };
     use std::sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -149,6 +152,15 @@ mod tests {
 
     #[tokio::test]
     async fn empty_kill_does_not_finish_a_request_still_waiting_for_its_response() {
+        assert_empty_kill_request_is_drained(false).await;
+    }
+
+    #[tokio::test]
+    async fn directory_statistics_write_is_drained_before_cancelled_scope_returns() {
+        assert_empty_kill_request_is_drained(true).await;
+    }
+
+    async fn assert_empty_kill_request_is_drained(directory_statistics: bool) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
         let received = Arc::new(Notify::new());
@@ -186,14 +198,22 @@ mod tests {
                     }
                     if String::from_utf8_lossy(&bytes).contains("KILL") {
                         kill_seen.notify_one();
-                    } else {
+                    } else if String::from_utf8_lossy(&bytes).contains("INSERT") {
                         seen.notify_one();
                         allow.notified().await;
                         written.store(true, Ordering::SeqCst);
                     }
-                    let _ = socket
-                        .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
-                        .await;
+                    let body = if String::from_utf8_lossy(&bytes).contains("DESCRIBE") {
+                        directory_schema()
+                    } else {
+                        Vec::new()
+                    };
+                    let header = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    let _ = socket.write_all(header.as_bytes()).await;
+                    let _ = socket.write_all(&body).await;
                 });
             }
         });
@@ -214,11 +234,24 @@ mod tests {
         let work = scope(store.query_cancellation(), cancel.clone(), async move {
             operation_cancel
                 .operation(async move {
-                    client
-                        .query("INSERT INTO fixture VALUES (1)")
-                        .execute()
-                        .await
-                        .map_err(DatabaseError::from)
+                    if directory_statistics {
+                        store
+                            .write_directory_statistics(
+                                1,
+                                1,
+                                &[ScanDirectoryStatisticsRow {
+                                    directory: "a".into(),
+                                    payload: "confirmed-contribution".into(),
+                                }],
+                            )
+                            .await
+                    } else {
+                        client
+                            .query("INSERT INTO fixture VALUES (1)")
+                            .execute()
+                            .await
+                            .map_err(DatabaseError::from)
+                    }
                 })
                 .await
         });
@@ -239,6 +272,37 @@ mod tests {
         assert!(completed.load(Ordering::SeqCst));
         server.abort();
         let _ = server.await;
+    }
+
+    fn directory_schema() -> Vec<u8> {
+        let mut bytes = vec![7];
+        let names = [
+            "name",
+            "type",
+            "default_type",
+            "default_expression",
+            "comment",
+            "codec_expression",
+            "ttl_expression",
+        ];
+        for value in names.into_iter().chain(["String"; 7]) {
+            bytes.push(value.len() as u8);
+            bytes.extend_from_slice(value.as_bytes());
+        }
+        for (name, kind) in [
+            ("job_id", "String"),
+            ("round", "Int64"),
+            ("version", "UInt64"),
+            ("revision", "UInt64"),
+            ("directory", "String"),
+            ("payload", "String"),
+        ] {
+            for value in [name, kind, "", "", "", "", ""] {
+                bytes.push(value.len() as u8);
+                bytes.extend_from_slice(value.as_bytes());
+            }
+        }
+        bytes
     }
 
     #[tokio::test]

@@ -7,7 +7,9 @@
 //! - `consumer` — StatisticConsumer（聚合以上模块 + HTTP 回调）
 
 pub mod accumulator;
+pub(crate) mod callback_state;
 pub mod consumer;
+pub mod diagnostics;
 pub mod progress_bar;
 pub mod report;
 

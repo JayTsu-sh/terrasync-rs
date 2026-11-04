@@ -10,7 +10,9 @@ use data_mover::model::ObservedEntry;
 use std::sync::Arc;
 use storage_adapter::observed_scan::ObservedScanEvent;
 
+pub(crate) mod directory_statistics;
 pub(crate) mod queries;
+pub use directory_statistics::{DirectoryStatisticsStore, ScanDirectoryStatisticsRow};
 pub use queries::{ScanQueryCancellation, with_scan_cancellation};
 
 enum Store {
@@ -65,6 +67,7 @@ pub struct ScanStore {
     inner: Store,
     job_id: String,
     queries: ScanQueryCancellation,
+    directory_statistics: DirectoryStatisticsStore,
 }
 
 macro_rules! delegate {
@@ -82,6 +85,7 @@ impl ScanStore {
                 inner: Store::Cluster(store.batch_writer()),
                 job_id: self.job_id.clone(),
                 queries: self.queries.clone(),
+                directory_statistics: self.directory_statistics.clone(),
             }),
             Store::Single(_) => None,
         }
@@ -98,10 +102,15 @@ impl ScanStore {
             Store::Single(store) => store.tag_scan_queries(queries.comment()),
             Store::Cluster(store) => store.tag_scan_queries(queries.comment()),
         }
+        let directory_statistics = match &inner {
+            Store::Single(store) => store.directory_statistics_ledger(),
+            Store::Cluster(store) => store.directory_statistics_ledger()?,
+        };
         Ok(Self {
             inner,
             job_id: job_id.into(),
             queries,
+            directory_statistics,
         })
     }
     pub fn query_cancellation(&self) -> ScanQueryCancellation {
@@ -133,7 +142,33 @@ impl ScanStore {
                 }
                 Ok(())
             }
-        }
+        }?;
+        // 原游标和结果全部失效后才能清贡献；中途失败仍保留可恢复检查点所需的历史。
+        self.directory_statistics.clear_job().await
+    }
+    /// 目录 producer 可独立持有的同一执行域句柄，不启用额外批次 writer。
+    pub fn directory_statistics_store(&self) -> DirectoryStatisticsStore {
+        self.directory_statistics.clone()
+    }
+    /// 目录贡献是追加历史；读取 cut 前先过滤版本，不能用 FINAL 丢弃旧检查点。
+    pub async fn prepare_directory_statistics(&self) -> Result<()> {
+        self.directory_statistics.prepare().await
+    }
+    /// 同一轮的版本须单调推进，恢复时先截去未提交的后续版本。
+    pub async fn write_directory_statistics(
+        &self, round: i64, version: u64, rows: &[ScanDirectoryStatisticsRow],
+    ) -> Result<()> {
+        self.directory_statistics.write(round, version, rows).await
+    }
+    /// 仅返回指定目录中在 cut 时已存在的贡献，不加载整轮目录到内存。
+    pub async fn load_directory_statistics(
+        &self, round: i64, cut: u64, paths: &[String],
+    ) -> Result<Vec<ScanDirectoryStatisticsRow>> {
+        self.directory_statistics.load(round, cut, paths).await
+    }
+    /// 持有作业执行锁且停止旧 writer 后调用，确认删除完成才开始新的恢复写入。
+    pub async fn truncate_directory_statistics(&self, round: i64, committed_cut: u64) -> Result<()> {
+        self.directory_statistics.truncate(round, committed_cut).await
     }
     pub async fn prepare_incremental(&self) -> Result<()> {
         match &self.inner {

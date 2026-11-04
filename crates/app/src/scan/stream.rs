@@ -1,42 +1,41 @@
 //! 不落库扫描的轻量通道；与持久化通道共享取消及故障域。
+#[cfg(test)]
+use crate::broadcast::BroadcastForwarder;
 use crate::{
-    broadcast::{BroadcastForwarder, DEFAULT_CHANNEL_CAPACITY},
-    config::{JobType, initialize_consumer_config, initialize_scan_config},
-    consumer::ConsumerManager,
-    dir_walker::scan_walkdir,
+    config::{JobType, initialize_consumer_config},
+    consumer::{ConsumerManager, ScanStatistics},
     error::{AppError, Result},
-    scan::{ScanRequest, ScanType, cancellation::ScanCancellation},
+    scan::{ScanRequest, cancellation::ScanCancellation, directory_ledger::DirectoryLedger},
+    storage_factory::{StorageRole, create_storage_for_role},
 };
-use std::time::Duration;
+use data_mover::{model::ObservedEntry, traversal::TraversalOutcome};
+use std::{num::NonZeroUsize, sync::Arc, time::Duration};
+use storage_adapter::{ResumableScan, ResumableScanItem, StorageError, WalkOptions, filter::parse_filter_expression};
+#[cfg(test)]
 use storage_adapter::{StorageEntryMessage, WalkDirAsyncIterator};
+#[cfg(test)]
 use tokio::task::JoinHandle;
+use tokio::time::{MissedTickBehavior, interval};
 use utils::app_config::AppConfig;
 
 pub(super) async fn run(request: ScanRequest<'_>, config: AppConfig) -> Result<()> {
     let cancel = ScanCancellation::new(request.cancel.clone());
-    let scan_config = initialize_scan_config(
-        request.job_id,
-        request.path,
-        request.depth,
-        ScanType::Full,
-        request.include,
-        request.exclude,
-        config.scan.concurrency,
-        config.scan.include_tags,
-        &None,
-        false,
-        0,
-    )?;
-    let iterator = cancel
-        .interrupt(scan_walkdir(
-            scan_config,
-            Duration::from_secs(config.scan.operation_timeout_secs),
-            Duration::from_secs(config.scan.recovery_window_secs),
-        ))
+    let storage = cancel
+        .interrupt(create_storage_for_role(request.path, None, false, StorageRole::Source))
         .await??;
-    let _failure_watch = iterator
-        .failure_signal()
-        .map(|failure| cancel.watch_storage_failure(failure));
+    let options = WalkOptions {
+        depth: NonZeroUsize::new(request.depth as usize).map(NonZeroUsize::get),
+        match_expressions: request.include.as_deref().map(parse_filter_expression).transpose()?,
+        exclude_expressions: request.exclude.as_deref().map(parse_filter_expression).transpose()?,
+        concurrency: config.scan.concurrency,
+        include_tags: config.scan.include_tags,
+        operation_timeout: Some(Duration::from_secs(config.scan.operation_timeout_secs)),
+        recovery_window: Some(Duration::from_secs(config.scan.recovery_window_secs)),
+        ..Default::default()
+    };
+    let mut source = storage.resumable_scan(&options, None, cancel.token().clone(), Duration::from_secs(60))?;
+    let failure = source.failure_signal();
+    let _failure_watch = cancel.watch_storage_failure(failure.clone());
     let consumer_config = initialize_consumer_config(
         request.job_id,
         request.job_dir,
@@ -46,21 +45,36 @@ pub(super) async fn run(request: ScanRequest<'_>, config: AppConfig) -> Result<(
         request.callback_url,
     )?;
     let mut manager = ConsumerManager::new(&consumer_config).await?;
-    let mut forwarder = BroadcastForwarder::new(DEFAULT_CHANNEL_CAPACITY);
+    manager
+        .initialize_scan_statistics(&storage, options.include_tags, None)
+        .await?;
+    let statistics = manager.scan_statistics();
+    let _recovery_progress = statistics.watch_recovery(source.recovery_status());
+    let mut ledger = DirectoryLedger::new(None, 1).await?;
     manager.begin_lifecycle().await;
-    let handles = manager.start_consumers(&mut forwarder).await?;
-    let result = consume(&iterator, &forwarder, &cancel).await;
-    iterator.close();
-    drop(forwarder);
-    let consumers = finish_consumers(handles, &cancel).await;
+    let result = consume_observed(&mut source, &statistics, &mut ledger, &cancel).await;
+    let result = match result {
+        Ok(()) => match source.finish().await {
+            Ok(TraversalOutcome::Completed(value))
+                if value.totals.failed_children == 0 && value.totals.listing_failures == 0 =>
+            {
+                statistics.complete_scan().await;
+                Ok(())
+            }
+            Ok(_) => Err(AppError::ScanError("Scan did not complete".into())),
+            Err(error) => Err(error.into()),
+        },
+        Err(error) => {
+            let _ = source.stop().await;
+            Err(error)
+        }
+    };
     let result = if request.cancel.is_cancelled() {
         Err(AppError::ObservationScanCancelled)
-    } else if let Some(error) = iterator.take_error() {
-        Err(error.into())
-    } else if result.is_err() {
-        result
+    } else if let Some(error) = failure.failure() {
+        Err(StorageError::from(error).into())
     } else {
-        consumers
+        result
     };
     if let Err(error) = &result
         && !request.cancel.is_cancelled()
@@ -68,7 +82,7 @@ pub(super) async fn run(request: ScanRequest<'_>, config: AppConfig) -> Result<(
         manager.record_task_failures(&[error.to_string()]).await;
     }
     manager.set_generation_committed(result.is_ok()).await;
-    if request.cancel.is_cancelled() {
+    if cancel.token().is_cancelled() {
         manager.end_cancelled_lifecycle().await;
     } else {
         manager.end_lifecycle().await;
@@ -76,6 +90,43 @@ pub(super) async fn run(request: ScanRequest<'_>, config: AppConfig) -> Result<(
     result
 }
 
+async fn consume_observed(
+    source: &mut ResumableScan, statistics: &ScanStatistics, ledger: &mut DirectoryLedger, cancel: &ScanCancellation,
+) -> Result<()> {
+    let mut entries = Vec::<Arc<ObservedEntry>>::with_capacity(256);
+    let mut tick = interval(Duration::from_millis(100));
+    tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    loop {
+        let item = tokio::select! {
+            biased;
+            ()=cancel.cancelled()=>return Err(AppError::ObservationScanCancelled),
+            item=source.next()=>item,
+            _=tick.tick(),if !entries.is_empty() || !ledger.is_empty()=>{
+                statistics.record_observations(&entries).await; entries.clear(); ledger.flush(statistics).await?; continue;
+            }
+        };
+        match item {
+            Some(Ok(ResumableScanItem::Entry(entry))) => {
+                entries.push(Arc::from(entry));
+                if entries.len() >= 256 {
+                    statistics.record_observations(&entries).await;
+                    entries.clear();
+                }
+            }
+            Some(Ok(ResumableScanItem::Statistics(value))) => {
+                cancel.interrupt(ledger.push(*value, statistics)).await??;
+            }
+            Some(Ok(ResumableScanItem::Checkpoint(_))) => {}
+            Some(Err(error)) => return Err(error.into()),
+            None => break,
+        }
+    }
+    statistics.record_observations(&entries).await;
+    cancel.interrupt(ledger.flush(statistics)).await??;
+    Ok(())
+}
+
+#[cfg(test)]
 async fn consume(
     iterator: &WalkDirAsyncIterator, forwarder: &BroadcastForwarder<StorageEntryMessage>, cancel: &ScanCancellation,
 ) -> Result<()> {
@@ -85,6 +136,7 @@ async fn consume(
     Ok(())
 }
 
+#[cfg(test)]
 async fn finish_consumers(handles: Vec<JoinHandle<Result<()>>>, cancel: &ScanCancellation) -> Result<()> {
     let mut failure = None;
     for mut handle in handles {

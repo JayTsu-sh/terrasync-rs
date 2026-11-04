@@ -1,6 +1,7 @@
 //! 扫描分发及检查点协调。数据库批次 B 写入时，下一批 A 在有界队列中积累。
 use super::{flush_batch, input::ScanInput, workers};
 use crate::scan::cancellation::ScanCancellation;
+use crate::scan::directory_ledger::DirectoryLedger;
 use crate::{
     consumer::{
         ConsumerManager, ScanStatistics,
@@ -11,7 +12,7 @@ use crate::{
 use data_mover::{model::ObservedEntry, traversal::TraversalOutcome};
 use db::{
     clickhouse::scan_resume::{FINALIZING, ScanResumeState},
-    scan_store::ScanStore,
+    scan_store::{DirectoryStatisticsStore, ScanStore},
 };
 use std::{
     sync::Arc,
@@ -40,6 +41,16 @@ pub(super) async fn consume(
     batch_size: usize, cancel: ScanCancellation,
 ) -> Result<()> {
     let failure = source.failure_signal();
+    let directory_store = database.directory_statistics_store();
+    let baseline = (!state.statistics.is_empty()).then(|| (directory_store.clone(), state.event_time, state.version));
+    let ledger = DirectoryLedger::new(
+        baseline,
+        state
+            .version
+            .checked_add(1)
+            .ok_or_else(|| AppError::ScanError("Scan statistics version overflow".into()))?,
+    )
+    .await?;
     // 独立于数据库/输出背压停止查询；只监听防抖耗尽后的最终故障，闪断不会取消扫描。
     let _failure_watch = cancel.watch_storage_failure(failure.clone());
     let mut forwarder = ObservedForwarder::<Entries>::new();
@@ -56,6 +67,7 @@ pub(super) async fn consume(
     let prefetch_capacity = Some(batch_size.saturating_mul(writer_workers).saturating_mul(windows));
     let mut producer_state = state.clone();
     let producer_statistics = statistics.scan_statistics();
+    let _recovery_progress = producer_statistics.watch_recovery(source.recovery_status());
     let count_statistics = producer_statistics.clone();
     let producer_cancel = cancel.clone();
     // SQL 行编码不能占住遍历生产者所在任务；退出时仍等待写入与统计屏障。
@@ -68,6 +80,8 @@ pub(super) async fn consume(
             control_tx,
             producer_cancel,
             prefetch_capacity,
+            ledger,
+            directory_store,
         )
         .await;
         (producer_state, result)
@@ -242,14 +256,20 @@ async fn save(control: &mpsc::Sender<SaveState>, state: &ScanResumeState) -> Res
 async fn produce(
     source: ResumableScan, state: &mut ScanResumeState, statistics: &ScanStatistics,
     forwarder: ObservedForwarder<Entries>, control: mpsc::Sender<SaveState>, cancel: ScanCancellation,
-    prefetch_capacity: Option<usize>,
+    prefetch_capacity: Option<usize>, ledger: DirectoryLedger, directory_store: DirectoryStatisticsStore,
 ) -> Result<()> {
     let mut input = ScanInput::new(source, prefetch_capacity);
-    let result = select! {
-        biased;
-        _=cancel.cancelled()=>Err(AppError::ObservationScanCancelled),
-        result=produce_items(&mut input, state, statistics, forwarder, control, cancel.clone())=>result,
-    };
+    let result = produce_items(
+        &mut input,
+        state,
+        statistics,
+        forwarder,
+        control,
+        cancel.clone(),
+        ledger,
+        directory_store,
+    )
+    .await;
     if result.is_err() {
         cancel.cancel();
         input.stop().await;
@@ -260,48 +280,56 @@ async fn produce(
 async fn produce_items(
     source: &mut ScanInput, state: &mut ScanResumeState, statistics: &ScanStatistics,
     forwarder: ObservedForwarder<Entries>, control: mpsc::Sender<SaveState>, cancel: ScanCancellation,
+    mut ledger: DirectoryLedger, directory_store: DirectoryStatisticsStore,
 ) -> Result<()> {
     let mut pending = Vec::with_capacity(DISPATCH_BATCH);
-    let mut observed = state.observed_entries;
     let mut tick = interval(Duration::from_millis(100));
     tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
     loop {
         let item = select! {
+            biased;
+            ()=cancel.cancelled()=>return Err(AppError::ObservationScanCancelled),
             item=source.next_batch(DISPATCH_BATCH)=>item,
-            _=tick.tick(),if !pending.is_empty()=>{deliver(&forwarder,&mut pending).await?;continue;}
+            _=tick.tick(),if !pending.is_empty() || !ledger.is_empty()=>{
+                cancel.interrupt(deliver(&forwarder,&mut pending)).await??;cancel.operation(ledger.flush(statistics)).await?;continue;
+            }
         };
         let Some(batch) = item else { break };
         for item in batch.items {
             match item {
                 ResumableScanItem::Entry(entry) => {
-                    observed = observed.saturating_add(entry.history().map_or(1, |h| h.records().len() as u64));
                     pending.push(Arc::from(entry));
                     if pending.len() >= DISPATCH_BATCH {
-                        deliver(&forwarder, &mut pending).await?;
+                        cancel.interrupt(deliver(&forwarder, &mut pending)).await??;
                     }
                 }
+                ResumableScanItem::Statistics(value) => cancel.operation(ledger.push(*value, statistics)).await?,
                 ResumableScanItem::Checkpoint(checkpoint) => {
-                    deliver(&forwarder, &mut pending).await?;
+                    cancel.interrupt(deliver(&forwarder, &mut pending)).await??;
                     let before = source.prefetched_batches();
                     let started = Instant::now();
-                    forwarder.barrier().await?;
+                    cancel.interrupt(forwarder.barrier()).await??;
                     info!(barrier_ms=started.elapsed().as_millis(),prefetched_batches_before=?before,
                         prefetched_batches_after=?source.prefetched_batches(),"Scan checkpoint consumer barrier finished");
-                    state.statistics = statistics.statistics_checkpoint().await?;
+                    cancel.operation(ledger.flush(statistics)).await?;
                     state.checkpoint = checkpoint;
-                    state.observed_entries = observed;
+                    state.observed_entries = statistics.scanned_entries().await;
                     state.advance()?;
-                    save(&control, state).await?;
+                    cancel
+                        .operation(ledger.persist(&directory_store, state.event_time, state.version))
+                        .await?;
+                    state.statistics = statistics.statistics_checkpoint().await?;
+                    cancel.interrupt(save(&control, state)).await??;
                     info!(
                         version = state.version,
-                        entries = observed,
+                        entries = state.observed_entries,
                         "Scan checkpoint acknowledged by all consumers"
                     );
                     #[cfg(feature = "lab-fault-injection")]
                     if let Ok(value) = std::env::var("TERRASYNC_LAB_SCAN_PAUSE_AFTER_CHECKPOINT_MS")
                         && let Ok(value) = value.parse::<u64>()
                     {
-                        sleep(Duration::from_millis(value)).await;
+                        cancel.interrupt(sleep(Duration::from_millis(value))).await?;
                     }
                     #[cfg(feature = "lab-fault-injection")]
                     if std::env::var_os("TERRASYNC_LAB_SCAN_STOP_AFTER_CHECKPOINT").is_some() {
@@ -315,18 +343,23 @@ async fn produce_items(
             return Err(error);
         }
     }
-    deliver(&forwarder, &mut pending).await?;
-    forwarder.barrier().await?;
-    let outcome = source.finish().await?;
+    cancel.interrupt(deliver(&forwarder, &mut pending)).await??;
+    cancel.interrupt(forwarder.barrier()).await??;
+    cancel.operation(ledger.flush(statistics)).await?;
+    let outcome = cancel.interrupt(source.finish()).await??;
     if !matches!(outcome,TraversalOutcome::Completed(ref completion) if completion.totals.failed_children==0 && completion.totals.listing_failures==0)
     {
         return Err(AppError::ScanError(
             "Scan paused or incomplete; checkpoint retained, generation not committed".into(),
         ));
     }
-    state.statistics = statistics.statistics_checkpoint().await?;
+    statistics.complete_scan().await;
     state.phase = FINALIZING;
-    state.observed_entries = observed;
+    state.observed_entries = statistics.scanned_entries().await;
     state.advance()?;
-    save(&control, state).await
+    cancel
+        .operation(ledger.persist(&directory_store, state.event_time, state.version))
+        .await?;
+    state.statistics = statistics.statistics_checkpoint().await?;
+    cancel.interrupt(save(&control, state)).await?
 }

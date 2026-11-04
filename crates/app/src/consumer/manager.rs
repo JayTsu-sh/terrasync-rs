@@ -23,17 +23,24 @@ use tokio::sync::Mutex;
 use tracing::{Instrument, debug, error, info_span, warn};
 
 // 内部模块
+use super::stats::callback_state::{SavedStatistics, StatisticsCheckpoint};
+use super::stats::diagnostics::safe_diagnostic_text;
 use crate::broadcast::BroadcastForwarder;
 use crate::config::{ConsumerConfig, JobType};
 use crate::consumer::DatabaseConsumer;
+#[cfg(test)]
+use crate::consumer::stats::ProgressReport;
 use crate::consumer::stats::{FileSizeRange, ProgressDetail, TimeRange};
 use crate::consumer::stats::{
-    FullStats, IncrementalStats, ProgressBar, ProgressReport, StatisticConsumer, StatsKind, consumer::CallbackGuard,
+    FullStats, IncrementalStats, ProgressBar, StatisticConsumer, StatsKind, consumer::CallbackGuard,
 };
 use crate::consumer::traits::Consumer;
 use crate::error::{AppError, Result};
+use crate::scan::statistics::{ScanCapabilities, ScanCounts, ScanSnapshot};
+use data_mover::traversal::{TraversalRecoveryState, TraversalRecoveryStatus};
 use db::clickhouse::scan_resume_statistics::ScanResumeStatistics;
 use db::scan_store::ScanFinalEvent;
+use tokio_util::task::AbortOnDropHandle;
 
 /// 消费者管理器 - 负责创建、启动和管理多个消费者实例
 pub struct ConsumerManager {
@@ -52,6 +59,95 @@ pub(crate) struct ScanStatistics {
 }
 
 impl ScanStatistics {
+    pub(crate) async fn snapshot(&self) -> Option<ScanSnapshot> {
+        match &self.inner {
+            Some(sc) => sc.lock().await.scan_snapshot.clone(),
+            None => None,
+        }
+    }
+    pub(crate) fn watch_recovery(&self, status: Option<&TraversalRecoveryStatus>) -> Option<AbortOnDropHandle<()>> {
+        let mut receiver = status?.subscribe();
+        let consumer = self.inner.clone()?;
+        Some(AbortOnDropHandle::new(tokio::spawn(async move {
+            let mut attempts = 0;
+            let mut recoveries = 0;
+            loop {
+                let state = receiver.borrow_and_update().clone();
+                {
+                    let mut consumer = consumer.lock().await;
+                    let callback = &mut consumer.callback;
+                    match state {
+                        TraversalRecoveryState::Running { recoveries: current } => {
+                            callback.runtime.successful_recoveries = callback
+                                .runtime
+                                .successful_recoveries
+                                .saturating_add(current.saturating_sub(recoveries));
+                            recoveries = current;
+                            attempts = 0;
+                            callback.runtime.state = "running".into();
+                            callback.runtime.current_error = None;
+                        }
+                        TraversalRecoveryState::Recovering { first_failure, attempt } => {
+                            if callback.runtime.state != "recovering" {
+                                callback.runtime.network_faults = callback.runtime.network_faults.saturating_add(1);
+                                callback.outbox.enqueue(
+                                    "storage",
+                                    "network_recovering",
+                                    &first_failure.to_string(),
+                                    Some(first_failure.path.as_str()),
+                                );
+                            }
+                            callback.runtime.recovery_attempts = callback
+                                .runtime
+                                .recovery_attempts
+                                .saturating_add(attempt.saturating_sub(attempts));
+                            attempts = attempt;
+                            callback.runtime.state = "recovering".into();
+                            callback.runtime.current_error = Some(safe_diagnostic_text(&first_failure.to_string()));
+                        }
+                        TraversalRecoveryState::Failed { failure } => {
+                            callback.runtime.state = "failed".into();
+                            callback.runtime.current_error = Some(safe_diagnostic_text(&failure.to_string()));
+                        }
+                    }
+                }
+                if receiver.changed().await.is_err() {
+                    break;
+                }
+            }
+        })))
+    }
+    pub(crate) async fn replace_directory_contributions(&self, changes: &[(ScanCounts, ScanCounts)], replayed: u64) {
+        if let Some(sc) = &self.inner {
+            let mut sc = sc.lock().await;
+            if let Some(snapshot) = &mut sc.scan_snapshot {
+                snapshot.replayed_directory_listings = snapshot.replayed_directory_listings.saturating_add(replayed);
+                for (old, new) in changes {
+                    snapshot.replace(old, new);
+                }
+            }
+        }
+    }
+
+    pub(crate) async fn complete_scan(&self) {
+        if let Some(sc) = &self.inner {
+            if let Some(snapshot) = &mut sc.lock().await.scan_snapshot {
+                snapshot.complete = true;
+            }
+        }
+    }
+
+    pub(crate) async fn scanned_entries(&self) -> u64 {
+        match &self.inner {
+            Some(sc) => sc
+                .lock()
+                .await
+                .scan_snapshot
+                .as_ref()
+                .map_or(0, |scan| scan.scanned_entries),
+            None => 0,
+        }
+    }
     pub(crate) async fn record_observed_events(&self, events: &[ObservedScanEvent]) {
         if let Some(sc) = &self.inner {
             let mut sc = sc.lock().await;
@@ -74,7 +170,12 @@ impl ScanStatistics {
         match &self.inner {
             Some(sc) => {
                 let sc = sc.lock().await;
-                Ok(serde_json::to_string(&(&sc.stats, sc.to_report(false)))?)
+                Ok(serde_json::to_string(&StatisticsCheckpoint {
+                    version: 1,
+                    stats: sc.stats.clone(),
+                    report: sc.to_report(false),
+                    callback: sc.callback.clone(),
+                })?)
             }
             None => Ok(String::new()),
         }
@@ -82,6 +183,24 @@ impl ScanStatistics {
 }
 
 impl ConsumerManager {
+    pub(crate) async fn initialize_scan_statistics(
+        &self, storage: &storage_adapter::StorageEnum, tags: bool, round: Option<i64>,
+    ) -> Result<()> {
+        if let Some(sc) = &self.stats_consumer {
+            let mut sc = sc.lock().await;
+            let job_id = sc.stats.job_id().to_owned();
+            let job_dir = sc.job_dir.clone();
+            let mut callback = std::mem::take(&mut sc.callback);
+            callback
+                .initialize_scan(&job_id, &job_dir, round, &mut sc.stats)
+                .await?;
+            sc.callback = callback;
+            if sc.scan_snapshot.is_none() {
+                sc.scan_snapshot = Some(ScanSnapshot::new(ScanCapabilities::from_storage(storage, tags)));
+            }
+        }
+        Ok(())
+    }
     pub(crate) fn scan_statistics(&self) -> ScanStatistics {
         ScanStatistics {
             inner: self.stats_consumer.clone(),
@@ -116,6 +235,9 @@ impl ConsumerManager {
     pub async fn reconcile_scan_statistics(&self, values: ScanResumeStatistics) {
         if let Some(sc) = &self.stats_consumer {
             let mut sc = sc.lock().await;
+            if let Some(scan) = &mut sc.scan_snapshot {
+                scan.distributions_reconciled = true;
+            }
             let deltas = if let StatsKind::Incremental(incremental) = &mut sc.stats {
                 incremental.new = Default::default();
                 incremental.changed = Default::default();
@@ -265,7 +387,13 @@ impl ConsumerManager {
         if saved.is_empty() {
             return Ok(());
         }
-        let (mut stats, report): (StatsKind, ProgressReport) = serde_json::from_str(saved)?;
+        let (mut stats, report, callback) = match serde_json::from_str::<SavedStatistics>(saved)? {
+            SavedStatistics::Current(saved) if saved.version == 1 => (saved.stats, saved.report, Some(saved.callback)),
+            SavedStatistics::Current(_) => {
+                return Err(AppError::ScanError("Unsupported statistics checkpoint version".into()));
+            }
+            SavedStatistics::Previous((stats, report)) => (stats, report, None),
+        };
         let duration = Duration::try_from_secs_f64(report.elapsed_secs)
             .map_err(|_| AppError::ConfigError("Invalid saved scan duration".into()))?;
         let start = Instant::now().checked_sub(duration).unwrap_or_else(Instant::now);
@@ -291,7 +419,11 @@ impl ConsumerManager {
                 _ => return Err(AppError::ConfigError("Saved scan statistics kind differs".into())),
             }
             sc.progress_bar.restore(&report)?;
+            sc.scan_snapshot = report.scan;
             sc.stats = stats;
+            if let Some(callback) = callback {
+                sc.callback.restore_checkpoint(callback)?;
+            }
         }
         Ok(())
     }
@@ -330,6 +462,8 @@ impl ConsumerManager {
                     callback_url,
                     generation_committed: None,
                     pb_handle: None,
+                    scan_snapshot: None,
+                    callback: Default::default(),
                 },
                 JobType::IncrementalScan | JobType::IncrementalCopy => StatisticConsumer {
                     stats: StatsKind::Incremental(IncrementalStats::new(job_type.clone(), job_id, command, log_path)),
@@ -338,6 +472,8 @@ impl ConsumerManager {
                     callback_url,
                     generation_committed: None,
                     pb_handle: None,
+                    scan_snapshot: None,
+                    callback: Default::default(),
                 },
             };
             manager.stats_consumer = Some(Arc::new(Mutex::new(sc)));
@@ -490,6 +626,8 @@ mod resume_tests {
             callback_url: None,
             generation_committed: None,
             pb_handle: None,
+            scan_snapshot: None,
+            callback: Default::default(),
         };
         stats.progress_bar.restore(&ProgressReport {
             job_id: "resume".into(),
@@ -505,6 +643,10 @@ mod resume_tests {
             },
             is_final: false,
             final_stats: None,
+            scan: None,
+            callback_identity: None,
+            diagnostics: None,
+            scan_runtime: None,
             generation_committed: None,
         })?;
         let manager = ConsumerManager {

@@ -11,9 +11,9 @@ use data_mover::{
         delete_tree,
     },
     traversal::{
-        Checkpoint, Resumable, ScanFailureSignal, TraversalCandidate, TraversalDecision, TraversalFilter,
-        TraversalItem, TraversalOrder, TraversalOutcome, TraversalRecoveryStatus, TraversalRequest, TraversalSession,
-        TraversalSource,
+        Checkpoint, DirectoryStatistics, Resumable, ScanFailureSignal, TraversalCandidate, TraversalDecision,
+        TraversalFilter, TraversalItem, TraversalOrder, TraversalOutcome, TraversalRecoveryStatus, TraversalRequest,
+        TraversalSession, TraversalSource,
     },
 };
 use std::{
@@ -56,6 +56,7 @@ impl ConnectedStorage {
         let cancel = cancel.child_token();
         let mut request = self
             .traversal_request(None, options, false)?
+            .directory_statistics(true)
             .cancel(cancel.clone())
             .resumable(Resumable::On { every });
         if let Some(bytes) = checkpoint {
@@ -417,6 +418,7 @@ enum DeleteEventFailure {
 /// 按交付顺序返回产品条目及其 opaque 遍历检查点。
 pub enum ResumableScanItem {
     Entry(Box<ObservedEntry>),
+    Statistics(Box<DirectoryStatistics>),
     Checkpoint(Vec<u8>),
 }
 
@@ -452,6 +454,9 @@ impl ResumableScan {
             };
             let Some(item) = item else { break };
             match item {
+                TraversalItem::DirectoryStatistics(statistics) if self.history.is_none() => {
+                    return Some(Ok(ResumableScanItem::Statistics(statistics)));
+                }
                 TraversalItem::Entry(entry) => {
                     if let Some(history) = entry.history() {
                         let expected = self.history.get_or_insert_with(|| (entry.path().as_str().into(), 0));

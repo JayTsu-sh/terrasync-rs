@@ -1,5 +1,6 @@
 //! 共享表的集群扫描存储。所有读写在这里绑定 job_id，业务层不拼接集群 SQL。
 use crate::clickhouse::replica_read::QuorumRead;
+use crate::scan_store::directory_statistics::DirectoryStatisticsStore;
 use crate::scan_store::queries::{ScanExecute, check_scan_cancellation, scan_retry_delay};
 #[cfg(test)]
 use std::collections::HashMap;
@@ -92,7 +93,7 @@ pub(crate) fn identifier(value: &str) -> Result<String> {
 }
 
 /// 顺序 quorum 写入遇到其他任务尚未完成的 quorum 时退避重试；所有目标行均可幂等重放。
-async fn retry_quorum<F, Fut>(mut operation: F) -> Result<()>
+pub(crate) async fn retry_quorum<F, Fut>(mut operation: F) -> Result<()>
 where
     F: FnMut() -> Fut,
     Fut: Future<Output = Result<()>>,
@@ -113,6 +114,9 @@ where
 }
 
 impl ClusterScanStore {
+    pub(crate) fn directory_statistics_ledger(&self) -> Result<DirectoryStatisticsStore> {
+        DirectoryStatisticsStore::cluster(self.client.clone(), &self.database, &self.cluster, &self.job_id)
+    }
     pub(crate) fn tag_scan_queries(&mut self, comment: &str) {
         self.client = self.client.clone().with_option("log_comment", comment);
     }

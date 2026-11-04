@@ -172,8 +172,20 @@ pub(crate) async fn run_persisted(request: ScanRequest<'_>, config: AppConfig) -
         // 本管道负责数据库持久化确认；manager 只消费统计信息。
         consumer_config.db_config.enabled = false;
         let mut consumers = ConsumerManager::new(&consumer_config).await?;
-        // 续扫展示上次确认检查点的累计统计，再叠加本次实际扫描流；整轮完成后校准去重。
+        // 累计数与目录贡献必须来自同一已确认检查点；旧检查点无法补出过滤计数。
         consumers.restore_statistics(&state.statistics).await?;
+        if (!state.checkpoint.is_empty() || state.observed_entries > 0)
+            && !consumers.scan_statistics().snapshot().await.is_some_and(|scan| scan.valid_checkpoint(state.observed_entries)) {
+            return Err(AppError::ScanError("Saved scan checkpoint lacks consistent directory statistics; reset this job's scan records before starting a new round".into()));
+        }
+        consumers
+            .initialize_scan_statistics(&storage, options.include_tags, Some(state.event_time))
+            .await?;
+        let directory_statistics = database.directory_statistics_store();
+        cancellation.operation(directory_statistics.prepare()).await?;
+        cancellation
+            .operation(directory_statistics.truncate(state.event_time, state.version))
+            .await?;
         consumers.begin_lifecycle().await;
         let result = if already_committed {
             Ok(())
@@ -202,7 +214,7 @@ pub(crate) async fn run_persisted(request: ScanRequest<'_>, config: AppConfig) -
                 .await;
         }
         consumers.set_generation_committed(result.is_ok()).await;
-        if cancel.is_cancelled() {
+        if cancellation.token().is_cancelled() {
             consumers.end_cancelled_lifecycle().await;
         } else {
             consumers.end_lifecycle().await;

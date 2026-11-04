@@ -26,6 +26,8 @@ use utils::error::UtilsError;
 /// 应用程序的专用错误枚举
 #[derive(Error, Debug)]
 pub enum AppError {
+    #[error("Scan statistics ledger error: {0}")]
+    ScanStatisticsLedger(#[from] sqlx::Error),
     /// 中立 traversal 的 session/runtime 终态失败。
     #[error("Traversal terminal failure: {0}")]
     TraversalTerminal(#[from] TraversalTerminalFailure),

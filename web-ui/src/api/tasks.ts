@@ -63,6 +63,87 @@ export interface ExecutionStats {
   error_count: number
   duration_secs: number
   avg_speed_bytes_per_sec: number
+  scan?: ScanSnapshot
+  scan_runtime?: ScanRuntimeState
+}
+
+export interface EntryKindCounts {
+  directories: number
+  regular_files: number
+  symlinks: number
+  block_devices: number
+  character_devices: number
+  fifos: number
+  sockets: number
+  unknown: number
+}
+
+export interface ScanSnapshot {
+  scanned_entries: number
+  filtered_entries: number
+  retained_entries: number
+  replayed_directory_listings: number
+  distributions_reconciled: boolean
+  counts: {
+    scanned: EntryKindCounts
+    filtered: EntryKindCounts
+    retained: EntryKindCounts
+    failed: EntryKindCounts
+    vanished: EntryKindCounts
+    pruned_directories: number
+    truncated_directories: number
+    regular_file_bytes: number
+    unknown_file_sizes: number
+    versions: number
+    delete_markers: number
+    all_versions_bytes: number
+    completed_listings: number
+    interrupted_listings: number
+    unreadable_listings: number
+    vanished_listings: number
+  }
+  complete: boolean
+  capabilities: {
+    backend: string
+    symlinks: StatisticSupport
+    special_files: StatisticSupport
+    directory_objects: boolean
+    metadata: { family: string; support: StatisticSupport; requested: boolean }[]
+  }
+}
+
+export type StatisticSupport = 'supported' | 'unsupported' | 'not_applicable' | 'unknown'
+
+export interface ScanRuntimeState {
+  state: string
+  network_faults: number
+  recovery_attempts: number
+  successful_recoveries: number
+  current_error: string | null
+}
+
+export interface CallbackIdentity {
+  round_id: string
+  attempt_id: string
+  round_started_at_millis: number
+  attempt_started_at_millis: number
+  sequence: number
+}
+
+export interface DiagnosticEvent {
+  event_id: string
+  round_id: string
+  attempt_id: string
+  origin: string
+  code: string
+  message: string
+  path: string | null
+}
+
+export interface DiagnosticPage {
+  events: DiagnosticEvent[]
+  omitted_count: number
+  next_offset: number | null
 }
 
 export interface TaskLog {
@@ -171,6 +252,9 @@ export interface TaskProgressSnapshot {
   error_count: number
   elapsed_secs: number
   speed_bytes_per_sec: number
+  scan?: ScanSnapshot
+  scan_runtime?: ScanRuntimeState
+  callback_identity?: CallbackIdentity
 }
 
 export async function getTaskProgress(taskId: string): Promise<TaskProgressSnapshot | null> {
