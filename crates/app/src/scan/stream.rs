@@ -5,12 +5,17 @@ use crate::{
     config::{JobType, initialize_consumer_config},
     consumer::{ConsumerManager, ScanStatistics},
     error::{AppError, Result},
-    scan::{ScanRequest, cancellation::ScanCancellation, directory_ledger::DirectoryLedger},
+    scan::{ScanRequest, cancellation::ScanCancellation, progress::ScanProgress},
     storage_factory::{StorageRole, create_storage_for_role},
 };
-use data_mover::{model::ObservedEntry, traversal::TraversalOutcome};
+use data_mover::{
+    model::ObservedEntry,
+    traversal::{TraversalOrder, TraversalOutcome},
+};
 use std::{num::NonZeroUsize, sync::Arc, time::Duration};
-use storage_adapter::{ResumableScan, ResumableScanItem, StorageError, WalkOptions, filter::parse_filter_expression};
+use storage_adapter::{
+    ResumableScan, ResumableScanItem, ScanSourceMode, StorageError, WalkOptions, filter::parse_filter_expression,
+};
 #[cfg(test)]
 use storage_adapter::{StorageEntryMessage, WalkDirAsyncIterator};
 #[cfg(test)]
@@ -33,7 +38,8 @@ pub(super) async fn run(request: ScanRequest<'_>, config: AppConfig) -> Result<(
         recovery_window: Some(Duration::from_secs(config.scan.recovery_window_secs)),
         ..Default::default()
     };
-    let mut source = storage.resumable_scan(&options, None, cancel.token().clone(), Duration::from_secs(60))?;
+    let order = streaming_order();
+    let mut source = storage.scan_source(&options, ScanSourceMode::Streaming { order }, cancel.token().clone())?;
     let failure = source.failure_signal();
     let _failure_watch = cancel.watch_storage_failure(failure.clone());
     let consumer_config = initialize_consumer_config(
@@ -50,9 +56,9 @@ pub(super) async fn run(request: ScanRequest<'_>, config: AppConfig) -> Result<(
         .await?;
     let statistics = manager.scan_statistics();
     let recovery_progress = statistics.watch_recovery(source.recovery_status()).await;
-    let mut ledger = DirectoryLedger::new(None, 1).await?;
+    let mut progress = ScanProgress::new(order, Default::default(), None);
     manager.begin_lifecycle().await;
-    let result = consume_observed(&mut source, &statistics, &mut ledger, &cancel).await;
+    let result = consume_observed(&mut source, &statistics, &mut progress, &cancel).await;
     let result = match result {
         Ok(()) => match source.finish().await {
             Ok(TraversalOutcome::Completed(value))
@@ -93,8 +99,17 @@ pub(super) async fn run(request: ScanRequest<'_>, config: AppConfig) -> Result<(
     result
 }
 
+fn streaming_order() -> TraversalOrder {
+    // 仅实验构建可选择 Blocks 不落库基准；产品的非续扫路径始终使用 Unordered。
+    #[cfg(feature = "lab-fault-injection")]
+    if std::env::var("TERRASYNC_LAB_SCAN_STREAM_ORDER").as_deref() == Ok("blocks") {
+        return TraversalOrder::Blocks;
+    }
+    TraversalOrder::Unordered
+}
+
 async fn consume_observed(
-    source: &mut ResumableScan, statistics: &ScanStatistics, ledger: &mut DirectoryLedger, cancel: &ScanCancellation,
+    source: &mut ResumableScan, statistics: &ScanStatistics, progress: &mut ScanProgress, cancel: &ScanCancellation,
 ) -> Result<()> {
     let mut entries = Vec::<Arc<ObservedEntry>>::with_capacity(256);
     let mut tick = interval(Duration::from_millis(100));
@@ -104,11 +119,15 @@ async fn consume_observed(
             biased;
             ()=cancel.cancelled()=>return Err(AppError::ObservationScanCancelled),
             item=source.next()=>item,
-            _=tick.tick(),if !entries.is_empty() || !ledger.is_empty()=>{
-                statistics.record_observations(&entries).await; entries.clear(); ledger.flush(statistics).await?; continue;
+            _=tick.tick(),if !entries.is_empty()=>{
+                statistics.record_observations(&entries).await; entries.clear(); continue;
             }
         };
         match item {
+            Some(Ok(ResumableScanItem::Resumed(event))) => {
+                entries.clear();
+                progress.resumed(&event, statistics).await?;
+            }
             Some(Ok(ResumableScanItem::Entry(entry))) => {
                 entries.push(Arc::from(entry));
                 if entries.len() >= 256 {
@@ -117,7 +136,7 @@ async fn consume_observed(
                 }
             }
             Some(Ok(ResumableScanItem::Statistics(value))) => {
-                cancel.interrupt(ledger.push(*value, statistics)).await??;
+                cancel.interrupt(progress.push(*value, statistics)).await??;
             }
             Some(Ok(ResumableScanItem::Checkpoint(_))) => {}
             Some(Err(error)) => return Err(error.into()),
@@ -125,8 +144,7 @@ async fn consume_observed(
         }
     }
     statistics.record_observations(&entries).await;
-    cancel.interrupt(ledger.flush(statistics)).await??;
-    Ok(())
+    progress.finish()
 }
 
 #[cfg(test)]

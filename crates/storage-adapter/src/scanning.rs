@@ -12,8 +12,8 @@ use data_mover::{
     },
     traversal::{
         Checkpoint, DirectoryStatistics, Resumable, ScanFailureSignal, TraversalCandidate, TraversalDecision,
-        TraversalFilter, TraversalItem, TraversalOrder, TraversalOutcome, TraversalRecoveryStatus, TraversalRequest,
-        TraversalSession, TraversalSource,
+        TraversalFilter, TraversalItem, TraversalOrder, TraversalOutcome, TraversalRecoveryResume,
+        TraversalRecoveryStatus, TraversalRequest, TraversalResume, TraversalSession, TraversalSource,
     },
 };
 use std::{
@@ -22,6 +22,16 @@ use std::{
     sync::Arc,
 };
 use tokio_util::sync::CancellationToken;
+
+pub enum ScanSourceMode {
+    Resumable {
+        checkpoint: Option<Vec<u8>>,
+        every: std::time::Duration,
+    },
+    Streaming {
+        order: TraversalOrder,
+    },
+}
 
 impl ConnectedStorage {
     fn traversal_request(&self, sub: Option<&Path>, options: &WalkOptions, blocks: bool) -> Result<TraversalRequest> {
@@ -48,21 +58,29 @@ impl ConnectedStorage {
         Ok(source.traverse(self.traversal_request(sub, options, blocks)?))
     }
 
-    /// 保存检查点前先持久化条目；恢复时可能重放一个目录。
-    pub fn resumable_scan(
-        &self, options: &WalkOptions, checkpoint: Option<Vec<u8>>, cancel: CancellationToken,
-        every: std::time::Duration,
+    /// 产品显式选择扫描顺序及恢复语义；不由 backend 或数据库开关推断。
+    pub fn scan_source(
+        &self, options: &WalkOptions, mode: ScanSourceMode, cancel: CancellationToken,
     ) -> Result<ResumableScan> {
         let cancel = cancel.child_token();
         let mut request = self
             .traversal_request(None, options, false)?
             .directory_statistics(true)
-            .cancel(cancel.clone())
-            .resumable(Resumable::On { every });
-        if let Some(bytes) = checkpoint {
-            request = request.resume_from(Checkpoint::from_bytes(bytes.into()));
-        }
-        let scan = self.start_traversal(request, options)?;
+            .cancel(cancel.clone());
+        let recovery_resume = match mode {
+            ScanSourceMode::Resumable { checkpoint, every } => {
+                request = request.order(TraversalOrder::Blocks).resumable(Resumable::On { every });
+                if let Some(bytes) = checkpoint {
+                    request = request.resume_from(Checkpoint::from_bytes(bytes.into()));
+                }
+                TraversalRecoveryResume::Checkpoint
+            }
+            ScanSourceMode::Streaming { order } => {
+                request = request.order(order);
+                TraversalRecoveryResume::RestartRoot
+            }
+        };
+        let scan = self.start_traversal_with_resume(request, options, recovery_resume)?;
         Ok(ResumableScan {
             session: scan.session,
             guard: scan.failure,
@@ -86,6 +104,10 @@ impl ConnectedStorage {
             let mut histories = HistoryProjection::default();
             while let Some(item) = session.next_item().await {
                 let message = match item {
+                    TraversalItem::Resumed(_) => {
+                        histories = HistoryProjection::default();
+                        continue;
+                    }
                     TraversalItem::Entry(entry) => {
                         let projected = match connected.project_history(&entry, &mut histories).await {
                             Ok(entries) => entries,
@@ -229,6 +251,7 @@ impl ConnectedStorage {
             let mut next = 0i32;
             while let Some(item) = session.next_item().await {
                 match item {
+                    TraversalItem::Resumed(_) => histories = HistoryProjection::default(),
                     TraversalItem::Entry(entry) => {
                         let projected = match connected.project_history(&entry, &mut histories).await {
                             Ok(entries) => entries,
@@ -417,6 +440,7 @@ enum DeleteEventFailure {
 
 /// 按交付顺序返回产品条目及其 opaque 遍历检查点。
 pub enum ResumableScanItem {
+    Resumed(Box<TraversalResume>),
     Entry(Box<ObservedEntry>),
     Statistics(Box<DirectoryStatistics>),
     Checkpoint(Vec<u8>),
@@ -454,6 +478,10 @@ impl ResumableScan {
             };
             let Some(item) = item else { break };
             match item {
+                TraversalItem::Resumed(event) => {
+                    self.history = None;
+                    return Some(Ok(ResumableScanItem::Resumed(event)));
+                }
                 TraversalItem::DirectoryStatistics(statistics) if self.history.is_none() => {
                     return Some(Ok(ResumableScanItem::Statistics(statistics)));
                 }

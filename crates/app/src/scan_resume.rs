@@ -1,10 +1,9 @@
 //! 检查点扫描：先确认结果与事件持久化，再将 opaque 游标写入 ClickHouse。
+use crate::job_execution::JobLease;
 use db::DatabaseConfig;
 use std::{
-    fs::OpenOptions,
     mem::take,
     num::NonZeroUsize,
-    path::Path,
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -14,12 +13,12 @@ use crate::scan::{
     cancellation::{self, ScanCancellation},
 };
 use data_mover::model::ObservedEntry;
-use data_mover::traversal::Resumable;
-use db::clickhouse::scan_resume::{COMPLETED, RUNNING, ScanResumeState};
+use data_mover::traversal::{Resumable, TraversalOrder};
+use db::clickhouse::scan_resume::{COMPLETED, FINALIZING, RUNNING, ScanResumeState};
 use db::clickhouse::scan_resume_statistics::ScanResumeStatistics;
 use db::scan_store::{ScanFinalEvent, ScanStore};
 use storage_adapter::filter::parse_filter_expression;
-use storage_adapter::{ErrorEvent, StorageEntryMessage, StorageEnum, WalkOptions, canonicalize_path};
+use storage_adapter::{ErrorEvent, ScanSourceMode, StorageEntryMessage, StorageEnum, WalkOptions, canonicalize_path};
 use tokio::{join, select, task::spawn_blocking};
 use tracing::{info, warn};
 use utils::app_config::AppConfig;
@@ -46,6 +45,7 @@ pub(crate) async fn run_persisted(request: ScanRequest<'_>, config: AppConfig) -
         command,
         cancel,
         callback_url,
+        resume,
         ..
     } = request;
     info!(concurrency = config.scan.concurrency, "Using scan task concurrency");
@@ -55,15 +55,7 @@ pub(crate) async fn run_persisted(request: ScanRequest<'_>, config: AppConfig) -
         ));
     }
     tokio::fs::create_dir_all(job_dir).await?;
-    let lease = OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .write(true)
-        .open(Path::new(job_dir).join("scan-resume.lock"))?;
-    lease.try_lock().map_err(|source| AppError::ScanJobLock {
-        job_id: job_id.into(),
-        source,
-    })?;
+    let _lease = JobLease::acquire(&config.database.clickhouse, job_id, job_dir)?;
     let source = canonicalize_path(path)?;
     let storage = select! {
         biased;
@@ -89,6 +81,7 @@ pub(crate) async fn run_persisted(request: ScanRequest<'_>, config: AppConfig) -
         include,
         exclude,
         options.include_tags,
+        resume,
     )?;
     let database_config = DatabaseConfig::from_app_config(&config.database);
     let mut database = ScanStore::new(
@@ -104,10 +97,10 @@ pub(crate) async fn run_persisted(request: ScanRequest<'_>, config: AppConfig) -
         cancellation.check()?;
         cancellation.operation(database.ping()).await?;
         cancellation.check()?;
-        let old = cancellation.operation(database.load_resume_state()).await?;
+        let mut old = cancellation.operation(database.load_resume_state()).await?;
         cancellation.check()?;
         let mut already_committed = false;
-        let mut state = if let Some(state) = old.as_ref().filter(|state| state.active()) {
+        let mut state = if let Some(state) = old.as_ref().filter(|state| state.active() && resume) {
             state.validate(&request_key)?;
             if !cancellation.operation(database.results_exist()).await? {
                 return Err(AppError::ScanError(
@@ -123,11 +116,14 @@ pub(crate) async fn run_persisted(request: ScanRequest<'_>, config: AppConfig) -
                 completed.checkpoint.clear();
                 completed.advance()?;
                 cancellation.operation(database.save_resume_state(&completed)).await?;
+                cancellation.operation(database.cleanup_scan_snapshots(&completed)).await?;
                 if let Err(error) = cancellation.operation(database.cleanup_resume_batch()).await {
                     warn!(%error, "Completed scan; deferred batch-table cleanup");
                 }
                 info!("Recovered the previous scan's completed generation commit");
                 already_committed = true;
+            } else {
+                cancellation.operation(database.restore_scan_checkpoint(state)).await?;
             }
             info!(
                 entries = state.observed_entries,
@@ -136,15 +132,31 @@ pub(crate) async fn run_persisted(request: ScanRequest<'_>, config: AppConfig) -
             );
             state.clone()
         } else {
+            if let Some(state) = old.as_mut().filter(|state| state.active()) {
+                let committed = state.phase == FINALIZING && cancellation.operation(database.restore_resume_generation(state)).await?;
+                if committed {
+                    state.phase = COMPLETED;
+                    state.checkpoint.clear();
+                    state.advance()?;
+                    cancellation.operation(database.save_resume_state(state)).await?;
+                } else {
+                    cancellation.operation(database.restore_scan_baseline(state)).await?;
+                }
+            }
             let incremental = cancellation.operation(database.has_baseline()).await?;
             cancellation.operation(database.initialize()).await?;
+            cancellation.operation(database.prepare_incremental()).await?;
+            cancellation.operation(database.prepare_native_schema()).await?;
+            let baseline_snapshot = cancellation.operation(database.capture_scan_baseline()).await?;
             let generation = cancellation.operation(database.begin_scan_generation()).await?;
+            // begin 可能写入旧轮次的 ABANDONED manifest；新轮版本必须严格超过它。
+            let previous = cancellation.operation(database.load_resume_state()).await?;
             let now = i64::try_from(SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos())?;
             let event_time = cancellation.operation(database.resume_event_epoch(now)).await?;
             let mut fresh = ScanResumeState {
                 id: 1,
                 schema_version: 1,
-                version: old.as_ref().map_or(0, |value| value.version),
+                version: previous.as_ref().map_or(0, |value| value.version),
                 request_key,
                 generation,
                 incremental,
@@ -153,9 +165,12 @@ pub(crate) async fn run_persisted(request: ScanRequest<'_>, config: AppConfig) -
                 observed_entries: 0,
                 checkpoint: Vec::new(),
                 statistics: String::new(),
+                checkpoint_snapshot: baseline_snapshot.clone(),
+                baseline_snapshot,
             };
             fresh.advance()?;
             cancellation.operation(database.save_resume_state(&fresh)).await?;
+            cancellation.operation(database.cleanup_scan_snapshots(&fresh)).await?;
             info!("Starting a scan with durable ClickHouse checkpoints");
             fresh
         };
@@ -181,11 +196,6 @@ pub(crate) async fn run_persisted(request: ScanRequest<'_>, config: AppConfig) -
         consumers
             .initialize_scan_statistics(&storage, options.include_tags, Some(state.event_time))
             .await?;
-        let directory_statistics = database.directory_statistics_store();
-        cancellation.operation(directory_statistics.prepare()).await?;
-        cancellation
-            .operation(directory_statistics.truncate(state.event_time, state.version))
-            .await?;
         consumers.begin_lifecycle().await;
         let result = if already_committed {
             Ok(())
@@ -197,7 +207,7 @@ pub(crate) async fn run_persisted(request: ScanRequest<'_>, config: AppConfig) -
                 &mut state,
                 &consumers,
                 config.database.batch_size.max(1) as usize,
-                cancellation.clone(),
+                cancellation.clone(), resume,
             )
             .await
         };
@@ -226,8 +236,9 @@ pub(crate) async fn run_persisted(request: ScanRequest<'_>, config: AppConfig) -
 
 fn request_key(
     kind: &str, identity: &str, depth: u32, include: &Option<String>, exclude: &Option<String>, tags: bool,
+    resume: bool,
 ) -> Result<String> {
-    let bytes = serde_json::to_vec(&(1, kind, identity, depth, include, exclude, tags))?;
+    let bytes = serde_json::to_vec(&(2, kind, identity, depth, include, exclude, tags, resume))?;
     Ok(blake3::hash(&bytes).to_hex().to_string())
 }
 
@@ -244,16 +255,21 @@ fn checkpoint_interval() -> Duration {
 #[allow(clippy::too_many_arguments)]
 async fn run(
     storage: &StorageEnum, options: &WalkOptions, database: &mut ScanStore, state: &mut ScanResumeState,
-    consumers: &ConsumerManager, batch_size: usize, cancel: ScanCancellation,
+    consumers: &ConsumerManager, batch_size: usize, cancel: ScanCancellation, resume: bool,
 ) -> Result<()> {
     if state.phase == RUNNING {
-        let source = storage.resumable_scan(
-            options,
-            (!state.checkpoint.is_empty()).then(|| state.checkpoint.clone()),
-            cancel.token().clone(),
-            checkpoint_interval(),
-        )?;
-        pipeline::consume(source, database, state, consumers, batch_size, cancel.clone()).await?;
+        let mode = if resume {
+            ScanSourceMode::Resumable {
+                checkpoint: (!state.checkpoint.is_empty()).then(|| state.checkpoint.clone()),
+                every: checkpoint_interval(),
+            }
+        } else {
+            ScanSourceMode::Streaming {
+                order: TraversalOrder::Unordered,
+            }
+        };
+        let source = storage.scan_source(options, mode, cancel.token().clone())?;
+        pipeline::consume(source, database, state, consumers, batch_size, cancel.clone(), resume).await?;
     }
     cancel.check()?;
     let statistics = final_statistics(database, state, consumers, batch_size, &cancel).await?;
@@ -262,7 +278,7 @@ async fn run(
     cancel.check()?;
     state.statistics = consumers.statistics_checkpoint().await?;
     state.advance()?;
-    cancel.operation(database.save_resume_state(state)).await?;
+    cancel.operation(database.seal_resume_state(state)).await?;
     cancel.check()?;
     cancel.operation(database.commit_scan_generation()).await?;
     cancel.check()?;
@@ -271,6 +287,7 @@ async fn run(
     state.checkpoint.clear();
     state.advance()?;
     cancel.operation(database.save_resume_state(state)).await?;
+    cancel.operation(database.cleanup_scan_snapshots(state)).await?;
     if let Err(error) = cancel.operation(database.cleanup_resume_batch()).await {
         warn!(%error, "Completed scan; deferred batch-table cleanup");
     }
@@ -441,15 +458,15 @@ mod tests {
 
     #[test]
     fn binds_source_depth_filters_and_tag_policy_but_not_secrets_in_plaintext() -> Result<()> {
-        let key = request_key("local", "root", 0, &None, &None, false)?;
+        let key = request_key("local", "root", 0, &None, &None, false, true)?;
         assert_eq!(key.len(), 64);
-        assert_ne!(key, request_key("local", "other", 0, &None, &None, false)?);
-        assert_ne!(key, request_key("local", "root", 1, &None, &None, false)?);
+        assert_ne!(key, request_key("local", "other", 0, &None, &None, false, true)?);
+        assert_ne!(key, request_key("local", "root", 1, &None, &None, false, true)?);
         assert_ne!(
             key,
-            request_key("local", "root", 0, &Some("type==file".into()), &None, false)?
+            request_key("local", "root", 0, &Some("type==file".into()), &None, false, true)?
         );
-        assert_ne!(key, request_key("local", "root", 0, &None, &None, true)?);
+        assert_ne!(key, request_key("local", "root", 0, &None, &None, true, true)?);
         Ok(())
     }
 }

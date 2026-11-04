@@ -13,6 +13,7 @@ use tracing::trace;
 // 内部模块
 use crate::config::{JobType, redact_command_line};
 use crate::integrity_check::{FixStatus, IntegrityIssue, IssueKind};
+use crate::scan::statistics::ScanCounts;
 
 // ─────────────────────────────────────────────────
 // 枚举：时间区间 / 文件大小区间
@@ -179,6 +180,21 @@ pub struct FullStats {
 }
 
 impl FullStats {
+    pub(crate) fn scan_prefix(&self, counts: &ScanCounts) -> Self {
+        let mut result = Self::new(
+            self.job_type.clone(),
+            self.job_id.clone(),
+            self.command.clone(),
+            self.log_path.clone(),
+        );
+        result.dir_count = counts.retained.directories as usize;
+        result.regular_file_count = counts.retained.regular_files as usize;
+        result.symlink_count = counts.retained.symlinks as usize;
+        result.regular_file_size = counts.regular_file_bytes as i64;
+        result.error_stats = self.error_stats.clone();
+        result.start_time = self.start_time;
+        result
+    }
     pub fn new(job_type: JobType, job_id: String, command: String, log_path: String) -> Self {
         Self {
             dir_count: 0,
@@ -380,20 +396,6 @@ pub struct ErrorStats {
 }
 
 impl ErrorStats {
-    pub(crate) fn merge_cumulative(&mut self, other: &Self) {
-        macro_rules! fields { ($($field:ident),*) => { $(self.$field = self.$field.max(other.$field);)* }; }
-        fields!(
-            scan,
-            copy,
-            copy_acl,
-            copy_xattr,
-            delete,
-            rename,
-            symlink_op,
-            pack,
-            integrity_check
-        );
-    }
     pub fn record(&mut self, event: ErrorEvent) {
         match event {
             ErrorEvent::Scan => self.scan += 1,
@@ -625,6 +627,24 @@ pub enum StatsKind {
 }
 
 impl StatsKind {
+    pub(crate) fn scan_prefix(&self, counts: &ScanCounts) -> Self {
+        match self {
+            Self::Full(value) => Self::Full(value.scan_prefix(counts)),
+            Self::Incremental(value) => Self::Incremental(IncrementalStats {
+                scanned: value.scanned.scan_prefix(counts),
+                new: value.new.clone(),
+                changed: value.changed.clone(),
+                deleted: value.deleted.clone(),
+                renamed: value.renamed.clone(),
+                error_stats: value.error_stats.clone(),
+                command: value.command.clone(),
+                job_id: value.job_id.clone(),
+                job_type: value.job_type.clone(),
+                log_path: value.log_path.clone(),
+                start_time: value.start_time,
+            }),
+        }
+    }
     pub fn update_from_message(&mut self, message: &StorageEntryMessage) {
         match self {
             StatsKind::Full(s) => s.update_from_message(message),

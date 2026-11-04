@@ -6,14 +6,7 @@ use super::{
 };
 use crate::error::{AppError, Result};
 use serde::{Deserialize, Serialize};
-use std::{
-    path::{Path, PathBuf},
-    time::{SystemTime, UNIX_EPOCH},
-};
-use tokio::{
-    fs::{OpenOptions, create_dir_all, read, rename},
-    io::AsyncWriteExt,
-};
+use std::time::{SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
 #[derive(Deserialize, Serialize)]
@@ -54,15 +47,6 @@ pub struct CallbackState {
     pub identity: CallbackIdentity,
     pub outbox: DiagnosticOutbox,
     pub runtime: ScanRuntimeState,
-    #[serde(skip)]
-    journal: Option<PathBuf>,
-}
-
-#[derive(Deserialize, Serialize)]
-struct Journal {
-    job_id: String,
-    callback: CallbackState,
-    errors: ErrorStats,
 }
 
 fn now_millis() -> u64 {
@@ -89,15 +73,12 @@ impl Default for CallbackState {
                 state: ScanRuntimePhase::Running,
                 ..Default::default()
             },
-            journal: None,
         }
     }
 }
 
 impl CallbackState {
-    pub(crate) async fn initialize_scan(
-        &mut self, job_id: &str, job_dir: &str, round: Option<i64>, stats: &mut StatsKind,
-    ) -> Result<()> {
+    pub(crate) fn initialize_scan(&mut self, job_id: &str, round: Option<i64>) -> Result<()> {
         if let Some(round) = round {
             let round_id = format!("{job_id}:{round}");
             if self.identity.round_id != round_id {
@@ -106,49 +87,6 @@ impl CallbackState {
             self.identity.round_id = round_id;
             self.identity.round_started_at_millis = u64::try_from(round / 1_000_000)?;
         }
-        if job_dir.is_empty() {
-            return Ok(());
-        }
-        create_dir_all(job_dir).await?;
-        // 轮次文件保留未确认明细；下一轮不会把旧轮次计数混入新统计。
-        let digest = blake3::hash(self.identity.round_id.as_bytes());
-        let path = Path::new(job_dir).join(format!("scan-callback-{}.json", digest.to_hex()));
-        match read(&path).await {
-            Ok(bytes) => {
-                if bytes.len() > 8 * 1024 * 1024 {
-                    return Err(AppError::ScanError("Scan callback journal exceeds size limit".into()));
-                }
-                let saved: Journal = serde_json::from_slice(&bytes)?;
-                if saved.job_id != job_id
-                    || saved.callback.identity.round_id != self.identity.round_id
-                    || !saved
-                        .callback
-                        .outbox
-                        .validate_identity(&saved.callback.identity.round_id, &saved.callback.identity.attempt_id)
-                {
-                    return Err(AppError::ScanError("Scan callback journal identity is invalid".into()));
-                }
-                self.runtime.network_faults = self.runtime.network_faults.max(saved.callback.runtime.network_faults);
-                self.runtime.recovery_attempts = self
-                    .runtime
-                    .recovery_attempts
-                    .max(saved.callback.runtime.recovery_attempts);
-                self.runtime.successful_recoveries = self
-                    .runtime
-                    .successful_recoveries
-                    .max(saved.callback.runtime.successful_recoveries);
-                if saved.callback.outbox.revision() > self.outbox.revision() {
-                    self.outbox = saved.callback.outbox;
-                    self.outbox.set_attempt(self.identity.attempt_id.clone());
-                    self.runtime.state = saved.callback.runtime.state;
-                    self.runtime.current_error = saved.callback.runtime.current_error;
-                }
-                errors_mut(stats).merge_cumulative(&saved.errors);
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error.into()),
-        }
-        self.journal = Some(path);
         Ok(())
     }
 
@@ -166,38 +104,12 @@ impl CallbackState {
         self.runtime = saved.runtime;
         Ok(())
     }
-
-    pub(crate) async fn persist(&self, job_id: &str, errors: &ErrorStats) -> Result<()> {
-        let Some(path) = &self.journal else { return Ok(()) };
-        let bytes = serde_json::to_vec(&Journal {
-            job_id: job_id.into(),
-            callback: self.clone(),
-            errors: errors.clone(),
-        })?;
-        let temporary = path.with_extension(format!("{}.tmp", self.identity.attempt_id));
-        let mut options = OpenOptions::new();
-        options.write(true).create(true).truncate(true);
-        #[cfg(unix)]
-        options.mode(0o600);
-        let mut file = options.open(&temporary).await?;
-        file.write_all(&bytes).await?;
-        file.sync_all().await?;
-        drop(file);
-        rename(&temporary, path).await?;
-        Ok(())
-    }
 }
 
 pub(crate) fn errors(stats: &StatsKind) -> &ErrorStats {
     match stats {
         StatsKind::Full(stats) => &stats.error_stats,
         StatsKind::Incremental(stats) => &stats.error_stats,
-    }
-}
-pub(crate) fn errors_mut(stats: &mut StatsKind) -> &mut ErrorStats {
-    match stats {
-        StatsKind::Full(stats) => &mut stats.error_stats,
-        StatsKind::Incremental(stats) => &mut stats.error_stats,
     }
 }
 

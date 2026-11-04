@@ -36,7 +36,6 @@ transport     = { workspace = true, features = ["quic"] }
 tokio-util    = { workspace = true, features = ["rt"] }
 utils         = { workspace = true }
 uuid          = { workspace = true }
-sqlx          = { version = "0.8", features = ["runtime-tokio", "sqlite"] }
 tempfile      = "3"
 
 [lints]

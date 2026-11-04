@@ -1,6 +1,5 @@
 //! 共享表的集群扫描存储。所有读写在这里绑定 job_id，业务层不拼接集群 SQL。
 use crate::clickhouse::replica_read::QuorumRead;
-use crate::scan_store::directory_statistics::DirectoryStatisticsStore;
 use crate::scan_store::queries::{ScanExecute, check_scan_cancellation, scan_retry_delay};
 #[cfg(test)]
 use std::collections::HashMap;
@@ -114,9 +113,6 @@ where
 }
 
 impl ClusterScanStore {
-    pub(crate) fn directory_statistics_ledger(&self) -> Result<DirectoryStatisticsStore> {
-        DirectoryStatisticsStore::cluster(self.client.clone(), &self.database, &self.cluster, &self.job_id)
-    }
     pub(crate) fn tag_scan_queries(&mut self, comment: &str) {
         self.client = self.client.clone().with_option("log_comment", comment);
     }
@@ -272,12 +268,17 @@ impl ClusterScanStore {
     }
 
     async fn create_checkpoint_table(&self) -> Result<()> {
-        let columns = "job_id String,id UInt8,schema_version UInt8,version UInt64,request_key String,generation UInt8,incremental Bool,phase UInt8,event_time Int64,observed_entries UInt64,checkpoint Array(UInt8),statistics String DEFAULT ''";
+        let columns = "job_id String,id UInt8,schema_version UInt8,version UInt64,request_key String,generation UInt8,incremental Bool,phase UInt8,event_time Int64,observed_entries UInt64,checkpoint Array(UInt8),statistics String DEFAULT '',baseline_snapshot String DEFAULT '',checkpoint_snapshot String DEFAULT ''";
         let cluster = identifier(&self.cluster)?;
         let database = identifier(&self.database)?;
         let path = format!("/clickhouse/terrasync/{}/scan_resume_local/{{shard}}", self.database);
         self.client.query(&format!("CREATE TABLE IF NOT EXISTS {database}.scan_resume_local ON CLUSTER {cluster} ({columns}) ENGINE = ReplicatedReplacingMergeTree('{path}','{{replica}}',version) PARTITION BY job_id ORDER BY job_id")).execute_scan().await?;
         self.client.query(&format!("CREATE TABLE IF NOT EXISTS {database}.scan_resume ON CLUSTER {cluster} AS {database}.scan_resume_local ENGINE = Distributed({cluster},{database},scan_resume_local,cityHash64(job_id))")).execute_scan().await?;
+        for table in ["scan_resume_local", "scan_resume"] {
+            for column in ["baseline_snapshot", "checkpoint_snapshot"] {
+                self.client.query(&format!("ALTER TABLE {database}.{table} ON CLUSTER {cluster} ADD COLUMN IF NOT EXISTS {column} String DEFAULT ''")).execute_scan().await?;
+            }
+        }
         Ok(())
     }
 
@@ -346,7 +347,7 @@ impl ClusterScanStore {
         let database = identifier(&self.database)?;
         self.initialize().await?;
         self.cleanup_abandoned_batches().await?;
-        let row=self.client.query(&format!("SELECT id,schema_version,version,request_key,generation,incremental,phase,event_time,observed_entries,checkpoint,statistics FROM {database}.scan_resume FINAL WHERE job_id=?")).bind(&self.job_id).fetch_quorum_one::<ScanResumeState>().await;
+        let row=self.client.query(&format!("SELECT id,schema_version,version,request_key,generation,incremental,phase,event_time,observed_entries,checkpoint,statistics,baseline_snapshot,checkpoint_snapshot FROM {database}.scan_resume FINAL WHERE job_id=?")).bind(&self.job_id).fetch_quorum_one::<ScanResumeState>().await;
         match row {
             Ok(state) => {
                 state.validate(&state.request_key)?;

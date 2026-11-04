@@ -24,7 +24,7 @@ pub use entry::*;
 pub use error::{Result, StorageError};
 pub use integrity_check::*;
 pub use options::*;
-pub use scanning::{DeleteDirIterator, DeleteEvent, ResumableScan, ResumableScanItem};
+pub use scanning::{DeleteDirIterator, DeleteEvent, ResumableScan, ResumableScanItem, ScanSourceMode};
 pub use streaming::*;
 pub type WalkDirAsyncIterator = AsyncReceiver<StorageEntryMessage>;
 pub type WalkDirAsyncIterator2 = AsyncReceiver<dir_tree::NdxEvent>;

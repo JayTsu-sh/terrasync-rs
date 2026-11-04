@@ -3,7 +3,7 @@ import { mount } from '@vue/test-utils'
 import TaskInfoPanel from '../TaskInfoPanel.vue'
 import type { MigrationTask } from '../../api/tasks'
 import type { Endpoint } from '../../api/endpoints'
-const task: MigrationTask = { id: 'scan', name: '扫描', task_type: 'scan', status: 'cancelled', source_endpoint_id: 'source', config: {}, created_at: '2026-11-01T00:00:00Z' }
+const task: MigrationTask = { id: 'scan', name: '扫描', task_type: 'scan', status: 'cancelled', source_endpoint_id: 'source', config: {scan_resume:true}, created_at: '2026-11-01T00:00:00Z' }
 const source = { id: 'source', name: '源目录', endpoint_type: 'local', config: {type:'local',path:'/data'} } as Endpoint
 function render(value = task, dest: Endpoint | null = null) {
  return mount(TaskInfoPanel, { props: { task: value, sourceEndpoint: source, destEndpoint: dest }, global: { stubs: { EndpointCard: { props: ['endpoint','placeholder'], template: '<div data-test="endpoint">{{ endpoint?.name || placeholder?.label }}</div>' } } } })
@@ -22,5 +22,8 @@ describe('task type and cancellation presentation', () => {
  })
  it('retains both endpoints for a migration', () => {
   expect(render({...task, task_type:'sync'}, {...source,id:'dest',name:'目标目录'}).findAll('[data-test="endpoint"]')).toHaveLength(2)
+ })
+ it('restarts a scan that did not enable checkpoints', () => {
+  expect(render({...task, config:{scan_resume:false}}).text()).toContain('重新扫描')
  })
 })

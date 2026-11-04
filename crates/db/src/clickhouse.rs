@@ -27,7 +27,6 @@ use crate::common::{
 use crate::config::ClickHouseConfig;
 use crate::error::{DatabaseError, Result};
 use crate::observation_record::{OBSERVATION_IDENTITY_JOIN_CLAUSE, ObservedEntryRecord};
-use crate::scan_store::directory_statistics::DirectoryStatisticsStore;
 use crate::scan_store::queries::check_scan_cancellation;
 use crate::traits::{
     CopyGenerationStatus, Database, IncrementalStorageEntryRecord, QueryResult, StorageEntryRecord, TarManifestRecord,
@@ -74,9 +73,6 @@ pub struct ClickHouseDatabase {
 }
 
 impl ClickHouseDatabase {
-    pub(crate) fn directory_statistics_ledger(&self) -> DirectoryStatisticsStore {
-        DirectoryStatisticsStore::single(self.sync_client.clone(), &self.job_id)
-    }
     pub(crate) fn tag_scan_queries(&mut self, comment: &str) {
         self.sync_client = self.sync_client.clone().with_option("log_comment", comment);
         self.async_client = self.async_client.clone().with_option("log_comment", comment);

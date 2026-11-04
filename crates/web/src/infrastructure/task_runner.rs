@@ -367,6 +367,7 @@ async fn run_migration_task(
     match task_type {
         TaskType::Scan => {
             scan(ScanRequest {
+                resume: task_config.scan_resume,
                 job_id,
                 job_dir,
                 path: source_url,

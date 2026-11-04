@@ -12,7 +12,7 @@ use storage_adapter::StorageEntryMessage;
 use storage_adapter::observed_scan::EntryStatistics;
 use tracing::info;
 
-use super::accumulator::{fmt_elapsed, format_bytes};
+use super::accumulator::{IncrementalStats, fmt_elapsed, format_bytes};
 use super::report::{ProgressDetail, ProgressReport};
 use crate::config::JobType;
 use crate::error::{AppError, Result};
@@ -239,7 +239,20 @@ impl ProgressBar {
 
     // ─── 统计更新 ───
 
-    /// 扫描只发布目录 ledger 的逻辑快照，不叠加重放/版本交付。
+    pub(crate) fn update_scan_events(&self, stats: &IncrementalStats) {
+        if let CounterSet::Incremental(c) = &self.counters {
+            for (count, size, values) in [
+                (&c.new_count, &c.new_size, &stats.new),
+                (&c.changed_count, &c.changed_size, &stats.changed),
+                (&c.deleted_count, &c.deleted_size, &stats.deleted),
+                (&c.renamed_count, &c.renamed_size, &stats.renamed),
+            ] {
+                count.store(values.total_count() as u64, Ordering::Relaxed);
+                size.store(values.total_size() as u64, Ordering::Relaxed);
+            }
+        }
+    }
+    /// 扫描只发布完整前缀及活跃目录的实际贡献，不叠加重放/版本交付。
     pub(crate) fn update_scan(&self, snapshot: &ScanSnapshot) {
         let retained = snapshot.counts.retained;
         match &self.counters {

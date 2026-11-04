@@ -98,6 +98,8 @@ fn state(epoch: i64, incremental: bool, generation: u8) -> ScanResumeState {
         observed_entries: 0,
         checkpoint: vec![],
         statistics: String::new(),
+        baseline_snapshot: String::new(),
+        checkpoint_snapshot: String::new(),
     }
 }
 

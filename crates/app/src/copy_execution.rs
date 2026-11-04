@@ -1,74 +1,25 @@
 //! 复制执行的互斥与恢复授权；不把轮次策略下沉到 backend。
+use crate::job_execution::JobLease;
 use crate::{
     config::SyncJobConfig,
     error::{AppError, Result},
     storage_factory::{StorageRole, create_storage_for_role},
 };
 use blake3::Hasher;
-use dashmap::{DashMap, mapref::entry::Entry};
 use db::{CopyGenerationStatus, Database};
-use std::{
-    fs::{File, OpenOptions, create_dir_all},
-    path::Path,
-    sync::OnceLock,
-};
+use std::fs::File;
 use tokio::task::spawn_blocking;
 use tracing::info;
 use utils::app_config::ClickhouseConfig;
-use utils::sanitize_job_id;
 
-static ACTIVE: OnceLock<DashMap<String, ()>> = OnceLock::new();
-
-/// 同进程按数据库身份和作业互斥；跨进程通过同一 job_dir 的文件锁互斥。
 pub(crate) struct CopyLease {
-    key: String,
-    _file: File,
+    _guard: JobLease,
 }
-
 impl CopyLease {
     pub(crate) fn acquire(connection: &ClickhouseConfig, job: &SyncJobConfig) -> Result<Self> {
-        let key = blake3::hash(&serde_json::to_vec(&(
-            &connection.dsn,
-            &connection.database,
-            sanitize_job_id(&job.job_id),
-        ))?)
-        .to_hex()
-        .to_string();
-        let active = ACTIVE.get_or_init(DashMap::new);
-        match active.entry(key.clone()) {
-            Entry::Occupied(_) => return Err(AppError::ConfigError("同一数据库作业已有复制执行，不能抢占恢复".into())),
-            Entry::Vacant(entry) => {
-                entry.insert(());
-            }
-        }
-        let file = (|| {
-            create_dir_all(&job.job_dir)?;
-            let file = OpenOptions::new()
-                .create(true)
-                .truncate(false)
-                .write(true)
-                .open(Path::new(&job.job_dir).join("copy.lock"))?;
-            file.try_lock().map_err(|source| AppError::CopyJobLock {
-                job_id: job.job_id.clone(),
-                source,
-            })?;
-            Ok(file)
-        })();
-        match file {
-            Ok(file) => Ok(Self { key, _file: file }),
-            Err(error) => {
-                active.remove(&key);
-                Err(error)
-            }
-        }
-    }
-}
-
-impl Drop for CopyLease {
-    fn drop(&mut self) {
-        if let Some(active) = ACTIVE.get() {
-            active.remove(&self.key);
-        }
+        Ok(Self {
+            _guard: JobLease::acquire(connection, &job.job_id, &job.job_dir)?,
+        })
     }
 }
 
@@ -156,6 +107,8 @@ fn require_safe_copy_recovery(status: CopyGenerationStatus, source_reserved: boo
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs::OpenOptions;
+    use std::path::Path;
     use storage_adapter::TransferMode;
 
     fn job(directory: &Path) -> SyncJobConfig {
@@ -222,14 +175,14 @@ mod tests {
             .create(true)
             .truncate(false)
             .write(true)
-            .open(directory.path().join("copy.lock"))?;
+            .open(directory.path().join("job.lock"))?;
         file.try_lock().map_err(|source| AppError::CopyJobLock {
             job_id: job.job_id.clone(),
             source,
         })?;
         assert!(matches!(
             CopyLease::acquire(&connection(), &job),
-            Err(AppError::CopyJobLock { .. })
+            Err(AppError::JobExecutionLock { .. })
         ));
         drop(file);
         assert!(CopyLease::acquire(&connection(), &job).is_ok());

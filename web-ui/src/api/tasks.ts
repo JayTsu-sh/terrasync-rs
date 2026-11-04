@@ -4,6 +4,7 @@ import { throwIfError } from './fetch-utils'
 const BASE = '/api/v1'
 
 export interface TaskConfig {
+  scan_resume?: boolean
   match_expr?: string
   exclude_expr?: string
   depth?: number
@@ -82,7 +83,8 @@ export interface ScanSnapshot {
   scanned_entries: number
   filtered_entries: number
   retained_entries: number
-  replayed_directory_listings: number
+  restarts: number
+  distributions_complete: boolean
   distributions_reconciled: boolean
   counts: {
     scanned: EntryKindCounts

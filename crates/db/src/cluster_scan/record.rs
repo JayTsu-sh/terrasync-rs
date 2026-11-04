@@ -149,6 +149,8 @@ pub(super) struct ClusterScanResumeState {
     pub observed_entries: u64,
     pub checkpoint: Vec<u8>,
     pub statistics: String,
+    pub baseline_snapshot: String,
+    pub checkpoint_snapshot: String,
 }
 
 impl ClusterScanResumeState {
@@ -166,6 +168,8 @@ impl ClusterScanResumeState {
             observed_entries: record.observed_entries,
             checkpoint: record.checkpoint,
             statistics: record.statistics,
+            baseline_snapshot: record.baseline_snapshot,
+            checkpoint_snapshot: record.checkpoint_snapshot,
         }
     }
 }

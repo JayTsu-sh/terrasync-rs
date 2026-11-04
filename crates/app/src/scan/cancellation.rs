@@ -115,10 +115,7 @@ pub(crate) async fn scope<T>(
 mod tests {
     use super::*;
     use clickhouse::Client;
-    use db::{
-        ClickHouseConfig, DatabaseError,
-        scan_store::{ScanDirectoryStatisticsRow, ScanStore},
-    };
+    use db::{ClickHouseConfig, DatabaseError, scan_store::ScanStore};
     use std::sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -152,15 +149,10 @@ mod tests {
 
     #[tokio::test]
     async fn empty_kill_does_not_finish_a_request_still_waiting_for_its_response() {
-        assert_empty_kill_request_is_drained(false).await;
+        assert_empty_kill_request_is_drained().await;
     }
 
-    #[tokio::test]
-    async fn directory_statistics_write_is_drained_before_cancelled_scope_returns() {
-        assert_empty_kill_request_is_drained(true).await;
-    }
-
-    async fn assert_empty_kill_request_is_drained(directory_statistics: bool) {
+    async fn assert_empty_kill_request_is_drained() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
         let received = Arc::new(Notify::new());
@@ -203,11 +195,7 @@ mod tests {
                         allow.notified().await;
                         written.store(true, Ordering::SeqCst);
                     }
-                    let body = if String::from_utf8_lossy(&bytes).contains("DESCRIBE") {
-                        directory_schema()
-                    } else {
-                        Vec::new()
-                    };
+                    let body = Vec::<u8>::new();
                     let header = format!(
                         "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                         body.len()
@@ -234,24 +222,11 @@ mod tests {
         let work = scope(store.query_cancellation(), cancel.clone(), async move {
             operation_cancel
                 .operation(async move {
-                    if directory_statistics {
-                        store
-                            .write_directory_statistics(
-                                1,
-                                1,
-                                &[ScanDirectoryStatisticsRow {
-                                    directory: "a".into(),
-                                    payload: "confirmed-contribution".into(),
-                                }],
-                            )
-                            .await
-                    } else {
-                        client
-                            .query("INSERT INTO fixture VALUES (1)")
-                            .execute()
-                            .await
-                            .map_err(DatabaseError::from)
-                    }
+                    client
+                        .query("INSERT INTO fixture VALUES (1)")
+                        .execute()
+                        .await
+                        .map_err(DatabaseError::from)
                 })
                 .await
         });
@@ -272,37 +247,6 @@ mod tests {
         assert!(completed.load(Ordering::SeqCst));
         server.abort();
         let _ = server.await;
-    }
-
-    fn directory_schema() -> Vec<u8> {
-        let mut bytes = vec![7];
-        let names = [
-            "name",
-            "type",
-            "default_type",
-            "default_expression",
-            "comment",
-            "codec_expression",
-            "ttl_expression",
-        ];
-        for value in names.into_iter().chain(["String"; 7]) {
-            bytes.push(value.len() as u8);
-            bytes.extend_from_slice(value.as_bytes());
-        }
-        for (name, kind) in [
-            ("job_id", "String"),
-            ("round", "Int64"),
-            ("version", "UInt64"),
-            ("revision", "UInt64"),
-            ("directory", "String"),
-            ("payload", "String"),
-        ] {
-            for value in [name, kind, "", "", "", "", ""] {
-                bytes.push(value.len() as u8);
-                bytes.extend_from_slice(value.as_bytes());
-            }
-        }
-        bytes
     }
 
     #[tokio::test]

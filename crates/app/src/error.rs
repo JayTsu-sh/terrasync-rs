@@ -26,8 +26,8 @@ use utils::error::UtilsError;
 /// 应用程序的专用错误枚举
 #[derive(Error, Debug)]
 pub enum AppError {
-    #[error("Scan statistics ledger error: {0}")]
-    ScanStatisticsLedger(#[from] sqlx::Error),
+    #[error("同一数据库作业 {job_id} 已有执行，无法获取作业锁: {source}")]
+    JobExecutionLock { job_id: String, source: TryLockError },
     /// 中立 traversal 的 session/runtime 终态失败。
     #[error("Traversal terminal failure: {0}")]
     TraversalTerminal(#[from] TraversalTerminalFailure),

@@ -161,7 +161,9 @@ pub struct ScanSnapshot {
     pub counts: ScanCounts,
     pub complete: bool,
     #[serde(default)]
-    pub replayed_directory_listings: u64,
+    pub restarts: u64,
+    #[serde(default)]
+    pub distributions_complete: bool,
     #[serde(default)]
     pub distributions_reconciled: bool,
     pub capabilities: ScanCapabilities,
@@ -188,7 +190,8 @@ impl ScanSnapshot {
             retained_entries: 0,
             counts: ScanCounts::default(),
             complete: false,
-            replayed_directory_listings: 0,
+            restarts: 0,
+            distributions_complete: true,
             distributions_reconciled: false,
             capabilities,
         }

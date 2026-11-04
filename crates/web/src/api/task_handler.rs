@@ -237,7 +237,7 @@ mod progress_tests {
             "is_final":false, "detail":{"kind":"Full","scanned_files":2,"scanned_dirs":1,
                 "total_bytes":10,"transferred_bytes":0,"error_count":3},
             "scan":{"scanned_entries":3,"filtered_entries":0,"retained_entries":3,"complete":false,
-                "replayed_directory_listings":7,"distributions_reconciled":true,
+                "restarts":7,"distributions_complete":false,"distributions_reconciled":true,
                 "counts":{"scanned":kinds,"filtered":empty,"retained":kinds,"failed":empty,"vanished":empty,
                     "pruned_directories":0,"truncated_directories":0,"regular_file_bytes":10,
                     "unknown_file_sizes":0,"versions":2,"delete_markers":0,"all_versions_bytes":10,
@@ -251,7 +251,8 @@ mod progress_tests {
         assert_eq!(snapshot["scanned_files"], 2);
         assert_eq!(snapshot["error_count"], 3);
         assert_eq!(snapshot["scan"]["retained_entries"], 3);
-        assert_eq!(snapshot["scan"]["replayed_directory_listings"], 7);
+        assert_eq!(snapshot["scan"]["restarts"], 7);
+        assert_eq!(snapshot["scan"]["distributions_complete"], false);
         assert_eq!(snapshot["scan"]["distributions_reconciled"], true);
         assert_eq!(snapshot["scan"]["capabilities"]["symlinks"], "unsupported");
         assert_eq!(snapshot["scan_runtime"]["current_error"], "connection reset");

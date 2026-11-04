@@ -166,6 +166,7 @@ impl TaskService {
         if task.task_type == TaskType::Scan
             && (old.source_endpoint_id != task.source_endpoint_id
                 || old.source_path_id != task.source_path_id
+                || old.config.scan_resume != task.config.scan_resume
                 || old.config.depth != task.config.depth
                 || old.config.match_expr != task.config.match_expr
                 || old.config.exclude_expr != task.config.exclude_expr)

@@ -152,6 +152,7 @@ pub async fn scan_cmd(
         }
     });
     let result = scan(ScanRequest {
+        resume,
         job_id,
         job_dir: &job_dir,
         path,

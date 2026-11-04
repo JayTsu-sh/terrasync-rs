@@ -1,7 +1,7 @@
 //! 扫描分发及检查点协调。数据库批次 B 写入时，下一批 A 在有界队列中积累。
 use super::{flush_batch, input::ScanInput, workers};
 use crate::scan::cancellation::ScanCancellation;
-use crate::scan::directory_ledger::DirectoryLedger;
+use crate::scan::progress::ScanProgress;
 use crate::{
     consumer::{
         ConsumerManager, ScanStatistics,
@@ -9,10 +9,13 @@ use crate::{
     },
     error::{AppError, Result},
 };
-use data_mover::{model::ObservedEntry, traversal::TraversalOutcome};
+use data_mover::{
+    model::ObservedEntry,
+    traversal::{TraversalOrder, TraversalOutcome},
+};
 use db::{
     clickhouse::scan_resume::{FINALIZING, ScanResumeState},
-    scan_store::{DirectoryStatisticsStore, ScanStore},
+    scan_store::ScanStore,
 };
 use std::{
     sync::Arc,
@@ -33,24 +36,41 @@ pub(super) const DISPATCH_BATCH: usize = 256;
 pub(super) type Entries = Arc<[Arc<ObservedEntry>]>;
 pub(super) struct SaveState {
     pub(super) state: ScanResumeState,
-    pub(super) ack: oneshot::Sender<()>,
+    pub(super) restore: bool,
+    pub(super) ack: oneshot::Sender<ScanResumeState>,
+}
+
+impl SaveState {
+    pub(super) async fn execute(mut self, database: &ScanStore) -> Result<()> {
+        if self.restore {
+            database.restore_scan_checkpoint(&self.state).await?;
+        } else {
+            database.seal_resume_state(&mut self.state).await?;
+        }
+        let _ = self.ack.send(self.state);
+        Ok(())
+    }
 }
 
 pub(super) async fn consume(
     source: ResumableScan, database: &mut ScanStore, state: &mut ScanResumeState, statistics: &ConsumerManager,
-    batch_size: usize, cancel: ScanCancellation,
+    batch_size: usize, cancel: ScanCancellation, resume: bool,
 ) -> Result<()> {
     let failure = source.failure_signal();
-    let directory_store = database.directory_statistics_store();
-    let baseline = (!state.statistics.is_empty()).then(|| (directory_store.clone(), state.event_time, state.version));
-    let ledger = DirectoryLedger::new(
-        baseline,
-        state
-            .version
-            .checked_add(1)
-            .ok_or_else(|| AppError::ScanError("Scan statistics version overflow".into()))?,
-    )
-    .await?;
+    let initial = statistics
+        .scan_statistics()
+        .snapshot()
+        .await
+        .map_or_else(Default::default, |scan| scan.counts);
+    let progress = ScanProgress::new(
+        if resume {
+            TraversalOrder::Blocks
+        } else {
+            TraversalOrder::Unordered
+        },
+        initial,
+        (!state.checkpoint.is_empty()).then(|| state.checkpoint.clone()),
+    );
     // 独立于数据库/输出背压停止查询；只监听防抖耗尽后的最终故障，闪断不会取消扫描。
     let _failure_watch = cancel.watch_storage_failure(failure.clone());
     let mut forwarder = ObservedForwarder::<Entries>::new();
@@ -80,8 +100,7 @@ pub(super) async fn consume(
             control_tx,
             producer_cancel,
             prefetch_capacity,
-            ledger,
-            directory_store,
+            progress,
         )
         .await;
         (producer_state, result)
@@ -217,7 +236,7 @@ async fn write(
             biased;
             _=cancel.cancelled()=>return Err(AppError::ObservationScanCancelled),
             command=control.recv(),if control_open=>match command {
-                Some(command)=>{database.save_resume_state(&command.state).await?;let _=command.ack.send(());}
+                Some(command)=>command.execute(database).await?,
                 None=>control_open=false,
             },
             delivery=receiver.recv()=>match delivery {
@@ -244,22 +263,25 @@ async fn deliver(forwarder: &ObservedForwarder<Entries>, pending: &mut Vec<Arc<O
     }
     Ok(())
 }
-async fn save(control: &mpsc::Sender<SaveState>, state: &ScanResumeState) -> Result<()> {
+async fn save(control: &mpsc::Sender<SaveState>, state: &mut ScanResumeState, restore: bool) -> Result<()> {
     let (tx, rx) = oneshot::channel();
     control
         .send(SaveState {
             state: state.clone(),
+            restore,
             ack: tx,
         })
         .await
         .map_err(|_| AppError::ConsumerError("ClickHouse checkpoint consumer stopped".into()))?;
-    rx.await
-        .map_err(|_| AppError::ConsumerError("ClickHouse checkpoint was not acknowledged".into()))
+    *state = rx
+        .await
+        .map_err(|_| AppError::ConsumerError("ClickHouse checkpoint was not acknowledged".into()))?;
+    Ok(())
 }
 async fn produce(
     source: ResumableScan, state: &mut ScanResumeState, statistics: &ScanStatistics,
     forwarder: ObservedForwarder<Entries>, control: mpsc::Sender<SaveState>, cancel: ScanCancellation,
-    prefetch_capacity: Option<usize>, ledger: DirectoryLedger, directory_store: DirectoryStatisticsStore,
+    prefetch_capacity: Option<usize>, progress: ScanProgress,
 ) -> Result<()> {
     let mut input = ScanInput::new(source, prefetch_capacity);
     let result = produce_items(
@@ -269,8 +291,7 @@ async fn produce(
         forwarder,
         control,
         cancel.clone(),
-        ledger,
-        directory_store,
+        progress,
     )
     .await;
     if result.is_err() {
@@ -283,7 +304,7 @@ async fn produce(
 async fn produce_items(
     source: &mut ScanInput, state: &mut ScanResumeState, statistics: &ScanStatistics,
     forwarder: ObservedForwarder<Entries>, control: mpsc::Sender<SaveState>, cancel: ScanCancellation,
-    mut ledger: DirectoryLedger, directory_store: DirectoryStatisticsStore,
+    mut progress: ScanProgress,
 ) -> Result<()> {
     let mut pending = Vec::with_capacity(DISPATCH_BATCH);
     let mut tick = interval(Duration::from_millis(100));
@@ -293,20 +314,27 @@ async fn produce_items(
             biased;
             ()=cancel.cancelled()=>return Err(AppError::ObservationScanCancelled),
             item=source.next_batch(DISPATCH_BATCH)=>item,
-            _=tick.tick(),if !pending.is_empty() || !ledger.is_empty()=>{
-                cancel.interrupt(deliver(&forwarder,&mut pending)).await??;cancel.operation(ledger.flush(statistics)).await?;continue;
+            _=tick.tick(),if !pending.is_empty()=>{
+                cancel.interrupt(deliver(&forwarder,&mut pending)).await??;continue;
             }
         };
         let Some(batch) = item else { break };
         for item in batch.items {
             match item {
+                ResumableScanItem::Resumed(event) => {
+                    pending.clear();
+                    cancel.interrupt(forwarder.barrier()).await??;
+                    cancel.interrupt(save(&control, state, true)).await??;
+                    progress.resumed(&event, statistics).await?;
+                    statistics.restore_scan_event_counts(&state.statistics).await?;
+                }
                 ResumableScanItem::Entry(entry) => {
                     pending.push(Arc::from(entry));
                     if pending.len() >= DISPATCH_BATCH {
                         cancel.interrupt(deliver(&forwarder, &mut pending)).await??;
                     }
                 }
-                ResumableScanItem::Statistics(value) => cancel.operation(ledger.push(*value, statistics)).await?,
+                ResumableScanItem::Statistics(value) => cancel.interrupt(progress.push(*value, statistics)).await??,
                 ResumableScanItem::Checkpoint(checkpoint) => {
                     cancel.interrupt(deliver(&forwarder, &mut pending)).await??;
                     let before = source.prefetched_batches();
@@ -314,15 +342,14 @@ async fn produce_items(
                     cancel.interrupt(forwarder.barrier()).await??;
                     info!(barrier_ms=started.elapsed().as_millis(),prefetched_batches_before=?before,
                         prefetched_batches_after=?source.prefetched_batches(),"Scan checkpoint consumer barrier finished");
-                    cancel.operation(ledger.flush(statistics)).await?;
-                    state.checkpoint = checkpoint;
-                    state.observed_entries = statistics.scanned_entries().await;
+
+                    state.checkpoint = checkpoint.clone();
+                    let prefix = progress.checkpoint_counts()?.clone();
+                    state.observed_entries = prefix.scanned.total();
                     state.advance()?;
-                    cancel
-                        .operation(ledger.persist(&directory_store, state.event_time, state.version))
-                        .await?;
-                    state.statistics = statistics.statistics_checkpoint().await?;
-                    cancel.interrupt(save(&control, state)).await??;
+                    state.statistics = statistics.checkpoint_for_scan_prefix(&prefix).await?;
+                    cancel.interrupt(save(&control, state, false)).await??;
+                    progress.confirm(checkpoint);
                     info!(
                         version = state.version,
                         entries = state.observed_entries,
@@ -348,7 +375,7 @@ async fn produce_items(
     }
     cancel.interrupt(deliver(&forwarder, &mut pending)).await??;
     cancel.interrupt(forwarder.barrier()).await??;
-    cancel.operation(ledger.flush(statistics)).await?;
+
     let outcome = cancel.interrupt(source.finish()).await??;
     if !matches!(outcome,TraversalOutcome::Completed(ref completion) if completion.totals.failed_children==0 && completion.totals.listing_failures==0)
     {
@@ -356,13 +383,11 @@ async fn produce_items(
             "Scan paused or incomplete; checkpoint retained, generation not committed".into(),
         ));
     }
+    progress.finish()?;
     statistics.complete_scan().await;
     state.phase = FINALIZING;
     state.observed_entries = statistics.scanned_entries().await;
     state.advance()?;
-    cancel
-        .operation(ledger.persist(&directory_store, state.event_time, state.version))
-        .await?;
     state.statistics = statistics.statistics_checkpoint().await?;
-    cancel.interrupt(save(&control, state)).await?
+    cancel.interrupt(save(&control, state, false)).await?
 }

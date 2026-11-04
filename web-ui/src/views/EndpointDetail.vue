@@ -168,7 +168,7 @@ onMounted(loadData)
             >取消扫描</NButton
           >
           <NButton v-else type="primary" size="small" :loading="scanning" @click="onScan">{{
-            latestScanTask && ['cancelled', 'failed'].includes(latestScanTask.status) ? '继续扫描' : '启动扫描'
+            latestScanTask && ['cancelled', 'failed'].includes(latestScanTask.status) ? (latestScanTask.config.scan_resume ? '继续扫描' : '重新扫描') : '启动扫描'
           }}</NButton>
           <NButton size="small" @click="showEditModal = true">编辑</NButton>
           <NButton size="small" @click="onTest">测试连接</NButton>

@@ -4,15 +4,16 @@ use crate::clickhouse::scan_resume_statistics::{ScanEventStatistics, ScanResumeS
 use crate::cluster_scan::ClusterScanStore;
 use crate::traits::StorageEntryRecord;
 use crate::{
-    ClickHouseConfig, ClickHouseDatabase, Database, INCREMENTAL_SCAN_TABLE_BASE_NAME, Result, base_table_name_for_job,
+    ClickHouseConfig, ClickHouseDatabase, Database, DatabaseError, INCREMENTAL_SCAN_TABLE_BASE_NAME, Result,
+    base_table_name_for_job,
 };
 use data_mover::model::ObservedEntry;
 use std::sync::Arc;
 use storage_adapter::observed_scan::ObservedScanEvent;
 
-pub(crate) mod directory_statistics;
+mod cuts;
 pub(crate) mod queries;
-pub use directory_statistics::{DirectoryStatisticsStore, ScanDirectoryStatisticsRow};
+use cuts::ScanCuts;
 pub use queries::{ScanQueryCancellation, with_scan_cancellation};
 
 enum Store {
@@ -67,7 +68,7 @@ pub struct ScanStore {
     inner: Store,
     job_id: String,
     queries: ScanQueryCancellation,
-    directory_statistics: DirectoryStatisticsStore,
+    cuts: ScanCuts,
 }
 
 macro_rules! delegate {
@@ -78,6 +79,10 @@ macro_rules! delegate {
     )*};
 }
 impl ScanStore {
+    /// 普通元数据入口不能把活动扫描的 working 表当作已发布结果。
+    pub(crate) async fn ensure_metadata_available(config: &ClickHouseConfig, job: &str) -> Result<()> {
+        ScanCuts::ensure_metadata_available(config, job).await
+    }
     /// 集群批次独享临时分区，连接池与扫描轮次共享；单机保留串行兼容路径。
     pub fn batch_writer(&self) -> Option<Self> {
         match &self.inner {
@@ -85,7 +90,7 @@ impl ScanStore {
                 inner: Store::Cluster(store.batch_writer()),
                 job_id: self.job_id.clone(),
                 queries: self.queries.clone(),
-                directory_statistics: self.directory_statistics.clone(),
+                cuts: self.cuts.clone(),
             }),
             Store::Single(_) => None,
         }
@@ -93,7 +98,7 @@ impl ScanStore {
 
     pub fn new(config: &ClickHouseConfig, job_id: &str) -> Result<Self> {
         let cluster = config.cluster_name()?;
-        let queries = ScanQueryCancellation::new(config, cluster)?;
+        let queries = ScanQueryCancellation::new(config, cluster, job_id)?;
         let mut inner = match cluster.filter(|value| !value.is_empty()) {
             Some(cluster) => Store::Cluster(ClusterScanStore::new(config, cluster, job_id)?),
             None => Store::Single(ClickHouseDatabase::new(config, job_id)?),
@@ -102,19 +107,55 @@ impl ScanStore {
             Store::Single(store) => store.tag_scan_queries(queries.comment()),
             Store::Cluster(store) => store.tag_scan_queries(queries.comment()),
         }
-        let directory_statistics = match &inner {
-            Store::Single(store) => store.directory_statistics_ledger(),
-            Store::Cluster(store) => store.directory_statistics_ledger()?,
-        };
         Ok(Self {
+            cuts: ScanCuts::new(config, job_id, queries.comment())?,
             inner,
             job_id: job_id.into(),
             queries,
-            directory_statistics,
         })
     }
     pub fn query_cancellation(&self) -> ScanQueryCancellation {
         self.queries.clone()
+    }
+    /// 先排空前次执行的 DDL/mutation，再读取恢复状态；旧 reset 也必须先完成。
+    pub async fn load_resume_state(&self) -> Result<Option<ScanResumeState>> {
+        self.cuts.await_prior_operations().await?;
+        match &self.inner {
+            Store::Single(store) => store.load_resume_state().await,
+            Store::Cluster(store) => store.load_resume_state().await,
+        }
+    }
+    /// 在 generation 的回标、旧状态失效等操作之前封存本轮原始基线。
+    pub async fn capture_scan_baseline(&self) -> Result<String> {
+        self.cuts.capture().await
+    }
+    pub async fn restore_scan_baseline(&self, state: &ScanResumeState) -> Result<()> {
+        self.cuts.restore(&state.baseline_snapshot).await
+    }
+    /// 调用方已经过 writer 屏障；不可变快照 ACK 之后才提交统计与源游标。
+    pub async fn seal_resume_state(&self, state: &mut ScanResumeState) -> Result<()> {
+        state.checkpoint_snapshot = self.cuts.capture().await?;
+        self.save_resume_state(state).await?;
+        self.cleanup_scan_snapshots(state).await?;
+        Ok(())
+    }
+    pub async fn restore_scan_checkpoint(&self, state: &ScanResumeState) -> Result<()> {
+        self.cuts.restore(&state.checkpoint_snapshot).await
+    }
+    /// 清理失败只留下可回收对象，不把已经提交的 manifest 改判失败。
+    pub async fn cleanup_scan_snapshots(&self, state: &ScanResumeState) -> Result<()> {
+        let keep = if state.active() {
+            vec![state.baseline_snapshot.as_str(), state.checkpoint_snapshot.as_str()]
+        } else {
+            Vec::new()
+        };
+        if let Err(error) = self.cuts.cleanup(&keep).await {
+            if matches!(error, DatabaseError::ScanCancelled) {
+                return Err(error);
+            }
+            tracing::warn!(%error, "Deferred scan metadata snapshot cleanup");
+        }
+        Ok(())
     }
     pub async fn initialize(&self) -> Result<()> {
         match &self.inner {
@@ -124,6 +165,7 @@ impl ScanStore {
     }
     /// 表布局及清理 SQL 由具体数据库实现负责，上层只指定作业。
     pub async fn clear_job(&self) -> Result<()> {
+        self.cuts.await_prior_operations().await?;
         match &self.inner {
             Store::Cluster(store) => store.clear_job().await,
             Store::Single(store) => {
@@ -143,32 +185,7 @@ impl ScanStore {
                 Ok(())
             }
         }?;
-        // 原游标和结果全部失效后才能清贡献；中途失败仍保留可恢复检查点所需的历史。
-        self.directory_statistics.clear_job().await
-    }
-    /// 目录 producer 可独立持有的同一执行域句柄，不启用额外批次 writer。
-    pub fn directory_statistics_store(&self) -> DirectoryStatisticsStore {
-        self.directory_statistics.clone()
-    }
-    /// 目录贡献是追加历史；读取 cut 前先过滤版本，不能用 FINAL 丢弃旧检查点。
-    pub async fn prepare_directory_statistics(&self) -> Result<()> {
-        self.directory_statistics.prepare().await
-    }
-    /// 同一轮的版本须单调推进，恢复时先截去未提交的后续版本。
-    pub async fn write_directory_statistics(
-        &self, round: i64, version: u64, rows: &[ScanDirectoryStatisticsRow],
-    ) -> Result<()> {
-        self.directory_statistics.write(round, version, rows).await
-    }
-    /// 仅返回指定目录中在 cut 时已存在的贡献，不加载整轮目录到内存。
-    pub async fn load_directory_statistics(
-        &self, round: i64, cut: u64, paths: &[String],
-    ) -> Result<Vec<ScanDirectoryStatisticsRow>> {
-        self.directory_statistics.load(round, cut, paths).await
-    }
-    /// 持有作业执行锁且停止旧 writer 后调用，确认删除完成才开始新的恢复写入。
-    pub async fn truncate_directory_statistics(&self, round: i64, committed_cut: u64) -> Result<()> {
-        self.directory_statistics.truncate(round, committed_cut).await
+        self.cuts.cleanup(&[]).await
     }
     pub async fn prepare_incremental(&self) -> Result<()> {
         match &self.inner {
@@ -268,7 +285,6 @@ impl ScanStore {
     delegate! {
         ping()->Result<()>;
         resume_execution_is_incremental()->Result<bool>;
-        load_resume_state()->Result<Option<ScanResumeState>>;
         save_resume_state(state:&ScanResumeState)->Result<()>;
         restore_resume_generation(state:&ScanResumeState)->Result<bool>;
         begin_scan_generation()->Result<u8>;

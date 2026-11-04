@@ -58,15 +58,48 @@ pub(crate) struct ScanStatistics {
 }
 
 impl ScanStatistics {
-    #[cfg(test)]
-    pub(crate) async fn raw_progress(&self) -> Option<ProgressReport> {
-        match &self.inner {
-            Some(sc) => {
-                let sc = sc.lock().await;
-                Some(sc.progress_bar.to_report(sc.stats.job_id()))
+    pub(crate) async fn restore_scan_counts(&self, counts: ScanCounts) {
+        if let Some(sc) = &self.inner {
+            let mut sc = sc.lock().await;
+            if let Some(snapshot) = &mut sc.scan_snapshot {
+                snapshot.distributions_complete = counts.retained.total() == 0;
+                snapshot.counts = counts;
+                snapshot.scanned_entries = snapshot.counts.scanned.total();
+                snapshot.filtered_entries = snapshot.counts.filtered.total();
+                snapshot.retained_entries = snapshot.counts.retained.total();
+                snapshot.restarts = snapshot.restarts.saturating_add(1);
+                snapshot.complete = false;
+                snapshot.distributions_reconciled = false;
             }
-            None => None,
+            sc.clear_scan_distributions();
+            sc.sync_scan_progress();
         }
+    }
+    /// 只回退可重放的事件计数；网络故障累计、诊断和回调 ACK 继续保留。
+    pub(crate) async fn restore_scan_event_counts(&self, saved: &str) -> Result<()> {
+        let saved = if saved.is_empty() {
+            None
+        } else {
+            let value: StatisticsCheckpoint = serde_json::from_str(saved)?;
+            if value.version != 2 {
+                return Err(AppError::ScanError("Unsupported scan statistics checkpoint".into()));
+            }
+            match value.stats {
+                StatsKind::Incremental(value) => Some(value),
+                StatsKind::Full(_) => None,
+            }
+        };
+        if let Some(sc) = &self.inner {
+            let mut sc = sc.lock().await;
+            if let StatsKind::Incremental(current) = &mut sc.stats {
+                (current.new, current.changed, current.deleted, current.renamed) = saved.map_or_else(
+                    || Default::default(),
+                    |value| (value.new, value.changed, value.deleted, value.renamed),
+                );
+            }
+            sc.sync_scan_progress();
+        }
+        Ok(())
     }
     pub(crate) async fn snapshot(&self) -> Option<ScanSnapshot> {
         match &self.inner {
@@ -77,11 +110,10 @@ impl ScanStatistics {
     pub(crate) async fn watch_recovery(&self, status: Option<&TraversalRecoveryStatus>) -> Option<RecoveryProgress> {
         Some(RecoveryProgress::start(self.inner.clone()?, status?.clone()).await)
     }
-    pub(crate) async fn replace_directory_contributions(&self, changes: &[(ScanCounts, ScanCounts)], replayed: u64) {
+    pub(crate) async fn replace_directory_contributions(&self, changes: &[(ScanCounts, ScanCounts)]) {
         if let Some(sc) = &self.inner {
             let mut sc = sc.lock().await;
             if let Some(snapshot) = &mut sc.scan_snapshot {
-                snapshot.replayed_directory_listings = snapshot.replayed_directory_listings.saturating_add(replayed);
                 for (old, new) in changes {
                     snapshot.replace(old, new);
                 }
@@ -132,7 +164,7 @@ impl ScanStatistics {
             Some(sc) => {
                 let sc = sc.lock().await;
                 Ok(serde_json::to_string(&StatisticsCheckpoint {
-                    version: 1,
+                    version: 2,
                     stats: sc.stats.clone(),
                     report: sc.to_report(false),
                     callback: sc.callback.clone(),
@@ -140,6 +172,19 @@ impl ScanStatistics {
             }
             None => Ok(String::new()),
         }
+    }
+
+    pub(crate) async fn checkpoint_for_scan_prefix(&self, counts: &ScanCounts) -> Result<String> {
+        let Some(sc) = &self.inner else {
+            return Ok(String::new());
+        };
+        let sc = sc.lock().await;
+        Ok(serde_json::to_string(&StatisticsCheckpoint {
+            version: 2,
+            stats: sc.stats.scan_prefix(counts),
+            report: sc.to_report_for_scan_prefix(counts),
+            callback: sc.callback.clone(),
+        })?)
     }
 }
 
@@ -150,11 +195,8 @@ impl ConsumerManager {
         if let Some(sc) = &self.stats_consumer {
             let mut sc = sc.lock().await;
             let job_id = sc.stats.job_id().to_owned();
-            let job_dir = sc.job_dir.clone();
             let mut callback = std::mem::take(&mut sc.callback);
-            callback
-                .initialize_scan(&job_id, &job_dir, round, &mut sc.stats)
-                .await?;
+            callback.initialize_scan(&job_id, round)?;
             sc.callback = callback;
             if sc.scan_snapshot.is_none() {
                 sc.scan_snapshot = Some(ScanSnapshot::new(ScanCapabilities::from_storage(storage, tags)));
@@ -351,9 +393,11 @@ impl ConsumerManager {
             return Ok(());
         }
         let (mut stats, report, callback) = match serde_json::from_str::<SavedStatistics>(saved)? {
-            SavedStatistics::Current(saved) if saved.version == 1 => (saved.stats, saved.report, Some(saved.callback)),
+            SavedStatistics::Current(saved) if saved.version == 2 => (saved.stats, saved.report, Some(saved.callback)),
             SavedStatistics::Current(_) => {
-                return Err(AppError::ScanError("Unsupported statistics checkpoint version".into()));
+                return Err(AppError::ScanError(
+                    "Unsupported statistics checkpoint version; reset this scan job".into(),
+                ));
             }
             SavedStatistics::Previous((stats, report)) => (stats, report, None),
         };

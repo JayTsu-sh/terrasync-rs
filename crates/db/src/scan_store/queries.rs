@@ -43,6 +43,12 @@ pub(crate) trait ScanExecute {
     async fn execute_scan(self) -> Result<()>;
 }
 
+pub(super) fn job_query_prefix(database: &str, job: &str) -> String {
+    let job = utils::sanitize_job_id(job);
+    let identity = format!("{database}\0{job}");
+    format!("terrasync-scan-{}-", &blake3::hash(identity.as_bytes()).to_hex()[..16])
+}
+
 impl ScanExecute for Query {
     async fn execute_scan(self) -> Result<()> {
         check_scan_cancellation()?;
@@ -58,10 +64,10 @@ pub struct ScanQueryCancellation {
 }
 
 impl ScanQueryCancellation {
-    pub(super) fn new(config: &ClickHouseConfig, cluster: Option<&str>) -> Result<Self> {
+    pub(super) fn new(config: &ClickHouseConfig, cluster: Option<&str>, job: &str) -> Result<Self> {
         Ok(Self {
             client: build_base_client(config),
-            comment: format!("terrasync-scan-{}", Uuid::new_v4()),
+            comment: format!("{}{}", job_query_prefix(&config.database, job), Uuid::new_v4()),
             cluster: cluster.filter(|value| !value.is_empty()).map(identifier).transpose()?,
         })
     }
@@ -95,6 +101,13 @@ mod tests {
     use super::*;
     use clickhouse::test::{Mock, handlers};
 
+    #[test]
+    fn query_tags_isolate_databases_and_jobs_without_distinguishing_credentials() {
+        assert_eq!(job_query_prefix("db", "job"), job_query_prefix("db", "job"));
+        assert_ne!(job_query_prefix("db", "job"), job_query_prefix("other_db", "job"));
+        assert_ne!(job_query_prefix("db", "job"), job_query_prefix("db", "other_job"));
+    }
+
     #[tokio::test]
     async fn cancellation_is_scoped_to_one_execution_and_all_replicas() -> Result<()> {
         let mock = Mock::new();
@@ -108,8 +121,8 @@ mod tests {
             dial_timeout: 1,
             read_timeout: 1,
         };
-        let first = ScanQueryCancellation::new(&config, Some("clickhouse"))?;
-        let other = ScanQueryCancellation::new(&config, Some("clickhouse"))?;
+        let first = ScanQueryCancellation::new(&config, Some("clickhouse"), "fixture")?;
+        let other = ScanQueryCancellation::new(&config, Some("clickhouse"), "fixture")?;
         assert_ne!(first.comment(), other.comment());
         let captured = mock.add(handlers::record_ddl());
         first.cancel().await?;

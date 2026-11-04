@@ -5,6 +5,7 @@ use crate::{
     config::JobType,
     consumer::stats::{FullStats, ProgressBar},
 };
+use storage_adapter::ErrorEvent;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpListener,
@@ -79,7 +80,7 @@ async fn failed_http_retries_same_batch_and_ack_preserves_new_errors() {
         pb_handle: None,
     }));
     let error = |reason: &str| StorageEntryMessage::Error {
-        event: storage_adapter::ErrorEvent::Scan,
+        event: ErrorEvent::Scan,
         path: "fixture".into(),
         entry: None,
         reason: reason.into(),

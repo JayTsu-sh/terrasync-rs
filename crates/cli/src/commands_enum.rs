@@ -215,8 +215,8 @@ pub enum Commands {
         #[arg(short, long)]
         id: Option<String>,
 
-        /// 要求启用 ClickHouse，并用同一 --id 继续中断的扫描。
-        /// 落库扫描始终保存检查点，无需此参数也会自动继续。
+        /// 启用目录块断点续扫；首次扫描和恢复都需传入，并启用 ClickHouse。
+        /// 未传入时使用无序扫描，不保存断点续扫检查点。
         #[arg(long, requires = "id")]
         resume: bool,
 

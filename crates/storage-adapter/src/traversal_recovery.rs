@@ -3,8 +3,9 @@ use std::sync::Arc;
 use data_mover::{
     storage,
     traversal::{
-        ScanFailureSignal, TraversalReconnect, TraversalRecoveryPolicy, TraversalRecoveryState,
-        TraversalRecoveryStatus, TraversalRequest, TraversalSession, TraversalSource, recoverable_traversal,
+        ScanFailureSignal, TraversalReconnect, TraversalRecoveryPolicy, TraversalRecoveryResume,
+        TraversalRecoveryState, TraversalRecoveryStatus, TraversalRequest, TraversalSession, TraversalSource,
+        recoverable_traversal,
     },
 };
 
@@ -20,6 +21,12 @@ impl ConnectedStorage {
     pub(crate) fn start_traversal(
         &self, request: TraversalRequest, options: &WalkOptions,
     ) -> Result<TraversalExecution> {
+        self.start_traversal_with_resume(request, options, TraversalRecoveryResume::Checkpoint)
+    }
+
+    pub(crate) fn start_traversal_with_resume(
+        &self, request: TraversalRequest, options: &WalkOptions, resume: TraversalRecoveryResume,
+    ) -> Result<TraversalExecution> {
         let Some((config, recovery_window)) = self.reconnect_config.clone().zip(options.recovery_window) else {
             let (source, failure) = ScanFailureSignal::source(&self.roles, options.operation_timeout)?;
             return Ok(TraversalExecution {
@@ -33,6 +40,7 @@ impl ConnectedStorage {
             Box::pin(storage::connect_backend(config))
         });
         let policy = TraversalRecoveryPolicy {
+            resume,
             operation_timeout: options.operation_timeout,
             recovery_window,
         };

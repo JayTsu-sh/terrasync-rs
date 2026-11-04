@@ -9,6 +9,7 @@ use std::{
     process::{Child, Command, Stdio},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
+use tokio::time::sleep;
 
 type Result<T = ()> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
@@ -113,16 +114,20 @@ struct ScanCommand {
     log: PathBuf,
 }
 fn command(root: &Path, config: &Path, source: &Path, name: &str) -> Result<ScanCommand> {
-    fs::create_dir_all(root.join("tmp"))?;
+    command_for_mode(root, config, source, name, true)
+}
+fn command_for_mode(root: &Path, config: &Path, source: &Path, name: &str, resume: bool) -> Result<ScanCommand> {
+    // 普通文件无法作为临时目录，证明扫描不依赖本地暂存。
+    fs::write(root.join("tmp-disabled"), b"no scan staging")?;
     let mut command = Command::new(std::env::var("TERRASYNC_TEST_BINARY")?);
     let log = root.join(format!("{name}.log"));
     let output = fs::File::create(&log)?;
     command
         .current_dir(root)
-        .env("TMPDIR", root.join("tmp"))
+        .env("TMPDIR", root.join("tmp-disabled"))
         .arg("-c")
         .arg(config)
-        .args(["scan", "--id", "resume_case", "--resume"])
+        .args(["scan", "--id", "resume_case"])
         .arg(source)
         .env("TERRASYNC_LAB_SCAN_CHECKPOINT_EVERY_MS", "0")
         .env_remove("TERRASYNC_LAB_SCAN_PAUSE_AFTER_CHECKPOINT_MS")
@@ -130,6 +135,9 @@ fn command(root: &Path, config: &Path, source: &Path, name: &str) -> Result<Scan
         .env_remove("TERRASYNC_LAB_SCAN_FAIL_AFTER_EVENTS")
         .stdout(Stdio::from(output.try_clone()?))
         .stderr(Stdio::from(output));
+    if resume {
+        command.arg("--resume");
+    }
     Ok(ScanCommand { command, log })
 }
 
@@ -140,6 +148,223 @@ fn discard_pod_local_state(root: &Path, phase: &str) -> Result {
             fs::rename(path, root.join(format!("old-pod-{phase}-{name}")))?;
         }
     }
+    Ok(())
+}
+
+fn write_scan_config(config: &Path, database: &str, batch_size: usize) -> Result {
+    let dsn = serde_json::to_string(
+        &std::env::var("LAB_CLICKHOUSE_DSN").unwrap_or_else(|_| "http://10.131.9.11:8123".into()),
+    )?;
+    let user = serde_json::to_string(&std::env::var("LAB_CLICKHOUSE_USER").unwrap_or_else(|_| "default".into()))?;
+    let password = serde_json::to_string(&std::env::var("LAB_CLICKHOUSE_PASSWORD").unwrap_or_default())?;
+    let cluster = std::env::var("LAB_CLICKHOUSE_CLUSTER")
+        .map(|value| format!("mode=\"cluster\"\ncluster={value:?}\n"))
+        .unwrap_or_default();
+    fs::write(
+        config,
+        format!(
+            "[database]\nenabled=true\ntype=\"clickhouse\"\nbatch_size={batch_size}\n[database.clickhouse]\ndsn={dsn}\ndatabase=\"{database}\"\nusername={user}\npassword={password}\n{cluster}[scan]\nconcurrency=1\n"
+        ),
+    )?;
+    Ok(())
+}
+
+async fn interrupt_unordered_round(mut scan: ScanCommand, database: &TestDatabase, total: u64) -> Result {
+    let previous = count(database, "SELECT version FROM scan_resume_resume_case FINAL")
+        .await
+        .unwrap_or_default();
+    let mut process = ChildGuard(scan.command.spawn()?);
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        assert!(
+            Instant::now() < deadline,
+            "no partial unordered output: {}",
+            fs::read_to_string(&scan.log)?
+        );
+        assert!(
+            process.0.try_wait()?.is_none(),
+            "scan exited before interruption: {}",
+            fs::read_to_string(&scan.log)?
+        );
+        if let Ok((version, phase, generation, epoch)) = database
+            .query("SELECT version,phase,generation,event_time FROM scan_resume_resume_case FINAL")
+            .fetch_one::<(u64, u8, u8, i64)>()
+            .await
+            && version > previous
+            && phase == 0
+        {
+            let sql = if std::env::var("LAB_CLICKHOUSE_CLUSTER").is_ok() {
+                format!("SELECT count() FROM base_resume_case FINAL WHERE epoch={epoch} AND is_deleted=0")
+            } else {
+                format!("SELECT count() FROM base_resume_case FINAL WHERE current_state={generation}")
+            };
+            let rows = count(database, &sql).await?;
+            if rows > 0 && rows < total {
+                break;
+            }
+        }
+        sleep(Duration::from_millis(5)).await;
+    }
+    let started = Instant::now();
+    assert!(
+        Command::new("kill")
+            .args(["-INT", &process.0.id().to_string()])
+            .status()?
+            .success()
+    );
+    loop {
+        if let Some(status) = process.0.try_wait()? {
+            assert!(!status.success());
+            break;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "unordered cancellation exceeded two seconds"
+        );
+        sleep(Duration::from_millis(10)).await;
+    }
+    let (observed, cursor): (u64, u8) = database
+        .query("SELECT observed_entries,notEmpty(checkpoint) FROM scan_resume_resume_case FINAL")
+        .fetch_one()
+        .await?;
+    assert_eq!(
+        (observed, cursor),
+        (0, 0),
+        "Unordered must not publish a resumable cursor"
+    );
+    eprintln!(
+        "Unordered cancellation: {:.3}s; no resumable checkpoint",
+        started.elapsed().as_secs_f64()
+    );
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires ClickHouse and TERRASYNC_TEST_BINARY built with lab-fault-injection"]
+async fn unordered_full_and_incremental_restart_cleanly_without_resumable_checkpoints() -> Result {
+    let name = format!(
+        "ts_scan_unordered_{}",
+        SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos()
+    );
+    client("default")
+        .query(&format!("CREATE DATABASE {name}"))
+        .execute()
+        .await?;
+    let _database_guard = DatabaseGuard(name.clone());
+    let database = client(&name);
+    let work = tempfile::tempdir()?;
+    let source = work.path().join("source");
+    fs::create_dir(&source)?;
+    for index in 0..5000 {
+        fs::write(source.join(format!("file{index:05}")), b"value")?;
+    }
+    let config = work.path().join("config.toml");
+    write_scan_config(&config, &name, 16)?;
+    interrupt_unordered_round(
+        command_for_mode(work.path(), &config, &source, "unordered-full-cancel", false)?,
+        &database,
+        5000,
+    )
+    .await?;
+    let tail = database
+        .query("SELECT relative_path FROM base_resume_case FINAL LIMIT 1")
+        .fetch_one::<String>()
+        .await?;
+    fs::remove_file(source.join(&tail))?;
+    discard_pod_local_state(work.path(), "unordered-full")?;
+    write_scan_config(&config, &name, 1024)?;
+    complete(command_for_mode(
+        work.path(),
+        &config,
+        &source,
+        "unordered-full-restart",
+        false,
+    )?)
+    .await?;
+    assert_paths(&database, &source).await?;
+    assert_eq!(
+        count(
+            &database,
+            "SELECT toUInt64(incremental) FROM scan_resume_resume_case FINAL"
+        )
+        .await?,
+        0
+    );
+    complete(command_for_mode(
+        work.path(),
+        &config,
+        &source,
+        "unordered-incremental-unchanged",
+        false,
+    )?)
+    .await?;
+    assert_paths(&database, &source).await?;
+    let epoch = database
+        .query("SELECT event_time FROM scan_resume_resume_case FINAL")
+        .fetch_one::<i64>()
+        .await?;
+    assert_eq!(
+        count(
+            &database,
+            &format!(
+                "SELECT count() FROM incremental_resume_case FINAL WHERE toUnixTimestamp64Nano(create_at)>={epoch}"
+            )
+        )
+        .await?,
+        0
+    );
+    let existing: Vec<_> = paths(&source)?.into_iter().collect();
+    // 先新增再删除，避免文件系统立即复用删除条目的 inode，使变化量精确可核验。
+    for index in 0..20 {
+        fs::write(source.join(format!("added{index:05}")), b"new")?;
+    }
+    for path in &existing[10..30] {
+        fs::write(source.join(path), b"modified-value")?;
+    }
+    for path in &existing[..10] {
+        fs::remove_file(source.join(path))?;
+    }
+    complete(command_for_mode(
+        work.path(),
+        &config,
+        &source,
+        "unordered-incremental-one-percent",
+        false,
+    )?)
+    .await?;
+    assert_paths(&database, &source).await?;
+    let epoch = database
+        .query("SELECT event_time FROM scan_resume_resume_case FINAL")
+        .fetch_one::<i64>()
+        .await?;
+    let events=database.query(&format!("SELECT countIf(operation_type='new'),countIf(endsWith(operation_type,'changed')),countIf(operation_type='deleted') FROM incremental_resume_case FINAL WHERE toUnixTimestamp64Nano(create_at)>={epoch}")).fetch_one::<(u64,u64,u64)>().await?;
+    assert_eq!(events, (20, 20, 10));
+    write_scan_config(&config, &name, 16)?;
+    interrupt_unordered_round(
+        command_for_mode(work.path(), &config, &source, "unordered-incremental-cancel", false)?,
+        &database,
+        5009,
+    )
+    .await?;
+    discard_pod_local_state(work.path(), "unordered-incremental")?;
+    write_scan_config(&config, &name, 1024)?;
+    complete(command_for_mode(
+        work.path(),
+        &config,
+        &source,
+        "unordered-incremental-restart",
+        false,
+    )?)
+    .await?;
+    assert_paths(&database, &source).await?;
+    assert_eq!(
+        count(
+            &database,
+            "SELECT toUInt64(incremental) FROM scan_resume_resume_case FINAL"
+        )
+        .await?,
+        1
+    );
     Ok(())
 }
 
@@ -179,7 +404,7 @@ async fn interrupt_after_checkpoint(mut scan: ScanCommand, database: &TestDataba
         {
             break;
         }
-        tokio::time::sleep(Duration::from_millis(25)).await;
+        sleep(Duration::from_millis(25)).await;
     }
     if graceful {
         let started = Instant::now();
@@ -198,7 +423,7 @@ async fn interrupt_after_checkpoint(mut scan: ScanCommand, database: &TestDataba
                 started.elapsed() < Duration::from_secs(2),
                 "scan did not cancel within two seconds"
             );
-            tokio::time::sleep(Duration::from_millis(10)).await;
+            sleep(Duration::from_millis(10)).await;
         }
         eprintln!("Graceful scan cancellation: {:.3}s", started.elapsed().as_secs_f64());
     } else {
@@ -209,6 +434,8 @@ async fn interrupt_after_checkpoint(mut scan: ScanCommand, database: &TestDataba
 }
 
 async fn complete(mut scan: ScanCommand) -> Result {
+    // 中断夹具用零间隔迅速取得边界；正常完成使用产品的 60 秒间隔。
+    scan.command.env("TERRASYNC_LAB_SCAN_CHECKPOINT_EVERY_MS", "60000");
     let mut process = ChildGuard(scan.command.spawn()?);
     let deadline = Instant::now() + Duration::from_secs(60);
     loop {
@@ -227,7 +454,7 @@ async fn complete(mut scan: ScanCommand) -> Result {
             "scan timed out: {}",
             fs::read_to_string(&scan.log)?
         );
-        tokio::time::sleep(Duration::from_millis(25)).await;
+        sleep(Duration::from_millis(25)).await;
     }
     Ok(())
 }
@@ -275,7 +502,7 @@ async fn assert_paths(database: &TestDatabase, source: &Path) -> Result {
     assert_eq!(rows.len(), actual.len(), "duplicate base rows");
     assert_eq!(actual, paths(source)?);
     eprintln!(
-        "Actual source paths={}, unique database paths={}, physical rows={}",
+        "Actual source paths={}, unique database paths={}, FINAL rows={}",
         actual.len(),
         actual.len(),
         rows.len()
@@ -356,7 +583,7 @@ async fn killed_scan_resumes_full_and_incremental_without_skips_or_duplicate_eve
     let user = serde_json::to_string(&std::env::var("LAB_CLICKHOUSE_USER").unwrap_or_else(|_| "default".into()))?;
     let password = serde_json::to_string(&std::env::var("LAB_CLICKHOUSE_PASSWORD").unwrap_or_default())?;
     let cluster_setting = std::env::var("LAB_CLICKHOUSE_CLUSTER")
-        .map(|value| format!("cluster={value:?}\n"))
+        .map(|value| format!("mode=\"cluster\"\ncluster={value:?}\n"))
         .unwrap_or_default();
     fs::write(
         &config,
@@ -402,11 +629,7 @@ async fn killed_scan_resumes_full_and_incremental_without_skips_or_duplicate_eve
         .await?;
     assert_eq!(resumed_full, full_round, "full resume must preserve its round and type");
     assert_eq!(
-        count(
-            &database,
-            "SELECT count() FROM system.tables WHERE database=currentDatabase() AND name='incremental_resume_case'"
-        )
-        .await?,
+        count(&database, "SELECT count() FROM incremental_resume_case FINAL").await?,
         0,
         "full scans must not generate incremental events"
     );
