@@ -6,6 +6,7 @@ use tracing::info;
 /// 重导出 `utils::sanitize_job_id`
 pub use utils::sanitize_job_id;
 
+use super::clickhouse_config::migrate_mode;
 use crate::error::{Result, WebError};
 
 /// 数据库文件默认路径
@@ -58,6 +59,8 @@ pub async fn init_database() -> Result<SqlitePool> {
     let init_sql = include_str!("../migrations/001_init.sql");
     sqlx::raw_sql(init_sql).execute(&pool).await?;
 
+    ensure_storage_failure_columns(&pool).await?;
+    migrate_mode(&pool).await?;
     info!("SQLite database initialized at {}", DEFAULT_DB_PATH);
     Ok(pool)
 }
@@ -112,4 +115,19 @@ mod resume_tests {
         assert_eq!(status, "cancelled");
         Ok(())
     }
+}
+
+/// 旧任务没有结构化错误时保持 NULL；重启后新增失败仍可按类型查询。
+async fn ensure_storage_failure_columns(pool: &SqlitePool) -> Result<()> {
+    for table in ["migration_tasks", "task_executions"] {
+        let columns: Vec<String> = sqlx::query_scalar(&format!("SELECT name FROM pragma_table_info('{table}')"))
+            .fetch_all(pool)
+            .await?;
+        if !columns.iter().any(|column| column == "storage_error_json") {
+            sqlx::query(&format!("ALTER TABLE {table} ADD COLUMN storage_error_json TEXT"))
+                .execute(pool)
+                .await?;
+        }
+    }
+    Ok(())
 }

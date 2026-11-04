@@ -204,6 +204,7 @@ pub(super) struct ClusterNativeScanRecord {
     pub modified_unix_nanos: Option<i128>,
     #[serde(serialize_with = "serialize_snapshot")]
     pub entry_snapshot: EntrySnapshot,
+    pub metadata_hash: Option<String>,
 }
 impl ClusterNativeScanRecord {
     pub fn new(job_id: String, epoch: u64, batch_id: u64, record: NativeScanRecord) -> Self {
@@ -239,6 +240,7 @@ impl ClusterNativeScanRecord {
             size_observed: record.size_observed,
             modified_unix_nanos: record.modified_unix_nanos,
             entry_snapshot: record.entry_snapshot,
+            metadata_hash: record.metadata_hash,
         }
     }
 }

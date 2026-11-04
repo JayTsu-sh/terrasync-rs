@@ -1,4 +1,5 @@
 //! 首次基线由代次提交发布，不能从建表推断扫描完成。
+#![allow(clippy::unwrap_used)]
 use super::*;
 use clickhouse::test::{Mock, handlers};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -6,6 +7,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 fn mocked_database(mock: &Mock, job: &str) -> ClickHouseDatabase {
     let mut database = ClickHouseDatabase::new(
         &ClickHouseConfig {
+            mode: Default::default(),
+            cluster: None,
             dsn: mock.url().into(),
             database: "default".into(),
             username: "default".into(),
@@ -14,7 +17,8 @@ fn mocked_database(mock: &Mock, job: &str) -> ClickHouseDatabase {
             read_timeout: 1,
         },
         job,
-    );
+    )
+    .unwrap();
     database.sync_client = database.sync_client.with_validation(false);
     database
 }
@@ -24,6 +28,7 @@ async fn fresh_initialization_keeps_the_baseline_uncommitted() -> Result<()> {
     let mock = Mock::new();
     let database = mocked_database(&mock, "initial_baseline");
     let _base = mock.add(handlers::record_ddl());
+    mock.add(handlers::provide(["relative_path, version_id".to_string()]));
     let schema = mock.add(handlers::record_ddl());
     let migration = mock.add(handlers::record_ddl());
     mock.add(handlers::provide(Vec::<u8>::new()));
@@ -70,6 +75,7 @@ async fn generation_commit_publishes_generation_and_baseline_in_one_row() -> Res
     assert!(insert.ends_with("VALUES (1, 1, true)"), "{insert}");
     // 重新初始化必须保留已提交的状态行。
     mock.add(handlers::record_ddl());
+    mock.add(handlers::provide(["relative_path, version_id".to_string()]));
     mock.add(handlers::record_ddl());
     mock.add(handlers::record_ddl());
     mock.add(handlers::provide([1u8]));
@@ -107,6 +113,8 @@ async fn isolated_database() -> Result<(ClickHouseConfig, IsolatedDatabase)> {
         .map_err(|error| DatabaseError::ConfigError(error.to_string()))?
         .as_nanos();
     let mut config = ClickHouseConfig {
+        mode: Default::default(),
+        cluster: None,
         dsn,
         database: "default".into(),
         username: std::env::var("LAB_CLICKHOUSE_USER").unwrap_or_else(|_| "default".into()),
@@ -129,10 +137,10 @@ async fn isolated_database() -> Result<(ClickHouseConfig, IsolatedDatabase)> {
 #[ignore = "requires explicit LAB_CLICKHOUSE_DSN; creates and removes an isolated database"]
 async fn real_reopen_before_first_resume_state_remains_full_until_commit() -> Result<()> {
     let (config, _guard) = isolated_database().await?;
-    let database = ClickHouseDatabase::new(&config, "first_full");
+    let database = ClickHouseDatabase::new(&config, "first_full").unwrap();
     database.initialize().await?;
     drop(database);
-    let reopened = ClickHouseDatabase::new(&config, "first_full");
+    let reopened = ClickHouseDatabase::new(&config, "first_full").unwrap();
     assert!(!reopened.check_table_exists("scan_resume_first_full").await?);
     assert!(!reopened.has_committed_baseline().await?);
     assert!(!reopened.resume_execution_is_incremental().await?);
@@ -140,7 +148,7 @@ async fn real_reopen_before_first_resume_state_remains_full_until_commit() -> Re
     assert!(!reopened.has_committed_baseline().await?);
     reopened.commit_scan_generation().await?;
     drop(reopened);
-    let committed = ClickHouseDatabase::new(&config, "first_full");
+    let committed = ClickHouseDatabase::new(&config, "first_full").unwrap();
     assert!(committed.has_committed_baseline().await?);
     assert!(committed.resume_execution_is_incremental().await?);
     committed.initialize().await?;
@@ -152,7 +160,7 @@ async fn real_reopen_before_first_resume_state_remains_full_until_commit() -> Re
 #[ignore = "requires explicit LAB_CLICKHOUSE_DSN; creates and removes an isolated database"]
 async fn real_legacy_state_row_remains_a_committed_baseline() -> Result<()> {
     let (config, _guard) = isolated_database().await?;
-    let database = ClickHouseDatabase::new(&config, "legacy");
+    let database = ClickHouseDatabase::new(&config, "legacy").unwrap();
     database.create_scan_base_table().await?;
     database
         .execute(

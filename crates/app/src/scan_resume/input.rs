@@ -1,6 +1,6 @@
 //! 确认检查点时，有界预读后续遍历项；交付仍保持原始检查点顺序。
 use crate::error::{AppError, Result};
-use data_mover::traversal::TraversalOutcome;
+use data_mover::traversal::{ScanFailureSignal, TraversalOutcome};
 use std::{
     future::{Future, poll_fn},
     pin::pin,
@@ -9,7 +9,7 @@ use std::{
     time::Duration,
     vec::IntoIter,
 };
-use storage_adapter::{ResumableScan, ResumableScanItem};
+use storage_adapter::{ResumableScan, ResumableScanItem, StorageError};
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::{
     select,
@@ -40,6 +40,7 @@ pub(super) enum ScanInput {
         permit: Option<OwnedSemaphorePermit>,
         reader: Option<AbortOnDropHandle<Result<TraversalOutcome>>>,
         discard: CancellationToken,
+        failure: ScanFailureSignal,
     },
 }
 
@@ -80,6 +81,7 @@ impl ScanInput {
             receiver,
             current,
             permit,
+            failure,
             ..
         } = self
             && limit >= PREFETCH_CHUNK
@@ -88,7 +90,11 @@ impl ScanInput {
         {
             // 稳态直接移交原缓冲区，避免为每个源端小批次再次分配和逐项 poll。
             permit.take();
-            let batch = receiver.recv().await?;
+            let batch = select! {
+                biased;
+                ()=failure.failed()=>return failure.failure().map(|error| ScanBatch { items:Vec::new(), failure:Some(StorageError::from(error).into()) }),
+                batch=receiver.recv()=>batch?,
+            };
             return Some(ScanBatch {
                 items: batch.items,
                 failure: None,
@@ -120,6 +126,12 @@ impl ScanInput {
         .await
     }
 
+    pub(super) fn prefetched_batches(&self) -> Option<usize> {
+        match self {
+            Self::Prefetched { receiver, .. } => Some(receiver.len()),
+            _ => None,
+        }
+    }
     pub(super) fn new(source: ResumableScan, capacity: Option<usize>) -> Self {
         let Some(capacity) = capacity else {
             return Self::Direct(Some(source));
@@ -130,6 +142,7 @@ impl ScanInput {
         let (sender, receiver) = mpsc::channel(capacity);
         let discard = CancellationToken::new();
         let stop = discard.clone();
+        let failure = source.failure_signal();
         let reader = AbortOnDropHandle::new(tokio::spawn(async move {
             let mut source = Self::Direct(Some(source));
             loop {
@@ -184,6 +197,7 @@ impl ScanInput {
             permit: None,
             reader: Some(reader),
             discard,
+            failure,
         }
     }
 
@@ -196,13 +210,21 @@ impl ScanInput {
                 receiver,
                 current,
                 permit,
+                failure,
                 ..
             } => loop {
+                if let Some(error) = failure.failure() {
+                    break Some(Err(StorageError::from(error).into()));
+                }
                 if let Some(item) = current.next() {
                     break Some(Ok(item));
                 }
                 permit.take();
-                let batch = receiver.recv().await?;
+                let batch = select! {
+                    biased;
+                    ()=failure.failed()=>break failure.failure().map(|error| Err(StorageError::from(error).into())),
+                    batch=receiver.recv()=>batch?,
+                };
                 *current = batch.items.into_iter();
                 *permit = Some(batch.permit);
             },
@@ -267,6 +289,15 @@ fn missing_outcome() -> AppError {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    async fn failure_signal() -> ScanFailureSignal {
+        let directory = tempfile::tempdir().unwrap();
+        let storage = create_storage_for_role(&directory.path().to_string_lossy(), None, false, StorageRole::Source)
+            .await
+            .unwrap();
+        ScanFailureSignal::source(storage.storage(), None).unwrap().1
+    }
+
     use crate::storage_factory::{StorageRole, create_storage_for_role};
     use data_mover::model::{
         BackendIdentity, BackendKind, EntryKind, IdentityStrength, ObservedEntry, SourceIdentity, StoragePath,
@@ -330,6 +361,7 @@ mod tests {
         .unwrap();
         let (sender, receiver) = mpsc::channel(4);
         let mut input = ScanInput::Prefetched {
+            failure: failure_signal().await,
             receiver,
             current: Vec::new().into_iter(),
             permit: None,
@@ -369,6 +401,7 @@ mod tests {
     async fn ready_batches_preserve_checkpoints_across_a_cancelled_empty_wait() {
         let (sender, receiver) = mpsc::channel(4);
         let mut input = ScanInput::Prefetched {
+            failure: failure_signal().await,
             receiver,
             current: Vec::new().into_iter(),
             permit: None,
@@ -433,6 +466,7 @@ mod tests {
             .await
             .unwrap();
         let mut input = ScanInput::Prefetched {
+            failure: failure_signal().await,
             receiver,
             current: Vec::new().into_iter(),
             permit: None,
@@ -461,6 +495,7 @@ mod tests {
             Err(AppError::ObservationScanCancelled)
         }));
         let mut input = ScanInput::Prefetched {
+            failure: failure_signal().await,
             receiver,
             current: Vec::new().into_iter(),
             permit: None,
@@ -492,6 +527,7 @@ mod tests {
             Err(AppError::ScanError("reader failed".into()))
         }));
         let mut input = ScanInput::Prefetched {
+            failure: failure_signal().await,
             receiver,
             current: Vec::new().into_iter(),
             permit: None,
@@ -530,6 +566,7 @@ mod tests {
             Err(AppError::ObservationScanCancelled)
         }));
         let mut input = ScanInput::Prefetched {
+            failure: failure_signal().await,
             receiver,
             current: Vec::new().into_iter(),
             permit: None,

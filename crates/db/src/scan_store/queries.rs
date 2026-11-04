@@ -99,6 +99,8 @@ mod tests {
     async fn cancellation_is_scoped_to_one_execution_and_all_replicas() -> Result<()> {
         let mock = Mock::new();
         let config = ClickHouseConfig {
+            mode: Default::default(),
+            cluster: None,
             dsn: mock.url().into(),
             database: "fixture".into(),
             username: "default".into(),

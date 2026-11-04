@@ -16,7 +16,7 @@ use data_mover::model::ObservedEntry;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use storage_adapter::{ChangeKind, EntryEnum, StorageEntryMessage};
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::{Mutex, MutexGuard, mpsc};
 use tracing::{debug, info, trace, warn};
 
 // 内部模块
@@ -28,7 +28,9 @@ use crate::config::ClickHouseConfig;
 use crate::error::{DatabaseError, Result};
 use crate::observation_record::{OBSERVATION_IDENTITY_JOIN_CLAUSE, ObservedEntryRecord};
 use crate::scan_store::queries::check_scan_cancellation;
-use crate::traits::{Database, IncrementalStorageEntryRecord, QueryResult, StorageEntryRecord, TarManifestRecord};
+use crate::traits::{
+    CopyGenerationStatus, Database, IncrementalStorageEntryRecord, QueryResult, StorageEntryRecord, TarManifestRecord,
+};
 use crate::{
     INCREMENTAL_SCAN_TABLE_BASE_NAME, SCAN_BASE_TABLE_BASE_NAME, SCAN_STATE_TABLE_BASE_NAME,
     TAR_MANIFEST_TABLE_BASE_NAME, generate_scan_temp_table_name, generate_version_count_join_sql,
@@ -36,6 +38,13 @@ use crate::{
     get_tar_manifest_table_name,
 };
 use utils::sanitize_job_id;
+
+mod catalogue;
+#[cfg(test)]
+mod catalogue_tests;
+mod copy_generation;
+use catalogue::{CatalogueEngine, ClusterCatalogue};
+use replica_read::QuorumRead;
 
 pub(crate) mod replica_read;
 pub mod scan_resume;
@@ -48,6 +57,7 @@ pub mod scan_resume_statistics;
 pub struct ClickHouseDatabase {
     /// ClickHouse同步客户端，用于执行同步操作如查询和简单插入
     sync_client: Client,
+    catalogue_cluster: Option<ClusterCatalogue>,
     /// ClickHouse异步客户端，配置了异步插入功能，用于大批量数据插入
     async_client: Client,
     /// 任务ID，用于在多任务环境下表命名的隔离和区分
@@ -59,7 +69,7 @@ pub struct ClickHouseDatabase {
     /// 每次扫描实例只检查一次旧基线的身份格式，避免每批全表统计。
     resume_base_has_typed_handles: Option<bool>,
     /// 同一 `ClickHouse` 身份与 job 共享的 scan generation 生命周期
-    generation_lifecycle: Arc<Mutex<ScanGenerationLifecycle>>,
+    generation_lifecycle: SharedGenerationLifecycle,
 }
 
 impl ClickHouseDatabase {
@@ -74,6 +84,7 @@ struct ScanGenerationLifecycle {
     working: Option<u8>,
     committed: bool,
     observation_publication_ambiguous: bool,
+    copy_recovery: bool,
 }
 
 #[derive(Clone, Eq, Hash, PartialEq)]
@@ -82,10 +93,23 @@ struct GenerationLifecycleKey {
     database: String,
     username: String,
     job_id: String,
+    cluster: Option<String>,
 }
 
-type SharedGenerationLifecycle = Arc<Mutex<ScanGenerationLifecycle>>;
-type GenerationLifecycleRegistry = HashMap<GenerationLifecycleKey, Weak<Mutex<ScanGenerationLifecycle>>>;
+#[derive(Default)]
+struct CatalogueLifecycle {
+    state: Mutex<ScanGenerationLifecycle>,
+    writes: Mutex<()>,
+}
+
+impl CatalogueLifecycle {
+    async fn lock(&self) -> MutexGuard<'_, ScanGenerationLifecycle> {
+        self.state.lock().await
+    }
+}
+
+type SharedGenerationLifecycle = Arc<CatalogueLifecycle>;
+type GenerationLifecycleRegistry = HashMap<GenerationLifecycleKey, Weak<CatalogueLifecycle>>;
 
 static GENERATION_LIFECYCLES: OnceLock<StdMutex<GenerationLifecycleRegistry>> = OnceLock::new();
 
@@ -95,6 +119,7 @@ fn shared_generation_lifecycle(config: &ClickHouseConfig, job_id: &str) -> Share
         database: config.database.clone(),
         username: config.username.clone(),
         job_id: sanitize_job_id(job_id),
+        cluster: config.cluster.clone(),
     };
     let registry = GENERATION_LIFECYCLES.get_or_init(|| StdMutex::new(HashMap::new()));
     let mut registry = registry.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -102,7 +127,7 @@ fn shared_generation_lifecycle(config: &ClickHouseConfig, job_id: &str) -> Share
     if let Some(lifecycle) = registry.get(&key).and_then(Weak::upgrade) {
         return lifecycle;
     }
-    let lifecycle = Arc::new(Mutex::new(ScanGenerationLifecycle::default()));
+    let lifecycle = Arc::new(CatalogueLifecycle::default());
     registry.insert(key, Arc::downgrade(&lifecycle));
     lifecycle
 }
@@ -142,6 +167,7 @@ macro_rules! file_scan_base_columns {
     size_observed Bool DEFAULT 0,
     modified_unix_nanos Nullable(Int128) DEFAULT NULL,
     entry_snapshot Array(UInt8) DEFAULT [],
+    metadata_hash Nullable(String) DEFAULT NULL,
     INDEX identity_key_idx identity_key TYPE bloom_filter GRANULARITY 1
 "
     };
@@ -337,13 +363,26 @@ pub(crate) fn build_base_client(config: &ClickHouseConfig) -> Client {
 
 impl ClickHouseDatabase {
     /// 创建新的`ClickHouse`数据库实例
-    pub fn new(config: &ClickHouseConfig, job_id: &str) -> Self {
-        let sync_client = build_base_client(config);
-        let async_client = build_base_client(config)
-            .with_option("async_insert", "1")
-            .with_option("wait_for_async_insert", "1");
+    ///
+    /// # Errors
+    /// 部署模式、集群名称或集群数据库标识符无效时返回配置错误；此时尚未发起网络请求。
+    pub fn new(config: &ClickHouseConfig, job_id: &str) -> Result<Self> {
+        let catalogue_cluster = ClusterCatalogue::from_config(config, job_id)?;
+        let client = build_base_client(config);
+        let (sync_client, async_client) = if let Some(cluster) = &catalogue_cluster {
+            let client = cluster.client(client);
+            (client.clone(), client)
+        } else {
+            (
+                client.clone(),
+                client
+                    .with_option("async_insert", "1")
+                    .with_option("wait_for_async_insert", "1"),
+            )
+        };
 
-        Self {
+        Ok(Self {
+            catalogue_cluster,
             sync_client,
             async_client,
             job_id: job_id.to_string(),
@@ -351,7 +390,7 @@ impl ClickHouseDatabase {
             cached_scan_state: AtomicU8::new(255),
             resume_base_has_typed_handles: None,
             generation_lifecycle: shared_generation_lifecycle(config, job_id),
-        }
+        })
     }
 
     /// 将 data-mover observation    /// 将 data-mover observation projection 写入当前 job 的同一张 base 大表。
@@ -379,8 +418,9 @@ impl ClickHouseDatabase {
         if records.is_empty() {
             return Ok(());
         }
-        let mut insert = self
-            .async_client
+        let _write = self.catalogue_write_guard().await;
+        let client = self.catalogue_write_client(&self.async_client);
+        let mut insert = client
             .insert::<ObservedEntryRecord>(table_name)
             .await
             .map_err(DatabaseError::ClickHouseError)?;
@@ -411,9 +451,8 @@ impl ClickHouseDatabase {
         );
         self.sync_client
             .query(&query)
-            .fetch_all::<ObservedEntryRecord>()
-            .await
-            .map_err(DatabaseError::ClickHouseError)?
+            .fetch_quorum_all::<ObservedEntryRecord>()
+            .await?
             .into_iter()
             .map(|record| record.reconstruct(backend))
             .collect()
@@ -435,7 +474,7 @@ impl ClickHouseDatabase {
         let generation = Database::begin_scan_generation(self).await?;
         let temp = generate_scan_temp_table_name();
         let base = get_scan_base_table_name(&self.job_id);
-        if let Err(error) = self.execute(&format!("CREATE TABLE {temp} AS {base}"), &[]).await {
+        if let Err(error) = self.create_catalogue_snapshot(&temp, &base).await {
             *self.generation_lifecycle.lock().await = ScanGenerationLifecycle::default();
             return Err(error);
         }
@@ -459,9 +498,8 @@ impl ClickHouseDatabase {
                 "SELECT count() FROM {base} WHERE identity_key != '' AND identity_key NOT IN \
                  (SELECT identity_key FROM {temp})"
             ))
-            .fetch_one::<u64>()
+            .fetch_quorum_one::<u64>()
             .await
-            .map_err(DatabaseError::ClickHouseError)
         {
             Ok(deleted) => deleted,
             Err(error) => {
@@ -474,7 +512,7 @@ impl ClickHouseDatabase {
                 return Err(error);
             }
         };
-        if let Err(error) = self.execute(&format!("EXCHANGE TABLES {base} AND {temp}"), &[]).await {
+        if let Err(error) = self.exchange_catalogue_snapshot(&base, &temp).await {
             self.generation_lifecycle.lock().await.observation_publication_ambiguous = true;
             return Err(DatabaseError::ObservationExchangeAmbiguous {
                 source: Box::new(error),
@@ -493,8 +531,7 @@ impl ClickHouseDatabase {
                     warn!("Recovered an ambiguous generation commit from persisted state: {commit_error}");
                 }
                 Ok(Some(_)) => {
-                    if let Err(rollback_error) = self.execute(&format!("EXCHANGE TABLES {base} AND {temp}"), &[]).await
-                    {
+                    if let Err(rollback_error) = self.exchange_catalogue_snapshot(&base, &temp).await {
                         self.generation_lifecycle.lock().await.observation_publication_ambiguous = true;
                         return Err(DatabaseError::ObservationRollbackFailed {
                             commit: Box::new(commit_error),
@@ -516,7 +553,7 @@ impl ClickHouseDatabase {
                 }
             }
         }
-        if let Err(error) = self.execute(&format!("DROP TABLE {temp}"), &[]).await {
+        if let Err(error) = self.drop_catalogue_table(&temp).await {
             warn!("Committed observation snapshot but deferred retired table cleanup for {temp}: {error}");
         } else {
             self.scan_temp_table_name = None;
@@ -548,17 +585,20 @@ impl ClickHouseDatabase {
         let table_name = get_scan_base_table_name(&self.job_id);
         let query = format!(
             "SELECT identity_key, relative_path, backend_kind, entry_kind, size, size_observed, \
-             modified_unix_nanos, current_state, entry_snapshot FROM {table_name} \
+             modified_unix_nanos, current_state, entry_snapshot FROM {table_name} FINAL \
              WHERE identity_key = ? LIMIT 1"
         );
-        let record = self
+        let records = self
             .sync_client
             .query(&query)
             .bind(identity_key)
-            .fetch_optional::<ObservedEntryRecord>()
-            .await
-            .map_err(DatabaseError::ClickHouseError)?;
-        record.map(|value| value.reconstruct(backend)).transpose()
+            .fetch_quorum_all::<ObservedEntryRecord>()
+            .await?;
+        records
+            .into_iter()
+            .next()
+            .map(|value| value.reconstruct(backend))
+            .transpose()
     }
 
     /// 执行SQL语句，支持参数化查询
@@ -566,9 +606,11 @@ impl ClickHouseDatabase {
     /// 注意：由于ClickHouse execute API的限制，当前无法获取受影响的行数
     pub(crate) async fn execute(&self, sql: &str, params: &[Value]) -> Result<QueryResult> {
         check_scan_cancellation()?;
+        let _write = self.catalogue_write_guard().await;
         debug!("Executing ClickHouse statement: {}", sql);
 
-        let mut query = self.sync_client.query(sql);
+        let client = self.catalogue_write_client(&self.sync_client);
+        let mut query = client.query(sql);
 
         // 绑定参数
         for param in params {
@@ -595,25 +637,44 @@ impl ClickHouseDatabase {
     /// 创建主扫描表（ReplacingMergeTree，按 `relative_path` + `version_id` 排序）
     pub async fn create_scan_base_table(&self) -> Result<()> {
         let table_name = get_scan_base_table_name(&self.job_id);
-        let create_table_sql = format!(
-            "CREATE TABLE IF NOT EXISTS {table_name} ({FILE_SCAN_COLUMNS_DEFINITION}) ENGINE = ReplacingMergeTree() ORDER BY (relative_path, version_id, identity_key) SETTINGS allow_nullable_key = 1"
-        );
+        self.create_catalogue_table(
+            &table_name,
+            FILE_SCAN_COLUMNS_DEFINITION,
+            "(relative_path, version_id)",
+            CatalogueEngine::Replacing,
+        )
+        .await?;
+        self.validate_scan_base_table().await
+    }
 
-        info!("Creating ClickHouse scan base table: {}", table_name);
-        self.execute(&create_table_sql, &[]).await?;
-
+    /// 检查已有快照键，拒绝续写旧表而保留所有记录。
+    pub(super) async fn validate_scan_base_table(&self) -> Result<()> {
+        let table_name = get_scan_base_table_name(&self.job_id);
+        let sorting_key = self
+            .sync_client
+            .query("SELECT sorting_key FROM system.tables WHERE database=currentDatabase() AND name=?")
+            .bind(self.catalogue_sorting_table(&table_name))
+            .fetch_quorum_one::<String>()
+            .await?;
+        let normalized = sorting_key.replace([' ', '(', ')', '`'], "");
+        if normalized.strip_prefix("tuple").unwrap_or(&normalized) != "relative_path,version_id" {
+            return Err(DatabaseError::ConfigError(format!(
+                "ClickHouse scan table {table_name} uses an incompatible sorting key; clear this scan job and run a full scan again"
+            )));
+        }
         Ok(())
     }
 
     /// 创建扫描状态表（id=1, `scan_state` 0/1）
     pub async fn create_scan_state_table(&self) -> Result<()> {
         let table_name = get_scan_state_table_name(&self.job_id);
-        let create_table_sql = format!(
-            "CREATE TABLE IF NOT EXISTS {table_name} (id UInt8, scan_state UInt8, baseline_committed Bool DEFAULT true) ENGINE = ReplacingMergeTree() ORDER BY id"
-        );
-
-        info!("Creating ClickHouse scan state table: {}", table_name);
-        self.execute(&create_table_sql, &[]).await?;
+        self.create_catalogue_table(
+            &table_name,
+            "id UInt8, scan_state UInt8, baseline_committed Bool DEFAULT true",
+            "id",
+            CatalogueEngine::Replacing,
+        )
+        .await?;
         self.ensure_baseline_committed_column().await?;
 
         Ok(())
@@ -622,11 +683,8 @@ impl ClickHouseDatabase {
     async fn ensure_baseline_committed_column(&self) -> Result<()> {
         let table = get_scan_state_table_name(&self.job_id);
         // 兼容旧状态行的已有基线；新任务在首次成功提交前显式写入 false。
-        self.execute(
-            &format!("ALTER TABLE {table} ADD COLUMN IF NOT EXISTS baseline_committed Bool DEFAULT true"),
-            &[],
-        )
-        .await?;
+        self.add_catalogue_column(&table, "baseline_committed Bool DEFAULT true")
+            .await?;
         Ok(())
     }
 
@@ -640,24 +698,25 @@ impl ClickHouseDatabase {
         match self
             .sync_client
             .query(&format!("SELECT baseline_committed FROM {table} FINAL WHERE id=1"))
-            .fetch_one::<bool>()
+            .fetch_quorum_one::<bool>()
             .await
         {
             Ok(committed) => Ok(committed),
-            Err(ClickHouseError::RowNotFound) => Ok(false),
-            Err(error) => Err(error.into()),
+            Err(DatabaseError::ClickHouseError(ClickHouseError::RowNotFound)) => Ok(false),
+            Err(error) => Err(error),
         }
     }
 
     /// 创建增量扫描表（按 `operation_type` + `relative_path` + `create_at` 排序）
     async fn create_incremental_scan_table(&self) -> Result<()> {
         let table_name = get_incremental_scan_base_table_name(&self.job_id);
-        let create_table_sql = format!(
-            "CREATE TABLE IF NOT EXISTS {table_name} ({FILE_INCREMENTAL_SCAN_COLUMNS_DEFINITION}) ENGINE = ReplacingMergeTree() ORDER BY (operation_type, relative_path, create_at)"
-        );
-
-        info!("Creating ClickHouse incremental scan base table: {}", table_name);
-        self.execute(&create_table_sql, &[]).await?;
+        self.create_catalogue_table(
+            &table_name,
+            FILE_INCREMENTAL_SCAN_COLUMNS_DEFINITION,
+            "(operation_type, relative_path, create_at)",
+            CatalogueEngine::Replacing,
+        )
+        .await?;
 
         Ok(())
     }
@@ -667,26 +726,15 @@ impl ClickHouseDatabase {
     /// 记录每个 .tar 文件内部包含的条目清单
     async fn create_tar_manifest_table_impl(&self) -> Result<()> {
         let table_name = get_tar_manifest_table_name(&self.job_id);
-        let create_table_sql = format!(
-            "CREATE TABLE IF NOT EXISTS {table_name} (\
-                tar_path String, \
-                entry_path String, \
-                size UInt64, \
-                ext Nullable(String), \
-                mtime Int64, \
-                mode Nullable(UInt32), \
-                storage_type String, \
-                is_dir Bool, \
-                is_symlink Bool, \
-                uid Nullable(UInt32), \
-                gid Nullable(UInt32), \
-                version_id String, \
-                tags Nullable(String)\
-            ) ENGINE = ReplacingMergeTree() ORDER BY (tar_path, entry_path, version_id)"
-        );
-
-        info!("Creating ClickHouse tar manifest table: {}", table_name);
-        self.execute(&create_table_sql, &[]).await?;
+        self.create_catalogue_table(
+            &table_name,
+            "tar_path String, entry_path String, size UInt64, ext Nullable(String), mtime Int64, mode Nullable(UInt32),
+             storage_type String, is_dir Bool, is_symlink Bool, uid Nullable(UInt32), gid Nullable(UInt32),
+             version_id String, tags Nullable(String)",
+            "(tar_path, entry_path, version_id)",
+            CatalogueEngine::Replacing,
+        )
+        .await?;
 
         Ok(())
     }
@@ -699,12 +747,7 @@ impl ClickHouseDatabase {
             "SELECT name FROM system.tables WHERE name LIKE '{escaped}%' ESCAPE '\\\\' AND database = currentDatabase()"
         );
 
-        let table_names: Vec<String> = self
-            .sync_client
-            .query(&query)
-            .fetch_all::<String>()
-            .await
-            .map_err(|e| DatabaseError::QueryError(e.to_string()))?;
+        let table_names: Vec<String> = self.sync_client.query(&query).fetch_quorum_all::<String>().await?;
 
         let mut dropped_tables = Vec::new();
         for table_name in table_names {
@@ -722,9 +765,8 @@ impl ClickHouseDatabase {
             .sync_client
             .query("SELECT count() FROM system.tables WHERE name = ? AND database = currentDatabase()")
             .bind(table_name)
-            .fetch_one()
-            .await
-            .map_err(|e| DatabaseError::QueryError(format!("Failed to check table existence: {e}")))?;
+            .fetch_quorum_one()
+            .await?;
         Ok(count > 0)
     }
 
@@ -735,12 +777,10 @@ impl ClickHouseDatabase {
         let table_name = get_scan_state_table_name(&self.job_id);
         let query = format!("SELECT scan_state FROM {table_name} FINAL WHERE id = 1");
 
-        match self.sync_client.query(&query).fetch_one::<u8>().await {
+        match self.sync_client.query(&query).fetch_quorum_one::<u8>().await {
             Ok(scan_state) => Ok(Some(scan_state)),
-            Err(ClickHouseError::RowNotFound) => Ok(None),
-            Err(e) => Err(DatabaseError::QueryError(format!(
-                "Failed to query scan_state table: {e}"
-            ))),
+            Err(DatabaseError::ClickHouseError(ClickHouseError::RowNotFound)) => Ok(None),
+            Err(error) => Err(error),
         }
     }
 
@@ -766,12 +806,13 @@ impl ClickHouseDatabase {
     }
 
     async fn insert_scan_state_with_baseline(&self, scan_state: u8, baseline_committed: bool) -> Result<()> {
+        let _write = self.catalogue_write_guard().await;
         let table_name = get_scan_state_table_name(&self.job_id);
         let insert_sql = format!("INSERT INTO {table_name} (id, scan_state, baseline_committed) VALUES (?, ?, ?)");
 
         debug!("Inserting scan state: id=1, scan_state={}", scan_state);
 
-        self.sync_client
+        self.catalogue_write_client(&self.sync_client)
             .query(&insert_sql)
             .bind(1u8)
             .bind(scan_state)
@@ -795,8 +836,9 @@ impl ClickHouseDatabase {
         }
         self.execute(
             &format!(
-                "ALTER TABLE {base_table_name} UPDATE current_state = ? \
-                 WHERE current_state = ? SETTINGS mutations_sync = 2"
+                "ALTER TABLE {} UPDATE current_state = ? \
+                 WHERE current_state = ? SETTINGS mutations_sync = 2",
+                self.catalogue_storage_table(&base_table_name)?
             ),
             &[Value::from(committed), Value::from(working)],
         )
@@ -824,9 +866,8 @@ impl ClickHouseDatabase {
         let rows = self
             .sync_client
             .query(&query)
-            .fetch_all::<StorageEntryRecord>()
-            .await
-            .map_err(|e| DatabaseError::QueryError(e.to_string()))?;
+            .fetch_quorum_all::<StorageEntryRecord>()
+            .await?;
 
         debug!("Found {} {} files", rows.len(), query_type);
         Ok(rows)
@@ -846,13 +887,7 @@ impl ClickHouseDatabase {
             temp_table_name, base_table_name
         );
 
-        let (tn, bn): (u64, u64) = match self.sync_client.query(&query).fetch_one().await {
-            Ok(row) => row,
-            Err(e) => {
-                warn!("Failed to query file_handle status: {}, defaulting to (0, 0)", e);
-                (0, 0)
-            }
-        };
+        let (tn, bn): (u64, u64) = self.sync_client.query(&query).fetch_quorum_one().await?;
 
         // 旧驱动句柄与新的中立 identity key 不可混用；升级过渡代按路径比较。
         let (temp_non_null, base_non_null) = if tn == 0 || bn == 0 {
@@ -881,21 +916,9 @@ impl ClickHouseDatabase {
             return Ok(());
         }
 
-        let delete_query = format!(
-            "DELETE FROM {} WHERE relative_path IN ({})",
-            table_name,
-            vec!["?"; deleted_paths.len()].join(", ")
-        );
-
-        let mut delete_stmt = self.sync_client.query(&delete_query);
-        for relative_path in deleted_paths {
-            delete_stmt = delete_stmt.bind(relative_path);
-        }
-
-        delete_stmt
-            .execute()
-            .await
-            .map_err(|e| DatabaseError::QueryError(format!("Failed to batch delete base records: {e}")))?;
+        let delete_query = self.catalogue_delete_statement(table_name, &vec!["?"; deleted_paths.len()].join(", "))?;
+        let paths = deleted_paths.iter().cloned().map(Value::from).collect::<Vec<_>>();
+        self.execute(&delete_query, &paths).await?;
 
         info!("Successfully batch deleted {} base records", deleted_paths.len());
         Ok(())
@@ -916,6 +939,7 @@ impl ClickHouseDatabase {
         );
 
         let current_state = self.get_cached_scan_state().await?;
+        let _write = self.catalogue_write_guard().await;
         debug!(
             "During batch inserting to table {}, current_state: {:?}",
             table_name, current_state
@@ -928,6 +952,7 @@ impl ClickHouseDatabase {
         } else {
             &self.sync_client
         };
+        let client = self.catalogue_write_client(client);
 
         let mut insert = client
             .insert::<StorageEntryRecord>(table_name)
@@ -952,6 +977,7 @@ impl Database for ClickHouseDatabase {
     fn clone_box(&self) -> Box<dyn Database> {
         let new_db = Self {
             sync_client: self.sync_client.clone(),
+            catalogue_cluster: self.catalogue_cluster.clone(),
             async_client: self.async_client.clone(),
             job_id: self.job_id.clone(),
             scan_temp_table_name: self.scan_temp_table_name.clone(),
@@ -977,7 +1003,7 @@ impl Database for ClickHouseDatabase {
     async fn ping(&self) -> Result<()> {
         self.sync_client
             .query("SELECT 1")
-            .fetch_one::<u8>()
+            .fetch_quorum_one::<u8>()
             .await
             .map_err(|e| DatabaseError::ConnectionError(e.to_string()))?;
 
@@ -1001,6 +1027,7 @@ impl Database for ClickHouseDatabase {
         if messages.is_empty() {
             return Ok(());
         }
+        let _write = self.catalogue_write_guard().await;
 
         let table_name = get_incremental_scan_base_table_name(&self.job_id);
 
@@ -1011,8 +1038,8 @@ impl Database for ClickHouseDatabase {
 
         let record_count = records.len();
 
-        let mut insert = self
-            .async_client
+        let client = self.catalogue_write_client(&self.async_client);
+        let mut insert = client
             .insert::<IncrementalStorageEntryRecord>(&table_name)
             .await
             .map_err(DatabaseError::ClickHouseError)?;
@@ -1038,12 +1065,13 @@ impl Database for ClickHouseDatabase {
     /// 创建扫描临时表（MergeTree，自动生成唯一表名）
     async fn create_scan_temporary_table(&mut self) -> Result<()> {
         let temp_table_name = generate_scan_temp_table_name();
-        let create_table_sql = format!(
-            "CREATE TABLE IF NOT EXISTS {temp_table_name} ({FILE_SCAN_COLUMNS_DEFINITION}) ENGINE = MergeTree() ORDER BY (relative_path, version_id, identity_key) SETTINGS allow_nullable_key = 1"
-        );
-
-        debug!("Creating ClickHouse scan temporary table: {}", temp_table_name);
-        self.execute(&create_table_sql, &[]).await?;
+        self.create_catalogue_table(
+            &temp_table_name,
+            FILE_SCAN_COLUMNS_DEFINITION,
+            "(relative_path, version_id, identity_key)",
+            CatalogueEngine::MergeTree,
+        )
+        .await?;
 
         trace!(
             "ClickHouse scan temporary table '{}' created successfully",
@@ -1061,10 +1089,7 @@ impl Database for ClickHouseDatabase {
             ));
         }
         if let Some(temp_table_name) = &self.scan_temp_table_name {
-            let drop_table_sql = format!("DROP TABLE IF EXISTS {temp_table_name}");
-
-            debug!("Dropping ClickHouse scan temporary table: {}", temp_table_name);
-            self.execute(&drop_table_sql, &[]).await?;
+            self.drop_catalogue_table(temp_table_name).await?;
 
             debug!(
                 "ClickHouse scan temporary table '{}' dropped successfully",
@@ -1080,9 +1105,7 @@ impl Database for ClickHouseDatabase {
 
     /// 删除指定表（IF EXISTS）
     async fn drop_table_by_name(&self, table_name: &str) -> Result<()> {
-        let drop_table_sql = format!("DROP TABLE IF EXISTS `{table_name}`");
-        debug!("Dropping ClickHouse table: {}", table_name);
-        self.execute(&drop_table_sql, &[]).await?;
+        self.drop_catalogue_table(table_name).await?;
         Ok(())
     }
 
@@ -1115,17 +1138,8 @@ impl Database for ClickHouseDatabase {
         self.batch_delete_record(&table_name, deleted_paths).await
     }
 
-    /// 切换 `scan_state`（0↔1）
-    async fn switch_scan_state(&self) -> Result<()> {
-        let current_state = self.get_cached_scan_state().await?;
-        let new_state = 1 - current_state;
-
-        self.insert_scan_state(new_state).await?;
-        self.cached_scan_state.store(new_state, Ordering::Relaxed);
-
-        debug!("Switched scan state: {} -> {}", current_state, new_state);
-
-        Ok(())
+    async fn begin_copy_generation(&self, request_key: &str) -> Result<CopyGenerationStatus> {
+        self.begin_catalogue_copy(request_key).await
     }
 
     async fn begin_scan_generation(&self) -> Result<u8> {
@@ -1162,6 +1176,7 @@ impl Database for ClickHouseDatabase {
         self.insert_scan_state(working).await?;
         self.cached_scan_state.store(working, Ordering::Relaxed);
         lifecycle.committed = true;
+        lifecycle.copy_recovery = false;
         Ok(())
     }
 
@@ -1176,7 +1191,8 @@ impl Database for ClickHouseDatabase {
             .as_deref()
             .ok_or_else(|| DatabaseError::UnsupportedType("No temporary table available".to_string()))?;
 
-        let base_table_name = get_scan_base_table_name(&self.job_id);
+        let temp_table_name = self.catalogue_query_table(temp_table_name)?;
+        let base_table_name = self.catalogue_query_table(&get_scan_base_table_name(&self.job_id))?;
 
         debug!(
             "Inserting data from temporary table {} to base table {} (excluded: {} paths)",
@@ -1197,41 +1213,23 @@ impl Database for ClickHouseDatabase {
             let exclude_table = format!("exclude_{}", uuid::Uuid::new_v4().simple());
 
             // 1. 创建 Memory 排除表
-            self.execute(
-                &format!("CREATE TABLE {exclude_table} (relative_path String, version_id String) ENGINE = Memory"),
-                &[],
-            )
-            .await?;
+            self.create_catalogue_exclusions(&exclude_table).await?;
 
-            // 2. 写入排除路径
-            let mut insert = self
-                .sync_client
-                .insert::<ExcludeRecord>(&exclude_table)
-                .await
-                .map_err(DatabaseError::ClickHouseError)?;
-            for (path, vid) in excluded_paths {
-                insert
-                    .write(&ExcludeRecord {
-                        relative_path: path.clone(),
-                        version_id: vid.clone(),
-                    })
-                    .await
-                    .map_err(DatabaseError::ClickHouseError)?;
-            }
-            insert.end().await.map_err(DatabaseError::ClickHouseError)?;
+            // 2. 写入排除路径，与同作业其它 quorum 写入保持顺序。
+            self.write_catalogue_exclusions(&exclude_table, excluded_paths).await?;
 
             // 3. 带过滤的 INSERT INTO SELECT
+            let exclude_query_table = self.catalogue_query_table(&exclude_table)?;
             let insert_sql = format!(
                 "INSERT INTO {} ({}) SELECT {} FROM {} \
                  WHERE (relative_path, version_id) NOT IN \
                  (SELECT relative_path, version_id FROM {})",
-                base_table_name, *FILE_SCAN_COLUMNS_LIST, *FILE_SCAN_COLUMNS_LIST, temp_table_name, exclude_table
+                base_table_name, *FILE_SCAN_COLUMNS_LIST, *FILE_SCAN_COLUMNS_LIST, temp_table_name, exclude_query_table
             );
             self.execute(&insert_sql, &[]).await?;
 
             // 4. 清理排除表
-            self.execute(&format!("DROP TABLE IF EXISTS {exclude_table}"), &[])
-                .await?;
+            self.drop_catalogue_table(&exclude_table).await?;
         }
 
         info!(
@@ -1245,6 +1243,9 @@ impl Database for ClickHouseDatabase {
 
     /// 检测临时表中新增的文件（不存在于主表）
     async fn detect_new_items(&self) -> Result<Box<dyn Iterator<Item = EntryEnum> + Send>> {
+        if self.is_copy_recovery().await {
+            return Ok(records_to_entry_iter(self.copy_replay_items().await?));
+        }
         let records = self
             .detect_items("new", |temp_table, base_table, strategy| {
                 let (vc_join, vc_expr) = generate_version_count_join_sql!(base_table);
@@ -1256,6 +1257,9 @@ impl Database for ClickHouseDatabase {
     }
 
     async fn detect_changed_items(&self) -> Result<Box<dyn Iterator<Item = (EntryEnum, ChangeKind)> + Send>> {
+        if self.is_copy_recovery().await {
+            return Ok(Box::new(std::iter::empty()));
+        }
         // 分别查询三种变更（三类条件互斥），用 try_join! 并发执行以降低整体延迟
         let (data_only, metadata_only, both) = tokio::try_join!(
             self.detect_items("changed(data)", |temp, base, strategy| {
@@ -1297,13 +1301,17 @@ impl Database for ClickHouseDatabase {
             .sync_client
             .query(&query)
             .bind(1 - current_state)
-            .fetch_all::<StorageEntryRecord>()
-            .await
-            .map_err(|e| DatabaseError::QueryError(format!("Failed to query deleted files: {e}")))?;
+            .fetch_quorum_all::<StorageEntryRecord>()
+            .await?;
 
         debug!("Found {} old-state entries", rows.len());
         if rows.is_empty() {
             return Ok(Box::new(std::iter::empty()));
+        }
+        if self.is_copy_recovery().await {
+            return Ok(Box::new(
+                self.copy_recovery_deletions(rows, current_state).await?.into_iter(),
+            ));
         }
 
         // 第二步：分离有/无 file_handle 的记录
@@ -1335,10 +1343,7 @@ impl Database for ClickHouseDatabase {
                 for fh in chunk {
                     q = q.bind(*fh);
                 }
-                let batch_rows = q
-                    .fetch_all::<StorageEntryRecord>()
-                    .await
-                    .map_err(|e| DatabaseError::QueryError(format!("Failed to batch query file_handle: {e}")))?;
+                let batch_rows = q.fetch_quorum_all::<StorageEntryRecord>().await?;
 
                 for row in batch_rows {
                     if let Some(fh) = &row.file_handle {
@@ -1361,12 +1366,7 @@ impl Database for ClickHouseDatabase {
         let full_table_name = format!("{}_{}", table_name, sanitize_job_id(&self.job_id));
         let query = format!("SELECT COUNT() FROM {full_table_name} FINAL");
 
-        let count = self
-            .sync_client
-            .query(&query)
-            .fetch_one::<u64>()
-            .await
-            .map_err(|e| DatabaseError::QueryError(format!("Failed to get count from {full_table_name}: {e}")))?;
+        let count = self.sync_client.query(&query).fetch_quorum_one::<u64>().await?;
 
         Ok(count)
     }
@@ -1408,23 +1408,7 @@ impl Database for ClickHouseDatabase {
         if let Some(ext) = ext_bind {
             q = q.bind(ext);
         }
-        let mut stream = q
-            .fetch::<StorageEntryRecord>()
-            .map_err(|e| DatabaseError::QueryError(format!("Failed to query storage entries: {e}")))?;
-
-        while let Ok(Some(record)) = stream.next().await {
-            debug!("query_storage_entry: the record {:?}", record);
-
-            let entry_enum = record.to_entry_enum();
-            debug!("query_storage_entry: {:?}", entry_enum);
-            if let Err(err) = tx.send(entry_enum).await {
-                return Err(DatabaseError::QueryError(format!(
-                    "Failed to send storage entry: {err}"
-                )));
-            }
-        }
-
-        Ok(())
+        self.send_catalogue_records(q, tx).await
     }
 
     async fn create_tar_manifest_table(&self) -> Result<()> {
@@ -1435,11 +1419,12 @@ impl Database for ClickHouseDatabase {
         if records.is_empty() {
             return Ok(());
         }
+        let _write = self.catalogue_write_guard().await;
 
         let table_name = get_tar_manifest_table_name(&self.job_id);
 
-        let mut insert = self
-            .async_client
+        let client = self.catalogue_write_client(&self.async_client);
+        let mut insert = client
             .insert::<TarManifestRecord>(&table_name)
             .await
             .map_err(DatabaseError::ClickHouseError)?;
@@ -1897,8 +1882,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ambiguous_exchange_blocks_begin_and_destructive_abort() {
+    async fn ambiguous_exchange_blocks_begin_and_destructive_abort() -> Result<()> {
         let config = ClickHouseConfig {
+            mode: Default::default(),
+            cluster: None,
             dsn: "http://127.0.0.1:1".to_string(),
             dial_timeout: 1,
             read_timeout: 1,
@@ -1906,8 +1893,8 @@ mod tests {
             username: "default".to_string(),
             password: None,
         };
-        let mut database = ClickHouseDatabase::new(&config, "ambiguous_exchange");
-        let mut second_handle = ClickHouseDatabase::new(&config, "ambiguous_exchange");
+        let mut database = ClickHouseDatabase::new(&config, "ambiguous_exchange")?;
+        let mut second_handle = ClickHouseDatabase::new(&config, "ambiguous_exchange")?;
         database.scan_temp_table_name = Some("rollback_table".to_string());
         database
             .generation_lifecycle
@@ -1932,6 +1919,7 @@ mod tests {
             Database::drop_scan_temporary_table(&mut second_handle).await,
             Err(DatabaseError::TransactionError(_))
         ));
+        Ok(())
     }
 }
 

@@ -22,30 +22,25 @@ const MAX_RETRY_ATTEMPTS: u32 = 3;
 const INITIAL_BACKOFF_MS: u64 = 100;
 
 #[derive(Default)]
-struct DatabaseFailures(usize);
+struct DatabaseFailures {
+    count: usize,
+    source: Option<DatabaseError>,
+}
 
 impl DatabaseFailures {
-    fn record_entries(&mut self, count: usize) {
-        self.0 += count;
+    fn record(&mut self, count: usize, source: DatabaseError) {
+        self.count += count;
+        self.source.get_or_insert(source);
     }
-
-    fn record_operation(&mut self) {
-        self.0 += 1;
-    }
-
     fn count(&self) -> usize {
-        self.0
+        self.count
     }
 }
 
-fn database_consumer_result(job_type: &JobType, failures: &DatabaseFailures) -> Result<()> {
-    if *job_type != JobType::IncrementalScan || failures.count() == 0 {
-        Ok(())
-    } else {
-        Err(crate::error::AppError::ConsumerError(format!(
-            "Database consumer drained with {} failed operations",
-            failures.count()
-        )))
+fn database_consumer_result(failures: DatabaseFailures) -> Result<()> {
+    match failures.source {
+        Some(error) => Err(error.into()),
+        None => Ok(()),
     }
 }
 
@@ -255,11 +250,11 @@ impl Consumer for DatabaseConsumer {
                             })
                             .await
                             {
-                                processed_errors.record_operation();
                                 error!(
                                     "[DatabaseConsumer] Failed to insert tar manifest for {} after {} retries: {}",
                                     tar_path, MAX_RETRY_ATTEMPTS, e
                                 );
+                                processed_errors.record(1, e);
                             }
                         }
                         StorageEntryMessage::Error {
@@ -320,7 +315,7 @@ impl Consumer for DatabaseConsumer {
                     processed_count,
                     processed_errors.count()
                 );
-                database_consumer_result(&job_type, &processed_errors)
+                database_consumer_result(processed_errors)
             }
             .instrument(span),
         );
@@ -355,35 +350,12 @@ impl DatabaseConsumer {
             config.db_config.db_type, config.db_config.batch_size, config.db_config.enabled
         );
 
-        let database = match DatabaseFactory::new_database(&config.db_config, job_id).await {
-            Ok(database) => {
-                info!("[DatabaseConsumer] Create database successfully");
-                database
-            }
-            Err(e) => {
-                error!("[DatabaseConsumer] Failed to create database: {}", e);
-                return Err(crate::error::AppError::DatabaseError(e));
-            }
-        };
-
-        // 全量扫描和全量拷贝需要初始化基础表
-        if config.job_type == JobType::Scan || config.job_type == JobType::Copy {
-            match database.initialize().await {
-                Ok(()) => {
-                    info!("[DatabaseConsumer] Database initialized successfully");
-                }
-                Err(e) => {
-                    error!("[DatabaseConsumer] Failed to initialize database: {}", e);
-                    return Err(crate::error::AppError::DatabaseError(e));
-                }
-            }
+        let database = DatabaseFactory::new_database(&config.db_config, job_id).await?;
+        if matches!(config.job_type, JobType::Scan | JobType::Copy) {
+            database.initialize().await?;
         }
-
-        // tar manifest 表仅在 Copy/IncrementalCopy 任务时创建（sync 过程中写入数据）
-        if (config.job_type == JobType::Copy || config.job_type == JobType::IncrementalCopy)
-            && let Err(e) = database.create_tar_manifest_table().await
-        {
-            error!("[DatabaseConsumer] Failed to create tar manifest table: {}", e);
+        if matches!(config.job_type, JobType::Copy | JobType::IncrementalCopy) {
+            database.create_tar_manifest_table().await?;
         }
 
         Ok(Self {
@@ -426,11 +398,11 @@ impl DatabaseConsumer {
             if let Err(e) =
                 retry_batch_operation("insert_base", || database.batch_insert_base_record(current_batch)).await
             {
-                processed_errors.record_entries(batch_len);
                 error!(
                     "[DatabaseConsumer] Failed to insert batch after {} retries, discarding {} records: {}",
                     MAX_RETRY_ATTEMPTS, batch_len, e
                 );
+                processed_errors.record(batch_len, e);
             } else {
                 info!("[DatabaseConsumer] Batch inserted successfully");
             }
@@ -462,13 +434,13 @@ impl DatabaseConsumer {
             })
             .await
             {
-                processed_errors.record_entries(current_batch.len());
                 error!(
                     "[DatabaseConsumer] Failed to insert final batch after {} retries, discarding {} records: {}",
                     MAX_RETRY_ATTEMPTS,
                     current_batch.len(),
                     e
                 );
+                processed_errors.record(current_batch.len(), e);
             } else {
                 info!("[DatabaseConsumer] Final batch inserted successfully");
             }
@@ -500,13 +472,13 @@ impl DatabaseConsumer {
             })
             .await
             {
-                processed_errors.record_entries(current_batch.len());
                 error!(
                     "[DatabaseConsumer] Failed to delete final batch after {} retries, discarding {} records: {}",
                     MAX_RETRY_ATTEMPTS,
                     current_batch.len(),
                     e
                 );
+                processed_errors.record(current_batch.len(), e);
             } else {
                 info!("[DatabaseConsumer] Final batch deleted successfully");
             }
@@ -531,11 +503,11 @@ impl DatabaseConsumer {
             if let Err(e) =
                 retry_batch_operation("delete_base", || database.batch_delete_base_record(current_batch)).await
             {
-                processed_errors.record_entries(batch_len);
                 error!(
                     "[DatabaseConsumer] Failed to delete base batch after {} retries, discarding {} records: {}",
                     MAX_RETRY_ATTEMPTS, batch_len, e
                 );
+                processed_errors.record(batch_len, e);
             } else {
                 info!("[DatabaseConsumer] Batch of base records deleted successfully");
             }
@@ -572,11 +544,11 @@ impl DatabaseConsumer {
             })
             .await
             {
-                processed_errors.record_entries(batch_len);
                 error!(
                     "[DatabaseConsumer] Failed to insert incremental batch after {} retries, discarding {} records: {}",
                     MAX_RETRY_ATTEMPTS, batch_len, e
                 );
+                processed_errors.record(batch_len, e);
             } else {
                 info!("[DatabaseConsumer] Batch of incremental records inserted successfully");
             }
@@ -608,13 +580,13 @@ impl DatabaseConsumer {
             })
             .await
             {
-                processed_errors.record_entries(current_batch.len());
                 error!(
                     "[DatabaseConsumer] Failed to insert final incremental batch after {} retries, discarding {} records: {}",
                     MAX_RETRY_ATTEMPTS,
                     current_batch.len(),
                     e
                 );
+                processed_errors.record(current_batch.len(), e);
             } else {
                 info!("[DatabaseConsumer] Final batch of incremental records inserted successfully");
             }
@@ -626,8 +598,8 @@ impl DatabaseConsumer {
         database: &dyn Database, entry: &Arc<EntryEnum>, processed_errors: &mut DatabaseFailures,
     ) {
         if let Err(e) = database.update_base_record(entry).await {
-            processed_errors.record_operation();
             error!("[DatabaseConsumer] Failed to update base record: {}", e);
+            processed_errors.record(1, e);
         } else {
             debug!("[DatabaseConsumer] Base record updated successfully");
         }
@@ -637,15 +609,18 @@ impl DatabaseConsumer {
 #[cfg(test)]
 mod tests {
     use super::{DatabaseFailures, database_consumer_result};
-    use crate::config::JobType;
+    use crate::error::AppError;
+    use db::DatabaseError;
 
     #[test]
-    fn database_consumer_returns_error_after_draining_recorded_failures() {
+    fn database_consumer_returns_the_first_typed_error_after_draining_failures() {
+        assert!(database_consumer_result(DatabaseFailures::default()).is_ok());
         let mut failures = DatabaseFailures::default();
-        assert!(database_consumer_result(&JobType::IncrementalScan, &failures).is_ok());
-
-        failures.record_entries(2);
-        assert!(database_consumer_result(&JobType::IncrementalScan, &failures).is_err());
-        assert!(database_consumer_result(&JobType::IncrementalCopy, &failures).is_ok());
+        failures.record(2, DatabaseError::QueryError("first durable flush failed".into()));
+        failures.record(1, DatabaseError::ConnectionError("later failure".into()));
+        assert_eq!(failures.count(), 3);
+        assert!(
+            matches!(database_consumer_result(failures), Err(AppError::DatabaseError(DatabaseError::QueryError(message))) if message=="first durable flush failed")
+        );
     }
 }

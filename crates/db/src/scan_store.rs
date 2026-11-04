@@ -1,6 +1,6 @@
 //! 扫描持久化接口：单机兼容旧作业；集群使用按 job_id 隔离的共享表。
 use crate::clickhouse::scan_resume::ScanResumeState;
-use crate::clickhouse::scan_resume_statistics::ScanResumeStatistics;
+use crate::clickhouse::scan_resume_statistics::{ScanEventStatistics, ScanResumeStatistics};
 use crate::cluster_scan::ClusterScanStore;
 use crate::traits::StorageEntryRecord;
 use crate::{
@@ -87,11 +87,12 @@ impl ScanStore {
         }
     }
 
-    pub fn new(config: &ClickHouseConfig, cluster: Option<&str>, job_id: &str) -> Result<Self> {
+    pub fn new(config: &ClickHouseConfig, job_id: &str) -> Result<Self> {
+        let cluster = config.cluster_name()?;
         let queries = ScanQueryCancellation::new(config, cluster)?;
         let mut inner = match cluster.filter(|value| !value.is_empty()) {
             Some(cluster) => Store::Cluster(ClusterScanStore::new(config, cluster, job_id)?),
-            None => Store::Single(ClickHouseDatabase::new(config, job_id)),
+            None => Store::Single(ClickHouseDatabase::new(config, job_id)?),
         };
         match &mut inner {
             Store::Single(store) => store.tag_scan_queries(queries.comment()),
@@ -112,10 +113,38 @@ impl ScanStore {
             Store::Cluster(_) => Ok(()),
         }
     }
+    /// 表布局及清理 SQL 由具体数据库实现负责，上层只指定作业。
+    pub async fn clear_job(&self) -> Result<()> {
+        match &self.inner {
+            Store::Cluster(store) => store.clear_job().await,
+            Store::Single(store) => {
+                let job = utils::sanitize_job_id(&self.job_id);
+                for prefix in [
+                    "base",
+                    "state",
+                    "scan_state",
+                    "incremental",
+                    "scan_resume",
+                    "scan_resume_batch",
+                    "scan_resume_event_keys",
+                    "scan_resume_delete_keys",
+                ] {
+                    store.drop_table_by_name(&format!("{prefix}_{job}")).await?;
+                }
+                Ok(())
+            }
+        }
+    }
     pub async fn prepare_incremental(&self) -> Result<()> {
         match &self.inner {
             Store::Single(store) => store.create_table(INCREMENTAL_SCAN_TABLE_BASE_NAME).await,
             Store::Cluster(store) => store.prepare_incremental().await,
+        }
+    }
+    pub async fn prepare_native_schema(&self) -> Result<()> {
+        match &self.inner {
+            Store::Single(store) => store.prepare_native_schema().await,
+            Store::Cluster(store) => store.prepare_native_schema().await,
         }
     }
     pub async fn has_baseline(&self) -> Result<bool> {
@@ -148,6 +177,15 @@ impl ScanStore {
         match &self.inner {
             Store::Single(store) => store.write_native(entries, temporary).await,
             Store::Cluster(store) => store.write_native(entries, temporary).await,
+        }
+    }
+    /// 候选事件已持久化后，随当前基线保存这些候选的可校验摘要。
+    pub async fn write_candidate_observations(
+        &self, entries: &[Arc<ObservedEntry>], candidates: &[ObservedScanEvent],
+    ) -> Result<()> {
+        match &self.inner {
+            Store::Single(store) => store.write_native_candidates(entries, false, candidates).await,
+            Store::Cluster(store) => store.write_native_candidates(entries, false, candidates).await,
         }
     }
     pub async fn write_observation_keys(&self, entries: &[Arc<ObservedEntry>]) -> Result<()> {
@@ -209,5 +247,6 @@ impl ScanStore {
 
 
         resume_statistics(generation:u8,event_time:Option<i64>)->Result<ScanResumeStatistics>;
+        resume_event_statistics(epoch:i64)->Result<ScanEventStatistics>;
     }
 }

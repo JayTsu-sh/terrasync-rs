@@ -1,5 +1,6 @@
 pub mod analysis_repo;
 pub mod clickhouse_client;
+pub(crate) mod clickhouse_config;
 pub mod config_repo;
 pub mod db;
 pub mod endpoint_repo;

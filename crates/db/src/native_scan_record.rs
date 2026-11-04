@@ -14,6 +14,7 @@ use data_mover::model::{
 use rustc_hash::FxHashMap;
 use serde::{Serialize, Serializer};
 use smol_str::SmolStr;
+use std::borrow::Cow;
 #[cfg(test)]
 use std::sync::Arc;
 use storage_adapter::Tag;
@@ -21,20 +22,20 @@ use storage_adapter::Tag;
 use storage_adapter::observed_scan::ObservedItem;
 use storage_adapter::observed_scan::{EntryStatistics, ObservedScanEvent, ObservedView, timestamp_nanos};
 
-pub(crate) const OBSERVED_COLUMNS: &str = "name,relative_path,size,ext,ctime,mtime,atime,mode,storage_type,is_symlink,is_dir,is_regular_file,hard_links,current_state,uid,gid,ino,file_handle,version_id,tags,version_count,identity_key,backend_kind,entry_kind,size_observed,modified_unix_nanos,entry_snapshot";
+pub(crate) const OBSERVED_COLUMNS: &str = "name,relative_path,size,ext,ctime,mtime,atime,mode,storage_type,is_symlink,is_dir,is_regular_file,hard_links,current_state,uid,gid,ino,file_handle,version_id,tags,version_count,identity_key,backend_kind,entry_kind,size_observed,modified_unix_nanos,entry_snapshot,metadata_hash";
 
 /// 比较集合只传输主键和身份；完整观察在事件持久化后直接写入 base。
 #[derive(Serialize, clickhouse::Row)]
-pub(crate) struct NativeScanKey {
-    pub relative_path: String,
-    pub version_id: String,
+pub(crate) struct NativeScanKey<'a> {
+    pub relative_path: Cow<'a, str>,
+    pub version_id: &'a str,
     pub file_handle: Option<String>,
 }
-impl NativeScanKey {
-    pub(crate) fn capture(view: ObservedView<'_>) -> Self {
+impl<'a> NativeScanKey<'a> {
+    pub(crate) fn capture(view: ObservedView<'a>) -> Self {
         Self {
-            relative_path: view.path(),
-            version_id: view.version_id().into(),
+            relative_path: view.sql_path(),
+            version_id: view.version_id(),
             file_handle: view.file_handle(),
         }
     }
@@ -70,6 +71,7 @@ pub(crate) struct NativeScanRecord {
     pub modified_unix_nanos: Option<i128>,
     #[serde(serialize_with = "serialize_snapshot")]
     pub entry_snapshot: EntrySnapshot,
+    pub metadata_hash: Option<String>,
 }
 pub(crate) fn serialize_snapshot<S: Serializer>(
     snapshot: &EntrySnapshot, serializer: S,
@@ -150,6 +152,7 @@ impl NativeScanRecord {
             size_observed: snapshot_entry.size().is_some(),
             modified_unix_nanos: modified,
             entry_snapshot: snapshot_entry.try_encode_snapshot()?,
+            metadata_hash: None,
         })
     }
     #[cfg(test)]
@@ -237,9 +240,24 @@ pub(crate) fn event_record(event: &ObservedScanEvent, event_time: i64) -> Result
 }
 
 pub(crate) fn final_event_records(events: &[ScanFinalEvent], time: i64) -> Vec<IncrementalStorageEntryRecord> {
+    let mut added: FxHashMap<SmolStr, u32> = FxHashMap::default();
+    for event in events {
+        if let ScanFinalEvent::Added(item) = event
+            && item.version_count.is_some()
+        {
+            let count = added.entry(SmolStr::new(&item.relative_path)).or_default();
+            *count = count.saturating_add(1);
+        }
+    }
     events
         .iter()
-        .map(|event| incremental_record(event.item().clone(), event.operation(), event.previous_path(), time))
+        .map(|event| {
+            let mut record = event.item().clone();
+            if matches!(event, ScanFinalEvent::Added(_)) && record.version_count.is_some() {
+                record.version_count = added.get(record.relative_path.as_str()).copied();
+            }
+            incremental_record(record, event.operation(), event.previous_path(), time)
+        })
         .collect()
 }
 
@@ -368,6 +386,8 @@ mod tests {
         assert_eq!(rows[0].size, 17);
         assert_eq!(rows[1].version_id, "deleted");
         assert_eq!(rows[0].version_count, Some(2));
+        let final_rows = final_event_records(&[ScanFinalEvent::Added(rows[0].clone().legacy())], 1);
+        assert_eq!(final_rows[0].version_count, Some(1));
         let marker = rows[1].observed(&backend)?;
         assert!(marker.view().version().is_some_and(VersionRecord::is_delete_marker));
         assert_eq!(marker.view().version_id(), "deleted");

@@ -9,6 +9,8 @@ level = "info"           # Log level: "debug", "info", "warn", "error" (default:
 enable_json = false      # Enable JSON structured logging to app.json.log (default: false)
 
 [scan]
+operation_timeout_secs = 30 # Per storage operation; excludes consumer waits
+recovery_window_secs = 3    # Retry window after a network fault is detected
 # Scan related configuration
 concurrency = 8          # Concurrency threads for scan operation (default: 8)
 include_tags = false     # Include tags of S3 object in scan results (default: false)
@@ -40,9 +42,11 @@ concurrency = 8            # Concurrency level for delete operations (default: 8
 # Database integration configuration
 enabled = true           # Enable Database integration (default: true)
 type = "clickhouse"       # Only ClickHouse is supported
-batch_size = 800000       # Batch size for file entries
+batch_size = 100000       # Batch size for file entries
 
 [database.clickhouse]
+mode = "single"          # single | cluster
+# cluster = "clickhouse"  # Required for cluster mode; omit for single mode
 # ClickHouse specific configuration
 dsn = "http://localhost:8123"  # DSN format: http://host:port
 dial_timeout = 5          # Connection timeout (seconds)

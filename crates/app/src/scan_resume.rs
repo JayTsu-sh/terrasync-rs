@@ -9,17 +9,18 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use self::cancellation::ScanCancellation;
+use crate::scan::{
+    ScanRequest,
+    cancellation::{self, ScanCancellation},
+};
 use data_mover::model::ObservedEntry;
 use data_mover::traversal::Resumable;
 use db::clickhouse::scan_resume::{COMPLETED, RUNNING, ScanResumeState};
+use db::clickhouse::scan_resume_statistics::ScanResumeStatistics;
 use db::scan_store::{ScanFinalEvent, ScanStore};
-#[cfg(feature = "license")]
-use licensing::verify::quick_verify;
 use storage_adapter::filter::parse_filter_expression;
 use storage_adapter::{ErrorEvent, StorageEntryMessage, StorageEnum, WalkOptions, canonicalize_path};
-use tokio::{select, task::spawn_blocking};
-use tokio_util::sync::CancellationToken;
+use tokio::{join, select, task::spawn_blocking};
 use tracing::{info, warn};
 use utils::app_config::AppConfig;
 
@@ -30,25 +31,12 @@ use crate::{
     storage_factory::{StorageRole, create_storage_for_role},
 };
 
-mod cancellation;
 mod input;
 mod pipeline;
 mod workers;
 
-#[allow(clippy::too_many_arguments, clippy::ref_option)]
-pub async fn scan_with_resume(
-    job_id: &str, job_dir: &str, path: &str, depth: u32, include: &Option<String>, exclude: &Option<String>,
-    command: String, cancel: CancellationToken,
-) -> Result<()> {
-    scan_with_resume_and_progress(job_id, job_dir, path, depth, include, exclude, command, cancel, None).await
-}
-
-#[allow(clippy::too_many_arguments, clippy::ref_option)]
-pub async fn scan_with_resume_and_progress(
-    job_id: &str, job_dir: &str, path: &str, depth: u32, include: &Option<String>, exclude: &Option<String>,
-    command: String, cancel: CancellationToken, callback_url: Option<String>,
-) -> Result<()> {
-    scan_with_resume_settings(
+pub(crate) async fn run_persisted(request: ScanRequest<'_>, config: AppConfig) -> Result<()> {
+    let ScanRequest {
         job_id,
         job_dir,
         path,
@@ -58,31 +46,12 @@ pub async fn scan_with_resume_and_progress(
         command,
         cancel,
         callback_url,
-        None,
-    )
-    .await
-}
-
-#[allow(clippy::too_many_arguments, clippy::ref_option)]
-pub async fn scan_with_resume_settings(
-    job_id: &str, job_dir: &str, path: &str, depth: u32, include: &Option<String>, exclude: &Option<String>,
-    command: String, cancel: CancellationToken, callback_url: Option<String>, concurrency: Option<usize>,
-) -> Result<()> {
-    #[cfg(feature = "license")]
-    if let Ok(license) = licensing::get_global_license() {
-        quick_verify(license)?;
-    }
-    let mut config = AppConfig::fetch()?;
-    if let Some(value) = concurrency {
-        if value == 0 {
-            return Err(AppError::ConfigError("scan concurrency must be positive".into()));
-        }
-        config.scan.concurrency = value;
-    }
+        ..
+    } = request;
     info!(concurrency = config.scan.concurrency, "Using scan task concurrency");
     if !config.database.enabled || config.database.r#type != "clickhouse" {
         return Err(AppError::ConfigError(
-            "scan --resume requires enabled ClickHouse storage".into(),
+            "Persisted scanning requires enabled ClickHouse storage".into(),
         ));
     }
     tokio::fs::create_dir_all(job_dir).await?;
@@ -102,6 +71,8 @@ pub async fn scan_with_resume_settings(
         storage=create_storage_for_role(&source, None, false, StorageRole::Source)=>storage?,
     };
     let options = WalkOptions {
+        operation_timeout: Some(Duration::from_secs(config.scan.operation_timeout_secs)),
+        recovery_window: Some(Duration::from_secs(config.scan.recovery_window_secs)),
         depth: NonZeroUsize::new(depth as usize).map(NonZeroUsize::get),
         match_expressions: include.as_deref().map(parse_filter_expression).transpose()?,
         exclude_expressions: exclude.as_deref().map(parse_filter_expression).transpose()?,
@@ -125,7 +96,6 @@ pub async fn scan_with_resume_settings(
             .clickhouse
             .as_ref()
             .ok_or_else(|| AppError::ConfigError("ClickHouse configuration missing".into()))?,
-        config.database.clickhouse.cluster.as_deref(),
         job_id,
     )?;
     let queries = database.query_cancellation();
@@ -192,6 +162,7 @@ pub async fn scan_with_resume_settings(
         if state.incremental {
             cancellation.operation(database.prepare_incremental()).await?;
         }
+        cancellation.operation(database.prepare_native_schema()).await?;
         let kind = if state.incremental {
             JobType::IncrementalScan
         } else {
@@ -214,7 +185,7 @@ pub async fn scan_with_resume_settings(
                 &mut state,
                 &consumers,
                 config.database.batch_size.max(1) as usize,
-                cancellation.child(),
+                cancellation.clone(),
             )
             .await
         };
@@ -273,19 +244,9 @@ async fn run(
         pipeline::consume(source, database, state, consumers, batch_size, cancel.clone()).await?;
     }
     cancel.check()?;
-    if state.incremental {
-        cancel
-            .operation(finalize_events(database, state, consumers, batch_size, &cancel))
-            .await?;
-    }
+    let statistics = final_statistics(database, state, consumers, batch_size, &cancel).await?;
     cancel.check()?;
-    consumers
-        .reconcile_scan_statistics(
-            cancel
-                .operation(database.resume_statistics(state.generation, state.incremental.then_some(state.event_time)))
-                .await?,
-        )
-        .await;
+    consumers.reconcile_scan_statistics(statistics).await;
     cancel.check()?;
     state.statistics = consumers.statistics_checkpoint().await?;
     state.advance()?;
@@ -350,7 +311,7 @@ async fn flush_batch(
                 "Lab failure after durable events, before base update".into(),
             ));
         }
-        database.write_observations(batch, false).await?;
+        database.write_candidate_observations(batch, &events).await?;
     } else {
         cancel.check()?;
         database.write_observations(batch, false).await?;
@@ -363,6 +324,30 @@ async fn flush_batch(
 fn sort_batch(batch: &mut [Arc<ObservedEntry>]) {
     // 相同路径保留源交付顺序，保证重放或路径复用时最后观察到的记录生效。
     batch.sort_by(|a, b| a.path().as_str().cmp(b.path().as_str()));
+}
+
+async fn final_statistics(
+    database: &ScanStore, state: &ScanResumeState, consumers: &ConsumerManager, batch_size: usize,
+    cancel: &ScanCancellation,
+) -> Result<ScanResumeStatistics> {
+    if !state.incremental {
+        return cancel
+            .operation(database.resume_statistics(state.generation, None))
+            .await;
+    }
+    // 所有观察已确认；最终化只删除旧代次，当前快照可并发只读汇总。两个分支均等待退出。
+    let (events, statistics) = join!(
+        cancel.operation(finalize_events(database, state, consumers, batch_size, cancel)),
+        cancel.operation(database.resume_statistics(state.generation, None)),
+    );
+    events?;
+    let mut statistics = statistics?;
+    cancel.check()?;
+    // 公共事件全部确认后再读本轮计数，包含中断前已落盘的最终化决定。
+    statistics.events = cancel
+        .operation(database.resume_event_statistics(state.event_time))
+        .await?;
+    Ok(statistics)
 }
 
 async fn finalize_events(
@@ -457,25 +442,14 @@ mod tests {
     }
 }
 
-/// 清理集群中一个扫描作业的数据分区，保留共享表和其他作业。
-pub async fn clear_cluster_scan(job_id: &str) -> Result<()> {
+/// 清理一个扫描作业的数据；表布局及其他作业隔离由数据库层负责。
+pub async fn clear_scan(job_id: &str) -> Result<()> {
     let config = AppConfig::fetch()?;
-    let cluster = config
-        .database
-        .clickhouse
-        .cluster
-        .as_deref()
-        .ok_or_else(|| AppError::ConfigError("ClickHouse cluster is not configured".into()))?;
-    let db_config = DatabaseConfig::from_app_config(&config.database);
-    db::clear_cluster_scan_data(
-        db_config
-            .clickhouse
-            .as_ref()
-            .ok_or_else(|| AppError::ConfigError("ClickHouse configuration missing".into()))?,
-        cluster,
-        job_id,
-    )
-    .await?;
+    if !config.database.enabled {
+        return Err(AppError::ConfigError("ClickHouse is not enabled".into()));
+    }
+    let store = ScanStore::new(&config.database.clickhouse, job_id)?;
+    store.clear_job().await?;
     Ok(())
 }
 
@@ -488,7 +462,6 @@ pub async fn scan_execution_is_incremental(job_id: &str) -> Result<bool> {
             .clickhouse
             .as_ref()
             .ok_or_else(|| AppError::ConfigError("ClickHouse configuration missing".into()))?,
-        config.database.clickhouse.cluster.as_deref(),
         job_id,
     )?;
     Ok(store.resume_execution_is_incremental().await?)

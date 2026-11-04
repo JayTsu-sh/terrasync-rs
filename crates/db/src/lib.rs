@@ -14,9 +14,8 @@ use uuid::Uuid;
 
 // 内部模块
 // 公共模块导出
-mod cluster_scan;
-pub use cluster_scan::clear_cluster_scan_data;
 pub mod clickhouse; // ClickHouse数据库实现
+mod cluster_scan;
 pub mod common; // Common types and utilities
 pub mod config; // 数据库配置定义
 pub mod error; // 错误处理
@@ -44,7 +43,7 @@ pub use config::{ClickHouseConfig, DatabaseConfig, DatabaseType}; // 配置相�
 pub use error::{DatabaseError, Result}; // 错误处理相关类型
 pub use factory::DatabaseFactory; // 数据库工厂类型
 pub use observation_record::{OBSERVATION_IDENTITY_JOIN_CLAUSE, ObservedEntryRecord};
-pub use traits::Database; // 数据库接口类型
+pub use traits::{CopyGenerationStatus, Database}; // 数据库接口类型
 
 /// 公共 API 的 prelude 模块
 ///
@@ -122,5 +121,6 @@ pub(crate) fn generate_scan_temp_table_name() -> String {
 }
 
 mod native_scan_record;
+mod scan_metadata;
 
 mod native_scan;

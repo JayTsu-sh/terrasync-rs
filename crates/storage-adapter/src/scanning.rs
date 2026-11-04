@@ -11,8 +11,9 @@ use data_mover::{
         delete_tree,
     },
     traversal::{
-        Checkpoint, Resumable, StorageTraversalSource, TraversalCandidate, TraversalDecision, TraversalFilter,
-        TraversalItem, TraversalOrder, TraversalOutcome, TraversalRequest, TraversalSession, TraversalSource,
+        Checkpoint, Resumable, ScanFailureSignal, TraversalCandidate, TraversalDecision, TraversalFilter,
+        TraversalItem, TraversalOrder, TraversalOutcome, TraversalRecoveryStatus, TraversalRequest, TraversalSession,
+        TraversalSource,
     },
 };
 use std::{
@@ -43,7 +44,8 @@ impl ConnectedStorage {
         Ok(request)
     }
     fn traversal(&self, sub: Option<&Path>, options: &WalkOptions, blocks: bool) -> Result<TraversalSession> {
-        Ok(StorageTraversalSource::new(&self.roles)?.traverse(self.traversal_request(sub, options, blocks)?))
+        let (source, _) = ScanFailureSignal::source(&self.roles, options.operation_timeout)?;
+        Ok(source.traverse(self.traversal_request(sub, options, blocks)?))
     }
 
     /// 保存检查点前先持久化条目；恢复时可能重放一个目录。
@@ -59,14 +61,22 @@ impl ConnectedStorage {
         if let Some(bytes) = checkpoint {
             request = request.resume_from(Checkpoint::from_bytes(bytes.into()));
         }
+        let scan = self.start_traversal(request, options)?;
         Ok(ResumableScan {
-            session: StorageTraversalSource::new(&self.roles)?.traverse(request),
+            session: scan.session,
+            guard: scan.failure,
+            recovery: scan.recovery,
             history: None,
             cancel,
         })
     }
     pub async fn walkdir(&self, sub: Option<&Path>, options: WalkOptions) -> Result<WalkDirAsyncIterator> {
-        let mut session = self.traversal(sub, &options, false)?;
+        let scan = self.start_traversal(self.traversal_request(sub, &options, false)?, &options)?;
+        let mut session = scan.session;
+        let guard = scan.failure;
+        let recovery = scan.recovery;
+        let terminal_error = Arc::new(std::sync::Mutex::new(None));
+        let stored_error = terminal_error.clone();
         let package = PackageFilter::new(&options);
         let root = sub.unwrap_or(Path::new("")).to_path_buf();
         let (tx, rx) = async_channel::bounded(128);
@@ -79,12 +89,17 @@ impl ConnectedStorage {
                         let projected = match connected.project_history(&entry, &mut histories).await {
                             Ok(entries) => entries,
                             Err(error) => {
+                                let reason = error.to_string();
+                                stored_error
+                                    .lock()
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                    .get_or_insert(error);
                                 let _ = tx
                                     .send(StorageEntryMessage::Error {
                                         event: ErrorEvent::Scan,
                                         path: entry.path().as_str().into(),
                                         entry: None,
-                                        reason: error.to_string(),
+                                        reason,
                                     })
                                     .await;
                                 return;
@@ -111,13 +126,34 @@ impl ConnectedStorage {
                         event: ErrorEvent::Scan,
                         path: PathBuf::from(failure.path.as_str()),
                         entry: None,
-                        reason: format!("{:?}: {:?}", failure.scope, failure.failure.class()),
+                        reason: {
+                            let error = StorageError::TraversalEntry {
+                                path: failure.path.clone(),
+                                scope: failure.scope,
+                                delivered: failure.delivered,
+                                source: failure.failure,
+                            };
+                            let reason = error.to_string();
+                            stored_error
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                .get_or_insert(error);
+                            reason
+                        },
                     },
                     TraversalItem::ObservationFailure(failure) => StorageEntryMessage::Error {
                         event: ErrorEvent::Scan,
                         path: PathBuf::from(failure.path.as_str()),
                         entry: None,
-                        reason: format!("{:?}: {:?}", failure.family, failure.class),
+                        reason: {
+                            let error = StorageError::TraversalObservation(failure);
+                            let reason = error.to_string();
+                            stored_error
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                .get_or_insert(error);
+                            reason
+                        },
                     },
                     _ => continue,
                 };
@@ -126,6 +162,10 @@ impl ConnectedStorage {
                 }
             }
             if !histories.is_complete() {
+                stored_error
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .get_or_insert_with(|| operation("incomplete object history"));
                 let _ = tx
                     .send(StorageEntryMessage::Error {
                         event: ErrorEvent::Scan,
@@ -139,18 +179,29 @@ impl ConnectedStorage {
             match session.finish().await {
                 Ok(TraversalOutcome::Completed(_)) => {}
                 result => {
+                    let reason = format!("traversal did not complete: {result:?}");
+                    let error = match result {
+                        Err(error) => StorageError::from(error),
+                        _ => StorageError::Cancelled,
+                    };
+                    stored_error
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .get_or_insert(error);
                     let _ = tx
                         .send(StorageEntryMessage::Error {
                             event: ErrorEvent::Scan,
                             path: PathBuf::new(),
                             entry: None,
-                            reason: format!("traversal did not complete: {result:?}"),
+                            reason,
                         })
                         .await;
                 }
             }
         });
-        Ok(AsyncReceiver::new(rx))
+        Ok(AsyncReceiver::new(rx)
+            .with_scan_failure(terminal_error, guard)
+            .with_recovery(recovery))
     }
     pub async fn walkdir_2(
         &self, sub: Option<&Path>, depth: Option<usize>, match_expressions: Option<FilterExpression>,
@@ -371,11 +422,21 @@ pub enum ResumableScanItem {
 
 pub struct ResumableScan {
     session: TraversalSession,
+    recovery: Option<TraversalRecoveryStatus>,
+    guard: ScanFailureSignal,
     history: Option<(String, u32)>,
     cancel: CancellationToken,
 }
 
 impl ResumableScan {
+    /// 当前恢复活动；临时断连不会触发最终失败信号。
+    pub fn recovery_status(&self) -> Option<&TraversalRecoveryStatus> {
+        self.recovery.as_ref()
+    }
+    /// 旁路通知让调用方立即停止预读缓冲的消费，并保留原始类型化错误。
+    pub fn failure_signal(&self) -> ScanFailureSignal {
+        self.guard.clone()
+    }
     /// 放弃未确认的尾部条目，等待遍历真正停止；不把取消时的部分历史当成完成证据。
     pub async fn stop(mut self) -> Result<TraversalOutcome> {
         self.cancel.cancel();
@@ -383,7 +444,13 @@ impl ResumableScan {
         self.session.finish().await.map_err(StorageError::from)
     }
     pub async fn next(&mut self) -> Option<Result<ResumableScanItem>> {
-        while let Some(item) = self.session.next_item().await {
+        loop {
+            let item = tokio::select! {
+                biased;
+                () = self.guard.failed() => return self.guard.failure().map(|failure| Err(failure.into())),
+                item = self.session.next_item() => item,
+            };
+            let Some(item) = item else { break };
             match item {
                 TraversalItem::Entry(entry) => {
                     if let Some(history) = entry.history() {
@@ -422,7 +489,11 @@ impl ResumableScan {
 
     pub async fn finish(self) -> Result<TraversalOutcome> {
         let partial = self.history.is_some();
-        let outcome = self.session.finish().await.map_err(StorageError::from)?;
+        let result = self.session.finish().await.map_err(StorageError::from);
+        if let Some(failure) = self.guard.failure() {
+            return Err(failure.into());
+        }
+        let outcome = result?;
         if partial {
             return Err(operation("scan ended with an incomplete version history"));
         }
@@ -480,6 +551,15 @@ impl PackageFilter {
     }
 }
 impl TraversalFilter for PackageFilter {
+    fn resume_key(&self) -> Option<Vec<u8>> {
+        let mut key = b"terrasync-package-filter-v1\0".to_vec();
+        key.extend(self.dsl.resume_key()?);
+        key.push(u8::from(self.enabled));
+        key.extend_from_slice(&(self.extra_depth as u64).to_le_bytes());
+        key.push(u8::from(self.maximum.is_some()));
+        key.extend_from_slice(&(self.maximum.unwrap_or_default() as u64).to_le_bytes());
+        Some(key)
+    }
     fn required_metadata(&self) -> MetadataRequirements {
         self.dsl.required_metadata()
     }
@@ -532,7 +612,13 @@ mod stopping_tests {
         let parent = CancellationToken::new();
         let cancel = parent.child_token();
         let (producer, session) = TraversalSession::bounded(NonZeroUsize::new(1).unwrap(), cancel.clone());
+        let directory = tempfile::tempdir().unwrap();
+        let storage = create_storage(&directory.path().to_string_lossy(), CreateStorageOptions::default())
+            .await
+            .unwrap();
         let scan = ResumableScan {
+            recovery: None,
+            guard: ScanFailureSignal::source(&storage.roles, None).unwrap().1,
             session,
             history: Some(("partial-history".into(), 1)),
             cancel: cancel.clone(),

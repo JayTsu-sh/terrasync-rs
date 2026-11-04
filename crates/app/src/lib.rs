@@ -35,6 +35,8 @@ pub mod config;
 /// 负责管理不同类型的消费者，如存储条目消费者和统计消费者
 pub mod consumer;
 
+mod copy_completion;
+mod copy_execution;
 pub mod local_transfer;
 pub mod observation_scan;
 /// Sync 编排器模块
@@ -42,6 +44,7 @@ pub mod observation_scan;
 /// SyncOrchestrator 封装 sync/incremental_sync 的核心逻辑
 pub mod orchestrator;
 pub mod scan_resume;
+mod sync_catalog;
 
 /// 双进程远端同步（Sender 侧）
 ///
@@ -123,7 +126,7 @@ pub mod prelude {
     /// 文件删除功能
     pub use crate::rm::rm;
     /// 文件扫描功能
-    pub use crate::scan::{ScanType, determine_scan_type, scan};
+    pub use crate::scan::{ScanRequest, ScanType, scan};
     /// 文件复制功能
     pub use crate::sync::{incremental_sync, sync};
 }

@@ -1,12 +1,13 @@
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
+use tokio::sync::Mutex;
 use tracing::warn;
 
 use crate::domain::repository::ConfigRepository;
 use crate::error::Result;
 use crate::infrastructure::clickhouse_client;
-use crate::infrastructure::task_runner::apply_db_config_from_sqlite;
+use crate::infrastructure::clickhouse_config::{apply_ch_config, apply_db_config_from_sqlite, parse_ch_config};
 
 #[derive(Debug, Serialize)]
 pub struct ConfigView {
@@ -28,11 +29,15 @@ pub struct ConfigUpdate {
 /// 配置管理服务
 pub struct ConfigService {
     config_repo: Arc<dyn ConfigRepository>,
+    updates: Mutex<()>,
 }
 
 impl ConfigService {
     pub fn new(config_repo: Arc<dyn ConfigRepository>) -> Self {
-        Self { config_repo }
+        Self {
+            config_repo,
+            updates: Mutex::new(()),
+        }
     }
 
     /// 获取所有配置项
@@ -51,9 +56,26 @@ impl ConfigService {
 
     /// 批量更新配置项，并处理副作用（日志级别重载、数据库配置应用）
     pub async fn update_config(&self, updates: &[ConfigUpdate]) -> Result<()> {
-        for update in updates {
-            let value_json = serde_json::to_string(&update.value)?;
-            self.config_repo.set(&update.key, &value_json).await?;
+        let _update = self.updates.lock().await;
+        let values: Vec<(String, String)> = updates
+            .iter()
+            .map(|update| Ok((update.key.clone(), serde_json::to_string(&update.value)?)))
+            .collect::<Result<_>>()?;
+        let clickhouse_changed = updates.iter().any(|update| update.key.starts_with("clickhouse_"));
+        let config = if clickhouse_changed {
+            let mut merged = self.config_repo.get_all().await?;
+            for (key, value) in &values {
+                merged.retain(|(old, _)| old != key);
+                merged.push((key.clone(), value.clone()));
+            }
+            parse_ch_config(&merged)?
+        } else {
+            None
+        };
+        self.config_repo.set_many(&values).await?;
+        // 应用已经校验并提交的同一快照，不能重读另一轮更新。
+        if let Some(config) = config {
+            apply_ch_config(&config)?;
         }
 
         // 如果更新了日志级别，动态应用到运行中的日志系统
@@ -62,13 +84,6 @@ impl ConfigService {
             && let Err(e) = utils::logger::reload_log_level(level)
         {
             warn!("Failed to reload log level: {e}");
-        }
-
-        // 如果更新了 ClickHouse 相关配置，重新加载到 AppConfig
-        if updates.iter().any(|u| u.key.starts_with("clickhouse_"))
-            && let Err(e) = apply_db_config_from_sqlite(self.config_repo.as_ref()).await
-        {
-            warn!("Failed to apply ClickHouse config: {e}");
         }
 
         Ok(())

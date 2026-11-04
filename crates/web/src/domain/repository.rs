@@ -1,3 +1,4 @@
+use super::storage_failure::StorageFailureDetail;
 use async_trait::async_trait;
 
 use super::endpoint::Endpoint;
@@ -31,7 +32,9 @@ pub trait TaskRepository: Send + Sync {
     async fn find_all(&self, filter: &TaskFilter) -> Result<Vec<MigrationTask>>;
     async fn find_by_endpoint_id(&self, endpoint_id: &str) -> Result<Vec<MigrationTask>>;
     async fn update(&self, task: &MigrationTask) -> Result<()>;
-    async fn update_status(&self, id: &str, status: TaskStatus, error_msg: Option<&str>) -> Result<()>;
+    async fn update_status(
+        &self, id: &str, status: TaskStatus, error_msg: Option<&str>, storage_error: Option<&StorageFailureDetail>,
+    ) -> Result<()>;
     async fn delete(&self, id: &str) -> Result<()>;
 }
 
@@ -49,6 +52,7 @@ pub trait ExecutionRepository: Send + Sync {
     async fn find_by_id(&self, id: &str) -> Result<Option<TaskExecution>>;
     async fn update_status(
         &self, id: &str, status: TaskStatus, stats: Option<&ExecutionStats>, error_msg: Option<&str>,
+        storage_error: Option<&StorageFailureDetail>,
     ) -> Result<()>;
     async fn save_log(&self, log: &TaskLog) -> Result<()>;
     async fn find_logs(
@@ -62,6 +66,7 @@ pub trait ExecutionRepository: Send + Sync {
 pub trait ConfigRepository: Send + Sync {
     async fn get(&self, key: &str) -> Result<Option<String>>;
     async fn get_all(&self) -> Result<Vec<(String, String)>>;
-    async fn set(&self, key: &str, value_json: &str) -> Result<()>;
+    /// 同一批设置必须原子可见，避免部署模式与集群名称出现中间状态。
+    async fn set_many(&self, values: &[(String, String)]) -> Result<()>;
     async fn delete(&self, key: &str) -> Result<()>;
 }

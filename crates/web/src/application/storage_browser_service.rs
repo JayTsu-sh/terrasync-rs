@@ -114,6 +114,9 @@ impl StorageBrowserService {
             }
         }
 
+        if let Some(error) = iter.take_error() {
+            return Err(error.into());
+        }
         entries.sort_by(|a, b| a.name.cmp(&b.name));
         let parent_str = parent_dir.to_string_lossy().to_string();
         Ok(ListDirsResult {

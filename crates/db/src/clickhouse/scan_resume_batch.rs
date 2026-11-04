@@ -171,6 +171,8 @@ mod tests {
                 .as_nanos()
         );
         let config = ClickHouseConfig {
+            mode: Default::default(),
+            cluster: None,
             dsn: std::env::var("LAB_CLICKHOUSE_DSN").unwrap_or_else(|_| "http://127.0.0.1:8123".into()),
             database: name.clone(),
             username: std::env::var("LAB_CLICKHOUSE_USER").unwrap_or_else(|_| "default".into()),
@@ -184,7 +186,7 @@ mod tests {
         });
         admin.query(&format!("CREATE DATABASE {name}")).execute().await?;
         let result: Result<([usize;4],u64,u64)>=async {
-            let mut database=ClickHouseDatabase::new(&config,"fixture");
+            let mut database=ClickHouseDatabase::new(&config,"fixture")?;
             database.initialize().await?;
             database.begin_resume_batch().await?;
             database.sync_client.query("INSERT INTO base_fixture (name,relative_path,size,mtime,mode,uid,gid,is_regular_file,file_handle,current_state) SELECT concat('file-',toString(number)),concat('file-',leftPad(toString(number),9,'0')),100,toDateTime64(1,9),420,1000,1000,1,concat('54534934',leftPad(lower(hex(number)),16,'0')),0 FROM numbers(100000)").execute().await?;
@@ -259,6 +261,8 @@ mod tests {
                 .as_nanos()
         );
         let config = ClickHouseConfig {
+            mode: Default::default(),
+            cluster: None,
             dsn: std::env::var("LAB_CLICKHOUSE_DSN").unwrap_or_else(|_| "http://127.0.0.1:8123".into()),
             database: name.clone(),
             username: std::env::var("LAB_CLICKHOUSE_USER").unwrap_or_else(|_| "default".into()),
@@ -282,7 +286,7 @@ mod tests {
                 let version_id = if storage_type == "s3" { "v1" } else { "" };
                 let base_mode = if storage_type == "s3" { "NULL" } else { "if(number=5,NULL,420)" };
                 let temp_mode = if storage_type == "s3" { "NULL" } else { "if(number=5,NULL,if(number IN(2,3),384,420))" };
-                let mut database = ClickHouseDatabase::new(&config, job);
+                let mut database = ClickHouseDatabase::new(&config, job)?;
                 database.initialize().await?;
                 database.begin_resume_batch().await?;
                 database.sync_client.query(&format!(

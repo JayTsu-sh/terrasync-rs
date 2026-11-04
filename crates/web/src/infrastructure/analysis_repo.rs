@@ -11,8 +11,8 @@ use tracing::warn;
 use crate::domain::analysis::{AnalysisMetric, AnalysisNode, AnalysisRepository};
 use crate::domain::repository::ConfigRepository;
 use crate::error::{Result, WebError};
+use crate::infrastructure::clickhouse_config::{ChConfig, load_ch_config};
 use crate::infrastructure::db::sanitize_job_id;
-use crate::infrastructure::task_runner::{ChConfig, load_ch_config};
 
 pub struct ClickHouseAnalysisRepo {
     config_repo: Arc<dyn ConfigRepository>,
@@ -36,7 +36,7 @@ impl AnalysisRepository for ClickHouseAnalysisRepo {
             .timeout(Duration::from_secs(30))
             .build()
             .map_err(analysis_request_failed)?;
-        let cluster_mode = config.cluster.is_some();
+        let cluster_mode = config.connection.cluster_name()?.is_some();
         let table = if cluster_mode {
             "base".to_string()
         } else {
@@ -93,9 +93,9 @@ struct ColumnRow {
 
 async fn query(client: &Client, config: &ChConfig, sql: &str, parameters: &[(&str, &str)]) -> Result<String> {
     let mut request = client
-        .post(config.dsn.trim_end_matches('/'))
-        .basic_auth(&config.username, Some(&config.password))
-        .header("X-ClickHouse-Database", &config.database)
+        .post(config.connection.dsn.trim_end_matches('/'))
+        .basic_auth(&config.connection.username, config.connection.password.as_deref())
+        .header("X-ClickHouse-Database", &config.connection.database)
         .body(sql.to_string())
         .build()
         .map_err(analysis_request_failed)?;
@@ -234,20 +234,26 @@ fn decode_nodes(body: &str) -> Result<Vec<AnalysisNode>> {
 mod tests {
     use reqwest::Client;
     use std::process::Command;
+    use utils::app_config::ClickhouseConfig;
 
     use super::{children_query, decode_nodes, query};
     use crate::domain::analysis::AnalysisMetric;
     use crate::error::WebError;
-    use crate::infrastructure::task_runner::ChConfig;
+    use crate::infrastructure::clickhouse_config::ChConfig;
 
     #[tokio::test]
     async fn invalid_query_url_preserves_typed_http_failure() {
         let config = ChConfig {
-            cluster: None,
-            dsn: "http://[invalid-private-host".into(),
-            username: "private-user".into(),
-            password: "private-password".into(),
-            database: "default".into(),
+            connection: ClickhouseConfig {
+                mode: Default::default(),
+                cluster: None,
+                dial_timeout: 10,
+                read_timeout: 30,
+                dsn: "http://[invalid-private-host".into(),
+                username: "private-user".into(),
+                password: Some("private-password".into()),
+                database: "default".into(),
+            },
             batch_size: 1_000,
         };
         let result = query(&Client::new(), &config, "SELECT 1", &[]).await;

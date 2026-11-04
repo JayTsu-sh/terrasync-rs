@@ -57,7 +57,7 @@ async fn copy_directory_aces(
         }
         Err(e) => {
             error!("Start directory walker failed: {}", e);
-            return Err(AppError::ScanError(format!("Start directory walker failed: {}", e)));
+            return Err(e);
         }
     };
 
@@ -97,6 +97,10 @@ async fn copy_directory_aces(
             }
             _ => {}
         }
+    }
+
+    if let Some(error) = walkdir_iter.take_error() {
+        return Err(error.into());
     }
 
     println!(
@@ -230,7 +234,7 @@ async fn list_directory_security_info(
         }
         Err(e) => {
             error!("Start directory walker failed: {}", e);
-            return Err(AppError::ScanError(format!("Start directory walker failed: {}", e)));
+            return Err(e);
         }
     };
 
@@ -262,6 +266,10 @@ async fn list_directory_security_info(
             }
             _ => {}
         }
+    }
+
+    if let Some(error) = walkdir_iter.take_error() {
+        return Err(error.into());
     }
 
     println!("\nTotal security entries processed: {}", entry_count);

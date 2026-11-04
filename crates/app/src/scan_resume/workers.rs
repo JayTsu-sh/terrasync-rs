@@ -1,9 +1,9 @@
 //! 按 SQL 路径分配有界批次 worker；同一路径串行，检查点等待所有 worker 提交。
 use super::{
-    cancellation::ScanCancellation,
     flush_batch,
     pipeline::{DISPATCH_BATCH, Entries, SaveState},
 };
+use crate::scan::cancellation::ScanCancellation;
 use crate::{
     consumer::{ScanStatistics, observed::Delivery},
     error::{AppError, Result},
@@ -124,7 +124,7 @@ async fn dispatch(
             version_index: entry.history().map(|_| 0),
         };
         let mut hash = FxHasher::default();
-        hash.write(view.path().as_bytes());
+        hash.write(view.sql_path().as_bytes());
         let worker = hash.finish() as usize % senders.len();
         pending[worker].push(Arc::clone(entry));
         if pending[worker].len() >= DISPATCH_BATCH {
@@ -214,6 +214,7 @@ mod tests {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use tokio::time::{Duration, sleep, timeout};
     use tokio_util::sync::CancellationToken;
+    use utils::app_config::ClickHouseMode;
 
     #[tokio::test]
     async fn cancelled_scan_stops_database_workers_without_waiting_for_queue_closure() {
@@ -235,6 +236,8 @@ mod tests {
         let manager = ConsumerManager::new(&config).await.unwrap();
         let mut database = ScanStore::new(
             &ClickHouseConfig {
+                mode: ClickHouseMode::Cluster,
+                cluster: Some("clickhouse".into()),
                 dsn: "http://127.0.0.1:1".into(),
                 database: "cancel_fixture".into(),
                 username: "default".into(),
@@ -242,7 +245,6 @@ mod tests {
                 dial_timeout: 30,
                 read_timeout: 120,
             },
-            Some("clickhouse"),
             "cancel_fixture",
         )
         .unwrap();
@@ -303,6 +305,8 @@ mod tests {
     fn offline_store() -> ScanStore {
         ScanStore::new(
             &ClickHouseConfig {
+                mode: Default::default(),
+                cluster: None,
                 dsn: "http://127.0.0.1:1".into(),
                 database: "routing_fixture".into(),
                 username: "default".into(),
@@ -310,7 +314,6 @@ mod tests {
                 dial_timeout: 1,
                 read_timeout: 1,
             },
-            None,
             "routing_fixture",
         )
         .unwrap()

@@ -50,6 +50,13 @@ pub enum AppError {
     #[error("Scan timestamp conversion error: {0}")]
     ScanTimestampConversion(#[from] TryFromIntError),
 
+    #[error("Cannot lock copy job {job_id}: {source}")]
+    CopyJobLock {
+        job_id: String,
+        #[source]
+        source: TryLockError,
+    },
+
     /// 扫描 job 锁获取失败，保留锁竞争或底层 I/O 原因。
     #[error("Cannot lock scan job {job_id}: {source}")]
     ScanJobLock {

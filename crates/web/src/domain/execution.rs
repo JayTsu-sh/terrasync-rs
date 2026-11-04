@@ -1,3 +1,4 @@
+use super::storage_failure::StorageFailureDetail;
 use serde::{Deserialize, Serialize};
 
 use super::task::TaskStatus;
@@ -57,6 +58,8 @@ pub struct TaskExecution {
     pub stats: Option<ExecutionStats>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error_message: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub storage_error: Option<StorageFailureDetail>,
 }
 
 /// 日志级别

@@ -122,7 +122,11 @@ async fn destination(fail: bool) -> (TempDir, StorageEnum, Arc<MetadataProbe>) {
         .unwrap();
     (
         root,
-        StorageEnum::Local(ConnectedStorage { roles, block_size: 4 }),
+        StorageEnum::Local(ConnectedStorage {
+            roles,
+            block_size: 4,
+            reconnect_config: None,
+        }),
         probe,
     )
 }

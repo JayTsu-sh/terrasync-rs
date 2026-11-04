@@ -1,16 +1,16 @@
 use std::sync::{Arc, OnceLock};
-use storage_adapter::TransferMode;
+use storage_adapter::{StorageError, TransferMode};
 
 use app::error::AppError;
-use app::scan_resume::{clear_cluster_scan, scan_execution_is_incremental, scan_with_resume_settings};
+use app::scan::{ScanRequest, scan};
+use app::scan_resume::{clear_scan, scan_execution_is_incremental};
 use dashmap::{DashMap, mapref::entry::Entry};
 use std::time::Duration;
 use tokio::select;
 use tokio::sync::Semaphore;
 use tokio::time::{sleep, timeout};
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, error, info};
-use utils::app_config::AppConfig;
+use tracing::{error, info};
 
 use crate::domain::endpoint::Endpoint;
 use crate::domain::execution::{ExecutionType, TaskExecution};
@@ -18,9 +18,11 @@ use crate::domain::path::MigrationPath;
 use crate::domain::repository::{
     ConfigRepository, EndpointRepository, ExecutionRepository, PathRepository, TaskRepository,
 };
+use crate::domain::storage_failure::StorageFailureDetail;
 use crate::domain::task::{MigrationTask, TaskConfig, TaskStatus, TaskType};
 use crate::error::{Result, WebError};
 use crate::infrastructure::clickhouse_client;
+use crate::infrastructure::clickhouse_config::apply_db_config_from_sqlite;
 use crate::infrastructure::db::sanitize_job_id;
 
 /// 进度回调基础 URL（web 层在绑定端口后设置，CLI 模式不存在此值）
@@ -163,12 +165,13 @@ impl TaskRunner {
             finished_at: None,
             stats: None,
             error_message: None,
+            storage_error: None,
         };
         self.execution_repo.save(&execution).await?;
 
         // 更新任务状态
         self.task_repo
-            .update_status(&task.id, TaskStatus::Running, None)
+            .update_status(&task.id, TaskStatus::Running, None, None)
             .await?;
 
         // 在后台 spawn 任务执行
@@ -224,12 +227,27 @@ impl TaskRunner {
                 .await;
 
                 let (final_status, error_msg) = task_outcome(&result, &cancel_token);
+                let storage_error = if final_status == TaskStatus::Failed {
+                    match &result {
+                        Err(WebError::AppError(AppError::StorageError(StorageError::RemoteScan(failure)))) => {
+                            Some(StorageFailureDetail::from(failure.as_ref()))
+                        }
+                        _ => None,
+                    }
+                } else {
+                    None
+                };
                 if let Some(message) = &error_msg {
                     error!("Task {task_id} failed: {message}");
                 }
 
                 if let Err(e) = task_repo
-                    .update_status(&task_id, final_status.clone(), error_msg.as_deref())
+                    .update_status(
+                        &task_id,
+                        final_status.clone(),
+                        error_msg.as_deref(),
+                        storage_error.as_ref(),
+                    )
                     .await
                 {
                     error!("Failed to update task status: {e}");
@@ -237,7 +255,13 @@ impl TaskRunner {
 
                 // stats 由 is_final 回调写入，此处传 None，COALESCE 保留已有数据
                 if let Err(e) = execution_repo
-                    .update_status(&execution_id, final_status, None, error_msg.as_deref())
+                    .update_status(
+                        &execution_id,
+                        final_status,
+                        None,
+                        error_msg.as_deref(),
+                        storage_error.as_ref(),
+                    )
                     .await
                 {
                     error!("Failed to update execution status: {e}");
@@ -328,7 +352,7 @@ async fn run_migration_task(
     select! {
         biased;
         _=cancel_token.cancelled()=>return Err(AppError::ObservationScanCancelled.into()),
-        result=clickhouse_client::test_connectivity(&ch_cfg.dsn, &ch_cfg.username, &ch_cfg.password, &ch_cfg.database)=>
+        result=clickhouse_client::test_connectivity(&ch_cfg.connection.dsn, &ch_cfg.connection.username, ch_cfg.connection.password.as_deref().unwrap_or(""), &ch_cfg.connection.database)=>
             result.map_err(|_| WebError::ConnectionTestFailed("请先在设置中检查 ClickHouse 数据库配置".to_string()))?,
     }
 
@@ -336,18 +360,18 @@ async fn run_migration_task(
 
     match task_type {
         TaskType::Scan => {
-            scan_with_resume_settings(
+            scan(ScanRequest {
                 job_id,
                 job_dir,
-                source_url,
-                task_config.depth,
-                &task_config.match_expr,
-                &task_config.exclude_expr,
-                format!("gui:scan {source_url}"),
-                cancel_token,
+                path: source_url,
+                depth: task_config.depth,
+                include: &task_config.match_expr,
+                exclude: &task_config.exclude_expr,
+                command: format!("gui:scan {source_url}"),
+                cancel: cancel_token,
                 callback_url,
-                task_config.concurrency,
-            )
+                concurrency: task_config.concurrency,
+            })
             .await?;
             Ok(())
         }
@@ -418,173 +442,8 @@ async fn drop_old_scan_tables(job_id: &str) {
 }
 
 async fn drop_scan_tables(job_id: &str) -> Result<()> {
-    let app_config = AppConfig::fetch()?;
-    if !app_config.database.enabled {
-        return Err(WebError::ValidationError("ClickHouse 未配置".into()));
-    }
-    if app_config
-        .database
-        .clickhouse
-        .cluster
-        .as_ref()
-        .is_some_and(|value| !value.is_empty())
-    {
-        clear_cluster_scan(job_id).await?;
-        return Ok(());
-    }
-    let cfg = &app_config.database.clickhouse;
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(30))
-        .build()
-        .map_err(|source| WebError::ClickHouseRequestFailed {
-            message: "无法初始化数据库连接",
-            source,
-        })?;
-    for prefix in [
-        "base",
-        "state",
-        "scan_state",
-        "incremental",
-        "scan_resume",
-        "scan_resume_batch",
-        "scan_resume_event_keys",
-        "scan_resume_delete_keys",
-    ] {
-        let table = format!("{prefix}_{job_id}");
-        let response = client
-            .post(format!("{}/", cfg.dsn.trim_end_matches('/')))
-            .basic_auth(&cfg.username, cfg.password.as_deref())
-            .header("X-ClickHouse-Database", &cfg.database)
-            .body(format!("DROP TABLE IF EXISTS `{table}`"))
-            .send()
-            .await
-            .map_err(|source| WebError::ClickHouseRequestFailed {
-                message: "清理旧扫描失败，请检查数据库连接后重试",
-                source,
-            })?;
-        if !response.status().is_success() {
-            return Err(WebError::ValidationError("清理旧扫描失败，未启动新扫描".into()));
-        }
-    }
+    clear_scan(job_id).await?;
     Ok(())
-}
-
-/// 从 `SQLite` 读取的 `ClickHouse` 配置
-pub(crate) struct ChConfig {
-    pub(crate) cluster: Option<String>,
-    pub(crate) dsn: String,
-    pub(crate) username: String,
-    pub(crate) password: String,
-    pub(crate) database: String,
-    pub(crate) batch_size: u32,
-}
-
-/// 从 `SQLite` `system_config` 表一次性读取所有 `ClickHouse` 配置
-pub(crate) async fn load_ch_config(config_repo: &dyn ConfigRepository) -> Result<Option<ChConfig>> {
-    let all = config_repo.get_all().await?;
-    let get = |key: &str| -> Option<String> { all.iter().find(|(k, _)| k == key).map(|(_, v)| strip_json_quotes(v)) };
-
-    let host = get("clickhouse_host").filter(|h| !h.is_empty());
-    let Some(host) = host else {
-        return Ok(None);
-    };
-
-    let port_str = get("clickhouse_port").unwrap_or_else(|| "8123".to_string());
-    let port: u16 = port_str
-        .parse()
-        .map_err(|_| WebError::ValidationError(format!("clickhouse_port 必须是有效端口号: {port_str}")))?;
-    let username = get("clickhouse_user").unwrap_or_else(|| "default".to_string());
-    let password = get("clickhouse_password").unwrap_or_default();
-    let database = get("clickhouse_database").unwrap_or_else(|| "default".to_string());
-    let batch_size = get("clickhouse_batch_size")
-        .and_then(|v| v.parse::<u32>().ok())
-        .unwrap_or(800_000);
-
-    // 校验 host 合法性：仅允许合法主机名或 IP 地址
-    if host.contains('/')
-        || host.contains('?')
-        || host.contains('#')
-        || host.contains('@')
-        || host.contains('\n')
-        || host.contains('\r')
-        || host.contains('\0')
-    {
-        return Err(WebError::ValidationError(format!(
-            "clickhouse_host 包含非法字符: {host}"
-        )));
-    }
-    // 校验 database 和 username 不含 HTTP header 注入字符
-    if database.contains('\n') || database.contains('\r') || database.contains('\0') {
-        return Err(WebError::ValidationError(format!(
-            "clickhouse_database 包含非法字符: {database}"
-        )));
-    }
-    if username.contains('\n') || username.contains('\r') || username.contains('\0') {
-        return Err(WebError::ValidationError(format!(
-            "clickhouse_user 包含非法字符: {username}"
-        )));
-    }
-    let cluster = get("clickhouse_cluster")
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty());
-    if cluster
-        .as_ref()
-        .is_some_and(|name| !name.bytes().all(|ch| ch.is_ascii_alphanumeric() || ch == b'_'))
-    {
-        return Err(WebError::ValidationError(
-            "ClickHouse 集群名称只能包含字母、数字和下划线".into(),
-        ));
-    }
-    let dsn = format!("http://{host}:{port}");
-    Ok(Some(ChConfig {
-        cluster,
-        dsn,
-        username,
-        password,
-        database,
-        batch_size,
-    }))
-}
-
-/// 从 `SQLite` 读取 `ClickHouse` 配置并覆盖 `AppConfig` 全局配置，返回读取到的配置
-///
-/// 在以下时机调用：
-/// - 服务启动时（加载已保存的配置）
-/// - 用户通过 API 修改 `ClickHouse` 配置后
-/// - 任务执行前（确保使用最新配置）
-pub(crate) async fn apply_db_config_from_sqlite(config_repo: &dyn ConfigRepository) -> Result<Option<ChConfig>> {
-    let Some(cfg) = load_ch_config(config_repo).await? else {
-        return Ok(None);
-    };
-
-    AppConfig::override_with(|c| {
-        c.database.enabled = true;
-        c.database.r#type = "clickhouse".to_string();
-        c.database.batch_size = cfg.batch_size;
-        c.database.clickhouse.dsn.clone_from(&cfg.dsn);
-        c.database.clickhouse.username.clone_from(&cfg.username);
-        c.database.clickhouse.password = Some(cfg.password.clone()).filter(|s| !s.is_empty());
-        c.database.clickhouse.database.clone_from(&cfg.database);
-        c.database.clickhouse.cluster.clone_from(&cfg.cluster);
-    })?;
-
-    debug!(
-        "[TaskRunner] Applied ClickHouse config: dsn={}, db={}",
-        cfg.dsn, cfg.database
-    );
-
-    Ok(Some(cfg))
-}
-
-/// `SQLite` 中 `value_json` 存的是 JSON 值，字符串带引号（如 `"http://..."`），需要去掉
-fn strip_json_quotes(s: &str) -> String {
-    serde_json::from_str::<String>(s).unwrap_or_else(|_| {
-        tracing::warn!(
-            "[ConfigRepo] Config value is not a JSON string, using raw (len={})",
-            s.len()
-        );
-        s.to_string()
-    })
 }
 
 #[cfg(test)]

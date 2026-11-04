@@ -61,7 +61,7 @@ where
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::{DatabaseError, scan_store::with_scan_cancellation};
     use clickhouse::{Client, Compression};
@@ -92,7 +92,7 @@ mod tests {
         assert_eq!(requests.len(), 1);
     }
 
-    async fn server(responses: Vec<(u16, Vec<u8>)>) -> (String, JoinHandle<Vec<String>>) {
+    pub(crate) async fn server(responses: Vec<(u16, Vec<u8>)>) -> (String, JoinHandle<Vec<String>>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let task = tokio::spawn(async move {

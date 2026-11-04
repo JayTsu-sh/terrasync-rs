@@ -215,8 +215,8 @@ pub enum Commands {
         #[arg(short, long)]
         id: Option<String>,
 
-        /// 启用检查点，并使用同一 --id 恢复中断的扫描。
-        /// 需要 ClickHouse；首次及恢复调用均须传入该参数。
+        /// 要求启用 ClickHouse，并用同一 --id 继续中断的扫描。
+        /// 落库扫描始终保存检查点，无需此参数也会自动继续。
         #[arg(long, requires = "id")]
         resume: bool,
 

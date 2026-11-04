@@ -2,9 +2,10 @@
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 
 use storage_adapter::storage_enum::StorageEnum;
-use storage_adapter::{ErrorEvent, StorageEntryMessage, WalkDirAsyncIterator};
+use storage_adapter::{ErrorEvent, StorageEntryMessage, StorageError, WalkDirAsyncIterator};
 // 外部crate
 use tracing::{Instrument, error, info, info_span};
 
@@ -16,22 +17,38 @@ use crate::storage_factory::{StorageRole, create_storage_for_role};
 /// 目录遍历器 - 提供通用的目录遍历功能
 pub struct DirectoryWalker {
     config: ScanConfig,
+    operation_timeout: Option<std::time::Duration>,
+    recovery_window: Option<std::time::Duration>,
 }
 
 impl DirectoryWalker {
     /// 创建一个新的目录遍历器
     pub fn new(config: ScanConfig) -> Self {
-        Self { config }
+        Self {
+            config,
+            operation_timeout: None,
+            recovery_window: None,
+        }
+    }
+
+    async fn source_storage(&self) -> Result<StorageEnum> {
+        create_storage_for_role(&self.config.path, None, false, StorageRole::Source).await
     }
 
     /// 开始遍历目录
     pub async fn walk(&self) -> Result<WalkDirAsyncIterator> {
         // 检查是否有file_list参数
         if let Some(file_list_path) = &self.config.file_list {
+            if self.operation_timeout.is_some() || self.recovery_window.is_some() {
+                return Err(AppError::ConfigError(
+                    "file_list metadata enumeration does not support directory traversal timeout/recovery options"
+                        .into(),
+                ));
+            }
             info!("Using file list from: {}", file_list_path);
 
             // 创建存储实例
-            let storage = create_storage_for_role(&self.config.path, None, false, StorageRole::Source).await?;
+            let storage = self.source_storage().await?;
 
             // 从文件列表创建迭代器
             walkdir_from_file_list(storage, file_list_path)
@@ -48,13 +65,16 @@ impl DirectoryWalker {
                 "Attempting to create storage for directory walk with concurrency: {}, path: {}",
                 self.config.concurrency, self.config.path
             );
-            let storage = create_storage_for_role(&self.config.path, None, false, StorageRole::Source)
+            let storage = self
+                .source_storage()
                 .await
                 .map_err(|e| AppError::ScanError(format!("Failed to create storage: {e}")))?;
             let walkdir_iter = storage
                 .walkdir(
                     None,
                     storage_adapter::WalkOptions {
+                        operation_timeout: self.operation_timeout,
+                        recovery_window: self.recovery_window,
                         depth,
                         match_expressions: self.config.match_expressions.clone(),
                         exclude_expressions: self.config.exclude_expressions.clone(),
@@ -64,8 +84,7 @@ impl DirectoryWalker {
                         package_depth: self.config.package_depth,
                     },
                 )
-                .await
-                .map_err(|e| AppError::ScanError(format!("Failed to start walkdir: {e}")))?;
+                .await?;
 
             Ok(walkdir_iter)
         }
@@ -115,6 +134,8 @@ fn walkdir_from_file_list(storage: StorageEnum, file_list_path: &str) -> Result<
     });
 
     let (tx, rx) = async_channel::bounded(1000);
+    let terminal_error = Arc::new(Mutex::new(None));
+    let stored_error = terminal_error.clone();
 
     // 启动一个异步任务，遍历文件列表并发送StorageEntryMessage
     let span = info_span!("dir_walker");
@@ -135,33 +156,43 @@ fn walkdir_from_file_list(storage: StorageEnum, file_list_path: &str) -> Result<
                             }
                             Err(e) => {
                                 error!("Failed to get metadata for file {:?}: {}", file_path, e);
+                                let reason = e.to_string();
+                                stored_error
+                                    .lock()
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                    .get_or_insert(e);
                                 // 发送错误消息到通道
                                 let msg = StorageEntryMessage::Error {
                                     event: ErrorEvent::Scan,
                                     path: file_path,
                                     entry: None,
-                                    reason: e.to_string(),
+                                    reason,
                                 };
                                 if let Err(e) = tx.send(msg).await {
                                     error!("Failed to send error: {}", e);
-                                    break;
                                 }
+                                break;
                             }
                         }
                     }
                     Err(e) => {
                         error!("Failed to read file path: {}", e);
+                        let reason = e.to_string();
+                        stored_error
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .get_or_insert(StorageError::from(e));
                         // 发送错误消息到通道
                         let msg = StorageEntryMessage::Error {
                             event: ErrorEvent::Scan,
                             path: PathBuf::new(),
                             entry: None,
-                            reason: e.to_string(),
+                            reason,
                         };
                         if let Err(e) = tx.send(msg).await {
                             error!("Failed to send error: {}", e);
-                            break;
                         }
+                        break;
                     }
                 }
             }
@@ -169,11 +200,71 @@ fn walkdir_from_file_list(storage: StorageEnum, file_list_path: &str) -> Result<
         .instrument(span),
     );
 
-    Ok(WalkDirAsyncIterator::new(rx))
+    Ok(WalkDirAsyncIterator::new(rx).with_error(terminal_error))
 }
 
 /// 通用的目录遍历函数 - 作为便捷的包装器
 pub async fn walkdir(config: ScanConfig) -> Result<storage_adapter::WalkDirAsyncIterator> {
     let walker = DirectoryWalker::new(config);
     walker.walk().await
+}
+
+/// 扫描显式选择遍历恢复预算；普通遍历由其调用方选择策略。
+pub async fn scan_walkdir(
+    config: ScanConfig, operation_timeout: std::time::Duration, recovery_window: std::time::Duration,
+) -> Result<WalkDirAsyncIterator> {
+    DirectoryWalker {
+        config,
+        operation_timeout: Some(operation_timeout),
+        recovery_window: Some(recovery_window),
+    }
+    .walk()
+    .await
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+    use crate::{
+        config::initialize_scan_config,
+        scan::ScanType,
+        storage_factory::{StorageRole, create_storage_for_role},
+    };
+    use std::time::Duration;
+    use tokio::fs;
+
+    #[tokio::test]
+    async fn file_list_cannot_silently_ignore_directory_recovery_options() -> Result<()> {
+        let config = initialize_scan_config(
+            "file-list-options",
+            "unused",
+            0,
+            ScanType::Full,
+            &None,
+            &None,
+            1,
+            false,
+            &Some("unused-list".into()),
+            false,
+            0,
+        )?;
+        assert!(
+            matches!(scan_walkdir(config, Duration::from_secs(1), Duration::from_secs(3)).await,
+            Err(AppError::ConfigError(reason)) if reason.contains("file_list"))
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn file_list_metadata_failure_is_not_a_successful_end_of_enumeration() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let paths = root.path().join("files.txt");
+        fs::write(&paths, b"missing-file\n").await?;
+        let storage = create_storage_for_role(root.path().to_str().unwrap(), None, false, StorageRole::Source).await?;
+        let iterator = walkdir_from_file_list(storage, paths.to_str().unwrap())?;
+        while iterator.next().await.is_some() {}
+        assert!(iterator.take_error().is_some_and(|error| error.is_not_found()));
+        Ok(())
+    }
 }

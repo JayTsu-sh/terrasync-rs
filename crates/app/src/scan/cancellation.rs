@@ -1,5 +1,6 @@
 //! 取消时持续终止本次执行的查询，直到本地工作任务全部退出。
 use crate::error::{AppError, Result};
+use data_mover::traversal::ScanFailureSignal;
 use db::{
     DatabaseError,
     scan_store::{ScanQueryCancellation, with_scan_cancellation},
@@ -14,51 +15,66 @@ use tokio_util::{sync::CancellationToken, task::AbortOnDropHandle};
 use tracing::warn;
 
 #[derive(Clone)]
-pub(super) struct ScanCancellation {
+pub(crate) struct ScanCancellation {
     requested: CancellationToken,
 }
 
 impl ScanCancellation {
-    pub(super) fn new(requested: CancellationToken) -> Self {
-        Self { requested }
-    }
-    pub(super) fn child(&self) -> Self {
+    pub(crate) fn new(requested: CancellationToken) -> Self {
         Self {
-            requested: self.requested.child_token(),
+            requested: requested.child_token(),
         }
     }
-    pub(super) fn token(&self) -> &CancellationToken {
+    pub(crate) fn watch_storage_failure(&self, failure: ScanFailureSignal) -> AbortOnDropHandle<()> {
+        let control = self.clone();
+        AbortOnDropHandle::new(tokio::spawn(async move {
+            failure.failed().await;
+            control.cancel();
+        }))
+    }
+    pub(crate) fn token(&self) -> &CancellationToken {
         &self.requested
     }
-    pub(super) fn cancel(&self) {
+    pub(crate) fn cancel(&self) {
         self.requested.cancel();
     }
-    pub(super) async fn cancelled(&self) {
+    pub(crate) async fn cancelled(&self) {
         self.requested.cancelled().await;
     }
-    pub(super) fn check(&self) -> Result<()> {
+    pub(crate) fn check(&self) -> Result<()> {
         if self.requested.is_cancelled() {
             Err(AppError::ObservationScanCancelled)
         } else {
             Ok(())
         }
     }
+    /// 流式读取和输出等待可以直接中止；数据库写入仍使用 operation 确认完成。
+    pub(crate) async fn interrupt<T>(&self, work: impl Future<Output = T>) -> Result<T> {
+        self.check()?;
+        select! {
+            biased;
+            () = self.cancelled() => Err(AppError::ObservationScanCancelled),
+            result = work => Ok(result),
+        }
+    }
     /// 取消后禁止新语句和重试，已发出的请求必须等待响应，不能因空匹配 KILL 提前丢弃。
-    pub(super) async fn operation<T, E: Into<AppError>>(
+    pub(crate) async fn operation<T, E: Into<AppError>>(
         &self, work: impl Future<Output = OperationResult<T, E>>,
     ) -> Result<T> {
         self.check()?;
-        match with_scan_cancellation(self.requested.clone(), work)
+        let result = with_scan_cancellation(self.requested.clone(), work)
             .await
-            .map_err(Into::into)
-        {
+            .map_err(Into::into);
+        // 已发出的请求先确认结束，再报告取消，禁止把 KILL 的副作用冒充原始存储故障。
+        self.check()?;
+        match result {
             Err(AppError::DatabaseError(DatabaseError::ScanCancelled)) => Err(AppError::ObservationScanCancelled),
             result => result,
         }
     }
 }
 
-pub(super) async fn scope<T>(
+pub(crate) async fn scope<T>(
     queries: ScanQueryCancellation, cancel: ScanCancellation, work: impl Future<Output = Result<T>>,
 ) -> Result<T> {
     let finished = CancellationToken::new();
@@ -88,7 +104,9 @@ pub(super) async fn scope<T>(
     }));
     let result = work.await;
     finished.cancel();
-    watcher.await?;
+    // 所有业务请求均已确认结束，此时终止仅针对本执行的管理轮询。
+    watcher.abort();
+    let _ = watcher.await;
     result
 }
 
@@ -108,6 +126,26 @@ mod tests {
         sync::{Notify, oneshot},
         task::JoinSet,
     };
+
+    #[test]
+    fn internal_storage_failure_cancellation_keeps_the_user_request_active() {
+        let user = CancellationToken::new();
+        let scope = ScanCancellation::new(user.clone());
+        scope.cancel();
+        assert!(scope.token().is_cancelled());
+        assert!(
+            !user.is_cancelled(),
+            "a storage failure must not be classified as user cancellation"
+        );
+    }
+
+    #[test]
+    fn a_user_cancel_still_reaches_the_internal_scan_scope() {
+        let user = CancellationToken::new();
+        let scope = ScanCancellation::new(user.clone());
+        user.cancel();
+        assert!(scope.token().is_cancelled());
+    }
 
     #[tokio::test]
     async fn empty_kill_does_not_finish_a_request_still_waiting_for_its_response() {
@@ -160,6 +198,8 @@ mod tests {
             }
         });
         let config = ClickHouseConfig {
+            mode: Default::default(),
+            cluster: None,
             dsn: url.clone(),
             database: "fixture".into(),
             username: "default".into(),
@@ -167,7 +207,7 @@ mod tests {
             dial_timeout: 1,
             read_timeout: 1,
         };
-        let store = ScanStore::new(&config, None, "fixture").unwrap();
+        let store = ScanStore::new(&config, "fixture").unwrap();
         let client = Client::default().with_url(url);
         let cancel = ScanCancellation::new(CancellationToken::new());
         let operation_cancel = cancel.clone();
@@ -192,10 +232,59 @@ mod tests {
         );
         assert!(!completed.load(Ordering::SeqCst));
         release.notify_one();
-        assert!(timeout(Duration::from_secs(2), work).await.unwrap().is_ok());
+        assert!(matches!(
+            timeout(Duration::from_secs(2), work).await.unwrap(),
+            Err(AppError::ObservationScanCancelled)
+        ));
         assert!(completed.load(Ordering::SeqCst));
         server.abort();
         let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn finished_work_does_not_wait_for_a_stalled_management_kill() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let received = Arc::new(Notify::new());
+        let seen = received.clone();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 4096];
+            assert!(socket.read(&mut request).await.unwrap() > 0);
+            seen.notify_one();
+            std::future::pending::<()>().await;
+        });
+        let config = ClickHouseConfig {
+            mode: Default::default(),
+            cluster: None,
+            dsn: url,
+            database: "fixture".into(),
+            username: "default".into(),
+            password: None,
+            dial_timeout: 1,
+            read_timeout: 1,
+        };
+        let store = ScanStore::new(&config, "fixture").unwrap();
+        let user = CancellationToken::new();
+        let cancel = ScanCancellation::new(user.clone());
+        let stop = cancel.clone();
+        let result = timeout(
+            Duration::from_millis(200),
+            scope(store.query_cancellation(), cancel, async move {
+                stop.cancel();
+                received.notified().await;
+                Err::<(), _>(AppError::ScanError("all owned requests have finished".into()))
+            }),
+        )
+        .await;
+        server.abort();
+        let _ = server.await;
+        assert!(
+            result.is_ok(),
+            "management polling must not extend an already quiescent scan"
+        );
+        assert!(matches!(result.unwrap(), Err(AppError::ScanError(_))));
+        assert!(!user.is_cancelled());
     }
 
     struct Dropped(Arc<AtomicBool>);
@@ -224,7 +313,7 @@ mod tests {
         assert!(!dropped.load(Ordering::SeqCst));
         complete.send(()).unwrap();
         let result = timeout(Duration::from_millis(200), operation).await.unwrap();
-        assert!(result.is_ok());
+        assert!(matches!(result, Err(AppError::ObservationScanCancelled)));
         assert!(dropped.load(Ordering::SeqCst));
     }
 

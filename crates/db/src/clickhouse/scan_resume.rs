@@ -48,7 +48,7 @@ impl ScanResumeState {
         self.validate_envelope()?;
         if self.request_key != request_key {
             return Err(DatabaseError::ConfigError(
-                "Scan resume source/options differ from the saved scan; use the original source/options or omit --resume to start a fresh scan".into(),
+                "Scan resume source/options differ from the saved scan; use the original source/options, reset this job's scan records, or choose a new job id".into(),
             ));
         }
         Ok(())
@@ -173,6 +173,7 @@ impl ClickHouseDatabase {
     /// 恢复现有工作代次，保留已扫描条目的代次。
     /// 返回 true 表示前一个进程退出前已提交最终代次。
     pub async fn restore_resume_generation(&self, state: &ScanResumeState) -> Result<bool> {
+        self.validate_scan_base_table().await?;
         let committed = self
             .query_scan_state()
             .await?

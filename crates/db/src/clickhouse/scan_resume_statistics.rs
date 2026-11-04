@@ -2,7 +2,7 @@
 use super::*;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-#[derive(Debug, Deserialize, clickhouse::Row)]
+#[derive(Debug, Deserialize, PartialEq, Eq, clickhouse::Row)]
 pub struct ScanResumeSummary {
     pub dirs: u64,
     pub dir_bytes: i64,
@@ -15,12 +15,14 @@ pub struct ScanResumeSummary {
     pub total_name_length: i64,
     pub max_name_length: u64,
 }
+pub type ScanEventStatistics = Vec<(String, bool, bool, u64, i64)>;
+
 pub struct ScanResumeStatistics {
     pub summary: ScanResumeSummary,
     pub extensions: Vec<(String, i64, u64)>,
     pub ages: Vec<(u8, i64, u64)>,
     pub sizes: Vec<(u8, i64, u64)>,
-    pub events: Vec<(String, bool, bool, u64, i64)>,
+    pub events: ScanEventStatistics,
 }
 impl ClickHouseDatabase {
     pub async fn resume_statistics(&self, generation: u8, event_time: Option<i64>) -> Result<ScanResumeStatistics> {
@@ -37,9 +39,7 @@ impl ClickHouseDatabase {
         let sizes = self.sync_client.query(&format!("SELECT toUInt8(multiIf(size<4096,0,size<65536,1,size<131072,2,size<262144,3,size<524288,4,size<1048576,5,size<2097152,6,size<16777216,7,size<67108864,8,size<134217728,9,size<536870912,10,11)) AS bucket, toInt64(sum(size)), count() {scope} AND {regular} GROUP BY bucket"))
             .fetch_all::<(u8,i64,u64)>().await?;
         let events = if let Some(epoch) = event_time {
-            let events_table = get_incremental_scan_base_table_name(&self.job_id);
-            self.sync_client.query(&format!("SELECT operation_type,is_dir,is_symlink,count(),toInt64(sum(size)) FROM {events_table} FINAL WHERE toUnixTimestamp64Nano(create_at)>=? GROUP BY operation_type,is_dir,is_symlink"))
-                .bind(epoch).fetch_all::<(String,bool,bool,u64,i64)>().await?
+            self.resume_event_statistics(epoch).await?
         } else {
             Vec::new()
         };
@@ -50,5 +50,10 @@ impl ClickHouseDatabase {
             sizes,
             events,
         })
+    }
+    pub async fn resume_event_statistics(&self, epoch: i64) -> Result<ScanEventStatistics> {
+        let events_table = get_incremental_scan_base_table_name(&self.job_id);
+        self.sync_client.query(&format!("SELECT operation_type,is_dir,is_symlink,count(),toInt64(sum(size)) FROM {events_table} FINAL WHERE toUnixTimestamp64Nano(create_at)>=? GROUP BY operation_type,is_dir,is_symlink"))
+            .bind(epoch).fetch_all::<(String,bool,bool,u64,i64)>().await.map_err(Into::into)
     }
 }

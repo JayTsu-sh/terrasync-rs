@@ -136,12 +136,13 @@ fn progress_report_to_snapshot(report: &ProgressReport) -> serde_json::Value {
         }),
         ProgressDetail::Incremental {
             scanned_files,
+            scanned_symlinks,
             scanned_dirs,
             scanned_size,
             error_count,
             ..
         } => serde_json::json!({
-            "scanned_files": scanned_files,
+            "scanned_files": scanned_files.saturating_add(*scanned_symlinks),
             "scanned_dirs": scanned_dirs,
             "total_bytes": scanned_size,
             "error_count": error_count,
@@ -166,5 +167,27 @@ pub async fn update_progress(
     match state.task_service.update_progress(&id, report).await {
         Ok(()) => Json(()).into_response(),
         Err(e) => e.into_response(),
+    }
+}
+
+#[cfg(test)]
+mod progress_tests {
+    use super::*;
+
+    #[test]
+    fn incremental_snapshot_counts_links_like_the_full_snapshot() -> Result<()> {
+        let report: ProgressReport = serde_json::from_value(serde_json::json!({
+            "job_id":"links", "job_type":"IncrementalScan", "elapsed_secs":1.0,
+            "speed_bytes_per_sec":0.0, "is_final":true,
+            "detail":{"kind":"Incremental", "scanned_files":10, "scanned_dirs":2,
+                "scanned_symlinks":4, "scanned_size":0, "transferred_bytes":0,
+                "error_count":0, "new_count":0, "new_size":0, "changed_count":0,
+                "changed_size":0, "deleted_count":0, "deleted_size":0,
+                "renamed_count":0, "renamed_size":0}
+        }))?;
+        let snapshot = progress_report_to_snapshot(&report);
+        assert_eq!(snapshot["scanned_files"], 14);
+        assert_eq!(snapshot["scanned_dirs"], 2);
+        Ok(())
     }
 }

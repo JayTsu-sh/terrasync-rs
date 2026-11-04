@@ -341,6 +341,8 @@ mod tests {
             .await
             .unwrap();
         let config = ClickHouseConfig {
+            mode: Default::default(),
+            cluster: None,
             dsn,
             dial_timeout: 10,
             read_timeout: 30,
@@ -348,7 +350,7 @@ mod tests {
             username: user,
             password,
         };
-        let mut sink = ClickHouseDatabase::new(&config, "public_seam");
+        let mut sink = ClickHouseDatabase::new(&config, "public_seam").unwrap();
         sink.initialize().await.unwrap();
 
         let (producer, session) = TraversalSession::bounded(NonZeroUsize::new(1).unwrap(), CancellationToken::new());

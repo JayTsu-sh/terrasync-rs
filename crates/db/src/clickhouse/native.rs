@@ -2,12 +2,29 @@ use super::*;
 use crate::native_scan::NativeScanAccess;
 use crate::native_scan_record::{NativeScanKey, NativeScanRecord, OBSERVED_COLUMNS, event_records};
 use crate::native_scan_record::{final_event_records, incremental_record};
+use crate::scan_metadata::{CandidateMetadataCache, missing_hash_columns};
 use crate::scan_store::ScanFinalEvent;
 use rustc_hash::{FxHashMap, FxHashSet};
 use smol_str::SmolStr;
 use storage_adapter::observed_scan::{ObservedScanEvent, ObservedView};
 
 impl ClickHouseDatabase {
+    pub(crate) async fn prepare_native_schema(&self) -> Result<()> {
+        let tables = [
+            get_scan_base_table_name(&self.job_id),
+            format!("scan_resume_batch_{}", sanitize_job_id(&self.job_id)),
+        ];
+        for table in missing_hash_columns(&self.sync_client, &tables).await? {
+            check_scan_cancellation()?;
+            self.sync_client
+                .query(&format!(
+                    "ALTER TABLE {table} ADD COLUMN IF NOT EXISTS metadata_hash Nullable(String) DEFAULT NULL"
+                ))
+                .execute()
+                .await?;
+        }
+        Ok(())
+    }
     pub(crate) async fn write_native_keys(&self, entries: &[Arc<ObservedEntry>]) -> Result<()> {
         check_scan_cancellation()?;
         if entries.is_empty() {
@@ -30,10 +47,6 @@ impl ClickHouseDatabase {
             client: &self.sync_client,
             base: get_scan_base_table_name(&self.job_id),
             events: get_incremental_scan_base_table_name(&self.job_id),
-            events_round: format!(
-                "toUnixTimestamp64Nano(create_at)>=(SELECT event_time FROM scan_resume_{} FINAL WHERE id=1)",
-                sanitize_job_id(&self.job_id)
-            ),
             stage: self.scan_temp_table_name.clone().unwrap_or_default(),
             scope: "1".into(),
             stage_scope: "1".into(),
@@ -44,6 +57,12 @@ impl ClickHouseDatabase {
         })
     }
     pub(crate) async fn write_native(&self, entries: &[Arc<ObservedEntry>], temporary: bool) -> Result<()> {
+        self.write_native_candidates(entries, temporary, &[]).await
+    }
+
+    pub(crate) async fn write_native_candidates(
+        &self, entries: &[Arc<ObservedEntry>], temporary: bool, candidates: &[ObservedScanEvent],
+    ) -> Result<()> {
         check_scan_cancellation()?;
         if entries.is_empty() {
             return Ok(());
@@ -51,11 +70,14 @@ impl ClickHouseDatabase {
         let access = self.native_access().await?;
         let table = if temporary { &access.stage } else { &access.base };
         let generation = self.get_cached_scan_state().await?;
+        let cache = CandidateMetadataCache::new(candidates).await?;
         let client = self.sync_client.clone().with_validation(false);
         let mut insert = client.insert::<NativeScanRecord>(table).await?;
         for entry in entries {
             for view in ObservedView::all(entry) {
-                insert.write(&NativeScanRecord::capture(view, generation)?).await?;
+                let mut record = NativeScanRecord::capture(view, generation)?;
+                cache.apply(&mut record);
+                insert.write(&record).await?;
             }
         }
         insert.end().await?;

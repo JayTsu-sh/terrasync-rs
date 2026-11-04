@@ -48,7 +48,7 @@ mod scan_resume_cli_tests {
     }
 
     #[test]
-    fn ordinary_scan_remains_opt_in() {
+    fn ordinary_scan_does_not_require_the_resume_flag() {
         let parsed = Cli::try_parse_from(["terrasync", "scan", "."]);
         assert!(matches!(
             parsed.map(|cli| cli.command),
