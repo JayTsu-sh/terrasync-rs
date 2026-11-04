@@ -270,6 +270,7 @@ fn text_prefix(text: &str, limit: usize) -> &str {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
 
