@@ -145,9 +145,7 @@ async fn isolated_generation_case(mode: ClickHouseMode) -> Result<()> {
         password: std::env::var("LAB_CLICKHOUSE_PASSWORD").ok().filter(|s| !s.is_empty()),
     };
     config.cluster_name()?;
-    let mut admin = Client::default()
-        .with_url(&config.dsn)
-        .with_user(&config.username);
+    let mut admin = Client::default().with_url(&config.dsn).with_user(&config.username);
     if let Some(password) = &config.password {
         admin = admin.with_password(password);
     }
