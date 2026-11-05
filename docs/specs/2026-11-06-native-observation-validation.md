@@ -154,6 +154,24 @@ StorageEnum 的五个变体都包装同一个连接对象，现已删除枚举�
 
 原生 Pending 输入取消回归也已修复：取消交付 typed Cancelled／Write／Transient，继续 await backend 写入以收束已有操作。它验证等待下一输入块的取消，不代表已停滞的所有协议请求都能被此 guard 中断；受影响真实链路的完整故障矩阵仍待最终候选执行。
 
+## 原生有偏移输入与精确 basis 读取
+
+write_positioned 集中连续偏移校验、完整摘要和恢复前缀跳过；TerraSync 只移动原生块并回填最终输入事实，删除重复 resume_offset。范围读取通过 read_current_range 绑定 fresh describe 的身份与已解析版本，保持精确 EOF 校验；旧 basis worker、channel、可选哈希和无人调用的 compute_hash／HashCalculator 已删除。重建单块直接移动 Bytes，多块才分配连续结果缓冲区。签名读取失败仍按原规则回退 full。两处读取仍使用独立 token；初始 describe 与已停滞请求仍依赖 backend 超时，不声明新增任务级取消保证。
+
+原生依赖固定 `44deb026db29024d15f27d4173548a3192f28ecb`，完整 make ci 通过，记录 `/tmp/data-mover-basis-range-ci.log`。TerraSync 最终 fmt／workspace check／Clippy、527 个 workspace 测试与双进程 E2E 16 例通过；85 个忽略项未计为通过。记录前缀 `/tmp/terrasync-native-basis-final-`。Standards／Spec 均无阻断项。
+
+对应 release SHA-256 为 `dc2231bf91c74ee9a331267e216e5751277955fafcf127b0acaab2d21034cee6`，源码记录 `/tmp/terrasync-native-basis-build-source.json`。以下 63 个真实场景通过，独立资源均清理成功：
+
+- marker／tags 17 例：`/work/terrasync-db-refactor-evidence/release-db-refactor-native-basis-marker-tags-20261105-223123/report.json`。
+- 有序版本历史 14 例：`/work/terrasync-db-refactor-evidence/release-db-refactor-native-basis-ordered-20261105-223233/report.json`。
+- 零字节源替换 2 例：`/work/terrasync-db-refactor-evidence/release-db-refactor-native-basis-zero-source-20261105-223346/report.json`。
+- metadata-only 3 例：`/work/terrasync-db-refactor-evidence/release-db-refactor-native-basis-metadata-only-v2-20261105-223358/report.json`。
+- 真实 S3／QUIC delta 3 例：`/work/terrasync-db-refactor-evidence/release-db-refactor-basis-delta-valid-v2-20261105-223531/report.json`。Atomic／Checkpoint 均实际读取 basis 范围、产生 delta token、校验完整目标并收到 1 个成功 ACK；额外拒绝一次 basis GET，保留 PermissionDenied 并正常回退 full。远端 sync 本身不使用数据库，此项不能算 ClickHouse 两种部署的持久化证据。
+- 真实 Kerberos HDFS + ClickHouse Single／Cluster 各 11 例：`/work/terrasync-db-refactor-evidence/release-db-refactor-native-basis-hdfs-single-20261105-223400/report.json` 与 `/work/terrasync-db-refactor-evidence/release-db-refactor-native-basis-hdfs-cluster-20261105-223405/report.json`，包含 unordered／blocks 两轮、完整性、Local／HDFS／QUIC 和真实权限。
+- 真实 S3 源断连及续传 2 例：`/work/terrasync-db-refactor-evidence/release-db-refactor-basis-source-cut-checkpoint-20261105-223831/report.json`。80 MiB+17 字节源在原生 64 MiB checkpoint 写入后断连，8 个 part 保留，旧目标内容和 tags 不变，0 成功／1 错误；同一地址／任务重试只上传 part 9、10、11，前缀没有重写，完整内容和 tags 正确并成功 ACK。两次执行总耗时分别约 3.13／3.72 秒，包含正常传输，不能据此推导独立故障检测或恢复窗口耗时。最终 multipart 与对象清理成功。
+
+最后两项的运行脚本和摘要已保存在对应证据目录。早期新夹具把 HEAD Content-Length 错写为零、查询远端 sync 并不创建的目录表，或在 64 MiB checkpoint 前断言复用，均不作为产品回归或通过证据；未降低最终内容、ACK 或前缀复用断言。
+
 ## 合入前仍须完成
 
 还需完成数据库目录会话与任务接口的整理，以及按设计删除 storage-adapter。任务契约与 transport 已分离，剩余存储机制和产品配置仍须分别归位。最终候选必须重跑对应 CI、真实 HDFS 和受影响故障链路，并完成全量／增量／续扫性能与峰值 RSS 对照。先前 HDFS 通过的二进制不能作为最终候选证据。
