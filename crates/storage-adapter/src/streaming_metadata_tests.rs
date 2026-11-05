@@ -5,20 +5,36 @@ use crate::ObservedEntryExt;
 use async_trait::async_trait;
 use bytes::Bytes;
 use data_mover::storage::{
-    BackendConfig, CheckpointObservation, CopiedMetadataTarget, CopiedValueTarget, DestinationPrepareRequest,
-    LocalBackendConfig, Metadata, MetadataMutation, PreparedStage, PublicationEvidence, PublicationFailure,
-    PublishRequest, StagedDestination, StorageBuilder, StorageRoleFailure, VerificationEvidence, VerifyRequest,
-    WriteEvidence, connect_backend,
+    BackendConfig, ByteStream, CheckpointObservation, CopiedMetadataTarget, CopiedValueTarget,
+    DestinationPrepareRequest, LocalBackendConfig, Metadata, MetadataMutation, PreparedStage, PublicationEvidence,
+    PublicationFailure, PublishRequest, StagedDestination, StorageBuilder, StorageRoleFailure, VerificationEvidence,
+    VerifyRequest, WriteEvidence, connect_backend,
 };
 use data_mover::transfer::TransferPhase;
+use std::error::Error;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
+use std::task::Poll;
 use std::{
     num::NonZeroUsize,
     path::PathBuf,
     sync::atomic::{AtomicBool, Ordering},
 };
 use tempfile::TempDir;
+use tokio::sync::Notify;
+
+fn role_failure(message: &str) -> storage::StorageRoleFailure {
+    StorageRoleFailure::Entry(
+        EntryOperationFailure::new(
+            StoragePath::root(),
+            Operation::Write,
+            FailureClass::Protocol,
+            Transience::Permanent,
+            message,
+        )
+        .unwrap_or_else(|_| unreachable!("固定诊断")),
+    )
+}
 
 /// 使用真实本地 stage，仅拦截元数据，验证上游引擎的应用和发布顺序。
 struct MetadataProbe {
@@ -347,7 +363,10 @@ async fn checkpoint_stream_reuses_partial_prefix_and_verifies_full_payload() {
     )
     .await
     .unwrap();
-    assert_eq!(resumed.state.lock().await.resume_offset, prefix as u64);
+    assert_eq!(
+        resumed.state.lock().await.session.as_ref().unwrap().write_offset(),
+        prefix as u64
+    );
     let (tx, rx) = mpsc::channel(4);
     let writer_handle = resumed.clone();
     let writer_dest = destination.clone();
@@ -693,6 +712,46 @@ async fn stream_cancel_before_publication_keeps_the_original_reason_and_target()
         }
         error => panic!("expected original typed cancellation reason: {error:?}"),
     }
+    assert!(!probe.called.load(Ordering::SeqCst));
+    assert_eq!(std::fs::read(root.path().join("file")).unwrap(), b"old");
+    assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 1);
+}
+
+#[tokio::test]
+async fn cancelling_a_pending_stream_preserves_the_native_reason_and_cleans_the_stage() {
+    let (root, destination, probe) = destination(false).await;
+    let entry = destination.get_metadata(Path::new("file")).await.unwrap();
+    let handle = StorageContext::prepare_stream(&destination, &entry).await.unwrap();
+    let polled = Arc::new(Notify::new());
+    let reader = Arc::clone(&polled);
+    let input: Input = Box::pin(stream::poll_fn(move |_| {
+        reader.notify_one();
+        Poll::Pending
+    }));
+    let writer = handle.clone();
+    let writing = tokio::spawn(async move { StorageContext::write_input(input, &writer, Arc::new(|_, _| {})).await });
+    tokio::time::timeout(Duration::from_secs(2), polled.notified())
+        .await
+        .unwrap();
+    handle.cancel();
+    let error = tokio::time::timeout(Duration::from_secs(2), writing)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap_err();
+    let StorageError::Transfer(failure) = error else {
+        panic!("expected native transfer failure");
+    };
+    assert_eq!(failure.phase(), TransferPhase::Transfer);
+    assert!(matches!(
+        failure.source().and_then(|cause| cause.downcast_ref::<StorageRoleFailure>()),
+        Some(StorageRoleFailure::Entry(cause)) if cause.class() == FailureClass::Cancelled
+            && cause.operation() == Operation::Write && cause.transience() == Transience::Transient
+    ));
+    assert!(failure.cleanup_failure().is_none());
+    assert!(!failure.final_destination_changed());
+    assert_eq!(handle.received_size().await, 0);
+    assert!(!handle.input_ended().await);
     assert!(!probe.called.load(Ordering::SeqCst));
     assert_eq!(std::fs::read(root.path().join("file")).unwrap(), b"old");
     assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 1);

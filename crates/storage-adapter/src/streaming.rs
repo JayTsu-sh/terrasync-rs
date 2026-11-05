@@ -2,10 +2,10 @@ use crate::copied_metadata::copied_metadata_plan;
 use crate::options::transfer_policy;
 use crate::{connected::path, error::operation, *};
 use blake3::{Hash, Hasher};
-use data_mover::storage::{PositionedChunk, StorageRoleFailure, WriteProgress, WriteProgressObserver};
+use data_mover::storage::{PositionedChunk, WriteProgress, WriteProgressObserver};
 use data_mover::{
     model::*,
-    storage::{self, ByteStream, SourceDescriptor, SourceQosGroup, SourceQosPolicy},
+    storage::{self, PositionedByteStream, SourceDescriptor, SourceQosGroup, SourceQosPolicy},
     transfer::{
         DirectPatchChunk, DirectPatchInput, DirectPatchSession, ExpertDestinationRequest, ExpertDestinationSession,
         ExpertDestinationTransferred, ExpertSourceEvidence, ExpertSourceRequest, ExpertSourceSession,
@@ -196,7 +196,6 @@ struct WriteState {
     direct: Option<DirectPatchSession>,
     written_bytes: u64,
     mode: TransferMode,
-    resume_offset: u64,
     transferred: Option<ExpertDestinationTransferred>,
     digest: [u8; 32],
     bytes: u64,
@@ -302,7 +301,7 @@ impl StorageContext {
                 }
             }
         });
-        let (session, direct, resume_offset) = if mode == TransferMode::Direct {
+        let (session, direct) = if mode == TransferMode::Direct {
             let source = SourceDescriptor::new(
                 p,
                 EntryKind::File,
@@ -312,12 +311,11 @@ impl StorageContext {
             (
                 None,
                 Some(DirectPatchSession::prepare(dest.roles.clone(), source, metadata_plan, cancel.clone()).await?),
-                0,
             )
         } else {
             let session = ExpertDestinationSession::prepare(
                 ExpertDestinationRequest::new(
-                    observed.clone(),
+                    observed,
                     dest.block_size as usize,
                     dest.roles.clone(),
                     p.clone(),
@@ -328,15 +326,13 @@ impl StorageContext {
                 .with_write_observer(progress),
             )
             .await?;
-            let offset = session.write_offset();
-            (Some(session), None, offset)
+            (Some(session), None)
         };
         let state = WriteState {
             session,
             direct,
             written_bytes: 0,
             mode,
-            resume_offset,
             transferred: None,
             digest: *blake3::hash(&[]).as_bytes(),
             bytes: 0,
@@ -384,7 +380,7 @@ impl StorageContext {
             state.direct = Some(direct);
             return result.map_err(StorageError::from);
         }
-        let (session, mode, resume_offset) = {
+        let (session, mode) = {
             let mut state = handle.state.lock().await;
             *state.observer.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(on_committed);
             (
@@ -393,50 +389,15 @@ impl StorageContext {
                     .take()
                     .ok_or_else(|| operation("writer already started"))?,
                 state.mode,
-                state.resume_offset,
             )
         };
-        let stats = Arc::new(Mutex::new((0u64, Hasher::new(), false)));
-        let tally = stats.clone();
-        let input: ByteStream = Box::pin(stream::unfold((incoming, false), move |(mut rx, failed)| {
-            let stats = stats.clone();
-            async move {
-                if failed {
-                    return None;
-                }
-                let result = loop {
-                    let chunk = match rx.next().await {
-                        Some(input) => input.chunk,
-                        None => {
-                            stats.lock().unwrap_or_else(std::sync::PoisonError::into_inner).2 = true;
-                            return None;
-                        }
-                    };
-                    let mut tally = stats.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-                    if chunk.offset != tally.0 {
-                        break Err(role_failure("non-contiguous payload"));
-                    }
-                    tally.0 += chunk.data.len() as u64;
-                    tally.1.update(&chunk.data);
-                    let skip = resume_offset.saturating_sub(chunk.offset).min(chunk.data.len() as u64) as usize;
-                    if skip < chunk.data.len() {
-                        break Ok(chunk.data.slice(skip..));
-                    }
-                };
-                let failed = result.is_err();
-                Some((result, (rx, failed)))
-            }
-        }));
-        let result = session.write(input).await;
-        let (bytes, digest, input_ended) = {
-            let stats = tally.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            (stats.0, *stats.1.finalize().as_bytes(), stats.2)
-        };
+        let input: PositionedByteStream = Box::pin(incoming.map(|input| Ok(input.chunk)));
+        let write = session.write_positioned(input).await;
         let mut state = handle.state.lock().await;
-        state.bytes = bytes;
-        state.input_ended = input_ended;
-        state.digest = digest;
-        match result {
+        state.bytes = write.progress.bytes;
+        state.input_ended = write.progress.ended;
+        state.digest = write.progress.blake3;
+        match write.outcome {
             Ok(transferred) => {
                 state.transferred = Some(transferred);
                 Ok(())
@@ -472,18 +433,6 @@ impl StorageContext {
             Err(failure) => Err(failure.cleanup_for_policy(transfer_policy(state.mode)).await.into()),
         }
     }
-}
-pub(crate) fn role_failure(message: &str) -> storage::StorageRoleFailure {
-    StorageRoleFailure::Entry(
-        EntryOperationFailure::new(
-            StoragePath::root(),
-            Operation::Write,
-            FailureClass::Protocol,
-            Transience::Permanent,
-            message,
-        )
-        .unwrap_or_else(|_| unreachable!("固定诊断")),
-    )
 }
 impl StorageContext {
     pub async fn compute_hash(&self, p: &Path, _size: u64) -> Result<String> {
