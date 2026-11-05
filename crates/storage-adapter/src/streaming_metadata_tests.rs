@@ -188,11 +188,7 @@ async fn stream_s3_tags_are_applied_before_publication() {
             [0, 1_234_000_000, 0],
             None,
             None,
-            (Some(vec![Tag {
-                key: "team".into(),
-                value: "archive".into(),
-            }]))
-            .map(|tags| tags.into_iter().map(|tag| (tag.key, tag.value)).collect()),
+            Some(vec![("team".into(), "archive".into())]),
             None,
         )
     };

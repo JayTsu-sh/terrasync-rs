@@ -137,6 +137,10 @@ StorageEnum 的五个变体都包装同一个连接对象，现已删除枚举�
 - Kerberos HDFS + ClickHouse Single 11 例：`/work/terrasync-db-refactor-evidence/release-db-refactor-context-hdfs-single-20261105-211141/report.json`。
 - Kerberos HDFS + ClickHouse Cluster 11 例：`/work/terrasync-db-refactor-evidence/release-db-refactor-context-hdfs-cluster-20261105-211147/report.json`。两种部署的 unordered／blocks 未变化第二轮 metadata_changed 均为 0→0；Local／HDFS／QUIC 复制、完整性和真实权限正确。
 
+## 删除失效的条目辅助类型
+
+无运行时调用的 datetime_to_string 和 Tag 已删除；唯一使用 Tag 的测试改为直接构造同一原生夹具输入，标签应用与发布顺序断言保留。fmt 与对应 stream_s3_tags_are_applied_before_publication 测试通过，日志前缀 `/tmp/terrasync-unused-entry-dto-`。此清理不改变存储 I/O。
+
 ## 合入前仍须完成
 
 还需完成数据库目录会话与任务接口的整理，以及按设计删除 storage-adapter。任务契约与 transport 已分离，剩余存储机制和产品配置仍须分别归位。最终候选必须重跑对应 CI、真实 HDFS 和受影响故障链路，并完成全量／增量／续扫性能与峰值 RSS 对照。先前 HDFS 通过的二进制不能作为最终候选证据。
