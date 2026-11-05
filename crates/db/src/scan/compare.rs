@@ -5,8 +5,8 @@ use crate::scan::ScanFinalEvent;
 use crate::scan::candidate_cache::ScanMetadataHash;
 use crate::scan::rows::directory_marker_state;
 use crate::{
-    common::FILE_SCAN_COLUMNS_LIST,
     error::{DatabaseError, Result},
+    schema::columns::FILE_SCAN_COLUMNS_LIST,
     schema::entry::EntrySummary as StorageEntryRecord,
 };
 use clickhouse::{Client, query::Query, sql::Bind};

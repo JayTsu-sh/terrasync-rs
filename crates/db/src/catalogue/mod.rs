@@ -20,10 +20,7 @@ use tokio::sync::{Mutex, MutexGuard, mpsc};
 use tracing::{debug, info, trace, warn};
 
 // 内部模块
-use crate::common::{
-    CATALOGUE_COLUMNS as FILE_SCAN_COLUMNS_LIST,
-    CATALOGUE_COLUMNS_WITH_T_PREFIX as FILE_SCAN_COLUMNS_LIST_WITH_T_PREFIX, DeletionStatus, classify_deletion_status,
-};
+use crate::common::{DeletionStatus, classify_deletion_status};
 use crate::config::ClickHouseConfig;
 use crate::error::{DatabaseError, Result};
 use crate::execution::{
@@ -32,6 +29,9 @@ use crate::execution::{
 };
 use crate::observation_record::{OBSERVATION_IDENTITY_JOIN_CLAUSE, ObservedEntryRecord};
 use crate::scan::rows::NativeScanRecord;
+use crate::schema::columns::{
+    CATALOGUE_COLUMNS as FILE_SCAN_COLUMNS_LIST, FILE_INCREMENTAL_SCAN_COLUMNS_DEFINITION, FILE_SCAN_COLUMNS_DEFINITION,
+};
 use crate::traits::{
     CopyGenerationStatus, Database, IncrementalStorageEntryRecord, QueryResult, StorageEntryRecord, TarManifestRecord,
 };
@@ -40,6 +40,7 @@ use crate::{
     TAR_MANIFEST_TABLE_BASE_NAME, generate_scan_temp_table_name, get_incremental_scan_base_table_name,
     get_scan_base_table_name, get_scan_state_table_name, get_tar_manifest_table_name,
 };
+use comparison::JoinStrategy;
 use storage_adapter::observed_scan::{ObservedItem, ObservedView, ObservedViews};
 use utils::sanitize_job_id;
 
@@ -132,223 +133,11 @@ fn shared_generation_lifecycle(config: &ClickHouseConfig, job_id: &str) -> Share
     lifecycle
 }
 
-/// 生成文件扫描列定义的宏
-///
-/// 支持无参调用（基础列）或带 `$prefix` / `$suffix` 的调用（在基础列前后拼接额外列）。
-#[macro_export]
-macro_rules! file_scan_base_columns {
-    // 内部宏，包含基础列定义
-    (@base) => {
-        r"
-    name String DEFAULT '',
-    relative_path String,
-    size UInt64,
-    ext Nullable(String) DEFAULT NULL,
-    ctime DateTime64(9) DEFAULT 0,
-    mtime DateTime64(9) DEFAULT 0,
-    atime DateTime64(9) DEFAULT 0,
-    mode Nullable(UInt32) DEFAULT NULL,
-    storage_type String DEFAULT '',
-    is_symlink Bool DEFAULT 0,
-    is_dir Bool DEFAULT 0,
-    is_regular_file Bool DEFAULT 0,
-    hard_links UInt32 DEFAULT 0,
-    current_state UInt8,
-    uid Nullable(UInt32) DEFAULT NULL,
-    gid Nullable(UInt32) DEFAULT NULL,
-    ino Nullable(UInt64) DEFAULT NULL,
-    file_handle Nullable(String) DEFAULT NULL,
-    version_id String DEFAULT '',
-    tags Nullable(String) DEFAULT NULL,
-    version_count Nullable(UInt32) DEFAULT NULL,
-    marker_state Nullable(String) DEFAULT NULL,
-    identity_key String DEFAULT '',
-    backend_kind String DEFAULT '',
-    backend_id String DEFAULT '',
-    entry_kind String DEFAULT '',
-    size_observed Bool DEFAULT 0,
-    modified_unix_nanos Nullable(Int128) DEFAULT NULL,
-    entry_snapshot Array(UInt8) DEFAULT [],
-    metadata_hash Nullable(String) DEFAULT NULL,
-    history_segment UInt32 DEFAULT 0,
-    history_index UInt32 DEFAULT 0,
-    INDEX identity_key_idx identity_key TYPE bloom_filter GRANULARITY 1
-"
-    };
-
-    // 生成基础列定义
-    () => {
-        file_scan_base_columns!(@base)
-    };
-
-    // 带前缀和后缀的调用
-    ($prefix:expr, $suffix:expr) => {
-        concat!($prefix, file_scan_base_columns!(@base), $suffix)
-    };
-}
-
-/// `ClickHouse`数据库实现文件扫描记录的标准列定义
-///
-/// 定义了存储文件扫描结果的表结构，包含文件路径、大小、扩展名、时间戳、权限等信息。
-/// 所有相关表（主表和临时表）都使用此结构定义。
-pub(crate) const FILE_SCAN_COLUMNS_DEFINITION: &str = file_scan_base_columns!();
-
-/// 文件增量扫描记录的标准列定义
-///
-/// 定义了存储文件增量扫描结果的表结构，包含操作类型、文件路径、大小、扩展名、时间戳、权限等信息。
-/// 增量扫描表使用此结构定义。
-pub(crate) const FILE_INCREMENTAL_SCAN_COLUMNS_DEFINITION: &str = file_scan_base_columns!(
-    r#"
-    operation_type String,
-"#,
-    r#"
-    ,create_at DateTime64(9),
-    comment Nullable(String),
-"#
-);
-
 /// Memory 排除表记录（优化 3）
 #[derive(clickhouse::Row, Serialize, Deserialize)]
 struct ExcludeRecord {
     relative_path: String,
     version_id: String,
-}
-
-/// JOIN/// JOIN 策略：path-based 或 file_handle-based
-///
-/// 决定增量扫描对比查询使用 `relative_path+version_id` 还是 `file_handle` 作为 JOIN 键。
-/// 当两表的 `file_handle` 全为 NULL 时使用 Path 模式，否则使用 `FileHandle` 模式。
-enum JoinStrategy {
-    /// 基于 `relative_path` + `version_id` 的对比
-    Path,
-    /// 基于 `file_handle` 的对比
-    FileHandle,
-}
-
-impl JoinStrategy {
-    /// 根据临时表和主表的 `file_handle` 统计信息决定 JOIN 策略
-    ///
-    /// 策略只取决于「是否存在 `file_handle`」，与表是否为空无关：
-    /// 两侧都无 `file_handle`（local/S3）→ 必须用 Path（`relative_path+version_id`）；
-    /// 任一侧有 `file_handle`（NFS/CIFS）→ 用 `FileHandle`。
-    ///
-    /// 注意：不得用 `base_total > 0` 之类的「表非空」作为前置条件——全量拷贝中断后
-    /// 续传时 base 为空，但 local/S3 文件无 `file_handle`，若误入 `FileHandle` 分支，
-    /// `NULL NOT IN (...)` 会求值为 NULL 导致新增文件漏判、被静默并入 base 而不拷贝。
-    fn from_file_handle_status(temp_non_null: usize, base_non_null: usize) -> Self {
-        if temp_non_null == 0 && base_non_null == 0 {
-            Self::Path
-        } else {
-            Self::FileHandle
-        }
-    }
-
-    /// 构建 `detect_new` SQL：temp 中存在但 base 中不存在的记录
-    ///
-    fn build_detect_new_sql(&self, temp: &str, base: &str) -> String {
-        let columns = &*FILE_SCAN_COLUMNS_LIST_WITH_T_PREFIX;
-        match self {
-            Self::Path => format!(
-                "SELECT {columns} FROM {temp} as t \
-                 WHERE (t.relative_path, t.version_id) NOT IN \
-                 (SELECT relative_path, version_id FROM {base}) \
-                 ORDER BY t.relative_path, t.history_segment, t.history_index, t.version_id"
-            ),
-            Self::FileHandle => format!(
-                "SELECT {columns} FROM {temp} as t \
-                 WHERE t.file_handle NOT IN \
-                 (SELECT file_handle FROM {base} WHERE file_handle IS NOT NULL) \
-                 ORDER BY t.relative_path, t.history_segment, t.history_index, t.version_id"
-            ),
-        }
-    }
-
-    /// 构建 `detect_changed` SQL：temp 与 base 都存在但存在变更
-    ///
-    /// 根据 `ChangeKind` 生成不同 WHERE 子句，三种 kind 互斥：
-    /// - `DataOnly`：size 或 mtime 变了；mode/uid/gid 均未变
-    /// - `MetadataOnly`：size + mtime 均未变；mode/uid/gid 至少一项变了（chmod/chown）
-    /// - `Both`：内容和属性都变了
-    fn build_detect_changed_sql(&self, temp: &str, base: &str, kind: ChangeKind) -> String {
-        let t_columns = &*FILE_SCAN_COLUMNS_LIST_WITH_T_PREFIX;
-        let marker_eq = "ifNull(t.marker_state = f.marker_state, (t.marker_state IS NULL AND f.marker_state IS NULL))";
-        let data_changed = format!("((t.size != f.size OR t.mtime != f.mtime) OR NOT {marker_eq})");
-        let data_unchanged = format!("((t.size = f.size AND t.mtime = f.mtime) AND {marker_eq})");
-        // mode/uid/gid 在 S3 等协议中为 Nullable 且常常为 NULL；ClickHouse 三值逻辑下
-        // `NULL = NULL` 返回 NULL（WHERE 视为 false），会让所有 ChangeKind 都不匹配。
-        // 比较结果为 NULL 时，只有两侧均 NULL 才相等；单侧未知不能掩盖真实变更。
-        // 此形式不依赖任何 sentinel，不会把真实值（如 mode=0）误等同于 NULL，
-        // 也不依赖"两侧来自同一后端"这种隐含不变量。
-        let mode_eq = "ifNull(t.mode = f.mode, (t.mode IS NULL AND f.mode IS NULL))";
-        let uid_eq = "ifNull(t.uid = f.uid, (t.uid IS NULL AND f.uid IS NULL))";
-        let gid_eq = "ifNull(t.gid = f.gid, (t.gid IS NULL AND f.gid IS NULL))";
-        let meta_changed = format!("(NOT {mode_eq} OR NOT {uid_eq} OR NOT {gid_eq})");
-        let meta_unchanged = format!("({mode_eq} AND {uid_eq} AND {gid_eq})");
-
-        let marker_removed = "(t.is_dir = 1 AND t.marker_state IS NULL AND f.marker_state IS NOT NULL)";
-        let kind_filter = match kind {
-            ChangeKind::DirectoryMarkerRemoved => marker_removed.into(),
-            ChangeKind::DataOnly => format!("{data_changed} AND {meta_unchanged}"),
-            ChangeKind::MetadataOnly => format!("{data_unchanged} AND {meta_changed}"),
-            ChangeKind::Both => format!("{data_changed} AND {meta_changed}"),
-        };
-
-        let kind_filter = if kind == ChangeKind::DirectoryMarkerRemoved {
-            kind_filter
-        } else {
-            format!("({kind_filter}) AND NOT {marker_removed}")
-        };
-        match self {
-            Self::Path => format!(
-                "SELECT {t_columns} FROM {temp} t \
-                 JOIN (SELECT relative_path, version_id, size, mtime, mode, uid, gid, is_dir, marker_state \
-                       FROM {base} FINAL \
-                       WHERE (relative_path, version_id) IN \
-                             (SELECT relative_path, version_id FROM {temp}) \
-                       ORDER BY relative_path, version_id \
-                       LIMIT 1 BY (relative_path, version_id) \
-                 ) f ON t.relative_path = f.relative_path AND t.version_id = f.version_id \
-                 WHERE {kind_filter} AND (f.is_dir = 0 OR NOT {marker_eq}) \
-                 ORDER BY t.relative_path, t.history_segment, t.history_index, t.version_id"
-            ),
-            Self::FileHandle => format!(
-                "SELECT {t_columns} FROM {temp} t \
-                 JOIN (SELECT file_handle, relative_path, size, mtime, mode, uid, gid, is_dir, marker_state \
-                       FROM {base} FINAL \
-                       WHERE file_handle IN \
-                             (SELECT file_handle FROM {temp} WHERE file_handle IS NOT NULL) \
-                       ORDER BY file_handle, relative_path \
-                       LIMIT 1 BY (file_handle, relative_path) \
-                 ) f ON t.file_handle = f.file_handle \
-                   AND t.relative_path = f.relative_path \
-                 WHERE {kind_filter} AND (f.is_dir = 0 OR NOT {marker_eq}) \
-                 ORDER BY t.relative_path, t.history_segment, t.history_index, t.version_id"
-            ),
-        }
-    }
-
-    /// 构建 `detect_deleted` SQL：base 中 old-state 的记录
-    /// 使用 FINAL 确保 `ReplacingMergeTree` 去重后再按 `current_state` 过滤
-    fn build_detect_deleted_sql(base: &str) -> String {
-        let columns = &*FILE_SCAN_COLUMNS_LIST;
-        format!(
-            "SELECT {columns} FROM {base} FINAL \
-             WHERE current_state = ? \
-             ORDER BY relative_path, version_id"
-        )
-    }
-
-    /// 构建批量 `file_handle` 查询 SQL（优化 2）
-    fn build_batch_fh_query_sql(base: &str, batch_size: usize) -> String {
-        let columns = &*FILE_SCAN_COLUMNS_LIST;
-        let placeholders = vec!["?"; batch_size].join(", ");
-        format!(
-            "SELECT {columns} FROM {base} \
-             WHERE file_handle IN ({placeholders}) \
-             ORDER BY file_handle, ctime, version_id \
-             LIMIT 1 BY (relative_path, version_id)"
-        )
-    }
 }
 
 /// 将 `StorageEntryRecord` 列表转换为 `ObservedEntry` 迭代器

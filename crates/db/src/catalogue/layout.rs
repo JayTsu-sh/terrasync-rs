@@ -1,8 +1,9 @@
 //! 通用目录的部署差异：业务查询复用同一投影，集群 DDL 和物理表名只在这里出现。
-use super::{ClickHouseDatabase, ExcludeRecord, FILE_SCAN_COLUMNS_DEFINITION};
+use super::{ClickHouseDatabase, ExcludeRecord};
 use crate::config::ClickHouseConfig;
 use crate::error::{DatabaseError, Result};
 use crate::execution::queries::{check_scan_cancellation, scan_retry_delay};
+use crate::schema::columns::FILE_SCAN_COLUMNS_DEFINITION;
 use crate::schema::identifier;
 use crate::traits::StorageEntryRecord;
 use clickhouse::{Client, error::Error as ClickHouseError, query::Query};

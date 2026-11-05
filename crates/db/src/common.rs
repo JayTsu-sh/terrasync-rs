@@ -1,7 +1,6 @@
 //! Common types and utilities for database implementations
 
 use std::collections::HashMap;
-use std::sync::LazyLock;
 
 use storage_adapter::ObservedEntry;
 use tracing::{error, trace};
@@ -22,55 +21,6 @@ pub enum DeletionStatus {
     /// The item was renamed, with the old and new entries.
     Renamed(Box<ObservedEntry>, Box<ObservedEntry>),
 }
-
-/// 文件扫描列名列表（不含 `version_count`）
-pub const FILE_SCAN_COLUMNS_LIST_WO_VERSIONCOUNT: &str = "name, relative_path, size, ext, ctime, mtime, atime, mode, storage_type, is_symlink, is_dir, is_regular_file, hard_links, current_state, uid, gid, ino, file_handle, version_id, tags";
-
-/// 通过 `FILE_SCAN_COLUMNS_LIST_WO_VERSIONCOUNT` 生成的完整列名列表，包含 `version_count`
-pub static FILE_SCAN_COLUMNS_LIST: LazyLock<String> =
-    LazyLock::new(|| format!("{FILE_SCAN_COLUMNS_LIST_WO_VERSIONCOUNT}, version_count, marker_state"));
-
-pub(crate) static CATALOGUE_COLUMNS: LazyLock<String> =
-    LazyLock::new(|| format!("{},backend_kind,backend_id,entry_snapshot", *FILE_SCAN_COLUMNS_LIST));
-pub(crate) static CATALOGUE_COLUMNS_WITH_T_PREFIX: LazyLock<String> = LazyLock::new(|| {
-    CATALOGUE_COLUMNS
-        .split(',')
-        .map(|name| format!("t.{}", name.trim()))
-        .collect::<Vec<_>>()
-        .join(",")
-});
-
-/// 基础扫描表的占位符列表（通过 `FILE_SCAN_COLUMNS_LIST` 计算）
-pub static FILE_SCAN_COLUMNS_PLACEHOLDERS: LazyLock<String> = LazyLock::new(|| {
-    let column_count = FILE_SCAN_COLUMNS_LIST.split(',').count();
-    vec!["?"; column_count].join(", ")
-});
-
-/// 带表前缀"t."的完整列名列表（不含 `version_count`）
-///
-/// 用于SQL语句中的带表前缀列名列表，如SELECT语句中的表别名前缀
-pub static FILE_SCAN_COLUMNS_LIST_WO_VERSIONCOUNT_WITH_T_PREFIX: LazyLock<String> = LazyLock::new(|| {
-    FILE_SCAN_COLUMNS_LIST_WO_VERSIONCOUNT
-        .split(',')
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(|col| format!("t.{col}"))
-        .collect::<Vec<_>>()
-        .join(", ")
-});
-
-/// 带表前缀"t."的完整列名列表（包含 `version_count`）
-///
-/// 通过 `FILE_SCAN_COLUMNS_LIST` 生成的完整列名列表，包含 `t.version_count`
-pub static FILE_SCAN_COLUMNS_LIST_WITH_T_PREFIX: LazyLock<String> = LazyLock::new(|| {
-    FILE_SCAN_COLUMNS_LIST
-        .split(',')
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(|col| format!("t.{col}"))
-        .collect::<Vec<_>>()
-        .join(", ")
-});
 
 /// 从 `detect_deleted_items` 提取的纯函数，对 `file_handle` 分组结果进行分类判断
 ///

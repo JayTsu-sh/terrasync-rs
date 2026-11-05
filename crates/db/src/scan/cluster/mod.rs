@@ -18,14 +18,14 @@ use serde::{Deserialize, Serialize};
 use utils::sanitize_job_id;
 
 use self::record::{ClusterIncrementalStorageEntryRecord, ClusterScanResumeState};
-use crate::catalogue::{FILE_INCREMENTAL_SCAN_COLUMNS_DEFINITION, FILE_SCAN_COLUMNS_DEFINITION};
-use crate::common::FILE_SCAN_COLUMNS_LIST;
 use crate::config::ClickHouseConfig;
 use crate::error::{DatabaseError, Result};
 #[cfg(test)]
 use crate::execution::base_client;
 use crate::scan::ScanResumeStatistics;
 use crate::scan::{FINALIZING, ScanResumeState};
+use crate::schema::columns::FILE_SCAN_COLUMNS_LIST;
+use crate::schema::columns::{FILE_INCREMENTAL_SCAN_COLUMNS_DEFINITION, FILE_SCAN_COLUMNS_DEFINITION};
 #[cfg(test)]
 use crate::schema::entry::EntrySummary as StorageEntryRecord;
 

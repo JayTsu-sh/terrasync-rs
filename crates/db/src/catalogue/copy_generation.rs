@@ -1,11 +1,11 @@
 //! 复制目录仅在物理操作与数据库确认全部完成后结束轮次；失败轮次保守重放。
 use super::{ClickHouseDatabase, ScanGenerationLifecycle};
-use crate::common::CATALOGUE_COLUMNS as FILE_SCAN_COLUMNS_LIST;
 use crate::common::DeletionStatus;
 use crate::error::{DatabaseError, Result};
 use crate::execution::read::QuorumRead;
 use crate::get_scan_base_table_name;
 use crate::get_scan_state_table_name;
+use crate::schema::columns::CATALOGUE_COLUMNS as FILE_SCAN_COLUMNS_LIST;
 use crate::traits::{CopyGenerationStatus, StorageEntryRecord};
 use clickhouse::error::Error as ClickHouseError;
 use serde::Deserialize;
