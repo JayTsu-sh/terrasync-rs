@@ -1,6 +1,6 @@
 # 开发规范与场景索引
 
-AI 工作流程以根目录 [AGENTS.md](../AGENTS.md) 为准，产品约束以 [agent.md](../agent.md) 为准。本页集中编码规范和技术资料路由。现有 .claude 目录中的文档和校验脚本可作为普通文件使用，不依赖 Claude 自动加载或专属 agent。
+AI 工作流程以根目录 [AGENTS.md](../AGENTS.md) 为准，产品约束按本页与专项文档执行。本页集中编码规范和技术资料路由。现有 .claude 目录中的文档和校验脚本可作为普通文件使用，不依赖 Claude 自动加载或专属 agent。
 
 
 ## 产品职责与变更验收
@@ -9,25 +9,25 @@ AI 工作流程以根目录 [AGENTS.md](../AGENTS.md) 为准，产品约束以 [
 
 | 修改范围 | 设计约束与必须验证的结果 |
 | --- | --- |
-| 任务创建、执行、取消与终态 | CLI／Web 复用任务用例及状态契约，执行身份隔离旧任务与新任务；故障、背压和取消后收束后台操作，独立验证最终状态与最终通知，不以 HTTP 返回或进程退出代替业务成功 |
+| 任务创建、执行、取消与终态 | CLI／Web 复用任务用例及状态契约；故障、背压和取消后收束后台操作，独立验证最终状态与最终通知，不以 HTTP 返回或进程退出代替业务成功 |
 | 扫描与续扫 | 非续扫全量／增量使用 unordered；首次计划续扫也显式启用 --resume，全量／增量续扫使用 blocks。生产 checkpoint 至少间隔 60 秒，并在满足间隔后等完整目录／子目录块完成；大平铺目录不能仅因计时到而提前确认。功能测试可缩短间隔，性能验收保持至少 60 秒 |
 | 持久化与统计 | 对齐已确认事实、checkpoint 与统计快照；恢复从确认点继续，累计数包含 checkpoint，重放实际去重，不能估算补偿或再次累加。过滤统计区分扫描／过滤／保留及目录、regular 文件、软链接等类型；目录剪枝未访问项不计数 |
 | ClickHouse 与提交 | Single／Cluster 共用上层语义，表布局、分片／副本及提交差异集中 db 模块；扫描及复制／同步元数据都按影响范围分别验证两种部署。确认丢失、旧执行延迟写入与清理必须靠执行身份和事实对账处理，不能假定超时即未执行 |
 | 性能、内存与并发 | 队列、批次、预取和在途工作有界，避免按总 entry 数常驻保留明细。全量／全量续扫损失目标不超过 5%，增量／增量续扫不超过 10%；分别匹配 unordered／blocks 的不落库基线，不跨模式比较；增量覆盖无变更与约 1% 增删改。报告峰值 RSS 和持续增长；约 200 MiB 是优化目标，不能牺牲正确性或已确认性能要求来换取 |
 | 续扫性能和整理 | 续扫净吞吐按对应 blocks 基线验收；另报中断前后总运行耗时及回退／重扫成本，排除人为暂停等待。应用主动触发的基线整理计入总耗时，不能隐藏数据库整理、重放或收尾成本 |
 
-这是当前开发与验收目标，不代表现有实现已经全部达标。外部环境异常的具体故障矩阵与通知策略统一见 [故障约束](external-dependency-failures.md)；本页不重复定义超时与重试规则。
+这是当前开发与验收目标，不代表现有实现已经全部达标。存储／服务连通性的故障矩阵与通知策略统一见 [故障约束](external-dependency-failures.md)；本页不重复定义超时与重试规则。
 
 ## 按场景查阅
 
 | 场景 | 依据 |
 | --- | --- |
 | 理解当前 workspace、crate 和依赖版本 | 根 Cargo.toml、crates/、[代码结构资料](../.claude/docs/codebase.md)；代码与构建配置为当前事实 |
-| 扫描、同步、故障恢复和 checkpoint | [架构资料](../.claude/docs/architecture.md)、[项目约定](../agent.md)、crates/app/、crates/storage-adapter/ 与 crates/db/ 的当前实现及测试 |
+| 扫描、同步、故障恢复和 checkpoint | [架构资料](../.claude/docs/architecture.md)、crates/app/ 的当前任务与扫描测试、crates/app/、crates/storage-adapter/ 与 crates/db/ 的当前实现及测试 |
 | 外部依赖与真实环境测试 | [E2E 资料](../.claude/docs/e2e-testing.md)、[实验室约束](../tests/lab/README.md) |
 | 存储驱动或环境配置 | [服务资料](../.claude/docs/services-and-storage.md)；实际能力、URL 解析和参数以当前依赖 API 与 CLI --help 为准 |
-| Web UI | [代码结构资料](../.claude/docs/codebase.md) 前端章节及 web-ui/package.json |
-| commit / PR、产物存放 | [提交规范](../.claude/docs/conventions.md) |
+| Web API／前端 | [Web／前端规范](web-development.md)、web-ui/package.json |
+| commit / PR、产物存放 | [提交规范](conventions.md) |
 | 构建、测试与工具链 | Cargo.toml、Makefile、[CI](../.github/workflows/ci.yml)；运行与影响范围对应的步骤 |
 
 旧架构名、历史接口和旧 CLI 示例须对照当前实现核验后使用。注释使用中文，技术标识符保持英文。
@@ -143,3 +143,19 @@ storage_op().map_err(|e| AppError::CopyFailed { path: path.clone(), source: e })
 - 具体操作（优先）：`ScanFailed`、`CopyFailed`、`ConnectionError`
 - 包装下游（透传）：`StorageError(#[from] ...)`、`DatabaseError(#[from] ...)`
 - 禁止：裸 `Error(String)` 兜底变种（`utils` 层除外，其余 crate 必须具名）
+
+## 首次开发阶段：不要求兼容性
+
+本项目目前处于首次开发阶段。所有设计、实现、优化、重构和 code review 均以当前最合理的架构和实现为准，不要求任何向后兼容。
+
+数据库表结构、已有数据、持久化 checkpoint 和统计格式，以及内部与外部接口、函数签名、CLI、配置和 callback 协议，均可直接调整。不为旧版本或旧实现增加兼容层、数据迁移、回填、双读写、兼容分支或弃用过渡。
+
+接口或格式调整时，同步更新所有当前调用方、配置示例、测试和文档；当前版本的功能正确性、断点续扫、精确计数、重试幂等、数据一致性及性能和内存目标仍须验证。
+
+## 迁移行为测试资料
+
+迁移策略切换、失败后源端变化及同 job ID 的代表场景整理在 [迁移代次测试用例](../tests/scenarios/migration-generations.md)。该文件是待实现／执行的测试规格，不能据此宣称功能已覆盖或通过。
+
+## 提交粒度
+
+完成一个可独立验证且语义完整的小功能或修复，通过适用检查后及时 commit。结构重构与行为变化分开；相互依赖才能成立的跨文件修改作为一个原子提交，避免积累大量无关改动，也不按文件数或机械频率制造半成品提交。推送与合入分别遵守当前 review 和检查要求。
