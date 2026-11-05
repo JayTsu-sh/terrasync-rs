@@ -656,7 +656,7 @@ mod resume_tests {
             "name":"fifo", "relative_path":"fifo", "size":0, "ext":null, "ctime":0, "mtime":0, "atime":0,
             "mode":null, "storage_type":"nas", "is_symlink":false, "is_dir":false, "is_regular_file":false,
             "hard_links":1, "current_state":0, "uid":null, "gid":null, "ino":null, "file_handle":null,
-            "version_id":"", "tags":null, "version_count":null
+            "version_id":"", "tags":null
         }))?;
         manager
             .record_final_events(&[

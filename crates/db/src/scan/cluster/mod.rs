@@ -560,7 +560,7 @@ impl ClusterScanStore {
                 .await?;
         }
         insert.end().await?;
-        let columns = &*FILE_SCAN_COLUMNS_LIST;
+        let columns = FILE_SCAN_COLUMNS_LIST;
         self.client.query(&format!("INSERT INTO {database}.base (job_id,epoch,ver,is_deleted,{columns}) SELECT job_id,?,fromUnixTimestamp64Nano(?),1,{columns} FROM {database}.base FINAL WHERE job_id=? AND is_deleted=0 AND epoch!=? AND (relative_path,version_id) IN (SELECT relative_path,version_id FROM {database}.scan_resume_keys WHERE job_id=? AND batch_id=?)")).bind(self.epoch.load(Ordering::Relaxed)).bind(self.epoch.load(Ordering::Relaxed) as i64).bind(&self.job_id).bind(self.epoch.load(Ordering::Relaxed)).bind(&self.job_id).bind(keys_id).execute_scan().await?;
         self.client
             .query(&format!(

@@ -29,7 +29,6 @@ macro_rules! file_scan_base_columns {
     file_handle Nullable(String) DEFAULT NULL,
     version_id String DEFAULT '',
     tags Nullable(String) DEFAULT NULL,
-    version_count Nullable(UInt32) DEFAULT NULL,
     marker_state Nullable(String) DEFAULT NULL,
     identity_key String DEFAULT '',
     backend_kind String DEFAULT '',
@@ -76,15 +75,11 @@ pub(crate) const FILE_INCREMENTAL_SCAN_COLUMNS_DEFINITION: &str = file_scan_base
 "#
 );
 
-/// 文件扫描列名列表（不含 `version_count`）
-pub const FILE_SCAN_COLUMNS_LIST_WO_VERSIONCOUNT: &str = "name, relative_path, size, ext, ctime, mtime, atime, mode, storage_type, is_symlink, is_dir, is_regular_file, hard_links, current_state, uid, gid, ino, file_handle, version_id, tags";
-
-/// 通过 `FILE_SCAN_COLUMNS_LIST_WO_VERSIONCOUNT` 生成的完整列名列表，包含 `version_count`
-pub static FILE_SCAN_COLUMNS_LIST: LazyLock<String> =
-    LazyLock::new(|| format!("{FILE_SCAN_COLUMNS_LIST_WO_VERSIONCOUNT}, version_count, marker_state"));
+/// 目录查询和扫描摘要共用的字段顺序。
+pub(crate) const FILE_SCAN_COLUMNS_LIST: &str = "name, relative_path, size, ext, ctime, mtime, atime, mode, storage_type, is_symlink, is_dir, is_regular_file, hard_links, current_state, uid, gid, ino, file_handle, version_id, tags, marker_state";
 
 pub(crate) static CATALOGUE_COLUMNS: LazyLock<String> =
-    LazyLock::new(|| format!("{},backend_kind,backend_id,entry_snapshot", *FILE_SCAN_COLUMNS_LIST));
+    LazyLock::new(|| format!("{},backend_kind,backend_id,entry_snapshot", FILE_SCAN_COLUMNS_LIST));
 pub(crate) static CATALOGUE_COLUMNS_WITH_T_PREFIX: LazyLock<String> = LazyLock::new(|| {
     CATALOGUE_COLUMNS
         .split(',')

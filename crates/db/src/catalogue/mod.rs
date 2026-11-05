@@ -1155,7 +1155,6 @@ mod tests {
         let record = StorageEntryRecord::capture(&s3, 0).unwrap();
         assert_eq!(record.storage_type, "s3");
         assert_eq!(record.version_id, "v1");
-        assert_eq!(record.version_count, Some(1));
         assert_eq!(record.to_observation().unwrap(), s3);
 
         let back = record.to_observation().unwrap();

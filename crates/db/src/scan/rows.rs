@@ -11,10 +11,8 @@ use data_mover::model::{
     StoragePath, SymlinkTarget, SymlinkTargetEncoding, VersionRecord,
 };
 use data_mover::model::{BackendKind, EntryKind, EntrySnapshot, ObservedEntry, StorageTimestamp};
-use rustc_hash::FxHashMap;
 use serde::ser::SerializeSeq;
 use serde::{Serialize, Serializer};
-use smol_str::SmolStr;
 use std::borrow::Cow;
 use std::path::Path;
 use std::sync::Arc;
@@ -46,7 +44,7 @@ pub(crate) fn directory_marker_state(entry: &ObservedEntry) -> Option<String> {
     Some(hash.finalize().to_hex().to_string())
 }
 
-pub(crate) const OBSERVED_COLUMNS: &str = "name,relative_path,size,ext,ctime,mtime,atime,mode,storage_type,is_symlink,is_dir,is_regular_file,hard_links,current_state,uid,gid,ino,file_handle,version_id,tags,version_count,marker_state,identity_key,backend_kind,backend_id,entry_kind,size_observed,modified_unix_nanos,entry_snapshot,metadata_hash,history_segment,history_index";
+pub(crate) const OBSERVED_COLUMNS: &str = "name,relative_path,size,ext,ctime,mtime,atime,mode,storage_type,is_symlink,is_dir,is_regular_file,hard_links,current_state,uid,gid,ino,file_handle,version_id,tags,marker_state,identity_key,backend_kind,backend_id,entry_kind,size_observed,modified_unix_nanos,entry_snapshot,metadata_hash,history_segment,history_index";
 
 /// 比较集合只传输主键和身份；完整观察在事件持久化后直接写入 base。
 #[derive(Serialize, clickhouse::Row)]
@@ -106,7 +104,6 @@ struct ScanRowFields<'a> {
     file_handle: Option<String>,
     version_id: &'a str,
     tags: Option<String>,
-    version_count: Option<u32>,
     marker_state: Option<String>,
 }
 impl<'a> ScanRowFields<'a> {
@@ -146,7 +143,6 @@ impl<'a> ScanRowFields<'a> {
             file_handle: view.file_handle(),
             version_id: view.version_id(),
             tags,
-            version_count: entry.history().map(|h| h.records().len().min(u32::MAX as usize) as u32),
             marker_state: directory_marker_state(entry),
         })
     }
@@ -172,7 +168,6 @@ impl<'a> ScanRowFields<'a> {
             file_handle: self.file_handle,
             version_id: self.version_id.into(),
             tags: self.tags,
-            version_count: self.version_count,
             marker_state: self.marker_state,
         }
     }
@@ -204,7 +199,6 @@ pub(crate) struct NativeScanRecord<'a> {
     pub file_handle: Option<String>,
     pub version_id: &'a str,
     pub tags: Option<String>,
-    pub version_count: Option<u32>,
     pub marker_state: Option<String>,
     pub identity_key: String,
     pub backend_kind: &'static str,
@@ -305,7 +299,6 @@ impl<'a> NativeScanRecord<'a> {
             file_handle: fields.file_handle,
             version_id: fields.version_id,
             tags: fields.tags,
-            version_count: fields.version_count,
             marker_state: fields.marker_state,
             identity_key: hex::encode(identity.identity_key().as_bytes()),
             backend_kind: entry.backend_kind().as_str().into(),
@@ -364,7 +357,6 @@ impl<'a> NativeScanRecord<'a> {
             file_handle: self.file_handle,
             version_id: self.version_id,
             tags: self.tags,
-            version_count: self.version_count,
             marker_state: self.marker_state,
         }
         .legacy()
@@ -372,25 +364,7 @@ impl<'a> NativeScanRecord<'a> {
 }
 
 pub(crate) fn event_records(events: &[ObservedScanEvent], time: i64) -> Result<Vec<IncrementalStorageEntryRecord>> {
-    let mut added: FxHashMap<SmolStr, u32> = FxHashMap::default();
-    for event in events {
-        if let ObservedScanEvent::New(item) = event
-            && item.version_index.is_some()
-        {
-            let count = added.entry(SmolStr::new(item.view().path())).or_default();
-            *count = count.saturating_add(1);
-        }
-    }
-    events
-        .iter()
-        .map(|event| {
-            let mut record = event_record(event, time)?;
-            if matches!(event, ObservedScanEvent::New(_)) && record.version_count.is_some() {
-                record.version_count = added.get(record.relative_path.as_str()).copied();
-            }
-            Ok(record)
-        })
-        .collect()
+    events.iter().map(|event| event_record(event, time)).collect()
 }
 
 pub(crate) fn event_record(event: &ObservedScanEvent, event_time: i64) -> Result<IncrementalStorageEntryRecord> {
@@ -407,24 +381,9 @@ pub(crate) fn event_record(event: &ObservedScanEvent, event_time: i64) -> Result
 }
 
 pub(crate) fn final_event_records(events: &[ScanFinalEvent], time: i64) -> Vec<IncrementalStorageEntryRecord> {
-    let mut added: FxHashMap<SmolStr, u32> = FxHashMap::default();
-    for event in events {
-        if let ScanFinalEvent::Added(item) = event
-            && item.version_count.is_some()
-        {
-            let count = added.entry(SmolStr::new(&item.relative_path)).or_default();
-            *count = count.saturating_add(1);
-        }
-    }
     events
         .iter()
-        .map(|event| {
-            let mut record = event.item().clone();
-            if matches!(event, ScanFinalEvent::Added(_)) && record.version_count.is_some() {
-                record.version_count = added.get(record.relative_path.as_str()).copied();
-            }
-            incremental_record(record, event.operation(), event.previous_path(), time)
-        })
+        .map(|event| incremental_record(event.item().clone(), event.operation(), event.previous_path(), time))
         .collect()
 }
 
@@ -455,7 +414,6 @@ pub(crate) fn incremental_record(
         file_handle: record.file_handle,
         version_id: record.version_id,
         tags: record.tags,
-        version_count: record.version_count,
         marker_state: record.marker_state,
     }
 }
@@ -649,9 +607,9 @@ mod tests {
         assert_eq!(rows[0].version_id, "null");
         assert_eq!(rows[0].size, 17);
         assert_eq!(rows[1].version_id, "deleted");
-        assert_eq!(rows[0].version_count, Some(2));
         let final_rows = final_event_records(&[ScanFinalEvent::Added(rows[0].clone().legacy())], 1);
-        assert_eq!(final_rows[0].version_count, Some(1));
+        assert_eq!(final_rows.len(), 1);
+        assert_eq!(final_rows[0].version_id, "null");
         let marker = rows[1].observed(&backend)?;
         assert!(marker.view().version().is_some_and(VersionRecord::is_delete_marker));
         assert_eq!(marker.view().version_id(), "deleted");
@@ -661,11 +619,9 @@ mod tests {
             version_index: Some(1),
         });
         let events = event_records(&[new], 9)?;
-        assert_eq!(
-            events[0].version_count,
-            Some(1),
-            "incremental events count only newly observed versions"
-        );
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].version_id, "deleted");
+        assert_eq!(events[0].size, 0);
         Ok(())
     }
 }

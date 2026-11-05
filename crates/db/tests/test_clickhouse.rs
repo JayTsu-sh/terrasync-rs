@@ -1755,7 +1755,7 @@ mod clickhouse_integration_tests {
         cleanup_test_tables(&db, &job_id).await.unwrap();
     }
 
-    // ═══ 2.7 version_count JOIN（优化 4）═══
+    // ═══ 2.7 原生版本顺序与已完成版本排除 ═══
 
     #[tokio::test]
     #[ignore]

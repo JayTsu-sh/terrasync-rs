@@ -132,7 +132,6 @@ macro_rules! metadata_hash {
                 self.file_handle.hash_field(&mut hash);
                 self.version_id.hash_field(&mut hash);
                 self.tags.hash_field(&mut hash);
-                self.version_count.hash_field(&mut hash);
                 self.marker_state.hash_field(&mut hash);
                 hash.finalize().to_hex().to_string()
             }
@@ -271,7 +270,7 @@ mod tests {
             |row| row.tags = Some("tag".into()),
             |row| row.file_handle = Some("replacement".into()),
             |row| row.version_id = "new-version".into(),
-            |row| row.version_count = Some(2),
+            |row| row.gid = Some(999),
         ];
         for change in mutations {
             let mut changed = row.clone();

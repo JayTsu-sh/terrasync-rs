@@ -73,6 +73,16 @@ marker 有到无的转换产生显式删除意图，不能仅由当前目录没�
 - 同候选真实 HDFS + ClickHouse Cluster（2 分片 × 3 副本）11 例通过。按 job_id 从六副本共享事件表去重检查，unordered／blocks 均为 0→0；复制、完整性、权限与目录结果同时通过。报告 `/work/terrasync-db-refactor-evidence/release-db-refactor-independent-permission-cluster-v2-20261105-192702/report.json`；独立数据库、HDFS 路径和临时认证配置已清理。早期测试查询误用了单机的按 job 分表名，404 不作为产品失败或通过证据。
 - 修复前真实失败报告 `/work/terrasync-db-refactor-evidence/release-db-refactor-independent-permission-red-20261105-191640/report.json` 记录 unordered 的累计 metadata_changed 为 0→2，资源清理通过。
 
+## 数据库结构整理
+
+SQL 列定义和有效投影已集中到 schema／columns，JOIN 分类构造集中到 catalogue／comparison；搬迁前后有效 SQL 文本和字段顺序机械比对一致。未接入任务执行流的 observation snapshot 独立原型及 EXCHANGE 生命周期已删除；只有该原型会设置的歧义标志和对应错误一并移除，实际 NativeScan／copy generation 恢复保持原样。
+
+原型的损坏 snapshot、错误 backend、路径不匹配校验已迁到实际使用的记录解码入口。真实 ClickHouse 验证通过：身份替换不产生重复路径；当前协议下更新提交、空代次删除检测及最终目录为空。旧专属 EXCHANGE 测试随接口删除，历史设计已标明被替代。该阶段完整 Rust 检查及双进程 16 例通过，日志前缀 `/tmp/terrasync-prototype-removal-`；后续最终分支仍须复查依赖固定后的整体结果。
+
+失效的 version_count 已从 SQL、Single／Cluster 行 DTO、比较摘要和批内计数中删除，移除了对应分组 map 和路径分配。逐版本视图、原生历史顺序、null／删除标记与实际逐版本 ACK 保留。测试直接断言选择的行数、版本 ID 和数据。
+
+字段清理阶段 fmt／workspace check／Clippy、workspace 测试及双进程 16 例通过；app 201、db 106 个本地测试通过，忽略项另计。真实 Single／Cluster catalogue、Single 集成测试及两种部署的切点测试均通过且独立数据库清理成功，报告前缀 `/tmp/terrasync-db-refactor-real-version-count-v1-`。Cluster 17 个扫描场景仍在运行，其二进制和源摘要记录在 `/tmp/terrasync-version-count-cluster-test-binary.json`，此处不提前记为通过。
+
 ## 合入前仍须完成
 
-还需完成数据库内部职责拆分、移除无用 DTO／原型及旧版本计数、任务契约和 transport 的归属整理，以及按设计删除 storage-adapter。最终候选必须重跑对应 CI、真实 HDFS 和受影响故障链路，并完成全量／增量／续扫性能与峰值 RSS 对照。先前 HDFS 通过的二进制不能作为最终候选证据。
+还需完成数据库内部职责拆分、收窄行 DTO 与任务接口、任务契约和 transport 的归属整理，以及按设计删除 storage-adapter。最终候选必须重跑对应 CI、真实 HDFS 和受影响故障链路，并完成全量／增量／续扫性能与峰值 RSS 对照。先前 HDFS 通过的二进制不能作为最终候选证据。

@@ -44,8 +44,6 @@ pub struct EntrySummary {
     pub version_id: String,
     /// 文件标签
     pub tags: Option<String>,
-    /// 版本计数
-    pub version_count: Option<u32>,
     pub marker_state: Option<String>,
 }
 

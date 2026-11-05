@@ -269,7 +269,7 @@ impl NativeScanAccess<'_> {
                 .map(|name| format!("b.{}", name.trim()))
                 .collect::<Vec<_>>()
                 .join(",");
-            self.read_query(&format!("SELECT {columns} FROM (SELECT {} FROM {} {} WHERE {} AND {} AND NOT ({}) AND relative_path BETWEEN ? AND ? AND (relative_path,version_id) IN (SELECT relative_path,version_id FROM {} WHERE {})) AS b INNER JOIN (SELECT relative_path,version_id,file_handle FROM {} WHERE {}) AS s USING(relative_path,version_id) WHERE b.file_handle IS NOT NULL AND startsWith(b.file_handle,'54534934') AND s.file_handle IS NOT NULL AND b.file_handle!=s.file_handle LIMIT 1 BY b.relative_path,b.version_id",*FILE_SCAN_COLUMNS_LIST,self.base,self.final_clause,self.scope,self.live,self.active,self.stage,self.stage_scope,self.stage,self.stage_scope)).bind(&paths[0]).bind(&paths[paths.len()-1]).fetch_quorum_all::<StorageEntryRecord>().await?
+            self.read_query(&format!("SELECT {columns} FROM (SELECT {} FROM {} {} WHERE {} AND {} AND NOT ({}) AND relative_path BETWEEN ? AND ? AND (relative_path,version_id) IN (SELECT relative_path,version_id FROM {} WHERE {})) AS b INNER JOIN (SELECT relative_path,version_id,file_handle FROM {} WHERE {}) AS s USING(relative_path,version_id) WHERE b.file_handle IS NOT NULL AND startsWith(b.file_handle,'54534934') AND s.file_handle IS NOT NULL AND b.file_handle!=s.file_handle LIMIT 1 BY b.relative_path,b.version_id",FILE_SCAN_COLUMNS_LIST,self.base,self.final_clause,self.scope,self.live,self.active,self.stage,self.stage_scope,self.stage,self.stage_scope)).bind(&paths[0]).bind(&paths[paths.len()-1]).fetch_quorum_all::<StorageEntryRecord>().await?
         } else {
             Vec::new()
         };
@@ -331,7 +331,7 @@ impl NativeScanAccess<'_> {
             .await?)
     }
     pub async fn final_events(&self, time: i64) -> Result<Vec<ScanFinalEvent>> {
-        let columns = &*FILE_SCAN_COLUMNS_LIST;
+        let columns = FILE_SCAN_COLUMNS_LIST;
         // 无删除的常见轮次只读去重所需列，避免解压整轮旧条目的全部元数据。
         let has_old = self
             .read_query(&format!(
@@ -426,7 +426,7 @@ impl NativeScanAccess<'_> {
     }
 
     async fn candidate_rows(&self, event_scope: &str) -> Result<Vec<StorageEntryRecord>> {
-        let columns = &*FILE_SCAN_COLUMNS_LIST;
+        let columns = FILE_SCAN_COLUMNS_LIST;
         let scope = format!("{event_scope} AND operation_type='candidate_new'");
         let keys = format!(
             "SELECT relative_path,version_id FROM {} FINAL WHERE {scope}",

@@ -31,7 +31,6 @@ pub(super) struct ClusterIncrementalStorageEntryRecord<'a> {
     pub file_handle: Option<&'a str>,
     pub version_id: &'a str,
     pub tags: Option<&'a str>,
-    pub version_count: Option<u32>,
     pub marker_state: Option<&'a str>,
     pub create_at: i64,
     pub comment: Option<&'a str>,
@@ -64,7 +63,6 @@ impl<'a> ClusterIncrementalStorageEntryRecord<'a> {
             file_handle: record.file_handle.as_deref(),
             version_id: &record.version_id,
             tags: record.tags.as_deref(),
-            version_count: record.version_count,
             marker_state: record.marker_state.as_deref(),
             create_at: record.create_at,
             comment: record.comment.as_deref(),
@@ -137,7 +135,6 @@ pub(super) struct ClusterNativeScanRecord<'a> {
     pub file_handle: Option<&'a str>,
     pub version_id: &'a str,
     pub tags: Option<&'a str>,
-    pub version_count: Option<u32>,
     pub marker_state: Option<&'a str>,
     pub identity_key: &'a str,
     pub backend_kind: &'static str,
@@ -178,7 +175,6 @@ impl<'a> ClusterNativeScanRecord<'a> {
             file_handle: record.file_handle.as_deref(),
             version_id: record.version_id,
             tags: record.tags.as_deref(),
-            version_count: record.version_count,
             marker_state: record.marker_state.as_deref(),
             identity_key: &record.identity_key,
             backend_kind: record.backend_kind,
@@ -207,7 +203,7 @@ mod tests {
             "ext":"dat", "ctime":11, "mtime":12, "atime":13, "mode":420, "storage_type":"nas",
             "is_symlink":false, "is_dir":false, "is_regular_file":true, "hard_links":2,
             "current_state":1, "uid":1000, "gid":1001, "ino":42, "file_handle":"abcd",
-            "version_id":"v1", "tags":"[]", "version_count":2, "create_at":17, "comment":"old/source.dat"
+            "version_id":"v1", "tags":"[]", "create_at":17, "comment":"old/source.dat"
         }))?;
         let mut expected = serde_json::to_value(&record)?;
         expected["job_id"] = json!("job");

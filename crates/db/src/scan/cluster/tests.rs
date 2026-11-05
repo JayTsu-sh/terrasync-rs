@@ -374,7 +374,7 @@ async fn cluster_shared_batch_prunes_base_and_supports_concurrent_jobs() -> Resu
         .client
         .query(&format!(
             "SELECT {} FROM {name}.scan_resume_batch WHERE job_id='a' AND batch_id={batch}",
-            *FILE_SCAN_COLUMNS_LIST
+            FILE_SCAN_COLUMNS_LIST
         ))
         .fetch_all::<StorageEntryRecord>()
         .await?;
@@ -585,7 +585,7 @@ async fn cluster_native_candidate_cache_rechecks_content_state_and_tombstones() 
     let candidates = [candidate(doomed.clone())];
     store.events_native(&candidates, epoch).await?;
     store.write_native_candidates(&[doomed], false, &candidates).await?;
-    let columns = &*FILE_SCAN_COLUMNS_LIST;
+    let columns = FILE_SCAN_COLUMNS_LIST;
     store.client.query(&format!("INSERT INTO base (job_id,epoch,ver,is_deleted,{columns}) SELECT job_id,epoch,fromUnixTimestamp64Nano(?),1,{columns} FROM base FINAL WHERE job_id='candidate_cache' AND relative_path='doomed'"))
         .bind(epoch+1).execute_scan().await?;
     let live: u64 = store
