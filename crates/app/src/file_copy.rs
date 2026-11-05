@@ -62,7 +62,8 @@ pub(crate) enum MetadataApplication {
 }
 
 pub(crate) async fn copy_file(
-    from: &StorageEnum, to: &StorageEnum, entry: &ObservedEntry, options: CopyOptions, hdfs: Option<&HdfsCopyContext>,
+    from: &StorageEnum, to: &StorageEnum, entry: &Arc<ObservedEntry>, options: CopyOptions,
+    hdfs: Option<&HdfsCopyContext>,
 ) -> Result<MetadataApplication> {
     if matches!(to, StorageEnum::HDFS(_)) {
         let context = hdfs
@@ -91,10 +92,10 @@ pub(crate) async fn copy_versions<I: Iterator<Item = ObservedItem> + Send>(
         if !keep_history && item.entry.kind() == EntryKind::Directory {
             to.create_dir_all(&item.entry).await?;
         } else {
-            StorageEnum::copy_observed_view(
+            StorageEnum::copy_observed_item(
                 from,
                 to,
-                item.view(),
+                &item,
                 &options,
                 hdfs.as_ref().map(HdfsCopyContext::transfer_identity),
             )
@@ -122,7 +123,7 @@ fn retain_version(item: &ObservedItem, keep_history: bool) -> bool {
 mod tests {
     use tokio::fs;
 
-    use std::path::Path;
+    use std::{path::Path, sync::Arc};
 
     use storage_adapter::hdfs::HdfsResumeMode;
     use storage_adapter::{CreateStorageOptions, StorageEnum, create_storage};
@@ -200,6 +201,7 @@ mod tests {
             .get_metadata(Path::new("payload.bin"))
             .await
             .unwrap_or_else(|error| panic!("source metadata: {error}"));
+        let entry = Arc::new(entry);
 
         let metadata = super::copy_file(&source, &destination, &entry, CopyOptions::default(), None)
             .await

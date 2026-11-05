@@ -190,8 +190,8 @@ pub async fn receiver_task(
 /// 根据 entry 类型（目录/符号链接/文件）dispatch 到不同的存储操作。
 /// 单进程模式下 Receiver 拥有 src+dest storage，可以直接调用 `copy_file`。
 pub(crate) async fn process_entry_on_receiver(
-    entry: &ObservedEntry, src_storage: &Arc<StorageEnum>, dest_storage: &Arc<StorageEnum>, config: &ReceiverConfig,
-    qos_manager: Option<QosManager>, bytes_counter: Option<Arc<AtomicU64>>,
+    entry: &Arc<ObservedEntry>, src_storage: &Arc<StorageEnum>, dest_storage: &Arc<StorageEnum>,
+    config: &ReceiverConfig, qos_manager: Option<QosManager>, bytes_counter: Option<Arc<AtomicU64>>,
 ) -> Result<()> {
     let relative_path = entry.get_relative_path();
     let span = info_span!("recv_entry", path = %relative_path.display());

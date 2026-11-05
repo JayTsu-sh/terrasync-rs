@@ -276,7 +276,7 @@ async fn stream_keeps_primary_metadata_error_when_cleanup_also_fails() {
 #[tokio::test]
 async fn unsupported_modes_fail_before_destination_mutation() {
     let (root, destination, probe) = destination(false).await;
-    let entry = destination.get_metadata(Path::new("file")).await.unwrap();
+    let entry = Arc::new(destination.get_metadata(Path::new("file")).await.unwrap());
     for mode in [TransferMode::Direct, TransferMode::Checkpoint] {
         probe.resumable.store(false, Ordering::SeqCst);
         let error = StorageEnum::copy_file(

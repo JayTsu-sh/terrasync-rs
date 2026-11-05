@@ -2,7 +2,7 @@
 //! 通过旧目标的硬链接观察实际写入语义，防止显式模式被静默替换。
 #[path = "../../../tests/support/observed.rs"]
 mod observed_fixtures;
-use std::{error::Error, os::unix::fs::MetadataExt, path::Path};
+use std::{error::Error, os::unix::fs::MetadataExt, path::Path, sync::Arc};
 use storage_adapter::{CopyOptions, CreateStorageOptions, StorageEnum, TransferMode, create_storage};
 
 #[tokio::test]
@@ -26,7 +26,7 @@ async fn direct_updates_existing_inode_while_atomic_and_checkpoint_replace_it() 
                 CreateStorageOptions::new(Some(64 * 1024), false),
             )
             .await?;
-            let entry = source.get_metadata(Path::new("file")).await?;
+            let entry = Arc::new(source.get_metadata(Path::new("file")).await?);
             StorageEnum::copy_file(
                 &source,
                 &target,

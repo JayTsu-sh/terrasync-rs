@@ -727,7 +727,7 @@ pub(crate) fn should_resume(resume: &ResumeOpts, entry: &ObservedEntry, src: &St
 ///   （data-mover 以 ListParts 反推缺失区间，忽略此处传入的 `missing`）；
 ///   本地状态文件仍随 part 回调更新，仅作进度参考。
 pub(crate) async fn copy_file_with_resume(
-    entry: &ObservedEntry, src_storage: &StorageEnum, dest_storage: &StorageEnum, enable_integrity_check: bool,
+    entry: &Arc<ObservedEntry>, src_storage: &StorageEnum, dest_storage: &StorageEnum, enable_integrity_check: bool,
     is_source_reserved: bool, qos_manager: Option<QosManager>, bytes_counter: Option<Arc<AtomicU64>>, job_dir: &str,
 ) -> Result<()> {
     let dest_rel = entry.get_relative_path();

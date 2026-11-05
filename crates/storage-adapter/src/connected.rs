@@ -1,7 +1,7 @@
 use crate::ObservedEntryExt;
 use crate::{
     error::operation,
-    observed_scan::ObservedView,
+    observed_scan::ObservedItem,
     options::BackendConfig as ProductBackendConfig,
     projection::{decode_acl, encode_acl},
     streaming::source_qos,
@@ -30,7 +30,7 @@ use std::os::windows::ffi::{OsStrExt, OsStringExt};
 use std::{
     num::NonZeroUsize,
     path::{Path, PathBuf},
-    sync::atomic::Ordering,
+    sync::{Arc, atomic::Ordering},
 };
 use tokio::fs::create_dir_all;
 use tokio_util::sync::CancellationToken;
@@ -404,46 +404,50 @@ impl ConnectedStorage {
     }
 }
 impl StorageEnum {
-    pub async fn copy_file(from: &Self, to: &Self, entry: &ObservedEntry, options: CopyOptions) -> Result<()> {
-        for view in ObservedView::all(entry) {
-            if view.version().is_some_and(|record| !record.is_latest()) && !to.is_bucket_versioned().await? {
+    pub async fn copy_file(from: &Self, to: &Self, entry: &Arc<ObservedEntry>, options: CopyOptions) -> Result<()> {
+        let keep_history = entry.history().is_some() && to.is_bucket_versioned().await?;
+        for item in ObservedItem::all(entry) {
+            if item
+                .view()
+                .version()
+                .is_some_and(|record| !keep_history && (!record.is_latest() || record.is_delete_marker()))
+            {
                 continue;
             }
-            Self::copy_observed_view(from, to, view, &options, None).await?;
+            Self::copy_observed_item(from, to, &item, &options, None).await?;
         }
         Ok(())
     }
 
     /// 仅复制指定的原生版本；版本选择和完成通知由任务流程负责。
-    pub async fn copy_observed_view(
-        from: &Self, to: &Self, view: ObservedView<'_>, options: &CopyOptions, identity: Option<&str>,
+    pub async fn copy_observed_item(
+        from: &Self, to: &Self, item: &ObservedItem, options: &CopyOptions, identity: Option<&str>,
     ) -> Result<()> {
         to.validate_transfer_mode(options.transfer_mode)?;
-        let p = view.source_path()?;
+        let view = item.view();
         if view.version().is_some_and(|record| record.is_delete_marker()) {
-            if to.is_bucket_versioned().await? {
-                transfer::write_delete_marker(to.roles.clone(), p, options.cancel.clone().unwrap_or_default()).await?;
-            }
+            transfer::write_delete_marker(
+                to.roles.clone(),
+                view.source_path()?,
+                options.cancel.clone().unwrap_or_default(),
+            )
+            .await?;
             return Ok(());
         }
-        let version = view
-            .source_version()
-            .ok_or_else(|| operation("history object lacks a source version"))?;
-        Self::copy_version(from, to, &p, version, options, identity).await
+        Self::copy_version(from, to, item, options, identity).await
     }
 
     async fn copy_version(
-        from: &Self, to: &Self, path: &StoragePath, version: SourceVersion, options: &CopyOptions,
-        identity: Option<&str>,
+        from: &Self, to: &Self, item: &ObservedItem, options: &CopyOptions, identity: Option<&str>,
     ) -> Result<()> {
-        let mut request = TransferRequest::new(
+        let mut request = TransferRequest::from_shared_observation(
             from.roles.clone(),
-            path.clone(),
+            Arc::clone(&item.entry),
+            item.version_index,
             to.roles.clone(),
             options.cancel.clone().unwrap_or_default(),
-        )
+        )?
         .with_transfer_policy(options.transfer_mode.policy())
-        .with_source_version(version)
         .with_read_back_verification(if options.enable_integrity_check {
             ReadBackVerification::Enabled
         } else {
@@ -467,20 +471,18 @@ impl StorageEnum {
         Ok(())
     }
     pub async fn copy_file_resumable(
-        from: &Self, to: &Self, entry: &ObservedEntry, options: CopyOptions, _resume: ResumeContext,
+        from: &Self, to: &Self, entry: &Arc<ObservedEntry>, options: CopyOptions, _resume: ResumeContext,
     ) -> Result<()> {
         to.validate_transfer_mode(TransferMode::Checkpoint)?;
         // 恢复权威在目标端；不再信任应用的 .part 路径或本地 offset 记录。
-        let mut request = TransferRequest::new(
+        let mut request = TransferRequest::from_shared_observation(
             from.roles.clone(),
-            path(entry.get_relative_path())?,
+            Arc::clone(entry),
+            None,
             to.roles.clone(),
             options.cancel.unwrap_or_default(),
-        )
+        )?
         .with_transfer_policy(TransferPolicy::Checkpointed);
-        if let Some(version) = entry.get_version_id() {
-            request = request.with_source_version(SourceVersion::Id(version.into()));
-        }
         request = request.with_read_back_verification(if options.enable_integrity_check {
             ReadBackVerification::Enabled
         } else {

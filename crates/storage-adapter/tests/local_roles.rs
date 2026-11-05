@@ -142,7 +142,7 @@ async fn role_copy_replaces_shorter_file_and_move_removes_only_verified_source()
     tokio::fs::write(destination.path().join("payload"), b"old-long-data").await?;
     let src = local(source.path()).await?;
     let dst = local(destination.path()).await?;
-    let entry = src.get_metadata(Path::new("payload")).await?;
+    let entry = Arc::new(src.get_metadata(Path::new("payload")).await?);
     StorageEnum::copy_file(
         &src,
         &dst,
@@ -178,7 +178,7 @@ async fn streamed_destination_is_published_only_after_complete() -> TestResult {
     tokio::fs::write(destination.path().join("payload"), b"old").await?;
     let src = local(source.path()).await?;
     let dst = local(destination.path()).await?;
-    let entry = src.get_metadata(Path::new("payload")).await?;
+    let entry = Arc::new(src.get_metadata(Path::new("payload")).await?);
     let handle = StorageEnum::prepare_stream(&dst, &entry).await?;
     let (tx, rx) = tokio::sync::mpsc::channel(1);
     let writer_dst = dst.clone();
@@ -218,7 +218,7 @@ async fn short_stream_cannot_replace_an_existing_destination() -> TestResult {
     tokio::fs::write(destination.path().join("payload"), b"old").await?;
     let src = local(source.path()).await?;
     let dst = local(destination.path()).await?;
-    let entry = src.get_metadata(Path::new("payload")).await?;
+    let entry = Arc::new(src.get_metadata(Path::new("payload")).await?);
     let handle = StorageEnum::prepare_stream(&dst, &entry).await?;
     let (tx, rx) = tokio::sync::mpsc::channel(1);
     tx.send(DataChunk {
@@ -324,7 +324,7 @@ async fn caller_offset_records_cannot_authorize_destination_resume() -> TestResu
     tokio::fs::write(source.path().join("payload"), &payload).await?;
     let src = local(source.path()).await?;
     let dst = local(destination.path()).await?;
-    let entry = src.get_metadata(Path::new("payload")).await?;
+    let entry = Arc::new(src.get_metadata(Path::new("payload")).await?);
     assert!(
         entry.get_file_handle().is_none(),
         "local runtime identity must not become a cross-scan rename key"
@@ -397,5 +397,59 @@ async fn packaged_scan_can_use_the_checkpoint_contract_required_for_network_reco
         ]
         .into()
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn copied_observation_rejects_source_changes_before_any_target_write() -> TestResult {
+    let source = TempDir::new()?;
+    let destination = TempDir::new()?;
+    tokio::fs::write(source.path().join("payload"), b"observed").await?;
+    tokio::fs::write(destination.path().join("payload"), b"published").await?;
+    let src = local(source.path()).await?;
+    let dst = local(destination.path()).await?;
+    let observed = Arc::new(src.get_metadata(Path::new("payload")).await?);
+    tokio::fs::write(source.path().join("payload"), b"modified after scan").await?;
+    let mut modes = vec![
+        storage_adapter::TransferMode::Atomic,
+        storage_adapter::TransferMode::Checkpoint,
+    ];
+    if cfg!(unix) {
+        modes.push(storage_adapter::TransferMode::Direct);
+    }
+    for transfer_mode in modes {
+        let result = StorageEnum::copy_file(
+            &src,
+            &dst,
+            &observed,
+            CopyOptions {
+                transfer_mode,
+                is_source_reserved: false,
+                enable_integrity_check: true,
+                ..Default::default()
+            },
+        )
+        .await;
+        assert!(result.is_err(), "stale observation was accepted in {transfer_mode:?}");
+        assert_eq!(
+            tokio::fs::read(source.path().join("payload")).await?,
+            b"modified after scan"
+        );
+        assert_eq!(tokio::fs::read(destination.path().join("payload")).await?, b"published");
+    }
+    let result = StorageEnum::copy_file_resumable(
+        &src,
+        &dst,
+        &observed,
+        CopyOptions::default(),
+        storage_adapter::ResumeContext {
+            part_relative_path: "advisory.part".into(),
+            missing_intervals: Vec::new(),
+            on_committed: Arc::new(|_, _| {}),
+        },
+    )
+    .await;
+    assert!(result.is_err());
+    assert_eq!(tokio::fs::read(destination.path().join("payload")).await?, b"published");
     Ok(())
 }

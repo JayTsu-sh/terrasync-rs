@@ -207,8 +207,8 @@ mod tests {
         }
 
         async fn classify_catalogue_items(&self) -> DatabaseResult<Vec<db::catalogue::CatalogueDifference>> {
-            self.detect_new_items().await?;
-            self.detect_changed_items().await?;
+            drop(self.detect_new_items().await?);
+            drop(self.detect_changed_items().await?);
             Ok(Vec::new())
         }
 

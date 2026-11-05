@@ -1351,7 +1351,7 @@ impl SyncOrchestrator {
     /// rename 后的内容与元数据必须完成，才能确认该条目的新状态。
     #[allow(clippy::too_many_arguments)]
     async fn sync_renamed_file_changes(
-        kind: ChangeKind, entry: &ObservedEntry, src: &StorageEnum, dest: &StorageEnum, qos: Option<QosManager>,
+        kind: ChangeKind, entry: &Arc<ObservedEntry>, src: &StorageEnum, dest: &StorageEnum, qos: Option<QosManager>,
         integrity: bool, source_reserved: bool, bytes: Option<Arc<AtomicU64>>, job_id: &str, job_dir: &str,
         transfer_mode: TransferMode,
     ) -> Result<()> {

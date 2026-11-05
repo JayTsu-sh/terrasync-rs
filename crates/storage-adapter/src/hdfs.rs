@@ -1,11 +1,8 @@
 use crate::ObservedEntryExt;
+use crate::streaming::source_qos;
 use crate::*;
-use crate::{connected::path, streaming::source_qos};
-use data_mover::{
-    model::SourceVersion,
-    transfer::{self, ReadBackVerification, TransferIdentity, TransferRequest},
-};
-use std::sync::atomic::Ordering;
+use data_mover::transfer::{self, ReadBackVerification, TransferIdentity, TransferRequest};
+use std::sync::{Arc, atomic::Ordering};
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum HdfsResumeMode {
     Auto,
@@ -33,7 +30,7 @@ impl HdfsRecoverableCopyOptions {
 }
 impl StorageEnum {
     pub async fn copy_file_hdfs_recoverable(
-        source: &Self, destination: &Self, entry: &ObservedEntry, options: CopyOptions,
+        source: &Self, destination: &Self, entry: &Arc<ObservedEntry>, options: CopyOptions,
         recovery: HdfsRecoverableCopyOptions,
     ) -> Result<()> {
         if recovery.mode == HdfsResumeMode::Require {
@@ -48,17 +45,15 @@ impl StorageEnum {
             HdfsResumeMode::Require => unreachable!("require-resume was rejected"),
         };
         destination.validate_transfer_mode(mode)?;
-        let mut request = TransferRequest::new(
+        let mut request = TransferRequest::from_shared_observation(
             source.roles.clone(),
-            path(entry.get_relative_path())?,
+            Arc::clone(entry),
+            None,
             destination.roles.clone(),
             options.cancel.unwrap_or_default(),
-        )
+        )?
         .with_identity_override(TransferIdentity::from_label(recovery.identity).map_err(StorageError::from)?)
         .with_transfer_policy(mode.policy());
-        if let Some(version) = entry.get_version_id() {
-            request = request.with_source_version(SourceVersion::Id(version.into()));
-        }
         if let Some(qos) = options.qos {
             request = request.with_source_qos(source_qos(&qos, source.block_size)?);
         }
