@@ -1,3 +1,4 @@
+use crate::copied_metadata::copied_metadata_plan;
 use crate::observed_scan::{EntryStatistics, ObservedItem, ObservedView};
 use crate::{
     connected::path,
@@ -7,15 +8,8 @@ use crate::{
 use blake3::{Hash, Hasher};
 use data_mover::storage::{StorageRoleFailure, WriteProgress, WriteProgressObserver};
 use data_mover::{
-    metadata::{
-        AclTarget, MetadataPlan, MetadataPlanRequest, MetadataPolicies, MetadataPolicy, MetadataTarget,
-        OwnershipTarget, TimestampTarget, TimestampTargetCapability, ValueTarget, compile_copied_metadata_plan,
-    },
     model::*,
-    storage::{
-        self, ByteStream, CopiedOwnershipTarget, CopiedTimestampTarget, CopiedValueTarget, SourceDescriptor,
-        SourceQosGroup, SourceQosPolicy,
-    },
+    storage::{self, ByteStream, SourceDescriptor, SourceQosGroup, SourceQosPolicy},
     transfer::{
         DirectPatchChunk, DirectPatchInput, DirectPatchSession, ExpertDestinationRequest, ExpertDestinationSession,
         ExpertDestinationTransferred, ExpertSourceEvidence, ExpertSourceRequest, ExpertSourceSession, TransferFailure,
@@ -180,71 +174,6 @@ impl StorageEnum {
         (rx, task)
     }
 }
-/// 从 wire 已捕获的值编译计划；不回读源端，也不修改最终路径。
-fn stream_metadata_plan(destination: &ConnectedStorage, entry: ObservedView<'_>) -> Result<MetadataPlan> {
-    let staged = destination.roles.staged_destination()?;
-    let target = staged.copied_metadata_target();
-    let ownership = entry.metadata().ownership_mode().value();
-    let mode = entry.mode().map(|mode| mode & 0o7777);
-    let owner_permitted = ownership.is_none_or(|owner| staged.may_set_owner(owner.uid, owner.gid));
-    let ownership_target = match target.map(|target| target.ownership) {
-        Some(CopiedOwnershipTarget::Numeric) if owner_permitted => OwnershipTarget::Numeric,
-        Some(CopiedOwnershipTarget::Numeric) => OwnershipTarget::NotPermitted,
-        Some(CopiedOwnershipTarget::ModeOnly) => OwnershipTarget::ModeOnly,
-        _ => OwnershipTarget::NotApplicable,
-    };
-    let timestamps = match target.map(|target| target.timestamps) {
-        Some(CopiedTimestampTarget::Stored(precision)) => TimestampTargetCapability::Supported(TimestampTarget {
-            precision,
-            accessed: true,
-            modified: true,
-            created: false,
-        }),
-        _ => TimestampTargetCapability::Unsupported,
-    };
-    let policies = MetadataPolicies::default()
-        .with_ownership_mode(
-            if ownership.is_some() && owner_permitted && ownership_target == OwnershipTarget::Numeric {
-                MetadataPolicy::RequireExact
-            } else if ownership.is_none() && mode.is_none() {
-                MetadataPolicy::BestEffort
-            } else {
-                MetadataPolicy::AllowKnownLoss
-            },
-        )
-        .with_timestamps(if matches!(timestamps, TimestampTargetCapability::Supported(_)) {
-            MetadataPolicy::AllowKnownLoss
-        } else {
-            MetadataPolicy::BestEffort
-        })
-        .with_tags(if entry.metadata().tags().value().is_some() {
-            MetadataPolicy::BestEffort
-        } else {
-            MetadataPolicy::Omit
-        });
-    Ok(compile_copied_metadata_plan(
-        &MetadataPlanRequest {
-            observations: entry.metadata(),
-            target: MetadataTarget {
-                acl: AclTarget::NotApplicable,
-                xattrs: ValueTarget::NotApplicable,
-                tags: if target.is_some_and(|target| target.tags == CopiedValueTarget::Supported) {
-                    ValueTarget::Supported
-                } else {
-                    ValueTarget::Unsupported
-                },
-                ownership_mode: ownership_target,
-                timestamps,
-            },
-            policies,
-            principal_mapper: None,
-        },
-        ownership.is_none().then_some(mode).flatten(),
-        false,
-        false,
-    )?)
-}
-
 /// basis 提示只由 Receiver 的重建器产生；同位置引用已读取并计入完整摘要。
 pub struct StreamChunk {
     pub chunk: DataChunk,
@@ -355,7 +284,7 @@ impl StorageEnum {
             entry.version().map_or(entry.entry.modified(), VersionRecord::modified),
             identity,
         )?;
-        let metadata_plan = stream_metadata_plan(dest, entry)?;
+        let metadata_plan = copied_metadata_plan(dest, entry)?;
         let identity_key = observed.identity_key();
         let observer = Arc::new(Mutex::new(None::<CommitCallback>));
         let callback = observer.clone();

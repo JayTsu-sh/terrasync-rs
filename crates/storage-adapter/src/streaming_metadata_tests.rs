@@ -5,9 +5,10 @@ use crate::ObservedEntryExt;
 use async_trait::async_trait;
 use bytes::Bytes;
 use data_mover::storage::{
-    BackendConfig, CheckpointObservation, CopiedMetadataTarget, DestinationPrepareRequest, LocalBackendConfig,
-    MetadataMutation, PreparedStage, PublicationEvidence, PublicationFailure, PublishRequest, StagedDestination,
-    StorageBuilder, StorageRoleFailure, VerificationEvidence, VerifyRequest, WriteEvidence, connect_backend,
+    BackendConfig, CheckpointObservation, CopiedMetadataTarget, CopiedValueTarget, DestinationPrepareRequest,
+    LocalBackendConfig, MetadataMutation, PreparedStage, PublicationEvidence, PublicationFailure, PublishRequest,
+    StagedDestination, StorageBuilder, StorageRoleFailure, VerificationEvidence, VerifyRequest, WriteEvidence,
+    connect_backend,
 };
 use data_mover::transfer::TransferPhase;
 use std::{

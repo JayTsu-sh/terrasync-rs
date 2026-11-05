@@ -2,6 +2,7 @@
 //! 所有后端 IO、复制、恢复与原子发布由 data-mover 执行。
 mod archive;
 mod connected;
+mod copied_metadata;
 mod entry;
 mod entry_facts;
 pub mod observation_wire;
