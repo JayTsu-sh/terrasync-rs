@@ -9,7 +9,7 @@ use tokio::task::yield_now;
 use crate::{
     error::Result, execution::queries::check_scan_cancellation, execution::read::QuorumRead,
     scan::rows::NativeScanRecord, schema::entry::EntrySummary as StorageEntryRecord,
-    traits::IncrementalStorageEntryRecord,
+    schema::records::IncrementalStorageEntryRecord,
 };
 
 pub(crate) async fn missing_hash_columns(client: &Client, tables: &[String]) -> Result<Vec<String>> {

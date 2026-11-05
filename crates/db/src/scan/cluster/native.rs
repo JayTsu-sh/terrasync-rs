@@ -5,7 +5,7 @@ use crate::scan::candidate_cache::{CandidateMetadataCache, missing_hash_columns}
 use crate::scan::compare::NativeScanAccess;
 use crate::scan::rows::{NativeScanKey, NativeWriteBatches, OBSERVED_COLUMNS, event_records};
 use crate::scan::rows::{final_event_records, incremental_record};
-use crate::traits::IncrementalStorageEntryRecord;
+use crate::schema::records::IncrementalStorageEntryRecord;
 use data_mover::model::ObservedEntry;
 use std::borrow::Cow;
 use storage_adapter::observed_scan::{ObservedScanEvent, ObservedView};

@@ -6,7 +6,7 @@ use storage_adapter::observed_scan::ObservedItem;
 // 外部crate
 use db::ClickHouseDatabase;
 use db::error::DatabaseError;
-use db::traits::{Database, TarManifestRecord};
+use db::traits::Database;
 use storage_adapter::{ObservedEntry, StorageEntryMessage};
 use tokio::sync::mpsc;
 use tracing::{Instrument, debug, error, info, info_span, trace};
@@ -214,11 +214,7 @@ impl Consumer for DatabaseConsumer {
                             ref entries,
                         } => {
                             trace!("[DatabaseConsumer] Received TarManifest for: {}", tar_path);
-                            let manifest_records: Vec<TarManifestRecord> = entries
-                                .iter()
-                                .map(|e| TarManifestRecord::from_entry(e, tar_path))
-                                .collect();
-                            if let Err(e) = db.batch_insert_tar_manifest(&manifest_records).await {
+                            if let Err(e) = db.batch_insert_tar_manifest(tar_path, entries).await {
                                 error!(
                                     "[DatabaseConsumer] Failed to insert tar manifest for {}: {}",
                                     tar_path, e

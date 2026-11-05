@@ -774,7 +774,6 @@ mod native_completion_tests {
     use crate::consumer::stats::FullStats;
     use crate::observed_fixtures::observation;
     use data_mover::model::{BackendKind, EntryKind, HistoryOrder, ObjectHistory};
-    use db::traits::IncrementalStorageEntryRecord;
 
     fn history(latest_is_delete: bool) -> Arc<ObservedEntry> {
         let observations: Vec<_> = [
@@ -812,7 +811,7 @@ mod native_completion_tests {
     }
 
     #[test]
-    fn completion_shares_history_but_counts_and_persists_each_selected_version_once() {
+    fn completion_shares_history_and_counts_each_selected_version_once() {
         let entry = history(false);
         let mut stats = FullStats::new(JobType::Copy, "selected".into(), String::new(), String::new());
         let completed: Vec<_> = crate::file_copy::selected_copy_items(&entry, true).collect();
@@ -820,11 +819,9 @@ mod native_completion_tests {
         let mut ids = Vec::new();
         for item in completed {
             assert!(Arc::ptr_eq(&item.entry, &entry));
+            ids.push(item.view().version_id().to_owned());
             let event = StorageEntryMessage::New(item);
             stats.update_from_message(&event);
-            let rows = IncrementalStorageEntryRecord::from_message(&event).unwrap();
-            assert_eq!(rows.len(), 1);
-            ids.push(rows[0].version_id.clone());
         }
         assert_eq!(stats.regular_file_count, 3);
         assert_eq!(stats.regular_file_size, 37);

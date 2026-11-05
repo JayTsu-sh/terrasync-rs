@@ -1,321 +1,12 @@
-//! 数据库接口和数据结构定义模块
-//!
-//! 该模块定义了数据库访问的核心接口和数据结构，包括：
-//! 1. 数据库访问接口（Database trait）
-//! 2. 存储条目消息类型
-//! 3. 查询结果结构体
-//! 4. 存储条目记录结构体
-//! 5. 辅助函数和转换方法
-
-// 标准库
-use std::sync::Arc;
-use std::time::SystemTime;
-use storage_adapter::ObservedEntryExt;
-
-// 外部crate
+//! 任务使用的目录操作契约；行编码与 SQL 投影由 schema 模块负责。
 use crate::catalogue::{CatalogueChange, CatalogueDifference, ComparisonMode, compare_catalogue_batch};
-use crate::error::DatabaseError;
-use crate::scan::rows::{capture_summary, incremental_record};
-use async_trait::async_trait;
-use data_mover::model::{BackendIdentity, BackendKind};
-use serde::{Deserialize, Serialize};
-use storage_adapter::{ChangeKind, ObservedEntry, StorageEntryMessage};
-use tokio::sync::mpsc;
-
-// 内部模块
 use crate::common::DeletionStatus;
 use crate::error::Result;
-
-/// 查询结果结构体
-/// 包含查询返回的行数据、受影响的行数和最后插入的ID
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub(crate) struct QueryResult {
-    /// 查询返回的行数据
-    pub rows: Vec<serde_json::Value>,
-    /// 受影响的行数
-    pub affected_rows: u64,
-    /// 最后插入的ID（可选）
-    pub last_insert_id: Option<u64>,
-}
-
-/// 文件扫描记录结构体
-/// 统一的数据结构，用于存储文件系统扫描结果
-#[derive(Debug, Clone, Serialize, Deserialize, clickhouse::Row)]
-pub struct StorageEntryRecord {
-    /// 文件或目录的名称
-    pub name: String,
-    /// 相对路径(主键)
-    pub relative_path: String,
-    /// 文件大小（字节）
-    pub size: u64,
-    /// 文件扩展名（可选）
-    pub ext: Option<String>,
-    /// 创建时间（时间戳）
-    pub ctime: i64,
-    /// 修改时间（时间戳）
-    pub mtime: i64,
-    /// 访问时间（时间戳）
-    pub atime: i64,
-    /// Unix权限模式（可选，如0o755）
-    pub mode: Option<u32>,
-    /// 存储类型 ("nas" 或 "s3")
-    pub storage_type: String,
-    /// 是否为符号链接
-    pub is_symlink: bool,
-    /// 是否为目录
-    pub is_dir: bool,
-    /// 是否为普通文件
-    pub is_regular_file: bool,
-    /// 硬链接数量
-    pub hard_links: u32,
-    /// 当前扫描状态
-    pub current_state: u8,
-    /// 用户ID
-    pub uid: Option<u32>,
-    /// 组ID
-    pub gid: Option<u32>,
-    /// 索引节点号
-    pub ino: Option<u64>,
-    /// 文件句柄（NFS file handle / CIFS file ID 等）
-    pub file_handle: Option<String>,
-    /// 对象版本ID（S3多版本使用）
-    pub version_id: String,
-    /// 文件标签
-    pub tags: Option<String>,
-    pub marker_state: Option<String>,
-    pub backend_kind: String,
-    pub backend_id: String,
-    pub entry_snapshot: Vec<u8>,
-}
-
-impl StorageEntryRecord {
-    #[cfg(test)]
-    pub fn capture(entry: &ObservedEntry, generation: u8) -> Result<Self> {
-        let fields = capture_summary(
-            storage_adapter::observed_scan::ObservedView {
-                entry,
-                version_index: entry.history().map(|_| 0),
-            },
-            generation,
-        )?;
-        Ok(Self {
-            name: fields.name,
-            relative_path: fields.relative_path,
-            size: fields.size,
-            ext: fields.ext,
-            ctime: fields.ctime,
-            mtime: fields.mtime,
-            atime: fields.atime,
-            mode: fields.mode,
-            storage_type: fields.storage_type,
-            is_symlink: fields.is_symlink,
-            is_dir: fields.is_dir,
-            is_regular_file: fields.is_regular_file,
-            hard_links: fields.hard_links,
-            current_state: fields.current_state,
-            uid: fields.uid,
-            gid: fields.gid,
-            ino: fields.ino,
-            file_handle: fields.file_handle,
-            version_id: fields.version_id,
-            tags: fields.tags,
-            marker_state: fields.marker_state,
-            backend_kind: entry.backend_kind().as_str().into(),
-            backend_id: entry.source_identity().backend().stable_id().into(),
-            entry_snapshot: entry.try_encode_snapshot()?.as_bytes().to_vec(),
-        })
-    }
-    /// 目录持久化读取只接受完整原生 snapshot，不从查询列拼造观察。
-    pub fn to_observation(&self) -> Result<ObservedEntry> {
-        let backend = BackendIdentity::new(self.backend_kind.parse()?, self.backend_id.clone())?;
-        let entry = ObservedEntry::decode_snapshot(&self.entry_snapshot, &backend)?;
-        if entry.get_relative_path() != std::path::Path::new(&self.relative_path)
-            && entry
-                .history_source_path()?
-                .as_ref()
-                .is_none_or(|path| path.as_str() != self.relative_path)
-        {
-            return Err(DatabaseError::ObservationProjectionMismatch { field: "relative_path" });
-        }
-        Ok(entry)
-    }
-}
-
-/// 文件增量扫描记录结构体
-/// 对应 `FILE_INCREMENTAL_SCAN_COLUMNS_DEFINITION` 中的列定义
-#[derive(Debug, Clone, Serialize, Deserialize, clickhouse::Row)]
-pub struct IncrementalStorageEntryRecord {
-    /// 操作类型：new, changed, deleted, rename
-    pub operation_type: String,
-    /// 文件或目录的名称
-    pub name: String,
-    /// 相对路径
-    pub relative_path: String,
-    /// 文件大小（字节）
-    pub size: u64,
-    /// 文件扩展名（可选）
-    pub ext: Option<String>,
-    /// 创建时间（纳秒时间戳）
-    pub ctime: i64,
-    /// 修改时间（纳秒时间戳）
-    pub mtime: i64,
-    /// 访问时间（纳秒时间戳）
-    pub atime: i64,
-    /// Unix权限模式（可选，如0o755）
-    pub mode: Option<u32>,
-    /// 存储类型 ("nas" 或 "s3")
-    pub storage_type: String,
-    /// 是否为符号链接
-    pub is_symlink: bool,
-    /// 是否为目录
-    pub is_dir: bool,
-    /// 是否为普通文件
-    pub is_regular_file: bool,
-    /// 硬链接数量
-    pub hard_links: u32,
-    /// 当前扫描状态
-    pub current_state: u8,
-    /// 用户ID
-    pub uid: Option<u32>,
-    /// 组ID
-    pub gid: Option<u32>,
-    /// 索引节点号
-    pub ino: Option<u64>,
-    /// 文件句柄（hex 字符串格式）
-    pub file_handle: Option<String>,
-    /// 对象版本ID（S3多版本使用）
-    pub version_id: String,
-    /// 文件标签
-    pub tags: Option<String>,
-    pub marker_state: Option<String>,
-    /// 记录创建时间
-    pub create_at: i64,
-    /// 备注信息（如重命名时的源路径）
-    pub comment: Option<String>,
-}
-
-impl IncrementalStorageEntryRecord {
-    pub fn from_message(message: &StorageEntryMessage) -> Result<Vec<Self>> {
-        let now = i64::try_from(SystemTime::now().duration_since(SystemTime::UNIX_EPOCH)?.as_nanos())?;
-        let (entry, operation, comment) = match message {
-            StorageEntryMessage::Scanned(entry) => (entry, "scanned", None),
-            StorageEntryMessage::Packaged(entry) => (entry, "packaged", None),
-            StorageEntryMessage::New(item) => {
-                let row = capture_summary(item.view(), 0)?;
-                return Ok(vec![incremental_record(row, "new", None, now)]);
-            }
-            StorageEntryMessage::Changed { entry, kind } => {
-                let row = capture_summary(entry.view(), 0)?;
-                return Ok(vec![incremental_record(row, kind.as_state_str(), None, now)]);
-            }
-            StorageEntryMessage::Deleted(entry) => (entry, "deleted", None),
-            StorageEntryMessage::IntegrityChecked(entry) => (entry, "integrity_checked", None),
-            StorageEntryMessage::Renamed((from, to)) => (to, "rename", Some(from.path().as_str().to_owned())),
-            StorageEntryMessage::Error {
-                event,
-                path,
-                entry,
-                reason,
-            } => {
-                let comment = Some(format!("[{event}] {reason}"));
-                if let Some(entry) = entry {
-                    return Self::observed_rows(entry, "error", comment, now);
-                }
-                let row = crate::schema::entry::EntrySummary {
-                    name: path
-                        .file_name()
-                        .map_or_else(String::new, |value| value.to_string_lossy().into_owned()),
-                    relative_path: path.to_string_lossy().into_owned(),
-                    ..Default::default()
-                };
-                return Ok(vec![incremental_record(row, "error", comment, now)]);
-            }
-            StorageEntryMessage::TarManifest { .. } => {
-                return Err(DatabaseError::ConversionError(
-                    "tar manifest must use the manifest writer".into(),
-                ));
-            }
-        };
-        Self::observed_rows(entry, operation, comment, now)
-    }
-
-    fn observed_rows(entry: &ObservedEntry, operation: &str, comment: Option<String>, now: i64) -> Result<Vec<Self>> {
-        storage_adapter::observed_scan::ObservedView::all(entry)
-            .map(|view| {
-                let row = capture_summary(view, 0)?;
-                Ok(incremental_record(row, operation, comment.clone(), now))
-            })
-            .collect()
-    }
-}
-
-/// Tar 打包 manifest 记录
-/// 记录每个 .tar 文件内部包含的条目信息，兼容 NAS 和 S3 条目
-#[derive(Debug, Clone, Serialize, Deserialize, clickhouse::Row)]
-pub struct TarManifestRecord {
-    /// .tar 文件的 `relative_path`
-    pub tar_path: String,
-    /// tar 内条目的相对路径
-    pub entry_path: String,
-    /// 文件大小（字节）
-    pub size: u64,
-    /// 文件扩展名（可选）
-    pub ext: Option<String>,
-    /// 修改时间（纳秒时间戳）
-    pub mtime: i64,
-    /// Unix 权限模式（NAS 有，S3 为 None）
-    pub mode: Option<u32>,
-    /// 存储类型 ("nas" 或 "s3")
-    pub storage_type: String,
-    /// 是否为目录
-    pub is_dir: bool,
-    /// 是否为符号链接
-    pub is_symlink: bool,
-    /// 用户 ID（NAS 有，S3 为 None）
-    pub uid: Option<u32>,
-    /// 组 ID（NAS 有，S3 为 None）
-    pub gid: Option<u32>,
-    /// 对象版本 ID（S3 多版本使用，NAS 为空字符串）
-    pub version_id: String,
-    /// 文件标签（S3 使用，JSON 字符串）
-    pub tags: Option<String>,
-}
-
-impl TarManifestRecord {
-    /// 从 `ObservedEntry` 和 tar 路径创建 `TarManifestRecord`
-    pub fn from_entry(entry: &ObservedEntry, tar_path: &str) -> Self {
-        let storage_type = match entry.backend_kind() {
-            BackendKind::S3 => "s3",
-            BackendKind::Hdfs => "hdfs",
-            _ => "nas",
-        };
-        let tags = entry.get_tags().and_then(|tags| {
-            serde_json::to_string(
-                &tags
-                    .iter()
-                    .map(|tag| (tag.key(), tag.value()))
-                    .collect::<std::collections::BTreeMap<_, _>>(),
-            )
-            .ok()
-        });
-
-        Self {
-            tar_path: tar_path.to_string(),
-            entry_path: entry.get_relative_path().to_string_lossy().into_owned(),
-            size: entry.get_size(),
-            ext: entry.get_extension().map(str::to_string),
-            mtime: entry.get_mtime(),
-            mode: entry.get_mode(),
-            storage_type: storage_type.to_string(),
-            is_dir: entry.get_is_dir(),
-            is_symlink: entry.get_is_symlink(),
-            uid: entry.get_uid(),
-            gid: entry.get_gid(),
-            version_id: entry.get_version_id().unwrap_or_default().to_string(),
-            tags,
-        }
-    }
-}
+use async_trait::async_trait;
+use std::sync::Arc;
+use storage_adapter::observed_scan::ObservedItem;
+use storage_adapter::{ChangeKind, ObservedEntry, StorageEntryMessage};
+use tokio::sync::mpsc;
 
 /// 复制目录轮次是否需要重放未确认的目标操作。
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -326,8 +17,7 @@ pub enum CopyGenerationStatus {
     Recovering,
 }
 
-/// 数据库通用接口
-/// 定义所有数据库后端需要实现的方法
+/// 任务使用的 ClickHouse 目录操作；单机与集群布局由实现内部处理。
 #[async_trait]
 pub trait Database: Send + Sync {
     /// 创建当前对象的Box克隆
@@ -406,9 +96,7 @@ pub trait Database: Send + Sync {
     /// - 成功返回Ok(())
     /// - 失败返回错误信息
     /// 仅写入实际完成的版本，借用共享观察，不扩大到同一对象的其他历史。
-    async fn batch_insert_completed_records(
-        &self, records: &[storage_adapter::observed_scan::ObservedItem],
-    ) -> Result<()>;
+    async fn batch_insert_completed_records(&self, records: &[ObservedItem]) -> Result<()>;
 
     async fn update_base_record(&self, record: &Arc<ObservedEntry>) -> Result<()>;
 
@@ -532,7 +220,7 @@ pub trait Database: Send + Sync {
     async fn create_tar_manifest_table(&self) -> Result<()>;
 
     /// 批量插入 tar manifest 记录
-    async fn batch_insert_tar_manifest(&self, records: &[TarManifestRecord]) -> Result<()>;
+    async fn batch_insert_tar_manifest(&self, tar_path: &str, entries: &[Arc<ObservedEntry>]) -> Result<()>;
 
     /// 检查指定表名是否存在
     ///
@@ -551,32 +239,5 @@ pub trait Database: Send + Sync {
 impl Clone for Box<dyn Database> {
     fn clone(&self) -> Self {
         (**self).clone_box()
-    }
-}
-
-impl storage_adapter::observed_scan::EntryStatistics for StorageEntryRecord {
-    fn get_size(&self) -> u64 {
-        self.size
-    }
-    fn get_name(&self) -> &str {
-        &self.name
-    }
-    fn get_relative_path(&self) -> &std::path::Path {
-        std::path::Path::new(&self.relative_path)
-    }
-    fn get_extension(&self) -> Option<&str> {
-        self.ext.as_deref()
-    }
-    fn get_is_dir(&self) -> bool {
-        self.is_dir
-    }
-    fn get_is_symlink(&self) -> bool {
-        self.is_symlink
-    }
-    fn get_is_regular_file(&self) -> bool {
-        self.is_regular_file
-    }
-    fn get_mtime(&self) -> i64 {
-        self.mtime
     }
 }

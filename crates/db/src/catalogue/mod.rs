@@ -30,9 +30,8 @@ use crate::scan::rows::NativeScanRecord;
 use crate::schema::columns::{
     CATALOGUE_COLUMNS as FILE_SCAN_COLUMNS_LIST, FILE_INCREMENTAL_SCAN_COLUMNS_DEFINITION, FILE_SCAN_COLUMNS_DEFINITION,
 };
-use crate::traits::{
-    CopyGenerationStatus, Database, IncrementalStorageEntryRecord, QueryResult, StorageEntryRecord, TarManifestRecord,
-};
+use crate::schema::records::{IncrementalStorageEntryRecord, StorageEntryRecord, TarManifestRecord};
+use crate::traits::{CopyGenerationStatus, Database};
 use crate::{
     INCREMENTAL_SCAN_TABLE_BASE_NAME, SCAN_BASE_TABLE_BASE_NAME, SCAN_STATE_TABLE_BASE_NAME,
     TAR_MANIFEST_TABLE_BASE_NAME, generate_scan_temp_table_name, get_incremental_scan_base_table_name,
@@ -162,7 +161,7 @@ impl ClickHouseDatabase {
     /// 执行SQL语句，支持参数化查询
     ///
     /// 注意：由于ClickHouse execute API的限制，当前无法获取受影响的行数
-    pub(crate) async fn execute(&self, sql: &str, params: &[Value]) -> Result<QueryResult> {
+    pub(crate) async fn execute(&self, sql: &str, params: &[Value]) -> Result<()> {
         check_scan_cancellation()?;
         let _write = self.catalogue_write_guard().await;
         debug!("Executing ClickHouse statement: {}", sql);
@@ -185,11 +184,7 @@ impl ClickHouseDatabase {
 
         query.execute_scan().await?;
 
-        Ok(QueryResult {
-            rows: Vec::new(),
-            affected_rows: 0, // ClickHouse execute返回()，无法获取affected_rows
-            last_insert_id: None,
-        })
+        Ok(())
     }
 
     /// 创建主扫描表（ReplacingMergeTree，按 `relative_path` + `version_id` 排序）
@@ -997,8 +992,8 @@ impl Database for ClickHouseDatabase {
         self.create_tar_manifest_table_impl().await
     }
 
-    async fn batch_insert_tar_manifest(&self, records: &[TarManifestRecord]) -> Result<()> {
-        if records.is_empty() {
+    async fn batch_insert_tar_manifest(&self, tar_path: &str, entries: &[Arc<ObservedEntry>]) -> Result<()> {
+        if entries.is_empty() {
             return Ok(());
         }
         let _write = self.catalogue_write_guard().await;
@@ -1011,15 +1006,18 @@ impl Database for ClickHouseDatabase {
             .await
             .map_err(DatabaseError::from)?;
 
-        for record in records {
-            insert.write(record).await.map_err(DatabaseError::from)?;
+        for entry in entries {
+            insert
+                .write(&TarManifestRecord::from_entry(entry, tar_path))
+                .await
+                .map_err(DatabaseError::from)?;
         }
 
         insert.end().await.map_err(DatabaseError::from)?;
 
         info!(
             "Successfully inserted {} tar manifest records to {}",
-            records.len(),
+            entries.len(),
             table_name
         );
         Ok(())
@@ -1038,7 +1036,7 @@ mod tests {
 
     use super::*;
     use crate::common::DeletionStatus;
-    use crate::traits::StorageEntryRecord;
+    use crate::schema::records::StorageEntryRecord;
 
     /// 构造 StorageEntryRecord，只需指定关键差异字段
     fn make_record(relative_path: &str, file_handle: Option<&str>, ctime: i64) -> StorageEntryRecord {

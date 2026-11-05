@@ -81,7 +81,15 @@ SQL 列定义和有效投影已集中到 schema／columns，JOIN 分类构造集
 
 失效的 version_count 已从 SQL、Single／Cluster 行 DTO、比较摘要和批内计数中删除，移除了对应分组 map 和路径分配。逐版本视图、原生历史顺序、null／删除标记与实际逐版本 ACK 保留。测试直接断言选择的行数、版本 ID 和数据。
 
-字段清理阶段 fmt／workspace check／Clippy、workspace 测试及双进程 16 例通过；app 201、db 106 个本地测试通过，忽略项另计。真实 Single／Cluster catalogue、Single 集成测试及两种部署的切点测试均通过且独立数据库清理成功，报告前缀 `/tmp/terrasync-db-refactor-real-version-count-v1-`。Cluster 17 个扫描场景仍在运行，其二进制和源摘要记录在 `/tmp/terrasync-version-count-cluster-test-binary.json`，此处不提前记为通过。
+字段清理阶段 fmt／workspace check／Clippy、workspace 测试及双进程 16 例通过；app 201、db 106 个本地测试通过，忽略项另计。真实 Single／Cluster catalogue、Single 集成测试及两种部署的切点测试均通过且独立数据库清理成功，报告前缀 `/tmp/terrasync-db-refactor-real-version-count-v1-`。Cluster 17 个真实扫描场景亦已通过（总耗时约 402 秒），包括大规模身份查询的有界 SQL 校验；独立数据库已清理。二进制和源摘要记录在 `/tmp/terrasync-version-count-cluster-test-binary.json`。这项功能校验不替代相同模式下的吞吐／峰值 RSS 性能验收。
+
+## 私有行编码与 manifest 写入
+
+SQL 行 DTO 已收回私有 schema／records；traits 只描述任务操作，删除了从未携带实际查询结果的 QueryResult。tar manifest 接口直接接收共享原生观察，数据库逐条借用路径、扩展名和版本 ID；应用层不再构造持久化行 Vec，只有 tags 的 SQL JSON 仍需编码。
+
+应用层保留 Arc 共享、逐版本统计及选择 ID 的断言，逐版本 SQL 编码断言迁到私有 schema；manifest 黄金测试核对全部字段与借用。Source snapshot 解码与 insert／end 错误传播保持原样，未改变未知写结果协议。
+
+该阶段 workspace check／Clippy／测试及双进程 E2E 16 例通过；app 201、db 108 个本地测试通过，忽略项另计。真实 catalogue Single 10／10、Cluster 11／11、Single 集成 44／44 通过且测试数据库清理成功。记录前缀 `/tmp/terrasync-db-refactor-real-private-row-v2-`，Rust 日志前缀 `/tmp/terrasync-private-row-dto-`；首次 Clippy 的测试 lint 问题已修复，最终通过日志为 `clippy-v2.log`。
 
 ## 合入前仍须完成
 

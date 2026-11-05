@@ -1,7 +1,7 @@
 //! 集群行封装：业务条目保持原有类型，写入时统一附加任务和轮次，禁止漏写 job_id。
 use crate::scan::ScanResumeState;
 use crate::scan::rows::{NativeScanRecord, serialize_snapshot};
-use crate::traits::IncrementalStorageEntryRecord;
+use crate::schema::records::IncrementalStorageEntryRecord;
 use data_mover::model::EntrySnapshot;
 use serde::Serialize;
 

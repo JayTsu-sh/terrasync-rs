@@ -2,7 +2,9 @@
 #[cfg(test)]
 use crate::error::DatabaseError;
 use crate::scan::ScanFinalEvent;
-use crate::{error::Result, schema::entry::EntrySummary as StorageEntryRecord, traits::IncrementalStorageEntryRecord};
+use crate::{
+    error::Result, schema::entry::EntrySummary as StorageEntryRecord, schema::records::IncrementalStorageEntryRecord,
+};
 use blake3::Hasher;
 use data_mover::model::ObjectTag;
 #[cfg(test)]

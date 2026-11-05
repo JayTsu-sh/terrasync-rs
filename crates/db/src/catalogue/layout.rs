@@ -4,7 +4,7 @@ use crate::config::ClickHouseConfig;
 use crate::error::{DatabaseError, Result};
 use crate::execution::queries::{check_scan_cancellation, scan_retry_delay};
 use crate::schema::identifier;
-use crate::traits::StorageEntryRecord;
+use crate::schema::records::StorageEntryRecord;
 use clickhouse::{Client, error::Error as ClickHouseError, query::Query};
 use std::time::{Duration, Instant};
 use storage_adapter::ObservedEntry;

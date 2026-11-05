@@ -241,7 +241,7 @@ async fn cluster_catalogue_copy_sync_and_delete_are_job_isolated() -> Result<()>
             && comment.as_deref() == Some("oldname"))
     );
     a.create_tar_manifest_table().await?;
-    a.batch_insert_tar_manifest(&[TarManifestRecord::from_entry(next[0].as_ref(), "bundle.tar")])
+    a.batch_insert_tar_manifest("bundle.tar", &[Arc::clone(&next[0])])
         .await?;
     let manifest = base_client(&fixture.config)
         .unwrap()

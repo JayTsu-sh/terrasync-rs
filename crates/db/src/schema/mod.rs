@@ -13,3 +13,5 @@ pub(crate) fn identifier(value: &str) -> Result<String> {
 pub(crate) mod entry;
 
 pub(crate) mod columns;
+
+pub(crate) mod records;

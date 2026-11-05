@@ -6,7 +6,7 @@ use storage_adapter::ObservedEntry;
 use tracing::{error, trace};
 
 use crate::Result;
-use crate::traits::StorageEntryRecord;
+use crate::schema::records::StorageEntryRecord;
 
 /// Represents the status of a deleted item, either a permanent deletion or a rename
 ///
@@ -29,7 +29,7 @@ pub enum DeletionStatus {
 /// - 2 条记录 → `Renamed`（ctime 小 = from，ctime 大 = to）
 /// - 其他 → error 日志
 #[allow(clippy::implicit_hasher)]
-pub fn classify_deletion_status(
+pub(crate) fn classify_deletion_status(
     no_fh_records: Vec<StorageEntryRecord>, fh_records: Vec<StorageEntryRecord>,
     fh_groups: &HashMap<String, Vec<StorageEntryRecord>>,
 ) -> Result<Vec<DeletionStatus>> {

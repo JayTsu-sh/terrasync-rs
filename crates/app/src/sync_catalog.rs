@@ -75,7 +75,7 @@ mod tests {
 
     use async_trait::async_trait;
     use db::error::DatabaseError;
-    use db::traits::{Database, TarManifestRecord};
+    use db::traits::Database;
     use db::{CopyGenerationStatus, DeletionStatus, Result as DatabaseResult};
     use storage_adapter::{ChangeKind, ObservedEntry, StorageEntryMessage};
     use tokio::sync::mpsc;
@@ -251,7 +251,9 @@ mod tests {
         async fn create_tar_manifest_table(&self) -> DatabaseResult<()> {
             Ok(())
         }
-        async fn batch_insert_tar_manifest(&self, _records: &[TarManifestRecord]) -> DatabaseResult<()> {
+        async fn batch_insert_tar_manifest(
+            &self, _tar_path: &str, _entries: &[Arc<ObservedEntry>],
+        ) -> DatabaseResult<()> {
             Ok(())
         }
         async fn table_exists(&self, _table_name: &str) -> DatabaseResult<bool> {
