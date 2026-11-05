@@ -141,6 +141,19 @@ StorageEnum 的五个变体都包装同一个连接对象，现已删除枚举�
 
 无运行时调用的 datetime_to_string 和 Tag 已删除；唯一使用 Tag 的测试改为直接构造同一原生夹具输入，标签应用与发布顺序断言保留。fmt 与对应 stream_s3_tags_are_applied_before_publication 测试通过，日志前缀 `/tmp/terrasync-unused-entry-dto-`。此清理不改变存储 I/O。
 
+## 原生失败与清理错误
+
+删除克隆式 StreamTransferDiagnostic、报告副本及产品层重复清理分支。失败按原传输策略由 data-mover 清理后直接透传 TransferFailure，保留阶段、目标可能已变化、原生元数据报告及独立清理失败。metadata 的 Error::source 采用原生契约（None），类型化原因由 metadata_failure 的 getter 获取；不能宣称旧 source 链完全不变。
+
+依赖精确固定到 `4f42841f02d8fec3cb26d929dcbe245e274b7bd0`。原生完整 make ci 通过，日志 `/tmp/data-mover-expert-input-final-v2-ci.log`；TerraSync fmt、workspace check／Clippy、526 个 workspace 测试及串行双进程 E2E 16 例通过，85 个忽略项未计为通过。日志前缀 `/tmp/terrasync-native-error-final-`。两项架构复审通过。
+
+真实 S3 代理只对本轮目标的数据 PUT 返回 403；旧候选缺少底层分类的复现与修复后复测形成对照。修复候选 release SHA-256 为 `45b48784df5db8b1ec4a4397eea80d5d6783bbfd968d08633259046add863afd`，源码记录 `/tmp/terrasync-cleanup-cause-fixed-build-source.json`。
+
+- 有效失败证据：`/work/terrasync-db-refactor-evidence/release-db-refactor-cleanup-publish-denial-red-v2-20261105-214248/report.json`，拒绝写入的目标保护通过，但 commit 诊断只有 storage role failed，丢失 PermissionDenied。
+- 修复后通过：`/work/terrasync-db-refactor-evidence/release-db-refactor-cleanup-publish-denial-fixed-20261105-221550/report.json`，准确显示 Publish／PermissionDenied／Permanent；1 次数据 PUT、0 次 tags PUT，目标内容、tags 和版本数不变，任务记录 1 个错误且无成功 ACK。独立对象与配置清理成功。
+
+原生 Pending 输入取消回归也已修复：取消交付 typed Cancelled／Write／Transient，继续 await backend 写入以收束已有操作。它验证等待下一输入块的取消，不代表已停滞的所有协议请求都能被此 guard 中断；受影响真实链路的完整故障矩阵仍待最终候选执行。
+
 ## 合入前仍须完成
 
 还需完成数据库目录会话与任务接口的整理，以及按设计删除 storage-adapter。任务契约与 transport 已分离，剩余存储机制和产品配置仍须分别归位。最终候选必须重跑对应 CI、真实 HDFS 和受影响故障链路，并完成全量／增量／续扫性能与峰值 RSS 对照。先前 HDFS 通过的二进制不能作为最终候选证据。
