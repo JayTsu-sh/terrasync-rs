@@ -7,7 +7,10 @@ use crate::{
     traits::{IncrementalStorageEntryRecord, StorageEntryRecord},
 };
 #[cfg(test)]
-use data_mover::model::{BackendIdentity, IdentityStrength, RecordKind, SourceIdentity, StoragePath, VersionRecord};
+use data_mover::model::{
+    BackendIdentity, IdentityStrength, RecordKind, SourceIdentity, SpecialFileKind, StoragePath, SymlinkTarget,
+    SymlinkTargetEncoding, VersionRecord,
+};
 use data_mover::model::{
     BackendKind, EntryKind, EntrySnapshot, HistoryOrder, ObjectHistory, ObservedEntry, StorageTimestamp,
 };
@@ -37,6 +40,99 @@ impl<'a> NativeScanKey<'a> {
             relative_path: view.sql_path(),
             version_id: view.version_id(),
             file_handle: view.file_handle(),
+        }
+    }
+}
+
+// 公共查询列只投影一次；事件不编码随后会丢弃的原生 snapshot。
+struct ScanRowFields {
+    name: String,
+    relative_path: String,
+    size: u64,
+    ext: Option<String>,
+    ctime: i64,
+    mtime: i64,
+    atime: i64,
+    mode: Option<u32>,
+    storage_type: &'static str,
+    is_symlink: bool,
+    is_dir: bool,
+    is_regular_file: bool,
+    hard_links: u32,
+    current_state: u8,
+    uid: Option<u32>,
+    gid: Option<u32>,
+    ino: Option<u64>,
+    file_handle: Option<String>,
+    version_id: String,
+    tags: Option<String>,
+    version_count: Option<u32>,
+}
+impl ScanRowFields {
+    fn capture(view: ObservedView<'_>, generation: u8) -> Result<Self> {
+        let entry = view.entry;
+        let ownership = view.metadata().ownership_mode().value();
+        let timestamps = view.metadata().timestamps().value();
+        let tags = view.metadata().tags().value().map(|tags| {
+            tags.iter()
+                .map(|tag| Tag {
+                    key: tag.key().into(),
+                    value: tag.value().into(),
+                })
+                .collect::<Vec<_>>()
+        });
+        Ok(Self {
+            name: view.get_name().into(),
+            relative_path: view.path(),
+            size: view.get_size(),
+            ext: view.get_extension().map(str::to_owned),
+            ctime: timestamp_nanos(timestamps.and_then(|t| t.created)),
+            mtime: view.get_mtime(),
+            atime: timestamp_nanos(timestamps.and_then(|t| t.accessed)),
+            mode: ownership.map(|o| o.mode),
+            storage_type: match entry.backend_kind() {
+                BackendKind::S3 => "s3",
+                BackendKind::Hdfs => "hdfs",
+                _ => "nas",
+            }
+            .into(),
+            is_symlink: view.get_is_symlink(),
+            is_dir: view.get_is_dir(),
+            is_regular_file: entry.kind() == EntryKind::File,
+            hard_links: 1,
+            current_state: generation,
+            uid: ownership.map(|o| o.uid),
+            gid: ownership.map(|o| o.gid),
+            ino: None,
+            file_handle: view.file_handle(),
+            version_id: view.version_id().into(),
+            tags: tags.as_ref().map(serde_json::to_string).transpose()?,
+            version_count: entry.history().map(|h| h.records().len().min(u32::MAX as usize) as u32),
+        })
+    }
+    fn legacy(self) -> StorageEntryRecord {
+        StorageEntryRecord {
+            name: self.name,
+            relative_path: self.relative_path,
+            size: self.size,
+            ext: self.ext,
+            ctime: self.ctime,
+            mtime: self.mtime,
+            atime: self.atime,
+            mode: self.mode,
+            storage_type: self.storage_type.into(),
+            is_symlink: self.is_symlink,
+            is_dir: self.is_dir,
+            is_regular_file: self.is_regular_file,
+            hard_links: self.hard_links,
+            current_state: self.current_state,
+            uid: self.uid,
+            gid: self.gid,
+            ino: self.ino,
+            file_handle: self.file_handle,
+            version_id: self.version_id,
+            tags: self.tags,
+            version_count: self.version_count,
         }
     }
 }
@@ -83,22 +179,13 @@ pub(crate) fn serialize_snapshot<S: Serializer>(
 impl NativeScanRecord {
     pub(crate) fn capture(view: ObservedView<'_>, generation: u8) -> Result<Self> {
         let entry = view.entry;
-        let ownership = view.metadata().ownership_mode().value();
-        let timestamps = view.metadata().timestamps().value();
+        let fields = ScanRowFields::capture(view, generation)?;
         let kind = match entry.kind() {
             EntryKind::File => "file",
             EntryKind::Directory => "directory",
             EntryKind::Symlink => "symlink",
             EntryKind::Special(_) => "special",
         };
-        let tags = view.metadata().tags().value().map(|tags| {
-            tags.iter()
-                .map(|tag| Tag {
-                    key: tag.key().into(),
-                    value: tag.value().into(),
-                })
-                .collect::<Vec<_>>()
-        });
         let selected;
         let snapshot_entry = if let Some(record) = view.version() {
             // 每个 SQL 版本行仅保存自身 snapshot，避免长历史平方级复制。
@@ -120,32 +207,27 @@ impl NativeScanRecord {
         };
         let modified = snapshot_entry.modified().map(StorageTimestamp::unix_nanos);
         Ok(Self {
-            name: view.get_name().into(),
-            relative_path: view.path(),
-            size: view.get_size(),
-            ext: view.get_extension().map(str::to_owned),
-            ctime: timestamp_nanos(timestamps.and_then(|t| t.created)),
-            mtime: view.get_mtime(),
-            atime: timestamp_nanos(timestamps.and_then(|t| t.accessed)),
-            mode: ownership.map(|o| o.mode),
-            storage_type: match entry.backend_kind() {
-                BackendKind::S3 => "s3",
-                BackendKind::Hdfs => "hdfs",
-                _ => "nas",
-            }
-            .into(),
-            is_symlink: view.get_is_symlink(),
-            is_dir: view.get_is_dir(),
-            is_regular_file: !view.get_is_dir() && !view.get_is_symlink(),
-            hard_links: 1,
-            current_state: generation,
-            uid: ownership.map(|o| o.uid),
-            gid: ownership.map(|o| o.gid),
-            ino: None,
-            file_handle: view.file_handle(),
-            version_id: view.version_id().into(),
-            tags: tags.as_ref().map(serde_json::to_string).transpose()?,
-            version_count: entry.history().map(|h| h.records().len().min(u32::MAX as usize) as u32),
+            name: fields.name,
+            relative_path: fields.relative_path,
+            size: fields.size,
+            ext: fields.ext,
+            ctime: fields.ctime,
+            mtime: fields.mtime,
+            atime: fields.atime,
+            mode: fields.mode,
+            storage_type: fields.storage_type,
+            is_symlink: fields.is_symlink,
+            is_dir: fields.is_dir,
+            is_regular_file: fields.is_regular_file,
+            hard_links: fields.hard_links,
+            current_state: fields.current_state,
+            uid: fields.uid,
+            gid: fields.gid,
+            ino: fields.ino,
+            file_handle: fields.file_handle,
+            version_id: fields.version_id,
+            tags: fields.tags,
+            version_count: fields.version_count,
             identity_key: hex::encode(snapshot_entry.identity_key().as_bytes()),
             backend_kind: entry.backend_kind().as_str().into(),
             entry_kind: kind.into(),
@@ -177,8 +259,9 @@ impl NativeScanRecord {
             version_index,
         })
     }
+    #[cfg(test)]
     pub(crate) fn legacy(self) -> StorageEntryRecord {
-        StorageEntryRecord {
+        ScanRowFields {
             name: self.name,
             relative_path: self.relative_path,
             size: self.size,
@@ -187,7 +270,7 @@ impl NativeScanRecord {
             mtime: self.mtime,
             atime: self.atime,
             mode: self.mode,
-            storage_type: self.storage_type.into(),
+            storage_type: self.storage_type,
             is_symlink: self.is_symlink,
             is_dir: self.is_dir,
             is_regular_file: self.is_regular_file,
@@ -201,6 +284,7 @@ impl NativeScanRecord {
             tags: self.tags,
             version_count: self.version_count,
         }
+        .legacy()
     }
 }
 
@@ -227,7 +311,7 @@ pub(crate) fn event_records(events: &[ObservedScanEvent], time: i64) -> Result<V
 }
 
 pub(crate) fn event_record(event: &ObservedScanEvent, event_time: i64) -> Result<IncrementalStorageEntryRecord> {
-    let record = NativeScanRecord::capture(event.item().view(), 0)?.legacy();
+    let record = ScanRowFields::capture(event.item().view(), 0)?.legacy();
     Ok(incremental_record(
         record,
         event.operation(),
@@ -354,6 +438,43 @@ mod tests {
         assert!(record.observed(&other).is_err());
         Ok(())
     }
+    #[test]
+    fn event_projection_preserves_columns_and_exact_file_kind() -> Result<()> {
+        let backend = BackendIdentity::new(BackendKind::Nfs, "event-projection")?;
+        for kind in [
+            EntryKind::File,
+            EntryKind::Directory,
+            EntryKind::Symlink,
+            EntryKind::Special(SpecialFileKind::BlockDevice),
+            EntryKind::Special(SpecialFileKind::CharacterDevice),
+            EntryKind::Special(SpecialFileKind::Fifo),
+            EntryKind::Special(SpecialFileKind::Socket),
+        ] {
+            let identity = SourceIdentity::new(backend.clone(), IdentityStrength::StableWithinBackend, b"node")?;
+            let entry = if kind == EntryKind::Symlink {
+                ObservedEntry::new_symlink(
+                    StoragePath::new("nested/node.dat")?,
+                    None,
+                    identity,
+                    SymlinkTarget::new(SymlinkTargetEncoding::UnixBytes, b"target".to_vec())?,
+                )?
+            } else {
+                ObservedEntry::new(StoragePath::new("nested/node.dat")?, kind, Some(17), None, identity)?
+            };
+            let entry = Arc::new(entry);
+            let item = ObservedItem {
+                entry,
+                version_index: None,
+            };
+            let native = NativeScanRecord::capture(item.view(), 0)?;
+            assert_eq!(native.is_regular_file, kind == EntryKind::File);
+            let expected = incremental_record(native.legacy(), "new", None, 19);
+            let actual = event_record(&ObservedScanEvent::New(item), 19)?;
+            assert_eq!(serde_json::to_value(actual)?, serde_json::to_value(expected)?);
+        }
+        Ok(())
+    }
+
     #[test]
     fn native_history_preserves_each_version_null_and_delete_marker() -> Result<()> {
         let backend = BackendIdentity::new(BackendKind::S3, "native-history")?;

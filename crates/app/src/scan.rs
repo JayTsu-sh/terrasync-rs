@@ -7,6 +7,8 @@ use tokio_util::sync::CancellationToken;
 use utils::app_config::AppConfig;
 
 pub(crate) mod cancellation;
+pub(crate) mod progress;
+pub(crate) mod statistics;
 mod stream;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -26,6 +28,7 @@ impl std::fmt::Display for ScanType {
 
 /// CLI 与 GUI 共用的扫描请求；持久化及全量／增量选择由扫描模块负责。
 pub struct ScanRequest<'a> {
+    pub resume: bool,
     pub job_id: &'a str,
     pub job_dir: &'a str,
     pub path: &'a str,
@@ -44,6 +47,9 @@ pub async fn scan(request: ScanRequest<'_>) -> Result<()> {
         quick_verify(license)?;
     }
     let mut config = AppConfig::fetch()?;
+    if request.resume && !config.database.enabled {
+        return Err(AppError::ConfigError("扫描 --resume 需要启用 ClickHouse".into()));
+    }
     if let Some(concurrency) = request.concurrency {
         if concurrency == 0 {
             return Err(AppError::ConfigError("扫描并发数必须大于 0".into()));
@@ -78,6 +84,7 @@ mod tests {
         let job = job.to_string_lossy();
         for _ in 0..2 {
             scan(ScanRequest {
+                resume: false,
                 job_id: "gateway",
                 job_dir: &job,
                 path: &source,
@@ -91,7 +98,7 @@ mod tests {
             })
             .await?;
         }
-        assert!(!directory.path().join("job/scan-resume.lock").exists());
+        assert!(!directory.path().join("job/job.lock").exists());
         AppConfig::override_with(|config| {
             config.database.enabled = true;
             config.database.clickhouse.dsn = "http://127.0.0.1:1".into();
@@ -99,8 +106,9 @@ mod tests {
             config.database.clickhouse.read_timeout = 1;
         })?;
         let persisted = timeout(
-            Duration::from_secs(3),
+            Duration::from_secs(5),
             scan(ScanRequest {
+                resume: false,
                 job_id: "gateway",
                 job_dir: &job,
                 path: &source,
@@ -115,7 +123,7 @@ mod tests {
         )
         .await;
         assert!(matches!(persisted, Ok(Err(AppError::DatabaseError(_)))));
-        assert!(directory.path().join("job/scan-resume.lock").exists());
+        assert!(directory.path().join("job/job.lock").exists());
         Ok(())
     }
 }

@@ -105,6 +105,8 @@ pub(crate) async fn run(
         callback_url: config.progress_callback_url.clone(),
         generation_committed: None,
         pb_handle: None,
+        scan_snapshot: None,
+        callback: Default::default(),
     }));
     let callback_guard = StatisticConsumer::begin(stats_consumer.clone()).await;
 
@@ -291,6 +293,8 @@ mod tests {
             callback_url: None,
             generation_committed: None,
             pb_handle: None,
+            scan_snapshot: None,
+            callback: Default::default(),
         }))
     }
 
@@ -2225,6 +2229,8 @@ mod tests {
             callback_url: Some(callback_url),
             generation_committed: None,
             pb_handle: None,
+            scan_snapshot: None,
+            callback: Default::default(),
         }));
         let callback_guard = StatisticConsumer::begin(stats_consumer.clone()).await;
 

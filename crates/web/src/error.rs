@@ -186,11 +186,10 @@ impl IntoResponse for WebError {
         };
 
         let connection_error = match &self {
-            WebError::EndpointStorageConnectionFailed(error)
-            | WebError::EndpointAppConnectionFailed(AppError::StorageError(error)) => {
-                Some(connection_failure_class(error))
+            WebError::EndpointStorageConnectionFailed(error) => Some(connection_failure_class(error)),
+            WebError::EndpointAppConnectionFailed(error) => {
+                Some(error.storage_error().and_then(connection_failure_class))
             }
-            WebError::EndpointAppConnectionFailed(_) => Some(None),
             _ => None,
         };
         // 可预期的连接失败提供安全提示；其他 5xx 仍隐藏内部错误。

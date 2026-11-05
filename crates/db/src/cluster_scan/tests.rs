@@ -3,6 +3,7 @@ use super::*;
 use crate::clickhouse::scan_resume::{COMPLETED, RUNNING};
 use crate::scan_store::ScanFinalEvent;
 use crate::scan_store::with_scan_cancellation;
+use clickhouse::test::{Mock, handlers};
 use data_mover::model::{
     BackendIdentity, BackendKind, EntryKind, IdentityStrength, ObservedEntry, SourceIdentity, StoragePath,
     StorageTimestamp, SymlinkTarget, SymlinkTargetEncoding, TimePrecision,
@@ -10,8 +11,97 @@ use data_mover::model::{
 use std::sync::atomic::AtomicUsize;
 use storage_adapter::ChangeKind;
 use storage_adapter::observed_scan::{ObservedItem, ObservedScanEvent};
-use tokio::{sync::Barrier, task::JoinSet};
+use tokio::{join, sync::Barrier, task::JoinSet};
 use tokio_util::sync::CancellationToken;
+use utils::app_config::ClickHouseMode;
+
+fn mock_schema_store(mock: &Mock) -> Result<ClusterScanStore> {
+    ClusterScanStore::new(
+        &ClickHouseConfig {
+            mode: ClickHouseMode::Cluster,
+            cluster: Some("clickhouse".into()),
+            dsn: mock.url().into(),
+            database: "schema_once".into(),
+            username: "default".into(),
+            password: None,
+            dial_timeout: 1,
+            read_timeout: 1,
+        },
+        "clickhouse",
+        "job",
+    )
+}
+
+#[tokio::test]
+async fn ordinary_batch_releases_only_its_staging_partition() -> Result<()> {
+    let mock = Mock::new();
+    let statement = mock.add(handlers::record_ddl());
+    let mut store = mock_schema_store(&mock)?;
+    store.batch_id = 41;
+    store.begin_resume_batch().await?;
+    let query = statement.query().await;
+    assert!(query.contains("scan_resume_batch_local"));
+    assert!(query.contains("41"));
+    assert!(!query.contains("scan_resume_keys_local"));
+    assert_ne!(store.batch_id, 41);
+    Ok(())
+}
+
+#[tokio::test]
+async fn empty_events_do_not_wait_for_an_unrelated_quorum_gate() -> Result<()> {
+    let mock = Mock::new();
+    let store = mock_schema_store(&mock)?;
+    let _in_flight = store.writes.events.lock().await;
+    tokio::time::timeout(std::time::Duration::from_millis(100), store.events_native(&[], 17))
+        .await
+        .map_err(|error| DatabaseError::TransactionError(error.to_string()))??;
+    Ok(())
+}
+
+#[tokio::test]
+async fn cancelled_empty_events_still_report_cancellation() -> Result<()> {
+    let mock = Mock::new();
+    let store = mock_schema_store(&mock)?;
+    let cancel = CancellationToken::new();
+    cancel.cancel();
+    let result = with_scan_cancellation(cancel, None, store.events_native(&[], 17)).await;
+    assert!(matches!(result, Err(DatabaseError::ScanCancelled)));
+    Ok(())
+}
+
+#[tokio::test]
+async fn schema_initialization_is_shared_by_concurrent_store_and_writer_calls() -> Result<()> {
+    let mock = Mock::new();
+    mock.add(handlers::provide::<String>([]));
+    let statements: Vec<_> = (0..16).map(|_| mock.add(handlers::record_ddl())).collect();
+    let store = mock_schema_store(&mock)?;
+    let writer = store.batch_writer();
+    let (first, concurrent) = join!(store.initialize(), writer.initialize());
+    first?;
+    concurrent?;
+    store.initialize().await?;
+    writer.initialize().await?;
+    for statement in statements {
+        assert!(statement.query().await.contains("ON CLUSTER `clickhouse`"));
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn schema_initialization_failure_can_retry_before_becoming_ready() -> Result<()> {
+    let mock = Mock::new();
+    mock.add(handlers::provide::<String>([]));
+    mock.add(handlers::exception(42));
+    let store = mock_schema_store(&mock)?;
+    assert!(store.initialize().await.is_err());
+    mock.add(handlers::provide::<String>([]));
+    for _ in 0..16 {
+        mock.add(handlers::record_ddl());
+    }
+    store.initialize().await?;
+    store.batch_writer().initialize().await?;
+    Ok(())
+}
 
 #[tokio::test]
 async fn cancelled_quorum_write_does_not_start_another_attempt() {
@@ -19,7 +109,8 @@ async fn cancelled_quorum_write_does_not_start_another_attempt() {
     let attempts = AtomicUsize::new(0);
     let result = with_scan_cancellation(
         cancel.clone(),
-        retry_quorum(|| {
+        None,
+        retry_quorum(RequestSafety::UnconfirmedWrite, || {
             attempts.fetch_add(1, Ordering::SeqCst);
             cancel.cancel();
             async {
@@ -45,8 +136,9 @@ impl Drop for DatabaseGuard {
         let name = self.name.clone();
         let cluster = self.cluster.clone();
         let _ = std::thread::spawn(move || {
-            if let Ok(runtime) = tokio::runtime::Builder::new_current_thread().enable_all().build() {
-                let admin = build_base_client(&config);
+            if let Ok(runtime) = tokio::runtime::Builder::new_current_thread().enable_all().build()
+                && let Ok(admin) = build_base_client(&config)
+            {
                 let _ = runtime.block_on(
                     admin
                         .query(&format!("DROP DATABASE IF EXISTS {name} ON CLUSTER {cluster} SYNC"))
@@ -98,6 +190,8 @@ fn state(epoch: i64, incremental: bool, generation: u8) -> ScanResumeState {
         observed_entries: 0,
         checkpoint: vec![],
         statistics: String::new(),
+        baseline_snapshot: String::new(),
+        checkpoint_snapshot: String::new(),
     }
 }
 
@@ -125,7 +219,7 @@ async fn fixture() -> Result<(ClickHouseConfig, Client, DatabaseGuard, String, i
     let admin = build_base_client(&ClickHouseConfig {
         database: "default".into(),
         ..config.clone()
-    });
+    })?;
     admin
         .query(&format!("CREATE DATABASE {name} ON CLUSTER {cluster}"))
         .execute()

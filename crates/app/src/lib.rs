@@ -37,6 +37,7 @@ pub mod consumer;
 
 mod copy_completion;
 mod copy_execution;
+mod job_execution;
 pub mod local_transfer;
 pub mod observation_scan;
 /// Sync 编排器模块

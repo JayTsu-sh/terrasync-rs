@@ -1,13 +1,14 @@
 use bytes::Bytes;
 use data_mover::traversal::TraversalOutcome;
-use std::{path::Path, sync::Arc};
+use std::{collections::BTreeSet, path::Path, sync::Arc, time::Duration};
 use storage_adapter::filter::parse_filter_expression;
 use storage_adapter::{
-    CopyOptions, CreateStorageOptions, DataChunk, EntryEnum, StorageEntryMessage, StorageEnum, TarPackOptions,
-    WalkOptions, create_storage,
+    CopyOptions, CreateStorageOptions, DataChunk, EntryEnum, ResumableScanItem, ScanSourceMode, StorageEntryMessage,
+    StorageEnum, TarPackOptions, WalkOptions, create_storage,
 };
 use tempfile::TempDir;
 use tokio::fs::{create_dir_all, write};
+use tokio_util::sync::CancellationToken;
 
 async fn local(root: &Path) -> storage_adapter::Result<StorageEnum> {
     create_storage(
@@ -21,9 +22,6 @@ type TestResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
 
 #[tokio::test]
 async fn opaque_scan_checkpoint_survives_reconnection_without_skipping_entries() -> TestResult {
-    use std::{collections::BTreeSet, time::Duration};
-    use storage_adapter::ResumableScanItem;
-    use tokio_util::sync::CancellationToken;
     let root = TempDir::new()?;
     let mut expected = BTreeSet::new();
     for index in 0..30 {
@@ -41,7 +39,14 @@ async fn opaque_scan_checkpoint_survives_reconnection_without_skipping_entries()
         concurrency: 1,
         ..Default::default()
     };
-    let mut scan = source.resumable_scan(&options, None, CancellationToken::new(), Duration::ZERO)?;
+    let mut scan = source.scan_source(
+        &options,
+        ScanSourceMode::Resumable {
+            checkpoint: None,
+            every: Duration::ZERO,
+        },
+        CancellationToken::new(),
+    )?;
     let mut seen = BTreeSet::new();
     let mut saved = None;
     while let Some(item) = scan.next().await {
@@ -60,11 +65,13 @@ async fn opaque_scan_checkpoint_survives_reconnection_without_skipping_entries()
     drop(scan);
     drop(source);
     let source = local(root.path()).await?;
-    let mut resumed = source.resumable_scan(
+    let mut resumed = source.scan_source(
         &options,
-        Some(checkpoint.clone()),
+        ScanSourceMode::Resumable {
+            checkpoint: Some(checkpoint.clone()),
+            every: Duration::ZERO,
+        },
         CancellationToken::new(),
-        Duration::ZERO,
     )?;
     while let Some(item) = resumed.next().await {
         if let ResumableScanItem::Entry(entry) = item? {
@@ -80,7 +87,14 @@ async fn opaque_scan_checkpoint_survives_reconnection_without_skipping_entries()
         depth: Some(1),
         ..options
     };
-    let mut rejected = source.resumable_scan(&changed, Some(checkpoint), CancellationToken::new(), Duration::ZERO)?;
+    let mut rejected = source.scan_source(
+        &changed,
+        ScanSourceMode::Resumable {
+            checkpoint: Some(checkpoint),
+            every: Duration::ZERO,
+        },
+        CancellationToken::new(),
+    )?;
     assert!(rejected.next().await.is_none());
     assert!(rejected.finish().await.is_err());
     Ok(())
@@ -346,9 +360,6 @@ async fn observed_zero_mode_is_preserved_instead_of_becoming_unknown() -> TestRe
 
 #[tokio::test]
 async fn packaged_scan_can_use_the_checkpoint_contract_required_for_network_recovery() -> TestResult {
-    use std::{collections::BTreeSet, time::Duration};
-    use storage_adapter::ResumableScanItem;
-    use tokio_util::sync::CancellationToken;
     let root = TempDir::new()?;
     create_dir_all(root.path().join("archive/20250101/child")).await?;
     write(root.path().join("archive/20250101/child/data"), b"payload").await?;
@@ -358,7 +369,14 @@ async fn packaged_scan_can_use_the_checkpoint_contract_required_for_network_reco
         match_expressions: Some(parse_filter_expression("dir_date <= 20260101")?),
         ..Default::default()
     };
-    let mut scan = storage.resumable_scan(&options, None, CancellationToken::new(), Duration::ZERO)?;
+    let mut scan = storage.scan_source(
+        &options,
+        ScanSourceMode::Resumable {
+            checkpoint: None,
+            every: Duration::ZERO,
+        },
+        CancellationToken::new(),
+    )?;
     let mut paths = BTreeSet::new();
     while let Some(item) = scan.next().await {
         if let ResumableScanItem::Entry(entry) = item? {

@@ -1,6 +1,10 @@
 //! 保留原有一致性设置；副本尚未到达已确认 quorum 时切换副本重试读取。
+use crate::scan_store::{
+    connectivity::RequestSafety,
+    queries::{execute_request, execution_active},
+};
 use crate::{
-    error::Result,
+    error::{DatabaseError, Result},
     scan_store::queries::{check_scan_cancellation, scan_retry_delay},
 };
 use clickhouse::{
@@ -33,6 +37,20 @@ where
     F: FnMut(Query) -> Fut,
     Fut: Future<Output = ClickHouseResult<T>>,
 {
+    if execution_active() {
+        let mut retried = false;
+        return execute_request(RequestSafety::ReadOnly, || {
+            let request = if retried {
+                query.clone().with_option("load_balancing", "random")
+            } else {
+                query.clone()
+            };
+            retried = true;
+            let future = operation(request);
+            async move { future.await.map_err(DatabaseError::from) }
+        })
+        .await;
+    }
     let started = Instant::now();
     let mut retrying = false;
     loop {
@@ -83,7 +101,7 @@ pub(crate) mod tests {
         let cancel = CancellationToken::new();
         let token = cancel.clone();
         let request = tokio::spawn(async move {
-            with_scan_cancellation(token, client.query("SELECT 42").fetch_quorum_one::<u64>()).await
+            with_scan_cancellation(token, None, client.query("SELECT 42").fetch_quorum_one::<u64>()).await
         });
         let requests = server.await.unwrap();
         cancel.cancel();

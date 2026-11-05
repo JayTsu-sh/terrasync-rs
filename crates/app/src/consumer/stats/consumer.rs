@@ -15,7 +15,8 @@ use std::sync::atomic::AtomicU64;
 use std::time::Duration;
 
 // 外部crate
-use data_mover::model::ObservedEntry;
+use data_mover::model::{EntryKind, ObservedEntry};
+use reqwest::Response;
 use storage_adapter::StorageEntryMessage;
 use storage_adapter::observed_scan::{EntryStatistics, ObservedScanEvent, ObservedView};
 use tokio::sync::{Mutex, mpsc};
@@ -25,8 +26,12 @@ use tracing::{error, info, trace, warn};
 
 // 内部模块
 use super::accumulator::StatsKind;
+use super::callback_state::{CallbackState, ScanRuntimePhase, errors};
+use super::diagnostics::{CallbackAck, safe_diagnostic_text};
 use super::progress_bar::ProgressBar;
+use super::report::ProgressDetail;
 use super::report::ProgressReport;
+use crate::scan::statistics::{ScanCounts, ScanSnapshot};
 
 /// HTTP 进度回调间隔（秒）
 const CALLBACK_INTERVAL_SECS: u64 = 2;
@@ -42,6 +47,8 @@ pub struct StatisticConsumer {
     pub callback_url: Option<String>,
     /// 纯增量扫描的 generation 是否成功提交；其他任务保持 `None`。
     pub generation_committed: Option<bool>,
+    pub scan_snapshot: Option<ScanSnapshot>,
+    pub callback: CallbackState,
     /// progress bar display 线程句柄，`finalize()` join 以确保正常退出
     pub(crate) pb_handle: Option<std::thread::JoinHandle<()>>,
 }
@@ -61,17 +68,66 @@ impl StatisticConsumer {
             }
         }
         println!("\n");
-        println!("{}", self.stats);
+        if let Some(scan) = &self.scan_snapshot {
+            println!("{scan}\nErrors: {}", errors(&self.stats).total());
+        } else {
+            println!("{}", self.stats);
+        }
     }
 
     /// 更新累计统计 + 进度条原子计数器
     pub fn update_observed_entry(&mut self, entry: &ObservedEntry) {
+        if let Some(scan) = &self.scan_snapshot {
+            if scan.distributions_complete && entry.history().is_none() {
+                let statistics = match &mut self.stats {
+                    StatsKind::Full(value) => value,
+                    StatsKind::Incremental(value) => &mut value.scanned,
+                };
+                for view in ObservedView::all(entry) {
+                    statistics.update_distributions(&view, entry.kind() == EntryKind::File);
+                }
+            }
+            return;
+        }
         for view in ObservedView::all(entry) {
             match &mut self.stats {
                 StatsKind::Full(stats) => stats.update(&view),
                 StatsKind::Incremental(stats) => stats.scanned.update(&view),
             }
             self.progress_bar.update_observed("scanned", &view);
+        }
+    }
+    pub(crate) fn clear_scan_distributions(&mut self) {
+        let value = match &mut self.stats {
+            StatsKind::Full(value) => value,
+            StatsKind::Incremental(value) => &mut value.scanned,
+        };
+        value.dir_size = 0;
+        value.symlink_size = 0;
+        value.total_dir_depth = 0;
+        value.max_dir_depth = 0;
+        value.total_name_length = 0;
+        value.max_name_length = 0;
+        value.extension_stats.clear();
+        value.time_range_stats.clear();
+        value.file_size_range_stats.clear();
+    }
+    pub(crate) fn sync_scan_progress(&mut self) {
+        if let Some(scan) = &self.scan_snapshot {
+            let statistics = match &mut self.stats {
+                StatsKind::Full(value) => value,
+                StatsKind::Incremental(value) => &mut value.scanned,
+            };
+            statistics.set_scan_counts(&scan.counts);
+            if !scan.distributions_complete && !scan.distributions_reconciled {
+                statistics.extension_stats.clear();
+                statistics.time_range_stats.clear();
+                statistics.file_size_range_stats.clear();
+            }
+            self.progress_bar.update_scan(scan);
+            if let StatsKind::Incremental(stats) = &self.stats {
+                self.progress_bar.update_scan_events(stats);
+            }
         }
     }
     pub fn update_observed_event(&mut self, event: &ObservedScanEvent) {
@@ -96,6 +152,17 @@ impl StatisticConsumer {
         trace!("Updating statistics for message: {:?}", message);
         self.stats.update_from_message(message);
         self.progress_bar.update_statistics(message);
+        if let StorageEntryMessage::Error {
+            event, path, reason, ..
+        } = message
+        {
+            let reason = safe_diagnostic_text(reason);
+            self.callback
+                .outbox
+                .enqueue("operation", &format!("{event:?}"), &reason, path.to_str());
+            self.callback.runtime.current_error = Some(reason);
+            self.callback.runtime.state = ScanRuntimePhase::Failed;
+        }
     }
 
     /// 获取 per-chunk 实时字节计数器（Copy job 使用）
@@ -107,13 +174,123 @@ impl StatisticConsumer {
 
     /// 构建进度报告（实时快照 + 可选 `final_stats`）
     pub fn to_report(&self, is_final: bool) -> ProgressReport {
+        self.report_for_scan(is_final, self.scan_snapshot.as_ref())
+    }
+    pub(crate) fn to_report_for_scan_prefix(&self, counts: &ScanCounts) -> ProgressReport {
+        let mut snapshot = self.scan_snapshot.clone();
+        if let Some(scan) = &mut snapshot {
+            scan.counts = counts.clone();
+            scan.scanned_entries = counts.scanned.total();
+            scan.filtered_entries = counts.filtered.total();
+            scan.retained_entries = counts.retained.total();
+            scan.distributions_complete = counts.retained.total() == 0;
+        }
+        self.report_for_scan(false, snapshot.as_ref())
+    }
+    fn report_for_scan(&self, is_final: bool, snapshot: Option<&ScanSnapshot>) -> ProgressReport {
         let mut report = self.progress_bar.to_report(self.stats.job_id());
         report.is_final = is_final;
         report.generation_committed = self.generation_committed;
+        report.scan = snapshot.cloned();
+        report.callback_identity = Some(self.callback.identity.clone());
+        if snapshot.is_some() {
+            report.scan_runtime = Some(self.callback.runtime.clone());
+            if let Some(scan) = snapshot {
+                let counts = scan.counts.retained;
+                match &mut report.detail {
+                    ProgressDetail::Full {
+                        scanned_files,
+                        scanned_dirs,
+                        total_bytes,
+                        error_count,
+                        ..
+                    } => {
+                        *scanned_files = counts.regular_files + counts.symlinks;
+                        *scanned_dirs = counts.directories;
+                        *total_bytes = scan.counts.regular_file_bytes;
+                        *error_count = errors(&self.stats).total() as u64;
+                    }
+                    ProgressDetail::Incremental {
+                        scanned_files,
+                        scanned_dirs,
+                        scanned_symlinks,
+                        scanned_size,
+                        error_count,
+                        ..
+                    } => {
+                        *scanned_files = counts.regular_files;
+                        *scanned_dirs = counts.directories;
+                        *scanned_symlinks = counts.symlinks;
+                        *scanned_size = scan.counts.regular_file_bytes;
+                        *error_count = errors(&self.stats).total() as u64;
+                    }
+                }
+            }
+        }
         if is_final {
             report.final_stats = Some(self.stats.to_final_stats());
+            if let (Some(scan), Some(final_stats)) = (snapshot, &mut report.final_stats) {
+                final_stats.dirs = scan.counts.retained.directories as usize;
+                final_stats.regular_files = scan.counts.retained.regular_files as usize;
+                final_stats.symlinks = scan.counts.retained.symlinks as usize;
+                final_stats.regular_file_size = scan.counts.regular_file_bytes as i64;
+                if !scan.distributions_reconciled || scan.counts.versions > 0 || scan.counts.delete_markers > 0 {
+                    final_stats.dir_size = None;
+                    final_stats.symlink_size = None;
+                }
+                let ordinary = scan.counts.retained.directories
+                    + scan.counts.retained.regular_files
+                    + scan.counts.retained.symlinks;
+                if !scan.complete
+                    || scan.counts.versions > 0
+                    || scan.counts.delete_markers > 0
+                    || ordinary != scan.counts.retained.total()
+                    || (!scan.distributions_complete && !scan.distributions_reconciled)
+                {
+                    // 旧分布按版本/交付流累积，不能冒充去重后的逻辑 entry 分布。
+                    final_stats.extension_stats = None;
+                    final_stats.time_range_stats = None;
+                    final_stats.file_size_range_stats = None;
+                }
+            }
         }
         report
+    }
+
+    async fn post_callback(consumer: &Arc<Mutex<Self>>, client: &reqwest::Client, url: &str, is_final: bool) -> bool {
+        let report = {
+            let mut consumer = consumer.lock().await;
+            consumer.callback.identity.sequence = consumer.callback.identity.sequence.saturating_add(1);
+            let batch = consumer.callback.outbox.prepare_batch();
+            let mut report = consumer.to_report(is_final);
+            report.diagnostics = batch;
+            report
+        };
+        let response = match client
+            .post(url)
+            .json(&report)
+            .send()
+            .await
+            .and_then(Response::error_for_status)
+        {
+            Ok(response) => response,
+            Err(error) => {
+                warn!(%error, "Progress callback failed; batch retained");
+                return false;
+            }
+        };
+        let Some(batch) = report.diagnostics else { return true };
+        let ack = match response.json::<CallbackAck>().await {
+            Ok(ack) if ack.batch_id.as_deref() == Some(batch.batch_id.as_str()) => ack,
+            _ => {
+                warn!("Progress callback did not acknowledge the diagnostic batch");
+                return false;
+            }
+        };
+        if let Some(batch_id) = ack.batch_id {
+            consumer.lock().await.callback.outbox.ack(&batch_id);
+        }
+        true
     }
 
     // ─── HTTP 回调 ───
@@ -168,21 +345,7 @@ impl StatisticConsumer {
             let mut interval = tokio::time::interval(Duration::from_secs(CALLBACK_INTERVAL_SECS));
             loop {
                 interval.tick().await;
-                let report = {
-                    let consumer = sc.lock().await;
-                    consumer.to_report(false)
-                };
-                match loop_client.post(&url).json(&report).send().await {
-                    Ok(resp) if !resp.status().is_success() => {
-                        let status = resp.status();
-                        let body = resp.text().await.unwrap_or_else(|e| format!("<body read error: {e}>"));
-                        warn!("[ProgressCallback] POST returned {status}: {body}");
-                    }
-                    Err(e) => {
-                        warn!("[ProgressCallback] POST failed: {e}");
-                    }
-                    _ => {}
-                }
+                Self::post_callback(&sc, &loop_client, &url, false).await;
             }
         });
         Some((handle, client))
@@ -190,37 +353,27 @@ impl StatisticConsumer {
 
     /// 发送最终回调（`is_final=true`），优先复用已有 client
     pub async fn send_final_callback(consumer: &Arc<Mutex<Self>>, client: Option<&reqwest::Client>) {
-        let (url, report) = {
-            let consumer = consumer.lock().await;
-            let url = consumer.callback_url.clone();
-            let report = consumer.to_report(true);
-            (url, report)
+        let url = consumer.lock().await.callback_url.clone();
+        let Some(url) = url else {
+            return;
         };
-
-        if let Some(ref url) = url {
-            let owned;
-            let client = match client {
-                Some(c) => c,
-                None => match Self::build_callback_client(url) {
-                    Some(c) => {
-                        owned = c;
-                        &owned
-                    }
-                    None => return,
-                },
-            };
-            match client.post(url).json(&report).send().await {
-                Ok(resp) if !resp.status().is_success() => {
-                    let status = resp.status();
-                    let body = resp.text().await.unwrap_or_else(|e| format!("<body read error: {e}>"));
-                    error!("[ProgressCallback] Final POST returned {status}: {body}");
-                }
-                Ok(_) => {
-                    info!("[ProgressCallback] Final progress report sent successfully (is_final=true)");
-                }
-                Err(e) => {
-                    error!("[ProgressCallback] Final POST failed: {e}");
-                }
+        let owned;
+        let client = match client {
+            Some(client) => client,
+            None => {
+                let Some(client) = Self::build_callback_client(&url) else {
+                    return;
+                };
+                owned = client;
+                &owned
+            }
+        };
+        loop {
+            if !Self::post_callback(consumer, client, &url, true).await {
+                break;
+            }
+            if consumer.lock().await.callback.outbox.prepare_batch().is_none() {
+                break;
             }
         }
     }
@@ -249,7 +402,13 @@ impl StatisticConsumer {
 
     /// 结束生命周期：abort HTTP 回调循环 → 发送 final 回调 → finalize（打印报告 + join 显示线程）。
     pub async fn end(consumer: Arc<Mutex<Self>>, callback: Option<CallbackGuard>) {
-        Self::end_with_budget(consumer, callback, None).await;
+        let budget = consumer
+            .lock()
+            .await
+            .scan_snapshot
+            .as_ref()
+            .map(|_| Duration::from_secs(2));
+        Self::end_with_budget(consumer, callback, budget).await;
     }
 
     pub(crate) async fn end_cancelled(consumer: Arc<Mutex<Self>>, callback: Option<CallbackGuard>) {
@@ -312,6 +471,8 @@ mod tests {
             callback_url: Some(format!("http://{address}/progress")),
             generation_committed: Some(false),
             pb_handle: None,
+            scan_snapshot: None,
+            callback: Default::default(),
         }));
         consumer.lock().await.start_progress_bar();
         let started = Instant::now();
@@ -365,6 +526,8 @@ mod tests {
             callback_url: None,
             generation_committed: Some(false),
             pb_handle: None,
+            scan_snapshot: None,
+            callback: Default::default(),
         };
 
         assert_eq!(consumer.to_report(true).generation_committed, Some(false));
@@ -389,3 +552,7 @@ impl Drop for StatisticConsumer {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "callback_tests.rs"]
+mod callback_tests;

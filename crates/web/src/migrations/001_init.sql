@@ -44,6 +44,29 @@ CREATE TABLE IF NOT EXISTS task_progress (
     updated_at  TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
+-- 明细、批次和快照游标由同一回调事务提交；任务删除时一并清理。
+CREATE TABLE IF NOT EXISTS task_diagnostic_events (
+    task_id TEXT NOT NULL REFERENCES migration_tasks(id) ON DELETE CASCADE,
+    event_id TEXT NOT NULL,
+    event_json TEXT NOT NULL,
+    PRIMARY KEY (task_id, event_id)
+);
+CREATE TABLE IF NOT EXISTS task_diagnostic_batches (
+    task_id TEXT NOT NULL REFERENCES migration_tasks(id) ON DELETE CASCADE,
+    batch_id TEXT NOT NULL,
+    batch_json TEXT NOT NULL,
+    PRIMARY KEY (task_id, batch_id)
+);
+CREATE TABLE IF NOT EXISTS task_callback_cursor (
+    task_id TEXT PRIMARY KEY REFERENCES migration_tasks(id) ON DELETE CASCADE,
+    identity_json TEXT NOT NULL,
+    is_final INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS task_diagnostic_summary (
+    task_id TEXT PRIMARY KEY REFERENCES migration_tasks(id) ON DELETE CASCADE,
+    omitted_count TEXT NOT NULL
+);
+
 -- 任务执行历史
 CREATE TABLE IF NOT EXISTS task_executions (
     id             TEXT PRIMARY KEY,

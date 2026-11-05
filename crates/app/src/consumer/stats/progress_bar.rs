@@ -12,10 +12,11 @@ use storage_adapter::StorageEntryMessage;
 use storage_adapter::observed_scan::EntryStatistics;
 use tracing::info;
 
-use super::accumulator::{fmt_elapsed, format_bytes};
+use super::accumulator::{IncrementalStats, fmt_elapsed, format_bytes};
 use super::report::{ProgressDetail, ProgressReport};
 use crate::config::JobType;
 use crate::error::{AppError, Result};
+use crate::scan::statistics::ScanSnapshot;
 
 /// 进度条 display 线程刷新间隔（秒）
 const DISPLAY_INTERVAL_SECS: u64 = 2;
@@ -23,6 +24,13 @@ const DISPLAY_INTERVAL_SECS: u64 = 2;
 const LOG_INTERVAL_SECS: u64 = 30;
 /// finish 检测粒度（毫秒）：每 100ms 检查一次，最坏 join 等待时间即为此值
 const FINISH_POLL_MS: u64 = 100;
+
+#[derive(Debug, Default)]
+struct ScanProgressCounters {
+    scanned: AtomicU64,
+    filtered: AtomicU64,
+    retained: AtomicU64,
+}
 
 /// 分段等待直到 `is_finished` 返回 true 或超时。
 /// 将大 sleep 拆成 `FINISH_POLL_MS` 小段，大幅缩短 join 等待时间。
@@ -97,6 +105,7 @@ pub struct ProgressBar {
     real_time_bytes: Arc<AtomicU64>,
     counters: CounterSet,
     rate: RateTracker,
+    scan_progress: Arc<ScanProgressCounters>,
 }
 
 impl ProgressBar {
@@ -219,6 +228,7 @@ impl ProgressBar {
                 last_bytes: 0,
                 last_log_time: now,
             },
+            scan_progress: Arc::default(),
         }
     }
 
@@ -228,6 +238,51 @@ impl ProgressBar {
     }
 
     // ─── 统计更新 ───
+
+    pub(crate) fn update_scan_events(&self, stats: &IncrementalStats) {
+        if let CounterSet::Incremental(c) = &self.counters {
+            for (count, size, values) in [
+                (&c.new_count, &c.new_size, &stats.new),
+                (&c.changed_count, &c.changed_size, &stats.changed),
+                (&c.deleted_count, &c.deleted_size, &stats.deleted),
+                (&c.renamed_count, &c.renamed_size, &stats.renamed),
+            ] {
+                count.store(values.total_count() as u64, Ordering::Relaxed);
+                size.store(values.total_size() as u64, Ordering::Relaxed);
+            }
+        }
+    }
+    /// 扫描只发布完整前缀及活跃目录的实际贡献，不叠加重放/版本交付。
+    pub(crate) fn update_scan(&self, snapshot: &ScanSnapshot) {
+        let retained = snapshot.counts.retained;
+        match &self.counters {
+            CounterSet::Full(c) => {
+                c.total_file_count
+                    .store(retained.regular_files + retained.symlinks, Ordering::Relaxed);
+                c.total_dir_count.store(retained.directories, Ordering::Relaxed);
+                c.total_count.store(snapshot.retained_entries, Ordering::Relaxed);
+                c.total_size
+                    .store(snapshot.counts.regular_file_bytes, Ordering::Relaxed);
+            }
+            CounterSet::Incremental(c) => {
+                c.scanned_regular_file_count
+                    .store(retained.regular_files, Ordering::Relaxed);
+                c.scanned_dir_count.store(retained.directories, Ordering::Relaxed);
+                c.scanned_symlink_count.store(retained.symlinks, Ordering::Relaxed);
+                c.scanned_size
+                    .store(snapshot.counts.regular_file_bytes, Ordering::Relaxed);
+            }
+        }
+        self.scan_progress
+            .scanned
+            .store(snapshot.scanned_entries, Ordering::Relaxed);
+        self.scan_progress
+            .filtered
+            .store(snapshot.filtered_entries, Ordering::Relaxed);
+        self.scan_progress
+            .retained
+            .store(snapshot.retained_entries, Ordering::Relaxed);
+    }
 
     /// 根据消息类型更新对应的原子计数器
     pub fn update_statistics(&self, message: &StorageEntryMessage) {
@@ -255,7 +310,7 @@ impl ProgressBar {
                         c.scanned_dir_count.fetch_add(1, Ordering::Relaxed);
                     } else if entry.get_is_symlink() {
                         c.scanned_symlink_count.fetch_add(1, Ordering::Relaxed);
-                    } else {
+                    } else if entry.get_is_regular_file() {
                         c.scanned_regular_file_count.fetch_add(1, Ordering::Relaxed);
                     }
                     c.scanned_size.fetch_add(entry.get_size(), Ordering::Relaxed);
@@ -378,6 +433,13 @@ impl ProgressBar {
         let op = self.job_type.to_operation_name();
 
         let msg = match self.job_type {
+            JobType::Scan => {
+                let scanned = self.scan_progress.scanned.load(Ordering::Relaxed);
+                let filtered = self.scan_progress.filtered.load(Ordering::Relaxed);
+                format!(
+                    "Scanned: {scanned} | Filtered: {filtered} | Retained: {total_count} (files {total_file_count}, dirs {total_dir_count}) | Rate: {item_rate:.0} items/sec | Size: {formatted_size} | Runtime: {formatted_time}                  "
+                )
+            }
             JobType::IntegrityCheck => format!(
                 "{op} Completed: files {total_file_count} | Rate: {item_rate:.0} items/sec | Size: {formatted_size} | Rate: {formatted_size_rate}/sec | Runtime: {formatted_time}                  "
             ),
@@ -427,9 +489,15 @@ impl ProgressBar {
         let op = self.job_type.to_operation_name();
         let formatted_time = fmt_elapsed(elapsed);
 
-        let msg = format!(
+        let mut msg = format!(
             "{op}: scanned {scanned_count} (files {scanned_file}, dirs {scanned_dir}) | {scanned_size_fmt} | {scan_rate:.0} items/sec | {size_rate_fmt}/sec | Runtime: {formatted_time}\n         \u{21b3} New {new_count} ({new_size}) | Changed {changed_count} ({changed_size}) | Deleted {deleted_count} | Renamed {renamed_count}                  "
         );
+        if matches!(self.job_type, JobType::IncrementalScan) {
+            let scanned = self.scan_progress.scanned.load(Ordering::Relaxed);
+            let filtered = self.scan_progress.filtered.load(Ordering::Relaxed);
+            let retained = self.scan_progress.retained.load(Ordering::Relaxed);
+            msg = format!("Scanned: {scanned} | Filtered: {filtered} | Retained: {retained}\n{msg}");
+        }
 
         self.log_and_set_msg(&msg);
     }
@@ -549,6 +617,10 @@ impl ProgressBar {
             is_final: false,
             generation_committed: None,
             final_stats: None,
+            scan: None,
+            callback_identity: None,
+            diagnostics: None,
+            scan_runtime: None,
         }
     }
 }

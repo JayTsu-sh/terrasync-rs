@@ -302,11 +302,12 @@ mod tests {
     use data_mover::model::{
         BackendIdentity, BackendKind, EntryKind, IdentityStrength, ObservedEntry, SourceIdentity, StoragePath,
     };
+    use data_mover::traversal::TraversalOrder;
     use std::sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
     };
-    use storage_adapter::WalkOptions;
+    use storage_adapter::{ScanSourceMode, WalkOptions};
     use tokio::{
         sync::{Notify, oneshot},
         time::{Duration, sleep, timeout},
@@ -323,7 +324,13 @@ mod tests {
             .unwrap();
         let parent = CancellationToken::new();
         let source = storage
-            .resumable_scan(&WalkOptions::default(), None, parent.clone(), Duration::from_secs(60))
+            .scan_source(
+                &WalkOptions::default(),
+                ScanSourceMode::Streaming {
+                    order: TraversalOrder::Unordered,
+                },
+                parent.clone(),
+            )
             .unwrap();
         let mut input = ScanInput::new(source, Some(1));
         timeout(Duration::from_secs(2), async {
@@ -425,7 +432,9 @@ mod tests {
             .into_iter()
             .map(|item| match item {
                 ResumableScanItem::Checkpoint(bytes) => bytes[0],
-                ResumableScanItem::Entry(_) => panic!("unexpected entry"),
+                ResumableScanItem::Entry(_) | ResumableScanItem::Statistics(_) | ResumableScanItem::Resumed(_) => {
+                    panic!("unexpected entry")
+                }
             })
             .collect();
         assert_eq!(markers, [1, 2]);

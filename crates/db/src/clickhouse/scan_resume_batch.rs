@@ -183,7 +183,7 @@ mod tests {
         let admin = build_base_client(&ClickHouseConfig {
             database: "default".into(),
             ..config.clone()
-        });
+        })?;
         admin.query(&format!("CREATE DATABASE {name}")).execute().await?;
         let result: Result<([usize;4],u64,u64)>=async {
             let mut database=ClickHouseDatabase::new(&config,"fixture")?;
@@ -273,7 +273,7 @@ mod tests {
         let admin = build_base_client(&ClickHouseConfig {
             database: "default".into(),
             ..config.clone()
-        });
+        })?;
         admin.query(&format!("CREATE DATABASE {name}")).execute().await?;
         let result: Result<Vec<_>> = async {
             let mut comparisons = Vec::new();

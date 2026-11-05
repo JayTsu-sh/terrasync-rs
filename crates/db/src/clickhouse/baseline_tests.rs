@@ -95,6 +95,7 @@ impl Drop for IsolatedDatabase {
             if let Ok(runtime) = tokio::runtime::Builder::new_current_thread().enable_all().build() {
                 let _ = runtime.block_on(async {
                     build_base_client(&config)
+                        .unwrap()
                         .query(&format!("DROP DATABASE IF EXISTS {name} SYNC"))
                         .execute()
                         .await
@@ -122,7 +123,7 @@ async fn isolated_database() -> Result<(ClickHouseConfig, IsolatedDatabase)> {
         dial_timeout: 10,
         read_timeout: 30,
     };
-    let admin = build_base_client(&config);
+    let admin = build_base_client(&config).unwrap();
     let name = format!("ts_baseline_fixture_{timestamp}");
     admin.query(&format!("CREATE DATABASE {name}")).execute().await?;
     let guard = IsolatedDatabase {

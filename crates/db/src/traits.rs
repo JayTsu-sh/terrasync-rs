@@ -707,6 +707,9 @@ impl EntryStatistics for StorageEntryRecord {
     fn get_is_symlink(&self) -> bool {
         self.is_symlink
     }
+    fn get_is_regular_file(&self) -> bool {
+        self.is_regular_file
+    }
     fn get_mtime(&self) -> i64 {
         self.mtime
     }

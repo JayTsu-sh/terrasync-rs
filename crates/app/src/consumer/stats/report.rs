@@ -10,7 +10,10 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 
 use super::accumulator::{DeltaCounts, ErrorStats, FileSizeRange, StatsKind, TimeRange};
+pub use super::callback_state::{ScanRuntimePhase, ScanRuntimeState};
+use super::diagnostics::{CallbackIdentity, DiagnosticBatch};
 use crate::config::JobType;
+pub use crate::scan::statistics::ScanSnapshot;
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 // (1) ProgressDetail — Full / Incremental 进度明细
@@ -57,6 +60,14 @@ pub struct ProgressReport {
     pub speed_bytes_per_sec: f64,
     pub detail: ProgressDetail,
     pub is_final: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scan: Option<ScanSnapshot>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub callback_identity: Option<CallbackIdentity>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diagnostics: Option<DiagnosticBatch>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scan_runtime: Option<ScanRuntimeState>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub generation_committed: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -108,11 +119,13 @@ pub enum JobSummary {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FinalStats {
     pub dirs: usize,
-    pub dir_size: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dir_size: Option<i64>,
     pub regular_files: usize,
     pub regular_file_size: i64,
     pub symlinks: usize,
-    pub symlink_size: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub symlink_size: Option<i64>,
     pub errors: ErrorStats,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub extension_stats: Option<Vec<ExtensionStatEntry>>,
@@ -201,11 +214,11 @@ impl StatsKind {
                 let is_ic = matches!(s.job_type, JobType::IntegrityCheck);
                 FinalStats {
                     dirs: s.dir_count,
-                    dir_size: s.dir_size,
+                    dir_size: Some(s.dir_size),
                     regular_files: s.regular_file_count,
                     regular_file_size: s.regular_file_size,
                     symlinks: s.symlink_count,
-                    symlink_size: s.symlink_size,
+                    symlink_size: Some(s.symlink_size),
                     errors: s.error_stats.clone(),
                     extension_stats: if is_ic {
                         None
@@ -227,11 +240,11 @@ impl StatsKind {
             }
             StatsKind::Incremental(s) => FinalStats {
                 dirs: s.scanned.dir_count,
-                dir_size: s.scanned.dir_size,
+                dir_size: Some(s.scanned.dir_size),
                 regular_files: s.scanned.regular_file_count,
                 regular_file_size: s.scanned.regular_file_size,
                 symlinks: s.scanned.symlink_count,
-                symlink_size: s.scanned.symlink_size,
+                symlink_size: Some(s.scanned.symlink_size),
                 errors: s.error_stats.clone(),
                 extension_stats: Some(convert_extension_stats(&s.scanned.extension_stats)),
                 time_range_stats: Some(convert_time_range_stats(&s.scanned.time_range_stats)),

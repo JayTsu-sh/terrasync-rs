@@ -91,6 +91,8 @@ impl TaskStatus {
 /// 任务配置（值对象）
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaskConfig {
+    #[serde(default)]
+    pub scan_resume: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub match_expr: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -122,6 +124,7 @@ fn default_peak_qos_rate() -> f32 {
 impl Default for TaskConfig {
     fn default() -> Self {
         Self {
+            scan_resume: false,
             match_expr: None,
             exclude_expr: None,
             depth: 0,

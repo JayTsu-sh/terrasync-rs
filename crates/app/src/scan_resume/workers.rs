@@ -91,8 +91,7 @@ async fn route(
             },
             command=control.recv(),if control_open=>match command {
                 Some(command)=>{
-                    database.save_resume_state(&command.state).await?;
-                    let _=command.ack.send(());
+                    command.execute(database).await?;
                 }
                 None=>control_open=false,
             },
@@ -261,6 +260,8 @@ mod tests {
             observed_entries: 0,
             checkpoint: vec![],
             statistics: String::new(),
+            baseline_snapshot: String::new(),
+            checkpoint_snapshot: String::new(),
         };
         let (_input, receiver) = mpsc::channel(1);
         let (_control, commands) = mpsc::channel(1);

@@ -4,6 +4,7 @@ use crate::native_scan_record::{NativeScanKey, NativeScanRecord, OBSERVED_COLUMN
 use crate::native_scan_record::{final_event_records, incremental_record};
 use crate::scan_metadata::{CandidateMetadataCache, missing_hash_columns};
 use crate::scan_store::ScanFinalEvent;
+use crate::scan_store::queries::execution_active;
 use rustc_hash::{FxHashMap, FxHashSet};
 use smol_str::SmolStr;
 use storage_adapter::observed_scan::{ObservedScanEvent, ObservedView};
@@ -20,8 +21,27 @@ impl ClickHouseDatabase {
                 .query(&format!(
                     "ALTER TABLE {table} ADD COLUMN IF NOT EXISTS metadata_hash Nullable(String) DEFAULT NULL"
                 ))
-                .execute()
+                .execute_idempotent_scan()
                 .await?;
+        }
+        if execution_active() {
+            for table in tables.into_iter().chain([
+                get_incremental_scan_base_table_name(&self.job_id),
+                get_scan_state_table_name(&self.job_id),
+                self.resume_table(),
+            ]) {
+                // staging 只在增量批次开始时创建；全量扫描不应为了设置而创建空表。
+                if table.starts_with("scan_resume_batch_") && !self.check_table_exists(&table).await? {
+                    continue;
+                }
+                self.sync_client
+                    .query(&format!(
+                        "ALTER TABLE {table} MODIFY SETTING non_replicated_deduplication_window=10000"
+                    ))
+                    .execute_idempotent_scan()
+                    .await?;
+            }
+            self.native_dedup_ready.store(true, Ordering::Release);
         }
         Ok(())
     }
@@ -31,15 +51,18 @@ impl ClickHouseDatabase {
             return Ok(());
         }
         let access = self.native_access().await?;
-        let client = self.sync_client.clone().with_validation(false);
-        let mut insert = client.insert::<NativeScanKey>(&access.stage).await?;
-        for entry in entries {
-            for view in ObservedView::all(entry) {
-                insert.write(&NativeScanKey::capture(view)).await?;
+        let client = idempotent_insert_client(&self.sync_client).with_validation(false);
+        execute_request(self.native_insert_safety(), || async {
+            let mut insert = client.insert::<NativeScanKey>(&access.stage).await?;
+            for entry in entries {
+                for view in ObservedView::all(entry) {
+                    insert.write(&NativeScanKey::capture(view)).await?;
+                }
             }
-        }
-        insert.end().await?;
-        Ok(())
+            insert.end().await?;
+            Ok(())
+        })
+        .await
     }
 
     async fn native_access(&self) -> Result<NativeScanAccess<'_>> {
@@ -71,22 +94,25 @@ impl ClickHouseDatabase {
         let table = if temporary { &access.stage } else { &access.base };
         let generation = self.get_cached_scan_state().await?;
         let cache = CandidateMetadataCache::new(candidates).await?;
-        let client = self.sync_client.clone().with_validation(false);
-        let mut insert = client.insert::<NativeScanRecord>(table).await?;
-        for entry in entries {
-            for view in ObservedView::all(entry) {
-                let mut record = NativeScanRecord::capture(view, generation)?;
-                cache.apply(&mut record);
-                insert.write(&record).await?;
+        let client = idempotent_insert_client(&self.sync_client).with_validation(false);
+        execute_request(self.native_insert_safety(), || async {
+            let mut insert = client.insert::<NativeScanRecord>(table).await?;
+            for entry in entries {
+                for view in ObservedView::all(entry) {
+                    let mut record = NativeScanRecord::capture(view, generation)?;
+                    cache.apply(&mut record);
+                    insert.write(&record).await?;
+                }
             }
-        }
-        insert.end().await?;
-        Ok(())
+            insert.end().await?;
+            Ok(())
+        })
+        .await
     }
     pub(crate) async fn compare_native(&mut self, entries: &[Arc<ObservedEntry>]) -> Result<Vec<ObservedScanEvent>> {
         if self.resume_base_has_typed_handles.is_none() {
             let base = get_scan_base_table_name(&self.job_id);
-            self.resume_base_has_typed_handles=Some(self.sync_client.query(&format!("SELECT count(file_handle)>0 AND countIf(file_handle IS NOT NULL AND NOT startsWith(file_handle,'54534934'))=0 FROM {base}")).fetch_one().await?);
+            self.resume_base_has_typed_handles=Some(self.sync_client.query(&format!("SELECT count(file_handle)>0 AND countIf(file_handle IS NOT NULL AND NOT startsWith(file_handle,'54534934'))=0 FROM {base}")).fetch_quorum_one().await?);
         }
         let compared = self.native_access().await?.compare(entries).await?;
         if !compared.displaced.is_empty() {
@@ -116,7 +142,7 @@ impl ClickHouseDatabase {
                 get_incremental_scan_base_table_name(&self.job_id)
             ))
             .bind(time)
-            .execute()
+            .execute_scan()
             .await?;
         Ok(())
     }
@@ -127,7 +153,7 @@ impl ClickHouseDatabase {
                 "INSERT INTO {} ({OBSERVED_COLUMNS}) SELECT {OBSERVED_COLUMNS} FROM {}",
                 access.base, access.stage
             ))
-            .execute()
+            .execute_scan()
             .await?;
         Ok(())
     }
@@ -149,13 +175,12 @@ impl ClickHouseDatabase {
             .map(|record| SmolStr::new(&record.relative_path))
             .collect();
         let keys = self.write_resume_keys(paths).await?;
-        let existing=self.sync_client.query(&format!("SELECT operation_type,relative_path,version_id,create_at FROM {table} FINAL WHERE toUnixTimestamp64Nano(create_at)>=? AND relative_path IN (SELECT relative_path FROM {keys})")).bind(time).fetch_all::<(String,String,String,i64)>().await?;
+        let existing=self.sync_client.query(&format!("SELECT operation_type,relative_path,version_id,create_at FROM {table} FINAL WHERE toUnixTimestamp64Nano(create_at)>=? AND relative_path IN (SELECT relative_path FROM {keys})")).bind(time).fetch_quorum_all::<(String,String,String,i64)>().await?;
         let mut next = existing.iter().map(|row| row.3).max().unwrap_or(time);
         let mut times: FxHashMap<_, _> = existing
             .into_iter()
             .map(|(op, path, version, time)| ((SmolStr::new(op), SmolStr::new(path), SmolStr::new(version)), time))
             .collect();
-        let mut insert = self.sync_client.insert::<IncrementalStorageEntryRecord>(&table).await?;
         for record in &mut records {
             let key = (
                 SmolStr::new(&record.operation_type),
@@ -171,9 +196,16 @@ impl ClickHouseDatabase {
                 times.insert(key, next);
                 next
             };
-            insert.write(record).await?;
         }
-        insert.end().await?;
-        Ok(())
+        let client = idempotent_insert_client(&self.sync_client);
+        execute_request(self.native_insert_safety(), || async {
+            let mut insert = client.insert::<IncrementalStorageEntryRecord>(&table).await?;
+            for record in &records {
+                insert.write(record).await?;
+            }
+            insert.end().await?;
+            Ok(())
+        })
+        .await
     }
 }

@@ -2,11 +2,12 @@ use std::sync::Arc;
 
 use app::consumer::ProgressReport;
 use app::consumer::stats::ProgressDetail;
+use app::consumer::stats::diagnostics::{CallbackAck, safe_diagnostic_text};
 use serde::Deserialize;
-use tracing::{debug, info, warn};
+use tracing::info;
 
 use crate::domain::execution::{ExecutionStats, LogLevel, TaskExecution, TaskLog};
-use crate::domain::progress::TaskProgress;
+use crate::domain::progress::{DiagnosticPage, ProgressSubmission, TaskProgress};
 use crate::domain::repository::{
     EndpointRepository, ExecutionRepository, PathRepository, ProgressRepository, TaskRepository,
 };
@@ -165,6 +166,7 @@ impl TaskService {
         if task.task_type == TaskType::Scan
             && (old.source_endpoint_id != task.source_endpoint_id
                 || old.source_path_id != task.source_path_id
+                || old.config.scan_resume != task.config.scan_resume
                 || old.config.depth != task.config.depth
                 || old.config.match_expr != task.config.match_expr
                 || old.config.exclude_expr != task.config.exclude_expr)
@@ -244,63 +246,50 @@ impl TaskService {
         self.execution_repo.delete_by_id(id).await
     }
 
-    /// 接收来自 app 层的进度回调，保存到 SQLite；最终回调时同步更新执行记录统计
-    pub async fn update_progress(&self, task_id: &str, report: ProgressReport) -> Result<()> {
-        // 最终回调时校验任务存在且处于 Running 状态；周期回调跳过校验以减少 SQLite 查询
-        if report.is_final {
-            let task = self
-                .task_repo
-                .find_by_id(task_id)
-                .await?
-                .ok_or_else(|| WebError::TaskNotFound(task_id.to_string()))?;
-            if !matches!(task.status, TaskStatus::Running) {
-                return Err(WebError::InvalidTaskState {
-                    status: task.status.to_string(),
-                    operation: "update progress".to_string(),
-                });
+    /// 明细、快照和最终执行统计原子提交，只有提交成功才能确认批次。
+    pub async fn update_progress(
+        &self, task_id: &str, mut report: ProgressReport, execution_id: Option<&str>,
+    ) -> Result<CallbackAck> {
+        if let Some(batch) = &mut report.diagnostics {
+            for event in &mut batch.events {
+                event.sanitize();
             }
         }
-
-        let report_json = serde_json::to_string(&report)?;
-
+        if let Some(runtime) = &mut report.scan_runtime {
+            runtime.current_error = runtime.current_error.as_deref().map(safe_diagnostic_text);
+        }
         let progress = TaskProgress {
             task_id: task_id.to_string(),
-            report_json,
+            report_json: serde_json::to_string(&report)?,
             is_final: report.is_final,
             updated_at: chrono::Utc::now(),
         };
-
-        self.progress_repo.upsert(&progress).await?;
-
-        // 最终回调时将统计数据持久化到执行记录，保证"查看报告"能显示统计和图表
-        if report.is_final {
-            info!("[Progress] Received final callback for task {task_id}, persisting stats to execution");
-            let executions = self.execution_repo.find_by_task_id(task_id).await?;
-            let status_summary: Vec<_> = executions.iter().map(|e| format!("{}={}", e.id, e.status)).collect();
-            if let Some(exec) = executions.into_iter().find(|e| matches!(e.status, TaskStatus::Running)) {
-                let stats = execution_stats_from_report(&report);
-                debug!(
-                    "[Progress] Writing stats to execution {}: files={}, bytes={}, duration={:.1}s",
-                    exec.id, stats.scanned_files, stats.total_bytes, stats.duration_secs
-                );
-                // status 传 Running 保持不变，COALESCE 确保 finished_at/error_message 不被清除
-                self.execution_repo
-                    .update_status(&exec.id, TaskStatus::Running, Some(&stats), None, None)
-                    .await?;
-            } else {
-                warn!(
-                    "[Progress] Final callback for task {task_id}: no running execution found! \
-                    Execution statuses: {status_summary:?}"
-                );
-            }
+        let stats = report.is_final.then(|| execution_stats_from_report(&report));
+        let receipt = self
+            .progress_repo
+            .receive(ProgressSubmission {
+                progress: &progress,
+                identity: report.callback_identity.as_ref(),
+                diagnostics: report.diagnostics.as_ref(),
+                execution_id,
+                final_stats: stats.as_ref(),
+            })
+            .await?;
+        if receipt.accepted && report.is_final {
+            info!("[Progress] Committed final callback for task {task_id}");
         }
-
-        Ok(())
+        Ok(receipt.ack)
     }
 
     /// 从 `SQLite` 读取任务进度
     pub async fn get_progress(&self, task_id: &str) -> Result<Option<TaskProgress>> {
         self.progress_repo.find_by_task_id(task_id).await
+    }
+
+    /// 读取已确认明细，不删除当前错误状态或累计数字。
+    pub async fn get_diagnostics(&self, task_id: &str, offset: u32, limit: u32) -> Result<DiagnosticPage> {
+        self.get_task(task_id).await?;
+        self.progress_repo.diagnostics(task_id, offset, limit).await
     }
 }
 
@@ -328,6 +317,8 @@ fn execution_stats_from_report(report: &ProgressReport) -> ExecutionStats {
             error_count: *error_count,
             duration_secs: report.elapsed_secs,
             avg_speed_bytes_per_sec: report.speed_bytes_per_sec,
+            scan: report.scan.clone(),
+            scan_runtime: report.scan_runtime.clone(),
         },
         ProgressDetail::Incremental {
             scanned_files,
@@ -345,6 +336,8 @@ fn execution_stats_from_report(report: &ProgressReport) -> ExecutionStats {
             error_count: *error_count,
             duration_secs: report.elapsed_secs,
             avg_speed_bytes_per_sec: report.speed_bytes_per_sec,
+            scan: report.scan.clone(),
+            scan_runtime: report.scan_runtime.clone(),
         },
     }
 }

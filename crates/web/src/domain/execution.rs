@@ -1,4 +1,5 @@
 use super::storage_failure::StorageFailureDetail;
+use app::consumer::stats::report::{ScanRuntimeState, ScanSnapshot};
 use serde::{Deserialize, Serialize};
 
 use super::task::TaskStatus;
@@ -13,6 +14,10 @@ pub struct ExecutionStats {
     pub error_count: u64,
     pub duration_secs: f64,
     pub avg_speed_bytes_per_sec: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scan: Option<ScanSnapshot>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scan_runtime: Option<ScanRuntimeState>,
 }
 
 /// 执行类型

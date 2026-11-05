@@ -37,6 +37,7 @@ pub fn build_router(state: AppState, port: u16) -> Router {
         .route("/tasks/{id}", delete(task_handler::delete_task))
         .route("/tasks/{id}/start", post(task_handler::start_task))
         .route("/tasks/{id}/cancel", post(task_handler::cancel_task))
+        .route("/tasks/{id}/diagnostics", get(task_handler::get_diagnostics))
         .route(
             "/tasks/{id}/progress",
             get(task_handler::get_progress).post(task_handler::update_progress),

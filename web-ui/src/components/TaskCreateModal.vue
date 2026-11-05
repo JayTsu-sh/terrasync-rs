@@ -168,6 +168,10 @@ async function onSubmit() {
             <NCheckbox v-model:checked="form.enable_integrity_check" />
           </NFormItem>
 
+          <NFormItem v-if="form.task_type === 'scan'" label="断点续扫">
+            <NCheckbox v-model:checked="form.scan_resume">首次运行即保存进度，中断后可继续</NCheckbox>
+          </NFormItem>
+
           <NFormItem label="并发度">
             <NInputNumber v-model:value="form.concurrency" :min="1" :max="128" :show-button="false" class="w-full" />
           </NFormItem>

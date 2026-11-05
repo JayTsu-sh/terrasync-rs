@@ -13,6 +13,7 @@ use tracing::trace;
 // 内部模块
 use crate::config::{JobType, redact_command_line};
 use crate::integrity_check::{FixStatus, IntegrityIssue, IssueKind};
+use crate::scan::statistics::ScanCounts;
 
 // ─────────────────────────────────────────────────
 // 枚举：时间区间 / 文件大小区间
@@ -142,16 +143,21 @@ pub fn format_bytes(bytes: f64, with_decimals: bool) -> String {
 // FullStats：Scan / Copy / IntegrityCheck 的最终统计
 // ─────────────────────────────────────────────────
 
-/// 按 dirs / `regular_files` / symlinks 三维度存储数量和 size
+/// 按目录、普通文件、软链接和其余类型保存数量与大小
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FullStats {
-    // 三维度 count + size
+    // 类型计数及大小
     pub dir_count: usize,
     pub dir_size: i64,
     pub regular_file_count: usize,
     pub regular_file_size: i64,
     pub symlink_count: usize,
     pub symlink_size: i64,
+    /// 其余类型（含特殊文件）；细分种类见扫描的 typed counts。
+    #[serde(default)]
+    pub other_entry_count: usize,
+    #[serde(default)]
+    pub other_entry_size: i64,
 
     // 目录深度
     pub total_dir_depth: i64,
@@ -179,6 +185,29 @@ pub struct FullStats {
 }
 
 impl FullStats {
+    pub(crate) fn scan_prefix(&self, counts: &ScanCounts) -> Self {
+        let mut result = Self::new(
+            self.job_type.clone(),
+            self.job_id.clone(),
+            self.command.clone(),
+            self.log_path.clone(),
+        );
+        result.set_scan_counts(counts);
+        result.error_stats = self.error_stats.clone();
+        result.start_time = self.start_time;
+        result
+    }
+    pub(crate) fn set_scan_counts(&mut self, counts: &ScanCounts) {
+        self.dir_count = counts.retained.directories as usize;
+        self.regular_file_count = counts.retained.regular_files as usize;
+        self.symlink_count = counts.retained.symlinks as usize;
+        self.other_entry_count = (counts.retained.block_devices
+            + counts.retained.character_devices
+            + counts.retained.fifos
+            + counts.retained.sockets
+            + counts.retained.unknown) as usize;
+        self.regular_file_size = counts.regular_file_bytes as i64;
+    }
     pub fn new(job_type: JobType, job_id: String, command: String, log_path: String) -> Self {
         Self {
             dir_count: 0,
@@ -187,6 +216,8 @@ impl FullStats {
             regular_file_size: 0,
             symlink_count: 0,
             symlink_size: 0,
+            other_entry_count: 0,
+            other_entry_size: 0,
             total_dir_depth: 0,
             max_dir_depth: 0,
             total_name_length: 0,
@@ -205,19 +236,19 @@ impl FullStats {
 
     // ── 派生计算 ──
     pub fn total_file_count(&self) -> usize {
-        self.regular_file_count + self.symlink_count
+        self.regular_file_count + self.symlink_count + self.other_entry_count
     }
 
     pub fn total_file_size(&self) -> i64 {
-        self.regular_file_size + self.symlink_size
+        self.regular_file_size + self.symlink_size + self.other_entry_size
     }
 
     pub fn total_count(&self) -> usize {
-        self.dir_count + self.regular_file_count + self.symlink_count
+        self.dir_count + self.regular_file_count + self.symlink_count + self.other_entry_count
     }
 
     pub fn total_size(&self) -> i64 {
-        self.dir_size + self.regular_file_size + self.symlink_size
+        self.dir_size + self.regular_file_size + self.symlink_size + self.other_entry_size
     }
 
     /// 根据 entry 类型更新对应维度的统计
@@ -241,27 +272,34 @@ impl FullStats {
         } else if entry.get_is_symlink() {
             self.symlink_count += 1;
             self.symlink_size += size;
-        } else {
+        } else if entry.get_is_regular_file() {
             self.regular_file_count += 1;
             self.regular_file_size += size;
-            // 扩展名统计
-            if let Some(ext) = entry.get_extension() {
-                let e = self.extension_stats.entry(ext.to_lowercase()).or_insert((0, 0));
-                e.0 += size;
-                e.1 += 1;
-            }
-            // 文件大小分布
-            let range = calculate_file_size_range(entry.get_size());
-            let r = self.file_size_range_stats.entry(range).or_insert((0, 0));
-            r.0 += size;
-            r.1 += 1;
+        } else {
+            self.other_entry_count += 1;
+            self.other_entry_size += size;
         }
+        self.update_distributions(entry, entry.get_is_regular_file());
+    }
 
-        // 修改时间分布（所有条目）
-        let tr = calculate_time_range(entry.get_mtime());
-        let t = self.time_range_stats.entry(tr).or_insert((0, 0));
-        t.0 += size;
-        t.1 += 1;
+    /// 扫描标量只取目录确认快照；此处只观察可选分布，不再累加条目数。
+    pub(crate) fn update_distributions(&mut self, entry: &impl EntryStatistics, regular: bool) {
+        let size = entry.get_size() as i64;
+        if regular {
+            if let Some(ext) = entry.get_extension() {
+                let value = self.extension_stats.entry(ext.to_lowercase()).or_insert((0, 0));
+                value.0 += size;
+                value.1 += 1;
+            }
+            let range = calculate_file_size_range(entry.get_size());
+            let value = self.file_size_range_stats.entry(range).or_insert((0, 0));
+            value.0 += size;
+            value.1 += 1;
+        }
+        let range = calculate_time_range(entry.get_mtime());
+        let value = self.time_range_stats.entry(range).or_insert((0, 0));
+        value.0 += size;
+        value.1 += 1;
     }
 
     pub fn update_from_message(&mut self, message: &StorageEntryMessage) {
@@ -411,7 +449,7 @@ impl ErrorStats {
 // IncrementalStats：IncrementalScan / IncrementalCopy
 // ─────────────────────────────────────────────────
 
-/// 增量操作的三维度统计辅助结构（内联字段展开到 `IncrementalStats`）
+/// 增量变化的类型统计；总数包含未归入目录、普通文件、软链接的条目。
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct DeltaCounts {
     pub dir_count: usize,
@@ -420,19 +458,24 @@ pub struct DeltaCounts {
     pub regular_file_size: i64,
     pub symlink_count: usize,
     pub symlink_size: i64,
+    /// 其余类型（含特殊文件）；细分种类见扫描的 typed counts。
+    #[serde(default)]
+    pub other_entry_count: usize,
+    #[serde(default)]
+    pub other_entry_size: i64,
 }
 
 impl DeltaCounts {
     pub fn total_count(&self) -> usize {
-        self.dir_count + self.regular_file_count + self.symlink_count
+        self.dir_count + self.regular_file_count + self.symlink_count + self.other_entry_count
     }
 
     pub fn total_file_count(&self) -> usize {
-        self.regular_file_count + self.symlink_count
+        self.regular_file_count + self.symlink_count + self.other_entry_count
     }
 
     pub fn total_size(&self) -> i64 {
-        self.dir_size + self.regular_file_size + self.symlink_size
+        self.dir_size + self.regular_file_size + self.symlink_size + self.other_entry_size
     }
 
     pub fn add(&mut self, entry: &impl EntryStatistics) {
@@ -443,9 +486,12 @@ impl DeltaCounts {
         } else if entry.get_is_symlink() {
             self.symlink_count += 1;
             self.symlink_size += size;
-        } else {
+        } else if entry.get_is_regular_file() {
             self.regular_file_count += 1;
             self.regular_file_size += size;
+        } else {
+            self.other_entry_count += 1;
+            self.other_entry_size += size;
         }
     }
 }
@@ -607,6 +653,24 @@ pub enum StatsKind {
 }
 
 impl StatsKind {
+    pub(crate) fn scan_prefix(&self, counts: &ScanCounts) -> Self {
+        match self {
+            Self::Full(value) => Self::Full(value.scan_prefix(counts)),
+            Self::Incremental(value) => Self::Incremental(IncrementalStats {
+                scanned: value.scanned.scan_prefix(counts),
+                new: value.new.clone(),
+                changed: value.changed.clone(),
+                deleted: value.deleted.clone(),
+                renamed: value.renamed.clone(),
+                error_stats: value.error_stats.clone(),
+                command: value.command.clone(),
+                job_id: value.job_id.clone(),
+                job_type: value.job_type.clone(),
+                log_path: value.log_path.clone(),
+                start_time: value.start_time,
+            }),
+        }
+    }
     pub fn update_from_message(&mut self, message: &StorageEntryMessage) {
         match self {
             StatsKind::Full(s) => s.update_from_message(message),
@@ -1205,6 +1269,60 @@ fn print_mismatch_table(mismatch: &[&IntegrityIssue], auto_fix: bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use data_mover::model::{
+        BackendIdentity, BackendKind, EntryKind, IdentityStrength, ObservedEntry, SourceIdentity, SpecialFileKind,
+        StoragePath,
+    };
+    use storage_adapter::observed_scan::ObservedView;
+
+    type TestResult = Result<(), Box<dyn std::error::Error>>;
+
+    #[test]
+    fn special_changes_keep_their_totals_without_becoming_regular_files() -> TestResult {
+        let backend = BackendIdentity::new(BackendKind::Nfs, "typed-deltas")?;
+        let mut full = FullStats::new(JobType::Scan, "types".into(), String::new(), String::new());
+        let mut delta = DeltaCounts::default();
+        for (index, kind) in [
+            EntryKind::File,
+            EntryKind::Directory,
+            EntryKind::Special(SpecialFileKind::Fifo),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let path = format!("node{index}.dat");
+            let identity =
+                SourceIdentity::new(backend.clone(), IdentityStrength::StableWithinBackend, path.as_bytes())?;
+            let entry = ObservedEntry::new(StoragePath::new(path)?, kind, Some(17), None, identity)?;
+            let view = ObservedView {
+                entry: &entry,
+                version_index: None,
+            };
+            full.update(&view);
+            delta.add(&view);
+        }
+        assert_eq!(
+            (full.total_count(), full.regular_file_count, full.other_entry_count),
+            (3, 1, 1)
+        );
+        assert_eq!(
+            (delta.total_count(), delta.regular_file_count, delta.other_entry_count),
+            (3, 1, 1)
+        );
+        assert_eq!((delta.total_size(), delta.other_entry_size), (51, 17));
+        assert_eq!(full.extension_stats.get("dat"), Some(&(17, 1)));
+        let mut counts = ScanCounts::default();
+        counts.retained.fifos = 1;
+        counts.retained.regular_files = 1;
+        counts.retained.directories = 1;
+        let prefix = full.scan_prefix(&counts);
+        assert_eq!((prefix.total_count(), prefix.other_entry_count), (3, 1));
+        let old: DeltaCounts = serde_json::from_str(
+            r#"{"dir_count":1,"dir_size":0,"regular_file_count":2,"regular_file_size":0,"symlink_count":3,"symlink_size":0}"#,
+        )?;
+        assert_eq!((old.total_count(), old.other_entry_count), (6, 0));
+        Ok(())
+    }
 
     #[test]
     fn completion_summary_redacts_storage_credentials_defensively() {

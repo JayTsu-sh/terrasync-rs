@@ -4,7 +4,7 @@ import { NTag, NButton, NIcon } from 'naive-ui'
 import { ArrowForward } from '@vicons/ionicons5'
 import type { MigrationTask } from '../api/tasks'
 import type { Endpoint } from '../api/endpoints'
-import { TASK_ACTIONS, statusColorMap, statusLabelMap, taskTypeLabelMap } from '../shared/task-rules'
+import { TASK_ACTIONS, startActionLabel, statusColorMap, statusLabelMap, taskTypeLabelMap } from '../shared/task-rules'
 import type { TaskStatus } from '../shared/task-rules'
 import EndpointCard from './EndpointCard.vue'
 
@@ -42,7 +42,7 @@ const status = computed(() => props.task.status as TaskStatus)
       <div class="flex items-center gap-2">
         <span class="text-xs text-gray-300">创建 {{ new Date(task.created_at).toLocaleString() }}</span>
         <NButton v-if="TASK_ACTIONS.canEdit(status)" size="small" @click="emit('edit')">编辑</NButton>
-        <NButton v-if="TASK_ACTIONS.canStart(status)" type="success" size="small" @click="emit('start')">{{ task.task_type === 'scan' && ['cancelled', 'failed'].includes(status) ? '继续扫描' : '启动' }}</NButton>
+        <NButton v-if="TASK_ACTIONS.canStart(status)" type="success" size="small" @click="emit('start')">{{ startActionLabel(status, task.task_type, task.config.scan_resume === true) }}</NButton>
         <NButton v-if="TASK_ACTIONS.canCancel(status)" size="small" @click="emit('cancel')">取消</NButton>
         <NButton v-if="TASK_ACTIONS.canDelete(status)" type="error" size="small" @click="emit('delete')">删除</NButton>
       </div>

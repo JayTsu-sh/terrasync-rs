@@ -1,13 +1,17 @@
 //! 共享表的集群扫描存储。所有读写在这里绑定 job_id，业务层不拼接集群 SQL。
 use crate::clickhouse::replica_read::QuorumRead;
 use crate::scan_store::queries::{ScanExecute, check_scan_cancellation, scan_retry_delay};
+use crate::scan_store::{
+    connectivity::RequestSafety,
+    queries::{execute_request, execution_active, idempotent_insert_client},
+};
 #[cfg(test)]
 use std::collections::HashMap;
 use std::future::Future;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, OnceCell};
 
 use clickhouse::Client;
 use clickhouse::error::Error as ClickHouseError;
@@ -19,9 +23,11 @@ use utils::sanitize_job_id;
 #[cfg(test)]
 use self::record::ClusterStorageEntryRecord;
 use self::record::{ClusterIncrementalStorageEntryRecord, ClusterScanResumeState};
+#[cfg(test)]
+use crate::clickhouse::build_base_client;
 use crate::clickhouse::scan_resume::{FINALIZING, ScanResumeState};
 use crate::clickhouse::scan_resume_statistics::ScanResumeStatistics;
-use crate::clickhouse::{FILE_INCREMENTAL_SCAN_COLUMNS_DEFINITION, FILE_SCAN_COLUMNS_DEFINITION, build_base_client};
+use crate::clickhouse::{FILE_INCREMENTAL_SCAN_COLUMNS_DEFINITION, FILE_SCAN_COLUMNS_DEFINITION};
 use crate::common::FILE_SCAN_COLUMNS_LIST;
 #[cfg(test)]
 use crate::common::{DeletionStatus, classify_deletion_status};
@@ -56,6 +62,7 @@ pub(crate) struct ClusterScanStore {
     generation: AtomicU8,
     batch_id: u64,
     writes: Arc<NativeWriteGates>,
+    schema_ready: Arc<OnceCell<()>>,
 }
 
 /// 同一作业内的顺序 quorum 写入按表协调，避免并行 worker 重传整批数据。
@@ -92,11 +99,14 @@ pub(crate) fn identifier(value: &str) -> Result<String> {
 }
 
 /// 顺序 quorum 写入遇到其他任务尚未完成的 quorum 时退避重试；所有目标行均可幂等重放。
-async fn retry_quorum<F, Fut>(mut operation: F) -> Result<()>
+pub(crate) async fn retry_quorum<F, Fut>(safety: RequestSafety, mut operation: F) -> Result<()>
 where
     F: FnMut() -> Fut,
     Fut: Future<Output = Result<()>>,
 {
+    if execution_active() {
+        return execute_request(safety, operation).await;
+    }
     let start = Instant::now();
     loop {
         check_scan_cancellation()?;
@@ -113,9 +123,6 @@ where
 }
 
 impl ClusterScanStore {
-    pub(crate) fn tag_scan_queries(&mut self, comment: &str) {
-        self.client = self.client.clone().with_option("log_comment", comment);
-    }
     pub(crate) fn batch_writer(&self) -> Self {
         Self {
             client: self.client.clone(),
@@ -126,13 +133,19 @@ impl ClusterScanStore {
             generation: AtomicU8::new(self.generation.load(Ordering::Relaxed)),
             batch_id: 0,
             writes: Arc::clone(&self.writes),
+            schema_ready: Arc::clone(&self.schema_ready),
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn new(config: &ClickHouseConfig, cluster: &str, job_id: &str) -> Result<Self> {
+        Self::with_client(config, cluster, job_id, build_base_client(config)?)
+    }
+
+    pub(crate) fn with_client(config: &ClickHouseConfig, cluster: &str, job_id: &str, client: Client) -> Result<Self> {
         identifier(cluster)?;
         identifier(&config.database)?;
-        let client = build_base_client(config)
+        let client = client
             .with_option("insert_distributed_sync", "1")
             .with_option("async_insert", "0")
             .with_option("insert_quorum", "auto")
@@ -143,6 +156,7 @@ impl ClusterScanStore {
             .with_option("skip_unavailable_shards", "0")
             .with_option("optimize_skip_unused_shards", "1")
             .with_option("distributed_product_mode", "local")
+            .with_option("distributed_ddl_output_mode", "throw")
             .with_option("distributed_ddl_task_timeout", "60");
         Ok(Self {
             client,
@@ -153,6 +167,7 @@ impl ClusterScanStore {
             generation: AtomicU8::new(0),
             batch_id: 0,
             writes: Arc::new(NativeWriteGates::default()),
+            schema_ready: Arc::new(OnceCell::new()),
         })
     }
 
@@ -180,14 +195,20 @@ impl ClusterScanStore {
         let local = format!("{name}_local");
         let path = format!("/clickhouse/terrasync/{}/{local}/{{shard}}", self.database);
         let sql = format!(
-            "CREATE TABLE IF NOT EXISTS {database}.{local} ON CLUSTER {cluster} ({columns}) ENGINE = {engine}('{path}', '{{replica}}') PARTITION BY {partition} ORDER BY {order} SETTINGS allow_nullable_key=1"
+            "CREATE TABLE IF NOT EXISTS {database}.{local} ON CLUSTER {cluster} ({columns}) ENGINE = {engine}('{path}', '{{replica}}') PARTITION BY {partition} ORDER BY {order} SETTINGS allow_nullable_key=1,replicated_deduplication_window=10000"
         );
-        self.client.query(&sql).execute_scan().await?;
-        self.client.query(&format!("CREATE TABLE IF NOT EXISTS {database}.{name} ON CLUSTER {cluster} AS {database}.{local} ENGINE = Distributed({cluster}, {database}, {local}, cityHash64(job_id))")).execute_scan().await?;
+        self.client.query(&sql).execute_idempotent_scan().await?;
+        self.client.query(&format!("CREATE TABLE IF NOT EXISTS {database}.{name} ON CLUSTER {cluster} AS {database}.{local} ENGINE = Distributed({cluster}, {database}, {local}, cityHash64(job_id))")).execute_idempotent_scan().await?;
         Ok(())
     }
 
     pub(crate) async fn initialize(&self) -> Result<()> {
+        // 同一执行及其 writer 共享就绪状态；失败不缓存，后续调用仍可重试。
+        self.schema_ready.get_or_try_init(|| self.initialize_schema()).await?;
+        Ok(())
+    }
+
+    async fn initialize_schema(&self) -> Result<()> {
         let columns = self
             .client
             .query("SELECT name FROM system.columns WHERE database=? AND table='base_local'")
@@ -268,12 +289,17 @@ impl ClusterScanStore {
     }
 
     async fn create_checkpoint_table(&self) -> Result<()> {
-        let columns = "job_id String,id UInt8,schema_version UInt8,version UInt64,request_key String,generation UInt8,incremental Bool,phase UInt8,event_time Int64,observed_entries UInt64,checkpoint Array(UInt8),statistics String DEFAULT ''";
+        let columns = "job_id String,id UInt8,schema_version UInt8,version UInt64,request_key String,generation UInt8,incremental Bool,phase UInt8,event_time Int64,observed_entries UInt64,checkpoint Array(UInt8),statistics String DEFAULT '',baseline_snapshot String DEFAULT '',checkpoint_snapshot String DEFAULT ''";
         let cluster = identifier(&self.cluster)?;
         let database = identifier(&self.database)?;
         let path = format!("/clickhouse/terrasync/{}/scan_resume_local/{{shard}}", self.database);
         self.client.query(&format!("CREATE TABLE IF NOT EXISTS {database}.scan_resume_local ON CLUSTER {cluster} ({columns}) ENGINE = ReplicatedReplacingMergeTree('{path}','{{replica}}',version) PARTITION BY job_id ORDER BY job_id")).execute_scan().await?;
         self.client.query(&format!("CREATE TABLE IF NOT EXISTS {database}.scan_resume ON CLUSTER {cluster} AS {database}.scan_resume_local ENGINE = Distributed({cluster},{database},scan_resume_local,cityHash64(job_id))")).execute_scan().await?;
+        for table in ["scan_resume_local", "scan_resume"] {
+            for column in ["baseline_snapshot", "checkpoint_snapshot"] {
+                self.client.query(&format!("ALTER TABLE {database}.{table} ON CLUSTER {cluster} ADD COLUMN IF NOT EXISTS {column} String DEFAULT ''")).execute_scan().await?;
+            }
+        }
         Ok(())
     }
 
@@ -342,7 +368,7 @@ impl ClusterScanStore {
         let database = identifier(&self.database)?;
         self.initialize().await?;
         self.cleanup_abandoned_batches().await?;
-        let row=self.client.query(&format!("SELECT id,schema_version,version,request_key,generation,incremental,phase,event_time,observed_entries,checkpoint,statistics FROM {database}.scan_resume FINAL WHERE job_id=?")).bind(&self.job_id).fetch_quorum_one::<ScanResumeState>().await;
+        let row=self.client.query(&format!("SELECT id,schema_version,version,request_key,generation,incremental,phase,event_time,observed_entries,checkpoint,statistics,baseline_snapshot,checkpoint_snapshot FROM {database}.scan_resume FINAL WHERE job_id=?")).bind(&self.job_id).fetch_quorum_one::<ScanResumeState>().await;
         match row {
             Ok(state) => {
                 state.validate(&state.request_key)?;
@@ -358,10 +384,11 @@ impl ClusterScanStore {
     }
 
     pub(crate) async fn save_resume_state(&self, state: &ScanResumeState) -> Result<()> {
-        retry_quorum(|| async move {
+        let client = idempotent_insert_client(&self.client);
+        retry_quorum(RequestSafety::IdempotentWrite, || async {
             self.epoch.store(state.event_time as u64, Ordering::Relaxed);
             self.generation.store(state.generation, Ordering::Relaxed);
-            let mut insert = self.client.insert::<ClusterScanResumeState>("scan_resume").await?;
+            let mut insert = client.insert::<ClusterScanResumeState>("scan_resume").await?;
             insert
                 .write(&ClusterScanResumeState::new(self.job_id.clone(), state.clone()))
                 .await?;
@@ -453,7 +480,8 @@ impl ClusterScanStore {
         Ok(false)
     }
     pub(crate) async fn commit_scan_generation(&self) -> Result<()> {
-        retry_quorum(|| async move {
+        let client = idempotent_insert_client(&self.client);
+        retry_quorum(RequestSafety::IdempotentWrite, || async {
             let database = identifier(&self.database)?;
             let epoch = self.epoch.load(Ordering::Relaxed);
             let generation: u8 = self
@@ -464,7 +492,7 @@ impl ClusterScanStore {
                 .bind(&self.job_id)
                 .fetch_quorum_one()
                 .await?;
-            let mut insert = self.client.insert::<CommittedScan>("state").await?;
+            let mut insert = client.insert::<CommittedScan>("state").await?;
             insert
                 .write(&CommittedScan {
                     job_id: self.job_id.clone(),
@@ -504,7 +532,7 @@ impl ClusterScanStore {
     }
     #[cfg(test)]
     async fn write_entries(&self, table: &str, entries: &[Arc<EntryEnum>], batch_id: u64) -> Result<()> {
-        retry_quorum(|| async move {
+        retry_quorum(RequestSafety::UnconfirmedWrite, || async move {
             if entries.is_empty() {
                 return Ok(());
             }
@@ -536,7 +564,7 @@ impl ClusterScanStore {
     }
     #[cfg(test)]
     pub(crate) async fn insert_temp_to_base_table(&self, _excluded: &[(String, String)]) -> Result<()> {
-        retry_quorum(|| async move {
+        retry_quorum(RequestSafety::UnconfirmedWrite, || async move {
 
         let database = identifier(&self.database)?;
         let columns = &*FILE_SCAN_COLUMNS_LIST;
@@ -547,7 +575,7 @@ impl ClusterScanStore {
     }
     #[cfg(test)]
     pub(crate) async fn write_resume_events(&self, messages: &[StorageEntryMessage], event_time: i64) -> Result<()> {
-        retry_quorum(|| async move {
+        retry_quorum(RequestSafety::UnconfirmedWrite, || async move {
             if messages.is_empty() {
                 return Ok(());
             }
@@ -560,9 +588,9 @@ impl ClusterScanStore {
                 record.create_at = event_time;
                 insert
                     .write(&ClusterIncrementalStorageEntryRecord::new(
-                        self.job_id.clone(),
+                        &self.job_id,
                         event_time as u64,
-                        record,
+                        &record,
                     ))
                     .await?;
             }
@@ -577,16 +605,16 @@ impl ClusterScanStore {
             return Ok(());
         }
         let cluster = identifier(&self.cluster)?;
-        for table in ["scan_resume_batch_local", "scan_resume_keys_local"] {
-            self.client
-                .query(&format!(
-                    "ALTER TABLE {database}.{table} ON CLUSTER {cluster} DROP PARTITION (?,?)"
-                ))
-                .bind(&self.job_id)
-                .bind(self.batch_id)
-                .execute_scan()
-                .await?;
-        }
+        // 本批只持有 batch 分区；删除 keys 使用独立编号并由删除操作清理。
+        // batch_id 在本执行中不复用，重发旧分区 DROP 不会删除下一批的数据。
+        self.client
+            .query(&format!(
+                "ALTER TABLE {database}.scan_resume_batch_local ON CLUSTER {cluster} DROP PARTITION (?,?)"
+            ))
+            .bind(&self.job_id)
+            .bind(self.batch_id)
+            .execute_idempotent_scan()
+            .await?;
         Ok(())
     }
     pub(crate) async fn cleanup_resume_batch(&self) -> Result<()> {
@@ -646,7 +674,7 @@ impl ClusterScanStore {
         ))
     }
     pub(crate) async fn delete_resume_entries(&self, entries: &[(String, String)]) -> Result<()> {
-        retry_quorum(|| async move {
+        retry_quorum(RequestSafety::UnconfirmedWrite, || async move {
 
         let database = identifier(&self.database)?;
         if entries.is_empty() {

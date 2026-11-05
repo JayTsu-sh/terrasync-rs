@@ -23,15 +23,21 @@ use tokio::sync::Mutex;
 use tracing::{Instrument, debug, error, info_span, warn};
 
 // 内部模块
+use super::stats::callback_state::{SavedStatistics, StatisticsCheckpoint};
+use super::stats::recovery_progress::RecoveryProgress;
 use crate::broadcast::BroadcastForwarder;
 use crate::config::{ConsumerConfig, JobType};
 use crate::consumer::DatabaseConsumer;
+#[cfg(test)]
+use crate::consumer::stats::ProgressReport;
 use crate::consumer::stats::{FileSizeRange, ProgressDetail, TimeRange};
 use crate::consumer::stats::{
-    FullStats, IncrementalStats, ProgressBar, ProgressReport, StatisticConsumer, StatsKind, consumer::CallbackGuard,
+    FullStats, IncrementalStats, ProgressBar, StatisticConsumer, StatsKind, consumer::CallbackGuard,
 };
 use crate::consumer::traits::Consumer;
 use crate::error::{AppError, Result};
+use crate::scan::statistics::{ScanCapabilities, ScanCounts, ScanSnapshot};
+use data_mover::traversal::TraversalRecoveryStatus;
 use db::clickhouse::scan_resume_statistics::ScanResumeStatistics;
 use db::scan_store::ScanFinalEvent;
 
@@ -52,6 +58,89 @@ pub(crate) struct ScanStatistics {
 }
 
 impl ScanStatistics {
+    pub(crate) async fn restore_scan_counts(&self, counts: ScanCounts) {
+        if let Some(sc) = &self.inner {
+            let mut sc = sc.lock().await;
+            if let Some(snapshot) = &mut sc.scan_snapshot {
+                snapshot.distributions_complete = counts.retained.total() == 0;
+                snapshot.counts = counts;
+                snapshot.scanned_entries = snapshot.counts.scanned.total();
+                snapshot.filtered_entries = snapshot.counts.filtered.total();
+                snapshot.retained_entries = snapshot.counts.retained.total();
+                snapshot.restarts = snapshot.restarts.saturating_add(1);
+                snapshot.complete = false;
+                snapshot.distributions_reconciled = false;
+            }
+            sc.clear_scan_distributions();
+            sc.sync_scan_progress();
+        }
+    }
+    /// 只回退可重放的事件计数；网络故障累计、诊断和回调 ACK 继续保留。
+    pub(crate) async fn restore_scan_event_counts(&self, saved: &str) -> Result<()> {
+        let saved = if saved.is_empty() {
+            None
+        } else {
+            let value: StatisticsCheckpoint = serde_json::from_str(saved)?;
+            if value.version != 2 {
+                return Err(AppError::ScanError("Unsupported scan statistics checkpoint".into()));
+            }
+            match value.stats {
+                StatsKind::Incremental(value) => Some(value),
+                StatsKind::Full(_) => None,
+            }
+        };
+        if let Some(sc) = &self.inner {
+            let mut sc = sc.lock().await;
+            if let StatsKind::Incremental(current) = &mut sc.stats {
+                (current.new, current.changed, current.deleted, current.renamed) = saved.map_or_else(
+                    || Default::default(),
+                    |value| (value.new, value.changed, value.deleted, value.renamed),
+                );
+            }
+            sc.sync_scan_progress();
+        }
+        Ok(())
+    }
+    pub(crate) async fn snapshot(&self) -> Option<ScanSnapshot> {
+        match &self.inner {
+            Some(sc) => sc.lock().await.scan_snapshot.clone(),
+            None => None,
+        }
+    }
+    pub(crate) async fn watch_recovery(&self, status: Option<&TraversalRecoveryStatus>) -> Option<RecoveryProgress> {
+        Some(RecoveryProgress::start(self.inner.clone()?, status?.clone()).await)
+    }
+    pub(crate) async fn replace_directory_contributions(&self, changes: &[(ScanCounts, ScanCounts)]) {
+        if let Some(sc) = &self.inner {
+            let mut sc = sc.lock().await;
+            if let Some(snapshot) = &mut sc.scan_snapshot {
+                for (old, new) in changes {
+                    snapshot.replace(old, new);
+                }
+            }
+            sc.sync_scan_progress();
+        }
+    }
+
+    pub(crate) async fn complete_scan(&self) {
+        if let Some(sc) = &self.inner {
+            if let Some(snapshot) = &mut sc.lock().await.scan_snapshot {
+                snapshot.complete = true;
+            }
+        }
+    }
+
+    pub(crate) async fn scanned_entries(&self) -> u64 {
+        match &self.inner {
+            Some(sc) => sc
+                .lock()
+                .await
+                .scan_snapshot
+                .as_ref()
+                .map_or(0, |scan| scan.scanned_entries),
+            None => 0,
+        }
+    }
     pub(crate) async fn record_observed_events(&self, events: &[ObservedScanEvent]) {
         if let Some(sc) = &self.inner {
             let mut sc = sc.lock().await;
@@ -74,14 +163,48 @@ impl ScanStatistics {
         match &self.inner {
             Some(sc) => {
                 let sc = sc.lock().await;
-                Ok(serde_json::to_string(&(&sc.stats, sc.to_report(false)))?)
+                Ok(serde_json::to_string(&StatisticsCheckpoint {
+                    version: 2,
+                    stats: sc.stats.clone(),
+                    report: sc.to_report(false),
+                    callback: sc.callback.clone(),
+                })?)
             }
             None => Ok(String::new()),
         }
     }
+
+    pub(crate) async fn checkpoint_for_scan_prefix(&self, counts: &ScanCounts) -> Result<String> {
+        let Some(sc) = &self.inner else {
+            return Ok(String::new());
+        };
+        let sc = sc.lock().await;
+        Ok(serde_json::to_string(&StatisticsCheckpoint {
+            version: 2,
+            stats: sc.stats.scan_prefix(counts),
+            report: sc.to_report_for_scan_prefix(counts),
+            callback: sc.callback.clone(),
+        })?)
+    }
 }
 
 impl ConsumerManager {
+    pub(crate) async fn initialize_scan_statistics(
+        &self, storage: &storage_adapter::StorageEnum, tags: bool, round: Option<i64>,
+    ) -> Result<()> {
+        if let Some(sc) = &self.stats_consumer {
+            let mut sc = sc.lock().await;
+            let job_id = sc.stats.job_id().to_owned();
+            let mut callback = std::mem::take(&mut sc.callback);
+            callback.initialize_scan(&job_id, round)?;
+            sc.callback = callback;
+            if sc.scan_snapshot.is_none() {
+                sc.scan_snapshot = Some(ScanSnapshot::new(ScanCapabilities::from_storage(storage, tags)));
+            }
+            sc.sync_scan_progress();
+        }
+        Ok(())
+    }
     pub(crate) fn scan_statistics(&self) -> ScanStatistics {
         ScanStatistics {
             inner: self.stats_consumer.clone(),
@@ -116,28 +239,36 @@ impl ConsumerManager {
     pub async fn reconcile_scan_statistics(&self, values: ScanResumeStatistics) {
         if let Some(sc) = &self.stats_consumer {
             let mut sc = sc.lock().await;
+            if let Some(scan) = &mut sc.scan_snapshot {
+                scan.distributions_reconciled = true;
+            }
             let deltas = if let StatsKind::Incremental(incremental) = &mut sc.stats {
                 incremental.new = Default::default();
                 incremental.changed = Default::default();
                 incremental.deleted = Default::default();
                 incremental.renamed = Default::default();
-                for (operation, directory, symlink, count, size) in values.events {
-                    let target = match operation.as_str() {
+                for event in values.events {
+                    let count = event.entries as usize;
+                    let size = event.bytes;
+                    let target = match event.operation_type.as_str() {
                         "new" => &mut incremental.new,
                         "data_changed" | "metadata_changed" | "both_changed" => &mut incremental.changed,
                         "deleted" => &mut incremental.deleted,
                         "rename" => &mut incremental.renamed,
                         _ => continue,
                     };
-                    if directory {
-                        target.dir_count += count as usize;
+                    if event.is_dir {
+                        target.dir_count += count;
                         target.dir_size += size;
-                    } else if symlink {
-                        target.symlink_count += count as usize;
+                    } else if event.is_symlink {
+                        target.symlink_count += count;
                         target.symlink_size += size;
-                    } else {
-                        target.regular_file_count += count as usize;
+                    } else if event.is_regular_file {
+                        target.regular_file_count += count;
                         target.regular_file_size += size;
+                    } else {
+                        target.other_entry_count += count;
+                        target.other_entry_size += size;
                     }
                 }
                 Some((
@@ -254,6 +385,7 @@ impl ConsumerManager {
             if let Err(error) = sc.progress_bar.restore(&report) {
                 error!(%error, "Failed to reconcile scan progress");
             }
+            sc.sync_scan_progress();
         }
     }
 
@@ -265,7 +397,15 @@ impl ConsumerManager {
         if saved.is_empty() {
             return Ok(());
         }
-        let (mut stats, report): (StatsKind, ProgressReport) = serde_json::from_str(saved)?;
+        let (mut stats, report, callback) = match serde_json::from_str::<SavedStatistics>(saved)? {
+            SavedStatistics::Current(saved) if saved.version == 2 => (saved.stats, saved.report, Some(saved.callback)),
+            SavedStatistics::Current(_) => {
+                return Err(AppError::ScanError(
+                    "Unsupported statistics checkpoint version; reset this scan job".into(),
+                ));
+            }
+            SavedStatistics::Previous((stats, report)) => (stats, report, None),
+        };
         let duration = Duration::try_from_secs_f64(report.elapsed_secs)
             .map_err(|_| AppError::ConfigError("Invalid saved scan duration".into()))?;
         let start = Instant::now().checked_sub(duration).unwrap_or_else(Instant::now);
@@ -291,7 +431,12 @@ impl ConsumerManager {
                 _ => return Err(AppError::ConfigError("Saved scan statistics kind differs".into())),
             }
             sc.progress_bar.restore(&report)?;
+            sc.scan_snapshot = report.scan;
             sc.stats = stats;
+            sc.sync_scan_progress();
+            if let Some(callback) = callback {
+                sc.callback.restore_checkpoint(callback)?;
+            }
         }
         Ok(())
     }
@@ -330,6 +475,8 @@ impl ConsumerManager {
                     callback_url,
                     generation_committed: None,
                     pb_handle: None,
+                    scan_snapshot: None,
+                    callback: Default::default(),
                 },
                 JobType::IncrementalScan | JobType::IncrementalCopy => StatisticConsumer {
                     stats: StatsKind::Incremental(IncrementalStats::new(job_type.clone(), job_id, command, log_path)),
@@ -338,6 +485,8 @@ impl ConsumerManager {
                     callback_url,
                     generation_committed: None,
                     pb_handle: None,
+                    scan_snapshot: None,
+                    callback: Default::default(),
                 },
             };
             manager.stats_consumer = Some(Arc::new(Mutex::new(sc)));
@@ -476,6 +625,124 @@ impl Drop for ConsumerManager {
 mod resume_tests {
     use super::*;
     use crate::consumer::stats::ProgressDetail;
+    use db::clickhouse::scan_resume_statistics::{ScanEventSummary, ScanResumeSummary};
+    use db::traits::StorageEntryRecord;
+
+    #[tokio::test]
+    async fn reconciled_special_events_keep_callback_totals_and_checkpoint_counts() -> Result<()> {
+        let stats = StatisticConsumer {
+            stats: StatsKind::Incremental(IncrementalStats::new(
+                JobType::IncrementalScan,
+                "special".into(),
+                String::new(),
+                String::new(),
+            )),
+            progress_bar: ProgressBar::new(JobType::IncrementalScan),
+            job_dir: String::new(),
+            callback_url: None,
+            generation_committed: None,
+            pb_handle: None,
+            scan_snapshot: None,
+            callback: Default::default(),
+        };
+        let manager = ConsumerManager {
+            consumers: vec![],
+            stats_consumer: Some(Arc::new(Mutex::new(stats))),
+            callback_guard: None,
+        };
+        let special: StorageEntryRecord = serde_json::from_value(serde_json::json!({
+            "name":"fifo", "relative_path":"fifo", "size":0, "ext":null, "ctime":0, "mtime":0, "atime":0,
+            "mode":null, "storage_type":"nas", "is_symlink":false, "is_dir":false, "is_regular_file":false,
+            "hard_links":1, "current_state":0, "uid":null, "gid":null, "ino":null, "file_handle":null,
+            "version_id":"", "tags":null, "version_count":null
+        }))?;
+        manager
+            .record_final_events(&[
+                ScanFinalEvent::Added(special.clone()),
+                ScanFinalEvent::Deleted(special.clone()),
+                ScanFinalEvent::Renamed {
+                    from_path: "old_fifo".into(),
+                    from_version: String::new(),
+                    to: special,
+                },
+            ])
+            .await;
+        {
+            let stats = manager
+                .stats_consumer
+                .as_ref()
+                .ok_or_else(|| AppError::ConfigError("missing statistics".into()))?
+                .lock()
+                .await;
+            let StatsKind::Incremental(values) = &stats.stats else {
+                return Err(AppError::ConfigError("wrong statistics kind".into()));
+            };
+            for delta in [&values.new, &values.deleted, &values.renamed] {
+                assert_eq!(
+                    (delta.total_count(), delta.regular_file_count, delta.other_entry_count),
+                    (1, 0, 1)
+                );
+            }
+        }
+        let values = ScanResumeStatistics {
+            summary: ScanResumeSummary {
+                dirs: 0,
+                dir_bytes: 0,
+                files: 0,
+                file_bytes: 0,
+                links: 0,
+                link_bytes: 0,
+                total_depth: 0,
+                max_depth: 0,
+                total_name_length: 0,
+                max_name_length: 0,
+            },
+            extensions: vec![],
+            ages: vec![],
+            sizes: vec![],
+            events: [
+                (true, false, false, 1),
+                (false, true, false, 1),
+                (false, false, true, 1),
+                (false, false, false, 4),
+            ]
+            .into_iter()
+            .map(|(is_dir, is_symlink, is_regular_file, entries)| ScanEventSummary {
+                operation_type: "new".into(),
+                is_dir,
+                is_symlink,
+                is_regular_file,
+                entries,
+                bytes: 0,
+            })
+            .collect(),
+        };
+        manager.reconcile_scan_statistics(values).await;
+        let checkpoint = manager.statistics_checkpoint().await?;
+        manager.restore_statistics(&checkpoint).await?;
+        let stats = manager
+            .stats_consumer
+            .as_ref()
+            .ok_or_else(|| AppError::ConfigError("missing statistics".into()))?
+            .lock()
+            .await;
+        assert!(matches!(
+            stats.to_report(true).detail,
+            ProgressDetail::Incremental { new_count: 7, .. }
+        ));
+        let StatsKind::Incremental(values) = &stats.stats else {
+            return Err(AppError::ConfigError("wrong statistics kind".into()));
+        };
+        assert_eq!(
+            (
+                values.new.total_count(),
+                values.new.regular_file_count,
+                values.new.other_entry_count
+            ),
+            (7, 1, 4)
+        );
+        Ok(())
+    }
 
     #[tokio::test]
     async fn statistics_checkpoint_restores_counts_without_replaying_old_messages() -> Result<()> {
@@ -490,6 +757,8 @@ mod resume_tests {
             callback_url: None,
             generation_committed: None,
             pb_handle: None,
+            scan_snapshot: None,
+            callback: Default::default(),
         };
         stats.progress_bar.restore(&ProgressReport {
             job_id: "resume".into(),
@@ -505,6 +774,10 @@ mod resume_tests {
             },
             is_final: false,
             final_stats: None,
+            scan: None,
+            callback_identity: None,
+            diagnostics: None,
+            scan_runtime: None,
             generation_committed: None,
         })?;
         let manager = ConsumerManager {

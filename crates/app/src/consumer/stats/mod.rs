@@ -7,8 +7,11 @@
 //! - `consumer` — StatisticConsumer（聚合以上模块 + HTTP 回调）
 
 pub mod accumulator;
+pub(crate) mod callback_state;
 pub mod consumer;
+pub mod diagnostics;
 pub mod progress_bar;
+pub(crate) mod recovery_progress;
 pub mod report;
 
 // 重新导出：上层只需 `use crate::consumer::stats::*` 即可拿到常用类型

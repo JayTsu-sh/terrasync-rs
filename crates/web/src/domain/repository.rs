@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use super::endpoint::Endpoint;
 use super::execution::{ExecutionStats, LogLevel, TaskExecution, TaskLog};
 use super::path::MigrationPath;
-use super::progress::TaskProgress;
+use super::progress::{DiagnosticPage, ProgressReceipt, ProgressSubmission, TaskProgress};
 use super::task::{MigrationTask, TaskFilter, TaskStatus};
 use crate::error::Result;
 
@@ -40,7 +40,8 @@ pub trait TaskRepository: Send + Sync {
 
 #[async_trait]
 pub trait ProgressRepository: Send + Sync {
-    async fn upsert(&self, progress: &TaskProgress) -> Result<()>;
+    async fn receive(&self, submission: ProgressSubmission<'_>) -> Result<ProgressReceipt>;
+    async fn diagnostics(&self, task_id: &str, offset: u32, limit: u32) -> Result<DiagnosticPage>;
     async fn find_by_task_id(&self, task_id: &str) -> Result<Option<TaskProgress>>;
     async fn delete_by_task_id(&self, task_id: &str) -> Result<()>;
 }

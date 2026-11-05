@@ -5,7 +5,7 @@
 // 标准库
 use data_mover::model::BackendIdentity;
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock, Weak};
 
 // 外部crate
@@ -26,8 +26,12 @@ use crate::common::{
 };
 use crate::config::ClickHouseConfig;
 use crate::error::{DatabaseError, Result};
+use crate::http_transport::build_client;
 use crate::observation_record::{OBSERVATION_IDENTITY_JOIN_CLAUSE, ObservedEntryRecord};
-use crate::scan_store::queries::check_scan_cancellation;
+use crate::scan_store::{
+    connectivity::RequestSafety,
+    queries::{ScanExecute, check_scan_cancellation, execute_request, idempotent_insert_client},
+};
 use crate::traits::{
     CopyGenerationStatus, Database, IncrementalStorageEntryRecord, QueryResult, StorageEntryRecord, TarManifestRecord,
 };
@@ -68,15 +72,9 @@ pub struct ClickHouseDatabase {
     cached_scan_state: AtomicU8,
     /// 每次扫描实例只检查一次旧基线的身份格式，避免每批全表统计。
     resume_base_has_typed_handles: Option<bool>,
+    native_dedup_ready: AtomicBool,
     /// 同一 `ClickHouse` 身份与 job 共享的 scan generation 生命周期
     generation_lifecycle: SharedGenerationLifecycle,
-}
-
-impl ClickHouseDatabase {
-    pub(crate) fn tag_scan_queries(&mut self, comment: &str) {
-        self.sync_client = self.sync_client.clone().with_option("log_comment", comment);
-        self.async_client = self.async_client.clone().with_option("log_comment", comment);
-    }
 }
 
 #[derive(Default)]
@@ -350,25 +348,29 @@ fn records_to_entry_iter(records: Vec<StorageEntryRecord>) -> Box<dyn Iterator<I
 }
 
 /// 构建基础 `ClickHouse` 客户端（含 url/database/username/password）
-pub(crate) fn build_base_client(config: &ClickHouseConfig) -> Client {
-    let mut client = Client::default()
-        .with_url(&config.dsn)
-        .with_database(config.database.clone())
-        .with_user(config.username.clone());
-    if let Some(password) = &config.password {
-        client = client.with_password(password);
-    }
-    client
+pub(crate) fn build_base_client(config: &ClickHouseConfig) -> Result<Client> {
+    build_client(config, None)
 }
 
 impl ClickHouseDatabase {
+    fn native_insert_safety(&self) -> RequestSafety {
+        if self.native_dedup_ready.load(Ordering::Acquire) {
+            RequestSafety::IdempotentWrite
+        } else {
+            RequestSafety::UnconfirmedWrite
+        }
+    }
+
     /// 创建新的`ClickHouse`数据库实例
     ///
     /// # Errors
     /// 部署模式、集群名称或集群数据库标识符无效时返回配置错误；此时尚未发起网络请求。
     pub fn new(config: &ClickHouseConfig, job_id: &str) -> Result<Self> {
+        Self::with_client(config, job_id, build_base_client(config)?)
+    }
+
+    pub(crate) fn with_client(config: &ClickHouseConfig, job_id: &str, client: Client) -> Result<Self> {
         let catalogue_cluster = ClusterCatalogue::from_config(config, job_id)?;
-        let client = build_base_client(config);
         let (sync_client, async_client) = if let Some(cluster) = &catalogue_cluster {
             let client = cluster.client(client);
             (client.clone(), client)
@@ -389,6 +391,7 @@ impl ClickHouseDatabase {
             scan_temp_table_name: None,
             cached_scan_state: AtomicU8::new(255),
             resume_base_has_typed_handles: None,
+            native_dedup_ready: AtomicBool::new(false),
             generation_lifecycle: shared_generation_lifecycle(config, job_id),
         })
     }
@@ -423,11 +426,11 @@ impl ClickHouseDatabase {
         let mut insert = client
             .insert::<ObservedEntryRecord>(table_name)
             .await
-            .map_err(DatabaseError::ClickHouseError)?;
+            .map_err(DatabaseError::from)?;
         for record in records {
-            insert.write(record).await.map_err(DatabaseError::ClickHouseError)?;
+            insert.write(record).await.map_err(DatabaseError::from)?;
         }
-        insert.end().await.map_err(DatabaseError::ClickHouseError)
+        insert.end().await.map_err(DatabaseError::from)
     }
 
     /// 用中立 identity key JOIN 临时观察与基线，返回查询投影发生变化的观察。
@@ -625,7 +628,7 @@ impl ClickHouseDatabase {
             }
         }
 
-        query.execute().await.map_err(DatabaseError::ClickHouseError)?;
+        query.execute_scan().await?;
 
         Ok(QueryResult {
             rows: Vec::new(),
@@ -812,14 +815,16 @@ impl ClickHouseDatabase {
 
         debug!("Inserting scan state: id=1, scan_state={}", scan_state);
 
-        self.catalogue_write_client(&self.sync_client)
-            .query(&insert_sql)
-            .bind(1u8)
-            .bind(scan_state)
-            .bind(baseline_committed)
-            .execute()
-            .await
-            .map_err(DatabaseError::ClickHouseError)?;
+        let client = idempotent_insert_client(&self.catalogue_write_client(&self.sync_client));
+        execute_request(self.native_insert_safety(), || {
+            let query = client
+                .query(&insert_sql)
+                .bind(1u8)
+                .bind(scan_state)
+                .bind(baseline_committed);
+            async move { query.execute().await.map_err(DatabaseError::from) }
+        })
+        .await?;
 
         debug!("Inserted scan state record: id=1, scan_state={}", scan_state);
         Ok(())
@@ -957,15 +962,15 @@ impl ClickHouseDatabase {
         let mut insert = client
             .insert::<StorageEntryRecord>(table_name)
             .await
-            .map_err(DatabaseError::ClickHouseError)?;
+            .map_err(DatabaseError::from)?;
 
         for entry in records {
             let record = StorageEntryRecord::from_entry_enum(entry.as_ref(), current_state);
             trace!("Inserting record: {:?} in table {}", record, table_name);
-            insert.write(&record).await.map_err(DatabaseError::ClickHouseError)?;
+            insert.write(&record).await.map_err(DatabaseError::from)?;
         }
 
-        insert.end().await.map_err(DatabaseError::ClickHouseError)?;
+        insert.end().await.map_err(DatabaseError::from)?;
 
         info!("Successfully inserted {} records to table {}", record_count, table_name);
         Ok(())
@@ -983,6 +988,7 @@ impl Database for ClickHouseDatabase {
             scan_temp_table_name: self.scan_temp_table_name.clone(),
             cached_scan_state: AtomicU8::new(self.cached_scan_state.load(Ordering::Relaxed)),
             resume_base_has_typed_handles: self.resume_base_has_typed_handles,
+            native_dedup_ready: AtomicBool::new(self.native_dedup_ready.load(Ordering::Acquire)),
             generation_lifecycle: Arc::clone(&self.generation_lifecycle),
         };
 
@@ -1001,11 +1007,7 @@ impl Database for ClickHouseDatabase {
 
     /// 通过 SELECT 1 测试连接
     async fn ping(&self) -> Result<()> {
-        self.sync_client
-            .query("SELECT 1")
-            .fetch_quorum_one::<u8>()
-            .await
-            .map_err(|e| DatabaseError::ConnectionError(e.to_string()))?;
+        self.sync_client.query("SELECT 1").fetch_quorum_one::<u8>().await?;
 
         debug!("ClickHouse connection established successfully");
         Ok(())
@@ -1042,7 +1044,7 @@ impl Database for ClickHouseDatabase {
         let mut insert = client
             .insert::<IncrementalStorageEntryRecord>(&table_name)
             .await
-            .map_err(DatabaseError::ClickHouseError)?;
+            .map_err(DatabaseError::from)?;
 
         for record in &records {
             trace!(
@@ -1050,10 +1052,10 @@ impl Database for ClickHouseDatabase {
                 record, table_name
             );
 
-            insert.write(record).await.map_err(DatabaseError::ClickHouseError)?;
+            insert.write(record).await.map_err(DatabaseError::from)?;
         }
 
-        insert.end().await.map_err(DatabaseError::ClickHouseError)?;
+        insert.end().await.map_err(DatabaseError::from)?;
 
         info!(
             "Successfully inserted {} events to incremental scan table {}",
@@ -1427,13 +1429,13 @@ impl Database for ClickHouseDatabase {
         let mut insert = client
             .insert::<TarManifestRecord>(&table_name)
             .await
-            .map_err(DatabaseError::ClickHouseError)?;
+            .map_err(DatabaseError::from)?;
 
         for record in records {
-            insert.write(record).await.map_err(DatabaseError::ClickHouseError)?;
+            insert.write(record).await.map_err(DatabaseError::from)?;
         }
 
-        insert.end().await.map_err(DatabaseError::ClickHouseError)?;
+        insert.end().await.map_err(DatabaseError::from)?;
 
         info!(
             "Successfully inserted {} tar manifest records to {}",

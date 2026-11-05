@@ -221,6 +221,8 @@ mod clickhouse_integration_tests {
             observed_entries: 10,
             checkpoint: vec![1, 2, 3],
             statistics: String::new(),
+            baseline_snapshot: String::new(),
+            checkpoint_snapshot: String::new(),
         };
         assert!(database.load_resume_state().await.unwrap().is_none());
         database.save_resume_state(&state).await.unwrap();
@@ -364,6 +366,8 @@ mod clickhouse_integration_tests {
             observed_entries: 0,
             checkpoint: Vec::new(),
             statistics: String::new(),
+            baseline_snapshot: String::new(),
+            checkpoint_snapshot: String::new(),
         };
         store.save_resume_state(&state).await.unwrap();
         let backend = BackendIdentity::new(BackendKind::Nfs, "single-cache").unwrap();
@@ -495,6 +499,8 @@ mod clickhouse_integration_tests {
             observed_entries: 0,
             checkpoint: Vec::new(),
             statistics: String::new(),
+            baseline_snapshot: String::new(),
+            checkpoint_snapshot: String::new(),
         };
         store.save_resume_state(&state).await.unwrap();
         store
@@ -666,6 +672,8 @@ mod clickhouse_integration_tests {
             observed_entries: 1,
             checkpoint: vec![1],
             statistics: String::new(),
+            baseline_snapshot: String::new(),
+            checkpoint_snapshot: String::new(),
         };
         database.save_resume_state(&state).await.unwrap();
         let saved = database.load_resume_state().await.unwrap().unwrap();

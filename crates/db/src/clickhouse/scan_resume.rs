@@ -32,6 +32,10 @@ pub struct ScanResumeState {
     pub observed_entries: u64,
     pub checkpoint: Vec<u8>,
     pub statistics: String,
+    #[serde(default)]
+    pub baseline_snapshot: String,
+    #[serde(default)]
+    pub checkpoint_snapshot: String,
 }
 
 impl ScanResumeState {
@@ -68,7 +72,7 @@ impl ScanResumeState {
 }
 
 impl ClickHouseDatabase {
-    fn resume_table(&self) -> String {
+    pub(super) fn resume_table(&self) -> String {
         format!("scan_resume_{}", sanitize_job_id(&self.job_id))
     }
 
@@ -78,7 +82,8 @@ impl ClickHouseDatabase {
             &format!(
                 "CREATE TABLE IF NOT EXISTS {table} (id UInt8, schema_version UInt8, version UInt64, \
              request_key String, generation UInt8, incremental Bool, phase UInt8, event_time Int64, \
-             observed_entries UInt64, checkpoint Array(UInt8), statistics String DEFAULT '') \
+             observed_entries UInt64, checkpoint Array(UInt8), statistics String DEFAULT '', \
+             baseline_snapshot String DEFAULT '', checkpoint_snapshot String DEFAULT '') \
              ENGINE = ReplacingMergeTree(version) ORDER BY id"
             ),
             &[],
@@ -89,30 +94,41 @@ impl ClickHouseDatabase {
             &[],
         )
         .await?;
+        for column in ["baseline_snapshot", "checkpoint_snapshot"] {
+            self.execute(
+                &format!("ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {column} String DEFAULT ''"),
+                &[],
+            )
+            .await?;
+        }
         match self
             .sync_client
             .query(&format!(
                 "SELECT id, schema_version, version, request_key, generation, incremental, phase, \
-             event_time, observed_entries, checkpoint, statistics FROM {table} ORDER BY version DESC LIMIT 1"
+             event_time, observed_entries, checkpoint, statistics, baseline_snapshot, checkpoint_snapshot FROM {table} ORDER BY version DESC LIMIT 1"
             ))
-            .fetch_one::<ScanResumeState>()
+            .fetch_quorum_one::<ScanResumeState>()
             .await
         {
             Ok(row) => {
                 row.validate_envelope()?;
                 Ok(Some(row))
             }
-            Err(ClickHouseError::RowNotFound) => Ok(None),
+            Err(DatabaseError::ClickHouseError(ClickHouseError::RowNotFound)) => Ok(None),
             Err(error) => Err(error.into()),
         }
     }
 
     pub async fn save_resume_state(&self, state: &ScanResumeState) -> Result<()> {
         state.validate_envelope()?;
-        let mut insert = self.sync_client.insert::<ScanResumeState>(&self.resume_table()).await?;
-        insert.write(state).await?;
-        insert.end().await?;
-        Ok(())
+        let client = idempotent_insert_client(&self.sync_client);
+        execute_request(self.native_insert_safety(), || async {
+            let mut insert = client.insert::<ScanResumeState>(&self.resume_table()).await?;
+            insert.write(state).await?;
+            insert.end().await?;
+            Ok(())
+        })
+        .await
     }
 
     pub async fn invalidate_resume_state(&self) -> Result<()> {
@@ -136,7 +152,7 @@ impl ClickHouseDatabase {
         self.execute(
             &format!(
                 "CREATE TABLE IF NOT EXISTS {table} ({FILE_SCAN_COLUMNS_DEFINITION}) \
-             ENGINE = MergeTree() ORDER BY (relative_path, version_id, identity_key) SETTINGS allow_nullable_key = 1"
+             ENGINE = MergeTree() ORDER BY (relative_path, version_id, identity_key) SETTINGS allow_nullable_key = 1, non_replicated_deduplication_window = 10000"
             ),
             &[],
         )
@@ -208,7 +224,7 @@ impl ClickHouseDatabase {
             .query(&format!(
                 "SELECT ifNull(toUnixTimestamp64Nano(max(create_at)), 0) FROM {table}"
             ))
-            .fetch_one::<i64>()
+            .fetch_quorum_one::<i64>()
             .await?;
         Ok(now.max(
             last.checked_add(1)
@@ -254,7 +270,7 @@ impl ClickHouseDatabase {
             .query(&format!(
                 "DELETE FROM {base} WHERE {previous}(relative_path, version_id) IN (SELECT relative_path, version_id FROM {keys})"
             ))
-            .execute()
+            .execute_scan()
             .await?;
         Ok(())
     }
@@ -298,7 +314,7 @@ impl ClickHouseDatabase {
              WHERE toUnixTimestamp64Nano(create_at) >= ? AND relative_path IN (SELECT relative_path FROM {keys})"
             ))
             .bind(event_time)
-            .fetch_all::<(String, String, String, i64)>()
+            .fetch_quorum_all::<(String, String, String, i64)>()
             .await?;
         let mut next_time = existing
             .iter()
@@ -353,6 +369,8 @@ mod tests {
             observed_entries: 100,
             checkpoint: vec![1, 2, 3],
             statistics: String::new(),
+            baseline_snapshot: String::new(),
+            checkpoint_snapshot: String::new(),
         }
     }
 
@@ -387,11 +405,11 @@ impl ClickHouseDatabase {
                     "SELECT incremental,phase FROM {} FINAL WHERE id=1",
                     self.resume_table()
                 ))
-                .fetch_one::<(bool, u8)>()
+                .fetch_quorum_one::<(bool, u8)>()
                 .await
             {
                 Ok((incremental, phase)) if phase == RUNNING || phase == FINALIZING => return Ok(incremental),
-                Ok(_) | Err(ClickHouseError::RowNotFound) => {}
+                Ok(_) | Err(DatabaseError::ClickHouseError(ClickHouseError::RowNotFound)) => {}
                 Err(error) => return Err(error.into()),
             }
         }

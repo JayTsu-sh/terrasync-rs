@@ -18,6 +18,7 @@ use tracing::error;
 use crate::clickhouse::ClickHouseDatabase;
 use crate::config::DatabaseConfig;
 use crate::error::{DatabaseError, Result};
+use crate::scan_store::ScanStore;
 use crate::traits::Database;
 
 /// 数据库创建函数类型定义
@@ -77,6 +78,7 @@ impl DatabaseFactory {
 
                 // 创建ClickHouse数据库实例
                 let db = ClickHouseDatabase::new(clickhouse_config, job_id)?;
+                ScanStore::ensure_metadata_available(clickhouse_config, job_id).await?;
                 Box::new(db) as Box<dyn Database>
             }
             _ => {

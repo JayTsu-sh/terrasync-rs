@@ -4,13 +4,18 @@ use crate::clickhouse::scan_resume_statistics::{ScanEventStatistics, ScanResumeS
 use crate::cluster_scan::ClusterScanStore;
 use crate::traits::StorageEntryRecord;
 use crate::{
-    ClickHouseConfig, ClickHouseDatabase, Database, INCREMENTAL_SCAN_TABLE_BASE_NAME, Result, base_table_name_for_job,
+    ClickHouseConfig, ClickHouseDatabase, Database, DatabaseError, INCREMENTAL_SCAN_TABLE_BASE_NAME, Result,
+    base_table_name_for_job,
 };
 use data_mover::model::ObservedEntry;
 use std::sync::Arc;
 use storage_adapter::observed_scan::ObservedScanEvent;
 
+pub(crate) mod connectivity;
+mod cuts;
 pub(crate) mod queries;
+pub use connectivity::{ConnectivityWatch, ScanDatabaseExecution};
+use cuts::ScanCuts;
 pub use queries::{ScanQueryCancellation, with_scan_cancellation};
 
 enum Store {
@@ -65,6 +70,7 @@ pub struct ScanStore {
     inner: Store,
     job_id: String,
     queries: ScanQueryCancellation,
+    cuts: ScanCuts,
 }
 
 macro_rules! delegate {
@@ -75,6 +81,10 @@ macro_rules! delegate {
     )*};
 }
 impl ScanStore {
+    /// 普通元数据入口不能把活动扫描的 working 表当作已发布结果。
+    pub(crate) async fn ensure_metadata_available(config: &ClickHouseConfig, job: &str) -> Result<()> {
+        ScanCuts::ensure_metadata_available(config, job).await
+    }
     /// 集群批次独享临时分区，连接池与扫描轮次共享；单机保留串行兼容路径。
     pub fn batch_writer(&self) -> Option<Self> {
         match &self.inner {
@@ -82,6 +92,7 @@ impl ScanStore {
                 inner: Store::Cluster(store.batch_writer()),
                 job_id: self.job_id.clone(),
                 queries: self.queries.clone(),
+                cuts: self.cuts.clone(),
             }),
             Store::Single(_) => None,
         }
@@ -89,16 +100,14 @@ impl ScanStore {
 
     pub fn new(config: &ClickHouseConfig, job_id: &str) -> Result<Self> {
         let cluster = config.cluster_name()?;
-        let queries = ScanQueryCancellation::new(config, cluster)?;
-        let mut inner = match cluster.filter(|value| !value.is_empty()) {
-            Some(cluster) => Store::Cluster(ClusterScanStore::new(config, cluster, job_id)?),
-            None => Store::Single(ClickHouseDatabase::new(config, job_id)?),
+        let queries = ScanQueryCancellation::new(config, cluster, job_id)?;
+        let client = queries.data_client(config)?;
+        let inner = match cluster.filter(|value| !value.is_empty()) {
+            Some(cluster) => Store::Cluster(ClusterScanStore::with_client(config, cluster, job_id, client.clone())?),
+            None => Store::Single(ClickHouseDatabase::with_client(config, job_id, client.clone())?),
         };
-        match &mut inner {
-            Store::Single(store) => store.tag_scan_queries(queries.comment()),
-            Store::Cluster(store) => store.tag_scan_queries(queries.comment()),
-        }
         Ok(Self {
+            cuts: ScanCuts::with_client(config, job_id, queries.comment(), client)?,
             inner,
             job_id: job_id.into(),
             queries,
@@ -106,6 +115,46 @@ impl ScanStore {
     }
     pub fn query_cancellation(&self) -> ScanQueryCancellation {
         self.queries.clone()
+    }
+    /// 先排空前次执行的 DDL/mutation，再读取恢复状态；旧 reset 也必须先完成。
+    pub async fn load_resume_state(&self) -> Result<Option<ScanResumeState>> {
+        self.cuts.await_prior_operations().await?;
+        match &self.inner {
+            Store::Single(store) => store.load_resume_state().await,
+            Store::Cluster(store) => store.load_resume_state().await,
+        }
+    }
+    /// 在 generation 的回标、旧状态失效等操作之前封存本轮原始基线。
+    pub async fn capture_scan_baseline(&self) -> Result<String> {
+        self.cuts.capture().await
+    }
+    pub async fn restore_scan_baseline(&self, state: &ScanResumeState) -> Result<()> {
+        self.cuts.restore(&state.baseline_snapshot).await
+    }
+    /// 调用方已经过 writer 屏障；不可变快照 ACK 之后才提交统计与源游标。
+    pub async fn seal_resume_state(&self, state: &mut ScanResumeState) -> Result<()> {
+        state.checkpoint_snapshot = self.cuts.capture().await?;
+        self.save_resume_state(state).await?;
+        self.cleanup_scan_snapshots(state).await?;
+        Ok(())
+    }
+    pub async fn restore_scan_checkpoint(&self, state: &ScanResumeState) -> Result<()> {
+        self.cuts.restore(&state.checkpoint_snapshot).await
+    }
+    /// 清理失败只留下可回收对象，不把已经提交的 manifest 改判失败。
+    pub async fn cleanup_scan_snapshots(&self, state: &ScanResumeState) -> Result<()> {
+        let keep = if state.active() {
+            vec![state.baseline_snapshot.as_str(), state.checkpoint_snapshot.as_str()]
+        } else {
+            Vec::new()
+        };
+        if let Err(error) = self.cuts.cleanup(&keep).await {
+            if matches!(error, DatabaseError::ScanCancelled) {
+                return Err(error);
+            }
+            tracing::warn!(%error, "Deferred scan metadata snapshot cleanup");
+        }
+        Ok(())
     }
     pub async fn initialize(&self) -> Result<()> {
         match &self.inner {
@@ -115,6 +164,7 @@ impl ScanStore {
     }
     /// 表布局及清理 SQL 由具体数据库实现负责，上层只指定作业。
     pub async fn clear_job(&self) -> Result<()> {
+        self.cuts.await_prior_operations().await?;
         match &self.inner {
             Store::Cluster(store) => store.clear_job().await,
             Store::Single(store) => {
@@ -133,7 +183,8 @@ impl ScanStore {
                 }
                 Ok(())
             }
-        }
+        }?;
+        self.cuts.cleanup(&[]).await
     }
     pub async fn prepare_incremental(&self) -> Result<()> {
         match &self.inner {
@@ -233,7 +284,6 @@ impl ScanStore {
     delegate! {
         ping()->Result<()>;
         resume_execution_is_incremental()->Result<bool>;
-        load_resume_state()->Result<Option<ScanResumeState>>;
         save_resume_state(state:&ScanResumeState)->Result<()>;
         restore_resume_generation(state:&ScanResumeState)->Result<bool>;
         begin_scan_generation()->Result<u8>;

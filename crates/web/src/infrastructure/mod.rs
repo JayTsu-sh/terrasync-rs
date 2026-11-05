@@ -1,4 +1,7 @@
 pub mod analysis_repo;
+mod callback_receipt;
+#[cfg(test)]
+mod callback_receipt_tests;
 pub mod clickhouse_client;
 pub(crate) mod clickhouse_config;
 pub mod config_repo;

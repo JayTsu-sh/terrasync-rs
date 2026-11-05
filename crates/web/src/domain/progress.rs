@@ -1,4 +1,30 @@
+use app::consumer::stats::diagnostics::{CallbackAck, CallbackIdentity, DiagnosticBatch, DiagnosticEvent};
 use serde::{Deserialize, Serialize};
+
+use super::execution::ExecutionStats;
+
+/// 一次回调的原子持久化单元；明细 ACK 与快照接受与否相互独立。
+pub struct ProgressSubmission<'a> {
+    pub progress: &'a TaskProgress,
+    pub identity: Option<&'a CallbackIdentity>,
+    pub diagnostics: Option<&'a DiagnosticBatch>,
+    pub execution_id: Option<&'a str>,
+    pub final_stats: Option<&'a ExecutionStats>,
+}
+
+/// 事务提交后的结果；旧回调可确认明细，但不能覆盖新快照。
+pub struct ProgressReceipt {
+    pub accepted: bool,
+    pub ack: CallbackAck,
+}
+
+/// 有界明细页面；省略数字按已持久化的唯一批次累计。
+#[derive(Debug, Serialize)]
+pub struct DiagnosticPage {
+    pub events: Vec<DiagnosticEvent>,
+    pub omitted_count: u64,
+    pub next_offset: Option<u32>,
+}
 
 /// `TaskProgress` 值对象 — 实时任务进度
 ///
