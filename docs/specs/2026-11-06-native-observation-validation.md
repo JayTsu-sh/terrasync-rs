@@ -61,6 +61,18 @@ marker 有到无的转换产生显式删除意图，不能仅由当前目录没�
 
 曾错误地使用 HDFS setgid 目录作为真实验收，早期失败不作为产品回归复现或修复证据。[HDFS 3.4.2 明确不支持 setuid／setgid，目录支持 sticky bit](https://hadoop.apache.org/docs/r3.4.2/hadoop-project-dist/hadoop-hdfs/HdfsPermissionsGuide.html)。setgid 的验证证据是原生计划回归和真实 Local role 的目录应用测试。
 
+## 独立权限事实的增量比较
+
+原生扫描持久化 mode／uid／gid 时使用独立权限事实，比较却仅读取完整 ownership 组合。真实 HDFS 的未变化第二轮 unordered 扫描产生了两条错误的 `metadata_changed`。修复让比较与行投影复用 ObservedView 的同一组 getter，保留未知值与真实零值的区别；所选历史版本不读取容器权限，无新增 I/O 或历史复制。
+
+命名主体、单侧数值身份、UID／GID／mode 为零、未知 mode 及真实 mode 变化的本地测试先复现失败后通过。完整 Rust 检查、workspace 测试与串行双进程 E2E 16 例通过，日志前缀 `/tmp/terrasync-independent-permissions-`。
+
+候选 SHA-256：`91ab7a59e584166fb013656504159d12fb9c77da032b987262a72d9a8fd94ea8`；源码记录 `/tmp/terrasync-independent-permissions-build-source.json`。
+
+- 真实 HDFS + ClickHouse Single：11 例通过。unordered 与 blocks 各两次扫描，第二轮 metadata_changed 累计数均为 0→0；保留其余 HDFS／QUIC 复制与完整性场景，文件 0640、目录 01775 和未知 uid／gid 正确。报告 `/work/terrasync-db-refactor-evidence/release-db-refactor-independent-permission-single-20261105-192506/report.json`，独立资源清理通过。
+- 同候选真实 HDFS + ClickHouse Cluster（2 分片 × 3 副本）11 例通过。按 job_id 从六副本共享事件表去重检查，unordered／blocks 均为 0→0；复制、完整性、权限与目录结果同时通过。报告 `/work/terrasync-db-refactor-evidence/release-db-refactor-independent-permission-cluster-v2-20261105-192702/report.json`；独立数据库、HDFS 路径和临时认证配置已清理。早期测试查询误用了单机的按 job 分表名，404 不作为产品失败或通过证据。
+- 修复前真实失败报告 `/work/terrasync-db-refactor-evidence/release-db-refactor-independent-permission-red-20261105-191640/report.json` 记录 unordered 的累计 metadata_changed 为 0→2，资源清理通过。
+
 ## 合入前仍须完成
 
 还需完成数据库内部职责拆分、移除无用 DTO／原型及旧版本计数、任务契约和 transport 的归属整理，以及按设计删除 storage-adapter。最终候选必须重跑对应 CI、真实 HDFS 和受影响故障链路，并完成全量／增量／续扫性能与峰值 RSS 对照。先前 HDFS 通过的二进制不能作为最终候选证据。

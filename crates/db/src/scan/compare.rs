@@ -145,11 +145,9 @@ impl Baseline {
             };
         }
         let view = item.view();
-        let ownership = view.metadata().ownership_mode().value();
         let data = self.size != view.get_size() || self.mtime != view.get_mtime();
-        let meta = self.mode != ownership.map(|o| o.mode)
-            || self.uid != ownership.map(|o| o.uid)
-            || self.gid != ownership.map(|o| o.gid);
+        // 与行投影使用同一组独立权限事实，保留未知值与真实零值的区别。
+        let meta = self.mode != view.mode() || self.uid != view.uid() || self.gid != view.gid();
         match (data, meta) {
             (true, true) => Some(ChangeKind::Both),
             (true, false) => Some(ChangeKind::DataOnly),
@@ -586,7 +584,8 @@ mod tests {
     use clickhouse::Compression;
     use clickhouse::test::{Mock, handlers};
     use data_mover::model::{
-        BackendIdentity, BackendKind, EntryKind, IdentityStrength, ObservedEntry, SourceIdentity, StoragePath,
+        BackendIdentity, BackendKind, EntryKind, IdentityStrength, ObservedEntry, PermissionFacts, PrincipalIdentity,
+        SourceIdentity, StoragePath,
     };
     use storage_adapter::observed_scan::ObservedView;
     use tokio_util::sync::CancellationToken;
@@ -624,6 +623,52 @@ mod tests {
             previous_generation: true,
         })
     }
+    #[test]
+    fn unchanged_scan_compares_independent_permissions_as_persisted() -> Result<()> {
+        for permissions in [
+            PermissionFacts {
+                owner: Some(PrincipalIdentity::Named("hdfs".into())),
+                group: Some(PrincipalIdentity::Named("supergroup".into())),
+                mode: Some(0o640),
+            },
+            PermissionFacts {
+                owner: Some(PrincipalIdentity::Numeric(0)),
+                group: None,
+                mode: Some(0),
+            },
+            PermissionFacts {
+                owner: None,
+                group: Some(PrincipalIdentity::Numeric(0)),
+                mode: None,
+            },
+        ] {
+            let entry = Arc::new(
+                observation("unchanged", IdentityStrength::StableWithinBackend)?
+                    .with_permissions(Some(Box::new(permissions)))?,
+            );
+            let previous = baseline(&entry)?;
+            assert_eq!(previous.change(&Arc::clone(&entry).into()), None);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn changed_independent_mode_is_a_metadata_change() -> Result<()> {
+        let original = observation("chmod", IdentityStrength::StableWithinBackend)?.with_permissions(Some(
+            Box::new(PermissionFacts {
+                mode: Some(0o640),
+                ..Default::default()
+            }),
+        ))?;
+        let previous = baseline(&original)?;
+        let changed = Arc::new(original.with_permissions(Some(Box::new(PermissionFacts {
+            mode: Some(0o600),
+            ..Default::default()
+        })))?);
+        assert_eq!(previous.change(&changed.into()), Some(ChangeKind::MetadataOnly));
+        Ok(())
+    }
+
     fn access(client: &Client) -> NativeScanAccess<'_> {
         NativeScanAccess {
             client,
