@@ -3,6 +3,7 @@
 use super::*;
 use crate::execution::base_client;
 use crate::observed_fixtures::directory_marker;
+use crate::schema::columns::CATALOGUE_COLUMNS;
 use data_mover::model::{BackendKind, EntryKind};
 use std::path::PathBuf;
 use std::time::Duration;
@@ -127,7 +128,7 @@ impl Fixture {
             .unwrap()
             .query(&format!(
                 "SELECT {} FROM {table} FINAL ORDER BY relative_path, version_id",
-                *FILE_SCAN_COLUMNS_LIST
+                *CATALOGUE_COLUMNS
             ))
             .fetch_all()
             .await?)

@@ -91,6 +91,14 @@ SQL 行 DTO 已收回私有 schema／records；traits 只描述任务操作，�
 
 该阶段 workspace check／Clippy／测试及双进程 E2E 16 例通过；app 201、db 108 个本地测试通过，忽略项另计。真实 catalogue Single 10／10、Cluster 11／11、Single 集成 44／44 通过且测试数据库清理成功。记录前缀 `/tmp/terrasync-db-refactor-real-private-row-v2-`，Rust 日志前缀 `/tmp/terrasync-private-row-dto-`；首次 Clippy 的测试 lint 问题已修复，最终通过日志为 `clippy-v2.log`。
 
+## 快照读取投影与表生命周期
+
+流式观察回读只查询 relative_path、backend_kind、backend_id 和 entry_snapshot，避免读取随后丢弃的摘要列。完整观察仍由原生 snapshot 恢复；宽行与窄行共用 backend、codec 和路径校验，保留历史目录对象路径规则。窄行消费自身，将 backend ID 移入 native 身份构造；校验函数仅借用该身份。原过滤、FINAL、读取重试、取消与发送流程保持不变。
+
+建表、排序键校验、表清理等九个方法集中到 catalogue／tables，SQL 与方法体机械比对保持一致；layout 继续处理物理部署。没有新增转发层。
+
+该阶段完整 Rust 检查和双进程 16 例通过；最终借用签名清理后另通过 workspace check、db Clippy 与 db 109 个本地测试。真实 catalogue Single 10／10、Cluster 11／11 和 Single 集成 44／44 通过，独立数据库清理成功。记录前缀 `/tmp/terrasync-db-refactor-real-read-tables-v1-` 与 `/tmp/terrasync-catalogue-read-tables-`。marker 完整快照回归验证窄投影未丢失原生事实。
+
 ## 合入前仍须完成
 
 还需完成数据库内部职责拆分、收窄行 DTO 与任务接口、任务契约和 transport 的归属整理，以及按设计删除 storage-adapter。最终候选必须重跑对应 CI、真实 HDFS 和受影响故障链路，并完成全量／增量／续扫性能与峰值 RSS 对照。先前 HDFS 通过的二进制不能作为最终候选证据。

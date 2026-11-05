@@ -78,6 +78,9 @@ pub(crate) const FILE_INCREMENTAL_SCAN_COLUMNS_DEFINITION: &str = file_scan_base
 /// 目录查询和扫描摘要共用的字段顺序。
 pub(crate) const FILE_SCAN_COLUMNS_LIST: &str = "name, relative_path, size, ext, ctime, mtime, atime, mode, storage_type, is_symlink, is_dir, is_regular_file, hard_links, current_state, uid, gid, ino, file_handle, version_id, tags, marker_state";
 
+/// 原生观察流式回读的最小查询投影，与 `SnapshotRow` 字段顺序一致。
+pub(crate) const SNAPSHOT_COLUMNS: &str = "relative_path,backend_kind,backend_id,entry_snapshot";
+
 pub(crate) static CATALOGUE_COLUMNS: LazyLock<String> =
     LazyLock::new(|| format!("{},backend_kind,backend_id,entry_snapshot", FILE_SCAN_COLUMNS_LIST));
 pub(crate) static CATALOGUE_COLUMNS_WITH_T_PREFIX: LazyLock<String> = LazyLock::new(|| {

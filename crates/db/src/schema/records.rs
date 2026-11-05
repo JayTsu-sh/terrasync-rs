@@ -98,17 +98,37 @@ impl StorageEntryRecord {
     /// 目录持久化读取只接受完整原生 snapshot，不从查询列拼造观察。
     pub fn to_observation(&self) -> Result<ObservedEntry> {
         let backend = BackendIdentity::new(self.backend_kind.parse()?, self.backend_id.clone())?;
-        let entry = ObservedEntry::decode_snapshot(&self.entry_snapshot, &backend)?;
-        if entry.get_relative_path() != Path::new(&self.relative_path)
-            && entry
-                .history_source_path()?
-                .as_ref()
-                .is_none_or(|path| path.as_str() != self.relative_path)
-        {
-            return Err(DatabaseError::ObservationProjectionMismatch { field: "relative_path" });
-        }
-        Ok(entry)
+        decode_observation(&self.relative_path, &self.entry_snapshot, &backend)
     }
+}
+
+/// 流式观察回读只取 codec 和路径校验需要的字段。
+#[derive(Deserialize, clickhouse::Row)]
+pub(crate) struct SnapshotRow {
+    relative_path: String,
+    backend_kind: String,
+    backend_id: String,
+    entry_snapshot: Vec<u8>,
+}
+
+impl SnapshotRow {
+    pub(crate) fn into_observation(self) -> Result<ObservedEntry> {
+        let backend = BackendIdentity::new(self.backend_kind.parse()?, self.backend_id)?;
+        decode_observation(&self.relative_path, &self.entry_snapshot, &backend)
+    }
+}
+
+fn decode_observation(relative_path: &str, snapshot: &[u8], backend: &BackendIdentity) -> Result<ObservedEntry> {
+    let entry = ObservedEntry::decode_snapshot(snapshot, backend)?;
+    if entry.get_relative_path() != Path::new(relative_path)
+        && entry
+            .history_source_path()?
+            .as_ref()
+            .is_none_or(|path| path.as_str() != relative_path)
+    {
+        return Err(DatabaseError::ObservationProjectionMismatch { field: "relative_path" });
+    }
+    Ok(entry)
 }
 
 /// 文件增量扫描记录结构体
@@ -280,6 +300,20 @@ mod tests {
     use serde_json::json;
     use std::sync::Arc;
     use storage_adapter::observed_scan::ObservedItem;
+
+    #[test]
+    fn narrow_snapshot_projection_keeps_the_complete_native_observation() -> Result<()> {
+        let entry = crate::observed_fixtures::directory_marker("folder", vec![("tag".into(), "kept".into())]);
+        let record = StorageEntryRecord::capture(&entry, 1)?;
+        let snapshot = SnapshotRow {
+            relative_path: record.relative_path,
+            backend_kind: record.backend_kind,
+            backend_id: record.backend_id,
+            entry_snapshot: record.entry_snapshot,
+        };
+        assert_eq!(snapshot.into_observation()?, entry);
+        Ok(())
+    }
 
     #[test]
     fn each_selected_completion_encodes_exactly_one_incremental_version() -> Result<()> {

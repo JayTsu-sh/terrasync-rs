@@ -4,7 +4,7 @@ use crate::config::ClickHouseConfig;
 use crate::error::{DatabaseError, Result};
 use crate::execution::queries::{check_scan_cancellation, scan_retry_delay};
 use crate::schema::identifier;
-use crate::schema::records::StorageEntryRecord;
+use crate::schema::records::SnapshotRow;
 use clickhouse::{Client, error::Error as ClickHouseError, query::Query};
 use std::time::{Duration, Instant};
 use storage_adapter::ObservedEntry;
@@ -79,7 +79,7 @@ impl ClusterCatalogue {
         let local = Self::local(table)?;
         let public = identifier(table)?;
         let on_cluster = self.on_cluster()?;
-        // 表被 EXCHANGE 后仍保留自己的 Keeper 路径；每次创建必须分配全新路径。
+        // 同名目录表可以重建；独立 Keeper 路径避免复用尚未清理的副本状态。
         let path = format!(
             "/terrasync/catalogue/{}/{}/{{shard}}",
             self.database,
@@ -121,11 +121,11 @@ impl ClickHouseDatabase {
             } else {
                 query.clone()
             };
-            let mut cursor = request.fetch::<StorageEntryRecord>()?;
+            let mut cursor = request.fetch::<SnapshotRow>()?;
             loop {
                 match cursor.next().await {
                     Ok(Some(record)) => {
-                        tx.send(record.to_observation()?).await.map_err(|error| {
+                        tx.send(record.into_observation()?).await.map_err(|error| {
                             DatabaseError::QueryError(format!("Failed to send storage entry: {error}"))
                         })?;
                         delivered = true;
