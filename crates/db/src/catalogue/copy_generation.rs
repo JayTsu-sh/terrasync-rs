@@ -29,11 +29,6 @@ impl ClickHouseDatabase {
             ));
         }
         let mut lifecycle = self.generation_lifecycle.lock().await;
-        if lifecycle.observation_publication_ambiguous {
-            return Err(DatabaseError::TransactionError(
-                "cannot begin copy while observation EXCHANGE outcome is ambiguous".into(),
-            ));
-        }
         let saved = self.copy_generation_state().await?;
         let previous = saved.scan_state;
         let recovering = saved.copy_in_progress || (!saved.baseline_committed && self.copy_base_has_rows().await?);

@@ -3,7 +3,7 @@
 use super::*;
 use crate::execution::base_client;
 use crate::observed_fixtures::directory_marker;
-use data_mover::model::{BackendKind, EntryKind, IdentityStrength, SourceIdentity, StoragePath};
+use data_mover::model::{BackendKind, EntryKind};
 use std::path::PathBuf;
 use std::time::Duration;
 use storage_adapter::{EntryChange, ObservedEntryExt};
@@ -508,49 +508,6 @@ async fn history_copy_recovery_keeps_the_group_and_does_not_delete_the_replayed_
     assert_eq!(records[0].version_id, "a-new");
     database.commit_scan_generation().await?;
     database.drop_scan_temporary_table().await?;
-    Ok(())
-}
-
-#[tokio::test]
-#[ignore = "requires an explicitly selected six-replica ClickHouse cluster; isolated database and local fixture only"]
-async fn cluster_catalogue_snapshot_can_exchange_repeatedly_without_reusing_keeper_paths() -> Result<()> {
-    let fixture = Fixture::new().await?;
-    let backend = BackendIdentity::new(BackendKind::Local, "catalogue-local-fixture")?;
-    let mut database = ClickHouseDatabase::new(&fixture.config, "snapshot")?;
-    database.initialize().await?;
-    let mut previous_paths = HashSet::new();
-    for (index, path) in ["first", "renamed", "third"].into_iter().enumerate() {
-        std::fs::write(fixture.source.join(path), b"snapshot").unwrap();
-        let observation = ObservedEntry::new(
-            StoragePath::new(path)?,
-            EntryKind::File,
-            Some(8),
-            None,
-            SourceIdentity::new(backend.clone(), IdentityStrength::PathScoped, path.as_bytes())?,
-        )?;
-        let generation = database.begin_observation_snapshot().await?;
-        database
-            .batch_insert_temp_observations(&[ObservedEntryRecord::capture(&observation, generation)])
-            .await?;
-        assert_eq!(database.publish_observation_snapshot().await?, u64::from(index != 0));
-        assert_eq!(
-            database
-                .load_observation(&hex::encode(observation.identity_key().as_bytes()), &backend)
-                .await?,
-            Some(observation)
-        );
-        let records: Vec<(String, String)> = fixture.admin.query(
-            "SELECT hostName(), zookeeper_path FROM clusterAllReplicas(?, system.replicas) WHERE database=? AND table='__catalogue_base_snapshot'"
-        ).bind(fixture.config.cluster.as_deref().unwrap()).bind(&fixture.config.database).fetch_all().await?;
-        assert_eq!(records.len(), 6);
-        for (host, path) in records {
-            assert!(
-                previous_paths.insert((host, path)),
-                "a retired snapshot Keeper path was reused"
-            );
-        }
-        assert_eq!(database.get_count("base").await?, 1);
-    }
     Ok(())
 }
 

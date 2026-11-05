@@ -19,7 +19,6 @@ pub mod common; // Common types and utilities
 pub mod config; // 数据库配置定义
 pub mod error; // 错误处理
 mod execution;
-pub mod observation_record;
 pub mod scan;
 mod schema;
 pub mod traits; // 数据库接口定义
@@ -41,7 +40,6 @@ pub use catalogue::ClickHouseDatabase; // ClickHouse数据库具体实现
 pub use common::DeletionStatus; // Common deletion status enum
 pub use config::ClickHouseConfig; // 配置相关类型
 pub use error::{DatabaseError, Result}; // 错误处理相关类型
-pub use observation_record::{OBSERVATION_IDENTITY_JOIN_CLAUSE, ObservedEntryRecord};
 pub use traits::{CopyGenerationStatus, Database}; // 数据库接口类型
 
 /// 公共 API 的 prelude 模块
@@ -59,7 +57,6 @@ pub mod prelude {
     pub use super::DeletionStatus;
     /// 错误处理相关类型
     pub use super::{DatabaseError, Result};
-    pub use super::{OBSERVATION_IDENTITY_JOIN_CLAUSE, ObservedEntryRecord};
 }
 
 /// 根据 `job_id` 生成扫描基础表名

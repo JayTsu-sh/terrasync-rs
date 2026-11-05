@@ -3,7 +3,6 @@ use super::{ClickHouseDatabase, ExcludeRecord};
 use crate::config::ClickHouseConfig;
 use crate::error::{DatabaseError, Result};
 use crate::execution::queries::{check_scan_cancellation, scan_retry_delay};
-use crate::schema::columns::FILE_SCAN_COLUMNS_DEFINITION;
 use crate::schema::identifier;
 use crate::traits::StorageEntryRecord;
 use clickhouse::{Client, error::Error as ClickHouseError, query::Query};
@@ -316,35 +315,6 @@ impl ClickHouseDatabase {
         } else {
             self.execute(&format!("DROP TABLE IF EXISTS {public}"), &[]).await?;
         }
-        Ok(())
-    }
-
-    pub(super) async fn create_catalogue_snapshot(&self, temp: &str, base: &str) -> Result<()> {
-        if self.catalogue_cluster.is_none() {
-            self.execute(&format!("CREATE TABLE {temp} AS {base}"), &[]).await?;
-            return Ok(());
-        }
-        self.create_catalogue_table(
-            temp,
-            FILE_SCAN_COLUMNS_DEFINITION,
-            "(relative_path, version_id)",
-            CatalogueEngine::Replacing,
-        )
-        .await
-    }
-
-    pub(super) async fn exchange_catalogue_snapshot(&self, base: &str, temp: &str) -> Result<()> {
-        let statement = if let Some(cluster) = &self.catalogue_cluster {
-            format!(
-                "EXCHANGE TABLES {} AND {} {}",
-                ClusterCatalogue::local(base)?,
-                ClusterCatalogue::local(temp)?,
-                cluster.on_cluster()?
-            )
-        } else {
-            format!("EXCHANGE TABLES {} AND {}", identifier(base)?, identifier(temp)?)
-        };
-        self.execute(&statement, &[]).await?;
         Ok(())
     }
 }

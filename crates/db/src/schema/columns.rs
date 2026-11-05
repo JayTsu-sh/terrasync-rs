@@ -92,3 +92,23 @@ pub(crate) static CATALOGUE_COLUMNS_WITH_T_PREFIX: LazyLock<String> = LazyLock::
         .collect::<Vec<_>>()
         .join(",")
 });
+
+#[cfg(test)]
+mod tests {
+    use super::FILE_SCAN_COLUMNS_DEFINITION;
+
+    #[test]
+    fn native_observation_columns_share_the_scan_table_definition() {
+        for column in [
+            "identity_key String",
+            "backend_kind String",
+            "entry_kind String",
+            "size_observed Bool",
+            "modified_unix_nanos Nullable(Int128)",
+            "entry_snapshot Array(UInt8)",
+            "INDEX identity_key_idx identity_key TYPE bloom_filter",
+        ] {
+            assert!(FILE_SCAN_COLUMNS_DEFINITION.contains(column));
+        }
+    }
+}

@@ -3,7 +3,6 @@
 //! 提供与ClickHouse数据库交互的所有操作功能，包括表的创建、查询、插入和删除等。
 
 // 标准库
-use data_mover::model::BackendIdentity;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock, Weak};
@@ -17,7 +16,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use storage_adapter::{ChangeKind, StorageEntryMessage};
 use tokio::sync::{Mutex, MutexGuard, mpsc};
-use tracing::{debug, info, trace, warn};
+use tracing::{debug, info, trace};
 
 // 内部模块
 use crate::common::{DeletionStatus, classify_deletion_status};
@@ -27,7 +26,6 @@ use crate::execution::{
     queries::{ScanExecute, check_scan_cancellation, execute_request, idempotent_insert_client},
     recovery::RequestSafety,
 };
-use crate::observation_record::{OBSERVATION_IDENTITY_JOIN_CLAUSE, ObservedEntryRecord};
 use crate::scan::rows::NativeScanRecord;
 use crate::schema::columns::{
     CATALOGUE_COLUMNS as FILE_SCAN_COLUMNS_LIST, FILE_INCREMENTAL_SCAN_COLUMNS_DEFINITION, FILE_SCAN_COLUMNS_DEFINITION,
@@ -84,7 +82,6 @@ pub struct ClickHouseDatabase {
 struct ScanGenerationLifecycle {
     working: Option<u8>,
     committed: bool,
-    observation_publication_ambiguous: bool,
     copy_recovery: bool,
 }
 
@@ -160,214 +157,6 @@ impl ClickHouseDatabase {
         } else {
             RequestSafety::UnconfirmedWrite
         }
-    }
-
-    /// 将 data-mover observation    /// 将 data-mover observation projection 写入当前 job 的同一张 base 大表。
-    ///
-    /// # Errors
-    /// `ClickHouse` 拒绝 schema 或写入时返回数据库错误。
-    pub async fn batch_insert_observations(&self, records: &[ObservedEntryRecord]) -> Result<()> {
-        self.insert_observations(&get_scan_base_table_name(&self.job_id), records)
-            .await
-    }
-
-    /// 将 observation projection 写入当前扫描临时表。
-    ///
-    /// # Errors
-    /// 尚未创建临时表或 `ClickHouse` 拒绝写入时返回数据库错误。
-    pub async fn batch_insert_temp_observations(&self, records: &[ObservedEntryRecord]) -> Result<()> {
-        let table_name = self
-            .scan_temp_table_name
-            .as_ref()
-            .ok_or_else(|| DatabaseError::TableNotFound("scan temporary table".to_string()))?;
-        self.insert_observations(table_name, records).await
-    }
-
-    async fn insert_observations(&self, table_name: &str, records: &[ObservedEntryRecord]) -> Result<()> {
-        if records.is_empty() {
-            return Ok(());
-        }
-        let _write = self.catalogue_write_guard().await;
-        let client = self.catalogue_write_client(&self.async_client);
-        let mut insert = client
-            .insert::<ObservedEntryRecord>(table_name)
-            .await
-            .map_err(DatabaseError::from)?;
-        for record in records {
-            insert.write(record).await.map_err(DatabaseError::from)?;
-        }
-        insert.end().await.map_err(DatabaseError::from)
-    }
-
-    /// 用中立 identity key JOIN 临时观察与基线，返回查询投影发生变化的观察。
-    ///
-    /// # Errors
-    /// 临时表不存在、查询失败、snapshot 异常或投影不一致时返回 typed error。
-    pub async fn detect_changed_observations(&self, backend: &BackendIdentity) -> Result<Vec<ObservedEntry>> {
-        let temp = self
-            .scan_temp_table_name
-            .as_ref()
-            .ok_or_else(|| DatabaseError::TableNotFound("scan temporary table".to_string()))?;
-        let base = get_scan_base_table_name(&self.job_id);
-        let columns = "t.identity_key, t.relative_path, t.backend_kind, t.entry_kind, t.size, \
-                       t.size_observed, t.modified_unix_nanos, t.current_state, t.entry_snapshot";
-        let query = format!(
-            "SELECT {columns} FROM {temp} t INNER JOIN {base} b ON {OBSERVATION_IDENTITY_JOIN_CLAUSE} \
-             WHERE (t.relative_path != b.relative_path OR t.entry_kind != b.entry_kind \
-                OR t.size != b.size OR t.size_observed != b.size_observed \
-                OR NOT isNotDistinctFrom(t.modified_unix_nanos, b.modified_unix_nanos)) \
-             ORDER BY t.identity_key"
-        );
-        self.sync_client
-            .query(&query)
-            .fetch_quorum_all::<ObservedEntryRecord>()
-            .await?
-            .into_iter()
-            .map(|record| record.reconstruct(backend))
-            .collect()
-    }
-
-    /// 创建与 base 表结构完全一致的 observation snapshot staging 表。
-    ///
-    /// # Errors
-    /// base 表不存在或 `ClickHouse` 拒绝建表时返回数据库错误。
-    pub async fn begin_observation_snapshot(&mut self) -> Result<u8> {
-        if self.generation_lifecycle.lock().await.observation_publication_ambiguous {
-            return Err(DatabaseError::TransactionError(
-                "cannot begin observation snapshot while a previous EXCHANGE outcome is ambiguous".to_string(),
-            ));
-        }
-        if self.scan_temp_table_name.is_some() {
-            self.drop_scan_temporary_table().await?;
-        }
-        let generation = Database::begin_scan_generation(self).await?;
-        let temp = generate_scan_temp_table_name();
-        let base = get_scan_base_table_name(&self.job_id);
-        if let Err(error) = self.create_catalogue_snapshot(&temp, &base).await {
-            *self.generation_lifecycle.lock().await = ScanGenerationLifecycle::default();
-            return Err(error);
-        }
-        self.scan_temp_table_name = Some(temp);
-        Ok(generation)
-    }
-
-    /// 原子交换完整 observation snapshot，并返回消失 identity 的数量。
-    ///
-    /// # Errors
-    /// staging 不存在、计数、交换或旧 snapshot 清理失败时返回数据库错误。
-    pub async fn publish_observation_snapshot(&mut self) -> Result<u64> {
-        let temp = self
-            .scan_temp_table_name
-            .clone()
-            .ok_or_else(|| DatabaseError::TableNotFound("observation snapshot staging".to_string()))?;
-        let base = get_scan_base_table_name(&self.job_id);
-        let deleted = match self
-            .sync_client
-            .query(&format!(
-                "SELECT count() FROM {base} WHERE identity_key != '' AND identity_key NOT IN \
-                 (SELECT identity_key FROM {temp})"
-            ))
-            .fetch_quorum_one::<u64>()
-            .await
-        {
-            Ok(deleted) => deleted,
-            Err(error) => {
-                if let Err(abort) = self.abort_observation_snapshot().await {
-                    return Err(DatabaseError::ObservationAbortFailed {
-                        source: Box::new(error),
-                        abort: Box::new(abort),
-                    });
-                }
-                return Err(error);
-            }
-        };
-        if let Err(error) = self.exchange_catalogue_snapshot(&base, &temp).await {
-            self.generation_lifecycle.lock().await.observation_publication_ambiguous = true;
-            return Err(DatabaseError::ObservationExchangeAmbiguous {
-                source: Box::new(error),
-            });
-        }
-        if let Err(commit_error) = Database::commit_scan_generation(self).await {
-            let Some(working) = self.generation_lifecycle.lock().await.working else {
-                return Err(DatabaseError::ObservationGenerationLost {
-                    source: Box::new(commit_error),
-                });
-            };
-            match self.query_scan_state().await {
-                Ok(Some(persisted)) if persisted == working => {
-                    self.cached_scan_state.store(working, Ordering::Relaxed);
-                    self.generation_lifecycle.lock().await.committed = true;
-                    warn!("Recovered an ambiguous generation commit from persisted state: {commit_error}");
-                }
-                Ok(Some(_)) => {
-                    if let Err(rollback_error) = self.exchange_catalogue_snapshot(&base, &temp).await {
-                        self.generation_lifecycle.lock().await.observation_publication_ambiguous = true;
-                        return Err(DatabaseError::ObservationRollbackFailed {
-                            commit: Box::new(commit_error),
-                            rollback: Box::new(rollback_error),
-                        });
-                    }
-                    *self.generation_lifecycle.lock().await = ScanGenerationLifecycle::default();
-                    if let Err(error) = self.drop_scan_temporary_table().await {
-                        warn!("Rolled back observation publication but deferred staging cleanup for {temp}: {error}");
-                    }
-                    return Err(commit_error);
-                }
-                result @ (Ok(None) | Err(_)) => {
-                    self.generation_lifecycle.lock().await.observation_publication_ambiguous = true;
-                    return Err(DatabaseError::ObservationCommitAmbiguous {
-                        commit: Box::new(commit_error),
-                        verification: result.err().map(Box::new),
-                    });
-                }
-            }
-        }
-        if let Err(error) = self.drop_catalogue_table(&temp).await {
-            warn!("Committed observation snapshot but deferred retired table cleanup for {temp}: {error}");
-        } else {
-            self.scan_temp_table_name = None;
-        }
-        Ok(deleted)
-    }
-
-    /// 丢弃未完成的 observation snapshot staging。
-    ///
-    /// # Errors
-    /// `ClickHouse` 拒绝清理时返回数据库错误。
-    pub async fn abort_observation_snapshot(&mut self) -> Result<()> {
-        if self.generation_lifecycle.lock().await.observation_publication_ambiguous {
-            return Err(DatabaseError::TransactionError(
-                "refusing to delete observation rollback table while EXCHANGE outcome is ambiguous".to_string(),
-            ));
-        }
-        *self.generation_lifecycle.lock().await = ScanGenerationLifecycle::default();
-        Database::drop_scan_temporary_table(self).await
-    }
-
-    /// 按持久 identity key 读取并仅通过 opaque codec 重建 observation。
-    ///
-    /// # Errors
-    /// 查询失败、snapshot 异常或查询投影不一致时返回 typed error。
-    pub async fn load_observation(
-        &self, identity_key: &str, backend: &BackendIdentity,
-    ) -> Result<Option<ObservedEntry>> {
-        let table_name = get_scan_base_table_name(&self.job_id);
-        let query = format!(
-            "SELECT identity_key, relative_path, backend_kind, entry_kind, size, size_observed, \
-             modified_unix_nanos, current_state, entry_snapshot FROM {table_name} FINAL \
-             WHERE identity_key = ? LIMIT 1"
-        );
-        let records = self
-            .sync_client
-            .query(&query)
-            .bind(identity_key)
-            .fetch_quorum_all::<ObservedEntryRecord>()
-            .await?;
-        records
-            .into_iter()
-            .next()
-            .map(|value| value.reconstruct(backend))
-            .transpose()
     }
 
     /// 执行SQL语句，支持参数化查询
@@ -858,11 +647,6 @@ impl Database for ClickHouseDatabase {
 
     /// 删除扫描临时表并清空 `scan_temp_table_name`
     async fn drop_scan_temporary_table(&mut self) -> Result<()> {
-        if self.generation_lifecycle.lock().await.observation_publication_ambiguous {
-            return Err(DatabaseError::TransactionError(
-                "refusing to drop scan temporary table while EXCHANGE outcome is ambiguous".to_string(),
-            ));
-        }
         if let Some(temp_table_name) = &self.scan_temp_table_name {
             self.drop_catalogue_table(temp_table_name).await?;
 
@@ -926,11 +710,6 @@ impl Database for ClickHouseDatabase {
     async fn begin_scan_generation(&self) -> Result<u8> {
         self.invalidate_resume_state().await?;
         let mut lifecycle = self.generation_lifecycle.lock().await;
-        if lifecycle.observation_publication_ambiguous {
-            return Err(DatabaseError::TransactionError(
-                "cannot begin scan generation while observation EXCHANGE outcome is ambiguous".to_string(),
-            ));
-        }
         *lifecycle = ScanGenerationLifecycle::default();
         let committed = self.query_scan_state().await?.ok_or_else(|| {
             DatabaseError::TransactionError("Cannot begin scan generation before initialization".to_string())
@@ -1296,6 +1075,28 @@ mod tests {
             );
             StorageEntryRecord::capture(&entry, 0).unwrap()
         }
+    }
+
+    #[test]
+    fn persisted_snapshot_rejects_corruption_backend_and_path_mismatch() {
+        let mut corrupted = make_record("file", None, 0);
+        corrupted.entry_snapshot[0] ^= 0xff;
+        assert!(matches!(
+            corrupted.to_observation(),
+            Err(DatabaseError::SnapshotDecode(_))
+        ));
+        let mut wrong_backend = make_record("file", None, 0);
+        wrong_backend.backend_id = "another-backend".into();
+        assert!(matches!(
+            wrong_backend.to_observation(),
+            Err(DatabaseError::SnapshotDecode(_))
+        ));
+        let mut wrong_path = make_record("file", None, 0);
+        wrong_path.relative_path = "another-path".into();
+        assert!(matches!(
+            wrong_path.to_observation(),
+            Err(DatabaseError::ObservationProjectionMismatch { .. })
+        ));
     }
 
     // ═══ 1.1 StorageEntryRecord 转换测试 ═══
@@ -1675,47 +1476,6 @@ mod tests {
         assert!(temp1.starts_with("temp_"));
         assert!(temp2.starts_with("temp_"));
         assert_ne!(temp1, temp2);
-    }
-
-    #[tokio::test]
-    async fn ambiguous_exchange_blocks_begin_and_destructive_abort() -> Result<()> {
-        let config = ClickHouseConfig {
-            mode: Default::default(),
-            cluster: None,
-            dsn: "http://127.0.0.1:1".to_string(),
-            dial_timeout: 1,
-            read_timeout: 1,
-            database: "default".to_string(),
-            username: "default".to_string(),
-            password: None,
-        };
-        let mut database = ClickHouseDatabase::new(&config, "ambiguous_exchange")?;
-        let mut second_handle = ClickHouseDatabase::new(&config, "ambiguous_exchange")?;
-        database.scan_temp_table_name = Some("rollback_table".to_string());
-        database
-            .generation_lifecycle
-            .lock()
-            .await
-            .observation_publication_ambiguous = true;
-
-        assert!(matches!(
-            database.begin_observation_snapshot().await,
-            Err(DatabaseError::TransactionError(_))
-        ));
-        assert!(matches!(
-            database.abort_observation_snapshot().await,
-            Err(DatabaseError::TransactionError(_))
-        ));
-        assert_eq!(database.scan_temp_table_name.as_deref(), Some("rollback_table"));
-        assert!(matches!(
-            second_handle.begin_observation_snapshot().await,
-            Err(DatabaseError::TransactionError(_))
-        ));
-        assert!(matches!(
-            Database::drop_scan_temporary_table(&mut second_handle).await,
-            Err(DatabaseError::TransactionError(_))
-        ));
-        Ok(())
     }
 }
 

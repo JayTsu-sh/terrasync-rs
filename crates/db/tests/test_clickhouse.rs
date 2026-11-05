@@ -23,9 +23,10 @@ mod clickhouse_integration_tests {
     use db::catalogue::ClickHouseDatabase;
     use db::scan::ScanResumeState;
     use db::scan::{ScanFinalEvent, ScanStore};
-    use db::{ClickHouseConfig, Database, DatabaseError, DeletionStatus, ObservedEntryRecord};
-    use storage_adapter::ObservedEntryExt;
+    use db::{ClickHouseConfig, Database, DatabaseError, DeletionStatus};
     use storage_adapter::observed_scan::{ObservedItem, ObservedScanEvent};
+    use storage_adapter::{ChangeKind, ObservedEntryExt};
+    use tokio::sync::mpsc;
 
     // 使用原子计数器确保每个测试用例都有唯一的job_id
     static TEST_COUNTER: AtomicUsize = AtomicUsize::new(0);
@@ -712,12 +713,12 @@ mod clickhouse_integration_tests {
                 source,
             )
             .unwrap();
-            let record = ObservedEntryRecord::capture(&entry, 1);
+            let entry = Arc::new(entry);
             database
-                .batch_insert_observations(std::slice::from_ref(&record))
+                .batch_insert_base_record(std::slice::from_ref(&entry))
                 .await
                 .unwrap();
-            observations.push((entry, record));
+            observations.push(entry);
         }
         let table = format!("base_{job}");
         let rows = clickhouse_client(&config)
@@ -730,94 +731,83 @@ mod clickhouse_integration_tests {
             (1, 8192),
             "one live path/version must keep the latest observation after identity changes"
         );
-        assert_eq!(
-            database
-                .load_observation(&observations[1].1.identity_key, &backend)
-                .await
-                .unwrap(),
-            Some(observations[1].0.clone())
-        );
-        assert!(
-            database
-                .load_observation(&observations[0].1.identity_key, &backend)
-                .await
-                .unwrap()
-                .is_none()
-        );
+        let stored = catalogue_entries(&database).await;
+        assert_eq!(stored.len(), 1);
+        assert_eq!(&stored[0], observations[1].as_ref());
+        assert_ne!(stored[0].identity_key(), observations[0].identity_key());
         isolated.cleanup().await;
+    }
+
+    async fn catalogue_entries(database: &ClickHouseDatabase) -> Vec<ObservedEntry> {
+        let (sender, mut receiver) = mpsc::channel(4);
+        database.query_storage_entry(None, None, None, sender).await.unwrap();
+        let mut entries = Vec::new();
+        while let Some(entry) = receiver.recv().await {
+            entries.push(entry);
+        }
+        entries
     }
 
     #[tokio::test]
     #[ignore = "requires lab ClickHouse"]
-    async fn observation_snapshot_round_trips_through_the_single_scan_table() {
-        let (mut db, _, _, database) = setup_isolated_state_db("observation_snapshot").await;
-        db.create_scan_base_table().await.unwrap();
-        db.create_scan_state_table().await.unwrap();
-        db.insert_scan_state(0).await.unwrap();
+    async fn native_catalogue_round_trips_updated_and_empty_generations() {
+        let (mut database, _, _, isolated) = setup_isolated_state_db("native_generations").await;
+        database.initialize().await.unwrap();
         let backend = BackendIdentity::new(BackendKind::Local, "clickhouse-fixture").unwrap();
-        let source = SourceIdentity::new(backend, IdentityStrength::PathScoped, b"nested/file").unwrap();
-        let entry = ObservedEntry::new(
-            StoragePath::new("nested/file").unwrap(),
-            EntryKind::File,
-            Some(4096),
-            None,
-            source,
-        )
-        .unwrap();
-        let record = ObservedEntryRecord::capture(&entry, 1);
-        db.batch_insert_observations(std::slice::from_ref(&record))
+        let identity = SourceIdentity::new(backend, IdentityStrength::PathScoped, b"nested/file").unwrap();
+        let entry = Arc::new(
+            ObservedEntry::new(
+                StoragePath::new("nested/file").unwrap(),
+                EntryKind::File,
+                Some(4096),
+                None,
+                identity.clone(),
+            )
+            .unwrap(),
+        );
+        database.begin_scan_generation().await.unwrap();
+        database
+            .batch_insert_base_record(std::slice::from_ref(&entry))
             .await
             .unwrap();
-        let stored = db
-            .load_observation(&record.identity_key, entry.source_identity().backend())
-            .await
-            .unwrap()
-            .unwrap();
+        database.commit_scan_generation().await.unwrap();
+        assert_eq!(catalogue_entries(&database).await, vec![entry.as_ref().clone()]);
 
-        assert_eq!(stored, entry);
-
-        db.begin_observation_snapshot().await.unwrap();
-        let changed_backend = BackendIdentity::new(BackendKind::Local, "clickhouse-fixture").unwrap();
-        let changed_source =
-            SourceIdentity::new(changed_backend, IdentityStrength::PathScoped, b"nested/file").unwrap();
-        let changed = ObservedEntry::new(
-            StoragePath::new("nested/file").unwrap(),
-            EntryKind::File,
-            Some(8192),
-            None,
-            changed_source,
-        )
-        .unwrap();
-        let changed_record = ObservedEntryRecord::capture(&changed, 0);
-        db.batch_insert_temp_observations(std::slice::from_ref(&changed_record))
+        let changed = Arc::new(
+            ObservedEntry::new(
+                StoragePath::new("nested/file").unwrap(),
+                EntryKind::File,
+                Some(8192),
+                None,
+                identity,
+            )
+            .unwrap(),
+        );
+        database.begin_scan_generation().await.unwrap();
+        database.create_scan_temporary_table().await.unwrap();
+        database
+            .batch_insert_temp_record(std::slice::from_ref(&changed))
             .await
             .unwrap();
+        let changes: Vec<_> = database.detect_changed_items().await.unwrap().collect();
+        assert_eq!(changes, vec![(changed.as_ref().clone(), ChangeKind::DataOnly)]);
+        database.insert_temp_to_base_table(&[]).await.unwrap();
+        database.commit_scan_generation().await.unwrap();
+        database.drop_scan_temporary_table().await.unwrap();
+        assert_eq!(catalogue_entries(&database).await, vec![changed.as_ref().clone()]);
 
-        assert_eq!(
-            db.detect_changed_observations(entry.source_identity().backend())
-                .await
-                .unwrap(),
-            vec![changed.clone()]
-        );
-        assert_eq!(db.publish_observation_snapshot().await.unwrap(), 0);
-        assert_eq!(db.query_scan_state().await.unwrap(), Some(1));
-        assert_eq!(
-            db.load_observation(&record.identity_key, entry.source_identity().backend())
-                .await
-                .unwrap(),
-            Some(changed)
-        );
-
-        db.begin_observation_snapshot().await.unwrap();
-        assert_eq!(db.publish_observation_snapshot().await.unwrap(), 1);
-        assert_eq!(db.query_scan_state().await.unwrap(), Some(0));
-        assert_eq!(
-            db.load_observation(&record.identity_key, entry.source_identity().backend())
-                .await
-                .unwrap(),
-            None
-        );
-        database.cleanup().await;
+        database.begin_scan_generation().await.unwrap();
+        database.create_scan_temporary_table().await.unwrap();
+        let deleted: Vec<_> = database.detect_deleted_items().await.unwrap().collect();
+        assert!(matches!(&deleted[..], [DeletionStatus::Deleted(entry)] if entry == changed.as_ref()));
+        database
+            .batch_delete_base_record(&["nested/file".into()])
+            .await
+            .unwrap();
+        database.commit_scan_generation().await.unwrap();
+        database.drop_scan_temporary_table().await.unwrap();
+        assert!(catalogue_entries(&database).await.is_empty());
+        isolated.cleanup().await;
     }
 
     #[tokio::test]
