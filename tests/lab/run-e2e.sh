@@ -19,7 +19,6 @@ clickhouse_query "CREATE DATABASE IF NOT EXISTS $database_name"
 cat > "$lab_root/config.toml" <<EOF
 [database]
 enabled = true
-type = "clickhouse"
 batch_size = 800000
 
 [database.clickhouse]

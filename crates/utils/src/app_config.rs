@@ -196,7 +196,6 @@ impl fmt::Debug for ClickhouseConfig {
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct DatabaseConfig {
     pub enabled: bool,
-    pub r#type: String,
     pub batch_size: u32,
     pub clickhouse: ClickhouseConfig,
 }
@@ -502,7 +501,6 @@ concurrency = 4
 
 [database]
 enabled = false
-type = "clickhouse"
 batch_size = 100
 
 [database.clickhouse]

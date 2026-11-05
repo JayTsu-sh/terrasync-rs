@@ -3,12 +3,12 @@ use storage_adapter::TransferMode;
 // 无
 
 // 外部crate
-use db::config::DatabaseConfig;
 use serde::{Deserialize, Serialize};
 use storage_adapter::filter::{FilterExpression, parse_filter_expression};
 use storage_adapter::redact_storage_url;
 use tracing::{debug, info};
 use utils::app_config::AppConfig;
+use utils::app_config::DatabaseConfig;
 
 // 内部模块
 use crate::error::Result;
@@ -166,7 +166,7 @@ pub fn initialize_consumer_config(
     job_id: &str, job_dir: &str, job_type: JobType, raw_command_line: String, app_config: &AppConfig,
     progress_callback_url: Option<String>,
 ) -> Result<ConsumerConfig> {
-    let db_config = db::config::DatabaseConfig::from_app_config(&app_config.database);
+    let db_config = app_config.database.clone();
 
     let consumer_config = ConsumerConfig {
         job_id: job_id.to_string(),

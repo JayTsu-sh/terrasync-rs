@@ -1,8 +1,7 @@
-//! 目录集群适配经由公开工厂和通用 Database 契约验证，不借用 native scan 入口。
+//! 目录集群适配经由公开连接和通用 Database 契约验证，不借用 native scan 入口。
 #![allow(clippy::unwrap_used)]
 use super::*;
-use crate::config::DatabaseConfig;
-use crate::factory::DatabaseFactory;
+use crate::execution::base_client;
 use data_mover::model::{BackendKind, EntryKind, IdentityStrength, SourceIdentity, StoragePath};
 use std::path::PathBuf;
 use std::time::Duration;
@@ -75,13 +74,7 @@ impl Fixture {
     }
 
     async fn database(&self, job: &str) -> Result<Box<dyn Database>> {
-        let config = DatabaseConfig {
-            enabled: true,
-            db_type: "clickhouse".into(),
-            batch_size: 100_000,
-            clickhouse: Some(self.config.clone()),
-        };
-        let database = DatabaseFactory::new_database(&config, job).await?;
+        let database: Box<dyn Database> = Box::new(ClickHouseDatabase::connect(&self.config, job).await?);
         database.initialize().await?;
         Ok(database)
     }

@@ -5,7 +5,7 @@ use data_mover::model::{
     StoragePath, SymlinkTarget, SymlinkTargetEncoding,
 };
 use db::{
-    ClickHouseConfig, DatabaseConfig, DatabaseFactory, Result,
+    ClickHouseConfig, ClickHouseDatabase, Result,
     scan::ScanStore,
     scan::{RUNNING, ScanResumeState},
 };
@@ -281,13 +281,7 @@ async fn exercise(fixture: &Fixture) -> Result<()> {
         tokio::time::sleep(std::time::Duration::from_secs(3)).await;
         assert_eq!(fixture.rows("base", job).await?, ["after_restore", "old", "prefix"]);
     }
-    let config = DatabaseConfig {
-        enabled: true,
-        db_type: "clickhouse".into(),
-        batch_size: 1,
-        clickhouse: Some(fixture.config.clone()),
-    };
-    assert!(DatabaseFactory::new_database(&config, job).await.is_err());
+    assert!(ClickHouseDatabase::connect(&fixture.config, job).await.is_err());
     store.restore_scan_baseline(&state).await?;
     assert_eq!(fixture.rows("base", job).await?, ["old"]);
     assert_eq!(fixture.rows("incremental", job).await?, ["old"]);

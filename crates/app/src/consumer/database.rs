@@ -6,8 +6,8 @@ use storage_adapter::ObservedEntryExt;
 use storage_adapter::observed_scan::ObservedItem;
 
 // 外部crate
+use db::ClickHouseDatabase;
 use db::error::DatabaseError;
-use db::factory::DatabaseFactory;
 use db::traits::{Database, TarManifestRecord};
 use storage_adapter::{ObservedEntry, StorageEntryMessage};
 use tokio::sync::mpsc;
@@ -349,11 +349,15 @@ impl DatabaseConsumer {
 
         info!("[DatabaseConsumer] Initializing database for job: {}", job_id);
         debug!(
-            "[DatabaseConsumer] Database config: type={}, batch_size={}, enabled={}",
-            config.db_config.db_type, config.db_config.batch_size, config.db_config.enabled
+            "[DatabaseConsumer] Database config: batch_size={}, enabled={}",
+            config.db_config.batch_size, config.db_config.enabled
         );
 
-        let database = DatabaseFactory::new_database(&config.db_config, job_id).await?;
+        if !config.db_config.enabled {
+            return Err(DatabaseError::DatabaseDisabledError().into());
+        }
+        let database: Box<dyn Database> =
+            Box::new(ClickHouseDatabase::connect(&config.db_config.clickhouse, job_id).await?);
         if matches!(config.job_type, JobType::Scan | JobType::Copy) {
             database.initialize().await?;
         }

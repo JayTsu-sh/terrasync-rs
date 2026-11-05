@@ -19,7 +19,6 @@ pub mod common; // Common types and utilities
 pub mod config; // 数据库配置定义
 pub mod error; // 错误处理
 mod execution;
-pub mod factory; // 数据库工厂，用于创建不同类型的数据库实例
 pub mod observation_record;
 pub mod scan;
 mod schema;
@@ -40,9 +39,8 @@ pub const TAR_MANIFEST_TABLE_BASE_NAME: &str = "tar_manifest";
 // 类型重导出，方便外部使用
 pub use catalogue::ClickHouseDatabase; // ClickHouse数据库具体实现
 pub use common::DeletionStatus; // Common deletion status enum
-pub use config::{ClickHouseConfig, DatabaseConfig, DatabaseType}; // 配置相关类型
+pub use config::ClickHouseConfig; // 配置相关类型
 pub use error::{DatabaseError, Result}; // 错误处理相关类型
-pub use factory::DatabaseFactory; // 数据库工厂类型
 pub use observation_record::{OBSERVATION_IDENTITY_JOIN_CLAUSE, ObservedEntryRecord};
 pub use traits::{CopyGenerationStatus, Database}; // 数据库接口类型
 
@@ -51,16 +49,14 @@ pub use traits::{CopyGenerationStatus, Database}; // 数据库接口类型
 /// 用户可以通过 `use db::prelude::*` 来导入最常用的类型，
 /// 简化应用开发过程中的导入语句
 pub mod prelude {
+    /// 配置相关类型
+    pub use super::ClickHouseConfig;
     /// 数据库具体实现
     pub use super::ClickHouseDatabase;
     /// 数据库接口类型
     pub use super::Database;
-    /// 数据库工厂类型
-    pub use super::DatabaseFactory;
     /// Common deletion status enum
     pub use super::DeletionStatus;
-    /// 配置相关类型
-    pub use super::{ClickHouseConfig, DatabaseConfig, DatabaseType};
     /// 错误处理相关类型
     pub use super::{DatabaseError, Result};
     pub use super::{OBSERVATION_IDENTITY_JOIN_CLAUSE, ObservedEntryRecord};

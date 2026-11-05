@@ -31,7 +31,7 @@ impl Drop for AtomicCounterGuard<'_> {
 }
 
 // 外部 crate
-use db::factory::DatabaseFactory;
+use db::ClickHouseDatabase;
 use db::traits::Database;
 use db::{self, DeletionStatus, INCREMENTAL_SCAN_TABLE_BASE_NAME};
 use storage_adapter::qos::QosManager;
@@ -262,13 +262,11 @@ impl SyncOrchestrator {
         }
 
         let app_config = AppConfig::fetch()?;
-        let db_config = db::config::DatabaseConfig::from_app_config(&app_config.database);
         // database.enabled=true 时必须成功构造；false 时忽略错误（未启用），走文件系统兜底
         let db_instance = if app_config.database.enabled {
             Some(
-                DatabaseFactory::new_database(&db_config, &c.job_id)
-                    .await
-                    .map_err(AppError::DatabaseError)?,
+                Box::new(ClickHouseDatabase::connect(&app_config.database.clickhouse, &c.job_id).await?)
+                    as Box<dyn Database>,
             )
         } else {
             None
@@ -357,7 +355,8 @@ impl SyncOrchestrator {
         )?);
 
         let database = if consumer_config.db_config.enabled {
-            let database = DatabaseFactory::new_database(&consumer_config.db_config, &c.job_id).await?;
+            let database: Box<dyn Database> =
+                Box::new(ClickHouseDatabase::connect(&consumer_config.db_config.clickhouse, &c.job_id).await?);
             database.initialize().await?;
             begin_copy_catalogue(database.as_ref(), c, block_size, is_source_reserved).await?;
             Some(database)
@@ -735,9 +734,8 @@ impl SyncOrchestrator {
             c.progress_callback_url.clone(),
         )?);
 
-        let database = DatabaseFactory::new_database(&consumer_config.db_config, &c.job_id)
-            .await
-            .map_err(AppError::DatabaseError)?;
+        let database: Box<dyn Database> =
+            Box::new(ClickHouseDatabase::connect(&consumer_config.db_config.clickhouse, &c.job_id).await?);
 
         if let Err(e) = database.create_table(INCREMENTAL_SCAN_TABLE_BASE_NAME).await {
             return Err(AppError::DatabaseError(e));

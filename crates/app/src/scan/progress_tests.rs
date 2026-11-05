@@ -10,7 +10,8 @@ use data_mover::{
     model::StoragePath,
     traversal::{Checkpoint, EntryKindCounts},
 };
-use db::DatabaseConfig;
+use db::ClickHouseConfig;
+use utils::app_config::DatabaseConfig;
 
 async fn manager() -> Result<ConsumerManager> {
     let config = ConsumerConfig {
@@ -19,9 +20,17 @@ async fn manager() -> Result<ConsumerManager> {
         job_type: JobType::Scan,
         db_config: DatabaseConfig {
             enabled: false,
-            db_type: "clickhouse".into(),
             batch_size: 256,
-            clickhouse: None,
+            clickhouse: ClickHouseConfig {
+                mode: Default::default(),
+                cluster: None,
+                dsn: "http://127.0.0.1:8123".into(),
+                dial_timeout: 1,
+                read_timeout: 1,
+                database: "default".into(),
+                username: "default".into(),
+                password: None,
+            },
         },
         console_config: ConsoleConfig {
             raw_command_line: String::new(),

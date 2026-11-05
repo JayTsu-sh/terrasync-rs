@@ -66,7 +66,6 @@ write_base_config() {
   cat > "$output" <<EOF
 [database]
 enabled = true
-type = "clickhouse"
 batch_size = 800000
 
 [database.clickhouse]

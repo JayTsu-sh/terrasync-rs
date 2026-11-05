@@ -27,7 +27,6 @@ use crate::common::{
 };
 use crate::config::ClickHouseConfig;
 use crate::error::{DatabaseError, Result};
-use crate::execution::base_client;
 use crate::execution::{
     queries::{ScanExecute, check_scan_cancellation, execute_request, idempotent_insert_client},
     recovery::RequestSafety,
@@ -48,6 +47,7 @@ use utils::sanitize_job_id;
 
 #[cfg(test)]
 mod catalogue_tests;
+mod connection;
 mod copy_generation;
 mod layout;
 use crate::execution::read::QuorumRead;
@@ -366,41 +366,6 @@ impl ClickHouseDatabase {
         } else {
             RequestSafety::UnconfirmedWrite
         }
-    }
-
-    /// 创建新的`ClickHouse`数据库实例
-    ///
-    /// # Errors
-    /// 部署模式、集群名称或集群数据库标识符无效时返回配置错误；此时尚未发起网络请求。
-    pub fn new(config: &ClickHouseConfig, job_id: &str) -> Result<Self> {
-        Self::with_client(config, job_id, base_client(config)?)
-    }
-
-    pub(crate) fn with_client(config: &ClickHouseConfig, job_id: &str, client: Client) -> Result<Self> {
-        let catalogue_cluster = ClusterCatalogue::from_config(config, job_id)?;
-        let (sync_client, async_client) = if let Some(cluster) = &catalogue_cluster {
-            let client = cluster.client(client);
-            (client.clone(), client)
-        } else {
-            (
-                client.clone(),
-                client
-                    .with_option("async_insert", "1")
-                    .with_option("wait_for_async_insert", "1"),
-            )
-        };
-
-        Ok(Self {
-            catalogue_cluster,
-            sync_client,
-            async_client,
-            job_id: job_id.to_string(),
-            scan_temp_table_name: None,
-            cached_scan_state: AtomicU8::new(255),
-            resume_base_has_typed_handles: None,
-            native_dedup_ready: AtomicBool::new(false),
-            generation_lifecycle: shared_generation_lifecycle(config, job_id),
-        })
     }
 
     /// 将 data-mover observation    /// 将 data-mover observation projection 写入当前 job 的同一张 base 大表。
@@ -865,7 +830,7 @@ impl ClickHouseDatabase {
         let temp_table_name = self
             .scan_temp_table_name
             .as_ref()
-            .ok_or_else(|| DatabaseError::UnsupportedType("Temporary table not created".to_string()))?;
+            .ok_or_else(|| DatabaseError::TableNotFound("Temporary table not created".to_string()))?;
         let base_table_name = get_scan_base_table_name(&self.job_id);
 
         let (temp_non_null, base_non_null) = self.check_file_handle_status(temp_table_name, &base_table_name).await?;
@@ -1032,7 +997,7 @@ impl Database for ClickHouseDatabase {
             SCAN_STATE_TABLE_BASE_NAME => self.create_scan_state_table().await,
             INCREMENTAL_SCAN_TABLE_BASE_NAME => self.create_incremental_scan_table().await,
             TAR_MANIFEST_TABLE_BASE_NAME => self.create_tar_manifest_table_impl().await,
-            _ => Err(DatabaseError::UnsupportedType(format!("Unknown table: {table_name}"))),
+            _ => Err(DatabaseError::TableNotFound(format!("Unknown table: {table_name}"))),
         }
     }
 
@@ -1130,7 +1095,7 @@ impl Database for ClickHouseDatabase {
         let temp_table_name = self
             .scan_temp_table_name
             .as_deref()
-            .ok_or_else(|| DatabaseError::UnsupportedType("No temporary table available".to_string()))?;
+            .ok_or_else(|| DatabaseError::TableNotFound("No temporary table available".to_string()))?;
 
         // 使用 async client，wait_for_async_insert=1 保证 end() 返回时数据已 flush
         self.batch_insert(temp_table_name, records, true).await
@@ -1211,7 +1176,7 @@ impl Database for ClickHouseDatabase {
         let temp_table_name = self
             .scan_temp_table_name
             .as_deref()
-            .ok_or_else(|| DatabaseError::UnsupportedType("No temporary table available".to_string()))?;
+            .ok_or_else(|| DatabaseError::TableNotFound("No temporary table available".to_string()))?;
 
         let temp_table_name = self.catalogue_query_table(temp_table_name)?;
         let base_table_name = self.catalogue_query_table(&get_scan_base_table_name(&self.job_id))?;

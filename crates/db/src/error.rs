@@ -132,11 +132,6 @@ pub enum DatabaseError {
     #[error("Database disabled error")]
     DatabaseDisabledError(),
 
-    /// 不支持的数据库类型
-    /// 当尝试使用未实现的数据库类型时触发
-    #[error("Unsupported database type: {0}")]
-    UnsupportedType(String),
-
     /// 表不存在错误
     /// 当尝试访问不存在的表时触发
     #[error("Table not found: {0}")]

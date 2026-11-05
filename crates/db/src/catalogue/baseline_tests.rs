@@ -1,6 +1,7 @@
 //! 首次基线由代次提交发布，不能从建表推断扫描完成。
 #![allow(clippy::unwrap_used)]
 use super::*;
+use crate::execution::base_client;
 use clickhouse::test::{Mock, handlers};
 use std::time::{SystemTime, UNIX_EPOCH};
 

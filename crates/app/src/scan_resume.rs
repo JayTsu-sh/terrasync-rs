@@ -1,6 +1,5 @@
 //! 检查点扫描：先确认结果与事件持久化，再将 opaque 游标写入 ClickHouse。
 use crate::job_execution::JobLease;
-use db::DatabaseConfig;
 use std::{
     mem::take,
     num::NonZeroUsize,
@@ -49,7 +48,7 @@ pub(crate) async fn run_persisted(request: ScanRequest<'_>, config: AppConfig) -
         ..
     } = request;
     info!(concurrency = config.scan.concurrency, "Using scan task concurrency");
-    if !config.database.enabled || config.database.r#type != "clickhouse" {
+    if !config.database.enabled {
         return Err(AppError::ConfigError(
             "Persisted scanning requires enabled ClickHouse storage".into(),
         ));
@@ -83,14 +82,7 @@ pub(crate) async fn run_persisted(request: ScanRequest<'_>, config: AppConfig) -
         options.include_tags,
         resume,
     )?;
-    let database_config = DatabaseConfig::from_app_config(&config.database);
-    let mut database = ScanStore::new(
-        database_config
-            .clickhouse
-            .as_ref()
-            .ok_or_else(|| AppError::ConfigError("ClickHouse configuration missing".into()))?,
-        job_id,
-    )?;
+    let mut database = ScanStore::new(&config.database.clickhouse, job_id)?;
     let queries = database.query_cancellation();
     let cancellation = ScanCancellation::new(cancel.clone());
     cancellation::scope(queries, cancellation.clone(), async {
@@ -490,13 +482,6 @@ pub async fn clear_scan(job_id: &str) -> Result<()> {
 /// 根据持久化轮次识别执行类型，不能用作业目录是否存在来区分全量续扫和增量。
 pub async fn scan_execution_is_incremental(job_id: &str) -> Result<bool> {
     let config = AppConfig::fetch()?;
-    let database = DatabaseConfig::from_app_config(&config.database);
-    let store = ScanStore::new(
-        database
-            .clickhouse
-            .as_ref()
-            .ok_or_else(|| AppError::ConfigError("ClickHouse configuration missing".into()))?,
-        job_id,
-    )?;
+    let store = ScanStore::new(&config.database.clickhouse, job_id)?;
     Ok(store.resume_execution_is_incremental().await?)
 }
