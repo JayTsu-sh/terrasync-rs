@@ -30,13 +30,13 @@ AI 工作流程以根目录 [AGENTS.md](../AGENTS.md) 为准，产品约束以 [
 
 ```rust
 // ❌ 禁止
-let entry = data_mover::NASEntry::new();
+let map = std::collections::HashMap::<String, usize>::new();
 fn foo() -> crate::error::Result<()> { ... }
 
 // ✅ 正确
-use data_mover::NASEntry;
+use std::collections::HashMap;
 use crate::error::Result;
-let entry = NASEntry::new();
+let map = HashMap::<String, usize>::new();
 ```
 
 例外：`std::io::Error`、`std::fmt::Display` 等广为人知的标准库路径，不影响可读性时可酌情保留。
