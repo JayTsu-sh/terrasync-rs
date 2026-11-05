@@ -1,9 +1,10 @@
 #![cfg(unix)]
 //! 通过旧目标的硬链接观察实际写入语义，防止显式模式被静默替换。
+use task_model::TransferMode;
 #[path = "../../../tests/support/observed.rs"]
 mod observed_fixtures;
 use std::{error::Error, os::unix::fs::MetadataExt, path::Path, sync::Arc};
-use storage_adapter::{CopyOptions, CreateStorageOptions, StorageEnum, TransferMode, create_storage};
+use storage_adapter::{CopyOptions, CreateStorageOptions, StorageEnum, create_storage};
 
 #[tokio::test]
 async fn direct_updates_existing_inode_while_atomic_and_checkpoint_replace_it() -> Result<(), Box<dyn Error>> {

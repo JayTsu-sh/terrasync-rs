@@ -1,17 +1,15 @@
 //! TerraSync 的存储边界：产品数据投影及旧会话与 data-mover 角色接口之间的转换。
 //! 所有后端 IO、复制、恢复与原子发布由 data-mover 执行。
-use task_model::{ErrorEvent, ObservedEntryExt, StorageEntryMessage};
+use task_model::{ErrorEvent, ObservedEntryExt, StorageEntryMessage, TransferMode};
 mod archive;
 mod connected;
 mod copied_metadata;
 mod entry;
-pub mod observation_wire;
 pub use data_mover::model::ObservedEntry;
 pub mod hdfs;
 mod options;
 pub use hdfs::HdfsRecoverableCopyOptions;
 pub mod async_receiver;
-pub mod dir_tree;
 pub mod error;
 mod integrity_check;
 mod projection;
@@ -27,10 +25,11 @@ pub use entry::*;
 pub use error::{Result, StorageError};
 pub use integrity_check::*;
 pub use options::*;
-pub use scanning::{DeleteDirIterator, DeleteEvent, ResumableScan, ResumableScanItem, ScanSourceMode};
+pub use scanning::{
+    DeleteDirIterator, DeleteEvent, DirectoryInventory, ResumableScan, ResumableScanItem, ScanSourceMode,
+};
 pub use streaming::*;
 pub type WalkDirAsyncIterator = AsyncReceiver<StorageEntryMessage>;
-pub type WalkDirAsyncIterator2 = AsyncReceiver<dir_tree::NdxEvent>;
 pub mod storage_enum {
     pub use crate::{StorageEnum, StorageType, detect_storage_type};
 }

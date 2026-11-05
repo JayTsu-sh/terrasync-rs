@@ -1,17 +1,19 @@
 //! 由 lab runner 启动真实 Receiver；本测试通过真实 QUIC 在指定阶段主动关闭连接。
 #![allow(clippy::unwrap_used)]
 use std::{env, error::Error, path::Path, sync::Arc, time::Duration};
+use task_model::TransferMode;
+use transport::chunk::DataChunk;
 
 use bytes::Bytes;
 use rustls::crypto::ring::default_provider;
 use rustls::pki_types::CertificateDer;
-use storage_adapter::dir_tree::{DirPageResult, NdxEntry};
-use storage_adapter::{CreateStorageOptions, DataChunk, TransferMode, create_storage};
+use storage_adapter::{CreateStorageOptions, create_storage};
 use tokio::{
     fs,
     io::AsyncReadExt,
     time::{sleep, timeout},
 };
+use transport::directory::{DirPageResult, NdxEntry};
 use transport::{
     message::{HandshakeResult, ProtocolHandshake, ReceiverMsg, SenderMsg, SessionConfig},
     quic,

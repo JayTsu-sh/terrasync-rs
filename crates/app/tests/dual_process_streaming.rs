@@ -1,4 +1,5 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
+use transport::chunk::DataChunk;
 // 用 in-process transport 断言 Sender 流式发送序列 + 源 hash 正确。
 #[path = "../../../tests/support/observed.rs"]
 mod observed_fixtures;
@@ -6,12 +7,12 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
-use storage_adapter::TransferMode;
+use task_model::TransferMode;
 
 use app::disk_commit::disk_commit_task;
 use app::receiver::ReceiverProgress;
 use bytes::Bytes;
-use storage_adapter::{DataChunk, ObservedEntry, StorageEnum, create_storage};
+use storage_adapter::{ObservedEntry, StorageEnum, create_storage};
 use tokio_util::sync::CancellationToken;
 use transport::message::{DcAck, DiskCommitMsg, FileOutcome, ReceiverMsg, SessionConfig};
 

@@ -7,15 +7,16 @@
 use crate::file_copy::copied_tags_required;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-#[cfg(test)]
-use storage_adapter::TransferMode;
 use task_model::ObservedEntryExt;
+#[cfg(test)]
+use task_model::TransferMode;
 use task_model::observation::ObservedItem;
 
-use storage_adapter::dir_tree::DirPageResult;
-use storage_adapter::{DataChunk, ObservedEntry, StorageEnum};
+use storage_adapter::{ObservedEntry, StorageEnum};
 use tokio::sync::mpsc::{Receiver, Sender};
 use tracing::{debug, info, warn};
+use transport::chunk::DataChunk;
+use transport::directory::DirPageResult;
 use transport::flow_control::{ReceiverCreditState, payload_credit_cost};
 use transport::message::{
     BlockSignature, DcAck, DestIndex, DiskCommitMsg, FeatureFlags, FileOutcome, NdxTable, ProgressSnapshot,
@@ -704,12 +705,14 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Duration;
 
+    use crate::remote_inventory::NdxEvent;
     use async_trait::async_trait;
     use bytes::Bytes;
-    use storage_adapter::DataChunk;
-    use storage_adapter::dir_tree::{DirPageResult, NdxEntry, NdxEvent};
+    use transport::directory::{DirPageResult, NdxEntry};
 
+    use crate::remote_inventory::directory_pages;
     use crate::storage_factory::{StorageRole, create_storage_for_role};
+    use storage_adapter::WalkOptions;
     use tempfile::tempdir;
     use tokio::sync::{Mutex as TokioMutex, mpsc};
     use transport::error::Result as TransportResult;
@@ -960,8 +963,15 @@ mod tests {
         let src_storage = create_storage(src_dir.path().to_str().unwrap(), None, false)
             .await
             .unwrap();
-        let walk = src_storage.walkdir_2(None, None, None, None, 4, false).await.unwrap();
-        let page = match walk.next().await {
+        let walk = directory_pages(
+            &src_storage,
+            WalkOptions {
+                concurrency: 4,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let page = match walk.recv().await.ok() {
             Some(NdxEvent::Page(page)) => page,
             other => panic!("expected one file page, got {other:?}"),
         };
@@ -1117,8 +1127,15 @@ mod tests {
         let src_storage = create_storage(src_dir.path().to_str().unwrap(), None, false)
             .await
             .unwrap();
-        let walk = src_storage.walkdir_2(None, None, None, None, 4, false).await.unwrap();
-        let page = match walk.next().await {
+        let walk = directory_pages(
+            &src_storage,
+            WalkOptions {
+                concurrency: 4,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let page = match walk.recv().await.ok() {
             Some(NdxEvent::Page(page)) => page,
             other => panic!("expected mixed file page, got {other:?}"),
         };
@@ -1201,8 +1218,15 @@ mod tests {
         let src_storage = create_storage(src_dir.path().to_str().unwrap(), None, false)
             .await
             .unwrap();
-        let walk = src_storage.walkdir_2(None, None, None, None, 4, false).await.unwrap();
-        let page = match walk.next().await {
+        let walk = directory_pages(
+            &src_storage,
+            WalkOptions {
+                concurrency: 4,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let page = match walk.recv().await.ok() {
             Some(NdxEvent::Page(page)) => page,
             other => panic!("expected changed file page, got {other:?}"),
         };

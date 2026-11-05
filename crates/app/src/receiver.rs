@@ -10,8 +10,8 @@ use data_mover::model::FailureClass;
 use std::path::{Component, Path};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use storage_adapter::TransferMode;
 use task_model::ObservedEntryExt;
+use task_model::TransferMode;
 use {storage_adapter::StorageError, task_model::StorageEntryMessage};
 
 // 外部 crate
@@ -862,12 +862,12 @@ pub(crate) async fn recv_file_list_and_data_phase(
 mod tests {
     use super::*;
     use crate::storage_factory::{StorageRole, create_storage_for_role};
-    use storage_adapter::dir_tree::DirPageResult;
     use tokio::{
         fs,
         sync::mpsc,
         time::{Duration, timeout},
     };
+    use transport::directory::DirPageResult;
     use transport::{in_process::create_in_process_pair, traits::SenderTransport};
 
     #[tokio::test]

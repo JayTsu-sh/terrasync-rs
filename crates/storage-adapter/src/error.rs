@@ -20,6 +20,8 @@ use data_mover::{
 };
 #[derive(Debug, thiserror::Error)]
 pub enum StorageError {
+    #[error("incomplete object history")]
+    IncompleteHistory,
     #[error(transparent)]
     TaskModel(#[from] TaskModelError),
     #[error(transparent)]

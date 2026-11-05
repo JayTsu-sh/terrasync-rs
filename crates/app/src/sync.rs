@@ -14,9 +14,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use task_model::ObservedEntryExt;
 use task_model::observation::ObservedItem;
+use task_model::{EntryChange, TransferMode};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
-use {storage_adapter::TransferMode, task_model::EntryChange};
 
 // 外部crate
 use storage_adapter::qos::QosManager;

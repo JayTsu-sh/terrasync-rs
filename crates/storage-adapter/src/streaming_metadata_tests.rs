@@ -138,7 +138,7 @@ async fn destination(fail: bool) -> (TempDir, StorageEnum, Arc<MetadataProbe>) {
 async fn stream(destination: &StorageEnum, entry: &ObservedEntry) -> Result<()> {
     let handle = StorageEnum::prepare_stream(destination, entry).await?;
     let (tx, rx) = mpsc::channel(2);
-    tx.send(DataChunk {
+    tx.send(PositionedChunk {
         offset: 0,
         data: Bytes::from_static(b"new"),
     })
@@ -322,7 +322,7 @@ async fn checkpoint_stream_reuses_partial_prefix_and_verifies_full_payload() {
             .unwrap();
     let (tx, rx) = mpsc::channel(2);
     let prefix = 1024 * 1024 + 3;
-    tx.send(DataChunk {
+    tx.send(PositionedChunk {
         offset: 0,
         data: Bytes::from(vec![b'A'; prefix]),
     })
@@ -364,7 +364,7 @@ async fn checkpoint_stream_reuses_partial_prefix_and_verifies_full_payload() {
     while offset < size {
         let data = chunk.slice(..((size - offset).min(chunk.len() as u64) as usize));
         expected.update(&data);
-        tx.send(DataChunk {
+        tx.send(PositionedChunk {
             offset,
             data: data.clone(),
         })
@@ -439,7 +439,7 @@ async fn a_selected_history_version_drives_stream_size_metadata_and_tags() {
     .await
     .unwrap();
     let (tx, rx) = mpsc::channel(1);
-    tx.send(StreamChunk::from(DataChunk {
+    tx.send(StreamChunk::from(PositionedChunk {
         offset: 0,
         data: Bytes::from_static(b"old"),
     }))

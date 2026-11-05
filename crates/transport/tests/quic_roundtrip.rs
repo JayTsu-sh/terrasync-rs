@@ -13,11 +13,12 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
-use storage_adapter::TransferMode;
 use task_model::ObservedEntryExt;
+use task_model::TransferMode;
+use transport::chunk::DataChunk;
 
 use bytes::Bytes;
-use storage_adapter::{DataChunk, ObservedEntry};
+use data_mover::model::ObservedEntry;
 use tokio::sync::oneshot;
 use transport::message::{
     AdvertisedObservation, AdvertisementEvent, AdvertisementTerminal, FeatureFlags, HandshakeResult, HashAlgorithm,
@@ -1102,8 +1103,8 @@ fn selected_observation_wire_keeps_one_version_and_shares_the_original_history()
         BackendIdentity, BackendKind, EntryKind, HistoryOrder, IdentityStrength, ObjectHistory, RecordKind,
         SourceIdentity, StoragePath, VersionRecord,
     };
-    use storage_adapter::dir_tree::NdxEntry;
     use task_model::observation::ObservedItem;
+    use transport::directory::NdxEntry;
 
     let backend = BackendIdentity::new(BackendKind::S3, "wire-selection").unwrap();
     let versions = (0..1000)

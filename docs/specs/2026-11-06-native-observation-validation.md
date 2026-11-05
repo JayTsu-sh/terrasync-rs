@@ -107,6 +107,24 @@ SQL 行 DTO 已收回私有 schema／records；traits 只描述任务操作，�
 
 此阶段两项架构复审通过。fmt、workspace Clippy／测试与串行双进程 E2E 16 例通过；app 201、db 110、task-model 2 个本地测试通过，忽略项另计。真实 catalogue Single 10／10、Cluster 11／11、Single 集成 44／44，以及 Single／Cluster 切点各 3 例通过，独立数据库清理均成功。Rust 日志前缀 `/tmp/terrasync-task-model-`，真实报告前缀 `/tmp/terrasync-db-refactor-real-task-model-v1-`。依赖清单记录 `/tmp/terrasync-task-model-normal-dependencies.txt`。
 
+## 传输契约与远端目录清单
+
+TransferMode 移入纯任务模型，引擎策略映射保留在存储消费者。opaque wire 编码、NDX 目录页和 DataChunk 归 transport；transport 已解除 storage-adapter 依赖。底层流读写使用原生 PositionedChunk，应用将 wire 的 Bytes 移入原生块，不复制 payload。
+
+目录排序、会话编号和容量 2 的目录页队列移到 app／remote_inventory。底层 DirectoryInventory 只交付原生事件，在编号前复用历史顺序和 Required tags 准入。错误文本、稳定排序、NDX 分配、结束判定和 ACK 流保持原样。无状态复制边界不再携带旧 AsyncReceiver 中未绑定的状态。
+
+两项架构复审通过；完整 Rust 检查、workspace 测试和串行双进程 16 例通过。app 201、db 110、task-model 2、transport 33 个本地测试通过，另有 QUIC roundtrip 14、双进程流 21、Local roles 12、Direct patch 4 例通过；忽略项另计。日志前缀 `/tmp/terrasync-transport-extract-`，无 adapter 的传输依赖清单为 `/tmp/terrasync-transport-normal-dependencies.txt`。
+
+对应 release SHA-256 为 `807904d0cab31d31aec687c4af139b69daf29a9956d6260b625c67f4f9d57d1b`，精确源码摘要在 `/tmp/terrasync-transport-extract-build-source.json`。以下报告均使用该候选，独立数据库、对象、HDFS 路径和认证配置清理成功：
+
+- marker／tags 17 例：`/work/terrasync-db-refactor-evidence/release-db-refactor-transport-marker-tags-20261105-205556/report.json`。
+- 有序历史 14 例：`/work/terrasync-db-refactor-evidence/release-db-refactor-transport-ordered-20261105-205703/report.json`。
+- 零字节源替换 2 例：`/work/terrasync-db-refactor-evidence/release-db-refactor-transport-zero-source-20261105-205816/report.json`。
+- metadata-only 3 例：`/work/terrasync-db-refactor-evidence/release-db-refactor-transport-metadata-only-v2-20261105-205955/report.json`，包含目标 tags PUT 被拒绝后没有成功 ACK；替换／清空 tags 均没有数据 PUT 或新增目标版本。
+- 真实 Kerberos HDFS + ClickHouse Single／Cluster 各 11 例：`/work/terrasync-db-refactor-evidence/release-db-refactor-transport-hdfs-single-20261105-205702/report.json` 与 `/work/terrasync-db-refactor-evidence/release-db-refactor-transport-hdfs-cluster-20261105-205708/report.json`。unordered／blocks 未变化第二轮均为 0→0；复制、QUIC、完整性、0640／01775 及未知数值主体正确。
+
+metadata-only 首次夹具创建失败，没有执行业务用例，不作为产品回归或通过证据。重跑根据真实 LIST 修改时间的差值调整两侧 PUT 的创建时序，8 次后获得完全相同的实际时间；没有修改服务时钟、伪造响应或降低断言。
+
 ## 合入前仍须完成
 
-还需完成数据库内部职责拆分、收窄行 DTO 与任务接口、任务契约和 transport 的归属整理，以及按设计删除 storage-adapter。最终候选必须重跑对应 CI、真实 HDFS 和受影响故障链路，并完成全量／增量／续扫性能与峰值 RSS 对照。先前 HDFS 通过的二进制不能作为最终候选证据。
+还需完成数据库目录会话与任务接口的整理，以及按设计删除 storage-adapter。任务契约与 transport 已分离，剩余存储机制和产品配置仍须分别归位。最终候选必须重跑对应 CI、真实 HDFS 和受影响故障链路，并完成全量／增量／续扫性能与峰值 RSS 对照。先前 HDFS 通过的二进制不能作为最终候选证据。

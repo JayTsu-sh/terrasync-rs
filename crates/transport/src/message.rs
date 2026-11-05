@@ -1,3 +1,4 @@
+use crate::chunk::DataChunk;
 // 标准库
 use data_mover::model::EntryKind;
 use std::borrow::{Borrow, Cow};
@@ -5,16 +6,16 @@ use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 use std::sync::Arc;
-use storage_adapter::TransferMode;
 use task_model::ObservedEntryExt;
+use task_model::TransferMode;
 use task_model::observation::{ObservedItem, ObservedView};
 
 // 外部 crate
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 // 内部模块
-use storage_adapter::dir_tree::DirPageResult;
-use storage_adapter::{DataChunk, ObservedEntry};
+use crate::directory::DirPageResult;
+use data_mover::model::ObservedEntry;
 
 /// 会话内临时分配的观察索引。它只用于一次 negotiated session 的关联，不能持久化。
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
@@ -216,7 +217,7 @@ pub enum SenderMsg {
     /// 会话配置（QoS、ACL、完整性校验等参数）
     SessionConfig(SessionConfig),
 
-    // ── File List（双进程模式，复用 walkdir_2 的 DirPageResult） ──
+    // ── File List（双进程模式，复用 directory_pages 的 DirPageResult） ──
     /// 一页目录内容
     FilePage(DirPageResult),
     /// 目录遍历中的错误
@@ -228,19 +229,19 @@ pub enum SenderMsg {
     /// 复制一个 entry（目录/符号链接/文件，Receiver 根据 entry 类型 dispatch）
     /// Receiver 调用 `process_entry(entry, src_storage, dest_storage, ...)` 完成完整复制
     CopyEntry {
-        #[serde(with = "storage_adapter::observation_wire::shared")]
+        #[serde(with = "crate::observation_wire::shared")]
         entry: Arc<ObservedEntry>,
     },
 
     // ── 双进程模式：数据流模式（Receiver 只有 dest storage，Sender 流式发送数据） ──
     /// 创建目录（Receiver 调用 `create_dir_all` + `set_metadata` + ACL）
     CreateDir {
-        #[serde(with = "storage_adapter::observation_wire::shared")]
+        #[serde(with = "crate::observation_wire::shared")]
         entry: Arc<ObservedEntry>,
     },
     /// 创建符号链接（Sender 已读取 target，Receiver 调用 `create_symlink`）
     CreateSymlink {
-        #[serde(with = "storage_adapter::observation_wire::shared")]
+        #[serde(with = "crate::observation_wire::shared")]
         entry: Arc<ObservedEntry>,
         target: PathBuf,
     },
@@ -262,16 +263,16 @@ pub enum SenderMsg {
     // ── Packaged（tar 打包模式） ──
     /// 打包目录为 tar（Sender 完成打包后发送结果）
     TarPacked {
-        #[serde(with = "storage_adapter::observation_wire::shared")]
+        #[serde(with = "crate::observation_wire::shared")]
         tar_entry: Arc<ObservedEntry>,
-        #[serde(with = "storage_adapter::observation_wire::batch")]
+        #[serde(with = "crate::observation_wire::batch")]
         manifest_entries: Vec<Arc<ObservedEntry>>,
     },
 
     // ── ACL 跨进程传输 ──
     /// 设置 ACL（Sender 读取后发送二进制数据，Receiver 设置）
     SetAcl {
-        #[serde(with = "storage_adapter::observation_wire::shared")]
+        #[serde(with = "crate::observation_wire::shared")]
         entry: Arc<ObservedEntry>,
         acl_data: Bytes,
     },
@@ -334,7 +335,7 @@ pub enum ReceiverMsg {
     //    NdxTable 里，没有对应 ndx。
     /// 分类判定通知（不产生传输请求的三类：`MetadataOnly`/`Skip`/`Deleted`）
     Classified {
-        #[serde(with = "storage_adapter::observation_wire::shared")]
+        #[serde(with = "crate::observation_wire::shared")]
         entry: Arc<ObservedEntry>,
         decision: TransferDecision,
     },
@@ -342,20 +343,20 @@ pub enum ReceiverMsg {
     // ── Entry 级别 ack（单进程 + 双进程通用） ──
     /// Entry 写入成功（Receiver 完成写入 + `set_metadata` + ACL 后发送）
     EntrySuccess {
-        #[serde(with = "storage_adapter::observation_wire::shared")]
+        #[serde(with = "crate::observation_wire::shared")]
         entry: Arc<ObservedEntry>,
     },
     /// Entry 写入失败
     EntryError {
-        #[serde(with = "storage_adapter::observation_wire::shared")]
+        #[serde(with = "crate::observation_wire::shared")]
         entry: Arc<ObservedEntry>,
         reason: String,
     },
     /// tar 包写入成功
     TarSuccess {
-        #[serde(with = "storage_adapter::observation_wire::shared")]
+        #[serde(with = "crate::observation_wire::shared")]
         tar_entry: Arc<ObservedEntry>,
-        #[serde(with = "storage_adapter::observation_wire::batch")]
+        #[serde(with = "crate::observation_wire::batch")]
         manifest_entries: Vec<Arc<ObservedEntry>>,
     },
 

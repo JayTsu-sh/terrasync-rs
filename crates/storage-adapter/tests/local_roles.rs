@@ -1,17 +1,18 @@
+use data_mover::storage::PositionedChunk;
 #[path = "../../../tests/support/observed.rs"]
 mod observed_fixtures;
 use bytes::Bytes;
 use data_mover::traversal::TraversalOutcome;
 use std::{collections::BTreeSet, path::Path, sync::Arc, time::Duration};
 use storage_adapter::filter::parse_filter_expression;
-use task_model::ObservedEntryExt;
+use task_model::{ObservedEntryExt, TransferMode};
 use tempfile::TempDir;
 use tokio::fs::{create_dir_all, write};
 use tokio_util::sync::CancellationToken;
 use {
     storage_adapter::{
-        CopyOptions, CreateStorageOptions, DataChunk, ResumableScanItem, ScanSourceMode, StorageEnum, TarPackOptions,
-        WalkOptions, create_storage,
+        CopyOptions, CreateStorageOptions, ResumableScanItem, ScanSourceMode, StorageEnum, TarPackOptions, WalkOptions,
+        create_storage,
     },
     task_model::StorageEntryMessage,
 };
@@ -199,7 +200,7 @@ async fn streamed_destination_is_published_only_after_complete() -> TestResult {
         .await
     });
     for (index, chunk) in payload.chunks(64 * 1024).enumerate() {
-        tx.send(DataChunk {
+        tx.send(PositionedChunk {
             offset: (index * 64 * 1024) as u64,
             data: Bytes::copy_from_slice(chunk),
         })
@@ -224,7 +225,7 @@ async fn short_stream_cannot_replace_an_existing_destination() -> TestResult {
     let entry = Arc::new(src.get_metadata(Path::new("payload")).await?);
     let handle = StorageEnum::prepare_stream(&dst, &entry).await?;
     let (tx, rx) = tokio::sync::mpsc::channel(1);
-    tx.send(DataChunk {
+    tx.send(PositionedChunk {
         offset: 0,
         data: Bytes::from_static(b"short"),
     })
@@ -409,12 +410,9 @@ async fn copied_observation_rejects_source_changes_before_any_target_write() -> 
     let dst = local(destination.path()).await?;
     let observed = Arc::new(src.get_metadata(Path::new("payload")).await?);
     tokio::fs::write(source.path().join("payload"), b"modified after scan").await?;
-    let mut modes = vec![
-        storage_adapter::TransferMode::Atomic,
-        storage_adapter::TransferMode::Checkpoint,
-    ];
+    let mut modes = vec![TransferMode::Atomic, TransferMode::Checkpoint];
     if cfg!(unix) {
-        modes.push(storage_adapter::TransferMode::Direct);
+        modes.push(TransferMode::Direct);
     }
     for transfer_mode in modes {
         let result = StorageEnum::copy_file(

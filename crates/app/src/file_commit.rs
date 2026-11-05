@@ -3,6 +3,8 @@
 //! 接收完成后先校验长度及源摘要，再由引擎读回校验并发布；目录和符号链接即时完成。
 //! delta token 经 Reconstructor 重建，basis 区间通过源角色读取。
 
+use data_mover::storage::PositionedChunk;
+use transport::chunk::DataChunk;
 // 标准库
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -11,7 +13,7 @@ use task_model::ObservedEntryExt;
 // 外部 crate
 use bytes::{Bytes, BytesMut};
 use storage_adapter::error::Result as StorageResult;
-use storage_adapter::{DataChunk, ObservedEntry, StorageEnum, StreamChunk, StreamHandle};
+use storage_adapter::{ObservedEntry, StorageEnum, StreamChunk, StreamHandle};
 use sync_delta::DeltaToken;
 use sync_delta::reconstruct::{ReconstructStep, Reconstructor};
 use task_model::observation::ObservedItem;
@@ -209,7 +211,12 @@ impl FileCommitter {
             debug!("[dc] rejecting full chunk for non-matching active stream");
             return;
         }
-        if active.tx_inner.send(StreamChunk::from(chunk)).await.is_err() {
+        if active
+            .tx_inner
+            .send(StreamChunk::from(PositionedChunk::from(chunk)))
+            .await
+            .is_err()
+        {
             debug!(
                 "[dc] write channel closed early for {:?}",
                 active.entry.get_relative_path()
@@ -270,7 +277,7 @@ impl FileCommitter {
                 delta.write_pos += data.len() as u64;
                 let _ = active
                     .tx_inner
-                    .send(StreamChunk::from(DataChunk { offset, data }))
+                    .send(StreamChunk::from(PositionedChunk { offset, data }))
                     .await;
             }
         }
@@ -464,7 +471,7 @@ async fn flush_basis(dest: &Arc<StorageEnum>, active: &mut ActiveFile) -> Result
     active
         .tx_inner
         .send(StreamChunk {
-            chunk: DataChunk {
+            chunk: PositionedChunk {
                 offset: write_offset,
                 data,
             },

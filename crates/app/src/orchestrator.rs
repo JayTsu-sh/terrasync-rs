@@ -11,8 +11,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
-use storage_adapter::TransferMode;
 use task_model::ObservedEntryExt;
+use task_model::TransferMode;
 
 /// RAII guard：构造时 +1，Drop 时 -1，确保计数器在 panic/early-return 时也能正确回收。
 struct AtomicCounterGuard<'a>(&'a AtomicUsize);
@@ -1311,7 +1311,7 @@ impl SyncOrchestrator {
         Ok(())
     }
 
-    /// 双进程全量同步 — Sender 侧：`walkdir_2` 分页 → QUIC → Receiver 比较 + 写入
+    /// 双进程全量同步 — Sender 侧：`directory_pages` 分页 → QUIC → Receiver 比较 + 写入
     async fn run_sync_remote(
         &self, remote_addr: &str, tls_cert_bytes: Option<&[u8]>, auth_token: Option<&str>,
     ) -> Result<()> {

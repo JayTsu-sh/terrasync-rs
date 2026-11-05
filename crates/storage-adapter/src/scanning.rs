@@ -1,8 +1,7 @@
 use crate::ObservedEntryExt;
 use crate::connected::path;
-use crate::filter::FilterExpression;
 use crate::projection::{HistorySequence, observation_plan, validate_required_tags};
-use crate::{dir_tree::*, error::operation, *};
+use crate::{error::operation, *};
 use chrono::NaiveDate;
 use data_mover::{
     DslTraversalFilter,
@@ -15,6 +14,7 @@ use data_mover::{
         Checkpoint, DirectoryStatistics, Resumable, ScanFailureSignal, TraversalCandidate, TraversalDecision,
         TraversalFilter, TraversalItem, TraversalOrder, TraversalOutcome, TraversalRecoveryResume,
         TraversalRecoveryStatus, TraversalRequest, TraversalResume, TraversalSession, TraversalSource,
+        TraversalTerminalFailure,
     },
 };
 use std::{
@@ -22,7 +22,6 @@ use std::{
     path::{Path, PathBuf},
     sync::Arc,
 };
-use task_model::observation::ObservedItem;
 use tokio_util::sync::CancellationToken;
 
 pub enum ScanSourceMode {
@@ -135,39 +134,34 @@ impl ConnectedStorage {
                         continue;
                     }
                     TraversalItem::Entry(entry) => {
-                        let projected = match histories.push(*entry, required_tags).map(|entry| [entry]) {
-                            Ok(entries) => entries,
-                            Err(error) => {
-                                let reason = error.to_string();
-                                stored_error
-                                    .lock()
-                                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                                    .get_or_insert(error);
-                                let _ = tx
-                                    .send(StorageEntryMessage::Error {
-                                        event: ErrorEvent::Scan,
-                                        path: root.clone(),
-                                        entry: None,
-                                        reason,
-                                    })
-                                    .await;
-                                return;
-                            }
+                        if let Err(error) = histories.check(&entry, required_tags) {
+                            let reason = error.to_string();
+                            stored_error
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                .get_or_insert(error);
+                            let _ = tx
+                                .send(StorageEntryMessage::Error {
+                                    event: ErrorEvent::Scan,
+                                    path: root.clone(),
+                                    entry: None,
+                                    reason,
+                                })
+                                .await;
+                            return;
+                        }
+                        let projected = *entry;
+                        let relative = projected
+                            .get_relative_path()
+                            .strip_prefix(&root)
+                            .unwrap_or(projected.get_relative_path());
+                        let message = if projected.get_is_dir() && package.packaged_path(&relative.to_string_lossy()) {
+                            StorageEntryMessage::Packaged(Arc::new(projected))
+                        } else {
+                            StorageEntryMessage::Scanned(Arc::new(projected))
                         };
-                        for projected in projected {
-                            let relative = projected
-                                .get_relative_path()
-                                .strip_prefix(&root)
-                                .unwrap_or(projected.get_relative_path());
-                            let message =
-                                if projected.get_is_dir() && package.packaged_path(&relative.to_string_lossy()) {
-                                    StorageEntryMessage::Packaged(Arc::new(projected))
-                                } else {
-                                    StorageEntryMessage::Scanned(Arc::new(projected))
-                                };
-                            if tx.send(message).await.is_err() {
-                                return;
-                            }
+                        if tx.send(message).await.is_err() {
+                            return;
                         }
                         continue;
                     }
@@ -252,142 +246,14 @@ impl ConnectedStorage {
             .with_scan_failure(terminal_error, guard)
             .with_recovery(recovery))
     }
-    pub async fn walkdir_2(
-        &self, sub: Option<&Path>, depth: Option<usize>, match_expressions: Option<FilterExpression>,
-        exclude_expressions: Option<FilterExpression>, concurrency: usize, include_tags: bool,
-    ) -> Result<WalkDirAsyncIterator2> {
-        let required_tags = self.tags_required(include_tags)?;
-        let mut session = self.traversal(
-            sub,
-            &WalkOptions {
-                depth,
-                match_expressions,
-                exclude_expressions,
-                concurrency,
-                include_tags,
-                ..Default::default()
-            },
-            true,
-        )?;
-        let (tx, rx) = async_channel::bounded(2);
-        tokio::spawn(async move {
-            let mut histories = HistorySequence::default();
-            let mut files: Vec<ObservedItem> = Vec::new();
-            let mut subdirs: Vec<ObservedItem> = Vec::new();
-            let mut next = 0i32;
-            while let Some(item) = session.next_item().await {
-                match item {
-                    TraversalItem::Resumed(_) => histories = HistorySequence::default(),
-                    TraversalItem::Entry(entry) => {
-                        let projected = match histories.push(*entry, required_tags).map(|entry| [entry]) {
-                            Ok(entries) => entries,
-                            Err(error) => {
-                                let _ = tx
-                                    .send(NdxEvent::Error {
-                                        path: String::new(),
-                                        reason: error.to_string(),
-                                    })
-                                    .await;
-                                return;
-                            }
-                        };
-                        for entry in projected {
-                            let entry = Arc::new(entry);
-                            if entry.history().is_some() {
-                                files.extend(ObservedItem::all(&entry));
-                            } else if entry.get_is_dir() {
-                                subdirs.push(entry.into());
-                            } else {
-                                files.push(entry.into());
-                            }
-                        }
-                    }
-                    TraversalItem::DirectoryListed(listed) => {
-                        files.sort_by(|a, b| a.get_name().cmp(b.get_name()));
-                        subdirs.sort_by(|a, b| a.get_name().cmp(b.get_name()));
-                        let start = next;
-                        let mut indexed = |entries: &mut Vec<ObservedItem>| -> Vec<NdxEntry> {
-                            entries
-                                .drain(..)
-                                .map(|entry| {
-                                    let ndx = next;
-                                    next = next.saturating_add(1);
-                                    NdxEntry {
-                                        ndx,
-                                        entry: entry.into(),
-                                    }
-                                })
-                                .collect()
-                        };
-                        let files = indexed(&mut files);
-                        let subdirs = indexed(&mut subdirs);
-                        let gap_ndx = next;
-                        next = next.saturating_add(1);
-                        if tx
-                            .send(NdxEvent::Page(DirPageResult {
-                                dir_path: listed.path.as_str().into(),
-                                ndx_start: start,
-                                files,
-                                subdirs,
-                                gap_ndx,
-                            }))
-                            .await
-                            .is_err()
-                        {
-                            return;
-                        }
-                    }
-                    TraversalItem::Failure(f) => {
-                        if tx
-                            .send(NdxEvent::Error {
-                                path: f.path.as_str().into(),
-                                reason: format!("{:?}: {:?}", f.scope, f.failure.class()),
-                            })
-                            .await
-                            .is_err()
-                        {
-                            return;
-                        }
-                    }
-                    TraversalItem::ObservationFailure(f) => {
-                        if tx
-                            .send(NdxEvent::Error {
-                                path: f.path.as_str().into(),
-                                reason: format!("{:?}: {:?}", f.family, f.class),
-                            })
-                            .await
-                            .is_err()
-                        {
-                            return;
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            if !histories.is_complete() {
-                let _ = tx
-                    .send(NdxEvent::Error {
-                        path: String::new(),
-                        reason: "incomplete object history".into(),
-                    })
-                    .await;
-                return;
-            }
-            match session.finish().await {
-                Ok(TraversalOutcome::Completed(_)) => {
-                    let _ = tx.send(NdxEvent::Done).await;
-                }
-                result => {
-                    let _ = tx
-                        .send(NdxEvent::Error {
-                            path: String::new(),
-                            reason: format!("traversal did not complete: {result:?}"),
-                        })
-                        .await;
-                }
-            }
-        });
-        Ok(AsyncReceiver::new(rx))
+    /// 交付原生目录块；历史顺序和必需事实在编号／传输前完成准入。
+    pub fn directory_inventory(&self, options: &WalkOptions) -> Result<DirectoryInventory> {
+        Ok(DirectoryInventory {
+            required_tags: self.tags_required(options.include_tags)?,
+            session: self.traversal(None, options, true)?,
+            histories: HistorySequence::default(),
+            ended: false,
+        })
     }
     pub async fn delete_dir_all_with_progress(
         &self, sub: Option<&Path>, concurrency: usize,
@@ -454,6 +320,48 @@ impl ConnectedStorage {
         Ok(())
     }
 }
+/// 有界原生目录流，不持有 NDX、wire 页或整棵目录的观察。
+pub struct DirectoryInventory {
+    required_tags: bool,
+    session: TraversalSession,
+    histories: HistorySequence,
+    ended: bool,
+}
+
+impl DirectoryInventory {
+    pub async fn next(&mut self) -> Option<Result<TraversalItem>> {
+        if self.ended {
+            return None;
+        }
+        match self.session.next_item().await {
+            Some(TraversalItem::Resumed(event)) => {
+                self.histories = HistorySequence::default();
+                Some(Ok(TraversalItem::Resumed(event)))
+            }
+            Some(TraversalItem::Entry(entry)) => match self.histories.check(&entry, self.required_tags) {
+                Ok(()) => Some(Ok(TraversalItem::Entry(entry))),
+                Err(error) => {
+                    self.ended = true;
+                    Some(Err(error))
+                }
+            },
+            Some(item) => Some(Ok(item)),
+            None => {
+                self.ended = true;
+                if self.histories.is_complete() {
+                    None
+                } else {
+                    Some(Err(StorageError::IncompleteHistory))
+                }
+            }
+        }
+    }
+
+    pub async fn finish(self) -> std::result::Result<TraversalOutcome, TraversalTerminalFailure> {
+        self.session.finish().await
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct DeleteEvent {
     pub relative_path: PathBuf,

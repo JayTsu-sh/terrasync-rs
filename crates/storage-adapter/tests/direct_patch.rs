@@ -1,13 +1,13 @@
 #![allow(clippy::expect_used)]
 #![cfg(unix)]
+use data_mover::storage::PositionedChunk;
+use task_model::TransferMode;
 #[path = "../../../tests/support/observed.rs"]
 mod observed_fixtures;
 use bytes::Bytes;
 use data_mover::transfer::DirectPatchError;
 use std::{error::Error, os::unix::fs::MetadataExt, path::Path};
-use storage_adapter::{
-    CreateStorageOptions, DataChunk, ObservedEntry, StorageEnum, StorageError, TransferMode, create_storage,
-};
+use storage_adapter::{CreateStorageOptions, ObservedEntry, StorageEnum, StorageError, create_storage};
 use tokio::sync::mpsc;
 use tokio::time::{Duration, timeout};
 use tokio_util::sync::CancellationToken;
@@ -41,7 +41,7 @@ async fn planned(
         .await
     });
     for (index, chunk) in payload.chunks(4).enumerate() {
-        tx.send(DataChunk {
+        tx.send(PositionedChunk {
             offset: (index * 4) as u64,
             data: Bytes::copy_from_slice(chunk),
         })

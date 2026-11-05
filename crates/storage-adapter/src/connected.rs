@@ -1,5 +1,6 @@
 use crate::ObservedEntryExt;
 use crate::copied_metadata::copied_metadata_plan;
+use crate::options::transfer_policy;
 use crate::{
     error::operation,
     options::BackendConfig as ProductBackendConfig,
@@ -468,7 +469,7 @@ impl StorageEnum {
             to.roles.clone(),
             options.cancel.clone().unwrap_or_default(),
         )?
-        .with_transfer_policy(options.transfer_mode.policy())
+        .with_transfer_policy(transfer_policy(options.transfer_mode))
         .with_read_back_verification(if options.enable_integrity_check {
             ReadBackVerification::Enabled
         } else {

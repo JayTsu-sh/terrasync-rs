@@ -135,9 +135,9 @@ pub(crate) struct HistorySequence {
     next_segment: u32,
 }
 impl HistorySequence {
-    pub fn push(&mut self, entry: ObservedEntry, tags: bool) -> Result<ObservedEntry> {
+    pub fn check(&mut self, entry: &ObservedEntry, tags: bool) -> Result<()> {
         if tags {
-            validate_required_tags(&entry)?;
+            validate_required_tags(entry)?;
         }
         if let Some(history) = entry.history() {
             if self.path.is_none() {
@@ -157,7 +157,7 @@ impl HistorySequence {
         } else if self.path.is_some() {
             return Err(operation("interrupted object history"));
         }
-        Ok(entry)
+        Ok(())
     }
     pub fn is_complete(&self) -> bool {
         self.path.is_none()

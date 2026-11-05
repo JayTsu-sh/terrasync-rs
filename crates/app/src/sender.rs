@@ -222,7 +222,6 @@ mod tests {
     use std::sync::Mutex;
 
     use async_trait::async_trait;
-    use storage_adapter::error::StorageError;
     use transport::error::{Result as TransportResult, TransportError};
     use transport::message::ReceiverMsg;
     use {storage_adapter::AsyncReceiver, task_model::ErrorEvent};
@@ -321,7 +320,7 @@ mod tests {
             sent.push(msg);
             if index < self.failures {
                 if index == 0 {
-                    return Err(StorageError::IoError(IoError::new(ErrorKind::TimedOut, "first send")).into());
+                    return Err(TransportError::Io(IoError::new(ErrorKind::TimedOut, "first send")).into());
                 }
                 return Err(TransportError::ChannelClosed);
             }
@@ -416,9 +415,7 @@ mod tests {
         )
         .await;
         assert!(
-            matches!(result, Err(AppError::TransportError(TransportError::StorageError(
-            StorageError::IoError(error)
-        ))) if error.kind() == ErrorKind::TimedOut)
+            matches!(result, Err(AppError::TransportError(TransportError::Io(error))) if error.kind() == ErrorKind::TimedOut)
         );
         assert_eq!(transport.sent.lock().unwrap().len(), 3);
         assert_eq!(count.load(Ordering::Relaxed), 3);

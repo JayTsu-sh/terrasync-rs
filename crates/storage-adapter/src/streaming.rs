@@ -1,11 +1,12 @@
 use crate::copied_metadata::copied_metadata_plan;
+use crate::options::transfer_policy;
 use crate::{
     connected::path,
     error::{StreamTransferDiagnostic, operation},
     *,
 };
 use blake3::{Hash, Hasher};
-use data_mover::storage::{StorageRoleFailure, WriteProgress, WriteProgressObserver};
+use data_mover::storage::{PositionedChunk, StorageRoleFailure, WriteProgress, WriteProgressObserver};
 use data_mover::{
     model::*,
     storage::{self, ByteStream, SourceDescriptor, SourceQosGroup, SourceQosPolicy},
@@ -86,7 +87,10 @@ impl StorageEnum {
     pub fn read_basis_chunk_stream(
         storage: &Self, entry: &Arc<ObservedEntry>, intervals: Option<Vec<(u64, u64)>>, qos: Option<QosManager>,
         hash: bool, capacity: usize,
-    ) -> (mpsc::Receiver<DataChunk>, JoinHandle<Result<Option<HashCalculator>>>) {
+    ) -> (
+        mpsc::Receiver<PositionedChunk>,
+        JoinHandle<Result<Option<HashCalculator>>>,
+    ) {
         Self::start_chunk_stream(storage, &Arc::clone(entry).into(), intervals, qos, hash, capacity)
     }
     /// 在发送 FileBegin 前由原生 source session 校验观察，并钉住所选源版本。
@@ -109,7 +113,10 @@ impl StorageEnum {
     fn start_chunk_stream(
         storage: &Self, item: &ObservedItem, intervals: Option<Vec<(u64, u64)>>, qos: Option<QosManager>, hash: bool,
         capacity: usize,
-    ) -> (mpsc::Receiver<DataChunk>, JoinHandle<Result<Option<HashCalculator>>>) {
+    ) -> (
+        mpsc::Receiver<PositionedChunk>,
+        JoinHandle<Result<Option<HashCalculator>>>,
+    ) {
         let storage = storage.clone();
         let item = item.clone();
         let (tx, rx) = mpsc::channel(capacity.max(1));
@@ -160,7 +167,7 @@ impl StorageEnum {
                         hasher.0.update(&data);
                     }
                     let len = data.len() as u64;
-                    if tx.send(DataChunk { offset, data }).await.is_err() {
+                    if tx.send(PositionedChunk { offset, data }).await.is_err() {
                         return Err(StorageError::Cancelled);
                     }
                     offset += len;
@@ -176,11 +183,11 @@ impl StorageEnum {
 }
 /// basis 提示只由 Receiver 的重建器产生；同位置引用已读取并计入完整摘要。
 pub struct StreamChunk {
-    pub chunk: DataChunk,
+    pub chunk: PositionedChunk,
     pub unchanged_basis: bool,
 }
-impl From<DataChunk> for StreamChunk {
-    fn from(chunk: DataChunk) -> Self {
+impl From<PositionedChunk> for StreamChunk {
+    fn from(chunk: PositionedChunk) -> Self {
         Self {
             chunk,
             unchanged_basis: false,
@@ -320,7 +327,7 @@ impl StorageEnum {
                     p.clone(),
                     cancel.clone(),
                 )
-                .with_transfer_policy(mode.policy())
+                .with_transfer_policy(transfer_policy(mode))
                 .with_metadata_plan(metadata_plan)
                 .with_write_observer(progress),
             )
@@ -348,7 +355,7 @@ impl StorageEnum {
         })
     }
     pub async fn write_chunk_stream(
-        _dest: &Self, _entry: &ObservedEntry, rx: mpsc::Receiver<DataChunk>, handle: &StreamHandle,
+        _dest: &Self, _entry: &ObservedEntry, rx: mpsc::Receiver<PositionedChunk>, handle: &StreamHandle,
         _qos: Option<QosManager>, on_committed: CommitCallback,
     ) -> Result<()> {
         let input: Input = Box::pin(stream::unfold(rx, |mut rx| async {

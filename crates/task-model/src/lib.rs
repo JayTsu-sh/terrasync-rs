@@ -4,9 +4,11 @@ pub mod error;
 mod event;
 mod facts;
 pub mod observation;
+mod transfer;
 pub use error::{Result, TaskModelError};
 pub use event::{ChangeKind, EntryChange, ErrorEvent, StorageEntryMessage};
 pub use facts::ObservedEntryExt;
+pub use transfer::TransferMode;
 
 #[cfg(test)]
 #[path = "../../../tests/support/observed.rs"]

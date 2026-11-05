@@ -1,7 +1,10 @@
+pub mod chunk;
+pub mod directory;
 pub mod error;
 pub mod flow_control;
 pub mod in_process;
 pub mod message;
+mod observation_wire;
 pub mod traits;
 
 /// QUIC 传输层实现（启用 "quic" feature 时编译）

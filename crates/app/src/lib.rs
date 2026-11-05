@@ -47,6 +47,7 @@ pub mod orchestrator;
 pub mod scan_resume;
 mod sync_catalog;
 
+mod remote_inventory;
 /// 双进程远端同步（Sender 侧）
 ///
 /// 将 run_sync_remote 的各阶段逻辑提取为独立函数，降低单函数复杂度

@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 
 use data_mover::transfer::TransferPolicy;
-use serde::{Deserialize, Serialize};
+use task_model::TransferMode;
 use tokio_util::sync::CancellationToken;
 
 use crate::filter::FilterExpression;
@@ -38,35 +38,6 @@ impl Default for WalkOptions {
             include_tags: false,
             packaged: false,
             package_depth: 0,
-        }
-    }
-}
-
-/// sync 的显式写入模式，原样传递给上游，不按文件大小或后端静默降级。
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
-pub enum TransferMode {
-    Checkpoint,
-    #[default]
-    Atomic,
-    Direct,
-}
-
-impl TransferMode {
-    pub const fn from_flags(resume: bool, in_place: bool) -> Self {
-        if resume {
-            Self::Checkpoint
-        } else if in_place {
-            Self::Atomic
-        } else {
-            Self::Direct
-        }
-    }
-
-    pub const fn policy(self) -> TransferPolicy {
-        match self {
-            Self::Checkpoint => TransferPolicy::Checkpointed,
-            Self::Atomic => TransferPolicy::AtomicReplace,
-            Self::Direct => TransferPolicy::Direct,
         }
     }
 }
@@ -113,5 +84,13 @@ impl CreateStorageOptions {
             ensure_dir,
             backend: BackendConfig::Default,
         }
+    }
+}
+
+pub(crate) const fn transfer_policy(mode: TransferMode) -> TransferPolicy {
+    match mode {
+        TransferMode::Checkpoint => TransferPolicy::Checkpointed,
+        TransferMode::Atomic => TransferPolicy::AtomicReplace,
+        TransferMode::Direct => TransferPolicy::Direct,
     }
 }

@@ -13,7 +13,7 @@ use app::scan::ScanRequest;
 use std::fs;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use storage_adapter::TransferMode;
+use task_model::TransferMode;
 use tokio::signal::ctrl_c;
 use tokio_util::sync::CancellationToken;
 

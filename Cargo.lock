@@ -6737,7 +6737,6 @@ dependencies = [
  "rcgen",
  "rustls 0.23.40",
  "serde",
- "storage-adapter",
  "task-model",
  "thiserror 2.0.20",
  "tokio",

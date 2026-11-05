@@ -23,14 +23,3 @@ pub struct DirPageResult {
     /// 本页段间隔的 gap NDX 值（-1 表示整棵树最后一页，无 gap）
     pub gap_ndx: i32,
 }
-
-/// `walkdir_2` 产出的事件流（页级粒度）
-#[derive(Debug)]
-pub enum NdxEvent {
-    /// 一整页目录内容，DFS 顺序产出
-    Page(DirPageResult),
-    /// 遍历过程中的 per-directory 错误（不中断整棵树）
-    Error { path: String, reason: String },
-    /// 整棵树遍历完成，对应 rsync `NDX_DONE` = -1
-    Done,
-}

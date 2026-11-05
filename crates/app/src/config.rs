@@ -1,4 +1,4 @@
-use storage_adapter::TransferMode;
+use task_model::TransferMode;
 // 标准库
 // 无
 

@@ -304,8 +304,9 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
+    use crate::chunk::DataChunk;
     use bytes::Bytes;
-    use storage_adapter::{DataChunk, ObservedEntry};
+    use data_mover::model::ObservedEntry;
 
     use super::*;
 

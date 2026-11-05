@@ -13,10 +13,11 @@ use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex, PoisonError};
 use task_model::ObservedEntryExt;
 use task_model::observation::ObservedItem;
+use transport::chunk::DataChunk;
 
-use storage_adapter::dir_tree::NdxEvent;
+use crate::remote_inventory::{DirectoryPages, NdxEvent};
 use storage_adapter::qos::QosManager;
-use storage_adapter::{DataChunk, ObservedEntry, StorageEnum, StorageError, WalkDirAsyncIterator2};
+use storage_adapter::{ObservedEntry, StorageEnum, StorageError};
 use sync_delta::DeltaToken;
 use sync_delta::matcher::DeltaMatcher;
 use task_model::{ChangeKind, ErrorEvent, StorageEntryMessage};
@@ -32,7 +33,7 @@ use crate::consumer::stats::format_bytes;
 pub(super) struct RemoteSenderSessionDeps<'a> {
     pub(super) transport: &'a dyn SenderTransport,
     pub(super) src_storage: &'a Arc<StorageEnum>,
-    pub(super) walkdir_iter: &'a WalkDirAsyncIterator2,
+    pub(super) walkdir_iter: &'a DirectoryPages,
     pub(super) qos: Option<&'a QosManager>,
     pub(super) enable_acl: bool,
     pub(super) checkpoint_path: &'a Path,
@@ -239,12 +240,12 @@ impl<'a> RemoteSenderSession<'a> {
 /// 这是 session implementation 的内部操作；生产调用者只使用
 /// [`RemoteSenderSession::run`]。
 pub(super) async fn advertise_file_list(
-    transport: &dyn SenderTransport, walkdir_iter: &WalkDirAsyncIterator2, ndx_table: &Mutex<NdxTable>,
+    transport: &dyn SenderTransport, walkdir_iter: &DirectoryPages, ndx_table: &Mutex<NdxTable>,
     stats_consumer: &Arc<AsyncMutex<StatisticConsumer>>,
 ) -> Result<u64> {
     info!("[Sender Remote] Sending file list");
     let mut page_count = 0u64;
-    while let Some(event) = walkdir_iter.next().await {
+    while let Some(event) = walkdir_iter.recv().await.ok() {
         match event {
             NdxEvent::Page(page) => {
                 {

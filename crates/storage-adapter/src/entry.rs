@@ -1,6 +1,5 @@
 //! TerraSync 数据库及 wire 使用的数据投影；不承担存储 IO。
 // 数据结构源自 data-mover d76ff5c（Apache-2.0）。
-use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 #[must_use]
 pub fn datetime_to_string(time: i64) -> String {
@@ -13,18 +12,6 @@ pub fn datetime_to_string(time: i64) -> String {
     .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
     let datetime: chrono::DateTime<chrono::Utc> = system_time.into();
     datetime.format("%Y-%m-%d %H:%M:%S%.9f").to_string()
-}
-
-/// 数据块结构体 - 用于表示文件传输过程中的数据片段
-///
-/// 该结构体封装了文件数据的一个数据块及其在原始文件中的偏移量，
-/// 主要用于在文件复制过程中进行数据分块传输和处理。
-#[derive(Debug, Serialize, Deserialize)]
-pub struct DataChunk {
-    /// 文件中的偏移量，表示该数据块在原文件中的起始位置
-    pub offset: u64,
-    /// 数据块的实际内容
-    pub data: Bytes,
 }
 
 /// 字节级断点续传的进度回调：参数 `(offset, len)` 表示 `[offset, offset+len)`

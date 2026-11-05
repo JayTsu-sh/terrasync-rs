@@ -4,8 +4,8 @@ mod observed_fixtures;
 use task_model::observation::ObservedItem;
 use tempfile::TempDir;
 use {
-    storage_adapter::{CopyOptions, CreateStorageOptions, StorageEnum, TransferMode, WalkOptions, create_storage},
-    task_model::StorageEntryMessage,
+    storage_adapter::{CopyOptions, CreateStorageOptions, StorageEnum, WalkOptions, create_storage},
+    task_model::{StorageEntryMessage, TransferMode},
 };
 
 type TestResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;

@@ -428,7 +428,7 @@ fn resolve_license_path(cli_license: Option<&Path>) -> error::Result<PathBuf> {
 mod sync_transfer_mode_tests {
     use super::*;
     use clap::Parser;
-    use storage_adapter::TransferMode;
+    use task_model::TransferMode;
 
     #[test]
     fn sync_flags_select_direct_atomic_and_checkpoint_with_resume_priority() {

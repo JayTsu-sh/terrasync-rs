@@ -10,23 +10,26 @@
 
 mod remote_sender_session;
 
+use crate::remote_inventory::directory_pages;
+use storage_adapter::WalkOptions;
+
 use remote_sender_session::{RemoteSenderSession, RemoteSenderSessionDeps};
 #[cfg(test)]
 use remote_sender_session::{classification_to_stats_message, entry_error_stats_message};
 #[cfg(test)]
-use storage_adapter::TransferMode;
+use task_model::TransferMode;
 
 use std::net::SocketAddr;
 use std::sync::Arc;
 #[cfg(test)]
 use std::sync::{Mutex, PoisonError};
 
+#[cfg(test)]
+use crate::remote_inventory::NdxEvent;
 use crate::storage_factory::{StorageRole, create_storage_for_role};
 use rustls::pki_types::CertificateDer;
 #[cfg(test)]
 use storage_adapter::StorageEnum;
-#[cfg(test)]
-use storage_adapter::dir_tree::NdxEvent;
 use storage_adapter::filter::parse_filter_expression;
 use tokio::sync::Mutex as AsyncMutex;
 use tracing::{info, warn};
@@ -113,7 +116,7 @@ pub(crate) async fn run(
     }));
     let callback_guard = StatisticConsumer::begin(stats_consumer.clone()).await;
 
-    // ── 4. 创建源端 storage + walkdir_2 ──
+    // ── 4. 创建源端 storage + directory_pages ──
     let block_size = match &config.block_size {
         Some(s) => Some(parse_size(s)?),
         None => None,
@@ -130,16 +133,16 @@ pub(crate) async fn run(
     let match_expr = config.r#match.as_deref().and_then(|e| parse_filter_expression(e).ok());
     let exclude_expr = config.exclude.as_deref().and_then(|e| parse_filter_expression(e).ok());
     let app_config = AppConfig::fetch()?;
-    let walkdir_iter = src_storage
-        .walkdir_2(
-            None,
-            None,
-            match_expr,
-            exclude_expr,
-            app_config.scan.concurrency,
-            app_config.scan.include_tags || copy_tags,
-        )
-        .await?;
+    let walkdir_iter = directory_pages(
+        &src_storage,
+        WalkOptions {
+            match_expressions: match_expr,
+            exclude_expressions: exclude_expr,
+            concurrency: app_config.scan.concurrency,
+            include_tags: app_config.scan.include_tags || copy_tags,
+            ..Default::default()
+        },
+    )?;
 
     // ── 5. QoS 管理器；checkpoint lifecycle 由 negotiated session 持有 ──
     let qos_manager = create_qos_manager(config.qos.as_ref(), config.peak_qos_rate, config.iops);
@@ -260,10 +263,10 @@ mod tests {
 
     use crate::storage_factory::{StorageRole, create_storage_for_role};
     use async_trait::async_trait;
-    use storage_adapter::DataChunk;
-    use storage_adapter::dir_tree::DirPageResult;
     use tempfile::tempdir;
     use tokio::task::JoinHandle;
+    use transport::chunk::DataChunk;
+    use transport::directory::DirPageResult;
     use transport::error::Result as TransportResult;
     use transport::in_process::{InProcessReceiverTransport, InProcessSenderTransport, create_in_process_pair};
     use transport::message::FeatureFlags;
@@ -346,7 +349,14 @@ mod tests {
                 .unwrap(),
         );
 
-        let walkdir_iter = src_storage.walkdir_2(None, None, None, None, 4, false).await.unwrap();
+        let walkdir_iter = directory_pages(
+            &src_storage,
+            WalkOptions {
+                concurrency: 4,
+                ..Default::default()
+            },
+        )
+        .unwrap();
 
         let (sender_transport, receiver_transport) = create_in_process_pair();
 
@@ -424,7 +434,14 @@ mod tests {
                 .await
                 .unwrap(),
         );
-        let walkdir_iter = src_storage.walkdir_2(None, None, None, None, 1, false).await.unwrap();
+        let walkdir_iter = directory_pages(
+            &src_storage,
+            WalkOptions {
+                concurrency: 1,
+                ..Default::default()
+            },
+        )
+        .unwrap();
         let (sender_transport, receiver_transport) = create_in_process_pair();
         let peer = tokio::spawn(async move {
             while let Some(message) = receiver_transport.recv().await {
@@ -466,7 +483,14 @@ mod tests {
                 .await
                 .unwrap(),
         );
-        let walkdir_iter = src_storage.walkdir_2(None, None, None, None, 1, false).await.unwrap();
+        let walkdir_iter = directory_pages(
+            &src_storage,
+            WalkOptions {
+                concurrency: 1,
+                ..Default::default()
+            },
+        )
+        .unwrap();
         let (sender_transport, receiver_transport) = create_in_process_pair();
         let peer = tokio::spawn(async move {
             while let Some(message) = receiver_transport.recv().await {
@@ -511,7 +535,14 @@ mod tests {
                 .await
                 .unwrap(),
         );
-        let walkdir_iter = src_storage.walkdir_2(None, None, None, None, 1, false).await.unwrap();
+        let walkdir_iter = directory_pages(
+            &src_storage,
+            WalkOptions {
+                concurrency: 1,
+                ..Default::default()
+            },
+        )
+        .unwrap();
         let (sender_transport, receiver_transport) = create_in_process_pair();
         let peer = tokio::spawn(async move {
             while let Some(message) = receiver_transport.recv().await {
@@ -642,7 +673,14 @@ mod tests {
         src_dir: &std::path::Path, dest_storage: Arc<StorageEnum>, enable_integrity_check: bool,
     ) -> (u64, u64) {
         let src_storage = Arc::new(create_storage(src_dir.to_str().unwrap(), None, false).await.unwrap());
-        let walkdir_iter = src_storage.walkdir_2(None, None, None, None, 4, false).await.unwrap();
+        let walkdir_iter = directory_pages(
+            &src_storage,
+            WalkOptions {
+                concurrency: 4,
+                ..Default::default()
+            },
+        )
+        .unwrap();
 
         let receiver_handle =
             tokio::spawn(async move { receiver_task_remote(&receiver_transport, dest_storage, None).await });
@@ -700,7 +738,14 @@ mod tests {
         src_dir: &std::path::Path, dest_storage: Arc<StorageEnum>, disrupt: impl FnOnce() + Send + 'a,
     ) -> (Arc<AsyncMutex<StatisticConsumer>>, u64, u64) {
         let src_storage = Arc::new(create_storage(src_dir.to_str().unwrap(), None, false).await.unwrap());
-        let walkdir_iter = src_storage.walkdir_2(None, None, None, None, 4, false).await.unwrap();
+        let walkdir_iter = directory_pages(
+            &src_storage,
+            WalkOptions {
+                concurrency: 4,
+                ..Default::default()
+            },
+        )
+        .unwrap();
 
         let receiver_handle =
             tokio::spawn(async move { receiver_task_remote(&receiver_transport, dest_storage, None).await });
@@ -1573,12 +1618,19 @@ mod tests {
         (sender_transport, receiver_handle)
     }
 
-    /// 用真实 `walkdir_2` 遍历 `dir`（测试前提：目录下恰好一个顶层文件）返回第一页 +
+    /// 用真实 `directory_pages` 遍历 `dir`（测试前提：目录下恰好一个顶层文件）返回第一页 +
     /// 该文件的 ndx。
     async fn single_file_page(dir: &std::path::Path) -> (DirPageResult, i32) {
         let storage = Arc::new(create_storage(dir.to_str().unwrap(), None, false).await.unwrap());
-        let walkdir_iter = storage.walkdir_2(None, None, None, None, 4, false).await.unwrap();
-        let page = match walkdir_iter.next().await {
+        let walkdir_iter = directory_pages(
+            &storage,
+            WalkOptions {
+                concurrency: 4,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let page = match walkdir_iter.recv().await.ok() {
             Some(NdxEvent::Page(p)) => p,
             other => panic!("expected Page, got {other:?}"),
         };
@@ -1971,9 +2023,16 @@ mod tests {
                 .await
                 .unwrap(),
         );
-        let walkdir_iter = src_storage.walkdir_2(None, None, None, None, 4, false).await.unwrap();
+        let walkdir_iter = directory_pages(
+            &src_storage,
+            WalkOptions {
+                concurrency: 4,
+                ..Default::default()
+            },
+        )
+        .unwrap();
         let mut expected_ndx = None;
-        while let Some(event) = walkdir_iter.next().await {
+        while let Some(event) = walkdir_iter.recv().await.ok() {
             if let NdxEvent::Page(page) = event {
                 for file in &page.files {
                     if file.entry.get_relative_path() == std::path::Path::new("sub/nested.txt") {

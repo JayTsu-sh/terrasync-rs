@@ -1,4 +1,5 @@
 use crate::ObservedEntryExt;
+use crate::options::transfer_policy;
 use crate::streaming::source_qos;
 use crate::*;
 use data_mover::transfer::{self, ReadBackVerification, TransferIdentity, TransferRequest};
@@ -53,7 +54,7 @@ impl StorageEnum {
             options.cancel.unwrap_or_default(),
         )?
         .with_identity_override(TransferIdentity::from_label(recovery.identity).map_err(StorageError::from)?)
-        .with_transfer_policy(mode.policy());
+        .with_transfer_policy(transfer_policy(mode));
         if let Some(qos) = options.qos {
             request = request.with_source_qos(source_qos(&qos, source.block_size)?);
         }

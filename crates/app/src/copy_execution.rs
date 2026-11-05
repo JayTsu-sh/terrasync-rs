@@ -109,7 +109,7 @@ mod tests {
     use super::*;
     use std::fs::OpenOptions;
     use std::path::Path;
-    use storage_adapter::TransferMode;
+    use task_model::TransferMode;
 
     fn job(directory: &Path) -> SyncJobConfig {
         SyncJobConfig {
