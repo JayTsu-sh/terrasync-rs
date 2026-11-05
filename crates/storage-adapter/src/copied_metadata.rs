@@ -8,7 +8,7 @@ use data_mover::{
     storage::{CopiedOwnershipTarget, CopiedTimestampTarget, CopiedValueTarget},
 };
 
-/// 从 wire 已捕获的值编译计划；不回读源端，也不修改最终路径。
+/// 从已捕获的值编译计划；不回读源端，也不修改最终路径。
 pub(crate) fn copied_metadata_plan(destination: &ConnectedStorage, entry: ObservedView<'_>) -> Result<MetadataPlan> {
     let staged = destination.roles.staged_destination()?;
     let target = staged.copied_metadata_target();
@@ -40,11 +40,15 @@ pub(crate) fn copied_metadata_plan(destination: &ConnectedStorage, entry: Observ
                 MetadataPolicy::AllowKnownLoss
             },
         )
-        .with_timestamps(if matches!(timestamps, TimestampTargetCapability::Supported(_)) {
-            MetadataPolicy::AllowKnownLoss
-        } else {
-            MetadataPolicy::BestEffort
-        })
+        .with_timestamps(
+            if entry.metadata().timestamps().value().is_some()
+                && matches!(timestamps, TimestampTargetCapability::Supported(_))
+            {
+                MetadataPolicy::AllowKnownLoss
+            } else {
+                MetadataPolicy::BestEffort
+            },
+        )
         .with_tags(if entry.metadata().tags().value().is_some() {
             MetadataPolicy::BestEffort
         } else {
@@ -70,5 +74,6 @@ pub(crate) fn copied_metadata_plan(destination: &ConnectedStorage, entry: Observ
         ownership.is_none().then_some(mode).flatten(),
         false,
         false,
+        entry.entry.kind(),
     )?)
 }

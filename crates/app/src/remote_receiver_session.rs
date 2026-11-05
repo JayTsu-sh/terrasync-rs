@@ -118,7 +118,15 @@ impl RemoteSessionState {
                 true
             }
             TransferDecision::MetadataOnly => {
-                let _ = dest.set_entry_metadata(&entry.entry).await;
+                if let Err(error) = dest.set_entry_metadata(&entry.entry).await {
+                    let _ = transport
+                        .send(ReceiverMsg::EntryError {
+                            entry: Arc::clone(&entry.entry),
+                            reason: error.to_string(),
+                        })
+                        .await;
+                    return true;
+                }
                 progress
                     .metadata_only
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1067,6 +1075,32 @@ mod tests {
             .expect("empty session should finish after TransferDone")
             .unwrap()
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn metadata_only_failure_reports_error_without_success_confirmation() {
+        let source_root = tempdir().unwrap();
+        let target_root = tempdir().unwrap();
+        fs::write(source_root.path().join("missing"), b"source").unwrap();
+        let source = create_storage(source_root.path().to_str().unwrap(), None, false)
+            .await
+            .unwrap();
+        let target = create_storage(target_root.path().to_str().unwrap(), None, true)
+            .await
+            .unwrap();
+        let entry = Arc::new(source.get_metadata(std::path::Path::new("missing")).await.unwrap()).into();
+        let (sender, receiver) = create_in_process_pair();
+        let progress = ReceiverProgress::new();
+        let mut state = RemoteSessionState::default();
+        assert!(
+            state
+                .handle_base_classification(&receiver, &target, &progress, 0, &entry, TransferDecision::MetadataOnly)
+                .await
+        );
+        assert!(matches!(sender.recv().await, Some(ReceiverMsg::EntryError { .. })));
+        assert_eq!(progress.metadata_only.load(Ordering::Relaxed), 0);
+        assert_eq!(state.counts(), (0, 0));
+        assert!(!target_root.path().join("missing").exists());
     }
 
     #[tokio::test]

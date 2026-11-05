@@ -6,11 +6,13 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use data_mover::storage::{
     BackendConfig, CheckpointObservation, CopiedMetadataTarget, CopiedValueTarget, DestinationPrepareRequest,
-    LocalBackendConfig, MetadataMutation, PreparedStage, PublicationEvidence, PublicationFailure, PublishRequest,
-    StagedDestination, StorageBuilder, StorageRoleFailure, VerificationEvidence, VerifyRequest, WriteEvidence,
-    connect_backend,
+    LocalBackendConfig, Metadata, MetadataMutation, PreparedStage, PublicationEvidence, PublicationFailure,
+    PublishRequest, StagedDestination, StorageBuilder, StorageRoleFailure, VerificationEvidence, VerifyRequest,
+    WriteEvidence, connect_backend,
 };
 use data_mover::transfer::TransferPhase;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::{
     num::NonZeroUsize,
     path::PathBuf,
@@ -476,7 +478,6 @@ async fn a_selected_history_version_drives_stream_size_metadata_and_tags() {
 #[tokio::test]
 async fn stream_keeps_true_mode_without_numeric_ownership() {
     use data_mover::model::{PermissionFacts, PrincipalIdentity};
-    use std::os::unix::fs::PermissionsExt;
     for backend in [BackendKind::Hdfs, BackendKind::Nfs] {
         let (root, destination, _) = destination(false).await;
         let entry = crate::observed_fixtures::observation(
@@ -512,4 +513,148 @@ async fn stream_keeps_true_mode_without_numeric_ownership() {
             0o640
         );
     }
+}
+
+struct PublishedMetadataProbe {
+    fail: bool,
+    mutations: Mutex<Vec<MetadataMutation>>,
+}
+
+#[async_trait]
+impl Metadata for PublishedMetadataProbe {
+    async fn observe(
+        &self, _: &StoragePath, _: ObservationPlan,
+    ) -> std::result::Result<MetadataObservations, StorageRoleFailure> {
+        panic!("已捕获的元数据不能重新观察源端");
+    }
+
+    async fn apply(
+        &self, _: &StoragePath, mutation: MetadataMutation, _: CancellationToken,
+    ) -> std::result::Result<(), StorageRoleFailure> {
+        if self.fail {
+            return Err(role_failure("injected published metadata failure"));
+        }
+        self.mutations.lock().unwrap().push(mutation);
+        Ok(())
+    }
+}
+
+async fn published_metadata_destination(fail: bool) -> (TempDir, StorageEnum, Arc<PublishedMetadataProbe>) {
+    let (root, destination, stage) = destination(false).await;
+    let metadata = Arc::new(PublishedMetadataProbe {
+        fail,
+        mutations: Mutex::default(),
+    });
+    let roles = StorageBuilder::new(
+        destination.roles.identity().clone(),
+        destination.roles.capabilities().clone(),
+    )
+    .read_source(destination.roles.read_source().unwrap())
+    .staged_destination(stage)
+    .namespace(destination.roles.namespace().unwrap())
+    .metadata(metadata.clone())
+    .build()
+    .unwrap();
+    (
+        root,
+        StorageEnum::S3(ConnectedStorage {
+            roles,
+            block_size: 4,
+            reconnect_config: None,
+        }),
+        metadata,
+    )
+}
+
+fn captured_tags(tags: Vec<ObjectTag>) -> ObservedEntry {
+    let identity = SourceIdentity::new(
+        BackendIdentity::new(BackendKind::S3, "captured-tags").unwrap(),
+        IdentityStrength::PathScoped,
+        b"file",
+    )
+    .unwrap();
+    let metadata = MetadataObservations::new(
+        MetadataObservation::NotRequested,
+        MetadataObservation::NotRequested,
+        MetadataObservation::Value {
+            value: tags,
+            provenance: MetadataProvenance::Inline,
+        },
+        MetadataObservation::NotRequested,
+        MetadataObservation::NotRequested,
+    )
+    .unwrap();
+    ObservedEntry::new(
+        StoragePath::new("file").unwrap(),
+        EntryKind::File,
+        Some(3),
+        None,
+        identity,
+    )
+    .unwrap()
+    .with_metadata(metadata)
+}
+
+#[tokio::test]
+async fn published_metadata_applies_and_clears_tags_without_inventing_timestamps() {
+    let (root, destination, probe) = published_metadata_destination(false).await;
+    let tag = ObjectTag::new("test", "captured").unwrap();
+    for tags in [vec![tag.clone()], Vec::new()] {
+        destination.set_entry_metadata(&captured_tags(tags)).await.unwrap();
+    }
+    let mutations = probe.mutations.lock().unwrap();
+    assert_eq!(mutations.len(), 2);
+    assert!(matches!(&mutations[0], MetadataMutation::Tags(tags) if tags == &[tag]));
+    assert!(matches!(&mutations[1], MetadataMutation::Tags(tags) if tags.is_empty()));
+    assert_eq!(std::fs::read(root.path().join("file")).unwrap(), b"old");
+}
+
+#[tokio::test]
+async fn published_metadata_preserves_typed_application_failure() {
+    let (_, destination, _) = published_metadata_destination(true).await;
+    let error = destination
+        .set_entry_metadata(&captured_tags(Vec::new()))
+        .await
+        .unwrap_err();
+    let StorageError::MetadataApplication(failure) = error else {
+        panic!("unexpected error: {error:?}");
+    };
+    assert!(failure.storage_error().is_some());
+    assert_eq!(failure.family(), MetadataFamily::Tags);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn published_directory_keeps_setgid_without_fabricating_numeric_owner() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::create_dir(root.path().join("directory")).unwrap();
+    let destination = create_storage(root.path().to_str().unwrap(), CreateStorageOptions::default())
+        .await
+        .unwrap();
+    let source = crate::observed_fixtures::observation(
+        BackendKind::Hdfs,
+        "directory".into(),
+        EntryKind::Directory,
+        0,
+        [0; 3],
+        None,
+        None,
+        None,
+        None,
+    )
+    .with_permissions(Some(Box::new(PermissionFacts {
+        owner: Some(PrincipalIdentity::Named("hdfs".into())),
+        group: Some(PrincipalIdentity::Named("supergroup".into())),
+        mode: Some(0o2775),
+    })))
+    .unwrap();
+    destination.set_entry_metadata(&source).await.unwrap();
+    assert_eq!(
+        std::fs::metadata(root.path().join("directory"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o7777,
+        0o2775
+    );
 }

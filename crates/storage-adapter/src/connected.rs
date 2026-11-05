@@ -1,7 +1,8 @@
 use crate::ObservedEntryExt;
+use crate::copied_metadata::copied_metadata_plan;
 use crate::{
     error::operation,
-    observed_scan::ObservedItem,
+    observed_scan::{ObservedItem, ObservedView},
     options::BackendConfig as ProductBackendConfig,
     projection::{decode_acl, encode_acl},
     streaming::source_qos,
@@ -392,19 +393,21 @@ impl ConnectedStorage {
         Ok(())
     }
     pub async fn set_entry_metadata(&self, entry: &ObservedEntry) -> Result<()> {
-        if self.roles.kind() == BackendKind::S3 {
-            return Ok(());
+        let view = ObservedView {
+            entry,
+            version_index: None,
         }
-        self.set_metadata(
-            entry.get_relative_path(),
-            Some(entry.get_atime()),
-            Some(entry.get_mtime()),
-            entry.get_uid(),
-            entry.get_gid(),
-            entry.get_mode(),
+        .payload();
+        let plan = copied_metadata_plan(self, view)?;
+        plan.apply(
+            self.roles.metadata()?.as_ref(),
+            &view.source_path()?,
+            CancellationToken::new(),
         )
-        .await
+        .await?;
+        Ok(())
     }
+
     pub async fn get_acl_bytes(&self, value: &Path) -> Result<Option<Vec<u8>>> {
         let facts = self
             .roles
@@ -582,6 +585,7 @@ impl ConnectedStorage {
             None,
             false,
             true,
+            EntryKind::File,
         )
         .map_err(StorageError::from)?;
         plan.apply(&*self.roles.metadata()?, &path(value)?, CancellationToken::new())

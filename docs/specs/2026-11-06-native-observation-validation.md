@@ -38,8 +38,29 @@ marker 有到无的转换产生显式删除意图，不能仅由当前目录没�
 
 证据：`/work/terrasync-db-refactor-evidence/release-db-refactor-zero-source-v3-20261105-184316/report.json`；独立 bucket 和私有配置已清理。root pinned workspace check 与 app／db／transport／storage-adapter 测试通过。
 
-## 合入前仍须完成
+同一 SHA 的正常回归继续通过：目录 marker／标签 17 例与版本历史 14 例，覆盖 Single／Cluster、atomic／checkpoint、QUIC、null 版本及部分历史失败。证据分别位于 `/work/terrasync-db-refactor-evidence/release-db-refactor-source-mtime-marker-tags-20261105-184345/report.json` 和 `/work/terrasync-db-refactor-evidence/release-db-refactor-source-mtime-ordered-20261105-184453/report.json`；独立库与 bucket 清理通过。
 
-普通文件 metadata-only 存在已有的标签应用与错误确认缺口，需要独立修复；零字节准入修复不替代该项。
+该 SHA 已上传真实 Kerberos HDFS 节点，重新通过 7 个场景：预载、HDFS→Local、HDFS→HDFS、两处完整性检查，以及 QUIC→Local／HDFS。Local 目标 SHA 与 0640 权限通过，catalogue 保留 mode 416 且 uid／gid 为 null。证据在 `/work/terrasync-db-refactor-evidence/release-db-refactor-source-mtime-hdfs-20261105-184945/report.json`，独立 HDFS 路径与数据库清理通过。此结果替代旧二进制的 HDFS 阶段证据，后续代码变化仍须重测。
+
+该阶段完整 Rust 检查通过：fmt、workspace check／Clippy、workspace 测试与串行双进程 E2E 16 例。日志前缀为 `/tmp/terrasync-source-mtime-`。
+
+## 仅元数据更新的确认
+
+普通文件 metadata-only 已复现标签未应用却确认成功的问题。修复让已发布目标和 staged stream 共用已捕获 metadata 计划；协议写入仍由 native role 负责。标签替换与清空都实际应用，失败返回保留 role 原因的类型错误，Receiver 不增加成功计数或发送分类确认。未知时间不合成 epoch；历史版本仍走完整复制，当前路径 metadata API 不声称支持源目标历史版本映射。
+
+复审另发现复制计划隐含普通文件假设，会剥离目录的 setgid。data-mover `4717f1c` 让复制计划显式接收 EntryKind，目录保留组继承位，普通文件保持安全的 set-id 规则。原生计划与真实 Local role 应用回归先失败后通过，上游完整 `make ci` 通过；Unix 权限测试显式限制 Unix 平台。
+
+最终阶段候选 SHA-256：`825ef2e16332b299d567f2831787e172a539cea2e4571cb08a69c0328ebb07eb`。源码记录：`/tmp/terrasync-directory-metadata-build-source.json`。fmt、pinned workspace check／Clippy、workspace 测试与串行双进程 E2E 16 例通过；本轮 app 207、storage-adapter 22 个测试通过，忽略项不计通过。
+
+- 真实 S3 + QUIC 3 例通过：标签替换、清空、受控 403 拒绝。源目标来自实际相同列表时间和大小的对象，未伪造扫描事实。每例只有一次标签 PUT，没有内容 PUT，目标字节与版本数保持不变；拒绝记录一个条目错误。修复前候选同一场景没有执行标签写入，不能确认完成。最终报告：`/work/terrasync-db-refactor-evidence/release-db-refactor-metadata-final-metadata-only-20261105-191122/report.json`。
+- 同候选版本历史 14 例与零字节替换 2 例通过。报告分别为 `/work/terrasync-db-refactor-evidence/release-db-refactor-metadata-final-ordered-20261105-191240/report.json` 和 `/work/terrasync-db-refactor-evidence/release-db-refactor-metadata-final-zero-source-20261105-191352/report.json`；包括部分历史失败不假确认、源替换不发布，以及 null 版本顺序。
+- 同候选目录 marker／标签 17 例通过：`/work/terrasync-db-refactor-evidence/release-db-refactor-metadata-final-marker-tags-20261105-191134/report.json`。
+- 同候选真实 Kerberos HDFS 7 例通过，增加含子文件的 sticky 目录，Local 目标保留文件 0640 与目录 01775，catalogue 对应 mode 416／1021、uid／gid 均为 null。报告：`/work/terrasync-db-refactor-evidence/release-db-refactor-metadata-final-hdfs-sticky-20261105-191253/report.json`。
+
+上述成功报告的独立数据库、bucket、HDFS 路径和私有配置均已清理。
+
+曾错误地使用 HDFS setgid 目录作为真实验收，早期失败不作为产品回归复现或修复证据。[HDFS 3.4.2 明确不支持 setuid／setgid，目录支持 sticky bit](https://hadoop.apache.org/docs/r3.4.2/hadoop-project-dist/hadoop-hdfs/HdfsPermissionsGuide.html)。setgid 的验证证据是原生计划回归和真实 Local role 的目录应用测试。
+
+## 合入前仍须完成
 
 还需完成数据库内部职责拆分、移除无用 DTO／原型及旧版本计数、任务契约和 transport 的归属整理，以及按设计删除 storage-adapter。最终候选必须重跑对应 CI、真实 HDFS 和受影响故障链路，并完成全量／增量／续扫性能与峰值 RSS 对照。先前 HDFS 通过的二进制不能作为最终候选证据。
