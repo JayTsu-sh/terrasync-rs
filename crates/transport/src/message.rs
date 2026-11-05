@@ -266,7 +266,7 @@ pub enum SenderMsg {
         #[serde(with = "crate::observation_wire::shared")]
         tar_entry: Arc<ObservedEntry>,
         #[serde(with = "crate::observation_wire::batch")]
-        manifest_entries: Vec<Arc<ObservedEntry>>,
+        manifest_entries: Arc<[Arc<ObservedEntry>]>,
     },
 
     // ── ACL 跨进程传输 ──
@@ -357,7 +357,7 @@ pub enum ReceiverMsg {
         #[serde(with = "crate::observation_wire::shared")]
         tar_entry: Arc<ObservedEntry>,
         #[serde(with = "crate::observation_wire::batch")]
-        manifest_entries: Vec<Arc<ObservedEntry>>,
+        manifest_entries: Arc<[Arc<ObservedEntry>]>,
     },
 
     /// 对已广告的观察完成分类，不重复发送其快照。
@@ -705,7 +705,7 @@ pub enum DiskCommitMsg {
     /// tar 打包结果
     TarPacked {
         tar_entry: Arc<ObservedEntry>,
-        manifest_entries: Vec<Arc<ObservedEntry>>,
+        manifest_entries: Arc<[Arc<ObservedEntry>]>,
     },
 
     // ── 控制 ──

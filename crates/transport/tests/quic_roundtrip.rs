@@ -17,6 +17,8 @@ use task_model::ObservedEntryExt;
 use task_model::TransferMode;
 use transport::chunk::DataChunk;
 
+use bincode::config::standard;
+use bincode::serde::{decode_from_slice, encode_to_vec};
 use bytes::Bytes;
 use data_mover::model::ObservedEntry;
 use tokio::sync::oneshot;
@@ -1168,4 +1170,50 @@ fn selected_observation_wire_keeps_one_version_and_shares_the_original_history()
     );
     assert!(Arc::ptr_eq(&item.entry, &original));
     assert_eq!(original.history().unwrap().records().len(), 1000);
+}
+
+#[test]
+fn tar_manifest_roundtrip_preserves_shared_native_facts_in_both_directions() {
+    let entries: Arc<[Arc<ObservedEntry>]> = vec![
+        dummy_file_entry("tree/file"),
+        Arc::new(observed_fixtures::directory_marker(
+            "tree",
+            vec![("tag".into(), "kept".into())],
+        )),
+    ]
+    .into();
+    let message = SenderMsg::TarPacked {
+        tar_entry: dummy_file_entry("tree.tar"),
+        manifest_entries: Arc::clone(&entries),
+    };
+    let bytes = encode_to_vec(&message, standard()).unwrap();
+    let (decoded, used): (SenderMsg, _) = decode_from_slice(&bytes, standard()).unwrap();
+    assert_eq!(used, bytes.len());
+    let SenderMsg::TarPacked {
+        tar_entry,
+        manifest_entries,
+    } = decoded
+    else {
+        panic!("wrong sender message");
+    };
+    let bytes = encode_to_vec(
+        &ReceiverMsg::TarSuccess {
+            tar_entry,
+            manifest_entries,
+        },
+        standard(),
+    )
+    .unwrap();
+    let (decoded, used): (ReceiverMsg, _) = decode_from_slice(&bytes, standard()).unwrap();
+    assert_eq!(used, bytes.len());
+    let ReceiverMsg::TarSuccess { manifest_entries, .. } = decoded else {
+        panic!("wrong receiver message");
+    };
+    assert_eq!(manifest_entries.len(), entries.len());
+    for (actual, expected) in manifest_entries.iter().zip(entries.iter()) {
+        assert_eq!(
+            actual.try_encode_snapshot().unwrap().as_bytes(),
+            expected.try_encode_snapshot().unwrap().as_bytes()
+        );
+    }
 }

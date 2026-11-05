@@ -127,7 +127,7 @@ pub enum StorageEntryMessage {
         /// `.tar` 文件的 `relative_path`
         tar_path: String,
         /// tar 内包含的所有条目
-        entries: Vec<Arc<ObservedEntry>>,
+        entries: Arc<[Arc<ObservedEntry>]>,
     },
     /// 扫描/同步过程中遇到的 per-entry 错误
     Error {

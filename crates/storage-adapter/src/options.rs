@@ -55,12 +55,6 @@ pub struct CopyOptions {
     pub cancel: Option<CancellationToken>,
 }
 
-#[derive(Clone, Default)]
-pub struct TarPackOptions {
-    pub qos: Option<QosManager>,
-    pub bytes_counter: Option<Arc<AtomicU64>>,
-}
-
 /// 后端专属的创建配置。
 ///
 /// 仅当后端有不属于存储地址或公共创建选项的显式配置时，才增加对应变体。

@@ -51,7 +51,7 @@ pub mod batch {
         }
         sequence.end()
     }
-    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Vec<Arc<ObservedEntry>>, D::Error> {
+    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Arc<[Arc<ObservedEntry>]>, D::Error> {
         Vec::<(String, String, Vec<u8>)>::deserialize(deserializer)?
             .into_iter()
             .map(|wire| decode(wire).map(Arc::new))

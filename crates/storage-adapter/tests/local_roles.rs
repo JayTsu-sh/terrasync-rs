@@ -11,8 +11,8 @@ use tokio::fs::{create_dir_all, write};
 use tokio_util::sync::CancellationToken;
 use {
     storage_adapter::{
-        CopyOptions, CreateStorageOptions, ResumableScanItem, ScanSourceMode, StorageContext, TarPackOptions,
-        WalkOptions, create_storage,
+        CopyOptions, CreateStorageOptions, ResumableScanItem, ScanSourceMode, StorageContext, WalkOptions,
+        create_storage,
     },
     task_model::StorageEntryMessage,
 };
@@ -238,31 +238,6 @@ async fn short_stream_cannot_replace_an_existing_destination() -> TestResult {
     );
     assert_eq!(tokio::fs::read(destination.path().join("payload")).await?, b"old");
     handle.discard().await?;
-    Ok(())
-}
-#[tokio::test]
-async fn tar_uses_checked_pax_size_and_bounded_source_reads() -> TestResult {
-    let source = TempDir::new()?;
-    let destination = TempDir::new()?;
-    let name = format!("{}.bin", "long".repeat(35));
-    tokio::fs::write(source.path().join(&name), b"archive").await?;
-    let src = local(source.path()).await?;
-    let dst = local(destination.path()).await?;
-    let entry = Arc::new(src.get_metadata(Path::new(&name)).await?);
-    let size = StorageContext::pack_files_to_tar(
-        &src,
-        &dst,
-        &[entry],
-        Path::new("packed.tar"),
-        0,
-        TarPackOptions::default(),
-    )
-    .await?;
-    let archive = tokio::fs::read(destination.path().join("packed.tar")).await?;
-    assert_eq!(size, archive.len() as u64);
-    assert!(size > 2048);
-    assert!(archive.windows(name.len()).any(|window| window == name.as_bytes()));
-    assert!(archive.windows(7).any(|window| window == b"archive"));
     Ok(())
 }
 #[tokio::test]

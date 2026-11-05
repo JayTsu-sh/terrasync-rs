@@ -26,7 +26,8 @@ use tokio_util::sync::CancellationToken;
 
 type Input = Pin<Box<dyn Stream<Item = StreamChunk> + Send>>;
 
-pub(crate) fn source_qos(qos: &QosManager, maximum: u64) -> Result<SourceQosGroup> {
+/// 按共享产品配置获取同一原生读取预算，所有文件与归档复用该配置的预算。
+pub fn source_qos(qos: &QosManager, maximum: u64) -> Result<SourceQosGroup> {
     type Groups = Cache<usize, (Weak<QosConfig>, SourceQosGroup)>;
     static GROUPS: OnceLock<Groups> = OnceLock::new();
     let config = qos.config();

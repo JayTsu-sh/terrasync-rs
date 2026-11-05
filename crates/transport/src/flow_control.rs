@@ -356,7 +356,7 @@ mod tests {
     fn credit_cost_counts_tar_packed_by_entry_size() {
         let message = SenderMsg::TarPacked {
             tar_entry: dummy_entry_with_size(12345),
-            manifest_entries: vec![],
+            manifest_entries: vec![].into(),
         };
         assert_eq!(credit_cost(&message), Some(12345));
     }

@@ -2,7 +2,6 @@
 //! 所有后端 IO、复制、恢复与原子发布由 data-mover 执行。
 use data_mover::model::BackendKind;
 use task_model::{ErrorEvent, ObservedEntryExt, StorageEntryMessage, TransferMode};
-mod archive;
 mod connected;
 mod copied_metadata;
 pub use data_mover::model::ObservedEntry;
