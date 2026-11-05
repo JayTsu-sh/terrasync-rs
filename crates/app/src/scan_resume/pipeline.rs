@@ -14,8 +14,8 @@ use data_mover::{
     traversal::{TraversalOrder, TraversalOutcome},
 };
 use db::{
-    clickhouse::scan_resume::{FINALIZING, ScanResumeState},
-    scan_store::ScanStore,
+    scan::ScanStore,
+    scan::{FINALIZING, ScanResumeState},
 };
 use std::{
     sync::Arc,

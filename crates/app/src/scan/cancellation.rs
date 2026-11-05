@@ -3,7 +3,7 @@ use crate::error::{AppError, Result};
 use data_mover::traversal::ScanFailureSignal;
 use db::{
     DatabaseError,
-    scan_store::{ScanDatabaseExecution, ScanQueryCancellation, with_scan_cancellation},
+    scan::{ScanDatabaseExecution, ScanQueryCancellation, with_scan_cancellation},
 };
 use std::result::Result as OperationResult;
 use std::{
@@ -202,7 +202,7 @@ fn fold_database_failure<T>(
 mod tests {
     use super::*;
     use clickhouse::{Client, error::Error as ClickHouseError};
-    use db::{ClickHouseConfig, DatabaseError, scan_store::ScanStore};
+    use db::{ClickHouseConfig, DatabaseError, scan::ScanStore};
     use std::io::{Error as IoError, ErrorKind};
     use std::sync::{
         Arc,

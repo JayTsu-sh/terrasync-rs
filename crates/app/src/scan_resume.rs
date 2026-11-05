@@ -14,9 +14,9 @@ use crate::scan::{
 };
 use data_mover::model::ObservedEntry;
 use data_mover::traversal::{Resumable, TraversalOrder};
-use db::clickhouse::scan_resume::{COMPLETED, FINALIZING, RUNNING, ScanResumeState};
-use db::clickhouse::scan_resume_statistics::ScanResumeStatistics;
-use db::scan_store::{ScanFinalEvent, ScanStore};
+use db::scan::ScanResumeStatistics;
+use db::scan::{COMPLETED, FINALIZING, RUNNING, ScanResumeState};
+use db::scan::{ScanFinalEvent, ScanStore};
 use storage_adapter::filter::parse_filter_expression;
 use storage_adapter::{ErrorEvent, ScanSourceMode, StorageEntryMessage, StorageEnum, WalkOptions, canonicalize_path};
 use tokio::{join, select, task::spawn_blocking};

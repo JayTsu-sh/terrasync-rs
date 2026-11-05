@@ -58,7 +58,7 @@ CLI 和 GUI 调用同一 `scan(ScanRequest)`。启用 ClickHouse 时首次全量
 
 `scan::progress` 只保存完成前缀和活跃目录的实际贡献：Blocks 至多一个活跃目录，Unordered 受 SDK 的并发窗口约束。没有逐条或逐目录历史账本，也不使用 SQLite、本地文件或其它本地磁盘暂存。完整统计及游标由 ClickHouse manifest 持久化。目录剪枝不补扫，不计入 scanned/filtered/retained。
 
-数据库层 `scan_store::cuts` 管理不可变的 base/events 成对快照。开轮前先保留原基线；writer 屏障确认后封存新 cut，最后保存引用该 cut 的统计与源游标。恢复先排空旧执行的服务端查询、DDL/mutation，再读取 manifest、同步两份快照并重建 working。单机使用作业表；集群仅处理当前 job 的分区，快照使用独立 Keeper 路径，Distributed 前端仍按 job 路由。两表恢复期间禁止公开元数据访问，任一步崩溃均从同一 cut 重试；空快照可清除尾部，缺失快照明确拒绝恢复。最终化先持久化 sealed cut，再提交 generation；重启先判定提交结果，不撤回已经发布的结果。只有新 manifest 确认后才清理未引用快照。
+数据库层 `scan::checkpoint` 管理不可变的 base/events 成对快照。开轮前先保留原基线；writer 屏障确认后封存新 cut，最后保存引用该 cut 的统计与源游标。恢复先排空旧执行的服务端查询、DDL/mutation，再读取 manifest、同步两份快照并重建 working。单机使用作业表；集群仅处理当前 job 的分区，快照使用独立 Keeper 路径，Distributed 前端仍按 job 路由。两表恢复期间禁止公开元数据访问，任一步崩溃均从同一 cut 重试；空快照可清除尾部，缺失快照明确拒绝恢复。最终化先持久化 sealed cut，再提交 generation；重启先判定提交结果，不撤回已经发布的结果。只有新 manifest 确认后才清理未引用快照。
 
 全量扫描的最终统计只读，复用源末 FINALIZING 已确认的 cut，仅更新统计 manifest；恢复 FINALIZING 也不重新枚举源。增量最终化会写事件、删除旧事实，须封存最终化后的新 cut。是否需要新快照取决于事实是否变化，不因统计报告更新而重复克隆相同元数据。
 

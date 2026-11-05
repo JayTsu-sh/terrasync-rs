@@ -17,9 +17,9 @@ mod clickhouse_integration_tests {
     use data_mover::model::{
         BackendIdentity, BackendKind, EntryKind, IdentityStrength, ObservedEntry, SourceIdentity, StoragePath,
     };
-    use db::clickhouse::ClickHouseDatabase;
-    use db::clickhouse::scan_resume::ScanResumeState;
-    use db::scan_store::{ScanFinalEvent, ScanStore};
+    use db::catalogue::ClickHouseDatabase;
+    use db::scan::ScanResumeState;
+    use db::scan::{ScanFinalEvent, ScanStore};
     use db::{ClickHouseConfig, Database, DatabaseError, DeletionStatus, ObservedEntryRecord};
     use storage_adapter::observed_scan::{ObservedItem, ObservedScanEvent};
     use storage_adapter::{EntryEnum, NASEntry, S3Entry};
@@ -200,7 +200,7 @@ mod clickhouse_integration_tests {
     #[tokio::test]
     #[ignore = "requires a real ClickHouse service"]
     async fn scan_resume_persists_cursor_generation_and_idempotent_events() {
-        use db::clickhouse::scan_resume::{ABANDONED, FINALIZING, RUNNING, ScanResumeState};
+        use db::scan::{ABANDONED, FINALIZING, RUNNING, ScanResumeState};
         use storage_adapter::StorageEntryMessage;
         let (database, config, job, cleanup) = setup_isolated_state_db("resume_state").await;
         database.initialize().await.unwrap();

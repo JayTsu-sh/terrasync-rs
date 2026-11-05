@@ -6,8 +6,8 @@ use data_mover::model::{
 };
 use db::{
     ClickHouseConfig, DatabaseConfig, DatabaseFactory, Result,
-    clickhouse::scan_resume::{RUNNING, ScanResumeState},
-    scan_store::ScanStore,
+    scan::ScanStore,
+    scan::{RUNNING, ScanResumeState},
 };
 use std::{
     sync::Arc,

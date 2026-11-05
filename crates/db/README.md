@@ -2,7 +2,7 @@
 
 本 crate 负责扫描与复制／同步目录的持久化，仅支持 ClickHouse。
 
-- 扫描入口为 `scan_store::ScanStore`，内部封装单机与集群部署差异。
+- 扫描入口为 `scan::ScanStore`，内部封装单机与集群部署差异。
 - 复制／同步目录通过 `DatabaseFactory::new_database` 创建，构造时检查未完成扫描，避免读取未发布的 working 数据。
 - 单机扫描按作业建表；集群扫描使用按 `job_id` 隔离的共享表。
 - 集群复制／同步目录使用独立的作业目录布局，不能与集群扫描共享表混用。

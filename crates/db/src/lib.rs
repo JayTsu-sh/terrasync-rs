@@ -14,15 +14,15 @@ use uuid::Uuid;
 
 // 内部模块
 // 公共模块导出
-pub mod clickhouse; // ClickHouse数据库实现
-mod cluster_scan;
+pub mod catalogue; // ClickHouse数据库实现
 pub mod common; // Common types and utilities
 pub mod config; // 数据库配置定义
 pub mod error; // 错误处理
+mod execution;
 pub mod factory; // 数据库工厂，用于创建不同类型的数据库实例
-mod http_transport;
 pub mod observation_record;
-pub mod scan_store;
+pub mod scan;
+mod schema;
 pub mod traits; // 数据库接口定义
 
 // 共享的表名常量
@@ -38,7 +38,7 @@ pub const SCAN_STATE_TABLE_BASE_NAME: &str = "state";
 pub const TAR_MANIFEST_TABLE_BASE_NAME: &str = "tar_manifest";
 
 // 类型重导出，方便外部使用
-pub use clickhouse::ClickHouseDatabase; // ClickHouse数据库具体实现
+pub use catalogue::ClickHouseDatabase; // ClickHouse数据库具体实现
 pub use common::DeletionStatus; // Common deletion status enum
 pub use config::{ClickHouseConfig, DatabaseConfig, DatabaseType}; // 配置相关类型
 pub use error::{DatabaseError, Result}; // 错误处理相关类型
@@ -120,8 +120,3 @@ pub(crate) fn generate_scan_temp_table_name() -> String {
     let uuid = Uuid::new_v4().to_string().replace('-', "_");
     format!("{SCAN_TEMP_TABLE_BASE_NAME}_{uuid}")
 }
-
-mod native_scan_record;
-mod scan_metadata;
-
-mod native_scan;

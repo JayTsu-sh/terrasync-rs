@@ -38,8 +38,8 @@ use crate::consumer::traits::Consumer;
 use crate::error::{AppError, Result};
 use crate::scan::statistics::{ScanCapabilities, ScanCounts, ScanSnapshot};
 use data_mover::traversal::TraversalRecoveryStatus;
-use db::clickhouse::scan_resume_statistics::ScanResumeStatistics;
-use db::scan_store::ScanFinalEvent;
+use db::scan::ScanFinalEvent;
+use db::scan::ScanResumeStatistics;
 
 /// 消费者管理器 - 负责创建、启动和管理多个消费者实例
 pub struct ConsumerManager {
@@ -625,7 +625,7 @@ impl Drop for ConsumerManager {
 mod resume_tests {
     use super::*;
     use crate::consumer::stats::ProgressDetail;
-    use db::clickhouse::scan_resume_statistics::{ScanEventSummary, ScanResumeSummary};
+    use db::scan::{ScanEventSummary, ScanResumeSummary};
     use db::traits::StorageEntryRecord;
 
     #[tokio::test]

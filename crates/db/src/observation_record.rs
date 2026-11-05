@@ -93,7 +93,7 @@ mod tests {
     };
 
     use super::{OBSERVATION_IDENTITY_JOIN_CLAUSE, ObservedEntryRecord};
-    use crate::clickhouse::FILE_SCAN_COLUMNS_DEFINITION;
+    use crate::catalogue::FILE_SCAN_COLUMNS_DEFINITION;
 
     fn observed(path: &str, stable_id: &[u8]) -> ObservedEntry {
         let backend = BackendIdentity::new(BackendKind::Local, "fixture").unwrap();

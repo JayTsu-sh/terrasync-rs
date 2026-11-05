@@ -3,10 +3,10 @@
 use tracing::error;
 
 // 内部模块
-use crate::clickhouse::ClickHouseDatabase;
+use crate::catalogue::ClickHouseDatabase;
 use crate::config::DatabaseConfig;
 use crate::error::{DatabaseError, Result};
-use crate::scan_store::ScanStore;
+use crate::scan::ScanStore;
 use crate::traits::Database;
 
 /// ClickHouse 目录连接的创建入口。

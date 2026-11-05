@@ -9,7 +9,7 @@ use crate::{
     error::{AppError, Result},
 };
 use data_mover::model::ObservedEntry;
-use db::{clickhouse::scan_resume::ScanResumeState, scan_store::ScanStore};
+use db::{scan::ScanResumeState, scan::ScanStore};
 use rustc_hash::FxHasher;
 use std::{hash::Hasher, sync::Arc};
 use storage_adapter::observed_scan::ObservedView;

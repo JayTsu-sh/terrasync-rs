@@ -1,7 +1,7 @@
 use super::*;
 use crate::storage_factory::{StorageRole, create_storage_for_role};
 use clickhouse::Client;
-use db::clickhouse::ClickHouseDatabase;
+use db::catalogue::ClickHouseDatabase;
 use db::{ClickHouseConfig, CopyGenerationStatus, DatabaseError};
 use std::future::pending;
 use std::path::Path;
