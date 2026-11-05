@@ -45,7 +45,10 @@ use utils::sanitize_job_id;
 
 #[cfg(test)]
 mod catalogue_tests;
+mod comparison;
 mod connection;
+pub(crate) use comparison::compare_catalogue_batch;
+pub use comparison::{CatalogueChange, CatalogueDifference, ComparisonMode};
 mod copy_generation;
 mod layout;
 use crate::execution::read::QuorumRead;
@@ -271,12 +274,12 @@ impl JoinStrategy {
         let data_unchanged = "(t.size = f.size AND t.mtime = f.mtime)";
         // mode/uid/gid 在 S3 等协议中为 Nullable 且常常为 NULL；ClickHouse 三值逻辑下
         // `NULL = NULL` 返回 NULL（WHERE 视为 false），会让所有 ChangeKind 都不匹配。
-        // 改用显式 NULL-safe 等价：`a = b OR (a IS NULL AND b IS NULL)`。
+        // 比较结果为 NULL 时，只有两侧均 NULL 才相等；单侧未知不能掩盖真实变更。
         // 此形式不依赖任何 sentinel，不会把真实值（如 mode=0）误等同于 NULL，
         // 也不依赖"两侧来自同一后端"这种隐含不变量。
-        let mode_eq = "(t.mode = f.mode OR (t.mode IS NULL AND f.mode IS NULL))";
-        let uid_eq = "(t.uid = f.uid OR (t.uid IS NULL AND f.uid IS NULL))";
-        let gid_eq = "(t.gid = f.gid OR (t.gid IS NULL AND f.gid IS NULL))";
+        let mode_eq = "ifNull(t.mode = f.mode, (t.mode IS NULL AND f.mode IS NULL))";
+        let uid_eq = "ifNull(t.uid = f.uid, (t.uid IS NULL AND f.uid IS NULL))";
+        let gid_eq = "ifNull(t.gid = f.gid, (t.gid IS NULL AND f.gid IS NULL))";
         let meta_changed = format!("(NOT {mode_eq} OR NOT {uid_eq} OR NOT {gid_eq})");
         let meta_unchanged = format!("({mode_eq} AND {uid_eq} AND {gid_eq})");
 
@@ -1228,6 +1231,10 @@ impl Database for ClickHouseDatabase {
         Ok(())
     }
 
+    async fn classify_catalogue_items(&self) -> Result<Vec<CatalogueDifference>> {
+        self.classify_batch().await
+    }
+
     /// 检测临时表中新增的文件（不存在于主表）
     async fn detect_new_items(&self) -> Result<Box<dyn Iterator<Item = ObservedEntry> + Send>> {
         if self.is_copy_recovery().await {
@@ -1796,7 +1803,7 @@ mod tests {
         assert!(sql.contains("t.size = f.size AND t.mtime = f.mtime"));
         assert_null_safe_meta_clauses(&sql);
         // 必须出现取反形式
-        assert!(sql.contains("NOT (t.mode = f.mode"));
+        assert!(sql.contains("NOT ifNull(t.mode = f.mode"));
     }
 
     #[test]
@@ -1805,7 +1812,7 @@ mod tests {
         // Both 条件：内容和属性都变了
         assert!(sql.contains("t.size != f.size OR t.mtime != f.mtime"));
         assert_null_safe_meta_clauses(&sql);
-        assert!(sql.contains("NOT (t.mode = f.mode"));
+        assert!(sql.contains("NOT ifNull(t.mode = f.mode"));
     }
 
     #[test]
@@ -1824,7 +1831,7 @@ mod tests {
         let sql = JoinStrategy::FileHandle.build_detect_changed_sql("temp_x", "base_y", ChangeKind::MetadataOnly);
         assert!(sql.contains("t.size = f.size AND t.mtime = f.mtime"));
         assert_null_safe_meta_clauses(&sql);
-        assert!(sql.contains("NOT (t.uid = f.uid"));
+        assert!(sql.contains("NOT ifNull(t.uid = f.uid"));
     }
 
     #[test]
@@ -1832,7 +1839,7 @@ mod tests {
         let sql = JoinStrategy::FileHandle.build_detect_changed_sql("temp_x", "base_y", ChangeKind::Both);
         assert!(sql.contains("t.size != f.size OR t.mtime != f.mtime"));
         assert_null_safe_meta_clauses(&sql);
-        assert!(sql.contains("NOT (t.gid = f.gid"));
+        assert!(sql.contains("NOT ifNull(t.gid = f.gid"));
     }
 
     #[test]

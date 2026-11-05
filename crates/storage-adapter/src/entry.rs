@@ -128,6 +128,21 @@ impl std::fmt::Display for ChangeKind {
     }
 }
 
+/// 数据库分类与复制完成共用的变更语义；条目和版本选择由 ObservedItem 携带。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EntryChange {
+    New,
+    Changed(ChangeKind),
+}
+impl EntryChange {
+    pub fn message(self, item: ObservedItem) -> StorageEntryMessage {
+        match self {
+            Self::New => StorageEntryMessage::New(item),
+            Self::Changed(kind) => StorageEntryMessage::Changed { entry: item, kind },
+        }
+    }
+}
+
 /// 文件操作消息枚举，用于在扫描/同步过程中传递文件状态变化
 #[derive(Debug, Clone)]
 pub enum StorageEntryMessage {
@@ -136,10 +151,7 @@ pub enum StorageEntryMessage {
     /// 新增文件
     New(ObservedItem),
     /// 文件已变更（kind 区分 data/metadata/both）
-    Changed {
-        entry: Arc<ObservedEntry>,
-        kind: ChangeKind,
-    },
+    Changed { entry: ObservedItem, kind: ChangeKind },
     /// 文件已删除
     Deleted(Arc<ObservedEntry>),
     /// 文件被重命名，(from, to)

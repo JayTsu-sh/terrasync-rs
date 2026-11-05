@@ -221,7 +221,7 @@ async fn cluster_catalogue_copy_sync_and_delete_are_job_isolated() -> Result<()>
     a.batch_insert_incremental_record(&[
         StorageEntryMessage::New(next[2].clone().into()),
         StorageEntryMessage::Changed {
-            entry: next[1].clone(),
+            entry: next[1].clone().into(),
             kind: ChangeKind::DataOnly,
         },
         StorageEntryMessage::Renamed((original[1].clone(), next[0].clone())),
@@ -634,5 +634,156 @@ async fn catalogue_stream_does_not_hide_a_terminal_query_error() -> Result<()> {
         .unwrap()
         .is_err()
     );
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires an explicitly selected six-replica ClickHouse cluster; isolated database and local fixture only"]
+async fn copy_comparison_binds_new_and_changed_versions_in_source_order() -> Result<()> {
+    use data_mover::model::{HistoryOrder, ObjectHistory};
+    use storage_adapter::EntryChange;
+    let fixture = Fixture::new().await?;
+    let observe = |id: Option<&str>, size, latest| {
+        crate::observed_fixtures::observation(
+            BackendKind::S3,
+            "object".into(),
+            EntryKind::File,
+            size,
+            [1_000_000_000; 3],
+            None,
+            None,
+            None,
+            Some((id.map(str::to_string), latest, false)),
+        )
+    };
+    let mut database = ClickHouseDatabase::new(&fixture.config, "mixed_history")?;
+    database.initialize().await?;
+    database.begin_copy_generation("mixed-history").await?;
+    database
+        .batch_insert_base_record(&[Arc::new(observe(None, 10, true))])
+        .await?;
+    database.commit_scan_generation().await?;
+    database.begin_copy_generation("mixed-history").await?;
+    // suspended bucket 的 null 被覆盖，随后恢复版本化并写入新版本。
+    let null = observe(None, 20, false);
+    let latest = observe(Some("a-new"), 30, true);
+    let history = ObjectHistory::whole(
+        vec![
+            null.history().unwrap().records()[0].clone(),
+            latest.history().unwrap().records()[0].clone(),
+        ],
+        HistoryOrder::Server,
+    )?;
+    let source = Arc::new(latest.with_history(Some(Box::new(history)))?);
+    let changes = database
+        .compare_catalogue_batch(&[Arc::clone(&source)], ComparisonMode::AwaitCopyAcknowledgement)
+        .await?;
+    assert_eq!(
+        changes.iter().map(|change| change.kind).collect::<Vec<_>>(),
+        [EntryChange::Changed(ChangeKind::DataOnly), EntryChange::New]
+    );
+    assert_eq!(
+        changes
+            .iter()
+            .map(|change| change.item.view().version_id())
+            .collect::<Vec<_>>(),
+        ["null", "a-new"]
+    );
+    assert_eq!(
+        changes
+            .iter()
+            .map(|change| change.item.version_index)
+            .collect::<Vec<_>>(),
+        [Some(0), Some(1)]
+    );
+    assert!(changes.iter().all(|change| Arc::ptr_eq(&change.item.entry, &source)));
+    let baseline = fixture.rows("mixed_history").await?;
+    assert_eq!(baseline.len(), 1);
+    assert_eq!(baseline[0].size, 10, "分类不能提前确认尚未复制的版本");
+    database
+        .batch_insert_completed_records(&changes.into_iter().map(|change| change.item).collect::<Vec<_>>())
+        .await?;
+    assert_eq!(database.detect_deleted_items().await?.count(), 0);
+    database.commit_scan_generation().await?;
+    let rows = fixture.rows("mixed_history").await?;
+    assert_eq!(
+        rows.iter()
+            .map(|row| (row.version_id.as_str(), row.size))
+            .collect::<Vec<_>>(),
+        [("a-new", 30), ("null", 20)]
+    );
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires an explicitly selected six-replica ClickHouse cluster; isolated database and local fixture only"]
+async fn copy_comparison_distinguishes_unmapped_principals_from_numeric_zero() -> Result<()> {
+    use data_mover::model::{PermissionFacts, PrincipalIdentity};
+    use storage_adapter::EntryChange;
+    let fixture = Fixture::new().await?;
+    let observe = |uid: Option<u32>| -> Result<Arc<ObservedEntry>> {
+        let entry = crate::observed_fixtures::observation(
+            BackendKind::Nfs,
+            "file".into(),
+            EntryKind::File,
+            10,
+            [1_000_000_000; 3],
+            None,
+            Some(b"stable-handle".to_vec()),
+            None,
+            None,
+        )
+        .with_permissions(Some(Box::new(PermissionFacts {
+            owner: uid.map(PrincipalIdentity::Numeric),
+            group: None,
+            mode: Some(0o640),
+        })))?;
+        Ok(Arc::new(entry))
+    };
+    let mut database = ClickHouseDatabase::new(&fixture.config, "nullable_principals")?;
+    database.initialize().await?;
+    database.begin_scan_generation().await?;
+    database.batch_insert_base_record(&[observe(None)?]).await?;
+    database.commit_scan_generation().await?;
+    for uid in [Some(0), None] {
+        database.begin_scan_generation().await?;
+        let source = observe(uid)?;
+        let changes = database
+            .compare_catalogue_batch(&[Arc::clone(&source)], ComparisonMode::AwaitCopyAcknowledgement)
+            .await?;
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].kind, EntryChange::Changed(ChangeKind::MetadataOnly));
+        assert!(Arc::ptr_eq(&changes[0].item.entry, &source));
+        database
+            .batch_insert_completed_records(&[changes.into_iter().next().unwrap().item])
+            .await?;
+        database.commit_scan_generation().await?;
+        assert_eq!(fixture.rows("nullable_principals").await?[0].uid, uid);
+    }
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires an explicitly selected six-replica ClickHouse cluster; isolated database and local fixture only"]
+async fn copy_comparison_deduplicates_repeated_identical_observations() -> Result<()> {
+    let fixture = Fixture::new().await?;
+    let mut database = ClickHouseDatabase::new(&fixture.config, "duplicate_source")?;
+    database.initialize().await?;
+    database.begin_scan_generation().await?;
+    let source = fixture.entry("same", 10, "aa");
+    let changes = database
+        .compare_catalogue_batch(
+            &[Arc::clone(&source), Arc::clone(&source)],
+            ComparisonMode::AwaitCopyAcknowledgement,
+        )
+        .await?;
+    assert_eq!(changes.len(), 1);
+    assert!(Arc::ptr_eq(&changes[0].item.entry, &source));
+    assert_eq!(fixture.rows("duplicate_source").await?.len(), 0);
+    database
+        .batch_insert_completed_records(&[changes.into_iter().next().unwrap().item])
+        .await?;
+    database.commit_scan_generation().await?;
+    assert_eq!(fixture.rows("duplicate_source").await?.len(), 1);
     Ok(())
 }

@@ -2244,7 +2244,7 @@ mod tests {
             let mut c = stats_consumer.lock().await;
             c.update_statistics(&StorageEntryMessage::New(dummy_entry("a.txt", false, 10).into()));
             c.update_statistics(&StorageEntryMessage::Changed {
-                entry: dummy_entry("b.txt", false, 20),
+                entry: dummy_entry("b.txt", false, 20).into(),
                 kind: ChangeKind::DataOnly,
             });
         }

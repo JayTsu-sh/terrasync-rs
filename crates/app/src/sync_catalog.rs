@@ -1,12 +1,8 @@
 //! 复制／同步的目录元数据比对，不承载扫描轮次或扫描取消策略。
-use crate::{
-    broadcast::BroadcastForwarder,
-    error::{AppError, Result},
-    scan::ScanType,
-};
+use crate::{broadcast::BroadcastForwarder, error::Result, scan::ScanType};
+use db::catalogue::ComparisonMode;
 use db::traits::Database;
 use std::sync::Arc;
-use storage_adapter::ObservedEntryExt;
 use storage_adapter::{ObservedEntry, StorageEntryMessage};
 use tokio::task::JoinHandle;
 use tracing::{error, trace, warn};
@@ -38,36 +34,15 @@ pub(crate) async fn batch_processing_to_generate_message(
     database: &Box<dyn Database>, batch: &[Arc<ObservedEntry>], broadcaster: BroadcastForwarder<StorageEntryMessage>,
     is_final_batch: bool, keep_item: bool,
 ) -> Result<()> {
-    // 由于database是不可变引用，但我们需要可变引用，这里进行clone
-    let mut db_mut = database.clone();
-
-    batch_insert_temp_record(0, &mut db_mut, batch, is_final_batch).await?;
-
-    // 使用现有的generate_storage_entry_message_events辅助函数生成事件
-    let generation_result =
-        generate_storage_entry_message_events(0, &mut db_mut, broadcaster, is_final_batch, keep_item).await;
-
-    // 清理临时表
-    trace!("Dropping temporary table for batch processing");
-    let cleanup_result = db_mut.drop_scan_temporary_table().await;
-
-    generation_result?;
-    cleanup_result.map_err(AppError::DatabaseError)?;
-
-    Ok(())
-}
-
-/// 处理批次数据的辅助函数: 创建临时表，插入当前批次的数据到临时表里
-async fn batch_insert_temp_record(
-    task_id: usize, database: &mut Box<dyn Database>, batch: &[Arc<ObservedEntry>], is_final_batch: bool,
-) -> Result<()> {
-    trace!(task_id, is_final_batch, "Preparing catalogue comparison batch");
-    database.create_scan_temporary_table().await?;
-    if let Err(source) = database.batch_insert_temp_record(batch).await {
-        if let Err(cleanup) = database.drop_scan_temporary_table().await {
-            warn!(%cleanup, "Failed to clean up incomplete catalogue batch");
-        }
-        return Err(source.into());
+    trace!(is_final_batch, "Comparing catalogue batch");
+    let mode = if keep_item {
+        ComparisonMode::PublishObserved
+    } else {
+        ComparisonMode::AwaitCopyAcknowledgement
+    };
+    let changes = database.compare_catalogue_batch(batch, mode).await?;
+    for change in changes {
+        broadcaster.broadcast(change.kind.message(change.item)).await;
     }
     Ok(())
 }
@@ -89,70 +64,6 @@ pub(crate) async fn finish_phase(tasks: Vec<JoinHandle<Result<()>>>) -> Result<(
         Some(error) => Err(error),
         None => Ok(()),
     }
-}
-
-/// 处理查询结果的辅助函数
-async fn generate_storage_entry_message_events(
-    task_id: usize, database: &mut Box<dyn Database>, broadcaster: BroadcastForwarder<StorageEntryMessage>,
-    is_final_batch: bool, keep_item: bool,
-) -> Result<()> {
-    // 根据是否是最后一批数据，设置不同的日志消息
-    let batch_type = if is_final_batch { "final batch" } else { "batch" };
-
-    let mut excluded_paths: Vec<(String, String)> = Vec::new();
-
-    // 查询新增文件
-    trace!("Task {} querying new items for {}", task_id, batch_type);
-    let new_items = database.detect_new_items().await.map_err(AppError::DatabaseError)?;
-    let items: Vec<ObservedEntry> = new_items.collect();
-    if !keep_item {
-        for item in &items {
-            excluded_paths.push((
-                item.get_relative_path().to_string_lossy().into_owned(),
-                item.get_version_id().unwrap_or_default().to_string(),
-            ));
-        }
-    }
-    for item in items {
-        broadcaster
-            .broadcast(StorageEntryMessage::New(Arc::new(item).into()))
-            .await;
-    }
-
-    // 查询修改文件（区分 Data/Metadata/Both 三种变更）
-    trace!("Task {} querying changed items for {}", task_id, batch_type);
-    let changed_items = database.detect_changed_items().await.map_err(AppError::DatabaseError)?;
-    let items: Vec<(ObservedEntry, storage_adapter::ChangeKind)> = changed_items.collect();
-    if !keep_item {
-        for (item, _) in &items {
-            excluded_paths.push((
-                item.get_relative_path().to_string_lossy().into_owned(),
-                item.get_version_id().unwrap_or_default().to_string(),
-            ));
-        }
-    }
-    for (item, kind) in items {
-        broadcaster
-            .broadcast(StorageEntryMessage::Changed {
-                entry: Arc::new(item),
-                kind,
-            })
-            .await;
-    }
-
-    // 将临时表数据插入到主表（带排除过滤）
-    trace!(
-        "Task {} inserting temporary table to base table for {} (excluded: {} paths)",
-        task_id,
-        batch_type,
-        excluded_paths.len()
-    );
-    database
-        .insert_temp_to_base_table(&excluded_paths)
-        .await
-        .map_err(AppError::DatabaseError)?;
-
-    Ok(())
 }
 
 #[cfg(test)]
@@ -295,6 +206,12 @@ mod tests {
             Ok(())
         }
 
+        async fn classify_catalogue_items(&self) -> DatabaseResult<Vec<db::catalogue::CatalogueDifference>> {
+            self.detect_new_items().await?;
+            self.detect_changed_items().await?;
+            Ok(Vec::new())
+        }
+
         async fn detect_new_items(&self) -> DatabaseResult<Box<dyn Iterator<Item = ObservedEntry> + Send>> {
             self.record("detect_new");
             match self.fault {
@@ -417,7 +334,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn changed_detection_failure_preserves_new_output_and_skips_merge() {
+    async fn changed_detection_failure_emits_no_partial_plan_and_skips_merge() {
         let (database, calls) = fault_database_with_calls(ScanDatabaseFault::DetectChanged);
         let mut broadcaster = BroadcastForwarder::new(8);
         let mut events = broadcaster.subscribe();
@@ -426,7 +343,7 @@ mod tests {
         let event = events.recv().await;
 
         assert!(result.is_err());
-        assert!(matches!(event, Some(StorageEntryMessage::New(_))));
+        assert!(event.is_none());
         assert!(events.recv().await.is_none());
         assert_eq!(
             *calls.lock().unwrap(),

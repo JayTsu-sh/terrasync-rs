@@ -543,11 +543,7 @@ impl IncrementalStats {
                 }
             }
             StorageEntryMessage::New(item) => self.new.add(&item.view()),
-            StorageEntryMessage::Changed { entry, .. } => {
-                for view in ObservedView::all(entry) {
-                    self.changed.add(&view);
-                }
-            }
+            StorageEntryMessage::Changed { entry, .. } => self.changed.add(&entry.view()),
             StorageEntryMessage::Deleted(entry) => {
                 for view in ObservedView::all(entry) {
                     self.deleted.add(&view);

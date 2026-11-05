@@ -296,7 +296,10 @@ impl ProgressBar {
                 self.update_observed(operation, &item.view());
                 return;
             }
-            StorageEntryMessage::Changed { entry, .. } => (entry, "changed"),
+            StorageEntryMessage::Changed { entry, .. } => {
+                self.update_observed("changed", &entry.view());
+                return;
+            }
             StorageEntryMessage::Deleted(entry) => (entry, "deleted"),
             StorageEntryMessage::Renamed((_, entry)) => (entry, "rename"),
             StorageEntryMessage::IntegrityChecked(entry) => match &self.counters {

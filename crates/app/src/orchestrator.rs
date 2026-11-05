@@ -37,7 +37,7 @@ use db::{self, DeletionStatus, INCREMENTAL_SCAN_TABLE_BASE_NAME};
 use storage_adapter::qos::QosManager;
 #[cfg(windows)]
 use storage_adapter::storage_enum::{StorageType, detect_storage_type};
-use storage_adapter::{ChangeKind, ErrorEvent, ObservedEntry, StorageEntryMessage, StorageEnum};
+use storage_adapter::{ChangeKind, EntryChange, ErrorEvent, ObservedEntry, StorageEntryMessage, StorageEnum};
 use tokio::sync::Semaphore;
 use tokio::task::JoinHandle;
 use tracing::{Instrument, error, info, info_span, trace, warn};
@@ -871,7 +871,7 @@ impl SyncOrchestrator {
                             StorageEntryMessage::New(ref entry) => {
                                 if entry.get_version_id().is_some() {
                                     if let Err(error) = process_versioned_entry(
-                                        &entry.entry,
+                                        entry,
                                         src.clone(),
                                         dest.clone(),
                                         bc.clone(),
@@ -881,6 +881,7 @@ impl SyncOrchestrator {
                                         is_source_reserved,
                                         bt.clone(),
                                         resume_opts.clone(),
+                                        EntryChange::New,
                                     )
                                     .await
                                     {
@@ -923,9 +924,24 @@ impl SyncOrchestrator {
                             }
                             StorageEntryMessage::Changed { ref entry, kind } => {
                                 // MetadataOnly：chmod/chown 变更，跳过 copy_file 只同步属性
-                                let result = if kind == ChangeKind::MetadataOnly {
-                                    process_metadata_only_entry(
+                                let result = if entry.entry.history().is_some() {
+                                    process_versioned_entry(
                                         entry,
+                                        src.clone(),
+                                        dest.clone(),
+                                        bc.clone(),
+                                        qos.clone(),
+                                        enable_integrity_check,
+                                        enable_acl,
+                                        is_source_reserved,
+                                        bt.clone(),
+                                        resume_opts.clone(),
+                                        EntryChange::Changed(kind),
+                                    )
+                                    .await
+                                } else if kind == ChangeKind::MetadataOnly {
+                                    process_metadata_only_entry(
+                                        &entry.entry,
                                         src.clone(),
                                         dest.clone(),
                                         enable_acl,
@@ -935,7 +951,7 @@ impl SyncOrchestrator {
                                     .await
                                 } else {
                                     process_entry(
-                                        entry,
+                                        &entry.entry,
                                         src.clone(),
                                         dest.clone(),
                                         enable_integrity_check,
@@ -949,6 +965,7 @@ impl SyncOrchestrator {
                                     .await
                                 };
                                 match result {
+                                    Ok(()) if entry.entry.history().is_some() => {}
                                     Ok(()) => bc.broadcast(message.clone()).await,
                                     Err(e) => {
                                         error!(
@@ -961,7 +978,7 @@ impl SyncOrchestrator {
                                         bc.broadcast(StorageEntryMessage::Error {
                                             event: ErrorEvent::Copy,
                                             path: entry.get_relative_path().to_path_buf(),
-                                            entry: Some(entry.clone()),
+                                            entry: Some(Arc::clone(&entry.entry)),
                                             reason: format!("{e}"),
                                         })
                                         .await;
@@ -1528,7 +1545,7 @@ impl SyncOrchestrator {
                                 }
                                 broadcaster
                                     .broadcast(StorageEntryMessage::Changed {
-                                        entry: to_arc.clone(),
+                                        entry: to_arc.clone().into(),
                                         kind,
                                     })
                                     .await;

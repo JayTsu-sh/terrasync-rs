@@ -19,9 +19,11 @@ use transport::traits::SenderTransport;
 // 内部模块
 use crate::broadcast::BroadcastForwarder;
 use crate::error::{AppError, Result};
+use crate::file_copy::copy_versions;
 use crate::receiver::ReceiverConfig;
-use crate::sync::{ResumeOpts, process_versioned_entry};
 use crate::tar_pack;
+use storage_adapter::observed_scan::ObservedItem;
+use storage_adapter::{CopyOptions, EntryChange};
 
 /// Sender worker 配置
 pub struct SenderWorkerConfig {
@@ -65,21 +67,21 @@ pub async fn sender_worker(
 
                 let result = if entry.history().is_some() {
                     // 同一路径的分段由固定 worker 顺序复制，不经过第二级竞争队列。
-                    process_versioned_entry(
-                        &entry,
-                        Arc::clone(&src_storage),
-                        Arc::clone(&dest_storage),
-                        broadcaster.clone(),
-                        qos_manager.clone(),
-                        copy_config.enable_integrity_check,
-                        copy_config.enable_acl,
-                        copy_config.is_source_reserved,
-                        bytes_tracker.clone(),
-                        ResumeOpts {
-                            job_id: copy_config.job_id.clone(),
-                            job_dir: copy_config.job_dir.clone(),
+                    copy_versions(
+                        ObservedItem::all(&entry),
+                        &src_storage,
+                        &dest_storage,
+                        CopyOptions {
                             transfer_mode: copy_config.transfer_mode,
+                            qos: qos_manager.clone(),
+                            enable_integrity_check: copy_config.enable_integrity_check,
+                            is_source_reserved: copy_config.is_source_reserved,
+                            bytes_counter: bytes_tracker.clone(),
+                            cancel: None,
                         },
+                        &copy_config.job_id,
+                        broadcaster,
+                        EntryChange::New,
                     )
                     .await
                 } else {

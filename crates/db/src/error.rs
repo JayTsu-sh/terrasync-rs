@@ -67,6 +67,13 @@ pub enum DatabaseError {
     #[error("Observation query projection mismatch in field {field}")]
     ObservationProjectionMismatch { field: &'static str },
 
+    #[error("Catalogue batch failed: {source}; staging cleanup also failed: {cleanup}")]
+    CatalogueBatchCleanupFailed {
+        #[source]
+        source: Box<DatabaseError>,
+        cleanup: Box<DatabaseError>,
+    },
+
     /// 查询失败后中止 staging 也失败，保留两次失败的类型。
     #[error("Observation publication failed: {source}; staging abort also failed: {abort}")]
     ObservationAbortFailed {

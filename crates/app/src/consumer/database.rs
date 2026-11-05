@@ -1,7 +1,5 @@
 // 标准库
-use std::future::Future;
 use std::sync::Arc;
-use std::time::Duration;
 use storage_adapter::ObservedEntryExt;
 use storage_adapter::observed_scan::ObservedItem;
 
@@ -11,17 +9,12 @@ use db::error::DatabaseError;
 use db::traits::{Database, TarManifestRecord};
 use storage_adapter::{ObservedEntry, StorageEntryMessage};
 use tokio::sync::mpsc;
-use tracing::{Instrument, debug, error, info, info_span, trace, warn};
+use tracing::{Instrument, debug, error, info, info_span, trace};
 
 // 内部模块
 use crate::config::{ConsumerConfig, JobType};
 use crate::consumer::traits::Consumer;
 use crate::error::Result;
-
-/// 默认重试次数
-const MAX_RETRY_ATTEMPTS: u32 = 3;
-/// 初始退避间隔（毫秒）
-const INITIAL_BACKOFF_MS: u64 = 100;
 
 #[derive(Default)]
 struct DatabaseFailures {
@@ -44,36 +37,6 @@ fn database_consumer_result(failures: DatabaseFailures) -> Result<()> {
         Some(error) => Err(error.into()),
         None => Ok(()),
     }
-}
-
-/// 带重试和指数退避的数据库批量操作辅助函数
-///
-/// 在失败时按指数退避策略重试（100ms → 200ms → 400ms），重试耗尽后返回最后一次的错误。
-async fn retry_batch_operation<F, Fut>(operation_name: &str, f: F) -> db::error::Result<()>
-where
-    F: Fn() -> Fut,
-    Fut: Future<Output = db::error::Result<()>>,
-{
-    let mut last_err = None;
-    for attempt in 0..MAX_RETRY_ATTEMPTS {
-        match f().await {
-            Ok(()) => return Ok(()),
-            Err(e) => {
-                let backoff = Duration::from_millis(INITIAL_BACKOFF_MS * 2u64.pow(attempt));
-                warn!(
-                    "[DatabaseConsumer] {} failed (attempt {}/{}): {}, retrying in {:?}",
-                    operation_name,
-                    attempt + 1,
-                    MAX_RETRY_ATTEMPTS,
-                    e,
-                    backoff
-                );
-                last_err = Some(e);
-                tokio::time::sleep(backoff).await;
-            }
-        }
-    }
-    Err(last_err.unwrap_or_else(|| DatabaseError::QueryError("retry exhausted".to_string())))
 }
 
 /// 数据库消费者 - 将扫描结果异步存储到数据库的组件
@@ -173,7 +136,14 @@ impl Consumer for DatabaseConsumer {
                             // 只有在增量拷贝场景才需要更新数据库里的记录
                             // 在增量扫描场景是不需要更新记录的,是因为在临时表导入主表时就已经更新了。
                             if job_type == JobType::IncrementalCopy {
-                                DatabaseConsumer::update_base_record(db.as_ref(), &entry, &mut processed_errors).await;
+                                DatabaseConsumer::batch_insert_base_record(
+                                    db.as_ref(),
+                                    &entry,
+                                    &mut current_insert_entry_batch,
+                                    batch_size,
+                                    &mut processed_errors,
+                                )
+                                .await;
                             }
 
                             DatabaseConsumer::batch_insert_incremental_record(
@@ -248,14 +218,10 @@ impl Consumer for DatabaseConsumer {
                                 .iter()
                                 .map(|e| TarManifestRecord::from_entry(e, tar_path))
                                 .collect();
-                            if let Err(e) = retry_batch_operation("insert_tar_manifest", || {
-                                db.batch_insert_tar_manifest(&manifest_records)
-                            })
-                            .await
-                            {
+                            if let Err(e) = db.batch_insert_tar_manifest(&manifest_records).await {
                                 error!(
-                                    "[DatabaseConsumer] Failed to insert tar manifest for {} after {} retries: {}",
-                                    tar_path, MAX_RETRY_ATTEMPTS, e
+                                    "[DatabaseConsumer] Failed to insert tar manifest for {}: {}",
+                                    tar_path, e
                                 );
                                 processed_errors.record(1, e);
                             }
@@ -402,12 +368,10 @@ impl DatabaseConsumer {
             );
 
             let batch_len = current_batch.len();
-            if let Err(e) =
-                retry_batch_operation("insert_base", || database.batch_insert_completed_records(current_batch)).await
-            {
+            if let Err(e) = database.batch_insert_completed_records(current_batch).await {
                 error!(
-                    "[DatabaseConsumer] Failed to insert batch after {} retries, discarding {} records: {}",
-                    MAX_RETRY_ATTEMPTS, batch_len, e
+                    "[DatabaseConsumer] Failed to insert batch discarding {} records: {}",
+                    batch_len, e
                 );
                 processed_errors.record(batch_len, e);
             } else {
@@ -436,14 +400,9 @@ impl DatabaseConsumer {
                 current_batch.len()
             );
 
-            if let Err(e) = retry_batch_operation("finalize_insert_base", || {
-                database.batch_insert_completed_records(current_batch)
-            })
-            .await
-            {
+            if let Err(e) = database.batch_insert_completed_records(current_batch).await {
                 error!(
-                    "[DatabaseConsumer] Failed to insert final batch after {} retries, discarding {} records: {}",
-                    MAX_RETRY_ATTEMPTS,
+                    "[DatabaseConsumer] Failed to insert final batch discarding {} records: {}",
                     current_batch.len(),
                     e
                 );
@@ -474,14 +433,9 @@ impl DatabaseConsumer {
                 current_batch
             );
 
-            if let Err(e) = retry_batch_operation("finalize_delete_base", || {
-                database.batch_delete_base_record(current_batch)
-            })
-            .await
-            {
+            if let Err(e) = database.batch_delete_base_record(current_batch).await {
                 error!(
-                    "[DatabaseConsumer] Failed to delete final batch after {} retries, discarding {} records: {}",
-                    MAX_RETRY_ATTEMPTS,
+                    "[DatabaseConsumer] Failed to delete final batch discarding {} records: {}",
                     current_batch.len(),
                     e
                 );
@@ -507,12 +461,10 @@ impl DatabaseConsumer {
                 batch_len
             );
 
-            if let Err(e) =
-                retry_batch_operation("delete_base", || database.batch_delete_base_record(current_batch)).await
-            {
+            if let Err(e) = database.batch_delete_base_record(current_batch).await {
                 error!(
-                    "[DatabaseConsumer] Failed to delete base batch after {} retries, discarding {} records: {}",
-                    MAX_RETRY_ATTEMPTS, batch_len, e
+                    "[DatabaseConsumer] Failed to delete base batch discarding {} records: {}",
+                    batch_len, e
                 );
                 processed_errors.record(batch_len, e);
             } else {
@@ -546,14 +498,10 @@ impl DatabaseConsumer {
                 batch_len
             );
 
-            if let Err(e) = retry_batch_operation("insert_incremental", || {
-                database.batch_insert_incremental_record(current_batch)
-            })
-            .await
-            {
+            if let Err(e) = database.batch_insert_incremental_record(current_batch).await {
                 error!(
-                    "[DatabaseConsumer] Failed to insert incremental batch after {} retries, discarding {} records: {}",
-                    MAX_RETRY_ATTEMPTS, batch_len, e
+                    "[DatabaseConsumer] Failed to insert incremental batch discarding {} records: {}",
+                    batch_len, e
                 );
                 processed_errors.record(batch_len, e);
             } else {
@@ -582,14 +530,9 @@ impl DatabaseConsumer {
                 current_batch.len()
             );
 
-            if let Err(e) = retry_batch_operation("finalize_insert_incremental", || {
-                database.batch_insert_incremental_record(current_batch)
-            })
-            .await
-            {
+            if let Err(e) = database.batch_insert_incremental_record(current_batch).await {
                 error!(
-                    "[DatabaseConsumer] Failed to insert final incremental batch after {} retries, discarding {} records: {}",
-                    MAX_RETRY_ATTEMPTS,
+                    "[DatabaseConsumer] Failed to insert final incremental batch discarding {} records: {}",
                     current_batch.len(),
                     e
                 );
@@ -598,17 +541,6 @@ impl DatabaseConsumer {
                 info!("[DatabaseConsumer] Final batch of incremental records inserted successfully");
             }
             current_batch.clear();
-        }
-    }
-
-    async fn update_base_record(
-        database: &dyn Database, entry: &Arc<ObservedEntry>, processed_errors: &mut DatabaseFailures,
-    ) {
-        if let Err(e) = database.update_base_record(entry).await {
-            error!("[DatabaseConsumer] Failed to update base record: {}", e);
-            processed_errors.record(1, e);
-        } else {
-            debug!("[DatabaseConsumer] Base record updated successfully");
         }
     }
 }

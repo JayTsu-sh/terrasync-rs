@@ -8,11 +8,13 @@
 //! 5. 重试机制集成
 
 // 标准库
-use crate::file_copy::{HdfsCopyContext, copy_file, copy_history};
+use crate::file_copy::{HdfsCopyContext, copy_file, copy_versions};
+use std::iter::once;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use storage_adapter::ObservedEntryExt;
-use storage_adapter::TransferMode;
+use storage_adapter::observed_scan::ObservedItem;
+use storage_adapter::{EntryChange, TransferMode};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 
@@ -234,14 +236,14 @@ pub(crate) fn check_admin_privileges() -> Result<bool> {
 }
 
 pub(crate) async fn process_versioned_entry(
-    entry: &Arc<ObservedEntry>, src_storage: Arc<StorageEnum>, dest_storage: Arc<StorageEnum>,
+    item: &ObservedItem, src_storage: Arc<StorageEnum>, dest_storage: Arc<StorageEnum>,
     broadcaster: BroadcastForwarder<StorageEntryMessage>, qos_manager: Option<QosManager>,
     enable_integrity_check: bool, enable_acl: bool, is_source_reserved: bool, bytes_counter: Option<Arc<AtomicU64>>,
-    resume: ResumeOpts,
+    resume: ResumeOpts, change: EntryChange,
 ) -> Result<()> {
-    if entry.history().is_some() {
-        return copy_history(
-            entry,
+    if item.entry.history().is_some() {
+        return copy_versions(
+            once(item.clone()),
             &src_storage,
             &dest_storage,
             CopyOptions {
@@ -254,13 +256,14 @@ pub(crate) async fn process_versioned_entry(
             },
             &resume.job_id,
             &broadcaster,
+            change,
         )
         .await;
     }
     process_entry(
-        entry,
+        &item.entry,
         src_storage,
-        Arc::clone(&dest_storage),
+        dest_storage,
         enable_integrity_check,
         enable_acl,
         is_source_reserved,
@@ -270,9 +273,7 @@ pub(crate) async fn process_versioned_entry(
         resume,
     )
     .await?;
-    broadcaster
-        .broadcast(StorageEntryMessage::New(Arc::clone(entry).into()))
-        .await;
+    broadcaster.broadcast(change.message(item.clone())).await;
     Ok(())
 }
 

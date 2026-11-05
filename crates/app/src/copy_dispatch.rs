@@ -27,9 +27,10 @@ impl CopyQueues {
             StorageEntryMessage::Scanned(entry)
             | StorageEntryMessage::Packaged(entry)
             | StorageEntryMessage::Deleted(entry)
-            | StorageEntryMessage::Changed { entry, .. }
             | StorageEntryMessage::IntegrityChecked(entry) => entry.path().as_str().hash(&mut hash),
-            StorageEntryMessage::New(item) => item.entry.path().as_str().hash(&mut hash),
+            StorageEntryMessage::New(item) | StorageEntryMessage::Changed { entry: item, .. } => {
+                item.entry.path().as_str().hash(&mut hash)
+            }
             StorageEntryMessage::Renamed((_, to)) => to.path().as_str().hash(&mut hash),
             StorageEntryMessage::Error { path, .. } => path.hash(&mut hash),
             StorageEntryMessage::TarManifest { tar_path, .. } => tar_path.hash(&mut hash),

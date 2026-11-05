@@ -1,8 +1,8 @@
 use crate::broadcast::BroadcastForwarder;
 use data_mover::model::EntryKind;
 use std::sync::Arc;
-use storage_adapter::StorageEntryMessage;
 use storage_adapter::observed_scan::ObservedItem;
+use storage_adapter::{EntryChange, StorageEntryMessage};
 
 use storage_adapter::hdfs::HdfsResumeMode;
 use storage_adapter::{
@@ -77,9 +77,9 @@ pub(crate) async fn copy_file(
 }
 
 /// 全量与增量共用源端确认的逐版本顺序；每个目标版本提交后才发送对应的完成事件。
-pub(crate) async fn copy_history(
-    entry: &Arc<ObservedEntry>, from: &StorageEnum, to: &StorageEnum, options: CopyOptions, job_id: &str,
-    broadcaster: &BroadcastForwarder<StorageEntryMessage>,
+pub(crate) async fn copy_versions<I: Iterator<Item = ObservedItem> + Send>(
+    items: I, from: &StorageEnum, to: &StorageEnum, options: CopyOptions, job_id: &str,
+    broadcaster: &BroadcastForwarder<StorageEntryMessage>, change: EntryChange,
 ) -> Result<()> {
     let keep_history = to.is_bucket_versioned().await?;
     let hdfs = if matches!(to, StorageEnum::HDFS(_)) {
@@ -87,9 +87,9 @@ pub(crate) async fn copy_history(
     } else {
         None
     };
-    for item in selected_copy_items(entry, keep_history) {
-        if !keep_history && entry.kind() == EntryKind::Directory {
-            to.create_dir_all(entry).await?;
+    for item in items.filter(|item| retain_version(item, keep_history)) {
+        if !keep_history && item.entry.kind() == EntryKind::Directory {
+            to.create_dir_all(&item.entry).await?;
         } else {
             StorageEnum::copy_observed_view(
                 from,
@@ -100,21 +100,24 @@ pub(crate) async fn copy_history(
             )
             .await?;
         }
-        broadcaster.broadcast(StorageEntryMessage::New(item)).await;
+        broadcaster.broadcast(change.message(item)).await;
     }
     Ok(())
 }
 
 /// 借用原生历史选择目标实际保留的版本，不分配或复制版本列表。
+#[cfg(test)]
 pub(crate) fn selected_copy_items(
     entry: &Arc<ObservedEntry>, keep_history: bool,
 ) -> impl Iterator<Item = ObservedItem> + '_ {
-    ObservedItem::all(entry).filter(move |item| {
-        item.view()
-            .version()
-            .is_none_or(|record| keep_history || (record.is_latest() && !record.is_delete_marker()))
-    })
+    ObservedItem::all(entry).filter(move |item| retain_version(item, keep_history))
 }
+fn retain_version(item: &ObservedItem, keep_history: bool) -> bool {
+    item.view()
+        .version()
+        .is_none_or(|record| keep_history || (record.is_latest() && !record.is_delete_marker()))
+}
+
 #[cfg(test)]
 mod tests {
     use tokio::fs;

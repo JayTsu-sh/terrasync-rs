@@ -671,11 +671,11 @@ pub(super) fn classification_to_stats_message(
     match decision {
         TransferDecision::FullTransfer => Some(StorageEntryMessage::New(entry)),
         TransferDecision::DeltaTransfer => Some(StorageEntryMessage::Changed {
-            entry: entry.entry,
+            entry,
             kind: ChangeKind::DataOnly,
         }),
         TransferDecision::MetadataOnly => Some(StorageEntryMessage::Changed {
-            entry: entry.entry,
+            entry,
             kind: ChangeKind::MetadataOnly,
         }),
         TransferDecision::Skip => None,

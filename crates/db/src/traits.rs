@@ -13,7 +13,9 @@ use std::time::SystemTime;
 use storage_adapter::ObservedEntryExt;
 
 // 外部crate
+use crate::catalogue::{CatalogueChange, CatalogueDifference, ComparisonMode, compare_catalogue_batch};
 use crate::error::DatabaseError;
+use crate::scan::rows::{capture_summary, incremental_record};
 use async_trait::async_trait;
 use data_mover::model::{BackendIdentity, BackendKind};
 use serde::{Deserialize, Serialize};
@@ -90,7 +92,7 @@ pub struct StorageEntryRecord {
 impl StorageEntryRecord {
     #[cfg(test)]
     pub fn capture(entry: &ObservedEntry, generation: u8) -> Result<Self> {
-        let fields = crate::scan::rows::capture_summary(
+        let fields = capture_summary(
             storage_adapter::observed_scan::ObservedView {
                 entry,
                 version_index: entry.history().map(|_| 0),
@@ -201,10 +203,13 @@ impl IncrementalStorageEntryRecord {
             StorageEntryMessage::Scanned(entry) => (entry, "scanned", None),
             StorageEntryMessage::Packaged(entry) => (entry, "packaged", None),
             StorageEntryMessage::New(item) => {
-                let row = crate::scan::rows::capture_summary(item.view(), 0)?;
-                return Ok(vec![crate::scan::rows::incremental_record(row, "new", None, now)]);
+                let row = capture_summary(item.view(), 0)?;
+                return Ok(vec![incremental_record(row, "new", None, now)]);
             }
-            StorageEntryMessage::Changed { entry, kind } => (entry, kind.as_state_str(), None),
+            StorageEntryMessage::Changed { entry, kind } => {
+                let row = capture_summary(entry.view(), 0)?;
+                return Ok(vec![incremental_record(row, kind.as_state_str(), None, now)]);
+            }
             StorageEntryMessage::Deleted(entry) => (entry, "deleted", None),
             StorageEntryMessage::IntegrityChecked(entry) => (entry, "integrity_checked", None),
             StorageEntryMessage::Renamed((from, to)) => (to, "rename", Some(from.path().as_str().to_owned())),
@@ -225,7 +230,7 @@ impl IncrementalStorageEntryRecord {
                     relative_path: path.to_string_lossy().into_owned(),
                     ..Default::default()
                 };
-                return Ok(vec![crate::scan::rows::incremental_record(row, "error", comment, now)]);
+                return Ok(vec![incremental_record(row, "error", comment, now)]);
             }
             StorageEntryMessage::TarManifest { .. } => {
                 return Err(DatabaseError::ConversionError(
@@ -239,13 +244,8 @@ impl IncrementalStorageEntryRecord {
     fn observed_rows(entry: &ObservedEntry, operation: &str, comment: Option<String>, now: i64) -> Result<Vec<Self>> {
         storage_adapter::observed_scan::ObservedView::all(entry)
             .map(|view| {
-                let row = crate::scan::rows::capture_summary(view, 0)?;
-                Ok(crate::scan::rows::incremental_record(
-                    row,
-                    operation,
-                    comment.clone(),
-                    now,
-                ))
+                let row = capture_summary(view, 0)?;
+                Ok(incremental_record(row, operation, comment.clone(), now))
             })
             .collect()
     }
@@ -454,6 +454,14 @@ pub trait Database: Send + Sync {
     async fn abandon_scan_resume(&self) -> Result<()> {
         Ok(())
     }
+
+    /// 在数据库层完成整个比对会话；返回的每项共享输入的原生观察及版本选择。
+    async fn compare_catalogue_batch(
+        &self, records: &[Arc<ObservedEntry>], mode: ComparisonMode,
+    ) -> Result<Vec<CatalogueChange>> {
+        compare_catalogue_batch(self.clone_box(), records, mode).await
+    }
+    async fn classify_catalogue_items(&self) -> Result<Vec<CatalogueDifference>>;
 
     /// 查询在最新扫描中新增的文件
     /// 即在临时表中存在但在主表中不存在的文件
