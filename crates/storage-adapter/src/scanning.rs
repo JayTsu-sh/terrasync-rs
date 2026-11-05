@@ -34,7 +34,7 @@ pub enum ScanSourceMode {
     },
 }
 
-impl ConnectedStorage {
+impl StorageContext {
     fn traversal_request(&self, sub: Option<&Path>, options: &WalkOptions, blocks: bool) -> Result<TraversalRequest> {
         let root = path(sub.unwrap_or(Path::new("")))?;
         let mut request = TraversalRequest::new(root)

@@ -29,7 +29,7 @@ impl HdfsRecoverableCopyOptions {
         self
     }
 }
-impl StorageEnum {
+impl StorageContext {
     pub async fn copy_file_hdfs_recoverable(
         source: &Self, destination: &Self, entry: &Arc<ObservedEntry>, options: CopyOptions,
         recovery: HdfsRecoverableCopyOptions,

@@ -2,7 +2,7 @@
 use async_channel::Receiver;
 use data_mover::traversal::{TraversalItem, TraversalOutcome};
 use std::sync::Arc;
-use storage_adapter::{Result as StorageResult, StorageEnum, WalkOptions};
+use storage_adapter::{Result as StorageResult, StorageContext, WalkOptions};
 use task_model::ObservedEntryExt;
 use task_model::observation::ObservedItem;
 use transport::directory::{DirPageResult, NdxEntry};
@@ -20,7 +20,7 @@ pub(crate) enum NdxEvent {
 
 pub(crate) type DirectoryPages = Receiver<NdxEvent>;
 
-pub(crate) fn directory_pages(storage: &StorageEnum, options: WalkOptions) -> StorageResult<DirectoryPages> {
+pub(crate) fn directory_pages(storage: &StorageContext, options: WalkOptions) -> StorageResult<DirectoryPages> {
     let mut session = storage.directory_inventory(&options)?;
     let (tx, rx) = async_channel::bounded(2);
     tokio::spawn(async move {

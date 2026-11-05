@@ -6,8 +6,8 @@ use storage_adapter::WalkOptions;
 use task_model::ObservedEntryExt;
 
 // 内部模块
+use storage_adapter::StorageContext;
 use storage_adapter::qos::QosManager;
-use storage_adapter::storage_enum::StorageEnum;
 use {
     storage_adapter::{ObservedEntry, WalkDirAsyncIterator},
     task_model::StorageEntryMessage,
@@ -21,13 +21,13 @@ use crate::error::{AppError, Result};
 ///
 /// 两阶段流程：
 /// 1. 子 walkdir 收集目录下所有条目 + 计算 tar 总大小
-/// 2. 调用 `StorageEnum::pack_files_to_tar()` 流式打包写入
+/// 2. 调用 `StorageContext::pack_files_to_tar()` 流式打包写入
 ///
 /// # 返回值
 /// - `tar_entry`: 合成的条目，表示目标端的 .tar 文件（变体与输入 `dir_entry` 一致）
 /// - `manifest_list`: tar 内所有条目的列表（供后续写入 manifest 表）
 pub async fn pack_directory(
-    src_storage: &StorageEnum, dest_storage: &StorageEnum, dir_entry: &ObservedEntry, is_source_reserved: bool,
+    src_storage: &StorageContext, dest_storage: &StorageContext, dir_entry: &ObservedEntry, is_source_reserved: bool,
     qos: Option<QosManager>, bytes_counter: Option<Arc<AtomicU64>>,
 ) -> Result<(ObservedEntry, Vec<Arc<ObservedEntry>>)> {
     let dir_path = dir_entry.get_relative_path();
@@ -47,7 +47,7 @@ pub async fn pack_directory(
     let tar_relative_path = PathBuf::from(format!("{}.tar", dir_path.to_string_lossy()));
 
     // ── 阶段 2：流式打包写入 ──
-    let tar_size = StorageEnum::pack_files_to_tar(
+    let tar_size = StorageContext::pack_files_to_tar(
         src_storage,
         dest_storage,
         &manifest_list,

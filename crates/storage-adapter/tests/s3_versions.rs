@@ -4,7 +4,7 @@ mod observed_fixtures;
 use task_model::observation::ObservedItem;
 use tempfile::TempDir;
 use {
-    storage_adapter::{CopyOptions, CreateStorageOptions, StorageEnum, WalkOptions, create_storage},
+    storage_adapter::{CopyOptions, CreateStorageOptions, StorageContext, WalkOptions, create_storage},
     task_model::{StorageEntryMessage, TransferMode},
 };
 
@@ -47,7 +47,7 @@ async fn checkpointed_copy_reads_requested_historical_version() -> TestResult {
         return Err(error.into());
     }
     let selected = selected.ok_or("requested source version was not listed")?;
-    StorageEnum::copy_observed_item(
+    StorageContext::copy_observed_item(
         &source,
         &target,
         &selected,

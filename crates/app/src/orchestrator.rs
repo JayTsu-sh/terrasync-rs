@@ -3,6 +3,7 @@
 //! SyncOrchestrator 封装 sync/incremental_sync 的核心逻辑，
 //! 通过 Transport 抽象层连接 Sender 和 Receiver，支持单进程和双进程两种模式。
 
+use data_mover::model::BackendKind;
 // 标准库
 use crate::copy_dispatch::{CopyQueues, partition_scan};
 use crate::file_copy::{HdfsCopyContext, MetadataApplication, copy_file};
@@ -34,9 +35,9 @@ impl Drop for AtomicCounterGuard<'_> {
 use db::ClickHouseDatabase;
 use db::traits::Database;
 use db::{self, DeletionStatus, INCREMENTAL_SCAN_TABLE_BASE_NAME};
-use storage_adapter::qos::QosManager;
 #[cfg(windows)]
-use storage_adapter::storage_enum::{StorageType, detect_storage_type};
+use storage_adapter::backend_kind_from_location;
+use storage_adapter::qos::QosManager;
 use tokio::sync::Semaphore;
 use tokio::task::JoinHandle;
 use tracing::{Instrument, error, info, info_span, trace, warn};
@@ -45,7 +46,7 @@ use transport::message::SenderMsg;
 use transport::traits::{ReceiverTransport, SenderTransport};
 use utils::app_config::AppConfig;
 use {
-    storage_adapter::{ObservedEntry, StorageEnum},
+    storage_adapter::{ObservedEntry, StorageContext},
     task_model::{ChangeKind, EntryChange, ErrorEvent, StorageEntryMessage},
 };
 
@@ -384,8 +385,8 @@ impl SyncOrchestrator {
         // Windows 管理员权限检查
         #[cfg(windows)]
         {
-            if matches!(detect_storage_type(&c.src_path), StorageType::Local)
-                && matches!(detect_storage_type(&c.dest_path), StorageType::Local)
+            if matches!(backend_kind_from_location(&c.src_path), BackendKind::Local)
+                && matches!(backend_kind_from_location(&c.dest_path), BackendKind::Local)
             {
                 match check_admin_privileges() {
                     Ok(true) => println!("✓ Running with administrator privileges\n"),
@@ -780,8 +781,8 @@ impl SyncOrchestrator {
         // ── 7. Windows 管理员权限检查 ──
         #[cfg(windows)]
         {
-            if matches!(detect_storage_type(&c.src_path), StorageType::Local)
-                && matches!(detect_storage_type(&c.dest_path), StorageType::Local)
+            if matches!(backend_kind_from_location(&c.src_path), BackendKind::Local)
+                && matches!(backend_kind_from_location(&c.dest_path), BackendKind::Local)
             {
                 match check_admin_privileges() {
                     Ok(true) => println!("✓ Running with administrator privileges\n"),
@@ -1250,7 +1251,7 @@ impl SyncOrchestrator {
         let phase_b_handles = consumer_manager.start_consumers(&mut broadcaster_b).await?;
 
         // dest storage 提升到 async 块外，供后续 update_directory_metadata 复用，避免二次挂载
-        let phase_b_dest_storage: Result<Arc<StorageEnum>> = async {
+        let phase_b_dest_storage: Result<Arc<StorageContext>> = async {
             let dest_storage_phase_b = Arc::new(
                 create_storage_for_role(
                     &c.dest_path,
@@ -1358,13 +1359,13 @@ impl SyncOrchestrator {
     /// rename 后的内容与元数据必须完成，才能确认该条目的新状态。
     #[allow(clippy::too_many_arguments)]
     async fn sync_renamed_file_changes(
-        kind: ChangeKind, entry: &Arc<ObservedEntry>, src: &StorageEnum, dest: &StorageEnum, qos: Option<QosManager>,
-        integrity: bool, source_reserved: bool, bytes: Option<Arc<AtomicU64>>, job_id: &str, job_dir: &str,
-        transfer_mode: TransferMode,
+        kind: ChangeKind, entry: &Arc<ObservedEntry>, src: &StorageContext, dest: &StorageContext,
+        qos: Option<QosManager>, integrity: bool, source_reserved: bool, bytes: Option<Arc<AtomicU64>>, job_id: &str,
+        job_dir: &str, transfer_mode: TransferMode,
     ) -> Result<()> {
         let mut metadata_applied = false;
         if kind != ChangeKind::MetadataOnly {
-            let hdfs = if matches!(dest, StorageEnum::HDFS(_)) {
+            let hdfs = if dest.storage().kind() == BackendKind::Hdfs {
                 Some(HdfsCopyContext::from_job(job_id, transfer_mode)?)
             } else {
                 None
@@ -1429,8 +1430,8 @@ impl SyncOrchestrator {
     /// 或元数据更新（处理「rename + data/metadata changed」复合场景）。
     #[allow(clippy::too_many_arguments)]
     async fn apply_deletions_and_renames(
-        db: &dyn Database, src_storage: Arc<StorageEnum>, dest_storage: Arc<StorageEnum>, is_source_reserved: bool,
-        broadcaster: &BroadcastForwarder<StorageEntryMessage>, enable_integrity_check: bool,
+        db: &dyn Database, src_storage: Arc<StorageContext>, dest_storage: Arc<StorageContext>,
+        is_source_reserved: bool, broadcaster: &BroadcastForwarder<StorageEntryMessage>, enable_integrity_check: bool,
         qos_manager: Option<QosManager>, bytes_counter: Option<Arc<AtomicU64>>, job_id: &str, job_dir: &str,
         transfer_mode: TransferMode,
     ) -> Result<()> {

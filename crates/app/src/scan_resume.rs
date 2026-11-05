@@ -21,7 +21,7 @@ use tokio::{join, select, task::spawn_blocking};
 use tracing::{info, warn};
 use utils::app_config::AppConfig;
 use {
-    storage_adapter::{ScanSourceMode, StorageEnum, WalkOptions, canonicalize_path},
+    storage_adapter::{ScanSourceMode, StorageContext, WalkOptions, canonicalize_path},
     task_model::{ErrorEvent, StorageEntryMessage},
 };
 
@@ -249,7 +249,7 @@ fn checkpoint_interval() -> Duration {
 
 #[allow(clippy::too_many_arguments)]
 async fn run(
-    storage: &StorageEnum, options: &WalkOptions, database: &mut ScanStore, state: &mut ScanResumeState,
+    storage: &StorageContext, options: &WalkOptions, database: &mut ScanStore, state: &mut ScanResumeState,
     consumers: &ConsumerManager, batch_size: usize, cancel: ScanCancellation, resume: bool,
 ) -> Result<()> {
     if state.phase == RUNNING {

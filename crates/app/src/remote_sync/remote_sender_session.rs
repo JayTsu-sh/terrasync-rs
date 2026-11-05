@@ -17,7 +17,7 @@ use transport::chunk::DataChunk;
 
 use crate::remote_inventory::{DirectoryPages, NdxEvent};
 use storage_adapter::qos::QosManager;
-use storage_adapter::{ObservedEntry, StorageEnum, StorageError};
+use storage_adapter::{ObservedEntry, StorageContext, StorageError};
 use sync_delta::DeltaToken;
 use sync_delta::matcher::DeltaMatcher;
 use task_model::{ChangeKind, ErrorEvent, StorageEntryMessage};
@@ -32,7 +32,7 @@ use crate::consumer::stats::format_bytes;
 /// 构造 negotiated session 所需的既有 adapter 与配置。
 pub(super) struct RemoteSenderSessionDeps<'a> {
     pub(super) transport: &'a dyn SenderTransport,
-    pub(super) src_storage: &'a Arc<StorageEnum>,
+    pub(super) src_storage: &'a Arc<StorageContext>,
     pub(super) walkdir_iter: &'a DirectoryPages,
     pub(super) qos: Option<&'a QosManager>,
     pub(super) enable_acl: bool,
@@ -79,7 +79,7 @@ pub(super) struct RequestAckSummary {
 
 struct SourceTransferContext<'a> {
     transport: &'a dyn SenderTransport,
-    src_storage: &'a Arc<StorageEnum>,
+    src_storage: &'a Arc<StorageContext>,
     qos: Option<&'a QosManager>,
     enable_acl: bool,
 }
@@ -276,7 +276,7 @@ pub(super) async fn advertise_file_list(
 
 /// 发送一个 full entry；目录、符号链接和 bounded file stream 共用一个 typed outcome。
 pub(super) async fn send_full_transfer(
-    transport: &dyn SenderTransport, src_storage: &Arc<StorageEnum>, entry: &ObservedItem, ndx: i32,
+    transport: &dyn SenderTransport, src_storage: &Arc<StorageContext>, entry: &ObservedItem, ndx: i32,
     qos: Option<&QosManager>, enable_acl: bool,
 ) -> Result<SourceTransferOutcome> {
     let outcome = if entry.view().version().is_some_and(|version| version.is_delete_marker()) {
@@ -355,7 +355,7 @@ pub(super) async fn send_full_transfer(
 
 /// ACL 跨进程传输：仅在启用且 entry 不是符号链接时发送。
 pub(super) async fn send_acl_if_enabled(
-    transport: &dyn SenderTransport, src_storage: &Arc<StorageEnum>, entry: &Arc<ObservedEntry>, enable_acl: bool,
+    transport: &dyn SenderTransport, src_storage: &Arc<StorageContext>, entry: &Arc<ObservedEntry>, enable_acl: bool,
 ) {
     if enable_acl
         && !entry.get_is_symlink()
@@ -428,9 +428,9 @@ async fn send_delta_transfer(
 
 /// 准入成功后才允许目标准备或消费源数据；完整性证据由原生 producer 给出。
 async fn open_source_payload(
-    transport: &dyn SenderTransport, storage: &StorageEnum, entry: &ObservedItem, ndx: i32, qos: Option<&QosManager>,
+    transport: &dyn SenderTransport, storage: &StorageContext, entry: &ObservedItem, ndx: i32, qos: Option<&QosManager>,
 ) -> Result<Option<ExpertSourcePayload>> {
-    match StorageEnum::open_observed_source(storage, entry, qos).await {
+    match StorageContext::open_observed_source(storage, entry, qos).await {
         Ok(session) => Ok(Some(session.stream_from(0).map_err(StorageError::from)?)),
         Err(error) => {
             report_source_failure(transport, entry, ndx, error.to_string()).await?;

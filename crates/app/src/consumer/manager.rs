@@ -190,7 +190,7 @@ impl ScanStatistics {
 
 impl ConsumerManager {
     pub(crate) async fn initialize_scan_statistics(
-        &self, storage: &storage_adapter::StorageEnum, tags: bool, round: Option<i64>,
+        &self, storage: &storage_adapter::StorageContext, tags: bool, round: Option<i64>,
     ) -> Result<()> {
         if let Some(sc) = &self.stats_consumer {
             let mut sc = sc.lock().await;

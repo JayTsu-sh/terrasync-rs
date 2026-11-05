@@ -1,5 +1,6 @@
 //! TerraSync 的存储边界：产品数据投影及旧会话与 data-mover 角色接口之间的转换。
 //! 所有后端 IO、复制、恢复与原子发布由 data-mover 执行。
+use data_mover::model::BackendKind;
 use task_model::{ErrorEvent, ObservedEntryExt, StorageEntryMessage, TransferMode};
 mod archive;
 mod connected;
@@ -30,12 +31,9 @@ pub use scanning::{
 };
 pub use streaming::*;
 pub type WalkDirAsyncIterator = AsyncReceiver<StorageEntryMessage>;
-pub mod storage_enum {
-    pub use crate::{StorageEnum, StorageType, detect_storage_type};
-}
 
 pub fn canonicalize_path(value: &str) -> std::io::Result<String> {
-    if detect_storage_type(value) == StorageType::Local {
+    if backend_kind_from_location(value) == BackendKind::Local {
         Ok(soft_canonicalize::soft_canonicalize(value)?
             .to_string_lossy()
             .into_owned())

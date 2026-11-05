@@ -12,7 +12,7 @@ use task_model::ObservedEntryExt;
 use task_model::TransferMode;
 use task_model::observation::ObservedItem;
 
-use storage_adapter::{ObservedEntry, StorageEnum};
+use storage_adapter::{ObservedEntry, StorageContext};
 use tokio::sync::mpsc::{Receiver, Sender};
 use tracing::{debug, info, warn};
 use transport::chunk::DataChunk;
@@ -109,7 +109,7 @@ impl RemoteSessionState {
 
     /// 处理不需要 delta implementation 的基础分类。返回该分类是否已完成处理。
     pub(crate) async fn handle_base_classification(
-        &mut self, transport: &(dyn ReceiverTransport + 'static), dest: &StorageEnum, progress: &ReceiverProgress,
+        &mut self, transport: &(dyn ReceiverTransport + 'static), dest: &StorageContext, progress: &ReceiverProgress,
         ndx: i32, entry: &ObservedItem, decision: TransferDecision,
     ) -> bool {
         match decision {
@@ -151,7 +151,7 @@ impl RemoteSessionState {
 
     /// 处理 changed entry 的 delta eligibility、basis signature 与 full fallback。
     pub(crate) async fn handle_delta_classification(
-        &mut self, transport: &(dyn ReceiverTransport + 'static), dest: &Arc<StorageEnum>, features: &FeatureFlags,
+        &mut self, transport: &(dyn ReceiverTransport + 'static), dest: &Arc<StorageContext>, features: &FeatureFlags,
         delta_size_threshold: u64, ndx: i32, entry: &ObservedItem, decision: TransferDecision,
     ) -> bool {
         if decision != TransferDecision::DeltaTransfer {
@@ -179,7 +179,7 @@ impl RemoteSessionState {
 
         let block_size = sync_delta::calculate_block_size(size);
         let (mut basis_rx, basis_handle) =
-            StorageEnum::read_basis_chunk_stream(dest, &entry.entry, None, None, false, 8);
+            StorageContext::read_basis_chunk_stream(dest, &entry.entry, None, None, false, 8);
         let mut sig_calc = sync_delta::signature::SignatureCalculator::new(block_size);
         while let Some(chunk) = basis_rx.recv().await {
             sig_calc.push(&chunk.data);
@@ -222,7 +222,7 @@ impl RemoteSessionState {
 
     /// 处理一个文件页中的子目录与目标端 orphan，并登记会话结束时需要恢复 metadata 的目录。
     pub(crate) async fn handle_directory_lifecycle(
-        &mut self, transport: &(dyn ReceiverTransport + 'static), dest: &StorageEnum, page: &DirPageResult,
+        &mut self, transport: &(dyn ReceiverTransport + 'static), dest: &StorageContext, page: &DirPageResult,
         dest_index: &mut DestIndex, delete_target: bool,
     ) {
         for subdir in &page.subdirs {
@@ -343,7 +343,7 @@ impl RemoteSessionState {
     }
 
     /// 在所有文件 durable outcome 完成后恢复目录 metadata。
-    pub(crate) async fn finalize_directories(&self, dest: &StorageEnum) {
+    pub(crate) async fn finalize_directories(&self, dest: &StorageContext) {
         for entry in &self.created_dirs {
             if let Err(error) = dest.set_entry_metadata(entry).await {
                 warn!(
@@ -544,7 +544,7 @@ impl RemoteSessionState {
     pub(crate) async fn shutdown_disk_commit(
         &mut self, dc_tx: Sender<DiskCommitMsg>, dc_join: tokio::task::JoinHandle<Result<()>>,
         ack_rx: &mut tokio::sync::mpsc::UnboundedReceiver<DcAck>, transport: &(dyn ReceiverTransport + 'static),
-        progress: &ReceiverProgress, dest: &StorageEnum,
+        progress: &ReceiverProgress, dest: &StorageContext,
     ) -> Result<()> {
         let _ = dc_tx.send(DiskCommitMsg::Shutdown).await;
         drop(dc_tx);
@@ -648,7 +648,7 @@ impl RemoteSessionState {
 
 /// 一次已完成协议协商与鉴权的远端 Receiver 会话。
 pub struct RemoteReceiverSession {
-    dest_storage: Arc<StorageEnum>,
+    dest_storage: Arc<StorageContext>,
     session_config: SessionConfig,
     negotiated_features: FeatureFlags,
     delta_size_threshold: u64,
@@ -657,7 +657,7 @@ pub struct RemoteReceiverSession {
 
 impl RemoteReceiverSession {
     pub fn new(
-        dest_storage: Arc<StorageEnum>, session_config: SessionConfig, negotiated_features: FeatureFlags,
+        dest_storage: Arc<StorageContext>, session_config: SessionConfig, negotiated_features: FeatureFlags,
         delta_size_threshold: u64, progress: Arc<ReceiverProgress>,
     ) -> Self {
         Self {
@@ -722,7 +722,7 @@ mod tests {
 
     use super::*;
 
-    async fn create_storage(path: &str, block_size: Option<u64>, ensure_dir: bool) -> Result<StorageEnum> {
+    async fn create_storage(path: &str, block_size: Option<u64>, ensure_dir: bool) -> Result<StorageContext> {
         let role = if ensure_dir {
             StorageRole::Destination
         } else {

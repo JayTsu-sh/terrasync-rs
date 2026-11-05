@@ -1,5 +1,5 @@
 //! 从已捕获的原生观察编译复制元数据计划。
-use crate::{ConnectedStorage, Result};
+use crate::{Result, StorageContext};
 use data_mover::{
     metadata::{
         AclTarget, MetadataPlan, MetadataPlanRequest, MetadataPolicies, MetadataPolicy, MetadataTarget,
@@ -10,7 +10,7 @@ use data_mover::{
 use task_model::observation::ObservedView;
 
 /// 从已捕获的值编译计划；不回读源端，也不修改最终路径。
-pub(crate) fn copied_metadata_plan(destination: &ConnectedStorage, entry: ObservedView<'_>) -> Result<MetadataPlan> {
+pub(crate) fn copied_metadata_plan(destination: &StorageContext, entry: ObservedView<'_>) -> Result<MetadataPlan> {
     let staged = destination.roles.staged_destination()?;
     let target = staged.copied_metadata_target();
     let ownership = entry.metadata().ownership_mode().value();

@@ -6,7 +6,7 @@ use std::{
     path::Path,
     sync::{Arc, atomic::Ordering},
 };
-impl StorageEnum {
+impl StorageContext {
     pub async fn pack_files_to_tar(
         source: &Self, destination: &Self, entries: &[Arc<ObservedEntry>], final_path: &Path, _mtime: i64,
         options: TarPackOptions,

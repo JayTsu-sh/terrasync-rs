@@ -1,4 +1,5 @@
 use crate::broadcast::BroadcastForwarder;
+use data_mover::model::BackendKind;
 use data_mover::model::EntryKind;
 use data_mover::storage::CopiedValueTarget;
 use std::sync::Arc;
@@ -7,7 +8,7 @@ use task_model::observation::ObservedItem;
 use task_model::{EntryChange, StorageEntryMessage};
 
 use storage_adapter::hdfs::HdfsResumeMode;
-use storage_adapter::{CommitCallback, CopyOptions, HdfsRecoverableCopyOptions, ObservedEntry, StorageEnum};
+use storage_adapter::{CommitCallback, CopyOptions, HdfsRecoverableCopyOptions, ObservedEntry, StorageContext};
 
 use crate::error::{AppError, Result};
 
@@ -62,7 +63,7 @@ pub(crate) enum MetadataApplication {
 }
 
 /// 复制契约取决于已连接目标实例的能力，不受扫描展示开关影响。
-pub(crate) fn copied_tags_required(to: &StorageEnum) -> storage_adapter::Result<bool> {
+pub(crate) fn copied_tags_required(to: &StorageContext) -> storage_adapter::Result<bool> {
     Ok(to
         .storage()
         .staged_destination()?
@@ -71,7 +72,7 @@ pub(crate) fn copied_tags_required(to: &StorageEnum) -> storage_adapter::Result<
 }
 
 /// 真实目录由 namespace 创建；虚拟目录无需落地，目录标记交给普通文件传输。
-pub(crate) async fn prepare_directory(entry: &ObservedEntry, to: &StorageEnum) -> Result<bool> {
+pub(crate) async fn prepare_directory(entry: &ObservedEntry, to: &StorageContext) -> Result<bool> {
     if entry.kind() != EntryKind::Directory {
         return Ok(false);
     }
@@ -83,28 +84,28 @@ pub(crate) async fn prepare_directory(entry: &ObservedEntry, to: &StorageEnum) -
 }
 
 pub(crate) async fn copy_file(
-    from: &StorageEnum, to: &StorageEnum, entry: &Arc<ObservedEntry>, options: CopyOptions,
+    from: &StorageContext, to: &StorageContext, entry: &Arc<ObservedEntry>, options: CopyOptions,
     hdfs: Option<&HdfsCopyContext>,
 ) -> Result<MetadataApplication> {
-    if matches!(to, StorageEnum::HDFS(_)) {
+    if to.storage().kind() == BackendKind::Hdfs {
         let context = hdfs
             .ok_or_else(|| AppError::ConfigError("HDFS recoverable copy requires a stable job identity".to_string()))?;
         let recovery = HdfsRecoverableCopyOptions::new(context.transfer_identity(), context.on_committed.clone())
             .with_resume_mode(context.resume_mode());
-        StorageEnum::copy_file_hdfs_recoverable(from, to, entry, options, recovery).await?;
+        StorageContext::copy_file_hdfs_recoverable(from, to, entry, options, recovery).await?;
         return Ok(MetadataApplication::DataMover);
     }
-    StorageEnum::copy_file(from, to, entry, options).await?;
+    StorageContext::copy_file(from, to, entry, options).await?;
     Ok(MetadataApplication::DataMover)
 }
 
 /// 全量与增量共用源端确认的逐版本顺序；每个目标版本提交后才发送对应的完成事件。
 pub(crate) async fn copy_versions<I: Iterator<Item = ObservedItem> + Send>(
-    items: I, from: &StorageEnum, to: &StorageEnum, options: CopyOptions, job_id: &str,
+    items: I, from: &StorageContext, to: &StorageContext, options: CopyOptions, job_id: &str,
     broadcaster: &BroadcastForwarder<StorageEntryMessage>, change: EntryChange,
 ) -> Result<()> {
     let keep_history = to.is_bucket_versioned().await?;
-    let hdfs = if matches!(to, StorageEnum::HDFS(_)) {
+    let hdfs = if to.storage().kind() == BackendKind::Hdfs {
         Some(HdfsCopyContext::from_job(job_id, options.transfer_mode)?)
     } else {
         None
@@ -113,7 +114,7 @@ pub(crate) async fn copy_versions<I: Iterator<Item = ObservedItem> + Send>(
         if !to.storage().holds_directory_objects() && item.entry.kind() == EntryKind::Directory {
             to.create_dir_all(&item.entry).await?;
         } else {
-            StorageEnum::copy_observed_item(
+            StorageContext::copy_observed_item(
                 from,
                 to,
                 &item,
@@ -142,12 +143,13 @@ fn retain_version(item: &ObservedItem, keep_history: bool) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use data_mover::model::BackendKind;
     use tokio::fs;
 
     use std::{path::Path, sync::Arc};
 
     use storage_adapter::hdfs::HdfsResumeMode;
-    use storage_adapter::{CreateStorageOptions, StorageEnum, create_storage};
+    use storage_adapter::{CreateStorageOptions, create_storage};
 
     use super::{HdfsCopyContext, MetadataApplication, TransferMode};
     use storage_adapter::CopyOptions;
@@ -229,7 +231,7 @@ mod tests {
             .unwrap_or_else(|error| panic!("legacy local copy: {error}"));
 
         assert_eq!(metadata, MetadataApplication::DataMover);
-        assert!(matches!(destination, StorageEnum::Local(_)));
+        assert_eq!(destination.storage().kind(), BackendKind::Local);
         assert_eq!(
             fs::read(destination_root.path().join("payload.bin"))
                 .await

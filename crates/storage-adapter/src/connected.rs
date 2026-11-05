@@ -41,58 +41,33 @@ use tokio_util::sync::CancellationToken;
 #[path = "connected_tests.rs"]
 mod tests;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum StorageType {
-    Local,
-    Nfs,
-    Cifs,
-    S3,
-    Hdfs,
-}
-pub fn detect_storage_type(path: &str) -> StorageType {
+pub fn backend_kind_from_location(path: &str) -> BackendKind {
     if path.starts_with("nfs://") || path.starts_with("nfs4://") {
-        StorageType::Nfs
+        BackendKind::Nfs
     } else if path.starts_with("s3") && path.contains("://") {
-        StorageType::S3
+        BackendKind::S3
     } else if path.starts_with("smb://") {
-        StorageType::Cifs
+        BackendKind::Cifs
     } else if path.starts_with("hdfs://") {
-        StorageType::Hdfs
+        BackendKind::Hdfs
     } else {
-        StorageType::Local
+        BackendKind::Local
     }
 }
 #[derive(Clone)]
-pub struct ConnectedStorage {
+pub struct StorageContext {
     pub(crate) roles: Storage,
     pub(crate) block_size: u64,
     pub(crate) reconnect_config: Option<std::sync::Arc<NativeBackendConfig>>,
 }
-/// 变体仅服务产品层策略判断；各操作统一借用连接的角色，无后端复制实现。
-#[derive(Clone)]
-pub enum StorageEnum {
-    Local(ConnectedStorage),
-    NFS(ConnectedStorage),
-    CIFS(ConnectedStorage),
-    S3(ConnectedStorage),
-    HDFS(ConnectedStorage),
-}
-impl std::ops::Deref for StorageEnum {
-    type Target = ConnectedStorage;
-    fn deref(&self) -> &Self::Target {
-        match self {
-            Self::Local(s) | Self::NFS(s) | Self::CIFS(s) | Self::S3(s) | Self::HDFS(s) => s,
-        }
-    }
-}
-pub async fn create_storage(path: &str, options: CreateStorageOptions) -> Result<StorageEnum> {
-    let kind = detect_storage_type(path);
+pub async fn create_storage(path: &str, options: CreateStorageOptions) -> Result<StorageContext> {
+    let kind = backend_kind_from_location(path);
     let block_size = options.block_size.unwrap_or(4 * 1024 * 1024);
     if block_size == 0 {
         return Err(StorageError::ConfigError("block size must be positive".into()));
     }
     let config = match kind {
-        StorageType::Local => {
+        BackendKind::Local => {
             let root = PathBuf::from(path);
             if options.ensure_dir {
                 create_dir_all(&root).await?;
@@ -110,23 +85,23 @@ pub async fn create_storage(path: &str, options: CreateStorageOptions) -> Result
                 write_chunk_bytes: options.block_size.and_then(|v| NonZeroUsize::new(v as usize)),
             })
         }
-        StorageType::Nfs => NativeBackendConfig::Nfs(NfsBackendConfig {
+        BackendKind::Nfs => NativeBackendConfig::Nfs(NfsBackendConfig {
             url: path.into(),
             block_size: options.block_size,
             ensure_dir: options.ensure_dir,
             transfer_concurrency: None,
         }),
-        StorageType::S3 => NativeBackendConfig::S3(S3BackendConfig {
+        BackendKind::S3 => NativeBackendConfig::S3(S3BackendConfig {
             url: path.into(),
             block_size: options.block_size,
             single_put_threshold: None,
         }),
-        StorageType::Cifs => {
+        BackendKind::Cifs => {
             let mut config = CifsBackendConfig::from_url(path).map_err(StorageError::from)?;
             config.ensure_dir = options.ensure_dir;
             NativeBackendConfig::Cifs(config)
         }
-        StorageType::Hdfs => {
+        BackendKind::Hdfs => {
             let ProductBackendConfig::Hdfs(client) = options.backend else {
                 return Err(StorageError::ConfigError(
                     "HDFS requires explicit client configuration".into(),
@@ -140,19 +115,12 @@ pub async fn create_storage(path: &str, options: CreateStorageOptions) -> Result
             })
         }
     };
-    let reconnect_config = (kind != StorageType::Local).then(|| std::sync::Arc::new(config.clone()));
+    let reconnect_config = (kind != BackendKind::Local).then(|| std::sync::Arc::new(config.clone()));
     let roles = storage::connect_backend(config).await.map_err(StorageError::from)?;
-    let connected = ConnectedStorage {
+    Ok(StorageContext {
         roles,
         block_size,
         reconnect_config,
-    };
-    Ok(match kind {
-        StorageType::Local => StorageEnum::Local(connected),
-        StorageType::Nfs => StorageEnum::NFS(connected),
-        StorageType::Cifs => StorageEnum::CIFS(connected),
-        StorageType::S3 => StorageEnum::S3(connected),
-        StorageType::Hdfs => StorageEnum::HDFS(connected),
     })
 }
 pub(crate) fn path(value: &Path) -> Result<StoragePath> {
@@ -171,7 +139,7 @@ pub(crate) fn timestamp(value: i64) -> StorageTimestamp {
     StorageTimestamp::new(i128::from(value), TimePrecision::Nanoseconds)
         .unwrap_or_else(|_| unreachable!("nanoseconds are always aligned"))
 }
-impl ConnectedStorage {
+impl StorageContext {
     pub fn validate_transfer_mode(&self, mode: TransferMode) -> Result<()> {
         let destination = self.roles.staged_destination()?;
         let reason = match mode {
@@ -425,7 +393,7 @@ impl ConnectedStorage {
         self.apply_acl(value, acl).await
     }
 }
-impl StorageEnum {
+impl StorageContext {
     pub async fn copy_file(from: &Self, to: &Self, entry: &Arc<ObservedEntry>, options: CopyOptions) -> Result<()> {
         let keep_history = entry.history().is_some() && to.is_bucket_versioned().await?;
         for item in ObservedItem::all(entry) {
@@ -552,7 +520,7 @@ impl StorageEnum {
     }
 }
 
-impl ConnectedStorage {
+impl StorageContext {
     /// 在当前目标的 ACL 能力下先编译映射，不能把另一协议的原生字节直接写入。
     pub(crate) async fn apply_acl(&self, value: &Path, acl: AclMetadata) -> Result<()> {
         let target = self.roles.staged_destination()?.copied_metadata_target();

@@ -95,7 +95,7 @@ impl StagedDestination for MetadataProbe {
     }
 }
 
-async fn destination(fail: bool) -> (TempDir, StorageEnum, Arc<MetadataProbe>) {
+async fn destination(fail: bool) -> (TempDir, StorageContext, Arc<MetadataProbe>) {
     let root = tempfile::tempdir().unwrap();
     std::fs::write(root.path().join("file"), b"old").unwrap();
     let local = connect_backend(BackendConfig::Local(LocalBackendConfig {
@@ -126,17 +126,17 @@ async fn destination(fail: bool) -> (TempDir, StorageEnum, Arc<MetadataProbe>) {
         .unwrap();
     (
         root,
-        StorageEnum::Local(ConnectedStorage {
+        StorageContext {
             roles,
             block_size: 4,
             reconnect_config: None,
-        }),
+        },
         probe,
     )
 }
 
-async fn stream(destination: &StorageEnum, entry: &ObservedEntry) -> Result<()> {
-    let handle = StorageEnum::prepare_stream(destination, entry).await?;
+async fn stream(destination: &StorageContext, entry: &ObservedEntry) -> Result<()> {
+    let handle = StorageContext::prepare_stream(destination, entry).await?;
     let (tx, rx) = mpsc::channel(2);
     tx.send(PositionedChunk {
         offset: 0,
@@ -145,9 +145,9 @@ async fn stream(destination: &StorageEnum, entry: &ObservedEntry) -> Result<()> 
     .await
     .unwrap();
     drop(tx);
-    StorageEnum::write_chunk_stream(destination, entry, rx, &handle, None, Arc::new(|_, _| {})).await?;
+    StorageContext::write_chunk_stream(destination, entry, rx, &handle, None, Arc::new(|_, _| {})).await?;
     assert_eq!(handle.received_size().await, 3);
-    StorageEnum::commit_chunk_stream(destination, entry, 3, handle).await
+    StorageContext::commit_chunk_stream(destination, entry, 3, handle).await
 }
 
 #[tokio::test]
@@ -282,7 +282,7 @@ async fn unsupported_modes_fail_before_destination_mutation() {
     let entry = Arc::new(destination.get_metadata(Path::new("file")).await.unwrap());
     for mode in [TransferMode::Direct, TransferMode::Checkpoint] {
         probe.resumable.store(false, Ordering::SeqCst);
-        let error = StorageEnum::copy_file(
+        let error = StorageContext::copy_file(
             &destination,
             &destination,
             &entry,
@@ -316,10 +316,14 @@ async fn checkpoint_stream_reuses_partial_prefix_and_verifies_full_payload() {
     let mut entry = destination.get_metadata(Path::new("file")).await.unwrap();
     let size = 256 * 1024 * 1024 + 17;
     entry = crate::observed_fixtures::with_size(entry, size);
-    let first =
-        StorageEnum::prepare_stream_with_mode(&destination, &entry, TransferMode::Checkpoint, CancellationToken::new())
-            .await
-            .unwrap();
+    let first = StorageContext::prepare_stream_with_mode(
+        &destination,
+        &entry,
+        TransferMode::Checkpoint,
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
     let (tx, rx) = mpsc::channel(2);
     let prefix = 1024 * 1024 + 3;
     tx.send(PositionedChunk {
@@ -329,7 +333,7 @@ async fn checkpoint_stream_reuses_partial_prefix_and_verifies_full_payload() {
     .await
     .unwrap();
     drop(tx);
-    let error = StorageEnum::write_chunk_stream(&destination, &entry, rx, &first, None, Arc::new(|_, _| {}))
+    let error = StorageContext::write_chunk_stream(&destination, &entry, rx, &first, None, Arc::new(|_, _| {}))
         .await
         .unwrap_err();
     assert!(matches!(error, StorageError::Transfer(_)), "{error:?}");
@@ -338,17 +342,21 @@ async fn checkpoint_stream_reuses_partial_prefix_and_verifies_full_payload() {
     drop(first);
     assert_eq!(std::fs::read(root.path().join("file")).unwrap(), b"old");
 
-    let resumed =
-        StorageEnum::prepare_stream_with_mode(&destination, &entry, TransferMode::Checkpoint, CancellationToken::new())
-            .await
-            .unwrap();
+    let resumed = StorageContext::prepare_stream_with_mode(
+        &destination,
+        &entry,
+        TransferMode::Checkpoint,
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
     assert_eq!(resumed.state.lock().await.resume_offset, prefix as u64);
     let (tx, rx) = mpsc::channel(4);
     let writer_handle = resumed.clone();
     let writer_dest = destination.clone();
     let writer_entry = entry.clone();
     let writer = tokio::spawn(async move {
-        StorageEnum::write_chunk_stream(
+        StorageContext::write_chunk_stream(
             &writer_dest,
             &writer_entry,
             rx,
@@ -374,7 +382,7 @@ async fn checkpoint_stream_reuses_partial_prefix_and_verifies_full_payload() {
     }
     drop(tx);
     writer.await.unwrap().unwrap();
-    StorageEnum::commit_chunk_stream(&destination, &entry, size, resumed)
+    StorageContext::commit_chunk_stream(&destination, &entry, size, resumed)
         .await
         .unwrap();
     assert_eq!(std::fs::metadata(root.path().join("file")).unwrap().len(), size);
@@ -430,7 +438,7 @@ async fn a_selected_history_version_drives_stream_size_metadata_and_tags() {
         entry: Arc::clone(&original),
         version_index: Some(0),
     };
-    let handle = StorageEnum::prepare_observed_stream(
+    let handle = StorageContext::prepare_observed_stream(
         &destination,
         selected.view(),
         TransferMode::Atomic,
@@ -446,8 +454,8 @@ async fn a_selected_history_version_drives_stream_size_metadata_and_tags() {
     .await
     .unwrap();
     drop(tx);
-    StorageEnum::write_planned_stream(rx, &handle).await.unwrap();
-    StorageEnum::commit_chunk_stream(&destination, &original, 3, handle)
+    StorageContext::write_planned_stream(rx, &handle).await.unwrap();
+    StorageContext::commit_chunk_stream(&destination, &original, 3, handle)
         .await
         .unwrap();
     assert_eq!(std::fs::read(root.path().join("file")).unwrap(), b"old");
@@ -539,7 +547,7 @@ impl Metadata for PublishedMetadataProbe {
     }
 }
 
-async fn published_metadata_destination(fail: bool) -> (TempDir, StorageEnum, Arc<PublishedMetadataProbe>) {
+async fn published_metadata_destination(fail: bool) -> (TempDir, StorageContext, Arc<PublishedMetadataProbe>) {
     let (root, destination, stage) = destination(false).await;
     let metadata = Arc::new(PublishedMetadataProbe {
         fail,
@@ -557,11 +565,11 @@ async fn published_metadata_destination(fail: bool) -> (TempDir, StorageEnum, Ar
     .unwrap();
     (
         root,
-        StorageEnum::S3(ConnectedStorage {
+        StorageContext {
             roles,
             block_size: 4,
             reconnect_config: None,
-        }),
+        },
         metadata,
     )
 }

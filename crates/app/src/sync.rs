@@ -7,6 +7,7 @@
 //! 4. 并发复制控制
 //! 5. 重试机制集成
 
+use data_mover::model::BackendKind;
 // 标准库
 use crate::file_copy::{HdfsCopyContext, copy_file, copy_versions, prepare_directory};
 use std::iter::once;
@@ -30,7 +31,7 @@ use windows_sys::Win32::Security::TOKEN_QUERY;
 #[cfg(windows)]
 use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 use {
-    storage_adapter::{CopyOptions, ObservedEntry, StorageEnum, redact_storage_url},
+    storage_adapter::{CopyOptions, ObservedEntry, StorageContext, redact_storage_url},
     task_model::{ErrorEvent, StorageEntryMessage},
 };
 
@@ -46,9 +47,9 @@ use crate::storage_factory::{StorageRole, create_storage_for_role};
 /// 提供了简洁的接口来获取存储实例和并发配置。
 pub struct StoragePair {
     /// 源存储实例，用于读取数据
-    src_storage: Arc<StorageEnum>,
+    src_storage: Arc<StorageContext>,
     /// 目标存储实例，用于写入数据
-    dest_storage: Arc<StorageEnum>,
+    dest_storage: Arc<StorageContext>,
 }
 
 impl StoragePair {
@@ -87,7 +88,7 @@ impl StoragePair {
     ///
     /// # 返回值
     /// - 源存储实例的Arc引用
-    pub fn get_src_storage(&self) -> &Arc<StorageEnum> {
+    pub fn get_src_storage(&self) -> &Arc<StorageContext> {
         &self.src_storage
     }
 
@@ -97,7 +98,7 @@ impl StoragePair {
     ///
     /// # 返回值
     /// - 目标存储实例的Arc引用
-    pub fn get_dest_storage(&self) -> &Arc<StorageEnum> {
+    pub fn get_dest_storage(&self) -> &Arc<StorageContext> {
         &self.dest_storage
     }
 }
@@ -239,7 +240,7 @@ pub(crate) fn check_admin_privileges() -> Result<bool> {
 }
 
 pub(crate) async fn process_versioned_entry(
-    item: &ObservedItem, src_storage: Arc<StorageEnum>, dest_storage: Arc<StorageEnum>,
+    item: &ObservedItem, src_storage: Arc<StorageContext>, dest_storage: Arc<StorageContext>,
     broadcaster: BroadcastForwarder<StorageEntryMessage>, qos_manager: Option<QosManager>,
     enable_integrity_check: bool, enable_acl: bool, is_source_reserved: bool, bytes_counter: Option<Arc<AtomicU64>>,
     resume: ResumeOpts, change: EntryChange,
@@ -295,7 +296,7 @@ pub(crate) struct ProcessEntryOpts {
 
 #[allow(clippy::too_many_arguments)] // 公共入口需要逐项透传调用方上下文，封装结构会破坏 API 形态
 pub(crate) async fn process_entry(
-    entry: &Arc<ObservedEntry>, src_storage: Arc<StorageEnum>, dest_storage: Arc<StorageEnum>,
+    entry: &Arc<ObservedEntry>, src_storage: Arc<StorageContext>, dest_storage: Arc<StorageContext>,
     enable_integrity_check: bool, enable_acl: bool, is_source_reserved: bool, qos_manager: Option<QosManager>,
     bytes_counter: Option<Arc<AtomicU64>>, broadcaster: &BroadcastForwarder<StorageEntryMessage>, resume: ResumeOpts,
 ) -> Result<()> {
@@ -323,7 +324,7 @@ pub(crate) async fn process_entry(
 /// 目录 / symlink 行为与 `process_entry` 完全一致；普通文件跳过 `copy_file`，
 /// 仍执行 `set_entry_metadata` + ACL / xattr 复制。
 pub(crate) async fn process_metadata_only_entry(
-    entry: &Arc<ObservedEntry>, src_storage: Arc<StorageEnum>, dest_storage: Arc<StorageEnum>, enable_acl: bool,
+    entry: &Arc<ObservedEntry>, src_storage: Arc<StorageContext>, dest_storage: Arc<StorageContext>, enable_acl: bool,
     is_source_reserved: bool, broadcaster: &BroadcastForwarder<StorageEntryMessage>,
 ) -> Result<()> {
     let opts = ProcessEntryOpts {
@@ -337,8 +338,8 @@ pub(crate) async fn process_metadata_only_entry(
 }
 
 async fn process_entry_inner(
-    entry: &Arc<ObservedEntry>, src_storage: Arc<StorageEnum>, dest_storage: Arc<StorageEnum>, opts: ProcessEntryOpts,
-    qos_manager: Option<QosManager>, bytes_counter: Option<Arc<AtomicU64>>,
+    entry: &Arc<ObservedEntry>, src_storage: Arc<StorageContext>, dest_storage: Arc<StorageContext>,
+    opts: ProcessEntryOpts, qos_manager: Option<QosManager>, bytes_counter: Option<Arc<AtomicU64>>,
     broadcaster: &BroadcastForwarder<StorageEntryMessage>,
 ) -> Result<()> {
     let ProcessEntryOpts {
@@ -402,7 +403,7 @@ async fn process_entry_inner(
         dest_storage
             .set_entry_metadata(entry)
             .await?;
-    } else if matches!(dest_storage.as_ref(), StorageEnum::HDFS(_)) {
+    } else if dest_storage.as_ref().storage().kind() == BackendKind::Hdfs {
         let hdfs = HdfsCopyContext::from_job(&resume.job_id, resume.transfer_mode)?;
         let recorder = if resume.transfer_mode == TransferMode::Checkpoint {
             Some(CommitRecorder::start(&resume.job_dir, entry, src_storage.block_size()).await?)
@@ -448,7 +449,7 @@ async fn process_entry_inner(
         debug!("Copying file {:?}", relative_path);
 
         // 调用 data_mover 的 copy_file（处理 QoS、完整性检查、源文件删除）
-        StorageEnum::copy_file(
+        StorageContext::copy_file(
             &src_storage,
             &dest_storage,
             entry,
@@ -471,7 +472,7 @@ async fn process_entry_inner(
     // ACL 复制（目录和文件均需要，symlink 除外）
     // 支持 Local→Local（Windows）、CIFS→CIFS（跨平台）、NFS→NFS（NFSv4+），其他组合静默跳过
     if enable_acl && !entry.get_is_symlink() {
-        if let Err(err) = StorageEnum::copy_acl(&src_storage, &dest_storage, relative_path).await {
+        if let Err(err) = StorageContext::copy_acl(&src_storage, &dest_storage, relative_path).await {
             error!("Failed to copy ACL for {:?}: {}", relative_path, err);
             broadcaster
                 .broadcast(StorageEntryMessage::Error {
@@ -485,7 +486,7 @@ async fn process_entry_inner(
         }
 
         // xattr 复制（仅 NFSv4.1→NFSv4.1，其他组合静默跳过）
-        if let Err(err) = StorageEnum::copy_xattr(&src_storage, &dest_storage, relative_path).await {
+        if let Err(err) = StorageContext::copy_xattr(&src_storage, &dest_storage, relative_path).await {
             error!("Failed to copy xattr for {:?}: {}", relative_path, err);
             broadcaster
                 .broadcast(StorageEntryMessage::Error {
@@ -679,8 +680,8 @@ mod commit_recorder_tests {
 }
 
 /// 该存储是否为 S3。
-fn is_s3(storage: &StorageEnum) -> bool {
-    matches!(storage, StorageEnum::S3(_))
+fn is_s3(storage: &StorageContext) -> bool {
+    storage.storage().kind() == BackendKind::S3
 }
 
 /// 该 entry 是否应走字节级断点续传：启用 + 多块大文件（全后端：Local/NFS/CIFS/S3）。
@@ -691,7 +692,9 @@ fn is_s3(storage: &StorageEnum) -> bool {
 ///   额外要求 size > 目标端 block_size（part 大小下限），单 part 文件续传无意义
 ///   （中断即全丢），走普通拷贝即可。
 /// - **S3 多版本路径**：版本化源固定 version_id，并遵循同一显式策略。
-pub(crate) fn should_resume(resume: &ResumeOpts, entry: &ObservedEntry, src: &StorageEnum, dest: &StorageEnum) -> bool {
+pub(crate) fn should_resume(
+    resume: &ResumeOpts, entry: &ObservedEntry, src: &StorageContext, dest: &StorageContext,
+) -> bool {
     resume.transfer_mode == TransferMode::Checkpoint
         && !resume.job_dir.is_empty()
         && !entry.get_is_dir()
@@ -711,8 +714,9 @@ pub(crate) fn should_resume(resume: &ResumeOpts, entry: &ObservedEntry, src: &St
 ///   （data-mover 以 ListParts 反推缺失区间，忽略此处传入的 `missing`）；
 ///   本地状态文件仍随 part 回调更新，仅作进度参考。
 pub(crate) async fn copy_file_with_resume(
-    entry: &Arc<ObservedEntry>, src_storage: &StorageEnum, dest_storage: &StorageEnum, enable_integrity_check: bool,
-    is_source_reserved: bool, qos_manager: Option<QosManager>, bytes_counter: Option<Arc<AtomicU64>>, job_dir: &str,
+    entry: &Arc<ObservedEntry>, src_storage: &StorageContext, dest_storage: &StorageContext,
+    enable_integrity_check: bool, is_source_reserved: bool, qos_manager: Option<QosManager>,
+    bytes_counter: Option<Arc<AtomicU64>>, job_dir: &str,
 ) -> Result<()> {
     let dest_rel = entry.get_relative_path();
     let recorder = CommitRecorder::start(job_dir, entry, src_storage.block_size()).await?;
@@ -724,7 +728,7 @@ pub(crate) async fn copy_file_with_resume(
         on_committed: recorder.callback(),
     };
 
-    let res = StorageEnum::copy_file_resumable(
+    let res = StorageContext::copy_file_resumable(
         src_storage,
         dest_storage,
         entry,
@@ -746,8 +750,8 @@ pub(crate) async fn copy_file_with_resume(
 
 /// 处理单个文件或目录的复制
 pub(crate) async fn process_rename_entry(
-    from_entry: Arc<ObservedEntry>, to_entry: Arc<ObservedEntry>, src_storage: Arc<StorageEnum>,
-    dest_storage: Arc<StorageEnum>, is_source_reserved: bool,
+    from_entry: Arc<ObservedEntry>, to_entry: Arc<ObservedEntry>, src_storage: Arc<StorageContext>,
+    dest_storage: Arc<StorageContext>, is_source_reserved: bool,
 ) -> Result<()> {
     let from_path = from_entry.get_relative_path();
     let to_path = to_entry.get_relative_path();

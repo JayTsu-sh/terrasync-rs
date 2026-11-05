@@ -29,7 +29,7 @@ use crate::remote_inventory::NdxEvent;
 use crate::storage_factory::{StorageRole, create_storage_for_role};
 use rustls::pki_types::CertificateDer;
 #[cfg(test)]
-use storage_adapter::StorageEnum;
+use storage_adapter::StorageContext;
 use storage_adapter::filter::parse_filter_expression;
 use tokio::sync::Mutex as AsyncMutex;
 use tracing::{info, warn};
@@ -274,7 +274,7 @@ mod tests {
 
     use super::*;
 
-    async fn create_storage(path: &str, block_size: Option<u64>, ensure_dir: bool) -> Result<StorageEnum> {
+    async fn create_storage(path: &str, block_size: Option<u64>, ensure_dir: bool) -> Result<StorageContext> {
         let role = if ensure_dir {
             StorageRole::Destination
         } else {
@@ -670,7 +670,7 @@ mod tests {
     /// 复用生产代码路径验证 redo 状态机。
     async fn run_pipeline(
         sender_transport: &(dyn SenderTransport + 'static), receiver_transport: InProcessReceiverTransport,
-        src_dir: &std::path::Path, dest_storage: Arc<StorageEnum>, enable_integrity_check: bool,
+        src_dir: &std::path::Path, dest_storage: Arc<StorageContext>, enable_integrity_check: bool,
     ) -> (u64, u64) {
         let src_storage = Arc::new(create_storage(src_dir.to_str().unwrap(), None, false).await.unwrap());
         let walkdir_iter = directory_pages(
@@ -735,7 +735,7 @@ mod tests {
     /// 正确喂入 `ErrorStats`（报表口径），而不只是本地 `error_count` u64。
     async fn run_pipeline_with_disruption<'a>(
         sender_transport: &'a (dyn SenderTransport + 'static), receiver_transport: InProcessReceiverTransport,
-        src_dir: &std::path::Path, dest_storage: Arc<StorageEnum>, disrupt: impl FnOnce() + Send + 'a,
+        src_dir: &std::path::Path, dest_storage: Arc<StorageContext>, disrupt: impl FnOnce() + Send + 'a,
     ) -> (Arc<AsyncMutex<StatisticConsumer>>, u64, u64) {
         let src_storage = Arc::new(create_storage(src_dir.to_str().unwrap(), None, false).await.unwrap());
         let walkdir_iter = directory_pages(
@@ -1551,7 +1551,7 @@ mod tests {
     }
 
     // ============================================================
-    // Receiver 分类信号正确性（issue #23 测试计划 2）：双端真实 StorageEnum +
+    // Receiver 分类信号正确性（issue #23 测试计划 2）：双端真实 StorageContext +
     // receiver_task_remote，验证 New/Changed(含 MetadataOnly)/Skip/Deleted 五类判定
     // 各自产生正确的 wire 信号，且执行动作（是否传输/是否本地改元数据/是否删除）与
     // 判定一致。
@@ -1564,7 +1564,7 @@ mod tests {
     /// （receiver 侧使用默认 512MiB），需要 override 见
     /// `spawn_receiver_and_handshake_with_threshold`。
     async fn spawn_receiver_and_handshake(
-        dest_storage: Arc<StorageEnum>, delete_target: bool, delta_enabled: bool,
+        dest_storage: Arc<StorageContext>, delete_target: bool, delta_enabled: bool,
     ) -> (InProcessSenderTransport, JoinHandle<Result<()>>) {
         spawn_receiver_and_handshake_with_threshold(dest_storage, delete_target, delta_enabled, None).await
     }
@@ -1572,7 +1572,8 @@ mod tests {
     /// 同 `spawn_receiver_and_handshake`，另可指定 `delta_size_threshold`（透传给
     /// `SessionConfig`，供 issue #54 阶段 0 的 size 门槛降级测试使用）。
     async fn spawn_receiver_and_handshake_with_threshold(
-        dest_storage: Arc<StorageEnum>, delete_target: bool, delta_enabled: bool, delta_size_threshold: Option<String>,
+        dest_storage: Arc<StorageContext>, delete_target: bool, delta_enabled: bool,
+        delta_size_threshold: Option<String>,
     ) -> (InProcessSenderTransport, JoinHandle<Result<()>>) {
         let (sender_transport, receiver_transport) = create_in_process_pair();
         let receiver_handle =

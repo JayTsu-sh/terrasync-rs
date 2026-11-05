@@ -13,7 +13,7 @@ use task_model::ObservedEntryExt;
 // 外部 crate
 use bytes::{Bytes, BytesMut};
 use storage_adapter::error::Result as StorageResult;
-use storage_adapter::{ObservedEntry, StorageEnum, StreamChunk, StreamHandle};
+use storage_adapter::{ObservedEntry, StorageContext, StreamChunk, StreamHandle};
 use sync_delta::DeltaToken;
 use sync_delta::reconstruct::{ReconstructStep, Reconstructor};
 use task_model::observation::ObservedItem;
@@ -94,7 +94,7 @@ struct DeltaCtx {
 /// 持有 disk-commit 接受的单个文件完整落盘生命周期。
 /// 外层 task 只分派命令；本模块决定文件是否 active 以及如何 settle。
 pub(crate) struct FileCommitter {
-    dest: Arc<StorageEnum>,
+    dest: Arc<StorageContext>,
     session: SessionConfig,
     ack_tx: mpsc::UnboundedSender<DcAck>,
     progress: Arc<ReceiverProgress>,
@@ -104,7 +104,7 @@ pub(crate) struct FileCommitter {
 
 impl FileCommitter {
     pub(crate) fn new(
-        dest: Arc<StorageEnum>, session: SessionConfig, ack_tx: mpsc::UnboundedSender<DcAck>,
+        dest: Arc<StorageContext>, session: SessionConfig, ack_tx: mpsc::UnboundedSender<DcAck>,
         progress: Arc<ReceiverProgress>, cancel: CancellationToken,
     ) -> Self {
         Self {
@@ -159,7 +159,7 @@ impl FileCommitter {
         } else {
             0
         };
-        match StorageEnum::prepare_observed_stream(
+        match StorageContext::prepare_observed_stream(
             &self.dest,
             entry.view(),
             self.session.transfer_mode,
@@ -171,7 +171,7 @@ impl FileCommitter {
                 let (tx_inner, rx_inner) = mpsc::channel::<StreamChunk>(8);
                 let writer_handle = handle.clone();
                 let write_join =
-                    tokio::spawn(async move { StorageEnum::write_planned_stream(rx_inner, &writer_handle).await });
+                    tokio::spawn(async move { StorageContext::write_planned_stream(rx_inner, &writer_handle).await });
                 let size = entry.get_size();
                 let mode = delta_block_size.map_or(ActiveFileMode::Full, |block_size| {
                     ActiveFileMode::Delta(DeltaCtx {
@@ -351,7 +351,7 @@ impl FileCommitter {
 /// 关闭输入后校验长度和源摘要，再由 expert 引擎校验目标并发布。
 /// 失败由会话清理其拥有的 stage，上报 outcome 后由 Receiver 决定是否 redo。
 async fn finalize_file(
-    dest: &Arc<StorageEnum>, session: &SessionConfig, a: ActiveFile, source_hash: Option<String>,
+    dest: &Arc<StorageContext>, session: &SessionConfig, a: ActiveFile, source_hash: Option<String>,
     progress: &Arc<ReceiverProgress>,
 ) -> CommitOutcome {
     let ActiveFile {
@@ -394,7 +394,7 @@ async fn finalize_file(
     }
 
     // 引擎完成读回校验与发布。
-    if let Err(e) = StorageEnum::commit_chunk_stream(dest, &entry.entry, size, handle).await {
+    if let Err(e) = StorageContext::commit_chunk_stream(dest, &entry.entry, size, handle).await {
         error!("[dc] commit {:?}: {}", entry.get_relative_path(), e);
         return CommitOutcome::HardError(AppError::from(e));
     }
@@ -416,7 +416,7 @@ async fn finalize_file(
 /// basis 读失败视为该文件的 `HardError`，中止当前 `ActiveFile`（清理当前 stage，语义同
 /// `AbortFile`）——中止后残余 token 因 `active` 已为 `None` 被静默丢弃，与 `FileChunk`
 /// 的"写 channel 已关闭"降噪处理同构。
-async fn settle_and_remove(_dest: &StorageEnum, active: ActiveFile) {
+async fn settle_and_remove(_dest: &StorageContext, active: ActiveFile) {
     let ActiveFile {
         tx_inner,
         write_join,
@@ -439,8 +439,10 @@ fn stage_error(stage: &'static str, source: AppError) -> CommitOutcome {
 /// 读取 basis file（目标端当前已有文件）的 `[offset, offset + len)` 区间，用于 `Match`
 /// token 重建。经 `read_chunk_stream` 公共入口（`intervals=Some`）读取——避免绕过已修复
 /// 的 NFS 短读处理（issue #54 阶段 3）。
-async fn read_basis_block(dest: &Arc<StorageEnum>, entry: &Arc<ObservedEntry>, offset: u64, len: u32) -> Result<Bytes> {
-    let (mut rx, handle) = StorageEnum::read_basis_chunk_stream(
+async fn read_basis_block(
+    dest: &Arc<StorageContext>, entry: &Arc<ObservedEntry>, offset: u64, len: u32,
+) -> Result<Bytes> {
+    let (mut rx, handle) = StorageContext::read_basis_chunk_stream(
         dest,
         entry,
         Some(vec![(offset, offset + u64::from(len))]),
@@ -460,7 +462,7 @@ async fn read_basis_block(dest: &Arc<StorageEnum>, entry: &Arc<ObservedEntry>, o
 }
 
 /// 连续的 basis 引用合并为有界读取，避免大文件逐块反复打开和描述目标。
-async fn flush_basis(dest: &Arc<StorageEnum>, active: &mut ActiveFile) -> Result<()> {
+async fn flush_basis(dest: &Arc<StorageContext>, active: &mut ActiveFile) -> Result<()> {
     let ActiveFileMode::Delta(delta) = &mut active.mode else {
         return Ok(());
     };

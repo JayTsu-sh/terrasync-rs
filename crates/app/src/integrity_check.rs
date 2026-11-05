@@ -14,13 +14,15 @@
 
 #[cfg(feature = "license")]
 use chrono::DateTime;
+#[cfg(feature = "license")]
+use data_mover::model::BackendKind;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 #[cfg(feature = "license")]
-use storage_adapter::storage_enum::{StorageType, detect_storage_type};
+use storage_adapter::backend_kind_from_location;
 use task_model::ErrorEvent;
 use task_model::ObservedEntryExt;
 
@@ -29,7 +31,7 @@ use tracing::{Instrument, debug, error, info, info_span, instrument, warn};
 use {
     storage_adapter::{
         IntegrityCheck, IntegrityCheckMode, IntegrityCheckOptions, MismatchDataField, MismatchMetaField,
-        MtimePrecision, ObservedEntry, StorageEnum, redact_storage_url,
+        MtimePrecision, ObservedEntry, StorageContext, redact_storage_url,
     },
     task_model::StorageEntryMessage,
 };
@@ -159,7 +161,7 @@ fn classify_lookup_error(entry_type: &'static str, relative_path: &Path, err: &S
 
 /// 对单个条目尝试 auto-fix；返回最终 `FixStatus` 和 issue 应填充的 mismatches 标签。
 async fn apply_auto_fix(
-    dest_storage: &StorageEnum, relative_path: &Path, entry_type: &'static str, src: &ObservedEntry,
+    dest_storage: &StorageContext, relative_path: &Path, entry_type: &'static str, src: &ObservedEntry,
     has_content_mismatch: bool,
 ) -> FixStatus {
     // 文件 auto-fix 只改 uid/gid/mode；目录额外尝试改 mtime；symlink 改 mtime/uid/gid（mode 无效）。
@@ -188,7 +190,7 @@ async fn apply_auto_fix(
 
 /// 构造一条 mismatch issue（按 `auto_fix` 决定 `FixStatus`）。
 async fn build_mismatch_issue(
-    dest_storage: &StorageEnum, relative_path: &Path, entry_type: &'static str, src: &ObservedEntry,
+    dest_storage: &StorageContext, relative_path: &Path, entry_type: &'static str, src: &ObservedEntry,
     mismatches: Vec<String>, auto_fix: bool,
 ) -> IntegrityIssue {
     let has_content_mismatch = detect_content_mismatch(&mismatches);
@@ -223,8 +225,8 @@ fn build_lookup_issue(entry_type: &'static str, relative_path: &Path, err: &Stor
 
 /// 单个 worker 的运行时上下文（避免 16 个 Arc 在每个 helper 之间逐个传递）。
 struct CheckContext {
-    src_storage: Arc<StorageEnum>,
-    dest_storage: Arc<StorageEnum>,
+    src_storage: Arc<StorageContext>,
+    dest_storage: Arc<StorageContext>,
     issues: Arc<Mutex<Vec<IntegrityIssue>>>,
     checked_files: Arc<AtomicUsize>,
     checked_dirs: Arc<AtomicUsize>,
@@ -573,7 +575,7 @@ pub async fn integrity_check_with_concurrency(
 /// 仅对远程存储（NFS/S3/CIFS）启用，本地存储自动跳过。
 #[cfg(feature = "license")]
 pub(crate) async fn verify_storage_time(dest_path: &str) -> Result<()> {
-    if matches!(detect_storage_type(dest_path), StorageType::Local) {
+    if matches!(backend_kind_from_location(dest_path), BackendKind::Local) {
         return Ok(());
     }
 

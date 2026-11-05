@@ -9,7 +9,7 @@ use data_mover::{
     },
 };
 
-use crate::{ConnectedStorage, Result, WalkOptions};
+use crate::{Result, StorageContext, WalkOptions};
 
 pub(crate) struct TraversalExecution {
     pub session: TraversalSession,
@@ -17,7 +17,7 @@ pub(crate) struct TraversalExecution {
     pub recovery: Option<TraversalRecoveryStatus>,
 }
 
-impl ConnectedStorage {
+impl StorageContext {
     pub(crate) fn start_traversal(
         &self, request: TraversalRequest, options: &WalkOptions,
     ) -> Result<TraversalExecution> {

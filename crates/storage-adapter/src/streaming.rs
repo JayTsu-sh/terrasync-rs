@@ -83,7 +83,7 @@ pub(crate) fn source_qos(qos: &QosManager, maximum: u64) -> Result<SourceQosGrou
     let (_, group) = groups.get_with(key, || (Arc::downgrade(&config), SourceQosGroup::new(policy)));
     Ok(group)
 }
-impl StorageEnum {
+impl StorageContext {
     pub fn read_basis_chunk_stream(
         storage: &Self, entry: &Arc<ObservedEntry>, intervals: Option<Vec<(u64, u64)>>, qos: Option<QosManager>,
         hash: bool, capacity: usize,
@@ -257,7 +257,7 @@ impl StreamHandle {
         Ok(())
     }
 }
-impl StorageEnum {
+impl StorageContext {
     pub async fn prepare_stream(dest: &Self, entry: &ObservedEntry) -> Result<StreamHandle> {
         Self::prepare_stream_with_mode(dest, entry, TransferMode::Atomic, CancellationToken::new()).await
     }
@@ -505,7 +505,7 @@ pub(crate) fn role_failure(message: &str) -> storage::StorageRoleFailure {
         .unwrap_or_else(|_| unreachable!("固定诊断")),
     )
 }
-impl ConnectedStorage {
+impl StorageContext {
     pub async fn compute_hash(&self, p: &Path, _size: u64) -> Result<String> {
         let source = self.roles.read_source()?;
         let p = path(p)?;

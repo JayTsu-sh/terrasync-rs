@@ -12,7 +12,7 @@ use tokio::sync::{Notify, oneshot};
 use tokio::time::{Duration, timeout};
 use utils::app_config::ClickHouseMode;
 
-async fn target(root: &TempDir) -> Result<Arc<StorageEnum>> {
+async fn target(root: &TempDir) -> Result<Arc<StorageContext>> {
     Ok(Arc::new(
         create_storage_for_role(&root.path().to_string_lossy(), None, false, StorageRole::Destination).await?,
     ))

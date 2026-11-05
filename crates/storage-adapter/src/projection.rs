@@ -1,5 +1,5 @@
 //! 元数据观察与 opaque 编码；运行时直接交付原生观察，不投影为后端条目。
-use crate::{ConnectedStorage, Result, StorageError, error::operation};
+use crate::{Result, StorageContext, StorageError, error::operation};
 use data_mover::model::*;
 use data_mover::storage::SourceDescriptor;
 use data_mover::storage::StorageRoleFailure;
@@ -49,7 +49,7 @@ pub(crate) fn observation_plan(tags: bool) -> ObservationPlan {
         })
 }
 
-impl ConnectedStorage {
+impl StorageContext {
     pub(crate) fn tags_required(&self, include_tags: bool) -> Result<bool> {
         Ok(include_tags
             && !matches!(

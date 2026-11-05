@@ -4,7 +4,7 @@ use task_model::TransferMode;
 #[path = "../../../tests/support/observed.rs"]
 mod observed_fixtures;
 use std::{error::Error, os::unix::fs::MetadataExt, path::Path, sync::Arc};
-use storage_adapter::{CopyOptions, CreateStorageOptions, StorageEnum, create_storage};
+use storage_adapter::{CopyOptions, CreateStorageOptions, StorageContext, create_storage};
 
 #[tokio::test]
 async fn direct_updates_existing_inode_while_atomic_and_checkpoint_replace_it() -> Result<(), Box<dyn Error>> {
@@ -28,7 +28,7 @@ async fn direct_updates_existing_inode_while_atomic_and_checkpoint_replace_it() 
             )
             .await?;
             let entry = Arc::new(source.get_metadata(Path::new("file")).await?);
-            StorageEnum::copy_file(
+            StorageContext::copy_file(
                 &source,
                 &target,
                 &entry,

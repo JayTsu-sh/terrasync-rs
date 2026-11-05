@@ -4,6 +4,7 @@
 //! 单进程模式下 Receiver 拥有 src+dest 两个 storage（命令模式）。
 //! 双进程模式下 Receiver 仅拥有 dest storage（数据流模式，Phase 3）。
 
+use data_mover::model::BackendKind;
 // 标准库
 use crate::file_copy::{HdfsCopyContext, MetadataApplication, copied_tags_required, copy_file, prepare_directory};
 use data_mover::model::FailureClass;
@@ -16,7 +17,7 @@ use {storage_adapter::StorageError, task_model::StorageEntryMessage};
 
 // 外部 crate
 use storage_adapter::qos::QosManager;
-use storage_adapter::{ObservedEntry, StorageEnum};
+use storage_adapter::{ObservedEntry, StorageContext};
 use tokio::sync::mpsc::Receiver as MpscReceiver;
 use tokio_util::sync::CancellationToken;
 use tracing::{Instrument, debug, error, info, info_span, trace, warn};
@@ -97,13 +98,13 @@ pub struct ReceiverConfig {
 
 /// 单进程模式的 Receiver 主 task（R1 + R2 合一）
 ///
-/// 从 transport 接收 `SenderMsg`，调用 `StorageEnum` 方法执行写入。
+/// 从 transport 接收 `SenderMsg`，调用 `StorageContext` 方法执行写入。
 /// 每完成一个 entry 后通过 transport 发送 `ReceiverMsg::EntrySuccess` 或 `EntryError`。
 ///
 /// 单进程模式下收到 `CopyEntry` 消息时，Receiver 有 src+dest storage，
 /// 直接调用 `process_entry_on_receiver()` 完成完整复制。
 pub async fn receiver_task(
-    transport: &(dyn ReceiverTransport + 'static), src_storage: Arc<StorageEnum>, dest_storage: Arc<StorageEnum>,
+    transport: &(dyn ReceiverTransport + 'static), src_storage: Arc<StorageContext>, dest_storage: Arc<StorageContext>,
     config: &ReceiverConfig, qos_manager: Option<QosManager>, bytes_tracker: Option<Arc<AtomicU64>>,
 ) -> Result<()> {
     info!("[Receiver] Started");
@@ -190,7 +191,7 @@ pub async fn receiver_task(
 /// 根据 entry 类型（目录/符号链接/文件）dispatch 到不同的存储操作。
 /// 单进程模式下 Receiver 拥有 src+dest storage，可以直接调用 `copy_file`。
 pub(crate) async fn process_entry_on_receiver(
-    entry: &Arc<ObservedEntry>, src_storage: &Arc<StorageEnum>, dest_storage: &Arc<StorageEnum>,
+    entry: &Arc<ObservedEntry>, src_storage: &Arc<StorageContext>, dest_storage: &Arc<StorageContext>,
     config: &ReceiverConfig, qos_manager: Option<QosManager>, bytes_counter: Option<Arc<AtomicU64>>,
 ) -> Result<()> {
     let relative_path = entry.get_relative_path();
@@ -220,7 +221,7 @@ pub(crate) async fn process_entry_on_receiver(
                 job_dir: config.job_dir.clone(),
                 transfer_mode: config.transfer_mode,
             };
-            if matches!(dest_storage.as_ref(), StorageEnum::HDFS(_)) {
+            if dest_storage.as_ref().storage().kind() == BackendKind::Hdfs {
                 let hdfs = HdfsCopyContext::from_job(&config.job_id, config.transfer_mode)?;
                 let recorder = if config.transfer_mode == TransferMode::Checkpoint {
                     Some(CommitRecorder::start(&config.job_dir, entry, src_storage.block_size()).await?)
@@ -290,7 +291,7 @@ pub(crate) async fn process_entry_on_receiver(
         // ACL 复制（目录和文件均需要，symlink 除外）
         if config.enable_acl
             && !entry.get_is_symlink()
-            && let Err(e) = StorageEnum::copy_acl(src_storage, dest_storage, relative_path).await
+            && let Err(e) = StorageContext::copy_acl(src_storage, dest_storage, relative_path).await
         {
             error!("[Receiver] Failed to copy ACL for {:?}: {}", relative_path, e);
         }
@@ -320,7 +321,7 @@ pub(crate) async fn process_entry_on_receiver(
 /// `expected_token`：`serve --token` 配置的期望值；为 `None` 时跳过鉴权（向后兼容，
 /// 未配置 token 时不校验，仍需完成 `Auth` 消息交换以保持协议阶段一致）。
 pub async fn receiver_task_remote(
-    transport: &(dyn ReceiverTransport + 'static), dest_storage: Arc<StorageEnum>, expected_token: Option<&str>,
+    transport: &(dyn ReceiverTransport + 'static), dest_storage: Arc<StorageContext>, expected_token: Option<&str>,
 ) -> Result<()> {
     info!("[Receiver Remote] Started, waiting for Handshake");
 
@@ -387,7 +388,7 @@ pub async fn receiver_task_remote(
 /// 版本不兼容时发送 `Rejected` 后立即返回错误，不进入 `SessionConfig` / 文件列表阶段，
 /// 确保拒绝发生在任何 `FilePage` / `TransferRequest` / `CopyEntry` 之前。
 async fn recv_and_negotiate_handshake(
-    transport: &(dyn ReceiverTransport + 'static), destination: &StorageEnum,
+    transport: &(dyn ReceiverTransport + 'static), destination: &StorageContext,
 ) -> Result<FeatureFlags> {
     loop {
         match transport.recv().await {
@@ -498,7 +499,7 @@ pub(crate) fn validate_relative_path(path: &Path) -> Result<()> {
 }
 
 /// 目标端枚举失败时，不能据此判定文件缺失或需要删除。
-async fn read_destination_index(storage: &StorageEnum, directory: &str) -> Result<DestIndex> {
+async fn read_destination_index(storage: &StorageContext, directory: &str) -> Result<DestIndex> {
     let mut index = DestIndex::new();
     let iterator = match storage
         .read_directory(Path::new(directory), copied_tags_required(storage)?)
@@ -557,7 +558,7 @@ async fn read_destination_index(storage: &StorageEnum, directory: &str) -> Resul
 /// `EndOfFile`/`CreateSymlink` 完成处理），只有二者相等**且**已经见过 `TransferDone`，
 /// 才真正结束循环。
 pub(crate) async fn recv_file_list_and_data_phase(
-    transport: &(dyn ReceiverTransport + 'static), dest_storage: &Arc<StorageEnum>, session_config: &SessionConfig,
+    transport: &(dyn ReceiverTransport + 'static), dest_storage: &Arc<StorageContext>, session_config: &SessionConfig,
     negotiated_features: &FeatureFlags, delta_size_threshold: u64, progress: &Arc<ReceiverProgress>,
     mut progress_rx: MpscReceiver<ProgressSnapshot>, state: &mut RemoteSessionState,
 ) -> Result<()> {

@@ -7,13 +7,13 @@ mod observed_fixtures;
 use bytes::Bytes;
 use data_mover::transfer::DirectPatchError;
 use std::{error::Error, os::unix::fs::MetadataExt, path::Path};
-use storage_adapter::{CreateStorageOptions, ObservedEntry, StorageEnum, StorageError, create_storage};
+use storage_adapter::{CreateStorageOptions, ObservedEntry, StorageContext, StorageError, create_storage};
 use tokio::sync::mpsc;
 use tokio::time::{Duration, timeout};
 use tokio_util::sync::CancellationToken;
 
 async fn planned(
-    target: &StorageEnum, payload: &[u8],
+    target: &StorageContext, payload: &[u8],
 ) -> Result<(ObservedEntry, storage_adapter::StreamHandle), Box<dyn Error>> {
     let source_root = tempfile::tempdir()?;
     std::fs::write(source_root.path().join("file"), payload)?;
@@ -24,13 +24,14 @@ async fn planned(
     .await?;
     let entry = source.get_metadata(Path::new("file")).await?;
     let handle =
-        StorageEnum::prepare_stream_with_mode(target, &entry, TransferMode::Direct, CancellationToken::new()).await?;
+        StorageContext::prepare_stream_with_mode(target, &entry, TransferMode::Direct, CancellationToken::new())
+            .await?;
     let (tx, rx) = mpsc::channel(4);
     let writer_target = target.clone();
     let writer_entry = entry.clone();
     let writer_handle = handle.clone();
     let writer = tokio::spawn(async move {
-        StorageEnum::write_chunk_stream(
+        StorageContext::write_chunk_stream(
             &writer_target,
             &writer_entry,
             rx,
@@ -74,7 +75,7 @@ async fn direct_only_writes_changed_ranges_and_handles_moves_growth_and_shrinkag
             old,
             "planning must keep every basis byte intact"
         );
-        StorageEnum::commit_chunk_stream(&target, &entry, new.len() as u64, handle.clone()).await?;
+        StorageContext::commit_chunk_stream(&target, &entry, new.len() as u64, handle.clone()).await?;
         assert_eq!(std::fs::read(root.path().join("file"))?, new);
         assert_eq!(std::fs::metadata(root.path().join("file"))?.ino(), inode);
         assert_eq!(handle.written_bytes().await, changed);
@@ -96,7 +97,7 @@ async fn interrupted_direct_and_concurrent_basis_change_do_not_apply_planned_pat
     assert_eq!(std::fs::read(root.path().join("file"))?, b"AAAABBBB");
     let (entry, handle) = planned(&target, b"AAAAXXXX").await?;
     std::fs::write(root.path().join("file"), b"EXTERNAL")?;
-    let error = StorageEnum::commit_chunk_stream(&target, &entry, 8, handle)
+    let error = StorageContext::commit_chunk_stream(&target, &entry, 8, handle)
         .await
         .expect_err("changed basis must be rejected");
     assert!(matches!(
@@ -119,7 +120,7 @@ async fn cancelled_direct_commit_preserves_basis_and_parent_is_not_cancelled_by_
     .await?;
     let (entry, handle) = planned(&target, b"AAAAXXXX").await?;
     handle.cancel();
-    let error = StorageEnum::commit_chunk_stream(&target, &entry, 8, handle)
+    let error = StorageContext::commit_chunk_stream(&target, &entry, 8, handle)
         .await
         .expect_err("取消后不得应用已经接收的补丁");
     assert!(error.is_cancelled());
@@ -127,7 +128,8 @@ async fn cancelled_direct_commit_preserves_basis_and_parent_is_not_cancelled_by_
     assert_eq!(std::fs::read(root.path().join("file"))?, b"AAAABBBB");
 
     let parent = CancellationToken::new();
-    let handle = StorageEnum::prepare_stream_with_mode(&target, &entry, TransferMode::Direct, parent.clone()).await?;
+    let handle =
+        StorageContext::prepare_stream_with_mode(&target, &entry, TransferMode::Direct, parent.clone()).await?;
     handle.discard().await?;
     assert!(!parent.is_cancelled());
     Ok(())
@@ -144,9 +146,10 @@ async fn caller_cancellation_interrupts_direct_writer_waiting_for_input() -> Res
     .await?;
     let entry = target.get_metadata(Path::new("file")).await?;
     let cancel = CancellationToken::new();
-    let handle = StorageEnum::prepare_stream_with_mode(&target, &entry, TransferMode::Direct, cancel.clone()).await?;
+    let handle =
+        StorageContext::prepare_stream_with_mode(&target, &entry, TransferMode::Direct, cancel.clone()).await?;
     let (_tx, rx) = mpsc::channel(1);
-    let writing = StorageEnum::write_planned_stream(rx, &handle);
+    let writing = StorageContext::write_planned_stream(rx, &handle);
     let (result, ()) = tokio::join!(timeout(Duration::from_secs(1), writing), async {
         tokio::task::yield_now().await;
         cancel.cancel();

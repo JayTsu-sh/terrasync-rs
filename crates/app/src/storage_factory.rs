@@ -1,6 +1,7 @@
+use data_mover::model::BackendKind;
 use storage_adapter::{
-    BackendConfig, CreateStorageOptions, HdfsConfig, HdfsKerberosCredentials, StorageEnum, StorageType,
-    detect_storage_type,
+    BackendConfig, CreateStorageOptions, HdfsConfig, HdfsKerberosCredentials, StorageContext,
+    backend_kind_from_location,
 };
 use utils::app_config::{AppConfig, HdfsClientConfig, StorageConfig};
 
@@ -25,9 +26,9 @@ fn configured_hdfs(config: &HdfsClientConfig) -> HdfsConfig {
 }
 
 fn create_storage_options(
-    storage_type: StorageType, block_size: Option<u64>, ensure_dir: bool, role: StorageRole, storage: &StorageConfig,
+    storage_type: BackendKind, block_size: Option<u64>, ensure_dir: bool, role: StorageRole, storage: &StorageConfig,
 ) -> Result<CreateStorageOptions> {
-    let backend = if matches!(storage_type, StorageType::Hdfs) {
+    let backend = if matches!(storage_type, BackendKind::Hdfs) {
         let hdfs = match role {
             StorageRole::Source => storage.source.hdfs.as_ref(),
             StorageRole::Destination => storage.destination.hdfs.as_ref(),
@@ -47,9 +48,9 @@ fn create_storage_options(
 
 pub async fn create_storage_for_role(
     path: &str, block_size: Option<u64>, ensure_dir: bool, role: StorageRole,
-) -> Result<StorageEnum> {
-    let storage_type = detect_storage_type(path);
-    let storage = if matches!(storage_type, StorageType::Hdfs) {
+) -> Result<StorageContext> {
+    let storage_type = backend_kind_from_location(path);
+    let storage = if matches!(storage_type, BackendKind::Hdfs) {
         AppConfig::fetch()?.storage
     } else {
         StorageConfig::default()
@@ -64,10 +65,11 @@ pub async fn create_storage_for_role(
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
+    use data_mover::model::BackendKind;
     use std::collections::HashMap;
     use std::path::PathBuf;
 
-    use storage_adapter::{BackendConfig, StorageType};
+    use storage_adapter::BackendConfig;
     use utils::app_config::{HdfsClientConfig, HdfsKerberosConfig, StorageConfig, StorageRoleConfig};
 
     use super::{StorageRole, create_storage_options};
@@ -94,9 +96,9 @@ mod tests {
             },
         };
 
-        let source = create_storage_options(StorageType::Hdfs, None, false, StorageRole::Source, &storage).unwrap();
+        let source = create_storage_options(BackendKind::Hdfs, None, false, StorageRole::Source, &storage).unwrap();
         let destination =
-            create_storage_options(StorageType::Hdfs, None, true, StorageRole::Destination, &storage).unwrap();
+            create_storage_options(BackendKind::Hdfs, None, true, StorageRole::Destination, &storage).unwrap();
 
         let BackendConfig::Hdfs(source) = source.backend else {
             panic!("source HDFS config must be selected");
@@ -124,14 +126,14 @@ mod tests {
             ..StorageConfig::default()
         };
 
-        let options = create_storage_options(StorageType::Nfs, None, false, StorageRole::Source, &storage).unwrap();
+        let options = create_storage_options(BackendKind::Nfs, None, false, StorageRole::Source, &storage).unwrap();
         assert_eq!(options.backend, BackendConfig::Default);
     }
 
     #[test]
     fn hdfs_options_reject_missing_role_configuration_without_ambient_fallback() {
         let error = create_storage_options(
-            StorageType::Hdfs,
+            BackendKind::Hdfs,
             None,
             false,
             StorageRole::Source,

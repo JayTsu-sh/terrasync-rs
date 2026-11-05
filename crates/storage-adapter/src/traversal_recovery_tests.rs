@@ -53,7 +53,7 @@ impl Metadata for StalledNamespace {
     }
 }
 
-fn storage() -> ConnectedStorage {
+fn storage() -> StorageContext {
     let unavailable = CapabilityAvailability::Unsupported(UnsupportedReason::new("unused in traversal test").unwrap());
     let roles = StorageBuilder::new(
         BackendIdentity::new(BackendKind::S3, "recovery-options").unwrap(),
@@ -68,7 +68,7 @@ fn storage() -> ConnectedStorage {
     .metadata(Arc::new(StalledNamespace))
     .build()
     .unwrap();
-    ConnectedStorage {
+    StorageContext {
         roles,
         block_size: 4096,
         reconnect_config: None,

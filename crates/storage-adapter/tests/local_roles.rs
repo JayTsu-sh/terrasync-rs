@@ -11,13 +11,13 @@ use tokio::fs::{create_dir_all, write};
 use tokio_util::sync::CancellationToken;
 use {
     storage_adapter::{
-        CopyOptions, CreateStorageOptions, ResumableScanItem, ScanSourceMode, StorageEnum, TarPackOptions, WalkOptions,
-        create_storage,
+        CopyOptions, CreateStorageOptions, ResumableScanItem, ScanSourceMode, StorageContext, TarPackOptions,
+        WalkOptions, create_storage,
     },
     task_model::StorageEntryMessage,
 };
 
-async fn local(root: &Path) -> storage_adapter::Result<StorageEnum> {
+async fn local(root: &Path) -> storage_adapter::Result<StorageContext> {
     create_storage(
         root.to_str()
             .ok_or_else(|| storage_adapter::StorageError::InvalidPath("test root".into()))?,
@@ -147,7 +147,7 @@ async fn role_copy_replaces_shorter_file_and_move_removes_only_verified_source()
     let src = local(source.path()).await?;
     let dst = local(destination.path()).await?;
     let entry = Arc::new(src.get_metadata(Path::new("payload")).await?);
-    StorageEnum::copy_file(
+    StorageContext::copy_file(
         &src,
         &dst,
         &entry,
@@ -160,7 +160,7 @@ async fn role_copy_replaces_shorter_file_and_move_removes_only_verified_source()
     .await?;
     assert_eq!(tokio::fs::read(destination.path().join("payload")).await?, b"new");
     assert!(source.path().join("payload").exists());
-    StorageEnum::copy_file(
+    StorageContext::copy_file(
         &src,
         &dst,
         &entry,
@@ -183,13 +183,13 @@ async fn streamed_destination_is_published_only_after_complete() -> TestResult {
     let src = local(source.path()).await?;
     let dst = local(destination.path()).await?;
     let entry = Arc::new(src.get_metadata(Path::new("payload")).await?);
-    let handle = StorageEnum::prepare_stream(&dst, &entry).await?;
+    let handle = StorageContext::prepare_stream(&dst, &entry).await?;
     let (tx, rx) = tokio::sync::mpsc::channel(1);
     let writer_dst = dst.clone();
     let writer_entry = entry.clone();
     let writer_handle = handle.clone();
     let writer = tokio::spawn(async move {
-        StorageEnum::write_chunk_stream(
+        StorageContext::write_chunk_stream(
             &writer_dst,
             &writer_entry,
             rx,
@@ -210,7 +210,7 @@ async fn streamed_destination_is_published_only_after_complete() -> TestResult {
     writer.await??;
     assert_eq!(tokio::fs::read(destination.path().join("payload")).await?, b"old");
     assert_eq!(handle.received_size().await, payload.len() as u64);
-    StorageEnum::commit_chunk_stream(&dst, &entry, payload.len() as u64, handle).await?;
+    StorageContext::commit_chunk_stream(&dst, &entry, payload.len() as u64, handle).await?;
     assert_eq!(tokio::fs::read(destination.path().join("payload")).await?, payload);
     Ok(())
 }
@@ -223,7 +223,7 @@ async fn short_stream_cannot_replace_an_existing_destination() -> TestResult {
     let src = local(source.path()).await?;
     let dst = local(destination.path()).await?;
     let entry = Arc::new(src.get_metadata(Path::new("payload")).await?);
-    let handle = StorageEnum::prepare_stream(&dst, &entry).await?;
+    let handle = StorageContext::prepare_stream(&dst, &entry).await?;
     let (tx, rx) = tokio::sync::mpsc::channel(1);
     tx.send(PositionedChunk {
         offset: 0,
@@ -232,7 +232,7 @@ async fn short_stream_cannot_replace_an_existing_destination() -> TestResult {
     .await?;
     drop(tx);
     assert!(
-        StorageEnum::write_chunk_stream(&dst, &entry, rx, &handle, None, Arc::new(|_, _| {}))
+        StorageContext::write_chunk_stream(&dst, &entry, rx, &handle, None, Arc::new(|_, _| {}))
             .await
             .is_err()
     );
@@ -249,7 +249,7 @@ async fn tar_uses_checked_pax_size_and_bounded_source_reads() -> TestResult {
     let src = local(source.path()).await?;
     let dst = local(destination.path()).await?;
     let entry = Arc::new(src.get_metadata(Path::new(&name)).await?);
-    let size = StorageEnum::pack_files_to_tar(
+    let size = StorageContext::pack_files_to_tar(
         &src,
         &dst,
         &[entry],
@@ -334,7 +334,7 @@ async fn caller_offset_records_cannot_authorize_destination_resume() -> TestResu
         missing_intervals: Vec::new(),
         on_committed: Arc::new(|_, _| {}),
     };
-    StorageEnum::copy_file_resumable(
+    StorageContext::copy_file_resumable(
         &src,
         &dst,
         &entry,
@@ -415,7 +415,7 @@ async fn copied_observation_rejects_source_changes_before_any_target_write() -> 
         modes.push(TransferMode::Direct);
     }
     for transfer_mode in modes {
-        let result = StorageEnum::copy_file(
+        let result = StorageContext::copy_file(
             &src,
             &dst,
             &observed,
@@ -434,7 +434,7 @@ async fn copied_observation_rejects_source_changes_before_any_target_write() -> 
         );
         assert_eq!(tokio::fs::read(destination.path().join("payload")).await?, b"published");
     }
-    let result = StorageEnum::copy_file_resumable(
+    let result = StorageContext::copy_file_resumable(
         &src,
         &dst,
         &observed,

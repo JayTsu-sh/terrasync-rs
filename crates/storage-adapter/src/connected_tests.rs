@@ -45,7 +45,7 @@ impl Namespace for NfsProbeNamespace {
 
 fn nfs(
     namespace: Arc<NfsProbeNamespace>,
-) -> std::result::Result<ConnectedStorage, Box<dyn std::error::Error + Send + Sync>> {
+) -> std::result::Result<StorageContext, Box<dyn std::error::Error + Send + Sync>> {
     let unsupported = CapabilityAvailability::Unsupported(UnsupportedReason::new("unused by connectivity")?);
     let roles = StorageBuilder::new(
         BackendIdentity::new(BackendKind::Nfs, "nfs-probe-test")?,
@@ -58,7 +58,7 @@ fn nfs(
     )
     .namespace(namespace)
     .build()?;
-    Ok(ConnectedStorage {
+    Ok(StorageContext {
         reconnect_config: None,
         roles,
         block_size: 4096,

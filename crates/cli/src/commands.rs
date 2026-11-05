@@ -383,7 +383,7 @@ pub async fn serve_cmd(listen: &str, dest_path: &str, tls_cert_out: &str, token:
         .parse()
         .map_err(|e| CliError::InvalidParameter(format!("Invalid listen address: {e}")))?;
 
-    // 3. 创建目标端 StorageEnum
+    // 3. 创建目标端 StorageContext
     let dest_storage = Arc::new(create_storage_for_role(dest_path, None, true, StorageRole::Destination).await?);
     info!("Created destination storage for: {}", redact_storage_url(dest_path));
 

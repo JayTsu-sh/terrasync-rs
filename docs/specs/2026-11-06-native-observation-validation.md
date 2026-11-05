@@ -125,6 +125,18 @@ TransferMode 移入纯任务模型，引擎策略映射保留在存储消费者�
 
 metadata-only 首次夹具创建失败，没有执行业务用例，不作为产品回归或通过证据。重跑根据真实 LIST 修改时间的差值调整两侧 PUT 的创建时序，8 次后获得完全相同的实际时间；没有修改服务时钟、伪造响应或降低断言。
 
+## 删除重复后端枚举
+
+StorageEnum 的五个变体都包装同一个连接对象，现已删除枚举、Deref 分派和 storage_enum 转发模块。实际连接状态合并为 StorageContext，只持有原生 roles、块大小与可选重连配置；没有保留旧类型别名。StorageType 同时删除；连接前 URL 分类保持原判断顺序，返回原生 BackendKind，连接后的 HDFS／S3 规则读取实际连接身份。
+
+工厂的块大小、ensure_dir、并发、角色认证与重连配置保持原样。HDFS 恢复身份、版本选择、目录元数据收尾和原始 typed errors 保留；观察和 payload 不增加复制。两项架构复审通过，workspace 全特性编译、Clippy、测试与双进程 E2E 16 例通过，记录前缀 `/tmp/terrasync-storage-context-`。
+
+对应 release SHA-256：`906365304e32d05e9d86690fcc2a09cdfa47dc0c94bc317922702b5604ada2ec`，源码记录 `/tmp/terrasync-storage-context-build-source.json`。真实验证及资源清理均通过：
+
+- Single／Cluster marker／tags 及 QUIC 17 例：`/work/terrasync-db-refactor-evidence/release-db-refactor-context-marker-tags-20261105-210946/report.json`。
+- Kerberos HDFS + ClickHouse Single 11 例：`/work/terrasync-db-refactor-evidence/release-db-refactor-context-hdfs-single-20261105-211141/report.json`。
+- Kerberos HDFS + ClickHouse Cluster 11 例：`/work/terrasync-db-refactor-evidence/release-db-refactor-context-hdfs-cluster-20261105-211147/report.json`。两种部署的 unordered／blocks 未变化第二轮 metadata_changed 均为 0→0；Local／HDFS／QUIC 复制、完整性和真实权限正确。
+
 ## 合入前仍须完成
 
 还需完成数据库目录会话与任务接口的整理，以及按设计删除 storage-adapter。任务契约与 transport 已分离，剩余存储机制和产品配置仍须分别归位。最终候选必须重跑对应 CI、真实 HDFS 和受影响故障链路，并完成全量／增量／续扫性能与峰值 RSS 对照。先前 HDFS 通过的二进制不能作为最终候选证据。

@@ -4,7 +4,7 @@ use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use storage_adapter::storage_enum::StorageEnum;
+use storage_adapter::StorageContext;
 use {
     storage_adapter::{StorageError, WalkDirAsyncIterator},
     task_model::{ErrorEvent, StorageEntryMessage},
@@ -34,7 +34,7 @@ impl DirectoryWalker {
         }
     }
 
-    async fn source_storage(&self) -> Result<StorageEnum> {
+    async fn source_storage(&self) -> Result<StorageContext> {
         create_storage_for_role(&self.config.path, None, false, StorageRole::Source).await
     }
 
@@ -106,7 +106,7 @@ impl DirectoryWalker {
 /// # 返回值
 /// - 成功时返回 `WalkDirAsyncIterator`
 /// - 失败时返回包含错误信息的 `Err`
-fn walkdir_from_file_list(storage: StorageEnum, file_list_path: &str) -> Result<WalkDirAsyncIterator> {
+fn walkdir_from_file_list(storage: StorageContext, file_list_path: &str) -> Result<WalkDirAsyncIterator> {
     // 从文件中读取文件路径
     let file = File::open(file_list_path).map_err(|e| AppError::ScanError(format!("Failed to open file list: {e}")))?;
     let reader = BufReader::new(file);

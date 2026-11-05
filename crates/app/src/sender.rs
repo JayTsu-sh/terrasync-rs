@@ -15,7 +15,7 @@ use tracing::{error, info};
 use transport::message::SenderMsg;
 use transport::traits::SenderTransport;
 use {
-    storage_adapter::{AsyncReceiver, ObservedEntry, StorageEnum},
+    storage_adapter::{AsyncReceiver, ObservedEntry, StorageContext},
     task_model::StorageEntryMessage,
 };
 
@@ -43,8 +43,8 @@ pub struct SenderWorkerConfig {
 /// 双进程模式：读取源文件数据后发送 `FileData` 流（Phase 3）。
 #[allow(clippy::too_many_arguments)]
 pub async fn sender_worker(
-    worker_id: usize, walkdir_iter: AsyncReceiver<StorageEntryMessage>, src_storage: Arc<StorageEnum>,
-    dest_storage: Arc<StorageEnum>, transport: Arc<dyn SenderTransport>,
+    worker_id: usize, walkdir_iter: AsyncReceiver<StorageEntryMessage>, src_storage: Arc<StorageContext>,
+    dest_storage: Arc<StorageContext>, transport: Arc<dyn SenderTransport>,
     broadcaster: &BroadcastForwarder<StorageEntryMessage>, config: &SenderWorkerConfig,
     qos_manager: Option<QosManager>, bytes_tracker: Option<Arc<AtomicU64>>, copy_config: &ReceiverConfig,
     active_entry_counter: Arc<AtomicUsize>, entry_counter: Arc<AtomicUsize>, size_counter: Arc<AtomicU64>,
@@ -164,9 +164,9 @@ async fn send_entry(worker_id: usize, transport: &Arc<dyn SenderTransport>, entr
 
 #[allow(clippy::too_many_arguments)]
 async fn send_packaged_entry(
-    worker_id: usize, entry: &Arc<ObservedEntry>, src_storage: &Arc<StorageEnum>, dest_storage: &Arc<StorageEnum>,
-    transport: &Arc<dyn SenderTransport>, config: &SenderWorkerConfig, qos_manager: Option<QosManager>,
-    bytes_tracker: Option<Arc<AtomicU64>>,
+    worker_id: usize, entry: &Arc<ObservedEntry>, src_storage: &Arc<StorageContext>,
+    dest_storage: &Arc<StorageContext>, transport: &Arc<dyn SenderTransport>, config: &SenderWorkerConfig,
+    qos_manager: Option<QosManager>, bytes_tracker: Option<Arc<AtomicU64>>,
 ) -> Result<()> {
     match tar_pack::pack_directory(
         src_storage,
@@ -232,7 +232,7 @@ mod tests {
 
     use super::*;
 
-    async fn create_storage(path: &str, block_size: Option<u64>, _ensure_dir: bool) -> Result<StorageEnum> {
+    async fn create_storage(path: &str, block_size: Option<u64>, _ensure_dir: bool) -> Result<StorageContext> {
         create_storage_for_role(path, block_size, false, StorageRole::Source).await
     }
 
@@ -354,7 +354,7 @@ mod tests {
     }
 
     async fn run_messages(
-        messages: Vec<StorageEntryMessage>, transport: Arc<dyn SenderTransport>, storage: Arc<StorageEnum>,
+        messages: Vec<StorageEntryMessage>, transport: Arc<dyn SenderTransport>, storage: Arc<StorageContext>,
         active: Arc<AtomicUsize>, count: Arc<AtomicUsize>,
     ) -> Result<()> {
         let (tx, rx) = async_channel::bounded(messages.len().max(1));

@@ -12,7 +12,7 @@ use task_model::TransferMode;
 use app::disk_commit::disk_commit_task;
 use app::receiver::ReceiverProgress;
 use bytes::Bytes;
-use storage_adapter::{ObservedEntry, StorageEnum, create_storage};
+use storage_adapter::{ObservedEntry, StorageContext, create_storage};
 use tokio_util::sync::CancellationToken;
 use transport::message::{DcAck, DiskCommitMsg, FileOutcome, ReceiverMsg, SessionConfig};
 
@@ -20,8 +20,8 @@ use transport::message::{DcAck, DiskCommitMsg, FileOutcome, ReceiverMsg, Session
 // disk_commit_task 测试辅助
 // ============================================================
 
-// 在 dir 上建一个 Local StorageEnum（不写任何数据文件）。
-async fn local_storage(dir: &std::path::Path) -> Arc<StorageEnum> {
+// 在 dir 上建一个 Local StorageContext（不写任何数据文件）。
+async fn local_storage(dir: &std::path::Path) -> Arc<StorageContext> {
     let storage = create_storage(
         &dir.to_string_lossy(),
         storage_adapter::CreateStorageOptions::new(None, false),
@@ -103,12 +103,12 @@ fn chunkify(bytes: &[u8], chunk_size: usize) -> Vec<(u64, Bytes)> {
 
 // 起 disk_commit_task，喂消息，收集 ack DcAck（目录/符号链接透传 ReceiverMsg；
 // 文件传输结果为 FileOutcome，redo 决策已上移到 Receiver 主 task，dc task 只上报 outcome）。
-async fn run_dc(dest: Arc<StorageEnum>, session: SessionConfig, msgs: Vec<DiskCommitMsg>) -> Vec<DcAck> {
+async fn run_dc(dest: Arc<StorageContext>, session: SessionConfig, msgs: Vec<DiskCommitMsg>) -> Vec<DcAck> {
     run_dc_inner(dest, session, msgs, true).await.0
 }
 
 async fn run_dc_inner(
-    dest: Arc<StorageEnum>, session: SessionConfig, msgs: Vec<DiskCommitMsg>, explicit_shutdown: bool,
+    dest: Arc<StorageContext>, session: SessionConfig, msgs: Vec<DiskCommitMsg>, explicit_shutdown: bool,
 ) -> (Vec<DcAck>, Arc<ReceiverProgress>) {
     let (dc_tx, dc_rx) = tokio::sync::mpsc::channel(16);
     let (ack_tx, mut ack_rx) = tokio::sync::mpsc::unbounded_channel();
