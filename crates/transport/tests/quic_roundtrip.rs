@@ -513,7 +513,7 @@ async fn test_quic_handshake_compatible_versions_roundtrip() {
         .unwrap();
 
     match sender.recv().await {
-        Some(ReceiverMsg::HandshakeAck(HandshakeResult::Accepted { features })) => {
+        Some(ReceiverMsg::HandshakeAck(HandshakeResult::Accepted { features, .. })) => {
             assert!(features.delta, "双方版本一致，delta 能力应协商成功");
         }
         other => panic!("Expected HandshakeAck(Accepted), got {:?}", other),
@@ -814,7 +814,7 @@ async fn test_quic_handshake_missing_delta_capability_downgrades() {
         .unwrap();
 
     match sender.recv().await {
-        Some(ReceiverMsg::HandshakeAck(HandshakeResult::Accepted { features })) => {
+        Some(ReceiverMsg::HandshakeAck(HandshakeResult::Accepted { features, .. })) => {
             assert!(!features.delta, "Receiver 不支持 delta 时协商结果应降级为 false");
             assert!(features.acl, "acl 双方均支持，协商结果应保持 true");
         }

@@ -252,7 +252,9 @@ impl ConsumerManager {
                     let size = event.bytes;
                     let target = match event.operation_type.as_str() {
                         "new" => &mut incremental.new,
-                        "data_changed" | "metadata_changed" | "both_changed" => &mut incremental.changed,
+                        "data_changed" | "metadata_changed" | "both_changed" | "directory_marker_removed" => {
+                            &mut incremental.changed
+                        }
                         "deleted" => &mut incremental.deleted,
                         "rename" => &mut incremental.renamed,
                         _ => continue,

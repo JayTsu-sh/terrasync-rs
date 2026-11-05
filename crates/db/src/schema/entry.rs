@@ -46,6 +46,7 @@ pub struct EntrySummary {
     pub tags: Option<String>,
     /// 版本计数
     pub version_count: Option<u32>,
+    pub marker_state: Option<String>,
 }
 
 impl EntryStatistics for EntrySummary {

@@ -8,6 +8,32 @@ use data_mover::model::{
 };
 use std::path::PathBuf;
 
+pub fn directory_marker(path: &str, tags: Vec<(String, String)>) -> ObservedEntry {
+    let directory = observation(
+        BackendKind::S3,
+        path.into(),
+        EntryKind::Directory,
+        0,
+        [0; 3],
+        None,
+        None,
+        None,
+        None,
+    );
+    let marker = observation(
+        BackendKind::S3,
+        format!("{path}/").into(),
+        EntryKind::File,
+        0,
+        [123; 3],
+        None,
+        None,
+        Some(tags),
+        None,
+    );
+    directory.with_directory_marker_object(Some(Box::new(marker))).unwrap()
+}
+
 fn value<T>(value: T) -> MetadataObservation<T> {
     MetadataObservation::Value {
         value,

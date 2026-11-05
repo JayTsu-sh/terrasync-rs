@@ -123,7 +123,7 @@ impl StorageEnum {
         let (tx, rx) = mpsc::channel(capacity.max(1));
         let task = tokio::spawn(async move {
             let source = storage.roles.read_source()?;
-            let view = item.view();
+            let view = item.view().payload();
             let p = view.source_path()?;
             let version = match binding {
                 ReadBinding::Advertised => view
@@ -353,6 +353,7 @@ impl StorageEnum {
     pub async fn prepare_observed_stream(
         dest: &Self, entry: ObservedView<'_>, mode: TransferMode, cancel: CancellationToken,
     ) -> Result<StreamHandle> {
+        let entry = entry.payload();
         let cancel = cancel.child_token();
         dest.validate_stream_transfer_mode(mode)?;
         let p = entry.source_path()?;

@@ -4,6 +4,7 @@
 //! `SessionConfig` 接收仍由外层负责；磁盘写入仍位于 disk-commit 内部 seam 后面。
 //! 当前实现委托既有事件循环，后续 tickets 将在此 interface 后逐步收拢会话状态。
 
+use crate::file_copy::copied_tags_required;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use storage_adapter::ObservedEntryExt;
@@ -227,12 +228,64 @@ impl RemoteSessionState {
                     .await;
                 continue;
             }
+            if dest.storage().holds_directory_objects() {
+                if subdir.entry.entry.directory_marker_object().is_some() {
+                    let copy_tags = match copied_tags_required(dest) {
+                        Ok(value) => value,
+                        Err(error) => {
+                            let _ = transport
+                                .send(ReceiverMsg::EntryError {
+                                    entry: Arc::clone(&subdir.entry.entry),
+                                    reason: format!("{error}"),
+                                })
+                                .await;
+                            continue;
+                        }
+                    };
+                    let decision = dest_index.check_directory_marker(&subdir.entry.entry, copy_tags);
+                    if decision == TransferDecision::Skip {
+                        let _ = transport
+                            .send(ReceiverMsg::ClassifiedObservation {
+                                ndx: subdir.ndx,
+                                decision,
+                            })
+                            .await;
+                    } else {
+                        let _ = transport
+                            .send(ReceiverMsg::TransferRequest {
+                                ndx: subdir.ndx,
+                                decision,
+                            })
+                            .await;
+                        self.ledger.record_request();
+                    }
+                } else if delete_target && dest_index.has_directory_marker(&subdir.entry.entry) {
+                    if let Err(error) = dest.remove_directory_marker(&subdir.entry.entry).await {
+                        let _ = transport
+                            .send(ReceiverMsg::EntryError {
+                                entry: Arc::clone(&subdir.entry.entry),
+                                reason: format!("{error}"),
+                            })
+                            .await;
+                    } else {
+                        dest_index.mark_directory_object_matched(&subdir.entry.entry);
+                    }
+                }
+                continue;
+            }
             if let Err(error) = dest.create_dir_all(&subdir.entry.entry).await {
                 warn!(
                     "[Receiver Remote] create_dir {:?}: {}",
                     subdir.entry.get_relative_path(),
                     error
                 );
+                let _ = transport
+                    .send(ReceiverMsg::EntryError {
+                        entry: Arc::clone(&subdir.entry.entry),
+                        reason: format!("{error}"),
+                    })
+                    .await;
+                continue;
             }
             self.created_dirs.push(Arc::clone(&subdir.entry.entry));
         }

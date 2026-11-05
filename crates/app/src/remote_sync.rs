@@ -68,7 +68,7 @@ pub(crate) async fn run(
     info!("[Sender Remote] Connected");
 
     // ── 2. 握手：协商协议版本与能力，不兼容则在发送任何 FilePage/CopyEntry 前中止 ──
-    negotiate_handshake(&transport).await?;
+    let copy_tags = negotiate_handshake(&transport).await?;
 
     // ── 2.5 Token 鉴权：握手通过后、SessionConfig 之前，鉴权失败则中止连接 ──
     send_and_check_auth(&transport, auth_token).await?;
@@ -134,7 +134,7 @@ pub(crate) async fn run(
             match_expr,
             exclude_expr,
             app_config.scan.concurrency,
-            app_config.scan.include_tags,
+            app_config.scan.include_tags || copy_tags,
         )
         .await?;
 
@@ -198,17 +198,17 @@ fn finalize_run_result(error_count: u64) -> Result<()> {
 ///
 /// 不兼容时 Receiver 会回 `Rejected`，此处直接返回错误，
 /// 调用方（`run()`）不会再发送 `SessionConfig` 及后续任何 Phase 1 数据。
-async fn negotiate_handshake(transport: &(dyn SenderTransport + 'static)) -> Result<()> {
+async fn negotiate_handshake(transport: &(dyn SenderTransport + 'static)) -> Result<bool> {
     transport
         .send(SenderMsg::Handshake(ProtocolHandshake::current()))
         .await?;
     match transport.recv().await {
-        Some(ReceiverMsg::HandshakeAck(HandshakeResult::Accepted { features })) => {
+        Some(ReceiverMsg::HandshakeAck(HandshakeResult::Accepted { features, copy_tags })) => {
             info!(
                 "[Sender Remote] Handshake accepted, negotiated features: {:?}",
                 features
             );
-            Ok(())
+            Ok(copy_tags)
         }
         Some(ReceiverMsg::HandshakeAck(HandshakeResult::Rejected { reason })) => {
             Err(TransportError::IncompatibleProtocol { reason }.into())
@@ -1476,7 +1476,7 @@ mod tests {
             };
             sender_transport.send(SenderMsg::Handshake(handshake)).await.unwrap();
             match sender_transport.recv().await {
-                Some(ReceiverMsg::HandshakeAck(HandshakeResult::Accepted { features })) => {
+                Some(ReceiverMsg::HandshakeAck(HandshakeResult::Accepted { features, .. })) => {
                     assert!(!features.delta, "delta 应协商为 false");
                 }
                 other => panic!("expected HandshakeAck(Accepted), got {other:?}"),

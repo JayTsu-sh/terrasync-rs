@@ -53,6 +53,7 @@ use crate::consumer::ConsumerManager;
 use crate::copy_completion;
 use crate::copy_execution::{CopyLease, begin_copy_catalogue};
 use crate::error::{AppError, Result};
+use crate::file_copy::copied_tags_required;
 #[cfg(feature = "license")]
 use crate::integrity_check::verify_storage_time;
 use crate::receiver::{ReceiverConfig, process_entry_on_receiver};
@@ -253,13 +254,14 @@ impl SyncOrchestrator {
                 "Packaged sync supports only Atomic mode; use --in-place".into(),
             ));
         }
-        match self.mode {
+        let copy_tags = match self.mode {
             SyncMode::Local => {
                 let destination = create_storage_for_role(&c.dest_path, None, true, StorageRole::Destination).await?;
                 destination.validate_transfer_mode(c.transfer_mode)?;
+                copied_tags_required(&destination)?
             }
-            SyncMode::Remote { .. } => {}
-        }
+            SyncMode::Remote { .. } => false,
+        };
 
         let app_config = AppConfig::fetch()?;
         // database.enabled=true 时必须成功构造；false 时忽略错误（未启用），走文件系统兜底
@@ -281,8 +283,8 @@ impl SyncOrchestrator {
 
         match &self.mode {
             SyncMode::Local => match scan_type {
-                ScanType::Full => self.run_sync().await,
-                ScanType::Incremental => self.run_incremental_sync().await,
+                ScanType::Full => self.run_sync(copy_tags).await,
+                ScanType::Incremental => self.run_incremental_sync(copy_tags).await,
             },
             // 双进程模式本就是 compare-based（DestIndex 实时比对目标端），Full/Incremental
             // 在 wire protocol 和执行路径上是同一套代码，ScanType 对 Remote 是 no-op
@@ -299,7 +301,7 @@ impl SyncOrchestrator {
     }
 
     /// 全量同步 — 通过 transport 连接 sender workers 和 receiver tasks
-    async fn run_sync(&self) -> Result<()> {
+    async fn run_sync(&self, copy_tags: bool) -> Result<()> {
         let c = &self.config;
 
         // ── License 校验 ──
@@ -338,7 +340,7 @@ impl SyncOrchestrator {
             &c.r#match,
             &c.exclude,
             c.concurrency.unwrap_or(app_config.scan.concurrency),
-            app_config.scan.include_tags,
+            app_config.scan.include_tags || copy_tags,
             &c.file_list,
             c.packaged,
             c.package_depth,
@@ -679,7 +681,7 @@ impl SyncOrchestrator {
     /// - Barrier：`drop(broadcaster_a)` + `await phase_a_handles`（base 表冲刷完毕）
     /// - Phase B：`detect_deleted_items` → 执行 dest 物理删除/重命名 → 通过 `broadcaster_b`
     ///   喂给同一组 consumers（`DatabaseConsumer` 自动完成 incremental 表写入 + base 表修正）
-    async fn run_incremental_sync(&self) -> Result<()> {
+    async fn run_incremental_sync(&self, copy_tags: bool) -> Result<()> {
         let c = &self.config;
 
         // ── License 校验 ──
@@ -718,7 +720,7 @@ impl SyncOrchestrator {
             &c.r#match,
             &c.exclude,
             c.concurrency.unwrap_or(app_config.scan.concurrency),
-            app_config.scan.include_tags,
+            app_config.scan.include_tags || copy_tags,
             &None,
             c.packaged,
             c.package_depth,
@@ -939,6 +941,8 @@ impl SyncOrchestrator {
                                         EntryChange::Changed(kind),
                                     )
                                     .await
+                                } else if kind == ChangeKind::DirectoryMarkerRemoved {
+                                    dest.remove_directory_marker(&entry.entry).await.map_err(AppError::from)
                                 } else if kind == ChangeKind::MetadataOnly {
                                     process_metadata_only_entry(
                                         &entry.entry,

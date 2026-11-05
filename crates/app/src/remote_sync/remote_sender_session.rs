@@ -279,7 +279,7 @@ pub(super) async fn send_full_transfer(
     let outcome = if entry.view().version().is_some_and(|version| version.is_delete_marker()) {
         transport.send(SenderMsg::WriteDeleteMarker { ndx }).await?;
         SourceTransferOutcome::Sent
-    } else if entry.entry.history().is_none() && entry.get_is_dir() {
+    } else if entry.entry.history().is_none() && entry.get_is_dir() && entry.entry.directory_marker_object().is_none() {
         transport
             .send(SenderMsg::CreateDir {
                 entry: Arc::clone(&entry.entry),

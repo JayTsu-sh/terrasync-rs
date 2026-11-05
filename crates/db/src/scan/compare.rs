@@ -3,6 +3,7 @@ use crate::execution::queries::check_scan_cancellation;
 use crate::execution::read::QuorumRead;
 use crate::scan::ScanFinalEvent;
 use crate::scan::candidate_cache::ScanMetadataHash;
+use crate::scan::rows::directory_marker_state;
 use crate::{
     common::FILE_SCAN_COLUMNS_LIST,
     error::{DatabaseError, Result},
@@ -66,6 +67,7 @@ pub(crate) struct ComparedBatch {
 #[derive(Deserialize, clickhouse::Row)]
 #[cfg_attr(test, derive(serde::Serialize))]
 struct Baseline {
+    marker_state: Option<String>,
     relative_path: String,
     version_id: String,
     size: u64,
@@ -135,7 +137,12 @@ async fn cache_checkpoint() -> Result<()> {
 impl Baseline {
     fn change(&self, item: &ObservedItem) -> Option<ChangeKind> {
         if self.is_dir {
-            return None;
+            let marker = directory_marker_state(&item.entry);
+            return if self.marker_state.is_some() && marker.is_none() {
+                Some(ChangeKind::DirectoryMarkerRemoved)
+            } else {
+                (self.marker_state != marker).then_some(ChangeKind::DataOnly)
+            };
         }
         let view = item.view();
         let ownership = view.metadata().ownership_mode().value();
@@ -294,7 +301,7 @@ impl NativeScanAccess<'_> {
             if end == start {
                 return self.baselines(first, last, by_handle).await;
             }
-            rows.extend(self.read_query(&format!("SELECT relative_path,version_id,size,mtime,mode,uid,gid,is_dir,({identity_changed}) AS identity_changed,NOT ({}) AS previous_generation FROM {} {} PREWHERE {} AND (relative_path,version_id) IN ? WHERE {} ORDER BY relative_path,version_id LIMIT 1 BY relative_path,version_id",self.active,self.base,self.final_clause,self.scope,self.live))
+            rows.extend(self.read_query(&format!("SELECT relative_path,version_id,size,mtime,mode,uid,gid,is_dir,marker_state,({identity_changed}) AS identity_changed,NOT ({}) AS previous_generation FROM {} {} PREWHERE {} AND (relative_path,version_id) IN ? WHERE {} ORDER BY relative_path,version_id LIMIT 1 BY relative_path,version_id",self.active,self.base,self.final_clause,self.scope,self.live))
                 .bind(&keys[start..end]).fetch_quorum_all::<Baseline>().await?);
             start = end;
         }
@@ -315,7 +322,7 @@ impl NativeScanAccess<'_> {
         let identity_changed = self.identity_changed(by_handle);
         // 动态 staging 集合保持 WHERE，保留索引剪枝；稀疏字面量集合可使用 PREWHERE。
         let sql = format!(
-            "SELECT relative_path,version_id,size,mtime,mode,uid,gid,is_dir,({identity_changed}) AS identity_changed,NOT ({}) AS previous_generation FROM {} {} WHERE {} AND {} AND relative_path BETWEEN ? AND ? AND {key} IN (SELECT {key} FROM {} WHERE {}) ORDER BY relative_path,version_id LIMIT 1 BY relative_path,version_id",
+            "SELECT relative_path,version_id,size,mtime,mode,uid,gid,is_dir,marker_state,({identity_changed}) AS identity_changed,NOT ({}) AS previous_generation FROM {} {} WHERE {} AND {} AND relative_path BETWEEN ? AND ? AND {key} IN (SELECT {key} FROM {} WHERE {}) ORDER BY relative_path,version_id LIMIT 1 BY relative_path,version_id",
             self.active, self.base, self.final_clause, self.scope, self.live, self.stage, self.stage_scope
         );
         Ok(self
@@ -604,6 +611,7 @@ mod tests {
         )?
         .legacy();
         Ok(Baseline {
+            marker_state: row.marker_state,
             relative_path: row.relative_path,
             version_id: row.version_id,
             size: row.size,

@@ -91,6 +91,8 @@ impl fmt::Display for ErrorEvent {
 /// - `Both`：内容和属性都变了 → 需 `copy_file` + `set_metadata`
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ChangeKind {
+    /// 已确认的源目录标记对象消失，保留目录及后代。
+    DirectoryMarkerRemoved,
     DataOnly,
     MetadataOnly,
     Both,
@@ -101,6 +103,7 @@ impl ChangeKind {
     #[must_use]
     pub fn as_state_str(&self) -> &'static str {
         match self {
+            ChangeKind::DirectoryMarkerRemoved => "directory_marker_removed",
             ChangeKind::DataOnly => "data_changed",
             ChangeKind::MetadataOnly => "metadata_changed",
             ChangeKind::Both => "both_changed",

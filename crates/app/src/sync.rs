@@ -8,7 +8,7 @@
 //! 5. 重试机制集成
 
 // 标准库
-use crate::file_copy::{HdfsCopyContext, copy_file, copy_versions};
+use crate::file_copy::{HdfsCopyContext, copy_file, copy_versions, prepare_directory};
 use std::iter::once;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -357,26 +357,7 @@ async fn process_entry_inner(
     if entry.history().is_some() && !skip_data_copy {
         return Err(AppError::ConfigError("history must use the ordered version-copy workflow".into()));
     }
-    if entry.get_is_dir() {
-        trace!("Calling create_dir_all: {:?}", relative_path);
-
-        // 创建目标目录
-        match dest_storage.create_dir_all(entry).await {
-            Ok(()) => debug!("Created directory: {:?}", relative_path),
-            Err(e) => {
-                error!("Error creating directory: {:?}, {:?}", relative_path, e);
-                broadcaster
-                    .broadcast(StorageEntryMessage::Error {
-                        event: ErrorEvent::Copy,
-                        path: relative_path.to_path_buf(),
-                        entry: Some(Arc::clone(entry)),
-                        reason: format!("{e}"),
-                    })
-                    .await;
-                return Err(e.into());
-            }
-        }
-
+    if prepare_directory(entry, &dest_storage).await? {
         trace!("Created directory: {:?}", relative_path);
     } else if entry.get_is_symlink() {
         match src_storage.read_symlink(entry).await {

@@ -392,7 +392,11 @@ async fn finalize_file(
         return CommitOutcome::HardError(AppError::from(e));
     }
 
-    progress.files_transferred.fetch_add(1, Ordering::Relaxed);
+    if entry.get_is_dir() {
+        progress.dirs_created.fetch_add(1, Ordering::Relaxed);
+    } else {
+        progress.files_transferred.fetch_add(1, Ordering::Relaxed);
+    }
     progress.bytes_transferred.fetch_add(size, Ordering::Relaxed);
     CommitOutcome::Success
 }

@@ -1,5 +1,6 @@
 use crate::broadcast::BroadcastForwarder;
 use data_mover::model::EntryKind;
+use data_mover::storage::CopiedValueTarget;
 use std::sync::Arc;
 use storage_adapter::observed_scan::ObservedItem;
 use storage_adapter::{EntryChange, StorageEntryMessage};
@@ -61,6 +62,27 @@ pub(crate) enum MetadataApplication {
     DataMover,
 }
 
+/// 复制契约取决于已连接目标实例的能力，不受扫描展示开关影响。
+pub(crate) fn copied_tags_required(to: &StorageEnum) -> storage_adapter::Result<bool> {
+    Ok(to
+        .storage()
+        .staged_destination()?
+        .copied_metadata_target()
+        .is_some_and(|target| target.tags == CopiedValueTarget::Supported))
+}
+
+/// 真实目录由 namespace 创建；虚拟目录无需落地，目录标记交给普通文件传输。
+pub(crate) async fn prepare_directory(entry: &ObservedEntry, to: &StorageEnum) -> Result<bool> {
+    if entry.kind() != EntryKind::Directory {
+        return Ok(false);
+    }
+    if to.storage().holds_directory_objects() {
+        return Ok(entry.directory_marker_object().is_none());
+    }
+    to.create_dir_all(entry).await?;
+    Ok(true)
+}
+
 pub(crate) async fn copy_file(
     from: &StorageEnum, to: &StorageEnum, entry: &Arc<ObservedEntry>, options: CopyOptions,
     hdfs: Option<&HdfsCopyContext>,
@@ -89,7 +111,7 @@ pub(crate) async fn copy_versions<I: Iterator<Item = ObservedItem> + Send>(
         None
     };
     for item in items.filter(|item| retain_version(item, keep_history)) {
-        if !keep_history && item.entry.kind() == EntryKind::Directory {
+        if !to.storage().holds_directory_objects() && item.entry.kind() == EntryKind::Directory {
             to.create_dir_all(&item.entry).await?;
         } else {
             StorageEnum::copy_observed_item(

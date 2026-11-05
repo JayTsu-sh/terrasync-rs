@@ -161,6 +161,7 @@ macro_rules! file_scan_base_columns {
     version_id String DEFAULT '',
     tags Nullable(String) DEFAULT NULL,
     version_count Nullable(UInt32) DEFAULT NULL,
+    marker_state Nullable(String) DEFAULT NULL,
     identity_key String DEFAULT '',
     backend_kind String DEFAULT '',
     backend_id String DEFAULT '',
@@ -270,8 +271,9 @@ impl JoinStrategy {
     /// - `Both`：内容和属性都变了
     fn build_detect_changed_sql(&self, temp: &str, base: &str, kind: ChangeKind) -> String {
         let t_columns = &*FILE_SCAN_COLUMNS_LIST_WITH_T_PREFIX;
-        let data_changed = "(t.size != f.size OR t.mtime != f.mtime)";
-        let data_unchanged = "(t.size = f.size AND t.mtime = f.mtime)";
+        let marker_eq = "ifNull(t.marker_state = f.marker_state, (t.marker_state IS NULL AND f.marker_state IS NULL))";
+        let data_changed = format!("((t.size != f.size OR t.mtime != f.mtime) OR NOT {marker_eq})");
+        let data_unchanged = format!("((t.size = f.size AND t.mtime = f.mtime) AND {marker_eq})");
         // mode/uid/gid 在 S3 等协议中为 Nullable 且常常为 NULL；ClickHouse 三值逻辑下
         // `NULL = NULL` 返回 NULL（WHERE 视为 false），会让所有 ChangeKind 都不匹配。
         // 比较结果为 NULL 时，只有两侧均 NULL 才相等；单侧未知不能掩盖真实变更。
@@ -283,36 +285,43 @@ impl JoinStrategy {
         let meta_changed = format!("(NOT {mode_eq} OR NOT {uid_eq} OR NOT {gid_eq})");
         let meta_unchanged = format!("({mode_eq} AND {uid_eq} AND {gid_eq})");
 
+        let marker_removed = "(t.is_dir = 1 AND t.marker_state IS NULL AND f.marker_state IS NOT NULL)";
         let kind_filter = match kind {
+            ChangeKind::DirectoryMarkerRemoved => marker_removed.into(),
             ChangeKind::DataOnly => format!("{data_changed} AND {meta_unchanged}"),
             ChangeKind::MetadataOnly => format!("{data_unchanged} AND {meta_changed}"),
             ChangeKind::Both => format!("{data_changed} AND {meta_changed}"),
         };
 
+        let kind_filter = if kind == ChangeKind::DirectoryMarkerRemoved {
+            kind_filter
+        } else {
+            format!("({kind_filter}) AND NOT {marker_removed}")
+        };
         match self {
             Self::Path => format!(
                 "SELECT {t_columns} FROM {temp} t \
-                 JOIN (SELECT relative_path, version_id, size, mtime, mode, uid, gid, is_dir \
-                       FROM {base} \
+                 JOIN (SELECT relative_path, version_id, size, mtime, mode, uid, gid, is_dir, marker_state \
+                       FROM {base} FINAL \
                        WHERE (relative_path, version_id) IN \
                              (SELECT relative_path, version_id FROM {temp}) \
                        ORDER BY relative_path, version_id \
                        LIMIT 1 BY (relative_path, version_id) \
                  ) f ON t.relative_path = f.relative_path AND t.version_id = f.version_id \
-                 WHERE {kind_filter} AND f.is_dir = 0 \
+                 WHERE {kind_filter} AND (f.is_dir = 0 OR NOT {marker_eq}) \
                  ORDER BY t.relative_path, t.history_segment, t.history_index, t.version_id"
             ),
             Self::FileHandle => format!(
                 "SELECT {t_columns} FROM {temp} t \
-                 JOIN (SELECT file_handle, relative_path, size, mtime, mode, uid, gid, is_dir \
-                       FROM {base} \
+                 JOIN (SELECT file_handle, relative_path, size, mtime, mode, uid, gid, is_dir, marker_state \
+                       FROM {base} FINAL \
                        WHERE file_handle IN \
                              (SELECT file_handle FROM {temp} WHERE file_handle IS NOT NULL) \
                        ORDER BY file_handle, relative_path \
                        LIMIT 1 BY (file_handle, relative_path) \
                  ) f ON t.file_handle = f.file_handle \
                    AND t.relative_path = f.relative_path \
-                 WHERE {kind_filter} AND f.is_dir = 0 \
+                 WHERE {kind_filter} AND (f.is_dir = 0 OR NOT {marker_eq}) \
                  ORDER BY t.relative_path, t.history_segment, t.history_index, t.version_id"
             ),
         }
@@ -1254,7 +1263,7 @@ impl Database for ClickHouseDatabase {
             return Ok(Box::new(std::iter::empty()));
         }
         // 分别查询三种变更（三类条件互斥），用 try_join! 并发执行以降低整体延迟
-        let (data_only, metadata_only, both) = tokio::try_join!(
+        let (data_only, metadata_only, both, marker_removed) = tokio::try_join!(
             self.detect_items("changed(data)", |temp, base, strategy| {
                 strategy.build_detect_changed_sql(temp, base, ChangeKind::DataOnly)
             }),
@@ -1263,6 +1272,9 @@ impl Database for ClickHouseDatabase {
             }),
             self.detect_items("changed(both)", |temp, base, strategy| {
                 strategy.build_detect_changed_sql(temp, base, ChangeKind::Both)
+            }),
+            self.detect_items("changed(marker removed)", |temp, base, strategy| {
+                strategy.build_detect_changed_sql(temp, base, ChangeKind::DirectoryMarkerRemoved)
             }),
         )?;
 
@@ -1278,6 +1290,10 @@ impl Database for ClickHouseDatabase {
                 both.into_iter()
                     .map(|r| r.to_observation().map(|entry| (entry, ChangeKind::Both))),
             );
+        let iter = iter.chain(marker_removed.into_iter().map(|row| {
+            row.to_observation()
+                .map(|entry| (entry, ChangeKind::DirectoryMarkerRemoved))
+        }));
         let entries = iter.collect::<Result<Vec<_>>>()?;
         Ok(Box::new(entries.into_iter()))
     }
@@ -1793,7 +1809,7 @@ mod tests {
         // DataOnly 条件：内容变了 + 属性未变
         assert!(sql.contains("t.size != f.size OR t.mtime != f.mtime"));
         assert_null_safe_meta_clauses(&sql);
-        assert!(!sql.contains("FINAL"));
+        assert!(sql.contains("FROM base_y FINAL"));
     }
 
     #[test]

@@ -28,7 +28,7 @@ pub const FILE_SCAN_COLUMNS_LIST_WO_VERSIONCOUNT: &str = "name, relative_path, s
 
 /// 通过 `FILE_SCAN_COLUMNS_LIST_WO_VERSIONCOUNT` 生成的完整列名列表，包含 `version_count`
 pub static FILE_SCAN_COLUMNS_LIST: LazyLock<String> =
-    LazyLock::new(|| format!("{FILE_SCAN_COLUMNS_LIST_WO_VERSIONCOUNT}, version_count"));
+    LazyLock::new(|| format!("{FILE_SCAN_COLUMNS_LIST_WO_VERSIONCOUNT}, version_count, marker_state"));
 
 pub(crate) static CATALOGUE_COLUMNS: LazyLock<String> =
     LazyLock::new(|| format!("{},backend_kind,backend_id,entry_snapshot", *FILE_SCAN_COLUMNS_LIST));

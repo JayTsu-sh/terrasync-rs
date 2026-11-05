@@ -247,6 +247,24 @@ impl ConnectedStorage {
     pub async fn rename(&self, from: &Path, to: &Path) -> Result<()> {
         Ok(self.roles.namespace()?.rename(&path(from)?, &path(to)?).await?)
     }
+    /// 只移除目录本身的零字节对象，保留同前缀下所有后代及历史对象。
+    pub async fn remove_directory_marker(&self, entry: &ObservedEntry) -> Result<()> {
+        if !self.roles.holds_directory_objects() {
+            return Ok(());
+        }
+        let marker = StoragePath::new(format!("{}/", entry.path().as_str())).map_err(StorageError::from)?;
+        let namespace = self.storage().namespace().map_err(StorageError::from)?;
+        let object = match namespace.stat(&marker).await.map_err(StorageError::from) {
+            Ok(object) => object,
+            Err(error) if error.is_not_found() => return Ok(()),
+            Err(error) => return Err(error),
+        };
+        if object.kind == EntryKind::File && object.size == Some(0) {
+            namespace.delete(&marker).await.map_err(StorageError::from)?;
+        }
+        Ok(())
+    }
+
     pub async fn delete_file(&self, entry: &ObservedEntry) -> Result<()> {
         Ok(self
             .roles

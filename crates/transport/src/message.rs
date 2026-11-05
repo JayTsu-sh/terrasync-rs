@@ -1,9 +1,13 @@
 // 标准库
+use data_mover::model::EntryKind;
+use std::borrow::{Borrow, Cow};
+use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 use std::sync::Arc;
 use storage_adapter::ObservedEntryExt;
 use storage_adapter::TransferMode;
-use storage_adapter::observed_scan::ObservedItem;
+use storage_adapter::observed_scan::{ObservedItem, ObservedView};
 
 // 外部 crate
 use bytes::Bytes;
@@ -416,13 +420,13 @@ pub enum ReceiverMsg {
 /// payload 与 source evidence。新旧 wire 不兼容，不提供双协议解码。
 ///
 /// 8：remote expert terminal 新增 staged metadata phase。新旧 wire 不兼容，不提供双协议解码。
-pub const PROTOCOL_VERSION: u32 = 11;
+pub const PROTOCOL_VERSION: u32 = 12;
 
 /// 当前 binary 能接受的最低对端协议版本
 ///
 /// 对端版本低于此值时握手拒绝，避免 bincode schema 不兼容导致反序列化失败
 /// 或部分文件已写入、部分未写入的"半执行"不一致状态。
-pub const MIN_SUPPORTED_PROTOCOL_VERSION: u32 = 11;
+pub const MIN_SUPPORTED_PROTOCOL_VERSION: u32 = 12;
 
 /// 完整性校验使用的 hash 算法
 ///
@@ -535,6 +539,7 @@ impl ProtocolHandshake {
         }
         HandshakeResult::Accepted {
             features: self.features.intersect(&remote.features),
+            copy_tags: false,
         }
     }
 }
@@ -543,7 +548,7 @@ impl ProtocolHandshake {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum HandshakeResult {
     /// 版本兼容，附带协商后的能力交集
-    Accepted { features: FeatureFlags },
+    Accepted { features: FeatureFlags, copy_tags: bool },
     /// 版本不兼容，携带原因；Sender 收到后应立即中止，不得发送任何数据
     Rejected { reason: String },
 }
@@ -785,60 +790,146 @@ impl NdxTable {
 // DestIndex（双进程模式 Receiver 按页构建的目标端索引）
 // ============================================================
 
-/// 目标端目录索引（按页粒度构建，处理完一页后释放）
-#[derive(Debug, Default)]
-pub struct DestIndex {
-    /// name → 目标端 ObservedEntry（仅当前目录下的直接子条目）
-    entries: std::collections::HashMap<String, Arc<ObservedEntry>>,
-    /// 已被源端 file list 匹配的条目名
-    matched: std::collections::HashSet<String>,
+/// 索引键借用共享观察的路径，不复制路径或整段历史。
+#[derive(Debug)]
+struct ObservedPath(Arc<ObservedEntry>);
+impl Borrow<str> for ObservedPath {
+    fn borrow(&self) -> &str {
+        self.0.path().as_str()
+    }
+}
+impl PartialEq for ObservedPath {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.path() == other.0.path()
+    }
+}
+impl Eq for ObservedPath {}
+impl Hash for ObservedPath {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.0.path().as_str().hash(state);
+    }
+}
+fn index_slot(entry: &ObservedEntry) -> usize {
+    usize::from(entry.kind() == EntryKind::Directory)
 }
 
+/// 目标端目录索引；文件和逻辑目录可以同路径共存，对象键 p/ 另行保留。
+#[derive(Debug, Default)]
+pub struct DestIndex {
+    // slot 0 存非目录条目，slot 1 存逻辑目录；bool 表示本页已匹配。
+    entries: [HashMap<ObservedPath, bool>; 2],
+}
 impl DestIndex {
     pub fn new() -> Self {
         Self::default()
     }
-
-    /// 插入一个目标端条目
     pub fn insert(&mut self, entry: Arc<ObservedEntry>) {
-        self.entries.insert(entry.get_name().to_string(), entry);
+        let entries = &mut self.entries[index_slot(&entry)];
+        // HashMap 替换相等键时保留旧键；这里必须同时更新键所借用的观察事实。
+        entries.remove(entry.path().as_str());
+        entries.insert(ObservedPath(entry), false);
     }
-
-    /// 与源端 entry 比较，返回传输决策
-    pub fn check(&mut self, src_entry: &ObservedEntry) -> TransferDecision {
-        let name = src_entry.get_name();
-        match self.entries.get(name) {
-            None => TransferDecision::FullTransfer,
-            Some(dest_entry) => {
-                self.matched.insert(name.to_string());
-                let data_match = data_check(src_entry, dest_entry);
-                let meta_match = metadata_check(src_entry, dest_entry);
-                match (data_match, meta_match) {
-                    (true, true) => TransferDecision::Skip,
-                    (true, false) => TransferDecision::MetadataOnly,
-                    (false, _) => TransferDecision::DeltaTransfer,
-                }
-            }
+    pub fn check(&mut self, source: &ObservedEntry) -> TransferDecision {
+        let entries = &mut self.entries[index_slot(source)];
+        let Some((key, _)) = entries.get_key_value(source.path().as_str()) else {
+            return TransferDecision::FullTransfer;
+        };
+        let decision = match (data_check(source, &key.0), metadata_check(source, &key.0)) {
+            (true, true) => TransferDecision::Skip,
+            (true, false) => TransferDecision::MetadataOnly,
+            (false, _) => TransferDecision::DeltaTransfer,
+        };
+        if let Some(matched) = entries.get_mut(source.path().as_str()) {
+            *matched = true;
+        }
+        decision
+    }
+    /// 零字节对象数据相同；只比较本次复制契约要求且源端适用的 tags。
+    pub fn check_directory_marker(&self, source: &ObservedEntry, copy_tags: bool) -> TransferDecision {
+        let Some(marker) = source.directory_marker_object() else {
+            return TransferDecision::Skip;
+        };
+        let destination = self.current_directory_marker(source);
+        if destination.is_some()
+            && (!copy_tags
+                || marker.metadata().tags().value().is_none()
+                || marker.metadata().tags().value() == destination.and_then(|view| view.metadata().tags().value()))
+        {
+            TransferDecision::Skip
+        } else {
+            TransferDecision::FullTransfer
         }
     }
-
-    /// 登记一个源端条目为已匹配（不做数据/元数据比较）
-    ///
-    /// 孤儿判定 = 目标端存在而源端不存在。`page.subdirs` 走 `create_dir_all` 路径、
-    /// 不经 `check()`，必须单独登记，否则目标端预先存在的同名子目录会被
-    /// `orphaned_entries()` 误判为孤儿而整树删除。
-    pub fn mark_matched(&mut self, src_entry: &ObservedEntry) {
-        self.matched.insert(src_entry.get_name().to_string());
+    pub fn has_directory_marker(&self, entry: &ObservedEntry) -> bool {
+        self.current_directory_marker(entry).is_some()
     }
-
-    /// 返回目标端存在但源端 file list 中不存在的条目（需删除）
+    fn current_directory_marker(&self, source: &ObservedEntry) -> Option<ObservedView<'_>> {
+        if let Some((key, _)) = self.entries[1].get_key_value(source.path().as_str()) {
+            let entry = &key.0;
+            if let Some(marker) = entry.directory_marker_object() {
+                return Some(ObservedView {
+                    entry: marker,
+                    version_index: None,
+                });
+            }
+            if let Some(view) = current_zero_object(entry) {
+                return Some(view);
+            }
+        }
+        let path = source
+            .directory_marker_object()
+            .map(|marker| Cow::Borrowed(marker.path().as_str()))
+            .unwrap_or_else(|| Cow::Owned(format!("{}/", source.path().as_str())));
+        let (key, _) = self.entries[0].get_key_value(path.as_ref())?;
+        current_zero_object(&key.0)
+    }
+    pub fn mark_matched(&mut self, source: &ObservedEntry) {
+        let already = self.entries[index_slot(source)]
+            .get_mut(source.path().as_str())
+            .is_some_and(|matched| {
+                let old = *matched;
+                *matched = true;
+                old
+            });
+        if !already
+            && source.kind() == EntryKind::Directory
+            && (source.directory_marker_object().is_some() || source.history().is_some())
+        {
+            self.mark_directory_object_matched(source);
+        }
+    }
+    /// 已确认的独立对象操作不再由本页 orphan 清理重复执行。
+    pub fn mark_directory_object_matched(&mut self, directory: &ObservedEntry) {
+        let path = directory
+            .directory_marker_object()
+            .map(|marker| Cow::Borrowed(marker.path().as_str()))
+            .unwrap_or_else(|| Cow::Owned(format!("{}/", directory.path().as_str())));
+        if let Some(matched) = self.entries[0].get_mut(path.as_ref()) {
+            *matched = true;
+        }
+    }
     pub fn orphaned_entries(&self) -> Vec<&Arc<ObservedEntry>> {
         self.entries
             .iter()
-            .filter(|(name, _)| !self.matched.contains(name.as_str()))
-            .map(|(_, entry)| entry)
+            .flat_map(|entries| entries.iter())
+            .filter(|(_, matched)| !**matched)
+            .map(|(key, _)| &key.0)
             .collect()
     }
+}
+fn current_zero_object(entry: &ObservedEntry) -> Option<ObservedView<'_>> {
+    if entry.kind() != EntryKind::Directory && !entry.path().names_directory_object() {
+        return None;
+    }
+    let history = entry.history()?;
+    let index = history
+        .records()
+        .iter()
+        .position(|record| record.is_latest() && !record.is_delete_marker() && record.size() == Some(0))?;
+    Some(ObservedView {
+        entry,
+        version_index: Some(index),
+    })
 }
 
 /// 数据比较：mtime + size
@@ -857,6 +948,88 @@ fn metadata_check(src: &ObservedEntry, dest: &ObservedEntry) -> bool {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+    use crate::observed_fixtures::{directory_marker, observation};
+    use data_mover::model::{BackendKind, EntryKind};
+
+    #[test]
+    fn marker_comparison_requires_the_actual_object_and_its_metadata() {
+        let source = directory_marker("folder", vec![("tag".into(), "new".into())]);
+        let virtual_directory = source.clone().with_directory_marker_object(None).unwrap();
+        let mut index = DestIndex::new();
+        index.insert(Arc::new(virtual_directory));
+        assert_eq!(
+            index.check_directory_marker(&source, true),
+            TransferDecision::FullTransfer
+        );
+        assert_eq!(
+            index.check_directory_marker(&source, false),
+            TransferDecision::FullTransfer
+        );
+        index.insert(Arc::new(directory_marker("folder", vec![("tag".into(), "old".into())])));
+        assert_eq!(
+            index.check_directory_marker(&source, true),
+            TransferDecision::FullTransfer
+        );
+        assert_eq!(index.check_directory_marker(&source, false), TransferDecision::Skip);
+        index.insert(Arc::new(source.clone()));
+        assert_eq!(index.check_directory_marker(&source, true), TransferDecision::Skip);
+        let target = observation(
+            BackendKind::S3,
+            "folder".into(),
+            EntryKind::Directory,
+            0,
+            [999; 3],
+            None,
+            None,
+            Some(vec![("tag".into(), "new".into())]),
+            Some((Some("target-version".into()), true, false)),
+        );
+        let ordinary_file = observation(
+            BackendKind::S3,
+            "folder".into(),
+            EntryKind::File,
+            0,
+            [999; 3],
+            None,
+            None,
+            Some(vec![("tag".into(), "new".into())]),
+            Some((Some("file-version".into()), true, false)),
+        );
+        let mut ordinary_index = DestIndex::new();
+        ordinary_index.insert(Arc::new(ordinary_file));
+        assert_eq!(
+            ordinary_index.check_directory_marker(&source, true),
+            TransferDecision::FullTransfer
+        );
+        index.insert(Arc::new(target));
+        assert!(index.has_directory_marker(&source));
+        assert_eq!(index.check_directory_marker(&source, true), TransferDecision::Skip);
+    }
+
+    #[test]
+    fn destination_index_keeps_same_path_file_and_directory_independent() {
+        let directory = Arc::new(directory_marker("folder", vec![("tag".into(), "new".into())]));
+        let file = Arc::new(observation(
+            BackendKind::S3,
+            "folder".into(),
+            EntryKind::File,
+            0,
+            [123; 3],
+            None,
+            None,
+            Some(Vec::new()),
+            None,
+        ));
+        let mut index = DestIndex::new();
+        index.insert(Arc::clone(&directory));
+        index.insert(Arc::clone(&file));
+        assert_eq!(index.check_directory_marker(&directory, true), TransferDecision::Skip);
+        assert_eq!(index.check(&file), TransferDecision::Skip);
+        assert_eq!(index.orphaned_entries().len(), 1);
+        assert!(index.orphaned_entries()[0].get_is_dir());
+        index.mark_matched(&directory);
+        assert!(index.orphaned_entries().is_empty());
+    }
 
     /// v1 对端（本 PR 改动 `SenderMsg` bincode 线格式前的协议版本）握手时必须被拒绝：
     /// `ndx` 加入 `FileBegin`/`EndOfFile`/`EntryError` 后 v1 与当前 v2 的 bincode schema

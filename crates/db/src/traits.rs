@@ -84,6 +84,7 @@ pub struct StorageEntryRecord {
     pub tags: Option<String>,
     /// 版本计数
     pub version_count: Option<u32>,
+    pub marker_state: Option<String>,
     pub backend_kind: String,
     pub backend_id: String,
     pub entry_snapshot: Vec<u8>,
@@ -121,6 +122,7 @@ impl StorageEntryRecord {
             version_id: fields.version_id,
             tags: fields.tags,
             version_count: fields.version_count,
+            marker_state: fields.marker_state,
             backend_kind: entry.backend_kind().as_str().into(),
             backend_id: entry.source_identity().backend().stable_id().into(),
             entry_snapshot: entry.try_encode_snapshot()?.as_bytes().to_vec(),
@@ -190,6 +192,7 @@ pub struct IncrementalStorageEntryRecord {
     pub tags: Option<String>,
     /// 版本计数
     pub version_count: Option<u32>,
+    pub marker_state: Option<String>,
     /// 记录创建时间
     pub create_at: i64,
     /// 备注信息（如重命名时的源路径）

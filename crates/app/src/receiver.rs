@@ -5,7 +5,7 @@
 //! 双进程模式下 Receiver 仅拥有 dest storage（数据流模式，Phase 3）。
 
 // 标准库
-use crate::file_copy::{HdfsCopyContext, MetadataApplication, copy_file};
+use crate::file_copy::{HdfsCopyContext, MetadataApplication, copied_tags_required, copy_file, prepare_directory};
 use data_mover::model::FailureClass;
 use std::path::{Component, Path};
 use std::sync::Arc;
@@ -197,11 +197,7 @@ pub(crate) async fn process_entry_on_receiver(
     let span = info_span!("recv_entry", path = %relative_path.display());
 
     async {
-        if entry.get_is_dir() {
-            if let Err(e) = dest_storage.create_dir_all(entry).await {
-                error!("[Receiver] Error creating directory {:?}: {}", relative_path, e);
-                // 目录创建失败不返回错误，继续尝试设置元数据和 ACL（与原逻辑一致）
-            }
+        if prepare_directory(entry, dest_storage).await? {
         } else if entry.get_is_symlink() {
             let target_path = src_storage
                 .read_symlink(entry)
@@ -329,7 +325,7 @@ pub async fn receiver_task_remote(
     info!("[Receiver Remote] Started, waiting for Handshake");
 
     // ── 阶段 -1: 协议握手（版本 + 能力协商），不兼容则回 reject 后立即中止 ──
-    let negotiated_features = recv_and_negotiate_handshake(transport).await?;
+    let negotiated_features = recv_and_negotiate_handshake(transport, &dest_storage).await?;
 
     // ── 阶段 -0.5: Token 鉴权，失败则回 AuthResult{ok:false} 并断连、中止 ──
     recv_and_check_auth(transport, expected_token).await?;
@@ -390,14 +386,19 @@ pub async fn receiver_task_remote(
 ///
 /// 版本不兼容时发送 `Rejected` 后立即返回错误，不进入 `SessionConfig` / 文件列表阶段，
 /// 确保拒绝发生在任何 `FilePage` / `TransferRequest` / `CopyEntry` 之前。
-async fn recv_and_negotiate_handshake(transport: &(dyn ReceiverTransport + 'static)) -> Result<FeatureFlags> {
+async fn recv_and_negotiate_handshake(
+    transport: &(dyn ReceiverTransport + 'static), destination: &StorageEnum,
+) -> Result<FeatureFlags> {
     loop {
         match transport.recv().await {
             Some(SenderMsg::Handshake(remote)) => {
                 let result = ProtocolHandshake::current().negotiate(&remote);
-                let ack = result.clone();
+                let mut ack = result.clone();
+                if let HandshakeResult::Accepted { copy_tags, .. } = &mut ack {
+                    *copy_tags = copied_tags_required(destination)?;
+                }
                 match result {
-                    HandshakeResult::Accepted { features } => {
+                    HandshakeResult::Accepted { features, .. } => {
                         info!(
                             "[Receiver Remote] Handshake accepted, negotiated features: {:?}",
                             features
@@ -500,13 +501,7 @@ pub(crate) fn validate_relative_path(path: &Path) -> Result<()> {
 async fn read_destination_index(storage: &StorageEnum, directory: &str) -> Result<DestIndex> {
     let mut index = DestIndex::new();
     let iterator = match storage
-        .walkdir(
-            Some(Path::new(directory)),
-            storage_adapter::WalkOptions {
-                depth: Some(1),
-                ..Default::default()
-            },
-        )
+        .read_directory(Path::new(directory), copied_tags_required(storage)?)
         .await
     {
         Ok(iterator) => iterator,

@@ -46,7 +46,10 @@ impl ClickHouseDatabase {
             .ok_or_else(|| DatabaseError::TableNotFound("catalogue comparison staging".into()))?;
         let temporary = self.catalogue_query_table(temporary)?;
         let query = if self.is_copy_recovery().await {
-            format!("SELECT relative_path,version_id,toUInt8(0) AS change_code FROM {temporary}")
+            let base = self.catalogue_query_table(&get_scan_base_table_name(&self.job_id))?;
+            format!(
+                "SELECT t.relative_path,t.version_id,toUInt8(if(t.is_dir = 1 AND t.marker_state IS NULL AND f.marker_state IS NOT NULL,4,0)) AS change_code FROM {temporary} t LEFT JOIN (SELECT relative_path,version_id,marker_state FROM {base} FINAL ORDER BY relative_path,version_id LIMIT 1 BY relative_path,version_id) f USING (relative_path,version_id)"
+            )
         } else {
             let base = self.catalogue_query_table(&get_scan_base_table_name(&self.job_id))?;
             let (temporary_handles, baseline_handles) = self.check_file_handle_status(&temporary, &base).await?;
@@ -56,6 +59,7 @@ impl ClickHouseDatabase {
                 strategy.build_detect_changed_sql(&temporary, &base, ChangeKind::DataOnly),
                 strategy.build_detect_changed_sql(&temporary, &base, ChangeKind::MetadataOnly),
                 strategy.build_detect_changed_sql(&temporary, &base, ChangeKind::Both),
+                strategy.build_detect_changed_sql(&temporary, &base, ChangeKind::DirectoryMarkerRemoved),
             ];
             queries
                 .into_iter()
@@ -77,6 +81,7 @@ impl ClickHouseDatabase {
                     1 => EntryChange::Changed(ChangeKind::DataOnly),
                     2 => EntryChange::Changed(ChangeKind::MetadataOnly),
                     3 => EntryChange::Changed(ChangeKind::Both),
+                    4 => EntryChange::Changed(ChangeKind::DirectoryMarkerRemoved),
                     code => {
                         return Err(DatabaseError::ConversionError(format!(
                             "Unknown catalogue classification {code}"

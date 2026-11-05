@@ -2,7 +2,7 @@ use crate::ObservedEntryExt;
 use crate::connected::path;
 use crate::filter::FilterExpression;
 use crate::observed_scan::ObservedItem;
-use crate::projection::{HistorySequence, observation_plan};
+use crate::projection::{HistorySequence, observation_plan, validate_required_tags};
 use crate::{dir_tree::*, error::operation, *};
 use chrono::NaiveDate;
 use data_mover::{
@@ -39,7 +39,7 @@ impl ConnectedStorage {
     fn traversal_request(&self, sub: Option<&Path>, options: &WalkOptions, blocks: bool) -> Result<TraversalRequest> {
         let root = path(sub.unwrap_or(Path::new("")))?;
         let mut request = TraversalRequest::new(root)
-            .observation_plan(observation_plan(options.include_tags))
+            .observation_plan(observation_plan(self.tags_required(options.include_tags)?))
             .max_inflight_operations(NonZeroUsize::new(options.concurrency).unwrap_or(NonZeroUsize::MIN))
             .max_depth(options.depth.and_then(NonZeroUsize::new));
         if blocks {
@@ -88,11 +88,36 @@ impl ConnectedStorage {
             guard: scan.failure,
             recovery: scan.recovery,
             history: None,
+            include_tags: self.tags_required(options.include_tags)?,
             cancel,
         })
     }
     pub async fn walkdir(&self, sub: Option<&Path>, options: WalkOptions) -> Result<WalkDirAsyncIterator> {
-        let scan = self.start_traversal(self.traversal_request(sub, &options, false)?, &options)?;
+        self.walkdir_with_root_policy(sub, options, true).await
+    }
+
+    /// 枚举已由父页处理其自身对象的目录；只返回直接子条目。
+    pub async fn read_directory(&self, directory: &Path, include_tags: bool) -> Result<WalkDirAsyncIterator> {
+        self.walkdir_with_root_policy(
+            Some(directory),
+            WalkOptions {
+                depth: Some(1),
+                include_tags,
+                ..Default::default()
+            },
+            false,
+        )
+        .await
+    }
+
+    async fn walkdir_with_root_policy(
+        &self, sub: Option<&Path>, options: WalkOptions, report_root: bool,
+    ) -> Result<WalkDirAsyncIterator> {
+        let required_tags = self.tags_required(options.include_tags)?;
+        let request = self
+            .traversal_request(sub, &options, false)?
+            .report_root_directory_object(report_root);
+        let scan = self.start_traversal(request, &options)?;
         let mut session = scan.session;
         let guard = scan.failure;
         let recovery = scan.recovery;
@@ -110,7 +135,7 @@ impl ConnectedStorage {
                         continue;
                     }
                     TraversalItem::Entry(entry) => {
-                        let projected = match histories.push(*entry).map(|entry| [entry]) {
+                        let projected = match histories.push(*entry, required_tags).map(|entry| [entry]) {
                             Ok(entries) => entries,
                             Err(error) => {
                                 let reason = error.to_string();
@@ -231,6 +256,7 @@ impl ConnectedStorage {
         &self, sub: Option<&Path>, depth: Option<usize>, match_expressions: Option<FilterExpression>,
         exclude_expressions: Option<FilterExpression>, concurrency: usize, include_tags: bool,
     ) -> Result<WalkDirAsyncIterator2> {
+        let required_tags = self.tags_required(include_tags)?;
         let mut session = self.traversal(
             sub,
             &WalkOptions {
@@ -253,7 +279,7 @@ impl ConnectedStorage {
                 match item {
                     TraversalItem::Resumed(_) => histories = HistorySequence::default(),
                     TraversalItem::Entry(entry) => {
-                        let projected = match histories.push(*entry).map(|entry| [entry]) {
+                        let projected = match histories.push(*entry, required_tags).map(|entry| [entry]) {
                             Ok(entries) => entries,
                             Err(error) => {
                                 let _ = tx
@@ -452,6 +478,7 @@ pub enum ResumableScanItem {
 }
 
 pub struct ResumableScan {
+    include_tags: bool,
     session: TraversalSession,
     recovery: Option<TraversalRecoveryStatus>,
     guard: ScanFailureSignal,
@@ -491,6 +518,11 @@ impl ResumableScan {
                     return Some(Ok(ResumableScanItem::Statistics(statistics)));
                 }
                 TraversalItem::Entry(entry) => {
+                    if self.include_tags {
+                        if let Err(error) = validate_required_tags(&entry) {
+                            return Some(Err(error));
+                        }
+                    }
                     if let Some(history) = entry.history() {
                         let expected = self.history.get_or_insert_with(|| (entry.path().as_str().into(), 0));
                         if expected.0 != entry.path().as_str() || expected.1 != history.segment() {
@@ -659,6 +691,7 @@ mod stopping_tests {
             guard: ScanFailureSignal::source(&storage.roles, None).unwrap().1,
             session,
             history: Some(("partial-history".into(), 1)),
+            include_tags: false,
             cancel: cancel.clone(),
         };
         let finished = Arc::new(AtomicBool::new(false));

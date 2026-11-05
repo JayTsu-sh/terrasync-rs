@@ -107,6 +107,19 @@ impl<'a> Iterator for ObservedViews<'a> {
     }
 }
 impl<'a> ObservedView<'a> {
+    /// 传输借用真实目录标记对象；逻辑目录仍用于编号、统计和目录生命周期。
+    pub fn payload(self) -> Self {
+        if self.version_index.is_none()
+            && let Some(marker) = self.entry.directory_marker_object()
+        {
+            Self {
+                entry: marker,
+                version_index: None,
+            }
+        } else {
+            self
+        }
+    }
     pub fn all(entry: &'a ObservedEntry) -> ObservedViews<'a> {
         ObservedViews {
             entry,
@@ -304,9 +317,27 @@ impl ObservedScanEvent {
 #[allow(clippy::unwrap_used)]
 mod path_tests {
     use super::*;
+    use crate::observed_fixtures::directory_marker;
     use data_mover::model::{
         BackendIdentity, HistoryOrder, IdentityStrength, ObjectHistory, RecordKind, SourceIdentity, StoragePath,
     };
+
+    #[test]
+    fn directory_payload_borrows_marker_without_changing_logical_view() {
+        let entry = directory_marker("folder", vec![("tag".into(), "value".into())]);
+        let item = ObservedItem::from(Arc::new(entry));
+        let logical = item.view();
+        let payload = logical.payload();
+        assert!(logical.get_is_dir());
+        assert_eq!(logical.sql_path(), "folder");
+        assert_eq!(payload.source_path().unwrap().as_str(), "folder/");
+        assert!(std::ptr::eq(
+            payload.entry,
+            item.entry.directory_marker_object().unwrap()
+        ));
+        assert_eq!(payload.metadata().tags().value().unwrap()[0].value(), "value");
+        assert_eq!(Arc::strong_count(&item.entry), 1);
+    }
 
     #[test]
     fn borrowed_projection_keeps_regular_and_versioned_directory_sql_keys() {

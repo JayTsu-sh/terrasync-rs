@@ -32,6 +32,7 @@ pub(super) struct ClusterIncrementalStorageEntryRecord<'a> {
     pub version_id: &'a str,
     pub tags: Option<&'a str>,
     pub version_count: Option<u32>,
+    pub marker_state: Option<&'a str>,
     pub create_at: i64,
     pub comment: Option<&'a str>,
 }
@@ -64,6 +65,7 @@ impl<'a> ClusterIncrementalStorageEntryRecord<'a> {
             version_id: &record.version_id,
             tags: record.tags.as_deref(),
             version_count: record.version_count,
+            marker_state: record.marker_state.as_deref(),
             create_at: record.create_at,
             comment: record.comment.as_deref(),
         }
@@ -136,6 +138,7 @@ pub(super) struct ClusterNativeScanRecord<'a> {
     pub version_id: &'a str,
     pub tags: Option<&'a str>,
     pub version_count: Option<u32>,
+    pub marker_state: Option<&'a str>,
     pub identity_key: &'a str,
     pub backend_kind: &'static str,
     pub backend_id: &'a str,
@@ -176,6 +179,7 @@ impl<'a> ClusterNativeScanRecord<'a> {
             version_id: record.version_id,
             tags: record.tags.as_deref(),
             version_count: record.version_count,
+            marker_state: record.marker_state.as_deref(),
             identity_key: &record.identity_key,
             backend_kind: record.backend_kind,
             backend_id: record.backend_id,

@@ -2,10 +2,11 @@
 #![allow(clippy::unwrap_used)]
 use super::*;
 use crate::execution::base_client;
+use crate::observed_fixtures::directory_marker;
 use data_mover::model::{BackendKind, EntryKind, IdentityStrength, SourceIdentity, StoragePath};
 use std::path::PathBuf;
 use std::time::Duration;
-use storage_adapter::ObservedEntryExt;
+use storage_adapter::{EntryChange, ObservedEntryExt};
 use tokio::runtime::Builder;
 use tokio::time::timeout;
 use utils::app_config::ClickHouseMode;
@@ -785,5 +786,118 @@ async fn copy_comparison_deduplicates_repeated_identical_observations() -> Resul
         .await?;
     database.commit_scan_generation().await?;
     assert_eq!(fixture.rows("duplicate_source").await?.len(), 1);
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires explicitly selected ClickHouse; isolated database only"]
+async fn directory_marker_changes_wait_for_copy_acknowledgement() -> Result<()> {
+    let fixture = Fixture::new().await?;
+    let database = ClickHouseDatabase::new(&fixture.config, "marker_state")?;
+    database.initialize().await?;
+    let first = Arc::new(directory_marker("folder", vec![("tag".into(), "first".into())]));
+    let virtual_directory = Arc::new(first.as_ref().clone().with_directory_marker_object(None)?);
+    let changed = Arc::new(directory_marker("folder", vec![("tag".into(), "changed".into())]));
+    for (entry, expected) in [
+        (&virtual_directory, EntryChange::New),
+        (&first, EntryChange::Changed(ChangeKind::DataOnly)),
+        (&changed, EntryChange::Changed(ChangeKind::DataOnly)),
+        (
+            &virtual_directory,
+            EntryChange::Changed(ChangeKind::DirectoryMarkerRemoved),
+        ),
+    ] {
+        database.begin_scan_generation().await?;
+        let before = fixture.rows("marker_state").await?;
+        let changes = database
+            .compare_catalogue_batch(&[Arc::clone(entry)], ComparisonMode::AwaitCopyAcknowledgement)
+            .await?;
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].kind, expected);
+        assert!(Arc::ptr_eq(&changes[0].item.entry, entry));
+        let after = fixture.rows("marker_state").await?;
+        assert_eq!(
+            before.iter().map(|row| &row.entry_snapshot).collect::<Vec<_>>(),
+            after.iter().map(|row| &row.entry_snapshot).collect::<Vec<_>>()
+        );
+        database
+            .batch_insert_completed_records(&[changes.into_iter().next().unwrap().item])
+            .await?;
+        database.commit_scan_generation().await?;
+        database.begin_scan_generation().await?;
+        assert!(
+            database
+                .compare_catalogue_batch(&[Arc::clone(entry)], ComparisonMode::AwaitCopyAcknowledgement)
+                .await?
+                .is_empty()
+        );
+        database.commit_scan_generation().await?;
+    }
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires explicitly selected ClickHouse; isolated database only"]
+async fn unacknowledged_marker_removal_keeps_its_intent_after_restart() -> Result<()> {
+    let fixture = Fixture::new().await?;
+    let database = ClickHouseDatabase::new(&fixture.config, "marker_retry")?;
+    database.initialize().await?;
+    let marker = Arc::new(directory_marker("folder", Vec::new()));
+    let virtual_before = Arc::new(marker.as_ref().clone().with_directory_marker_object(None)?);
+    let base = get_scan_base_table_name("marker_retry");
+    let local = database.catalogue_sorting_table(&base);
+    let cluster = fixture
+        .config
+        .cluster
+        .as_ref()
+        .map_or(String::new(), |name| format!(" ON CLUSTER `{name}`"));
+    fixture
+        .admin
+        .query(&format!(
+            "ALTER TABLE `{}`.`{local}`{cluster} MODIFY SETTING max_bytes_to_merge_at_max_space_in_pool=1",
+            fixture.config.database
+        ))
+        .execute()
+        .await?;
+    database.batch_insert_base_record(&[virtual_before]).await?;
+    database.batch_insert_base_record(&[Arc::clone(&marker)]).await?;
+    let rows: u64 = base_client(&fixture.config)
+        .unwrap()
+        .query(&format!("SELECT count() FROM {base} WHERE relative_path='folder'"))
+        .fetch_one()
+        .await?;
+    assert!(rows >= 2, "the regression must preserve obsolete physical rows");
+    database.insert_scan_state(0).await?;
+    let virtual_directory = Arc::new(marker.as_ref().clone().with_directory_marker_object(None)?);
+    database.begin_copy_generation("marker-binding").await?;
+    let pending = database
+        .compare_catalogue_batch(
+            &[Arc::clone(&virtual_directory)],
+            ComparisonMode::AwaitCopyAcknowledgement,
+        )
+        .await?;
+    assert_eq!(
+        pending[0].kind,
+        EntryChange::Changed(ChangeKind::DirectoryMarkerRemoved)
+    );
+    drop(database);
+    let retry = ClickHouseDatabase::new(&fixture.config, "marker_retry")?;
+    assert_eq!(
+        retry.begin_copy_generation("marker-binding").await?,
+        CopyGenerationStatus::Recovering
+    );
+    let replay = retry
+        .compare_catalogue_batch(
+            &[Arc::clone(&virtual_directory)],
+            ComparisonMode::AwaitCopyAcknowledgement,
+        )
+        .await?;
+    assert_eq!(replay[0].kind, EntryChange::Changed(ChangeKind::DirectoryMarkerRemoved));
+    assert!(fixture.rows("marker_retry").await?[0].marker_state.is_some());
+    retry
+        .batch_insert_completed_records(&[replay.into_iter().next().unwrap().item])
+        .await?;
+    retry.commit_scan_generation().await?;
+    assert!(fixture.rows("marker_retry").await?[0].marker_state.is_none());
     Ok(())
 }

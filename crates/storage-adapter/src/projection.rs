@@ -2,22 +2,67 @@
 use crate::{ConnectedStorage, Result, StorageError, error::operation};
 use data_mover::model::*;
 use data_mover::storage::SourceDescriptor;
+use data_mover::storage::StorageRoleFailure;
+
+/// 必须复制的事实失败后不能继续发布观察或把缺失事实解释成 Omit。
+pub(crate) fn validate_required_tags(entry: &ObservedEntry) -> Result<()> {
+    fn check(path: &StoragePath, facts: &MetadataObservations) -> Result<()> {
+        let (class, transience) = match facts.tags() {
+            MetadataObservation::Value { .. } | MetadataObservation::NotApplicable => return Ok(()),
+            MetadataObservation::Unsupported => (FailureClass::Unsupported, Transience::Permanent),
+            MetadataObservation::Failed { class, transience } => (*class, *transience),
+            MetadataObservation::NotRequested => (FailureClass::InvalidInput, Transience::Permanent),
+        };
+        Err(StorageRoleFailure::Entry(EntryOperationFailure::new(
+            path.clone(),
+            Operation::Metadata,
+            class,
+            transience,
+            "required copy tags were not observed",
+        )?)
+        .into())
+    }
+    if let Some(history) = entry.history() {
+        for record in history.records().iter().filter(|record| !record.is_delete_marker()) {
+            if let Some(metadata) = record.metadata() {
+                check(entry.path(), metadata)?;
+            } else {
+                check(entry.path(), &MetadataObservations::default())?;
+            }
+        }
+    } else if let Some(marker) = entry.directory_marker_object() {
+        check(marker.path(), marker.metadata())?;
+    } else if entry.kind() != EntryKind::Directory {
+        check(entry.path(), entry.metadata())?;
+    }
+    Ok(())
+}
 
 pub(crate) fn observation_plan(tags: bool) -> ObservationPlan {
     ObservationPlan::default()
         .with_timestamps(ObservationMode::InlineOnly)
         .with_ownership_mode(ObservationMode::InlineOnly)
         .with_tags(if tags {
-            ObservationMode::BestEffort
+            ObservationMode::Required
         } else {
             ObservationMode::Omit
         })
 }
 
 impl ConnectedStorage {
+    pub(crate) fn tags_required(&self, include_tags: bool) -> Result<bool> {
+        Ok(include_tags
+            && !matches!(
+                self.roles
+                    .metadata()?
+                    .observation_capabilities()
+                    .support(MetadataFamily::Tags),
+                ObservationSupport::Unsupported | ObservationSupport::NotApplicable
+            ))
+    }
     pub(crate) async fn project_descriptor(&self, descriptor: SourceDescriptor, tags: bool) -> Result<ObservedEntry> {
         let metadata_role = self.roles.metadata()?;
-        let plan = observation_plan(tags);
+        let plan = observation_plan(self.tags_required(tags)?);
         let metadata = match metadata_role.observe_listed(&descriptor, plan) {
             Some(result) => result?,
             None => metadata_role.observe(&descriptor.path, plan).await?,
@@ -90,7 +135,10 @@ pub(crate) struct HistorySequence {
     next_segment: u32,
 }
 impl HistorySequence {
-    pub fn push(&mut self, entry: ObservedEntry) -> Result<ObservedEntry> {
+    pub fn push(&mut self, entry: ObservedEntry, tags: bool) -> Result<ObservedEntry> {
+        if tags {
+            validate_required_tags(&entry)?;
+        }
         if let Some(history) = entry.history() {
             if self.path.is_none() {
                 self.path = Some(entry.path().clone());
@@ -113,5 +161,64 @@ impl HistorySequence {
     }
     pub fn is_complete(&self) -> bool {
         self.path.is_none()
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod required_tags_tests {
+    use super::*;
+    use crate::observed_fixtures::{directory_marker, observation};
+
+    #[test]
+    fn failed_required_tags_block_the_object_and_keep_the_typed_cause() {
+        let entry = directory_marker("folder", Vec::new());
+        assert!(validate_required_tags(&entry).is_ok());
+        let marker = entry.directory_marker_object().unwrap();
+        let facts = MetadataObservations::new(
+            MetadataObservation::NotApplicable,
+            MetadataObservation::NotApplicable,
+            MetadataObservation::Failed {
+                class: FailureClass::Timeout,
+                transience: Transience::Transient,
+            },
+            MetadataObservation::NotApplicable,
+            MetadataObservation::NotRequested,
+        )
+        .unwrap();
+        let marker = marker.clone().with_metadata(facts);
+        let entry = entry.with_directory_marker_object(Some(Box::new(marker))).unwrap();
+        match validate_required_tags(&entry) {
+            Err(StorageError::Role(StorageRoleFailure::Entry(error))) => {
+                assert_eq!(error.path().as_str(), "folder/");
+                assert_eq!(error.class(), FailureClass::Timeout);
+                assert_eq!(error.transience(), Transience::Transient);
+            }
+            result => panic!("expected the typed tag failure, got {result:?}"),
+        }
+    }
+
+    #[test]
+    fn absent_required_tags_cannot_admit_a_history_version() {
+        let entry = observation(
+            BackendKind::S3,
+            "file".into(),
+            EntryKind::File,
+            1,
+            [123; 3],
+            None,
+            None,
+            None,
+            Some((Some("v1".into()), true, false)),
+        );
+        assert!(validate_required_tags(&entry).is_err());
+        let structural = directory_marker("folder", Vec::new())
+            .with_directory_marker_object(None)
+            .unwrap();
+        assert!(validate_required_tags(&structural).is_ok());
+        assert_eq!(
+            observation_plan(true).mode(MetadataFamily::Tags),
+            ObservationMode::Required
+        );
     }
 }

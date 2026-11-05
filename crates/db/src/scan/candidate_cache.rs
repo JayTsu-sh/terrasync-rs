@@ -133,6 +133,7 @@ macro_rules! metadata_hash {
                 self.version_id.hash_field(&mut hash);
                 self.tags.hash_field(&mut hash);
                 self.version_count.hash_field(&mut hash);
+                self.marker_state.hash_field(&mut hash);
                 hash.finalize().to_hex().to_string()
             }
         }

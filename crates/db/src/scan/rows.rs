@@ -3,6 +3,7 @@
 use crate::error::DatabaseError;
 use crate::scan::ScanFinalEvent;
 use crate::{error::Result, schema::entry::EntrySummary as StorageEntryRecord, traits::IncrementalStorageEntryRecord};
+use blake3::Hasher;
 use data_mover::model::ObjectTag;
 #[cfg(test)]
 use data_mover::model::{
@@ -21,7 +22,31 @@ use std::sync::Arc;
 use storage_adapter::observed_scan::ObservedItem;
 use storage_adapter::observed_scan::{EntryStatistics, ObservedScanEvent, ObservedView, timestamp_nanos};
 
-pub(crate) const OBSERVED_COLUMNS: &str = "name,relative_path,size,ext,ctime,mtime,atime,mode,storage_type,is_symlink,is_dir,is_regular_file,hard_links,current_state,uid,gid,ino,file_handle,version_id,tags,version_count,identity_key,backend_kind,backend_id,entry_kind,size_observed,modified_unix_nanos,entry_snapshot,metadata_hash,history_segment,history_index";
+/// 只摘要原生标记对象的比较事实，不重新编码或复制 opaque snapshot。
+pub(crate) fn directory_marker_state(entry: &ObservedEntry) -> Option<String> {
+    let marker = entry.directory_marker_object()?;
+    let mut hash = Hasher::new();
+    hash.update(marker.identity_key().as_bytes());
+    hash.update(
+        &marker
+            .modified()
+            .map(StorageTimestamp::unix_nanos)
+            .unwrap_or_default()
+            .to_le_bytes(),
+    );
+    if let Some(tags) = marker.metadata().tags().value() {
+        hash.update(&[1]);
+        for tag in tags {
+            for part in [tag.key(), tag.value()] {
+                hash.update(&(part.len() as u64).to_le_bytes());
+                hash.update(part.as_bytes());
+            }
+        }
+    }
+    Some(hash.finalize().to_hex().to_string())
+}
+
+pub(crate) const OBSERVED_COLUMNS: &str = "name,relative_path,size,ext,ctime,mtime,atime,mode,storage_type,is_symlink,is_dir,is_regular_file,hard_links,current_state,uid,gid,ino,file_handle,version_id,tags,version_count,marker_state,identity_key,backend_kind,backend_id,entry_kind,size_observed,modified_unix_nanos,entry_snapshot,metadata_hash,history_segment,history_index";
 
 /// 比较集合只传输主键和身份；完整观察在事件持久化后直接写入 base。
 #[derive(Serialize, clickhouse::Row)]
@@ -82,6 +107,7 @@ struct ScanRowFields<'a> {
     version_id: &'a str,
     tags: Option<String>,
     version_count: Option<u32>,
+    marker_state: Option<String>,
 }
 impl<'a> ScanRowFields<'a> {
     fn capture(view: ObservedView<'a>, generation: u8) -> Result<Self> {
@@ -121,6 +147,7 @@ impl<'a> ScanRowFields<'a> {
             version_id: view.version_id(),
             tags,
             version_count: entry.history().map(|h| h.records().len().min(u32::MAX as usize) as u32),
+            marker_state: directory_marker_state(entry),
         })
     }
     fn legacy(self) -> StorageEntryRecord {
@@ -146,6 +173,7 @@ impl<'a> ScanRowFields<'a> {
             version_id: self.version_id.into(),
             tags: self.tags,
             version_count: self.version_count,
+            marker_state: self.marker_state,
         }
     }
 }
@@ -177,6 +205,7 @@ pub(crate) struct NativeScanRecord<'a> {
     pub version_id: &'a str,
     pub tags: Option<String>,
     pub version_count: Option<u32>,
+    pub marker_state: Option<String>,
     pub identity_key: String,
     pub backend_kind: &'static str,
     pub backend_id: &'a str,
@@ -277,6 +306,7 @@ impl<'a> NativeScanRecord<'a> {
             version_id: fields.version_id,
             tags: fields.tags,
             version_count: fields.version_count,
+            marker_state: fields.marker_state,
             identity_key: hex::encode(identity.identity_key().as_bytes()),
             backend_kind: entry.backend_kind().as_str().into(),
             backend_id: entry.source_identity().backend().stable_id(),
@@ -335,6 +365,7 @@ impl<'a> NativeScanRecord<'a> {
             version_id: self.version_id,
             tags: self.tags,
             version_count: self.version_count,
+            marker_state: self.marker_state,
         }
         .legacy()
     }
@@ -425,6 +456,7 @@ pub(crate) fn incremental_record(
         version_id: record.version_id,
         tags: record.tags,
         version_count: record.version_count,
+        marker_state: record.marker_state,
     }
 }
 
