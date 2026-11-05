@@ -416,23 +416,40 @@ async fn empty_unconfirmed_copy_remains_dirty_until_commit() -> Result<()> {
 #[ignore = "requires an explicitly selected six-replica ClickHouse cluster; isolated database and local fixture only"]
 async fn history_copy_recovery_keeps_the_group_and_does_not_delete_the_replayed_path() -> Result<()> {
     let fixture = Fixture::new().await?;
-    let version = |id: &str| {
-        Arc::new(crate::observed_fixtures::observation(
-            data_mover::model::BackendKind::S3,
-            "object".into(),
-            data_mover::model::EntryKind::File,
-            10,
-            [1_000_000_000; 3],
-            None,
-            None,
-            None,
-            Some((Some(id.into()), id == "v2", false)),
-        ))
-    };
+    use data_mover::model::{HistoryOrder, ObjectHistory};
+    use storage_adapter::observed_scan::ObservedItem;
+    // 源顺序不能由版本 ID、变更类型或时间戳排序推断；真实分段必须保留位置。
+    let versions: Vec<_> = [("z-old", false), ("m-delete", true), ("a-new", false)]
+        .into_iter()
+        .map(|(id, deleted)| {
+            crate::observed_fixtures::observation(
+                BackendKind::S3,
+                "object".into(),
+                EntryKind::File,
+                10,
+                [1_000_000_000; 3],
+                None,
+                None,
+                None,
+                Some((Some(id.into()), id == "a-new", deleted)),
+            )
+        })
+        .collect();
+    let records = versions
+        .iter()
+        .map(|entry| entry.history().unwrap().records()[0].clone())
+        .collect();
+    let history = ObjectHistory::whole(records, HistoryOrder::Server)?;
+    let whole = versions
+        .into_iter()
+        .last()
+        .unwrap()
+        .with_history(Some(Box::new(history)))?;
+    let segments: Vec<_> = whole.into_segments(1).into_iter().map(Arc::new).collect();
     let mut database = ClickHouseDatabase::new(&fixture.config, "history_copy")?;
     database.initialize().await?;
     database.begin_copy_generation("catalogue-fixture-v1").await?;
-    database.batch_insert_base_record(&[version("v1")]).await?;
+    database.batch_insert_base_record(&[Arc::clone(&segments[0])]).await?;
     database.commit_scan_generation().await?;
     database.begin_copy_generation("catalogue-fixture-v1").await?;
     drop(database); // A later source/metadata failure left this round uncommitted.
@@ -442,22 +459,52 @@ async fn history_copy_recovery_keeps_the_group_and_does_not_delete_the_replayed_
         CopyGenerationStatus::Recovering
     );
     database.create_scan_temporary_table().await?;
-    database
-        .batch_insert_temp_record(&[version("v1"), version("v2")])
-        .await?;
+    database.batch_insert_temp_record(&segments).await?;
     let replay: Vec<_> = database.clone_box().detect_new_items().await?.collect();
-    assert_eq!(replay.len(), 2);
-    assert!(replay.iter().all(|entry| entry.get_version_count() == Some(2)));
+    assert_eq!(
+        replay.iter().map(|entry| entry.get_version_id()).collect::<Vec<_>>(),
+        [Some("z-old"), Some("m-delete"), Some("a-new")]
+    );
+    assert_eq!(
+        replay.iter().map(|entry| entry.get_is_latest()).collect::<Vec<_>>(),
+        [false, false, true]
+    );
+    assert_eq!(
+        replay
+            .iter()
+            .map(|entry| entry.get_is_delete_marker())
+            .collect::<Vec<_>>(),
+        [false, true, false]
+    );
+    for (entry, source) in replay.iter().zip(&segments) {
+        assert_eq!(
+            entry.identity_key(),
+            source.history().unwrap().records()[0].identity().identity_key()
+        );
+    }
+    let before_ack = fixture.rows("history_copy").await?;
+    assert_eq!(before_ack.len(), 1);
+    assert_eq!(before_ack[0].version_id, "z-old");
     assert_eq!(database.detect_changed_items().await?.count(), 0);
     database
-        .insert_temp_to_base_table(&[("object".into(), "v1".into()), ("object".into(), "v2".into())])
+        .insert_temp_to_base_table(&[
+            ("object".into(), "z-old".into()),
+            ("object".into(), "m-delete".into()),
+            ("object".into(), "a-new".into()),
+        ])
         .await?;
     // A non-history destination acknowledges only the latest item of this group.
-    database.update_base_record(&version("v2")).await?;
+    assert_eq!(fixture.rows("history_copy").await?.len(), 1);
+    database
+        .batch_insert_completed_records(&[ObservedItem {
+            entry: Arc::clone(&segments[2]),
+            version_index: Some(0),
+        }])
+        .await?;
     assert_eq!(database.detect_deleted_items().await?.count(), 0);
     let records = fixture.rows("history_copy").await?;
     assert_eq!(records.len(), 1);
-    assert_eq!(records[0].version_id, "v2");
+    assert_eq!(records[0].version_id, "a-new");
     database.commit_scan_generation().await?;
     database.drop_scan_temporary_table().await?;
     Ok(())

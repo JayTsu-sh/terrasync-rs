@@ -22,8 +22,7 @@ use tracing::{debug, info, trace, warn};
 // 内部模块
 use crate::common::{
     CATALOGUE_COLUMNS as FILE_SCAN_COLUMNS_LIST,
-    CATALOGUE_COLUMNS_WITH_T_PREFIX as FILE_SCAN_COLUMNS_LIST_WITH_T_PREFIX, DeletionStatus,
-    FILE_SCAN_COLUMNS_LIST_WO_VERSIONCOUNT_WITH_T_PREFIX, classify_deletion_status,
+    CATALOGUE_COLUMNS_WITH_T_PREFIX as FILE_SCAN_COLUMNS_LIST_WITH_T_PREFIX, DeletionStatus, classify_deletion_status,
 };
 use crate::config::ClickHouseConfig;
 use crate::error::{DatabaseError, Result};
@@ -38,9 +37,8 @@ use crate::traits::{
 };
 use crate::{
     INCREMENTAL_SCAN_TABLE_BASE_NAME, SCAN_BASE_TABLE_BASE_NAME, SCAN_STATE_TABLE_BASE_NAME,
-    TAR_MANIFEST_TABLE_BASE_NAME, generate_scan_temp_table_name, generate_version_count_join_sql,
-    get_incremental_scan_base_table_name, get_scan_base_table_name, get_scan_state_table_name,
-    get_tar_manifest_table_name,
+    TAR_MANIFEST_TABLE_BASE_NAME, generate_scan_temp_table_name, get_incremental_scan_base_table_name,
+    get_scan_base_table_name, get_scan_state_table_name, get_tar_manifest_table_name,
 };
 use storage_adapter::observed_scan::{ObservedItem, ObservedView, ObservedViews};
 use utils::sanitize_job_id;
@@ -243,22 +241,17 @@ impl JoinStrategy {
 
     /// 构建 `detect_new` SQL：temp 中存在但 base 中不存在的记录
     ///
-    /// `version_count_join` 和 `version_count_expr` 由 `generate_version_count_join_sql!` 生成
-    fn build_detect_new_sql(
-        &self, temp: &str, base: &str, version_count_join: &str, version_count_expr: &str,
-    ) -> String {
-        let columns = &*FILE_SCAN_COLUMNS_LIST_WO_VERSIONCOUNT_WITH_T_PREFIX;
+    fn build_detect_new_sql(&self, temp: &str, base: &str) -> String {
+        let columns = &*FILE_SCAN_COLUMNS_LIST_WITH_T_PREFIX;
         match self {
             Self::Path => format!(
-                "SELECT {columns}, {version_count_expr}, t.backend_kind,t.backend_id,t.entry_snapshot FROM {temp} as t \
-                 {version_count_join} \
+                "SELECT {columns} FROM {temp} as t \
                  WHERE (t.relative_path, t.version_id) NOT IN \
                  (SELECT relative_path, version_id FROM {base}) \
                  ORDER BY t.relative_path, t.history_segment, t.history_index, t.version_id"
             ),
             Self::FileHandle => format!(
-                "SELECT {columns}, {version_count_expr}, t.backend_kind,t.backend_id,t.entry_snapshot FROM {temp} as t \
-                 {version_count_join} \
+                "SELECT {columns} FROM {temp} as t \
                  WHERE t.file_handle NOT IN \
                  (SELECT file_handle FROM {base} WHERE file_handle IS NOT NULL) \
                  ORDER BY t.relative_path, t.history_segment, t.history_index, t.version_id"
@@ -1242,8 +1235,7 @@ impl Database for ClickHouseDatabase {
         }
         let records = self
             .detect_items("new", |temp_table, base_table, strategy| {
-                let (vc_join, vc_expr) = generate_version_count_join_sql!(base_table);
-                strategy.build_detect_new_sql(temp_table, base_table, &vc_join, &vc_expr)
+                strategy.build_detect_new_sql(temp_table, base_table)
             })
             .await?;
 
@@ -1759,8 +1751,7 @@ mod tests {
 
     #[test]
     fn test_detect_new_sql_path_mode() {
-        let (vc_join, vc_expr) = generate_version_count_join_sql!("base_y");
-        let sql = JoinStrategy::Path.build_detect_new_sql("temp_x", "base_y", &vc_join, &vc_expr);
+        let sql = JoinStrategy::Path.build_detect_new_sql("temp_x", "base_y");
         assert!(sql.contains("NOT IN (SELECT relative_path, version_id FROM base_y)"));
         assert!(sql.contains("FROM temp_x"));
         assert!(!sql.contains("FINAL"));
@@ -1768,8 +1759,7 @@ mod tests {
 
     #[test]
     fn test_detect_new_sql_fh_mode() {
-        let (vc_join, vc_expr) = generate_version_count_join_sql!("base_y");
-        let sql = JoinStrategy::FileHandle.build_detect_new_sql("temp_x", "base_y", &vc_join, &vc_expr);
+        let sql = JoinStrategy::FileHandle.build_detect_new_sql("temp_x", "base_y");
         assert!(sql.contains("file_handle NOT IN"));
         assert!(sql.contains("FROM base_y WHERE file_handle IS NOT NULL"));
         assert!(!sql.contains("FINAL"));
@@ -1873,17 +1863,6 @@ mod tests {
         assert!(temp1.starts_with("temp_"));
         assert!(temp2.starts_with("temp_"));
         assert_ne!(temp1, temp2);
-    }
-
-    #[test]
-    fn test_version_count_join_sql() {
-        let (join_clause, select_expr) = generate_version_count_join_sql!("base_job1");
-        assert!(join_clause.contains("base_job1"));
-        assert!(join_clause.contains("LEFT JOIN"));
-        assert!(!join_clause.contains("row_kind"));
-        assert!(join_clause.contains("GROUP BY relative_path"));
-        assert!(select_expr.contains("CASE WHEN"));
-        assert!(select_expr.contains("COALESCE"));
     }
 
     #[tokio::test]

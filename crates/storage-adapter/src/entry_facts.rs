@@ -22,7 +22,6 @@ pub trait ObservedEntryExt {
     fn get_tags(&self) -> Option<&[ObjectTag]>;
     fn get_file_handle(&self) -> Option<[u8; 36]>;
     fn get_version_id(&self) -> Option<&str>;
-    fn get_version_count(&self) -> Option<u32>;
     fn get_is_latest(&self) -> bool;
     fn get_is_delete_marker(&self) -> bool;
 }
@@ -109,10 +108,6 @@ impl ObservedEntryExt for ObservedEntry {
         };
         Some(record.version_id().unwrap_or("null"))
     }
-    fn get_version_count(&self) -> Option<u32> {
-        self.history()
-            .map(|history| history.records().len().min(u32::MAX as usize) as u32)
-    }
     fn get_is_latest(&self) -> bool {
         self.history()
             .and_then(|history| history.records().first())
@@ -190,9 +185,6 @@ impl ObservedEntryExt for crate::observed_scan::ObservedItem {
         self.view()
             .version()
             .map(|record| record.version_id().unwrap_or("null"))
-    }
-    fn get_version_count(&self) -> Option<u32> {
-        self.version_index.map(|_| 1)
     }
     fn get_is_latest(&self) -> bool {
         self.view().version().is_none_or(|record| record.is_latest())

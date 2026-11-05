@@ -103,7 +103,7 @@ impl ClickHouseDatabase {
             .scan_temp_table_name
             .as_deref()
             .ok_or_else(|| DatabaseError::TableNotFound("copy comparison staging".into()))?;
-        // 原样保留完整 source history 的 version_count，交回普通 New 分组协议。
+        // 按源端历史位置返回逐版本快照；只有复制完成 ACK 才能确认对应版本。
         self.sync_client
             .query(&format!(
                 "SELECT {} FROM {table} ORDER BY relative_path, history_segment, history_index, version_id",

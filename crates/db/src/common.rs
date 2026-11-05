@@ -131,24 +131,3 @@ pub fn classify_deletion_status(
 
     Ok(deletion_statuses)
 }
-
-/// 生成 `version_count` 的 JOIN 子句和 SELECT 表达式（优化 4）
-///
-/// 返回 `(join_clause, select_expr)`：
-/// - `join_clause`: LEFT JOIN 预聚合子查询
-/// - `select_expr`: CASE WHEN 表达式
-#[macro_export]
-macro_rules! generate_version_count_join_sql {
-    ($base_table:expr) => {{
-        let join_clause = format!(
-            "LEFT JOIN (SELECT relative_path, count() as cnt FROM {} GROUP BY relative_path) as vc \
-             ON t.relative_path = vc.relative_path",
-            $base_table
-        );
-        let select_expr = "CASE WHEN t.version_count IS NOT NULL \
-             THEN CAST(t.version_count - COALESCE(vc.cnt, 0) AS UInt32) \
-             ELSE NULL END as version_count"
-            .to_string();
-        (join_clause, select_expr)
-    }};
-}
