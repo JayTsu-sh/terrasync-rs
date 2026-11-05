@@ -28,8 +28,18 @@ marker 有到无的转换产生显式删除意图，不能仅由当前目录没�
 - 真实 catalogue 适用场景：Single 10／10，Cluster 12／12。新增用例验证 marker 差异等待 ACK、删除失败后恢复仍保留意图；限制测试表后台合并并断言存在多条物理行，防止后台合并掩盖旧事实选择错误。记录见 `/tmp/terrasync-db-refactor-real-marker-tags-v4-{single,cluster}-catalogue.{log,json}`。
 - 上述成功 S3 测试报告中，数据库、bucket、版本、上传状态及私有配置清理均通过。失败的早期诊断不计为通过。
 
+## 远端源观察校验
+
+远端 full／delta 内容读取改用共享 native expert source session，在 FileBegin 或 delta tokens 前核验所选观察。源读取与摘要由同一个 session 完成；错误不发送 EOF。普通对象、目录 marker 和历史版本共享该机制，原始观察通过 Arc 共享。
+
+真实零字节替换注入先复现失败：S3 HEAD 已读取 LastModified，但 descriptor 没有交付这项事实，替换后仍被复制。data-mover `04f0854` 补齐 descriptor 的修改时间，并按双方声明的较粗时间精度比较；精度以内不能区分的变化不宣称可检测。上游完整 `make ci` 通过，新增精度与替换回归先失败后通过。
+
+修复候选 SHA-256：`9c7ae27860a6561bdc71584630aa6e4212b2beced0b7cf20bec401315f72c709`；精确源码记录在 `/tmp/terrasync-source-mtime-build-source.json`。真实 QUIC 两例通过：扫描后替换零字节普通对象与目录 marker，均报告一个条目错误，目标未发布，也没有内容 GET。CLI 按既有条目报告语义退出，不能用退出码代替任务结果。单元回归另断言没有 FileBegin 和成功 ACK。
+
+证据：`/work/terrasync-db-refactor-evidence/release-db-refactor-zero-source-v3-20261105-184316/report.json`；独立 bucket 和私有配置已清理。root pinned workspace check 与 app／db／transport／storage-adapter 测试通过。
+
 ## 合入前仍须完成
 
-远端通用 source stream 对零字节观察存在准入缺口：describe 成功后未比较所广告的 identity／size／mtime，而零字节没有 read 来触发 expected-source 校验。需要以共享 native expert source session 统一处理所选观察与版本，并补源替换后不发布／不 ACK 的回归。本阶段正常路径通过不能替代此项。
+普通文件 metadata-only 存在已有的标签应用与错误确认缺口，需要独立修复；零字节准入修复不替代该项。
 
 还需完成数据库内部职责拆分、移除无用 DTO／原型及旧版本计数、任务契约和 transport 的归属整理，以及按设计删除 storage-adapter。最终候选必须重跑对应 CI、真实 HDFS 和受影响故障链路，并完成全量／增量／续扫性能与峰值 RSS 对照。先前 HDFS 通过的二进制不能作为最终候选证据。

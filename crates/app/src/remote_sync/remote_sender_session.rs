@@ -4,6 +4,8 @@
 //! 从文件列表发布开始运行到 Receiver 返回 `AllDone`。后续迁移会逐步把会话状态与转换
 //! 收入此模块，调用者与测试始终只依赖这里的 interface。
 
+use blake3::Hash;
+use data_mover::transfer::ExpertSourcePayload;
 use std::collections::HashSet;
 use std::path::Path;
 use std::path::PathBuf;
@@ -15,7 +17,7 @@ use storage_adapter::observed_scan::ObservedItem;
 use storage_adapter::dir_tree::NdxEvent;
 use storage_adapter::qos::QosManager;
 use storage_adapter::{ChangeKind, ErrorEvent, StorageEntryMessage};
-use storage_adapter::{ConsistencyCheck, ObservedEntry, StorageEnum, WalkDirAsyncIterator2};
+use storage_adapter::{DataChunk, ObservedEntry, StorageEnum, StorageError, WalkDirAsyncIterator2};
 use sync_delta::DeltaToken;
 use sync_delta::matcher::DeltaMatcher;
 use tokio::sync::Mutex as AsyncMutex;
@@ -310,37 +312,38 @@ pub(super) async fn send_full_transfer(
             }
         }
     } else {
-        let (mut chunks, read_join) =
-            StorageEnum::read_observed_chunk_stream(src_storage, entry, None, qos.cloned(), true, 8);
-        transport.send(SenderMsg::FileBegin { ndx }).await?;
-        while let Some(chunk) = chunks.recv().await {
-            transport.send(SenderMsg::FileData { ndx, chunk }).await?;
-        }
-        let read_result = match read_join.await {
-            Ok(inner) => inner.map_err(|error| error.to_string()),
-            Err(error) => Err(error.to_string()),
+        let Some(mut payload) = open_source_payload(transport, src_storage, entry, ndx, qos).await? else {
+            return Ok(SourceTransferOutcome::SourceFailed);
         };
-        match read_result {
-            Ok(hasher) => {
+        transport.send(SenderMsg::FileBegin { ndx }).await?;
+        let mut offset = 0;
+        loop {
+            match payload.next_chunk().await {
+                Ok(Some(data)) => {
+                    let length = data.len() as u64;
+                    transport
+                        .send(SenderMsg::FileData {
+                            ndx,
+                            chunk: DataChunk { offset, data },
+                        })
+                        .await?;
+                    offset += length;
+                }
+                Ok(None) => break,
+                Err(error) => return report_source_failure(transport, entry, ndx, error.to_string()).await,
+            }
+        }
+        match payload.finish().await {
+            Ok(evidence) => {
                 transport
                     .send(SenderMsg::EndOfFile {
                         ndx,
-                        source_hash: hasher.map(ConsistencyCheck::finalize),
+                        source_hash: Some(Hash::from_bytes(evidence.blake3).to_hex().to_string()),
                     })
                     .await?;
                 SourceTransferOutcome::Sent
             }
-            Err(reason) => {
-                error!("[Sender Remote] read file {:?}: {reason}", entry.get_relative_path());
-                transport
-                    .send(SenderMsg::EntryError {
-                        path: entry.get_relative_path().to_path_buf(),
-                        reason,
-                        ndx: Some(ndx),
-                    })
-                    .await?;
-                SourceTransferOutcome::SourceFailed
-            }
+            Err(error) => return report_source_failure(transport, entry, ndx, error.to_string()).await,
         }
     };
     if outcome == SourceTransferOutcome::Sent && entry.entry.history().is_none() {
@@ -386,49 +389,67 @@ async fn send_delta_transfer(
         .collect::<Vec<_>>();
     let mut matcher = DeltaMatcher::new(&signatures, block_size);
     let mut token_count = 0usize;
-    let (mut chunks, read_join) =
-        StorageEnum::read_observed_chunk_stream(src_storage, entry, None, qos.cloned(), true, 8);
-    while let Some(chunk) = chunks.recv().await {
-        let tokens = matcher.push(&chunk.data);
-        token_count += tokens.len();
-        send_delta_tokens(*transport, ndx, tokens, *qos).await?;
+    let Some(mut payload) = open_source_payload(*transport, src_storage, entry, ndx, *qos).await? else {
+        return Ok(SourceTransferOutcome::SourceFailed);
+    };
+    loop {
+        match payload.next_chunk().await {
+            Ok(Some(data)) => {
+                let tokens = matcher.push(&data);
+                token_count += tokens.len();
+                send_delta_tokens(*transport, ndx, tokens, *qos).await?;
+            }
+            Ok(None) => break,
+            Err(error) => return report_source_failure(*transport, entry, ndx, error.to_string()).await,
+        }
     }
+    let evidence = match payload.finish().await {
+        Ok(evidence) => evidence,
+        Err(error) => return report_source_failure(*transport, entry, ndx, error.to_string()).await,
+    };
     let tokens = matcher.finish();
     token_count += tokens.len();
     send_delta_tokens(*transport, ndx, tokens, *qos).await?;
+    transport
+        .send(SenderMsg::EndOfFile {
+            ndx,
+            source_hash: Some(Hash::from_bytes(evidence.blake3).to_hex().to_string()),
+        })
+        .await?;
+    info!(
+        "[Sender Remote] Delta transfer {:?}: {} tokens",
+        entry.get_relative_path(),
+        token_count
+    );
+    send_acl_if_enabled(*transport, src_storage, &entry.entry, *enable_acl).await;
+    Ok(SourceTransferOutcome::Sent)
+}
 
-    let read_result = match read_join.await {
-        Ok(inner) => inner.map_err(|error| error.to_string()),
-        Err(error) => Err(error.to_string()),
-    };
-    match read_result {
-        Ok(hasher) => {
-            transport
-                .send(SenderMsg::EndOfFile {
-                    ndx,
-                    source_hash: hasher.map(ConsistencyCheck::finalize),
-                })
-                .await?;
-            info!(
-                "[Sender Remote] Delta transfer {:?}: {} tokens",
-                entry.get_relative_path(),
-                token_count
-            );
-            send_acl_if_enabled(*transport, src_storage, &entry.entry, *enable_acl).await;
-            Ok(SourceTransferOutcome::Sent)
-        }
-        Err(reason) => {
-            error!("[Sender Remote] read file {:?}: {reason}", entry.get_relative_path());
-            transport
-                .send(SenderMsg::EntryError {
-                    path: entry.get_relative_path().to_path_buf(),
-                    reason,
-                    ndx: Some(ndx),
-                })
-                .await?;
-            Ok(SourceTransferOutcome::SourceFailed)
+/// 准入成功后才允许目标准备或消费源数据；完整性证据由原生 producer 给出。
+async fn open_source_payload(
+    transport: &dyn SenderTransport, storage: &StorageEnum, entry: &ObservedItem, ndx: i32, qos: Option<&QosManager>,
+) -> Result<Option<ExpertSourcePayload>> {
+    match StorageEnum::open_observed_source(storage, entry, qos).await {
+        Ok(session) => Ok(Some(session.stream_from(0).map_err(StorageError::from)?)),
+        Err(error) => {
+            report_source_failure(transport, entry, ndx, error.to_string()).await?;
+            Ok(None)
         }
     }
+}
+
+async fn report_source_failure(
+    transport: &dyn SenderTransport, entry: &ObservedItem, ndx: i32, reason: String,
+) -> Result<SourceTransferOutcome> {
+    error!("[Sender Remote] source {:?}: {reason}", entry.get_relative_path());
+    transport
+        .send(SenderMsg::EntryError {
+            path: entry.get_relative_path().to_path_buf(),
+            reason,
+            ndx: Some(ndx),
+        })
+        .await?;
+    Ok(SourceTransferOutcome::SourceFailed)
 }
 
 async fn send_delta_tokens(

@@ -18,12 +18,13 @@ use data_mover::{
     },
     transfer::{
         DirectPatchChunk, DirectPatchInput, DirectPatchSession, ExpertDestinationRequest, ExpertDestinationSession,
-        ExpertDestinationTransferred, ExpertSourceEvidence, TransferFailure,
+        ExpertDestinationTransferred, ExpertSourceEvidence, ExpertSourceRequest, ExpertSourceSession, TransferFailure,
     },
 };
 use futures::{Stream, StreamExt, stream};
 use moka::sync::Cache;
 use qos::{QosConfig, QosManager, parse_bandwidth_string};
+use std::num::NonZeroUsize;
 use std::pin::Pin;
 use std::{
     path::Path,
@@ -87,36 +88,33 @@ pub(crate) fn source_qos(qos: &QosManager, maximum: u64) -> Result<SourceQosGrou
     let (_, group) = groups.get_with(key, || (Arc::downgrade(&config), SourceQosGroup::new(policy)));
     Ok(group)
 }
-#[derive(Clone, Copy)]
-enum ReadBinding {
-    Advertised,
-    Basis,
-}
-
 impl StorageEnum {
     pub fn read_basis_chunk_stream(
         storage: &Self, entry: &Arc<ObservedEntry>, intervals: Option<Vec<(u64, u64)>>, qos: Option<QosManager>,
         hash: bool, capacity: usize,
     ) -> (mpsc::Receiver<DataChunk>, JoinHandle<Result<Option<HashCalculator>>>) {
-        Self::start_chunk_stream(
-            storage,
-            &Arc::clone(entry).into(),
-            intervals,
-            qos,
-            hash,
-            capacity,
-            ReadBinding::Basis,
-        )
+        Self::start_chunk_stream(storage, &Arc::clone(entry).into(), intervals, qos, hash, capacity)
     }
-    pub fn read_observed_chunk_stream(
-        storage: &Self, item: &ObservedItem, intervals: Option<Vec<(u64, u64)>>, qos: Option<QosManager>, hash: bool,
-        capacity: usize,
-    ) -> (mpsc::Receiver<DataChunk>, JoinHandle<Result<Option<HashCalculator>>>) {
-        Self::start_chunk_stream(storage, item, intervals, qos, hash, capacity, ReadBinding::Advertised)
+    /// 在发送 FileBegin 前由原生 source session 校验观察，并钉住所选源版本。
+    pub async fn open_observed_source(
+        storage: &Self, item: &ObservedItem, qos: Option<&QosManager>,
+    ) -> Result<ExpertSourceSession> {
+        let maximum = NonZeroUsize::new(storage.block_size as usize).unwrap_or(NonZeroUsize::MIN);
+        let mut request = ExpertSourceRequest::from_shared_observation(
+            storage.roles.clone(),
+            Arc::clone(&item.entry),
+            item.version_index,
+            CancellationToken::new(),
+        )?
+        .with_maximum_chunk_bytes(maximum);
+        if let Some(qos) = qos {
+            request = request.with_source_qos(source_qos(qos, storage.block_size)?);
+        }
+        Ok(ExpertSourceSession::open(request).await?)
     }
     fn start_chunk_stream(
         storage: &Self, item: &ObservedItem, intervals: Option<Vec<(u64, u64)>>, qos: Option<QosManager>, hash: bool,
-        capacity: usize, binding: ReadBinding,
+        capacity: usize,
     ) -> (mpsc::Receiver<DataChunk>, JoinHandle<Result<Option<HashCalculator>>>) {
         let storage = storage.clone();
         let item = item.clone();
@@ -125,12 +123,7 @@ impl StorageEnum {
             let source = storage.roles.read_source()?;
             let view = item.view().payload();
             let p = view.source_path()?;
-            let version = match binding {
-                ReadBinding::Advertised => view
-                    .source_version()
-                    .ok_or_else(|| operation("no object version selected for source read"))?,
-                ReadBinding::Basis => SourceVersion::Current,
-            };
+            let version = SourceVersion::Current;
             let descriptor = source.describe_version(&p, &version).await?;
             let size = descriptor.size.ok_or_else(|| operation("unknown source size"))?;
             let ranges = intervals.unwrap_or_else(|| vec![(0, size)]);
@@ -152,10 +145,7 @@ impl StorageEnum {
                     .read(storage::ReadRequest {
                         path: p.clone(),
                         range: Some(start..end),
-                        expected_source: Some(match binding {
-                            ReadBinding::Advertised => view.source_identity().clone(),
-                            ReadBinding::Basis => descriptor.source_identity.clone(),
-                        }),
+                        expected_source: Some(descriptor.source_identity.clone()),
                         maximum_chunk_bytes: source
                             .maximum_read_chunk_bytes()
                             .min(storage.block_size as usize)

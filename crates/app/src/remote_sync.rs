@@ -251,6 +251,7 @@ mod tests {
     use std::fs::File;
     use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::{Duration, SystemTime};
     use storage_adapter::ObservedEntryExt;
 
@@ -1241,6 +1242,71 @@ mod tests {
             }
             other => panic!("expected StatsKind::Incremental, got {other:?}"),
         }
+    }
+
+    struct SourceAdmissionTrace {
+        inner: InProcessSenderTransport,
+        begins: AtomicUsize,
+        successes: AtomicUsize,
+    }
+    #[async_trait]
+    impl SenderTransport for SourceAdmissionTrace {
+        async fn send(&self, mut message: SenderMsg) -> TransportResult<()> {
+            match &mut message {
+                SenderMsg::Handshake(handshake) => handshake.features.delta = false,
+                SenderMsg::FileBegin { .. } => {
+                    self.begins.fetch_add(1, Ordering::Relaxed);
+                }
+                _ => {}
+            }
+            self.inner.send(message).await
+        }
+        async fn recv(&self) -> Option<ReceiverMsg> {
+            let message = self.inner.recv().await;
+            if matches!(
+                message,
+                Some(ReceiverMsg::Success { .. } | ReceiverMsg::EntrySuccess { .. })
+            ) {
+                self.successes.fetch_add(1, Ordering::Relaxed);
+            }
+            message
+        }
+        async fn close(&self) -> TransportResult<()> {
+            self.inner.close().await
+        }
+    }
+
+    #[tokio::test]
+    async fn replaced_empty_source_is_refused_before_file_begin_and_does_not_publish_or_ack() {
+        let source = tempdir().unwrap();
+        let destination = tempdir().unwrap();
+        fs::write(source.path().join("empty"), []).unwrap();
+        fs::write(destination.path().join("empty"), b"published").unwrap();
+        let target = Arc::new(
+            create_storage(destination.path().to_str().unwrap(), None, true)
+                .await
+                .unwrap(),
+        );
+        let (sender, receiver) = create_in_process_pair();
+        let trace = SourceAdmissionTrace {
+            inner: sender,
+            begins: AtomicUsize::new(0),
+            successes: AtomicUsize::new(0),
+        };
+        let (stats, successes, errors) = tokio::time::timeout(
+            Duration::from_secs(10),
+            run_pipeline_with_disruption(&trace, receiver, source.path(), target, || {
+                fs::write(source.path().join("replacement"), []).unwrap();
+                fs::rename(source.path().join("replacement"), source.path().join("empty")).unwrap();
+            }),
+        )
+        .await
+        .expect("source refusal must terminate the pending NDX");
+        assert_eq!((successes, errors), (0, 1));
+        assert_eq!(trace.begins.load(Ordering::Relaxed), 0);
+        assert_eq!(trace.successes.load(Ordering::Relaxed), 0);
+        assert_eq!(fs::read(destination.path().join("empty")).unwrap(), b"published");
+        assert!(matches!(&stats.lock().await.stats, StatsKind::Incremental(value) if value.error_stats.copy == 1));
     }
 
     /// [2] delta 源读失败：该 ndx 正常完成（不 hang），Sender 自增 error_count 并喂入
