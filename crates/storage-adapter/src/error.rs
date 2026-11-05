@@ -112,6 +112,7 @@ impl StorageError {
     pub fn is_cancelled(&self) -> bool {
         matches!(self, Self::Cancelled)
             || matches!(self, Self::Role(StorageRoleFailure::Entry(error)) if error.class() == FailureClass::Cancelled)
+            || matches!(self, Self::DirectPatch(error) if error.is_cancelled())
     }
 }
 impl From<TransferFailure> for StorageError {

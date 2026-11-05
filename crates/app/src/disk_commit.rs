@@ -9,6 +9,7 @@ use std::sync::atomic::Ordering;
 use storage_adapter::StorageEnum;
 use sync_delta::DeltaToken;
 use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 use tracing::warn;
 use transport::message::{DcAck, DiskCommitMsg, ReceiverMsg, SessionConfig};
 
@@ -19,9 +20,9 @@ use crate::receiver::ReceiverProgress;
 /// 串行分派 Receiver 落盘命令，并将文件命令交给单一生命周期所有者。
 pub async fn disk_commit_task(
     dest: Arc<StorageEnum>, session: SessionConfig, mut rx: mpsc::Receiver<DiskCommitMsg>,
-    ack_tx: mpsc::UnboundedSender<DcAck>, progress: Arc<ReceiverProgress>,
+    ack_tx: mpsc::UnboundedSender<DcAck>, progress: Arc<ReceiverProgress>, cancel: CancellationToken,
 ) -> Result<()> {
-    let mut files = FileCommitter::new(dest.clone(), session, ack_tx.clone(), progress.clone());
+    let mut files = FileCommitter::new(dest.clone(), session, ack_tx.clone(), progress.clone(), cancel);
 
     while let Some(msg) = rx.recv().await {
         match msg {

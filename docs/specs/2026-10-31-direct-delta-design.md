@@ -21,6 +21,12 @@ CLI 优先级为 `--resume` → Checkpointed，否则 `--in-place` → AtomicRep
 同位置 Match 不重写；移动或重叠引用在改写前已全部消费。临时输入、文件句柄、校验、元数据
 及发布都由 data-mover 持有。输入失败后会话不可再提交，Unix 暂存创建后立即 unlink。
 
+Receiver 的落盘取消信号传给 transfer 会话；会话持有子令牌并贯穿输入等待、basis 读取、
+补丁、校验、元数据和发布。异常退出先取消落盘再等待收尾，单文件中止先取消再等待 writer。
+`StreamHandle` 可在提交锁外请求取消。丢弃会话或提交 future 也会取消子令牌，使已启动的
+Local 后台校验停止；调用方父令牌与其他文件不受会话释放影响。正常取消等待 backend 收尾，
+开始应用补丁后的取消可能保留部分更新，须重新生成 basis 后重试。
+
 原地补丁需要独立的 `supports_sparse_patch` / `patch_direct` 能力，不能复用先截断文件的普通
 positioned writer。当前仅 Unix Local 支持；其他远端目标应显式使用 Atomic/Checkpoint。
 Direct 默认不受 512MiB 门槛限制，但保留用户显式设置的门槛。Atomic/Checkpoint 保持旧门槛。
