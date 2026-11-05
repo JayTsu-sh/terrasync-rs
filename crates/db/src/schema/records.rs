@@ -5,8 +5,11 @@ use crate::schema::entry::EntrySummary;
 use data_mover::model::{BackendIdentity, BackendKind};
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, path::Path, time::SystemTime};
-use storage_adapter::observed_scan::ObservedView;
-use storage_adapter::{ObservedEntry, ObservedEntryExt, StorageEntryMessage};
+use task_model::observation::ObservedView;
+use {
+    data_mover::model::ObservedEntry,
+    task_model::{ObservedEntryExt, StorageEntryMessage},
+};
 
 /// 文件扫描记录结构体
 /// 统一的数据结构，用于存储文件系统扫描结果
@@ -299,7 +302,7 @@ mod tests {
     use data_mover::model::{EntryKind, HistoryOrder, ObjectHistory};
     use serde_json::json;
     use std::sync::Arc;
-    use storage_adapter::observed_scan::ObservedItem;
+    use task_model::observation::ObservedItem;
 
     #[test]
     fn narrow_snapshot_projection_keeps_the_complete_native_observation() -> Result<()> {

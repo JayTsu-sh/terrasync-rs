@@ -4,6 +4,7 @@ use crate::execution::read::QuorumRead;
 use crate::scan::ScanFinalEvent;
 use crate::scan::candidate_cache::ScanMetadataHash;
 use crate::scan::rows::directory_marker_state;
+use crate::schema::identity::{PERSISTED_IDENTITY_PREFIX, has_cross_scan_identity};
 use crate::{
     error::{DatabaseError, Result},
     schema::columns::FILE_SCAN_COLUMNS_LIST,
@@ -15,12 +16,12 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use serde::Deserialize;
 use smol_str::SmolStr;
 use std::{fmt, sync::Arc};
-use storage_adapter::{
-    ChangeKind,
-    observed_scan::{EntryStatistics, ObservedItem, ObservedScanEvent, ObservedView},
-};
 use tokio::task::yield_now;
 use tracing::warn;
+use {
+    task_model::ChangeKind,
+    task_model::observation::{EntryStatistics, ObservedItem, ObservedScanEvent, ObservedView},
+};
 
 const SPARSE_KEY_BYTES: usize = 16_384;
 
@@ -176,13 +177,13 @@ impl NativeScanAccess<'_> {
         }
         let mut paths: Vec<_> = entries
             .iter()
-            .flat_map(|entry| ObservedView::all(entry).map(|view| view.sql_path()))
+            .flat_map(|entry| ObservedView::all(entry).map(|view| view.path_key()))
             .collect();
         paths.sort_unstable();
         let by_handle = self.typed_handles
             && entries
                 .iter()
-                .any(|entry| ObservedItem::all(entry).any(|item| item.view().file_handle().is_some()));
+                .any(|entry| ObservedItem::all(entry).any(|item| has_cross_scan_identity(&item.entry)));
         let rows = self
             .baselines(paths[0].as_ref(), paths[paths.len() - 1].as_ref(), by_handle)
             .await?;
@@ -194,11 +195,11 @@ impl NativeScanAccess<'_> {
         for entry in entries {
             for item in ObservedItem::all(entry) {
                 let view = item.view();
-                if let Some(old) = by_path.get(&(view.sql_path().as_ref(), view.version_id())) {
+                if let Some(old) = by_path.get(&(view.path_key().as_ref(), view.version_id())) {
                     let changed_identity = by_handle && old.identity_changed;
                     if changed_identity {
                         has_displaced |= old.previous_generation;
-                        if view.file_handle().is_some() {
+                        if has_cross_scan_identity(view.entry) {
                             absent.push(item);
                         }
                         continue;
@@ -207,7 +208,7 @@ impl NativeScanAccess<'_> {
                         events.push(ObservedScanEvent::Changed { item, kind });
                     }
                 } else if by_handle {
-                    if view.file_handle().is_some() {
+                    if has_cross_scan_identity(view.entry) {
                         absent.push(item);
                     } else {
                         path_only.push(item);
@@ -225,7 +226,7 @@ impl NativeScanAccess<'_> {
             let mut recovered = 0;
             for item in path_only {
                 let view = item.view();
-                if let Some(old) = checked.get(&(view.sql_path().as_ref(), view.version_id())) {
+                if let Some(old) = checked.get(&(view.path_key().as_ref(), view.version_id())) {
                     recovered += 1;
                     if let Some(kind) = old.change(&item) {
                         events.push(ObservedScanEvent::Changed { item, kind });
@@ -247,7 +248,7 @@ impl NativeScanAccess<'_> {
             let mut recovered = 0;
             for item in absent {
                 let view = item.view();
-                if let Some(old) = rechecked_by_path.get(&(view.sql_path().as_ref(), view.version_id())) {
+                if let Some(old) = rechecked_by_path.get(&(view.path_key().as_ref(), view.version_id())) {
                     if !old.identity_changed {
                         recovered += 1;
                         if let Some(kind) = old.change(&item) {
@@ -269,7 +270,7 @@ impl NativeScanAccess<'_> {
                 .map(|name| format!("b.{}", name.trim()))
                 .collect::<Vec<_>>()
                 .join(",");
-            self.read_query(&format!("SELECT {columns} FROM (SELECT {} FROM {} {} WHERE {} AND {} AND NOT ({}) AND relative_path BETWEEN ? AND ? AND (relative_path,version_id) IN (SELECT relative_path,version_id FROM {} WHERE {})) AS b INNER JOIN (SELECT relative_path,version_id,file_handle FROM {} WHERE {}) AS s USING(relative_path,version_id) WHERE b.file_handle IS NOT NULL AND startsWith(b.file_handle,'54534934') AND s.file_handle IS NOT NULL AND b.file_handle!=s.file_handle LIMIT 1 BY b.relative_path,b.version_id",FILE_SCAN_COLUMNS_LIST,self.base,self.final_clause,self.scope,self.live,self.active,self.stage,self.stage_scope,self.stage,self.stage_scope)).bind(&paths[0]).bind(&paths[paths.len()-1]).fetch_quorum_all::<StorageEntryRecord>().await?
+            self.read_query(&format!("SELECT {columns} FROM (SELECT {} FROM {} {} WHERE {} AND {} AND NOT ({}) AND relative_path BETWEEN ? AND ? AND (relative_path,version_id) IN (SELECT relative_path,version_id FROM {} WHERE {})) AS b INNER JOIN (SELECT relative_path,version_id,file_handle FROM {} WHERE {}) AS s USING(relative_path,version_id) WHERE b.file_handle IS NOT NULL AND startsWith(b.file_handle,'{PERSISTED_IDENTITY_PREFIX}') AND s.file_handle IS NOT NULL AND b.file_handle!=s.file_handle LIMIT 1 BY b.relative_path,b.version_id",FILE_SCAN_COLUMNS_LIST,self.base,self.final_clause,self.scope,self.live,self.active,self.stage,self.stage_scope,self.stage,self.stage_scope)).bind(&paths[0]).bind(&paths[paths.len()-1]).fetch_quorum_all::<StorageEntryRecord>().await?
         } else {
             Vec::new()
         };
@@ -288,7 +289,7 @@ impl NativeScanAccess<'_> {
             .iter()
             .map(|item| {
                 let view = item.view();
-                (view.sql_path(), view.version_id())
+                (view.path_key(), view.version_id())
             })
             .collect();
         let mut rows = Vec::new();
@@ -308,7 +309,7 @@ impl NativeScanAccess<'_> {
     fn identity_changed(&self, by_handle: bool) -> String {
         if by_handle {
             format!(
-                "startsWith(ifNull(file_handle,''),'54534934') AND (relative_path,version_id) IN (SELECT relative_path,version_id FROM {} WHERE {} AND file_handle IS NOT NULL) AND (relative_path,version_id,file_handle) NOT IN (SELECT relative_path,version_id,file_handle FROM {} WHERE {} AND file_handle IS NOT NULL)",
+                "startsWith(ifNull(file_handle,''),'{PERSISTED_IDENTITY_PREFIX}') AND (relative_path,version_id) IN (SELECT relative_path,version_id FROM {} WHERE {} AND file_handle IS NOT NULL) AND (relative_path,version_id,file_handle) NOT IN (SELECT relative_path,version_id,file_handle FROM {} WHERE {} AND file_handle IS NOT NULL)",
                 self.stage, self.stage_scope, self.stage, self.stage_scope
             )
         } else {
@@ -587,7 +588,7 @@ mod tests {
         BackendIdentity, BackendKind, EntryKind, IdentityStrength, ObservedEntry, PermissionFacts, PrincipalIdentity,
         SourceIdentity, StoragePath,
     };
-    use storage_adapter::observed_scan::ObservedView;
+    use task_model::observation::ObservedView;
     use tokio_util::sync::CancellationToken;
     fn observation(path: &str, strength: IdentityStrength) -> Result<ObservedEntry> {
         let backend = BackendIdentity::new(BackendKind::Nfs, "hardlink-fixture")?;

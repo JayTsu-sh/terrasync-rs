@@ -1,7 +1,7 @@
 //! 复制轮次收尾：目录元数据全部确认后才允许数据库提交。
 use std::sync::Arc;
 use std::thread::JoinHandle as ThreadHandle;
-use storage_adapter::ObservedEntryExt;
+use task_model::ObservedEntryExt;
 
 use db::Database;
 use storage_adapter::{ObservedEntry, StorageEnum};

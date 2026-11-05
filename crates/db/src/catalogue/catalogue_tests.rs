@@ -7,7 +7,7 @@ use crate::schema::columns::CATALOGUE_COLUMNS;
 use data_mover::model::{BackendKind, EntryKind};
 use std::path::PathBuf;
 use std::time::Duration;
-use storage_adapter::{EntryChange, ObservedEntryExt};
+use task_model::{EntryChange, ObservedEntryExt};
 use tokio::runtime::Builder;
 use tokio::time::timeout;
 use utils::app_config::ClickHouseMode;
@@ -89,7 +89,6 @@ impl Fixture {
                 let fixture_storage: String = "nas".into();
                 let fixture_version: String = String::new();
                 let fixture_handle: Option<String> = Some(format!("54534934{handle}"));
-                let fixture_tags: Option<String> = None;
                 let entry = crate::observed_fixtures::observation(
                     if fixture_storage == "s3" {
                         data_mover::model::BackendKind::S3
@@ -106,13 +105,7 @@ impl Fixture {
                         gid: 1000,
                     }),
                     fixture_handle.map(|handle| hex::decode(handle).unwrap()),
-                    fixture_tags.map(|tags| {
-                        serde_json::from_str::<Vec<storage_adapter::Tag>>(&tags)
-                            .unwrap()
-                            .into_iter()
-                            .map(|tag| (tag.key, tag.value))
-                            .collect()
-                    }),
+                    None,
                     (!fixture_version.is_empty()).then_some((Some(fixture_version), true, false)),
                 );
                 StorageEntryRecord::capture(&entry, 0).unwrap()
@@ -419,7 +412,7 @@ async fn empty_unconfirmed_copy_remains_dirty_until_commit() -> Result<()> {
 async fn history_copy_recovery_keeps_the_group_and_does_not_delete_the_replayed_path() -> Result<()> {
     let fixture = Fixture::new().await?;
     use data_mover::model::{HistoryOrder, ObjectHistory};
-    use storage_adapter::observed_scan::ObservedItem;
+    use task_model::observation::ObservedItem;
     // 源顺序不能由版本 ID、变更类型或时间戳排序推断；真实分段必须保留位置。
     let versions: Vec<_> = [("z-old", false), ("m-delete", true), ("a-new", false)]
         .into_iter()
@@ -600,7 +593,7 @@ async fn catalogue_stream_does_not_hide_a_terminal_query_error() -> Result<()> {
 #[ignore = "requires an explicitly selected six-replica ClickHouse cluster; isolated database and local fixture only"]
 async fn copy_comparison_binds_new_and_changed_versions_in_source_order() -> Result<()> {
     use data_mover::model::{HistoryOrder, ObjectHistory};
-    use storage_adapter::EntryChange;
+    use task_model::EntryChange;
     let fixture = Fixture::new().await?;
     let observe = |id: Option<&str>, size, latest| {
         crate::observed_fixtures::observation(
@@ -678,7 +671,7 @@ async fn copy_comparison_binds_new_and_changed_versions_in_source_order() -> Res
 #[ignore = "requires an explicitly selected six-replica ClickHouse cluster; isolated database and local fixture only"]
 async fn copy_comparison_distinguishes_unmapped_principals_from_numeric_zero() -> Result<()> {
     use data_mover::model::{PermissionFacts, PrincipalIdentity};
-    use storage_adapter::EntryChange;
+    use task_model::EntryChange;
     let fixture = Fixture::new().await?;
     let observe = |uid: Option<u32>| -> Result<Arc<ObservedEntry>> {
         let entry = crate::observed_fixtures::observation(

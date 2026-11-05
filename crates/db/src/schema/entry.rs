@@ -1,6 +1,6 @@
 //! 用于比较、统计和最终事件的轻量查询事实；不伪造完整观察。
 use serde::{Deserialize, Serialize};
-use storage_adapter::observed_scan::EntryStatistics;
+use task_model::observation::EntryStatistics;
 
 #[derive(Default, Debug, Clone, Serialize, Deserialize, clickhouse::Row)]
 pub struct EntrySummary {

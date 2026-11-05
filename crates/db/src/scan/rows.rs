@@ -2,6 +2,7 @@
 #[cfg(test)]
 use crate::error::DatabaseError;
 use crate::scan::ScanFinalEvent;
+use crate::schema::identity::encoded_file_handle;
 use crate::{
     error::Result, schema::entry::EntrySummary as StorageEntryRecord, schema::records::IncrementalStorageEntryRecord,
 };
@@ -19,8 +20,8 @@ use std::borrow::Cow;
 use std::path::Path;
 use std::sync::Arc;
 #[cfg(test)]
-use storage_adapter::observed_scan::ObservedItem;
-use storage_adapter::observed_scan::{EntryStatistics, ObservedScanEvent, ObservedView, timestamp_nanos};
+use task_model::observation::ObservedItem;
+use task_model::observation::{EntryStatistics, ObservedScanEvent, ObservedView, timestamp_nanos};
 
 /// 只摘要原生标记对象的比较事实，不重新编码或复制 opaque snapshot。
 pub(crate) fn directory_marker_state(entry: &ObservedEntry) -> Option<String> {
@@ -58,9 +59,9 @@ pub(crate) struct NativeScanKey<'a> {
 impl<'a> NativeScanKey<'a> {
     pub(crate) fn capture(view: ObservedView<'a>) -> Self {
         Self {
-            relative_path: view.sql_path(),
+            relative_path: view.path_key(),
             version_id: view.version_id(),
-            file_handle: view.file_handle(),
+            file_handle: encoded_file_handle(view.entry),
         }
     }
 }
@@ -121,7 +122,7 @@ impl<'a> ScanRowFields<'a> {
         let path = Path::new(entry.path().as_str());
         Ok(Self {
             name: path.file_name().and_then(|name| name.to_str()).unwrap_or_default(),
-            relative_path: view.sql_path(),
+            relative_path: view.path_key(),
             size: view.get_size(),
             ext: path.extension().and_then(|ext| ext.to_str()),
             ctime: timestamp_nanos(timestamps.and_then(|t| t.created)),
@@ -142,7 +143,7 @@ impl<'a> ScanRowFields<'a> {
             uid: view.uid(),
             gid: view.gid(),
             ino: None,
-            file_handle: view.file_handle(),
+            file_handle: encoded_file_handle(view.entry),
             version_id: view.version_id(),
             tags,
             marker_state: directory_marker_state(entry),
@@ -323,7 +324,7 @@ impl<'a> NativeScanRecord<'a> {
             version_index,
         };
         if hex::encode(entry.identity_key().as_bytes()) != self.identity_key
-            || view.path() != self.relative_path
+            || view.path_key().as_ref() != self.relative_path
             || view.version_id() != self.version_id
             || view.get_size() != self.size
         {
@@ -375,7 +376,7 @@ pub(crate) fn event_record(event: &ObservedScanEvent, event_time: i64) -> Result
         record,
         event.operation(),
         match event {
-            ObservedScanEvent::Renamed { from, .. } => Some(from.view().path()),
+            ObservedScanEvent::Renamed { from, .. } => Some(from.view().path_key().into_owned()),
             _ => None,
         },
         event_time,

@@ -1,6 +1,6 @@
 //! TerraSync 会话的目录页及编号，不属于存储后端。
-use crate::observed_scan::ObservedItem;
 use serde::{Deserialize, Serialize};
+use task_model::observation::ObservedItem;
 /// 带 NDX 编号的 entry
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NdxEntry {

@@ -1,15 +1,13 @@
 //! TerraSync 的存储边界：产品数据投影及旧会话与 data-mover 角色接口之间的转换。
 //! 所有后端 IO、复制、恢复与原子发布由 data-mover 执行。
+use task_model::{ErrorEvent, ObservedEntryExt, StorageEntryMessage};
 mod archive;
 mod connected;
 mod copied_metadata;
 mod entry;
-mod entry_facts;
 pub mod observation_wire;
 pub use data_mover::model::ObservedEntry;
-pub use entry_facts::ObservedEntryExt;
 pub mod hdfs;
-pub mod observed_scan;
 mod options;
 pub use hdfs::HdfsRecoverableCopyOptions;
 pub mod async_receiver;

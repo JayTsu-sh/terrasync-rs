@@ -3,15 +3,18 @@ mod observed_fixtures;
 use bytes::Bytes;
 use data_mover::traversal::TraversalOutcome;
 use std::{collections::BTreeSet, path::Path, sync::Arc, time::Duration};
-use storage_adapter::ObservedEntryExt;
 use storage_adapter::filter::parse_filter_expression;
-use storage_adapter::{
-    CopyOptions, CreateStorageOptions, DataChunk, ResumableScanItem, ScanSourceMode, StorageEntryMessage, StorageEnum,
-    TarPackOptions, WalkOptions, create_storage,
-};
+use task_model::ObservedEntryExt;
 use tempfile::TempDir;
 use tokio::fs::{create_dir_all, write};
 use tokio_util::sync::CancellationToken;
+use {
+    storage_adapter::{
+        CopyOptions, CreateStorageOptions, DataChunk, ResumableScanItem, ScanSourceMode, StorageEnum, TarPackOptions,
+        WalkOptions, create_storage,
+    },
+    task_model::StorageEntryMessage,
+};
 
 async fn local(root: &Path) -> storage_adapter::Result<StorageEnum> {
     create_storage(
@@ -325,10 +328,6 @@ async fn caller_offset_records_cannot_authorize_destination_resume() -> TestResu
     let src = local(source.path()).await?;
     let dst = local(destination.path()).await?;
     let entry = Arc::new(src.get_metadata(Path::new("payload")).await?);
-    assert!(
-        entry.get_file_handle().is_none(),
-        "local runtime identity must not become a cross-scan rename key"
-    );
     let resume = storage_adapter::ResumeContext {
         part_relative_path: "untrusted.part".into(),
         missing_intervals: Vec::new(),

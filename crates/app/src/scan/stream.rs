@@ -13,15 +13,16 @@ use data_mover::{
     traversal::{TraversalOrder, TraversalOutcome},
 };
 use std::{num::NonZeroUsize, sync::Arc, time::Duration};
-use storage_adapter::{
-    ResumableScan, ResumableScanItem, ScanSourceMode, StorageError, WalkOptions, filter::parse_filter_expression,
-};
-#[cfg(test)]
-use storage_adapter::{StorageEntryMessage, WalkDirAsyncIterator};
 #[cfg(test)]
 use tokio::task::JoinHandle;
 use tokio::time::{MissedTickBehavior, interval};
 use utils::app_config::AppConfig;
+#[cfg(test)]
+use {storage_adapter::WalkDirAsyncIterator, task_model::StorageEntryMessage};
+use {
+    storage_adapter::filter::parse_filter_expression,
+    storage_adapter::{ResumableScan, ResumableScanItem, ScanSourceMode, StorageError, WalkOptions},
+};
 
 pub(super) async fn run(request: ScanRequest<'_>, config: AppConfig) -> Result<()> {
     let cancel = ScanCancellation::new(request.cancel.clone());
@@ -188,9 +189,9 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Duration;
-    use storage_adapter::{AsyncReceiver, ErrorEvent};
     use tokio::time::{sleep, timeout};
     use tokio_util::sync::CancellationToken;
+    use {storage_adapter::AsyncReceiver, task_model::ErrorEvent};
 
     #[tokio::test]
     async fn consumer_failure_keeps_type_and_drains_later_tasks() {

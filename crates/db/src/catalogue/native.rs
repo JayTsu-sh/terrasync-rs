@@ -5,9 +5,10 @@ use crate::scan::candidate_cache::{CandidateMetadataCache, missing_hash_columns}
 use crate::scan::compare::NativeScanAccess;
 use crate::scan::rows::{NativeScanKey, NativeScanRecord, NativeWriteBatches, OBSERVED_COLUMNS, event_records};
 use crate::scan::rows::{final_event_records, incremental_record};
+use crate::schema::identity::PERSISTED_IDENTITY_PREFIX;
 use rustc_hash::{FxHashMap, FxHashSet};
 use smol_str::SmolStr;
-use storage_adapter::observed_scan::{ObservedScanEvent, ObservedView};
+use task_model::observation::{ObservedScanEvent, ObservedView};
 
 impl ClickHouseDatabase {
     pub(crate) async fn prepare_native_schema(&self) -> Result<()> {
@@ -116,7 +117,7 @@ impl ClickHouseDatabase {
     pub(crate) async fn compare_native(&mut self, entries: &[Arc<ObservedEntry>]) -> Result<Vec<ObservedScanEvent>> {
         if self.resume_base_has_typed_handles.is_none() {
             let base = get_scan_base_table_name(&self.job_id);
-            self.resume_base_has_typed_handles=Some(self.sync_client.query(&format!("SELECT count(file_handle)>0 AND countIf(file_handle IS NOT NULL AND NOT startsWith(file_handle,'54534934'))=0 FROM {base}")).fetch_quorum_one().await?);
+            self.resume_base_has_typed_handles=Some(self.sync_client.query(&format!("SELECT count(file_handle)>0 AND countIf(file_handle IS NOT NULL AND NOT startsWith(file_handle,'{PERSISTED_IDENTITY_PREFIX}'))=0 FROM {base}")).fetch_quorum_one().await?);
         }
         let compared = self.native_access().await?.compare(entries).await?;
         if !compared.displaced.is_empty() {

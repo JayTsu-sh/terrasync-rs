@@ -2,8 +2,8 @@ use crate::broadcast::BroadcastForwarder;
 use data_mover::model::EntryKind;
 use data_mover::storage::CopiedValueTarget;
 use std::sync::Arc;
-use storage_adapter::observed_scan::ObservedItem;
-use storage_adapter::{EntryChange, StorageEntryMessage};
+use task_model::observation::ObservedItem;
+use task_model::{EntryChange, StorageEntryMessage};
 
 use storage_adapter::hdfs::HdfsResumeMode;
 use storage_adapter::{

@@ -1,9 +1,9 @@
 //! 原生观察的借用查询，不保存重复的条目字段，也不展开历史。
-use crate::observed_scan::ObservedView;
-use data_mover::model::{BackendKind, EntryKind, ObjectTag, ObservedEntry};
+use crate::observation::{EntryStatistics, ObservedItem, ObservedView};
+use data_mover_model::{EntryKind, ObjectTag, ObservedEntry};
 use std::path::Path;
 
-use crate::observed_scan::timestamp_nanos;
+use crate::observation::timestamp_nanos;
 
 pub trait ObservedEntryExt {
     fn get_size(&self) -> u64;
@@ -20,7 +20,6 @@ pub trait ObservedEntryExt {
     fn get_uid(&self) -> Option<u32>;
     fn get_gid(&self) -> Option<u32>;
     fn get_tags(&self) -> Option<&[ObjectTag]>;
-    fn get_file_handle(&self) -> Option<[u8; 36]>;
     fn get_version_id(&self) -> Option<&str>;
     fn get_is_latest(&self) -> bool;
     fn get_is_delete_marker(&self) -> bool;
@@ -34,13 +33,15 @@ impl ObservedEntryExt for ObservedEntry {
         Path::new(self.path().as_str())
     }
     fn get_name(&self) -> &str {
-        self.get_relative_path()
+        ObservedEntryExt::get_relative_path(self)
             .file_name()
             .and_then(|name| name.to_str())
             .unwrap_or_default()
     }
     fn get_extension(&self) -> Option<&str> {
-        self.get_relative_path().extension().and_then(|ext| ext.to_str())
+        ObservedEntryExt::get_relative_path(self)
+            .extension()
+            .and_then(|ext| ext.to_str())
     }
     fn get_is_dir(&self) -> bool {
         self.kind() == EntryKind::Directory
@@ -90,15 +91,6 @@ impl ObservedEntryExt for ObservedEntry {
     fn get_tags(&self) -> Option<&[ObjectTag]> {
         self.metadata().tags().value().map(Vec::as_slice)
     }
-    fn get_file_handle(&self) -> Option<[u8; 36]> {
-        if self.backend_kind() == BackendKind::Local || self.source_identity().stable_bytes().is_none() {
-            return None;
-        }
-        let mut key = [0; 36];
-        key[..4].copy_from_slice(b"TSI4");
-        key[4..].copy_from_slice(self.identity_key().as_bytes());
-        Some(key)
-    }
     fn get_version_id(&self) -> Option<&str> {
         let history = self.history()?;
         let record = if history.records().len() == 1 {
@@ -120,21 +112,23 @@ impl ObservedEntryExt for ObservedEntry {
     }
 }
 
-impl ObservedEntryExt for crate::observed_scan::ObservedItem {
+impl ObservedEntryExt for ObservedItem {
     fn get_size(&self) -> u64 {
-        crate::observed_scan::EntryStatistics::get_size(&self.view())
+        EntryStatistics::get_size(&self.view())
     }
     fn get_relative_path(&self) -> &Path {
         Path::new(self.entry.path().as_str())
     }
     fn get_name(&self) -> &str {
-        self.get_relative_path()
+        ObservedEntryExt::get_relative_path(self)
             .file_name()
             .and_then(|name| name.to_str())
             .unwrap_or_default()
     }
     fn get_extension(&self) -> Option<&str> {
-        self.get_relative_path().extension().and_then(|ext| ext.to_str())
+        ObservedEntryExt::get_relative_path(self)
+            .extension()
+            .and_then(|ext| ext.to_str())
     }
     fn get_is_dir(&self) -> bool {
         self.entry.kind() == EntryKind::Directory
@@ -146,7 +140,7 @@ impl ObservedEntryExt for crate::observed_scan::ObservedItem {
         self.entry.kind() == EntryKind::File
     }
     fn get_mtime(&self) -> i64 {
-        crate::observed_scan::EntryStatistics::get_mtime(&self.view())
+        EntryStatistics::get_mtime(&self.view())
     }
     fn get_atime(&self) -> i64 {
         timestamp_nanos(
@@ -177,9 +171,6 @@ impl ObservedEntryExt for crate::observed_scan::ObservedItem {
     }
     fn get_tags(&self) -> Option<&[ObjectTag]> {
         self.view().metadata().tags().value().map(Vec::as_slice)
-    }
-    fn get_file_handle(&self) -> Option<[u8; 36]> {
-        self.entry.get_file_handle()
     }
     fn get_version_id(&self) -> Option<&str> {
         self.view()

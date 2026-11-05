@@ -27,6 +27,7 @@ members = [
     "crates/transport",
     "crates/sync-delta",
     "crates/storage-adapter",
+    "crates/task-model",
 ]
 
 # 集中管理 workspace 共享依赖，子 crate 用 `xxx = { workspace = true }` 引用。
@@ -67,6 +68,8 @@ reqwest      = { version = "0.13", default-features = false, features = ["rustls
 # 外部 fork（固定 main 提交，保证可复现）
 data-mover   = { git = "https://github.com/JayTsu-sh/data-mover-rs.git", rev = "4717f1cd42335c1d47d63913139812f4ec462b9c" }
 
+data-mover-model = { git = "https://github.com/JayTsu-sh/data-mover-rs.git", rev = "4717f1cd42335c1d47d63913139812f4ec462b9c" }
+
 # 内部 path crate
 app          = { path = "crates/app" }
 cli          = { path = "crates/cli" }
@@ -74,6 +77,7 @@ db           = { path = "crates/db" }
 licensing    = { path = "crates/licensing" }
 sync-delta   = { path = "crates/sync-delta" }
 storage-adapter = { path = "crates/storage-adapter" }
+task-model = { path = "crates/task-model" }
 transport    = { path = "crates/transport" }
 utils        = { path = "crates/utils" }
 web          = { path = "crates/web" }

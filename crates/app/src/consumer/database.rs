@@ -1,15 +1,15 @@
 // 标准库
 use std::sync::Arc;
-use storage_adapter::ObservedEntryExt;
-use storage_adapter::observed_scan::ObservedItem;
+use task_model::ObservedEntryExt;
+use task_model::observation::ObservedItem;
 
 // 外部crate
 use db::ClickHouseDatabase;
 use db::error::DatabaseError;
 use db::traits::Database;
-use storage_adapter::{ObservedEntry, StorageEntryMessage};
 use tokio::sync::mpsc;
 use tracing::{Instrument, debug, error, info, info_span, trace};
+use {storage_adapter::ObservedEntry, task_model::StorageEntryMessage};
 
 // 内部模块
 use crate::config::{ConsumerConfig, JobType};

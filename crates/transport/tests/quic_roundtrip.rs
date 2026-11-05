@@ -13,8 +13,8 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
-use storage_adapter::ObservedEntryExt;
 use storage_adapter::TransferMode;
+use task_model::ObservedEntryExt;
 
 use bytes::Bytes;
 use storage_adapter::{DataChunk, ObservedEntry};
@@ -1103,7 +1103,7 @@ fn selected_observation_wire_keeps_one_version_and_shares_the_original_history()
         SourceIdentity, StoragePath, VersionRecord,
     };
     use storage_adapter::dir_tree::NdxEntry;
-    use storage_adapter::observed_scan::ObservedItem;
+    use task_model::observation::ObservedItem;
 
     let backend = BackendIdentity::new(BackendKind::S3, "wire-selection").unwrap();
     let versions = (0..1000)

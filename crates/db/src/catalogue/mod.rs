@@ -16,7 +16,7 @@ use clickhouse::error::Error as ClickHouseError;
 use data_mover::model::ObservedEntry;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use storage_adapter::{ChangeKind, StorageEntryMessage};
+use task_model::{ChangeKind, StorageEntryMessage};
 use tokio::sync::{Mutex, MutexGuard, mpsc};
 use tracing::{debug, info, trace};
 
@@ -30,6 +30,7 @@ use crate::execution::{
 };
 use crate::scan::rows::NativeScanRecord;
 use crate::schema::columns::FILE_SCAN_COLUMNS_DEFINITION;
+use crate::schema::identity::PERSISTED_IDENTITY_PREFIX;
 use crate::schema::records::{IncrementalStorageEntryRecord, StorageEntryRecord, TarManifestRecord};
 use crate::traits::{CopyGenerationStatus, Database};
 use crate::{
@@ -38,7 +39,7 @@ use crate::{
     get_scan_base_table_name, get_scan_state_table_name, get_tar_manifest_table_name,
 };
 use comparison::JoinStrategy;
-use storage_adapter::observed_scan::{ObservedItem, ObservedView, ObservedViews};
+use task_model::observation::{ObservedItem, ObservedView, ObservedViews};
 use utils::sanitize_job_id;
 
 #[cfg(test)]
@@ -298,8 +299,8 @@ impl ClickHouseDatabase {
     async fn check_file_handle_status(&self, temp_table_name: &str, base_table_name: &str) -> Result<(usize, usize)> {
         let query = format!(
             "SELECT t.non_null, b.non_null \
-             FROM (SELECT if(countIf(file_handle IS NOT NULL AND NOT startsWith(file_handle, '54534934')) = 0, count(file_handle), 0) AS non_null FROM {temp_table_name}) t \
-             CROSS JOIN (SELECT if(countIf(file_handle IS NOT NULL AND NOT startsWith(file_handle, '54534934')) = 0, count(file_handle), 0) AS non_null FROM {base_table_name}) b"
+             FROM (SELECT if(countIf(file_handle IS NOT NULL AND NOT startsWith(file_handle, '{PERSISTED_IDENTITY_PREFIX}')) = 0, count(file_handle), 0) AS non_null FROM {temp_table_name}) t \
+             CROSS JOIN (SELECT if(countIf(file_handle IS NOT NULL AND NOT startsWith(file_handle, '{PERSISTED_IDENTITY_PREFIX}')) = 0, count(file_handle), 0) AS non_null FROM {base_table_name}) b"
         );
 
         debug!(
@@ -894,7 +895,7 @@ impl Database for ClickHouseDatabase {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use std::path::PathBuf;
-    use storage_adapter::ObservedEntryExt;
+    use task_model::ObservedEntryExt;
 
     use super::*;
     use crate::common::DeletionStatus;
@@ -907,7 +908,6 @@ mod tests {
             let fixture_storage: String = "nas".to_string();
             let fixture_version: String = String::new();
             let fixture_handle: Option<String> = file_handle.map(String::from);
-            let fixture_tags: Option<String> = None;
             let entry = crate::observed_fixtures::observation(
                 if fixture_storage == "s3" {
                     data_mover::model::BackendKind::S3
@@ -924,13 +924,7 @@ mod tests {
                     gid: 1000,
                 }),
                 fixture_handle.map(String::into_bytes),
-                fixture_tags.map(|tags| {
-                    serde_json::from_str::<Vec<storage_adapter::Tag>>(&tags)
-                        .unwrap()
-                        .into_iter()
-                        .map(|tag| (tag.key, tag.value))
-                        .collect()
-                }),
+                None,
                 (!fixture_version.is_empty()).then_some((Some(fixture_version), true, false)),
             );
             StorageEntryRecord::capture(&entry, 0).unwrap()
@@ -984,7 +978,10 @@ mod tests {
 
         let record = StorageEntryRecord::capture(&nas, 1).unwrap();
         assert_eq!(record.storage_type, "nas");
-        assert_eq!(record.file_handle, nas.get_file_handle().map(hex::encode));
+        assert_eq!(
+            record.file_handle,
+            Some(format!("54534934{}", hex::encode(nas.identity_key().as_bytes())))
+        );
         assert_eq!(record.version_id, "");
         assert_eq!(record.current_state, 1);
         assert_eq!(record.size, 2048);
@@ -1043,7 +1040,7 @@ mod tests {
         assert_eq!(record.mode, None);
 
         let back = record.to_observation().unwrap();
-        assert_eq!(back.get_file_handle(), None);
+        assert!(back.source_identity().stable_bytes().is_none());
         assert_eq!(back.get_mode(), None);
     }
 

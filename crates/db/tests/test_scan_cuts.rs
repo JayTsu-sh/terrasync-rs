@@ -13,7 +13,7 @@ use std::{
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
-use storage_adapter::observed_scan::{ObservedItem, ObservedScanEvent};
+use task_model::observation::{ObservedItem, ObservedScanEvent};
 use tokio::time::sleep;
 use utils::app_config::ClickHouseMode;
 use uuid::Uuid;

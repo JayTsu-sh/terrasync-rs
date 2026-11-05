@@ -1,10 +1,10 @@
 //! wire 只编码原生 opaque snapshot；后端身份随上下文传递以核验解码结果。
-use crate::observed_scan::ObservedItem;
 use data_mover::model::{BackendIdentity, BackendKind, ObservedEntry};
 use serde::{
     Deserialize, Deserializer, Serialize, Serializer, de::Error as DeError, ser::Error as SerError, ser::SerializeSeq,
 };
 use std::sync::Arc;
+use task_model::observation::ObservedItem;
 
 struct SnapshotBytes<'a>(&'a [u8]);
 impl Serialize for SnapshotBytes<'_> {

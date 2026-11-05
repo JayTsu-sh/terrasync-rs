@@ -5,7 +5,10 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use storage_adapter::storage_enum::StorageEnum;
-use storage_adapter::{ErrorEvent, StorageEntryMessage, StorageError, WalkDirAsyncIterator};
+use {
+    storage_adapter::{StorageError, WalkDirAsyncIterator},
+    task_model::{ErrorEvent, StorageEntryMessage},
+};
 // 外部crate
 use tracing::{Instrument, error, info, info_span};
 

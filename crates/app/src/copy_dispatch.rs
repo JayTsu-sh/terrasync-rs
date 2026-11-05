@@ -2,8 +2,8 @@
 use std::hash::{DefaultHasher, Hash, Hasher};
 
 use async_channel::Sender;
-use storage_adapter::{AsyncReceiver, StorageEntryMessage};
 use tokio::task::JoinHandle;
+use {storage_adapter::AsyncReceiver, task_model::StorageEntryMessage};
 
 use crate::error::{AppError, Result};
 
@@ -63,7 +63,7 @@ mod tests {
     use crate::observed_fixtures::observation;
     use data_mover::model::{BackendKind, EntryKind};
     use std::sync::Arc;
-    use storage_adapter::ObservedEntryExt;
+    use task_model::ObservedEntryExt;
 
     #[tokio::test]
     async fn a_path_keeps_delivery_order_and_other_paths_can_run_in_parallel() {

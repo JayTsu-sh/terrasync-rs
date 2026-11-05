@@ -13,9 +13,9 @@ use crate::{
 use data_mover::model::ObservedEntry;
 use serde::Deserialize;
 use std::sync::Arc;
-use storage_adapter::{
-    ChangeKind, EntryChange,
-    observed_scan::{ObservedItem, ObservedView},
+use {
+    task_model::observation::{ObservedItem, ObservedView},
+    task_model::{ChangeKind, EntryChange},
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -130,7 +130,7 @@ fn bind_input_order(
             entry,
             version_index: entry.history().map(|_| 0),
         };
-        let path = view.sql_path();
+        let path = view.path_key();
         for view in ObservedView::all(entry) {
             let version = view.version_id();
             if let Ok(index) = differences.binary_search_by(|row| {

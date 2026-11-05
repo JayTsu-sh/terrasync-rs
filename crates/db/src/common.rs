@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 
-use storage_adapter::ObservedEntry;
+use data_mover::model::ObservedEntry;
 use tracing::{error, trace};
 
 use crate::Result;

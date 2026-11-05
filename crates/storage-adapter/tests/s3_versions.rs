@@ -1,11 +1,12 @@
 //! 需要实验室提供两个同名、内容不同的版本，验证恢复路径不会读取最新版本。
 #[path = "../../../tests/support/observed.rs"]
 mod observed_fixtures;
-use storage_adapter::observed_scan::ObservedItem;
-use storage_adapter::{
-    CopyOptions, CreateStorageOptions, StorageEntryMessage, StorageEnum, TransferMode, WalkOptions, create_storage,
-};
+use task_model::observation::ObservedItem;
 use tempfile::TempDir;
+use {
+    storage_adapter::{CopyOptions, CreateStorageOptions, StorageEnum, TransferMode, WalkOptions, create_storage},
+    task_model::StorageEntryMessage,
+};
 
 type TestResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
 

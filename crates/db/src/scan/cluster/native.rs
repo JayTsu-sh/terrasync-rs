@@ -8,7 +8,7 @@ use crate::scan::rows::{final_event_records, incremental_record};
 use crate::schema::records::IncrementalStorageEntryRecord;
 use data_mover::model::ObservedEntry;
 use std::borrow::Cow;
-use storage_adapter::observed_scan::{ObservedScanEvent, ObservedView};
+use task_model::observation::{ObservedScanEvent, ObservedView};
 
 #[derive(Serialize, clickhouse::Row)]
 struct ClusterNativeScanKey<'a> {

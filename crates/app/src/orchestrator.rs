@@ -11,8 +11,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
-use storage_adapter::ObservedEntryExt;
 use storage_adapter::TransferMode;
+use task_model::ObservedEntryExt;
 
 /// RAII guard：构造时 +1，Drop 时 -1，确保计数器在 panic/early-return 时也能正确回收。
 struct AtomicCounterGuard<'a>(&'a AtomicUsize);
@@ -37,7 +37,6 @@ use db::{self, DeletionStatus, INCREMENTAL_SCAN_TABLE_BASE_NAME};
 use storage_adapter::qos::QosManager;
 #[cfg(windows)]
 use storage_adapter::storage_enum::{StorageType, detect_storage_type};
-use storage_adapter::{ChangeKind, EntryChange, ErrorEvent, ObservedEntry, StorageEntryMessage, StorageEnum};
 use tokio::sync::Semaphore;
 use tokio::task::JoinHandle;
 use tracing::{Instrument, error, info, info_span, trace, warn};
@@ -45,6 +44,10 @@ use transport::in_process::create_in_process_pair;
 use transport::message::SenderMsg;
 use transport::traits::{ReceiverTransport, SenderTransport};
 use utils::app_config::AppConfig;
+use {
+    storage_adapter::{ObservedEntry, StorageEnum},
+    task_model::{ChangeKind, EntryChange, ErrorEvent, StorageEntryMessage},
+};
 
 // 内部模块
 use crate::broadcast::{BroadcastForwarder, DEFAULT_CHANNEL_CAPACITY};

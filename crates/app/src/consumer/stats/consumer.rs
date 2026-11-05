@@ -17,8 +17,8 @@ use std::time::Duration;
 // 外部crate
 use data_mover::model::{EntryKind, ObservedEntry};
 use reqwest::Response;
-use storage_adapter::StorageEntryMessage;
-use storage_adapter::observed_scan::{EntryStatistics, ObservedScanEvent, ObservedView};
+use task_model::StorageEntryMessage;
+use task_model::observation::{EntryStatistics, ObservedScanEvent, ObservedView};
 use tokio::sync::{Mutex, mpsc};
 use tokio::task::JoinHandle;
 use tokio::time::timeout;

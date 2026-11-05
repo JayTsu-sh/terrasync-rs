@@ -10,9 +10,9 @@ use data_mover::model::FailureClass;
 use std::path::{Component, Path};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use storage_adapter::ObservedEntryExt;
 use storage_adapter::TransferMode;
-use storage_adapter::{StorageEntryMessage, StorageError};
+use task_model::ObservedEntryExt;
+use {storage_adapter::StorageError, task_model::StorageEntryMessage};
 
 // 外部 crate
 use storage_adapter::qos::QosManager;

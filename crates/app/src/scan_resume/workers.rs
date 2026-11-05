@@ -12,7 +12,7 @@ use data_mover::model::ObservedEntry;
 use db::{scan::ScanResumeState, scan::ScanStore};
 use rustc_hash::FxHasher;
 use std::{hash::Hasher, sync::Arc};
-use storage_adapter::observed_scan::ObservedView;
+use task_model::observation::ObservedView;
 use tokio::{
     select,
     sync::{mpsc, oneshot},
@@ -123,7 +123,7 @@ async fn dispatch(
             version_index: entry.history().map(|_| 0),
         };
         let mut hash = FxHasher::default();
-        hash.write(view.sql_path().as_bytes());
+        hash.write(view.path_key().as_bytes());
         let worker = hash.finish() as usize % senders.len();
         pending[worker].push(Arc::clone(entry));
         if pending[worker].len() >= DISPATCH_BATCH {

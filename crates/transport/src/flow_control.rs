@@ -75,7 +75,7 @@
 
 use crate::message::RemoteSourceEvent;
 use std::sync::Mutex;
-use storage_adapter::ObservedEntryExt;
+use task_model::ObservedEntryExt;
 
 // 外部 crate
 use tokio::sync::Notify;

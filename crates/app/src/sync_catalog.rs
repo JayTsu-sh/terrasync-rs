@@ -3,9 +3,9 @@ use crate::{broadcast::BroadcastForwarder, error::Result, scan::ScanType};
 use db::catalogue::ComparisonMode;
 use db::traits::Database;
 use std::sync::Arc;
-use storage_adapter::{ObservedEntry, StorageEntryMessage};
 use tokio::task::JoinHandle;
 use tracing::{error, trace, warn};
+use {storage_adapter::ObservedEntry, task_model::StorageEntryMessage};
 
 pub(crate) async fn determine_sync_type(
     db: Option<&dyn Database>, job_id: &str, job_dir_pre_existing: bool,
@@ -77,8 +77,11 @@ mod tests {
     use db::error::DatabaseError;
     use db::traits::Database;
     use db::{CopyGenerationStatus, DeletionStatus, Result as DatabaseResult};
-    use storage_adapter::{ChangeKind, ObservedEntry, StorageEntryMessage};
     use tokio::sync::mpsc;
+    use {
+        storage_adapter::ObservedEntry,
+        task_model::{ChangeKind, StorageEntryMessage},
+    };
 
     use super::{batch_processing_to_generate_message, finish_phase};
     use crate::broadcast::BroadcastForwarder;
@@ -176,7 +179,7 @@ mod tests {
             Ok(())
         }
         async fn batch_insert_completed_records(
-            &self, _records: &[storage_adapter::observed_scan::ObservedItem],
+            &self, _records: &[task_model::observation::ObservedItem],
         ) -> DatabaseResult<()> {
             Ok(())
         }

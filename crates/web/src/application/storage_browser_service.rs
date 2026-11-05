@@ -1,10 +1,10 @@
 use data_mover::storage::{list_buckets, list_exports};
 use std::path::{Path, PathBuf};
-use storage_adapter::ObservedEntryExt;
 use storage_adapter::StorageError;
+use task_model::ObservedEntryExt;
 
 use app::storage_factory::{StorageRole, create_storage_for_role};
-use storage_adapter::{S3BucketInfo, StorageEntryMessage};
+use {storage_adapter::S3BucketInfo, task_model::StorageEntryMessage};
 
 use crate::error::Result;
 

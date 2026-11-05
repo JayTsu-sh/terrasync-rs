@@ -28,8 +28,6 @@ use storage_adapter::StorageEnum;
 #[cfg(test)]
 use storage_adapter::dir_tree::NdxEvent;
 use storage_adapter::filter::parse_filter_expression;
-#[cfg(test)]
-use storage_adapter::{ChangeKind, ErrorEvent, ObservedEntry, StorageEntryMessage};
 use tokio::sync::Mutex as AsyncMutex;
 use tracing::{info, warn};
 use transport::error::TransportError;
@@ -41,6 +39,11 @@ use transport::message::{HandshakeResult, ProtocolHandshake, ReceiverMsg, Sender
 use transport::traits::SenderTransport;
 use utils::app_config::AppConfig;
 use utils::logger;
+#[cfg(test)]
+use {
+    storage_adapter::ObservedEntry,
+    task_model::{ChangeKind, ErrorEvent, StorageEntryMessage},
+};
 
 use crate::config::{JobType, SyncJobConfig};
 use crate::consumer::stats::{IncrementalStats, ProgressBar, StatisticConsumer, StatsKind};
@@ -253,7 +256,7 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::{Duration, SystemTime};
-    use storage_adapter::ObservedEntryExt;
+    use task_model::ObservedEntryExt;
 
     use crate::storage_factory::{StorageRole, create_storage_for_role};
     use async_trait::async_trait;

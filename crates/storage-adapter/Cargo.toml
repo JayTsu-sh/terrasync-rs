@@ -5,6 +5,7 @@ edition = "2024"
 license = "MIT AND Apache-2.0"
 
 [dependencies]
+task-model = { workspace = true }
 data-mover = { workspace = true }
 async-channel = { workspace = true }
 async-trait = { workspace = true }

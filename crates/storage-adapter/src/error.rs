@@ -1,5 +1,6 @@
 use data_mover::error::StorageError as NativeStorageError;
 use std::error::Error as StdError;
+use task_model::TaskModelError;
 use tokio::task::JoinError;
 
 use crate::{MismatchDataField, MismatchMetaField, RemoteScanFailure, TransferMode};
@@ -19,6 +20,8 @@ use data_mover::{
 };
 #[derive(Debug, thiserror::Error)]
 pub enum StorageError {
+    #[error(transparent)]
+    TaskModel(#[from] TaskModelError),
     #[error(transparent)]
     ScanSetup(#[from] ScanSetupError),
     #[error(transparent)]

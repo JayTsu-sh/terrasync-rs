@@ -7,10 +7,10 @@
 use crate::file_copy::copied_tags_required;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use storage_adapter::ObservedEntryExt;
 #[cfg(test)]
 use storage_adapter::TransferMode;
-use storage_adapter::observed_scan::ObservedItem;
+use task_model::ObservedEntryExt;
+use task_model::observation::ObservedItem;
 
 use storage_adapter::dir_tree::DirPageResult;
 use storage_adapter::{DataChunk, ObservedEntry, StorageEnum};

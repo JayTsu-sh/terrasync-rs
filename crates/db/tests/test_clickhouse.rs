@@ -24,8 +24,8 @@ mod clickhouse_integration_tests {
     use db::scan::ScanResumeState;
     use db::scan::{ScanFinalEvent, ScanStore};
     use db::{ClickHouseConfig, Database, DatabaseError, DeletionStatus};
-    use storage_adapter::observed_scan::{ObservedItem, ObservedScanEvent};
-    use storage_adapter::{ChangeKind, ObservedEntryExt};
+    use task_model::observation::{ObservedItem, ObservedScanEvent};
+    use task_model::{ChangeKind, ObservedEntryExt};
     use tokio::sync::mpsc;
 
     // 使用原子计数器确保每个测试用例都有唯一的job_id
@@ -203,7 +203,7 @@ mod clickhouse_integration_tests {
     #[ignore = "requires a real ClickHouse service"]
     async fn scan_resume_persists_cursor_generation_and_idempotent_events() {
         use db::scan::{ABANDONED, FINALIZING, RUNNING, ScanResumeState};
-        use storage_adapter::StorageEntryMessage;
+        use task_model::StorageEntryMessage;
         let (database, config, job, cleanup) = setup_isolated_state_db("resume_state").await;
         database.initialize().await.unwrap();
         database

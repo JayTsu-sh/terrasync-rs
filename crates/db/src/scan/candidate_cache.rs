@@ -3,7 +3,7 @@ use blake3::Hasher;
 use clickhouse::Client;
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::borrow::Cow;
-use storage_adapter::observed_scan::ObservedScanEvent;
+use task_model::observation::ObservedScanEvent;
 use tokio::task::yield_now;
 
 use crate::{
@@ -39,7 +39,7 @@ impl CandidateMetadataCache {
                     let view = item.view();
                     cache
                         .versions
-                        .entry(view.sql_path().into_owned())
+                        .entry(view.path_key().into_owned())
                         .or_default()
                         .insert(view.version_id().into());
                 }
@@ -150,7 +150,7 @@ mod tests {
         BackendIdentity, BackendKind, EntryKind, IdentityStrength, ObservedEntry, SourceIdentity, StoragePath,
     };
     use std::sync::Arc;
-    use storage_adapter::observed_scan::{ObservedItem, ObservedView};
+    use task_model::observation::{ObservedItem, ObservedView};
     use tokio_util::sync::CancellationToken;
 
     fn observation() -> Result<Arc<ObservedEntry>> {

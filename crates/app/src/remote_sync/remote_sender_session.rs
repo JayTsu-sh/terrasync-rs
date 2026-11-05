@@ -11,15 +11,15 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex, PoisonError};
-use storage_adapter::ObservedEntryExt;
-use storage_adapter::observed_scan::ObservedItem;
+use task_model::ObservedEntryExt;
+use task_model::observation::ObservedItem;
 
 use storage_adapter::dir_tree::NdxEvent;
 use storage_adapter::qos::QosManager;
-use storage_adapter::{ChangeKind, ErrorEvent, StorageEntryMessage};
 use storage_adapter::{DataChunk, ObservedEntry, StorageEnum, StorageError, WalkDirAsyncIterator2};
 use sync_delta::DeltaToken;
 use sync_delta::matcher::DeltaMatcher;
+use task_model::{ChangeKind, ErrorEvent, StorageEntryMessage};
 use tokio::sync::Mutex as AsyncMutex;
 use tracing::{debug, error, info, warn};
 use transport::message::{BlockSignature, NdxTable, ProgressSnapshot, ReceiverMsg, SenderMsg, TransferDecision};

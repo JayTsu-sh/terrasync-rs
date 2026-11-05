@@ -17,8 +17,8 @@ use std::time::{Duration, Instant};
 
 // 外部crate
 use data_mover::model::ObservedEntry;
-use storage_adapter::observed_scan::ObservedScanEvent;
-use storage_adapter::{ErrorEvent, StorageEntryMessage};
+use task_model::observation::ObservedScanEvent;
+use task_model::{ErrorEvent, StorageEntryMessage};
 use tokio::sync::Mutex;
 use tracing::{Instrument, debug, error, info_span, warn};
 

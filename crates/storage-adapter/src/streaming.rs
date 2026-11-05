@@ -1,5 +1,4 @@
 use crate::copied_metadata::copied_metadata_plan;
-use crate::observed_scan::{EntryStatistics, ObservedItem, ObservedView};
 use crate::{
     connected::path,
     error::{StreamTransferDiagnostic, operation},
@@ -25,6 +24,7 @@ use std::{
     sync::{Arc, Mutex, OnceLock, Weak},
     time::Duration,
 };
+use task_model::observation::{EntryStatistics, ObservedItem, ObservedView};
 use tokio::{
     sync::{Mutex as AsyncMutex, mpsc},
     task::JoinHandle,

@@ -12,15 +12,14 @@ use crate::file_copy::{HdfsCopyContext, copy_file, copy_versions, prepare_direct
 use std::iter::once;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use storage_adapter::ObservedEntryExt;
-use storage_adapter::observed_scan::ObservedItem;
-use storage_adapter::{EntryChange, TransferMode};
+use task_model::ObservedEntryExt;
+use task_model::observation::ObservedItem;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
+use {storage_adapter::TransferMode, task_model::EntryChange};
 
 // 外部crate
 use storage_adapter::qos::QosManager;
-use storage_adapter::{CopyOptions, ErrorEvent, ObservedEntry, StorageEntryMessage, StorageEnum, redact_storage_url};
 use tracing::{Instrument, debug, error, info, info_span, instrument, trace, warn};
 #[cfg(windows)]
 use windows_sys::Win32::Foundation::CloseHandle;
@@ -30,6 +29,10 @@ use windows_sys::Win32::Security::GetTokenInformation;
 use windows_sys::Win32::Security::TOKEN_QUERY;
 #[cfg(windows)]
 use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+use {
+    storage_adapter::{CopyOptions, ObservedEntry, StorageEnum, redact_storage_url},
+    task_model::{ErrorEvent, StorageEntryMessage},
+};
 
 // 内部模块
 use crate::broadcast::BroadcastForwarder;

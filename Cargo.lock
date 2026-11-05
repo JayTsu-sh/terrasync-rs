@@ -165,6 +165,7 @@ dependencies = [
  "serial_test",
  "storage-adapter",
  "sync-delta",
+ "task-model",
  "tempfile",
  "thiserror 2.0.20",
  "tokio",
@@ -1213,6 +1214,7 @@ dependencies = [
  "licensing",
  "rustls 0.23.40",
  "storage-adapter",
+ "task-model",
  "thiserror 2.0.20",
  "tokio",
  "tokio-util",
@@ -1991,7 +1993,7 @@ dependencies = [
  "serde",
  "serde_json",
  "smol_str",
- "storage-adapter",
+ "task-model",
  "thiserror 2.0.20",
  "tokio",
  "tokio-util",
@@ -6140,6 +6142,7 @@ dependencies = [
  "serde",
  "serde_json",
  "soft-canonicalize",
+ "task-model",
  "tempfile",
  "thiserror 2.0.20",
  "tokio",
@@ -6248,6 +6251,16 @@ name = "tap"
 version = "1.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "55937e1799185b12863d447f42597ed69d9928686b8d88a1df17376a097d8369"
+
+[[package]]
+name = "task-model"
+version = "0.1.0"
+dependencies = [
+ "data-mover",
+ "data-mover-model",
+ "serde",
+ "thiserror 2.0.20",
+]
 
 [[package]]
 name = "tempfile"
@@ -6725,6 +6738,7 @@ dependencies = [
  "rustls 0.23.40",
  "serde",
  "storage-adapter",
+ "task-model",
  "thiserror 2.0.20",
  "tokio",
  "tracing",
@@ -7083,6 +7097,7 @@ dependencies = [
  "serde_json",
  "sqlx",
  "storage-adapter",
+ "task-model",
  "thiserror 2.0.20",
  "tokio",
  "tokio-util",

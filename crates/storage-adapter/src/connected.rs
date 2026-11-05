@@ -2,7 +2,6 @@ use crate::ObservedEntryExt;
 use crate::copied_metadata::copied_metadata_plan;
 use crate::{
     error::operation,
-    observed_scan::{ObservedItem, ObservedView},
     options::BackendConfig as ProductBackendConfig,
     projection::{decode_acl, encode_acl},
     streaming::source_qos,
@@ -33,6 +32,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{Arc, atomic::Ordering},
 };
+use task_model::observation::{ObservedItem, ObservedView};
 use tokio::fs::create_dir_all;
 use tokio_util::sync::CancellationToken;
 

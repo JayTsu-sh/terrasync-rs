@@ -99,6 +99,14 @@ SQL 行 DTO 已收回私有 schema／records；traits 只描述任务操作，�
 
 该阶段完整 Rust 检查和双进程 16 例通过；最终借用签名清理后另通过 workspace check、db Clippy 与 db 109 个本地测试。真实 catalogue Single 10／10、Cluster 11／11 和 Single 集成 44／44 通过，独立数据库清理成功。记录前缀 `/tmp/terrasync-db-refactor-real-read-tables-v1-` 与 `/tmp/terrasync-catalogue-read-tables-`。marker 完整快照回归验证窄投影未丢失原生事实。
 
+## 纯任务模型与数据库身份策略
+
+观察视图、事件和事实读取移到 task-model；其正常依赖仅为 data-mover-model、serde 和 thiserror。数据库不再依赖 storage-adapter；应用、传输与 Web 直接引用任务契约，adapter 不再公开重导出这些类型。原生观察和逐版本视图仍共享 Arc，不复制完整历史。
+
+路径键保留 Cow 借用，删除无用的 owned 路径便捷接口。跨扫描身份的资格与编码集中到私有 db／schema／identity；比较阶段只判断资格，不再为布尔判断分配编码字符串。Local 身份排除规则和持久化前缀保持原样。模型错误通过透明类型包装保留 source，取消与 NotFound 的分类保持不变。
+
+此阶段两项架构复审通过。fmt、workspace Clippy／测试与串行双进程 E2E 16 例通过；app 201、db 110、task-model 2 个本地测试通过，忽略项另计。真实 catalogue Single 10／10、Cluster 11／11、Single 集成 44／44，以及 Single／Cluster 切点各 3 例通过，独立数据库清理均成功。Rust 日志前缀 `/tmp/terrasync-task-model-`，真实报告前缀 `/tmp/terrasync-db-refactor-real-task-model-v1-`。依赖清单记录 `/tmp/terrasync-task-model-normal-dependencies.txt`。
+
 ## 合入前仍须完成
 
 还需完成数据库内部职责拆分、收窄行 DTO 与任务接口、任务契约和 transport 的归属整理，以及按设计删除 storage-adapter。最终候选必须重跑对应 CI、真实 HDFS 和受影响故障链路，并完成全量／增量／续扫性能与峰值 RSS 对照。先前 HDFS 通过的二进制不能作为最终候选证据。

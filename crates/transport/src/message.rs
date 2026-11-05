@@ -5,9 +5,9 @@ use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 use std::sync::Arc;
-use storage_adapter::ObservedEntryExt;
 use storage_adapter::TransferMode;
-use storage_adapter::observed_scan::{ObservedItem, ObservedView};
+use task_model::ObservedEntryExt;
+use task_model::observation::{ObservedItem, ObservedView};
 
 // 外部 crate
 use bytes::Bytes;

@@ -1,7 +1,6 @@
 use crate::ObservedEntryExt;
 use crate::connected::path;
 use crate::error::operation;
-use crate::observed_scan::timestamp_nanos as nanos;
 use crate::{ObservedEntry, Result, StorageEnum, StorageError};
 use data_mover::integrity::MtimePrecision as NativeMtimePrecision;
 use data_mover::integrity::{
@@ -10,6 +9,7 @@ use data_mover::integrity::{
 use data_mover::model::EntryKind;
 use data_mover::storage::PrincipalIdentity;
 use std::time::Duration;
+use task_model::observation::timestamp_nanos as nanos;
 use tokio_util::sync::CancellationToken;
 /// 结构化完整性差异中的条目类型。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

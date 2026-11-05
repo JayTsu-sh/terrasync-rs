@@ -7,7 +7,7 @@ use crate::{
 };
 use data_mover::model::ObservedEntry;
 use std::sync::Arc;
-use storage_adapter::observed_scan::ObservedScanEvent;
+use task_model::observation::ObservedScanEvent;
 
 mod checkpoint;
 pub(crate) mod model;

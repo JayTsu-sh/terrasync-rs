@@ -8,8 +8,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use indicatif::{ProgressBar as IndicatifBar, ProgressStyle};
-use storage_adapter::StorageEntryMessage;
-use storage_adapter::observed_scan::EntryStatistics;
+use task_model::StorageEntryMessage;
+use task_model::observation::EntryStatistics;
 use tracing::info;
 
 use super::accumulator::{IncrementalStats, fmt_elapsed, format_bytes};
@@ -319,7 +319,7 @@ impl ProgressBar {
             }
             StorageEntryMessage::TarManifest { .. } => return,
         };
-        for view in storage_adapter::observed_scan::ObservedView::all(entry) {
+        for view in task_model::observation::ObservedView::all(entry) {
             match &self.counters {
                 CounterSet::Full(_) if matches!(operation, "new" | "scanned") => self.update_observed("scanned", &view),
                 CounterSet::Incremental(_) => self.update_observed(operation, &view),

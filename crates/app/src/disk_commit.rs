@@ -5,7 +5,7 @@
 
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
-use storage_adapter::ObservedEntryExt;
+use task_model::ObservedEntryExt;
 
 use data_mover::transfer::write_delete_marker;
 use storage_adapter::StorageEnum;

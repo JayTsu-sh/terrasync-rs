@@ -6,15 +6,15 @@
 // 标准库
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
-use storage_adapter::ObservedEntryExt;
+use task_model::ObservedEntryExt;
 
 // 外部 crate
 use bytes::{Bytes, BytesMut};
 use storage_adapter::error::Result as StorageResult;
-use storage_adapter::observed_scan::ObservedItem;
 use storage_adapter::{DataChunk, ObservedEntry, StorageEnum, StreamChunk, StreamHandle};
 use sync_delta::DeltaToken;
 use sync_delta::reconstruct::{ReconstructStep, Reconstructor};
+use task_model::observation::ObservedItem;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;

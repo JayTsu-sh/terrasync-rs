@@ -4,7 +4,7 @@ version = "0.2.0"
 edition = "2024"
 
 [dependencies]
-storage-adapter = { workspace = true }
+task-model = { workspace = true }
 async-trait = { workspace = true }
 blake3      = { workspace = true }
 bytes       = { workspace = true }

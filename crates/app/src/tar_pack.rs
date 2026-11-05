@@ -2,13 +2,16 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
-use storage_adapter::ObservedEntryExt;
 use storage_adapter::WalkOptions;
+use task_model::ObservedEntryExt;
 
 // 内部模块
 use storage_adapter::qos::QosManager;
 use storage_adapter::storage_enum::StorageEnum;
-use storage_adapter::{ObservedEntry, StorageEntryMessage, WalkDirAsyncIterator};
+use {
+    storage_adapter::{ObservedEntry, WalkDirAsyncIterator},
+    task_model::StorageEntryMessage,
+};
 // 外部crate
 use tracing::{debug, info};
 
@@ -109,7 +112,7 @@ async fn collect_entries(iterator: WalkDirAsyncIterator) -> Result<Vec<Arc<Obser
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
-    use storage_adapter::{AsyncReceiver, ErrorEvent};
+    use {storage_adapter::AsyncReceiver, task_model::ErrorEvent};
 
     #[tokio::test]
     async fn an_enumeration_error_cannot_become_a_successful_tar_manifest() {

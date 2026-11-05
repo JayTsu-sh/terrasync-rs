@@ -11,6 +11,7 @@ lab-fault-injection = []
 
 [dependencies]
 storage-adapter = { workspace = true }
+task-model = { workspace = true }
 async-channel = { workspace = true }
 async-trait   = { workspace = true }
 blake3        = { workspace = true }

@@ -6,7 +6,7 @@ use db::{ClickHouseConfig, CopyGenerationStatus, DatabaseError};
 use std::future::pending;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
-use storage_adapter::ObservedEntryExt;
+use task_model::ObservedEntryExt;
 use tempfile::TempDir;
 use tokio::sync::{Notify, oneshot};
 use tokio::time::{Duration, timeout};

@@ -1,0 +1,15 @@
+[package]
+name = "task-model"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+data-mover-model = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+data-mover = { workspace = true }
+
+[lints]
+workspace = true

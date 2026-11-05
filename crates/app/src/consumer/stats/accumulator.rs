@@ -6,8 +6,8 @@ use std::time::{Instant, SystemTime};
 
 // 外部crate
 use serde::{Deserialize, Serialize};
-use storage_adapter::observed_scan::{EntryStatistics, ObservedView};
-use storage_adapter::{ErrorEvent, StorageEntryMessage};
+use task_model::observation::{EntryStatistics, ObservedView};
+use task_model::{ErrorEvent, StorageEntryMessage};
 use tracing::trace;
 
 // 内部模块
@@ -1285,7 +1285,7 @@ mod tests {
         BackendIdentity, BackendKind, EntryKind, IdentityStrength, ObservedEntry, SourceIdentity, SpecialFileKind,
         StoragePath,
     };
-    use storage_adapter::observed_scan::ObservedView;
+    use task_model::observation::ObservedView;
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
 

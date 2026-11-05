@@ -4,9 +4,12 @@ use crate::common::DeletionStatus;
 use crate::error::Result;
 use async_trait::async_trait;
 use std::sync::Arc;
-use storage_adapter::observed_scan::ObservedItem;
-use storage_adapter::{ChangeKind, ObservedEntry, StorageEntryMessage};
+use task_model::observation::ObservedItem;
 use tokio::sync::mpsc;
+use {
+    data_mover::model::ObservedEntry,
+    task_model::{ChangeKind, StorageEntryMessage},
+};
 
 /// 复制目录轮次是否需要重放未确认的目标操作。
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

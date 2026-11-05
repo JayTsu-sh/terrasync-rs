@@ -17,10 +17,13 @@ use db::scan::ScanResumeStatistics;
 use db::scan::{COMPLETED, FINALIZING, RUNNING, ScanResumeState};
 use db::scan::{ScanFinalEvent, ScanStore};
 use storage_adapter::filter::parse_filter_expression;
-use storage_adapter::{ErrorEvent, ScanSourceMode, StorageEntryMessage, StorageEnum, WalkOptions, canonicalize_path};
 use tokio::{join, select, task::spawn_blocking};
 use tracing::{info, warn};
 use utils::app_config::AppConfig;
+use {
+    storage_adapter::{ScanSourceMode, StorageEnum, WalkOptions, canonicalize_path},
+    task_model::{ErrorEvent, StorageEntryMessage},
+};
 
 use crate::{
     config::{JobType, initialize_consumer_config},

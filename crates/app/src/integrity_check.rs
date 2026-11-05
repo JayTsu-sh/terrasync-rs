@@ -19,17 +19,20 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
-use storage_adapter::ErrorEvent;
-use storage_adapter::ObservedEntryExt;
 #[cfg(feature = "license")]
 use storage_adapter::storage_enum::{StorageType, detect_storage_type};
+use task_model::ErrorEvent;
+use task_model::ObservedEntryExt;
 
 use storage_adapter::error::StorageError;
-use storage_adapter::{
-    IntegrityCheck, IntegrityCheckMode, IntegrityCheckOptions, MismatchDataField, MismatchMetaField, MtimePrecision,
-    ObservedEntry, StorageEntryMessage, StorageEnum, redact_storage_url,
-};
 use tracing::{Instrument, debug, error, info, info_span, instrument, warn};
+use {
+    storage_adapter::{
+        IntegrityCheck, IntegrityCheckMode, IntegrityCheckOptions, MismatchDataField, MismatchMetaField,
+        MtimePrecision, ObservedEntry, StorageEnum, redact_storage_url,
+    },
+    task_model::StorageEntryMessage,
+};
 
 use crate::broadcast::{BroadcastForwarder, DEFAULT_CHANNEL_CAPACITY};
 use crate::config::{JobType, ScanConfig, initialize_consumer_config};

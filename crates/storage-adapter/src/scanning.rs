@@ -1,7 +1,6 @@
 use crate::ObservedEntryExt;
 use crate::connected::path;
 use crate::filter::FilterExpression;
-use crate::observed_scan::ObservedItem;
 use crate::projection::{HistorySequence, observation_plan, validate_required_tags};
 use crate::{dir_tree::*, error::operation, *};
 use chrono::NaiveDate;
@@ -23,6 +22,7 @@ use std::{
     path::{Path, PathBuf},
     sync::Arc,
 };
+use task_model::observation::ObservedItem;
 use tokio_util::sync::CancellationToken;
 
 pub enum ScanSourceMode {

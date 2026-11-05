@@ -15,3 +15,5 @@ pub(crate) mod entry;
 pub(crate) mod columns;
 
 pub(crate) mod records;
+
+pub(crate) mod identity;

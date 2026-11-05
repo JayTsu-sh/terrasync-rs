@@ -9,8 +9,8 @@ use data_mover::model::{
     StorageTimestamp, SymlinkTarget, SymlinkTargetEncoding, TimePrecision,
 };
 use std::sync::atomic::AtomicUsize;
-use storage_adapter::ChangeKind;
-use storage_adapter::observed_scan::{ObservedItem, ObservedScanEvent};
+use task_model::ChangeKind;
+use task_model::observation::{ObservedItem, ObservedScanEvent};
 use tokio::{join, sync::Barrier, task::JoinSet};
 use tokio_util::sync::CancellationToken;
 use utils::app_config::ClickHouseMode;
@@ -949,7 +949,7 @@ async fn cluster_shared_native_observations_roundtrip_merge_replay_and_legacy_ba
     assert!(
         events
             .iter()
-            .any(|event| matches!(event,ObservedScanEvent::New(item) if item.view().path()=="added"))
+            .any(|event| matches!(event,ObservedScanEvent::New(item) if item.view().path_key()=="added"))
     );
     store.events_native(&events, incremental.event_time).await?;
     store.events_native(&events, incremental.event_time).await?;

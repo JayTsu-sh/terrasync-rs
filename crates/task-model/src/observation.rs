@@ -1,8 +1,8 @@
 //! 扫描保留原生观察对象；逐版本视图只用于统计、比较和数据库行投影。
-use crate::{ChangeKind, ObservedEntryExt};
-use data_mover::model::{
-    BackendKind, EntryKind, MetadataObservations, ModelValueError, ObservedEntry, PrincipalIdentity, SourceIdentity,
-    SourceVersion, StoragePath, StorageTimestamp, VersionRecord,
+use crate::{ChangeKind, ObservedEntryExt, Result};
+use data_mover_model::{
+    EntryKind, MetadataObservations, ObservedEntry, PrincipalIdentity, SourceIdentity, SourceVersion, StoragePath,
+    StorageTimestamp, VersionRecord,
 };
 use std::{
     borrow::Cow,
@@ -10,7 +10,7 @@ use std::{
     sync::{Arc, OnceLock},
 };
 
-/// 统计所需的公共事实，兼容迁移旧消息和原生扫描，均不转换条目。
+/// 扫描和完成事件共用的统计事实；逐版本视图借用所选记录。
 pub trait EntryStatistics {
     fn get_size(&self) -> u64;
     fn get_name(&self) -> &str;
@@ -141,7 +141,7 @@ impl<'a> ObservedView<'a> {
             self.version()?.source()
         }
     }
-    pub fn source_path(&self) -> Result<StoragePath, ModelValueError> {
+    pub fn source_path(&self) -> Result<StoragePath> {
         Ok(self
             .entry
             .history_source_path()?
@@ -151,31 +151,13 @@ impl<'a> ObservedView<'a> {
         self.version()
             .map_or("", |record| record.version_id().unwrap_or("null"))
     }
-    pub fn path(&self) -> String {
-        self.sql_path().into_owned()
-    }
-    /// 普通路径借用原生观察；历史目录对象的 SQL 键保留尾部斜线。
-    pub fn sql_path(&self) -> Cow<'a, str> {
+    /// 普通路径借用原生观察；历史目录对象的任务键保留尾部斜线。
+    pub fn path_key(&self) -> Cow<'a, str> {
         if self.version().is_some() && self.entry.kind() == EntryKind::Directory {
             Cow::Owned(format!("{}/", self.entry.path().as_str()))
         } else {
             Cow::Borrowed(self.entry.path().as_str())
         }
-    }
-    pub fn file_handle(&self) -> Option<String> {
-        if self.entry.backend_kind() == BackendKind::Local {
-            return None;
-        }
-        self.entry.source_identity().stable_bytes().map(|_| {
-            let mut value = String::with_capacity(72);
-            value.push_str("54534934");
-            for byte in self.entry.identity_key().as_bytes() {
-                const HEX: &[u8; 16] = b"0123456789abcdef";
-                value.push(HEX[(byte >> 4) as usize] as char);
-                value.push(HEX[(byte & 15) as usize] as char);
-            }
-            value
-        })
     }
     /// Permission facts belong to the selected version, never to the history container.
     pub fn mode(&self) -> Option<u32> {
@@ -318,7 +300,8 @@ impl ObservedScanEvent {
 mod path_tests {
     use super::*;
     use crate::observed_fixtures::directory_marker;
-    use data_mover::model::{
+    use data_mover_model::BackendKind;
+    use data_mover_model::{
         BackendIdentity, HistoryOrder, IdentityStrength, ObjectHistory, RecordKind, SourceIdentity, StoragePath,
     };
 
@@ -329,7 +312,7 @@ mod path_tests {
         let logical = item.view();
         let payload = logical.payload();
         assert!(logical.get_is_dir());
-        assert_eq!(logical.sql_path(), "folder");
+        assert_eq!(logical.path_key(), "folder");
         assert_eq!(payload.source_path().unwrap().as_str(), "folder/");
         assert!(std::ptr::eq(
             payload.entry,
@@ -340,7 +323,7 @@ mod path_tests {
     }
 
     #[test]
-    fn borrowed_projection_keeps_regular_and_versioned_directory_sql_keys() {
+    fn borrowed_projection_keeps_regular_and_versioned_directory_path_keys() {
         let backend = BackendIdentity::new(BackendKind::S3, "sql-path-fixture").unwrap();
         let identity = SourceIdentity::new(backend, IdentityStrength::PathScoped, b"folder").unwrap();
         let history = ObjectHistory::whole(
@@ -378,10 +361,8 @@ mod path_tests {
             entry: &directory,
             version_index: Some(0),
         };
-        assert_eq!(current.sql_path(), "folder");
-        assert_eq!(current.path(), "folder");
-        assert_eq!(historical.sql_path(), "folder/");
-        assert_eq!(historical.path(), "folder/");
+        assert_eq!(current.path_key(), "folder");
+        assert_eq!(historical.path_key(), "folder/");
         assert_eq!(historical.version_id(), "v1");
     }
 }
