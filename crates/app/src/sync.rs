@@ -37,7 +37,7 @@ use {
 
 // 内部模块
 use crate::broadcast::BroadcastForwarder;
-use crate::byte_resume::{ByteResumeStore, part_path_for};
+use crate::byte_resume::ByteResumeStore;
 use crate::error::{AppError, Result};
 use crate::storage_factory::{StorageRole, create_storage_for_role};
 
@@ -703,30 +703,14 @@ pub(crate) fn should_resume(
         && (!is_s3(dest) || entry.get_size() > dest.block_size())
 }
 
-/// 字节级断点续传复制单个大文件（全量建 `.part` / 增量续 `.part` 共用）。
-///
-/// 加载/创建 `<job_dir>/byte_resume/` 下的进度状态，把缺失区间交给
-/// `copy_file_resumable`；每个 chunk 确认落盘的回调经有界 channel 投递到收敛 task
-/// 异步持久化区间（不阻塞写管道热路径）。成功后清理状态文件；失败（中断）保留状态供续传。
-///
-/// - NAS 目标端：续写到 `<dest>.terrasync-part`，完成后由 data-mover 原子 rename。
-/// - S3 目标端：multipart part 粒度续传，进度真值是目标端 in-progress upload
-///   （data-mover 以 ListParts 反推缺失区间，忽略此处传入的 `missing`）；
-///   本地状态文件仍随 part 回调更新，仅作进度参考。
+/// 以原生 Checkpoint 策略复制大文件；恢复路径与已确认范围只由目标引擎发现。
+/// 本地记录器保留现有产品进度收尾，不向引擎提供 `.part` 路径或缺失区间。
 pub(crate) async fn copy_file_with_resume(
     entry: &Arc<ObservedEntry>, src_storage: &StorageContext, dest_storage: &StorageContext,
     enable_integrity_check: bool, is_source_reserved: bool, qos_manager: Option<QosManager>,
     bytes_counter: Option<Arc<AtomicU64>>, job_dir: &str,
 ) -> Result<()> {
-    let dest_rel = entry.get_relative_path();
     let recorder = CommitRecorder::start(job_dir, entry, src_storage.block_size()).await?;
-    let missing = recorder.store.missing_intervals().await;
-
-    let resume = storage_adapter::ResumeContext {
-        part_relative_path: part_path_for(dest_rel),
-        missing_intervals: missing,
-        on_committed: recorder.callback(),
-    };
 
     let res = StorageContext::copy_file_resumable(
         src_storage,
@@ -740,7 +724,6 @@ pub(crate) async fn copy_file_with_resume(
             bytes_counter,
             ..Default::default()
         },
-        resume,
     )
     .await;
 

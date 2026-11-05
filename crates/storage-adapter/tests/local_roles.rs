@@ -321,7 +321,7 @@ async fn packaged_date_directory_stops_traversal_at_requested_package_depth() ->
 }
 
 #[tokio::test]
-async fn caller_offset_records_cannot_authorize_destination_resume() -> TestResult {
+async fn checkpointed_copy_keeps_unrelated_files_without_caller_offsets() -> TestResult {
     let source = TempDir::new()?;
     let destination = TempDir::new()?;
     let payload = vec![0x39; 256 * 1024 + 13];
@@ -329,11 +329,7 @@ async fn caller_offset_records_cannot_authorize_destination_resume() -> TestResu
     let src = local(source.path()).await?;
     let dst = local(destination.path()).await?;
     let entry = Arc::new(src.get_metadata(Path::new("payload")).await?);
-    let resume = storage_adapter::ResumeContext {
-        part_relative_path: "untrusted.part".into(),
-        missing_intervals: Vec::new(),
-        on_committed: Arc::new(|_, _| {}),
-    };
+    tokio::fs::write(destination.path().join("untrusted.part"), b"unrelated").await?;
     StorageContext::copy_file_resumable(
         &src,
         &dst,
@@ -342,10 +338,13 @@ async fn caller_offset_records_cannot_authorize_destination_resume() -> TestResu
             is_source_reserved: true,
             ..Default::default()
         },
-        resume,
     )
     .await?;
     assert_eq!(tokio::fs::read(destination.path().join("payload")).await?, payload);
+    assert_eq!(
+        tokio::fs::read(destination.path().join("untrusted.part")).await?,
+        b"unrelated"
+    );
     Ok(())
 }
 
@@ -434,18 +433,7 @@ async fn copied_observation_rejects_source_changes_before_any_target_write() -> 
         );
         assert_eq!(tokio::fs::read(destination.path().join("payload")).await?, b"published");
     }
-    let result = StorageContext::copy_file_resumable(
-        &src,
-        &dst,
-        &observed,
-        CopyOptions::default(),
-        storage_adapter::ResumeContext {
-            part_relative_path: "advisory.part".into(),
-            missing_intervals: Vec::new(),
-            on_committed: Arc::new(|_, _| {}),
-        },
-    )
-    .await;
+    let result = StorageContext::copy_file_resumable(&src, &dst, &observed, CopyOptions::default()).await;
     assert!(result.is_err());
     assert_eq!(tokio::fs::read(destination.path().join("payload")).await?, b"published");
     Ok(())

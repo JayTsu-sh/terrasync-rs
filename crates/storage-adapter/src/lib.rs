@@ -5,7 +5,6 @@ use task_model::{ErrorEvent, ObservedEntryExt, StorageEntryMessage, TransferMode
 mod archive;
 mod connected;
 mod copied_metadata;
-mod entry;
 pub use data_mover::model::ObservedEntry;
 pub mod hdfs;
 mod options;
@@ -22,7 +21,6 @@ pub use connected::*;
 pub use data_mover::storage::{HdfsConfig, HdfsKerberosCredentials, S3BucketInfo};
 pub use data_mover::traversal::{RemoteScanFailure, RemoteScanFailureKind};
 pub use data_mover::{FilterFieldDef, filter, get_filter_field_definitions, qos, redact_storage_url};
-pub use entry::*;
 pub use error::{Result, StorageError};
 pub use integrity_check::*;
 pub use options::*;

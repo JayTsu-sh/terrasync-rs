@@ -42,6 +42,9 @@ impl Default for WalkOptions {
     }
 }
 
+/// 目标确认的字节进度，不代表 crash durability；回调不得阻塞写管道。
+pub type CommitCallback = Arc<dyn Fn(u64, u64) + Send + Sync>;
+
 #[derive(Clone, Default)]
 pub struct CopyOptions {
     pub transfer_mode: TransferMode,

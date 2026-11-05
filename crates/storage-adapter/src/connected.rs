@@ -461,7 +461,7 @@ impl StorageContext {
         Ok(())
     }
     pub async fn copy_file_resumable(
-        from: &Self, to: &Self, entry: &Arc<ObservedEntry>, options: CopyOptions, _resume: ResumeContext,
+        from: &Self, to: &Self, entry: &Arc<ObservedEntry>, options: CopyOptions,
     ) -> Result<()> {
         to.validate_transfer_mode(TransferMode::Checkpoint)?;
         // 恢复权威在目标端；不再信任应用的 .part 路径或本地 offset 记录。
