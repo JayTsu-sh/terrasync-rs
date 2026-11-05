@@ -2,73 +2,8 @@
 use crate::scan::ScanResumeState;
 use crate::scan::rows::{NativeScanRecord, serialize_snapshot};
 use crate::traits::IncrementalStorageEntryRecord;
-#[cfg(test)]
-use crate::traits::StorageEntryRecord;
 use data_mover::model::EntrySnapshot;
 use serde::Serialize;
-
-#[cfg(test)]
-#[derive(Serialize, clickhouse::Row)]
-pub(super) struct ClusterStorageEntryRecord {
-    pub job_id: String,
-    pub epoch: u64,
-    pub ver: i64,
-    pub batch_id: u64,
-    pub name: String,
-    pub relative_path: String,
-    pub size: u64,
-    pub ext: Option<String>,
-    pub ctime: i64,
-    pub mtime: i64,
-    pub atime: i64,
-    pub mode: Option<u32>,
-    pub storage_type: String,
-    pub is_symlink: bool,
-    pub is_dir: bool,
-    pub is_regular_file: bool,
-    pub hard_links: u32,
-    pub current_state: u8,
-    pub uid: Option<u32>,
-    pub gid: Option<u32>,
-    pub ino: Option<u64>,
-    pub file_handle: Option<String>,
-    pub version_id: String,
-    pub tags: Option<String>,
-    pub version_count: Option<u32>,
-}
-
-#[cfg(test)]
-impl ClusterStorageEntryRecord {
-    pub fn new(job_id: String, epoch: u64, batch_id: u64, record: StorageEntryRecord) -> Self {
-        Self {
-            job_id,
-            epoch,
-            ver: epoch as i64,
-            batch_id,
-            name: record.name,
-            relative_path: record.relative_path,
-            size: record.size,
-            ext: record.ext,
-            ctime: record.ctime,
-            mtime: record.mtime,
-            atime: record.atime,
-            mode: record.mode,
-            storage_type: record.storage_type,
-            is_symlink: record.is_symlink,
-            is_dir: record.is_dir,
-            is_regular_file: record.is_regular_file,
-            hard_links: record.hard_links,
-            current_state: record.current_state,
-            uid: record.uid,
-            gid: record.gid,
-            ino: record.ino,
-            file_handle: record.file_handle,
-            version_id: record.version_id,
-            tags: record.tags,
-            version_count: record.version_count,
-        }
-    }
-}
 
 #[derive(Serialize, clickhouse::Row)]
 pub(super) struct ClusterIncrementalStorageEntryRecord<'a> {
@@ -175,15 +110,15 @@ impl ClusterScanResumeState {
 }
 
 #[derive(Serialize, clickhouse::Row)]
-pub(super) struct ClusterNativeScanRecord {
-    pub job_id: String,
+pub(super) struct ClusterNativeScanRecord<'a> {
+    pub job_id: &'a str,
     pub epoch: u64,
     pub ver: i64,
     pub batch_id: u64,
-    pub name: String,
-    pub relative_path: String,
+    pub name: &'a str,
+    pub relative_path: &'a str,
     pub size: u64,
-    pub ext: Option<String>,
+    pub ext: Option<&'a str>,
     pub ctime: i64,
     pub mtime: i64,
     pub atime: i64,
@@ -197,28 +132,31 @@ pub(super) struct ClusterNativeScanRecord {
     pub uid: Option<u32>,
     pub gid: Option<u32>,
     pub ino: Option<u64>,
-    pub file_handle: Option<String>,
-    pub version_id: String,
-    pub tags: Option<String>,
+    pub file_handle: Option<&'a str>,
+    pub version_id: &'a str,
+    pub tags: Option<&'a str>,
     pub version_count: Option<u32>,
-    pub identity_key: String,
+    pub identity_key: &'a str,
     pub backend_kind: &'static str,
+    pub backend_id: &'a str,
     pub entry_kind: &'static str,
     pub size_observed: bool,
     pub modified_unix_nanos: Option<i128>,
     #[serde(serialize_with = "serialize_snapshot")]
-    pub entry_snapshot: EntrySnapshot,
-    pub metadata_hash: Option<String>,
+    pub entry_snapshot: &'a EntrySnapshot,
+    pub metadata_hash: Option<&'a str>,
+    pub history_segment: u32,
+    pub history_index: u32,
 }
-impl ClusterNativeScanRecord {
-    pub fn new(job_id: String, epoch: u64, batch_id: u64, record: NativeScanRecord) -> Self {
+impl<'a> ClusterNativeScanRecord<'a> {
+    pub fn new(job_id: &'a str, epoch: u64, batch_id: u64, record: &'a NativeScanRecord<'_>) -> Self {
         Self {
             job_id,
             epoch,
             ver: epoch as i64,
             batch_id,
             name: record.name,
-            relative_path: record.relative_path,
+            relative_path: &record.relative_path,
             size: record.size,
             ext: record.ext,
             ctime: record.ctime,
@@ -234,17 +172,20 @@ impl ClusterNativeScanRecord {
             uid: record.uid,
             gid: record.gid,
             ino: record.ino,
-            file_handle: record.file_handle,
+            file_handle: record.file_handle.as_deref(),
             version_id: record.version_id,
-            tags: record.tags,
+            tags: record.tags.as_deref(),
             version_count: record.version_count,
-            identity_key: record.identity_key,
+            identity_key: &record.identity_key,
             backend_kind: record.backend_kind,
+            backend_id: record.backend_id,
             entry_kind: record.entry_kind,
             size_observed: record.size_observed,
             modified_unix_nanos: record.modified_unix_nanos,
-            entry_snapshot: record.entry_snapshot,
-            metadata_hash: record.metadata_hash,
+            entry_snapshot: &record.entry_snapshot,
+            metadata_hash: record.metadata_hash.as_deref(),
+            history_segment: record.history_segment,
+            history_index: record.history_index,
         }
     }
 }

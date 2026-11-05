@@ -20,13 +20,14 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 use storage_adapter::ErrorEvent;
+use storage_adapter::ObservedEntryExt;
 #[cfg(feature = "license")]
 use storage_adapter::storage_enum::{StorageType, detect_storage_type};
 
 use storage_adapter::error::StorageError;
 use storage_adapter::{
-    EntryEnum, IntegrityCheck, IntegrityCheckMode, IntegrityCheckOptions, MismatchDataField, MismatchMetaField,
-    MtimePrecision, StorageEntryMessage, StorageEnum, redact_storage_url,
+    IntegrityCheck, IntegrityCheckMode, IntegrityCheckOptions, MismatchDataField, MismatchMetaField, MtimePrecision,
+    ObservedEntry, StorageEntryMessage, StorageEnum, redact_storage_url,
 };
 use tracing::{Instrument, debug, error, info, info_span, instrument, warn};
 
@@ -155,7 +156,7 @@ fn classify_lookup_error(entry_type: &'static str, relative_path: &Path, err: &S
 
 /// 对单个条目尝试 auto-fix；返回最终 `FixStatus` 和 issue 应填充的 mismatches 标签。
 async fn apply_auto_fix(
-    dest_storage: &StorageEnum, relative_path: &Path, entry_type: &'static str, src: &EntryEnum,
+    dest_storage: &StorageEnum, relative_path: &Path, entry_type: &'static str, src: &ObservedEntry,
     has_content_mismatch: bool,
 ) -> FixStatus {
     // 文件 auto-fix 只改 uid/gid/mode；目录额外尝试改 mtime；symlink 改 mtime/uid/gid（mode 无效）。
@@ -184,7 +185,7 @@ async fn apply_auto_fix(
 
 /// 构造一条 mismatch issue（按 `auto_fix` 决定 `FixStatus`）。
 async fn build_mismatch_issue(
-    dest_storage: &StorageEnum, relative_path: &Path, entry_type: &'static str, src: &EntryEnum,
+    dest_storage: &StorageEnum, relative_path: &Path, entry_type: &'static str, src: &ObservedEntry,
     mismatches: Vec<String>, auto_fix: bool,
 ) -> IntegrityIssue {
     let has_content_mismatch = detect_content_mismatch(&mismatches);
@@ -239,7 +240,9 @@ impl CheckContext {
         }
     }
 
-    async fn process_entry(&self, entry: &EntryEnum, relative_path: &Path, entry_type: &'static str) -> Option<String> {
+    async fn process_entry(
+        &self, entry: &ObservedEntry, relative_path: &Path, entry_type: &'static str,
+    ) -> Option<String> {
         match IntegrityCheck::check_with_source_entry_and_options(
             &self.src_storage,
             &self.dest_storage,
@@ -278,7 +281,7 @@ impl CheckContext {
     }
 
     /// 处理一条 walkdir 消息：根据 entry 类型分派到对应 helper，并增加计数 + 广播。
-    async fn dispatch(&self, entry: Arc<EntryEnum>, broadcaster: &BroadcastForwarder<StorageEntryMessage>) {
+    async fn dispatch(&self, entry: Arc<ObservedEntry>, broadcaster: &BroadcastForwarder<StorageEntryMessage>) {
         let relative_path = entry.get_relative_path().to_path_buf();
         let error_reason = if entry.get_is_symlink() {
             let result = self.process_entry(entry.as_ref(), &relative_path, "symlink").await;

@@ -1,6 +1,8 @@
+use crate::ObservedEntryExt;
 use crate::connected::path;
 use crate::filter::FilterExpression;
-use crate::projection::{HistoryProjection, observation_plan};
+use crate::observed_scan::ObservedItem;
+use crate::projection::{HistorySequence, observation_plan};
 use crate::{dir_tree::*, error::operation, *};
 use chrono::NaiveDate;
 use data_mover::{
@@ -99,17 +101,16 @@ impl ConnectedStorage {
         let package = PackageFilter::new(&options);
         let root = sub.unwrap_or(Path::new("")).to_path_buf();
         let (tx, rx) = async_channel::bounded(128);
-        let connected = self.clone();
         tokio::spawn(async move {
-            let mut histories = HistoryProjection::default();
+            let mut histories = HistorySequence::default();
             while let Some(item) = session.next_item().await {
                 let message = match item {
                     TraversalItem::Resumed(_) => {
-                        histories = HistoryProjection::default();
+                        histories = HistorySequence::default();
                         continue;
                     }
                     TraversalItem::Entry(entry) => {
-                        let projected = match connected.project_history(&entry, &mut histories).await {
+                        let projected = match histories.push(*entry).map(|entry| [entry]) {
                             Ok(entries) => entries,
                             Err(error) => {
                                 let reason = error.to_string();
@@ -120,7 +121,7 @@ impl ConnectedStorage {
                                 let _ = tx
                                     .send(StorageEntryMessage::Error {
                                         event: ErrorEvent::Scan,
-                                        path: entry.path().as_str().into(),
+                                        path: root.clone(),
                                         entry: None,
                                         reason,
                                     })
@@ -154,7 +155,7 @@ impl ConnectedStorage {
                                 path: failure.path.clone(),
                                 scope: failure.scope,
                                 delivered: failure.delivered,
-                                source: failure.failure,
+                                source: Box::new(failure.failure),
                             };
                             let reason = error.to_string();
                             stored_error
@@ -243,22 +244,21 @@ impl ConnectedStorage {
             true,
         )?;
         let (tx, rx) = async_channel::bounded(2);
-        let connected = self.clone();
         tokio::spawn(async move {
-            let mut histories = HistoryProjection::default();
-            let mut files = Vec::new();
-            let mut subdirs = Vec::new();
+            let mut histories = HistorySequence::default();
+            let mut files: Vec<ObservedItem> = Vec::new();
+            let mut subdirs: Vec<ObservedItem> = Vec::new();
             let mut next = 0i32;
             while let Some(item) = session.next_item().await {
                 match item {
-                    TraversalItem::Resumed(_) => histories = HistoryProjection::default(),
+                    TraversalItem::Resumed(_) => histories = HistorySequence::default(),
                     TraversalItem::Entry(entry) => {
-                        let projected = match connected.project_history(&entry, &mut histories).await {
+                        let projected = match histories.push(*entry).map(|entry| [entry]) {
                             Ok(entries) => entries,
                             Err(error) => {
                                 let _ = tx
                                     .send(NdxEvent::Error {
-                                        path: entry.path().as_str().into(),
+                                        path: String::new(),
                                         reason: error.to_string(),
                                     })
                                     .await;
@@ -267,10 +267,12 @@ impl ConnectedStorage {
                         };
                         for entry in projected {
                             let entry = Arc::new(entry);
-                            if entry.get_is_dir() {
-                                subdirs.push(entry);
+                            if entry.history().is_some() {
+                                files.extend(ObservedItem::all(&entry));
+                            } else if entry.get_is_dir() {
+                                subdirs.push(entry.into());
                             } else {
-                                files.push(entry);
+                                files.push(entry.into());
                             }
                         }
                     }
@@ -278,13 +280,16 @@ impl ConnectedStorage {
                         files.sort_by(|a, b| a.get_name().cmp(b.get_name()));
                         subdirs.sort_by(|a, b| a.get_name().cmp(b.get_name()));
                         let start = next;
-                        let mut indexed = |entries: &mut Vec<Arc<EntryEnum>>| -> Vec<NdxEntry> {
+                        let mut indexed = |entries: &mut Vec<ObservedItem>| -> Vec<NdxEntry> {
                             entries
                                 .drain(..)
                                 .map(|entry| {
                                     let ndx = next;
                                     next = next.saturating_add(1);
-                                    NdxEntry { ndx, entry }
+                                    NdxEntry {
+                                        ndx,
+                                        entry: entry.into(),
+                                    }
                                 })
                                 .collect()
                         };
@@ -407,7 +412,7 @@ impl ConnectedStorage {
         });
         Ok(AsyncReceiver::new(rx))
     }
-    pub async fn delete_dir_all(&self, entry: &EntryEnum) -> Result<()> {
+    pub async fn delete_dir_all(&self, entry: &ObservedEntry) -> Result<()> {
         let events = self
             .delete_dir_all_with_progress(Some(entry.get_relative_path()), 4)
             .await?;
@@ -508,7 +513,7 @@ impl ResumableScan {
                         path: failure.path,
                         scope: failure.scope,
                         delivered: failure.delivered,
-                        source: failure.failure,
+                        source: Box::new(failure.failure),
                     }));
                 }
                 TraversalItem::ObservationFailure(failure) => {

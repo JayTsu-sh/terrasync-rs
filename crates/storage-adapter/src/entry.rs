@@ -1,13 +1,11 @@
 //! TerraSync 数据库及 wire 使用的数据投影；不承担存储 IO。
 // 数据结构源自 data-mover d76ff5c（Apache-2.0）。
+use crate::ObservedEntryExt;
+use crate::observed_scan::ObservedItem;
 use bytes::Bytes;
-use data_mover::model::AclMetadata;
+use data_mover::model::ObservedEntry;
 use serde::{Deserialize, Serialize};
-use std::{
-    fmt,
-    path::{Path, PathBuf},
-    sync::Arc,
-};
+use std::{fmt, path::PathBuf, sync::Arc};
 #[must_use]
 pub fn datetime_to_string(time: i64) -> String {
     let magnitude = std::time::Duration::from_nanos(time.unsigned_abs());
@@ -45,197 +43,6 @@ pub struct ResumeContext {
     pub missing_intervals: Vec<(u64, u64)>,
     /// 每个 chunk 确认落盘后触发的进度回调
     pub on_committed: CommitCallback,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum EntryEnum {
-    NAS(NASEntry),
-    S3(S3Entry),
-    HDFS(HDFSEntry),
-}
-
-impl EntryEnum {
-    pub fn get_size(&self) -> u64 {
-        match self {
-            EntryEnum::NAS(entry) => entry.size,
-            EntryEnum::S3(entry) => entry.size,
-            EntryEnum::HDFS(entry) => entry.size,
-        }
-    }
-
-    pub fn get_relative_path(&self) -> &Path {
-        match self {
-            EntryEnum::NAS(entry) => entry.relative_path.as_path(),
-            EntryEnum::S3(entry) => Path::new(&entry.relative_path),
-            EntryEnum::HDFS(entry) => entry.relative_path.as_path(),
-        }
-    }
-
-    pub fn get_name(&self) -> &str {
-        match self {
-            EntryEnum::NAS(entry) => &entry.name,
-            EntryEnum::S3(entry) => &entry.name,
-            EntryEnum::HDFS(entry) => &entry.name,
-        }
-    }
-
-    pub fn get_is_dir(&self) -> bool {
-        match self {
-            EntryEnum::NAS(entry) => entry.is_dir,
-            EntryEnum::S3(entry) => entry.is_dir,
-            EntryEnum::HDFS(entry) => entry.is_dir,
-        }
-    }
-
-    pub fn get_is_symlink(&self) -> bool {
-        match self {
-            EntryEnum::NAS(entry) => entry.is_symlink,
-            EntryEnum::S3(_) | EntryEnum::HDFS(_) => false,
-        }
-    }
-
-    pub fn get_is_regular_file(&self) -> bool {
-        match self {
-            EntryEnum::NAS(entry) => !entry.is_dir && !entry.is_symlink,
-            EntryEnum::S3(entry) => !entry.is_dir,
-            EntryEnum::HDFS(entry) => !entry.is_dir,
-        }
-    }
-
-    pub fn get_mtime(&self) -> i64 {
-        match self {
-            EntryEnum::NAS(entry) => entry.mtime,
-            EntryEnum::S3(entry) => entry.mtime,
-            EntryEnum::HDFS(entry) => entry.mtime,
-        }
-    }
-
-    pub fn get_atime(&self) -> i64 {
-        match self {
-            EntryEnum::NAS(entry) => entry.atime,
-            EntryEnum::S3(entry) => entry.mtime,
-            EntryEnum::HDFS(entry) => entry.atime,
-        }
-    }
-
-    pub fn get_ctime(&self) -> i64 {
-        match self {
-            EntryEnum::NAS(entry) => entry.ctime,
-            EntryEnum::S3(entry) => entry.mtime,
-            EntryEnum::HDFS(entry) => entry.mtime,
-        }
-    }
-
-    pub fn get_mode(&self) -> Option<u32> {
-        match self {
-            EntryEnum::NAS(entry) => entry.mode,
-            EntryEnum::S3(_) => None,
-            EntryEnum::HDFS(entry) => entry.mode,
-        }
-    }
-
-    pub fn get_extension(&self) -> Option<&str> {
-        match self {
-            EntryEnum::NAS(entry) => entry.extension.as_deref(),
-            EntryEnum::S3(entry) => entry.extension.as_deref(),
-            EntryEnum::HDFS(entry) => entry.extension.as_deref(),
-        }
-    }
-
-    pub fn get_hard_links(&self) -> Option<u32> {
-        match self {
-            EntryEnum::NAS(entry) => entry.hard_links,
-            EntryEnum::S3(_) | EntryEnum::HDFS(_) => None,
-        }
-    }
-
-    pub fn get_uid(&self) -> Option<u32> {
-        match self {
-            EntryEnum::NAS(entry) => entry.uid,
-            EntryEnum::S3(_) | EntryEnum::HDFS(_) => None,
-        }
-    }
-
-    pub fn get_gid(&self) -> Option<u32> {
-        match self {
-            EntryEnum::NAS(entry) => entry.gid,
-            EntryEnum::S3(_) | EntryEnum::HDFS(_) => None,
-        }
-    }
-
-    pub fn get_ino(&self) -> Option<u64> {
-        match self {
-            EntryEnum::NAS(entry) => entry.ino,
-            EntryEnum::S3(_) | EntryEnum::HDFS(_) => None,
-        }
-    }
-
-    pub fn get_file_handle(&self) -> Option<&Bytes> {
-        match self {
-            EntryEnum::NAS(entry) => entry.file_handle.as_ref(),
-            EntryEnum::S3(_) | EntryEnum::HDFS(_) => None,
-        }
-    }
-
-    pub fn get_version_id(&self) -> Option<&str> {
-        match self {
-            EntryEnum::NAS(_) | EntryEnum::HDFS(_) => None,
-            EntryEnum::S3(entry) => entry.version_id.as_deref(),
-        }
-    }
-
-    pub fn get_tags(&self) -> Option<&Vec<Tag>> {
-        match self {
-            EntryEnum::NAS(_) | EntryEnum::HDFS(_) => None,
-            EntryEnum::S3(entry) => entry.tags.as_ref(),
-        }
-    }
-
-    pub fn get_version_count(&self) -> Option<u32> {
-        match self {
-            EntryEnum::NAS(_) | EntryEnum::HDFS(_) => None,
-            EntryEnum::S3(entry) => entry.version_count,
-        }
-    }
-
-    pub fn get_is_latest(&self) -> bool {
-        match self {
-            EntryEnum::NAS(_) | EntryEnum::HDFS(_) => true,
-            EntryEnum::S3(entry) => entry.is_latest,
-        }
-    }
-
-    pub fn get_is_delete_marker(&self) -> bool {
-        match self {
-            EntryEnum::NAS(_) | EntryEnum::HDFS(_) => false,
-            EntryEnum::S3(entry) => entry.is_delete_marker,
-        }
-    }
-
-    pub fn set_version_count(&mut self, count: u32) {
-        if let EntryEnum::S3(entry) = self {
-            entry.version_count = Some(count);
-        }
-    }
-}
-
-/// HDFS 原生元数据，不附加 NAS 或对象存储语义。
-#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
-pub struct HDFSEntry {
-    pub name: String,
-    pub relative_path: PathBuf,
-    pub is_dir: bool,
-    pub size: u64,
-    /// 自 Unix epoch 起经过的纳秒数。
-    pub mtime: i64,
-    /// 自 Unix epoch 起经过的纳秒数。
-    pub atime: i64,
-    pub mode: Option<u32>,
-    pub owner: String,
-    pub group: String,
-    pub replication: Option<u32>,
-    pub block_size: Option<u64>,
-    pub extension: Option<String>,
 }
 
 /// 失败事件类型，用于区分不同场景下的错误
@@ -302,7 +109,7 @@ impl ChangeKind {
 
     /// 根据两个 entry 的属性差异推断变更类型；无变更时返回 `None`。
     #[must_use]
-    pub fn from_entry_diff(from: &EntryEnum, to: &EntryEnum) -> Option<Self> {
+    pub fn from_entry_diff(from: &ObservedEntry, to: &ObservedEntry) -> Option<Self> {
         let data_changed = from.get_size() != to.get_size() || from.get_mtime() != to.get_mtime();
         let meta_changed =
             from.get_mode() != to.get_mode() || from.get_uid() != to.get_uid() || from.get_gid() != to.get_gid();
@@ -322,28 +129,31 @@ impl std::fmt::Display for ChangeKind {
 }
 
 /// 文件操作消息枚举，用于在扫描/同步过程中传递文件状态变化
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 pub enum StorageEntryMessage {
     /// 文件被扫描到
-    Scanned(Arc<EntryEnum>),
+    Scanned(Arc<ObservedEntry>),
     /// 新增文件
-    New(Arc<EntryEnum>),
+    New(ObservedItem),
     /// 文件已变更（kind 区分 data/metadata/both）
-    Changed { entry: Arc<EntryEnum>, kind: ChangeKind },
+    Changed {
+        entry: Arc<ObservedEntry>,
+        kind: ChangeKind,
+    },
     /// 文件已删除
-    Deleted(Arc<EntryEnum>),
+    Deleted(Arc<ObservedEntry>),
     /// 文件被重命名，(from, to)
-    Renamed((Arc<EntryEnum>, Arc<EntryEnum>)),
+    Renamed((Arc<ObservedEntry>, Arc<ObservedEntry>)),
     /// 文件完整性检查完成
-    IntegrityChecked(Arc<EntryEnum>),
+    IntegrityChecked(Arc<ObservedEntry>),
     /// 目录需要打包为 tar（仅在 --packaged 模式下由 walkdir 发射）
-    Packaged(Arc<EntryEnum>),
+    Packaged(Arc<ObservedEntry>),
     /// 打包完成后的 manifest 数据，由 sync worker 广播，DatabaseConsumer 消费写入数据库
     TarManifest {
         /// `.tar` 文件的 `relative_path`
         tar_path: String,
         /// tar 内包含的所有条目
-        entries: Vec<Arc<EntryEnum>>,
+        entries: Vec<Arc<ObservedEntry>>,
     },
     /// 扫描/同步过程中遇到的 per-entry 错误
     Error {
@@ -352,96 +162,10 @@ pub enum StorageEntryMessage {
         /// 出错的文件或目录路径
         path: PathBuf,
         /// 条目上下文；早期扫描错误尚未构造完整条目时为 `None`。
-        entry: Option<Arc<EntryEnum>>,
+        entry: Option<Arc<ObservedEntry>>,
         /// 错误原因
         reason: String,
     },
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct NASEntry {
-    /// 通用属性
-    /// 文件或目录的名称
-    pub name: String,
-    /// 相对于扫描根目录的相对路径
-    pub relative_path: PathBuf,
-    /// 文件扩展名（如果有）
-    pub extension: Option<String>,
-    /// 是否为目录
-    pub is_dir: bool,
-    /// 文件大小（字节），目录大小通常为0
-    pub size: u64,
-    /// 访问时间（纳秒时间戳）
-    pub atime: i64,
-    /// 创建时间（纳秒时间戳）
-    pub ctime: i64,
-    /// 修改时间（纳秒时间戳）
-    pub mtime: i64,
-    /// 实际观测到的 POSIX mode；None 表示未知，Some(0) 表示真实的 000 权限。
-    pub mode: Option<u32>,
-
-    /// 是否为符号链接（Unix和NFS客户端使用）
-    pub is_symlink: bool,
-    /// 硬链接数（Unix和NFS客户端使用）
-    pub hard_links: Option<u32>,
-    /// 用户ID（Unix和NFS客户端使用）
-    pub uid: Option<u32>,
-    /// 组ID（Unix和NFS客户端使用）
-    pub gid: Option<u32>,
-    /// inode编号（Unix和NFS客户端使用）
-    pub ino: Option<u64>,
-
-    /// 文件句柄（NFS file handle / CIFS file ID 等，用于跨协议唯一标识文件）
-    #[serde(skip)]
-    pub file_handle: Option<Bytes>,
-
-    /// `NFSv4` ACL（仅 `NFSv4`+ 填充）
-    #[serde(skip)]
-    pub acl: Option<AclMetadata>,
-
-    /// `NFSv4` owner 字符串，如 "root@localdomain"
-    pub owner: Option<String>,
-
-    /// `NFSv4` `owner_group` 字符串
-    pub owner_group: Option<String>,
-
-    /// Extended attributes (xattr) key-value pairs（仅 `NFSv4`+ 扫描时填充）
-    #[serde(skip)]
-    pub xattrs: Option<Vec<(String, Vec<u8>)>>,
-}
-
-impl fmt::Display for NASEntry {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "NASEntry {{")?;
-        write!(f, "name: {:?}, ", self.name)?;
-        write!(f, "relative_path: {}, ", self.relative_path.display())?;
-        write!(f, "extension: {:?}, ", self.extension)?;
-        write!(f, "is_dir: {}, ", self.is_dir)?;
-        write!(f, "size: {}, ", self.size)?;
-        write!(f, "atime: {}, ", datetime_to_string(self.atime))?;
-        write!(f, "ctime: {}, ", datetime_to_string(self.ctime))?;
-        write!(f, "mtime: {}, ", datetime_to_string(self.mtime))?;
-        write!(f, "mode: {:?}, ", self.mode)?; // 八进制格式化
-        write!(f, "is_symlink: {}, ", self.is_symlink)?;
-        write!(f, "hard_links: {:?}, ", self.hard_links)?;
-        write!(f, "uid: {:?}, ", self.uid)?;
-        write!(f, "gid: {:?}, ", self.gid)?;
-        write!(f, "ino: {:?}, ", self.ino)?;
-        write!(f, "file_handle: {:?}, ", self.file_handle)?;
-        if let Some(ref owner) = self.owner {
-            write!(f, "owner: {owner:?}, ")?;
-        }
-        if let Some(ref owner_group) = self.owner_group {
-            write!(f, "owner_group: {owner_group:?}, ")?;
-        }
-        if let Some(ref acl) = self.acl {
-            write!(f, "acl: {} aces, ", acl.access().map_or(0, <[u8]>::len))?;
-        }
-        if let Some(ref xattrs) = self.xattrs {
-            write!(f, "xattrs: {} entries, ", xattrs.len())?;
-        }
-        write!(f, "}}")
-    }
 }
 
 /// 文件标签结构，用于存储文件的元数据标签
@@ -451,51 +175,4 @@ pub struct Tag {
     pub key: String,
     /// 标签值
     pub value: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct S3Entry {
-    /// 通用属性
-    /// 文件或目录的名称
-    pub name: String,
-    /// 相对于扫描根目录的相对路径
-    pub relative_path: String,
-    /// 文件扩展名（如果有）
-    pub extension: Option<String>,
-    /// 文件大小（字节），目录大小通常为0
-    pub size: u64,
-    /// 修改时间（纳秒时间戳）
-    pub mtime: i64,
-
-    /// 对象特有属性
-    /// 文件标签（S3使用）
-    pub tags: Option<Vec<Tag>>,
-    /// 对象版本ID（S3多版本使用）
-    pub version_id: Option<String>,
-    /// 是否为最新版本（S3多版本使用）
-    pub is_latest: bool,
-    /// 是否为删除标记（S3多版本使用）
-    pub is_delete_marker: bool,
-    /// 对象版本数量（S3多版本使用）
-    pub version_count: Option<u32>,
-    /// 是否为目录（S3 prefix）
-    pub is_dir: bool,
-}
-
-impl fmt::Display for S3Entry {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "S3Entry {{")?;
-        write!(f, "name: {:?}, ", self.name)?;
-        write!(f, "relative_path: {:?}, ", self.relative_path)?;
-        write!(f, "extension: {:?}, ", self.extension)?;
-        write!(f, "size: {}, ", self.size)?;
-        write!(f, "mtime: {}, ", datetime_to_string(self.mtime))?;
-        write!(f, "tags: {:?}, ", self.tags)?;
-        write!(f, "version_id: {:?}, ", self.version_id)?;
-        write!(f, "is_latest: {}, ", self.is_latest)?;
-        write!(f, "is_delete_marker: {}, ", self.is_delete_marker)?;
-        write!(f, "version_count: {:?}, ", self.version_count)?;
-        write!(f, "is_dir: {}", self.is_dir)?;
-        write!(f, "}}")
-    }
 }

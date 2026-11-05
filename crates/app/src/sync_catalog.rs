@@ -6,7 +6,8 @@ use crate::{
 };
 use db::traits::Database;
 use std::sync::Arc;
-use storage_adapter::{EntryEnum, StorageEntryMessage};
+use storage_adapter::ObservedEntryExt;
+use storage_adapter::{ObservedEntry, StorageEntryMessage};
 use tokio::task::JoinHandle;
 use tracing::{error, trace, warn};
 
@@ -34,7 +35,7 @@ pub(crate) async fn determine_sync_type(
 
 #[allow(clippy::borrowed_box)]
 pub(crate) async fn batch_processing_to_generate_message(
-    database: &Box<dyn Database>, batch: &[Arc<EntryEnum>], broadcaster: BroadcastForwarder<StorageEntryMessage>,
+    database: &Box<dyn Database>, batch: &[Arc<ObservedEntry>], broadcaster: BroadcastForwarder<StorageEntryMessage>,
     is_final_batch: bool, keep_item: bool,
 ) -> Result<()> {
     // 由于database是不可变引用，但我们需要可变引用，这里进行clone
@@ -58,7 +59,7 @@ pub(crate) async fn batch_processing_to_generate_message(
 
 /// 处理批次数据的辅助函数: 创建临时表，插入当前批次的数据到临时表里
 async fn batch_insert_temp_record(
-    task_id: usize, database: &mut Box<dyn Database>, batch: &[Arc<EntryEnum>], is_final_batch: bool,
+    task_id: usize, database: &mut Box<dyn Database>, batch: &[Arc<ObservedEntry>], is_final_batch: bool,
 ) -> Result<()> {
     trace!(task_id, is_final_batch, "Preparing catalogue comparison batch");
     database.create_scan_temporary_table().await?;
@@ -103,7 +104,7 @@ async fn generate_storage_entry_message_events(
     // 查询新增文件
     trace!("Task {} querying new items for {}", task_id, batch_type);
     let new_items = database.detect_new_items().await.map_err(AppError::DatabaseError)?;
-    let items: Vec<EntryEnum> = new_items.collect();
+    let items: Vec<ObservedEntry> = new_items.collect();
     if !keep_item {
         for item in &items {
             excluded_paths.push((
@@ -113,13 +114,15 @@ async fn generate_storage_entry_message_events(
         }
     }
     for item in items {
-        broadcaster.broadcast(StorageEntryMessage::New(Arc::new(item))).await;
+        broadcaster
+            .broadcast(StorageEntryMessage::New(Arc::new(item).into()))
+            .await;
     }
 
     // 查询修改文件（区分 Data/Metadata/Both 三种变更）
     trace!("Task {} querying changed items for {}", task_id, batch_type);
     let changed_items = database.detect_changed_items().await.map_err(AppError::DatabaseError)?;
-    let items: Vec<(EntryEnum, storage_adapter::ChangeKind)> = changed_items.collect();
+    let items: Vec<(ObservedEntry, storage_adapter::ChangeKind)> = changed_items.collect();
     if !keep_item {
         for (item, _) in &items {
             excluded_paths.push((
@@ -163,7 +166,7 @@ mod tests {
     use db::error::DatabaseError;
     use db::traits::{Database, TarManifestRecord};
     use db::{CopyGenerationStatus, DeletionStatus, Result as DatabaseResult};
-    use storage_adapter::{ChangeKind, EntryEnum, StorageEntryMessage};
+    use storage_adapter::{ChangeKind, ObservedEntry, StorageEntryMessage};
     use tokio::sync::mpsc;
 
     use super::{batch_processing_to_generate_message, finish_phase};
@@ -200,28 +203,25 @@ mod tests {
         (Box::new(database), calls)
     }
 
-    fn dummy_entry(name: &str) -> EntryEnum {
-        EntryEnum::NAS(storage_adapter::NASEntry {
-            name: name.to_string(),
-            relative_path: PathBuf::from(name),
-            extension: None,
-            is_dir: false,
-            size: 1,
-            atime: 0,
-            ctime: 0,
-            mtime: 0,
-            mode: Some(0o644),
-            is_symlink: false,
-            hard_links: None,
-            uid: None,
-            gid: None,
-            ino: None,
-            file_handle: None,
-            acl: None,
-            owner: None,
-            owner_group: None,
-            xattrs: None,
-        })
+    fn dummy_entry(name: &str) -> ObservedEntry {
+        {
+            let fixture_path: std::path::PathBuf = PathBuf::from(name);
+            crate::observed_fixtures::observation(
+                data_mover::model::BackendKind::Nfs,
+                fixture_path,
+                data_mover::model::EntryKind::File,
+                1,
+                [0, 0, 0],
+                Some(data_mover::model::OwnershipMode {
+                    mode: 0o644,
+                    uid: 0u32,
+                    gid: 0u32,
+                }),
+                None,
+                None,
+                None,
+            )
+        }
     }
 
     impl FaultDatabase {
@@ -261,16 +261,21 @@ mod tests {
         async fn drop_table_by_name(&self, _table_name: &str) -> DatabaseResult<()> {
             Ok(())
         }
-        async fn batch_insert_base_record(&self, _records: &[Arc<EntryEnum>]) -> DatabaseResult<()> {
+        async fn batch_insert_base_record(&self, _records: &[Arc<ObservedEntry>]) -> DatabaseResult<()> {
             Ok(())
         }
-        async fn update_base_record(&self, _record: &Arc<EntryEnum>) -> DatabaseResult<()> {
+        async fn batch_insert_completed_records(
+            &self, _records: &[storage_adapter::observed_scan::ObservedItem],
+        ) -> DatabaseResult<()> {
+            Ok(())
+        }
+        async fn update_base_record(&self, _record: &Arc<ObservedEntry>) -> DatabaseResult<()> {
             Ok(())
         }
         async fn batch_delete_base_record(&self, _deleted_paths: &[String]) -> DatabaseResult<()> {
             Ok(())
         }
-        async fn batch_insert_temp_record(&self, _records: &[Arc<EntryEnum>]) -> DatabaseResult<()> {
+        async fn batch_insert_temp_record(&self, _records: &[Arc<ObservedEntry>]) -> DatabaseResult<()> {
             self.record("insert_temp");
             if self.fires_once(ScanDatabaseFault::BatchInsertOnce) {
                 return Err(DatabaseError::QueryError("injected batch insert failure".into()));
@@ -290,7 +295,7 @@ mod tests {
             Ok(())
         }
 
-        async fn detect_new_items(&self) -> DatabaseResult<Box<dyn Iterator<Item = EntryEnum> + Send>> {
+        async fn detect_new_items(&self) -> DatabaseResult<Box<dyn Iterator<Item = ObservedEntry> + Send>> {
             self.record("detect_new");
             match self.fault {
                 ScanDatabaseFault::DetectNew => Err(DatabaseError::QueryError("injected new detection failure".into())),
@@ -301,7 +306,7 @@ mod tests {
 
         async fn detect_changed_items(
             &self,
-        ) -> DatabaseResult<Box<dyn Iterator<Item = (EntryEnum, ChangeKind)> + Send>> {
+        ) -> DatabaseResult<Box<dyn Iterator<Item = (ObservedEntry, ChangeKind)> + Send>> {
             self.record("detect_changed");
             if matches!(self.fault, ScanDatabaseFault::DetectChanged) {
                 return Err(DatabaseError::QueryError("injected changed detection failure".into()));
@@ -322,7 +327,7 @@ mod tests {
         }
         async fn query_storage_entry(
             &self, _is_dir: Option<bool>, _is_symlink: Option<bool>, _extension: Option<String>,
-            _tx: mpsc::Sender<EntryEnum>,
+            _tx: mpsc::Sender<ObservedEntry>,
         ) -> DatabaseResult<()> {
             Ok(())
         }

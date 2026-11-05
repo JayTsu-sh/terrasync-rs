@@ -149,33 +149,22 @@ impl Drop for DatabaseGuard {
         .join();
     }
 }
-fn entry(path: &str, size: u64, handle: Option<&str>) -> Arc<EntryEnum> {
-    Arc::new(
-        StorageEntryRecord {
-            name: path.into(),
-            relative_path: path.into(),
-            size,
-            ext: None,
-            ctime: 1_000_000_000,
-            mtime: 1_000_000_000,
-            atime: 1_000_000_000,
-            mode: Some(420),
-            storage_type: "nas".into(),
-            is_symlink: false,
-            is_dir: false,
-            is_regular_file: true,
-            hard_links: 1,
-            current_state: 0,
-            uid: Some(1000),
-            gid: Some(1000),
-            ino: None,
-            file_handle: handle.map(str::to_string),
-            version_id: String::new(),
-            tags: None,
-            version_count: None,
-        }
-        .to_entry_enum(),
-    )
+fn entry(path: &str, size: u64, handle: Option<&str>) -> Arc<ObservedEntry> {
+    Arc::new(crate::observed_fixtures::observation(
+        data_mover::model::BackendKind::Nfs,
+        path.into(),
+        data_mover::model::EntryKind::File,
+        size,
+        [1_000_000_000; 3],
+        Some(data_mover::model::OwnershipMode {
+            uid: 1000,
+            gid: 1000,
+            mode: 420,
+        }),
+        handle.map(|value| hex::decode(value).unwrap_or_else(|error| panic!("fixture handle: {error}"))),
+        None,
+        None,
+    ))
 }
 fn state(epoch: i64, incremental: bool, generation: u8) -> ScanResumeState {
     ScanResumeState {
@@ -286,7 +275,7 @@ async fn cluster_shared_tables_isolate_jobs_and_resume_rounds() -> Result<()> {
     assert_eq!(
         events
             .iter()
-            .filter(|event| matches!(event, StorageEntryMessage::New(_)))
+            .filter(|event| matches!(event, ObservedScanEvent::New(_)))
             .count(),
         1
     );
@@ -295,7 +284,7 @@ async fn cluster_shared_tables_isolate_jobs_and_resume_rounds() -> Result<()> {
             .iter()
             .filter(|event| matches!(
                 event,
-                StorageEntryMessage::Changed {
+                ObservedScanEvent::Changed {
                     kind: ChangeKind::DataOnly,
                     ..
                 }
@@ -325,15 +314,10 @@ async fn cluster_shared_tables_isolate_jobs_and_resume_rounds() -> Result<()> {
     resumed.insert_temp_to_base_table(&[]).await?;
     let deleted: Vec<_> = resumed.detect_deleted_items().await?.collect();
     assert_eq!(deleted.len(), 2);
-    let mut keys = Vec::new();
-    let mut messages = Vec::new();
-    for deletion in deleted {
-        if let DeletionStatus::Deleted(entry) = deletion {
-            keys.push((entry.get_relative_path().to_string_lossy().into_owned(), String::new()));
-            messages.push(StorageEntryMessage::Deleted(Arc::new(entry)));
-        }
-    }
-    resumed.write_resume_events(&messages, incremental.event_time).await?;
+    let keys: Vec<_> = deleted.iter().filter_map(ScanFinalEvent::deletion_key).collect();
+    resumed
+        .write_final_events_native(&deleted, incremental.event_time)
+        .await?;
     resumed.delete_resume_entries(&keys).await?;
     let summary = resumed.resume_statistics(0, Some(incremental.event_time)).await?;
     assert_eq!(summary.summary.files, 2);
@@ -381,11 +365,11 @@ async fn cluster_shared_batch_prunes_base_and_supports_concurrent_jobs() -> Resu
     let name = &config.database;
     let mut store = ClusterScanStore::new(&config, &cluster, "a")?;
     store.load_resume_state().await?;
-    store.client.query(&format!("INSERT INTO {name}.base (job_id,epoch,ver,name,relative_path,size,mtime,mode,is_regular_file,current_state) SELECT if(number<500000,'a','b'),{epoch},fromUnixTimestamp64Nano({epoch}),toString(n),leftPad(toString(n),9,'0'),if(number<500000,100,999),toDateTime64(1,9),420,1,1 FROM (SELECT number,number%500000 AS n FROM numbers(1000000))")).execute().await?;
+    store.client.query(&format!("INSERT INTO {name}.base (job_id,epoch,ver,name,relative_path,size,mtime,mode,uid,gid,is_regular_file,current_state) SELECT if(number<500000,'a','b'),{epoch},fromUnixTimestamp64Nano({epoch}),toString(n),leftPad(toString(n),9,'0'),if(number<500000,100,999),toDateTime64(1,9),420,1000,1000,1,1 FROM (SELECT number,number%500000 AS n FROM numbers(1000000))")).execute().await?;
     store.save_resume_state(&state(epoch + 10, true, 0)).await?;
     store.begin_resume_batch().await?;
     let batch = store.batch_id;
-    store.client.query(&format!("INSERT INTO {name}.scan_resume_batch (job_id,epoch,ver,batch_id,name,relative_path,size,mtime,mode,is_regular_file,current_state) SELECT 'a',{},fromUnixTimestamp64Nano({}),{batch},toString(n),leftPad(toString(n),9,'0'),101,toDateTime64(1,9),420,1,0 FROM (SELECT number+100000 AS n FROM numbers(200))",epoch+10,epoch+10)).execute().await?;
+    store.client.query(&format!("INSERT INTO {name}.scan_resume_batch (job_id,epoch,ver,batch_id,name,relative_path,size,mtime,mode,uid,gid,is_regular_file,current_state) SELECT 'a',{},fromUnixTimestamp64Nano({}),{batch},toString(n),leftPad(toString(n),9,'0'),101,toDateTime64(1,9),420,1000,1000,1,0 FROM (SELECT number+100000 AS n FROM numbers(200))",epoch+10,epoch+10)).execute().await?;
     let records = store
         .client
         .query(&format!(
@@ -394,7 +378,10 @@ async fn cluster_shared_batch_prunes_base_and_supports_concurrent_jobs() -> Resu
         ))
         .fetch_all::<StorageEntryRecord>()
         .await?;
-    let entries: Vec<_> = records.iter().map(|record| Arc::new(record.to_entry_enum())).collect();
+    let entries: Vec<_> = records
+        .iter()
+        .map(|record| entry(&record.relative_path, record.size, None))
+        .collect();
     // 一百万行基线下，相关批次的读取必须少于十万行；恢复全表聚合会直接触发限制。
     store.client = store.client.clone().with_option("max_rows_to_read", "100000");
     let started = Instant::now();
@@ -402,7 +389,7 @@ async fn cluster_shared_batch_prunes_base_and_supports_concurrent_jobs() -> Resu
     assert_eq!(events.len(), 200);
     assert!(events.iter().all(|event| matches!(
         event,
-        StorageEntryMessage::Changed {
+        ObservedScanEvent::Changed {
             kind: ChangeKind::DataOnly,
             ..
         }
@@ -440,25 +427,44 @@ async fn cluster_shared_batch_prunes_base_and_supports_concurrent_jobs() -> Resu
     ];
     nfs.write_resume_temp_records(&entries).await?;
     let events = nfs.detect_resume_batch_events(&entries).await?;
-    assert_eq!(events.len(), 1);
+    assert_eq!(events.len(), 2);
     assert!(
-        matches!(&events[0],StorageEntryMessage::New(entry) if entry.get_relative_path().to_string_lossy()=="z/added")
+        events
+            .iter()
+            .all(|event| matches!(event, ObservedScanEvent::Candidate(_)))
     );
+    nfs.write_resume_events(&events, epoch + 22).await?;
     nfs.insert_temp_to_base_table(&[]).await?;
-    let renamed: Vec<_> = nfs.detect_deleted_items().await?.collect();
-    assert_eq!(renamed.len(), 1);
-    assert!(matches!(&renamed[0], DeletionStatus::Renamed(..)));
+    let final_events: Vec<_> = nfs.detect_deleted_items().await?.collect();
+    assert_eq!(
+        final_events
+            .iter()
+            .filter(|event| matches!(event, ScanFinalEvent::Renamed { .. }))
+            .count(),
+        1
+    );
+    assert!(
+        final_events
+            .iter()
+            .any(|event| matches!(event, ScanFinalEvent::Added(row) if row.relative_path == "z/added"))
+    );
+    nfs.write_final_events_native(&final_events, epoch + 22).await?;
+    let keys: Vec<_> = final_events.iter().filter_map(ScanFinalEvent::deletion_key).collect();
+    nfs.delete_resume_entries(&keys).await?;
+    nfs.cleanup_candidates(epoch + 22).await?;
     nfs.begin_resume_batch().await?;
-    let mut hardlink = entry("z/hardlink", 1, Some("5453493401")).as_ref().clone();
-    if let EntryEnum::NAS(entry) = &mut hardlink {
-        entry.hard_links = Some(2);
-    }
-    let entries = vec![Arc::new(hardlink)];
+    let entries = vec![entry("z/hardlink", 1, Some("5453493401"))];
     nfs.write_resume_temp_records(&entries).await?;
-    assert!(matches!(
-        nfs.detect_resume_batch_events(&entries).await?.as_slice(),
-        [StorageEntryMessage::New(_)]
-    ));
+    let events = nfs.detect_resume_batch_events(&entries).await?;
+    assert!(matches!(events.as_slice(), [ObservedScanEvent::Candidate(_)]));
+    nfs.write_resume_events(&events, epoch + 22).await?;
+    nfs.write_native(&entries, false).await?;
+    let final_events = nfs.resolve_final_events_native(epoch + 22).await?;
+    assert!(
+        final_events
+            .iter()
+            .any(|event| matches!(event, ScanFinalEvent::Added(row) if row.relative_path == "z/hardlink"))
+    );
     nfs.cleanup_resume_batch().await?;
 
     let jobs = admin
@@ -1440,4 +1446,31 @@ async fn cluster_native_partial_candidate_cleanup_does_not_invent_a_deleted_rena
     assert_eq!(rows, vec![("a".into(), 2), ("b".into(), 1)]);
     store.cleanup_candidates(round).await?;
     Ok(())
+}
+
+// 造数及旧用例迁移只调用真实原生入口，不保留独立比较／删除算法。
+impl ClusterScanStore {
+    async fn write_resume_base_records(&self, entries: &[Arc<ObservedEntry>]) -> Result<()> {
+        self.write_native(entries, false).await
+    }
+    async fn write_resume_temp_records(&self, entries: &[Arc<ObservedEntry>]) -> Result<()> {
+        self.write_native(entries, true).await
+    }
+    async fn insert_temp_to_base_table(&self, excluded: &[(String, String)]) -> Result<()> {
+        assert!(excluded.is_empty());
+        self.merge_native().await
+    }
+    async fn detect_resume_batch_events(&mut self, entries: &[Arc<ObservedEntry>]) -> Result<Vec<ObservedScanEvent>> {
+        self.compare_native(entries).await
+    }
+    async fn write_resume_events(&self, events: &[ObservedScanEvent], time: i64) -> Result<()> {
+        self.events_native(events, time).await
+    }
+    async fn detect_deleted_items(&self) -> Result<Box<dyn Iterator<Item = ScanFinalEvent> + Send>> {
+        Ok(Box::new(
+            self.resolve_final_events_native(self.epoch.load(Ordering::Relaxed) as i64)
+                .await?
+                .into_iter(),
+        ))
+    }
 }

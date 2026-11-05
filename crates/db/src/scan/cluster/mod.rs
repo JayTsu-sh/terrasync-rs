@@ -6,8 +6,6 @@ use crate::execution::{
     recovery::RequestSafety,
 };
 use crate::schema::identifier;
-#[cfg(test)]
-use std::collections::HashMap;
 use std::future::Future;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
@@ -17,17 +15,11 @@ use tokio::sync::{Mutex, OnceCell};
 use clickhouse::Client;
 use clickhouse::error::Error as ClickHouseError;
 use serde::{Deserialize, Serialize};
-#[cfg(test)]
-use storage_adapter::{EntryEnum, StorageEntryMessage};
 use utils::sanitize_job_id;
 
-#[cfg(test)]
-use self::record::ClusterStorageEntryRecord;
 use self::record::{ClusterIncrementalStorageEntryRecord, ClusterScanResumeState};
 use crate::catalogue::{FILE_INCREMENTAL_SCAN_COLUMNS_DEFINITION, FILE_SCAN_COLUMNS_DEFINITION};
 use crate::common::FILE_SCAN_COLUMNS_LIST;
-#[cfg(test)]
-use crate::common::{DeletionStatus, classify_deletion_status};
 use crate::config::ClickHouseConfig;
 use crate::error::{DatabaseError, Result};
 #[cfg(test)]
@@ -35,10 +27,8 @@ use crate::execution::base_client;
 use crate::scan::ScanResumeStatistics;
 use crate::scan::{FINALIZING, ScanResumeState};
 #[cfg(test)]
-use crate::traits::{IncrementalStorageEntryRecord, StorageEntryRecord};
+use crate::schema::entry::EntrySummary as StorageEntryRecord;
 
-#[cfg(test)]
-mod compare;
 mod record;
 mod statistics;
 
@@ -522,75 +512,6 @@ impl ClusterScanStore {
         self.batch_id = next_batch_id()?;
         Ok(())
     }
-    #[cfg(test)]
-    async fn write_entries(&self, table: &str, entries: &[Arc<EntryEnum>], batch_id: u64) -> Result<()> {
-        retry_quorum(RequestSafety::UnconfirmedWrite, || async move {
-            if entries.is_empty() {
-                return Ok(());
-            }
-            let epoch = self.epoch.load(Ordering::Relaxed);
-            let mut insert = self.client.insert::<ClusterStorageEntryRecord>(table).await?;
-            for entry in entries {
-                let record = StorageEntryRecord::from_entry_enum(entry, self.generation.load(Ordering::Relaxed));
-                insert
-                    .write(&ClusterStorageEntryRecord::new(
-                        self.job_id.clone(),
-                        epoch,
-                        batch_id,
-                        record,
-                    ))
-                    .await?;
-            }
-            insert.end().await?;
-            Ok(())
-        })
-        .await
-    }
-    #[cfg(test)]
-    pub(crate) async fn write_resume_temp_records(&self, entries: &[Arc<EntryEnum>]) -> Result<()> {
-        self.write_entries("scan_resume_batch", entries, self.batch_id).await
-    }
-    #[cfg(test)]
-    pub(crate) async fn write_resume_base_records(&self, entries: &[Arc<EntryEnum>]) -> Result<()> {
-        self.write_entries("base", entries, 0).await
-    }
-    #[cfg(test)]
-    pub(crate) async fn insert_temp_to_base_table(&self, _excluded: &[(String, String)]) -> Result<()> {
-        retry_quorum(RequestSafety::UnconfirmedWrite, || async move {
-
-        let database = identifier(&self.database)?;
-        let columns = &*FILE_SCAN_COLUMNS_LIST;
-        self.client.query(&format!("INSERT INTO {database}.base (job_id,epoch,ver,{columns}) SELECT job_id,epoch,ver,{columns} FROM {database}.scan_resume_batch WHERE job_id=? AND batch_id=?")).bind(&self.job_id).bind(self.batch_id).execute_scan().await?;
-        Ok(())
-
-        }).await
-    }
-    #[cfg(test)]
-    pub(crate) async fn write_resume_events(&self, messages: &[StorageEntryMessage], event_time: i64) -> Result<()> {
-        retry_quorum(RequestSafety::UnconfirmedWrite, || async move {
-            if messages.is_empty() {
-                return Ok(());
-            }
-            let mut insert = self
-                .client
-                .insert::<ClusterIncrementalStorageEntryRecord>("incremental")
-                .await?;
-            for message in messages {
-                let mut record = IncrementalStorageEntryRecord::from_message(message);
-                record.create_at = event_time;
-                insert
-                    .write(&ClusterIncrementalStorageEntryRecord::new(
-                        &self.job_id,
-                        event_time as u64,
-                        &record,
-                    ))
-                    .await?;
-            }
-            insert.end().await?;
-            Ok(())
-        })
-        .await
-    }
     async fn drop_batch(&self) -> Result<()> {
         let database = identifier(&self.database)?;
         if self.batch_id == 0 {
@@ -613,58 +534,6 @@ impl ClusterScanStore {
         self.cleanup_abandoned_batches().await
     }
 
-    #[cfg(test)]
-    pub(crate) async fn detect_deleted_items(&self) -> Result<Box<dyn Iterator<Item = DeletionStatus> + Send>> {
-        let database = identifier(&self.database)?;
-        let records = self
-            .client
-            .query(&format!(
-                "SELECT {} FROM {database}.base FINAL WHERE job_id=? AND epoch!=? AND is_deleted=0",
-                *FILE_SCAN_COLUMNS_LIST
-            ))
-            .bind(&self.job_id)
-            .bind(self.epoch.load(Ordering::Relaxed))
-            .fetch_quorum_all::<StorageEntryRecord>()
-            .await?;
-        let mut no_handles = Vec::new();
-        let mut handles = Vec::new();
-        for record in records {
-            if record
-                .file_handle
-                .as_ref()
-                .is_some_and(|handle| handle.starts_with("54534934"))
-            {
-                handles.push(record);
-            } else {
-                no_handles.push(record);
-            }
-        }
-        let mut groups = HashMap::new();
-        for chunk in handles.chunks(100_000) {
-            let keys: Vec<_> = chunk
-                .iter()
-                .filter_map(|record| record.file_handle.as_deref())
-                .collect();
-            let rows = self
-                .client
-                .query(&format!(
-                    "SELECT {} FROM {database}.base FINAL WHERE job_id=? AND file_handle IN ? AND is_deleted=0",
-                    *FILE_SCAN_COLUMNS_LIST
-                ))
-                .bind(&self.job_id)
-                .bind(&keys)
-                .fetch_quorum_all::<StorageEntryRecord>()
-                .await?;
-            for row in rows {
-                if let Some(handle) = &row.file_handle {
-                    groups.entry(handle.clone()).or_insert_with(Vec::new).push(row);
-                }
-            }
-        }
-        Ok(Box::new(
-            classify_deletion_status(no_handles, handles, &groups).into_iter(),
-        ))
-    }
     pub(crate) async fn delete_resume_entries(&self, entries: &[(String, String)]) -> Result<()> {
         retry_quorum(RequestSafety::UnconfirmedWrite, || async move {
 

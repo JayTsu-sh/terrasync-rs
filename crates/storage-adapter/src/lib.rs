@@ -3,6 +3,10 @@
 mod archive;
 mod connected;
 mod entry;
+mod entry_facts;
+pub mod observation_wire;
+pub use data_mover::model::ObservedEntry;
+pub use entry_facts::ObservedEntryExt;
 pub mod hdfs;
 pub mod observed_scan;
 mod options;
@@ -41,3 +45,7 @@ pub fn canonicalize_path(value: &str) -> std::io::Result<String> {
         Ok(value.into())
     }
 }
+
+#[cfg(test)]
+#[path = "../../../tests/support/observed.rs"]
+mod observed_fixtures;

@@ -2,15 +2,14 @@
 use blake3::Hasher;
 use clickhouse::Client;
 use rustc_hash::{FxHashMap, FxHashSet};
+use std::borrow::Cow;
 use storage_adapter::observed_scan::ObservedScanEvent;
 use tokio::task::yield_now;
 
 use crate::{
-    error::Result,
-    execution::queries::check_scan_cancellation,
-    execution::read::QuorumRead,
-    scan::rows::NativeScanRecord,
-    traits::{IncrementalStorageEntryRecord, StorageEntryRecord},
+    error::Result, execution::queries::check_scan_cancellation, execution::read::QuorumRead,
+    scan::rows::NativeScanRecord, schema::entry::EntrySummary as StorageEntryRecord,
+    traits::IncrementalStorageEntryRecord,
 };
 
 pub(crate) async fn missing_hash_columns(client: &Client, tables: &[String]) -> Result<Vec<String>> {
@@ -52,8 +51,8 @@ impl CandidateMetadataCache {
     pub(crate) fn apply(&self, row: &mut NativeScanRecord) {
         let candidate = self
             .versions
-            .get(row.relative_path.as_str())
-            .is_some_and(|versions| versions.contains(row.version_id.as_str()));
+            .get(row.relative_path.as_ref())
+            .is_some_and(|versions| versions.contains(row.version_id));
         row.metadata_hash = candidate.then(|| row.scan_metadata_hash());
     }
 }
@@ -79,6 +78,16 @@ impl<T: HashField> HashField for Option<T> {
         if let Some(value) = self {
             value.hash_field(hash);
         }
+    }
+}
+impl<T: HashField + ?Sized> HashField for &T {
+    fn hash_field(&self, hash: &mut Hasher) {
+        T::hash_field(*self, hash);
+    }
+}
+impl HashField for Cow<'_, str> {
+    fn hash_field(&self, hash: &mut Hasher) {
+        self.as_ref().hash_field(hash);
     }
 }
 impl HashField for bool {
@@ -129,7 +138,7 @@ macro_rules! metadata_hash {
         }
     )+};
 }
-metadata_hash!(NativeScanRecord, StorageEntryRecord, IncrementalStorageEntryRecord);
+metadata_hash!(NativeScanRecord<'_>, StorageEntryRecord, IncrementalStorageEntryRecord);
 
 #[cfg(test)]
 mod tests {
@@ -156,8 +165,7 @@ mod tests {
         )?))
     }
 
-    fn native() -> Result<NativeScanRecord> {
-        let entry = observation()?;
+    fn native(entry: &Arc<ObservedEntry>) -> Result<NativeScanRecord<'_>> {
         NativeScanRecord::capture(
             ObservedView {
                 entry: &entry,
@@ -169,7 +177,8 @@ mod tests {
 
     #[test]
     fn ordinary_observations_do_not_compute_or_retain_a_digest() -> Result<()> {
-        let mut row = native()?;
+        let entry = observation()?;
+        let mut row = native(&entry)?;
         assert!(row.metadata_hash.is_none());
         row.metadata_hash = Some(row.scan_metadata_hash());
         CandidateMetadataCache::default().apply(&mut row);
@@ -184,13 +193,14 @@ mod tests {
             version_index: None,
         });
         let cache = CandidateMetadataCache::new(&[candidate]).await?;
-        let mut row = native()?;
+        let entry = observation()?;
+        let mut row = native(&entry)?;
         cache.apply(&mut row);
         assert_eq!(row.metadata_hash, Some(row.scan_metadata_hash()));
         row.version_id = "other-version".into();
         cache.apply(&mut row);
         assert!(row.metadata_hash.is_none());
-        row.version_id.clear();
+        row.version_id = "";
         row.relative_path = "other-path".into();
         cache.apply(&mut row);
         assert!(row.metadata_hash.is_none());
@@ -203,7 +213,8 @@ mod tests {
             entry: observation()?,
             version_index: None,
         });
-        let mut row = native()?;
+        let entry = observation()?;
+        let mut row = native(&entry)?;
         CandidateMetadataCache::new(&[event]).await?.apply(&mut row);
         assert!(row.metadata_hash.is_none());
         Ok(())
@@ -233,7 +244,8 @@ mod tests {
 
     #[test]
     fn native_and_event_hashes_agree_across_generation_changes() -> Result<()> {
-        let mut native = native()?;
+        let entry = observation()?;
+        let mut native = native(&entry)?;
         native.metadata_hash = Some(native.scan_metadata_hash());
         let digest = native.metadata_hash.clone();
         let mut row = native.legacy();
@@ -246,7 +258,7 @@ mod tests {
 
     #[test]
     fn data_metadata_identity_and_version_changes_invalidate_the_cache() -> Result<()> {
-        let row = native()?.legacy();
+        let row = native(&observation()?)?.legacy();
         let digest = row.scan_metadata_hash();
         let mutations: [fn(&mut StorageEntryRecord); 10] = [
             |row| row.size += 1,
@@ -270,7 +282,7 @@ mod tests {
 
     #[test]
     fn field_boundaries_and_nullable_values_have_distinct_encodings() -> Result<()> {
-        let mut first = native()?.legacy();
+        let mut first = native(&observation()?)?.legacy();
         first.name = "ab".into();
         first.relative_path = "c".into();
         let mut second = first.clone();

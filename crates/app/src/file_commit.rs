@@ -6,11 +6,13 @@
 // 标准库
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
+use storage_adapter::ObservedEntryExt;
 
 // 外部 crate
 use bytes::{Bytes, BytesMut};
 use storage_adapter::error::Result as StorageResult;
-use storage_adapter::{DataChunk, EntryEnum, StorageEnum, StreamChunk, StreamHandle};
+use storage_adapter::observed_scan::ObservedItem;
+use storage_adapter::{DataChunk, ObservedEntry, StorageEnum, StreamChunk, StreamHandle};
 use sync_delta::DeltaToken;
 use sync_delta::reconstruct::{ReconstructStep, Reconstructor};
 use tokio::sync::mpsc;
@@ -28,7 +30,7 @@ struct ActiveFile {
     /// Receiver 请求索引，在完整落盘生命周期中保持权威关联。
     ndx: i32,
     /// 目标端文件 entry（最终路径及暂存元数据计划的依据）
-    entry: Arc<EntryEnum>,
+    entry: ObservedItem,
     /// 向 `write_chunk_stream` 内部 channel 转发数据块的发送端
     tx_inner: mpsc::Sender<StreamChunk>,
     /// 后台写任务句柄，channel 关闭后收尾并返回结果
@@ -113,15 +115,15 @@ impl FileCommitter {
         }
     }
 
-    pub(crate) async fn begin_full(&mut self, ndx: i32, entry: Arc<EntryEnum>) {
+    pub(crate) async fn begin_full(&mut self, ndx: i32, entry: ObservedItem) {
         self.begin(ndx, entry, None).await;
     }
 
-    pub(crate) async fn begin_delta(&mut self, ndx: i32, entry: Arc<EntryEnum>, block_size: u32) {
-        self.begin(ndx, entry, Some(block_size)).await;
+    pub(crate) async fn begin_delta(&mut self, ndx: i32, entry: Arc<ObservedEntry>, block_size: u32) {
+        self.begin(ndx, entry.into(), Some(block_size)).await;
     }
 
-    async fn begin(&mut self, ndx: i32, entry: Arc<EntryEnum>, delta_block_size: Option<u32>) {
+    async fn begin(&mut self, ndx: i32, entry: ObservedItem, delta_block_size: Option<u32>) {
         if matches!(
             self.state,
             FileCommitState::FullActive(_) | FileCommitState::DeltaActive(_) | FileCommitState::Committing
@@ -155,8 +157,13 @@ impl FileCommitter {
         } else {
             0
         };
-        match StorageEnum::prepare_stream_with_mode(&self.dest, &entry, self.session.transfer_mode, self.cancel.clone())
-            .await
+        match StorageEnum::prepare_observed_stream(
+            &self.dest,
+            entry.view(),
+            self.session.transfer_mode,
+            self.cancel.clone(),
+        )
+        .await
         {
             Ok(handle) => {
                 let (tx_inner, rx_inner) = mpsc::channel::<StreamChunk>(8);
@@ -193,21 +200,24 @@ impl FileCommitter {
         }
     }
 
-    pub(crate) async fn push_full(&self, entry: &EntryEnum, chunk: DataChunk) {
+    pub(crate) async fn push_full(&self, ndx: i32, chunk: DataChunk) {
         let FileCommitState::FullActive(active) = &self.state else {
-            debug!("[dc] full chunk without active stream: {:?}", entry.get_relative_path());
+            debug!("[dc] full chunk without active stream: ndx={ndx}");
             return;
         };
-        if active.entry.get_relative_path() != entry.get_relative_path() {
+        if active.ndx != ndx {
             debug!("[dc] rejecting full chunk for non-matching active stream");
             return;
         }
         if active.tx_inner.send(StreamChunk::from(chunk)).await.is_err() {
-            debug!("[dc] write channel closed early for {:?}", entry.get_relative_path());
+            debug!(
+                "[dc] write channel closed early for {:?}",
+                active.entry.get_relative_path()
+            );
         }
     }
 
-    pub(crate) async fn push_delta(&mut self, entry: &EntryEnum, token: DeltaToken) {
+    pub(crate) async fn push_delta(&mut self, entry: &ObservedEntry, token: DeltaToken) {
         let FileCommitState::DeltaActive(active) = &mut self.state else {
             debug!(
                 "[dc] delta token for {:?} without active stream",
@@ -267,7 +277,7 @@ impl FileCommitter {
     }
 
     pub(crate) async fn commit(
-        &mut self, ndx: i32, entry: &EntryEnum, source_hash: Option<String>, expected_mode: FileTransferMode,
+        &mut self, ndx: i32, entry: &ObservedEntry, source_hash: Option<String>, expected_mode: FileTransferMode,
     ) {
         let active = match &self.state {
             FileCommitState::FullActive(active) | FileCommitState::DeltaActive(active) => active,
@@ -377,7 +387,7 @@ async fn finalize_file(
     }
 
     // 引擎完成读回校验与发布。
-    if let Err(e) = StorageEnum::commit_chunk_stream(dest, &entry, size, handle).await {
+    if let Err(e) = StorageEnum::commit_chunk_stream(dest, &entry.entry, size, handle).await {
         error!("[dc] commit {:?}: {}", entry.get_relative_path(), e);
         return CommitOutcome::HardError(AppError::from(e));
     }
@@ -418,8 +428,8 @@ fn stage_error(stage: &'static str, source: AppError) -> CommitOutcome {
 /// 读取 basis file（目标端当前已有文件）的 `[offset, offset + len)` 区间，用于 `Match`
 /// token 重建。经 `read_chunk_stream` 公共入口（`intervals=Some`）读取——避免绕过已修复
 /// 的 NFS 短读处理（issue #54 阶段 3）。
-async fn read_basis_block(dest: &Arc<StorageEnum>, entry: &Arc<EntryEnum>, offset: u64, len: u32) -> Result<Bytes> {
-    let (mut rx, handle) = StorageEnum::read_chunk_stream(
+async fn read_basis_block(dest: &Arc<StorageEnum>, entry: &Arc<ObservedEntry>, offset: u64, len: u32) -> Result<Bytes> {
+    let (mut rx, handle) = StorageEnum::read_basis_chunk_stream(
         dest,
         entry,
         Some(vec![(offset, offset + u64::from(len))]),
@@ -446,7 +456,7 @@ async fn flush_basis(dest: &Arc<StorageEnum>, active: &mut ActiveFile) -> Result
     let Some((offset, len, write_offset)) = delta.pending_basis.take() else {
         return Ok(());
     };
-    let data = read_basis_block(dest, &active.entry, offset, len).await?;
+    let data = read_basis_block(dest, &active.entry.entry, offset, len).await?;
     active
         .tx_inner
         .send(StreamChunk {

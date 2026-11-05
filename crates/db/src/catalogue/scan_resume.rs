@@ -105,12 +105,12 @@ impl ClickHouseDatabase {
         Ok(())
     }
 
-    pub async fn write_resume_base_records(&self, entries: &[Arc<EntryEnum>]) -> Result<()> {
+    pub async fn write_resume_base_records(&self, entries: &[Arc<ObservedEntry>]) -> Result<()> {
         self.batch_insert(&get_scan_base_table_name(&self.job_id), entries, false)
             .await
     }
 
-    pub async fn write_resume_temp_records(&self, entries: &[Arc<EntryEnum>]) -> Result<()> {
+    pub async fn write_resume_temp_records(&self, entries: &[Arc<ObservedEntry>]) -> Result<()> {
         let table = self
             .scan_temp_table_name
             .as_deref()
@@ -244,10 +244,14 @@ impl ClickHouseDatabase {
             return Ok(());
         }
         let table = get_incremental_scan_base_table_name(&self.job_id);
-        let paths: HashSet<String> = messages
+        let records = messages
             .iter()
-            .map(|message| IncrementalStorageEntryRecord::from_message(message).relative_path)
-            .collect();
+            .map(IncrementalStorageEntryRecord::from_message)
+            .collect::<Result<Vec<_>>>()?
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
+        let paths: HashSet<String> = records.iter().map(|record| record.relative_path.clone()).collect();
         // 使用 RowBinary 辅助键表，避免大批次生成超长 SQL IN 字面量。
         let keys = self.write_resume_keys(paths).await?;
         let existing = self
@@ -271,8 +275,7 @@ impl ClickHouseDatabase {
             .map(|(op, path, version, time)| ((op, path, version), time))
             .collect();
         let mut insert = self.sync_client.insert::<IncrementalStorageEntryRecord>(&table).await?;
-        for message in messages {
-            let mut record = IncrementalStorageEntryRecord::from_message(message);
+        for mut record in records {
             let key = (
                 record.operation_type.clone(),
                 record.relative_path.clone(),

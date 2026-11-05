@@ -1,6 +1,8 @@
 // 集成测试代码：豁免 unwrap/expect deny
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+#[path = "../../../tests/support/observed.rs"]
+mod observed_fixtures;
 #[cfg(test)]
 mod clickhouse_integration_tests {
     // 标准库
@@ -15,14 +17,15 @@ mod clickhouse_integration_tests {
     use clickhouse::error::Error as ClickHouseError;
     // 内部模块
     use data_mover::model::{
-        BackendIdentity, BackendKind, EntryKind, IdentityStrength, ObservedEntry, SourceIdentity, StoragePath,
+        BackendIdentity, BackendKind, EntryKind, HistoryOrder, IdentityStrength, ObjectHistory, ObservedEntry,
+        SourceIdentity, StoragePath,
     };
     use db::catalogue::ClickHouseDatabase;
     use db::scan::ScanResumeState;
     use db::scan::{ScanFinalEvent, ScanStore};
     use db::{ClickHouseConfig, Database, DatabaseError, DeletionStatus, ObservedEntryRecord};
+    use storage_adapter::ObservedEntryExt;
     use storage_adapter::observed_scan::{ObservedItem, ObservedScanEvent};
-    use storage_adapter::{EntryEnum, NASEntry, S3Entry};
 
     // 使用原子计数器确保每个测试用例都有唯一的job_id
     static TEST_COUNTER: AtomicUsize = AtomicUsize::new(0);
@@ -155,46 +158,44 @@ mod clickhouse_integration_tests {
         Ok(())
     }
 
-    /// 构造 NASEntry 的 EntryEnum，只需指定差异字段
-    fn make_nas(rel_path: &str, size: u64, mtime: i64, fh: Option<&[u8]>) -> EntryEnum {
-        EntryEnum::NAS(NASEntry {
-            name: rel_path.rsplit('/').next().unwrap_or(rel_path).to_string(),
-            relative_path: PathBuf::from(rel_path),
-            extension: None,
-            is_dir: false,
-            size,
-            atime: mtime,
-            ctime: mtime,
-            mtime,
-            mode: Some(0o644),
-            is_symlink: false,
-            hard_links: Some(1),
-            uid: Some(1000),
-            gid: Some(1000),
-            ino: Some(12345),
-            file_handle: fh.map(Bytes::copy_from_slice),
-            acl: None,
-            owner: None,
-            owner_group: None,
-            xattrs: None,
-        })
+    /// 构造 NASEntry 的 ObservedEntry，只需指定差异字段
+    fn make_nas(rel_path: &str, size: u64, mtime: i64, fh: Option<&[u8]>) -> ObservedEntry {
+        {
+            let fixture_path: std::path::PathBuf = PathBuf::from(rel_path);
+            crate::observed_fixtures::observation(
+                data_mover::model::BackendKind::Nfs,
+                fixture_path,
+                data_mover::model::EntryKind::File,
+                size,
+                [mtime, mtime, mtime],
+                Some(data_mover::model::OwnershipMode {
+                    mode: 0o644,
+                    uid: 1000,
+                    gid: 1000,
+                }),
+                (fh.map(Bytes::copy_from_slice)).map(|handle| handle.to_vec()),
+                None,
+                None,
+            )
+        }
     }
 
-    /// 构造 S3Entry 的 EntryEnum
-    fn make_s3(rel_path: &str, size: u64, mtime: i64, version_id: Option<&str>) -> EntryEnum {
-        EntryEnum::S3(S3Entry {
-            name: rel_path.rsplit('/').next().unwrap_or(rel_path).to_string(),
-            relative_path: rel_path.to_string(),
-            extension: None,
-            size,
-            mtime,
-            tags: None,
-            version_id: version_id.map(String::from),
-            is_latest: true,
-            is_delete_marker: false,
-            version_count: None,
-            is_dir: false,
-        })
+    /// 构造 S3Entry 的 ObservedEntry
+    fn make_s3(rel_path: &str, size: u64, mtime: i64, version_id: Option<&str>) -> ObservedEntry {
+        {
+            let fixture_path: std::path::PathBuf = (rel_path.to_string()).into();
+            crate::observed_fixtures::observation(
+                data_mover::model::BackendKind::S3,
+                fixture_path,
+                data_mover::model::EntryKind::File,
+                size,
+                [0, mtime, 0],
+                None,
+                None,
+                None,
+                Some((version_id.map(String::from), true, false)),
+            )
+        }
     }
 
     #[tokio::test]
@@ -231,7 +232,7 @@ mod clickhouse_integration_tests {
         let loaded = database.load_resume_state().await.unwrap().unwrap();
         assert_eq!(loaded.checkpoint, state.checkpoint);
         assert!(!database.restore_resume_generation(&loaded).await.unwrap());
-        let event = StorageEntryMessage::New(Arc::new(make_nas("file", 3, 0, None)));
+        let event = StorageEntryMessage::New(Arc::new(make_nas("file", 3, 0, None)).into());
         database
             .write_resume_events(&[event.clone()], state.event_time)
             .await
@@ -247,8 +248,8 @@ mod clickhouse_integration_tests {
             .unwrap();
         assert_eq!(count, 1);
         let versions = [
-            StorageEntryMessage::New(Arc::new(make_s3("history-key", 1, 0, Some("v1")))),
-            StorageEntryMessage::New(Arc::new(make_s3("history-key", 2, 0, Some("v2")))),
+            StorageEntryMessage::New(Arc::new(make_s3("history-key", 1, 0, Some("v1"))).into()),
+            StorageEntryMessage::New(Arc::new(make_s3("history-key", 2, 0, Some("v2"))).into()),
         ];
         database.write_resume_events(&versions, state.event_time).await.unwrap();
         database
@@ -266,12 +267,9 @@ mod clickhouse_integration_tests {
         assert_eq!(version_count, 2, "S3 versions must not collapse or duplicate on replay");
         let large: Vec<_> = (0..600)
             .map(|index| {
-                StorageEntryMessage::New(Arc::new(make_nas(
-                    &format!("bulk_{index}_{}", "x".repeat(1024)),
-                    1,
-                    0,
-                    None,
-                )))
+                StorageEntryMessage::New(
+                    Arc::new(make_nas(&format!("bulk_{index}_{}", "x".repeat(1024)), 1, 0, None)).into(),
+                )
             })
             .collect();
         database.write_resume_events(&large, state.event_time).await.unwrap();
@@ -298,7 +296,7 @@ mod clickhouse_integration_tests {
                 _ => None,
             })
             .collect();
-        database.write_resume_base_records(&entries).await.unwrap();
+        database.batch_insert_completed_records(&entries).await.unwrap();
         let paths: Vec<_> = entries
             .iter()
             .map(|entry| entry.get_relative_path().to_string_lossy().into_owned())
@@ -595,7 +593,7 @@ mod clickhouse_integration_tests {
     }
 
     /// 批量生成 NASEntry（用于模拟大 base 表场景）
-    fn make_nas_batch(prefix: &str, count: usize, mtime: i64) -> Vec<Arc<EntryEnum>> {
+    fn make_nas_batch(prefix: &str, count: usize, mtime: i64) -> Vec<Arc<ObservedEntry>> {
         (0..count)
             .map(|i| Arc::new(make_nas(&format!("{}/{}.dat", prefix, i), 1024, mtime, None)))
             .collect()
@@ -1414,7 +1412,7 @@ mod clickhouse_integration_tests {
         db.create_scan_temporary_table().await.unwrap();
         assert!(db.scan_temp_table_name.is_some());
 
-        let batch: Vec<Arc<EntryEnum>> = (0..100)
+        let batch: Vec<Arc<ObservedEntry>> = (0..100)
             .map(|i| Arc::new(make_nas(&format!("dir/{}.txt", i), 512, 100, None)))
             .collect();
         db.batch_insert_temp_record(&batch).await.unwrap();
@@ -1440,7 +1438,7 @@ mod clickhouse_integration_tests {
 
         // temp: 前 90 条已有 + 10 条全新
         db.create_scan_temporary_table().await.unwrap();
-        let mut temp_items: Vec<Arc<EntryEnum>> = (0..90)
+        let mut temp_items: Vec<Arc<ObservedEntry>> = (0..90)
             .map(|i| Arc::new(make_nas(&format!("dir/{}.dat", i), 1024, 1000000, None)))
             .collect();
         for i in 0..10 {
@@ -1463,7 +1461,7 @@ mod clickhouse_integration_tests {
         db.initialize().await.unwrap();
 
         // base: 1000 条带 fh
-        let base_batch: Vec<Arc<EntryEnum>> = (0..1000)
+        let base_batch: Vec<Arc<ObservedEntry>> = (0..1000)
             .map(|i| {
                 let fh = format!("{:04x}", i);
                 Arc::new(make_nas(&format!("dir/{}.dat", i), 1024, 1000000, Some(fh.as_bytes())))
@@ -1473,7 +1471,7 @@ mod clickhouse_integration_tests {
 
         // temp: 90 条已有 fh + 10 条新 fh
         db.create_scan_temporary_table().await.unwrap();
-        let mut temp_items: Vec<Arc<EntryEnum>> = (0..90)
+        let mut temp_items: Vec<Arc<ObservedEntry>> = (0..90)
             .map(|i| {
                 let fh = format!("{:04x}", i);
                 Arc::new(make_nas(&format!("dir/{}.dat", i), 1024, 1000000, Some(fh.as_bytes())))
@@ -1512,7 +1510,7 @@ mod clickhouse_integration_tests {
 
         // temp: 100 条（其中 5 条 size=9999 变更）
         db.create_scan_temporary_table().await.unwrap();
-        let mut temp_items: Vec<Arc<EntryEnum>> = (0..95)
+        let mut temp_items: Vec<Arc<ObservedEntry>> = (0..95)
             .map(|i| Arc::new(make_nas(&format!("dir/{}.dat", i), 1024, 1000000, None)))
             .collect();
         for i in 95..100 {
@@ -1546,7 +1544,7 @@ mod clickhouse_integration_tests {
 
         // 第二轮: temp 插入 990 条（10 条消失）
         db.create_scan_temporary_table().await.unwrap();
-        let temp_batch: Vec<Arc<EntryEnum>> = (0..990)
+        let temp_batch: Vec<Arc<ObservedEntry>> = (0..990)
             .map(|i| Arc::new(make_nas(&format!("dir/{}.dat", i), 1024, 1000000, None)))
             .collect();
         db.batch_insert_temp_record(&temp_batch).await.unwrap();
@@ -1573,7 +1571,7 @@ mod clickhouse_integration_tests {
         db.initialize().await.unwrap();
 
         db.create_scan_temporary_table().await.unwrap();
-        let batch: Vec<Arc<EntryEnum>> = (0..100)
+        let batch: Vec<Arc<ObservedEntry>> = (0..100)
             .map(|i| Arc::new(make_nas(&format!("dir/{}.txt", i), 512, 100, None)))
             .collect();
         db.batch_insert_temp_record(&batch).await.unwrap();
@@ -1595,7 +1593,7 @@ mod clickhouse_integration_tests {
         db.initialize().await.unwrap();
 
         db.create_scan_temporary_table().await.unwrap();
-        let batch: Vec<Arc<EntryEnum>> = (0..100)
+        let batch: Vec<Arc<ObservedEntry>> = (0..100)
             .map(|i| Arc::new(make_nas(&format!("dir/{}.txt", i), 512, 100, None)))
             .collect();
         db.batch_insert_temp_record(&batch).await.unwrap();
@@ -1619,7 +1617,7 @@ mod clickhouse_integration_tests {
         db.initialize().await.unwrap();
 
         db.create_scan_temporary_table().await.unwrap();
-        let batch: Vec<Arc<EntryEnum>> = (0..100)
+        let batch: Vec<Arc<ObservedEntry>> = (0..100)
             .map(|i| Arc::new(make_nas(&format!("dir/{}.txt", i), 512, 100, None)))
             .collect();
         db.batch_insert_temp_record(&batch).await.unwrap();
@@ -1642,7 +1640,7 @@ mod clickhouse_integration_tests {
         db.initialize().await.unwrap();
 
         db.create_scan_temporary_table().await.unwrap();
-        let batch: Vec<Arc<EntryEnum>> = vec![
+        let batch: Vec<Arc<ObservedEntry>> = vec![
             Arc::new(make_s3("a.txt", 100, 100, Some("v1"))),
             Arc::new(make_s3("a.txt", 100, 100, Some("v2"))),
             Arc::new(make_s3("a.txt", 100, 100, Some("v3"))),
@@ -1679,7 +1677,7 @@ mod clickhouse_integration_tests {
 
         // 第二轮：temp 100 条（80 已有其中 5 变更 + 20 新增）
         db.create_scan_temporary_table().await.unwrap();
-        let mut temp_items: Vec<Arc<EntryEnum>> = Vec::with_capacity(100);
+        let mut temp_items: Vec<Arc<ObservedEntry>> = Vec::with_capacity(100);
         // 75 条未变更
         for i in 0..75 {
             temp_items.push(Arc::new(make_nas(&format!("dir/{}.dat", i), 1024, 1000000, None)));
@@ -1729,7 +1727,7 @@ mod clickhouse_integration_tests {
 
         // 第二轮
         db.create_scan_temporary_table().await.unwrap();
-        let mut temp_items: Vec<Arc<EntryEnum>> = Vec::with_capacity(100);
+        let mut temp_items: Vec<Arc<ObservedEntry>> = Vec::with_capacity(100);
         for i in 0..75 {
             temp_items.push(Arc::new(make_nas(&format!("dir/{}.dat", i), 1024, 1000000, None)));
         }
@@ -1771,7 +1769,7 @@ mod clickhouse_integration_tests {
 
     #[tokio::test]
     #[ignore]
-    async fn test_version_count_deduction() {
+    async fn test_native_version_order_and_existing_version_exclusion() {
         let job_id = generate_unique_job_id("vc");
         let mut db = setup_test_db_with_job_id(&job_id);
         db.initialize().await.unwrap();
@@ -1783,19 +1781,29 @@ mod clickhouse_integration_tests {
         ];
         db.batch_insert_base_record(&base_batch).await.unwrap();
 
-        // temp: S3Entry("a.txt", vid="v3", version_count=5)
+        // 临时观察包含五个真实版本；已存在的两个版本应按版本键排除。
         db.create_scan_temporary_table().await.unwrap();
-        let mut s3_new = make_s3("a.txt", 100, 100, Some("v3"));
-        if let EntryEnum::S3(ref mut e) = s3_new {
-            e.version_count = Some(5);
-        }
-        let temp_batch = vec![Arc::new(s3_new)];
-        db.batch_insert_temp_record(&temp_batch).await.unwrap();
+        let versions: Vec<_> = ["v1", "v2", "v5", "v3", "v4"]
+            .into_iter()
+            .map(|version| make_s3("a.txt", 100, 100, Some(version)))
+            .flat_map(|entry| entry.history().unwrap().records().to_vec())
+            .collect();
+        let entry = make_s3("a.txt", 100, 100, Some("v5"))
+            .with_history(Some(Box::new(
+                ObjectHistory::whole(versions, HistoryOrder::Server).unwrap(),
+            )))
+            .unwrap();
+        db.batch_insert_temp_record(&[Arc::new(entry)]).await.unwrap();
 
-        // detect_new → version_count = 5 - 2 = 3
         let new_items: Vec<_> = db.detect_new_items().await.unwrap().collect();
-        assert_eq!(new_items.len(), 1);
-        assert_eq!(new_items[0].get_version_count(), Some(3));
+        assert_eq!(new_items.len(), 3);
+        let ids: Vec<_> = new_items.iter().map(|entry| entry.get_version_id().unwrap()).collect();
+        assert_eq!(ids, ["v5", "v3", "v4"]);
+        assert!(
+            new_items
+                .iter()
+                .all(|entry| entry.history().unwrap().records().len() == 1)
+        );
 
         db.drop_scan_temporary_table().await.unwrap();
         cleanup_test_tables(&db, &job_id).await.unwrap();

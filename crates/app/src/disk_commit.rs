@@ -5,13 +5,16 @@
 
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
+use storage_adapter::ObservedEntryExt;
 
+use data_mover::transfer::write_delete_marker;
 use storage_adapter::StorageEnum;
+use storage_adapter::StorageError;
 use sync_delta::DeltaToken;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::warn;
-use transport::message::{DcAck, DiskCommitMsg, ReceiverMsg, SessionConfig};
+use transport::message::{DcAck, DiskCommitMsg, FileOutcome, ReceiverMsg, SessionConfig};
 
 use crate::error::Result;
 use crate::file_commit::{FileCommitter, FileTransferMode};
@@ -22,7 +25,7 @@ pub async fn disk_commit_task(
     dest: Arc<StorageEnum>, session: SessionConfig, mut rx: mpsc::Receiver<DiskCommitMsg>,
     ack_tx: mpsc::UnboundedSender<DcAck>, progress: Arc<ReceiverProgress>, cancel: CancellationToken,
 ) -> Result<()> {
-    let mut files = FileCommitter::new(dest.clone(), session, ack_tx.clone(), progress.clone(), cancel);
+    let mut files = FileCommitter::new(dest.clone(), session, ack_tx.clone(), progress.clone(), cancel.clone());
 
     while let Some(msg) = rx.recv().await {
         match msg {
@@ -46,8 +49,26 @@ pub async fn disk_commit_task(
                     }));
                 }
             },
+            DiskCommitMsg::WriteDeleteMarker { ndx, entry } => {
+                let result = async {
+                    let path = entry.view().source_path().map_err(StorageError::from)?;
+                    write_delete_marker(dest.storage().clone(), path, cancel.clone())
+                        .await
+                        .map_err(StorageError::from)?;
+                    Ok::<_, StorageError>(())
+                }
+                .await;
+                let outcome = match result {
+                    Ok(()) => {
+                        progress.files_transferred.fetch_add(1, Ordering::Relaxed);
+                        FileOutcome::Success
+                    }
+                    Err(error) => FileOutcome::HardError(error.to_string()),
+                };
+                let _ = ack_tx.send(DcAck::FileOutcome { ndx, outcome });
+            }
             DiskCommitMsg::FileBegin { ndx, entry } => files.begin_full(ndx, entry).await,
-            DiskCommitMsg::FileChunk { entry, chunk } => files.push_full(&entry, chunk).await,
+            DiskCommitMsg::FileChunk { ndx, chunk } => files.push_full(ndx, chunk).await,
             DiskCommitMsg::FileCommit {
                 ndx,
                 entry,

@@ -26,3 +26,7 @@ pub mod prelude {
     pub use crate::quic::{QuicReceiverTransport, QuicSenderTransport};
     pub use crate::traits::{ReceiverTransport, SenderTransport};
 }
+
+#[cfg(test)]
+#[path = "../../../tests/support/observed.rs"]
+mod observed_fixtures;

@@ -7,7 +7,7 @@ use crate::schema::identifier;
 use crate::traits::StorageEntryRecord;
 use clickhouse::{Client, error::Error as ClickHouseError, query::Query};
 use std::time::{Duration, Instant};
-use storage_adapter::EntryEnum;
+use storage_adapter::ObservedEntry;
 use tokio::sync::MutexGuard;
 use tokio::sync::mpsc;
 use uuid::Uuid;
@@ -110,7 +110,7 @@ impl ClickHouseDatabase {
             client.clone()
         }
     }
-    pub(super) async fn send_catalogue_records(&self, query: Query, tx: mpsc::Sender<EntryEnum>) -> Result<()> {
+    pub(super) async fn send_catalogue_records(&self, query: Query, tx: mpsc::Sender<ObservedEntry>) -> Result<()> {
         let started = Instant::now();
         let mut delivered = false;
         let mut retrying = false;
@@ -125,7 +125,7 @@ impl ClickHouseDatabase {
             loop {
                 match cursor.next().await {
                     Ok(Some(record)) => {
-                        tx.send(record.to_entry_enum()).await.map_err(|error| {
+                        tx.send(record.to_observation()?).await.map_err(|error| {
                             DatabaseError::QueryError(format!("Failed to send storage entry: {error}"))
                         })?;
                         delivered = true;

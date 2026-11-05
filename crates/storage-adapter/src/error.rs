@@ -77,7 +77,7 @@ pub enum StorageError {
         scope: FailureScope,
         delivered: Option<u64>,
         #[source]
-        source: EntryOperationFailure,
+        source: Box<EntryOperationFailure>,
     },
     #[error("Scan observation failed: {0:?}")]
     TraversalObservation(Box<ObservationFailure>),

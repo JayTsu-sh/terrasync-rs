@@ -8,22 +8,21 @@
 //! 5. 辅助函数和转换方法
 
 // 标准库
-use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime};
+use std::time::SystemTime;
+use storage_adapter::ObservedEntryExt;
 
 // 外部crate
+use crate::error::DatabaseError;
 use async_trait::async_trait;
-use bytes::Bytes;
+use data_mover::model::{BackendIdentity, BackendKind};
 use serde::{Deserialize, Serialize};
-use storage_adapter::{ChangeKind, EntryEnum, NASEntry, S3Entry, StorageEntryMessage};
+use storage_adapter::{ChangeKind, ObservedEntry, StorageEntryMessage};
 use tokio::sync::mpsc;
-use tracing::{trace, warn};
 
 // 内部模块
 use crate::common::DeletionStatus;
 use crate::error::Result;
-use storage_adapter::observed_scan::EntryStatistics;
 
 /// 查询结果结构体
 /// 包含查询返回的行数据、受影响的行数和最后插入的ID
@@ -83,118 +82,61 @@ pub struct StorageEntryRecord {
     pub tags: Option<String>,
     /// 版本计数
     pub version_count: Option<u32>,
+    pub backend_kind: String,
+    pub backend_id: String,
+    pub entry_snapshot: Vec<u8>,
 }
 
 impl StorageEntryRecord {
-    /// 将 `EntryEnum` 转换为 `StorageEntryRecord`
-    ///
-    /// # 参数
-    /// - `entry`: 存储条目对象（NAS或S3）
-    /// - `current_state`: 当前扫描状态
-    ///
-    /// # 返回值
-    /// - 转换后的 `StorageEntryRecord` 对象
-    pub fn from_entry_enum(entry: &EntryEnum, current_state: u8) -> Self {
-        let ext = entry.get_extension().map(str::to_string);
-        trace!("{:?}", entry.get_file_handle());
-
-        // 将Bytes转换为hex字符串
-        let file_handle = entry.get_file_handle().map(hex::encode);
-        trace!("{:?}", file_handle);
-
-        // 将Vec<Tag>转换为JSON字符串
-        let tags = entry.get_tags().and_then(|tags| serde_json::to_string(tags).ok());
-
-        let storage_type = match entry {
-            EntryEnum::NAS(_) => "nas",
-            EntryEnum::S3(_) => "s3",
-            EntryEnum::HDFS(_) => "hdfs",
-        };
-
-        StorageEntryRecord {
-            name: entry.get_name().to_string(),
-            relative_path: entry.get_relative_path().to_string_lossy().into_owned(),
-            size: entry.get_size(),
-            ext,
-            ctime: entry.get_ctime(),
-            mtime: entry.get_mtime(),
-            atime: entry.get_atime(),
-            mode: entry.get_mode(),
-            storage_type: storage_type.to_string(),
-            is_symlink: entry.get_is_symlink(),
-            is_dir: entry.get_is_dir(),
-            is_regular_file: entry.get_is_regular_file(),
-            hard_links: entry.get_hard_links().unwrap_or(1),
-            current_state,
-            uid: entry.get_uid(),
-            gid: entry.get_gid(),
-            ino: entry.get_ino(),
-            file_handle,
-            version_id: entry.get_version_id().unwrap_or_default().to_string(),
-            tags,
-            version_count: entry.get_version_count(),
-        }
+    #[cfg(test)]
+    pub fn capture(entry: &ObservedEntry, generation: u8) -> Result<Self> {
+        let fields = crate::scan::rows::capture_summary(
+            storage_adapter::observed_scan::ObservedView {
+                entry,
+                version_index: entry.history().map(|_| 0),
+            },
+            generation,
+        )?;
+        Ok(Self {
+            name: fields.name,
+            relative_path: fields.relative_path,
+            size: fields.size,
+            ext: fields.ext,
+            ctime: fields.ctime,
+            mtime: fields.mtime,
+            atime: fields.atime,
+            mode: fields.mode,
+            storage_type: fields.storage_type,
+            is_symlink: fields.is_symlink,
+            is_dir: fields.is_dir,
+            is_regular_file: fields.is_regular_file,
+            hard_links: fields.hard_links,
+            current_state: fields.current_state,
+            uid: fields.uid,
+            gid: fields.gid,
+            ino: fields.ino,
+            file_handle: fields.file_handle,
+            version_id: fields.version_id,
+            tags: fields.tags,
+            version_count: fields.version_count,
+            backend_kind: entry.backend_kind().as_str().into(),
+            backend_id: entry.source_identity().backend().stable_id().into(),
+            entry_snapshot: entry.try_encode_snapshot()?.as_bytes().to_vec(),
+        })
     }
-
-    /// 将 `StorageEntryRecord` 转换为 `EntryEnum`
-    ///
-    /// # 返回值
-    /// - 转换后的 `EntryEnum` 对象（根据 `storage_type` 选择 NAS 或 S3）
-    pub fn to_entry_enum(&self) -> EntryEnum {
-        // 将十六进制字符串解码为Bytes
-        let file_handle = self
-            .file_handle
-            .as_ref()
-            .and_then(|s| hex::decode(s).ok())
-            .map(Bytes::from);
-
-        // 将JSON字符串转换为Vec<Tag>
-        let tags = self
-            .tags
-            .as_ref()
-            .and_then(|tags_str| serde_json::from_str::<Vec<storage_adapter::Tag>>(tags_str).ok());
-
-        if self.storage_type == "s3" {
-            EntryEnum::S3(S3Entry {
-                name: self.name.clone(),
-                relative_path: self.relative_path.clone(),
-                extension: self.ext.clone(),
-                size: self.size,
-                mtime: self.mtime,
-                tags,
-                version_id: if self.version_id.is_empty() {
-                    None
-                } else {
-                    Some(self.version_id.clone())
-                },
-                is_latest: false,
-                is_delete_marker: false,
-                version_count: self.version_count,
-                is_dir: self.is_dir,
-            })
-        } else {
-            EntryEnum::NAS(NASEntry {
-                name: self.name.clone(),
-                relative_path: PathBuf::from(&self.relative_path),
-                extension: self.ext.clone(),
-                is_dir: self.is_dir,
-                size: self.size,
-                atime: self.atime,
-                ctime: self.ctime,
-                mtime: self.mtime,
-                mode: self.mode,
-                is_symlink: self.is_symlink,
-                hard_links: Some(self.hard_links),
-                file_handle,
-                uid: self.uid,
-                gid: self.gid,
-                ino: self.ino,
-                acl: None,
-                owner: None,
-                owner_group: None,
-                xattrs: None,
-            })
+    /// 目录持久化读取只接受完整原生 snapshot，不从查询列拼造观察。
+    pub fn to_observation(&self) -> Result<ObservedEntry> {
+        let backend = BackendIdentity::new(self.backend_kind.parse()?, self.backend_id.clone())?;
+        let entry = ObservedEntry::decode_snapshot(&self.entry_snapshot, &backend)?;
+        if entry.get_relative_path() != std::path::Path::new(&self.relative_path)
+            && entry
+                .history_source_path()?
+                .as_ref()
+                .is_none_or(|path| path.as_str() != self.relative_path)
+        {
+            return Err(DatabaseError::ObservationProjectionMismatch { field: "relative_path" });
         }
+        Ok(entry)
     }
 }
 
@@ -253,155 +195,59 @@ pub struct IncrementalStorageEntryRecord {
 }
 
 impl IncrementalStorageEntryRecord {
-    /// 从 `StorageEntryMessage` 创建 `IncrementalStorageEntryRecord`
-    ///
-    /// # 参数
-    /// - `message`: 存储条目消息对象（来自 `data_mover`）
-    ///
-    /// # 返回值
-    /// - 转换后的 `IncrementalStorageEntryRecord` 对象
-    pub fn from_message(message: &StorageEntryMessage) -> Self {
-        // 计算当前时间戳，避免在每个分支重复计算
-        let create_at = SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .unwrap_or_else(|_| {
-                warn!("系统时钟早于 Unix epoch，create_at 将记为 0");
-                Duration::ZERO
-            })
-            .as_nanos() as i64;
-
-        match message {
-            // 处理普通操作（new、changed、deleted）的公共逻辑
-            StorageEntryMessage::Scanned(entry) => Self::from_entry(entry.as_ref(), "scanned", None, create_at),
-            StorageEntryMessage::Packaged(entry) => Self::from_entry(entry.as_ref(), "packaged", None, create_at),
-            StorageEntryMessage::New(entry) => Self::from_entry(entry.as_ref(), "new", None, create_at),
-            StorageEntryMessage::Changed { entry, kind } => {
-                // state 列区分三种变更：data_changed / metadata_changed / both_changed
-                Self::from_entry(entry.as_ref(), kind.as_state_str(), None, create_at)
+    pub fn from_message(message: &StorageEntryMessage) -> Result<Vec<Self>> {
+        let now = i64::try_from(SystemTime::now().duration_since(SystemTime::UNIX_EPOCH)?.as_nanos())?;
+        let (entry, operation, comment) = match message {
+            StorageEntryMessage::Scanned(entry) => (entry, "scanned", None),
+            StorageEntryMessage::Packaged(entry) => (entry, "packaged", None),
+            StorageEntryMessage::New(item) => {
+                let row = crate::scan::rows::capture_summary(item.view(), 0)?;
+                return Ok(vec![crate::scan::rows::incremental_record(row, "new", None, now)]);
             }
-            StorageEntryMessage::Deleted(entry) => Self::from_entry(entry.as_ref(), "deleted", None, create_at),
-            StorageEntryMessage::IntegrityChecked(entry) => {
-                Self::from_entry(entry.as_ref(), "integrity_checked", None, create_at)
-            }
-
-            // 处理重命名操作的特殊逻辑
-            StorageEntryMessage::Renamed((from_entry, to_entry)) => {
-                let comment = Some(from_entry.get_relative_path().to_string_lossy().into_owned());
-                Self::from_entry(to_entry.as_ref(), "rename", comment, create_at)
-            }
-
-            // TarManifest 由 DatabaseConsumer 单独处理，此分支仅为满足 match 穷举
-            StorageEntryMessage::TarManifest { tar_path, .. } => Self {
-                operation_type: "tar_manifest".to_string(),
-                name: String::new(),
-                relative_path: tar_path.clone(),
-                size: 0,
-                ext: None,
-                ctime: 0,
-                mtime: 0,
-                atime: 0,
-                mode: None,
-                storage_type: String::new(),
-                is_symlink: false,
-                is_dir: false,
-                is_regular_file: false,
-                hard_links: 0,
-                current_state: 0,
-                uid: None,
-                gid: None,
-                ino: None,
-                file_handle: None,
-                version_id: String::new(),
-                create_at,
-                comment: None,
-                tags: None,
-                version_count: None,
-            },
-
-            // 错误消息记录为 error 操作类型
+            StorageEntryMessage::Changed { entry, kind } => (entry, kind.as_state_str(), None),
+            StorageEntryMessage::Deleted(entry) => (entry, "deleted", None),
+            StorageEntryMessage::IntegrityChecked(entry) => (entry, "integrity_checked", None),
+            StorageEntryMessage::Renamed((from, to)) => (to, "rename", Some(from.path().as_str().to_owned())),
             StorageEntryMessage::Error {
-                event, path, reason, ..
-            } => Self {
-                operation_type: "error".to_string(),
-                name: path
-                    .file_name()
-                    .map(|n| n.to_string_lossy().into_owned())
-                    .unwrap_or_default(),
-                relative_path: path.to_string_lossy().into_owned(),
-                size: 0,
-                ext: None,
-                ctime: 0,
-                mtime: 0,
-                atime: 0,
-                mode: None,
-                storage_type: String::new(),
-                is_symlink: false,
-                is_dir: false,
-                is_regular_file: false,
-                hard_links: 0,
-                current_state: 0,
-                uid: None,
-                gid: None,
-                ino: None,
-                file_handle: None,
-                version_id: String::new(),
-                create_at,
-                comment: Some(format!("[{event}] {reason}")),
-                tags: None,
-                version_count: None,
-            },
-        }
+                event,
+                path,
+                entry,
+                reason,
+            } => {
+                let comment = Some(format!("[{event}] {reason}"));
+                if let Some(entry) = entry {
+                    return Self::observed_rows(entry, "error", comment, now);
+                }
+                let row = crate::schema::entry::EntrySummary {
+                    name: path
+                        .file_name()
+                        .map_or_else(String::new, |value| value.to_string_lossy().into_owned()),
+                    relative_path: path.to_string_lossy().into_owned(),
+                    ..Default::default()
+                };
+                return Ok(vec![crate::scan::rows::incremental_record(row, "error", comment, now)]);
+            }
+            StorageEntryMessage::TarManifest { .. } => {
+                return Err(DatabaseError::ConversionError(
+                    "tar manifest must use the manifest writer".into(),
+                ));
+            }
+        };
+        Self::observed_rows(entry, operation, comment, now)
     }
 
-    /// 从 `EntryEnum` 和操作类型创建 `IncrementalStorageEntryRecord` 的辅助方法
-    ///
-    /// # 参数
-    /// - `entry`: 存储条目对象（NAS或S3）
-    /// - `operation_type`: 操作类型字符串
-    /// - `comment`: 可选的备注信息
-    /// - `create_at`: 创建时间戳
-    ///
-    /// # 返回值
-    /// - 构建的 `IncrementalStorageEntryRecord` 对象
-    fn from_entry(entry: &EntryEnum, operation_type: &str, comment: Option<String>, create_at: i64) -> Self {
-        // 将Bytes转换为hex字符串
-        let file_handle = entry.get_file_handle().map(hex::encode);
-
-        // 将Vec<Tag>转换为JSON字符串
-        let tags = entry.get_tags().and_then(|tags| serde_json::to_string(tags).ok());
-
-        let storage_type = match entry {
-            EntryEnum::NAS(_) => "nas",
-            EntryEnum::S3(_) => "s3",
-            EntryEnum::HDFS(_) => "hdfs",
-        };
-
-        Self {
-            operation_type: operation_type.to_string(),
-            name: entry.get_name().to_string(),
-            relative_path: entry.get_relative_path().to_string_lossy().into_owned(),
-            size: entry.get_size(),
-            ext: entry.get_extension().map(str::to_string),
-            ctime: entry.get_ctime(),
-            mtime: entry.get_mtime(),
-            atime: entry.get_atime(),
-            mode: entry.get_mode(),
-            storage_type: storage_type.to_string(),
-            is_symlink: entry.get_is_symlink(),
-            is_dir: entry.get_is_dir(),
-            is_regular_file: entry.get_is_regular_file(),
-            hard_links: entry.get_hard_links().unwrap_or(1),
-            current_state: 0, // 默认值，增量记录不需要current_state
-            uid: entry.get_uid(),
-            gid: entry.get_gid(),
-            ino: entry.get_ino(),
-            file_handle,
-            version_id: entry.get_version_id().unwrap_or_default().to_string(),
-            create_at,
-            comment,
-            tags,
-            version_count: entry.get_version_count(),
-        }
+    fn observed_rows(entry: &ObservedEntry, operation: &str, comment: Option<String>, now: i64) -> Result<Vec<Self>> {
+        storage_adapter::observed_scan::ObservedView::all(entry)
+            .map(|view| {
+                let row = crate::scan::rows::capture_summary(view, 0)?;
+                Ok(crate::scan::rows::incremental_record(
+                    row,
+                    operation,
+                    comment.clone(),
+                    now,
+                ))
+            })
+            .collect()
     }
 }
 
@@ -438,14 +284,22 @@ pub struct TarManifestRecord {
 }
 
 impl TarManifestRecord {
-    /// 从 `EntryEnum` 和 tar 路径创建 `TarManifestRecord`
-    pub fn from_entry(entry: &EntryEnum, tar_path: &str) -> Self {
-        let storage_type = match entry {
-            EntryEnum::NAS(_) => "nas",
-            EntryEnum::S3(_) => "s3",
-            EntryEnum::HDFS(_) => "hdfs",
+    /// 从 `ObservedEntry` 和 tar 路径创建 `TarManifestRecord`
+    pub fn from_entry(entry: &ObservedEntry, tar_path: &str) -> Self {
+        let storage_type = match entry.backend_kind() {
+            BackendKind::S3 => "s3",
+            BackendKind::Hdfs => "hdfs",
+            _ => "nas",
         };
-        let tags = entry.get_tags().and_then(|tags| serde_json::to_string(tags).ok());
+        let tags = entry.get_tags().and_then(|tags| {
+            serde_json::to_string(
+                &tags
+                    .iter()
+                    .map(|tag| (tag.key(), tag.value()))
+                    .collect::<std::collections::BTreeMap<_, _>>(),
+            )
+            .ok()
+        });
 
         Self {
             tar_path: tar_path.to_string(),
@@ -538,22 +392,27 @@ pub trait Database: Send + Sync {
     /// 批量插入数据到主表
     ///
     /// # 参数
-    /// - `records`: `EntryEnum` 切片
+    /// - `records`: `ObservedEntry` 切片
     ///
     /// # 返回值
     /// - 成功返回Ok(())
     /// - 失败返回错误信息
-    async fn batch_insert_base_record(&self, records: &[Arc<EntryEnum>]) -> Result<()>;
+    async fn batch_insert_base_record(&self, records: &[Arc<ObservedEntry>]) -> Result<()>;
 
     /// 更新单个主表记录
     ///
     /// # 参数
-    /// - `record`: `EntryEnum` 引用
+    /// - `record`: `ObservedEntry` 引用
     ///
     /// # 返回值
     /// - 成功返回Ok(())
     /// - 失败返回错误信息
-    async fn update_base_record(&self, record: &Arc<EntryEnum>) -> Result<()>;
+    /// 仅写入实际完成的版本，借用共享观察，不扩大到同一对象的其他历史。
+    async fn batch_insert_completed_records(
+        &self, records: &[storage_adapter::observed_scan::ObservedItem],
+    ) -> Result<()>;
+
+    async fn update_base_record(&self, record: &Arc<ObservedEntry>) -> Result<()>;
 
     /// 批量删除基础表记录
     async fn batch_delete_base_record(&self, deleted_paths: &[String]) -> Result<()>;
@@ -561,12 +420,12 @@ pub trait Database: Send + Sync {
     /// 批量插入临时表记录
     ///
     /// # 参数
-    /// - `records`: `EntryEnum` 切片
+    /// - `records`: `ObservedEntry` 切片
     ///
     /// # 返回值
     /// - 成功返回Ok(())
     /// - 失败返回错误信息
-    async fn batch_insert_temp_record(&self, records: &[Arc<EntryEnum>]) -> Result<()>;
+    async fn batch_insert_temp_record(&self, records: &[Arc<ObservedEntry>]) -> Result<()>;
 
     /// 批量插入增量记录
     ///
@@ -600,9 +459,9 @@ pub trait Database: Send + Sync {
     /// 即在临时表中存在但在主表中不存在的文件
     ///
     /// # 返回值
-    /// - 成功返回包含 `EntryEnum` 迭代器的 `Ok`
+    /// - 成功返回包含 `ObservedEntry` 迭代器的 `Ok`
     /// - 失败返回错误信息
-    async fn detect_new_items(&self) -> Result<Box<dyn Iterator<Item = EntryEnum> + Send>>;
+    async fn detect_new_items(&self) -> Result<Box<dyn Iterator<Item = ObservedEntry> + Send>>;
 
     /// 查询在最新扫描中发生变更的文件
     /// 区分三种变更：
@@ -611,9 +470,9 @@ pub trait Database: Send + Sync {
     /// - `ChangeKind::Both`：内容和属性都变了
     ///
     /// # 返回值
-    /// - 成功返回 `(EntryEnum, ChangeKind)` 迭代器
+    /// - 成功返回 `(ObservedEntry, ChangeKind)` 迭代器
     /// - 失败返回错误信息
-    async fn detect_changed_items(&self) -> Result<Box<dyn Iterator<Item = (EntryEnum, ChangeKind)> + Send>>;
+    async fn detect_changed_items(&self) -> Result<Box<dyn Iterator<Item = (ObservedEntry, ChangeKind)> + Send>>;
 
     /// 查询在上一次扫描中存在但在最新扫描中缺失的文件
     /// 识别出待删除的文件后，立即在数据库中批量删除这些记录
@@ -659,7 +518,8 @@ pub trait Database: Send + Sync {
     /// - 成功返回Ok(())
     /// - 失败返回错误信息
     async fn query_storage_entry(
-        &self, is_dir: Option<bool>, is_symlink: Option<bool>, extension: Option<String>, tx: mpsc::Sender<EntryEnum>,
+        &self, is_dir: Option<bool>, is_symlink: Option<bool>, extension: Option<String>,
+        tx: mpsc::Sender<ObservedEntry>,
     ) -> Result<()>;
 
     /// 创建 tar manifest 表
@@ -688,7 +548,7 @@ impl Clone for Box<dyn Database> {
     }
 }
 
-impl EntryStatistics for StorageEntryRecord {
+impl storage_adapter::observed_scan::EntryStatistics for StorageEntryRecord {
     fn get_size(&self) -> u64 {
         self.size
     }

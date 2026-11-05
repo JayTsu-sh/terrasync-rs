@@ -75,6 +75,7 @@
 
 use crate::message::RemoteSourceEvent;
 use std::sync::Mutex;
+use storage_adapter::ObservedEntryExt;
 
 // 外部 crate
 use tokio::sync::Notify;
@@ -304,38 +305,35 @@ mod tests {
     use std::time::Duration;
 
     use bytes::Bytes;
-    use storage_adapter::{DataChunk, EntryEnum, NASEntry};
+    use storage_adapter::{DataChunk, ObservedEntry};
 
     use super::*;
 
-    fn dummy_entry_with_size(size: u64) -> Arc<EntryEnum> {
-        Arc::new(EntryEnum::NAS(NASEntry {
-            name: "f".to_string(),
-            relative_path: PathBuf::from("f"),
-            extension: None,
-            is_dir: false,
-            size,
-            atime: 0,
-            ctime: 0,
-            mtime: 0,
-            mode: Some(0o644),
-            is_symlink: false,
-            hard_links: None,
-            uid: None,
-            gid: None,
-            ino: None,
-            file_handle: None,
-            acl: None,
-            owner: None,
-            owner_group: None,
-            xattrs: None,
-        }))
+    fn dummy_entry_with_size(size: u64) -> Arc<ObservedEntry> {
+        Arc::new({
+            let fixture_path: std::path::PathBuf = PathBuf::from("f");
+            crate::observed_fixtures::observation(
+                data_mover::model::BackendKind::Nfs,
+                fixture_path,
+                data_mover::model::EntryKind::File,
+                size,
+                [0, 0, 0],
+                Some(data_mover::model::OwnershipMode {
+                    mode: 0o644,
+                    uid: 0u32,
+                    gid: 0u32,
+                }),
+                None,
+                None,
+                None,
+            )
+        })
     }
 
     #[test]
     fn credit_cost_counts_file_data_by_chunk_payload_len() {
         let message = SenderMsg::FileData {
-            entry: dummy_entry_with_size(0),
+            ndx: 0,
             chunk: DataChunk {
                 offset: 0,
                 data: Bytes::from(vec![0u8; 100]),

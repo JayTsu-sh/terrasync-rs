@@ -15,13 +15,14 @@ use clickhouse::error::Error as ClickHouseError;
 use data_mover::model::ObservedEntry;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use storage_adapter::{ChangeKind, EntryEnum, StorageEntryMessage};
+use storage_adapter::{ChangeKind, StorageEntryMessage};
 use tokio::sync::{Mutex, MutexGuard, mpsc};
 use tracing::{debug, info, trace, warn};
 
 // 内部模块
 use crate::common::{
-    DeletionStatus, FILE_SCAN_COLUMNS_LIST, FILE_SCAN_COLUMNS_LIST_WITH_T_PREFIX,
+    CATALOGUE_COLUMNS as FILE_SCAN_COLUMNS_LIST,
+    CATALOGUE_COLUMNS_WITH_T_PREFIX as FILE_SCAN_COLUMNS_LIST_WITH_T_PREFIX, DeletionStatus,
     FILE_SCAN_COLUMNS_LIST_WO_VERSIONCOUNT_WITH_T_PREFIX, classify_deletion_status,
 };
 use crate::config::ClickHouseConfig;
@@ -32,6 +33,7 @@ use crate::execution::{
     recovery::RequestSafety,
 };
 use crate::observation_record::{OBSERVATION_IDENTITY_JOIN_CLAUSE, ObservedEntryRecord};
+use crate::scan::rows::NativeScanRecord;
 use crate::traits::{
     CopyGenerationStatus, Database, IncrementalStorageEntryRecord, QueryResult, StorageEntryRecord, TarManifestRecord,
 };
@@ -41,6 +43,7 @@ use crate::{
     get_incremental_scan_base_table_name, get_scan_base_table_name, get_scan_state_table_name,
     get_tar_manifest_table_name,
 };
+use storage_adapter::observed_scan::{ObservedItem, ObservedView, ObservedViews};
 use utils::sanitize_job_id;
 
 #[cfg(test)]
@@ -51,7 +54,6 @@ use crate::execution::read::QuorumRead;
 use layout::{CatalogueEngine, ClusterCatalogue};
 
 mod scan_resume;
-mod scan_resume_batch;
 mod scan_resume_statistics;
 
 /// `ClickHouse`数据库实现
@@ -160,11 +162,14 @@ macro_rules! file_scan_base_columns {
     version_count Nullable(UInt32) DEFAULT NULL,
     identity_key String DEFAULT '',
     backend_kind String DEFAULT '',
+    backend_id String DEFAULT '',
     entry_kind String DEFAULT '',
     size_observed Bool DEFAULT 0,
     modified_unix_nanos Nullable(Int128) DEFAULT NULL,
     entry_snapshot Array(UInt8) DEFAULT [],
     metadata_hash Nullable(String) DEFAULT NULL,
+    history_segment UInt32 DEFAULT 0,
+    history_index UInt32 DEFAULT 0,
     INDEX identity_key_idx identity_key TYPE bloom_filter GRANULARITY 1
 "
     };
@@ -245,18 +250,18 @@ impl JoinStrategy {
         let columns = &*FILE_SCAN_COLUMNS_LIST_WO_VERSIONCOUNT_WITH_T_PREFIX;
         match self {
             Self::Path => format!(
-                "SELECT {columns}, {version_count_expr} FROM {temp} as t \
+                "SELECT {columns}, {version_count_expr}, t.backend_kind,t.backend_id,t.entry_snapshot FROM {temp} as t \
                  {version_count_join} \
                  WHERE (t.relative_path, t.version_id) NOT IN \
                  (SELECT relative_path, version_id FROM {base}) \
-                 ORDER BY t.relative_path, t.version_id"
+                 ORDER BY t.relative_path, t.history_segment, t.history_index, t.version_id"
             ),
             Self::FileHandle => format!(
-                "SELECT {columns}, {version_count_expr} FROM {temp} as t \
+                "SELECT {columns}, {version_count_expr}, t.backend_kind,t.backend_id,t.entry_snapshot FROM {temp} as t \
                  {version_count_join} \
                  WHERE t.file_handle NOT IN \
                  (SELECT file_handle FROM {base} WHERE file_handle IS NOT NULL) \
-                 ORDER BY t.relative_path, t.version_id"
+                 ORDER BY t.relative_path, t.history_segment, t.history_index, t.version_id"
             ),
         }
     }
@@ -299,7 +304,7 @@ impl JoinStrategy {
                        LIMIT 1 BY (relative_path, version_id) \
                  ) f ON t.relative_path = f.relative_path AND t.version_id = f.version_id \
                  WHERE {kind_filter} AND f.is_dir = 0 \
-                 ORDER BY t.relative_path, t.version_id"
+                 ORDER BY t.relative_path, t.history_segment, t.history_index, t.version_id"
             ),
             Self::FileHandle => format!(
                 "SELECT {t_columns} FROM {temp} t \
@@ -312,7 +317,7 @@ impl JoinStrategy {
                  ) f ON t.file_handle = f.file_handle \
                    AND t.relative_path = f.relative_path \
                  WHERE {kind_filter} AND f.is_dir = 0 \
-                 ORDER BY t.relative_path, t.version_id"
+                 ORDER BY t.relative_path, t.history_segment, t.history_index, t.version_id"
             ),
         }
     }
@@ -341,9 +346,17 @@ impl JoinStrategy {
     }
 }
 
-/// 将 `StorageEntryRecord` 列表转换为 `EntryEnum` 迭代器
-fn records_to_entry_iter(records: Vec<StorageEntryRecord>) -> Box<dyn Iterator<Item = EntryEnum> + Send> {
-    Box::new(records.into_iter().map(|r| r.to_entry_enum()))
+/// 将 `StorageEntryRecord` 列表转换为 `ObservedEntry` 迭代器
+fn records_to_entry_iter(records: Vec<StorageEntryRecord>) -> Result<Box<dyn Iterator<Item = ObservedEntry> + Send>> {
+    let entries = records
+        .into_iter()
+        .map(|row| row.to_observation())
+        .collect::<Result<Vec<_>>>()?;
+    Ok(Box::new(entries.into_iter()))
+}
+
+fn observation_views(entry: &Arc<ObservedEntry>) -> ObservedViews<'_> {
+    ObservedView::all(entry)
 }
 
 impl ClickHouseDatabase {
@@ -924,19 +937,24 @@ impl ClickHouseDatabase {
     }
 
     /// 通用批量插入方法，支持同步和异步客户端模式
-    async fn batch_insert(&self, table_name: &str, records: &[Arc<EntryEnum>], use_async_client: bool) -> Result<()> {
-        if records.is_empty() {
-            debug!("No records to insert into table {}", table_name);
+    async fn batch_insert<'a>(
+        &self, table_name: &str, records: &'a [Arc<ObservedEntry>], use_async_client: bool,
+    ) -> Result<()> {
+        self.insert_views(
+            table_name,
+            Box::new(records.iter().flat_map(observation_views)),
+            use_async_client,
+        )
+        .await
+    }
+
+    async fn insert_views<'a>(
+        &self, table_name: &str, views: Box<dyn Iterator<Item = ObservedView<'a>> + Send + 'a>, use_async_client: bool,
+    ) -> Result<()> {
+        let mut views = views.peekable();
+        if views.peek().is_none() {
             return Ok(());
         }
-
-        info!(
-            "Inserting {} records to table {} in {} mode",
-            records.len(),
-            table_name,
-            if use_async_client { "async" } else { "sync" }
-        );
-
         let current_state = self.get_cached_scan_state().await?;
         let _write = self.catalogue_write_guard().await;
         debug!(
@@ -944,24 +962,24 @@ impl ClickHouseDatabase {
             table_name, current_state
         );
 
-        let record_count = records.len();
+        let mut record_count = 0;
 
         let client = if use_async_client {
             &self.async_client
         } else {
             &self.sync_client
         };
-        let client = self.catalogue_write_client(client);
+        let client = self.catalogue_write_client(client).with_validation(false);
 
         let mut insert = client
-            .insert::<StorageEntryRecord>(table_name)
+            .insert::<NativeScanRecord>(table_name)
             .await
             .map_err(DatabaseError::from)?;
 
-        for entry in records {
-            let record = StorageEntryRecord::from_entry_enum(entry.as_ref(), current_state);
-            trace!("Inserting record: {:?} in table {}", record, table_name);
+        for view in views {
+            let record = NativeScanRecord::capture(view, current_state)?;
             insert.write(&record).await.map_err(DatabaseError::from)?;
+            record_count += 1;
         }
 
         insert.end().await.map_err(DatabaseError::from)?;
@@ -1027,10 +1045,12 @@ impl Database for ClickHouseDatabase {
 
         let table_name = get_incremental_scan_base_table_name(&self.job_id);
 
-        let records: Vec<IncrementalStorageEntryRecord> = messages
+        let records = messages
             .iter()
-            .map(IncrementalStorageEntryRecord::from_message)
-            .collect();
+            .try_fold(Vec::new(), |mut records, message| -> Result<_> {
+                records.extend(IncrementalStorageEntryRecord::from_message(message)?);
+                Ok(records)
+            })?;
 
         let record_count = records.len();
 
@@ -1106,7 +1126,7 @@ impl Database for ClickHouseDatabase {
     }
 
     /// 批量插入记录到临时表（async client）
-    async fn batch_insert_temp_record(&self, records: &[Arc<EntryEnum>]) -> Result<()> {
+    async fn batch_insert_temp_record(&self, records: &[Arc<ObservedEntry>]) -> Result<()> {
         let temp_table_name = self
             .scan_temp_table_name
             .as_deref()
@@ -1117,13 +1137,19 @@ impl Database for ClickHouseDatabase {
     }
 
     /// 批量插入记录到主表（async client）
-    async fn batch_insert_base_record(&self, records: &[Arc<EntryEnum>]) -> Result<()> {
+    async fn batch_insert_base_record(&self, records: &[Arc<ObservedEntry>]) -> Result<()> {
         let base_table_name = get_scan_base_table_name(&self.job_id);
         self.batch_insert(&base_table_name, records, true).await
     }
 
+    async fn batch_insert_completed_records(&self, records: &[ObservedItem]) -> Result<()> {
+        let table = get_scan_base_table_name(&self.job_id);
+        self.insert_views(&table, Box::new(records.iter().map(ObservedItem::view)), true)
+            .await
+    }
+
     /// 更新主表中的单条记录（利用 `ReplacingMergeTree` 插入覆盖）
-    async fn update_base_record(&self, record: &Arc<EntryEnum>) -> Result<()> {
+    async fn update_base_record(&self, record: &Arc<ObservedEntry>) -> Result<()> {
         let base_table_name = get_scan_base_table_name(&self.job_id);
         self.batch_insert(&base_table_name, &[Arc::clone(record)], false).await
     }
@@ -1201,7 +1227,10 @@ impl Database for ClickHouseDatabase {
             // 增量扫描：全量插入（无额外开销）
             let insert_sql = format!(
                 "INSERT INTO {} ({}) SELECT {} FROM {}",
-                base_table_name, *FILE_SCAN_COLUMNS_LIST, *FILE_SCAN_COLUMNS_LIST, temp_table_name
+                base_table_name,
+                crate::scan::rows::OBSERVED_COLUMNS,
+                crate::scan::rows::OBSERVED_COLUMNS,
+                temp_table_name
             );
             self.execute(&insert_sql, &[]).await?;
         } else {
@@ -1220,7 +1249,11 @@ impl Database for ClickHouseDatabase {
                 "INSERT INTO {} ({}) SELECT {} FROM {} \
                  WHERE (relative_path, version_id) NOT IN \
                  (SELECT relative_path, version_id FROM {})",
-                base_table_name, *FILE_SCAN_COLUMNS_LIST, *FILE_SCAN_COLUMNS_LIST, temp_table_name, exclude_query_table
+                base_table_name,
+                crate::scan::rows::OBSERVED_COLUMNS,
+                crate::scan::rows::OBSERVED_COLUMNS,
+                temp_table_name,
+                exclude_query_table
             );
             self.execute(&insert_sql, &[]).await?;
 
@@ -1238,9 +1271,9 @@ impl Database for ClickHouseDatabase {
     }
 
     /// 检测临时表中新增的文件（不存在于主表）
-    async fn detect_new_items(&self) -> Result<Box<dyn Iterator<Item = EntryEnum> + Send>> {
+    async fn detect_new_items(&self) -> Result<Box<dyn Iterator<Item = ObservedEntry> + Send>> {
         if self.is_copy_recovery().await {
-            return Ok(records_to_entry_iter(self.copy_replay_items().await?));
+            return records_to_entry_iter(self.copy_replay_items().await?);
         }
         let records = self
             .detect_items("new", |temp_table, base_table, strategy| {
@@ -1249,10 +1282,10 @@ impl Database for ClickHouseDatabase {
             })
             .await?;
 
-        Ok(records_to_entry_iter(records))
+        records_to_entry_iter(records)
     }
 
-    async fn detect_changed_items(&self) -> Result<Box<dyn Iterator<Item = (EntryEnum, ChangeKind)> + Send>> {
+    async fn detect_changed_items(&self) -> Result<Box<dyn Iterator<Item = (ObservedEntry, ChangeKind)> + Send>> {
         if self.is_copy_recovery().await {
             return Ok(Box::new(std::iter::empty()));
         }
@@ -1271,14 +1304,18 @@ impl Database for ClickHouseDatabase {
 
         let iter = data_only
             .into_iter()
-            .map(|r| (r.to_entry_enum(), ChangeKind::DataOnly))
+            .map(|r| r.to_observation().map(|entry| (entry, ChangeKind::DataOnly)))
             .chain(
                 metadata_only
                     .into_iter()
-                    .map(|r| (r.to_entry_enum(), ChangeKind::MetadataOnly)),
+                    .map(|r| r.to_observation().map(|entry| (entry, ChangeKind::MetadataOnly))),
             )
-            .chain(both.into_iter().map(|r| (r.to_entry_enum(), ChangeKind::Both)));
-        Ok(Box::new(iter))
+            .chain(
+                both.into_iter()
+                    .map(|r| r.to_observation().map(|entry| (entry, ChangeKind::Both))),
+            );
+        let entries = iter.collect::<Result<Vec<_>>>()?;
+        Ok(Box::new(entries.into_iter()))
     }
 
     /// 检测已删除或重命名的文件（old-state 记录 + `file_handle` 分组判定）
@@ -1350,7 +1387,7 @@ impl Database for ClickHouseDatabase {
         }
 
         // 第四步：使用纯函数分类
-        let deletion_statuses = classify_deletion_status(no_fh_records, fh_records, &fh_groups);
+        let deletion_statuses = classify_deletion_status(no_fh_records, fh_records, &fh_groups)?;
 
         debug!("Found {} deleted or renamed entries", deletion_statuses.len());
 
@@ -1368,7 +1405,8 @@ impl Database for ClickHouseDatabase {
     }
 
     async fn query_storage_entry(
-        &self, is_dir: Option<bool>, is_symlink: Option<bool>, extension: Option<String>, tx: mpsc::Sender<EntryEnum>,
+        &self, is_dir: Option<bool>, is_symlink: Option<bool>, extension: Option<String>,
+        tx: mpsc::Sender<ObservedEntry>,
     ) -> Result<()> {
         let base_table_name = get_scan_base_table_name(&self.job_id);
         debug!("[query_storage_entry] base table name: {}", base_table_name);
@@ -1445,9 +1483,10 @@ impl Database for ClickHouseDatabase {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use std::path::PathBuf;
-    use storage_adapter::{NASEntry, S3Entry};
+    use storage_adapter::ObservedEntryExt;
 
     use super::*;
     use crate::common::DeletionStatus;
@@ -1455,28 +1494,38 @@ mod tests {
 
     /// 构造 StorageEntryRecord，只需指定关键差异字段
     fn make_record(relative_path: &str, file_handle: Option<&str>, ctime: i64) -> StorageEntryRecord {
-        StorageEntryRecord {
-            name: relative_path.rsplit('/').next().unwrap_or(relative_path).to_string(),
-            relative_path: relative_path.to_string(),
-            size: 1024,
-            ext: None,
-            ctime,
-            mtime: ctime,
-            atime: ctime,
-            mode: Some(0o644),
-            storage_type: "nas".to_string(),
-            is_symlink: false,
-            is_dir: false,
-            is_regular_file: true,
-            hard_links: 1,
-            current_state: 0,
-            uid: Some(1000),
-            gid: Some(1000),
-            ino: Some(12345),
-            file_handle: file_handle.map(String::from),
-            version_id: String::new(),
-            tags: None,
-            version_count: None,
+        {
+            let fixture_path: std::path::PathBuf = (relative_path.to_string()).into();
+            let fixture_storage: String = "nas".to_string();
+            let fixture_version: String = String::new();
+            let fixture_handle: Option<String> = file_handle.map(String::from);
+            let fixture_tags: Option<String> = None;
+            let entry = crate::observed_fixtures::observation(
+                if fixture_storage == "s3" {
+                    data_mover::model::BackendKind::S3
+                } else {
+                    data_mover::model::BackendKind::Nfs
+                },
+                fixture_path,
+                data_mover::model::EntryKind::File,
+                1024,
+                [ctime, ctime, ctime],
+                Some(data_mover::model::OwnershipMode {
+                    mode: 0o644,
+                    uid: 1000,
+                    gid: 1000,
+                }),
+                fixture_handle.map(String::into_bytes),
+                fixture_tags.map(|tags| {
+                    serde_json::from_str::<Vec<storage_adapter::Tag>>(&tags)
+                        .unwrap()
+                        .into_iter()
+                        .map(|tag| (tag.key, tag.value))
+                        .collect()
+                }),
+                (!fixture_version.is_empty()).then_some((Some(fixture_version), true, false)),
+            );
+            StorageEntryRecord::capture(&entry, 0).unwrap()
         }
     }
 
@@ -1484,36 +1533,33 @@ mod tests {
 
     #[test]
     fn test_nas_entry_roundtrip() {
-        let nas = EntryEnum::NAS(NASEntry {
-            name: "test.txt".to_string(),
-            relative_path: PathBuf::from("dir/test.txt"),
-            extension: Some("txt".to_string()),
-            is_dir: false,
-            size: 2048,
-            atime: 100,
-            ctime: 200,
-            mtime: 300,
-            mode: Some(0o755),
-            is_symlink: false,
-            hard_links: Some(2),
-            uid: Some(1000),
-            gid: Some(1000),
-            ino: Some(54321),
-            file_handle: Some(bytes::Bytes::from_static(&[0xDE, 0xAD])),
-            acl: None,
-            owner: None,
-            owner_group: None,
-            xattrs: None,
-        });
+        let nas = {
+            let fixture_path: std::path::PathBuf = PathBuf::from("dir/test.txt");
+            crate::observed_fixtures::observation(
+                data_mover::model::BackendKind::Nfs,
+                fixture_path,
+                data_mover::model::EntryKind::File,
+                2048,
+                [200, 300, 100],
+                Some(data_mover::model::OwnershipMode {
+                    mode: 0o755,
+                    uid: 1000,
+                    gid: 1000,
+                }),
+                (Some(bytes::Bytes::from_static(&[0xDE, 0xAD]))).map(|handle| handle.to_vec()),
+                None,
+                None,
+            )
+        };
 
-        let record = StorageEntryRecord::from_entry_enum(&nas, 1);
+        let record = StorageEntryRecord::capture(&nas, 1).unwrap();
         assert_eq!(record.storage_type, "nas");
-        assert_eq!(record.file_handle, Some("dead".to_string()));
+        assert_eq!(record.file_handle, nas.get_file_handle().map(hex::encode));
         assert_eq!(record.version_id, "");
         assert_eq!(record.current_state, 1);
         assert_eq!(record.size, 2048);
 
-        let back = record.to_entry_enum();
+        let back = record.to_observation().unwrap();
         assert_eq!(back.get_name(), "test.txt");
         assert_eq!(back.get_size(), 2048);
         assert_eq!(back.get_mtime(), 300);
@@ -1521,90 +1567,82 @@ mod tests {
 
     #[test]
     fn test_s3_entry_roundtrip() {
-        let s3 = EntryEnum::S3(S3Entry {
-            name: "obj.json".to_string(),
-            relative_path: "bucket/obj.json".to_string(),
-            extension: Some("json".to_string()),
-            size: 512,
-            mtime: 400,
-            tags: None,
-            version_id: Some("v1".to_string()),
-            is_latest: true,
-            is_delete_marker: false,
-            version_count: Some(3),
-            is_dir: false,
-        });
+        let s3 = {
+            let fixture_path: std::path::PathBuf = ("bucket/obj.json".to_string()).into();
+            crate::observed_fixtures::observation(
+                data_mover::model::BackendKind::S3,
+                fixture_path,
+                data_mover::model::EntryKind::File,
+                512,
+                [0, 400, 0],
+                None,
+                None,
+                None,
+                Some((Some("v1".to_string()), true, false)),
+            )
+        };
 
-        let record = StorageEntryRecord::from_entry_enum(&s3, 0);
+        let record = StorageEntryRecord::capture(&s3, 0).unwrap();
         assert_eq!(record.storage_type, "s3");
         assert_eq!(record.version_id, "v1");
-        assert_eq!(record.version_count, Some(3));
+        assert_eq!(record.version_count, Some(1));
+        assert_eq!(record.to_observation().unwrap(), s3);
 
-        let back = record.to_entry_enum();
+        let back = record.to_observation().unwrap();
         assert_eq!(back.get_version_id(), Some("v1"));
     }
 
     #[test]
     fn test_nas_entry_optional_fields_none() {
-        let nas = EntryEnum::NAS(NASEntry {
-            name: "a.txt".to_string(),
-            relative_path: PathBuf::from("a.txt"),
-            extension: None,
-            is_dir: false,
-            size: 0,
-            atime: 0,
-            ctime: 0,
-            mtime: 0,
-            mode: None,
-            is_symlink: false,
-            hard_links: None,
-            uid: None,
-            gid: None,
-            ino: None,
-            file_handle: None,
-            acl: None,
-            owner: None,
-            owner_group: None,
-            xattrs: None,
-        });
+        let nas = {
+            let fixture_path: std::path::PathBuf = PathBuf::from("a.txt");
+            crate::observed_fixtures::observation(
+                data_mover::model::BackendKind::Nfs,
+                fixture_path,
+                data_mover::model::EntryKind::File,
+                0,
+                [0, 0, 0],
+                None,
+                None,
+                None,
+                None,
+            )
+        };
 
-        let record = StorageEntryRecord::from_entry_enum(&nas, 0);
+        let record = StorageEntryRecord::capture(&nas, 0).unwrap();
         assert_eq!(record.file_handle, None);
         assert_eq!(record.mode, None);
 
-        let back = record.to_entry_enum();
+        let back = record.to_observation().unwrap();
         assert_eq!(back.get_file_handle(), None);
         assert_eq!(back.get_mode(), None);
     }
 
     #[test]
     fn test_current_state_propagation() {
-        let nas = EntryEnum::NAS(NASEntry {
-            name: "a.txt".to_string(),
-            relative_path: PathBuf::from("a.txt"),
-            extension: None,
-            is_dir: false,
-            size: 100,
-            atime: 0,
-            ctime: 0,
-            mtime: 0,
-            mode: Some(0o644),
-            is_symlink: false,
-            hard_links: Some(1),
-            uid: None,
-            gid: None,
-            ino: None,
-            file_handle: None,
-            acl: None,
-            owner: None,
-            owner_group: None,
-            xattrs: None,
-        });
+        let nas = {
+            let fixture_path: std::path::PathBuf = PathBuf::from("a.txt");
+            crate::observed_fixtures::observation(
+                data_mover::model::BackendKind::Nfs,
+                fixture_path,
+                data_mover::model::EntryKind::File,
+                100,
+                [0, 0, 0],
+                Some(data_mover::model::OwnershipMode {
+                    mode: 0o644,
+                    uid: 0u32,
+                    gid: 0u32,
+                }),
+                None,
+                None,
+                None,
+            )
+        };
 
-        let r0 = StorageEntryRecord::from_entry_enum(&nas, 0);
+        let r0 = StorageEntryRecord::capture(&nas, 0).unwrap();
         assert_eq!(r0.current_state, 0);
 
-        let r1 = StorageEntryRecord::from_entry_enum(&nas, 1);
+        let r1 = StorageEntryRecord::capture(&nas, 1).unwrap();
         assert_eq!(r1.current_state, 1);
     }
 
@@ -1614,9 +1652,12 @@ mod tests {
     fn test_classify_single_fh_is_deleted() {
         let fh_records = vec![make_record("a.txt", Some("abc"), 100)];
         let mut groups = HashMap::new();
-        groups.insert("abc".to_string(), vec![make_record("a.txt", Some("abc"), 100)]);
+        groups.insert(
+            make_record("_", Some("abc"), 0).file_handle.unwrap(),
+            vec![make_record("a.txt", Some("abc"), 100)],
+        );
 
-        let result = classify_deletion_status(vec![], fh_records, &groups);
+        let result = classify_deletion_status(vec![], fh_records, &groups).unwrap();
         assert_eq!(result.len(), 1);
         assert!(matches!(result[0], DeletionStatus::Deleted(_)));
     }
@@ -1626,14 +1667,14 @@ mod tests {
         let fh_records = vec![make_record("old.txt", Some("abc"), 100)];
         let mut groups = HashMap::new();
         groups.insert(
-            "abc".to_string(),
+            make_record("_", Some("abc"), 0).file_handle.unwrap(),
             vec![
                 make_record("old.txt", Some("abc"), 100),
                 make_record("new.txt", Some("abc"), 200),
             ],
         );
 
-        let result = classify_deletion_status(vec![], fh_records, &groups);
+        let result = classify_deletion_status(vec![], fh_records, &groups).unwrap();
         assert_eq!(result.len(), 1);
         match &result[0] {
             DeletionStatus::Renamed(from, to) => {
@@ -1649,14 +1690,14 @@ mod tests {
         let fh_records = vec![make_record("old.txt", Some("abc"), 200)];
         let mut groups = HashMap::new();
         groups.insert(
-            "abc".to_string(),
+            make_record("_", Some("abc"), 0).file_handle.unwrap(),
             vec![
                 make_record("new.txt", Some("abc"), 200),
                 make_record("old.txt", Some("abc"), 100),
             ],
         );
 
-        let result = classify_deletion_status(vec![], fh_records, &groups);
+        let result = classify_deletion_status(vec![], fh_records, &groups).unwrap();
         assert_eq!(result.len(), 1);
         match &result[0] {
             DeletionStatus::Renamed(from, to) => {
@@ -1673,7 +1714,7 @@ mod tests {
         let fh_records = vec![make_record("x.txt", Some("xyz"), 100)];
         let groups = HashMap::new(); // 空 groups
 
-        let result = classify_deletion_status(vec![], fh_records, &groups);
+        let result = classify_deletion_status(vec![], fh_records, &groups).unwrap();
         assert_eq!(result.len(), 1);
         assert!(matches!(result[0], DeletionStatus::Deleted(_)));
     }
@@ -1688,10 +1729,13 @@ mod tests {
         ];
         let mut groups = HashMap::new();
         // fh_a: 1 条 → Deleted
-        groups.insert("fh_a".to_string(), vec![make_record("c.txt", Some("fh_a"), 100)]);
+        groups.insert(
+            make_record("_", Some("fh_a"), 0).file_handle.unwrap(),
+            vec![make_record("c.txt", Some("fh_a"), 100)],
+        );
         // fh_b: 2 条 → Renamed
         groups.insert(
-            "fh_b".to_string(),
+            make_record("_", Some("fh_b"), 0).file_handle.unwrap(),
             vec![
                 make_record("d.txt", Some("fh_b"), 100),
                 make_record("d_new.txt", Some("fh_b"), 200),
@@ -1699,7 +1743,7 @@ mod tests {
         );
         // fh_c: 3 条 → 跳过 (error log)
         groups.insert(
-            "fh_c".to_string(),
+            make_record("_", Some("fh_c"), 0).file_handle.unwrap(),
             vec![
                 make_record("e1.txt", Some("fh_c"), 100),
                 make_record("e2.txt", Some("fh_c"), 200),
@@ -1707,7 +1751,7 @@ mod tests {
             ],
         );
 
-        let result = classify_deletion_status(no_fh, fh_records, &groups);
+        let result = classify_deletion_status(no_fh, fh_records, &groups).unwrap();
         // 2 Deleted (no_fh) + 1 Deleted (fh_a) + 1 Renamed (fh_b) + 0 (fh_c skipped)
         let deleted_count = result
             .iter()

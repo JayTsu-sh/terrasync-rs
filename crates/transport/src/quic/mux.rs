@@ -117,6 +117,7 @@ pub(crate) fn sender_stream_kind(msg: &SenderMsg) -> StreamKind {
         SenderMsg::CopyEntry { .. }
         | SenderMsg::CreateDir { .. }
         | SenderMsg::CreateSymlink { .. }
+        | SenderMsg::WriteDeleteMarker { .. }
         | SenderMsg::FileBegin { .. }
         | SenderMsg::FileData { .. }
         | SenderMsg::EndOfFile { .. }
@@ -142,6 +143,7 @@ pub(crate) fn receiver_stream_kind(msg: &ReceiverMsg) -> StreamKind {
         | ReceiverMsg::DeltaTransferRequest { .. }
         | ReceiverMsg::MetadataUpdateRequest { .. }
         | ReceiverMsg::Classified { .. }
+        | ReceiverMsg::ClassifiedObservation { .. }
         | ReceiverMsg::RequestsDone
         | ReceiverMsg::RemoteDestination(
             RemoteDestinationEvent::TransferRequested { .. } | RemoteDestinationEvent::PayloadRequested { .. },

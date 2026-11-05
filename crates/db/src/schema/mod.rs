@@ -9,3 +9,5 @@ pub(crate) fn identifier(value: &str) -> Result<String> {
     }
     Ok(format!("`{value}`"))
 }
+
+pub(crate) mod entry;

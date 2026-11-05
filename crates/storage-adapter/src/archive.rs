@@ -8,17 +8,13 @@ use std::{
 };
 impl StorageEnum {
     pub async fn pack_files_to_tar(
-        source: &Self, destination: &Self, entries: &[Arc<EntryEnum>], final_path: &Path, _mtime: i64,
+        source: &Self, destination: &Self, entries: &[Arc<ObservedEntry>], final_path: &Path, _mtime: i64,
         options: TarPackOptions,
     ) -> Result<u64> {
-        let mut observations = Vec::with_capacity(entries.len());
-        for entry in entries {
-            observations.push(source.observe(entry.get_relative_path()).await?);
-        }
         let request = TarRequest {
             source: source.roles.clone(),
             destination: destination.roles.clone(),
-            entries: observations,
+            entries: entries.to_vec(),
             final_path: path(final_path)?,
             cancel: Default::default(),
             source_qos: options

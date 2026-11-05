@@ -10,12 +10,13 @@ use data_mover::model::FailureClass;
 use std::path::{Component, Path};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use storage_adapter::ObservedEntryExt;
 use storage_adapter::TransferMode;
 use storage_adapter::{StorageEntryMessage, StorageError};
 
 // 外部 crate
 use storage_adapter::qos::QosManager;
-use storage_adapter::{EntryEnum, StorageEnum};
+use storage_adapter::{ObservedEntry, StorageEnum};
 use tokio::sync::mpsc::Receiver as MpscReceiver;
 use tokio_util::sync::CancellationToken;
 use tracing::{Instrument, debug, error, info, info_span, trace, warn};
@@ -189,7 +190,7 @@ pub async fn receiver_task(
 /// 根据 entry 类型（目录/符号链接/文件）dispatch 到不同的存储操作。
 /// 单进程模式下 Receiver 拥有 src+dest storage，可以直接调用 `copy_file`。
 pub(crate) async fn process_entry_on_receiver(
-    entry: &EntryEnum, src_storage: &Arc<StorageEnum>, dest_storage: &Arc<StorageEnum>, config: &ReceiverConfig,
+    entry: &ObservedEntry, src_storage: &Arc<StorageEnum>, dest_storage: &Arc<StorageEnum>, config: &ReceiverConfig,
     qos_manager: Option<QosManager>, bytes_counter: Option<Arc<AtomicU64>>,
 ) -> Result<()> {
     let relative_path = entry.get_relative_path();
@@ -573,6 +574,7 @@ pub(crate) async fn recv_file_list_and_data_phase(
     // disk-commit task：全量/delta 文件均三段流式落盘（去整文件 BytesMut/token Vec）；ack
     // 经 unbounded channel 回流，避免路由 select 阻在 dc_tx.send 时不 drain ack → dc 阻在
     // ack_tx.send 的双向死锁。
+    let keeps_history = dest_storage.is_bucket_versioned().await?;
     let (dc_tx, dc_rx) = tokio::sync::mpsc::channel::<DiskCommitMsg>(16);
     let (ack_tx, mut ack_rx) = tokio::sync::mpsc::unbounded_channel::<DcAck>();
     let disk_cancel = CancellationToken::new();
@@ -629,7 +631,18 @@ pub(crate) async fn recv_file_list_and_data_phase(
                 // 附带 decision 供 Sender 侧统计正确分类）或 Classified（MetadataOnly/Skip，
                 // Receiver 本地执行/判定，此前零 wire 流量，见 issue #23）
                 for nf in &page.files {
-                    let decision = dest_index.check(&nf.entry);
+                    if let Some(version) = nf.entry.view().version() {
+                        dest_index.mark_matched(&nf.entry.entry);
+                        if !keeps_history && (!version.is_latest() || version.is_delete_marker()) { continue; }
+                        if !keeps_history && dest_storage.has_real_directory_objects() && nf.entry.get_is_dir() {
+                            dest_storage.create_dir_all(&nf.entry.entry).await?;
+                            progress.dirs_created.fetch_add(1, Ordering::Relaxed);
+                            transport.send(ReceiverMsg::ClassifiedObservation { ndx: nf.ndx, decision: TransferDecision::FullTransfer }).await?;
+                            transport.send(ReceiverMsg::Success { ndx: nf.ndx }).await?;
+                            continue;
+                        }
+                    }
+                    let decision = if nf.entry.view().version().is_some() { TransferDecision::FullTransfer } else { dest_index.check(&nf.entry.entry) };
                     if state
                         .handle_base_classification(transport, dest_storage, progress, nf.ndx, &nf.entry, decision)
                         .await
@@ -676,8 +689,14 @@ pub(crate) async fn recv_file_list_and_data_phase(
             }
 
             // ── 文件开始：标记走全量流式路径，交 disk-commit task 起 resume_prepare + write_chunk_stream ──
-            Some(SenderMsg::FileBegin { ndx, entry }) => {
-                state.begin_full(&dc_tx, ndx, entry).await;
+            Some(SenderMsg::WriteDeleteMarker { ndx }) => {
+                if let Some(entry) = state.indexed_entry(ndx).cloned() {
+                    dc_tx.send(DiskCommitMsg::WriteDeleteMarker { ndx, entry }).await
+                        .map_err(|_| AppError::CopyError("Disk commit task closed before delete marker".into()))?;
+                }
+            }
+            Some(SenderMsg::FileBegin { ndx }) => {
+                if let Some(entry) = state.indexed_entry(ndx).cloned() { state.begin_full(&dc_tx, ndx, entry).await; }
             }
 
             // ── 数据流模式：目录 ──
@@ -729,8 +748,8 @@ pub(crate) async fn recv_file_list_and_data_phase(
             }
 
             // ── 数据流模式：文件数据块 → 转发给 disk-commit task 的 write_chunk_stream ──
-            Some(SenderMsg::FileData { entry, chunk }) => {
-                if let Err(error) = state.accept_full_chunk(transport, &dc_tx, entry, chunk).await {
+            Some(SenderMsg::FileData { ndx, chunk }) => {
+                if let Err(error) = state.accept_full_chunk(transport, &dc_tx, ndx, chunk).await {
                     receive_failure = Some(error);
                     break;
                 }
@@ -740,14 +759,14 @@ pub(crate) async fn recv_file_list_and_data_phase(
             //    issue #54 阶段 3），首个属于该 ndx 的 token 先触发一次 DeltaBegin ──
             Some(SenderMsg::DeltaMatch { ndx, block_index }) => {
                 if let Some(entry) = state.indexed_entry(ndx).cloned() {
-                    state.push_delta_match(&dc_tx, ndx, &entry, block_index).await;
+                    state.push_delta_match(&dc_tx, ndx, &entry.entry, block_index).await;
                 } else {
                     warn!("[Receiver Remote] DeltaMatch for unknown ndx {}", ndx);
                 }
             }
             Some(SenderMsg::DeltaData { ndx, data }) => {
                 if let Some(entry) = state.indexed_entry(ndx).cloned() {
-                    if let Err(error) = state.accept_delta_data(transport, &dc_tx, ndx, &entry, data).await {
+                    if let Err(error) = state.accept_delta_data(transport, &dc_tx, ndx, &entry.entry, data).await {
                         receive_failure = Some(error);
                         break;
                     }
@@ -760,9 +779,11 @@ pub(crate) async fn recv_file_list_and_data_phase(
             //    rename）；否则是 delta 路径（含零 token 的空文件 delta，session state
             //    幂等补发 DeltaBegin），同样交 disk-commit task 三段式收尾。完成计数统一
             //    在 dc ack 回流时才 +1（session outcome policy 做 redo 决策，全量/delta 共用一份状态机）──
-            Some(SenderMsg::EndOfFile { ndx, entry, source_hash }) => {
-                if !state.commit_full(&dc_tx, ndx, &entry, &source_hash).await {
-                    state.commit_delta(&dc_tx, ndx, &entry, &source_hash).await;
+            Some(SenderMsg::EndOfFile { ndx, source_hash }) => {
+                if let Some(entry) = state.indexed_entry(ndx).cloned() {
+                    if !state.commit_full(&dc_tx, ndx, &entry.entry, &source_hash).await {
+                        state.commit_delta(&dc_tx, ndx, &entry.entry, &source_hash).await;
+                    }
                 }
             }
 

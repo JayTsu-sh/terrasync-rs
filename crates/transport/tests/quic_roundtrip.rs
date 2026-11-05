@@ -7,14 +7,17 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 #![allow(clippy::pedantic)]
 
+#[path = "../../../tests/support/observed.rs"]
+mod observed_fixtures;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
+use storage_adapter::ObservedEntryExt;
 use storage_adapter::TransferMode;
 
 use bytes::Bytes;
-use storage_adapter::{DataChunk, EntryEnum, NASEntry};
+use storage_adapter::{DataChunk, ObservedEntry};
 use tokio::sync::oneshot;
 use transport::message::{
     AdvertisedObservation, AdvertisementEvent, AdvertisementTerminal, FeatureFlags, HandshakeResult, HashAlgorithm,
@@ -838,28 +841,25 @@ fn incompressible_bytes(len: usize, seed: u64) -> Bytes {
 }
 
 /// 构造一个仅用于测试的最小 `NASEntry`（字段值无实际语义，只满足 `FileData` 的类型要求）
-fn dummy_file_entry(name: &str) -> Arc<EntryEnum> {
-    Arc::new(EntryEnum::NAS(NASEntry {
-        name: name.to_string(),
-        relative_path: PathBuf::from(name),
-        extension: None,
-        is_dir: false,
-        size: 0,
-        atime: 0,
-        ctime: 0,
-        mtime: 0,
-        mode: Some(0o644),
-        is_symlink: false,
-        hard_links: None,
-        uid: None,
-        gid: None,
-        ino: None,
-        file_handle: None,
-        acl: None,
-        owner: None,
-        owner_group: None,
-        xattrs: None,
-    }))
+fn dummy_file_entry(name: &str) -> Arc<ObservedEntry> {
+    Arc::new({
+        let fixture_path: std::path::PathBuf = PathBuf::from(name);
+        crate::observed_fixtures::observation(
+            data_mover::model::BackendKind::Nfs,
+            fixture_path,
+            data_mover::model::EntryKind::File,
+            0,
+            [0, 0, 0],
+            Some(data_mover::model::OwnershipMode {
+                mode: 0o644,
+                uid: 0u32,
+                gid: 0u32,
+            }),
+            None,
+            None,
+            None,
+        )
+    })
 }
 
 /// #23 协议扩展序列化往返：`ReceiverMsg::TransferRequest{ndx, decision}` 与新增的
@@ -1017,7 +1017,7 @@ async fn test_quic_mux_large_data_stream_does_not_block_ack_progress_stream() {
     // ~1.19MiB 的 per-stream 接收窗口，足量触发阻塞。数据必须是不可压缩的随机字节——
     // `framing::write_msg` 对 >=1KiB 的 payload 会尝试 zstd 压缩，全 0 数据会被压缩到
     // 几乎为 0 字节，实际上不了线，永远填不满接收窗口。
-    let entry = dummy_file_entry("big.bin");
+    let _entry = dummy_file_entry("big.bin");
     let flood_sender = sender.clone();
     let flood_handle = tokio::spawn(async move {
         for i in 0..64u64 {
@@ -1025,14 +1025,7 @@ async fn test_quic_mux_large_data_stream_does_not_block_ack_progress_stream() {
                 offset: i * 128 * 1024,
                 data: incompressible_bytes(128 * 1024, i),
             };
-            if flood_sender
-                .send(SenderMsg::FileData {
-                    entry: entry.clone(),
-                    chunk,
-                })
-                .await
-                .is_err()
-            {
+            if flood_sender.send(SenderMsg::FileData { ndx: 0, chunk }).await.is_err() {
                 break;
             }
         }
@@ -1101,4 +1094,77 @@ async fn test_quic_sender_recv_returns_none_after_connection_dropped() {
         "连接被 Receiver 侧关闭后应返回 None，实际: {:?}",
         reply
     );
+}
+
+#[test]
+fn selected_observation_wire_keeps_one_version_and_shares_the_original_history() {
+    use data_mover::model::{
+        BackendIdentity, BackendKind, EntryKind, HistoryOrder, IdentityStrength, ObjectHistory, RecordKind,
+        SourceIdentity, StoragePath, VersionRecord,
+    };
+    use storage_adapter::dir_tree::NdxEntry;
+    use storage_adapter::observed_scan::ObservedItem;
+
+    let backend = BackendIdentity::new(BackendKind::S3, "wire-selection").unwrap();
+    let versions = (0..1000)
+        .map(|index| {
+            let id = format!("v{index}");
+            let identity =
+                SourceIdentity::new(backend.clone(), IdentityStrength::VersionScoped, id.as_bytes()).unwrap();
+            VersionRecord::from_listing(
+                id,
+                index == 999,
+                RecordKind::Object {
+                    size: index,
+                    etag: "tag".into(),
+                    modified: None,
+                },
+                identity,
+            )
+            .unwrap()
+        })
+        .collect();
+    let original = Arc::new(
+        ObservedEntry::new(
+            StoragePath::new("file").unwrap(),
+            EntryKind::File,
+            Some(999),
+            None,
+            SourceIdentity::new(backend.clone(), IdentityStrength::PathScoped, b"file").unwrap(),
+        )
+        .unwrap()
+        .with_history(Some(Box::new(
+            ObjectHistory::whole(versions, HistoryOrder::Server).unwrap(),
+        )))
+        .unwrap(),
+    );
+    let item = ObservedItem {
+        entry: Arc::clone(&original),
+        version_index: Some(17),
+    };
+    let encoded = bincode::serde::encode_to_vec(
+        NdxEntry {
+            ndx: 7,
+            entry: item.clone(),
+        },
+        bincode::config::standard(),
+    )
+    .unwrap();
+    assert!(
+        encoded.len() < 1024,
+        "one selected version must not carry the other 999 records"
+    );
+    let (decoded, used): (NdxEntry, _) =
+        bincode::serde::decode_from_slice(&encoded, bincode::config::standard()).unwrap();
+    assert_eq!(used, encoded.len());
+    assert_eq!(decoded.ndx, 7);
+    assert_eq!(decoded.entry.view().version_id(), "v17");
+    assert_eq!(decoded.entry.get_size(), 17);
+    assert_eq!(decoded.entry.entry.history().unwrap().records().len(), 1);
+    assert_eq!(
+        decoded.entry.entry.source_identity(),
+        original.history().unwrap().records()[17].identity()
+    );
+    assert!(Arc::ptr_eq(&item.entry, &original));
+    assert_eq!(original.history().unwrap().records().len(), 1000);
 }

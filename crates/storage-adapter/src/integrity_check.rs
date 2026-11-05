@@ -1,7 +1,8 @@
+use crate::ObservedEntryExt;
 use crate::connected::path;
 use crate::error::operation;
-use crate::projection::nanos;
-use crate::{EntryEnum, Result, StorageEnum, StorageError};
+use crate::observed_scan::timestamp_nanos as nanos;
+use crate::{ObservedEntry, Result, StorageEnum, StorageError};
 use data_mover::integrity::MtimePrecision as NativeMtimePrecision;
 use data_mover::integrity::{
     self, IntegrityDifference, IntegrityMode, IntegrityOptions, IntegrityPlan, IntegrityRequest,
@@ -117,7 +118,7 @@ pub struct IntegrityCheck;
 
 impl IntegrityCheck {
     pub async fn check_with_source_entry_and_options(
-        src: &StorageEnum, dest: &StorageEnum, entry: &EntryEnum, options: IntegrityCheckOptions,
+        src: &StorageEnum, dest: &StorageEnum, entry: &ObservedEntry, options: IntegrityCheckOptions,
         cancel: Option<&CancellationToken>,
     ) -> Result<()> {
         let p = path(entry.get_relative_path())?;

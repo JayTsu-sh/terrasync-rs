@@ -93,7 +93,7 @@ impl DirectoryWalker {
 
 /// 从文件列表创建 `WalkDirAsyncIterator`
 ///
-/// 该函数从文件列表中读取文件路径，然后为每个文件创建 `EntryEnum`，
+/// 该函数从文件列表中读取文件路径，然后为每个文件创建 `ObservedEntry`，
 /// 并通过 `WalkDirAsyncIterator` 返回。
 ///
 /// # 参数
@@ -144,7 +144,7 @@ fn walkdir_from_file_list(storage: StorageEnum, file_list_path: &str) -> Result<
             for relative_path in file_paths_iter {
                 match relative_path {
                     Ok(file_path) => {
-                        // 尝试获取文件的EntryEnum
+                        // 尝试获取文件的ObservedEntry
                         match storage.get_metadata(&file_path).await {
                             Ok(metadata) => {
                                 // 发送Scanned消息到通道

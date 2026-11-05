@@ -29,7 +29,7 @@ use storage_adapter::StorageEnum;
 use storage_adapter::dir_tree::NdxEvent;
 use storage_adapter::filter::parse_filter_expression;
 #[cfg(test)]
-use storage_adapter::{ChangeKind, EntryEnum, ErrorEvent, StorageEntryMessage};
+use storage_adapter::{ChangeKind, ErrorEvent, ObservedEntry, StorageEntryMessage};
 use tokio::sync::Mutex as AsyncMutex;
 use tracing::{info, warn};
 use transport::error::TransportError;
@@ -252,6 +252,7 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
     use std::time::{Duration, SystemTime};
+    use storage_adapter::ObservedEntryExt;
 
     use crate::storage_factory::{StorageRole, create_storage_for_role};
     use async_trait::async_trait;
@@ -573,11 +574,7 @@ mod tests {
     impl SenderTransport for HashMismatchInjector {
         async fn send(&self, msg: SenderMsg) -> TransportResult<()> {
             let msg = match msg {
-                SenderMsg::EndOfFile {
-                    ndx,
-                    entry,
-                    source_hash,
-                } => {
+                SenderMsg::EndOfFile { ndx, source_hash } => {
                     let mut remaining = self.corrupt_remaining.lock().unwrap_or_else(PoisonError::into_inner);
                     let budget = remaining.entry(ndx).or_insert(0);
                     let source_hash = if *budget > 0 {
@@ -586,11 +583,7 @@ mod tests {
                     } else {
                         source_hash
                     };
-                    SenderMsg::EndOfFile {
-                        ndx,
-                        entry,
-                        source_hash,
-                    }
+                    SenderMsg::EndOfFile { ndx, source_hash }
                 }
                 other => other,
             };
@@ -832,6 +825,7 @@ mod tests {
     struct SizeTruncationInjector {
         inner: InProcessSenderTransport,
         target_path: PathBuf,
+        target_ndx: Mutex<Option<i32>>,
         truncate_remaining: Mutex<u32>,
         /// 本次 attempt 是否已决定截断（`None` = 未决定；首个匹配 chunk 时决定并固定）
         truncating_this_attempt: Mutex<Option<bool>>,
@@ -846,6 +840,7 @@ mod tests {
             Self {
                 inner,
                 target_path,
+                target_ndx: Mutex::new(None),
                 truncate_remaining: Mutex::new(truncate_remaining),
                 truncating_this_attempt: Mutex::new(None),
                 truncated_once: Mutex::new(false),
@@ -876,9 +871,19 @@ mod tests {
     impl SenderTransport for SizeTruncationInjector {
         async fn send(&self, msg: SenderMsg) -> TransportResult<()> {
             match msg {
-                SenderMsg::FileData { entry, chunk } if entry.get_relative_path() == self.target_path.as_path() => {
+                SenderMsg::FilePage(page) => {
+                    for file in &page.files {
+                        if file.entry.get_relative_path() == self.target_path.as_path() {
+                            *self.target_ndx.lock().unwrap_or_else(PoisonError::into_inner) = Some(file.ndx);
+                        }
+                    }
+                    self.inner.send(SenderMsg::FilePage(page)).await
+                }
+                SenderMsg::FileData { ndx, chunk }
+                    if *self.target_ndx.lock().unwrap_or_else(PoisonError::into_inner) == Some(ndx) =>
+                {
                     if !self.is_truncating_this_attempt() {
-                        return self.inner.send(SenderMsg::FileData { entry, chunk }).await;
+                        return self.inner.send(SenderMsg::FileData { ndx, chunk }).await;
                     }
                     let already_truncated = {
                         let mut truncated_once = self.truncated_once.lock().unwrap_or_else(PoisonError::into_inner);
@@ -896,7 +901,7 @@ mod tests {
                         .extend_from_slice(&truncated_data);
                     self.inner
                         .send(SenderMsg::FileData {
-                            entry,
+                            ndx,
                             chunk: DataChunk {
                                 offset: chunk.offset,
                                 data: truncated_data,
@@ -904,11 +909,9 @@ mod tests {
                         })
                         .await
                 }
-                SenderMsg::EndOfFile {
-                    ndx,
-                    entry,
-                    source_hash,
-                } if entry.get_relative_path() == self.target_path.as_path() => {
+                SenderMsg::EndOfFile { ndx, source_hash }
+                    if *self.target_ndx.lock().unwrap_or_else(PoisonError::into_inner) == Some(ndx) =>
+                {
                     let was_truncating = self
                         .truncating_this_attempt
                         .lock()
@@ -923,13 +926,7 @@ mod tests {
                     } else {
                         source_hash
                     };
-                    self.inner
-                        .send(SenderMsg::EndOfFile {
-                            ndx,
-                            entry,
-                            source_hash,
-                        })
-                        .await
+                    self.inner.send(SenderMsg::EndOfFile { ndx, source_hash }).await
                 }
                 other => self.inner.send(other).await,
             }
@@ -1768,10 +1765,10 @@ mod tests {
         sender_transport.send(SenderMsg::FilePage(page)).await.unwrap();
 
         match recv_skip_progress(&sender_transport).await {
-            Some(ReceiverMsg::Classified {
-                entry,
+            Some(ReceiverMsg::ClassifiedObservation {
+                ndx,
                 decision: TransferDecision::MetadataOnly,
-            }) => assert_eq!(entry.get_relative_path(), std::path::Path::new("a.txt")),
+            }) => assert_eq!(ndx, _ndx),
             other => panic!("expected Classified{{decision:MetadataOnly}}, got {other:?}"),
         }
 
@@ -1810,10 +1807,10 @@ mod tests {
         sender_transport.send(SenderMsg::FilePage(page)).await.unwrap();
 
         match recv_skip_progress(&sender_transport).await {
-            Some(ReceiverMsg::Classified {
+            Some(ReceiverMsg::ClassifiedObservation {
+                ndx,
                 decision: TransferDecision::Skip,
-                ..
-            }) => {}
+            }) => assert_eq!(ndx, _ndx),
             other => panic!("expected Classified{{decision:Skip}}, got {other:?}"),
         }
 
@@ -1906,8 +1903,14 @@ mod tests {
                 .unwrap(),
         );
         let walkdir_iter = src_storage.walkdir_2(None, None, None, None, 4, false).await.unwrap();
+        let mut expected_ndx = None;
         while let Some(event) = walkdir_iter.next().await {
             if let NdxEvent::Page(page) = event {
+                for file in &page.files {
+                    if file.entry.get_relative_path() == std::path::Path::new("sub/nested.txt") {
+                        expected_ndx = Some(file.ndx);
+                    }
+                }
                 sender_transport.send(SenderMsg::FilePage(page)).await.unwrap();
             }
         }
@@ -1915,10 +1918,10 @@ mod tests {
         // 唯一预期信号：nested.txt 完全一致 → Classified{Skip}。若子目录被误判孤儿，
         // 这里会先收到 Classified{Deleted}（或整树误删后 nested.txt 的 TransferRequest）
         match recv_skip_progress(&sender_transport).await {
-            Some(ReceiverMsg::Classified {
-                entry,
+            Some(ReceiverMsg::ClassifiedObservation {
+                ndx,
                 decision: TransferDecision::Skip,
-            }) => assert_eq!(entry.get_relative_path(), std::path::Path::new("sub/nested.txt")),
+            }) => assert_eq!(Some(ndx), expected_ndx),
             other => panic!("expected Classified{{decision:Skip}} for sub/nested.txt, got {other:?}"),
         }
 
@@ -1976,34 +1979,37 @@ mod tests {
     // ============================================================
 
     /// 构造一个仅用于测试的最小 `NASEntry`（字段值无实际语义，只满足统计消息类型要求）
-    fn dummy_entry(name: &str, is_dir: bool, size: u64) -> Arc<EntryEnum> {
-        Arc::new(EntryEnum::NAS(storage_adapter::NASEntry {
-            name: name.to_string(),
-            relative_path: PathBuf::from(name),
-            extension: None,
-            is_dir,
-            size,
-            atime: 0,
-            ctime: 0,
-            mtime: 0,
-            mode: Some(0o644),
-            is_symlink: false,
-            hard_links: None,
-            uid: None,
-            gid: None,
-            ino: None,
-            file_handle: None,
-            acl: None,
-            owner: None,
-            owner_group: None,
-            xattrs: None,
-        }))
+    fn dummy_entry(name: &str, is_dir: bool, size: u64) -> Arc<ObservedEntry> {
+        Arc::new({
+            let fixture_path: std::path::PathBuf = PathBuf::from(name);
+            crate::observed_fixtures::observation(
+                data_mover::model::BackendKind::Nfs,
+                fixture_path,
+                if is_dir {
+                    data_mover::model::EntryKind::Directory
+                } else if false {
+                    data_mover::model::EntryKind::Symlink
+                } else {
+                    data_mover::model::EntryKind::File
+                },
+                size,
+                [0, 0, 0],
+                Some(data_mover::model::OwnershipMode {
+                    mode: 0o644,
+                    uid: 0u32,
+                    gid: 0u32,
+                }),
+                None,
+                None,
+                None,
+            )
+        })
     }
 
     #[test]
     fn classification_to_stats_message_maps_full_transfer_to_new() {
         let entry = dummy_entry("a.txt", false, 10);
-        match classification_to_stats_message(TransferDecision::FullTransfer, entry) {
+        match classification_to_stats_message(TransferDecision::FullTransfer, entry.into()) {
             Some(StorageEntryMessage::New(_)) => {}
             other => panic!("expected New, got {other:?}"),
         }
@@ -2012,7 +2018,7 @@ mod tests {
     #[test]
     fn classification_to_stats_message_maps_delta_transfer_to_changed_data_only() {
         let entry = dummy_entry("a.txt", false, 10);
-        match classification_to_stats_message(TransferDecision::DeltaTransfer, entry) {
+        match classification_to_stats_message(TransferDecision::DeltaTransfer, entry.into()) {
             Some(StorageEntryMessage::Changed {
                 kind: ChangeKind::DataOnly,
                 ..
@@ -2024,7 +2030,7 @@ mod tests {
     #[test]
     fn classification_to_stats_message_maps_metadata_only_to_changed_metadata_only() {
         let entry = dummy_entry("a.txt", false, 10);
-        match classification_to_stats_message(TransferDecision::MetadataOnly, entry) {
+        match classification_to_stats_message(TransferDecision::MetadataOnly, entry.into()) {
             Some(StorageEntryMessage::Changed {
                 kind: ChangeKind::MetadataOnly,
                 ..
@@ -2036,13 +2042,13 @@ mod tests {
     #[test]
     fn classification_to_stats_message_skip_produces_no_message() {
         let entry = dummy_entry("a.txt", false, 10);
-        assert!(classification_to_stats_message(TransferDecision::Skip, entry).is_none());
+        assert!(classification_to_stats_message(TransferDecision::Skip, entry.into()).is_none());
     }
 
     #[test]
     fn classification_to_stats_message_maps_deleted_to_deleted() {
         let entry = dummy_entry("a.txt", false, 10);
-        match classification_to_stats_message(TransferDecision::Deleted, entry) {
+        match classification_to_stats_message(TransferDecision::Deleted, entry.into()) {
             Some(StorageEntryMessage::Deleted(_)) => {}
             other => panic!("expected Deleted, got {other:?}"),
         }
@@ -2078,7 +2084,7 @@ mod tests {
             (TransferDecision::Deleted, dummy_entry("gone.txt", false, 30)),
         ];
         for (decision, entry) in events {
-            if let Some(msg) = classification_to_stats_message(decision, entry) {
+            if let Some(msg) = classification_to_stats_message(decision, entry.into()) {
                 stats_consumer.lock().await.update_statistics(&msg);
             }
         }
@@ -2119,7 +2125,7 @@ mod tests {
             (TransferDecision::Deleted, dummy_entry("d1.txt", false, 60)),
         ];
         for (decision, entry) in events {
-            if let Some(msg) = classification_to_stats_message(decision, entry) {
+            if let Some(msg) = classification_to_stats_message(decision, entry.into()) {
                 stats_consumer.lock().await.update_statistics(&msg);
             }
         }
@@ -2236,7 +2242,7 @@ mod tests {
 
         {
             let mut c = stats_consumer.lock().await;
-            c.update_statistics(&StorageEntryMessage::New(dummy_entry("a.txt", false, 10)));
+            c.update_statistics(&StorageEntryMessage::New(dummy_entry("a.txt", false, 10).into()));
             c.update_statistics(&StorageEntryMessage::Changed {
                 entry: dummy_entry("b.txt", false, 20),
                 kind: ChangeKind::DataOnly,

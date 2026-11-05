@@ -9,11 +9,13 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex, PoisonError};
+use storage_adapter::ObservedEntryExt;
+use storage_adapter::observed_scan::ObservedItem;
 
 use storage_adapter::dir_tree::NdxEvent;
 use storage_adapter::qos::QosManager;
 use storage_adapter::{ChangeKind, ErrorEvent, StorageEntryMessage};
-use storage_adapter::{ConsistencyCheck, EntryEnum, StorageEnum, WalkDirAsyncIterator2};
+use storage_adapter::{ConsistencyCheck, ObservedEntry, StorageEnum, WalkDirAsyncIterator2};
 use sync_delta::DeltaToken;
 use sync_delta::matcher::DeltaMatcher;
 use tokio::sync::Mutex as AsyncMutex;
@@ -246,10 +248,10 @@ pub(super) async fn advertise_file_list(
                 {
                     let mut consumer = stats_consumer.lock().await;
                     for file in &page.files {
-                        consumer.update_statistics(&StorageEntryMessage::Scanned(file.entry.clone()));
+                        consumer.update_scanned_view(file.entry.view());
                     }
                     for directory in &page.subdirs {
-                        consumer.update_statistics(&StorageEntryMessage::Scanned(directory.entry.clone()));
+                        consumer.update_scanned_view(directory.entry.view());
                     }
                 }
                 ndx_table
@@ -271,18 +273,25 @@ pub(super) async fn advertise_file_list(
 
 /// 发送一个 full entry；目录、符号链接和 bounded file stream 共用一个 typed outcome。
 pub(super) async fn send_full_transfer(
-    transport: &dyn SenderTransport, src_storage: &Arc<StorageEnum>, entry: &Arc<EntryEnum>, ndx: i32,
+    transport: &dyn SenderTransport, src_storage: &Arc<StorageEnum>, entry: &ObservedItem, ndx: i32,
     qos: Option<&QosManager>, enable_acl: bool,
 ) -> Result<SourceTransferOutcome> {
-    let outcome = if entry.get_is_dir() {
-        transport.send(SenderMsg::CreateDir { entry: entry.clone() }).await?;
+    let outcome = if entry.view().version().is_some_and(|version| version.is_delete_marker()) {
+        transport.send(SenderMsg::WriteDeleteMarker { ndx }).await?;
+        SourceTransferOutcome::Sent
+    } else if entry.entry.history().is_none() && entry.get_is_dir() {
+        transport
+            .send(SenderMsg::CreateDir {
+                entry: Arc::clone(&entry.entry),
+            })
+            .await?;
         SourceTransferOutcome::Sent
     } else if entry.get_is_symlink() {
-        match src_storage.read_symlink(entry).await {
+        match src_storage.read_symlink(&entry.entry).await {
             Ok(target) => {
                 transport
                     .send(SenderMsg::CreateSymlink {
-                        entry: entry.clone(),
+                        entry: Arc::clone(&entry.entry),
                         target,
                     })
                     .await?;
@@ -301,20 +310,11 @@ pub(super) async fn send_full_transfer(
             }
         }
     } else {
-        let (mut chunks, read_join) = StorageEnum::read_chunk_stream(src_storage, entry, None, qos.cloned(), true, 8);
-        transport
-            .send(SenderMsg::FileBegin {
-                ndx,
-                entry: entry.clone(),
-            })
-            .await?;
+        let (mut chunks, read_join) =
+            StorageEnum::read_observed_chunk_stream(src_storage, entry, None, qos.cloned(), true, 8);
+        transport.send(SenderMsg::FileBegin { ndx }).await?;
         while let Some(chunk) = chunks.recv().await {
-            transport
-                .send(SenderMsg::FileData {
-                    entry: entry.clone(),
-                    chunk,
-                })
-                .await?;
+            transport.send(SenderMsg::FileData { ndx, chunk }).await?;
         }
         let read_result = match read_join.await {
             Ok(inner) => inner.map_err(|error| error.to_string()),
@@ -325,7 +325,6 @@ pub(super) async fn send_full_transfer(
                 transport
                     .send(SenderMsg::EndOfFile {
                         ndx,
-                        entry: entry.clone(),
                         source_hash: hasher.map(ConsistencyCheck::finalize),
                     })
                     .await?;
@@ -344,15 +343,15 @@ pub(super) async fn send_full_transfer(
             }
         }
     };
-    if outcome == SourceTransferOutcome::Sent {
-        send_acl_if_enabled(transport, src_storage, entry, enable_acl).await;
+    if outcome == SourceTransferOutcome::Sent && entry.entry.history().is_none() {
+        send_acl_if_enabled(transport, src_storage, &entry.entry, enable_acl).await;
     }
     Ok(outcome)
 }
 
 /// ACL 跨进程传输：仅在启用且 entry 不是符号链接时发送。
 pub(super) async fn send_acl_if_enabled(
-    transport: &dyn SenderTransport, src_storage: &Arc<StorageEnum>, entry: &Arc<EntryEnum>, enable_acl: bool,
+    transport: &dyn SenderTransport, src_storage: &Arc<StorageEnum>, entry: &Arc<ObservedEntry>, enable_acl: bool,
 ) {
     if enable_acl
         && !entry.get_is_symlink()
@@ -369,7 +368,7 @@ pub(super) async fn send_acl_if_enabled(
 
 /// Delta source stream：matcher 与 token emission 都由 session implementation 持有。
 async fn send_delta_transfer(
-    context: &SourceTransferContext<'_>, entry: &Arc<EntryEnum>, ndx: i32, block_size: u32,
+    context: &SourceTransferContext<'_>, entry: &ObservedItem, ndx: i32, block_size: u32,
     signatures: Vec<BlockSignature>,
 ) -> Result<SourceTransferOutcome> {
     let SourceTransferContext {
@@ -387,7 +386,8 @@ async fn send_delta_transfer(
         .collect::<Vec<_>>();
     let mut matcher = DeltaMatcher::new(&signatures, block_size);
     let mut token_count = 0usize;
-    let (mut chunks, read_join) = StorageEnum::read_chunk_stream(src_storage, entry, None, qos.cloned(), true, 8);
+    let (mut chunks, read_join) =
+        StorageEnum::read_observed_chunk_stream(src_storage, entry, None, qos.cloned(), true, 8);
     while let Some(chunk) = chunks.recv().await {
         let tokens = matcher.push(&chunk.data);
         token_count += tokens.len();
@@ -406,7 +406,6 @@ async fn send_delta_transfer(
             transport
                 .send(SenderMsg::EndOfFile {
                     ndx,
-                    entry: entry.clone(),
                     source_hash: hasher.map(ConsistencyCheck::finalize),
                 })
                 .await?;
@@ -415,7 +414,7 @@ async fn send_delta_transfer(
                 entry.get_relative_path(),
                 token_count
             );
-            send_acl_if_enabled(*transport, src_storage, entry, *enable_acl).await;
+            send_acl_if_enabled(*transport, src_storage, &entry.entry, *enable_acl).await;
             Ok(SourceTransferOutcome::Sent)
         }
         Err(reason) => {
@@ -524,8 +523,18 @@ async fn process_requests_and_acks(context: RequestLoopContext<'_>) -> Result<()
                     error!("[Sender Remote] Unknown NDX {ndx} for delta");
                 }
             }
+            Some(ReceiverMsg::ClassifiedObservation { ndx, decision }) => {
+                let item = ndx_table
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .get(ndx)
+                    .cloned();
+                if let Some(item) = item {
+                    record_classification(stats_consumer, decision, item).await;
+                }
+            }
             Some(ReceiverMsg::Classified { entry, decision }) => {
-                record_classification(stats_consumer, decision, entry).await;
+                record_classification(stats_consumer, decision, entry.into()).await;
             }
             Some(ReceiverMsg::Redo { ndx }) => {
                 let entry = ndx_table
@@ -614,7 +623,7 @@ async fn process_requests_and_acks(context: RequestLoopContext<'_>) -> Result<()
 }
 
 pub(super) async fn record_classification(
-    stats_consumer: &Arc<AsyncMutex<StatisticConsumer>>, decision: TransferDecision, entry: Arc<EntryEnum>,
+    stats_consumer: &Arc<AsyncMutex<StatisticConsumer>>, decision: TransferDecision, entry: ObservedItem,
 ) {
     if let Some(message) = classification_to_stats_message(decision, entry) {
         stats_consumer.lock().await.update_statistics(&message);
@@ -657,20 +666,20 @@ pub(super) fn entry_error_stats_message(path: PathBuf, reason: String) -> Storag
 }
 
 pub(super) fn classification_to_stats_message(
-    decision: TransferDecision, entry: Arc<EntryEnum>,
+    decision: TransferDecision, entry: ObservedItem,
 ) -> Option<StorageEntryMessage> {
     match decision {
         TransferDecision::FullTransfer => Some(StorageEntryMessage::New(entry)),
         TransferDecision::DeltaTransfer => Some(StorageEntryMessage::Changed {
-            entry,
+            entry: entry.entry,
             kind: ChangeKind::DataOnly,
         }),
         TransferDecision::MetadataOnly => Some(StorageEntryMessage::Changed {
-            entry,
+            entry: entry.entry,
             kind: ChangeKind::MetadataOnly,
         }),
         TransferDecision::Skip => None,
-        TransferDecision::Deleted => Some(StorageEntryMessage::Deleted(entry)),
+        TransferDecision::Deleted => Some(StorageEntryMessage::Deleted(entry.entry)),
     }
 }
 

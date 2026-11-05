@@ -1,11 +1,7 @@
-use crate::connected::path;
-use crate::{error::operation, *};
-use bytes::Bytes;
-use data_mover::{
-    model::{observation::PrivateBackendEntryFacts, *},
-    storage::{InlineOwnership, PrincipalIdentity, SourceDescriptor},
-};
-use std::path::PathBuf;
+//! 元数据观察与 opaque 编码；运行时直接交付原生观察，不投影为后端条目。
+use crate::{ConnectedStorage, Result, StorageError, error::operation};
+use data_mover::model::*;
+use data_mover::storage::SourceDescriptor;
 
 pub(crate) fn observation_plan(tags: bool) -> ObservationPlan {
     ObservationPlan::default()
@@ -17,194 +13,42 @@ pub(crate) fn observation_plan(tags: bool) -> ObservationPlan {
             ObservationMode::Omit
         })
 }
-pub(crate) fn nanos(value: Option<StorageTimestamp>) -> i64 {
-    value.map_or(0, |v| {
-        v.unix_nanos().clamp(i128::from(i64::MIN), i128::from(i64::MAX)) as i64
-    })
-}
+
 impl ConnectedStorage {
-    pub(crate) async fn project_descriptor(&self, descriptor: SourceDescriptor, tags: bool) -> Result<EntryEnum> {
-        let role = self.roles.metadata()?;
+    pub(crate) async fn project_descriptor(&self, descriptor: SourceDescriptor, tags: bool) -> Result<ObservedEntry> {
+        let metadata_role = self.roles.metadata()?;
         let plan = observation_plan(tags);
-        let metadata = match role.observe_listed(&descriptor, plan) {
+        let metadata = match metadata_role.observe_listed(&descriptor, plan) {
             Some(result) => result?,
-            None => role.observe(&descriptor.path, plan).await?,
+            None => metadata_role.observe(&descriptor.path, plan).await?,
         };
         let modified = metadata
             .timestamps()
             .value()
-            .and_then(|v| v.modified)
-            .or(descriptor.inline_timestamps.and_then(|v| v.modified));
-        let entry = ObservedEntry::new(
-            descriptor.path.clone(),
-            descriptor.kind,
-            descriptor.size,
-            modified,
-            descriptor.source_identity.clone(),
-        )?
-        .with_metadata(metadata);
-        let mut projected = project(&entry);
-        match &mut projected {
-            EntryEnum::NAS(nas) => {
-                if self.roles.kind() != BackendKind::Cifs
-                    && let Some(mode) = descriptor.inline_mode
-                {
-                    nas.mode = Some(mode);
-                }
-                if let Some(InlineOwnership::Known(OwnershipMode { uid, gid, .. })) = descriptor.inline_ownership {
-                    nas.uid = Some(uid);
-                    nas.gid = Some(gid);
-                }
-            }
-            _ => {}
+            .and_then(|times| times.modified)
+            .or(descriptor.inline_timestamps.and_then(|times| times.modified));
+        let mut entry = if descriptor.kind == EntryKind::Symlink {
+            let target = self.roles.namespace()?.read_link(&descriptor.path).await?;
+            ObservedEntry::new_symlink(descriptor.path, modified, descriptor.source_identity, target)?
+        } else {
+            ObservedEntry::new(
+                descriptor.path,
+                descriptor.kind,
+                descriptor.size,
+                modified,
+                descriptor.source_identity,
+            )?
         }
-        self.project_named_permissions(&descriptor, &mut projected).await?;
-        Ok(projected)
-    }
-
-    async fn project_named_permissions(&self, descriptor: &SourceDescriptor, entry: &mut EntryEnum) -> Result<()> {
-        let EntryEnum::HDFS(entry) = entry else { return Ok(()) };
-        let permissions = self.roles.metadata()?.permissions(descriptor).await?;
-        entry.mode = permissions.mode;
-        if let Some(PrincipalIdentity::Named(owner)) = permissions.owner {
-            entry.owner = owner;
+        .with_permissions(descriptor.permissions)?
+        .with_metadata(metadata)
+        .with_rename_evidence(descriptor.rename_evidence);
+        if let Some(facts) = descriptor.backend_fact {
+            entry = entry.with_backend_fact_bytes(facts.to_vec())?;
         }
-        if let Some(PrincipalIdentity::Named(group)) = permissions.group {
-            entry.group = group;
-        }
-        Ok(())
-    }
-
-    pub(crate) async fn project_history(
-        &self, observed: &ObservedEntry, histories: &mut HistoryProjection,
-    ) -> Result<Vec<EntryEnum>> {
-        let mut entries = histories.push(observed)?;
-        if let PrivateBackendEntryFacts::Hdfs(facts) = observed.backend_facts() {
-            // 将 opaque 后端事实交给对应角色；HDFS 从 listing 事实获取权限，
-            // 不执行第二次 stat，也不映射数字主体。
-            let descriptor = SourceDescriptor::new(
-                observed.path().clone(),
-                observed.kind(),
-                observed.size(),
-                observed.source_identity().clone(),
-            )
-            .with_backend_fact(Bytes::copy_from_slice(facts));
-            for entry in &mut entries {
-                self.project_named_permissions(&descriptor, entry).await?;
-            }
-        }
-        Ok(entries)
-    }
-    pub(crate) async fn observe(&self, value: &std::path::Path) -> Result<ObservedEntry> {
-        let p = path(value)?;
-        let descriptor = self.roles.read_source()?.describe(&p).await?;
-        let metadata = self
-            .roles
-            .metadata()?
-            .observe_bound(&p, &descriptor.source_identity, observation_plan(true))
-            .await?;
-        let mut entry = ObservedEntry::new(
-            p,
-            descriptor.kind,
-            descriptor.size,
-            descriptor.inline_timestamps.and_then(|v| v.modified),
-            descriptor.source_identity,
-        )?;
-        if descriptor.kind == EntryKind::Symlink {
-            entry = ObservedEntry::new_symlink(
-                entry.path().clone(),
-                entry.modified(),
-                entry.source_identity().clone(),
-                self.roles.namespace()?.read_link(entry.path()).await?,
-            )?;
-        }
-        Ok(entry.with_metadata(metadata))
+        Ok(entry)
     }
 }
-pub(crate) fn project(entry: &ObservedEntry) -> EntryEnum {
-    let p = PathBuf::from(entry.path().as_str());
-    let name = p
-        .file_name()
-        .map(|v| v.to_string_lossy().into_owned())
-        .unwrap_or_default();
-    let extension = p.extension().map(|v| v.to_string_lossy().into_owned());
-    let timestamps = entry.metadata().timestamps().value();
-    let mtime = nanos(timestamps.and_then(|v| v.modified).or(entry.modified()));
-    let atime = nanos(timestamps.and_then(|v| v.accessed));
-    let ownership = entry.metadata().ownership_mode().value();
-    let mode = ownership.map(|v| v.mode);
-    if entry.backend_kind() == BackendKind::S3 {
-        EntryEnum::S3(S3Entry {
-            name,
-            relative_path: entry.path().as_str().into(),
-            extension,
-            size: entry.size().unwrap_or(0),
-            mtime,
-            tags: entry.metadata().tags().value().map(|tags| {
-                tags.iter()
-                    .map(|v| Tag {
-                        key: v.key().into(),
-                        value: v.value().into(),
-                    })
-                    .collect()
-            }),
-            version_id: entry.source_version().and_then(|v| v.version_id().map(str::to_owned)),
-            is_latest: true,
-            is_delete_marker: false,
-            version_count: None,
-            is_dir: entry.kind() == EntryKind::Directory,
-        })
-    } else if entry.backend_kind() == BackendKind::Hdfs {
-        EntryEnum::HDFS(HDFSEntry {
-            name,
-            relative_path: p,
-            extension,
-            size: entry.size().unwrap_or(0),
-            mtime,
-            atime,
-            mode,
-            is_dir: entry.kind() == EntryKind::Directory,
-            owner: String::new(),
-            group: String::new(),
-            replication: None,
-            block_size: None,
-        })
-    } else {
-        EntryEnum::NAS(NASEntry {
-            name,
-            relative_path: p,
-            extension,
-            size: entry.size().unwrap_or(0),
-            mtime,
-            atime,
-            ctime: nanos(timestamps.and_then(|v| v.created)),
-            mode,
-            is_dir: entry.kind() == EntryKind::Directory,
-            is_symlink: entry.kind() == EntryKind::Symlink,
-            hard_links: None,
-            uid: ownership.map(|v| v.uid),
-            gid: ownership.map(|v| v.gid),
-            ino: None,
-            file_handle: if entry.backend_kind() == BackendKind::Local {
-                None
-            } else {
-                entry.source_identity().stable_bytes().map(|_| {
-                    let mut key = b"TSI4".to_vec();
-                    key.extend_from_slice(entry.identity_key().as_bytes());
-                    Bytes::from(key)
-                })
-            },
-            acl: entry.metadata().acl().value().cloned(),
-            owner: None,
-            owner_group: None,
-            xattrs: entry.metadata().xattrs().value().map(|v| {
-                v.iter()
-                    .map(|a| (String::from_utf8_lossy(a.name()).into_owned(), a.value().to_vec()))
-                    .collect()
-            }),
-        })
-    }
-}
+
 #[derive(serde::Serialize, serde::Deserialize)]
 struct WireAcl {
     encoding: u8,
@@ -239,128 +83,35 @@ pub(crate) fn decode_acl(bytes: &[u8]) -> Result<AclMetadata> {
     }
 }
 
-/// 将上游按 key 交付的对象历史展开为 TerraSync 既有的逐版本消息。
-pub(crate) fn project_all(entry: &ObservedEntry) -> Vec<EntryEnum> {
-    let base = project(entry);
-    let (EntryEnum::S3(base), Some(history)) = (&base, entry.history()) else {
-        return vec![base];
-    };
-    let source_path = entry.history_source_path().ok().flatten();
-    history
-        .records()
-        .iter()
-        .map(|record| {
-            let mut projected = base.clone();
-            if let Some(path) = &source_path {
-                projected.relative_path = path.as_str().into();
-            }
-            projected.version_id = Some(record.version_id().unwrap_or("null").to_owned());
-            projected.is_latest = record.is_latest();
-            projected.is_delete_marker = record.is_delete_marker();
-            projected.version_count = Some(history.records().len() as u32);
-            projected.mtime = nanos(record.modified());
-            projected.size = record.size().unwrap_or(0);
-            projected.tags = record.metadata().and_then(|m| m.tags().value()).map(|tags| {
-                tags.iter()
-                    .map(|tag| Tag {
-                        key: tag.key().into(),
-                        value: tag.value().into(),
-                    })
-                    .collect()
-            });
-            EntryEnum::S3(projected)
-        })
-        .collect()
-}
-
-/// 旧产品逐版本协议需要完整计数；只在最后一段到达后交出该 key。
+/// 验证原生历史分段顺序，不积累整段历史，也不复制逐版本条目。
 #[derive(Default)]
-pub(crate) struct HistoryProjection {
-    path: Option<String>,
+pub(crate) struct HistorySequence {
+    path: Option<StoragePath>,
     next_segment: u32,
-    entries: Vec<EntryEnum>,
 }
-impl HistoryProjection {
-    pub fn push(&mut self, entry: &ObservedEntry) -> Result<Vec<EntryEnum>> {
-        let Some(history) = entry.history() else {
-            if self.path.is_some() {
-                return Err(operation("interrupted object history"));
+impl HistorySequence {
+    pub fn push(&mut self, entry: ObservedEntry) -> Result<ObservedEntry> {
+        if let Some(history) = entry.history() {
+            if self.path.is_none() {
+                self.path = Some(entry.path().clone());
+                self.next_segment = 0;
             }
-            return Ok(project_all(entry));
-        };
-        if self.path.is_none() {
-            self.path = Some(entry.path().as_str().into());
-            self.next_segment = 0;
+            if self.path.as_ref() != Some(entry.path()) || history.segment() != self.next_segment {
+                return Err(operation("out-of-order object history"));
+            }
+            self.next_segment = self
+                .next_segment
+                .checked_add(1)
+                .ok_or_else(|| operation("history segment overflow"))?;
+            if history.is_complete() {
+                self.path = None;
+            }
+        } else if self.path.is_some() {
+            return Err(operation("interrupted object history"));
         }
-        if self.path.as_deref() != Some(entry.path().as_str()) || history.segment() != self.next_segment {
-            return Err(operation("out-of-order object history"));
-        }
-        self.entries.extend(project_all(entry));
-        self.next_segment = self.next_segment.saturating_add(1);
-        if !history.is_complete() {
-            return Ok(Vec::new());
-        }
-        let count = u32::try_from(self.entries.len()).map_err(StorageError::from)?;
-        for entry in &mut self.entries {
-            entry.set_version_count(count);
-        }
-        self.path = None;
-        Ok(std::mem::take(&mut self.entries))
+        Ok(entry)
     }
     pub fn is_complete(&self) -> bool {
         self.path.is_none()
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    type TestResult = std::result::Result<(), Box<dyn std::error::Error + Send + Sync>>;
-    #[test]
-    fn unobserved_posix_mode_remains_unknown() -> TestResult {
-        let backend = BackendIdentity::new(BackendKind::Cifs, "unknown-permissions")?;
-        let identity = SourceIdentity::new(backend, IdentityStrength::PathScoped, b"dir")?;
-        let entry = ObservedEntry::new(StoragePath::new("dir")?, EntryKind::Directory, None, None, identity)?;
-        assert_eq!(project(&entry).get_mode(), None);
-        Ok(())
-    }
-
-    #[test]
-    fn history_segments_preserve_null_versions_markers_and_total_count() -> TestResult {
-        let backend = BackendIdentity::new(BackendKind::S3, "history-fixture")?;
-        let identity = SourceIdentity::new(backend, IdentityStrength::VersionScoped, b"key")?;
-        let records = vec![
-            VersionRecord::new(
-                None,
-                false,
-                RecordKind::Object {
-                    size: 3,
-                    etag: "etag".into(),
-                    modified: None,
-                },
-                identity.clone(),
-                None,
-            )?,
-            VersionRecord::new(
-                Some("marker".into()),
-                true,
-                RecordKind::DeleteMarker { modified: None },
-                identity.clone(),
-                None,
-            )?,
-        ];
-        let entry = ObservedEntry::new(StoragePath::new("key")?, EntryKind::File, None, None, identity)?
-            .with_history(Some(Box::new(ObjectHistory::whole(records, HistoryOrder::Server)?)))?;
-        let mut projection = HistoryProjection::default();
-        let mut entries = Vec::new();
-        for segment in entry.into_segments(1) {
-            entries.extend(projection.push(&segment)?);
-        }
-        assert!(projection.is_complete());
-        assert_eq!(entries.len(), 2);
-        assert_eq!(entries[0].get_version_id(), Some("null"));
-        assert!(entries[1].get_is_delete_marker());
-        assert!(entries.iter().all(|entry| entry.get_version_count() == Some(2)));
-        Ok(())
     }
 }

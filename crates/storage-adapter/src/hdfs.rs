@@ -1,3 +1,4 @@
+use crate::ObservedEntryExt;
 use crate::*;
 use crate::{connected::path, streaming::source_qos};
 use data_mover::{
@@ -32,7 +33,7 @@ impl HdfsRecoverableCopyOptions {
 }
 impl StorageEnum {
     pub async fn copy_file_hdfs_recoverable(
-        source: &Self, destination: &Self, entry: &EntryEnum, options: CopyOptions,
+        source: &Self, destination: &Self, entry: &ObservedEntry, options: CopyOptions,
         recovery: HdfsRecoverableCopyOptions,
     ) -> Result<()> {
         if recovery.mode == HdfsResumeMode::Require {

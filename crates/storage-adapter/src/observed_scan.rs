@@ -1,6 +1,9 @@
 //! 扫描保留原生观察对象；逐版本视图只用于统计、比较和数据库行投影。
-use crate::{ChangeKind, EntryEnum};
-use data_mover::model::{BackendKind, EntryKind, MetadataObservations, ObservedEntry, StorageTimestamp, VersionRecord};
+use crate::{ChangeKind, ObservedEntryExt};
+use data_mover::model::{
+    BackendKind, EntryKind, MetadataObservations, ModelValueError, ObservedEntry, PrincipalIdentity, SourceIdentity,
+    SourceVersion, StoragePath, StorageTimestamp, VersionRecord,
+};
 use std::{
     borrow::Cow,
     path::Path,
@@ -18,30 +21,30 @@ pub trait EntryStatistics {
     fn get_is_regular_file(&self) -> bool;
     fn get_mtime(&self) -> i64;
 }
-impl EntryStatistics for EntryEnum {
+impl EntryStatistics for ObservedEntry {
     fn get_size(&self) -> u64 {
-        self.get_size()
+        ObservedEntryExt::get_size(self)
     }
     fn get_name(&self) -> &str {
-        self.get_name()
+        ObservedEntryExt::get_name(self)
     }
     fn get_relative_path(&self) -> &Path {
-        self.get_relative_path()
+        ObservedEntryExt::get_relative_path(self)
     }
     fn get_extension(&self) -> Option<&str> {
-        self.get_extension()
+        ObservedEntryExt::get_extension(self)
     }
     fn get_is_dir(&self) -> bool {
-        self.get_is_dir()
+        ObservedEntryExt::get_is_dir(self)
     }
     fn get_is_symlink(&self) -> bool {
-        self.get_is_symlink()
+        ObservedEntryExt::get_is_symlink(self)
     }
     fn get_is_regular_file(&self) -> bool {
-        self.get_is_regular_file()
+        ObservedEntryExt::get_is_regular_file(self)
     }
     fn get_mtime(&self) -> i64 {
-        self.get_mtime()
+        ObservedEntryExt::get_mtime(self)
     }
 }
 
@@ -67,22 +70,69 @@ impl ObservedItem {
     }
 }
 
+impl From<Arc<ObservedEntry>> for ObservedItem {
+    fn from(entry: Arc<ObservedEntry>) -> Self {
+        let version_index = entry.history().and_then(|history| {
+            if history.records().len() == 1 {
+                Some(0)
+            } else {
+                history.records().iter().position(|record| record.is_latest())
+            }
+        });
+        Self { entry, version_index }
+    }
+}
+impl AsRef<ObservedEntry> for ObservedItem {
+    fn as_ref(&self) -> &ObservedEntry {
+        &self.entry
+    }
+}
+
 #[derive(Clone, Copy)]
 pub struct ObservedView<'a> {
     pub entry: &'a ObservedEntry,
     pub version_index: Option<usize>,
 }
-impl<'a> ObservedView<'a> {
-    pub fn all(entry: &'a ObservedEntry) -> impl Iterator<Item = Self> {
-        let count = entry.history().map_or(1, |history| history.records().len());
-        (0..count).map(move |index| Self {
-            entry,
-            version_index: entry.history().map(|_| index),
+pub struct ObservedViews<'a> {
+    entry: &'a ObservedEntry,
+    indices: std::ops::Range<usize>,
+}
+impl<'a> Iterator for ObservedViews<'a> {
+    type Item = ObservedView<'a>;
+    fn next(&mut self) -> Option<Self::Item> {
+        self.indices.next().map(|index| ObservedView {
+            entry: self.entry,
+            version_index: self.entry.history().map(|_| index),
         })
+    }
+}
+impl<'a> ObservedView<'a> {
+    pub fn all(entry: &'a ObservedEntry) -> ObservedViews<'a> {
+        ObservedViews {
+            entry,
+            indices: 0..entry.history().map_or(1, |history| history.records().len()),
+        }
     }
     pub fn version(&self) -> Option<&'a VersionRecord> {
         self.version_index
             .and_then(|index| self.entry.history()?.records().get(index))
+    }
+    pub fn source_identity(&self) -> &'a SourceIdentity {
+        self.version()
+            .map_or(self.entry.source_identity(), VersionRecord::identity)
+    }
+    pub fn source_version(&self) -> Option<SourceVersion> {
+        if self.entry.history().is_none() {
+            Some(SourceVersion::Current)
+        } else {
+            self.version()?.source()
+        }
+    }
+    pub fn source_path(&self) -> Result<StoragePath, ModelValueError> {
+        Ok(self
+            .entry
+            .history_source_path()?
+            .unwrap_or_else(|| self.entry.path().clone()))
     }
     pub fn version_id(&self) -> &'a str {
         self.version()
@@ -113,6 +163,49 @@ impl<'a> ObservedView<'a> {
             }
             value
         })
+    }
+    /// Permission facts belong to the selected version, never to the history container.
+    pub fn mode(&self) -> Option<u32> {
+        self.metadata()
+            .ownership_mode()
+            .value()
+            .map(|owner| owner.mode)
+            .or_else(|| {
+                self.version_index
+                    .is_none()
+                    .then(|| self.entry.permissions()?.mode)
+                    .flatten()
+            })
+    }
+    pub fn uid(&self) -> Option<u32> {
+        self.metadata()
+            .ownership_mode()
+            .value()
+            .map(|owner| owner.uid)
+            .or_else(|| {
+                if self.version_index.is_some() {
+                    return None;
+                }
+                match self.entry.permissions()?.owner.as_ref()? {
+                    PrincipalIdentity::Numeric(uid) => Some(*uid),
+                    PrincipalIdentity::Named(_) => None,
+                }
+            })
+    }
+    pub fn gid(&self) -> Option<u32> {
+        self.metadata()
+            .ownership_mode()
+            .value()
+            .map(|owner| owner.gid)
+            .or_else(|| {
+                if self.version_index.is_some() {
+                    return None;
+                }
+                match self.entry.permissions()?.group.as_ref()? {
+                    PrincipalIdentity::Numeric(gid) => Some(*gid),
+                    PrincipalIdentity::Named(_) => None,
+                }
+            })
     }
     pub fn metadata(&self) -> &'a MetadataObservations {
         if let Some(version) = self.version() {

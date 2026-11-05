@@ -286,9 +286,42 @@ impl ProgressBar {
 
     /// 根据消息类型更新对应的原子计数器
     pub fn update_statistics(&self, message: &StorageEntryMessage) {
-        match &self.counters {
-            CounterSet::Full(c) => Self::update_full(c, message),
-            CounterSet::Incremental(c) => Self::update_incremental(c, message),
+        let (entry, operation) = match message {
+            StorageEntryMessage::Scanned(entry) | StorageEntryMessage::Packaged(entry) => (entry, "scanned"),
+            StorageEntryMessage::New(item) => {
+                let operation = match &self.counters {
+                    CounterSet::Full(_) => "scanned",
+                    CounterSet::Incremental(_) => "new",
+                };
+                self.update_observed(operation, &item.view());
+                return;
+            }
+            StorageEntryMessage::Changed { entry, .. } => (entry, "changed"),
+            StorageEntryMessage::Deleted(entry) => (entry, "deleted"),
+            StorageEntryMessage::Renamed((_, entry)) => (entry, "rename"),
+            StorageEntryMessage::IntegrityChecked(entry) => match &self.counters {
+                CounterSet::Full(_) => (entry, "scanned"),
+                CounterSet::Incremental(_) => return,
+            },
+            StorageEntryMessage::Error { .. } => {
+                match &self.counters {
+                    CounterSet::Full(c) => {
+                        c.error_count.fetch_add(1, Ordering::Relaxed);
+                    }
+                    CounterSet::Incremental(c) => {
+                        c.error_count.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+                return;
+            }
+            StorageEntryMessage::TarManifest { .. } => return,
+        };
+        for view in storage_adapter::observed_scan::ObservedView::all(entry) {
+            match &self.counters {
+                CounterSet::Full(_) if matches!(operation, "new" | "scanned") => self.update_observed("scanned", &view),
+                CounterSet::Incremental(_) => self.update_observed(operation, &view),
+                _ => {}
+            }
         }
     }
 
@@ -329,73 +362,6 @@ impl ProgressBar {
         }
     }
 
-    fn update_full(c: &FullCounters, message: &StorageEntryMessage) {
-        let entry = match message {
-            // Scan job 收 Scanned/Packaged，Copy job 收 New
-            StorageEntryMessage::Scanned(e) | StorageEntryMessage::Packaged(e) | StorageEntryMessage::New(e) => e,
-            StorageEntryMessage::IntegrityChecked(e) => {
-                if e.get_is_dir() {
-                    c.total_dir_count.fetch_add(1, Ordering::Relaxed);
-                } else {
-                    c.total_file_count.fetch_add(1, Ordering::Relaxed);
-                }
-                c.total_count.fetch_add(1, Ordering::Relaxed);
-                c.total_size.fetch_add(e.get_size(), Ordering::Relaxed);
-                return;
-            }
-            StorageEntryMessage::Error { .. } => {
-                c.error_count.fetch_add(1, Ordering::Relaxed);
-                return;
-            }
-            _ => return,
-        };
-        if entry.get_is_dir() {
-            c.total_dir_count.fetch_add(1, Ordering::Relaxed);
-        } else {
-            c.total_file_count.fetch_add(1, Ordering::Relaxed);
-        }
-        c.total_count.fetch_add(1, Ordering::Relaxed);
-        c.total_size.fetch_add(entry.get_size(), Ordering::Relaxed);
-    }
-
-    fn update_incremental(c: &IncrCounters, message: &StorageEntryMessage) {
-        match message {
-            StorageEntryMessage::Scanned(entry) | StorageEntryMessage::Packaged(entry) => {
-                if entry.get_is_dir() {
-                    c.scanned_dir_count.fetch_add(1, Ordering::Relaxed);
-                } else if entry.get_is_symlink() {
-                    c.scanned_symlink_count.fetch_add(1, Ordering::Relaxed);
-                } else {
-                    c.scanned_regular_file_count.fetch_add(1, Ordering::Relaxed);
-                }
-                c.scanned_size.fetch_add(entry.get_size(), Ordering::Relaxed);
-            }
-            StorageEntryMessage::New(entry) => {
-                c.new_count.fetch_add(1, Ordering::Relaxed);
-                c.new_size.fetch_add(entry.get_size(), Ordering::Relaxed);
-            }
-            StorageEntryMessage::Changed { entry, .. } => {
-                c.changed_count.fetch_add(1, Ordering::Relaxed);
-                c.changed_size.fetch_add(entry.get_size(), Ordering::Relaxed);
-            }
-            StorageEntryMessage::Deleted(entry) => {
-                c.deleted_count.fetch_add(1, Ordering::Relaxed);
-                c.deleted_size.fetch_add(entry.get_size(), Ordering::Relaxed);
-            }
-            StorageEntryMessage::Renamed((_, to_entry)) => {
-                c.renamed_count.fetch_add(1, Ordering::Relaxed);
-                c.renamed_size.fetch_add(to_entry.get_size(), Ordering::Relaxed);
-            }
-            StorageEntryMessage::Error { .. } => {
-                c.error_count.fetch_add(1, Ordering::Relaxed);
-            }
-            _ => {}
-        }
-    }
-
-    // ─── 显示 ───
-
-    /// 刷新进度条显示（由 display thread 定时调用）
     pub fn display(&mut self) {
         match &self.counters {
             CounterSet::Full(_) => self.display_full(),

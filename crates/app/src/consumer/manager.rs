@@ -625,8 +625,8 @@ impl Drop for ConsumerManager {
 mod resume_tests {
     use super::*;
     use crate::consumer::stats::ProgressDetail;
+    use db::EntrySummary as StorageEntryRecord;
     use db::scan::{ScanEventSummary, ScanResumeSummary};
-    use db::traits::StorageEntryRecord;
 
     #[tokio::test]
     async fn reconciled_special_events_keep_callback_totals_and_checkpoint_counts() -> Result<()> {

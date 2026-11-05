@@ -3,7 +3,7 @@ use crate::execution::queries::execution_active;
 use crate::scan::ScanFinalEvent;
 use crate::scan::candidate_cache::{CandidateMetadataCache, missing_hash_columns};
 use crate::scan::compare::NativeScanAccess;
-use crate::scan::rows::{NativeScanKey, NativeScanRecord, OBSERVED_COLUMNS, event_records};
+use crate::scan::rows::{NativeScanKey, NativeScanRecord, NativeWriteBatches, OBSERVED_COLUMNS, event_records};
 use crate::scan::rows::{final_event_records, incremental_record};
 use rustc_hash::{FxHashMap, FxHashSet};
 use smol_str::SmolStr;
@@ -94,20 +94,24 @@ impl ClickHouseDatabase {
         let table = if temporary { &access.stage } else { &access.base };
         let generation = self.get_cached_scan_state().await?;
         let cache = CandidateMetadataCache::new(candidates).await?;
-        let client = idempotent_insert_client(&self.sync_client).with_validation(false);
-        execute_request(self.native_insert_safety(), || async {
-            let mut insert = client.insert::<NativeScanRecord>(table).await?;
-            for entry in entries {
-                for view in ObservedView::all(entry) {
-                    let mut record = NativeScanRecord::capture(view, generation)?;
-                    cache.apply(&mut record);
-                    insert.write(&record).await?;
-                }
+        for rows in NativeWriteBatches::new(entries, generation) {
+            check_scan_cancellation()?;
+            let mut rows = rows?;
+            for row in &mut rows {
+                cache.apply(row);
             }
-            insert.end().await?;
-            Ok(())
-        })
-        .await
+            let client = idempotent_insert_client(&self.sync_client).with_validation(false);
+            execute_request(self.native_insert_safety(), || async {
+                let mut insert = client.insert::<NativeScanRecord>(table).await?;
+                for row in &rows {
+                    insert.write(row).await?;
+                }
+                insert.end().await?;
+                Ok(())
+            })
+            .await?;
+        }
+        Ok(())
     }
     pub(crate) async fn compare_native(&mut self, entries: &[Arc<ObservedEntry>]) -> Result<Vec<ObservedScanEvent>> {
         if self.resume_base_has_typed_handles.is_none() {

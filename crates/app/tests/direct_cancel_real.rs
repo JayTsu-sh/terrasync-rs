@@ -78,7 +78,7 @@ async fn run() -> TestResult {
             ndx_start: 0,
             files: vec![NdxEntry {
                 ndx: 0,
-                entry: entry.clone(),
+                entry: entry.clone().into(),
             }],
             subdirs: Vec::new(),
             gap_ndx: 1,
@@ -100,12 +100,7 @@ async fn run() -> TestResult {
         closing.close().await
     });
     let payload = async {
-        transport
-            .send(SenderMsg::FileBegin {
-                ndx: 0,
-                entry: entry.clone(),
-            })
-            .await?;
+        transport.send(SenderMsg::FileBegin { ndx: 0 }).await?;
         let mut file = fs::File::open(source).await?;
         let mut offset = 0;
         let mut hash = blake3::Hasher::new();
@@ -118,7 +113,7 @@ async fn run() -> TestResult {
             hash.update(&buffer[..read]);
             transport
                 .send(SenderMsg::FileData {
-                    entry: entry.clone(),
+                    ndx: 0,
                     chunk: DataChunk {
                         offset,
                         data: Bytes::copy_from_slice(&buffer[..read]),
@@ -130,7 +125,6 @@ async fn run() -> TestResult {
         transport
             .send(SenderMsg::EndOfFile {
                 ndx: 0,
-                entry,
                 source_hash: Some(hash.finalize().to_hex().to_string()),
             })
             .await?;

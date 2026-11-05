@@ -1,6 +1,6 @@
 //! 扫描持久化接口：单机兼容旧作业；集群使用按 job_id 隔离的共享表。
 use crate::scan::cluster::ClusterScanStore;
-use crate::traits::StorageEntryRecord;
+use crate::schema::entry::EntrySummary as StorageEntryRecord;
 use crate::{
     ClickHouseConfig, ClickHouseDatabase, Database, DatabaseError, INCREMENTAL_SCAN_TABLE_BASE_NAME, Result,
     base_table_name_for_job,

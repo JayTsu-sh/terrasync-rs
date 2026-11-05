@@ -1,14 +1,16 @@
 // 标准库
 use std::path::PathBuf;
 use std::sync::Arc;
+use storage_adapter::ObservedEntryExt;
 use storage_adapter::TransferMode;
+use storage_adapter::observed_scan::ObservedItem;
 
 // 外部 crate
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 // 内部模块
 use storage_adapter::dir_tree::DirPageResult;
-use storage_adapter::{DataChunk, EntryEnum};
+use storage_adapter::{DataChunk, ObservedEntry};
 
 /// 会话内临时分配的观察索引。它只用于一次 negotiated session 的关联，不能持久化。
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
@@ -221,24 +223,31 @@ pub enum SenderMsg {
     // ── 单进程模式：命令模式（Receiver 有 src+dest storage，自己执行 copy） ──
     /// 复制一个 entry（目录/符号链接/文件，Receiver 根据 entry 类型 dispatch）
     /// Receiver 调用 `process_entry(entry, src_storage, dest_storage, ...)` 完成完整复制
-    CopyEntry { entry: Arc<EntryEnum> },
+    CopyEntry {
+        #[serde(with = "storage_adapter::observation_wire::shared")]
+        entry: Arc<ObservedEntry>,
+    },
 
     // ── 双进程模式：数据流模式（Receiver 只有 dest storage，Sender 流式发送数据） ──
     /// 创建目录（Receiver 调用 `create_dir_all` + `set_metadata` + ACL）
-    CreateDir { entry: Arc<EntryEnum> },
-    /// 创建符号链接（Sender 已读取 target，Receiver 调用 `create_symlink`）
-    CreateSymlink { entry: Arc<EntryEnum>, target: PathBuf },
-    /// 文件传输开始（Receiver 用于准备写入上下文）
-    FileBegin { ndx: i32, entry: Arc<EntryEnum> },
-    /// 文件数据块（不带 `ndx`：dc task 严格串行处理，同一时刻只有一个 `ActiveFile`，
-    /// 落盘路由靠 `FileBegin`/`FileCommit` 上的 `ndx` 即可确定，chunk 级 `ndx` 从未被读取）
-    FileData { entry: Arc<EntryEnum>, chunk: DataChunk },
-    /// 文件传输结束
-    EndOfFile {
-        ndx: i32,
-        entry: Arc<EntryEnum>,
-        source_hash: Option<String>,
+    CreateDir {
+        #[serde(with = "storage_adapter::observation_wire::shared")]
+        entry: Arc<ObservedEntry>,
     },
+    /// 创建符号链接（Sender 已读取 target，Receiver 调用 `create_symlink`）
+    CreateSymlink {
+        #[serde(with = "storage_adapter::observation_wire::shared")]
+        entry: Arc<ObservedEntry>,
+        target: PathBuf,
+    },
+    /// 文件传输开始（Receiver 用于准备写入上下文）
+    FileBegin { ndx: i32 },
+    /// 按已广告的原生版本事实创建删除标记，和文件数据共用有序 Data 流。
+    WriteDeleteMarker { ndx: i32 },
+    /// 文件数据块只携带会话索引；元数据由 FileBegin 确定，接收端拒绝不匹配的索引。
+    FileData { ndx: i32, chunk: DataChunk },
+    /// 文件传输结束
+    EndOfFile { ndx: i32, source_hash: Option<String> },
 
     // ── 增量传输（chunk 级 delta，Phase 5 实现） ──
     /// Delta token: 原始数据（源文件中目标端没有的部分）
@@ -249,13 +258,19 @@ pub enum SenderMsg {
     // ── Packaged（tar 打包模式） ──
     /// 打包目录为 tar（Sender 完成打包后发送结果）
     TarPacked {
-        tar_entry: Arc<EntryEnum>,
-        manifest_entries: Vec<Arc<EntryEnum>>,
+        #[serde(with = "storage_adapter::observation_wire::shared")]
+        tar_entry: Arc<ObservedEntry>,
+        #[serde(with = "storage_adapter::observation_wire::batch")]
+        manifest_entries: Vec<Arc<ObservedEntry>>,
     },
 
     // ── ACL 跨进程传输 ──
     /// 设置 ACL（Sender 读取后发送二进制数据，Receiver 设置）
-    SetAcl { entry: Arc<EntryEnum>, acl_data: Bytes },
+    SetAcl {
+        #[serde(with = "storage_adapter::observation_wire::shared")]
+        entry: Arc<ObservedEntry>,
+        acl_data: Bytes,
+    },
 
     // ── 控制消息 ──
     /// Walkdir 中的错误（非致命，继续处理）；`ndx`：双进程远端模式下 per-ndx 传输
@@ -315,20 +330,33 @@ pub enum ReceiverMsg {
     //    NdxTable 里，没有对应 ndx。
     /// 分类判定通知（不产生传输请求的三类：`MetadataOnly`/`Skip`/`Deleted`）
     Classified {
-        entry: Arc<EntryEnum>,
+        #[serde(with = "storage_adapter::observation_wire::shared")]
+        entry: Arc<ObservedEntry>,
         decision: TransferDecision,
     },
 
     // ── Entry 级别 ack（单进程 + 双进程通用） ──
     /// Entry 写入成功（Receiver 完成写入 + `set_metadata` + ACL 后发送）
-    EntrySuccess { entry: Arc<EntryEnum> },
+    EntrySuccess {
+        #[serde(with = "storage_adapter::observation_wire::shared")]
+        entry: Arc<ObservedEntry>,
+    },
     /// Entry 写入失败
-    EntryError { entry: Arc<EntryEnum>, reason: String },
+    EntryError {
+        #[serde(with = "storage_adapter::observation_wire::shared")]
+        entry: Arc<ObservedEntry>,
+        reason: String,
+    },
     /// tar 包写入成功
     TarSuccess {
-        tar_entry: Arc<EntryEnum>,
-        manifest_entries: Vec<Arc<EntryEnum>>,
+        #[serde(with = "storage_adapter::observation_wire::shared")]
+        tar_entry: Arc<ObservedEntry>,
+        #[serde(with = "storage_adapter::observation_wire::batch")]
+        manifest_entries: Vec<Arc<ObservedEntry>>,
     },
+
+    /// 对已广告的观察完成分类，不重复发送其快照。
+    ClassifiedObservation { ndx: i32, decision: TransferDecision },
 
     // ── NDX 级别 ack（双进程模式） ──
     /// 文件写入成功
@@ -388,13 +416,13 @@ pub enum ReceiverMsg {
 /// payload 与 source evidence。新旧 wire 不兼容，不提供双协议解码。
 ///
 /// 8：remote expert terminal 新增 staged metadata phase。新旧 wire 不兼容，不提供双协议解码。
-pub const PROTOCOL_VERSION: u32 = 10;
+pub const PROTOCOL_VERSION: u32 = 11;
 
 /// 当前 binary 能接受的最低对端协议版本
 ///
 /// 对端版本低于此值时握手拒绝，避免 bincode schema 不兼容导致反序列化失败
 /// 或部分文件已写入、部分未写入的"半执行"不一致状态。
-pub const MIN_SUPPORTED_PROTOCOL_VERSION: u32 = 10;
+pub const MIN_SUPPORTED_PROTOCOL_VERSION: u32 = 11;
 
 /// 完整性校验使用的 hash 算法
 ///
@@ -609,20 +637,35 @@ pub enum TransferDecision {
 pub enum DiskCommitMsg {
     // ── 目录/符号链接（即时完成，不需要 multi-chunk） ──
     /// 创建目录 + `set_metadata` + ACL
-    CreateDir { entry: Arc<EntryEnum> },
+    CreateDir {
+        entry: Arc<ObservedEntry>,
+    },
     /// 创建符号链接
-    CreateSymlink { entry: Arc<EntryEnum>, target: PathBuf },
+    CreateSymlink {
+        entry: Arc<ObservedEntry>,
+        target: PathBuf,
+    },
+
+    WriteDeleteMarker {
+        ndx: i32,
+        entry: ObservedItem,
+    },
 
     // ── 全量文件传输（3 段流式驱动） ──
     /// 文件开始：Receiver 据此 resume_prepare + 起 write_chunk_stream
-    FileBegin { ndx: i32, entry: Arc<EntryEnum> },
-    /// 文件数据块（直接转发 DataChunk 给 write_chunk_stream 的 channel；不带 `ndx`：
-    /// dc task 严格串行，同一时刻只有一个 `ActiveFile`，从未被读取）
-    FileChunk { entry: Arc<EntryEnum>, chunk: DataChunk },
+    FileBegin {
+        ndx: i32,
+        entry: ObservedItem,
+    },
+    /// 按活动文件的会话索引核验后转交数据块，避免每块持有完整观察。
+    FileChunk {
+        ndx: i32,
+        chunk: DataChunk,
+    },
     /// 文件传输结束，提交：读回 .part hash 校验 + set_metadata + ACL + 原子 rename
     FileCommit {
         ndx: i32,
-        entry: Arc<EntryEnum>,
+        entry: Arc<ObservedEntry>,
         source_hash: Option<String>,
     },
 
@@ -632,25 +675,31 @@ pub enum DiskCommitMsg {
     /// 只有一个 `ActiveFile`），basis 读失败等 mid-stream 错误需要据此上报 outcome
     DeltaBegin {
         ndx: i32,
-        entry: Arc<EntryEnum>,
+        entry: Arc<ObservedEntry>,
         block_size: u32,
     },
     /// Delta: 原始数据
-    DeltaData { entry: Arc<EntryEnum>, data: Bytes },
+    DeltaData {
+        entry: Arc<ObservedEntry>,
+        data: Bytes,
+    },
     /// Delta: 引用目标端 basis file 的 block
-    DeltaMatch { entry: Arc<EntryEnum>, block_index: u32 },
+    DeltaMatch {
+        entry: Arc<ObservedEntry>,
+        block_index: u32,
+    },
     /// Delta 完成：读回 .part hash 校验 + 原子 rename（与 `FileCommit` 同构）
     DeltaCommit {
         ndx: i32,
-        entry: Arc<EntryEnum>,
+        entry: Arc<ObservedEntry>,
         source_hash: Option<String>,
     },
 
     // ── tar 包 ──
     /// tar 打包结果
     TarPacked {
-        tar_entry: Arc<EntryEnum>,
-        manifest_entries: Vec<Arc<EntryEnum>>,
+        tar_entry: Arc<ObservedEntry>,
+        manifest_entries: Vec<Arc<ObservedEntry>>,
     },
 
     // ── 控制 ──
@@ -696,10 +745,10 @@ pub enum FileOutcome {
 // NDX 映射表（双进程模式下 Receiver 和 Sender 各持一份）
 // ============================================================
 
-/// NDX → `EntryEnum` 的映射表
+/// NDX → `ObservedEntry` 的映射表
 #[derive(Debug, Default)]
 pub struct NdxTable {
-    entries: std::collections::HashMap<i32, Arc<EntryEnum>>,
+    entries: std::collections::HashMap<i32, ObservedItem>,
 }
 
 impl NdxTable {
@@ -718,7 +767,7 @@ impl NdxTable {
     }
 
     /// 按 NDX 查找 entry
-    pub fn get(&self, ndx: i32) -> Option<&Arc<EntryEnum>> {
+    pub fn get(&self, ndx: i32) -> Option<&ObservedItem> {
         self.entries.get(&ndx)
     }
 
@@ -739,8 +788,8 @@ impl NdxTable {
 /// 目标端目录索引（按页粒度构建，处理完一页后释放）
 #[derive(Debug, Default)]
 pub struct DestIndex {
-    /// name → 目标端 EntryEnum（仅当前目录下的直接子条目）
-    entries: std::collections::HashMap<String, Arc<EntryEnum>>,
+    /// name → 目标端 ObservedEntry（仅当前目录下的直接子条目）
+    entries: std::collections::HashMap<String, Arc<ObservedEntry>>,
     /// 已被源端 file list 匹配的条目名
     matched: std::collections::HashSet<String>,
 }
@@ -751,12 +800,12 @@ impl DestIndex {
     }
 
     /// 插入一个目标端条目
-    pub fn insert(&mut self, entry: Arc<EntryEnum>) {
+    pub fn insert(&mut self, entry: Arc<ObservedEntry>) {
         self.entries.insert(entry.get_name().to_string(), entry);
     }
 
     /// 与源端 entry 比较，返回传输决策
-    pub fn check(&mut self, src_entry: &EntryEnum) -> TransferDecision {
+    pub fn check(&mut self, src_entry: &ObservedEntry) -> TransferDecision {
         let name = src_entry.get_name();
         match self.entries.get(name) {
             None => TransferDecision::FullTransfer,
@@ -778,12 +827,12 @@ impl DestIndex {
     /// 孤儿判定 = 目标端存在而源端不存在。`page.subdirs` 走 `create_dir_all` 路径、
     /// 不经 `check()`，必须单独登记，否则目标端预先存在的同名子目录会被
     /// `orphaned_entries()` 误判为孤儿而整树删除。
-    pub fn mark_matched(&mut self, src_entry: &EntryEnum) {
+    pub fn mark_matched(&mut self, src_entry: &ObservedEntry) {
         self.matched.insert(src_entry.get_name().to_string());
     }
 
     /// 返回目标端存在但源端 file list 中不存在的条目（需删除）
-    pub fn orphaned_entries(&self) -> Vec<&Arc<EntryEnum>> {
+    pub fn orphaned_entries(&self) -> Vec<&Arc<ObservedEntry>> {
         self.entries
             .iter()
             .filter(|(name, _)| !self.matched.contains(name.as_str()))
@@ -793,18 +842,15 @@ impl DestIndex {
 }
 
 /// 数据比较：mtime + size
-fn data_check(src: &EntryEnum, dest: &EntryEnum) -> bool {
+fn data_check(src: &ObservedEntry, dest: &ObservedEntry) -> bool {
     src.get_mtime() == dest.get_mtime() && src.get_size() == dest.get_size()
 }
 
-/// 元数据比较：按 `EntryEnum` 类型比较不同字段
-fn metadata_check(src: &EntryEnum, dest: &EntryEnum) -> bool {
-    match (src, dest) {
-        (EntryEnum::NAS(s), EntryEnum::NAS(d)) => s.mode == d.mode && s.uid == d.uid && s.gid == d.gid,
-        (EntryEnum::S3(s), EntryEnum::S3(d)) => s.tags == d.tags,
-        // 跨类型（NAS→S3 或 S3→NAS）：元数据体系不同，视为不匹配
-        _ => false,
-    }
+/// 元数据比较：按 `ObservedEntry` 类型比较不同字段
+fn metadata_check(src: &ObservedEntry, dest: &ObservedEntry) -> bool {
+    src.backend_kind() == dest.backend_kind()
+        && src.metadata().ownership_mode() == dest.metadata().ownership_mode()
+        && src.metadata().tags() == dest.metadata().tags()
 }
 
 #[cfg(test)]
@@ -941,7 +987,16 @@ mod tests {
         assert!(matches!(current.negotiate(&old), HandshakeResult::Rejected { .. }));
     }
 
-    /// 双方均为当前版本（v10）时握手应正常通过。
+    #[test]
+    fn negotiate_rejects_the_previous_repeated_entry_frame_format() {
+        let current = ProtocolHandshake::current();
+        let mut old = current.clone();
+        old.protocol_version = 10;
+        old.min_supported_version = 10;
+        assert!(matches!(current.negotiate(&old), HandshakeResult::Rejected { .. }));
+    }
+
+    /// 双方均为当前版本时握手应正常通过。
     #[test]
     fn negotiate_accepts_matching_current_peers() {
         let current = ProtocolHandshake::current();

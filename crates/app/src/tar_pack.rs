@@ -2,12 +2,13 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
+use storage_adapter::ObservedEntryExt;
 use storage_adapter::WalkOptions;
 
 // 内部模块
 use storage_adapter::qos::QosManager;
 use storage_adapter::storage_enum::StorageEnum;
-use storage_adapter::{EntryEnum, NASEntry, S3Entry, StorageEntryMessage, WalkDirAsyncIterator};
+use storage_adapter::{ObservedEntry, StorageEntryMessage, WalkDirAsyncIterator};
 // 外部crate
 use tracing::{debug, info};
 
@@ -23,9 +24,9 @@ use crate::error::{AppError, Result};
 /// - `tar_entry`: 合成的条目，表示目标端的 .tar 文件（变体与输入 `dir_entry` 一致）
 /// - `manifest_list`: tar 内所有条目的列表（供后续写入 manifest 表）
 pub async fn pack_directory(
-    src_storage: &StorageEnum, dest_storage: &StorageEnum, dir_entry: &EntryEnum, is_source_reserved: bool,
+    src_storage: &StorageEnum, dest_storage: &StorageEnum, dir_entry: &ObservedEntry, is_source_reserved: bool,
     qos: Option<QosManager>, bytes_counter: Option<Arc<AtomicU64>>,
-) -> Result<(EntryEnum, Vec<Arc<EntryEnum>>)> {
+) -> Result<(ObservedEntry, Vec<Arc<ObservedEntry>>)> {
     let dir_path = dir_entry.get_relative_path();
     let dir_mtime = dir_entry.get_mtime();
 
@@ -61,57 +62,8 @@ pub async fn pack_directory(
         manifest_list.len()
     );
 
-    // 根据输入条目类型构造对应变体的 tar_entry
-    let tar_name = tar_relative_path
-        .file_name()
-        .map(|n| n.to_string_lossy().to_string())
-        .unwrap_or_default();
-    let tar_entry = match dir_entry {
-        EntryEnum::NAS(_) => EntryEnum::NAS(NASEntry {
-            name: tar_name,
-            relative_path: tar_relative_path,
-            extension: Some("tar".to_string()),
-            is_dir: false,
-            size: tar_size,
-            atime: dir_mtime,
-            ctime: dir_mtime,
-            mtime: dir_mtime,
-            mode: dir_entry.get_mode(),
-            is_symlink: false,
-            hard_links: None,
-            uid: dir_entry.get_uid(),
-            gid: dir_entry.get_gid(),
-            ino: None,
-            file_handle: None,
-            acl: None,
-            owner: None,
-            owner_group: None,
-            xattrs: None,
-        }),
-        EntryEnum::S3(_) => EntryEnum::S3(S3Entry {
-            name: tar_name,
-            relative_path: tar_relative_path.to_string_lossy().replace('\\', "/"),
-            extension: Some("tar".to_string()),
-            is_dir: false,
-            size: tar_size,
-            mtime: dir_mtime,
-            tags: None,
-            version_id: None,
-            is_latest: false,
-            is_delete_marker: false,
-            version_count: None,
-        }),
-        EntryEnum::HDFS(entry) => {
-            let mut tar = entry.clone();
-            tar.name = tar_name;
-            tar.relative_path = tar_relative_path;
-            tar.extension = Some("tar".to_string());
-            tar.is_dir = false;
-            tar.size = tar_size;
-            tar.mtime = dir_mtime;
-            EntryEnum::HDFS(tar)
-        }
-    };
+    // 归档是目标端已经发布的真实文件，读取其原生观察，不能借用源目录身份拼造条目。
+    let tar_entry = dest_storage.get_metadata(&tar_relative_path).await?;
 
     // 删除源端目录（如果不保留）
     if !is_source_reserved {
@@ -123,7 +75,7 @@ pub async fn pack_directory(
 }
 
 /// 从 walkdir 迭代器收集所有条目
-async fn collect_entries(iterator: WalkDirAsyncIterator) -> Result<Vec<Arc<EntryEnum>>> {
+async fn collect_entries(iterator: WalkDirAsyncIterator) -> Result<Vec<Arc<ObservedEntry>>> {
     let mut entries = Vec::new();
     let mut enumeration_error = None;
     while let Some(message) = iterator.next().await {

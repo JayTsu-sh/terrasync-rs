@@ -6,11 +6,13 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use storage_adapter::ObservedEntryExt;
 #[cfg(test)]
 use storage_adapter::TransferMode;
+use storage_adapter::observed_scan::ObservedItem;
 
 use storage_adapter::dir_tree::DirPageResult;
-use storage_adapter::{DataChunk, EntryEnum, StorageEnum};
+use storage_adapter::{DataChunk, ObservedEntry, StorageEnum};
 use tokio::sync::mpsc::{Receiver, Sender};
 use tracing::{debug, info, warn};
 use transport::flow_control::{ReceiverCreditState, payload_credit_cost};
@@ -84,7 +86,7 @@ impl TransferLedger {
 pub(crate) struct RemoteSessionState {
     ledger: TransferLedger,
     ndx_table: NdxTable,
-    created_dirs: Vec<Arc<EntryEnum>>,
+    created_dirs: Vec<Arc<ObservedEntry>>,
     active_transfer: ActiveTransfer,
     credit: ReceiverCreditState,
     attempts: HashMap<i32, u8>,
@@ -95,7 +97,7 @@ impl RemoteSessionState {
         self.ndx_table.ingest_page(page);
     }
 
-    pub(crate) fn indexed_entry(&self, ndx: i32) -> Option<&Arc<EntryEnum>> {
+    pub(crate) fn indexed_entry(&self, ndx: i32) -> Option<&ObservedItem> {
         self.ndx_table.get(ndx)
     }
 
@@ -106,7 +108,7 @@ impl RemoteSessionState {
     /// 处理不需要 delta implementation 的基础分类。返回该分类是否已完成处理。
     pub(crate) async fn handle_base_classification(
         &mut self, transport: &(dyn ReceiverTransport + 'static), dest: &StorageEnum, progress: &ReceiverProgress,
-        ndx: i32, entry: &Arc<EntryEnum>, decision: TransferDecision,
+        ndx: i32, entry: &ObservedItem, decision: TransferDecision,
     ) -> bool {
         match decision {
             TransferDecision::FullTransfer => {
@@ -115,15 +117,12 @@ impl RemoteSessionState {
                 true
             }
             TransferDecision::MetadataOnly => {
-                let _ = dest.set_entry_metadata(entry).await;
+                let _ = dest.set_entry_metadata(&entry.entry).await;
                 progress
                     .metadata_only
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let _ = transport
-                    .send(ReceiverMsg::Classified {
-                        entry: entry.clone(),
-                        decision,
-                    })
+                    .send(ReceiverMsg::ClassifiedObservation { ndx, decision })
                     .await;
                 true
             }
@@ -132,10 +131,7 @@ impl RemoteSessionState {
                     .files_skipped
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let _ = transport
-                    .send(ReceiverMsg::Classified {
-                        entry: entry.clone(),
-                        decision,
-                    })
+                    .send(ReceiverMsg::ClassifiedObservation { ndx, decision })
                     .await;
                 true
             }
@@ -146,7 +142,7 @@ impl RemoteSessionState {
     /// 处理 changed entry 的 delta eligibility、basis signature 与 full fallback。
     pub(crate) async fn handle_delta_classification(
         &mut self, transport: &(dyn ReceiverTransport + 'static), dest: &Arc<StorageEnum>, features: &FeatureFlags,
-        delta_size_threshold: u64, ndx: i32, entry: &Arc<EntryEnum>, decision: TransferDecision,
+        delta_size_threshold: u64, ndx: i32, entry: &ObservedItem, decision: TransferDecision,
     ) -> bool {
         if decision != TransferDecision::DeltaTransfer {
             return false;
@@ -172,7 +168,8 @@ impl RemoteSessionState {
         }
 
         let block_size = sync_delta::calculate_block_size(size);
-        let (mut basis_rx, basis_handle) = StorageEnum::read_chunk_stream(dest, entry, None, None, false, 8);
+        let (mut basis_rx, basis_handle) =
+            StorageEnum::read_basis_chunk_stream(dest, &entry.entry, None, None, false, 8);
         let mut sig_calc = sync_delta::signature::SignatureCalculator::new(block_size);
         while let Some(chunk) = basis_rx.recv().await {
             sig_calc.push(&chunk.data);
@@ -219,25 +216,25 @@ impl RemoteSessionState {
         dest_index: &mut DestIndex, delete_target: bool,
     ) {
         for subdir in &page.subdirs {
-            dest_index.mark_matched(&subdir.entry);
+            dest_index.mark_matched(&subdir.entry.entry);
             if let Err(error) = validate_relative_path(subdir.entry.get_relative_path()) {
                 warn!("[Receiver Remote] Rejecting unsafe subdir path: {}", error);
                 let _ = transport
                     .send(ReceiverMsg::EntryError {
-                        entry: subdir.entry.clone(),
+                        entry: Arc::clone(&subdir.entry.entry),
                         reason: format!("{error}"),
                     })
                     .await;
                 continue;
             }
-            if let Err(error) = dest.create_dir_all(&subdir.entry).await {
+            if let Err(error) = dest.create_dir_all(&subdir.entry.entry).await {
                 warn!(
                     "[Receiver Remote] create_dir {:?}: {}",
                     subdir.entry.get_relative_path(),
                     error
                 );
             }
-            self.created_dirs.push(subdir.entry.clone());
+            self.created_dirs.push(Arc::clone(&subdir.entry.entry));
         }
 
         if !delete_target {
@@ -296,7 +293,7 @@ impl RemoteSessionState {
         }
     }
 
-    pub(crate) async fn begin_full(&mut self, dc_tx: &Sender<DiskCommitMsg>, ndx: i32, entry: Arc<EntryEnum>) -> bool {
+    pub(crate) async fn begin_full(&mut self, dc_tx: &Sender<DiskCommitMsg>, ndx: i32, entry: ObservedItem) -> bool {
         if self.ledger.terminated_ndx.contains(&ndx) {
             debug!("[Receiver Remote] dropping late FileBegin for terminated ndx {}", ndx);
             return false;
@@ -306,26 +303,31 @@ impl RemoteSessionState {
             return false;
         }
         self.active_transfer = ActiveTransfer::Full { ndx };
-        let _ = dc_tx.send(DiskCommitMsg::FileBegin { ndx, entry }).await;
+        let _ = dc_tx
+            .send(DiskCommitMsg::FileBegin {
+                ndx,
+                entry: entry.into(),
+            })
+            .await;
         true
     }
 
-    async fn push_full_chunk(&self, dc_tx: &Sender<DiskCommitMsg>, entry: Arc<EntryEnum>, chunk: DataChunk) -> bool {
-        if !matches!(self.active_transfer, ActiveTransfer::Full { .. }) {
+    async fn push_full_chunk(&self, dc_tx: &Sender<DiskCommitMsg>, ndx: i32, chunk: DataChunk) -> bool {
+        if !matches!(self.active_transfer, ActiveTransfer::Full { ndx: active } if active == ndx) {
             warn!("[Receiver Remote] rejecting FileData without an active full transfer");
             return false;
         }
-        dc_tx.send(DiskCommitMsg::FileChunk { entry, chunk }).await.is_ok()
+        dc_tx.send(DiskCommitMsg::FileChunk { ndx, chunk }).await.is_ok()
     }
 
     /// Accepts one full-data chunk at the bounded disk-commit seam and returns
     /// credit only after that enqueue succeeds.
     pub(crate) async fn accept_full_chunk(
-        &mut self, transport: &(dyn ReceiverTransport + 'static), dc_tx: &Sender<DiskCommitMsg>, entry: Arc<EntryEnum>,
+        &mut self, transport: &(dyn ReceiverTransport + 'static), dc_tx: &Sender<DiskCommitMsg>, ndx: i32,
         chunk: DataChunk,
     ) -> Result<bool> {
         let bytes = payload_credit_cost(&chunk.data);
-        if !self.push_full_chunk(dc_tx, entry, chunk).await {
+        if !self.push_full_chunk(dc_tx, ndx, chunk).await {
             return Ok(false);
         }
         self.credit.accepted(transport, bytes).await?;
@@ -334,7 +336,7 @@ impl RemoteSessionState {
 
     /// 提交 active full transfer；返回 false 表示该 `EndOfFile` 应由 delta 路径处理。
     pub(crate) async fn commit_full(
-        &mut self, dc_tx: &Sender<DiskCommitMsg>, ndx: i32, entry: &Arc<EntryEnum>, source_hash: &Option<String>,
+        &mut self, dc_tx: &Sender<DiskCommitMsg>, ndx: i32, entry: &Arc<ObservedEntry>, source_hash: &Option<String>,
     ) -> bool {
         if self.ledger.terminated_ndx.contains(&ndx)
             || !matches!(self.active_transfer, ActiveTransfer::Full { ndx: active_ndx } if active_ndx == ndx)
@@ -354,7 +356,9 @@ impl RemoteSessionState {
 
     /// Lazily starts the delta stream for `ndx`. Repeated events for the same
     /// entry are idempotent; interleaved or full-transfer events are rejected.
-    async fn ensure_delta_active(&mut self, dc_tx: &Sender<DiskCommitMsg>, ndx: i32, entry: &Arc<EntryEnum>) -> bool {
+    async fn ensure_delta_active(
+        &mut self, dc_tx: &Sender<DiskCommitMsg>, ndx: i32, entry: &Arc<ObservedEntry>,
+    ) -> bool {
         if self.ledger.terminated_ndx.contains(&ndx) {
             debug!("[Receiver Remote] dropping late delta event for terminated ndx {}", ndx);
             return false;
@@ -388,7 +392,7 @@ impl RemoteSessionState {
     }
 
     pub(crate) async fn push_delta_match(
-        &mut self, dc_tx: &Sender<DiskCommitMsg>, ndx: i32, entry: &Arc<EntryEnum>, block_index: u32,
+        &mut self, dc_tx: &Sender<DiskCommitMsg>, ndx: i32, entry: &Arc<ObservedEntry>, block_index: u32,
     ) -> bool {
         if !self.ensure_delta_active(dc_tx, ndx, entry).await {
             return false;
@@ -403,7 +407,7 @@ impl RemoteSessionState {
     }
 
     async fn push_delta_data(
-        &mut self, dc_tx: &Sender<DiskCommitMsg>, ndx: i32, entry: &Arc<EntryEnum>, data: bytes::Bytes,
+        &mut self, dc_tx: &Sender<DiskCommitMsg>, ndx: i32, entry: &Arc<ObservedEntry>, data: bytes::Bytes,
     ) -> bool {
         if !self.ensure_delta_active(dc_tx, ndx, entry).await {
             return false;
@@ -421,7 +425,7 @@ impl RemoteSessionState {
     /// as full-file chunks. Match tokens intentionally carry no byte credit.
     pub(crate) async fn accept_delta_data(
         &mut self, transport: &(dyn ReceiverTransport + 'static), dc_tx: &Sender<DiskCommitMsg>, ndx: i32,
-        entry: &Arc<EntryEnum>, data: bytes::Bytes,
+        entry: &Arc<ObservedEntry>, data: bytes::Bytes,
     ) -> Result<bool> {
         let bytes = payload_credit_cost(&data);
         if !self.push_delta_data(dc_tx, ndx, entry, data).await {
@@ -433,7 +437,7 @@ impl RemoteSessionState {
 
     /// Commits a delta stream, lazily beginning it when it contains zero tokens.
     pub(crate) async fn commit_delta(
-        &mut self, dc_tx: &Sender<DiskCommitMsg>, ndx: i32, entry: &Arc<EntryEnum>, source_hash: &Option<String>,
+        &mut self, dc_tx: &Sender<DiskCommitMsg>, ndx: i32, entry: &Arc<ObservedEntry>, source_hash: &Option<String>,
     ) -> bool {
         if !self.ensure_delta_active(dc_tx, ndx, entry).await {
             return false;
@@ -641,8 +645,8 @@ mod tests {
 
     use async_trait::async_trait;
     use bytes::Bytes;
+    use storage_adapter::DataChunk;
     use storage_adapter::dir_tree::{DirPageResult, NdxEntry, NdxEvent};
-    use storage_adapter::{DataChunk, NASEntry};
 
     use crate::storage_factory::{StorageRole, create_storage_for_role};
     use tempfile::tempdir;
@@ -783,18 +787,30 @@ mod tests {
                 .await
                 .unwrap(),
         );
-        let entry = Arc::new(dest.get_metadata(std::path::Path::new("file")).await.unwrap());
-        let (incoming_tx, incoming_rx) = mpsc::channel(2);
-        incoming_tx
-            .send(SenderMsg::FileBegin {
-                ndx: 0,
-                entry: entry.clone(),
-            })
+        let source_root = tempdir().unwrap();
+        fs::write(source_root.path().join("file"), b"AAAAXXXX").unwrap();
+        let source = create_storage(source_root.path().to_str().unwrap(), None, false)
             .await
             .unwrap();
+        let entry = Arc::new(source.get_metadata(std::path::Path::new("file")).await.unwrap());
+        let (incoming_tx, incoming_rx) = mpsc::channel(3);
+        incoming_tx
+            .send(SenderMsg::FilePage(DirPageResult {
+                dir_path: String::new(),
+                ndx_start: 0,
+                files: vec![NdxEntry {
+                    ndx: 0,
+                    entry: entry.clone().into(),
+                }],
+                subdirs: Vec::new(),
+                gap_ndx: -1,
+            }))
+            .await
+            .unwrap();
+        incoming_tx.send(SenderMsg::FileBegin { ndx: 0 }).await.unwrap();
         incoming_tx
             .send(SenderMsg::FileData {
-                entry,
+                ndx: 0,
                 chunk: DataChunk {
                     offset: 0,
                     data: Bytes::from_static(b"AAAAXXXX"),
@@ -846,28 +862,31 @@ mod tests {
         assert_terminal_path_discards_residual(false).await;
     }
 
-    fn nas_entry(name: &str, relative_path: PathBuf, is_dir: bool) -> Arc<EntryEnum> {
-        Arc::new(EntryEnum::NAS(NASEntry {
-            name: name.into(),
-            relative_path,
-            extension: None,
-            is_dir,
-            size: 0,
-            atime: 0,
-            ctime: 0,
-            mtime: 0,
-            mode: Some(if is_dir { 0o755 } else { 0o644 }),
-            is_symlink: false,
-            hard_links: None,
-            uid: None,
-            gid: None,
-            ino: None,
-            file_handle: None,
-            acl: None,
-            owner: None,
-            owner_group: None,
-            xattrs: None,
-        }))
+    fn nas_entry(_name: &str, relative_path: PathBuf, is_dir: bool) -> Arc<ObservedEntry> {
+        Arc::new({
+            let fixture_path: std::path::PathBuf = relative_path;
+            crate::observed_fixtures::observation(
+                data_mover::model::BackendKind::Nfs,
+                fixture_path,
+                if is_dir {
+                    data_mover::model::EntryKind::Directory
+                } else if false {
+                    data_mover::model::EntryKind::Symlink
+                } else {
+                    data_mover::model::EntryKind::File
+                },
+                0,
+                [0, 0, 0],
+                Some(data_mover::model::OwnershipMode {
+                    mode: if is_dir { 0o755 } else { 0o644 },
+                    uid: 0u32,
+                    gid: 0u32,
+                }),
+                None,
+                None,
+                None,
+            )
+        })
     }
 
     #[tokio::test]
@@ -886,7 +905,6 @@ mod tests {
             other => panic!("expected one file page, got {other:?}"),
         };
         let ndx = page.files[0].ndx;
-        let entry = page.files[0].entry.clone();
 
         let dest_storage = Arc::new(
             create_storage(dest_dir.path().to_str().unwrap(), None, true)
@@ -931,13 +949,7 @@ mod tests {
 
         sender_transport.send(SenderMsg::FileListDone).await.unwrap();
         assert!(matches!(sender_transport.recv().await, Some(ReceiverMsg::RequestsDone)));
-        sender_transport
-            .send(SenderMsg::FileBegin {
-                ndx,
-                entry: entry.clone(),
-            })
-            .await
-            .unwrap();
+        sender_transport.send(SenderMsg::FileBegin { ndx }).await.unwrap();
 
         // Control-stream completion may overtake data. The session must stay alive until disk commit
         // reports the requested file's durable outcome.
@@ -950,7 +962,7 @@ mod tests {
 
         sender_transport
             .send(SenderMsg::FileData {
-                entry: entry.clone(),
+                ndx,
                 chunk: DataChunk {
                     offset: 0,
                     data: content.clone(),
@@ -959,11 +971,7 @@ mod tests {
             .await
             .unwrap();
         sender_transport
-            .send(SenderMsg::EndOfFile {
-                ndx,
-                entry,
-                source_hash: None,
-            })
+            .send(SenderMsg::EndOfFile { ndx, source_hash: None })
             .await
             .unwrap();
 
@@ -1067,11 +1075,11 @@ mod tests {
                     decision: TransferDecision::FullTransfer,
                     ..
                 }) => saw_full = true,
-                Some(ReceiverMsg::Classified {
+                Some(ReceiverMsg::ClassifiedObservation {
                     decision: TransferDecision::MetadataOnly,
                     ..
                 }) => saw_metadata = true,
-                Some(ReceiverMsg::Classified {
+                Some(ReceiverMsg::ClassifiedObservation {
                     decision: TransferDecision::Skip,
                     ..
                 }) => saw_skip = true,
@@ -1157,7 +1165,7 @@ mod tests {
             files: vec![],
             subdirs: vec![NdxEntry {
                 ndx: 0,
-                entry: nas_entry(&escape_name, escape_path, true),
+                entry: nas_entry(&escape_name, escape_path, true).into(),
             }],
             gap_ndx: -1,
         };
@@ -1213,7 +1221,7 @@ mod tests {
             !state
                 .push_full_chunk(
                     &dc_tx,
-                    entry.clone(),
+                    1,
                     DataChunk {
                         offset: 0,
                         data: Bytes::from_static(b"invalid"),
@@ -1223,19 +1231,19 @@ mod tests {
         );
         assert!(dc_rx.try_recv().is_err());
 
-        assert!(state.begin_full(&dc_tx, 7, entry.clone()).await);
+        assert!(state.begin_full(&dc_tx, 7, entry.clone().into()).await);
         assert!(matches!(
             dc_rx.recv().await,
             Some(DiskCommitMsg::FileBegin { ndx: 7, .. })
         ));
-        assert!(!state.begin_full(&dc_tx, 8, entry.clone()).await);
+        assert!(!state.begin_full(&dc_tx, 8, entry.clone().into()).await);
         assert!(dc_rx.try_recv().is_err());
 
         assert!(
             state
                 .push_full_chunk(
                     &dc_tx,
-                    entry.clone(),
+                    7,
                     DataChunk {
                         offset: 0,
                         data: Bytes::from_static(b"valid"),
@@ -1302,7 +1310,7 @@ mod tests {
             Some(DiskCommitMsg::DeltaCommit { ndx: 9, .. })
         ));
 
-        assert!(state.begin_full(&dc_tx, 10, entry.clone()).await);
+        assert!(state.begin_full(&dc_tx, 10, entry.clone().into()).await);
         assert!(matches!(dc_rx.recv().await, Some(DiskCommitMsg::FileBegin { .. })));
         assert!(
             !state
@@ -1346,7 +1354,7 @@ mod tests {
         let (dc_tx, mut dc_rx) = mpsc::channel(1);
         let mut state = RemoteSessionState::default();
         state.credit = ReceiverCreditState::new(2).unwrap();
-        assert!(state.begin_full(&dc_tx, 1, entry.clone()).await);
+        assert!(state.begin_full(&dc_tx, 1, entry.clone().into()).await);
         assert!(matches!(dc_rx.recv().await, Some(DiskCommitMsg::FileBegin { .. })));
         drop(dc_rx);
 
@@ -1355,7 +1363,7 @@ mod tests {
                 .accept_full_chunk(
                     &receiver_transport,
                     &dc_tx,
-                    entry,
+                    1,
                     DataChunk {
                         offset: 0,
                         data: Bytes::from_static(b"ab"),
@@ -1377,7 +1385,7 @@ mod tests {
         let (_sender_transport, receiver_transport) = create_in_process_pair();
         let (dc_tx, mut dc_rx) = mpsc::channel(1);
         let mut state = RemoteSessionState::default();
-        assert!(state.begin_full(&dc_tx, 1, entry.clone()).await);
+        assert!(state.begin_full(&dc_tx, 1, entry.clone().into()).await);
         assert!(matches!(dc_rx.recv().await, Some(DiskCommitMsg::FileBegin { .. })));
 
         assert!(
@@ -1385,7 +1393,7 @@ mod tests {
                 .accept_full_chunk(
                     &receiver_transport,
                     &dc_tx,
-                    entry.clone(),
+                    1,
                     DataChunk {
                         offset: 0,
                         data: Bytes::from_static(b"a"),
@@ -1400,7 +1408,7 @@ mod tests {
                 .accept_full_chunk(
                     &receiver_transport,
                     &dc_tx,
-                    entry,
+                    1,
                     DataChunk {
                         offset: 1,
                         data: Bytes::from_static(b"b"),
@@ -1487,7 +1495,7 @@ mod tests {
         );
 
         let entry = nas_entry("late.bin", PathBuf::from("late.bin"), false);
-        assert!(!state.begin_full(&dc_tx, ndx, entry.clone()).await);
+        assert!(!state.begin_full(&dc_tx, ndx, entry.clone().into()).await);
         assert!(!state.commit_delta(&dc_tx, ndx, &entry, &None).await);
         assert!(
             dc_rx.try_recv().is_err(),

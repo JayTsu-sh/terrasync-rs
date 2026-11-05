@@ -3,7 +3,7 @@ use super::*;
 use crate::scan::ScanFinalEvent;
 use crate::scan::candidate_cache::{CandidateMetadataCache, missing_hash_columns};
 use crate::scan::compare::NativeScanAccess;
-use crate::scan::rows::{NativeScanKey, NativeScanRecord, OBSERVED_COLUMNS, event_records};
+use crate::scan::rows::{NativeScanKey, NativeWriteBatches, OBSERVED_COLUMNS, event_records};
 use crate::scan::rows::{final_event_records, incremental_record};
 use crate::traits::IncrementalStorageEntryRecord;
 use data_mover::model::ObservedEntry;
@@ -90,33 +90,34 @@ impl ClusterScanStore {
             &self.writes.base
         };
         let _guard = gate.lock().await;
-        let client = idempotent_insert_client(&self.client).with_validation(false);
-        retry_quorum(RequestSafety::IdempotentWrite, || async {
-            if entries.is_empty() {
-                return Ok(());
+        let table = if temporary { "scan_resume_batch" } else { "base" };
+        let epoch = self.epoch.load(Ordering::Relaxed);
+        let generation = self.generation.load(Ordering::Relaxed);
+        for rows in NativeWriteBatches::new(entries, generation) {
+            check_scan_cancellation()?;
+            let mut rows = rows?;
+            for row in &mut rows {
+                cache.apply(row);
             }
-            let table = if temporary { "scan_resume_batch" } else { "base" };
-            let epoch = self.epoch.load(Ordering::Relaxed);
-            // 仅原生固定布局批次使用 bulk RowBinary；查询和增量事件仍校验 schema。
-            let mut insert = client.insert::<ClusterNativeScanRecord>(table).await?;
-            for entry in entries {
-                for view in ObservedView::all(entry) {
-                    let mut record = NativeScanRecord::capture(view, self.generation.load(Ordering::Relaxed))?;
-                    cache.apply(&mut record);
+            let client = idempotent_insert_client(&self.client).with_validation(false);
+            retry_quorum(RequestSafety::IdempotentWrite, || async {
+                let mut insert = client.insert::<ClusterNativeScanRecord>(table).await?;
+                for row in &rows {
                     insert
                         .write(&ClusterNativeScanRecord::new(
-                            self.job_id.clone(),
+                            &self.job_id,
                             epoch,
                             if temporary { self.batch_id } else { 0 },
-                            record,
+                            row,
                         ))
                         .await?;
                 }
-            }
-            insert.end().await?;
-            Ok(())
-        })
-        .await
+                insert.end().await?;
+                Ok(())
+            })
+            .await?;
+        }
+        Ok(())
     }
     pub(crate) async fn compare_native(&mut self, entries: &[Arc<ObservedEntry>]) -> Result<Vec<ObservedScanEvent>> {
         let compared = self.native_access()?.compare(entries).await?;

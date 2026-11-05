@@ -1,5 +1,6 @@
+use crate::observed_scan::{EntryStatistics, ObservedItem, ObservedView};
 use crate::{
-    connected::{path, timestamp},
+    connected::path,
     error::{StreamTransferDiagnostic, operation},
     *,
 };
@@ -86,20 +87,50 @@ pub(crate) fn source_qos(qos: &QosManager, maximum: u64) -> Result<SourceQosGrou
     let (_, group) = groups.get_with(key, || (Arc::downgrade(&config), SourceQosGroup::new(policy)));
     Ok(group)
 }
+#[derive(Clone, Copy)]
+enum ReadBinding {
+    Advertised,
+    Basis,
+}
+
 impl StorageEnum {
-    pub fn read_chunk_stream(
-        storage: &Self, entry: &EntryEnum, intervals: Option<Vec<(u64, u64)>>, qos: Option<QosManager>, hash: bool,
+    pub fn read_basis_chunk_stream(
+        storage: &Self, entry: &Arc<ObservedEntry>, intervals: Option<Vec<(u64, u64)>>, qos: Option<QosManager>,
+        hash: bool, capacity: usize,
+    ) -> (mpsc::Receiver<DataChunk>, JoinHandle<Result<Option<HashCalculator>>>) {
+        Self::start_chunk_stream(
+            storage,
+            &Arc::clone(entry).into(),
+            intervals,
+            qos,
+            hash,
+            capacity,
+            ReadBinding::Basis,
+        )
+    }
+    pub fn read_observed_chunk_stream(
+        storage: &Self, item: &ObservedItem, intervals: Option<Vec<(u64, u64)>>, qos: Option<QosManager>, hash: bool,
         capacity: usize,
     ) -> (mpsc::Receiver<DataChunk>, JoinHandle<Result<Option<HashCalculator>>>) {
+        Self::start_chunk_stream(storage, item, intervals, qos, hash, capacity, ReadBinding::Advertised)
+    }
+    fn start_chunk_stream(
+        storage: &Self, item: &ObservedItem, intervals: Option<Vec<(u64, u64)>>, qos: Option<QosManager>, hash: bool,
+        capacity: usize, binding: ReadBinding,
+    ) -> (mpsc::Receiver<DataChunk>, JoinHandle<Result<Option<HashCalculator>>>) {
         let storage = storage.clone();
-        let entry = entry.clone();
+        let item = item.clone();
         let (tx, rx) = mpsc::channel(capacity.max(1));
         let task = tokio::spawn(async move {
             let source = storage.roles.read_source()?;
-            let p = path(entry.get_relative_path())?;
-            let version = entry
-                .get_version_id()
-                .map_or(SourceVersion::Current, |v| SourceVersion::Id(v.into()));
+            let view = item.view();
+            let p = view.source_path()?;
+            let version = match binding {
+                ReadBinding::Advertised => view
+                    .source_version()
+                    .ok_or_else(|| operation("no object version selected for source read"))?,
+                ReadBinding::Basis => SourceVersion::Current,
+            };
             let descriptor = source.describe_version(&p, &version).await?;
             let size = descriptor.size.ok_or_else(|| operation("unknown source size"))?;
             let ranges = intervals.unwrap_or_else(|| vec![(0, size)]);
@@ -121,7 +152,10 @@ impl StorageEnum {
                     .read(storage::ReadRequest {
                         path: p.clone(),
                         range: Some(start..end),
-                        expected_source: Some(descriptor.source_identity.clone()),
+                        expected_source: Some(match binding {
+                            ReadBinding::Advertised => view.source_identity().clone(),
+                            ReadBinding::Basis => descriptor.source_identity.clone(),
+                        }),
                         maximum_chunk_bytes: source
                             .maximum_read_chunk_bytes()
                             .min(storage.block_size as usize)
@@ -157,34 +191,12 @@ impl StorageEnum {
     }
 }
 /// 从 wire 已捕获的值编译计划；不回读源端，也不修改最终路径。
-fn stream_metadata_plan(destination: &ConnectedStorage, entry: &EntryEnum) -> Result<MetadataPlan> {
+fn stream_metadata_plan(destination: &ConnectedStorage, entry: ObservedView<'_>) -> Result<MetadataPlan> {
     let staged = destination.roles.staged_destination()?;
     let target = staged.copied_metadata_target();
-    let mode = entry.get_mode().map(|value| value & 0o7777);
-    let ownership = match (entry.get_uid(), entry.get_gid(), mode) {
-        (Some(uid), Some(gid), Some(mode)) => Some(OwnershipMode { uid, gid, mode }),
-        _ => None,
-    };
+    let ownership = entry.metadata().ownership_mode().value();
+    let mode = entry.mode().map(|mode| mode & 0o7777);
     let owner_permitted = ownership.is_none_or(|owner| staged.may_set_owner(owner.uid, owner.gid));
-    let tags = entry
-        .get_tags()
-        .map(|tags| {
-            tags.iter()
-                .map(|tag| ObjectTag::new(tag.key.clone(), tag.value.clone()))
-                .collect::<std::result::Result<Vec<_>, _>>()
-        })
-        .transpose()?;
-    let observations = MetadataObservations::new(
-        MetadataObservation::NotRequested,
-        MetadataObservation::NotRequested,
-        captured(tags),
-        captured(ownership),
-        captured(Some(TimestampMetadata {
-            accessed: Some(timestamp(entry.get_atime())),
-            modified: Some(timestamp(entry.get_mtime())),
-            created: None,
-        })),
-    )?;
     let ownership_target = match target.map(|target| target.ownership) {
         Some(CopiedOwnershipTarget::Numeric) if owner_permitted => OwnershipTarget::Numeric,
         Some(CopiedOwnershipTarget::Numeric) => OwnershipTarget::NotPermitted,
@@ -215,14 +227,14 @@ fn stream_metadata_plan(destination: &ConnectedStorage, entry: &EntryEnum) -> Re
         } else {
             MetadataPolicy::BestEffort
         })
-        .with_tags(if entry.get_tags().is_some() {
+        .with_tags(if entry.metadata().tags().value().is_some() {
             MetadataPolicy::BestEffort
         } else {
             MetadataPolicy::Omit
         });
     Ok(compile_copied_metadata_plan(
         &MetadataPlanRequest {
-            observations: &observations,
+            observations: entry.metadata(),
             target: MetadataTarget {
                 acl: AclTarget::NotApplicable,
                 xattrs: ValueTarget::NotApplicable,
@@ -241,13 +253,6 @@ fn stream_metadata_plan(destination: &ConnectedStorage, entry: &EntryEnum) -> Re
         false,
         false,
     )?)
-}
-
-fn captured<T>(value: Option<T>) -> MetadataObservation<T> {
-    value.map_or(MetadataObservation::NotRequested, |value| MetadataObservation::Value {
-        value,
-        provenance: MetadataProvenance::Inline,
-    })
 }
 
 /// basis 提示只由 Receiver 的重建器产生；同位置引用已读取并计入完整摘要。
@@ -327,27 +332,36 @@ impl StreamHandle {
     }
 }
 impl StorageEnum {
-    pub async fn prepare_stream(dest: &Self, entry: &EntryEnum) -> Result<StreamHandle> {
+    pub async fn prepare_stream(dest: &Self, entry: &ObservedEntry) -> Result<StreamHandle> {
         Self::prepare_stream_with_mode(dest, entry, TransferMode::Atomic, CancellationToken::new()).await
     }
 
     pub async fn prepare_stream_with_mode(
-        dest: &Self, entry: &EntryEnum, mode: TransferMode, cancel: CancellationToken,
+        dest: &Self, entry: &ObservedEntry, mode: TransferMode, cancel: CancellationToken,
+    ) -> Result<StreamHandle> {
+        Self::prepare_observed_stream(
+            dest,
+            ObservedView {
+                entry,
+                version_index: entry.history().map(|_| 0),
+            },
+            mode,
+            cancel,
+        )
+        .await
+    }
+    pub async fn prepare_observed_stream(
+        dest: &Self, entry: ObservedView<'_>, mode: TransferMode, cancel: CancellationToken,
     ) -> Result<StreamHandle> {
         let cancel = cancel.child_token();
         dest.validate_stream_transfer_mode(mode)?;
-        let p = path(entry.get_relative_path())?;
-        // wire 元数据固定本轮源描述；目标检查点由上游绑定并校验，传输仍接收全量摘要证据。
-        let identity = SourceIdentity::new(
-            BackendIdentity::new(BackendKind::Local, "terrasync-wire-v10")?,
-            IdentityStrength::PathScoped,
-            blake3::hash(p.as_str().as_bytes()).as_bytes(),
-        )?;
+        let p = entry.source_path()?;
+        let identity = entry.source_identity().clone();
         let observed = ObservedEntry::new(
             p.clone(),
             EntryKind::File,
             Some(entry.get_size()),
-            Some(timestamp(entry.get_mtime())),
+            entry.version().map_or(entry.entry.modified(), VersionRecord::modified),
             identity,
         )?;
         let metadata_plan = stream_metadata_plan(dest, entry)?;
@@ -414,7 +428,7 @@ impl StorageEnum {
         })
     }
     pub async fn write_chunk_stream(
-        _dest: &Self, _entry: &EntryEnum, rx: mpsc::Receiver<DataChunk>, handle: &StreamHandle,
+        _dest: &Self, _entry: &ObservedEntry, rx: mpsc::Receiver<DataChunk>, handle: &StreamHandle,
         _qos: Option<QosManager>, on_committed: CommitCallback,
     ) -> Result<()> {
         let input: Input = Box::pin(stream::unfold(rx, |mut rx| async {
@@ -507,7 +521,9 @@ impl StorageEnum {
             Err(failure) => Err(cleanup_stream_failure(failure, mode).await),
         }
     }
-    pub async fn commit_chunk_stream(_dest: &Self, _entry: &EntryEnum, _size: u64, handle: StreamHandle) -> Result<()> {
+    pub async fn commit_chunk_stream(
+        _dest: &Self, _entry: &ObservedEntry, _size: u64, handle: StreamHandle,
+    ) -> Result<()> {
         let mut state = handle.state.lock().await;
         if let Some(direct) = state.direct.take() {
             state.written_bytes = direct.complete().await?;

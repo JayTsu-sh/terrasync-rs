@@ -10,6 +10,7 @@
 pub mod ace;
 
 pub mod broadcast;
+mod copy_dispatch;
 
 /// 双进程模式 Receiver 落盘任务模块
 ///
@@ -131,3 +132,7 @@ pub mod prelude {
     /// 文件复制功能
     pub use crate::sync::{incremental_sync, sync};
 }
+
+#[cfg(test)]
+#[path = "../../../tests/support/observed.rs"]
+mod observed_fixtures;

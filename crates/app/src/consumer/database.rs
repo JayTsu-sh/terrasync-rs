@@ -2,12 +2,14 @@
 use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
+use storage_adapter::ObservedEntryExt;
+use storage_adapter::observed_scan::ObservedItem;
 
 // 外部crate
 use db::error::DatabaseError;
 use db::factory::DatabaseFactory;
 use db::traits::{Database, TarManifestRecord};
-use storage_adapter::{EntryEnum, StorageEntryMessage};
+use storage_adapter::{ObservedEntry, StorageEntryMessage};
 use tokio::sync::mpsc;
 use tracing::{Instrument, debug, error, info, info_span, trace, warn};
 
@@ -113,7 +115,7 @@ impl Consumer for DatabaseConsumer {
             async move {
                 // 预分配容量以优化性能
                 let mut current_message_batch: Vec<StorageEntryMessage> = Vec::with_capacity(batch_size as usize);
-                let mut current_insert_entry_batch: Vec<Arc<EntryEnum>> = Vec::with_capacity(batch_size as usize);
+                let mut current_insert_entry_batch: Vec<ObservedItem> = Vec::with_capacity(batch_size as usize);
                 let mut current_delete_entry_batch: Vec<String> = Vec::with_capacity(batch_size as usize);
                 let mut processed_count = 0;
                 let mut processed_errors = DatabaseFailures::default();
@@ -125,19 +127,20 @@ impl Consumer for DatabaseConsumer {
                             // 全量扫描场景：将扫描到的条目插入基础表
                             // 其他场景（如增量扫描）Scanned 仅用于统计，无需入库
                             if job_type == JobType::Scan {
-                                DatabaseConsumer::batch_insert_base_record(
-                                    db.as_ref(),
-                                    &entry,
-                                    &mut current_insert_entry_batch,
-                                    batch_size,
-                                    &mut processed_errors,
-                                )
-                                .await;
+                                for item in ObservedItem::all(&entry) {
+                                    DatabaseConsumer::batch_insert_base_record(
+                                        db.as_ref(),
+                                        &item,
+                                        &mut current_insert_entry_batch,
+                                        batch_size,
+                                        &mut processed_errors,
+                                    )
+                                    .await;
+                                }
                             }
                         }
                         StorageEntryMessage::New(entry) => {
                             trace!(path = %entry.get_relative_path().display(), "db: new entry");
-                            let db_clone = Box::clone(&db);
 
                             // 全量拷贝(Copy)和增量拷贝(IncrementalCopy)都需要插入基础表；
                             // 增量扫描(IncrementalScan)无需插入基础表（临时表导入主表时已处理）。
@@ -155,7 +158,7 @@ impl Consumer for DatabaseConsumer {
                             // 全量拷贝(Copy)只需入基础表，不需要增量记录。
                             if job_type != JobType::Copy {
                                 DatabaseConsumer::batch_insert_incremental_record(
-                                    db_clone.as_ref(),
+                                    db.as_ref(),
                                     &StorageEntryMessage::New(entry),
                                     &mut current_message_batch,
                                     batch_size,
@@ -187,7 +190,7 @@ impl Consumer for DatabaseConsumer {
                             // 在增量拷贝和增量扫描场景均需要更新数据库里的记录
                             DatabaseConsumer::batch_insert_base_record(
                                 db.as_ref(),
-                                &to_entry,
+                                &Arc::clone(&to_entry).into(),
                                 &mut current_insert_entry_batch,
                                 batch_size,
                                 &mut processed_errors,
@@ -382,7 +385,7 @@ impl DatabaseConsumer {
     /// * `current_batch` - 当前批次的记录，新记录会被添加到这里
     /// * `batch_size` - 批量插入的大小阈值
     async fn batch_insert_base_record(
-        database: &dyn Database, entry: &Arc<EntryEnum>, current_batch: &mut Vec<Arc<EntryEnum>>, batch_size: u32,
+        database: &dyn Database, entry: &ObservedItem, current_batch: &mut Vec<ObservedItem>, batch_size: u32,
         processed_errors: &mut DatabaseFailures,
     ) {
         current_batch.push(entry.clone());
@@ -396,7 +399,7 @@ impl DatabaseConsumer {
 
             let batch_len = current_batch.len();
             if let Err(e) =
-                retry_batch_operation("insert_base", || database.batch_insert_base_record(current_batch)).await
+                retry_batch_operation("insert_base", || database.batch_insert_completed_records(current_batch)).await
             {
                 error!(
                     "[DatabaseConsumer] Failed to insert batch after {} retries, discarding {} records: {}",
@@ -419,7 +422,7 @@ impl DatabaseConsumer {
     /// * `database` - 数据库实例引用
     /// * `current_batch` - 当前批次的记录，处理后会被清空
     async fn finalize_insert_base_record(
-        database: &dyn Database, current_batch: &mut Vec<Arc<EntryEnum>>, processed_errors: &mut DatabaseFailures,
+        database: &dyn Database, current_batch: &mut Vec<ObservedItem>, processed_errors: &mut DatabaseFailures,
     ) {
         if current_batch.is_empty() {
             info!("[DatabaseConsumer] No remaining records to flush");
@@ -430,7 +433,7 @@ impl DatabaseConsumer {
             );
 
             if let Err(e) = retry_batch_operation("finalize_insert_base", || {
-                database.batch_insert_base_record(current_batch)
+                database.batch_insert_completed_records(current_batch)
             })
             .await
             {
@@ -487,7 +490,7 @@ impl DatabaseConsumer {
     }
 
     async fn batch_delete_base_record(
-        database: &dyn Database, entry: &Arc<EntryEnum>, current_batch: &mut Vec<String>, batch_size: u32,
+        database: &dyn Database, entry: &Arc<ObservedEntry>, current_batch: &mut Vec<String>, batch_size: u32,
         processed_errors: &mut DatabaseFailures,
     ) {
         current_batch.push(entry.get_relative_path().to_string_lossy().to_string());
@@ -595,7 +598,7 @@ impl DatabaseConsumer {
     }
 
     async fn update_base_record(
-        database: &dyn Database, entry: &Arc<EntryEnum>, processed_errors: &mut DatabaseFailures,
+        database: &dyn Database, entry: &Arc<ObservedEntry>, processed_errors: &mut DatabaseFailures,
     ) {
         if let Err(e) = database.update_base_record(entry).await {
             error!("[DatabaseConsumer] Failed to update base record: {}", e);

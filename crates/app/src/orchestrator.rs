@@ -4,12 +4,14 @@
 //! 通过 Transport 抽象层连接 Sender 和 Receiver，支持单进程和双进程两种模式。
 
 // 标准库
+use crate::copy_dispatch::{CopyQueues, partition_scan};
 use crate::file_copy::{HdfsCopyContext, MetadataApplication, copy_file};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
+use storage_adapter::ObservedEntryExt;
 use storage_adapter::TransferMode;
 
 /// RAII guard：构造时 +1，Drop 时 -1，确保计数器在 panic/early-return 时也能正确回收。
@@ -29,14 +31,13 @@ impl Drop for AtomicCounterGuard<'_> {
 }
 
 // 外部 crate
-use dashmap::DashMap;
 use db::factory::DatabaseFactory;
 use db::traits::Database;
 use db::{self, DeletionStatus, INCREMENTAL_SCAN_TABLE_BASE_NAME};
 use storage_adapter::qos::QosManager;
 #[cfg(windows)]
 use storage_adapter::storage_enum::{StorageType, detect_storage_type};
-use storage_adapter::{ChangeKind, EntryEnum, ErrorEvent, StorageEntryMessage, StorageEnum};
+use storage_adapter::{ChangeKind, ErrorEvent, ObservedEntry, StorageEntryMessage, StorageEnum};
 use tokio::sync::Semaphore;
 use tokio::task::JoinHandle;
 use tracing::{Instrument, error, info, info_span, trace, warn};
@@ -489,7 +490,7 @@ impl SyncOrchestrator {
                                     .await
                                 {
                                     Ok(()) => {
-                                        bc.broadcast(StorageEntryMessage::New(entry)).await;
+                                        bc.broadcast(StorageEntryMessage::New(entry.into())).await;
                                     }
                                     Err(e) => {
                                         error!(
@@ -514,7 +515,7 @@ impl SyncOrchestrator {
                                 manifest_entries,
                             } => {
                                 let tar_path = tar_entry.get_relative_path().to_string_lossy().to_string();
-                                bc.broadcast(StorageEntryMessage::New(tar_entry)).await;
+                                bc.broadcast(StorageEntryMessage::New(tar_entry.into())).await;
                                 bc.broadcast(StorageEntryMessage::TarManifest {
                                     tar_path,
                                     entries: manifest_entries,
@@ -547,19 +548,22 @@ impl SyncOrchestrator {
             large_file_log_threshold: LARGE_FILE_LOG_THRESHOLD,
         });
 
-        let object_buffers: Arc<DashMap<String, Vec<Arc<EntryEnum>>>> = Arc::new(DashMap::new());
+        let (sender_inputs, source_dispatch) = partition_scan(
+            walkdir_iter.clone(),
+            copy_concurrency,
+            DEFAULT_CHANNEL_CAPACITY / copy_concurrency.max(1),
+        );
         let mut sender_handles = Vec::new();
 
-        for worker_id in 0..copy_concurrency {
-            let wi = walkdir_iter.clone();
+        for (worker_id, wi) in sender_inputs.into_iter().enumerate() {
             let src_path = c.src_path.clone();
             let dest_path = c.dest_path.clone();
             let transport = sender_transport.clone();
             let bc = broadcaster.clone();
             let cfg = sender_config.clone();
+            let copy_cfg = receiver_config.clone();
             let qos = qos_manager.clone();
             let bt = bytes_tracker.clone();
-            let ob = object_buffers.clone();
             let aec = active_entry_counter.clone();
             let ec = entry_counter.clone();
             let sc = size_counter.clone();
@@ -594,7 +598,10 @@ impl SyncOrchestrator {
                     done_counter.fetch_add(1, Ordering::Release);
                     let src = storage_pair.get_src_storage().clone();
                     let dest = storage_pair.get_dest_storage().clone();
-                    sender_worker(worker_id, wi, src, dest, transport, &bc, &cfg, qos, bt, ob, aec, ec, sc).await
+                    sender_worker(
+                        worker_id, wi, src, dest, transport, &bc, &cfg, qos, bt, &copy_cfg, aec, ec, sc,
+                    )
+                    .await
                 }
                 .instrument(span),
             );
@@ -616,6 +623,7 @@ impl SyncOrchestrator {
         // ── 11. 等待 Sender workers 完成 ──
         let senders_result = finish_phase(sender_handles).await;
         walkdir_iter.close();
+        let source_dispatch_result = finish_phase(vec![source_dispatch]).await;
 
         // ── 12. 关闭管线（和原始 sync_inner 一致） ──
         // Sender workers 全部完成 → 不再发 CopyEntry
@@ -636,19 +644,12 @@ impl SyncOrchestrator {
         drop(broadcaster);
         let consumers_result = finish_phase(consumer_handles).await;
         let source_result = walkdir_iter.take_error().map_or(Ok(()), |error| Err(error.into()));
-        let history_result = if object_buffers.is_empty() {
-            Ok(())
-        } else {
-            Err(AppError::CopyError(
-                "Incomplete object history; copy cannot commit".into(),
-            ))
-        };
         let result: Result<()> = async {
             source_result
                 .and(senders_result)
                 .and(receivers_result)
                 .and(consumers_result)
-                .and(history_result)?;
+                .and(source_dispatch_result)?;
             if let Some(database) = &database {
                 let destination = Arc::new(
                     create_storage_for_role(
@@ -762,7 +763,8 @@ impl SyncOrchestrator {
         // scan workers → detect_broadcaster → dispatch_task → async_channel(MPMC) → N handler workers → broadcaster
         let mut detect_broadcaster = BroadcastForwarder::<StorageEntryMessage>::new(DEFAULT_CHANNEL_CAPACITY);
         let mut file_op_rx = detect_broadcaster.subscribe();
-        let (work_tx, work_rx) = async_channel::bounded::<StorageEntryMessage>(DEFAULT_CHANNEL_CAPACITY);
+        let (work_queues, handler_inputs) =
+            CopyQueues::new(copy_concurrency, DEFAULT_CHANNEL_CAPACITY / copy_concurrency.max(1));
 
         // ── 6. 并发度 + block_size ──
         let incremental_scan_concurrency = c.concurrency.unwrap_or(app_config.scan.concurrency);
@@ -791,14 +793,13 @@ impl SyncOrchestrator {
 
         // ── 8. QoS + 版本化对象缓冲 ──
         let qos_manager = create_qos_manager(c.qos.as_ref(), c.peak_qos_rate, c.iops);
-        let object_buffers: Arc<DashMap<String, Vec<Arc<EntryEnum>>>> = Arc::new(DashMap::new());
 
         // ── 10. 启动 dispatch task：detect_broadcaster → async_channel（MPMC） ──
         let dispatch_span = info_span!("inc_dispatch");
         let dispatch_handle: JoinHandle<Result<()>> = tokio::spawn(
             async move {
                 while let Some(msg) = file_op_rx.recv().await {
-                    if work_tx.send(msg).await.is_err() {
+                    if work_queues.send(msg).await.is_err() {
                         return Err(AppError::ConsumerError(
                             "Incremental sync handler channel closed".into(),
                         ));
@@ -821,12 +822,10 @@ impl SyncOrchestrator {
         let src_path_str = c.src_path.clone();
         let dest_path_str = c.dest_path.clone();
 
-        for handler_id in 0..copy_concurrency {
-            let rx = work_rx.clone();
+        for (handler_id, rx) in handler_inputs.into_iter().enumerate() {
             let src_path_c = src_path_str.clone();
             let dest_path_c = dest_path_str.clone();
             let bc = broadcaster.clone();
-            let ob = object_buffers.clone();
             let qos = qos_manager.clone();
             let bt = bytes_tracker.clone();
             let enable_integrity_check = c.enable_integrity_check;
@@ -869,17 +868,16 @@ impl SyncOrchestrator {
                     let dest = storage_pair.get_dest_storage().clone();
 
                     let mut failure: Option<AppError> = None;
-                    while let Ok(message) = rx.recv().await {
+                    while let Some(message) = rx.next().await {
                         match message {
                             StorageEntryMessage::New(ref entry) => {
                                 if entry.get_version_id().is_some() {
                                     if let Err(error) = process_versioned_entry(
-                                        entry,
+                                        &entry.entry,
                                         src.clone(),
                                         dest.clone(),
                                         bc.clone(),
                                         qos.clone(),
-                                        ob.clone(),
                                         enable_integrity_check,
                                         enable_acl,
                                         is_source_reserved,
@@ -892,7 +890,7 @@ impl SyncOrchestrator {
                                     }
                                 } else {
                                     match process_entry(
-                                        entry,
+                                        &entry.entry,
                                         src.clone(),
                                         dest.clone(),
                                         enable_integrity_check,
@@ -916,7 +914,7 @@ impl SyncOrchestrator {
                                             bc.broadcast(StorageEntryMessage::Error {
                                                 event: ErrorEvent::Copy,
                                                 path: entry.get_relative_path().to_path_buf(),
-                                                entry: Some(entry.clone()),
+                                                entry: Some(Arc::clone(&entry.entry)),
                                                 reason: format!("{e}"),
                                             })
                                             .await;
@@ -1056,7 +1054,7 @@ impl SyncOrchestrator {
                                 {
                                     Ok((tar_entry, manifest)) => {
                                         let tar_path = tar_entry.get_relative_path().to_string_lossy().to_string();
-                                        bc.broadcast(StorageEntryMessage::New(Arc::new(tar_entry))).await;
+                                        bc.broadcast(StorageEntryMessage::New(Arc::new(tar_entry).into())).await;
                                         bc.broadcast(StorageEntryMessage::TarManifest {
                                             tar_path,
                                             entries: manifest,
@@ -1098,7 +1096,6 @@ impl SyncOrchestrator {
             handler_handles.push(handle);
         }
         // drop work_rx 本体（只有 clone 在 worker 手里）
-        drop(work_rx);
 
         // ── 11.5. 等待所有 handler worker 完成 mount 初始化，输出存活汇总 ──
         wait_for_mount_init(&[(&mount_done_handlers, &alive_handlers, "Handler")], copy_concurrency).await;
@@ -1107,8 +1104,12 @@ impl SyncOrchestrator {
         let database_clone = database.clone();
         let mut scan_worker_handles = Vec::new();
 
-        for worker_id in 0..incremental_scan_concurrency {
-            let worker_walkdir_iter = walkdir_iter.clone();
+        let (scan_inputs, scan_dispatch) = partition_scan(
+            walkdir_iter.clone(),
+            incremental_scan_concurrency,
+            DEFAULT_CHANNEL_CAPACITY / incremental_scan_concurrency.max(1),
+        );
+        for (worker_id, worker_walkdir_iter) in scan_inputs.into_iter().enumerate() {
             let database_clone = database_clone.clone();
             let detect_broadcaster = detect_broadcaster.clone();
             let broadcaster = broadcaster.clone();
@@ -1181,6 +1182,7 @@ impl SyncOrchestrator {
         // ── 14. 等待 scan workers 完成 ──
         let scan_result = finish_phase(scan_worker_handles).await;
         walkdir_iter.close();
+        let scan_dispatch_result = finish_phase(vec![scan_dispatch]).await;
 
         // ── 15. 关闭 detect_broadcaster → dispatch task 的 file_op_rx 耗尽 ──
         // scan workers 已全部退出，其 detect_broadcaster clone 均已 drop；
@@ -1203,19 +1205,12 @@ impl SyncOrchestrator {
         let durable_result = finish_phase(consumer_handles).await;
         let enumeration_result = walkdir_iter.take_error().map_or(Ok(()), |error| Err(error.into()));
         // 未完整比对或未持久化的条目不能作为删除依据。
-        let history_result = if object_buffers.is_empty() {
-            Ok(())
-        } else {
-            Err(AppError::CopyError(
-                "Incomplete object history; refusing deletion phase".into(),
-            ))
-        };
         let phase_a = enumeration_result
             .and(scan_result)
             .and(handler_result)
             .and(durable_result)
             .and(dispatch_result)
-            .and(history_result);
+            .and(scan_dispatch_result);
         if let Err(error) = phase_a {
             if let Some(ref qos_mgr) = qos_manager {
                 qos_mgr.shutdown();
@@ -1341,7 +1336,7 @@ impl SyncOrchestrator {
     /// rename 后的内容与元数据必须完成，才能确认该条目的新状态。
     #[allow(clippy::too_many_arguments)]
     async fn sync_renamed_file_changes(
-        kind: ChangeKind, entry: &EntryEnum, src: &StorageEnum, dest: &StorageEnum, qos: Option<QosManager>,
+        kind: ChangeKind, entry: &ObservedEntry, src: &StorageEnum, dest: &StorageEnum, qos: Option<QosManager>,
         integrity: bool, source_reserved: bool, bytes: Option<Arc<AtomicU64>>, job_id: &str, job_dir: &str,
         transfer_mode: TransferMode,
     ) -> Result<()> {

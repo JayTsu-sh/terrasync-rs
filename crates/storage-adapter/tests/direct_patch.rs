@@ -1,10 +1,12 @@
 #![allow(clippy::expect_used)]
 #![cfg(unix)]
+#[path = "../../../tests/support/observed.rs"]
+mod observed_fixtures;
 use bytes::Bytes;
 use data_mover::transfer::DirectPatchError;
 use std::{error::Error, os::unix::fs::MetadataExt, path::Path};
 use storage_adapter::{
-    CreateStorageOptions, DataChunk, EntryEnum, StorageEnum, StorageError, TransferMode, create_storage,
+    CreateStorageOptions, DataChunk, ObservedEntry, StorageEnum, StorageError, TransferMode, create_storage,
 };
 use tokio::sync::mpsc;
 use tokio::time::{Duration, timeout};
@@ -12,11 +14,15 @@ use tokio_util::sync::CancellationToken;
 
 async fn planned(
     target: &StorageEnum, payload: &[u8],
-) -> Result<(EntryEnum, storage_adapter::StreamHandle), Box<dyn Error>> {
-    let mut entry = target.get_metadata(Path::new("file")).await?;
-    if let EntryEnum::NAS(file) = &mut entry {
-        file.size = payload.len() as u64;
-    }
+) -> Result<(ObservedEntry, storage_adapter::StreamHandle), Box<dyn Error>> {
+    let source_root = tempfile::tempdir()?;
+    std::fs::write(source_root.path().join("file"), payload)?;
+    let source = create_storage(
+        source_root.path().to_str().ok_or("bad source path")?,
+        CreateStorageOptions::new(None, false),
+    )
+    .await?;
+    let entry = source.get_metadata(Path::new("file")).await?;
     let handle =
         StorageEnum::prepare_stream_with_mode(target, &entry, TransferMode::Direct, CancellationToken::new()).await?;
     let (tx, rx) = mpsc::channel(4);

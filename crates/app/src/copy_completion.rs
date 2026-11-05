@@ -1,9 +1,10 @@
 //! 复制轮次收尾：目录元数据全部确认后才允许数据库提交。
 use std::sync::Arc;
 use std::thread::JoinHandle as ThreadHandle;
+use storage_adapter::ObservedEntryExt;
 
 use db::Database;
-use storage_adapter::{EntryEnum, StorageEnum};
+use storage_adapter::{ObservedEntry, StorageEnum};
 use tokio::sync::mpsc::{self, Receiver};
 use tokio::task::{JoinError, JoinHandle, JoinSet};
 use tokio_util::task::AbortOnDropHandle;
@@ -60,7 +61,7 @@ async fn update_directories(database: Box<dyn Database>, destination: Arc<Storag
 }
 
 async fn apply_directories(
-    query: JoinHandle<Result<()>>, mut receiver: Receiver<EntryEnum>, destination: Arc<StorageEnum>,
+    query: JoinHandle<Result<()>>, mut receiver: Receiver<ObservedEntry>, destination: Arc<StorageEnum>,
 ) -> Result<()> {
     // 调用方取消整个收尾 future 时，查询与进度线程也随所属执行域释放。
     let query = AbortOnDropHandle::new(query);

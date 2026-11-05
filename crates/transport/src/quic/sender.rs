@@ -185,7 +185,7 @@ mod tests {
     use std::time::Duration;
 
     use bytes::Bytes;
-    use storage_adapter::{DataChunk, EntryEnum, NASEntry};
+    use storage_adapter::{DataChunk, ObservedEntry};
 
     use super::*;
     use crate::quic::framing;
@@ -203,28 +203,25 @@ mod tests {
     }
 
     /// 构造一个仅用于测试的最小 `NASEntry`（字段值无实际语义，只满足 `FileData` 的类型要求）
-    fn dummy_file_entry(name: &str) -> Arc<EntryEnum> {
-        Arc::new(EntryEnum::NAS(NASEntry {
-            name: name.to_string(),
-            relative_path: PathBuf::from(name),
-            extension: None,
-            is_dir: false,
-            size: 0,
-            atime: 0,
-            ctime: 0,
-            mtime: 0,
-            mode: Some(0o644),
-            is_symlink: false,
-            hard_links: None,
-            uid: None,
-            gid: None,
-            ino: None,
-            file_handle: None,
-            acl: None,
-            owner: None,
-            owner_group: None,
-            xattrs: None,
-        }))
+    fn dummy_file_entry(name: &str) -> Arc<ObservedEntry> {
+        Arc::new({
+            let fixture_path: std::path::PathBuf = PathBuf::from(name);
+            crate::observed_fixtures::observation(
+                data_mover::model::BackendKind::Nfs,
+                fixture_path,
+                data_mover::model::EntryKind::File,
+                0,
+                [0, 0, 0],
+                Some(data_mover::model::OwnershipMode {
+                    mode: 0o644,
+                    uid: 0u32,
+                    gid: 0u32,
+                }),
+                None,
+                None,
+                None,
+            )
+        })
     }
 
     /// 真实 QUIC：credit 窗口耗尽后 `send()` 应挂起，直到收到 `ReceiverMsg::CreditGrant`
@@ -290,16 +287,13 @@ mod tests {
                 .unwrap(),
         );
 
-        let entry = dummy_file_entry("big.bin");
+        let _entry = dummy_file_entry("big.bin");
         let chunk1 = DataChunk {
             offset: 0,
             data: Bytes::from(vec![0u8; TINY_WINDOW as usize]),
         };
         sender
-            .send(SenderMsg::FileData {
-                entry: entry.clone(),
-                chunk: chunk1,
-            })
+            .send(SenderMsg::FileData { ndx: 0, chunk: chunk1 })
             .await
             .unwrap();
 
@@ -309,7 +303,7 @@ mod tests {
             data: Bytes::from(vec![1u8; TINY_WINDOW as usize]),
         };
         let sender2 = sender.clone();
-        let send_task = tokio::spawn(async move { sender2.send(SenderMsg::FileData { entry, chunk: chunk2 }).await });
+        let send_task = tokio::spawn(async move { sender2.send(SenderMsg::FileData { ndx: 0, chunk: chunk2 }).await });
 
         tokio::time::sleep(Duration::from_millis(150)).await;
         assert!(
@@ -376,10 +370,7 @@ mod tests {
             data: Bytes::from(vec![0u8; TINY_WINDOW as usize]),
         };
         sender
-            .send(SenderMsg::FileData {
-                entry: entry.clone(),
-                chunk: chunk1,
-            })
+            .send(SenderMsg::FileData { ndx: 0, chunk: chunk1 })
             .await
             .unwrap();
 
@@ -389,14 +380,9 @@ mod tests {
             data: Bytes::from(vec![1u8; TINY_WINDOW as usize]),
         };
         let sender2 = sender.clone();
-        let entry2 = entry.clone();
+        let _entry2 = entry.clone();
         let stuck_send = tokio::spawn(async move {
-            let _ = sender2
-                .send(SenderMsg::FileData {
-                    entry: entry2,
-                    chunk: chunk2,
-                })
-                .await;
+            let _ = sender2.send(SenderMsg::FileData { ndx: 0, chunk: chunk2 }).await;
         });
         tokio::time::sleep(Duration::from_millis(200)).await;
         assert!(
@@ -448,13 +434,13 @@ mod tests {
             }
         });
 
-        for name in ["first.bin", "second.bin"] {
+        for _name in ["first.bin", "second.bin"] {
             let sender = connect_with_credit_window(server_addr, "localhost", None, TINY_WINDOW)
                 .await
                 .unwrap();
             sender
                 .send(SenderMsg::FileData {
-                    entry: dummy_file_entry(name),
+                    ndx: 0,
                     chunk: DataChunk {
                         offset: 0,
                         data: Bytes::from_static(b"12345678"),
@@ -492,7 +478,7 @@ mod tests {
             .unwrap();
         sender
             .send(SenderMsg::FileData {
-                entry: dummy_file_entry("first.bin"),
+                ndx: 0,
                 chunk: DataChunk {
                     offset: 0,
                     data: Bytes::from_static(b"12345678"),
@@ -504,7 +490,7 @@ mod tests {
         let result = tokio::time::timeout(
             Duration::from_secs(2),
             sender.send(SenderMsg::FileData {
-                entry: dummy_file_entry("blocked.bin"),
+                ndx: 0,
                 chunk: DataChunk {
                     offset: 0,
                     data: Bytes::from_static(b"12345678"),

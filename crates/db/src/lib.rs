@@ -120,3 +120,9 @@ pub(crate) fn generate_scan_temp_table_name() -> String {
     let uuid = Uuid::new_v4().to_string().replace('-', "_");
     format!("{SCAN_TEMP_TABLE_BASE_NAME}_{uuid}")
 }
+
+#[cfg(test)]
+#[path = "../../../tests/support/observed.rs"]
+mod observed_fixtures;
+
+pub use schema::entry::EntrySummary;

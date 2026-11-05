@@ -1,12 +1,12 @@
 //! TerraSync 会话的目录页及编号，不属于存储后端。
-use crate::EntryEnum;
+use crate::observed_scan::ObservedItem;
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
 /// 带 NDX 编号的 entry
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NdxEntry {
     pub ndx: i32,
-    pub entry: Arc<EntryEnum>,
+    #[serde(with = "crate::observation_wire::selected")]
+    pub entry: ObservedItem,
 }
 
 /// 一整页目录内容，消费完 drop 即释放内存

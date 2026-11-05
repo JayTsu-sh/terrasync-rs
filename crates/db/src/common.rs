@@ -3,9 +3,10 @@
 use std::collections::HashMap;
 use std::sync::LazyLock;
 
-use storage_adapter::EntryEnum;
+use storage_adapter::ObservedEntry;
 use tracing::{error, trace};
 
+use crate::Result;
 use crate::traits::StorageEntryRecord;
 
 /// Represents the status of a deleted item, either a permanent deletion or a rename
@@ -17,9 +18,9 @@ use crate::traits::StorageEntryRecord;
 #[allow(clippy::large_enum_variant)]
 pub enum DeletionStatus {
     /// The item was permanently deleted
-    Deleted(EntryEnum),
+    Deleted(ObservedEntry),
     /// The item was renamed, with the old and new entries.
-    Renamed(Box<EntryEnum>, Box<EntryEnum>),
+    Renamed(Box<ObservedEntry>, Box<ObservedEntry>),
 }
 
 /// 文件扫描列名列表（不含 `version_count`）
@@ -28,6 +29,16 @@ pub const FILE_SCAN_COLUMNS_LIST_WO_VERSIONCOUNT: &str = "name, relative_path, s
 /// 通过 `FILE_SCAN_COLUMNS_LIST_WO_VERSIONCOUNT` 生成的完整列名列表，包含 `version_count`
 pub static FILE_SCAN_COLUMNS_LIST: LazyLock<String> =
     LazyLock::new(|| format!("{FILE_SCAN_COLUMNS_LIST_WO_VERSIONCOUNT}, version_count"));
+
+pub(crate) static CATALOGUE_COLUMNS: LazyLock<String> =
+    LazyLock::new(|| format!("{},backend_kind,backend_id,entry_snapshot", *FILE_SCAN_COLUMNS_LIST));
+pub(crate) static CATALOGUE_COLUMNS_WITH_T_PREFIX: LazyLock<String> = LazyLock::new(|| {
+    CATALOGUE_COLUMNS
+        .split(',')
+        .map(|name| format!("t.{}", name.trim()))
+        .collect::<Vec<_>>()
+        .join(",")
+});
 
 /// 基础扫描表的占位符列表（通过 `FILE_SCAN_COLUMNS_LIST` 计算）
 pub static FILE_SCAN_COLUMNS_PLACEHOLDERS: LazyLock<String> = LazyLock::new(|| {
@@ -71,12 +82,12 @@ pub static FILE_SCAN_COLUMNS_LIST_WITH_T_PREFIX: LazyLock<String> = LazyLock::ne
 pub fn classify_deletion_status(
     no_fh_records: Vec<StorageEntryRecord>, fh_records: Vec<StorageEntryRecord>,
     fh_groups: &HashMap<String, Vec<StorageEntryRecord>>,
-) -> Vec<DeletionStatus> {
+) -> Result<Vec<DeletionStatus>> {
     let mut deletion_statuses: Vec<DeletionStatus> = Vec::with_capacity(no_fh_records.len() + fh_records.len());
 
     // 无 file_handle → 全部 Deleted
     for record in no_fh_records {
-        deletion_statuses.push(DeletionStatus::Deleted(record.to_entry_enum()));
+        deletion_statuses.push(DeletionStatus::Deleted(record.to_observation()?));
     }
 
     // 有 file_handle → 根据 groups 判断
@@ -85,16 +96,16 @@ pub fn classify_deletion_status(
             match fh_groups.get(fh).map(Vec::as_slice) {
                 Some(entries) if entries.len() == 1 => {
                     trace!("file_handle {} has 1 entry, Deleted", fh);
-                    deletion_statuses.push(DeletionStatus::Deleted(record.to_entry_enum()));
+                    deletion_statuses.push(DeletionStatus::Deleted(record.to_observation()?));
                 }
                 Some(entries) if entries.len() == 2 => {
                     // `record` 来自 old-state 查询，其 relative_path 即旧路径。
                     // 用路径精确匹配 from/to，避免依赖 ctime——父目录 rename 不更新
                     // 子文件 ctime（NFS v3 行为），ctime 相等时排序不确定会导致 swap。
                     let (from, to) = if entries[0].relative_path == record.relative_path.as_str() {
-                        (entries[0].to_entry_enum(), entries[1].to_entry_enum())
+                        (entries[0].to_observation()?, entries[1].to_observation()?)
                     } else {
-                        (entries[1].to_entry_enum(), entries[0].to_entry_enum())
+                        (entries[1].to_observation()?, entries[0].to_observation()?)
                     };
                     trace!("file_handle {} has 2 entries, Renamed", fh);
                     deletion_statuses.push(DeletionStatus::Renamed(Box::new(from), Box::new(to)));
@@ -109,16 +120,16 @@ pub fn classify_deletion_status(
                 }
                 None => {
                     error!("file_handle {} not found in batch query results", fh);
-                    deletion_statuses.push(DeletionStatus::Deleted(record.to_entry_enum()));
+                    deletion_statuses.push(DeletionStatus::Deleted(record.to_observation()?));
                 }
             }
         } else {
             // 理论上不应该到达这里，但安全处理
-            deletion_statuses.push(DeletionStatus::Deleted(record.to_entry_enum()));
+            deletion_statuses.push(DeletionStatus::Deleted(record.to_observation()?));
         }
     }
 
-    deletion_statuses
+    Ok(deletion_statuses)
 }
 
 /// 生成 `version_count` 的 JOIN 子句和 SELECT 表达式（优化 4）

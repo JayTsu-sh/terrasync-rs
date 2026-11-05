@@ -6,7 +6,7 @@ use crate::scan::candidate_cache::ScanMetadataHash;
 use crate::{
     common::FILE_SCAN_COLUMNS_LIST,
     error::{DatabaseError, Result},
-    traits::StorageEntryRecord,
+    schema::entry::EntrySummary as StorageEntryRecord,
 };
 use clickhouse::{Client, query::Query, sql::Bind};
 use data_mover::model::ObservedEntry;

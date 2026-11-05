@@ -1,10 +1,13 @@
+#[path = "../../../tests/support/observed.rs"]
+mod observed_fixtures;
 use bytes::Bytes;
 use data_mover::traversal::TraversalOutcome;
 use std::{collections::BTreeSet, path::Path, sync::Arc, time::Duration};
+use storage_adapter::ObservedEntryExt;
 use storage_adapter::filter::parse_filter_expression;
 use storage_adapter::{
-    CopyOptions, CreateStorageOptions, DataChunk, EntryEnum, ResumableScanItem, ScanSourceMode, StorageEntryMessage,
-    StorageEnum, TarPackOptions, WalkOptions, create_storage,
+    CopyOptions, CreateStorageOptions, DataChunk, ResumableScanItem, ScanSourceMode, StorageEntryMessage, StorageEnum,
+    TarPackOptions, WalkOptions, create_storage,
 };
 use tempfile::TempDir;
 use tokio::fs::{create_dir_all, write};
@@ -264,12 +267,14 @@ async fn namespace_symlinks_and_recursive_delete_use_storage_roles() -> TestResu
     tokio::fs::create_dir_all(root.path().join("a/b")).await?;
     tokio::fs::write(root.path().join("a/b/data"), b"keep target").await?;
     let storage = local(root.path()).await?;
-    let mut link = storage.get_metadata(Path::new("a/b/data")).await?;
-    if let EntryEnum::NAS(ref mut entry) = link {
-        entry.relative_path = "a/link".into();
-        entry.name = "link".into();
-        entry.is_symlink = true;
-    }
+    let original = storage.get_metadata(Path::new("a/b/data")).await?;
+    let link = data_mover::model::ObservedEntry::new_symlink(
+        data_mover::model::StoragePath::new("a/link")?,
+        original.modified(),
+        original.source_identity().clone(),
+        data_mover::model::SymlinkTarget::new(data_mover::model::SymlinkTargetEncoding::UnixBytes, b"b/data".to_vec())?,
+    )?
+    .with_metadata(original.metadata().clone());
     storage.create_symlink(&link, Path::new("b/data")).await?;
     assert_eq!(storage.read_symlink(&link).await?, Path::new("b/data"));
     let directory = storage.get_metadata(Path::new("a")).await?;

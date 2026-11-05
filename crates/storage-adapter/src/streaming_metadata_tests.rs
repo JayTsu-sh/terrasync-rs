@@ -1,6 +1,7 @@
 #![allow(clippy::unwrap_used)]
 
 use super::*;
+use crate::ObservedEntryExt;
 use async_trait::async_trait;
 use bytes::Bytes;
 use data_mover::storage::{
@@ -131,7 +132,7 @@ async fn destination(fail: bool) -> (TempDir, StorageEnum, Arc<MetadataProbe>) {
     )
 }
 
-async fn stream(destination: &StorageEnum, entry: &EntryEnum) -> Result<()> {
+async fn stream(destination: &StorageEnum, entry: &ObservedEntry) -> Result<()> {
     let handle = StorageEnum::prepare_stream(destination, entry).await?;
     let (tx, rx) = mpsc::channel(2);
     tx.send(DataChunk {
@@ -150,9 +151,7 @@ async fn stream(destination: &StorageEnum, entry: &EntryEnum) -> Result<()> {
 async fn stream_metadata_failure_keeps_old_destination() {
     let (root, destination, probe) = destination(true).await;
     let mut entry = destination.get_metadata(Path::new("file")).await.unwrap();
-    if let EntryEnum::NAS(entry) = &mut entry {
-        entry.mode = Some(0o640);
-    }
+    entry = crate::observed_fixtures::with_mode(entry, Some(0o640));
     let error = stream(&destination, &entry).await.unwrap_err();
     assert!(probe.called.load(Ordering::SeqCst));
     assert_eq!(std::fs::read(root.path().join("file")).unwrap(), b"old");
@@ -176,22 +175,24 @@ async fn stream_metadata_failure_keeps_old_destination() {
 #[tokio::test]
 async fn stream_s3_tags_are_applied_before_publication() {
     let (root, destination, probe) = destination(false).await;
-    let entry = EntryEnum::S3(S3Entry {
-        name: "file".into(),
-        relative_path: "file".into(),
-        extension: None,
-        size: 3,
-        mtime: 1_234_000_000,
-        tags: Some(vec![Tag {
-            key: "team".into(),
-            value: "archive".into(),
-        }]),
-        version_id: None,
-        is_latest: true,
-        is_delete_marker: false,
-        version_count: None,
-        is_dir: false,
-    });
+    let entry = {
+        let fixture_path: std::path::PathBuf = "file".into();
+        crate::observed_fixtures::observation(
+            data_mover::model::BackendKind::S3,
+            fixture_path,
+            data_mover::model::EntryKind::File,
+            3,
+            [0, 1_234_000_000, 0],
+            None,
+            None,
+            (Some(vec![Tag {
+                key: "team".into(),
+                value: "archive".into(),
+            }]))
+            .map(|tags| tags.into_iter().map(|tag| (tag.key, tag.value)).collect()),
+            None,
+        )
+    };
     stream(&destination, &entry).await.unwrap();
     assert_eq!(std::fs::read(root.path().join("file")).unwrap(), b"new");
     let tags = probe.tags.lock().unwrap();
@@ -205,11 +206,8 @@ async fn stream_applies_mode_owner_and_timestamps_on_stage() {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
     let (root, destination, _) = destination(false).await;
     let mut entry = destination.get_metadata(Path::new("file")).await.unwrap();
-    if let EntryEnum::NAS(entry) = &mut entry {
-        entry.mode = Some(0o640);
-        entry.atime = 2_000_000_000;
-        entry.mtime = 3_000_000_000;
-    }
+    entry = crate::observed_fixtures::with_mode(entry, Some(0o640));
+    entry = crate::observed_fixtures::with_times(entry, Some(2_000_000_000), Some(3_000_000_000));
     stream(&destination, &entry).await.unwrap();
     let metadata = std::fs::metadata(root.path().join("file")).unwrap();
     assert_eq!(metadata.permissions().mode() & 0o7777, 0o640);
@@ -314,9 +312,7 @@ async fn checkpoint_stream_reuses_partial_prefix_and_verifies_full_payload() {
     .unwrap();
     let mut entry = destination.get_metadata(Path::new("file")).await.unwrap();
     let size = 256 * 1024 * 1024 + 17;
-    if let EntryEnum::NAS(ref mut file) = entry {
-        file.size = size;
-    }
+    entry = crate::observed_fixtures::with_size(entry, size);
     let first =
         StorageEnum::prepare_stream_with_mode(&destination, &entry, TransferMode::Checkpoint, CancellationToken::new())
             .await
@@ -390,4 +386,129 @@ async fn checkpoint_stream_reuses_partial_prefix_and_verifies_full_payload() {
         actual.update(&buffer[..n]);
     }
     assert_eq!(actual.finalize(), expected.finalize());
+}
+
+#[tokio::test]
+async fn a_selected_history_version_drives_stream_size_metadata_and_tags() {
+    let (root, destination, probe) = destination(false).await;
+    let observations: Vec<_> = [("old", 3, 100, "old-tag"), ("current", 7, 200, "current-tag")]
+        .into_iter()
+        .map(|(id, size, time, tag)| {
+            crate::observed_fixtures::observation(
+                BackendKind::S3,
+                "file".into(),
+                EntryKind::File,
+                size,
+                [time; 3],
+                None,
+                None,
+                Some(vec![("version".into(), tag.into())]),
+                Some((Some(id.into()), id == "current", false)),
+            )
+        })
+        .collect();
+    let history = ObjectHistory::whole(
+        observations
+            .iter()
+            .flat_map(|entry| entry.history().unwrap().records().to_vec())
+            .collect(),
+        HistoryOrder::Server,
+    )
+    .unwrap();
+    let original = Arc::new(
+        observations
+            .into_iter()
+            .last()
+            .unwrap()
+            .with_history(Some(Box::new(history)))
+            .unwrap(),
+    );
+    let selected = ObservedItem {
+        entry: Arc::clone(&original),
+        version_index: Some(0),
+    };
+    let handle = StorageEnum::prepare_observed_stream(
+        &destination,
+        selected.view(),
+        TransferMode::Atomic,
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    let (tx, rx) = mpsc::channel(1);
+    tx.send(StreamChunk::from(DataChunk {
+        offset: 0,
+        data: Bytes::from_static(b"old"),
+    }))
+    .await
+    .unwrap();
+    drop(tx);
+    StorageEnum::write_planned_stream(rx, &handle).await.unwrap();
+    StorageEnum::commit_chunk_stream(&destination, &original, 3, handle)
+        .await
+        .unwrap();
+    assert_eq!(std::fs::read(root.path().join("file")).unwrap(), b"old");
+    assert_eq!(
+        probe
+            .tags
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|tag| (tag.key(), tag.value()))
+            .collect::<Vec<_>>(),
+        [("version", "old-tag")]
+    );
+    assert_eq!(
+        std::fs::metadata(root.path().join("file"))
+            .unwrap()
+            .modified()
+            .unwrap()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos(),
+        100
+    );
+    assert!(Arc::ptr_eq(&selected.entry, &original));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn stream_keeps_true_mode_without_numeric_ownership() {
+    use data_mover::model::{PermissionFacts, PrincipalIdentity};
+    use std::os::unix::fs::PermissionsExt;
+    for backend in [BackendKind::Hdfs, BackendKind::Nfs] {
+        let (root, destination, _) = destination(false).await;
+        let entry = crate::observed_fixtures::observation(
+            backend,
+            "file".into(),
+            EntryKind::File,
+            3,
+            [0; 3],
+            None,
+            None,
+            None,
+            None,
+        )
+        .with_permissions(Some(Box::new(PermissionFacts {
+            owner: (backend == BackendKind::Hdfs).then(|| PrincipalIdentity::Named("alice".into())),
+            group: None,
+            mode: Some(0o6640),
+        })))
+        .unwrap();
+        // Use the wire round trip: the receiver only knows the advertised snapshot.
+        let entry =
+            ObservedEntry::decode_snapshot(entry.encode_snapshot().as_bytes(), entry.source_identity().backend())
+                .unwrap();
+        assert_eq!(entry.get_mode(), Some(0o6640));
+        assert_eq!(entry.get_uid(), None);
+        stream(&destination, &entry).await.unwrap();
+        assert_eq!(
+            std::fs::metadata(root.path().join("file"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o7777,
+            0o640
+        );
+    }
 }

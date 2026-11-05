@@ -1,5 +1,7 @@
 #![cfg(unix)]
 //! 通过旧目标的硬链接观察实际写入语义，防止显式模式被静默替换。
+#[path = "../../../tests/support/observed.rs"]
+mod observed_fixtures;
 use std::{error::Error, os::unix::fs::MetadataExt, path::Path};
 use storage_adapter::{CopyOptions, CreateStorageOptions, StorageEnum, TransferMode, create_storage};
 

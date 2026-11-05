@@ -1,7 +1,13 @@
+use crate::broadcast::BroadcastForwarder;
+use data_mover::model::EntryKind;
 use std::sync::Arc;
+use storage_adapter::StorageEntryMessage;
+use storage_adapter::observed_scan::ObservedItem;
 
 use storage_adapter::hdfs::HdfsResumeMode;
-use storage_adapter::{CommitCallback, CopyOptions, EntryEnum, HdfsRecoverableCopyOptions, StorageEnum, TransferMode};
+use storage_adapter::{
+    CommitCallback, CopyOptions, HdfsRecoverableCopyOptions, ObservedEntry, StorageEnum, TransferMode,
+};
 
 use crate::error::{AppError, Result};
 
@@ -56,7 +62,7 @@ pub(crate) enum MetadataApplication {
 }
 
 pub(crate) async fn copy_file(
-    from: &StorageEnum, to: &StorageEnum, entry: &EntryEnum, options: CopyOptions, hdfs: Option<&HdfsCopyContext>,
+    from: &StorageEnum, to: &StorageEnum, entry: &ObservedEntry, options: CopyOptions, hdfs: Option<&HdfsCopyContext>,
 ) -> Result<MetadataApplication> {
     if matches!(to, StorageEnum::HDFS(_)) {
         let context = hdfs
@@ -70,6 +76,45 @@ pub(crate) async fn copy_file(
     Ok(MetadataApplication::DataMover)
 }
 
+/// 全量与增量共用源端确认的逐版本顺序；每个目标版本提交后才发送对应的完成事件。
+pub(crate) async fn copy_history(
+    entry: &Arc<ObservedEntry>, from: &StorageEnum, to: &StorageEnum, options: CopyOptions, job_id: &str,
+    broadcaster: &BroadcastForwarder<StorageEntryMessage>,
+) -> Result<()> {
+    let keep_history = to.is_bucket_versioned().await?;
+    let hdfs = if matches!(to, StorageEnum::HDFS(_)) {
+        Some(HdfsCopyContext::from_job(job_id, options.transfer_mode)?)
+    } else {
+        None
+    };
+    for item in selected_copy_items(entry, keep_history) {
+        if !keep_history && entry.kind() == EntryKind::Directory {
+            to.create_dir_all(entry).await?;
+        } else {
+            StorageEnum::copy_observed_view(
+                from,
+                to,
+                item.view(),
+                &options,
+                hdfs.as_ref().map(HdfsCopyContext::transfer_identity),
+            )
+            .await?;
+        }
+        broadcaster.broadcast(StorageEntryMessage::New(item)).await;
+    }
+    Ok(())
+}
+
+/// 借用原生历史选择目标实际保留的版本，不分配或复制版本列表。
+pub(crate) fn selected_copy_items(
+    entry: &Arc<ObservedEntry>, keep_history: bool,
+) -> impl Iterator<Item = ObservedItem> + '_ {
+    ObservedItem::all(entry).filter(move |item| {
+        item.view()
+            .version()
+            .is_none_or(|record| keep_history || (record.is_latest() && !record.is_delete_marker()))
+    })
+}
 #[cfg(test)]
 mod tests {
     use tokio::fs;

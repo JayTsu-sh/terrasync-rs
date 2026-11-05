@@ -7,11 +7,11 @@
 // 标准库
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use storage_adapter::ObservedEntryExt;
 
 // 外部 crate
-use dashmap::DashMap;
 use storage_adapter::qos::QosManager;
-use storage_adapter::{AsyncReceiver, EntryEnum, StorageEntryMessage, StorageEnum};
+use storage_adapter::{AsyncReceiver, ObservedEntry, StorageEntryMessage, StorageEnum};
 use tracing::{error, info};
 use transport::message::SenderMsg;
 use transport::traits::SenderTransport;
@@ -19,6 +19,8 @@ use transport::traits::SenderTransport;
 // 内部模块
 use crate::broadcast::BroadcastForwarder;
 use crate::error::{AppError, Result};
+use crate::receiver::ReceiverConfig;
+use crate::sync::{ResumeOpts, process_versioned_entry};
 use crate::tar_pack;
 
 /// Sender worker 配置
@@ -39,9 +41,8 @@ pub async fn sender_worker(
     worker_id: usize, walkdir_iter: AsyncReceiver<StorageEntryMessage>, src_storage: Arc<StorageEnum>,
     dest_storage: Arc<StorageEnum>, transport: Arc<dyn SenderTransport>,
     broadcaster: &BroadcastForwarder<StorageEntryMessage>, config: &SenderWorkerConfig,
-    qos_manager: Option<QosManager>, bytes_tracker: Option<Arc<AtomicU64>>,
-    object_buffers: Arc<DashMap<String, Vec<Arc<EntryEnum>>>>, active_entry_counter: Arc<AtomicUsize>,
-    entry_counter: Arc<AtomicUsize>, size_counter: Arc<AtomicU64>,
+    qos_manager: Option<QosManager>, bytes_tracker: Option<Arc<AtomicU64>>, copy_config: &ReceiverConfig,
+    active_entry_counter: Arc<AtomicUsize>, entry_counter: Arc<AtomicUsize>, size_counter: Arc<AtomicU64>,
 ) -> Result<()> {
     info!("[Sender Worker {}] Started", worker_id);
     let mut failure = None;
@@ -62,9 +63,25 @@ pub async fn sender_worker(
                     );
                 }
 
-                let result = if entry.get_version_id().is_some() {
-                    // S3 多版本对象：缓冲收集后一次性处理
-                    handle_versioned_entry(worker_id, &entry, &transport, &dest_storage, &object_buffers).await
+                let result = if entry.history().is_some() {
+                    // 同一路径的分段由固定 worker 顺序复制，不经过第二级竞争队列。
+                    process_versioned_entry(
+                        &entry,
+                        Arc::clone(&src_storage),
+                        Arc::clone(&dest_storage),
+                        broadcaster.clone(),
+                        qos_manager.clone(),
+                        copy_config.enable_integrity_check,
+                        copy_config.enable_acl,
+                        copy_config.is_source_reserved,
+                        bytes_tracker.clone(),
+                        ResumeOpts {
+                            job_id: copy_config.job_id.clone(),
+                            job_dir: copy_config.job_dir.clone(),
+                            transfer_mode: copy_config.transfer_mode,
+                        },
+                    )
+                    .await
                 } else {
                     send_entry(worker_id, &transport, &entry).await
                 };
@@ -127,7 +144,7 @@ pub async fn sender_worker(
     failure.map_or(Ok(()), Err)
 }
 
-async fn send_entry(worker_id: usize, transport: &Arc<dyn SenderTransport>, entry: &Arc<EntryEnum>) -> Result<()> {
+async fn send_entry(worker_id: usize, transport: &Arc<dyn SenderTransport>, entry: &Arc<ObservedEntry>) -> Result<()> {
     if let Err(error) = transport.send(SenderMsg::CopyEntry { entry: entry.clone() }).await {
         error!(
             "[Sender Worker {}] Failed to send CopyEntry for {:?}: {}",
@@ -142,7 +159,7 @@ async fn send_entry(worker_id: usize, transport: &Arc<dyn SenderTransport>, entr
 
 #[allow(clippy::too_many_arguments)]
 async fn send_packaged_entry(
-    worker_id: usize, entry: &Arc<EntryEnum>, src_storage: &Arc<StorageEnum>, dest_storage: &Arc<StorageEnum>,
+    worker_id: usize, entry: &Arc<ObservedEntry>, src_storage: &Arc<StorageEnum>, dest_storage: &Arc<StorageEnum>,
     transport: &Arc<dyn SenderTransport>, config: &SenderWorkerConfig, qos_manager: Option<QosManager>,
     bytes_tracker: Option<Arc<AtomicU64>>,
 ) -> Result<()> {
@@ -191,51 +208,6 @@ async fn send_packaged_entry(
     }
 }
 
-/// 处理 S3 多版本对象：缓冲所有版本后统一发送
-async fn handle_versioned_entry(
-    worker_id: usize, entry: &Arc<EntryEnum>, transport: &Arc<dyn SenderTransport>, dest_storage: &Arc<StorageEnum>,
-    object_buffers: &Arc<DashMap<String, Vec<Arc<EntryEnum>>>>,
-) -> Result<()> {
-    let object_key = entry.get_relative_path().to_string_lossy().to_string();
-
-    // 缓冲版本
-    let mut collected_versions = None;
-    {
-        let mut versions = object_buffers.entry(object_key.clone()).or_default();
-        versions.push(entry.clone());
-
-        if let Some(version_count) = entry.get_version_count()
-            && versions.len() >= version_count as usize
-        {
-            collected_versions = Some(versions.clone());
-            // 清理缓冲区
-            drop(versions);
-            object_buffers.remove(&object_key);
-        }
-    }
-
-    // 所有版本收集完毕，逐版本发送
-    if let Some(mut versions) = collected_versions {
-        // 按 mtime 升序排列（旧→新）
-        versions.sort_by_key(|e| e.get_mtime());
-
-        let mut failure = None;
-        if dest_storage.is_bucket_versioned().await? {
-            // 目标支持版本化：旧到新发送所有版本，失败后仍排空已收齐的版本组。
-            for version in &versions {
-                if let Err(error) = send_entry(worker_id, transport, version).await {
-                    failure.get_or_insert(error);
-                }
-            }
-        } else if let Some(latest) = versions.last() {
-            // 目标不支持版本化：仅发送最新版本。
-            send_entry(worker_id, transport, latest).await?;
-        }
-        return failure.map_or(Ok(()), Err);
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
@@ -246,7 +218,7 @@ mod tests {
 
     use async_trait::async_trait;
     use storage_adapter::error::StorageError;
-    use storage_adapter::{AsyncReceiver, ErrorEvent, S3Entry};
+    use storage_adapter::{AsyncReceiver, ErrorEvent};
     use transport::error::{Result as TransportResult, TransportError};
     use transport::message::ReceiverMsg;
 
@@ -303,7 +275,14 @@ mod tests {
             &config,
             None,
             None,
-            Arc::new(DashMap::new()),
+            &ReceiverConfig {
+                job_id: "test".into(),
+                enable_integrity_check: false,
+                enable_acl: false,
+                is_source_reserved: true,
+                job_dir: String::new(),
+                transfer_mode: Default::default(),
+            },
             Arc::new(AtomicUsize::new(0)),
             Arc::new(AtomicUsize::new(0)),
             Arc::new(AtomicU64::new(0)),
@@ -353,20 +332,21 @@ mod tests {
         }
     }
 
-    fn entry(path: &str, mtime: i64, version: Option<&str>, count: Option<u32>) -> Arc<EntryEnum> {
-        Arc::new(EntryEnum::S3(S3Entry {
-            name: path.into(),
-            relative_path: path.into(),
-            extension: None,
-            is_dir: false,
-            size: 7,
-            mtime,
-            tags: None,
-            version_id: version.map(str::to_owned),
-            is_latest: false,
-            is_delete_marker: false,
-            version_count: count,
-        }))
+    fn entry(path: &str, mtime: i64, version: Option<&str>, _count: Option<u32>) -> Arc<ObservedEntry> {
+        Arc::new({
+            let fixture_path: std::path::PathBuf = path.into();
+            crate::observed_fixtures::observation(
+                data_mover::model::BackendKind::S3,
+                fixture_path,
+                data_mover::model::EntryKind::File,
+                7,
+                [0, mtime, 0],
+                None,
+                None,
+                None,
+                version.map(|version| (Some(version.to_owned()), false, false)),
+            )
+        })
     }
 
     async fn run_messages(
@@ -394,7 +374,14 @@ mod tests {
             &config,
             None,
             None,
-            Arc::new(DashMap::new()),
+            &ReceiverConfig {
+                job_id: "test".into(),
+                enable_integrity_check: false,
+                enable_acl: false,
+                is_source_reserved: true,
+                job_dir: String::new(),
+                transfer_mode: Default::default(),
+            },
             active,
             count,
             Arc::new(AtomicU64::new(0)),
@@ -431,43 +418,6 @@ mod tests {
         assert_eq!(transport.sent.lock().unwrap().len(), 3);
         assert_eq!(count.load(Ordering::Relaxed), 3);
         assert_eq!(active.load(Ordering::Relaxed), 0);
-    }
-
-    #[tokio::test]
-    async fn latest_version_send_failure_is_returned_after_complete_sorted_group() {
-        let tmp = tempdir().unwrap();
-        let storage = Arc::new(create_storage(tmp.path().to_str().unwrap(), None, false).await.unwrap());
-        let recorded = Arc::new(RecordingTransport {
-            failures: 1,
-            ..RecordingTransport::default()
-        });
-        let transport: Arc<dyn SenderTransport> = recorded.clone();
-        let buffers = Arc::new(DashMap::new());
-        for (mtime, version) in [(30, "latest"), (10, "oldest")] {
-            handle_versioned_entry(
-                0,
-                &entry("object", mtime, Some(version), Some(3)),
-                &transport,
-                &storage,
-                &buffers,
-            )
-            .await
-            .unwrap();
-            assert!(recorded.sent.lock().unwrap().is_empty());
-        }
-        let result = handle_versioned_entry(
-            0,
-            &entry("object", 20, Some("middle"), Some(3)),
-            &transport,
-            &storage,
-            &buffers,
-        )
-        .await;
-        assert!(matches!(result, Err(AppError::TransportError(_))));
-        assert!(buffers.is_empty());
-        let sent = recorded.sent.lock().unwrap();
-        assert_eq!(sent.len(), 1);
-        assert!(matches!(&sent[0], SenderMsg::CopyEntry { entry } if entry.get_version_id() == Some("latest")));
     }
 
     #[tokio::test]

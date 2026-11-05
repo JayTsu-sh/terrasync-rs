@@ -6,6 +6,7 @@ use db::{ClickHouseConfig, CopyGenerationStatus, DatabaseError};
 use std::future::pending;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
+use storage_adapter::ObservedEntryExt;
 use tempfile::TempDir;
 use tokio::sync::{Notify, oneshot};
 use tokio::time::{Duration, timeout};
@@ -17,13 +18,11 @@ async fn target(root: &TempDir) -> Result<Arc<StorageEnum>> {
     ))
 }
 
-async fn directory_entry(source: &TempDir, name: &str) -> Result<EntryEnum> {
+async fn directory_entry(source: &TempDir, name: &str) -> Result<ObservedEntry> {
     std::fs::create_dir_all(source.path().join(name))?;
     let storage = create_storage_for_role(&source.path().to_string_lossy(), None, false, StorageRole::Source).await?;
     let mut entry = storage.get_metadata(Path::new(name)).await?;
-    if let EntryEnum::NAS(directory) = &mut entry {
-        directory.mtime = 1_234_567_890_000_000_000;
-    }
+    entry = crate::observed_fixtures::with_times(entry, None, Some(1_234_567_890_000_000_000));
     Ok(entry)
 }
 

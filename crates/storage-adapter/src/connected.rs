@@ -1,5 +1,7 @@
+use crate::ObservedEntryExt;
 use crate::{
     error::operation,
+    observed_scan::ObservedView,
     options::BackendConfig as ProductBackendConfig,
     projection::{decode_acl, encode_acl},
     streaming::source_qos,
@@ -18,7 +20,7 @@ use data_mover::{
     model::*,
     probes::{check_connectivity, probe_server_time},
     storage::{self, CopiedOwnershipTarget, CopiedTimestampTarget, MetadataMutation, Storage},
-    transfer::{self, ReadBackVerification, TransferPolicy, TransferRequest},
+    transfer::{self, ReadBackVerification, TransferIdentity, TransferPolicy, TransferRequest},
 };
 use futures::StreamExt;
 #[cfg(unix)]
@@ -233,11 +235,11 @@ impl ConnectedStorage {
             .map_err(StorageError::from)?
             .map(|v| (v.unix_nanos() / 1_000_000_000) as i64))
     }
-    pub async fn get_metadata(&self, value: &Path) -> Result<EntryEnum> {
+    pub async fn get_metadata(&self, value: &Path) -> Result<ObservedEntry> {
         let descriptor = self.roles.namespace()?.stat(&path(value)?).await?;
         self.project_descriptor(descriptor, true).await
     }
-    pub async fn create_dir_all(&self, entry: &EntryEnum) -> Result<()> {
+    pub async fn create_dir_all(&self, entry: &ObservedEntry) -> Result<()> {
         storage::create_directory_all(&self.roles, &path(entry.get_relative_path())?)
             .await
             .map_err(StorageError::from)
@@ -245,14 +247,14 @@ impl ConnectedStorage {
     pub async fn rename(&self, from: &Path, to: &Path) -> Result<()> {
         Ok(self.roles.namespace()?.rename(&path(from)?, &path(to)?).await?)
     }
-    pub async fn delete_file(&self, entry: &EntryEnum) -> Result<()> {
+    pub async fn delete_file(&self, entry: &ObservedEntry) -> Result<()> {
         Ok(self
             .roles
             .namespace()?
             .delete(&path(entry.get_relative_path())?)
             .await?)
     }
-    pub async fn read_symlink(&self, entry: &EntryEnum) -> Result<PathBuf> {
+    pub async fn read_symlink(&self, entry: &ObservedEntry) -> Result<PathBuf> {
         let target = self
             .roles
             .namespace()?
@@ -278,7 +280,7 @@ impl ConnectedStorage {
             }
         }
     }
-    pub async fn create_symlink(&self, entry: &EntryEnum, target: &Path) -> Result<()> {
+    pub async fn create_symlink(&self, entry: &ObservedEntry, target: &Path) -> Result<()> {
         let name = path(entry.get_relative_path())?;
         if let Some(parent) = entry.get_relative_path().parent() {
             storage::create_directory_all(&self.roles, &path(parent)?)
@@ -371,7 +373,7 @@ impl ConnectedStorage {
         }
         Ok(())
     }
-    pub async fn set_entry_metadata(&self, entry: &EntryEnum) -> Result<()> {
+    pub async fn set_entry_metadata(&self, entry: &ObservedEntry) -> Result<()> {
         if self.roles.kind() == BackendKind::S3 {
             return Ok(());
         }
@@ -402,43 +404,70 @@ impl ConnectedStorage {
     }
 }
 impl StorageEnum {
-    pub async fn copy_file(from: &Self, to: &Self, entry: &EntryEnum, options: CopyOptions) -> Result<()> {
+    pub async fn copy_file(from: &Self, to: &Self, entry: &ObservedEntry, options: CopyOptions) -> Result<()> {
+        for view in ObservedView::all(entry) {
+            if view.version().is_some_and(|record| !record.is_latest()) && !to.is_bucket_versioned().await? {
+                continue;
+            }
+            Self::copy_observed_view(from, to, view, &options, None).await?;
+        }
+        Ok(())
+    }
+
+    /// 仅复制指定的原生版本；版本选择和完成通知由任务流程负责。
+    pub async fn copy_observed_view(
+        from: &Self, to: &Self, view: ObservedView<'_>, options: &CopyOptions, identity: Option<&str>,
+    ) -> Result<()> {
         to.validate_transfer_mode(options.transfer_mode)?;
-        let p = path(entry.get_relative_path())?;
-        if entry.get_is_delete_marker() {
-            transfer::write_delete_marker(to.roles.clone(), p, options.cancel.unwrap_or_default()).await?;
+        let p = view.source_path()?;
+        if view.version().is_some_and(|record| record.is_delete_marker()) {
+            if to.is_bucket_versioned().await? {
+                transfer::write_delete_marker(to.roles.clone(), p, options.cancel.clone().unwrap_or_default()).await?;
+            }
             return Ok(());
         }
+        let version = view
+            .source_version()
+            .ok_or_else(|| operation("history object lacks a source version"))?;
+        Self::copy_version(from, to, &p, version, options, identity).await
+    }
+
+    async fn copy_version(
+        from: &Self, to: &Self, path: &StoragePath, version: SourceVersion, options: &CopyOptions,
+        identity: Option<&str>,
+    ) -> Result<()> {
         let mut request = TransferRequest::new(
             from.roles.clone(),
-            p,
+            path.clone(),
             to.roles.clone(),
-            options.cancel.unwrap_or_default(),
+            options.cancel.clone().unwrap_or_default(),
         )
-        .with_transfer_policy(options.transfer_mode.policy());
-        if let Some(version) = entry.get_version_id() {
-            request = request.with_source_version(SourceVersion::Id(version.into()));
-        }
-        request = request.with_read_back_verification(if options.enable_integrity_check {
+        .with_transfer_policy(options.transfer_mode.policy())
+        .with_source_version(version)
+        .with_read_back_verification(if options.enable_integrity_check {
             ReadBackVerification::Enabled
         } else {
             ReadBackVerification::Disabled
         });
-        if let Some(qos) = options.qos {
-            request = request.with_source_qos(source_qos(&qos, from.block_size)?);
+        if let Some(identity) = identity {
+            request =
+                request.with_identity_override(TransferIdentity::from_label(identity).map_err(StorageError::from)?);
+        }
+        if let Some(qos) = &options.qos {
+            request = request.with_source_qos(source_qos(qos, from.block_size)?);
         }
         let outcome = if options.is_source_reserved {
             transfer::transfer(request).await?
         } else {
             transfer::move_file(request).await?
         };
-        if let Some(counter) = options.bytes_counter {
+        if let Some(counter) = &options.bytes_counter {
             counter.fetch_add(outcome.transferred_bytes, Ordering::Relaxed);
         }
         Ok(())
     }
     pub async fn copy_file_resumable(
-        from: &Self, to: &Self, entry: &EntryEnum, options: CopyOptions, _resume: ResumeContext,
+        from: &Self, to: &Self, entry: &ObservedEntry, options: CopyOptions, _resume: ResumeContext,
     ) -> Result<()> {
         to.validate_transfer_mode(TransferMode::Checkpoint)?;
         // 恢复权威在目标端；不再信任应用的 .part 路径或本地 offset 记录。

@@ -6,6 +6,7 @@ use crate::factory::DatabaseFactory;
 use data_mover::model::{BackendKind, EntryKind, IdentityStrength, SourceIdentity, StoragePath};
 use std::path::PathBuf;
 use std::time::Duration;
+use storage_adapter::ObservedEntryExt;
 use tokio::runtime::Builder;
 use tokio::time::timeout;
 use utils::app_config::ClickHouseMode;
@@ -85,33 +86,44 @@ impl Fixture {
         Ok(database)
     }
 
-    fn entry(&self, path: &str, size: u64, handle: &str) -> Arc<EntryEnum> {
+    fn entry(&self, path: &str, size: u64, handle: &str) -> Arc<ObservedEntry> {
         std::fs::write(self.source.join(path), vec![0u8; usize::try_from(size).unwrap()]).unwrap();
         Arc::new(
-            StorageEntryRecord {
-                name: path.into(),
-                relative_path: path.into(),
-                size,
-                ext: None,
-                ctime: 1_000_000_000,
-                mtime: 1_000_000_000,
-                atime: 1_000_000_000,
-                mode: Some(420),
-                storage_type: "nas".into(),
-                is_symlink: false,
-                is_dir: false,
-                is_regular_file: true,
-                hard_links: 1,
-                current_state: 0,
-                uid: Some(1000),
-                gid: Some(1000),
-                ino: None,
-                file_handle: Some(format!("54534934{handle}")),
-                version_id: String::new(),
-                tags: None,
-                version_count: None,
+            {
+                let fixture_path: std::path::PathBuf = path.into();
+                let fixture_storage: String = "nas".into();
+                let fixture_version: String = String::new();
+                let fixture_handle: Option<String> = Some(format!("54534934{handle}"));
+                let fixture_tags: Option<String> = None;
+                let entry = crate::observed_fixtures::observation(
+                    if fixture_storage == "s3" {
+                        data_mover::model::BackendKind::S3
+                    } else {
+                        data_mover::model::BackendKind::Nfs
+                    },
+                    fixture_path,
+                    data_mover::model::EntryKind::File,
+                    size,
+                    [1_000_000_000, 1_000_000_000, 1_000_000_000],
+                    Some(data_mover::model::OwnershipMode {
+                        mode: 420,
+                        uid: 1000,
+                        gid: 1000,
+                    }),
+                    fixture_handle.map(|handle| hex::decode(handle).unwrap()),
+                    fixture_tags.map(|tags| {
+                        serde_json::from_str::<Vec<storage_adapter::Tag>>(&tags)
+                            .unwrap()
+                            .into_iter()
+                            .map(|tag| (tag.key, tag.value))
+                            .collect()
+                    }),
+                    (!fixture_version.is_empty()).then_some((Some(fixture_version), true, false)),
+                );
+                StorageEntryRecord::capture(&entry, 0).unwrap()
             }
-            .to_entry_enum(),
+            .to_observation()
+            .unwrap(),
         )
     }
 
@@ -151,7 +163,7 @@ impl Drop for Fixture {
     }
 }
 
-fn paths(entries: impl Iterator<Item = EntryEnum>) -> Vec<String> {
+fn paths(entries: impl Iterator<Item = ObservedEntry>) -> Vec<String> {
     entries
         .map(|entry| entry.get_relative_path().to_string_lossy().into_owned())
         .collect()
@@ -214,7 +226,7 @@ async fn cluster_catalogue_copy_sync_and_delete_are_job_isolated() -> Result<()>
     assert_eq!(fixture.rows("a").await?[0].size, 15);
     a.create_table(INCREMENTAL_SCAN_TABLE_BASE_NAME).await?;
     a.batch_insert_incremental_record(&[
-        StorageEntryMessage::New(next[2].clone()),
+        StorageEntryMessage::New(next[2].clone().into()),
         StorageEntryMessage::Changed {
             entry: next[1].clone(),
             kind: ChangeKind::DataOnly,
@@ -251,12 +263,18 @@ async fn cluster_catalogue_copy_sync_and_delete_are_job_isolated() -> Result<()>
 async fn cluster_catalogue_versions_survive_reopening_an_uncommitted_generation() -> Result<()> {
     let fixture = Fixture::new().await?;
     let version = |id: &str, size| {
-        let mut record = StorageEntryRecord::from_entry_enum(fixture.entry("object", size, "aa").as_ref(), 0);
-        record.storage_type = "s3".into();
-        record.file_handle = None;
-        record.version_id = id.into();
-        record.version_count = Some(2);
-        Arc::new(record.to_entry_enum())
+        let _ = fixture.entry("object", size, "aa");
+        Arc::new(crate::observed_fixtures::observation(
+            data_mover::model::BackendKind::S3,
+            "object".into(),
+            data_mover::model::EntryKind::File,
+            size,
+            [1_000_000_000; 3],
+            None,
+            None,
+            None,
+            Some((Some(id.into()), id == "v2", false)),
+        ))
     };
     let first = version("v1", 11);
     let second = version("v2", 12);
@@ -406,12 +424,17 @@ async fn empty_unconfirmed_copy_remains_dirty_until_commit() -> Result<()> {
 async fn history_copy_recovery_keeps_the_group_and_does_not_delete_the_replayed_path() -> Result<()> {
     let fixture = Fixture::new().await?;
     let version = |id: &str| {
-        let mut row = StorageEntryRecord::from_entry_enum(fixture.entry("object", 10, "aa").as_ref(), 0);
-        row.storage_type = "s3".into();
-        row.file_handle = None;
-        row.version_id = id.into();
-        row.version_count = Some(2);
-        Arc::new(row.to_entry_enum())
+        Arc::new(crate::observed_fixtures::observation(
+            data_mover::model::BackendKind::S3,
+            "object".into(),
+            data_mover::model::EntryKind::File,
+            10,
+            [1_000_000_000; 3],
+            None,
+            None,
+            None,
+            Some((Some(id.into()), id == "v2", false)),
+        ))
     };
     let mut database = ClickHouseDatabase::new(&fixture.config, "history_copy")?;
     database.initialize().await?;

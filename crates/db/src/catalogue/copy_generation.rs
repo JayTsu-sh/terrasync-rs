@@ -1,7 +1,7 @@
 //! 复制目录仅在物理操作与数据库确认全部完成后结束轮次；失败轮次保守重放。
 use super::{ClickHouseDatabase, ScanGenerationLifecycle};
+use crate::common::CATALOGUE_COLUMNS as FILE_SCAN_COLUMNS_LIST;
 use crate::common::DeletionStatus;
-use crate::common::FILE_SCAN_COLUMNS_LIST;
 use crate::error::{DatabaseError, Result};
 use crate::execution::read::QuorumRead;
 use crate::get_scan_base_table_name;
@@ -106,7 +106,7 @@ impl ClickHouseDatabase {
         // 原样保留完整 source history 的 version_count，交回普通 New 分组协议。
         self.sync_client
             .query(&format!(
-                "SELECT {} FROM {table} ORDER BY relative_path, version_id",
+                "SELECT {} FROM {table} ORDER BY relative_path, history_segment, history_index, version_id",
                 *FILE_SCAN_COLUMNS_LIST
             ))
             .fetch_quorum_all()
@@ -124,7 +124,7 @@ impl ClickHouseDatabase {
             if active.contains(&row.relative_path) {
                 retired.push((row.relative_path, row.version_id));
             } else if emitted.insert(row.relative_path.clone()) {
-                deleted.push(DeletionStatus::Deleted(row.to_entry_enum()));
+                deleted.push(DeletionStatus::Deleted(row.to_observation()?));
             }
         }
         self.retire_copy_versions(&retired, working).await?;

@@ -1,5 +1,6 @@
 use data_mover::storage::{list_buckets, list_exports};
 use std::path::{Path, PathBuf};
+use storage_adapter::ObservedEntryExt;
 use storage_adapter::StorageError;
 
 use app::storage_factory::{StorageRole, create_storage_for_role};
