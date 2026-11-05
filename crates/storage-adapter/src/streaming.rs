@@ -1,10 +1,6 @@
 use crate::copied_metadata::copied_metadata_plan;
 use crate::options::transfer_policy;
-use crate::{
-    connected::path,
-    error::{StreamTransferDiagnostic, operation},
-    *,
-};
+use crate::{connected::path, error::operation, *};
 use blake3::{Hash, Hasher};
 use data_mover::storage::{PositionedChunk, StorageRoleFailure, WriteProgress, WriteProgressObserver};
 use data_mover::{
@@ -12,7 +8,7 @@ use data_mover::{
     storage::{self, ByteStream, SourceDescriptor, SourceQosGroup, SourceQosPolicy},
     transfer::{
         DirectPatchChunk, DirectPatchInput, DirectPatchSession, ExpertDestinationRequest, ExpertDestinationSession,
-        ExpertDestinationTransferred, ExpertSourceEvidence, ExpertSourceRequest, ExpertSourceSession, TransferFailure,
+        ExpertDestinationTransferred, ExpertSourceEvidence, ExpertSourceRequest, ExpertSourceSession,
     },
 };
 use futures::{Stream, StreamExt, stream};
@@ -445,7 +441,7 @@ impl StorageContext {
                 state.transferred = Some(transferred);
                 Ok(())
             }
-            Err(failure) => Err(cleanup_stream_failure(failure, mode).await),
+            Err(failure) => Err(failure.cleanup_for_policy(transfer_policy(mode)).await.into()),
         }
     }
     pub async fn commit_chunk_stream(
@@ -473,26 +469,10 @@ impl StorageContext {
             .await;
         match result {
             Ok(_) => Ok(()),
-            Err(failure) => Err(cleanup_stream_failure(failure, state.mode).await),
+            Err(failure) => Err(failure.cleanup_for_policy(transfer_policy(state.mode)).await.into()),
         }
     }
 }
-/// Checkpoint 保留未发布状态；Atomic 先复制结构化诊断，再清理原始失败持有的 stage。
-async fn cleanup_stream_failure(failure: TransferFailure, mode: TransferMode) -> StorageError {
-    if mode == TransferMode::Checkpoint && failure.has_unpublished_stage() {
-        return failure.into();
-    }
-    let mut diagnostic = StreamTransferDiagnostic::capture(&failure);
-    diagnostic.cleanup_failure = if failure.has_pending_cleanup() {
-        failure.cleanup_published_stage().await.err()
-    } else if failure.has_unpublished_stage() {
-        failure.discard_stage().await.err()
-    } else {
-        None
-    };
-    StorageError::StreamTransfer(Box::new(diagnostic))
-}
-
 pub(crate) fn role_failure(message: &str) -> storage::StorageRoleFailure {
     StorageRoleFailure::Entry(
         EntryOperationFailure::new(

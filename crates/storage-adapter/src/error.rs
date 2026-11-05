@@ -1,19 +1,18 @@
 use data_mover::error::StorageError as NativeStorageError;
-use std::error::Error as StdError;
 use task_model::TaskModelError;
 use tokio::task::JoinError;
 
 use crate::{MismatchDataField, MismatchMetaField, RemoteScanFailure, TransferMode};
 use data_mover::{
-    metadata::{ApplicationFailureKind, MetadataApplicationFailure, MetadataApplicationReport, MetadataPlanError},
-    model::{BackendKind, EntryOperationFailure, FailureClass, MetadataFamily, ModelValueError, StoragePath},
+    metadata::{MetadataApplicationFailure, MetadataPlanError},
+    model::{BackendKind, EntryOperationFailure, FailureClass, ModelValueError, StoragePath},
     probes::ProbeFailure,
     storage::{
         BackendConnectError, CapabilityUnavailable, CreateDirectoryAllFailure, DeleteTreeTerminalFailure,
-        SourceQosStats, SourceQosValueError, StorageRoleFailure,
+        SourceQosValueError, StorageRoleFailure,
     },
     tar_pack::TarFailure,
-    transfer::{DirectPatchError, MoveFailure, TransferFailure, TransferPhase, TransferSide, TransferValueError},
+    transfer::{DirectPatchError, MoveFailure, TransferFailure, TransferValueError},
     traversal::{
         FailureScope, ObservationFailure, ScanSetupError, TraversalConfigurationError, TraversalTerminalFailure,
     },
@@ -103,8 +102,6 @@ pub enum StorageError {
     #[error(transparent)]
     Transfer(Box<TransferFailure>),
     #[error(transparent)]
-    StreamTransfer(Box<StreamTransferDiagnostic>),
-    #[error(transparent)]
     Move(Box<MoveFailure>),
     #[error(transparent)]
     Archive(Box<TarFailure>),
@@ -138,51 +135,6 @@ impl From<MoveFailure> for StorageError {
 impl From<TarFailure> for StorageError {
     fn from(value: TarFailure) -> Self {
         Self::Archive(Box::new(value))
-    }
-}
-
-/// stage 清理会消耗上游失败；先复制公开的结构化证据，清理失败也保留在同一诊断中。
-#[derive(Debug, thiserror::Error)]
-#[error(
-    "stream transfer failed in {phase:?}/{side:?}: role={role:?}, metadata={metadata_failures:?}, refusal={refusal:?}, cleanup={cleanup_failure:?}"
-)]
-pub struct StreamTransferDiagnostic {
-    pub phase: TransferPhase,
-    pub side: TransferSide,
-    pub final_destination_changed: bool,
-    pub source_qos: SourceQosStats,
-    #[source]
-    pub role: Option<StorageRoleFailure>,
-    pub metadata_report: Option<MetadataApplicationReport>,
-    pub metadata_failures: Vec<(MetadataFamily, ApplicationFailureKind, Option<StorageRoleFailure>)>,
-    pub refusal: Option<MetadataPlanError>,
-    pub cleanup_failure: Option<StorageRoleFailure>,
-}
-
-impl StreamTransferDiagnostic {
-    pub(crate) fn capture(failure: &TransferFailure) -> Self {
-        let metadata = failure.metadata_failure();
-        let role = StdError::source(failure)
-            .and_then(|source| source.downcast_ref::<StorageRoleFailure>())
-            .or_else(|| metadata.and_then(|failure| failure.storage_error()))
-            .cloned();
-        Self {
-            phase: failure.phase(),
-            side: failure.side(),
-            final_destination_changed: failure.final_destination_changed(),
-            source_qos: failure.source_qos(),
-            role,
-            metadata_report: metadata.map(|failure| failure.report().clone()),
-            metadata_failures: metadata.map_or_else(Vec::new, |failure| {
-                failure
-                    .failures()
-                    .iter()
-                    .map(|family| (family.family(), family.kind(), family.storage_error().cloned()))
-                    .collect()
-            }),
-            refusal: failure.metadata_refusal(),
-            cleanup_failure: None,
-        }
     }
 }
 

@@ -159,12 +159,12 @@ async fn stream_metadata_failure_keeps_old_destination() {
     assert!(probe.called.load(Ordering::SeqCst));
     assert_eq!(std::fs::read(root.path().join("file")).unwrap(), b"old");
     match error {
-        StorageError::StreamTransfer(failure) => {
-            assert_eq!(failure.phase, TransferPhase::Metadata);
-            assert!(!failure.final_destination_changed);
-            assert!(failure.cleanup_failure.is_none());
-            assert!(failure.metadata_report.is_some());
-            assert!(!failure.metadata_failures.is_empty());
+        StorageError::Transfer(failure) => {
+            assert_eq!(failure.phase(), TransferPhase::Metadata);
+            assert!(!failure.final_destination_changed());
+            assert!(failure.cleanup_failure().is_none());
+            let metadata = failure.metadata_failure().unwrap();
+            assert!(!metadata.failures().is_empty());
         }
         error => panic!("expected typed transfer failure: {error:?}"),
     }
@@ -261,11 +261,12 @@ async fn stream_keeps_primary_metadata_error_when_cleanup_also_fails() {
     let entry = destination.get_metadata(Path::new("file")).await.unwrap();
     let error = stream(&destination, &entry).await.unwrap_err();
     match error {
-        StorageError::StreamTransfer(diagnostic) => {
-            assert_eq!(diagnostic.phase, TransferPhase::Metadata);
-            assert!(diagnostic.role.is_some());
-            assert!(!diagnostic.metadata_failures.is_empty());
-            assert!(diagnostic.cleanup_failure.is_some());
+        StorageError::Transfer(failure) => {
+            assert_eq!(failure.phase(), TransferPhase::Metadata);
+            let metadata = failure.metadata_failure().unwrap();
+            assert!(metadata.storage_error().is_some());
+            assert!(!metadata.failures().is_empty());
+            assert!(failure.cleanup_failure().is_some());
         }
         error => panic!("expected primary error and cleanup evidence: {error:?}"),
     }
@@ -661,4 +662,38 @@ async fn published_directory_keeps_setgid_without_fabricating_numeric_owner() {
             & 0o7777,
         0o2775
     );
+}
+
+#[tokio::test]
+async fn stream_cancel_before_publication_keeps_the_original_reason_and_target() {
+    let (root, destination, probe) = destination(false).await;
+    let entry = destination.get_metadata(Path::new("file")).await.unwrap();
+    let handle = StorageContext::prepare_stream(&destination, &entry).await.unwrap();
+    let (tx, rx) = mpsc::channel(2);
+    tx.send(PositionedChunk {
+        offset: 0,
+        data: Bytes::from_static(b"new"),
+    })
+    .await
+    .unwrap();
+    drop(tx);
+    StorageContext::write_chunk_stream(&destination, &entry, rx, &handle, None, Arc::new(|_, _| {}))
+        .await
+        .unwrap();
+    handle.cancel();
+    let error = StorageContext::commit_chunk_stream(&destination, &entry, 3, handle)
+        .await
+        .unwrap_err();
+    match error {
+        StorageError::Transfer(failure) => {
+            assert_eq!(failure.phase(), TransferPhase::Verify);
+            assert!(failure.to_string().contains("cancelled"));
+            assert!(!failure.final_destination_changed());
+            assert!(failure.cleanup_failure().is_none());
+        }
+        error => panic!("expected original typed cancellation reason: {error:?}"),
+    }
+    assert!(!probe.called.load(Ordering::SeqCst));
+    assert_eq!(std::fs::read(root.path().join("file")).unwrap(), b"old");
+    assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 1);
 }
