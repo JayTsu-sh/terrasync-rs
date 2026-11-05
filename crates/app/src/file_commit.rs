@@ -3,7 +3,9 @@
 //! 接收完成后先校验长度及源摘要，再由引擎读回校验并发布；目录和符号链接即时完成。
 //! delta token 经 Reconstructor 重建，basis 区间通过源角色读取。
 
-use data_mover::storage::PositionedChunk;
+use data_mover::storage::{PositionedChunk, read_current_range};
+use futures::StreamExt;
+use std::num::NonZeroUsize;
 use transport::chunk::DataChunk;
 // 标准库
 use std::sync::Arc;
@@ -13,7 +15,7 @@ use task_model::ObservedEntryExt;
 // 外部 crate
 use bytes::{Bytes, BytesMut};
 use storage_adapter::error::Result as StorageResult;
-use storage_adapter::{ObservedEntry, StorageContext, StreamChunk, StreamHandle};
+use storage_adapter::{ObservedEntry, StorageContext, StorageError, StreamChunk, StreamHandle};
 use sync_delta::DeltaToken;
 use sync_delta::reconstruct::{ReconstructStep, Reconstructor};
 use task_model::observation::ObservedItem;
@@ -436,29 +438,36 @@ fn stage_error(stage: &'static str, source: AppError) -> CommitOutcome {
     })
 }
 
-/// 读取 basis file（目标端当前已有文件）的 `[offset, offset + len)` 区间，用于 `Match`
-/// token 重建。经 `read_chunk_stream` 公共入口（`intervals=Some`）读取——避免绕过已修复
-/// 的 NFS 短读处理（issue #54 阶段 3）。
+/// 为 delta 重建读取当前 basis 的精确区间；原生流校验身份、版本和完整范围。
+/// 单块结果直接移动，多块结果才分配重建器要求的连续缓冲区。
 async fn read_basis_block(
     dest: &Arc<StorageContext>, entry: &Arc<ObservedEntry>, offset: u64, len: u32,
 ) -> Result<Bytes> {
-    let (mut rx, handle) = StorageContext::read_basis_chunk_stream(
-        dest,
-        entry,
-        Some(vec![(offset, offset + u64::from(len))]),
-        None,
-        false,
-        1,
-    );
-    let mut buf = BytesMut::with_capacity(len as usize);
-    while let Some(chunk) = rx.recv().await {
-        buf.extend_from_slice(&chunk.data);
+    let source = dest.storage().read_source().map_err(StorageError::from)?;
+    let maximum = NonZeroUsize::new(dest.block_size() as usize).unwrap_or(NonZeroUsize::MIN);
+    let input = read_current_range(
+        source.as_ref(),
+        entry.path().clone(),
+        Some(offset..offset + u64::from(len)),
+        maximum,
+        CancellationToken::new(),
+    )
+    .await
+    .map_err(StorageError::from)?;
+    let mut input = input.map(|item| item.map_err(StorageError::from));
+    let Some(first) = input.next().await.transpose()? else {
+        return Ok(Bytes::new());
+    };
+    let Some(second) = input.next().await.transpose()? else {
+        return Ok(first.data);
+    };
+    let mut buffer = BytesMut::with_capacity(len as usize);
+    buffer.extend_from_slice(&first.data);
+    buffer.extend_from_slice(&second.data);
+    while let Some(chunk) = input.next().await.transpose()? {
+        buffer.extend_from_slice(&chunk.data);
     }
-    match handle.await {
-        Ok(Ok(_)) => Ok(buf.freeze()),
-        Ok(Err(e)) => Err(AppError::from(e)),
-        Err(join_err) => Err(AppError::from(join_err)),
-    }
+    Ok(buffer.freeze())
 }
 
 /// 连续的 basis 引用合并为有界读取，避免大文件逐块反复打开和描述目标。

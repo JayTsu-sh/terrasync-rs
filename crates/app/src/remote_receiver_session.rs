@@ -5,14 +5,18 @@
 //! 当前实现委托既有事件循环，后续 tickets 将在此 interface 后逐步收拢会话状态。
 
 use crate::file_copy::copied_tags_required;
+use data_mover::storage::read_current_range;
+use futures::StreamExt;
 use std::collections::{HashMap, HashSet};
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 use task_model::ObservedEntryExt;
 #[cfg(test)]
 use task_model::TransferMode;
 use task_model::observation::ObservedItem;
+use tokio_util::sync::CancellationToken;
 
-use storage_adapter::{ObservedEntry, StorageContext};
+use storage_adapter::{ObservedEntry, Result as StorageResult, StorageContext};
 use tokio::sync::mpsc::{Receiver, Sender};
 use tracing::{debug, info, warn};
 use transport::chunk::DataChunk;
@@ -178,16 +182,24 @@ impl RemoteSessionState {
         }
 
         let block_size = sync_delta::calculate_block_size(size);
-        let (mut basis_rx, basis_handle) =
-            StorageContext::read_basis_chunk_stream(dest, &entry.entry, None, None, false, 8);
         let mut sig_calc = sync_delta::signature::SignatureCalculator::new(block_size);
-        while let Some(chunk) = basis_rx.recv().await {
-            sig_calc.push(&chunk.data);
+        let basis_read_result: StorageResult<()> = async {
+            let source = dest.storage().read_source()?;
+            let maximum = NonZeroUsize::new(dest.block_size() as usize).unwrap_or(NonZeroUsize::MIN);
+            let mut input = read_current_range(
+                source.as_ref(),
+                entry.entry.path().clone(),
+                None,
+                maximum,
+                CancellationToken::new(),
+            )
+            .await?;
+            while let Some(chunk) = input.next().await {
+                sig_calc.push(&chunk?.data);
+            }
+            Ok(())
         }
-        let basis_read_result = match basis_handle.await {
-            Ok(inner) => inner.map_err(|e| e.to_string()),
-            Err(e) => Err(e.to_string()),
-        };
+        .await;
 
         match basis_read_result {
             Ok(_) => {

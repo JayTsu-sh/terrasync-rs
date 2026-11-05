@@ -3,6 +3,7 @@
 use super::*;
 use crate::ObservedEntryExt;
 use async_trait::async_trait;
+use blake3::Hasher;
 use bytes::Bytes;
 use data_mover::storage::{
     BackendConfig, ByteStream, CheckpointObservation, CopiedMetadataTarget, CopiedValueTarget,
@@ -17,7 +18,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::task::Poll;
 use std::{
     num::NonZeroUsize,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::atomic::{AtomicBool, Ordering},
 };
 use tempfile::TempDir;

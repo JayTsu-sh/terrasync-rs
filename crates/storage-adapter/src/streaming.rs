@@ -1,7 +1,7 @@
 use crate::copied_metadata::copied_metadata_plan;
 use crate::options::transfer_policy;
-use crate::{connected::path, error::operation, *};
-use blake3::{Hash, Hasher};
+use crate::{error::operation, *};
+use blake3::Hash;
 use data_mover::storage::{PositionedChunk, WriteProgress, WriteProgressObserver};
 use data_mover::{
     model::*,
@@ -17,29 +17,15 @@ use qos::{QosConfig, QosManager, parse_bandwidth_string};
 use std::num::NonZeroUsize;
 use std::pin::Pin;
 use std::{
-    path::Path,
     sync::{Arc, Mutex, OnceLock, Weak},
     time::Duration,
 };
 use task_model::observation::{EntryStatistics, ObservedItem, ObservedView};
-use tokio::{
-    sync::{Mutex as AsyncMutex, mpsc},
-    task::JoinHandle,
-};
+use tokio::sync::{Mutex as AsyncMutex, mpsc};
 use tokio_util::sync::CancellationToken;
 
 type Input = Pin<Box<dyn Stream<Item = StreamChunk> + Send>>;
 
-pub trait ConsistencyCheck {
-    fn finalize(self) -> String;
-}
-#[derive(Clone, Default)]
-pub struct HashCalculator(pub(crate) blake3::Hasher);
-impl ConsistencyCheck for HashCalculator {
-    fn finalize(self) -> String {
-        self.0.finalize().to_hex().to_string()
-    }
-}
 pub(crate) fn source_qos(qos: &QosManager, maximum: u64) -> Result<SourceQosGroup> {
     type Groups = Cache<usize, (Weak<QosConfig>, SourceQosGroup)>;
     static GROUPS: OnceLock<Groups> = OnceLock::new();
@@ -80,15 +66,6 @@ pub(crate) fn source_qos(qos: &QosManager, maximum: u64) -> Result<SourceQosGrou
     Ok(group)
 }
 impl StorageContext {
-    pub fn read_basis_chunk_stream(
-        storage: &Self, entry: &Arc<ObservedEntry>, intervals: Option<Vec<(u64, u64)>>, qos: Option<QosManager>,
-        hash: bool, capacity: usize,
-    ) -> (
-        mpsc::Receiver<PositionedChunk>,
-        JoinHandle<Result<Option<HashCalculator>>>,
-    ) {
-        Self::start_chunk_stream(storage, &Arc::clone(entry).into(), intervals, qos, hash, capacity)
-    }
     /// 在发送 FileBegin 前由原生 source session 校验观察，并钉住所选源版本。
     pub async fn open_observed_source(
         storage: &Self, item: &ObservedItem, qos: Option<&QosManager>,
@@ -105,76 +82,6 @@ impl StorageContext {
             request = request.with_source_qos(source_qos(qos, storage.block_size)?);
         }
         Ok(ExpertSourceSession::open(request).await?)
-    }
-    fn start_chunk_stream(
-        storage: &Self, item: &ObservedItem, intervals: Option<Vec<(u64, u64)>>, qos: Option<QosManager>, hash: bool,
-        capacity: usize,
-    ) -> (
-        mpsc::Receiver<PositionedChunk>,
-        JoinHandle<Result<Option<HashCalculator>>>,
-    ) {
-        let storage = storage.clone();
-        let item = item.clone();
-        let (tx, rx) = mpsc::channel(capacity.max(1));
-        let task = tokio::spawn(async move {
-            let source = storage.roles.read_source()?;
-            let view = item.view().payload();
-            let p = view.source_path()?;
-            let version = SourceVersion::Current;
-            let descriptor = source.describe_version(&p, &version).await?;
-            let size = descriptor.size.ok_or_else(|| operation("unknown source size"))?;
-            let ranges = intervals.unwrap_or_else(|| vec![(0, size)]);
-            let mut hasher = hash.then(HashCalculator::default);
-            let budget = qos
-                .as_ref()
-                .map(|q| source_qos(q, storage.block_size))
-                .transpose()?
-                .map(|g| g.transfer_budget());
-            for (start, end) in ranges {
-                if start > end || end > size {
-                    return Err(operation("source range outside object"));
-                }
-                if start == end {
-                    continue;
-                }
-                let mut offset = start;
-                let mut stream = source
-                    .read(storage::ReadRequest {
-                        path: p.clone(),
-                        range: Some(start..end),
-                        expected_source: Some(descriptor.source_identity.clone()),
-                        maximum_chunk_bytes: source
-                            .maximum_read_chunk_bytes()
-                            .min(storage.block_size as usize)
-                            .max(1),
-                        read_inflight: source.read_concurrency(),
-                        read_budget: None,
-                        cancel: CancellationToken::new(),
-                        source_qos: budget.clone(),
-                        version: version.clone(),
-                    })
-                    .await?;
-                while let Some(data) = stream.next().await {
-                    let data = data?;
-                    if offset + data.len() as u64 > end {
-                        return Err(operation("source read exceeded requested range"));
-                    }
-                    if let Some(hasher) = hasher.as_mut() {
-                        hasher.0.update(&data);
-                    }
-                    let len = data.len() as u64;
-                    if tx.send(PositionedChunk { offset, data }).await.is_err() {
-                        return Err(StorageError::Cancelled);
-                    }
-                    offset += len;
-                }
-                if offset != end {
-                    return Err(operation("source returned a short read"));
-                }
-            }
-            Ok(hasher)
-        });
-        (rx, task)
     }
 }
 /// basis 提示只由 Receiver 的重建器产生；同位置引用已读取并计入完整摘要。
@@ -434,32 +341,6 @@ impl StorageContext {
         }
     }
 }
-impl StorageContext {
-    pub async fn compute_hash(&self, p: &Path, _size: u64) -> Result<String> {
-        let source = self.roles.read_source()?;
-        let p = path(p)?;
-        let desc = source.describe(&p).await?;
-        let mut stream = source
-            .read(storage::ReadRequest {
-                path: p,
-                range: None,
-                expected_source: Some(desc.source_identity),
-                maximum_chunk_bytes: source.maximum_read_chunk_bytes(),
-                read_inflight: source.read_concurrency(),
-                read_budget: None,
-                cancel: CancellationToken::new(),
-                source_qos: None,
-                version: SourceVersion::Current,
-            })
-            .await?;
-        let mut hasher = Hasher::new();
-        while let Some(bytes) = stream.next().await {
-            hasher.update(&bytes?);
-        }
-        Ok(hasher.finalize().to_hex().to_string())
-    }
-}
-
 #[cfg(test)]
 #[path = "streaming_metadata_tests.rs"]
 mod tests;
