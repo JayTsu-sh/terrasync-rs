@@ -276,26 +276,34 @@ struct WriteState {
     input_ended: bool,
     identity_key: EntryIdentityKey,
     size: u64,
-    cancel: CancellationToken,
     observer: Arc<Mutex<Option<CommitCallback>>>,
 }
 #[derive(Clone)]
-pub struct StreamHandle(Arc<AsyncMutex<WriteState>>);
+pub struct StreamHandle {
+    state: Arc<AsyncMutex<WriteState>>,
+    cancel: CancellationToken,
+}
 impl StreamHandle {
+    /// 无需等待提交锁即可请求取消；实际资源由正在运行的引擎阶段收尾。
+    pub fn cancel(&self) {
+        self.cancel.cancel();
+    }
+
     pub async fn written_bytes(&self) -> u64 {
-        self.0.lock().await.written_bytes
+        self.state.lock().await.written_bytes
     }
     pub async fn received_size(&self) -> u64 {
-        self.0.lock().await.bytes
+        self.state.lock().await.bytes
     }
     pub async fn input_ended(&self) -> bool {
-        self.0.lock().await.input_ended
+        self.state.lock().await.input_ended
     }
     pub async fn received_hash(&self) -> String {
-        Hash::from_bytes(self.0.lock().await.digest).to_hex().to_string()
+        Hash::from_bytes(self.state.lock().await.digest).to_hex().to_string()
     }
     pub async fn discard(&self) -> Result<()> {
-        let mut state = self.0.lock().await;
+        self.cancel();
+        let mut state = self.state.lock().await;
         state.direct.take();
         if let Some(session) = state.session.take() {
             if state.mode != TransferMode::Checkpoint {
@@ -303,7 +311,6 @@ impl StreamHandle {
             }
         }
         if let Some(transferred) = state.transferred.take() {
-            state.cancel.cancel();
             let evidence = ExpertSourceEvidence {
                 source_size: state.size,
                 blake3: state.digest,
@@ -321,10 +328,13 @@ impl StreamHandle {
 }
 impl StorageEnum {
     pub async fn prepare_stream(dest: &Self, entry: &EntryEnum) -> Result<StreamHandle> {
-        Self::prepare_stream_with_mode(dest, entry, TransferMode::Atomic).await
+        Self::prepare_stream_with_mode(dest, entry, TransferMode::Atomic, CancellationToken::new()).await
     }
 
-    pub async fn prepare_stream_with_mode(dest: &Self, entry: &EntryEnum, mode: TransferMode) -> Result<StreamHandle> {
+    pub async fn prepare_stream_with_mode(
+        dest: &Self, entry: &EntryEnum, mode: TransferMode, cancel: CancellationToken,
+    ) -> Result<StreamHandle> {
+        let cancel = cancel.child_token();
         dest.validate_stream_transfer_mode(mode)?;
         let p = path(entry.get_relative_path())?;
         // wire 元数据固定本轮源描述；目标检查点由上游绑定并校验，传输仍接收全量摘要证据。
@@ -342,7 +352,6 @@ impl StorageEnum {
         )?;
         let metadata_plan = stream_metadata_plan(dest, entry)?;
         let identity_key = observed.identity_key();
-        let cancel = CancellationToken::new();
         let observer = Arc::new(Mutex::new(None::<CommitCallback>));
         let callback = observer.clone();
         let progress = WriteProgressObserver::new(move |event| {
@@ -365,7 +374,7 @@ impl StorageEnum {
             );
             (
                 None,
-                Some(DirectPatchSession::prepare(dest.roles.clone(), source, metadata_plan).await?),
+                Some(DirectPatchSession::prepare(dest.roles.clone(), source, metadata_plan, cancel.clone()).await?),
                 0,
             )
         } else {
@@ -397,10 +406,12 @@ impl StorageEnum {
             input_ended: false,
             identity_key,
             size: entry.get_size(),
-            cancel,
             observer,
         };
-        Ok(StreamHandle(Arc::new(AsyncMutex::new(state))))
+        Ok(StreamHandle {
+            state: Arc::new(AsyncMutex::new(state)),
+            cancel,
+        })
     }
     pub async fn write_chunk_stream(
         _dest: &Self, _entry: &EntryEnum, rx: mpsc::Receiver<DataChunk>, handle: &StreamHandle,
@@ -420,7 +431,7 @@ impl StorageEnum {
     }
 
     async fn write_input(incoming: Input, handle: &StreamHandle, on_committed: CommitCallback) -> Result<()> {
-        let direct = handle.0.lock().await.direct.take();
+        let direct = handle.state.lock().await.direct.take();
         if let Some(mut direct) = direct {
             let mut input: DirectPatchInput = Box::pin(incoming.map(|input| DirectPatchChunk {
                 offset: input.chunk.offset,
@@ -429,7 +440,7 @@ impl StorageEnum {
             }));
             let result = direct.receive(&mut input).await;
             let progress = direct.progress();
-            let mut state = handle.0.lock().await;
+            let mut state = handle.state.lock().await;
             state.bytes = progress.bytes;
             state.digest = progress.blake3;
             state.input_ended = progress.ended;
@@ -437,7 +448,7 @@ impl StorageEnum {
             return result.map_err(StorageError::from);
         }
         let (session, mode, resume_offset) = {
-            let mut state = handle.0.lock().await;
+            let mut state = handle.state.lock().await;
             *state.observer.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(on_committed);
             (
                 state
@@ -484,7 +495,7 @@ impl StorageEnum {
             let stats = tally.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             (stats.0, *stats.1.finalize().as_bytes(), stats.2)
         };
-        let mut state = handle.0.lock().await;
+        let mut state = handle.state.lock().await;
         state.bytes = bytes;
         state.input_ended = input_ended;
         state.digest = digest;
@@ -497,7 +508,7 @@ impl StorageEnum {
         }
     }
     pub async fn commit_chunk_stream(_dest: &Self, _entry: &EntryEnum, _size: u64, handle: StreamHandle) -> Result<()> {
-        let mut state = handle.0.lock().await;
+        let mut state = handle.state.lock().await;
         if let Some(direct) = state.direct.take() {
             state.written_bytes = direct.complete().await?;
             return Ok(());

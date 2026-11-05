@@ -7,6 +7,8 @@ use storage_adapter::{
     CreateStorageOptions, DataChunk, EntryEnum, StorageEnum, StorageError, TransferMode, create_storage,
 };
 use tokio::sync::mpsc;
+use tokio::time::{Duration, timeout};
+use tokio_util::sync::CancellationToken;
 
 async fn planned(
     target: &StorageEnum, payload: &[u8],
@@ -15,7 +17,8 @@ async fn planned(
     if let EntryEnum::NAS(file) = &mut entry {
         file.size = payload.len() as u64;
     }
-    let handle = StorageEnum::prepare_stream_with_mode(target, &entry, TransferMode::Direct).await?;
+    let handle =
+        StorageEnum::prepare_stream_with_mode(target, &entry, TransferMode::Direct, CancellationToken::new()).await?;
     let (tx, rx) = mpsc::channel(4);
     let writer_target = target.clone();
     let writer_entry = entry.clone();
@@ -95,5 +98,58 @@ async fn interrupted_direct_and_concurrent_basis_change_do_not_apply_planned_pat
         StorageError::DirectPatch(DirectPatchError::BasisChanged(_))
     ));
     assert_eq!(std::fs::read(root.path().join("file"))?, b"EXTERNAL");
+    Ok(())
+}
+
+#[tokio::test]
+async fn cancelled_direct_commit_preserves_basis_and_parent_is_not_cancelled_by_discard() -> Result<(), Box<dyn Error>>
+{
+    let root = tempfile::tempdir()?;
+    std::fs::write(root.path().join("file"), b"AAAABBBB")?;
+    let target = create_storage(
+        root.path().to_str().ok_or("bad path")?,
+        CreateStorageOptions::new(None, false),
+    )
+    .await?;
+    let (entry, handle) = planned(&target, b"AAAAXXXX").await?;
+    handle.cancel();
+    let error = StorageEnum::commit_chunk_stream(&target, &entry, 8, handle)
+        .await
+        .expect_err("取消后不得应用已经接收的补丁");
+    assert!(error.is_cancelled());
+    assert!(matches!(error, StorageError::DirectPatch(DirectPatchError::Cancelled)));
+    assert_eq!(std::fs::read(root.path().join("file"))?, b"AAAABBBB");
+
+    let parent = CancellationToken::new();
+    let handle = StorageEnum::prepare_stream_with_mode(&target, &entry, TransferMode::Direct, parent.clone()).await?;
+    handle.discard().await?;
+    assert!(!parent.is_cancelled());
+    Ok(())
+}
+
+#[tokio::test]
+async fn caller_cancellation_interrupts_direct_writer_waiting_for_input() -> Result<(), Box<dyn Error>> {
+    let root = tempfile::tempdir()?;
+    std::fs::write(root.path().join("file"), b"AAAABBBB")?;
+    let target = create_storage(
+        root.path().to_str().ok_or("bad path")?,
+        CreateStorageOptions::new(None, false),
+    )
+    .await?;
+    let entry = target.get_metadata(Path::new("file")).await?;
+    let cancel = CancellationToken::new();
+    let handle = StorageEnum::prepare_stream_with_mode(&target, &entry, TransferMode::Direct, cancel.clone()).await?;
+    let (_tx, rx) = mpsc::channel(1);
+    let writing = StorageEnum::write_planned_stream(rx, &handle);
+    let (result, ()) = tokio::join!(timeout(Duration::from_secs(1), writing), async {
+        tokio::task::yield_now().await;
+        cancel.cancel();
+    });
+    assert!(matches!(
+        result?,
+        Err(StorageError::DirectPatch(DirectPatchError::Cancelled))
+    ));
+    handle.discard().await?;
+    assert_eq!(std::fs::read(root.path().join("file"))?, b"AAAABBBB");
     Ok(())
 }

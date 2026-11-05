@@ -317,9 +317,10 @@ async fn checkpoint_stream_reuses_partial_prefix_and_verifies_full_payload() {
     if let EntryEnum::NAS(ref mut file) = entry {
         file.size = size;
     }
-    let first = StorageEnum::prepare_stream_with_mode(&destination, &entry, TransferMode::Checkpoint)
-        .await
-        .unwrap();
+    let first =
+        StorageEnum::prepare_stream_with_mode(&destination, &entry, TransferMode::Checkpoint, CancellationToken::new())
+            .await
+            .unwrap();
     let (tx, rx) = mpsc::channel(2);
     let prefix = 1024 * 1024 + 3;
     tx.send(DataChunk {
@@ -338,10 +339,11 @@ async fn checkpoint_stream_reuses_partial_prefix_and_verifies_full_payload() {
     drop(first);
     assert_eq!(std::fs::read(root.path().join("file")).unwrap(), b"old");
 
-    let resumed = StorageEnum::prepare_stream_with_mode(&destination, &entry, TransferMode::Checkpoint)
-        .await
-        .unwrap();
-    assert_eq!(resumed.0.lock().await.resume_offset, prefix as u64);
+    let resumed =
+        StorageEnum::prepare_stream_with_mode(&destination, &entry, TransferMode::Checkpoint, CancellationToken::new())
+            .await
+            .unwrap();
+    assert_eq!(resumed.state.lock().await.resume_offset, prefix as u64);
     let (tx, rx) = mpsc::channel(4);
     let writer_handle = resumed.clone();
     let writer_dest = destination.clone();

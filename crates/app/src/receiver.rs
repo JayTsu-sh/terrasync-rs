@@ -17,6 +17,7 @@ use storage_adapter::{StorageEntryMessage, StorageError};
 use storage_adapter::qos::QosManager;
 use storage_adapter::{EntryEnum, StorageEnum};
 use tokio::sync::mpsc::Receiver as MpscReceiver;
+use tokio_util::sync::CancellationToken;
 use tracing::{Instrument, debug, error, info, info_span, trace, warn};
 use transport::error::TransportError;
 use transport::message::{
@@ -574,15 +575,18 @@ pub(crate) async fn recv_file_list_and_data_phase(
     // ack_tx.send 的双向死锁。
     let (dc_tx, dc_rx) = tokio::sync::mpsc::channel::<DiskCommitMsg>(16);
     let (ack_tx, mut ack_rx) = tokio::sync::mpsc::unbounded_channel::<DcAck>();
+    let disk_cancel = CancellationToken::new();
+    let _cancel_on_drop = disk_cancel.clone().drop_guard();
     let dc_join = tokio::spawn(crate::disk_commit::disk_commit_task(
         dest_storage.clone(),
         session_config.clone(),
         dc_rx,
         ack_tx,
         progress.clone(),
+        disk_cancel.clone(),
     ));
     let mut transport_closed = false;
-    let mut enumeration_failure = None;
+    let mut receive_failure = None;
 
     loop {
         // 同时处理 transport 消息和 progress 上报
@@ -616,7 +620,7 @@ pub(crate) async fn recv_file_list_and_data_phase(
                 let mut dest_index = match read_destination_index(dest_storage, &page.dir_path).await {
                     Ok(index) => index,
                     Err(error) => {
-                        enumeration_failure = Some(error);
+                        receive_failure = Some(error);
                         break;
                     }
                 };
@@ -660,7 +664,7 @@ pub(crate) async fn recv_file_list_and_data_phase(
                     .await;
             }
             Some(SenderMsg::FileListError { path, reason }) => {
-                enumeration_failure = Some(AppError::CopyError(format!("Source listing failed at {path}: {reason}")));
+                receive_failure = Some(AppError::CopyError(format!("Source listing failed at {path}: {reason}")));
                 break;
             }
             Some(SenderMsg::FileListDone) => {
@@ -726,7 +730,10 @@ pub(crate) async fn recv_file_list_and_data_phase(
 
             // ── 数据流模式：文件数据块 → 转发给 disk-commit task 的 write_chunk_stream ──
             Some(SenderMsg::FileData { entry, chunk }) => {
-                state.accept_full_chunk(transport, &dc_tx, entry, chunk).await?;
+                if let Err(error) = state.accept_full_chunk(transport, &dc_tx, entry, chunk).await {
+                    receive_failure = Some(error);
+                    break;
+                }
             }
 
             // ── Delta token 接收：逐 token 转发给 disk-commit task（不再攒整文件 Vec，见
@@ -740,7 +747,10 @@ pub(crate) async fn recv_file_list_and_data_phase(
             }
             Some(SenderMsg::DeltaData { ndx, data }) => {
                 if let Some(entry) = state.indexed_entry(ndx).cloned() {
-                    state.accept_delta_data(transport, &dc_tx, ndx, &entry, data).await?;
+                    if let Err(error) = state.accept_delta_data(transport, &dc_tx, ndx, &entry, data).await {
+                        receive_failure = Some(error);
+                        break;
+                    }
                 } else {
                     warn!("[Receiver Remote] DeltaData for unknown ndx {}", ndx);
                 }
@@ -798,8 +808,9 @@ pub(crate) async fn recv_file_list_and_data_phase(
         } // close select!
     } // close loop
 
-    if enumeration_failure.is_some() || transport_closed {
-        if enumeration_failure.is_some() {
+    if receive_failure.is_some() || transport_closed {
+        disk_cancel.cancel();
+        if receive_failure.is_some() {
             progress.error_count.fetch_add(1, Ordering::Relaxed);
         }
         // 先通知对端停止，再收尾已开始的磁盘任务；失败不能触发目录完成元数据。
@@ -813,7 +824,7 @@ pub(crate) async fn recv_file_list_and_data_phase(
     // Connection-local residual credit is meaningless after every terminal path,
     // including a disk-commit shutdown failure.
     state.discard_residual_credit();
-    if let Some(error) = enumeration_failure {
+    if let Some(error) = receive_failure {
         if let Err(cleanup_error) = shutdown_result {
             warn!(%cleanup_error, "disk cleanup failed after enumeration failure");
         }

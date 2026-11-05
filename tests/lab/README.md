@@ -2,6 +2,33 @@
 
 The lab is shared by `nfs-rs`, `data-mover-rs`, and `terrasync-rs`.
 
+## Direct 取消回归
+
+`verify-direct-cancel.py` 在真实远端 Local 目标和 QUIC 链路上验证 Direct 取消。
+先构建 `cargo build --release --bin terrasync` 和
+`cargo test -p app --test direct_cancel_real --no-run`；后者输出独立测试二进制路径。
+
+```sh
+timeout 1200 python3 tests/lab/verify-direct-cancel.py \
+  --binary /path/to/release/terrasync \
+  --sender-test-binary /path/to/direct_cancel_real-HASH \
+  --work-dir /tmp/terrasync-direct-cancel-RUN \
+  --run-id nightly-direct-cancel-YYYYMMDD-HHMM \
+  --ssh-key /path/to/terrasync_lab
+```
+
+默认在目标 VM `10.131.9.13` 启动正式 Receiver，业务连接走 `10.10.1.13`；
+runner 调用 `prepare-run.sh`／`cleanup-run.sh`，只写本次 `/var/lib/terrasync-ci/<run>/`。
+测试 Sender 使用生产 QUIC transport，在远端确认私有补丁已接收或原生文件校验开始后
+主动关闭连接。阶段确认使用 Linux `/proc/<pid>/fdinfo`：basis 读取为 positioned read，
+校验使用顺序读取；测试不依赖固定睡眠来猜测阶段，也不向生产代码加入暂停入口。
+
+默认每项使用 2 GiB 文件和 16 MiB 差异。分别检查接收中断不改目标、校验中断保留已写内容
+但不发布元数据、不报告业务成功、三秒内取消退出、进程及临时文件收尾；每次中断后用正式
+CLI 对同一目标重新执行，独立核验 SHA-256、大小、inode 和 mode。报告同时记录两次正常重试
+及清理结果。此测试覆盖 Direct 的真实 Local 目标，不代表其他 backend 或其他写入策略的
+故障矩阵已通过。
+
 | Role | Management | Data | Services |
 |---|---|---|---|
 | Controller | 10.131.9.11 | 10.10.1.11 | GitHub Actions Runner, ClickHouse |

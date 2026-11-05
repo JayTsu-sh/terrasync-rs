@@ -10,6 +10,7 @@ use app::disk_commit::disk_commit_task;
 use app::receiver::ReceiverProgress;
 use bytes::Bytes;
 use storage_adapter::{DataChunk, EntryEnum, NASEntry, StorageEnum, create_storage};
+use tokio_util::sync::CancellationToken;
 use transport::message::{DcAck, DiskCommitMsg, FileOutcome, ReceiverMsg, SessionConfig};
 
 // ============================================================
@@ -106,7 +107,14 @@ async fn run_dc_inner(
     let (dc_tx, dc_rx) = tokio::sync::mpsc::channel(16);
     let (ack_tx, mut ack_rx) = tokio::sync::mpsc::unbounded_channel();
     let progress = Arc::new(ReceiverProgress::new());
-    let jh = tokio::spawn(disk_commit_task(dest, session, dc_rx, ack_tx, progress.clone()));
+    let jh = tokio::spawn(disk_commit_task(
+        dest,
+        session,
+        dc_rx,
+        ack_tx,
+        progress.clone(),
+        CancellationToken::new(),
+    ));
     for m in msgs {
         dc_tx.send(m).await.unwrap();
     }
@@ -957,4 +965,60 @@ async fn dc_delta_basis_read_failure_reports_hard_error_and_cleans_part() {
     assert_eq!(acks.len(), 1, "失败后的残余命令不得产生重复 outcome");
     assert!(!tmp.path().join("missing.bin").exists());
     assert!(!tmp.path().join("missing.bin.terrasync-part").exists());
+}
+
+#[tokio::test]
+async fn dc_direct_abort_cancels_one_file_and_allows_the_next_commit() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(tmp.path().join("file"), b"AAAABBBB").unwrap();
+    let dest = local_storage(tmp.path()).await;
+    let entry = make_nas_entry("file", false, false, 8, 0o644);
+    let mut session = session_cfg(true);
+    session.transfer_mode = TransferMode::Direct;
+    let messages = vec![
+        DiskCommitMsg::FileBegin {
+            ndx: 0,
+            entry: entry.clone(),
+        },
+        DiskCommitMsg::FileChunk {
+            entry: entry.clone(),
+            chunk: DataChunk {
+                offset: 0,
+                data: Bytes::from_static(b"AAAAXXXX"),
+            },
+        },
+        DiskCommitMsg::AbortFile,
+        DiskCommitMsg::FileBegin {
+            ndx: 1,
+            entry: entry.clone(),
+        },
+        DiskCommitMsg::FileChunk {
+            entry: entry.clone(),
+            chunk: DataChunk {
+                offset: 0,
+                data: Bytes::from_static(b"AAAAYYYY"),
+            },
+        },
+        DiskCommitMsg::FileCommit {
+            ndx: 1,
+            entry,
+            source_hash: Some(blake3::hash(b"AAAAYYYY").to_hex().to_string()),
+        },
+    ];
+    let (acks, progress) = tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        run_dc_inner(dest, session, messages, true),
+    )
+    .await
+    .unwrap();
+    assert_eq!(acks.len(), 1);
+    assert!(matches!(
+        &acks[0],
+        DcAck::FileOutcome {
+            ndx: 1,
+            outcome: FileOutcome::Success
+        }
+    ));
+    assert_eq!(progress.files_transferred.load(Ordering::Relaxed), 1);
+    assert_eq!(std::fs::read(tmp.path().join("file")).unwrap(), b"AAAAYYYY");
 }

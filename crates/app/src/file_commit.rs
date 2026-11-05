@@ -15,6 +15,7 @@ use sync_delta::DeltaToken;
 use sync_delta::reconstruct::{ReconstructStep, Reconstructor};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, warn};
 use transport::message::{DcAck, FileOutcome, SessionConfig};
 
@@ -94,12 +95,13 @@ pub(crate) struct FileCommitter {
     ack_tx: mpsc::UnboundedSender<DcAck>,
     progress: Arc<ReceiverProgress>,
     state: FileCommitState,
+    cancel: CancellationToken,
 }
 
 impl FileCommitter {
     pub(crate) fn new(
         dest: Arc<StorageEnum>, session: SessionConfig, ack_tx: mpsc::UnboundedSender<DcAck>,
-        progress: Arc<ReceiverProgress>,
+        progress: Arc<ReceiverProgress>, cancel: CancellationToken,
     ) -> Self {
         Self {
             dest,
@@ -107,6 +109,7 @@ impl FileCommitter {
             ack_tx,
             progress,
             state: FileCommitState::Idle,
+            cancel,
         }
     }
 
@@ -152,7 +155,9 @@ impl FileCommitter {
         } else {
             0
         };
-        match StorageEnum::prepare_stream_with_mode(&self.dest, &entry, self.session.transfer_mode).await {
+        match StorageEnum::prepare_stream_with_mode(&self.dest, &entry, self.session.transfer_mode, self.cancel.clone())
+            .await
+        {
             Ok(handle) => {
                 let (tx_inner, rx_inner) = mpsc::channel::<StreamChunk>(8);
                 let writer_handle = handle.clone();
@@ -397,6 +402,7 @@ async fn settle_and_remove(_dest: &StorageEnum, active: ActiveFile) {
         handle,
         ..
     } = active;
+    handle.cancel();
     drop(tx_inner);
     let _ = write_join.await;
     let _ = handle.discard().await;

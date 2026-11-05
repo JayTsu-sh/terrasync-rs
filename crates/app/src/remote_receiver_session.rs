@@ -636,7 +636,7 @@ mod tests {
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
-    use std::sync::atomic::Ordering;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Duration;
 
     use async_trait::async_trait;
@@ -666,6 +666,8 @@ mod tests {
     struct RecordingReceiverTransport {
         incoming: TokioMutex<mpsc::Receiver<SenderMsg>>,
         sent: TokioMutex<Vec<ReceiverMsg>>,
+        fail_credit: bool,
+        closed: AtomicBool,
     }
 
     #[async_trait]
@@ -675,11 +677,15 @@ mod tests {
         }
 
         async fn send(&self, message: ReceiverMsg) -> TransportResult<()> {
+            if self.fail_credit && matches!(message, ReceiverMsg::CreditGrant { .. }) {
+                return Err(transport::error::TransportError::ChannelClosed);
+            }
             self.sent.lock().await.push(message);
             Ok(())
         }
 
         async fn close(&self) -> TransportResult<()> {
+            self.closed.store(true, Ordering::SeqCst);
             Ok(())
         }
     }
@@ -729,6 +735,8 @@ mod tests {
         let transport = RecordingReceiverTransport {
             incoming: TokioMutex::new(incoming_rx),
             sent: TokioMutex::new(Vec::new()),
+            fail_credit: false,
+            closed: AtomicBool::new(false),
         };
         let progress = Arc::new(ReceiverProgress::new());
         let (_progress_tx, progress_rx) = mpsc::channel(1);
@@ -764,6 +772,68 @@ mod tests {
                 .iter()
                 .any(|message| matches!(message, ReceiverMsg::CreditGrant { .. }))
         );
+    }
+
+    #[tokio::test]
+    async fn failed_credit_delivery_cancels_and_joins_direct_disk_work() {
+        let root = tempdir().unwrap();
+        fs::write(root.path().join("file"), b"AAAABBBB").unwrap();
+        let dest = Arc::new(
+            create_storage(root.path().to_str().unwrap(), None, false)
+                .await
+                .unwrap(),
+        );
+        let entry = Arc::new(dest.get_metadata(std::path::Path::new("file")).await.unwrap());
+        let (incoming_tx, incoming_rx) = mpsc::channel(2);
+        incoming_tx
+            .send(SenderMsg::FileBegin {
+                ndx: 0,
+                entry: entry.clone(),
+            })
+            .await
+            .unwrap();
+        incoming_tx
+            .send(SenderMsg::FileData {
+                entry,
+                chunk: DataChunk {
+                    offset: 0,
+                    data: Bytes::from_static(b"AAAAXXXX"),
+                },
+            })
+            .await
+            .unwrap();
+        let transport = RecordingReceiverTransport {
+            incoming: TokioMutex::new(incoming_rx),
+            sent: TokioMutex::new(Vec::new()),
+            fail_credit: true,
+            closed: AtomicBool::new(false),
+        };
+        let mut config = session_config();
+        config.transfer_mode = TransferMode::Direct;
+        let progress = Arc::new(ReceiverProgress::new());
+        let (_progress_tx, progress_rx) = mpsc::channel(1);
+        let mut state = RemoteSessionState::default();
+        state.credit = ReceiverCreditState::new(2).unwrap();
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            recv_file_list_and_data_phase(
+                &transport,
+                &dest,
+                &config,
+                &FeatureFlags::current(),
+                u64::MAX,
+                &progress,
+                progress_rx,
+                &mut state,
+            ),
+        )
+        .await
+        .unwrap();
+        assert!(result.is_err());
+        assert!(transport.closed.load(Ordering::SeqCst));
+        assert_eq!(Arc::strong_count(&dest), 1, "返回前必须等待落盘任务释放目标");
+        assert_eq!(progress.files_transferred.load(Ordering::Relaxed), 0);
+        assert_eq!(fs::read(root.path().join("file")).unwrap(), b"AAAABBBB");
     }
 
     #[tokio::test]
