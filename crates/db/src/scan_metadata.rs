@@ -221,7 +221,7 @@ mod tests {
             })
             .collect();
         let cancel = CancellationToken::new();
-        let building = with_scan_cancellation(cancel.clone(), CandidateMetadataCache::new(&events));
+        let building = with_scan_cancellation(cancel.clone(), None, CandidateMetadataCache::new(&events));
         let cancelling = async {
             yield_now().await;
             cancel.cancel();

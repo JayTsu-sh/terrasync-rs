@@ -1003,7 +1003,7 @@ mod tests {
             .collect::<Result<Vec<_>>>()?;
         let references = cached.iter().map(reference).collect();
         let cancel = CancellationToken::new();
-        let validating = with_scan_cancellation(cancel.clone(), verified_candidates(cached, references));
+        let validating = with_scan_cancellation(cancel.clone(), None, verified_candidates(cached, references));
         let cancelling = async {
             yield_now().await;
             cancel.cancel();

@@ -29,17 +29,17 @@ impl ClusterScanStore {
             .collect();
         for table in missing_hash_columns(&self.client, &tables).await? {
             self.client.query(&format!("ALTER TABLE {database}.{table} ON CLUSTER {cluster} ADD COLUMN IF NOT EXISTS metadata_hash Nullable(String) DEFAULT NULL"))
-                .execute_scan().await?;
+                .execute_idempotent_scan().await?;
         }
         Ok(())
     }
     pub(crate) async fn write_native_keys(&self, entries: &[Arc<ObservedEntry>]) -> Result<()> {
         let _guard = self.writes.temporary.lock().await;
-        retry_quorum(|| async {
+        let client = idempotent_insert_client(&self.client).with_validation(false);
+        retry_quorum(RequestSafety::IdempotentWrite, || async {
             if entries.is_empty() {
                 return Ok(());
             }
-            let client = self.client.clone().with_validation(false);
             let mut insert = client.insert::<ClusterNativeScanKey>("scan_resume_batch").await?;
             for entry in entries {
                 for view in ObservedView::all(entry) {
@@ -90,14 +90,14 @@ impl ClusterScanStore {
             &self.writes.base
         };
         let _guard = gate.lock().await;
-        retry_quorum(|| async {
+        let client = idempotent_insert_client(&self.client).with_validation(false);
+        retry_quorum(RequestSafety::IdempotentWrite, || async {
             if entries.is_empty() {
                 return Ok(());
             }
             let table = if temporary { "scan_resume_batch" } else { "base" };
             let epoch = self.epoch.load(Ordering::Relaxed);
             // 仅原生固定布局批次使用 bulk RowBinary；查询和增量事件仍校验 schema。
-            let client = self.client.clone().with_validation(false);
             let mut insert = client.insert::<ClusterNativeScanRecord>(table).await?;
             for entry in entries {
                 for view in ObservedView::all(entry) {
@@ -142,7 +142,7 @@ impl ClusterScanStore {
     }
     pub(crate) async fn merge_native(&self) -> Result<()> {
         let _guard = self.writes.base.lock().await;
-        retry_quorum(||async {
+        retry_quorum(RequestSafety::UnconfirmedWrite, ||async {
             let database=identifier(&self.database)?;
             self.client.query(&format!("INSERT INTO {database}.base (job_id,epoch,ver,{OBSERVED_COLUMNS}) SELECT job_id,epoch,ver,{OBSERVED_COLUMNS} FROM {database}.scan_resume_batch WHERE job_id=? AND batch_id=?")).bind(&self.job_id).bind(self.batch_id).execute_scan().await?;
             Ok(())
@@ -162,9 +162,9 @@ impl ClusterScanStore {
             return Ok(());
         }
         let _guard = self.writes.events.lock().await;
-        retry_quorum(|| async {
-            let mut insert = self
-                .client
+        let client = idempotent_insert_client(&self.client);
+        retry_quorum(RequestSafety::IdempotentWrite, || async {
+            let mut insert = client
                 .insert::<ClusterIncrementalStorageEntryRecord>("incremental")
                 .await?;
             for record in &records {

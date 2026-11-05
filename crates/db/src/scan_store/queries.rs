@@ -1,18 +1,54 @@
 //! 用执行实例独有的标记停止查询，不依赖任务名、数据库名或数据库用户。
+use super::connectivity::{RequestSafety, ScanDatabaseExecution};
+use crate::http_transport::build_client;
 use crate::{ClickHouseConfig, DatabaseError, Result, clickhouse::build_base_client, cluster_scan::identifier};
 use clickhouse::{Client, error::Error, query::Query};
-use std::{future::Future, time::Duration};
+use std::{future::Future, panic::Location, time::Duration};
 use tokio::{select, time::sleep};
 use tokio_util::sync::CancellationToken;
+use tracing::warn;
 use uuid::Uuid;
 
 tokio::task_local! {
     static SCAN_CANCELLATION: CancellationToken;
+    static SCAN_EXECUTION: Option<ScanDatabaseExecution>;
 }
 
 /// 仅作用于当前执行 future；并发 worker 各自进入此作用域，不影响其他任务。
-pub async fn with_scan_cancellation<T>(cancel: CancellationToken, work: impl Future<Output = T>) -> T {
-    SCAN_CANCELLATION.scope(cancel, work).await
+pub async fn with_scan_cancellation<T>(
+    cancel: CancellationToken, execution: Option<ScanDatabaseExecution>, work: impl Future<Output = T>,
+) -> T {
+    SCAN_CANCELLATION
+        .scope(cancel, SCAN_EXECUTION.scope(execution, work))
+        .await
+}
+
+pub(crate) fn execution_active() -> bool {
+    current_execution().is_some()
+}
+
+pub(super) fn current_execution() -> Option<ScanDatabaseExecution> {
+    SCAN_EXECUTION.try_with(Clone::clone).ok().flatten()
+}
+
+pub(crate) async fn execute_request<T, F, Fut>(safety: RequestSafety, mut operation: F) -> Result<T>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<T>>,
+{
+    check_scan_cancellation()?;
+    let execution = current_execution();
+    match execution {
+        Some(execution) => execution.request(safety, operation).await,
+        None => operation().await,
+    }
+}
+
+pub(crate) fn idempotent_insert_client(client: &Client) -> Client {
+    client
+        .clone()
+        .with_option("deduplicate_insert", "enable")
+        .with_option("insert_deduplication_token", Uuid::new_v4().simple().to_string())
 }
 
 pub(crate) fn check_scan_cancellation() -> Result<()> {
@@ -40,7 +76,9 @@ pub(crate) async fn scan_retry_delay(duration: Duration) -> Result<()> {
 }
 
 pub(crate) trait ScanExecute {
-    async fn execute_scan(self) -> Result<()>;
+    #[track_caller]
+    fn execute_scan(self) -> impl Future<Output = Result<()>> + Send;
+    async fn execute_idempotent_scan(self) -> Result<()>;
 }
 
 pub(super) fn job_query_prefix(database: &str, job: &str) -> String {
@@ -50,9 +88,39 @@ pub(super) fn job_query_prefix(database: &str, job: &str) -> String {
 }
 
 impl ScanExecute for Query {
-    async fn execute_scan(self) -> Result<()> {
-        check_scan_cancellation()?;
-        Ok(self.execute().await?)
+    #[track_caller]
+    fn execute_scan(self) -> impl Future<Output = Result<()>> + Send {
+        // 记录语句调用位置，既能定位未确认阶段，又不输出 SQL、URL 或认证配置。
+        let origin = Location::caller();
+        async move {
+            check_scan_cancellation()?;
+            let result = execute_request(RequestSafety::UnconfirmedWrite, || {
+                let query = self.clone();
+                async move { query.execute().await.map_err(DatabaseError::from) }
+            })
+            .await;
+            if let Err(error) = &result
+                && !error.is_confirmed_scan_cancellation()
+            {
+                let (error_class, server_code) = error.diagnostic_class();
+                warn!(
+                    operation_file = origin.file(),
+                    operation_line = origin.line(),
+                    error_class,
+                    server_code,
+                    "ClickHouse statement did not complete successfully"
+                );
+            }
+            result
+        }
+    }
+
+    async fn execute_idempotent_scan(self) -> Result<()> {
+        execute_request(RequestSafety::IdempotentWrite, || {
+            let query = self.clone();
+            async move { query.execute().await.map_err(DatabaseError::from) }
+        })
+        .await
     }
 }
 
@@ -60,16 +128,36 @@ impl ScanExecute for Query {
 pub struct ScanQueryCancellation {
     client: Client,
     comment: String,
+    execution: ScanDatabaseExecution,
     cluster: Option<String>,
 }
 
 impl ScanQueryCancellation {
     pub(super) fn new(config: &ClickHouseConfig, cluster: Option<&str>, job: &str) -> Result<Self> {
         Ok(Self {
-            client: build_base_client(config),
+            client: {
+                let mut control = config.clone();
+                control.dial_timeout = control.dial_timeout.min(1);
+                control.read_timeout = control.read_timeout.min(1);
+                build_base_client(&control)?
+            },
+            execution: ScanDatabaseExecution::new(config)?,
             comment: format!("{}{}", job_query_prefix(&config.database, job), Uuid::new_v4()),
             cluster: cluster.filter(|value| !value.is_empty()).map(identifier).transpose()?,
         })
+    }
+
+    pub(super) fn data_client(&self, config: &ClickHouseConfig) -> Result<Client> {
+        Ok(build_client(config, Some(self.execution.transport()))?.with_option("log_comment", &self.comment))
+    }
+
+    /// 先给精确 KILL 留短暂机会，再以同一执行截止时间终止所有本地 HTTP 等待。
+    pub fn begin_cancellation(&self) {
+        self.execution.begin_stop();
+    }
+
+    pub fn execution(&self) -> ScanDatabaseExecution {
+        self.execution.clone()
     }
 
     pub(super) fn comment(&self) -> &str {

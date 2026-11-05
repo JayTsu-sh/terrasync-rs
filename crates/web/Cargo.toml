@@ -40,3 +40,6 @@ data-mover = { workspace = true }
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+db = { workspace = true }

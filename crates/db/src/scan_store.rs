@@ -11,8 +11,10 @@ use data_mover::model::ObservedEntry;
 use std::sync::Arc;
 use storage_adapter::observed_scan::ObservedScanEvent;
 
+pub(crate) mod connectivity;
 mod cuts;
 pub(crate) mod queries;
+pub use connectivity::{ConnectivityWatch, ScanDatabaseExecution};
 use cuts::ScanCuts;
 pub use queries::{ScanQueryCancellation, with_scan_cancellation};
 
@@ -99,16 +101,13 @@ impl ScanStore {
     pub fn new(config: &ClickHouseConfig, job_id: &str) -> Result<Self> {
         let cluster = config.cluster_name()?;
         let queries = ScanQueryCancellation::new(config, cluster, job_id)?;
-        let mut inner = match cluster.filter(|value| !value.is_empty()) {
-            Some(cluster) => Store::Cluster(ClusterScanStore::new(config, cluster, job_id)?),
-            None => Store::Single(ClickHouseDatabase::new(config, job_id)?),
+        let client = queries.data_client(config)?;
+        let inner = match cluster.filter(|value| !value.is_empty()) {
+            Some(cluster) => Store::Cluster(ClusterScanStore::with_client(config, cluster, job_id, client.clone())?),
+            None => Store::Single(ClickHouseDatabase::with_client(config, job_id, client.clone())?),
         };
-        match &mut inner {
-            Store::Single(store) => store.tag_scan_queries(queries.comment()),
-            Store::Cluster(store) => store.tag_scan_queries(queries.comment()),
-        }
         Ok(Self {
-            cuts: ScanCuts::new(config, job_id, queries.comment())?,
+            cuts: ScanCuts::with_client(config, job_id, queries.comment(), client)?,
             inner,
             job_id: job_id.into(),
             queries,

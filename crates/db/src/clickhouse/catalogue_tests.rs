@@ -46,7 +46,7 @@ impl Fixture {
             dial_timeout: 10,
             read_timeout: 60,
         };
-        let admin = build_base_client(&config);
+        let admin = build_base_client(&config).unwrap();
         // 本 fixture 只操作自己的随机数据库及临时本地文件，不访问远程源。
         if let Some(cluster) = &cluster {
             let replicas = admin
@@ -118,6 +118,7 @@ impl Fixture {
     async fn rows(&self, job: &str) -> Result<Vec<StorageEntryRecord>> {
         let table = get_scan_base_table_name(job);
         Ok(build_base_client(&self.config)
+            .unwrap()
             .query(&format!(
                 "SELECT {} FROM {table} FINAL ORDER BY relative_path, version_id",
                 *FILE_SCAN_COLUMNS_LIST
@@ -137,7 +138,7 @@ impl Drop for Fixture {
         };
         let _ = std::thread::spawn(move || {
             if let Ok(runtime) = Builder::new_current_thread().enable_all().build() {
-                let admin = build_base_client(&config);
+                let admin = build_base_client(&config).unwrap();
                 let statement = match cluster {
                     Some(cluster) => format!("DROP DATABASE IF EXISTS {database} ON CLUSTER `{cluster}` SYNC"),
                     None => format!("DROP DATABASE IF EXISTS {database} SYNC"),
@@ -223,6 +224,7 @@ async fn cluster_catalogue_copy_sync_and_delete_are_job_isolated() -> Result<()>
     ])
     .await?;
     let events: Vec<(String, String, Option<String>)> = build_base_client(&fixture.config)
+        .unwrap()
         .query("SELECT operation_type, relative_path, comment FROM incremental_a FINAL ORDER BY operation_type")
         .fetch_all()
         .await?;
@@ -236,6 +238,7 @@ async fn cluster_catalogue_copy_sync_and_delete_are_job_isolated() -> Result<()>
     a.batch_insert_tar_manifest(&[TarManifestRecord::from_entry(next[0].as_ref(), "bundle.tar")])
         .await?;
     let manifest = build_base_client(&fixture.config)
+        .unwrap()
         .query("SELECT entry_path FROM tar_manifest_a FINAL")
         .fetch_one::<String>()
         .await?;

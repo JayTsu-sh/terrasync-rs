@@ -3,7 +3,8 @@
 #[cfg(test)]
 mod tests;
 
-use super::queries::{ScanExecute, check_scan_cancellation, job_query_prefix, scan_retry_delay};
+use super::queries::{ScanExecute, check_scan_cancellation, current_execution, job_query_prefix, scan_retry_delay};
+use super::{ScanDatabaseExecution, connectivity::RequestSafety, queries::execute_request};
 use crate::clickhouse::{replica_read::QuorumRead, scan_resume::FINALIZING};
 use crate::{ClickHouseConfig, DatabaseError, Result, clickhouse::build_base_client, cluster_scan::identifier};
 use clickhouse::{
@@ -11,8 +12,11 @@ use clickhouse::{
     error::Error as ClickHouseError,
     sql::{Bind, Identifier},
 };
-use std::time::{Duration, Instant};
-use tokio::time::timeout;
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
+use tokio::{sync::Mutex, time::timeout};
 use utils::sanitize_job_id;
 use uuid::Uuid;
 
@@ -24,6 +28,7 @@ pub(super) struct ScanCuts {
     prefix: String,
     cluster: Option<String>,
     comment: String,
+    prior_execution: Arc<Mutex<Option<ScanDatabaseExecution>>>,
 }
 
 impl ScanCuts {
@@ -61,10 +66,14 @@ impl ScanCuts {
         }
     }
     pub(super) fn new(config: &ClickHouseConfig, job: &str, comment: &str) -> Result<Self> {
+        Self::with_client(config, job, comment, build_base_client(config)?)
+    }
+
+    pub(super) fn with_client(config: &ClickHouseConfig, job: &str, comment: &str, client: Client) -> Result<Self> {
         let job = sanitize_job_id(job);
         let prefix = format!("scan_cut_{}_", &blake3::hash(job.as_bytes()).to_hex()[..16]);
         Ok(Self {
-            client: build_base_client(config)
+            client: client
                 .with_option("log_comment", comment)
                 .with_option("distributed_ddl_task_timeout", "60")
                 .with_option("distributed_ddl_output_mode", "throw")
@@ -77,6 +86,7 @@ impl ScanCuts {
             job,
             prefix,
             comment: comment.to_owned(),
+            prior_execution: Arc::new(Mutex::new(None)),
         })
     }
 
@@ -133,7 +143,29 @@ impl ScanCuts {
 
     /// 调用方已排空所有 writer；两个快照确认后才允许保存游标和统计。
     pub(super) async fn capture(&self) -> Result<String> {
-        self.await_prior_operations().await?;
+        // 读取先按自身语义恢复；确认成功后，正常的快照构造不再消耗该读取的恢复窗口。
+        self.ensure_prior_execution_quiescent().await?;
+        // writer 屏障保持 working 不变；失败尝试只留下未发布的独立 UUID 快照，可整体重启。
+        execute_request(RequestSafety::IsolatedRestart, || self.capture_once()).await
+    }
+
+    async fn ensure_prior_execution_quiescent(&self) -> Result<()> {
+        let Some(execution) = current_execution() else {
+            return self.await_prior_operations().await;
+        };
+        let mut prior = self.prior_execution.lock().await;
+        if !prior
+            .as_ref()
+            .is_some_and(|previous| previous.same_execution(&execution))
+        {
+            // 只复用当前执行已成功取得的前次执行排空证明；恢复内部仍实时排空。
+            self.await_prior_operations().await?;
+            *prior = Some(execution);
+        }
+        Ok(())
+    }
+
+    async fn capture_once(&self) -> Result<String> {
         let token = Uuid::new_v4().simple().to_string();
         let base = self.name(&token, false)?;
         let events = self.name(&token, true)?;
@@ -198,7 +230,7 @@ impl ScanCuts {
             .query("SELECT count() FROM system.tables WHERE database=? AND name=?")
             .bind(&self.database)
             .bind(table)
-            .fetch_one()
+            .fetch_quorum_one()
             .await?;
         Ok(count == 1)
     }
@@ -302,7 +334,7 @@ impl ScanCuts {
             ))
             .bind(job_query_prefix(&self.database, &self.job))
             .bind(&self.comment)
-            .fetch_one()
+            .fetch_quorum_one()
             .await?)
     }
 
@@ -314,7 +346,7 @@ impl ScanCuts {
         // 新执行用稳定的数据库/job 标签覆盖所有类型的 DDL。
         let count = self.client.query("SELECT count() FROM system.distributed_ddl_queue WHERE cluster=? AND position(query,?)>0 AND (startsWith(settings['log_comment'],?) OR position(query,?)>0) AND (status IS NULL OR status NOT IN ('Finished','Removing'))")
             .bind(cluster).bind(format!("{}.", identifier(&self.database)?)).bind(job_query_prefix(&self.database, &self.job))
-            .bind(format!("'{}'", self.job)).fetch_one().await?;
+            .bind(format!("'{}'", self.job)).fetch_quorum_one().await?;
         Ok(count)
     }
 
@@ -343,7 +375,7 @@ impl ScanCuts {
         } else {
             query
         };
-        Ok(query.fetch_one().await?)
+        Ok(query.fetch_quorum_one().await?)
     }
 
     /// manifest 确认之后清理未引用对象；清理失败不允许撤销已经确认的 checkpoint。
@@ -354,7 +386,7 @@ impl ScanCuts {
             .query("SELECT name FROM system.tables WHERE database=? AND startsWith(name,?)")
             .bind(&self.database)
             .bind(&self.prefix)
-            .fetch_all::<String>()
+            .fetch_quorum_all::<String>()
             .await?;
         let mut statements = Vec::new();
         for table in tables {
@@ -387,7 +419,8 @@ impl ScanCuts {
     }
     async fn drop_snapshot(&self, statement: Option<&String>) -> Result<()> {
         if let Some(statement) = statement {
-            self.client.query(statement).execute_scan().await?;
+            // 仅处理无 manifest 引用且名称永不复用的 UUID 对象；重复 DROP 不会影响新 cut。
+            self.client.query(statement).execute_idempotent_scan().await?;
         }
         Ok(())
     }

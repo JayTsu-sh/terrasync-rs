@@ -64,7 +64,7 @@ async fn cancelled_empty_events_still_report_cancellation() -> Result<()> {
     let store = mock_schema_store(&mock)?;
     let cancel = CancellationToken::new();
     cancel.cancel();
-    let result = with_scan_cancellation(cancel, store.events_native(&[], 17)).await;
+    let result = with_scan_cancellation(cancel, None, store.events_native(&[], 17)).await;
     assert!(matches!(result, Err(DatabaseError::ScanCancelled)));
     Ok(())
 }
@@ -109,7 +109,8 @@ async fn cancelled_quorum_write_does_not_start_another_attempt() {
     let attempts = AtomicUsize::new(0);
     let result = with_scan_cancellation(
         cancel.clone(),
-        retry_quorum(|| {
+        None,
+        retry_quorum(RequestSafety::UnconfirmedWrite, || {
             attempts.fetch_add(1, Ordering::SeqCst);
             cancel.cancel();
             async {
@@ -135,8 +136,9 @@ impl Drop for DatabaseGuard {
         let name = self.name.clone();
         let cluster = self.cluster.clone();
         let _ = std::thread::spawn(move || {
-            if let Ok(runtime) = tokio::runtime::Builder::new_current_thread().enable_all().build() {
-                let admin = build_base_client(&config);
+            if let Ok(runtime) = tokio::runtime::Builder::new_current_thread().enable_all().build()
+                && let Ok(admin) = build_base_client(&config)
+            {
                 let _ = runtime.block_on(
                     admin
                         .query(&format!("DROP DATABASE IF EXISTS {name} ON CLUSTER {cluster} SYNC"))
@@ -217,7 +219,7 @@ async fn fixture() -> Result<(ClickHouseConfig, Client, DatabaseGuard, String, i
     let admin = build_base_client(&ClickHouseConfig {
         database: "default".into(),
         ..config.clone()
-    });
+    })?;
     admin
         .query(&format!("CREATE DATABASE {name} ON CLUSTER {cluster}"))
         .execute()

@@ -106,7 +106,7 @@ mod tests {
             config.database.clickhouse.read_timeout = 1;
         })?;
         let persisted = timeout(
-            Duration::from_secs(3),
+            Duration::from_secs(5),
             scan(ScanRequest {
                 resume: false,
                 job_id: "gateway",

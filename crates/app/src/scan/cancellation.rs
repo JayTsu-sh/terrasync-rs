@@ -3,10 +3,14 @@ use crate::error::{AppError, Result};
 use data_mover::traversal::ScanFailureSignal;
 use db::{
     DatabaseError,
-    scan_store::{ScanQueryCancellation, with_scan_cancellation},
+    scan_store::{ScanDatabaseExecution, ScanQueryCancellation, with_scan_cancellation},
 };
 use std::result::Result as OperationResult;
-use std::{future::Future, time::Duration};
+use std::{
+    future::Future,
+    sync::{Arc, OnceLock},
+    time::Duration,
+};
 use tokio::{
     select,
     time::{sleep, timeout},
@@ -17,12 +21,14 @@ use tracing::warn;
 #[derive(Clone)]
 pub(crate) struct ScanCancellation {
     requested: CancellationToken,
+    database: Arc<OnceLock<ScanDatabaseExecution>>,
 }
 
 impl ScanCancellation {
     pub(crate) fn new(requested: CancellationToken) -> Self {
         Self {
             requested: requested.child_token(),
+            database: Arc::new(OnceLock::new()),
         }
     }
     pub(crate) fn watch_storage_failure(&self, failure: ScanFailureSignal) -> AbortOnDropHandle<()> {
@@ -62,9 +68,19 @@ impl ScanCancellation {
         &self, work: impl Future<Output = OperationResult<T, E>>,
     ) -> Result<T> {
         self.check()?;
-        let result = with_scan_cancellation(self.requested.clone(), work)
+        let result = with_scan_cancellation(self.requested.clone(), self.database.get().cloned(), work)
             .await
             .map_err(Into::into);
+        let result = match result {
+            Err(AppError::DatabaseError(error)) if !self.requested.is_cancelled() => match self.database.get() {
+                Some(database) => Err(AppError::DatabaseError(database.settle_failure(error).await)),
+                None => Err(AppError::DatabaseError(error)),
+            },
+            result => result,
+        };
+        if matches!(&result, Err(AppError::DatabaseError(error)) if !error.is_confirmed_scan_cancellation()) {
+            return result;
+        }
         // 已发出的请求先确认结束，再报告取消，禁止把 KILL 的副作用冒充原始存储故障。
         self.check()?;
         match result {
@@ -77,13 +93,31 @@ impl ScanCancellation {
 pub(crate) async fn scope<T>(
     queries: ScanQueryCancellation, cancel: ScanCancellation, work: impl Future<Output = Result<T>>,
 ) -> Result<T> {
+    let database = queries.execution();
+    if let Err(other) = cancel.database.set(database.clone())
+        && !cancel
+            .database
+            .get()
+            .is_some_and(|current| current.same_execution(&other))
+    {
+        return Err(AppError::ConsumerError(
+            "Scan cancellation is already bound to another database execution".into(),
+        ));
+    }
+    let connectivity = database.start_monitor()?;
     let finished = CancellationToken::new();
     let done = finished.clone();
+    let terminal = database.clone();
     let watcher = AbortOnDropHandle::new(tokio::spawn(async move {
         select! {
             biased;
-            _=cancel.cancelled()=>{},
+            _=cancel.cancelled()=>queries.begin_cancellation(),
             _=done.cancelled()=>return,
+            failure=terminal.failed()=>{
+                if failure.is_none() { return; }
+                cancel.cancel();
+                queries.begin_cancellation();
+            }
         }
         let mut warned = false;
         loop {
@@ -107,15 +141,69 @@ pub(crate) async fn scope<T>(
     // 所有业务请求均已确认结束，此时终止仅针对本执行的管理轮询。
     watcher.abort();
     let _ = watcher.await;
+    let monitored = connectivity.finish().await;
+    let failure = database.failure();
+    let recovery_window = database.recovery_window();
+    let result = fold_database_failure(result, failure, recovery_window);
+    if result.is_ok() {
+        monitored?;
+    } else if let Err(error) = monitored {
+        warn!(%error, "Connectivity monitor failed during scan cleanup");
+    }
     result
+}
+
+fn fold_database_failure<T>(
+    result: Result<T>, failure: Option<Arc<DatabaseError>>, recovery_window: Duration,
+) -> Result<T> {
+    match (result, failure) {
+        (Ok(_), Some(source)) => Err(DatabaseError::ScanDatabaseUnavailable {
+            recovery_window,
+            source,
+            termination: None,
+        }
+        .into()),
+        (Err(AppError::ObservationScanCancelled), Some(source)) => Err(DatabaseError::ScanDatabaseUnavailable {
+            recovery_window,
+            source,
+            termination: None,
+        }
+        .into()),
+        (Err(AppError::DatabaseError(error)), Some(source)) => Err(DatabaseError::ScanDatabaseUnavailable {
+            recovery_window,
+            source,
+            termination: Some(Box::new(error)),
+        }
+        .into()),
+        (Err(AppError::ScanStorageAndDatabaseFailure { source, database }), Some(failure)) => {
+            Err(AppError::ScanStorageAndDatabaseFailure {
+                source,
+                database: Box::new(DatabaseError::ScanDatabaseUnavailable {
+                    recovery_window,
+                    source: failure,
+                    termination: Some(database),
+                }),
+            })
+        }
+        (Err(AppError::StorageError(source)), Some(failure)) => Err(AppError::ScanStorageAndDatabaseFailure {
+            source: Box::new(source),
+            database: Box::new(DatabaseError::ScanDatabaseUnavailable {
+                recovery_window,
+                source: failure,
+                termination: None,
+            }),
+        }),
+        (result, _) => result,
+    }
 }
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
-    use clickhouse::Client;
+    use clickhouse::{Client, error::Error as ClickHouseError};
     use db::{ClickHouseConfig, DatabaseError, scan_store::ScanStore};
+    use std::io::{Error as IoError, ErrorKind};
     use std::sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -126,6 +214,15 @@ mod tests {
         sync::{Notify, oneshot},
         task::JoinSet,
     };
+
+    #[test]
+    fn a_terminal_database_failure_cannot_be_hidden_by_late_success() {
+        let source = Arc::new(DatabaseError::ClusterProbeIncomplete);
+        assert!(matches!(
+            fold_database_failure(Ok(()), Some(source), Duration::from_secs(3)),
+            Err(AppError::DatabaseError(DatabaseError::ScanDatabaseUnavailable { .. }))
+        ));
+    }
 
     #[test]
     fn internal_storage_failure_cancellation_keeps_the_user_request_active() {
@@ -323,6 +420,27 @@ mod tests {
         let result = timeout(Duration::from_millis(200), operation).await.unwrap();
         assert!(matches!(result, Err(AppError::ObservationScanCancelled)));
         assert!(dropped.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn actual_read_timeout_is_not_erased_by_an_earlier_user_cancel() {
+        let cancel = ScanCancellation::new(CancellationToken::new());
+        let (release, ready) = oneshot::channel();
+        let operation = cancel.operation(async {
+            ready.await.unwrap();
+            Err::<(), _>(DatabaseError::from(ClickHouseError::Network(
+                IoError::new(ErrorKind::TimedOut, "response ACK was lost").into(),
+            )))
+        });
+        tokio::pin!(operation);
+        assert!(timeout(Duration::from_millis(10), &mut operation).await.is_err());
+        cancel.cancel();
+        release.send(()).unwrap();
+        let result = operation.await;
+        assert!(matches!(
+            result,
+            Err(AppError::DatabaseError(DatabaseError::RequestOutcomeUnconfirmed { .. }))
+        ));
     }
 
     #[tokio::test]

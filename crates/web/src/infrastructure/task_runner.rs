@@ -72,7 +72,14 @@ impl Drop for RunningTaskGuard {
 
 fn task_outcome(result: &Result<()>, cancel: &CancellationToken) -> (TaskStatus, Option<String>) {
     if cancel.is_cancelled() {
-        return (TaskStatus::Cancelled, None);
+        // 用户动作仍记为取消，但数据库结果不确定不能在执行记录中丢失。
+        let error = match result {
+            Err(
+                error @ WebError::AppError(AppError::DatabaseError(_) | AppError::ScanStorageAndDatabaseFailure { .. }),
+            ) => Some(error.to_string()),
+            _ => None,
+        };
+        return (TaskStatus::Cancelled, error);
     }
     match result {
         Ok(()) => (TaskStatus::Completed, None),
@@ -235,9 +242,12 @@ impl TaskRunner {
                 let (final_status, error_msg) = task_outcome(&result, &cancel_token);
                 let storage_error = if final_status == TaskStatus::Failed {
                     match &result {
-                        Err(WebError::AppError(AppError::StorageError(StorageError::RemoteScan(failure)))) => {
-                            Some(StorageFailureDetail::from(failure.as_ref()))
-                        }
+                        Err(WebError::AppError(error)) => match error.storage_error() {
+                            Some(StorageError::RemoteScan(failure)) => {
+                                Some(StorageFailureDetail::from(failure.as_ref()))
+                            }
+                            _ => None,
+                        },
                         _ => None,
                     }
                 } else {
@@ -456,6 +466,7 @@ async fn drop_scan_tables(job_id: &str) -> Result<()> {
 #[cfg(test)]
 mod resume_tests {
     use super::*;
+    use db::DatabaseError;
 
     #[test]
     fn user_pause_cannot_be_reported_as_completed_or_failed() {
@@ -465,6 +476,21 @@ mod resume_tests {
         let failure = Err(WebError::ValidationError("scan paused".into()));
         assert_eq!(task_outcome(&failure, &token).0, TaskStatus::Cancelled);
         assert_eq!(task_outcome(&failure, &CancellationToken::new()).0, TaskStatus::Failed);
+    }
+
+    #[test]
+    fn user_cancel_preserves_unconfirmed_database_results_in_execution_history() {
+        let token = CancellationToken::new();
+        token.cancel();
+        let error = DatabaseError::ScanDatabaseUnavailable {
+            recovery_window: Duration::from_secs(3),
+            source: Arc::new(DatabaseError::ClusterProbeIncomplete),
+            termination: None,
+        };
+        let result = Err(WebError::from(AppError::from(error)));
+        let (status, detail) = task_outcome(&result, &token);
+        assert_eq!(status, TaskStatus::Cancelled);
+        assert!(detail.is_some_and(|value| value.contains("ClickHouse unavailable")));
     }
 
     #[test]

@@ -159,6 +159,15 @@ pub(super) async fn consume(
 }
 
 fn merge_outcomes(persisted: Result<()>, traversal: Result<()>, failure: Option<RemoteScanFailure>) -> Result<()> {
+    let (persisted, failure) = match (persisted, failure) {
+        (Err(AppError::DatabaseError(database)), Some(failure)) => {
+            return Err(AppError::ScanStorageAndDatabaseFailure {
+                source: Box::new(StorageError::from(failure)),
+                database: Box::new(database),
+            });
+        }
+        pair => pair,
+    };
     if matches!(
         &persisted,
         Ok(()) | Err(AppError::ObservationScanCancelled | AppError::ScanWorkerStopped)
@@ -178,6 +187,7 @@ fn merge_outcomes(persisted: Result<()>, traversal: Result<()>, failure: Option<
 #[cfg(test)]
 mod outcome_tests {
     use super::*;
+    use clickhouse::error::Error as ClickHouseError;
     use db::DatabaseError;
 
     #[test]
@@ -197,6 +207,37 @@ mod outcome_tests {
         );
         assert!(matches!(result, Err(AppError::DatabaseError(_))));
     }
+    #[test]
+    fn source_failure_and_database_uncertainty_are_both_preserved() {
+        use data_mover::model::{BackendKind, Operation, StoragePath};
+        use storage_adapter::RemoteScanFailureKind;
+        let failure = RemoteScanFailure {
+            backend: BackendKind::Nfs,
+            operation: Operation::Traverse,
+            path: StoragePath::root(),
+            kind: RemoteScanFailureKind::ConnectionLost,
+            operation_timeout: Duration::from_secs(30),
+            source: None,
+        };
+        let result = merge_outcomes(
+            Err(AppError::DatabaseError(DatabaseError::ScanTerminationUnconfirmed {
+                source: ClickHouseError::TimedOut,
+            })),
+            Err(AppError::ObservationScanCancelled),
+            Some(failure),
+        );
+        let error = match result {
+            Err(error) => error,
+            Ok(()) => panic!("scan must fail"),
+        };
+        assert!(
+            matches!(error.storage_error(), Some(StorageError::RemoteScan(failure)) if failure.backend==BackendKind::Nfs && failure.kind==RemoteScanFailureKind::ConnectionLost)
+        );
+        assert!(
+            matches!(error, AppError::ScanStorageAndDatabaseFailure { database, .. } if matches!(*database, DatabaseError::ScanTerminationUnconfirmed { .. }))
+        );
+    }
+
     #[test]
     fn final_storage_failure_is_not_relabelled_by_query_cancellation() {
         use data_mover::model::{BackendKind, Operation, StoragePath};

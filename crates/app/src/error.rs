@@ -26,6 +26,12 @@ use utils::error::UtilsError;
 /// 应用程序的专用错误枚举
 #[derive(Error, Debug)]
 pub enum AppError {
+    #[error("Scan storage failure: {source}; database also failed while stopping: {database}")]
+    ScanStorageAndDatabaseFailure {
+        #[source]
+        source: Box<StorageError>,
+        database: Box<DatabaseError>,
+    },
     #[error("同一数据库作业 {job_id} 已有执行，无法获取作业锁: {source}")]
     JobExecutionLock { job_id: String, source: TryLockError },
     /// 中立 traversal 的 session/runtime 终态失败。
@@ -243,3 +249,13 @@ pub enum AppError {
 
 /// 应用程序的结果类型别名
 pub type Result<T> = std::result::Result<T, AppError>;
+
+impl AppError {
+    pub fn storage_error(&self) -> Option<&StorageError> {
+        match self {
+            Self::StorageError(error) => Some(error),
+            Self::ScanStorageAndDatabaseFailure { source, .. } => Some(source),
+            _ => None,
+        }
+    }
+}

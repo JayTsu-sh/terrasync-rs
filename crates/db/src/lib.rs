@@ -20,6 +20,7 @@ pub mod common; // Common types and utilities
 pub mod config; // 数据库配置定义
 pub mod error; // 错误处理
 pub mod factory; // 数据库工厂，用于创建不同类型的数据库实例
+mod http_transport;
 pub mod observation_record;
 pub mod scan_store;
 pub mod traits; // 数据库接口定义

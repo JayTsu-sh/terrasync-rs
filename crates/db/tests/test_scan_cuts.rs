@@ -11,9 +11,10 @@ use db::{
 };
 use std::{
     sync::Arc,
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use storage_adapter::observed_scan::{ObservedItem, ObservedScanEvent};
+use tokio::time::sleep;
 use utils::app_config::ClickHouseMode;
 use uuid::Uuid;
 
@@ -153,6 +154,28 @@ impl Fixture {
         store.prepare_native_schema().await?;
         Ok(store)
     }
+}
+
+#[tokio::test]
+#[ignore = "requires an isolated writable ClickHouse database"]
+async fn idle_scan_monitor_stays_healthy_in_the_configured_deployment() -> Result<()> {
+    let fixture = Fixture::new().await?;
+    let execution = ScanStore::new(&fixture.config, "healthy_probe")?
+        .query_cancellation()
+        .execution();
+    let monitor = execution.start_monitor()?;
+    // 没有业务 ACK，至少跨过一次完整的探测 + 恢复窗口，不能把 NULL 标记读成 UInt8 零。
+    sleep(Duration::from_millis(4500)).await;
+    let failure = execution.failure();
+    let drained = monitor.finish().await;
+    let cleanup = fixture.cleanup().await;
+    drained?;
+    cleanup?;
+    assert!(
+        failure.is_none(),
+        "healthy ClickHouse was reported unavailable: {failure:?}"
+    );
+    Ok(())
 }
 
 #[tokio::test]

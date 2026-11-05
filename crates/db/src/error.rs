@@ -11,7 +11,15 @@
 
 // 外部crate
 use data_mover::model::SnapshotDecodeError;
+use hyper_util::client::legacy::Error as HyperClientError;
+use std::error::Error as StdError;
+use std::sync::Arc;
+use std::time::Duration;
 use thiserror::Error;
+
+#[derive(Debug, Error)]
+#[error("scan cancellation deadline expired; remote request completion is unconfirmed")]
+pub(crate) struct ScanCancellationDeadline;
 
 // 内部模块
 // 无
@@ -20,6 +28,27 @@ use thiserror::Error;
 /// 使用thiserror库实现错误处理和转换
 #[derive(Error, Debug)]
 pub enum DatabaseError {
+    #[error("ClickHouse probe could not reach all nodes required by scan snapshot publication")]
+    ClusterProbeIncomplete,
+    #[error("ClickHouse connectivity monitor ended unexpectedly")]
+    ConnectivityMonitorStopped,
+    #[error("ClickHouse scan request failed: {source}")]
+    ScanRequestFailed {
+        #[source]
+        source: Arc<DatabaseError>,
+    },
+    #[error("ClickHouse unavailable after {recovery_window:?} recovery: {source}; termination: {termination:?}")]
+    ScanDatabaseUnavailable {
+        recovery_window: Duration,
+        #[source]
+        source: Arc<DatabaseError>,
+        termination: Option<Box<DatabaseError>>,
+    },
+    #[error("ClickHouse health probe timed out: {source}")]
+    ProbeTimeout {
+        #[source]
+        source: tokio::time::error::Elapsed,
+    },
     #[error("Scan database operation cancelled before starting another request")]
     ScanCancelled,
     #[error("System clock is before the epoch: {0}")]
@@ -79,7 +108,19 @@ pub enum DatabaseError {
     /// `ClickHouse` 数据库相关错误
     /// 从 `clickhouse` 库的错误类型自动转换
     #[error("ClickHouse error: {0}")]
-    ClickHouseError(#[from] clickhouse::error::Error),
+    ClickHouseError(#[source] clickhouse::error::Error),
+
+    #[error("ClickHouse request termination could not be confirmed; last acknowledged checkpoint retained: {source}")]
+    ScanTerminationUnconfirmed {
+        #[source]
+        source: clickhouse::error::Error,
+    },
+
+    #[error("ClickHouse response was lost; request outcome is unconfirmed: {source}")]
+    RequestOutcomeUnconfirmed {
+        #[source]
+        source: clickhouse::error::Error,
+    },
 
     /// 配置错误
     /// 当数据库配置无效或不完整时触发
@@ -150,3 +191,105 @@ pub enum DatabaseError {
 /// 数据库操作的结果类型别名
 /// 封装了 `DatabaseError` 作为错误类型
 pub type Result<T> = std::result::Result<T, DatabaseError>;
+
+impl From<clickhouse::error::Error> for DatabaseError {
+    fn from(source: clickhouse::error::Error) -> Self {
+        let mut cause: Option<&(dyn StdError + 'static)> = Some(&source);
+        while let Some(error) = cause {
+            if error.is::<ScanCancellationDeadline>() {
+                return Self::ScanTerminationUnconfirmed { source };
+            }
+            // io::Error 的 source 可能跳过自定义内层，SDK Other 也未声明 source。
+            cause = if let Some(io) = error.downcast_ref::<std::io::Error>() {
+                io.get_ref().map(|inner| inner as &(dyn StdError + 'static))
+            } else if let Some(clickhouse::error::Error::Other(inner)) =
+                error.downcast_ref::<clickhouse::error::Error>()
+            {
+                Some(inner.as_ref())
+            } else {
+                error.source()
+            };
+        }
+        let unconfirmed = match &source {
+            clickhouse::error::Error::Network(error) => !error
+                .downcast_ref::<HyperClientError>()
+                .is_some_and(HyperClientError::is_connect),
+            clickhouse::error::Error::TimedOut => true,
+            clickhouse::error::Error::Other(error) => error.is::<std::io::Error>(),
+            _ => false,
+        };
+        if unconfirmed {
+            Self::RequestOutcomeUnconfirmed { source }
+        } else {
+            Self::ClickHouseError(source)
+        }
+    }
+}
+
+impl DatabaseError {
+    /// 日志只暴露稳定分类和服务端数字码，原始响应可能含 SQL 或绑定值，留在 typed cause 中。
+    pub(crate) fn diagnostic_class(&self) -> (&'static str, Option<u32>) {
+        match self {
+            Self::ScanRequestFailed { source } | Self::ScanDatabaseUnavailable { source, .. } => {
+                source.diagnostic_class()
+            }
+            Self::ScanTerminationUnconfirmed { .. } => ("termination_unconfirmed", None),
+            Self::RequestOutcomeUnconfirmed { .. } => ("request_unconfirmed", None),
+            Self::ProbeTimeout { .. } => ("probe_timeout", None),
+            Self::ClusterProbeIncomplete => ("cluster_unavailable", None),
+            Self::ConnectivityMonitorStopped => ("monitor_stopped", None),
+            Self::ScanCancelled => ("cancelled", None),
+            Self::ClickHouseError(clickhouse::error::Error::BadResponse(message)) => {
+                ("server_response", server_error_code(message))
+            }
+            Self::ClickHouseError(_) => ("client_error", None),
+            _ => ("database_error", None),
+        }
+    }
+    pub(crate) fn request_was_not_sent(&self) -> bool {
+        match self {
+            Self::ScanRequestFailed { source } => source.request_was_not_sent(),
+            Self::ClickHouseError(clickhouse::error::Error::Network(error)) => error
+                .downcast_ref::<HyperClientError>()
+                .is_some_and(HyperClientError::is_connect),
+            _ => false,
+        }
+    }
+    pub(crate) fn is_transient_connectivity_failure(&self) -> bool {
+        match self {
+            Self::ProbeTimeout { .. } | Self::ClusterProbeIncomplete => true,
+            Self::ScanRequestFailed { source } | Self::ScanDatabaseUnavailable { source, .. } => {
+                source.is_transient_connectivity_failure()
+            }
+            Self::RequestOutcomeUnconfirmed { source } | Self::ClickHouseError(source) => match source {
+                clickhouse::error::Error::Network(_) | clickhouse::error::Error::TimedOut => true,
+                clickhouse::error::Error::Other(error) => error.is::<std::io::Error>(),
+                clickhouse::error::Error::BadResponse(message) => matches!(
+                    server_error_code(message),
+                    Some(198 | 209 | 210 | 254 | 265 | 279 | 285 | 286 | 289 | 297)
+                ),
+                _ => false,
+            },
+            _ => false,
+        }
+    }
+    pub fn is_confirmed_scan_cancellation(&self) -> bool {
+        match self {
+            Self::ScanCancelled => true,
+            Self::ClickHouseError(clickhouse::error::Error::BadResponse(message)) => {
+                let code = server_error_code(message);
+                // 服务端明确确认 QUERY_WAS_CANCELLED / QUERY_WAS_CANCELLED_BY_CLIENT。
+                matches!(code, Some(394 | 735))
+            }
+            _ => false,
+        }
+    }
+}
+
+fn server_error_code(message: &str) -> Option<u32> {
+    message
+        .trim_start()
+        .strip_prefix("Code:")
+        .and_then(|text| text.trim_start().split('.').next())
+        .and_then(|text| text.parse().ok())
+}

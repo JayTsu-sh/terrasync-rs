@@ -3,13 +3,17 @@
 
 use super::ScanCuts;
 use crate::ClickHouseConfig;
+use crate::{
+    http_transport::build_client,
+    scan_store::{ScanDatabaseExecution, with_scan_cancellation},
+};
 use clickhouse::Compression;
 use std::{
     net::SocketAddr,
     str::from_utf8,
     sync::{
         Arc,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     time::Duration,
 };
@@ -18,9 +22,9 @@ use tokio::{
     net::{TcpListener, TcpStream},
     sync::{Barrier, Notify},
     task::JoinSet,
-    time::timeout,
+    time::{sleep, timeout},
 };
-use tokio_util::task::AbortOnDropHandle;
+use tokio_util::{sync::CancellationToken, task::AbortOnDropHandle};
 use utils::app_config::ClickHouseMode;
 
 struct Gates {
@@ -81,22 +85,21 @@ async fn respond(mut socket: TcpStream, gates: Arc<Gates>) {
     socket.write_all(&body).await.unwrap();
 }
 
+fn single_config(address: SocketAddr) -> ClickHouseConfig {
+    ClickHouseConfig {
+        mode: ClickHouseMode::Single,
+        cluster: None,
+        dsn: format!("http://{address}"),
+        database: "capture_test".into(),
+        username: "default".into(),
+        password: None,
+        dial_timeout: 1,
+        read_timeout: 1,
+    }
+}
+
 fn single_cuts(address: SocketAddr) -> ScanCuts {
-    let mut cuts = ScanCuts::new(
-        &ClickHouseConfig {
-            mode: ClickHouseMode::Single,
-            cluster: None,
-            dsn: format!("http://{address}"),
-            database: "capture_test".into(),
-            username: "default".into(),
-            password: None,
-            dial_timeout: 1,
-            read_timeout: 1,
-        },
-        "job",
-        "owner",
-    )
-    .unwrap();
+    let mut cuts = ScanCuts::new(&single_config(address), "job", "owner").unwrap();
     cuts.client = cuts.client.with_validation(false).with_compression(Compression::None);
     cuts
 }
@@ -144,6 +147,205 @@ async fn capture_waits_for_both_tables_before_returning_a_token() {
 #[tokio::test]
 async fn capture_finishes_the_other_clone_before_returning_failure() {
     capture_case(true).await;
+}
+
+#[tokio::test]
+async fn prior_execution_drain_is_shared_by_cuts_but_not_by_new_executions() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let reads = Arc::new(AtomicUsize::new(0));
+    let creates = Arc::new(AtomicUsize::new(0));
+    let arrived = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let server_reads = reads.clone();
+    let server_creates = creates.clone();
+    let server_arrived = arrived.clone();
+    let server_release = release.clone();
+    let _server = AbortOnDropHandle::new(tokio::spawn(async move {
+        let mut tasks = JoinSet::new();
+        loop {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let reads = server_reads.clone();
+            let creates = server_creates.clone();
+            let arrived = server_arrived.clone();
+            let release = server_release.clone();
+            tasks.spawn(async move {
+                let sql = request(&mut socket).await;
+                if sql.contains("system.processes") {
+                    reads.fetch_add(1, Ordering::SeqCst);
+                    arrived.notify_one();
+                    release.notified().await;
+                }
+                if sql.contains("CREATE TABLE") {
+                    creates.fetch_add(1, Ordering::SeqCst);
+                }
+                let body = if sql.contains("SELECT") { vec![0; 8] } else { vec![] };
+                let header = format!(
+                    "HTTP/1.1 200 Test\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                socket.write_all(header.as_bytes()).await.unwrap();
+                socket.write_all(&body).await.unwrap();
+            });
+        }
+    }));
+    let cuts = single_cuts(address);
+    let execution = ScanDatabaseExecution::new(&single_config(address)).unwrap();
+    let first = cuts.clone();
+    let first_execution = execution.clone();
+    let mut drain = AbortOnDropHandle::new(tokio::spawn(async move {
+        with_scan_cancellation(CancellationToken::new(), Some(first_execution), first.capture()).await
+    }));
+    timeout(Duration::from_secs(1), arrived.notified()).await.unwrap();
+    assert!(timeout(Duration::from_millis(20), &mut drain).await.is_err());
+    assert_eq!(creates.load(Ordering::SeqCst), 0);
+    release.notify_one();
+    drain.await.unwrap().unwrap();
+
+    // 同一执行的后续检查点只克隆已排空的 working；旧执行检查不能再次阻塞它。
+    let captured = timeout(
+        Duration::from_millis(500),
+        with_scan_cancellation(CancellationToken::new(), Some(execution), cuts.clone().capture()),
+    )
+    .await;
+    assert!(captured.is_ok(), "a later checkpoint repeated the old-execution drain");
+    captured.unwrap().unwrap();
+    assert_eq!(reads.load(Ordering::SeqCst), 1);
+    assert_eq!(creates.load(Ordering::SeqCst), 4);
+
+    // 同一 job 的新执行必须重新排空，不能跨执行复用成功证明。
+    let fresh = cuts.clone();
+    let next_execution = ScanDatabaseExecution::new(&single_config(address)).unwrap();
+    let mut drain = AbortOnDropHandle::new(tokio::spawn(async move {
+        with_scan_cancellation(CancellationToken::new(), Some(next_execution), fresh.capture()).await
+    }));
+    timeout(Duration::from_secs(1), arrived.notified()).await.unwrap();
+    assert!(timeout(Duration::from_millis(20), &mut drain).await.is_err());
+    release.notify_one();
+    drain.await.unwrap().unwrap();
+    assert_eq!(reads.load(Ordering::SeqCst), 2);
+
+    // 无执行域的公共调用也不能使用前一个扫描的缓存。
+    let mut drain = AbortOnDropHandle::new(tokio::spawn(async move { cuts.capture().await }));
+    timeout(Duration::from_secs(1), arrived.notified()).await.unwrap();
+    assert!(timeout(Duration::from_millis(20), &mut drain).await.is_err());
+    release.notify_one();
+    drain.await.unwrap().unwrap();
+    assert_eq!(reads.load(Ordering::SeqCst), 3);
+}
+
+#[tokio::test]
+async fn failed_prior_execution_drain_is_not_cached() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let reads = Arc::new(AtomicUsize::new(0));
+    let server_reads = reads.clone();
+    let _server = AbortOnDropHandle::new(tokio::spawn(async move {
+        let mut tasks = JoinSet::new();
+        loop {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let reads = server_reads.clone();
+            tasks.spawn(async move {
+                let sql = request(&mut socket).await;
+                let failed = sql.contains("system.processes") && reads.fetch_add(1, Ordering::SeqCst) == 0;
+                let (status, body) = if failed {
+                    (500, b"Code: 516. AUTHENTICATION_FAILED".to_vec())
+                } else {
+                    (200, vec![0; 8])
+                };
+                let header = format!(
+                    "HTTP/1.1 {status} Test\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                socket.write_all(header.as_bytes()).await.unwrap();
+                socket.write_all(&body).await.unwrap();
+            });
+        }
+    }));
+    let cuts = single_cuts(address);
+    let execution = ScanDatabaseExecution::new(&single_config(address)).unwrap();
+    with_scan_cancellation(CancellationToken::new(), Some(execution), async {
+        assert!(cuts.capture().await.is_err());
+        cuts.capture().await.unwrap();
+        cuts.clone().capture().await.unwrap();
+    })
+    .await;
+    assert_eq!(reads.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn recovered_preflight_read_does_not_charge_healthy_capture_to_its_recovery_window() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let failed = Arc::new(AtomicBool::new(false));
+    let server = AbortOnDropHandle::new(tokio::spawn(async move {
+        let mut tasks = JoinSet::new();
+        loop {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let failed = failed.clone();
+            tasks.spawn(async move {
+                let sql = request(&mut socket).await;
+                let first_read = sql.contains("system.processes") && !failed.swap(true, Ordering::SeqCst);
+                if sql.contains("CREATE TABLE") {
+                    sleep(Duration::from_millis(3100)).await;
+                }
+                let body = if first_read {
+                    b"Code: 210. NETWORK_ERROR".to_vec()
+                } else if sql.contains("SELECT 1") {
+                    vec![1]
+                } else if sql.contains("SELECT") {
+                    vec![0; 8]
+                } else {
+                    vec![]
+                };
+                let status = if first_read { 503 } else { 200 };
+                let header = format!(
+                    "HTTP/1.1 {status} Test\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = socket.write_all(header.as_bytes()).await;
+                let _ = socket.write_all(&body).await;
+            });
+        }
+    }));
+    let config = ClickHouseConfig {
+        mode: ClickHouseMode::Single,
+        cluster: None,
+        dsn: format!("http://{address}"),
+        database: "capture_test".into(),
+        username: "default".into(),
+        password: None,
+        dial_timeout: 1,
+        read_timeout: 10,
+    };
+    let execution = ScanDatabaseExecution::new(&config).unwrap();
+    let client = build_client(&config, Some(execution.transport()))
+        .unwrap()
+        .with_validation(false)
+        .with_compression(Compression::None);
+    let cuts = ScanCuts::with_client(&config, "job", "owner", client).unwrap();
+    let monitor = execution.start_monitor().unwrap();
+    let stop = execution.clone();
+    let stopper = AbortOnDropHandle::new(tokio::spawn(async move {
+        stop.failed().await;
+        stop.begin_stop();
+    }));
+    let result = timeout(
+        Duration::from_secs(6),
+        with_scan_cancellation(CancellationToken::new(), Some(execution.clone()), cuts.capture()),
+    )
+    .await
+    .unwrap();
+    stopper.abort();
+    let _ = stopper.await;
+    monitor.finish().await.unwrap();
+    server.abort();
+    let _ = server.await;
+    assert!(
+        result.is_ok(),
+        "a recovered read must not time out unrelated healthy capture work: {result:?}"
+    );
+    assert!(execution.failure().is_none());
 }
 
 struct CleanupGates {
