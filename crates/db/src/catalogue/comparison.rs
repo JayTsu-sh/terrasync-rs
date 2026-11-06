@@ -270,8 +270,8 @@ impl JoinStrategy {
     pub(super) fn build_detect_changed_sql(&self, temp: &str, base: &str, kind: ChangeKind) -> String {
         let t_columns = &*FILE_SCAN_COLUMNS_LIST_WITH_T_PREFIX;
         let marker_eq = "ifNull(t.marker_state = f.marker_state, (t.marker_state IS NULL AND f.marker_state IS NULL))";
-        let data_changed = format!("((t.size != f.size OR t.mtime != f.mtime) OR NOT {marker_eq})");
-        let data_unchanged = format!("((t.size = f.size AND t.mtime = f.mtime) AND {marker_eq})");
+        let data_changed = format!("((t.is_dir = 0 AND (t.size != f.size OR t.mtime != f.mtime)) OR NOT {marker_eq})");
+        let data_unchanged = format!("((t.is_dir = 1 OR (t.size = f.size AND t.mtime = f.mtime)) AND {marker_eq})");
         // mode/uid/gid 在 S3 等协议中为 Nullable 且常常为 NULL；ClickHouse 三值逻辑下
         // `NULL = NULL` 返回 NULL（WHERE 视为 false），会让所有 ChangeKind 都不匹配。
         // 比较结果为 NULL 时，只有两侧均 NULL 才相等；单侧未知不能掩盖真实变更。
@@ -280,8 +280,12 @@ impl JoinStrategy {
         let mode_eq = "ifNull(t.mode = f.mode, (t.mode IS NULL AND f.mode IS NULL))";
         let uid_eq = "ifNull(t.uid = f.uid, (t.uid IS NULL AND f.uid IS NULL))";
         let gid_eq = "ifNull(t.gid = f.gid, (t.gid IS NULL AND f.gid IS NULL))";
-        let meta_changed = format!("(NOT {mode_eq} OR NOT {uid_eq} OR NOT {gid_eq})");
-        let meta_unchanged = format!("({mode_eq} AND {uid_eq} AND {gid_eq})");
+        let meta_changed = format!(
+            "(NOT {mode_eq} OR NOT {uid_eq} OR NOT {gid_eq} OR t.metadata_digests != f.metadata_digests OR (t.is_dir = 1 AND t.mtime != f.mtime))"
+        );
+        let meta_unchanged = format!(
+            "({mode_eq} AND {uid_eq} AND {gid_eq} AND t.metadata_digests = f.metadata_digests AND (t.is_dir = 0 OR t.mtime = f.mtime))"
+        );
 
         let marker_removed = "(t.is_dir = 1 AND t.marker_state IS NULL AND f.marker_state IS NOT NULL)";
         let kind_filter = match kind {
@@ -299,19 +303,19 @@ impl JoinStrategy {
         match self {
             Self::Path => format!(
                 "SELECT {t_columns} FROM {temp} t \
-                 JOIN (SELECT relative_path, version_id, size, mtime, mode, uid, gid, is_dir, marker_state \
+                 JOIN (SELECT relative_path, version_id, size, mtime, mode, uid, gid, is_dir, marker_state, metadata_digests \
                        FROM {base} FINAL \
                        WHERE (relative_path, version_id) IN \
                              (SELECT relative_path, version_id FROM {temp}) \
                        ORDER BY relative_path, version_id \
                        LIMIT 1 BY (relative_path, version_id) \
                  ) f ON t.relative_path = f.relative_path AND t.version_id = f.version_id \
-                 WHERE {kind_filter} AND (f.is_dir = 0 OR NOT {marker_eq}) \
+                 WHERE {kind_filter} \
                  ORDER BY t.relative_path, t.history_segment, t.history_index, t.version_id"
             ),
             Self::FileHandle => format!(
                 "SELECT {t_columns} FROM {temp} t \
-                 JOIN (SELECT file_handle, relative_path, size, mtime, mode, uid, gid, is_dir, marker_state \
+                 JOIN (SELECT file_handle, relative_path, size, mtime, mode, uid, gid, is_dir, marker_state, metadata_digests \
                        FROM {base} FINAL \
                        WHERE file_handle IN \
                              (SELECT file_handle FROM {temp} WHERE file_handle IS NOT NULL) \
@@ -319,7 +323,7 @@ impl JoinStrategy {
                        LIMIT 1 BY (file_handle, relative_path) \
                  ) f ON t.file_handle = f.file_handle \
                    AND t.relative_path = f.relative_path \
-                 WHERE {kind_filter} AND (f.is_dir = 0 OR NOT {marker_eq}) \
+                 WHERE {kind_filter} \
                  ORDER BY t.relative_path, t.history_segment, t.history_index, t.version_id"
             ),
         }

@@ -45,6 +45,7 @@ pub struct EntrySummary {
     /// 文件标签
     pub tags: Option<String>,
     pub marker_state: Option<String>,
+    pub metadata_digests: Vec<String>,
 }
 
 impl EntryStatistics for EntrySummary {

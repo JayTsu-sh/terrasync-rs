@@ -66,6 +66,7 @@ pub(crate) struct StorageEntryRecord {
     /// 文件标签
     pub tags: Option<String>,
     pub marker_state: Option<String>,
+    pub metadata_digests: Vec<String>,
     pub backend_kind: String,
     pub backend_id: String,
     pub entry_snapshot: Vec<u8>,
@@ -103,6 +104,7 @@ impl StorageEntryRecord {
             version_id: fields.version_id,
             tags: fields.tags,
             marker_state: fields.marker_state,
+            metadata_digests: fields.metadata_digests,
             backend_kind: entry.backend_kind().as_str().into(),
             backend_id: entry.source_identity().backend().stable_id().into(),
             entry_snapshot: entry.try_encode_snapshot()?.as_bytes().to_vec(),
@@ -191,6 +193,7 @@ pub(crate) struct IncrementalStorageEntryRecord {
     /// 文件标签
     pub tags: Option<String>,
     pub marker_state: Option<String>,
+    pub metadata_digests: Vec<String>,
     /// 记录创建时间
     pub create_at: i64,
     /// 备注信息（如重命名时的源路径）

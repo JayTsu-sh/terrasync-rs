@@ -3,6 +3,7 @@
 pub mod error;
 mod event;
 mod facts;
+pub mod metadata;
 pub mod observation;
 mod transfer;
 pub use error::{Result, TaskModelError};

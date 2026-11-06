@@ -30,6 +30,7 @@ macro_rules! file_scan_base_columns {
     version_id String DEFAULT '',
     tags Nullable(String) DEFAULT NULL,
     marker_state Nullable(String) DEFAULT NULL,
+    metadata_digests Array(String) DEFAULT [],
     identity_key String DEFAULT '',
     backend_kind String DEFAULT '',
     backend_id String DEFAULT '',
@@ -76,7 +77,7 @@ pub(crate) const FILE_INCREMENTAL_SCAN_COLUMNS_DEFINITION: &str = file_scan_base
 );
 
 /// 目录查询和扫描摘要共用的字段顺序。
-pub(crate) const FILE_SCAN_COLUMNS_LIST: &str = "name, relative_path, size, ext, ctime, mtime, atime, mode, storage_type, is_symlink, is_dir, is_regular_file, hard_links, current_state, uid, gid, ino, file_handle, version_id, tags, marker_state";
+pub(crate) const FILE_SCAN_COLUMNS_LIST: &str = "name, relative_path, size, ext, ctime, mtime, atime, mode, storage_type, is_symlink, is_dir, is_regular_file, hard_links, current_state, uid, gid, ino, file_handle, version_id, tags, marker_state, metadata_digests";
 
 /// 原生观察流式回读的最小查询投影，与 `SnapshotRow` 字段顺序一致。
 pub(crate) const SNAPSHOT_COLUMNS: &str = "relative_path,backend_kind,backend_id,entry_snapshot";

@@ -32,6 +32,7 @@ pub(super) struct ClusterIncrementalStorageEntryRecord<'a> {
     pub version_id: &'a str,
     pub tags: Option<&'a str>,
     pub marker_state: Option<&'a str>,
+    pub metadata_digests: &'a [String],
     pub create_at: i64,
     pub comment: Option<&'a str>,
 }
@@ -64,6 +65,7 @@ impl<'a> ClusterIncrementalStorageEntryRecord<'a> {
             version_id: &record.version_id,
             tags: record.tags.as_deref(),
             marker_state: record.marker_state.as_deref(),
+            metadata_digests: &record.metadata_digests,
             create_at: record.create_at,
             comment: record.comment.as_deref(),
         }
@@ -136,6 +138,7 @@ pub(super) struct ClusterNativeScanRecord<'a> {
     pub version_id: &'a str,
     pub tags: Option<&'a str>,
     pub marker_state: Option<&'a str>,
+    pub metadata_digests: &'a [String],
     pub identity_key: &'a str,
     pub backend_kind: &'static str,
     pub backend_id: &'a str,
@@ -176,6 +179,7 @@ impl<'a> ClusterNativeScanRecord<'a> {
             version_id: record.version_id,
             tags: record.tags.as_deref(),
             marker_state: record.marker_state.as_deref(),
+            metadata_digests: &record.metadata_digests,
             identity_key: &record.identity_key,
             backend_kind: record.backend_kind,
             backend_id: record.backend_id,
@@ -203,7 +207,8 @@ mod tests {
             "ext":"dat", "ctime":11, "mtime":12, "atime":13, "mode":420, "storage_type":"nas",
             "is_symlink":false, "is_dir":false, "is_regular_file":true, "hard_links":2,
             "current_state":1, "uid":1000, "gid":1001, "ino":42, "file_handle":"abcd",
-            "version_id":"v1", "tags":"[]", "create_at":17, "comment":"old/source.dat"
+            "version_id":"v1", "tags":"[]", "metadata_digests":["acl", "xattrs", "tags"],
+            "create_at":17, "comment":"old/source.dat"
         }))?;
         let mut expected = serde_json::to_value(&record)?;
         expected["job_id"] = json!("job");
