@@ -215,7 +215,13 @@ pub(crate) struct NativeScanRecord<'a> {
     pub history_segment: u32,
     pub history_index: u32,
 }
-/// 每次请求拥有有界的编码缓冲；重试复用相同字节和去重 token。
+// 请求边界按载荷预算划分，不能把调用方的批次固定切成千行 HTTP 请求。
+// 预算只统计本请求拥有的编码／字符串，借用的观察由调用方持有。
+// 单个超大行沿用独立请求语义，因此软上限最多超出一行。
+const MAX_NATIVE_REQUEST_BYTES: usize = 8 * 1024 * 1024;
+const MAX_NATIVE_REQUEST_ROWS: usize = 65_536;
+
+/// 每次请求保留有界的 snapshot 编码；重试复用原编码和同一去重 token。
 pub(crate) struct NativeWriteBatches<'a> {
     views: Box<dyn Iterator<Item = ObservedView<'a>> + Send + 'a>,
     generation: u8,
@@ -233,7 +239,7 @@ impl<'a> Iterator for NativeWriteBatches<'a> {
     fn next(&mut self) -> Option<Self::Item> {
         let mut rows = Vec::new();
         let mut retained_bytes = 0usize;
-        while rows.len() < 1024 && retained_bytes < 1024 * 1024 {
+        while rows.len() < MAX_NATIVE_REQUEST_ROWS && retained_bytes < MAX_NATIVE_REQUEST_BYTES {
             let Some(view) = self.views.next() else {
                 break;
             };
@@ -698,3 +704,7 @@ mod wire_tests {
         exercise(200_000).await
     }
 }
+
+#[cfg(test)]
+#[path = "rows/batch_tests.rs"]
+mod batch_tests;

@@ -362,3 +362,53 @@ Single／Cluster × Atomic／Checkpoint：代理仅在真实最终写请求获�
 
 最终候选的其余 S3／HA Kerberos HDFS 回归正在执行；网络矩阵采用 5 秒 ClickHouse 读时限的完整复测尚未收尾。
 相同模式的性能／RSS 验收、最终 PR 状态及 worktree 清理尚未完成。
+
+
+## 最终正常链路与完整扫描故障矩阵
+
+Receiver 修复候选 f5ba57d8 的其余正常回归 **101 项通过**。报告目录前缀为
+`/work/terrasync-db-refactor-evidence/release-db-refactor-native-final-`：
+point 8、markers 17、ordered 14、tar-guards 8、tar-manifest 2、basis 3、checkpoint-source-cut 2、publish-denial 1、qos 8、rm-denial 2，以及 hdfs-single／hdfs-cluster 各 18。
+与上述最终目标写 ACK 丢失 4 项分开计数；HDFS 额外 QoS 用例仍不计为 DB 部署模式验证。
+成功报告均保留精确二进制来源和临时资源清理结果。
+
+完整 **72 项扫描故障矩阵通过**，报告
+`/work/terrasync-db-refactor-evidence/release-db-refactor-without-adapter-scan-fault-v3-20261106-044418/report.json`。
+采用真实 S3、Single／Cluster 与真实 callback 接收器：full／incremental／resume／incremental_resume 四种执行，
+分别注入源端闪断、持续重置、静默、故障取消，及数据库对应四项和成功写入后丢失 ACK。
+每项恢复后回读 372 条实际路径、唯一事实及累计统计；成功终态载荷已独立核对。
+静默检测与恢复分开配置：源端 operation 1 秒、DB read 5 秒，识别后 recovery 3 秒。
+持续重置从注入到退出约 3 秒；源静默约 4 秒、DB 静默约 8 秒，包含各自检测时限。
+报告是注入到完成的观测，不冒充精确识别后计时。未知写结果按有类型的 RequestOutcomeUnconfirmed 保留，不改成已确认取消。
+本轮没有宣称 callback 交付重试／补偿的基点限制已修复，也不涵盖 HDFS 网络故障。
+
+## 扫描 HTTP 合批性能修复
+
+500500 条实际 NFS 事实的同配置对照发现新原生扫描的 1024 行请求上限引入约五倍单机全量回归：
+主分支约 7.05 秒，未修复候选约 35.29 秒。
+首轮 `release-db-refactor-native-performance-20261106-051339` 因该回归中止，不能计作性能验收通过。
+原始主分支在同一热缓存 NFS 上也未达到相对无 DB 基线的 5%／10% 目标，不能将其 DB 成绩当作无 DB 基线。
+
+将同一调用批次的原生行合并为最多 8 MiB 拥有载荷软预算／65536 行的请求；超大单行可越过软预算。
+Single／Cluster 共用 NativeWriteBatches，调用批次成功边界、代次、checkpoint 与取消协议不变。
+快照在重试外编码，重试仍由 SDK 生成 RowBinary；没有宣称完整 HTTP body 只编码一次。
+2 项回归先红后绿，覆盖 5000 个小行的一次请求及大事实拆分后的全部快照字节。
+
+候选 `/work/terrasync-db-refactor-request-packing`，SHA-256
+`a99e37e1c46cafd81f42bdbffc6e7102986d31227c9bccbee322d50fe19fbcb3`，
+来源 `/tmp/terrasync-request-packing-build-source.json`，基于 3791267 加本次两文件修改。
+fmt、workspace all-features/all-targets check／Clippy、完整 workspace **539 通过、86 忽略**，串行双进程 E2E **16 通过**。
+日志为 `/tmp/terrasync-request-packing-final-{fmt,clippy,tests,e2e}.log` 和 `/tmp/terrasync-request-packing-check.log`。
+真实 DB 契约 **75 项通过**，独立库清理成功，报告前缀 `/tmp/terrasync-db-refactor-real-request-packing-v1-`。
+
+实际大批次写入后丢失响应 **Single／Cluster 2 项通过**：
+`/work/terrasync-db-refactor-evidence/release-db-refactor-request-packing-large-data-ack-loss-20261106-054953/report.json`。
+5004 条事实均准确且无重复，首次与重试的实际数据请求 body hash 及非空去重 token 一致，累计统计无重复。
+API 探针精确来源另存 `/tmp/terrasync-request-packing-scan-probe-source.json`。
+
+同数据集初步性能对照报告
+`/work/terrasync-db-refactor-evidence/release-db-refactor-request-packing-perf-control-20261106-054815/report.json`：
+Single full 主分支 8.49 秒／候选 8.38 秒，incremental0 为 14.31／14.93 秒；五倍回归已消除。
+Cluster full 为 23.77／28.70 秒，incremental0 为 28.86／27.77 秒；单轮差异需多轮同模式复核。
+峰值候选 Single 约 179 MiB、Cluster 约 269 MiB；该报告 passed 仅表示功能和清理检查通过，不表示性能目标达标。
+unordered／blocks、无变更／约 1% 变更、多轮 RSS 以及生产周期续扫成本仍在独立验收中。
