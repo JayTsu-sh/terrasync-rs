@@ -20,6 +20,8 @@ AI 工作流程以根目录 [AGENTS.md](../AGENTS.md) 为准，产品约束按�
 
 ## 按场景查阅
 
+扫描性能优化、重构及 review 的历史基准固定为 [PR #135／#137 性能基准](perf/scan-performance-baseline.md)：并发 16、批次 100000，保留原吞吐和整轮 RSS 成绩；后续报告同时给出历史差值与同环境 A/B。
+
 | 场景 | 依据 |
 | --- | --- |
 | 理解当前 workspace、crate 和依赖版本 | 根 Cargo.toml、crates/、[代码结构资料](../.claude/docs/codebase.md)；代码与构建配置为当前事实 |
