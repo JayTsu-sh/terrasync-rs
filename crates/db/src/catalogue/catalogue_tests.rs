@@ -1,6 +1,7 @@
 //! 目录集群适配经由公开连接和通用 Database 契约验证，不借用 native scan 入口。
 #![allow(clippy::unwrap_used)]
 use super::*;
+use crate::ClickHouseConfig;
 use crate::execution::base_client;
 use crate::observed_fixtures::directory_marker;
 use crate::schema::columns::CATALOGUE_COLUMNS;
@@ -155,6 +156,35 @@ fn paths(entries: impl Iterator<Item = ObservedEntry>) -> Vec<String> {
     entries
         .map(|entry| entry.get_relative_path().to_string_lossy().into_owned())
         .collect()
+}
+
+#[tokio::test]
+#[ignore = "requires explicitly selected ClickHouse Single or six-replica Cluster; isolated database only"]
+async fn catalogue_clones_share_generation_and_independent_tasks_cannot_commit_it() -> Result<()> {
+    let fixture = Fixture::new().await?;
+    let database = ClickHouseDatabase::new(&fixture.config, "task_scope")?;
+    database.initialize().await?;
+    let early_clone = database.clone();
+    assert_eq!(database.begin_scan_generation().await?, 1);
+    let late_clone = database.clone();
+    early_clone
+        .batch_insert_base_record(&[fixture.entry("payload", 7, "aa")])
+        .await?;
+    let rows = fixture.rows("task_scope").await?;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].current_state, 1);
+
+    let independent = ClickHouseDatabase::new(&fixture.config, "task_scope")?;
+    assert!(matches!(
+        independent.commit_scan_generation().await,
+        Err(DatabaseError::TransactionError(_))
+    ));
+    let (first, second) = tokio::join!(database.commit_scan_generation(), early_clone.commit_scan_generation());
+    first?;
+    second?;
+    late_clone.commit_scan_generation().await?;
+    assert_eq!(late_clone.query_scan_state().await?, Some(1));
+    Ok(())
 }
 
 #[tokio::test]

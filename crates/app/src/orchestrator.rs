@@ -375,7 +375,7 @@ impl SyncOrchestrator {
 
         // ── 4. 广播器 + 消费者 ──
         let mut broadcaster = BroadcastForwarder::new(DEFAULT_CHANNEL_CAPACITY);
-        let mut consumer_manager = ConsumerManager::new(consumer_config.as_ref()).await?;
+        let mut consumer_manager = ConsumerManager::with_database(consumer_config.as_ref(), database.clone()).await?;
         consumer_manager.begin_lifecycle().await;
         let consumer_handles = consumer_manager.start_consumers(&mut broadcaster).await?;
         let bytes_tracker = consumer_manager.get_bytes_tracker().await;
@@ -755,7 +755,8 @@ impl SyncOrchestrator {
         let walkdir_iter = dir_walker::walkdir(scan_config).await?;
 
         // ── 4. 消费者管理器 + 共享生命周期（跨 Phase A/B 共用同一份统计累积） ──
-        let mut consumer_manager = ConsumerManager::new(consumer_config.as_ref()).await?;
+        let mut consumer_manager =
+            ConsumerManager::with_database(consumer_config.as_ref(), Some(database.clone())).await?;
         consumer_manager.begin_lifecycle().await;
         let bytes_tracker = consumer_manager.get_bytes_tracker().await;
 

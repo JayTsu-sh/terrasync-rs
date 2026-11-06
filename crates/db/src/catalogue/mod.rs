@@ -6,8 +6,8 @@ use crate::schema::columns::SNAPSHOT_COLUMNS;
 
 // 标准库
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
-use std::sync::{Arc, Mutex as StdMutex, OnceLock, Weak};
 
 // 外部crate
 use async_trait::async_trait;
@@ -17,12 +17,11 @@ use data_mover::model::ObservedEntry;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use task_model::{ChangeKind, StorageEntryMessage};
-use tokio::sync::{Mutex, MutexGuard, mpsc};
+use tokio::sync::mpsc;
 use tracing::{debug, info, trace};
 
 // 内部模块
 use crate::common::{DeletionStatus, classify_deletion_status};
-use crate::config::ClickHouseConfig;
 use crate::error::{DatabaseError, Result};
 use crate::execution::{
     queries::{ScanExecute, check_scan_cancellation, execute_request, idempotent_insert_client},
@@ -50,6 +49,8 @@ pub(crate) use comparison::compare_catalogue_batch;
 pub use comparison::{CatalogueChange, CatalogueDifference, ComparisonMode};
 mod copy_generation;
 mod layout;
+mod lifecycle;
+use lifecycle::{CatalogueLifecycle, ScanGenerationLifecycle};
 mod tables;
 use crate::execution::read::QuorumRead;
 use layout::{CatalogueEngine, ClusterCatalogue};
@@ -75,60 +76,8 @@ pub struct ClickHouseDatabase {
     /// 每次扫描实例只检查一次旧基线的身份格式，避免每批全表统计。
     resume_base_has_typed_handles: Option<bool>,
     native_dedup_ready: AtomicBool,
-    /// 同一 `ClickHouse` 身份与 job 共享的 scan generation 生命周期
-    generation_lifecycle: SharedGenerationLifecycle,
-}
-
-#[derive(Default)]
-struct ScanGenerationLifecycle {
-    working: Option<u8>,
-    committed: bool,
-    copy_recovery: bool,
-}
-
-#[derive(Clone, Eq, Hash, PartialEq)]
-struct GenerationLifecycleKey {
-    dsn: String,
-    database: String,
-    username: String,
-    job_id: String,
-    cluster: Option<String>,
-}
-
-#[derive(Default)]
-struct CatalogueLifecycle {
-    state: Mutex<ScanGenerationLifecycle>,
-    writes: Mutex<()>,
-}
-
-impl CatalogueLifecycle {
-    async fn lock(&self) -> MutexGuard<'_, ScanGenerationLifecycle> {
-        self.state.lock().await
-    }
-}
-
-type SharedGenerationLifecycle = Arc<CatalogueLifecycle>;
-type GenerationLifecycleRegistry = HashMap<GenerationLifecycleKey, Weak<CatalogueLifecycle>>;
-
-static GENERATION_LIFECYCLES: OnceLock<StdMutex<GenerationLifecycleRegistry>> = OnceLock::new();
-
-fn shared_generation_lifecycle(config: &ClickHouseConfig, job_id: &str) -> SharedGenerationLifecycle {
-    let key = GenerationLifecycleKey {
-        dsn: config.dsn.clone(),
-        database: config.database.clone(),
-        username: config.username.clone(),
-        job_id: sanitize_job_id(job_id),
-        cluster: config.cluster.clone(),
-    };
-    let registry = GENERATION_LIFECYCLES.get_or_init(|| StdMutex::new(HashMap::new()));
-    let mut registry = registry.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-    registry.retain(|_, lifecycle| lifecycle.strong_count() > 0);
-    if let Some(lifecycle) = registry.get(&key).and_then(Weak::upgrade) {
-        return lifecycle;
-    }
-    let lifecycle = Arc::new(CatalogueLifecycle::default());
-    registry.insert(key, Arc::downgrade(&lifecycle));
-    lifecycle
+    /// 由本任务显式克隆的目录实例共享的代次与写入协调状态
+    generation_lifecycle: Arc<CatalogueLifecycle>,
 }
 
 /// Memory 排除表记录（优化 3）
@@ -401,19 +350,7 @@ impl ClickHouseDatabase {
 #[async_trait]
 impl Database for ClickHouseDatabase {
     fn clone_box(&self) -> Box<dyn Database> {
-        let new_db = Self {
-            sync_client: self.sync_client.clone(),
-            catalogue_cluster: self.catalogue_cluster.clone(),
-            async_client: self.async_client.clone(),
-            job_id: self.job_id.clone(),
-            scan_temp_table_name: self.scan_temp_table_name.clone(),
-            cached_scan_state: AtomicU8::new(self.cached_scan_state.load(Ordering::Relaxed)),
-            resume_base_has_typed_handles: self.resume_base_has_typed_handles,
-            native_dedup_ready: AtomicBool::new(self.native_dedup_ready.load(Ordering::Acquire)),
-            generation_lifecycle: Arc::clone(&self.generation_lifecycle),
-        };
-
-        Box::new(new_db)
+        Box::new(self.clone())
     }
 
     /// 初始化：创建主扫描表 + 状态表，仅在状态缺失时设置初始 `scan_state=0`

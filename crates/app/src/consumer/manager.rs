@@ -38,6 +38,7 @@ use crate::consumer::traits::Consumer;
 use crate::error::{AppError, Result};
 use crate::scan::statistics::{ScanCapabilities, ScanCounts, ScanSnapshot};
 use data_mover::traversal::TraversalRecoveryStatus;
+use db::Database;
 use db::scan::ScanFinalEvent;
 use db::scan::ScanResumeStatistics;
 
@@ -443,19 +444,39 @@ impl ConsumerManager {
         Ok(())
     }
 
-    /// 创建新的消费者管理器实例
+    /// Create a standalone consumer pipeline with its own catalogue scope.
     pub async fn new(consumer_config: &ConsumerConfig) -> Result<Self> {
-        let enable_db = consumer_config.db_config.enabled;
+        let consumer = if consumer_config.db_config.enabled {
+            Some(DatabaseConsumer::connect(consumer_config).await?)
+        } else {
+            None
+        };
+        Ok(Self::with_database_consumer(consumer_config, consumer))
+    }
 
+    /// A copy pipeline explicitly shares the catalogue that began its generation.
+    pub(crate) async fn with_database(
+        consumer_config: &ConsumerConfig, database: Option<Box<dyn Database>>,
+    ) -> Result<Self> {
+        let consumer = match (consumer_config.db_config.enabled, database) {
+            (true, Some(database)) => Some(DatabaseConsumer::with_database(consumer_config, database).await?),
+            (false, None) => None,
+            _ => {
+                return Err(AppError::ConfigError(
+                    "Consumer catalogue does not match database enablement".into(),
+                ));
+            }
+        };
+        Ok(Self::with_database_consumer(consumer_config, consumer))
+    }
+
+    fn with_database_consumer(consumer_config: &ConsumerConfig, consumer: Option<DatabaseConsumer>) -> Self {
         let mut manager = Self {
             consumers: Vec::new(),
             stats_consumer: None,
             callback_guard: None,
         };
-
-        // 根据配置初始化数据库消费者
-        if enable_db {
-            let consumer = DatabaseConsumer::try_new(consumer_config).await?;
+        if let Some(consumer) = consumer {
             manager.add_consumer(Box::new(consumer));
             debug!("Database consumer initialized successfully");
         }
@@ -500,7 +521,7 @@ impl ConsumerManager {
             warn!("No consumers were successfully initialized");
         }
 
-        Ok(manager)
+        manager
     }
 
     /// 向消费者管理器添加一个消费者

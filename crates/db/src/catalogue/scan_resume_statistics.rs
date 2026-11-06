@@ -41,6 +41,7 @@ impl ClickHouseDatabase {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+    use crate::ClickHouseConfig;
     use crate::{
         execution::read::tests::server,
         scan::{ScanDatabaseExecution, with_scan_cancellation},

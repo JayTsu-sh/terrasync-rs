@@ -192,6 +192,23 @@ write_positioned 集中连续偏移校验、完整摘要和恢复前缀跳过；
 
 本轮保留的有效失败对照包括：源变化后错误发布并删掉新源的 `/work/terrasync-db-refactor-evidence/release-db-refactor-tar-stale-red-20261105-233802/report.json`；旧 HDFS header 不保留独立权限的 `/work/terrasync-db-refactor-evidence/release-db-refactor-shared-tar-hdfs-single-valid-20261105-230640/report.json`；中间候选 Local mode 混入类型位的 `/work/terrasync-db-refactor-evidence/release-db-refactor-tar-guards-header-20261106-000517/report.json`。最后一项的 Local 最小复现为 0100640；原生真实 Local 回归修复前失败记录 `/tmp/data-mover-tar-type-bits-red.log`。这些失败报告不计为通过，未放宽最终断言。
 
+## 任务显式持有目录作用域
+
+删除按配置／job 查找的全局弱引用代次注册表。每次创建目录建立独立任务作用域；显式 Clone 共享代次状态与集群写锁。状态及锁集中到 catalogue／lifecycle，连接与 Clone 构造归 connection。clone_box 复用同一具体 Clone 契约。
+
+全量／增量复制将已经启动代次的目录 clone 注入消费者，避免消费者再次连接并依赖隐式状态共享。独立消费者仍自行连接；纯扫描统计消费者继续不落库。Single／Cluster 的布局和写入差异保持在 db。删除无人调用的 get_database。
+
+两项本地测试验证代次共享／任务隔离和写锁共享；四项真实共享测试的夹具改为显式 clone，写入、并发提交、失败传播及重新 begin 的原断言均保留，真正重开恢复仍使用 new。新增实际 Single／Cluster 用例验证 begin 前后的 clone 使用正确代次、独立 same-job 任务不能提交该代次，以及并发／重复提交。
+
+最终 fmt、workspace check／Clippy、530 个 workspace 测试和双进程 E2E 16 例通过；86 个忽略项不计通过。匹配最终测试夹具的检查记录前缀 `/tmp/terrasync-catalogue-scope-final-`，E2E 为 `/tmp/terrasync-catalogue-scope-e2e.log`。
+
+候选 release SHA-256 为 `4720949c51bffd8fc7f287b29741f513e229ed8e8387bf84295a5eb918676fe0`；源码记录 `/tmp/terrasync-catalogue-scope-build-source.json` 同时记录 tracked diff 与新增 lifecycle 文件摘要。以下 134 个真实用例通过，独立测试资源均清理成功：
+
+- ClickHouse Single 目录 11、Cluster 目录 12、Single 集成 44、两种部署切点各 3 例，共 73 例。报告前缀 `/tmp/terrasync-db-refactor-real-catalogue-scope-v1-`，分别为 `single-catalogue.json`、`cluster-catalogue.json`、`single.json`、`single-cuts.json`、`cluster-cuts.json`。包含上述显式共享／隔离用例和保留的持久重开恢复断言；目录 fixture 的库按本轮日志逐一回查已删除。
+- 同一 release 的 S3 marker／tags 17 例：`/work/terrasync-db-refactor-evidence/release-db-refactor-catalogue-scope-marker-tags-20261106-003246/report.json`。
+- 有序版本、恢复及 null 历史 14 例：`/work/terrasync-db-refactor-evidence/release-db-refactor-catalogue-scope-ordered-20261106-003354/report.json`。
+- Kerberos HDFS + Single／Cluster 各 15 例：`/work/terrasync-db-refactor-evidence/release-db-refactor-catalogue-scope-hdfs-single-20261106-003245/report.json`、`/work/terrasync-db-refactor-evidence/release-db-refactor-catalogue-scope-hdfs-cluster-20261106-003259/report.json`。包含扫描两轮、复制／QUIC、真实权限、两类归档及回读。
+
 ## 合入前仍须完成
 
-还需完成数据库目录会话与任务接口的整理，以及按设计删除 storage-adapter。任务契约与 transport 已分离，剩余存储机制和产品配置仍须分别归位。最终候选必须重跑对应 CI、真实 HDFS 和受影响故障链路，并完成全量／增量／续扫性能与峰值 RSS 对照。先前 HDFS 通过的二进制不能作为最终候选证据。
+目录作用域已显式共享；还需收敛数据库任务接口及临时表协议，以及按设计删除 storage-adapter。任务契约与 transport 已分离，剩余存储机制和产品配置仍须分别归位。最终候选必须重跑对应 CI、真实 HDFS 和受影响故障链路，并完成全量／增量／续扫性能与峰值 RSS 对照。先前 HDFS 通过的二进制不能作为最终候选证据。

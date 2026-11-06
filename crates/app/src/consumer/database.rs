@@ -305,7 +305,7 @@ impl DatabaseConsumer {
     ///
     /// # 返回值
     /// 返回初始化后的数据库消费者实例
-    pub async fn try_new(config: &ConsumerConfig) -> Result<Self> {
+    pub async fn connect(config: &ConsumerConfig) -> Result<Self> {
         // 从配置中提取job_id（作为引用使用）
         let job_id = &config.job_id;
 
@@ -320,6 +320,11 @@ impl DatabaseConsumer {
         }
         let database: Box<dyn Database> =
             Box::new(ClickHouseDatabase::connect(&config.db_config.clickhouse, job_id).await?);
+        Self::with_database(config, database).await
+    }
+
+    /// Attach the task-owned catalogue so its generation and write coordination are shared.
+    pub(crate) async fn with_database(config: &ConsumerConfig, database: Box<dyn Database>) -> Result<Self> {
         if matches!(config.job_type, JobType::Scan | JobType::Copy) {
             database.initialize().await?;
         }
@@ -332,13 +337,6 @@ impl DatabaseConsumer {
             batch_size: config.db_config.batch_size,
             job_type: config.job_type.clone(),
         })
-    }
-
-    /// 获取数据库实例的引用
-    ///
-    /// 允许外部代码访问内部使用的数据库实例
-    pub fn get_database(&self) -> Box<dyn Database> {
-        Box::clone(&self.db)
     }
 
     /// 处理单个扫描结果
