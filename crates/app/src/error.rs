@@ -1,8 +1,9 @@
 use data_mover::storage::{CapabilityUnavailable, StorageRoleFailure};
 // 标准库
+use std::fmt::{Display, Formatter};
 use std::fs::TryLockError;
 use std::num::TryFromIntError;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::SystemTimeError;
 
 // 外部crate
@@ -25,9 +26,34 @@ use utils::error::UtilsError;
 // 内部模块
 // 无
 
+/// 本机复制失败所在的任务步骤；原始存储原因由 source 保留。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CopyStep {
+    ReadSourceLink,
+    CreateDestinationLink,
+    Transfer,
+}
+
+impl Display for CopyStep {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::ReadSourceLink => "read source symlink",
+            Self::CreateDestinationLink => "create destination symlink",
+            Self::Transfer => "transfer file",
+        })
+    }
+}
+
 /// 应用程序的专用错误枚举
 #[derive(Error, Debug)]
 pub enum AppError {
+    #[error("Failed to {step} {path:?}: {source}")]
+    CopyEntryFailed {
+        step: CopyStep,
+        path: PathBuf,
+        #[source]
+        source: Box<AppError>,
+    },
     #[error("Scan storage failure: {source}; database also failed while stopping: {database}")]
     ScanStorageAndDatabaseFailure {
         #[source]
@@ -253,8 +279,17 @@ pub enum AppError {
 pub type Result<T> = std::result::Result<T, AppError>;
 
 impl AppError {
+    pub(crate) fn copy_entry_failure(step: CopyStep, path: &Path, source: impl Into<Self>) -> Self {
+        Self::CopyEntryFailed {
+            step,
+            path: path.to_path_buf(),
+            source: Box::new(source.into()),
+        }
+    }
+
     pub fn storage_error(&self) -> Option<&StorageError> {
         match self {
+            Self::CopyEntryFailed { source, .. } => source.storage_error(),
             Self::StorageError(error) => Some(error),
             Self::ScanStorageAndDatabaseFailure { source, .. } => Some(source),
             _ => None,

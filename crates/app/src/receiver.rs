@@ -34,7 +34,7 @@ use transport::message::{
 use transport::traits::ReceiverTransport;
 
 // 内部模块
-use crate::error::{AppError, Result};
+use crate::error::{AppError, CopyStep, Result};
 use crate::remote_receiver_session::{RemoteReceiverSession, RemoteSessionState};
 use crate::sync::{CommitRecorder, ResumeOpts, copy_file_with_resume, parse_size, should_resume};
 
@@ -103,7 +103,7 @@ pub struct ReceiverConfig {
 
 /// 单进程模式的 Receiver 主 task（R1 + R2 合一）
 ///
-/// 从 transport 接收 `SenderMsg`，调用 `StorageContext` 方法执行写入。
+/// 从 transport 接收 `SenderMsg`，调用任务复制用例与原生存储角色执行写入。
 /// 每完成一个 entry 后通过 transport 发送 `ReceiverMsg::EntrySuccess` 或 `EntryError`。
 ///
 /// 单进程模式下收到 `CopyEntry` 消息时，Receiver 有 src+dest storage，
@@ -207,12 +207,10 @@ pub(crate) async fn process_entry_on_receiver(
         } else if entry.get_is_symlink() {
             let target_path = copy_namespace::read_symlink(src_storage.storage(), entry)
                 .await
-                .map_err(|e| AppError::CopyError(format!("Failed to read symlink {}: {e}", relative_path.display())))?;
+                .map_err(|e| AppError::copy_entry_failure(CopyStep::ReadSourceLink, relative_path, e))?;
             copy_namespace::create_symlink(dest_storage.storage(), entry, &target_path)
                 .await
-                .map_err(|e| {
-                    AppError::CopyError(format!("Failed to create symlink {}: {e}", relative_path.display()))
-                })?;
+                .map_err(|e| AppError::copy_entry_failure(CopyStep::CreateDestinationLink, relative_path, e))?;
 
             // 源端符号链接删除（is_source_reserved=false 时）
             if !config.is_source_reserved
@@ -285,7 +283,7 @@ pub(crate) async fn process_entry_on_receiver(
                     None,
                 )
                 .await
-                .map_err(|e| AppError::CopyError(format!("Failed to copy {}: {e}", relative_path.display())))?
+                .map_err(|e| AppError::copy_entry_failure(CopyStep::Transfer, relative_path, e))?
             };
 
             // 普通传输和检查点传输都在发布前应用协商后的元数据。
@@ -1000,3 +998,7 @@ mod tests {
         assert!(resolve_delta_size_threshold(&Some("not-a-size".to_string())).is_err());
     }
 }
+
+#[cfg(test)]
+#[path = "receiver/copy_failure_tests.rs"]
+mod copy_failure_tests;

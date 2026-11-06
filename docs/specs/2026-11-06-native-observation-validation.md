@@ -327,3 +327,38 @@ storage-adapter 的结构迁移提交为 `da0dc0b`。随后独立修复删除结
 网络矩阵 v2 的原报告整体未通过：单机 36 项及部分集群用例已通过；集群无注入的恢复执行遇到 1 秒 read_timeout，保留 RequestOutcomeUnconfirmed 并准确失败。
 该失败不能标成整套通过，也没有因此改产品错误语义。将真实集群正常请求的读时限设为 5 秒后，独立的集群增量闪断及恢复对照已通过；完整矩阵仍需完成。
 最终 callback 的基点既有限制与性能/RSS 门禁仍按上节标为未完成。
+
+
+## Receiver 原始错误保留与最终运行时候选
+
+删除修复已独立提交 `8a50c5c`。Receiver 的普通文件、源链接读取、目标链接建立原来把错误格式化为 CopyError(String)，丢失了原生类型。
+新增 CopyStep／相对路径上下文及 boxed 原始 AppError，统一的 storage_error 递归保留分类入口；只在错误分支取得路径所有权，成功及重试流程不变。
+三个真实 Local I/O 测试先以旧代码失败，再以修复代码通过：源文件消失、源软链消失、非空目标目录拒绝替换；同时断言旧目标、已有子文件和暂存清理。
+红／绿日志为 `/tmp/terrasync-receiver-copy-failure-{red,green}-tests.log`。
+两轴 review 均未发现此步新增问题。
+
+最终运行时候选 `/work/terrasync-db-refactor-native-final`，SHA-256
+`f5ba57d8264c2d81d44b028eff0db137c5d68ea3503eac608928eda8d1e5f882`，来源 `/tmp/terrasync-native-final-build-source.json`。
+
+源码在完整检查、测试和构建期间冻结，构建后及追加本节前核对指纹。
+fmt、workspace all-features/all-targets check／Clippy 通过；完整 workspace **537 通过、86 原条件忽略**，双进程 E2E **16 通过**。
+日志 `/tmp/terrasync-native-final-{fmt,check,clippy,tests,e2e,release-build}.log`，不能把已有 Clippy 警告写成零警告。
+
+最终候选的真实目标 S3 响应丢失验证 **4 项通过**：
+`/work/terrasync-db-refactor-evidence/release-db-refactor-native-final-target-lost-ack-v2-20261106-045857/report.json`。
+
+Single／Cluster × Atomic／Checkpoint：代理仅在真实最终写请求获得成功响应后切断响应。
+首次和重跑后均独立读回内容及版本数；最终 1 份源事实，目标仅原始旧版本＋新版本，没有多出重传版本，完成后没有残留 multipart upload。
+初次 harness 错把 Cluster 扫描表的共享命名用于 catalogue，前两项通过后在集群查询遇到 404；该整体失败报告不作为通过证据。
+修正为两种部署均有的 catalogue 前端 base_<job> 后，以上完整四项通过。单机／集群的物理差异仍只由 db 决定。
+
+另外，结构候选所用的实际 app 扫描 API 已在真实 Linux NFSv4.1 的 READDIR 链路通过 **6 项受控故障验证**：
+`/work/terrasync-db-refactor-evidence/release-db-refactor-nfs-source-fault-20261106-045234/report.json`。
+
+只通过本轮 TCP 代理识别和转发实际 RPC，不修改共享服务。覆盖正常、0.5 秒闪断、持续重置、静默不转发，以及重置／静默期间取消；每项解除代理故障后重新扫描成功。
+成功的初次扫描和恢复扫描均核对 **68 条实际条目**，没有重放重复累计。
+闪断从注入到成功约 0.71 秒；持续故障约 3.42 秒退出；静默故障约 4.02 秒退出（包含配置的 1 秒检测时限）；取消约 0.041 秒。
+这些是从注入开始的实际观察值，不伪装为精确的识别后耗时。该 NFS 组关闭 DB，不能计成 NFS+Single／Cluster 故障组合验证。
+
+最终候选的其余 S3／HA Kerberos HDFS 回归正在执行；网络矩阵采用 5 秒 ClickHouse 读时限的完整复测尚未收尾。
+相同模式的性能／RSS 验收、最终 PR 状态及 worktree 清理尚未完成。
