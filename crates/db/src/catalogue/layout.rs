@@ -10,6 +10,9 @@ use crate::error::{DatabaseError, Result};
 use crate::schema::identifier;
 use crate::schema::records::ExcludeRecord;
 
+// 普通请求默认禁用去重；只有显式 token 的写入启用该建表能力。
+pub(super) const SINGLE_WRITE_SETTINGS: &str = "non_replicated_deduplication_window=10000";
+
 #[derive(Clone)]
 pub(super) struct ClusterCatalogue {
     cluster: String,
@@ -155,7 +158,7 @@ impl ClickHouseDatabase {
     ) -> Result<()> {
         let Some(cluster) = &self.catalogue_cluster else {
             self.execute(&format!(
-                "CREATE TABLE IF NOT EXISTS {table} ({columns}) ENGINE = {}() ORDER BY {order} SETTINGS allow_nullable_key = 1",
+                "CREATE TABLE IF NOT EXISTS {table} ({columns}) ENGINE = {}() ORDER BY {order} SETTINGS allow_nullable_key = 1, {SINGLE_WRITE_SETTINGS}",
                 engine.name(false)
             ), &[]).await?;
             return Ok(());

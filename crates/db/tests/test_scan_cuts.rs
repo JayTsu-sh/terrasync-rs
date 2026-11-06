@@ -151,7 +151,6 @@ impl Fixture {
         store.load_resume_state().await?;
         store.initialize().await?;
         store.prepare_incremental().await?;
-        store.prepare_native_writes().await?;
         Ok(store)
     }
 }
@@ -242,6 +241,20 @@ async fn exercise(fixture: &Fixture) -> Result<()> {
     assert_eq!(fixture.rows("base", job).await?, ["old", "prefix"]);
     assert_eq!(fixture.rows("incremental", job).await?, ["old", "prefix"]);
     assert_eq!(fixture.rows("base", "scan_b").await?, ["unrelated"]);
+    if fixture.cluster.is_none() {
+        let definition = fixture
+            .client
+            .query("SELECT create_table_query FROM system.tables WHERE database=currentDatabase() AND name=?")
+            .bind(format!("base_{job}"))
+            .fetch_one::<String>()
+            .await?;
+        assert!(
+            definition
+                .replace(' ', "")
+                .contains("non_replicated_deduplication_window=10000"),
+            "恢复分区不能丢失 working 表的写入去重能力"
+        );
+    }
     let scope = if fixture.cluster.is_some() {
         " AND job_id='scan_a'"
     } else {

@@ -1,6 +1,7 @@
 #![allow(clippy::unwrap_used)]
 use super::*;
 use crate::execution::queries::idempotent_insert_client;
+use crate::{ClickHouseDatabase, get_scan_state_table_name};
 use clickhouse::{Compression, error::Error as ClickHouseError};
 use serde::Serialize;
 use std::{
@@ -209,20 +210,23 @@ async fn ordinary_writes_do_not_inherit_scan_block_deduplication() -> Result<()>
         read_timeout: 10,
     };
     let client = build_client(&config, None)?.with_validation(false);
-    let table = format!("ts_http_dedup_scope_{}", Uuid::new_v4().simple());
-    client.query(&format!("CREATE TABLE {table} (id UInt8,generation UInt8) ENGINE=ReplacingMergeTree ORDER BY id SETTINGS non_replicated_deduplication_window=10000")).execute().await?;
+    let job = format!("ts_http_dedup_scope_{}", Uuid::new_v4().simple());
+    let table = get_scan_state_table_name(&job);
+    ClickHouseDatabase::new(&config, &job)?
+        .create_scan_state_table()
+        .await?;
     let checked = async {
         // 物理行数用于验证真正的重发抑制，不能让后台合并掩盖重复插入。
         client.query(&format!("SYSTEM STOP MERGES {table}")).execute().await?;
         let mut states = Vec::new();
         for value in [0, 1, 0] {
             client
-                .query(&format!("INSERT INTO {table} VALUES (1,{value})"))
+                .query(&format!("INSERT INTO {table} (id,scan_state) VALUES (1,{value})"))
                 .execute()
                 .await?;
             states.push(
                 client
-                    .query(&format!("SELECT generation FROM {table} FINAL WHERE id=1"))
+                    .query(&format!("SELECT scan_state FROM {table} FINAL WHERE id=1"))
                     .fetch_one::<u8>()
                     .await?,
             );
@@ -230,7 +234,7 @@ async fn ordinary_writes_do_not_inherit_scan_block_deduplication() -> Result<()>
         let retry = idempotent_insert_client(&client);
         for _ in 0..2 {
             retry
-                .query(&format!("INSERT INTO {table} VALUES (2,7)"))
+                .query(&format!("INSERT INTO {table} (id,scan_state) VALUES (2,1)"))
                 .execute()
                 .await?;
         }
@@ -239,7 +243,7 @@ async fn ordinary_writes_do_not_inherit_scan_block_deduplication() -> Result<()>
             .fetch_one::<u64>()
             .await?;
         idempotent_insert_client(&client)
-            .query(&format!("INSERT INTO {table} VALUES (2,7)"))
+            .query(&format!("INSERT INTO {table} (id,scan_state) VALUES (2,1)"))
             .execute()
             .await?;
         let new_intent_rows = client

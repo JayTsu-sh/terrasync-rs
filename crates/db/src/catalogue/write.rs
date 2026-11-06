@@ -1,7 +1,6 @@
 //! Native observation batches and acknowledged versions written to the catalogue.
 
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
 
 use data_mover::model::ObservedEntry;
 use serde_json::Value;
@@ -14,7 +13,6 @@ use super::ClickHouseDatabase;
 use crate::error::{DatabaseError, Result};
 use crate::execution::queries::ScanExecute;
 use crate::execution::queries::check_scan_cancellation;
-use crate::execution::recovery::RequestSafety;
 use crate::get_incremental_scan_base_table_name;
 use crate::get_scan_base_table_name;
 use crate::get_tar_manifest_table_name;
@@ -26,14 +24,6 @@ fn observation_views(entry: &Arc<ObservedEntry>) -> ObservedViews<'_> {
 }
 
 impl ClickHouseDatabase {
-    pub(super) fn native_insert_safety(&self) -> RequestSafety {
-        if self.native_dedup_ready.load(Ordering::Acquire) {
-            RequestSafety::IdempotentWrite
-        } else {
-            RequestSafety::UnconfirmedWrite
-        }
-    }
-
     /// 执行SQL语句，支持参数化查询
     ///
     /// 注意：由于ClickHouse execute API的限制，当前无法获取受影响的行数

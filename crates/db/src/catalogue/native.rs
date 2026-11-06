@@ -1,16 +1,14 @@
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
 
 use data_mover::model::ObservedEntry;
 use rustc_hash::{FxHashMap, FxHashSet};
 use smol_str::SmolStr;
 use task_model::observation::{ObservedScanEvent, ObservedView};
-use utils::sanitize_job_id;
 
 use super::ClickHouseDatabase;
-use crate::execution::queries::execution_active;
 use crate::execution::queries::{ScanExecute, check_scan_cancellation, execute_request, idempotent_insert_client};
 use crate::execution::read::QuorumRead;
+use crate::execution::recovery::RequestSafety;
 use crate::scan::ScanFinalEvent;
 use crate::scan::candidate_cache::CandidateMetadataCache;
 use crate::scan::compare::NativeScanAccess;
@@ -18,37 +16,9 @@ use crate::scan::rows::{NativeScanKey, NativeScanRecord, NativeWriteBatches, OBS
 use crate::scan::rows::{final_event_records, incremental_record};
 use crate::schema::identity::PERSISTED_IDENTITY_PREFIX;
 use crate::schema::records::IncrementalStorageEntryRecord;
-use crate::{
-    DatabaseError, Result, get_incremental_scan_base_table_name, get_scan_base_table_name, get_scan_state_table_name,
-};
+use crate::{DatabaseError, Result, get_incremental_scan_base_table_name, get_scan_base_table_name};
 
 impl ClickHouseDatabase {
-    pub(crate) async fn prepare_native_writes(&self) -> Result<()> {
-        let tables = [
-            get_scan_base_table_name(&self.job_id),
-            format!("scan_resume_batch_{}", sanitize_job_id(&self.job_id)),
-        ];
-        if execution_active() {
-            for table in tables.into_iter().chain([
-                get_incremental_scan_base_table_name(&self.job_id),
-                get_scan_state_table_name(&self.job_id),
-                self.resume_table(),
-            ]) {
-                // staging 只在增量批次开始时创建；全量扫描不应为了设置而创建空表。
-                if table.starts_with("scan_resume_batch_") && !self.table_exists(&table).await? {
-                    continue;
-                }
-                self.sync_client
-                    .query(&format!(
-                        "ALTER TABLE {table} MODIFY SETTING non_replicated_deduplication_window=10000"
-                    ))
-                    .execute_idempotent_scan()
-                    .await?;
-            }
-            self.native_dedup_ready.store(true, Ordering::Release);
-        }
-        Ok(())
-    }
     pub(crate) async fn write_native_keys(&self, entries: &[Arc<ObservedEntry>]) -> Result<()> {
         check_scan_cancellation()?;
         if entries.is_empty() {
@@ -56,7 +26,7 @@ impl ClickHouseDatabase {
         }
         let access = self.native_access().await?;
         let client = idempotent_insert_client(&self.sync_client).with_validation(false);
-        execute_request(self.native_insert_safety(), || async {
+        execute_request(RequestSafety::IdempotentWrite, || async {
             let mut insert = client.insert::<NativeScanKey>(&access.stage).await?;
             for entry in entries {
                 for view in ObservedView::all(entry) {
@@ -105,7 +75,7 @@ impl ClickHouseDatabase {
                 cache.apply(row);
             }
             let client = idempotent_insert_client(&self.sync_client).with_validation(false);
-            execute_request(self.native_insert_safety(), || async {
+            execute_request(RequestSafety::IdempotentWrite, || async {
                 let mut insert = client.insert::<NativeScanRecord>(table).await?;
                 for row in &rows {
                     insert.write(row).await?;
@@ -206,7 +176,7 @@ impl ClickHouseDatabase {
             };
         }
         let client = idempotent_insert_client(&self.sync_client);
-        execute_request(self.native_insert_safety(), || async {
+        execute_request(RequestSafety::IdempotentWrite, || async {
             let mut insert = client.insert::<IncrementalStorageEntryRecord>(&table).await?;
             for record in &records {
                 insert.write(record).await?;

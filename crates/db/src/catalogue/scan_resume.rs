@@ -11,9 +11,11 @@ use task_model::StorageEntryMessage;
 use utils::sanitize_job_id;
 
 use super::ClickHouseDatabase;
+use super::layout::SINGLE_WRITE_SETTINGS;
 use super::lifecycle::ScanGenerationLifecycle;
 use crate::execution::queries::{ScanExecute, execute_request, idempotent_insert_client};
 use crate::execution::read::QuorumRead;
+use crate::execution::recovery::RequestSafety;
 use crate::scan::model::{ABANDONED, FINALIZING, RUNNING, ScanResumeState};
 use crate::schema::columns::FILE_SCAN_COLUMNS_DEFINITION;
 use crate::schema::records::IncrementalStorageEntryRecord;
@@ -43,7 +45,7 @@ impl ClickHouseDatabase {
              request_key String, generation UInt8, incremental Bool, phase UInt8, event_time Int64, \
              observed_entries UInt64, checkpoint Array(UInt8), statistics String DEFAULT '', \
              baseline_snapshot String DEFAULT '', checkpoint_snapshot String DEFAULT '') \
-             ENGINE = ReplacingMergeTree(version) ORDER BY id"
+             ENGINE = ReplacingMergeTree(version) ORDER BY id SETTINGS {SINGLE_WRITE_SETTINGS}"
             ),
             &[],
         )
@@ -69,7 +71,7 @@ impl ClickHouseDatabase {
     pub async fn save_resume_state(&self, state: &ScanResumeState) -> Result<()> {
         state.validate_envelope()?;
         let client = idempotent_insert_client(&self.sync_client);
-        execute_request(self.native_insert_safety(), || async {
+        execute_request(RequestSafety::IdempotentWrite, || async {
             let mut insert = client.insert::<ScanResumeState>(&self.resume_table()).await?;
             insert.write(state).await?;
             insert.end().await?;
@@ -99,7 +101,7 @@ impl ClickHouseDatabase {
         self.execute(
             &format!(
                 "CREATE TABLE IF NOT EXISTS {table} ({FILE_SCAN_COLUMNS_DEFINITION}) \
-             ENGINE = MergeTree() ORDER BY (relative_path, version_id, identity_key) SETTINGS allow_nullable_key = 1, non_replicated_deduplication_window = 10000"
+             ENGINE = MergeTree() ORDER BY (relative_path, version_id, identity_key) SETTINGS allow_nullable_key = 1, {SINGLE_WRITE_SETTINGS}"
             ),
             &[],
         )

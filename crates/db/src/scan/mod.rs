@@ -193,12 +193,6 @@ impl ScanStore {
             Store::Cluster(store) => store.prepare_incremental().await,
         }
     }
-    pub async fn prepare_native_writes(&self) -> Result<()> {
-        match &self.inner {
-            Store::Single(store) => store.prepare_native_writes().await,
-            Store::Cluster(_) => Ok(()),
-        }
-    }
     pub async fn has_baseline(&self) -> Result<bool> {
         match &self.inner {
             Store::Single(store) => store.has_committed_baseline().await,

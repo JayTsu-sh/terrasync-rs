@@ -369,7 +369,6 @@ mod clickhouse_integration_tests {
         store.initialize().await.unwrap();
         store.prepare_incremental().await.unwrap();
         store.load_resume_state().await.unwrap();
-        store.prepare_native_writes().await.unwrap();
         let generation = store.begin_scan_generation().await.unwrap();
         let state = ScanResumeState {
             id: 1,
@@ -456,6 +455,7 @@ mod clickhouse_integration_tests {
     async fn native_single_fresh_schema_includes_candidate_hash_on_all_tables() {
         let (_database, config, job, cleanup) = setup_isolated_state_db("cache_schema").await;
         let mut store = ScanStore::new(&config, &job).unwrap();
+        store.load_resume_state().await.unwrap();
         store.initialize().await.unwrap();
         store.prepare_incremental().await.unwrap();
         store.begin_resume_batch().await.unwrap();
@@ -466,6 +466,20 @@ mod clickhouse_integration_tests {
             .await
             .unwrap();
         assert_eq!(count, 3);
+        let definitions = client
+            .query("SELECT create_table_query FROM system.tables WHERE database=currentDatabase() AND engine IN ('MergeTree','ReplacingMergeTree')")
+            .fetch_all::<String>()
+            .await
+            .unwrap();
+        assert_eq!(definitions.len(), 5);
+        for definition in definitions {
+            assert!(
+                definition
+                    .replace(' ', "")
+                    .contains("non_replicated_deduplication_window=10000"),
+                "原生写入表必须由建表契约提供去重窗口: {definition}"
+            );
+        }
         cleanup.cleanup().await;
     }
 

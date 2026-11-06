@@ -1,7 +1,7 @@
 //! ClickHouse 目录的连接构造及已提交基线保护。
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU8, Ordering};
 
 use clickhouse::Client;
 use tracing::debug;
@@ -49,7 +49,6 @@ impl ClickHouseDatabase {
             scan_temp_table_name: None,
             cached_scan_state: AtomicU8::new(255),
             resume_base_has_typed_handles: None,
-            native_dedup_ready: AtomicBool::new(false),
             generation_lifecycle: Arc::new(CatalogueLifecycle::default()),
         })
     }
@@ -65,7 +64,6 @@ impl Clone for ClickHouseDatabase {
             scan_temp_table_name: self.scan_temp_table_name.clone(),
             cached_scan_state: AtomicU8::new(self.cached_scan_state.load(Ordering::Relaxed)),
             resume_base_has_typed_handles: self.resume_base_has_typed_handles,
-            native_dedup_ready: AtomicBool::new(self.native_dedup_ready.load(Ordering::Acquire)),
             generation_lifecycle: Arc::clone(&self.generation_lifecycle),
         }
     }

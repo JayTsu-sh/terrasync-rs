@@ -480,3 +480,42 @@ fmt、workspace all-features/all-targets check／Clippy、workspace **539 通过
 本轮峰值 RSS：原主分支 Single 240.4／Cluster 291.0 MiB，候选 Single 252.9／Cluster 333.0 MiB。
 前／后段 p90 的运行内差值中位数均为负；这仅说明本轮采样未见持续单调增长，不证明任意规模无泄漏。
 约 200 MiB 目标未达。当前 schema 清理候选的生产至少 60 秒 checkpoint 恢复成本另行验证，不与该热缓存诊断混为同一性能 profile。
+
+
+## 去重能力归入建表契约
+
+Single 的去重窗口通过完整建表定义一次确定：catalogue 两种 MergeTree 引擎、resume manifest 和 stage 共用 SINGLE_WRITE_SETTINGS。
+删除重复 ALTER、公开 prepare 协议、app 两处准备调用和 readiness AtomicBool。
+仅五处在重试外生成稳定 token 的 INSERT 使用 IdempotentWrite；Memory 操作、INSERT SELECT 和普通 SQL 的安全分类未放宽。
+普通连接仍默认 deduplicate_insert=disable，新 token 表达新的写入意图，不依赖内容相同来抑制正常写入。
+
+实际 owned state 建表回归先红后绿：旧 DDL 的同 token 重发产生 2 个物理行；新 DDL 为 1 个物理行，新 token 的相同内容产生第二行。
+普通 0→1→0 写入仍完整可见。证据 `/tmp/terrasync-ddl-window-{red,green}.log`。
+真实 fresh Single 五表均检查窗口；恢复 checkpoint 后检查 working 表仍有该设置。
+恢复只 DROP／ATTACH working 分区，没有重建其 DDL；不把快照设置继承当作已测试的重试前提。
+
+候选 `/work/terrasync-db-refactor-ddl-window`，SHA-256
+`9f0c14a70d76ac98aa3c9634cca40cd78e851dc9b243dc491cd2cfcaa3b4f39f`；
+来源 `/tmp/terrasync-ddl-window-build-source.json`，基于 9508426 加本轮修改。
+fmt、workspace all-features/all-targets check／Clippy、**539 项 workspace＋16 项双进程 E2E** 均通过，86 忽略项和既有警告另计。
+日志 `/tmp/terrasync-ddl-window-final-{fmt,check,clippy,tests,e2e}.log`。
+真实 DB 契约 **76 项通过**，报告 `/tmp/terrasync-db-refactor-real-ddl-window-v1-{suite}.json`；所有临时库清理成功。
+两轴审查通过；未把旧表的零窗口配置列为支持的恢复输入，开发旧表需清理重建。
+本轮 API 故障探针 `/work/terrasync-db-refactor-scan-probe-ddl-window`，SHA-256
+`3bc173026b2dad419495fe33e286b97c66f07ef4d874b4aef5a75eb9dce33d8c`；精确驱动／manifest／应用来源在 `/tmp/terrasync-ddl-window-scan-probe-source.json`。
+
+## 生产周期恢复诊断与性能验收数据源调整
+
+schema 清理候选 26169e50 在旧 Linux NFS 的受控延迟 profile 完成 **6 项生产周期强退恢复**，报告
+`/work/terrasync-db-refactor-evidence/release-db-refactor-production-resume-20261106-062302/report.json`。
+200000 文件＋200 目录，READDIR 额外 0.5 秒、concurrency 1；无 DB blocks 为 105.78 秒。
+每项在至少 60 秒实际 checkpoint 后强退并从新工作目录恢复；最终事实、唯一条目和累计统计均为 200200，临时库已清理。
+Single full／incremental0／incremental1 总活动时间 107.03／107.30／106.49 秒，吞吐损失 1.17%／1.41%／0.67%。
+Cluster 对应 121.90／122.38／120.00 秒，损失 13.22%／13.56%／11.85%，均未达到其目标。
+报告 functional_passed=true、passed=false，不能把整套写为性能通过。
+
+用户随后明确性能数据源使用整个 `nfs://10.131.5.221/m1-source`，功能回归可使用小目录。
+上述旧 share、受控延迟以及已取消的旧 share 新候选基准仅保留为诊断，不作为指定 NAS 的最终验收。
+指定 NAS 的原生 NFSv3 只读连通探测通过；v4.1 返回 RPC service unavailable，不计通过。
+首轮 whole-share 只读校准触及 harness 的 900 秒预算，未完成，不作为已完成的无 DB 基线。
+已保留明确失败记录；源数据没有改动，后续长时基准按用户指定的四种 Cluster 场景执行，并分别匹配 unordered／blocks 无 DB 基线。

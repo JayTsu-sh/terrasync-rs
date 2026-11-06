@@ -12,6 +12,7 @@ use crate::error::{DatabaseError, Result};
 use crate::execution::queries::execute_request;
 use crate::execution::queries::idempotent_insert_client;
 use crate::execution::read::QuorumRead;
+use crate::execution::recovery::RequestSafety;
 use crate::{get_scan_base_table_name, get_scan_state_table_name};
 
 impl ClickHouseDatabase {
@@ -57,7 +58,7 @@ impl ClickHouseDatabase {
         debug!("Inserting scan state: id=1, scan_state={}", scan_state);
 
         let client = idempotent_insert_client(&self.catalogue_write_client(&self.sync_client));
-        execute_request(self.native_insert_safety(), || {
+        execute_request(RequestSafety::IdempotentWrite, || {
             let query = client
                 .query(&insert_sql)
                 .bind(1u8)

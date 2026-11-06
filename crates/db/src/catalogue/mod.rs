@@ -1,6 +1,6 @@
 //! Task-owned ClickHouse catalogue. Single/Cluster placement is private to layout.
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU8};
+use std::sync::atomic::AtomicU8;
 
 use clickhouse::Client;
 
@@ -49,7 +49,6 @@ pub struct ClickHouseDatabase {
     cached_scan_state: AtomicU8,
     /// 每次扫描实例只检查一次旧基线的身份格式，避免每批全表统计。
     resume_base_has_typed_handles: Option<bool>,
-    native_dedup_ready: AtomicBool,
     /// 由本任务显式克隆的目录实例共享的代次与写入协调状态
     generation_lifecycle: Arc<CatalogueLifecycle>,
 }
