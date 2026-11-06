@@ -1,7 +1,23 @@
 //! 持久化扫描游标：结果与事件写入确认后才能推进游标。
-use super::*;
-use crate::scan::model::{ABANDONED, FINALIZING, RUNNING, ScanResumeState};
+
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
+use std::sync::atomic::Ordering;
+
 use clickhouse::error::Error as ClickHouseError;
+use data_mover::model::ObservedEntry;
+use serde::Serialize;
+use task_model::StorageEntryMessage;
+use utils::sanitize_job_id;
+
+use super::ClickHouseDatabase;
+use super::lifecycle::ScanGenerationLifecycle;
+use crate::execution::queries::{ScanExecute, execute_request, idempotent_insert_client};
+use crate::execution::read::QuorumRead;
+use crate::scan::model::{ABANDONED, FINALIZING, RUNNING, ScanResumeState};
+use crate::schema::columns::FILE_SCAN_COLUMNS_DEFINITION;
+use crate::schema::records::IncrementalStorageEntryRecord;
+use crate::{DatabaseError, Result, get_incremental_scan_base_table_name, get_scan_base_table_name};
 
 #[derive(Serialize, clickhouse::Row)]
 struct ResumeDeleteKey {
@@ -74,8 +90,8 @@ impl ClickHouseDatabase {
         .await
     }
 
-    pub async fn invalidate_resume_state(&self) -> Result<()> {
-        if !self.check_table_exists(&self.resume_table()).await? {
+    pub async fn abandon_scan_resume(&self) -> Result<()> {
+        if !self.table_exists(&self.resume_table()).await? {
             return Ok(());
         }
         if let Some(mut state) = self.load_resume_state().await?
@@ -159,7 +175,7 @@ impl ClickHouseDatabase {
     /// 即使运行节点时钟回拨，本轮也从历史事件之后开始。
     pub async fn resume_event_epoch(&self, now: i64) -> Result<i64> {
         let table = get_incremental_scan_base_table_name(&self.job_id);
-        if !self.check_table_exists(&table).await? {
+        if !self.table_exists(&table).await? {
             return Ok(now);
         }
         let last = self
@@ -344,7 +360,7 @@ mod tests {
 impl ClickHouseDatabase {
     /// 未完成全量即使已有 job 目录或 base 表也仍是全量续扫。
     pub async fn resume_execution_is_incremental(&self) -> Result<bool> {
-        if self.check_table_exists(&self.resume_table()).await? {
+        if self.table_exists(&self.resume_table()).await? {
             match self
                 .sync_client
                 .query(&format!(

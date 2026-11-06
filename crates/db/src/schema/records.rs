@@ -1,15 +1,25 @@
 //! `ClickHouse` 目录行及事件行的编码；查询和任务入口不暴露 SQL 行 DTO。
-use crate::error::{DatabaseError, Result};
-use crate::scan::rows::{capture_summary, incremental_record};
-use crate::schema::entry::EntrySummary;
+
+use std::{collections::BTreeMap, path::Path, time::SystemTime};
+
 use data_mover::model::{BackendIdentity, BackendKind};
 use serde::{Deserialize, Serialize};
-use std::{collections::BTreeMap, path::Path, time::SystemTime};
 use task_model::observation::ObservedView;
 use {
     data_mover::model::ObservedEntry,
     task_model::{ObservedEntryExt, StorageEntryMessage},
 };
+
+use crate::error::{DatabaseError, Result};
+use crate::scan::rows::{capture_summary, incremental_record};
+use crate::schema::entry::EntrySummary;
+
+/// Borrowed exclusion keys are serialized while the classification owns their strings.
+#[derive(clickhouse::Row, Serialize)]
+pub(crate) struct ExcludeRecord<'a> {
+    pub relative_path: &'a str,
+    pub version_id: &'a str,
+}
 
 /// 文件扫描记录结构体
 /// 统一的数据结构，用于存储文件系统扫描结果

@@ -1,8 +1,9 @@
 //! 首次基线由代次提交发布，不能从建表推断扫描完成。
 #![allow(clippy::unwrap_used)]
-use super::*;
+use super::ClickHouseDatabase;
 use crate::ClickHouseConfig;
 use crate::execution::base_client;
+use crate::{DatabaseError, Result};
 use clickhouse::test::{Mock, handlers};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -144,7 +145,7 @@ async fn real_reopen_before_first_resume_state_remains_full_until_commit() -> Re
     database.initialize().await?;
     drop(database);
     let reopened = ClickHouseDatabase::new(&config, "first_full").unwrap();
-    assert!(!reopened.check_table_exists("scan_resume_first_full").await?);
+    assert!(!reopened.table_exists("scan_resume_first_full").await?);
     assert!(!reopened.has_committed_baseline().await?);
     assert!(!reopened.resume_execution_is_incremental().await?);
     assert_eq!(reopened.begin_scan_generation().await?, 1);

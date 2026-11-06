@@ -1980,7 +1980,6 @@ dependencies = [
 name = "db"
 version = "0.2.0"
 dependencies = [
- "async-trait",
  "blake3",
  "bytes 1.12.1",
  "clickhouse",

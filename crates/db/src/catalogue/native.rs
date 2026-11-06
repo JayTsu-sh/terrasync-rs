@@ -1,14 +1,26 @@
-use super::*;
+use std::sync::Arc;
+use std::sync::atomic::Ordering;
+
+use data_mover::model::ObservedEntry;
+use rustc_hash::{FxHashMap, FxHashSet};
+use smol_str::SmolStr;
+use task_model::observation::{ObservedScanEvent, ObservedView};
+use utils::sanitize_job_id;
+
+use super::ClickHouseDatabase;
 use crate::execution::queries::execution_active;
+use crate::execution::queries::{ScanExecute, check_scan_cancellation, execute_request, idempotent_insert_client};
+use crate::execution::read::QuorumRead;
 use crate::scan::ScanFinalEvent;
 use crate::scan::candidate_cache::{CandidateMetadataCache, missing_hash_columns};
 use crate::scan::compare::NativeScanAccess;
 use crate::scan::rows::{NativeScanKey, NativeScanRecord, NativeWriteBatches, OBSERVED_COLUMNS, event_records};
 use crate::scan::rows::{final_event_records, incremental_record};
 use crate::schema::identity::PERSISTED_IDENTITY_PREFIX;
-use rustc_hash::{FxHashMap, FxHashSet};
-use smol_str::SmolStr;
-use task_model::observation::{ObservedScanEvent, ObservedView};
+use crate::schema::records::IncrementalStorageEntryRecord;
+use crate::{
+    DatabaseError, Result, get_incremental_scan_base_table_name, get_scan_base_table_name, get_scan_state_table_name,
+};
 
 impl ClickHouseDatabase {
     pub(crate) async fn prepare_native_schema(&self) -> Result<()> {
@@ -32,7 +44,7 @@ impl ClickHouseDatabase {
                 self.resume_table(),
             ]) {
                 // staging 只在增量批次开始时创建；全量扫描不应为了设置而创建空表。
-                if table.starts_with("scan_resume_batch_") && !self.check_table_exists(&table).await? {
+                if table.starts_with("scan_resume_batch_") && !self.table_exists(&table).await? {
                     continue;
                 }
                 self.sync_client

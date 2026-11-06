@@ -1,16 +1,18 @@
-use super::*;
-use crate::storage_factory::{StorageRole, create_storage_for_role};
-use clickhouse::Client;
-use db::catalogue::ClickHouseDatabase;
-use db::{ClickHouseConfig, CopyGenerationStatus, DatabaseError};
 use std::future::pending;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
+
+use clickhouse::Client;
+use db::catalogue::ClickHouseDatabase;
+use db::{ClickHouseConfig, CopyGenerationStatus, DatabaseError};
 use task_model::ObservedEntryExt;
 use tempfile::TempDir;
 use tokio::sync::{Notify, oneshot};
 use tokio::time::{Duration, timeout};
 use utils::app_config::ClickHouseMode;
+
+use super::*;
+use crate::storage_factory::{StorageRole, create_storage_for_role};
 
 async fn target(root: &TempDir) -> Result<Arc<StorageContext>> {
     Ok(Arc::new(
@@ -170,7 +172,7 @@ async fn isolated_generation_case(mode: ClickHouseMode) -> Result<()> {
         .await
         .map_err(DatabaseError::from)?;
     let outcome = async {
-        let database: Box<dyn Database> = Box::new(ClickHouseDatabase::new(&config, "completion")?);
+        let database: ClickHouseDatabase = ClickHouseDatabase::new(&config, "completion")?;
         database.initialize().await?;
         database
             .begin_copy_generation("directory-completion-regression")

@@ -1,11 +1,12 @@
 //! 复制轮次收尾：目录元数据全部确认后才允许数据库提交。
-use data_mover::model::BackendKind;
+
 use std::sync::Arc;
 use std::thread::JoinHandle as ThreadHandle;
-use task_model::ObservedEntryExt;
 
-use db::Database;
+use data_mover::model::BackendKind;
+use db::ClickHouseDatabase;
 use storage_adapter::{ObservedEntry, StorageContext};
+use task_model::ObservedEntryExt;
 use tokio::sync::mpsc::{self, Receiver};
 use tokio::task::{JoinError, JoinHandle, JoinSet};
 use tokio_util::task::AbortOnDropHandle;
@@ -40,7 +41,7 @@ impl Drop for DirectoryProgress {
     }
 }
 
-pub(crate) async fn complete(database: Box<dyn Database>, destination: Arc<StorageContext>) -> Result<()> {
+pub(crate) async fn complete(database: ClickHouseDatabase, destination: Arc<StorageContext>) -> Result<()> {
     if destination.storage().kind() != BackendKind::S3 {
         update_directories(database.clone(), destination).await?;
     }
@@ -48,7 +49,7 @@ pub(crate) async fn complete(database: Box<dyn Database>, destination: Arc<Stora
     Ok(())
 }
 
-async fn update_directories(database: Box<dyn Database>, destination: Arc<StorageContext>) -> Result<()> {
+async fn update_directories(database: ClickHouseDatabase, destination: Arc<StorageContext>) -> Result<()> {
     let (sender, receiver) = mpsc::channel(1000);
     let query = tokio::spawn(
         async move {

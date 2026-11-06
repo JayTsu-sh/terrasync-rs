@@ -1,7 +1,11 @@
 //! 扫描完成时从幂等结果汇总统计，排除目录检查点重放造成的重复观察。
-use super::*;
-use crate::scan::model::{ScanEventStatistics, ScanEventSummary, ScanResumeStatistics, ScanResumeSummary};
+
 use std::time::{SystemTime, UNIX_EPOCH};
+
+use super::ClickHouseDatabase;
+use crate::execution::read::QuorumRead;
+use crate::scan::model::{ScanEventStatistics, ScanEventSummary, ScanResumeStatistics, ScanResumeSummary};
+use crate::{Result, get_incremental_scan_base_table_name, get_scan_base_table_name};
 
 impl ClickHouseDatabase {
     pub async fn resume_statistics(&self, generation: u8, event_time: Option<i64>) -> Result<ScanResumeStatistics> {
@@ -46,7 +50,7 @@ mod tests {
         execution::read::tests::server,
         scan::{ScanDatabaseExecution, with_scan_cancellation},
     };
-    use clickhouse::Compression;
+    use clickhouse::{Client, Compression};
     use tokio_util::sync::CancellationToken;
 
     #[tokio::test]

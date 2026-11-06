@@ -17,6 +17,7 @@ use std::time::{Duration, Instant};
 
 // 外部crate
 use data_mover::model::ObservedEntry;
+use db::ClickHouseDatabase;
 use task_model::observation::ObservedScanEvent;
 use task_model::{ErrorEvent, StorageEntryMessage};
 use tokio::sync::Mutex;
@@ -38,7 +39,6 @@ use crate::consumer::traits::Consumer;
 use crate::error::{AppError, Result};
 use crate::scan::statistics::{ScanCapabilities, ScanCounts, ScanSnapshot};
 use data_mover::traversal::TraversalRecoveryStatus;
-use db::Database;
 use db::scan::ScanFinalEvent;
 use db::scan::ScanResumeStatistics;
 
@@ -456,7 +456,7 @@ impl ConsumerManager {
 
     /// A copy pipeline explicitly shares the catalogue that began its generation.
     pub(crate) async fn with_database(
-        consumer_config: &ConsumerConfig, database: Option<Box<dyn Database>>,
+        consumer_config: &ConsumerConfig, database: Option<ClickHouseDatabase>,
     ) -> Result<Self> {
         let consumer = match (consumer_config.db_config.enabled, database) {
             (true, Some(database)) => Some(DatabaseConsumer::with_database(consumer_config, database).await?),

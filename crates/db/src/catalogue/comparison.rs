@@ -1,5 +1,17 @@
 //! 比对批次的暂存、分类、发布及清理。分类结果重新绑定输入观察，保留源端版本顺序。
+
+use std::sync::Arc;
+
+use data_mover::model::ObservedEntry;
+use serde::Deserialize;
+use tracing::{debug, info};
+use {
+    task_model::observation::{ObservedItem, ObservedView},
+    task_model::{ChangeKind, EntryChange},
+};
+
 use super::ClickHouseDatabase;
+use crate::scan::rows::OBSERVED_COLUMNS;
 use crate::schema::columns::{
     CATALOGUE_COLUMNS as FILE_SCAN_COLUMNS_LIST,
     CATALOGUE_COLUMNS_WITH_T_PREFIX as FILE_SCAN_COLUMNS_LIST_WITH_T_PREFIX,
@@ -8,15 +20,11 @@ use crate::{
     error::{DatabaseError, Result},
     execution::read::QuorumRead,
     get_scan_base_table_name,
-    traits::Database,
 };
-use data_mover::model::ObservedEntry;
-use serde::Deserialize;
-use std::sync::Arc;
-use {
-    task_model::observation::{ObservedItem, ObservedView},
-    task_model::{ChangeKind, EntryChange},
-};
+
+#[cfg(test)]
+#[path = "comparison/session_tests.rs"]
+mod session_tests;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ComparisonMode {
@@ -25,10 +33,10 @@ pub enum ComparisonMode {
 }
 
 /// 只携带分类所需的主键，不重新解码或复制输入观察。
-pub struct CatalogueDifference {
-    pub relative_path: String,
-    pub version_id: String,
-    pub kind: EntryChange,
+struct CatalogueDifference {
+    relative_path: String,
+    version_id: String,
+    kind: EntryChange,
 }
 pub struct CatalogueChange {
     pub item: ObservedItem,
@@ -43,7 +51,7 @@ struct DifferenceRow {
 }
 
 impl ClickHouseDatabase {
-    pub(super) async fn classify_batch(&self) -> Result<Vec<CatalogueDifference>> {
+    async fn classify_batch(&self) -> Result<Vec<CatalogueDifference>> {
         let temporary = self
             .scan_temp_table_name
             .as_deref()
@@ -169,34 +177,38 @@ fn bind_input_order(
     Ok(changes)
 }
 
-pub(crate) async fn compare_catalogue_batch(
-    mut database: Box<dyn Database>, entries: &[Arc<ObservedEntry>], mode: ComparisonMode,
-) -> Result<Vec<CatalogueChange>> {
-    database.create_scan_temporary_table().await?;
-    let operation = async {
-        database.batch_insert_temp_record(entries).await?;
-        let mut differences = database.classify_catalogue_items().await?;
-        let changes = bind_input_order(entries, &mut differences)?;
-        // 复用分类查询拥有的主键；不再次复制观察中的路径／版本字符串。
-        let excluded = match mode {
-            ComparisonMode::PublishObserved => Vec::new(),
-            ComparisonMode::AwaitCopyAcknowledgement => differences
-                .into_iter()
-                .map(|row| (row.relative_path, row.version_id))
-                .collect(),
-        };
-        database.insert_temp_to_base_table(&excluded).await?;
-        Ok(changes)
-    }
-    .await;
-    let cleanup = database.drop_scan_temporary_table().await;
-    match (operation, cleanup) {
-        (Ok(changes), Ok(())) => Ok(changes),
-        (Err(source), Ok(())) | (Ok(_), Err(source)) => Err(source),
-        (Err(source), Err(cleanup)) => Err(DatabaseError::CatalogueBatchCleanupFailed {
-            source: Box::new(source),
-            cleanup: Box::new(cleanup),
-        }),
+impl ClickHouseDatabase {
+    /// Owns comparison staging and cleanup; results share the selected input observations.
+    pub async fn compare_catalogue_batch(
+        &self, entries: &[Arc<ObservedEntry>], mode: ComparisonMode,
+    ) -> Result<Vec<CatalogueChange>> {
+        let mut database = self.clone();
+        database.create_scan_temporary_table().await?;
+        let operation = async {
+            database.batch_insert_temp_record(entries).await?;
+            let mut differences = database.classify_batch().await?;
+            let changes = bind_input_order(entries, &mut differences)?;
+            // 复用分类查询拥有的主键；不再次复制观察中的路径／版本字符串。
+            let excluded = match mode {
+                ComparisonMode::PublishObserved => Vec::new(),
+                ComparisonMode::AwaitCopyAcknowledgement => differences
+                    .into_iter()
+                    .map(|row| (row.relative_path, row.version_id))
+                    .collect(),
+            };
+            database.insert_temp_to_base_table(&excluded).await?;
+            Ok(changes)
+        }
+        .await;
+        let cleanup = database.drop_scan_temporary_table().await;
+        match (operation, cleanup) {
+            (Ok(changes), Ok(())) => Ok(changes),
+            (Err(source), Ok(())) | (Ok(_), Err(source)) => Err(source),
+            (Err(source), Err(cleanup)) => Err(DatabaseError::CatalogueBatchCleanupFailed {
+                source: Box::new(source),
+                cleanup: Box::new(cleanup),
+            }),
+        }
     }
 }
 
@@ -334,5 +346,64 @@ impl JoinStrategy {
              ORDER BY file_handle, ctime, version_id \
              LIMIT 1 BY (relative_path, version_id)"
         )
+    }
+}
+
+impl ClickHouseDatabase {
+    /// 将临时表记录合并到主表（INSERT INTO SELECT），可排除指定路径
+    pub async fn insert_temp_to_base_table(&self, excluded_paths: &[(String, String)]) -> Result<()> {
+        let temp_table_name = self
+            .scan_temp_table_name
+            .as_deref()
+            .ok_or_else(|| DatabaseError::TableNotFound("No temporary table available".to_string()))?;
+
+        let temp_table_name = self.catalogue_query_table(temp_table_name)?;
+        let base_table_name = self.catalogue_query_table(&get_scan_base_table_name(&self.job_id))?;
+
+        debug!(
+            "Inserting data from temporary table {} to base table {} (excluded: {} paths)",
+            temp_table_name,
+            base_table_name,
+            excluded_paths.len()
+        );
+
+        if excluded_paths.is_empty() {
+            // 增量扫描：全量插入（无额外开销）
+            let insert_sql = format!(
+                "INSERT INTO {} ({}) SELECT {} FROM {}",
+                base_table_name, OBSERVED_COLUMNS, OBSERVED_COLUMNS, temp_table_name
+            );
+            self.execute(&insert_sql, &[]).await?;
+        } else {
+            // 增量拷贝：Memory 排除表 + NOT IN 过滤
+            let exclude_table = format!("exclude_{}", uuid::Uuid::new_v4().simple());
+
+            // 1. 创建 Memory 排除表
+            self.create_catalogue_exclusions(&exclude_table).await?;
+
+            // 2. 写入排除路径，与同作业其它 quorum 写入保持顺序。
+            self.write_catalogue_exclusions(&exclude_table, excluded_paths).await?;
+
+            // 3. 带过滤的 INSERT INTO SELECT
+            let exclude_query_table = self.catalogue_query_table(&exclude_table)?;
+            let insert_sql = format!(
+                "INSERT INTO {} ({}) SELECT {} FROM {} \
+                 WHERE (relative_path, version_id) NOT IN \
+                 (SELECT relative_path, version_id FROM {})",
+                base_table_name, OBSERVED_COLUMNS, OBSERVED_COLUMNS, temp_table_name, exclude_query_table
+            );
+            self.execute(&insert_sql, &[]).await?;
+
+            // 4. 清理排除表
+            self.drop_catalogue_table(&exclude_table).await?;
+        }
+
+        info!(
+            "Successfully inserted records from {} to {} (excluded: {})",
+            temp_table_name,
+            base_table_name,
+            excluded_paths.len()
+        );
+        Ok(())
     }
 }

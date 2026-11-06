@@ -1,11 +1,15 @@
-//! Common types and utilities for database implementations
+//! Catalogue deletion and rename classification.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use data_mover::model::ObservedEntry;
-use tracing::{error, trace};
+use tracing::{debug, error, trace};
 
+use super::ClickHouseDatabase;
+use super::comparison::JoinStrategy;
 use crate::Result;
+use crate::execution::read::QuorumRead;
+use crate::get_scan_base_table_name;
 use crate::schema::records::StorageEntryRecord;
 
 /// Represents the status of a deleted item, either a permanent deletion or a rename
@@ -26,7 +30,7 @@ pub enum DeletionStatus {
 ///
 /// 根据 `fh_groups` 中每个 `file_handle` 对应的记录数量判断是 `Deleted` 还是 `Renamed`：
 /// - 1 条记录 → `Deleted`
-/// - 2 条记录 → `Renamed`（ctime 小 = from，ctime 大 = to）
+/// - 2 条记录 → `Renamed`（按候选旧路径匹配 from／to）
 /// - 其他 → error 日志
 #[allow(clippy::implicit_hasher)]
 pub(crate) fn classify_deletion_status(
@@ -80,4 +84,80 @@ pub(crate) fn classify_deletion_status(
     }
 
     Ok(deletion_statuses)
+}
+
+impl ClickHouseDatabase {
+    /// 检测已删除或重命名的文件（old-state 记录 + `file_handle` 分组判定）
+    pub async fn detect_deleted_items(&self) -> Result<Box<dyn Iterator<Item = DeletionStatus> + Send>> {
+        let base_table_name = get_scan_base_table_name(&self.job_id);
+
+        // begin 之后必须使用共享生命周期中的 working generation；持久 state 只有 commit
+        // 成功后才推进，直接读取它会把本轮 working 记录误判为 old-state 并全部删除。
+        let current_state = self.get_cached_scan_state().await?;
+        debug!("During detect_deleted_items, current_state is {}", current_state);
+
+        // 第一步：查询所有 old-state 记录（LIMIT 1 BY 替代 FINAL）
+        let query = JoinStrategy::build_detect_deleted_sql(&base_table_name);
+
+        let rows = self
+            .sync_client
+            .query(&query)
+            .bind(1 - current_state)
+            .fetch_quorum_all::<StorageEntryRecord>()
+            .await?;
+
+        debug!("Found {} old-state entries", rows.len());
+        if rows.is_empty() {
+            return Ok(Box::new(std::iter::empty()));
+        }
+        if self.is_copy_recovery().await {
+            return Ok(Box::new(
+                self.copy_recovery_deletions(rows, current_state).await?.into_iter(),
+            ));
+        }
+
+        let deletion_statuses = self.classify_deleted_candidates(&base_table_name, rows).await?;
+
+        debug!("Found {} deleted or renamed entries", deletion_statuses.len());
+
+        Ok(Box::new(deletion_statuses.into_iter()))
+    }
+    /// Classify candidate rows after the query and recovery decision, without copying observations.
+    async fn classify_deleted_candidates(
+        &self, base_table_name: &str, rows: Vec<StorageEntryRecord>,
+    ) -> Result<Vec<DeletionStatus>> {
+        let (no_fh_records, fh_records): (Vec<_>, Vec<_>) =
+            rows.into_iter().partition(|record| record.file_handle.is_none());
+        let unique_fh_set: HashSet<String> = fh_records
+            .iter()
+            .filter_map(|record| record.file_handle.clone())
+            .collect();
+
+        // 第三步：有 file_handle → 分批批量查询
+        let mut fh_groups: HashMap<String, Vec<StorageEntryRecord>> = HashMap::new();
+
+        if !fh_records.is_empty() {
+            const BATCH_SIZE: usize = 10_000;
+            let unique_fh_list: Vec<&str> = unique_fh_set.iter().map(String::as_str).collect();
+
+            // 每批 10K 个 fh，避免 SQL 过长
+            for chunk in unique_fh_list.chunks(BATCH_SIZE) {
+                let batch_query = JoinStrategy::build_batch_fh_query_sql(base_table_name, chunk.len());
+
+                let mut q = self.sync_client.query(&batch_query);
+                for fh in chunk {
+                    q = q.bind(*fh);
+                }
+                let batch_rows = q.fetch_quorum_all::<StorageEntryRecord>().await?;
+
+                for row in batch_rows {
+                    if let Some(fh) = &row.file_handle {
+                        fh_groups.entry(fh.clone()).or_default().push(row);
+                    }
+                }
+            }
+        }
+
+        classify_deletion_status(no_fh_records, fh_records, &fh_groups)
+    }
 }

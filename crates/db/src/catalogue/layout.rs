@@ -1,16 +1,14 @@
 //! 通用目录的部署差异：业务查询复用同一投影，集群 DDL 和物理表名只在这里出现。
-use super::{ClickHouseDatabase, ExcludeRecord};
+
+use clickhouse::Client;
+use tokio::sync::MutexGuard;
+use uuid::Uuid;
+
+use super::ClickHouseDatabase;
 use crate::config::ClickHouseConfig;
 use crate::error::{DatabaseError, Result};
-use crate::execution::queries::{check_scan_cancellation, scan_retry_delay};
 use crate::schema::identifier;
-use crate::schema::records::SnapshotRow;
-use clickhouse::{Client, error::Error as ClickHouseError, query::Query};
-use data_mover::model::ObservedEntry;
-use std::time::{Duration, Instant};
-use tokio::sync::MutexGuard;
-use tokio::sync::mpsc;
-use uuid::Uuid;
+use crate::schema::records::ExcludeRecord;
 
 #[derive(Clone)]
 pub(super) struct ClusterCatalogue {
@@ -110,42 +108,6 @@ impl ClickHouseDatabase {
             client.clone()
         }
     }
-    pub(super) async fn send_catalogue_records(&self, query: Query, tx: mpsc::Sender<ObservedEntry>) -> Result<()> {
-        let started = Instant::now();
-        let mut delivered = false;
-        let mut retrying = false;
-        loop {
-            check_scan_cancellation()?;
-            let request = if retrying {
-                query.clone().with_option("load_balancing", "random")
-            } else {
-                query.clone()
-            };
-            let mut cursor = request.fetch::<SnapshotRow>()?;
-            loop {
-                match cursor.next().await {
-                    Ok(Some(record)) => {
-                        tx.send(record.into_observation()?).await.map_err(|error| {
-                            DatabaseError::QueryError(format!("Failed to send storage entry: {error}"))
-                        })?;
-                        delivered = true;
-                    }
-                    Ok(None) => return Ok(()),
-                    Err(ClickHouseError::BadResponse(message))
-                        if !delivered
-                            && message.contains("REPLICA_IS_NOT_IN_QUORUM")
-                            && started.elapsed() < Duration::from_secs(30) =>
-                    {
-                        retrying = true;
-                        scan_retry_delay(Duration::from_millis(50)).await?;
-                        break;
-                    }
-                    Err(error) => return Err(error.into()),
-                }
-            }
-        }
-    }
-
     pub(super) async fn catalogue_write_guard(&self) -> Option<MutexGuard<'_, ()>> {
         if self.catalogue_cluster.is_some() {
             Some(self.generation_lifecycle.writes.lock().await)
@@ -198,12 +160,12 @@ impl ClickHouseDatabase {
     pub(super) async fn write_catalogue_exclusions(&self, table: &str, paths: &[(String, String)]) -> Result<()> {
         let _write = self.catalogue_write_guard().await;
         let client = self.catalogue_write_client(&self.sync_client);
-        let mut insert = client.insert::<ExcludeRecord>(table).await?;
+        let mut insert = client.insert::<ExcludeRecord<'_>>(table).await?;
         for (path, version) in paths {
             insert
                 .write(&ExcludeRecord {
-                    relative_path: path.clone(),
-                    version_id: version.clone(),
+                    relative_path: path.as_str(),
+                    version_id: version.as_str(),
                 })
                 .await?;
         }

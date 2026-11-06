@@ -209,6 +209,23 @@ write_positioned 集中连续偏移校验、完整摘要和恢复前缀跳过；
 - 有序版本、恢复及 null 历史 14 例：`/work/terrasync-db-refactor-evidence/release-db-refactor-catalogue-scope-ordered-20261106-003354/report.json`。
 - Kerberos HDFS + Single／Cluster 各 15 例：`/work/terrasync-db-refactor-evidence/release-db-refactor-catalogue-scope-hdfs-single-20261106-003245/report.json`、`/work/terrasync-db-refactor-evidence/release-db-refactor-catalogue-scope-hdfs-cluster-20261106-003259/report.json`。包含扫描两轮、复制／QUIC、真实权限、两类归档及回读。
 
+## 具体目录接口与内聚拆分
+
+删除 Database trait、Box<dyn Database>、clone_box 和 db 的 async-trait 依赖；应用显式持有 ClickHouseDatabase。Single／Cluster 差异仍私有于 db，未引入替代注册表。catalogue 根文件只保留模块和状态声明，读、写、代次、删除判定及表生命周期分别归位；移除仅调用同名实现的转发方法和无人使用的 prelude。目录绑定自身 job 检查复制基线，应用不再拼接物理表名。临时扫描表名及差异分类中间结果私有化。
+
+排除行使用借用字符串的私有 SQL DTO，去掉序列化前路径／版本的重复分配；实际 RowBinary 解码覆盖 Unicode 和空版本。临时比较表的失败及清理验证通过真实 HTTP／RowBinary 客户端测试，包括插入失败后重试、分类失败、不发布部分结果，以及操作与清理双失败原因保留。应用删除大范围假数据库实现，改为从真实客户端错误入口断言状态和事件。
+
+32 个移位方法体、4 个取消转发后的实际实现及删除查询 SQL 的等价检查记录在 `/tmp/terrasync-catalogue-concrete-move-verification.json`。最终 Standards／Spec 双轴审查通过。拆分期间发现 baseline_tests 注册遗漏，已恢复；原 db 137 个测试函数均保留。此前少计测试的候选与日志已作废，未用于真实验收。
+
+最终 fmt、默认与 all-features 的 workspace all-targets check、Clippy、532 个 workspace 测试及双进程 E2E 16 例通过；86 个忽略项未计通过。记录前缀 `/tmp/terrasync-catalogue-concrete-v3-`。完整基线模块单独确认 3 个本地用例及 2 个环境用例注册。
+
+匹配该源码的 release SHA-256 为 `5de332518685fc54e794da931f836a3c3f5fb4c042d0e4c68ae309aa6181f1d4`，源码记录 `/tmp/terrasync-catalogue-concrete-build-source.json`；构建前后校验 tracked diff 和全部未跟踪源码摘要。恢复测试入口不改变生产二进制，故 SHA 与已作废的中间产物相同；本轮采用完整检查后的新记录。以下 136 项真实用例全部通过，测试资源清理成功：
+
+- DB 75 项：Single 目录 11、Cluster 目录 12、Single 集成 44、Single／Cluster 切点各 3、Single 首次基线与重开 2。报告前缀 `/tmp/terrasync-db-refactor-real-catalogue-concrete-v1-`，分别对应 `single-catalogue`、`cluster-catalogue`、`single`、`single-cuts`、`cluster-cuts`、`single-baseline`。目录 fixture 逐项回查已删除，首次基线 fixture 按本轮唯一时间范围回查无残留。
+- S3 marker／tags 17 项：`/work/terrasync-db-refactor-evidence/release-db-refactor-catalogue-concrete-marker-tags-20261106-015928/report.json`。
+- 有序版本、恢复及 null 历史 14 项：`/work/terrasync-db-refactor-evidence/release-db-refactor-catalogue-concrete-ordered-20261106-020042/report.json`。
+- Kerberos HDFS + Single／Cluster 各 15 项：`/work/terrasync-db-refactor-evidence/release-db-refactor-catalogue-concrete-hdfs-single-20261106-015940/report.json` 与 `/work/terrasync-db-refactor-evidence/release-db-refactor-catalogue-concrete-hdfs-cluster-20261106-015956/report.json`。远端上传校验与报告 SHA 相符，覆盖两轮扫描、复制／QUIC、权限、归档及回读。
+
 ## 合入前仍须完成
 
-目录作用域已显式共享；还需收敛数据库任务接口及临时表协议，以及按设计删除 storage-adapter。任务契约与 transport 已分离，剩余存储机制和产品配置仍须分别归位。最终候选必须重跑对应 CI、真实 HDFS 和受影响故障链路，并完成全量／增量／续扫性能与峰值 RSS 对照。先前 HDFS 通过的二进制不能作为最终候选证据。
+目录作用域、具体数据库接口及临时表协议已收敛；还需按设计删除 storage-adapter。任务契约与 transport 已分离，剩余存储机制和产品配置仍须分别归位。最终候选必须重跑对应 CI、真实 HDFS 和受影响故障链路，并完成全量／增量／续扫性能与峰值 RSS 对照。先前 HDFS 通过的二进制不能作为最终候选证据。

@@ -1,9 +1,14 @@
 //! ClickHouse 目录的连接构造及已提交基线保护。
-use super::{CatalogueLifecycle, ClickHouseDatabase, ClusterCatalogue};
-use crate::{config::ClickHouseConfig, error::Result, execution::base_client, scan::ScanStore, traits::Database};
-use clickhouse::Client;
+
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+
+use clickhouse::Client;
+use tracing::debug;
+
+use super::{CatalogueLifecycle, ClickHouseDatabase, ClusterCatalogue};
+use crate::execution::read::QuorumRead;
+use crate::{config::ClickHouseConfig, error::Result, execution::base_client, scan::ScanStore};
 
 impl ClickHouseDatabase {
     /// 连接唯一的 ClickHouse 目录实现，保留原始有类型的连接失败。
@@ -63,5 +68,15 @@ impl Clone for ClickHouseDatabase {
             native_dedup_ready: AtomicBool::new(self.native_dedup_ready.load(Ordering::Acquire)),
             generation_lifecycle: Arc::clone(&self.generation_lifecycle),
         }
+    }
+}
+
+impl ClickHouseDatabase {
+    /// 通过 SELECT 1 测试连接
+    pub async fn ping(&self) -> Result<()> {
+        self.sync_client.query("SELECT 1").fetch_quorum_one::<u8>().await?;
+
+        debug!("ClickHouse connection established successfully");
+        Ok(())
     }
 }

@@ -33,7 +33,6 @@ impl Drop for AtomicCounterGuard<'_> {
 
 // 外部 crate
 use db::ClickHouseDatabase;
-use db::traits::Database;
 use db::{self, DeletionStatus, INCREMENTAL_SCAN_TABLE_BASE_NAME};
 #[cfg(windows)]
 use storage_adapter::backend_kind_from_location;
@@ -270,17 +269,14 @@ impl SyncOrchestrator {
         let app_config = AppConfig::fetch()?;
         // database.enabled=true 时必须成功构造；false 时忽略错误（未启用），走文件系统兜底
         let db_instance = if app_config.database.enabled {
-            Some(
-                Box::new(ClickHouseDatabase::connect(&app_config.database.clickhouse, &c.job_id).await?)
-                    as Box<dyn Database>,
-            )
+            Some(ClickHouseDatabase::connect(&app_config.database.clickhouse, &c.job_id).await?)
         } else {
             None
         };
         let scan_type = if !app_config.database.enabled || !app_config.sync.is_source_reserved {
             ScanType::Full
         } else {
-            determine_sync_type(db_instance.as_deref(), &c.job_id, c.job_dir_pre_existing).await
+            determine_sync_type(db_instance.as_ref(), c.job_dir_pre_existing).await
         };
 
         info!("SyncOrchestrator: determined scan_type={}", scan_type);
@@ -361,10 +357,10 @@ impl SyncOrchestrator {
         )?);
 
         let database = if consumer_config.db_config.enabled {
-            let database: Box<dyn Database> =
-                Box::new(ClickHouseDatabase::connect(&consumer_config.db_config.clickhouse, &c.job_id).await?);
+            let database: ClickHouseDatabase =
+                ClickHouseDatabase::connect(&consumer_config.db_config.clickhouse, &c.job_id).await?;
             database.initialize().await?;
-            begin_copy_catalogue(database.as_ref(), c, block_size, is_source_reserved).await?;
+            begin_copy_catalogue(&database, c, block_size, is_source_reserved).await?;
             Some(database)
         } else {
             None
@@ -740,14 +736,14 @@ impl SyncOrchestrator {
             c.progress_callback_url.clone(),
         )?);
 
-        let database: Box<dyn Database> =
-            Box::new(ClickHouseDatabase::connect(&consumer_config.db_config.clickhouse, &c.job_id).await?);
+        let database: ClickHouseDatabase =
+            ClickHouseDatabase::connect(&consumer_config.db_config.clickhouse, &c.job_id).await?;
 
         if let Err(e) = database.create_table(INCREMENTAL_SCAN_TABLE_BASE_NAME).await {
             return Err(AppError::DatabaseError(e));
         }
 
-        begin_copy_catalogue(database.as_ref(), c, block_size, is_source_reserved).await?;
+        begin_copy_catalogue(&database, c, block_size, is_source_reserved).await?;
 
         let batch_size = consumer_config.db_config.batch_size as usize;
 
@@ -1267,7 +1263,7 @@ impl SyncOrchestrator {
             );
 
             Self::apply_deletions_and_renames(
-                database.as_ref(),
+                &database,
                 src_storage_phase_b.clone(),
                 dest_storage_phase_b.clone(),
                 is_source_reserved,
@@ -1431,7 +1427,7 @@ impl SyncOrchestrator {
     /// 或元数据更新（处理「rename + data/metadata changed」复合场景）。
     #[allow(clippy::too_many_arguments)]
     async fn apply_deletions_and_renames(
-        db: &dyn Database, src_storage: Arc<StorageContext>, dest_storage: Arc<StorageContext>,
+        db: &ClickHouseDatabase, src_storage: Arc<StorageContext>, dest_storage: Arc<StorageContext>,
         is_source_reserved: bool, broadcaster: &BroadcastForwarder<StorageEntryMessage>, enable_integrity_check: bool,
         qos_manager: Option<QosManager>, bytes_counter: Option<Arc<AtomicU64>>, job_id: &str, job_dir: &str,
         transfer_mode: TransferMode,

@@ -1,18 +1,30 @@
 //! 复制目录仅在物理操作与数据库确认全部完成后结束轮次；失败轮次保守重放。
-use super::{ClickHouseDatabase, ScanGenerationLifecycle};
-use crate::common::DeletionStatus;
+
+use std::collections::HashSet;
+use std::sync::atomic::Ordering;
+
+use clickhouse::error::Error as ClickHouseError;
+use serde::Deserialize;
+use serde_json::Value;
+
+use super::ClickHouseDatabase;
+use super::lifecycle::ScanGenerationLifecycle;
+use crate::DeletionStatus;
 use crate::error::{DatabaseError, Result};
 use crate::execution::read::QuorumRead;
 use crate::get_scan_base_table_name;
 use crate::get_scan_state_table_name;
 use crate::schema::columns::CATALOGUE_COLUMNS as FILE_SCAN_COLUMNS_LIST;
 use crate::schema::records::StorageEntryRecord;
-use crate::traits::CopyGenerationStatus;
-use clickhouse::error::Error as ClickHouseError;
-use serde::Deserialize;
-use serde_json::Value;
-use std::collections::HashSet;
-use std::sync::atomic::Ordering;
+
+/// Whether an unfinished copy generation must replay unacknowledged target operations.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CopyGenerationStatus {
+    /// 首轮或上一轮全部确认成功，沿用正常增量比较。
+    Fresh,
+    /// 上轮复制没有确认完成，必须重放源项或拒绝不安全的恢复。
+    Recovering,
+}
 
 #[derive(Deserialize, clickhouse::Row)]
 struct CopyState {
@@ -23,7 +35,7 @@ struct CopyState {
 }
 
 impl ClickHouseDatabase {
-    pub(super) async fn begin_catalogue_copy(&self, request_key: &str) -> Result<CopyGenerationStatus> {
+    pub async fn begin_copy_generation(&self, request_key: &str) -> Result<CopyGenerationStatus> {
         if request_key.is_empty() {
             return Err(DatabaseError::ConfigError(
                 "copy generation requires a source/destination recovery binding".into(),

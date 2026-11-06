@@ -2,8 +2,8 @@
 use crate::scan::cluster::ClusterScanStore;
 use crate::schema::entry::EntrySummary as StorageEntryRecord;
 use crate::{
-    ClickHouseConfig, ClickHouseDatabase, Database, DatabaseError, INCREMENTAL_SCAN_TABLE_BASE_NAME, Result,
-    base_table_name_for_job,
+    ClickHouseConfig, ClickHouseDatabase, DatabaseError, INCREMENTAL_SCAN_TABLE_BASE_NAME, Result,
+    get_scan_base_table_name,
 };
 use data_mover::model::ObservedEntry;
 use std::sync::Arc;
@@ -207,7 +207,7 @@ impl ScanStore {
     }
     pub async fn results_exist(&self) -> Result<bool> {
         match &self.inner {
-            Store::Single(store) => store.table_exists(&base_table_name_for_job(&self.job_id)).await,
+            Store::Single(store) => store.table_exists(&get_scan_base_table_name(&self.job_id)).await,
             Store::Cluster(store) => store.results_exist().await,
         }
     }

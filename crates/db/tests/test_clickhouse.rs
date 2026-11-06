@@ -23,7 +23,7 @@ mod clickhouse_integration_tests {
     use db::catalogue::ClickHouseDatabase;
     use db::scan::ScanResumeState;
     use db::scan::{ScanFinalEvent, ScanStore};
-    use db::{ClickHouseConfig, Database, DatabaseError, DeletionStatus};
+    use db::{ClickHouseConfig, DatabaseError, DeletionStatus};
     use task_model::observation::{ObservedItem, ObservedScanEvent};
     use task_model::{ChangeKind, ObservedEntryExt};
     use tokio::sync::mpsc;
@@ -78,6 +78,24 @@ mod clickhouse_integration_tests {
             client = client.with_password(password);
         }
         client
+    }
+
+    async fn table_names(config: &ClickHouseConfig) -> Vec<String> {
+        clickhouse_client(config)
+            .query("SELECT name FROM system.tables WHERE database=currentDatabase() ORDER BY name")
+            .fetch_all::<String>()
+            .await
+            .unwrap()
+    }
+
+    async fn created_table_name(config: &ClickHouseConfig, before: &[String]) -> String {
+        let mut added: Vec<_> = table_names(config)
+            .await
+            .into_iter()
+            .filter(|name| !before.contains(name))
+            .collect();
+        assert_eq!(added.len(), 1, "one owned staging table must be created");
+        added.pop().unwrap()
     }
 
     struct IsolatedDatabase {
@@ -392,7 +410,7 @@ mod clickhouse_integration_tests {
         let hash = clickhouse_client(&config)
             .query(&format!(
                 "SELECT metadata_hash FROM {} FINAL WHERE relative_path='added'",
-                db::base_table_name_for_job(&job)
+                format!("base_{}", utils::sanitize_job_id(&job))
             ))
             .fetch_one::<Option<String>>()
             .await
@@ -412,7 +430,7 @@ mod clickhouse_integration_tests {
         let hash = clickhouse_client(&config)
             .query(&format!(
                 "SELECT metadata_hash FROM {} FINAL WHERE relative_path='added'",
-                db::base_table_name_for_job(&job)
+                format!("base_{}", utils::sanitize_job_id(&job))
             ))
             .fetch_one::<Option<String>>()
             .await
@@ -424,7 +442,7 @@ mod clickhouse_integration_tests {
             .with_option("mutations_sync", "2")
             .query(&format!(
                 "ALTER TABLE {} DELETE WHERE relative_path='added'",
-                db::base_table_name_for_job(&job)
+                format!("base_{}", utils::sanitize_job_id(&job))
             ))
             .execute()
             .await
@@ -885,8 +903,9 @@ mod clickhouse_integration_tests {
             .await
             .unwrap();
         assert_eq!(stamped_generation, 1);
+        let before = table_names(&config).await;
         db.create_scan_temporary_table().await.unwrap();
-        let temp_table = db.scan_temp_table_name.clone().unwrap();
+        let temp_table = created_table_name(&config, &before).await;
         let temp_record = Arc::new(make_nas("temp-working.dat", 11, 1_700_000_001, None));
         db.batch_insert_temp_record(&[temp_record]).await.unwrap();
         let temp_generation = client
@@ -1199,8 +1218,9 @@ mod clickhouse_integration_tests {
             .unwrap();
         assert_eq!(current_state, 1);
 
+        let before = table_names(&config).await;
         adapter_b.create_scan_temporary_table().await.unwrap();
-        let temp_table = adapter_b.scan_temp_table_name.clone().unwrap();
+        let temp_table = created_table_name(&config, &before).await;
         let temp_record = Arc::new(make_nas("shared-temp.dat", 19, 1_700_000_001, None));
         adapter_b.batch_insert_temp_record(&[temp_record]).await.unwrap();
         let temp_state = client
@@ -1220,7 +1240,7 @@ mod clickhouse_integration_tests {
     async fn cloned_adapter_uses_shared_working_generation() {
         let (adapter, config, job_id, database) = setup_isolated_state_db("shared_clone_batch").await;
         adapter.initialize().await.unwrap();
-        let cloned = adapter.clone_box();
+        let cloned = adapter.clone();
         assert_eq!(adapter.begin_scan_generation().await.unwrap(), 1);
 
         let record = Arc::new(make_nas("cloned.dat", 17, 1_700_000_000, None));
@@ -1402,12 +1422,12 @@ mod clickhouse_integration_tests {
     #[tokio::test]
     #[ignore]
     async fn test_temp_table_lifecycle() {
-        let job_id = generate_unique_job_id("temp");
-        let mut db = setup_test_db_with_job_id(&job_id);
+        let (mut db, config, _job_id, database) = setup_isolated_state_db("temp").await;
         db.initialize().await.unwrap();
 
+        let before = table_names(&config).await;
         db.create_scan_temporary_table().await.unwrap();
-        assert!(db.scan_temp_table_name.is_some());
+        let temp_table = created_table_name(&config, &before).await;
 
         let batch: Vec<Arc<ObservedEntry>> = (0..100)
             .map(|i| Arc::new(make_nas(&format!("dir/{}.txt", i), 512, 100, None)))
@@ -1415,9 +1435,10 @@ mod clickhouse_integration_tests {
         db.batch_insert_temp_record(&batch).await.unwrap();
 
         db.drop_scan_temporary_table().await.unwrap();
-        assert!(db.scan_temp_table_name.is_none());
+        assert!(!table_names(&config).await.contains(&temp_table));
+        assert_eq!(table_names(&config).await, before);
 
-        cleanup_test_tables(&db, &job_id).await.unwrap();
+        database.cleanup().await;
     }
 
     // ═══ 2.2 detect_new_items（优化 1: NOT IN）═══

@@ -6,7 +6,6 @@ use task_model::observation::ObservedItem;
 // 外部crate
 use db::ClickHouseDatabase;
 use db::error::DatabaseError;
-use db::traits::Database;
 use tokio::sync::mpsc;
 use tracing::{Instrument, debug, error, info, info_span, trace};
 use {storage_adapter::ObservedEntry, task_model::StorageEntryMessage};
@@ -45,7 +44,7 @@ fn database_consumer_result(failures: DatabaseFailures) -> Result<()> {
 #[derive(Clone)]
 pub struct DatabaseConsumer {
     /// 数据库实例引用
-    db: Box<dyn Database>,
+    db: ClickHouseDatabase,
     /// 批量插入的大小阈值
     batch_size: u32,
     job_type: JobType,
@@ -92,7 +91,7 @@ impl Consumer for DatabaseConsumer {
                             if job_type == JobType::Scan {
                                 for item in ObservedItem::all(&entry) {
                                     DatabaseConsumer::batch_insert_base_record(
-                                        db.as_ref(),
+                                        &db,
                                         &item,
                                         &mut current_insert_entry_batch,
                                         batch_size,
@@ -109,7 +108,7 @@ impl Consumer for DatabaseConsumer {
                             // 增量扫描(IncrementalScan)无需插入基础表（临时表导入主表时已处理）。
                             if job_type == JobType::Copy || job_type == JobType::IncrementalCopy {
                                 DatabaseConsumer::batch_insert_base_record(
-                                    db.as_ref(),
+                                    &db,
                                     &entry,
                                     &mut current_insert_entry_batch,
                                     batch_size,
@@ -121,7 +120,7 @@ impl Consumer for DatabaseConsumer {
                             // 全量拷贝(Copy)只需入基础表，不需要增量记录。
                             if job_type != JobType::Copy {
                                 DatabaseConsumer::batch_insert_incremental_record(
-                                    db.as_ref(),
+                                    &db,
                                     &StorageEntryMessage::New(entry),
                                     &mut current_message_batch,
                                     batch_size,
@@ -137,7 +136,7 @@ impl Consumer for DatabaseConsumer {
                             // 在增量扫描场景是不需要更新记录的,是因为在临时表导入主表时就已经更新了。
                             if job_type == JobType::IncrementalCopy {
                                 DatabaseConsumer::batch_insert_base_record(
-                                    db.as_ref(),
+                                    &db,
                                     &entry,
                                     &mut current_insert_entry_batch,
                                     batch_size,
@@ -147,7 +146,7 @@ impl Consumer for DatabaseConsumer {
                             }
 
                             DatabaseConsumer::batch_insert_incremental_record(
-                                db.as_ref(),
+                                &db,
                                 &StorageEntryMessage::Changed { entry, kind },
                                 &mut current_message_batch,
                                 batch_size,
@@ -159,7 +158,7 @@ impl Consumer for DatabaseConsumer {
                             trace!("[DatabaseConsumer] Renaming entry {:?} to {:?}", from_entry, to_entry);
                             // 在增量拷贝和增量扫描场景均需要更新数据库里的记录
                             DatabaseConsumer::batch_insert_base_record(
-                                db.as_ref(),
+                                &db,
                                 &Arc::clone(&to_entry).into(),
                                 &mut current_insert_entry_batch,
                                 batch_size,
@@ -168,7 +167,7 @@ impl Consumer for DatabaseConsumer {
                             .await;
 
                             DatabaseConsumer::batch_delete_base_record(
-                                db.as_ref(),
+                                &db,
                                 &from_entry,
                                 &mut current_delete_entry_batch,
                                 batch_size,
@@ -177,7 +176,7 @@ impl Consumer for DatabaseConsumer {
                             .await;
 
                             DatabaseConsumer::batch_insert_incremental_record(
-                                db.as_ref(),
+                                &db,
                                 &StorageEntryMessage::Renamed((from_entry, to_entry)),
                                 &mut current_message_batch,
                                 batch_size,
@@ -189,7 +188,7 @@ impl Consumer for DatabaseConsumer {
                             trace!(path = %entry.get_relative_path().display(), "db: deleted entry");
                             // 在增量拷贝和增量扫描场景均需要删除数据库里的记录
                             DatabaseConsumer::batch_delete_base_record(
-                                db.as_ref(),
+                                &db,
                                 &entry,
                                 &mut current_delete_entry_batch,
                                 batch_size,
@@ -198,7 +197,7 @@ impl Consumer for DatabaseConsumer {
                             .await;
 
                             DatabaseConsumer::batch_insert_incremental_record(
-                                db.as_ref(),
+                                &db,
                                 &StorageEntryMessage::Deleted(entry),
                                 &mut current_message_batch,
                                 batch_size,
@@ -244,7 +243,7 @@ impl Consumer for DatabaseConsumer {
                         current_insert_entry_batch.len()
                     );
                     DatabaseConsumer::finalize_insert_base_record(
-                        db.as_ref(),
+                        &db,
                         &mut current_insert_entry_batch,
                         &mut processed_errors,
                     )
@@ -256,7 +255,7 @@ impl Consumer for DatabaseConsumer {
                         current_delete_entry_batch.len()
                     );
                     DatabaseConsumer::finalize_delete_base_record(
-                        db.as_ref(),
+                        &db,
                         &mut current_delete_entry_batch,
                         &mut processed_errors,
                     )
@@ -268,7 +267,7 @@ impl Consumer for DatabaseConsumer {
                         current_message_batch.len()
                     );
                     DatabaseConsumer::finalize_insert_incremental_record(
-                        db.as_ref(),
+                        &db,
                         &mut current_message_batch,
                         &mut processed_errors,
                     )
@@ -318,13 +317,12 @@ impl DatabaseConsumer {
         if !config.db_config.enabled {
             return Err(DatabaseError::DatabaseDisabledError().into());
         }
-        let database: Box<dyn Database> =
-            Box::new(ClickHouseDatabase::connect(&config.db_config.clickhouse, job_id).await?);
+        let database: ClickHouseDatabase = ClickHouseDatabase::connect(&config.db_config.clickhouse, job_id).await?;
         Self::with_database(config, database).await
     }
 
     /// Attach the task-owned catalogue so its generation and write coordination are shared.
-    pub(crate) async fn with_database(config: &ConsumerConfig, database: Box<dyn Database>) -> Result<Self> {
+    pub(crate) async fn with_database(config: &ConsumerConfig, database: ClickHouseDatabase) -> Result<Self> {
         if matches!(config.job_type, JobType::Scan | JobType::Copy) {
             database.initialize().await?;
         }
@@ -349,7 +347,7 @@ impl DatabaseConsumer {
     /// * `current_batch` - 当前批次的记录，新记录会被添加到这里
     /// * `batch_size` - 批量插入的大小阈值
     async fn batch_insert_base_record(
-        database: &dyn Database, entry: &ObservedItem, current_batch: &mut Vec<ObservedItem>, batch_size: u32,
+        database: &ClickHouseDatabase, entry: &ObservedItem, current_batch: &mut Vec<ObservedItem>, batch_size: u32,
         processed_errors: &mut DatabaseFailures,
     ) {
         current_batch.push(entry.clone());
@@ -384,7 +382,7 @@ impl DatabaseConsumer {
     /// * `database` - 数据库实例引用
     /// * `current_batch` - 当前批次的记录，处理后会被清空
     async fn finalize_insert_base_record(
-        database: &dyn Database, current_batch: &mut Vec<ObservedItem>, processed_errors: &mut DatabaseFailures,
+        database: &ClickHouseDatabase, current_batch: &mut Vec<ObservedItem>, processed_errors: &mut DatabaseFailures,
     ) {
         if current_batch.is_empty() {
             info!("[DatabaseConsumer] No remaining records to flush");
@@ -416,7 +414,7 @@ impl DatabaseConsumer {
     /// * `database` - 数据库实例引用
     /// * `current_batch` - 当前批次的记录，处理后会被清空
     async fn finalize_delete_base_record(
-        database: &dyn Database, current_batch: &mut Vec<String>, processed_errors: &mut DatabaseFailures,
+        database: &ClickHouseDatabase, current_batch: &mut Vec<String>, processed_errors: &mut DatabaseFailures,
     ) {
         if current_batch.is_empty() {
             info!("[DatabaseConsumer] No remaining records to flush");
@@ -442,7 +440,7 @@ impl DatabaseConsumer {
     }
 
     async fn batch_delete_base_record(
-        database: &dyn Database, entry: &Arc<ObservedEntry>, current_batch: &mut Vec<String>, batch_size: u32,
+        database: &ClickHouseDatabase, entry: &Arc<ObservedEntry>, current_batch: &mut Vec<String>, batch_size: u32,
         processed_errors: &mut DatabaseFailures,
     ) {
         current_batch.push(entry.get_relative_path().to_string_lossy().to_string());
@@ -479,7 +477,7 @@ impl DatabaseConsumer {
     /// * `current_batch` - 当前批次的记录，新记录会被添加到这里
     /// * `batch_size` - 批量插入的大小阈值
     async fn batch_insert_incremental_record(
-        database: &dyn Database, message: &StorageEntryMessage, current_batch: &mut Vec<StorageEntryMessage>,
+        database: &ClickHouseDatabase, message: &StorageEntryMessage, current_batch: &mut Vec<StorageEntryMessage>,
         batch_size: u32, processed_errors: &mut DatabaseFailures,
     ) {
         current_batch.push(message.clone());
@@ -514,7 +512,8 @@ impl DatabaseConsumer {
     /// * `database` - 数据库实例引用
     /// * `current_batch` - 当前批次的记录，处理后会被清空
     async fn finalize_insert_incremental_record(
-        database: &dyn Database, current_batch: &mut Vec<StorageEntryMessage>, processed_errors: &mut DatabaseFailures,
+        database: &ClickHouseDatabase, current_batch: &mut Vec<StorageEntryMessage>,
+        processed_errors: &mut DatabaseFailures,
     ) {
         if current_batch.is_empty() {
             info!("[DatabaseConsumer] No remaining incremental records to flush");

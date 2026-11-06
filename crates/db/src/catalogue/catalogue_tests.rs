@@ -1,15 +1,27 @@
 //! 目录集群适配经由公开连接和通用 Database 契约验证，不借用 native scan 入口。
 #![allow(clippy::unwrap_used)]
-use super::*;
+use super::{ClickHouseDatabase, ComparisonMode};
 use crate::ClickHouseConfig;
 use crate::execution::base_client;
+use crate::execution::read::QuorumRead;
 use crate::observed_fixtures::directory_marker;
 use crate::schema::columns::CATALOGUE_COLUMNS;
+use crate::schema::columns::FILE_SCAN_COLUMNS_DEFINITION;
+use crate::schema::records::StorageEntryRecord;
+use crate::{
+    CopyGenerationStatus, DatabaseError, DeletionStatus, INCREMENTAL_SCAN_TABLE_BASE_NAME, Result,
+    get_scan_base_table_name,
+};
+use clickhouse::Client;
+use data_mover::model::ObservedEntry;
 use data_mover::model::{BackendKind, EntryKind};
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
+use task_model::{ChangeKind, StorageEntryMessage};
 use task_model::{EntryChange, ObservedEntryExt};
 use tokio::runtime::Builder;
+use tokio::sync::mpsc;
 use tokio::time::timeout;
 use utils::app_config::ClickHouseMode;
 use uuid::Uuid;
@@ -76,8 +88,8 @@ impl Fixture {
         Ok(Self { config, admin, source })
     }
 
-    async fn database(&self, job: &str) -> Result<Box<dyn Database>> {
-        let database: Box<dyn Database> = Box::new(ClickHouseDatabase::connect(&self.config, job).await?);
+    async fn database(&self, job: &str) -> Result<ClickHouseDatabase> {
+        let database: ClickHouseDatabase = ClickHouseDatabase::connect(&self.config, job).await?;
         database.initialize().await?;
         Ok(database)
     }
@@ -239,7 +251,7 @@ async fn cluster_catalogue_copy_sync_and_delete_are_job_isolated() -> Result<()>
     observed.sort();
     assert_eq!(observed, ["keep", "newname"]);
     // 工厂 clone 仍写同一部署和 generation，而不是退回本机表。
-    let clone = a.clone_box();
+    let clone = a.clone();
     clone.update_base_record(&fixture.entry("keep", 15, "cc")).await?;
     assert_eq!(fixture.rows("a").await?[0].size, 15);
     a.create_table(INCREMENTAL_SCAN_TABLE_BASE_NAME).await?;
@@ -485,7 +497,7 @@ async fn history_copy_recovery_keeps_the_group_and_does_not_delete_the_replayed_
     );
     database.create_scan_temporary_table().await?;
     database.batch_insert_temp_record(&segments).await?;
-    let replay: Vec<_> = database.clone_box().detect_new_items().await?.collect();
+    let replay: Vec<_> = database.clone().detect_new_items().await?.collect();
     assert_eq!(
         replay.iter().map(|entry| entry.get_version_id()).collect::<Vec<_>>(),
         [Some("z-old"), Some("m-delete"), Some("a-new")]
