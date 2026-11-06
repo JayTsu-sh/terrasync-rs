@@ -412,3 +412,22 @@ Single full 主分支 8.49 秒／候选 8.38 秒，incremental0 为 14.31／14.9
 Cluster full 为 23.77／28.70 秒，incremental0 为 28.86／27.77 秒；单轮差异需多轮同模式复核。
 峰值候选 Single 约 179 MiB、Cluster 约 269 MiB；该报告 passed 仅表示功能和清理检查通过，不表示性能目标达标。
 unordered／blocks、无变更／约 1% 变更、多轮 RSS 以及生产周期续扫成本仍在独立验收中。
+
+
+## 非特权 CI 夹具修复与合批后恢复验证
+
+e383ddb 的 GitHub Rust CI 在 dc_creates_symlink 失败：成功夹具把 UID／GID 固定为 0，普通 runner 无权 chown 到 root。
+以 nobody、TMPDIR=/tmp 执行原测试二进制复现相同 ACK 断言失败（`/tmp/terrasync-unprivileged-symlink-red-v2.log`）。
+最初未覆盖 TMPDIR 的尝试仅因 /work/tmp 不可写而失败，不计为该问题复现。
+夹具改从真实临时文件取得执行身份，保留链接类型／目标／成功 ACK 断言并增加 UID／GID 检查；生产代码和权限失败语义不变。
+同一 21 项 dual_process_streaming 套件在 root 和 nobody 下分别全部通过，fmt／对应测试 Clippy 通过。
+证据 `/tmp/terrasync-unprivileged-fixture-{root,unprivileged}-green.log` 及 `...-clippy.log`。
+Standards／Spec 复核未发现该测试修复掩盖权限错误。
+
+合批二进制另有 **8 项真实应用强退／重启回归通过**：
+Single `/work/terrasync-db-refactor-evidence/release-db-refactor-request-packing-resume-single-1793944386163925136/report.json`；
+Cluster `/work/terrasync-db-refactor-evidence/release-db-refactor-request-packing-resume-cluster-1793944510654020615/report.json`。
+各 4 项，均独立观察并核实 4 个临时数据库已清理；功能测试缩短周期，不能代替生产至少 60 秒 checkpoint 性能验证。
+
+上游为满足 strict 分支保护合并 main 为 924c2c8；相对 0070c159 仅增加 Direct 中途取消测试及夹具支持，没有运行时代码变化。
+新的 GitHub CI 仍在等待，未绕过保护规则；下游 native pin 的运行时代码与该合并头一致。

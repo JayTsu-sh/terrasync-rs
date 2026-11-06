@@ -3,7 +3,7 @@ use transport::chunk::DataChunk;
 // 用 in-process transport 断言 Sender 流式发送序列 + 源 hash 正确。
 #[path = "../../../tests/support/observed.rs"]
 mod observed_fixtures;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -34,6 +34,8 @@ async fn local_storage(dir: &std::path::Path) -> Arc<StorageContext> {
 
 // 构造一个 NAS ObservedEntry（测试用最小字段集，relative_path=name）。
 fn make_nas_entry(name: &str, is_dir: bool, is_symlink: bool, size: u64, mode: u32) -> Arc<ObservedEntry> {
+    // 使用实际执行身份；成功路径不能隐含调用方具有 chown 到 root 的权限。
+    let owner = tempfile::tempfile().unwrap().metadata().unwrap();
     Arc::new({
         let fixture_path: std::path::PathBuf = PathBuf::from(name);
         crate::observed_fixtures::observation(
@@ -50,8 +52,8 @@ fn make_nas_entry(name: &str, is_dir: bool, is_symlink: bool, size: u64, mode: u
             [0, 0, 0],
             Some(data_mover::model::OwnershipMode {
                 mode: mode,
-                uid: 0u32,
-                gid: 0u32,
+                uid: owner.uid(),
+                gid: owner.gid(),
             }),
             None,
             None,
@@ -321,6 +323,8 @@ async fn dc_creates_symlink() {
     );
     let lm = std::fs::symlink_metadata(tmp.path().join("link.txt")).unwrap();
     assert!(lm.file_type().is_symlink());
+    let owner = std::fs::metadata(tmp.path()).unwrap();
+    assert_eq!((lm.uid(), lm.gid()), (owner.uid(), owner.gid()));
     assert_eq!(
         std::fs::read_link(tmp.path().join("link.txt")).unwrap(),
         PathBuf::from("target.txt")
