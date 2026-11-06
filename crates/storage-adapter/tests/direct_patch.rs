@@ -5,9 +5,10 @@ use task_model::TransferMode;
 #[path = "../../../tests/support/observed.rs"]
 mod observed_fixtures;
 use bytes::Bytes;
+use data_mover::model::ObservedEntry;
 use data_mover::transfer::DirectPatchError;
 use std::{error::Error, os::unix::fs::MetadataExt, path::Path};
-use storage_adapter::{CreateStorageOptions, ObservedEntry, StorageContext, StorageError, create_storage};
+use storage_adapter::{CreateStorageOptions, StorageContext, StorageError, create_storage};
 use tokio::sync::mpsc;
 use tokio::time::{Duration, timeout};
 use tokio_util::sync::CancellationToken;

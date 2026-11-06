@@ -2,9 +2,9 @@ use data_mover::storage::PositionedChunk;
 #[path = "../../../tests/support/observed.rs"]
 mod observed_fixtures;
 use bytes::Bytes;
+use data_mover::filter::parse_filter_expression;
 use data_mover::traversal::TraversalOutcome;
 use std::{collections::BTreeSet, path::Path, sync::Arc, time::Duration};
-use storage_adapter::filter::parse_filter_expression;
 use task_model::{ObservedEntryExt, TransferMode};
 use tempfile::TempDir;
 use tokio::fs::{create_dir_all, write};
@@ -120,9 +120,7 @@ async fn scan_filter_and_depth_are_applied_by_role_traversal() -> TestResult {
             None,
             WalkOptions {
                 depth: Some(2),
-                match_expressions: Some(storage_adapter::filter::parse_filter_expression(
-                    "extension == \"txt\"",
-                )?),
+                match_expressions: Some(data_mover::filter::parse_filter_expression("extension == \"txt\"")?),
                 ..Default::default()
             },
         )
@@ -275,9 +273,7 @@ async fn packaged_date_directory_stops_traversal_at_requested_package_depth() ->
                 WalkOptions {
                     packaged: true,
                     package_depth: depth,
-                    match_expressions: Some(storage_adapter::filter::parse_filter_expression(
-                        "dir_date <= 20260101",
-                    )?),
+                    match_expressions: Some(data_mover::filter::parse_filter_expression("dir_date <= 20260101")?),
                     ..Default::default()
                 },
             )

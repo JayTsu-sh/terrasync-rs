@@ -9,6 +9,7 @@ use crate::{
     },
     error::{AppError, Result},
 };
+use data_mover::traversal::RemoteScanFailure;
 use data_mover::{
     model::ObservedEntry,
     traversal::{TraversalOrder, TraversalOutcome},
@@ -21,7 +22,7 @@ use std::{
     sync::Arc,
     time::{Duration, Instant},
 };
-use storage_adapter::{RemoteScanFailure, ResumableScan, ResumableScanItem, StorageError};
+use storage_adapter::{ResumableScan, ResumableScanItem, StorageError};
 #[cfg(feature = "lab-fault-injection")]
 use tokio::time::sleep;
 use tokio::{
@@ -210,7 +211,7 @@ mod outcome_tests {
     #[test]
     fn source_failure_and_database_uncertainty_are_both_preserved() {
         use data_mover::model::{BackendKind, Operation, StoragePath};
-        use storage_adapter::RemoteScanFailureKind;
+        use data_mover::traversal::RemoteScanFailureKind;
         let failure = RemoteScanFailure {
             backend: BackendKind::Nfs,
             operation: Operation::Traverse,
@@ -241,7 +242,7 @@ mod outcome_tests {
     #[test]
     fn final_storage_failure_is_not_relabelled_by_query_cancellation() {
         use data_mover::model::{BackendKind, Operation, StoragePath};
-        use storage_adapter::RemoteScanFailureKind;
+        use data_mover::traversal::RemoteScanFailureKind;
         let failure = RemoteScanFailure {
             backend: BackendKind::Cifs,
             operation: Operation::Traverse,

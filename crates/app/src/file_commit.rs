@@ -14,8 +14,9 @@ use task_model::ObservedEntryExt;
 
 // 外部 crate
 use bytes::{Bytes, BytesMut};
+use data_mover::model::ObservedEntry;
 use storage_adapter::error::Result as StorageResult;
-use storage_adapter::{ObservedEntry, StorageContext, StorageError, StreamChunk, StreamHandle};
+use storage_adapter::{StorageContext, StorageError, StreamChunk, StreamHandle};
 use sync_delta::DeltaToken;
 use sync_delta::reconstruct::{ReconstructStep, Reconstructor};
 use task_model::observation::ObservedItem;

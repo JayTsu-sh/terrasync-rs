@@ -16,8 +16,9 @@ use task_model::observation::ObservedItem;
 use transport::chunk::DataChunk;
 
 use crate::remote_inventory::{DirectoryPages, NdxEvent};
-use storage_adapter::qos::QosManager;
-use storage_adapter::{ObservedEntry, StorageContext, StorageError};
+use data_mover::model::ObservedEntry;
+use data_mover::qos::QosManager;
+use storage_adapter::{StorageContext, StorageError};
 use sync_delta::DeltaToken;
 use sync_delta::matcher::DeltaMatcher;
 use task_model::{ChangeKind, ErrorEvent, StorageEntryMessage};

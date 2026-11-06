@@ -3,7 +3,8 @@ use data_mover::qos::SourceQosSetupError;
 use task_model::TaskModelError;
 use tokio::task::JoinError;
 
-use crate::{MismatchDataField, MismatchMetaField, RemoteScanFailure, TransferMode};
+use crate::{MismatchDataField, MismatchMetaField, TransferMode};
+use data_mover::traversal::RemoteScanFailure;
 use data_mover::{
     metadata::{MetadataApplicationFailure, MetadataPlanError},
     model::{BackendKind, EntryOperationFailure, FailureClass, ModelValueError, StoragePath},

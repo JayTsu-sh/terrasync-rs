@@ -10,14 +10,13 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use task_model::ObservedEntryExt;
 
 // 外部 crate
-use storage_adapter::qos::QosManager;
+use data_mover::model::ObservedEntry;
+use data_mover::qos::QosManager;
+use storage_adapter::{AsyncReceiver, StorageContext};
+use task_model::StorageEntryMessage;
 use tracing::{error, info};
 use transport::message::SenderMsg;
 use transport::traits::SenderTransport;
-use {
-    storage_adapter::{AsyncReceiver, ObservedEntry, StorageContext},
-    task_model::StorageEntryMessage,
-};
 
 // 内部模块
 use crate::broadcast::BroadcastForwarder;

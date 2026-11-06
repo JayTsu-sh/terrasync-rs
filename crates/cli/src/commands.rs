@@ -22,7 +22,7 @@ use app::config::SyncJobConfig;
 use app::orchestrator::SyncOrchestrator;
 use app::prelude::{integrity_check, parse_bandwidth_string, rm, scan, sync};
 use app::storage_factory::{StorageRole, create_storage_for_role};
-use storage_adapter::redact_storage_url;
+use data_mover::redact_storage_url;
 use tracing::info;
 use transport::quic;
 use utils::app_config::AppConfig;

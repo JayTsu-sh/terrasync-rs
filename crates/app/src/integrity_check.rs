@@ -26,15 +26,15 @@ use storage_adapter::backend_kind_from_location;
 use task_model::ErrorEvent;
 use task_model::ObservedEntryExt;
 
+use data_mover::model::ObservedEntry;
+use data_mover::redact_storage_url;
 use storage_adapter::error::StorageError;
-use tracing::{Instrument, debug, error, info, info_span, instrument, warn};
-use {
-    storage_adapter::{
-        IntegrityCheck, IntegrityCheckMode, IntegrityCheckOptions, MismatchDataField, MismatchMetaField,
-        MtimePrecision, ObservedEntry, StorageContext, redact_storage_url,
-    },
-    task_model::StorageEntryMessage,
+use storage_adapter::{
+    IntegrityCheck, IntegrityCheckMode, IntegrityCheckOptions, MismatchDataField, MismatchMetaField, MtimePrecision,
+    StorageContext,
 };
+use task_model::StorageEntryMessage;
+use tracing::{Instrument, debug, error, info, info_span, instrument, warn};
 
 use crate::broadcast::{BroadcastForwarder, DEFAULT_CHANNEL_CAPACITY};
 use crate::config::{JobType, ScanConfig, initialize_consumer_config};

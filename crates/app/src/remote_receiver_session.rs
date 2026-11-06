@@ -16,7 +16,8 @@ use task_model::TransferMode;
 use task_model::observation::ObservedItem;
 use tokio_util::sync::CancellationToken;
 
-use storage_adapter::{ObservedEntry, Result as StorageResult, StorageContext};
+use data_mover::model::ObservedEntry;
+use storage_adapter::{Result as StorageResult, StorageContext};
 use tokio::sync::mpsc::{Receiver, Sender};
 use tracing::{debug, info, warn};
 use transport::chunk::DataChunk;

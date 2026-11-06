@@ -1,12 +1,13 @@
 use crate::ObservedEntryExt;
 use crate::connected::path;
 use crate::error::operation;
-use crate::{ObservedEntry, Result, StorageContext, StorageError};
+use crate::{Result, StorageContext, StorageError};
 use data_mover::integrity::MtimePrecision as NativeMtimePrecision;
 use data_mover::integrity::{
     self, IntegrityDifference, IntegrityMode, IntegrityOptions, IntegrityPlan, IntegrityRequest,
 };
 use data_mover::model::EntryKind;
+use data_mover::model::ObservedEntry;
 use data_mover::storage::PrincipalIdentity;
 use std::time::Duration;
 use task_model::observation::timestamp_nanos as nanos;

@@ -11,12 +11,12 @@ use crate::scan::{
     ScanRequest,
     cancellation::{self, ScanCancellation},
 };
+use data_mover::filter::parse_filter_expression;
 use data_mover::model::ObservedEntry;
 use data_mover::traversal::{Resumable, TraversalOrder};
 use db::scan::ScanResumeStatistics;
 use db::scan::{COMPLETED, FINALIZING, RUNNING, ScanResumeState};
 use db::scan::{ScanFinalEvent, ScanStore};
-use storage_adapter::filter::parse_filter_expression;
 use tokio::{join, select, task::spawn_blocking};
 use tracing::{info, warn};
 use utils::app_config::AppConfig;

@@ -12,7 +12,8 @@ use task_model::TransferMode;
 use app::disk_commit::disk_commit_task;
 use app::receiver::ReceiverProgress;
 use bytes::Bytes;
-use storage_adapter::{ObservedEntry, StorageContext, create_storage};
+use data_mover::model::ObservedEntry;
+use storage_adapter::{StorageContext, create_storage};
 use tokio_util::sync::CancellationToken;
 use transport::message::{DcAck, DiskCommitMsg, FileOutcome, ReceiverMsg, SessionConfig};
 

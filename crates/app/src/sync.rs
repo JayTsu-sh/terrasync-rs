@@ -20,7 +20,11 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 
 // 外部crate
-use storage_adapter::qos::QosManager;
+use data_mover::model::ObservedEntry;
+use data_mover::qos::QosManager;
+use data_mover::redact_storage_url;
+use storage_adapter::{CopyOptions, StorageContext};
+use task_model::{ErrorEvent, StorageEntryMessage};
 use tracing::{Instrument, debug, error, info, info_span, instrument, trace, warn};
 #[cfg(windows)]
 use windows_sys::Win32::Foundation::CloseHandle;
@@ -30,10 +34,6 @@ use windows_sys::Win32::Security::GetTokenInformation;
 use windows_sys::Win32::Security::TOKEN_QUERY;
 #[cfg(windows)]
 use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
-use {
-    storage_adapter::{CopyOptions, ObservedEntry, StorageContext, redact_storage_url},
-    task_model::{ErrorEvent, StorageEntryMessage},
-};
 
 // 内部模块
 use crate::broadcast::BroadcastForwarder;

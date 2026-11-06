@@ -9,12 +9,11 @@ use storage_adapter::WalkOptions;
 use task_model::ObservedEntryExt;
 
 // 内部模块
-use storage_adapter::qos::QosManager;
+use data_mover::model::ObservedEntry;
+use data_mover::qos::QosManager;
+use storage_adapter::WalkDirAsyncIterator;
 use storage_adapter::{StorageContext, StorageError};
-use {
-    storage_adapter::{ObservedEntry, WalkDirAsyncIterator},
-    task_model::StorageEntryMessage,
-};
+use task_model::StorageEntryMessage;
 // 外部crate
 use tracing::{debug, info};
 

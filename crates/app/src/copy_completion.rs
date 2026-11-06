@@ -4,8 +4,9 @@ use std::sync::Arc;
 use std::thread::JoinHandle as ThreadHandle;
 
 use data_mover::model::BackendKind;
+use data_mover::model::ObservedEntry;
 use db::ClickHouseDatabase;
-use storage_adapter::{ObservedEntry, StorageContext};
+use storage_adapter::StorageContext;
 use task_model::ObservedEntryExt;
 use tokio::sync::mpsc::{self, Receiver};
 use tokio::task::{JoinError, JoinHandle, JoinSet};

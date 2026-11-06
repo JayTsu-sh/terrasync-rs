@@ -32,11 +32,14 @@ impl Drop for AtomicCounterGuard<'_> {
 }
 
 // 外部 crate
+use data_mover::model::ObservedEntry;
+use data_mover::qos::QosManager;
 use db::ClickHouseDatabase;
 use db::{self, DeletionStatus, INCREMENTAL_SCAN_TABLE_BASE_NAME};
+use storage_adapter::StorageContext;
 #[cfg(windows)]
 use storage_adapter::backend_kind_from_location;
-use storage_adapter::qos::QosManager;
+use task_model::{ChangeKind, EntryChange, ErrorEvent, StorageEntryMessage};
 use tokio::sync::Semaphore;
 use tokio::task::JoinHandle;
 use tracing::{Instrument, error, info, info_span, trace, warn};
@@ -44,10 +47,6 @@ use transport::in_process::create_in_process_pair;
 use transport::message::SenderMsg;
 use transport::traits::{ReceiverTransport, SenderTransport};
 use utils::app_config::AppConfig;
-use {
-    storage_adapter::{ObservedEntry, StorageContext},
-    task_model::{ChangeKind, EntryChange, ErrorEvent, StorageEntryMessage},
-};
 
 // 内部模块
 use crate::broadcast::{BroadcastForwarder, DEFAULT_CHANNEL_CAPACITY};
@@ -316,8 +315,8 @@ impl SyncOrchestrator {
         info!(
             "Starting sync via orchestrator: job_id({}), src({}), dest({})",
             c.job_id,
-            storage_adapter::redact_storage_url(&c.src_path),
-            storage_adapter::redact_storage_url(&c.dest_path)
+            data_mover::redact_storage_url(&c.src_path),
+            data_mover::redact_storage_url(&c.dest_path)
         );
 
         // ── 1. 加载配置 ──
@@ -696,8 +695,8 @@ impl SyncOrchestrator {
         info!(
             "Starting incremental sync via orchestrator: job_id({}), src({}), dest({})",
             c.job_id,
-            storage_adapter::redact_storage_url(&c.src_path),
-            storage_adapter::redact_storage_url(&c.dest_path)
+            data_mover::redact_storage_url(&c.src_path),
+            data_mover::redact_storage_url(&c.dest_path)
         );
 
         // ── 1. 加载配置 ──

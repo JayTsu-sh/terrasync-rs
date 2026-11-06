@@ -4,11 +4,12 @@ use task_model::ObservedEntryExt;
 use task_model::observation::ObservedItem;
 
 // 外部crate
+use data_mover::model::ObservedEntry;
 use db::ClickHouseDatabase;
 use db::error::DatabaseError;
+use task_model::StorageEntryMessage;
 use tokio::sync::mpsc;
 use tracing::{Instrument, debug, error, info, info_span, trace};
-use {storage_adapter::ObservedEntry, task_model::StorageEntryMessage};
 
 // 内部模块
 use crate::config::{ConsumerConfig, JobType};

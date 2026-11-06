@@ -16,8 +16,9 @@ use task_model::TransferMode;
 use {storage_adapter::StorageError, task_model::StorageEntryMessage};
 
 // 外部 crate
-use storage_adapter::qos::QosManager;
-use storage_adapter::{ObservedEntry, StorageContext};
+use data_mover::model::ObservedEntry;
+use data_mover::qos::QosManager;
+use storage_adapter::StorageContext;
 use tokio::sync::mpsc::Receiver as MpscReceiver;
 use tokio_util::sync::CancellationToken;
 use tracing::{Instrument, debug, error, info, info_span, trace, warn};
@@ -335,7 +336,7 @@ pub async fn receiver_task_remote(
     let session_config = recv_session_config(transport).await?;
     info!(
         "[Receiver Remote] SessionConfig: src_path={}, integrity={}, acl={}",
-        storage_adapter::redact_storage_url(&session_config.src_path),
+        data_mover::redact_storage_url(&session_config.src_path),
         session_config.enable_integrity_check,
         session_config.enable_acl
     );

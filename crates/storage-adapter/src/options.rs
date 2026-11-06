@@ -7,8 +7,8 @@ use data_mover::transfer::TransferPolicy;
 use task_model::TransferMode;
 use tokio_util::sync::CancellationToken;
 
-use crate::filter::FilterExpression;
-use crate::qos::QosManager;
+use data_mover::filter::FilterExpression;
+use data_mover::qos::QosManager;
 use data_mover::storage::HdfsConfig;
 
 #[derive(Debug, Clone)]

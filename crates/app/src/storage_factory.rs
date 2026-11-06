@@ -1,8 +1,6 @@
 use data_mover::model::BackendKind;
-use storage_adapter::{
-    BackendConfig, CreateStorageOptions, HdfsConfig, HdfsKerberosCredentials, StorageContext,
-    backend_kind_from_location,
-};
+use data_mover::storage::{HdfsConfig, HdfsKerberosCredentials};
+use storage_adapter::{BackendConfig, CreateStorageOptions, StorageContext, backend_kind_from_location};
 use utils::app_config::{AppConfig, HdfsClientConfig, StorageConfig};
 
 use crate::error::{AppError, Result};

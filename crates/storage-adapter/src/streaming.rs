@@ -2,6 +2,7 @@ use crate::copied_metadata::copied_metadata_plan;
 use crate::options::transfer_policy;
 use crate::{error::operation, *};
 use blake3::Hash;
+use data_mover::qos::QosManager;
 use data_mover::storage::{PositionedChunk, WriteProgress, WriteProgressObserver};
 use data_mover::{
     model::*,
@@ -12,7 +13,6 @@ use data_mover::{
     },
 };
 use futures::{Stream, StreamExt, stream};
-use qos::QosManager;
 use std::num::NonZeroUsize;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};

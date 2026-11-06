@@ -7,8 +7,9 @@ use task_model::TransferMode;
 use task_model::observation::ObservedItem;
 use task_model::{EntryChange, StorageEntryMessage};
 
+use data_mover::model::ObservedEntry;
 use storage_adapter::hdfs::HdfsResumeMode;
-use storage_adapter::{CommitCallback, CopyOptions, HdfsRecoverableCopyOptions, ObservedEntry, StorageContext};
+use storage_adapter::{CommitCallback, CopyOptions, HdfsRecoverableCopyOptions, StorageContext};
 
 use crate::error::{AppError, Result};
 

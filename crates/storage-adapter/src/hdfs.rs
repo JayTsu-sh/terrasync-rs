@@ -1,6 +1,7 @@
 use crate::ObservedEntryExt;
 use crate::options::transfer_policy;
 use crate::*;
+use data_mover::model::ObservedEntry;
 use data_mover::transfer::{self, ReadBackVerification, TransferIdentity, TransferRequest};
 use std::sync::{Arc, atomic::Ordering};
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

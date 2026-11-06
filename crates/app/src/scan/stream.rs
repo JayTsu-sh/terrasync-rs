@@ -8,21 +8,19 @@ use crate::{
     scan::{ScanRequest, cancellation::ScanCancellation, progress::ScanProgress},
     storage_factory::{StorageRole, create_storage_for_role},
 };
+use data_mover::filter::parse_filter_expression;
 use data_mover::{
     model::ObservedEntry,
     traversal::{TraversalOrder, TraversalOutcome},
 };
 use std::{num::NonZeroUsize, sync::Arc, time::Duration};
+use storage_adapter::{ResumableScan, ResumableScanItem, ScanSourceMode, StorageError, WalkOptions};
 #[cfg(test)]
 use tokio::task::JoinHandle;
 use tokio::time::{MissedTickBehavior, interval};
 use utils::app_config::AppConfig;
 #[cfg(test)]
 use {storage_adapter::WalkDirAsyncIterator, task_model::StorageEntryMessage};
-use {
-    storage_adapter::filter::parse_filter_expression,
-    storage_adapter::{ResumableScan, ResumableScanItem, ScanSourceMode, StorageError, WalkOptions},
-};
 
 pub(super) async fn run(request: ScanRequest<'_>, config: AppConfig) -> Result<()> {
     let cancel = ScanCancellation::new(request.cancel.clone());

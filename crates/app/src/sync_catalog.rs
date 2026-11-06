@@ -2,11 +2,12 @@
 
 use std::sync::Arc;
 
+use data_mover::model::ObservedEntry;
 use db::ClickHouseDatabase;
 use db::catalogue::ComparisonMode;
+use task_model::StorageEntryMessage;
 use tokio::task::JoinHandle;
 use tracing::{error, trace, warn};
-use {storage_adapter::ObservedEntry, task_model::StorageEntryMessage};
 
 use crate::{broadcast::BroadcastForwarder, error::Result, scan::ScanType};
 

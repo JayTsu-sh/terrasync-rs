@@ -27,10 +27,14 @@ use std::sync::{Mutex, PoisonError};
 #[cfg(test)]
 use crate::remote_inventory::NdxEvent;
 use crate::storage_factory::{StorageRole, create_storage_for_role};
+use data_mover::filter::parse_filter_expression;
+#[cfg(test)]
+use data_mover::model::ObservedEntry;
 use rustls::pki_types::CertificateDer;
 #[cfg(test)]
 use storage_adapter::StorageContext;
-use storage_adapter::filter::parse_filter_expression;
+#[cfg(test)]
+use task_model::{ChangeKind, ErrorEvent, StorageEntryMessage};
 use tokio::sync::Mutex as AsyncMutex;
 use tracing::{info, warn};
 use transport::error::TransportError;
@@ -42,11 +46,6 @@ use transport::message::{HandshakeResult, ProtocolHandshake, ReceiverMsg, Sender
 use transport::traits::SenderTransport;
 use utils::app_config::AppConfig;
 use utils::logger;
-#[cfg(test)]
-use {
-    storage_adapter::ObservedEntry,
-    task_model::{ChangeKind, ErrorEvent, StorageEntryMessage},
-};
 
 use crate::config::{JobType, SyncJobConfig};
 use crate::consumer::stats::{IncrementalStats, ProgressBar, StatisticConsumer, StatsKind};

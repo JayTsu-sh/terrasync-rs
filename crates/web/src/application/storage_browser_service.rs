@@ -4,7 +4,8 @@ use storage_adapter::StorageError;
 use task_model::ObservedEntryExt;
 
 use app::storage_factory::{StorageRole, create_storage_for_role};
-use {storage_adapter::S3BucketInfo, task_model::StorageEntryMessage};
+use data_mover::storage::S3BucketInfo;
+use task_model::StorageEntryMessage;
 
 use crate::error::Result;
 
