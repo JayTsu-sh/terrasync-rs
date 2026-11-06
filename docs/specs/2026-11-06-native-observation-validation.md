@@ -172,6 +172,26 @@ write_positioned 集中连续偏移校验、完整摘要和恢复前缀跳过；
 
 最后两项的运行脚本和摘要已保存在对应证据目录。早期新夹具把 HEAD Content-Length 错写为零、查询远端 sync 并不创建的目录表，或在 64 MiB checkpoint 前断言复用，均不作为产品回归或通过证据；未降低最终内容、ACK 或前缀复用断言。
 
+## 删除旧恢复上下文与共享归档清单
+
+`ResumeContext`、忽略的恢复参数和伪造的 part 路径已删除；原生目标端仍是续传权威，实际使用的 CommitRecorder／HDFS 提交回调保留。应用直接构造 TarRequest，删除 adapter 的归档转发层；任务事件、transport 和数据库借用同一 Arc 清单，原生流游标使用索引，不克隆每个观察句柄。
+
+结构提交为 `8cdf221`、`d5218a6`。随后三个原生行为修复独立提交：`1098432` 在每个文件读前／EOF 后共用观察校验，并按 Atomic 策略清理；`4edb721` 从独立 PermissionFacts 投影权限和已知数字主体；`8277b3c` 将 TAR mode 限定为权限位，类型由 typeflag 表达。未知权限 facet 不回退到旧数字字段，Named 主体不猜测 UID／GID；set-id 继续使用模型的共同安全规则。
+
+检测到源变化会保留 typed Source／Read／Conflict，发生在计数、删源及成功 manifest 通知之前。清理保留原失败、发布状态及独立清理错误，不回滚已发布最终对象。这不提供可变目录的原子快照；删除归档源仍要求调用方独占控制。
+
+原生最终 make ci 通过，记录 `/tmp/data-mover-tar-type-bits-final-v2-ci.log`，其中 7 个权限投影用例及 10 个真实 Local role 归档用例通过。TerraSync 最终 fmt、workspace check／Clippy、528 个 workspace 测试及串行双进程 E2E 16 例通过；85 个忽略项未计通过。日志前缀 `/tmp/terrasync-tar-guards-v2-`。前端 157 个测试与构建、MCP 7 个测试通过，记录前缀 `/tmp/terrasync-refactor-web-`、`/tmp/terrasync-refactor-mcp-`。
+
+对应依赖精确固定 `8277b3cedc9a20e2b4cce449a03f03596b2318c7`；release SHA-256 为 `df5099bb961689d0b42ceaa84964c7ce7cba472b355e13c9e6bd87ac29bda151`，源码记录 `/tmp/terrasync-tar-guards-v2-build-source.json`。以下 45 个真实场景使用该同一候选，全部通过且独立资源清理成功；脚本与二进制源码摘要保存在报告同目录：
+
+- Local→S3 + ClickHouse Single／Cluster 归档 2 例：`/work/terrasync-db-refactor-evidence/release-db-refactor-tar-guards-v2-header-20261106-001939/report.json`。核对完整内容、长路径、0640、PAX 时间、manifest 与已发布观察。
+- S3 归档源变化 + Single／Cluster 8 例：`/work/terrasync-db-refactor-evidence/release-db-refactor-tar-guards-v2-stale-20261106-001939/report.json`。读前增长、等长修改、空文件变非空，以及真实 GET 后交付前修改源并要求删源；均保留变化后的源与旧目标，无完成行／manifest，有 typed Source Conflict，对应目标前缀无残留 multipart 或额外对象。
+- Kerberos HDFS + ClickHouse Single／Cluster 各 15 例：`/work/terrasync-db-refactor-evidence/release-db-refactor-tar-guards-v2-hdfs-single-20261106-001951/report.json`、`/work/terrasync-db-refactor-evidence/release-db-refactor-tar-guards-v2-hdfs-cluster-20261106-002004/report.json`。包含 unordered／blocks 两轮、Local／HDFS／QUIC、完整性、真实 0640 与目录 sticky 权限，以及 HDFS→Local／HDFS 归档和回读；header 和 manifest 保留真实 mode，manifest 的未知数字主体仍为 null。
+- S3／QUIC delta 3 例：`/work/terrasync-db-refactor-evidence/release-db-refactor-tar-guards-v2-delta-20261106-001952/report.json`。Atomic／Checkpoint 的实际 basis 范围读取与 ACK，以及拒绝一次 GET 后保持类型并完整回退；远端 sync 不使用数据库，不计为两种 ClickHouse 部署证据。
+- S3 源断连与续传 2 例：`/work/terrasync-db-refactor-evidence/release-db-refactor-tar-guards-v2-source-cut-20261106-002009/report.json`。实际 64 MiB checkpoint 后断连，保留 8 个 part；同一任务重试只上传 9／10／11，完整内容、tags 与 ACK 正确。总执行耗时不代表独立的故障检测／恢复窗口。
+
+本轮保留的有效失败对照包括：源变化后错误发布并删掉新源的 `/work/terrasync-db-refactor-evidence/release-db-refactor-tar-stale-red-20261105-233802/report.json`；旧 HDFS header 不保留独立权限的 `/work/terrasync-db-refactor-evidence/release-db-refactor-shared-tar-hdfs-single-valid-20261105-230640/report.json`；中间候选 Local mode 混入类型位的 `/work/terrasync-db-refactor-evidence/release-db-refactor-tar-guards-header-20261106-000517/report.json`。最后一项的 Local 最小复现为 0100640；原生真实 Local 回归修复前失败记录 `/tmp/data-mover-tar-type-bits-red.log`。这些失败报告不计为通过，未放宽最终断言。
+
 ## 合入前仍须完成
 
 还需完成数据库目录会话与任务接口的整理，以及按设计删除 storage-adapter。任务契约与 transport 已分离，剩余存储机制和产品配置仍须分别归位。最终候选必须重跑对应 CI、真实 HDFS 和受影响故障链路，并完成全量／增量／续扫性能与峰值 RSS 对照。先前 HDFS 通过的二进制不能作为最终候选证据。
