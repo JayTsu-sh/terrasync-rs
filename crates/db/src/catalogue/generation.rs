@@ -46,7 +46,6 @@ impl ClickHouseDatabase {
 
     /// 插入或更新扫描状态（id=1，利用 `ReplacingMergeTree` 自动去重）
     pub async fn insert_scan_state(&self, scan_state: u8) -> Result<()> {
-        self.ensure_baseline_committed_column().await?;
         self.insert_scan_state_with_baseline(scan_state, true).await
     }
 

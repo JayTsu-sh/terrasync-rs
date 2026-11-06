@@ -277,11 +277,6 @@ impl ClusterScanStore {
         let path = format!("/clickhouse/terrasync/{}/scan_resume_local/{{shard}}", self.database);
         self.client.query(&format!("CREATE TABLE IF NOT EXISTS {database}.scan_resume_local ON CLUSTER {cluster} ({columns}) ENGINE = ReplicatedReplacingMergeTree('{path}','{{replica}}',version) PARTITION BY job_id ORDER BY job_id")).execute_scan().await?;
         self.client.query(&format!("CREATE TABLE IF NOT EXISTS {database}.scan_resume ON CLUSTER {cluster} AS {database}.scan_resume_local ENGINE = Distributed({cluster},{database},scan_resume_local,cityHash64(job_id))")).execute_scan().await?;
-        for table in ["scan_resume_local", "scan_resume"] {
-            for column in ["baseline_snapshot", "checkpoint_snapshot"] {
-                self.client.query(&format!("ALTER TABLE {database}.{table} ON CLUSTER {cluster} ADD COLUMN IF NOT EXISTS {column} String DEFAULT ''")).execute_scan().await?;
-            }
-        }
         Ok(())
     }
 

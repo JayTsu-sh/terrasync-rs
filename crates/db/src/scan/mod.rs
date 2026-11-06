@@ -1,4 +1,4 @@
-//! 扫描持久化接口：单机兼容旧作业；集群使用按 job_id 隔离的共享表。
+//! 扫描持久化接口：单机按作业分表；集群使用按 job_id 隔离的共享表。
 use crate::scan::cluster::ClusterScanStore;
 use crate::schema::entry::EntrySummary as StorageEntryRecord;
 use crate::{
@@ -86,7 +86,7 @@ impl ScanStore {
     pub(crate) async fn ensure_metadata_available(config: &ClickHouseConfig, job: &str) -> Result<()> {
         ScanCuts::ensure_metadata_available(config, job).await
     }
-    /// 集群批次独享临时分区，连接池与扫描轮次共享；单机保留串行兼容路径。
+    /// 集群批次独享临时分区，连接池与扫描轮次共享；单机串行写入。
     pub fn batch_writer(&self) -> Option<Self> {
         match &self.inner {
             Store::Cluster(store) => Some(Self {
@@ -193,10 +193,10 @@ impl ScanStore {
             Store::Cluster(store) => store.prepare_incremental().await,
         }
     }
-    pub async fn prepare_native_schema(&self) -> Result<()> {
+    pub async fn prepare_native_writes(&self) -> Result<()> {
         match &self.inner {
-            Store::Single(store) => store.prepare_native_schema().await,
-            Store::Cluster(store) => store.prepare_native_schema().await,
+            Store::Single(store) => store.prepare_native_writes().await,
+            Store::Cluster(_) => Ok(()),
         }
     }
     pub async fn has_baseline(&self) -> Result<bool> {

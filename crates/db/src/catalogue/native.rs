@@ -12,7 +12,7 @@ use crate::execution::queries::execution_active;
 use crate::execution::queries::{ScanExecute, check_scan_cancellation, execute_request, idempotent_insert_client};
 use crate::execution::read::QuorumRead;
 use crate::scan::ScanFinalEvent;
-use crate::scan::candidate_cache::{CandidateMetadataCache, missing_hash_columns};
+use crate::scan::candidate_cache::CandidateMetadataCache;
 use crate::scan::compare::NativeScanAccess;
 use crate::scan::rows::{NativeScanKey, NativeScanRecord, NativeWriteBatches, OBSERVED_COLUMNS, event_records};
 use crate::scan::rows::{final_event_records, incremental_record};
@@ -23,20 +23,11 @@ use crate::{
 };
 
 impl ClickHouseDatabase {
-    pub(crate) async fn prepare_native_schema(&self) -> Result<()> {
+    pub(crate) async fn prepare_native_writes(&self) -> Result<()> {
         let tables = [
             get_scan_base_table_name(&self.job_id),
             format!("scan_resume_batch_{}", sanitize_job_id(&self.job_id)),
         ];
-        for table in missing_hash_columns(&self.sync_client, &tables).await? {
-            check_scan_cancellation()?;
-            self.sync_client
-                .query(&format!(
-                    "ALTER TABLE {table} ADD COLUMN IF NOT EXISTS metadata_hash Nullable(String) DEFAULT NULL"
-                ))
-                .execute_idempotent_scan()
-                .await?;
-        }
         if execution_active() {
             for table in tables.into_iter().chain([
                 get_incremental_scan_base_table_name(&self.job_id),

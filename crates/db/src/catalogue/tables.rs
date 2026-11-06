@@ -55,21 +55,12 @@ impl ClickHouseDatabase {
         let table_name = get_scan_state_table_name(&self.job_id);
         self.create_catalogue_table(
             &table_name,
-            "id UInt8, scan_state UInt8, baseline_committed Bool DEFAULT true",
+            "id UInt8, scan_state UInt8, baseline_committed Bool DEFAULT false, \
+             copy_in_progress Bool DEFAULT false, copy_request_key String DEFAULT ''",
             "id",
             CatalogueEngine::Replacing,
         )
         .await?;
-        self.ensure_baseline_committed_column().await?;
-
-        Ok(())
-    }
-
-    pub(super) async fn ensure_baseline_committed_column(&self) -> Result<()> {
-        let table = get_scan_state_table_name(&self.job_id);
-        // 兼容旧状态行的已有基线；新任务在首次成功提交前显式写入 false。
-        self.add_catalogue_column(&table, "baseline_committed Bool DEFAULT true")
-            .await?;
         Ok(())
     }
 
@@ -79,7 +70,6 @@ impl ClickHouseDatabase {
         if !self.table_exists(&table).await? {
             return Ok(false);
         }
-        self.ensure_baseline_committed_column().await?;
         match self
             .sync_client
             .query(&format!("SELECT baseline_committed FROM {table} FINAL WHERE id=1"))

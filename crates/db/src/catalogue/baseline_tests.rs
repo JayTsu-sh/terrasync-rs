@@ -33,12 +33,13 @@ async fn fresh_initialization_keeps_the_baseline_uncommitted() -> Result<()> {
     let _base = mock.add(handlers::record_ddl());
     mock.add(handlers::provide(["relative_path, version_id".to_string()]));
     let schema = mock.add(handlers::record_ddl());
-    let migration = mock.add(handlers::record_ddl());
     mock.add(handlers::provide(Vec::<u8>::new()));
     let initial = mock.add(handlers::record_ddl());
     database.initialize().await?;
-    assert!(schema.query().await.contains("baseline_committed Bool DEFAULT true"));
-    assert!(migration.query().await.contains("ADD COLUMN IF NOT EXISTS"));
+    let ddl = schema.query().await;
+    assert!(ddl.contains("baseline_committed Bool DEFAULT false"));
+    assert!(ddl.contains("copy_in_progress Bool DEFAULT false"));
+    assert!(ddl.contains("copy_request_key String DEFAULT ''"));
     let insert = initial.query().await;
     assert!(insert.contains("(id, scan_state, baseline_committed)"));
     assert!(insert.ends_with("VALUES (1, 0, false)"), "{insert}");
@@ -46,7 +47,6 @@ async fn fresh_initialization_keeps_the_baseline_uncommitted() -> Result<()> {
     // 重连不能把已经建好的表当成已完成基线。
     let reopened = mocked_database(&mock, "initial_baseline");
     mock.add(handlers::provide([1u64]));
-    mock.add(handlers::record_ddl());
     mock.add(handlers::provide([false]));
     assert!(!reopened.has_committed_baseline().await?);
     Ok(())
@@ -59,7 +59,6 @@ async fn missing_or_empty_state_has_no_committed_baseline() -> Result<()> {
     mock.add(handlers::provide([0u64]));
     assert!(!database.has_committed_baseline().await?);
     mock.add(handlers::provide([1u64]));
-    mock.add(handlers::record_ddl());
     mock.add(handlers::provide(Vec::<bool>::new()));
     assert!(!database.has_committed_baseline().await?);
     Ok(())
@@ -70,7 +69,6 @@ async fn generation_commit_publishes_generation_and_baseline_in_one_row() -> Res
     let mock = Mock::new();
     let database = mocked_database(&mock, "committed_baseline");
     database.generation_lifecycle.lock().await.working = Some(1);
-    mock.add(handlers::record_ddl());
     let committed = mock.add(handlers::record_ddl());
     database.commit_scan_generation().await?;
     let insert = committed.query().await;
@@ -79,7 +77,6 @@ async fn generation_commit_publishes_generation_and_baseline_in_one_row() -> Res
     // 重新初始化必须保留已提交的状态行。
     mock.add(handlers::record_ddl());
     mock.add(handlers::provide(["relative_path, version_id".to_string()]));
-    mock.add(handlers::record_ddl());
     mock.add(handlers::record_ddl());
     mock.add(handlers::provide([1u8]));
     database.initialize().await?;
@@ -162,21 +159,26 @@ async fn real_reopen_before_first_resume_state_remains_full_until_commit() -> Re
 
 #[tokio::test]
 #[ignore = "requires explicit LAB_CLICKHOUSE_DSN; creates and removes an isolated database"]
-async fn real_legacy_state_row_remains_a_committed_baseline() -> Result<()> {
+async fn real_fresh_state_supports_copy_recovery_and_committed_baseline() -> Result<()> {
     let (config, _guard) = isolated_database().await?;
-    let database = ClickHouseDatabase::new(&config, "legacy").unwrap();
-    database.create_scan_base_table().await?;
-    database
-        .execute(
-            "CREATE TABLE state_legacy (id UInt8,scan_state UInt8) ENGINE=ReplacingMergeTree ORDER BY id",
-            &[],
-        )
-        .await?;
-    database.execute("INSERT INTO state_legacy VALUES (1,1)", &[]).await?;
-    assert!(database.has_committed_baseline().await?);
-    assert!(database.resume_execution_is_incremental().await?);
-    assert_eq!(database.query_scan_state().await?, Some(1));
+    let database = ClickHouseDatabase::new(&config, "fresh_copy").unwrap();
     database.initialize().await?;
+    assert!(!database.has_committed_baseline().await?);
+    assert_eq!(
+        database.begin_copy_generation("source-to-target").await?,
+        super::CopyGenerationStatus::Fresh
+    );
+    drop(database);
+    let database = ClickHouseDatabase::new(&config, "fresh_copy").unwrap();
+    assert_eq!(
+        database.begin_copy_generation("source-to-target").await?,
+        super::CopyGenerationStatus::Recovering
+    );
+    database.commit_scan_generation().await?;
     assert!(database.has_committed_baseline().await?);
+    assert_eq!(
+        database.begin_copy_generation("another-source-to-target").await?,
+        super::CopyGenerationStatus::Fresh
+    );
     Ok(())
 }

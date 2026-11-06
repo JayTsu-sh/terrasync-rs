@@ -73,7 +73,7 @@ async fn cancelled_empty_events_still_report_cancellation() -> Result<()> {
 async fn schema_initialization_is_shared_by_concurrent_store_and_writer_calls() -> Result<()> {
     let mock = Mock::new();
     mock.add(handlers::provide::<String>([]));
-    let statements: Vec<_> = (0..16).map(|_| mock.add(handlers::record_ddl())).collect();
+    let statements: Vec<_> = (0..12).map(|_| mock.add(handlers::record_ddl())).collect();
     let store = mock_schema_store(&mock)?;
     let writer = store.batch_writer();
     let (first, concurrent) = join!(store.initialize(), writer.initialize());
@@ -95,7 +95,7 @@ async fn schema_initialization_failure_can_retry_before_becoming_ready() -> Resu
     let store = mock_schema_store(&mock)?;
     assert!(store.initialize().await.is_err());
     mock.add(handlers::provide::<String>([]));
-    for _ in 0..16 {
+    for _ in 0..12 {
         mock.add(handlers::record_ddl());
     }
     store.initialize().await?;
@@ -603,23 +603,11 @@ async fn cluster_native_candidate_cache_rechecks_content_state_and_tombstones() 
 
 #[tokio::test]
 #[ignore = "requires a real multi-shard ClickHouse cluster"]
-async fn cluster_native_candidate_cache_upgrades_local_and_distributed_columns() -> Result<()> {
+async fn cluster_fresh_schema_includes_candidate_hash_on_every_replica() -> Result<()> {
     let (config, _admin, _guard, cluster, _) = fixture().await?;
     let store = ClusterScanStore::new(&config, &cluster, "cache_schema")?;
     store.load_resume_state().await?;
-    let database = identifier(&config.database)?;
-    let cluster = identifier(&cluster)?;
     let tables = ["base", "base_local", "scan_resume_batch", "scan_resume_batch_local"];
-    for table in tables {
-        store
-            .client
-            .query(&format!(
-                "ALTER TABLE {database}.{table} ON CLUSTER {cluster} DROP COLUMN metadata_hash"
-            ))
-            .execute_scan()
-            .await?;
-    }
-    store.prepare_native_schema().await?;
     let columns:u64 = store.client.query("SELECT count() FROM clusterAllReplicas(?,system.columns) WHERE database=? AND table IN ? AND name='metadata_hash'")
         .bind(&store.cluster).bind(&config.database).bind(tables).fetch_one().await?;
     let nodes: u64 = store
@@ -898,7 +886,7 @@ async fn cluster_native_replayed_path_restoring_original_identity_is_not_deleted
 
 #[tokio::test]
 #[ignore = "requires a real multi-shard ClickHouse cluster"]
-async fn cluster_shared_native_observations_roundtrip_merge_replay_and_legacy_baseline() -> Result<()> {
+async fn cluster_shared_native_observations_roundtrip_merge_replay_and_deletions() -> Result<()> {
     let (config, _admin, _guard, cluster, epoch) = fixture().await?;
     let mut store = ClusterScanStore::new(&config, &cluster, "native_a")?;
     let other = ClusterScanStore::new(&config, &cluster, "native_b")?;
@@ -910,13 +898,12 @@ async fn cluster_shared_native_observations_roundtrip_merge_replay_and_legacy_ba
         native_entry("changed", 100, None)?,
         native_entry("victim", 7, None)?,
         native_entry("a/old", 5, Some(b"rename"))?,
+        native_entry("missing", 3, None)?,
     ];
 
     store.write_native(&initial, false).await?;
     other.save_resume_state(&state(epoch + 1, false, 1)).await?;
     other.write_native(&[native_entry("same", 999, None)?], false).await?;
-    // 旧 GUI 结果没有 snapshot；升级后的增量删除必须仍能读取。
-    store.client.query("INSERT INTO base (job_id,epoch,ver,name,relative_path,size,is_regular_file,current_state) VALUES ('native_a',?,fromUnixTimestamp64Nano(?),'legacy','legacy',3,1,1)").bind(epoch as u64).bind(epoch).execute().await?;
     full.phase = FINALIZING;
     full.version += 1;
     store.save_resume_state(&full).await?;

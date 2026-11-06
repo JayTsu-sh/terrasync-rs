@@ -48,18 +48,6 @@ impl ClickHouseDatabase {
             &[],
         )
         .await?;
-        self.execute(
-            &format!("ALTER TABLE {table} ADD COLUMN IF NOT EXISTS statistics String DEFAULT ''"),
-            &[],
-        )
-        .await?;
-        for column in ["baseline_snapshot", "checkpoint_snapshot"] {
-            self.execute(
-                &format!("ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {column} String DEFAULT ''"),
-                &[],
-            )
-            .await?;
-        }
         match self
             .sync_client
             .query(&format!(

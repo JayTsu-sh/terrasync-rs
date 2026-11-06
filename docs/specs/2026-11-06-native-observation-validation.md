@@ -431,3 +431,52 @@ Cluster `/work/terrasync-db-refactor-evidence/release-db-refactor-request-packin
 
 上游为满足 strict 分支保护合并 main 为 924c2c8；相对 0070c159 仅增加 Direct 中途取消测试及夹具支持，没有运行时代码变化。
 新的 GitHub CI 仍在等待，未绕过保护规则；下游 native pin 的运行时代码与该合并头一致。
+
+
+## 删除旧 schema 升级及完整当前建表契约
+
+上游 PR #185 已于 2026-11-06 合入 main，merge commit 为 `b47b31d660c8e4ee27bf3c0a998d9836332b5d45`。
+924c2c8 的 Linux 完整 CI、Windows HDFS compile contract 和 Windows native runtime 均通过。
+原始 main 工作区已快进；只删除本任务的 native feature worktree、对应本地／远端分支。
+下游固定的 0070c159 是合入历史中的祖先，运行时代码与上游最终树一致。
+
+按照首次开发不保留旧版本兼容的约束，删除 metadata_hash、baseline_committed、statistics 与 snapshot 字段的探测和 ADD COLUMN。
+这些升级分支在基点已存在，本轮将其作为 db 完整整理的一部分独立删除。
+state 的完整建表定义现在直接包含 copy_in_progress／copy_request_key；默认 baseline_committed=false，首次成功提交才显式置 true。
+当前复制 request 绑定、失败代次回标、checkpoint 捕获／恢复、Single 写去重窗口及 readiness 均保留。
+准备方法按实际剩余职责改为 prepare_native_writes，Cluster 不保留空升级方法。
+旧列升级 fixture 改为真实 fresh schema；复制首次 Fresh→重开 Recovering→提交→不同 request Fresh 的真实回归保留当前恢复要求。
+
+候选 `/work/terrasync-db-refactor-current-schema`，SHA-256
+`26169e5082494e54a085c2b80254e7236235ae98a5e3eec3fda73253173c272c`；
+来源 `/tmp/terrasync-current-schema-build-source.json`，基于 a88945d 加当前 schema 清理。
+最终冻结源指纹为 `/tmp/terrasync-current-schema-build-capture-v3.json`。
+fmt、workspace all-features/all-targets check／Clippy、workspace **539 通过、86 忽略**、串行双进程 E2E **16 通过**。
+日志 `/tmp/terrasync-current-schema-final-{fmt,check,clippy,tests,e2e}-v3.log`，release 构建日志同阶段 v3。
+早期 check 因集成测试未同步方法名而失败；v2 构建期间补齐旧升级 fixture 后指纹检查拒绝采纳，未把它作为最终二进制来源。
+
+真实 DB 契约 **76 项通过**：
+- `/tmp/terrasync-db-refactor-real-current-schema-v1-{single,cluster}-catalogue.json`：11＋12。
+- `/tmp/terrasync-db-refactor-real-current-schema-v2-single.json`：44。
+- 同 v2 single-cuts／cluster-cuts：各 3；single-baseline：2；cluster-fresh：1（六副本的 fresh 列定义）。
+临时库与 fixture 清理均通过。最初 v1 Single 的旧补列测试失败不计为通过；替换首次建表契约后完整 44 项通过。
+两轴审查未发现本轮清理引入的职责、恢复或身份安全阻断。
+
+## 三轮热缓存 NFS 诊断结果
+
+报告 `/work/terrasync-db-refactor-evidence/release-db-refactor-packing-matrix-20261106-055848/report.json`。
+实际 500000 文件＋500 目录，concurrency 8、batch 8192；unordered／blocks 分别三轮，incremental0 及约 1% 增删改均覆盖。
+合批候选 a99e37e1 与 bedb632 原主分支对照，86 次运行的实际条目／去重检查全部通过，4 个临时数据库已清理。
+**12 个相对无 DB 吞吐比较均未达标**，报告 passed=false、functional_passed=true；不能将功能通过改写为性能通过。
+
+| 部署／模式 | full 主分支→候选秒 | incremental0 主分支→候选秒 | incremental1 主分支→候选秒 |
+| --- | --- | --- | --- |
+| Single unordered | 6.93→7.74 | 14.00→14.45 | 14.15→14.41 |
+| Single blocks | 7.03→7.79 | 12.35→13.15 | 12.80→13.35 |
+| Cluster unordered | 25.08→27.14 | 28.34→29.19 | 21.97→24.53 |
+| Cluster blocks | 28.45→27.44 | 28.99→27.84 | 20.67→20.72 |
+
+同候选无 DB 的两个模式中位数均约 1.017 秒。Single full 相对旧 DB 仍增加约 11%，Cluster unordered full 约 8%，unordered incremental1 约 12%；需要继续处理／解释，不作达标结论。
+本轮峰值 RSS：原主分支 Single 240.4／Cluster 291.0 MiB，候选 Single 252.9／Cluster 333.0 MiB。
+前／后段 p90 的运行内差值中位数均为负；这仅说明本轮采样未见持续单调增长，不证明任意规模无泄漏。
+约 200 MiB 目标未达。当前 schema 清理候选的生产至少 60 秒 checkpoint 恢复成本另行验证，不与该热缓存诊断混为同一性能 profile。

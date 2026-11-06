@@ -140,7 +140,7 @@ pub(crate) async fn run_persisted(request: ScanRequest<'_>, config: AppConfig) -
             let incremental = cancellation.operation(database.has_baseline()).await?;
             cancellation.operation(database.initialize()).await?;
             cancellation.operation(database.prepare_incremental()).await?;
-            cancellation.operation(database.prepare_native_schema()).await?;
+            cancellation.operation(database.prepare_native_writes()).await?;
             let baseline_snapshot = cancellation.operation(database.capture_scan_baseline()).await?;
             let generation = cancellation.operation(database.begin_scan_generation()).await?;
             // begin 可能写入旧轮次的 ABANDONED manifest；新轮版本必须严格超过它。
@@ -171,7 +171,7 @@ pub(crate) async fn run_persisted(request: ScanRequest<'_>, config: AppConfig) -
         if state.incremental {
             cancellation.operation(database.prepare_incremental()).await?;
         }
-        cancellation.operation(database.prepare_native_schema()).await?;
+        cancellation.operation(database.prepare_native_writes()).await?;
         let kind = if state.incremental {
             JobType::IncrementalScan
         } else {

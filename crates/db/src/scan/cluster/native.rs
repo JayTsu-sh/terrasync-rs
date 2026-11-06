@@ -1,7 +1,7 @@
 use super::record::ClusterNativeScanRecord;
 use super::*;
 use crate::scan::ScanFinalEvent;
-use crate::scan::candidate_cache::{CandidateMetadataCache, missing_hash_columns};
+use crate::scan::candidate_cache::CandidateMetadataCache;
 use crate::scan::compare::NativeScanAccess;
 use crate::scan::rows::{NativeScanKey, NativeWriteBatches, OBSERVED_COLUMNS, event_records};
 use crate::scan::rows::{final_event_records, incremental_record};
@@ -20,19 +20,6 @@ struct ClusterNativeScanKey<'a> {
 }
 
 impl ClusterScanStore {
-    pub(crate) async fn prepare_native_schema(&self) -> Result<()> {
-        let database = identifier(&self.database)?;
-        let cluster = identifier(&self.cluster)?;
-        let tables: Vec<_> = ["base", "scan_resume_batch"]
-            .into_iter()
-            .flat_map(|name| [name.to_owned(), format!("{name}_local")])
-            .collect();
-        for table in missing_hash_columns(&self.client, &tables).await? {
-            self.client.query(&format!("ALTER TABLE {database}.{table} ON CLUSTER {cluster} ADD COLUMN IF NOT EXISTS metadata_hash Nullable(String) DEFAULT NULL"))
-                .execute_idempotent_scan().await?;
-        }
-        Ok(())
-    }
     pub(crate) async fn write_native_keys(&self, entries: &[Arc<ObservedEntry>]) -> Result<()> {
         let _guard = self.writes.temporary.lock().await;
         let client = idempotent_insert_client(&self.client).with_validation(false);

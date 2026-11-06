@@ -116,29 +116,6 @@ impl ClickHouseDatabase {
         }
     }
 
-    pub(super) async fn add_catalogue_column(&self, table: &str, definition: &str) -> Result<()> {
-        self.execute(
-            &format!(
-                "ALTER TABLE {} ADD COLUMN IF NOT EXISTS {definition}",
-                self.catalogue_storage_table(table)?
-            ),
-            &[],
-        )
-        .await?;
-        if let Some(cluster) = &self.catalogue_cluster {
-            self.execute(
-                &format!(
-                    "ALTER TABLE {} {} ADD COLUMN IF NOT EXISTS {definition}",
-                    identifier(table)?,
-                    cluster.on_cluster()?
-                ),
-                &[],
-            )
-            .await?;
-        }
-        Ok(())
-    }
-
     pub(super) async fn create_catalogue_exclusions(&self, table: &str) -> Result<()> {
         if self.catalogue_cluster.is_none() {
             self.execute(

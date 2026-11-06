@@ -1,21 +1,14 @@
 //! 候选事件缓存的元数据摘要；扫描代次由当前基线单独提供。
 use blake3::Hasher;
-use clickhouse::Client;
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::borrow::Cow;
 use task_model::observation::ObservedScanEvent;
 use tokio::task::yield_now;
 
 use crate::{
-    error::Result, execution::queries::check_scan_cancellation, execution::read::QuorumRead,
-    scan::rows::NativeScanRecord, schema::entry::EntrySummary as StorageEntryRecord,
-    schema::records::IncrementalStorageEntryRecord,
+    error::Result, execution::queries::check_scan_cancellation, scan::rows::NativeScanRecord,
+    schema::entry::EntrySummary as StorageEntryRecord, schema::records::IncrementalStorageEntryRecord,
 };
-
-pub(crate) async fn missing_hash_columns(client: &Client, tables: &[String]) -> Result<Vec<String>> {
-    client.query("SELECT table FROM system.columns WHERE database=currentDatabase() AND table IN ? GROUP BY table HAVING countIf(name='metadata_hash')=0")
-        .bind(tables).fetch_quorum_all().await
-}
 
 pub(crate) trait ScanMetadataHash {
     fn scan_metadata_hash(&self) -> String;

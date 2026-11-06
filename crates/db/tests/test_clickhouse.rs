@@ -369,7 +369,7 @@ mod clickhouse_integration_tests {
         store.initialize().await.unwrap();
         store.prepare_incremental().await.unwrap();
         store.load_resume_state().await.unwrap();
-        store.prepare_native_schema().await.unwrap();
+        store.prepare_native_writes().await.unwrap();
         let generation = store.begin_scan_generation().await.unwrap();
         let state = ScanResumeState {
             id: 1,
@@ -453,33 +453,19 @@ mod clickhouse_integration_tests {
 
     #[tokio::test]
     #[ignore = "requires lab ClickHouse"]
-    async fn native_single_candidate_cache_upgrades_existing_tables() {
+    async fn native_single_fresh_schema_includes_candidate_hash_on_all_tables() {
         let (_database, config, job, cleanup) = setup_isolated_state_db("cache_schema").await;
         let mut store = ScanStore::new(&config, &job).unwrap();
         store.initialize().await.unwrap();
         store.prepare_incremental().await.unwrap();
         store.begin_resume_batch().await.unwrap();
         let client = clickhouse_client(&config);
-        let tables = client
-            .query("SELECT table FROM system.columns WHERE database=currentDatabase() AND name='metadata_hash'")
-            .fetch_all::<String>()
-            .await
-            .unwrap();
-        assert_eq!(tables.len(), 3);
-        for table in tables {
-            client
-                .query(&format!("ALTER TABLE {table} DROP COLUMN metadata_hash"))
-                .execute()
-                .await
-                .unwrap();
-        }
-        store.prepare_native_schema().await.unwrap();
         let count = client
             .query("SELECT count() FROM system.columns WHERE database=currentDatabase() AND name='metadata_hash'")
             .fetch_one::<u64>()
             .await
             .unwrap();
-        assert_eq!(count, 2);
+        assert_eq!(count, 3);
         cleanup.cleanup().await;
     }
 

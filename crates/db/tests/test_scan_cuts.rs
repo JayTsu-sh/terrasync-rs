@@ -151,7 +151,7 @@ impl Fixture {
         store.load_resume_state().await?;
         store.initialize().await?;
         store.prepare_incremental().await?;
-        store.prepare_native_schema().await?;
+        store.prepare_native_writes().await?;
         Ok(store)
     }
 }

@@ -72,10 +72,6 @@ impl ClickHouseDatabase {
 
     async fn copy_generation_state(&self) -> Result<CopyState> {
         let table = get_scan_state_table_name(&self.job_id);
-        self.add_catalogue_column(&table, "copy_in_progress Bool DEFAULT false")
-            .await?;
-        self.add_catalogue_column(&table, "copy_request_key String DEFAULT ''")
-            .await?;
         let state = self.sync_client.query(&format!(
             "SELECT scan_state, baseline_committed, copy_in_progress, copy_request_key FROM {table} FINAL WHERE id=1"
         )).fetch_quorum_one::<CopyState>().await?;
