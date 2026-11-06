@@ -1,0 +1,544 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="description" content="TerraSync 全量迁移优化方案：保留或删除源端时的目录元数据、扫描计划、多版本顺序、故障恢复、校验与统计契约。">
+  <title>全量迁移优化方案 · TerraSync</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --bg: #f4f6f8;
+      --paper: #fff;
+      --ink: #182a3b;
+      --muted: #526477;
+      --line: #dce4ea;
+      --accent: #086c63;
+      --accent-bg: #eaf5f2;
+      --warn: #86520c;
+      --warn-bg: #fff5e4;
+      --nav-width: 254px;
+      --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+      --mono: ui-monospace, SFMono-Regular, Consolas, "Liberation Mono", monospace;
+    }
+    * { box-sizing: border-box; }
+    html { scroll-behavior: smooth; scroll-padding-top: 24px; }
+    body { margin: 0; color: var(--ink); background: var(--bg); font: 15px/1.85 var(--sans); }
+    a { color: var(--accent); text-underline-offset: 3px; overflow-wrap: anywhere; }
+    a:hover { text-decoration-thickness: 2px; }
+    a:focus-visible, button:focus-visible { outline: 3px solid #c27a16; outline-offset: 4px; border-radius: 3px; }
+    .skip { position: absolute; left: 12px; top: -100px; padding: 8px 14px; background: var(--paper); z-index: 10; }
+    .skip:focus { top: 12px; }
+    .layout { max-width: 1480px; margin: auto; display: grid; grid-template-columns: var(--nav-width) minmax(0, 1fr); }
+    .sidebar { position: sticky; top: 0; align-self: start; height: 100vh; overflow-y: auto; padding: 34px 23px; border-right: 1px solid var(--line); }
+    .brand { font: 700 12px/1.5 var(--mono); letter-spacing: .12em; color: var(--accent); }
+    .sidebar h2 { font-size: 17px; margin: 8px 0 4px; }
+    .sidebar p { margin: 0 0 20px; color: var(--muted); font-size: 12px; }
+    .sidebar nav a { display: block; padding: 7px 9px; margin: 3px -9px; border-radius: 6px; text-decoration: none; color: var(--muted); font-size: 13px; }
+    .sidebar nav a:hover { background: #e6eeed; color: var(--accent); }
+    .sidebar nav a.major { margin-top: 16px; font-weight: 700; color: var(--ink); }
+    .sidebar .nav-note { margin-top: 28px; padding-top: 18px; border-top: 1px solid var(--line); }
+    main { min-width: 0; padding: 36px 42px 70px; }
+    .hero { padding: 34px 38px; background: #142d3b; border-radius: 15px; color: #fff; }
+    .eyebrow { margin: 0 0 12px; font: 12px/1.6 var(--mono); color: #b0ddd0; letter-spacing: .12em; }
+    h1 { font-size: clamp(28px, 3vw, 40px); line-height: 1.35; letter-spacing: -.025em; margin: 0 0 16px; }
+    .hero .lead { max-width: 780px; margin: 0; color: #dbe6ec; font-size: 16px; }
+    .meta { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 22px; }
+    .badge { display: inline-block; padding: 4px 10px; border: 1px solid #66828f; border-radius: 5px; font-size: 12px; color: #e1edf1; }
+    .principles { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; margin: 20px 0 30px; }
+    .principle { background: var(--paper); border: 1px solid var(--line); border-radius: 9px; padding: 18px 20px; }
+    .principle span { display: block; font: 11px/1.5 var(--mono); color: var(--accent); margin-bottom: 8px; }
+    .principle strong { display: block; font-size: 16px; }
+    .principle p { margin: 7px 0 0; font-size: 13px; color: var(--muted); }
+    section { background: var(--paper); border: 1px solid var(--line); border-radius: 12px; padding: 28px 32px; margin: 22px 0; }
+    section > :first-child { margin-top: 0; }
+    section > :last-child { margin-bottom: 0; }
+    h2 { font-size: 23px; line-height: 1.5; letter-spacing: -.02em; margin: 0 0 18px; }
+    h2 .index { font: 13px/1.5 var(--mono); color: var(--accent); display: block; margin-bottom: 4px; }
+    h3 { margin: 30px 0 12px; font-size: 18px; line-height: 1.6; }
+    h4 { font-size: 15px; margin: 22px 0 8px; }
+    p { margin: 12px 0; }
+    ul, ol { padding-left: 24px; margin: 12px 0; }
+    li { padding-left: 3px; margin: 7px 0; }
+    code { font: .87em/1.6 var(--mono); background: #edf2f5; color: #25485c; padding: 2px 5px; border-radius: 4px; overflow-wrap: anywhere; }
+    .note { border-left: 4px solid var(--accent); background: var(--accent-bg); padding: 13px 17px; margin: 18px 0; border-radius: 0 7px 7px 0; }
+    .note.warn { border-left-color: #be811d; background: var(--warn-bg); color: var(--warn); }
+    .note p { margin: 3px 0; }
+    .table-wrap { max-width: 100%; overflow-x: auto; margin: 16px 0; border: 1px solid var(--line); border-radius: 8px; }
+    table { width: 100%; border-collapse: collapse; font-size: 13px; line-height: 1.8; }
+    caption { text-align: left; padding: 12px 14px; font-weight: 700; background: #f1f5f7; }
+    th, td { padding: 12px 14px; text-align: left; vertical-align: top; border-bottom: 1px solid var(--line); overflow-wrap: anywhere; }
+    th { background: #f1f5f7; font-weight: 650; }
+    tbody tr:last-child td, tbody tr:last-child th { border-bottom: 0; }
+    tbody th { min-width: 120px; background: #f8fafb; }
+    .matrix { min-width: 640px; }
+    .muted { color: var(--muted); }
+    .small { font-size: 12px; }
+    .flow { list-style: none; padding: 0; margin: 22px 0; display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 10px; counter-reset: stage; }
+    .flow li { counter-increment: stage; margin: 0; padding: 14px; background: #f1f6f6; border: 1px solid #d0e2dd; border-radius: 8px; font-size: 13px; }
+    .flow li::before { content: counter(stage, decimal-leading-zero); display: block; color: var(--accent); font: 700 12px/1.5 var(--mono); margin-bottom: 8px; }
+    .flow strong { display: block; font-size: 14px; margin-bottom: 5px; }
+    .flow p { margin: 0; color: var(--muted); font-size: 12px; }
+    .example { margin: 18px 0; background: #f4f7fa; padding: 19px 20px; border-radius: 8px; }
+    .example p { margin: 4px 0; }
+    .metrics { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; margin: 12px 0; }
+    .metric { padding: 12px 15px; background: var(--paper); border: 1px solid var(--line); border-radius: 7px; }
+    .metric b { display: block; font-size: 25px; font-weight: 650; color: var(--accent); line-height: 1.4; }
+    .metric span { color: var(--muted); font-size: 12px; }
+    .metric.pending b { color: var(--warn); }
+    .source-list li { margin-bottom: 13px; }
+    .source-list code { font-size: 11px; }
+    .section-intro { color: var(--muted); margin-top: -6px; }
+    footer { margin: 28px 0 0; font-size: 12px; color: var(--muted); text-align: center; }
+    .tools { display: flex; justify-content: flex-end; margin-bottom: 12px; }
+    .print-button { appearance: none; padding: 7px 13px; border: 1px solid #bdcdd7; border-radius: 6px; background: var(--paper); color: var(--ink); font: 13px/1.5 var(--sans); cursor: pointer; }
+    .print-button:hover { border-color: var(--accent); color: var(--accent); }
+    @media (max-width: 1100px) {
+      :root { --nav-width: 220px; }
+      main { padding: 26px 24px 50px; }
+      section { padding: 25px; }
+      .hero { padding: 28px; }
+      .flow { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    }
+    @media (max-width: 780px) {
+      .layout { display: block; }
+      .sidebar { position: static; width: auto; height: auto; padding: 20px; border-right: 0; border-bottom: 1px solid var(--line); }
+      .sidebar h2 { font-size: 16px; }
+      .sidebar p { margin-bottom: 10px; }
+      .sidebar nav { display: flex; gap: 5px 14px; flex-wrap: wrap; }
+      .sidebar nav a, .sidebar nav a.major { margin: 0; padding: 3px 0; font-size: 12px; }
+      .sidebar nav .sub, .sidebar .nav-note { display: none; }
+      main { padding: 20px 14px 40px; }
+      .hero { padding: 25px 23px; }
+      .principles { grid-template-columns: 1fr; gap: 8px; margin-bottom: 20px; }
+      .principle { padding: 13px 18px; }
+      .principle span { display: inline; margin-right: 8px; }
+      .principle strong { display: inline; font-size: 14px; }
+      section { padding: 22px 18px; }
+      h2 { font-size: 21px; }
+      h3 { font-size: 17px; }
+      th, td { padding: 10px; }
+      .metrics { gap: 6px; }
+      .metric { padding: 10px; }
+      .metric b { font-size: 22px; }
+    }
+    @media (max-width: 390px) { .flow, .metrics { grid-template-columns: 1fr; } }
+    @media (prefers-reduced-motion: reduce) { html { scroll-behavior: auto; } }
+    @page { size: A4; margin: 16mm 13mm; }
+    @media print {
+      body { font-size: 10pt; background: #fff; color: #000; }
+      .layout { display: block; max-width: none; }
+      .sidebar, .tools, .skip { display: none; }
+      main { padding: 0; }
+      .hero { background: #fff; color: #000; border: 1px solid #aaa; padding: 18px; }
+      .hero .lead, .eyebrow, .badge { color: #333; }
+      .badge { border-color: #aaa; }
+      h1 { font-size: 25pt; }
+      h2 { font-size: 17pt; }
+      h3 { font-size: 13pt; }
+      section { border: 0; padding: 0; margin: 24px 0; }
+      h2, h3, h4 { break-after: avoid; }
+      .principle, .flow li, .example, .note, tr { break-inside: avoid; }
+      .flow { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .table-wrap { overflow: visible; border-radius: 0; }
+      table { font-size: 9pt; }
+      .matrix { min-width: 0; }
+      th, td { padding: 7px 8px; }
+      thead { display: table-header-group; }
+      a { color: #000; }
+      footer { text-align: left; }
+    }
+  </style>
+</head>
+<body>
+  <a class="skip" href="#main">跳到正文</a>
+  <div class="layout">
+    <aside class="sidebar" aria-label="文档导航">
+      <div class="brand">TERRASYNC / DESIGN</div>
+      <h2>全量迁移优化方案</h2>
+      <p>设计建议 · 2026-11-06</p>
+      <nav aria-label="目录">
+        <a class="major" href="#overview">01　范围与设计原则</a>
+        <a class="major" href="#current">02　当前实现与缺口</a>
+        <a class="major" href="#keep-source">03　保留源端的全量迁移</a>
+        <a class="sub" href="#keep-mtime">目录 mtime 与 blocks</a>
+        <a class="sub" href="#baseline">新全量的 base 清理</a>
+        <a class="sub" href="#versions">跨 entry 的多版本顺序</a>
+        <a class="sub" href="#metadata-plan">扫描与元数据计划</a>
+        <a class="sub" href="#network">网络中断与恢复预算</a>
+        <a class="sub" href="#retry-report">偶发失败与上报</a>
+        <a class="major" href="#move-source">04　删除源端的全量迁移</a>
+        <a class="sub" href="#ready-contract">目标就绪与安全删除</a>
+        <a class="sub" href="#directory-cleanup">目录删除与收尾</a>
+        <a class="sub" href="#fault-matrix">异常故障矩阵</a>
+        <a class="sub" href="#verification">校验时机与内容</a>
+        <a class="sub" href="#delete-failure">删除失败与恢复</a>
+        <a class="major" href="#statistics">05　统计与状态呈现</a>
+        <a class="major" href="#delivery">06　职责与实施优先级</a>
+        <a class="major" href="#acceptance">07　验收与未验证范围</a>
+        <a class="major" href="#references">08　代码与协议依据</a>
+      </nav>
+      <p class="nav-note">独立 HTML，可离线阅读正文。代码链接指向同一仓库内的源文件；外部协议资料需要联网。支持浏览器打印为 PDF。</p>
+    </aside>
+
+    <main id="main">
+      <div class="tools"><button class="print-button" type="button" onclick="window.print()">打印 / 导出 PDF</button></div>
+      <header class="hero">
+        <p class="eyebrow">FULL MIGRATION · CORRECTNESS &amp; RECOVERY</p>
+        <h1>全量迁移优化方案</h1>
+        <p class="lead">围绕目录元数据、多版本顺序、扫描计划、网络故障、校验、源端清理和统计，分别定义保留源端与删除源端时的完成条件。</p>
+        <div class="meta">
+          <span class="badge">分析日期：2026-11-06</span>
+          <span class="badge">状态：设计建议，待实施验收</span>
+          <span class="badge">分析阶段未修改运行时代码</span>
+        </div>
+      </header>
+
+      <div class="principles" aria-label="三项设计原则">
+        <div class="principle"><span>01 / ORDER</span><strong>扫描顺序与完成顺序分开</strong><p>blocks 提供枚举边界；复制、重试与发布仍需完成屏障。</p></div>
+        <div class="principle"><span>02 / SAFETY</span><strong>目标就绪与源端删除分开</strong><p>数据、约定元数据和最终发布均已确认，才能授权删除。</p></div>
+        <div class="principle"><span>03 / RECOVERY</span><strong>新全量与同轮恢复分开</strong><p>新全量清理旧基线；同轮恢复保留已确认事实。</p></div>
+      </div>
+
+      <section id="overview">
+        <h2><span class="index">01 / SCOPE</span>范围与设计原则</h2>
+        <p>本方案覆盖两类全量迁移：保留源端的复制，以及目标就绪后删除源端的搬迁。重点是让实际副作用、数据库事实、checkpoint、统计和任务终态保持一致。</p>
+        <p>推荐优先完善现有 unordered 扫描、路径分派和目录统一收尾机制。只有需要提前完成子树时，再引入目录完成屏障；不将切换 blocks 或合并全部历史版本作为正确性的替代方案。</p>
+        <div class="note"><p><strong>完成条件：</strong>保留源端时，目标文件和目录达到约定状态；删除源端时，还要确认迁移范围内的源项清理完成。结果未知、清理失败和通知失败分别表达。</p></div>
+        <p>当前处于首次开发阶段，可直接调整任务契约、状态格式、表结构及 callback，无需设计旧版本兼容层。当前数据正确性、幂等、恢复和性能约束仍然有效。</p>
+        <p class="muted small">证据边界：以下“当前实现”来自分析时工作区和 Cargo.toml 锁定的 data-mover 提交 <code>0070c1599689e6c3a5cb3c8e7df602e03f00ca97</code> 的源码阅读；方案和验收目标不代表已经实现或通过实测。</p>
+      </section>
+
+      <section id="current">
+        <h2><span class="index">02 / FINDINGS</span>当前实现与缺口</h2>
+        <div class="table-wrap">
+          <table class="matrix">
+            <caption>源码现状及其设计影响</caption>
+            <thead><tr><th scope="col">主题</th><th scope="col">当前实现</th><th scope="col">需要补齐的语义</th></tr></thead>
+            <tbody>
+              <tr><th scope="row">目录元数据</th><td><a href="../../crates/app/src/copy_completion.rs">copy_completion::complete</a> 在非 S3 目标上统一更新目录，再提交代次。当前全量入口在启用数据库时调用。</td><td>覆盖无数据库模式、目录最终校验及恢复；不能仅凭文件完成数表示整轮完成。</td></tr>
+              <tr><th scope="row">复制代次</th><td><a href="../../crates/db/src/catalogue/copy_generation.rs">begin_copy_generation</a> 保留旧数据用于恢复，没有无条件清空 base。</td><td>区分新全量与同轮恢复；清理基线不能销毁未完成搬迁的证据。</td></tr>
+              <tr><th scope="row">历史版本</th><td><a href="../../crates/app/src/copy_dispatch.rs">CopyQueues</a> 按路径分派；历史分段在同一 sender worker 顺序执行。</td><td><a href="../../crates/app/src/sender.rs">sender_worker</a> 记录失败后继续消费，仍需保证同一对象前序失败或未知时阻断后序发布。</td></tr>
+              <tr><th scope="row">普通文件搬迁</th><td><a href="../../crates/app/src/file_copy/transfer.rs">execute_file</a> 调用 data-mover <code>move_file</code>。依赖库强制回读校验，应用所选元数据并发布，复核源对象后删除；拒绝指定历史版本。</td><td>补齐任务层持久化确认边界；完整元数据要求与历史版本删除不能由当前普通文件接口直接推导。</td></tr>
+              <tr><th scope="row">软链接与 ACL</th><td><a href="../../crates/app/src/receiver.rs">process_entry_on_receiver</a> 对源软链接删除失败、ACL 复制失败只记日志；ACL 处理位于文件搬迁之后。</td><td>统一严格错误传播；必需元数据应在源端删除前完成，不能将这些失败折叠为 entry 成功。</td></tr>
+              <tr><th scope="row">超时与恢复</th><td><a href="../../crates/app/src/dir_walker.rs">DirectoryWalker::new</a> 默认没有设置 operation timeout 和 recovery window，普通全量遍历使用这个入口。</td><td>全量迁移应显式传递扫描和复制的恢复策略，不能借用独立扫描路径的能力作为达标证据。</td></tr>
+              <tr><th scope="row">统计与诊断</th><td><a href="../../crates/app/src/consumer/stats/report.rs">ProgressDetail::Full</a> 主要是数量、字节和错误数；已有<a href="../../crates/app/src/consumer/stats/diagnostics.rs">有界诊断发件箱与批次 ACK</a>。</td><td>增加目标就绪、删除结果、目录收尾、结果未知等状态；保留结构化错误原因和可查询明细。</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <section id="keep-source">
+        <h2><span class="index">03 / COPY</span>保留源端的全量迁移</h2>
+        <p class="section-intro">对应问题：目录 mtime、base 清理、统计、多版本顺序、扫描 plan、网络故障和偶发复制失败。</p>
+
+        <h3 id="keep-mtime">3.1　目录 mtime：保留统一收尾，补齐完成屏障</h3>
+        <p>目录 mtime 应在目标目录中最后一次创建、删除、rename 等目录项操作之后设置。扫描结束或 blocks 的目录块结束，只能证明枚举阶段推进，不能证明异步复制和发布已经结束。</p>
+        <ol>
+          <li>扫描时捕获源目录原始元数据，包括迁移根目录和空目录。</li>
+          <li>先创建目标目录，并保留后续写入、遍历和收尾所需权限。</li>
+          <li>并发迁移内容，等待所有目标命名空间操作、重试和未知结果对账结束。</li>
+          <li>应用目录最终元数据并回读确认；全部必需操作成功后，才确认任务完成。</li>
+        </ol>
+        <p>只恢复 mtime 时，全局命名空间操作结束后可以并发执行。最终 mode、ACL 可能收紧父目录权限，应采用从深到浅的顺序，避免阻断后代收尾。</p>
+        <p>当前应优先补齐无数据库模式的目录跟踪与收尾。跟踪队列和在途任务必须有界，不能为所有扫描项常驻保存明细，也不能新增本地磁盘扫描暂存。若无法提供等价恢复能力，应在任务能力中明确限制。</p>
+        <div class="note"><p><strong>blocks 的适用点：</strong>未来需要提前完成某个子树时，可结合 blocks 的枚举边界，增加“枚举完整 + 相关 worker 全部确认 + 无待重试或未知操作”的目录完成屏障。blocks 本身不是该屏障。</p></div>
+
+        <h3 id="baseline">3.2　base 清理：新全量清空，同轮恢复保留</h3>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th scope="col">启动语义</th><th scope="col">处理规则</th></tr></thead>
+            <tbody>
+              <tr><th scope="row">新建一轮全量</th><td>扫描和复制启动前，确保该 job 的旧 base 清空，同时重置对应临时表、checkpoint、统计及目录收尾状态。</td></tr>
+              <tr><th scope="row">恢复未完成的同一轮</th><td>保留已确认副作用、待处理项与累计统计；核验源、目标及选项绑定后恢复，不将恢复解释为清空重做。</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>准备顺序为：取得执行独占权 → 确认旧执行已停止 → 清理本 job 的基线和关联状态 → 确认清理完成 → 启动扫描。清理或确认失败时不得继续。</p>
+        <p>Single／Cluster 共用上层语义，物理表清理、分片／副本确认由 db 层集中实现。发出异步 DELETE 不能作为清空证据，也不能误清其他 job 的数据。</p>
+        <p>建议分开保存扫描基线与迁移执行事实。尤其对删除源端任务，已搬走的文件不再出现在源扫描中，不能通过重扫补回已丢失的执行记录。</p>
+        <p>每轮执行需要独立身份，拒绝旧执行晚到的确认污染新轮次。当前进程内／文件锁不能直接视作跨机器的完整执行隔离；外部存储副作用还需收束旧执行，并使用 backend 支持的隔离能力或独占控制。</p>
+
+        <h3 id="copy-statistics">3.3　统计：扫描、目标完成与收尾分别展示</h3>
+        <p>扫描数量、复制完成数量、校验完成数量和目录收尾数量分别统计。历史版本按“逻辑对象数”和“版本数”展示，不把历史分段 entry 数当成文件数。</p>
+        <p>扫描完整前，不估算完整总量；部分成功时保留准确成功事实。即使数据传输达到 100%，仍应展示“正在校验”或“正在恢复目录元数据”。完整字段及异常示例见<a href="#statistics">统计与状态呈现</a>。</p>
+
+        <h3 id="versions">3.4　多版本：有界分段，同一对象串行推进</h3>
+        <p>不建议将全部历史版本放入单个 entry。版本数量很大时，会增加内存占用、首条交付延迟和失败重放成本。保留有界历史分段，沿用路径固定分派机制。</p>
+        <ul>
+          <li>同一对象按源端明确提供的历史顺序处理，不按 version_id 字符串排序。</li>
+          <li>同一对象同时最多有一个版本处于提交阶段，不同对象并行执行。</li>
+          <li>某个版本失败或提交结果未知时，阻断该对象后续版本发布，其他对象可按故障范围继续。</li>
+          <li>恢复依据已确认版本边界；版本化目标写入响应丢失时，先核对目标版本，不能盲目重放并生成额外版本。</li>
+        </ul>
+        <p>删除标记也属于顺序契约。目标支持原生历史时迁移版本与删除标记；NFS 等不能表达同名多版本的目标，应预先明确“仅迁移当前可见版本”或另行定义历史保存格式。要求完整保留历史而目标无法表达时，启动前拒绝。</p>
+        <p>现有保守恢复限制应保留到对账机制完整：当前实现会拒绝未完成的源端删除任务自动恢复，以及版本化目标的未知写入自动重放，不能通过简单放开限制代替恢复设计。</p>
+
+        <h3 id="metadata-plan">3.5　扫描 plan：按实例能力与迁移要求编译</h3>
+        <p>需要 plan，但不能只按 NFS→NFS、S3→NFS 等 backend 类型组合硬编码。计划还依赖协议版本、实际权限、时间精度、目标版本配置及用户要求。</p>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th scope="col">元数据策略</th><th scope="col">获取与缺失处理</th></tr></thead>
+            <tbody>
+              <tr><th scope="row">必需</th><td>扫描或复制前必须取得；inline 不足时补充获取，仍失败或目标无法表达则该对象失败。</td></tr>
+              <tr><th scope="row">允许明确损失</th><td>定义允许的精度损失、所有者／ACL 映射等转换，记录具体损失后按约定继续。</td></tr>
+              <tr><th scope="row">不迁移／不适用</th><td>不执行无意义的额外读取，明确表达未请求、源端不适用或目标不适用的原因。</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>计划覆盖身份、类型、大小、版本、mtime、ownership、mode、ACL、xattr、tags、软链接目标及目录标记。扫描能顺带获取的事实直接捕获，昂贵的额外读取可延迟到复制，但必须绑定相同源对象／版本，并在删除前完成。</p>
+        <p>“值为空”“不支持”“未请求”“请求失败”必须区分。源端没有可迁移的目录 mtime 时，不能用默认时间冒充源值；必需元数据获取失败不能静默变成 Omit。</p>
+        <p>plan 的需求由任务层确定；能力查询、观察、转换与应用机制归 data-mover，协议获取细节归客户端。CLI／Web 复用同一任务契约。</p>
+
+        <h3 id="network">3.6　网络中断：暂停调度，有界恢复</h3>
+        <p>源端故障时暂停新增源读取；目标端故障时暂停新增写入和发布。逐项收束在途操作，并使用有界队列与背压，避免所有 worker 持续制造同类失败。</p>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th scope="col">阶段／依赖</th><th scope="col">恢复与退出规则</th></tr></thead>
+            <tbody>
+              <tr><th scope="row">源端／ClickHouse 扫描</th><td>故障识别后，同一次故障最多再恢复约 3 秒。分页、重试和并发请求不得重置窗口；检测耗时另行记录。</td></tr>
+              <tr><th scope="row">复制与目标发布</th><td>单独定义操作超时、恢复总预算和退出条件，由调用方指定并由 data-mover 执行；不能直接套用扫描窗口，也不能无限等待。</td></tr>
+              <tr><th scope="row">写入或发布超时</th><td>保留结果未知状态，依据发布证据对账；不能将超时等价为未执行。</td></tr>
+              <tr><th scope="row">权限、认证、只读、容量不足</th><td>按实际原因分类，不作为普通断网持续重试。</td></tr>
+              <tr><th scope="row">故障期间取消</th><td>停止新增调度，秒级响应取消，处理在途与未知结果，并收束后台任务生命周期。</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>错误分类、预算和调度规则应集中定义，避免 client、data-mover、app 多层重试叠加。批处理、空闲和背压期间也必须有界感知故障。</p>
+
+        <h3 id="retry-report">3.7　偶发失败：按阶段重试，结构化上报</h3>
+        <p>瞬时网络错误、限流等可在次数与总时间双重限制内退避重试，并加入抖动。权限错误、不支持的必需元数据、无效配置不应持续重试。源对象变化时重新观察或报告冲突。</p>
+        <p>重试单位为“对象的具体阶段”。目标已确认发布后，后续清理或记账失败不应触发整文件重复制。单个对象失败与依赖整体故障分别处理；历史前序版本失败时仍必须阻断后序。</p>
+        <div class="table-wrap">
+          <table>
+            <caption>建议错误明细契约</caption>
+            <thead><tr><th scope="col">字段组</th><th scope="col">内容</th></tr></thead>
+            <tbody>
+              <tr><th scope="row">身份</th><td>job_id、轮次、执行尝试、可去重事件 ID、对象路径与版本。</td></tr>
+              <tr><th scope="row">位置与原因</th><td>源端／目标端／数据库／通知、操作阶段、稳定错误码、有类型的 cause、脱敏可读说明。</td></tr>
+              <tr><th scope="row">恢复信息</th><td>是否可重试、尝试次数、首次／最近失败时间、是否已经恢复。</td></tr>
+              <tr><th scope="row">副作用证据</th><td>目标是否已发布、发布身份、源删除是否已发出、结果是否未知、建议恢复动作。</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>复用现有有界诊断发件箱和批次 ACK。callback 携带累计数和有界明细，完整失败记录支持持久化、分页查询；不能只保留日志或首个错误。明细被省略时明确报告省略数，不丢失累计计数。</p>
+        <p>终态 callback 首次失败后最多再重试 3 次；仍失败时，将准确最终载荷、任务／执行身份和发送失败信息保存到可用 ClickHouse。通知失败不改变任务实际结果，也不能标记为已交付。ClickHouse 与 callback 同时不可用时由上层处理，不增加专门兜底存储。</p>
+      </section>
+
+      <section id="move-source">
+        <h2><span class="index">04 / MOVE</span>删除源端的全量迁移</h2>
+        <p class="section-intro">对应问题：逐文件删除、目录删除时机、故障安全、校验、统计、blocks 与删除失败。</p>
+
+        <h3 id="ready-contract">4.1　逐文件删除的前提：目标已就绪</h3>
+        <p>可以逐文件复制后删除，但“复制函数返回成功”必须具有严格含义。数据、约定元数据、最终发布与所需持久性全部确认后，才允许删除对应源对象。</p>
+        <ol class="flow" aria-label="文件安全搬迁状态顺序">
+          <li><strong>观察源对象</strong><p>捕获身份、版本和所需元数据，绑定本轮计划。</p></li>
+          <li><strong>复制与内容校验</strong><p>传输数据，取得与源对象绑定的校验结果。</p></li>
+          <li><strong>元数据与发布确认</strong><p>应用并校验必需元数据，确认最终发布与持久性。</p></li>
+          <li><strong>记录目标就绪</strong><p>持久化目标证据，形成可恢复的删除前置事实。</p></li>
+          <li><strong>复核源身份</strong><p>确认仍是被迁移对象，并检查取消与执行权限。</p></li>
+          <li><strong>受保护删除</strong><p>执行删除；超时保留未知状态，不盲目重删。</p></li>
+          <li><strong>确认删除结果</strong><p>对账源对象状态，持久化确认结果。</p></li>
+          <li><strong>确认文件完成</strong><p>目标就绪与源删除均已确认，才计入搬迁完成。</p></li>
+        </ol>
+        <p>内容校验可以位于发布前或发布后，由 backend 能力决定；删除必须位于所有必需条件确认之后。当前 move_file 已提供普通文件的部分保护，但任务层仍需补齐删除前持久化边界，并把必需 ACL／xattr 等纳入统一流程。</p>
+        <p>建议由 data-mover 提供与发布证据绑定的受保护源删除能力，或在内部删除前提供可靠的任务确认边界。应用层不重复实现协议检查和重试循环。</p>
+        <div class="note warn"><p><strong>并发修改边界：</strong>两次 stat 无法消除“最后检查之后、删除之前”源路径被替换的竞态。没有条件删除能力时，必须取得源命名空间独占控制或停写；目标也要避免其他执行覆盖已确认副本。还需排除源目标实际为同一对象、路径别名或会影响源扫描的重叠范围。</p></div>
+        <p>要求可恢复删除时，迁移事实必须持久化。数据库关闭的执行不能宣称具有相同恢复能力；准备失败、执行身份失效或确认记录不可用时，不得继续新增删除。</p>
+
+        <h3 id="directory-cleanup">4.2　源目录：目标元数据确认后，从深到浅删除空目录</h3>
+        <ol>
+          <li>删除任何子项之前，保存源目录原始 mtime、mode、ownership 和要求的 ACL／xattr。</li>
+          <li>完成后代迁移，结束目标目录内所有命名空间修改。</li>
+          <li>恢复并校验目标目录最终元数据。</li>
+          <li>确认相关后代源项已经删除，无未完成或结果未知操作。</li>
+          <li>从深到浅执行源空目录删除；迁移根目录默认保留。</li>
+        </ol>
+        <p>源目录非空时保留并报告。不能递归删除迁移期间新建的文件、被过滤的内容或迁移失败对象。扫描不完整的目录不能获得清理授权。</p>
+        <div class="table-wrap">
+          <table>
+            <caption>需要在任务契约中区分的两种删除策略</caption>
+            <thead><tr><th scope="col">策略</th><th scope="col">行为与边界</th></tr></thead>
+            <tbody>
+              <tr><th scope="row">逐文件就绪后删除</th><td>降低源端占用。目录最后收尾和删除；后续故障时，源树可能仅剩部分数据，整树元数据也可能尚未完成。</td></tr>
+              <tr><th scope="row">整树就绪后清理</th><td>先完成整轮复制、文件与目录校验，再集中删除源文件及空目录。适合要求整棵目标树就绪后才开始删除的场景。</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>两种策略都不提供跨源、目标的整体事务回滚。选择必须写入执行计划并参与恢复绑定，不能在同轮恢复中静默切换。</p>
+
+        <h3 id="fault-matrix">4.3　异常故障矩阵：证据不足不删源</h3>
+        <div class="table-wrap">
+          <table class="matrix">
+            <thead><tr><th scope="col">故障／异常</th><th scope="col">源端处理</th><th scope="col">恢复与上报</th></tr></thead>
+            <tbody>
+              <tr><th scope="row">源读取失败</th><td>保留源文件。</td><td>按原因有限重试；源变化则重新观察或报告冲突。</td></tr>
+              <tr><th scope="row">目标写入失败</th><td>保留源文件。</td><td>依据传输模式与 stage 证据恢复，不确认目标就绪。</td></tr>
+              <tr><th scope="row">内容校验失败</th><td>保留源文件。</td><td>记录不匹配证据，按策略重新传输或失败。</td></tr>
+              <tr><th scope="row">必需元数据失败</th><td>保留源文件。</td><td>仅恢复失败的元数据阶段；不能用内容成功覆盖该失败。</td></tr>
+              <tr><th scope="row">发布超时／响应丢失</th><td>目标结果未确认前不删除。</td><td>标记结果未知，核对发布身份及最终对象；版本化目标禁止盲目重放。</td></tr>
+              <tr><th scope="row">未确认目标持久性</th><td>保留源文件。</td><td>等待 backend 所需的稳定写入／提交证据，读回一致本身不足以替代持久性。</td></tr>
+              <tr><th scope="row">目标就绪后源端断网</th><td>停止新增源删除。</td><td>保存目标就绪事实，恢复后只推进清理阶段。</td></tr>
+              <tr><th scope="row">删除超时／响应丢失</th><td>不盲目再次删除同一路径。</td><td>标记删除结果未知，重新观察源身份并对账。</td></tr>
+              <tr><th scope="row">源路径被新对象替换</th><td>保留新对象。</td><td>报告身份冲突；原对象的迁移证据不能授权删除新对象。</td></tr>
+              <tr><th scope="row">目标被覆盖／身份改变</th><td>暂停尚未执行的删除。</td><td>旧就绪证据失效，重新核验或报告冲突。</td></tr>
+              <tr><th scope="row">数据库无法确认就绪事实</th><td>暂停新增删除。</td><td>恢复数据库并确认事实；不将超时当作未写入。</td></tr>
+              <tr><th scope="row">删除成功后记账失败／崩溃</th><td>不依据新扫描缺失直接清理目标。</td><td>结合删除前事实、当前源和目标对账，再补记完成。</td></tr>
+              <tr><th scope="row">源只读／权限不足</th><td>保留源文件和已就绪目标。</td><td>标记清理失败；原因消除后复核身份，仅重试删除。</td></tr>
+              <tr><th scope="row">用户取消</th><td>停止新删除。</td><td>收束在途操作，保留已发删除的实际或未知结果。</td></tr>
+              <tr><th scope="row">旧执行未停止／并发接管</th><td>不允许新执行继续删除。</td><td>先收束旧执行，确认身份和副作用，再允许接管。</td></tr>
+              <tr><th scope="row">目录非空／枚举不完整</th><td>保留目录及残留项。</td><td>报告未完成、过滤保留或并发新增，不升级为递归删除。</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>NFS 的目标就绪必须包含 backend 对所需稳定存储的确认，不能只依据客户端缓存或回读一致。稳定写入与 COMMIT 的协议处理归客户端和 data-mover，见 <a href="https://www.rfc-editor.org/rfc/rfc7530.html#section-16.3.5">NFSv4 COMMIT 语义</a>。</p>
+        <p>历史版本搬迁和打包迁移需单独验证。归档发布成功不能直接授权递归删除整个源目录，应按已校验清单和源对象身份逐项清理，防止删除打包后新增或变化的内容。</p>
+
+        <h3 id="verification">4.4　校验：作为删除前置条件</h3>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th scope="col">对象／维度</th><th scope="col">校验内容与时机</th></tr></thead>
+            <tbody>
+              <tr><th scope="row">普通文件数据</th><td>确认类型、长度、内容摘要。源摘要绑定本次读取对象，目标进行对应强度的回读或 backend 可证明的校验。相同大小和 mtime 不足以授权删除。</td></tr>
+              <tr><th scope="row">普通文件元数据</th><td>按计划验证 mtime、mode、ownership、ACL、xattr、tags 等必需项；在删除之前完成。</td></tr>
+              <tr><th scope="row">软链接</th><td>校验链接目标本身及约定元数据，不跟随链接校验其指向的文件。</td></tr>
+              <tr><th scope="row">目录</th><td>后代命名空间操作结束后，恢复并验证目录最终元数据，再确认目录完成。</td></tr>
+              <tr><th scope="row">时间精度与读取副作用</th><td>按协商精度和允许转换比较；不可设置的 ctime 不作为复制成功条件。内容回读可能改变 atime，必要时在回读后恢复最终时间，再确认元数据。</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>保留源端时校验强度可由计划明确；删除源端时必须启用足以授权删除的校验，不能因为用户关闭了普通复制校验开关而跳过保护。每个必需条件都应具有明确结果，不能只保存一个模糊的 success 布尔值。</p>
+
+        <h3 id="move-statistics">4.5　统计：目标成功不等于搬迁完成</h3>
+        <p>增加“目标已就绪”“源文件已删除”“删除待重试”“删除失败”“删除结果未知”和“源目录清理进度”。清理失败不能记为复制失败，也不能计作已搬迁完成。</p>
+        <p>源端为空不能单独作为成功依据，必须结合本轮计划和已确认事实判断；扫描未完成时，源端剩余量仍可能未知。示例及计数规则见<a href="#statistics">统计与状态呈现</a>。</p>
+
+        <h3 id="move-blocks">4.6　blocks：可帮助续扫，不能替代迁移确认</h3>
+        <p>初期继续采用规范要求的 unordered 非续扫全量路径，加全局完成屏障、目录最终元数据和从深到浅的空目录删除。全量／增量续扫使用 blocks，首次计划续扫也显式启用 resume。</p>
+        <p>未来用 blocks 提前完成子树时，仍需等待关联 worker、重试和未知项全部收束。扫描 checkpoint 只证明枚举确认到了哪里，不能替代文件迁移和源删除的确认记录。</p>
+        <p>生产扫描 checkpoint 至少间隔 60 秒，且满足间隔后仍需等待完整目录／子目录块完成；大平铺目录不能仅因计时到而提前确认。</p>
+
+        <h3 id="delete-failure">4.7　删除失败：保留目标，只恢复清理阶段</h3>
+        <p>源端网络闪断可有限重试；只读、权限不足、对象锁或保留策略限制，应准确上报并停止无效重试。目标已就绪的事实必须保留，避免后续重新复制整文件。</p>
+        <p>重试删除前，复核目标证据仍有效、源路径仍指向原对象。删除曾返回未知时，即使路径重新存在，也不能直接继续删除，因为它可能已经是新文件。</p>
+        <div class="note warn"><p><strong>版本化源的“删除”必须定义：</strong>隐藏当前对象与永久删除指定历史版本是不同操作。S3 版本化桶中，不带 versionId 的删除通常新增 delete marker，历史数据仍保留，见 <a href="https://docs.aws.amazon.com/AmazonS3/latest/userguide/DeletingObjectVersions.html">S3 删除版本语义</a>。</p></div>
+        <p>目标仅保存当前版本时，未复制的历史版本不得成为本轮清理对象。若要求迁移并删除全部历史，必须建立逐版本目标确认、源版本删除和删除标记处理规则；当前普通 move_file 接口不能承担这个语义。</p>
+      </section>
+
+      <section id="statistics">
+        <h2><span class="index">05 / OBSERVABILITY</span>统计与状态呈现</h2>
+        <p>以持久化、已确认事实为累计统计依据，运行中状态单独展示。CLI、Web、查询接口和 callback 共用同一口径。</p>
+        <div class="table-wrap">
+          <table class="matrix">
+            <thead><tr><th scope="col">类别</th><th scope="col">建议展示</th><th scope="col">异常场景要求</th></tr></thead>
+            <tbody>
+              <tr><th scope="row">扫描</th><td>已访问、已过滤、已纳入计划；目录、普通文件、软链接等分开；扫描是否完整。</td><td>目录剪枝未访问的项不计数。扫描失败时不得宣称掌握完整总量。</td></tr>
+              <tr><th scope="row">计划规模</th><td>逻辑对象数、待迁移版本数、逻辑字节数。</td><td>历史分段 entry 数不等于对象数；过滤和目标仅保留当前版本的选择须有独立口径。</td></tr>
+              <tr><th scope="row">执行中</th><td>排队、复制中、校验中、重试等待、依赖恢复中。</td><td>恢复不等于最终失败；依赖故障不放大为无数个独立文件失败。</td></tr>
+              <tr><th scope="row">目标结果</th><td>目标已就绪、最终失败、结果未知；数量和逻辑字节分别统计。</td><td>目标未知写入先对账，不能直接记成功或按未执行重放。</td></tr>
+              <tr><th scope="row">目录收尾</th><td>待处理、元数据已确认、失败；源目录待删除／已删除。</td><td>数据传输完毕不等于目录完成；非空目录单独报告原因。</td></tr>
+              <tr><th scope="row">源端清理</th><td>源文件已删除、待重试、失败、结果未知。</td><td>目标已就绪但清理失败时保留目标成功，不计作完整搬迁。</td></tr>
+              <tr><th scope="row">性能</th><td>逻辑完成字节、实际传输字节、重传字节、复用字节、校验读取字节、速率与耗时。</td><td>重传不增加逻辑完成字节，校验流量不冒充迁移有效吞吐。</td></tr>
+              <tr><th scope="row">任务与通知</th><td>实际任务状态、当前阶段、完成条件、终态通知交付状态。</td><td>通知失败独立表达；不能改变迁移事实或将未交付载荷标为已交付。</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <h3>正常场景</h3>
+        <p>保留源端时，可先展示“文件复制与校验完成，正在恢复目录元数据”，完成最后收尾后再进入成功终态。删除源端时，明确显示当前处于复制、校验、目录收尾还是源端清理阶段。</p>
+        <h3>清理失败场景</h3>
+        <div class="example" aria-label="源端只读时的统计示例">
+          <p><strong>示例：1000 个文件已在目标就绪，其中 20 个因源端只读未删除。</strong></p>
+          <div class="metrics">
+            <div class="metric"><b>1,000</b><span>目标文件已就绪</span></div>
+            <div class="metric"><b>980</b><span>源文件已删除</span></div>
+            <div class="metric pending"><b>20</b><span>清理失败：源端只读</span></div>
+          </div>
+          <p>任务结果：数据迁移完成，源端清理未完成。后续仅复核并恢复清理，不重复增加目标完成数，不重新复制这 20 个文件。</p>
+        </div>
+        <h3>计数与恢复规则</h3>
+        <ul>
+          <li>同一对象／版本按执行事实去重；同轮重启恢复包含 checkpoint 已确认累计数，重放不得再次累加。</li>
+          <li>重试事件数、成功恢复数与最终失败对象数分开。重试后成功的对象不保留在最终失败数中，历史事件仍可查询。</li>
+          <li>目标就绪、源删除确认等累计里程碑可以重叠；排队、执行中、待重试等当前状态必须按明确定义计算，不能把不同口径简单相加。</li>
+          <li>扫描不完整或结果未知时，总量、剩余量和完成百分比标注不完整／未知，不做估算补偿。</li>
+          <li>清理失败、数据失败、目录元数据失败、取消、未知结果与通知失败分别表达，不共用一个 error_count 解释全部结果。</li>
+        </ul>
+      </section>
+
+      <section id="delivery">
+        <h2><span class="index">06 / DELIVERY</span>职责与实施优先级</h2>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th scope="col">所属层</th><th scope="col">负责内容</th></tr></thead>
+            <tbody>
+              <tr><th scope="row">任务层 / app</th><td>迁移策略、元数据要求、执行身份、阶段推进、删除授权、统计和终态通知；CLI／Web 共用契约。</td></tr>
+              <tr><th scope="row">db</th><td>新全量清理、执行事实持久化、发布及删除确认、恢复对账、精确累计；集中处理 Single／Cluster 的部署差异。</td></tr>
+              <tr><th scope="row">data-mover</th><td>存储能力、元数据观察与应用、传输校验、发布证据、受保护删除及调用方指定的恢复预算执行。</td></tr>
+              <tr><th scope="row">协议客户端</th><td>连接和协议恢复、稳定写入、COMMIT、条件操作与有类型协议错误，提供实际可证明的操作结果。</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>不在 CLI、Web、sender、receiver 各自实现 backend 特判和恢复循环。目录统一收尾应形成明确模块边界，数据复制与源删除共享同一套错误和状态转换契约。</p>
+        <div class="table-wrap">
+          <table class="matrix">
+            <caption>推荐实施次序；以下均为待实施工作</caption>
+            <thead><tr><th scope="col">优先级</th><th scope="col">工作</th><th scope="col">可独立验收的结果</th></tr></thead>
+            <tbody>
+              <tr><th scope="row">P0</th><td>定义目标就绪、删除确认、结果未知及元数据必需项；修复只记日志的失败路径。</td><td>必需条件未满足不删源；ACL／软链接等失败准确影响结果。</td></tr>
+              <tr><th scope="row">P0</th><td>建立删除前持久化边界、发布证据绑定与受保护删除；补齐并发修改边界。</td><td>故障或取消后可根据事实对账，不能误删新对象。</td></tr>
+              <tr><th scope="row">P1</th><td>区分新全量和同轮恢复，完成 base 清理、身份隔离与恢复事实保留。</td><td>新全量启动前基线为空；同轮恢复不丢事实、不重复计数。</td></tr>
+              <tr><th scope="row">P1</th><td>统一扫描 plan、恢复预算、结构化错误及统计契约。</td><td>元数据缺失准确处理；断网有界恢复；查询与 callback 口径一致。</td></tr>
+              <tr><th scope="row">P1</th><td>完善目录统一收尾、空目录删除和多版本失败阻断。</td><td>目录元数据准确，非空目录保留，同对象前序失败不推进后序发布。</td></tr>
+              <tr><th scope="row">P2</th><td>按实际需求增加子树完成屏障，再评估 blocks 带来的调度收益。</td><td>保持有界内存和正确性，以同模式基线证明性能收益。</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>结构重构与行为修复分别提交。每个实现步骤应形成语义完整、可独立验证的改动；不以增加抽象或减少文件数量作为架构优化证据。</p>
+      </section>
+
+      <section id="acceptance">
+        <h2><span class="index">07 / VALIDATION</span>验收与未验证范围</h2>
+        <p>实现后对受影响真实链路实施受控故障注入，至少覆盖闪断、持续断连、静默丢包／超时、恢复、取消与进程崩溃。单元测试和正常路径成功不能替代真实故障验证。</p>
+        <div class="table-wrap">
+          <table class="matrix">
+            <thead><tr><th scope="col">验收维度</th><th scope="col">必须核对的结果</th></tr></thead>
+            <tbody>
+              <tr><th scope="row">目录与元数据</th><td>根目录、空目录、深层目录、限制性权限、失败后重试；文件数据完成后目录 mtime 不再被本轮操作改变；必需元数据真实读回一致。</td></tr>
+              <tr><th scope="row">安全删除</th><td>每个源删除都有对应目标就绪证据；覆盖删除响应丢失、删除后记账失败、源替换、只读、非空目录、归档清单变化。</td></tr>
+              <tr><th scope="row">多版本</th><td>跨多个 entry、多个 worker、长历史、删除标记、前序失败阻断；版本化目标未知写入不会盲目重放。</td></tr>
+              <tr><th scope="row">代次与隔离</th><td>同 job 新全量清理、同轮恢复、旧执行晚到确认、并发执行、选项或源目标变化；不同 job 不互相影响。</td></tr>
+              <tr><th scope="row">故障时间</th><td>记录检测耗时、识别后恢复／退出耗时、取消耗时。扫描约 3 秒恢复窗口不能被并发、分页或重试重置。</td></tr>
+              <tr><th scope="row">数据库与通知</th><td>按影响覆盖 Single／Cluster，验证确认丢失与实际已写入、checkpoint 与事实对齐、终态 callback 限次重试及可用 ClickHouse 保存失败载荷。</td></tr>
+              <tr><th scope="row">统计</th><td>累计数与实际源／目标逐项核对；恢复不重复计数；重传不增加逻辑完成量；扫描不完整与结果未知准确呈现。</td></tr>
+              <tr><th scope="row">性能与资源</th><td>匹配 unordered／blocks 的不落库基线，报告吞吐、总耗时、回退重扫、收尾成本及峰值 RSS；队列、批次和在途工作有界。</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>性能目标沿用仓库约束：全量／全量续扫损失不超过 5%，增量／增量续扫不超过 10%；不得跨 unordered／blocks 比较。约 200 MiB 为内存优化目标，不能牺牲正确性或已确认性能要求。</p>
+        <div class="note warn"><p><strong>本次验证范围：</strong>本方案基于源码与已有规范分析。未修改或运行迁移逻辑，未执行 NFS／S3／ClickHouse／callback 真实故障注入，未取得本方案的吞吐、恢复时延或数据安全实测结论。文档生成检查只证明文档结构与链接等内容，不证明运行时行为。</p></div>
+      </section>
+
+      <section id="references">
+        <h2><span class="index">08 / REFERENCES</span>代码与协议依据</h2>
+        <p class="muted small">相对链接以本文件位于 docs/specs/ 为基准，可在原仓库内打开。HTML 单独拷贝后正文和样式仍可阅读，仓库相对链接需要保留目录结构。</p>
+        <ol class="source-list">
+          <li><a href="../development.md">开发规范</a>：产品职责、扫描顺序、checkpoint、统计、性能和首次开发约束。</li>
+          <li><a href="../external-dependency-failures.md">外部依赖故障约束</a>：检测、恢复预算、取消、未知写入与最终通知。</li>
+          <li><a href="../architecture-review.md">架构审查要求</a>：职责归属、模块边界和规则集中。</li>
+          <li><a href="../../crates/app/src/copy_completion.rs">copy_completion.rs</a>：目录统一收尾与代次提交。<a href="../../crates/app/src/orchestrator.rs">orchestrator.rs</a>：全量／增量任务入口与收尾调用。</li>
+          <li><a href="../../crates/app/src/copy_dispatch.rs">copy_dispatch.rs</a>、<a href="../../crates/app/src/sender.rs">sender.rs</a>、<a href="../../crates/app/src/file_copy.rs">file_copy.rs</a>：路径分派、历史分段和逐版本处理。</li>
+          <li><a href="../../crates/app/src/file_copy/transfer.rs">file_copy/transfer.rs</a>、<a href="../../crates/app/src/receiver.rs">receiver.rs</a>、<a href="../../crates/app/src/sync.rs">sync.rs</a>：传输策略、源删除和应用层元数据处理。</li>
+          <li><a href="../../crates/app/src/scan/observation.rs">scan/observation.rs</a>、<a href="../../crates/app/src/scan/source.rs">scan/source.rs</a>、<a href="../../crates/app/src/dir_walker.rs">dir_walker.rs</a>：观察计划、历史准入及扫描入口。</li>
+          <li><a href="../../crates/db/src/catalogue/copy_generation.rs">catalogue/copy_generation.rs</a>、<a href="../../crates/app/src/copy_execution.rs">copy_execution.rs</a>、<a href="../../crates/app/src/job_execution.rs">job_execution.rs</a>：代次恢复、保守拒绝和执行互斥范围。</li>
+          <li><a href="../../crates/app/src/consumer/stats/report.rs">stats/report.rs</a>、<a href="../../crates/app/src/consumer/stats/diagnostics.rs">stats/diagnostics.rs</a>：当前统计字段和有界诊断明细。</li>
+          <li><a href="../../crates/app/src/tar_pack.rs">tar_pack.rs</a>、<a href="../../tests/scenarios/migration-generations.md">迁移代次测试场景</a>：打包源清理及待实现／执行的场景规格，不能据此认定通过。</li>
+          <li><a href="../../Cargo.toml">Cargo.toml</a> 固定 data-mover 提交：<code>0070c1599689e6c3a5cb3c8e7df602e03f00ca97</code>。已阅读依赖中 <code>crates/transfer/src/transfer/move_file.rs</code> 与 <code>engine/publication.rs</code>，确认普通文件搬迁保护及其边界。</li>
+          <li><a href="https://www.rfc-editor.org/rfc/rfc7530.html#section-16.3.5">RFC 7530 §16.3.5 · NFSv4 COMMIT</a>：稳定存储与提交语义。</li>
+          <li><a href="https://docs.aws.amazon.com/AmazonS3/latest/userguide/DeletingObjectVersions.html">Amazon S3 · 删除对象版本</a>：delete marker 与指定版本永久删除的区别。</li>
+        </ol>
+      </section>
+      <footer>TerraSync · 全量迁移优化方案 · 2026-11-06 · 设计建议，实施结论以代码和实际验收证据为准</footer>
+    </main>
+  </div>
+</body>
+</html>
