@@ -7,18 +7,28 @@
 //! 4. 并发复制控制
 //! 5. 重试机制集成
 
+use crate::file_copy::metadata as copy_metadata;
+use crate::file_copy::namespace as copy_namespace;
+use crate::file_copy::transfer as copy_transfer;
+use data_mover::model::BackendKind;
 // 标准库
-use crate::file_copy::{HdfsCopyContext, copy_file};
+use crate::file_copy::{HdfsCopyContext, copy_file, copy_versions, prepare_directory};
+use std::iter::once;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use storage_adapter::TransferMode;
+use task_model::ObservedEntryExt;
+use task_model::observation::ObservedItem;
+use task_model::{EntryChange, TransferMode};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 
 // 外部crate
-use dashmap::DashMap;
-use storage_adapter::qos::QosManager;
-use storage_adapter::{EntryEnum, ErrorEvent, StorageEntryMessage, StorageEnum, redact_storage_url};
+use crate::file_copy::CopyOptions;
+use crate::storage_factory::StorageContext;
+use data_mover::model::ObservedEntry;
+use data_mover::qos::QosManager;
+use data_mover::redact_storage_url;
+use task_model::{ErrorEvent, StorageEntryMessage};
 use tracing::{Instrument, debug, error, info, info_span, instrument, trace, warn};
 #[cfg(windows)]
 use windows_sys::Win32::Foundation::CloseHandle;
@@ -31,7 +41,7 @@ use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken}
 
 // 内部模块
 use crate::broadcast::BroadcastForwarder;
-use crate::byte_resume::{ByteResumeStore, part_path_for};
+use crate::byte_resume::ByteResumeStore;
 use crate::error::{AppError, Result};
 use crate::storage_factory::{StorageRole, create_storage_for_role};
 
@@ -41,9 +51,9 @@ use crate::storage_factory::{StorageRole, create_storage_for_role};
 /// 提供了简洁的接口来获取存储实例和并发配置。
 pub struct StoragePair {
     /// 源存储实例，用于读取数据
-    src_storage: Arc<StorageEnum>,
+    src_storage: Arc<StorageContext>,
     /// 目标存储实例，用于写入数据
-    dest_storage: Arc<StorageEnum>,
+    dest_storage: Arc<StorageContext>,
 }
 
 impl StoragePair {
@@ -82,7 +92,7 @@ impl StoragePair {
     ///
     /// # 返回值
     /// - 源存储实例的Arc引用
-    pub fn get_src_storage(&self) -> &Arc<StorageEnum> {
+    pub fn get_src_storage(&self) -> &Arc<StorageContext> {
         &self.src_storage
     }
 
@@ -92,7 +102,7 @@ impl StoragePair {
     ///
     /// # 返回值
     /// - 目标存储实例的Arc引用
-    pub fn get_dest_storage(&self) -> &Arc<StorageEnum> {
+    pub fn get_dest_storage(&self) -> &Arc<StorageContext> {
         &self.dest_storage
     }
 }
@@ -233,178 +243,46 @@ pub(crate) fn check_admin_privileges() -> Result<bool> {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 pub(crate) async fn process_versioned_entry(
-    entry: &Arc<EntryEnum>, src_storage: Arc<StorageEnum>, dest_storage: Arc<StorageEnum>,
+    item: &ObservedItem, src_storage: Arc<StorageContext>, dest_storage: Arc<StorageContext>,
     broadcaster: BroadcastForwarder<StorageEntryMessage>, qos_manager: Option<QosManager>,
-    object_buffers: Arc<DashMap<String, Vec<Arc<EntryEnum>>>>, enable_integrity_check: bool, enable_acl: bool,
-    is_source_reserved: bool, bytes_counter: Option<Arc<AtomicU64>>, resume: ResumeOpts,
+    enable_integrity_check: bool, enable_acl: bool, is_source_reserved: bool, bytes_counter: Option<Arc<AtomicU64>>,
+    resume: ResumeOpts, change: EntryChange,
 ) -> Result<()> {
-    // 版本化对象，使用per-object缓冲区机制
-    trace!("Processing versioned entry with buffer: {:?}", entry);
-
-    // 按对象分组
-    let object_key = match &**entry {
-        EntryEnum::S3(s3_entry) => s3_entry.relative_path.clone(),
-        EntryEnum::NAS(_) => {
-            error!("Expected S3Entry for versioned processing, got {:?}", entry);
-            return Err(AppError::CopyError("Versioned processing requires an S3 entry".into()));
-        }
-        EntryEnum::HDFS(_) => {
-            error!("Expected S3Entry for versioned processing, got HDFS entry");
-            return Err(AppError::CopyError("Versioned processing requires an S3 entry".into()));
-        }
-    };
-
-    // 使用 DashMap per-key 细粒度锁：只锁住当前 object_key，不阻塞其他对象
-    // push + 集齐判定 + take 在同一个锁 scope 内完成，消除多 worker 下的 TOCTOU 竞态
-    let object_versions = {
-        let mut entry_ref = object_buffers.entry(object_key.clone()).or_default();
-        entry_ref.push(entry.clone());
-
-        // 检查是否已收集所有版本（无版本信息时视为单版本，立即处理）
-        let total = entry.get_version_count().unwrap_or(1) as usize;
-        if entry_ref.len() < total {
-            // 未集齐，drop RefMut 自动释放锁
-            return Ok(());
-        }
-
-        // 集齐 → 在持锁期间 take 走数据（留空 Vec）
-        std::mem::take(entry_ref.value_mut())
-    };
-    // RefMut 已 drop，安全清理空壳 entry
-    object_buffers.remove(&object_key);
-
-    // 已集齐所有版本，开始处理
-    trace!("All versions of object {} collected, starting processing", object_key);
-
-    // 当前 handler 等待版本组完成，阶段屏障必须覆盖实际复制及错误。
-    let span = info_span!("version_processor", path = %object_key, object_key = %object_key);
-    async move {
-        let mut failure = None;
-        let mut task_versions = object_versions;
-
-        // 按mtime从旧到新排序版本
-        task_versions.sort_by_key(|a| a.get_mtime());
-
-        trace!("Sorted versions: {:?}", task_versions);
-
-        if dest_storage.is_bucket_versioned().await? {
-            let version_count = task_versions.len() as u32;
-            debug!("Processing object {} with {} versions", object_key, version_count);
-
-            // 处理每个版本
-            for mut entry in task_versions {
-                // 设置版本计数
-                Arc::make_mut(&mut entry).set_version_count(version_count);
-
-                // 记录开始处理的版本信息
-                trace!(
-                    "Processing versioned entry: relative_path={:?}, version_id={:?}, is_latest={}, is_delete_marker={}, mtime={:?}",
-                    entry.get_relative_path(),
-                    entry.get_version_id(),
-                    entry.get_is_latest(),
-                    entry.get_is_delete_marker(),
-                    entry.get_mtime()
-                );
-
-                // 每个源版本都使用同一显式策略，上游请求固定对应的 version_id。
-                match process_entry(
-                    entry.as_ref(),
-                    Arc::clone(&src_storage),
-                    Arc::clone(&dest_storage),
-                    enable_integrity_check,
-                    enable_acl,
-                    is_source_reserved,
-                    qos_manager.clone(),
-                    bytes_counter.clone(),
-                    &broadcaster,
-                    resume.clone(),
-                )
-                .await
-                {
-                    Ok(()) => {
-                        // 记录处理成功的版本信息
-                        debug!(
-                            "Successfully processed versioned entry: relative_path={:?}, version_id={:?}, is_latest={}, is_delete_marker={}, mtime={:?}",
-                            entry.get_relative_path(),
-                            entry.get_version_id(),
-                            entry.get_is_latest(),
-                            entry.get_is_delete_marker(),
-                            entry.get_mtime()
-                        );
-
-                        // 复制成功后才广播结果
-                        broadcaster.broadcast(StorageEntryMessage::New(entry.clone())).await;
-                    }
-                    Err(e) => {
-                        error!(
-                            "Failed to process versioned entry {:?}: {}",
-                            entry.get_relative_path(),
-                            e
-                        );
-                        broadcaster
-                            .broadcast(StorageEntryMessage::Error {
-                                event: ErrorEvent::Copy,
-                                path: entry.get_relative_path().to_path_buf(),
-                                entry: Some(entry.clone()),
-                                reason: format!("{e}"),
-                            })
-                            .await;
-                        failure.get_or_insert(e);
-                    }
-                }
-            }
-        } else {
-            // 目标不支持版本化，仅复制最新版本（最后一个，因为已按mtime升序排列）
-            if let Some(entry) = task_versions.last() {
-                let entry = entry.clone();
-                debug!(
-                    "Destination not versioned, copying only latest version of object {}: version_id={:?}, mtime={:?}",
-                    object_key,
-                    entry.get_version_id(),
-                    entry.get_mtime()
-                );
-
-                match process_entry(
-                    entry.as_ref(),
-                    Arc::clone(&src_storage),
-                    Arc::clone(&dest_storage),
-                    enable_integrity_check,
-                    enable_acl,
-                    is_source_reserved,
-                    qos_manager.clone(),
-                    bytes_counter.clone(),
-                    &broadcaster,
-                    resume.clone(),
-                )
-                .await
-                {
-                    Ok(()) => {
-                        debug!(
-                            "Successfully processed latest version of object {}: version_id={:?}",
-                            object_key,
-                            entry.get_version_id()
-                        );
-                        broadcaster.broadcast(StorageEntryMessage::New(entry)).await;
-                    }
-                    Err(e) => {
-                        error!("Failed to process latest version of object {}: {}", object_key, e);
-                        broadcaster
-                            .broadcast(StorageEntryMessage::Error {
-                                event: ErrorEvent::Copy,
-                                path: object_key.clone().into(),
-                                entry: Some(entry.clone()),
-                                reason: format!("{e}"),
-                            })
-                            .await;
-                        failure.get_or_insert(e);
-                    }
-                }
-            }
-        }
-        match failure { Some(error) => Err(error), None => Ok(()) }
-    }.instrument(span).await
+    if item.entry.history().is_some() {
+        return copy_versions(
+            once(item.clone()),
+            &src_storage,
+            &dest_storage,
+            CopyOptions {
+                transfer_mode: resume.transfer_mode,
+                qos: qos_manager,
+                enable_integrity_check,
+                is_source_reserved,
+                bytes_counter,
+                cancel: None,
+            },
+            &resume.job_id,
+            &broadcaster,
+            change,
+        )
+        .await;
+    }
+    process_entry(
+        &item.entry,
+        src_storage,
+        dest_storage,
+        enable_integrity_check,
+        enable_acl,
+        is_source_reserved,
+        qos_manager,
+        bytes_counter,
+        &broadcaster,
+        resume,
+    )
+    .await?;
+    broadcaster.broadcast(change.message(item.clone())).await;
+    Ok(())
 }
 
 /// `process_entry` / `process_entry_inner` 的标志位组合
@@ -422,9 +300,9 @@ pub(crate) struct ProcessEntryOpts {
 
 #[allow(clippy::too_many_arguments)] // 公共入口需要逐项透传调用方上下文，封装结构会破坏 API 形态
 pub(crate) async fn process_entry(
-    entry: &EntryEnum, src_storage: Arc<StorageEnum>, dest_storage: Arc<StorageEnum>, enable_integrity_check: bool,
-    enable_acl: bool, is_source_reserved: bool, qos_manager: Option<QosManager>, bytes_counter: Option<Arc<AtomicU64>>,
-    broadcaster: &BroadcastForwarder<StorageEntryMessage>, resume: ResumeOpts,
+    entry: &Arc<ObservedEntry>, src_storage: Arc<StorageContext>, dest_storage: Arc<StorageContext>,
+    enable_integrity_check: bool, enable_acl: bool, is_source_reserved: bool, qos_manager: Option<QosManager>,
+    bytes_counter: Option<Arc<AtomicU64>>, broadcaster: &BroadcastForwarder<StorageEntryMessage>, resume: ResumeOpts,
 ) -> Result<()> {
     let opts = ProcessEntryOpts {
         enable_integrity_check,
@@ -450,7 +328,7 @@ pub(crate) async fn process_entry(
 /// 目录 / symlink 行为与 `process_entry` 完全一致；普通文件跳过 `copy_file`，
 /// 仍执行 `set_entry_metadata` + ACL / xattr 复制。
 pub(crate) async fn process_metadata_only_entry(
-    entry: &EntryEnum, src_storage: Arc<StorageEnum>, dest_storage: Arc<StorageEnum>, enable_acl: bool,
+    entry: &Arc<ObservedEntry>, src_storage: Arc<StorageContext>, dest_storage: Arc<StorageContext>, enable_acl: bool,
     is_source_reserved: bool, broadcaster: &BroadcastForwarder<StorageEntryMessage>,
 ) -> Result<()> {
     let opts = ProcessEntryOpts {
@@ -464,8 +342,8 @@ pub(crate) async fn process_metadata_only_entry(
 }
 
 async fn process_entry_inner(
-    entry: &EntryEnum, src_storage: Arc<StorageEnum>, dest_storage: Arc<StorageEnum>, opts: ProcessEntryOpts,
-    qos_manager: Option<QosManager>, bytes_counter: Option<Arc<AtomicU64>>,
+    entry: &Arc<ObservedEntry>, src_storage: Arc<StorageContext>, dest_storage: Arc<StorageContext>,
+    opts: ProcessEntryOpts, qos_manager: Option<QosManager>, bytes_counter: Option<Arc<AtomicU64>>,
     broadcaster: &BroadcastForwarder<StorageEntryMessage>,
 ) -> Result<()> {
     let ProcessEntryOpts {
@@ -484,41 +362,25 @@ async fn process_entry_inner(
         relative_path, enable_integrity_check, enable_acl, is_source_reserved
     );
 
-    if entry.get_is_dir() {
-        trace!("Calling create_dir_all: {:?}", relative_path);
-
-        // 创建目标目录
-        match dest_storage.create_dir_all(entry).await {
-            Ok(()) => debug!("Created directory: {:?}", relative_path),
-            Err(e) => {
-                error!("Error creating directory: {:?}, {:?}", relative_path, e);
-                broadcaster
-                    .broadcast(StorageEntryMessage::Error {
-                        event: ErrorEvent::Copy,
-                        path: relative_path.to_path_buf(),
-                        entry: Some(Arc::new(entry.clone())),
-                        reason: format!("{e}"),
-                    })
-                    .await;
-                return Err(e.into());
-            }
-        }
-
+    if entry.history().is_some() && !skip_data_copy {
+        return Err(AppError::ConfigError("history must use the ordered version-copy workflow".into()));
+    }
+    if prepare_directory(entry, &dest_storage).await? {
         trace!("Created directory: {:?}", relative_path);
     } else if entry.get_is_symlink() {
-        match src_storage.read_symlink(entry).await {
+        match copy_namespace::read_symlink(src_storage.storage(), entry).await {
             Ok(target_path) => {
-                dest_storage.create_symlink(entry, &target_path).await?;
+                copy_namespace::create_symlink(dest_storage.storage(), entry, &target_path).await?;
 
                 if !is_source_reserved {
                     trace!("Is not source reserved, removing symlink {:?}", relative_path);
-                    if let Err(e) = src_storage.delete_file(entry).await {
+                    if let Err(e) = copy_namespace::delete_file(src_storage.storage(), entry).await {
                         error!("Failed to remove existing symlink {:?}: {}", relative_path, e);
                         broadcaster
                             .broadcast(StorageEntryMessage::Error {
                                 event: ErrorEvent::SymlinkOp,
                                 path: relative_path.to_path_buf(),
-                                entry: Some(Arc::new(entry.clone())),
+                                entry: Some(Arc::clone(entry)),
                                 reason: format!("{e}"),
                             })
                             .await;
@@ -532,7 +394,7 @@ async fn process_entry_inner(
                     .broadcast(StorageEntryMessage::Error {
                         event: ErrorEvent::SymlinkOp,
                         path: relative_path.to_path_buf(),
-                        entry: Some(Arc::new(entry.clone())),
+                        entry: Some(Arc::clone(entry)),
                         reason: format!("{e}"),
                     })
                     .await;
@@ -542,10 +404,9 @@ async fn process_entry_inner(
     } else if skip_data_copy {
         // MetadataOnly 变更：chmod/chown 导致 mode/uid/gid 变了但内容未变，跳过 copy_file
         trace!("Skipping data copy (metadata-only change): {:?}", relative_path);
-        dest_storage
-            .set_entry_metadata(entry)
+        copy_metadata::set_entry_metadata(dest_storage.storage(), entry)
             .await?;
-    } else if matches!(dest_storage.as_ref(), StorageEnum::HDFS(_)) {
+    } else if dest_storage.as_ref().storage().kind() == BackendKind::Hdfs {
         let hdfs = HdfsCopyContext::from_job(&resume.job_id, resume.transfer_mode)?;
         let recorder = if resume.transfer_mode == TransferMode::Checkpoint {
             Some(CommitRecorder::start(&resume.job_dir, entry, src_storage.block_size()).await?)
@@ -555,7 +416,7 @@ async fn process_entry_inner(
             &src_storage,
             &dest_storage,
             entry,
-            storage_adapter::CopyOptions {
+            crate::file_copy::CopyOptions {
                 transfer_mode: resume.transfer_mode,
                 qos: qos_manager,
                 enable_integrity_check,
@@ -591,11 +452,11 @@ async fn process_entry_inner(
         debug!("Copying file {:?}", relative_path);
 
         // 调用 data_mover 的 copy_file（处理 QoS、完整性检查、源文件删除）
-        StorageEnum::copy_file(
+        copy_transfer::copy_entry(
             &src_storage,
             &dest_storage,
             entry,
-            storage_adapter::CopyOptions {
+            crate::file_copy::CopyOptions {
                 transfer_mode: resume.transfer_mode,
                 qos: qos_manager,
                 enable_integrity_check,
@@ -614,13 +475,13 @@ async fn process_entry_inner(
     // ACL 复制（目录和文件均需要，symlink 除外）
     // 支持 Local→Local（Windows）、CIFS→CIFS（跨平台）、NFS→NFS（NFSv4+），其他组合静默跳过
     if enable_acl && !entry.get_is_symlink() {
-        if let Err(err) = StorageEnum::copy_acl(&src_storage, &dest_storage, relative_path).await {
+        if let Err(err) = copy_metadata::copy_acl((&src_storage).storage(), (&dest_storage).storage(), relative_path).await {
             error!("Failed to copy ACL for {:?}: {}", relative_path, err);
             broadcaster
                 .broadcast(StorageEntryMessage::Error {
                     event: ErrorEvent::CopyAcl,
                     path: relative_path.to_path_buf(),
-                    entry: Some(Arc::new(entry.clone())),
+                    entry: Some(Arc::clone(entry)),
                     reason: format!("{err}"),
                 })
                 .await;
@@ -628,13 +489,13 @@ async fn process_entry_inner(
         }
 
         // xattr 复制（仅 NFSv4.1→NFSv4.1，其他组合静默跳过）
-        if let Err(err) = StorageEnum::copy_xattr(&src_storage, &dest_storage, relative_path).await {
+        if let Err(err) = copy_metadata::copy_xattr((&src_storage).storage(), (&dest_storage).storage(), relative_path).await {
             error!("Failed to copy xattr for {:?}: {}", relative_path, err);
             broadcaster
                 .broadcast(StorageEntryMessage::Error {
                     event: ErrorEvent::CopyXattr,
                     path: relative_path.to_path_buf(),
-                    entry: Some(Arc::new(entry.clone())),
+                    entry: Some(Arc::clone(entry)),
                     reason: format!("{err}"),
                 })
                 .await;
@@ -659,7 +520,7 @@ pub(crate) struct ResumeOpts {
 
 pub(crate) struct CommitRecorder {
     store: Arc<ByteResumeStore>,
-    callback: storage_adapter::CommitCallback,
+    callback: crate::byte_resume::CommitCallback,
     drain: JoinHandle<()>,
     shutdown: oneshot::Sender<()>,
     dropped: Arc<AtomicU64>,
@@ -667,7 +528,7 @@ pub(crate) struct CommitRecorder {
 }
 
 impl CommitRecorder {
-    pub(crate) async fn start(job_dir: &str, entry: &EntryEnum, block_size: u64) -> Result<Self> {
+    pub(crate) async fn start(job_dir: &str, entry: &ObservedEntry, block_size: u64) -> Result<Self> {
         if job_dir.trim().is_empty() {
             return Err(AppError::ConfigError(
                 "recoverable copy requires a persistent job directory".to_string(),
@@ -720,7 +581,7 @@ impl CommitRecorder {
         })
     }
 
-    pub(crate) fn callback(&self) -> storage_adapter::CommitCallback {
+    pub(crate) fn callback(&self) -> crate::byte_resume::CommitCallback {
         self.callback.clone()
     }
 
@@ -748,10 +609,11 @@ impl CommitRecorder {
 #[cfg(test)]
 #[allow(clippy::items_after_test_module)]
 mod commit_recorder_tests {
+    use crate::scan::observe_path;
     use std::path::Path;
     use std::time::Duration;
 
-    use storage_adapter::{CreateStorageOptions, create_storage};
+    use crate::storage_factory::{CreateStorageOptions, create_storage};
 
     use super::CommitRecorder;
 
@@ -771,8 +633,7 @@ mod commit_recorder_tests {
         )
         .await
         .unwrap_or_else(|error| panic!("create source storage: {error}"));
-        let entry = source
-            .get_metadata(Path::new("payload.bin"))
+        let entry = observe_path(source.storage(), Path::new("payload.bin"))
             .await
             .unwrap_or_else(|error| panic!("source metadata: {error}"));
         let recorder = CommitRecorder::start(
@@ -811,8 +672,7 @@ mod commit_recorder_tests {
         )
         .await
         .unwrap_or_else(|error| panic!("create source storage: {error}"));
-        let entry = source
-            .get_metadata(Path::new("payload.bin"))
+        let entry = observe_path(source.storage(), Path::new("payload.bin"))
             .await
             .unwrap_or_else(|error| panic!("source metadata: {error}"));
 
@@ -822,8 +682,8 @@ mod commit_recorder_tests {
 }
 
 /// 该存储是否为 S3。
-fn is_s3(storage: &StorageEnum) -> bool {
-    matches!(storage, StorageEnum::S3(_))
+fn is_s3(storage: &StorageContext) -> bool {
+    storage.storage().kind() == BackendKind::S3
 }
 
 /// 该 entry 是否应走字节级断点续传：启用 + 多块大文件（全后端：Local/NFS/CIFS/S3）。
@@ -834,7 +694,9 @@ fn is_s3(storage: &StorageEnum) -> bool {
 ///   额外要求 size > 目标端 block_size（part 大小下限），单 part 文件续传无意义
 ///   （中断即全丢），走普通拷贝即可。
 /// - **S3 多版本路径**：版本化源固定 version_id，并遵循同一显式策略。
-pub(crate) fn should_resume(resume: &ResumeOpts, entry: &EntryEnum, src: &StorageEnum, dest: &StorageEnum) -> bool {
+pub(crate) fn should_resume(
+    resume: &ResumeOpts, entry: &ObservedEntry, src: &StorageContext, dest: &StorageContext,
+) -> bool {
     resume.transfer_mode == TransferMode::Checkpoint
         && !resume.job_dir.is_empty()
         && !entry.get_is_dir()
@@ -843,35 +705,20 @@ pub(crate) fn should_resume(resume: &ResumeOpts, entry: &EntryEnum, src: &Storag
         && (!is_s3(dest) || entry.get_size() > dest.block_size())
 }
 
-/// 字节级断点续传复制单个大文件（全量建 `.part` / 增量续 `.part` 共用）。
-///
-/// 加载/创建 `<job_dir>/byte_resume/` 下的进度状态，把缺失区间交给
-/// `copy_file_resumable`；每个 chunk 确认落盘的回调经有界 channel 投递到收敛 task
-/// 异步持久化区间（不阻塞写管道热路径）。成功后清理状态文件；失败（中断）保留状态供续传。
-///
-/// - NAS 目标端：续写到 `<dest>.terrasync-part`，完成后由 data-mover 原子 rename。
-/// - S3 目标端：multipart part 粒度续传，进度真值是目标端 in-progress upload
-///   （data-mover 以 ListParts 反推缺失区间，忽略此处传入的 `missing`）；
-///   本地状态文件仍随 part 回调更新，仅作进度参考。
+/// 以原生 Checkpoint 策略复制大文件；恢复路径与已确认范围只由目标引擎发现。
+/// 本地记录器保留现有产品进度收尾，不向引擎提供 `.part` 路径或缺失区间。
 pub(crate) async fn copy_file_with_resume(
-    entry: &EntryEnum, src_storage: &StorageEnum, dest_storage: &StorageEnum, enable_integrity_check: bool,
-    is_source_reserved: bool, qos_manager: Option<QosManager>, bytes_counter: Option<Arc<AtomicU64>>, job_dir: &str,
+    entry: &Arc<ObservedEntry>, src_storage: &StorageContext, dest_storage: &StorageContext,
+    enable_integrity_check: bool, is_source_reserved: bool, qos_manager: Option<QosManager>,
+    bytes_counter: Option<Arc<AtomicU64>>, job_dir: &str,
 ) -> Result<()> {
-    let dest_rel = entry.get_relative_path();
     let recorder = CommitRecorder::start(job_dir, entry, src_storage.block_size()).await?;
-    let missing = recorder.store.missing_intervals().await;
 
-    let resume = storage_adapter::ResumeContext {
-        part_relative_path: part_path_for(dest_rel),
-        missing_intervals: missing,
-        on_committed: recorder.callback(),
-    };
-
-    let res = StorageEnum::copy_file_resumable(
+    let res = copy_transfer::copy_checkpointed(
         src_storage,
         dest_storage,
         entry,
-        storage_adapter::CopyOptions {
+        crate::file_copy::CopyOptions {
             transfer_mode: TransferMode::Checkpoint,
             qos: qos_manager,
             enable_integrity_check,
@@ -879,7 +726,6 @@ pub(crate) async fn copy_file_with_resume(
             bytes_counter,
             ..Default::default()
         },
-        resume,
     )
     .await;
 
@@ -889,8 +735,8 @@ pub(crate) async fn copy_file_with_resume(
 
 /// 处理单个文件或目录的复制
 pub(crate) async fn process_rename_entry(
-    from_entry: Arc<EntryEnum>, to_entry: Arc<EntryEnum>, src_storage: Arc<StorageEnum>,
-    dest_storage: Arc<StorageEnum>, is_source_reserved: bool,
+    from_entry: Arc<ObservedEntry>, to_entry: Arc<ObservedEntry>, src_storage: Arc<StorageContext>,
+    dest_storage: Arc<StorageContext>, is_source_reserved: bool,
 ) -> Result<()> {
     let from_path = from_entry.get_relative_path();
     let to_path = to_entry.get_relative_path();
@@ -899,15 +745,93 @@ pub(crate) async fn process_rename_entry(
     async {
         trace!("rename file: {:?} to {:?}", from_path, to_path);
 
-        dest_storage.rename(from_path, to_path).await?;
+        dest_storage
+            .roles
+            .namespace()?
+            .rename(from_entry.path(), to_entry.path())
+            .await?;
 
         if !is_source_reserved {
             // 如果源文件不是保留文件，删除源文件
-            src_storage.delete_file(to_entry.as_ref()).await?;
+            copy_namespace::delete_file(src_storage.storage(), to_entry.as_ref()).await?;
         }
 
         Ok(())
     }
     .instrument(span)
     .await
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod native_completion_tests {
+    use super::*;
+    use crate::config::JobType;
+    use crate::consumer::stats::FullStats;
+    use crate::observed_fixtures::observation;
+    use data_mover::model::{BackendKind, EntryKind, HistoryOrder, ObjectHistory};
+
+    fn history(latest_is_delete: bool) -> Arc<ObservedEntry> {
+        let observations: Vec<_> = [
+            ("old", 7, false, false),
+            ("null", 11, false, false),
+            ("latest", 19, true, latest_is_delete),
+        ]
+        .into_iter()
+        .map(|(id, size, latest, deleted)| {
+            observation(
+                BackendKind::S3,
+                "object".into(),
+                EntryKind::File,
+                size,
+                [0, 1, 0],
+                None,
+                None,
+                None,
+                Some((if id == "null" { None } else { Some(id.into()) }, latest, deleted)),
+            )
+        })
+        .collect();
+        let versions = observations
+            .iter()
+            .flat_map(|entry| entry.history().unwrap().records().to_vec())
+            .collect();
+        let current = observations.into_iter().last().unwrap();
+        Arc::new(
+            current
+                .with_history(Some(Box::new(
+                    ObjectHistory::whole(versions, HistoryOrder::Server).unwrap(),
+                )))
+                .unwrap(),
+        )
+    }
+
+    #[test]
+    fn completion_shares_history_and_counts_each_selected_version_once() {
+        let entry = history(false);
+        let mut stats = FullStats::new(JobType::Copy, "selected".into(), String::new(), String::new());
+        let completed: Vec<_> = crate::file_copy::selected_copy_items(&entry, true).collect();
+        assert_eq!(completed.len(), 3);
+        let mut ids = Vec::new();
+        for item in completed {
+            assert!(Arc::ptr_eq(&item.entry, &entry));
+            ids.push(item.view().version_id().to_owned());
+            let event = StorageEntryMessage::New(item);
+            stats.update_from_message(&event);
+        }
+        assert_eq!(stats.regular_file_count, 3);
+        assert_eq!(stats.regular_file_size, 37);
+        assert_eq!(ids, ["old", "null", "latest"]);
+
+        let selected: Vec<_> = crate::file_copy::selected_copy_items(&entry, false).collect();
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].view().version_id(), "latest");
+    }
+
+    #[test]
+    fn a_latest_delete_marker_has_no_file_completion_on_a_nonversioned_target() {
+        let entry = history(true);
+        assert_eq!(crate::file_copy::selected_copy_items(&entry, false).count(), 0);
+        assert_eq!(crate::file_copy::selected_copy_items(&entry, true).count(), 3);
+    }
 }

@@ -1,0 +1,403 @@
+use crate::file_commit::stream as commit_stream;
+use crate::file_copy::CopyOptions;
+use crate::file_copy::namespace as copy_namespace;
+use crate::file_copy::transfer as copy_transfer;
+use crate::rm::progress as deletion;
+use crate::scan::observe_path;
+use crate::scan::source::{ResumableScanItem, ScanSourceMode, WalkOptions};
+use crate::storage_factory::{CreateStorageOptions, StorageContext, create_storage};
+use bytes::Bytes;
+use data_mover::filter::parse_filter_expression;
+use data_mover::storage::PositionedChunk;
+use data_mover::traversal::TraversalOutcome;
+use std::{collections::BTreeSet, path::Path, sync::Arc, time::Duration};
+use task_model::StorageEntryMessage;
+use task_model::{ObservedEntryExt, TransferMode};
+use tempfile::TempDir;
+use tokio::fs::{create_dir_all, write};
+use tokio_util::sync::CancellationToken;
+
+async fn local(root: &Path) -> crate::error::storage::Result<StorageContext> {
+    create_storage(
+        root.to_str()
+            .ok_or_else(|| crate::error::StorageError::InvalidPath("test root".into()))?,
+        CreateStorageOptions::new(Some(64 * 1024), false),
+    )
+    .await
+}
+type TestResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
+
+#[tokio::test]
+async fn opaque_scan_checkpoint_survives_reconnection_without_skipping_entries() -> TestResult {
+    let root = TempDir::new()?;
+    let mut expected = BTreeSet::new();
+    for index in 0..30 {
+        let dir = format!("dir{index:03}");
+        std::fs::create_dir(root.path().join(&dir))?;
+        expected.insert(dir.clone());
+        for name in ["a", "b"] {
+            let path = format!("{dir}/{name}");
+            std::fs::write(root.path().join(&path), b"value")?;
+            expected.insert(path);
+        }
+    }
+    let source = local(root.path()).await?;
+    let options = WalkOptions {
+        concurrency: 1,
+        ..Default::default()
+    };
+    let mut scan = source.scan_source(
+        &options,
+        ScanSourceMode::Resumable {
+            checkpoint: None,
+            every: Duration::ZERO,
+        },
+        CancellationToken::new(),
+    )?;
+    let mut seen = BTreeSet::new();
+    let mut saved = None;
+    while let Some(item) = scan.next().await {
+        match item? {
+            ResumableScanItem::Entry(entry) => {
+                seen.insert(entry.path().as_str().to_owned());
+            }
+            ResumableScanItem::Checkpoint(bytes) if !seen.is_empty() => {
+                saved = Some(bytes);
+                break;
+            }
+            _ => {}
+        }
+    }
+    let checkpoint = saved.ok_or("no checkpoint emitted")?;
+    drop(scan);
+    drop(source);
+    let source = local(root.path()).await?;
+    let mut resumed = source.scan_source(
+        &options,
+        ScanSourceMode::Resumable {
+            checkpoint: Some(checkpoint.clone()),
+            every: Duration::ZERO,
+        },
+        CancellationToken::new(),
+    )?;
+    while let Some(item) = resumed.next().await {
+        if let ResumableScanItem::Entry(entry) = item? {
+            seen.insert(entry.path().as_str().to_owned());
+        }
+    }
+    assert!(matches!(
+        resumed.finish().await?,
+        data_mover::traversal::TraversalOutcome::Completed(_)
+    ));
+    assert_eq!(seen, expected);
+    let changed = WalkOptions {
+        depth: Some(1),
+        ..options
+    };
+    let mut rejected = source.scan_source(
+        &changed,
+        ScanSourceMode::Resumable {
+            checkpoint: Some(checkpoint),
+            every: Duration::ZERO,
+        },
+        CancellationToken::new(),
+    )?;
+    assert!(rejected.next().await.is_none());
+    assert!(rejected.finish().await.is_err());
+    Ok(())
+}
+
+#[tokio::test]
+async fn scan_filter_and_depth_are_applied_by_role_traversal() -> TestResult {
+    let root = TempDir::new()?;
+    tokio::fs::create_dir_all(root.path().join("nested/deeper")).await?;
+    tokio::fs::write(root.path().join("a.txt"), b"one").await?;
+    tokio::fs::write(root.path().join("nested/b.txt"), b"two").await?;
+    tokio::fs::write(root.path().join("nested/deeper/c.txt"), b"three").await?;
+    let storage = local(root.path()).await?;
+    let iter = storage
+        .walkdir(
+            None,
+            WalkOptions {
+                depth: Some(2),
+                match_expressions: Some(data_mover::filter::parse_filter_expression("extension == \"txt\"")?),
+                ..Default::default()
+            },
+        )
+        .await?;
+    let mut paths = Vec::new();
+    while let Some(message) = iter.next().await {
+        match message {
+            StorageEntryMessage::Scanned(entry) => paths.push(entry.get_relative_path().to_path_buf()),
+            other => return Err(format!("unexpected event: {other:?}").into()),
+        }
+    }
+    paths.sort();
+    assert_eq!(paths, vec![Path::new("a.txt"), Path::new("nested/b.txt")]);
+    Ok(())
+}
+#[tokio::test]
+async fn role_copy_replaces_shorter_file_and_move_removes_only_verified_source() -> TestResult {
+    let source = TempDir::new()?;
+    let destination = TempDir::new()?;
+    tokio::fs::write(source.path().join("payload"), b"new").await?;
+    tokio::fs::write(destination.path().join("payload"), b"old-long-data").await?;
+    let src = local(source.path()).await?;
+    let dst = local(destination.path()).await?;
+    let entry = Arc::new(observe_path(src.storage(), Path::new("payload")).await?);
+    copy_transfer::copy_entry(
+        &src,
+        &dst,
+        &entry,
+        CopyOptions {
+            is_source_reserved: true,
+            enable_integrity_check: true,
+            ..Default::default()
+        },
+    )
+    .await?;
+    assert_eq!(tokio::fs::read(destination.path().join("payload")).await?, b"new");
+    assert!(source.path().join("payload").exists());
+    copy_transfer::copy_entry(
+        &src,
+        &dst,
+        &entry,
+        CopyOptions {
+            is_source_reserved: false,
+            ..Default::default()
+        },
+    )
+    .await?;
+    assert!(!source.path().join("payload").exists());
+    Ok(())
+}
+#[tokio::test]
+async fn streamed_destination_is_published_only_after_complete() -> TestResult {
+    let source = TempDir::new()?;
+    let destination = TempDir::new()?;
+    let payload = vec![0x59; 192 * 1024 + 7];
+    tokio::fs::write(source.path().join("payload"), &payload).await?;
+    tokio::fs::write(destination.path().join("payload"), b"old").await?;
+    let src = local(source.path()).await?;
+    let dst = local(destination.path()).await?;
+    let entry = Arc::new(observe_path(src.storage(), Path::new("payload")).await?);
+    let handle = commit_stream::prepare_stream(&dst, &entry).await?;
+    let (tx, rx) = tokio::sync::mpsc::channel(1);
+    let writer_handle = handle.clone();
+    let writer =
+        tokio::spawn(async move { commit_stream::write_chunk_stream(rx, &writer_handle, Arc::new(|_, _| {})).await });
+    for (index, chunk) in payload.chunks(64 * 1024).enumerate() {
+        tx.send(PositionedChunk {
+            offset: (index * 64 * 1024) as u64,
+            data: Bytes::copy_from_slice(chunk),
+        })
+        .await?;
+    }
+    drop(tx);
+    writer.await??;
+    assert_eq!(tokio::fs::read(destination.path().join("payload")).await?, b"old");
+    assert_eq!(handle.received_size().await, payload.len() as u64);
+    commit_stream::commit_chunk_stream(handle).await?;
+    assert_eq!(tokio::fs::read(destination.path().join("payload")).await?, payload);
+    Ok(())
+}
+#[tokio::test]
+async fn short_stream_cannot_replace_an_existing_destination() -> TestResult {
+    let source = TempDir::new()?;
+    let destination = TempDir::new()?;
+    tokio::fs::write(source.path().join("payload"), b"complete").await?;
+    tokio::fs::write(destination.path().join("payload"), b"old").await?;
+    let src = local(source.path()).await?;
+    let dst = local(destination.path()).await?;
+    let entry = Arc::new(observe_path(src.storage(), Path::new("payload")).await?);
+    let handle = commit_stream::prepare_stream(&dst, &entry).await?;
+    let (tx, rx) = tokio::sync::mpsc::channel(1);
+    tx.send(PositionedChunk {
+        offset: 0,
+        data: Bytes::from_static(b"short"),
+    })
+    .await?;
+    drop(tx);
+    assert!(
+        commit_stream::write_chunk_stream(rx, &handle, Arc::new(|_, _| {}))
+            .await
+            .is_err()
+    );
+    assert_eq!(tokio::fs::read(destination.path().join("payload")).await?, b"old");
+    handle.discard().await?;
+    Ok(())
+}
+#[tokio::test]
+async fn namespace_symlinks_and_recursive_delete_use_storage_roles() -> TestResult {
+    let root = TempDir::new()?;
+    tokio::fs::create_dir_all(root.path().join("a/b")).await?;
+    tokio::fs::write(root.path().join("a/b/data"), b"keep target").await?;
+    let storage = local(root.path()).await?;
+    let original = observe_path(storage.storage(), Path::new("a/b/data")).await?;
+    let link = data_mover::model::ObservedEntry::new_symlink(
+        data_mover::model::StoragePath::new("a/link")?,
+        original.modified(),
+        original.source_identity().clone(),
+        data_mover::model::SymlinkTarget::new(data_mover::model::SymlinkTargetEncoding::UnixBytes, b"b/data".to_vec())?,
+    )?
+    .with_metadata(original.metadata().clone());
+    copy_namespace::create_symlink(storage.storage(), &link, Path::new("b/data")).await?;
+    assert_eq!(
+        copy_namespace::read_symlink(storage.storage(), &link).await?,
+        Path::new("b/data")
+    );
+    let directory = observe_path(storage.storage(), Path::new("a")).await?;
+    deletion::delete_dir_all(storage.storage(), &directory).await?;
+    assert!(!root.path().join("a").exists());
+    Ok(())
+}
+
+#[tokio::test]
+async fn packaged_date_directory_stops_traversal_at_requested_package_depth() -> TestResult {
+    let root = TempDir::new()?;
+    tokio::fs::create_dir_all(root.path().join("archive/20250101/child")).await?;
+    tokio::fs::write(root.path().join("archive/20250101/child/data"), b"payload").await?;
+    let storage = local(root.path()).await?;
+    for (depth, expected) in [(0, "archive/20250101"), (1, "archive/20250101/child")] {
+        let iter = storage
+            .walkdir(
+                None,
+                WalkOptions {
+                    packaged: true,
+                    package_depth: depth,
+                    match_expressions: Some(data_mover::filter::parse_filter_expression("dir_date <= 20260101")?),
+                    ..Default::default()
+                },
+            )
+            .await?;
+        let mut packaged = Vec::new();
+        while let Some(message) = iter.next().await {
+            match message {
+                StorageEntryMessage::Packaged(entry) => packaged.push(entry.get_relative_path().to_path_buf()),
+                StorageEntryMessage::Scanned(entry) => assert!(!entry.get_is_regular_file()),
+                other => return Err(format!("unexpected package event: {other:?}").into()),
+            }
+        }
+        assert_eq!(packaged, vec![Path::new(expected)]);
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn checkpointed_copy_keeps_unrelated_files_without_caller_offsets() -> TestResult {
+    let source = TempDir::new()?;
+    let destination = TempDir::new()?;
+    let payload = vec![0x39; 256 * 1024 + 13];
+    tokio::fs::write(source.path().join("payload"), &payload).await?;
+    let src = local(source.path()).await?;
+    let dst = local(destination.path()).await?;
+    let entry = Arc::new(observe_path(src.storage(), Path::new("payload")).await?);
+    tokio::fs::write(destination.path().join("untrusted.part"), b"unrelated").await?;
+    copy_transfer::copy_checkpointed(
+        &src,
+        &dst,
+        &entry,
+        CopyOptions {
+            is_source_reserved: true,
+            ..Default::default()
+        },
+    )
+    .await?;
+    assert_eq!(tokio::fs::read(destination.path().join("payload")).await?, payload);
+    assert_eq!(
+        tokio::fs::read(destination.path().join("untrusted.part")).await?,
+        b"unrelated"
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn observed_zero_mode_is_preserved_instead_of_becoming_unknown() -> TestResult {
+    use std::os::unix::fs::PermissionsExt;
+    let root = tempfile::tempdir()?;
+    let file = root.path().join("zero-mode");
+    std::fs::write(&file, b"payload")?;
+    std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o000))?;
+    let storage = local(root.path()).await?;
+    let entry = observe_path(storage.storage(), Path::new("zero-mode")).await?;
+    assert_eq!(entry.get_mode().map(|mode| mode & 0o7777), Some(0));
+    Ok(())
+}
+
+#[tokio::test]
+async fn packaged_scan_can_use_the_checkpoint_contract_required_for_network_recovery() -> TestResult {
+    let root = TempDir::new()?;
+    create_dir_all(root.path().join("archive/20250101/child")).await?;
+    write(root.path().join("archive/20250101/child/data"), b"payload").await?;
+    let storage = local(root.path()).await?;
+    let options = WalkOptions {
+        packaged: true,
+        match_expressions: Some(parse_filter_expression("dir_date <= 20260101")?),
+        ..Default::default()
+    };
+    let mut scan = storage.scan_source(
+        &options,
+        ScanSourceMode::Resumable {
+            checkpoint: None,
+            every: Duration::ZERO,
+        },
+        CancellationToken::new(),
+    )?;
+    let mut paths = BTreeSet::new();
+    while let Some(item) = scan.next().await {
+        if let ResumableScanItem::Entry(entry) = item? {
+            paths.insert(Path::new(entry.path().as_str()).to_owned());
+        }
+    }
+    assert!(matches!(scan.finish().await?, TraversalOutcome::Completed(_)));
+    assert_eq!(
+        paths,
+        [
+            Path::new("archive").to_owned(),
+            Path::new("archive/20250101").to_owned()
+        ]
+        .into()
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn copied_observation_rejects_source_changes_before_any_target_write() -> TestResult {
+    let source = TempDir::new()?;
+    let destination = TempDir::new()?;
+    tokio::fs::write(source.path().join("payload"), b"observed").await?;
+    tokio::fs::write(destination.path().join("payload"), b"published").await?;
+    let src = local(source.path()).await?;
+    let dst = local(destination.path()).await?;
+    let observed = Arc::new(observe_path(src.storage(), Path::new("payload")).await?);
+    tokio::fs::write(source.path().join("payload"), b"modified after scan").await?;
+    let mut modes = vec![TransferMode::Atomic, TransferMode::Checkpoint];
+    if cfg!(unix) {
+        modes.push(TransferMode::Direct);
+    }
+    for transfer_mode in modes {
+        let result = copy_transfer::copy_entry(
+            &src,
+            &dst,
+            &observed,
+            CopyOptions {
+                transfer_mode,
+                is_source_reserved: false,
+                enable_integrity_check: true,
+                ..Default::default()
+            },
+        )
+        .await;
+        assert!(result.is_err(), "stale observation was accepted in {transfer_mode:?}");
+        assert_eq!(
+            tokio::fs::read(source.path().join("payload")).await?,
+            b"modified after scan"
+        );
+        assert_eq!(tokio::fs::read(destination.path().join("payload")).await?, b"published");
+    }
+    let result = copy_transfer::copy_checkpointed(&src, &dst, &observed, CopyOptions::default()).await;
+    assert!(result.is_err());
+    assert_eq!(tokio::fs::read(destination.path().join("payload")).await?, b"published");
+    Ok(())
+}

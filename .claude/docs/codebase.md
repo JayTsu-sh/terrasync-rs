@@ -4,33 +4,35 @@
 
 | Crate | 关键入口 | 说明 |
 |-------|---------|------|
-| `src/` (root) | `src/main.rs` | 只调 `cli::cli_match()`，无业务逻辑 |
-| `cli/` | `src/commands.rs` | 各子命令实现（scan/sync/ace/web/license） |
-| `app/` | `src/scan.rs`, `src/sync.rs`, `src/dir_walker.rs` | 核心业务逻辑 |
-| `app/` | `src/consumer/manager.rs` | ConsumerManager，注册/驱动所有 consumer |
-| `data-mover` | 外部 git dep | StorageEnum、NASEntry、S3Entry、filter、qos |
-| `db/` | `src/traits.rs` | Database trait（ClickHouse + DuckDB 双实现）|
-| `transport/` | `src/lib.rs`, `src/message.rs` | SenderMsg/ReceiverMsg 协议定义 |
-| `sync-delta/` | `src/lib.rs` | chunk 级 rolling checksum + delta 算法 |
-| `utils/` | `src/config.rs` | AppConfig（全局配置单例）|
-| `web/` | `src/api/`, `src/application/`, `src/domain/`, `src/infrastructure/` | DDD 四层 |
+| 根包 | `src/main.rs` | CLI 入口 |
+| `crates/cli/` | `src/commands.rs` | 子命令解析与应用调用 |
+| `crates/app/` | `src/scan.rs`, `src/sync.rs`, `src/dir_walker.rs` | 产品任务与扫描／复制编排 |
+| `crates/app/` | `src/consumer/manager.rs` | 数据库与统计消费者的生命周期 |
+| `data-mover` | 根 Cargo.toml 中固定 revision 的 git 依赖 | 原生观察、typed storage roles、遍历、传输、元数据及恢复 |
+| `crates/task-model/` | `src/lib.rs`, `src/observation.rs` | 无 I/O 的共享观察视图、任务事件和传输模式 |
+| `crates/db/` | `src/catalogue/`, `src/scan/`, `src/execution/`, `src/schema/` | 唯一 ClickHouse 实现；Single／Cluster 布局在内部处理 |
+| `crates/transport/` | `src/message.rs`, `src/directory.rs`, `src/chunk.rs` | 进程内／QUIC 消息、NDX、快照 wire 编码和块所有权 |
+| `crates/storage-adapter/` | `src/connected.rs`, `src/scanning.rs`, `src/streaming.rs` | 重构中尚待归位的产品配置、观察投影与存储调用；db 和 transport 已不依赖它 |
+| `crates/sync-delta/` | `src/lib.rs` | 块级签名与 delta 算法 |
+| `crates/utils/` | `src/app_config.rs` | 应用配置及公共工具 |
+| `crates/web/` | `src/api/`, `src/application/`, `src/domain/`, `src/infrastructure/` | Web 入口与应用契约 |
 
 ## Cargo Features
 
 | Feature | 默认 | 说明 |
 |---------|------|------|
-| `basic` | ✓ | 始终开启 |
-| `duckdb` | ✗ | DuckDB 数据库支持（`db/duckdb.rs`）|
+| `basic` | ✓ | 基础 CLI |
 | `license` | ✗ | 离线 license 验证与激活 |
-| `gui` | ✗ | GUI 模式 |
+| `gui` | ✗ | Web GUI |
 | `profiling` | ✗ | `console-subscriber`（tokio-console）|
+| `lab-fault-injection` | ✗ | 实验室受控故障验证入口 |
 
-常用组合：
 ```bash
-cargo build --features duckdb          # 开发调试
-cargo build --all-features             # 全功能验证
-cargo build --release                  # 生产构建（基础功能）
+cargo check --workspace --all-targets --locked
+cargo build --all-features
+cargo build --release --locked
 ```
+
 
 ## Workspace Clippy Lints
 
@@ -65,7 +67,7 @@ imports_granularity = "Module"
 group_imports = "StdExternalCrate"
 ```
 
-所有 crate 暴露 `pub mod prelude` 做常用类型再导出。
+公开入口以各 crate 的 `lib.rs` 为准；避免为删除的模型保留兼容再导出。
 
 ## 前端技术栈与约束
 

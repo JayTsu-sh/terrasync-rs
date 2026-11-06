@@ -1,3 +1,5 @@
+> 更新：下文提及的 `project_pure_scan`／`ObservedEntryRecord` 独立原型已在原生观察重构中移除；历史分析不代表当前任务入口。当前方案见 [原生观察重构](../specs/2026-11-05-db-native-refactor-design.md)。
+
 # disktree 调研与 TerraSync GUI 数据分析功能建议
 
 调研日期：2026-10-31。外部源码固定在 [`tobi/disktree@9b18b272`](https://github.com/tobi/disktree/tree/9b18b272ca3c5a145f6ff58eaf89dc4d311eeaea)，工作区版本号为 0.11.0。以下外部项目结论来自源码静态检查；没有运行其桌面程序或做性能基准。TerraSync 对照和实现建议见后续章节。
@@ -188,7 +190,7 @@ snapshot_id 应是不会重用的结果版本；现有 scan generation 是交替
 
 新 API 的示意职责为 snapshot summary、directory children、entries、distributions 和 selection export，全部显式指定 snapshot_id。是否保留每次完整明细可分阶段：首版至少只发布已验证完成的结果；如果只保留最新明细，就明确旧执行仅有概要，不能用最新树图冒充旧树图。要支持历史下钻，再引入保留策略和空间预算。
 
-当前 `project_pure_scan` 已有 staging、完整性核验与原子发布逻辑可借鉴，但 GUI runner 尚未通过该入口。设计文档标注 Implemented 不代表当前 GUI 已获得这套保证；实际接入与失败传播必须验证。[纯观察扫描实现](../../crates/app/src/observation_scan.rs)、[相关设计](../specs/2026-08-31-pure-observation-scan-design.md)、[GUI 入口](../../crates/web/src/infrastructure/task_runner.rs)。
+当前 `project_pure_scan` 已有 staging、完整性核验与原子发布逻辑可借鉴，但 GUI runner 尚未通过该入口。设计文档标注 Implemented 不代表当前 GUI 已获得这套保证；实际接入与失败传播必须验证。[当前原生扫描实现](../../crates/db/src/scan/mod.rs)、[相关设计](../specs/2026-08-31-pure-observation-scan-design.md)、[GUI 入口](../../crates/web/src/infrastructure/task_runner.rs)。
 
 ### 10.4 选择如何进入后续任务
 

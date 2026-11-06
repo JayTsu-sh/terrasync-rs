@@ -17,8 +17,9 @@ use std::time::{Duration, Instant};
 
 // 外部crate
 use data_mover::model::ObservedEntry;
-use storage_adapter::observed_scan::ObservedScanEvent;
-use storage_adapter::{ErrorEvent, StorageEntryMessage};
+use db::ClickHouseDatabase;
+use task_model::observation::ObservedScanEvent;
+use task_model::{ErrorEvent, StorageEntryMessage};
 use tokio::sync::Mutex;
 use tracing::{Instrument, debug, error, info_span, warn};
 
@@ -38,8 +39,8 @@ use crate::consumer::traits::Consumer;
 use crate::error::{AppError, Result};
 use crate::scan::statistics::{ScanCapabilities, ScanCounts, ScanSnapshot};
 use data_mover::traversal::TraversalRecoveryStatus;
-use db::clickhouse::scan_resume_statistics::ScanResumeStatistics;
-use db::scan_store::ScanFinalEvent;
+use db::scan::ScanFinalEvent;
+use db::scan::ScanResumeStatistics;
 
 /// 消费者管理器 - 负责创建、启动和管理多个消费者实例
 pub struct ConsumerManager {
@@ -190,7 +191,7 @@ impl ScanStatistics {
 
 impl ConsumerManager {
     pub(crate) async fn initialize_scan_statistics(
-        &self, storage: &storage_adapter::StorageEnum, tags: bool, round: Option<i64>,
+        &self, storage: &crate::storage_factory::StorageContext, tags: bool, round: Option<i64>,
     ) -> Result<()> {
         if let Some(sc) = &self.stats_consumer {
             let mut sc = sc.lock().await;
@@ -252,7 +253,9 @@ impl ConsumerManager {
                     let size = event.bytes;
                     let target = match event.operation_type.as_str() {
                         "new" => &mut incremental.new,
-                        "data_changed" | "metadata_changed" | "both_changed" => &mut incremental.changed,
+                        "data_changed" | "metadata_changed" | "both_changed" | "directory_marker_removed" => {
+                            &mut incremental.changed
+                        }
                         "deleted" => &mut incremental.deleted,
                         "rename" => &mut incremental.renamed,
                         _ => continue,
@@ -441,19 +444,39 @@ impl ConsumerManager {
         Ok(())
     }
 
-    /// 创建新的消费者管理器实例
+    /// Create a standalone consumer pipeline with its own catalogue scope.
     pub async fn new(consumer_config: &ConsumerConfig) -> Result<Self> {
-        let enable_db = consumer_config.db_config.enabled;
+        let consumer = if consumer_config.db_config.enabled {
+            Some(DatabaseConsumer::connect(consumer_config).await?)
+        } else {
+            None
+        };
+        Ok(Self::with_database_consumer(consumer_config, consumer))
+    }
 
+    /// A copy pipeline explicitly shares the catalogue that began its generation.
+    pub(crate) async fn with_database(
+        consumer_config: &ConsumerConfig, database: Option<ClickHouseDatabase>,
+    ) -> Result<Self> {
+        let consumer = match (consumer_config.db_config.enabled, database) {
+            (true, Some(database)) => Some(DatabaseConsumer::with_database(consumer_config, database).await?),
+            (false, None) => None,
+            _ => {
+                return Err(AppError::ConfigError(
+                    "Consumer catalogue does not match database enablement".into(),
+                ));
+            }
+        };
+        Ok(Self::with_database_consumer(consumer_config, consumer))
+    }
+
+    fn with_database_consumer(consumer_config: &ConsumerConfig, consumer: Option<DatabaseConsumer>) -> Self {
         let mut manager = Self {
             consumers: Vec::new(),
             stats_consumer: None,
             callback_guard: None,
         };
-
-        // 根据配置初始化数据库消费者
-        if enable_db {
-            let consumer = DatabaseConsumer::try_new(consumer_config).await?;
+        if let Some(consumer) = consumer {
             manager.add_consumer(Box::new(consumer));
             debug!("Database consumer initialized successfully");
         }
@@ -498,7 +521,7 @@ impl ConsumerManager {
             warn!("No consumers were successfully initialized");
         }
 
-        Ok(manager)
+        manager
     }
 
     /// 向消费者管理器添加一个消费者
@@ -625,8 +648,8 @@ impl Drop for ConsumerManager {
 mod resume_tests {
     use super::*;
     use crate::consumer::stats::ProgressDetail;
-    use db::clickhouse::scan_resume_statistics::{ScanEventSummary, ScanResumeSummary};
-    use db::traits::StorageEntryRecord;
+    use db::EntrySummary as StorageEntryRecord;
+    use db::scan::{ScanEventSummary, ScanResumeSummary};
 
     #[tokio::test]
     async fn reconciled_special_events_keep_callback_totals_and_checkpoint_counts() -> Result<()> {
@@ -654,7 +677,7 @@ mod resume_tests {
             "name":"fifo", "relative_path":"fifo", "size":0, "ext":null, "ctime":0, "mtime":0, "atime":0,
             "mode":null, "storage_type":"nas", "is_symlink":false, "is_dir":false, "is_regular_file":false,
             "hard_links":1, "current_state":0, "uid":null, "gid":null, "ino":null, "file_handle":null,
-            "version_id":"", "tags":null, "version_count":null
+            "version_id":"", "tags":null
         }))?;
         manager
             .record_final_events(&[

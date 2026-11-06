@@ -1,9 +1,11 @@
+use app::error::StorageError;
 use data_mover::storage::{list_buckets, list_exports};
 use std::path::{Path, PathBuf};
-use storage_adapter::StorageError;
+use task_model::ObservedEntryExt;
 
 use app::storage_factory::{StorageRole, create_storage_for_role};
-use storage_adapter::{S3BucketInfo, StorageEntryMessage};
+use data_mover::storage::S3BucketInfo;
+use task_model::StorageEntryMessage;
 
 use crate::error::Result;
 
@@ -92,7 +94,7 @@ impl StorageBrowserService {
         let iter = storage
             .walkdir(
                 sub_path,
-                storage_adapter::WalkOptions {
+                app::scan::source::WalkOptions {
                     depth: Some(1),
                     ..Default::default()
                 },

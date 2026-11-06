@@ -22,7 +22,6 @@ concurrency = 8             # Concurrency level for delete operations (default: 
 
 [database]
 enabled = true           # Enable Database integration
-type = "clickhouse"       # Only ClickHouse is supported
 batch_size = 100000       # Batch size for file entries
 
 [database.clickhouse]

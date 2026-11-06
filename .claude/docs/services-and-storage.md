@@ -1,21 +1,10 @@
 # 存储服务与驱动
 
-## StorageEnum dispatch 模式
+## 原生存储角色与产品配置
 
-所有存储操作通过 `data_mover::StorageEnum` 枚举 dispatch，**不用** `Box<dyn Storage>`：
+存储由 data-mover 的 `Storage` typed roles 提供。产品层 `StorageContext` 保存连接、块大小和重连配置；它不是 backend 枚举。backend 能力、错误分类、传输恢复与发布由 data-mover 管理，任务模式与连接配置由 app 选择。
 
-```rust
-// data_mover 中的枚举（外部 git dep）
-pub enum StorageEnum {
-    Local(LocalStorage),
-    Nfs(NfsStorage),        // v3 和 v4 共用，协议通过 URL 区分
-    S3(S3Storage),
-    Cifs(CifsStorage),
-    Hdfs(HdfsStorage),
-}
-```
-
-`dir_walker` 接受 `StorageEnum`，对所有协议透明迭代。
+扫描事实为原生 `ObservedEntry`，不可变历史由 `Arc` 共享；产品任务与 wire 分别使用 task-model 和 transport 的契约。重构剩余范围见 [方案](../../docs/specs/2026-11-05-db-native-refactor-design.md)。
 
 ## URL 格式详解
 
@@ -53,24 +42,24 @@ nfs://192.168.50.23/export/nfsv4?version=4.1    # 目标端
 ### S3 / rustfs
 ```
 # HTTP（rustfs 测试环境）
-s3://access_key:secret_key@bucket.host:port/prefix
+s3://<access-key>:<secret-key>@bucket.host:port/prefix
 
 示例（测试环境 rustfs）：
-s3://rustfsadmin:rustfsadmin123@test-bucket.192.168.50.173:39000/test-data
-s3://rustfsadmin:rustfsadmin123@test-bucket.192.168.50.23:39000/test-data
+s3://<access-key>:<secret-key>@test-bucket.192.168.50.173:39000/test-data
+s3://<access-key>:<secret-key>@test-bucket.192.168.50.23:39000/test-data
 
 # HTTPS（生产 S3 或 rustfs HTTPS 端口）
-s3+https://access_key:secret_key@bucket.host:port/prefix
+s3+https://<access-key>:<secret-key>@bucket.host:port/prefix
 ```
 
 ### SMB / CIFS
 ```
-smb://user:password@host[:port]/share[/sub/path]
+smb://<user>:<password>@host[:port]/share[/sub/path]
 
 注意：域用户的 \ 必须编码为 %5C
 示例（测试环境 Samba）：
-smb://terrasync:terrasync123@192.168.50.173/testshare/test-data   # 源端
-smb://terrasync:terrasync123@192.168.50.23/testshare/test-data    # 目标端
+smb://<user>:<password>@192.168.50.173/testshare/test-data   # 源端
+smb://<user>:<password>@192.168.50.23/testshare/test-data    # 目标端
 ```
 
 ### HDFS
@@ -122,5 +111,5 @@ data-mover = { git = "...", rev = "<pinned-commit>" }
 
 升级 `data-mover` 时：
 1. 更新 rev（pinned commit）
-2. `cargo check` 验证接口兼容
-3. 运行相关 e2e 测试验证行为一致
+2. 同步修改当前调用方，运行 CI 对应检查
+3. 对受影响链路执行真实功能、故障与取消验证，按需报告性能／内存证据

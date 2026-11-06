@@ -9,7 +9,10 @@
 #[cfg(windows)]
 pub mod ace;
 
+pub mod task_stream;
+
 pub mod broadcast;
+mod copy_dispatch;
 
 /// 双进程模式 Receiver 落盘任务模块
 ///
@@ -39,7 +42,6 @@ mod copy_completion;
 mod copy_execution;
 mod job_execution;
 pub mod local_transfer;
-pub mod observation_scan;
 /// Sync 编排器模块
 ///
 /// SyncOrchestrator 封装 sync/incremental_sync 的核心逻辑
@@ -47,6 +49,7 @@ pub mod orchestrator;
 pub mod scan_resume;
 mod sync_catalog;
 
+mod remote_inventory;
 /// 双进程远端同步（Sender 侧）
 ///
 /// 将 run_sync_remote 的各阶段逻辑提取为独立函数，降低单函数复杂度
@@ -109,7 +112,7 @@ pub mod tar_pack;
 /// 简化应用开发过程中的导入语句
 pub mod prelude {
     /// `QoS` 带宽解析函数
-    pub use storage_adapter::qos::parse_bandwidth_string;
+    pub use data_mover::qos::parse_bandwidth_string;
 
     /// Windows ACL相关功能（仅Windows平台可用）
     #[cfg(windows)]
@@ -131,3 +134,10 @@ pub mod prelude {
     /// 文件复制功能
     pub use crate::sync::{incremental_sync, sync};
 }
+
+#[cfg(test)]
+#[path = "../../../tests/support/observed.rs"]
+mod observed_fixtures;
+
+#[cfg(test)]
+mod storage_tests;

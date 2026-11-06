@@ -1,15 +1,19 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
+use transport::chunk::DataChunk;
 // 用 in-process transport 断言 Sender 流式发送序列 + 源 hash 正确。
-use std::os::unix::fs::PermissionsExt;
+#[path = "../../../tests/support/observed.rs"]
+mod observed_fixtures;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
-use storage_adapter::TransferMode;
+use task_model::TransferMode;
 
 use app::disk_commit::disk_commit_task;
 use app::receiver::ReceiverProgress;
+use app::storage_factory::{StorageContext, create_storage};
 use bytes::Bytes;
-use storage_adapter::{DataChunk, EntryEnum, NASEntry, StorageEnum, create_storage};
+use data_mover::model::ObservedEntry;
 use tokio_util::sync::CancellationToken;
 use transport::message::{DcAck, DiskCommitMsg, FileOutcome, ReceiverMsg, SessionConfig};
 
@@ -17,52 +21,57 @@ use transport::message::{DcAck, DiskCommitMsg, FileOutcome, ReceiverMsg, Session
 // disk_commit_task 测试辅助
 // ============================================================
 
-// 在 dir 上建一个 Local StorageEnum（不写任何数据文件）。
-async fn local_storage(dir: &std::path::Path) -> Arc<StorageEnum> {
+// 在 dir 上建一个 Local StorageContext（不写任何数据文件）。
+async fn local_storage(dir: &std::path::Path) -> Arc<StorageContext> {
     let storage = create_storage(
         &dir.to_string_lossy(),
-        storage_adapter::CreateStorageOptions::new(None, false),
+        app::storage_factory::CreateStorageOptions::new(None, false),
     )
     .await
     .unwrap();
     Arc::new(storage)
 }
 
-// 构造一个 NAS EntryEnum（测试用最小字段集，relative_path=name）。
-fn make_nas_entry(name: &str, is_dir: bool, is_symlink: bool, size: u64, mode: u32) -> Arc<EntryEnum> {
-    Arc::new(EntryEnum::NAS(NASEntry {
-        name: name.rsplit('/').next().unwrap_or(name).to_string(),
-        relative_path: PathBuf::from(name),
-        extension: None,
-        is_dir,
-        size,
-        atime: 0,
-        ctime: 0,
-        mtime: 0,
-        mode: Some(mode),
-        is_symlink,
-        hard_links: Some(1),
-        uid: None,
-        gid: None,
-        ino: None,
-        file_handle: None,
-        acl: None,
-        owner: None,
-        owner_group: None,
-        xattrs: None,
-    }))
+// 构造一个 NAS ObservedEntry（测试用最小字段集，relative_path=name）。
+fn make_nas_entry(name: &str, is_dir: bool, is_symlink: bool, size: u64, mode: u32) -> Arc<ObservedEntry> {
+    // 使用实际执行身份；成功路径不能隐含调用方具有 chown 到 root 的权限。
+    let owner = tempfile::tempfile().unwrap().metadata().unwrap();
+    Arc::new({
+        let fixture_path: std::path::PathBuf = PathBuf::from(name);
+        crate::observed_fixtures::observation(
+            data_mover::model::BackendKind::Nfs,
+            fixture_path,
+            if is_dir {
+                data_mover::model::EntryKind::Directory
+            } else if is_symlink {
+                data_mover::model::EntryKind::Symlink
+            } else {
+                data_mover::model::EntryKind::File
+            },
+            size,
+            [0, 0, 0],
+            Some(data_mover::model::OwnershipMode {
+                mode: mode,
+                uid: owner.uid(),
+                gid: owner.gid(),
+            }),
+            None,
+            None,
+            None,
+        )
+    })
 }
 
-// 构造大小为 size 的确定性字节序列 + 对应的文件 EntryEnum（is_dir=false，
+// 构造大小为 size 的确定性字节序列 + 对应的文件 ObservedEntry（is_dir=false，
 // relative_path=name，size 匹配）。字节按 offset 变化，可验证乱序/错位写入。
 // 不落盘——最终文件由 disk_commit_task 写入。
-fn entry_for(_root: &std::path::Path, name: &str, size: usize) -> (Arc<EntryEnum>, Vec<u8>) {
+fn entry_for(_root: &std::path::Path, name: &str, size: usize) -> (Arc<ObservedEntry>, Vec<u8>) {
     let bytes: Vec<u8> = (0..size).map(|i| (i % 251) as u8).collect();
     (make_nas_entry(name, false, false, size as u64, 0o644), bytes)
 }
 
-// 构造一个目录 EntryEnum（is_dir=true）。
-fn dir_entry(name: &str) -> Arc<EntryEnum> {
+// 构造一个目录 ObservedEntry（is_dir=true）。
+fn dir_entry(name: &str) -> Arc<ObservedEntry> {
     make_nas_entry(name, true, false, 0, 0o755)
 }
 
@@ -97,12 +106,12 @@ fn chunkify(bytes: &[u8], chunk_size: usize) -> Vec<(u64, Bytes)> {
 
 // 起 disk_commit_task，喂消息，收集 ack DcAck（目录/符号链接透传 ReceiverMsg；
 // 文件传输结果为 FileOutcome，redo 决策已上移到 Receiver 主 task，dc task 只上报 outcome）。
-async fn run_dc(dest: Arc<StorageEnum>, session: SessionConfig, msgs: Vec<DiskCommitMsg>) -> Vec<DcAck> {
+async fn run_dc(dest: Arc<StorageContext>, session: SessionConfig, msgs: Vec<DiskCommitMsg>) -> Vec<DcAck> {
     run_dc_inner(dest, session, msgs, true).await.0
 }
 
 async fn run_dc_inner(
-    dest: Arc<StorageEnum>, session: SessionConfig, msgs: Vec<DiskCommitMsg>, explicit_shutdown: bool,
+    dest: Arc<StorageContext>, session: SessionConfig, msgs: Vec<DiskCommitMsg>, explicit_shutdown: bool,
 ) -> (Vec<DcAck>, Arc<ReceiverProgress>) {
     let (dc_tx, dc_rx) = tokio::sync::mpsc::channel(16);
     let (ack_tx, mut ack_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -144,12 +153,12 @@ async fn dc_writes_full_file_and_acks_success() {
         },
         DiskCommitMsg::FileBegin {
             ndx: 0,
-            entry: entry.clone(),
+            entry: entry.clone().into(),
         },
     ];
     for (off, c) in chunkify(&bytes, 1 << 20) {
         msgs.push(DiskCommitMsg::FileChunk {
-            entry: entry.clone(),
+            ndx: 0,
             chunk: DataChunk { offset: off, data: c },
         });
     }
@@ -190,11 +199,11 @@ async fn dc_hash_mismatch_rejects_and_cleans_part() {
     let session = session_cfg(true);
     let mut msgs = vec![DiskCommitMsg::FileBegin {
         ndx: 0,
-        entry: entry.clone(),
+        entry: entry.clone().into(),
     }];
     for (off, c) in chunkify(&bytes, 1 << 20) {
         msgs.push(DiskCommitMsg::FileChunk {
-            entry: entry.clone(),
+            ndx: 0,
             chunk: DataChunk { offset: off, data: c },
         });
     }
@@ -231,10 +240,10 @@ async fn dc_size_mismatch_without_integrity_rejects_and_cleans_part() {
         vec![
             DiskCommitMsg::FileBegin {
                 ndx: 3,
-                entry: entry.clone(),
+                entry: entry.clone().into(),
             },
             DiskCommitMsg::FileChunk {
-                entry: entry.clone(),
+                ndx: 3,
                 chunk: DataChunk {
                     offset: 0,
                     data: Bytes::from_static(b"short"),
@@ -274,7 +283,7 @@ async fn dc_zero_byte_file() {
         vec![
             DiskCommitMsg::FileBegin {
                 ndx: 0,
-                entry: entry.clone(),
+                entry: entry.clone().into(),
             },
             DiskCommitMsg::FileCommit {
                 ndx: 0,
@@ -314,6 +323,8 @@ async fn dc_creates_symlink() {
     );
     let lm = std::fs::symlink_metadata(tmp.path().join("link.txt")).unwrap();
     assert!(lm.file_type().is_symlink());
+    let owner = std::fs::metadata(tmp.path()).unwrap();
+    assert_eq!((lm.uid(), lm.gid()), (owner.uid(), owner.gid()));
     assert_eq!(
         std::fs::read_link(tmp.path().join("link.txt")).unwrap(),
         PathBuf::from("target.txt")
@@ -352,11 +363,11 @@ async fn dc_abort_file_drops_part_no_ack() {
     let (entry, bytes) = entry_for(tmp.path(), "aborted.bin", 2 * 1024 * 1024);
     let mut msgs = vec![DiskCommitMsg::FileBegin {
         ndx: 0,
-        entry: entry.clone(),
+        entry: entry.clone().into(),
     }];
     for (off, c) in chunkify(&bytes, 1 << 20) {
         msgs.push(DiskCommitMsg::FileChunk {
-            entry: entry.clone(),
+            ndx: 0,
             chunk: DataChunk { offset: off, data: c },
         });
     }
@@ -377,11 +388,11 @@ async fn dc_shutdown_active_file_cleans_part_no_ack() {
     let (entry, bytes) = entry_for(tmp.path(), "shutdown.bin", 2 * 1024 * 1024);
     let mut msgs = vec![DiskCommitMsg::FileBegin {
         ndx: 0,
-        entry: entry.clone(),
+        entry: entry.clone().into(),
     }];
     for (off, data) in chunkify(&bytes, 1 << 20) {
         msgs.push(DiskCommitMsg::FileChunk {
-            entry: entry.clone(),
+            ndx: 0,
             chunk: DataChunk { offset: off, data },
         });
     }
@@ -403,10 +414,10 @@ async fn dc_channel_close_settles_and_cleans_active_file() {
         vec![
             DiskCommitMsg::FileBegin {
                 ndx: 0,
-                entry: entry.clone(),
+                entry: entry.clone().into(),
             },
             DiskCommitMsg::FileChunk {
-                entry,
+                ndx: 0,
                 chunk: DataChunk {
                     offset: 0,
                     data: Bytes::from(bytes),
@@ -433,10 +444,10 @@ async fn dc_progress_counts_only_successful_commit() {
         vec![
             DiskCommitMsg::FileBegin {
                 ndx: 1,
-                entry: success_entry.clone(),
+                entry: success_entry.clone().into(),
             },
             DiskCommitMsg::FileChunk {
-                entry: success_entry.clone(),
+                ndx: 1,
                 chunk: DataChunk {
                     offset: 0,
                     data: Bytes::from_static(b"done"),
@@ -463,10 +474,10 @@ async fn dc_progress_counts_only_successful_commit() {
         vec![
             DiskCommitMsg::FileBegin {
                 ndx: 2,
-                entry: failed_entry.clone(),
+                entry: failed_entry.clone().into(),
             },
             DiskCommitMsg::FileChunk {
-                entry: failed_entry.clone(),
+                ndx: 2,
                 chunk: DataChunk {
                     offset: 0,
                     data: Bytes::from_static(b"short"),
@@ -499,16 +510,19 @@ async fn dc_second_begin_does_not_replace_active_file() {
         vec![
             DiskCommitMsg::FileBegin {
                 ndx: 1,
-                entry: first.clone(),
+                entry: first.clone().into(),
             },
             DiskCommitMsg::FileChunk {
-                entry: first.clone(),
+                ndx: 1,
                 chunk: DataChunk {
                     offset: 0,
                     data: Bytes::from(first_bytes.clone()),
                 },
             },
-            DiskCommitMsg::FileBegin { ndx: 2, entry: second },
+            DiskCommitMsg::FileBegin {
+                ndx: 2,
+                entry: second.into(),
+            },
             DiskCommitMsg::FileCommit {
                 ndx: 1,
                 entry: first,
@@ -543,10 +557,10 @@ async fn dc_delta_commit_does_not_commit_full_active_file() {
         vec![
             DiskCommitMsg::FileBegin {
                 ndx: 1,
-                entry: entry.clone(),
+                entry: entry.clone().into(),
             },
             DiskCommitMsg::FileChunk {
-                entry: entry.clone(),
+                ndx: 1,
                 chunk: DataChunk {
                     offset: 0,
                     data: Bytes::from(bytes),
@@ -622,14 +636,14 @@ async fn dc_mode_mismatched_data_does_not_mutate_active_file() {
         vec![
             DiskCommitMsg::FileBegin {
                 ndx: 1,
-                entry: full.clone(),
+                entry: full.clone().into(),
             },
             DiskCommitMsg::DeltaData {
                 entry: full.clone(),
                 data: Bytes::from_static(b"wrong"),
             },
             DiskCommitMsg::FileChunk {
-                entry: full.clone(),
+                ndx: 1,
                 chunk: DataChunk {
                     offset: 0,
                     data: Bytes::from_static(b"full"),
@@ -646,7 +660,7 @@ async fn dc_mode_mismatched_data_does_not_mutate_active_file() {
                 block_size: 5,
             },
             DiskCommitMsg::FileChunk {
-                entry: delta.clone(),
+                ndx: 2,
                 chunk: DataChunk {
                     offset: 0,
                     data: Bytes::from_static(b"wrong"),
@@ -726,7 +740,7 @@ async fn dc_commands_without_begin_and_duplicate_commit_do_not_duplicate_outcome
         session_cfg(false),
         vec![
             DiskCommitMsg::FileChunk {
-                entry: entry.clone(),
+                ndx: 0,
                 chunk: DataChunk {
                     offset: 0,
                     data: Bytes::from_static(b"drop"),
@@ -739,10 +753,10 @@ async fn dc_commands_without_begin_and_duplicate_commit_do_not_duplicate_outcome
             },
             DiskCommitMsg::FileBegin {
                 ndx: 4,
-                entry: entry.clone(),
+                entry: entry.clone().into(),
             },
             DiskCommitMsg::FileChunk {
-                entry: entry.clone(),
+                ndx: 4,
                 chunk: DataChunk {
                     offset: 0,
                     data: Bytes::from_static(b"once"),
@@ -783,7 +797,7 @@ async fn dc_failed_begin_then_commit_reports_one_outcome() {
         vec![
             DiskCommitMsg::FileBegin {
                 ndx: 9,
-                entry: entry.clone(),
+                entry: entry.clone().into(),
             },
             DiskCommitMsg::FileCommit {
                 ndx: 9,
@@ -978,10 +992,10 @@ async fn dc_direct_abort_cancels_one_file_and_allows_the_next_commit() {
     let messages = vec![
         DiskCommitMsg::FileBegin {
             ndx: 0,
-            entry: entry.clone(),
+            entry: entry.clone().into(),
         },
         DiskCommitMsg::FileChunk {
-            entry: entry.clone(),
+            ndx: 0,
             chunk: DataChunk {
                 offset: 0,
                 data: Bytes::from_static(b"AAAAXXXX"),
@@ -990,10 +1004,10 @@ async fn dc_direct_abort_cancels_one_file_and_allows_the_next_commit() {
         DiskCommitMsg::AbortFile,
         DiskCommitMsg::FileBegin {
             ndx: 1,
-            entry: entry.clone(),
+            entry: entry.clone().into(),
         },
         DiskCommitMsg::FileChunk {
-            entry: entry.clone(),
+            ndx: 1,
             chunk: DataChunk {
                 offset: 0,
                 data: Bytes::from_static(b"AAAAYYYY"),

@@ -5,7 +5,7 @@ use crate::{
     config::JobType,
     consumer::stats::{FullStats, ProgressBar},
 };
-use storage_adapter::ErrorEvent;
+use task_model::ErrorEvent;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpListener,

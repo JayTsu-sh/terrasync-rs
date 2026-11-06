@@ -5,7 +5,7 @@
 
 // 外部crate
 use async_trait::async_trait;
-use storage_adapter::StorageEntryMessage;
+use task_model::StorageEntryMessage;
 use tokio::sync::mpsc;
 
 // 内部模块

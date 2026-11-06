@@ -6,8 +6,8 @@ use std::time::{Instant, SystemTime};
 
 // 外部crate
 use serde::{Deserialize, Serialize};
-use storage_adapter::observed_scan::EntryStatistics;
-use storage_adapter::{ErrorEvent, StorageEntryMessage};
+use task_model::observation::{EntryStatistics, ObservedView};
+use task_model::{ErrorEvent, StorageEntryMessage};
 use tracing::trace;
 
 // 内部模块
@@ -305,12 +305,14 @@ impl FullStats {
     pub fn update_from_message(&mut self, message: &StorageEntryMessage) {
         match message {
             StorageEntryMessage::Scanned(entry)
-            | StorageEntryMessage::New(entry)
             | StorageEntryMessage::Packaged(entry)
             | StorageEntryMessage::IntegrityChecked(entry) => {
                 trace!("[FullStats] update: {:?}", entry.get_relative_path());
-                self.update(entry.as_ref());
+                for view in ObservedView::all(entry) {
+                    self.update(&view);
+                }
             }
+            StorageEntryMessage::New(item) => self.update(&item.view()),
             StorageEntryMessage::Error { event, .. } => self.error_stats.record(*event),
             _ => {}
         }
@@ -536,12 +538,22 @@ impl IncrementalStats {
     pub fn update_from_message(&mut self, message: &StorageEntryMessage) {
         match message {
             StorageEntryMessage::Scanned(entry) | StorageEntryMessage::Packaged(entry) => {
-                self.scanned.update(entry.as_ref());
+                for view in ObservedView::all(entry) {
+                    self.scanned.update(&view);
+                }
             }
-            StorageEntryMessage::New(entry) => self.new.add(entry.as_ref()),
-            StorageEntryMessage::Changed { entry, .. } => self.changed.add(entry.as_ref()),
-            StorageEntryMessage::Deleted(entry) => self.deleted.add(entry.as_ref()),
-            StorageEntryMessage::Renamed((_, to_entry)) => self.renamed.add(to_entry.as_ref()),
+            StorageEntryMessage::New(item) => self.new.add(&item.view()),
+            StorageEntryMessage::Changed { entry, .. } => self.changed.add(&entry.view()),
+            StorageEntryMessage::Deleted(entry) => {
+                for view in ObservedView::all(entry) {
+                    self.deleted.add(&view);
+                }
+            }
+            StorageEntryMessage::Renamed((_, to_entry)) => {
+                for view in ObservedView::all(to_entry) {
+                    self.renamed.add(&view);
+                }
+            }
             StorageEntryMessage::Error { event, .. } => self.error_stats.record(*event),
             _ => {}
         }
@@ -1273,7 +1285,7 @@ mod tests {
         BackendIdentity, BackendKind, EntryKind, IdentityStrength, ObservedEntry, SourceIdentity, SpecialFileKind,
         StoragePath,
     };
-    use storage_adapter::observed_scan::ObservedView;
+    use task_model::observation::ObservedView;
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
 

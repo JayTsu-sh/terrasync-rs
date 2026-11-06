@@ -457,7 +457,7 @@ mod tests {
     #[test]
     fn production_queue_has_no_backend_pair_or_transport_dispatch() {
         let production = include_str!("local_transfer.rs").split("#[cfg(test)]").next().unwrap();
-        for forbidden in ["BackendKind", "StorageEnum", "Ndx", "NDX", "Quic", "QUIC"] {
+        for forbidden in ["BackendKind", "StorageContext", "Ndx", "NDX", "Quic", "QUIC"] {
             assert!(!production.contains(forbidden), "production queue contains {forbidden}");
         }
     }

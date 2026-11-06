@@ -8,17 +8,17 @@ use std::env;
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
 
+use app::error::StorageError;
 use app::local_transfer::{LocalTransferConfig, LocalTransferSink, run_local_transfer};
 use async_trait::async_trait;
 use data_mover::model::{ModelValueError, ObservedEntry, StoragePath};
+use data_mover::storage::HdfsConfig;
 use data_mover::storage::{
     BackendConfig, BackendConnectError, CifsBackendConfig, HdfsBackendConfig, LocalBackendConfig, NfsBackendConfig,
     S3BackendConfig, connect_backend,
 };
 use data_mover::transfer::{TransferFailure, TransferOutcome, TransferPolicy, TransferValueError};
 use data_mover::traversal::{TraversalCompletion, TraversalItem, TraversalOutcome, TraversalSession};
-use storage_adapter::HdfsConfig;
-use storage_adapter::error::StorageError;
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
 
@@ -124,7 +124,7 @@ fn hdfs_client(role: &str) -> Result<HdfsConfig, MatrixError> {
     Ok(HdfsConfig {
         config_dir,
         overrides: HashMap::new(),
-        kerberos_credentials: Some(storage_adapter::HdfsKerberosCredentials {
+        kerberos_credentials: Some(data_mover::storage::HdfsKerberosCredentials {
             principal: Some(principal),
             keytab: Some(keytab),
             cache: Some(cache),

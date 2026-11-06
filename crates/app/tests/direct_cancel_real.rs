@@ -1,17 +1,20 @@
 //! 由 lab runner 启动真实 Receiver；本测试通过真实 QUIC 在指定阶段主动关闭连接。
 #![allow(clippy::unwrap_used)]
+use app::scan::observe_path;
 use std::{env, error::Error, path::Path, sync::Arc, time::Duration};
+use task_model::TransferMode;
+use transport::chunk::DataChunk;
 
+use app::storage_factory::{CreateStorageOptions, create_storage};
 use bytes::Bytes;
 use rustls::crypto::ring::default_provider;
 use rustls::pki_types::CertificateDer;
-use storage_adapter::dir_tree::{DirPageResult, NdxEntry};
-use storage_adapter::{CreateStorageOptions, DataChunk, TransferMode, create_storage};
 use tokio::{
     fs,
     io::AsyncReadExt,
     time::{sleep, timeout},
 };
+use transport::directory::{DirPageResult, NdxEntry};
 use transport::{
     message::{HandshakeResult, ProtocolHandshake, ReceiverMsg, SenderMsg, SessionConfig},
     quic,
@@ -43,7 +46,7 @@ async fn run() -> TestResult {
         CreateStorageOptions::new(None, false),
     )
     .await?;
-    let entry = Arc::new(storage.get_metadata(Path::new("file")).await?);
+    let entry = Arc::new(observe_path(storage.storage(), Path::new("file")).await?);
     let transport = Arc::new(quic::connect(address, "localhost", Some(CertificateDer::from(cert))).await?);
     let mut handshake = ProtocolHandshake::current();
     handshake.features.delta = false;
@@ -78,7 +81,7 @@ async fn run() -> TestResult {
             ndx_start: 0,
             files: vec![NdxEntry {
                 ndx: 0,
-                entry: entry.clone(),
+                entry: entry.clone().into(),
             }],
             subdirs: Vec::new(),
             gap_ndx: 1,
@@ -100,12 +103,7 @@ async fn run() -> TestResult {
         closing.close().await
     });
     let payload = async {
-        transport
-            .send(SenderMsg::FileBegin {
-                ndx: 0,
-                entry: entry.clone(),
-            })
-            .await?;
+        transport.send(SenderMsg::FileBegin { ndx: 0 }).await?;
         let mut file = fs::File::open(source).await?;
         let mut offset = 0;
         let mut hash = blake3::Hasher::new();
@@ -118,7 +116,7 @@ async fn run() -> TestResult {
             hash.update(&buffer[..read]);
             transport
                 .send(SenderMsg::FileData {
-                    entry: entry.clone(),
+                    ndx: 0,
                     chunk: DataChunk {
                         offset,
                         data: Bytes::copy_from_slice(&buffer[..read]),
@@ -130,7 +128,6 @@ async fn run() -> TestResult {
         transport
             .send(SenderMsg::EndOfFile {
                 ndx: 0,
-                entry,
                 source_hash: Some(hash.finalize().to_hex().to_string()),
             })
             .await?;

@@ -12,22 +12,33 @@
 //! S3 目标没有真实目录对象，因此目录 entry 跳过目标 metadata 查询；文件的
 //! POSIX 元数据跳过策略由 data-mover 统一处理。
 
+use crate::file_copy::metadata as copy_metadata;
+#[cfg(feature = "license")]
+use data_mover::probes::probe_server_time;
+mod comparison;
+#[cfg(feature = "license")]
+use crate::storage_factory::backend_kind_from_location;
 #[cfg(feature = "license")]
 use chrono::DateTime;
+pub use comparison::{
+    IntegrityCheckMode, IntegrityCheckOptions, IntegrityEntryKind, IntegritySide, MismatchDataField, MismatchMetaField,
+    MtimePrecision, compare_entry,
+};
+#[cfg(feature = "license")]
+use data_mover::model::BackendKind;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
-use storage_adapter::ErrorEvent;
-#[cfg(feature = "license")]
-use storage_adapter::storage_enum::{StorageType, detect_storage_type};
+use task_model::ErrorEvent;
+use task_model::ObservedEntryExt;
 
-use storage_adapter::error::StorageError;
-use storage_adapter::{
-    EntryEnum, IntegrityCheck, IntegrityCheckMode, IntegrityCheckOptions, MismatchDataField, MismatchMetaField,
-    MtimePrecision, StorageEntryMessage, StorageEnum, redact_storage_url,
-};
+use crate::error::StorageError;
+use crate::storage_factory::StorageContext;
+use data_mover::model::ObservedEntry;
+use data_mover::redact_storage_url;
+use task_model::StorageEntryMessage;
 use tracing::{Instrument, debug, error, info, info_span, instrument, warn};
 
 use crate::broadcast::{BroadcastForwarder, DEFAULT_CHANNEL_CAPACITY};
@@ -155,7 +166,7 @@ fn classify_lookup_error(entry_type: &'static str, relative_path: &Path, err: &S
 
 /// 对单个条目尝试 auto-fix；返回最终 `FixStatus` 和 issue 应填充的 mismatches 标签。
 async fn apply_auto_fix(
-    dest_storage: &StorageEnum, relative_path: &Path, entry_type: &'static str, src: &EntryEnum,
+    dest_storage: &StorageContext, relative_path: &Path, entry_type: &'static str, src: &ObservedEntry,
     has_content_mismatch: bool,
 ) -> FixStatus {
     // 文件 auto-fix 只改 uid/gid/mode；目录额外尝试改 mtime；symlink 改 mtime/uid/gid（mode 无效）。
@@ -166,9 +177,16 @@ async fn apply_auto_fix(
         _ => (None, None, None),
     };
 
-    if let Err(e) = dest_storage
-        .set_metadata(relative_path, atime, mtime, src.get_uid(), src.get_gid(), mode)
-        .await
+    if let Err(e) = copy_metadata::set_metadata(
+        dest_storage.storage(),
+        relative_path,
+        atime,
+        mtime,
+        src.get_uid(),
+        src.get_gid(),
+        mode,
+    )
+    .await
     {
         error!("Auto-fix failed for {} {:?}: {}", entry_type, relative_path, e);
         FixStatus::FixFailed
@@ -184,7 +202,7 @@ async fn apply_auto_fix(
 
 /// 构造一条 mismatch issue（按 `auto_fix` 决定 `FixStatus`）。
 async fn build_mismatch_issue(
-    dest_storage: &StorageEnum, relative_path: &Path, entry_type: &'static str, src: &EntryEnum,
+    dest_storage: &StorageContext, relative_path: &Path, entry_type: &'static str, src: &ObservedEntry,
     mismatches: Vec<String>, auto_fix: bool,
 ) -> IntegrityIssue {
     let has_content_mismatch = detect_content_mismatch(&mismatches);
@@ -219,8 +237,8 @@ fn build_lookup_issue(entry_type: &'static str, relative_path: &Path, err: &Stor
 
 /// 单个 worker 的运行时上下文（避免 16 个 Arc 在每个 helper 之间逐个传递）。
 struct CheckContext {
-    src_storage: Arc<StorageEnum>,
-    dest_storage: Arc<StorageEnum>,
+    src_storage: Arc<StorageContext>,
+    dest_storage: Arc<StorageContext>,
     issues: Arc<Mutex<Vec<IntegrityIssue>>>,
     checked_files: Arc<AtomicUsize>,
     checked_dirs: Arc<AtomicUsize>,
@@ -239,16 +257,10 @@ impl CheckContext {
         }
     }
 
-    async fn process_entry(&self, entry: &EntryEnum, relative_path: &Path, entry_type: &'static str) -> Option<String> {
-        match IntegrityCheck::check_with_source_entry_and_options(
-            &self.src_storage,
-            &self.dest_storage,
-            entry,
-            self.options,
-            None,
-        )
-        .await
-        {
+    async fn process_entry(
+        &self, entry: &ObservedEntry, relative_path: &Path, entry_type: &'static str,
+    ) -> Option<String> {
+        match compare_entry(&self.src_storage, &self.dest_storage, entry, self.options, None).await {
             Ok(()) => {
                 debug!("Integrity check passed for {:?}", relative_path);
                 None
@@ -278,14 +290,14 @@ impl CheckContext {
     }
 
     /// 处理一条 walkdir 消息：根据 entry 类型分派到对应 helper，并增加计数 + 广播。
-    async fn dispatch(&self, entry: Arc<EntryEnum>, broadcaster: &BroadcastForwarder<StorageEntryMessage>) {
+    async fn dispatch(&self, entry: Arc<ObservedEntry>, broadcaster: &BroadcastForwarder<StorageEntryMessage>) {
         let relative_path = entry.get_relative_path().to_path_buf();
         let error_reason = if entry.get_is_symlink() {
             let result = self.process_entry(entry.as_ref(), &relative_path, "symlink").await;
             self.checked_symlinks.fetch_add(1, Ordering::Relaxed);
             result
         } else if entry.get_is_dir() {
-            let result = if self.dest_storage.has_real_directory_objects() {
+            let result = if !self.dest_storage.storage().holds_directory_objects() {
                 self.process_entry(entry.as_ref(), &relative_path, "dir").await
             } else {
                 None
@@ -567,7 +579,7 @@ pub async fn integrity_check_with_concurrency(
 /// 仅对远程存储（NFS/S3/CIFS）启用，本地存储自动跳过。
 #[cfg(feature = "license")]
 pub(crate) async fn verify_storage_time(dest_path: &str) -> Result<()> {
-    if matches!(detect_storage_type(dest_path), StorageType::Local) {
+    if matches!(backend_kind_from_location(dest_path), BackendKind::Local) {
         return Ok(());
     }
 
@@ -589,8 +601,8 @@ pub(crate) async fn verify_storage_time(dest_path: &str) -> Result<()> {
         }
     };
 
-    let server_time = match dest_storage.probe_server_time().await {
-        Ok(Some(mtime)) => match DateTime::from_timestamp(mtime, 0) {
+    let server_time = match probe_server_time(dest_storage.storage()).await {
+        Ok(Some(mtime)) => match DateTime::from_timestamp((mtime.unix_nanos() / 1_000_000_000) as i64, 0) {
             Some(dt) => dt,
             None => return Ok(()),
         },

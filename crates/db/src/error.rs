@@ -67,42 +67,11 @@ pub enum DatabaseError {
     #[error("Observation query projection mismatch in field {field}")]
     ObservationProjectionMismatch { field: &'static str },
 
-    /// 查询失败后中止 staging 也失败，保留两次失败的类型。
-    #[error("Observation publication failed: {source}; staging abort also failed: {abort}")]
-    ObservationAbortFailed {
+    #[error("Catalogue batch failed: {source}; staging cleanup also failed: {cleanup}")]
+    CatalogueBatchCleanupFailed {
         #[source]
         source: Box<DatabaseError>,
-        abort: Box<DatabaseError>,
-    },
-
-    /// EXCHANGE 返回错误，无法确认 snapshot 是否已经交换。
-    #[error("Observation snapshot EXCHANGE outcome is ambiguous: {source}")]
-    ObservationExchangeAmbiguous {
-        #[source]
-        source: Box<DatabaseError>,
-    },
-
-    /// generation 提交失败后工作代状态丢失，保留提交错误。
-    #[error("Observation publication lost its working generation after commit failed: {source}")]
-    ObservationGenerationLost {
-        #[source]
-        source: Box<DatabaseError>,
-    },
-
-    /// generation 提交及反向交换均失败，保留提交和回滚错误。
-    #[error("Generation commit failed ({commit}); snapshot rollback also failed ({rollback})")]
-    ObservationRollbackFailed {
-        #[source]
-        commit: Box<DatabaseError>,
-        rollback: Box<DatabaseError>,
-    },
-
-    /// 无法确认 generation 提交结果；检查状态失败时也保留该错误。
-    #[error("Generation commit outcome is ambiguous after snapshot exchange: {commit}; state query: {verification:?}")]
-    ObservationCommitAmbiguous {
-        #[source]
-        commit: Box<DatabaseError>,
-        verification: Option<Box<DatabaseError>>,
+        cleanup: Box<DatabaseError>,
     },
 
     /// `ClickHouse` 数据库相关错误
@@ -131,11 +100,6 @@ pub enum DatabaseError {
     /// 当尝试使用已禁用的数据库时触发
     #[error("Database disabled error")]
     DatabaseDisabledError(),
-
-    /// 不支持的数据库类型
-    /// 当尝试使用未实现的数据库类型时触发
-    #[error("Unsupported database type: {0}")]
-    UnsupportedType(String),
 
     /// 表不存在错误
     /// 当尝试访问不存在的表时触发

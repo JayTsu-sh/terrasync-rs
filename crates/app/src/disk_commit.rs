@@ -3,15 +3,20 @@
 //! 目录与符号链接在此即时处理；full/delta 单文件生命周期全部委托给
 //! `FileCommitter` 深模块。
 
+use crate::file_copy::metadata as copy_metadata;
+use crate::file_copy::namespace as copy_namespace;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
+use task_model::ObservedEntryExt;
 
-use storage_adapter::StorageEnum;
+use crate::error::StorageError;
+use crate::storage_factory::StorageContext;
+use data_mover::transfer::write_delete_marker;
 use sync_delta::DeltaToken;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::warn;
-use transport::message::{DcAck, DiskCommitMsg, ReceiverMsg, SessionConfig};
+use transport::message::{DcAck, DiskCommitMsg, FileOutcome, ReceiverMsg, SessionConfig};
 
 use crate::error::Result;
 use crate::file_commit::{FileCommitter, FileTransferMode};
@@ -19,35 +24,55 @@ use crate::receiver::ReceiverProgress;
 
 /// 串行分派 Receiver 落盘命令，并将文件命令交给单一生命周期所有者。
 pub async fn disk_commit_task(
-    dest: Arc<StorageEnum>, session: SessionConfig, mut rx: mpsc::Receiver<DiskCommitMsg>,
+    dest: Arc<StorageContext>, session: SessionConfig, mut rx: mpsc::Receiver<DiskCommitMsg>,
     ack_tx: mpsc::UnboundedSender<DcAck>, progress: Arc<ReceiverProgress>, cancel: CancellationToken,
 ) -> Result<()> {
-    let mut files = FileCommitter::new(dest.clone(), session, ack_tx.clone(), progress.clone(), cancel);
+    let mut files = FileCommitter::new(dest.clone(), session, ack_tx.clone(), progress.clone(), cancel.clone());
 
     while let Some(msg) = rx.recv().await {
         match msg {
             DiskCommitMsg::CreateDir { entry } => {
-                if let Err(error) = dest.create_dir_all(&entry).await {
+                if let Err(error) = copy_namespace::create_dir_all(dest.storage(), &entry).await {
                     warn!("[dc] create_dir {:?}: {error}", entry.get_relative_path());
                 }
-                let _ = dest.set_entry_metadata(&entry).await;
+                let _ = copy_metadata::set_entry_metadata(dest.storage(), &entry).await;
                 progress.dirs_created.fetch_add(1, Ordering::Relaxed);
                 let _ = ack_tx.send(DcAck::Entry(ReceiverMsg::EntrySuccess { entry }));
             }
-            DiskCommitMsg::CreateSymlink { entry, target } => match dest.create_symlink(&entry, &target).await {
-                Ok(()) => {
-                    progress.files_transferred.fetch_add(1, Ordering::Relaxed);
-                    let _ = ack_tx.send(DcAck::Entry(ReceiverMsg::EntrySuccess { entry }));
+            DiskCommitMsg::CreateSymlink { entry, target } => {
+                match copy_namespace::create_symlink(dest.storage(), &entry, &target).await {
+                    Ok(()) => {
+                        progress.files_transferred.fetch_add(1, Ordering::Relaxed);
+                        let _ = ack_tx.send(DcAck::Entry(ReceiverMsg::EntrySuccess { entry }));
+                    }
+                    Err(error) => {
+                        let _ = ack_tx.send(DcAck::Entry(ReceiverMsg::EntryError {
+                            entry,
+                            reason: error.to_string(),
+                        }));
+                    }
                 }
-                Err(error) => {
-                    let _ = ack_tx.send(DcAck::Entry(ReceiverMsg::EntryError {
-                        entry,
-                        reason: error.to_string(),
-                    }));
+            }
+            DiskCommitMsg::WriteDeleteMarker { ndx, entry } => {
+                let result = async {
+                    let path = entry.view().source_path().map_err(StorageError::from)?;
+                    write_delete_marker(dest.storage().clone(), path, cancel.clone())
+                        .await
+                        .map_err(StorageError::from)?;
+                    Ok::<_, StorageError>(())
                 }
-            },
+                .await;
+                let outcome = match result {
+                    Ok(()) => {
+                        progress.files_transferred.fetch_add(1, Ordering::Relaxed);
+                        FileOutcome::Success
+                    }
+                    Err(error) => FileOutcome::HardError(error.to_string()),
+                };
+                let _ = ack_tx.send(DcAck::FileOutcome { ndx, outcome });
+            }
             DiskCommitMsg::FileBegin { ndx, entry } => files.begin_full(ndx, entry).await,
-            DiskCommitMsg::FileChunk { entry, chunk } => files.push_full(&entry, chunk).await,
+            DiskCommitMsg::FileChunk { ndx, chunk } => files.push_full(ndx, chunk).await,
             DiskCommitMsg::FileCommit {
                 ndx,
                 entry,

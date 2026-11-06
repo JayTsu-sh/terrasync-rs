@@ -4,19 +4,32 @@
 //! 从文件列表发布开始运行到 Receiver 返回 `AllDone`。后续迁移会逐步把会话状态与转换
 //! 收入此模块，调用者与测试始终只依赖这里的 interface。
 
+use crate::file_copy::metadata as copy_metadata;
+use crate::file_copy::namespace as copy_namespace;
+use blake3::Hash;
+use data_mover::transfer::{ExpertSourcePayload, ExpertSourceRequest, ExpertSourceSession};
 use std::collections::HashSet;
+use std::num::NonZeroUsize;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex, PoisonError};
+use task_model::ObservedEntryExt;
+use task_model::observation::ObservedItem;
+use transport::acl::encode_acl;
+use transport::chunk::DataChunk;
 
-use storage_adapter::dir_tree::NdxEvent;
-use storage_adapter::qos::QosManager;
-use storage_adapter::{ChangeKind, ErrorEvent, StorageEntryMessage};
-use storage_adapter::{ConsistencyCheck, EntryEnum, StorageEnum, WalkDirAsyncIterator2};
+use crate::error::StorageError;
+use crate::error::storage::Result as StorageResult;
+use crate::remote_inventory::{DirectoryPages, NdxEvent};
+use crate::storage_factory::StorageContext;
+use data_mover::model::ObservedEntry;
+use data_mover::qos::QosManager;
 use sync_delta::DeltaToken;
 use sync_delta::matcher::DeltaMatcher;
+use task_model::{ChangeKind, ErrorEvent, StorageEntryMessage};
 use tokio::sync::Mutex as AsyncMutex;
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 use transport::message::{BlockSignature, NdxTable, ProgressSnapshot, ReceiverMsg, SenderMsg, TransferDecision};
 use transport::traits::SenderTransport;
@@ -27,8 +40,8 @@ use crate::consumer::stats::format_bytes;
 /// 构造 negotiated session 所需的既有 adapter 与配置。
 pub(super) struct RemoteSenderSessionDeps<'a> {
     pub(super) transport: &'a dyn SenderTransport,
-    pub(super) src_storage: &'a Arc<StorageEnum>,
-    pub(super) walkdir_iter: &'a WalkDirAsyncIterator2,
+    pub(super) src_storage: &'a Arc<StorageContext>,
+    pub(super) walkdir_iter: &'a DirectoryPages,
     pub(super) qos: Option<&'a QosManager>,
     pub(super) enable_acl: bool,
     pub(super) checkpoint_path: &'a Path,
@@ -74,7 +87,7 @@ pub(super) struct RequestAckSummary {
 
 struct SourceTransferContext<'a> {
     transport: &'a dyn SenderTransport,
-    src_storage: &'a Arc<StorageEnum>,
+    src_storage: &'a Arc<StorageContext>,
     qos: Option<&'a QosManager>,
     enable_acl: bool,
 }
@@ -235,21 +248,21 @@ impl<'a> RemoteSenderSession<'a> {
 /// 这是 session implementation 的内部操作；生产调用者只使用
 /// [`RemoteSenderSession::run`]。
 pub(super) async fn advertise_file_list(
-    transport: &dyn SenderTransport, walkdir_iter: &WalkDirAsyncIterator2, ndx_table: &Mutex<NdxTable>,
+    transport: &dyn SenderTransport, walkdir_iter: &DirectoryPages, ndx_table: &Mutex<NdxTable>,
     stats_consumer: &Arc<AsyncMutex<StatisticConsumer>>,
 ) -> Result<u64> {
     info!("[Sender Remote] Sending file list");
     let mut page_count = 0u64;
-    while let Some(event) = walkdir_iter.next().await {
+    while let Some(event) = walkdir_iter.recv().await.ok() {
         match event {
             NdxEvent::Page(page) => {
                 {
                     let mut consumer = stats_consumer.lock().await;
                     for file in &page.files {
-                        consumer.update_statistics(&StorageEntryMessage::Scanned(file.entry.clone()));
+                        consumer.update_scanned_view(file.entry.view());
                     }
                     for directory in &page.subdirs {
-                        consumer.update_statistics(&StorageEntryMessage::Scanned(directory.entry.clone()));
+                        consumer.update_scanned_view(directory.entry.view());
                     }
                 }
                 ndx_table
@@ -271,18 +284,25 @@ pub(super) async fn advertise_file_list(
 
 /// 发送一个 full entry；目录、符号链接和 bounded file stream 共用一个 typed outcome。
 pub(super) async fn send_full_transfer(
-    transport: &dyn SenderTransport, src_storage: &Arc<StorageEnum>, entry: &Arc<EntryEnum>, ndx: i32,
+    transport: &dyn SenderTransport, src_storage: &Arc<StorageContext>, entry: &ObservedItem, ndx: i32,
     qos: Option<&QosManager>, enable_acl: bool,
 ) -> Result<SourceTransferOutcome> {
-    let outcome = if entry.get_is_dir() {
-        transport.send(SenderMsg::CreateDir { entry: entry.clone() }).await?;
+    let outcome = if entry.view().version().is_some_and(|version| version.is_delete_marker()) {
+        transport.send(SenderMsg::WriteDeleteMarker { ndx }).await?;
+        SourceTransferOutcome::Sent
+    } else if entry.entry.history().is_none() && entry.get_is_dir() && entry.entry.directory_marker_object().is_none() {
+        transport
+            .send(SenderMsg::CreateDir {
+                entry: Arc::clone(&entry.entry),
+            })
+            .await?;
         SourceTransferOutcome::Sent
     } else if entry.get_is_symlink() {
-        match src_storage.read_symlink(entry).await {
+        match copy_namespace::read_symlink(src_storage.storage(), &entry.entry).await {
             Ok(target) => {
                 transport
                     .send(SenderMsg::CreateSymlink {
-                        entry: entry.clone(),
+                        entry: Arc::clone(&entry.entry),
                         target,
                     })
                     .await?;
@@ -301,62 +321,54 @@ pub(super) async fn send_full_transfer(
             }
         }
     } else {
-        let (mut chunks, read_join) = StorageEnum::read_chunk_stream(src_storage, entry, None, qos.cloned(), true, 8);
-        transport
-            .send(SenderMsg::FileBegin {
-                ndx,
-                entry: entry.clone(),
-            })
-            .await?;
-        while let Some(chunk) = chunks.recv().await {
-            transport
-                .send(SenderMsg::FileData {
-                    entry: entry.clone(),
-                    chunk,
-                })
-                .await?;
-        }
-        let read_result = match read_join.await {
-            Ok(inner) => inner.map_err(|error| error.to_string()),
-            Err(error) => Err(error.to_string()),
+        let Some(mut payload) = open_source_payload(transport, src_storage, entry, ndx, qos).await? else {
+            return Ok(SourceTransferOutcome::SourceFailed);
         };
-        match read_result {
-            Ok(hasher) => {
+        transport.send(SenderMsg::FileBegin { ndx }).await?;
+        let mut offset = 0;
+        loop {
+            match payload.next_chunk().await {
+                Ok(Some(data)) => {
+                    let length = data.len() as u64;
+                    transport
+                        .send(SenderMsg::FileData {
+                            ndx,
+                            chunk: DataChunk { offset, data },
+                        })
+                        .await?;
+                    offset += length;
+                }
+                Ok(None) => break,
+                Err(error) => return report_source_failure(transport, entry, ndx, error.to_string()).await,
+            }
+        }
+        match payload.finish().await {
+            Ok(evidence) => {
                 transport
                     .send(SenderMsg::EndOfFile {
                         ndx,
-                        entry: entry.clone(),
-                        source_hash: hasher.map(ConsistencyCheck::finalize),
+                        source_hash: Some(Hash::from_bytes(evidence.blake3).to_hex().to_string()),
                     })
                     .await?;
                 SourceTransferOutcome::Sent
             }
-            Err(reason) => {
-                error!("[Sender Remote] read file {:?}: {reason}", entry.get_relative_path());
-                transport
-                    .send(SenderMsg::EntryError {
-                        path: entry.get_relative_path().to_path_buf(),
-                        reason,
-                        ndx: Some(ndx),
-                    })
-                    .await?;
-                SourceTransferOutcome::SourceFailed
-            }
+            Err(error) => return report_source_failure(transport, entry, ndx, error.to_string()).await,
         }
     };
-    if outcome == SourceTransferOutcome::Sent {
-        send_acl_if_enabled(transport, src_storage, entry, enable_acl).await;
+    if outcome == SourceTransferOutcome::Sent && entry.entry.history().is_none() {
+        send_acl_if_enabled(transport, src_storage, &entry.entry, enable_acl).await;
     }
     Ok(outcome)
 }
 
 /// ACL 跨进程传输：仅在启用且 entry 不是符号链接时发送。
 pub(super) async fn send_acl_if_enabled(
-    transport: &dyn SenderTransport, src_storage: &Arc<StorageEnum>, entry: &Arc<EntryEnum>, enable_acl: bool,
+    transport: &dyn SenderTransport, src_storage: &Arc<StorageContext>, entry: &Arc<ObservedEntry>, enable_acl: bool,
 ) {
     if enable_acl
         && !entry.get_is_symlink()
-        && let Ok(Some(acl_data)) = src_storage.get_acl_bytes(entry.get_relative_path()).await
+        && let Ok(Some(acl)) = copy_metadata::observe_acl(src_storage.storage(), entry.get_relative_path()).await
+        && let Ok(acl_data) = encode_acl(&acl)
     {
         let _ = transport
             .send(SenderMsg::SetAcl {
@@ -369,7 +381,7 @@ pub(super) async fn send_acl_if_enabled(
 
 /// Delta source stream：matcher 与 token emission 都由 session implementation 持有。
 async fn send_delta_transfer(
-    context: &SourceTransferContext<'_>, entry: &Arc<EntryEnum>, ndx: i32, block_size: u32,
+    context: &SourceTransferContext<'_>, entry: &ObservedItem, ndx: i32, block_size: u32,
     signatures: Vec<BlockSignature>,
 ) -> Result<SourceTransferOutcome> {
     let SourceTransferContext {
@@ -387,49 +399,67 @@ async fn send_delta_transfer(
         .collect::<Vec<_>>();
     let mut matcher = DeltaMatcher::new(&signatures, block_size);
     let mut token_count = 0usize;
-    let (mut chunks, read_join) = StorageEnum::read_chunk_stream(src_storage, entry, None, qos.cloned(), true, 8);
-    while let Some(chunk) = chunks.recv().await {
-        let tokens = matcher.push(&chunk.data);
-        token_count += tokens.len();
-        send_delta_tokens(*transport, ndx, tokens, *qos).await?;
+    let Some(mut payload) = open_source_payload(*transport, src_storage, entry, ndx, *qos).await? else {
+        return Ok(SourceTransferOutcome::SourceFailed);
+    };
+    loop {
+        match payload.next_chunk().await {
+            Ok(Some(data)) => {
+                let tokens = matcher.push(&data);
+                token_count += tokens.len();
+                send_delta_tokens(*transport, ndx, tokens, *qos).await?;
+            }
+            Ok(None) => break,
+            Err(error) => return report_source_failure(*transport, entry, ndx, error.to_string()).await,
+        }
     }
+    let evidence = match payload.finish().await {
+        Ok(evidence) => evidence,
+        Err(error) => return report_source_failure(*transport, entry, ndx, error.to_string()).await,
+    };
     let tokens = matcher.finish();
     token_count += tokens.len();
     send_delta_tokens(*transport, ndx, tokens, *qos).await?;
+    transport
+        .send(SenderMsg::EndOfFile {
+            ndx,
+            source_hash: Some(Hash::from_bytes(evidence.blake3).to_hex().to_string()),
+        })
+        .await?;
+    info!(
+        "[Sender Remote] Delta transfer {:?}: {} tokens",
+        entry.get_relative_path(),
+        token_count
+    );
+    send_acl_if_enabled(*transport, src_storage, &entry.entry, *enable_acl).await;
+    Ok(SourceTransferOutcome::Sent)
+}
 
-    let read_result = match read_join.await {
-        Ok(inner) => inner.map_err(|error| error.to_string()),
-        Err(error) => Err(error.to_string()),
-    };
-    match read_result {
-        Ok(hasher) => {
-            transport
-                .send(SenderMsg::EndOfFile {
-                    ndx,
-                    entry: entry.clone(),
-                    source_hash: hasher.map(ConsistencyCheck::finalize),
-                })
-                .await?;
-            info!(
-                "[Sender Remote] Delta transfer {:?}: {} tokens",
-                entry.get_relative_path(),
-                token_count
-            );
-            send_acl_if_enabled(*transport, src_storage, entry, *enable_acl).await;
-            Ok(SourceTransferOutcome::Sent)
-        }
-        Err(reason) => {
-            error!("[Sender Remote] read file {:?}: {reason}", entry.get_relative_path());
-            transport
-                .send(SenderMsg::EntryError {
-                    path: entry.get_relative_path().to_path_buf(),
-                    reason,
-                    ndx: Some(ndx),
-                })
-                .await?;
-            Ok(SourceTransferOutcome::SourceFailed)
+/// 准入成功后才允许目标准备或消费源数据；完整性证据由原生 producer 给出。
+async fn open_source_payload(
+    transport: &dyn SenderTransport, storage: &StorageContext, entry: &ObservedItem, ndx: i32, qos: Option<&QosManager>,
+) -> Result<Option<ExpertSourcePayload>> {
+    match open_observed_source(storage, entry, qos).await {
+        Ok(session) => Ok(Some(session.stream_from(0).map_err(StorageError::from)?)),
+        Err(error) => {
+            report_source_failure(transport, entry, ndx, error.to_string()).await?;
+            Ok(None)
         }
     }
+}
+
+async fn report_source_failure(
+    transport: &dyn SenderTransport, entry: &ObservedItem, ndx: i32, reason: String,
+) -> Result<SourceTransferOutcome> {
+    error!("[Sender Remote] source {:?}: {reason}", entry.get_relative_path());
+    transport
+        .send(SenderMsg::EntryError {
+            path: entry.get_relative_path().to_path_buf(),
+            reason,
+            ndx: Some(ndx),
+        })
+        .await?;
+    Ok(SourceTransferOutcome::SourceFailed)
 }
 
 async fn send_delta_tokens(
@@ -524,8 +554,18 @@ async fn process_requests_and_acks(context: RequestLoopContext<'_>) -> Result<()
                     error!("[Sender Remote] Unknown NDX {ndx} for delta");
                 }
             }
+            Some(ReceiverMsg::ClassifiedObservation { ndx, decision }) => {
+                let item = ndx_table
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .get(ndx)
+                    .cloned();
+                if let Some(item) = item {
+                    record_classification(stats_consumer, decision, item).await;
+                }
+            }
             Some(ReceiverMsg::Classified { entry, decision }) => {
-                record_classification(stats_consumer, decision, entry).await;
+                record_classification(stats_consumer, decision, entry.into()).await;
             }
             Some(ReceiverMsg::Redo { ndx }) => {
                 let entry = ndx_table
@@ -614,7 +654,7 @@ async fn process_requests_and_acks(context: RequestLoopContext<'_>) -> Result<()
 }
 
 pub(super) async fn record_classification(
-    stats_consumer: &Arc<AsyncMutex<StatisticConsumer>>, decision: TransferDecision, entry: Arc<EntryEnum>,
+    stats_consumer: &Arc<AsyncMutex<StatisticConsumer>>, decision: TransferDecision, entry: ObservedItem,
 ) {
     if let Some(message) = classification_to_stats_message(decision, entry) {
         stats_consumer.lock().await.update_statistics(&message);
@@ -657,7 +697,7 @@ pub(super) fn entry_error_stats_message(path: PathBuf, reason: String) -> Storag
 }
 
 pub(super) fn classification_to_stats_message(
-    decision: TransferDecision, entry: Arc<EntryEnum>,
+    decision: TransferDecision, entry: ObservedItem,
 ) -> Option<StorageEntryMessage> {
     match decision {
         TransferDecision::FullTransfer => Some(StorageEntryMessage::New(entry)),
@@ -670,7 +710,7 @@ pub(super) fn classification_to_stats_message(
             kind: ChangeKind::MetadataOnly,
         }),
         TransferDecision::Skip => None,
-        TransferDecision::Deleted => Some(StorageEntryMessage::Deleted(entry)),
+        TransferDecision::Deleted => Some(StorageEntryMessage::Deleted(entry.entry)),
     }
 }
 
@@ -722,4 +762,22 @@ fn stage_error(stage: &'static str, source: AppError) -> AppError {
         stage,
         source: Box::new(source),
     }
+}
+
+/// 在发送 FileBegin 前由原生 source session 校验观察，并钉住所选源版本。
+async fn open_observed_source(
+    storage: &StorageContext, item: &ObservedItem, qos: Option<&QosManager>,
+) -> StorageResult<ExpertSourceSession> {
+    let maximum = NonZeroUsize::new(storage.block_size as usize).unwrap_or(NonZeroUsize::MIN);
+    let mut request = ExpertSourceRequest::from_shared_observation(
+        storage.roles.clone(),
+        Arc::clone(&item.entry),
+        item.version_index,
+        CancellationToken::new(),
+    )?
+    .with_maximum_chunk_bytes(maximum);
+    if let Some(qos) = qos {
+        request = request.with_source_qos(qos.source_group(storage.block_size)?);
+    }
+    Ok(ExpertSourceSession::open(request).await?)
 }

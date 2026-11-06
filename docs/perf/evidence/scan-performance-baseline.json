@@ -1,0 +1,89 @@
+{
+  "status": "confirmed_historical_reference_for_future_performance_work",
+  "configuration": {
+    "scan_concurrency": 16,
+    "database_batch_size": 100000,
+    "clickhouse_shards": 2,
+    "replicas_per_shard": 3,
+    "source": "nfs://10.131.5.221/m1-source",
+    "historical_files": 50000007,
+    "historical_directories": 3368427
+  },
+  "pr135": {
+    "url": "https://github.com/JayTsu-sh/terrasync-rs/pull/135",
+    "commit": "8a91f7ca43b4bfd157efd719d4a51b84dd2f9331",
+    "unit": "files/second as originally reported; excludesdirectories",
+    "results": [
+      {
+        "scenario": "NoDB",
+        "files_per_second": 51546.92,
+        "throughput_loss_percent": 0
+      },
+      {
+        "scenario": "full",
+        "files_per_second": 51347.061,
+        "throughput_loss_percent": 0.39
+      },
+      {
+        "scenario": "full_resume",
+        "files_per_second": 51204.988,
+        "throughput_loss_percent": 0.66
+      },
+      {
+        "scenario": "incremental",
+        "files_per_second": 49496.682,
+        "throughput_loss_percent": 3.98
+      },
+      {
+        "scenario": "incremental_resume",
+        "files_per_second": 49588.003,
+        "throughput_loss_percent": 3.8
+      }
+    ]
+  },
+  "pr137": {
+    "url": "https://github.com/JayTsu-sh/terrasync-rs/pull/137",
+    "committed_document_reference": "https://github.com/JayTsu-sh/terrasync-rs/blob/f7e6f988b1ef13d2e649a2ecb06a28ab4bf25798/.claude/docs/architecture.md",
+    "nodb_seconds": 966.88,
+    "end_nodb_throughput_difference_percent": 0.0021,
+    "measurement_scope": "one formal release binary,whole runtime includingfinalization;latercopy-metadatafixesseparatelytestedwithoutanother50mperformancepass",
+    "results": [
+      {
+        "scenario": "full",
+        "elapsed_increase_percent": 0.73,
+        "peak_rss_mib": 159.79
+      },
+      {
+        "scenario": "full_resume",
+        "elapsed_increase_percent": 0.99,
+        "peak_rss_mib": 173.81
+      },
+      {
+        "scenario": "incremental_unchanged",
+        "elapsed_increase_percent": 2.63,
+        "peak_rss_mib": 521.2
+      },
+      {
+        "scenario": "incremental_unchanged_resume",
+        "elapsed_increase_percent": 3.29,
+        "peak_rss_mib": 554.42
+      },
+      {
+        "scenario": "incremental_one_percent_changes",
+        "elapsed_increase_percent": 2.99,
+        "peak_rss_mib": 621.57
+      },
+      {
+        "scenario": "incremental_one_percent_changes_resume",
+        "elapsed_increase_percent": 4.36,
+        "peak_rss_mib": 752.86
+      }
+    ]
+  },
+  "provenance_note": "Verified against retainedmergedPRbodies,commitmessageandcommitteddocumentation.Originalreleaseandfine-grainedreportsnotfoundatpreviouspaths;newf7e6f98buildisnotclaimedastheoriginalbinary.",
+  "source_archive_sha256": {
+    "pr-135.json": "9ff46d79c60fbd98405c00482ed4f2d0b8d5594c2d3a55a9eaaa14282a88aadb",
+    "pr-137.json": "e689561a46b7294bf2cafc9f229a800e61c986357998f2d3df2af7d3d4eb8627",
+    "pr137-architecture-at-f7e6f98.md": "33ec10168ed9a6a13761f2854a05bd3cb4bf3311ce6588fb8f1af46400d684c0"
+  }
+}

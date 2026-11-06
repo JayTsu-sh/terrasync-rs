@@ -1,29 +1,31 @@
-use super::*;
-use crate::storage_factory::{StorageRole, create_storage_for_role};
-use clickhouse::Client;
-use db::clickhouse::ClickHouseDatabase;
-use db::{ClickHouseConfig, CopyGenerationStatus, DatabaseError};
+use crate::scan::observe_path;
 use std::future::pending;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
+
+use clickhouse::Client;
+use db::catalogue::ClickHouseDatabase;
+use db::{ClickHouseConfig, CopyGenerationStatus, DatabaseError};
+use task_model::ObservedEntryExt;
 use tempfile::TempDir;
 use tokio::sync::{Notify, oneshot};
 use tokio::time::{Duration, timeout};
 use utils::app_config::ClickHouseMode;
 
-async fn target(root: &TempDir) -> Result<Arc<StorageEnum>> {
+use super::*;
+use crate::storage_factory::{StorageRole, create_storage_for_role};
+
+async fn target(root: &TempDir) -> Result<Arc<StorageContext>> {
     Ok(Arc::new(
         create_storage_for_role(&root.path().to_string_lossy(), None, false, StorageRole::Destination).await?,
     ))
 }
 
-async fn directory_entry(source: &TempDir, name: &str) -> Result<EntryEnum> {
+async fn directory_entry(source: &TempDir, name: &str) -> Result<ObservedEntry> {
     std::fs::create_dir_all(source.path().join(name))?;
     let storage = create_storage_for_role(&source.path().to_string_lossy(), None, false, StorageRole::Source).await?;
-    let mut entry = storage.get_metadata(Path::new(name)).await?;
-    if let EntryEnum::NAS(directory) = &mut entry {
-        directory.mtime = 1_234_567_890_000_000_000;
-    }
+    let mut entry = observe_path(storage.storage(), Path::new(name)).await?;
+    entry = crate::observed_fixtures::with_times(entry, None, Some(1_234_567_890_000_000_000));
     Ok(entry)
 }
 
@@ -171,7 +173,7 @@ async fn isolated_generation_case(mode: ClickHouseMode) -> Result<()> {
         .await
         .map_err(DatabaseError::from)?;
     let outcome = async {
-        let database: Box<dyn Database> = Box::new(ClickHouseDatabase::new(&config, "completion")?);
+        let database: ClickHouseDatabase = ClickHouseDatabase::new(&config, "completion")?;
         database.initialize().await?;
         database
             .begin_copy_generation("directory-completion-regression")

@@ -10,26 +10,31 @@
 
 mod remote_sender_session;
 
+use crate::remote_inventory::directory_pages;
+use crate::scan::source::WalkOptions;
+
 use remote_sender_session::{RemoteSenderSession, RemoteSenderSessionDeps};
 #[cfg(test)]
 use remote_sender_session::{classification_to_stats_message, entry_error_stats_message};
 #[cfg(test)]
-use storage_adapter::TransferMode;
+use task_model::TransferMode;
 
 use std::net::SocketAddr;
 use std::sync::Arc;
 #[cfg(test)]
 use std::sync::{Mutex, PoisonError};
 
+#[cfg(test)]
+use crate::remote_inventory::NdxEvent;
+#[cfg(test)]
+use crate::storage_factory::StorageContext;
 use crate::storage_factory::{StorageRole, create_storage_for_role};
+use data_mover::filter::parse_filter_expression;
+#[cfg(test)]
+use data_mover::model::ObservedEntry;
 use rustls::pki_types::CertificateDer;
 #[cfg(test)]
-use storage_adapter::StorageEnum;
-#[cfg(test)]
-use storage_adapter::dir_tree::NdxEvent;
-use storage_adapter::filter::parse_filter_expression;
-#[cfg(test)]
-use storage_adapter::{ChangeKind, EntryEnum, ErrorEvent, StorageEntryMessage};
+use task_model::{ChangeKind, ErrorEvent, StorageEntryMessage};
 use tokio::sync::Mutex as AsyncMutex;
 use tracing::{info, warn};
 use transport::error::TransportError;
@@ -68,7 +73,7 @@ pub(crate) async fn run(
     info!("[Sender Remote] Connected");
 
     // ── 2. 握手：协商协议版本与能力，不兼容则在发送任何 FilePage/CopyEntry 前中止 ──
-    negotiate_handshake(&transport).await?;
+    let copy_tags = negotiate_handshake(&transport).await?;
 
     // ── 2.5 Token 鉴权：握手通过后、SessionConfig 之前，鉴权失败则中止连接 ──
     send_and_check_auth(&transport, auth_token).await?;
@@ -110,7 +115,7 @@ pub(crate) async fn run(
     }));
     let callback_guard = StatisticConsumer::begin(stats_consumer.clone()).await;
 
-    // ── 4. 创建源端 storage + walkdir_2 ──
+    // ── 4. 创建源端 storage + directory_pages ──
     let block_size = match &config.block_size {
         Some(s) => Some(parse_size(s)?),
         None => None,
@@ -127,16 +132,16 @@ pub(crate) async fn run(
     let match_expr = config.r#match.as_deref().and_then(|e| parse_filter_expression(e).ok());
     let exclude_expr = config.exclude.as_deref().and_then(|e| parse_filter_expression(e).ok());
     let app_config = AppConfig::fetch()?;
-    let walkdir_iter = src_storage
-        .walkdir_2(
-            None,
-            None,
-            match_expr,
-            exclude_expr,
-            app_config.scan.concurrency,
-            app_config.scan.include_tags,
-        )
-        .await?;
+    let walkdir_iter = directory_pages(
+        &src_storage,
+        WalkOptions {
+            match_expressions: match_expr,
+            exclude_expressions: exclude_expr,
+            concurrency: app_config.scan.concurrency,
+            include_tags: app_config.scan.include_tags || copy_tags,
+            ..Default::default()
+        },
+    )?;
 
     // ── 5. QoS 管理器；checkpoint lifecycle 由 negotiated session 持有 ──
     let qos_manager = create_qos_manager(config.qos.as_ref(), config.peak_qos_rate, config.iops);
@@ -198,17 +203,17 @@ fn finalize_run_result(error_count: u64) -> Result<()> {
 ///
 /// 不兼容时 Receiver 会回 `Rejected`，此处直接返回错误，
 /// 调用方（`run()`）不会再发送 `SessionConfig` 及后续任何 Phase 1 数据。
-async fn negotiate_handshake(transport: &(dyn SenderTransport + 'static)) -> Result<()> {
+async fn negotiate_handshake(transport: &(dyn SenderTransport + 'static)) -> Result<bool> {
     transport
         .send(SenderMsg::Handshake(ProtocolHandshake::current()))
         .await?;
     match transport.recv().await {
-        Some(ReceiverMsg::HandshakeAck(HandshakeResult::Accepted { features })) => {
+        Some(ReceiverMsg::HandshakeAck(HandshakeResult::Accepted { features, copy_tags })) => {
             info!(
                 "[Sender Remote] Handshake accepted, negotiated features: {:?}",
                 features
             );
-            Ok(())
+            Ok(copy_tags)
         }
         Some(ReceiverMsg::HandshakeAck(HandshakeResult::Rejected { reason })) => {
             Err(TransportError::IncompatibleProtocol { reason }.into())
@@ -251,14 +256,16 @@ mod tests {
     use std::fs::File;
     use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::{Duration, SystemTime};
+    use task_model::ObservedEntryExt;
 
     use crate::storage_factory::{StorageRole, create_storage_for_role};
     use async_trait::async_trait;
-    use storage_adapter::DataChunk;
-    use storage_adapter::dir_tree::DirPageResult;
     use tempfile::tempdir;
     use tokio::task::JoinHandle;
+    use transport::chunk::DataChunk;
+    use transport::directory::DirPageResult;
     use transport::error::Result as TransportResult;
     use transport::in_process::{InProcessReceiverTransport, InProcessSenderTransport, create_in_process_pair};
     use transport::message::FeatureFlags;
@@ -266,7 +273,7 @@ mod tests {
 
     use super::*;
 
-    async fn create_storage(path: &str, block_size: Option<u64>, ensure_dir: bool) -> Result<StorageEnum> {
+    async fn create_storage(path: &str, block_size: Option<u64>, ensure_dir: bool) -> Result<StorageContext> {
         let role = if ensure_dir {
             StorageRole::Destination
         } else {
@@ -341,7 +348,14 @@ mod tests {
                 .unwrap(),
         );
 
-        let walkdir_iter = src_storage.walkdir_2(None, None, None, None, 4, false).await.unwrap();
+        let walkdir_iter = directory_pages(
+            &src_storage,
+            WalkOptions {
+                concurrency: 4,
+                ..Default::default()
+            },
+        )
+        .unwrap();
 
         let (sender_transport, receiver_transport) = create_in_process_pair();
 
@@ -419,7 +433,14 @@ mod tests {
                 .await
                 .unwrap(),
         );
-        let walkdir_iter = src_storage.walkdir_2(None, None, None, None, 1, false).await.unwrap();
+        let walkdir_iter = directory_pages(
+            &src_storage,
+            WalkOptions {
+                concurrency: 1,
+                ..Default::default()
+            },
+        )
+        .unwrap();
         let (sender_transport, receiver_transport) = create_in_process_pair();
         let peer = tokio::spawn(async move {
             while let Some(message) = receiver_transport.recv().await {
@@ -461,7 +482,14 @@ mod tests {
                 .await
                 .unwrap(),
         );
-        let walkdir_iter = src_storage.walkdir_2(None, None, None, None, 1, false).await.unwrap();
+        let walkdir_iter = directory_pages(
+            &src_storage,
+            WalkOptions {
+                concurrency: 1,
+                ..Default::default()
+            },
+        )
+        .unwrap();
         let (sender_transport, receiver_transport) = create_in_process_pair();
         let peer = tokio::spawn(async move {
             while let Some(message) = receiver_transport.recv().await {
@@ -506,7 +534,14 @@ mod tests {
                 .await
                 .unwrap(),
         );
-        let walkdir_iter = src_storage.walkdir_2(None, None, None, None, 1, false).await.unwrap();
+        let walkdir_iter = directory_pages(
+            &src_storage,
+            WalkOptions {
+                concurrency: 1,
+                ..Default::default()
+            },
+        )
+        .unwrap();
         let (sender_transport, receiver_transport) = create_in_process_pair();
         let peer = tokio::spawn(async move {
             while let Some(message) = receiver_transport.recv().await {
@@ -573,11 +608,7 @@ mod tests {
     impl SenderTransport for HashMismatchInjector {
         async fn send(&self, msg: SenderMsg) -> TransportResult<()> {
             let msg = match msg {
-                SenderMsg::EndOfFile {
-                    ndx,
-                    entry,
-                    source_hash,
-                } => {
+                SenderMsg::EndOfFile { ndx, source_hash } => {
                     let mut remaining = self.corrupt_remaining.lock().unwrap_or_else(PoisonError::into_inner);
                     let budget = remaining.entry(ndx).or_insert(0);
                     let source_hash = if *budget > 0 {
@@ -586,11 +617,7 @@ mod tests {
                     } else {
                         source_hash
                     };
-                    SenderMsg::EndOfFile {
-                        ndx,
-                        entry,
-                        source_hash,
-                    }
+                    SenderMsg::EndOfFile { ndx, source_hash }
                 }
                 other => other,
             };
@@ -642,10 +669,17 @@ mod tests {
     /// 复用生产代码路径验证 redo 状态机。
     async fn run_pipeline(
         sender_transport: &(dyn SenderTransport + 'static), receiver_transport: InProcessReceiverTransport,
-        src_dir: &std::path::Path, dest_storage: Arc<StorageEnum>, enable_integrity_check: bool,
+        src_dir: &std::path::Path, dest_storage: Arc<StorageContext>, enable_integrity_check: bool,
     ) -> (u64, u64) {
         let src_storage = Arc::new(create_storage(src_dir.to_str().unwrap(), None, false).await.unwrap());
-        let walkdir_iter = src_storage.walkdir_2(None, None, None, None, 4, false).await.unwrap();
+        let walkdir_iter = directory_pages(
+            &src_storage,
+            WalkOptions {
+                concurrency: 4,
+                ..Default::default()
+            },
+        )
+        .unwrap();
 
         let receiver_handle =
             tokio::spawn(async move { receiver_task_remote(&receiver_transport, dest_storage, None).await });
@@ -700,10 +734,17 @@ mod tests {
     /// 正确喂入 `ErrorStats`（报表口径），而不只是本地 `error_count` u64。
     async fn run_pipeline_with_disruption<'a>(
         sender_transport: &'a (dyn SenderTransport + 'static), receiver_transport: InProcessReceiverTransport,
-        src_dir: &std::path::Path, dest_storage: Arc<StorageEnum>, disrupt: impl FnOnce() + Send + 'a,
+        src_dir: &std::path::Path, dest_storage: Arc<StorageContext>, disrupt: impl FnOnce() + Send + 'a,
     ) -> (Arc<AsyncMutex<StatisticConsumer>>, u64, u64) {
         let src_storage = Arc::new(create_storage(src_dir.to_str().unwrap(), None, false).await.unwrap());
-        let walkdir_iter = src_storage.walkdir_2(None, None, None, None, 4, false).await.unwrap();
+        let walkdir_iter = directory_pages(
+            &src_storage,
+            WalkOptions {
+                concurrency: 4,
+                ..Default::default()
+            },
+        )
+        .unwrap();
 
         let receiver_handle =
             tokio::spawn(async move { receiver_task_remote(&receiver_transport, dest_storage, None).await });
@@ -832,6 +873,7 @@ mod tests {
     struct SizeTruncationInjector {
         inner: InProcessSenderTransport,
         target_path: PathBuf,
+        target_ndx: Mutex<Option<i32>>,
         truncate_remaining: Mutex<u32>,
         /// 本次 attempt 是否已决定截断（`None` = 未决定；首个匹配 chunk 时决定并固定）
         truncating_this_attempt: Mutex<Option<bool>>,
@@ -846,6 +888,7 @@ mod tests {
             Self {
                 inner,
                 target_path,
+                target_ndx: Mutex::new(None),
                 truncate_remaining: Mutex::new(truncate_remaining),
                 truncating_this_attempt: Mutex::new(None),
                 truncated_once: Mutex::new(false),
@@ -876,9 +919,19 @@ mod tests {
     impl SenderTransport for SizeTruncationInjector {
         async fn send(&self, msg: SenderMsg) -> TransportResult<()> {
             match msg {
-                SenderMsg::FileData { entry, chunk } if entry.get_relative_path() == self.target_path.as_path() => {
+                SenderMsg::FilePage(page) => {
+                    for file in &page.files {
+                        if file.entry.get_relative_path() == self.target_path.as_path() {
+                            *self.target_ndx.lock().unwrap_or_else(PoisonError::into_inner) = Some(file.ndx);
+                        }
+                    }
+                    self.inner.send(SenderMsg::FilePage(page)).await
+                }
+                SenderMsg::FileData { ndx, chunk }
+                    if *self.target_ndx.lock().unwrap_or_else(PoisonError::into_inner) == Some(ndx) =>
+                {
                     if !self.is_truncating_this_attempt() {
-                        return self.inner.send(SenderMsg::FileData { entry, chunk }).await;
+                        return self.inner.send(SenderMsg::FileData { ndx, chunk }).await;
                     }
                     let already_truncated = {
                         let mut truncated_once = self.truncated_once.lock().unwrap_or_else(PoisonError::into_inner);
@@ -896,7 +949,7 @@ mod tests {
                         .extend_from_slice(&truncated_data);
                     self.inner
                         .send(SenderMsg::FileData {
-                            entry,
+                            ndx,
                             chunk: DataChunk {
                                 offset: chunk.offset,
                                 data: truncated_data,
@@ -904,11 +957,9 @@ mod tests {
                         })
                         .await
                 }
-                SenderMsg::EndOfFile {
-                    ndx,
-                    entry,
-                    source_hash,
-                } if entry.get_relative_path() == self.target_path.as_path() => {
+                SenderMsg::EndOfFile { ndx, source_hash }
+                    if *self.target_ndx.lock().unwrap_or_else(PoisonError::into_inner) == Some(ndx) =>
+                {
                     let was_truncating = self
                         .truncating_this_attempt
                         .lock()
@@ -923,13 +974,7 @@ mod tests {
                     } else {
                         source_hash
                     };
-                    self.inner
-                        .send(SenderMsg::EndOfFile {
-                            ndx,
-                            entry,
-                            source_hash,
-                        })
-                        .await
+                    self.inner.send(SenderMsg::EndOfFile { ndx, source_hash }).await
                 }
                 other => self.inner.send(other).await,
             }
@@ -1246,6 +1291,71 @@ mod tests {
         }
     }
 
+    struct SourceAdmissionTrace {
+        inner: InProcessSenderTransport,
+        begins: AtomicUsize,
+        successes: AtomicUsize,
+    }
+    #[async_trait]
+    impl SenderTransport for SourceAdmissionTrace {
+        async fn send(&self, mut message: SenderMsg) -> TransportResult<()> {
+            match &mut message {
+                SenderMsg::Handshake(handshake) => handshake.features.delta = false,
+                SenderMsg::FileBegin { .. } => {
+                    self.begins.fetch_add(1, Ordering::Relaxed);
+                }
+                _ => {}
+            }
+            self.inner.send(message).await
+        }
+        async fn recv(&self) -> Option<ReceiverMsg> {
+            let message = self.inner.recv().await;
+            if matches!(
+                message,
+                Some(ReceiverMsg::Success { .. } | ReceiverMsg::EntrySuccess { .. })
+            ) {
+                self.successes.fetch_add(1, Ordering::Relaxed);
+            }
+            message
+        }
+        async fn close(&self) -> TransportResult<()> {
+            self.inner.close().await
+        }
+    }
+
+    #[tokio::test]
+    async fn replaced_empty_source_is_refused_before_file_begin_and_does_not_publish_or_ack() {
+        let source = tempdir().unwrap();
+        let destination = tempdir().unwrap();
+        fs::write(source.path().join("empty"), []).unwrap();
+        fs::write(destination.path().join("empty"), b"published").unwrap();
+        let target = Arc::new(
+            create_storage(destination.path().to_str().unwrap(), None, true)
+                .await
+                .unwrap(),
+        );
+        let (sender, receiver) = create_in_process_pair();
+        let trace = SourceAdmissionTrace {
+            inner: sender,
+            begins: AtomicUsize::new(0),
+            successes: AtomicUsize::new(0),
+        };
+        let (stats, successes, errors) = tokio::time::timeout(
+            Duration::from_secs(10),
+            run_pipeline_with_disruption(&trace, receiver, source.path(), target, || {
+                fs::write(source.path().join("replacement"), []).unwrap();
+                fs::rename(source.path().join("replacement"), source.path().join("empty")).unwrap();
+            }),
+        )
+        .await
+        .expect("source refusal must terminate the pending NDX");
+        assert_eq!((successes, errors), (0, 1));
+        assert_eq!(trace.begins.load(Ordering::Relaxed), 0);
+        assert_eq!(trace.successes.load(Ordering::Relaxed), 0);
+        assert_eq!(fs::read(destination.path().join("empty")).unwrap(), b"published");
+        assert!(matches!(&stats.lock().await.stats, StatsKind::Incremental(value) if value.error_stats.copy == 1));
+    }
+
     /// [2] delta 源读失败：该 ndx 正常完成（不 hang），Sender 自增 error_count 并喂入
     /// `ErrorStats`（issue #57）。修复前 `handle_delta_transfer` 读失败只
     /// `return Ok(false)`、不发任何消息，Receiver 该 ndx 永不完成，两端 hang。
@@ -1440,7 +1550,7 @@ mod tests {
     }
 
     // ============================================================
-    // Receiver 分类信号正确性（issue #23 测试计划 2）：双端真实 StorageEnum +
+    // Receiver 分类信号正确性（issue #23 测试计划 2）：双端真实 StorageContext +
     // receiver_task_remote，验证 New/Changed(含 MetadataOnly)/Skip/Deleted 五类判定
     // 各自产生正确的 wire 信号，且执行动作（是否传输/是否本地改元数据/是否删除）与
     // 判定一致。
@@ -1453,7 +1563,7 @@ mod tests {
     /// （receiver 侧使用默认 512MiB），需要 override 见
     /// `spawn_receiver_and_handshake_with_threshold`。
     async fn spawn_receiver_and_handshake(
-        dest_storage: Arc<StorageEnum>, delete_target: bool, delta_enabled: bool,
+        dest_storage: Arc<StorageContext>, delete_target: bool, delta_enabled: bool,
     ) -> (InProcessSenderTransport, JoinHandle<Result<()>>) {
         spawn_receiver_and_handshake_with_threshold(dest_storage, delete_target, delta_enabled, None).await
     }
@@ -1461,7 +1571,8 @@ mod tests {
     /// 同 `spawn_receiver_and_handshake`，另可指定 `delta_size_threshold`（透传给
     /// `SessionConfig`，供 issue #54 阶段 0 的 size 门槛降级测试使用）。
     async fn spawn_receiver_and_handshake_with_threshold(
-        dest_storage: Arc<StorageEnum>, delete_target: bool, delta_enabled: bool, delta_size_threshold: Option<String>,
+        dest_storage: Arc<StorageContext>, delete_target: bool, delta_enabled: bool,
+        delta_size_threshold: Option<String>,
     ) -> (InProcessSenderTransport, JoinHandle<Result<()>>) {
         let (sender_transport, receiver_transport) = create_in_process_pair();
         let receiver_handle =
@@ -1479,7 +1590,7 @@ mod tests {
             };
             sender_transport.send(SenderMsg::Handshake(handshake)).await.unwrap();
             match sender_transport.recv().await {
-                Some(ReceiverMsg::HandshakeAck(HandshakeResult::Accepted { features })) => {
+                Some(ReceiverMsg::HandshakeAck(HandshakeResult::Accepted { features, .. })) => {
                     assert!(!features.delta, "delta 应协商为 false");
                 }
                 other => panic!("expected HandshakeAck(Accepted), got {other:?}"),
@@ -1507,12 +1618,19 @@ mod tests {
         (sender_transport, receiver_handle)
     }
 
-    /// 用真实 `walkdir_2` 遍历 `dir`（测试前提：目录下恰好一个顶层文件）返回第一页 +
+    /// 用真实 `directory_pages` 遍历 `dir`（测试前提：目录下恰好一个顶层文件）返回第一页 +
     /// 该文件的 ndx。
     async fn single_file_page(dir: &std::path::Path) -> (DirPageResult, i32) {
         let storage = Arc::new(create_storage(dir.to_str().unwrap(), None, false).await.unwrap());
-        let walkdir_iter = storage.walkdir_2(None, None, None, None, 4, false).await.unwrap();
-        let page = match walkdir_iter.next().await {
+        let walkdir_iter = directory_pages(
+            &storage,
+            WalkOptions {
+                concurrency: 4,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let page = match walkdir_iter.recv().await.ok() {
             Some(NdxEvent::Page(p)) => p,
             other => panic!("expected Page, got {other:?}"),
         };
@@ -1768,10 +1886,10 @@ mod tests {
         sender_transport.send(SenderMsg::FilePage(page)).await.unwrap();
 
         match recv_skip_progress(&sender_transport).await {
-            Some(ReceiverMsg::Classified {
-                entry,
+            Some(ReceiverMsg::ClassifiedObservation {
+                ndx,
                 decision: TransferDecision::MetadataOnly,
-            }) => assert_eq!(entry.get_relative_path(), std::path::Path::new("a.txt")),
+            }) => assert_eq!(ndx, _ndx),
             other => panic!("expected Classified{{decision:MetadataOnly}}, got {other:?}"),
         }
 
@@ -1810,10 +1928,10 @@ mod tests {
         sender_transport.send(SenderMsg::FilePage(page)).await.unwrap();
 
         match recv_skip_progress(&sender_transport).await {
-            Some(ReceiverMsg::Classified {
+            Some(ReceiverMsg::ClassifiedObservation {
+                ndx,
                 decision: TransferDecision::Skip,
-                ..
-            }) => {}
+            }) => assert_eq!(ndx, _ndx),
             other => panic!("expected Classified{{decision:Skip}}, got {other:?}"),
         }
 
@@ -1905,9 +2023,22 @@ mod tests {
                 .await
                 .unwrap(),
         );
-        let walkdir_iter = src_storage.walkdir_2(None, None, None, None, 4, false).await.unwrap();
-        while let Some(event) = walkdir_iter.next().await {
+        let walkdir_iter = directory_pages(
+            &src_storage,
+            WalkOptions {
+                concurrency: 4,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let mut expected_ndx = None;
+        while let Some(event) = walkdir_iter.recv().await.ok() {
             if let NdxEvent::Page(page) = event {
+                for file in &page.files {
+                    if file.entry.get_relative_path() == std::path::Path::new("sub/nested.txt") {
+                        expected_ndx = Some(file.ndx);
+                    }
+                }
                 sender_transport.send(SenderMsg::FilePage(page)).await.unwrap();
             }
         }
@@ -1915,10 +2046,10 @@ mod tests {
         // 唯一预期信号：nested.txt 完全一致 → Classified{Skip}。若子目录被误判孤儿，
         // 这里会先收到 Classified{Deleted}（或整树误删后 nested.txt 的 TransferRequest）
         match recv_skip_progress(&sender_transport).await {
-            Some(ReceiverMsg::Classified {
-                entry,
+            Some(ReceiverMsg::ClassifiedObservation {
+                ndx,
                 decision: TransferDecision::Skip,
-            }) => assert_eq!(entry.get_relative_path(), std::path::Path::new("sub/nested.txt")),
+            }) => assert_eq!(Some(ndx), expected_ndx),
             other => panic!("expected Classified{{decision:Skip}} for sub/nested.txt, got {other:?}"),
         }
 
@@ -1976,34 +2107,37 @@ mod tests {
     // ============================================================
 
     /// 构造一个仅用于测试的最小 `NASEntry`（字段值无实际语义，只满足统计消息类型要求）
-    fn dummy_entry(name: &str, is_dir: bool, size: u64) -> Arc<EntryEnum> {
-        Arc::new(EntryEnum::NAS(storage_adapter::NASEntry {
-            name: name.to_string(),
-            relative_path: PathBuf::from(name),
-            extension: None,
-            is_dir,
-            size,
-            atime: 0,
-            ctime: 0,
-            mtime: 0,
-            mode: Some(0o644),
-            is_symlink: false,
-            hard_links: None,
-            uid: None,
-            gid: None,
-            ino: None,
-            file_handle: None,
-            acl: None,
-            owner: None,
-            owner_group: None,
-            xattrs: None,
-        }))
+    fn dummy_entry(name: &str, is_dir: bool, size: u64) -> Arc<ObservedEntry> {
+        Arc::new({
+            let fixture_path: std::path::PathBuf = PathBuf::from(name);
+            crate::observed_fixtures::observation(
+                data_mover::model::BackendKind::Nfs,
+                fixture_path,
+                if is_dir {
+                    data_mover::model::EntryKind::Directory
+                } else if false {
+                    data_mover::model::EntryKind::Symlink
+                } else {
+                    data_mover::model::EntryKind::File
+                },
+                size,
+                [0, 0, 0],
+                Some(data_mover::model::OwnershipMode {
+                    mode: 0o644,
+                    uid: 0u32,
+                    gid: 0u32,
+                }),
+                None,
+                None,
+                None,
+            )
+        })
     }
 
     #[test]
     fn classification_to_stats_message_maps_full_transfer_to_new() {
         let entry = dummy_entry("a.txt", false, 10);
-        match classification_to_stats_message(TransferDecision::FullTransfer, entry) {
+        match classification_to_stats_message(TransferDecision::FullTransfer, entry.into()) {
             Some(StorageEntryMessage::New(_)) => {}
             other => panic!("expected New, got {other:?}"),
         }
@@ -2012,7 +2146,7 @@ mod tests {
     #[test]
     fn classification_to_stats_message_maps_delta_transfer_to_changed_data_only() {
         let entry = dummy_entry("a.txt", false, 10);
-        match classification_to_stats_message(TransferDecision::DeltaTransfer, entry) {
+        match classification_to_stats_message(TransferDecision::DeltaTransfer, entry.into()) {
             Some(StorageEntryMessage::Changed {
                 kind: ChangeKind::DataOnly,
                 ..
@@ -2024,7 +2158,7 @@ mod tests {
     #[test]
     fn classification_to_stats_message_maps_metadata_only_to_changed_metadata_only() {
         let entry = dummy_entry("a.txt", false, 10);
-        match classification_to_stats_message(TransferDecision::MetadataOnly, entry) {
+        match classification_to_stats_message(TransferDecision::MetadataOnly, entry.into()) {
             Some(StorageEntryMessage::Changed {
                 kind: ChangeKind::MetadataOnly,
                 ..
@@ -2036,13 +2170,13 @@ mod tests {
     #[test]
     fn classification_to_stats_message_skip_produces_no_message() {
         let entry = dummy_entry("a.txt", false, 10);
-        assert!(classification_to_stats_message(TransferDecision::Skip, entry).is_none());
+        assert!(classification_to_stats_message(TransferDecision::Skip, entry.into()).is_none());
     }
 
     #[test]
     fn classification_to_stats_message_maps_deleted_to_deleted() {
         let entry = dummy_entry("a.txt", false, 10);
-        match classification_to_stats_message(TransferDecision::Deleted, entry) {
+        match classification_to_stats_message(TransferDecision::Deleted, entry.into()) {
             Some(StorageEntryMessage::Deleted(_)) => {}
             other => panic!("expected Deleted, got {other:?}"),
         }
@@ -2078,7 +2212,7 @@ mod tests {
             (TransferDecision::Deleted, dummy_entry("gone.txt", false, 30)),
         ];
         for (decision, entry) in events {
-            if let Some(msg) = classification_to_stats_message(decision, entry) {
+            if let Some(msg) = classification_to_stats_message(decision, entry.into()) {
                 stats_consumer.lock().await.update_statistics(&msg);
             }
         }
@@ -2119,7 +2253,7 @@ mod tests {
             (TransferDecision::Deleted, dummy_entry("d1.txt", false, 60)),
         ];
         for (decision, entry) in events {
-            if let Some(msg) = classification_to_stats_message(decision, entry) {
+            if let Some(msg) = classification_to_stats_message(decision, entry.into()) {
                 stats_consumer.lock().await.update_statistics(&msg);
             }
         }
@@ -2236,9 +2370,9 @@ mod tests {
 
         {
             let mut c = stats_consumer.lock().await;
-            c.update_statistics(&StorageEntryMessage::New(dummy_entry("a.txt", false, 10)));
+            c.update_statistics(&StorageEntryMessage::New(dummy_entry("a.txt", false, 10).into()));
             c.update_statistics(&StorageEntryMessage::Changed {
-                entry: dummy_entry("b.txt", false, 20),
+                entry: dummy_entry("b.txt", false, 20).into(),
                 kind: ChangeKind::DataOnly,
             });
         }

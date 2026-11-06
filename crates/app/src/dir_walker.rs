@@ -1,11 +1,14 @@
+use crate::scan::observe_path;
 // 标准库
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use storage_adapter::storage_enum::StorageEnum;
-use storage_adapter::{ErrorEvent, StorageEntryMessage, StorageError, WalkDirAsyncIterator};
+use crate::error::StorageError;
+use crate::scan::source::WalkDirAsyncIterator;
+use crate::storage_factory::StorageContext;
+use task_model::{ErrorEvent, StorageEntryMessage};
 // 外部crate
 use tracing::{Instrument, error, info, info_span};
 
@@ -31,7 +34,7 @@ impl DirectoryWalker {
         }
     }
 
-    async fn source_storage(&self) -> Result<StorageEnum> {
+    async fn source_storage(&self) -> Result<StorageContext> {
         create_storage_for_role(&self.config.path, None, false, StorageRole::Source).await
     }
 
@@ -72,7 +75,7 @@ impl DirectoryWalker {
             let walkdir_iter = storage
                 .walkdir(
                     None,
-                    storage_adapter::WalkOptions {
+                    crate::scan::source::WalkOptions {
                         operation_timeout: self.operation_timeout,
                         recovery_window: self.recovery_window,
                         depth,
@@ -93,7 +96,7 @@ impl DirectoryWalker {
 
 /// 从文件列表创建 `WalkDirAsyncIterator`
 ///
-/// 该函数从文件列表中读取文件路径，然后为每个文件创建 `EntryEnum`，
+/// 该函数从文件列表中读取文件路径，然后为每个文件创建 `ObservedEntry`，
 /// 并通过 `WalkDirAsyncIterator` 返回。
 ///
 /// # 参数
@@ -103,7 +106,7 @@ impl DirectoryWalker {
 /// # 返回值
 /// - 成功时返回 `WalkDirAsyncIterator`
 /// - 失败时返回包含错误信息的 `Err`
-fn walkdir_from_file_list(storage: StorageEnum, file_list_path: &str) -> Result<WalkDirAsyncIterator> {
+fn walkdir_from_file_list(storage: StorageContext, file_list_path: &str) -> Result<WalkDirAsyncIterator> {
     // 从文件中读取文件路径
     let file = File::open(file_list_path).map_err(|e| AppError::ScanError(format!("Failed to open file list: {e}")))?;
     let reader = BufReader::new(file);
@@ -144,8 +147,8 @@ fn walkdir_from_file_list(storage: StorageEnum, file_list_path: &str) -> Result<
             for relative_path in file_paths_iter {
                 match relative_path {
                     Ok(file_path) => {
-                        // 尝试获取文件的EntryEnum
-                        match storage.get_metadata(&file_path).await {
+                        // 尝试获取文件的ObservedEntry
+                        match observe_path(storage.storage(), &file_path).await {
                             Ok(metadata) => {
                                 // 发送Scanned消息到通道
                                 let msg = StorageEntryMessage::Scanned(std::sync::Arc::new(metadata));
@@ -204,7 +207,7 @@ fn walkdir_from_file_list(storage: StorageEnum, file_list_path: &str) -> Result<
 }
 
 /// 通用的目录遍历函数 - 作为便捷的包装器
-pub async fn walkdir(config: ScanConfig) -> Result<storage_adapter::WalkDirAsyncIterator> {
+pub async fn walkdir(config: ScanConfig) -> Result<crate::scan::source::WalkDirAsyncIterator> {
     let walker = DirectoryWalker::new(config);
     walker.walk().await
 }

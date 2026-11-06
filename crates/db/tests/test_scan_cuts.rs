@@ -5,15 +5,15 @@ use data_mover::model::{
     StoragePath, SymlinkTarget, SymlinkTargetEncoding,
 };
 use db::{
-    ClickHouseConfig, DatabaseConfig, DatabaseFactory, Result,
-    clickhouse::scan_resume::{RUNNING, ScanResumeState},
-    scan_store::ScanStore,
+    ClickHouseConfig, ClickHouseDatabase, Result,
+    scan::ScanStore,
+    scan::{RUNNING, ScanResumeState},
 };
 use std::{
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
-use storage_adapter::observed_scan::{ObservedItem, ObservedScanEvent};
+use task_model::observation::{ObservedItem, ObservedScanEvent};
 use tokio::time::sleep;
 use utils::app_config::ClickHouseMode;
 use uuid::Uuid;
@@ -151,7 +151,6 @@ impl Fixture {
         store.load_resume_state().await?;
         store.initialize().await?;
         store.prepare_incremental().await?;
-        store.prepare_native_schema().await?;
         Ok(store)
     }
 }
@@ -242,6 +241,20 @@ async fn exercise(fixture: &Fixture) -> Result<()> {
     assert_eq!(fixture.rows("base", job).await?, ["old", "prefix"]);
     assert_eq!(fixture.rows("incremental", job).await?, ["old", "prefix"]);
     assert_eq!(fixture.rows("base", "scan_b").await?, ["unrelated"]);
+    if fixture.cluster.is_none() {
+        let definition = fixture
+            .client
+            .query("SELECT create_table_query FROM system.tables WHERE database=currentDatabase() AND name=?")
+            .bind(format!("base_{job}"))
+            .fetch_one::<String>()
+            .await?;
+        assert!(
+            definition
+                .replace(' ', "")
+                .contains("non_replicated_deduplication_window=10000"),
+            "恢复分区不能丢失 working 表的写入去重能力"
+        );
+    }
     let scope = if fixture.cluster.is_some() {
         " AND job_id='scan_a'"
     } else {
@@ -281,13 +294,7 @@ async fn exercise(fixture: &Fixture) -> Result<()> {
         tokio::time::sleep(std::time::Duration::from_secs(3)).await;
         assert_eq!(fixture.rows("base", job).await?, ["after_restore", "old", "prefix"]);
     }
-    let config = DatabaseConfig {
-        enabled: true,
-        db_type: "clickhouse".into(),
-        batch_size: 1,
-        clickhouse: Some(fixture.config.clone()),
-    };
-    assert!(DatabaseFactory::new_database(&config, job).await.is_err());
+    assert!(ClickHouseDatabase::connect(&fixture.config, job).await.is_err());
     store.restore_scan_baseline(&state).await?;
     assert_eq!(fixture.rows("base", job).await?, ["old"]);
     assert_eq!(fixture.rows("incremental", job).await?, ["old"]);

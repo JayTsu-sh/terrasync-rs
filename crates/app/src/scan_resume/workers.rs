@@ -9,10 +9,10 @@ use crate::{
     error::{AppError, Result},
 };
 use data_mover::model::ObservedEntry;
-use db::{clickhouse::scan_resume::ScanResumeState, scan_store::ScanStore};
+use db::{scan::ScanResumeState, scan::ScanStore};
 use rustc_hash::FxHasher;
 use std::{hash::Hasher, sync::Arc};
-use storage_adapter::observed_scan::ObservedView;
+use task_model::observation::ObservedView;
 use tokio::{
     select,
     sync::{mpsc, oneshot},
@@ -123,7 +123,7 @@ async fn dispatch(
             version_index: entry.history().map(|_| 0),
         };
         let mut hash = FxHasher::default();
-        hash.write(view.sql_path().as_bytes());
+        hash.write(view.path_key().as_bytes());
         let worker = hash.finish() as usize % senders.len();
         pending[worker].push(Arc::clone(entry));
         if pending[worker].len() >= DISPATCH_BATCH {
@@ -209,11 +209,12 @@ mod tests {
         consumer::ConsumerManager,
     };
     use data_mover::model::{BackendIdentity, BackendKind, EntryKind, IdentityStrength, SourceIdentity, StoragePath};
-    use db::{ClickHouseConfig, DatabaseConfig};
+    use db::ClickHouseConfig;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use tokio::time::{Duration, sleep, timeout};
     use tokio_util::sync::CancellationToken;
     use utils::app_config::ClickHouseMode;
+    use utils::app_config::DatabaseConfig;
 
     #[tokio::test]
     async fn cancelled_scan_stops_database_workers_without_waiting_for_queue_closure() {
@@ -223,9 +224,17 @@ mod tests {
             job_type: JobType::IncrementalScan,
             db_config: DatabaseConfig {
                 enabled: false,
-                db_type: "clickhouse".into(),
                 batch_size: 1,
-                clickhouse: None,
+                clickhouse: ClickHouseConfig {
+                    mode: Default::default(),
+                    cluster: None,
+                    dsn: "http://127.0.0.1:8123".into(),
+                    dial_timeout: 1,
+                    read_timeout: 1,
+                    database: "default".into(),
+                    username: "default".into(),
+                    password: None,
+                },
             },
             console_config: ConsoleConfig {
                 raw_command_line: String::new(),

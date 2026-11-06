@@ -1,4 +1,5 @@
 use app::error::AppError;
+use app::error::StorageError;
 use axum::Json;
 use axum::extract::rejection::JsonRejection;
 use axum::http::StatusCode;
@@ -7,7 +8,6 @@ use data_mover::model::FailureClass;
 use data_mover::probes::ProbeError;
 use data_mover::storage::StorageRoleFailure;
 use serde::Serialize;
-use storage_adapter::error::StorageError;
 use thiserror::Error;
 use tracing::error;
 

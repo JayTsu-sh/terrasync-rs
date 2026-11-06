@@ -1,16 +1,20 @@
 //! 复制执行的互斥与恢复授权；不把轮次策略下沉到 backend。
+
+use std::fs::File;
+
+use blake3::Hasher;
+use db::ClickHouseDatabase;
+use db::CopyGenerationStatus;
+use tokio::task::spawn_blocking;
+use tracing::info;
+use utils::app_config::ClickhouseConfig;
+
 use crate::job_execution::JobLease;
 use crate::{
     config::SyncJobConfig,
     error::{AppError, Result},
     storage_factory::{StorageRole, create_storage_for_role},
 };
-use blake3::Hasher;
-use db::{CopyGenerationStatus, Database};
-use std::fs::File;
-use tokio::task::spawn_blocking;
-use tracing::info;
-use utils::app_config::ClickhouseConfig;
 
 pub(crate) struct CopyLease {
     _guard: JobLease,
@@ -24,7 +28,7 @@ impl CopyLease {
 }
 
 pub(crate) async fn begin_copy_catalogue(
-    database: &dyn Database, job: &SyncJobConfig, block_size: Option<usize>, source_reserved: bool,
+    database: &ClickHouseDatabase, job: &SyncJobConfig, block_size: Option<usize>, source_reserved: bool,
 ) -> Result<()> {
     // 身份不包含凭据；恢复计划变化必须在任何 payload 或回标前被拒绝。
     let source = create_storage_for_role(
@@ -43,7 +47,7 @@ pub(crate) async fn begin_copy_catalogue(
     .await?;
     let source = source.storage().identity();
     let target_identity = target.storage().identity();
-    let history = target.is_bucket_versioned().await?;
+    let history = target.storage().staged_destination()?.keeps_history().await?;
     let list_digest = if let Some(path) = job.file_list.clone() {
         Some(
             spawn_blocking(move || -> Result<String> {
@@ -109,7 +113,7 @@ mod tests {
     use super::*;
     use std::fs::OpenOptions;
     use std::path::Path;
-    use storage_adapter::TransferMode;
+    use task_model::TransferMode;
 
     fn job(directory: &Path) -> SyncJobConfig {
         SyncJobConfig {

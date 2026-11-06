@@ -1,10 +1,18 @@
 // 外部 crate
-use storage_adapter::error::StorageError;
+use data_mover::model::ModelValueError;
 use thiserror::Error;
 
 /// Transport 层错误类型
 #[derive(Error, Debug)]
 pub enum TransportError {
+    #[error(transparent)]
+    AclSerialization(#[from] serde_json::Error),
+    #[error(transparent)]
+    AclModel(#[from] ModelValueError),
+    #[error("unknown ACL encoding: {encoding}")]
+    InvalidAclEncoding { encoding: u8 },
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
     /// 通道已关闭（发送端或接收端已 drop）
     #[error("Channel closed")]
     ChannelClosed,
@@ -20,10 +28,6 @@ pub enum TransportError {
     /// 序列化/反序列化错误（双进程模式下使用）
     #[error("Serialization error: {0}")]
     SerializationError(String),
-
-    /// 底层存储操作错误
-    #[error("Storage error: {0}")]
-    StorageError(#[from] StorageError),
 
     /// 握手阶段协议版本或能力不兼容（Sender/Receiver 协议版本超出彼此支持范围）
     #[error("Incompatible protocol: {reason}")]

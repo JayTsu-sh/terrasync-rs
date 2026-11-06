@@ -3,14 +3,21 @@
 //! SyncOrchestrator 封装 sync/incremental_sync 的核心逻辑，
 //! 通过 Transport 抽象层连接 Sender 和 Receiver，支持单进程和双进程两种模式。
 
+use crate::file_copy::metadata as copy_metadata;
+use crate::file_copy::namespace as copy_namespace;
+use crate::file_copy::transfer as copy_transfer;
+use crate::rm::progress as deletion;
+use data_mover::model::BackendKind;
 // 标准库
-use crate::file_copy::{HdfsCopyContext, MetadataApplication, copy_file};
+use crate::copy_dispatch::{CopyQueues, partition_scan};
+use crate::file_copy::{HdfsCopyContext, copy_file};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
-use storage_adapter::TransferMode;
+use task_model::ObservedEntryExt;
+use task_model::TransferMode;
 
 /// RAII guard：构造时 +1，Drop 时 -1，确保计数器在 panic/early-return 时也能正确回收。
 struct AtomicCounterGuard<'a>(&'a AtomicUsize);
@@ -29,14 +36,14 @@ impl Drop for AtomicCounterGuard<'_> {
 }
 
 // 外部 crate
-use dashmap::DashMap;
-use db::factory::DatabaseFactory;
-use db::traits::Database;
-use db::{self, DeletionStatus, INCREMENTAL_SCAN_TABLE_BASE_NAME};
-use storage_adapter::qos::QosManager;
+use crate::storage_factory::StorageContext;
 #[cfg(windows)]
-use storage_adapter::storage_enum::{StorageType, detect_storage_type};
-use storage_adapter::{ChangeKind, EntryEnum, ErrorEvent, StorageEntryMessage, StorageEnum};
+use crate::storage_factory::backend_kind_from_location;
+use data_mover::model::ObservedEntry;
+use data_mover::qos::QosManager;
+use db::ClickHouseDatabase;
+use db::{self, DeletionStatus, INCREMENTAL_SCAN_TABLE_BASE_NAME};
+use task_model::{ChangeKind, EntryChange, ErrorEvent, StorageEntryMessage};
 use tokio::sync::Semaphore;
 use tokio::task::JoinHandle;
 use tracing::{Instrument, error, info, info_span, trace, warn};
@@ -52,6 +59,7 @@ use crate::consumer::ConsumerManager;
 use crate::copy_completion;
 use crate::copy_execution::{CopyLease, begin_copy_catalogue};
 use crate::error::{AppError, Result};
+use crate::file_copy::copied_tags_required;
 #[cfg(feature = "license")]
 use crate::integrity_check::verify_storage_time;
 use crate::receiver::{ReceiverConfig, process_entry_on_receiver};
@@ -252,38 +260,34 @@ impl SyncOrchestrator {
                 "Packaged sync supports only Atomic mode; use --in-place".into(),
             ));
         }
-        match self.mode {
+        let copy_tags = match self.mode {
             SyncMode::Local => {
                 let destination = create_storage_for_role(&c.dest_path, None, true, StorageRole::Destination).await?;
-                destination.validate_transfer_mode(c.transfer_mode)?;
+                copy_transfer::validate_transfer_mode(&destination, c.transfer_mode)?;
+                copied_tags_required(&destination)?
             }
-            SyncMode::Remote { .. } => {}
-        }
+            SyncMode::Remote { .. } => false,
+        };
 
         let app_config = AppConfig::fetch()?;
-        let db_config = db::config::DatabaseConfig::from_app_config(&app_config.database);
         // database.enabled=true 时必须成功构造；false 时忽略错误（未启用），走文件系统兜底
         let db_instance = if app_config.database.enabled {
-            Some(
-                DatabaseFactory::new_database(&db_config, &c.job_id)
-                    .await
-                    .map_err(AppError::DatabaseError)?,
-            )
+            Some(ClickHouseDatabase::connect(&app_config.database.clickhouse, &c.job_id).await?)
         } else {
             None
         };
         let scan_type = if !app_config.database.enabled || !app_config.sync.is_source_reserved {
             ScanType::Full
         } else {
-            determine_sync_type(db_instance.as_deref(), &c.job_id, c.job_dir_pre_existing).await
+            determine_sync_type(db_instance.as_ref(), c.job_dir_pre_existing).await
         };
 
         info!("SyncOrchestrator: determined scan_type={}", scan_type);
 
         match &self.mode {
             SyncMode::Local => match scan_type {
-                ScanType::Full => self.run_sync().await,
-                ScanType::Incremental => self.run_incremental_sync().await,
+                ScanType::Full => self.run_sync(copy_tags).await,
+                ScanType::Incremental => self.run_incremental_sync(copy_tags).await,
             },
             // 双进程模式本就是 compare-based（DestIndex 实时比对目标端），Full/Incremental
             // 在 wire protocol 和执行路径上是同一套代码，ScanType 对 Remote 是 no-op
@@ -300,7 +304,7 @@ impl SyncOrchestrator {
     }
 
     /// 全量同步 — 通过 transport 连接 sender workers 和 receiver tasks
-    async fn run_sync(&self) -> Result<()> {
+    async fn run_sync(&self, copy_tags: bool) -> Result<()> {
         let c = &self.config;
 
         // ── License 校验 ──
@@ -315,8 +319,8 @@ impl SyncOrchestrator {
         info!(
             "Starting sync via orchestrator: job_id({}), src({}), dest({})",
             c.job_id,
-            storage_adapter::redact_storage_url(&c.src_path),
-            storage_adapter::redact_storage_url(&c.dest_path)
+            data_mover::redact_storage_url(&c.src_path),
+            data_mover::redact_storage_url(&c.dest_path)
         );
 
         // ── 1. 加载配置 ──
@@ -339,7 +343,7 @@ impl SyncOrchestrator {
             &c.r#match,
             &c.exclude,
             c.concurrency.unwrap_or(app_config.scan.concurrency),
-            app_config.scan.include_tags,
+            app_config.scan.include_tags || copy_tags,
             &c.file_list,
             c.packaged,
             c.package_depth,
@@ -356,9 +360,10 @@ impl SyncOrchestrator {
         )?);
 
         let database = if consumer_config.db_config.enabled {
-            let database = DatabaseFactory::new_database(&consumer_config.db_config, &c.job_id).await?;
+            let database: ClickHouseDatabase =
+                ClickHouseDatabase::connect(&consumer_config.db_config.clickhouse, &c.job_id).await?;
             database.initialize().await?;
-            begin_copy_catalogue(database.as_ref(), c, block_size, is_source_reserved).await?;
+            begin_copy_catalogue(&database, c, block_size, is_source_reserved).await?;
             Some(database)
         } else {
             None
@@ -369,7 +374,7 @@ impl SyncOrchestrator {
 
         // ── 4. 广播器 + 消费者 ──
         let mut broadcaster = BroadcastForwarder::new(DEFAULT_CHANNEL_CAPACITY);
-        let mut consumer_manager = ConsumerManager::new(consumer_config.as_ref()).await?;
+        let mut consumer_manager = ConsumerManager::with_database(consumer_config.as_ref(), database.clone()).await?;
         consumer_manager.begin_lifecycle().await;
         let consumer_handles = consumer_manager.start_consumers(&mut broadcaster).await?;
         let bytes_tracker = consumer_manager.get_bytes_tracker().await;
@@ -379,8 +384,8 @@ impl SyncOrchestrator {
         // Windows 管理员权限检查
         #[cfg(windows)]
         {
-            if matches!(detect_storage_type(&c.src_path), StorageType::Local)
-                && matches!(detect_storage_type(&c.dest_path), StorageType::Local)
+            if matches!(backend_kind_from_location(&c.src_path), BackendKind::Local)
+                && matches!(backend_kind_from_location(&c.dest_path), BackendKind::Local)
             {
                 match check_admin_privileges() {
                     Ok(true) => println!("✓ Running with administrator privileges\n"),
@@ -489,7 +494,7 @@ impl SyncOrchestrator {
                                     .await
                                 {
                                     Ok(()) => {
-                                        bc.broadcast(StorageEntryMessage::New(entry)).await;
+                                        bc.broadcast(StorageEntryMessage::New(entry.into())).await;
                                     }
                                     Err(e) => {
                                         error!(
@@ -514,7 +519,7 @@ impl SyncOrchestrator {
                                 manifest_entries,
                             } => {
                                 let tar_path = tar_entry.get_relative_path().to_string_lossy().to_string();
-                                bc.broadcast(StorageEntryMessage::New(tar_entry)).await;
+                                bc.broadcast(StorageEntryMessage::New(tar_entry.into())).await;
                                 bc.broadcast(StorageEntryMessage::TarManifest {
                                     tar_path,
                                     entries: manifest_entries,
@@ -547,19 +552,22 @@ impl SyncOrchestrator {
             large_file_log_threshold: LARGE_FILE_LOG_THRESHOLD,
         });
 
-        let object_buffers: Arc<DashMap<String, Vec<Arc<EntryEnum>>>> = Arc::new(DashMap::new());
+        let (sender_inputs, source_dispatch) = partition_scan(
+            walkdir_iter.clone(),
+            copy_concurrency,
+            DEFAULT_CHANNEL_CAPACITY / copy_concurrency.max(1),
+        );
         let mut sender_handles = Vec::new();
 
-        for worker_id in 0..copy_concurrency {
-            let wi = walkdir_iter.clone();
+        for (worker_id, wi) in sender_inputs.into_iter().enumerate() {
             let src_path = c.src_path.clone();
             let dest_path = c.dest_path.clone();
             let transport = sender_transport.clone();
             let bc = broadcaster.clone();
             let cfg = sender_config.clone();
+            let copy_cfg = receiver_config.clone();
             let qos = qos_manager.clone();
             let bt = bytes_tracker.clone();
-            let ob = object_buffers.clone();
             let aec = active_entry_counter.clone();
             let ec = entry_counter.clone();
             let sc = size_counter.clone();
@@ -594,7 +602,10 @@ impl SyncOrchestrator {
                     done_counter.fetch_add(1, Ordering::Release);
                     let src = storage_pair.get_src_storage().clone();
                     let dest = storage_pair.get_dest_storage().clone();
-                    sender_worker(worker_id, wi, src, dest, transport, &bc, &cfg, qos, bt, ob, aec, ec, sc).await
+                    sender_worker(
+                        worker_id, wi, src, dest, transport, &bc, &cfg, qos, bt, &copy_cfg, aec, ec, sc,
+                    )
+                    .await
                 }
                 .instrument(span),
             );
@@ -616,6 +627,7 @@ impl SyncOrchestrator {
         // ── 11. 等待 Sender workers 完成 ──
         let senders_result = finish_phase(sender_handles).await;
         walkdir_iter.close();
+        let source_dispatch_result = finish_phase(vec![source_dispatch]).await;
 
         // ── 12. 关闭管线（和原始 sync_inner 一致） ──
         // Sender workers 全部完成 → 不再发 CopyEntry
@@ -636,19 +648,12 @@ impl SyncOrchestrator {
         drop(broadcaster);
         let consumers_result = finish_phase(consumer_handles).await;
         let source_result = walkdir_iter.take_error().map_or(Ok(()), |error| Err(error.into()));
-        let history_result = if object_buffers.is_empty() {
-            Ok(())
-        } else {
-            Err(AppError::CopyError(
-                "Incomplete object history; copy cannot commit".into(),
-            ))
-        };
         let result: Result<()> = async {
             source_result
                 .and(senders_result)
                 .and(receivers_result)
                 .and(consumers_result)
-                .and(history_result)?;
+                .and(source_dispatch_result)?;
             if let Some(database) = &database {
                 let destination = Arc::new(
                     create_storage_for_role(
@@ -679,7 +684,7 @@ impl SyncOrchestrator {
     /// - Barrier：`drop(broadcaster_a)` + `await phase_a_handles`（base 表冲刷完毕）
     /// - Phase B：`detect_deleted_items` → 执行 dest 物理删除/重命名 → 通过 `broadcaster_b`
     ///   喂给同一组 consumers（`DatabaseConsumer` 自动完成 incremental 表写入 + base 表修正）
-    async fn run_incremental_sync(&self) -> Result<()> {
+    async fn run_incremental_sync(&self, copy_tags: bool) -> Result<()> {
         let c = &self.config;
 
         // ── License 校验 ──
@@ -694,8 +699,8 @@ impl SyncOrchestrator {
         info!(
             "Starting incremental sync via orchestrator: job_id({}), src({}), dest({})",
             c.job_id,
-            storage_adapter::redact_storage_url(&c.src_path),
-            storage_adapter::redact_storage_url(&c.dest_path)
+            data_mover::redact_storage_url(&c.src_path),
+            data_mover::redact_storage_url(&c.dest_path)
         );
 
         // ── 1. 加载配置 ──
@@ -718,7 +723,7 @@ impl SyncOrchestrator {
             &c.r#match,
             &c.exclude,
             c.concurrency.unwrap_or(app_config.scan.concurrency),
-            app_config.scan.include_tags,
+            app_config.scan.include_tags || copy_tags,
             &None,
             c.packaged,
             c.package_depth,
@@ -734,15 +739,14 @@ impl SyncOrchestrator {
             c.progress_callback_url.clone(),
         )?);
 
-        let database = DatabaseFactory::new_database(&consumer_config.db_config, &c.job_id)
-            .await
-            .map_err(AppError::DatabaseError)?;
+        let database: ClickHouseDatabase =
+            ClickHouseDatabase::connect(&consumer_config.db_config.clickhouse, &c.job_id).await?;
 
         if let Err(e) = database.create_table(INCREMENTAL_SCAN_TABLE_BASE_NAME).await {
             return Err(AppError::DatabaseError(e));
         }
 
-        begin_copy_catalogue(database.as_ref(), c, block_size, is_source_reserved).await?;
+        begin_copy_catalogue(&database, c, block_size, is_source_reserved).await?;
 
         let batch_size = consumer_config.db_config.batch_size as usize;
 
@@ -750,7 +754,8 @@ impl SyncOrchestrator {
         let walkdir_iter = dir_walker::walkdir(scan_config).await?;
 
         // ── 4. 消费者管理器 + 共享生命周期（跨 Phase A/B 共用同一份统计累积） ──
-        let mut consumer_manager = ConsumerManager::new(consumer_config.as_ref()).await?;
+        let mut consumer_manager =
+            ConsumerManager::with_database(consumer_config.as_ref(), Some(database.clone())).await?;
         consumer_manager.begin_lifecycle().await;
         let bytes_tracker = consumer_manager.get_bytes_tracker().await;
 
@@ -762,7 +767,8 @@ impl SyncOrchestrator {
         // scan workers → detect_broadcaster → dispatch_task → async_channel(MPMC) → N handler workers → broadcaster
         let mut detect_broadcaster = BroadcastForwarder::<StorageEntryMessage>::new(DEFAULT_CHANNEL_CAPACITY);
         let mut file_op_rx = detect_broadcaster.subscribe();
-        let (work_tx, work_rx) = async_channel::bounded::<StorageEntryMessage>(DEFAULT_CHANNEL_CAPACITY);
+        let (work_queues, handler_inputs) =
+            CopyQueues::new(copy_concurrency, DEFAULT_CHANNEL_CAPACITY / copy_concurrency.max(1));
 
         // ── 6. 并发度 + block_size ──
         let incremental_scan_concurrency = c.concurrency.unwrap_or(app_config.scan.concurrency);
@@ -775,8 +781,8 @@ impl SyncOrchestrator {
         // ── 7. Windows 管理员权限检查 ──
         #[cfg(windows)]
         {
-            if matches!(detect_storage_type(&c.src_path), StorageType::Local)
-                && matches!(detect_storage_type(&c.dest_path), StorageType::Local)
+            if matches!(backend_kind_from_location(&c.src_path), BackendKind::Local)
+                && matches!(backend_kind_from_location(&c.dest_path), BackendKind::Local)
             {
                 match check_admin_privileges() {
                     Ok(true) => println!("✓ Running with administrator privileges\n"),
@@ -791,14 +797,13 @@ impl SyncOrchestrator {
 
         // ── 8. QoS + 版本化对象缓冲 ──
         let qos_manager = create_qos_manager(c.qos.as_ref(), c.peak_qos_rate, c.iops);
-        let object_buffers: Arc<DashMap<String, Vec<Arc<EntryEnum>>>> = Arc::new(DashMap::new());
 
         // ── 10. 启动 dispatch task：detect_broadcaster → async_channel（MPMC） ──
         let dispatch_span = info_span!("inc_dispatch");
         let dispatch_handle: JoinHandle<Result<()>> = tokio::spawn(
             async move {
                 while let Some(msg) = file_op_rx.recv().await {
-                    if work_tx.send(msg).await.is_err() {
+                    if work_queues.send(msg).await.is_err() {
                         return Err(AppError::ConsumerError(
                             "Incremental sync handler channel closed".into(),
                         ));
@@ -821,12 +826,10 @@ impl SyncOrchestrator {
         let src_path_str = c.src_path.clone();
         let dest_path_str = c.dest_path.clone();
 
-        for handler_id in 0..copy_concurrency {
-            let rx = work_rx.clone();
+        for (handler_id, rx) in handler_inputs.into_iter().enumerate() {
             let src_path_c = src_path_str.clone();
             let dest_path_c = dest_path_str.clone();
             let bc = broadcaster.clone();
-            let ob = object_buffers.clone();
             let qos = qos_manager.clone();
             let bt = bytes_tracker.clone();
             let enable_integrity_check = c.enable_integrity_check;
@@ -869,7 +872,7 @@ impl SyncOrchestrator {
                     let dest = storage_pair.get_dest_storage().clone();
 
                     let mut failure: Option<AppError> = None;
-                    while let Ok(message) = rx.recv().await {
+                    while let Some(message) = rx.next().await {
                         match message {
                             StorageEntryMessage::New(ref entry) => {
                                 if entry.get_version_id().is_some() {
@@ -879,12 +882,12 @@ impl SyncOrchestrator {
                                         dest.clone(),
                                         bc.clone(),
                                         qos.clone(),
-                                        ob.clone(),
                                         enable_integrity_check,
                                         enable_acl,
                                         is_source_reserved,
                                         bt.clone(),
                                         resume_opts.clone(),
+                                        EntryChange::New,
                                     )
                                     .await
                                     {
@@ -892,7 +895,7 @@ impl SyncOrchestrator {
                                     }
                                 } else {
                                     match process_entry(
-                                        entry,
+                                        &entry.entry,
                                         src.clone(),
                                         dest.clone(),
                                         enable_integrity_check,
@@ -916,7 +919,7 @@ impl SyncOrchestrator {
                                             bc.broadcast(StorageEntryMessage::Error {
                                                 event: ErrorEvent::Copy,
                                                 path: entry.get_relative_path().to_path_buf(),
-                                                entry: Some(entry.clone()),
+                                                entry: Some(Arc::clone(&entry.entry)),
                                                 reason: format!("{e}"),
                                             })
                                             .await;
@@ -927,9 +930,28 @@ impl SyncOrchestrator {
                             }
                             StorageEntryMessage::Changed { ref entry, kind } => {
                                 // MetadataOnly：chmod/chown 变更，跳过 copy_file 只同步属性
-                                let result = if kind == ChangeKind::MetadataOnly {
-                                    process_metadata_only_entry(
+                                let result = if entry.entry.history().is_some() {
+                                    process_versioned_entry(
                                         entry,
+                                        src.clone(),
+                                        dest.clone(),
+                                        bc.clone(),
+                                        qos.clone(),
+                                        enable_integrity_check,
+                                        enable_acl,
+                                        is_source_reserved,
+                                        bt.clone(),
+                                        resume_opts.clone(),
+                                        EntryChange::Changed(kind),
+                                    )
+                                    .await
+                                } else if kind == ChangeKind::DirectoryMarkerRemoved {
+                                    copy_namespace::remove_directory_marker(dest.storage(), &entry.entry)
+                                        .await
+                                        .map_err(AppError::from)
+                                } else if kind == ChangeKind::MetadataOnly {
+                                    process_metadata_only_entry(
+                                        &entry.entry,
                                         src.clone(),
                                         dest.clone(),
                                         enable_acl,
@@ -939,7 +961,7 @@ impl SyncOrchestrator {
                                     .await
                                 } else {
                                     process_entry(
-                                        entry,
+                                        &entry.entry,
                                         src.clone(),
                                         dest.clone(),
                                         enable_integrity_check,
@@ -953,6 +975,7 @@ impl SyncOrchestrator {
                                     .await
                                 };
                                 match result {
+                                    Ok(()) if entry.entry.history().is_some() => {}
                                     Ok(()) => bc.broadcast(message.clone()).await,
                                     Err(e) => {
                                         error!(
@@ -965,7 +988,7 @@ impl SyncOrchestrator {
                                         bc.broadcast(StorageEntryMessage::Error {
                                             event: ErrorEvent::Copy,
                                             path: entry.get_relative_path().to_path_buf(),
-                                            entry: Some(entry.clone()),
+                                            entry: Some(Arc::clone(&entry.entry)),
                                             reason: format!("{e}"),
                                         })
                                         .await;
@@ -977,10 +1000,10 @@ impl SyncOrchestrator {
                                 // 删除操作幂等化：NotFound 视为成功
                                 let result = if entry.get_is_dir() {
                                     trace!("Deleting directory: {:?}", entry.get_relative_path());
-                                    dest.delete_dir_all(entry).await
+                                    deletion::delete_dir_all(dest.storage(), entry).await
                                 } else {
                                     trace!("Deleting file: {:?}", entry.get_relative_path());
-                                    dest.delete_file(entry).await
+                                    copy_namespace::delete_file(dest.storage(), entry).await
                                 };
                                 match result {
                                     Ok(()) => bc.broadcast(message.clone()).await,
@@ -1056,7 +1079,7 @@ impl SyncOrchestrator {
                                 {
                                     Ok((tar_entry, manifest)) => {
                                         let tar_path = tar_entry.get_relative_path().to_string_lossy().to_string();
-                                        bc.broadcast(StorageEntryMessage::New(Arc::new(tar_entry))).await;
+                                        bc.broadcast(StorageEntryMessage::New(Arc::new(tar_entry).into())).await;
                                         bc.broadcast(StorageEntryMessage::TarManifest {
                                             tar_path,
                                             entries: manifest,
@@ -1098,7 +1121,6 @@ impl SyncOrchestrator {
             handler_handles.push(handle);
         }
         // drop work_rx 本体（只有 clone 在 worker 手里）
-        drop(work_rx);
 
         // ── 11.5. 等待所有 handler worker 完成 mount 初始化，输出存活汇总 ──
         wait_for_mount_init(&[(&mount_done_handlers, &alive_handlers, "Handler")], copy_concurrency).await;
@@ -1107,8 +1129,12 @@ impl SyncOrchestrator {
         let database_clone = database.clone();
         let mut scan_worker_handles = Vec::new();
 
-        for worker_id in 0..incremental_scan_concurrency {
-            let worker_walkdir_iter = walkdir_iter.clone();
+        let (scan_inputs, scan_dispatch) = partition_scan(
+            walkdir_iter.clone(),
+            incremental_scan_concurrency,
+            DEFAULT_CHANNEL_CAPACITY / incremental_scan_concurrency.max(1),
+        );
+        for (worker_id, worker_walkdir_iter) in scan_inputs.into_iter().enumerate() {
             let database_clone = database_clone.clone();
             let detect_broadcaster = detect_broadcaster.clone();
             let broadcaster = broadcaster.clone();
@@ -1181,6 +1207,7 @@ impl SyncOrchestrator {
         // ── 14. 等待 scan workers 完成 ──
         let scan_result = finish_phase(scan_worker_handles).await;
         walkdir_iter.close();
+        let scan_dispatch_result = finish_phase(vec![scan_dispatch]).await;
 
         // ── 15. 关闭 detect_broadcaster → dispatch task 的 file_op_rx 耗尽 ──
         // scan workers 已全部退出，其 detect_broadcaster clone 均已 drop；
@@ -1203,19 +1230,12 @@ impl SyncOrchestrator {
         let durable_result = finish_phase(consumer_handles).await;
         let enumeration_result = walkdir_iter.take_error().map_or(Ok(()), |error| Err(error.into()));
         // 未完整比对或未持久化的条目不能作为删除依据。
-        let history_result = if object_buffers.is_empty() {
-            Ok(())
-        } else {
-            Err(AppError::CopyError(
-                "Incomplete object history; refusing deletion phase".into(),
-            ))
-        };
         let phase_a = enumeration_result
             .and(scan_result)
             .and(handler_result)
             .and(durable_result)
             .and(dispatch_result)
-            .and(history_result);
+            .and(scan_dispatch_result);
         if let Err(error) = phase_a {
             if let Some(ref qos_mgr) = qos_manager {
                 qos_mgr.shutdown();
@@ -1233,7 +1253,7 @@ impl SyncOrchestrator {
         let phase_b_handles = consumer_manager.start_consumers(&mut broadcaster_b).await?;
 
         // dest storage 提升到 async 块外，供后续 update_directory_metadata 复用，避免二次挂载
-        let phase_b_dest_storage: Result<Arc<StorageEnum>> = async {
+        let phase_b_dest_storage: Result<Arc<StorageContext>> = async {
             let dest_storage_phase_b = Arc::new(
                 create_storage_for_role(
                     &c.dest_path,
@@ -1248,7 +1268,7 @@ impl SyncOrchestrator {
             );
 
             Self::apply_deletions_and_renames(
-                database.as_ref(),
+                &database,
                 src_storage_phase_b.clone(),
                 dest_storage_phase_b.clone(),
                 is_source_reserved,
@@ -1294,7 +1314,7 @@ impl SyncOrchestrator {
         Ok(())
     }
 
-    /// 双进程全量同步 — Sender 侧：`walkdir_2` 分页 → QUIC → Receiver 比较 + 写入
+    /// 双进程全量同步 — Sender 侧：`directory_pages` 分页 → QUIC → Receiver 比较 + 写入
     async fn run_sync_remote(
         &self, remote_addr: &str, tls_cert_bytes: Option<&[u8]>, auth_token: Option<&str>,
     ) -> Result<()> {
@@ -1341,13 +1361,13 @@ impl SyncOrchestrator {
     /// rename 后的内容与元数据必须完成，才能确认该条目的新状态。
     #[allow(clippy::too_many_arguments)]
     async fn sync_renamed_file_changes(
-        kind: ChangeKind, entry: &EntryEnum, src: &StorageEnum, dest: &StorageEnum, qos: Option<QosManager>,
-        integrity: bool, source_reserved: bool, bytes: Option<Arc<AtomicU64>>, job_id: &str, job_dir: &str,
-        transfer_mode: TransferMode,
+        kind: ChangeKind, entry: &Arc<ObservedEntry>, src: &StorageContext, dest: &StorageContext,
+        qos: Option<QosManager>, integrity: bool, source_reserved: bool, bytes: Option<Arc<AtomicU64>>, job_id: &str,
+        job_dir: &str, transfer_mode: TransferMode,
     ) -> Result<()> {
         let mut metadata_applied = false;
         if kind != ChangeKind::MetadataOnly {
-            let hdfs = if matches!(dest, StorageEnum::HDFS(_)) {
+            let hdfs = if dest.storage().kind() == BackendKind::Hdfs {
                 Some(HdfsCopyContext::from_job(job_id, transfer_mode)?)
             } else {
                 None
@@ -1366,7 +1386,7 @@ impl SyncOrchestrator {
                 src,
                 dest,
                 entry,
-                storage_adapter::CopyOptions {
+                crate::file_copy::CopyOptions {
                     transfer_mode,
                     qos,
                     enable_integrity_check: integrity,
@@ -1377,17 +1397,15 @@ impl SyncOrchestrator {
                 hdfs.as_ref(),
             )
             .await;
-            let metadata = if let Some(recorder) = recorder {
-                let metadata = result.as_ref().ok().copied();
-                recorder.finish(result.map(|_| ())).await?;
-                metadata.unwrap_or(MetadataApplication::DataMover)
+            if let Some(recorder) = recorder {
+                recorder.finish(result).await?;
             } else {
-                result?
-            };
-            metadata_applied = matches!(metadata, MetadataApplication::DataMover);
+                result?;
+            }
+            metadata_applied = true;
         }
         if !metadata_applied {
-            dest.set_entry_metadata(entry).await?;
+            copy_metadata::set_entry_metadata(dest.storage(), entry).await?;
         }
         Ok(())
     }
@@ -1412,8 +1430,8 @@ impl SyncOrchestrator {
     /// 或元数据更新（处理「rename + data/metadata changed」复合场景）。
     #[allow(clippy::too_many_arguments)]
     async fn apply_deletions_and_renames(
-        db: &dyn Database, src_storage: Arc<StorageEnum>, dest_storage: Arc<StorageEnum>, is_source_reserved: bool,
-        broadcaster: &BroadcastForwarder<StorageEntryMessage>, enable_integrity_check: bool,
+        db: &ClickHouseDatabase, src_storage: Arc<StorageContext>, dest_storage: Arc<StorageContext>,
+        is_source_reserved: bool, broadcaster: &BroadcastForwarder<StorageEntryMessage>, enable_integrity_check: bool,
         qos_manager: Option<QosManager>, bytes_counter: Option<Arc<AtomicU64>>, job_id: &str, job_dir: &str,
         transfer_mode: TransferMode,
     ) -> Result<()> {
@@ -1446,9 +1464,9 @@ impl SyncOrchestrator {
                 DeletionStatus::Deleted(entry) => {
                     let entry_arc = Arc::new(entry);
                     let result = if entry_arc.get_is_dir() {
-                        dest_storage.delete_dir_all(&entry_arc).await
+                        deletion::delete_dir_all(dest_storage.storage(), &entry_arc).await
                     } else {
-                        dest_storage.delete_file(&entry_arc).await
+                        copy_namespace::delete_file(dest_storage.storage(), &entry_arc).await
                     };
                     match result {
                         Ok(()) => {
@@ -1535,14 +1553,14 @@ impl SyncOrchestrator {
                                 }
                                 broadcaster
                                     .broadcast(StorageEntryMessage::Changed {
-                                        entry: to_arc.clone(),
+                                        entry: to_arc.clone().into(),
                                         kind,
                                     })
                                     .await;
                             }
 
                             if !is_source_reserved {
-                                if let Err(error) = src_storage.delete_file(&to_arc).await
+                                if let Err(error) = copy_namespace::delete_file(src_storage.storage(), &to_arc).await
                                     && !error.is_not_found()
                                 {
                                     broadcaster

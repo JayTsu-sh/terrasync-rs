@@ -2,21 +2,18 @@
 
 ## 完整数据流
 
+```text
+CLI / Web → app 任务契约与编排
+  ├→ data-mover typed roles → 各 backend
+  ├→ 原生 Arc<ObservedEntry> + 逐版本索引 → task-model 任务事件
+  ├→ transport InProcess / QUIC → 接收端任务
+  ├→ sync-delta → 块级匹配与重建
+  └→ ConsumerManager
+       ├→ DatabaseConsumer → db ClickHouse catalogue / scan
+       └→ StatisticConsumer → 统计与任务通知
 ```
-CLI args
-  └→ cli::cli_match()
-       └→ app::scan / app::sync / app::ace / app::integrity_check
-            └→ app::dir_walker
-                 └→ data_mover::StorageEnum  (枚举 dispatch: Local / NFS / S3 / CIFS)
-                      └→ NASEntry / S3Entry  (各协议 entry 类型)
-            └→ transport::InProcess / QUIC
-                 └→ app::receiver (双进程模式下的接收方)
-            └→ sync-delta  (增量同步时的 chunk 级匹配)
-            └→ app::consumer::ConsumerManager
-                 ├→ DatabaseConsumer  → db::Database (ClickHouse / DuckDB)
-                 ├→ StatisticConsumer (内存统计，进度广播)
-                 └→ KafkaConsumer     → kafka crate (分布式模式)
-```
+
+`db`、`transport` 只共享纯任务契约，不依赖 `storage-adapter`。后者仍在逐项迁出产品策略和通用机制，尚未完成删除；职责目标与实测状态分别见 [重构方案](../../docs/specs/2026-11-05-db-native-refactor-design.md) 和 [验证记录](../../docs/specs/2026-11-06-native-observation-validation.md)。
 
 ## 统一扫描入口与检查点状态机
 
@@ -26,7 +23,7 @@ CLI 和 GUI 调用同一 `scan(ScanRequest)`。启用 ClickHouse 时首次全量
 
 `[database.clickhouse] mode = "single" | "cluster"` 是唯一部署选择；集群模式还必须提供 `cluster` 名称，单机模式不接受非空集群名。默认批量 100,000。Web 设置使用同一配置类型并在保存前校验；旧 SQLite 配置在启动迁移时一次性记录模式，现有 TOML 集群配置须显式补上 `mode = "cluster"`。
 
-扫描与复制／同步均支持两种部署。数据库层负责集群复制存储表及 Distributed 表、quorum 读写、DDL 和快照发布；业务层保持同一数据库接口。集群复制／同步目录按作业建立成对表，同一作业路由到同一 shard；扫描继续使用共享表按 job_id 隔离。集群快照发布交换物理表并使用独立 Keeper 路径，避免后续轮次复用已发布副本路径。
+扫描与复制／同步均支持两种部署。数据库层负责集群复制存储表及 Distributed 表、quorum 读写、DDL 和快照发布；业务层保持同一数据库接口。集群复制／同步目录按作业建立成对表，同一作业路由到同一 shard；扫描继续使用共享表按 job_id 隔离。扫描 checkpoint 保留不可变成对快照，集群快照使用独立 Keeper 路径；复制轮次按已确认的版本事实推进，未使用已删除的 EXCHANGE 目录原型。
 
 ```
 已有未完成轮次（RUNNING / FINALIZING）
@@ -52,17 +49,17 @@ CLI 和 GUI 调用同一 `scan(ScanRequest)`。启用 ClickHouse 时首次全量
 
 扫描统一消费原生观察及 `DirectoryStatistics`，不落库扫描也使用该输入。data-mover 只返回每次目录列举的直属孩子绝对统计，不决定产品计数的持久化。`scan::statistics` 定义公共快照：scanned、filtered、retained、failed、vanished 按目录、普通文件、软链接、四类特殊文件和 unknown 分类；S3 key 只计一次，历史版本及删除标记另计。排除且不下钻的剪枝目录及子树不进入这些 entry 数，也不为统计补扫。能力声明随报告返回，unsupported/not_applicable 与实际零值分开。大小未知单独计数，逻辑文件字节不混入目录和链接元数据大小。
 
-`EntryStatistics` 的各实现显式提供普通文件判断：原生 `ObservedView` 使用 typed kind，数据库记录读取持久化标记。公共统计的 `other_entry_count` 保存其余类型，完整扫描和增量变化总数均包含它们；特殊文件的细分类别由扫描快照提供。数据库事件汇总保留全部条目，并明确返回普通文件标记，最终化事件和恢复后的统计校准使用同一分类规则。数据模型与接口按 [开发规范](../../docs/development.md) 中的首次开发阶段约定维护。
+`EntryStatistics` 由纯任务契约定义，`ObservedView` 借用原生观察和选中版本并使用 typed kind；数据库只在 SQL 边界生成私有行投影。公共统计的 `other_entry_count` 保存其余类型，完整扫描和增量变化总数均包含它们；特殊文件的细分类别由扫描快照提供。数据库事件汇总保留全部条目，并明确返回普通文件标记，最终化事件和恢复后的统计校准使用同一分类规则。数据模型与接口按 [开发规范](../../docs/development.md) 中的首次开发阶段约定维护。
 
 扫描是否可续扫由首次运行的 `--resume` 或 GUI `scan_resume` 明确选择；不由启用数据库自动推断。可续扫使用 Blocks，普通扫描使用 Unordered。Blocks 的 periodic/final checkpoint 都只出现在完整目录块边界；平铺大目录即使超过60秒也不推进检查点。已经交付但未被 checkpoint 确认的完整块与部分块同属未确认尾部，恢复时一并回退，不按已看到的 Complete 事件自行推进。data-mover 在旧 attempt 结束后有序发出 `Resumed`，携带实际选择的 opaque checkpoint；TerraSync 校验其与已确认统计一致，只回退扫描计数及可重放事件计数，异常累计、当前恢复状态、诊断发件箱及 ACK 不回退。Unordered 的闪断恢复从根重新扫描，先清本 attempt 的扫描贡献。
 
 `scan::progress` 只保存完成前缀和活跃目录的实际贡献：Blocks 至多一个活跃目录，Unordered 受 SDK 的并发窗口约束。没有逐条或逐目录历史账本，也不使用 SQLite、本地文件或其它本地磁盘暂存。完整统计及游标由 ClickHouse manifest 持久化。目录剪枝不补扫，不计入 scanned/filtered/retained。
 
-数据库层 `scan_store::cuts` 管理不可变的 base/events 成对快照。开轮前先保留原基线；writer 屏障确认后封存新 cut，最后保存引用该 cut 的统计与源游标。恢复先排空旧执行的服务端查询、DDL/mutation，再读取 manifest、同步两份快照并重建 working。单机使用作业表；集群仅处理当前 job 的分区，快照使用独立 Keeper 路径，Distributed 前端仍按 job 路由。两表恢复期间禁止公开元数据访问，任一步崩溃均从同一 cut 重试；空快照可清除尾部，缺失快照明确拒绝恢复。最终化先持久化 sealed cut，再提交 generation；重启先判定提交结果，不撤回已经发布的结果。只有新 manifest 确认后才清理未引用快照。
+数据库层 `scan::checkpoint` 管理不可变的 base/events 成对快照。开轮前先保留原基线；writer 屏障确认后封存新 cut，最后保存引用该 cut 的统计与源游标。恢复先排空旧执行的服务端查询、DDL/mutation，再读取 manifest、同步两份快照并重建 working。单机使用作业表；集群仅处理当前 job 的分区，快照使用独立 Keeper 路径，Distributed 前端仍按 job 路由。两表恢复期间禁止公开元数据访问，任一步崩溃均从同一 cut 重试；空快照可清除尾部，缺失快照明确拒绝恢复。最终化先持久化 sealed cut，再提交 generation；重启先判定提交结果，不撤回已经发布的结果。只有新 manifest 确认后才清理未引用快照。
 
 全量扫描的最终统计只读，复用源末 FINALIZING 已确认的 cut，仅更新统计 manifest；恢复 FINALIZING 也不重新枚举源。增量最终化会写事件、删除旧事实，须封存最终化后的新 cut。是否需要新快照取决于事实是否变化，不因统计报告更新而重复克隆相同元数据。
 
-扫描和复制共用 `job_execution` 的进程内作业注册和 job_dir 文件锁；普通数据库工厂拒绝读取活动扫描的 working 元数据。跨 Pod 同一数据库作业仍要求由任务协调器保证只运行一个执行；文件锁不是分布式租约。
+扫描和复制共用 `job_execution` 的进程内作业注册和 job_dir 文件锁；ClickHouse 连接入口拒绝读取活动扫描的 working 元数据。跨 Pod 同一数据库作业仍要求由任务协调器保证只运行一个执行；文件锁不是分布式租约。
 
 最终性能验收按是否启用续扫匹配同源、同选项的基线：未启用续扫对 Unordered 不落库，启用续扫对 Blocks 不落库。两组内全量净吞吐损失不超过5%，增量不超过10%；不混用遍历顺序基线。整理、快照、最终化及清理的应用耗时均计入净运行耗时；续扫总耗时另列回退量和重扫成本，不对任意中断位置承诺固定比例的总耗时损失。
 
@@ -96,7 +93,7 @@ Web 接收端先验证 execution 归属，再在同一 SQLite 事务内去重事
 | DB 写入 | `batch_insert` | 循环逐条 insert |
 | 限速 | `QosManager` (TokenBucket) | `tokio::time::sleep` 粗粒度 |
 | channel 背压 | `bounded()` 自然限流 | unbounded channel |
-| 存储层 | `StorageEnum` 枚举 dispatch | `Box<dyn Storage>` |
+| 存储层 | data-mover typed roles，共享原生观察 | 产品层重复 backend 枚举与条目模型 |
 | 热路径字符串 | `write!(&mut buf, ...)` + `buf.clear()` | `format!` / `to_string()` |
 | 集合初始化 | `Vec::with_capacity(n)` | 空 Vec + 循环 push |
 | 字符串 Key Map | `SmolStr` + `FxHashMap` | `HashMap<String, V>` 热路径 |
@@ -104,10 +101,10 @@ Web 接收端先验证 execution 归属，再在同一 SQLite 事务内去重事
 
 ## 设计决策
 
-**为什么用 StorageEnum 而非 Box\<dyn Storage\>**  
-枚举 dispatch 零虚表开销，编译期可知所有变体，便于穷举匹配和特化优化。热路径（dir_walker 每次迭代都调用）收益显著。
+**为什么共享原生观察并借用版本**
+不可变 `ObservedEntry` 由 `Arc` 共享，逐版本事件仅携带索引。调用方借用版本事实，避免复制整个历史；SQL／wire 在实际需要拥有编码字节的边界生成有界批次。存储协议与恢复机制通过 data-mover roles 使用。
 
-**为什么 transport 有 InProcess 和 QUIC 两种**  
+**为什么 transport 有 InProcess 和 QUIC 两种**
 单机场景用 InProcess（零拷贝 channel），跨机场景用 QUIC（低延迟 UDP 传输）。两者实现同一个消息协议（`SenderMsg` / `ReceiverMsg`），上层透明。
 
 **为什么按持久化轮次区分全量、增量和续扫**

@@ -1,5 +1,7 @@
 //! 确认检查点时，有界预读后续遍历项；交付仍保持原始检查点顺序。
+use crate::error::StorageError;
 use crate::error::{AppError, Result};
+use crate::scan::source::{ResumableScan, ResumableScanItem};
 use data_mover::traversal::{ScanFailureSignal, TraversalOutcome};
 use std::{
     future::{Future, poll_fn},
@@ -9,7 +11,6 @@ use std::{
     time::Duration,
     vec::IntoIter,
 };
-use storage_adapter::{ResumableScan, ResumableScanItem, StorageError};
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::{
     select,
@@ -298,6 +299,7 @@ mod tests {
         ScanFailureSignal::source(storage.storage(), None).unwrap().1
     }
 
+    use crate::scan::source::{ScanSourceMode, WalkOptions};
     use crate::storage_factory::{StorageRole, create_storage_for_role};
     use data_mover::model::{
         BackendIdentity, BackendKind, EntryKind, IdentityStrength, ObservedEntry, SourceIdentity, StoragePath,
@@ -307,7 +309,6 @@ mod tests {
         Arc,
         atomic::{AtomicBool, Ordering},
     };
-    use storage_adapter::{ScanSourceMode, WalkOptions};
     use tokio::{
         sync::{Notify, oneshot},
         time::{Duration, sleep, timeout},

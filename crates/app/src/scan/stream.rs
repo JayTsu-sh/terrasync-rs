@@ -1,6 +1,10 @@
 //! 不落库扫描的轻量通道；与持久化通道共享取消及故障域。
 #[cfg(test)]
 use crate::broadcast::BroadcastForwarder;
+use crate::error::StorageError;
+#[cfg(test)]
+use crate::scan::source::WalkDirAsyncIterator;
+use crate::scan::source::{ResumableScan, ResumableScanItem, ScanSourceMode, WalkOptions};
 use crate::{
     config::{JobType, initialize_consumer_config},
     consumer::{ConsumerManager, ScanStatistics},
@@ -8,16 +12,14 @@ use crate::{
     scan::{ScanRequest, cancellation::ScanCancellation, progress::ScanProgress},
     storage_factory::{StorageRole, create_storage_for_role},
 };
+use data_mover::filter::parse_filter_expression;
 use data_mover::{
     model::ObservedEntry,
     traversal::{TraversalOrder, TraversalOutcome},
 };
 use std::{num::NonZeroUsize, sync::Arc, time::Duration};
-use storage_adapter::{
-    ResumableScan, ResumableScanItem, ScanSourceMode, StorageError, WalkOptions, filter::parse_filter_expression,
-};
 #[cfg(test)]
-use storage_adapter::{StorageEntryMessage, WalkDirAsyncIterator};
+use task_model::StorageEntryMessage;
 #[cfg(test)]
 use tokio::task::JoinHandle;
 use tokio::time::{MissedTickBehavior, interval};
@@ -183,12 +185,13 @@ async fn finish_consumers(handles: Vec<JoinHandle<Result<()>>>, cancel: &ScanCan
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::task_stream::AsyncReceiver;
     use std::future::pending;
     use std::io::{Error as IoError, ErrorKind};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Duration;
-    use storage_adapter::{AsyncReceiver, ErrorEvent};
+    use task_model::ErrorEvent;
     use tokio::time::{sleep, timeout};
     use tokio_util::sync::CancellationToken;
 

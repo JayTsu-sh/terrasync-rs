@@ -13,7 +13,7 @@ use app::scan::ScanRequest;
 use std::fs;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use storage_adapter::TransferMode;
+use task_model::TransferMode;
 use tokio::signal::ctrl_c;
 use tokio_util::sync::CancellationToken;
 
@@ -22,7 +22,7 @@ use app::config::SyncJobConfig;
 use app::orchestrator::SyncOrchestrator;
 use app::prelude::{integrity_check, parse_bandwidth_string, rm, scan, sync};
 use app::storage_factory::{StorageRole, create_storage_for_role};
-use storage_adapter::redact_storage_url;
+use data_mover::redact_storage_url;
 use tracing::info;
 use transport::quic;
 use utils::app_config::AppConfig;
@@ -50,7 +50,7 @@ pub fn validate_qos_format(s: &str) -> Result<String> {
 }
 
 /// 校验并 trim 存储路径（本地 / nfs:// / smb:// / hdfs:// / s3:// / s3+https://）
-/// 参考 `storage_adapter::storage_enum` 和 `data_mover::storage::config::s3` 中的协议解析逻辑
+/// 位置分类由 app 的存储工厂负责；协议 URL 的解析由 data-mover backend 负责
 pub fn validate_storage_path(s: &str) -> Result<String> {
     let s = s.trim();
     if s.is_empty() {
@@ -326,7 +326,7 @@ pub async fn ace_copy_cmd(
 
 /// 处理删除命令
 pub async fn rm_cmd(path: &str) -> Result<()> {
-    info!("执行删除命令，路径: {}", path);
+    info!("执行删除命令，路径: {}", redact_storage_url(path));
 
     rm(path).await?;
 
@@ -383,7 +383,7 @@ pub async fn serve_cmd(listen: &str, dest_path: &str, tls_cert_out: &str, token:
         .parse()
         .map_err(|e| CliError::InvalidParameter(format!("Invalid listen address: {e}")))?;
 
-    // 3. 创建目标端 StorageEnum
+    // 3. 创建目标端 StorageContext
     let dest_storage = Arc::new(create_storage_for_role(dest_path, None, true, StorageRole::Destination).await?);
     info!("Created destination storage for: {}", redact_storage_url(dest_path));
 

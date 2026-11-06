@@ -1,6 +1,8 @@
 // 集成测试代码：豁免 unwrap/expect deny
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+#[path = "../../../tests/support/observed.rs"]
+mod observed_fixtures;
 #[cfg(test)]
 mod clickhouse_integration_tests {
     // 标准库
@@ -15,14 +17,16 @@ mod clickhouse_integration_tests {
     use clickhouse::error::Error as ClickHouseError;
     // 内部模块
     use data_mover::model::{
-        BackendIdentity, BackendKind, EntryKind, IdentityStrength, ObservedEntry, SourceIdentity, StoragePath,
+        BackendIdentity, BackendKind, EntryKind, HistoryOrder, IdentityStrength, ObjectHistory, ObservedEntry,
+        SourceIdentity, StoragePath,
     };
-    use db::clickhouse::ClickHouseDatabase;
-    use db::clickhouse::scan_resume::ScanResumeState;
-    use db::scan_store::{ScanFinalEvent, ScanStore};
-    use db::{ClickHouseConfig, Database, DatabaseError, DeletionStatus, ObservedEntryRecord};
-    use storage_adapter::observed_scan::{ObservedItem, ObservedScanEvent};
-    use storage_adapter::{EntryEnum, NASEntry, S3Entry};
+    use db::catalogue::ClickHouseDatabase;
+    use db::scan::ScanResumeState;
+    use db::scan::{ScanFinalEvent, ScanStore};
+    use db::{ClickHouseConfig, DatabaseError, DeletionStatus};
+    use task_model::observation::{ObservedItem, ObservedScanEvent};
+    use task_model::{ChangeKind, ObservedEntryExt};
+    use tokio::sync::mpsc;
 
     // 使用原子计数器确保每个测试用例都有唯一的job_id
     static TEST_COUNTER: AtomicUsize = AtomicUsize::new(0);
@@ -74,6 +78,24 @@ mod clickhouse_integration_tests {
             client = client.with_password(password);
         }
         client
+    }
+
+    async fn table_names(config: &ClickHouseConfig) -> Vec<String> {
+        clickhouse_client(config)
+            .query("SELECT name FROM system.tables WHERE database=currentDatabase() ORDER BY name")
+            .fetch_all::<String>()
+            .await
+            .unwrap()
+    }
+
+    async fn created_table_name(config: &ClickHouseConfig, before: &[String]) -> String {
+        let mut added: Vec<_> = table_names(config)
+            .await
+            .into_iter()
+            .filter(|name| !before.contains(name))
+            .collect();
+        assert_eq!(added.len(), 1, "one owned staging table must be created");
+        added.pop().unwrap()
     }
 
     struct IsolatedDatabase {
@@ -155,53 +177,51 @@ mod clickhouse_integration_tests {
         Ok(())
     }
 
-    /// 构造 NASEntry 的 EntryEnum，只需指定差异字段
-    fn make_nas(rel_path: &str, size: u64, mtime: i64, fh: Option<&[u8]>) -> EntryEnum {
-        EntryEnum::NAS(NASEntry {
-            name: rel_path.rsplit('/').next().unwrap_or(rel_path).to_string(),
-            relative_path: PathBuf::from(rel_path),
-            extension: None,
-            is_dir: false,
-            size,
-            atime: mtime,
-            ctime: mtime,
-            mtime,
-            mode: Some(0o644),
-            is_symlink: false,
-            hard_links: Some(1),
-            uid: Some(1000),
-            gid: Some(1000),
-            ino: Some(12345),
-            file_handle: fh.map(Bytes::copy_from_slice),
-            acl: None,
-            owner: None,
-            owner_group: None,
-            xattrs: None,
-        })
+    /// 构造 NASEntry 的 ObservedEntry，只需指定差异字段
+    fn make_nas(rel_path: &str, size: u64, mtime: i64, fh: Option<&[u8]>) -> ObservedEntry {
+        {
+            let fixture_path: std::path::PathBuf = PathBuf::from(rel_path);
+            crate::observed_fixtures::observation(
+                data_mover::model::BackendKind::Nfs,
+                fixture_path,
+                data_mover::model::EntryKind::File,
+                size,
+                [mtime, mtime, mtime],
+                Some(data_mover::model::OwnershipMode {
+                    mode: 0o644,
+                    uid: 1000,
+                    gid: 1000,
+                }),
+                (fh.map(Bytes::copy_from_slice)).map(|handle| handle.to_vec()),
+                None,
+                None,
+            )
+        }
     }
 
-    /// 构造 S3Entry 的 EntryEnum
-    fn make_s3(rel_path: &str, size: u64, mtime: i64, version_id: Option<&str>) -> EntryEnum {
-        EntryEnum::S3(S3Entry {
-            name: rel_path.rsplit('/').next().unwrap_or(rel_path).to_string(),
-            relative_path: rel_path.to_string(),
-            extension: None,
-            size,
-            mtime,
-            tags: None,
-            version_id: version_id.map(String::from),
-            is_latest: true,
-            is_delete_marker: false,
-            version_count: None,
-            is_dir: false,
-        })
+    /// 构造 S3Entry 的 ObservedEntry
+    fn make_s3(rel_path: &str, size: u64, mtime: i64, version_id: Option<&str>) -> ObservedEntry {
+        {
+            let fixture_path: std::path::PathBuf = (rel_path.to_string()).into();
+            crate::observed_fixtures::observation(
+                data_mover::model::BackendKind::S3,
+                fixture_path,
+                data_mover::model::EntryKind::File,
+                size,
+                [0, mtime, 0],
+                None,
+                None,
+                None,
+                Some((version_id.map(String::from), true, false)),
+            )
+        }
     }
 
     #[tokio::test]
     #[ignore = "requires a real ClickHouse service"]
     async fn scan_resume_persists_cursor_generation_and_idempotent_events() {
-        use db::clickhouse::scan_resume::{ABANDONED, FINALIZING, RUNNING, ScanResumeState};
-        use storage_adapter::StorageEntryMessage;
+        use db::scan::{ABANDONED, FINALIZING, RUNNING, ScanResumeState};
+        use task_model::StorageEntryMessage;
         let (database, config, job, cleanup) = setup_isolated_state_db("resume_state").await;
         database.initialize().await.unwrap();
         database
@@ -231,7 +251,7 @@ mod clickhouse_integration_tests {
         let loaded = database.load_resume_state().await.unwrap().unwrap();
         assert_eq!(loaded.checkpoint, state.checkpoint);
         assert!(!database.restore_resume_generation(&loaded).await.unwrap());
-        let event = StorageEntryMessage::New(Arc::new(make_nas("file", 3, 0, None)));
+        let event = StorageEntryMessage::New(Arc::new(make_nas("file", 3, 0, None)).into());
         database
             .write_resume_events(&[event.clone()], state.event_time)
             .await
@@ -247,8 +267,8 @@ mod clickhouse_integration_tests {
             .unwrap();
         assert_eq!(count, 1);
         let versions = [
-            StorageEntryMessage::New(Arc::new(make_s3("history-key", 1, 0, Some("v1")))),
-            StorageEntryMessage::New(Arc::new(make_s3("history-key", 2, 0, Some("v2")))),
+            StorageEntryMessage::New(Arc::new(make_s3("history-key", 1, 0, Some("v1"))).into()),
+            StorageEntryMessage::New(Arc::new(make_s3("history-key", 2, 0, Some("v2"))).into()),
         ];
         database.write_resume_events(&versions, state.event_time).await.unwrap();
         database
@@ -266,12 +286,9 @@ mod clickhouse_integration_tests {
         assert_eq!(version_count, 2, "S3 versions must not collapse or duplicate on replay");
         let large: Vec<_> = (0..600)
             .map(|index| {
-                StorageEntryMessage::New(Arc::new(make_nas(
-                    &format!("bulk_{index}_{}", "x".repeat(1024)),
-                    1,
-                    0,
-                    None,
-                )))
+                StorageEntryMessage::New(
+                    Arc::new(make_nas(&format!("bulk_{index}_{}", "x".repeat(1024)), 1, 0, None)).into(),
+                )
             })
             .collect();
         database.write_resume_events(&large, state.event_time).await.unwrap();
@@ -298,7 +315,7 @@ mod clickhouse_integration_tests {
                 _ => None,
             })
             .collect();
-        database.write_resume_base_records(&entries).await.unwrap();
+        database.batch_insert_completed_records(&entries).await.unwrap();
         let paths: Vec<_> = entries
             .iter()
             .map(|entry| entry.get_relative_path().to_string_lossy().into_owned())
@@ -352,7 +369,6 @@ mod clickhouse_integration_tests {
         store.initialize().await.unwrap();
         store.prepare_incremental().await.unwrap();
         store.load_resume_state().await.unwrap();
-        store.prepare_native_schema().await.unwrap();
         let generation = store.begin_scan_generation().await.unwrap();
         let state = ScanResumeState {
             id: 1,
@@ -393,7 +409,7 @@ mod clickhouse_integration_tests {
         let hash = clickhouse_client(&config)
             .query(&format!(
                 "SELECT metadata_hash FROM {} FINAL WHERE relative_path='added'",
-                db::base_table_name_for_job(&job)
+                format!("base_{}", utils::sanitize_job_id(&job))
             ))
             .fetch_one::<Option<String>>()
             .await
@@ -413,7 +429,7 @@ mod clickhouse_integration_tests {
         let hash = clickhouse_client(&config)
             .query(&format!(
                 "SELECT metadata_hash FROM {} FINAL WHERE relative_path='added'",
-                db::base_table_name_for_job(&job)
+                format!("base_{}", utils::sanitize_job_id(&job))
             ))
             .fetch_one::<Option<String>>()
             .await
@@ -425,7 +441,7 @@ mod clickhouse_integration_tests {
             .with_option("mutations_sync", "2")
             .query(&format!(
                 "ALTER TABLE {} DELETE WHERE relative_path='added'",
-                db::base_table_name_for_job(&job)
+                format!("base_{}", utils::sanitize_job_id(&job))
             ))
             .execute()
             .await
@@ -436,33 +452,34 @@ mod clickhouse_integration_tests {
 
     #[tokio::test]
     #[ignore = "requires lab ClickHouse"]
-    async fn native_single_candidate_cache_upgrades_existing_tables() {
+    async fn native_single_fresh_schema_includes_candidate_hash_on_all_tables() {
         let (_database, config, job, cleanup) = setup_isolated_state_db("cache_schema").await;
         let mut store = ScanStore::new(&config, &job).unwrap();
+        store.load_resume_state().await.unwrap();
         store.initialize().await.unwrap();
         store.prepare_incremental().await.unwrap();
         store.begin_resume_batch().await.unwrap();
         let client = clickhouse_client(&config);
-        let tables = client
-            .query("SELECT table FROM system.columns WHERE database=currentDatabase() AND name='metadata_hash'")
-            .fetch_all::<String>()
-            .await
-            .unwrap();
-        assert_eq!(tables.len(), 3);
-        for table in tables {
-            client
-                .query(&format!("ALTER TABLE {table} DROP COLUMN metadata_hash"))
-                .execute()
-                .await
-                .unwrap();
-        }
-        store.prepare_native_schema().await.unwrap();
         let count = client
             .query("SELECT count() FROM system.columns WHERE database=currentDatabase() AND name='metadata_hash'")
             .fetch_one::<u64>()
             .await
             .unwrap();
-        assert_eq!(count, 2);
+        assert_eq!(count, 3);
+        let definitions = client
+            .query("SELECT create_table_query FROM system.tables WHERE database=currentDatabase() AND engine IN ('MergeTree','ReplacingMergeTree')")
+            .fetch_all::<String>()
+            .await
+            .unwrap();
+        assert_eq!(definitions.len(), 5);
+        for definition in definitions {
+            assert!(
+                definition
+                    .replace(' ', "")
+                    .contains("non_replicated_deduplication_window=10000"),
+                "原生写入表必须由建表契约提供去重窗口: {definition}"
+            );
+        }
         cleanup.cleanup().await;
     }
 
@@ -595,7 +612,7 @@ mod clickhouse_integration_tests {
     }
 
     /// 批量生成 NASEntry（用于模拟大 base 表场景）
-    fn make_nas_batch(prefix: &str, count: usize, mtime: i64) -> Vec<Arc<EntryEnum>> {
+    fn make_nas_batch(prefix: &str, count: usize, mtime: i64) -> Vec<Arc<ObservedEntry>> {
         (0..count)
             .map(|i| Arc::new(make_nas(&format!("{}/{}.dat", prefix, i), 1024, mtime, None)))
             .collect()
@@ -714,12 +731,12 @@ mod clickhouse_integration_tests {
                 source,
             )
             .unwrap();
-            let record = ObservedEntryRecord::capture(&entry, 1);
+            let entry = Arc::new(entry);
             database
-                .batch_insert_observations(std::slice::from_ref(&record))
+                .batch_insert_base_record(std::slice::from_ref(&entry))
                 .await
                 .unwrap();
-            observations.push((entry, record));
+            observations.push(entry);
         }
         let table = format!("base_{job}");
         let rows = clickhouse_client(&config)
@@ -732,94 +749,83 @@ mod clickhouse_integration_tests {
             (1, 8192),
             "one live path/version must keep the latest observation after identity changes"
         );
-        assert_eq!(
-            database
-                .load_observation(&observations[1].1.identity_key, &backend)
-                .await
-                .unwrap(),
-            Some(observations[1].0.clone())
-        );
-        assert!(
-            database
-                .load_observation(&observations[0].1.identity_key, &backend)
-                .await
-                .unwrap()
-                .is_none()
-        );
+        let stored = catalogue_entries(&database).await;
+        assert_eq!(stored.len(), 1);
+        assert_eq!(&stored[0], observations[1].as_ref());
+        assert_ne!(stored[0].identity_key(), observations[0].identity_key());
         isolated.cleanup().await;
+    }
+
+    async fn catalogue_entries(database: &ClickHouseDatabase) -> Vec<ObservedEntry> {
+        let (sender, mut receiver) = mpsc::channel(4);
+        database.query_storage_entry(None, None, None, sender).await.unwrap();
+        let mut entries = Vec::new();
+        while let Some(entry) = receiver.recv().await {
+            entries.push(entry);
+        }
+        entries
     }
 
     #[tokio::test]
     #[ignore = "requires lab ClickHouse"]
-    async fn observation_snapshot_round_trips_through_the_single_scan_table() {
-        let (mut db, _, _, database) = setup_isolated_state_db("observation_snapshot").await;
-        db.create_scan_base_table().await.unwrap();
-        db.create_scan_state_table().await.unwrap();
-        db.insert_scan_state(0).await.unwrap();
+    async fn native_catalogue_round_trips_updated_and_empty_generations() {
+        let (mut database, _, _, isolated) = setup_isolated_state_db("native_generations").await;
+        database.initialize().await.unwrap();
         let backend = BackendIdentity::new(BackendKind::Local, "clickhouse-fixture").unwrap();
-        let source = SourceIdentity::new(backend, IdentityStrength::PathScoped, b"nested/file").unwrap();
-        let entry = ObservedEntry::new(
-            StoragePath::new("nested/file").unwrap(),
-            EntryKind::File,
-            Some(4096),
-            None,
-            source,
-        )
-        .unwrap();
-        let record = ObservedEntryRecord::capture(&entry, 1);
-        db.batch_insert_observations(std::slice::from_ref(&record))
+        let identity = SourceIdentity::new(backend, IdentityStrength::PathScoped, b"nested/file").unwrap();
+        let entry = Arc::new(
+            ObservedEntry::new(
+                StoragePath::new("nested/file").unwrap(),
+                EntryKind::File,
+                Some(4096),
+                None,
+                identity.clone(),
+            )
+            .unwrap(),
+        );
+        database.begin_scan_generation().await.unwrap();
+        database
+            .batch_insert_base_record(std::slice::from_ref(&entry))
             .await
             .unwrap();
-        let stored = db
-            .load_observation(&record.identity_key, entry.source_identity().backend())
-            .await
-            .unwrap()
-            .unwrap();
+        database.commit_scan_generation().await.unwrap();
+        assert_eq!(catalogue_entries(&database).await, vec![entry.as_ref().clone()]);
 
-        assert_eq!(stored, entry);
-
-        db.begin_observation_snapshot().await.unwrap();
-        let changed_backend = BackendIdentity::new(BackendKind::Local, "clickhouse-fixture").unwrap();
-        let changed_source =
-            SourceIdentity::new(changed_backend, IdentityStrength::PathScoped, b"nested/file").unwrap();
-        let changed = ObservedEntry::new(
-            StoragePath::new("nested/file").unwrap(),
-            EntryKind::File,
-            Some(8192),
-            None,
-            changed_source,
-        )
-        .unwrap();
-        let changed_record = ObservedEntryRecord::capture(&changed, 0);
-        db.batch_insert_temp_observations(std::slice::from_ref(&changed_record))
+        let changed = Arc::new(
+            ObservedEntry::new(
+                StoragePath::new("nested/file").unwrap(),
+                EntryKind::File,
+                Some(8192),
+                None,
+                identity,
+            )
+            .unwrap(),
+        );
+        database.begin_scan_generation().await.unwrap();
+        database.create_scan_temporary_table().await.unwrap();
+        database
+            .batch_insert_temp_record(std::slice::from_ref(&changed))
             .await
             .unwrap();
+        let changes: Vec<_> = database.detect_changed_items().await.unwrap().collect();
+        assert_eq!(changes, vec![(changed.as_ref().clone(), ChangeKind::DataOnly)]);
+        database.insert_temp_to_base_table(&[]).await.unwrap();
+        database.commit_scan_generation().await.unwrap();
+        database.drop_scan_temporary_table().await.unwrap();
+        assert_eq!(catalogue_entries(&database).await, vec![changed.as_ref().clone()]);
 
-        assert_eq!(
-            db.detect_changed_observations(entry.source_identity().backend())
-                .await
-                .unwrap(),
-            vec![changed.clone()]
-        );
-        assert_eq!(db.publish_observation_snapshot().await.unwrap(), 0);
-        assert_eq!(db.query_scan_state().await.unwrap(), Some(1));
-        assert_eq!(
-            db.load_observation(&record.identity_key, entry.source_identity().backend())
-                .await
-                .unwrap(),
-            Some(changed)
-        );
-
-        db.begin_observation_snapshot().await.unwrap();
-        assert_eq!(db.publish_observation_snapshot().await.unwrap(), 1);
-        assert_eq!(db.query_scan_state().await.unwrap(), Some(0));
-        assert_eq!(
-            db.load_observation(&record.identity_key, entry.source_identity().backend())
-                .await
-                .unwrap(),
-            None
-        );
-        database.cleanup().await;
+        database.begin_scan_generation().await.unwrap();
+        database.create_scan_temporary_table().await.unwrap();
+        let deleted: Vec<_> = database.detect_deleted_items().await.unwrap().collect();
+        assert!(matches!(&deleted[..], [DeletionStatus::Deleted(entry)] if entry == changed.as_ref()));
+        database
+            .batch_delete_base_record(&["nested/file".into()])
+            .await
+            .unwrap();
+        database.commit_scan_generation().await.unwrap();
+        database.drop_scan_temporary_table().await.unwrap();
+        assert!(catalogue_entries(&database).await.is_empty());
+        isolated.cleanup().await;
     }
 
     #[tokio::test]
@@ -897,8 +903,9 @@ mod clickhouse_integration_tests {
             .await
             .unwrap();
         assert_eq!(stamped_generation, 1);
+        let before = table_names(&config).await;
         db.create_scan_temporary_table().await.unwrap();
-        let temp_table = db.scan_temp_table_name.clone().unwrap();
+        let temp_table = created_table_name(&config, &before).await;
         let temp_record = Arc::new(make_nas("temp-working.dat", 11, 1_700_000_001, None));
         db.batch_insert_temp_record(&[temp_record]).await.unwrap();
         let temp_generation = client
@@ -1193,12 +1200,12 @@ mod clickhouse_integration_tests {
 
     #[tokio::test]
     #[ignore = "requires lab ClickHouse"]
-    async fn independent_adapter_batch_uses_shared_working_generation() {
+    async fn cloned_catalogue_batch_uses_shared_working_generation() {
         let (adapter_a, config, job_id, database) = setup_isolated_state_db("shared_adapter_batch").await;
         adapter_a.initialize().await.unwrap();
         assert_eq!(adapter_a.begin_scan_generation().await.unwrap(), 1);
 
-        let mut adapter_b = ClickHouseDatabase::new(&config, &job_id).unwrap();
+        let mut adapter_b = adapter_a.clone();
         let record = Arc::new(make_nas("shared.dat", 13, 1_700_000_000, None));
         adapter_b.batch_insert_base_record(&[record]).await.unwrap();
         let client = clickhouse_client(&config);
@@ -1211,8 +1218,9 @@ mod clickhouse_integration_tests {
             .unwrap();
         assert_eq!(current_state, 1);
 
+        let before = table_names(&config).await;
         adapter_b.create_scan_temporary_table().await.unwrap();
-        let temp_table = adapter_b.scan_temp_table_name.clone().unwrap();
+        let temp_table = created_table_name(&config, &before).await;
         let temp_record = Arc::new(make_nas("shared-temp.dat", 19, 1_700_000_001, None));
         adapter_b.batch_insert_temp_record(&[temp_record]).await.unwrap();
         let temp_state = client
@@ -1232,7 +1240,7 @@ mod clickhouse_integration_tests {
     async fn cloned_adapter_uses_shared_working_generation() {
         let (adapter, config, job_id, database) = setup_isolated_state_db("shared_clone_batch").await;
         adapter.initialize().await.unwrap();
-        let cloned = adapter.clone_box();
+        let cloned = adapter.clone();
         assert_eq!(adapter.begin_scan_generation().await.unwrap(), 1);
 
         let record = Arc::new(make_nas("cloned.dat", 17, 1_700_000_000, None));
@@ -1251,12 +1259,12 @@ mod clickhouse_integration_tests {
 
     #[tokio::test]
     #[ignore = "requires lab ClickHouse"]
-    async fn shared_adapters_commit_once_across_concurrent_and_repeated_calls() {
+    async fn catalogue_clones_commit_once_across_concurrent_and_repeated_calls() {
         let (adapter_a, config, job_id, database) = setup_isolated_state_db("shared_commit").await;
         adapter_a.initialize().await.unwrap();
         assert_eq!(adapter_a.begin_scan_generation().await.unwrap(), 1);
-        let adapter_b = ClickHouseDatabase::new(&config, &job_id).unwrap();
-        let adapter_c = ClickHouseDatabase::new(&config, &job_id).unwrap();
+        let adapter_b = adapter_a.clone();
+        let adapter_c = adapter_a.clone();
         let client = clickhouse_client(&config);
         let rows_before = client
             .query(&format!("SELECT count() FROM state_{job_id}"))
@@ -1282,11 +1290,11 @@ mod clickhouse_integration_tests {
 
     #[tokio::test]
     #[ignore = "requires lab ClickHouse"]
-    async fn failed_begin_clears_shared_working_generation_for_every_adapter() {
-        let (adapter_a, config, job_id, database) = setup_isolated_state_db("shared_failed_begin").await;
+    async fn failed_begin_clears_working_generation_for_all_clones() {
+        let (adapter_a, _config, job_id, database) = setup_isolated_state_db("shared_failed_begin").await;
         adapter_a.initialize().await.unwrap();
         assert_eq!(adapter_a.begin_scan_generation().await.unwrap(), 1);
-        let adapter_b = ClickHouseDatabase::new(&config, &job_id).unwrap();
+        let adapter_b = adapter_a.clone();
         adapter_b.drop_table_by_name(&format!("state_{job_id}")).await.unwrap();
 
         assert!(matches!(
@@ -1303,7 +1311,7 @@ mod clickhouse_integration_tests {
 
     #[tokio::test]
     #[ignore = "requires lab ClickHouse"]
-    async fn shared_lifecycle_is_isolated_by_job_and_reclaimed_after_last_adapter_drops() {
+    async fn independent_catalogues_keep_working_state_isolated_from_other_tasks() {
         let (adapter_a, config, job_id, database) = setup_isolated_state_db("shared_isolation").await;
         adapter_a.initialize().await.unwrap();
         assert_eq!(adapter_a.begin_scan_generation().await.unwrap(), 1);
@@ -1313,6 +1321,13 @@ mod clickhouse_integration_tests {
         other_job.initialize().await.unwrap();
         assert!(matches!(
             other_job.commit_scan_generation().await.unwrap_err(),
+            DatabaseError::TransactionError(_)
+        ));
+
+        // A separately constructed task cannot commit another live task's in-memory generation.
+        let independent = ClickHouseDatabase::new(&config, &job_id).unwrap();
+        assert!(matches!(
+            independent.commit_scan_generation().await.unwrap_err(),
             DatabaseError::TransactionError(_)
         ));
 
@@ -1329,13 +1344,13 @@ mod clickhouse_integration_tests {
 
     #[tokio::test]
     #[ignore = "requires lab ClickHouse"]
-    async fn successful_rebegin_overwrites_stale_shared_working_from_persisted_state() {
+    async fn successful_rebegin_updates_all_clones_from_persisted_state() {
         let (adapter_a, config, job_id, database) = setup_isolated_state_db("shared_rebegin").await;
         adapter_a.initialize().await.unwrap();
         assert_eq!(adapter_a.begin_scan_generation().await.unwrap(), 1);
         adapter_a.insert_scan_state(1).await.unwrap();
 
-        let adapter_b = ClickHouseDatabase::new(&config, &job_id).unwrap();
+        let adapter_b = adapter_a.clone();
         assert_eq!(adapter_b.begin_scan_generation().await.unwrap(), 0);
         let record = Arc::new(make_nas("rebegin.dat", 23, 1_700_000_000, None));
         adapter_a.batch_insert_base_record(&[record]).await.unwrap();
@@ -1407,22 +1422,23 @@ mod clickhouse_integration_tests {
     #[tokio::test]
     #[ignore]
     async fn test_temp_table_lifecycle() {
-        let job_id = generate_unique_job_id("temp");
-        let mut db = setup_test_db_with_job_id(&job_id);
+        let (mut db, config, _job_id, database) = setup_isolated_state_db("temp").await;
         db.initialize().await.unwrap();
 
+        let before = table_names(&config).await;
         db.create_scan_temporary_table().await.unwrap();
-        assert!(db.scan_temp_table_name.is_some());
+        let temp_table = created_table_name(&config, &before).await;
 
-        let batch: Vec<Arc<EntryEnum>> = (0..100)
+        let batch: Vec<Arc<ObservedEntry>> = (0..100)
             .map(|i| Arc::new(make_nas(&format!("dir/{}.txt", i), 512, 100, None)))
             .collect();
         db.batch_insert_temp_record(&batch).await.unwrap();
 
         db.drop_scan_temporary_table().await.unwrap();
-        assert!(db.scan_temp_table_name.is_none());
+        assert!(!table_names(&config).await.contains(&temp_table));
+        assert_eq!(table_names(&config).await, before);
 
-        cleanup_test_tables(&db, &job_id).await.unwrap();
+        database.cleanup().await;
     }
 
     // ═══ 2.2 detect_new_items（优化 1: NOT IN）═══
@@ -1440,7 +1456,7 @@ mod clickhouse_integration_tests {
 
         // temp: 前 90 条已有 + 10 条全新
         db.create_scan_temporary_table().await.unwrap();
-        let mut temp_items: Vec<Arc<EntryEnum>> = (0..90)
+        let mut temp_items: Vec<Arc<ObservedEntry>> = (0..90)
             .map(|i| Arc::new(make_nas(&format!("dir/{}.dat", i), 1024, 1000000, None)))
             .collect();
         for i in 0..10 {
@@ -1463,7 +1479,7 @@ mod clickhouse_integration_tests {
         db.initialize().await.unwrap();
 
         // base: 1000 条带 fh
-        let base_batch: Vec<Arc<EntryEnum>> = (0..1000)
+        let base_batch: Vec<Arc<ObservedEntry>> = (0..1000)
             .map(|i| {
                 let fh = format!("{:04x}", i);
                 Arc::new(make_nas(&format!("dir/{}.dat", i), 1024, 1000000, Some(fh.as_bytes())))
@@ -1473,7 +1489,7 @@ mod clickhouse_integration_tests {
 
         // temp: 90 条已有 fh + 10 条新 fh
         db.create_scan_temporary_table().await.unwrap();
-        let mut temp_items: Vec<Arc<EntryEnum>> = (0..90)
+        let mut temp_items: Vec<Arc<ObservedEntry>> = (0..90)
             .map(|i| {
                 let fh = format!("{:04x}", i);
                 Arc::new(make_nas(&format!("dir/{}.dat", i), 1024, 1000000, Some(fh.as_bytes())))
@@ -1512,7 +1528,7 @@ mod clickhouse_integration_tests {
 
         // temp: 100 条（其中 5 条 size=9999 变更）
         db.create_scan_temporary_table().await.unwrap();
-        let mut temp_items: Vec<Arc<EntryEnum>> = (0..95)
+        let mut temp_items: Vec<Arc<ObservedEntry>> = (0..95)
             .map(|i| Arc::new(make_nas(&format!("dir/{}.dat", i), 1024, 1000000, None)))
             .collect();
         for i in 95..100 {
@@ -1546,7 +1562,7 @@ mod clickhouse_integration_tests {
 
         // 第二轮: temp 插入 990 条（10 条消失）
         db.create_scan_temporary_table().await.unwrap();
-        let temp_batch: Vec<Arc<EntryEnum>> = (0..990)
+        let temp_batch: Vec<Arc<ObservedEntry>> = (0..990)
             .map(|i| Arc::new(make_nas(&format!("dir/{}.dat", i), 1024, 1000000, None)))
             .collect();
         db.batch_insert_temp_record(&temp_batch).await.unwrap();
@@ -1573,7 +1589,7 @@ mod clickhouse_integration_tests {
         db.initialize().await.unwrap();
 
         db.create_scan_temporary_table().await.unwrap();
-        let batch: Vec<Arc<EntryEnum>> = (0..100)
+        let batch: Vec<Arc<ObservedEntry>> = (0..100)
             .map(|i| Arc::new(make_nas(&format!("dir/{}.txt", i), 512, 100, None)))
             .collect();
         db.batch_insert_temp_record(&batch).await.unwrap();
@@ -1595,7 +1611,7 @@ mod clickhouse_integration_tests {
         db.initialize().await.unwrap();
 
         db.create_scan_temporary_table().await.unwrap();
-        let batch: Vec<Arc<EntryEnum>> = (0..100)
+        let batch: Vec<Arc<ObservedEntry>> = (0..100)
             .map(|i| Arc::new(make_nas(&format!("dir/{}.txt", i), 512, 100, None)))
             .collect();
         db.batch_insert_temp_record(&batch).await.unwrap();
@@ -1619,7 +1635,7 @@ mod clickhouse_integration_tests {
         db.initialize().await.unwrap();
 
         db.create_scan_temporary_table().await.unwrap();
-        let batch: Vec<Arc<EntryEnum>> = (0..100)
+        let batch: Vec<Arc<ObservedEntry>> = (0..100)
             .map(|i| Arc::new(make_nas(&format!("dir/{}.txt", i), 512, 100, None)))
             .collect();
         db.batch_insert_temp_record(&batch).await.unwrap();
@@ -1642,7 +1658,7 @@ mod clickhouse_integration_tests {
         db.initialize().await.unwrap();
 
         db.create_scan_temporary_table().await.unwrap();
-        let batch: Vec<Arc<EntryEnum>> = vec![
+        let batch: Vec<Arc<ObservedEntry>> = vec![
             Arc::new(make_s3("a.txt", 100, 100, Some("v1"))),
             Arc::new(make_s3("a.txt", 100, 100, Some("v2"))),
             Arc::new(make_s3("a.txt", 100, 100, Some("v3"))),
@@ -1679,7 +1695,7 @@ mod clickhouse_integration_tests {
 
         // 第二轮：temp 100 条（80 已有其中 5 变更 + 20 新增）
         db.create_scan_temporary_table().await.unwrap();
-        let mut temp_items: Vec<Arc<EntryEnum>> = Vec::with_capacity(100);
+        let mut temp_items: Vec<Arc<ObservedEntry>> = Vec::with_capacity(100);
         // 75 条未变更
         for i in 0..75 {
             temp_items.push(Arc::new(make_nas(&format!("dir/{}.dat", i), 1024, 1000000, None)));
@@ -1729,7 +1745,7 @@ mod clickhouse_integration_tests {
 
         // 第二轮
         db.create_scan_temporary_table().await.unwrap();
-        let mut temp_items: Vec<Arc<EntryEnum>> = Vec::with_capacity(100);
+        let mut temp_items: Vec<Arc<ObservedEntry>> = Vec::with_capacity(100);
         for i in 0..75 {
             temp_items.push(Arc::new(make_nas(&format!("dir/{}.dat", i), 1024, 1000000, None)));
         }
@@ -1767,11 +1783,11 @@ mod clickhouse_integration_tests {
         cleanup_test_tables(&db, &job_id).await.unwrap();
     }
 
-    // ═══ 2.7 version_count JOIN（优化 4）═══
+    // ═══ 2.7 原生版本顺序与已完成版本排除 ═══
 
     #[tokio::test]
     #[ignore]
-    async fn test_version_count_deduction() {
+    async fn test_native_version_order_and_existing_version_exclusion() {
         let job_id = generate_unique_job_id("vc");
         let mut db = setup_test_db_with_job_id(&job_id);
         db.initialize().await.unwrap();
@@ -1783,19 +1799,29 @@ mod clickhouse_integration_tests {
         ];
         db.batch_insert_base_record(&base_batch).await.unwrap();
 
-        // temp: S3Entry("a.txt", vid="v3", version_count=5)
+        // 临时观察包含五个真实版本；已存在的两个版本应按版本键排除。
         db.create_scan_temporary_table().await.unwrap();
-        let mut s3_new = make_s3("a.txt", 100, 100, Some("v3"));
-        if let EntryEnum::S3(ref mut e) = s3_new {
-            e.version_count = Some(5);
-        }
-        let temp_batch = vec![Arc::new(s3_new)];
-        db.batch_insert_temp_record(&temp_batch).await.unwrap();
+        let versions: Vec<_> = ["v1", "v2", "v5", "v3", "v4"]
+            .into_iter()
+            .map(|version| make_s3("a.txt", 100, 100, Some(version)))
+            .flat_map(|entry| entry.history().unwrap().records().to_vec())
+            .collect();
+        let entry = make_s3("a.txt", 100, 100, Some("v5"))
+            .with_history(Some(Box::new(
+                ObjectHistory::whole(versions, HistoryOrder::Server).unwrap(),
+            )))
+            .unwrap();
+        db.batch_insert_temp_record(&[Arc::new(entry)]).await.unwrap();
 
-        // detect_new → version_count = 5 - 2 = 3
         let new_items: Vec<_> = db.detect_new_items().await.unwrap().collect();
-        assert_eq!(new_items.len(), 1);
-        assert_eq!(new_items[0].get_version_count(), Some(3));
+        assert_eq!(new_items.len(), 3);
+        let ids: Vec<_> = new_items.iter().map(|entry| entry.get_version_id().unwrap()).collect();
+        assert_eq!(ids, ["v5", "v3", "v4"]);
+        assert!(
+            new_items
+                .iter()
+                .all(|entry| entry.history().unwrap().records().len() == 1)
+        );
 
         db.drop_scan_temporary_table().await.unwrap();
         cleanup_test_tables(&db, &job_id).await.unwrap();

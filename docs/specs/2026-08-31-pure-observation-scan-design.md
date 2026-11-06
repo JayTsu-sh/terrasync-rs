@@ -1,7 +1,9 @@
 # Pure observation scan projection 设计
 
 **日期：** 2026-08-31  
-**状态：** Implemented
+**状态：** Superseded
+
+本文记录历史独立原型；该入口未被任务执行流使用，现已移除。当前扫描／续扫和目录流程统一采用原生观察与实际任务代次协议，见 [当前重构方案](2026-11-05-db-native-refactor-design.md)。以下内容保留为历史设计，不代表当前接口或验收证据。
 
 ## 问题
 

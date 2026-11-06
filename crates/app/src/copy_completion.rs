@@ -1,9 +1,14 @@
 //! 复制轮次收尾：目录元数据全部确认后才允许数据库提交。
+
+use crate::file_copy::metadata as copy_metadata;
 use std::sync::Arc;
 use std::thread::JoinHandle as ThreadHandle;
 
-use db::Database;
-use storage_adapter::{EntryEnum, StorageEnum};
+use crate::storage_factory::StorageContext;
+use data_mover::model::BackendKind;
+use data_mover::model::ObservedEntry;
+use db::ClickHouseDatabase;
+use task_model::ObservedEntryExt;
 use tokio::sync::mpsc::{self, Receiver};
 use tokio::task::{JoinError, JoinHandle, JoinSet};
 use tokio_util::task::AbortOnDropHandle;
@@ -38,15 +43,15 @@ impl Drop for DirectoryProgress {
     }
 }
 
-pub(crate) async fn complete(database: Box<dyn Database>, destination: Arc<StorageEnum>) -> Result<()> {
-    if !matches!(destination.as_ref(), StorageEnum::S3(_)) {
+pub(crate) async fn complete(database: ClickHouseDatabase, destination: Arc<StorageContext>) -> Result<()> {
+    if destination.storage().kind() != BackendKind::S3 {
         update_directories(database.clone(), destination).await?;
     }
     database.commit_scan_generation().await?;
     Ok(())
 }
 
-async fn update_directories(database: Box<dyn Database>, destination: Arc<StorageEnum>) -> Result<()> {
+async fn update_directories(database: ClickHouseDatabase, destination: Arc<StorageContext>) -> Result<()> {
     let (sender, receiver) = mpsc::channel(1000);
     let query = tokio::spawn(
         async move {
@@ -60,7 +65,7 @@ async fn update_directories(database: Box<dyn Database>, destination: Arc<Storag
 }
 
 async fn apply_directories(
-    query: JoinHandle<Result<()>>, mut receiver: Receiver<EntryEnum>, destination: Arc<StorageEnum>,
+    query: JoinHandle<Result<()>>, mut receiver: Receiver<ObservedEntry>, destination: Arc<StorageContext>,
 ) -> Result<()> {
     // 调用方取消整个收尾 future 时，查询与进度线程也随所属执行域释放。
     let query = AbortOnDropHandle::new(query);
@@ -77,7 +82,7 @@ async fn apply_directories(
         let target = destination.clone();
         tasks.spawn(async move {
             trace!(path = ?entry.get_relative_path(), "Updating directory metadata");
-            target.set_entry_metadata(&entry).await?;
+            copy_metadata::set_entry_metadata(target.storage(), &entry).await?;
             Ok(())
         });
     }

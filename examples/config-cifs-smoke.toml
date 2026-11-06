@@ -20,7 +20,6 @@ concurrency = 4
 
 [database]
 enabled = true
-type = "clickhouse"
 batch_size = 800000
 
 [database.clickhouse]

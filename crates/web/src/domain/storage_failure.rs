@@ -1,5 +1,5 @@
+use data_mover::traversal::RemoteScanFailure;
 use serde::{Deserialize, Serialize};
-use storage_adapter::RemoteScanFailure;
 
 /// 可持久化且不含凭据的扫描故障；调用方无需解析 `error_message`。
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]

@@ -1,29 +1,55 @@
+use crate::broadcast::BroadcastForwarder;
+use crate::file_copy::namespace as copy_namespace;
+use data_mover::model::BackendKind;
+use data_mover::model::EntryKind;
+use data_mover::qos::QosManager;
+use data_mover::storage::CopiedValueTarget;
+use data_mover::transfer::TransferPolicy;
 use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
+use task_model::observation::ObservedItem;
+use task_model::{EntryChange, StorageEntryMessage};
+use task_model::{ObservedEntryExt, TransferMode};
+use tokio_util::sync::CancellationToken;
 
-use storage_adapter::hdfs::HdfsResumeMode;
-use storage_adapter::{CommitCallback, CopyOptions, EntryEnum, HdfsRecoverableCopyOptions, StorageEnum, TransferMode};
+use crate::byte_resume::CommitCallback;
+use crate::storage_factory::StorageContext;
+use data_mover::model::ObservedEntry;
 
 use crate::error::{AppError, Result};
+
+pub(crate) mod metadata;
+pub(crate) mod namespace;
+pub(crate) mod transfer;
+
+#[derive(Clone, Default)]
+pub struct CopyOptions {
+    pub transfer_mode: TransferMode,
+    pub qos: Option<QosManager>,
+    pub enable_integrity_check: bool,
+    pub is_source_reserved: bool,
+    pub bytes_counter: Option<Arc<AtomicU64>>,
+    pub cancel: Option<CancellationToken>,
+}
+
+pub(crate) const fn transfer_policy(mode: TransferMode) -> TransferPolicy {
+    match mode {
+        TransferMode::Checkpoint => TransferPolicy::Checkpointed,
+        TransferMode::Atomic => TransferPolicy::AtomicReplace,
+        TransferMode::Direct => TransferPolicy::Direct,
+    }
+}
 
 /// 一次 HDFS 目标复制所需的调用方恢复参数。
 #[derive(Clone)]
 pub(crate) struct HdfsCopyContext {
     transfer_identity: String,
-    resume_mode: HdfsResumeMode,
+    mode: TransferMode,
     on_committed: CommitCallback,
 }
 
 impl HdfsCopyContext {
     pub(crate) fn from_job(job_id: &str, mode: TransferMode) -> Result<Self> {
-        let resume_mode = match mode {
-            TransferMode::Checkpoint => HdfsResumeMode::Auto,
-            TransferMode::Atomic => HdfsResumeMode::Restart,
-            TransferMode::Direct => HdfsResumeMode::Direct,
-        };
-        Self::with_mode(job_id, resume_mode)
-    }
-
-    pub(crate) fn with_mode(job_id: &str, resume_mode: HdfsResumeMode) -> Result<Self> {
         if job_id.trim().is_empty() {
             return Err(AppError::ConfigError(
                 "HDFS recoverable copy requires a stable job identity".to_string(),
@@ -31,7 +57,7 @@ impl HdfsCopyContext {
         }
         Ok(Self {
             transfer_identity: job_id.to_string(),
-            resume_mode,
+            mode,
             on_committed: Arc::new(|_, _| {}),
         })
     }
@@ -45,42 +71,101 @@ impl HdfsCopyContext {
         &self.transfer_identity
     }
 
-    pub(crate) const fn resume_mode(&self) -> HdfsResumeMode {
-        self.resume_mode
+    pub(crate) const fn transfer_mode(&self) -> TransferMode {
+        self.mode
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum MetadataApplication {
-    DataMover,
+/// 复制契约取决于已连接目标实例的能力，不受扫描展示开关影响。
+pub(crate) fn copied_tags_required(to: &StorageContext) -> crate::error::storage::Result<bool> {
+    Ok(to
+        .storage()
+        .staged_destination()?
+        .copied_metadata_target()
+        .is_some_and(|target| target.tags == CopiedValueTarget::Supported))
+}
+
+/// 真实目录由 namespace 创建；虚拟目录无需落地，目录标记交给普通文件传输。
+pub(crate) async fn prepare_directory(entry: &ObservedEntry, to: &StorageContext) -> Result<bool> {
+    if entry.kind() != EntryKind::Directory {
+        return Ok(false);
+    }
+    if to.storage().holds_directory_objects() {
+        return Ok(entry.directory_marker_object().is_none());
+    }
+    copy_namespace::create_dir_all(to.storage(), entry).await?;
+    Ok(true)
 }
 
 pub(crate) async fn copy_file(
-    from: &StorageEnum, to: &StorageEnum, entry: &EntryEnum, options: CopyOptions, hdfs: Option<&HdfsCopyContext>,
-) -> Result<MetadataApplication> {
-    if matches!(to, StorageEnum::HDFS(_)) {
+    from: &StorageContext, to: &StorageContext, entry: &Arc<ObservedEntry>, mut options: CopyOptions,
+    hdfs: Option<&HdfsCopyContext>,
+) -> Result<()> {
+    if to.roles.kind() == BackendKind::Hdfs {
         let context = hdfs
             .ok_or_else(|| AppError::ConfigError("HDFS recoverable copy requires a stable job identity".to_string()))?;
-        let recovery = HdfsRecoverableCopyOptions::new(context.transfer_identity(), context.on_committed.clone())
-            .with_resume_mode(context.resume_mode());
-        StorageEnum::copy_file_hdfs_recoverable(from, to, entry, options, recovery).await?;
-        return Ok(MetadataApplication::DataMover);
+        options.transfer_mode = context.transfer_mode();
+        transfer::copy_current(from, to, entry, &options, Some(context.transfer_identity())).await?;
+        (context.on_committed)(0, entry.get_size());
+    } else {
+        transfer::copy_entry(from, to, entry, options).await?;
     }
-    StorageEnum::copy_file(from, to, entry, options).await?;
-    Ok(MetadataApplication::DataMover)
+    Ok(())
+}
+
+/// 全量与增量共用源端确认的逐版本顺序；每个目标版本提交后才发送对应的完成事件。
+pub(crate) async fn copy_versions<I: Iterator<Item = ObservedItem> + Send>(
+    items: I, from: &StorageContext, to: &StorageContext, options: CopyOptions, job_id: &str,
+    broadcaster: &BroadcastForwarder<StorageEntryMessage>, change: EntryChange,
+) -> Result<()> {
+    let keep_history = to.storage().staged_destination()?.keeps_history().await?;
+    let hdfs = if to.storage().kind() == BackendKind::Hdfs {
+        Some(HdfsCopyContext::from_job(job_id, options.transfer_mode)?)
+    } else {
+        None
+    };
+    for item in items.filter(|item| retain_version(item, keep_history)) {
+        if !to.storage().holds_directory_objects() && item.entry.kind() == EntryKind::Directory {
+            copy_namespace::create_dir_all(to.storage(), &item.entry).await?;
+        } else {
+            transfer::copy_item(
+                from,
+                to,
+                &item,
+                &options,
+                hdfs.as_ref().map(HdfsCopyContext::transfer_identity),
+            )
+            .await?;
+        }
+        broadcaster.broadcast(change.message(item)).await;
+    }
+    Ok(())
+}
+
+/// 借用原生历史选择目标实际保留的版本，不分配或复制版本列表。
+#[cfg(test)]
+pub(crate) fn selected_copy_items(
+    entry: &Arc<ObservedEntry>, keep_history: bool,
+) -> impl Iterator<Item = ObservedItem> + '_ {
+    ObservedItem::all(entry).filter(move |item| retain_version(item, keep_history))
+}
+fn retain_version(item: &ObservedItem, keep_history: bool) -> bool {
+    item.view()
+        .version()
+        .is_none_or(|record| keep_history || (record.is_latest() && !record.is_delete_marker()))
 }
 
 #[cfg(test)]
 mod tests {
+    use crate::scan::observe_path;
+    use data_mover::model::BackendKind;
     use tokio::fs;
 
-    use std::path::Path;
+    use std::{path::Path, sync::Arc};
 
-    use storage_adapter::hdfs::HdfsResumeMode;
-    use storage_adapter::{CreateStorageOptions, StorageEnum, create_storage};
+    use crate::storage_factory::{CreateStorageOptions, create_storage};
 
-    use super::{HdfsCopyContext, MetadataApplication, TransferMode};
-    use storage_adapter::CopyOptions;
+    use super::{CopyOptions, HdfsCopyContext, TransferMode};
 
     #[test]
     fn checkpoint_mode_keeps_stable_job_identity_and_uses_auto_recovery() {
@@ -91,7 +176,7 @@ mod tests {
 
         assert_eq!(first.transfer_identity(), "persistent-job");
         assert_eq!(first.transfer_identity(), restarted.transfer_identity());
-        assert_eq!(first.resume_mode(), HdfsResumeMode::Auto);
+        assert_eq!(first.transfer_mode(), TransferMode::Checkpoint);
     }
 
     #[test]
@@ -99,28 +184,20 @@ mod tests {
         let context = HdfsCopyContext::from_job("persistent-job", TransferMode::Atomic)
             .unwrap_or_else(|error| panic!("valid job identity rejected: {error}"));
 
-        assert_eq!(context.resume_mode(), HdfsResumeMode::Restart);
+        assert_eq!(context.transfer_mode(), TransferMode::Atomic);
     }
 
     #[test]
     fn direct_mode_does_not_use_hdfs_recovery() {
         let context = HdfsCopyContext::from_job("persistent-job", TransferMode::Direct)
             .unwrap_or_else(|error| panic!("valid Direct context rejected: {error}"));
-        assert_eq!(context.resume_mode(), HdfsResumeMode::Direct);
+        assert_eq!(context.transfer_mode(), TransferMode::Direct);
     }
 
     #[test]
     fn hdfs_context_rejects_missing_stable_job_identity() {
         assert!(HdfsCopyContext::from_job("", TransferMode::Checkpoint).is_err());
         assert!(HdfsCopyContext::from_job("   ", TransferMode::Checkpoint).is_err());
-    }
-
-    #[test]
-    fn hdfs_context_can_express_require_mode() {
-        let context = HdfsCopyContext::with_mode("persistent-job", HdfsResumeMode::Require)
-            .unwrap_or_else(|error| panic!("valid Require context rejected: {error}"));
-
-        assert_eq!(context.resume_mode(), HdfsResumeMode::Require);
     }
 
     #[tokio::test]
@@ -130,6 +207,19 @@ mod tests {
         fs::write(source_root.path().join("payload.bin"), b"legacy route")
             .await
             .unwrap_or_else(|error| panic!("write source: {error}"));
+        let modified = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_001);
+        std::fs::File::open(source_root.path().join("payload.bin"))
+            .and_then(|file| file.set_modified(modified))
+            .unwrap_or_else(|error| panic!("set source mtime: {error}"));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(
+                source_root.path().join("payload.bin"),
+                std::fs::Permissions::from_mode(0o640),
+            )
+            .unwrap_or_else(|error| panic!("set source permissions: {error}"));
+        }
         let source = create_storage(
             source_root
                 .path()
@@ -148,17 +238,27 @@ mod tests {
         )
         .await
         .unwrap_or_else(|error| panic!("create destination storage: {error}"));
-        let entry = source
-            .get_metadata(Path::new("payload.bin"))
+        let entry = observe_path(source.storage(), Path::new("payload.bin"))
             .await
             .unwrap_or_else(|error| panic!("source metadata: {error}"));
+        let entry = Arc::new(entry);
 
-        let metadata = super::copy_file(&source, &destination, &entry, CopyOptions::default(), None)
+        super::copy_file(&source, &destination, &entry, CopyOptions::default(), None)
             .await
             .unwrap_or_else(|error| panic!("legacy local copy: {error}"));
 
-        assert_eq!(metadata, MetadataApplication::DataMover);
-        assert!(matches!(destination, StorageEnum::Local(_)));
+        let metadata = std::fs::metadata(destination_root.path().join("payload.bin"))
+            .unwrap_or_else(|error| panic!("read destination metadata: {error}"));
+        assert_eq!(
+            metadata.modified().unwrap_or_else(|error| panic!("mtime: {error}")),
+            modified
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(metadata.permissions().mode() & 0o7777, 0o640);
+        }
+        assert_eq!(destination.storage().kind(), BackendKind::Local);
         assert_eq!(
             fs::read(destination_root.path().join("payload.bin"))
                 .await

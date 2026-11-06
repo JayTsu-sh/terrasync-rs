@@ -40,7 +40,7 @@
 //! 数据要么从未到达 Receiver、要么到达了但 ack 没能传回来），沿用旧窗口状态毫无依据。
 //! 后续实现者不要为了"优化重连体验"给这里加持久化——那是解决一个不存在的问题。
 //!
-//! ## 与 `storage_adapter::qos::QosManager` 的关系
+//! ## 与 `data_mover::qos::QosManager` 的关系
 //!
 //! 两者用法形似（`acquire(cost).await` 挂起在调用点、外部补充后自动唤醒），但控制的
 //! 物理量不同，不能互相替代：
@@ -75,6 +75,7 @@
 
 use crate::message::RemoteSourceEvent;
 use std::sync::Mutex;
+use task_model::ObservedEntryExt;
 
 // 外部 crate
 use tokio::sync::Notify;
@@ -303,39 +304,37 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
+    use crate::chunk::DataChunk;
     use bytes::Bytes;
-    use storage_adapter::{DataChunk, EntryEnum, NASEntry};
+    use data_mover::model::ObservedEntry;
 
     use super::*;
 
-    fn dummy_entry_with_size(size: u64) -> Arc<EntryEnum> {
-        Arc::new(EntryEnum::NAS(NASEntry {
-            name: "f".to_string(),
-            relative_path: PathBuf::from("f"),
-            extension: None,
-            is_dir: false,
-            size,
-            atime: 0,
-            ctime: 0,
-            mtime: 0,
-            mode: Some(0o644),
-            is_symlink: false,
-            hard_links: None,
-            uid: None,
-            gid: None,
-            ino: None,
-            file_handle: None,
-            acl: None,
-            owner: None,
-            owner_group: None,
-            xattrs: None,
-        }))
+    fn dummy_entry_with_size(size: u64) -> Arc<ObservedEntry> {
+        Arc::new({
+            let fixture_path: std::path::PathBuf = PathBuf::from("f");
+            crate::observed_fixtures::observation(
+                data_mover::model::BackendKind::Nfs,
+                fixture_path,
+                data_mover::model::EntryKind::File,
+                size,
+                [0, 0, 0],
+                Some(data_mover::model::OwnershipMode {
+                    mode: 0o644,
+                    uid: 0u32,
+                    gid: 0u32,
+                }),
+                None,
+                None,
+                None,
+            )
+        })
     }
 
     #[test]
     fn credit_cost_counts_file_data_by_chunk_payload_len() {
         let message = SenderMsg::FileData {
-            entry: dummy_entry_with_size(0),
+            ndx: 0,
             chunk: DataChunk {
                 offset: 0,
                 data: Bytes::from(vec![0u8; 100]),
@@ -357,7 +356,7 @@ mod tests {
     fn credit_cost_counts_tar_packed_by_entry_size() {
         let message = SenderMsg::TarPacked {
             tar_entry: dummy_entry_with_size(12345),
-            manifest_entries: vec![],
+            manifest_entries: vec![].into(),
         };
         assert_eq!(credit_cost(&message), Some(12345));
     }

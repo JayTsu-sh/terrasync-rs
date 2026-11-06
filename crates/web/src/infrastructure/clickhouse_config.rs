@@ -78,7 +78,6 @@ pub(crate) async fn apply_db_config_from_sqlite(repository: &dyn ConfigRepositor
 pub(crate) fn apply_ch_config(config: &ChConfig) -> Result<()> {
     AppConfig::override_with(|app| {
         app.database.enabled = true;
-        app.database.r#type = "clickhouse".into();
         app.database.batch_size = config.batch_size;
         app.database.clickhouse = config.connection.clone();
     })?;

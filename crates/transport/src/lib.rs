@@ -1,7 +1,11 @@
+pub mod acl;
+pub mod chunk;
+pub mod directory;
 pub mod error;
 pub mod flow_control;
 pub mod in_process;
 pub mod message;
+mod observation_wire;
 pub mod traits;
 
 /// QUIC 传输层实现（启用 "quic" feature 时编译）
@@ -26,3 +30,7 @@ pub mod prelude {
     pub use crate::quic::{QuicReceiverTransport, QuicSenderTransport};
     pub use crate::traits::{ReceiverTransport, SenderTransport};
 }
+
+#[cfg(test)]
+#[path = "../../../tests/support/observed.rs"]
+mod observed_fixtures;

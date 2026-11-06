@@ -4,18 +4,25 @@
 //! 单进程模式下 Receiver 拥有 src+dest 两个 storage（命令模式）。
 //! 双进程模式下 Receiver 仅拥有 dest storage（数据流模式，Phase 3）。
 
+use crate::file_copy::metadata as copy_metadata;
+use crate::file_copy::namespace as copy_namespace;
+use data_mover::model::BackendKind;
+use transport::acl::decode_acl;
 // 标准库
-use crate::file_copy::{HdfsCopyContext, MetadataApplication, copy_file};
+use crate::error::StorageError;
+use crate::file_copy::{CopyOptions, HdfsCopyContext, copied_tags_required, copy_file, prepare_directory};
 use data_mover::model::FailureClass;
 use std::path::{Component, Path};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use storage_adapter::TransferMode;
-use storage_adapter::{StorageEntryMessage, StorageError};
+use task_model::ObservedEntryExt;
+use task_model::StorageEntryMessage;
+use task_model::TransferMode;
 
 // 外部 crate
-use storage_adapter::qos::QosManager;
-use storage_adapter::{EntryEnum, StorageEnum};
+use crate::storage_factory::StorageContext;
+use data_mover::model::ObservedEntry;
+use data_mover::qos::QosManager;
 use tokio::sync::mpsc::Receiver as MpscReceiver;
 use tokio_util::sync::CancellationToken;
 use tracing::{Instrument, debug, error, info, info_span, trace, warn};
@@ -27,7 +34,7 @@ use transport::message::{
 use transport::traits::ReceiverTransport;
 
 // 内部模块
-use crate::error::{AppError, Result};
+use crate::error::{AppError, CopyStep, Result};
 use crate::remote_receiver_session::{RemoteReceiverSession, RemoteSessionState};
 use crate::sync::{CommitRecorder, ResumeOpts, copy_file_with_resume, parse_size, should_resume};
 
@@ -96,13 +103,13 @@ pub struct ReceiverConfig {
 
 /// 单进程模式的 Receiver 主 task（R1 + R2 合一）
 ///
-/// 从 transport 接收 `SenderMsg`，调用 `StorageEnum` 方法执行写入。
+/// 从 transport 接收 `SenderMsg`，调用任务复制用例与原生存储角色执行写入。
 /// 每完成一个 entry 后通过 transport 发送 `ReceiverMsg::EntrySuccess` 或 `EntryError`。
 ///
 /// 单进程模式下收到 `CopyEntry` 消息时，Receiver 有 src+dest storage，
 /// 直接调用 `process_entry_on_receiver()` 完成完整复制。
 pub async fn receiver_task(
-    transport: &(dyn ReceiverTransport + 'static), src_storage: Arc<StorageEnum>, dest_storage: Arc<StorageEnum>,
+    transport: &(dyn ReceiverTransport + 'static), src_storage: Arc<StorageContext>, dest_storage: Arc<StorageContext>,
     config: &ReceiverConfig, qos_manager: Option<QosManager>, bytes_tracker: Option<Arc<AtomicU64>>,
 ) -> Result<()> {
     info!("[Receiver] Started");
@@ -189,30 +196,25 @@ pub async fn receiver_task(
 /// 根据 entry 类型（目录/符号链接/文件）dispatch 到不同的存储操作。
 /// 单进程模式下 Receiver 拥有 src+dest storage，可以直接调用 `copy_file`。
 pub(crate) async fn process_entry_on_receiver(
-    entry: &EntryEnum, src_storage: &Arc<StorageEnum>, dest_storage: &Arc<StorageEnum>, config: &ReceiverConfig,
-    qos_manager: Option<QosManager>, bytes_counter: Option<Arc<AtomicU64>>,
+    entry: &Arc<ObservedEntry>, src_storage: &Arc<StorageContext>, dest_storage: &Arc<StorageContext>,
+    config: &ReceiverConfig, qos_manager: Option<QosManager>, bytes_counter: Option<Arc<AtomicU64>>,
 ) -> Result<()> {
     let relative_path = entry.get_relative_path();
     let span = info_span!("recv_entry", path = %relative_path.display());
 
     async {
-        if entry.get_is_dir() {
-            if let Err(e) = dest_storage.create_dir_all(entry).await {
-                error!("[Receiver] Error creating directory {:?}: {}", relative_path, e);
-                // 目录创建失败不返回错误，继续尝试设置元数据和 ACL（与原逻辑一致）
-            }
+        if prepare_directory(entry, dest_storage).await? {
         } else if entry.get_is_symlink() {
-            let target_path = src_storage
-                .read_symlink(entry)
+            let target_path = copy_namespace::read_symlink(src_storage.storage(), entry)
                 .await
-                .map_err(|e| AppError::CopyError(format!("Failed to read symlink {}: {e}", relative_path.display())))?;
-            dest_storage.create_symlink(entry, &target_path).await.map_err(|e| {
-                AppError::CopyError(format!("Failed to create symlink {}: {e}", relative_path.display()))
-            })?;
+                .map_err(|e| AppError::copy_entry_failure(CopyStep::ReadSourceLink, relative_path, e))?;
+            copy_namespace::create_symlink(dest_storage.storage(), entry, &target_path)
+                .await
+                .map_err(|e| AppError::copy_entry_failure(CopyStep::CreateDestinationLink, relative_path, e))?;
 
             // 源端符号链接删除（is_source_reserved=false 时）
             if !config.is_source_reserved
-                && let Err(e) = src_storage.delete_file(entry).await
+                && let Err(e) = copy_namespace::delete_file(src_storage.storage(), entry).await
             {
                 error!("[Receiver] Failed to remove source symlink {:?}: {}", relative_path, e);
             }
@@ -223,7 +225,7 @@ pub(crate) async fn process_entry_on_receiver(
                 job_dir: config.job_dir.clone(),
                 transfer_mode: config.transfer_mode,
             };
-            if matches!(dest_storage.as_ref(), StorageEnum::HDFS(_)) {
+            if dest_storage.as_ref().storage().kind() == BackendKind::Hdfs {
                 let hdfs = HdfsCopyContext::from_job(&config.job_id, config.transfer_mode)?;
                 let recorder = if config.transfer_mode == TransferMode::Checkpoint {
                     Some(CommitRecorder::start(&config.job_dir, entry, src_storage.block_size()).await?)
@@ -237,7 +239,7 @@ pub(crate) async fn process_entry_on_receiver(
                     src_storage,
                     dest_storage,
                     entry,
-                    storage_adapter::CopyOptions {
+                    CopyOptions {
                         transfer_mode: config.transfer_mode,
                         qos: qos_manager,
                         enable_integrity_check: config.enable_integrity_check,
@@ -248,13 +250,11 @@ pub(crate) async fn process_entry_on_receiver(
                     Some(&hdfs),
                 )
                 .await;
-                let metadata = result.as_ref().copied().unwrap_or(MetadataApplication::DataMover);
                 if let Some(recorder) = recorder {
-                    recorder.finish(result.map(|_| ())).await?;
+                    recorder.finish(result).await?;
                 } else {
                     result?;
                 }
-                metadata
             } else if should_resume(&resume, entry, src_storage, dest_storage) {
                 copy_file_with_resume(
                     entry,
@@ -267,13 +267,12 @@ pub(crate) async fn process_entry_on_receiver(
                     &config.job_dir,
                 )
                 .await?;
-                MetadataApplication::DataMover
             } else {
                 copy_file(
                     src_storage,
                     dest_storage,
                     entry,
-                    storage_adapter::CopyOptions {
+                    CopyOptions {
                         transfer_mode: config.transfer_mode,
                         qos: qos_manager,
                         enable_integrity_check: config.enable_integrity_check,
@@ -284,7 +283,7 @@ pub(crate) async fn process_entry_on_receiver(
                     None,
                 )
                 .await
-                .map_err(|e| AppError::CopyError(format!("Failed to copy {}: {e}", relative_path.display())))?
+                .map_err(|e| AppError::copy_entry_failure(CopyStep::Transfer, relative_path, e))?
             };
 
             // 普通传输和检查点传输都在发布前应用协商后的元数据。
@@ -293,7 +292,7 @@ pub(crate) async fn process_entry_on_receiver(
         // ACL 复制（目录和文件均需要，symlink 除外）
         if config.enable_acl
             && !entry.get_is_symlink()
-            && let Err(e) = StorageEnum::copy_acl(src_storage, dest_storage, relative_path).await
+            && let Err(e) = copy_metadata::copy_acl(src_storage.storage(), dest_storage.storage(), relative_path).await
         {
             error!("[Receiver] Failed to copy ACL for {:?}: {}", relative_path, e);
         }
@@ -323,12 +322,12 @@ pub(crate) async fn process_entry_on_receiver(
 /// `expected_token`：`serve --token` 配置的期望值；为 `None` 时跳过鉴权（向后兼容，
 /// 未配置 token 时不校验，仍需完成 `Auth` 消息交换以保持协议阶段一致）。
 pub async fn receiver_task_remote(
-    transport: &(dyn ReceiverTransport + 'static), dest_storage: Arc<StorageEnum>, expected_token: Option<&str>,
+    transport: &(dyn ReceiverTransport + 'static), dest_storage: Arc<StorageContext>, expected_token: Option<&str>,
 ) -> Result<()> {
     info!("[Receiver Remote] Started, waiting for Handshake");
 
     // ── 阶段 -1: 协议握手（版本 + 能力协商），不兼容则回 reject 后立即中止 ──
-    let negotiated_features = recv_and_negotiate_handshake(transport).await?;
+    let negotiated_features = recv_and_negotiate_handshake(transport, &dest_storage).await?;
 
     // ── 阶段 -0.5: Token 鉴权，失败则回 AuthResult{ok:false} 并断连、中止 ──
     recv_and_check_auth(transport, expected_token).await?;
@@ -337,7 +336,7 @@ pub async fn receiver_task_remote(
     let session_config = recv_session_config(transport).await?;
     info!(
         "[Receiver Remote] SessionConfig: src_path={}, integrity={}, acl={}",
-        storage_adapter::redact_storage_url(&session_config.src_path),
+        data_mover::redact_storage_url(&session_config.src_path),
         session_config.enable_integrity_check,
         session_config.enable_acl
     );
@@ -389,14 +388,19 @@ pub async fn receiver_task_remote(
 ///
 /// 版本不兼容时发送 `Rejected` 后立即返回错误，不进入 `SessionConfig` / 文件列表阶段，
 /// 确保拒绝发生在任何 `FilePage` / `TransferRequest` / `CopyEntry` 之前。
-async fn recv_and_negotiate_handshake(transport: &(dyn ReceiverTransport + 'static)) -> Result<FeatureFlags> {
+async fn recv_and_negotiate_handshake(
+    transport: &(dyn ReceiverTransport + 'static), destination: &StorageContext,
+) -> Result<FeatureFlags> {
     loop {
         match transport.recv().await {
             Some(SenderMsg::Handshake(remote)) => {
                 let result = ProtocolHandshake::current().negotiate(&remote);
-                let ack = result.clone();
+                let mut ack = result.clone();
+                if let HandshakeResult::Accepted { copy_tags, .. } = &mut ack {
+                    *copy_tags = copied_tags_required(destination)?;
+                }
                 match result {
-                    HandshakeResult::Accepted { features } => {
+                    HandshakeResult::Accepted { features, .. } => {
                         info!(
                             "[Receiver Remote] Handshake accepted, negotiated features: {:?}",
                             features
@@ -496,16 +500,10 @@ pub(crate) fn validate_relative_path(path: &Path) -> Result<()> {
 }
 
 /// 目标端枚举失败时，不能据此判定文件缺失或需要删除。
-async fn read_destination_index(storage: &StorageEnum, directory: &str) -> Result<DestIndex> {
+async fn read_destination_index(storage: &StorageContext, directory: &str) -> Result<DestIndex> {
     let mut index = DestIndex::new();
     let iterator = match storage
-        .walkdir(
-            Some(Path::new(directory)),
-            storage_adapter::WalkOptions {
-                depth: Some(1),
-                ..Default::default()
-            },
-        )
+        .read_directory(Path::new(directory), copied_tags_required(storage)?)
         .await
     {
         Ok(iterator) => iterator,
@@ -561,7 +559,7 @@ async fn read_destination_index(storage: &StorageEnum, directory: &str) -> Resul
 /// `EndOfFile`/`CreateSymlink` 完成处理），只有二者相等**且**已经见过 `TransferDone`，
 /// 才真正结束循环。
 pub(crate) async fn recv_file_list_and_data_phase(
-    transport: &(dyn ReceiverTransport + 'static), dest_storage: &Arc<StorageEnum>, session_config: &SessionConfig,
+    transport: &(dyn ReceiverTransport + 'static), dest_storage: &Arc<StorageContext>, session_config: &SessionConfig,
     negotiated_features: &FeatureFlags, delta_size_threshold: u64, progress: &Arc<ReceiverProgress>,
     mut progress_rx: MpscReceiver<ProgressSnapshot>, state: &mut RemoteSessionState,
 ) -> Result<()> {
@@ -573,6 +571,7 @@ pub(crate) async fn recv_file_list_and_data_phase(
     // disk-commit task：全量/delta 文件均三段流式落盘（去整文件 BytesMut/token Vec）；ack
     // 经 unbounded channel 回流，避免路由 select 阻在 dc_tx.send 时不 drain ack → dc 阻在
     // ack_tx.send 的双向死锁。
+    let keeps_history = dest_storage.storage().staged_destination()?.keeps_history().await?;
     let (dc_tx, dc_rx) = tokio::sync::mpsc::channel::<DiskCommitMsg>(16);
     let (ack_tx, mut ack_rx) = tokio::sync::mpsc::unbounded_channel::<DcAck>();
     let disk_cancel = CancellationToken::new();
@@ -629,7 +628,18 @@ pub(crate) async fn recv_file_list_and_data_phase(
                 // 附带 decision 供 Sender 侧统计正确分类）或 Classified（MetadataOnly/Skip，
                 // Receiver 本地执行/判定，此前零 wire 流量，见 issue #23）
                 for nf in &page.files {
-                    let decision = dest_index.check(&nf.entry);
+                    if let Some(version) = nf.entry.view().version() {
+                        dest_index.mark_matched(&nf.entry.entry);
+                        if !keeps_history && (!version.is_latest() || version.is_delete_marker()) { continue; }
+                        if !keeps_history && !dest_storage.storage().holds_directory_objects() && nf.entry.get_is_dir() {
+                            copy_namespace::create_dir_all(dest_storage.storage(), &nf.entry.entry).await?;
+                            progress.dirs_created.fetch_add(1, Ordering::Relaxed);
+                            transport.send(ReceiverMsg::ClassifiedObservation { ndx: nf.ndx, decision: TransferDecision::FullTransfer }).await?;
+                            transport.send(ReceiverMsg::Success { ndx: nf.ndx }).await?;
+                            continue;
+                        }
+                    }
+                    let decision = if nf.entry.view().version().is_some() { TransferDecision::FullTransfer } else { dest_index.check(&nf.entry.entry) };
                     if state
                         .handle_base_classification(transport, dest_storage, progress, nf.ndx, &nf.entry, decision)
                         .await
@@ -676,8 +686,14 @@ pub(crate) async fn recv_file_list_and_data_phase(
             }
 
             // ── 文件开始：标记走全量流式路径，交 disk-commit task 起 resume_prepare + write_chunk_stream ──
-            Some(SenderMsg::FileBegin { ndx, entry }) => {
-                state.begin_full(&dc_tx, ndx, entry).await;
+            Some(SenderMsg::WriteDeleteMarker { ndx }) => {
+                if let Some(entry) = state.indexed_entry(ndx).cloned() {
+                    dc_tx.send(DiskCommitMsg::WriteDeleteMarker { ndx, entry }).await
+                        .map_err(|_| AppError::CopyError("Disk commit task closed before delete marker".into()))?;
+                }
+            }
+            Some(SenderMsg::FileBegin { ndx }) => {
+                if let Some(entry) = state.indexed_entry(ndx).cloned() { state.begin_full(&dc_tx, ndx, entry).await; }
             }
 
             // ── 数据流模式：目录 ──
@@ -689,10 +705,10 @@ pub(crate) async fn recv_file_list_and_data_phase(
                         .await;
                     continue;
                 }
-                if let Err(e) = dest_storage.create_dir_all(&entry).await {
+                if let Err(e) = copy_namespace::create_dir_all(dest_storage.storage(), &entry).await {
                     warn!("[Receiver Remote] create_dir {:?}: {}", entry.get_relative_path(), e);
                 }
-                let _ = dest_storage.set_entry_metadata(&entry).await;
+                let _ = copy_metadata::set_entry_metadata(dest_storage.storage(), &entry).await;
                 progress.dirs_created.fetch_add(1, Ordering::Relaxed);
                 let _ = transport.send(ReceiverMsg::EntrySuccess { entry }).await;
             }
@@ -710,7 +726,7 @@ pub(crate) async fn recv_file_list_and_data_phase(
                     }
                     continue;
                 }
-                match dest_storage.create_symlink(&entry, &target).await {
+                match copy_namespace::create_symlink(dest_storage.storage(), &entry, &target).await {
                     Ok(()) => {
                         progress.files_transferred.fetch_add(1, Ordering::Relaxed);
                         let _ = transport.send(ReceiverMsg::EntrySuccess { entry }).await;
@@ -729,8 +745,8 @@ pub(crate) async fn recv_file_list_and_data_phase(
             }
 
             // ── 数据流模式：文件数据块 → 转发给 disk-commit task 的 write_chunk_stream ──
-            Some(SenderMsg::FileData { entry, chunk }) => {
-                if let Err(error) = state.accept_full_chunk(transport, &dc_tx, entry, chunk).await {
+            Some(SenderMsg::FileData { ndx, chunk }) => {
+                if let Err(error) = state.accept_full_chunk(transport, &dc_tx, ndx, chunk).await {
                     receive_failure = Some(error);
                     break;
                 }
@@ -740,14 +756,14 @@ pub(crate) async fn recv_file_list_and_data_phase(
             //    issue #54 阶段 3），首个属于该 ndx 的 token 先触发一次 DeltaBegin ──
             Some(SenderMsg::DeltaMatch { ndx, block_index }) => {
                 if let Some(entry) = state.indexed_entry(ndx).cloned() {
-                    state.push_delta_match(&dc_tx, ndx, &entry, block_index).await;
+                    state.push_delta_match(&dc_tx, ndx, &entry.entry, block_index).await;
                 } else {
                     warn!("[Receiver Remote] DeltaMatch for unknown ndx {}", ndx);
                 }
             }
             Some(SenderMsg::DeltaData { ndx, data }) => {
                 if let Some(entry) = state.indexed_entry(ndx).cloned() {
-                    if let Err(error) = state.accept_delta_data(transport, &dc_tx, ndx, &entry, data).await {
+                    if let Err(error) = state.accept_delta_data(transport, &dc_tx, ndx, &entry.entry, data).await {
                         receive_failure = Some(error);
                         break;
                     }
@@ -760,18 +776,25 @@ pub(crate) async fn recv_file_list_and_data_phase(
             //    rename）；否则是 delta 路径（含零 token 的空文件 delta，session state
             //    幂等补发 DeltaBegin），同样交 disk-commit task 三段式收尾。完成计数统一
             //    在 dc ack 回流时才 +1（session outcome policy 做 redo 决策，全量/delta 共用一份状态机）──
-            Some(SenderMsg::EndOfFile { ndx, entry, source_hash }) => {
-                if !state.commit_full(&dc_tx, ndx, &entry, &source_hash).await {
-                    state.commit_delta(&dc_tx, ndx, &entry, &source_hash).await;
+            Some(SenderMsg::EndOfFile { ndx, source_hash }) => {
+                if let Some(entry) = state.indexed_entry(ndx).cloned() {
+                    if !state.commit_full(&dc_tx, ndx, &entry.entry, &source_hash).await {
+                        state.commit_delta(&dc_tx, ndx, &entry.entry, &source_hash).await;
+                    }
                 }
             }
 
             // ── ACL 跨进程 ──
             Some(SenderMsg::SetAcl { entry, acl_data }) => {
-                if session_config.enable_acl
-                    && let Err(e) = dest_storage.set_acl_bytes(entry.get_relative_path(), &acl_data).await
-                {
-                    warn!("[Receiver Remote] set ACL {:?}: {}", entry.get_relative_path(), e);
+                if session_config.enable_acl {
+                    let result = async {
+                        let acl = decode_acl(&acl_data)?;
+                        copy_metadata::apply_acl(dest_storage.storage(), entry.get_relative_path(), acl).await?;
+                        Ok::<_, AppError>(())
+                    }.await;
+                    if let Err(e) = result {
+                        warn!("[Receiver Remote] set ACL {:?}: {}", entry.get_relative_path(), e);
+                    }
                 }
             }
 
@@ -846,12 +869,12 @@ pub(crate) async fn recv_file_list_and_data_phase(
 mod tests {
     use super::*;
     use crate::storage_factory::{StorageRole, create_storage_for_role};
-    use storage_adapter::dir_tree::DirPageResult;
     use tokio::{
         fs,
         sync::mpsc,
         time::{Duration, timeout},
     };
+    use transport::directory::DirPageResult;
     use transport::{in_process::create_in_process_pair, traits::SenderTransport};
 
     #[tokio::test]
@@ -975,3 +998,7 @@ mod tests {
         assert!(resolve_delta_size_threshold(&Some("not-a-size".to_string())).is_err());
     }
 }
+
+#[cfg(test)]
+#[path = "receiver/copy_failure_tests.rs"]
+mod copy_failure_tests;

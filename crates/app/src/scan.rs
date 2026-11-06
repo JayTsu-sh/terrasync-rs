@@ -6,6 +6,12 @@ use licensing::{get_global_license, verify::quick_verify};
 use tokio_util::sync::CancellationToken;
 use utils::app_config::AppConfig;
 
+mod observation;
+pub use observation::observe_path;
+mod packaging;
+mod recovery;
+pub mod source;
+
 pub(crate) mod cancellation;
 pub(crate) mod progress;
 pub(crate) mod statistics;

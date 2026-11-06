@@ -17,8 +17,8 @@ use std::time::Duration;
 // 外部crate
 use data_mover::model::{EntryKind, ObservedEntry};
 use reqwest::Response;
-use storage_adapter::StorageEntryMessage;
-use storage_adapter::observed_scan::{EntryStatistics, ObservedScanEvent, ObservedView};
+use task_model::StorageEntryMessage;
+use task_model::observation::{EntryStatistics, ObservedScanEvent, ObservedView};
 use tokio::sync::{Mutex, mpsc};
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
@@ -90,12 +90,15 @@ impl StatisticConsumer {
             return;
         }
         for view in ObservedView::all(entry) {
-            match &mut self.stats {
-                StatsKind::Full(stats) => stats.update(&view),
-                StatsKind::Incremental(stats) => stats.scanned.update(&view),
-            }
-            self.progress_bar.update_observed("scanned", &view);
+            self.update_scanned_view(view);
         }
+    }
+    pub(crate) fn update_scanned_view(&mut self, view: ObservedView<'_>) {
+        match &mut self.stats {
+            StatsKind::Full(stats) => stats.update(&view),
+            StatsKind::Incremental(stats) => stats.scanned.update(&view),
+        }
+        self.progress_bar.update_observed("scanned", &view);
     }
     pub(crate) fn clear_scan_distributions(&mut self) {
         let value = match &mut self.stats {
