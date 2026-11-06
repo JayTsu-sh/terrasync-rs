@@ -175,6 +175,7 @@
         <a class="sub" href="#fault-matrix">异常故障矩阵</a>
         <a class="sub" href="#verification">校验时机与内容</a>
         <a class="sub" href="#delete-failure">删除失败与恢复</a>
+        <a class="sub" href="#permanent-version-delete">版本化源永久删除</a>
         <a class="major" href="#statistics">05　统计与状态呈现</a>
         <a class="major" href="#delivery">06　职责与实施优先级</a>
         <a class="major" href="#acceptance">07　验收与未验证范围</a>
@@ -210,6 +211,7 @@
         <p>推荐优先完善现有 unordered 扫描、路径分派和目录统一收尾机制。只有需要提前完成子树时，再引入目录完成屏障；不将切换 blocks 或合并全部历史版本作为正确性的替代方案。</p>
         <div class="note"><p><strong>完成条件：</strong>保留源端时，目标文件和目录达到约定状态；删除源端时，还要确认迁移范围内的源项清理完成。结果未知、清理失败和通知失败分别表达。</p></div>
         <div class="note warn"><p><strong>删除硬约束：</strong>每个源对象对应的复制、校验及最终发布成功事实，必须先写入 ClickHouse 并取得持久化成功确认，才能发起源端删除。仅扫描入库、发送异步消息或进入内存批次，都不构成删除授权。</p></div>
+        <div class="note warn"><p><strong>版本化源端删除语义：</strong>永久删除迁移范围内已确认的指定版本，不能仅新增 delete marker 将当前对象隐藏。数据版本与已有 delete marker 都按明确版本身份处理，并遵守删除前 ClickHouse 入库确认约束。</p></div>
         <div class="note"><p><strong>本次全量迁移的性能目标：</strong>与优化前的全量迁移实现相比，优化后的整轮性能和内存开销都应相当。新增元数据观察、摘要、校验、ClickHouse 入库确认、源端清理和目录收尾的成本全部计入，不能只比较扫描或数据复制阶段，也不能以其他固定内存目标替代优化前后的实际对比。</p></div>
         <p>当前处于首次开发阶段，可直接调整任务契约、状态格式、表结构及 callback，无需设计旧版本兼容层。当前数据正确性、幂等、恢复和性能约束仍然有效。</p>
         <p class="muted small">证据边界：以下“当前实现”来自分析时工作区和 Cargo.toml 锁定的 data-mover 提交 <code>0070c1599689e6c3a5cb3c8e7df602e03f00ca97</code> 的源码阅读；方案和验收目标不代表已经实现或通过实测。</p>
@@ -227,7 +229,7 @@
               <tr><th scope="row">历史版本</th><td><a href="../../crates/app/src/copy_dispatch.rs">CopyQueues</a> 按路径分派；历史分段在同一 sender worker 顺序执行。</td><td><a href="../../crates/app/src/sender.rs">sender_worker</a> 记录失败后继续消费，仍需保证同一对象前序失败或未知时阻断后序发布。</td></tr>
               <tr><th scope="row">元数据摘要与快照</th><td><a href="../../crates/db/src/schema/columns.rs">表结构</a> 同时包含 entry_snapshot 和 metadata_hash。<a href="../../crates/db/src/scan/candidate_cache.rs">现有 hash</a> 用于候选事件缓存，普通基线写入可置空，且不覆盖完整 ACL／xattr。</td><td>不能把现有缓存 hash 当成完整迁移元数据指纹。摘要与原值的职责、读取投影及保留期限应分别定义。</td></tr>
               <tr><th scope="row">增量元数据范围</th><td><a href="../../crates/db/src/catalogue/comparison.rs">复制目录比较</a> 的元数据判据主要为 mode／uid／gid；<a href="../../crates/db/src/scan/compare.rs">原生扫描比较</a> 的目录分支优先处理目录标记。</td><td>必须将对象 tags、NFS ACL、xattr 及其他计划要求的元数据纳入文件和目录的增量比较；快照中保存了原值不等于比较逻辑已覆盖。</td></tr>
-              <tr><th scope="row">普通文件搬迁</th><td><a href="../../crates/app/src/file_copy/transfer.rs">execute_file</a> 调用 data-mover <code>move_file</code>。依赖库强制回读校验，应用所选元数据并发布，复核源对象后删除；拒绝指定历史版本。</td><td>当前先由 move_file 删除，再广播完成消息供数据库消费者入库，不满足“ClickHouse 入库确认后才能删除”。必须调整确认边界；完整元数据要求与历史版本删除也需单独定义。</td></tr>
+              <tr><th scope="row">普通文件搬迁</th><td><a href="../../crates/app/src/file_copy/transfer.rs">execute_file</a> 调用 data-mover <code>move_file</code>。依赖库强制回读校验，应用所选元数据并发布，复核源对象后删除；拒绝指定历史版本，其 S3 删除保留历史。</td><td>当前先由 move_file 删除，再广播完成消息供数据库消费者入库，不满足“ClickHouse 入库确认后才能删除”；也不能承担版本化源的指定版本永久删除。必须调整确认边界与删除接口。</td></tr>
               <tr><th scope="row">软链接与 ACL</th><td><a href="../../crates/app/src/receiver.rs">process_entry_on_receiver</a> 对源软链接删除失败、ACL 复制失败只记日志；ACL 处理位于文件搬迁之后。</td><td>统一严格错误传播；必需元数据应在源端删除前完成，不能将这些失败折叠为 entry 成功。</td></tr>
               <tr><th scope="row">超时与恢复</th><td><a href="../../crates/app/src/dir_walker.rs">DirectoryWalker::new</a> 默认没有设置 operation timeout 和 recovery window，普通全量遍历使用这个入口。</td><td>全量迁移应显式传递扫描和复制的恢复策略，不能借用独立扫描路径的能力作为达标证据。</td></tr>
               <tr><th scope="row">统计与诊断</th><td><a href="../../crates/app/src/consumer/stats/report.rs">ProgressDetail::Full</a> 主要是数量、字节和错误数；已有<a href="../../crates/app/src/consumer/stats/diagnostics.rs">有界诊断发件箱与批次 ACK</a>。</td><td>增加目标就绪、删除结果、目录收尾、结果未知等状态；保留结构化错误原因和可查询明细。</td></tr>
@@ -280,6 +282,7 @@
           <li>恢复依据已确认版本边界；版本化目标写入响应丢失时，先核对目标版本，不能盲目重放并生成额外版本。</li>
         </ul>
         <p>删除标记也属于顺序契约。目标支持原生历史时迁移版本与删除标记；NFS 等不能表达同名多版本的目标，应预先明确“仅迁移当前可见版本”或另行定义历史保存格式。要求完整保留历史而目标无法表达时，启动前拒绝。</p>
+        <p>删除源端时，迁移范围内的源版本采用永久删除。完整历史搬迁不能在目标仅保留当前版本时继续清理全部源历史；必须先具备完整历史表达与校验能力。源端版本 ID 与目标新生成的版本 ID 分别记录，不要求相同。</p>
         <p>现有保守恢复限制应保留到对账机制完整：当前实现会拒绝未完成的源端删除任务自动恢复，以及版本化目标的未知写入自动重放，不能通过简单放开限制代替恢复设计。</p>
 
         <h3 id="metadata-plan">3.5　扫描 plan：按实例能力与迁移要求编译</h3>
@@ -417,7 +420,7 @@
             <caption>ClickHouse 确认与删除授权契约</caption>
             <thead><tr><th scope="col">环节</th><th scope="col">必须满足的条件</th></tr></thead>
             <tbody>
-              <tr><th scope="row">入库事实</th><td>绑定 job、迁移轮次、执行身份、源对象身份／版本、目标发布身份、数据及必需元数据校验结果和计划。不能复用其他轮次或其他对象的旧成功记录。</td></tr>
+              <tr><th scope="row">入库事实</th><td>绑定 job、迁移轮次、执行身份、源对象身份／版本、目标发布身份、数据及必需元数据校验结果和计划。版本化源还需保存源端与目标端各自的版本 ID、数据版本／delete marker 类型和永久删除语义。不能复用其他轮次或其他对象的旧成功记录。</td></tr>
               <tr><th scope="row">成功确认</th><td>db 层确认对应记录已按 Single／Cluster 的持久化契约成功写入，才向该对象返回入库确认。内存队列、广播成功、启动 INSERT 或未完成的异步写入均不算确认。</td></tr>
               <tr><th scope="row">批量入库</th><td>允许有界批次和限时刷新。只有已确认批次覆盖的对象才能进入删除队列；未确认对象继续等待。确认失败或部分结果未知时，不得整批授权删除。</td></tr>
               <tr><th scope="row">确认丢失</th><td>超时不等于写入失败，也不等于写入成功。按同一幂等身份对账或重试，取得对应事实已持久化的确定证据后，才能继续删除。</td></tr>
@@ -469,6 +472,8 @@
               <tr><th scope="row">ClickHouse 确认丢失／超时</th><td>不删除未获确定入库确认的对象。</td><td>按同一对象与执行身份对账，取得已持久化证据后才能继续；不能凭旧记录或队列状态放行。</td></tr>
               <tr><th scope="row">删除成功后记账失败／崩溃</th><td>不依据新扫描缺失直接清理目标。</td><td>利用删除前已经确认写入 ClickHouse 的事实，结合当前源和目标对账，再补记删除结果。</td></tr>
               <tr><th scope="row">源只读／权限不足</th><td>保留源文件和已就绪目标。</td><td>标记清理失败；原因消除后复核身份，仅重试删除。</td></tr>
+              <tr><th scope="row">指定版本删除失败／受保护</th><td>保留未成功删除的源版本。</td><td>按版本报告权限、Object Lock、保留策略或 MFA 等原因；不能退回不带版本 ID 的逻辑删除，也不能自动绕过保护。</td></tr>
+              <tr><th scope="row">版本永久删除响应丢失</th><td>只对原源版本身份对账或重试。</td><td>查询指定版本及版本清单，不能以当前 key 的 GET 返回不存在判定历史版本已删除；不得误删同 key 新增的版本。</td></tr>
               <tr><th scope="row">用户取消</th><td>停止新删除。</td><td>收束在途操作，保留已发删除的实际或未知结果。</td></tr>
               <tr><th scope="row">旧执行未停止／并发接管</th><td>不允许新执行继续删除。</td><td>先收束旧执行，确认身份和副作用，再允许接管。</td></tr>
               <tr><th scope="row">目录非空／枚举不完整</th><td>保留目录及残留项。</td><td>报告未完成、过滤保留或并发新增，不升级为递归删除。</td></tr>
@@ -505,8 +510,19 @@
         <h3 id="delete-failure">4.7　删除失败：保留目标，只恢复清理阶段</h3>
         <p>源端网络闪断可有限重试；只读、权限不足、对象锁或保留策略限制，应准确上报并停止无效重试。目标已就绪的事实必须保留，避免后续重新复制整文件。</p>
         <p>重试删除前，确认 ClickHouse 中对应轮次、执行与对象的就绪事实已持久化，复核目标证据仍有效、源路径仍指向原对象。删除曾返回未知时，即使路径重新存在，也不能直接继续删除，因为它可能已经是新文件。</p>
-        <div class="note warn"><p><strong>版本化源的“删除”必须定义：</strong>隐藏当前对象与永久删除指定历史版本是不同操作。S3 版本化桶中，不带 versionId 的删除通常新增 delete marker，历史数据仍保留，见 <a href="https://docs.aws.amazon.com/AmazonS3/latest/userguide/DeletingObjectVersions.html">S3 删除版本语义</a>。</p></div>
-        <p>目标仅保存当前版本时，未复制的历史版本不得成为本轮清理对象。若要求迁移并删除全部历史，必须建立逐版本目标确认、源版本删除和删除标记处理规则；当前普通 move_file 接口不能承担这个语义。</p>
+        <h4 id="permanent-version-delete">版本化源：永久删除指定版本</h4>
+        <p>版本化源端的删除明确为永久删除，不使用新增 delete marker 的方式代替。以 S3 为例，应携带源端指定 versionId 调用删除接口；已有 delete marker 也通过其自身 versionId 永久删除。协议依据见 <a href="https://docs.aws.amazon.com/AmazonS3/latest/API/API_DeleteObject.html">S3 DeleteObject</a> 与 <a href="https://docs.aws.amazon.com/AmazonS3/latest/userguide/ManagingDelMarkers.html">delete marker 永久删除</a>。</p>
+        <ol>
+          <li>完整枚举迁移范围内的历史版本和 delete marker，按源端历史顺序在目标落地；数据版本校验内容及约定元数据，delete marker 校验对应目标历史状态。</li>
+          <li>逐版本将源／目标版本映射、校验及发布结果写入 ClickHouse 并确认。保留源历史顺序与清理进度，不能只保留当前 key 的一个完成标记。</li>
+          <li>推荐同一 key 的全部计划版本与标记都在目标就绪且入库确认后，才清理该 key 的源历史。按已完成历史分段的持久化事实推进，不将所有版本原值加载到内存。</li>
+          <li>先清理非当前历史版本与标记，当前版本或当前 delete marker 最后处理，避免清理过程中将旧版本重新暴露为当前可见内容。当前身份变化时重新核验，不删除计划外新版本；并发源修改仍需满足既定独占或条件操作要求。</li>
+          <li>每次永久删除绑定源 backend、key 和源 versionId，成功后将该版本删除结果写回 ClickHouse。结果未知时只对账原版本；不能把目标版本 ID、当前版本或同名新版本作为重试删除目标。</li>
+        </ol>
+        <p>普通版本 ID 可用于精确指定删除对象；对于 versioning suspended 等情况下可能被替换的 null 版本，必须显式传递 null 版本身份，并增加相应身份校验、条件删除或独占控制，不能将字符串 null 当作不可变版本保证。</p>
+        <p>只有对应版本确已确认永久删除，才能增加“源数据版本永久删除数”或“源 delete marker 永久删除数”；只有该 key 的全部计划清理项都确认完成，才算该对象搬迁完成。源端逻辑不可见不等于全部历史已永久删除，逻辑删除数量也不能作为永久删除数量或已释放存储空间的证据。</p>
+        <p>目标仅保存当前版本时，未复制的历史版本不得成为本轮清理对象。完整历史搬迁而目标无法承载全部历史时，应在执行前拒绝该组合。若计划明确只选择部分版本，仅永久删除这些已迁移并确认的版本，其余源历史保留且准确报告；若删除当前版本／标记会使未迁移旧版本意外重新可见，应拒绝该计划，不能通过额外逻辑删除掩盖。要求清空源 key 的完整历史时，必须迁移并确认其全部版本及标记。</p>
+        <p>当前普通 move_file 接口拒绝指定历史版本，且 S3 现有移除语义保留历史，因此必须补齐 data-mover／客户端的指定版本永久删除能力及任务层确认流程。源端永久删除与目标端回放 delete marker 是不同操作，不能共用模糊的 delete 成功状态。</p>
       </section>
 
       <section id="statistics">
@@ -521,7 +537,7 @@
               <tr><th scope="row">执行中</th><td>排队、复制中、校验中、等待 ClickHouse 入库确认、已入库待删除、重试等待、依赖恢复中。</td><td>目标已就绪但尚未确认入库时不能计作可删除；恢复不等于最终失败，依赖故障不放大为无数个独立文件失败。</td></tr>
               <tr><th scope="row">目标结果</th><td>目标已就绪、最终失败、结果未知；数量和逻辑字节分别统计。</td><td>目标未知写入先对账，不能直接记成功或按未执行重放。</td></tr>
               <tr><th scope="row">目录收尾</th><td>待处理、元数据已确认、失败；源目录待删除／已删除。</td><td>数据传输完毕不等于目录完成；非空目录单独报告原因。</td></tr>
-              <tr><th scope="row">源端清理</th><td>源文件已删除、待重试、失败、结果未知。</td><td>目标已就绪但清理失败时保留目标成功，不计作完整搬迁。</td></tr>
+              <tr><th scope="row">源端清理</th><td>源文件已删除、源数据版本永久删除数、源 delete marker 永久删除数、完整历史清理完成对象数，以及待重试、失败、结果未知。</td><td>按版本去重确认；逻辑不可见不能记作永久删除。目标已就绪但清理失败时保留目标成功，不计作完整搬迁。</td></tr>
               <tr><th scope="row">性能</th><td>逻辑完成字节、实际传输字节、重传字节、复用字节、校验读取字节、速率与耗时。</td><td>重传不增加逻辑完成字节，校验流量不冒充迁移有效吞吐。</td></tr>
               <tr><th scope="row">任务与通知</th><td>实际任务状态、当前阶段、完成条件、终态通知交付状态。</td><td>通知失败独立表达；不能改变迁移事实或将未交付载荷标为已交付。</td></tr>
             </tbody>
@@ -570,7 +586,7 @@
             <thead><tr><th scope="col">优先级</th><th scope="col">工作</th><th scope="col">可独立验收的结果</th></tr></thead>
             <tbody>
               <tr><th scope="row">P0</th><td>定义目标就绪、删除确认、结果未知及元数据必需项；修复只记日志的失败路径。</td><td>必需条件未满足不删源；ACL／软链接等失败准确影响结果。</td></tr>
-              <tr><th scope="row">P0</th><td>建立“目标就绪事实经 ClickHouse 入库确认后才能删除”的强制边界，调整当前 move_file 先删后入库顺序；绑定发布证据并提供受保护删除。</td><td>ClickHouse 未启用、写入失败或确认未知时不删除；故障或取消后可根据事实对账，不能误删新对象。确认队列及批次有界，整轮性能与内存对比随实现步骤验证。</td></tr>
+              <tr><th scope="row">P0</th><td>建立“目标就绪事实经 ClickHouse 入库确认后才能删除”的强制边界，调整当前 move_file 先删后入库顺序；绑定发布证据并提供受保护删除及指定源版本永久删除。</td><td>ClickHouse 未启用、写入失败或确认未知时不删除；版本化源不得降级为逻辑删除，未知结果只针对原版本对账。确认队列及批次有界，整轮性能与内存对比随实现步骤验证。</td></tr>
               <tr><th scope="row">P1</th><td>区分新全量和同轮恢复，完成 base 清理、身份隔离与恢复事实保留。</td><td>新全量启动前基线为空；同轮恢复不丢事实、不重复计数。</td></tr>
               <tr><th scope="row">P1</th><td>统一扫描 plan、元数据分类摘要与原值保留、恢复预算、结构化错误及统计契约。</td><td>tags、NFS ACL、xattr 等独立变化可被识别；必需项失败不推进成功基线；断网有界恢复；查询与 callback 口径一致。</td></tr>
               <tr><th scope="row">P1</th><td>完善目录统一收尾、空目录删除和多版本失败阻断。</td><td>目录元数据准确，非空目录保留，同对象前序失败不推进后序发布。</td></tr>
@@ -592,7 +608,7 @@
               <tr><th scope="row">分类元数据增量</th><td>size／mtime 不变而仅 tags、NFS ACL、xattr、mode／owner 或其他所选属性变化；覆盖文件与目录、属性删除与空集合、ACE 顺序、源目标映射、获取失败及应用失败后的再次增量，确保不漏更新或错误推进基线。</td></tr>
               <tr><th scope="row">摘要与获取成本</th><td>验证摘要确定性、观察状态区别、原值恢复引用和目录收尾；测量每对象实际 RPC 数、请求字节、摘要与快照存储量，不能将减少 SQL 列读取声称为减少源端 RPC。</td></tr>
               <tr><th scope="row">安全删除</th><td>逐项证明“目标就绪事实的 ClickHouse 持久化确认早于源删除请求”，覆盖普通文件、软链接、目录、历史版本和归档清理；覆盖删除响应丢失、删除后记账失败、源替换、只读、非空目录、归档清单变化。</td></tr>
-              <tr><th scope="row">多版本</th><td>跨多个 entry、多个 worker、长历史、删除标记、前序失败阻断；版本化目标未知写入不会盲目重放。</td></tr>
+              <tr><th scope="row">多版本</th><td>跨多个 entry、多个 worker、长历史、删除标记、前序失败阻断；版本化目标未知写入不会盲目重放。确认版本化源使用指定 versionId 永久删除，覆盖 delete marker、null 版本、受保护版本、删除响应丢失与同 key 新增版本；不能出现历史误删或清理期间旧版本意外重新可见。</td></tr>
               <tr><th scope="row">代次与隔离</th><td>同 job 新全量清理、同轮恢复、旧执行晚到确认、并发执行、选项或源目标变化；不同 job 不互相影响。</td></tr>
               <tr><th scope="row">故障时间</th><td>记录检测耗时、识别后恢复／退出耗时、取消耗时。扫描约 3 秒恢复窗口不能被并发、分页或重试重置。</td></tr>
               <tr><th scope="row">数据库与通知</th><td>按影响覆盖 Single／Cluster；验证未启用 ClickHouse 时拒绝删除模式，写入失败、确认丢失、批次部分未知或进程在确认前崩溃时没有未授权删除；验证对账恢复、checkpoint 与事实对齐、终态 callback 限次重试及可用 ClickHouse 保存失败载荷。</td></tr>
