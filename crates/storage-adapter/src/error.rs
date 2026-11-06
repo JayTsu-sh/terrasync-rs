@@ -1,4 +1,5 @@
 use data_mover::error::StorageError as NativeStorageError;
+use data_mover::qos::SourceQosSetupError;
 use task_model::TaskModelError;
 use tokio::task::JoinError;
 
@@ -9,7 +10,7 @@ use data_mover::{
     probes::ProbeFailure,
     storage::{
         BackendConnectError, CapabilityUnavailable, CreateDirectoryAllFailure, DeleteTreeTerminalFailure,
-        SourceQosValueError, StorageRoleFailure,
+        StorageRoleFailure,
     },
     tar_pack::TarFailure,
     transfer::{DirectPatchError, MoveFailure, TransferFailure, TransferValueError},
@@ -62,7 +63,7 @@ pub enum StorageError {
     #[error(transparent)]
     MetadataPlan(#[from] MetadataPlanError),
     #[error(transparent)]
-    SourceQos(#[from] SourceQosValueError),
+    SourceQos(#[from] SourceQosSetupError),
     #[error(transparent)]
     ModelValue(#[from] ModelValueError),
     #[error(transparent)]

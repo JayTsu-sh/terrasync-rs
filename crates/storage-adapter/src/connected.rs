@@ -5,7 +5,6 @@ use crate::{
     error::operation,
     options::BackendConfig as ProductBackendConfig,
     projection::{decode_acl, encode_acl},
-    streaming::source_qos,
     *,
 };
 use data_mover::storage::{
@@ -448,7 +447,7 @@ impl StorageContext {
                 request.with_identity_override(TransferIdentity::from_label(identity).map_err(StorageError::from)?);
         }
         if let Some(qos) = &options.qos {
-            request = request.with_source_qos(source_qos(qos, from.block_size)?);
+            request = request.with_source_qos(qos.source_group(from.block_size)?);
         }
         let outcome = if options.is_source_reserved {
             transfer::transfer(request).await?
@@ -479,7 +478,7 @@ impl StorageContext {
             ReadBackVerification::Disabled
         });
         if let Some(qos) = options.qos {
-            request = request.with_source_qos(source_qos(&qos, from.block_size)?);
+            request = request.with_source_qos(qos.source_group(from.block_size)?);
         }
         let outcome = if options.is_source_reserved {
             transfer::transfer(request).await?

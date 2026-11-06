@@ -226,6 +226,21 @@ write_positioned 集中连续偏移校验、完整摘要和恢复前缀跳过；
 - 有序版本、恢复及 null 历史 14 项：`/work/terrasync-db-refactor-evidence/release-db-refactor-catalogue-concrete-ordered-20261106-020042/report.json`。
 - Kerberos HDFS + Single／Cluster 各 15 项：`/work/terrasync-db-refactor-evidence/release-db-refactor-catalogue-concrete-hdfs-single-20261106-015940/report.json` 与 `/work/terrasync-db-refactor-evidence/release-db-refactor-catalogue-concrete-hdfs-cluster-20261106-015956/report.json`。远端上传校验与报告 SHA 相符，覆盖两轮扫描、复制／QUIC、权限、归档及回读。
 
+## 源读取预算由原生管理器持有
+
+原生提交 `2752c8293fc5ffb1606a2fb17bc68ae94493f10d` 将配置快照到 SourceQosPolicy 的编译及共享预算归 QosManager；删除 adapter 中全局 Weak／Moka 注册表和重复编译，普通复制、checkpoint、HDFS、expert source 及归档直接共用管理器预算。缓存随 manager clone 生命周期释放，每个快照沿用首次默认读上限；热更新后的调用创建新预算，活动旧流继续持有旧预算。无新增后台任务或按 entry 累积的集合。
+
+审查发现并修正锁外读取快照可能使旧调用覆盖新组的问题：现在持缓存锁后读取快照。4 项暂停时钟测试覆盖 clone 共用、热更新保留旧流、并发初始化及独立管理器／取消；8 路 admission 并发验证总预算，工作线程显式进入同一 runtime。原生完整 make ci 通过，日志 `/tmp/data-mover-source-group-final-v2-ci.log`；Standards／Spec 复审通过。
+
+TerraSync 最终 fmt、默认与 all-features workspace all-targets check、Clippy、532 项 workspace 测试和 16 项双进程 E2E 通过；86 个忽略项不计通过，日志前缀 `/tmp/terrasync-source-group-`。release SHA-256 为 `e8ee185342ba88103754d29f12b302c3d101e7bb3268a5e9be0c6158ce280948`，源码记录 `/tmp/terrasync-source-group-build-source.json`，构建前后源码指纹一致。
+
+该候选的 44 项真实回归通过，资源全部清理：
+
+- S3／Local、跨 S3、QUIC、两个并发归档的不限速／限速对照共 8 项：`/work/terrasync-db-refactor-evidence/release-db-refactor-source-group-qos-20261106-022230/report.json`。每项核对最终内容，S3 普通与远端路径还核对 tags。1 MiB 总载荷共享 256 KiB/s，四条限速链路分别约 4.13／4.13／4.12／4.54 秒，不限速约 0.22～0.63 秒。这是预算功能回归，不代表最终吞吐／RSS 验收。
+- Kerberos HDFS + ClickHouse Single／Cluster 各 18 项：`/work/terrasync-db-refactor-evidence/release-db-refactor-source-group-valid-hdfs-single-20261106-022419/report.json`、`/work/terrasync-db-refactor-evidence/release-db-refactor-source-group-valid-hdfs-cluster-20261106-022445/report.json`。每组保留 15 项扫描／复制／权限／归档／回读，再加 Local→HDFS 限速、HDFS→Local 不限速与限速 3 项。追加的限流用例关闭落库，不能将其计为集群落库验证；各 15 项原有场景分别验证对应部署。HDFS 源／目标的 1 MiB 载荷共享预算约 4.1～4.2 秒，回读内容一致。
+
+首次新增 HDFS 限速夹具使用了不适用该 NameNode 的 64 KiB block 配置，Prepare 失败，记录 `/work/terrasync-db-refactor-evidence/release-db-refactor-source-group-hdfs-single-20261106-022233/report.json`；改为 1 MiB 后重跑上述完整两组，未改变产品代码或放宽内容、限速断言。该失败及旧构建的脚本对照 8 项不计入本轮 44 项通过。
+
 ## 合入前仍须完成
 
 目录作用域、具体数据库接口及临时表协议已收敛；还需按设计删除 storage-adapter。任务契约与 transport 已分离，剩余存储机制和产品配置仍须分别归位。最终候选必须重跑对应 CI、真实 HDFS 和受影响故障链路，并完成全量／增量／续扫性能与峰值 RSS 对照。先前 HDFS 通过的二进制不能作为最终候选证据。

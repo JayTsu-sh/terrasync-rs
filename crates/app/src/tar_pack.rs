@@ -10,7 +10,7 @@ use task_model::ObservedEntryExt;
 
 // 内部模块
 use storage_adapter::qos::QosManager;
-use storage_adapter::{StorageContext, StorageError, source_qos};
+use storage_adapter::{StorageContext, StorageError};
 use {
     storage_adapter::{ObservedEntry, WalkDirAsyncIterator},
     task_model::StorageEntryMessage,
@@ -55,8 +55,9 @@ pub async fn pack_directory(
         cancel: Default::default(),
         source_qos: qos
             .as_ref()
-            .map(|qos| source_qos(qos, src_storage.block_size()))
-            .transpose()?,
+            .map(|qos| qos.source_group(src_storage.block_size()))
+            .transpose()
+            .map_err(StorageError::from)?,
     };
     let outcome = tar_pack::pack(request).await.map_err(StorageError::from)?;
     let tar_size = outcome.transferred_bytes;

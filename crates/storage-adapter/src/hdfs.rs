@@ -1,6 +1,5 @@
 use crate::ObservedEntryExt;
 use crate::options::transfer_policy;
-use crate::streaming::source_qos;
 use crate::*;
 use data_mover::transfer::{self, ReadBackVerification, TransferIdentity, TransferRequest};
 use std::sync::{Arc, atomic::Ordering};
@@ -56,7 +55,7 @@ impl StorageContext {
         .with_identity_override(TransferIdentity::from_label(recovery.identity).map_err(StorageError::from)?)
         .with_transfer_policy(transfer_policy(mode));
         if let Some(qos) = options.qos {
-            request = request.with_source_qos(source_qos(&qos, source.block_size)?);
+            request = request.with_source_qos(qos.source_group(source.block_size)?);
         }
         request = request.with_read_back_verification(if options.enable_integrity_check {
             ReadBackVerification::Enabled

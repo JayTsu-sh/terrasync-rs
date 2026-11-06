@@ -5,67 +5,23 @@ use blake3::Hash;
 use data_mover::storage::{PositionedChunk, WriteProgress, WriteProgressObserver};
 use data_mover::{
     model::*,
-    storage::{self, PositionedByteStream, SourceDescriptor, SourceQosGroup, SourceQosPolicy},
+    storage::{self, PositionedByteStream, SourceDescriptor},
     transfer::{
         DirectPatchChunk, DirectPatchInput, DirectPatchSession, ExpertDestinationRequest, ExpertDestinationSession,
         ExpertDestinationTransferred, ExpertSourceEvidence, ExpertSourceRequest, ExpertSourceSession,
     },
 };
 use futures::{Stream, StreamExt, stream};
-use moka::sync::Cache;
-use qos::{QosConfig, QosManager, parse_bandwidth_string};
+use qos::QosManager;
 use std::num::NonZeroUsize;
 use std::pin::Pin;
-use std::{
-    sync::{Arc, Mutex, OnceLock, Weak},
-    time::Duration,
-};
+use std::sync::{Arc, Mutex};
 use task_model::observation::{EntryStatistics, ObservedItem, ObservedView};
 use tokio::sync::{Mutex as AsyncMutex, mpsc};
 use tokio_util::sync::CancellationToken;
 
 type Input = Pin<Box<dyn Stream<Item = StreamChunk> + Send>>;
 
-/// 按共享产品配置获取同一原生读取预算，所有文件与归档复用该配置的预算。
-pub fn source_qos(qos: &QosManager, maximum: u64) -> Result<SourceQosGroup> {
-    type Groups = Cache<usize, (Weak<QosConfig>, SourceQosGroup)>;
-    static GROUPS: OnceLock<Groups> = OnceLock::new();
-    let config = qos.config();
-    let key = Arc::as_ptr(&config) as usize;
-    let groups = GROUPS.get_or_init(|| Cache::builder().support_invalidation_closures().build());
-    // 配置释放后移除预算；活跃配置的预算不能被容量或时间驱逐。
-    let _ = groups.invalidate_entries_if(|_, (owner, _)| owner.strong_count() == 0);
-    if let Some((_, group)) = groups.get(&key) {
-        return Ok(group);
-    }
-    let bandwidth = config.bandwidth.as_deref().map(parse_bandwidth_string).transpose()?;
-    let hard = config
-        .hard_bandwidth
-        .as_deref()
-        .map(parse_bandwidth_string)
-        .transpose()?;
-    let policy = SourceQosPolicy::new(
-        bandwidth.map(|soft| {
-            (
-                soft,
-                hard.unwrap_or_else(|| (soft as f64 * f64::from(config.peak_rate)) as u64)
-                    .max(soft),
-                config.peak_duration.unwrap_or(Duration::ZERO),
-            )
-        }),
-        config.max_io_bytes.unwrap_or(maximum).max(1),
-        config.iops.map(|soft| {
-            (
-                soft,
-                config.hard_iops.unwrap_or(soft).max(soft),
-                config.iops_peak_duration.unwrap_or(Duration::ZERO),
-            )
-        }),
-    )?;
-    // get_with 合并并发初始化，确保相同配置始终共用一个限流预算。
-    let (_, group) = groups.get_with(key, || (Arc::downgrade(&config), SourceQosGroup::new(policy)));
-    Ok(group)
-}
 impl StorageContext {
     /// 在发送 FileBegin 前由原生 source session 校验观察，并钉住所选源版本。
     pub async fn open_observed_source(
@@ -80,7 +36,7 @@ impl StorageContext {
         )?
         .with_maximum_chunk_bytes(maximum);
         if let Some(qos) = qos {
-            request = request.with_source_qos(source_qos(qos, storage.block_size)?);
+            request = request.with_source_qos(qos.source_group(storage.block_size)?);
         }
         Ok(ExpertSourceSession::open(request).await?)
     }

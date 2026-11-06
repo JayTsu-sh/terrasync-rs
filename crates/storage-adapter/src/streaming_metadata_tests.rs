@@ -16,6 +16,7 @@ use std::error::Error;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::task::Poll;
+use std::time::Duration;
 use std::{
     num::NonZeroUsize,
     path::{Path, PathBuf},
@@ -236,12 +237,12 @@ async fn stream_applies_mode_owner_and_timestamps_on_stage() {
 #[tokio::test]
 async fn qos_cache_shares_one_budget_for_the_same_config_under_concurrent_access() {
     let manager = QosManager::try_new(None, 1.0, None).unwrap();
-    let _first = source_qos(&manager, 128).unwrap();
+    let _first = manager.source_group(128).unwrap();
     let groups = std::thread::scope(|scope| {
         let handles: Vec<_> = (0..16)
             .map(|_| {
                 let manager = &manager;
-                scope.spawn(move || source_qos(manager, 256).unwrap())
+                scope.spawn(move || manager.source_group(256).unwrap())
             })
             .collect();
         handles
@@ -261,7 +262,8 @@ async fn qos_cache_shares_one_budget_for_the_same_config_under_concurrent_access
     }
     let independent = QosManager::try_new(None, 1.0, None).unwrap();
     assert_eq!(
-        source_qos(&independent, 256)
+        independent
+            .source_group(256)
             .unwrap()
             .transfer_budget()
             .admit_request(1024, &CancellationToken::new())
