@@ -298,3 +298,32 @@ HDFS 产物经 SHA 校验上传到本任务已有运行根；原始配置与 key
   日志保留了 RequestOutcomeUnconfirmed；修正 harness 后需分别核对取消耗时、未知结果、恢复后目录与累计统计，不能将未知写结果强行改标为已确认取消。
 - 相同 unordered／blocks 的无 DB 基线性能、峰值 RSS 和持续增长尚未完成。
 - 最终 callback 首次失败即退出、缺少文档目标中的三次重试及 ClickHouse 补偿，是基点 bedb632 已有流程，本次未改动；本轮不宣称该目标已达成。
+
+
+## 删除失败的独立行为修复与强退恢复验证
+
+storage-adapter 的结构迁移提交为 `da0dc0b`。随后独立修复删除结果：
+只对真实删除事件计数，Entry／Terminal 原因和取消保持有类型；保留首个错误，排空事件直到 native finish 后再返回，避免错误后遗留在途删除。
+成功日志仅在完整成功后产生，app 与 CLI 的根位置日志均复用 URL 脱敏。
+新增 2 项测试覆盖原始错误分类及未完成事件不能计数；相关测试、app Clippy 与 workspace all-features/all-targets check 均通过。
+
+必须纠正最初删除 harness 的证据：`without-adapter-rm-denial-red` 与 `without-adapter-rm-denial-green` 仅拦截 DELETE，没有拦截实际使用的 POST DeleteObjects，未命中拒绝分支，二者均不能证明拒绝行为。
+补齐批量拦截后，`without-adapter-rm-batch-denial-red` 在旧候选上明确记录 **1 次拒绝、保护对象未变，但 CLI 仍退出 0**，才是有效红测。
+
+修复候选 `/work/terrasync-db-refactor-rm-failure-v2`，SHA-256
+`728464b14052a2f099da5a00b2fea91c3d37cb03449814e748ba2a269db4e342`。来源 `/tmp/terrasync-rm-failure-v2-build-source.json`，构建前后及追加本文前核对指纹。
+
+真实 S3 两项绿测均通过：`/work/terrasync-db-refactor-evidence/release-db-refactor-without-adapter-rm-batch-denial-green-20261106-044136/report.json`。
+
+代理只拒绝本轮保护对象所在的删除批次，另一个已发出删除延迟 0.6 秒；CLI 失败后独立读回确认保护对象不变，允许删除的对象已完成，没有假成功日志或凭据泄漏。解除拒绝后再次删除成功；临时桶已清理。
+最初无效运行的 3 份含旧原始 URL 的自有日志已脱敏，不保留凭据副本。
+
+前一结构候选另有 **8 项真实 Single／Cluster 强退／重启回归通过**：
+- `single`：`/work/terrasync-db-refactor-evidence/release-db-refactor-without-adapter-resume-single-1793938701600005613/report.json`，4 项，4 个临时库均由测试 guard 清理。
+- `cluster`：`/work/terrasync-db-refactor-evidence/release-db-refactor-without-adapter-resume-cluster-1793938826074335154/report.json`，4 项，4 个临时库均由测试 guard 清理。
+
+覆盖已封存全量的 Pod 本地状态丢失、checkpoint 后事实的新 metadata cut、完整／增量的强退与正常取消，以及 unordered 重启。回读核对实际源路径、唯一数据库事实、已确认 checkpoint 与累计统计，没有通过重扫再次累计。
+
+网络矩阵 v2 的原报告整体未通过：单机 36 项及部分集群用例已通过；集群无注入的恢复执行遇到 1 秒 read_timeout，保留 RequestOutcomeUnconfirmed 并准确失败。
+该失败不能标成整套通过，也没有因此改产品错误语义。将真实集群正常请求的读时限设为 5 秒后，独立的集群增量闪断及恢复对照已通过；完整矩阵仍需完成。
+最终 callback 的基点既有限制与性能/RSS 门禁仍按上节标为未完成。

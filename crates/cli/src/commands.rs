@@ -326,7 +326,7 @@ pub async fn ace_copy_cmd(
 
 /// 处理删除命令
 pub async fn rm_cmd(path: &str) -> Result<()> {
-    info!("执行删除命令，路径: {}", path);
+    info!("执行删除命令，路径: {}", redact_storage_url(path));
 
     rm(path).await?;
 
