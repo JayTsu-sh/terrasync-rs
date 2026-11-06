@@ -1,6 +1,6 @@
 # 原生观察重构：阶段验证记录
 
-本记录区分已完成的阶段验证与最终验收。当前工作分支尚未合入；本页不代表整个数据库重构已完成。
+本记录保留各候选的阶段证据，最新结论见文末“最终功能回归与合入审查”。性能已按用户要求暂停，完整性能验收尚未完成。
 
 ## 已提交的观察绑定
 
@@ -601,3 +601,57 @@ functional_passed=true、cleanup_passed=true、performance_passed=null；其 1ms
 本轮完整／中断／受干扰结果、RSS 曲线、版本摘要及原始报告 SHA 见 [性能实测记录](../perf/2026-11-06-db-refactor-ab.md)。
 两次 16／100000 NoDB 对照中，首轮两版完整，重复轮仅旧版完整；同一旧版耗时变化 -19.07%，尚不能将首轮差值归因为固定代码回退。
 完整性能矩阵未完成，后续功能审查和合入决定须保持这一状态表述。
+
+## 最终功能回归与合入审查
+
+用户在暂停性能、固定 PR #135／#137 历史基准后，要求完成剩余功能验证及代码 review，通过后合入 GitHub 主分支。
+本节更新最终功能与审查结论；前文各阶段的“正在执行／未合入”保留为当时状态，不代表当前结论。
+**性能继续暂停，完整性能验收未完成，已有回退／波动及未定位根因继续保留，未将其标为通过。**
+
+最终运行时为 `5b0fe97`；其后提交只涉及文档。真实 CLI SHA-256 为
+`9f0c14a70d76ac98aa3c9634cca40cd78e851dc9b243dc491cd2cfcaa3b4f39f`，
+扫描 API 探针 SHA-256 为 `3bc173026b2dad419495fe33e286b97c66f07ef4d874b4aef5a75eb9dce33d8c`。
+构建时的 9508426 工作树差异排除 docs 后与最终 5b0fe97 运行时差异一致；没有因后续文档提交更换二进制。
+
+最终 CLI 重新完成 **105 项真实 S3／QUIC／HA Kerberos HDFS 回归**：
+
+| 场景 | 通过项数 |
+| --- | ---: |
+| 虚拟目录／真实目录对象 | 8 |
+| marker／tags／目标后代保护 | 17 |
+| 多版本／null／删除标记／历史顺序 | 14 |
+| 打包源变化保护／manifest | 8＋2 |
+| 增量 basis／checkpoint 源变化 | 3＋2 |
+| 发布权限拒绝／删除失败 | 1＋2 |
+| S3 源端 QoS | 8 |
+| 目标写成功后 ACK 丢失 | 4 |
+| HA Kerberos HDFS：Single／Cluster 配置 | 18＋18 |
+
+HDFS 覆盖 unordered／blocks 首次与无变化重扫、真实 mode／sticky mode、内容完整性、本地与独立 QUIC 接收、打包及 QoS。
+部分 QoS 用例关闭数据库，不能按 DB 部署模式重复宣称其验证范围。RustFS 禁用 tags profile 仍不等于 DXN 实机验证。
+所有本轮临时数据库、bucket／对象、HDFS 目录与私有配置的清理检查通过。额外执行的 HDFS 11＋11 项子集不重复计数。
+
+最终扫描 API 另通过 **25 项真实 ClickHouse 响应丢失验证**：
+
+- Single／Cluster × full／incremental／resume／incremental_resume × data、state 提交、manifest，共 24 项。
+- Single 全量初始化 `baseline_committed=false` 的首次状态写，再加 1 项。
+
+代理只在真实上游返回成功后截断相应响应，验证同一逻辑重试保持非空 token 与请求 body hash；state／manifest 组同时把 query 参数中的 SQL 纳入 hash。
+state 主组命中已提交状态；普通扫描 manifest 命中 FINALIZING 且 observed_entries=372，续扫命中 RUNNING、observed_entries>0、非空 checkpoint。
+同次执行恢复成功，再用新工作目录重开，独立核对 372 个唯一实际路径、COMPLETED manifest、清空 checkpoint、完成标志及累计扫描／保留数。
+功能用 checkpoint 间隔为 1ms，不作为生产 60 秒 checkpoint 或性能证据；现有 owned-state 物理去重契约另计于 76 项数据库验证。
+data 组的 fault_requests 统计代理活动期间的请求，可能包括并发健康检查，不能直接解释为被截断响应数量。
+
+初版辅助查询存在表名大小写和集群共享 state 漏 job_id 过滤的问题，导致代理解析错误、未命中预期注入；两个失败整组保留并排除通过统计。另外两次 manifest 整组在集群首项注入前遇到 InvalidAccessKeyId：脚本清理字段的模块级循环覆盖了 S3 access-key 变量，切换部署后 URL 使用了错误凭据；同样保留并排除，修正变量名后独立整组复测。
+修正脚本的任务隔离后重测通过，没有据此修改产品代码、恢复预算或错误分类。
+
+可核验汇总、各组原始报告路径、SHA-256、注入阶段及最终计数见 [最终功能证据](evidence/2026-11-06-db-native-final-functional.json)。
+原始日志、驱动和报告保留在 `/work/terrasync-db-refactor-evidence/`；性能证据及独立源夹具按暂停时状态保留。
+
+Standards 轴：固定基点 bedb632、候选 aeeb5e9，未发现新增且未解决的规范／架构阻断；职责、模块边界、目录／文件／函数内聚以及共享借用边界通过。
+Spec 轴：相同固定点未发现新增实现阻断；建议的最终 state／manifest 响应丢失补测已完成。
+EntryEnum、注册机制、宽数据库 trait 和 storage-adapter 已删除，Single／Cluster 差异留在 db；最终文档没有改变运行时代码。
+前述最终本地检查 539 项＋16 项 E2E、76 项真实 DB 契约，以及 GitHub Rust／Web／MCP CI 的通过证据继续有效；未重跑无变化的全量本地检查。
+
+剩余项如实保留：完整性能／RSS 验收和回退根因、HDFS 网络故障、基点既有的 callback 重试／ClickHouse 补偿限制。
+这些未写成已实现或已验证。合入通过 [PR #141](https://github.com/JayTsu-sh/terrasync-rs/pull/141) 执行，遵守最终提交的 GitHub 分支保护检查。

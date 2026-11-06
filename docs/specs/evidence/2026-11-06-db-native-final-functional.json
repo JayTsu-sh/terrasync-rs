@@ -1,0 +1,676 @@
+{
+  "runtime_commit": "5b0fe97e67ef07704feb5d9b98e2bff76c302384",
+  "review_base": "bedb63239b26f4ceea383edd94aff78135ad0780",
+  "review_head_before_final_documentation": "aeeb5e908180d3437d61f65c6d9e62375c2af3e9",
+  "cli_sha256": "9f0c14a70d76ac98aa3c9634cca40cd78e851dc9b243dc491cd2cfcaa3b4f39f",
+  "scan_probe_sha256": "3bc173026b2dad419495fe33e286b97c66f07ef4d874b4aef5a75eb9dce33d8c",
+  "scope": "Final-runtime small-fixture functional regression only; performance remains paused and incomplete. HDFS network faults and DXN appliance not covered. HDFS/S3 QoS cases may explicitly disable DB.",
+  "suites": [
+    {
+      "suite": "point",
+      "kind": "cli",
+      "case_count": 8,
+      "passed": true,
+      "report": "/work/terrasync-db-refactor-evidence/release-db-refactor-merge-final-point-20261106-150136/report.json",
+      "report_sha256": "953022a288fec9074d5a7b7089dae619356f5351ef9f37b5cf1e5ad780fba75d",
+      "cli_sha256": "9f0c14a70d76ac98aa3c9634cca40cd78e851dc9b243dc491cd2cfcaa3b4f39f",
+      "cleanup_passed": true
+    },
+    {
+      "suite": "markers",
+      "kind": "cli",
+      "case_count": 17,
+      "passed": true,
+      "report": "/work/terrasync-db-refactor-evidence/release-db-refactor-merge-final-markers-20261106-150156/report.json",
+      "report_sha256": "6fedd1beae593ff74a3b0db57c784a906782f3511b53d83c75506c16e30a069e",
+      "cli_sha256": "9f0c14a70d76ac98aa3c9634cca40cd78e851dc9b243dc491cd2cfcaa3b4f39f",
+      "cleanup_passed": true
+    },
+    {
+      "suite": "ordered",
+      "kind": "cli",
+      "case_count": 14,
+      "passed": true,
+      "report": "/work/terrasync-db-refactor-evidence/release-db-refactor-merge-final-ordered-20261106-150302/report.json",
+      "report_sha256": "e0fc541ed9615b7b28f08b02eea673f182a5b03e0a8dcb4ddfb29c66471caeb7",
+      "cli_sha256": "9f0c14a70d76ac98aa3c9634cca40cd78e851dc9b243dc491cd2cfcaa3b4f39f",
+      "cleanup_passed": true
+    },
+    {
+      "suite": "tar-guards",
+      "kind": "cli",
+      "case_count": 8,
+      "passed": true,
+      "report": "/work/terrasync-db-refactor-evidence/release-db-refactor-merge-final-tar-guards-20261106-150417/report.json",
+      "report_sha256": "90c84ca1aac89fe0429f72f0d9ea623a4140e718cb37bd8d08154dab082d3f62",
+      "cli_sha256": "9f0c14a70d76ac98aa3c9634cca40cd78e851dc9b243dc491cd2cfcaa3b4f39f",
+      "cleanup_passed": true
+    },
+    {
+      "suite": "tar-manifest",
+      "kind": "cli",
+      "case_count": 2,
+      "passed": true,
+      "report": "/work/terrasync-db-refactor-evidence/release-db-refactor-merge-final-tar-manifest-20261106-150519/report.json",
+      "report_sha256": "1340d5680d3e7935cce2e35f00810de555c4fb3437bbc8d3ffc537b8a6b78562",
+      "cli_sha256": "9f0c14a70d76ac98aa3c9634cca40cd78e851dc9b243dc491cd2cfcaa3b4f39f",
+      "cleanup_passed": true
+    },
+    {
+      "suite": "basis",
+      "kind": "cli",
+      "case_count": 3,
+      "passed": true,
+      "report": "/work/terrasync-db-refactor-evidence/release-db-refactor-merge-final-basis-20261106-150530/report.json",
+      "report_sha256": "2df01a479ce5c4086734399cc39216b8e48534894109de4a2b6f5a9b36f5f02a",
+      "cli_sha256": "9f0c14a70d76ac98aa3c9634cca40cd78e851dc9b243dc491cd2cfcaa3b4f39f",
+      "cleanup_passed": true
+    },
+    {
+      "suite": "checkpoint-source-cut",
+      "kind": "cli",
+      "case_count": 2,
+      "passed": true,
+      "report": "/work/terrasync-db-refactor-evidence/release-db-refactor-merge-final-checkpoint-source-cut-20261106-150547/report.json",
+      "report_sha256": "6cbf67ca227859dec09a73137c1dd2cf81da5eec794bdd0bb5b0f4be1e02447a",
+      "cli_sha256": "9f0c14a70d76ac98aa3c9634cca40cd78e851dc9b243dc491cd2cfcaa3b4f39f",
+      "cleanup_passed": true
+    },
+    {
+      "suite": "publish-denial",
+      "kind": "cli",
+      "case_count": 1,
+      "passed": true,
+      "report": "/work/terrasync-db-refactor-evidence/release-db-refactor-merge-final-publish-denial-20261106-150606/report.json",
+      "report_sha256": "a7a17b59949f8ef1efbbc0797c65dcf72e6a0226cd33c6a77f8990fd8ff5ece6",
+      "cli_sha256": "9f0c14a70d76ac98aa3c9634cca40cd78e851dc9b243dc491cd2cfcaa3b4f39f",
+      "cleanup_passed": true
+    },
+    {
+      "suite": "qos",
+      "kind": "cli",
+      "case_count": 8,
+      "passed": true,
+      "report": "/work/terrasync-db-refactor-evidence/release-db-refactor-merge-final-qos-20261106-150617/report.json",
+      "report_sha256": "972c979877d1fc33e596ece10683d05d46abf2f26ed91b48e4db7988d34507f8",
+      "cli_sha256": "9f0c14a70d76ac98aa3c9634cca40cd78e851dc9b243dc491cd2cfcaa3b4f39f",
+      "cleanup_passed": true
+    },
+    {
+      "suite": "rm-denial",
+      "kind": "cli",
+      "case_count": 2,
+      "passed": true,
+      "report": "/work/terrasync-db-refactor-evidence/release-db-refactor-merge-final-rm-denial-20261106-150645/report.json",
+      "report_sha256": "f92a34671c65fc4cb319a828d806e5f0a186405e858019fde03225a191a8d008",
+      "cli_sha256": "9f0c14a70d76ac98aa3c9634cca40cd78e851dc9b243dc491cd2cfcaa3b4f39f",
+      "cleanup_passed": true
+    },
+    {
+      "suite": "target-lost-ack",
+      "kind": "cli",
+      "case_count": 4,
+      "passed": true,
+      "report": "/work/terrasync-db-refactor-evidence/release-db-refactor-merge-final-target-lost-ack-20261106-150655/report.json",
+      "report_sha256": "638b0dabfc05714207163d8c8adda13452eb20190120e292bc6c5ca1d3bf4173",
+      "cli_sha256": "9f0c14a70d76ac98aa3c9634cca40cd78e851dc9b243dc491cd2cfcaa3b4f39f",
+      "cleanup_passed": true
+    },
+    {
+      "suite": "hdfs-complete-single",
+      "kind": "cli",
+      "case_count": 18,
+      "passed": true,
+      "report": "/work/terrasync-db-refactor-evidence/release-db-refactor-merge-final-hdfs-complete-single-20261106-150553/report.json",
+      "report_sha256": "17b6d0a72a6e7c1d90891f09637ff7b1142f50b86b96532df95f43f281f927e3",
+      "cli_sha256": "9f0c14a70d76ac98aa3c9634cca40cd78e851dc9b243dc491cd2cfcaa3b4f39f",
+      "cleanup_passed": true
+    },
+    {
+      "suite": "hdfs-complete-cluster",
+      "kind": "cli",
+      "case_count": 18,
+      "passed": true,
+      "report": "/work/terrasync-db-refactor-evidence/release-db-refactor-merge-final-hdfs-complete-cluster-20261106-150609/report.json",
+      "report_sha256": "5630ba51ea9e70be1f4383e1d08d946f547f9fa7a6ba6b655860cd80ca0c139d",
+      "cli_sha256": "9f0c14a70d76ac98aa3c9634cca40cd78e851dc9b243dc491cd2cfcaa3b4f39f",
+      "cleanup_passed": true
+    },
+    {
+      "suite": "ack-data",
+      "kind": "scan_api_ack_loss",
+      "case_count": 8,
+      "passed": true,
+      "report": "/work/terrasync-db-refactor-evidence/release-db-refactor-merge-final-ack-data-20261106-150353/report.json",
+      "report_sha256": "5925c33809d3761cb4d2451a6946d8f1559f521a34593948f4587ff4ccc1883b",
+      "cli_sha256": "9f0c14a70d76ac98aa3c9634cca40cd78e851dc9b243dc491cd2cfcaa3b4f39f",
+      "cleanup_passed": true,
+      "scan_probe_sha256": "3bc173026b2dad419495fe33e286b97c66f07ef4d874b4aef5a75eb9dce33d8c",
+      "cases": [
+        {
+          "name": "single-fault_full_database_lost_ack",
+          "ack_target": "data",
+          "same_execution_recovered": true,
+          "successful_response_loss_verified": true,
+          "proxy_active_request_observations": 1,
+          "stable_token_and_request_hash": true,
+          "final_unique_entries": 372,
+          "duplicates": 0,
+          "durable_scan_complete": true
+        },
+        {
+          "name": "single-fault_incremental_database_lost_ack",
+          "ack_target": "data",
+          "same_execution_recovered": true,
+          "successful_response_loss_verified": true,
+          "proxy_active_request_observations": 1,
+          "stable_token_and_request_hash": true,
+          "final_unique_entries": 372,
+          "duplicates": 0,
+          "durable_scan_complete": true
+        },
+        {
+          "name": "single-fault_resume_database_lost_ack",
+          "ack_target": "data",
+          "same_execution_recovered": true,
+          "successful_response_loss_verified": true,
+          "proxy_active_request_observations": 1,
+          "stable_token_and_request_hash": true,
+          "final_unique_entries": 372,
+          "duplicates": 0,
+          "durable_scan_complete": true
+        },
+        {
+          "name": "single-fault_incremental_resume_database_lost_ack",
+          "ack_target": "data",
+          "same_execution_recovered": true,
+          "successful_response_loss_verified": true,
+          "proxy_active_request_observations": 1,
+          "stable_token_and_request_hash": true,
+          "final_unique_entries": 372,
+          "duplicates": 0,
+          "durable_scan_complete": true
+        },
+        {
+          "name": "cluster-fault_full_database_lost_ack",
+          "ack_target": "data",
+          "same_execution_recovered": true,
+          "successful_response_loss_verified": true,
+          "proxy_active_request_observations": 1,
+          "stable_token_and_request_hash": true,
+          "final_unique_entries": 372,
+          "duplicates": 0,
+          "durable_scan_complete": true
+        },
+        {
+          "name": "cluster-fault_incremental_database_lost_ack",
+          "ack_target": "data",
+          "same_execution_recovered": true,
+          "successful_response_loss_verified": true,
+          "proxy_active_request_observations": 2,
+          "stable_token_and_request_hash": true,
+          "final_unique_entries": 372,
+          "duplicates": 0,
+          "durable_scan_complete": true
+        },
+        {
+          "name": "cluster-fault_resume_database_lost_ack",
+          "ack_target": "data",
+          "same_execution_recovered": true,
+          "successful_response_loss_verified": true,
+          "proxy_active_request_observations": 1,
+          "stable_token_and_request_hash": true,
+          "final_unique_entries": 372,
+          "duplicates": 0,
+          "durable_scan_complete": true
+        },
+        {
+          "name": "cluster-fault_incremental_resume_database_lost_ack",
+          "ack_target": "data",
+          "same_execution_recovered": true,
+          "successful_response_loss_verified": true,
+          "proxy_active_request_observations": 2,
+          "stable_token_and_request_hash": true,
+          "final_unique_entries": 372,
+          "duplicates": 0,
+          "durable_scan_complete": true
+        }
+      ]
+    },
+    {
+      "suite": "ack-v3-state",
+      "kind": "scan_api_ack_loss",
+      "case_count": 8,
+      "passed": true,
+      "report": "/work/terrasync-db-refactor-evidence/release-db-refactor-merge-final-ack-v3-state-20261106-151044/report.json",
+      "report_sha256": "7665b2c96c4998c294a5fbef385d3b184eb5f97ff50df687b7ace3bb127b4aed",
+      "cli_sha256": "9f0c14a70d76ac98aa3c9634cca40cd78e851dc9b243dc491cd2cfcaa3b4f39f",
+      "cleanup_passed": true,
+      "scan_probe_sha256": "3bc173026b2dad419495fe33e286b97c66f07ef4d874b4aef5a75eb9dce33d8c",
+      "cases": [
+        {
+          "name": "single-fault_full_database_lost_ack",
+          "ack_target": "state",
+          "same_execution_recovered": true,
+          "successful_response_loss_verified": true,
+          "proxy_active_request_observations": 1,
+          "stable_token_and_request_hash": true,
+          "final_unique_entries": 372,
+          "duplicates": 0,
+          "durable_scan_complete": true,
+          "persisted_before_drop": {
+            "scan_state": 1,
+            "baseline_committed": true
+          },
+          "final_manifest": {
+            "phase": 2,
+            "checkpoint_bytes": 0
+          }
+        },
+        {
+          "name": "single-fault_incremental_database_lost_ack",
+          "ack_target": "state",
+          "same_execution_recovered": true,
+          "successful_response_loss_verified": true,
+          "proxy_active_request_observations": 1,
+          "stable_token_and_request_hash": true,
+          "final_unique_entries": 372,
+          "duplicates": 0,
+          "durable_scan_complete": true,
+          "persisted_before_drop": {
+            "scan_state": 0,
+            "baseline_committed": true
+          },
+          "final_manifest": {
+            "phase": 2,
+            "checkpoint_bytes": 0
+          }
+        },
+        {
+          "name": "single-fault_resume_database_lost_ack",
+          "ack_target": "state",
+          "same_execution_recovered": true,
+          "successful_response_loss_verified": true,
+          "proxy_active_request_observations": 1,
+          "stable_token_and_request_hash": true,
+          "final_unique_entries": 372,
+          "duplicates": 0,
+          "durable_scan_complete": true,
+          "persisted_before_drop": {
+            "scan_state": 1,
+            "baseline_committed": true
+          },
+          "final_manifest": {
+            "phase": 2,
+            "checkpoint_bytes": 0
+          }
+        },
+        {
+          "name": "single-fault_incremental_resume_database_lost_ack",
+          "ack_target": "state",
+          "same_execution_recovered": true,
+          "successful_response_loss_verified": true,
+          "proxy_active_request_observations": 1,
+          "stable_token_and_request_hash": true,
+          "final_unique_entries": 372,
+          "duplicates": 0,
+          "durable_scan_complete": true,
+          "persisted_before_drop": {
+            "scan_state": 0,
+            "baseline_committed": true
+          },
+          "final_manifest": {
+            "phase": 2,
+            "checkpoint_bytes": 0
+          }
+        },
+        {
+          "name": "cluster-fault_full_database_lost_ack",
+          "ack_target": "state",
+          "same_execution_recovered": true,
+          "successful_response_loss_verified": true,
+          "proxy_active_request_observations": 1,
+          "stable_token_and_request_hash": true,
+          "final_unique_entries": 372,
+          "duplicates": 0,
+          "durable_scan_complete": true,
+          "persisted_before_drop": {
+            "generation": 1,
+            "epoch": 1793977908642504830
+          },
+          "final_manifest": {
+            "phase": 2,
+            "checkpoint_bytes": 0
+          }
+        },
+        {
+          "name": "cluster-fault_incremental_database_lost_ack",
+          "ack_target": "state",
+          "same_execution_recovered": true,
+          "successful_response_loss_verified": true,
+          "proxy_active_request_observations": 1,
+          "stable_token_and_request_hash": true,
+          "final_unique_entries": 372,
+          "duplicates": 0,
+          "durable_scan_complete": true,
+          "persisted_before_drop": {
+            "generation": 0,
+            "epoch": 1793977939005609044
+          },
+          "final_manifest": {
+            "phase": 2,
+            "checkpoint_bytes": 0
+          }
+        },
+        {
+          "name": "cluster-fault_resume_database_lost_ack",
+          "ack_target": "state",
+          "same_execution_recovered": true,
+          "successful_response_loss_verified": true,
+          "proxy_active_request_observations": 1,
+          "stable_token_and_request_hash": true,
+          "final_unique_entries": 372,
+          "duplicates": 0,
+          "durable_scan_complete": true,
+          "persisted_before_drop": {
+            "generation": 1,
+            "epoch": 1793977966160491020
+          },
+          "final_manifest": {
+            "phase": 2,
+            "checkpoint_bytes": 0
+          }
+        },
+        {
+          "name": "cluster-fault_incremental_resume_database_lost_ack",
+          "ack_target": "state",
+          "same_execution_recovered": true,
+          "successful_response_loss_verified": true,
+          "proxy_active_request_observations": 1,
+          "stable_token_and_request_hash": true,
+          "final_unique_entries": 372,
+          "duplicates": 0,
+          "durable_scan_complete": true,
+          "persisted_before_drop": {
+            "generation": 0,
+            "epoch": 1793978026616490380
+          },
+          "final_manifest": {
+            "phase": 2,
+            "checkpoint_bytes": 0
+          }
+        }
+      ]
+    },
+    {
+      "suite": "ack-v5-manifest",
+      "kind": "scan_api_ack_loss",
+      "case_count": 8,
+      "passed": true,
+      "report": "/work/terrasync-db-refactor-evidence/release-db-refactor-merge-final-ack-v5-manifest-20261106-151950/report.json",
+      "report_sha256": "d5b1e63bd51b5cba343f26432d6fcca32606e535c77b21ffb4b30e631f5b2e21",
+      "cli_sha256": "9f0c14a70d76ac98aa3c9634cca40cd78e851dc9b243dc491cd2cfcaa3b4f39f",
+      "cleanup_passed": true,
+      "scan_probe_sha256": "3bc173026b2dad419495fe33e286b97c66f07ef4d874b4aef5a75eb9dce33d8c",
+      "cases": [
+        {
+          "name": "single-fault_full_database_lost_ack",
+          "ack_target": "manifest",
+          "same_execution_recovered": true,
+          "successful_response_loss_verified": true,
+          "proxy_active_request_observations": 1,
+          "stable_token_and_request_hash": true,
+          "final_unique_entries": 372,
+          "duplicates": 0,
+          "durable_scan_complete": true,
+          "persisted_before_drop": {
+            "phase": 1,
+            "observed_entries": 372,
+            "checkpoint_bytes": 0
+          },
+          "final_manifest": {
+            "phase": 2,
+            "checkpoint_bytes": 0
+          }
+        },
+        {
+          "name": "single-fault_incremental_database_lost_ack",
+          "ack_target": "manifest",
+          "same_execution_recovered": true,
+          "successful_response_loss_verified": true,
+          "proxy_active_request_observations": 1,
+          "stable_token_and_request_hash": true,
+          "final_unique_entries": 372,
+          "duplicates": 0,
+          "durable_scan_complete": true,
+          "persisted_before_drop": {
+            "phase": 1,
+            "observed_entries": 372,
+            "checkpoint_bytes": 0
+          },
+          "final_manifest": {
+            "phase": 2,
+            "checkpoint_bytes": 0
+          }
+        },
+        {
+          "name": "single-fault_resume_database_lost_ack",
+          "ack_target": "manifest",
+          "same_execution_recovered": true,
+          "successful_response_loss_verified": true,
+          "proxy_active_request_observations": 1,
+          "stable_token_and_request_hash": true,
+          "final_unique_entries": 372,
+          "duplicates": 0,
+          "durable_scan_complete": true,
+          "persisted_before_drop": {
+            "phase": 0,
+            "observed_entries": 12,
+            "checkpoint_bytes": 87
+          },
+          "final_manifest": {
+            "phase": 2,
+            "checkpoint_bytes": 0
+          }
+        },
+        {
+          "name": "single-fault_incremental_resume_database_lost_ack",
+          "ack_target": "manifest",
+          "same_execution_recovered": true,
+          "successful_response_loss_verified": true,
+          "proxy_active_request_observations": 1,
+          "stable_token_and_request_hash": true,
+          "final_unique_entries": 372,
+          "duplicates": 0,
+          "durable_scan_complete": true,
+          "persisted_before_drop": {
+            "phase": 0,
+            "observed_entries": 12,
+            "checkpoint_bytes": 87
+          },
+          "final_manifest": {
+            "phase": 2,
+            "checkpoint_bytes": 0
+          }
+        },
+        {
+          "name": "cluster-fault_full_database_lost_ack",
+          "ack_target": "manifest",
+          "same_execution_recovered": true,
+          "successful_response_loss_verified": true,
+          "proxy_active_request_observations": 1,
+          "stable_token_and_request_hash": true,
+          "final_unique_entries": 372,
+          "duplicates": 0,
+          "durable_scan_complete": true,
+          "persisted_before_drop": {
+            "phase": 1,
+            "observed_entries": 372,
+            "checkpoint_bytes": 0
+          },
+          "final_manifest": {
+            "phase": 2,
+            "checkpoint_bytes": 0
+          }
+        },
+        {
+          "name": "cluster-fault_incremental_database_lost_ack",
+          "ack_target": "manifest",
+          "same_execution_recovered": true,
+          "successful_response_loss_verified": true,
+          "proxy_active_request_observations": 1,
+          "stable_token_and_request_hash": true,
+          "final_unique_entries": 372,
+          "duplicates": 0,
+          "durable_scan_complete": true,
+          "persisted_before_drop": {
+            "phase": 1,
+            "observed_entries": 372,
+            "checkpoint_bytes": 0
+          },
+          "final_manifest": {
+            "phase": 2,
+            "checkpoint_bytes": 0
+          }
+        },
+        {
+          "name": "cluster-fault_resume_database_lost_ack",
+          "ack_target": "manifest",
+          "same_execution_recovered": true,
+          "successful_response_loss_verified": true,
+          "proxy_active_request_observations": 1,
+          "stable_token_and_request_hash": true,
+          "final_unique_entries": 372,
+          "duplicates": 0,
+          "durable_scan_complete": true,
+          "persisted_before_drop": {
+            "phase": 0,
+            "observed_entries": 12,
+            "checkpoint_bytes": 87
+          },
+          "final_manifest": {
+            "phase": 2,
+            "checkpoint_bytes": 0
+          }
+        },
+        {
+          "name": "cluster-fault_incremental_resume_database_lost_ack",
+          "ack_target": "manifest",
+          "same_execution_recovered": true,
+          "successful_response_loss_verified": true,
+          "proxy_active_request_observations": 1,
+          "stable_token_and_request_hash": true,
+          "final_unique_entries": 372,
+          "duplicates": 0,
+          "durable_scan_complete": true,
+          "persisted_before_drop": {
+            "phase": 0,
+            "observed_entries": 12,
+            "checkpoint_bytes": 87
+          },
+          "final_manifest": {
+            "phase": 2,
+            "checkpoint_bytes": 0
+          }
+        }
+      ]
+    },
+    {
+      "suite": "ack-initialization-v2",
+      "kind": "scan_api_ack_loss",
+      "case_count": 1,
+      "passed": true,
+      "report": "/work/terrasync-db-refactor-evidence/release-db-refactor-merge-final-ack-initialization-v2-20261106-150724/report.json",
+      "report_sha256": "c9ab1faacba64f4d45c690d226e533294973a1d1c8743f379c9647efc7572765",
+      "cli_sha256": "9f0c14a70d76ac98aa3c9634cca40cd78e851dc9b243dc491cd2cfcaa3b4f39f",
+      "cleanup_passed": true,
+      "scan_probe_sha256": "3bc173026b2dad419495fe33e286b97c66f07ef4d874b4aef5a75eb9dce33d8c",
+      "cases": [
+        {
+          "name": "single-fault_full_database_lost_ack",
+          "ack_target": "initialization",
+          "same_execution_recovered": true,
+          "successful_response_loss_verified": true,
+          "proxy_active_request_observations": 1,
+          "stable_token_and_request_hash": true,
+          "final_unique_entries": 372,
+          "duplicates": 0,
+          "durable_scan_complete": true,
+          "persisted_before_drop": {
+            "scan_state": 0,
+            "baseline_committed": false
+          },
+          "final_manifest": {
+            "phase": 2,
+            "checkpoint_bytes": 0
+          }
+        }
+      ]
+    }
+  ],
+  "failed_harness_runs_excluded": [
+    "release-db-refactor-merge-final-ack-initialization-20261106-150631",
+    "release-db-refactor-merge-final-ack-state-20261106-150707",
+    "release-db-refactor-merge-final-ack-v3-manifest-20261106-151446",
+    "release-db-refactor-merge-final-ack-v4-manifest-20261106-151715"
+  ],
+  "excluded_failure_reason": "First two runs: harness evidence SELECT used uppercase table names or omitted current job_id on shared cluster state tables. v3/v4 manifest runs: a module-scope cleanup loop overwrote the S3 access-key variable, so source Traverse failed with InvalidAccessKeyId before cluster injection; fixed by using a separate field_name binding. Failed whole runs are not counted as passes; complete reruns are separately recorded.",
+  "database_contracts": [
+    {
+      "suite": "single-baseline",
+      "case_count": 2,
+      "report": "/tmp/terrasync-db-refactor-real-ddl-window-v1-single-baseline.json",
+      "report_sha256": "cb7728f7db6213af12f3e0bbfe756bd691b44cc8b859b85a906ff9627a4bd22e",
+      "passed": true,
+      "cleanup_passed": true
+    },
+    {
+      "suite": "single",
+      "case_count": 44,
+      "report": "/tmp/terrasync-db-refactor-real-ddl-window-v1-single.json",
+      "report_sha256": "1b846a8e37b9e53f5d4d982382eda96e943a87270ee272dc3f78a89ffa9bd32a",
+      "passed": true,
+      "cleanup_passed": true
+    },
+    {
+      "suite": "cluster-fresh",
+      "case_count": 1,
+      "report": "/tmp/terrasync-db-refactor-real-ddl-window-v1-cluster-fresh.json",
+      "report_sha256": "b52640a3f2e3695e3e60e3c84f425095b090a437ed48307a7fda53fabafefc07",
+      "passed": true,
+      "cleanup_passed": true
+    },
+    {
+      "suite": "single-cuts",
+      "case_count": 3,
+      "report": "/tmp/terrasync-db-refactor-real-ddl-window-v1-single-cuts.json",
+      "report_sha256": "383e768b52a06dd415d8d8ca07ce843f400cb3c601e30bcf7d78b2535df24c2d",
+      "passed": true,
+      "cleanup_passed": true
+    },
+    {
+      "suite": "single-catalogue",
+      "case_count": 11,
+      "report": "/tmp/terrasync-db-refactor-real-ddl-window-v1-single-catalogue.json",
+      "report_sha256": "5c14cc1abc3bbc2b66847ba8d53f11adeb0e4f70f0ab111a02111127e8a89b5b",
+      "passed": true,
+      "cleanup_passed": true
+    },
+    {
+      "suite": "cluster-catalogue",
+      "case_count": 12,
+      "report": "/tmp/terrasync-db-refactor-real-ddl-window-v1-cluster-catalogue.json",
+      "report_sha256": "6b84ee595d4d9e930f9c05b3db6ddb9e6cb6793e39a4e60de03c56e8a749660d",
+      "passed": true,
+      "cleanup_passed": true
+    },
+    {
+      "suite": "cluster-cuts",
+      "case_count": 3,
+      "report": "/tmp/terrasync-db-refactor-real-ddl-window-v1-cluster-cuts.json",
+      "report_sha256": "6e171319b51f6588c7d4aa388424b561efd18d119f52e878beb4fadca5f13662",
+      "passed": true,
+      "cleanup_passed": true
+    }
+  ]
+}
