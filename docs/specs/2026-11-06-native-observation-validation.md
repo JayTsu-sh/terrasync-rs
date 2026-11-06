@@ -519,3 +519,36 @@ Cluster 对应 121.90／122.38／120.00 秒，损失 13.22%／13.56%／11.85%，
 指定 NAS 的原生 NFSv3 只读连通探测通过；v4.1 返回 RPC service unavailable，不计通过。
 首轮 whole-share 只读校准触及 harness 的 900 秒预算，未完成，不作为已完成的无 DB 基线。
 已保留明确失败记录；源数据没有改动，后续长时基准按用户指定的四种 Cluster 场景执行，并分别匹配 unordered／blocks 无 DB 基线。
+
+## 指定 NAS 的实际 CLI A/B
+
+针对用户反馈的“优化前约 5 万条目／秒”，先用实际 CLI 对照原主分支 bedb632 与候选 5b0fe97 的运行时产物。
+固定 concurrency=8、batch_size=8192，不启用额外进度 callback。
+子目录 `nfs://10.131.5.221/m1-source:/d003/d003` 实际 134735 项，交错执行三轮：
+旧／新 unordered 中位数分别约 2.573／2.552 秒，即 5.236／5.279 万项／秒。
+报告 `/work/terrasync-db-refactor-evidence/release-db-refactor-m1-nodb-ab-20261106-083020/report.json`。
+整个 share 的同长 60 秒诊断中，旧／新分别交付 3157411／3282009 项，约 5.262／5.470 万项／秒；
+这是主动取消的局部诊断，不能代替完成全量扫描的基线。
+报告 `/work/terrasync-db-refactor-evidence/release-db-refactor-m1-nodb-window-ab-20261106-083355/report.json`。
+以上 CLI 测量没有复现扫描吞吐下降；先前定制 API 长时驱动的较低速度原因尚未确定，不据此修改产品代码。
+
+按用户指定，将两版 release CLI 部署到 `10.131.5.223`：32 核、约 385 GiB 内存。
+远端 SHA-256 核对通过，旧版 `09b4154c4b5c21cd028136628a13ded9e3898daa5fd424905a7c18589e95c6a6`，
+候选仍为上文的 `9f0c14a70d76ac98aa3c9634cca40cd78e851dc9b243dc491cd2cfcaa3b4f39f`。
+远端 glibc 2.34，两个程序共用本次独立目录中的 loader 和运行库，均可启动；系统库没有修改。
+部署摘要 `/tmp/terrasync-perf-runner-deployment.json`，平台摘要 `/tmp/terrasync-perf-runner-platform.json`。
+
+新远端驱动的小目录预演已通过 **22 次实际 CLI 执行**：两版各有 unordered／blocks 无 DB、全量、
+无变更增量、全量强退恢复、无变更增量强退恢复、约 1% 增删改增量及其强退恢复。
+30000 个空文件、30 个目录及一个所有权标记，共 30031 项；受控变化新增 100、删除 100、修改 100 项。
+核对实际任务类型、manifest 的 incremental 标志、checkpoint、累计统计，以及独立 DB 行数／类型／字节／路径校验和，
+增量还核对当前 epoch 的操作行及持久化 new／changed／deleted／renamed 计数。
+两版的临时库均验证六个副本不存在，小目录清理成功。
+报告 `/work/terrasync-db-refactor-evidence/remote-223-ab/complete-ab-20261106-090248/report.json`，
+functional_passed=true、cleanup_passed=true、performance_passed=null；其 1ms checkpoint 仅为功能预演，不是性能证据。
+
+整个 `nfs://10.131.5.221/m1-source` 的 22 次实际 CLI A/B 已启动，结果尚未完成。
+续传保持生产至少 60 秒 checkpoint，确认实际持久化 checkpoint 后 SIGKILL，并从新工作目录重启；
+报告中断前后活动时间之和、控制器间隙、已确认项、终端可见未确认尾部和 RSS。
+约 1% 增删改只使用本次创建且带所有权标记的前缀，两版共享同一次变化；原有数据不改动。
+正式结果完成前，不把预演、部分扫描速度或旧数据源的结果写为指定 NAS 性能通过。
