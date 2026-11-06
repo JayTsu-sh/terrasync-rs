@@ -3,13 +3,15 @@
 //! 目录与符号链接在此即时处理；full/delta 单文件生命周期全部委托给
 //! `FileCommitter` 深模块。
 
+use crate::file_copy::metadata as copy_metadata;
+use crate::file_copy::namespace as copy_namespace;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use task_model::ObservedEntryExt;
 
+use crate::error::StorageError;
+use crate::storage_factory::StorageContext;
 use data_mover::transfer::write_delete_marker;
-use storage_adapter::StorageContext;
-use storage_adapter::StorageError;
 use sync_delta::DeltaToken;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -30,25 +32,27 @@ pub async fn disk_commit_task(
     while let Some(msg) = rx.recv().await {
         match msg {
             DiskCommitMsg::CreateDir { entry } => {
-                if let Err(error) = dest.create_dir_all(&entry).await {
+                if let Err(error) = copy_namespace::create_dir_all(dest.storage(), &entry).await {
                     warn!("[dc] create_dir {:?}: {error}", entry.get_relative_path());
                 }
-                let _ = dest.set_entry_metadata(&entry).await;
+                let _ = copy_metadata::set_entry_metadata(dest.storage(), &entry).await;
                 progress.dirs_created.fetch_add(1, Ordering::Relaxed);
                 let _ = ack_tx.send(DcAck::Entry(ReceiverMsg::EntrySuccess { entry }));
             }
-            DiskCommitMsg::CreateSymlink { entry, target } => match dest.create_symlink(&entry, &target).await {
-                Ok(()) => {
-                    progress.files_transferred.fetch_add(1, Ordering::Relaxed);
-                    let _ = ack_tx.send(DcAck::Entry(ReceiverMsg::EntrySuccess { entry }));
+            DiskCommitMsg::CreateSymlink { entry, target } => {
+                match copy_namespace::create_symlink(dest.storage(), &entry, &target).await {
+                    Ok(()) => {
+                        progress.files_transferred.fetch_add(1, Ordering::Relaxed);
+                        let _ = ack_tx.send(DcAck::Entry(ReceiverMsg::EntrySuccess { entry }));
+                    }
+                    Err(error) => {
+                        let _ = ack_tx.send(DcAck::Entry(ReceiverMsg::EntryError {
+                            entry,
+                            reason: error.to_string(),
+                        }));
+                    }
                 }
-                Err(error) => {
-                    let _ = ack_tx.send(DcAck::Entry(ReceiverMsg::EntryError {
-                        entry,
-                        reason: error.to_string(),
-                    }));
-                }
-            },
+            }
             DiskCommitMsg::WriteDeleteMarker { ndx, entry } => {
                 let result = async {
                     let path = entry.view().source_path().map_err(StorageError::from)?;

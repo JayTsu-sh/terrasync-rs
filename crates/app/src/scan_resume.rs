@@ -7,23 +7,22 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+use crate::scan::source::{ScanSourceMode, WalkOptions};
 use crate::scan::{
     ScanRequest,
     cancellation::{self, ScanCancellation},
 };
+use crate::storage_factory::{StorageContext, canonicalize_path};
 use data_mover::filter::parse_filter_expression;
 use data_mover::model::ObservedEntry;
 use data_mover::traversal::{Resumable, TraversalOrder};
 use db::scan::ScanResumeStatistics;
 use db::scan::{COMPLETED, FINALIZING, RUNNING, ScanResumeState};
 use db::scan::{ScanFinalEvent, ScanStore};
+use task_model::{ErrorEvent, StorageEntryMessage};
 use tokio::{join, select, task::spawn_blocking};
 use tracing::{info, warn};
 use utils::app_config::AppConfig;
-use {
-    storage_adapter::{ScanSourceMode, StorageContext, WalkOptions, canonicalize_path},
-    task_model::{ErrorEvent, StorageEntryMessage},
-};
 
 use crate::{
     config::{JobType, initialize_consumer_config},

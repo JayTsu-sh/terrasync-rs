@@ -1,8 +1,11 @@
 //! Receiver 单文件落盘生命周期：消费 full/delta 文件命令，
-//! 通过存储适配层驱动 expert destination 的 prepare、write、complete 生命周期。
+//! 通过任务持有的会话驱动原生 expert destination 的 prepare、write、complete 生命周期。
 //! 接收完成后先校验长度及源摘要，再由引擎读回校验并发布；目录和符号链接即时完成。
 //! delta token 经 Reconstructor 重建，basis 区间通过源角色读取。
 
+use crate::file_commit::stream as commit_stream;
+use crate::scan::observe_path;
+pub mod stream;
 use data_mover::storage::{PositionedChunk, read_current_range};
 use futures::StreamExt;
 use std::num::NonZeroUsize;
@@ -13,10 +16,12 @@ use std::sync::atomic::Ordering;
 use task_model::ObservedEntryExt;
 
 // 外部 crate
+use crate::error::StorageError;
+use crate::error::storage::Result as StorageResult;
+use crate::file_commit::stream::{StreamChunk, StreamHandle};
+use crate::storage_factory::StorageContext;
 use bytes::{Bytes, BytesMut};
 use data_mover::model::ObservedEntry;
-use storage_adapter::error::Result as StorageResult;
-use storage_adapter::{StorageContext, StorageError, StreamChunk, StreamHandle};
 use sync_delta::DeltaToken;
 use sync_delta::reconstruct::{ReconstructStep, Reconstructor};
 use task_model::observation::ObservedItem;
@@ -150,7 +155,7 @@ impl FileCommitter {
         }
 
         let basis_size = if delta_block_size.is_some() {
-            match self.dest.get_metadata(entry.get_relative_path()).await {
+            match observe_path(self.dest.storage(), entry.get_relative_path()).await {
                 Ok(basis) => basis.get_size(),
                 Err(error) if error.is_not_found() => entry.get_size(),
                 Err(error) => {
@@ -162,7 +167,7 @@ impl FileCommitter {
         } else {
             0
         };
-        match StorageContext::prepare_observed_stream(
+        match commit_stream::prepare_observed_stream(
             &self.dest,
             entry.view(),
             self.session.transfer_mode,
@@ -174,7 +179,7 @@ impl FileCommitter {
                 let (tx_inner, rx_inner) = mpsc::channel::<StreamChunk>(8);
                 let writer_handle = handle.clone();
                 let write_join =
-                    tokio::spawn(async move { StorageContext::write_planned_stream(rx_inner, &writer_handle).await });
+                    tokio::spawn(async move { commit_stream::write_planned_stream(rx_inner, &writer_handle).await });
                 let size = entry.get_size();
                 let mode = delta_block_size.map_or(ActiveFileMode::Full, |block_size| {
                     ActiveFileMode::Delta(DeltaCtx {
@@ -319,7 +324,7 @@ impl FileCommitter {
             FileCommitState::FullActive(active) | FileCommitState::DeltaActive(active) => active,
             _ => unreachable!("validated active state changed before commit"),
         };
-        let outcome = finalize_file(&self.dest, &self.session, active, source_hash, &self.progress).await;
+        let outcome = finalize_file(&self.session, active, source_hash, &self.progress).await;
         self.state = match &outcome {
             CommitOutcome::Success => FileCommitState::Completed,
             _ => FileCommitState::Failed,
@@ -354,8 +359,7 @@ impl FileCommitter {
 /// 关闭输入后校验长度和源摘要，再由 expert 引擎校验目标并发布。
 /// 失败由会话清理其拥有的 stage，上报 outcome 后由 Receiver 决定是否 redo。
 async fn finalize_file(
-    dest: &Arc<StorageContext>, session: &SessionConfig, a: ActiveFile, source_hash: Option<String>,
-    progress: &Arc<ReceiverProgress>,
+    session: &SessionConfig, a: ActiveFile, source_hash: Option<String>, progress: &Arc<ReceiverProgress>,
 ) -> CommitOutcome {
     let ActiveFile {
         entry,
@@ -397,7 +401,7 @@ async fn finalize_file(
     }
 
     // 引擎完成读回校验与发布。
-    if let Err(e) = StorageContext::commit_chunk_stream(dest, &entry.entry, size, handle).await {
+    if let Err(e) = commit_stream::commit_chunk_stream(handle).await {
         error!("[dc] commit {:?}: {}", entry.get_relative_path(), e);
         return CommitOutcome::HardError(AppError::from(e));
     }

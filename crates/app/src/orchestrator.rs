@@ -3,10 +3,14 @@
 //! SyncOrchestrator 封装 sync/incremental_sync 的核心逻辑，
 //! 通过 Transport 抽象层连接 Sender 和 Receiver，支持单进程和双进程两种模式。
 
+use crate::file_copy::metadata as copy_metadata;
+use crate::file_copy::namespace as copy_namespace;
+use crate::file_copy::transfer as copy_transfer;
+use crate::rm::progress as deletion;
 use data_mover::model::BackendKind;
 // 标准库
 use crate::copy_dispatch::{CopyQueues, partition_scan};
-use crate::file_copy::{HdfsCopyContext, MetadataApplication, copy_file};
+use crate::file_copy::{HdfsCopyContext, copy_file};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -32,13 +36,13 @@ impl Drop for AtomicCounterGuard<'_> {
 }
 
 // 外部 crate
+use crate::storage_factory::StorageContext;
+#[cfg(windows)]
+use crate::storage_factory::backend_kind_from_location;
 use data_mover::model::ObservedEntry;
 use data_mover::qos::QosManager;
 use db::ClickHouseDatabase;
 use db::{self, DeletionStatus, INCREMENTAL_SCAN_TABLE_BASE_NAME};
-use storage_adapter::StorageContext;
-#[cfg(windows)]
-use storage_adapter::backend_kind_from_location;
 use task_model::{ChangeKind, EntryChange, ErrorEvent, StorageEntryMessage};
 use tokio::sync::Semaphore;
 use tokio::task::JoinHandle;
@@ -259,7 +263,7 @@ impl SyncOrchestrator {
         let copy_tags = match self.mode {
             SyncMode::Local => {
                 let destination = create_storage_for_role(&c.dest_path, None, true, StorageRole::Destination).await?;
-                destination.validate_transfer_mode(c.transfer_mode)?;
+                copy_transfer::validate_transfer_mode(&destination, c.transfer_mode)?;
                 copied_tags_required(&destination)?
             }
             SyncMode::Remote { .. } => false,
@@ -942,7 +946,9 @@ impl SyncOrchestrator {
                                     )
                                     .await
                                 } else if kind == ChangeKind::DirectoryMarkerRemoved {
-                                    dest.remove_directory_marker(&entry.entry).await.map_err(AppError::from)
+                                    copy_namespace::remove_directory_marker(dest.storage(), &entry.entry)
+                                        .await
+                                        .map_err(AppError::from)
                                 } else if kind == ChangeKind::MetadataOnly {
                                     process_metadata_only_entry(
                                         &entry.entry,
@@ -994,10 +1000,10 @@ impl SyncOrchestrator {
                                 // 删除操作幂等化：NotFound 视为成功
                                 let result = if entry.get_is_dir() {
                                     trace!("Deleting directory: {:?}", entry.get_relative_path());
-                                    dest.delete_dir_all(entry).await
+                                    deletion::delete_dir_all(dest.storage(), entry).await
                                 } else {
                                     trace!("Deleting file: {:?}", entry.get_relative_path());
-                                    dest.delete_file(entry).await
+                                    copy_namespace::delete_file(dest.storage(), entry).await
                                 };
                                 match result {
                                     Ok(()) => bc.broadcast(message.clone()).await,
@@ -1380,7 +1386,7 @@ impl SyncOrchestrator {
                 src,
                 dest,
                 entry,
-                storage_adapter::CopyOptions {
+                crate::file_copy::CopyOptions {
                     transfer_mode,
                     qos,
                     enable_integrity_check: integrity,
@@ -1391,17 +1397,15 @@ impl SyncOrchestrator {
                 hdfs.as_ref(),
             )
             .await;
-            let metadata = if let Some(recorder) = recorder {
-                let metadata = result.as_ref().ok().copied();
-                recorder.finish(result.map(|_| ())).await?;
-                metadata.unwrap_or(MetadataApplication::DataMover)
+            if let Some(recorder) = recorder {
+                recorder.finish(result).await?;
             } else {
-                result?
-            };
-            metadata_applied = matches!(metadata, MetadataApplication::DataMover);
+                result?;
+            }
+            metadata_applied = true;
         }
         if !metadata_applied {
-            dest.set_entry_metadata(entry).await?;
+            copy_metadata::set_entry_metadata(dest.storage(), entry).await?;
         }
         Ok(())
     }
@@ -1460,9 +1464,9 @@ impl SyncOrchestrator {
                 DeletionStatus::Deleted(entry) => {
                     let entry_arc = Arc::new(entry);
                     let result = if entry_arc.get_is_dir() {
-                        dest_storage.delete_dir_all(&entry_arc).await
+                        deletion::delete_dir_all(dest_storage.storage(), &entry_arc).await
                     } else {
-                        dest_storage.delete_file(&entry_arc).await
+                        copy_namespace::delete_file(dest_storage.storage(), &entry_arc).await
                     };
                     match result {
                         Ok(()) => {
@@ -1556,7 +1560,7 @@ impl SyncOrchestrator {
                             }
 
                             if !is_source_reserved {
-                                if let Err(error) = src_storage.delete_file(&to_arc).await
+                                if let Err(error) = copy_namespace::delete_file(src_storage.storage(), &to_arc).await
                                     && !error.is_not_found()
                                 {
                                     broadcaster

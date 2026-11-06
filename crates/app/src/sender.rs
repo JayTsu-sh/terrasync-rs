@@ -10,9 +10,10 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use task_model::ObservedEntryExt;
 
 // 外部 crate
+use crate::storage_factory::StorageContext;
+use crate::task_stream::AsyncReceiver;
 use data_mover::model::ObservedEntry;
 use data_mover::qos::QosManager;
-use storage_adapter::{AsyncReceiver, StorageContext};
 use task_model::StorageEntryMessage;
 use tracing::{error, info};
 use transport::message::SenderMsg;
@@ -21,11 +22,12 @@ use transport::traits::SenderTransport;
 // 内部模块
 use crate::broadcast::BroadcastForwarder;
 use crate::error::{AppError, Result};
+use crate::file_copy::CopyOptions;
 use crate::file_copy::copy_versions;
 use crate::receiver::ReceiverConfig;
 use crate::tar_pack;
+use task_model::EntryChange;
 use task_model::observation::ObservedItem;
-use {storage_adapter::CopyOptions, task_model::EntryChange};
 
 /// Sender worker 配置
 pub struct SenderWorkerConfig {
@@ -220,10 +222,11 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::Mutex;
 
+    use crate::task_stream::AsyncReceiver;
     use async_trait::async_trait;
+    use task_model::ErrorEvent;
     use transport::error::{Result as TransportResult, TransportError};
     use transport::message::ReceiverMsg;
-    use {storage_adapter::AsyncReceiver, task_model::ErrorEvent};
 
     use crate::storage_factory::{StorageRole, create_storage_for_role};
     use tempfile::tempdir;

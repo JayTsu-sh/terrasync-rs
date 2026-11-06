@@ -1,7 +1,9 @@
 //! 扫描分发及检查点协调。数据库批次 B 写入时，下一批 A 在有界队列中积累。
 use super::{flush_batch, input::ScanInput, workers};
+use crate::error::StorageError;
 use crate::scan::cancellation::ScanCancellation;
 use crate::scan::progress::ScanProgress;
+use crate::scan::source::{ResumableScan, ResumableScanItem};
 use crate::{
     consumer::{
         ConsumerManager, ScanStatistics,
@@ -22,7 +24,6 @@ use std::{
     sync::Arc,
     time::{Duration, Instant},
 };
-use storage_adapter::{ResumableScan, ResumableScanItem, StorageError};
 #[cfg(feature = "lab-fault-injection")]
 use tokio::time::sleep;
 use tokio::{

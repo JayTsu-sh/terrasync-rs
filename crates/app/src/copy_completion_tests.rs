@@ -1,3 +1,4 @@
+use crate::scan::observe_path;
 use std::future::pending;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -23,7 +24,7 @@ async fn target(root: &TempDir) -> Result<Arc<StorageContext>> {
 async fn directory_entry(source: &TempDir, name: &str) -> Result<ObservedEntry> {
     std::fs::create_dir_all(source.path().join(name))?;
     let storage = create_storage_for_role(&source.path().to_string_lossy(), None, false, StorageRole::Source).await?;
-    let mut entry = storage.get_metadata(Path::new(name)).await?;
+    let mut entry = observe_path(storage.storage(), Path::new(name)).await?;
     entry = crate::observed_fixtures::with_times(entry, None, Some(1_234_567_890_000_000_000));
     Ok(entry)
 }

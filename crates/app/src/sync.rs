@@ -7,6 +7,9 @@
 //! 4. 并发复制控制
 //! 5. 重试机制集成
 
+use crate::file_copy::metadata as copy_metadata;
+use crate::file_copy::namespace as copy_namespace;
+use crate::file_copy::transfer as copy_transfer;
 use data_mover::model::BackendKind;
 // 标准库
 use crate::file_copy::{HdfsCopyContext, copy_file, copy_versions, prepare_directory};
@@ -20,10 +23,11 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 
 // 外部crate
+use crate::file_copy::CopyOptions;
+use crate::storage_factory::StorageContext;
 use data_mover::model::ObservedEntry;
 use data_mover::qos::QosManager;
 use data_mover::redact_storage_url;
-use storage_adapter::{CopyOptions, StorageContext};
 use task_model::{ErrorEvent, StorageEntryMessage};
 use tracing::{Instrument, debug, error, info, info_span, instrument, trace, warn};
 #[cfg(windows)]
@@ -364,13 +368,13 @@ async fn process_entry_inner(
     if prepare_directory(entry, &dest_storage).await? {
         trace!("Created directory: {:?}", relative_path);
     } else if entry.get_is_symlink() {
-        match src_storage.read_symlink(entry).await {
+        match copy_namespace::read_symlink(src_storage.storage(), entry).await {
             Ok(target_path) => {
-                dest_storage.create_symlink(entry, &target_path).await?;
+                copy_namespace::create_symlink(dest_storage.storage(), entry, &target_path).await?;
 
                 if !is_source_reserved {
                     trace!("Is not source reserved, removing symlink {:?}", relative_path);
-                    if let Err(e) = src_storage.delete_file(entry).await {
+                    if let Err(e) = copy_namespace::delete_file(src_storage.storage(), entry).await {
                         error!("Failed to remove existing symlink {:?}: {}", relative_path, e);
                         broadcaster
                             .broadcast(StorageEntryMessage::Error {
@@ -400,8 +404,7 @@ async fn process_entry_inner(
     } else if skip_data_copy {
         // MetadataOnly 变更：chmod/chown 导致 mode/uid/gid 变了但内容未变，跳过 copy_file
         trace!("Skipping data copy (metadata-only change): {:?}", relative_path);
-        dest_storage
-            .set_entry_metadata(entry)
+        copy_metadata::set_entry_metadata(dest_storage.storage(), entry)
             .await?;
     } else if dest_storage.as_ref().storage().kind() == BackendKind::Hdfs {
         let hdfs = HdfsCopyContext::from_job(&resume.job_id, resume.transfer_mode)?;
@@ -413,7 +416,7 @@ async fn process_entry_inner(
             &src_storage,
             &dest_storage,
             entry,
-            storage_adapter::CopyOptions {
+            crate::file_copy::CopyOptions {
                 transfer_mode: resume.transfer_mode,
                 qos: qos_manager,
                 enable_integrity_check,
@@ -449,11 +452,11 @@ async fn process_entry_inner(
         debug!("Copying file {:?}", relative_path);
 
         // 调用 data_mover 的 copy_file（处理 QoS、完整性检查、源文件删除）
-        StorageContext::copy_file(
+        copy_transfer::copy_entry(
             &src_storage,
             &dest_storage,
             entry,
-            storage_adapter::CopyOptions {
+            crate::file_copy::CopyOptions {
                 transfer_mode: resume.transfer_mode,
                 qos: qos_manager,
                 enable_integrity_check,
@@ -472,7 +475,7 @@ async fn process_entry_inner(
     // ACL 复制（目录和文件均需要，symlink 除外）
     // 支持 Local→Local（Windows）、CIFS→CIFS（跨平台）、NFS→NFS（NFSv4+），其他组合静默跳过
     if enable_acl && !entry.get_is_symlink() {
-        if let Err(err) = StorageContext::copy_acl(&src_storage, &dest_storage, relative_path).await {
+        if let Err(err) = copy_metadata::copy_acl((&src_storage).storage(), (&dest_storage).storage(), relative_path).await {
             error!("Failed to copy ACL for {:?}: {}", relative_path, err);
             broadcaster
                 .broadcast(StorageEntryMessage::Error {
@@ -486,7 +489,7 @@ async fn process_entry_inner(
         }
 
         // xattr 复制（仅 NFSv4.1→NFSv4.1，其他组合静默跳过）
-        if let Err(err) = StorageContext::copy_xattr(&src_storage, &dest_storage, relative_path).await {
+        if let Err(err) = copy_metadata::copy_xattr((&src_storage).storage(), (&dest_storage).storage(), relative_path).await {
             error!("Failed to copy xattr for {:?}: {}", relative_path, err);
             broadcaster
                 .broadcast(StorageEntryMessage::Error {
@@ -517,7 +520,7 @@ pub(crate) struct ResumeOpts {
 
 pub(crate) struct CommitRecorder {
     store: Arc<ByteResumeStore>,
-    callback: storage_adapter::CommitCallback,
+    callback: crate::byte_resume::CommitCallback,
     drain: JoinHandle<()>,
     shutdown: oneshot::Sender<()>,
     dropped: Arc<AtomicU64>,
@@ -578,7 +581,7 @@ impl CommitRecorder {
         })
     }
 
-    pub(crate) fn callback(&self) -> storage_adapter::CommitCallback {
+    pub(crate) fn callback(&self) -> crate::byte_resume::CommitCallback {
         self.callback.clone()
     }
 
@@ -606,10 +609,11 @@ impl CommitRecorder {
 #[cfg(test)]
 #[allow(clippy::items_after_test_module)]
 mod commit_recorder_tests {
+    use crate::scan::observe_path;
     use std::path::Path;
     use std::time::Duration;
 
-    use storage_adapter::{CreateStorageOptions, create_storage};
+    use crate::storage_factory::{CreateStorageOptions, create_storage};
 
     use super::CommitRecorder;
 
@@ -629,8 +633,7 @@ mod commit_recorder_tests {
         )
         .await
         .unwrap_or_else(|error| panic!("create source storage: {error}"));
-        let entry = source
-            .get_metadata(Path::new("payload.bin"))
+        let entry = observe_path(source.storage(), Path::new("payload.bin"))
             .await
             .unwrap_or_else(|error| panic!("source metadata: {error}"));
         let recorder = CommitRecorder::start(
@@ -669,8 +672,7 @@ mod commit_recorder_tests {
         )
         .await
         .unwrap_or_else(|error| panic!("create source storage: {error}"));
-        let entry = source
-            .get_metadata(Path::new("payload.bin"))
+        let entry = observe_path(source.storage(), Path::new("payload.bin"))
             .await
             .unwrap_or_else(|error| panic!("source metadata: {error}"));
 
@@ -712,11 +714,11 @@ pub(crate) async fn copy_file_with_resume(
 ) -> Result<()> {
     let recorder = CommitRecorder::start(job_dir, entry, src_storage.block_size()).await?;
 
-    let res = StorageContext::copy_file_resumable(
+    let res = copy_transfer::copy_checkpointed(
         src_storage,
         dest_storage,
         entry,
-        storage_adapter::CopyOptions {
+        crate::file_copy::CopyOptions {
             transfer_mode: TransferMode::Checkpoint,
             qos: qos_manager,
             enable_integrity_check,
@@ -743,11 +745,15 @@ pub(crate) async fn process_rename_entry(
     async {
         trace!("rename file: {:?} to {:?}", from_path, to_path);
 
-        dest_storage.rename(from_path, to_path).await?;
+        dest_storage
+            .roles
+            .namespace()?
+            .rename(from_entry.path(), to_entry.path())
+            .await?;
 
         if !is_source_reserved {
             // 如果源文件不是保留文件，删除源文件
-            src_storage.delete_file(to_entry.as_ref()).await?;
+            copy_namespace::delete_file(src_storage.storage(), to_entry.as_ref()).await?;
         }
 
         Ok(())

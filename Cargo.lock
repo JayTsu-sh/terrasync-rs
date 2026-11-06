@@ -163,7 +163,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serial_test",
- "storage-adapter",
+ "soft-canonicalize",
  "sync-delta",
  "task-model",
  "tempfile",
@@ -1213,7 +1213,6 @@ dependencies = [
  "data-mover",
  "licensing",
  "rustls 0.23.40",
- "storage-adapter",
  "task-model",
  "thiserror 2.0.20",
  "tokio",
@@ -1711,7 +1710,7 @@ checksum = "4583a4551df46e2792f82ceeac45e850d2e2d5debba0b91f102385cda5b11f06"
 [[package]]
 name = "data-mover"
 version = "0.4.0"
-source = "git+https://github.com/JayTsu-sh/data-mover-rs.git?rev=2752c8293fc5ffb1606a2fb17bc68ae94493f10d#2752c8293fc5ffb1606a2fb17bc68ae94493f10d"
+source = "git+https://github.com/JayTsu-sh/data-mover-rs.git?rev=0070c1599689e6c3a5cb3c8e7df602e03f00ca97#0070c1599689e6c3a5cb3c8e7df602e03f00ca97"
 dependencies = [
  "aws-config",
  "aws-credential-types",
@@ -1740,7 +1739,7 @@ dependencies = [
 [[package]]
 name = "data-mover-acl"
 version = "0.4.0"
-source = "git+https://github.com/JayTsu-sh/data-mover-rs.git?rev=2752c8293fc5ffb1606a2fb17bc68ae94493f10d#2752c8293fc5ffb1606a2fb17bc68ae94493f10d"
+source = "git+https://github.com/JayTsu-sh/data-mover-rs.git?rev=0070c1599689e6c3a5cb3c8e7df602e03f00ca97#0070c1599689e6c3a5cb3c8e7df602e03f00ca97"
 dependencies = [
  "data-mover-model",
  "thiserror 2.0.20",
@@ -1749,7 +1748,7 @@ dependencies = [
 [[package]]
 name = "data-mover-backend-cifs"
 version = "0.4.0"
-source = "git+https://github.com/JayTsu-sh/data-mover-rs.git?rev=2752c8293fc5ffb1606a2fb17bc68ae94493f10d#2752c8293fc5ffb1606a2fb17bc68ae94493f10d"
+source = "git+https://github.com/JayTsu-sh/data-mover-rs.git?rev=0070c1599689e6c3a5cb3c8e7df602e03f00ca97#0070c1599689e6c3a5cb3c8e7df602e03f00ca97"
 dependencies = [
  "async-trait",
  "binrw",
@@ -1770,7 +1769,7 @@ dependencies = [
 [[package]]
 name = "data-mover-backend-hdfs"
 version = "0.4.0"
-source = "git+https://github.com/JayTsu-sh/data-mover-rs.git?rev=2752c8293fc5ffb1606a2fb17bc68ae94493f10d#2752c8293fc5ffb1606a2fb17bc68ae94493f10d"
+source = "git+https://github.com/JayTsu-sh/data-mover-rs.git?rev=0070c1599689e6c3a5cb3c8e7df602e03f00ca97#0070c1599689e6c3a5cb3c8e7df602e03f00ca97"
 dependencies = [
  "async-trait",
  "blake3",
@@ -1788,7 +1787,7 @@ dependencies = [
 [[package]]
 name = "data-mover-backend-local"
 version = "0.4.0"
-source = "git+https://github.com/JayTsu-sh/data-mover-rs.git?rev=2752c8293fc5ffb1606a2fb17bc68ae94493f10d#2752c8293fc5ffb1606a2fb17bc68ae94493f10d"
+source = "git+https://github.com/JayTsu-sh/data-mover-rs.git?rev=0070c1599689e6c3a5cb3c8e7df602e03f00ca97#0070c1599689e6c3a5cb3c8e7df602e03f00ca97"
 dependencies = [
  "async-trait",
  "blake3",
@@ -1813,7 +1812,7 @@ dependencies = [
 [[package]]
 name = "data-mover-backend-nfs"
 version = "0.4.0"
-source = "git+https://github.com/JayTsu-sh/data-mover-rs.git?rev=2752c8293fc5ffb1606a2fb17bc68ae94493f10d#2752c8293fc5ffb1606a2fb17bc68ae94493f10d"
+source = "git+https://github.com/JayTsu-sh/data-mover-rs.git?rev=0070c1599689e6c3a5cb3c8e7df602e03f00ca97#0070c1599689e6c3a5cb3c8e7df602e03f00ca97"
 dependencies = [
  "async-trait",
  "blake3",
@@ -1837,7 +1836,7 @@ dependencies = [
 [[package]]
 name = "data-mover-backend-s3"
 version = "0.4.0"
-source = "git+https://github.com/JayTsu-sh/data-mover-rs.git?rev=2752c8293fc5ffb1606a2fb17bc68ae94493f10d#2752c8293fc5ffb1606a2fb17bc68ae94493f10d"
+source = "git+https://github.com/JayTsu-sh/data-mover-rs.git?rev=0070c1599689e6c3a5cb3c8e7df602e03f00ca97#0070c1599689e6c3a5cb3c8e7df602e03f00ca97"
 dependencies = [
  "async-trait",
  "aws-config",
@@ -1871,7 +1870,7 @@ dependencies = [
 [[package]]
 name = "data-mover-integrity"
 version = "0.4.0"
-source = "git+https://github.com/JayTsu-sh/data-mover-rs.git?rev=2752c8293fc5ffb1606a2fb17bc68ae94493f10d#2752c8293fc5ffb1606a2fb17bc68ae94493f10d"
+source = "git+https://github.com/JayTsu-sh/data-mover-rs.git?rev=0070c1599689e6c3a5cb3c8e7df602e03f00ca97#0070c1599689e6c3a5cb3c8e7df602e03f00ca97"
 dependencies = [
  "async-trait",
  "blake3",
@@ -1887,7 +1886,7 @@ dependencies = [
 [[package]]
 name = "data-mover-metadata"
 version = "0.4.0"
-source = "git+https://github.com/JayTsu-sh/data-mover-rs.git?rev=2752c8293fc5ffb1606a2fb17bc68ae94493f10d#2752c8293fc5ffb1606a2fb17bc68ae94493f10d"
+source = "git+https://github.com/JayTsu-sh/data-mover-rs.git?rev=0070c1599689e6c3a5cb3c8e7df602e03f00ca97#0070c1599689e6c3a5cb3c8e7df602e03f00ca97"
 dependencies = [
  "async-trait",
  "blake3",
@@ -1902,15 +1901,16 @@ dependencies = [
 [[package]]
 name = "data-mover-model"
 version = "0.4.0"
-source = "git+https://github.com/JayTsu-sh/data-mover-rs.git?rev=2752c8293fc5ffb1606a2fb17bc68ae94493f10d#2752c8293fc5ffb1606a2fb17bc68ae94493f10d"
+source = "git+https://github.com/JayTsu-sh/data-mover-rs.git?rev=0070c1599689e6c3a5cb3c8e7df602e03f00ca97#0070c1599689e6c3a5cb3c8e7df602e03f00ca97"
 dependencies = [
  "blake3",
+ "bytes 1.12.1",
 ]
 
 [[package]]
 name = "data-mover-storage-core"
 version = "0.4.0"
-source = "git+https://github.com/JayTsu-sh/data-mover-rs.git?rev=2752c8293fc5ffb1606a2fb17bc68ae94493f10d#2752c8293fc5ffb1606a2fb17bc68ae94493f10d"
+source = "git+https://github.com/JayTsu-sh/data-mover-rs.git?rev=0070c1599689e6c3a5cb3c8e7df602e03f00ca97#0070c1599689e6c3a5cb3c8e7df602e03f00ca97"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -1937,7 +1937,7 @@ dependencies = [
 [[package]]
 name = "data-mover-transfer"
 version = "0.4.0"
-source = "git+https://github.com/JayTsu-sh/data-mover-rs.git?rev=2752c8293fc5ffb1606a2fb17bc68ae94493f10d#2752c8293fc5ffb1606a2fb17bc68ae94493f10d"
+source = "git+https://github.com/JayTsu-sh/data-mover-rs.git?rev=0070c1599689e6c3a5cb3c8e7df602e03f00ca97#0070c1599689e6c3a5cb3c8e7df602e03f00ca97"
 dependencies = [
  "async-trait",
  "blake3",
@@ -1958,7 +1958,7 @@ dependencies = [
 [[package]]
 name = "data-mover-traversal"
 version = "0.4.0"
-source = "git+https://github.com/JayTsu-sh/data-mover-rs.git?rev=2752c8293fc5ffb1606a2fb17bc68ae94493f10d#2752c8293fc5ffb1606a2fb17bc68ae94493f10d"
+source = "git+https://github.com/JayTsu-sh/data-mover-rs.git?rev=0070c1599689e6c3a5cb3c8e7df602e03f00ca97#0070c1599689e6c3a5cb3c8e7df602e03f00ca97"
 dependencies = [
  "async-trait",
  "blake3",
@@ -6127,28 +6127,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
 
 [[package]]
-name = "storage-adapter"
-version = "0.1.0"
-dependencies = [
- "async-channel",
- "async-trait",
- "blake3",
- "bytes 1.12.1",
- "chrono",
- "data-mover",
- "futures",
- "serde",
- "serde_json",
- "soft-canonicalize",
- "task-model",
- "tempfile",
- "thiserror 2.0.20",
- "tokio",
- "tokio-util",
- "tracing",
-]
-
-[[package]]
 name = "stringprep"
 version = "0.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6735,6 +6713,7 @@ dependencies = [
  "rcgen",
  "rustls 0.23.40",
  "serde",
+ "serde_json",
  "task-model",
  "thiserror 2.0.20",
  "tokio",
@@ -7093,7 +7072,6 @@ dependencies = [
  "serde",
  "serde_json",
  "sqlx",
- "storage-adapter",
  "task-model",
  "thiserror 2.0.20",
  "tokio",
@@ -7184,7 +7162,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.48.0",
 ]
 
 [[package]]

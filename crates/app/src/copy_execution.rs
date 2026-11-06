@@ -47,7 +47,7 @@ pub(crate) async fn begin_copy_catalogue(
     .await?;
     let source = source.storage().identity();
     let target_identity = target.storage().identity();
-    let history = target.is_bucket_versioned().await?;
+    let history = target.storage().staged_destination()?.keeps_history().await?;
     let list_digest = if let Some(path) = job.file_list.clone() {
         Some(
             spawn_blocking(move || -> Result<String> {

@@ -1,11 +1,11 @@
 //! 扫描逻辑统计：按目录替换贡献，回调与检查点共用同一快照。
+use crate::storage_factory::StorageContext;
 use data_mover::{
     model::{BackendKind, MetadataFamily, ObservationSupport},
     traversal::{DirectoryStatistics, EntryKindCounts, ListingOutcome},
 };
 use serde::{Deserialize, Serialize};
 use std::fmt;
-use storage_adapter::StorageContext;
 
 /// 每个目录的直属孩子贡献；历史版本与逻辑 entry 分开计数。
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]

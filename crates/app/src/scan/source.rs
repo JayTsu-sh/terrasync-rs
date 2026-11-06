@@ -1,20 +1,17 @@
-use crate::ObservedEntryExt;
-use crate::connected::path;
-use crate::projection::{HistorySequence, observation_plan, validate_required_tags};
-use crate::{error::operation, *};
-use chrono::NaiveDate;
+use super::observation::{HistorySequence, observation_plan, tags_required, validate_required_tags};
+use crate::error::storage::{Result, StorageError, operation};
+use crate::storage_factory::{StorageContext, path};
+use task_model::ObservedEntryExt;
+
+use super::packaging::PackageFilter;
+use crate::task_stream::AsyncReceiver;
 use data_mover::{
     DslTraversalFilter,
-    model::{EntryKind, EntryOperationFailure, MetadataObservations, MetadataRequirements, ObservedEntry},
-    storage::{
-        DeleteTreeItem, DeleteTreeOutcome, DeleteTreeRequest, DeleteTreeTerminalFailure, StorageRoleFailure,
-        delete_tree,
-    },
+    model::ObservedEntry,
     traversal::{
-        Checkpoint, DirectoryStatistics, Resumable, ScanFailureSignal, TraversalCandidate, TraversalDecision,
-        TraversalFilter, TraversalItem, TraversalOrder, TraversalOutcome, TraversalRecoveryResume,
-        TraversalRecoveryStatus, TraversalRequest, TraversalResume, TraversalSession, TraversalSource,
-        TraversalTerminalFailure,
+        Checkpoint, DirectoryStatistics, Resumable, ScanFailureSignal, TraversalItem, TraversalOrder, TraversalOutcome,
+        TraversalRecoveryResume, TraversalRecoveryStatus, TraversalRequest, TraversalResume, TraversalSession,
+        TraversalSource, TraversalTerminalFailure,
     },
 };
 use std::{
@@ -22,6 +19,7 @@ use std::{
     path::{Path, PathBuf},
     sync::Arc,
 };
+use task_model::{ErrorEvent, StorageEntryMessage};
 use tokio_util::sync::CancellationToken;
 
 pub enum ScanSourceMode {
@@ -38,7 +36,7 @@ impl StorageContext {
     fn traversal_request(&self, sub: Option<&Path>, options: &WalkOptions, blocks: bool) -> Result<TraversalRequest> {
         let root = path(sub.unwrap_or(Path::new("")))?;
         let mut request = TraversalRequest::new(root)
-            .observation_plan(observation_plan(self.tags_required(options.include_tags)?))
+            .observation_plan(observation_plan(tags_required(&self.roles, options.include_tags)?))
             .max_inflight_operations(NonZeroUsize::new(options.concurrency).unwrap_or(NonZeroUsize::MIN))
             .max_depth(options.depth.and_then(NonZeroUsize::new));
         if blocks {
@@ -87,7 +85,7 @@ impl StorageContext {
             guard: scan.failure,
             recovery: scan.recovery,
             history: None,
-            include_tags: self.tags_required(options.include_tags)?,
+            include_tags: tags_required(&self.roles, options.include_tags)?,
             cancel,
         })
     }
@@ -112,7 +110,7 @@ impl StorageContext {
     async fn walkdir_with_root_policy(
         &self, sub: Option<&Path>, options: WalkOptions, report_root: bool,
     ) -> Result<WalkDirAsyncIterator> {
-        let required_tags = self.tags_required(options.include_tags)?;
+        let required_tags = tags_required(&self.roles, options.include_tags)?;
         let request = self
             .traversal_request(sub, &options, false)?
             .report_root_directory_object(report_root);
@@ -249,75 +247,11 @@ impl StorageContext {
     /// 交付原生目录块；历史顺序和必需事实在编号／传输前完成准入。
     pub fn directory_inventory(&self, options: &WalkOptions) -> Result<DirectoryInventory> {
         Ok(DirectoryInventory {
-            required_tags: self.tags_required(options.include_tags)?,
+            required_tags: tags_required(&self.roles, options.include_tags)?,
             session: self.traversal(None, options, true)?,
             histories: HistorySequence::default(),
             ended: false,
         })
-    }
-    pub async fn delete_dir_all_with_progress(
-        &self, sub: Option<&Path>, concurrency: usize,
-    ) -> Result<AsyncReceiver<DeleteEvent>> {
-        let mut session = delete_tree(
-            &self.roles,
-            DeleteTreeRequest {
-                root: path(sub.unwrap_or(Path::new("")))?,
-                delete_root: true,
-                max_inflight_operations: NonZeroUsize::new(concurrency).unwrap_or(NonZeroUsize::MIN),
-                max_buffered_items: NonZeroUsize::new(128).unwrap_or(NonZeroUsize::MIN),
-                cancel: CancellationToken::new(),
-            },
-        )
-        .map_err(StorageError::from)?;
-        let (tx, rx) = async_channel::bounded(128);
-        tokio::spawn(async move {
-            while let Some(item) = session.next_item().await {
-                let event = match item {
-                    DeleteTreeItem::Deleted { path, kind } => DeleteEvent {
-                        relative_path: path.as_str().into(),
-                        is_dir: kind == EntryKind::Directory,
-                        error: None,
-                        failure: None,
-                    },
-                    DeleteTreeItem::EntryFailure(f) => DeleteEvent {
-                        relative_path: f.path().as_str().into(),
-                        is_dir: false,
-                        error: Some(f.to_string()),
-                        failure: Some(DeleteEventFailure::Entry(f)),
-                    },
-                };
-                if tx.send(event).await.is_err() {
-                    return;
-                }
-            }
-            let result = session.finish().await;
-            if !matches!(&result, Ok(DeleteTreeOutcome::Completed(_))) {
-                let _ = tx
-                    .send(DeleteEvent {
-                        relative_path: PathBuf::new(),
-                        is_dir: false,
-                        error: Some("recursive deletion did not complete".into()),
-                        failure: result.err().map(DeleteEventFailure::Terminal),
-                    })
-                    .await;
-            }
-        });
-        Ok(AsyncReceiver::new(rx))
-    }
-    pub async fn delete_dir_all(&self, entry: &ObservedEntry) -> Result<()> {
-        let events = self
-            .delete_dir_all_with_progress(Some(entry.get_relative_path()), 4)
-            .await?;
-        while let Some(event) = events.next().await {
-            if let Some(error) = event.error {
-                return Err(match event.failure {
-                    Some(DeleteEventFailure::Entry(source)) => StorageRoleFailure::Entry(source).into(),
-                    Some(DeleteEventFailure::Terminal(source)) => source.into(),
-                    None => operation(error),
-                });
-            }
-        }
-        Ok(())
     }
 }
 /// 有界原生目录流，不持有 NDX、wire 页或整棵目录的观察。
@@ -360,21 +294,6 @@ impl DirectoryInventory {
     pub async fn finish(self) -> std::result::Result<TraversalOutcome, TraversalTerminalFailure> {
         self.session.finish().await
     }
-}
-
-#[derive(Debug, Clone)]
-pub struct DeleteEvent {
-    pub relative_path: PathBuf,
-    pub is_dir: bool,
-    pub error: Option<String>,
-    // 仅在适配层内保留原始来源；对外进度消息继续使用原有文本。
-    failure: Option<DeleteEventFailure>,
-}
-
-#[derive(Debug, Clone)]
-enum DeleteEventFailure {
-    Entry(EntryOperationFailure),
-    Terminal(DeleteTreeTerminalFailure),
 }
 
 /// 按交付顺序返回产品条目及其 opaque 遍历检查点。
@@ -478,103 +397,12 @@ impl ResumableScan {
         Ok(outcome)
     }
 }
-pub type DeleteDirIterator = AsyncReceiver<DeleteEvent>;
-
-/// 打包选择属于产品层；遍历仍由上游按页执行，在选中目录处停止下钻。
-#[derive(Debug)]
-struct PackageFilter {
-    dsl: DslTraversalFilter,
-    enabled: bool,
-    extra_depth: usize,
-    maximum: Option<usize>,
-}
-impl PackageFilter {
-    fn new(options: &WalkOptions) -> Self {
-        Self {
-            dsl: DslTraversalFilter::new(options.match_expressions.clone(), options.exclude_expressions.clone()),
-            enabled: options.packaged && options.match_expressions.is_some(),
-            extra_depth: options.package_depth,
-            maximum: options.depth.filter(|v| *v > 0),
-        }
-    }
-    fn target_depth(&self, value: &str, is_dir: bool) -> Option<usize> {
-        if !self.enabled {
-            return None;
-        }
-        let parts: Vec<_> = value.split('/').filter(|v| !v.is_empty()).collect();
-        let directories = parts.len().saturating_sub(usize::from(!is_dir));
-        for index in 0..directories {
-            if !date_name(parts[index]) {
-                continue;
-            }
-            let ancestor = parts[..=index].join("/");
-            let metadata = MetadataObservations::default();
-            let candidate = TraversalCandidate {
-                path: &ancestor,
-                name: parts[index],
-                kind: EntryKind::Directory,
-                size: None,
-                modified: None,
-                metadata: &metadata,
-            };
-            if self.dsl.decide(&candidate).emit {
-                let target = index + 1 + self.extra_depth;
-                return Some(target);
-            }
-        }
-        None
-    }
-    fn packaged_path(&self, value: &str) -> bool {
-        self.target_depth(value, true) == Some(value.split('/').filter(|v| !v.is_empty()).count())
-    }
-}
-impl TraversalFilter for PackageFilter {
-    fn resume_key(&self) -> Option<Vec<u8>> {
-        let mut key = b"terrasync-package-filter-v1\0".to_vec();
-        key.extend(self.dsl.resume_key()?);
-        key.push(u8::from(self.enabled));
-        key.extend_from_slice(&(self.extra_depth as u64).to_le_bytes());
-        key.push(u8::from(self.maximum.is_some()));
-        key.extend_from_slice(&(self.maximum.unwrap_or_default() as u64).to_le_bytes());
-        Some(key)
-    }
-    fn required_metadata(&self) -> MetadataRequirements {
-        self.dsl.required_metadata()
-    }
-    fn decide(&self, candidate: &TraversalCandidate<'_>) -> TraversalDecision {
-        let mut decision = self.dsl.decide(candidate);
-        let is_dir = candidate.kind == EntryKind::Directory;
-        if let Some(target) = self.target_depth(candidate.path, is_dir) {
-            let depth = candidate.path.split('/').filter(|v| !v.is_empty()).count();
-            if self.maximum.is_some_and(|maximum| target > maximum) {
-                decision.emit = false;
-                decision.descend = false;
-            } else if depth == target && is_dir {
-                decision.descend = false;
-            } else {
-                decision.emit = false;
-            }
-        }
-        // 必须在每层评估打包深度；普通 DSL 可以提前放行整个子树。
-        decision.filter_children = true;
-        decision
-    }
-}
-fn date_name(name: &str) -> bool {
-    name.char_indices().any(|(start, _)| {
-        [(10, "%Y-%m-%d"), (8, "%Y%m%d"), (6, "%y%m%d")]
-            .into_iter()
-            .any(|(length, format)| {
-                name.get(start..start + length)
-                    .is_some_and(|value| NaiveDate::parse_from_str(value, format).is_ok())
-            })
-    })
-}
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod stopping_tests {
     use super::*;
+    use crate::storage_factory::{CreateStorageOptions, create_storage};
     use data_mover::traversal::TraversalTerminalFailure;
     use std::{
         num::NonZeroUsize,
@@ -616,3 +444,38 @@ mod stopping_tests {
         source.await.unwrap();
     }
 }
+
+pub type WalkDirAsyncIterator = AsyncReceiver<StorageEntryMessage>;
+
+#[derive(Debug, Clone)]
+pub struct WalkOptions {
+    /// 单个远程存储操作的等待上限；独立于自动恢复，不包含消费者背压。
+    pub operation_timeout: Option<std::time::Duration>,
+    /// 调用方显式选择的故障恢复窗口；None 直接报告失败，不自动重连。
+    pub recovery_window: Option<std::time::Duration>,
+    pub depth: Option<usize>,
+    pub match_expressions: Option<FilterExpression>,
+    pub exclude_expressions: Option<FilterExpression>,
+    pub concurrency: usize,
+    pub include_tags: bool,
+    pub packaged: bool,
+    pub package_depth: usize,
+}
+
+impl Default for WalkOptions {
+    fn default() -> Self {
+        Self {
+            operation_timeout: None,
+            recovery_window: None,
+            depth: None,
+            match_expressions: None,
+            exclude_expressions: None,
+            concurrency: 1,
+            include_tags: false,
+            packaged: false,
+            package_depth: 0,
+        }
+    }
+}
+
+use data_mover::filter::FilterExpression;

@@ -1,18 +1,21 @@
+use crate::rm::progress as deletion;
+use crate::scan::observe_path;
 // 标准库
+use crate::scan::source::WalkOptions;
 use data_mover::model::StoragePath;
 use data_mover::tar_pack::{self, TarRequest};
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
-use storage_adapter::WalkOptions;
 use task_model::ObservedEntryExt;
 
 // 内部模块
+use crate::error::StorageError;
+use crate::scan::source::WalkDirAsyncIterator;
+use crate::storage_factory::StorageContext;
 use data_mover::model::ObservedEntry;
 use data_mover::qos::QosManager;
-use storage_adapter::WalkDirAsyncIterator;
-use storage_adapter::{StorageContext, StorageError};
 use task_model::StorageEntryMessage;
 // 外部crate
 use tracing::{debug, info};
@@ -73,12 +76,12 @@ pub async fn pack_directory(
     );
 
     // 归档是目标端已经发布的真实文件，读取其原生观察，不能借用源目录身份拼造条目。
-    let tar_entry = dest_storage.get_metadata(Path::new(tar_relative_path.as_str())).await?;
+    let tar_entry = observe_path(dest_storage.storage(), Path::new(tar_relative_path.as_str())).await?;
 
     // 删除源端目录（如果不保留）
     if !is_source_reserved {
         debug!("Deleting source directory: {:?}", dir_path);
-        src_storage.delete_dir_all(dir_entry).await?;
+        deletion::delete_dir_all(src_storage.storage(), dir_entry).await?;
     }
 
     Ok((tar_entry, manifest_list))
@@ -119,7 +122,8 @@ async fn collect_entries(iterator: WalkDirAsyncIterator) -> Result<Vec<Arc<Obser
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
-    use storage_adapter::{AsyncReceiver, CreateStorageOptions, create_storage};
+    use crate::storage_factory::{CreateStorageOptions, create_storage};
+    use crate::task_stream::AsyncReceiver;
     use task_model::ErrorEvent;
 
     #[tokio::test]
@@ -152,7 +156,7 @@ mod tests {
         )
         .await?;
         let target = create_storage(target_root.path().to_str().unwrap(), CreateStorageOptions::default()).await?;
-        let directory = source.get_metadata(Path::new("tree")).await?;
+        let directory = observe_path(source.storage(), Path::new("tree")).await?;
         let counter = Arc::new(AtomicU64::new(0));
         let (tar_entry, manifest) =
             pack_directory(&source, &target, &directory, true, None, Some(Arc::clone(&counter))).await?;

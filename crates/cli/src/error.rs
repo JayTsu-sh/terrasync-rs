@@ -10,7 +10,7 @@
 // 无
 
 // 外部crate
-use storage_adapter::error::StorageError;
+use app::error::StorageError;
 use thiserror::Error;
 
 // 内部模块

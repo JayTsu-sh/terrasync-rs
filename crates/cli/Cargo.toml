@@ -11,7 +11,6 @@ gui = ["dep:web"]
 lab-fault-injection = ["app/lab-fault-injection"]
 
 [dependencies]
-storage-adapter = { workspace = true }
 task-model = { workspace = true }
 app        = { workspace = true }
 licensing  = { workspace = true, optional = true }

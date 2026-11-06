@@ -1,12 +1,11 @@
 //! 需要实验室提供两个同名、内容不同的版本，验证恢复路径不会读取最新版本。
-#[path = "../../../tests/support/observed.rs"]
-mod observed_fixtures;
+use crate::file_copy::CopyOptions;
+use crate::file_copy::transfer as copy_transfer;
+use crate::scan::source::WalkOptions;
+use crate::storage_factory::{CreateStorageOptions, create_storage};
 use task_model::observation::ObservedItem;
+use task_model::{StorageEntryMessage, TransferMode};
 use tempfile::TempDir;
-use {
-    storage_adapter::{CopyOptions, CreateStorageOptions, StorageContext, WalkOptions, create_storage},
-    task_model::{StorageEntryMessage, TransferMode},
-};
 
 type TestResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
 
@@ -47,7 +46,7 @@ async fn checkpointed_copy_reads_requested_historical_version() -> TestResult {
         return Err(error.into());
     }
     let selected = selected.ok_or("requested source version was not listed")?;
-    StorageContext::copy_observed_item(
+    copy_transfer::copy_item(
         &source,
         &target,
         &selected,

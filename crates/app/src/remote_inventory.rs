@@ -1,8 +1,10 @@
 //! 源端原生目录块的产品清单：排序、会话编号和有界目录页。
+use crate::error::storage::Result as StorageResult;
+use crate::scan::source::WalkOptions;
+use crate::storage_factory::StorageContext;
 use async_channel::Receiver;
 use data_mover::traversal::{TraversalItem, TraversalOutcome};
 use std::sync::Arc;
-use storage_adapter::{Result as StorageResult, StorageContext, WalkOptions};
 use task_model::ObservedEntryExt;
 use task_model::observation::ObservedItem;
 use transport::directory::{DirPageResult, NdxEntry};

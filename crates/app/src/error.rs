@@ -1,3 +1,4 @@
+use data_mover::storage::{CapabilityUnavailable, StorageRoleFailure};
 // 标准库
 use std::fs::TryLockError;
 use std::num::TryFromIntError;
@@ -13,7 +14,8 @@ use db::error::DatabaseError;
 #[cfg(feature = "license")]
 use licensing::error::LicenseError;
 use serde_json::Error as JsonError;
-use storage_adapter::error::StorageError;
+pub mod storage;
+pub use storage::StorageError;
 use thiserror::Error;
 use tokio::task::JoinError;
 use transport::error::TransportError;
@@ -257,5 +259,16 @@ impl AppError {
             Self::ScanStorageAndDatabaseFailure { source, .. } => Some(source),
             _ => None,
         }
+    }
+}
+
+impl From<StorageRoleFailure> for AppError {
+    fn from(source: StorageRoleFailure) -> Self {
+        Self::StorageError(source.into())
+    }
+}
+impl From<CapabilityUnavailable> for AppError {
+    fn from(source: CapabilityUnavailable) -> Self {
+        Self::StorageError(source.into())
     }
 }

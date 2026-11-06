@@ -1,9 +1,16 @@
 // 外部 crate
+use data_mover::model::ModelValueError;
 use thiserror::Error;
 
 /// Transport 层错误类型
 #[derive(Error, Debug)]
 pub enum TransportError {
+    #[error(transparent)]
+    AclSerialization(#[from] serde_json::Error),
+    #[error(transparent)]
+    AclModel(#[from] ModelValueError),
+    #[error("unknown ACL encoding: {encoding}")]
+    InvalidAclEncoding { encoding: u8 },
     #[error(transparent)]
     Io(#[from] std::io::Error),
     /// 通道已关闭（发送端或接收端已 drop）

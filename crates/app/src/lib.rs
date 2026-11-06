@@ -9,6 +9,8 @@
 #[cfg(windows)]
 pub mod ace;
 
+pub mod task_stream;
+
 pub mod broadcast;
 mod copy_dispatch;
 
@@ -136,3 +138,6 @@ pub mod prelude {
 #[cfg(test)]
 #[path = "../../../tests/support/observed.rs"]
 mod observed_fixtures;
+
+#[cfg(test)]
+mod storage_tests;

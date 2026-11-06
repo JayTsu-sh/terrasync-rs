@@ -650,7 +650,7 @@ async fn copy_comparison_binds_new_and_changed_versions_in_source_order() -> Res
             Some((id.map(str::to_string), latest, false)),
         )
     };
-    let mut database = ClickHouseDatabase::new(&fixture.config, "mixed_history")?;
+    let database = ClickHouseDatabase::new(&fixture.config, "mixed_history")?;
     database.initialize().await?;
     database.begin_copy_generation("mixed-history").await?;
     database
@@ -734,7 +734,7 @@ async fn copy_comparison_distinguishes_unmapped_principals_from_numeric_zero() -
         })))?;
         Ok(Arc::new(entry))
     };
-    let mut database = ClickHouseDatabase::new(&fixture.config, "nullable_principals")?;
+    let database = ClickHouseDatabase::new(&fixture.config, "nullable_principals")?;
     database.initialize().await?;
     database.begin_scan_generation().await?;
     database.batch_insert_base_record(&[observe(None)?]).await?;
@@ -761,7 +761,7 @@ async fn copy_comparison_distinguishes_unmapped_principals_from_numeric_zero() -
 #[ignore = "requires an explicitly selected six-replica ClickHouse cluster; isolated database and local fixture only"]
 async fn copy_comparison_deduplicates_repeated_identical_observations() -> Result<()> {
     let fixture = Fixture::new().await?;
-    let mut database = ClickHouseDatabase::new(&fixture.config, "duplicate_source")?;
+    let database = ClickHouseDatabase::new(&fixture.config, "duplicate_source")?;
     database.initialize().await?;
     database.begin_scan_generation().await?;
     let source = fixture.entry("same", 10, "aa");

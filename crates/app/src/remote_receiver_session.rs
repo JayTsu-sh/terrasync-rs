@@ -5,6 +5,9 @@
 //! 当前实现委托既有事件循环，后续 tickets 将在此 interface 后逐步收拢会话状态。
 
 use crate::file_copy::copied_tags_required;
+use crate::file_copy::metadata as copy_metadata;
+use crate::file_copy::namespace as copy_namespace;
+use crate::rm::progress as deletion;
 use data_mover::storage::read_current_range;
 use futures::StreamExt;
 use std::collections::{HashMap, HashSet};
@@ -16,8 +19,9 @@ use task_model::TransferMode;
 use task_model::observation::ObservedItem;
 use tokio_util::sync::CancellationToken;
 
+use crate::error::storage::Result as StorageResult;
+use crate::storage_factory::StorageContext;
 use data_mover::model::ObservedEntry;
-use storage_adapter::{Result as StorageResult, StorageContext};
 use tokio::sync::mpsc::{Receiver, Sender};
 use tracing::{debug, info, warn};
 use transport::chunk::DataChunk;
@@ -124,7 +128,7 @@ impl RemoteSessionState {
                 true
             }
             TransferDecision::MetadataOnly => {
-                if let Err(error) = dest.set_entry_metadata(&entry.entry).await {
+                if let Err(error) = copy_metadata::set_entry_metadata(dest.storage(), &entry.entry).await {
                     let _ = transport
                         .send(ReceiverMsg::EntryError {
                             entry: Arc::clone(&entry.entry),
@@ -282,7 +286,9 @@ impl RemoteSessionState {
                         self.ledger.record_request();
                     }
                 } else if delete_target && dest_index.has_directory_marker(&subdir.entry.entry) {
-                    if let Err(error) = dest.remove_directory_marker(&subdir.entry.entry).await {
+                    if let Err(error) =
+                        copy_namespace::remove_directory_marker(dest.storage(), &subdir.entry.entry).await
+                    {
                         let _ = transport
                             .send(ReceiverMsg::EntryError {
                                 entry: Arc::clone(&subdir.entry.entry),
@@ -295,7 +301,7 @@ impl RemoteSessionState {
                 }
                 continue;
             }
-            if let Err(error) = dest.create_dir_all(&subdir.entry.entry).await {
+            if let Err(error) = copy_namespace::create_dir_all(dest.storage(), &subdir.entry.entry).await {
                 warn!(
                     "[Receiver Remote] create_dir {:?}: {}",
                     subdir.entry.get_relative_path(),
@@ -323,10 +329,10 @@ impl RemoteSessionState {
             }
             let result = if orphan.get_is_dir() {
                 info!("[Receiver Remote] Deleting orphaned dir: {:?}", path);
-                dest.delete_dir_all(orphan).await
+                deletion::delete_dir_all(dest.storage(), orphan).await
             } else {
                 info!("[Receiver Remote] Deleting orphaned file: {:?}", path);
-                dest.delete_file(orphan).await
+                copy_namespace::delete_file(dest.storage(), orphan).await
             };
             match result {
                 Ok(()) => {
@@ -358,7 +364,7 @@ impl RemoteSessionState {
     /// 在所有文件 durable outcome 完成后恢复目录 metadata。
     pub(crate) async fn finalize_directories(&self, dest: &StorageContext) {
         for entry in &self.created_dirs {
-            if let Err(error) = dest.set_entry_metadata(entry).await {
+            if let Err(error) = copy_metadata::set_entry_metadata(dest.storage(), entry).await {
                 warn!(
                     "[Receiver Remote] 回写目录元数据 {:?} 失败: {}",
                     entry.get_relative_path(),
@@ -712,6 +718,7 @@ impl RemoteReceiverSession {
 #[cfg(test)]
 #[allow(clippy::expect_used, clippy::field_reassign_with_default, clippy::unwrap_used)]
 mod tests {
+    use crate::scan::observe_path;
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
@@ -724,8 +731,8 @@ mod tests {
     use transport::directory::{DirPageResult, NdxEntry};
 
     use crate::remote_inventory::directory_pages;
+    use crate::scan::source::WalkOptions;
     use crate::storage_factory::{StorageRole, create_storage_for_role};
-    use storage_adapter::WalkOptions;
     use tempfile::tempdir;
     use tokio::sync::{Mutex as TokioMutex, mpsc};
     use transport::error::Result as TransportResult;
@@ -869,7 +876,11 @@ mod tests {
         let source = create_storage(source_root.path().to_str().unwrap(), None, false)
             .await
             .unwrap();
-        let entry = Arc::new(source.get_metadata(std::path::Path::new("file")).await.unwrap());
+        let entry = Arc::new(
+            observe_path(source.storage(), std::path::Path::new("file"))
+                .await
+                .unwrap(),
+        );
         let (incoming_tx, incoming_rx) = mpsc::channel(3);
         incoming_tx
             .send(SenderMsg::FilePage(DirPageResult {
@@ -1111,7 +1122,12 @@ mod tests {
         let target = create_storage(target_root.path().to_str().unwrap(), None, true)
             .await
             .unwrap();
-        let entry = Arc::new(source.get_metadata(std::path::Path::new("missing")).await.unwrap()).into();
+        let entry = Arc::new(
+            observe_path(source.storage(), std::path::Path::new("missing"))
+                .await
+                .unwrap(),
+        )
+        .into();
         let (sender, receiver) = create_in_process_pair();
         let progress = ReceiverProgress::new();
         let mut state = RemoteSessionState::default();

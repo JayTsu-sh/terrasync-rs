@@ -13,6 +13,7 @@ async-channel = { workspace = true }
 async-trait   = { workspace = true }
 bytes         = { workspace = true, features = ["serde"] }
 serde         = { workspace = true, features = ["rc"] }
+serde_json    = { workspace = true }
 data-mover    = { workspace = true }
 thiserror     = { workspace = true }
 tokio         = { version = "1.51.1", features = ["sync"] }

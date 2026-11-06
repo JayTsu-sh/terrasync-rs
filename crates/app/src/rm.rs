@@ -2,6 +2,8 @@
 //!
 //! 该模块提供了删除指定路径下所有文件和目录的功能，支持递归删除并实时显示进度。
 
+use crate::rm::progress as deletion;
+pub(crate) mod progress;
 // 标准库
 use std::time::Duration;
 
@@ -31,7 +33,7 @@ pub async fn rm(path: &str) -> Result<()> {
     pb.enable_steady_tick(Duration::from_secs(2));
 
     let concurrency = AppConfig::fetch()?.delete.concurrency;
-    let iter = storage.delete_dir_all_with_progress(None, concurrency).await?;
+    let iter = deletion::delete_dir_all_with_progress(storage.storage(), None, concurrency).await?;
 
     let mut file_count: u64 = 0;
     let mut dir_count: u64 = 0;

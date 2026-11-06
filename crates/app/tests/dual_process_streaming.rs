@@ -11,9 +11,9 @@ use task_model::TransferMode;
 
 use app::disk_commit::disk_commit_task;
 use app::receiver::ReceiverProgress;
+use app::storage_factory::{StorageContext, create_storage};
 use bytes::Bytes;
 use data_mover::model::ObservedEntry;
-use storage_adapter::{StorageContext, create_storage};
 use tokio_util::sync::CancellationToken;
 use transport::message::{DcAck, DiskCommitMsg, FileOutcome, ReceiverMsg, SessionConfig};
 
@@ -25,7 +25,7 @@ use transport::message::{DcAck, DiskCommitMsg, FileOutcome, ReceiverMsg, Session
 async fn local_storage(dir: &std::path::Path) -> Arc<StorageContext> {
     let storage = create_storage(
         &dir.to_string_lossy(),
-        storage_adapter::CreateStorageOptions::new(None, false),
+        app::storage_factory::CreateStorageOptions::new(None, false),
     )
     .await
     .unwrap();

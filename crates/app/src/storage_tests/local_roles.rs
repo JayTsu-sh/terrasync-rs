@@ -1,26 +1,26 @@
-use data_mover::storage::PositionedChunk;
-#[path = "../../../tests/support/observed.rs"]
-mod observed_fixtures;
+use crate::file_commit::stream as commit_stream;
+use crate::file_copy::CopyOptions;
+use crate::file_copy::namespace as copy_namespace;
+use crate::file_copy::transfer as copy_transfer;
+use crate::rm::progress as deletion;
+use crate::scan::observe_path;
+use crate::scan::source::{ResumableScanItem, ScanSourceMode, WalkOptions};
+use crate::storage_factory::{CreateStorageOptions, StorageContext, create_storage};
 use bytes::Bytes;
 use data_mover::filter::parse_filter_expression;
+use data_mover::storage::PositionedChunk;
 use data_mover::traversal::TraversalOutcome;
 use std::{collections::BTreeSet, path::Path, sync::Arc, time::Duration};
+use task_model::StorageEntryMessage;
 use task_model::{ObservedEntryExt, TransferMode};
 use tempfile::TempDir;
 use tokio::fs::{create_dir_all, write};
 use tokio_util::sync::CancellationToken;
-use {
-    storage_adapter::{
-        CopyOptions, CreateStorageOptions, ResumableScanItem, ScanSourceMode, StorageContext, WalkOptions,
-        create_storage,
-    },
-    task_model::StorageEntryMessage,
-};
 
-async fn local(root: &Path) -> storage_adapter::Result<StorageContext> {
+async fn local(root: &Path) -> crate::error::storage::Result<StorageContext> {
     create_storage(
         root.to_str()
-            .ok_or_else(|| storage_adapter::StorageError::InvalidPath("test root".into()))?,
+            .ok_or_else(|| crate::error::StorageError::InvalidPath("test root".into()))?,
         CreateStorageOptions::new(Some(64 * 1024), false),
     )
     .await
@@ -144,8 +144,8 @@ async fn role_copy_replaces_shorter_file_and_move_removes_only_verified_source()
     tokio::fs::write(destination.path().join("payload"), b"old-long-data").await?;
     let src = local(source.path()).await?;
     let dst = local(destination.path()).await?;
-    let entry = Arc::new(src.get_metadata(Path::new("payload")).await?);
-    StorageContext::copy_file(
+    let entry = Arc::new(observe_path(src.storage(), Path::new("payload")).await?);
+    copy_transfer::copy_entry(
         &src,
         &dst,
         &entry,
@@ -158,7 +158,7 @@ async fn role_copy_replaces_shorter_file_and_move_removes_only_verified_source()
     .await?;
     assert_eq!(tokio::fs::read(destination.path().join("payload")).await?, b"new");
     assert!(source.path().join("payload").exists());
-    StorageContext::copy_file(
+    copy_transfer::copy_entry(
         &src,
         &dst,
         &entry,
@@ -180,23 +180,12 @@ async fn streamed_destination_is_published_only_after_complete() -> TestResult {
     tokio::fs::write(destination.path().join("payload"), b"old").await?;
     let src = local(source.path()).await?;
     let dst = local(destination.path()).await?;
-    let entry = Arc::new(src.get_metadata(Path::new("payload")).await?);
-    let handle = StorageContext::prepare_stream(&dst, &entry).await?;
+    let entry = Arc::new(observe_path(src.storage(), Path::new("payload")).await?);
+    let handle = commit_stream::prepare_stream(&dst, &entry).await?;
     let (tx, rx) = tokio::sync::mpsc::channel(1);
-    let writer_dst = dst.clone();
-    let writer_entry = entry.clone();
     let writer_handle = handle.clone();
-    let writer = tokio::spawn(async move {
-        StorageContext::write_chunk_stream(
-            &writer_dst,
-            &writer_entry,
-            rx,
-            &writer_handle,
-            None,
-            Arc::new(|_, _| {}),
-        )
-        .await
-    });
+    let writer =
+        tokio::spawn(async move { commit_stream::write_chunk_stream(rx, &writer_handle, Arc::new(|_, _| {})).await });
     for (index, chunk) in payload.chunks(64 * 1024).enumerate() {
         tx.send(PositionedChunk {
             offset: (index * 64 * 1024) as u64,
@@ -208,7 +197,7 @@ async fn streamed_destination_is_published_only_after_complete() -> TestResult {
     writer.await??;
     assert_eq!(tokio::fs::read(destination.path().join("payload")).await?, b"old");
     assert_eq!(handle.received_size().await, payload.len() as u64);
-    StorageContext::commit_chunk_stream(&dst, &entry, payload.len() as u64, handle).await?;
+    commit_stream::commit_chunk_stream(handle).await?;
     assert_eq!(tokio::fs::read(destination.path().join("payload")).await?, payload);
     Ok(())
 }
@@ -220,8 +209,8 @@ async fn short_stream_cannot_replace_an_existing_destination() -> TestResult {
     tokio::fs::write(destination.path().join("payload"), b"old").await?;
     let src = local(source.path()).await?;
     let dst = local(destination.path()).await?;
-    let entry = Arc::new(src.get_metadata(Path::new("payload")).await?);
-    let handle = StorageContext::prepare_stream(&dst, &entry).await?;
+    let entry = Arc::new(observe_path(src.storage(), Path::new("payload")).await?);
+    let handle = commit_stream::prepare_stream(&dst, &entry).await?;
     let (tx, rx) = tokio::sync::mpsc::channel(1);
     tx.send(PositionedChunk {
         offset: 0,
@@ -230,7 +219,7 @@ async fn short_stream_cannot_replace_an_existing_destination() -> TestResult {
     .await?;
     drop(tx);
     assert!(
-        StorageContext::write_chunk_stream(&dst, &entry, rx, &handle, None, Arc::new(|_, _| {}))
+        commit_stream::write_chunk_stream(rx, &handle, Arc::new(|_, _| {}))
             .await
             .is_err()
     );
@@ -244,7 +233,7 @@ async fn namespace_symlinks_and_recursive_delete_use_storage_roles() -> TestResu
     tokio::fs::create_dir_all(root.path().join("a/b")).await?;
     tokio::fs::write(root.path().join("a/b/data"), b"keep target").await?;
     let storage = local(root.path()).await?;
-    let original = storage.get_metadata(Path::new("a/b/data")).await?;
+    let original = observe_path(storage.storage(), Path::new("a/b/data")).await?;
     let link = data_mover::model::ObservedEntry::new_symlink(
         data_mover::model::StoragePath::new("a/link")?,
         original.modified(),
@@ -252,10 +241,13 @@ async fn namespace_symlinks_and_recursive_delete_use_storage_roles() -> TestResu
         data_mover::model::SymlinkTarget::new(data_mover::model::SymlinkTargetEncoding::UnixBytes, b"b/data".to_vec())?,
     )?
     .with_metadata(original.metadata().clone());
-    storage.create_symlink(&link, Path::new("b/data")).await?;
-    assert_eq!(storage.read_symlink(&link).await?, Path::new("b/data"));
-    let directory = storage.get_metadata(Path::new("a")).await?;
-    storage.delete_dir_all(&directory).await?;
+    copy_namespace::create_symlink(storage.storage(), &link, Path::new("b/data")).await?;
+    assert_eq!(
+        copy_namespace::read_symlink(storage.storage(), &link).await?,
+        Path::new("b/data")
+    );
+    let directory = observe_path(storage.storage(), Path::new("a")).await?;
+    deletion::delete_dir_all(storage.storage(), &directory).await?;
     assert!(!root.path().join("a").exists());
     Ok(())
 }
@@ -299,9 +291,9 @@ async fn checkpointed_copy_keeps_unrelated_files_without_caller_offsets() -> Tes
     tokio::fs::write(source.path().join("payload"), &payload).await?;
     let src = local(source.path()).await?;
     let dst = local(destination.path()).await?;
-    let entry = Arc::new(src.get_metadata(Path::new("payload")).await?);
+    let entry = Arc::new(observe_path(src.storage(), Path::new("payload")).await?);
     tokio::fs::write(destination.path().join("untrusted.part"), b"unrelated").await?;
-    StorageContext::copy_file_resumable(
+    copy_transfer::copy_checkpointed(
         &src,
         &dst,
         &entry,
@@ -328,7 +320,7 @@ async fn observed_zero_mode_is_preserved_instead_of_becoming_unknown() -> TestRe
     std::fs::write(&file, b"payload")?;
     std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o000))?;
     let storage = local(root.path()).await?;
-    let entry = storage.get_metadata(Path::new("zero-mode")).await?;
+    let entry = observe_path(storage.storage(), Path::new("zero-mode")).await?;
     assert_eq!(entry.get_mode().map(|mode| mode & 0o7777), Some(0));
     Ok(())
 }
@@ -378,14 +370,14 @@ async fn copied_observation_rejects_source_changes_before_any_target_write() -> 
     tokio::fs::write(destination.path().join("payload"), b"published").await?;
     let src = local(source.path()).await?;
     let dst = local(destination.path()).await?;
-    let observed = Arc::new(src.get_metadata(Path::new("payload")).await?);
+    let observed = Arc::new(observe_path(src.storage(), Path::new("payload")).await?);
     tokio::fs::write(source.path().join("payload"), b"modified after scan").await?;
     let mut modes = vec![TransferMode::Atomic, TransferMode::Checkpoint];
     if cfg!(unix) {
         modes.push(TransferMode::Direct);
     }
     for transfer_mode in modes {
-        let result = StorageContext::copy_file(
+        let result = copy_transfer::copy_entry(
             &src,
             &dst,
             &observed,
@@ -404,7 +396,7 @@ async fn copied_observation_rejects_source_changes_before_any_target_write() -> 
         );
         assert_eq!(tokio::fs::read(destination.path().join("payload")).await?, b"published");
     }
-    let result = StorageContext::copy_file_resumable(&src, &dst, &observed, CopyOptions::default()).await;
+    let result = copy_transfer::copy_checkpointed(&src, &dst, &observed, CopyOptions::default()).await;
     assert!(result.is_err());
     assert_eq!(tokio::fs::read(destination.path().join("payload")).await?, b"published");
     Ok(())

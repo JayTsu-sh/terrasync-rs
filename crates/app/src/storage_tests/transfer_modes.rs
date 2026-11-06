@@ -1,10 +1,11 @@
 #![cfg(unix)]
 //! 通过旧目标的硬链接观察实际写入语义，防止显式模式被静默替换。
-use task_model::TransferMode;
-#[path = "../../../tests/support/observed.rs"]
-mod observed_fixtures;
+use crate::file_copy::CopyOptions;
+use crate::file_copy::transfer as copy_transfer;
+use crate::scan::observe_path;
+use crate::storage_factory::{CreateStorageOptions, create_storage};
 use std::{error::Error, os::unix::fs::MetadataExt, path::Path, sync::Arc};
-use storage_adapter::{CopyOptions, CreateStorageOptions, StorageContext, create_storage};
+use task_model::TransferMode;
 
 #[tokio::test]
 async fn direct_updates_existing_inode_while_atomic_and_checkpoint_replace_it() -> Result<(), Box<dyn Error>> {
@@ -27,8 +28,8 @@ async fn direct_updates_existing_inode_while_atomic_and_checkpoint_replace_it() 
                 CreateStorageOptions::new(Some(64 * 1024), false),
             )
             .await?;
-            let entry = Arc::new(source.get_metadata(Path::new("file")).await?);
-            StorageContext::copy_file(
+            let entry = Arc::new(observe_path(source.storage(), Path::new("file")).await?);
+            copy_transfer::copy_entry(
                 &source,
                 &target,
                 &entry,

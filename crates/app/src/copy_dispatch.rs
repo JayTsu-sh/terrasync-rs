@@ -1,9 +1,10 @@
 //! 复制流水线按对象路径分派：同一对象的历史分段和操作保持源顺序，队列总量有界。
 use std::hash::{DefaultHasher, Hash, Hasher};
 
+use crate::task_stream::AsyncReceiver;
 use async_channel::Sender;
+use task_model::StorageEntryMessage;
 use tokio::task::JoinHandle;
-use {storage_adapter::AsyncReceiver, task_model::StorageEntryMessage};
 
 use crate::error::{AppError, Result};
 

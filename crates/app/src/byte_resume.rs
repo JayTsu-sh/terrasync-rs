@@ -1,15 +1,8 @@
-//! 字节级断点续传状态（单文件 offset Resume）
+//! 任务字节进度快照。
 //!
-//! 为「多块大文件」记录已确认落盘的 offset 区间集合，持久化在
-//! `jobs/<job_id>/byte_resume/<dest_rel_hash>.json` 下。任务中断后重跑时，
-//! 重新计算缺失区间，只补未完成部分，避免重传整个前半段。
-//!
-//! 设计取舍（见方案文档）：
-//! - 进度 = 已完成区间集合（多块管道乱序并发写，半截文件可能有空洞）。
-//! - 半截文件写到 `<dest>.terrasync-part`，全部补齐后由 data-mover 原子 rename。
-//! - 信任进度记录直接续：靠 commit 语义保证落盘 + 源 mtime/size 未变兜底，不重算 hash。
-//! - S3 目标端例外：进度真值是目标端 in-progress multipart upload（data-mover 以
-//!   ListParts 反推缺失区间），本状态文件仅作进度参考，不参与 S3 续传决策。
+//! 记录目标已确认的 offset 区间，用于持久化任务进度与通知。
+//! 本地 JSON 和临时文件名不决定续传范围；原生传输会话依据目标恢复凭据、
+//! 已持久化字节及源身份决定可恢复位置，并负责完整性校验和最终发布。
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -19,6 +12,9 @@ use tokio::sync::Mutex;
 use tracing::{info, warn};
 
 use crate::error::{AppError, Result};
+
+/// 目标确认的字节进度；该通知不替代原生目标的恢复凭据。
+pub type CommitCallback = Arc<dyn Fn(u64, u64) + Send + Sync>;
 
 /// 状态文件子目录（位于 `job_dir` 下）
 const RESUME_SUBDIR: &str = "byte_resume";

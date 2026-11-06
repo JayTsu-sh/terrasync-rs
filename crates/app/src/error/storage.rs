@@ -1,9 +1,10 @@
 use data_mover::error::StorageError as NativeStorageError;
 use data_mover::qos::SourceQosSetupError;
+use data_mover::storage::EntryObservationFailure;
 use task_model::TaskModelError;
 use tokio::task::JoinError;
 
-use crate::{MismatchDataField, MismatchMetaField, TransferMode};
+use crate::integrity_check::{MismatchDataField, MismatchMetaField};
 use data_mover::traversal::RemoteScanFailure;
 use data_mover::{
     metadata::{MetadataApplicationFailure, MetadataPlanError},
@@ -19,8 +20,11 @@ use data_mover::{
         FailureScope, ObservationFailure, ScanSetupError, TraversalConfigurationError, TraversalTerminalFailure,
     },
 };
+use task_model::TransferMode;
 #[derive(Debug, thiserror::Error)]
 pub enum StorageError {
+    #[error(transparent)]
+    Observation(EntryObservationFailure),
     #[error("incomplete object history")]
     IncompleteHistory,
     #[error(transparent)]
@@ -143,5 +147,17 @@ impl From<TarFailure> for StorageError {
 impl From<RemoteScanFailure> for StorageError {
     fn from(failure: RemoteScanFailure) -> Self {
         Self::RemoteScan(Box::new(failure))
+    }
+}
+
+// 原生聚合操作的已知原因保持原有边界分类，不能因一次封装改变缺失／取消语义。
+impl From<EntryObservationFailure> for StorageError {
+    fn from(failure: EntryObservationFailure) -> Self {
+        match failure {
+            EntryObservationFailure::Role(error) => Self::Role(error),
+            EntryObservationFailure::Capability(error) => Self::Capability(error),
+            EntryObservationFailure::ModelValue(error) => Self::ModelValue(error),
+            other @ EntryObservationFailure::UnsupportedDescriptor { .. } => Self::Observation(other),
+        }
     }
 }

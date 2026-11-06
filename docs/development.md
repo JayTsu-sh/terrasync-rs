@@ -23,7 +23,7 @@ AI 工作流程以根目录 [AGENTS.md](../AGENTS.md) 为准，产品约束按�
 | 场景 | 依据 |
 | --- | --- |
 | 理解当前 workspace、crate 和依赖版本 | 根 Cargo.toml、crates/、[代码结构资料](../.claude/docs/codebase.md)；代码与构建配置为当前事实 |
-| 扫描、同步、故障恢复和 checkpoint | [架构资料](../.claude/docs/architecture.md)、crates/app/ 的当前任务与扫描测试、crates/app/、crates/storage-adapter/ 与 crates/db/ 的当前实现及测试 |
+| 扫描、同步、故障恢复和 checkpoint | [架构资料](../.claude/docs/architecture.md)、crates/app/ 的当前任务与扫描测试、crates/app/scan/、crates/app/file_copy/ 与 crates/db/ 的当前实现及测试 |
 | 外部依赖与真实环境测试 | [E2E 资料](../.claude/docs/e2e-testing.md)、[实验室约束](../tests/lab/README.md) |
 | 存储驱动或环境配置 | [服务资料](../.claude/docs/services-and-storage.md)；实际能力、URL 解析和参数以当前依赖 API 与 CLI --help 为准 |
 | Web API／前端 | [Web／前端规范](web-development.md)、web-ui/package.json |

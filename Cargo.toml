@@ -26,7 +26,6 @@ members = [
     "crates/web",
     "crates/transport",
     "crates/sync-delta",
-    "crates/storage-adapter",
     "crates/task-model",
 ]
 
@@ -66,9 +65,9 @@ rustls       = { version = "0.23", default-features = false, features = ["ring",
 reqwest      = { version = "0.13", default-features = false, features = ["rustls", "json"] }
 
 # 外部 fork（固定精确提交，保证可复现）
-data-mover   = { git = "https://github.com/JayTsu-sh/data-mover-rs.git", rev = "2752c8293fc5ffb1606a2fb17bc68ae94493f10d" }
+data-mover   = { git = "https://github.com/JayTsu-sh/data-mover-rs.git", rev = "0070c1599689e6c3a5cb3c8e7df602e03f00ca97" }
 
-data-mover-model = { git = "https://github.com/JayTsu-sh/data-mover-rs.git", rev = "2752c8293fc5ffb1606a2fb17bc68ae94493f10d" }
+data-mover-model = { git = "https://github.com/JayTsu-sh/data-mover-rs.git", rev = "0070c1599689e6c3a5cb3c8e7df602e03f00ca97" }
 
 # 内部 path crate
 app          = { path = "crates/app" }
@@ -76,7 +75,6 @@ cli          = { path = "crates/cli" }
 db           = { path = "crates/db" }
 licensing    = { path = "crates/licensing" }
 sync-delta   = { path = "crates/sync-delta" }
-storage-adapter = { path = "crates/storage-adapter" }
 task-model = { path = "crates/task-model" }
 transport    = { path = "crates/transport" }
 utils        = { path = "crates/utils" }

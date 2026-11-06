@@ -4,25 +4,32 @@
 //! 从文件列表发布开始运行到 Receiver 返回 `AllDone`。后续迁移会逐步把会话状态与转换
 //! 收入此模块，调用者与测试始终只依赖这里的 interface。
 
+use crate::file_copy::metadata as copy_metadata;
+use crate::file_copy::namespace as copy_namespace;
 use blake3::Hash;
-use data_mover::transfer::ExpertSourcePayload;
+use data_mover::transfer::{ExpertSourcePayload, ExpertSourceRequest, ExpertSourceSession};
 use std::collections::HashSet;
+use std::num::NonZeroUsize;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex, PoisonError};
 use task_model::ObservedEntryExt;
 use task_model::observation::ObservedItem;
+use transport::acl::encode_acl;
 use transport::chunk::DataChunk;
 
+use crate::error::StorageError;
+use crate::error::storage::Result as StorageResult;
 use crate::remote_inventory::{DirectoryPages, NdxEvent};
+use crate::storage_factory::StorageContext;
 use data_mover::model::ObservedEntry;
 use data_mover::qos::QosManager;
-use storage_adapter::{StorageContext, StorageError};
 use sync_delta::DeltaToken;
 use sync_delta::matcher::DeltaMatcher;
 use task_model::{ChangeKind, ErrorEvent, StorageEntryMessage};
 use tokio::sync::Mutex as AsyncMutex;
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 use transport::message::{BlockSignature, NdxTable, ProgressSnapshot, ReceiverMsg, SenderMsg, TransferDecision};
 use transport::traits::SenderTransport;
@@ -291,7 +298,7 @@ pub(super) async fn send_full_transfer(
             .await?;
         SourceTransferOutcome::Sent
     } else if entry.get_is_symlink() {
-        match src_storage.read_symlink(&entry.entry).await {
+        match copy_namespace::read_symlink(src_storage.storage(), &entry.entry).await {
             Ok(target) => {
                 transport
                     .send(SenderMsg::CreateSymlink {
@@ -360,7 +367,8 @@ pub(super) async fn send_acl_if_enabled(
 ) {
     if enable_acl
         && !entry.get_is_symlink()
-        && let Ok(Some(acl_data)) = src_storage.get_acl_bytes(entry.get_relative_path()).await
+        && let Ok(Some(acl)) = copy_metadata::observe_acl(src_storage.storage(), entry.get_relative_path()).await
+        && let Ok(acl_data) = encode_acl(&acl)
     {
         let _ = transport
             .send(SenderMsg::SetAcl {
@@ -431,7 +439,7 @@ async fn send_delta_transfer(
 async fn open_source_payload(
     transport: &dyn SenderTransport, storage: &StorageContext, entry: &ObservedItem, ndx: i32, qos: Option<&QosManager>,
 ) -> Result<Option<ExpertSourcePayload>> {
-    match StorageContext::open_observed_source(storage, entry, qos).await {
+    match open_observed_source(storage, entry, qos).await {
         Ok(session) => Ok(Some(session.stream_from(0).map_err(StorageError::from)?)),
         Err(error) => {
             report_source_failure(transport, entry, ndx, error.to_string()).await?;
@@ -754,4 +762,22 @@ fn stage_error(stage: &'static str, source: AppError) -> AppError {
         stage,
         source: Box::new(source),
     }
+}
+
+/// 在发送 FileBegin 前由原生 source session 校验观察，并钉住所选源版本。
+async fn open_observed_source(
+    storage: &StorageContext, item: &ObservedItem, qos: Option<&QosManager>,
+) -> StorageResult<ExpertSourceSession> {
+    let maximum = NonZeroUsize::new(storage.block_size as usize).unwrap_or(NonZeroUsize::MIN);
+    let mut request = ExpertSourceRequest::from_shared_observation(
+        storage.roles.clone(),
+        Arc::clone(&item.entry),
+        item.version_index,
+        CancellationToken::new(),
+    )?
+    .with_maximum_chunk_bytes(maximum);
+    if let Some(qos) = qos {
+        request = request.with_source_qos(qos.source_group(storage.block_size)?);
+    }
+    Ok(ExpertSourceSession::open(request).await?)
 }

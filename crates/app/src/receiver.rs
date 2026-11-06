@@ -4,21 +4,25 @@
 //! 单进程模式下 Receiver 拥有 src+dest 两个 storage（命令模式）。
 //! 双进程模式下 Receiver 仅拥有 dest storage（数据流模式，Phase 3）。
 
+use crate::file_copy::metadata as copy_metadata;
+use crate::file_copy::namespace as copy_namespace;
 use data_mover::model::BackendKind;
+use transport::acl::decode_acl;
 // 标准库
-use crate::file_copy::{HdfsCopyContext, MetadataApplication, copied_tags_required, copy_file, prepare_directory};
+use crate::error::StorageError;
+use crate::file_copy::{CopyOptions, HdfsCopyContext, copied_tags_required, copy_file, prepare_directory};
 use data_mover::model::FailureClass;
 use std::path::{Component, Path};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use task_model::ObservedEntryExt;
+use task_model::StorageEntryMessage;
 use task_model::TransferMode;
-use {storage_adapter::StorageError, task_model::StorageEntryMessage};
 
 // 外部 crate
+use crate::storage_factory::StorageContext;
 use data_mover::model::ObservedEntry;
 use data_mover::qos::QosManager;
-use storage_adapter::StorageContext;
 use tokio::sync::mpsc::Receiver as MpscReceiver;
 use tokio_util::sync::CancellationToken;
 use tracing::{Instrument, debug, error, info, info_span, trace, warn};
@@ -201,17 +205,18 @@ pub(crate) async fn process_entry_on_receiver(
     async {
         if prepare_directory(entry, dest_storage).await? {
         } else if entry.get_is_symlink() {
-            let target_path = src_storage
-                .read_symlink(entry)
+            let target_path = copy_namespace::read_symlink(src_storage.storage(), entry)
                 .await
                 .map_err(|e| AppError::CopyError(format!("Failed to read symlink {}: {e}", relative_path.display())))?;
-            dest_storage.create_symlink(entry, &target_path).await.map_err(|e| {
-                AppError::CopyError(format!("Failed to create symlink {}: {e}", relative_path.display()))
-            })?;
+            copy_namespace::create_symlink(dest_storage.storage(), entry, &target_path)
+                .await
+                .map_err(|e| {
+                    AppError::CopyError(format!("Failed to create symlink {}: {e}", relative_path.display()))
+                })?;
 
             // 源端符号链接删除（is_source_reserved=false 时）
             if !config.is_source_reserved
-                && let Err(e) = src_storage.delete_file(entry).await
+                && let Err(e) = copy_namespace::delete_file(src_storage.storage(), entry).await
             {
                 error!("[Receiver] Failed to remove source symlink {:?}: {}", relative_path, e);
             }
@@ -236,7 +241,7 @@ pub(crate) async fn process_entry_on_receiver(
                     src_storage,
                     dest_storage,
                     entry,
-                    storage_adapter::CopyOptions {
+                    CopyOptions {
                         transfer_mode: config.transfer_mode,
                         qos: qos_manager,
                         enable_integrity_check: config.enable_integrity_check,
@@ -247,13 +252,11 @@ pub(crate) async fn process_entry_on_receiver(
                     Some(&hdfs),
                 )
                 .await;
-                let metadata = result.as_ref().copied().unwrap_or(MetadataApplication::DataMover);
                 if let Some(recorder) = recorder {
-                    recorder.finish(result.map(|_| ())).await?;
+                    recorder.finish(result).await?;
                 } else {
                     result?;
                 }
-                metadata
             } else if should_resume(&resume, entry, src_storage, dest_storage) {
                 copy_file_with_resume(
                     entry,
@@ -266,13 +269,12 @@ pub(crate) async fn process_entry_on_receiver(
                     &config.job_dir,
                 )
                 .await?;
-                MetadataApplication::DataMover
             } else {
                 copy_file(
                     src_storage,
                     dest_storage,
                     entry,
-                    storage_adapter::CopyOptions {
+                    CopyOptions {
                         transfer_mode: config.transfer_mode,
                         qos: qos_manager,
                         enable_integrity_check: config.enable_integrity_check,
@@ -292,7 +294,7 @@ pub(crate) async fn process_entry_on_receiver(
         // ACL 复制（目录和文件均需要，symlink 除外）
         if config.enable_acl
             && !entry.get_is_symlink()
-            && let Err(e) = StorageContext::copy_acl(src_storage, dest_storage, relative_path).await
+            && let Err(e) = copy_metadata::copy_acl(src_storage.storage(), dest_storage.storage(), relative_path).await
         {
             error!("[Receiver] Failed to copy ACL for {:?}: {}", relative_path, e);
         }
@@ -571,7 +573,7 @@ pub(crate) async fn recv_file_list_and_data_phase(
     // disk-commit task：全量/delta 文件均三段流式落盘（去整文件 BytesMut/token Vec）；ack
     // 经 unbounded channel 回流，避免路由 select 阻在 dc_tx.send 时不 drain ack → dc 阻在
     // ack_tx.send 的双向死锁。
-    let keeps_history = dest_storage.is_bucket_versioned().await?;
+    let keeps_history = dest_storage.storage().staged_destination()?.keeps_history().await?;
     let (dc_tx, dc_rx) = tokio::sync::mpsc::channel::<DiskCommitMsg>(16);
     let (ack_tx, mut ack_rx) = tokio::sync::mpsc::unbounded_channel::<DcAck>();
     let disk_cancel = CancellationToken::new();
@@ -631,8 +633,8 @@ pub(crate) async fn recv_file_list_and_data_phase(
                     if let Some(version) = nf.entry.view().version() {
                         dest_index.mark_matched(&nf.entry.entry);
                         if !keeps_history && (!version.is_latest() || version.is_delete_marker()) { continue; }
-                        if !keeps_history && dest_storage.has_real_directory_objects() && nf.entry.get_is_dir() {
-                            dest_storage.create_dir_all(&nf.entry.entry).await?;
+                        if !keeps_history && !dest_storage.storage().holds_directory_objects() && nf.entry.get_is_dir() {
+                            copy_namespace::create_dir_all(dest_storage.storage(), &nf.entry.entry).await?;
                             progress.dirs_created.fetch_add(1, Ordering::Relaxed);
                             transport.send(ReceiverMsg::ClassifiedObservation { ndx: nf.ndx, decision: TransferDecision::FullTransfer }).await?;
                             transport.send(ReceiverMsg::Success { ndx: nf.ndx }).await?;
@@ -705,10 +707,10 @@ pub(crate) async fn recv_file_list_and_data_phase(
                         .await;
                     continue;
                 }
-                if let Err(e) = dest_storage.create_dir_all(&entry).await {
+                if let Err(e) = copy_namespace::create_dir_all(dest_storage.storage(), &entry).await {
                     warn!("[Receiver Remote] create_dir {:?}: {}", entry.get_relative_path(), e);
                 }
-                let _ = dest_storage.set_entry_metadata(&entry).await;
+                let _ = copy_metadata::set_entry_metadata(dest_storage.storage(), &entry).await;
                 progress.dirs_created.fetch_add(1, Ordering::Relaxed);
                 let _ = transport.send(ReceiverMsg::EntrySuccess { entry }).await;
             }
@@ -726,7 +728,7 @@ pub(crate) async fn recv_file_list_and_data_phase(
                     }
                     continue;
                 }
-                match dest_storage.create_symlink(&entry, &target).await {
+                match copy_namespace::create_symlink(dest_storage.storage(), &entry, &target).await {
                     Ok(()) => {
                         progress.files_transferred.fetch_add(1, Ordering::Relaxed);
                         let _ = transport.send(ReceiverMsg::EntrySuccess { entry }).await;
@@ -786,10 +788,15 @@ pub(crate) async fn recv_file_list_and_data_phase(
 
             // ── ACL 跨进程 ──
             Some(SenderMsg::SetAcl { entry, acl_data }) => {
-                if session_config.enable_acl
-                    && let Err(e) = dest_storage.set_acl_bytes(entry.get_relative_path(), &acl_data).await
-                {
-                    warn!("[Receiver Remote] set ACL {:?}: {}", entry.get_relative_path(), e);
+                if session_config.enable_acl {
+                    let result = async {
+                        let acl = decode_acl(&acl_data)?;
+                        copy_metadata::apply_acl(dest_storage.storage(), entry.get_relative_path(), acl).await?;
+                        Ok::<_, AppError>(())
+                    }.await;
+                    if let Err(e) = result {
+                        warn!("[Receiver Remote] set ACL {:?}: {}", entry.get_relative_path(), e);
+                    }
                 }
             }
 

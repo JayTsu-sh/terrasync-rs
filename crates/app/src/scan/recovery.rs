@@ -9,7 +9,9 @@ use data_mover::{
     },
 };
 
-use crate::{Result, StorageContext, WalkOptions};
+use crate::error::storage::Result;
+use crate::scan::source::WalkOptions;
+use crate::storage_factory::StorageContext;
 
 pub(crate) struct TraversalExecution {
     pub session: TraversalSession,
@@ -74,5 +76,5 @@ fn log_recovery(status: TraversalRecoveryStatus) {
 }
 
 #[cfg(test)]
-#[path = "traversal_recovery_tests.rs"]
+#[path = "recovery_tests.rs"]
 mod tests;

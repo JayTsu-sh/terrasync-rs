@@ -1,21 +1,22 @@
 #![allow(clippy::expect_used)]
 #![cfg(unix)]
-use data_mover::storage::PositionedChunk;
-use task_model::TransferMode;
-#[path = "../../../tests/support/observed.rs"]
-mod observed_fixtures;
+use crate::error::StorageError;
+use crate::file_commit::stream as commit_stream;
+use crate::scan::observe_path;
+use crate::storage_factory::{CreateStorageOptions, StorageContext, create_storage};
 use bytes::Bytes;
 use data_mover::model::ObservedEntry;
+use data_mover::storage::PositionedChunk;
 use data_mover::transfer::DirectPatchError;
 use std::{error::Error, os::unix::fs::MetadataExt, path::Path};
-use storage_adapter::{CreateStorageOptions, StorageContext, StorageError, create_storage};
+use task_model::TransferMode;
 use tokio::sync::mpsc;
 use tokio::time::{Duration, timeout};
 use tokio_util::sync::CancellationToken;
 
 async fn planned(
     target: &StorageContext, payload: &[u8],
-) -> Result<(ObservedEntry, storage_adapter::StreamHandle), Box<dyn Error>> {
+) -> Result<(ObservedEntry, crate::file_commit::stream::StreamHandle), Box<dyn Error>> {
     let source_root = tempfile::tempdir()?;
     std::fs::write(source_root.path().join("file"), payload)?;
     let source = create_storage(
@@ -23,24 +24,13 @@ async fn planned(
         CreateStorageOptions::new(None, false),
     )
     .await?;
-    let entry = source.get_metadata(Path::new("file")).await?;
+    let entry = observe_path(source.storage(), Path::new("file")).await?;
     let handle =
-        StorageContext::prepare_stream_with_mode(target, &entry, TransferMode::Direct, CancellationToken::new())
-            .await?;
+        commit_stream::prepare_stream_with_mode(target, &entry, TransferMode::Direct, CancellationToken::new()).await?;
     let (tx, rx) = mpsc::channel(4);
-    let writer_target = target.clone();
-    let writer_entry = entry.clone();
     let writer_handle = handle.clone();
     let writer = tokio::spawn(async move {
-        StorageContext::write_chunk_stream(
-            &writer_target,
-            &writer_entry,
-            rx,
-            &writer_handle,
-            None,
-            std::sync::Arc::new(|_, _| {}),
-        )
-        .await
+        commit_stream::write_chunk_stream(rx, &writer_handle, std::sync::Arc::new(|_, _| {})).await
     });
     for (index, chunk) in payload.chunks(4).enumerate() {
         tx.send(PositionedChunk {
@@ -70,13 +60,13 @@ async fn direct_only_writes_changed_ranges_and_handles_moves_growth_and_shrinkag
             CreateStorageOptions::new(None, false),
         )
         .await?;
-        let (entry, handle) = planned(&target, new).await?;
+        let (_entry, handle) = planned(&target, new).await?;
         assert_eq!(
             std::fs::read(root.path().join("file"))?,
             old,
             "planning must keep every basis byte intact"
         );
-        StorageContext::commit_chunk_stream(&target, &entry, new.len() as u64, handle.clone()).await?;
+        commit_stream::commit_chunk_stream(handle.clone()).await?;
         assert_eq!(std::fs::read(root.path().join("file"))?, new);
         assert_eq!(std::fs::metadata(root.path().join("file"))?.ino(), inode);
         assert_eq!(handle.written_bytes().await, changed);
@@ -96,9 +86,9 @@ async fn interrupted_direct_and_concurrent_basis_change_do_not_apply_planned_pat
     let (_, handle) = planned(&target, b"AAAAXXXX").await?;
     handle.discard().await?;
     assert_eq!(std::fs::read(root.path().join("file"))?, b"AAAABBBB");
-    let (entry, handle) = planned(&target, b"AAAAXXXX").await?;
+    let (_entry, handle) = planned(&target, b"AAAAXXXX").await?;
     std::fs::write(root.path().join("file"), b"EXTERNAL")?;
-    let error = StorageContext::commit_chunk_stream(&target, &entry, 8, handle)
+    let error = commit_stream::commit_chunk_stream(handle)
         .await
         .expect_err("changed basis must be rejected");
     assert!(matches!(
@@ -121,7 +111,7 @@ async fn cancelled_direct_commit_preserves_basis_and_parent_is_not_cancelled_by_
     .await?;
     let (entry, handle) = planned(&target, b"AAAAXXXX").await?;
     handle.cancel();
-    let error = StorageContext::commit_chunk_stream(&target, &entry, 8, handle)
+    let error = commit_stream::commit_chunk_stream(handle)
         .await
         .expect_err("取消后不得应用已经接收的补丁");
     assert!(error.is_cancelled());
@@ -129,8 +119,7 @@ async fn cancelled_direct_commit_preserves_basis_and_parent_is_not_cancelled_by_
     assert_eq!(std::fs::read(root.path().join("file"))?, b"AAAABBBB");
 
     let parent = CancellationToken::new();
-    let handle =
-        StorageContext::prepare_stream_with_mode(&target, &entry, TransferMode::Direct, parent.clone()).await?;
+    let handle = commit_stream::prepare_stream_with_mode(&target, &entry, TransferMode::Direct, parent.clone()).await?;
     handle.discard().await?;
     assert!(!parent.is_cancelled());
     Ok(())
@@ -145,12 +134,11 @@ async fn caller_cancellation_interrupts_direct_writer_waiting_for_input() -> Res
         CreateStorageOptions::new(None, false),
     )
     .await?;
-    let entry = target.get_metadata(Path::new("file")).await?;
+    let entry = observe_path(target.storage(), Path::new("file")).await?;
     let cancel = CancellationToken::new();
-    let handle =
-        StorageContext::prepare_stream_with_mode(&target, &entry, TransferMode::Direct, cancel.clone()).await?;
+    let handle = commit_stream::prepare_stream_with_mode(&target, &entry, TransferMode::Direct, cancel.clone()).await?;
     let (_tx, rx) = mpsc::channel(1);
-    let writing = StorageContext::write_planned_stream(rx, &handle);
+    let writing = commit_stream::write_planned_stream(rx, &handle);
     let (result, ()) = tokio::join!(timeout(Duration::from_secs(1), writing), async {
         tokio::task::yield_now().await;
         cancel.cancel();

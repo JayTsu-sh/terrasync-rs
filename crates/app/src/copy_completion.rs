@@ -1,12 +1,13 @@
 //! 复制轮次收尾：目录元数据全部确认后才允许数据库提交。
 
+use crate::file_copy::metadata as copy_metadata;
 use std::sync::Arc;
 use std::thread::JoinHandle as ThreadHandle;
 
+use crate::storage_factory::StorageContext;
 use data_mover::model::BackendKind;
 use data_mover::model::ObservedEntry;
 use db::ClickHouseDatabase;
-use storage_adapter::StorageContext;
 use task_model::ObservedEntryExt;
 use tokio::sync::mpsc::{self, Receiver};
 use tokio::task::{JoinError, JoinHandle, JoinSet};
@@ -81,7 +82,7 @@ async fn apply_directories(
         let target = destination.clone();
         tasks.spawn(async move {
             trace!(path = ?entry.get_relative_path(), "Updating directory metadata");
-            target.set_entry_metadata(&entry).await?;
+            copy_metadata::set_entry_metadata(target.storage(), &entry).await?;
             Ok(())
         });
     }

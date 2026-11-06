@@ -1,8 +1,10 @@
 //! 元数据观察与 opaque 编码；运行时直接交付原生观察，不投影为后端条目。
-use crate::{Result, StorageContext, StorageError, error::operation};
+use crate::error::storage::{Result, operation};
+use crate::storage_factory::path;
 use data_mover::model::*;
-use data_mover::storage::SourceDescriptor;
 use data_mover::storage::StorageRoleFailure;
+use data_mover::storage::{Storage, observe_descriptor};
+use std::path::Path;
 
 /// 必须复制的事实失败后不能继续发布观察或把缺失事实解释成 Omit。
 pub(crate) fn validate_required_tags(entry: &ObservedEntry) -> Result<()> {
@@ -49,83 +51,22 @@ pub(crate) fn observation_plan(tags: bool) -> ObservationPlan {
         })
 }
 
-impl StorageContext {
-    pub(crate) fn tags_required(&self, include_tags: bool) -> Result<bool> {
-        Ok(include_tags
-            && !matches!(
-                self.roles
-                    .metadata()?
-                    .observation_capabilities()
-                    .support(MetadataFamily::Tags),
-                ObservationSupport::Unsupported | ObservationSupport::NotApplicable
-            ))
-    }
-    pub(crate) async fn project_descriptor(&self, descriptor: SourceDescriptor, tags: bool) -> Result<ObservedEntry> {
-        let metadata_role = self.roles.metadata()?;
-        let plan = observation_plan(self.tags_required(tags)?);
-        let metadata = match metadata_role.observe_listed(&descriptor, plan) {
-            Some(result) => result?,
-            None => metadata_role.observe(&descriptor.path, plan).await?,
-        };
-        let modified = metadata
-            .timestamps()
-            .value()
-            .and_then(|times| times.modified)
-            .or(descriptor.inline_timestamps.and_then(|times| times.modified));
-        let mut entry = if descriptor.kind == EntryKind::Symlink {
-            let target = self.roles.namespace()?.read_link(&descriptor.path).await?;
-            ObservedEntry::new_symlink(descriptor.path, modified, descriptor.source_identity, target)?
-        } else {
-            ObservedEntry::new(
-                descriptor.path,
-                descriptor.kind,
-                descriptor.size,
-                modified,
-                descriptor.source_identity,
-            )?
-        }
-        .with_permissions(descriptor.permissions)?
-        .with_metadata(metadata)
-        .with_rename_evidence(descriptor.rename_evidence);
-        if let Some(facts) = descriptor.backend_fact {
-            entry = entry.with_backend_fact_bytes(facts.to_vec())?;
-        }
-        Ok(entry)
-    }
+pub(crate) fn tags_required(storage: &Storage, include_tags: bool) -> Result<bool> {
+    Ok(include_tags
+        && !matches!(
+            storage
+                .metadata()?
+                .observation_capabilities()
+                .support(MetadataFamily::Tags),
+            ObservationSupport::Unsupported | ObservationSupport::NotApplicable
+        ))
 }
 
-#[derive(serde::Serialize, serde::Deserialize)]
-struct WireAcl {
-    encoding: u8,
-    access: Option<Vec<u8>>,
-    default: Option<Vec<u8>>,
-}
-pub(crate) fn encode_acl(value: &AclMetadata) -> Result<Vec<u8>> {
-    let wire = WireAcl {
-        encoding: match value.encoding() {
-            AclEncoding::Posix => 0,
-            AclEncoding::NfsV4 => 1,
-            AclEncoding::WindowsSecurityDescriptor => 2,
-        },
-        access: value.access().map(<[u8]>::to_vec),
-        default: value.default_acl().map(<[u8]>::to_vec),
-    };
-    bincode_encode(&wire)
-}
-fn bincode_encode(value: &WireAcl) -> Result<Vec<u8>> {
-    serde_json::to_vec(value).map_err(StorageError::from)
-}
-pub(crate) fn decode_acl(bytes: &[u8]) -> Result<AclMetadata> {
-    let wire: WireAcl = serde_json::from_slice(bytes).map_err(StorageError::from)?;
-    match wire.encoding {
-        0 => Ok(AclMetadata::new_posix(wire.access, wire.default)?),
-        1 => Ok(AclMetadata::new(AclEncoding::NfsV4, wire.access.unwrap_or_default())?),
-        2 => Ok(AclMetadata::new(
-            AclEncoding::WindowsSecurityDescriptor,
-            wire.access.unwrap_or_default(),
-        )?),
-        _ => Err(operation("unknown ACL encoding")),
-    }
+/// 捕获单个任务路径所需的复制事实；IO 和模型构造由原生角色完成。
+pub async fn observe_path(storage: &Storage, value: &Path) -> Result<ObservedEntry> {
+    let descriptor = storage.namespace()?.stat(&path(value)?).await?;
+    let plan = observation_plan(tags_required(storage, true)?);
+    Ok(observe_descriptor(storage, descriptor, plan).await?)
 }
 
 /// 验证原生历史分段顺序，不积累整段历史，也不复制逐版本条目。
@@ -168,6 +109,7 @@ impl HistorySequence {
 #[allow(clippy::unwrap_used)]
 mod required_tags_tests {
     use super::*;
+    use crate::error::StorageError;
     use crate::observed_fixtures::{directory_marker, observation};
 
     #[test]
@@ -222,3 +164,7 @@ mod required_tags_tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "observation_failures_tests.rs"]
+mod failure_tests;

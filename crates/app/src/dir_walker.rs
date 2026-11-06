@@ -1,14 +1,14 @@
+use crate::scan::observe_path;
 // 标准库
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use storage_adapter::StorageContext;
-use {
-    storage_adapter::{StorageError, WalkDirAsyncIterator},
-    task_model::{ErrorEvent, StorageEntryMessage},
-};
+use crate::error::StorageError;
+use crate::scan::source::WalkDirAsyncIterator;
+use crate::storage_factory::StorageContext;
+use task_model::{ErrorEvent, StorageEntryMessage};
 // 外部crate
 use tracing::{Instrument, error, info, info_span};
 
@@ -75,7 +75,7 @@ impl DirectoryWalker {
             let walkdir_iter = storage
                 .walkdir(
                     None,
-                    storage_adapter::WalkOptions {
+                    crate::scan::source::WalkOptions {
                         operation_timeout: self.operation_timeout,
                         recovery_window: self.recovery_window,
                         depth,
@@ -148,7 +148,7 @@ fn walkdir_from_file_list(storage: StorageContext, file_list_path: &str) -> Resu
                 match relative_path {
                     Ok(file_path) => {
                         // 尝试获取文件的ObservedEntry
-                        match storage.get_metadata(&file_path).await {
+                        match observe_path(storage.storage(), &file_path).await {
                             Ok(metadata) => {
                                 // 发送Scanned消息到通道
                                 let msg = StorageEntryMessage::Scanned(std::sync::Arc::new(metadata));
@@ -207,7 +207,7 @@ fn walkdir_from_file_list(storage: StorageContext, file_list_path: &str) -> Resu
 }
 
 /// 通用的目录遍历函数 - 作为便捷的包装器
-pub async fn walkdir(config: ScanConfig) -> Result<storage_adapter::WalkDirAsyncIterator> {
+pub async fn walkdir(config: ScanConfig) -> Result<crate::scan::source::WalkDirAsyncIterator> {
     let walker = DirectoryWalker::new(config);
     walker.walk().await
 }

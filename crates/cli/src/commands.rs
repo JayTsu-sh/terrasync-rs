@@ -50,7 +50,7 @@ pub fn validate_qos_format(s: &str) -> Result<String> {
 }
 
 /// 校验并 trim 存储路径（本地 / nfs:// / smb:// / hdfs:// / s3:// / s3+https://）
-/// 参考 `storage_adapter::storage_enum` 和 `data_mover::storage::config::s3` 中的协议解析逻辑
+/// 位置分类由 app 的存储工厂负责；协议 URL 的解析由 data-mover backend 负责
 pub fn validate_storage_path(s: &str) -> Result<String> {
     let s = s.trim();
     if s.is_empty() {

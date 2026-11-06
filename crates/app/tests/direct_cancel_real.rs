@@ -1,13 +1,14 @@
 //! 由 lab runner 启动真实 Receiver；本测试通过真实 QUIC 在指定阶段主动关闭连接。
 #![allow(clippy::unwrap_used)]
+use app::scan::observe_path;
 use std::{env, error::Error, path::Path, sync::Arc, time::Duration};
 use task_model::TransferMode;
 use transport::chunk::DataChunk;
 
+use app::storage_factory::{CreateStorageOptions, create_storage};
 use bytes::Bytes;
 use rustls::crypto::ring::default_provider;
 use rustls::pki_types::CertificateDer;
-use storage_adapter::{CreateStorageOptions, create_storage};
 use tokio::{
     fs,
     io::AsyncReadExt,
@@ -45,7 +46,7 @@ async fn run() -> TestResult {
         CreateStorageOptions::new(None, false),
     )
     .await?;
-    let entry = Arc::new(storage.get_metadata(Path::new("file")).await?);
+    let entry = Arc::new(observe_path(storage.storage(), Path::new("file")).await?);
     let transport = Arc::new(quic::connect(address, "localhost", Some(CertificateDer::from(cert))).await?);
     let mut handshake = ProtocolHandshake::current();
     handshake.features.delta = false;

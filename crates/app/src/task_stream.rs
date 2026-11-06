@@ -1,6 +1,6 @@
 use data_mover::traversal::{ScanFailureSignal, TraversalRecoveryStatus};
 
-use crate::StorageError;
+use crate::error::StorageError;
 
 /// 通用异步通道接收器封装。
 ///

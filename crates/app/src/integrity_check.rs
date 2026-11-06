@@ -12,8 +12,18 @@
 //! S3 目标没有真实目录对象，因此目录 entry 跳过目标 metadata 查询；文件的
 //! POSIX 元数据跳过策略由 data-mover 统一处理。
 
+use crate::file_copy::metadata as copy_metadata;
+#[cfg(feature = "license")]
+use data_mover::probes::probe_server_time;
+mod comparison;
+#[cfg(feature = "license")]
+use crate::storage_factory::backend_kind_from_location;
 #[cfg(feature = "license")]
 use chrono::DateTime;
+pub use comparison::{
+    IntegrityCheckMode, IntegrityCheckOptions, IntegrityEntryKind, IntegritySide, MismatchDataField, MismatchMetaField,
+    MtimePrecision, compare_entry,
+};
 #[cfg(feature = "license")]
 use data_mover::model::BackendKind;
 use std::path::Path;
@@ -21,18 +31,13 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
-#[cfg(feature = "license")]
-use storage_adapter::backend_kind_from_location;
 use task_model::ErrorEvent;
 use task_model::ObservedEntryExt;
 
+use crate::error::StorageError;
+use crate::storage_factory::StorageContext;
 use data_mover::model::ObservedEntry;
 use data_mover::redact_storage_url;
-use storage_adapter::error::StorageError;
-use storage_adapter::{
-    IntegrityCheck, IntegrityCheckMode, IntegrityCheckOptions, MismatchDataField, MismatchMetaField, MtimePrecision,
-    StorageContext,
-};
 use task_model::StorageEntryMessage;
 use tracing::{Instrument, debug, error, info, info_span, instrument, warn};
 
@@ -172,9 +177,16 @@ async fn apply_auto_fix(
         _ => (None, None, None),
     };
 
-    if let Err(e) = dest_storage
-        .set_metadata(relative_path, atime, mtime, src.get_uid(), src.get_gid(), mode)
-        .await
+    if let Err(e) = copy_metadata::set_metadata(
+        dest_storage.storage(),
+        relative_path,
+        atime,
+        mtime,
+        src.get_uid(),
+        src.get_gid(),
+        mode,
+    )
+    .await
     {
         error!("Auto-fix failed for {} {:?}: {}", entry_type, relative_path, e);
         FixStatus::FixFailed
@@ -248,15 +260,7 @@ impl CheckContext {
     async fn process_entry(
         &self, entry: &ObservedEntry, relative_path: &Path, entry_type: &'static str,
     ) -> Option<String> {
-        match IntegrityCheck::check_with_source_entry_and_options(
-            &self.src_storage,
-            &self.dest_storage,
-            entry,
-            self.options,
-            None,
-        )
-        .await
-        {
+        match compare_entry(&self.src_storage, &self.dest_storage, entry, self.options, None).await {
             Ok(()) => {
                 debug!("Integrity check passed for {:?}", relative_path);
                 None
@@ -293,7 +297,7 @@ impl CheckContext {
             self.checked_symlinks.fetch_add(1, Ordering::Relaxed);
             result
         } else if entry.get_is_dir() {
-            let result = if self.dest_storage.has_real_directory_objects() {
+            let result = if !self.dest_storage.storage().holds_directory_objects() {
                 self.process_entry(entry.as_ref(), &relative_path, "dir").await
             } else {
                 None
@@ -597,8 +601,8 @@ pub(crate) async fn verify_storage_time(dest_path: &str) -> Result<()> {
         }
     };
 
-    let server_time = match dest_storage.probe_server_time().await {
-        Ok(Some(mtime)) => match DateTime::from_timestamp(mtime, 0) {
+    let server_time = match probe_server_time(dest_storage.storage()).await {
+        Ok(Some(mtime)) => match DateTime::from_timestamp((mtime.unix_nanos() / 1_000_000_000) as i64, 0) {
             Some(dt) => dt,
             None => return Ok(()),
         },

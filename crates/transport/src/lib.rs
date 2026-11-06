@@ -1,3 +1,4 @@
+pub mod acl;
 pub mod chunk;
 pub mod directory;
 pub mod error;

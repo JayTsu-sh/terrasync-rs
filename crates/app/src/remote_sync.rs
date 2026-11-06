@@ -11,7 +11,7 @@
 mod remote_sender_session;
 
 use crate::remote_inventory::directory_pages;
-use storage_adapter::WalkOptions;
+use crate::scan::source::WalkOptions;
 
 use remote_sender_session::{RemoteSenderSession, RemoteSenderSessionDeps};
 #[cfg(test)]
@@ -26,13 +26,13 @@ use std::sync::{Mutex, PoisonError};
 
 #[cfg(test)]
 use crate::remote_inventory::NdxEvent;
+#[cfg(test)]
+use crate::storage_factory::StorageContext;
 use crate::storage_factory::{StorageRole, create_storage_for_role};
 use data_mover::filter::parse_filter_expression;
 #[cfg(test)]
 use data_mover::model::ObservedEntry;
 use rustls::pki_types::CertificateDer;
-#[cfg(test)]
-use storage_adapter::StorageContext;
 #[cfg(test)]
 use task_model::{ChangeKind, ErrorEvent, StorageEntryMessage};
 use tokio::sync::Mutex as AsyncMutex;

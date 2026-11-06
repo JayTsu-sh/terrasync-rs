@@ -1,5 +1,5 @@
+use app::error::StorageError;
 use std::sync::{Arc, OnceLock};
-use storage_adapter::StorageError;
 use task_model::TransferMode;
 
 use app::error::AppError;

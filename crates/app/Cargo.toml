@@ -6,17 +6,17 @@ description = "The application core code"
 edition = "2024"
 
 [features]
-license = ["dep:licensing", "dep:chrono"]
+license = ["dep:licensing"]
 lab-fault-injection = []
 
 [dependencies]
-storage-adapter = { workspace = true }
+soft-canonicalize = "0.5"
 task-model = { workspace = true }
 async-channel = { workspace = true }
 async-trait   = { workspace = true }
 blake3        = { workspace = true }
 bytes         = { workspace = true }
-chrono        = { workspace = true, optional = true }
+chrono        = { workspace = true }
 dashmap       = { workspace = true }
 db            = { workspace = true }
 futures       = { workspace = true }

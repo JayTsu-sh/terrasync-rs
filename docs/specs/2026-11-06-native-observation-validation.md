@@ -244,3 +244,57 @@ TerraSync 最终 fmt、默认与 all-features workspace all-targets check、Clip
 ## 合入前仍须完成
 
 目录作用域、具体数据库接口及临时表协议已收敛；还需按设计删除 storage-adapter。任务契约与 transport 已分离，剩余存储机制和产品配置仍须分别归位。最终候选必须重跑对应 CI、真实 HDFS 和受影响故障链路，并完成全量／增量／续扫性能与峰值 RSS 对照。先前 HDFS 通过的二进制不能作为最终候选证据。
+
+
+## storage-adapter 删除与实际职责迁移（2026-11-06）
+
+运行时候选 `/work/terrasync-db-refactor-without-adapter`，SHA-256
+`1dfde0c5d2e9f3d9720f0b7f3335db35c0fadea9d5c353b4a7148b749dcf16dc`。
+精确构建来源为 `/tmp/terrasync-adapter-removal-build-source.json`：基于 `2ea8622` 的已记录工作区内容，包含每个新增文件的散列；检查、测试、构建期间保持源码冻结，构建后及追加本文前均核对指纹。原生依赖固定为
+`0070c1599689e6c3a5cb3c8e7df602e03f00ca97`。
+
+- 删除整个 storage-adapter crate、workspace 成员和所有依赖项，没有新增替代 facade crate。
+  任务连接配置在 app/storage_factory，扫描策略／准入／恢复在 app/scan，复制策略及元数据损失策略在 app/file_copy，远端提交状态在 app/file_commit，报告映射在 app/integrity_check。
+  普通／历史／当前版本／checkpoint／HDFS 的复制请求集中构造，IO、恢复、读回验证和发布仍由原生引擎承担。
+- StorageContext 只持有真实连接角色、块大小及重连配置。删除静态复制／metadata／namespace 转发，单路径观察直接调用原生构造。删除重复 HDFS 恢复模式与单变体 MetadataApplication；生产调用使用已有 TransferMode，成功返回后才认定元数据已应用。
+- ACL JSON 编码迁入 transport：编码借用原生字节，解码仅在接收边界取得所有权，保持现有 wire 字节；本机 ACL 复制直接消费原生事实。xattr 载荷直接移动，不再先 clone。
+- 原生 SourceDescriptor／ObservedEntry 的 backend facts 使用 Bytes 共享；指针测试覆盖 model、traversal、expert 路径，v11 快照字节保持。不可用的历史／marker 描述仍被单路径观察拒绝；当前虚拟目录使用内联事实，避免访问不存在的对象。
+- NFS 根目录特判归入 backend 的 Namespace：读取最多 16 条的一页后取消剩余枚举。
+  原三个确定性断言迁入 native；完整 make ci 通过，真实 Linux NFS v3／v4.0／v4.1 只读 probe 通过。
+  来源和日志为 `/tmp/data-mover-nfs-connectivity-final-real-report.json`、`/tmp/data-mover-native-nfs-connectivity-final-ci.log`；这些结果不包含 NFS 故障注入。
+- 原 adapter 的测试按职责迁移并注册；删除一个仅表达无生产调用的 Require 模式的测试，三个 NFS probe 测试迁至 native。
+  新增 ACL wire 两项、观察错误类型两项；普通复制直接校验实际 mtime 与 0640，而不再断言单变体返回值。
+  原生聚合观察错误集中映射回已有 Role／Capability／ModelValue 分类，保留 NotFound／Cancelled 语义和 source。
+
+本地 fmt、all-features/all-targets check 与 Clippy 均通过；workspace 测试 **532 通过、86 按原条件忽略**，真实双进程 E2E **16 通过**。
+日志 `/tmp/terrasync-adapter-final-{fmt,check,clippy,tests,e2e}.log`。
+Clippy 仍有仓库已有警告，以及待独立修复的删除进度路径未读取提示；不能写成零警告。
+
+真实正常路径与协议契约共 **150 项通过**，所有本轮服务夹具已按报告清理：
+
+| 范围 | 实际通过项 | 证据 |
+| --- | ---: | --- |
+| DB single-catalogue | 11 | `/tmp/terrasync-db-refactor-real-adapter-removal-v1-single-catalogue.json` |
+| DB cluster-catalogue | 12 | `/tmp/terrasync-db-refactor-real-adapter-removal-v1-cluster-catalogue.json` |
+| DB single | 44 | `/tmp/terrasync-db-refactor-real-adapter-removal-v1-single.json` |
+| DB single-cuts | 3 | `/tmp/terrasync-db-refactor-real-adapter-removal-v1-single-cuts.json` |
+| DB cluster-cuts | 3 | `/tmp/terrasync-db-refactor-real-adapter-removal-v1-cluster-cuts.json` |
+| DB single-baseline | 2 | `/tmp/terrasync-db-refactor-real-adapter-removal-v1-single-baseline.json` |
+| App point | 8 | `/work/terrasync-db-refactor-evidence/release-db-refactor-without-adapter-point-20261106-041355/report.json` |
+| App markers | 17 | `/work/terrasync-db-refactor-evidence/release-db-refactor-without-adapter-markers-20261106-041419/report.json` |
+| App ordered | 14 | `/work/terrasync-db-refactor-evidence/release-db-refactor-without-adapter-ordered-20261106-041533/report.json` |
+| App hdfs-single | 18 | `/work/terrasync-db-refactor-evidence/release-db-refactor-without-adapter-hdfs-single-20261106-041701/report.json` |
+| App hdfs-cluster | 18 | `/work/terrasync-db-refactor-evidence/release-db-refactor-without-adapter-hdfs-cluster-20261106-041728/report.json` |
+
+point 8 项覆盖 Single／Cluster、普通／QUIC 与标准／禁用 tags profile；验证没有 marker 对象的虚拟目录、子文件和普通文件。
+禁用 tags profile 运行于真实 RustFS，不是 DXN 设备验证。
+HDFS 每模式原 15 项使用真实 Single／Cluster；额外 3 项 QoS 的 Local→HDFS、HDFS→Local 路径关闭 DB，不能把这 6 项记成数据库部署模式验证。
+HDFS 产物经 SHA 校验上传到本任务已有运行根；原始配置与 keytab 未修改。
+
+整分支 Standards／Spec 复核结合阶段审查，未发现新增结构或观察语义阻断。以下仍须独立收尾，不能据上述正常路径宣布整体验收通过：
+
+- rm 对失败事件的计数与返回、receiver 字符串化原始错误，按行为修复单独提交。
+- 真实强退／重启／Pod 本地状态丢失及网络故障矩阵正在验证；最初的网络 harness 将未确认数据库写入误判为普通取消失败，报告 `without-adapter-scan-fault-initial` 整体未通过，不计入上述 150 项。
+  日志保留了 RequestOutcomeUnconfirmed；修正 harness 后需分别核对取消耗时、未知结果、恢复后目录与累计统计，不能将未知写结果强行改标为已确认取消。
+- 相同 unordered／blocks 的无 DB 基线性能、峰值 RSS 和持续增长尚未完成。
+- 最终 callback 首次失败即退出、缺少文档目标中的三次重试及 ClickHouse 补偿，是基点 bedb632 已有流程，本次未改动；本轮不宣称该目标已达成。
