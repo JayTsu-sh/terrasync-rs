@@ -6,6 +6,7 @@ pub(super) struct ScanGenerationLifecycle {
     pub working: Option<u8>,
     pub committed: bool,
     pub copy_recovery: bool,
+    pub copy_request_key: Option<String>,
 }
 
 #[derive(Default)]

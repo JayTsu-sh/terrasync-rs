@@ -134,9 +134,22 @@ impl ClickHouseDatabase {
         Ok(dropped_tables)
     }
 
-    /// 表存在只代表本任务已有复制目录；恢复资格由 begin_copy_generation 判断。
+    /// 只有迁移执行标识才代表复制事实，不能将普通扫描基线当作迁移完成。
     pub async fn copy_catalogue_exists(&self) -> Result<bool> {
-        self.table_exists(&get_scan_base_table_name(&self.job_id)).await
+        if !self.table_exists(&get_scan_base_table_name(&self.job_id)).await?
+            || !self.table_exists(&get_scan_state_table_name(&self.job_id)).await?
+        {
+            return Ok(false);
+        }
+        let table = get_scan_state_table_name(&self.job_id);
+        let started: u64 = self
+            .sync_client
+            .query(&format!(
+                "SELECT count() FROM {table} FINAL WHERE id=1 AND copy_request_key!=''"
+            ))
+            .fetch_quorum_one()
+            .await?;
+        Ok(started > 0)
     }
 
     /// 检查指定表名是否存在于当前数据库中

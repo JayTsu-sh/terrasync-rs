@@ -28,7 +28,7 @@ impl CopyLease {
 }
 
 pub(crate) async fn begin_copy_catalogue(
-    database: &ClickHouseDatabase, job: &SyncJobConfig, block_size: Option<usize>, source_reserved: bool,
+    database: &ClickHouseDatabase, job: &SyncJobConfig, block_size: Option<usize>, _source_reserved: bool,
 ) -> Result<()> {
     // 身份不包含凭据；恢复计划变化必须在任何 payload 或回标前被拒绝。
     let source = create_storage_for_role(
@@ -65,7 +65,6 @@ pub(crate) async fn begin_copy_catalogue(
         source.stable_id(),
         target_identity.kind().as_str(),
         target_identity.stable_id(),
-        source_reserved,
         history,
         &job.r#match,
         &job.exclude,
@@ -80,30 +79,18 @@ pub(crate) async fn begin_copy_catalogue(
     .to_hex()
     .to_string();
     let status = database.begin_copy_generation(&request_key).await?;
-    require_safe_copy_recovery(status, source_reserved, history)?;
+    if status == CopyGenerationStatus::Recovering && history {
+        return Err(AppError::ConfigError(
+            "版本化目标的上轮发布确认尚待对账，保留已复制版本和全部源历史，禁止盲目重放".into(),
+        ));
+    }
     if status == CopyGenerationStatus::Recovering && job.file_list.is_some() {
         return Err(AppError::ConfigError(
             "文件清单复制未完成，不支持改用完整目录自动续作；请核对未完成条目".into(),
         ));
     }
     if status == CopyGenerationStatus::Recovering {
-        info!("Recovering incomplete copy by replaying the full source and reconciling target paths");
-    }
-    Ok(())
-}
-
-fn require_safe_copy_recovery(status: CopyGenerationStatus, source_reserved: bool, target_history: bool) -> Result<()> {
-    if status == CopyGenerationStatus::Recovering {
-        if !source_reserved {
-            return Err(AppError::ConfigError(
-                "上次移动任务未完成，不能按源缺失项自动清理目标；请核对已搬运数据后恢复任务".into(),
-            ));
-        }
-        if target_history {
-            return Err(AppError::ConfigError(
-                "上次复制未完成，版本化目标无法确认未应答的写入；请先核对目标版本，禁止自动重放".into(),
-            ));
-        }
+        info!("Continuing failed full migration with an incremental scan over confirmed copy facts");
     }
     Ok(())
 }
@@ -191,13 +178,5 @@ mod tests {
         drop(file);
         assert!(CopyLease::acquire(&connection(), &job).is_ok());
         Ok(())
-    }
-
-    #[test]
-    fn only_preserved_sources_and_overwritable_targets_allow_automatic_recovery() {
-        assert!(require_safe_copy_recovery(CopyGenerationStatus::Fresh, false, true).is_ok());
-        assert!(require_safe_copy_recovery(CopyGenerationStatus::Recovering, true, false).is_ok());
-        assert!(require_safe_copy_recovery(CopyGenerationStatus::Recovering, false, false).is_err());
-        assert!(require_safe_copy_recovery(CopyGenerationStatus::Recovering, true, true).is_err());
     }
 }

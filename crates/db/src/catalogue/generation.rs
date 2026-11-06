@@ -119,7 +119,12 @@ impl ClickHouseDatabase {
         if lifecycle.committed {
             return Ok(());
         }
-        self.insert_scan_state(working).await?;
+        if let Some(request_key) = &lifecycle.copy_request_key {
+            let table = get_scan_state_table_name(&self.job_id);
+            self.execute(&format!("INSERT INTO {table} (id,scan_state,baseline_committed,copy_in_progress,copy_request_key) VALUES (1,{working},true,false,?)"), &[Value::from(request_key.clone())]).await?;
+        } else {
+            self.insert_scan_state(working).await?;
+        }
         self.cached_scan_state.store(working, Ordering::Relaxed);
         lifecycle.committed = true;
         lifecycle.copy_recovery = false;

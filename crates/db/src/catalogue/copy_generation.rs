@@ -1,9 +1,8 @@
-//! 复制目录仅在物理操作与数据库确认全部完成后结束轮次；失败轮次保守重放。
+//! 首次迁移清理扫描基线，失败轮次保留确认事实并重新进行增量比较。
 
 use std::collections::HashSet;
 use std::sync::atomic::Ordering;
 
-use clickhouse::error::Error as ClickHouseError;
 use serde::Deserialize;
 use serde_json::Value;
 
@@ -17,22 +16,26 @@ use crate::get_scan_state_table_name;
 use crate::schema::columns::CATALOGUE_COLUMNS as FILE_SCAN_COLUMNS_LIST;
 use crate::schema::records::StorageEntryRecord;
 
-/// Whether an unfinished copy generation must replay unacknowledged target operations.
+/// 复制代次是否正在利用失败轮次留下的确认事实。
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CopyGenerationStatus {
     /// 首轮或上一轮全部确认成功，沿用正常增量比较。
     Fresh,
-    /// 上轮复制没有确认完成，必须重放源项或拒绝不安全的恢复。
+    /// 上轮复制未结束；保留确认事实，重新扫描并做增量比较。
     Recovering,
 }
 
 #[derive(Deserialize, clickhouse::Row)]
+#[cfg_attr(test, derive(serde::Serialize))]
 struct CopyState {
     scan_state: u8,
-    baseline_committed: bool,
     copy_in_progress: bool,
     copy_request_key: String,
 }
+
+#[cfg(test)]
+#[path = "copy_generation_tests.rs"]
+mod tests;
 
 impl ClickHouseDatabase {
     pub async fn begin_copy_generation(&self, request_key: &str) -> Result<CopyGenerationStatus> {
@@ -44,9 +47,14 @@ impl ClickHouseDatabase {
         let mut lifecycle = self.generation_lifecycle.lock().await;
         let saved = self.copy_generation_state().await?;
         let previous = saved.scan_state;
-        let recovering = saved.copy_in_progress || (!saved.baseline_committed && self.copy_base_has_rows().await?);
-        if recovering && (saved.copy_request_key.is_empty() || saved.copy_request_key != request_key) {
+        let recovering = !saved.copy_request_key.is_empty() && saved.copy_in_progress;
+        if !saved.copy_request_key.is_empty() && saved.copy_request_key != request_key {
             return Err(DatabaseError::ConfigError("incomplete copy belongs to unknown or different source/destination/options; restore the original settings or choose a new job id".into()));
+        }
+        if saved.copy_request_key.is_empty() {
+            // 首次迁移不能复用扫描结果作为复制完成事实；清理确认后才启动扫描。
+            let base = self.catalogue_storage_table(&get_scan_base_table_name(&self.job_id))?;
+            self.execute(&format!("TRUNCATE TABLE {base} SYNC"), &[]).await?;
         }
         let working = 1 - previous;
         if recovering {
@@ -59,7 +67,8 @@ impl ClickHouseDatabase {
         ), &[Value::from(request_key)]).await?;
         *lifecycle = ScanGenerationLifecycle {
             working: Some(working),
-            copy_recovery: recovering,
+            copy_recovery: false,
+            copy_request_key: Some(request_key.into()),
             ..Default::default()
         };
         self.cached_scan_state.store(working, Ordering::Relaxed);
@@ -72,9 +81,13 @@ impl ClickHouseDatabase {
 
     async fn copy_generation_state(&self) -> Result<CopyState> {
         let table = get_scan_state_table_name(&self.job_id);
-        let state = self.sync_client.query(&format!(
-            "SELECT scan_state, baseline_committed, copy_in_progress, copy_request_key FROM {table} FINAL WHERE id=1"
-        )).fetch_quorum_one::<CopyState>().await?;
+        let state = self
+            .sync_client
+            .query(&format!(
+                "SELECT scan_state, copy_in_progress, copy_request_key FROM {table} FINAL WHERE id=1"
+            ))
+            .fetch_quorum_one::<CopyState>()
+            .await?;
         if state.scan_state > 1 {
             return Err(DatabaseError::ConversionError(format!(
                 "Invalid copy generation {}; expected 0 or 1",
@@ -82,20 +95,6 @@ impl ClickHouseDatabase {
             )));
         }
         Ok(state)
-    }
-
-    async fn copy_base_has_rows(&self) -> Result<bool> {
-        let table = get_scan_base_table_name(&self.job_id);
-        match self
-            .sync_client
-            .query(&format!("SELECT 1 FROM {table} LIMIT 1"))
-            .fetch_quorum_one::<u8>()
-            .await
-        {
-            Ok(_) => Ok(true),
-            Err(DatabaseError::ClickHouseError(ClickHouseError::RowNotFound)) => Ok(false),
-            Err(error) => Err(error),
-        }
     }
 
     pub(super) async fn is_copy_recovery(&self) -> bool {
