@@ -121,11 +121,8 @@ async fn execute_file(
     if let Some(qos) = &options.qos {
         request = request.with_source_qos(qos.source_group(source.block_size)?);
     }
-    let outcome = if options.is_source_reserved {
-        transfer::transfer(request).await?
-    } else {
-        transfer::move_file(request).await?
-    };
+    // 存储传输只负责复制；删源必须由任务层在数据库确认之后授权。
+    let outcome = transfer::transfer(request).await?;
     if let Some(counter) = &options.bytes_counter {
         counter.fetch_add(outcome.transferred_bytes, Ordering::Relaxed);
     }

@@ -47,6 +47,7 @@ pub mod local_transfer;
 /// SyncOrchestrator 封装 sync/incremental_sync 的核心逻辑
 pub mod orchestrator;
 pub mod scan_resume;
+mod source_cleanup;
 mod sync_catalog;
 
 mod remote_inventory;

@@ -1,4 +1,3 @@
-use crate::rm::progress as deletion;
 use crate::scan::observe_path;
 // 标准库
 use crate::scan::source::WalkOptions;
@@ -35,6 +34,11 @@ pub async fn pack_directory(
     src_storage: &StorageContext, dest_storage: &StorageContext, dir_entry: &ObservedEntry, is_source_reserved: bool,
     qos: Option<QosManager>, bytes_counter: Option<Arc<AtomicU64>>,
 ) -> Result<(ObservedEntry, Arc<[Arc<ObservedEntry>]>)> {
+    if !is_source_reserved {
+        return Err(AppError::ConfigError(
+            "打包移动需要逐项清单确认与校验，不能递归删除源目录".into(),
+        ));
+    }
     let dir_path = dir_entry.get_relative_path();
 
     info!("Pack directory: {:?}", dir_path);
@@ -77,12 +81,6 @@ pub async fn pack_directory(
 
     // 归档是目标端已经发布的真实文件，读取其原生观察，不能借用源目录身份拼造条目。
     let tar_entry = observe_path(dest_storage.storage(), Path::new(tar_relative_path.as_str())).await?;
-
-    // 删除源端目录（如果不保留）
-    if !is_source_reserved {
-        debug!("Deleting source directory: {:?}", dir_path);
-        deletion::delete_dir_all(src_storage.storage(), dir_entry).await?;
-    }
 
     Ok((tar_entry, manifest_list))
 }

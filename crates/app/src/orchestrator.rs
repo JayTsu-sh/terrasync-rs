@@ -65,6 +65,7 @@ use crate::integrity_check::verify_storage_time;
 use crate::receiver::{ReceiverConfig, process_entry_on_receiver};
 use crate::scan::ScanType;
 use crate::sender::{SenderWorkerConfig, sender_worker};
+use crate::source_cleanup::remove_confirmed_sources;
 use crate::storage_factory::{StorageRole, create_storage_for_role};
 #[cfg(windows)]
 use crate::sync::check_admin_privileges;
@@ -263,6 +264,12 @@ impl SyncOrchestrator {
         let copy_tags = match self.mode {
             SyncMode::Local => {
                 let destination = create_storage_for_role(&c.dest_path, None, true, StorageRole::Destination).await?;
+                if !AppConfig::fetch()?.sync.is_source_reserved {
+                    let source = create_storage_for_role(&c.src_path, None, false, StorageRole::Source).await?;
+                    if source.storage().identity() == destination.storage().identity() {
+                        return Err(AppError::ConfigError("移动任务的源端和目标端不能是同一存储根".into()));
+                    }
+                }
                 copy_transfer::validate_transfer_mode(&destination, c.transfer_mode)?;
                 copied_tags_required(&destination)?
             }
@@ -270,13 +277,23 @@ impl SyncOrchestrator {
         };
 
         let app_config = AppConfig::fetch()?;
+        if !app_config.sync.is_source_reserved && !app_config.database.enabled {
+            return Err(AppError::ConfigError(
+                "移动任务必须启用 ClickHouse，确认落库后才能删除源端".into(),
+            ));
+        }
+        if c.packaged && !app_config.sync.is_source_reserved {
+            return Err(AppError::ConfigError(
+                "打包移动需要逐项清单确认与校验，当前拒绝提前删除源目录".into(),
+            ));
+        }
         // database.enabled=true 时必须成功构造；false 时忽略错误（未启用），走文件系统兜底
         let db_instance = if app_config.database.enabled {
             Some(ClickHouseDatabase::connect(&app_config.database.clickhouse, &c.job_id).await?)
         } else {
             None
         };
-        let scan_type = if !app_config.database.enabled || !app_config.sync.is_source_reserved {
+        let scan_type = if !app_config.database.enabled {
             ScanType::Full
         } else {
             determine_sync_type(db_instance.as_ref(), c.job_dir_pre_existing).await
@@ -664,7 +681,19 @@ impl SyncOrchestrator {
                     )
                     .await?,
                 );
-                copy_completion::complete(database.clone(), destination).await?;
+                copy_completion::complete(database.clone(), destination.clone()).await?;
+                if !is_source_reserved {
+                    let source = Arc::new(
+                        create_storage_for_role(
+                            &c.src_path,
+                            block_size.map(|size| size as u64),
+                            false,
+                            StorageRole::Source,
+                        )
+                        .await?,
+                    );
+                    remove_confirmed_sources(database.clone(), source, destination).await?;
+                }
             }
             Ok(())
         }
@@ -1298,7 +1327,20 @@ impl SyncOrchestrator {
         let result: Result<()> = async {
             let destination = phase_b_dest_storage?;
             phase_b_consumers?;
-            copy_completion::complete(database.clone(), destination).await
+            copy_completion::complete(database.clone(), destination.clone()).await?;
+            if !is_source_reserved {
+                let source = Arc::new(
+                    create_storage_for_role(
+                        &c.src_path,
+                        block_size.map(|size| size as u64),
+                        false,
+                        StorageRole::Source,
+                    )
+                    .await?,
+                );
+                remove_confirmed_sources(database.clone(), source, destination).await?;
+            }
+            Ok(())
         }
         .await;
         if let Err(error) = &result {
@@ -1362,7 +1404,7 @@ impl SyncOrchestrator {
     #[allow(clippy::too_many_arguments)]
     async fn sync_renamed_file_changes(
         kind: ChangeKind, entry: &Arc<ObservedEntry>, src: &StorageContext, dest: &StorageContext,
-        qos: Option<QosManager>, integrity: bool, source_reserved: bool, bytes: Option<Arc<AtomicU64>>, job_id: &str,
+        qos: Option<QosManager>, integrity: bool, _source_reserved: bool, bytes: Option<Arc<AtomicU64>>, job_id: &str,
         job_dir: &str, transfer_mode: TransferMode,
     ) -> Result<()> {
         let mut metadata_applied = false;
@@ -1390,7 +1432,6 @@ impl SyncOrchestrator {
                     transfer_mode,
                     qos,
                     enable_integrity_check: integrity,
-                    is_source_reserved: source_reserved,
                     bytes_counter: bytes,
                     ..Default::default()
                 },
@@ -1435,6 +1476,10 @@ impl SyncOrchestrator {
         qos_manager: Option<QosManager>, bytes_counter: Option<Arc<AtomicU64>>, job_id: &str, job_dir: &str,
         transfer_mode: TransferMode,
     ) -> Result<()> {
+        // 移动后源端缺失是已搬运事实，不能据此删除目标。
+        if !is_source_reserved {
+            return Ok(());
+        }
         let deletion_iter = db.detect_deleted_items().await?;
         let mut failure: Option<AppError> = None;
 

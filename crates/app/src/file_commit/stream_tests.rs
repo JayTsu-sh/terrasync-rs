@@ -312,7 +312,6 @@ async fn unsupported_modes_fail_before_destination_mutation() {
             &entry,
             CopyOptions {
                 transfer_mode: mode,
-                is_source_reserved: true,
                 ..Default::default()
             },
         )

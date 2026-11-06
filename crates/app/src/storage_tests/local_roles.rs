@@ -137,7 +137,7 @@ async fn scan_filter_and_depth_are_applied_by_role_traversal() -> TestResult {
     Ok(())
 }
 #[tokio::test]
-async fn role_copy_replaces_shorter_file_and_move_removes_only_verified_source() -> TestResult {
+async fn role_copy_replaces_shorter_file_and_never_deletes_source_without_catalogue_ack() -> TestResult {
     let source = TempDir::new()?;
     let destination = TempDir::new()?;
     tokio::fs::write(source.path().join("payload"), b"new").await?;
@@ -150,7 +150,6 @@ async fn role_copy_replaces_shorter_file_and_move_removes_only_verified_source()
         &dst,
         &entry,
         CopyOptions {
-            is_source_reserved: true,
             enable_integrity_check: true,
             ..Default::default()
         },
@@ -158,17 +157,8 @@ async fn role_copy_replaces_shorter_file_and_move_removes_only_verified_source()
     .await?;
     assert_eq!(tokio::fs::read(destination.path().join("payload")).await?, b"new");
     assert!(source.path().join("payload").exists());
-    copy_transfer::copy_entry(
-        &src,
-        &dst,
-        &entry,
-        CopyOptions {
-            is_source_reserved: false,
-            ..Default::default()
-        },
-    )
-    .await?;
-    assert!(!source.path().join("payload").exists());
+    copy_transfer::copy_entry(&src, &dst, &entry, CopyOptions { ..Default::default() }).await?;
+    assert!(source.path().join("payload").exists());
     Ok(())
 }
 #[tokio::test]
@@ -293,16 +283,7 @@ async fn checkpointed_copy_keeps_unrelated_files_without_caller_offsets() -> Tes
     let dst = local(destination.path()).await?;
     let entry = Arc::new(observe_path(src.storage(), Path::new("payload")).await?);
     tokio::fs::write(destination.path().join("untrusted.part"), b"unrelated").await?;
-    copy_transfer::copy_checkpointed(
-        &src,
-        &dst,
-        &entry,
-        CopyOptions {
-            is_source_reserved: true,
-            ..Default::default()
-        },
-    )
-    .await?;
+    copy_transfer::copy_checkpointed(&src, &dst, &entry, CopyOptions { ..Default::default() }).await?;
     assert_eq!(tokio::fs::read(destination.path().join("payload")).await?, payload);
     assert_eq!(
         tokio::fs::read(destination.path().join("untrusted.part")).await?,
@@ -383,7 +364,6 @@ async fn copied_observation_rejects_source_changes_before_any_target_write() -> 
             &observed,
             CopyOptions {
                 transfer_mode,
-                is_source_reserved: false,
                 enable_integrity_check: true,
                 ..Default::default()
             },

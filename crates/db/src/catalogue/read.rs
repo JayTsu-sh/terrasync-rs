@@ -181,7 +181,10 @@ impl ClickHouseDatabase {
             format!("WHERE {}", where_conditions.join(" AND "))
         };
 
-        let query = format!("SELECT {SNAPSHOT_COLUMNS} FROM {base_table_name} FINAL {where_clause}");
+        // 子项先于父目录收尾，避免父目录的只读权限阻断子项元数据和清理。
+        let query = format!(
+            "SELECT {SNAPSHOT_COLUMNS} FROM {base_table_name} FINAL {where_clause} ORDER BY length(splitByChar('/', relative_path)) DESC, relative_path"
+        );
 
         let mut q = self.sync_client.query(&query);
         if let Some(ext) = ext_bind {

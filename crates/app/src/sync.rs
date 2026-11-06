@@ -258,7 +258,6 @@ pub(crate) async fn process_versioned_entry(
                 transfer_mode: resume.transfer_mode,
                 qos: qos_manager,
                 enable_integrity_check,
-                is_source_reserved,
                 bytes_counter,
                 cancel: None,
             },
@@ -371,22 +370,6 @@ async fn process_entry_inner(
         match copy_namespace::read_symlink(src_storage.storage(), entry).await {
             Ok(target_path) => {
                 copy_namespace::create_symlink(dest_storage.storage(), entry, &target_path).await?;
-
-                if !is_source_reserved {
-                    trace!("Is not source reserved, removing symlink {:?}", relative_path);
-                    if let Err(e) = copy_namespace::delete_file(src_storage.storage(), entry).await {
-                        error!("Failed to remove existing symlink {:?}: {}", relative_path, e);
-                        broadcaster
-                            .broadcast(StorageEntryMessage::Error {
-                                event: ErrorEvent::SymlinkOp,
-                                path: relative_path.to_path_buf(),
-                                entry: Some(Arc::clone(entry)),
-                                reason: format!("{e}"),
-                            })
-                            .await;
-                        return Err(e.into());
-                    }
-                }
             }
             Err(e) => {
                 error!("Failed to read symlink {:?}: {}", relative_path, e);
@@ -420,7 +403,6 @@ async fn process_entry_inner(
                 transfer_mode: resume.transfer_mode,
                 qos: qos_manager,
                 enable_integrity_check,
-                is_source_reserved,
                 bytes_counter,
                 ..Default::default()
             },
@@ -460,7 +442,6 @@ async fn process_entry_inner(
                 transfer_mode: resume.transfer_mode,
                 qos: qos_manager,
                 enable_integrity_check,
-                is_source_reserved,
                 bytes_counter,
                 ..Default::default()
             },
@@ -709,7 +690,7 @@ pub(crate) fn should_resume(
 /// 本地记录器保留现有产品进度收尾，不向引擎提供 `.part` 路径或缺失区间。
 pub(crate) async fn copy_file_with_resume(
     entry: &Arc<ObservedEntry>, src_storage: &StorageContext, dest_storage: &StorageContext,
-    enable_integrity_check: bool, is_source_reserved: bool, qos_manager: Option<QosManager>,
+    enable_integrity_check: bool, _is_source_reserved: bool, qos_manager: Option<QosManager>,
     bytes_counter: Option<Arc<AtomicU64>>, job_dir: &str,
 ) -> Result<()> {
     let recorder = CommitRecorder::start(job_dir, entry, src_storage.block_size()).await?;
@@ -722,7 +703,6 @@ pub(crate) async fn copy_file_with_resume(
             transfer_mode: TransferMode::Checkpoint,
             qos: qos_manager,
             enable_integrity_check,
-            is_source_reserved,
             bytes_counter,
             ..Default::default()
         },
@@ -735,8 +715,8 @@ pub(crate) async fn copy_file_with_resume(
 
 /// 处理单个文件或目录的复制
 pub(crate) async fn process_rename_entry(
-    from_entry: Arc<ObservedEntry>, to_entry: Arc<ObservedEntry>, src_storage: Arc<StorageContext>,
-    dest_storage: Arc<StorageContext>, is_source_reserved: bool,
+    from_entry: Arc<ObservedEntry>, to_entry: Arc<ObservedEntry>, _src_storage: Arc<StorageContext>,
+    dest_storage: Arc<StorageContext>, _is_source_reserved: bool,
 ) -> Result<()> {
     let from_path = from_entry.get_relative_path();
     let to_path = to_entry.get_relative_path();
@@ -750,11 +730,6 @@ pub(crate) async fn process_rename_entry(
             .namespace()?
             .rename(from_entry.path(), to_entry.path())
             .await?;
-
-        if !is_source_reserved {
-            // 如果源文件不是保留文件，删除源文件
-            copy_namespace::delete_file(src_storage.storage(), to_entry.as_ref()).await?;
-        }
 
         Ok(())
     }

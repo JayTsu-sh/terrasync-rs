@@ -27,7 +27,6 @@ pub struct CopyOptions {
     pub transfer_mode: TransferMode,
     pub qos: Option<QosManager>,
     pub enable_integrity_check: bool,
-    pub is_source_reserved: bool,
     pub bytes_counter: Option<Arc<AtomicU64>>,
     pub cancel: Option<CancellationToken>,
 }

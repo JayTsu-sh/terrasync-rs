@@ -35,7 +35,6 @@ async fn direct_updates_existing_inode_while_atomic_and_checkpoint_replace_it() 
                 &entry,
                 CopyOptions {
                     transfer_mode: mode,
-                    is_source_reserved: true,
                     enable_integrity_check: true,
                     ..Default::default()
                 },

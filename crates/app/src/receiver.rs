@@ -211,13 +211,6 @@ pub(crate) async fn process_entry_on_receiver(
             copy_namespace::create_symlink(dest_storage.storage(), entry, &target_path)
                 .await
                 .map_err(|e| AppError::copy_entry_failure(CopyStep::CreateDestinationLink, relative_path, e))?;
-
-            // 源端符号链接删除（is_source_reserved=false 时）
-            if !config.is_source_reserved
-                && let Err(e) = copy_namespace::delete_file(src_storage.storage(), entry).await
-            {
-                error!("[Receiver] Failed to remove source symlink {:?}: {}", relative_path, e);
-            }
         } else {
             // 所有文件使用同一显式策略；检查点及原子发布由上游管理。
             let resume = ResumeOpts {
@@ -243,7 +236,6 @@ pub(crate) async fn process_entry_on_receiver(
                         transfer_mode: config.transfer_mode,
                         qos: qos_manager,
                         enable_integrity_check: config.enable_integrity_check,
-                        is_source_reserved: config.is_source_reserved,
                         bytes_counter,
                         ..Default::default()
                     },
@@ -276,7 +268,6 @@ pub(crate) async fn process_entry_on_receiver(
                         transfer_mode: config.transfer_mode,
                         qos: qos_manager,
                         enable_integrity_check: config.enable_integrity_check,
-                        is_source_reserved: config.is_source_reserved,
                         bytes_counter,
                         ..Default::default()
                     },
@@ -290,11 +281,8 @@ pub(crate) async fn process_entry_on_receiver(
         }
 
         // ACL 复制（目录和文件均需要，symlink 除外）
-        if config.enable_acl
-            && !entry.get_is_symlink()
-            && let Err(e) = copy_metadata::copy_acl(src_storage.storage(), dest_storage.storage(), relative_path).await
-        {
-            error!("[Receiver] Failed to copy ACL for {:?}: {}", relative_path, e);
+        if config.enable_acl && !entry.get_is_symlink() {
+            copy_metadata::copy_acl(src_storage.storage(), dest_storage.storage(), relative_path).await?;
         }
 
         Ok(())

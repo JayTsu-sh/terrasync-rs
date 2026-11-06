@@ -72,7 +72,16 @@ async fn apply_directories(
     let progress = DirectoryProgress::new();
     let mut tasks = JoinSet::new();
     let mut failure = None;
+    let mut depth = None;
     while let Some(entry) = receiver.recv().await {
+        let entry_depth = entry.path().as_str().split('/').count();
+        // 查询按深度倒序；父目录收紧权限前，必须完成所有更深目录。
+        if depth.is_some_and(|previous| previous != entry_depth) {
+            while let Some(result) = tasks.join_next().await {
+                record_update(result, &mut failure, &progress.bar);
+            }
+        }
+        depth = Some(entry_depth);
         // 及时回收已结束任务，任务集合连同完成结果也保持有界。
         while tasks.len() >= DIRECTORY_CONCURRENCY {
             if let Some(result) = tasks.join_next().await {

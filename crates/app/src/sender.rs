@@ -79,7 +79,6 @@ pub async fn sender_worker(
                             transfer_mode: copy_config.transfer_mode,
                             qos: qos_manager.clone(),
                             enable_integrity_check: copy_config.enable_integrity_check,
-                            is_source_reserved: copy_config.is_source_reserved,
                             bytes_counter: bytes_tracker.clone(),
                             cancel: None,
                         },

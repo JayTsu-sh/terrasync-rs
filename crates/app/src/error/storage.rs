@@ -23,6 +23,10 @@ use data_mover::{
 use task_model::TransferMode;
 #[derive(Debug, thiserror::Error)]
 pub enum StorageError {
+    #[error("源端清理前发现条目变化，已保留源端: {path}")]
+    SourceChangedBeforeDelete { path: StoragePath },
+    #[error("源端版本永久清理不可用，已保留所有历史: {path}")]
+    PermanentVersionCleanupUnavailable { path: StoragePath },
     #[error(transparent)]
     Observation(EntryObservationFailure),
     #[error("incomplete object history")]

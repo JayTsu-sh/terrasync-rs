@@ -52,7 +52,6 @@ async fn checkpointed_copy_reads_requested_historical_version() -> TestResult {
         &selected,
         &CopyOptions {
             transfer_mode: TransferMode::Checkpoint,
-            is_source_reserved: true,
             enable_integrity_check: true,
             ..Default::default()
         },
