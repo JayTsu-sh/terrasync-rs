@@ -69,7 +69,12 @@ async fn preserve_case(config: &ClickHouseConfig) -> Result<()> {
         Arc::new(create_storage(&target_root.path().to_string_lossy(), CreateStorageOptions::default()).await?);
     let database = ClickHouseDatabase::connect(config, "retained_target").await?;
     database.initialize().await?;
-    database.begin_copy_generation(&request("same-plan", true)).await?;
+    let descriptor = |reserved| {
+        let mut request = request("same-plan", reserved);
+        request.binding.target_history = true;
+        request
+    };
+    database.begin_copy_generation(&descriptor(true)).await?;
     let mut entries = Vec::new();
     // 历史来自确定性 S3 观察；真实链路验证范围为 CH、Local 目标与 HTTP callback。
     entries.push(version_facts());
@@ -80,7 +85,7 @@ async fn preserve_case(config: &ClickHouseConfig) -> Result<()> {
     std::fs::remove_file(source_root.path().join("payload"))?;
     std::fs::remove_dir(source_root.path().join("folder"))?;
     let database = database.new_execution_scope();
-    database.begin_copy_generation(&request("same-plan", false)).await?;
+    database.begin_copy_generation(&descriptor(false)).await?;
     let mut events = BroadcastForwarder::new(8);
     let mut received = events.subscribe();
     SyncOrchestrator::apply_deletions_and_renames(

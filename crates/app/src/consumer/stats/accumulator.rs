@@ -257,29 +257,30 @@ impl FullStats {
     /// 根据 entry 类型更新对应维度的统计
     pub fn update(&mut self, entry: &impl EntryStatistics) {
         let size = entry.get_size() as i64;
+        let count = entry.entry_count();
         let name_len = entry.get_name().len();
 
-        self.total_name_length += name_len as i64;
+        self.total_name_length += (name_len * count) as i64;
         if name_len > self.max_name_length {
             self.max_name_length = name_len;
         }
 
         if entry.get_is_dir() {
-            self.dir_count += 1;
+            self.dir_count += count;
             self.dir_size += size;
             let depth = calculate_depth(entry.get_relative_path());
-            self.total_dir_depth += depth as i64;
+            self.total_dir_depth += (depth * count) as i64;
             if depth > self.max_dir_depth {
                 self.max_dir_depth = depth;
             }
         } else if entry.get_is_symlink() {
-            self.symlink_count += 1;
+            self.symlink_count += count;
             self.symlink_size += size;
         } else if entry.get_is_regular_file() {
-            self.regular_file_count += 1;
+            self.regular_file_count += count;
             self.regular_file_size += size;
         } else {
-            self.other_entry_count += 1;
+            self.other_entry_count += count;
             self.other_entry_size += size;
         }
         self.update_distributions(entry, entry.get_is_regular_file());
@@ -288,21 +289,22 @@ impl FullStats {
     /// 扫描标量只取目录确认快照；此处只观察可选分布，不再累加条目数。
     pub(crate) fn update_distributions(&mut self, entry: &impl EntryStatistics, regular: bool) {
         let size = entry.get_size() as i64;
+        let count = entry.entry_count();
         if regular {
             if let Some(ext) = entry.get_extension() {
                 let value = self.extension_stats.entry(ext.to_lowercase()).or_insert((0, 0));
                 value.0 += size;
-                value.1 += 1;
+                value.1 += count;
             }
-            let range = calculate_file_size_range(entry.get_size());
+            let range = calculate_file_size_range(entry.distribution_size());
             let value = self.file_size_range_stats.entry(range).or_insert((0, 0));
             value.0 += size;
-            value.1 += 1;
+            value.1 += count;
         }
         let range = calculate_time_range(entry.get_mtime());
         let value = self.time_range_stats.entry(range).or_insert((0, 0));
         value.0 += size;
-        value.1 += 1;
+        value.1 += count;
     }
 
     pub fn update_from_message(&mut self, message: &StorageEntryMessage) {
@@ -321,6 +323,8 @@ impl FullStats {
                 self.update(&EntryProgress {
                     entry,
                     logical_bytes: *logical_bytes,
+                    count_entry: true,
+                    distribution_bytes: None,
                 });
             }
             StorageEntryMessage::Error { event, .. } => self.error_stats.record(*event),
@@ -497,16 +501,16 @@ impl DeltaCounts {
     pub fn add(&mut self, entry: &impl EntryStatistics) {
         let size = entry.get_size() as i64;
         if entry.get_is_dir() {
-            self.dir_count += 1;
+            self.dir_count += entry.entry_count();
             self.dir_size += size;
         } else if entry.get_is_symlink() {
-            self.symlink_count += 1;
+            self.symlink_count += entry.entry_count();
             self.symlink_size += size;
         } else if entry.get_is_regular_file() {
-            self.regular_file_count += 1;
+            self.regular_file_count += entry.entry_count();
             self.regular_file_size += size;
         } else {
-            self.other_entry_count += 1;
+            self.other_entry_count += entry.entry_count();
             self.other_entry_size += size;
         }
     }

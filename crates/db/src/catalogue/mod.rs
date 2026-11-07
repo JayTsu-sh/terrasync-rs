@@ -22,6 +22,7 @@ mod read;
 mod scan_resume;
 mod scan_resume_statistics;
 mod tables;
+mod versions;
 mod write;
 
 pub use comparison::{CatalogueChange, ComparisonMode};

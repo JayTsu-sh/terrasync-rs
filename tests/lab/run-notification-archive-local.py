@@ -72,9 +72,19 @@ def run_isolated():
                     image,
                 )
                 containers.append(container)
+            if "--version-catalogue" in sys.argv:
+                containers.append(docker(
+                    "run", "-d", "--name", f"ts-version-catalogue-{uuid.uuid4().hex[:12]}",
+                    "--network", f"container:{containers[0]}", "--memory=768m", "--cpus=1",
+                    "--tmpfs", "/data:rw,size=128m,mode=1777", "--label", "codex.task=version-catalogue",
+                    "-e", "RUSTFS_ADDRESS=0.0.0.0:19000", "-e", "RUSTFS_CONSOLE_ADDRESS=0.0.0.0:19001",
+                    "-e", "RUSTFS_ACCESS_KEY=migration-test", "-e", "RUSTFS_SECRET_KEY=migration-test-isolated-only",
+                    os.environ.get("MIGRATION_S3_IMAGE", "rustfs/rustfs:latest"), "/data",
+                ))
+                print(f"isolated S3 image={docker('inspect', containers[-1], '--format', '{{.Image}}')}", flush=True)
             print(f"isolated notification image={docker('inspect', containers[0], '--format', '{{.Image}}')}", flush=True)
             pid = docker("inspect", containers[0], "--format", "{{.State.Pid}}")
-            suite = [flag for flag in ("--copy-generations", "--rename-generations", "--retention-events", "--source-absence", "--request-policy", "--copy-contracts") if flag in sys.argv]
+            suite = [flag for flag in ("--copy-generations", "--rename-generations", "--retention-events", "--source-absence", "--request-policy", "--copy-contracts", "--version-catalogue", "--scan-wire") if flag in sys.argv]
             subprocess.run(["nsenter", "-t", pid, "-n", sys.executable, __file__, "--inside", *suite], cwd=ROOT, check=True)
         except BaseException:
             for container in containers:
@@ -174,6 +184,20 @@ def run_copy_generations():
     environment["LAB_COPY_GENERATION_DSN"] = f"http://{address}"
     environment["LAB_COPY_GENERATION_CONTROL"] = address
     try:
+        if "--scan-wire" in sys.argv:
+            environment["LAB_CLICKHOUSE_DSN"] = environment["LAB_COPY_GENERATION_DSN"]
+            environment["LAB_CLICKHOUSE_CLUSTER"] = "notification_cluster"
+            for test in ("cluster_fresh_schema_includes_candidate_hash_on_every_replica",
+                         "cluster_native_key_stage_replays_events_before_direct_base_write",
+                         "cluster_shared_native_observations_roundtrip_merge_replay_and_deletions"):
+                subprocess.run([
+                    "cargo", "test", "--offline", "--locked", "-p", "db", "--lib",
+                    "scan::cluster::tests::" + test, "--", "--ignored", "--exact", "--nocapture",
+                ], cwd=ROOT, env=environment, check=True)
+            return
+        if "--version-catalogue" in sys.argv:
+            run_version_catalogue(environment)
+            return
         if "--copy-contracts" in sys.argv:
             environment["LAB_CATALOGUE_SINGLE"] = "1"
             environment["LAB_CLICKHOUSE_DSN"] = environment["LAB_COPY_GENERATION_DSN"]
@@ -220,6 +244,87 @@ def run_copy_generations():
         release.set()
         proxy.shutdown()
         proxy.server_close()
+
+
+
+def run_version_catalogue(environment):
+    import boto3
+    from botocore.config import Config
+    for _ in range(100):
+        try:
+            with urllib.request.urlopen("http://127.0.0.1:19000/health/ready", timeout=1) as response:
+                if response.status == 200:
+                    break
+        except OSError:
+            pass
+        time.sleep(0.25)
+    else:
+        raise RuntimeError("owned S3 readiness timed out")
+    client = boto3.client("s3", endpoint_url="http://127.0.0.1:19000", aws_access_key_id="migration-test",
+                          aws_secret_access_key="migration-test-isolated-only", region_name="us-east-1",
+                          config=Config(s3={"addressing_style": "path"}, proxies={}, connect_timeout=2, read_timeout=3))
+    buckets = {kind: f"catalogue-{kind}-{uuid.uuid4().hex[:12]}" for kind in ("source", "latest", "history")}
+    for kind, bucket in buckets.items():
+        client.create_bucket(Bucket=bucket)
+        if kind != "latest":
+            client.put_bucket_versioning(Bucket=bucket, VersioningConfiguration={"Status": "Enabled"})
+        environment["LAB_VERSION_CATALOGUE_" + kind.upper()] = f"s3://migration-test:migration-test-isolated-only@{bucket}.127.0.0.1:19000"
+    for prefix in ("single", "cluster"):
+        for version in range(4):
+            client.put_object(Bucket=buckets["source"], Key=prefix + "/payload", Body=f"payload-{version}".encode(), Tagging=f"raw={version}")
+    reports = []
+    class Control(http.server.BaseHTTPRequestHandler):
+        def log_message(self, *_):
+            pass
+
+        def do_GET(self):
+            if self.path not in ("/marker/single", "/marker/cluster"):
+                self.send_error(404)
+                return
+            prefix = self.path.rsplit("/", 1)[1]
+            client.delete_object(Bucket=buckets["source"], Key=prefix + "/payload")
+            self.send_response(204)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+
+        def do_POST(self):
+            reports.append(json.loads(self.rfile.read(int(self.headers["Content-Length"]))))
+            self.send_response(204)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+
+    control = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Control)
+    control.daemon_threads = True
+    threading.Thread(target=control.serve_forever, daemon=True).start()
+    environment["LAB_VERSION_CATALOGUE_CONTROL"] = f"127.0.0.1:{control.server_port}"
+    environment["LAB_VERSION_CATALOGUE_CALLBACK"] = f"http://127.0.0.1:{control.server_port}/callback"
+    try:
+        subprocess.run([
+            "cargo", "test", "--offline", "--locked", "-p", "app", "--lib",
+            "copy_execution::version_tests::real_versioned_copy_catalogues_follow_destination_history", "--", "--ignored", "--exact", "--nocapture",
+        ], cwd=ROOT, env=environment, check=True)
+        for prefix in ("single", "cluster"):
+            key = prefix + "/payload"
+            assert client.get_object(Bucket=buckets["latest"], Key=key)["Body"].read() == b"changed-payload"
+            versions = client.list_object_versions(Bucket=buckets["history"], Prefix=key)
+            assert len(versions.get("Versions", [])) == 5 and not versions.get("DeleteMarkers"), versions
+            contents = [client.get_object(Bucket=buckets["history"], Key=key, VersionId=version["VersionId"])["Body"].read()
+                        for version in versions["Versions"]]
+            assert contents == [b"changed-payload", b"payload-3", b"payload-2", b"payload-1", b"payload-0"], contents
+            source = client.list_object_versions(Bucket=buckets["source"], Prefix=key)
+            assert len(source.get("Versions", [])) == 5 and len(source.get("DeleteMarkers", [])) == 1, source
+        print("independent S3 catalogue inspection deployments=2 latest_current_payload=true target_history_versions=5 no_duplicate_replay=true source_versions_retained=5 source_delete_markers=1 latest_marker_target_preserved=true ordered_payloads=true", flush=True)
+        summaries = [report for report in reports if report["is_final"] and not report.get("diagnostics")]
+        assert len(summaries) == 14 and all(report["task_error_count"] == 0 and report["diagnostics_complete"] for report in summaries), summaries
+        retained = [report for report in summaries if report["target_preserved_count"] == 1]
+        assert len(retained) == 2, retained
+        markers = [event for report in reports for event in (report.get("diagnostics") or {}).get("events", [])
+                   if event.get("retention", {}).get("source_path") == "payload"]
+        assert len(markers) == 2 and all(event["retention"]["reason"] == "source_deletion_unconfirmed" for event in markers), markers
+        print("independent S3 callback inspection successful_rounds=14 latest_delete_marker_retention_entries=2 task_errors=0 HTTP_204=accepted", flush=True)
+    finally:
+        control.shutdown()
+        control.server_close()
 
 
 def run_request_policy(environment):
@@ -338,7 +443,7 @@ def run_inside():
             time.sleep(0.2)
         else:
             raise RuntimeError(f"ClickHouse readiness timed out on port {port}")
-    if any(flag in sys.argv for flag in ("--copy-generations", "--rename-generations", "--retention-events", "--source-absence", "--request-policy", "--copy-contracts")):
+    if any(flag in sys.argv for flag in ("--copy-generations", "--rename-generations", "--retention-events", "--source-absence", "--request-policy", "--copy-contracts", "--version-catalogue", "--scan-wire")):
         run_copy_generations()
         return
     environment = dict(os.environ)

@@ -104,8 +104,8 @@ impl ClickHouseDatabase {
             )
             .await?;
         } else {
-            self.execute(&format!("ALTER TABLE {base} DELETE WHERE NOT copy_path_confirmed AND copy_sequence < ? SETTINGS mutations_sync=2"),
-                &[Value::from(sequence)]).await?;
+            // 未确认行作为墓碑保留；只删这些物理行会复活同键更早的已确认快照。
+            // 比较和收尾均排除它们，只有新的复制 ACK 才能恢复该目标槽的就绪证明。
             // 范围外事实跨多轮保留；每轮统一回到 C，观察之后才写 W。
             self.execute(&format!("ALTER TABLE {base} UPDATE current_state={committed} WHERE current_state!={committed} AND copy_sequence < ? SETTINGS mutations_sync=2"),
                 &[Value::from(sequence)]).await?;

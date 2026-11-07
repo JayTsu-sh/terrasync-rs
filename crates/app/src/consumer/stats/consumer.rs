@@ -17,7 +17,7 @@ use std::time::Duration;
 use data_mover::model::{EntryKind, ObservedEntry};
 use reqwest::redirect::Policy;
 use task_model::migration::MigrationReport;
-use task_model::observation::{EntryStatistics, ObservedScanEvent, ObservedView};
+use task_model::observation::{EntryProgress, EntryStatistics, ObservedScanEvent, ObservedView};
 use task_model::{RetentionScope, StorageEntryMessage};
 use tokio::sync::{Mutex, mpsc};
 use tokio::task::JoinHandle;
@@ -34,6 +34,7 @@ use super::progress_bar::ProgressBar;
 use super::report::ProgressDetail;
 use super::report::ProgressReport;
 use crate::callback::CallbackEndpoint;
+use crate::config::JobType;
 use crate::error::{AppError, Result};
 use crate::scan::statistics::{ScanCounts, ScanSnapshot};
 use db::ClickHouseDatabase;
@@ -180,6 +181,16 @@ impl StatisticConsumer {
 
     pub fn update_statistics(&mut self, message: &StorageEntryMessage) {
         trace!("Updating statistics for message: {:?}", message);
+        if let StorageEntryMessage::Scanned(entry) = message
+            && let StatsKind::Incremental(stats) = &mut self.stats
+            && matches!(stats.job_type, JobType::IncrementalCopy)
+        {
+            let inventory =
+                EntryProgress::copy_inventory(entry, self.migration.as_ref().is_some_and(|plan| !plan.target_history));
+            stats.scanned.update(&inventory);
+            self.progress_bar.update_observed("scanned", &inventory);
+            return;
+        }
         self.stats.update_from_message(message);
         if let StorageEntryMessage::TargetPreserved { retention, reason } = message {
             if retention.scope == RetentionScope::Entry {

@@ -438,6 +438,7 @@ impl SyncOrchestrator {
                 execution_id: request.execution_id.clone(),
                 filter_evaluated_at: request.filter_evaluated_at,
                 source_cleanup: request.source_cleanup,
+                target_history: request.binding.target_history,
                 plan: CopyGenerationPlan::decide(request, None, false)?,
                 phase: CopyGenerationPhase::Prepared,
                 baseline_prepared: false,

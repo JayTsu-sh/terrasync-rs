@@ -6,6 +6,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use clickhouse::Client;
+use serde::Deserialize;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::time::timeout;
@@ -19,8 +20,17 @@ use crate::execution::base_client;
 use crate::observed_fixtures::observation;
 use crate::schema::identity::encoded_file_handle;
 use crate::{ClickHouseConfig, ClickHouseDatabase, DatabaseError, Result};
-use data_mover::model::{BackendKind, EntryKind, ObservedEntry};
-use task_model::EntryChange;
+use data_mover::model::{BackendKind, EntryKind, HistoryOrder, ObjectHistory, ObservedEntry};
+use task_model::observation::ObservedItem;
+use task_model::{ChangeKind, EntryChange};
+
+#[derive(Deserialize, clickhouse::Row)]
+struct VersionSlotRow {
+    version_id: String,
+    source_version_id: String,
+    entry_snapshot: Vec<u8>,
+    copy_path_confirmed: bool,
+}
 
 struct Fixture {
     config: ClickHouseConfig,
@@ -192,6 +202,167 @@ async fn read_faults(fixture: &Fixture) -> Result<()> {
     Ok(())
 }
 
+async fn version_slots(fixture: &Fixture, history_target: bool) -> Result<()> {
+    let job = format!("version_slots_{history_target}");
+    let descriptor = || {
+        let mut request = request("version-slots", true);
+        request.binding.target_history = history_target;
+        request
+    };
+    let versions = |ids: &[&str]| -> Result<Vec<Arc<ObservedEntry>>> {
+        let mut entries: Vec<_> = ids
+            .iter()
+            .enumerate()
+            .map(|(index, id)| {
+                observation(
+                    BackendKind::S3,
+                    "payload".into(),
+                    EntryKind::File,
+                    7,
+                    [11; 3],
+                    None,
+                    None,
+                    Some(vec![("raw".into(), id.to_string())]),
+                    Some((Some(id.to_string()), index + 1 == ids.len(), false)),
+                )
+            })
+            .collect();
+        let records = entries
+            .iter()
+            .flat_map(|entry| {
+                entry
+                    .history()
+                    .into_iter()
+                    .flat_map(|history| history.records().iter().cloned())
+            })
+            .collect();
+        let entry = entries.pop().ok_or(DatabaseError::CopyExecutionUnavailable)?;
+        let history = ObjectHistory::whole(records, HistoryOrder::Server)?;
+        Ok(entry
+            .with_history(Some(Box::new(history)))?
+            .into_segments(1)
+            .into_iter()
+            .map(Arc::new)
+            .collect())
+    };
+    let initial = versions(&["old", "current"])?;
+    let database = fixture.open(&job).await?;
+    database.begin_copy_generation(&descriptor()).await?;
+    let base = database.catalogue_storage_table(&format!("base_{job}"))?;
+    database
+        .execute(
+            &format!("ALTER TABLE {base} MODIFY SETTING max_bytes_to_merge_at_max_space_in_pool=1"),
+            &[],
+        )
+        .await?;
+    database.batch_insert_base_record(&initial).await?;
+    assert_eq!(database.get_count("base").await?, if history_target { 2 } else { 1 });
+    database.commit_scan_generation().await?;
+    database.finish_copy_generation(CopyGenerationPhase::Completed).await?;
+    let updated = versions(&["old", "current", "new"])?;
+    let database = database.new_execution_scope();
+    database.begin_copy_generation(&descriptor()).await?;
+    let changes = database
+        .compare_catalogue_batch(&updated, ComparisonMode::AwaitCopyAcknowledgement)
+        .await?;
+    assert_eq!(
+        changes.len(),
+        1,
+        "旧历史不能为最新目标重复生成工作；历史目标只新增未确认版本"
+    );
+    assert_eq!(changes[0].item.view().version_id(), "new");
+    let expected = if history_target {
+        EntryChange::New
+    } else {
+        EntryChange::Changed(ChangeKind::Both)
+    };
+    assert_eq!(changes[0].kind, expected, "相同大小和 mtime 不得掩盖源版本变化");
+    let client = base_client(&fixture.config)?;
+    let rows = || {
+        client.query(&format!(
+            "SELECT version_id,source_version_id,entry_snapshot,copy_path_confirmed FROM base_{job} FINAL ORDER BY version_id"
+        ))
+    };
+    let before = rows().fetch_all::<VersionSlotRow>().await?;
+    assert!(
+        before.iter().all(|row| row.source_version_id != "new"),
+        "未经 ACK 保留上个目标事实"
+    );
+    if !history_target {
+        assert!(!before[0].copy_path_confirmed, "复制尚未确认，旧原值不能授权复用或删源");
+    }
+    fail_after_comparison(fixture, &database).await?;
+    let mut database = database.new_execution_scope();
+    assert_eq!(
+        database.begin_copy_generation(&descriptor()).await?,
+        CopyGenerationStatus::Recovering
+    );
+    if !history_target {
+        let physical = client
+            .query(&format!("SELECT countIf(copy_path_confirmed) FROM base_{job}"))
+            .fetch_one::<u64>()
+            .await?;
+        assert!(physical > 0, "回归必须保留同键更早的已确认物理行");
+        for _ in 0..3 {
+            let reverted = database
+                .compare_catalogue_batch(&initial, ComparisonMode::AwaitCopyAcknowledgement)
+                .await?;
+            assert_eq!(reverted.len(), 1, "失败后源恢复原版本也不能把已覆盖的目标当成就绪");
+            assert_eq!(reverted[0].kind, EntryChange::New);
+            database = database.new_execution_scope();
+            assert_eq!(
+                database.begin_copy_generation(&descriptor()).await?,
+                CopyGenerationStatus::Recovering
+            );
+        }
+    }
+    let changes = database
+        .compare_catalogue_batch(&updated, ComparisonMode::AwaitCopyAcknowledgement)
+        .await?;
+    assert_eq!(changes.len(), 1);
+    assert_eq!(changes[0].kind, EntryChange::New);
+    database
+        .batch_insert_completed_records(
+            &changes
+                .into_iter()
+                .map(|change| change.item)
+                .collect::<Vec<ObservedItem>>(),
+        )
+        .await?;
+    assert!(
+        database
+            .compare_catalogue_batch(&updated, ComparisonMode::AwaitCopyAcknowledgement)
+            .await?
+            .is_empty()
+    );
+    let after = rows().fetch_all::<VersionSlotRow>().await?;
+    assert_eq!(after.len(), if history_target { 3 } else { 1 });
+    let latest = after
+        .iter()
+        .find(|row| row.source_version_id == "new")
+        .ok_or(DatabaseError::CopyExecutionUnavailable)?;
+    assert_eq!(latest.version_id, if history_target { "new" } else { "" });
+    let entry = ObservedEntry::decode_snapshot(&latest.entry_snapshot, updated[2].source_identity().backend())?;
+    assert_eq!(
+        entry.history().map(|history| history.records()[0].version_id()),
+        Some(Some("new"))
+    );
+    assert_eq!(
+        entry
+            .history()
+            .and_then(|history| history.records()[0].metadata())
+            .and_then(|metadata| metadata.tags().value())
+            .map(|tags| tags[0].value()),
+        Some("new")
+    );
+    eprintln!(
+        "version-slots cluster={} history_target={history_target} before_ack_preserved=true retry_work=1 same_size_and_mtime=true base_rows={} raw_source_version_and_tags_preserved=true",
+        fixture.config.cluster.is_some(),
+        after.len()
+    );
+    Ok(())
+}
+
 #[tokio::test]
 #[ignore = "requires an isolated ClickHouse pair and fault proxy from run-notification-archive-local.py --copy-generations"]
 async fn real_copy_generation_policies() -> Result<()> {
@@ -207,6 +378,8 @@ async fn real_copy_generation_policies() -> Result<()> {
                     }
                 }
             }
+            version_slots(&fixture, false).await?;
+            version_slots(&fixture, true).await?;
             read_faults(&fixture).await
         }
         .await;
@@ -398,7 +571,7 @@ async fn reused_paths_are_copied_before_replacing_confirmed_target_facts(fixture
         .fetch_one()
         .await?;
     assert_eq!(identity, encoded_file_handle(&original[0]));
-    assert!(confirmed);
+    assert!(!confirmed, "待覆盖路径的旧原值保留，但就绪证明必须撤销");
     let completed: Vec<_> = changes.into_iter().map(|change| change.item).collect();
     database.batch_insert_completed_records(&completed).await?;
     assert_eq!(database.detect_deleted_items().await?.count(), 0);

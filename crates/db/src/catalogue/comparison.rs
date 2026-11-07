@@ -12,6 +12,7 @@ use {
 };
 
 use super::ClickHouseDatabase;
+use super::versions::CatalogueVersions;
 use crate::scan::rows::OBSERVED_COLUMNS;
 use crate::schema::columns::{
     CATALOGUE_COLUMNS as FILE_SCAN_COLUMNS_LIST,
@@ -129,7 +130,7 @@ impl ClickHouseDatabase {
 }
 
 fn bind_input_order(
-    entries: &[Arc<ObservedEntry>], differences: &mut Vec<CatalogueDifference>,
+    entries: &[Arc<ObservedEntry>], differences: &mut Vec<CatalogueDifference>, versions: CatalogueVersions,
 ) -> Result<Vec<CatalogueChange>> {
     if differences.is_empty() {
         return Ok(Vec::new());
@@ -157,8 +158,8 @@ fn bind_input_order(
             version_index: entry.history().map(|_| 0),
         };
         let path = view.path_key();
-        for view in ObservedView::all(entry) {
-            let version = view.version_id();
+        for view in ObservedView::all(entry).filter(|view| versions.includes(*view)) {
+            let version = versions.key(view);
             if let Ok(index) = differences.binary_search_by(|row| {
                 (row.relative_path.as_str(), row.version_id.as_str()).cmp(&(path.as_ref(), version))
             }) {
@@ -205,7 +206,7 @@ impl ClickHouseDatabase {
         let operation = async {
             database.batch_insert_temp_record(entries).await?;
             let mut differences = database.classify_batch().await?;
-            let changes = bind_input_order(entries, &mut differences)?;
+            let changes = bind_input_order(entries, &mut differences, self.catalogue_versions().await)?;
             // 复用分类查询拥有的主键；不再次复制观察中的路径／版本字符串。
             let excluded = match mode {
                 ComparisonMode::PublishObserved => Vec::new(),
@@ -303,8 +304,12 @@ impl JoinStrategy {
     pub(super) fn build_detect_changed_sql(&self, temp: &str, base: &str, kind: ChangeKind) -> String {
         let t_columns = &*FILE_SCAN_COLUMNS_LIST_WITH_T_PREFIX;
         let marker_eq = "ifNull(t.marker_state = f.marker_state, (t.marker_state IS NULL AND f.marker_state IS NULL))";
-        let data_changed = format!("((t.is_dir = 0 AND (t.size != f.size OR t.mtime != f.mtime)) OR NOT {marker_eq})");
-        let data_unchanged = format!("((t.is_dir = 1 OR (t.size = f.size AND t.mtime = f.mtime)) AND {marker_eq})");
+        let data_changed = format!(
+            "((t.is_dir = 0 AND (t.size != f.size OR t.mtime != f.mtime OR t.source_version_id != f.source_version_id)) OR NOT {marker_eq})"
+        );
+        let data_unchanged = format!(
+            "((t.is_dir = 1 OR (t.size = f.size AND t.mtime = f.mtime AND t.source_version_id = f.source_version_id)) AND {marker_eq})"
+        );
         // mode/uid/gid 在 S3 等协议中为 Nullable 且常常为 NULL；ClickHouse 三值逻辑下
         // `NULL = NULL` 返回 NULL（WHERE 视为 false），会让所有 ChangeKind 都不匹配。
         // 比较结果为 NULL 时，只有两侧均 NULL 才相等；单侧未知不能掩盖真实变更。
@@ -346,7 +351,7 @@ impl JoinStrategy {
         match self {
             Self::Path | Self::CopyPath => format!(
                 "SELECT {t_columns} FROM {temp} t \
-                 JOIN (SELECT relative_path, version_id, size, mtime, mode, uid, gid, is_dir, marker_state, metadata_digests{identity_columns} \
+                 JOIN (SELECT relative_path, version_id, source_version_id, size, mtime, mode, uid, gid, is_dir, marker_state, metadata_digests{identity_columns} \
                        FROM {base} FINAL \
                        WHERE copy_path_confirmed AND (relative_path, version_id) IN \
                              (SELECT relative_path, version_id FROM {temp}) \
@@ -358,7 +363,7 @@ impl JoinStrategy {
             ),
             Self::FileHandle => format!(
                 "SELECT {t_columns} FROM {temp} t \
-                 JOIN (SELECT file_handle, relative_path, size, mtime, mode, uid, gid, is_dir, marker_state, metadata_digests \
+                 JOIN (SELECT file_handle, relative_path, source_version_id, size, mtime, mode, uid, gid, is_dir, marker_state, metadata_digests \
                        FROM {base} FINAL \
                        WHERE copy_path_confirmed AND file_handle IN \
                              (SELECT file_handle FROM {temp} WHERE file_handle IS NOT NULL) \
@@ -445,11 +450,26 @@ impl ClickHouseDatabase {
 
             // 3. 带过滤的 INSERT INTO SELECT
             let exclude_query_table = self.catalogue_query_table(&exclude_table)?;
-            let insert_sql = format!(
+            let mut insert_sql = format!(
                 "INSERT INTO {base_table_name} ({columns}) SELECT {projection} FROM {temp_table_name} \
                  WHERE (relative_path, version_id) NOT IN \
                  (SELECT relative_path, version_id FROM {exclude_query_table})"
             );
+            if copying {
+                // 可变目标开始覆盖前撤销旧就绪证明，保留原值供诊断；失败后源版本回退也必须重复制。
+                // 与本批观察同一条 INSERT，避免增加逐项请求或确认；保留标记对象的决定不触碰旧证明。
+                let pending = OBSERVED_COLUMNS
+                    .split(',')
+                    .map(|name| format!("f.{name}"))
+                    .collect::<Vec<_>>()
+                    .join(",");
+                insert_sql.push_str(&format!(
+                    " UNION ALL SELECT {pending},false FROM (SELECT {OBSERVED_COLUMNS} FROM {base_table_name} FINAL \
+                     WHERE (relative_path,version_id) IN (SELECT relative_path,version_id FROM {exclude_query_table})) AS f \
+                     WHERE NOT (f.is_dir AND f.marker_state IS NOT NULL AND (f.relative_path,f.version_id) IN \
+                     (SELECT relative_path,version_id FROM {temp_table_name} WHERE is_dir AND marker_state IS NULL))"
+                ));
+            }
             self.execute(&insert_sql, &[]).await?;
 
             // 4. 清理排除表

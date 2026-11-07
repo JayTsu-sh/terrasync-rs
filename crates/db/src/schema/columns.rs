@@ -31,6 +31,7 @@ macro_rules! file_scan_base_columns {
     ino Nullable(UInt64) DEFAULT NULL,
     file_handle Nullable(String) DEFAULT NULL,
     version_id String DEFAULT '',
+    source_version_id String DEFAULT '',
     tags Nullable(String) DEFAULT NULL,
     marker_state Nullable(String) DEFAULT NULL,
     metadata_digests Array(String) DEFAULT [],

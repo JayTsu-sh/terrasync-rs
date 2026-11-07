@@ -8,7 +8,7 @@ use data_mover::transfer::TransferPolicy;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 use task_model::observation::{EntryStatistics, ObservedItem};
-use task_model::{EntryChange, StorageEntryMessage};
+use task_model::{EntryChange, StorageEntryMessage, TargetRetention, TargetRetentionReason};
 use task_model::{ObservedEntryExt, TransferMode};
 use tokio_util::sync::CancellationToken;
 use tracing::error;
@@ -145,7 +145,26 @@ pub(crate) async fn copy_versions<I: Iterator<Item = ObservedItem> + Send>(
     let mut logical_bytes = 0_u64;
     let mut first_failure: Option<StorageError> = None;
     let mut data_failed = false;
-    for item in items.filter(|item| retain_version(item, keep_history)) {
+    for item in items {
+        if !retain_version(&item, keep_history) {
+            if item
+                .view()
+                .version()
+                .is_some_and(|version| version.is_latest() && version.is_delete_marker())
+            {
+                let path = item.view().source_path()?;
+                broadcaster
+                    .broadcast(StorageEntryMessage::TargetPreserved {
+                        retention: Box::new(TargetRetention::entry(
+                            &path,
+                            TargetRetentionReason::SourceDeletionUnconfirmed,
+                        )),
+                        reason: "源最新记录为删除标记；非版本化目标保留既有数据，未确认目标归属及完整历史缺失".into(),
+                    })
+                    .await?;
+            }
+            continue;
+        }
         if data_failed {
             broadcaster
                 .broadcast(StorageEntryMessage::CopyVersionFailed {

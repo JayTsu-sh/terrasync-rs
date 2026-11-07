@@ -116,6 +116,31 @@ silently inherit rows written before any accepted copy request. This runner skip
 the separate six-replica topology tests and does not certify history publication
 replay in app, which remains guarded.
 
+`python3 tests/lab/run-notification-archive-local.py --version-catalogue` adds an
+owned RustFS service to the isolated ClickHouse network. It executes fourteen actual
+migrations across Single and the two-replica Cluster: four distinct source versions
+to a latest-only and a history target, one new source version, then unchanged
+incremental runs and latest-only runs after source delete markers are added. It checks archived plans, selected bytes and logical inventory
+counts; latest-only base remains one slot with raw source version identity, while
+the history base grows from four to five versions. Independent S3 reads verify all
+payloads, chronological publication order, five retained source versions and no
+extra target versions on unchanged replay. Latest delete markers retain the
+existing latest-only target payload and report one structured preservation event
+per deployment through HTTP 204, without task errors; accepted details clear and
+final reports remain archived. `--copy-generations` separately tests
+same-size/same-mtime version changes, raw tag recovery, unacknowledged writes and
+source version reversal across three further uncommitted generations. Earlier
+confirmed physical rows are deliberately retained: unconfirmed tombstones must
+prevent their resurrection. This does not certify version-to-target metadata retry
+mapping, all multi-version incremental delivery/error counters, unknown publication
+recovery, permanent history purge, or throughput/RSS.
+
+`python3 tests/lab/run-notification-archive-local.py --scan-wire` runs three shared
+scan-storage regressions on the owned two-replica topology: schema availability,
+key staging with event replay, and native observation roundtrip/merge/deletions.
+It checks the shared row/schema change without claiming six-replica topology or
+whole-job fault/performance coverage.
+
 `python3 tests/lab/run-notification-archive-local.py --retention-events` checks the
 existing source-deleting migration's target-preservation branch against real Single and
 two-replica ClickHouse, real Local target contents, and an HTTP 204 callback. Twenty

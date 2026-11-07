@@ -48,7 +48,7 @@ pub(crate) fn directory_marker_state(entry: &ObservedEntry) -> Option<String> {
     Some(hash.finalize().to_hex().to_string())
 }
 
-pub(crate) const OBSERVED_COLUMNS: &str = "name,relative_path,size,ext,ctime,mtime,atime,mode,storage_type,is_symlink,is_dir,is_regular_file,hard_links,current_state,uid,gid,ino,file_handle,version_id,tags,marker_state,metadata_digests,identity_key,backend_kind,backend_id,entry_kind,size_observed,modified_unix_nanos,entry_snapshot,metadata_hash,history_segment,history_index,copy_execution_id,copy_sequence";
+pub(crate) const OBSERVED_COLUMNS: &str = "name,relative_path,size,ext,ctime,mtime,atime,mode,storage_type,is_symlink,is_dir,is_regular_file,hard_links,current_state,uid,gid,ino,file_handle,version_id,source_version_id,tags,marker_state,metadata_digests,identity_key,backend_kind,backend_id,entry_kind,size_observed,modified_unix_nanos,entry_snapshot,metadata_hash,history_segment,history_index,copy_execution_id,copy_sequence";
 
 /// 比较集合只传输主键和身份；完整观察在事件持久化后直接写入 base。
 #[derive(Serialize, clickhouse::Row)]
@@ -205,6 +205,7 @@ pub(crate) struct NativeScanRecord<'a> {
     pub ino: Option<u64>,
     pub file_handle: Option<String>,
     pub version_id: &'a str,
+    pub source_version_id: &'a str,
     pub tags: Option<String>,
     pub marker_state: Option<String>,
     pub metadata_digests: Vec<String>,
@@ -315,6 +316,7 @@ impl<'a> NativeScanRecord<'a> {
             ino: fields.ino,
             file_handle: fields.file_handle,
             version_id: fields.version_id,
+            source_version_id: fields.version_id,
             tags: fields.tags,
             marker_state: fields.marker_state,
             metadata_digests: fields.metadata_digests,

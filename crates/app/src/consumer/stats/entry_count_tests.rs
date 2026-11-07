@@ -4,14 +4,18 @@
 use std::sync::Arc;
 
 use data_mover::model::{BackendKind, EntryKind, HistoryOrder, ObjectHistory, ObservedEntry, StoragePath};
-use task_model::observation::ObservedItem;
+use task_model::observation::{EntryProgress, ObservedItem};
 use task_model::{SourcePresence, StorageEntryMessage, TargetRetention, TargetRetentionReason};
 
+use super::FileSizeRange;
+use super::IncrementalStats;
 use super::callback_state::CallbackState;
 use super::journal;
 use super::{FullStats, ProgressBar, ProgressDetail, StatisticConsumer, StatsKind};
 use crate::config::JobType;
+use crate::migration_fixtures::request;
 use crate::observed_fixtures::observation;
+use task_model::migration::{CopyGeneration, CopyGenerationPhase, CopyGenerationPlan};
 
 fn retention_consumer() -> StatisticConsumer {
     StatisticConsumer {
@@ -180,6 +184,110 @@ fn latest_only_selection_counts_one_entry_and_only_the_selected_payload() {
     stats.update_from_message(&completed);
     progress.update_statistics(&completed);
     check_count(&stats, &progress, 1, 20);
+}
+
+#[test]
+fn incremental_inventory_keeps_entry_counts_and_selected_bytes_across_history_segments() {
+    for history_target in [false, true] {
+        for cap in [1, 7, 20] {
+            let mut consumer = retention_consumer();
+            consumer.stats = StatsKind::Incremental(IncrementalStats::new(
+                JobType::IncrementalCopy,
+                "inventory".into(),
+                String::new(),
+                String::new(),
+            ));
+            consumer.progress_bar = ProgressBar::new(JobType::IncrementalCopy);
+            let mut request = request("inventory", true);
+            request.binding.target_history = history_target;
+            consumer.migration = Some(
+                CopyGeneration {
+                    sequence: 1,
+                    revision: 2,
+                    plan: CopyGenerationPlan::decide(&request, None, false).unwrap(),
+                    request,
+                    phase: CopyGenerationPhase::Prepared,
+                    baseline_prepared: true,
+                }
+                .report(),
+            );
+            for entry in history_entry().as_ref().clone().into_segments(cap) {
+                consumer.update_statistics(&StorageEntryMessage::Scanned(Arc::new(entry)));
+            }
+            let bytes = if history_target { 210 } else { 20 };
+            assert!(matches!(consumer.to_report(false).detail, ProgressDetail::Incremental {
+                scanned_files:1,scanned_size,error_count:0,..
+            } if scanned_size==bytes));
+            let StatsKind::Incremental(stats) = &consumer.stats else {
+                panic!("incremental inventory")
+            };
+            assert_eq!(stats.scanned.total_count(), 1);
+            assert_eq!(stats.scanned.total_size(), bytes as i64);
+            assert_eq!(
+                stats
+                    .scanned
+                    .time_range_stats
+                    .values()
+                    .map(|value| value.1)
+                    .sum::<usize>(),
+                1
+            );
+        }
+    }
+}
+
+#[test]
+fn history_inventory_size_buckets_keep_counts_and_bytes_in_the_selected_scope() {
+    let versions: Vec<_> = [("old", 8 * 1024 * 1024), ("latest", 1)]
+        .into_iter()
+        .map(|(id, size)| {
+            observation(
+                BackendKind::S3,
+                "payload".into(),
+                EntryKind::File,
+                size,
+                [0; 3],
+                None,
+                None,
+                None,
+                Some((Some(id.into()), id == "latest", false)),
+            )
+        })
+        .collect();
+    let records = versions
+        .iter()
+        .flat_map(|entry| entry.history().unwrap().records().iter().cloned())
+        .collect();
+    let whole = versions[1]
+        .clone()
+        .with_history(Some(Box::new(
+            ObjectHistory::whole(records, HistoryOrder::Server).unwrap(),
+        )))
+        .unwrap();
+    for latest_only in [false, true] {
+        let mut stats = FullStats::new(JobType::IncrementalCopy, "buckets".into(), String::new(), String::new());
+        for segment in whole.clone().into_segments(1) {
+            stats.update(&EntryProgress::copy_inventory(&segment, latest_only));
+        }
+        let bytes = if latest_only { 1 } else { 8 * 1024 * 1024 + 1 };
+        assert_eq!(stats.total_count(), 1);
+        assert_eq!(stats.total_size(), bytes);
+        let nonempty: Vec<_> = stats
+            .file_size_range_stats
+            .iter()
+            .filter(|(_, value)| value.0 != 0 || value.1 != 0)
+            .collect();
+        assert_eq!(nonempty.len(), 1);
+        assert_eq!(
+            *nonempty[0].0,
+            if latest_only {
+                FileSizeRange::LessThan4K
+            } else {
+                FileSizeRange::Between2MAnd16M
+            }
+        );
+        assert_eq!(*nonempty[0].1, (bytes, 1));
+    }
 }
 
 #[test]

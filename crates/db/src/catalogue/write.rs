@@ -88,7 +88,8 @@ impl ClickHouseDatabase {
     pub(super) async fn insert_views<'a>(
         &self, table_name: &str, views: Box<dyn Iterator<Item = ObservedView<'a>> + Send + 'a>, use_async_client: bool,
     ) -> Result<()> {
-        let mut views = views.peekable();
+        let versions = self.catalogue_versions().await;
+        let mut views = versions.select(views).peekable();
         if views.peek().is_none() {
             return Ok(());
         }
@@ -128,6 +129,7 @@ impl ClickHouseDatabase {
 
         for view in views {
             let mut record = NativeScanRecord::capture(view, current_state)?;
+            record.version_id = versions.key(view);
             record.copy_execution_id = &copy_execution_id;
             record.copy_sequence = copy_sequence;
             insert.write(&record).await.map_err(DatabaseError::from)?;

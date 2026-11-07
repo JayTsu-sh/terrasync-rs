@@ -1,8 +1,8 @@
 //! 扫描保留原生观察对象；逐版本视图只用于统计、比较和数据库行投影。
 use crate::{ChangeKind, ObservedEntryExt, Result};
 use data_mover_model::{
-    EntryKind, MetadataObservations, ObservedEntry, PrincipalIdentity, SourceIdentity, SourceVersion, StoragePath,
-    StorageTimestamp, VersionRecord,
+    EntryKind, MetadataObservations, ObjectHistory, ObservedEntry, PrincipalIdentity, SourceIdentity, SourceVersion,
+    StoragePath, StorageTimestamp, VersionRecord,
 };
 use std::{
     borrow::Cow,
@@ -12,6 +12,12 @@ use std::{
 
 /// 扫描和完成事件共用的统计事实；逐版本视图借用所选记录。
 pub trait EntryStatistics {
+    fn entry_count(&self) -> usize {
+        1
+    }
+    fn distribution_size(&self) -> u64 {
+        self.get_size()
+    }
     fn get_size(&self) -> u64;
     fn get_name(&self) -> &str;
     fn get_relative_path(&self) -> &Path;
@@ -26,9 +32,50 @@ pub trait EntryStatistics {
 pub struct EntryProgress<'a> {
     pub entry: &'a ObservedEntry,
     pub logical_bytes: u64,
+    pub count_entry: bool,
+    pub distribution_bytes: Option<u64>,
+}
+
+impl<'a> EntryProgress<'a> {
+    /// 完整枚举后计一个 entry；字节按段相加，不保留按总对象数增长的去重集合。
+    pub fn copy_inventory(entry: &'a ObservedEntry, latest_only: bool) -> Self {
+        let logical_bytes = entry.history().map_or_else(
+            || entry.size().unwrap_or_default(),
+            |history| {
+                history
+                    .records()
+                    .iter()
+                    .filter(|version| !latest_only || version.is_latest())
+                    .fold(0u64, |sum, version| {
+                        sum.saturating_add(version.size().unwrap_or_default())
+                    })
+            },
+        );
+        Self {
+            entry,
+            logical_bytes,
+            count_entry: entry.history().is_none_or(ObjectHistory::is_complete),
+            distribution_bytes: Some(entry.history().map_or_else(
+                || entry.size().unwrap_or_default(),
+                |history| {
+                    if latest_only {
+                        history.current().and_then(VersionRecord::size).unwrap_or_default()
+                    } else {
+                        history.largest_version().unwrap_or_default()
+                    }
+                },
+            )),
+        }
+    }
 }
 
 impl EntryStatistics for EntryProgress<'_> {
+    fn entry_count(&self) -> usize {
+        usize::from(self.count_entry)
+    }
+    fn distribution_size(&self) -> u64 {
+        self.distribution_bytes.unwrap_or(self.logical_bytes)
+    }
     fn get_size(&self) -> u64 {
         self.logical_bytes
     }

@@ -136,25 +136,18 @@ async fn failed_initial_clear_retains_accepted_policy_but_never_authorizes_copy(
 }
 
 #[tokio::test]
-async fn failed_retained_copy_rebases_only_older_confirmed_facts() -> Result<()> {
+async fn failed_retained_copy_rebases_without_removing_unconfirmed_tombstones() -> Result<()> {
     let mock = Mock::new();
     let database = database(&mock)?;
     let previous = prior("bound", true, CopyGenerationPhase::Failed, true);
     expect_previous(&mock, Some(&previous), 0);
     expect_accepted_and_initialized(&mock, 0, &previous.request.execution_id);
-    let retire = mock.add(handlers::record_ddl());
     let rebase = mock.add(handlers::record_ddl());
     mock.add(handlers::record_ddl());
     mock.add(handlers::record_ddl());
     assert_eq!(
         database.begin_copy_generation(&request("bound", true)).await?,
         CopyGenerationStatus::Recovering
-    );
-    assert!(
-        retire
-            .query()
-            .await
-            .contains("NOT copy_path_confirmed AND copy_sequence < 5")
     );
     assert!(rebase.query().await.contains("current_state!=0 AND copy_sequence < 5"));
     assert_eq!(

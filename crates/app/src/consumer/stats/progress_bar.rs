@@ -307,6 +307,8 @@ impl ProgressBar {
                         &EntryProgress {
                             entry,
                             logical_bytes: *logical_bytes,
+                            count_entry: true,
+                            distribution_bytes: None,
                         },
                     );
                 }
@@ -357,21 +359,26 @@ impl ProgressBar {
         match &self.counters {
             CounterSet::Full(c) if operation == "scanned" => {
                 if entry.get_is_dir() {
-                    c.total_dir_count.fetch_add(1, Ordering::Relaxed);
+                    c.total_dir_count
+                        .fetch_add(entry.entry_count() as u64, Ordering::Relaxed);
                 } else {
-                    c.total_file_count.fetch_add(1, Ordering::Relaxed);
+                    c.total_file_count
+                        .fetch_add(entry.entry_count() as u64, Ordering::Relaxed);
                 }
-                c.total_count.fetch_add(1, Ordering::Relaxed);
+                c.total_count.fetch_add(entry.entry_count() as u64, Ordering::Relaxed);
                 c.total_size.fetch_add(entry.get_size(), Ordering::Relaxed);
             }
             CounterSet::Incremental(c) => {
                 if operation == "scanned" {
                     if entry.get_is_dir() {
-                        c.scanned_dir_count.fetch_add(1, Ordering::Relaxed);
+                        c.scanned_dir_count
+                            .fetch_add(entry.entry_count() as u64, Ordering::Relaxed);
                     } else if entry.get_is_symlink() {
-                        c.scanned_symlink_count.fetch_add(1, Ordering::Relaxed);
+                        c.scanned_symlink_count
+                            .fetch_add(entry.entry_count() as u64, Ordering::Relaxed);
                     } else if entry.get_is_regular_file() {
-                        c.scanned_regular_file_count.fetch_add(1, Ordering::Relaxed);
+                        c.scanned_regular_file_count
+                            .fetch_add(entry.entry_count() as u64, Ordering::Relaxed);
                     }
                     c.scanned_size.fetch_add(entry.get_size(), Ordering::Relaxed);
                 } else {
@@ -381,7 +388,7 @@ impl ProgressBar {
                         "rename" => (&c.renamed_count, &c.renamed_size),
                         _ => (&c.changed_count, &c.changed_size),
                     };
-                    count.fetch_add(1, Ordering::Relaxed);
+                    count.fetch_add(entry.entry_count() as u64, Ordering::Relaxed);
                     size.fetch_add(entry.get_size(), Ordering::Relaxed);
                 }
             }

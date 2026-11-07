@@ -675,14 +675,19 @@ async fn copy_comparison_binds_new_and_changed_versions_in_source_order() -> Res
     };
     let database = ClickHouseDatabase::new(&fixture.config, "mixed_history")?;
     database.initialize().await?;
-    database.begin_copy_generation(&request("mixed-history", true)).await?;
+    let descriptor = || {
+        let mut request = request("mixed-history", true);
+        request.binding.target_history = true;
+        request
+    };
+    database.begin_copy_generation(&descriptor()).await?;
     database
         .batch_insert_base_record(&[Arc::new(observe(None, 10, true))])
         .await?;
     database.commit_scan_generation().await?;
     database.finish_copy_generation(CopyGenerationPhase::Completed).await?;
     let database = database.new_execution_scope();
-    database.begin_copy_generation(&request("mixed-history", true)).await?;
+    database.begin_copy_generation(&descriptor()).await?;
     // suspended bucket 的 null 被覆盖，随后恢复版本化并写入新版本。
     let null = observe(None, 20, false);
     let latest = observe(Some("a-new"), 30, true);
