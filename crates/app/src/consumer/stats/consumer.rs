@@ -306,7 +306,8 @@ impl StatisticConsumer {
         {
             Ok(response) => response,
             Err(error) => {
-                warn!(%error, "Progress callback failed; batch retained");
+                let error = error.without_url();
+                warn!(job_id = %report.job_id, %error, "Progress callback failed; batch retained");
                 return false;
             }
         };
@@ -314,7 +315,7 @@ impl StatisticConsumer {
         let ack = match response.json::<CallbackAck>().await {
             Ok(ack) if ack.batch_id.as_deref() == Some(batch.batch_id.as_str()) => ack,
             _ => {
-                warn!("Progress callback did not acknowledge the diagnostic batch");
+                warn!(job_id = %report.job_id, "Progress callback did not acknowledge the diagnostic batch");
                 return false;
             }
         };
@@ -361,14 +362,12 @@ impl StatisticConsumer {
     /// 仅在配置了 `callback_url` 时启动。
     /// 返回 ([`JoinHandle`], Client) 供调用方在消息循环结束后 abort 并复用 client；无 URL 返回 None。
     pub async fn start_callback_loop(consumer: Arc<Mutex<Self>>) -> Option<CallbackGuard> {
-        let url = {
+        let (url, job_id) = {
             let c = consumer.lock().await;
-            c.callback_url.clone()
+            (c.callback_url.clone()?, c.stats.job_id().to_owned())
         };
-
-        let url = url?;
         let client = Self::build_callback_client(&url)?;
-        info!("[ProgressCallback] Starting callback loop → {url}");
+        info!(%job_id, "[ProgressCallback] Starting callback loop");
         let sc = consumer.clone();
         let loop_client = client.clone();
 

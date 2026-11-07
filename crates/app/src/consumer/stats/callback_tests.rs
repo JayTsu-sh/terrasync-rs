@@ -5,16 +5,57 @@ use crate::{
     config::JobType,
     consumer::stats::{FullStats, ProgressBar},
 };
+use std::fmt;
+use std::sync::Mutex as StdMutex;
 use task_model::ErrorEvent;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpListener,
 };
+use tracing::instrument::WithSubscriber;
+use tracing::{
+    Event, Metadata, Subscriber,
+    field::{Field, Visit},
+    span::{Attributes, Id, Record},
+};
+
+#[derive(Clone)]
+struct CallbackLogs(Arc<StdMutex<Vec<String>>>);
+
+struct LogFields(String);
+impl Visit for LogFields {
+    fn record_debug(&mut self, field: &Field, value: &dyn fmt::Debug) {
+        self.0.push_str(&format!("{field}={value:?} "));
+    }
+}
+
+impl Subscriber for CallbackLogs {
+    fn enabled(&self, metadata: &Metadata<'_>) -> bool {
+        metadata.target().starts_with("app::consumer::stats")
+    }
+    fn new_span(&self, _: &Attributes<'_>) -> Id {
+        Id::from_u64(1)
+    }
+    fn record(&self, _: &Id, _: &Record<'_>) {}
+    fn record_follows_from(&self, _: &Id, _: &Id) {}
+    fn event(&self, event: &Event<'_>) {
+        if self.enabled(event.metadata()) {
+            let mut fields = LogFields(String::new());
+            event.record(&mut fields);
+            self.0.lock().unwrap().push(fields.0);
+        }
+    }
+    fn enter(&self, _: &Id) {}
+    fn exit(&self, _: &Id) {}
+}
 
 #[tokio::test]
 async fn failed_http_retries_same_batch_and_ack_preserves_new_errors() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let url = format!("http://{}/progress", listener.local_addr().unwrap());
+    let url = format!(
+        "http://callback-user-canary:callback-password-canary@{}/progress?token=callback-query-canary",
+        listener.local_addr().unwrap()
+    );
     let server = tokio::spawn(async move {
         let mut batches = Vec::new();
         for index in 0..3 {
@@ -87,7 +128,21 @@ async fn failed_http_retries_same_batch_and_ack_preserves_new_errors() {
     };
     consumer.lock().await.update_statistics(&error("first"));
     let client = StatisticConsumer::build_callback_client(&url).unwrap();
-    assert!(!StatisticConsumer::post_callback(&consumer, &client, &url, false).await);
+    let logs = Arc::new(StdMutex::new(Vec::new()));
+    assert!(
+        !StatisticConsumer::post_callback(&consumer, &client, &url, false)
+            .with_subscriber(CallbackLogs(Arc::clone(&logs)))
+            .await
+    );
+    let output = logs.lock().unwrap().join("\n");
+    assert!(output.contains("500 Internal Server Error"), "{output}");
+    for secret in [
+        "callback-user-canary",
+        "callback-password-canary",
+        "callback-query-canary",
+    ] {
+        assert!(!output.contains(secret), "callback logs exposed {secret}");
+    }
     consumer.lock().await.update_statistics(&error("second"));
     assert!(StatisticConsumer::post_callback(&consumer, &client, &url, false).await);
     {
