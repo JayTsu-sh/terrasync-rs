@@ -140,8 +140,8 @@ pub(crate) async fn run(
             )
             .await?,
         );
-        let match_expr = config.r#match.as_deref().and_then(|e| parse_filter_expression(e).ok());
-        let exclude_expr = config.exclude.as_deref().and_then(|e| parse_filter_expression(e).ok());
+        let match_expr = config.r#match.as_deref().map(parse_filter_expression).transpose()?;
+        let exclude_expr = config.exclude.as_deref().map(parse_filter_expression).transpose()?;
         let walkdir_iter = directory_pages(
             &src_storage,
             WalkOptions {

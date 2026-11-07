@@ -153,8 +153,8 @@ pub fn initialize_scan_config(
         concurrency,
         r#match: r#match.clone().unwrap_or_default(),
         exclude: exclude.clone().unwrap_or_default(),
-        match_expressions: r#match.as_deref().and_then(|expr| parse_filter_expression(expr).ok()),
-        exclude_expressions: exclude.as_deref().and_then(|expr| parse_filter_expression(expr).ok()),
+        match_expressions: r#match.as_deref().map(parse_filter_expression).transpose()?,
+        exclude_expressions: exclude.as_deref().map(parse_filter_expression).transpose()?,
         include_tags,
         observation_plan: None,
         metadata_scope: MetadataScope::default(),
@@ -192,6 +192,65 @@ pub fn initialize_consumer_config(
 #[cfg(test)]
 mod redaction_tests {
     use super::*;
+    use crate::error::AppError;
+    use std::mem::discriminant;
+
+    #[test]
+    fn invalid_filters_return_the_typed_error_instead_of_admitting_every_entry() {
+        for (expression, is_exclude) in [("invalid_field == 1", false), ("size > invalid", true)] {
+            let expected = match parse_filter_expression(expression) {
+                Err(error) => error,
+                Ok(_) => panic!("fixture must be rejected by the native parser"),
+            };
+            let (include, exclude) = if is_exclude {
+                (None, Some(expression.into()))
+            } else {
+                (Some(expression.into()), None)
+            };
+            let result = initialize_scan_config(
+                "invalid-filter",
+                "unused",
+                0,
+                ScanType::Full,
+                &include,
+                &exclude,
+                1,
+                false,
+                &None,
+                false,
+                0,
+            );
+            match result {
+                Err(AppError::ScanFilter(actual)) => {
+                    assert_eq!(discriminant(&actual), discriminant(&expected));
+                    assert_eq!(actual.to_string(), expected.to_string());
+                }
+                other => panic!("invalid filter must fail closed: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn absent_and_valid_filters_keep_their_distinct_selection() -> Result<()> {
+        for include in [None, Some("modified < 7d".into())] {
+            let config = initialize_scan_config(
+                "valid-filter",
+                "unused",
+                0,
+                ScanType::Full,
+                &include,
+                &None,
+                1,
+                false,
+                &None,
+                false,
+                0,
+            )?;
+            assert_eq!(config.match_expressions.is_some(), include.is_some());
+            assert!(config.exclude_expressions.is_none());
+        }
+        Ok(())
+    }
 
     #[test]
     fn command_line_redacts_storage_credentials_and_preserves_other_arguments() {
