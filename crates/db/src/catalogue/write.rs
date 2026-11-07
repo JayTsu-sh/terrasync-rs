@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use data_mover::model::ObservedEntry;
 use serde_json::Value;
-use task_model::observation::{ObservedItem, ObservedView, ObservedViews};
+use task_model::observation::ObservedItem;
 use task_model::{CopyCompletion, CopyReadiness, StorageEntryMessage};
 use tracing::trace;
 use tracing::{debug, info};
@@ -19,10 +19,6 @@ use crate::get_scan_base_table_name;
 use crate::get_tar_manifest_table_name;
 use crate::scan::rows::NativeScanRecord;
 use crate::schema::records::{IncrementalStorageEntryRecord, TarManifestRecord};
-
-fn observation_views(entry: &Arc<ObservedEntry>) -> ObservedViews<'_> {
-    ObservedView::all(entry)
-}
 
 impl ClickHouseDatabase {
     /// 执行SQL语句，支持参数化查询
@@ -78,18 +74,7 @@ impl ClickHouseDatabase {
     pub(super) async fn batch_insert(
         &self, table_name: &str, records: &[Arc<ObservedEntry>], use_async_client: bool,
     ) -> Result<()> {
-        self.insert_views(
-            table_name,
-            Box::new(records.iter().flat_map(observation_views)),
-            use_async_client,
-        )
-        .await
-    }
-
-    pub(super) async fn insert_views<'a>(
-        &self, table_name: &str, views: Box<dyn Iterator<Item = ObservedView<'a>> + Send + 'a>, use_async_client: bool,
-    ) -> Result<()> {
-        self.insert_copy_views(table_name, CatalogueInputs::Observed(views), use_async_client)
+        self.insert_copy_views(table_name, CatalogueInputs::Observed(records), use_async_client)
             .await
     }
 
@@ -216,13 +201,13 @@ impl ClickHouseDatabase {
 
     pub async fn batch_insert_completed_records(&self, records: &[ObservedItem]) -> Result<()> {
         let table = get_scan_base_table_name(&self.job_id);
-        self.insert_views(&table, Box::new(records.iter().map(ObservedItem::view)), true)
+        self.insert_copy_views(&table, CatalogueInputs::Selected(records), true)
             .await
     }
 
     pub async fn batch_insert_copy_completions(&self, records: &[CopyCompletion]) -> Result<()> {
         let table = get_scan_base_table_name(&self.job_id);
-        self.insert_copy_views(&table, CatalogueInputs::Copied(records.iter()), true)
+        self.insert_copy_views(&table, CatalogueInputs::Copied(records), true)
             .await
     }
 

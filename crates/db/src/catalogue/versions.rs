@@ -1,9 +1,9 @@
 //! 事实键对应目标的版本槽；源版本原值仍保存在标量列和原生 snapshot。
-use std::slice;
+use std::sync::Arc;
 
-use data_mover::model::VersionRecord;
+use data_mover::model::{ObservedEntry, VersionRecord};
 use task_model::CopyCompletion;
-use task_model::observation::ObservedView;
+use task_model::observation::{ObservedItem, ObservedView, ObservedViews};
 
 use super::ClickHouseDatabase;
 
@@ -26,18 +26,27 @@ impl CatalogueVersions {
     }
 }
 
+#[derive(Clone, Copy)]
 pub(super) enum CatalogueInputs<'a> {
-    Observed(Box<dyn Iterator<Item = ObservedView<'a>> + Send + 'a>),
-    Copied(slice::Iter<'a, CopyCompletion>),
+    Observed(&'a [Arc<ObservedEntry>]),
+    Selected(&'a [ObservedItem]),
+    Copied(&'a [CopyCompletion]),
 }
 
 pub(super) struct CatalogueViews<'a> {
     inputs: CatalogueInputs<'a>,
     versions: CatalogueVersions,
+    position: usize,
+    current: Option<ObservedViews<'a>>,
 }
 impl<'a> CatalogueViews<'a> {
     pub(super) fn new(inputs: CatalogueInputs<'a>, versions: CatalogueVersions) -> Self {
-        Self { inputs, versions }
+        Self {
+            inputs,
+            versions,
+            position: 0,
+            current: None,
+        }
     }
 }
 impl<'a> Iterator for CatalogueViews<'a> {
@@ -45,9 +54,22 @@ impl<'a> Iterator for CatalogueViews<'a> {
     fn next(&mut self) -> Option<Self::Item> {
         loop {
             let item = match &mut self.inputs {
-                CatalogueInputs::Observed(views) => (views.next()?, None),
+                CatalogueInputs::Observed(records) => loop {
+                    if let Some(view) = self.current.as_mut().and_then(Iterator::next) {
+                        break (view, None);
+                    }
+                    let entry = records.get(self.position)?;
+                    self.position += 1;
+                    self.current = Some(ObservedView::all(entry));
+                },
+                CatalogueInputs::Selected(records) => {
+                    let item = records.get(self.position)?;
+                    self.position += 1;
+                    (item.view(), None)
+                }
                 CatalogueInputs::Copied(records) => {
-                    let completion = records.next()?;
+                    let completion = records.get(self.position)?;
+                    self.position += 1;
                     (completion.item.view(), Some(completion))
                 }
             };
