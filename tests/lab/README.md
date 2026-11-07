@@ -120,7 +120,22 @@ ClickHouse, redact storage credentials and a whitespace-containing auth token,
 and create no copy base. The process-level wrong-token QUIC case additionally
 requires a final task-error count and no plaintext token in stdout/stderr. This is
 preflight and notification evidence; it does not certify remote source deletion,
-the complete generation descriptor/selection plan, or Local preflight coverage.
+the complete generation descriptor/selection plan, or the whole-job recovery budget.
+The same suite now checks Local packaged-mode rejection, invalid filters, missing
+file lists and changed bindings before consumer startup. Rejections retain source
+bytes; changed bindings also retain the original target and base. Invalid database
+configuration still reaches the callback through the notification-only fallback,
+returns the original typed error and starts no copy; that invalid database cannot
+archive its report. A controlled proxy additionally disconnects/stalls startup
+ClickHouse probes, then restores access when notification archival begins. Both
+Single and Cluster report one task error, receive HTTP 204, preserve source bytes
+and archive the final report. Observed total times including final notification
+were 83/310 ms for disconnect and 1089/1306 ms for stall with one-second read
+budgets; these are startup cases, not whole-job recovery/cancellation evidence.
+There are 18 independently inspected rejected requests across both deployments,
+including 14 Local requests. Successful Local full and subsequent incremental
+runs verify actual target bytes, distinct execution identities, correct full/delta
+report kinds, and two archived final reports per deployment without a callback.
 
 `python3 tests/lab/run-notification-archive-local.py --source-absence` exercises
 incremental target reconciliation against owned Single and two-replica ClickHouse

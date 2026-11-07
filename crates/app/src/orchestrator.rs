@@ -278,6 +278,37 @@ impl SyncOrchestrator {
     }
 
     async fn run_local(&self) -> Result<()> {
+        let app_config = AppConfig::fetch()?;
+        let c = &self.config;
+        let mut notifications = initialize_consumer_config(
+            &c.job_id,
+            &c.job_dir,
+            JobType::Copy,
+            c.raw_command_line.clone(),
+            &app_config,
+            c.progress_callback_url.clone(),
+        )?;
+        // 此时尚未连接存储或改变基线；准入失败也使用同一最终报告通道。
+        let (mut consumers, initialization_error) = match ConsumerManager::statistics_only(&notifications) {
+            Ok(consumers) => (consumers, None),
+            Err(error) => {
+                // 数据库配置无效时仍通知外部；原错误返回，不把无数据库当成迁移降级。
+                notifications.db_config.enabled = false;
+                (ConsumerManager::statistics_only(&notifications)?, Some(error))
+            }
+        };
+        let result = match initialization_error {
+            Some(error) => Err(error),
+            None => self.run_local_prepared(&app_config, &mut consumers).await,
+        };
+        if let Err(error) = &result {
+            consumers.record_task_error(error).await;
+        }
+        consumers.end_lifecycle().await;
+        result
+    }
+
+    async fn run_local_prepared(&self, app_config: &AppConfig, consumers: &mut ConsumerManager) -> Result<()> {
         let c = &self.config;
         info!(transfer_mode = ?c.transfer_mode, "Sync transfer mode selected");
         if c.packaged && c.transfer_mode != TransferMode::Atomic {
@@ -297,7 +328,6 @@ impl SyncOrchestrator {
             Some(plan)
         };
 
-        let app_config = AppConfig::fetch()?;
         // 模式选择与代次准备共用独占权，避免读取旧策略后被另一执行切换代次。
         let _lease = CopyLease::acquire(&app_config.database.clickhouse, c)?;
         if !c.source_cleanup.retains_source() && !app_config.database.enabled {
@@ -326,13 +356,23 @@ impl SyncOrchestrator {
 
         match scan_type {
             // 任务边界隔离管线状态机的布局，避免继续嵌套到 CLI／Web 入口。
-            ScanType::Full => self.run_sync(observation_plan).boxed_local().await,
-            ScanType::Incremental => self.run_incremental_sync(observation_plan).boxed_local().await,
+            ScanType::Full => {
+                self.run_sync(observation_plan, app_config, consumers)
+                    .boxed_local()
+                    .await
+            }
+            ScanType::Incremental => {
+                self.run_incremental_sync(observation_plan, app_config, consumers)
+                    .boxed_local()
+                    .await
+            }
         }
     }
 
     /// 全量同步 — 通过 transport 连接 sender workers 和 receiver tasks
-    async fn run_sync(&self, observation_plan: Option<MigrationPlan>) -> Result<()> {
+    async fn run_sync(
+        &self, observation_plan: Option<MigrationPlan>, app_config: &AppConfig, consumer_manager: &mut ConsumerManager,
+    ) -> Result<()> {
         let c = &self.config;
 
         // ── License 校验 ──
@@ -352,7 +392,6 @@ impl SyncOrchestrator {
         );
 
         // ── 1. 加载配置 ──
-        let app_config = AppConfig::fetch()?;
         let is_source_reserved = c.source_cleanup.retains_source();
         let copy_concurrency = c.concurrency.unwrap_or(app_config.sync.concurrency);
 
@@ -386,7 +425,7 @@ impl SyncOrchestrator {
             &c.job_dir,
             JobType::Copy,
             c.raw_command_line.clone(),
-            &app_config,
+            app_config,
             c.progress_callback_url.clone(),
         )?);
 
@@ -405,7 +444,9 @@ impl SyncOrchestrator {
 
         // ── 4. 广播器 + 消费者 ──
         let mut broadcaster = BroadcastForwarder::new(DEFAULT_CHANNEL_CAPACITY);
-        let mut consumer_manager = ConsumerManager::with_database(consumer_config.as_ref(), database.clone()).await?;
+        consumer_manager
+            .prepare_copy_consumers(consumer_config.as_ref(), database.clone())
+            .await?;
         consumer_manager.begin_lifecycle().await;
         let consumer_handles = consumer_manager.start_consumers(&mut broadcaster).await?;
         let bytes_tracker = consumer_manager.get_bytes_tracker().await;
@@ -731,10 +772,6 @@ impl SyncOrchestrator {
             Ok(())
         }
         .await;
-        if let Err(error) = &result {
-            consumer_manager.record_task_error(&error).await;
-        }
-        consumer_manager.end_lifecycle().await;
         result?;
 
         info!("Copy job {} completed successfully via orchestrator", c.job_id);
@@ -746,7 +783,9 @@ impl SyncOrchestrator {
     /// - Barrier：`drop(broadcaster_a)` + `await phase_a_handles`（base 表冲刷完毕）
     /// - Phase B：`detect_deleted_items` → 执行 dest 物理删除/重命名 → 通过 `broadcaster_b`
     ///   喂给同一组 consumers（`DatabaseConsumer` 自动完成 incremental 表写入 + base 表修正）
-    async fn run_incremental_sync(&self, observation_plan: Option<MigrationPlan>) -> Result<()> {
+    async fn run_incremental_sync(
+        &self, observation_plan: Option<MigrationPlan>, app_config: &AppConfig, consumer_manager: &mut ConsumerManager,
+    ) -> Result<()> {
         let c = &self.config;
 
         // ── License 校验 ──
@@ -766,7 +805,6 @@ impl SyncOrchestrator {
         );
 
         // ── 1. 加载配置 ──
-        let app_config = AppConfig::fetch()?;
         let is_source_reserved = c.source_cleanup.retains_source();
         let copy_concurrency = c.concurrency.unwrap_or(app_config.sync.concurrency);
 
@@ -800,7 +838,7 @@ impl SyncOrchestrator {
             &c.job_dir,
             JobType::IncrementalCopy,
             c.raw_command_line.clone(),
-            &app_config,
+            app_config,
             c.progress_callback_url.clone(),
         )?);
 
@@ -819,8 +857,9 @@ impl SyncOrchestrator {
         let walkdir_iter = dir_walker::walkdir(scan_config).await?;
 
         // ── 4. 消费者管理器 + 共享生命周期（跨 Phase A/B 共用同一份统计累积） ──
-        let mut consumer_manager =
-            ConsumerManager::with_database(consumer_config.as_ref(), Some(database.clone())).await?;
+        consumer_manager
+            .prepare_copy_consumers(consumer_config.as_ref(), Some(database.clone()))
+            .await?;
         consumer_manager.begin_lifecycle().await;
         let bytes_tracker = consumer_manager.get_bytes_tracker().await;
 
@@ -1258,8 +1297,6 @@ impl SyncOrchestrator {
             if let Some(ref qos_mgr) = qos_manager {
                 qos_mgr.shutdown();
             }
-            consumer_manager.record_task_error(&error).await;
-            consumer_manager.end_lifecycle().await;
             return Err(error);
         }
         info!("Phase A complete; base table ready for delete/rename detection");
@@ -1336,10 +1373,6 @@ impl SyncOrchestrator {
             Ok(())
         }
         .await;
-        if let Err(error) = &result {
-            consumer_manager.record_task_error(&error).await;
-        }
-        consumer_manager.end_lifecycle().await;
         result?;
 
         info!(

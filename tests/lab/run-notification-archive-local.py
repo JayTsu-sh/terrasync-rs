@@ -97,7 +97,7 @@ def run_copy_generations():
 
         def do_GET(self):
             nonlocal state
-            if self.path not in ("/normal", "/disconnect", "/stall"):
+            if self.path not in ("/normal", "/disconnect", "/stall", "/startup_disconnect", "/startup_stall"):
                 self.send_error(404)
                 return
             with guard:
@@ -107,6 +107,7 @@ def run_copy_generations():
             self.end_headers()
 
         def do_POST(self):
+            nonlocal state
             if self.headers.get("Transfer-Encoding", "").lower() == "chunked":
                 chunks = []
                 while True:
@@ -122,6 +123,12 @@ def run_copy_generations():
                 body = self.rfile.read(int(self.headers.get("Content-Length", "0")))
             with guard:
                 fault = state
+                # 启动探测持续失败；进入通知归档后恢复数据库，单独验证最终通知链路。
+                if fault.startswith("startup_"):
+                    if "notifications_" in urllib.parse.unquote(self.path) or b"notifications_" in body:
+                        state = fault = "normal"
+                    else:
+                        fault = fault.removeprefix("startup_")
             if fault == "disconnect":
                 self.close_connection = True
                 return
@@ -221,16 +228,18 @@ def run_request_policy(environment):
         ], cwd=ROOT, env=environment, check=True)
         final = [report for report in reports if report["is_final"]]
         summaries = [report for report in final if not report.get("diagnostics")]
-        assert len(summaries) == 4, reports
+        assert len(summaries) == 18, reports
         assert all(report["task_error_count"] == 1 and report["diagnostics_complete"] for report in summaries), summaries
-        assert all(report["detail"]["new_count"] == 0 for report in final), final
+        assert all(report["detail"].get("new_count", 0) == 0 for report in final), final
         events = [event for report in reports for event in (report.get("diagnostics") or {}).get("events", [])]
-        assert len(events) == 4, events
+        assert len(events) == 18, events
         assert sum("双进程模式尚未提供" in event["message"] for event in events) == 2, events
         assert sum("Invalid remote address" in event["message"] for event in events) == 2, events
+        local = [report for report in summaries if report["job_id"].startswith("local_preflight_")]
+        assert len(local) == 14, local
         serialized = json.dumps(reports)
         assert "policy-secret" not in serialized and "policy-access" not in serialized and "policy auth secret" not in serialized, serialized
-        print("independent request-policy HTTP inspection deployments=2 rejections=4 task_errors_each=1 HTTP_204=accepted credentials=redacted", flush=True)
+        print("independent request-policy HTTP inspection deployments=2 rejections=18 local_preflight=14 task_errors_each=1 HTTP_204=accepted credentials=redacted", flush=True)
     finally:
         callback.shutdown()
         callback.server_close()

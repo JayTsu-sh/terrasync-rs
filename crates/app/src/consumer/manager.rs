@@ -52,6 +52,7 @@ pub struct ConsumerManager {
     /// `begin_lifecycle()` 启动的周期 HTTP 回调守卫，在 `end_lifecycle()` 中 abort + 复用 client
     callback_guard: Option<CallbackGuard>,
     notification_database: Option<ClickHouseDatabase>,
+    copy_pipeline_prepared: bool,
 }
 
 /// 扫描工作任务共享统计状态，不持有生命周期守卫或其他消费者。
@@ -467,12 +468,18 @@ impl ConsumerManager {
         Ok(Self::with_database_consumer(consumer_config, None, database))
     }
 
-    /// A copy pipeline explicitly shares the catalogue that began its generation.
-    pub(crate) async fn with_database(
-        consumer_config: &ConsumerConfig, database: Option<ClickHouseDatabase>,
-    ) -> Result<Self> {
-        let consumer = match (consumer_config.db_config.enabled, database) {
-            (true, Some(database)) => Some(DatabaseConsumer::with_database(consumer_config, database).await?),
+    /// 复制准入完成后挂接事实消费者；准入前创建的通知状态继续使用同一身份。
+    pub(crate) async fn prepare_copy_consumers(
+        &mut self, config: &ConsumerConfig, database: Option<ClickHouseDatabase>,
+    ) -> Result<()> {
+        if self.copy_pipeline_prepared || self.callback_guard.is_some() || !self.consumers.is_empty() {
+            return Err(AppError::ConfigError("复制消费者只能在生命周期开始前准备一次".into()));
+        }
+        if !matches!(config.job_type, JobType::Copy | JobType::IncrementalCopy) {
+            return Err(AppError::ConfigError("复制消费者需要复制任务类型".into()));
+        }
+        let consumer = match (config.db_config.enabled, database) {
+            (true, Some(database)) => Some(DatabaseConsumer::with_database(config, database).await?),
             (false, None) => None,
             _ => {
                 return Err(AppError::ConfigError(
@@ -480,7 +487,31 @@ impl ConsumerManager {
                 ));
             }
         };
-        Ok(Self::with_database_consumer(consumer_config, consumer, None))
+        if let Some(state) = &self.stats_consumer {
+            let mut state = state.lock().await;
+            let command = config.console_config.raw_command_line.clone();
+            let log_path = match &state.stats {
+                StatsKind::Full(summary) => summary.log_path.clone(),
+                StatsKind::Incremental(summary) => summary.log_path.clone(),
+            };
+            state.stats = match config.job_type {
+                JobType::Copy => {
+                    StatsKind::Full(FullStats::new(JobType::Copy, config.job_id.clone(), command, log_path))
+                }
+                _ => StatsKind::Incremental(IncrementalStats::new(
+                    JobType::IncrementalCopy,
+                    config.job_id.clone(),
+                    command,
+                    log_path,
+                )),
+            };
+            state.progress_bar = ProgressBar::new(config.job_type.clone());
+        }
+        if let Some(consumer) = consumer {
+            self.add_consumer(Box::new(consumer));
+        }
+        self.copy_pipeline_prepared = true;
+        Ok(())
     }
 
     fn with_database_consumer(
@@ -496,6 +527,7 @@ impl ConsumerManager {
             stats_consumer: None,
             callback_guard: None,
             notification_database,
+            copy_pipeline_prepared: false,
         };
         if let Some(consumer) = consumer {
             manager.add_consumer(Box::new(consumer));
@@ -709,6 +741,7 @@ mod resume_tests {
             stats_consumer: Some(Arc::new(Mutex::new(stats))),
             callback_guard: None,
             notification_database: None,
+            copy_pipeline_prepared: false,
         };
         let source = AppError::CopyError("version v2 upload refused".into());
         let failure = AppError::ReportedCopyFailure {
@@ -771,6 +804,7 @@ mod resume_tests {
             stats_consumer: Some(Arc::new(Mutex::new(stats))),
             callback_guard: None,
             notification_database: None,
+            copy_pipeline_prepared: false,
         };
         let special: StorageEntryRecord = serde_json::from_value(serde_json::json!({
             "name":"fifo", "relative_path":"fifo", "size":0, "ext":null, "ctime":0, "mtime":0, "atime":0,
@@ -911,6 +945,7 @@ mod resume_tests {
             stats_consumer: Some(Arc::new(Mutex::new(stats))),
             callback_guard: None,
             notification_database: None,
+            copy_pipeline_prepared: false,
         };
         let json = manager.statistics_checkpoint().await?;
         assert!(
