@@ -33,7 +33,11 @@ pub const SCAN_STATE_TABLE_BASE_NAME: &str = "state";
 pub const TAR_MANIFEST_TABLE_BASE_NAME: &str = "tar_manifest";
 
 // 类型重导出，方便外部使用
-pub use catalogue::{ClickHouseDatabase, CopyGenerationStatus, DeletionStatus};
+pub use catalogue::{
+    ClickHouseDatabase, CopyGenerationStatus, DeletionStatus, MAX_NOTIFICATION_BATCH_BYTES,
+    MAX_NOTIFICATION_BATCH_RECORDS, MAX_NOTIFICATION_RECORD_BYTES, NotificationCursor, NotificationKind,
+    NotificationRecord,
+};
 pub use config::ClickHouseConfig; // 配置相关类型
 pub use error::{DatabaseError, Result}; // 错误处理相关类型
 

@@ -28,6 +28,15 @@ pub(crate) struct ScanCancellationDeadline;
 /// 使用thiserror库实现错误处理和转换
 #[derive(Error, Debug)]
 pub enum DatabaseError {
+    #[error("Invalid notification archive field: {field}")]
+    NotificationRecordInvalid { field: &'static str },
+    #[error("Invalid notification JSON payload: {source}")]
+    NotificationPayloadJson {
+        #[source]
+        source: serde_json::Error,
+    },
+    #[error("Notification archive batch exceeds bounds: records={records}, payload_bytes={bytes}")]
+    NotificationBatchTooLarge { records: usize, bytes: usize },
     #[error("ClickHouse probe could not reach all nodes required by scan snapshot publication")]
     ClusterProbeIncomplete,
     #[error("ClickHouse connectivity monitor ended unexpectedly")]

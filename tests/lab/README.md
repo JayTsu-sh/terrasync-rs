@@ -55,6 +55,22 @@ callback must receive and acknowledge all 20 version-specific reasons. Denied so
 also check that later versions and history segments stop publishing, with failure counts following
 the delivered entry boundaries. Its container and volumes are removed on exit. This check does
 not cover ClickHouse acknowledgement, callback outages, or the shared network recovery window.
+
+`python3 tests/lab/run-notification-archive-local.py` validates the database notification archive
+in isolated ClickHouse single-server and one-shard/two-replica deployments, with an embedded Keeper.
+It requires `docker`, `nsenter`, cached Rust dependencies, and
+`clickhouse/clickhouse-server:26.3-alpine` (`NOTIFICATION_CLICKHOUSE_IMAGE` overrides the image).
+The repository uses the `deduplicate_insert` setting introduced in
+[ClickHouse 26.2](https://github.com/ClickHouse/ClickHouse/blob/master/docs/changelogs/v26.2.1.1139-stable.md),
+so older test images cannot execute the current database client settings.
+The runner checks 1024 archived errors, reopen/replay, late inserts after ACK, discovery of a late
+event behind a pagination cursor, exact final-failure
+payloads, and byte-bounded reads of 800 KB payloads. Its proxy injects disconnects, lost write/ACK
+responses, and silent response stalls; a real readonly setting checks confirmed refusals separately.
+Only its own databases, containers, volumes, and configuration directory are removed on exit.
+This validates the database primitive. Connecting it to the app callback outbox, end-to-end task
+cancellation, full-migration fault handling, and final-notification delivery remain separate gates.
+
 NFS fixtures use UID/GID 1000 to match the non-root GitHub runner, allowing
 metadata preservation to be verified without privileged local writes.
 

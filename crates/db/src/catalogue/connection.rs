@@ -4,6 +4,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
 
 use clickhouse::Client;
+use tokio::sync::OnceCell;
 use tracing::debug;
 
 use super::{CatalogueLifecycle, ClickHouseDatabase, ClusterCatalogue};
@@ -50,6 +51,7 @@ impl ClickHouseDatabase {
             cached_scan_state: AtomicU8::new(255),
             resume_base_has_typed_handles: None,
             generation_lifecycle: Arc::new(CatalogueLifecycle::default()),
+            notifications_initialized: Arc::new(OnceCell::new()),
         })
     }
 }
@@ -65,6 +67,7 @@ impl Clone for ClickHouseDatabase {
             cached_scan_state: AtomicU8::new(self.cached_scan_state.load(Ordering::Relaxed)),
             resume_base_has_typed_handles: self.resume_base_has_typed_handles,
             generation_lifecycle: Arc::clone(&self.generation_lifecycle),
+            notifications_initialized: Arc::clone(&self.notifications_initialized),
         }
     }
 }

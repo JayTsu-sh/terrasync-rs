@@ -3,6 +3,7 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicU8;
 
 use clickhouse::Client;
+use tokio::sync::OnceCell;
 
 use self::layout::ClusterCatalogue;
 use self::lifecycle::CatalogueLifecycle;
@@ -15,6 +16,7 @@ mod generation;
 mod layout;
 mod lifecycle;
 mod native;
+mod notifications;
 mod read;
 mod scan_resume;
 mod scan_resume_statistics;
@@ -24,6 +26,10 @@ mod write;
 pub use comparison::{CatalogueChange, ComparisonMode};
 pub use copy_generation::CopyGenerationStatus;
 pub use deletion::DeletionStatus;
+pub use notifications::{
+    MAX_NOTIFICATION_BATCH_BYTES, MAX_NOTIFICATION_BATCH_RECORDS, MAX_NOTIFICATION_RECORD_BYTES, NotificationCursor,
+    NotificationKind, NotificationRecord,
+};
 
 #[cfg(test)]
 mod baseline_tests;
@@ -51,4 +57,6 @@ pub struct ClickHouseDatabase {
     resume_base_has_typed_handles: Option<bool>,
     /// 由本任务显式克隆的目录实例共享的代次与写入协调状态
     generation_lifecycle: Arc<CatalogueLifecycle>,
+    /// 通知表按需初始化，正常无错误任务不为诊断额外建表。
+    notifications_initialized: Arc<OnceCell<()>>,
 }
