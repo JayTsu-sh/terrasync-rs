@@ -363,7 +363,9 @@ impl ProgressBar {
                 }
                 return;
             }
-            StorageEntryMessage::Diagnostic { .. }
+            StorageEntryMessage::CopyItemCompleted { .. }
+            | StorageEntryMessage::VersionMetadataChanged { .. }
+            | StorageEntryMessage::Diagnostic { .. }
             | StorageEntryMessage::CopyEntryBoundary(_)
             | StorageEntryMessage::CopySkipped { .. }
             | StorageEntryMessage::TarManifest { .. }

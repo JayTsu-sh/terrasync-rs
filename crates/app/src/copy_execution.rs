@@ -39,6 +39,9 @@ mod plan_tests;
 #[path = "copy_request_tests.rs"]
 mod request_tests;
 #[cfg(test)]
+#[path = "copy_version_metadata_tests.rs"]
+mod version_metadata_tests;
+#[cfg(test)]
 #[path = "copy_version_plan_tests.rs"]
 mod version_tests;
 impl CopyLease {
@@ -143,11 +146,6 @@ pub(crate) async fn compile_copy_request(
 
 pub(crate) async fn begin_copy_catalogue(database: &ClickHouseDatabase, request: &CopyRequestDescriptor) -> Result<()> {
     let status = database.begin_copy_generation(request).await?;
-    if status == CopyGenerationStatus::Recovering && request.binding.target_history {
-        return Err(AppError::ConfigError(
-            "版本化目标的上轮发布确认尚待对账，保留已复制版本和全部源历史，禁止盲目重放".into(),
-        ));
-    }
     if status == CopyGenerationStatus::Recovering {
         info!("Continuing failed migration with a fresh incremental scan over confirmed copy facts");
     }

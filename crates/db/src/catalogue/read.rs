@@ -90,12 +90,13 @@ impl ClickHouseDatabase {
 
     /// 检测临时表中新增的文件（不存在于主表）
     pub async fn detect_new_items(&self) -> Result<Box<dyn Iterator<Item = ObservedEntry> + Send>> {
+        let copy_only = self.generation_lifecycle.lock().await.copy_generation.is_some();
         if self.is_copy_recovery().await {
             return records_to_entry_iter(self.copy_replay_items().await?);
         }
         let records = self
             .detect_items("new", |temp_table, base_table, strategy| {
-                strategy.build_detect_new_sql(temp_table, base_table)
+                strategy.build_detect_new_sql(temp_table, base_table, copy_only)
             })
             .await?;
 
@@ -103,22 +104,23 @@ impl ClickHouseDatabase {
     }
 
     pub async fn detect_changed_items(&self) -> Result<Box<dyn Iterator<Item = (ObservedEntry, ChangeKind)> + Send>> {
+        let copy_only = self.generation_lifecycle.lock().await.copy_generation.is_some();
         if self.is_copy_recovery().await {
             return Ok(Box::new(std::iter::empty()));
         }
         // 分别查询三种变更（三类条件互斥），用 try_join! 并发执行以降低整体延迟
         let (data_only, metadata_only, both, marker_removed) = tokio::try_join!(
             self.detect_items("changed(data)", |temp, base, strategy| {
-                strategy.build_detect_changed_sql(temp, base, ChangeKind::DataOnly)
+                strategy.build_detect_changed_sql(temp, base, ChangeKind::DataOnly, false, copy_only)
             }),
             self.detect_items("changed(meta)", |temp, base, strategy| {
-                strategy.build_detect_changed_sql(temp, base, ChangeKind::MetadataOnly)
+                strategy.build_detect_changed_sql(temp, base, ChangeKind::MetadataOnly, false, copy_only)
             }),
             self.detect_items("changed(both)", |temp, base, strategy| {
-                strategy.build_detect_changed_sql(temp, base, ChangeKind::Both)
+                strategy.build_detect_changed_sql(temp, base, ChangeKind::Both, false, copy_only)
             }),
             self.detect_items("changed(marker removed)", |temp, base, strategy| {
-                strategy.build_detect_changed_sql(temp, base, ChangeKind::DirectoryMarkerRemoved)
+                strategy.build_detect_changed_sql(temp, base, ChangeKind::DirectoryMarkerRemoved, false, copy_only)
             }),
         )?;
 

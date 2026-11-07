@@ -19,6 +19,7 @@ use crate::schema::entry::EntrySummary;
 pub(crate) struct ExcludeRecord<'a> {
     pub relative_path: &'a str,
     pub version_id: &'a str,
+    pub data_unchanged: bool,
 }
 
 /// 文件扫描记录结构体
@@ -204,6 +205,10 @@ impl IncrementalStorageEntryRecord {
     pub fn from_message(message: &StorageEntryMessage) -> Result<Vec<Self>> {
         let now = i64::try_from(SystemTime::now().duration_since(SystemTime::UNIX_EPOCH)?.as_nanos())?;
         let (entry, operation, comment) = match message {
+            StorageEntryMessage::CopyItemCompleted { completion, change } => {
+                return Self::from_message(&change.message(completion.item.clone()));
+            }
+            StorageEntryMessage::VersionMetadataChanged { .. } => return Ok(Vec::new()),
             StorageEntryMessage::CopyEntryBoundary(_) | StorageEntryMessage::CopyEntryDeltaCompleted { .. } => {
                 return Ok(Vec::new());
             }

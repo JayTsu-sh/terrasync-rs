@@ -208,15 +208,21 @@ pub(crate) async fn set_item_metadata(
     storage: &Storage, view: ObservedView<'_>, target_version: Option<&str>,
 ) -> Result<SourceDescriptor> {
     let plan = captured_metadata_plan(storage, view)?;
-    plan.apply(
-        storage.metadata()?.as_ref(),
-        &view.source_path()?,
-        CancellationToken::new(),
-    )
-    .await?;
-    Ok(plan
-        .verify_published(storage, &view.source_path()?, target_version, CancellationToken::new())
-        .await?)
+    let metadata = storage.metadata()?;
+    let path = view.source_path()?;
+    if let Some(version) = target_version {
+        plan.apply_to_version(metadata.as_ref(), &path, version, CancellationToken::new())
+            .await?;
+    } else {
+        plan.apply(metadata.as_ref(), &path, CancellationToken::new()).await?;
+    }
+    Ok(if let Some(version) = target_version {
+        plan.verify_version(storage, &path, version, CancellationToken::new())
+            .await?
+    } else {
+        plan.verify_published(storage, &path, None, CancellationToken::new())
+            .await?
+    })
 }
 
 pub(crate) async fn apply_acl(storage: &Storage, value: &Path, acl: AclMetadata) -> Result<()> {

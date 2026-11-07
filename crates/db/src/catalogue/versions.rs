@@ -1,5 +1,8 @@
 //! 事实键对应目标的版本槽；源版本原值仍保存在标量列和原生 snapshot。
+use std::slice;
+
 use data_mover::model::VersionRecord;
+use task_model::CopyCompletion;
 use task_model::observation::ObservedView;
 
 use super::ClickHouseDatabase;
@@ -11,9 +14,6 @@ pub(super) enum CatalogueVersions {
 }
 
 impl CatalogueVersions {
-    pub fn select<'a>(self, views: Box<dyn Iterator<Item = ObservedView<'a>> + Send + 'a>) -> CatalogueViews<'a> {
-        CatalogueViews { views, versions: self }
-    }
     pub fn includes(self, view: ObservedView<'_>) -> bool {
         matches!(self, Self::All) || view.version().is_none_or(VersionRecord::is_latest)
     }
@@ -26,16 +26,35 @@ impl CatalogueVersions {
     }
 }
 
-pub(super) struct CatalogueViews<'a> {
-    views: Box<dyn Iterator<Item = ObservedView<'a>> + Send + 'a>,
-    versions: CatalogueVersions,
+pub(super) enum CatalogueInputs<'a> {
+    Observed(Box<dyn Iterator<Item = ObservedView<'a>> + Send + 'a>),
+    Copied(slice::Iter<'a, CopyCompletion>),
 }
 
+pub(super) struct CatalogueViews<'a> {
+    inputs: CatalogueInputs<'a>,
+    versions: CatalogueVersions,
+}
+impl<'a> CatalogueViews<'a> {
+    pub(super) fn new(inputs: CatalogueInputs<'a>, versions: CatalogueVersions) -> Self {
+        Self { inputs, versions }
+    }
+}
 impl<'a> Iterator for CatalogueViews<'a> {
-    type Item = ObservedView<'a>;
-
+    type Item = (ObservedView<'a>, Option<&'a CopyCompletion>);
     fn next(&mut self) -> Option<Self::Item> {
-        self.views.by_ref().find(|view| self.versions.includes(*view))
+        loop {
+            let item = match &mut self.inputs {
+                CatalogueInputs::Observed(views) => (views.next()?, None),
+                CatalogueInputs::Copied(records) => {
+                    let completion = records.next()?;
+                    (completion.item.view(), Some(completion))
+                }
+            };
+            if self.versions.includes(item.0) {
+                return Some(item);
+            }
+        }
     }
 }
 

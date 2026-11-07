@@ -22,7 +22,7 @@ use crate::schema::identity::encoded_file_handle;
 use crate::{ClickHouseConfig, ClickHouseDatabase, DatabaseError, Result};
 use data_mover::model::{BackendKind, EntryKind, HistoryOrder, ObjectHistory, ObservedEntry};
 use task_model::observation::ObservedItem;
-use task_model::{ChangeKind, EntryChange};
+use task_model::{ChangeKind, CopyCompletion, CopyReadiness, EntryChange};
 
 #[derive(Deserialize, clickhouse::Row)]
 struct VersionSlotRow {
@@ -363,6 +363,69 @@ async fn version_slots(fixture: &Fixture, history_target: bool) -> Result<()> {
     Ok(())
 }
 
+async fn delayed_copy_ack_cannot_restore_metadata_readiness(fixture: &Fixture) -> Result<()> {
+    let job = "delayed_metadata_ack";
+    let first = fixture.open(job).await?;
+    first.begin_copy_generation(&request("delayed-metadata", true)).await?;
+    let item: ObservedItem = Arc::new(observation(
+        BackendKind::Local,
+        "payload".into(),
+        EntryKind::File,
+        7,
+        [0, 11, 0],
+        None,
+        None,
+        None,
+        None,
+    ))
+    .into();
+    first
+        .batch_insert_copy_completions(&[CopyCompletion {
+            item: item.clone(),
+            target_version: Some("actual-target-version".into()),
+            readiness: CopyReadiness::DataOnly,
+        }])
+        .await?;
+    first.finish_copy_generation(CopyGenerationPhase::Failed).await?;
+    let next = first.new_execution_scope();
+    next.begin_copy_generation(&request("delayed-metadata", true)).await?;
+    let compare = || {
+        next.compare_catalogue_batch(
+            std::slice::from_ref(&item.entry),
+            ComparisonMode::AwaitCopyAcknowledgement,
+        )
+    };
+    let changes = compare().await?;
+    assert_eq!(changes.len(), 1);
+    assert_eq!(changes[0].kind, EntryChange::Changed(ChangeKind::MetadataOnly));
+    // 模拟上轮响应丢失后延迟到达的完成写入，以及独立 Scan 的 seq=0 写入。
+    first
+        .batch_insert_copy_completions(&[CopyCompletion {
+            item: item.clone(),
+            target_version: Some("stale-target-version".into()),
+            readiness: CopyReadiness::Ready,
+        }])
+        .await?;
+    let scan = fixture.open(job).await?;
+    scan.batch_insert_base_record(std::slice::from_ref(&item.entry)).await?;
+    let client = base_client(&fixture.config)?;
+    let row = client
+        .query(&format!(
+            "SELECT copy_sequence,copy_data_confirmed,copy_path_confirmed,copy_target_version FROM base_{job} FINAL"
+        ))
+        .fetch_one::<(u64, bool, bool, Option<String>)>()
+        .await?;
+    assert_eq!(row, (2, true, false, Some("actual-target-version".into())));
+    let changes = compare().await?;
+    assert_eq!(changes.len(), 1);
+    assert_eq!(changes[0].kind, EntryChange::Changed(ChangeKind::MetadataOnly));
+    eprintln!(
+        "metadata-fence cluster={} older_ack_and_scan_cannot_restore_readiness=true",
+        fixture.config.cluster.is_some()
+    );
+    Ok(())
+}
+
 #[tokio::test]
 #[ignore = "requires an isolated ClickHouse pair and fault proxy from run-notification-archive-local.py --copy-generations"]
 async fn real_copy_generation_policies() -> Result<()> {
@@ -378,6 +441,7 @@ async fn real_copy_generation_policies() -> Result<()> {
                     }
                 }
             }
+            delayed_copy_ack_cannot_restore_metadata_readiness(&fixture).await?;
             version_slots(&fixture, false).await?;
             version_slots(&fixture, true).await?;
             read_faults(&fixture).await

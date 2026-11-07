@@ -5,6 +5,7 @@ use std::sync::atomic::Ordering;
 
 use data_mover::metadata::MetadataPlan;
 use data_mover::model::{EntryKind, ObservedEntry};
+use data_mover::storage::DeleteMarkerOutcome;
 use data_mover::transfer::{
     self, MetadataFailurePolicy, MetadataTransferMode, ReadBackVerification, TransferIdentity, TransferOutcome,
     TransferRequest,
@@ -70,20 +71,26 @@ pub(crate) async fn copy_entry(
 pub(crate) async fn copy_item(
     source: &StorageContext, destination: &StorageContext, item: &ObservedItem, options: &CopyOptions,
     identity: Option<&str>,
-) -> Result<()> {
+) -> Result<Option<String>> {
     validate_transfer_mode(destination, options.transfer_mode)?;
     let view = item.view();
     if view.version().is_some_and(|record| record.is_delete_marker()) {
-        transfer::write_delete_marker(
+        let outcome = transfer::write_delete_marker(
             destination.roles.clone(),
             view.source_path()?,
             options.cancel.clone().unwrap_or_default(),
         )
         .await?;
-        return Ok(());
+        return Ok(match outcome {
+            DeleteMarkerOutcome::Written { version_id } | DeleteMarkerOutcome::Merged { version_id } => {
+                Some(version_id)
+            }
+            DeleteMarkerOutcome::NullVersionRemoved { marker, .. } => marker,
+            _ => None,
+        });
     }
-    execute_file(source, destination, &item.entry, item.version_index, options, identity).await?;
-    Ok(())
+    let outcome = execute_file(source, destination, &item.entry, item.version_index, options, identity).await?;
+    Ok(outcome.destination_version)
 }
 
 pub(crate) async fn copy_current(
@@ -126,7 +133,12 @@ async fn execute_file(
     .await;
     let (outcome, plan) = match (result, metadata) {
         (Ok(outcome), Ok(plan)) => (outcome, plan),
-        (Ok(_), Err(metadata)) => return Err(metadata),
+        (Ok(outcome), Err(metadata)) => {
+            return Err(StorageError::PublishedDataMetadata {
+                data: Box::new(outcome),
+                source: Box::new(metadata),
+            });
+        }
         (Err(data), Ok(_)) => return Err(data),
         (Err(data), Err(metadata)) => {
             return Err(StorageError::TransferAndMetadata {
@@ -142,7 +154,11 @@ async fn execute_file(
             outcome.destination_version.as_deref(),
             options.cancel.clone().unwrap_or_default(),
         )
-        .await?;
+        .await
+        .map_err(|error| StorageError::PublishedDataMetadata {
+            data: Box::new(outcome.clone()),
+            source: Box::new(error.into()),
+        })?;
     if target.kind != EntryKind::File || target.size != Some(view.get_size()) {
         return Err(StorageError::TargetPublicationChanged { path: target.path });
     }

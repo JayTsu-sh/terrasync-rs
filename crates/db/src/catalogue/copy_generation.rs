@@ -119,6 +119,7 @@ impl ClickHouseDatabase {
         self.save_copy_generation(generation).await?;
         lifecycle.working = Some(working);
         lifecycle.copy_recovery = false;
+        lifecycle.copy_generation_recovering = recovering;
         lifecycle.copy_execution_id = Some(request.execution_id.clone());
         self.cached_scan_state.store(working, Ordering::Relaxed);
         Ok(if recovering {
@@ -154,6 +155,11 @@ impl ClickHouseDatabase {
             )));
         }
         Ok(state)
+    }
+
+    /// 本轮是否接续未完成的复制代次；不改变已确认事实的增量比较。
+    pub async fn copy_generation_recovering(&self) -> bool {
+        self.generation_lifecycle.lock().await.copy_generation_recovering
     }
 
     pub(super) async fn is_copy_recovery(&self) -> bool {

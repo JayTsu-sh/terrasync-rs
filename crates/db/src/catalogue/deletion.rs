@@ -100,7 +100,8 @@ impl ClickHouseDatabase {
         debug!("During detect_deleted_items, current_state is {}", current_state);
 
         // 第一步：查询所有 old-state 记录（LIMIT 1 BY 替代 FINAL）
-        let query = JoinStrategy::build_detect_deleted_sql(&base_table_name);
+        let copy_only = self.generation_lifecycle.lock().await.copy_generation.is_some();
+        let query = JoinStrategy::build_detect_deleted_sql(&base_table_name, copy_only);
 
         let rows = self
             .sync_client
@@ -129,6 +130,7 @@ impl ClickHouseDatabase {
     async fn classify_deleted_candidates(
         &self, base_table_name: &str, rows: Vec<StorageEntryRecord>,
     ) -> Result<Vec<DeletionStatus>> {
+        let copy_only = self.generation_lifecycle.lock().await.copy_generation.is_some();
         let (no_fh_records, fh_records): (Vec<_>, Vec<_>) =
             rows.into_iter().partition(|record| record.file_handle.is_none());
         let unique_fh_set: HashSet<String> = fh_records
@@ -147,7 +149,7 @@ impl ClickHouseDatabase {
 
             // 每批 10K 个 fh，避免 SQL 过长
             for chunk in unique_fh_list.chunks(BATCH_SIZE) {
-                let batch_query = JoinStrategy::build_batch_fh_query_sql(base_table_name, chunk.len());
+                let batch_query = JoinStrategy::build_batch_fh_query_sql(base_table_name, chunk.len(), copy_only);
 
                 let mut q = self.sync_client.query(&batch_query);
                 for fh in chunk {

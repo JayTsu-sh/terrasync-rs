@@ -17,7 +17,7 @@ use data_mover::{
         NamespaceReadFailure, StorageRoleFailure,
     },
     tar_pack::TarFailure,
-    transfer::{DirectPatchError, TransferFailure, TransferValueError},
+    transfer::{DirectPatchError, TransferFailure, TransferOutcome, TransferValueError},
     traversal::{
         FailureScope, ObservationFailure, ScanSetupError, TraversalConfigurationError, TraversalTerminalFailure,
     },
@@ -43,6 +43,16 @@ pub enum StorageError {
         data: Box<StorageError>,
         metadata: Box<StorageError>,
     },
+    #[error("数据已发布，但元数据未就绪，禁止删源: {source}")]
+    PublishedDataMetadata {
+        data: Box<TransferOutcome>,
+        #[source]
+        source: Box<StorageError>,
+    },
+    #[error("缺少实际目标版本映射，保留数据且不重新发布旧版本: {path} source_version={source_version}")]
+    TargetVersionUnconfirmed { path: StoragePath, source_version: String },
+    #[error("上轮历史数据发布结果未确认，保留所有源和目标版本，禁止重放旧数据: {path} source_version={source_version}")]
+    HistoricalPublicationUnconfirmed { path: StoragePath, source_version: String },
     #[error("源端版本永久清理不可用，已保留所有历史: {path}")]
     PermanentVersionCleanupUnavailable { path: StoragePath },
     #[error(transparent)]
@@ -133,6 +143,14 @@ pub enum StorageError {
     Archive(Box<TarFailure>),
 }
 impl StorageError {
+    pub(crate) fn published_data(&self) -> Option<&TransferOutcome> {
+        match self {
+            Self::PublishedDataMetadata { data, .. } => Some(data),
+            Self::Transfer(error) => error.published_data(),
+            Self::TransferAndMetadata { data, .. } => data.published_data(),
+            _ => None,
+        }
+    }
     pub fn is_not_found(&self) -> bool {
         matches!(self, Self::FileNotFound(_) | Self::DirectoryNotFound(_))
             || matches!(self, Self::Role(StorageRoleFailure::Entry(error)) if error.class() == FailureClass::NotFound)

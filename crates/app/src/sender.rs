@@ -71,6 +71,7 @@ pub async fn sender_worker(
             active_entry_limit: 1,
             target_history: config.target_history,
             completion: HistoryCompletion::Full,
+            recovering: false,
         },
     );
 

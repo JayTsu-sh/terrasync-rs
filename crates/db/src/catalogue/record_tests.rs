@@ -302,17 +302,17 @@ fn test_join_strategy_from_file_handle_status() {
 
 #[test]
 fn test_detect_new_sql_path_mode() {
-    let sql = JoinStrategy::Path.build_detect_new_sql("temp_x", "base_y");
-    assert!(sql.contains("NOT IN (SELECT relative_path, version_id FROM base_y FINAL WHERE copy_path_confirmed)"));
+    let sql = JoinStrategy::Path.build_detect_new_sql("temp_x", "base_y", false);
+    assert!(sql.contains("NOT IN (SELECT relative_path, version_id FROM base_y FINAL WHERE copy_data_confirmed)"));
     assert!(sql.contains("FROM temp_x"));
     assert!(sql.contains("FINAL"));
 }
 
 #[test]
 fn test_detect_new_sql_fh_mode() {
-    let sql = JoinStrategy::FileHandle.build_detect_new_sql("temp_x", "base_y");
+    let sql = JoinStrategy::FileHandle.build_detect_new_sql("temp_x", "base_y", false);
     assert!(sql.contains("file_handle NOT IN"));
-    assert!(sql.contains("FROM base_y FINAL WHERE copy_path_confirmed AND file_handle IS NOT NULL"));
+    assert!(sql.contains("FROM base_y FINAL WHERE copy_data_confirmed AND file_handle IS NOT NULL"));
     assert!(sql.contains("FINAL"));
 }
 
@@ -332,7 +332,7 @@ fn assert_null_safe_meta_clauses(sql: &str) {
 
 #[test]
 fn test_detect_changed_sql_path_mode_data_only() {
-    let sql = JoinStrategy::Path.build_detect_changed_sql("temp_x", "base_y", ChangeKind::DataOnly);
+    let sql = JoinStrategy::Path.build_detect_changed_sql("temp_x", "base_y", ChangeKind::DataOnly, false, false);
     assert!(sql.contains("LIMIT 1 BY (relative_path, version_id)"));
     // DataOnly 条件：内容变了 + 属性未变
     assert!(sql.contains("t.size != f.size OR t.mtime != f.mtime"));
@@ -342,7 +342,7 @@ fn test_detect_changed_sql_path_mode_data_only() {
 
 #[test]
 fn test_detect_changed_sql_path_mode_metadata_only() {
-    let sql = JoinStrategy::Path.build_detect_changed_sql("temp_x", "base_y", ChangeKind::MetadataOnly);
+    let sql = JoinStrategy::Path.build_detect_changed_sql("temp_x", "base_y", ChangeKind::MetadataOnly, false, false);
     // MetadataOnly 条件：内容未变 + 属性变了
     assert!(sql.contains("t.size = f.size AND t.mtime = f.mtime"));
     assert_null_safe_meta_clauses(&sql);
@@ -352,7 +352,7 @@ fn test_detect_changed_sql_path_mode_metadata_only() {
 
 #[test]
 fn test_detect_changed_sql_path_mode_both() {
-    let sql = JoinStrategy::Path.build_detect_changed_sql("temp_x", "base_y", ChangeKind::Both);
+    let sql = JoinStrategy::Path.build_detect_changed_sql("temp_x", "base_y", ChangeKind::Both, false, false);
     // Both 条件：内容和属性都变了
     assert!(sql.contains("t.size != f.size OR t.mtime != f.mtime"));
     assert_null_safe_meta_clauses(&sql);
@@ -361,7 +361,7 @@ fn test_detect_changed_sql_path_mode_both() {
 
 #[test]
 fn test_detect_changed_sql_fh_mode_data_only() {
-    let sql = JoinStrategy::FileHandle.build_detect_changed_sql("temp_x", "base_y", ChangeKind::DataOnly);
+    let sql = JoinStrategy::FileHandle.build_detect_changed_sql("temp_x", "base_y", ChangeKind::DataOnly, false, false);
     // 路径等值条件：仅对路径未变的条目判 Changed，避免把 rename+changed 误判为纯 Changed
     assert!(sql.contains("LIMIT 1 BY (file_handle, relative_path)"));
     assert!(sql.contains("t.file_handle = f.file_handle"));
@@ -372,7 +372,8 @@ fn test_detect_changed_sql_fh_mode_data_only() {
 
 #[test]
 fn test_detect_changed_sql_fh_mode_metadata_only() {
-    let sql = JoinStrategy::FileHandle.build_detect_changed_sql("temp_x", "base_y", ChangeKind::MetadataOnly);
+    let sql =
+        JoinStrategy::FileHandle.build_detect_changed_sql("temp_x", "base_y", ChangeKind::MetadataOnly, false, false);
     assert!(sql.contains("t.size = f.size AND t.mtime = f.mtime"));
     assert_null_safe_meta_clauses(&sql);
     assert!(sql.contains("NOT ifNull(t.uid = f.uid"));
@@ -380,7 +381,7 @@ fn test_detect_changed_sql_fh_mode_metadata_only() {
 
 #[test]
 fn test_detect_changed_sql_fh_mode_both() {
-    let sql = JoinStrategy::FileHandle.build_detect_changed_sql("temp_x", "base_y", ChangeKind::Both);
+    let sql = JoinStrategy::FileHandle.build_detect_changed_sql("temp_x", "base_y", ChangeKind::Both, false, false);
     assert!(sql.contains("t.size != f.size OR t.mtime != f.mtime"));
     assert_null_safe_meta_clauses(&sql);
     assert!(sql.contains("NOT ifNull(t.gid = f.gid"));
@@ -388,7 +389,7 @@ fn test_detect_changed_sql_fh_mode_both() {
 
 #[test]
 fn test_detect_deleted_sql() {
-    let sql = JoinStrategy::build_detect_deleted_sql("base_y");
+    let sql = JoinStrategy::build_detect_deleted_sql("base_y", false);
     assert!(sql.contains("FINAL"));
     assert!(sql.contains("current_state = ?"));
     assert!(!sql.contains("LIMIT 1 BY"));
@@ -396,7 +397,7 @@ fn test_detect_deleted_sql() {
 
 #[test]
 fn test_batch_fh_query_sql() {
-    let sql = JoinStrategy::build_batch_fh_query_sql("base_y", 3);
+    let sql = JoinStrategy::build_batch_fh_query_sql("base_y", 3, false);
     assert!(sql.contains("file_handle IN (?, ?, ?)"));
     assert!(sql.contains("LIMIT 1 BY (relative_path, version_id)"));
     assert!(sql.contains("FINAL"));

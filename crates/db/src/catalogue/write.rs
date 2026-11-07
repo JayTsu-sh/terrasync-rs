@@ -4,12 +4,13 @@ use std::sync::Arc;
 
 use data_mover::model::ObservedEntry;
 use serde_json::Value;
-use task_model::StorageEntryMessage;
 use task_model::observation::{ObservedItem, ObservedView, ObservedViews};
+use task_model::{CopyCompletion, CopyReadiness, StorageEntryMessage};
 use tracing::trace;
 use tracing::{debug, info};
 
 use super::ClickHouseDatabase;
+use super::versions::{CatalogueInputs, CatalogueViews};
 use crate::error::{DatabaseError, Result};
 use crate::execution::queries::ScanExecute;
 use crate::execution::queries::check_scan_cancellation;
@@ -74,8 +75,8 @@ impl ClickHouseDatabase {
     }
 
     /// 通用批量插入方法，支持同步和异步客户端模式
-    pub(super) async fn batch_insert<'a>(
-        &self, table_name: &str, records: &'a [Arc<ObservedEntry>], use_async_client: bool,
+    pub(super) async fn batch_insert(
+        &self, table_name: &str, records: &[Arc<ObservedEntry>], use_async_client: bool,
     ) -> Result<()> {
         self.insert_views(
             table_name,
@@ -88,8 +89,15 @@ impl ClickHouseDatabase {
     pub(super) async fn insert_views<'a>(
         &self, table_name: &str, views: Box<dyn Iterator<Item = ObservedView<'a>> + Send + 'a>, use_async_client: bool,
     ) -> Result<()> {
+        self.insert_copy_views(table_name, CatalogueInputs::Observed(views), use_async_client)
+            .await
+    }
+
+    async fn insert_copy_views(
+        &self, table_name: &str, views: CatalogueInputs<'_>, use_async_client: bool,
+    ) -> Result<()> {
         let versions = self.catalogue_versions().await;
-        let mut views = versions.select(views).peekable();
+        let mut views = CatalogueViews::new(views, versions).peekable();
         if views.peek().is_none() {
             return Ok(());
         }
@@ -127,8 +135,13 @@ impl ClickHouseDatabase {
             .await
             .map_err(DatabaseError::from)?;
 
-        for view in views {
+        for (view, completion) in views {
             let mut record = NativeScanRecord::capture(view, current_state)?;
+            if let Some(completion) = completion {
+                record.copy_path_confirmed = completion.readiness == CopyReadiness::Ready;
+                record.copy_data_confirmed = true;
+                record.copy_target_version = completion.target_version.as_deref();
+            }
             record.version_id = versions.key(view);
             record.copy_execution_id = &copy_execution_id;
             record.copy_sequence = copy_sequence;
@@ -204,6 +217,12 @@ impl ClickHouseDatabase {
     pub async fn batch_insert_completed_records(&self, records: &[ObservedItem]) -> Result<()> {
         let table = get_scan_base_table_name(&self.job_id);
         self.insert_views(&table, Box::new(records.iter().map(ObservedItem::view)), true)
+            .await
+    }
+
+    pub async fn batch_insert_copy_completions(&self, records: &[CopyCompletion]) -> Result<()> {
+        let table = get_scan_base_table_name(&self.job_id);
+        self.insert_copy_views(&table, CatalogueInputs::Copied(records.iter()), true)
             .await
     }
 

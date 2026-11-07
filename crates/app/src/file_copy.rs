@@ -8,7 +8,10 @@ use data_mover::transfer::TransferPolicy;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 use task_model::observation::{EntryStatistics, ObservedItem};
-use task_model::{EntryChange, StorageEntryMessage, TargetRetention, TargetRetentionReason};
+use task_model::{
+    ChangeKind, CopyCompletion, CopyReadiness, EntryChange, MetadataTargetVersion, StorageEntryMessage,
+    TargetRetention, TargetRetentionReason,
+};
 use task_model::{ObservedEntryExt, TransferMode};
 use tokio_util::sync::CancellationToken;
 use tracing::error;
@@ -124,7 +127,7 @@ pub(crate) async fn copy_file(
 /// 全量与增量共用源端确认的逐版本顺序；每个目标版本提交后才发送对应的完成事件。
 pub(crate) async fn copy_versions<I: Iterator<Item = ObservedItem> + Send>(
     items: I, from: &StorageContext, to: &StorageContext, options: CopyOptions, job_id: &str,
-    broadcaster: &BroadcastForwarder<StorageEntryMessage>, scope: VersionCopyScope,
+    broadcaster: &BroadcastForwarder<StorageEntryMessage>, scope: VersionCopyScope<'_>,
 ) -> Result<()> {
     let mut items = items.peekable();
     if scope == VersionCopyScope::WholeEntry
@@ -196,7 +199,28 @@ pub(crate) async fn copy_versions<I: Iterator<Item = ObservedItem> + Send>(
             return Err(AppError::CopyError("WholeEntry 复制范围不能混入其他 entry".into()));
         }
         let result = if !to.storage().holds_directory_objects() && item.entry.kind() == EntryKind::Directory {
-            copy_namespace::create_dir_all(to.storage(), &item.entry).await
+            copy_namespace::create_dir_all(to.storage(), &item.entry)
+                .await
+                .map(|_| None)
+        } else if change == EntryChange::Changed(ChangeKind::MetadataOnly) {
+            let target = match scope {
+                VersionCopyScope::SelectedVersion { metadata_target, .. } => metadata_target,
+                _ => None,
+            };
+            let version = match target {
+                Some(MetadataTargetVersion::Bound(version)) => Some(version.as_str()),
+                Some(MetadataTargetVersion::Unconfirmed) | None if keep_history => {
+                    return Err(StorageError::TargetVersionUnconfirmed {
+                        path: item.view().source_path()?,
+                        source_version: item.view().version_id().to_owned(),
+                    }
+                    .into());
+                }
+                _ => None,
+            };
+            metadata::set_item_metadata(to.storage(), item.view().payload(), version)
+                .await
+                .map(|_| version.map(str::to_owned))
         } else {
             transfer::copy_item(
                 from,
@@ -207,43 +231,79 @@ pub(crate) async fn copy_versions<I: Iterator<Item = ObservedItem> + Send>(
             )
             .await
         };
-        if let Err(error) = result {
-            if matches!(scope, VersionCopyScope::SelectedVersion { .. }) {
-                return Err(error.into());
+        let result = result.and_then(|version| {
+            let version = version.filter(|value| !value.is_empty());
+            if keep_history && item.view().version().is_some() && version.is_none() {
+                return Err(StorageError::TargetVersionUnconfirmed {
+                    path: item.view().source_path()?,
+                    source_version: item.view().version_id().to_owned(),
+                });
             }
-            let context = VersionFailureContext::for_error(&error, from.storage().kind(), to.storage().kind());
-            error!(
-                path = %item.entry.path(),
-                version = item.view().version_id(),
-                phase = %context.phase,
-                backend = ?context.backend,
-                error = %error,
-                "版本复制失败"
-            );
-            broadcaster
-                .broadcast(StorageEntryMessage::CopyVersionFailed {
-                    entry: item,
-                    phase: context.phase,
-                    backend: context.backend,
-                    reason: error.to_string(),
-                    first_in_entry: first_failure.is_none(),
-                })
-                .await?;
-            if context.metadata_only {
-                first_failure.get_or_insert(error);
-            } else {
-                data_failed = true;
-                // 后续版本被阻断时必须指向实际的数据错误，不能误用此前的元数据错误。
-                first_failure = Some(error);
+            Ok(version)
+        });
+        if let Err(error) = &result {
+            if let Some(data) = error.published_data() {
+                broadcaster
+                    .broadcast(StorageEntryMessage::CopyItemCompleted {
+                        completion: CopyCompletion {
+                            item: item.clone(),
+                            target_version: data.destination_version.clone(),
+                            readiness: CopyReadiness::DataOnly,
+                        },
+                        change,
+                    })
+                    .await?;
             }
-            // 数据已经发布；元数据失败不阻断该 entry 后续版本的数据复制。
-            continue;
         }
+        let target_version = match result {
+            Ok(version) => version,
+            Err(error) => {
+                if matches!(scope, VersionCopyScope::SelectedVersion { .. }) {
+                    return Err(error.into());
+                }
+                let context = VersionFailureContext::for_error(&error, from.storage().kind(), to.storage().kind());
+                error!(
+                    path = %item.entry.path(),
+                    version = item.view().version_id(),
+                    phase = %context.phase,
+                    backend = ?context.backend,
+                    error = %error,
+                    "版本复制失败"
+                );
+                broadcaster
+                    .broadcast(StorageEntryMessage::CopyVersionFailed {
+                        entry: item,
+                        phase: context.phase,
+                        backend: context.backend,
+                        reason: error.to_string(),
+                        first_in_entry: first_failure.is_none(),
+                    })
+                    .await?;
+                if context.metadata_only {
+                    first_failure.get_or_insert(error);
+                } else {
+                    data_failed = true;
+                    // 后续版本被阻断时必须指向实际的数据错误，不能误用此前的元数据错误。
+                    first_failure = Some(error);
+                }
+                // 数据已经发布；元数据失败不阻断该 entry 后续版本的数据复制。
+                continue;
+            }
+        };
         logical_bytes = logical_bytes
             .checked_add(item.view().payload().get_size())
             .ok_or_else(|| AppError::CopyError("所选版本的复制字节总量超出统计上限".into()))?;
         completed_entry.get_or_insert_with(|| Arc::clone(&item.entry));
-        broadcaster.broadcast(change.message(item)).await?;
+        broadcaster
+            .broadcast(StorageEntryMessage::CopyItemCompleted {
+                completion: CopyCompletion {
+                    item,
+                    target_version,
+                    readiness: CopyReadiness::Ready,
+                },
+                change,
+            })
+            .await?;
     }
     if let Some(error) = first_failure {
         return Err(AppError::ReportedCopyFailure {
@@ -262,11 +322,12 @@ pub(crate) async fn copy_versions<I: Iterator<Item = ObservedItem> + Send>(
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
-pub(crate) enum VersionCopyScope {
+pub(crate) enum VersionCopyScope<'a> {
     WholeEntry,
     SelectedVersion {
         change: EntryChange,
         target_history: Option<bool>,
+        metadata_target: Option<&'a MetadataTargetVersion>,
     },
 }
 

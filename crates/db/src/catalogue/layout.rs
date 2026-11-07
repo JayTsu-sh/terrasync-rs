@@ -143,7 +143,9 @@ impl ClickHouseDatabase {
     pub(super) async fn create_catalogue_exclusions(&self, table: &str) -> Result<()> {
         if self.catalogue_cluster.is_none() {
             self.execute(
-                &format!("CREATE TABLE {table} (relative_path String, version_id String) ENGINE = Memory"),
+                &format!(
+                    "CREATE TABLE {table} (relative_path String, version_id String,data_unchanged Bool) ENGINE = Memory"
+                ),
                 &[],
             )
             .await?;
@@ -151,22 +153,23 @@ impl ClickHouseDatabase {
         }
         self.create_catalogue_table(
             table,
-            "relative_path String, version_id String",
+            "relative_path String, version_id String,data_unchanged Bool",
             "(relative_path, version_id)",
             CatalogueEngine::MergeTree,
         )
         .await
     }
 
-    pub(super) async fn write_catalogue_exclusions(&self, table: &str, paths: &[(String, String)]) -> Result<()> {
+    pub(super) async fn write_catalogue_exclusions(&self, table: &str, paths: &[(String, String, bool)]) -> Result<()> {
         let _write = self.catalogue_write_guard().await;
         let client = self.catalogue_write_client(&self.sync_client);
         let mut insert = client.insert::<ExcludeRecord<'_>>(table).await?;
-        for (path, version) in paths {
+        for (path, version, data_unchanged) in paths {
             insert
                 .write(&ExcludeRecord {
                     relative_path: path.as_str(),
                     version_id: version.as_str(),
+                    data_unchanged: *data_unchanged,
                 })
                 .await?;
         }

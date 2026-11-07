@@ -35,6 +35,7 @@ async fn worker(limit: usize) -> (HistoryCopyWorker, Receiver<StorageEntryMessag
             active_entry_limit: limit,
             target_history: Some(false),
             completion: HistoryCompletion::Incremental,
+            recovering: false,
         },
     );
     (worker, receiver, source, target)
@@ -174,5 +175,84 @@ async fn missing_directory_marker_keeps_the_conservative_handler_and_has_no_deli
         .unwrap();
     worker.finish().await.unwrap();
     assert!(received.recv().await.is_none());
+    assert_eq!(std::fs::read(target.path().join("payload")).unwrap(), b"retained-data");
+}
+
+#[tokio::test]
+async fn missing_target_version_binding_never_republishes_old_data_and_counts_one_entry() {
+    let (mut worker, mut received, _source, target) = worker(1).await;
+    worker.policy.target_history = Some(true);
+    let entry = Arc::new(history("payload", 2, false));
+    for item in ObservedItem::all(&entry) {
+        worker
+            .process(&StorageEntryMessage::VersionMetadataChanged {
+                entry: item,
+                target: MetadataTargetVersion::Unconfirmed,
+            })
+            .await
+            .unwrap();
+    }
+    worker.end_segment(&entry).await.unwrap();
+    let result = worker.finish().await;
+    assert!(
+        result
+            .as_ref()
+            .is_err_and(|error| error.is_reported_copy_failure() && !error.reported_copy_data_failed())
+    );
+    let mut failures = Vec::new();
+    while let Some(message) = received.recv().await {
+        match message {
+            StorageEntryMessage::CopyVersionFailed {
+                phase,
+                reason,
+                first_in_entry,
+                ..
+            } => {
+                assert_eq!(phase, "target_version_binding");
+                assert!(reason.contains("source_version=v"));
+                failures.push(first_in_entry);
+            }
+            other => panic!("missing mapping must not emit completion: {other:?}"),
+        }
+    }
+    assert_eq!(failures, [true, false]);
+    assert_eq!(std::fs::read(target.path().join("payload")).unwrap(), b"retained-data");
+}
+
+#[tokio::test]
+async fn recovering_history_refuses_ambiguous_data_without_replacing_the_current_target() {
+    let (mut worker, mut received, _source, target) = worker(1).await;
+    worker.policy.target_history = Some(true);
+    worker.policy.recovering = true;
+    let entry = Arc::new(history("payload", 2, false));
+    worker.copy_segment(&entry).await.unwrap();
+    let result = worker.finish().await;
+    assert!(
+        result
+            .as_ref()
+            .is_err_and(|error| error.is_reported_copy_failure() && error.reported_copy_data_failed())
+    );
+    let mut failures = Vec::new();
+    while let Some(message) = received.recv().await {
+        match message {
+            StorageEntryMessage::CopyVersionFailed {
+                phase,
+                reason,
+                first_in_entry,
+                ..
+            } => {
+                assert!(reason.contains("source_version=v0"));
+                failures.push((phase, first_in_entry));
+            }
+            other => panic!("ambiguous history must not emit completion: {other:?}"),
+        }
+    }
+    assert_eq!(
+        failures,
+        [
+            ("historical_publication_unconfirmed".into(), true),
+            ("blocked_by_prior_version".into(), false)
+        ]
+    );
     assert_eq!(std::fs::read(target.path().join("payload")).unwrap(), b"retained-data");
 }

@@ -5,7 +5,7 @@ use std::sync::Arc;
 use data_mover::model::ObservedEntry;
 use db::catalogue::ComparisonMode;
 use db::{ClickHouseDatabase, DatabaseError};
-use task_model::StorageEntryMessage;
+use task_model::{ChangeKind, EntryChange, MetadataTargetVersion, StorageEntryMessage};
 use tracing::trace;
 
 #[cfg(test)]
@@ -50,7 +50,18 @@ pub(crate) async fn batch_processing_to_generate_message(
             .is_some_and(|change| Arc::ptr_eq(&change.item.entry, entry))
         {
             if let Some(change) = changes.next() {
-                broadcaster.broadcast(change.kind.message(change.item)).await?;
+                let message = if !keep_item
+                    && change.kind == EntryChange::Changed(ChangeKind::MetadataOnly)
+                    && change.metadata_target != MetadataTargetVersion::Current
+                {
+                    StorageEntryMessage::VersionMetadataChanged {
+                        entry: change.item,
+                        target: change.metadata_target,
+                    }
+                } else {
+                    change.kind.message(change.item)
+                };
+                broadcaster.broadcast(message).await?;
             }
         }
         if !keep_item && entry.history().is_some() {

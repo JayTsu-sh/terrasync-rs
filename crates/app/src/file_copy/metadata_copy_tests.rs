@@ -49,8 +49,16 @@ async fn failed_source_metadata_does_not_block_data_and_reports_every_failed_fam
     )
     .await
     .unwrap_err();
-    match error {
-        AppError::StorageError(StorageError::SourceMetadataAcquisitionFailed { failures, .. }) => {
+    let source_error = match error {
+        AppError::StorageError(StorageError::PublishedDataMetadata { data, source }) => {
+            assert_eq!(data.transferred_bytes, b"readable payload".len() as u64);
+            assert!(data.metadata.is_none());
+            *source
+        }
+        other => panic!("expected completed data with metadata failure, got {other:?}"),
+    };
+    match source_error {
+        StorageError::SourceMetadataAcquisitionFailed { failures, .. } => {
             assert_eq!(failures.len(), 2);
             assert!(
                 failures

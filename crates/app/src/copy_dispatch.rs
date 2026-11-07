@@ -36,7 +36,11 @@ impl CopyQueues {
             | StorageEntryMessage::Packaged(entry)
             | StorageEntryMessage::Deleted(entry)
             | StorageEntryMessage::IntegrityChecked(entry) => entry.path().as_str().hash(&mut hash),
+            StorageEntryMessage::CopyItemCompleted { completion, .. } => {
+                completion.item.entry.path().as_str().hash(&mut hash)
+            }
             StorageEntryMessage::New(item)
+            | StorageEntryMessage::VersionMetadataChanged { entry: item, .. }
             | StorageEntryMessage::Changed { entry: item, .. }
             | StorageEntryMessage::CopyVersionFailed { entry: item, .. } => item.entry.path().as_str().hash(&mut hash),
             StorageEntryMessage::Renamed((_, to)) => to.path().as_str().hash(&mut hash),

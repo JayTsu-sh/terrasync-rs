@@ -24,6 +24,8 @@ macro_rules! file_scan_base_columns {
     hard_links UInt32 DEFAULT 0,
     current_state UInt8,
     copy_path_confirmed Bool DEFAULT true,
+    copy_data_confirmed Bool DEFAULT true,
+    copy_target_version Nullable(String) DEFAULT NULL,
     copy_execution_id String DEFAULT '',
     copy_sequence UInt64 DEFAULT 0,
     uid Nullable(UInt32) DEFAULT NULL,

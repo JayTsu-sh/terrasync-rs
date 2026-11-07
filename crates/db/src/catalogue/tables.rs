@@ -19,14 +19,15 @@ use crate::{
 };
 
 impl ClickHouseDatabase {
-    /// 创建主扫描表（ReplacingMergeTree，按 `relative_path` + `version_id` 排序）
+    /// 复制事实按代次选择同键最新版本，旧执行的延迟 ACK 不得恢复已撤销的就绪证明。
+    /// 普通扫描的 copy_sequence 为零，同代内仍沿用最后写入的状态。
     pub async fn create_scan_base_table(&self) -> Result<()> {
         let table_name = get_scan_base_table_name(&self.job_id);
         self.create_catalogue_table(
             &table_name,
             FILE_SCAN_COLUMNS_DEFINITION,
             "(relative_path, version_id)",
-            CatalogueEngine::Replacing,
+            CatalogueEngine::ReplacingVersion("copy_sequence"),
         )
         .await?;
         self.validate_scan_base_table().await

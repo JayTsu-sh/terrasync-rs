@@ -7,7 +7,7 @@ use task_model::observation::ObservedItem;
 use data_mover::model::ObservedEntry;
 use db::ClickHouseDatabase;
 use db::error::DatabaseError;
-use task_model::StorageEntryMessage;
+use task_model::{CopyCompletion, CopyReadiness, StorageEntryMessage};
 use tokio::sync::mpsc;
 use tracing::{Instrument, debug, error, info, info_span, trace};
 
@@ -78,7 +78,7 @@ impl Consumer for DatabaseConsumer {
             async move {
                 // 预分配容量以优化性能
                 let mut current_message_batch: Vec<StorageEntryMessage> = Vec::with_capacity(batch_size as usize);
-                let mut current_insert_entry_batch: Vec<ObservedItem> = Vec::with_capacity(batch_size as usize);
+                let mut current_insert_entry_batch: Vec<CopyCompletion> = Vec::with_capacity(batch_size as usize);
                 let mut current_delete_entry_batch: Vec<String> = Vec::with_capacity(batch_size as usize);
                 let mut processed_count = 0;
                 let mut processed_errors = DatabaseFailures::default();
@@ -101,6 +101,26 @@ impl Consumer for DatabaseConsumer {
                                     .await;
                                 }
                             }
+                        }
+                        StorageEntryMessage::CopyItemCompleted { completion, change } => {
+                            if job_type != JobType::Copy && completion.readiness == CopyReadiness::Ready {
+                                Self::batch_insert_incremental_record(
+                                    &db,
+                                    &change.message(completion.item.clone()),
+                                    &mut current_message_batch,
+                                    batch_size,
+                                    &mut processed_errors,
+                                )
+                                .await;
+                            }
+                            Self::batch_insert_copy_completion(
+                                &db,
+                                completion,
+                                &mut current_insert_entry_batch,
+                                batch_size,
+                                &mut processed_errors,
+                            )
+                            .await;
                         }
                         StorageEntryMessage::New(entry) => {
                             trace!(path = %entry.get_relative_path().display(), "db: new entry");
@@ -235,7 +255,8 @@ impl Consumer for DatabaseConsumer {
                                 "db: error entry, skipping"
                             );
                         }
-                        StorageEntryMessage::CopyVersionFailed { .. }
+                        StorageEntryMessage::VersionMetadataChanged { .. }
+                        | StorageEntryMessage::CopyVersionFailed { .. }
                         | StorageEntryMessage::CopySkipped { .. }
                         | StorageEntryMessage::TargetPreserved { .. }
                         | StorageEntryMessage::Diagnostic { .. } => {}
@@ -360,10 +381,24 @@ impl DatabaseConsumer {
     /// * `current_batch` - 当前批次的记录，新记录会被添加到这里
     /// * `batch_size` - 批量插入的大小阈值
     async fn batch_insert_base_record(
-        database: &ClickHouseDatabase, entry: &ObservedItem, current_batch: &mut Vec<ObservedItem>, batch_size: u32,
+        database: &ClickHouseDatabase, entry: &ObservedItem, current_batch: &mut Vec<CopyCompletion>, batch_size: u32,
         processed_errors: &mut DatabaseFailures,
     ) {
-        current_batch.push(entry.clone());
+        Self::batch_insert_copy_completion(
+            database,
+            entry.clone().into(),
+            current_batch,
+            batch_size,
+            processed_errors,
+        )
+        .await;
+    }
+
+    async fn batch_insert_copy_completion(
+        database: &ClickHouseDatabase, completion: CopyCompletion, current_batch: &mut Vec<CopyCompletion>,
+        batch_size: u32, processed_errors: &mut DatabaseFailures,
+    ) {
+        current_batch.push(completion);
 
         // 达到批量大小则异步插入数据库并切换缓冲
         if current_batch.len() >= batch_size as usize {
@@ -373,7 +408,7 @@ impl DatabaseConsumer {
             );
 
             let batch_len = current_batch.len();
-            if let Err(e) = database.batch_insert_completed_records(current_batch).await {
+            if let Err(e) = database.batch_insert_copy_completions(current_batch).await {
                 error!(
                     "[DatabaseConsumer] Failed to insert batch discarding {} records: {}",
                     batch_len, e
@@ -395,7 +430,7 @@ impl DatabaseConsumer {
     /// * `database` - 数据库实例引用
     /// * `current_batch` - 当前批次的记录，处理后会被清空
     async fn finalize_insert_base_record(
-        database: &ClickHouseDatabase, current_batch: &mut Vec<ObservedItem>, processed_errors: &mut DatabaseFailures,
+        database: &ClickHouseDatabase, current_batch: &mut Vec<CopyCompletion>, processed_errors: &mut DatabaseFailures,
     ) {
         if current_batch.is_empty() {
             info!("[DatabaseConsumer] No remaining records to flush");
@@ -405,7 +440,7 @@ impl DatabaseConsumer {
                 current_batch.len()
             );
 
-            if let Err(e) = database.batch_insert_completed_records(current_batch).await {
+            if let Err(e) = database.batch_insert_copy_completions(current_batch).await {
                 error!(
                     "[DatabaseConsumer] Failed to insert final batch discarding {} records: {}",
                     current_batch.len(),

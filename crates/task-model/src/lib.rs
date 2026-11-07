@@ -1,5 +1,6 @@
 //! CLI、Web、数据库和传输共用的纯任务契约。
 //! 观察始终使用原生类型；逐版本视图借用共享观察，不复制历史。
+mod copy;
 pub mod error;
 mod event;
 mod facts;
@@ -9,6 +10,7 @@ pub mod observation;
 mod retention;
 mod source_cleanup;
 mod transfer;
+pub use copy::{CopyCompletion, CopyReadiness, MetadataTargetVersion};
 pub use error::{Result, TaskModelError};
 pub use event::{ChangeKind, EntryChange, ErrorEvent, StorageEntryMessage};
 pub use facts::ObservedEntryExt;

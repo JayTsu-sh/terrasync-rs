@@ -15,6 +15,19 @@ content equality when the backend's observed identity also stays unchanged, sour
 purge safety, or whole-job throughput/RSS. Containers and their private data are
 removed on exit.
 
+`python3 tests/lab/run-notification-archive-local.py --version-metadata` runs
+56 real migration rounds across Single/two-replica ClickHouse, latest/history
+S3 destinations and quick/full verification. Each case denies source tag reads
+twice, denies destination tag writes twice, recovers, checks an unchanged round,
+and changes only an old source version's tags. It checks data-only versus whole
+readiness, raw source facts, exact destination version bindings and archived
+reports. An independent S3 client checks every body/tag/version, latest head and
+retained source; proxy counters require zero data replay in all six incremental
+rounds. HTTP 204 callback checks cumulative entry counts, each version failure,
+source observation diagnostics and conservative retained ranges separately.
+This does not establish recovery for ambiguous historical data publication,
+source purge readiness, whole-job network budgets or throughput/RSS.
+
 ## Direct 取消回归
 
 `verify-direct-cancel.py` 在真实远端 Local 目标和 QUIC 链路上验证 Direct 取消。

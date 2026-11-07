@@ -3,11 +3,11 @@ use std::{collections::HashMap, iter::once, path::PathBuf, sync::Arc};
 
 use data_mover::model::{ObjectHistory, ObservedEntry};
 use task_model::observation::{EntryStatistics, ObservedItem, ObservedView};
-use task_model::{ChangeKind, EntryChange, ErrorEvent, StorageEntryMessage};
+use task_model::{ChangeKind, EntryChange, ErrorEvent, MetadataTargetVersion, StorageEntryMessage};
 use tracing::error;
 
 use crate::broadcast::BroadcastForwarder;
-use crate::error::{AppError, Result};
+use crate::error::{AppError, Result, StorageError};
 use crate::file_copy::selection::skip_unrepresentable;
 use crate::file_copy::{CopyOptions, VersionCopyScope, VersionFailureContext, copy_versions, retain_version};
 use crate::storage_factory::StorageContext;
@@ -23,6 +23,7 @@ pub(crate) struct HistoryCopyPolicy {
     pub active_entry_limit: usize,
     pub target_history: Option<bool>,
     pub completion: HistoryCompletion,
+    pub recovering: bool,
 }
 
 pub(crate) struct HistoryCopyContext {
@@ -120,6 +121,10 @@ impl HistoryCopyWorker {
             {
                 self.version(entry, EntryChange::Changed(*kind)).await?;
             }
+            StorageEntryMessage::VersionMetadataChanged { entry, target } => {
+                self.version_with_target(entry, EntryChange::Changed(ChangeKind::MetadataOnly), Some(target))
+                    .await?;
+            }
             StorageEntryMessage::CopyEntryBoundary(entry) => self.end_segment(entry).await?,
             _ => return Ok(false),
         }
@@ -134,6 +139,12 @@ impl HistoryCopyWorker {
     }
 
     async fn version(&mut self, item: &ObservedItem, change: EntryChange) -> Result<()> {
+        self.version_with_target(item, change, None).await
+    }
+
+    async fn version_with_target(
+        &mut self, item: &ObservedItem, change: EntryChange, target: Option<&MetadataTargetVersion>,
+    ) -> Result<()> {
         let path = item.view().source_path()?.as_str().to_owned();
         let index = item
             .version_index
@@ -177,19 +188,32 @@ impl HistoryCopyWorker {
             self.entry(&path, segment)?.skipped = true;
             return Ok(());
         }
-        let result = copy_versions(
-            once(item.clone()),
-            &self.context.source,
-            &self.context.destination,
-            self.context.options.clone(),
-            &self.context.job_id,
-            &self.context.broadcaster,
-            VersionCopyScope::SelectedVersion {
-                change,
-                target_history: Some(target_history),
-            },
-        )
-        .await;
+        let result = if self.policy.recovering
+            && target_history
+            && change != EntryChange::Changed(ChangeKind::MetadataOnly)
+            && retain_version(item, true)
+        {
+            Err(StorageError::HistoricalPublicationUnconfirmed {
+                path: item.view().source_path()?,
+                source_version: item.view().version_id().into(),
+            }
+            .into())
+        } else {
+            copy_versions(
+                once(item.clone()),
+                &self.context.source,
+                &self.context.destination,
+                self.context.options.clone(),
+                &self.context.job_id,
+                &self.context.broadcaster,
+                VersionCopyScope::SelectedVersion {
+                    change,
+                    target_history: Some(target_history),
+                    metadata_target: target,
+                },
+            )
+            .await
+        };
         match result {
             Ok(()) if retain_version(item, target_history) => {
                 let state = self.entry(&path, segment)?;

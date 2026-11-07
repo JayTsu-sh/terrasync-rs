@@ -230,7 +230,8 @@ async fn cluster_catalogue_copy_sync_and_delete_are_job_isolated() -> Result<()>
     assert!(
         matches!(changed.as_slice(), [(entry, ChangeKind::DataOnly)] if entry.get_relative_path().to_string_lossy()=="keep")
     );
-    a.insert_temp_to_base_table(&[("added".into(), String::new())]).await?;
+    a.insert_temp_to_base_table(&[("added".into(), String::new(), false)])
+        .await?;
     let final_events: Vec<_> = a.detect_deleted_items().await?.collect();
     assert!(final_events.iter().any(
         |event| matches!(event, DeletionStatus::Deleted(entry) if entry.get_relative_path().to_string_lossy()=="gone")
@@ -545,7 +546,10 @@ async fn history_copy_recovery_keeps_the_group_and_does_not_delete_the_replayed_
     assert_eq!(before_ack[0].version_id, "z-old");
     assert_eq!(database.detect_changed_items().await?.count(), 0);
     database
-        .insert_temp_to_base_table(&[("object".into(), "m-delete".into()), ("object".into(), "a-new".into())])
+        .insert_temp_to_base_table(&[
+            ("object".into(), "m-delete".into(), false),
+            ("object".into(), "a-new".into(), false),
+        ])
         .await?;
     // 历史目标只复制未确认版本，已确认历史仍保留并标记为本轮观察。
     assert_eq!(fixture.rows("history_copy").await?.len(), 1);

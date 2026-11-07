@@ -62,9 +62,9 @@ async fn optional_source_metadata_failure_retains_inline_facts_and_delivers_read
     let result = copy_file(&source, &target, &Arc::new(entry), CopyOptions::default(), None).await;
     assert!(matches!(
         result,
-        Err(AppError::StorageError(
-            StorageError::SourceMetadataAcquisitionFailed { .. }
-        ))
+        Err(AppError::StorageError(StorageError::PublishedDataMetadata { data, source }))
+            if data.transferred_bytes == b"readable".len() as u64
+                && matches!(*source, StorageError::SourceMetadataAcquisitionFailed { .. })
     ));
     assert_eq!(std::fs::read(target_root.path().join("file")).unwrap(), b"readable");
     assert_eq!(std::fs::read(root.path().join("file")).unwrap(), b"readable");

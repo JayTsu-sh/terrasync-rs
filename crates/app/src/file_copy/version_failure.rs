@@ -15,6 +15,13 @@ pub(crate) struct VersionFailureContext {
 impl VersionFailureContext {
     pub fn for_error(error: &StorageError, source: BackendKind, destination: BackendKind) -> Self {
         let (phase, backend, metadata_only) = match error {
+            StorageError::PublishedDataMetadata { source: error, .. } => {
+                return Self::for_error(error, source, destination);
+            }
+            StorageError::HistoricalPublicationUnconfirmed { .. } => {
+                ("historical_publication_unconfirmed".into(), destination, false)
+            }
+            StorageError::TargetVersionUnconfirmed { .. } => ("target_version_binding".into(), destination, true),
             StorageError::TransferAndMetadata { data, .. } => return Self::for_error(data, source, destination),
             StorageError::SourceMetadataAcquisitionFailed { .. } => ("source_metadata".into(), source, true),
             StorageError::MetadataPlan(error) => {

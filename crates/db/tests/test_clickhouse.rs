@@ -1622,7 +1622,9 @@ mod clickhouse_integration_tests {
         db.batch_insert_temp_record(&batch).await.unwrap();
 
         // 排除前 20 条
-        let excluded: Vec<(String, String)> = (0..20).map(|i| (format!("dir/{}.txt", i), String::new())).collect();
+        let excluded: Vec<(String, String, bool)> = (0..20)
+            .map(|i| (format!("dir/{}.txt", i), String::new(), false))
+            .collect();
         db.insert_temp_to_base_table(&excluded).await.unwrap();
 
         let count = db.get_count(db::SCAN_BASE_TABLE_BASE_NAME).await.unwrap();
@@ -1645,7 +1647,9 @@ mod clickhouse_integration_tests {
             .collect();
         db.batch_insert_temp_record(&batch).await.unwrap();
 
-        let excluded: Vec<(String, String)> = (0..100).map(|i| (format!("dir/{}.txt", i), String::new())).collect();
+        let excluded: Vec<(String, String, bool)> = (0..100)
+            .map(|i| (format!("dir/{}.txt", i), String::new(), false))
+            .collect();
         db.insert_temp_to_base_table(&excluded).await.unwrap();
 
         let count = db.get_count(db::SCAN_BASE_TABLE_BASE_NAME).await.unwrap();
@@ -1671,7 +1675,7 @@ mod clickhouse_integration_tests {
         db.batch_insert_temp_record(&batch).await.unwrap();
 
         // 只排除 v2
-        let excluded = vec![("a.txt".to_string(), "v2".to_string())];
+        let excluded = vec![("a.txt".to_string(), "v2".to_string(), false)];
         db.insert_temp_to_base_table(&excluded).await.unwrap();
 
         let count = db.get_count(db::SCAN_BASE_TABLE_BASE_NAME).await.unwrap();
@@ -1771,17 +1775,19 @@ mod clickhouse_integration_tests {
         let changed_items: Vec<_> = db.detect_changed_items().await.unwrap().collect();
 
         // 收集 excluded_paths（模拟 app 层 keep_item=false 行为）
-        let mut excluded: Vec<(String, String)> = Vec::new();
+        let mut excluded: Vec<(String, String, bool)> = Vec::new();
         for item in &new_items {
             excluded.push((
                 item.get_relative_path().to_string_lossy().into_owned(),
                 item.get_version_id().unwrap_or_default().to_string(),
+                false,
             ));
         }
         for (item, _kind) in &changed_items {
             excluded.push((
                 item.get_relative_path().to_string_lossy().into_owned(),
                 item.get_version_id().unwrap_or_default().to_string(),
+                false,
             ));
         }
 

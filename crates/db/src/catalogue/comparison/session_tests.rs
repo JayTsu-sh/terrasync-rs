@@ -42,6 +42,7 @@ async fn catalogue(mock: &Mock) -> Result<ClickHouseDatabase> {
 struct ExclusionReply {
     relative_path: String,
     version_id: String,
+    data_unchanged: bool,
 }
 
 #[tokio::test]
@@ -50,16 +51,17 @@ async fn borrowed_exclusion_keys_preserve_the_rowbinary_wire_shape() -> Result<(
     let database = catalogue(&mock).await?;
     let recorded = mock.add(handlers::record::<ExclusionReply>());
     let keys = vec![
-        ("目录/文件".to_owned(), String::new()),
-        ("other".to_owned(), "v1".to_owned()),
+        ("目录/文件".to_owned(), String::new(), true),
+        ("other".to_owned(), "v1".to_owned(), false),
     ];
     database.write_catalogue_exclusions("owned_exclusions", &keys).await?;
     let actual: Vec<ExclusionReply> = recorded.collect().await;
     let expected: Vec<_> = keys
         .into_iter()
-        .map(|(relative_path, version_id)| ExclusionReply {
+        .map(|(relative_path, version_id, data_unchanged)| ExclusionReply {
             relative_path,
             version_id,
+            data_unchanged,
         })
         .collect();
     assert_eq!(actual, expected);
@@ -160,6 +162,7 @@ struct DifferenceReply<'a> {
     relative_path: &'a str,
     version_id: &'a str,
     change_code: u8,
+    target_version: Option<&'a str>,
 }
 
 #[tokio::test]
@@ -173,6 +176,7 @@ async fn an_invalid_classification_cannot_publish_a_partial_plan() -> Result<()>
             relative_path,
             version_id: "",
             change_code: 0,
+            target_version: None,
         }
     })));
     let cleanup = mock.add(handlers::record_ddl());

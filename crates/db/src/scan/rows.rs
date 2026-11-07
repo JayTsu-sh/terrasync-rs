@@ -222,6 +222,9 @@ pub(crate) struct NativeScanRecord<'a> {
     pub history_index: u32,
     pub copy_execution_id: &'a str,
     pub copy_sequence: u64,
+    pub copy_path_confirmed: bool,
+    pub copy_data_confirmed: bool,
+    pub copy_target_version: Option<&'a str>,
 }
 // 请求边界按载荷预算划分，不能把调用方的批次固定切成千行 HTTP 请求。
 // 预算只统计本请求拥有的编码／字符串，借用的观察由调用方持有。
@@ -332,6 +335,9 @@ impl<'a> NativeScanRecord<'a> {
             history_index: view.version_index.unwrap_or_default() as u32,
             copy_execution_id: "",
             copy_sequence: 0,
+            copy_path_confirmed: true,
+            copy_data_confirmed: true,
+            copy_target_version: None,
         })
     }
     #[cfg(test)]

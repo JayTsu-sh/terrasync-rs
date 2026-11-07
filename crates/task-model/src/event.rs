@@ -1,5 +1,5 @@
 //! 任务分类与观察事件；不承担数据库、网络和存储 I/O。
-use crate::{ObservedEntryExt, TargetRetention, observation::ObservedItem};
+use crate::{CopyCompletion, MetadataTargetVersion, ObservedEntryExt, TargetRetention, observation::ObservedItem};
 use data_mover_model::{BackendKind, ObservedEntry};
 use serde::{Deserialize, Serialize};
 use std::{fmt, path::PathBuf, sync::Arc};
@@ -119,6 +119,16 @@ pub enum StorageEntryMessage {
     CopySkipped { entry: Arc<ObservedEntry>, reason: String },
     /// 新增文件
     New(ObservedItem),
+    /// 逐项完成事实只负责持久化；逻辑 entry 的成功／失败仍由边界事件计数。
+    CopyItemCompleted {
+        completion: CopyCompletion,
+        change: EntryChange,
+    },
+    /// 历史版本的元数据工作携带实际目标版本，不重新复制数据。
+    VersionMetadataChanged {
+        entry: ObservedItem,
+        target: MetadataTargetVersion,
+    },
     /// 一个逻辑 entry 的全部历史分段及所选版本复制完成；版本行另行落库。
     CopyEntryCompleted {
         entry: Arc<ObservedEntry>,

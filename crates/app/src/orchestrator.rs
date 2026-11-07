@@ -3,6 +3,7 @@
 //! SyncOrchestrator 封装 sync/incremental_sync 的核心逻辑，
 //! 通过 Transport 抽象层连接 Sender 和 Receiver，支持单进程和双进程两种模式。
 
+use crate::error::StorageError;
 use crate::file_copy::transfer as copy_transfer;
 // 标准库
 use crate::copy_dispatch::{CopyQueues, partition_scan};
@@ -1038,6 +1039,7 @@ impl SyncOrchestrator {
                 active_entry_limit: incremental_scan_concurrency,
                 target_history: Some(target_history),
                 completion: HistoryCompletion::Incremental,
+                recovering: database.copy_generation_recovering().await,
             },
         )
         .await;
@@ -1090,6 +1092,9 @@ impl SyncOrchestrator {
                                     )
                                     .await?;
                                 }
+                            }
+                            StorageEntryMessage::Diagnostic { .. } => {
+                                broadcaster.broadcast(msg.clone()).await?;
                             }
                             StorageEntryMessage::Error {
                                 ref path, ref reason, ..
@@ -1149,6 +1154,17 @@ impl SyncOrchestrator {
         let durable_result = finish_phase(consumer_handles).await;
         let enumeration_result = walkdir_iter.take_error().map_or(Ok(()), |error| Err(error.into()));
         // 未完整比对或未持久化的条目不能作为删除依据。
+        // 元数据读取诊断已随观察交付；优先返回 worker 已计数的同项失败，避免再记任务错误。
+        let (enumeration_result, handler_result) =
+            if matches!(
+                &enumeration_result,
+                Err(AppError::StorageError(StorageError::TraversalObservation(_)))
+            ) && handler_result.as_ref().is_err_and(AppError::is_reported_copy_failure)
+            {
+                (Ok(()), handler_result)
+            } else {
+                (enumeration_result, handler_result)
+            };
         let phase_a = enumeration_result
             .and(scan_result)
             .and(handler_result)
