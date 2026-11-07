@@ -82,6 +82,17 @@ def run_inside():
         "storage_tests::s3_versions::required_consumer_failure_stops_history_worker_before_next_version_or_entry",
         "--", "--ignored", "--exact", "--nocapture",
     ], cwd=ROOT, env=environment, check=True)
+    subprocess.run([
+        "cargo", "test", "--offline", "--locked", "-p", "app", "--lib",
+        "storage_tests::s3_versions::segmented_full_copy_counts_one_logical_entry_and_keeps_every_version",
+        "--", "--ignored", "--exact", "--nocapture",
+    ], cwd=ROOT, env=environment, check=True)
+    for cap in (1, 7):
+        key = f"segment-success-{cap}/payload"
+        versions = client.list_object_versions(Bucket=buckets["history"], Prefix=key)
+        assert len(versions.get("Versions", [])) == 20 and not versions.get("DeleteMarkers"), versions
+        assert client.get_object(Bucket=buckets["history"], Key=key)["Body"].read() == b"payload"
+    print("independent S3 inspection segmented_full caps=1,7 logical_entries=1 target_versions=20", flush=True)
     published = client.list_object_versions(Bucket=buckets["history"], Prefix="consumer-closed/payload")
     assert len(published.get("Versions", [])) == 1 and not published.get("DeleteMarkers"), published
     retained = client.list_object_versions(Bucket=buckets["source"], Prefix="payload")
@@ -168,6 +179,12 @@ def run_inside():
         assert len(failed_records) == 20, len(failed_records)
         assert client.get_object(Bucket=buckets["history"], Key="metadata-failure/payload")["Body"].read() == b"payload"
         print("independent S3 inspection metadata_failures=20 target_data_versions=20 failed_entries=1", flush=True)
+        for cap in (1, 7):
+            key = f"metadata-failure/segments-{cap}/payload"
+            versions = client.list_object_versions(Bucket=buckets["history"], Prefix=key)
+            assert len(versions.get("Versions", [])) == 20 and not versions.get("DeleteMarkers"), versions
+            assert client.get_object(Bucket=buckets["history"], Key=key)["Body"].read() == b"payload"
+        print("independent S3 inspection segmented_metadata caps=1,7 failed_entries=1 target_data_versions=20 extra_tag_reads=0", flush=True)
         fault = "data"
         subprocess.run([
             "cargo", "test", "--offline", "--locked", "-p", "app", "--lib",

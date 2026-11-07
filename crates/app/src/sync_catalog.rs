@@ -3,8 +3,8 @@
 use std::sync::Arc;
 
 use data_mover::model::ObservedEntry;
-use db::ClickHouseDatabase;
 use db::catalogue::ComparisonMode;
+use db::{ClickHouseDatabase, DatabaseError};
 use task_model::StorageEntryMessage;
 use tracing::trace;
 
@@ -39,9 +39,31 @@ pub(crate) async fn batch_processing_to_generate_message(
     } else {
         ComparisonMode::AwaitCopyAcknowledgement
     };
-    let changes = database.compare_catalogue_batch(batch, mode).await?;
-    for change in changes {
-        broadcaster.broadcast(change.kind.message(change.item)).await?;
+    let mut changes = database
+        .compare_catalogue_batch(batch, mode)
+        .await?
+        .into_iter()
+        .peekable();
+    for entry in batch {
+        while changes
+            .peek()
+            .is_some_and(|change| Arc::ptr_eq(&change.item.entry, entry))
+        {
+            if let Some(change) = changes.next() {
+                broadcaster.broadcast(change.kind.message(change.item)).await?;
+            }
+        }
+        if !keep_item && entry.history().is_some() {
+            broadcaster
+                .broadcast(StorageEntryMessage::CopyEntryBoundary(entry.clone()))
+                .await?;
+        }
+    }
+    if changes.next().is_some() {
+        return Err(DatabaseError::ObservationProjectionMismatch {
+            field: "catalogue input order",
+        }
+        .into());
     }
     Ok(())
 }

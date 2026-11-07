@@ -29,8 +29,10 @@ impl CopyQueues {
                 retention.source_path.as_deref().unwrap_or_default().hash(&mut hash)
             }
             StorageEntryMessage::Scanned(entry)
+            | StorageEntryMessage::CopyEntryBoundary(entry)
             | StorageEntryMessage::CopySkipped { entry, .. }
             | StorageEntryMessage::CopyEntryCompleted { entry, .. }
+            | StorageEntryMessage::CopyEntryDeltaCompleted { entry, .. }
             | StorageEntryMessage::Packaged(entry)
             | StorageEntryMessage::Deleted(entry)
             | StorageEntryMessage::IntegrityChecked(entry) => entry.path().as_str().hash(&mut hash),

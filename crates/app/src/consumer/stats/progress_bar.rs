@@ -8,8 +8,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use indicatif::{ProgressBar as IndicatifBar, ProgressStyle};
-use task_model::StorageEntryMessage;
 use task_model::observation::{EntryProgress, EntryStatistics};
+use task_model::{EntryChange, StorageEntryMessage};
 use tracing::info;
 
 use super::accumulator::{IncrementalStats, fmt_elapsed, format_bytes};
@@ -290,7 +290,9 @@ impl ProgressBar {
             StorageEntryMessage::TargetPreserved { .. } => return,
             StorageEntryMessage::Scanned(entry) | StorageEntryMessage::Packaged(entry) => (entry, "scanned"),
             StorageEntryMessage::New(item) => {
-                if matches!(&self.counters, CounterSet::Full(_)) && item.entry.history().is_some() {
+                if item.entry.history().is_some()
+                    && (matches!(&self.counters, CounterSet::Full(_)) || self.job_type == JobType::IncrementalCopy)
+                {
                     return;
                 }
                 let operation = match &self.counters {
@@ -315,7 +317,30 @@ impl ProgressBar {
                 return;
             }
             StorageEntryMessage::Changed { entry, .. } => {
+                if self.job_type == JobType::IncrementalCopy && entry.entry.history().is_some() {
+                    return;
+                }
                 self.update_observed("changed", &entry.view());
+                return;
+            }
+            StorageEntryMessage::CopyEntryDeltaCompleted {
+                entry,
+                change,
+                logical_bytes,
+            } => {
+                let operation = match change {
+                    EntryChange::New => "new",
+                    EntryChange::Changed(_) => "changed",
+                };
+                self.update_observed(
+                    operation,
+                    &EntryProgress {
+                        entry,
+                        logical_bytes: *logical_bytes,
+                        count_entry: true,
+                        distribution_bytes: None,
+                    },
+                );
                 return;
             }
             StorageEntryMessage::Deleted(entry) => (entry, "deleted"),
@@ -339,6 +364,7 @@ impl ProgressBar {
                 return;
             }
             StorageEntryMessage::Diagnostic { .. }
+            | StorageEntryMessage::CopyEntryBoundary(_)
             | StorageEntryMessage::CopySkipped { .. }
             | StorageEntryMessage::TarManifest { .. }
             | StorageEntryMessage::CopyVersionFailed {

@@ -12,7 +12,7 @@ use task_model::ObservedEntryExt;
 // 外部 crate
 use crate::storage_factory::StorageContext;
 use crate::task_stream::AsyncReceiver;
-use data_mover::model::{EntryKind, ObservedEntry, StoragePath};
+use data_mover::model::ObservedEntry;
 use data_mover::qos::QosManager;
 use task_model::StorageEntryMessage;
 use tracing::{error, info};
@@ -21,16 +21,17 @@ use transport::traits::SenderTransport;
 
 // 内部模块
 use crate::broadcast::BroadcastForwarder;
+use crate::copy_history::{HistoryCompletion, HistoryCopyContext, HistoryCopyPolicy, HistoryCopyWorker};
 use crate::error::{AppError, Result};
-use crate::file_copy::copy_versions;
+use crate::file_copy::CopyOptions;
 use crate::file_copy::selection::skip_unrepresentable;
-use crate::file_copy::{CopyOptions, VersionCopyScope};
 use crate::receiver::ReceiverConfig;
 use crate::tar_pack;
-use task_model::observation::ObservedItem;
+use task_model::observation::EntryProgress;
 
 /// Sender worker 配置
 pub struct SenderWorkerConfig {
+    pub target_history: Option<bool>,
     pub enable_integrity_check: bool,
     pub enable_acl: bool,
     pub is_source_reserved: bool,
@@ -52,7 +53,26 @@ pub async fn sender_worker(
 ) -> Result<()> {
     info!("[Sender Worker {}] Started", worker_id);
     let mut failure = None;
-    let mut blocked_history: Option<(StoragePath, EntryKind, String)> = None;
+    let mut history = HistoryCopyWorker::new(
+        HistoryCopyContext {
+            source: src_storage.clone(),
+            destination: dest_storage.clone(),
+            broadcaster: broadcaster.clone(),
+            job_id: copy_config.job_id.clone(),
+            options: CopyOptions {
+                transfer_mode: copy_config.transfer_mode,
+                qos: qos_manager.clone(),
+                enable_integrity_check: copy_config.enable_integrity_check,
+                bytes_counter: bytes_tracker.clone(),
+                cancel: None,
+            },
+        },
+        HistoryCopyPolicy {
+            active_entry_limit: 1,
+            target_history: config.target_history,
+            completion: HistoryCompletion::Full,
+        },
+    );
 
     while let Some(msg) = walkdir_iter.next().await {
         if broadcaster.is_closed() {
@@ -61,14 +81,22 @@ pub async fn sender_worker(
         match msg {
             StorageEntryMessage::Diagnostic { .. } => broadcaster.broadcast(msg).await?,
             StorageEntryMessage::Scanned(entry) => {
-                if skip_unrepresentable(&entry, &dest_storage, broadcaster).await? {
+                if entry.history().is_some() {
+                    active_entry_counter.fetch_add(1, Ordering::Relaxed);
+                    if entry.history().is_some_and(|history| history.segment() == 0) {
+                        entry_counter.fetch_add(1, Ordering::Relaxed);
+                    }
+                    size_counter.fetch_add(
+                        EntryProgress::copy_inventory(&entry, !config.target_history.unwrap_or(true)).logical_bytes,
+                        Ordering::Relaxed,
+                    );
+                    let result = history.copy_segment(&entry).await;
+                    active_entry_counter.fetch_sub(1, Ordering::Relaxed);
+                    result?;
                     continue;
                 }
-                if blocked_history
-                    .as_ref()
-                    .is_some_and(|(path, kind, _)| path != entry.path() || *kind != entry.kind())
-                {
-                    blocked_history = None;
+                if skip_unrepresentable(&entry, &dest_storage, broadcaster).await? {
+                    continue;
                 }
                 active_entry_counter.fetch_add(1, Ordering::Relaxed);
                 entry_counter.fetch_add(1, Ordering::Relaxed);
@@ -83,53 +111,11 @@ pub async fn sender_worker(
                     );
                 }
 
-                let result = if entry.history().is_some() {
-                    if let Some((_, _, reason)) = &blocked_history {
-                        active_entry_counter.fetch_sub(1, Ordering::Relaxed);
-                        for (index, item) in ObservedItem::all(&entry).enumerate() {
-                            broadcaster
-                                .broadcast(StorageEntryMessage::CopyVersionFailed {
-                                    entry: item,
-                                    phase: "blocked_by_prior_version".into(),
-                                    backend: dest_storage.storage().kind(),
-                                    reason: format!(
-                                        "历史分段 {} 未执行：此前版本的数据复制失败：{reason}",
-                                        entry.history().map_or(0, |history| history.segment())
-                                    ),
-                                    // 分段交付的每个 entry 独立计数，段内版本共享一次失败。
-                                    first_in_entry: index == 0,
-                                })
-                                .await?;
-                        }
-                        continue;
-                    }
-                    // 同一路径的分段由固定 worker 顺序复制，不经过第二级竞争队列。
-                    copy_versions(
-                        ObservedItem::all(&entry),
-                        &src_storage,
-                        &dest_storage,
-                        CopyOptions {
-                            transfer_mode: copy_config.transfer_mode,
-                            qos: qos_manager.clone(),
-                            enable_integrity_check: copy_config.enable_integrity_check,
-                            bytes_counter: bytes_tracker.clone(),
-                            cancel: None,
-                        },
-                        &copy_config.job_id,
-                        broadcaster,
-                        VersionCopyScope::WholeEntry,
-                    )
-                    .await
-                } else {
-                    send_entry(worker_id, &transport, &entry).await
-                };
+                let result = send_entry(worker_id, &transport, &entry).await;
                 active_entry_counter.fetch_sub(1, Ordering::Relaxed);
                 if let Err(error) = result {
                     if error.stops_event_pipeline() {
                         return Err(error);
-                    }
-                    if error.reported_copy_data_failed() {
-                        blocked_history = Some((entry.path().clone(), entry.kind(), error.to_string()));
                     }
                     failure.get_or_insert(error);
                 }
@@ -184,7 +170,8 @@ pub async fn sender_worker(
     }
 
     info!("[Sender Worker {}] Completed", worker_id);
-    failure.map_or(Ok(()), Err)
+    let history_result = history.finish().await;
+    failure.map_or(history_result, Err)
 }
 
 async fn send_entry(worker_id: usize, transport: &Arc<dyn SenderTransport>, entry: &Arc<ObservedEntry>) -> Result<()> {
@@ -299,6 +286,7 @@ mod tests {
         let storage = Arc::new(create_storage(tmp.path().to_str().unwrap(), None, false).await.unwrap());
 
         let config = SenderWorkerConfig {
+            target_history: None,
             enable_integrity_check: false,
             enable_acl: false,
             is_source_reserved: true,
@@ -402,6 +390,7 @@ mod tests {
         }
         drop(tx);
         let config = SenderWorkerConfig {
+            target_history: None,
             enable_integrity_check: false,
             enable_acl: false,
             is_source_reserved: true,

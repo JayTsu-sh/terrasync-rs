@@ -51,6 +51,31 @@ impl Display for CopyStep {
 /// 应用程序的专用错误枚举
 #[derive(Error, Debug)]
 pub enum AppError {
+    #[error("历史版本分段顺序无效: {path:?}, expected={expected}, actual={actual}")]
+    CopyHistoryOrder { path: PathBuf, expected: u32, actual: u32 },
+    #[error("历史版本没有完整结束: {path:?}, last_version={last_version:?}")]
+    CopyHistoryIncomplete {
+        path: PathBuf,
+        last_version: Option<String>,
+    },
+    #[error("活跃历史 entry 超出有界协议: {path:?}, limit={limit}")]
+    CopyHistoryCapacity { path: PathBuf, limit: usize },
+    #[error("历史版本分段编号超出范围: {path:?}")]
+    CopyHistorySegmentOverflow { path: PathBuf },
+    #[error("历史版本选择无效: {path:?}, version_index={version_index:?}")]
+    CopyHistorySelection {
+        path: PathBuf,
+        version_index: Option<usize>,
+    },
+    #[error("历史分段内版本顺序无效: {path:?}, segment={segment}, previous={previous}, actual={actual}")]
+    CopyHistoryVersionOrder {
+        path: PathBuf,
+        segment: u32,
+        previous: usize,
+        actual: usize,
+    },
+    #[error("历史 entry 的版本字节总量超出统计范围: {path:?}")]
+    CopyHistoryBytesOverflow { path: PathBuf },
     #[error(transparent)]
     MigrationPolicy(#[from] task_model::TaskModelError),
     #[error("迁移失败: {source}; 代次收尾也失败: {finalization}")]
@@ -334,6 +359,7 @@ impl AppError {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn reported_copy_data_failed(&self) -> bool {
         match self {
             Self::ReportedCopyFailure { data_failed, .. } => *data_failed,

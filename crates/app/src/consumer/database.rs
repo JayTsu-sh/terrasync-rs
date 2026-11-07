@@ -208,7 +208,9 @@ impl Consumer for DatabaseConsumer {
                         }
                         StorageEntryMessage::IntegrityChecked(_)
                         | StorageEntryMessage::Packaged(_)
-                        | StorageEntryMessage::CopyEntryCompleted { .. } => {
+                        | StorageEntryMessage::CopyEntryCompleted { .. }
+                        | StorageEntryMessage::CopyEntryBoundary(_)
+                        | StorageEntryMessage::CopyEntryDeltaCompleted { .. } => {
                             // 完整性检查/Packaged 操作，不做数据库操作
                         }
                         StorageEntryMessage::TarManifest {

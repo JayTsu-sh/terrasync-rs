@@ -3,9 +3,11 @@ use super::{create_storage_pair_with_retry, mount_concurrency_for_pair, wait_for
 use crate::{
     broadcast::BroadcastForwarder,
     config::SyncJobConfig,
+    copy_history::{HistoryCopyContext, HistoryCopyPolicy, HistoryCopyWorker},
     error::{AppError, Result},
+    file_copy::CopyOptions,
     file_copy::selection::SkipTracker,
-    sync::{ResumeOpts, process_entry, process_metadata_only_entry, process_versioned_entry},
+    sync::{ResumeOpts, process_entry, process_metadata_only_entry},
     tar_pack,
     task_stream::AsyncReceiver,
 };
@@ -15,7 +17,7 @@ use std::sync::{
     atomic::{AtomicU64, AtomicUsize, Ordering},
 };
 use task_model::{
-    ChangeKind, EntryChange, ErrorEvent, ObservedEntryExt, StorageEntryMessage, TargetRetention, TargetRetentionReason,
+    ChangeKind, ErrorEvent, ObservedEntryExt, StorageEntryMessage, TargetRetention, TargetRetentionReason,
 };
 use tokio::{sync::Semaphore, task::JoinHandle};
 use tracing::{Instrument, error, info, info_span};
@@ -23,7 +25,7 @@ use tracing::{Instrument, error, info, info_span};
 pub(super) async fn spawn_handlers(
     c: &SyncJobConfig, handler_inputs: Vec<AsyncReceiver<StorageEntryMessage>>,
     broadcaster: BroadcastForwarder<StorageEntryMessage>, qos_manager: Option<QosManager>,
-    bytes_tracker: Option<Arc<AtomicU64>>, block_size: Option<usize>,
+    bytes_tracker: Option<Arc<AtomicU64>>, block_size: Option<usize>, history_policy: HistoryCopyPolicy,
 ) -> Vec<JoinHandle<Result<()>>> {
     let copy_concurrency = handler_inputs.len();
     let is_source_reserved = c.source_cleanup.retains_source();
@@ -85,7 +87,26 @@ pub(super) async fn spawn_handlers(
 
                 let mut failure: Option<AppError> = None;
                 let mut skipped = SkipTracker::default();
+                let mut history = HistoryCopyWorker::new(
+                    HistoryCopyContext {
+                        source: src.clone(),
+                        destination: dest.clone(),
+                        broadcaster: bc.clone(),
+                        job_id: resume_opts.job_id.clone(),
+                        options: CopyOptions {
+                            transfer_mode: resume_opts.transfer_mode,
+                            qos: qos.clone(),
+                            enable_integrity_check,
+                            bytes_counter: bt.clone(),
+                            cancel: None,
+                        },
+                    },
+                    history_policy,
+                );
                 while let Some(message) = rx.next().await {
+                    if history.process(&message).await? {
+                        continue;
+                    }
                     let selected = match &message {
                         StorageEntryMessage::New(item) | StorageEntryMessage::Changed { entry: item, .. } => {
                             Some(&item.entry)
@@ -99,56 +120,36 @@ pub(super) async fn spawn_handlers(
                     }
                     match message {
                         StorageEntryMessage::New(ref entry) => {
-                            if entry.get_version_id().is_some() {
-                                if let Err(error) = process_versioned_entry(
-                                    entry,
-                                    src.clone(),
-                                    dest.clone(),
-                                    bc.clone(),
-                                    qos.clone(),
-                                    enable_integrity_check,
-                                    enable_acl,
-                                    is_source_reserved,
-                                    bt.clone(),
-                                    resume_opts.clone(),
-                                    EntryChange::New,
-                                )
-                                .await
-                                {
-                                    failure.get_or_insert(error);
-                                }
-                            } else {
-                                match process_entry(
-                                    &entry.entry,
-                                    src.clone(),
-                                    dest.clone(),
-                                    enable_integrity_check,
-                                    enable_acl,
-                                    is_source_reserved,
-                                    qos.clone(),
-                                    bt.clone(),
-                                    &bc,
-                                    resume_opts.clone(),
-                                )
-                                .await
-                                {
-                                    Ok(()) => bc.broadcast(message.clone()).await?,
-                                    Err(e) => {
-                                        error!(
-                                            "Handler {}: Failed to process new entry {:?}: {}",
-                                            handler_id,
-                                            entry.get_relative_path(),
-                                            e
-                                        );
-                                        bc.broadcast(StorageEntryMessage::Error {
-                                            event: ErrorEvent::Copy,
-                                            path: entry.get_relative_path().to_path_buf(),
-                                            entry: Some(Arc::clone(&entry.entry)),
-                                            reason: format!("{e}"),
-                                        })
-                                        .await?;
-                                        failure.get_or_insert(e.into());
-                                    }
+                            match process_entry(
+                                &entry.entry,
+                                src.clone(),
+                                dest.clone(),
+                                enable_integrity_check,
+                                enable_acl,
+                                is_source_reserved,
+                                qos.clone(),
+                                bt.clone(),
+                                &bc,
+                                resume_opts.clone(),
+                            )
+                            .await
+                            {
+                                Ok(()) => bc.broadcast(message.clone()).await?,
+                                Err(e) => {
+                                    error!(
+                                        "Handler {}: Failed to process new entry {:?}: {}",
+                                        handler_id,
+                                        entry.get_relative_path(),
+                                        e
+                                    );
+                                    bc.broadcast(StorageEntryMessage::Error {
+                                        event: ErrorEvent::Copy,
+                                        path: entry.get_relative_path().to_path_buf(),
+                                        entry: Some(Arc::clone(&entry.entry)),
+                                        reason: format!("{e}"),
+                                    })
+                                    .await?;
+                                    failure.get_or_insert(e);
                                 }
                             }
                         }
@@ -166,22 +167,7 @@ pub(super) async fn spawn_handlers(
                                 continue;
                             }
                             // MetadataOnly：chmod/chown 变更，跳过 copy_file 只同步属性
-                            let result = if entry.entry.history().is_some() {
-                                process_versioned_entry(
-                                    entry,
-                                    src.clone(),
-                                    dest.clone(),
-                                    bc.clone(),
-                                    qos.clone(),
-                                    enable_integrity_check,
-                                    enable_acl,
-                                    is_source_reserved,
-                                    bt.clone(),
-                                    resume_opts.clone(),
-                                    EntryChange::Changed(kind),
-                                )
-                                .await
-                            } else if kind == ChangeKind::MetadataOnly {
+                            let result = if kind == ChangeKind::MetadataOnly {
                                 process_metadata_only_entry(
                                     &entry.entry,
                                     src.clone(),
@@ -207,7 +193,6 @@ pub(super) async fn spawn_handlers(
                                 .await
                             };
                             match result {
-                                Ok(()) if entry.entry.history().is_some() => {}
                                 Ok(()) => bc.broadcast(message.clone()).await?,
                                 Err(e) => {
                                     error!(
@@ -224,7 +209,7 @@ pub(super) async fn spawn_handlers(
                                         reason: format!("{e}"),
                                     })
                                     .await?;
-                                    failure.get_or_insert(e.into());
+                                    failure.get_or_insert(e);
                                 }
                             }
                         }
@@ -271,7 +256,7 @@ pub(super) async fn spawn_handlers(
                                         reason: format!("{e}"),
                                     })
                                     .await?;
-                                    failure.get_or_insert(e.into());
+                                    failure.get_or_insert(e);
                                 }
                             }
                         }
@@ -282,9 +267,10 @@ pub(super) async fn spawn_handlers(
                 }
 
                 info!("Handler worker {} completed", handler_id);
+                let history_result = history.finish().await;
                 match failure {
                     Some(error) => Err(error),
-                    None => Ok(()),
+                    None => history_result,
                 }
             }
             .instrument(span),

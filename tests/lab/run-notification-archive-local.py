@@ -269,20 +269,71 @@ def run_version_catalogue(environment):
         if kind != "latest":
             client.put_bucket_versioning(Bucket=bucket, VersioningConfiguration={"Status": "Enabled"})
         environment["LAB_VERSION_CATALOGUE_" + kind.upper()] = f"s3://migration-test:migration-test-isolated-only@{bucket}.127.0.0.1:19000"
+    seeded = {prefix: set() for prefix in ("single", "cluster")}
     for prefix in ("single", "cluster"):
         for version in range(4):
-            client.put_object(Bucket=buckets["source"], Key=prefix + "/payload", Body=f"payload-{version}".encode(), Tagging=f"raw={version}")
+            saved = client.put_object(Bucket=buckets["source"], Key=prefix + "/payload", Body=f"payload-{version}".encode(), Tagging=f"raw={version}")
+            seeded[prefix].add(saved["VersionId"])
+    fault_prefixes = set()
+    data_refusals = {prefix: 0 for prefix in seeded}
+    fault_guard = threading.Lock()
+    class SourceProxy(http.server.BaseHTTPRequestHandler):
+        def log_message(self, *_):
+            pass
+
+        def handle_request(self):
+            parsed = urllib.parse.urlsplit(self.path)
+            arguments = urllib.parse.parse_qs(parsed.query, keep_blank_values=True)
+            prefix = next((prefix for prefix in seeded if f"/{prefix}/" in parsed.path), None)
+            version = arguments.get("versionId", [None])[0]
+            is_data = self.command == "GET" and version is not None and not any(key in arguments for key in ("tagging", "attributes", "acl"))
+            with fault_guard:
+                deny = prefix in fault_prefixes and version not in seeded.get(prefix, set()) and is_data
+                if deny:
+                    data_refusals[prefix] += 1
+            if deny:
+                body = b"<Error><Code>AccessDenied</Code><Message>injected new version data permission denial</Message></Error>"
+                self.send_response(403)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
+            upstream = http.client.HTTPConnection("127.0.0.1", 19000, timeout=10)
+            try:
+                upstream.request(self.command, self.path, headers=dict(self.headers))
+                response = upstream.getresponse()
+                body = response.read()
+                self.send_response(response.status)
+                for key, value in response.getheaders():
+                    if key.lower() not in ("connection", "content-length", "transfer-encoding"):
+                        self.send_header(key, value)
+                self.send_header("Content-Length", response.getheader("Content-Length", "0") if self.command == "HEAD" else str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+            finally:
+                upstream.close()
+
+        do_GET = do_HEAD = handle_request
+
+    source_proxy = http.server.ThreadingHTTPServer(("127.0.0.1", 0), SourceProxy)
+    source_proxy.daemon_threads = True
+    threading.Thread(target=source_proxy.serve_forever, daemon=True).start()
+    environment["LAB_VERSION_CATALOGUE_FAULT_SOURCE"] = f"s3://migration-test:migration-test-isolated-only@{buckets['source']}.127.0.0.1:{source_proxy.server_port}"
     reports = []
     class Control(http.server.BaseHTTPRequestHandler):
         def log_message(self, *_):
             pass
 
         def do_GET(self):
-            if self.path not in ("/marker/single", "/marker/cluster"):
+            if self.path not in ("/marker/single", "/marker/cluster", "/data-fault/single", "/data-fault/cluster"):
                 self.send_error(404)
                 return
             prefix = self.path.rsplit("/", 1)[1]
-            client.delete_object(Bucket=buckets["source"], Key=prefix + "/payload")
+            if self.path.startswith("/marker/"):
+                client.delete_object(Bucket=buckets["source"], Key=prefix + "/payload")
+            else:
+                with fault_guard:
+                    fault_prefixes.add(prefix)
             self.send_response(204)
             self.send_header("Content-Length", "0")
             self.end_headers()
@@ -305,26 +356,36 @@ def run_version_catalogue(environment):
         ], cwd=ROOT, env=environment, check=True)
         for prefix in ("single", "cluster"):
             key = prefix + "/payload"
-            assert client.get_object(Bucket=buckets["latest"], Key=key)["Body"].read() == b"changed-payload"
+            assert client.get_object(Bucket=buckets["latest"], Key=key)["Body"].read() == b"final-payload"
             versions = client.list_object_versions(Bucket=buckets["history"], Prefix=key)
-            assert len(versions.get("Versions", [])) == 5 and not versions.get("DeleteMarkers"), versions
+            assert len(versions.get("Versions", [])) == 6 and not versions.get("DeleteMarkers"), versions
             contents = [client.get_object(Bucket=buckets["history"], Key=key, VersionId=version["VersionId"])["Body"].read()
                         for version in versions["Versions"]]
-            assert contents == [b"changed-payload", b"payload-3", b"payload-2", b"payload-1", b"payload-0"], contents
+            assert contents == [b"final-payload", b"changed-payload", b"payload-3", b"payload-2", b"payload-1", b"payload-0"], contents
+            failed = client.list_object_versions(Bucket=buckets["history"], Prefix=prefix + "/failure/payload")
+            assert len(failed.get("Versions", [])) == 4 and not failed.get("DeleteMarkers"), failed
+            assert data_refusals[prefix] == 1, data_refusals
             source = client.list_object_versions(Bucket=buckets["source"], Prefix=key)
-            assert len(source.get("Versions", [])) == 5 and len(source.get("DeleteMarkers", [])) == 1, source
-        print("independent S3 catalogue inspection deployments=2 latest_current_payload=true target_history_versions=5 no_duplicate_replay=true source_versions_retained=5 source_delete_markers=1 latest_marker_target_preserved=true ordered_payloads=true", flush=True)
+            assert len(source.get("Versions", [])) == 6 and len(source.get("DeleteMarkers", [])) == 1, source
+        print("independent S3 catalogue inspection deployments=2 latest_current_payload=true target_history_versions=6 no_duplicate_replay=true source_versions_retained=6 source_delete_markers=1 latest_marker_target_preserved=true ordered_payloads=true failed_target_versions=4 denied_data_reads_per_failed_entry=1", flush=True)
         summaries = [report for report in reports if report["is_final"] and not report.get("diagnostics")]
-        assert len(summaries) == 14 and all(report["task_error_count"] == 0 and report["diagnostics_complete"] for report in summaries), summaries
+        assert len(summaries) == 18 and all(report["task_error_count"] == 0 and report["diagnostics_complete"] for report in summaries), summaries
+        failures = [report for report in summaries if report["detail"]["error_count"] == 1]
+        assert len(failures) == 2 and all(report["job_id"] == "version_failed_history" and report["migration"]["phase"] == "failed" for report in failures), failures
+        errors = [event for report in reports for event in (report.get("diagnostics") or {}).get("events", []) if event["code"] == "copy_version_failed"]
+        assert len(errors) == 4 and all("AccessDenied" in event["message"] for event in errors), errors
+        assert sum("blocked_by_prior_version" in event["message"] for event in errors) == 2, errors
         retained = [report for report in summaries if report["target_preserved_count"] == 1]
         assert len(retained) == 2, retained
         markers = [event for report in reports for event in (report.get("diagnostics") or {}).get("events", [])
                    if event.get("retention", {}).get("source_path") == "payload"]
         assert len(markers) == 2 and all(event["retention"]["reason"] == "source_deletion_unconfirmed" for event in markers), markers
-        print("independent S3 callback inspection successful_rounds=14 latest_delete_marker_retention_entries=2 task_errors=0 HTTP_204=accepted", flush=True)
+        print("independent S3 callback inspection successful_rounds=16 failed_entries=2 version_error_details=4 blocked_versions=2 latest_delete_marker_retention_entries=2 task_errors=0 HTTP_204=accepted", flush=True)
     finally:
         control.shutdown()
         control.server_close()
+        source_proxy.shutdown()
+        source_proxy.server_close()
 
 
 def run_request_policy(environment):

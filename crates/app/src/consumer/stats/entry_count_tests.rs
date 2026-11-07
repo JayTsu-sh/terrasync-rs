@@ -187,6 +187,50 @@ fn latest_only_selection_counts_one_entry_and_only_the_selected_payload() {
 }
 
 #[test]
+fn incremental_version_acknowledgements_do_not_count_entries_before_group_completion() {
+    let entry = history_entry();
+    let mut consumer = retention_consumer();
+    consumer.stats = StatsKind::Incremental(IncrementalStats::new(
+        JobType::IncrementalCopy,
+        "delta".into(),
+        String::new(),
+        String::new(),
+    ));
+    consumer.progress_bar = ProgressBar::new(JobType::IncrementalCopy);
+    for item in ObservedItem::all(&entry) {
+        consumer.update_statistics(&StorageEntryMessage::New(item));
+    }
+    assert!(matches!(
+        consumer.to_report(false).detail,
+        ProgressDetail::Incremental {
+            new_count: 0,
+            changed_count: 0,
+            ..
+        }
+    ));
+    consumer.update_statistics(&StorageEntryMessage::CopyEntryDeltaCompleted {
+        entry,
+        change: task_model::EntryChange::New,
+        logical_bytes: 210,
+    });
+    assert!(matches!(
+        consumer.to_report(true).detail,
+        ProgressDetail::Incremental {
+            new_count: 1,
+            new_size: 210,
+            changed_count: 0,
+            error_count: 0,
+            ..
+        }
+    ));
+    let StatsKind::Incremental(stats) = &consumer.stats else {
+        panic!("delta counts")
+    };
+    assert_eq!(stats.new.total_count(), 1);
+    assert_eq!(stats.new.total_size(), 210);
+}
+
+#[test]
 fn incremental_inventory_keeps_entry_counts_and_selected_bytes_across_history_segments() {
     for history_target in [false, true] {
         for cap in [1, 7, 20] {

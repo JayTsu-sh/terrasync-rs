@@ -55,6 +55,7 @@ use crate::config::{JobType, SyncJobConfig, initialize_consumer_config, initiali
 use crate::consumer::ConsumerManager;
 use crate::copy_completion;
 use crate::copy_execution::{CopyLease, begin_copy_catalogue, compile_copy_request};
+use crate::copy_history::{HistoryCompletion, HistoryCopyPolicy};
 use crate::dir_walker;
 use crate::error::{AppError, Result};
 use crate::file_copy::VersionFailureContext;
@@ -535,6 +536,7 @@ impl SyncOrchestrator {
 
         scan_config.filter_time_anchor = observation_plan.as_ref().map(|plan| plan.filter_time_anchor);
         scan_config.observation_plan = observation_plan.as_ref().map(|plan| plan.observation);
+        let target_history = observation_plan.as_ref().map(|plan| !plan.scope.latest_version_only);
         scan_config.metadata_scope = observation_plan.map(|plan| plan.scope).unwrap_or_default();
 
         // ── 3. 初始化消费者配置 + 数据库 ──
@@ -745,6 +747,7 @@ impl SyncOrchestrator {
 
         // ── 10. 启动 N 个 Sender worker（S1） ──
         let sender_config = Arc::new(SenderWorkerConfig {
+            target_history,
             enable_integrity_check: c.enable_integrity_check,
             enable_acl: c.enable_acl,
             is_source_reserved,
@@ -952,8 +955,9 @@ impl SyncOrchestrator {
         )?);
 
         database.create_table(INCREMENTAL_SCAN_TABLE_BASE_NAME).await?;
-        let preserve_target =
-            database.current_copy_generation().await?.plan.target_cleanup == TargetCleanupPolicy::Preserve;
+        let generation = database.current_copy_generation().await?;
+        let preserve_target = generation.plan.target_cleanup == TargetCleanupPolicy::Preserve;
+        let target_history = generation.request.binding.target_history;
 
         let batch_size = consumer_config.db_config.batch_size as usize;
 
@@ -1030,6 +1034,11 @@ impl SyncOrchestrator {
             qos_manager.clone(),
             bytes_tracker.clone(),
             block_size,
+            HistoryCopyPolicy {
+                active_entry_limit: incremental_scan_concurrency,
+                target_history: Some(target_history),
+                completion: HistoryCompletion::Incremental,
+            },
         )
         .await;
 

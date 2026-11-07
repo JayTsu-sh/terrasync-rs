@@ -15,10 +15,11 @@ use crate::file_copy::{VersionCopyScope, copy_versions};
 use crate::receiver::ReceiverConfig;
 use crate::scan::source::WalkOptions;
 use crate::sender::{SenderWorkerConfig, sender_worker};
-use crate::storage_factory::{CreateStorageOptions, create_storage};
+use crate::storage_factory::{CreateStorageOptions, StorageContext, create_storage};
 use crate::task_stream::AsyncReceiver;
 use data_mover::model::{
     BackendKind, FailureClass, MetadataObservation, MetadataObservations, ObservationMode, ObservationPlan,
+    ObservedEntry,
 };
 use task_model::observation::ObservedItem;
 use task_model::{ErrorEvent, StorageEntryMessage, TransferMode};
@@ -27,7 +28,121 @@ use tokio::sync::Mutex;
 use tokio::time::Instant;
 use transport::in_process::create_in_process_pair;
 
-type TestResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
+type TestResult<T = ()> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
+
+async fn segmented_sender(
+    source: Arc<StorageContext>, destination: Arc<StorageContext>, entry: &Arc<ObservedEntry>, cap: usize,
+) -> TestResult<(Result<(), AppError>, Vec<StorageEntryMessage>)> {
+    let segments = entry.as_ref().clone().into_segments(cap);
+    let (tx, rx) = async_channel::bounded(segments.len());
+    for entry in segments {
+        tx.send(StorageEntryMessage::Scanned(Arc::new(entry))).await?;
+    }
+    drop(tx);
+    let mut broadcaster = BroadcastForwarder::new(64);
+    let mut received = broadcaster.subscribe();
+    let (transport, _receiver_transport) = create_in_process_pair();
+    let active = Arc::new(AtomicUsize::new(0));
+    let visited = Arc::new(AtomicUsize::new(0));
+    let result = sender_worker(
+        0,
+        AsyncReceiver::new(rx),
+        source,
+        destination,
+        Arc::new(transport),
+        &broadcaster,
+        &SenderWorkerConfig {
+            target_history: Some(true),
+            enable_integrity_check: false,
+            enable_acl: false,
+            is_source_reserved: true,
+            large_file_log_threshold: u64::MAX,
+        },
+        None,
+        None,
+        &ReceiverConfig {
+            job_id: "segmented-copy".into(),
+            enable_integrity_check: false,
+            enable_acl: false,
+            is_source_reserved: true,
+            job_dir: String::new(),
+            transfer_mode: TransferMode::Direct,
+        },
+        active.clone(),
+        visited.clone(),
+        Arc::new(AtomicU64::new(0)),
+    )
+    .await;
+    assert_eq!(active.load(Ordering::Relaxed), 0);
+    assert_eq!(visited.load(Ordering::Relaxed), 1);
+    drop(broadcaster);
+    let mut messages = Vec::new();
+    while let Some(message) = received.recv().await {
+        messages.push(message);
+    }
+    Ok((result, messages))
+}
+
+#[tokio::test]
+#[ignore = "requires owned real S3 source and history target"]
+async fn segmented_full_copy_counts_one_logical_entry_and_keeps_every_version() -> TestResult {
+    let source = Arc::new(
+        create_storage(
+            &std::env::var("LAB_MIGRATION_SOURCE_URL")?,
+            CreateStorageOptions::default(),
+        )
+        .await?,
+    );
+    let scan = source.walkdir(None, WalkOptions::default()).await?;
+    let mut entry = None;
+    while let Some(message) = scan.next().await {
+        if let StorageEntryMessage::Scanned(found) = message
+            && found.path().as_str() == "payload"
+        {
+            entry = Some(found);
+        }
+    }
+    if let Some(error) = scan.take_error() {
+        return Err(error.into());
+    }
+    let entry = entry.ok_or("source payload missing")?;
+    for cap in [1, 7] {
+        let target = Arc::new(
+            create_storage(
+                &format!("{}/segment-success-{cap}", std::env::var("LAB_MIGRATION_HISTORY_URL")?),
+                CreateStorageOptions::default(),
+            )
+            .await?,
+        );
+        let (result, messages) = segmented_sender(source.clone(), target, &entry, cap).await?;
+        result?;
+        let mut stats = FullStats::new(JobType::Copy, "segments".into(), String::new(), String::new());
+        let progress = ProgressBar::new(JobType::Copy);
+        let mut rows = 0;
+        let mut completed = 0;
+        for message in messages {
+            rows += usize::from(matches!(message, StorageEntryMessage::New(_)));
+            completed += usize::from(matches!(message, StorageEntryMessage::CopyEntryCompleted { .. }));
+            stats.update_from_message(&message);
+            progress.update_statistics(&message);
+        }
+        assert_eq!(
+            (rows, completed, stats.total_count(), stats.total_size()),
+            (20, 1, 1, 140)
+        );
+        assert!(matches!(
+            progress.to_report("segments").detail,
+            ProgressDetail::Full {
+                scanned_files: 1,
+                error_count: 0,
+                total_bytes: 140,
+                ..
+            }
+        ));
+        eprintln!("segmented-full cap={cap} version_rows=20 completed_entries=1 logical_bytes=140");
+    }
+    Ok(())
+}
 
 #[tokio::test]
 #[ignore = "requires isolated real S3 slash-key source and destinations"]
@@ -194,6 +309,7 @@ async fn required_consumer_failure_stops_history_worker_before_next_version_or_e
         Arc::new(transport),
         &broadcaster,
         &SenderWorkerConfig {
+            target_history: None,
             enable_integrity_check: false,
             enable_acl: false,
             is_source_reserved: true,
@@ -279,6 +395,7 @@ async fn data_failure_blocks_later_versions_and_counts_each_delivered_entry_once
             Arc::new(transport),
             &broadcaster,
             &SenderWorkerConfig {
+                target_history: None,
                 enable_integrity_check: false,
                 enable_acl: false,
                 is_source_reserved: true,
@@ -338,10 +455,12 @@ async fn data_failure_blocks_later_versions_and_counts_each_delivered_entry_once
             }
         }
         assert_eq!(failed_versions, 20);
-        assert_eq!(failed_entries, entry_count);
+        assert_eq!(failed_entries, 1);
         assert_eq!(stats.total_count(), 0);
-        assert!(matches!(progress.to_report("data-failure").detail,
-            ProgressDetail::Full { error_count, .. } if error_count == entry_count as u64));
+        assert!(matches!(
+            progress.to_report("data-failure").detail,
+            ProgressDetail::Full { error_count: 1, .. }
+        ));
         println!("history_segment_cap={cap} failed_entries={failed_entries} version_error_details={failed_versions}");
     }
     Ok(())
@@ -470,6 +589,44 @@ async fn metadata_failures_copy_every_version_but_count_one_failed_entry() -> Te
         let consumer = Arc::new(Mutex::new(consumer));
         StatisticConsumer::send_final_callback(&consumer, None).await;
         assert!(consumer.lock().await.callback.outbox.prepare_batch().is_none());
+    }
+    let source = Arc::new(source);
+    for cap in [1, 7] {
+        let destination = Arc::new(
+            create_storage(
+                &format!("{}/segments-{cap}", std::env::var("LAB_MIGRATION_FAILED_URL")?),
+                CreateStorageOptions::default(),
+            )
+            .await?,
+        );
+        let (result, messages) = segmented_sender(source.clone(), destination, &entry, cap).await?;
+        assert!(
+            result
+                .as_ref()
+                .is_err_and(|error| error.is_reported_copy_failure() && !error.reported_copy_data_failed())
+        );
+        let mut stats = FullStats::new(
+            JobType::Copy,
+            "segment-metadata-errors".into(),
+            String::new(),
+            String::new(),
+        );
+        let mut errors = 0;
+        let mut first = 0;
+        for message in messages {
+            if let StorageEntryMessage::CopyVersionFailed {
+                phase, first_in_entry, ..
+            } = &message
+            {
+                assert_eq!(phase, "source_metadata");
+                errors += 1;
+                first += usize::from(*first_in_entry);
+            }
+            stats.update_from_message(&message);
+        }
+        assert_eq!((errors, first, stats.error_stats.copy), (20, 1, 1));
+        assert_eq!(stats.total_count(), 0);
+        eprintln!("segmented-metadata-failure cap={cap} version_errors=20 failed_entries=1 target_data_versions=20");
     }
     Ok(())
 }

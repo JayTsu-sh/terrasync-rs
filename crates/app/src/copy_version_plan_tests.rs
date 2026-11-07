@@ -26,6 +26,57 @@ use crate::orchestrator::SyncOrchestrator;
 use crate::scan::observe_path;
 use crate::storage_factory::{CreateStorageOptions, create_storage};
 
+async fn control_action(action: &str, prefix: &str) -> Result<()> {
+    let control = std::env::var("LAB_VERSION_CATALOGUE_CONTROL")
+        .map_err(|_| AppError::ConfigError("owned S3 control required".into()))?;
+    timeout(Duration::from_secs(3), async {
+        let mut stream = TcpStream::connect(&control).await?;
+        stream
+            .write_all(format!("GET /{action}/{prefix} HTTP/1.0\r\nHost: {control}\r\n\r\n").as_bytes())
+            .await?;
+        let mut reply = Vec::new();
+        stream.read_to_end(&mut reply).await?;
+        assert!(reply.starts_with(b"HTTP/1.0 204"));
+        Ok::<(), AppError>(())
+    })
+    .await
+    .map_err(|_| AppError::ConfigError("owned control timed out".into()))?
+}
+
+async fn failed_incremental_history(config: &ClickHouseConfig, command: &SyncJobConfig) -> Result<()> {
+    let result = SyncOrchestrator::new_local(command.clone()).run().await;
+    assert!(result.as_ref().is_err_and(AppError::is_reported_copy_failure));
+    let database = ClickHouseDatabase::connect(config, &command.job_id).await?;
+    let generation = database
+        .latest_copy_generation()
+        .await?
+        .ok_or_else(|| AppError::ConfigError("failed generation required".into()))?;
+    assert_eq!(generation.phase, CopyGenerationPhase::Failed);
+    assert_eq!(database.get_count("base").await?, 4);
+    let client = Client::default()
+        .with_url(&config.dsn)
+        .with_user("default")
+        .with_database(&config.database);
+    let raw=client.query(&format!("SELECT payload_json FROM notifications_{} FINAL WHERE kind=2 AND attempt_id=? ORDER BY sequence DESC LIMIT 1",command.job_id))
+        .bind(&generation.request.execution_id).fetch_one::<String>().await.map_err(DatabaseError::from)?;
+    let saved: FinalCallbackReport = serde_json::from_str(&raw)?;
+    let report: ProgressReport = serde_json::from_str(&saved.payload_json)?;
+    assert!(report.is_final && report.diagnostics_complete);
+    assert_eq!(report.task_error_count, 0, "已交付逐版本错误不能再次计任务错误");
+    assert!(matches!(
+        report.detail,
+        ProgressDetail::Incremental {
+            scanned_files: 1,
+            error_count: 1,
+            new_count: 0,
+            changed_count: 0,
+            transferred_bytes: 0,
+            ..
+        }
+    ));
+    Ok(())
+}
+
 async fn run_round(config: &ClickHouseConfig, command: &SyncJobConfig, expected_bytes: u64, rows: u64) -> Result<u64> {
     SyncOrchestrator::new_local(command.clone()).run().await?;
     let database = ClickHouseDatabase::connect(config, &command.job_id).await?;
@@ -124,48 +175,44 @@ async fn copy_versions_case(config: &ClickHouseConfig, prefix: &str) -> Result<(
     history.dest_path = environment("HISTORY")?;
     run_round(config, &latest, 9, 1).await?;
     run_round(config, &history, 36, 4).await?;
+    let mut failed = history.clone();
+    failed.job_id = "version_failed_history".into();
+    failed.src_path = environment("FAULT_SOURCE")?;
+    failed.dest_path.push_str("/failure");
+    run_round(config, &failed, 36, 4).await?;
 
     let upload = tempfile::tempdir()?;
-    std::fs::write(upload.path().join("payload"), b"changed-payload")?;
-    let upload = create_storage(&upload.path().to_string_lossy(), CreateStorageOptions::default()).await?;
+    let upload_storage = create_storage(&upload.path().to_string_lossy(), CreateStorageOptions::default()).await?;
     let source = create_storage(&latest.src_path, CreateStorageOptions::default()).await?;
-    let entry = Arc::new(observe_path(upload.storage(), Path::new("payload")).await?);
-    copy_file(
-        &upload,
-        &source,
-        &entry,
-        CopyOptions {
-            transfer_mode: TransferMode::Direct,
-            ..Default::default()
-        },
-        None,
-    )
-    .await?;
-    run_round(config, &latest, 15, 1).await?;
-    run_round(config, &history, 15, 5).await?;
+    for content in [b"changed-payload".as_slice(), b"final-payload".as_slice()] {
+        std::fs::write(upload.path().join("payload"), content)?;
+        let entry = Arc::new(observe_path(upload_storage.storage(), Path::new("payload")).await?);
+        copy_file(
+            &upload_storage,
+            &source,
+            &entry,
+            CopyOptions {
+                transfer_mode: TransferMode::Direct,
+                ..Default::default()
+            },
+            None,
+        )
+        .await?;
+    }
+    run_round(config, &latest, 13, 1).await?;
+    run_round(config, &history, 28, 6).await?;
     run_round(config, &latest, 0, 1).await?;
-    run_round(config, &history, 0, 5).await?;
-    let control = std::env::var("LAB_VERSION_CATALOGUE_CONTROL")
-        .map_err(|_| AppError::ConfigError("owned S3 control required".into()))?;
-    timeout(Duration::from_secs(3), async {
-        let mut stream = TcpStream::connect(&control).await?;
-        stream
-            .write_all(format!("GET /marker/{prefix} HTTP/1.0\r\nHost: {control}\r\n\r\n").as_bytes())
-            .await?;
-        let mut reply = Vec::new();
-        stream.read_to_end(&mut reply).await?;
-        assert!(reply.starts_with(b"HTTP/1.0 204"));
-        Ok::<(), AppError>(())
-    })
-    .await
-    .map_err(|_| AppError::ConfigError("owned marker control timed out".into()))??;
+    run_round(config, &history, 0, 6).await?;
+    control_action("data-fault", prefix).await?;
+    failed_incremental_history(config, &failed).await?;
+    control_action("marker", prefix).await?;
     assert_eq!(
         run_round(config, &latest, 0, 1).await?,
         1,
         "已识别删除标记的保留决定必须明确进入 callback"
     );
     eprintln!(
-        "version-catalogue cluster={} real_rounds=7 latest_rows=1 history_rows=5 unchanged_bytes=0 logical_entries_per_change=1 latest_marker_preserves_target_with_callback=true reports_archived=true",
+        "version-catalogue cluster={} real_rounds=9 latest_rows=1 history_rows=6 unchanged_bytes=0 changed_versions=2 logical_entries_per_change=1 failed_entries=1 failed_version_details=2 latest_marker_preserves_target_with_callback=true reports_archived=true",
         config.cluster.is_some()
     );
     Ok(())

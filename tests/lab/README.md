@@ -52,8 +52,10 @@ one completed entry in the statistics/progress report, and independently verifie
 20 destination versions and the retained source. A proxy then denies source tag reads: all
 20 data versions must remain published, failure accounting must be one entry, and a real HTTP
 callback must receive and acknowledge all 20 version-specific reasons. Denied source data reads
-also check that later versions and history segments stop publishing, with failure counts following
-the delivered entry boundaries. Its container and volumes are removed on exit. This check does
+also check that later versions and history segments stop publishing, with one failed logical
+entry across segment sizes 20 and 10. Success and source-metadata failure additionally run
+with segment sizes 1 and 7: each target has all 20 versions, completion or failure counts
+remain one, and the captured metadata failure causes no repeated tag requests. Its container and volumes are removed on exit. This check does
 not cover ClickHouse acknowledgement, callback outages, or the shared network recovery window.
 
 The runner also seeds a nonempty `a/`, `a/file`, and an empty marker. It verifies one
@@ -117,23 +119,27 @@ the separate six-replica topology tests and does not certify history publication
 replay in app, which remains guarded.
 
 `python3 tests/lab/run-notification-archive-local.py --version-catalogue` adds an
-owned RustFS service to the isolated ClickHouse network. It executes fourteen actual
+owned RustFS service to the isolated ClickHouse network. It executes eighteen actual
 migrations across Single and the two-replica Cluster: four distinct source versions
-to a latest-only and a history target, one new source version, then unchanged
-incremental runs and latest-only runs after source delete markers are added. It checks archived plans, selected bytes and logical inventory
-counts; latest-only base remains one slot with raw source version identity, while
-the history base grows from four to five versions. Independent S3 reads verify all
-payloads, chronological publication order, five retained source versions and no
-extra target versions on unchanged replay. Latest delete markers retain the
-existing latest-only target payload and report one structured preservation event
-per deployment through HTTP 204, without task errors; accepted details clear and
-final reports remain archived. `--copy-generations` separately tests
-same-size/same-mtime version changes, raw tag recovery, unacknowledged writes and
-source version reversal across three further uncommitted generations. Earlier
-confirmed physical rows are deliberately retained: unconfirmed tombstones must
-prevent their resurrection. This does not certify version-to-target metadata retry
-mapping, all multi-version incremental delivery/error counters, unknown publication
-recovery, permanent history purge, or throughput/RSS.
+to latest-only and history targets, two new source versions in one incremental entry,
+unchanged incremental runs, a failed historical incremental run, and latest-only
+runs after source delete markers are added. Sixteen runs succeed; two fail as injected.
+It checks archived plans, selected bytes and logical inventory/delivery counts;
+latest-only base remains one slot with raw source version identity, while the
+successful history base grows from four to six versions. Independent S3 reads verify
+all payloads, chronological publication order, six retained source versions and no
+extra versions on unchanged replay. A source proxy denies the first new version's
+data GET: each failed run counts one entry, reports that version's actual error and
+the later version's blocked reason, starts no later data GET and leaves the target's
+four successful historical versions intact. All four version errors reach HTTP 204;
+accepted details clear, cumulative errors remain, and final Failed reports are archived.
+Latest delete markers retain the existing latest-only target payload and report one
+structured preservation event per deployment without task errors. `--copy-generations`
+separately tests same-size/same-mtime version changes, raw tag recovery, unacknowledged
+writes and source version reversal across three further uncommitted generations.
+Earlier confirmed physical rows are deliberately retained: unconfirmed tombstones
+must prevent their resurrection. These runs do not certify version-to-target metadata
+retry mapping, unknown publication recovery, permanent history purge, or throughput/RSS.
 
 `python3 tests/lab/run-notification-archive-local.py --scan-wire` runs three shared
 scan-storage regressions on the owned two-replica topology: schema availability,

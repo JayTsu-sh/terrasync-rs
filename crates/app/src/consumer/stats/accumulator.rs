@@ -7,7 +7,7 @@ use std::time::{Instant, SystemTime};
 // 外部crate
 use serde::{Deserialize, Serialize};
 use task_model::observation::{EntryProgress, EntryStatistics, ObservedView};
-use task_model::{ErrorEvent, StorageEntryMessage};
+use task_model::{EntryChange, ErrorEvent, StorageEntryMessage};
 use tracing::trace;
 
 // 内部模块
@@ -563,8 +563,32 @@ impl IncrementalStats {
                     self.scanned.update(&view);
                 }
             }
-            StorageEntryMessage::New(item) => self.new.add(&item.view()),
-            StorageEntryMessage::Changed { entry, .. } => self.changed.add(&entry.view()),
+            StorageEntryMessage::New(item)
+                if self.job_type != JobType::IncrementalCopy || item.entry.history().is_none() =>
+            {
+                self.new.add(&item.view())
+            }
+            StorageEntryMessage::Changed { entry, .. }
+                if self.job_type != JobType::IncrementalCopy || entry.entry.history().is_none() =>
+            {
+                self.changed.add(&entry.view())
+            }
+            StorageEntryMessage::CopyEntryDeltaCompleted {
+                entry,
+                change,
+                logical_bytes,
+            } => {
+                let progress = EntryProgress {
+                    entry,
+                    logical_bytes: *logical_bytes,
+                    count_entry: true,
+                    distribution_bytes: None,
+                };
+                match change {
+                    EntryChange::New => self.new.add(&progress),
+                    EntryChange::Changed(_) => self.changed.add(&progress),
+                }
+            }
             StorageEntryMessage::Deleted(entry) => {
                 for view in ObservedView::all(entry) {
                     self.deleted.add(&view);

@@ -12,18 +12,15 @@ use crate::file_copy::namespace as copy_namespace;
 use crate::file_copy::transfer as copy_transfer;
 use data_mover::model::BackendKind;
 // 标准库
-use crate::file_copy::{HdfsCopyContext, copy_file, copy_versions, prepare_directory};
-use std::iter::once;
+use crate::file_copy::{CopyOptions, HdfsCopyContext, copy_file, prepare_directory};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use task_model::ObservedEntryExt;
-use task_model::observation::ObservedItem;
-use task_model::{EntryChange, TransferMode};
+use task_model::TransferMode;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 
 // 外部crate
-use crate::file_copy::{CopyOptions, VersionCopyScope};
 use crate::storage_factory::StorageContext;
 use data_mover::model::ObservedEntry;
 use data_mover::qos::QosManager;
@@ -243,47 +240,6 @@ pub(crate) fn check_admin_privileges() -> Result<bool> {
     }
 }
 
-pub(crate) async fn process_versioned_entry(
-    item: &ObservedItem, src_storage: Arc<StorageContext>, dest_storage: Arc<StorageContext>,
-    broadcaster: BroadcastForwarder<StorageEntryMessage>, qos_manager: Option<QosManager>,
-    enable_integrity_check: bool, enable_acl: bool, is_source_reserved: bool, bytes_counter: Option<Arc<AtomicU64>>,
-    resume: ResumeOpts, change: EntryChange,
-) -> Result<()> {
-    if item.entry.history().is_some() {
-        return copy_versions(
-            once(item.clone()),
-            &src_storage,
-            &dest_storage,
-            CopyOptions {
-                transfer_mode: resume.transfer_mode,
-                qos: qos_manager,
-                enable_integrity_check,
-                bytes_counter,
-                cancel: None,
-            },
-            &resume.job_id,
-            &broadcaster,
-            VersionCopyScope::SelectedVersion(change),
-        )
-        .await;
-    }
-    process_entry(
-        &item.entry,
-        src_storage,
-        dest_storage,
-        enable_integrity_check,
-        enable_acl,
-        is_source_reserved,
-        qos_manager,
-        bytes_counter,
-        &broadcaster,
-        resume,
-    )
-    .await?;
-    broadcaster.broadcast(change.message(item.clone())).await?;
-    Ok(())
-}
-
 /// `process_entry` / `process_entry_inner` 的标志位组合
 #[derive(Debug, Clone, Default)]
 #[allow(clippy::struct_excessive_bools)] // 标志位结构按调用现场天然分组，封装为枚举会引入调用点繁杂匹配
@@ -399,7 +355,7 @@ async fn process_entry_inner(
             &src_storage,
             &dest_storage,
             entry,
-            crate::file_copy::CopyOptions {
+            CopyOptions {
                 transfer_mode: resume.transfer_mode,
                 qos: qos_manager,
                 enable_integrity_check,
@@ -438,7 +394,7 @@ async fn process_entry_inner(
             &src_storage,
             &dest_storage,
             entry,
-            crate::file_copy::CopyOptions {
+            CopyOptions {
                 transfer_mode: resume.transfer_mode,
                 qos: qos_manager,
                 enable_integrity_check,
@@ -669,7 +625,7 @@ pub(crate) async fn copy_file_with_resume(
         src_storage,
         dest_storage,
         entry,
-        crate::file_copy::CopyOptions {
+        CopyOptions {
             transfer_mode: TransferMode::Checkpoint,
             qos: qos_manager,
             enable_integrity_check,

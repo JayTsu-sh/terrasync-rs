@@ -133,9 +133,15 @@ pub(crate) async fn copy_versions<I: Iterator<Item = ObservedItem> + Send>(
     }
     let change = match scope {
         VersionCopyScope::WholeEntry => EntryChange::New,
-        VersionCopyScope::SelectedVersion(change) => change,
+        VersionCopyScope::SelectedVersion { change, .. } => change,
     };
-    let keep_history = to.storage().staged_destination()?.keeps_history().await?;
+    let keep_history = match scope {
+        VersionCopyScope::SelectedVersion {
+            target_history: Some(value),
+            ..
+        } => value,
+        _ => to.storage().staged_destination()?.keeps_history().await?,
+    };
     let hdfs = if to.storage().kind() == BackendKind::Hdfs {
         Some(HdfsCopyContext::from_job(job_id, options.transfer_mode)?)
     } else {
@@ -200,7 +206,7 @@ pub(crate) async fn copy_versions<I: Iterator<Item = ObservedItem> + Send>(
             .await
         };
         if let Err(error) = result {
-            if matches!(scope, VersionCopyScope::SelectedVersion(_)) {
+            if matches!(scope, VersionCopyScope::SelectedVersion { .. }) {
                 return Err(error.into());
             }
             let context = VersionFailureContext::for_error(&error, from.storage().kind(), to.storage().kind());
@@ -256,7 +262,10 @@ pub(crate) async fn copy_versions<I: Iterator<Item = ObservedItem> + Send>(
 #[derive(Clone, Copy, Eq, PartialEq)]
 pub(crate) enum VersionCopyScope {
     WholeEntry,
-    SelectedVersion(EntryChange),
+    SelectedVersion {
+        change: EntryChange,
+        target_history: Option<bool>,
+    },
 }
 
 /// 借用原生历史选择目标实际保留的版本，不分配或复制版本列表。
@@ -266,7 +275,7 @@ pub(crate) fn selected_copy_items(
 ) -> impl Iterator<Item = ObservedItem> + '_ {
     ObservedItem::all(entry).filter(move |item| retain_version(item, keep_history))
 }
-fn retain_version(item: &ObservedItem, keep_history: bool) -> bool {
+pub(crate) fn retain_version(item: &ObservedItem, keep_history: bool) -> bool {
     item.view()
         .version()
         .is_none_or(|record| keep_history || (record.is_latest() && !record.is_delete_marker()))

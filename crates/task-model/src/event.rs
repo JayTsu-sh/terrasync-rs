@@ -119,9 +119,17 @@ pub enum StorageEntryMessage {
     CopySkipped { entry: Arc<ObservedEntry>, reason: String },
     /// 新增文件
     New(ObservedItem),
-    /// 一个历史分段 entry 的全部所选版本已复制并通过元数据校验；版本行另行落库。
+    /// 一个逻辑 entry 的全部历史分段及所选版本复制完成；版本行另行落库。
     CopyEntryCompleted {
         entry: Arc<ObservedEntry>,
+        logical_bytes: u64,
+    },
+    /// 增量比较流的分段边界；即使本段没有变化版本也必须交付，用于有界收尾。
+    CopyEntryBoundary(Arc<ObservedEntry>),
+    /// 一个逻辑 entry 的全部增量版本交付完成；逐版本 ACK 只负责事实入库。
+    CopyEntryDeltaCompleted {
+        entry: Arc<ObservedEntry>,
+        change: EntryChange,
         logical_bytes: u64,
     },
     /// 版本错误逐条交付；同一 entry 仅首个错误推进失败计数。
