@@ -4,6 +4,7 @@ pub mod error;
 mod event;
 mod facts;
 pub mod metadata;
+pub mod migration;
 pub mod observation;
 mod retention;
 mod source_cleanup;
