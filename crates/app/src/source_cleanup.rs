@@ -1,4 +1,4 @@
-//! 只消费任务已经确认落库的复制事实；永不递归删除未列入目录的源项。
+//! 只消费本次重新选中且目标已确认落库的事实；不清理范围外的旧源项。
 
 use std::sync::Arc;
 
@@ -20,7 +20,7 @@ pub(crate) async fn remove_confirmed_sources(
 ) -> Result<()> {
     let (sender, mut receiver) = mpsc::channel(32);
     let query = AbortOnDropHandle::new(tokio::spawn(async move {
-        database.query_storage_entry(None, None, None, sender).await
+        database.query_current_copy_entries(None, None, None, sender).await
     }));
     while let Some(entry) = receiver.recv().await {
         // 一旦清理失败就停止发出新删除，避免断连后继续扩大未知副作用。

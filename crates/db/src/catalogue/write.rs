@@ -93,6 +93,13 @@ impl ClickHouseDatabase {
             return Ok(());
         }
         let current_state = self.get_cached_scan_state().await?;
+        let copy_execution_id = self
+            .generation_lifecycle
+            .lock()
+            .await
+            .copy_execution_id
+            .clone()
+            .unwrap_or_default();
         let _write = self.catalogue_write_guard().await;
         debug!(
             "During batch inserting to table {}, current_state: {:?}",
@@ -114,7 +121,8 @@ impl ClickHouseDatabase {
             .map_err(DatabaseError::from)?;
 
         for view in views {
-            let record = NativeScanRecord::capture(view, current_state)?;
+            let mut record = NativeScanRecord::capture(view, current_state)?;
+            record.copy_execution_id = &copy_execution_id;
             insert.write(&record).await.map_err(DatabaseError::from)?;
             record_count += 1;
         }

@@ -48,7 +48,7 @@ pub(crate) fn directory_marker_state(entry: &ObservedEntry) -> Option<String> {
     Some(hash.finalize().to_hex().to_string())
 }
 
-pub(crate) const OBSERVED_COLUMNS: &str = "name,relative_path,size,ext,ctime,mtime,atime,mode,storage_type,is_symlink,is_dir,is_regular_file,hard_links,current_state,uid,gid,ino,file_handle,version_id,tags,marker_state,metadata_digests,identity_key,backend_kind,backend_id,entry_kind,size_observed,modified_unix_nanos,entry_snapshot,metadata_hash,history_segment,history_index";
+pub(crate) const OBSERVED_COLUMNS: &str = "name,relative_path,size,ext,ctime,mtime,atime,mode,storage_type,is_symlink,is_dir,is_regular_file,hard_links,current_state,uid,gid,ino,file_handle,version_id,tags,marker_state,metadata_digests,identity_key,backend_kind,backend_id,entry_kind,size_observed,modified_unix_nanos,entry_snapshot,metadata_hash,history_segment,history_index,copy_execution_id";
 
 /// 比较集合只传输主键和身份；完整观察在事件持久化后直接写入 base。
 #[derive(Serialize, clickhouse::Row)]
@@ -219,6 +219,7 @@ pub(crate) struct NativeScanRecord<'a> {
     pub metadata_hash: Option<String>,
     pub history_segment: u32,
     pub history_index: u32,
+    pub copy_execution_id: &'a str,
 }
 // 请求边界按载荷预算划分，不能把调用方的批次固定切成千行 HTTP 请求。
 // 预算只统计本请求拥有的编码／字符串，借用的观察由调用方持有。
@@ -326,6 +327,7 @@ impl<'a> NativeScanRecord<'a> {
             metadata_hash: None,
             history_segment: entry.history().map_or(0, |history| history.segment()),
             history_index: view.version_index.unwrap_or_default() as u32,
+            copy_execution_id: "",
         })
     }
     #[cfg(test)]

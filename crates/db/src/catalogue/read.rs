@@ -156,11 +156,37 @@ impl ClickHouseDatabase {
         &self, is_dir: Option<bool>, is_symlink: Option<bool>, extension: Option<String>,
         tx: mpsc::Sender<ObservedEntry>,
     ) -> Result<()> {
+        self.query_entries(None, is_dir, is_symlink, extension, tx).await
+    }
+
+    /// 只交付本次重新选中且目标已确认的事实；旧 C/W 相等不构成执行授权。
+    pub async fn query_current_copy_entries(
+        &self, is_dir: Option<bool>, is_symlink: Option<bool>, extension: Option<String>,
+        tx: mpsc::Sender<ObservedEntry>,
+    ) -> Result<()> {
+        let execution = self
+            .generation_lifecycle
+            .lock()
+            .await
+            .copy_execution_id
+            .clone()
+            .ok_or(DatabaseError::CopyExecutionUnavailable)?;
+        self.query_entries(Some(execution), is_dir, is_symlink, extension, tx)
+            .await
+    }
+
+    async fn query_entries(
+        &self, execution: Option<String>, is_dir: Option<bool>, is_symlink: Option<bool>, extension: Option<String>,
+        tx: mpsc::Sender<ObservedEntry>,
+    ) -> Result<()> {
         let base_table_name = get_scan_base_table_name(&self.job_id);
         debug!("[query_storage_entry] base table name: {}", base_table_name);
 
         let mut where_conditions = vec!["copy_path_confirmed".to_string()];
         let mut ext_bind: Option<String> = None;
+        if execution.is_some() {
+            where_conditions.push("copy_execution_id = ?".into());
+        }
 
         if let Some(dir_val) = is_dir {
             where_conditions.push(format!("is_dir = {dir_val}"));
@@ -187,6 +213,9 @@ impl ClickHouseDatabase {
         );
 
         let mut q = self.sync_client.query(&query);
+        if let Some(execution) = execution {
+            q = q.bind(execution);
+        }
         if let Some(ext) = ext_bind {
             q = q.bind(ext);
         }

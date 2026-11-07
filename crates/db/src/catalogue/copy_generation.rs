@@ -5,6 +5,7 @@ use std::sync::atomic::Ordering;
 
 use serde::Deserialize;
 use serde_json::Value;
+use uuid::Uuid;
 
 use super::ClickHouseDatabase;
 use super::lifecycle::ScanGenerationLifecycle;
@@ -84,6 +85,7 @@ impl ClickHouseDatabase {
             working: Some(working),
             copy_recovery: false,
             copy_request_key: Some(request_key.into()),
+            copy_execution_id: Some(Uuid::new_v4().to_string()),
             copy_source_reserved: source_reserved,
             ..Default::default()
         };

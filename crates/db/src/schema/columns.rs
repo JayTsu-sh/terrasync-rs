@@ -24,6 +24,7 @@ macro_rules! file_scan_base_columns {
     hard_links UInt32 DEFAULT 0,
     current_state UInt8,
     copy_path_confirmed Bool DEFAULT true,
+    copy_execution_id String DEFAULT '',
     uid Nullable(UInt32) DEFAULT NULL,
     gid Nullable(UInt32) DEFAULT NULL,
     ino Nullable(UInt64) DEFAULT NULL,
@@ -106,6 +107,7 @@ mod tests {
             "size_observed Bool",
             "modified_unix_nanos Nullable(Int128)",
             "entry_snapshot Array(UInt8)",
+            "copy_execution_id String DEFAULT ''",
             "INDEX identity_key_idx identity_key TYPE bloom_filter",
         ] {
             assert!(FILE_SCAN_COLUMNS_DEFINITION.contains(column));

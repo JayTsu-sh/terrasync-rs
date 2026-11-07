@@ -55,8 +55,10 @@ async fn update_directories(database: ClickHouseDatabase, destination: Arc<Stora
     let (sender, receiver) = mpsc::channel(1000);
     let query = tokio::spawn(
         async move {
-            database.query_storage_entry(Some(true), None, None, sender).await?;
-            info!("Query all directories completed");
+            database
+                .query_current_copy_entries(Some(true), None, None, sender)
+                .await?;
+            info!("Query selected current-copy directories completed");
             Ok(())
         }
         .instrument(info_span!("directory_metadata_query")),

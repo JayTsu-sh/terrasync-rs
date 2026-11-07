@@ -6,6 +6,7 @@ use crate::execution::base_client;
 use crate::{DatabaseError, Result};
 use clickhouse::test::{Mock, handlers};
 use std::time::{SystemTime, UNIX_EPOCH};
+use tokio::sync::mpsc;
 
 fn mocked_database(mock: &Mock, job: &str) -> ClickHouseDatabase {
     let mut database = ClickHouseDatabase::new(
@@ -24,6 +25,19 @@ fn mocked_database(mock: &Mock, job: &str) -> ClickHouseDatabase {
     .unwrap();
     database.sync_client = database.sync_client.with_validation(false);
     database
+}
+
+#[tokio::test]
+async fn copy_finalization_without_execution_authority_never_queries_the_catalogue() -> Result<()> {
+    let mock = Mock::new();
+    let database = mocked_database(&mock, "no_copy_execution");
+    let (sender, mut receiver) = mpsc::channel(1);
+    assert!(matches!(
+        database.query_current_copy_entries(None, None, None, sender).await,
+        Err(DatabaseError::CopyExecutionUnavailable)
+    ));
+    assert!(receiver.recv().await.is_none());
+    Ok(())
 }
 
 #[tokio::test]

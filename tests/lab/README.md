@@ -94,6 +94,12 @@ entry without copy work, deletes its source, and leaves the target bytes, inode 
 unchanged. After a real Local copy and protected source purge, both a completed and an
 incomplete source-deleting generation must switch to full when retaining the source again,
 with no reverse-delete candidates and the existing target bytes, inode and ctime unchanged.
+The same suite also leaves three compared generations uncommitted, commits a
+selected subset, and deliberately makes an unselected old row's binary state
+collide with the next working state. Only the currently selected unchanged file
+is source-purged; outside files/directories remain, the unselected target directory
+mtime is unchanged, and no file retransmission is requested. This uses real
+catalogue selection batches and Local IO, not the pending window-selection planner.
 These are catalogue/cleanup contract checks; they do not validate the pending
 change to delete before asynchronous database confirmation, the whole-job failure callback,
 version-history purge, six-replica topology or throughput/RSS targets.

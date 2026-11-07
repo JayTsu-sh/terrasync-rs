@@ -28,6 +28,8 @@ pub(crate) struct ScanCancellationDeadline;
 /// 使用thiserror库实现错误处理和转换
 #[derive(Error, Debug)]
 pub enum DatabaseError {
+    #[error("本轮复制执行身份尚未准备，拒绝查询删源或目录收尾候选")]
+    CopyExecutionUnavailable,
     #[error(
         "Cannot determine rename for {path}: {reason}; confirmed missing paths={confirmed_paths}, current observed paths={observed_paths}"
     )]
