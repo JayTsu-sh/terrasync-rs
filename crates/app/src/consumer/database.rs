@@ -325,6 +325,10 @@ impl DatabaseConsumer {
         Self::with_database(config, database).await
     }
 
+    pub(crate) fn database(&self) -> &ClickHouseDatabase {
+        &self.db
+    }
+
     /// Attach the task-owned catalogue so its generation and write coordination are shared.
     pub(crate) async fn with_database(config: &ConsumerConfig, database: ClickHouseDatabase) -> Result<Self> {
         if matches!(config.job_type, JobType::Scan | JobType::Copy) {

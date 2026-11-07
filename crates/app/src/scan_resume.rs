@@ -175,10 +175,9 @@ pub(crate) async fn run_persisted(request: ScanRequest<'_>, config: AppConfig) -
         } else {
             JobType::Scan
         };
-        let mut consumer_config = initialize_consumer_config(job_id, job_dir, kind, command, &config, callback_url)?;
-        // 本管道负责数据库持久化确认；manager 只消费统计信息。
-        consumer_config.db_config.enabled = false;
-        let mut consumers = ConsumerManager::new(&consumer_config).await?;
+        let consumer_config = initialize_consumer_config(job_id, job_dir, kind, command, &config, callback_url)?;
+        // 本管道确认扫描事实；manager 管理统计及独立的最终报告。
+        let mut consumers = ConsumerManager::statistics_only(&consumer_config)?;
         // 累计数与目录贡献必须来自同一已确认检查点；旧检查点无法补出过滤计数。
         consumers.restore_statistics(&state.statistics).await?;
         if (!state.checkpoint.is_empty() || state.observed_entries > 0)

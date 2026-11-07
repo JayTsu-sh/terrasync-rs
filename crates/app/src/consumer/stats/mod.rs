@@ -9,6 +9,7 @@
 pub mod accumulator;
 pub(crate) mod callback_state;
 pub mod consumer;
+pub(crate) mod delivery;
 pub mod diagnostics;
 pub mod progress_bar;
 pub(crate) mod recovery_progress;

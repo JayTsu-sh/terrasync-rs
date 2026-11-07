@@ -68,8 +68,21 @@ event behind a pagination cursor, exact final-failure
 payloads, and byte-bounded reads of 800 KB payloads. Its proxy injects disconnects, lost write/ACK
 responses, and silent response stalls; a real readonly setting checks confirmed refusals separately.
 Only its own databases, containers, volumes, and configuration directory are removed on exit.
-This validates the database primitive. Connecting it to the app callback outbox, end-to-end task
-cancellation, full-migration fault handling, and final-notification delivery remain separate gates.
+The runner also exercises the app's final callback lifecycle through real HTTP: disconnects,
+HTTP 500, wrong ACKs, silent stalls, and recovery within four attempts. It checks byte-identical
+retries, retained unacknowledged diagnostics, the exact final report archived after exhaustion,
+and archival during an already-cancelled task scope, successful HTTP delivery, or no configured
+callback. Callback delivery failure causes remain only in logs; they are excluded from the
+archived envelope. Final reports remain queryable after ACK via
+`ClickHouseDatabase::final_report` (round, attempt, sequence). The job-scoped
+`notifications_<sanitized_job_id>` table stores kind 2 for reports and delivery_revision 0/1
+for pending/ACK, with the exact report in the envelope's `payload_json` field.
+The archive proxy separately checks lost initial-write/ACK replies, disconnects, and silent
+stalls during that lifecycle. Normal final HTTP delivery has a shared two-second budget,
+plus at most one second shared by initial archival and durable ACK; cancelled lifecycle
+uses 500 ms for each. Expired archival has an unknown write outcome and does not claim delivery.
+Connecting all diagnostic outbox overflow to persistent paging, full-migration fault handling,
+and end-to-end worker cancellation remain separate gates.
 
 NFS fixtures use UID/GID 1000 to match the non-root GitHub runner, allowing
 metadata preservation to be verified without privileged local writes.

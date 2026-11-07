@@ -146,7 +146,11 @@ def run_inside():
                 mode = fault if is_insert else "normal"
                 unblock = release
                 if is_insert:
-                    fault = "normal"
+                    # 首次归档正常，第二次 ACK 写入丢失响应。
+                    if mode == "ack_lost_reply":
+                        mode, fault = "normal", "lost_ack"
+                    else:
+                        fault = "normal"
             if mode == "disconnect":
                 self.connection.close()
                 return
@@ -187,6 +191,11 @@ def run_inside():
             subprocess.run([
                 "cargo", "test", "--offline", "--locked", "-p", "db", "--lib",
                 "catalogue::notifications::tests::real_",
+                "--", "--ignored", "--test-threads=1", "--nocapture",
+            ], cwd=ROOT, env=environment, check=True)
+            subprocess.run([
+                "cargo", "test", "--offline", "--locked", "-p", "app", "--lib",
+                "consumer::stats::delivery::tests::real_",
                 "--", "--ignored", "--test-threads=1", "--nocapture",
             ], cwd=ROOT, env=environment, check=True)
     finally:

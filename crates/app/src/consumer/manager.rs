@@ -50,6 +50,7 @@ pub struct ConsumerManager {
     stats_consumer: Option<Arc<Mutex<StatisticConsumer>>>,
     /// `begin_lifecycle()` 启动的周期 HTTP 回调守卫，在 `end_lifecycle()` 中 abort + 复用 client
     callback_guard: Option<CallbackGuard>,
+    notification_database: Option<ClickHouseDatabase>,
 }
 
 /// 扫描工作任务共享统计状态，不持有生命周期守卫或其他消费者。
@@ -454,6 +455,18 @@ impl ConsumerManager {
         Ok(Self::with_database_consumer(consumer_config, consumer))
     }
 
+    /// 扫描管道自行确认事实写入；这里仅管理统计和独立的最终报告归档。
+    pub(crate) fn statistics_only(consumer_config: &ConsumerConfig) -> Result<Self> {
+        let mut manager = Self::with_database_consumer(consumer_config, None);
+        if consumer_config.db_config.enabled {
+            manager.notification_database = Some(ClickHouseDatabase::new(
+                &consumer_config.db_config.clickhouse,
+                &consumer_config.job_id,
+            )?);
+        }
+        Ok(manager)
+    }
+
     /// A copy pipeline explicitly shares the catalogue that began its generation.
     pub(crate) async fn with_database(
         consumer_config: &ConsumerConfig, database: Option<ClickHouseDatabase>,
@@ -471,10 +484,12 @@ impl ConsumerManager {
     }
 
     fn with_database_consumer(consumer_config: &ConsumerConfig, consumer: Option<DatabaseConsumer>) -> Self {
+        let notification_database = consumer.as_ref().map(|consumer| consumer.database().clone());
         let mut manager = Self {
             consumers: Vec::new(),
             stats_consumer: None,
             callback_guard: None,
+            notification_database,
         };
         if let Some(consumer) = consumer {
             manager.add_consumer(Box::new(consumer));
@@ -628,14 +643,14 @@ impl ConsumerManager {
     pub async fn end_lifecycle(&mut self) {
         if let Some(sc) = self.stats_consumer.clone() {
             let callback = self.callback_guard.take();
-            StatisticConsumer::end(sc, callback).await;
+            StatisticConsumer::end_with_database(sc, callback, self.notification_database.as_ref(), false).await;
         }
     }
 
     pub(crate) async fn end_cancelled_lifecycle(&mut self) {
         if let Some(sc) = self.stats_consumer.clone() {
             let callback = self.callback_guard.take();
-            StatisticConsumer::end_cancelled(sc, callback).await;
+            StatisticConsumer::end_with_database(sc, callback, self.notification_database.as_ref(), true).await;
         }
     }
 }
@@ -681,6 +696,7 @@ mod resume_tests {
             consumers: vec![],
             stats_consumer: Some(Arc::new(Mutex::new(stats))),
             callback_guard: None,
+            notification_database: None,
         };
         let source = AppError::CopyError("version v2 upload refused".into());
         let failure = AppError::ReportedCopyFailure {
@@ -742,6 +758,7 @@ mod resume_tests {
             consumers: vec![],
             stats_consumer: Some(Arc::new(Mutex::new(stats))),
             callback_guard: None,
+            notification_database: None,
         };
         let special: StorageEntryRecord = serde_json::from_value(serde_json::json!({
             "name":"fifo", "relative_path":"fifo", "size":0, "ext":null, "ctime":0, "mtime":0, "atime":0,
@@ -877,6 +894,7 @@ mod resume_tests {
             consumers: vec![],
             stats_consumer: Some(Arc::new(Mutex::new(stats))),
             callback_guard: None,
+            notification_database: None,
         };
         let json = manager.statistics_checkpoint().await?;
         assert!(

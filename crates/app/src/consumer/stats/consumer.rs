@@ -15,23 +15,23 @@ use std::time::Duration;
 
 // 外部crate
 use data_mover::model::{EntryKind, ObservedEntry};
-use reqwest::Response;
 use task_model::StorageEntryMessage;
 use task_model::observation::{EntryStatistics, ObservedScanEvent, ObservedView};
 use tokio::sync::{Mutex, mpsc};
 use tokio::task::JoinHandle;
-use tokio::time::timeout;
 use tracing::{error, info, trace, warn};
 
 // 内部模块
 use super::accumulator::StatsKind;
 use super::callback_state::{CallbackState, ScanRuntimePhase, errors};
-use super::diagnostics::{CallbackAck, safe_diagnostic_text};
+use super::delivery::{self, DeliveryError, PreparedCallback};
+use super::diagnostics::safe_diagnostic_text;
 use super::progress_bar::ProgressBar;
 use super::report::ProgressDetail;
 use super::report::ProgressReport;
 use crate::callback::CallbackEndpoint;
 use crate::scan::statistics::{ScanCounts, ScanSnapshot};
+use db::ClickHouseDatabase;
 
 /// HTTP 进度回调间隔（秒）
 const CALLBACK_INTERVAL_SECS: u64 = 2;
@@ -291,37 +291,19 @@ impl StatisticConsumer {
     async fn post_callback(
         consumer: &Arc<Mutex<Self>>, client: &reqwest::Client, url: &CallbackEndpoint, is_final: bool,
     ) -> bool {
-        let report = {
-            let mut consumer = consumer.lock().await;
-            consumer.callback.identity.sequence = consumer.callback.identity.sequence.saturating_add(1);
-            let batch = consumer.callback.outbox.prepare_batch();
-            let mut report = consumer.to_report(is_final);
-            report.diagnostics = batch;
-            report
-        };
-        let response = match client
-            .post(url.request_url().clone())
-            .json(&report)
-            .send()
-            .await
-            .and_then(Response::error_for_status)
-        {
-            Ok(response) => response,
+        let prepared = match PreparedCallback::new(&mut *consumer.lock().await, is_final) {
+            Ok(value) => value,
             Err(error) => {
-                let error = error.without_url();
-                warn!(job_id = %report.job_id, %error, "Progress callback failed; batch retained");
+                warn!(%error, "Progress callback serialization failed");
                 return false;
             }
         };
-        let Some(batch) = report.diagnostics else { return true };
-        let ack = match response.json::<CallbackAck>().await {
-            Ok(ack) if ack.batch_id.as_deref() == Some(batch.batch_id.as_str()) => ack,
-            _ => {
-                warn!(job_id = %report.job_id, "Progress callback did not acknowledge the diagnostic batch");
-                return false;
-            }
-        };
-        if let Some(batch_id) = ack.batch_id {
+        if let Err(error) = prepared.send(client, url).await {
+            let state = consumer.lock().await;
+            warn!(job_id = %state.stats.job_id(), %error, "Progress callback failed; batch retained");
+            return false;
+        }
+        if let Some(batch_id) = prepared.batch_id {
             consumer.lock().await.callback.outbox.ack(&batch_id);
         }
         true
@@ -331,18 +313,14 @@ impl StatisticConsumer {
 
     /// 构建共享的 HTTP 客户端（带超时），供回调循环和最终回调复用。
     /// 本机回调绕过系统代理，外部回调继续遵循代理环境变量。
-    fn build_callback_client(url: &CallbackEndpoint) -> Option<reqwest::Client> {
+    fn build_callback_client(url: &CallbackEndpoint) -> std::result::Result<reqwest::Client, DeliveryError> {
         let mut builder = reqwest::Client::builder().timeout(Duration::from_secs(10));
         if url.is_loopback() {
             builder = builder.no_proxy();
         }
-        match builder.build() {
-            Ok(c) => Some(c),
-            Err(e) => {
-                error!("[ProgressCallback] Failed to build HTTP client, aborting callbacks: {e}");
-                None
-            }
-        }
+        builder
+            .build()
+            .map_err(|error| DeliveryError::Http(error.without_url()))
     }
 
     /// 启动周期性 HTTP 回调任务（每 2 秒 POST `ProgressReport`）
@@ -354,7 +332,13 @@ impl StatisticConsumer {
             let c = consumer.lock().await;
             (c.callback_url.clone()?, c.stats.job_id().to_owned())
         };
-        let client = Self::build_callback_client(&url)?;
+        let client = match Self::build_callback_client(&url) {
+            Ok(client) => client,
+            Err(error) => {
+                warn!(%job_id, %error, "Could not start callback loop");
+                return None;
+            }
+        };
         info!(%job_id, "[ProgressCallback] Starting callback loop");
         let sc = consumer.clone();
         let loop_client = client.clone();
@@ -371,29 +355,33 @@ impl StatisticConsumer {
 
     /// 发送最终回调（`is_final=true`），优先复用已有 client
     pub async fn send_final_callback(consumer: &Arc<Mutex<Self>>, client: Option<&reqwest::Client>) {
+        Self::send_final_with_database(consumer, client, None, Duration::from_secs(2)).await;
+    }
+
+    async fn send_final_with_database(
+        consumer: &Arc<Mutex<Self>>, client: Option<&reqwest::Client>, database: Option<&ClickHouseDatabase>,
+        budget: Duration,
+    ) {
         let url = consumer.lock().await.callback_url.clone();
-        let Some(url) = url else {
-            return;
+        let owned = match (&url, client) {
+            (Some(url), None) => match Self::build_callback_client(url) {
+                Ok(client) => Some(client),
+                Err(error) => {
+                    warn!(%error, "Final callback client could not be built; preserving final report");
+                    None
+                }
+            },
+            _ => None,
         };
-        let owned;
-        let client = match client {
-            Some(client) => client,
-            None => {
-                let Some(client) = Self::build_callback_client(&url) else {
-                    return;
-                };
-                owned = client;
-                &owned
-            }
-        };
-        loop {
-            if !Self::post_callback(consumer, client, &url, true).await {
-                break;
-            }
-            if consumer.lock().await.callback.outbox.prepare_batch().is_none() {
-                break;
-            }
-        }
+        delivery::send_final(
+            consumer,
+            client.or(owned.as_ref()),
+            url.as_ref(),
+            database,
+            budget,
+            budget.min(Duration::from_secs(1)),
+        )
+        .await;
     }
 
     // ─── 生命周期拆分 ───
@@ -420,20 +408,18 @@ impl StatisticConsumer {
 
     /// 结束生命周期：abort HTTP 回调循环 → 发送 final 回调 → finalize（打印报告 + join 显示线程）。
     pub async fn end(consumer: Arc<Mutex<Self>>, callback: Option<CallbackGuard>) {
-        let budget = consumer
-            .lock()
-            .await
-            .scan_snapshot
-            .as_ref()
-            .map(|_| Duration::from_secs(2));
-        Self::end_with_budget(consumer, callback, budget).await;
+        Self::end_with_database(consumer, callback, None, false).await;
     }
 
-    pub(crate) async fn end_cancelled(consumer: Arc<Mutex<Self>>, callback: Option<CallbackGuard>) {
-        Self::end_with_budget(consumer, callback, Some(Duration::from_millis(500))).await;
-    }
-
-    async fn end_with_budget(consumer: Arc<Mutex<Self>>, callback: Option<CallbackGuard>, budget: Option<Duration>) {
+    pub(crate) async fn end_with_database(
+        consumer: Arc<Mutex<Self>>, callback: Option<CallbackGuard>, database: Option<&ClickHouseDatabase>,
+        cancelled: bool,
+    ) {
+        let budget = if cancelled {
+            Duration::from_millis(500)
+        } else {
+            Duration::from_secs(2)
+        };
         let shared_client = if let Some((handle, client)) = callback {
             handle.abort();
             let _ = handle.await;
@@ -442,14 +428,7 @@ impl StatisticConsumer {
             None
         };
 
-        let callback = Self::send_final_callback(&consumer, shared_client.as_ref());
-        if let Some(budget) = budget {
-            if timeout(budget, callback).await.is_err() {
-                warn!("[ProgressCallback] Cancelled scan final report exceeded its time budget");
-            }
-        } else {
-            callback.await;
-        }
+        Self::send_final_with_database(&consumer, shared_client.as_ref(), database, budget).await;
 
         let mut c = consumer.lock().await;
         c.finalize();
@@ -495,7 +474,7 @@ mod tests {
         }));
         consumer.lock().await.start_progress_bar();
         let started = Instant::now();
-        StatisticConsumer::end_cancelled(consumer.clone(), None).await;
+        StatisticConsumer::end_with_database(consumer.clone(), None, None, true).await;
         stalled.abort();
         let _ = stalled.await;
         assert!(started.elapsed() < Duration::from_secs(2));

@@ -1,5 +1,6 @@
 //! 真实 HTTP 失败重试时批次不变，ACK 不清并发新事件和累计数字。
 #![allow(clippy::unwrap_used)]
+use super::super::diagnostics::CallbackAck;
 use super::*;
 use crate::{
     config::JobType,

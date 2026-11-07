@@ -20,18 +20,18 @@ const COLUMNS: &str = "round_id, attempt_id, sequence, kind, record_id, payload_
 const DEFINITION: &str = "round_id String, attempt_id String, sequence UInt64, kind UInt8, \
     record_id String, payload_json String, delivery_revision UInt64";
 
-/// 错误明细与最终投递失败载荷分开查询，避免把最终载荷当作普通错误事件重发。
+/// 错误明细与最终报告分开查询，避免把最终报告当作普通错误事件重发。
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum NotificationKind {
     Diagnostic,
-    FinalDeliveryFailure,
+    FinalReport,
 }
 
 impl NotificationKind {
     const fn code(self) -> u8 {
         match self {
             Self::Diagnostic => 1,
-            Self::FinalDeliveryFailure => 2,
+            Self::FinalReport => 2,
         }
     }
 }
@@ -124,6 +124,10 @@ impl NotificationRecord {
         &self.payload_json
     }
 
+    pub const fn is_delivered(&self) -> bool {
+        self.delivery_revision == 1
+    }
+
     pub fn cursor(&self) -> NotificationCursor {
         NotificationCursor {
             round_id: self.round_id.clone(),
@@ -207,6 +211,38 @@ struct WriteRecord<'a> {
 }
 
 impl ClickHouseDatabase {
+    /// 外部查询按完整执行身份读取最终报告；HTTP ACK 后仍可查询原文。
+    pub async fn final_report(
+        &self, round_id: &str, attempt_id: &str, sequence: u64,
+    ) -> Result<Option<NotificationRecord>> {
+        validate_id(round_id, "round_id")?;
+        validate_id(attempt_id, "attempt_id")?;
+        if sequence == 0 {
+            return Err(DatabaseError::NotificationRecordInvalid { field: "sequence" });
+        }
+        self.ensure_notification_archive().await?;
+        let table = self.catalogue_query_table(&self.notification_table())?;
+        let sql = format!(
+            "SELECT {COLUMNS} FROM {table} FINAL WHERE round_id=? AND attempt_id=? AND sequence=? AND kind=? LIMIT 2 SETTINGS optimize_move_to_prewhere=0"
+        );
+        let mut records: Vec<NotificationRecord> = self
+            .sync_client
+            .query(&sql)
+            .bind(round_id)
+            .bind(attempt_id)
+            .bind(sequence)
+            .bind(NotificationKind::FinalReport.code())
+            .fetch_quorum_all()
+            .await?;
+        validate_batch(&records)?;
+        if records.len() > 1 {
+            return Err(DatabaseError::NotificationRecordInvalid {
+                field: "conflicting_final_report",
+            });
+        }
+        Ok(records.pop())
+    }
+
     fn notification_table(&self) -> String {
         format!("notifications_{}", sanitize_job_id(&self.job_id))
     }

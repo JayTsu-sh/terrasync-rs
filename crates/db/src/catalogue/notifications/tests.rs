@@ -125,6 +125,11 @@ async fn oversize_archive_batches_fail_before_any_request_and_empty_batches_do_n
         Err(DatabaseError::NotificationRecordInvalid { field: "cursor_scope" })
     ));
     assert!(database.notifications_initialized.get().is_none());
+    assert!(matches!(
+        database.final_report("round", "attempt", 0).await,
+        Err(DatabaseError::NotificationRecordInvalid { field: "sequence" })
+    ));
+    assert!(database.notifications_initialized.get().is_none());
     Ok(())
 }
 
@@ -433,12 +438,12 @@ async fn real_archive_reopens_beyond_memory_limit_and_late_inserts_cannot_revoke
             .await?
             .is_empty()
     );
-    let exact = " {\"is_final\": true, \"error\": \"callback unreachable\"} \n";
+    let exact = " {\"is_final\": true, \"job_id\": \"example-job\"} \n";
     let final_failure = NotificationRecord::new(
         "round".into(),
         "attempt".into(),
         1025,
-        NotificationKind::FinalDeliveryFailure,
+        NotificationKind::FinalReport,
         exact.into(),
     )?;
     reopened.archive_notifications(&[final_failure]).await?;
@@ -449,10 +454,25 @@ async fn real_archive_reopens_beyond_memory_limit_and_late_inserts_cannot_revoke
             .is_empty()
     );
     let pending = reopened
-        .pending_notifications("round", NotificationKind::FinalDeliveryFailure)
+        .pending_notifications("round", NotificationKind::FinalReport)
         .await?;
     assert_eq!(pending.len(), 1);
     assert_eq!(pending[0].payload_json(), exact);
+    let report = reopened.final_report("round", "attempt", 1025).await?.unwrap();
+    assert!(!report.is_delivered());
+    reopened
+        .acknowledge_notifications(std::slice::from_ref(&report))
+        .await?;
+    assert!(
+        reopened
+            .pending_notifications("round", NotificationKind::FinalReport)
+            .await?
+            .is_empty()
+    );
+    let saved = reopened.final_report("round", "attempt", 1025).await?.unwrap();
+    assert!(saved.is_delivered());
+    assert_eq!(saved.record_id(), report.record_id());
+    assert_eq!(saved.payload_json(), exact);
     let client = base_client(&config)?;
     let table = reopened.notification_table();
     let (events, acked): (u64, u64) = client

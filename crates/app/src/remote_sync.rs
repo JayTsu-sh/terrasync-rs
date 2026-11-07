@@ -32,6 +32,7 @@ use crate::storage_factory::{StorageRole, create_storage_for_role};
 use data_mover::filter::parse_filter_expression;
 #[cfg(test)]
 use data_mover::model::ObservedEntry;
+use db::ClickHouseDatabase;
 use rustls::pki_types::CertificateDer;
 #[cfg(test)]
 use task_model::{ChangeKind, ErrorEvent, StorageEntryMessage};
@@ -132,6 +133,11 @@ pub(crate) async fn run(
     let match_expr = config.r#match.as_deref().and_then(|e| parse_filter_expression(e).ok());
     let exclude_expr = config.exclude.as_deref().and_then(|e| parse_filter_expression(e).ok());
     let app_config = AppConfig::fetch()?;
+    let notification_database = app_config
+        .database
+        .enabled
+        .then(|| ClickHouseDatabase::new(&app_config.database.clickhouse, &config.job_id))
+        .transpose()?;
     let walkdir_iter = directory_pages(
         &src_storage,
         WalkOptions {
@@ -175,7 +181,7 @@ pub(crate) async fn run(
     }
     transport.close().await?;
     // 结束统计报表生命周期：abort 回调循环 → 发最终回调(is_final=true) → 打印终态报表
-    StatisticConsumer::end(stats_consumer, callback_guard).await;
+    StatisticConsumer::end_with_database(stats_consumer, callback_guard, notification_database.as_ref(), false).await;
     finalize_run_result(summary.error_count)
 }
 
