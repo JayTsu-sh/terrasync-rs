@@ -249,7 +249,7 @@
               <tr><th scope="row">源元数据获取与数据复制</th><td><a href="../../crates/app/src/scan/observation.rs">validate_required_tags</a> 会在观察准入时拒绝缺失的必需 tags；其他观察和传输路径也可能将元数据失败作为整项操作失败。</td><td>数据仍可读取时必须继续生成和执行数据复制任务，携带分类元数据失败。扫描、data-mover 与任务层需共同支持“数据完成，元数据失败”的结果，不能提前丢弃对象或静默忽略错误。</td></tr>
               <tr><th scope="row">软链接与 ACL</th><td><a href="../../crates/app/src/receiver.rs">process_entry_on_receiver</a> 对源软链接删除失败、ACL 复制失败只记日志；ACL 处理位于文件搬迁之后。</td><td>统一严格错误传播；必需元数据应在源端删除前完成，不能将这些失败折叠为 entry 成功。</td></tr>
               <tr><th scope="row">超时与退出</th><td><a href="../../crates/app/src/dir_walker.rs">DirectoryWalker::new</a> 默认没有设置 operation timeout 和 recovery window，普通全量遍历使用这个入口。</td><td>需显式设置有界检测和取消收尾；识别网络中断后快速进入终止流程，不持续重连，也不能借用独立扫描路径的恢复能力作为优雅退出已达标的证据。</td></tr>
-              <tr><th scope="row">统计与诊断</th><td><a href="../../crates/app/src/consumer/stats/report.rs">ProgressDetail::Full</a> 主要是数量、字节和错误数；已有<a href="../../crates/app/src/consumer/stats/diagnostics.rs">有界诊断发件箱与批次 ACK</a>。</td><td>增加目标就绪、删除结果、目录收尾、结果未知等状态。最终未恢复错误都进入 callback；重试后恢复错误仅写日志。现有有界队列的省略计数不能代替完整最终错误上报。</td></tr>
+              <tr><th scope="row">统计与诊断</th><td><a href="../../crates/app/src/consumer/stats/report.rs">ProgressDetail::Full</a> 主要是数量、字节和错误数；已有<a href="../../crates/app/src/consumer/stats/diagnostics.rs">有界诊断发件箱与批次身份</a>。</td><td>增加目标就绪、删除结果、目录收尾、结果未知等状态。最终未恢复错误都进入 callback；重试后恢复错误仅写日志。现有有界队列的省略计数不能代替完整最终错误上报。</td></tr>
             </tbody>
           </table>
         </div>
@@ -501,9 +501,11 @@
             </tbody>
           </table>
         </div>
-        <p>复用有界诊断发件箱和批次 ACK，但最终未恢复错误不得因队列容量而只留省略数。完整最终错误持久化到可用 ClickHouse，按有界批次生成 callback 并按事件／批次身份去重确认；积压通过持久化分页读取及背压处理，不在内存保留全部明细。累计错误数、待发送数、已确认数和明细完整性分别呈现，不能把截断列表或只有日志／查询引用视为已完整上报。</p>
+        <p>复用有界诊断发件箱和批次身份，但最终未恢复错误不得因队列容量而只留省略数。完整最终错误持久化到可用 ClickHouse，按有界批次生成 callback 并按事件／批次身份去重确认；积压通过持久化分页读取及背压处理，不在内存保留全部明细。累计错误数、待发送数、已确认数和明细完整性分别呈现，不能把截断列表或只有日志／查询引用视为已完整上报。</p>
+        <p>callback 是外部 HTTP 接口，HTTP 2xx 即接收成功，无需返回 batch_id 或特定响应体；3xx 不视为成功且不自动跳转。每批成功后清理该批待发错误明细，累计 entry 错误数和任务错误数始终保留。ClickHouse 的内部确认只表示发送方已记录该批 HTTP 接收结果，避免重发，不表示外部业务已处理完成；确认写入失败不能将同进程已经收到 2xx 的明细再次主动发送。崩溃发生在接收与确认之间仍可能重复，外部按事件身份幂等。</p>
+        <p>实现按最多 64 条归档前缀与分页读写，通过持久化和背压控制内存；内部待确认记录最多 128 条，未知归档前缀最多 64 条。未恢复 checkpoint 且无错误时无需访问诊断表，不增加源端元数据读取。最终明细可分批发送，再以无明细汇总报告的 diagnostics_complete 表示完整性；预算耗尽、遗漏或确认未完成必须为 false。分批终态报告序号递增，接收端不能仅因已收到首个终态就忽略最后汇总。</p>
         <p>终态载荷须明确实际任务状态、全部最终错误累计数及错误明细交付是否完成；未发送完的明细保留为待交付，不得宣称 callback 已完整送达。callback 自身发送失败的原因只记录日志，不写入 ClickHouse，也不能递归触发无限错误通知。</p>
-        <p>终态 callback 首次失败后最多再重试 3 次；准确最终报告及任务／执行身份独立保存到可用 ClickHouse，供外部应用查询；不以 callback 是否配置或投递成功作为保存条件。发送失败原因只记日志，不入库，ACK 后仍保留报告原文。通知失败不改变任务实际结果，也不能标记为已交付。ClickHouse 与 callback 同时不可用时由上层处理，不增加专门兜底存储。</p>
+        <p>终态 callback 首次失败后最多再重试 3 次；准确最终报告及任务／执行身份独立保存到可用 ClickHouse，供外部应用查询；不以 callback 是否配置或投递成功作为保存条件。发送失败原因只记日志，不入库，HTTP 2xx 后仍保留报告原文。通知失败不改变任务实际结果，也不能标记为已交付。ClickHouse 与 callback 同时不可用时由上层处理，不增加专门兜底存储。</p>
       </section>
 
       <section id="move-source">
@@ -809,7 +811,7 @@
         <p>实现上优先用有界批量 ClickHouse 写入和限时刷新，批次持久化确认后只释放对应对象进入删除阶段，避免逐文件串行 INSERT。元数据按 backend 合并获取并复用不可变观察，流式计算分类摘要；减少重复序列化、复制快照和无必要的再次回源。</p>
         <p>队列、批次、在途观察和缓存同时考虑条目数与字节预算，原值与摘要持久化后按需投影、压缩和流式读取，避免巨大 ACL／xattr 常驻或重复存储。增量比较同次查询返回所需原值，不用额外查库或回源换取表面存储节省；全部成本和收益以完整正确性及实测为准。</p>
         <p>本方案不包含全量断点续扫验收。独立扫描场景已有的 unordered／blocks、checkpoint 及专项性能规范仅在其对应范围适用，不能替代本次完整全量迁移及失败后增量的前后对比。“全量扫描损失不超过 5%”“增量扫描损失不超过 10%”及约 200 MiB 的通用内存优化目标，不作为整轮全量迁移“性能和内存相当”的替代判据。</p>
-        <div class="note warn"><p><strong>本次验证范围：</strong>本方案基于源码与已有规范分析。未修改或运行迁移逻辑，未执行 NFS／S3／ClickHouse／callback 真实故障注入，未取得本方案的吞吐、恢复时延或数据安全实测结论。文档生成检查只证明文档结构与链接等内容，不证明运行时行为。</p></div>
+        <div class="note warn"><p><strong>本次验证范围：</strong>本方案仍含待实现项目，不能据文档认定全量优化已经完成。通知链路的真实 ClickHouse 单机／集群和 HTTP 故障用例见 <a href="../../tests/lab/README.md">实验室验证说明</a>及对应测试；其证据不代表完整迁移的全部存储故障矩阵或性能／RSS 目标已通过。每次提交以实际执行结果报告已验证范围。</p></div>
       </section>
 
       <section id="references">

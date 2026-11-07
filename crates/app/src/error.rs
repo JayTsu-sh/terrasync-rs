@@ -18,6 +18,7 @@ use serde_json::Error as JsonError;
 pub mod storage;
 use crate::broadcast::BroadcastError;
 use crate::callback::CallbackEndpointError;
+use std::sync::Arc;
 pub use storage::StorageError;
 use task_model::StorageEntryMessage;
 use thiserror::Error;
@@ -50,6 +51,20 @@ impl Display for CopyStep {
 /// 应用程序的专用错误枚举
 #[derive(Error, Debug)]
 pub enum AppError {
+    #[error("Diagnostic processing stopped: {source}")]
+    DiagnosticJournalStopped {
+        #[source]
+        source: Arc<AppError>,
+    },
+    #[error("Diagnostic database unavailable after bounded recovery: {source}")]
+    DiagnosticDatabaseUnavailable {
+        #[source]
+        source: Arc<DatabaseError>,
+    },
+    #[error("Unresolved diagnostics could not be retained or acknowledged within the delivery budget")]
+    DiagnosticDeliveryUnavailable,
+    #[error("Invalid archived diagnostic record: {field}")]
+    DiagnosticArchiveInvalid { field: &'static str },
     #[error("{source}")]
     ConsumerDisconnected {
         #[source]

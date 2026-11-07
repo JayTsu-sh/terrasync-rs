@@ -133,6 +133,7 @@ export interface CallbackIdentity {
 }
 
 export interface DiagnosticEvent {
+  sequence: number
   event_id: string
   round_id: string
   attempt_id: string
@@ -248,6 +249,8 @@ export async function deleteExecution(id: string): Promise<void> {
 }
 
 export interface TaskProgressSnapshot {
+  task_error_count?: number
+  diagnostics_complete?: boolean
   scanned_files: number
   scanned_dirs: number
   total_bytes: number

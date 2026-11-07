@@ -168,6 +168,8 @@ fn progress_report_to_snapshot(report: &ProgressReport) -> Result<serde_json::Va
             "speed_bytes_per_sec": report.speed_bytes_per_sec,
         }),
     };
+    snapshot["task_error_count"] = serde_json::to_value(report.task_error_count)?;
+    snapshot["diagnostics_complete"] = serde_json::to_value(report.diagnostics_complete)?;
     if let Some(scan) = &report.scan {
         snapshot["scan"] = serde_json::to_value(scan)?;
     }
@@ -185,7 +187,7 @@ pub struct CallbackQuery {
     pub execution_id: Option<String>,
 }
 
-/// 接收本机回调，仅在持久化成功后返回批次 ACK。
+/// 接收本机回调，仅在事务提交后返回 HTTP 2xx；响应体的批次信息可供调用方参考。
 pub async fn update_progress(
     ConnectInfo(peer): ConnectInfo<SocketAddr>, State(state): State<AppState>, Path(id): Path<String>,
     Query(query): Query<CallbackQuery>, Json(report): Json<ProgressReport>,

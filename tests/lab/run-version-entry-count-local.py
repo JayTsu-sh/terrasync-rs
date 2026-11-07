@@ -140,12 +140,9 @@ def run_inside():
         def do_POST(self):
             report = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
             callback_reports.append(report)
-            body = json.dumps({"batch_id": report.get("diagnostics", {}).get("batch_id")}).encode()
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(body)))
+            self.send_response(204)
+            self.send_header("Content-Length", "0")
             self.end_headers()
-            self.wfile.write(body)
 
     callback = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Callback)
     callback.daemon_threads = True
@@ -160,12 +157,13 @@ def run_inside():
             "--", "--ignored", "--exact", "--nocapture",
         ], cwd=ROOT, env=environment, check=True)
         assert tag_refusals == 20, tag_refusals
-        assert len(callback_reports) == 1, callback_reports
-        report = callback_reports[0]
-        assert report["is_final"] and report["detail"]["error_count"] == 1, report
-        errors = [event for event in report["diagnostics"]["events"] if event["code"] == "copy_version_failed"]
+        assert len(callback_reports) == 2, callback_reports
+        report = callback_reports[-1]
+        assert report["is_final"] and report["diagnostics_complete"] and report["detail"]["error_count"] == 1, report
+        assert all(item["detail"]["error_count"] == 1 for item in callback_reports), callback_reports
+        errors = [event for item in callback_reports for event in (item.get("diagnostics") or {}).get("events", []) if event["code"] == "copy_version_failed"]
         assert len(errors) == 20 and all("PermissionDenied" in event["message"] and "phase=source_metadata" in event["message"] for event in errors), errors
-        print("real HTTP callback failed_entries=1 version_error_details=20 ACK=confirmed", flush=True)
+        print("real HTTP callback failed_entries=1 version_error_details=20 HTTP_204=accepted summary_complete=true", flush=True)
         failed_records = client.list_object_versions(Bucket=buckets["history"], Prefix="metadata-failure/payload").get("Versions", [])
         assert len(failed_records) == 20, len(failed_records)
         assert client.get_object(Bucket=buckets["history"], Key="metadata-failure/payload")["Body"].read() == b"payload"

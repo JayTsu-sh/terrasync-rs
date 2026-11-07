@@ -28,6 +28,11 @@ pub(crate) struct ScanCancellationDeadline;
 /// 使用thiserror库实现错误处理和转换
 #[derive(Error, Debug)]
 pub enum DatabaseError {
+    #[error("Notification request timed out; its outcome is unconfirmed: {source}")]
+    NotificationRequestTimedOut {
+        #[source]
+        source: tokio::time::error::Elapsed,
+    },
     #[error("Invalid notification archive field: {field}")]
     NotificationRecordInvalid { field: &'static str },
     #[error("Invalid notification JSON payload: {source}")]
@@ -201,7 +206,7 @@ impl From<clickhouse::error::Error> for DatabaseError {
 
 impl DatabaseError {
     /// 日志只暴露稳定分类和服务端数字码，原始响应可能含 SQL 或绑定值，留在 typed cause 中。
-    pub(crate) fn diagnostic_class(&self) -> (&'static str, Option<u32>) {
+    pub fn diagnostic_class(&self) -> (&'static str, Option<u32>) {
         match self {
             Self::ScanRequestFailed { source } | Self::ScanDatabaseUnavailable { source, .. } => {
                 source.diagnostic_class()
@@ -228,9 +233,9 @@ impl DatabaseError {
             _ => false,
         }
     }
-    pub(crate) fn is_transient_connectivity_failure(&self) -> bool {
+    pub fn is_transient_connectivity_failure(&self) -> bool {
         match self {
-            Self::ProbeTimeout { .. } | Self::ClusterProbeIncomplete => true,
+            Self::ProbeTimeout { .. } | Self::ClusterProbeIncomplete | Self::NotificationRequestTimedOut { .. } => true,
             Self::ScanRequestFailed { source } | Self::ScanDatabaseUnavailable { source, .. } => {
                 source.is_transient_connectivity_failure()
             }

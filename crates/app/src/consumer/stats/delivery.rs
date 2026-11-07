@@ -2,8 +2,8 @@
 use std::{slice::from_ref, sync::Arc, time::Duration};
 
 use db::scan::with_scan_cancellation;
-use db::{ClickHouseDatabase, NotificationKind, NotificationRecord};
-use reqwest::{Client, Response};
+use db::{ClickHouseDatabase, DatabaseError, NotificationKind, NotificationRecord};
+use reqwest::{Client, StatusCode};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::{
@@ -15,9 +15,11 @@ use tracing::warn;
 
 use super::{
     consumer::StatisticConsumer,
-    diagnostics::{CallbackAck, CallbackIdentity},
+    diagnostics::{CallbackIdentity, DiagnosticBatch},
+    journal,
 };
 use crate::callback::CallbackEndpoint;
+use crate::error::Result;
 
 const FINAL_ATTEMPTS: u8 = 4;
 const RETRY_DELAY: Duration = Duration::from_millis(40);
@@ -26,10 +28,8 @@ const RETRY_DELAY: Duration = Duration::from_millis(40);
 pub(crate) enum DeliveryError {
     #[error("callback HTTP request failed: {0}")]
     Http(#[source] reqwest::Error),
-    #[error("callback did not acknowledge the diagnostic batch")]
-    MissingAck,
-    #[error("callback acknowledgement could not be read: {0}")]
-    InvalidAck(#[source] reqwest::Error),
+    #[error("callback returned HTTP {status}")]
+    HttpStatus { status: StatusCode },
     #[error("callback delivery time budget exhausted")]
     Timeout,
 }
@@ -39,9 +39,12 @@ pub(crate) struct PreparedCallback {
     identity: CallbackIdentity,
     pub(crate) batch_id: Option<String>,
     payload_json: String,
+    pub(crate) records: Vec<NotificationRecord>,
+    from_database: bool,
+    pub(crate) complete: bool,
 }
 
-/// `payload_json` 与实际 HTTP body 逐字节相同；未收到 ACK 不能标为已交付。
+/// `payload_json` 与实际 HTTP body 逐字节相同；HTTP 2xx 仅表示外部接口已接收。
 #[derive(Serialize, Deserialize)]
 pub(crate) struct FinalCallbackReport {
     pub(crate) job_id: String,
@@ -50,20 +53,114 @@ pub(crate) struct FinalCallbackReport {
 }
 
 impl PreparedCallback {
-    pub(crate) fn new(
-        consumer: &mut StatisticConsumer, is_final: bool,
-    ) -> std::result::Result<Self, serde_json::Error> {
-        consumer.callback.identity.sequence = consumer.callback.identity.sequence.saturating_add(1);
+    pub(crate) fn new(consumer: &mut StatisticConsumer, is_final: bool) -> Result<Self> {
         let batch = consumer.callback.outbox.prepare_batch();
+        Self::with_batch(consumer, is_final, batch, None)
+    }
+
+    fn with_batch(
+        consumer: &mut StatisticConsumer, is_final: bool, batch: Option<DiagnosticBatch>,
+        archived: Option<Vec<NotificationRecord>>,
+    ) -> Result<Self> {
+        consumer.callback.identity.sequence = consumer.callback.identity.sequence.saturating_add(1);
         let mut report = consumer.to_report(is_final);
         let batch_id = batch.as_ref().map(|batch| batch.batch_id.clone());
+        let from_database = archived.is_some();
+        let records = if let Some(rows) = archived {
+            rows
+        } else if consumer.callback.journal.database.is_some() {
+            batch
+                .as_ref()
+                .map(|batch| journal::records(&batch.events))
+                .transpose()?
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        let complete = is_final
+            && batch.is_none()
+            && !consumer.callback.diagnostics_incomplete
+            && !consumer.callback.outbox.has_omissions()
+            && consumer.callback.pending_acknowledgements.is_empty();
         report.diagnostics = batch;
+        report.diagnostics_complete = complete;
         Ok(Self {
             job_id: report.job_id.clone(),
             identity: consumer.callback.identity.clone(),
             batch_id,
             payload_json: serde_json::to_string(&report)?,
+            records,
+            from_database,
+            complete,
         })
+    }
+
+    pub(crate) async fn prepare(consumer: &Arc<Mutex<StatisticConsumer>>, is_final: bool) -> Result<Self> {
+        let failed = consumer.lock().await.callback.journal.failed;
+        if !failed || is_final {
+            journal::confirm_pending(consumer, is_final).await?;
+        }
+        loop {
+            let (use_database, pending_memory, gate) = {
+                let state = consumer.lock().await;
+                (
+                    state.callback.journal.database.is_some() && !state.callback.journal.failed,
+                    state.callback.outbox.pending_len() != 0,
+                    state.callback.journal.producer.clone(),
+                )
+            };
+            if use_database && pending_memory {
+                let _guard = gate.lock().await;
+                journal::persist_prefix(consumer).await?;
+            }
+            if let Some(rows) = journal::pending(consumer, is_final).await? {
+                let batch = journal::batch(&rows)?;
+                return Self::with_batch(&mut *consumer.lock().await, is_final, Some(batch), Some(rows));
+            }
+            // 从旧 checkpoint 恢复的内存前缀可能已在数据库确认。归档 revision=0
+            // 不能撤销该确认；循环释放这些前缀，不能再次发送已被 HTTP 2xx 接收的事件。
+            if use_database && consumer.lock().await.callback.outbox.pending_len() != 0 {
+                continue;
+            }
+            return Self::new(&mut *consumer.lock().await, is_final);
+        }
+    }
+
+    pub(crate) async fn received(&self, consumer: &Arc<Mutex<StatisticConsumer>>) {
+        // HTTP 2xx 即接收成功，先清本批待发明细；数据库确认失败只重试内部确认，不重发 HTTP。
+        let mut state = consumer.lock().await;
+        if let Some(batch_id) = &self.batch_id {
+            state.callback.outbox.ack(batch_id);
+        }
+        if self.from_database {
+            state.callback.journal.cursor = self.records.last().map(NotificationRecord::cursor);
+            state.callback.journal.in_flight = None;
+        }
+        if state.callback.journal.database.is_some() {
+            for row in &self.records {
+                let attempted = !state.callback.journal.failed
+                    || self.from_database
+                    || state
+                        .callback
+                        .unconfirmed_archive
+                        .iter()
+                        .any(|other| other.record_id() == row.record_id());
+                if attempted
+                    && !state
+                        .callback
+                        .pending_acknowledgements
+                        .iter()
+                        .any(|other| other.record_id() == row.record_id())
+                {
+                    if state.callback.pending_acknowledgements.len() >= journal::MAX_PENDING_CONFIRMATIONS {
+                        state.callback.diagnostics_incomplete = true;
+                        state.callback.journal.failed = true;
+                        break;
+                    }
+                    state.callback.pending_acknowledgements.push(row.clone());
+                }
+            }
+        }
     }
 
     pub(crate) async fn send(
@@ -75,16 +172,10 @@ impl PreparedCallback {
             .body(self.payload_json.clone())
             .send()
             .await
-            .and_then(Response::error_for_status)
             .map_err(|error| DeliveryError::Http(error.without_url()))?;
-        if let Some(batch_id) = &self.batch_id {
-            let ack = response
-                .json::<CallbackAck>()
-                .await
-                .map_err(|error| DeliveryError::InvalidAck(error.without_url()))?;
-            if ack.batch_id.as_ref() != Some(batch_id) {
-                return Err(DeliveryError::MissingAck);
-            }
+        let status = response.status();
+        if !status.is_success() {
+            return Err(DeliveryError::HttpStatus { status });
         }
         Ok(())
     }
@@ -173,14 +264,52 @@ pub(crate) async fn send_final(
     if database.is_none() && (client.is_none() || endpoint.is_none()) {
         return;
     }
-    // 只累计 HTTP 耗时，数据库收尾另有共享预算，不按批次重置。
+    if let Some(database) = database {
+        consumer.lock().await.callback.journal.database = Some(database.clone());
+    }
+    let gate = consumer.lock().await.callback.journal.delivery.clone();
+    let _delivery = gate.lock().await;
+    let failed = consumer.lock().await.callback.journal.failed;
+    if !failed && database.is_some() {
+        let started = Instant::now();
+        let result = timeout(archive_budget / 2, journal::flush_all(consumer)).await;
+        archive_budget = archive_budget.saturating_sub(started.elapsed());
+        match result {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => StatisticConsumer::diagnostic_failure(consumer, error).await,
+            Err(source) => {
+                StatisticConsumer::diagnostic_failure(
+                    consumer,
+                    DatabaseError::NotificationRequestTimedOut { source }.into(),
+                )
+                .await;
+            }
+        }
+    }
     let mut delivery_remaining = delivery_budget;
     loop {
-        let prepared = match PreparedCallback::new(&mut *consumer.lock().await, true) {
-            Ok(value) => value,
-            Err(error) => {
-                warn!(%error, "Final callback serialization failed");
-                return;
+        let started = Instant::now();
+        let result = timeout(archive_budget / 2, PreparedCallback::prepare(consumer, true)).await;
+        archive_budget = archive_budget.saturating_sub(started.elapsed());
+        let prepared = match result {
+            Ok(Ok(value)) => value,
+            failure => {
+                if let Ok(Err(error)) = failure {
+                    StatisticConsumer::diagnostic_failure(consumer, error).await;
+                } else if let Err(source) = failure {
+                    StatisticConsumer::diagnostic_failure(
+                        consumer,
+                        DatabaseError::NotificationRequestTimedOut { source }.into(),
+                    )
+                    .await;
+                }
+                match PreparedCallback::new(&mut *consumer.lock().await, true) {
+                    Ok(value) => value,
+                    Err(error) => {
+                        warn!(%error, "Final callback serialization failed");
+                        return;
+                    }
+                }
             }
         };
         let record = database.and_then(|_| prepared.record());
@@ -192,18 +321,15 @@ pub(crate) async fn send_final(
         };
         let started = Instant::now();
         if let Err((attempts, error)) = prepared.retry(client, endpoint, started + delivery_remaining).await {
-            warn!(job_id = %prepared.job_id, attempts, %error, "Final callback undelivered; report retains its pending delivery state");
+            warn!(job_id = %prepared.job_id, attempts, %error, "Final callback was not accepted; retaining pending diagnostics");
             return;
         }
         delivery_remaining = delivery_remaining.saturating_sub(started.elapsed());
+        prepared.received(consumer).await;
         if let (Some(database), Some(record)) = (database, &record) {
             archive(database, record, true, &mut archive_budget).await;
         }
-        let mut state = consumer.lock().await;
-        if let Some(batch_id) = &prepared.batch_id {
-            state.callback.outbox.ack(batch_id);
-        }
-        if state.callback.outbox.prepare_batch().is_none() {
+        if prepared.complete || prepared.batch_id.is_none() {
             return;
         }
     }
@@ -211,4 +337,4 @@ pub(crate) async fn send_final(
 
 #[cfg(test)]
 #[path = "delivery_tests.rs"]
-mod tests;
+pub(crate) mod tests;

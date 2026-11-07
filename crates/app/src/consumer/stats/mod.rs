@@ -11,6 +11,7 @@ pub(crate) mod callback_state;
 pub mod consumer;
 pub(crate) mod delivery;
 pub mod diagnostics;
+pub(crate) mod journal;
 pub mod progress_bar;
 pub(crate) mod recovery_progress;
 pub mod report;

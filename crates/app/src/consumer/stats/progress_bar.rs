@@ -600,6 +600,8 @@ impl ProgressBar {
         };
 
         ProgressReport {
+            diagnostics_complete: false,
+            task_error_count: 0,
             job_id: job_id.to_string(),
             job_type: self.job_type.to_callback_name().to_string(),
             elapsed_secs,

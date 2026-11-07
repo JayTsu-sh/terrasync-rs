@@ -41,7 +41,11 @@ pub async fn receive(
             .fetch_optional(&mut **transaction)
             .await?;
     let mut accepted = match (submission.identity, current) {
-        (Some(identity), Some((json, final_report))) => follows(identity, &serde_json::from_str(&json)?, final_report),
+        (Some(identity), Some((json, final_report))) => follows(
+            identity,
+            &serde_json::from_str(&json)?,
+            final_report && !submission.progress.is_final,
+        ),
         (Some(_), None) | (None, None) => true,
         (None, Some(_)) => false,
     };
@@ -101,7 +105,7 @@ fn invalid_callback() -> WebError {
     WebError::ValidationError("Invalid callback diagnostic identity or batch".into())
 }
 
-fn follows(next: &CallbackIdentity, current: &CallbackIdentity, final_report: bool) -> bool {
+fn follows(next: &CallbackIdentity, current: &CallbackIdentity, periodic_after_final: bool) -> bool {
     match next.round_started_at_millis.cmp(&current.round_started_at_millis) {
         Ordering::Greater => return next.round_id != current.round_id,
         Ordering::Less => return false,
@@ -111,7 +115,9 @@ fn follows(next: &CallbackIdentity, current: &CallbackIdentity, final_report: bo
     match next.attempt_started_at_millis.cmp(&current.attempt_started_at_millis) {
         Ordering::Greater => next.attempt_id != current.attempt_id,
         Ordering::Less => false,
-        Ordering::Equal => next.attempt_id == current.attempt_id && next.sequence > current.sequence && !final_report,
+        Ordering::Equal => {
+            next.attempt_id == current.attempt_id && next.sequence > current.sequence && !periodic_after_final
+        }
     }
 }
 

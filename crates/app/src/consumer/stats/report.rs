@@ -60,6 +60,10 @@ pub struct ProgressReport {
     pub speed_bytes_per_sec: f64,
     pub detail: ProgressDetail,
     pub is_final: bool,
+    #[serde(default)]
+    pub diagnostics_complete: bool,
+    #[serde(default)]
+    pub task_error_count: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scan: Option<ScanSnapshot>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

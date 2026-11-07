@@ -507,7 +507,7 @@ async fn process_requests_and_acks(context: RequestLoopContext<'_>) -> Result<()
                     .get(ndx)
                     .cloned();
                 if let Some(entry) = entry {
-                    record_classification(stats_consumer, decision, entry.clone()).await;
+                    record_classification(stats_consumer, decision, entry.clone()).await?;
                     if matches!(
                         send_full_transfer(*transport, src_storage, &entry, ndx, *qos, *enable_acl).await?,
                         SourceTransferOutcome::SourceFailed
@@ -518,7 +518,7 @@ async fn process_requests_and_acks(context: RequestLoopContext<'_>) -> Result<()
                             entry.get_relative_path().to_path_buf(),
                             format!("source read failed for ndx {ndx}"),
                         )
-                        .await;
+                        .await?;
                     }
                     ledger.record_transfer();
                 } else {
@@ -536,7 +536,7 @@ async fn process_requests_and_acks(context: RequestLoopContext<'_>) -> Result<()
                     .get(ndx)
                     .cloned();
                 if let Some(entry) = entry {
-                    record_classification(stats_consumer, TransferDecision::DeltaTransfer, entry.clone()).await;
+                    record_classification(stats_consumer, TransferDecision::DeltaTransfer, entry.clone()).await?;
                     if matches!(
                         send_delta_transfer(&source, &entry, ndx, block_size, signatures).await?,
                         SourceTransferOutcome::Sent
@@ -548,7 +548,7 @@ async fn process_requests_and_acks(context: RequestLoopContext<'_>) -> Result<()
                             entry.get_relative_path().to_path_buf(),
                             format!("delta source read failed for ndx {ndx}"),
                         )
-                        .await;
+                        .await?;
                     }
                 } else {
                     error!("[Sender Remote] Unknown NDX {ndx} for delta");
@@ -561,11 +561,11 @@ async fn process_requests_and_acks(context: RequestLoopContext<'_>) -> Result<()
                     .get(ndx)
                     .cloned();
                 if let Some(item) = item {
-                    record_classification(stats_consumer, decision, item).await;
+                    record_classification(stats_consumer, decision, item).await?;
                 }
             }
             Some(ReceiverMsg::Classified { entry, decision }) => {
-                record_classification(stats_consumer, decision, entry.into()).await;
+                record_classification(stats_consumer, decision, entry.into()).await?;
             }
             Some(ReceiverMsg::Redo { ndx }) => {
                 let entry = ndx_table
@@ -616,7 +616,7 @@ async fn process_requests_and_acks(context: RequestLoopContext<'_>) -> Result<()
                 let path = entry.get_relative_path().to_path_buf();
                 error!("[Sender Remote] Entry failed {path:?}: {reason}");
                 ledger.record_entry_error();
-                record_copy_error(stats_consumer, path, reason).await;
+                record_copy_error(stats_consumer, path, reason).await?;
             }
             Some(ReceiverMsg::Error { ndx, reason }) if ndx < 0 => {
                 return Err(AppError::CopyError(reason));
@@ -632,7 +632,7 @@ async fn process_requests_and_acks(context: RequestLoopContext<'_>) -> Result<()
                             || PathBuf::from(format!("<ndx-{ndx}>")),
                             |entry| entry.get_relative_path().to_path_buf(),
                         );
-                    record_copy_error(stats_consumer, path, reason).await;
+                    record_copy_error(stats_consumer, path, reason).await?;
                 }
             }
             Some(ReceiverMsg::AllDone) => {
@@ -655,17 +655,19 @@ async fn process_requests_and_acks(context: RequestLoopContext<'_>) -> Result<()
 
 pub(super) async fn record_classification(
     stats_consumer: &Arc<AsyncMutex<StatisticConsumer>>, decision: TransferDecision, entry: ObservedItem,
-) {
+) -> Result<()> {
     if let Some(message) = classification_to_stats_message(decision, entry) {
-        stats_consumer.lock().await.update_statistics(&message);
+        StatisticConsumer::record_message(stats_consumer, &message).await?;
     }
+    Ok(())
 }
 
 pub(super) async fn record_copy_error(
     stats_consumer: &Arc<AsyncMutex<StatisticConsumer>>, path: PathBuf, reason: String,
-) {
+) -> Result<()> {
     let message = entry_error_stats_message(path, reason);
-    stats_consumer.lock().await.update_statistics(&message);
+    StatisticConsumer::record_message(stats_consumer, &message).await?;
+    Ok(())
 }
 
 pub(super) async fn apply_progress(stats_consumer: &Arc<AsyncMutex<StatisticConsumer>>, snapshot: ProgressSnapshot) {

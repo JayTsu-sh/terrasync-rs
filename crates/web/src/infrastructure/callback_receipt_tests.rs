@@ -180,6 +180,9 @@ async fn rounds_attempts_and_final_reports_cannot_move_progress_backwards() -> R
         ),
         (identity("r2", "a3", 4, 5, 2), "finished", true, true),
         (identity("r2", "a3", 4, 5, 3), "late periodic", false, false),
+        (identity("r2", "a3", 4, 5, 4), "final detail page", true, true),
+        (identity("r2", "a3", 4, 5, 5), "complete summary", true, true),
+        (identity("r2", "a3", 4, 5, 4), "late detail page", false, true),
     ] {
         let report = progress(text, is_final);
         let receipt = repo
@@ -193,7 +196,10 @@ async fn rounds_attempts_and_final_reports_cannot_move_progress_backwards() -> R
             .await?;
         assert_eq!(receipt.accepted, accepted, "{text}");
     }
-    assert_eq!(repo.find_by_task_id("task").await?.unwrap().report_json, "finished");
+    assert_eq!(
+        repo.find_by_task_id("task").await?.unwrap().report_json,
+        "complete summary"
+    );
     Ok(())
 }
 

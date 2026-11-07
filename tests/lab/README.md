@@ -77,7 +77,8 @@ payloads, and byte-bounded reads of 800 KB payloads. Its proxy injects disconnec
 responses, and silent response stalls; a real readonly setting checks confirmed refusals separately.
 Only its own databases, containers, volumes, and configuration directory are removed on exit.
 The runner also exercises the app's final callback lifecycle through real HTTP: disconnects,
-HTTP 500, wrong ACKs, silent stalls, and recovery within four attempts. It checks byte-identical
+HTTP 500, redirects, silent stalls, and recovery within four attempts. HTTP 2xx alone
+is receipt success, including empty 204 and arbitrary 200/202 response bodies; redirects are disabled. It checks byte-identical
 retries, retained unacknowledged diagnostics, the exact final report archived after exhaustion,
 and archival during an already-cancelled task scope, successful HTTP delivery, or no configured
 callback. Callback delivery failure causes remain only in logs; they are excluded from the
@@ -89,8 +90,18 @@ The archive proxy separately checks lost initial-write/ACK replies, disconnects,
 stalls during that lifecycle. Normal final HTTP delivery has a shared two-second budget,
 plus at most one second shared by initial archival and durable ACK; cancelled lifecycle
 uses 500 ms for each. Expired archival has an unknown write outcome and does not claim delivery.
-Connecting all diagnostic outbox overflow to persistent paging, full-migration fault handling,
-and end-to-end worker cancellation remain separate gates.
+The app journal tests drive 1280 version failures through the real statistics consumer and bounded
+broadcast queue. They check 64 failed entries, all 1280 unique diagnostics delivered in pages,
+a memory prefix of at most 64 events during healthy archival, and no recounting during replay.
+Lost archive/confirmation responses recover without duplicate accepted HTTP details. Restored
+pending confirmations and stale checkpoints cannot resend already confirmed events.
+A restored empty checkpoint must still discover diagnostics archived after that checkpoint. Cancellation
+retains an unknown archive prefix for idempotent replay. Persistent write disconnects and stalls
+stop the producer even while database reads succeed; the identified incident has one shared
+three-second recovery window, with a separate one-second request detection bound. Final reports
+have `diagnostics_complete=false` if collection or delivery cannot be completed in budget.
+These checks cover the notification chain, not the full source/target network fault matrix,
+whole-worker cancellation, or throughput/RSS parity of the complete migration.
 
 NFS fixtures use UID/GID 1000 to match the non-root GitHub runner, allowing
 metadata preservation to be verified without privileged local writes.

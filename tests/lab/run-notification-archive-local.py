@@ -103,6 +103,7 @@ def run_inside():
     environment.pop("LAB_NOTIFICATION_CLICKHOUSE_CLUSTER", None)
     fault = "normal"
     release = threading.Event()
+    observed = threading.Event()
     lock = threading.Lock()
 
     class Proxy(http.server.BaseHTTPRequestHandler):
@@ -111,6 +112,13 @@ def run_inside():
 
         def do_GET(self):
             nonlocal fault, release
+            if self.path == "/observed":
+                body = b"yes" if observed.is_set() else b"no"
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
             if not self.path.startswith("/control?mode="):
                 self.send_error(404)
                 return
@@ -118,6 +126,7 @@ def run_inside():
                 release.set()
                 release = threading.Event()
                 fault = self.path.split("=", 1)[1]
+                observed.clear()
             self.send_response(200)
             self.send_header("Content-Length", "2")
             self.end_headers()
@@ -146,11 +155,13 @@ def run_inside():
                 mode = fault if is_insert else "normal"
                 unblock = release
                 if is_insert:
+                    observed.set()
                     # 首次归档正常，第二次 ACK 写入丢失响应。
                     if mode == "ack_lost_reply":
                         mode, fault = "normal", "lost_ack"
-                    else:
+                    elif not mode.startswith("persistent_"):
                         fault = "normal"
+                mode = mode.removeprefix("persistent_")
             if mode == "disconnect":
                 self.connection.close()
                 return
@@ -196,6 +207,11 @@ def run_inside():
             subprocess.run([
                 "cargo", "test", "--offline", "--locked", "-p", "app", "--lib",
                 "consumer::stats::delivery::tests::real_",
+                "--", "--ignored", "--test-threads=1", "--nocapture",
+            ], cwd=ROOT, env=environment, check=True)
+            subprocess.run([
+                "cargo", "test", "--offline", "--locked", "-p", "app", "--lib",
+                "consumer::stats::journal::tests::real_",
                 "--", "--ignored", "--test-threads=1", "--nocapture",
             ], cwd=ROOT, env=environment, check=True)
     finally:

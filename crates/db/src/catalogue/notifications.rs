@@ -150,7 +150,7 @@ impl NotificationRecord {
         hash.finalize().to_hex().to_string()
     }
 
-    fn validate(&self) -> Result<()> {
+    pub fn validate(&self) -> Result<()> {
         self.validate_fields()?;
         if self.record_id != self.content_id() {
             return Err(DatabaseError::NotificationRecordInvalid {
@@ -269,7 +269,8 @@ impl ClickHouseDatabase {
         self.write_notifications(records, 0).await
     }
 
-    /// 仅在 HTTP 收到匹配 ACK 后调用。迟到的 revision=0 写入不能撤销已确认状态。
+    /// 仅在 HTTP 2xx 确认接收后调用；内部出队状态不代表外部业务处理完成。
+    /// 迟到的 revision=0 写入不能撤销已确认状态。
     pub async fn acknowledge_notifications(&self, records: &[NotificationRecord]) -> Result<()> {
         self.write_notifications(records, 1).await
     }

@@ -132,9 +132,10 @@ async fn failed_http_retries_same_batch_and_ack_preserves_new_errors() {
     let client = StatisticConsumer::build_callback_client(&url).unwrap();
     let logs = Arc::new(StdMutex::new(Vec::new()));
     assert!(
-        !StatisticConsumer::post_callback(&consumer, &client, &url, false)
+        StatisticConsumer::post_callback(&consumer, &client, &url, false)
             .with_subscriber(CallbackLogs(Arc::clone(&logs)))
             .await
+            .is_none()
     );
     let output = logs.lock().unwrap().join("\n");
     assert!(output.contains("500 Internal Server Error"), "{output}");
@@ -146,7 +147,11 @@ async fn failed_http_retries_same_batch_and_ack_preserves_new_errors() {
         assert!(!output.contains(secret), "callback logs exposed {secret}");
     }
     consumer.lock().await.update_statistics(&error("second"));
-    assert!(StatisticConsumer::post_callback(&consumer, &client, &url, false).await);
+    assert!(
+        StatisticConsumer::post_callback(&consumer, &client, &url, false)
+            .await
+            .is_some()
+    );
     {
         let mut state = consumer.lock().await;
         assert_eq!(errors(&state.stats).total(), 2);
@@ -156,7 +161,11 @@ async fn failed_http_retries_same_batch_and_ack_preserves_new_errors() {
             "second"
         );
     }
-    assert!(StatisticConsumer::post_callback(&consumer, &client, &url, true).await);
+    assert!(
+        StatisticConsumer::post_callback(&consumer, &client, &url, true)
+            .await
+            .is_some()
+    );
     assert!(consumer.lock().await.callback.outbox.prepare_batch().is_none());
     assert_eq!(errors(&consumer.lock().await.stats).total(), 2);
     server.await.unwrap();

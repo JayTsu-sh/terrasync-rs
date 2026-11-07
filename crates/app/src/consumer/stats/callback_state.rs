@@ -1,10 +1,12 @@
 //! 回调状态独立于可回退的扫描游标；ACK 只清明细，不清累计错误或恢复状态。
+use super::journal::{self, DiagnosticJournal};
 use super::report::ProgressReport;
 use super::{
     accumulator::{ErrorStats, StatsKind},
-    diagnostics::{CallbackIdentity, DiagnosticOutbox},
+    diagnostics::{CallbackIdentity, DiagnosticOutbox, MAX_DIAGNOSTIC_BATCH_EVENTS},
 };
 use crate::error::{AppError, Result};
+use db::{ClickHouseDatabase, NotificationRecord};
 use serde::{Deserialize, Serialize};
 use std::time::{SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
@@ -47,6 +49,13 @@ pub struct CallbackState {
     pub identity: CallbackIdentity,
     pub outbox: DiagnosticOutbox,
     pub runtime: ScanRuntimeState,
+    pub archived_diagnostics: bool,
+    pub diagnostics_incomplete: bool,
+    pub task_error_count: u64,
+    pub pending_acknowledgements: Vec<NotificationRecord>,
+    pub unconfirmed_archive: Vec<NotificationRecord>,
+    #[serde(skip)]
+    pub(crate) journal: DiagnosticJournal,
 }
 
 fn now_millis() -> u64 {
@@ -61,6 +70,12 @@ impl Default for CallbackState {
         let attempt_id = Uuid::new_v4().to_string();
         let now = now_millis();
         Self {
+            archived_diagnostics: false,
+            diagnostics_incomplete: false,
+            task_error_count: 0,
+            pending_acknowledgements: Vec::new(),
+            unconfirmed_archive: Vec::new(),
+            journal: DiagnosticJournal::default(),
             outbox: DiagnosticOutbox::new(round_id.clone(), attempt_id.clone(), 512, 64),
             identity: CallbackIdentity {
                 round_id,
@@ -78,10 +93,22 @@ impl Default for CallbackState {
 }
 
 impl CallbackState {
+    pub(crate) fn with_database(database: Option<ClickHouseDatabase>) -> Self {
+        Self {
+            journal: DiagnosticJournal::new(database),
+            ..Self::default()
+        }
+    }
     pub(crate) fn initialize_scan(&mut self, job_id: &str, round: Option<i64>) -> Result<()> {
         if let Some(round) = round {
             let round_id = format!("{job_id}:{round}");
             if self.identity.round_id != round_id {
+                self.archived_diagnostics = false;
+                self.diagnostics_incomplete = false;
+                self.task_error_count = 0;
+                self.pending_acknowledgements.clear();
+                self.unconfirmed_archive.clear();
+                self.journal.reset_delivery();
                 self.outbox = DiagnosticOutbox::new(round_id.clone(), self.identity.attempt_id.clone(), 512, 64);
             }
             self.identity.round_id = round_id;
@@ -91,6 +118,24 @@ impl CallbackState {
     }
 
     pub(crate) fn restore_checkpoint(&mut self, saved: Self) -> Result<()> {
+        if saved.pending_acknowledgements.len() > journal::MAX_PENDING_CONFIRMATIONS
+            || saved.unconfirmed_archive.len() > MAX_DIAGNOSTIC_BATCH_EVENTS
+        {
+            return Err(AppError::DiagnosticArchiveInvalid {
+                field: "checkpoint_record_count",
+            });
+        }
+        for row in saved.pending_acknowledgements.iter().chain(&saved.unconfirmed_archive) {
+            row.validate()?;
+            if row.round_id() != saved.identity.round_id {
+                return Err(AppError::DiagnosticArchiveInvalid {
+                    field: "checkpoint_record_round",
+                });
+            }
+        }
+        for rows in [&saved.pending_acknowledgements, &saved.unconfirmed_archive] {
+            journal::batch(rows)?;
+        }
         if !saved
             .outbox
             .validate_identity(&saved.identity.round_id, &saved.identity.attempt_id)
@@ -102,6 +147,13 @@ impl CallbackState {
         self.outbox = saved.outbox;
         self.outbox.set_attempt(self.identity.attempt_id.clone());
         self.runtime = saved.runtime;
+        // checkpoint 之后也可能已有明细落库；恢复不能只依据旧快照中的布尔值跳过查询。
+        self.archived_diagnostics = saved.archived_diagnostics || self.journal.database.is_some();
+        self.diagnostics_incomplete = saved.diagnostics_incomplete;
+        self.task_error_count = saved.task_error_count;
+        self.pending_acknowledgements = saved.pending_acknowledgements;
+        self.unconfirmed_archive = saved.unconfirmed_archive;
+        self.journal.reset_delivery();
         Ok(())
     }
 }

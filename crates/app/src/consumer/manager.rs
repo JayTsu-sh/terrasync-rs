@@ -35,6 +35,7 @@ use crate::consumer::stats::{FileSizeRange, ProgressDetail, TimeRange};
 use crate::consumer::stats::{
     FullStats, IncrementalStats, ProgressBar, StatisticConsumer, StatsKind, consumer::CallbackGuard,
 };
+use crate::consumer::stats::{callback_state::CallbackState, journal};
 use crate::consumer::traits::Consumer;
 use crate::error::{AppError, Result};
 use crate::scan::statistics::{ScanCapabilities, ScanCounts, ScanSnapshot};
@@ -230,9 +231,10 @@ impl ConsumerManager {
     /// 扫描条目按实际输入流更新，变更事件落盘后更新；保存游标前等待两者处理完成。
     pub async fn record_statistics(&self, messages: impl IntoIterator<Item = StorageEntryMessage>) {
         if let Some(sc) = &self.stats_consumer {
-            let mut sc = sc.lock().await;
             for message in messages {
-                sc.update_statistics(&message);
+                if let Err(error) = journal::record(sc, &message).await {
+                    StatisticConsumer::diagnostic_failure(sc, error).await;
+                }
             }
         }
     }
@@ -452,19 +454,17 @@ impl ConsumerManager {
         } else {
             None
         };
-        Ok(Self::with_database_consumer(consumer_config, consumer))
+        Ok(Self::with_database_consumer(consumer_config, consumer, None))
     }
 
     /// 扫描管道自行确认事实写入；这里仅管理统计和独立的最终报告归档。
     pub(crate) fn statistics_only(consumer_config: &ConsumerConfig) -> Result<Self> {
-        let mut manager = Self::with_database_consumer(consumer_config, None);
-        if consumer_config.db_config.enabled {
-            manager.notification_database = Some(ClickHouseDatabase::new(
-                &consumer_config.db_config.clickhouse,
-                &consumer_config.job_id,
-            )?);
-        }
-        Ok(manager)
+        let database = consumer_config
+            .db_config
+            .enabled
+            .then(|| ClickHouseDatabase::new(&consumer_config.db_config.clickhouse, &consumer_config.job_id))
+            .transpose()?;
+        Ok(Self::with_database_consumer(consumer_config, None, database))
     }
 
     /// A copy pipeline explicitly shares the catalogue that began its generation.
@@ -480,11 +480,17 @@ impl ConsumerManager {
                 ));
             }
         };
-        Ok(Self::with_database_consumer(consumer_config, consumer))
+        Ok(Self::with_database_consumer(consumer_config, consumer, None))
     }
 
-    fn with_database_consumer(consumer_config: &ConsumerConfig, consumer: Option<DatabaseConsumer>) -> Self {
-        let notification_database = consumer.as_ref().map(|consumer| consumer.database().clone());
+    fn with_database_consumer(
+        consumer_config: &ConsumerConfig, consumer: Option<DatabaseConsumer>,
+        notification_database: Option<ClickHouseDatabase>,
+    ) -> Self {
+        let notification_database = consumer
+            .as_ref()
+            .map(|consumer| consumer.database().clone())
+            .or(notification_database);
         let mut manager = Self {
             consumers: Vec::new(),
             stats_consumer: None,
@@ -514,7 +520,7 @@ impl ConsumerManager {
                     generation_committed: None,
                     pb_handle: None,
                     scan_snapshot: None,
-                    callback: Default::default(),
+                    callback: CallbackState::with_database(manager.notification_database.clone()),
                 },
                 JobType::IncrementalScan | JobType::IncrementalCopy => StatisticConsumer {
                     stats: StatsKind::Incremental(IncrementalStats::new(job_type.clone(), job_id, command, log_path)),
@@ -524,7 +530,7 @@ impl ConsumerManager {
                     generation_committed: None,
                     pb_handle: None,
                     scan_snapshot: None,
-                    callback: Default::default(),
+                    callback: CallbackState::with_database(manager.notification_database.clone()),
                 },
             };
             manager.stats_consumer = Some(Arc::new(Mutex::new(sc)));
@@ -579,11 +585,7 @@ impl ConsumerManager {
             let stats_consumer_clone = stats_consumer.clone();
             let span = info_span!("consumer", kind = "statistics");
             let stats_handle = tokio::spawn(
-                async move {
-                    StatisticConsumer::process(stats_consumer_clone, stats_rx).await;
-                    Ok(())
-                }
-                .instrument(span),
+                async move { StatisticConsumer::process(stats_consumer_clone, stats_rx).await }.instrument(span),
             );
             handles.push(stats_handle);
             debug!("Statistic consumer process task started successfully");
@@ -611,18 +613,28 @@ impl ConsumerManager {
         let Some(stats_consumer) = &self.stats_consumer else {
             return;
         };
-        let mut stats_consumer = stats_consumer.lock().await;
         for reason in failures {
-            stats_consumer.update_statistics(&StorageEntryMessage::Error {
+            let mut state = stats_consumer.lock().await;
+            state.callback.task_error_count = state.callback.task_error_count.saturating_add(1);
+            drop(state);
+            let message = StorageEntryMessage::Diagnostic {
                 event: ErrorEvent::Scan,
                 path: PathBuf::new(),
-                entry: None,
                 reason: reason.clone(),
-            });
+            };
+            if let Err(error) = journal::record(stats_consumer, &message).await {
+                StatisticConsumer::diagnostic_failure(stats_consumer, error).await;
+            }
         }
     }
 
     pub(crate) async fn record_task_error(&self, error: &AppError) {
+        if (error.stops_event_pipeline() || matches!(error, AppError::DiagnosticJournalStopped { .. }))
+            && let Some(consumer) = &self.stats_consumer
+            && consumer.lock().await.callback.journal.terminal.is_some()
+        {
+            return;
+        }
         // 版本执行器已经交付 entry 失败及逐版本原因，收尾不能再增加一次相同失败。
         if !error.is_reported_copy_failure() {
             self.record_task_failures(&[error.to_string()]).await;
@@ -871,6 +883,8 @@ mod resume_tests {
             callback: Default::default(),
         };
         stats.progress_bar.restore(&ProgressReport {
+            diagnostics_complete: false,
+            task_error_count: 0,
             job_id: "resume".into(),
             job_type: "scan".into(),
             elapsed_secs: 12.0,

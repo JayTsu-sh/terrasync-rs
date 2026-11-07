@@ -35,7 +35,8 @@ use data_mover::model::ObservedEntry;
 use db::ClickHouseDatabase;
 use rustls::pki_types::CertificateDer;
 #[cfg(test)]
-use task_model::{ChangeKind, ErrorEvent, StorageEntryMessage};
+use task_model::ChangeKind;
+use task_model::{ErrorEvent, StorageEntryMessage};
 use tokio::sync::Mutex as AsyncMutex;
 use tracing::{info, warn};
 use transport::error::TransportError;
@@ -49,6 +50,7 @@ use utils::app_config::AppConfig;
 use utils::logger;
 
 use crate::config::{JobType, SyncJobConfig};
+use crate::consumer::stats::callback_state::CallbackState;
 use crate::consumer::stats::{IncrementalStats, ProgressBar, StatisticConsumer, StatsKind};
 use crate::error::{AppError, Result};
 use crate::orchestrator::create_qos_manager;
@@ -96,6 +98,12 @@ pub(crate) async fn run(
         }))
         .await?;
 
+    let app_config = AppConfig::fetch()?;
+    let notification_database = app_config
+        .database
+        .enabled
+        .then(|| ClickHouseDatabase::new(&app_config.database.clickhouse, &config.job_id))
+        .transpose()?;
     // ── 3.5 结构化统计报表（Sender 侧，复用本地 StatisticConsumer/IncrementalStats——
     //    双进程远端不分 full/incremental，报表形状本身就是 delta 语义，与 orchestrator
     //    的 ScanType 路由无关，统一用 JobType::IncrementalCopy）──
@@ -112,59 +120,71 @@ pub(crate) async fn run(
         generation_committed: None,
         pb_handle: None,
         scan_snapshot: None,
-        callback: Default::default(),
+        callback: CallbackState::with_database(notification_database.clone()),
     }));
     let callback_guard = StatisticConsumer::begin(stats_consumer.clone()).await;
 
-    // ── 4. 创建源端 storage + directory_pages ──
-    let block_size = match &config.block_size {
-        Some(s) => Some(parse_size(s)?),
-        None => None,
-    };
-    let src_storage = Arc::new(
-        create_storage_for_role(
-            &config.src_path,
-            block_size.map(|s| s as u64),
-            false,
-            StorageRole::Source,
-        )
-        .await?,
-    );
-    let match_expr = config.r#match.as_deref().and_then(|e| parse_filter_expression(e).ok());
-    let exclude_expr = config.exclude.as_deref().and_then(|e| parse_filter_expression(e).ok());
-    let app_config = AppConfig::fetch()?;
-    let notification_database = app_config
-        .database
-        .enabled
-        .then(|| ClickHouseDatabase::new(&app_config.database.clickhouse, &config.job_id))
-        .transpose()?;
-    let walkdir_iter = directory_pages(
-        &src_storage,
-        WalkOptions {
-            match_expressions: match_expr,
-            exclude_expressions: exclude_expr,
-            concurrency: app_config.scan.concurrency,
-            include_tags: app_config.scan.include_tags || copy_tags,
-            ..Default::default()
-        },
-    )?;
-
-    // ── 5. QoS 管理器；checkpoint lifecycle 由 negotiated session 持有 ──
     let qos_manager = create_qos_manager(config.qos.as_ref(), config.peak_qos_rate, config.iops);
-    let checkpoint_path = std::path::PathBuf::from(&config.job_dir).join("remote_checkpoint.json");
+    let result = async {
+        // ── 4. 创建源端 storage + directory_pages ──
+        let block_size = match &config.block_size {
+            Some(s) => Some(parse_size(s)?),
+            None => None,
+        };
+        let src_storage = Arc::new(
+            create_storage_for_role(
+                &config.src_path,
+                block_size.map(|s| s as u64),
+                false,
+                StorageRole::Source,
+            )
+            .await?,
+        );
+        let match_expr = config.r#match.as_deref().and_then(|e| parse_filter_expression(e).ok());
+        let exclude_expr = config.exclude.as_deref().and_then(|e| parse_filter_expression(e).ok());
+        let walkdir_iter = directory_pages(
+            &src_storage,
+            WalkOptions {
+                match_expressions: match_expr,
+                exclude_expressions: exclude_expr,
+                concurrency: app_config.scan.concurrency,
+                include_tags: app_config.scan.include_tags || copy_tags,
+                ..Default::default()
+            },
+        )?;
 
-    // ── 6+7+8. 文件列表发送 与 请求处理+Ack收集 并发运行（流水线，无阶段 barrier） ──
-    let summary = RemoteSenderSession::new(RemoteSenderSessionDeps {
-        transport: &transport,
-        src_storage: &src_storage,
-        walkdir_iter: &walkdir_iter,
-        qos: qos_manager.as_ref(),
-        enable_acl: config.enable_acl,
-        checkpoint_path: &checkpoint_path,
-        stats_consumer: &stats_consumer,
-    })
-    .run()
-    .await?;
+        // ── 5. QoS 管理器；checkpoint lifecycle 由 negotiated session 持有 ──
+        let checkpoint_path = std::path::PathBuf::from(&config.job_dir).join("remote_checkpoint.json");
+
+        // ── 6+7+8. 文件列表发送 与 请求处理+Ack收集 并发运行（流水线，无阶段 barrier） ──
+        RemoteSenderSession::new(RemoteSenderSessionDeps {
+            transport: &transport,
+            src_storage: &src_storage,
+            walkdir_iter: &walkdir_iter,
+            qos: qos_manager.as_ref(),
+            enable_acl: config.enable_acl,
+            checkpoint_path: &checkpoint_path,
+            stats_consumer: &stats_consumer,
+        })
+        .run()
+        .await
+    }
+    .await;
+    if let Some(ref qos) = qos_manager {
+        qos.shutdown();
+    }
+    let close = transport.close().await;
+    if let Err(error) = &result
+        && !matches!(error, AppError::DiagnosticJournalStopped { .. })
+    {
+        record_remote_task_failure(&stats_consumer, error.to_string()).await;
+    }
+    if let Err(error) = &close {
+        record_remote_task_failure(&stats_consumer, error.to_string()).await;
+    }
+    StatisticConsumer::end_with_database(stats_consumer, callback_guard, notification_database.as_ref(), false).await;
+    let summary = result?;
+    close?;
     info!(
         "[Sender Remote] File list sent: {} pages, {} entries",
         summary.page_count, summary.advertised_entries
@@ -174,15 +194,21 @@ pub(crate) async fn run(
         "[Sender Remote] Complete: {} success, {} errors",
         summary.success_count, summary.error_count
     );
-
-    // ── 9. 资源清理 ──
-    if let Some(ref qos) = qos_manager {
-        qos.shutdown();
-    }
-    transport.close().await?;
-    // 结束统计报表生命周期：abort 回调循环 → 发最终回调(is_final=true) → 打印终态报表
-    StatisticConsumer::end_with_database(stats_consumer, callback_guard, notification_database.as_ref(), false).await;
     finalize_run_result(summary.error_count)
+}
+
+async fn record_remote_task_failure(consumer: &Arc<AsyncMutex<StatisticConsumer>>, reason: String) {
+    let mut state = consumer.lock().await;
+    state.callback.task_error_count = state.callback.task_error_count.saturating_add(1);
+    drop(state);
+    let message = StorageEntryMessage::Diagnostic {
+        event: ErrorEvent::Copy,
+        path: Default::default(),
+        reason,
+    };
+    if let Err(error) = StatisticConsumer::record_message(consumer, &message).await {
+        warn!(%error, "Remote task diagnostic could not be retained");
+    }
 }
 
 /// 双进程模式下 entry 级失败（部分或全部）不再影响进程退出码——与单进程语义对齐，

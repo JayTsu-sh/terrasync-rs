@@ -17,6 +17,7 @@ pub struct CallbackIdentity {
 /// 可独立去重的诊断事件；不参与错误累计数字的扣减。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DiagnosticEvent {
+    pub sequence: u64,
     pub event_id: String,
     pub round_id: String,
     pub attempt_id: String,
@@ -34,7 +35,7 @@ pub struct DiagnosticBatch {
     pub omitted_count: u64,
 }
 
-/// 仅在接收事务提交后返回；旧报告无明细时没有批次 ID。
+/// 内部 Web 接口可返回的批次信息；发送端只依据 HTTP 2xx，不要求此响应体。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CallbackAck {
     pub batch_id: Option<String>,
@@ -123,6 +124,7 @@ impl DiagnosticOutbox {
         }
         self.next_event += 1;
         let event = DiagnosticEvent {
+            sequence: self.next_event,
             event_id: self.identifier("event", self.next_event),
             round_id: self.round_id.clone(),
             attempt_id: self.attempt_id.clone(),
@@ -177,6 +179,26 @@ impl DiagnosticOutbox {
         true
     }
 
+    pub(crate) fn pending_len(&self) -> usize {
+        self.pending.len()
+    }
+    pub(crate) fn has_omissions(&self) -> bool {
+        self.omitted_count != 0
+    }
+
+    pub(crate) fn archive_prefix(&self) -> Vec<DiagnosticEvent> {
+        self.pending.iter().take(MAX_DIAGNOSTIC_BATCH_EVENTS).cloned().collect()
+    }
+
+    /// 仅在已落库或已确认交付后释放相同前缀；迟到的回调 ACK 不能清除新的批次。
+    pub(crate) fn release_prefix(&mut self, events: &[DiagnosticEvent]) {
+        if !events.is_empty() && self.pending.iter().take(events.len()).eq(events.iter()) {
+            self.pending.drain(..events.len());
+            self.in_flight = None;
+            self.revision = self.revision.saturating_add(1);
+        }
+    }
+
     fn identifier(&self, kind: &str, sequence: u64) -> String {
         let identity = (&self.round_id, &self.attempt_id, kind, sequence);
         let bytes = format!(
@@ -200,8 +222,9 @@ impl DiagnosticEvent {
         self.path = self.path.as_deref().map(safe_diagnostic_text);
     }
 
-    fn is_bounded(&self) -> bool {
-        is_digest(&self.event_id)
+    pub(crate) fn is_bounded(&self) -> bool {
+        self.sequence > 0
+            && is_digest(&self.event_id)
             && [&self.origin, &self.code]
                 .into_iter()
                 .all(|text| text.len() <= MAX_DIAGNOSTIC_LABEL_BYTES)
