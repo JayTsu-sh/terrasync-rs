@@ -6,7 +6,6 @@
 use crate::file_copy::namespace as copy_namespace;
 use crate::file_copy::selection::SkipTracker;
 use crate::file_copy::transfer as copy_transfer;
-use crate::rm::progress as deletion;
 // 标准库
 use crate::copy_dispatch::{CopyQueues, partition_scan};
 use std::sync::Arc;
@@ -60,7 +59,6 @@ use crate::file_copy::VersionFailureContext;
 use crate::integrity_check::verify_storage_time;
 use crate::migration_plan::MigrationPlan;
 use crate::receiver::{ReceiverConfig, process_entry_on_receiver};
-use crate::rename::{RenameOptions, rename_or_copy};
 use crate::scan::ScanType;
 use crate::sender::{SenderWorkerConfig, sender_worker};
 use crate::source_cleanup::remove_confirmed_sources;
@@ -71,9 +69,13 @@ use crate::sync::{
     ResumeOpts, StoragePair, parse_size, process_entry, process_metadata_only_entry, process_versioned_entry,
 };
 use crate::sync_catalog::{batch_processing_to_generate_message, determine_sync_type};
+use crate::target_absence::SourceAbsenceCheck;
 use crate::task_stream::finish_phase;
 use crate::{dir_walker, tar_pack};
 
+#[cfg(test)]
+#[path = "orchestrator_absence_tests.rs"]
+mod absence_tests;
 #[path = "orchestrator_target_reconciliation.rs"]
 mod target_reconciliation;
 
@@ -1077,75 +1079,11 @@ impl SyncOrchestrator {
                                     }
                                 }
                             }
-                            StorageEntryMessage::Deleted(ref entry) => {
-                                // 删除操作幂等化：NotFound 视为成功
-                                let result = if entry.get_is_dir() {
-                                    trace!("Deleting directory: {:?}", entry.get_relative_path());
-                                    deletion::delete_dir_all(dest.storage(), entry).await
-                                } else {
-                                    trace!("Deleting file: {:?}", entry.get_relative_path());
-                                    copy_namespace::delete_file(dest.storage(), entry).await
-                                };
-                                match result {
-                                    Ok(()) => bc.broadcast(message.clone()).await?,
-                                    Err(error) if error.is_not_found() => {
-                                        trace!("Already deleted, skipping: {:?}", entry.get_relative_path());
-                                        bc.broadcast(message.clone()).await?;
-                                    }
-                                    Err(e) => {
-                                        error!(
-                                            "Handler {}: Failed to delete {:?}: {}",
-                                            handler_id,
-                                            entry.get_relative_path(),
-                                            e
-                                        );
-                                        bc.broadcast(StorageEntryMessage::Error {
-                                            event: ErrorEvent::Delete,
-                                            path: entry.get_relative_path().to_path_buf(),
-                                            entry: Some(entry.clone()),
-                                            reason: format!("{e}"),
-                                        })
-                                        .await?;
-                                        failure.get_or_insert(e.into());
-                                    }
-                                }
-                            }
-                            StorageEntryMessage::Renamed((ref from_entry, ref to_entry)) => {
-                                match rename_or_copy(
-                                    from_entry.clone(),
-                                    to_entry.clone(),
-                                    src.clone(),
-                                    dest.clone(),
-                                    RenameOptions {
-                                        enable_integrity_check,
-                                        enable_acl,
-                                        resume: resume_opts.clone(),
-                                        qos: qos.clone(),
-                                        bytes: bt.clone(),
-                                        events: &bc,
-                                    },
-                                )
-                                .await
-                                {
-                                    Ok(_) => bc.broadcast(message.clone()).await?,
-                                    Err(e) => {
-                                        error!(
-                                            "Handler {}: Failed to rename {:?} to {:?}: {}",
-                                            handler_id,
-                                            from_entry.get_relative_path(),
-                                            to_entry.get_relative_path(),
-                                            e
-                                        );
-                                        bc.broadcast(StorageEntryMessage::Error {
-                                            event: ErrorEvent::Rename,
-                                            path: to_entry.get_relative_path().to_path_buf(),
-                                            entry: Some(to_entry.clone()),
-                                            reason: format!("{e}"),
-                                        })
-                                        .await?;
-                                        failure.get_or_insert(e.into());
-                                    }
-                                }
+                            StorageEntryMessage::Deleted(_) | StorageEntryMessage::Renamed(_) => {
+                                // 扫描比较只交付 New/Changed；目标变更必须经过 Phase B 的存在性确认。
+                                return Err(AppError::ConfigError(
+                                    "目标删除或重命名只能在源端扫描完成后的统一清理阶段执行".into(),
+                                ));
                             }
                             StorageEntryMessage::Packaged(ref entry) => {
                                 info!("Packing directory {:?}", entry.get_relative_path());
@@ -1365,6 +1303,10 @@ impl SyncOrchestrator {
                 &c.job_id,
                 &c.job_dir,
                 c.transfer_mode,
+                SourceAbsenceCheck::new(
+                    Duration::from_secs(app_config.scan.operation_timeout_secs),
+                    Duration::from_secs(app_config.scan.recovery_window_secs),
+                ),
             )
             .await?;
 

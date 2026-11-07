@@ -1,5 +1,7 @@
 //! 真实目录查询与 Local 命名空间：搬迁跳过反向删除，但必须执行 rename。
+use crate::target_absence::SourceAbsenceCheck;
 use std::sync::Arc;
+use std::time::Duration;
 
 use clickhouse::Client;
 use data_mover::model::{BackendKind, EntryKind};
@@ -79,6 +81,7 @@ async fn apply_case(config: &ClickHouseConfig, reserved: bool, directory: bool) 
         &job,
         "",
         TransferMode::Direct,
+        SourceAbsenceCheck::new(Duration::from_secs(1), Duration::from_secs(3)),
     )
     .await?;
     assert!(

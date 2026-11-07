@@ -74,7 +74,7 @@ def run_isolated():
                 containers.append(container)
             print(f"isolated notification image={docker('inspect', containers[0], '--format', '{{.Image}}')}", flush=True)
             pid = docker("inspect", containers[0], "--format", "{{.State.Pid}}")
-            suite = [flag for flag in ("--copy-generations", "--rename-generations", "--retention-events") if flag in sys.argv]
+            suite = [flag for flag in ("--copy-generations", "--rename-generations", "--retention-events", "--source-absence") if flag in sys.argv]
             subprocess.run(["nsenter", "-t", pid, "-n", sys.executable, __file__, "--inside", *suite], cwd=ROOT, check=True)
         except BaseException:
             for container in containers:
@@ -157,6 +157,12 @@ def run_copy_generations():
     environment["LAB_COPY_GENERATION_DSN"] = f"http://{address}"
     environment["LAB_COPY_GENERATION_CONTROL"] = address
     try:
+        if "--source-absence" in sys.argv:
+            subprocess.run([
+                "cargo", "test", "--offline", "--locked", "-p", "app", "--lib",
+                "orchestrator::absence_tests::real_source_absence_guards_target_mutations", "--", "--ignored", "--exact", "--nocapture",
+            ], cwd=ROOT, env=environment, check=True)
+            return
         if "--retention-events" in sys.argv:
             run_retention_events(environment)
             return
@@ -235,7 +241,7 @@ def run_inside():
             time.sleep(0.2)
         else:
             raise RuntimeError(f"ClickHouse readiness timed out on port {port}")
-    if any(flag in sys.argv for flag in ("--copy-generations", "--rename-generations", "--retention-events")):
+    if any(flag in sys.argv for flag in ("--copy-generations", "--rename-generations", "--retention-events", "--source-absence")):
         run_copy_generations()
         return
     environment = dict(os.environ)

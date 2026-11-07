@@ -1,6 +1,8 @@
 //! 真实 `ClickHouse` 与 HTTP 回调验证保留目标的状态事件，不把它计为删除或复制失败。
+use crate::target_absence::SourceAbsenceCheck;
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration;
 
 use clickhouse::Client;
 use data_mover::model::{BackendKind, EntryKind, HistoryOrder, ObjectHistory, ObservedEntry};
@@ -89,6 +91,7 @@ async fn preserve_case(config: &ClickHouseConfig) -> Result<()> {
         "retained_target",
         "",
         TransferMode::Direct,
+        SourceAbsenceCheck::new(Duration::from_secs(1), Duration::from_secs(3)),
     )
     .await?;
     let consumer = Arc::new(Mutex::new(StatisticConsumer {

@@ -11,7 +11,8 @@ use data_mover::{
 };
 use db::{ClickHouseDatabase, DeletionStatus};
 use task_model::{
-    ChangeKind, ErrorEvent, ObservedEntryExt, StorageEntryMessage, TargetRetention, TargetRetentionReason, TransferMode,
+    ChangeKind, ErrorEvent, ObservedEntryExt, SourcePresence, StorageEntryMessage, TargetRetention,
+    TargetRetentionReason, TransferMode,
 };
 use tracing::error;
 
@@ -21,9 +22,9 @@ use crate::error::{AppError, Result};
 use crate::file_copy::{CopyOptions, HdfsCopyContext, copy_file};
 use crate::file_copy::{metadata as copy_metadata, namespace as copy_namespace};
 use crate::rename::{RenameOptions, RenameOutcome, rename_or_copy};
-use crate::rm::progress as deletion;
 use crate::storage_factory::StorageContext;
-use crate::sync::{CommitRecorder, ResumeOpts};
+use crate::sync::{CommitRecorder, ResumeOpts, process_entry};
+use crate::target_absence::{SourceAbsenceCheck, preserve};
 
 impl SyncOrchestrator {
     /// rename 后的内容与元数据必须完成，才能确认该条目的新状态。
@@ -100,7 +101,7 @@ impl SyncOrchestrator {
         db: &ClickHouseDatabase, src_storage: Arc<StorageContext>, dest_storage: Arc<StorageContext>,
         is_source_reserved: bool, broadcaster: &BroadcastForwarder<StorageEntryMessage>, enable_integrity_check: bool,
         qos_manager: Option<QosManager>, bytes_counter: Option<Arc<AtomicU64>>, job_id: &str, job_dir: &str,
-        transfer_mode: TransferMode,
+        transfer_mode: TransferMode, source_absence: SourceAbsenceCheck,
     ) -> Result<()> {
         let deletion_iter = db.detect_deleted_items().await?;
         let mut failure: Option<AppError> = None;
@@ -109,7 +110,10 @@ impl SyncOrchestrator {
         // 映射同时保存目标路径和实际移动确认，计划存在不代表子树已经移动。
         // 收录所有 is_dir=true 的 Renamed 条目（包括同名跨父目录 move 如 d3/d3_4 → d4/d3_4）。
         // 用于判断某条目的父目录是否正在被 rename，若是则子条目无需单独执行物理操作。
-        let statuses: Vec<DeletionStatus> = deletion_iter.collect();
+        let mut statuses: Vec<DeletionStatus> = deletion_iter.collect();
+        // 先移动父目录，再清理旧子项／空父目录；避免正常目录移除被非空检查误报失败。
+        // 仅重排已经物化的候选，不新增按全部扫描条目增长的状态。
+        statuses.sort_unstable_by(|left, right| reconciliation_order(left).cmp(&reconciliation_order(right)));
         let mut renamed_dirs: HashMap<PathBuf, (PathBuf, bool)> = statuses
             .iter()
             .filter_map(|s| {
@@ -131,12 +135,12 @@ impl SyncOrchestrator {
         for status in statuses {
             match status {
                 DeletionStatus::Deleted(entry) => {
+                    if last_preserved_path.as_ref() == Some(entry.path()) {
+                        continue;
+                    }
+                    last_preserved_path = Some(entry.path().clone());
                     // 搬迁不将源缺失反向删除目标；rename 仍需推进，不能跳过整个阶段。
                     if !is_source_reserved {
-                        if last_preserved_path.as_ref() == Some(entry.path()) {
-                            continue;
-                        }
-                        last_preserved_path = Some(entry.path().clone());
                         broadcaster
                             .broadcast(StorageEntryMessage::TargetPreserved {
                                 retention: Box::new(TargetRetention::entry(
@@ -148,12 +152,12 @@ impl SyncOrchestrator {
                             .await?;
                         continue;
                     }
+                    if !source_absence.confirm(&src_storage, &entry, broadcaster).await? {
+                        continue;
+                    }
                     let entry_arc = Arc::new(entry);
-                    let result = if entry_arc.get_is_dir() {
-                        deletion::delete_dir_all(dest_storage.storage(), &entry_arc).await
-                    } else {
-                        copy_namespace::delete_file(dest_storage.storage(), &entry_arc).await
-                    };
+                    // 仅删除本条目或空目录；未核验的后代永远不递归清理。
+                    let result = copy_namespace::delete_file(dest_storage.storage(), &entry_arc).await;
                     match result {
                         Ok(()) => {
                             broadcaster.broadcast(StorageEntryMessage::Deleted(entry_arc)).await?;
@@ -162,6 +166,16 @@ impl SyncOrchestrator {
                             broadcaster.broadcast(StorageEntryMessage::Deleted(entry_arc)).await?;
                         }
                         Err(e) => {
+                            preserve(
+                                broadcaster,
+                                &entry_arc,
+                                SourcePresence::Absent,
+                                TargetRetentionReason::StaleEvidence,
+                                format!(
+                                    "源路径已确认缺失，但目标删除未获成功确认；保留尚存部分，删除结果可能未知: {e}"
+                                ),
+                            )
+                            .await?;
                             error!("Phase B: Failed to delete {:?}: {}", entry_arc.get_relative_path(), e);
                             broadcaster
                                 .broadcast(StorageEntryMessage::Error {
@@ -178,7 +192,7 @@ impl SyncOrchestrator {
                 DeletionStatus::Renamed(from, to) => {
                     let from_arc = Arc::new(*from);
                     let to_arc = Arc::new(*to);
-
+                    let old_source_absent = source_absence.confirm(&src_storage, &from_arc, broadcaster).await?;
                     // 父目录正在被 rename 时，NFS RENAME 已传递性地移动了子条目，无需重复操作。
                     // from_parent 分配仅在同名情况下进行，避免对名字不同的 rename 做无效分配。
                     let skip_physical = from_arc.get_name() == to_arc.get_name() && {
@@ -192,7 +206,27 @@ impl SyncOrchestrator {
                         }
                     };
 
-                    let dest_op_result = if skip_physical {
+                    let dest_op_result = if !old_source_absent {
+                        // 同一身份也可能是硬链接；旧源仍在或证据不足时复制新路径并保留旧事实。
+                        process_entry(
+                            &to_arc,
+                            src_storage.clone(),
+                            dest_storage.clone(),
+                            enable_integrity_check,
+                            false,
+                            true,
+                            qos_manager.clone(),
+                            bytes_counter.clone(),
+                            broadcaster,
+                            ResumeOpts {
+                                job_id: job_id.into(),
+                                job_dir: job_dir.into(),
+                                transfer_mode,
+                            },
+                        )
+                        .await
+                        .map(|()| RenameOutcome::Copied)
+                    } else if skip_physical {
                         Ok(RenameOutcome::Moved)
                     } else {
                         rename_or_copy(
@@ -264,9 +298,13 @@ impl SyncOrchestrator {
                                     .await?;
                             }
 
-                            broadcaster
-                                .broadcast(StorageEntryMessage::Renamed((from_arc, to_arc)))
-                                .await?;
+                            if old_source_absent {
+                                broadcaster
+                                    .broadcast(StorageEntryMessage::Renamed((from_arc, to_arc)))
+                                    .await?;
+                            } else {
+                                broadcaster.broadcast(StorageEntryMessage::New(to_arc.into())).await?;
+                            }
                         }
                         Err(e) => {
                             error!(
@@ -283,7 +321,7 @@ impl SyncOrchestrator {
                                     reason: format!("{e}"),
                                 })
                                 .await?;
-                            failure.get_or_insert(e.into());
+                            failure.get_or_insert(e);
                         }
                     }
                 }
@@ -293,5 +331,16 @@ impl SyncOrchestrator {
             Some(error) => Err(error),
             None => Ok(()),
         }
+    }
+}
+
+fn reconciliation_order(status: &DeletionStatus) -> (u8, usize, &str) {
+    match status {
+        DeletionStatus::Renamed(from, _) => (0, from.path().as_str().split('/').count(), from.path().as_str()),
+        DeletionStatus::Deleted(entry) => (
+            1,
+            usize::MAX - entry.path().as_str().split('/').count(),
+            entry.path().as_str(),
+        ),
     }
 }

@@ -108,6 +108,19 @@ count retained, and final reports still queryable in ClickHouse. S3 source histo
 deterministic fixture, not a real S3 protocol run. This does not validate the pending relative
 window plan, source-presence probing, or whole-job throughput/RSS.
 
+`python3 tests/lab/run-notification-archive-local.py --source-absence` exercises
+incremental target reconciliation against owned Single and two-replica ClickHouse
+and actual Local source/target paths. Cases distinguish an unobserved but present
+file/directory from a truly absent source, retain unknown descendants without
+recursive deletion, and copy a new hardlink path while retaining the old target
+and both confirmed catalogue facts. The hardlink association uses deterministic
+NFS-shaped identities; it is not a real NFS protocol result. Events are checked
+before production DatabaseConsumer processes them; HTTP delivery uses the separate
+retention suite. The pinned data-mover namespace-read runner separately injects
+real S3 disconnect, timeout, permission, cancellation and recovery. These checks
+do not certify target ownership guards, whole-history absence, atomic cross-store
+absence/delete, remote reconciliation, or the complete network/performance matrix.
+
 `python3 tests/lab/run-notification-archive-local.py --rename-generations` uses real
 ClickHouse Single and the two-replica Cluster to compare the same file/directory,
 verify its persisted state changed, inject a connection failure, and reopen with

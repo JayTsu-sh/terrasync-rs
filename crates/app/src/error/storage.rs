@@ -14,7 +14,7 @@ use data_mover::{
     probes::ProbeFailure,
     storage::{
         BackendConnectError, CapabilityUnavailable, CreateDirectoryAllFailure, DeleteTreeTerminalFailure,
-        StorageRoleFailure,
+        NamespaceReadFailure, StorageRoleFailure,
     },
     tar_pack::TarFailure,
     transfer::{DirectPatchError, TransferFailure, TransferValueError},
@@ -25,6 +25,8 @@ use data_mover::{
 use task_model::TransferMode;
 #[derive(Debug, thiserror::Error)]
 pub enum StorageError {
+    #[error(transparent)]
+    NamespaceRead(#[from] NamespaceReadFailure),
     #[error(transparent)]
     MetadataVerification(#[from] MetadataVerificationError),
     #[error("目标发布状态与复制结果不一致，禁止删源: {path}")]
@@ -131,6 +133,7 @@ impl StorageError {
     }
     pub fn is_cancelled(&self) -> bool {
         matches!(self, Self::Cancelled)
+            || matches!(self, Self::NamespaceRead(NamespaceReadFailure::Cancelled { .. }))
             || matches!(self, Self::Role(StorageRoleFailure::Entry(error)) if error.class() == FailureClass::Cancelled)
             || matches!(self, Self::DirectPatch(error) if error.is_cancelled())
     }

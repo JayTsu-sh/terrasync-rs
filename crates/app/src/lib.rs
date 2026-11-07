@@ -52,6 +52,7 @@ mod rename;
 pub mod scan_resume;
 mod source_cleanup;
 mod sync_catalog;
+mod target_absence;
 
 mod remote_inventory;
 /// 双进程远端同步（Sender 侧）
