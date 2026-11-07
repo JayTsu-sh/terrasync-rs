@@ -65,6 +65,14 @@ source to remain identical afterwards; it does not claim a real 20-version slash
 The 20-version skip-count and remote classification cases use deterministic observations.
 Ordinary `payload` version history is independently checked against 20 real versions above.
 
+It also counts source tag requests through a deny-on-unneeded-read proxy. An explicit metadata
+scope for filesystem output reads only the child and empty marker tags (two requests), while
+the nonempty slash object's tag endpoint is denied and must receive no request. Latest-only
+output keeps all 20 source history records available for ordering and cleanup decisions but
+requests tags only for the latest version (one request); all old-version tag endpoints are
+denied. These are source scanning checks, not evidence of remote handshake scope propagation
+or whole-job throughput/RSS equivalence.
+
 The same runner also disconnects a required event consumer while another consumer's queue is
 full. Against real versioned S3 it checks that the sender returns a typed failure after the
 first published version, starts no later history version or delivered entry, releases its

@@ -280,8 +280,7 @@ impl SyncOrchestrator {
                     }
                 }
                 copy_transfer::validate_transfer_mode(&destination, c.transfer_mode)?;
-                let mut plan = MigrationPlan::compile(&source, &destination, c.enable_acl)?;
-                plan.latest_metadata_only = !destination.storage().staged_destination()?.keeps_history().await?;
+                let plan = MigrationPlan::compile(&source, &destination, c.enable_acl).await?;
                 plan.log();
                 Some(plan)
             }
@@ -384,7 +383,7 @@ impl SyncOrchestrator {
         )?;
 
         scan_config.observation_plan = observation_plan.as_ref().map(|plan| plan.observation);
-        scan_config.latest_metadata_only = observation_plan.is_some_and(|plan| plan.latest_metadata_only);
+        scan_config.metadata_scope = observation_plan.map(|plan| plan.scope).unwrap_or_default();
 
         // ── 3. 初始化消费者配置 + 数据库 ──
         let consumer_config = Arc::new(initialize_consumer_config(
@@ -797,7 +796,7 @@ impl SyncOrchestrator {
         )?;
 
         scan_config.observation_plan = observation_plan.as_ref().map(|plan| plan.observation);
-        scan_config.latest_metadata_only = observation_plan.is_some_and(|plan| plan.latest_metadata_only);
+        scan_config.metadata_scope = observation_plan.map(|plan| plan.scope).unwrap_or_default();
 
         // ── 3. 初始化消费者配置 + 数据库 ──
         let consumer_config = Arc::new(initialize_consumer_config(

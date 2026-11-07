@@ -78,7 +78,7 @@ impl DirectoryWalker {
                     None,
                     crate::scan::source::WalkOptions {
                         observation_plan: self.config.observation_plan,
-                        latest_metadata_only: self.config.latest_metadata_only,
+                        metadata_scope: self.config.metadata_scope,
                         operation_timeout: self.operation_timeout,
                         recovery_window: self.recovery_window,
                         depth,

@@ -2,6 +2,23 @@
 
 use blake3::Hasher;
 use data_mover_model::{AclEncoding, MetadataObservation, MetadataObservations};
+use serde::{Deserialize, Serialize};
+
+/// 源端输出元数据范围；目标能力决定版本范围及不迁移目录对象的属性读取。
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct MetadataScope {
+    pub latest_version_only: bool,
+    pub directory_object_output: bool,
+}
+
+impl Default for MetadataScope {
+    fn default() -> Self {
+        Self {
+            latest_version_only: false,
+            directory_object_output: true,
+        }
+    }
+}
 
 /// 固定顺序为 ACL、xattr、tags；权限和 mtime 直接比较已有标量。
 /// 域与编码版本属于持久化比较契约；来源为内联还是附加调用不影响语义。

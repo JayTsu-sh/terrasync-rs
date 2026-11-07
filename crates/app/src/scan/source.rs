@@ -1,8 +1,10 @@
-use super::observation::{HistorySequence, observation_plan, tags_required, validate_required_tags};
+use super::observation::{HistorySequence, ObservationValidation, observation_plan, tags_required};
 use crate::error::storage::{Result, StorageError, operation};
 use crate::storage_factory::{StorageContext, path};
 use data_mover::model::{ObservationMode, ObservationPlan};
+use data_mover::storage::Storage;
 use task_model::ObservedEntryExt;
+use task_model::metadata::MetadataScope;
 
 use super::packaging::PackageFilter;
 use crate::task_stream::AsyncReceiver;
@@ -42,7 +44,8 @@ impl StorageContext {
                     .observation_plan
                     .unwrap_or(observation_plan(tags_required(&self.roles, options.include_tags)?)),
             )
-            .latest_metadata_only(options.latest_metadata_only)
+            .latest_metadata_only(options.metadata_scope.latest_version_only)
+            .directory_object_metadata(options.metadata_scope.directory_object_output)
             .max_inflight_operations(NonZeroUsize::new(options.concurrency).unwrap_or(NonZeroUsize::MIN))
             .max_depth(options.depth.and_then(NonZeroUsize::new));
         if blocks {
@@ -91,7 +94,7 @@ impl StorageContext {
             guard: scan.failure,
             recovery: scan.recovery,
             history: None,
-            include_tags: tags_required(&self.roles, options.include_tags)?,
+            validation: validation_for(&self.roles, options)?,
             cancel,
         })
     }
@@ -117,10 +120,7 @@ impl StorageContext {
         &self, sub: Option<&Path>, options: WalkOptions, report_root: bool,
     ) -> Result<WalkDirAsyncIterator> {
         let migration_metadata = options.observation_plan.is_some();
-        let required_tags = match options.observation_plan {
-            Some(plan) => plan.tags() == ObservationMode::Required,
-            None => tags_required(&self.roles, options.include_tags)?,
-        };
+        let validation = validation_for(&self.roles, &options)?;
         let request = self
             .traversal_request(sub, &options, false)?
             .report_root_directory_object(report_root);
@@ -142,7 +142,7 @@ impl StorageContext {
                         continue;
                     }
                     TraversalItem::Entry(entry) => {
-                        if let Err(error) = histories.check(&entry, required_tags) {
+                        if let Err(error) = histories.check(&entry, validation) {
                             let reason = error.to_string();
                             stored_error
                                 .lock()
@@ -269,7 +269,7 @@ impl StorageContext {
     /// 交付原生目录块；历史顺序和必需事实在编号／传输前完成准入。
     pub fn directory_inventory(&self, options: &WalkOptions) -> Result<DirectoryInventory> {
         Ok(DirectoryInventory {
-            required_tags: tags_required(&self.roles, options.include_tags)?,
+            validation: validation_for(&self.roles, options)?,
             session: self.traversal(None, options, true)?,
             histories: HistorySequence::default(),
             ended: false,
@@ -278,7 +278,7 @@ impl StorageContext {
 }
 /// 有界原生目录流，不持有 NDX、wire 页或整棵目录的观察。
 pub struct DirectoryInventory {
-    required_tags: bool,
+    validation: ObservationValidation,
     session: TraversalSession,
     histories: HistorySequence,
     ended: bool,
@@ -294,7 +294,7 @@ impl DirectoryInventory {
                 self.histories = HistorySequence::default();
                 Some(Ok(TraversalItem::Resumed(event)))
             }
-            Some(TraversalItem::Entry(entry)) => match self.histories.check(&entry, self.required_tags) {
+            Some(TraversalItem::Entry(entry)) => match self.histories.check(&entry, self.validation) {
                 Ok(()) => Some(Ok(TraversalItem::Entry(entry))),
                 Err(error) => {
                     self.ended = true;
@@ -327,7 +327,7 @@ pub enum ResumableScanItem {
 }
 
 pub struct ResumableScan {
-    include_tags: bool,
+    validation: ObservationValidation,
     session: TraversalSession,
     recovery: Option<TraversalRecoveryStatus>,
     guard: ScanFailureSignal,
@@ -367,10 +367,8 @@ impl ResumableScan {
                     return Some(Ok(ResumableScanItem::Statistics(statistics)));
                 }
                 TraversalItem::Entry(entry) => {
-                    if self.include_tags {
-                        if let Err(error) = validate_required_tags(&entry) {
-                            return Some(Err(error));
-                        }
+                    if let Err(error) = self.validation.validate(&entry) {
+                        return Some(Err(error));
                     }
                     if let Some(history) = entry.history() {
                         let expected = self.history.get_or_insert_with(|| (entry.path().as_str().into(), 0));
@@ -449,7 +447,7 @@ mod stopping_tests {
             guard: ScanFailureSignal::source(&storage.roles, None).unwrap().1,
             session,
             history: Some(("partial-history".into(), 1)),
-            include_tags: false,
+            validation: ObservationValidation::new(false, MetadataScope::default()),
             cancel: cancel.clone(),
         };
         let finished = Arc::new(AtomicBool::new(false));
@@ -469,10 +467,18 @@ mod stopping_tests {
 
 pub type WalkDirAsyncIterator = AsyncReceiver<StorageEntryMessage>;
 
+fn validation_for(storage: &Storage, options: &WalkOptions) -> Result<ObservationValidation> {
+    let required_tags = match options.observation_plan {
+        Some(plan) => plan.tags() == ObservationMode::Required,
+        None => tags_required(storage, options.include_tags)?,
+    };
+    Ok(ObservationValidation::new(required_tags, options.metadata_scope))
+}
+
 #[derive(Debug, Clone)]
 pub struct WalkOptions {
     pub observation_plan: Option<ObservationPlan>,
-    pub latest_metadata_only: bool,
+    pub metadata_scope: MetadataScope,
     /// 单个远程存储操作的等待上限；独立于自动恢复，不包含消费者背压。
     pub operation_timeout: Option<std::time::Duration>,
     /// 调用方显式选择的故障恢复窗口；None 直接报告失败，不自动重连。
@@ -490,7 +496,7 @@ impl Default for WalkOptions {
     fn default() -> Self {
         Self {
             observation_plan: None,
-            latest_metadata_only: false,
+            metadata_scope: MetadataScope::default(),
             operation_timeout: None,
             recovery_window: None,
             depth: None,

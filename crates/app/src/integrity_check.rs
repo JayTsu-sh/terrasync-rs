@@ -16,6 +16,7 @@ use crate::callback::CallbackEndpoint;
 use crate::file_copy::metadata as copy_metadata;
 #[cfg(feature = "license")]
 use data_mover::probes::probe_server_time;
+use task_model::metadata::MetadataScope;
 mod comparison;
 #[cfg(feature = "license")]
 use crate::storage_factory::backend_kind_from_location;
@@ -410,7 +411,7 @@ pub async fn integrity_check_with_concurrency(
         exclude_expressions: None,
         include_tags: false,
         observation_plan: None,
-        latest_metadata_only: false,
+        metadata_scope: MetadataScope::default(),
         file_list: None,
         packaged: false,
         package_depth: 0,

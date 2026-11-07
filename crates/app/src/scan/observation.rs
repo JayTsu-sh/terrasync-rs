@@ -4,10 +4,39 @@ use crate::storage_factory::path;
 use data_mover::model::*;
 use data_mover::storage::StorageRoleFailure;
 use data_mover::storage::{Storage, observe_descriptor};
+use data_mover::transfer::{DirectoryObjectAction, DirectoryObjectDestination, directory_object_action};
 use std::path::Path;
+use task_model::metadata::MetadataScope;
+
+#[derive(Clone, Copy)]
+pub(crate) struct ObservationValidation {
+    required_tags: bool,
+    scope: MetadataScope,
+}
+
+impl ObservationValidation {
+    pub fn new(required_tags: bool, scope: MetadataScope) -> Self {
+        Self { required_tags, scope }
+    }
+
+    pub fn validate(self, entry: &ObservedEntry) -> Result<()> {
+        if !self.required_tags {
+            return Ok(());
+        }
+        let omitted = !self.scope.directory_object_output
+            && matches!(
+                directory_object_action(entry, DirectoryObjectDestination::new(false, None)),
+                DirectoryObjectAction::Skip(_)
+            );
+        if !omitted {
+            validate_required_tags(entry, self.scope.latest_version_only)?;
+        }
+        Ok(())
+    }
+}
 
 /// 必须复制的事实失败后不能继续发布观察或把缺失事实解释成 Omit。
-pub(crate) fn validate_required_tags(entry: &ObservedEntry) -> Result<()> {
+pub(crate) fn validate_required_tags(entry: &ObservedEntry, latest_only: bool) -> Result<()> {
     fn check(path: &StoragePath, facts: &MetadataObservations) -> Result<()> {
         let (class, transience) = match facts.tags() {
             MetadataObservation::Value { .. } | MetadataObservation::NotApplicable => return Ok(()),
@@ -25,7 +54,11 @@ pub(crate) fn validate_required_tags(entry: &ObservedEntry) -> Result<()> {
         .into())
     }
     if let Some(history) = entry.history() {
-        for record in history.records().iter().filter(|record| !record.is_delete_marker()) {
+        for record in history
+            .records()
+            .iter()
+            .filter(|record| !record.is_delete_marker() && (!latest_only || record.is_latest()))
+        {
             if let Some(metadata) = record.metadata() {
                 check(entry.path(), metadata)?;
             } else {
@@ -82,10 +115,8 @@ pub(crate) struct HistorySequence {
     next_segment: u32,
 }
 impl HistorySequence {
-    pub fn check(&mut self, entry: &ObservedEntry, tags: bool) -> Result<()> {
-        if tags {
-            validate_required_tags(entry)?;
-        }
+    pub fn check(&mut self, entry: &ObservedEntry, validation: ObservationValidation) -> Result<()> {
+        validation.validate(entry)?;
         if let Some(history) = entry.history() {
             if self.path.is_none() {
                 self.path = Some(entry.path().clone());
@@ -121,7 +152,7 @@ mod required_tags_tests {
     #[test]
     fn failed_required_tags_block_the_object_and_keep_the_typed_cause() {
         let entry = directory_marker("folder", Vec::new());
-        assert!(validate_required_tags(&entry).is_ok());
+        assert!(validate_required_tags(&entry, false).is_ok());
         let marker = entry.directory_marker_object().unwrap();
         let facts = MetadataObservations::new(
             MetadataObservation::NotApplicable,
@@ -136,7 +167,7 @@ mod required_tags_tests {
         .unwrap();
         let marker = marker.clone().with_metadata(facts);
         let entry = entry.with_directory_marker_object(Some(Box::new(marker))).unwrap();
-        match validate_required_tags(&entry) {
+        match validate_required_tags(&entry, false) {
             Err(StorageError::Role(StorageRoleFailure::Entry(error))) => {
                 assert_eq!(error.path().as_str(), "folder/");
                 assert_eq!(error.class(), FailureClass::Timeout);
@@ -159,11 +190,11 @@ mod required_tags_tests {
             None,
             Some((Some("v1".into()), true, false)),
         );
-        assert!(validate_required_tags(&entry).is_err());
+        assert!(validate_required_tags(&entry, false).is_err());
         let structural = directory_marker("folder", Vec::new())
             .with_directory_marker_object(None)
             .unwrap();
-        assert!(validate_required_tags(&structural).is_ok());
+        assert!(validate_required_tags(&structural, false).is_ok());
         assert_eq!(
             observation_plan(true).mode(MetadataFamily::Tags),
             ObservationMode::Required
@@ -174,3 +205,7 @@ mod required_tags_tests {
 #[cfg(test)]
 #[path = "observation_failures_tests.rs"]
 mod failure_tests;
+
+#[cfg(test)]
+#[path = "observation_scope_tests.rs"]
+mod scope_tests;

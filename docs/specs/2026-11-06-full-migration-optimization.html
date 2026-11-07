@@ -227,7 +227,7 @@
         <div class="note"><p><strong>非空尾斜杠对象：</strong>对象 key 以 / 结尾且内容非空时，目标为非对象存储则自动忽略该对象并保留源端；目标为对象存储则保留原始 key，正常复制内容与所需元数据／版本历史。只忽略该实际对象，不剪枝同前缀下的其他对象。</p></div>
         <div class="note"><p><strong>本次全量迁移的性能目标：</strong>与优化前相比，整轮性能和内存开销均应相当。元数据观察、摘要、校验、异步批量入库、源清理和目录收尾全部计入。不以小概率入库缺失为由引入常态逐对象等待或额外持久化链路。</p></div>
         <p>当前处于首次开发阶段，可直接调整任务契约、状态格式、表结构及 callback，无需设计旧版本兼容层。当前数据正确性、幂等、恢复和性能约束仍然有效。</p>
-        <p class="muted small">证据边界：以下“当前实现”来自分析时工作区和 Cargo.toml 锁定的 data-mover 提交 <code>89e2e8a9b51d97d94144123073d48cb80f791760</code> 的源码阅读；方案和验收目标不代表已经实现或通过实测。</p>
+        <p class="muted small">证据边界：以下“当前实现”来自分析时工作区和 Cargo.toml 锁定的 data-mover 提交 <code>173a4ce3c9103fca44728cd780b3b74ac992bb5f</code> 的源码阅读；方案和验收目标不代表已经实现或通过实测。</p>
       </section>
 
       <section id="current">
@@ -394,6 +394,7 @@
           </table>
         </div>
         <p>例如 NFS→S3 的 plan 可明确记为“ACL：Omit，原因：目标无对应迁移用途，额外请求 0；xattr：Omit，原因同上”。若用户另行要求将这些值编码到对象 metadata，或过滤条件实际依赖它们，则属于明确需求，重新纳入扫描获取和成本估算，不能继续宣称零调用。</p>
+        <div class="note"><p><strong>本地目录遍历管线已接入的扫描范围：</strong><a href="../../crates/app/src/migration_plan.rs">MigrationPlan</a> 在扫描前查询目标是否保留历史、是否承载尾斜杠对象，将 MetadataScope 同时交给全量／增量扫描与观察校验。data-mover 对已知非空且不会迁移的尾斜杠对象仅省略输出属性，仍保留过滤依赖；空标记、未知大小、同前缀子项不扩大跳过。只获取最新版本输出元数据时，历史身份和分段顺序仍完整保留，旧版本未请求的属性不触发必需属性缺失错误。纯扫描默认观察范围不变；文件清单入口的范围接入仍待补齐，远程握手尚未传播该目标范围，不能据此宣称远程端已完成相同优化。</p><p>验证证据：隔离真实 S3 代理把非空尾斜杠对象及旧版本 tags 端点设为拒绝访问，实际无多余请求；尾斜杠场景只有子项和空标记的 2 次标签读取，20 版本场景仅对最新版本读取 1 次、20 条历史记录仍保留。原有源 tags 拒绝测试仍交付 20 版本数据、按 1 个失败 entry 统计并通过 HTTP callback 交付 20 条具体原因。另有原生 unordered／blocks、过滤用途及版本范围组合测试；这些证据不代表整轮吞吐／RSS 或统一断网恢复已通过。</p></div>
         <p>版本化源到非版本化目标时，仅对最新可见数据版本获取计划要求的元数据并入库，不为不复制的旧版本额外读内容、ACL、tags 等。启用源删除时，清理阶段从源端流式列举旧版本身份，不将其作为历史迁移记录落库。版本化目标则对每个实际复制的数据版本获取对应元数据，delete marker 不发无意义的数据版本元数据请求。</p>
         <p>“值为空”“不支持”“未请求”“请求失败”必须区分。源端没有可迁移的目录 mtime 时，不能用默认时间冒充源值；必需元数据获取失败不能静默变成 Omit。</p>
         <p>源元数据获取结果与数据读取准入分开。ACL、xattr、tags、mtime、ownership／mode 等获取失败时，保留失败类别、原因及已知源身份，并继续复制可读取的数据；缺失值不能被解释成清空目标属性或写入默认权限。若定位源对象或实际数据读取本身也失败，则按真实的数据读取错误处理，不能伪报复制成功。</p>
@@ -835,7 +836,7 @@
           <li><a href="../../crates/db/src/catalogue/copy_generation.rs">catalogue/copy_generation.rs</a>、<a href="../../crates/app/src/copy_execution.rs">copy_execution.rs</a>、<a href="../../crates/app/src/job_execution.rs">job_execution.rs</a>：代次恢复、保守拒绝和执行互斥范围。</li>
           <li><a href="../../crates/app/src/consumer/stats/report.rs">stats/report.rs</a>、<a href="../../crates/app/src/consumer/stats/diagnostics.rs">stats/diagnostics.rs</a>：当前统计字段和有界诊断明细。</li>
           <li><a href="../../crates/app/src/tar_pack.rs">tar_pack.rs</a>、<a href="../../tests/scenarios/migration-generations.md">迁移代次测试场景</a>：打包源清理及待实现／执行的场景规格，不能据此认定通过。</li>
-          <li><a href="../../Cargo.toml">Cargo.toml</a> 锁定 data-mover <code>89e2e8a9b51d97d94144123073d48cb80f791760</code>。当前使用 transfer 及 Namespace::purge_observed；旧 move_file 入口已移除，不能据旧实现推断当前删除行为。</li>
+          <li><a href="../../Cargo.toml">Cargo.toml</a> 锁定 data-mover <code>173a4ce3c9103fca44728cd780b3b74ac992bb5f</code>。当前使用 transfer 及 Namespace::purge_observed；旧 move_file 入口已移除，不能据旧实现推断当前删除行为。</li>
           <li><a href="https://www.rfc-editor.org/rfc/rfc7530.html#section-16.3.5">RFC 7530 §16.3.5 · NFSv4 COMMIT</a>：稳定存储与提交语义。</li>
           <li><a href="https://docs.aws.amazon.com/AmazonS3/latest/userguide/DeletingObjectVersions.html">Amazon S3 · 删除对象版本</a>：delete marker 与指定版本永久删除的区别。</li>
         </ol>

@@ -2,6 +2,7 @@
 
 use data_mover::model::{MetadataCapabilities, MetadataFamily, ObservationMode, ObservationPlan, ObservationSupport};
 use data_mover::storage::{CopiedAclTarget, CopiedMetadataTarget, CopiedValueTarget};
+use task_model::metadata::MetadataScope;
 
 use crate::error::Result;
 use crate::storage_factory::StorageContext;
@@ -9,13 +10,14 @@ use crate::storage_factory::StorageContext;
 #[derive(Clone, Debug)]
 pub(crate) struct MigrationPlan {
     pub observation: ObservationPlan,
-    pub latest_metadata_only: bool,
+    pub scope: MetadataScope,
     pub additional_reads: Vec<MetadataRead>,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::storage_factory::{CreateStorageOptions, create_storage};
     use data_mover::model::AclEncoding;
     use data_mover::storage::{CopiedOwnershipTarget, CopiedTimestampTarget};
 
@@ -62,6 +64,20 @@ mod tests {
         assert_eq!(plan.observation.acl(), ObservationMode::Omit);
         assert_eq!(plan.observation.xattrs(), ObservationMode::Omit);
     }
+
+    #[tokio::test]
+    async fn filesystem_destination_selects_latest_version_and_omits_content_directory_object_attributes() -> Result<()>
+    {
+        let source_root = tempfile::tempdir()?;
+        let target_root = tempfile::tempdir()?;
+        let source = create_storage(&source_root.path().to_string_lossy(), CreateStorageOptions::default()).await?;
+        let destination =
+            create_storage(&target_root.path().to_string_lossy(), CreateStorageOptions::default()).await?;
+        let plan = MigrationPlan::compile(&source, &destination, false).await?;
+        assert!(plan.scope.latest_version_only);
+        assert!(!plan.scope.directory_object_output);
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -75,10 +91,19 @@ pub(crate) struct MetadataRead {
 }
 
 impl MigrationPlan {
-    pub fn compile(source: &StorageContext, destination: &StorageContext, acl: bool) -> Result<Self> {
+    pub async fn compile(source: &StorageContext, destination: &StorageContext, acl: bool) -> Result<Self> {
         let source = source.storage().metadata()?.observation_capabilities();
         let target = destination.storage().staged_destination()?.copied_metadata_target();
-        Ok(Self::from_capabilities(source, target, acl))
+        let mut plan = Self::from_capabilities(source, target, acl);
+        plan.scope = Self::scope_for(destination).await?;
+        Ok(plan)
+    }
+
+    pub async fn scope_for(destination: &StorageContext) -> Result<MetadataScope> {
+        Ok(MetadataScope {
+            latest_version_only: !destination.storage().staged_destination()?.keeps_history().await?,
+            directory_object_output: destination.storage().holds_directory_objects(),
+        })
     }
 
     fn from_capabilities(source: MetadataCapabilities, target: Option<CopiedMetadataTarget>, acl: bool) -> Self {
@@ -141,16 +166,20 @@ impl MigrationPlan {
             .collect();
         Self {
             observation,
-            latest_metadata_only: false,
+            scope: MetadataScope::default(),
             additional_reads,
         }
     }
 
     pub fn log(&self) {
         tracing::info!(
-            latest_metadata_only = self.latest_metadata_only,
+            latest_metadata_only = self.scope.latest_version_only,
+            directory_object_metadata = self.scope.directory_object_output,
             "Migration version metadata selection"
         );
+        if !self.scope.directory_object_output {
+            tracing::info!("已知非空尾斜杠对象省略输出元数据额外读取；过滤依赖仍按计划获取");
+        }
         for read in &self.additional_reads {
             tracing::info!(family = ?read.family, requested = read.requested, extra_calls_per_version = ?read.extra_calls,
                 reason = read.reason, call_rule = read.call_rule, "Migration metadata plan (listing/stat baseline plus selected extra requests)");

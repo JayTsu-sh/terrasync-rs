@@ -229,6 +229,74 @@ def run_inside():
         callback.shutdown()
         callback.server_close()
 
+    # 输出范围省略的属性不应发送请求；若误发则由真实服务前代理明确拒绝。
+    for _ in range(20):
+        client.put_object(Bucket=buckets["source"], Key="metadata-scope/payload", Body=b"scope")
+    scope_records = client.list_object_versions(Bucket=buckets["source"], Prefix="metadata-scope/payload")["Versions"]
+    assert len(scope_records) == 20
+    latest_id = next(item["VersionId"] for item in scope_records if item["IsLatest"])
+    metadata_requests = []
+    denied_metadata = []
+
+    class ScopedMetadata(http.server.BaseHTTPRequestHandler):
+        def log_message(self, *_):
+            pass
+
+        def handle_request(self):
+            parsed = urllib.parse.urlsplit(self.path)
+            query = urllib.parse.parse_qs(parsed.query, keep_blank_values=True)
+            object_path = urllib.parse.unquote(parsed.path)
+            if "tagging" in query:
+                record = (object_path, query.get("versionId", [None])[0])
+                metadata_requests.append(record)
+                if object_path.endswith("/slash/a/") or (object_path.endswith("/metadata-scope/payload") and record[1] != latest_id):
+                    denied_metadata.append(record)
+                    payload = b"<Error><Code>AccessDenied</Code><Message>unneeded metadata read</Message></Error>"
+                    self.send_response(403)
+                    self.send_header("Content-Length", str(len(payload)))
+                    self.end_headers()
+                    self.wfile.write(payload)
+                    return
+            upstream = http.client.HTTPConnection("127.0.0.1", 9000, timeout=5)
+            try:
+                upstream.request(self.command, self.path, headers=dict(self.headers))
+                response = upstream.getresponse()
+                payload = response.read()
+                self.send_response(response.status)
+                for key, value in response.getheaders():
+                    if key.lower() not in ("connection", "transfer-encoding", "content-length"):
+                        self.send_header(key, value)
+                self.send_header("Content-Length", response.getheader("Content-Length", "0") if self.command == "HEAD" else str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+            finally:
+                upstream.close()
+
+        do_GET = do_HEAD = handle_request
+
+    scope_proxy = http.server.ThreadingHTTPServer(("127.0.0.1", 0), ScopedMetadata)
+    scope_proxy.daemon_threads = True
+    threading.Thread(target=scope_proxy.serve_forever, daemon=True).start()
+    try:
+        scope_root = f"s3://migration-test:migration-test-isolated-only@{buckets['source']}.127.0.0.1:{scope_proxy.server_port}"
+        for prefix, test_name, expected_reads in (
+            ("slash", "omitted_directory_object_metadata_does_not_read_denied_tags_or_hide_children", 2),
+            ("metadata-scope", "latest_version_metadata_scope_keeps_all_history_without_reading_old_tags", 1),
+        ):
+            metadata_requests.clear()
+            environment["LAB_METADATA_SCOPE_SOURCE_URL"] = f"{scope_root}/{prefix}"
+            subprocess.run([
+                "cargo", "test", "--offline", "--locked", "-p", "app", "--lib",
+                f"storage_tests::s3_metadata_scope::{test_name}",
+                "--", "--ignored", "--exact", "--nocapture",
+            ], cwd=ROOT, env=environment, check=True)
+            assert len(metadata_requests) == expected_reads, metadata_requests
+            assert not denied_metadata, denied_metadata
+            print(f"independent S3 metadata inspection prefix={prefix} tag_requests={expected_reads} unnecessary_reads=0", flush=True)
+    finally:
+        scope_proxy.shutdown()
+        scope_proxy.server_close()
+
 
 if __name__ == "__main__":
     if "--inside" in sys.argv:
