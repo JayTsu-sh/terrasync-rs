@@ -1,4 +1,6 @@
 //! 真实 Single／Cluster 上验证策略切换、失败代次与记录缺失。
+use crate::migration_fixtures::request;
+use task_model::migration::CopyGenerationPhase;
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -103,7 +105,9 @@ async fn transition(
     let first = fixture.open(&job).await?;
     first.initialize().await?;
     assert_eq!(first.copy_catalogue_source_reserved().await?, None);
-    first.begin_copy_generation("same-endpoints", previous_reserved).await?;
+    first
+        .begin_copy_generation(&request("same-endpoints", previous_reserved))
+        .await?;
     if !empty {
         let entry = observation(
             BackendKind::Local,
@@ -120,11 +124,14 @@ async fn transition(
     }
     if !incomplete {
         first.commit_scan_generation().await?;
+        first.finish_copy_generation(CopyGenerationPhase::Completed).await?;
     }
     drop(first);
     let next = fixture.open(&job).await?;
     assert_eq!(next.copy_catalogue_source_reserved().await?, Some(previous_reserved));
-    let status = next.begin_copy_generation("same-endpoints", current_reserved).await?;
+    let status = next
+        .begin_copy_generation(&request("same-endpoints", current_reserved))
+        .await?;
     assert_eq!(
         status,
         if incomplete && previous_reserved {
@@ -137,11 +144,12 @@ async fn transition(
     assert_eq!(next.get_count("base").await?, expected);
     assert_eq!(next.copy_catalogue_source_reserved().await?, Some(current_reserved));
     next.commit_scan_generation().await?;
+    next.finish_copy_generation(CopyGenerationPhase::Completed).await?;
     drop(next);
     let third = fixture.open(&job).await?;
     assert_eq!(third.copy_catalogue_source_reserved().await?, Some(current_reserved));
     assert_eq!(
-        third.begin_copy_generation("same-endpoints", false).await?,
+        third.begin_copy_generation(&request("same-endpoints", false)).await?,
         CopyGenerationStatus::Fresh
     );
     assert_eq!(
@@ -158,7 +166,9 @@ async fn transition(
 async fn read_faults(fixture: &Fixture) -> Result<()> {
     let database = fixture.open("faults").await?;
     database.initialize().await?;
-    database.begin_copy_generation("same-endpoints", false).await?;
+    database
+        .begin_copy_generation(&request("same-endpoints", false))
+        .await?;
     for fault in ["disconnect", "stall"] {
         fixture.fault(fault).await?;
         let started = Instant::now();
@@ -237,20 +247,52 @@ async fn fail_after_comparison(fixture: &Fixture, database: &ClickHouseDatabase)
     Ok(())
 }
 
+async fn source_cleanup_never_suppresses_new_paths_with_stable_identity(fixture: &Fixture) -> Result<()> {
+    for directory in [false, true] {
+        let job = format!("preserve_rename_{directory}");
+        let database = fixture.open(&job).await?;
+        database.begin_copy_generation(&request("same-endpoints", true)).await?;
+        database
+            .batch_insert_base_record(&[rename_entry("old", directory)])
+            .await?;
+        database.commit_scan_generation().await?;
+        database.finish_copy_generation(CopyGenerationPhase::Completed).await?;
+        let database = database.new_execution_scope();
+        database
+            .begin_copy_generation(&request("same-endpoints", false))
+            .await?;
+        let changes = database
+            .compare_catalogue_batch(
+                &[rename_entry("new", directory)],
+                ComparisonMode::AwaitCopyAcknowledgement,
+            )
+            .await?;
+        assert_eq!(changes.len(), 1);
+        assert!(matches!(changes[0].kind, EntryChange::New));
+        assert_eq!(changes[0].item.entry.path().as_str(), "new");
+        eprintln!(
+            "preserve-rename cluster={} directory={directory} stable_identity=true new_path_requires_copy=true",
+            fixture.config.cluster.is_some()
+        );
+    }
+    Ok(())
+}
+
 async fn rename_after_changed_state(fixture: &Fixture, directory: bool, interruptions: usize) -> Result<()> {
     let job = format!("rename_{directory}_{interruptions}");
     let first = fixture.open(&job).await?;
     first.initialize().await?;
-    first.begin_copy_generation("same-endpoints", true).await?;
+    first.begin_copy_generation(&request("same-endpoints", true)).await?;
     first
         .batch_insert_base_record(&[rename_entry("old", directory)])
         .await?;
     first.commit_scan_generation().await?;
+    first.finish_copy_generation(CopyGenerationPhase::Completed).await?;
     let committed = first.query_scan_state().await?;
     drop(first);
     for round in 0..interruptions {
         let database = fixture.open(&job).await?;
-        database.begin_copy_generation("same-endpoints", true).await?;
+        database.begin_copy_generation(&request("same-endpoints", true)).await?;
         assert_eq!(
             database.query_scan_state().await?,
             committed,
@@ -298,7 +340,7 @@ async fn rename_after_changed_state(fixture: &Fixture, directory: bool, interrup
         drop(database);
     }
     let database = fixture.open(&job).await?;
-    database.begin_copy_generation("same-endpoints", true).await?;
+    database.begin_copy_generation(&request("same-endpoints", true)).await?;
     let latest = format!("renamed_{interruptions}");
     assert!(
         database
@@ -321,7 +363,7 @@ async fn rename_after_changed_state(fixture: &Fixture, directory: bool, interrup
 async fn reused_paths_are_copied_before_replacing_confirmed_target_facts(fixture: &Fixture) -> Result<()> {
     let database = fixture.open("reused_paths").await?;
     database.initialize().await?;
-    database.begin_copy_generation("same-endpoints", true).await?;
+    database.begin_copy_generation(&request("same-endpoints", true)).await?;
     let entry = |path: &str, identity: &[u8]| {
         Arc::new(observation(
             BackendKind::Nfs,
@@ -338,7 +380,9 @@ async fn reused_paths_are_copied_before_replacing_confirmed_target_facts(fixture
     let original = [entry("a", b"identity-a"), entry("b", b"identity-b")];
     database.batch_insert_base_record(&original).await?;
     database.commit_scan_generation().await?;
-    database.begin_copy_generation("same-endpoints", true).await?;
+    database.finish_copy_generation(CopyGenerationPhase::Completed).await?;
+    let database = database.new_execution_scope();
+    database.begin_copy_generation(&request("same-endpoints", true)).await?;
     let observed = [entry("a", b"identity-b"), entry("b", b"identity-a")];
     let changes = database
         .compare_catalogue_batch(&observed, ComparisonMode::AwaitCopyAcknowledgement)
@@ -359,12 +403,15 @@ async fn reused_paths_are_copied_before_replacing_confirmed_target_facts(fixture
     database.batch_insert_completed_records(&completed).await?;
     assert_eq!(database.detect_deleted_items().await?.count(), 0);
     database.commit_scan_generation().await?;
+    database.finish_copy_generation(CopyGenerationPhase::Completed).await?;
     let database = fixture.open("occupied_rename").await?;
     database.initialize().await?;
-    database.begin_copy_generation("same-endpoints", true).await?;
+    database.begin_copy_generation(&request("same-endpoints", true)).await?;
     database.batch_insert_base_record(&original).await?;
     database.commit_scan_generation().await?;
-    database.begin_copy_generation("same-endpoints", true).await?;
+    database.finish_copy_generation(CopyGenerationPhase::Completed).await?;
+    let database = database.new_execution_scope();
+    database.begin_copy_generation(&request("same-endpoints", true)).await?;
     let current = [entry("b", b"identity-a")];
     let changes = database
         .compare_catalogue_batch(&current, ComparisonMode::AwaitCopyAcknowledgement)
@@ -380,7 +427,7 @@ async fn reused_paths_are_copied_before_replacing_confirmed_target_facts(fixture
     Ok(())
 }
 
-async fn successful_rounds_advance_once_while_reusing_marker_payloads(fixture: &Fixture) -> Result<()> {
+async fn successful_rounds_advance_once_while_reusing_bindings(fixture: &Fixture) -> Result<()> {
     for reserved in [false, true] {
         let job = format!("state_cycles_{reserved}");
         let first = fixture.open(&job).await?;
@@ -389,17 +436,20 @@ async fn successful_rounds_advance_once_while_reusing_marker_payloads(fixture: &
         for round in 0..6 {
             let database = fixture.open(&job).await?;
             let committed = database.query_scan_state().await?.unwrap_or_default();
-            database.begin_copy_generation("same-endpoints", reserved).await?;
-            let (started_state, in_progress): (u8, bool) = base_client(&fixture.config)?
-                .query(&format!(
-                    "SELECT scan_state,copy_in_progress FROM state_{job} FINAL WHERE id=1"
-                ))
-                .fetch_one()
+            database
+                .begin_copy_generation(&request("same-endpoints", reserved))
                 .await?;
-            assert_eq!(started_state, committed);
-            assert!(in_progress, "reused marker payload must still mark a new started round");
+            assert_eq!(database.query_scan_state().await?, Some(committed));
+            assert_eq!(
+                database
+                    .latest_copy_generation()
+                    .await?
+                    .map(|generation| generation.phase),
+                Some(CopyGenerationPhase::Prepared)
+            );
             assert_eq!(database.get_cached_scan_state().await?, 1 - committed);
             database.commit_scan_generation().await?;
+            database.finish_copy_generation(CopyGenerationPhase::Completed).await?;
             assert_eq!(database.query_scan_state().await?, Some(1 - committed));
             eprintln!(
                 "state-cycle cluster={} source_reserved={reserved} round={round} committed_before={committed} committed_after={} marker_confirmed=true",
@@ -423,7 +473,8 @@ async fn real_rename_after_failed_comparison_of_the_same_item() -> Result<()> {
                 }
             }
             reused_paths_are_copied_before_replacing_confirmed_target_facts(&fixture).await?;
-            successful_rounds_advance_once_while_reusing_marker_payloads(&fixture).await?;
+            successful_rounds_advance_once_while_reusing_bindings(&fixture).await?;
+            source_cleanup_never_suppresses_new_paths_with_stable_identity(&fixture).await?;
             Ok(())
         }
         .await;

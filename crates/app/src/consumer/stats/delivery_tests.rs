@@ -177,6 +177,7 @@ pub(crate) fn consumer(endpoint: &CallbackEndpoint) -> Arc<Mutex<StatisticConsum
         job_dir: String::new(),
         callback_url: Some(endpoint.clone()),
         generation_committed: None,
+        migration: None,
         scan_snapshot: None,
         callback,
         pb_handle: None,

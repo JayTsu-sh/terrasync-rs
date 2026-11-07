@@ -27,7 +27,16 @@ fn request() -> CopyRequestDescriptor {
         contract: CopyContract {
             acl: false,
             verification: VerificationLevel::Quick,
-            transfer: TransferMode::Direct,
+        },
+        runtime: CopyRuntimeSettings {
+            transfer_mode: TransferMode::Direct,
+            scan_concurrency: 2,
+            copy_concurrency: 2,
+            block_size: None,
+            delta_size_threshold: None,
+            qos: None,
+            peak_qos_rate: 2.0,
+            iops: None,
         },
         filter_evaluated_at: 1,
         delete_target: false,
@@ -37,6 +46,7 @@ fn request() -> CopyRequestDescriptor {
 fn previous(request: CopyRequestDescriptor, phase: CopyGenerationPhase, prepared: bool) -> CopyGeneration {
     CopyGeneration {
         sequence: 1,
+        revision: 1,
         plan: CopyGenerationPlan::decide(&request, None, false).unwrap(),
         request,
         phase,
@@ -133,6 +143,18 @@ fn contract_changes_revalidate_selected_entries_without_changing_binding() {
     let plan = CopyGenerationPlan::decide(&current, Some(&prior), true).unwrap();
     assert_eq!(plan.mode, MigrationMode::Incremental);
     assert!(plan.force_copy && plan.reasons.contains(&MigrationReason::ContractChanged));
+}
+
+#[test]
+fn resume_and_scheduling_changes_do_not_invalidate_confirmed_copy_facts() {
+    let prior = previous(request(), CopyGenerationPhase::Completed, true);
+    let mut current = request();
+    current.runtime.transfer_mode = TransferMode::Checkpoint;
+    current.runtime.scan_concurrency = 8;
+    current.runtime.peak_qos_rate = 1.0;
+    let plan = CopyGenerationPlan::decide(&current, Some(&prior), true).unwrap();
+    assert_eq!(plan.mode, MigrationMode::Incremental);
+    assert!(!plan.force_copy);
 }
 
 #[test]

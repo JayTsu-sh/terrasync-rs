@@ -56,8 +56,7 @@ impl ClickHouseDatabase {
         self.create_catalogue_table(
             &table_name,
             "id UInt8, scan_state UInt8, baseline_committed Bool DEFAULT false, \
-             copy_in_progress Bool DEFAULT false, copy_request_key String DEFAULT '', \
-             copy_source_reserved Bool DEFAULT true",
+             copy_execution_id String DEFAULT ''",
             "id",
             CatalogueEngine::Replacing,
         )
@@ -137,24 +136,10 @@ impl ClickHouseDatabase {
 
     /// 返回上一复制代次的源保留策略；普通扫描不构成可复用的复制基线。
     pub async fn copy_catalogue_source_reserved(&self) -> Result<Option<bool>> {
-        if !self.table_exists(&get_scan_base_table_name(&self.job_id)).await?
-            || !self.table_exists(&get_scan_state_table_name(&self.job_id)).await?
-        {
-            return Ok(None);
-        }
-        let table = get_scan_state_table_name(&self.job_id);
-        match self
-            .sync_client
-            .query(&format!(
-                "SELECT copy_source_reserved FROM {table} FINAL WHERE id=1 AND copy_request_key!=''"
-            ))
-            .fetch_quorum_one::<bool>()
-            .await
-        {
-            Ok(reserved) => Ok(Some(reserved)),
-            Err(DatabaseError::ClickHouseError(ClickHouseError::RowNotFound)) => Ok(None),
-            Err(error) => Err(error),
-        }
+        Ok(self
+            .latest_copy_generation()
+            .await?
+            .map(|generation| generation.request.source_cleanup.retains_source()))
     }
 
     /// 检查指定表名是否存在于当前数据库中

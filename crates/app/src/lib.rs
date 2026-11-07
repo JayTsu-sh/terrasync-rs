@@ -43,6 +43,9 @@ mod copy_completion;
 mod copy_execution;
 mod job_execution;
 pub mod local_transfer;
+#[cfg(test)]
+#[path = "../../../tests/support/migration.rs"]
+mod migration_fixtures;
 mod migration_plan;
 /// Sync 编排器模块
 ///

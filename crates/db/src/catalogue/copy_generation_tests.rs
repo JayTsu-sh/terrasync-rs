@@ -1,11 +1,18 @@
 use clickhouse::{
     Client, Compression,
-    test::{Mock, handlers},
+    test::{
+        Mock,
+        handlers::{self, RecordDdlControl},
+    },
 };
 use hyper::StatusCode;
+use task_model::TaskModelError;
+use task_model::migration::{CopyGeneration, CopyGenerationPhase, CopyGenerationPlan, MigrationMode};
 
 use super::{CopyGenerationStatus, CopyState};
-use crate::{ClickHouseConfig, ClickHouseDatabase, Result};
+use crate::catalogue::copy_runs::CopyRunRow;
+use crate::migration_fixtures::request;
+use crate::{ClickHouseConfig, ClickHouseDatabase, DatabaseError, Result};
 
 fn database(mock: &Mock) -> Result<ClickHouseDatabase> {
     let config = ClickHouseConfig {
@@ -28,149 +35,169 @@ fn database(mock: &Mock) -> Result<ClickHouseDatabase> {
     )
 }
 
+fn prior(binding: &str, reserved: bool, phase: CopyGenerationPhase, prepared: bool) -> CopyGeneration {
+    let request = request(binding, reserved);
+    CopyGeneration {
+        sequence: 4,
+        revision: 3,
+        plan: CopyGenerationPlan::decide(&request, None, false).unwrap_or_else(|error| panic!("fixture: {error}")),
+        request,
+        phase,
+        baseline_prepared: prepared,
+    }
+}
+
+fn expect_previous(mock: &Mock, previous: Option<&CopyGeneration>, committed: u8) {
+    mock.add(handlers::record_ddl());
+    mock.add(handlers::provide([1u64]));
+    let rows = previous.map(|generation| CopyRunRow {
+        sequence: generation.sequence,
+        execution_id: generation.request.execution_id.clone(),
+        revision: generation.revision,
+        descriptor: serde_json::to_string(generation).unwrap_or_else(|error| panic!("fixture: {error}")),
+    });
+    mock.add(handlers::provide(rows));
+    if let Some(previous) = previous {
+        if previous.baseline_prepared {
+            mock.add(handlers::provide([1u64]));
+            mock.add(handlers::provide([1u64]));
+            mock.add(handlers::provide([CopyState {
+                scan_state: committed,
+                copy_execution_id: previous.request.execution_id.clone(),
+            }]));
+        }
+    } else {
+        mock.add(handlers::provide([1u64]));
+        mock.add(handlers::provide([CopyState {
+            scan_state: committed,
+            copy_execution_id: String::new(),
+        }]));
+    }
+}
+
+fn expect_accepted_and_initialized(mock: &Mock, committed: u8, old_execution: &str) -> RecordDdlControl {
+    let accepted = mock.add(handlers::record_ddl());
+    mock.add(handlers::record_ddl());
+    mock.add(handlers::provide(["relative_path,version_id".to_owned()]));
+    mock.add(handlers::record_ddl());
+    mock.add(handlers::provide([committed]));
+    mock.add(handlers::provide([CopyState {
+        scan_state: committed,
+        copy_execution_id: old_execution.into(),
+    }]));
+    accepted
+}
+
 #[tokio::test]
-async fn initial_copy_clears_scan_rows_and_committed_copy_keeps_its_binding() -> Result<()> {
+async fn accepted_policy_precedes_clear_and_copy_commit_keeps_its_execution_stamp() -> Result<()> {
     let mock = Mock::new();
     let database = database(&mock)?;
-    mock.add(handlers::provide([CopyState {
-        scan_state: 0,
-        copy_in_progress: false,
-        copy_request_key: String::new(),
-        copy_source_reserved: true,
-    }]));
+    expect_previous(&mock, None, 0);
+    let accepted = expect_accepted_and_initialized(&mock, 0, "");
     let clear = mock.add(handlers::record_ddl());
-    let begin = mock.add(handlers::record_ddl());
+    let stamp = mock.add(handlers::record_ddl());
+    let prepared = mock.add(handlers::record_ddl());
+    let command = request("bound", true);
     assert_eq!(
-        database.begin_copy_generation("bound-plan", true).await?,
+        database.begin_copy_generation(&command).await?,
         CopyGenerationStatus::Fresh
     );
-    assert!(clear.query().await.starts_with("TRUNCATE TABLE"));
-    assert!(begin.query().await.contains("bound-plan"));
+    assert!(accepted.query().await.contains("accepted"));
+    assert!(clear.query().await.contains("DELETE WHERE copy_sequence < 1"));
+    assert!(stamp.query().await.contains(&command.execution_id));
+    assert!(prepared.query().await.contains("prepared"));
     let commit = mock.add(handlers::record_ddl());
     database.commit_scan_generation().await?;
-    let commit = commit.query().await;
-    assert!(commit.contains("true,false,'bound-plan',true"));
+    assert!(commit.query().await.contains(&command.execution_id));
+    let finish = mock.add(handlers::record_ddl());
+    database.finish_copy_generation(CopyGenerationPhase::Completed).await?;
+    assert!(finish.query().await.contains("completed"));
+    assert_eq!(
+        database.current_copy_generation().await?.phase,
+        CopyGenerationPhase::Completed
+    );
     Ok(())
 }
 
 #[tokio::test]
-async fn failed_initial_clear_cannot_start_a_copy_generation() -> Result<()> {
+async fn failed_initial_clear_retains_accepted_policy_but_never_authorizes_copy() -> Result<()> {
     let mock = Mock::new();
     let database = database(&mock)?;
-    mock.add(handlers::provide([CopyState {
-        scan_state: 0,
-        copy_in_progress: false,
-        copy_request_key: String::new(),
-        copy_source_reserved: true,
-    }]));
+    expect_previous(&mock, None, 0);
+    let accepted = expect_accepted_and_initialized(&mock, 0, "");
     mock.add(handlers::failure(StatusCode::FORBIDDEN));
-    assert!(database.begin_copy_generation("bound-plan", true).await.is_err());
+    assert!(database.begin_copy_generation(&request("bound", false)).await.is_err());
+    assert!(accepted.query().await.contains("delete_selected_ready"));
+    let generation = database.current_copy_generation().await?;
+    assert_eq!(generation.phase, CopyGenerationPhase::Accepted);
+    assert!(!generation.baseline_prepared);
     assert!(database.generation_lifecycle.lock().await.working.is_none());
     Ok(())
 }
 
 #[tokio::test]
-async fn failed_copy_rebases_confirmed_rows_without_clearing_or_forcing_replay() -> Result<()> {
+async fn failed_retained_copy_rebases_only_older_confirmed_facts() -> Result<()> {
     let mock = Mock::new();
     let database = database(&mock)?;
-    mock.add(handlers::provide([CopyState {
-        scan_state: 0,
-        copy_in_progress: true,
-        copy_request_key: "bound-plan".into(),
-        copy_source_reserved: true,
-    }]));
-    let retire_unconfirmed = mock.add(handlers::record_ddl());
+    let previous = prior("bound", true, CopyGenerationPhase::Failed, true);
+    expect_previous(&mock, Some(&previous), 0);
+    expect_accepted_and_initialized(&mock, 0, &previous.request.execution_id);
+    let retire = mock.add(handlers::record_ddl());
     let rebase = mock.add(handlers::record_ddl());
     mock.add(handlers::record_ddl());
+    mock.add(handlers::record_ddl());
     assert_eq!(
-        database.begin_copy_generation("bound-plan", true).await?,
+        database.begin_copy_generation(&request("bound", true)).await?,
         CopyGenerationStatus::Recovering
     );
     assert!(
-        retire_unconfirmed
+        retire
             .query()
             .await
-            .contains("DELETE WHERE NOT copy_path_confirmed")
+            .contains("NOT copy_path_confirmed AND copy_sequence < 5")
     );
-    assert!(rebase.query().await.starts_with("ALTER TABLE"));
-    assert!(!database.is_copy_recovery().await);
+    assert!(rebase.query().await.contains("current_state!=0 AND copy_sequence < 5"));
+    assert_eq!(
+        database.current_copy_generation().await?.plan.mode,
+        MigrationMode::Incremental
+    );
     Ok(())
 }
 
 #[tokio::test]
-async fn different_endpoint_or_plan_is_refused_before_mutating_confirmed_facts() -> Result<()> {
+async fn foreign_binding_is_rejected_without_acceptance_or_baseline_mutation() -> Result<()> {
     let mock = Mock::new();
     let database = database(&mock)?;
-    mock.add(handlers::provide([CopyState {
-        scan_state: 0,
-        copy_in_progress: true,
-        copy_request_key: "original-plan".into(),
-        copy_source_reserved: true,
-    }]));
-    assert!(database.begin_copy_generation("foreign-plan", true).await.is_err());
+    let previous = prior("original", true, CopyGenerationPhase::Failed, true);
+    expect_previous(&mock, Some(&previous), 0);
+    assert!(matches!(
+        database.begin_copy_generation(&request("foreign", true)).await,
+        Err(DatabaseError::MigrationPolicy(TaskModelError::CopyBindingChanged))
+    ));
+    assert!(matches!(
+        database.current_copy_generation().await,
+        Err(DatabaseError::CopyExecutionUnavailable)
+    ));
     Ok(())
 }
 
 #[tokio::test]
-async fn source_policy_controls_baseline_reuse_even_after_an_incomplete_generation() -> Result<()> {
-    for previous_reserved in [false, true] {
-        for source_reserved in [false, true] {
-            for incomplete in [false, true] {
-                let mock = Mock::new();
-                let database = database(&mock)?;
-                mock.add(handlers::provide([CopyState {
-                    scan_state: 1,
-                    copy_in_progress: incomplete,
-                    copy_request_key: "same-endpoints".into(),
-                    copy_source_reserved: previous_reserved,
-                }]));
-                let reset = !previous_reserved;
-                let mutation = if reset || incomplete {
-                    Some(mock.add(handlers::record_ddl()))
-                } else {
-                    None
-                };
-                let rebase = if incomplete && !reset {
-                    Some(mock.add(handlers::record_ddl()))
-                } else {
-                    None
-                };
-                let begin = mock.add(handlers::record_ddl());
-                let actual = database
-                    .begin_copy_generation("same-endpoints", source_reserved)
-                    .await?;
-                let expected = if incomplete && !reset {
-                    CopyGenerationStatus::Recovering
-                } else {
-                    CopyGenerationStatus::Fresh
-                };
-                assert_eq!(actual, expected);
-                if let Some(mutation) = mutation {
-                    let sql = mutation.query().await;
-                    assert!(
-                        sql.starts_with(if reset { "TRUNCATE TABLE" } else { "ALTER TABLE" }),
-                        "{sql}"
-                    );
-                }
-                assert!(
-                    begin
-                        .query()
-                        .await
-                        .ends_with(&format!("'same-endpoints',{source_reserved})"))
-                );
-                if let Some(rebase) = rebase {
-                    assert!(rebase.query().await.contains("UPDATE current_state=1"));
-                }
-                let commit = mock.add(handlers::record_ddl());
-                database.commit_scan_generation().await?;
-                assert!(
-                    commit
-                        .query()
-                        .await
-                        .ends_with(&format!("'same-endpoints',{source_reserved})"))
-                );
-            }
-        }
+async fn unprepared_attempt_and_previous_source_deletion_both_force_a_new_full() -> Result<()> {
+    for (reserved, prepared) in [(false, true), (true, false)] {
+        let mock = Mock::new();
+        let database = database(&mock)?;
+        let previous = prior("bound", reserved, CopyGenerationPhase::Failed, prepared);
+        expect_previous(&mock, Some(&previous), 1);
+        expect_accepted_and_initialized(&mock, 1, &previous.request.execution_id);
+        let clear = mock.add(handlers::record_ddl());
+        mock.add(handlers::record_ddl());
+        mock.add(handlers::record_ddl());
+        assert_eq!(
+            database.begin_copy_generation(&request("bound", true)).await?,
+            CopyGenerationStatus::Fresh
+        );
+        assert!(clear.query().await.contains("copy_sequence < 5"));
+        assert_eq!(database.current_copy_generation().await?.plan.mode, MigrationMode::Full);
     }
     Ok(())
 }

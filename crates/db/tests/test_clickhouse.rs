@@ -1,11 +1,14 @@
 // 集成测试代码：豁免 unwrap/expect deny
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+#[path = "../../../tests/support/migration.rs"]
+mod migration_fixtures;
 #[path = "../../../tests/support/observed.rs"]
 mod observed_fixtures;
 #[cfg(test)]
 mod clickhouse_integration_tests {
     // 标准库
+    use super::migration_fixtures;
     use std::path::PathBuf;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1558,7 +1561,9 @@ mod clickhouse_integration_tests {
 
         // begin_copy_generation
         db.insert_scan_state(0).await.unwrap();
-        db.begin_copy_generation("catalogue-fixture-v1", true).await.unwrap();
+        db.begin_copy_generation(&migration_fixtures::request("catalogue-fixture-v1", true))
+            .await
+            .unwrap();
 
         // 第二轮: temp 插入 990 条（10 条消失）
         db.create_scan_temporary_table().await.unwrap();
@@ -1691,7 +1696,9 @@ mod clickhouse_integration_tests {
 
         // begin_copy_generation
         db.insert_scan_state(0).await.unwrap();
-        db.begin_copy_generation("catalogue-fixture-v1", true).await.unwrap();
+        db.begin_copy_generation(&migration_fixtures::request("catalogue-fixture-v1", true))
+            .await
+            .unwrap();
 
         // 第二轮：temp 100 条（80 已有其中 5 变更 + 20 新增）
         db.create_scan_temporary_table().await.unwrap();
@@ -1741,7 +1748,9 @@ mod clickhouse_integration_tests {
         db.batch_insert_base_record(&base_batch).await.unwrap();
 
         db.insert_scan_state(0).await.unwrap();
-        db.begin_copy_generation("catalogue-fixture-v1", true).await.unwrap();
+        db.begin_copy_generation(&migration_fixtures::request("catalogue-fixture-v1", true))
+            .await
+            .unwrap();
 
         // 第二轮
         db.create_scan_temporary_table().await.unwrap();

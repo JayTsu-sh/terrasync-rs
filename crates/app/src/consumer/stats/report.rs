@@ -8,6 +8,7 @@
 use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
+use task_model::migration::MigrationReport;
 
 use super::accumulator::{DeltaCounts, ErrorStats, FileSizeRange, StatsKind, TimeRange};
 pub use super::callback_state::{ScanRuntimePhase, ScanRuntimeState};
@@ -77,6 +78,8 @@ pub struct ProgressReport {
     pub scan_runtime: Option<ScanRuntimeState>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub generation_committed: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub migration: Option<MigrationReport>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub final_stats: Option<FinalStats>,
 }

@@ -28,6 +28,15 @@ pub(crate) struct ScanCancellationDeadline;
 /// 使用thiserror库实现错误处理和转换
 #[derive(Error, Debug)]
 pub enum DatabaseError {
+    #[error("迁移代次记录无效: {field}")]
+    CopyGenerationInvalid { field: &'static str },
+    #[error("迁移代次记录序列化失败: {source}")]
+    CopyGenerationJson {
+        #[source]
+        source: serde_json::Error,
+    },
+    #[error(transparent)]
+    MigrationPolicy(#[from] task_model::TaskModelError),
     #[error("本轮复制执行身份尚未准备，拒绝查询删源或目录收尾候选")]
     CopyExecutionUnavailable,
     #[error(

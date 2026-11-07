@@ -100,6 +100,7 @@ async fn unsupported_content_history_is_one_skip_without_success_failure_or_coun
             job_dir: String::new(),
             callback_url: Some(CallbackEndpoint::parse("http://127.0.0.1/callback")?),
             generation_committed: None,
+            migration: None,
             scan_snapshot: None,
             callback: CallbackState::default(),
             pb_handle: None,

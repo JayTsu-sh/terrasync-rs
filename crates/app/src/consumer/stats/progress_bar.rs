@@ -613,6 +613,7 @@ impl ProgressBar {
             detail,
             is_final: false,
             generation_committed: None,
+            migration: None,
             final_stats: None,
             scan: None,
             callback_identity: None,

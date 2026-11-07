@@ -56,18 +56,54 @@ pub enum VerificationLevel {
 pub struct CopyContract {
     pub acl: bool,
     pub verification: VerificationLevel,
-    pub transfer: TransferMode,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct CopyRuntimeSettings {
+    pub transfer_mode: TransferMode,
+    pub scan_concurrency: usize,
+    pub copy_concurrency: usize,
+    pub block_size: Option<String>,
+    pub delta_size_threshold: Option<String>,
+    pub qos: Option<String>,
+    pub peak_qos_rate: f32,
+    pub iops: Option<u32>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct CopyRequestDescriptor {
     pub execution_id: String,
     pub binding: CopyBinding,
     pub source_cleanup: SourceCleanupPolicy,
     pub selection: CopySelection,
     pub contract: CopyContract,
+    pub runtime: CopyRuntimeSettings,
     pub filter_evaluated_at: i64,
     pub delete_target: bool,
+}
+
+impl CopyRequestDescriptor {
+    pub fn validate(&self) -> Result<()> {
+        for (field, value) in [
+            ("execution_id", self.execution_id.as_str()),
+            ("selection.definition_key", self.selection.definition_key.as_str()),
+            ("source.backend_kind", self.binding.source.backend_kind.as_str()),
+            ("source.namespace", self.binding.source.namespace.as_str()),
+            ("target.backend_kind", self.binding.target.backend_kind.as_str()),
+            ("target.namespace", self.binding.target.namespace.as_str()),
+        ] {
+            if value.is_empty() || value.contains('\0') {
+                return Err(TaskModelError::InvalidMigrationDescriptor { field });
+            }
+        }
+        if self.runtime.scan_concurrency == 0 || self.runtime.copy_concurrency == 0 {
+            return Err(TaskModelError::InvalidMigrationDescriptor { field: "concurrency" });
+        }
+        if !self.runtime.peak_qos_rate.is_finite() || self.runtime.peak_qos_rate <= 0.0 {
+            return Err(TaskModelError::InvalidMigrationDescriptor { field: "peak_qos_rate" });
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -116,9 +152,10 @@ pub enum CopyGenerationPhase {
     Cancelled,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct CopyGeneration {
     pub sequence: u64,
+    pub revision: u64,
     pub request: CopyRequestDescriptor,
     pub plan: CopyGenerationPlan,
     pub phase: CopyGenerationPhase,
@@ -126,13 +163,36 @@ pub struct CopyGeneration {
     pub baseline_prepared: bool,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct MigrationReport {
+    pub generation: Option<u64>,
+    pub execution_id: String,
+    pub filter_evaluated_at: i64,
+    pub source_cleanup: SourceCleanupPolicy,
+    pub plan: CopyGenerationPlan,
+    pub phase: CopyGenerationPhase,
+    pub baseline_prepared: bool,
+}
+
+impl CopyGeneration {
+    pub fn report(&self) -> MigrationReport {
+        MigrationReport {
+            generation: Some(self.sequence),
+            execution_id: self.request.execution_id.clone(),
+            filter_evaluated_at: self.request.filter_evaluated_at,
+            source_cleanup: self.request.source_cleanup,
+            plan: self.plan.clone(),
+            phase: self.phase,
+            baseline_prepared: self.baseline_prepared,
+        }
+    }
+}
+
 impl CopyGenerationPlan {
     pub fn decide(
         request: &CopyRequestDescriptor, previous: Option<&CopyGeneration>, baseline_available: bool,
     ) -> Result<Self> {
-        if request.execution_id.is_empty() || request.selection.definition_key.is_empty() {
-            return Err(TaskModelError::InvalidMigrationDescriptor);
-        }
+        request.validate()?;
         if previous.is_some_and(|previous| previous.request.binding != request.binding) {
             return Err(TaskModelError::CopyBindingChanged);
         }

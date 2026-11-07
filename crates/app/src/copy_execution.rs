@@ -2,24 +2,36 @@
 
 use std::fs::File;
 
+use crate::migration_plan::MigrationPlan;
+use crate::storage_factory::StorageContext;
 use blake3::Hasher;
+use data_mover::{
+    DslTraversalFilter,
+    filter::{FilterExpression, parse_filter_expression},
+};
 use db::ClickHouseDatabase;
 use db::CopyGenerationStatus;
+use task_model::migration::{
+    CopyBinding, CopyContract, CopyRequestDescriptor, CopyRuntimeSettings, CopySelection, FileSelection,
+    NamespaceBinding, PathMapping, VerificationLevel,
+};
 use tokio::task::spawn_blocking;
 use tracing::info;
-use utils::app_config::ClickhouseConfig;
+use utils::app_config::{AppConfig, ClickhouseConfig};
 
 use crate::job_execution::JobLease;
 use crate::{
     config::SyncJobConfig,
     error::{AppError, Result},
-    storage_factory::{StorageRole, create_storage_for_role},
 };
 
 pub(crate) struct CopyLease {
     _guard: JobLease,
 }
 
+#[cfg(test)]
+#[path = "copy_plan_tests.rs"]
+mod plan_tests;
 #[cfg(test)]
 #[path = "copy_request_tests.rs"]
 mod request_tests;
@@ -31,72 +43,107 @@ impl CopyLease {
     }
 }
 
-pub(crate) async fn begin_copy_catalogue(
-    database: &ClickHouseDatabase, job: &SyncJobConfig, block_size: Option<usize>,
-) -> Result<()> {
-    // 身份不包含凭据；恢复计划变化必须在任何 payload 或回标前被拒绝。
-    let source = create_storage_for_role(
-        &job.src_path,
-        block_size.map(|value| value as u64),
-        false,
-        StorageRole::Source,
-    )
-    .await?;
-    let target = create_storage_for_role(
-        &job.dest_path,
-        block_size.map(|value| value as u64),
-        true,
-        StorageRole::Destination,
-    )
-    .await?;
-    let source = source.storage().identity();
-    let target_identity = target.storage().identity();
-    let history = target.storage().staged_destination()?.keeps_history().await?;
-    let list_digest = if let Some(path) = job.file_list.clone() {
+pub(crate) async fn compile_copy_request(
+    job: &SyncJobConfig, source: &StorageContext, target: &StorageContext, metadata: &MigrationPlan,
+    config: &AppConfig, execution_id: String,
+) -> Result<CopyRequestDescriptor> {
+    let include = job.r#match.as_deref().map(parse_filter_expression).transpose()?;
+    let exclude = job.exclude.as_deref().map(parse_filter_expression).transpose()?;
+    let relative_time = include
+        .iter()
+        .chain(exclude.iter())
+        .any(FilterExpression::has_relative_time_condition);
+    if job.file_list.is_some()
+        && (include.is_some() || exclude.is_some() || job.packaged || !metadata.scope.latest_version_only)
+    {
+        return Err(AppError::ConfigError(
+            "文件清单暂不支持同时使用过滤、打包或历史目标；已拒绝，避免扩大选择或遗漏历史".into(),
+        ));
+    }
+    let native_filter = DslTraversalFilter::new(include, exclude);
+    let file_list = if let Some(path) = job.file_list.clone() {
         Some(
-            spawn_blocking(move || -> Result<String> {
+            spawn_blocking(move || -> Result<FileSelection> {
                 let mut digest = Hasher::new();
-                digest.update_reader(File::open(path)?)?;
-                Ok(digest.finalize().to_hex().to_string())
+                digest.update_reader(File::open(&path)?)?;
+                Ok(FileSelection {
+                    path,
+                    digest: digest.finalize().to_hex().to_string(),
+                })
             })
             .await??,
         )
     } else {
         None
     };
-    let request_key = blake3::hash(&serde_json::to_vec(&(
-        source.kind().as_str(),
-        source.stable_id(),
-        target_identity.kind().as_str(),
-        target_identity.stable_id(),
-        history,
-        &job.r#match,
-        &job.exclude,
-        &job.file_list,
-        job.packaged,
-        job.package_depth,
-        job.enable_acl,
-        job.enable_integrity_check,
-        job.transfer_mode,
-        list_digest,
-    ))?)
-    .to_hex()
-    .to_string();
-    let status = database
-        .begin_copy_generation(&request_key, job.source_cleanup.retains_source())
-        .await?;
-    if status == CopyGenerationStatus::Recovering && history {
+    let mut definition = Hasher::new();
+    definition.update(b"terrasync/copy-selection/v1\0");
+    definition.update(native_filter.selection_key());
+    definition.update(&[u8::from(file_list.is_some())]);
+    if let Some(list) = &file_list {
+        definition.update(list.digest.as_bytes());
+    }
+    let namespace = |storage: &StorageContext| {
+        let identity = storage.storage().identity();
+        NamespaceBinding {
+            backend_kind: identity.kind().as_str().into(),
+            namespace: identity.stable_id().into(),
+        }
+    };
+    Ok(CopyRequestDescriptor {
+        execution_id,
+        binding: CopyBinding {
+            source: namespace(source),
+            target: namespace(target),
+            target_history: !metadata.scope.latest_version_only,
+            mapping: if job.packaged {
+                PathMapping::Packaged {
+                    depth: job.package_depth,
+                }
+            } else {
+                PathMapping::Relative
+            },
+        },
+        source_cleanup: job.source_cleanup,
+        selection: CopySelection {
+            include: job.r#match.clone(),
+            exclude: job.exclude.clone(),
+            file_list,
+            definition_key: definition.finalize().to_hex().to_string(),
+            relative_time,
+        },
+        contract: CopyContract {
+            acl: job.enable_acl,
+            verification: if job.enable_integrity_check {
+                VerificationLevel::Full
+            } else {
+                VerificationLevel::Quick
+            },
+        },
+        runtime: CopyRuntimeSettings {
+            transfer_mode: job.transfer_mode,
+            scan_concurrency: job.concurrency.unwrap_or(config.scan.concurrency),
+            copy_concurrency: job.concurrency.unwrap_or(config.sync.concurrency),
+            block_size: job.block_size.clone(),
+            delta_size_threshold: job.delta_size_threshold.clone(),
+            qos: job.qos.clone(),
+            peak_qos_rate: job.peak_qos_rate,
+            iops: job.iops,
+        },
+        filter_evaluated_at: metadata.filter_time_anchor,
+        delete_target: job.delete_target,
+    })
+}
+
+pub(crate) async fn begin_copy_catalogue(database: &ClickHouseDatabase, request: &CopyRequestDescriptor) -> Result<()> {
+    let status = database.begin_copy_generation(request).await?;
+    if status == CopyGenerationStatus::Recovering && request.binding.target_history {
         return Err(AppError::ConfigError(
             "版本化目标的上轮发布确认尚待对账，保留已复制版本和全部源历史，禁止盲目重放".into(),
         ));
     }
-    if status == CopyGenerationStatus::Recovering && job.file_list.is_some() {
-        return Err(AppError::ConfigError(
-            "文件清单复制未完成，不支持改用完整目录自动续作；请核对未完成条目".into(),
-        ));
-    }
     if status == CopyGenerationStatus::Recovering {
-        info!("Continuing failed full migration with an incremental scan over confirmed copy facts");
+        info!("Continuing failed migration with a fresh incremental scan over confirmed copy facts");
     }
     Ok(())
 }

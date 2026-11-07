@@ -130,6 +130,7 @@ mod tests {
             job_dir: String::new(),
             callback_url: None,
             generation_committed: None,
+            migration: None,
             scan_snapshot: None,
             callback: Default::default(),
             pb_handle: None,

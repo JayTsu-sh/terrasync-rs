@@ -1,4 +1,5 @@
 //! One task's catalogue coordination. Only explicit catalogue clones share this state.
+use task_model::migration::CopyGeneration;
 use tokio::sync::{Mutex, MutexGuard};
 
 #[derive(Default)]
@@ -6,9 +7,8 @@ pub(super) struct ScanGenerationLifecycle {
     pub working: Option<u8>,
     pub committed: bool,
     pub copy_recovery: bool,
-    pub copy_request_key: Option<String>,
     pub copy_execution_id: Option<String>,
-    pub copy_source_reserved: bool,
+    pub copy_generation: Option<CopyGeneration>,
 }
 
 #[derive(Default)]

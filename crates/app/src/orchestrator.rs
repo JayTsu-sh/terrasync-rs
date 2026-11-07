@@ -3,7 +3,6 @@
 //! SyncOrchestrator 封装 sync/incremental_sync 的核心逻辑，
 //! 通过 Transport 抽象层连接 Sender 和 Receiver，支持单进程和双进程两种模式。
 
-use crate::file_copy::namespace as copy_namespace;
 use crate::file_copy::selection::SkipTracker;
 use crate::file_copy::transfer as copy_transfer;
 // 标准库
@@ -38,7 +37,11 @@ use data_mover::qos::QosManager;
 use db::ClickHouseDatabase;
 use db::{self, INCREMENTAL_SCAN_TABLE_BASE_NAME};
 use futures::FutureExt;
-use task_model::{ChangeKind, EntryChange, ErrorEvent, StorageEntryMessage};
+use task_model::migration::{
+    CopyGenerationPhase, CopyGenerationPlan, CopyRequestDescriptor, MigrationMode, MigrationReason, MigrationReport,
+    TargetCleanupPolicy,
+};
+use task_model::{ChangeKind, EntryChange, ErrorEvent, StorageEntryMessage, TargetRetention, TargetRetentionReason};
 use tokio::sync::Semaphore;
 use tokio::task::JoinHandle;
 use tracing::{Instrument, error, info, info_span, trace, warn};
@@ -52,7 +55,7 @@ use crate::broadcast::{BroadcastForwarder, DEFAULT_CHANNEL_CAPACITY};
 use crate::config::{JobType, SyncJobConfig, initialize_consumer_config, initialize_scan_config};
 use crate::consumer::ConsumerManager;
 use crate::copy_completion;
-use crate::copy_execution::{CopyLease, begin_copy_catalogue};
+use crate::copy_execution::{CopyLease, begin_copy_catalogue, compile_copy_request};
 use crate::error::{AppError, Result};
 use crate::file_copy::VersionFailureContext;
 #[cfg(feature = "license")]
@@ -68,7 +71,7 @@ use crate::sync::check_admin_privileges;
 use crate::sync::{
     ResumeOpts, StoragePair, parse_size, process_entry, process_metadata_only_entry, process_versioned_entry,
 };
-use crate::sync_catalog::{batch_processing_to_generate_message, determine_sync_type};
+use crate::sync_catalog::batch_processing_to_generate_message;
 use crate::target_absence::SourceAbsenceCheck;
 use crate::task_stream::finish_phase;
 use crate::{dir_walker, tar_pack};
@@ -231,14 +234,23 @@ enum SyncMode {
 pub struct SyncOrchestrator {
     config: SyncJobConfig,
     mode: SyncMode,
+    #[cfg(test)]
+    filter_time: Option<i64>,
 }
 
 impl SyncOrchestrator {
+    #[cfg(test)]
+    pub(crate) fn with_filter_time(mut self, epoch: i64) -> Self {
+        self.filter_time = Some(epoch);
+        self
+    }
     /// 创建单进程模式的编排器
     pub fn new_local(config: SyncJobConfig) -> Self {
         Self {
             config,
             mode: SyncMode::Local,
+            #[cfg(test)]
+            filter_time: None,
         }
     }
 
@@ -257,6 +269,8 @@ impl SyncOrchestrator {
                 tls_server_cert,
                 auth_token,
             },
+            #[cfg(test)]
+            filter_time: None,
         }
     }
 
@@ -301,6 +315,13 @@ impl SyncOrchestrator {
             Some(error) => Err(error),
             None => self.run_local_prepared(&app_config, &mut consumers).await,
         };
+        consumers
+            .finish_unpersisted_migration(if result.is_ok() {
+                CopyGenerationPhase::Completed
+            } else {
+                CopyGenerationPhase::Failed
+            })
+            .await;
         if let Err(error) = &result {
             consumers.record_task_error(error).await;
         }
@@ -316,7 +337,7 @@ impl SyncOrchestrator {
                 "Packaged sync supports only Atomic mode; use --in-place".into(),
             ));
         }
-        let observation_plan = {
+        let (observation_plan, request) = {
             let destination = create_storage_for_role(&c.dest_path, None, true, StorageRole::Destination).await?;
             let source = create_storage_for_role(&c.src_path, None, false, StorageRole::Source).await?;
             if !c.source_cleanup.retains_source() && source.storage().identity() == destination.storage().identity() {
@@ -324,8 +345,25 @@ impl SyncOrchestrator {
             }
             copy_transfer::validate_transfer_mode(&destination, c.transfer_mode)?;
             let plan = MigrationPlan::compile(&source, &destination, c.enable_acl).await?;
+            #[cfg(test)]
+            let plan = {
+                let mut plan = plan;
+                if let Some(epoch) = self.filter_time {
+                    plan.filter_time_anchor = epoch;
+                }
+                plan
+            };
             plan.log();
-            Some(plan)
+            let request = compile_copy_request(
+                c,
+                &source,
+                &destination,
+                &plan,
+                app_config,
+                consumers.copy_attempt_id().await?,
+            )
+            .await?;
+            (Some(plan), request)
         };
 
         // 模式选择与代次准备共用独占权，避免读取旧策略后被另一执行切换代次。
@@ -346,25 +384,104 @@ impl SyncOrchestrator {
         } else {
             None
         };
-        let scan_type = if let Some(database) = db_instance.as_ref() {
-            determine_sync_type(database).await?
+        let mut result = self
+            .run_planned_local(observation_plan, &request, app_config, consumers, db_instance.clone())
+            .await;
+        if let Some(database) = db_instance {
+            let phase = if result.is_ok() {
+                CopyGenerationPhase::Completed
+            } else {
+                CopyGenerationPhase::Failed
+            };
+            let finalization = database.finish_copy_generation(phase).await;
+            if let Ok(generation) = database.current_copy_generation().await {
+                consumers.set_migration_report(generation.report()).await;
+                if let Err(source) = result {
+                    result = match consumers
+                        .record_target_retention_range(
+                            TargetRetentionReason::IncompleteEnumeration,
+                            "本轮迁移未完整收尾，未展开的旧目标范围全部保留，未逐项确认源缺失".into(),
+                        )
+                        .await
+                    {
+                        Ok(()) => Err(source),
+                        Err(reporting) => Err(AppError::MigrationReportingFailed {
+                            source: Box::new(source),
+                            reporting: Box::new(reporting),
+                        }),
+                    };
+                }
+            }
+            return match (result, finalization) {
+                (Ok(()), Ok(())) => Ok(()),
+                (Err(source), Ok(())) => Err(source),
+                (Ok(()), Err(source)) => Err(source.into()),
+                (Err(source), Err(finalization)) => Err(AppError::MigrationFinalizationFailed {
+                    source: Box::new(source),
+                    finalization,
+                }),
+            };
+        }
+        result
+    }
+
+    async fn run_planned_local(
+        &self, observation_plan: Option<MigrationPlan>, request: &CopyRequestDescriptor, app_config: &AppConfig,
+        consumers: &mut ConsumerManager, database: Option<ClickHouseDatabase>,
+    ) -> Result<()> {
+        let report = if let Some(database) = &database {
+            begin_copy_catalogue(database, request).await?;
+            database.current_copy_generation().await?.report()
         } else {
-            ScanType::Full
+            MigrationReport {
+                generation: None,
+                execution_id: request.execution_id.clone(),
+                filter_evaluated_at: request.filter_evaluated_at,
+                source_cleanup: request.source_cleanup,
+                plan: CopyGenerationPlan::decide(request, None, false)?,
+                phase: CopyGenerationPhase::Prepared,
+                baseline_prepared: false,
+            }
         };
-
-        info!("SyncOrchestrator: determined scan_type={}", scan_type);
-
-        match scan_type {
-            // 任务边界隔离管线状态机的布局，避免继续嵌套到 CLI／Web 入口。
-            ScanType::Full => {
-                self.run_sync(observation_plan, app_config, consumers)
+        info!(mode=?report.plan.mode, target_cleanup=?report.plan.target_cleanup, reasons=?report.plan.reasons,
+            filter_evaluated_at=report.filter_evaluated_at, generation=?report.generation, "Migration execution plan");
+        consumers.set_migration_report(report.clone()).await;
+        if report.plan.target_cleanup == TargetCleanupPolicy::Preserve {
+            let reason = if !request.source_cleanup.retains_source()
+                || report.plan.reasons.contains(&MigrationReason::PreviousSourceDeleted)
+            {
+                TargetRetentionReason::SourceCleanupPolicy
+            } else if request.selection.is_filtered()
+                || request.selection.relative_time
+                || report.plan.reasons.contains(&MigrationReason::SelectionChanged)
+            {
+                TargetRetentionReason::FilteredSelection
+            } else {
+                TargetRetentionReason::BaselineUnavailable
+            };
+            consumers
+                .record_target_retention_range(
+                    reason,
+                    format!("本轮采用 Preserve，原因 {:?}；未展开的旧目标范围全部保留，不逐项回源查询，也不推断缺失删除或破坏性 rename", report.plan.reasons),
+                )
+                .await?;
+        }
+        // 任务边界隔离管线状态机的布局，避免继续嵌套到 CLI／Web 入口。
+        match report.plan.mode {
+            MigrationMode::Full => {
+                self.run_sync(observation_plan, app_config, consumers, database)
                     .boxed_local()
                     .await
             }
-            ScanType::Incremental => {
-                self.run_incremental_sync(observation_plan, app_config, consumers)
-                    .boxed_local()
-                    .await
+            MigrationMode::Incremental => {
+                self.run_incremental_sync(
+                    observation_plan,
+                    app_config,
+                    consumers,
+                    database.ok_or_else(|| AppError::ConfigError("增量迁移需要已准备的复制目录".into()))?,
+                )
+                .boxed_local()
+                .await
             }
         }
     }
@@ -372,6 +489,7 @@ impl SyncOrchestrator {
     /// 全量同步 — 通过 transport 连接 sender workers 和 receiver tasks
     async fn run_sync(
         &self, observation_plan: Option<MigrationPlan>, app_config: &AppConfig, consumer_manager: &mut ConsumerManager,
+        database: Option<ClickHouseDatabase>,
     ) -> Result<()> {
         let c = &self.config;
 
@@ -428,16 +546,6 @@ impl SyncOrchestrator {
             app_config,
             c.progress_callback_url.clone(),
         )?);
-
-        let database = if consumer_config.db_config.enabled {
-            let database: ClickHouseDatabase =
-                ClickHouseDatabase::connect(&consumer_config.db_config.clickhouse, &c.job_id).await?;
-            database.initialize().await?;
-            begin_copy_catalogue(&database, c, block_size).await?;
-            Some(database)
-        } else {
-            None
-        };
 
         // 先建立枚举，再启动后台消费者；连接失败时没有待收尾的 worker。
         let walkdir_iter = dir_walker::walkdir(scan_config).await?;
@@ -785,6 +893,7 @@ impl SyncOrchestrator {
     ///   喂给同一组 consumers（`DatabaseConsumer` 自动完成 incremental 表写入 + base 表修正）
     async fn run_incremental_sync(
         &self, observation_plan: Option<MigrationPlan>, app_config: &AppConfig, consumer_manager: &mut ConsumerManager,
+        database: ClickHouseDatabase,
     ) -> Result<()> {
         let c = &self.config;
 
@@ -823,7 +932,7 @@ impl SyncOrchestrator {
             &c.exclude,
             c.concurrency.unwrap_or(app_config.scan.concurrency),
             false,
-            &None,
+            &c.file_list,
             c.packaged,
             c.package_depth,
         )?;
@@ -842,14 +951,9 @@ impl SyncOrchestrator {
             c.progress_callback_url.clone(),
         )?);
 
-        let database: ClickHouseDatabase =
-            ClickHouseDatabase::connect(&consumer_config.db_config.clickhouse, &c.job_id).await?;
-
-        if let Err(e) = database.create_table(INCREMENTAL_SCAN_TABLE_BASE_NAME).await {
-            return Err(AppError::DatabaseError(e));
-        }
-
-        begin_copy_catalogue(&database, c, block_size).await?;
+        database.create_table(INCREMENTAL_SCAN_TABLE_BASE_NAME).await?;
+        let preserve_target =
+            database.current_copy_generation().await?.plan.target_cleanup == TargetCleanupPolicy::Preserve;
 
         let batch_size = consumer_config.db_config.batch_size as usize;
 
@@ -1045,6 +1149,19 @@ impl SyncOrchestrator {
                                 }
                             }
                             StorageEntryMessage::Changed { ref entry, kind } => {
+                                if kind == ChangeKind::DirectoryMarkerRemoved {
+                                    bc.broadcast(StorageEntryMessage::TargetPreserved {
+                                        retention: Box::new(TargetRetention::entry(
+                                            entry.entry.path(),
+                                            TargetRetentionReason::SourceDeletionUnconfirmed,
+                                        )),
+                                        reason:
+                                            "目录对象缺失尚无独立的源缺失与目标归属证明，保留目标标记对象及确认事实"
+                                                .into(),
+                                    })
+                                    .await?;
+                                    continue;
+                                }
                                 // MetadataOnly：chmod/chown 变更，跳过 copy_file 只同步属性
                                 let result = if entry.entry.history().is_some() {
                                     process_versioned_entry(
@@ -1061,10 +1178,6 @@ impl SyncOrchestrator {
                                         EntryChange::Changed(kind),
                                     )
                                     .await
-                                } else if kind == ChangeKind::DirectoryMarkerRemoved {
-                                    copy_namespace::remove_directory_marker(dest.storage(), &entry.entry)
-                                        .await
-                                        .map_err(AppError::from)
                                 } else if kind == ChangeKind::MetadataOnly {
                                     process_metadata_only_entry(
                                         &entry.entry,
@@ -1318,28 +1431,31 @@ impl SyncOrchestrator {
                 )
                 .await?,
             );
-            let src_storage_phase_b = Arc::new(
-                create_storage_for_role(&c.src_path, block_size.map(|s| s as u64), false, StorageRole::Source).await?,
-            );
+            if !preserve_target {
+                let src_storage_phase_b = Arc::new(
+                    create_storage_for_role(&c.src_path, block_size.map(|s| s as u64), false, StorageRole::Source)
+                        .await?,
+                );
 
-            Self::apply_deletions_and_renames(
-                &database,
-                src_storage_phase_b.clone(),
-                dest_storage_phase_b.clone(),
-                is_source_reserved,
-                &broadcaster_b,
-                c.enable_integrity_check,
-                qos_manager.clone(),
-                bytes_tracker.clone(),
-                &c.job_id,
-                &c.job_dir,
-                c.transfer_mode,
-                SourceAbsenceCheck::new(
-                    Duration::from_secs(app_config.scan.operation_timeout_secs),
-                    Duration::from_secs(app_config.scan.recovery_window_secs),
-                ),
-            )
-            .await?;
+                Self::apply_deletions_and_renames(
+                    &database,
+                    src_storage_phase_b.clone(),
+                    dest_storage_phase_b.clone(),
+                    is_source_reserved,
+                    &broadcaster_b,
+                    c.enable_integrity_check,
+                    qos_manager.clone(),
+                    bytes_tracker.clone(),
+                    &c.job_id,
+                    &c.job_dir,
+                    c.transfer_mode,
+                    SourceAbsenceCheck::new(
+                        Duration::from_secs(app_config.scan.operation_timeout_secs),
+                        Duration::from_secs(app_config.scan.recovery_window_secs),
+                    ),
+                )
+                .await?;
+            }
 
             Ok(dest_storage_phase_b)
         }

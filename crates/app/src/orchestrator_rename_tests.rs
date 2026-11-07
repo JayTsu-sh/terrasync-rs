@@ -1,7 +1,9 @@
-//! 真实目录查询与 Local 命名空间：搬迁跳过反向删除，但必须执行 rename。
+//! 真实目录查询与 Local 命名空间：无过滤保留源迁移确认缺失后执行 rename。
+use crate::migration_fixtures::request;
 use crate::target_absence::SourceAbsenceCheck;
 use std::sync::Arc;
 use std::time::Duration;
+use task_model::migration::CopyGenerationPhase;
 
 use clickhouse::Client;
 use data_mover::model::{BackendKind, EntryKind};
@@ -19,11 +21,12 @@ use crate::file_copy::metadata::set_entry_metadata;
 use crate::observed_fixtures::observation;
 use crate::storage_factory::{CreateStorageOptions, create_storage};
 
-async fn apply_case(config: &ClickHouseConfig, reserved: bool, directory: bool) -> Result<()> {
+async fn apply_case(config: &ClickHouseConfig, directory: bool) -> Result<()> {
+    let reserved = true;
     let job = format!("rename_{reserved}_{directory}");
     let database = ClickHouseDatabase::connect(config, &job).await?;
     database.initialize().await?;
-    database.begin_copy_generation("same-plan", true).await?;
+    database.begin_copy_generation(&request("same-plan", true)).await?;
     let source_root = tempdir()?;
     let target_root = tempdir()?;
     if directory {
@@ -60,7 +63,9 @@ async fn apply_case(config: &ClickHouseConfig, reserved: bool, directory: bool) 
     set_entry_metadata(target.storage(), &entry("old")).await?;
     database.batch_insert_base_record(&[entry("old").into()]).await?;
     database.commit_scan_generation().await?;
-    database.begin_copy_generation("same-plan", reserved).await?;
+    database.finish_copy_generation(CopyGenerationPhase::Completed).await?;
+    let database = database.new_execution_scope();
+    database.begin_copy_generation(&request("same-plan", reserved)).await?;
     assert!(
         database
             .compare_catalogue_batch(&[entry("new").into()], ComparisonMode::AwaitCopyAcknowledgement)
@@ -104,7 +109,7 @@ async fn apply_case(config: &ClickHouseConfig, reserved: bool, directory: bool) 
 
 #[tokio::test]
 #[ignore = "requires owned ClickHouse pair from run-notification-archive-local.py --rename-generations"]
-async fn real_incremental_move_still_applies_rename_without_early_source_purge() -> Result<()> {
+async fn real_retained_incremental_applies_confirmed_rename() -> Result<()> {
     let dsn = std::env::var("LAB_COPY_GENERATION_DSN")
         .map_err(|_| AppError::ConfigError("LAB_COPY_GENERATION_DSN must select an isolated server".into()))?;
     let admin = Client::default().with_url(&dsn).with_user("default");
@@ -134,10 +139,8 @@ async fn real_incremental_move_still_applies_rename_without_early_source_purge()
             .await
             .map_err(DatabaseError::from)?;
         let result: Result<()> = async {
-            for reserved in [false, true] {
-                for directory in [false, true] {
-                    apply_case(&config, reserved, directory).await?;
-                }
+            for directory in [false, true] {
+                apply_case(&config, directory).await?;
             }
             Ok(())
         }

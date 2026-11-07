@@ -3,7 +3,7 @@ use clickhouse::Client;
 use db::{ClickHouseConfig, ClickHouseDatabase, DatabaseError};
 use std::time::{Duration, Instant};
 use std::{path::Path, sync::Arc};
-use task_model::SourceCleanupPolicy;
+use task_model::{SourceCleanupPolicy, TaskModelError};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpStream,
@@ -12,14 +12,32 @@ use tokio::{
 use utils::app_config::{AppConfig, ClickHouseMode};
 use uuid::Uuid;
 
-use super::{begin_copy_catalogue, tests::job};
+use super::{begin_copy_catalogue, compile_copy_request, tests::job};
 use crate::callback::CallbackEndpoint;
+use crate::config::SyncJobConfig;
 use crate::consumer::stats::delivery::FinalCallbackReport;
 use crate::consumer::stats::{ProgressDetail, ProgressReport};
 use crate::error::{AppError, Result};
+use crate::migration_plan::MigrationPlan;
 use crate::orchestrator::SyncOrchestrator;
 use crate::scan::observe_path;
 use crate::storage_factory::{StorageRole, create_storage_for_role};
+
+async fn begin_job_copy(database: &ClickHouseDatabase, job: &SyncJobConfig) -> Result<()> {
+    let source = create_storage_for_role(&job.src_path, None, false, StorageRole::Source).await?;
+    let target = create_storage_for_role(&job.dest_path, None, true, StorageRole::Destination).await?;
+    let plan = MigrationPlan::compile(&source, &target, job.enable_acl).await?;
+    let request = compile_copy_request(
+        job,
+        &source,
+        &target,
+        &plan,
+        &AppConfig::fetch()?,
+        Uuid::new_v4().to_string(),
+    )
+    .await?;
+    begin_copy_catalogue(database, &request).await
+}
 
 async fn frozen_catalogue(config: &ClickHouseConfig) -> Result<()> {
     let source = tempfile::tempdir()?;
@@ -29,8 +47,6 @@ async fn frozen_catalogue(config: &ClickHouseConfig) -> Result<()> {
     command.job_id = "frozen_command".into();
     command.src_path = source.path().to_string_lossy().into_owned();
     command.dest_path = target.path().to_string_lossy().into_owned();
-    let database = ClickHouseDatabase::connect(config, &command.job_id).await?;
-    database.initialize().await?;
     // 每轮刻意让全局值与请求相反；包括尚未提交的失败代次。
     for policy in [
         SourceCleanupPolicy::Retain,
@@ -39,7 +55,8 @@ async fn frozen_catalogue(config: &ClickHouseConfig) -> Result<()> {
     ] {
         command.source_cleanup = policy;
         AppConfig::override_with(|global| global.sync.is_source_reserved = !policy.retains_source())?;
-        begin_copy_catalogue(&database, &command, None).await?;
+        let database = ClickHouseDatabase::connect(config, &command.job_id).await?;
+        begin_job_copy(&database, &command).await?;
         let observed = ClickHouseDatabase::connect(config, &command.job_id).await?;
         assert_eq!(
             observed.copy_catalogue_source_reserved().await?,
@@ -163,7 +180,7 @@ async fn local_rejections(config: &ClickHouseConfig) -> Result<()> {
             }
             _ => {
                 database.initialize().await?;
-                begin_copy_catalogue(&database, &command, None).await?;
+                begin_job_copy(&database, &command).await?;
                 let storage = create_storage_for_role(&command.src_path, None, false, StorageRole::Source).await?;
                 database
                     .batch_insert_base_record(&[Arc::new(observe_path(storage.storage(), Path::new("payload")).await?)])
@@ -204,7 +221,9 @@ async fn local_rejections(config: &ClickHouseConfig) -> Result<()> {
             _ => {
                 assert!(matches!(
                     result,
-                    Err(AppError::DatabaseError(DatabaseError::ConfigError(_)))
+                    Err(AppError::DatabaseError(DatabaseError::MigrationPolicy(
+                        TaskModelError::CopyBindingChanged
+                    )))
                 ));
                 assert_eq!(database.get_count("base").await?, 1);
                 assert_eq!(database.copy_catalogue_source_reserved().await?, Some(true));
@@ -250,7 +269,7 @@ async fn local_rejections(config: &ClickHouseConfig) -> Result<()> {
     Ok(())
 }
 
-async fn startup_fault(mode: &str) -> Result<()> {
+pub(super) async fn startup_fault(mode: &str) -> Result<()> {
     let control = std::env::var("LAB_COPY_GENERATION_CONTROL")
         .map_err(|_| AppError::ConfigError("owned fault control required".into()))?;
     timeout(Duration::from_secs(1), async {
@@ -298,9 +317,14 @@ async fn local_pipeline_reports(config: &ClickHouseConfig) -> Result<()> {
     for row in rows {
         let archived: FinalCallbackReport = serde_json::from_str(&row)?;
         let report: ProgressReport = serde_json::from_str(&archived.payload_json)?;
-        assert!(report.is_final && report.diagnostics_complete);
+        assert!(report.is_final);
         assert_eq!(report.task_error_count, 0);
-        assert!(report.diagnostics.is_none());
+        if let Some(diagnostics) = &report.diagnostics {
+            assert!(!report.diagnostics_complete);
+            assert!(diagnostics.events.iter().all(|event| event.retention.is_some()));
+        } else {
+            assert!(report.diagnostics_complete);
+        }
         identities.push(archived.identity.attempt_id);
         match report.detail {
             ProgressDetail::Full {
@@ -374,7 +398,9 @@ async fn real_copy_requests_freeze_cleanup_and_report_preflight_rejections() -> 
             remote_rejection(&config, false).await?;
             remote_rejection(&config, true).await?;
             local_rejections(&config).await?;
-            local_pipeline_reports(&config).await
+            local_pipeline_reports(&config).await?;
+            super::plan_tests::transitions(&config).await?;
+            super::plan_tests::lifecycle_edges(&config).await
         }
         .await;
         let cleanup = admin

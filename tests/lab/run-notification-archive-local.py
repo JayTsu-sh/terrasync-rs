@@ -74,7 +74,7 @@ def run_isolated():
                 containers.append(container)
             print(f"isolated notification image={docker('inspect', containers[0], '--format', '{{.Image}}')}", flush=True)
             pid = docker("inspect", containers[0], "--format", "{{.State.Pid}}")
-            suite = [flag for flag in ("--copy-generations", "--rename-generations", "--retention-events", "--source-absence", "--request-policy") if flag in sys.argv]
+            suite = [flag for flag in ("--copy-generations", "--rename-generations", "--retention-events", "--source-absence", "--request-policy", "--copy-contracts") if flag in sys.argv]
             subprocess.run(["nsenter", "-t", pid, "-n", sys.executable, __file__, "--inside", *suite], cwd=ROOT, check=True)
         except BaseException:
             for container in containers:
@@ -97,7 +97,7 @@ def run_copy_generations():
 
         def do_GET(self):
             nonlocal state
-            if self.path not in ("/normal", "/disconnect", "/stall", "/startup_disconnect", "/startup_stall"):
+            if self.path not in ("/normal", "/disconnect", "/stall", "/startup_disconnect", "/startup_stall", "/reject_prepare"):
                 self.send_error(404)
                 return
             with guard:
@@ -123,6 +123,13 @@ def run_copy_generations():
                 body = self.rfile.read(int(self.headers.get("Content-Length", "0")))
             with guard:
                 fault = state
+                # 接受记录已入库后，仅拒绝本次基线准备，不阻塞后续终态归档。
+                if fault == "reject_prepare":
+                    query = urllib.parse.unquote(self.path).encode() + body
+                    if b"ALTER TABLE" in query and b"copy_sequence <" in query:
+                        state = "normal"
+                    else:
+                        fault = "normal"
                 # 启动探测持续失败；进入通知归档后恢复数据库，单独验证最终通知链路。
                 if fault.startswith("startup_"):
                     if "notifications_" in urllib.parse.unquote(self.path) or b"notifications_" in body:
@@ -131,6 +138,9 @@ def run_copy_generations():
                         fault = fault.removeprefix("startup_")
             if fault == "disconnect":
                 self.close_connection = True
+                return
+            if fault == "reject_prepare":
+                self.send_error(403, "owned prepare rejection")
                 return
             if fault == "stall":
                 release.wait(10)
@@ -164,6 +174,15 @@ def run_copy_generations():
     environment["LAB_COPY_GENERATION_DSN"] = f"http://{address}"
     environment["LAB_COPY_GENERATION_CONTROL"] = address
     try:
+        if "--copy-contracts" in sys.argv:
+            environment["LAB_CATALOGUE_SINGLE"] = "1"
+            environment["LAB_CLICKHOUSE_DSN"] = environment["LAB_COPY_GENERATION_DSN"]
+            subprocess.run([
+                "cargo", "test", "--offline", "--locked", "-p", "db", "--lib",
+                "catalogue::catalogue_tests", "--", "--ignored", "--nocapture",
+                "--test-threads=1", "--skip", "cluster_catalogue_",
+            ], cwd=ROOT, env=environment, check=True)
+            return
         if "--request-policy" in sys.argv:
             run_request_policy(environment)
             return
@@ -184,7 +203,7 @@ def run_copy_generations():
             ], cwd=ROOT, env=environment, check=True)
             subprocess.run([
                 "cargo", "test", "--offline", "--locked", "-p", "app", "--lib",
-                "real_incremental_move_still_applies_rename_without_early_source_purge",
+                "real_retained_incremental_applies_confirmed_rename",
                 "--", "--ignored", "--nocapture",
             ], cwd=ROOT, env=environment, check=True)
             return
@@ -226,17 +245,43 @@ def run_request_policy(environment):
             "real_copy_requests_freeze_cleanup_and_report_preflight_rejections",
             "--", "--ignored", "--nocapture",
         ], cwd=ROOT, env=environment, check=True)
-        final = [report for report in reports if report["is_final"]]
+        rejected = [report for report in reports if report["job_id"].startswith(("local_preflight_", "remote_policy_"))]
+        final = [report for report in rejected if report["is_final"]]
         summaries = [report for report in final if not report.get("diagnostics")]
         assert len(summaries) == 18, reports
         assert all(report["task_error_count"] == 1 and report["diagnostics_complete"] for report in summaries), summaries
         assert all(report["detail"].get("new_count", 0) == 0 for report in final), final
-        events = [event for report in reports for event in (report.get("diagnostics") or {}).get("events", [])]
+        events = [event for report in rejected for event in (report.get("diagnostics") or {}).get("events", [])]
         assert len(events) == 18, events
         assert sum("双进程模式尚未提供" in event["message"] for event in events) == 2, events
         assert sum("Invalid remote address" in event["message"] for event in events) == 2, events
         local = [report for report in summaries if report["job_id"].startswith("local_preflight_")]
         assert len(local) == 14, local
+        planned = [report for report in reports if report["job_id"].startswith("plan_window_")
+                   and report["is_final"] and not report.get("diagnostics")]
+        successful = [report for report in planned if report["task_error_count"] == 0]
+        bindings = [report for report in planned if report["task_error_count"] == 1]
+        assert len(successful) == 48 and len(bindings) == 6, planned
+        expected_modes = ["full", "incremental", "incremental", "incremental", "incremental", "full", "full", "incremental"]
+        expected_bytes = [1, 0, 1, 0, 0, 1, 0, 0]
+        for report in successful:
+            migration = report["migration"]
+            position = migration["generation"] - 1
+            assert migration["plan"]["mode"] == expected_modes[position], report
+            assert migration["plan"]["target_cleanup"] == "preserve", report
+            assert migration["phase"] == "completed" and report["diagnostics_complete"], report
+            assert report["detail"]["transferred_bytes"] == expected_bytes[position], report
+        print("independent generation-plan HTTP inspection successful_runs=48 binding_rejections=6 include_exclude_combined=true plans_and_data_bytes_match=true", flush=True)
+        edges = [report for report in reports if report["job_id"].startswith("plan_edge_")
+                 and report["is_final"] and not report.get("diagnostics")]
+        assert len(edges) == 16 and all(report["diagnostics_complete"] for report in edges), edges
+        failed = [report for report in edges if report["task_error_count"] == 1]
+        assert len(failed) == 6, failed
+        accepted_failures = [report for report in failed if report.get("migration")]
+        assert len(accepted_failures) == 2, failed
+        assert all(report["migration"]["phase"] == "failed"
+                   and not report["migration"]["baseline_prepared"] for report in accepted_failures), accepted_failures
+        print("independent lifecycle HTTP inspection prepare_failure=2 mirror_conflict=2 binding_after_base_drop=2 recovered_successful_runs=10", flush=True)
         serialized = json.dumps(reports)
         assert "policy-secret" not in serialized and "policy-access" not in serialized and "policy auth secret" not in serialized, serialized
         print("independent request-policy HTTP inspection deployments=2 rejections=18 local_preflight=14 task_errors_each=1 HTTP_204=accepted credentials=redacted", flush=True)
@@ -293,7 +338,7 @@ def run_inside():
             time.sleep(0.2)
         else:
             raise RuntimeError(f"ClickHouse readiness timed out on port {port}")
-    if any(flag in sys.argv for flag in ("--copy-generations", "--rename-generations", "--retention-events", "--source-absence", "--request-policy")):
+    if any(flag in sys.argv for flag in ("--copy-generations", "--rename-generations", "--retention-events", "--source-absence", "--request-policy", "--copy-contracts")):
         run_copy_generations()
         return
     environment = dict(os.environ)

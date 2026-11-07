@@ -98,11 +98,23 @@ The same suite also leaves three compared generations uncommitted, commits a
 selected subset, and deliberately makes an unselected old row's binary state
 collide with the next working state. Only the currently selected unchanged file
 is source-purged; outside files/directories remain, the unselected target directory
-mtime is unchanged, and no file retransmission is requested. This uses real
-catalogue selection batches and Local IO, not the pending window-selection planner.
+mtime is unchanged, and no file retransmission is requested. Preparation rebases
+old rows to C; execution identity still limits cleanup to the current selection.
+This component suite uses catalogue selection batches and Local IO. Actual window
+planning is exercised separately by `--request-policy`.
 These are catalogue/cleanup contract checks; they do not validate the pending
 change to delete before asynchronous database confirmation, the whole-job failure callback,
 version-history purge, six-replica topology or throughput/RSS targets.
+
+`python3 tests/lab/run-notification-archive-local.py --copy-contracts` runs nine
+additional catalogue contracts against an owned real Single deployment. It checks
+explicit execution scopes, accepted empty generations, binding rejection, pending
+rename acknowledgement after restart, ordered unconfirmed history versions,
+nullable ownership, duplicate observations and directory-marker intents. Fixtures
+establish a preceding generation explicitly; first Full preparation must not
+silently inherit rows written before any accepted copy request. This runner skips
+the separate six-replica topology tests and does not certify history publication
+replay in app, which remains guarded.
 
 `python3 tests/lab/run-notification-archive-local.py --retention-events` checks the
 existing source-deleting migration's target-preservation branch against real Single and
@@ -111,8 +123,8 @@ deterministic S3 history observations plus one directory produce two entry-level
 events, no delete/rename/error counts, and 21 preserved base rows. The HTTP receiver checks
 structured unknown-presence details; sender checks details cleared after receipt, cumulative
 count retained, and final reports still queryable in ClickHouse. S3 source history is a
-deterministic fixture, not a real S3 protocol run. This does not validate the pending relative
-window plan, source-presence probing, or whole-job throughput/RSS.
+deterministic fixture, not a real S3 protocol run. This component suite does not validate source-presence probing or whole-job
+throughput/RSS; actual window plans have separate request-policy coverage.
 
 `python3 tests/lab/run-notification-archive-local.py --request-policy` checks the
 task-owned SourceCleanupPolicy against owned Single and two-replica ClickHouse.
@@ -125,8 +137,8 @@ clear their delivered details, retain cumulative task errors and final reports i
 ClickHouse, redact storage credentials and a whitespace-containing auth token,
 and create no copy base. The process-level wrong-token QUIC case additionally
 requires a final task-error count and no plaintext token in stdout/stderr. This is
-preflight and notification evidence; it does not certify remote source deletion,
-the complete generation descriptor/selection plan, or the whole-job recovery budget.
+preflight and notification evidence; it does not certify remote source deletion
+or the whole-job recovery budget.
 The same suite now checks Local packaged-mode rejection, invalid filters, missing
 file lists and changed bindings before consumer startup. Rejections retain source
 bytes; changed bindings also retain the original target and base. Invalid database
@@ -142,6 +154,21 @@ There are 18 independently inspected rejected requests across both deployments,
 including 14 Local requests. Successful Local full and subsequent incremental
 runs verify actual target bytes, distinct execution identities, correct full/delta
 report kinds, and two archived final reports per deployment without a callback.
+
+The request suite also executes 48 successful Local migrations with include,
+exclude and combined relative-time predicates across both database deployments.
+Windows move out and back; only newly selected data transfers, outside facts and
+targets survive, unchanged selected sources can be deleted, and a previous
+source-deleting run forces the next run to full. Each actual mode, fixed filter
+time, preservation policy and transferred byte count is checked against both
+the HTTP callback and the separately queried final archive. Six changed-binding
+requests leave the accepted descriptor intact. Ten additional successful runs
+cover recovery after an accepted request's preparation is rejected with a real
+HTTP 403, loss of base without loss of binding, and source-deleting rename copying
+the new path while preserving the old target. Six rejected/failed lifecycle runs
+check preparation readiness, mirror conflicts and changed bindings after base
+removal. This is not a whole-job network/cancellation budget, asynchronous source
+purge, full version-history, distributed fencing, or throughput/RSS certification.
 
 `python3 tests/lab/run-notification-archive-local.py --source-absence` exercises
 incremental target reconciliation against owned Single and two-replica ClickHouse
@@ -162,9 +189,12 @@ verify its persisted state changed, inject a connection failure, and reopen with
 a new path observation for that same stable identity. It covers one, two and five interrupted rounds:
 committed state stays fixed, working state stays fixed, and the final rename resolves
 from the confirmed old target path. Occupied/swapped paths must copy before replacing
-confirmed facts; an already copied new target must not be overwritten by an older rename. A component case also runs real Local target
-rename for both source-retaining and source-deleting policies, keeping the source for
-the later cleanup stage. Source stable identities in these cases are deterministic
+confirmed facts; an already copied new target must not be overwritten by an older rename.
+A component case runs real Local target rename for an unfiltered source-retaining
+policy, keeping the source. Source-deleting plans preserve old targets instead;
+stable-identity file and directory observations must still produce copy work for
+the new path. The actual Local source-deleting path is covered by `--request-policy`.
+Source stable identities in the component cases are deterministic
 NFS-shaped observations; this does not claim a real NFS/CIFS source, whole-process
 SIGKILL, whole-job callback, or throughput/RSS validation. Local execution tests
 separately recover an already-moved but unrecorded target by copying current source

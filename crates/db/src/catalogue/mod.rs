@@ -11,6 +11,7 @@ use self::lifecycle::CatalogueLifecycle;
 mod comparison;
 mod connection;
 mod copy_generation;
+mod copy_runs;
 mod deletion;
 mod generation;
 mod layout;

@@ -51,6 +51,20 @@ impl Display for CopyStep {
 /// 应用程序的专用错误枚举
 #[derive(Error, Debug)]
 pub enum AppError {
+    #[error(transparent)]
+    MigrationPolicy(#[from] task_model::TaskModelError),
+    #[error("迁移失败: {source}; 代次收尾也失败: {finalization}")]
+    MigrationFinalizationFailed {
+        #[source]
+        source: Box<AppError>,
+        finalization: DatabaseError,
+    },
+    #[error("迁移失败: {source}; 保留目标的范围明细也未能记录: {reporting}")]
+    MigrationReportingFailed {
+        #[source]
+        source: Box<AppError>,
+        reporting: Box<AppError>,
+    },
     #[error("双进程模式尚未提供目标就绪后受保护删除源端的能力；已拒绝任务，未启动复制")]
     RemoteSourceCleanupUnavailable,
     #[error("Diagnostic processing stopped: {source}")]

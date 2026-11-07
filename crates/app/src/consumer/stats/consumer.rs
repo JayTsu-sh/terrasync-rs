@@ -16,6 +16,7 @@ use std::time::Duration;
 // 外部crate
 use data_mover::model::{EntryKind, ObservedEntry};
 use reqwest::redirect::Policy;
+use task_model::migration::MigrationReport;
 use task_model::observation::{EntryStatistics, ObservedScanEvent, ObservedView};
 use task_model::{RetentionScope, StorageEntryMessage};
 use tokio::sync::{Mutex, mpsc};
@@ -51,6 +52,7 @@ pub struct StatisticConsumer {
     pub callback_url: Option<CallbackEndpoint>,
     /// 纯增量扫描的 generation 是否成功提交；其他任务保持 `None`。
     pub generation_committed: Option<bool>,
+    pub migration: Option<MigrationReport>,
     pub scan_snapshot: Option<ScanSnapshot>,
     pub callback: CallbackState,
     /// progress bar display 线程句柄，`finalize()` join 以确保正常退出
@@ -267,6 +269,7 @@ impl StatisticConsumer {
         report.target_preserved_count = self.callback.target_preserved_count;
         report.task_error_count = self.callback.task_error_count;
         report.generation_committed = self.generation_committed;
+        report.migration = self.migration.clone();
         report.scan = snapshot.cloned();
         report.callback_identity = Some(self.callback.identity.clone());
         if snapshot.is_some() {
@@ -593,6 +596,7 @@ mod tests {
             job_dir: String::new(),
             callback_url: Some(CallbackEndpoint::parse(&format!("http://{address}/progress"))?),
             generation_committed: Some(false),
+            migration: None,
             pb_handle: None,
             scan_snapshot: None,
             callback: Default::default(),
@@ -648,6 +652,7 @@ mod tests {
             job_dir: String::new(),
             callback_url: None,
             generation_committed: Some(false),
+            migration: None,
             pb_handle: None,
             scan_snapshot: None,
             callback: Default::default(),

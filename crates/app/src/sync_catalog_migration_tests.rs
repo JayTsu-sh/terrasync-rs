@@ -1,4 +1,6 @@
 //! 源保留策略切换：未变化项可搬迁，已搬走的项不能反向删除目标。
+use crate::migration_fixtures::request;
+use task_model::migration::CopyGenerationPhase;
 
 use std::fs::{File, FileTimes};
 use std::os::unix::fs::MetadataExt;
@@ -35,7 +37,9 @@ async fn unchanged_copy_is_deleted(config: &ClickHouseConfig) -> Result<()> {
     let entry = Arc::new(observe_path(source.storage(), Path::new("payload")).await?);
     let database = ClickHouseDatabase::connect(config, "unchanged_move").await?;
     database.initialize().await?;
-    database.begin_copy_generation("same-source-target", true).await?;
+    database
+        .begin_copy_generation(&request("same-source-target", true))
+        .await?;
     copy_file(
         &source,
         &target,
@@ -49,11 +53,14 @@ async fn unchanged_copy_is_deleted(config: &ClickHouseConfig) -> Result<()> {
     .await?;
     database.batch_insert_base_record(&[Arc::clone(&entry)]).await?;
     database.commit_scan_generation().await?;
+    database.finish_copy_generation(CopyGenerationPhase::Completed).await?;
     drop(database);
     let metadata = std::fs::metadata(target_root.path().join("payload"))?;
     let database = ClickHouseDatabase::connect(config, "unchanged_move").await?;
     assert_eq!(determine_sync_type(&database).await?, ScanType::Incremental);
-    database.begin_copy_generation("same-source-target", false).await?;
+    database
+        .begin_copy_generation(&request("same-source-target", false))
+        .await?;
     let current = Arc::new(observe_path(source.storage(), Path::new("payload")).await?);
     let changes = database
         .compare_catalogue_batch(&[current], ComparisonMode::AwaitCopyAcknowledgement)
@@ -89,7 +96,9 @@ async fn moved_copy_is_retained(config: &ClickHouseConfig, incomplete: bool) -> 
     let job = format!("moved_then_retained_{incomplete}");
     let database = ClickHouseDatabase::connect(config, &job).await?;
     database.initialize().await?;
-    database.begin_copy_generation("same-source-target", false).await?;
+    database
+        .begin_copy_generation(&request("same-source-target", false))
+        .await?;
     copy_file(
         &source,
         &target,
@@ -109,15 +118,19 @@ async fn moved_copy_is_retained(config: &ClickHouseConfig, incomplete: bool) -> 
         .await?;
     if !incomplete {
         database.commit_scan_generation().await?;
+        database.finish_copy_generation(CopyGenerationPhase::Completed).await?;
     }
     drop(database);
     let before = std::fs::metadata(target_root.path().join("payload"))?;
     let database = ClickHouseDatabase::connect(config, &job).await?;
     assert_eq!(determine_sync_type(&database).await?, ScanType::Full);
-    database.begin_copy_generation("same-source-target", true).await?;
+    database
+        .begin_copy_generation(&request("same-source-target", true))
+        .await?;
     assert_eq!(database.get_count("base").await?, 0);
     assert_eq!(database.detect_deleted_items().await?.count(), 0);
     database.commit_scan_generation().await?;
+    database.finish_copy_generation(CopyGenerationPhase::Completed).await?;
     assert!(!source_root.path().join("payload").exists());
     assert_eq!(std::fs::read(target_root.path().join("payload"))?, b"moved payload");
     let after = std::fs::metadata(target_root.path().join("payload"))?;
@@ -146,7 +159,9 @@ async fn only_current_selection_authorizes_source_cleanup(config: &ClickHouseCon
         Arc::new(create_storage(&target_root.path().to_string_lossy(), CreateStorageOptions::default()).await?);
     let database = ClickHouseDatabase::connect(config, "selected_cleanup").await?;
     database.initialize().await?;
-    database.begin_copy_generation("same-source-target", true).await?;
+    database
+        .begin_copy_generation(&request("same-source-target", true))
+        .await?;
     let mut entries = Vec::new();
     for name in ["selected", "outside", "outside-dir"] {
         let entry = Arc::new(observe_path(source.storage(), Path::new(name)).await?);
@@ -169,6 +184,7 @@ async fn only_current_selection_authorizes_source_cleanup(config: &ClickHouseCon
     }
     database.batch_insert_base_record(&entries).await?;
     database.commit_scan_generation().await?;
+    database.finish_copy_generation(CopyGenerationPhase::Completed).await?;
     drop(database);
     let client = Client::default()
         .with_url(&config.dsn)
@@ -177,7 +193,9 @@ async fn only_current_selection_authorizes_source_cleanup(config: &ClickHouseCon
     // 三轮已经更新 state 但未提交，再成功提交一轮；每次重新打开执行域。
     for round in 0..4 {
         let database = ClickHouseDatabase::connect(config, "selected_cleanup").await?;
-        database.begin_copy_generation("same-source-target", true).await?;
+        database
+            .begin_copy_generation(&request("same-source-target", true))
+            .await?;
         let changes = database
             .compare_catalogue_batch(&entries[..1], ComparisonMode::AwaitCopyAcknowledgement)
             .await?;
@@ -193,11 +211,20 @@ async fn only_current_selection_authorizes_source_cleanup(config: &ClickHouseCon
         );
         if round == 3 {
             database.commit_scan_generation().await?;
+            database.finish_copy_generation(CopyGenerationPhase::Completed).await?;
         }
     }
-    // 本轮 W=1，未选中的旧记录也恰为 1；不能靠这个相等关系授权删除。
+    // 下一轮 W=1，准备前未选中的旧记录也恰为 1；不能靠这个相等关系授权删除。
+    let state = client
+        .query("SELECT current_state FROM base_selected_cleanup FINAL WHERE relative_path='outside'")
+        .fetch_one::<u8>()
+        .await
+        .map_err(DatabaseError::from)?;
+    assert_eq!(state, 1);
     let database = ClickHouseDatabase::connect(config, "selected_cleanup").await?;
-    database.begin_copy_generation("same-source-target", false).await?;
+    database
+        .begin_copy_generation(&request("same-source-target", false))
+        .await?;
     let changes = database
         .compare_catalogue_batch(&entries[..1], ComparisonMode::AwaitCopyAcknowledgement)
         .await?;
@@ -207,7 +234,7 @@ async fn only_current_selection_authorizes_source_cleanup(config: &ClickHouseCon
         .fetch_one::<u8>()
         .await
         .map_err(DatabaseError::from)?;
-    assert_eq!(state, 1);
+    assert_eq!(state, 0, "新代次统一回标旧事实，执行身份仍负责限定本轮清理范围");
     let untouched_time = UNIX_EPOCH + Duration::from_secs(1_234_567);
     File::open(target_root.path().join("outside-dir"))?.set_times(FileTimes::new().set_modified(untouched_time))?;
     copy_completion::complete(database.clone(), Arc::clone(&target)).await?;

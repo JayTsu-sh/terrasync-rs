@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use data_mover::model::ObservedEntry;
 use serde::Deserialize;
+use task_model::migration::TargetCleanupPolicy;
 use tracing::{debug, info};
 use {
     task_model::observation::{ObservedItem, ObservedView},
@@ -57,15 +58,32 @@ impl ClickHouseDatabase {
             .as_deref()
             .ok_or_else(|| DatabaseError::TableNotFound("catalogue comparison staging".into()))?;
         let temporary = self.catalogue_query_table(temporary)?;
-        let query = if self.is_copy_recovery().await {
+        let (force_copy, preserve_target) = {
+            let lifecycle = self.generation_lifecycle.lock().await;
+            (
+                lifecycle
+                    .copy_generation
+                    .as_ref()
+                    .is_some_and(|generation| generation.plan.force_copy),
+                lifecycle
+                    .copy_generation
+                    .as_ref()
+                    .is_some_and(|generation| generation.plan.target_cleanup == TargetCleanupPolicy::Preserve),
+            )
+        };
+        let query = if force_copy || self.is_copy_recovery().await {
             let base = self.catalogue_query_table(&get_scan_base_table_name(&self.job_id))?;
             format!(
                 "SELECT t.relative_path,t.version_id,toUInt8(if(t.is_dir = 1 AND t.marker_state IS NULL AND f.marker_state IS NOT NULL,4,0)) AS change_code FROM {temporary} t LEFT JOIN (SELECT relative_path,version_id,marker_state FROM {base} FINAL ORDER BY relative_path,version_id LIMIT 1 BY relative_path,version_id) f USING (relative_path,version_id)"
             )
         } else {
             let base = self.catalogue_query_table(&get_scan_base_table_name(&self.job_id))?;
-            let (temporary_handles, baseline_handles) = self.check_file_handle_status(&temporary, &base).await?;
-            let strategy = JoinStrategy::from_file_handle_status(temporary_handles, baseline_handles);
+            let strategy = if preserve_target {
+                JoinStrategy::CopyPath
+            } else {
+                let (temporary_handles, baseline_handles) = self.check_file_handle_status(&temporary, &base).await?;
+                JoinStrategy::from_file_handle_status(temporary_handles, baseline_handles)
+            };
             let queries = [
                 strategy.build_detect_new_sql(&temporary, &base),
                 strategy.build_detect_changed_sql(&temporary, &base, ChangeKind::DataOnly),
@@ -219,6 +237,8 @@ impl ClickHouseDatabase {
 pub(super) enum JoinStrategy {
     /// 基于 `relative_path` + `version_id` 的对比
     Path,
+    /// Preserve 时新路径必须产生复制工作；同路径的类型／稳定身份替换也不能复用旧确认。
+    CopyPath,
     /// 基于 `file_handle` 的对比
     FileHandle,
 }
@@ -246,6 +266,12 @@ impl JoinStrategy {
     pub(super) fn build_detect_new_sql(&self, temp: &str, base: &str) -> String {
         let columns = &*FILE_SCAN_COLUMNS_LIST_WITH_T_PREFIX;
         match self {
+            Self::CopyPath => format!(
+                "SELECT {columns} FROM {temp} as t WHERE (t.relative_path,t.version_id,ifNull(t.file_handle,''),t.entry_kind) NOT IN \
+                 (SELECT relative_path,version_id,ifNull(file_handle,''),entry_kind FROM {base} FINAL WHERE copy_path_confirmed \
+                  AND (relative_path,version_id) IN (SELECT relative_path,version_id FROM {temp})) \
+                 ORDER BY t.relative_path,t.history_segment,t.history_index,t.version_id"
+            ),
             Self::Path => format!(
                 "SELECT {columns} FROM {temp} as t \
                  WHERE (t.relative_path, t.version_id) NOT IN \
@@ -307,17 +333,27 @@ impl JoinStrategy {
         } else {
             format!("({kind_filter}) AND NOT {marker_removed}")
         };
+        let identity_columns = if matches!(self, Self::CopyPath) {
+            ",file_handle,entry_kind"
+        } else {
+            ""
+        };
+        let identity_match = if matches!(self, Self::CopyPath) {
+            " AND ifNull(t.file_handle=f.file_handle,t.file_handle IS NULL AND f.file_handle IS NULL) AND t.entry_kind=f.entry_kind"
+        } else {
+            ""
+        };
         match self {
-            Self::Path => format!(
+            Self::Path | Self::CopyPath => format!(
                 "SELECT {t_columns} FROM {temp} t \
-                 JOIN (SELECT relative_path, version_id, size, mtime, mode, uid, gid, is_dir, marker_state, metadata_digests \
+                 JOIN (SELECT relative_path, version_id, size, mtime, mode, uid, gid, is_dir, marker_state, metadata_digests{identity_columns} \
                        FROM {base} FINAL \
                        WHERE copy_path_confirmed AND (relative_path, version_id) IN \
                              (SELECT relative_path, version_id FROM {temp}) \
                        ORDER BY relative_path, version_id \
                        LIMIT 1 BY (relative_path, version_id) \
                  ) f ON t.relative_path = f.relative_path AND t.version_id = f.version_id \
-                 WHERE {kind_filter} \
+                 WHERE ({kind_filter}){identity_match} \
                  ORDER BY t.relative_path, t.history_segment, t.history_index, t.version_id"
             ),
             Self::FileHandle => format!(
@@ -370,7 +406,7 @@ impl ClickHouseDatabase {
 
         let temp_table_name = self.catalogue_query_table(temp_table_name)?;
         let base_table_name = self.catalogue_query_table(&get_scan_base_table_name(&self.job_id))?;
-        let copying = self.generation_lifecycle.lock().await.copy_request_key.is_some();
+        let copying = self.generation_lifecycle.lock().await.copy_generation.is_some();
         let columns = if copying {
             format!("{OBSERVED_COLUMNS},copy_path_confirmed")
         } else {

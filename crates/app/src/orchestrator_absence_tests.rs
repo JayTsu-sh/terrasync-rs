@@ -1,5 +1,7 @@
 //! 真实 CH 与 Local：漏扫、缺失、未知后代及硬链接的目标收尾。
+use crate::migration_fixtures::request;
 use std::{path::Path, sync::Arc, time::Duration};
+use task_model::migration::CopyGenerationPhase;
 
 use async_trait::async_trait;
 use clickhouse::Client;
@@ -43,7 +45,7 @@ async fn deletion_case(config: &ClickHouseConfig, present: bool, directory: bool
     let database = ClickHouseDatabase::connect(config, &job).await?;
     database.initialize().await?;
     database.create_table(INCREMENTAL_SCAN_TABLE_BASE_NAME).await?;
-    database.begin_copy_generation("same", true).await?;
+    database.begin_copy_generation(&request("same", true)).await?;
     let source_root = tempfile::tempdir()?;
     let target_root = tempfile::tempdir()?;
     for root in [source_root.path(), target_root.path()] {
@@ -72,7 +74,9 @@ async fn deletion_case(config: &ClickHouseConfig, present: bool, directory: bool
     }
     database.batch_insert_base_record(&old).await?;
     database.commit_scan_generation().await?;
-    database.begin_copy_generation("same", true).await?;
+    database.finish_copy_generation(CopyGenerationPhase::Completed).await?;
+    let database = database.new_execution_scope();
+    database.begin_copy_generation(&request("same", true)).await?;
     if !present {
         if known_child {
             std::fs::remove_file(source_root.path().join("entry/known"))?;
@@ -212,7 +216,7 @@ async fn hardlink_case(config: &ClickHouseConfig) -> Result<()> {
     let database = ClickHouseDatabase::connect(config, "hardlink").await?;
     database.initialize().await?;
     database.create_table(INCREMENTAL_SCAN_TABLE_BASE_NAME).await?;
-    database.begin_copy_generation("same", true).await?;
+    database.begin_copy_generation(&request("same", true)).await?;
     let source_root = tempfile::tempdir()?;
     let target_root = tempfile::tempdir()?;
     std::fs::write(source_root.path().join("old"), b"payload")?;
@@ -223,7 +227,9 @@ async fn hardlink_case(config: &ClickHouseConfig) -> Result<()> {
         .batch_insert_base_record(&[stable_entry(&source, "old").await?])
         .await?;
     database.commit_scan_generation().await?;
-    database.begin_copy_generation("same", true).await?;
+    database.finish_copy_generation(CopyGenerationPhase::Completed).await?;
+    let database = database.new_execution_scope();
+    database.begin_copy_generation(&request("same", true)).await?;
     assert!(
         database
             .compare_catalogue_batch(

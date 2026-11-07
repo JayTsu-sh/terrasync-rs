@@ -8,16 +8,23 @@ use db::catalogue::ComparisonMode;
 use task_model::StorageEntryMessage;
 use tracing::trace;
 
-use crate::{broadcast::BroadcastForwarder, error::Result, scan::ScanType};
+#[cfg(test)]
+use crate::scan::ScanType;
+use crate::{broadcast::BroadcastForwarder, error::Result};
 
 #[cfg(all(test, unix))]
 #[path = "sync_catalog_migration_tests.rs"]
 mod migration_tests;
 
+#[cfg(test)]
 pub(crate) async fn determine_sync_type(db: &ClickHouseDatabase) -> Result<ScanType> {
-    let previous = db.copy_catalogue_source_reserved().await?;
+    let previous = db.latest_copy_generation().await?;
     Ok(match previous {
-        Some(true) => ScanType::Incremental,
+        Some(previous)
+            if previous.request.source_cleanup.retains_source() && db.copy_baseline_available(&previous).await? =>
+        {
+            ScanType::Incremental
+        }
         _ => ScanType::Full,
     })
 }
@@ -43,6 +50,7 @@ pub(crate) async fn batch_processing_to_generate_message(
 mod tests {
     use super::*;
     use crate::error::AppError;
+    use crate::migration_fixtures::request;
     use crate::task_stream::finish_phase;
     use clickhouse::error::Error as ClickHouseError;
     use clickhouse::test::{Mock, handlers};
@@ -50,7 +58,21 @@ mod tests {
     use reqwest::StatusCode;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Duration;
+    use task_model::migration::{CopyGeneration, CopyGenerationPhase, CopyGenerationPlan};
     use tokio::time::sleep;
+
+    #[derive(serde::Serialize, clickhouse::Row)]
+    struct RunRow {
+        sequence: u64,
+        execution_id: String,
+        revision: u64,
+        descriptor: String,
+    }
+    #[derive(serde::Serialize, clickhouse::Row)]
+    struct StateRow {
+        scan_state: u8,
+        copy_execution_id: String,
+    }
 
     fn fixture_database(mock: &Mock) -> ClickHouseDatabase {
         ClickHouseDatabase::new(
@@ -78,9 +100,34 @@ mod tests {
         ] {
             let mock = Mock::new();
             let database = fixture_database(&mock);
-            mock.add(handlers::provide([1u64]));
-            mock.add(handlers::provide([1u64]));
-            mock.add(handlers::provide(previous));
+            if let Some(reserved) = previous {
+                let request = request("preview", reserved);
+                let generation = CopyGeneration {
+                    sequence: 1,
+                    revision: 3,
+                    plan: CopyGenerationPlan::decide(&request, None, false)?,
+                    request,
+                    phase: CopyGenerationPhase::Completed,
+                    baseline_prepared: true,
+                };
+                mock.add(handlers::provide([1u64]));
+                mock.add(handlers::provide([RunRow {
+                    sequence: 1,
+                    revision: 3,
+                    execution_id: generation.request.execution_id.clone(),
+                    descriptor: serde_json::to_string(&generation)?,
+                }]));
+                if reserved {
+                    mock.add(handlers::provide([1u64]));
+                    mock.add(handlers::provide([1u64]));
+                    mock.add(handlers::provide([StateRow {
+                        scan_state: 1,
+                        copy_execution_id: generation.request.execution_id,
+                    }]));
+                }
+            } else {
+                mock.add(handlers::provide([0u64]));
+            }
             assert_eq!(determine_sync_type(&database).await?, expected);
         }
         Ok(())

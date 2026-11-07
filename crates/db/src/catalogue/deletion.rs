@@ -143,7 +143,7 @@ impl ClickHouseDatabase {
             const BATCH_SIZE: usize = 10_000;
             let unique_fh_list: Vec<&str> = unique_fh_set.iter().map(String::as_str).collect();
             let current_state = self.get_cached_scan_state().await?;
-            let copying = self.generation_lifecycle.lock().await.copy_request_key.is_some();
+            let copying = self.generation_lifecycle.lock().await.copy_generation.is_some();
 
             // 每批 10K 个 fh，避免 SQL 过长
             for chunk in unique_fh_list.chunks(BATCH_SIZE) {

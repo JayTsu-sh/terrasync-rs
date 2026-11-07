@@ -1,8 +1,10 @@
 //! 真实 `ClickHouse` 与 HTTP 回调验证保留目标的状态事件，不把它计为删除或复制失败。
+use crate::migration_fixtures::request;
 use crate::target_absence::SourceAbsenceCheck;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
+use task_model::migration::CopyGenerationPhase;
 
 use clickhouse::Client;
 use data_mover::model::{BackendKind, EntryKind, HistoryOrder, ObjectHistory, ObservedEntry};
@@ -67,16 +69,18 @@ async fn preserve_case(config: &ClickHouseConfig) -> Result<()> {
         Arc::new(create_storage(&target_root.path().to_string_lossy(), CreateStorageOptions::default()).await?);
     let database = ClickHouseDatabase::connect(config, "retained_target").await?;
     database.initialize().await?;
-    database.begin_copy_generation("same-plan", true).await?;
+    database.begin_copy_generation(&request("same-plan", true)).await?;
     let mut entries = Vec::new();
     // 历史来自确定性 S3 观察；真实链路验证范围为 CH、Local 目标与 HTTP callback。
     entries.push(version_facts());
     entries.push(Arc::new(observe_path(source.storage(), Path::new("folder")).await?));
     database.batch_insert_base_record(&entries).await?;
     database.commit_scan_generation().await?;
+    database.finish_copy_generation(CopyGenerationPhase::Completed).await?;
     std::fs::remove_file(source_root.path().join("payload"))?;
     std::fs::remove_dir(source_root.path().join("folder"))?;
-    database.begin_copy_generation("same-plan", false).await?;
+    let database = database.new_execution_scope();
+    database.begin_copy_generation(&request("same-plan", false)).await?;
     let mut events = BroadcastForwarder::new(8);
     let mut received = events.subscribe();
     SyncOrchestrator::apply_deletions_and_renames(
@@ -108,6 +112,7 @@ async fn preserve_case(config: &ClickHouseConfig) -> Result<()> {
                 .map_err(|_| AppError::ConfigError("owned callback URL required".into()))?,
         )?),
         generation_committed: None,
+        migration: None,
         scan_snapshot: None,
         callback: CallbackState::with_database(Some(database.clone())),
         pb_handle: None,

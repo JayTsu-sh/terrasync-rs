@@ -18,8 +18,10 @@ use std::time::{Duration, Instant};
 // 外部crate
 use data_mover::model::ObservedEntry;
 use db::ClickHouseDatabase;
+use task_model::migration::{CopyGenerationPhase, MigrationMode, MigrationReport};
 use task_model::observation::ObservedScanEvent;
 use task_model::{ErrorEvent, StorageEntryMessage};
+use task_model::{TargetRetention, TargetRetentionReason};
 use tokio::sync::Mutex;
 use tracing::{Instrument, debug, error, info_span, warn};
 
@@ -193,6 +195,79 @@ impl ScanStatistics {
 }
 
 impl ConsumerManager {
+    pub(crate) async fn copy_attempt_id(&self) -> Result<String> {
+        let consumer = self
+            .stats_consumer
+            .as_ref()
+            .ok_or_else(|| AppError::ConfigError("迁移通知状态未创建".into()))?;
+        Ok(consumer.lock().await.callback.identity.attempt_id.clone())
+    }
+
+    pub(crate) async fn set_migration_report(&self, report: MigrationReport) {
+        if let Some(consumer) = &self.stats_consumer {
+            let mut consumer = consumer.lock().await;
+            if !self.copy_pipeline_prepared {
+                let job_type = match report.plan.mode {
+                    MigrationMode::Full => JobType::Copy,
+                    MigrationMode::Incremental => JobType::IncrementalCopy,
+                };
+                Self::reset_copy_statistics(&mut consumer, job_type);
+            }
+            consumer.migration = Some(report);
+        }
+    }
+
+    pub(crate) async fn finish_unpersisted_migration(&self, phase: CopyGenerationPhase) {
+        if let Some(consumer) = &self.stats_consumer {
+            let mut consumer = consumer.lock().await;
+            if let Some(report) = &mut consumer.migration
+                && report.generation.is_none()
+            {
+                report.phase = phase;
+            }
+        }
+    }
+
+    pub(crate) async fn record_target_retention_range(
+        &self, reason: TargetRetentionReason, message: String,
+    ) -> Result<()> {
+        if let Some(consumer) = &self.stats_consumer {
+            StatisticConsumer::record_message(
+                consumer,
+                &StorageEntryMessage::TargetPreserved {
+                    retention: Box::new(TargetRetention::source_range(reason)),
+                    reason: message,
+                },
+            )
+            .await?;
+        }
+        Ok(())
+    }
+
+    fn reset_copy_statistics(state: &mut StatisticConsumer, job_type: JobType) {
+        let (job_id, command, log_path) = match &state.stats {
+            StatsKind::Full(summary) => (
+                summary.job_id.clone(),
+                summary.command.clone(),
+                summary.log_path.clone(),
+            ),
+            StatsKind::Incremental(summary) => (
+                summary.job_id.clone(),
+                summary.command.clone(),
+                summary.log_path.clone(),
+            ),
+        };
+        state.stats = match job_type {
+            JobType::Copy => StatsKind::Full(FullStats::new(JobType::Copy, job_id, command, log_path)),
+            _ => StatsKind::Incremental(IncrementalStats::new(
+                JobType::IncrementalCopy,
+                job_id,
+                command,
+                log_path,
+            )),
+        };
+        state.progress_bar = ProgressBar::new(job_type);
+    }
     pub(crate) async fn initialize_scan_statistics(
         &self, storage: &crate::storage_factory::StorageContext, tags: bool, round: Option<i64>,
     ) -> Result<()> {
@@ -489,23 +564,7 @@ impl ConsumerManager {
         };
         if let Some(state) = &self.stats_consumer {
             let mut state = state.lock().await;
-            let command = config.console_config.raw_command_line.clone();
-            let log_path = match &state.stats {
-                StatsKind::Full(summary) => summary.log_path.clone(),
-                StatsKind::Incremental(summary) => summary.log_path.clone(),
-            };
-            state.stats = match config.job_type {
-                JobType::Copy => {
-                    StatsKind::Full(FullStats::new(JobType::Copy, config.job_id.clone(), command, log_path))
-                }
-                _ => StatsKind::Incremental(IncrementalStats::new(
-                    JobType::IncrementalCopy,
-                    config.job_id.clone(),
-                    command,
-                    log_path,
-                )),
-            };
-            state.progress_bar = ProgressBar::new(config.job_type.clone());
+            Self::reset_copy_statistics(&mut state, config.job_type.clone());
         }
         if let Some(consumer) = consumer {
             self.add_consumer(Box::new(consumer));
@@ -550,6 +609,7 @@ impl ConsumerManager {
                     job_dir,
                     callback_url,
                     generation_committed: None,
+                    migration: None,
                     pb_handle: None,
                     scan_snapshot: None,
                     callback: CallbackState::with_database(manager.notification_database.clone()),
@@ -560,6 +620,7 @@ impl ConsumerManager {
                     job_dir,
                     callback_url,
                     generation_committed: None,
+                    migration: None,
                     pb_handle: None,
                     scan_snapshot: None,
                     callback: CallbackState::with_database(manager.notification_database.clone()),
@@ -732,6 +793,7 @@ mod resume_tests {
             job_dir: String::new(),
             callback_url: None,
             generation_committed: None,
+            migration: None,
             pb_handle: None,
             scan_snapshot: None,
             callback: Default::default(),
@@ -795,6 +857,7 @@ mod resume_tests {
             job_dir: String::new(),
             callback_url: None,
             generation_committed: None,
+            migration: None,
             pb_handle: None,
             scan_snapshot: None,
             callback: Default::default(),
@@ -912,6 +975,7 @@ mod resume_tests {
             job_dir: String::new(),
             callback_url: None,
             generation_committed: None,
+            migration: None,
             pb_handle: None,
             scan_snapshot: None,
             callback: Default::default(),
@@ -939,6 +1003,7 @@ mod resume_tests {
             diagnostics: None,
             scan_runtime: None,
             generation_committed: None,
+            migration: None,
         })?;
         let manager = ConsumerManager {
             consumers: vec![],

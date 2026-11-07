@@ -12,6 +12,17 @@ use crate::execution::read::QuorumRead;
 use crate::{config::ClickHouseConfig, error::Result, execution::base_client, scan::ScanStore};
 
 impl ClickHouseDatabase {
+    /// 新执行复用连接池并隔离游标／代次状态；Clone 仍只用于同一执行的 worker。
+    #[must_use]
+    pub fn new_execution_scope(&self) -> Self {
+        let mut next = self.clone();
+        next.scan_temp_table_name = None;
+        next.cached_scan_state = AtomicU8::new(255);
+        next.resume_base_has_typed_handles = None;
+        next.generation_lifecycle = Arc::new(CatalogueLifecycle::default());
+        next
+    }
+
     /// 连接唯一的 ClickHouse 目录实现，保留原始有类型的连接失败。
     pub async fn connect(config: &ClickHouseConfig, job_id: &str) -> Result<Self> {
         let catalogue = Self::new(config, job_id)?;

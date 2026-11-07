@@ -93,4 +93,8 @@ pub(crate) fn generate_scan_temp_table_name() -> String {
 #[path = "../../../tests/support/observed.rs"]
 mod observed_fixtures;
 
+#[cfg(test)]
+#[path = "../../../tests/support/migration.rs"]
+mod migration_fixtures;
+
 pub use schema::entry::EntrySummary;
