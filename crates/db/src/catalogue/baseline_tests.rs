@@ -40,6 +40,7 @@ async fn fresh_initialization_keeps_the_baseline_uncommitted() -> Result<()> {
     assert!(ddl.contains("baseline_committed Bool DEFAULT false"));
     assert!(ddl.contains("copy_in_progress Bool DEFAULT false"));
     assert!(ddl.contains("copy_request_key String DEFAULT ''"));
+    assert!(ddl.contains("copy_source_reserved Bool DEFAULT true"));
     let insert = initial.query().await;
     assert!(insert.contains("(id, scan_state, baseline_committed)"));
     assert!(insert.ends_with("VALUES (1, 0, false)"), "{insert}");
@@ -165,19 +166,19 @@ async fn real_fresh_state_supports_copy_recovery_and_committed_baseline() -> Res
     database.initialize().await?;
     assert!(!database.has_committed_baseline().await?);
     assert_eq!(
-        database.begin_copy_generation("source-to-target").await?,
+        database.begin_copy_generation("source-to-target", true).await?,
         super::CopyGenerationStatus::Fresh
     );
     drop(database);
     let database = ClickHouseDatabase::new(&config, "fresh_copy").unwrap();
     assert_eq!(
-        database.begin_copy_generation("source-to-target").await?,
+        database.begin_copy_generation("source-to-target", true).await?,
         super::CopyGenerationStatus::Recovering
     );
     database.commit_scan_generation().await?;
     assert!(database.has_committed_baseline().await?);
     assert_eq!(
-        database.begin_copy_generation("another-source-to-target").await?,
+        database.begin_copy_generation("another-source-to-target", true).await?,
         super::CopyGenerationStatus::Fresh
     );
     Ok(())

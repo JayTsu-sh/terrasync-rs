@@ -176,7 +176,7 @@ async fn isolated_generation_case(mode: ClickHouseMode) -> Result<()> {
         let database: ClickHouseDatabase = ClickHouseDatabase::new(&config, "completion")?;
         database.initialize().await?;
         database
-            .begin_copy_generation("directory-completion-regression")
+            .begin_copy_generation("directory-completion-regression", true)
             .await?;
         database.batch_insert_base_record(&[Arc::new(entry.clone())]).await?;
         let result = complete(database.clone(), target(&destination).await?).await;
@@ -186,7 +186,7 @@ async fn isolated_generation_case(mode: ClickHouseMode) -> Result<()> {
             )));
         }
         if database
-            .begin_copy_generation("directory-completion-regression")
+            .begin_copy_generation("directory-completion-regression", true)
             .await?
             != CopyGenerationStatus::Recovering
         {
@@ -199,7 +199,7 @@ async fn isolated_generation_case(mode: ClickHouseMode) -> Result<()> {
         complete(database.clone(), target(&destination).await?).await?;
         verify_mtime(&destination, "missing", entry.get_mtime())?;
         if database
-            .begin_copy_generation("directory-completion-regression")
+            .begin_copy_generation("directory-completion-regression", true)
             .await?
             != CopyGenerationStatus::Fresh
         {

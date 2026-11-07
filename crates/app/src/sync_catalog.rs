@@ -6,27 +6,20 @@ use data_mover::model::ObservedEntry;
 use db::ClickHouseDatabase;
 use db::catalogue::ComparisonMode;
 use task_model::StorageEntryMessage;
-use tracing::{trace, warn};
+use tracing::trace;
 
 use crate::{broadcast::BroadcastForwarder, error::Result, scan::ScanType};
 
-pub(crate) async fn determine_sync_type(db: Option<&ClickHouseDatabase>, job_dir_pre_existing: bool) -> ScanType {
-    if let Some(db) = db {
-        match db.copy_catalogue_exists().await {
-            Ok(true) => return ScanType::Incremental,
-            Ok(false) => return ScanType::Full,
-            Err(e) => {
-                warn!("数据库查询失败，fallback 到文件系统快照判定: {}", e);
-            }
-        }
-    }
+#[cfg(all(test, unix))]
+#[path = "sync_catalog_migration_tests.rs"]
+mod migration_tests;
 
-    // Fallback：调用方注入的 job_dir 预存在快照
-    if job_dir_pre_existing {
-        ScanType::Incremental
-    } else {
-        ScanType::Full
-    }
+pub(crate) async fn determine_sync_type(db: &ClickHouseDatabase, source_reserved: bool) -> Result<ScanType> {
+    let previous = db.copy_catalogue_source_reserved().await?;
+    Ok(match previous {
+        Some(previous_reserved) if source_reserved || previous_reserved => ScanType::Incremental,
+        _ => ScanType::Full,
+    })
 }
 
 pub(crate) async fn batch_processing_to_generate_message(
@@ -58,6 +51,54 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Duration;
     use tokio::time::sleep;
+
+    fn fixture_database(mock: &Mock) -> ClickHouseDatabase {
+        ClickHouseDatabase::new(
+            &ClickHouseConfig {
+                mode: Default::default(),
+                cluster: None,
+                dsn: mock.url().into(),
+                database: "default".into(),
+                username: "default".into(),
+                password: None,
+                dial_timeout: 1,
+                read_timeout: 1,
+            },
+            "generation_selection",
+        )
+        .unwrap_or_else(|error| panic!("fixture catalogue: {error}"))
+    }
+
+    #[tokio::test]
+    async fn deleting_source_uses_incremental_only_after_a_source_retaining_generation() -> Result<()> {
+        for (previous, reserved, expected) in [
+            (None, false, ScanType::Full),
+            (None, true, ScanType::Full),
+            (Some(false), false, ScanType::Full),
+            (Some(false), true, ScanType::Incremental),
+            (Some(true), false, ScanType::Incremental),
+            (Some(true), true, ScanType::Incremental),
+        ] {
+            let mock = Mock::new();
+            let database = fixture_database(&mock);
+            mock.add(handlers::provide([1u64]));
+            mock.add(handlers::provide([1u64]));
+            mock.add(handlers::provide(previous));
+            assert_eq!(determine_sync_type(&database, reserved).await?, expected);
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn selecting_a_generation_preserves_database_errors_instead_of_guessing_from_job_directory() {
+        let mock = Mock::new();
+        let database = fixture_database(&mock);
+        mock.add(handlers::failure(StatusCode::FORBIDDEN));
+        assert!(matches!(
+            determine_sync_type(&database, false).await,
+            Err(AppError::DatabaseError(_))
+        ));
+    }
 
     #[tokio::test]
     async fn failed_catalogue_batch_stays_typed_emits_no_events_and_drains_phase_tasks() {

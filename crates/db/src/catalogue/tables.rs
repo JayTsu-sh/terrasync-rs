@@ -56,7 +56,8 @@ impl ClickHouseDatabase {
         self.create_catalogue_table(
             &table_name,
             "id UInt8, scan_state UInt8, baseline_committed Bool DEFAULT false, \
-             copy_in_progress Bool DEFAULT false, copy_request_key String DEFAULT ''",
+             copy_in_progress Bool DEFAULT false, copy_request_key String DEFAULT '', \
+             copy_source_reserved Bool DEFAULT true",
             "id",
             CatalogueEngine::Replacing,
         )
@@ -134,22 +135,26 @@ impl ClickHouseDatabase {
         Ok(dropped_tables)
     }
 
-    /// 只有迁移执行标识才代表复制事实，不能将普通扫描基线当作迁移完成。
-    pub async fn copy_catalogue_exists(&self) -> Result<bool> {
+    /// 返回上一复制代次的源保留策略；普通扫描不构成可复用的复制基线。
+    pub async fn copy_catalogue_source_reserved(&self) -> Result<Option<bool>> {
         if !self.table_exists(&get_scan_base_table_name(&self.job_id)).await?
             || !self.table_exists(&get_scan_state_table_name(&self.job_id)).await?
         {
-            return Ok(false);
+            return Ok(None);
         }
         let table = get_scan_state_table_name(&self.job_id);
-        let started: u64 = self
+        match self
             .sync_client
             .query(&format!(
-                "SELECT count() FROM {table} FINAL WHERE id=1 AND copy_request_key!=''"
+                "SELECT copy_source_reserved FROM {table} FINAL WHERE id=1 AND copy_request_key!=''"
             ))
-            .fetch_quorum_one()
-            .await?;
-        Ok(started > 0)
+            .fetch_quorum_one::<bool>()
+            .await
+        {
+            Ok(reserved) => Ok(Some(reserved)),
+            Err(DatabaseError::ClickHouseError(ClickHouseError::RowNotFound)) => Ok(None),
+            Err(error) => Err(error),
+        }
     }
 
     /// 检查指定表名是否存在于当前数据库中

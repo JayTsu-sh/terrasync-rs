@@ -73,6 +73,19 @@ across broadcaster clones; blocked sends to other queues are cancelled. This is 
 for stopping safely when diagnostic persistence fails, not validation of diagnostic spill or
 replay itself.
 
+`python3 tests/lab/run-notification-archive-local.py --copy-generations` reuses the
+isolated ClickHouse pair for migration-generation tests. Against both Single and the
+one-shard/two-replica Cluster it checks previous source-retaining/deleting policies,
+completed/incomplete generations, present/missing copy rows, policy persistence on reopen
+and commit, and clearing the base for the next source-deleting generation. A controlled
+proxy disconnects and silently stalls policy reads: the typed failure must propagate,
+the policy must remain unchanged, and each request returns within its bounded timeout.
+A real Local copy then verifies that switching to source deletion classifies an unchanged
+entry without copy work, deletes its source, and leaves the target bytes, inode and ctime
+unchanged. These are catalogue/cleanup contract checks; they do not validate the pending
+change to delete before asynchronous database confirmation, the whole-job failure callback,
+version-history purge, six-replica topology or throughput/RSS targets.
+
 `python3 tests/lab/run-notification-archive-local.py` validates the database notification archive
 in isolated ClickHouse single-server and one-shard/two-replica deployments, with an embedded Keeper.
 It requires `docker`, `nsenter`, cached Rust dependencies, and

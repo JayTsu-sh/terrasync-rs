@@ -1,4 +1,4 @@
-//! 首次迁移清理扫描基线，失败轮次保留确认事实并重新进行增量比较。
+//! 复制代次准备：保留源端的事实可复用，连续删除源端的代次重新全量。
 
 use std::collections::HashSet;
 use std::sync::atomic::Ordering;
@@ -19,7 +19,7 @@ use crate::schema::records::StorageEntryRecord;
 /// 复制代次是否正在利用失败轮次留下的确认事实。
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CopyGenerationStatus {
-    /// 首轮或上一轮全部确认成功，沿用正常增量比较。
+    /// 首轮、连续删除源端或上一轮已经结束，不恢复未完成代次。
     Fresh,
     /// 上轮复制未结束；保留确认事实，重新扫描并做增量比较。
     Recovering,
@@ -31,14 +31,21 @@ struct CopyState {
     scan_state: u8,
     copy_in_progress: bool,
     copy_request_key: String,
+    copy_source_reserved: bool,
 }
 
 #[cfg(test)]
 #[path = "copy_generation_tests.rs"]
 mod tests;
 
+#[cfg(test)]
+#[path = "copy_generation_real_tests.rs"]
+mod real_tests;
+
 impl ClickHouseDatabase {
-    pub async fn begin_copy_generation(&self, request_key: &str) -> Result<CopyGenerationStatus> {
+    pub async fn begin_copy_generation(
+        &self, request_key: &str, source_reserved: bool,
+    ) -> Result<CopyGenerationStatus> {
         if request_key.is_empty() {
             return Err(DatabaseError::ConfigError(
                 "copy generation requires a source/destination recovery binding".into(),
@@ -47,12 +54,13 @@ impl ClickHouseDatabase {
         let mut lifecycle = self.generation_lifecycle.lock().await;
         let saved = self.copy_generation_state().await?;
         let previous = saved.scan_state;
-        let recovering = !saved.copy_request_key.is_empty() && saved.copy_in_progress;
+        let reset = !source_reserved && !saved.copy_source_reserved;
+        let recovering = !reset && !saved.copy_request_key.is_empty() && saved.copy_in_progress;
         if !saved.copy_request_key.is_empty() && saved.copy_request_key != request_key {
             return Err(DatabaseError::ConfigError("incomplete copy belongs to unknown or different source/destination/options; restore the original settings or choose a new job id".into()));
         }
-        if saved.copy_request_key.is_empty() {
-            // 首次迁移不能复用扫描结果作为复制完成事实；清理确认后才启动扫描。
+        if saved.copy_request_key.is_empty() || reset {
+            // 首次复制及连续删除源端的代次不复用旧基线；清理确认后才启动扫描。
             let base = self.catalogue_storage_table(&get_scan_base_table_name(&self.job_id))?;
             self.execute(&format!("TRUNCATE TABLE {base} SYNC"), &[]).await?;
         }
@@ -63,12 +71,13 @@ impl ClickHouseDatabase {
         }
         let table = get_scan_state_table_name(&self.job_id);
         self.execute(&format!(
-            "INSERT INTO {table} (id,scan_state,baseline_committed,copy_in_progress,copy_request_key) VALUES (1,{working},false,true,?)"
-        ), &[Value::from(request_key)]).await?;
+            "INSERT INTO {table} (id,scan_state,baseline_committed,copy_in_progress,copy_request_key,copy_source_reserved) VALUES (1,{working},false,true,?,?)"
+        ), &[Value::from(request_key), Value::from(source_reserved)]).await?;
         *lifecycle = ScanGenerationLifecycle {
             working: Some(working),
             copy_recovery: false,
             copy_request_key: Some(request_key.into()),
+            copy_source_reserved: source_reserved,
             ..Default::default()
         };
         self.cached_scan_state.store(working, Ordering::Relaxed);
@@ -84,7 +93,7 @@ impl ClickHouseDatabase {
         let state = self
             .sync_client
             .query(&format!(
-                "SELECT scan_state, copy_in_progress, copy_request_key FROM {table} FINAL WHERE id=1"
+                "SELECT scan_state, copy_in_progress, copy_request_key, copy_source_reserved FROM {table} FINAL WHERE id=1"
             ))
             .fetch_quorum_one::<CopyState>()
             .await?;

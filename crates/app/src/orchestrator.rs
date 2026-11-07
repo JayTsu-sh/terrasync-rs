@@ -283,6 +283,11 @@ impl SyncOrchestrator {
         };
 
         let app_config = AppConfig::fetch()?;
+        // 模式选择与代次准备共用独占权，避免读取旧策略后被另一执行切换代次。
+        let _lease = match self.mode {
+            SyncMode::Local => Some(CopyLease::acquire(&app_config.database.clickhouse, c)?),
+            SyncMode::Remote { .. } => None,
+        };
         if !app_config.sync.is_source_reserved && !app_config.database.enabled {
             return Err(AppError::ConfigError(
                 "移动任务必须启用 ClickHouse，确认落库后才能删除源端".into(),
@@ -299,10 +304,10 @@ impl SyncOrchestrator {
         } else {
             None
         };
-        let scan_type = if !app_config.database.enabled {
-            ScanType::Full
+        let scan_type = if let Some(database) = db_instance.as_ref() {
+            determine_sync_type(database, app_config.sync.is_source_reserved).await?
         } else {
-            determine_sync_type(db_instance.as_ref(), c.job_dir_pre_existing).await
+            ScanType::Full
         };
 
         info!("SyncOrchestrator: determined scan_type={}", scan_type);
@@ -348,7 +353,6 @@ impl SyncOrchestrator {
 
         // ── 1. 加载配置 ──
         let app_config = AppConfig::fetch()?;
-        let _lease = CopyLease::acquire(&app_config.database.clickhouse, c)?;
         let is_source_reserved = app_config.sync.is_source_reserved;
         let copy_concurrency = c.concurrency.unwrap_or(app_config.sync.concurrency);
 
@@ -762,7 +766,6 @@ impl SyncOrchestrator {
 
         // ── 1. 加载配置 ──
         let app_config = AppConfig::fetch()?;
-        let _lease = CopyLease::acquire(&app_config.database.clickhouse, c)?;
         let is_source_reserved = app_config.sync.is_source_reserved;
         let copy_concurrency = c.concurrency.unwrap_or(app_config.sync.concurrency);
 

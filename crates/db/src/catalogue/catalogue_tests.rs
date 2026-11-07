@@ -341,7 +341,7 @@ async fn incomplete_copy_replays_metadata_that_preceded_a_failed_rename_copy() -
     database.batch_insert_base_record(&[original]).await?;
     database.insert_scan_state(0).await?;
     assert_eq!(
-        database.begin_copy_generation("catalogue-fixture-v1").await?,
+        database.begin_copy_generation("catalogue-fixture-v1", true).await?,
         CopyGenerationStatus::Fresh
     );
     let changed = fixture.entry("new", 20, "aa");
@@ -356,7 +356,7 @@ async fn incomplete_copy_replays_metadata_that_preceded_a_failed_rename_copy() -
     drop(database);
     let mut retry = ClickHouseDatabase::new(&fixture.config, "copy_retry")?;
     assert_eq!(
-        retry.begin_copy_generation("catalogue-fixture-v1").await?,
+        retry.begin_copy_generation("catalogue-fixture-v1", true).await?,
         CopyGenerationStatus::Recovering
     );
     retry.create_scan_temporary_table().await?;
@@ -386,7 +386,7 @@ async fn incomplete_copy_replays_metadata_that_preceded_a_failed_rename_copy() -
     drop(retry);
     let fresh = ClickHouseDatabase::new(&fixture.config, "copy_retry")?;
     assert_eq!(
-        fresh.begin_copy_generation("catalogue-fixture-v1").await?,
+        fresh.begin_copy_generation("catalogue-fixture-v1", true).await?,
         CopyGenerationStatus::Fresh
     );
     Ok(())
@@ -399,7 +399,7 @@ async fn empty_unconfirmed_copy_remains_dirty_until_commit() -> Result<()> {
     let database = ClickHouseDatabase::new(&fixture.config, "empty_copy")?;
     database.initialize().await?;
     assert_eq!(
-        database.begin_copy_generation("catalogue-fixture-v1").await?,
+        database.begin_copy_generation("catalogue-fixture-v1", true).await?,
         CopyGenerationStatus::Fresh
     );
     assert_eq!(database.get_count("base").await?, 0);
@@ -408,11 +408,11 @@ async fn empty_unconfirmed_copy_remains_dirty_until_commit() -> Result<()> {
     // first DB acknowledgement. The caller must see Recovering and reject replay.
     let retry = ClickHouseDatabase::new(&fixture.config, "empty_copy")?;
     assert!(matches!(
-        retry.begin_copy_generation("changed-source-or-move-policy").await,
+        retry.begin_copy_generation("changed-source-or-move-policy", true).await,
         Err(DatabaseError::ConfigError(_))
     ));
     assert_eq!(
-        retry.begin_copy_generation("catalogue-fixture-v1").await?,
+        retry.begin_copy_generation("catalogue-fixture-v1", true).await?,
         CopyGenerationStatus::Recovering
     );
     assert_eq!(retry.get_count("base").await?, 0);
@@ -420,7 +420,7 @@ async fn empty_unconfirmed_copy_remains_dirty_until_commit() -> Result<()> {
     drop(retry);
     let clean = ClickHouseDatabase::new(&fixture.config, "empty_copy")?;
     assert_eq!(
-        clean.begin_copy_generation("catalogue-fixture-v1").await?,
+        clean.begin_copy_generation("catalogue-fixture-v1", true).await?,
         CopyGenerationStatus::Fresh
     );
     clean.commit_scan_generation().await?;
@@ -429,7 +429,7 @@ async fn empty_unconfirmed_copy_remains_dirty_until_commit() -> Result<()> {
     for _ in 0..4 {
         let next = ClickHouseDatabase::new(&fixture.config, "empty_copy")?;
         assert_eq!(
-            next.begin_copy_generation("catalogue-fixture-v1").await?,
+            next.begin_copy_generation("catalogue-fixture-v1", true).await?,
             CopyGenerationStatus::Fresh
         );
         let marker = next
@@ -485,14 +485,14 @@ async fn history_copy_recovery_keeps_the_group_and_does_not_delete_the_replayed_
     let segments: Vec<_> = whole.into_segments(1).into_iter().map(Arc::new).collect();
     let mut database = ClickHouseDatabase::new(&fixture.config, "history_copy")?;
     database.initialize().await?;
-    database.begin_copy_generation("catalogue-fixture-v1").await?;
+    database.begin_copy_generation("catalogue-fixture-v1", true).await?;
     database.batch_insert_base_record(&[Arc::clone(&segments[0])]).await?;
     database.commit_scan_generation().await?;
-    database.begin_copy_generation("catalogue-fixture-v1").await?;
+    database.begin_copy_generation("catalogue-fixture-v1", true).await?;
     drop(database); // A later source/metadata failure left this round uncommitted.
     database = ClickHouseDatabase::new(&fixture.config, "history_copy")?;
     assert_eq!(
-        database.begin_copy_generation("catalogue-fixture-v1").await?,
+        database.begin_copy_generation("catalogue-fixture-v1", true).await?,
         CopyGenerationStatus::Recovering
     );
     database.create_scan_temporary_table().await?;
@@ -652,12 +652,12 @@ async fn copy_comparison_binds_new_and_changed_versions_in_source_order() -> Res
     };
     let database = ClickHouseDatabase::new(&fixture.config, "mixed_history")?;
     database.initialize().await?;
-    database.begin_copy_generation("mixed-history").await?;
+    database.begin_copy_generation("mixed-history", true).await?;
     database
         .batch_insert_base_record(&[Arc::new(observe(None, 10, true))])
         .await?;
     database.commit_scan_generation().await?;
-    database.begin_copy_generation("mixed-history").await?;
+    database.begin_copy_generation("mixed-history", true).await?;
     // suspended bucket 的 null 被覆盖，随后恢复版本化并写入新版本。
     let null = observe(None, 20, false);
     let latest = observe(Some("a-new"), 30, true);
@@ -862,7 +862,7 @@ async fn unacknowledged_marker_removal_keeps_its_intent_after_restart() -> Resul
     assert!(rows >= 2, "the regression must preserve obsolete physical rows");
     database.insert_scan_state(0).await?;
     let virtual_directory = Arc::new(marker.as_ref().clone().with_directory_marker_object(None)?);
-    database.begin_copy_generation("marker-binding").await?;
+    database.begin_copy_generation("marker-binding", true).await?;
     let pending = database
         .compare_catalogue_batch(
             &[Arc::clone(&virtual_directory)],
@@ -876,7 +876,7 @@ async fn unacknowledged_marker_removal_keeps_its_intent_after_restart() -> Resul
     drop(database);
     let retry = ClickHouseDatabase::new(&fixture.config, "marker_retry")?;
     assert_eq!(
-        retry.begin_copy_generation("marker-binding").await?,
+        retry.begin_copy_generation("marker-binding", true).await?,
         CopyGenerationStatus::Recovering
     );
     let replay = retry

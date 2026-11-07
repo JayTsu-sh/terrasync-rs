@@ -73,7 +73,8 @@ def run_isolated():
                 containers.append(container)
             print(f"isolated notification image={docker('inspect', containers[0], '--format', '{{.Image}}')}", flush=True)
             pid = docker("inspect", containers[0], "--format", "{{.State.Pid}}")
-            subprocess.run(["nsenter", "-t", pid, "-n", sys.executable, __file__, "--inside"], cwd=ROOT, check=True)
+            suite = ["--copy-generations"] if "--copy-generations" in sys.argv else []
+            subprocess.run(["nsenter", "-t", pid, "-n", sys.executable, __file__, "--inside", *suite], cwd=ROOT, check=True)
         except BaseException:
             for container in containers:
                 print(docker("logs", "--tail=25", container), file=sys.stderr)
@@ -81,6 +82,93 @@ def run_isolated():
         finally:
             for container in reversed(containers):
                 docker("rm", "-f", "-v", container)
+
+
+def run_copy_generations():
+    """Reuse the owned ClickHouse pair for copy-generation state and read faults."""
+    state = "normal"
+    guard = threading.Lock()
+    release = threading.Event()
+
+    class Proxy(http.server.BaseHTTPRequestHandler):
+        def log_message(self, *_):
+            pass
+
+        def do_GET(self):
+            nonlocal state
+            if self.path not in ("/normal", "/disconnect", "/stall"):
+                self.send_error(404)
+                return
+            with guard:
+                state = self.path[1:]
+            self.send_response(200)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+
+        def do_POST(self):
+            if self.headers.get("Transfer-Encoding", "").lower() == "chunked":
+                chunks = []
+                while True:
+                    count = int(self.rfile.readline().split(b";", 1)[0], 16)
+                    if count == 0:
+                        while self.rfile.readline() not in (b"\r\n", b""):
+                            pass
+                        break
+                    chunks.append(self.rfile.read(count))
+                    assert self.rfile.read(2) == b"\r\n"
+                body = b"".join(chunks)
+            else:
+                body = self.rfile.read(int(self.headers.get("Content-Length", "0")))
+            with guard:
+                fault = state
+            if fault == "disconnect":
+                self.close_connection = True
+                return
+            if fault == "stall":
+                release.wait(10)
+                self.close_connection = True
+                return
+            connection = http.client.HTTPConnection("127.0.0.1", 8123, timeout=15)
+            try:
+                headers = {key: value for key, value in self.headers.items()
+                           if key.lower() not in ("host", "connection", "content-length", "transfer-encoding")}
+                headers["Content-Length"] = str(len(body))
+                connection.request("POST", self.path, body=body, headers=headers)
+                response = connection.getresponse()
+                payload = response.read()
+                self.send_response(response.status)
+                for key, value in response.getheaders():
+                    if key.lower() not in ("content-length", "transfer-encoding", "connection"):
+                        self.send_header(key, value)
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+            finally:
+                connection.close()
+
+    proxy = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Proxy)
+    proxy.daemon_threads = True
+    threading.Thread(target=proxy.serve_forever, daemon=True).start()
+    environment = dict(os.environ)
+    address = f"127.0.0.1:{proxy.server_port}"
+    environment["LAB_COPY_GENERATION_DSN"] = f"http://{address}"
+    environment["LAB_COPY_GENERATION_CONTROL"] = address
+    try:
+        subprocess.run([
+            "cargo", "test", "--offline", "--locked", "-p", "db", "--lib",
+            "real_copy_generation_policies", "--", "--ignored", "--nocapture",
+        ], cwd=ROOT, env=environment, check=True)
+        subprocess.run([
+            "cargo", "test", "--offline", "--locked", "-p", "app", "--lib",
+            "real_retained_copy_becomes_incremental_move_without_rewriting_the_target",
+            "--", "--ignored", "--nocapture",
+        ], cwd=ROOT, env=environment, check=True)
+    finally:
+        release.set()
+        proxy.shutdown()
+        proxy.server_close()
 
 
 def run_inside():
@@ -96,6 +184,9 @@ def run_inside():
             time.sleep(0.2)
         else:
             raise RuntimeError(f"ClickHouse readiness timed out on port {port}")
+    if "--copy-generations" in sys.argv:
+        run_copy_generations()
+        return
     environment = dict(os.environ)
     environment["LAB_NOTIFICATION_CLICKHOUSE_DSN"] = "http://127.0.0.1:8123"
     environment["LAB_NOTIFICATION_CLICKHOUSE_USER"] = "default"

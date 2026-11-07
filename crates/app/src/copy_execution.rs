@@ -28,7 +28,7 @@ impl CopyLease {
 }
 
 pub(crate) async fn begin_copy_catalogue(
-    database: &ClickHouseDatabase, job: &SyncJobConfig, block_size: Option<usize>, _source_reserved: bool,
+    database: &ClickHouseDatabase, job: &SyncJobConfig, block_size: Option<usize>, source_reserved: bool,
 ) -> Result<()> {
     // 身份不包含凭据；恢复计划变化必须在任何 payload 或回标前被拒绝。
     let source = create_storage_for_role(
@@ -78,7 +78,7 @@ pub(crate) async fn begin_copy_catalogue(
     ))?)
     .to_hex()
     .to_string();
-    let status = database.begin_copy_generation(&request_key).await?;
+    let status = database.begin_copy_generation(&request_key, source_reserved).await?;
     if status == CopyGenerationStatus::Recovering && history {
         return Err(AppError::ConfigError(
             "版本化目标的上轮发布确认尚待对账，保留已复制版本和全部源历史，禁止盲目重放".into(),
