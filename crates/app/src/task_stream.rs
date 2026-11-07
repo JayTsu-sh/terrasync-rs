@@ -1,6 +1,8 @@
 use data_mover::traversal::{ScanFailureSignal, TraversalRecoveryStatus};
 
-use crate::error::StorageError;
+use crate::error::{Result, StorageError};
+use tokio::task::JoinHandle;
+use tracing::error;
 
 /// 通用异步通道接收器封装。
 ///
@@ -99,5 +101,24 @@ impl<T> AsyncReceiver<T> {
         } else {
             self.rx.recv().await.ok()
         }
+    }
+}
+
+/// 排空同一阶段的所有任务后返回首个类型化错误；调用方仅在成功后推进删除阶段。
+pub(crate) async fn finish_phase(tasks: Vec<JoinHandle<Result<()>>>) -> Result<()> {
+    let mut failure = None;
+    for task in tasks {
+        let result = match task.await {
+            Ok(result) => result,
+            Err(error) => Err(error.into()),
+        };
+        if let Err(error) = result {
+            error!(%error, "Catalogue phase task failed");
+            failure.get_or_insert(error);
+        }
+    }
+    match failure {
+        Some(error) => Err(error),
+        None => Ok(()),
     }
 }

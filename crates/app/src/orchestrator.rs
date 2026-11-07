@@ -74,7 +74,8 @@ use crate::sync::{
     CommitRecorder, ResumeOpts, StoragePair, parse_size, process_entry, process_metadata_only_entry,
     process_rename_entry, process_versioned_entry,
 };
-use crate::sync_catalog::{batch_processing_to_generate_message, determine_sync_type, finish_phase};
+use crate::sync_catalog::{batch_processing_to_generate_message, determine_sync_type};
+use crate::task_stream::finish_phase;
 use crate::{dir_walker, tar_pack};
 
 /// 大文件日志阈值（512 MiB）

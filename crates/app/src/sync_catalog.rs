@@ -6,8 +6,7 @@ use data_mover::model::ObservedEntry;
 use db::ClickHouseDatabase;
 use db::catalogue::ComparisonMode;
 use task_model::StorageEntryMessage;
-use tokio::task::JoinHandle;
-use tracing::{error, trace, warn};
+use tracing::{trace, warn};
 
 use crate::{broadcast::BroadcastForwarder, error::Result, scan::ScanType};
 
@@ -47,29 +46,11 @@ pub(crate) async fn batch_processing_to_generate_message(
     Ok(())
 }
 
-/// 排空同一阶段的所有任务后返回首个类型化错误；调用方仅在成功后推进删除阶段。
-pub(crate) async fn finish_phase(tasks: Vec<JoinHandle<Result<()>>>) -> Result<()> {
-    let mut failure = None;
-    for task in tasks {
-        let result = match task.await {
-            Ok(result) => result,
-            Err(error) => Err(error.into()),
-        };
-        if let Err(error) = result {
-            error!(%error, "Catalogue phase task failed");
-            failure.get_or_insert(error);
-        }
-    }
-    match failure {
-        Some(error) => Err(error),
-        None => Ok(()),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::error::AppError;
+    use crate::task_stream::finish_phase;
     use clickhouse::error::Error as ClickHouseError;
     use clickhouse::test::{Mock, handlers};
     use db::{ClickHouseConfig, DatabaseError};

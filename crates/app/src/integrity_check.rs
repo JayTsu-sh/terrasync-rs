@@ -49,7 +49,7 @@ use crate::dir_walker;
 use crate::error::{AppError, Result};
 use crate::scan::ScanType;
 use crate::storage_factory::{StorageRole, create_storage_for_role};
-use crate::sync_catalog::finish_phase;
+use crate::task_stream::finish_phase;
 
 // ─────────────────────────────────────────────────
 // Integrity Check 数据模型
