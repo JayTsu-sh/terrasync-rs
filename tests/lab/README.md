@@ -86,6 +86,20 @@ unchanged. These are catalogue/cleanup contract checks; they do not validate the
 change to delete before asynchronous database confirmation, the whole-job failure callback,
 version-history purge, six-replica topology or throughput/RSS targets.
 
+`python3 tests/lab/run-notification-archive-local.py --rename-generations` uses real
+ClickHouse Single and the two-replica Cluster to compare the same file/directory,
+verify its persisted state changed, inject a connection failure, and reopen with
+a new path observation for that same stable identity. It covers one, two and five interrupted rounds:
+committed state stays fixed, working state stays fixed, and the final rename resolves
+from the confirmed old target path. Occupied/swapped paths must copy before replacing
+confirmed facts; an already copied new target must not be overwritten by an older rename. A component case also runs real Local target
+rename for both source-retaining and source-deleting policies, keeping the source for
+the later cleanup stage. Source stable identities in these cases are deterministic
+NFS-shaped observations; this does not claim a real NFS/CIFS source, whole-process
+SIGKILL, whole-job callback, or throughput/RSS validation. Local execution tests
+separately recover an already-moved but unrecorded target by copying current source
+bytes, including explicit full verification; recovered missing-path errors stay in logs.
+
 `python3 tests/lab/run-notification-archive-local.py` validates the database notification archive
 in isolated ClickHouse single-server and one-shard/two-replica deployments, with an embedded Keeper.
 It requires `docker`, `nsenter`, cached Rust dependencies, and

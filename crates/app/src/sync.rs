@@ -427,13 +427,13 @@ async fn process_entry_inner(
         )
         .await?;
 
-        // data-mover 在发布文件前应用协商后的元数据。
+        // 复制入口复用扫描观察应用并校验元数据。
 
         debug!("Copied file (resumable) {:?}", relative_path);
     } else {
         debug!("Copying file {:?}", relative_path);
 
-        // 调用 data_mover 的 copy_file（处理 QoS、完整性检查、源文件删除）
+        // 传输入口处理 QoS、所选校验及元数据；源清理由任务层单独执行
         copy_transfer::copy_entry(
             &src_storage,
             &dest_storage,
@@ -448,7 +448,7 @@ async fn process_entry_inner(
         )
         .await?;
 
-        // data-mover 在发布文件前应用协商后的元数据。
+        // 复制入口复用扫描观察应用并校验元数据。
 
         debug!("Copied file {:?}", relative_path);
     }
@@ -681,30 +681,6 @@ pub(crate) async fn copy_file_with_resume(
 
     let result = res.map_err(AppError::from);
     recorder.finish(result).await
-}
-
-/// 处理单个文件或目录的复制
-pub(crate) async fn process_rename_entry(
-    from_entry: Arc<ObservedEntry>, to_entry: Arc<ObservedEntry>, _src_storage: Arc<StorageContext>,
-    dest_storage: Arc<StorageContext>, _is_source_reserved: bool,
-) -> Result<()> {
-    let from_path = from_entry.get_relative_path();
-    let to_path = to_entry.get_relative_path();
-    let span = info_span!("process_rename", from = %from_path.display(), to = %to_path.display());
-
-    async {
-        trace!("rename file: {:?} to {:?}", from_path, to_path);
-
-        dest_storage
-            .roles
-            .namespace()?
-            .rename(from_entry.path(), to_entry.path())
-            .await?;
-
-        Ok(())
-    }
-    .instrument(span)
-    .await
 }
 
 #[cfg(test)]

@@ -249,13 +249,20 @@ impl JoinStrategy {
             Self::Path => format!(
                 "SELECT {columns} FROM {temp} as t \
                  WHERE (t.relative_path, t.version_id) NOT IN \
-                 (SELECT relative_path, version_id FROM {base}) \
+                 (SELECT relative_path, version_id FROM {base} FINAL WHERE copy_path_confirmed) \
                  ORDER BY t.relative_path, t.history_segment, t.history_index, t.version_id"
             ),
             Self::FileHandle => format!(
                 "SELECT {columns} FROM {temp} as t \
                  WHERE t.file_handle NOT IN \
-                 (SELECT file_handle FROM {base} WHERE file_handle IS NOT NULL) \
+                 (SELECT file_handle FROM {base} FINAL WHERE copy_path_confirmed AND file_handle IS NOT NULL) \
+                 OR (t.relative_path,t.version_id) IN \
+                 (SELECT p.relative_path,p.version_id FROM {temp} p \
+                  JOIN (SELECT relative_path,version_id,file_handle FROM {base} FINAL \
+                        WHERE copy_path_confirmed AND (relative_path,version_id) IN \
+                        (SELECT relative_path,version_id FROM {temp})) f \
+                  ON p.relative_path=f.relative_path AND p.version_id=f.version_id \
+                  WHERE NOT ifNull(p.file_handle=f.file_handle,p.file_handle IS NULL AND f.file_handle IS NULL)) \
                  ORDER BY t.relative_path, t.history_segment, t.history_index, t.version_id"
             ),
         }
@@ -305,7 +312,7 @@ impl JoinStrategy {
                 "SELECT {t_columns} FROM {temp} t \
                  JOIN (SELECT relative_path, version_id, size, mtime, mode, uid, gid, is_dir, marker_state, metadata_digests \
                        FROM {base} FINAL \
-                       WHERE (relative_path, version_id) IN \
+                       WHERE copy_path_confirmed AND (relative_path, version_id) IN \
                              (SELECT relative_path, version_id FROM {temp}) \
                        ORDER BY relative_path, version_id \
                        LIMIT 1 BY (relative_path, version_id) \
@@ -317,7 +324,7 @@ impl JoinStrategy {
                 "SELECT {t_columns} FROM {temp} t \
                  JOIN (SELECT file_handle, relative_path, size, mtime, mode, uid, gid, is_dir, marker_state, metadata_digests \
                        FROM {base} FINAL \
-                       WHERE file_handle IN \
+                       WHERE copy_path_confirmed AND file_handle IN \
                              (SELECT file_handle FROM {temp} WHERE file_handle IS NOT NULL) \
                        ORDER BY file_handle, relative_path \
                        LIMIT 1 BY (file_handle, relative_path) \
@@ -335,7 +342,7 @@ impl JoinStrategy {
         let columns = &*FILE_SCAN_COLUMNS_LIST;
         format!(
             "SELECT {columns} FROM {base} FINAL \
-             WHERE current_state = ? \
+             WHERE current_state = ? AND copy_path_confirmed \
              ORDER BY relative_path, version_id"
         )
     }
@@ -345,9 +352,9 @@ impl JoinStrategy {
         let columns = &*FILE_SCAN_COLUMNS_LIST;
         let placeholders = vec!["?"; batch_size].join(", ");
         format!(
-            "SELECT {columns} FROM {base} \
-             WHERE file_handle IN ({placeholders}) \
-             ORDER BY file_handle, ctime, version_id \
+            "SELECT {columns} FROM {base} FINAL \
+             WHERE file_handle IN ({placeholders}) AND current_state = ? AND (? OR NOT copy_path_confirmed) \
+             ORDER BY file_handle, relative_path, version_id \
              LIMIT 1 BY (relative_path, version_id)"
         )
     }
@@ -363,6 +370,20 @@ impl ClickHouseDatabase {
 
         let temp_table_name = self.catalogue_query_table(temp_table_name)?;
         let base_table_name = self.catalogue_query_table(&get_scan_base_table_name(&self.job_id))?;
+        let copying = self.generation_lifecycle.lock().await.copy_request_key.is_some();
+        let columns = if copying {
+            format!("{OBSERVED_COLUMNS},copy_path_confirmed")
+        } else {
+            OBSERVED_COLUMNS.to_string()
+        };
+        // 只继承同一路径已有的目标确认；新观察的 rename 路径在物理操作成功前保持未确认。
+        let projection = if copying {
+            format!(
+                "{OBSERVED_COLUMNS},(relative_path,version_id,ifNull(file_handle,'')) IN (SELECT relative_path,version_id,ifNull(file_handle,'') FROM {base_table_name} FINAL WHERE copy_path_confirmed AND (relative_path,version_id) IN (SELECT relative_path,version_id FROM {temp_table_name}))"
+            )
+        } else {
+            OBSERVED_COLUMNS.to_string()
+        };
 
         debug!(
             "Inserting data from temporary table {} to base table {} (excluded: {} paths)",
@@ -373,10 +394,8 @@ impl ClickHouseDatabase {
 
         if excluded_paths.is_empty() {
             // 增量扫描：全量插入（无额外开销）
-            let insert_sql = format!(
-                "INSERT INTO {} ({}) SELECT {} FROM {}",
-                base_table_name, OBSERVED_COLUMNS, OBSERVED_COLUMNS, temp_table_name
-            );
+            let insert_sql =
+                format!("INSERT INTO {base_table_name} ({columns}) SELECT {projection} FROM {temp_table_name}");
             self.execute(&insert_sql, &[]).await?;
         } else {
             // 增量拷贝：Memory 排除表 + NOT IN 过滤
@@ -391,10 +410,9 @@ impl ClickHouseDatabase {
             // 3. 带过滤的 INSERT INTO SELECT
             let exclude_query_table = self.catalogue_query_table(&exclude_table)?;
             let insert_sql = format!(
-                "INSERT INTO {} ({}) SELECT {} FROM {} \
+                "INSERT INTO {base_table_name} ({columns}) SELECT {projection} FROM {temp_table_name} \
                  WHERE (relative_path, version_id) NOT IN \
-                 (SELECT relative_path, version_id FROM {})",
-                base_table_name, OBSERVED_COLUMNS, OBSERVED_COLUMNS, temp_table_name, exclude_query_table
+                 (SELECT relative_path, version_id FROM {exclude_query_table})"
             );
             self.execute(&insert_sql, &[]).await?;
 

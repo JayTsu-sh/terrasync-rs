@@ -53,6 +53,7 @@ impl ClickHouseDatabase {
         }
         let mut lifecycle = self.generation_lifecycle.lock().await;
         let saved = self.copy_generation_state().await?;
+        // scan_state 只保存已提交 C；所有失败重试复用 W=1-C，开始时不能先发布 W。
         let previous = saved.scan_state;
         let reset = !source_reserved && !saved.copy_source_reserved;
         let recovering = !reset && !saved.copy_request_key.is_empty() && saved.copy_in_progress;
@@ -67,11 +68,17 @@ impl ClickHouseDatabase {
         let working = 1 - previous;
         if recovering {
             let base = self.catalogue_storage_table(&get_scan_base_table_name(&self.job_id))?;
+            // 扫描见过的新路径不代表目标已完成 rename；重试只保留已确认目标路径。
+            self.execute(
+                &format!("ALTER TABLE {base} DELETE WHERE NOT copy_path_confirmed SETTINGS mutations_sync=2"),
+                &[],
+            )
+            .await?;
             self.execute(&format!("ALTER TABLE {base} UPDATE current_state={previous} WHERE current_state!={previous} SETTINGS mutations_sync=2"), &[]).await?;
         }
         let table = get_scan_state_table_name(&self.job_id);
         self.execute(&format!(
-            "INSERT INTO {table} (id,scan_state,baseline_committed,copy_in_progress,copy_request_key,copy_source_reserved) VALUES (1,{working},false,true,?,?)"
+            "INSERT INTO {table} (id,scan_state,baseline_committed,copy_in_progress,copy_request_key,copy_source_reserved) VALUES (1,{previous},false,true,?,?)"
         ), &[Value::from(request_key), Value::from(source_reserved)]).await?;
         *lifecycle = ScanGenerationLifecycle {
             working: Some(working),

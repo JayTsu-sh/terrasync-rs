@@ -159,7 +159,7 @@ impl ClickHouseDatabase {
         let base_table_name = get_scan_base_table_name(&self.job_id);
         debug!("[query_storage_entry] base table name: {}", base_table_name);
 
-        let mut where_conditions = Vec::new();
+        let mut where_conditions = vec!["copy_path_confirmed".to_string()];
         let mut ext_bind: Option<String> = None;
 
         if let Some(dir_val) = is_dir {

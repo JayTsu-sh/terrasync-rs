@@ -79,11 +79,18 @@ async fn failed_copy_rebases_confirmed_rows_without_clearing_or_forcing_replay()
         copy_request_key: "bound-plan".into(),
         copy_source_reserved: true,
     }]));
+    let retire_unconfirmed = mock.add(handlers::record_ddl());
     let rebase = mock.add(handlers::record_ddl());
     mock.add(handlers::record_ddl());
     assert_eq!(
         database.begin_copy_generation("bound-plan", true).await?,
         CopyGenerationStatus::Recovering
+    );
+    assert!(
+        retire_unconfirmed
+            .query()
+            .await
+            .contains("DELETE WHERE NOT copy_path_confirmed")
     );
     assert!(rebase.query().await.starts_with("ALTER TABLE"));
     assert!(!database.is_copy_recovery().await);
@@ -123,6 +130,11 @@ async fn source_policy_controls_baseline_reuse_even_after_an_incomplete_generati
                 } else {
                     None
                 };
+                let rebase = if incomplete && !reset {
+                    Some(mock.add(handlers::record_ddl()))
+                } else {
+                    None
+                };
                 let begin = mock.add(handlers::record_ddl());
                 let actual = database
                     .begin_copy_generation("same-endpoints", source_reserved)
@@ -146,6 +158,9 @@ async fn source_policy_controls_baseline_reuse_even_after_an_incomplete_generati
                         .await
                         .ends_with(&format!("'same-endpoints',{source_reserved})"))
                 );
+                if let Some(rebase) = rebase {
+                    assert!(rebase.query().await.contains("UPDATE current_state=1"));
+                }
                 let commit = mock.add(handlers::record_ddl());
                 database.commit_scan_generation().await?;
                 assert!(

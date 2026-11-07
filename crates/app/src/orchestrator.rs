@@ -65,6 +65,7 @@ use crate::file_copy::VersionFailureContext;
 use crate::integrity_check::verify_storage_time;
 use crate::migration_plan::MigrationPlan;
 use crate::receiver::{ReceiverConfig, process_entry_on_receiver};
+use crate::rename::{RenameOptions, RenameOutcome, rename_or_copy};
 use crate::scan::ScanType;
 use crate::sender::{SenderWorkerConfig, sender_worker};
 use crate::source_cleanup::remove_confirmed_sources;
@@ -73,11 +74,15 @@ use crate::storage_factory::{StorageRole, create_storage_for_role};
 use crate::sync::check_admin_privileges;
 use crate::sync::{
     CommitRecorder, ResumeOpts, StoragePair, parse_size, process_entry, process_metadata_only_entry,
-    process_rename_entry, process_versioned_entry,
+    process_versioned_entry,
 };
 use crate::sync_catalog::{batch_processing_to_generate_message, determine_sync_type};
 use crate::task_stream::finish_phase;
 use crate::{dir_walker, tar_pack};
+
+#[cfg(test)]
+#[path = "orchestrator_rename_tests.rs"]
+mod rename_tests;
 
 /// 大文件日志阈值（512 MiB）
 const LARGE_FILE_LOG_THRESHOLD: u64 = 512 * 1024 * 1024;
@@ -1105,37 +1110,39 @@ impl SyncOrchestrator {
                                 }
                             }
                             StorageEntryMessage::Renamed((ref from_entry, ref to_entry)) => {
-                                if from_entry.get_name() == to_entry.get_name() {
-                                    // 同名 rename（父目录移动）：直接广播
-                                    bc.broadcast(message.clone()).await?;
-                                } else {
-                                    match process_rename_entry(
-                                        from_entry.clone(),
-                                        to_entry.clone(),
-                                        src.clone(),
-                                        dest.clone(),
-                                        is_source_reserved,
-                                    )
-                                    .await
-                                    {
-                                        Ok(()) => bc.broadcast(message.clone()).await?,
-                                        Err(e) => {
-                                            error!(
-                                                "Handler {}: Failed to rename {:?} to {:?}: {}",
-                                                handler_id,
-                                                from_entry.get_relative_path(),
-                                                to_entry.get_relative_path(),
-                                                e
-                                            );
-                                            bc.broadcast(StorageEntryMessage::Error {
-                                                event: ErrorEvent::Rename,
-                                                path: to_entry.get_relative_path().to_path_buf(),
-                                                entry: Some(to_entry.clone()),
-                                                reason: format!("{e}"),
-                                            })
-                                            .await?;
-                                            failure.get_or_insert(e.into());
-                                        }
+                                match rename_or_copy(
+                                    from_entry.clone(),
+                                    to_entry.clone(),
+                                    src.clone(),
+                                    dest.clone(),
+                                    RenameOptions {
+                                        enable_integrity_check,
+                                        enable_acl,
+                                        resume: resume_opts.clone(),
+                                        qos: qos.clone(),
+                                        bytes: bt.clone(),
+                                        events: &bc,
+                                    },
+                                )
+                                .await
+                                {
+                                    Ok(_) => bc.broadcast(message.clone()).await?,
+                                    Err(e) => {
+                                        error!(
+                                            "Handler {}: Failed to rename {:?} to {:?}: {}",
+                                            handler_id,
+                                            from_entry.get_relative_path(),
+                                            to_entry.get_relative_path(),
+                                            e
+                                        );
+                                        bc.broadcast(StorageEntryMessage::Error {
+                                            event: ErrorEvent::Rename,
+                                            path: to_entry.get_relative_path().to_path_buf(),
+                                            entry: Some(to_entry.clone()),
+                                            reason: format!("{e}"),
+                                        })
+                                        .await?;
+                                        failure.get_or_insert(e.into());
                                     }
                                 }
                             }
@@ -1510,11 +1517,11 @@ impl SyncOrchestrator {
     /// 构建 `renamed_dirs` 映射（`old_dir_path` → `new_dir_path`）。
     ///
     /// **第二遍**：顺序执行物理操作。对每条 `Renamed(from, to)` 判断是否跳过：
-    /// - `from.name != to.name`：目录/文件本身改了名字 → 必须调用 `process_rename_entry`
+    /// - `from.name != to.name`：目录/文件本身改了名字 → 必须调用 `rename_or_copy`
     /// - `from.name == to.name` 且 `from.parent` 在 `renamed_dirs` 中且映射到 `to.parent`：
     ///   父目录的 NFS RENAME 已传递性地移动了这个子条目 → 跳过物理操作
     /// - `from.name == to.name` 但父目录未在 `renamed_dirs` 中（跨父目录 move）：
-    ///   没有父目录 rename 代为处理 → 必须调用 `process_rename_entry`
+    ///   没有父目录 rename 代为处理 → 必须调用 `rename_or_copy`
     ///
     /// 对于 rename 成功后检测到内容或元数据也同时变化的普通文件，额外执行内容拷贝
     /// 或元数据更新（处理「rename + data/metadata changed」复合场景）。
@@ -1525,19 +1532,15 @@ impl SyncOrchestrator {
         qos_manager: Option<QosManager>, bytes_counter: Option<Arc<AtomicU64>>, job_id: &str, job_dir: &str,
         transfer_mode: TransferMode,
     ) -> Result<()> {
-        // 移动后源端缺失是已搬运事实，不能据此删除目标。
-        if !is_source_reserved {
-            return Ok(());
-        }
         let deletion_iter = db.detect_deleted_items().await?;
         let mut failure: Option<AppError> = None;
 
-        // 第一遍：一次性收集，构建「所有目录 rename」映射表。
-        // 映射语义：renamed_dirs[old_dir_path] = new_dir_path
+        // 第一遍：收集目录 rename 计划及待确认状态。
+        // 映射同时保存目标路径和实际移动确认，计划存在不代表子树已经移动。
         // 收录所有 is_dir=true 的 Renamed 条目（包括同名跨父目录 move 如 d3/d3_4 → d4/d3_4）。
         // 用于判断某条目的父目录是否正在被 rename，若是则子条目无需单独执行物理操作。
         let statuses: Vec<DeletionStatus> = deletion_iter.collect();
-        let renamed_dirs: HashMap<PathBuf, PathBuf> = statuses
+        let mut renamed_dirs: HashMap<PathBuf, (PathBuf, bool)> = statuses
             .iter()
             .filter_map(|s| {
                 if let DeletionStatus::Renamed(from, to) = s
@@ -1545,7 +1548,7 @@ impl SyncOrchestrator {
                 {
                     return Some((
                         from.get_relative_path().to_path_buf(),
-                        to.get_relative_path().to_path_buf(),
+                        (to.get_relative_path().to_path_buf(), false),
                     ));
                 }
                 None
@@ -1556,6 +1559,10 @@ impl SyncOrchestrator {
         for status in statuses {
             match status {
                 DeletionStatus::Deleted(entry) => {
+                    // 搬迁不将源缺失反向删除目标；rename 仍需推进，不能跳过整个阶段。
+                    if !is_source_reserved {
+                        continue;
+                    }
                     let entry_arc = Arc::new(entry);
                     let result = if entry_arc.get_is_dir() {
                         deletion::delete_dir_all(dest_storage.storage(), &entry_arc).await
@@ -1593,29 +1600,48 @@ impl SyncOrchestrator {
                         let from_parent = from_arc.get_relative_path().parent().map(PathBuf::from);
                         let to_parent = to_arc.get_relative_path().parent().map(PathBuf::from);
                         match (from_parent, to_parent) {
-                            (Some(fp), Some(tp)) => renamed_dirs.get(&fp).is_some_and(|d| d == &tp),
+                            (Some(fp), Some(tp)) => renamed_dirs
+                                .get(&fp)
+                                .is_some_and(|(path, completed)| *completed && path == &tp),
                             _ => false,
                         }
                     };
 
                     let dest_op_result = if skip_physical {
-                        Ok(())
+                        Ok(RenameOutcome::Moved)
                     } else {
-                        process_rename_entry(
+                        rename_or_copy(
                             from_arc.clone(),
                             to_arc.clone(),
                             src_storage.clone(),
                             dest_storage.clone(),
-                            true,
+                            RenameOptions {
+                                enable_integrity_check,
+                                enable_acl: false,
+                                resume: ResumeOpts {
+                                    job_id: job_id.into(),
+                                    job_dir: job_dir.into(),
+                                    transfer_mode,
+                                },
+                                qos: qos_manager.clone(),
+                                bytes: bytes_counter.clone(),
+                                events: broadcaster,
+                            },
                         )
                         .await
                     };
 
                     match dest_op_result {
-                        Ok(()) => {
+                        Ok(outcome) => {
+                            if outcome == RenameOutcome::Moved
+                                && let Some((_, completed)) = renamed_dirs.get_mut(from_arc.get_relative_path())
+                            {
+                                *completed = true;
+                            }
                             // Phase A 不再把路径已变的文件判为 Changed（Fix 2a），
                             // 此处补足 rename+changed 文件的内容/元数据同步，并广播 Changed 消息供消费者统计。
-                            if !from_arc.get_is_dir()
+                            if outcome == RenameOutcome::Moved
+                                && !from_arc.get_is_dir()
                                 && !from_arc.get_is_symlink()
                                 && let Some(kind) = ChangeKind::from_entry_diff(&from_arc, &to_arc)
                             {
@@ -1653,22 +1679,6 @@ impl SyncOrchestrator {
                                     .await?;
                             }
 
-                            if !is_source_reserved {
-                                if let Err(error) = copy_namespace::delete_file(src_storage.storage(), &to_arc).await
-                                    && !error.is_not_found()
-                                {
-                                    broadcaster
-                                        .broadcast(StorageEntryMessage::Error {
-                                            event: ErrorEvent::Delete,
-                                            path: to_arc.get_relative_path().to_path_buf(),
-                                            entry: Some(to_arc.clone()),
-                                            reason: error.to_string(),
-                                        })
-                                        .await?;
-                                    failure.get_or_insert(error.into());
-                                    continue;
-                                }
-                            }
                             broadcaster
                                 .broadcast(StorageEntryMessage::Renamed((from_arc, to_arc)))
                                 .await?;

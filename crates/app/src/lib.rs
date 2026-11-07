@@ -48,6 +48,7 @@ mod migration_plan;
 ///
 /// SyncOrchestrator 封装 sync/incremental_sync 的核心逻辑
 pub mod orchestrator;
+mod rename;
 pub mod scan_resume;
 mod source_cleanup;
 mod sync_catalog;

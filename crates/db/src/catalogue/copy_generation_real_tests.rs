@@ -1,5 +1,6 @@
 //! 真实 Single／Cluster 上验证策略切换、失败代次与记录缺失。
 
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use clickhouse::Client;
@@ -10,10 +11,14 @@ use utils::app_config::ClickHouseMode;
 use uuid::Uuid;
 
 use super::CopyGenerationStatus;
+use crate::DeletionStatus;
+use crate::catalogue::ComparisonMode;
 use crate::execution::base_client;
 use crate::observed_fixtures::observation;
+use crate::schema::identity::encoded_file_handle;
 use crate::{ClickHouseConfig, ClickHouseDatabase, DatabaseError, Result};
-use data_mover::model::{BackendKind, EntryKind};
+use data_mover::model::{BackendKind, EntryKind, ObservedEntry};
+use task_model::EntryChange;
 
 struct Fixture {
     config: ClickHouseConfig,
@@ -177,7 +182,7 @@ async fn read_faults(fixture: &Fixture) -> Result<()> {
 async fn real_copy_generation_policies() -> Result<()> {
     for cluster in [false, true] {
         let fixture = Fixture::new(cluster).await?;
-        let result = async {
+        let result: Result<()> = async {
             for previous_reserved in [false, true] {
                 for incomplete in [false, true] {
                     for empty in [false, true] {
@@ -186,6 +191,233 @@ async fn real_copy_generation_policies() -> Result<()> {
                 }
             }
             read_faults(&fixture).await
+        }
+        .await;
+        let cleanup = fixture.cleanup().await;
+        result?;
+        cleanup?;
+    }
+    Ok(())
+}
+
+fn rename_entry(path: &str, directory: bool) -> Arc<ObservedEntry> {
+    observation(
+        BackendKind::Nfs,
+        path.into(),
+        if directory {
+            EntryKind::Directory
+        } else {
+            EntryKind::File
+        },
+        7,
+        [0, 11, 0],
+        None,
+        Some(b"same-stable-object".to_vec()),
+        None,
+        None,
+    )
+    .into()
+}
+
+async fn fail_after_comparison(fixture: &Fixture, database: &ClickHouseDatabase) -> Result<()> {
+    fixture.fault("disconnect").await?;
+    let failure = database.copy_catalogue_source_reserved().await;
+    fixture.fault("normal").await?;
+    assert!(
+        failure.is_err(),
+        "the generation must stop after a real database failure"
+    );
+    Ok(())
+}
+
+async fn rename_after_changed_state(fixture: &Fixture, directory: bool, interruptions: usize) -> Result<()> {
+    let job = format!("rename_{directory}_{interruptions}");
+    let first = fixture.open(&job).await?;
+    first.initialize().await?;
+    first.begin_copy_generation("same-endpoints", true).await?;
+    first
+        .batch_insert_base_record(&[rename_entry("old", directory)])
+        .await?;
+    first.commit_scan_generation().await?;
+    let committed = first.query_scan_state().await?;
+    drop(first);
+    for round in 0..interruptions {
+        let database = fixture.open(&job).await?;
+        database.begin_copy_generation("same-endpoints", true).await?;
+        assert_eq!(
+            database.query_scan_state().await?,
+            committed,
+            "failed generations must not advance the committed state"
+        );
+        assert_eq!(
+            database.get_cached_scan_state().await?,
+            1 - committed.unwrap_or_default()
+        );
+        let path = if round == 0 {
+            "old".into()
+        } else {
+            format!("renamed_{round}")
+        };
+        let changes = database
+            .compare_catalogue_batch(
+                &[rename_entry(&path, directory)],
+                ComparisonMode::AwaitCopyAcknowledgement,
+            )
+            .await?;
+        assert!(changes.is_empty());
+        let state: u8 = base_client(&fixture.config)?
+            .query(&format!(
+                "SELECT current_state FROM base_{job} FINAL WHERE relative_path=?"
+            ))
+            .bind(&path)
+            .fetch_one()
+            .await?;
+        assert_eq!(
+            state,
+            1 - committed.unwrap_or_default(),
+            "retry uses the same working state"
+        );
+        if round == 0 {
+            assert_ne!(
+                Some(state),
+                committed,
+                "the same item must have persisted a changed state before failure"
+            );
+        }
+        eprintln!(
+            "rename-repro directory={directory} round={round} path={path} committed={committed:?} compared_state={state} before_failure=true"
+        );
+        fail_after_comparison(fixture, &database).await?;
+        drop(database);
+    }
+    let database = fixture.open(&job).await?;
+    database.begin_copy_generation("same-endpoints", true).await?;
+    let latest = format!("renamed_{interruptions}");
+    assert!(
+        database
+            .compare_catalogue_batch(
+                &[rename_entry(&latest, directory)],
+                ComparisonMode::AwaitCopyAcknowledgement
+            )
+            .await?
+            .is_empty()
+    );
+    let changes: Vec<_> = database.detect_deleted_items().await?.collect();
+    assert!(
+        changes.iter().any(|change| matches!(change,
+        DeletionStatus::Renamed(from, to) if from.path().as_str()=="old" && to.path().as_str()==latest)),
+        "rename after confirmed comparison and failure must not disappear: {changes:?}"
+    );
+    Ok(())
+}
+
+async fn reused_paths_are_copied_before_replacing_confirmed_target_facts(fixture: &Fixture) -> Result<()> {
+    let database = fixture.open("reused_paths").await?;
+    database.initialize().await?;
+    database.begin_copy_generation("same-endpoints", true).await?;
+    let entry = |path: &str, identity: &[u8]| {
+        Arc::new(observation(
+            BackendKind::Nfs,
+            path.into(),
+            EntryKind::File,
+            7,
+            [0, 11, 0],
+            None,
+            Some(identity.to_vec()),
+            None,
+            None,
+        ))
+    };
+    let original = [entry("a", b"identity-a"), entry("b", b"identity-b")];
+    database.batch_insert_base_record(&original).await?;
+    database.commit_scan_generation().await?;
+    database.begin_copy_generation("same-endpoints", true).await?;
+    let observed = [entry("a", b"identity-b"), entry("b", b"identity-a")];
+    let changes = database
+        .compare_catalogue_batch(&observed, ComparisonMode::AwaitCopyAcknowledgement)
+        .await?;
+    assert_eq!(
+        changes.len(),
+        2,
+        "occupied paths must produce copy work rather than erase old confirmed facts"
+    );
+    assert!(changes.iter().all(|change| change.kind == EntryChange::New));
+    let (identity, confirmed): (Option<String>, bool) = base_client(&fixture.config)?
+        .query("SELECT file_handle,copy_path_confirmed FROM base_reused_paths FINAL WHERE relative_path='a'")
+        .fetch_one()
+        .await?;
+    assert_eq!(identity, encoded_file_handle(&original[0]));
+    assert!(confirmed);
+    let completed: Vec<_> = changes.into_iter().map(|change| change.item).collect();
+    database.batch_insert_completed_records(&completed).await?;
+    assert_eq!(database.detect_deleted_items().await?.count(), 0);
+    database.commit_scan_generation().await?;
+    let database = fixture.open("occupied_rename").await?;
+    database.initialize().await?;
+    database.begin_copy_generation("same-endpoints", true).await?;
+    database.batch_insert_base_record(&original).await?;
+    database.commit_scan_generation().await?;
+    database.begin_copy_generation("same-endpoints", true).await?;
+    let current = [entry("b", b"identity-a")];
+    let changes = database
+        .compare_catalogue_batch(&current, ComparisonMode::AwaitCopyAcknowledgement)
+        .await?;
+    assert_eq!(changes.len(), 1);
+    let completed: Vec<_> = changes.into_iter().map(|change| change.item).collect();
+    database.batch_insert_completed_records(&completed).await?;
+    let remaining: Vec<_> = database.detect_deleted_items().await?.collect();
+    assert!(
+        matches!(remaining.as_slice(), [DeletionStatus::Deleted(old)] if old.path().as_str()=="a"),
+        "an already copied current target must not be overwritten by an older rename: {remaining:?}"
+    );
+    Ok(())
+}
+
+async fn successful_rounds_advance_once_while_reusing_marker_payloads(fixture: &Fixture) -> Result<()> {
+    for reserved in [false, true] {
+        let job = format!("state_cycles_{reserved}");
+        let first = fixture.open(&job).await?;
+        first.initialize().await?;
+        drop(first);
+        for round in 0..6 {
+            let database = fixture.open(&job).await?;
+            let committed = database.query_scan_state().await?.unwrap_or_default();
+            database.begin_copy_generation("same-endpoints", reserved).await?;
+            let (started_state, in_progress): (u8, bool) = base_client(&fixture.config)?
+                .query(&format!(
+                    "SELECT scan_state,copy_in_progress FROM state_{job} FINAL WHERE id=1"
+                ))
+                .fetch_one()
+                .await?;
+            assert_eq!(started_state, committed);
+            assert!(in_progress, "reused marker payload must still mark a new started round");
+            assert_eq!(database.get_cached_scan_state().await?, 1 - committed);
+            database.commit_scan_generation().await?;
+            assert_eq!(database.query_scan_state().await?, Some(1 - committed));
+            eprintln!(
+                "state-cycle cluster={} source_reserved={reserved} round={round} committed_before={committed} committed_after={} marker_confirmed=true",
+                fixture.config.cluster.is_some(),
+                1 - committed
+            );
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires owned ClickHouse pair and fault proxy from run-notification-archive-local.py --rename-generations"]
+async fn real_rename_after_failed_comparison_of_the_same_item() -> Result<()> {
+    for cluster in [false, true] {
+        let fixture = Fixture::new(cluster).await?;
+        let result: Result<()> = async {
+            for directory in [false, true] {
+                for interruptions in [1, 2, 5] {
+                    rename_after_changed_state(&fixture, directory, interruptions).await?;
+                }
+            }
+            reused_paths_are_copied_before_replacing_confirmed_target_facts(&fixture).await?;
+            successful_rounds_advance_once_while_reusing_marker_payloads(&fixture).await?;
+            Ok(())
         }
         .await;
         let cleanup = fixture.cleanup().await;

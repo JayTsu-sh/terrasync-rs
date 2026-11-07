@@ -23,6 +23,7 @@ macro_rules! file_scan_base_columns {
     is_regular_file Bool DEFAULT 0,
     hard_links UInt32 DEFAULT 0,
     current_state UInt8,
+    copy_path_confirmed Bool DEFAULT true,
     uid Nullable(UInt32) DEFAULT NULL,
     gid Nullable(UInt32) DEFAULT NULL,
     ino Nullable(UInt64) DEFAULT NULL,

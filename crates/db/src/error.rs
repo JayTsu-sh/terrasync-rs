@@ -28,6 +28,15 @@ pub(crate) struct ScanCancellationDeadline;
 /// 使用thiserror库实现错误处理和转换
 #[derive(Error, Debug)]
 pub enum DatabaseError {
+    #[error(
+        "Cannot determine rename for {path}: {reason}; confirmed missing paths={confirmed_paths}, current observed paths={observed_paths}"
+    )]
+    RenameAssociationInvalid {
+        path: String,
+        reason: &'static str,
+        confirmed_paths: usize,
+        observed_paths: usize,
+    },
     #[error("Notification request timed out; its outcome is unconfirmed: {source}")]
     NotificationRequestTimedOut {
         #[source]
@@ -208,6 +217,7 @@ impl DatabaseError {
     /// 日志只暴露稳定分类和服务端数字码，原始响应可能含 SQL 或绑定值，留在 typed cause 中。
     pub fn diagnostic_class(&self) -> (&'static str, Option<u32>) {
         match self {
+            Self::RenameAssociationInvalid { .. } => ("rename_association_invalid", None),
             Self::ScanRequestFailed { source } | Self::ScanDatabaseUnavailable { source, .. } => {
                 source.diagnostic_class()
             }
