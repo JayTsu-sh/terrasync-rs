@@ -12,6 +12,7 @@ use utils::app_config::AppConfig;
 use utils::app_config::DatabaseConfig;
 
 // 内部模块
+use crate::callback::CallbackEndpoint;
 use crate::error::Result;
 use crate::scan::ScanType;
 
@@ -93,7 +94,7 @@ pub struct ConsumerConfig {
     pub console_config: ConsoleConfig,
     /// 进度回调 URL（由环境变量 `TERRASYNC_PROGRESS_CALLBACK_URL` 拼接而成）
     /// 当 web 层启动任务时设置，CLI 模式下为 None
-    pub progress_callback_url: Option<String>,
+    pub progress_callback_url: Option<CallbackEndpoint>,
 }
 
 /// Sync/IncrementalSync 的统一任务配置
@@ -127,7 +128,7 @@ pub struct SyncJobConfig {
     pub package_depth: usize,
     pub raw_command_line: String,
     /// 进度回调 URL（web 层注入，CLI 为 None）
-    pub progress_callback_url: Option<String>,
+    pub progress_callback_url: Option<CallbackEndpoint>,
     /// 文件写入模式，由 CLI 参数优先级显式确定。
     pub transfer_mode: TransferMode,
     /// `--delete-target`：仅 `--remote` 双进程模式生效，控制是否清理目标端多余文件
@@ -169,7 +170,7 @@ pub fn initialize_scan_config(
 /// `progress_callback_url`：完整的 HTTP 回调 URL（web 层传入，CLI 传 `None`）
 pub fn initialize_consumer_config(
     job_id: &str, job_dir: &str, job_type: JobType, raw_command_line: String, app_config: &AppConfig,
-    progress_callback_url: Option<String>,
+    progress_callback_url: Option<CallbackEndpoint>,
 ) -> Result<ConsumerConfig> {
     let db_config = app_config.database.clone();
 

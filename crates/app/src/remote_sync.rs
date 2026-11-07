@@ -251,6 +251,7 @@ async fn send_and_check_auth(transport: &(dyn SenderTransport + 'static), auth_t
 #[cfg(test)]
 #[allow(clippy::expect_used, clippy::unwrap_used)]
 mod tests {
+    use crate::callback::CallbackEndpoint;
     use std::collections::HashMap;
     use std::fs;
     use std::fs::File;
@@ -2360,7 +2361,7 @@ mod tests {
             )),
             progress_bar: ProgressBar::new(JobType::IncrementalCopy),
             job_dir: String::new(),
-            callback_url: Some(callback_url),
+            callback_url: Some(CallbackEndpoint::parse(&callback_url).unwrap()),
             generation_committed: None,
             pb_handle: None,
             scan_snapshot: None,

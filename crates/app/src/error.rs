@@ -16,6 +16,7 @@ use db::error::DatabaseError;
 use licensing::error::LicenseError;
 use serde_json::Error as JsonError;
 pub mod storage;
+use crate::callback::CallbackEndpointError;
 pub use storage::StorageError;
 use thiserror::Error;
 use tokio::task::JoinError;
@@ -47,6 +48,8 @@ impl Display for CopyStep {
 /// 应用程序的专用错误枚举
 #[derive(Error, Debug)]
 pub enum AppError {
+    #[error("Invalid progress callback endpoint: {0}")]
+    CallbackEndpoint(#[from] CallbackEndpointError),
     #[error("{source}")]
     ReportedCopyFailure {
         #[source]

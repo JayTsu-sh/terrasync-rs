@@ -12,6 +12,7 @@ pub mod ace;
 pub mod task_stream;
 
 pub mod broadcast;
+pub mod callback;
 mod copy_dispatch;
 
 /// 双进程模式 Receiver 落盘任务模块

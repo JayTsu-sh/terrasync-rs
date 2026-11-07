@@ -12,6 +12,7 @@
 //! S3 目标没有真实目录对象，因此目录 entry 跳过目标 metadata 查询；文件的
 //! POSIX 元数据跳过策略由 data-mover 统一处理。
 
+use crate::callback::CallbackEndpoint;
 use crate::file_copy::metadata as copy_metadata;
 #[cfg(feature = "license")]
 use data_mover::probes::probe_server_time;
@@ -351,7 +352,7 @@ impl CheckContext {
 #[allow(clippy::too_many_arguments)]
 pub async fn integrity_check(
     job_id: String, job_dir: String, src_path: &str, dest_path: &str, quick: bool, auto_fix: bool,
-    raw_command_line: String, progress_callback_url: Option<String>,
+    raw_command_line: String, progress_callback_url: Option<CallbackEndpoint>,
 ) -> Result<()> {
     integrity_check_with_concurrency(
         job_id,
@@ -370,7 +371,7 @@ pub async fn integrity_check(
 #[allow(clippy::too_many_arguments)]
 pub async fn integrity_check_with_concurrency(
     job_id: String, job_dir: String, src_path: &str, dest_path: &str, quick: bool, auto_fix: bool,
-    raw_command_line: String, progress_callback_url: Option<String>, concurrency: Option<usize>,
+    raw_command_line: String, progress_callback_url: Option<CallbackEndpoint>, concurrency: Option<usize>,
 ) -> Result<()> {
     info!(
         "Starting integrity check between {} and {}",

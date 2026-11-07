@@ -63,6 +63,7 @@ rustls       = { version = "0.23", default-features = false, features = ["ring",
 
 # HTTP 客户端
 reqwest      = { version = "0.13", default-features = false, features = ["rustls", "json"] }
+url          = "2.5"
 
 # 外部 fork（固定精确提交，保证可复现）
 data-mover = { git = "https://github.com/JayTsu-sh/data-mover-rs.git", rev = "89e2e8a9b51d97d94144123073d48cb80f791760" }

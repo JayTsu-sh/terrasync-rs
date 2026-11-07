@@ -52,10 +52,11 @@ impl Subscriber for CallbackLogs {
 #[tokio::test]
 async fn failed_http_retries_same_batch_and_ack_preserves_new_errors() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let url = format!(
+    let url = CallbackEndpoint::parse(&format!(
         "http://callback-user-canary:callback-password-canary@{}/progress?token=callback-query-canary",
         listener.local_addr().unwrap()
-    );
+    ))
+    .unwrap();
     let server = tokio::spawn(async move {
         let mut batches = Vec::new();
         for index in 0..3 {

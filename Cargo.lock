@@ -172,6 +172,7 @@ dependencies = [
  "tokio-util",
  "tracing",
  "transport",
+ "url",
  "utils",
  "uuid",
  "windows-sys 0.61.2",

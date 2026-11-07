@@ -2,6 +2,7 @@ use app::error::StorageError;
 use std::sync::{Arc, OnceLock};
 use task_model::TransferMode;
 
+use app::callback::CallbackEndpoint;
 use app::error::AppError;
 use app::scan::{ScanRequest, scan};
 use app::scan_resume::{clear_scan, scan_execution_is_incremental};
@@ -35,15 +36,21 @@ pub fn set_progress_callback_base_url(url: String) {
 }
 
 /// 构造指定任务的完整回调 URL
-fn progress_callback_url_for(task_id: &str, execution_id: &str) -> Option<String> {
-    PROGRESS_CALLBACK_BASE_URL.get().map(|base| {
-        format!(
-            "{}/tasks/{}/progress?execution_id={}",
-            base.trim_end_matches('/'),
-            task_id,
-            execution_id
-        )
-    })
+fn progress_callback_url_for(task_id: &str, execution_id: &str) -> Result<Option<CallbackEndpoint>> {
+    PROGRESS_CALLBACK_BASE_URL
+        .get()
+        .map(|base| {
+            let value = format!(
+                "{}/tasks/{}/progress?execution_id={}",
+                base.trim_end_matches('/'),
+                task_id,
+                execution_id
+            );
+            CallbackEndpoint::parse(&value)
+                .map_err(AppError::from)
+                .map_err(WebError::from)
+        })
+        .transpose()
 }
 
 /// 最大并发任务数。`app::scan`/`sync` 内部使用了非 `Send` 的 `dyn Consumer`，
@@ -373,7 +380,7 @@ async fn run_migration_task(
             result.map_err(|_| WebError::ConnectionTestFailed("请先在设置中检查 ClickHouse 数据库配置".to_string()))?,
     }
 
-    let callback_url = progress_callback_url_for(task_id, execution_id);
+    let callback_url = progress_callback_url_for(task_id, execution_id)?;
 
     match task_type {
         TaskType::Scan => {

@@ -9,7 +9,6 @@
 //! 三段式编排；不再暴露一站式 `run`。
 
 // 标准库
-use std::net::IpAddr;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 use std::time::Duration;
@@ -31,6 +30,7 @@ use super::diagnostics::{CallbackAck, safe_diagnostic_text};
 use super::progress_bar::ProgressBar;
 use super::report::ProgressDetail;
 use super::report::ProgressReport;
+use crate::callback::CallbackEndpoint;
 use crate::scan::statistics::{ScanCounts, ScanSnapshot};
 
 /// HTTP 进度回调间隔（秒）
@@ -44,7 +44,7 @@ pub struct StatisticConsumer {
     pub stats: StatsKind,
     pub progress_bar: ProgressBar,
     pub job_dir: String,
-    pub callback_url: Option<String>,
+    pub callback_url: Option<CallbackEndpoint>,
     /// 纯增量扫描的 generation 是否成功提交；其他任务保持 `None`。
     pub generation_committed: Option<bool>,
     pub scan_snapshot: Option<ScanSnapshot>,
@@ -288,7 +288,9 @@ impl StatisticConsumer {
         report
     }
 
-    async fn post_callback(consumer: &Arc<Mutex<Self>>, client: &reqwest::Client, url: &str, is_final: bool) -> bool {
+    async fn post_callback(
+        consumer: &Arc<Mutex<Self>>, client: &reqwest::Client, url: &CallbackEndpoint, is_final: bool,
+    ) -> bool {
         let report = {
             let mut consumer = consumer.lock().await;
             consumer.callback.identity.sequence = consumer.callback.identity.sequence.saturating_add(1);
@@ -298,7 +300,7 @@ impl StatisticConsumer {
             report
         };
         let response = match client
-            .post(url)
+            .post(url.request_url().clone())
             .json(&report)
             .send()
             .await
@@ -327,25 +329,11 @@ impl StatisticConsumer {
 
     // ─── HTTP 回调 ───
 
-    fn callback_is_loopback(url: &str) -> bool {
-        let Ok(parsed) = reqwest::Url::parse(url) else {
-            return false;
-        };
-        let Some(host) = parsed.host_str() else {
-            return false;
-        };
-        let address_host = host.trim_start_matches('[').trim_end_matches(']');
-        host.eq_ignore_ascii_case("localhost")
-            || address_host
-                .parse::<IpAddr>()
-                .is_ok_and(|address| address.is_loopback())
-    }
-
     /// 构建共享的 HTTP 客户端（带超时），供回调循环和最终回调复用。
     /// 本机回调绕过系统代理，外部回调继续遵循代理环境变量。
-    fn build_callback_client(url: &str) -> Option<reqwest::Client> {
+    fn build_callback_client(url: &CallbackEndpoint) -> Option<reqwest::Client> {
         let mut builder = reqwest::Client::builder().timeout(Duration::from_secs(10));
-        if Self::callback_is_loopback(url) {
+        if url.is_loopback() {
             builder = builder.no_proxy();
         }
         match builder.build() {
@@ -471,6 +459,7 @@ impl StatisticConsumer {
 #[cfg(test)]
 mod tests {
     use super::StatisticConsumer;
+    use crate::callback::CallbackEndpoint;
     use crate::config::JobType;
     use crate::consumer::stats::{FullStats, IncrementalStats, ProgressBar, StatsKind};
     use crate::error::Result;
@@ -498,7 +487,7 @@ mod tests {
             )),
             progress_bar: ProgressBar::new(JobType::Scan),
             job_dir: String::new(),
-            callback_url: Some(format!("http://{address}/progress")),
+            callback_url: Some(CallbackEndpoint::parse(&format!("http://{address}/progress"))?),
             generation_committed: Some(false),
             pb_handle: None,
             scan_snapshot: None,
@@ -525,7 +514,7 @@ mod tests {
             "http://[::1]:3000/callback",
         ] {
             assert!(
-                StatisticConsumer::callback_is_loopback(url),
+                CallbackEndpoint::parse(url).is_ok_and(|endpoint| endpoint.is_loopback()),
                 "expected loopback URL: {url}"
             );
         }
@@ -536,7 +525,7 @@ mod tests {
             "not a URL",
         ] {
             assert!(
-                !StatisticConsumer::callback_is_loopback(url),
+                !CallbackEndpoint::parse(url).is_ok_and(|endpoint| endpoint.is_loopback()),
                 "expected external URL: {url}"
             );
         }

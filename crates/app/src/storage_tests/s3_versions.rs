@@ -3,6 +3,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use crate::broadcast::BroadcastForwarder;
+use crate::callback::CallbackEndpoint;
 use crate::config::JobType;
 use crate::consumer::stats::callback_state::CallbackState;
 use crate::consumer::stats::{FullStats, ProgressBar, ProgressDetail, StatisticConsumer, StatsKind};
@@ -179,7 +180,11 @@ async fn metadata_failures_copy_every_version_but_count_one_failed_entry() -> Te
         )),
         progress_bar: ProgressBar::new(JobType::Copy),
         job_dir: String::new(),
-        callback_url: std::env::var("LAB_MIGRATION_CALLBACK_URL").ok(),
+        callback_url: std::env::var("LAB_MIGRATION_CALLBACK_URL")
+            .ok()
+            .as_deref()
+            .map(CallbackEndpoint::parse)
+            .transpose()?,
         generation_committed: None,
         scan_snapshot: None,
         callback: CallbackState::default(),

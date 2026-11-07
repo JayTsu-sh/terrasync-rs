@@ -1,4 +1,5 @@
 //! 扫描统一入口：落库使用持久化检查点，不落库使用轻量流式统计。
+use crate::callback::CallbackEndpoint;
 use crate::error::{AppError, Result};
 use crate::scan_resume::run_persisted;
 #[cfg(feature = "license")]
@@ -44,7 +45,7 @@ pub struct ScanRequest<'a> {
     pub exclude: &'a Option<String>,
     pub command: String,
     pub cancel: CancellationToken,
-    pub callback_url: Option<String>,
+    pub callback_url: Option<CallbackEndpoint>,
     pub concurrency: Option<usize>,
 }
 
