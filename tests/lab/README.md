@@ -2,6 +2,19 @@
 
 The lab is shared by `nfs-rs`, `data-mover-rs`, and `terrasync-rs`.
 
+`python3 tests/lab/run-notification-archive-local.py --mutable-catalogue` runs
+24 real migration rounds across Single and two-replica ClickHouse, ordinary and
+suspended-version S3 sources, and latest-only and versioned destinations. An owned
+read proxy fixes LastModified while retaining real payloads, ETags, tags and version
+IDs. Equal-sized overwrites with the same version slot must copy once; an unchanged
+third round copies no data. Independent S3 reads check final bytes, tags, retained
+source and exactly two ordered destination versions where history is enabled.
+Source request counters require two data GETs and three scan-time tag GETs per
+case, so the identity comparison adds no source reads. The test does not establish
+content equality when the backend's observed identity also stays unchanged, source
+purge safety, or whole-job throughput/RSS. Containers and their private data are
+removed on exit.
+
 ## Direct 取消回归
 
 `verify-direct-cancel.py` 在真实远端 Local 目标和 QUIC 链路上验证 Direct 取消。

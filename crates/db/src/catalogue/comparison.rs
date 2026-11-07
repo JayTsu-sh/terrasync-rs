@@ -298,17 +298,19 @@ impl JoinStrategy {
     /// 构建 `detect_changed` SQL：temp 与 base 都存在但存在变更
     ///
     /// 根据 `ChangeKind` 生成不同 WHERE 子句，三种 kind 互斥：
-    /// - `DataOnly`：size 或 mtime 变了；mode/uid/gid 均未变
-    /// - `MetadataOnly`：size + mtime 均未变；mode/uid/gid 至少一项变了（chmod/chown）
+    /// - `DataOnly`：数据比较事实变了；元数据未变
+    /// - `MetadataOnly`：大小、mtime、真实源版本及身份均未变；元数据变了
     /// - `Both`：内容和属性都变了
     pub(super) fn build_detect_changed_sql(&self, temp: &str, base: &str, kind: ChangeKind) -> String {
         let t_columns = &*FILE_SCAN_COLUMNS_LIST_WITH_T_PREFIX;
         let marker_eq = "ifNull(t.marker_state = f.marker_state, (t.marker_state IS NULL AND f.marker_state IS NULL))";
+        // PathScoped 身份可携带 ETag 等 backend 观察事实；null／非版本化对象覆盖后
+        // 大小、mtime 和版本槽仍可能相同。复用已持久化的比较键，不额外读取或哈希数据。
         let data_changed = format!(
-            "((t.is_dir = 0 AND (t.size != f.size OR t.mtime != f.mtime OR t.source_version_id != f.source_version_id)) OR NOT {marker_eq})"
+            "((t.is_dir = 0 AND (t.size != f.size OR t.mtime != f.mtime OR t.source_version_id != f.source_version_id OR t.identity_key != f.identity_key)) OR NOT {marker_eq})"
         );
         let data_unchanged = format!(
-            "((t.is_dir = 1 OR (t.size = f.size AND t.mtime = f.mtime AND t.source_version_id = f.source_version_id)) AND {marker_eq})"
+            "((t.is_dir = 1 OR (t.size = f.size AND t.mtime = f.mtime AND t.source_version_id = f.source_version_id AND t.identity_key = f.identity_key)) AND {marker_eq})"
         );
         // mode/uid/gid 在 S3 等协议中为 Nullable 且常常为 NULL；ClickHouse 三值逻辑下
         // `NULL = NULL` 返回 NULL（WHERE 视为 false），会让所有 ChangeKind 都不匹配。
@@ -351,7 +353,7 @@ impl JoinStrategy {
         match self {
             Self::Path | Self::CopyPath => format!(
                 "SELECT {t_columns} FROM {temp} t \
-                 JOIN (SELECT relative_path, version_id, source_version_id, size, mtime, mode, uid, gid, is_dir, marker_state, metadata_digests{identity_columns} \
+                 JOIN (SELECT relative_path, version_id, source_version_id, identity_key, size, mtime, mode, uid, gid, is_dir, marker_state, metadata_digests{identity_columns} \
                        FROM {base} FINAL \
                        WHERE copy_path_confirmed AND (relative_path, version_id) IN \
                              (SELECT relative_path, version_id FROM {temp}) \
@@ -363,7 +365,7 @@ impl JoinStrategy {
             ),
             Self::FileHandle => format!(
                 "SELECT {t_columns} FROM {temp} t \
-                 JOIN (SELECT file_handle, relative_path, source_version_id, size, mtime, mode, uid, gid, is_dir, marker_state, metadata_digests \
+                 JOIN (SELECT file_handle, relative_path, source_version_id, identity_key, size, mtime, mode, uid, gid, is_dir, marker_state, metadata_digests \
                        FROM {base} FINAL \
                        WHERE copy_path_confirmed AND file_handle IN \
                              (SELECT file_handle FROM {temp} WHERE file_handle IS NOT NULL) \

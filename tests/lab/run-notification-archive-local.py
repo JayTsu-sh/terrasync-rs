@@ -72,7 +72,7 @@ def run_isolated():
                     image,
                 )
                 containers.append(container)
-            if "--version-catalogue" in sys.argv:
+            if "--version-catalogue" in sys.argv or "--mutable-catalogue" in sys.argv:
                 containers.append(docker(
                     "run", "-d", "--name", f"ts-version-catalogue-{uuid.uuid4().hex[:12]}",
                     "--network", f"container:{containers[0]}", "--memory=768m", "--cpus=1",
@@ -84,7 +84,7 @@ def run_isolated():
                 print(f"isolated S3 image={docker('inspect', containers[-1], '--format', '{{.Image}}')}", flush=True)
             print(f"isolated notification image={docker('inspect', containers[0], '--format', '{{.Image}}')}", flush=True)
             pid = docker("inspect", containers[0], "--format", "{{.State.Pid}}")
-            suite = [flag for flag in ("--copy-generations", "--rename-generations", "--retention-events", "--source-absence", "--request-policy", "--copy-contracts", "--version-catalogue", "--scan-wire") if flag in sys.argv]
+            suite = [flag for flag in ("--copy-generations", "--rename-generations", "--retention-events", "--source-absence", "--request-policy", "--copy-contracts", "--version-catalogue", "--mutable-catalogue", "--scan-wire") if flag in sys.argv]
             subprocess.run(["nsenter", "-t", pid, "-n", sys.executable, __file__, "--inside", *suite], cwd=ROOT, check=True)
         except BaseException:
             for container in containers:
@@ -197,6 +197,10 @@ def run_copy_generations():
             return
         if "--version-catalogue" in sys.argv:
             run_version_catalogue(environment)
+            return
+        if "--mutable-catalogue" in sys.argv:
+            from mutable_object_catalogue import run
+            run(ROOT, environment)
             return
         if "--copy-contracts" in sys.argv:
             environment["LAB_CATALOGUE_SINGLE"] = "1"
@@ -504,7 +508,7 @@ def run_inside():
             time.sleep(0.2)
         else:
             raise RuntimeError(f"ClickHouse readiness timed out on port {port}")
-    if any(flag in sys.argv for flag in ("--copy-generations", "--rename-generations", "--retention-events", "--source-absence", "--request-policy", "--copy-contracts", "--version-catalogue", "--scan-wire")):
+    if any(flag in sys.argv for flag in ("--copy-generations", "--rename-generations", "--retention-events", "--source-absence", "--request-policy", "--copy-contracts", "--version-catalogue", "--mutable-catalogue", "--scan-wire")):
         run_copy_generations()
         return
     environment = dict(os.environ)
