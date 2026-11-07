@@ -8,6 +8,7 @@ use utils::app_config::AppConfig;
 
 mod observation;
 pub use observation::observe_path;
+pub(crate) use observation::observe_path_with_plan;
 mod packaging;
 mod recovery;
 pub mod source;

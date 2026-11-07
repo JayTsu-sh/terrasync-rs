@@ -280,11 +280,6 @@ pub(crate) async fn process_entry_on_receiver(
             // 普通传输和检查点传输都在发布前应用协商后的元数据。
         }
 
-        // ACL 复制（目录和文件均需要，symlink 除外）
-        if config.enable_acl && !entry.get_is_symlink() {
-            copy_metadata::copy_acl(src_storage.storage(), dest_storage.storage(), relative_path).await?;
-        }
-
         Ok(())
     }
     .instrument(span)

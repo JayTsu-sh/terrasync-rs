@@ -1,6 +1,7 @@
 use super::observation::{HistorySequence, observation_plan, tags_required, validate_required_tags};
 use crate::error::storage::{Result, StorageError, operation};
 use crate::storage_factory::{StorageContext, path};
+use data_mover::model::{ObservationMode, ObservationPlan};
 use task_model::ObservedEntryExt;
 
 use super::packaging::PackageFilter;
@@ -36,7 +37,12 @@ impl StorageContext {
     fn traversal_request(&self, sub: Option<&Path>, options: &WalkOptions, blocks: bool) -> Result<TraversalRequest> {
         let root = path(sub.unwrap_or(Path::new("")))?;
         let mut request = TraversalRequest::new(root)
-            .observation_plan(observation_plan(tags_required(&self.roles, options.include_tags)?))
+            .observation_plan(
+                options
+                    .observation_plan
+                    .unwrap_or(observation_plan(tags_required(&self.roles, options.include_tags)?)),
+            )
+            .latest_metadata_only(options.latest_metadata_only)
             .max_inflight_operations(NonZeroUsize::new(options.concurrency).unwrap_or(NonZeroUsize::MIN))
             .max_depth(options.depth.and_then(NonZeroUsize::new));
         if blocks {
@@ -110,7 +116,10 @@ impl StorageContext {
     async fn walkdir_with_root_policy(
         &self, sub: Option<&Path>, options: WalkOptions, report_root: bool,
     ) -> Result<WalkDirAsyncIterator> {
-        let required_tags = tags_required(&self.roles, options.include_tags)?;
+        let required_tags = match options.observation_plan {
+            Some(plan) => plan.tags() == ObservationMode::Required,
+            None => tags_required(&self.roles, options.include_tags)?,
+        };
         let request = self
             .traversal_request(sub, &options, false)?
             .report_root_directory_object(report_root);
@@ -449,6 +458,8 @@ pub type WalkDirAsyncIterator = AsyncReceiver<StorageEntryMessage>;
 
 #[derive(Debug, Clone)]
 pub struct WalkOptions {
+    pub observation_plan: Option<ObservationPlan>,
+    pub latest_metadata_only: bool,
     /// 单个远程存储操作的等待上限；独立于自动恢复，不包含消费者背压。
     pub operation_timeout: Option<std::time::Duration>,
     /// 调用方显式选择的故障恢复窗口；None 直接报告失败，不自动重连。
@@ -465,6 +476,8 @@ pub struct WalkOptions {
 impl Default for WalkOptions {
     fn default() -> Self {
         Self {
+            observation_plan: None,
+            latest_metadata_only: false,
             operation_timeout: None,
             recovery_window: None,
             depth: None,

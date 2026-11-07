@@ -404,6 +404,8 @@ pub async fn integrity_check_with_concurrency(
         match_expressions: None,
         exclude_expressions: None,
         include_tags: false,
+        observation_plan: None,
+        latest_metadata_only: false,
         file_list: None,
         packaged: false,
         package_depth: 0,

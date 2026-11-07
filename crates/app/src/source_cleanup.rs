@@ -4,12 +4,13 @@ use std::sync::Arc;
 
 use data_mover::model::{EntryKind, ObservedEntry};
 use db::ClickHouseDatabase;
-use task_model::observation::timestamp_nanos;
+use task_model::observation::ObservedView;
 use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 use tokio_util::task::AbortOnDropHandle;
 
 use crate::error::{AppError, Result, StorageError};
-use crate::integrity_check::{IntegrityCheckMode, IntegrityCheckOptions, compare_entry};
+use crate::file_copy::metadata::copied_metadata_plan;
 use crate::storage_factory::StorageContext;
 
 /// 调用方必须先排空复制和数据库消费者，并完成目标目录元数据与代次提交。
@@ -39,40 +40,45 @@ async fn remove_entry(source: &StorageContext, destination: &StorageContext, ent
         }
         .into());
     }
-    let namespace = source.storage().namespace()?;
-    let current = match namespace.stat(entry.path()).await {
-        Ok(current) => current,
-        Err(error) => {
-            let error = StorageError::from(error);
-            // 上次清理成功但响应丢失时，目标事实依旧保留，缺失源项无需重删。
-            if error.is_not_found() {
-                return Ok(());
-            }
-            return Err(error.into());
-        }
-    };
-    let modified = entry.metadata().timestamps().value().and_then(|times| times.modified);
-    let current_modified = current.inline_timestamps.and_then(|times| times.modified);
-    if current.kind != entry.kind()
-        || current.source_identity != *entry.source_identity()
-        || (entry.kind() != EntryKind::Directory
-            && (current.size != entry.size() || timestamp_nanos(current_modified) != timestamp_nanos(modified)))
-    {
-        return Err(StorageError::SourceChangedBeforeDelete {
+    // 只核验目标与落库的原始事实；删源改变的目录 mtime 和已经消失的源项不回写目标。
+    let target = copied_metadata_plan(
+        destination.storage(),
+        ObservedView {
+            entry,
+            version_index: None,
+        },
+    )?
+    .verify_published(destination.storage(), entry.path(), None, CancellationToken::new())
+    .await
+    .map_err(StorageError::from)?;
+    if target.kind != entry.kind() || (entry.kind() == EntryKind::File && target.size != entry.size()) {
+        return Err(StorageError::TargetPublicationChanged {
             path: entry.path().clone(),
         }
         .into());
     }
-    compare_entry(
-        source,
-        destination,
-        entry,
-        IntegrityCheckOptions::new(IntegrityCheckMode::Quick),
-        None,
-    )
-    .await?;
+    if entry.kind() == EntryKind::Symlink
+        && Some(
+            &destination
+                .storage()
+                .namespace()?
+                .read_link(entry.path())
+                .await
+                .map_err(StorageError::from)?,
+        ) != entry.symlink_target()
+    {
+        return Err(StorageError::TargetPublicationChanged {
+            path: entry.path().clone(),
+        }
+        .into());
+    }
     // 仅删除文件、链接本身或空目录；过滤掉或并发新增的子项会阻止目录删除。
-    namespace.delete(entry.path()).await.map_err(StorageError::from)?;
+    source
+        .storage()
+        .namespace()?
+        .purge_observed(entry, CancellationToken::new())
+        .await
+        .map_err(StorageError::from)?;
     Ok(())
 }
 
@@ -80,6 +86,7 @@ async fn remove_entry(source: &StorageContext, destination: &StorageContext, ent
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+    use crate::file_copy::{CopyOptions, copy_file, metadata::set_entry_metadata};
     use crate::scan::observe_path;
     use crate::storage_factory::{CreateStorageOptions, create_storage};
     use std::path::Path;
@@ -93,10 +100,7 @@ mod tests {
         let file = observe_path(storage.storage(), Path::new("tree/file")).await?;
         let directory = observe_path(storage.storage(), Path::new("tree")).await?;
         std::fs::write(root.path().join("tree/file"), b"changed and longer")?;
-        assert!(matches!(
-            remove_entry(&storage, &storage, &file).await,
-            Err(AppError::StorageError(StorageError::SourceChangedBeforeDelete { .. }))
-        ));
+        assert!(remove_entry(&storage, &storage, &file).await.is_err());
         assert!(remove_entry(&storage, &storage, &directory).await.is_err());
         assert_eq!(std::fs::read(root.path().join("tree/file"))?, b"changed and longer");
         Ok(())
@@ -105,12 +109,51 @@ mod tests {
     #[tokio::test]
     async fn confirmed_entry_cleanup_is_idempotent() -> Result<()> {
         let root = tempfile::tempdir()?;
+        let destination_root = tempfile::tempdir()?;
         std::fs::write(root.path().join("file"), b"payload")?;
         let storage = create_storage(root.path().to_str().unwrap(), CreateStorageOptions::default()).await?;
         let entry = observe_path(storage.storage(), Path::new("file")).await?;
-        remove_entry(&storage, &storage, &entry).await?;
-        remove_entry(&storage, &storage, &entry).await?;
+        let target = create_storage(
+            destination_root.path().to_str().unwrap(),
+            CreateStorageOptions::default(),
+        )
+        .await?;
+        copy_file(
+            &storage,
+            &target,
+            &Arc::new(entry.clone()),
+            CopyOptions::default(),
+            None,
+        )
+        .await?;
+        remove_entry(&storage, &target, &entry).await?;
+        remove_entry(&storage, &target, &entry).await?;
         assert!(!root.path().join("file").exists());
+        assert_eq!(std::fs::read(destination_root.path().join("file"))?, b"payload");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn child_removal_does_not_replace_the_original_directory_mtime() -> Result<()> {
+        let source_root = tempfile::tempdir()?;
+        let target_root = tempfile::tempdir()?;
+        std::fs::create_dir(source_root.path().join("tree"))?;
+        std::fs::write(source_root.path().join("tree/file"), b"payload")?;
+        let source = create_storage(source_root.path().to_str().unwrap(), CreateStorageOptions::default()).await?;
+        let target = create_storage(target_root.path().to_str().unwrap(), CreateStorageOptions::default()).await?;
+        let directory = observe_path(source.storage(), Path::new("tree")).await?;
+        let file = Arc::new(observe_path(source.storage(), Path::new("tree/file")).await?);
+        copy_file(&source, &target, &file, CopyOptions::default(), None).await?;
+        set_entry_metadata(target.storage(), &directory).await?;
+        let expected = std::fs::metadata(target_root.path().join("tree"))?.modified()?;
+        remove_entry(&source, &target, &file).await?;
+        remove_entry(&source, &target, &directory).await?;
+        assert!(!source_root.path().join("tree").exists());
+        assert_eq!(
+            std::fs::metadata(target_root.path().join("tree"))?.modified()?,
+            expected
+        );
+        assert_eq!(std::fs::read(target_root.path().join("tree/file"))?, b"payload");
         Ok(())
     }
 }

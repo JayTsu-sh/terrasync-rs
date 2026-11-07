@@ -3,11 +3,14 @@
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
-use data_mover::model::ObservedEntry;
-use data_mover::transfer::{self, ReadBackVerification, TransferIdentity, TransferOutcome, TransferRequest};
+use data_mover::model::{EntryKind, ObservedEntry};
+use data_mover::transfer::{
+    self, MetadataTransferMode, ReadBackVerification, TransferIdentity, TransferOutcome, TransferRequest,
+};
 use task_model::TransferMode;
-use task_model::observation::ObservedItem;
+use task_model::observation::{EntryStatistics, ObservedItem};
 
+use super::metadata::set_item_metadata;
 use super::{CopyOptions, transfer_policy};
 use crate::error::storage::{Result, StorageError};
 use crate::storage_factory::StorageContext;
@@ -110,6 +113,7 @@ async fn execute_file(
         options.cancel.clone().unwrap_or_default(),
     )?
     .with_transfer_policy(transfer_policy(options.transfer_mode))
+    .with_metadata_mode(MetadataTransferMode::CallerManaged)
     .with_read_back_verification(if options.enable_integrity_check {
         ReadBackVerification::Enabled
     } else {
@@ -125,6 +129,19 @@ async fn execute_file(
     let outcome = transfer::transfer(request).await?;
     if let Some(counter) = &options.bytes_counter {
         counter.fetch_add(outcome.transferred_bytes, Ordering::Relaxed);
+    }
+    let item = ObservedItem {
+        entry: Arc::clone(entry),
+        version_index,
+    };
+    let target = set_item_metadata(
+        destination.storage(),
+        item.view().payload(),
+        outcome.destination_version.as_deref(),
+    )
+    .await?;
+    if target.kind != EntryKind::File || target.size != Some(item.view().payload().get_size()) {
+        return Err(StorageError::TargetPublicationChanged { path: target.path });
     }
     Ok(outcome)
 }

@@ -59,9 +59,9 @@ use crate::consumer::ConsumerManager;
 use crate::copy_completion;
 use crate::copy_execution::{CopyLease, begin_copy_catalogue};
 use crate::error::{AppError, Result};
-use crate::file_copy::copied_tags_required;
 #[cfg(feature = "license")]
 use crate::integrity_check::verify_storage_time;
+use crate::migration_plan::MigrationPlan;
 use crate::receiver::{ReceiverConfig, process_entry_on_receiver};
 use crate::scan::ScanType;
 use crate::sender::{SenderWorkerConfig, sender_worker};
@@ -261,19 +261,22 @@ impl SyncOrchestrator {
                 "Packaged sync supports only Atomic mode; use --in-place".into(),
             ));
         }
-        let copy_tags = match self.mode {
+        let observation_plan = match self.mode {
             SyncMode::Local => {
                 let destination = create_storage_for_role(&c.dest_path, None, true, StorageRole::Destination).await?;
+                let source = create_storage_for_role(&c.src_path, None, false, StorageRole::Source).await?;
                 if !AppConfig::fetch()?.sync.is_source_reserved {
-                    let source = create_storage_for_role(&c.src_path, None, false, StorageRole::Source).await?;
                     if source.storage().identity() == destination.storage().identity() {
                         return Err(AppError::ConfigError("移动任务的源端和目标端不能是同一存储根".into()));
                     }
                 }
                 copy_transfer::validate_transfer_mode(&destination, c.transfer_mode)?;
-                copied_tags_required(&destination)?
+                let mut plan = MigrationPlan::compile(&source, &destination, c.enable_acl)?;
+                plan.latest_metadata_only = !destination.storage().staged_destination()?.keeps_history().await?;
+                plan.log();
+                Some(plan)
             }
-            SyncMode::Remote { .. } => false,
+            SyncMode::Remote { .. } => None,
         };
 
         let app_config = AppConfig::fetch()?;
@@ -303,8 +306,8 @@ impl SyncOrchestrator {
 
         match &self.mode {
             SyncMode::Local => match scan_type {
-                ScanType::Full => self.run_sync(copy_tags).await,
-                ScanType::Incremental => self.run_incremental_sync(copy_tags).await,
+                ScanType::Full => self.run_sync(observation_plan).await,
+                ScanType::Incremental => self.run_incremental_sync(observation_plan).await,
             },
             // 双进程模式本就是 compare-based（DestIndex 实时比对目标端），Full/Incremental
             // 在 wire protocol 和执行路径上是同一套代码，ScanType 对 Remote 是 no-op
@@ -321,7 +324,7 @@ impl SyncOrchestrator {
     }
 
     /// 全量同步 — 通过 transport 连接 sender workers 和 receiver tasks
-    async fn run_sync(&self, copy_tags: bool) -> Result<()> {
+    async fn run_sync(&self, observation_plan: Option<MigrationPlan>) -> Result<()> {
         let c = &self.config;
 
         // ── License 校验 ──
@@ -352,7 +355,7 @@ impl SyncOrchestrator {
         };
 
         // ── 2. 初始化扫描配置 ──
-        let scan_config = initialize_scan_config(
+        let mut scan_config = initialize_scan_config(
             &c.job_id,
             &c.src_path,
             0,
@@ -360,11 +363,14 @@ impl SyncOrchestrator {
             &c.r#match,
             &c.exclude,
             c.concurrency.unwrap_or(app_config.scan.concurrency),
-            app_config.scan.include_tags || copy_tags,
+            false,
             &c.file_list,
             c.packaged,
             c.package_depth,
         )?;
+
+        scan_config.observation_plan = observation_plan.as_ref().map(|plan| plan.observation);
+        scan_config.latest_metadata_only = observation_plan.is_some_and(|plan| plan.latest_metadata_only);
 
         // ── 3. 初始化消费者配置 + 数据库 ──
         let consumer_config = Arc::new(initialize_consumer_config(
@@ -713,7 +719,7 @@ impl SyncOrchestrator {
     /// - Barrier：`drop(broadcaster_a)` + `await phase_a_handles`（base 表冲刷完毕）
     /// - Phase B：`detect_deleted_items` → 执行 dest 物理删除/重命名 → 通过 `broadcaster_b`
     ///   喂给同一组 consumers（`DatabaseConsumer` 自动完成 incremental 表写入 + base 表修正）
-    async fn run_incremental_sync(&self, copy_tags: bool) -> Result<()> {
+    async fn run_incremental_sync(&self, observation_plan: Option<MigrationPlan>) -> Result<()> {
         let c = &self.config;
 
         // ── License 校验 ──
@@ -744,7 +750,7 @@ impl SyncOrchestrator {
         };
 
         // ── 2. 初始化扫描配置（增量不支持 file_list） ──
-        let scan_config = initialize_scan_config(
+        let mut scan_config = initialize_scan_config(
             &c.job_id,
             &c.src_path,
             0,
@@ -752,11 +758,14 @@ impl SyncOrchestrator {
             &c.r#match,
             &c.exclude,
             c.concurrency.unwrap_or(app_config.scan.concurrency),
-            app_config.scan.include_tags || copy_tags,
+            false,
             &None,
             c.packaged,
             c.package_depth,
         )?;
+
+        scan_config.observation_plan = observation_plan.as_ref().map(|plan| plan.observation);
+        scan_config.latest_metadata_only = observation_plan.is_some_and(|plan| plan.latest_metadata_only);
 
         // ── 3. 初始化消费者配置 + 数据库 ──
         let consumer_config = Arc::new(initialize_consumer_config(

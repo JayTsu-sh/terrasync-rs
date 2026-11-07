@@ -64,8 +64,14 @@ pub(crate) fn tags_required(storage: &Storage, include_tags: bool) -> Result<boo
 
 /// 捕获单个任务路径所需的复制事实；IO 和模型构造由原生角色完成。
 pub async fn observe_path(storage: &Storage, value: &Path) -> Result<ObservedEntry> {
-    let descriptor = storage.namespace()?.stat(&path(value)?).await?;
     let plan = observation_plan(tags_required(storage, true)?);
+    observe_path_with_plan(storage, value, plan).await
+}
+
+pub(crate) async fn observe_path_with_plan(
+    storage: &Storage, value: &Path, plan: ObservationPlan,
+) -> Result<ObservedEntry> {
+    let descriptor = storage.namespace()?.stat(&path(value)?).await?;
     Ok(observe_descriptor(storage, descriptor, plan).await?)
 }
 

@@ -1,3 +1,4 @@
+use data_mover::model::ObservationPlan;
 use task_model::TransferMode;
 // 标准库
 // 无
@@ -70,6 +71,8 @@ pub struct ScanConfig {
     pub match_expressions: Option<FilterExpression>,
     pub exclude_expressions: Option<FilterExpression>,
     pub include_tags: bool,
+    pub observation_plan: Option<ObservationPlan>,
+    pub latest_metadata_only: bool,
     pub file_list: Option<String>,
     pub packaged: bool,
     pub package_depth: usize,
@@ -151,6 +154,8 @@ pub fn initialize_scan_config(
         match_expressions: r#match.as_deref().and_then(|expr| parse_filter_expression(expr).ok()),
         exclude_expressions: exclude.as_deref().and_then(|expr| parse_filter_expression(expr).ok()),
         include_tags,
+        observation_plan: None,
+        latest_metadata_only: false,
         file_list: file_list.clone(),
         packaged,
         package_depth,

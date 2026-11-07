@@ -19,6 +19,9 @@ use data_mover::model::ObservedEntry;
 use crate::error::{AppError, Result};
 
 pub(crate) mod metadata;
+#[cfg(test)]
+#[path = "file_copy/metadata_copy_tests.rs"]
+mod metadata_copy_tests;
 pub(crate) mod namespace;
 pub(crate) mod transfer;
 

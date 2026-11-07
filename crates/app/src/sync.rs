@@ -347,7 +347,7 @@ async fn process_entry_inner(
 ) -> Result<()> {
     let ProcessEntryOpts {
         enable_integrity_check,
-        enable_acl,
+        enable_acl: _,
         is_source_reserved,
         skip_data_copy,
         resume,
@@ -358,7 +358,7 @@ async fn process_entry_inner(
     async {
     trace!(
         "Processing entry: {:?} with parameters: enable_integrity_check: {:?}, enable_acl: {:?}, is_source_reserved: {:?}",
-        relative_path, enable_integrity_check, enable_acl, is_source_reserved
+        relative_path, enable_integrity_check, opts.enable_acl, is_source_reserved
     );
 
     if entry.history().is_some() && !skip_data_copy {
@@ -453,36 +453,6 @@ async fn process_entry_inner(
         debug!("Copied file {:?}", relative_path);
     }
 
-    // ACL 复制（目录和文件均需要，symlink 除外）
-    // 支持 Local→Local（Windows）、CIFS→CIFS（跨平台）、NFS→NFS（NFSv4+），其他组合静默跳过
-    if enable_acl && !entry.get_is_symlink() {
-        if let Err(err) = copy_metadata::copy_acl((&src_storage).storage(), (&dest_storage).storage(), relative_path).await {
-            error!("Failed to copy ACL for {:?}: {}", relative_path, err);
-            broadcaster
-                .broadcast(StorageEntryMessage::Error {
-                    event: ErrorEvent::CopyAcl,
-                    path: relative_path.to_path_buf(),
-                    entry: Some(Arc::clone(entry)),
-                    reason: format!("{err}"),
-                })
-                .await;
-            return Err(err.into());
-        }
-
-        // xattr 复制（仅 NFSv4.1→NFSv4.1，其他组合静默跳过）
-        if let Err(err) = copy_metadata::copy_xattr((&src_storage).storage(), (&dest_storage).storage(), relative_path).await {
-            error!("Failed to copy xattr for {:?}: {}", relative_path, err);
-            broadcaster
-                .broadcast(StorageEntryMessage::Error {
-                    event: ErrorEvent::CopyXattr,
-                    path: relative_path.to_path_buf(),
-                    entry: Some(Arc::clone(entry)),
-                    reason: format!("{err}"),
-                })
-                .await;
-            return Err(err.into());
-        }
-    }
 
     Ok(())
     }.instrument(span).await

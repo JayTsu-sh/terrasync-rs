@@ -1,4 +1,6 @@
 use data_mover::error::StorageError as NativeStorageError;
+use data_mover::metadata::MetadataVerificationError;
+use data_mover::model::MetadataObservationFailure;
 use data_mover::qos::SourceQosSetupError;
 use data_mover::storage::EntryObservationFailure;
 use task_model::TaskModelError;
@@ -15,7 +17,7 @@ use data_mover::{
         StorageRoleFailure,
     },
     tar_pack::TarFailure,
-    transfer::{DirectPatchError, MoveFailure, TransferFailure, TransferValueError},
+    transfer::{DirectPatchError, TransferFailure, TransferValueError},
     traversal::{
         FailureScope, ObservationFailure, ScanSetupError, TraversalConfigurationError, TraversalTerminalFailure,
     },
@@ -23,8 +25,16 @@ use data_mover::{
 use task_model::TransferMode;
 #[derive(Debug, thiserror::Error)]
 pub enum StorageError {
-    #[error("源端清理前发现条目变化，已保留源端: {path}")]
-    SourceChangedBeforeDelete { path: StoragePath },
+    #[error(transparent)]
+    MetadataVerification(#[from] MetadataVerificationError),
+    #[error("目标发布状态与复制结果不一致，禁止删源: {path}")]
+    TargetPublicationChanged { path: StoragePath },
+    #[error("源端元数据获取失败，数据已保留且禁止删源: {path} version={version:?}, failures={failures:?}")]
+    SourceMetadataAcquisitionFailed {
+        path: StoragePath,
+        version: Option<String>,
+        failures: Vec<MetadataObservationFailure>,
+    },
     #[error("源端版本永久清理不可用，已保留所有历史: {path}")]
     PermanentVersionCleanupUnavailable { path: StoragePath },
     #[error(transparent)]
@@ -112,8 +122,6 @@ pub enum StorageError {
     #[error(transparent)]
     Transfer(Box<TransferFailure>),
     #[error(transparent)]
-    Move(Box<MoveFailure>),
-    #[error(transparent)]
     Archive(Box<TarFailure>),
 }
 impl StorageError {
@@ -137,11 +145,6 @@ pub(crate) fn operation(error: impl Into<String>) -> StorageError {
     StorageError::OperationError(error.into())
 }
 
-impl From<MoveFailure> for StorageError {
-    fn from(value: MoveFailure) -> Self {
-        Self::Move(Box::new(value))
-    }
-}
 impl From<TarFailure> for StorageError {
     fn from(value: TarFailure) -> Self {
         Self::Archive(Box::new(value))

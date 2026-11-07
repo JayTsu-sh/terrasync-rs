@@ -1,12 +1,15 @@
 #![allow(clippy::unwrap_used)]
 
-use crate::scan::observe_path;
+use crate::error::AppError;
+use crate::file_copy::{CopyOptions, copy_file};
+use crate::scan::{observe_path, observe_path_with_plan};
 use std::path::Path;
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use data_mover::model::{
-    EntryOperationFailure, FailureClass, MetadataObservations, ObservationPlan, Operation, StoragePath, Transience,
+    EntryOperationFailure, FailureClass, MetadataFamily, MetadataObservations, ObservationMode, ObservationPlan,
+    Operation, StoragePath, Transience,
 };
 use data_mover::storage::{
     ListRequest, ListingStream, Metadata, MetadataMutation, Namespace, SourceDescriptor, StorageBuilder,
@@ -29,6 +32,42 @@ impl Metadata for FailingMetadata {
     ) -> Result<(), StorageRoleFailure> {
         Err(self.0.clone())
     }
+}
+
+#[tokio::test]
+async fn optional_source_metadata_failure_retains_inline_facts_and_delivers_readable_data() {
+    let root = tempfile::tempdir().unwrap();
+    let target_root = tempfile::tempdir().unwrap();
+    std::fs::write(root.path().join("file"), b"readable").unwrap();
+    let source = context(root.path(), FailureClass::PermissionDenied, false).await;
+    let target = create_storage(&target_root.path().to_string_lossy(), CreateStorageOptions::default())
+        .await
+        .unwrap();
+    let entry = observe_path_with_plan(
+        source.storage(),
+        Path::new("file"),
+        ObservationPlan::default()
+            .with_timestamps(ObservationMode::InlineOnly)
+            .with_ownership_mode(ObservationMode::InlineOnly)
+            .with_tags(ObservationMode::BestEffort),
+    )
+    .await
+    .unwrap();
+    assert!(entry.metadata().timestamps().value().is_some());
+    assert!(entry.metadata().ownership_mode().value().is_some());
+    let failures: Vec<_> = entry.metadata().failures().collect();
+    assert_eq!(failures.len(), 1);
+    assert_eq!(failures[0].family, MetadataFamily::Tags);
+    assert_eq!(failures[0].class, FailureClass::PermissionDenied);
+    let result = copy_file(&source, &target, &Arc::new(entry), CopyOptions::default(), None).await;
+    assert!(matches!(
+        result,
+        Err(AppError::StorageError(
+            StorageError::SourceMetadataAcquisitionFailed { .. }
+        ))
+    ));
+    assert_eq!(std::fs::read(target_root.path().join("file")).unwrap(), b"readable");
+    assert_eq!(std::fs::read(root.path().join("file")).unwrap(), b"readable");
 }
 
 struct FailingLink {

@@ -536,15 +536,44 @@ async fn stream_keeps_true_mode_without_numeric_ownership() {
 
 struct PublishedMetadataProbe {
     fail: bool,
+    stale_read_back: AtomicBool,
     mutations: Mutex<Vec<MetadataMutation>>,
 }
 
 #[async_trait]
 impl Metadata for PublishedMetadataProbe {
     async fn observe(
-        &self, _: &StoragePath, _: ObservationPlan,
+        &self, _: &StoragePath, plan: ObservationPlan,
     ) -> std::result::Result<MetadataObservations, StorageRoleFailure> {
-        panic!("已捕获的元数据不能重新观察源端");
+        assert_eq!(plan.timestamps(), ObservationMode::Omit);
+        let tags = if self.stale_read_back.load(Ordering::Relaxed) {
+            Vec::new()
+        } else {
+            self.mutations
+                .lock()
+                .unwrap()
+                .iter()
+                .rev()
+                .find_map(|mutation| {
+                    if let MetadataMutation::Tags(tags) = mutation {
+                        Some(tags.clone())
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or_default()
+        };
+        Ok(MetadataObservations::new(
+            MetadataObservation::NotRequested,
+            MetadataObservation::NotRequested,
+            MetadataObservation::Value {
+                value: tags,
+                provenance: MetadataProvenance::AdditionalCall,
+            },
+            MetadataObservation::NotRequested,
+            MetadataObservation::NotRequested,
+        )
+        .unwrap())
     }
 
     async fn apply(
@@ -562,6 +591,7 @@ async fn published_metadata_destination(fail: bool) -> (TempDir, StorageContext,
     let (root, destination, stage) = destination(false).await;
     let metadata = Arc::new(PublishedMetadataProbe {
         fail,
+        stale_read_back: AtomicBool::new(false),
         mutations: Mutex::default(),
     });
     let roles = StorageBuilder::new(
@@ -641,6 +671,20 @@ async fn published_metadata_preserves_typed_application_failure() {
     };
     assert!(failure.storage_error().is_some());
     assert_eq!(failure.family(), MetadataFamily::Tags);
+}
+
+#[tokio::test]
+async fn successful_metadata_write_with_wrong_read_back_keeps_target_data_and_fails() {
+    let (root, destination, probe) = published_metadata_destination(false).await;
+    probe.stale_read_back.store(true, Ordering::Relaxed);
+    let error = copy_metadata::set_entry_metadata(
+        destination.storage(),
+        &captured_tags(vec![ObjectTag::new("tag", "expected").unwrap()]),
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(error, StorageError::MetadataVerification(_)));
+    assert_eq!(std::fs::read(root.path().join("file")).unwrap(), b"old");
 }
 
 #[cfg(unix)]

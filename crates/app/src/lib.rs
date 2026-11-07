@@ -42,6 +42,7 @@ mod copy_completion;
 mod copy_execution;
 mod job_execution;
 pub mod local_transfer;
+mod migration_plan;
 /// Sync 编排器模块
 ///
 /// SyncOrchestrator 封装 sync/incremental_sync 的核心逻辑

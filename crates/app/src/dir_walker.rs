@@ -1,4 +1,5 @@
-use crate::scan::observe_path;
+use crate::scan::{observe_path, observe_path_with_plan};
+use data_mover::model::ObservationPlan;
 // 标准库
 use std::fs::File;
 use std::io::{BufRead, BufReader};
@@ -54,7 +55,7 @@ impl DirectoryWalker {
             let storage = self.source_storage().await?;
 
             // 从文件列表创建迭代器
-            walkdir_from_file_list(storage, file_list_path)
+            walkdir_from_file_list(storage, file_list_path, self.config.observation_plan)
         } else {
             // 使用现有的walkdir扫描方式
             let depth = if self.config.depth > 0 {
@@ -76,6 +77,8 @@ impl DirectoryWalker {
                 .walkdir(
                     None,
                     crate::scan::source::WalkOptions {
+                        observation_plan: self.config.observation_plan,
+                        latest_metadata_only: self.config.latest_metadata_only,
                         operation_timeout: self.operation_timeout,
                         recovery_window: self.recovery_window,
                         depth,
@@ -106,7 +109,9 @@ impl DirectoryWalker {
 /// # 返回值
 /// - 成功时返回 `WalkDirAsyncIterator`
 /// - 失败时返回包含错误信息的 `Err`
-fn walkdir_from_file_list(storage: StorageContext, file_list_path: &str) -> Result<WalkDirAsyncIterator> {
+fn walkdir_from_file_list(
+    storage: StorageContext, file_list_path: &str, plan: Option<ObservationPlan>,
+) -> Result<WalkDirAsyncIterator> {
     // 从文件中读取文件路径
     let file = File::open(file_list_path).map_err(|e| AppError::ScanError(format!("Failed to open file list: {e}")))?;
     let reader = BufReader::new(file);
@@ -148,7 +153,11 @@ fn walkdir_from_file_list(storage: StorageContext, file_list_path: &str) -> Resu
                 match relative_path {
                     Ok(file_path) => {
                         // 尝试获取文件的ObservedEntry
-                        match observe_path(storage.storage(), &file_path).await {
+                        let observation = match plan {
+                            Some(plan) => observe_path_with_plan(storage.storage(), &file_path, plan).await,
+                            None => observe_path(storage.storage(), &file_path).await,
+                        };
+                        match observation {
                             Ok(metadata) => {
                                 // 发送Scanned消息到通道
                                 let msg = StorageEntryMessage::Scanned(std::sync::Arc::new(metadata));
@@ -265,7 +274,7 @@ mod tests {
         let paths = root.path().join("files.txt");
         fs::write(&paths, b"missing-file\n").await?;
         let storage = create_storage_for_role(root.path().to_str().unwrap(), None, false, StorageRole::Source).await?;
-        let iterator = walkdir_from_file_list(storage, paths.to_str().unwrap())?;
+        let iterator = walkdir_from_file_list(storage, paths.to_str().unwrap(), None)?;
         while iterator.next().await.is_some() {}
         assert!(iterator.take_error().is_some_and(|error| error.is_not_found()));
         Ok(())
