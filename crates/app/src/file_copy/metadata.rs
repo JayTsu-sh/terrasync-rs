@@ -191,9 +191,8 @@ pub(crate) async fn set_entry_metadata(storage: &Storage, entry: &ObservedEntry)
     set_item_metadata(storage, view, None).await.map(|_| ())
 }
 
-pub(crate) async fn set_item_metadata(
-    storage: &Storage, view: ObservedView<'_>, target_version: Option<&str>,
-) -> Result<SourceDescriptor> {
+/// 核对捕获结果并编译计划；不查询源端，也不应用目标元数据。
+pub(crate) fn captured_metadata_plan(storage: &Storage, view: ObservedView<'_>) -> Result<MetadataPlan> {
     let failures: Vec<_> = view.metadata().failures().collect();
     if !failures.is_empty() {
         return Err(StorageError::SourceMetadataAcquisitionFailed {
@@ -202,7 +201,13 @@ pub(crate) async fn set_item_metadata(
             failures,
         });
     }
-    let plan = copied_metadata_plan(storage, view)?;
+    copied_metadata_plan(storage, view)
+}
+
+pub(crate) async fn set_item_metadata(
+    storage: &Storage, view: ObservedView<'_>, target_version: Option<&str>,
+) -> Result<SourceDescriptor> {
+    let plan = captured_metadata_plan(storage, view)?;
     plan.apply(
         storage.metadata()?.as_ref(),
         &view.source_path()?,
