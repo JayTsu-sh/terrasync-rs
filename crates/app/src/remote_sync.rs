@@ -32,6 +32,7 @@ use crate::storage_factory::{StorageRole, create_storage_for_role};
 use data_mover::filter::parse_filter_expression;
 #[cfg(test)]
 use data_mover::model::ObservedEntry;
+use data_mover::time_util::now_secs;
 use db::ClickHouseDatabase;
 use rustls::pki_types::CertificateDer;
 #[cfg(test)]
@@ -98,6 +99,11 @@ pub(crate) async fn run(
     let callback_guard = StatisticConsumer::begin(stats_consumer.clone()).await;
 
     let qos_manager = create_qos_manager(config.qos.as_ref(), config.peak_qos_rate, config.iops);
+    let filter_time_anchor = now_secs();
+    info!(
+        filter_time_anchor_epoch = filter_time_anchor,
+        "Remote migration filter time selected"
+    );
     let mut connection = None;
     let result = async {
         if !config.source_cleanup.retains_source() {
@@ -161,6 +167,7 @@ pub(crate) async fn run(
         let walkdir_iter = directory_pages(
             &src_storage,
             WalkOptions {
+                filter_time_anchor: Some(filter_time_anchor),
                 match_expressions: match_expr,
                 exclude_expressions: exclude_expr,
                 concurrency: app_config.scan.concurrency,

@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use crate::error::StorageError;
-use crate::scan::source::WalkDirAsyncIterator;
+use crate::scan::source::{WalkDirAsyncIterator, WalkOptions};
 use crate::storage_factory::StorageContext;
 use task_model::{ErrorEvent, StorageEntryMessage};
 // 外部crate
@@ -76,7 +76,8 @@ impl DirectoryWalker {
             let walkdir_iter = storage
                 .walkdir(
                     None,
-                    crate::scan::source::WalkOptions {
+                    WalkOptions {
+                        filter_time_anchor: self.config.filter_time_anchor,
                         observation_plan: self.config.observation_plan,
                         metadata_scope: self.config.metadata_scope,
                         operation_timeout: self.operation_timeout,
@@ -244,6 +245,8 @@ mod tests {
         storage_factory::{StorageRole, create_storage_for_role},
     };
     use std::time::Duration;
+    use std::{fs::FileTimes, time::UNIX_EPOCH};
+    use task_model::ObservedEntryExt;
     use tokio::fs;
 
     #[tokio::test]
@@ -277,6 +280,50 @@ mod tests {
         let iterator = walkdir_from_file_list(storage, paths.to_str().unwrap(), None)?;
         while iterator.next().await.is_some() {}
         assert!(iterator.take_error().is_some_and(|error| error.is_not_found()));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn migration_scan_uses_one_explicit_filter_clock() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let payload = root.path().join("payload");
+        fs::write(&payload, b"window-bound").await?;
+        File::options()
+            .write(true)
+            .open(&payload)?
+            .set_times(FileTimes::new().set_modified(UNIX_EPOCH + Duration::from_secs(10 * 86_400)))?;
+        // 两种迁移入口共用 DirectoryWalker；时钟远离当前时间，避免实时回退也通过测试。
+        for mode in [ScanType::Full, ScanType::Incremental] {
+            for (anchor, expected) in [(16 * 86_400, vec![PathBuf::from("payload")]), (18 * 86_400, vec![])] {
+                let mut config = initialize_scan_config(
+                    "fixed-window",
+                    root.path().to_str().unwrap(),
+                    0,
+                    mode,
+                    &Some("modified < 7d".into()),
+                    &None,
+                    2,
+                    false,
+                    &None,
+                    false,
+                    0,
+                )?;
+                config.filter_time_anchor = Some(anchor);
+                let iterator = DirectoryWalker::new(config).walk().await?;
+                let mut files = Vec::new();
+                while let Some(message) = iterator.next().await {
+                    match message {
+                        StorageEntryMessage::Scanned(entry) if !entry.get_is_dir() => {
+                            files.push(entry.get_relative_path().to_path_buf());
+                        }
+                        StorageEntryMessage::Error { reason, .. } => panic!("{reason}"),
+                        _ => {}
+                    }
+                }
+                assert!(iterator.take_error().is_none());
+                assert_eq!(files, expected, "{mode:?}, anchor={anchor}");
+            }
+        }
         Ok(())
     }
 }

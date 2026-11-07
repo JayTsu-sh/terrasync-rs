@@ -72,6 +72,8 @@ pub struct ScanConfig {
     pub exclude: String,
     pub match_expressions: Option<FilterExpression>,
     pub exclude_expressions: Option<FilterExpression>,
+    /// 迁移任务固定本轮过滤时间；独立扫描未指定时保持既有实时语义。
+    pub filter_time_anchor: Option<i64>,
     pub include_tags: bool,
     pub observation_plan: Option<ObservationPlan>,
     pub metadata_scope: MetadataScope,
@@ -157,6 +159,7 @@ pub fn initialize_scan_config(
         exclude: exclude.clone().unwrap_or_default(),
         match_expressions: r#match.as_deref().map(parse_filter_expression).transpose()?,
         exclude_expressions: exclude.as_deref().map(parse_filter_expression).transpose()?,
+        filter_time_anchor: None,
         include_tags,
         observation_plan: None,
         metadata_scope: MetadataScope::default(),

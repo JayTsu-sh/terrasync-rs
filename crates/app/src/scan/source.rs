@@ -1,6 +1,7 @@
 use super::observation::{HistorySequence, ObservationValidation, observation_plan, tags_required};
 use crate::error::storage::{Result, StorageError, operation};
 use crate::storage_factory::{StorageContext, path};
+use data_mover::filter::FilterExpression;
 use data_mover::model::{ObservationMode, ObservationPlan};
 use data_mover::storage::Storage;
 use task_model::ObservedEntryExt;
@@ -54,10 +55,7 @@ impl StorageContext {
         if options.packaged {
             request = request.filter(Arc::new(PackageFilter::new(options)));
         } else if options.match_expressions.is_some() || options.exclude_expressions.is_some() {
-            request = request.filter(Arc::new(DslTraversalFilter::new(
-                options.match_expressions.clone(),
-                options.exclude_expressions.clone(),
-            )));
+            request = request.filter(Arc::new(options.dsl_filter()));
         }
         Ok(request)
     }
@@ -477,6 +475,8 @@ fn validation_for(storage: &Storage, options: &WalkOptions) -> Result<Observatio
 
 #[derive(Debug, Clone)]
 pub struct WalkOptions {
+    /// 固定本执行的过滤时间；独立遍历可以显式保留实时判定。
+    pub filter_time_anchor: Option<i64>,
     pub observation_plan: Option<ObservationPlan>,
     pub metadata_scope: MetadataScope,
     /// 单个远程存储操作的等待上限；独立于自动恢复，不包含消费者背压。
@@ -495,6 +495,7 @@ pub struct WalkOptions {
 impl Default for WalkOptions {
     fn default() -> Self {
         Self {
+            filter_time_anchor: None,
             observation_plan: None,
             metadata_scope: MetadataScope::default(),
             operation_timeout: None,
@@ -510,4 +511,12 @@ impl Default for WalkOptions {
     }
 }
 
-use data_mover::filter::FilterExpression;
+impl WalkOptions {
+    pub(crate) fn dsl_filter(&self) -> DslTraversalFilter {
+        let filter = DslTraversalFilter::new(self.match_expressions.clone(), self.exclude_expressions.clone());
+        match self.filter_time_anchor {
+            Some(epoch) => filter.with_time_anchor(epoch),
+            None => filter,
+        }
+    }
+}

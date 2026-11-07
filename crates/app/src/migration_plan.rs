@@ -2,6 +2,7 @@
 
 use data_mover::model::{MetadataCapabilities, MetadataFamily, ObservationMode, ObservationPlan, ObservationSupport};
 use data_mover::storage::{CopiedAclTarget, CopiedMetadataTarget, CopiedValueTarget};
+use data_mover::time_util::now_secs;
 use task_model::metadata::MetadataScope;
 
 use crate::error::Result;
@@ -9,6 +10,7 @@ use crate::storage_factory::StorageContext;
 
 #[derive(Clone, Debug)]
 pub(crate) struct MigrationPlan {
+    pub filter_time_anchor: i64,
     pub observation: ObservationPlan,
     pub scope: MetadataScope,
     pub additional_reads: Vec<MetadataRead>,
@@ -165,6 +167,7 @@ impl MigrationPlan {
             })
             .collect();
         Self {
+            filter_time_anchor: now_secs(),
             observation,
             scope: MetadataScope::default(),
             additional_reads,
@@ -173,6 +176,7 @@ impl MigrationPlan {
 
     pub fn log(&self) {
         tracing::info!(
+            filter_time_anchor_epoch = self.filter_time_anchor,
             latest_metadata_only = self.scope.latest_version_only,
             directory_object_metadata = self.scope.directory_object_output,
             "Migration version metadata selection"

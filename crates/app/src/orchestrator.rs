@@ -376,6 +376,7 @@ impl SyncOrchestrator {
             c.package_depth,
         )?;
 
+        scan_config.filter_time_anchor = observation_plan.as_ref().map(|plan| plan.filter_time_anchor);
         scan_config.observation_plan = observation_plan.as_ref().map(|plan| plan.observation);
         scan_config.metadata_scope = observation_plan.map(|plan| plan.scope).unwrap_or_default();
 
@@ -789,6 +790,7 @@ impl SyncOrchestrator {
             c.package_depth,
         )?;
 
+        scan_config.filter_time_anchor = observation_plan.as_ref().map(|plan| plan.filter_time_anchor);
         scan_config.observation_plan = observation_plan.as_ref().map(|plan| plan.observation);
         scan_config.metadata_scope = observation_plan.map(|plan| plan.scope).unwrap_or_default();
 

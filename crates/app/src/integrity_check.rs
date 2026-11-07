@@ -400,6 +400,7 @@ pub async fn integrity_check_with_concurrency(
     )?);
 
     let scan_config = ScanConfig {
+        filter_time_anchor: None,
         job_id: job_id.clone(),
         path: src_path.to_string(),
         depth: 0,
