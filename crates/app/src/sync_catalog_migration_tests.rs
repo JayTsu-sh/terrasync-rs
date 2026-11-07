@@ -23,7 +23,7 @@ use crate::error::{AppError, Result};
 use crate::file_copy::metadata::set_entry_metadata;
 use crate::file_copy::{CopyOptions, copy_file};
 use crate::scan::{ScanType, observe_path};
-use crate::source_cleanup::remove_confirmed_sources;
+use crate::source_cleanup::{SourceCleanupCheck, remove_confirmed_sources};
 use crate::storage_factory::{CreateStorageOptions, create_storage};
 
 async fn unchanged_copy_is_deleted(config: &ClickHouseConfig) -> Result<()> {
@@ -67,7 +67,13 @@ async fn unchanged_copy_is_deleted(config: &ClickHouseConfig) -> Result<()> {
         .await?;
     assert!(changes.is_empty(), "unchanged entries must produce no copy work");
     copy_completion::complete(database.clone(), Arc::clone(&target)).await?;
-    remove_confirmed_sources(database, source, target).await?;
+    remove_confirmed_sources(
+        database,
+        source,
+        target,
+        SourceCleanupCheck::new(Duration::from_secs(1), Duration::from_secs(3), CancellationToken::new()),
+    )
+    .await?;
     assert!(!source_root.path().join("payload").exists());
     assert_eq!(
         std::fs::read(target_root.path().join("payload"))?,
@@ -238,7 +244,13 @@ async fn only_current_selection_authorizes_source_cleanup(config: &ClickHouseCon
     let untouched_time = UNIX_EPOCH + Duration::from_secs(1_234_567);
     File::open(target_root.path().join("outside-dir"))?.set_times(FileTimes::new().set_modified(untouched_time))?;
     copy_completion::complete(database.clone(), Arc::clone(&target)).await?;
-    remove_confirmed_sources(database, source, target).await?;
+    remove_confirmed_sources(
+        database,
+        source,
+        target,
+        SourceCleanupCheck::new(Duration::from_secs(1), Duration::from_secs(3), CancellationToken::new()),
+    )
+    .await?;
     assert!(!source_root.path().join("selected").exists());
     assert_eq!(std::fs::read(source_root.path().join("outside"))?, b"outside");
     assert!(source_root.path().join("outside-dir").is_dir());

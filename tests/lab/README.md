@@ -360,3 +360,17 @@ While FAS2750 CIFS root provisioning is explicitly deferred, nightly sets
 the remaining seven profiles, with `cifs_fas2750` recorded in
 `deferred_profiles`; it is not a substitute for the 64-cell acceptance gate.
 Release validation remains on the full matrix.
+
+`run-source-metadata-guard.py` requires a unique `nightly-source-metadata-guard-*`
+prefix already held by a `prepare-run.sh` / `cleanup-run.sh` lifecycle and
+`LAB_SOURCE_GUARD_RUN_ID`, `LAB_SSH_KEY` plus root fixture control. It connects a
+private TCP relay to the source NFS v4.1 data interface, then runs the ignored
+`source_cleanup::real_tests` cases. It independently checks actual server files
+and target bytes: unchanged source removal, post-copy source mode changes,
+idempotence, recovered disconnect, continuous loss, silent loss and cancellation.
+A counting namespace delegates to the real NFS role and requires zero purge calls
+when metadata observation fails. The relay affects only its own sockets; no
+server, firewall, export or SSH configuration is changed. The caller must always
+execute cleanup, including after test failure. This verifies source observation
+and purge admission, not target durability/ownership, task-wide deadlines,
+ClickHouse/callback outages or full migration performance.

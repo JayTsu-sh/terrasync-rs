@@ -66,7 +66,7 @@ use crate::migration_plan::MigrationPlan;
 use crate::receiver::{ReceiverConfig, process_entry_on_receiver};
 use crate::scan::ScanType;
 use crate::sender::{SenderWorkerConfig, sender_worker};
-use crate::source_cleanup::remove_confirmed_sources;
+use crate::source_cleanup::{self, SourceCleanupCheck, remove_confirmed_sources};
 use crate::storage_factory::{StorageRole, create_storage_for_role};
 #[cfg(windows)]
 use crate::sync::check_admin_privileges;
@@ -74,6 +74,7 @@ use crate::sync::{StoragePair, parse_size};
 use crate::sync_catalog::batch_processing_to_generate_message;
 use crate::target_absence::SourceAbsenceCheck;
 use crate::task_stream::finish_phase;
+use tokio_util::sync::CancellationToken;
 
 #[cfg(test)]
 #[path = "orchestrator_absence_tests.rs"]
@@ -316,6 +317,7 @@ impl SyncOrchestrator {
             Some(error) => Err(error),
             None => self.run_local_prepared(&app_config, &mut consumers).await,
         };
+        let result = source_cleanup::report_failure(result, &consumers).await;
         consumers
             .finish_unpersisted_migration(if result.is_ok() {
                 CopyGenerationPhase::Completed
@@ -878,7 +880,17 @@ impl SyncOrchestrator {
                         )
                         .await?,
                     );
-                    remove_confirmed_sources(database.clone(), source, destination).await?;
+                    remove_confirmed_sources(
+                        database.clone(),
+                        source,
+                        destination,
+                        SourceCleanupCheck::new(
+                            Duration::from_secs(app_config.scan.operation_timeout_secs),
+                            Duration::from_secs(app_config.scan.recovery_window_secs),
+                            CancellationToken::new(),
+                        ),
+                    )
+                    .await?;
                 }
             }
             Ok(())
@@ -1249,7 +1261,17 @@ impl SyncOrchestrator {
                     )
                     .await?,
                 );
-                remove_confirmed_sources(database.clone(), source, destination).await?;
+                remove_confirmed_sources(
+                    database.clone(),
+                    source,
+                    destination,
+                    SourceCleanupCheck::new(
+                        Duration::from_secs(app_config.scan.operation_timeout_secs),
+                        Duration::from_secs(app_config.scan.recovery_window_secs),
+                        CancellationToken::new(),
+                    ),
+                )
+                .await?;
             }
             Ok(())
         }

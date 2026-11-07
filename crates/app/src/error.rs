@@ -36,6 +36,7 @@ pub enum CopyStep {
     ReadSourceLink,
     CreateDestinationLink,
     Transfer,
+    SourceCleanup,
 }
 
 impl Display for CopyStep {
@@ -44,6 +45,7 @@ impl Display for CopyStep {
             Self::ReadSourceLink => "read source symlink",
             Self::CreateDestinationLink => "create destination symlink",
             Self::Transfer => "transfer file",
+            Self::SourceCleanup => "clean up source entry",
         })
     }
 }
@@ -351,6 +353,19 @@ pub enum AppError {
 pub type Result<T> = std::result::Result<T, AppError>;
 
 impl AppError {
+    pub(crate) fn source_cleanup_entry(&self) -> Option<(&Path, &Self)> {
+        match self {
+            Self::CopyEntryFailed {
+                step: CopyStep::SourceCleanup,
+                path,
+                source,
+            } => Some((path, source)),
+            Self::MigrationFinalizationFailed { source, .. } | Self::MigrationReportingFailed { source, .. } => {
+                source.source_cleanup_entry()
+            }
+            _ => None,
+        }
+    }
     pub(crate) fn is_reported_copy_failure(&self) -> bool {
         match self {
             Self::ReportedCopyFailure { .. } => true,

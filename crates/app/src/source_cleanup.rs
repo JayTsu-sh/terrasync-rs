@@ -1,22 +1,53 @@
 //! 只消费本次重新选中且目标已确认落库的事实；不清理范围外的旧源项。
 
-use std::sync::Arc;
+use std::{path::Path, sync::Arc, time::Duration};
 
 use data_mover::model::{EntryKind, ObservedEntry};
+use data_mover::storage::NamespaceReadPolicy;
 use db::ClickHouseDatabase;
 use task_model::observation::ObservedView;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::AbortOnDropHandle;
 
+use crate::consumer::ConsumerManager;
+use crate::error::CopyStep;
 use crate::error::{AppError, Result, StorageError};
 use crate::file_copy::metadata::copied_metadata_plan;
 use crate::file_copy::selection::unrepresentable_object;
-use crate::storage_factory::StorageContext;
+use crate::storage_factory::{StorageContext, path};
+use task_model::{SourcePresence, TargetRetention, TargetRetentionReason};
+
+mod verification;
+use verification::verify_source_metadata;
+
+#[cfg(all(test, unix))]
+#[path = "source_cleanup_real_tests.rs"]
+mod real_tests;
+
+#[derive(Clone)]
+pub(crate) struct SourceCleanupCheck {
+    read_policy: NamespaceReadPolicy,
+    cancel: CancellationToken,
+}
+
+impl SourceCleanupCheck {
+    pub fn new(operation_timeout: Duration, recovery_window: Duration, cancel: CancellationToken) -> Self {
+        Self {
+            read_policy: NamespaceReadPolicy {
+                operation_timeout,
+                recovery_window,
+                retry_interval: Duration::from_millis(100),
+            },
+            cancel,
+        }
+    }
+}
 
 /// 调用方必须先排空复制和数据库消费者，并完成目标目录元数据与代次提交。
 pub(crate) async fn remove_confirmed_sources(
     database: ClickHouseDatabase, source: Arc<StorageContext>, destination: Arc<StorageContext>,
+    check: SourceCleanupCheck,
 ) -> Result<()> {
     let (sender, mut receiver) = mpsc::channel(32);
     let query = AbortOnDropHandle::new(tokio::spawn(async move {
@@ -24,13 +55,52 @@ pub(crate) async fn remove_confirmed_sources(
     }));
     while let Some(entry) = receiver.recv().await {
         // 一旦清理失败就停止发出新删除，避免断连后继续扩大未知副作用。
-        remove_entry(&source, &destination, &entry).await?;
+        remove_entry(&source, &destination, &entry, &check)
+            .await
+            .map_err(|source| {
+                AppError::copy_entry_failure(CopyStep::SourceCleanup, Path::new(entry.path().as_str()), source)
+            })?;
     }
     query.await.map_err(AppError::from)??;
     Ok(())
 }
 
-async fn remove_entry(source: &StorageContext, destination: &StorageContext, entry: &ObservedEntry) -> Result<()> {
+/// 终态保留事件包含已识别路径；未观察到实际存在性的故障仍明确为 Unknown。
+pub(crate) async fn report_failure(result: Result<()>, reports: &ConsumerManager) -> Result<()> {
+    let Err(source) = result else {
+        return result;
+    };
+    let Some((entry_path, failure)) = source.source_cleanup_entry() else {
+        return Err(source);
+    };
+    let report = async {
+        let reason = if matches!(failure.storage_error(), Some(StorageError::NamespaceRead(_))) {
+            TargetRetentionReason::SourceQueryFailed
+        } else {
+            TargetRetentionReason::StaleEvidence
+        };
+        let mut retention = TargetRetention::entry(&path(entry_path)?, reason);
+        if matches!(
+            failure.storage_error(),
+            Some(StorageError::SourceMetadataChanged { .. })
+        ) {
+            retention.source_presence = SourcePresence::Present;
+        }
+        reports.record_target_retention(retention, source.to_string()).await
+    }
+    .await;
+    match report {
+        Ok(()) => Err(source),
+        Err(reporting) => Err(AppError::MigrationReportingFailed {
+            source: Box::new(source),
+            reporting: Box::new(reporting),
+        }),
+    }
+}
+
+async fn remove_entry(
+    source: &StorageContext, destination: &StorageContext, entry: &ObservedEntry, check: &SourceCleanupCheck,
+) -> Result<()> {
     // 存储根和虚拟目录不是本次传输拥有的可删除实体。
     if entry.path().as_str().is_empty() || unrepresentable_object(entry, destination).is_some() {
         return Ok(());
@@ -49,7 +119,7 @@ async fn remove_entry(source: &StorageContext, destination: &StorageContext, ent
             version_index: None,
         },
     )?
-    .verify_published(destination.storage(), entry.path(), None, CancellationToken::new())
+    .verify_published(destination.storage(), entry.path(), None, check.cancel.clone())
     .await
     .map_err(StorageError::from)?;
     if target.kind != entry.kind() || (entry.kind() == EntryKind::File && target.size != entry.size()) {
@@ -73,11 +143,14 @@ async fn remove_entry(source: &StorageContext, destination: &StorageContext, ent
         }
         .into());
     }
+    if !verify_source_metadata(source, entry, check).await? {
+        return Ok(());
+    }
     // 仅删除文件、链接本身或空目录；过滤掉或并发新增的子项会阻止目录删除。
     source
         .storage()
         .namespace()?
-        .purge_observed(entry, CancellationToken::new())
+        .purge_observed(entry, check.cancel.clone())
         .await
         .map_err(StorageError::from)?;
     Ok(())
@@ -87,6 +160,16 @@ async fn remove_entry(source: &StorageContext, destination: &StorageContext, ent
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    async fn remove_entry(source: &StorageContext, destination: &StorageContext, entry: &ObservedEntry) -> Result<()> {
+        super::remove_entry(
+            source,
+            destination,
+            entry,
+            &SourceCleanupCheck::new(Duration::from_secs(1), Duration::from_secs(3), CancellationToken::new()),
+        )
+        .await
+    }
     use crate::file_copy::{CopyOptions, copy_file, metadata::set_entry_metadata};
     use crate::observed_fixtures::observation;
     use crate::scan::observe_path;
@@ -178,6 +261,94 @@ mod tests {
             expected
         );
         assert_eq!(std::fs::read(target_root.path().join("tree/file"))?, b"payload");
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn ownership_changes_after_copy_preserve_the_source_file_and_directory() -> Result<()> {
+        use data_mover::model::MetadataFamily;
+        use std::os::unix::fs::PermissionsExt;
+
+        let source_root = tempfile::tempdir()?;
+        let target_root = tempfile::tempdir()?;
+        let source = create_storage(source_root.path().to_str().unwrap(), CreateStorageOptions::default()).await?;
+        let target = create_storage(target_root.path().to_str().unwrap(), CreateStorageOptions::default()).await?;
+        for directory in [false, true] {
+            let name = if directory { "directory" } else { "file" };
+            let path = source_root.path().join(name);
+            if directory {
+                std::fs::create_dir(&path)?;
+            } else {
+                std::fs::write(&path, b"payload")?;
+            }
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))?;
+            let entry = observe_path(source.storage(), Path::new(name)).await?;
+            if directory {
+                std::fs::create_dir(target_root.path().join(name))?;
+                set_entry_metadata(target.storage(), &entry).await?;
+            } else {
+                copy_file(&source, &target, &Arc::new(entry.clone()), CopyOptions::default(), None).await?;
+            }
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o750))?;
+            assert!(matches!(remove_entry(&source, &target, &entry).await,
+                Err(AppError::StorageError(StorageError::SourceMetadataChanged { families, .. }))
+                if families == [MetadataFamily::OwnershipMode]));
+            assert!(path.exists());
+            assert!(target_root.path().join(name).exists());
+        }
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn xattr_changes_after_copy_keep_both_original_target_and_changed_source() -> Result<()> {
+        use crate::scan::observe_path_with_plan;
+        use data_mover::model::{ExtendedAttribute, MetadataFamily, ObservationMode, ObservationPlan, StoragePath};
+        use data_mover::storage::MetadataMutation;
+
+        let source_root = tempfile::tempdir()?;
+        let target_root = tempfile::tempdir()?;
+        std::fs::write(source_root.path().join("file"), b"payload")?;
+        let source = create_storage(source_root.path().to_str().unwrap(), CreateStorageOptions::default()).await?;
+        let target = create_storage(target_root.path().to_str().unwrap(), CreateStorageOptions::default()).await?;
+        let path = StoragePath::new("file").map_err(StorageError::from)?;
+        let attributes =
+            |value: &[u8]| vec![ExtendedAttribute::new(b"user.cleanup-proof".to_vec(), value.to_vec()).unwrap()];
+        source
+            .storage()
+            .metadata()?
+            .apply(
+                &path,
+                MetadataMutation::Xattrs(attributes(b"before")),
+                CancellationToken::new(),
+            )
+            .await?;
+        let plan = ObservationPlan::default()
+            .with_xattrs(ObservationMode::Required)
+            .with_timestamps(ObservationMode::InlineOnly)
+            .with_ownership_mode(ObservationMode::InlineOnly);
+        let entry = observe_path_with_plan(source.storage(), Path::new("file"), plan).await?;
+        assert_eq!(entry.metadata().xattrs().value(), Some(&attributes(b"before")));
+        copy_file(&source, &target, &Arc::new(entry.clone()), CopyOptions::default(), None).await?;
+        source
+            .storage()
+            .metadata()?
+            .apply(
+                &path,
+                MetadataMutation::Xattrs(attributes(b"after")),
+                CancellationToken::new(),
+            )
+            .await?;
+        assert!(matches!(remove_entry(&source, &target, &entry).await,
+            Err(AppError::StorageError(StorageError::SourceMetadataChanged { families, .. }))
+            if families == [MetadataFamily::Xattrs]));
+        let actual_source = observe_path_with_plan(source.storage(), Path::new("file"), plan).await?;
+        let actual_target = observe_path_with_plan(target.storage(), Path::new("file"), plan).await?;
+        assert_eq!(actual_source.metadata().xattrs().value(), Some(&attributes(b"after")));
+        assert_eq!(actual_target.metadata().xattrs().value(), Some(&attributes(b"before")));
+        assert_eq!(std::fs::read(source_root.path().join("file"))?, b"payload");
+        assert_eq!(std::fs::read(target_root.path().join("file"))?, b"payload");
         Ok(())
     }
 }

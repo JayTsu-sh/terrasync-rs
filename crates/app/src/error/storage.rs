@@ -1,5 +1,6 @@
 use data_mover::error::StorageError as NativeStorageError;
 use data_mover::metadata::MetadataVerificationError;
+use data_mover::model::MetadataFamily;
 use data_mover::model::MetadataObservationFailure;
 use data_mover::qos::SourceQosSetupError;
 use data_mover::storage::EntryObservationFailure;
@@ -31,6 +32,11 @@ pub enum StorageError {
     MetadataVerification(#[from] MetadataVerificationError),
     #[error("目标发布状态与复制结果不一致，禁止删源: {path}")]
     TargetPublicationChanged { path: StoragePath },
+    #[error("复制后源端元数据发生变化，保留源端: {path}, families={families:?}")]
+    SourceMetadataChanged {
+        path: StoragePath,
+        families: Vec<MetadataFamily>,
+    },
     #[error("源端元数据获取失败，禁止删源: {path} version={version:?}, failures={failures:?}")]
     SourceMetadataAcquisitionFailed {
         path: StoragePath,

@@ -231,11 +231,16 @@ impl ConsumerManager {
     pub(crate) async fn record_target_retention_range(
         &self, reason: TargetRetentionReason, message: String,
     ) -> Result<()> {
+        self.record_target_retention(TargetRetention::source_range(reason), message)
+            .await
+    }
+
+    pub(crate) async fn record_target_retention(&self, retention: TargetRetention, message: String) -> Result<()> {
         if let Some(consumer) = &self.stats_consumer {
             StatisticConsumer::record_message(
                 consumer,
                 &StorageEntryMessage::TargetPreserved {
-                    retention: Box::new(TargetRetention::source_range(reason)),
+                    retention: Box::new(retention),
                     reason: message,
                 },
             )
@@ -775,10 +780,114 @@ impl Drop for ConsumerManager {
 mod resume_tests {
     use super::*;
     use crate::consumer::stats::ProgressDetail;
+    use crate::error::{CopyStep, StorageError};
     use crate::observed_fixtures::observation;
+    use crate::source_cleanup;
     use data_mover::model::{BackendKind, EntryKind};
+    use data_mover::model::{MetadataFamily, StoragePath};
+    use data_mover::storage::{NamespaceReadCause, NamespaceReadFailure};
+    use db::DatabaseError;
     use db::EntrySummary as StorageEntryRecord;
     use db::scan::{ScanEventSummary, ScanResumeSummary};
+    use std::path::Path;
+    use task_model::{RetentionScope, SourcePresence};
+
+    #[tokio::test]
+    async fn source_cleanup_failure_reports_known_paths_and_presence_without_double_entry_errors() -> Result<()> {
+        for present in [false, true] {
+            let statistics = StatisticConsumer {
+                stats: StatsKind::Full(FullStats::new(
+                    JobType::Copy,
+                    "source-cleanup-failure".into(),
+                    String::new(),
+                    String::new(),
+                )),
+                progress_bar: ProgressBar::new(JobType::Copy),
+                job_dir: String::new(),
+                callback_url: None,
+                generation_committed: None,
+                migration: None,
+                pb_handle: None,
+                scan_snapshot: None,
+                callback: Default::default(),
+            };
+            let manager = ConsumerManager {
+                consumers: vec![],
+                stats_consumer: Some(Arc::new(Mutex::new(statistics))),
+                callback_guard: None,
+                notification_database: None,
+                copy_pipeline_prepared: false,
+            };
+            let path = StoragePath::new("payload").map_err(StorageError::from)?;
+            let source = if present {
+                StorageError::SourceMetadataChanged {
+                    path,
+                    families: vec![MetadataFamily::OwnershipMode],
+                }
+            } else {
+                StorageError::NamespaceRead(NamespaceReadFailure::Operation {
+                    path,
+                    attempts: 3,
+                    first: Box::new(NamespaceReadCause::ObservationTimeout),
+                    last: Box::new(NamespaceReadCause::ObservationTimeout),
+                })
+            };
+            let error = AppError::copy_entry_failure(CopyStep::SourceCleanup, Path::new("payload"), source);
+            let error = AppError::MigrationFinalizationFailed {
+                source: Box::new(error),
+                finalization: DatabaseError::ConfigError("injected finalization failure".into()),
+            };
+            let result = source_cleanup::report_failure(Err(error), &manager).await;
+            let error = result
+                .err()
+                .ok_or_else(|| AppError::ConfigError("cleanup failure disappeared".into()))?;
+            manager.record_task_error(&error).await;
+            let mut state = manager
+                .stats_consumer
+                .as_ref()
+                .ok_or_else(|| AppError::ConfigError("test statistics missing".into()))?
+                .lock()
+                .await;
+            let report = state.to_report(true);
+            assert_eq!(report.task_error_count, 1);
+            assert_eq!(report.target_preserved_count, 1);
+            assert!(matches!(report.detail, ProgressDetail::Full { error_count: 0, .. }));
+            let batch = state
+                .callback
+                .outbox
+                .prepare_batch()
+                .ok_or_else(|| AppError::ConfigError("missing cleanup callback details".into()))?;
+            let event = batch
+                .events
+                .iter()
+                .find(|event| event.code == "target_preserved")
+                .ok_or_else(|| AppError::ConfigError("missing retention event".into()))?;
+            let retention = event
+                .retention
+                .as_ref()
+                .ok_or_else(|| AppError::ConfigError("missing retention context".into()))?;
+            assert_eq!(retention.scope, RetentionScope::Entry);
+            assert_eq!(retention.source_path.as_deref(), Some("payload"));
+            assert_eq!(retention.target_path.as_deref(), Some("payload"));
+            assert_eq!(
+                retention.source_presence,
+                if present {
+                    SourcePresence::Present
+                } else {
+                    SourcePresence::Unknown
+                }
+            );
+            assert_eq!(
+                retention.reason,
+                if present {
+                    TargetRetentionReason::StaleEvidence
+                } else {
+                    TargetRetentionReason::SourceQueryFailed
+                }
+            );
+        }
+        Ok(())
+    }
 
     #[tokio::test]
     async fn already_reported_version_failure_is_not_counted_again_at_task_finish() -> Result<()> {
