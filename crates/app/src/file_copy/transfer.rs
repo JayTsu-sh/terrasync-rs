@@ -19,10 +19,10 @@ pub(crate) fn validate_transfer_mode(destination: &StorageContext, mode: Transfe
     let staged = destination.roles.staged_destination()?;
     let reason = match mode {
         TransferMode::Direct if !staged.supports_direct() => {
-            Some("direct writes are unavailable; select --resume or --in-place")
+            Some("direct writes are unavailable; select --resume or a supported backend")
         }
         TransferMode::Checkpoint if !staged.resumable_at_destination() => {
-            Some("destination checkpoints are unavailable; select --in-place or a supported backend")
+            Some("destination checkpoints are unavailable; select a supported backend")
         }
         _ => None,
     };
@@ -42,7 +42,7 @@ pub(crate) fn validate_stream_transfer_mode(destination: &StorageContext, mode: 
         return Err(StorageError::UnsupportedTransferMode {
             backend: destination.roles.kind(),
             mode,
-            reason: "remote Direct requires sparse patch support; use --resume or --in-place",
+            reason: "remote Direct requires sparse patch support; use --resume or a supported backend",
         });
     }
     Ok(())

@@ -27,6 +27,8 @@ export interface Endpoint {
 // ========== Task 类型 ==========
 
 export interface TaskConfig {
+  scan_resume?: boolean
+  copy_resume?: boolean
   match_expr?: string
   exclude_expr?: string
   depth?: number

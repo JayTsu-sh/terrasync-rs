@@ -1144,29 +1144,29 @@ python tools/log_analyzer.py --app /tmp/app.json.log --error /tmp/error.log -o /
 
 | 参数 | data-mover 策略 | 行为 |
 |------|----------------|------|
-| `--resume`（优先级最高） | Checkpointed | 保留目标端可恢复检查点；小文件可能按上游门槛省略检查点 |
-| 仅 `--in-place` | AtomicReplace | 重建到 staging，完成校验后原子发布，不保留恢复检查点 |
-| 两者都不指定 | Direct | 直接写最终目标；失败可能留下部分内容 |
+| `--resume` | Checkpointed | 保留目标端有效的文件传输检查点；小文件可能按上游门槛省略检查点，不恢复扫描位置 |
+| 未启用 `--resume` | Direct | 直接写最终目标；失败可能留下部分内容 |
 
-这里的 `--in-place` 按产品约定选择 Atomic，并非直接改写旧目标。
-模式贯穿全量同步、增量新增/变更以及 rename 后的内容重拷贝；后端能力不足时明确报错，不自动降级。
-旧 `--no-resume` 仅作为兼容参数接受，不再开启默认续传；不能与 `--resume` 同用。
-Web 发起的任务继续显式使用 Checkpoint，不受 CLI 默认值调整影响。
+CLI 与 Web 共用同一规则；Web 的“文件断点续传”默认关闭，可在任务创建和编辑时保存。
+`--in-place`、`--no-resume` 及产品 Atomic 模式已移除。模式贯穿全量、增量及 rename 后的内容重拷贝，
+后端能力不足时明确报错，不自动降级。快速／全量校验独立选择，不改变传输模式。
 
 双进程 `--remote` 会把模式传给 Receiver。当前 Direct 稀疏补丁支持 Unix Local 目标；
-其他 backend 必须实现上游的 `supports_sparse_patch`/`patch_direct`，否则明确报错，
-可显式改用 `--in-place` 或 `--resume`。协议 v10 要求两端同时升级。
-`--packaged` 的 tar API 固定 Atomic，因此需指定 `--in-place`；其他模式明确报错。
+其他 backend 必须实现上游的 `supports_sparse_patch`/`patch_direct`，否则明确报错，可选择支持续传的目标。
+协议 v14 要求两端同时升级。单进程 NFS／CIFS Direct 能力仍待补齐，不应通过 Atomic 静默替代。
+`--packaged` 显式使用 Direct，生成的 tar 流不支持 `--resume`；Unix Local 和 S3 已验证目标与清单源项的
+别名保护，避免覆盖源文件或对象。打包移动仍需逐项清单校验，当前明确拒绝。
+最终失败数据的受保护清理尚待补齐；本次模式整理不表示该清理或完整迁移性能验收已经完成。
 
 已有完整目标后的 Direct delta 会先消费所有 basis 引用，只暂存不同区间，校验完整输入和
 basis 版本后才原地改写。相同位置的 Match 不写入，连续引用合并读取；重复块优先选择
 同位置引用。增长、缩短、移动和重叠引用均按最终输出区间处理。补丁实际写入字节数会记入日志。
 输入暂存和 backend 文件句柄均由 data-mover 持有，Unix 输入暂存立即 unlink，进程中断不会留下 spool。
 网络接收阶段中断不改旧目标；应用补丁期间失败可能留下部分更新，重跑时须重新生成 basis 签名。
-Direct 不提供 Atomic 的回滚或其他进程并发写隔离保证。
+Direct 不提供回滚或其他进程并发写隔离保证。
 
 Direct 默认不受原有 512MiB delta 门槛限制；显式 `--delta-size-threshold` 仍有效。
-Atomic/Checkpoint 保留原默认门槛。delta 的网络传输只包括变化字节及未变块引用，但签名和完整校验
+Checkpoint 保留原默认门槛。delta 的网络传输只包括变化字节及未变块引用，但签名和完整校验
 仍可能读取整文件。Checkpoint 保留目标端前缀；当前双进程 wire 重跑会重放数据或 delta token
 计算完整摘要，不代表网络字节级续传。
 

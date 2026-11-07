@@ -5,6 +5,7 @@ const BASE = '/api/v1'
 
 export interface TaskConfig {
   scan_resume?: boolean
+  copy_resume?: boolean
   match_expr?: string
   exclude_expr?: string
   depth?: number

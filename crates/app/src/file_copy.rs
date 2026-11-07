@@ -41,7 +41,6 @@ pub struct CopyOptions {
 pub(crate) const fn transfer_policy(mode: TransferMode) -> TransferPolicy {
     match mode {
         TransferMode::Checkpoint => TransferPolicy::Checkpointed,
-        TransferMode::Atomic => TransferPolicy::AtomicReplace,
         TransferMode::Direct => TransferPolicy::Direct,
     }
 }
@@ -303,14 +302,6 @@ mod tests {
         assert_eq!(first.transfer_identity(), "persistent-job");
         assert_eq!(first.transfer_identity(), restarted.transfer_identity());
         assert_eq!(first.transfer_mode(), TransferMode::Checkpoint);
-    }
-
-    #[test]
-    fn atomic_mode_maps_to_hdfs_restart() {
-        let context = HdfsCopyContext::from_job("persistent-job", TransferMode::Atomic)
-            .unwrap_or_else(|error| panic!("valid job identity rejected: {error}"));
-
-        assert_eq!(context.transfer_mode(), TransferMode::Atomic);
     }
 
     #[test]

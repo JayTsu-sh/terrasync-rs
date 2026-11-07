@@ -431,7 +431,7 @@ async fn run_migration_task(
                 package_depth: 0,
                 raw_command_line: format!("gui:sync {source_url} {dest}"),
                 progress_callback_url: callback_url,
-                transfer_mode: TransferMode::Checkpoint,
+                transfer_mode: TransferMode::from_resume(task_config.copy_resume),
                 // web 层是否暴露该参数为后续可选项，本次先给默认值保证编译通过
                 delete_target: false,
                 concurrency: task_config.concurrency,

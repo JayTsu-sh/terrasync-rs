@@ -424,13 +424,14 @@ pub enum ReceiverMsg {
 ///
 /// 8：remote expert terminal 新增 staged metadata phase。新旧 wire 不兼容，不提供双协议解码。
 /// 13：新增不产生传输成功事实的 CopySkipped 分类，要求对端理解其统计与保留语义。
-pub const PROTOCOL_VERSION: u32 = 13;
+/// 14：文件传输模式仅保留 Checkpoint／Direct，移除 Atomic 的线格式。
+pub const PROTOCOL_VERSION: u32 = 14;
 
 /// 当前 binary 能接受的最低对端协议版本
 ///
 /// 对端版本低于此值时握手拒绝，避免 bincode schema 不兼容导致反序列化失败
 /// 或部分文件已写入、部分未写入的"半执行"不一致状态。
-pub const MIN_SUPPORTED_PROTOCOL_VERSION: u32 = 13;
+pub const MIN_SUPPORTED_PROTOCOL_VERSION: u32 = 14;
 
 /// 完整性校验使用的 hash 算法
 ///

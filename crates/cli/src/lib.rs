@@ -272,7 +272,6 @@ pub async fn cli_match() -> error::Result<()> {
             tls_server_cert,
             token,
             resume,
-            in_place,
             delete_target,
             ..
         } => {
@@ -297,7 +296,6 @@ pub async fn cli_match() -> error::Result<()> {
                 token,
                 raw_command_line,
                 *resume,
-                *in_place,
                 *delete_target,
             )
             .await?;
@@ -431,21 +429,21 @@ mod sync_transfer_mode_tests {
     use task_model::TransferMode;
 
     #[test]
-    fn sync_flags_select_direct_atomic_and_checkpoint_with_resume_priority() {
+    fn sync_flags_select_direct_or_file_checkpoint() {
         for (flags, expected) in [
             (vec![], TransferMode::Direct),
-            (vec!["--in-place"], TransferMode::Atomic),
             (vec!["--resume"], TransferMode::Checkpoint),
-            (vec!["--in-place", "--resume"], TransferMode::Checkpoint),
-            (vec!["--resume", "--in-place"], TransferMode::Checkpoint),
         ] {
             let mut args = vec!["terrasync", "sync", "--id", "job", "/src", "/dest"];
             args.extend(flags);
             let cli = Cli::try_parse_from(args).unwrap_or_else(|error| panic!("invalid sync flags: {error}"));
-            let Commands::Sync { resume, in_place, .. } = cli.command else {
+            let Commands::Sync { resume, .. } = cli.command else {
                 panic!("expected sync");
             };
-            assert_eq!(TransferMode::from_flags(resume, in_place), expected);
+            assert_eq!(TransferMode::from_resume(resume), expected);
+        }
+        for obsolete in ["--in-place", "--no-resume"] {
+            assert!(Cli::try_parse_from(["terrasync", "sync", "--id", "job", "/src", "/dest", obsolete]).is_err());
         }
     }
 }

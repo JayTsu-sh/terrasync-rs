@@ -480,7 +480,7 @@ async fn test_quic_session_config_roundtrip() {
     let sender = quic::connect(server_addr, "localhost", None).await.unwrap();
     sender
         .send(SenderMsg::SessionConfig(SessionConfig {
-            transfer_mode: TransferMode::Atomic,
+            transfer_mode: TransferMode::Direct,
             src_path: "/tmp/test".to_string(),
             qos: Some("1GiB/s".to_string()),
             peak_qos_rate: 1.5,
@@ -566,7 +566,7 @@ async fn test_quic_handshake_compatible_versions_roundtrip() {
     // 握手通过后 Sender 才继续发送 SessionConfig（模拟真实 Sender 流程）
     sender
         .send(SenderMsg::SessionConfig(SessionConfig {
-            transfer_mode: TransferMode::Atomic,
+            transfer_mode: TransferMode::Direct,
             src_path: "/tmp/test".to_string(),
             qos: None,
             peak_qos_rate: 1.0,
@@ -718,7 +718,7 @@ async fn test_quic_auth_success_then_session_config_roundtrip() {
 
     sender
         .send(SenderMsg::SessionConfig(SessionConfig {
-            transfer_mode: TransferMode::Atomic,
+            transfer_mode: TransferMode::Direct,
             src_path: "/tmp/test".to_string(),
             qos: None,
             peak_qos_rate: 1.0,

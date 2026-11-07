@@ -353,7 +353,7 @@ async fn copied_observation_rejects_source_changes_before_any_target_write() -> 
     let dst = local(destination.path()).await?;
     let observed = Arc::new(observe_path(src.storage(), Path::new("payload")).await?);
     tokio::fs::write(source.path().join("payload"), b"modified after scan").await?;
-    let mut modes = vec![TransferMode::Atomic, TransferMode::Checkpoint];
+    let mut modes = vec![TransferMode::Checkpoint];
     if cfg!(unix) {
         modes.push(TransferMode::Direct);
     }

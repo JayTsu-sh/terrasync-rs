@@ -332,9 +332,9 @@ impl SyncOrchestrator {
     async fn run_local_prepared(&self, app_config: &AppConfig, consumers: &mut ConsumerManager) -> Result<()> {
         let c = &self.config;
         info!(transfer_mode = ?c.transfer_mode, "Sync transfer mode selected");
-        if c.packaged && c.transfer_mode != TransferMode::Atomic {
+        if c.packaged && c.transfer_mode != TransferMode::Direct {
             return Err(AppError::ConfigError(
-                "Packaged sync supports only Atomic mode; use --in-place".into(),
+                "Packaged sync supports Direct only; generated archives do not support --resume".into(),
             ));
         }
         let (observation_plan, request) = {

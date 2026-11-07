@@ -11,13 +11,14 @@ use async_trait::async_trait;
 use blake3::Hasher;
 use bytes::Bytes;
 use data_mover::qos::QosManager;
+use data_mover::storage::artifacts::{ArtifactKind, artifact_name};
 use data_mover::storage::{
     BackendConfig, ByteStream, CheckpointObservation, CopiedMetadataTarget, CopiedValueTarget,
     DestinationPrepareRequest, LocalBackendConfig, Metadata, MetadataMutation, PreparedStage, PublicationEvidence,
     PublicationFailure, PublishRequest, StagedDestination, StorageBuilder, StorageRoleFailure, VerificationEvidence,
     VerifyRequest, WriteEvidence, connect_backend,
 };
-use data_mover::transfer::TransferPhase;
+use data_mover::transfer::{DirectPatchError, TransferPhase};
 use std::error::Error;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
@@ -54,11 +55,30 @@ struct MetadataProbe {
     called: AtomicBool,
     cleanup_failure: AtomicBool,
     resumable: AtomicBool,
+    direct: AtomicBool,
+    discarded: AtomicBool,
     tags: Mutex<Vec<ObjectTag>>,
 }
 
 #[async_trait]
 impl StagedDestination for MetadataProbe {
+    fn supports_direct(&self) -> bool {
+        self.direct.load(Ordering::SeqCst) && self.inner.supports_direct()
+    }
+    fn supports_sparse_patch(&self) -> bool {
+        self.direct.load(Ordering::SeqCst) && self.inner.supports_sparse_patch()
+    }
+    async fn prepare_direct(
+        &self, request: storage::PrepareRequest, cancel: CancellationToken,
+    ) -> std::result::Result<PreparedStage, StorageRoleFailure> {
+        self.inner.prepare_direct(request, cancel).await
+    }
+    async fn patch_direct(
+        &self, stage: &PreparedStage, input: PositionedByteStream, final_size: u64, cancel: CancellationToken,
+    ) -> std::result::Result<WriteEvidence, StorageRoleFailure> {
+        self.inner.patch_direct(stage, input, final_size, cancel).await
+    }
+
     fn resumable_at_destination(&self) -> bool {
         self.resumable.load(Ordering::SeqCst)
     }
@@ -94,7 +114,10 @@ impl StagedDestination for MetadataProbe {
     async fn apply_metadata(
         &self, stage: &PreparedStage, mutation: MetadataMutation, cancel: CancellationToken,
     ) -> std::result::Result<(), StorageRoleFailure> {
-        assert_eq!(std::fs::read(&self.final_path).unwrap(), b"old");
+        assert_eq!(
+            std::fs::read(&self.final_path).unwrap(),
+            if stage.direct() { b"new" } else { b"old" }
+        );
         self.called.store(true, Ordering::SeqCst);
         if self.fail {
             return Err(role_failure("injected metadata failure"));
@@ -113,6 +136,7 @@ impl StagedDestination for MetadataProbe {
         self.inner.publish(stage, request).await
     }
     async fn discard(&self, stage: PreparedStage) -> std::result::Result<(), StorageRoleFailure> {
+        self.discarded.store(true, Ordering::SeqCst);
         self.inner.discard(stage).await?;
         if self.cleanup_failure.load(Ordering::SeqCst) {
             return Err(role_failure("injected cleanup failure"));
@@ -141,6 +165,8 @@ async fn destination(fail: bool) -> (TempDir, StorageContext, Arc<MetadataProbe>
         called: AtomicBool::new(false),
         cleanup_failure: AtomicBool::new(false),
         resumable: AtomicBool::new(true),
+        direct: AtomicBool::new(false),
+        discarded: AtomicBool::new(false),
         tags: Mutex::default(),
     });
     let roles = StorageBuilder::new(local.identity().clone(), local.capabilities().clone())
@@ -162,7 +188,9 @@ async fn destination(fail: bool) -> (TempDir, StorageContext, Arc<MetadataProbe>
 }
 
 async fn stream(destination: &StorageContext, entry: &ObservedEntry) -> Result<()> {
-    let handle = commit_stream::prepare_stream(destination, entry).await?;
+    let handle =
+        commit_stream::prepare_stream_with_mode(destination, entry, TransferMode::Checkpoint, CancellationToken::new())
+            .await?;
     let (tx, rx) = mpsc::channel(2);
     tx.send(PositionedChunk {
         offset: 0,
@@ -194,11 +222,47 @@ async fn stream_metadata_failure_keeps_old_destination() {
         }
         error => panic!("expected typed transfer failure: {error:?}"),
     }
-    let paths: Vec<_> = std::fs::read_dir(root.path())
-        .unwrap()
-        .map(|entry| entry.unwrap().file_name())
-        .collect();
-    assert_eq!(paths, vec![std::ffi::OsString::from("file")]);
+    assert_eq!(
+        std::fs::read(root.path().join(artifact_name("file", ArtifactKind::Stage))).unwrap(),
+        b"new"
+    );
+    assert!(!probe.discarded.load(Ordering::SeqCst));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn direct_metadata_failure_retains_the_new_data_and_original_source() {
+    let source_root = tempfile::tempdir().unwrap();
+    std::fs::write(source_root.path().join("file"), b"new").unwrap();
+    let source = create_storage(&source_root.path().to_string_lossy(), CreateStorageOptions::default())
+        .await
+        .unwrap();
+    let entry = observe_path(source.storage(), Path::new("file")).await.unwrap();
+    let (root, destination, probe) = destination(true).await;
+    probe.direct.store(true, Ordering::SeqCst);
+    let handle = commit_stream::prepare_stream(&destination, &entry).await.unwrap();
+    let (tx, rx) = mpsc::channel(1);
+    tx.send(PositionedChunk {
+        offset: 0,
+        data: Bytes::from_static(b"new"),
+    })
+    .await
+    .unwrap();
+    drop(tx);
+    commit_stream::write_chunk_stream(rx, &handle, Arc::new(|_, _| {}))
+        .await
+        .unwrap();
+    assert_eq!(std::fs::read(root.path().join("file")).unwrap(), b"old");
+    let error = commit_stream::commit_chunk_stream(handle).await.unwrap_err();
+    let StorageError::DirectPatch(DirectPatchError::Metadata(failure)) = error else {
+        panic!("expected the typed Direct metadata failure");
+    };
+    assert!(failure.storage_error().is_some());
+    assert!(probe.called.load(Ordering::SeqCst));
+    assert!(!probe.discarded.load(Ordering::SeqCst));
+    assert_eq!(std::fs::read(root.path().join("file")).unwrap(), b"new");
+    assert_eq!(std::fs::read(source_root.path().join("file")).unwrap(), b"new");
+    assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 1);
 }
 
 #[tokio::test]
@@ -282,7 +346,7 @@ async fn qos_cache_shares_one_budget_for_the_same_config_under_concurrent_access
 }
 
 #[tokio::test]
-async fn stream_keeps_primary_metadata_error_when_cleanup_also_fails() {
+async fn checkpoint_metadata_failure_keeps_data_without_attempting_discard() {
     let (root, destination, probe) = destination(true).await;
     probe.cleanup_failure.store(true, Ordering::SeqCst);
     let entry = observe_path(destination.storage(), Path::new("file")).await.unwrap();
@@ -293,11 +357,16 @@ async fn stream_keeps_primary_metadata_error_when_cleanup_also_fails() {
             let metadata = failure.metadata_failure().unwrap();
             assert!(metadata.storage_error().is_some());
             assert!(!metadata.failures().is_empty());
-            assert!(failure.cleanup_failure().is_some());
+            assert!(failure.cleanup_failure().is_none());
         }
         error => panic!("expected primary error and cleanup evidence: {error:?}"),
     }
     assert_eq!(std::fs::read(root.path().join("file")).unwrap(), b"old");
+    assert_eq!(
+        std::fs::read(root.path().join(artifact_name("file", ArtifactKind::Stage))).unwrap(),
+        b"new"
+    );
+    assert!(!probe.discarded.load(Ordering::SeqCst));
 }
 
 #[tokio::test]
@@ -321,7 +390,8 @@ async fn unsupported_modes_fail_before_destination_mutation() {
         assert_eq!(std::fs::read(root.path().join("file")).unwrap(), b"old");
         assert!(!probe.called.load(Ordering::SeqCst));
     }
-    assert!(copy_transfer::validate_transfer_mode(&destination, TransferMode::Atomic).is_ok());
+    probe.resumable.store(true, Ordering::SeqCst);
+    assert!(copy_transfer::validate_transfer_mode(&destination, TransferMode::Checkpoint).is_ok());
 }
 
 /// 上游 Local 的生产恢复门槛为 256 MiB；使用共享 chunk 控制内存，验证真实前缀复用。
@@ -454,7 +524,7 @@ async fn a_selected_history_version_drives_stream_size_metadata_and_tags() {
     let handle = commit_stream::prepare_observed_stream(
         &destination,
         selected.view(),
-        TransferMode::Atomic,
+        TransferMode::Checkpoint,
         CancellationToken::new(),
     )
     .await
@@ -729,7 +799,14 @@ async fn published_directory_keeps_setgid_without_fabricating_numeric_owner() {
 async fn stream_cancel_before_publication_keeps_the_original_reason_and_target() {
     let (root, destination, probe) = destination(false).await;
     let entry = observe_path(destination.storage(), Path::new("file")).await.unwrap();
-    let handle = commit_stream::prepare_stream(&destination, &entry).await.unwrap();
+    let handle = commit_stream::prepare_stream_with_mode(
+        &destination,
+        &entry,
+        TransferMode::Checkpoint,
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
     let (tx, rx) = mpsc::channel(2);
     tx.send(PositionedChunk {
         offset: 0,
@@ -754,14 +831,22 @@ async fn stream_cancel_before_publication_keeps_the_original_reason_and_target()
     }
     assert!(!probe.called.load(Ordering::SeqCst));
     assert_eq!(std::fs::read(root.path().join("file")).unwrap(), b"old");
-    assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 1);
+    assert!(root.path().join(artifact_name("file", ArtifactKind::Stage)).is_file());
+    assert!(!probe.discarded.load(Ordering::SeqCst));
 }
 
 #[tokio::test]
-async fn cancelling_a_pending_stream_preserves_the_native_reason_and_cleans_the_stage() {
+async fn cancelling_a_pending_checkpoint_stream_preserves_the_reason_and_unpublished_state() {
     let (root, destination, probe) = destination(false).await;
     let entry = observe_path(destination.storage(), Path::new("file")).await.unwrap();
-    let handle = commit_stream::prepare_stream(&destination, &entry).await.unwrap();
+    let handle = commit_stream::prepare_stream_with_mode(
+        &destination,
+        &entry,
+        TransferMode::Checkpoint,
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
     let polled = Arc::new(Notify::new());
     let reader = Arc::clone(&polled);
     let input: Input = Box::pin(stream::poll_fn(move |_| {
@@ -794,5 +879,6 @@ async fn cancelling_a_pending_stream_preserves_the_native_reason_and_cleans_the_
     assert!(!handle.input_ended().await);
     assert!(!probe.called.load(Ordering::SeqCst));
     assert_eq!(std::fs::read(root.path().join("file")).unwrap(), b"old");
-    assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 1);
+    assert!(root.path().join(artifact_name("file", ArtifactKind::Stage)).is_file());
+    assert!(!probe.discarded.load(Ordering::SeqCst));
 }

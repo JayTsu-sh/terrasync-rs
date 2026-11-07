@@ -176,7 +176,7 @@ pub async fn sync_cmd(
     enable_acl: bool, r#match: &Option<String>, exclude: &Option<String>, qos: &Option<String>, peak_qos_rate: f32,
     iops: Option<u32>, block_size: &Option<String>, delta_size_threshold: &Option<String>, file_list: &Option<String>,
     packaged: bool, package_depth: Option<usize>, remote: &Option<String>, tls_server_cert: &Option<String>,
-    token: &Option<String>, raw_command_line: String, resume: bool, in_place: bool, delete_target: bool,
+    token: &Option<String>, raw_command_line: String, resume: bool, delete_target: bool,
 ) -> Result<()> {
     let config = AppConfig::fetch()?;
 
@@ -238,7 +238,7 @@ pub async fn sync_cmd(
         package_depth: package_depth.unwrap_or(0),
         raw_command_line,
         progress_callback_url: None,
-        transfer_mode: TransferMode::from_flags(resume, in_place),
+        transfer_mode: TransferMode::from_resume(resume),
         delete_target,
         concurrency: None,
     };

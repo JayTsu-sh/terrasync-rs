@@ -3,7 +3,7 @@ use clickhouse::Client;
 use db::{ClickHouseConfig, ClickHouseDatabase, DatabaseError};
 use std::time::{Duration, Instant};
 use std::{path::Path, sync::Arc};
-use task_model::{SourceCleanupPolicy, TaskModelError};
+use task_model::{SourceCleanupPolicy, TaskModelError, TransferMode};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpStream,
@@ -160,7 +160,10 @@ async fn local_rejections(config: &ClickHouseConfig) -> Result<()> {
         )?);
         let database = ClickHouseDatabase::connect(config, &command.job_id).await?;
         match case {
-            "packaged" => command.packaged = true,
+            "packaged" => {
+                command.packaged = true;
+                command.transfer_mode = TransferMode::Checkpoint;
+            }
             "filter" => command.exclude = Some("invalid_field == 1".into()),
             "file_list" => {
                 command.file_list = Some(directory.path().join("missing-list").to_string_lossy().into_owned());

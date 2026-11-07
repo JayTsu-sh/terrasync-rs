@@ -3,6 +3,7 @@ use crate::scan::observe_path;
 use crate::scan::source::WalkOptions;
 use data_mover::model::StoragePath;
 use data_mover::tar_pack::{self, TarRequest};
+use data_mover::transfer::TransferPolicy;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
@@ -59,6 +60,7 @@ pub async fn pack_directory(
         entries: Arc::clone(&manifest_list),
         final_path: tar_relative_path.clone(),
         cancel: Default::default(),
+        transfer_policy: TransferPolicy::Direct,
         source_qos: qos
             .as_ref()
             .map(|qos| qos.source_group(src_storage.block_size()))

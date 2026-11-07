@@ -906,7 +906,7 @@ mod tests {
             };
             sender.send(message).await?;
             let config = SessionConfig {
-                transfer_mode: TransferMode::Atomic,
+                transfer_mode: TransferMode::Direct,
                 src_path: "source".into(),
                 qos: None,
                 peak_qos_rate: 1.0,

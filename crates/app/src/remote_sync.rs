@@ -429,7 +429,7 @@ mod tests {
         send_and_check_auth(&sender_transport, None).await.unwrap();
         sender_transport
             .send(SenderMsg::SessionConfig(SessionConfig {
-                transfer_mode: TransferMode::Atomic,
+                transfer_mode: TransferMode::Direct,
                 src_path: src_dir.path().to_string_lossy().to_string(),
                 qos: None,
                 peak_qos_rate: 1.0,
@@ -749,7 +749,7 @@ mod tests {
         send_and_check_auth(sender_transport, None).await.unwrap();
         sender_transport
             .send(SenderMsg::SessionConfig(SessionConfig {
-                transfer_mode: TransferMode::Atomic,
+                transfer_mode: TransferMode::Direct,
                 src_path: src_dir.to_string_lossy().to_string(),
                 qos: None,
                 peak_qos_rate: 1.0,
@@ -814,7 +814,7 @@ mod tests {
         send_and_check_auth(sender_transport, None).await.unwrap();
         sender_transport
             .send(SenderMsg::SessionConfig(SessionConfig {
-                transfer_mode: TransferMode::Atomic,
+                transfer_mode: TransferMode::Direct,
                 src_path: src_dir.to_string_lossy().to_string(),
                 qos: None,
                 peak_qos_rate: 1.0,
@@ -1661,7 +1661,7 @@ mod tests {
         send_and_check_auth(&sender_transport, None).await.unwrap();
         sender_transport
             .send(SenderMsg::SessionConfig(SessionConfig {
-                transfer_mode: TransferMode::Atomic,
+                transfer_mode: TransferMode::Direct,
                 src_path: String::new(),
                 qos: None,
                 peak_qos_rate: 1.0,

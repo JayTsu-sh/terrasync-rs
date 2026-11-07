@@ -78,7 +78,7 @@ fn dir_entry(name: &str) -> Arc<ObservedEntry> {
 // 构造 SessionConfig，仅关心 enable_integrity_check，其余取默认。
 fn session_cfg(integrity: bool) -> SessionConfig {
     SessionConfig {
-        transfer_mode: TransferMode::Atomic,
+        transfer_mode: TransferMode::Direct,
         src_path: String::new(),
         qos: None,
         peak_qos_rate: 1.0,
@@ -826,10 +826,10 @@ async fn dc_failed_begin_then_commit_reports_one_outcome() {
 // ============================================================
 
 // Match token（basis block）+ Data token（字面量）交错重建：basis.bin 预先落盘为旧内容，
-// DeltaCommit 后应原子替换为新内容，且 .part 被清理。
+// DeltaCommit 后内容完整；Checkpoint 发布新文件，Direct 仅修改所需区间。
 #[tokio::test]
 async fn dc_delta_reconstructs_from_basis_and_literal_tokens() {
-    for mode in [TransferMode::Atomic, TransferMode::Checkpoint, TransferMode::Direct] {
+    for mode in [TransferMode::Checkpoint, TransferMode::Direct] {
         let tmp = tempfile::tempdir().unwrap();
         let dest = local_storage(tmp.path()).await;
         let basis_content = b"AAAAABBBBBCCCCCDDDDD"; // 4 个 5 字节 block

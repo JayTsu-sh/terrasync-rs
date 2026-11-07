@@ -806,7 +806,7 @@ mod tests {
 
     fn session_config() -> SessionConfig {
         SessionConfig {
-            transfer_mode: TransferMode::Atomic,
+            transfer_mode: TransferMode::Direct,
             src_path: String::new(),
             qos: None,
             peak_qos_rate: 1.0,

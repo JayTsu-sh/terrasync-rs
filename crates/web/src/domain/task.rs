@@ -93,6 +93,9 @@ impl TaskStatus {
 pub struct TaskConfig {
     #[serde(default)]
     pub scan_resume: bool,
+    /// 文件续传不恢复全量扫描位置。
+    #[serde(default)]
+    pub copy_resume: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub match_expr: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -125,6 +128,7 @@ impl Default for TaskConfig {
     fn default() -> Self {
         Self {
             scan_resume: false,
+            copy_resume: false,
             match_expr: None,
             exclude_expr: None,
             depth: 0,
@@ -176,11 +180,26 @@ pub struct TaskFilter {
 #[cfg(test)]
 mod config_tests {
     use super::*;
+    use task_model::TransferMode;
     #[test]
     fn concurrency_survives_config_roundtrip() -> Result<(), serde_json::Error> {
         let config: TaskConfig = serde_json::from_value(serde_json::json!({"concurrency":32,"depth":3}))?;
         let saved = serde_json::to_value(&config)?;
         assert_eq!(saved.get("concurrency"), Some(&serde_json::json!(32)));
+        Ok(())
+    }
+
+    #[test]
+    fn persisted_file_resume_is_independent_from_scan_resume() -> Result<(), serde_json::Error> {
+        for (json, expected) in [
+            (r#"{"scan_resume":true}"#, TransferMode::Direct),
+            (r#"{"copy_resume":true,"scan_resume":false}"#, TransferMode::Checkpoint),
+        ] {
+            let config: TaskConfig = serde_json::from_str(json)?;
+            let restored: TaskConfig = serde_json::from_str(&serde_json::to_string(&config)?)?;
+            assert_eq!(TransferMode::from_resume(restored.copy_resume), expected);
+            assert_eq!(restored.scan_resume, config.scan_resume);
+        }
         Ok(())
     }
 }

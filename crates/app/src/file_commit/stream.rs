@@ -103,7 +103,7 @@ impl StreamHandle {
 }
 #[cfg(test)]
 pub async fn prepare_stream(dest: &StorageContext, entry: &ObservedEntry) -> Result<StreamHandle> {
-    prepare_stream_with_mode(dest, entry, TransferMode::Atomic, CancellationToken::new()).await
+    prepare_stream_with_mode(dest, entry, TransferMode::Direct, CancellationToken::new()).await
 }
 
 #[cfg(test)]

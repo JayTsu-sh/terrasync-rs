@@ -23,7 +23,7 @@ fn config() -> ReceiverConfig {
         enable_integrity_check: true,
         enable_acl: false,
         is_source_reserved: true,
-        transfer_mode: TransferMode::Atomic,
+        transfer_mode: TransferMode::Direct,
     }
 }
 
