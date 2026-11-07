@@ -7,6 +7,7 @@ use crate::callback::CallbackEndpoint;
 use crate::config::JobType;
 use crate::consumer::stats::callback_state::CallbackState;
 use crate::consumer::stats::{FullStats, ProgressBar, ProgressDetail, StatisticConsumer, StatsKind};
+use crate::error::AppError;
 use crate::file_copy::CopyOptions;
 use crate::file_copy::transfer as copy_transfer;
 use crate::file_copy::{VersionCopyScope, copy_versions};
@@ -19,12 +20,110 @@ use data_mover::model::{
     BackendKind, FailureClass, MetadataObservation, MetadataObservations, ObservationMode, ObservationPlan,
 };
 use task_model::observation::ObservedItem;
-use task_model::{StorageEntryMessage, TransferMode};
+use task_model::{ErrorEvent, StorageEntryMessage, TransferMode};
 use tempfile::TempDir;
 use tokio::sync::Mutex;
+use tokio::time::Instant;
 use transport::in_process::create_in_process_pair;
 
 type TestResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
+
+#[tokio::test]
+#[ignore = "requires isolated real versioned S3 source and target"]
+async fn required_consumer_failure_stops_history_worker_before_next_version_or_entry() -> TestResult {
+    let source = Arc::new(
+        create_storage(
+            &std::env::var("LAB_MIGRATION_SOURCE_URL")?,
+            CreateStorageOptions::default(),
+        )
+        .await?,
+    );
+    let destination = Arc::new(
+        create_storage(
+            &format!("{}/consumer-closed", std::env::var("LAB_MIGRATION_HISTORY_URL")?),
+            CreateStorageOptions::default(),
+        )
+        .await?,
+    );
+    let scan = source.walkdir(None, WalkOptions::default()).await?;
+    let mut found = None;
+    while let Some(message) = scan.next().await {
+        if let StorageEntryMessage::Scanned(entry) = message
+            && entry.path().as_str() == "payload"
+        {
+            found = Some(entry);
+        }
+    }
+    if let Some(error) = scan.take_error() {
+        return Err(error.into());
+    }
+    let entries = found
+        .ok_or("source payload missing")?
+        .as_ref()
+        .clone()
+        .into_segments(10);
+    assert_eq!(entries.len(), 2);
+    let (tx, rx) = async_channel::bounded(2);
+    for entry in entries {
+        tx.send(StorageEntryMessage::Scanned(Arc::new(entry))).await?;
+    }
+    drop(tx);
+    let mut broadcaster = BroadcastForwarder::new(1);
+    let mut blocked = broadcaster.subscribe();
+    broadcaster
+        .broadcast(StorageEntryMessage::Diagnostic {
+            event: ErrorEvent::Copy,
+            path: "sentinel".into(),
+            reason: "queue is full".into(),
+        })
+        .await?;
+    drop(broadcaster.subscribe());
+    let (transport, _receiver_transport) = create_in_process_pair();
+    let active = Arc::new(AtomicUsize::new(0));
+    let visited = Arc::new(AtomicUsize::new(0));
+    let started = Instant::now();
+    let result = sender_worker(
+        0,
+        AsyncReceiver::new(rx),
+        source,
+        destination,
+        Arc::new(transport),
+        &broadcaster,
+        &SenderWorkerConfig {
+            enable_integrity_check: false,
+            enable_acl: false,
+            is_source_reserved: true,
+            large_file_log_threshold: u64::MAX,
+        },
+        None,
+        None,
+        &ReceiverConfig {
+            job_id: "consumer-closed".into(),
+            enable_integrity_check: false,
+            enable_acl: false,
+            is_source_reserved: true,
+            job_dir: String::new(),
+            transfer_mode: TransferMode::Direct,
+        },
+        active.clone(),
+        visited.clone(),
+        Arc::new(AtomicU64::new(0)),
+    )
+    .await;
+    assert!(matches!(result, Err(AppError::ConsumerDisconnected { .. })));
+    assert_eq!(active.load(Ordering::Relaxed), 0);
+    assert_eq!(visited.load(Ordering::Relaxed), 1);
+    assert!(matches!(
+        blocked.recv().await,
+        Some(StorageEntryMessage::Diagnostic { .. })
+    ));
+    assert!(blocked.try_recv().is_err());
+    println!(
+        "required_consumer_closed=typed_error full_peer_queue=cancelled visited_entries=1 elapsed_ms={}",
+        started.elapsed().as_millis()
+    );
+    Ok(())
+}
 
 #[tokio::test]
 #[ignore = "requires isolated real S3 source with denied version-data reads"]

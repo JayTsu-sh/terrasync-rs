@@ -280,7 +280,7 @@ pub(crate) async fn process_versioned_entry(
         resume,
     )
     .await?;
-    broadcaster.broadcast(change.message(item.clone())).await;
+    broadcaster.broadcast(change.message(item.clone())).await?;
     Ok(())
 }
 
@@ -380,7 +380,7 @@ async fn process_entry_inner(
                         entry: Some(Arc::clone(entry)),
                         reason: format!("{e}"),
                     })
-                    .await;
+                    .await?;
                 return Err(e.into());
             }
         }

@@ -518,7 +518,7 @@ impl SyncOrchestrator {
                                     .await
                                 {
                                     Ok(()) => {
-                                        bc.broadcast(StorageEntryMessage::New(entry.into())).await;
+                                        bc.broadcast(StorageEntryMessage::New(entry.into())).await?;
                                     }
                                     Err(e) => {
                                         error!(
@@ -549,7 +549,7 @@ impl SyncOrchestrator {
                                             reason: e.to_string(),
                                             first_in_entry: true,
                                         })
-                                        .await;
+                                        .await?;
                                         failure.get_or_insert(AppError::ReportedCopyFailure {
                                             source: Box::new(e),
                                             data_failed,
@@ -562,12 +562,12 @@ impl SyncOrchestrator {
                                 manifest_entries,
                             } => {
                                 let tar_path = tar_entry.get_relative_path().to_string_lossy().to_string();
-                                bc.broadcast(StorageEntryMessage::New(tar_entry.into())).await;
+                                bc.broadcast(StorageEntryMessage::New(tar_entry.into())).await?;
                                 bc.broadcast(StorageEntryMessage::TarManifest {
                                     tar_path,
                                     entries: manifest_entries,
                                 })
-                                .await;
+                                .await?;
                             }
                             _ => {}
                         }
@@ -966,7 +966,7 @@ impl SyncOrchestrator {
                                     )
                                     .await
                                     {
-                                        Ok(()) => bc.broadcast(message.clone()).await,
+                                        Ok(()) => bc.broadcast(message.clone()).await?,
                                         Err(e) => {
                                             error!(
                                                 "Handler {}: Failed to process new entry {:?}: {}",
@@ -980,7 +980,7 @@ impl SyncOrchestrator {
                                                 entry: Some(Arc::clone(&entry.entry)),
                                                 reason: format!("{e}"),
                                             })
-                                            .await;
+                                            .await?;
                                             failure.get_or_insert(e.into());
                                         }
                                     }
@@ -1034,7 +1034,7 @@ impl SyncOrchestrator {
                                 };
                                 match result {
                                     Ok(()) if entry.entry.history().is_some() => {}
-                                    Ok(()) => bc.broadcast(message.clone()).await,
+                                    Ok(()) => bc.broadcast(message.clone()).await?,
                                     Err(e) => {
                                         error!(
                                             "Handler {}: Failed to process changed entry {:?} (kind={}): {}",
@@ -1049,7 +1049,7 @@ impl SyncOrchestrator {
                                             entry: Some(Arc::clone(&entry.entry)),
                                             reason: format!("{e}"),
                                         })
-                                        .await;
+                                        .await?;
                                         failure.get_or_insert(e.into());
                                     }
                                 }
@@ -1064,10 +1064,10 @@ impl SyncOrchestrator {
                                     copy_namespace::delete_file(dest.storage(), entry).await
                                 };
                                 match result {
-                                    Ok(()) => bc.broadcast(message.clone()).await,
+                                    Ok(()) => bc.broadcast(message.clone()).await?,
                                     Err(error) if error.is_not_found() => {
                                         trace!("Already deleted, skipping: {:?}", entry.get_relative_path());
-                                        bc.broadcast(message.clone()).await;
+                                        bc.broadcast(message.clone()).await?;
                                     }
                                     Err(e) => {
                                         error!(
@@ -1082,7 +1082,7 @@ impl SyncOrchestrator {
                                             entry: Some(entry.clone()),
                                             reason: format!("{e}"),
                                         })
-                                        .await;
+                                        .await?;
                                         failure.get_or_insert(e.into());
                                     }
                                 }
@@ -1090,7 +1090,7 @@ impl SyncOrchestrator {
                             StorageEntryMessage::Renamed((ref from_entry, ref to_entry)) => {
                                 if from_entry.get_name() == to_entry.get_name() {
                                     // 同名 rename（父目录移动）：直接广播
-                                    bc.broadcast(message.clone()).await;
+                                    bc.broadcast(message.clone()).await?;
                                 } else {
                                     match process_rename_entry(
                                         from_entry.clone(),
@@ -1101,7 +1101,7 @@ impl SyncOrchestrator {
                                     )
                                     .await
                                     {
-                                        Ok(()) => bc.broadcast(message.clone()).await,
+                                        Ok(()) => bc.broadcast(message.clone()).await?,
                                         Err(e) => {
                                             error!(
                                                 "Handler {}: Failed to rename {:?} to {:?}: {}",
@@ -1116,7 +1116,7 @@ impl SyncOrchestrator {
                                                 entry: Some(to_entry.clone()),
                                                 reason: format!("{e}"),
                                             })
-                                            .await;
+                                            .await?;
                                             failure.get_or_insert(e.into());
                                         }
                                     }
@@ -1137,12 +1137,13 @@ impl SyncOrchestrator {
                                 {
                                     Ok((tar_entry, manifest)) => {
                                         let tar_path = tar_entry.get_relative_path().to_string_lossy().to_string();
-                                        bc.broadcast(StorageEntryMessage::New(Arc::new(tar_entry).into())).await;
+                                        bc.broadcast(StorageEntryMessage::New(Arc::new(tar_entry).into()))
+                                            .await?;
                                         bc.broadcast(StorageEntryMessage::TarManifest {
                                             tar_path,
                                             entries: manifest,
                                         })
-                                        .await;
+                                        .await?;
                                     }
                                     Err(e) => {
                                         error!(
@@ -1157,7 +1158,7 @@ impl SyncOrchestrator {
                                             entry: Some(entry.clone()),
                                             reason: format!("{e}"),
                                         })
-                                        .await;
+                                        .await?;
                                         failure.get_or_insert(e.into());
                                     }
                                 }
@@ -1212,7 +1213,9 @@ impl SyncOrchestrator {
                                     worker_id, entry
                                 );
 
-                                broadcaster.broadcast(StorageEntryMessage::Scanned(entry.clone())).await;
+                                broadcaster
+                                    .broadcast(StorageEntryMessage::Scanned(entry.clone()))
+                                    .await?;
 
                                 current_batch.push(entry.clone());
 
@@ -1239,7 +1242,7 @@ impl SyncOrchestrator {
                                     path.display(),
                                     reason
                                 );
-                                broadcaster.broadcast(msg.clone()).await;
+                                broadcaster.broadcast(msg.clone()).await?;
                             }
                             _ => {}
                         }
@@ -1544,10 +1547,10 @@ impl SyncOrchestrator {
                     };
                     match result {
                         Ok(()) => {
-                            broadcaster.broadcast(StorageEntryMessage::Deleted(entry_arc)).await;
+                            broadcaster.broadcast(StorageEntryMessage::Deleted(entry_arc)).await?;
                         }
                         Err(error) if error.is_not_found() => {
-                            broadcaster.broadcast(StorageEntryMessage::Deleted(entry_arc)).await;
+                            broadcaster.broadcast(StorageEntryMessage::Deleted(entry_arc)).await?;
                         }
                         Err(e) => {
                             error!("Phase B: Failed to delete {:?}: {}", entry_arc.get_relative_path(), e);
@@ -1558,7 +1561,7 @@ impl SyncOrchestrator {
                                     entry: Some(entry_arc.clone()),
                                     reason: format!("{e}"),
                                 })
-                                .await;
+                                .await?;
                             failure.get_or_insert(e.into());
                         }
                     }
@@ -1621,7 +1624,7 @@ impl SyncOrchestrator {
                                             entry: Some(to_arc.clone()),
                                             reason: error.to_string(),
                                         })
-                                        .await;
+                                        .await?;
                                     failure.get_or_insert(error);
                                     continue;
                                 }
@@ -1630,7 +1633,7 @@ impl SyncOrchestrator {
                                         entry: to_arc.clone().into(),
                                         kind,
                                     })
-                                    .await;
+                                    .await?;
                             }
 
                             if !is_source_reserved {
@@ -1644,14 +1647,14 @@ impl SyncOrchestrator {
                                             entry: Some(to_arc.clone()),
                                             reason: error.to_string(),
                                         })
-                                        .await;
+                                        .await?;
                                     failure.get_or_insert(error.into());
                                     continue;
                                 }
                             }
                             broadcaster
                                 .broadcast(StorageEntryMessage::Renamed((from_arc, to_arc)))
-                                .await;
+                                .await?;
                         }
                         Err(e) => {
                             error!(
@@ -1667,7 +1670,7 @@ impl SyncOrchestrator {
                                     entry: Some(to_arc.clone()),
                                     reason: format!("{e}"),
                                 })
-                                .await;
+                                .await?;
                             failure.get_or_insert(e.into());
                         }
                     }

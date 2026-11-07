@@ -56,6 +56,14 @@ also check that later versions and history segments stop publishing, with failur
 the delivered entry boundaries. Its container and volumes are removed on exit. This check does
 not cover ClickHouse acknowledgement, callback outages, or the shared network recovery window.
 
+The same runner also disconnects a required event consumer while another consumer's queue is
+full. Against real versioned S3 it checks that the sender returns a typed failure after the
+first published version, starts no later history version or delivered entry, releases its
+active-entry counter, and retains all 20 source versions. Required-consumer failures latch
+across broadcaster clones; blocked sends to other queues are cancelled. This is a prerequisite
+for stopping safely when diagnostic persistence fails, not validation of diagnostic spill or
+replay itself.
+
 `python3 tests/lab/run-notification-archive-local.py` validates the database notification archive
 in isolated ClickHouse single-server and one-shard/two-replica deployments, with an embedded Keeper.
 It requires `docker`, `nsenter`, cached Rust dependencies, and

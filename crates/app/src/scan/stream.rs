@@ -154,7 +154,7 @@ async fn consume(
     iterator: &WalkDirAsyncIterator, forwarder: &BroadcastForwarder<StorageEntryMessage>, cancel: &ScanCancellation,
 ) -> Result<()> {
     while let Some(message) = cancel.interrupt(iterator.next()).await? {
-        cancel.interrupt(forwarder.broadcast(message)).await?;
+        cancel.interrupt(forwarder.broadcast(message)).await??;
     }
     Ok(())
 }

@@ -1,12 +1,13 @@
 // 示例代码：演示 BroadcastForwarder 用法，sample 性质豁免 unwrap deny
 #![allow(clippy::unwrap_used)]
 
+use std::error::Error;
 use std::time::SystemTime;
 
 use app::broadcast::BroadcastForwarder;
 
 #[tokio::main]
-async fn main() {
+async fn main() -> Result<(), Box<dyn Error>> {
     let mut forwarder = BroadcastForwarder::new(1000);
 
     // 添加两个消费者
@@ -52,10 +53,11 @@ async fn main() {
             .unwrap()
             .as_millis();
         println!("[{:?}] 发送消息 {}", timestamp, i);
-        forwarder.broadcast(i).await;
+        forwarder.broadcast(i).await?;
     }
 
     // 等待所有消费者任务完成
+    drop(forwarder);
     consumer1.await.unwrap();
     consumer2.await.unwrap();
 
@@ -64,4 +66,5 @@ async fn main() {
         .unwrap()
         .as_millis();
     println!("[{:?}] 所有消息处理完毕，程序退出", timestamp);
+    Ok(())
 }

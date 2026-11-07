@@ -77,6 +77,16 @@ def run_inside():
         "storage_tests::s3_versions::full_copy_counts_versioned_source_by_delivered_entry",
         "--", "--ignored", "--exact", "--nocapture",
     ], cwd=ROOT, env=environment, check=True)
+    subprocess.run([
+        "cargo", "test", "--offline", "--locked", "-p", "app", "--lib",
+        "storage_tests::s3_versions::required_consumer_failure_stops_history_worker_before_next_version_or_entry",
+        "--", "--ignored", "--exact", "--nocapture",
+    ], cwd=ROOT, env=environment, check=True)
+    published = client.list_object_versions(Bucket=buckets["history"], Prefix="consumer-closed/payload")
+    assert len(published.get("Versions", [])) == 1 and not published.get("DeleteMarkers"), published
+    retained = client.list_object_versions(Bucket=buckets["source"], Prefix="payload")
+    assert len(retained.get("Versions", [])) == 20 and not retained.get("DeleteMarkers"), retained
+    print("independent S3 inspection closed_consumer target_versions=1 source_versions=20 next_version_or_entry=not_started", flush=True)
     tag_refusals = 0
     data_refusals = 0
     fault = "tags"

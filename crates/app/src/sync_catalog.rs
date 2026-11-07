@@ -42,7 +42,7 @@ pub(crate) async fn batch_processing_to_generate_message(
     };
     let changes = database.compare_catalogue_batch(batch, mode).await?;
     for change in changes {
-        broadcaster.broadcast(change.kind.message(change.item)).await;
+        broadcaster.broadcast(change.kind.message(change.item)).await?;
     }
     Ok(())
 }

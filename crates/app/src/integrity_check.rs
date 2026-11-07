@@ -40,7 +40,7 @@ use crate::storage_factory::StorageContext;
 use data_mover::model::ObservedEntry;
 use data_mover::redact_storage_url;
 use task_model::StorageEntryMessage;
-use tracing::{Instrument, debug, error, info, info_span, instrument, warn};
+use tracing::{Instrument, debug, error, info, info_span, instrument};
 
 use crate::broadcast::{BroadcastForwarder, DEFAULT_CHANNEL_CAPACITY};
 use crate::config::{JobType, ScanConfig, initialize_consumer_config};
@@ -49,6 +49,7 @@ use crate::dir_walker;
 use crate::error::{AppError, Result};
 use crate::scan::ScanType;
 use crate::storage_factory::{StorageRole, create_storage_for_role};
+use crate::sync_catalog::finish_phase;
 
 // ─────────────────────────────────────────────────
 // Integrity Check 数据模型
@@ -291,7 +292,9 @@ impl CheckContext {
     }
 
     /// 处理一条 walkdir 消息：根据 entry 类型分派到对应 helper，并增加计数 + 广播。
-    async fn dispatch(&self, entry: Arc<ObservedEntry>, broadcaster: &BroadcastForwarder<StorageEntryMessage>) {
+    async fn dispatch(
+        &self, entry: Arc<ObservedEntry>, broadcaster: &BroadcastForwarder<StorageEntryMessage>,
+    ) -> Result<()> {
         let relative_path = entry.get_relative_path().to_path_buf();
         let error_reason = if entry.get_is_symlink() {
             let result = self.process_entry(entry.as_ref(), &relative_path, "symlink").await;
@@ -318,12 +321,13 @@ impl CheckContext {
                     entry: Some(entry),
                     reason,
                 })
-                .await;
+                .await?;
         } else {
             broadcaster
                 .broadcast(StorageEntryMessage::IntegrityChecked(entry))
-                .await;
+                .await?;
         }
+        Ok(())
     }
 }
 
@@ -465,7 +469,7 @@ pub async fn integrity_check_with_concurrency(
                     Ok(s) => Arc::new(s),
                     Err(e) => {
                         error!("Worker {}: Failed to create src storage: {}", worker_id, e);
-                        return;
+                        return Err(e);
                     }
                 };
                 let dest_storage =
@@ -473,7 +477,7 @@ pub async fn integrity_check_with_concurrency(
                         Ok(s) => Arc::new(s),
                         Err(e) => {
                             error!("Worker {}: Failed to create dest storage: {}", worker_id, e);
-                            return;
+                            return Err(e);
                         }
                     };
                 let ctx = CheckContext {
@@ -489,7 +493,7 @@ pub async fn integrity_check_with_concurrency(
 
                 while let Some(msg) = walkdir_iter.next().await {
                     match msg {
-                        StorageEntryMessage::Scanned(entry) => ctx.dispatch(entry, &broadcaster).await,
+                        StorageEntryMessage::Scanned(entry) => ctx.dispatch(entry, &broadcaster).await?,
                         StorageEntryMessage::Error {
                             path, entry, reason, ..
                         } => {
@@ -506,11 +510,12 @@ pub async fn integrity_check_with_concurrency(
                                     entry,
                                     reason,
                                 })
-                                .await;
+                                .await?;
                         }
                         _ => {}
                     }
                 }
+                Ok(())
             }
             .instrument(span),
         );
@@ -518,10 +523,9 @@ pub async fn integrity_check_with_concurrency(
         worker_handles.push(handle);
     }
 
-    for handle in worker_handles {
-        if let Err(e) = handle.await {
-            error!("Integrity check worker panicked: {}", e);
-        }
+    let workers_result = finish_phase(worker_handles).await;
+    if workers_result.is_err() {
+        walkdir_iter.close();
     }
 
     let issues = Arc::try_unwrap(issues)
@@ -534,28 +538,12 @@ pub async fn integrity_check_with_concurrency(
 
     drop(broadcaster);
 
-    let mut all_successful = true;
-    for handle in consumer_handles {
-        match handle.await {
-            Ok(Ok(())) => debug!("Consumer task completed successfully"),
-            Ok(Err(e)) => {
-                error!("Consumer task failed: {}", e);
-                all_successful = false;
-            }
-            Err(e) => {
-                error!("Consumer task panicked: {}", e);
-                all_successful = false;
-            }
-        }
+    let result = workers_result.and(finish_phase(consumer_handles).await);
+    if let Err(error) = &result {
+        consumer_manager.record_task_error(error).await;
     }
-
-    if all_successful {
-        info!("All consumer tasks completed successfully");
-    } else {
-        warn!("Some consumer tasks failed or panicked");
-    }
-
     consumer_manager.end_lifecycle().await;
+    result?;
     if let Some(error) = walkdir_iter.take_error() {
         return Err(error.into());
     }

@@ -54,8 +54,11 @@ pub async fn sender_worker(
     let mut blocked_history: Option<(StoragePath, EntryKind, String)> = None;
 
     while let Some(msg) = walkdir_iter.next().await {
+        if broadcaster.is_closed() {
+            break;
+        }
         match msg {
-            StorageEntryMessage::Diagnostic { .. } => broadcaster.broadcast(msg).await,
+            StorageEntryMessage::Diagnostic { .. } => broadcaster.broadcast(msg).await?,
             StorageEntryMessage::Scanned(entry) => {
                 if blocked_history
                     .as_ref()
@@ -78,6 +81,7 @@ pub async fn sender_worker(
 
                 let result = if entry.history().is_some() {
                     if let Some((_, _, reason)) = &blocked_history {
+                        active_entry_counter.fetch_sub(1, Ordering::Relaxed);
                         for (index, item) in ObservedItem::all(&entry).enumerate() {
                             broadcaster
                                 .broadcast(StorageEntryMessage::CopyVersionFailed {
@@ -91,9 +95,8 @@ pub async fn sender_worker(
                                     // 分段交付的每个 entry 独立计数，段内版本共享一次失败。
                                     first_in_entry: index == 0,
                                 })
-                                .await;
+                                .await?;
                         }
-                        active_entry_counter.fetch_sub(1, Ordering::Relaxed);
                         continue;
                     }
                     // 同一路径的分段由固定 worker 顺序复制，不经过第二级竞争队列。
@@ -116,14 +119,16 @@ pub async fn sender_worker(
                 } else {
                     send_entry(worker_id, &transport, &entry).await
                 };
+                active_entry_counter.fetch_sub(1, Ordering::Relaxed);
                 if let Err(error) = result {
+                    if error.stops_event_pipeline() {
+                        return Err(error);
+                    }
                     if error.reported_copy_data_failed() {
                         blocked_history = Some((entry.path().clone(), entry.kind(), error.to_string()));
                     }
                     failure.get_or_insert(error);
                 }
-
-                active_entry_counter.fetch_sub(1, Ordering::Relaxed);
             }
 
             StorageEntryMessage::Packaged(entry) => {
@@ -166,7 +171,7 @@ pub async fn sender_worker(
                 // 全量模式下与增量分支（orchestrator.rs 的 scan worker）对齐：把 walkdir
                 // 扫描错误广播出去，计入 ErrorStats.scan、进 ERROR STATISTICS 报表与
                 // progress error 计数（issue #57，此前只打日志，报表恒不体现）。
-                broadcaster.broadcast(msg.clone()).await;
+                broadcaster.broadcast(msg.clone()).await?;
                 failure.get_or_insert_with(|| AppError::ScanError(reason.clone()));
             }
 

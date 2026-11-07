@@ -150,7 +150,7 @@ pub(crate) async fn copy_versions<I: Iterator<Item = ObservedItem> + Send>(
                     ),
                     first_in_entry: false,
                 })
-                .await;
+                .await?;
             continue;
         }
         if scope == VersionCopyScope::WholeEntry
@@ -193,7 +193,7 @@ pub(crate) async fn copy_versions<I: Iterator<Item = ObservedItem> + Send>(
                     reason: error.to_string(),
                     first_in_entry: first_failure.is_none(),
                 })
-                .await;
+                .await?;
             if context.metadata_only {
                 first_failure.get_or_insert(error);
             } else {
@@ -208,7 +208,7 @@ pub(crate) async fn copy_versions<I: Iterator<Item = ObservedItem> + Send>(
             .checked_add(item.view().payload().get_size())
             .ok_or_else(|| AppError::CopyError("所选版本的复制字节总量超出统计上限".into()))?;
         completed_entry.get_or_insert_with(|| Arc::clone(&item.entry));
-        broadcaster.broadcast(change.message(item)).await;
+        broadcaster.broadcast(change.message(item)).await?;
     }
     if let Some(error) = first_failure {
         return Err(AppError::ReportedCopyFailure {
@@ -221,7 +221,7 @@ pub(crate) async fn copy_versions<I: Iterator<Item = ObservedItem> + Send>(
     {
         broadcaster
             .broadcast(StorageEntryMessage::CopyEntryCompleted { entry, logical_bytes })
-            .await;
+            .await?;
     }
     Ok(())
 }

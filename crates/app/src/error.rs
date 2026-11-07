@@ -16,8 +16,10 @@ use db::error::DatabaseError;
 use licensing::error::LicenseError;
 use serde_json::Error as JsonError;
 pub mod storage;
+use crate::broadcast::BroadcastError;
 use crate::callback::CallbackEndpointError;
 pub use storage::StorageError;
+use task_model::StorageEntryMessage;
 use thiserror::Error;
 use tokio::task::JoinError;
 use transport::error::TransportError;
@@ -48,6 +50,11 @@ impl Display for CopyStep {
 /// 应用程序的专用错误枚举
 #[derive(Error, Debug)]
 pub enum AppError {
+    #[error("{source}")]
+    ConsumerDisconnected {
+        #[source]
+        source: Box<BroadcastError<StorageEntryMessage>>,
+    },
     #[error("Invalid progress callback endpoint: {0}")]
     CallbackEndpoint(#[from] CallbackEndpointError),
     #[error("{source}")]
@@ -311,6 +318,16 @@ impl AppError {
         }
     }
 
+    pub(crate) fn stops_event_pipeline(&self) -> bool {
+        match self {
+            Self::ConsumerDisconnected { .. } => true,
+            Self::CopyEntryFailed { source, .. } | Self::ReportedCopyFailure { source, .. } => {
+                source.stops_event_pipeline()
+            }
+            _ => false,
+        }
+    }
+
     pub fn storage_error(&self) -> Option<&StorageError> {
         match self {
             Self::CopyEntryFailed { source, .. } | Self::ReportedCopyFailure { source, .. } => source.storage_error(),
@@ -324,6 +341,14 @@ impl AppError {
 impl From<StorageRoleFailure> for AppError {
     fn from(source: StorageRoleFailure) -> Self {
         Self::StorageError(source.into())
+    }
+}
+
+impl From<BroadcastError<StorageEntryMessage>> for AppError {
+    fn from(source: BroadcastError<StorageEntryMessage>) -> Self {
+        Self::ConsumerDisconnected {
+            source: Box::new(source),
+        }
     }
 }
 impl From<CapabilityUnavailable> for AppError {
