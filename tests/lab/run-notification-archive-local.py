@@ -74,7 +74,7 @@ def run_isolated():
                 containers.append(container)
             print(f"isolated notification image={docker('inspect', containers[0], '--format', '{{.Image}}')}", flush=True)
             pid = docker("inspect", containers[0], "--format", "{{.State.Pid}}")
-            suite = [flag for flag in ("--copy-generations", "--rename-generations", "--retention-events", "--source-absence") if flag in sys.argv]
+            suite = [flag for flag in ("--copy-generations", "--rename-generations", "--retention-events", "--source-absence", "--request-policy") if flag in sys.argv]
             subprocess.run(["nsenter", "-t", pid, "-n", sys.executable, __file__, "--inside", *suite], cwd=ROOT, check=True)
         except BaseException:
             for container in containers:
@@ -157,6 +157,9 @@ def run_copy_generations():
     environment["LAB_COPY_GENERATION_DSN"] = f"http://{address}"
     environment["LAB_COPY_GENERATION_CONTROL"] = address
     try:
+        if "--request-policy" in sys.argv:
+            run_request_policy(environment)
+            return
         if "--source-absence" in sys.argv:
             subprocess.run([
                 "cargo", "test", "--offline", "--locked", "-p", "app", "--lib",
@@ -191,6 +194,46 @@ def run_copy_generations():
         release.set()
         proxy.shutdown()
         proxy.server_close()
+
+
+def run_request_policy(environment):
+    reports = []
+
+    class Callback(http.server.BaseHTTPRequestHandler):
+        def log_message(self, *_):
+            pass
+
+        def do_POST(self):
+            reports.append(json.loads(self.rfile.read(int(self.headers["Content-Length"]))))
+            self.send_response(204)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+
+    callback = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Callback)
+    callback.daemon_threads = True
+    threading.Thread(target=callback.serve_forever, daemon=True).start()
+    environment["LAB_REQUEST_POLICY_CALLBACK_URL"] = f"http://127.0.0.1:{callback.server_port}/progress"
+    try:
+        subprocess.run([
+            "cargo", "test", "--offline", "--locked", "-p", "app", "--lib",
+            "real_copy_requests_freeze_cleanup_and_report_preflight_rejections",
+            "--", "--ignored", "--nocapture",
+        ], cwd=ROOT, env=environment, check=True)
+        final = [report for report in reports if report["is_final"]]
+        summaries = [report for report in final if not report.get("diagnostics")]
+        assert len(summaries) == 4, reports
+        assert all(report["task_error_count"] == 1 and report["diagnostics_complete"] for report in summaries), summaries
+        assert all(report["detail"]["new_count"] == 0 for report in final), final
+        events = [event for report in reports for event in (report.get("diagnostics") or {}).get("events", [])]
+        assert len(events) == 4, events
+        assert sum("双进程模式尚未提供" in event["message"] for event in events) == 2, events
+        assert sum("Invalid remote address" in event["message"] for event in events) == 2, events
+        serialized = json.dumps(reports)
+        assert "policy-secret" not in serialized and "policy-access" not in serialized and "policy auth secret" not in serialized, serialized
+        print("independent request-policy HTTP inspection deployments=2 rejections=4 task_errors_each=1 HTTP_204=accepted credentials=redacted", flush=True)
+    finally:
+        callback.shutdown()
+        callback.server_close()
 
 
 def run_retention_events(environment):
@@ -241,7 +284,7 @@ def run_inside():
             time.sleep(0.2)
         else:
             raise RuntimeError(f"ClickHouse readiness timed out on port {port}")
-    if any(flag in sys.argv for flag in ("--copy-generations", "--rename-generations", "--retention-events", "--source-absence")):
+    if any(flag in sys.argv for flag in ("--copy-generations", "--rename-generations", "--retention-events", "--source-absence", "--request-policy")):
         run_copy_generations()
         return
     environment = dict(os.environ)

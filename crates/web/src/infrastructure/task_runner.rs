@@ -1,6 +1,7 @@
 use app::error::StorageError;
 use std::sync::{Arc, OnceLock};
-use task_model::TransferMode;
+use task_model::{SourceCleanupPolicy, TransferMode};
+use utils::app_config::AppConfig;
 
 use app::callback::CallbackEndpoint;
 use app::error::AppError;
@@ -404,16 +405,17 @@ async fn run_migration_task(
             let dest = dest_url
                 .ok_or_else(|| WebError::ValidationError("Sync task requires destination endpoint".to_string()))?;
 
-            // 在调用 app 层之前 snapshot job_dir 预存在状态，用作 DB 不可达时的 fallback 信号
+            // 工作目录状态与任务请求一起记录，不用它代替数据库代次事实。
             let job_dir_pre_existing = std::path::Path::new(job_dir).exists();
 
-            // ScanType 由 app 层自动判定（查数据库 base 表，fallback 文件系统快照）
+            // 迁移模式由 app 层读取已持久化的代次策略决定。
             let config = app::config::SyncJobConfig {
                 job_id: job_id.to_string(),
                 job_dir: job_dir.to_string(),
                 job_dir_pre_existing,
                 src_path: source_url.to_string(),
                 dest_path: dest.to_string(),
+                source_cleanup: SourceCleanupPolicy::from_reserved(AppConfig::fetch()?.sync.is_source_reserved),
                 enable_integrity_check: task_config.enable_integrity_check,
                 enable_acl: task_config.enable_acl,
                 r#match: task_config.match_expr.clone(),

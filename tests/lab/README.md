@@ -108,6 +108,20 @@ count retained, and final reports still queryable in ClickHouse. S3 source histo
 deterministic fixture, not a real S3 protocol run. This does not validate the pending relative
 window plan, source-presence probing, or whole-job throughput/RSS.
 
+`python3 tests/lab/run-notification-archive-local.py --request-policy` checks the
+task-owned SourceCleanupPolicy against owned Single and two-replica ClickHouse.
+Three uncommitted attempts deliberately use a global source-retention setting
+opposite to the request, then independently read the persisted request policy.
+Remote move requests are rejected before transport/storage access; retained-source
+requests with an invalid remote address report that address error instead of
+inheriting the global deletion policy. Both errors reach the real HTTP 204 sink,
+clear their delivered details, retain cumulative task errors and final reports in
+ClickHouse, redact storage credentials and a whitespace-containing auth token,
+and create no copy base. The process-level wrong-token QUIC case additionally
+requires a final task-error count and no plaintext token in stdout/stderr. This is
+preflight and notification evidence; it does not certify remote source deletion,
+the complete generation descriptor/selection plan, or Local preflight coverage.
+
 `python3 tests/lab/run-notification-archive-local.py --source-absence` exercises
 incremental target reconciliation against owned Single and two-replica ClickHouse
 and actual Local source/target paths. Cases distinguish an unobserved but present

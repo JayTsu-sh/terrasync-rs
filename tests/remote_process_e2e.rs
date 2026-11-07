@@ -495,11 +495,19 @@ fn test_remote_process_e2e_wrong_token_rejected() {
         .arg("--tls-server-cert")
         .arg(&cert_path)
         .arg("--token")
-        .arg("wrong-token")
+        .arg("wrong token secret")
         .arg(&src_dir)
         .arg(&dest_dir);
 
-    sender_cmd.assert().failure();
+    let output = sender_cmd.assert().failure().get_output().clone();
+    let sender_stdout = String::from_utf8_lossy(&output.stdout);
+    let sender_stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        sender_stdout.contains("Task errors: 1"),
+        "鉴权失败必须进入最终任务统计: {sender_stdout}"
+    );
+    assert!(!sender_stdout.contains("wrong token secret"));
+    assert!(!sender_stderr.contains("wrong token secret"));
 
     // Receiver 收到非法 token 后也会以非零码退出（鉴权失败向上传播为进程错误）
     let receiver_status = wait_for_child_exit(&mut receiver_child, RECEIVER_EXIT_TIMEOUT);

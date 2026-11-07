@@ -264,7 +264,20 @@ impl SyncOrchestrator {
     ///
     /// 根据已提交数据库基线和复制策略选择；启用数据库时构造失败直接上报。
     pub async fn run(&self) -> Result<()> {
-        // 自动判定 ScanType
+        match &self.mode {
+            SyncMode::Local => self.run_local().await,
+            SyncMode::Remote {
+                remote_addr,
+                tls_server_cert,
+                auth_token,
+            } => {
+                self.run_sync_remote(remote_addr, tls_server_cert.as_deref(), auth_token.as_deref())
+                    .await
+            }
+        }
+    }
+
+    async fn run_local(&self) -> Result<()> {
         let c = &self.config;
         info!(transfer_mode = ?c.transfer_mode, "Sync transfer mode selected");
         if c.packaged && c.transfer_mode != TransferMode::Atomic {
@@ -272,35 +285,27 @@ impl SyncOrchestrator {
                 "Packaged sync supports only Atomic mode; use --in-place".into(),
             ));
         }
-        let observation_plan = match self.mode {
-            SyncMode::Local => {
-                let destination = create_storage_for_role(&c.dest_path, None, true, StorageRole::Destination).await?;
-                let source = create_storage_for_role(&c.src_path, None, false, StorageRole::Source).await?;
-                if !AppConfig::fetch()?.sync.is_source_reserved {
-                    if source.storage().identity() == destination.storage().identity() {
-                        return Err(AppError::ConfigError("移动任务的源端和目标端不能是同一存储根".into()));
-                    }
-                }
-                copy_transfer::validate_transfer_mode(&destination, c.transfer_mode)?;
-                let plan = MigrationPlan::compile(&source, &destination, c.enable_acl).await?;
-                plan.log();
-                Some(plan)
+        let observation_plan = {
+            let destination = create_storage_for_role(&c.dest_path, None, true, StorageRole::Destination).await?;
+            let source = create_storage_for_role(&c.src_path, None, false, StorageRole::Source).await?;
+            if !c.source_cleanup.retains_source() && source.storage().identity() == destination.storage().identity() {
+                return Err(AppError::ConfigError("移动任务的源端和目标端不能是同一存储根".into()));
             }
-            SyncMode::Remote { .. } => None,
+            copy_transfer::validate_transfer_mode(&destination, c.transfer_mode)?;
+            let plan = MigrationPlan::compile(&source, &destination, c.enable_acl).await?;
+            plan.log();
+            Some(plan)
         };
 
         let app_config = AppConfig::fetch()?;
         // 模式选择与代次准备共用独占权，避免读取旧策略后被另一执行切换代次。
-        let _lease = match self.mode {
-            SyncMode::Local => Some(CopyLease::acquire(&app_config.database.clickhouse, c)?),
-            SyncMode::Remote { .. } => None,
-        };
-        if !app_config.sync.is_source_reserved && !app_config.database.enabled {
+        let _lease = CopyLease::acquire(&app_config.database.clickhouse, c)?;
+        if !c.source_cleanup.retains_source() && !app_config.database.enabled {
             return Err(AppError::ConfigError(
-                "移动任务必须启用 ClickHouse，确认落库后才能删除源端".into(),
+                "当前移动任务要求启用 ClickHouse 目录和代次记录".into(),
             ));
         }
-        if c.packaged && !app_config.sync.is_source_reserved {
+        if c.packaged && !c.source_cleanup.retains_source() {
             return Err(AppError::ConfigError(
                 "打包移动需要逐项清单确认与校验，当前拒绝提前删除源目录".into(),
             ));
@@ -319,23 +324,10 @@ impl SyncOrchestrator {
 
         info!("SyncOrchestrator: determined scan_type={}", scan_type);
 
-        match &self.mode {
-            SyncMode::Local => match scan_type {
-                // 任务边界隔离管线状态机的布局，避免继续嵌套到 CLI／Web 入口。
-                ScanType::Full => self.run_sync(observation_plan).boxed_local().await,
-                ScanType::Incremental => self.run_incremental_sync(observation_plan).boxed_local().await,
-            },
-            // 双进程模式本就是 compare-based（DestIndex 实时比对目标端），Full/Incremental
-            // 在 wire protocol 和执行路径上是同一套代码，ScanType 对 Remote 是 no-op
-            // （issue #23：不存在需要新写的"远端增量模式"）。
-            SyncMode::Remote {
-                remote_addr,
-                tls_server_cert,
-                auth_token,
-            } => {
-                self.run_sync_remote(remote_addr, tls_server_cert.as_deref(), auth_token.as_deref())
-                    .await
-            }
+        match scan_type {
+            // 任务边界隔离管线状态机的布局，避免继续嵌套到 CLI／Web 入口。
+            ScanType::Full => self.run_sync(observation_plan).boxed_local().await,
+            ScanType::Incremental => self.run_incremental_sync(observation_plan).boxed_local().await,
         }
     }
 
@@ -361,7 +353,7 @@ impl SyncOrchestrator {
 
         // ── 1. 加载配置 ──
         let app_config = AppConfig::fetch()?;
-        let is_source_reserved = app_config.sync.is_source_reserved;
+        let is_source_reserved = c.source_cleanup.retains_source();
         let copy_concurrency = c.concurrency.unwrap_or(app_config.sync.concurrency);
 
         let block_size = match &c.block_size {
@@ -401,7 +393,7 @@ impl SyncOrchestrator {
             let database: ClickHouseDatabase =
                 ClickHouseDatabase::connect(&consumer_config.db_config.clickhouse, &c.job_id).await?;
             database.initialize().await?;
-            begin_copy_catalogue(&database, c, block_size, is_source_reserved).await?;
+            begin_copy_catalogue(&database, c, block_size).await?;
             Some(database)
         } else {
             None
@@ -774,7 +766,7 @@ impl SyncOrchestrator {
 
         // ── 1. 加载配置 ──
         let app_config = AppConfig::fetch()?;
-        let is_source_reserved = app_config.sync.is_source_reserved;
+        let is_source_reserved = c.source_cleanup.retains_source();
         let copy_concurrency = c.concurrency.unwrap_or(app_config.sync.concurrency);
 
         let block_size = match &c.block_size {
@@ -817,7 +809,7 @@ impl SyncOrchestrator {
             return Err(AppError::DatabaseError(e));
         }
 
-        begin_copy_catalogue(&database, c, block_size, is_source_reserved).await?;
+        begin_copy_catalogue(&database, c, block_size).await?;
 
         let batch_size = consumer_config.db_config.batch_size as usize;
 

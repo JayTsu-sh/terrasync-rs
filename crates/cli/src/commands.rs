@@ -13,7 +13,7 @@ use app::scan::ScanRequest;
 use std::fs;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use task_model::TransferMode;
+use task_model::{SourceCleanupPolicy, TransferMode};
 use tokio::signal::ctrl_c;
 use tokio_util::sync::CancellationToken;
 
@@ -223,6 +223,7 @@ pub async fn sync_cmd(
         job_dir_pre_existing,
         src_path: src_path_str.to_string(),
         dest_path: dest_path_str.to_string(),
+        source_cleanup: SourceCleanupPolicy::from_reserved(config.sync.is_source_reserved),
         enable_integrity_check: effective_enable_integrity_check,
         enable_acl: effective_enable_acl,
         r#match: effective_match,

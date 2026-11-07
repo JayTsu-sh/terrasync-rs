@@ -19,6 +19,10 @@ use crate::{
 pub(crate) struct CopyLease {
     _guard: JobLease,
 }
+
+#[cfg(test)]
+#[path = "copy_request_tests.rs"]
+mod request_tests;
 impl CopyLease {
     pub(crate) fn acquire(connection: &ClickhouseConfig, job: &SyncJobConfig) -> Result<Self> {
         Ok(Self {
@@ -28,7 +32,7 @@ impl CopyLease {
 }
 
 pub(crate) async fn begin_copy_catalogue(
-    database: &ClickHouseDatabase, job: &SyncJobConfig, block_size: Option<usize>, source_reserved: bool,
+    database: &ClickHouseDatabase, job: &SyncJobConfig, block_size: Option<usize>,
 ) -> Result<()> {
     // 身份不包含凭据；恢复计划变化必须在任何 payload 或回标前被拒绝。
     let source = create_storage_for_role(
@@ -78,7 +82,9 @@ pub(crate) async fn begin_copy_catalogue(
     ))?)
     .to_hex()
     .to_string();
-    let status = database.begin_copy_generation(&request_key, source_reserved).await?;
+    let status = database
+        .begin_copy_generation(&request_key, job.source_cleanup.retains_source())
+        .await?;
     if status == CopyGenerationStatus::Recovering && history {
         return Err(AppError::ConfigError(
             "版本化目标的上轮发布确认尚待对账，保留已复制版本和全部源历史，禁止盲目重放".into(),
@@ -100,15 +106,16 @@ mod tests {
     use super::*;
     use std::fs::OpenOptions;
     use std::path::Path;
-    use task_model::TransferMode;
+    use task_model::{SourceCleanupPolicy, TransferMode};
 
-    fn job(directory: &Path) -> SyncJobConfig {
+    pub(super) fn job(directory: &Path) -> SyncJobConfig {
         SyncJobConfig {
             job_id: directory.to_string_lossy().into_owned(),
             job_dir: directory.to_string_lossy().into_owned(),
             job_dir_pre_existing: false,
             src_path: String::new(),
             dest_path: String::new(),
+            source_cleanup: SourceCleanupPolicy::Retain,
             enable_integrity_check: false,
             enable_acl: false,
             r#match: None,

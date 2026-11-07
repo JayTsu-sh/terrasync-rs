@@ -49,7 +49,7 @@ use transport::traits::SenderTransport;
 use utils::app_config::AppConfig;
 use utils::logger;
 
-use crate::config::{JobType, SyncJobConfig};
+use crate::config::{JobType, SyncJobConfig, redact_command_line};
 use crate::consumer::stats::callback_state::CallbackState;
 use crate::consumer::stats::{IncrementalStats, ProgressBar, StatisticConsumer, StatsKind};
 use crate::error::{AppError, Result};
@@ -65,53 +65,26 @@ use crate::sync::parse_size;
 pub(crate) async fn run(
     config: &SyncJobConfig, remote_addr: &str, tls_cert_bytes: Option<&[u8]>, auth_token: Option<&str>,
 ) -> Result<()> {
-    info!("[Sender Remote] Connecting to Receiver at {}", remote_addr);
-
-    // ── 1. 连接 QUIC ──
-    let addr: SocketAddr = remote_addr
-        .parse()
-        .map_err(|e| AppError::CopyError(format!("Invalid remote address '{remote_addr}': {e}")))?;
-    let server_cert = tls_cert_bytes.map(|b| CertificateDer::from(b.to_vec()));
-    let transport = transport::quic::connect(addr, "localhost", server_cert).await?;
-    info!("[Sender Remote] Connected");
-
-    // ── 2. 握手：协商协议版本与能力，不兼容则在发送任何 FilePage/CopyEntry 前中止 ──
-    let copy_tags = negotiate_handshake(&transport).await?;
-
-    // ── 2.5 Token 鉴权：握手通过后、SessionConfig 之前，鉴权失败则中止连接 ──
-    send_and_check_auth(&transport, auth_token).await?;
-
-    // ── 3. 发送 SessionConfig ──
-    transport
-        .send(SenderMsg::SessionConfig(SessionConfig {
-            transfer_mode: config.transfer_mode,
-            src_path: config.src_path.clone(),
-            qos: config.qos.clone(),
-            peak_qos_rate: config.peak_qos_rate,
-            iops: config.iops,
-            enable_integrity_check: config.enable_integrity_check,
-            enable_acl: config.enable_acl,
-            is_source_reserved: true,
-            block_size: config.block_size.clone(),
-            delete_target: config.delete_target,
-            delta_size_threshold: config.delta_size_threshold.clone(),
-        }))
-        .await?;
-
     let app_config = AppConfig::fetch()?;
     let notification_database = app_config
         .database
         .enabled
         .then(|| ClickHouseDatabase::new(&app_config.database.clickhouse, &config.job_id))
         .transpose()?;
-    // ── 3.5 结构化统计报表（Sender 侧，复用本地 StatisticConsumer/IncrementalStats——
+    // raw 命令行已经丢失 argv 边界；按实际鉴权值脱敏，包含空格的 token 也不会残留。
+    let command = match auth_token.filter(|token| !token.is_empty()) {
+        Some(token) => config.raw_command_line.replace(token, "***"),
+        None => config.raw_command_line.clone(),
+    };
+    // 先建立通知生命周期，连接、握手、鉴权及准入错误也进入最终报告。
+    // 结构化统计报表（Sender 侧，复用本地 StatisticConsumer/IncrementalStats——
     //    双进程远端不分 full/incremental，报表形状本身就是 delta 语义，与 orchestrator
     //    的 ScanType 路由无关，统一用 JobType::IncrementalCopy）──
     let stats_consumer = Arc::new(AsyncMutex::new(StatisticConsumer {
         stats: StatsKind::Incremental(IncrementalStats::new(
             JobType::IncrementalCopy,
             config.job_id.clone(),
-            config.raw_command_line.clone(),
+            redact_command_line(&command),
             logger::get_current_app_log_path(),
         )),
         progress_bar: ProgressBar::new(JobType::IncrementalCopy),
@@ -125,7 +98,50 @@ pub(crate) async fn run(
     let callback_guard = StatisticConsumer::begin(stats_consumer.clone()).await;
 
     let qos_manager = create_qos_manager(config.qos.as_ref(), config.peak_qos_rate, config.iops);
+    let mut connection = None;
     let result = async {
+        if !config.source_cleanup.retains_source() {
+            return Err(AppError::RemoteSourceCleanupUnavailable);
+        }
+        if config.packaged {
+            return Err(AppError::ConfigError("双进程模式不支持打包迁移".into()));
+        }
+        if let Some(database) = &notification_database {
+            database.ping().await?;
+        }
+        info!("[Sender Remote] Connecting to Receiver at {}", remote_addr);
+
+        // ── 1. 连接 QUIC ──
+        let addr: SocketAddr = remote_addr
+            .parse()
+            .map_err(|e| AppError::CopyError(format!("Invalid remote address '{remote_addr}': {e}")))?;
+        let server_cert = tls_cert_bytes.map(|b| CertificateDer::from(b.to_vec()));
+        let transport = &*connection.insert(transport::quic::connect(addr, "localhost", server_cert).await?);
+        info!("[Sender Remote] Connected");
+
+        // ── 2. 握手：协商协议版本与能力，不兼容则在发送任何 FilePage/CopyEntry 前中止 ──
+        let copy_tags = negotiate_handshake(transport).await?;
+
+        // ── 2.5 Token 鉴权：握手通过后、SessionConfig 之前，鉴权失败则中止连接 ──
+        send_and_check_auth(transport, auth_token).await?;
+
+        // ── 3. 发送 SessionConfig ──
+        transport
+            .send(SenderMsg::SessionConfig(SessionConfig {
+                transfer_mode: config.transfer_mode,
+                src_path: config.src_path.clone(),
+                qos: config.qos.clone(),
+                peak_qos_rate: config.peak_qos_rate,
+                iops: config.iops,
+                enable_integrity_check: config.enable_integrity_check,
+                enable_acl: config.enable_acl,
+                is_source_reserved: config.source_cleanup.retains_source(),
+                block_size: config.block_size.clone(),
+                delete_target: config.delete_target,
+                delta_size_threshold: config.delta_size_threshold.clone(),
+            }))
+            .await?;
+
         // ── 4. 创建源端 storage + directory_pages ──
         let block_size = match &config.block_size {
             Some(s) => Some(parse_size(s)?),
@@ -158,7 +174,7 @@ pub(crate) async fn run(
 
         // ── 6+7+8. 文件列表发送 与 请求处理+Ack收集 并发运行（流水线，无阶段 barrier） ──
         RemoteSenderSession::new(RemoteSenderSessionDeps {
-            transport: &transport,
+            transport,
             src_storage: &src_storage,
             walkdir_iter: &walkdir_iter,
             qos: qos_manager.as_ref(),
@@ -173,7 +189,10 @@ pub(crate) async fn run(
     if let Some(ref qos) = qos_manager {
         qos.shutdown();
     }
-    let close = transport.close().await;
+    let close = match connection {
+        Some(transport) => transport.close().await,
+        None => Ok(()),
+    };
     if let Err(error) = &result
         && !matches!(error, AppError::DiagnosticJournalStopped { .. })
     {

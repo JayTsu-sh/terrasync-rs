@@ -1,6 +1,6 @@
 use data_mover::model::ObservationPlan;
-use task_model::TransferMode;
 use task_model::metadata::MetadataScope;
+use task_model::{SourceCleanupPolicy, TransferMode};
 // 标准库
 // 无
 
@@ -101,17 +101,19 @@ pub struct ConsumerConfig {
 /// Sync/IncrementalSync 的统一任务配置
 ///
 /// 整合 `sync()/incremental_sync()` 的所有参数，供 `SyncOrchestrator` 使用。
-/// `scan_type` 由 `SyncOrchestrator::run()` 自动判定（查数据库 base 表，fallback 文件系统）。
+/// `scan_type` 由任务层依据持久化代次策略判定；数据库故障直接上报。
 #[derive(Debug, Clone)]
 #[allow(clippy::struct_excessive_bools)] // 配置结构按用途分组的开关集合，重构为枚举会失去可读性
 pub struct SyncJobConfig {
     pub job_id: String,
     pub job_dir: String,
     /// `job_dir` 是否在本次调用前已经存在（由调用方 snapshot 注入）
-    /// 用于 app 层判定 `ScanType` 的文件系统 fallback（数据库不可达时）
+    /// 不作为迁移模式或数据库故障的替代依据。
     pub job_dir_pre_existing: bool,
     pub src_path: String,
     pub dest_path: String,
+    /// CLI／Web 在接受任务时固定，后续代次记录和源清理共用此值。
+    pub source_cleanup: SourceCleanupPolicy,
     pub enable_integrity_check: bool,
     pub enable_acl: bool,
     pub r#match: Option<String>,
@@ -134,7 +136,7 @@ pub struct SyncJobConfig {
     pub transfer_mode: TransferMode,
     /// `--delete-target`：仅 `--remote` 双进程模式生效，控制是否清理目标端多余文件
     /// （目标端存在但源端已不存在的条目）。本地模式的孤儿清理由 DB diff 驱动、
-    /// 无条件执行，不受此字段影响（两套机制并存但互不干扰）。
+    /// 须经策略及源端存在性确认，不受此远程开关影响。
     pub delete_target: bool,
     pub concurrency: Option<usize>,
 }
