@@ -5,6 +5,7 @@
 
 use crate::file_copy::metadata as copy_metadata;
 use crate::file_copy::namespace as copy_namespace;
+use crate::file_copy::selection::SkipTracker;
 use crate::file_copy::transfer as copy_transfer;
 use crate::rm::progress as deletion;
 use data_mover::model::BackendKind;
@@ -931,7 +932,19 @@ impl SyncOrchestrator {
                     let dest = storage_pair.get_dest_storage().clone();
 
                     let mut failure: Option<AppError> = None;
+                    let mut skipped = SkipTracker::default();
                     while let Some(message) = rx.next().await {
+                        let selected = match &message {
+                            StorageEntryMessage::New(item) | StorageEntryMessage::Changed { entry: item, .. } => {
+                                Some(&item.entry)
+                            }
+                            _ => None,
+                        };
+                        if let Some(entry) = selected
+                            && skipped.skip(entry, &dest, &bc).await?
+                        {
+                            continue;
+                        }
                         match message {
                             StorageEntryMessage::New(ref entry) => {
                                 if entry.get_version_id().is_some() {

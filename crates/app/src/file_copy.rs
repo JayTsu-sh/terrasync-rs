@@ -24,6 +24,7 @@ pub(crate) mod metadata;
 #[path = "file_copy/metadata_copy_tests.rs"]
 mod metadata_copy_tests;
 pub(crate) mod namespace;
+pub(crate) mod selection;
 pub(crate) mod transfer;
 mod version_failure;
 pub(crate) use version_failure::VersionFailureContext;
@@ -123,6 +124,13 @@ pub(crate) async fn copy_versions<I: Iterator<Item = ObservedItem> + Send>(
     items: I, from: &StorageContext, to: &StorageContext, options: CopyOptions, job_id: &str,
     broadcaster: &BroadcastForwarder<StorageEntryMessage>, scope: VersionCopyScope,
 ) -> Result<()> {
+    let mut items = items.peekable();
+    if scope == VersionCopyScope::WholeEntry
+        && let Some(first) = items.peek()
+        && selection::skip_unrepresentable(&first.entry, to, broadcaster).await?
+    {
+        return Ok(());
+    }
     let change = match scope {
         VersionCopyScope::WholeEntry => EntryChange::New,
         VersionCopyScope::SelectedVersion(change) => change,

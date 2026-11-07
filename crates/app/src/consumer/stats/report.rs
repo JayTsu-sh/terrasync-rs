@@ -54,6 +54,8 @@ pub enum ProgressDetail {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProgressReport {
+    #[serde(default)]
+    pub skipped_count: u64,
     pub job_id: String,
     pub job_type: String,
     pub elapsed_secs: f64,
@@ -85,6 +87,7 @@ pub struct ProgressReport {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JobResult {
+    pub skipped_count: u64,
     pub job_id: String,
     pub job_type: String,
     pub duration_secs: f64,
@@ -122,6 +125,8 @@ pub enum JobSummary {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FinalStats {
+    #[serde(default)]
+    pub skipped_count: u64,
     pub dirs: usize,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dir_size: Option<i64>,
@@ -179,6 +184,7 @@ impl StatsKind {
     pub fn to_job_result(&self) -> JobResult {
         match self {
             StatsKind::Full(s) => JobResult {
+                skipped_count: s.skipped_count,
                 job_id: s.job_id.clone(),
                 job_type: s.job_type.to_callback_name().to_string(),
                 duration_secs: s.start_time.elapsed().as_secs_f64(),
@@ -192,6 +198,7 @@ impl StatsKind {
                 },
             },
             StatsKind::Incremental(s) => JobResult {
+                skipped_count: s.skipped_count,
                 job_id: s.job_id.clone(),
                 job_type: s.job_type.to_callback_name().to_string(),
                 duration_secs: s.start_time.elapsed().as_secs_f64(),
@@ -217,6 +224,7 @@ impl StatsKind {
             StatsKind::Full(s) => {
                 let is_ic = matches!(s.job_type, JobType::IntegrityCheck);
                 FinalStats {
+                    skipped_count: s.skipped_count,
                     dirs: s.dir_count,
                     dir_size: Some(s.dir_size),
                     regular_files: s.regular_file_count,
@@ -243,6 +251,7 @@ impl StatsKind {
                 }
             }
             StatsKind::Incremental(s) => FinalStats {
+                skipped_count: s.skipped_count,
                 dirs: s.scanned.dir_count,
                 dir_size: Some(s.scanned.dir_size),
                 regular_files: s.scanned.regular_file_count,

@@ -233,7 +233,9 @@ impl Consumer for DatabaseConsumer {
                                 "db: error entry, skipping"
                             );
                         }
-                        StorageEntryMessage::CopyVersionFailed { .. } | StorageEntryMessage::Diagnostic { .. } => {}
+                        StorageEntryMessage::CopyVersionFailed { .. }
+                        | StorageEntryMessage::CopySkipped { .. }
+                        | StorageEntryMessage::Diagnostic { .. } => {}
                     }
 
                     processed_count += 1;

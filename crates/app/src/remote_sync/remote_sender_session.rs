@@ -554,6 +554,23 @@ async fn process_requests_and_acks(context: RequestLoopContext<'_>) -> Result<()
                     error!("[Sender Remote] Unknown NDX {ndx} for delta");
                 }
             }
+            Some(ReceiverMsg::CopySkipped { ndx, reason }) => {
+                let item = ndx_table
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .get(ndx)
+                    .cloned();
+                let item =
+                    item.ok_or_else(|| AppError::CopyError(format!("Receiver skipped unknown observation {ndx}")))?;
+                StatisticConsumer::record_message(
+                    stats_consumer,
+                    &StorageEntryMessage::CopySkipped {
+                        entry: item.entry,
+                        reason,
+                    },
+                )
+                .await?;
+            }
             Some(ReceiverMsg::ClassifiedObservation { ndx, decision }) => {
                 let item = ndx_table
                     .lock()

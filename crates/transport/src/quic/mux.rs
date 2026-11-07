@@ -144,6 +144,7 @@ pub(crate) fn receiver_stream_kind(msg: &ReceiverMsg) -> StreamKind {
         | ReceiverMsg::MetadataUpdateRequest { .. }
         | ReceiverMsg::Classified { .. }
         | ReceiverMsg::ClassifiedObservation { .. }
+        | ReceiverMsg::CopySkipped { .. }
         | ReceiverMsg::RequestsDone
         | ReceiverMsg::RemoteDestination(
             RemoteDestinationEvent::TransferRequested { .. } | RemoteDestinationEvent::PayloadRequested { .. },

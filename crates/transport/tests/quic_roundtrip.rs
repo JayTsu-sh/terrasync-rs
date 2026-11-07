@@ -34,6 +34,47 @@ fn install_crypto_provider() {
     let _ = rustls::crypto::ring::default_provider().install_default();
 }
 
+#[tokio::test]
+async fn test_quic_copy_skip_uses_production_classification_stream_without_payload() {
+    install_crypto_provider();
+    let (endpoint, address) = create_server_endpoint();
+    let (done_tx, done_rx) = oneshot::channel();
+    let receiver = tokio::spawn(async move {
+        let peer = quic::accept_connection(&endpoint).await.unwrap();
+        let mut handshake = false;
+        let mut listed = false;
+        for _ in 0..2 {
+            match peer.recv().await {
+                Some(SenderMsg::Handshake(_)) => handshake = true,
+                Some(SenderMsg::FileListDone) => listed = true,
+                other => panic!("unexpected advertisement: {other:?}"),
+            }
+        }
+        assert!(handshake && listed);
+        peer.send(ReceiverMsg::CopySkipped {
+            ndx: 42,
+            reason: "nonempty directory object cannot be represented".into(),
+        })
+        .await
+        .unwrap();
+        let _ = done_rx.await;
+        peer.close().await.unwrap();
+    });
+    let sender = quic::connect(address, "localhost", None).await.unwrap();
+    sender
+        .send(SenderMsg::Handshake(ProtocolHandshake::current()))
+        .await
+        .unwrap();
+    sender.send(SenderMsg::FileListDone).await.unwrap();
+    let message = tokio::time::timeout(Duration::from_secs(2), sender.recv())
+        .await
+        .unwrap();
+    assert!(matches!(message, Some(ReceiverMsg::CopySkipped { ndx: 42, reason }) if reason.contains("nonempty")));
+    let _ = done_tx.send(());
+    receiver.await.unwrap();
+    sender.close().await.unwrap();
+}
+
 fn create_server_endpoint() -> (quinn::Endpoint, SocketAddr) {
     let (certs, key) = quic::cert::generate_self_signed(&[]).unwrap();
     let server_config = quic::cert::build_server_config(certs, key).unwrap();

@@ -7,6 +7,7 @@
 use crate::file_copy::copied_tags_required;
 use crate::file_copy::metadata as copy_metadata;
 use crate::file_copy::namespace as copy_namespace;
+use crate::file_copy::selection::unrepresentable_object;
 use crate::rm::progress as deletion;
 use data_mover::storage::read_current_range;
 use futures::StreamExt;
@@ -104,6 +105,24 @@ pub(crate) struct RemoteSessionState {
 }
 
 impl RemoteSessionState {
+    pub(crate) async fn skip_unrepresentable(
+        &self, transport: &(dyn ReceiverTransport + 'static), destination: &StorageContext, ndx: i32,
+        entry: &ObservedItem,
+    ) -> Result<bool> {
+        let Some(reason) = unrepresentable_object(&entry.entry, destination) else {
+            return Ok(false);
+        };
+        // 历史段内所有版本共用一个 entry；只在首个版本报告一次跳过。
+        if entry.version_index.is_none_or(|index| index == 0) {
+            transport
+                .send(ReceiverMsg::CopySkipped {
+                    ndx,
+                    reason: reason.into(),
+                })
+                .await?;
+        }
+        Ok(true)
+    }
     pub(crate) fn ingest_page(&mut self, page: &DirPageResult) {
         self.ndx_table.ingest_page(page);
     }
@@ -241,9 +260,15 @@ impl RemoteSessionState {
     pub(crate) async fn handle_directory_lifecycle(
         &mut self, transport: &(dyn ReceiverTransport + 'static), dest: &StorageContext, page: &DirPageResult,
         dest_index: &mut DestIndex, delete_target: bool,
-    ) {
+    ) -> Result<()> {
         for subdir in &page.subdirs {
             dest_index.mark_matched(&subdir.entry.entry);
+            if self
+                .skip_unrepresentable(transport, dest, subdir.ndx, &subdir.entry)
+                .await?
+            {
+                continue;
+            }
             if let Err(error) = validate_relative_path(subdir.entry.get_relative_path()) {
                 warn!("[Receiver Remote] Rejecting unsafe subdir path: {}", error);
                 let _ = transport
@@ -319,7 +344,7 @@ impl RemoteSessionState {
         }
 
         if !delete_target {
-            return;
+            return Ok(());
         }
         for orphan in dest_index.orphaned_entries() {
             let path = orphan.get_relative_path();
@@ -354,6 +379,7 @@ impl RemoteSessionState {
                 }
             }
         }
+        Ok(())
     }
 
     /// 枚举失败时放弃待回写的目录元数据，避免将不完整任务视为完成。
@@ -1315,7 +1341,8 @@ mod tests {
 
         state
             .handle_directory_lifecycle(&receiver_transport, &dest_storage, &page, &mut dest_index, false)
-            .await;
+            .await
+            .unwrap();
 
         assert!(matches!(
             sender_transport.recv().await,
@@ -1346,7 +1373,8 @@ mod tests {
 
         state
             .handle_directory_lifecycle(&receiver_transport, &dest_storage, &page, &mut dest_index, true)
-            .await;
+            .await
+            .unwrap();
 
         assert!(dest_dir.path().join(part_name).exists());
     }

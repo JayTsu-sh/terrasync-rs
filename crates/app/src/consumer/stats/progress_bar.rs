@@ -336,6 +336,7 @@ impl ProgressBar {
                 return;
             }
             StorageEntryMessage::Diagnostic { .. }
+            | StorageEntryMessage::CopySkipped { .. }
             | StorageEntryMessage::TarManifest { .. }
             | StorageEntryMessage::CopyVersionFailed {
                 first_in_entry: false, ..
@@ -600,6 +601,7 @@ impl ProgressBar {
         };
 
         ProgressReport {
+            skipped_count: 0,
             diagnostics_complete: false,
             task_error_count: 0,
             job_id: job_id.to_string(),

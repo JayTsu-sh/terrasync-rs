@@ -2119,7 +2119,8 @@ mod tests {
                 &mut dest_index,
                 true,
             )
-            .await;
+            .await
+            .unwrap();
 
         match recv_skip_progress(&sender_transport).await {
             Some(ReceiverMsg::EntryError { entry, reason }) => {

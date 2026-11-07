@@ -146,6 +146,7 @@ pub fn format_bytes(bytes: f64, with_decimals: bool) -> String {
 /// 按目录、普通文件、软链接和其余类型保存数量与大小
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FullStats {
+    pub skipped_count: u64,
     // 类型计数及大小
     pub dir_count: usize,
     pub dir_size: i64,
@@ -194,6 +195,7 @@ impl FullStats {
         );
         result.set_scan_counts(counts);
         result.error_stats = self.error_stats.clone();
+        result.skipped_count = self.skipped_count;
         result.start_time = self.start_time;
         result
     }
@@ -210,6 +212,7 @@ impl FullStats {
     }
     pub fn new(job_type: JobType, job_id: String, command: String, log_path: String) -> Self {
         Self {
+            skipped_count: 0,
             dir_count: 0,
             dir_size: 0,
             regular_file_count: 0,
@@ -304,6 +307,7 @@ impl FullStats {
 
     pub fn update_from_message(&mut self, message: &StorageEntryMessage) {
         match message {
+            StorageEntryMessage::CopySkipped { .. } => self.skipped_count = self.skipped_count.saturating_add(1),
             StorageEntryMessage::Scanned(entry)
             | StorageEntryMessage::Packaged(entry)
             | StorageEntryMessage::IntegrityChecked(entry) => {
@@ -363,6 +367,7 @@ impl fmt::Display for FullStats {
         writeln!(f, "   └─ Total Time: {elapsed:.1}s")?;
         writeln!(f)?;
 
+        writeln!(f, "  Skipped entries: {}", self.skipped_count)?;
         writeln!(f, "  Basic Statistics:")?;
         #[rustfmt::skip]
         writeln!(f, "   ├─ Dirs:          {:>12}  ({})", self.dir_count, format_bytes(self.dir_size as f64, true))?;
@@ -509,6 +514,7 @@ impl DeltaCounts {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IncrementalStats {
+    pub skipped_count: u64,
     pub scanned: FullStats,
     pub new: DeltaCounts,
     pub changed: DeltaCounts,
@@ -530,6 +536,7 @@ impl IncrementalStats {
         // scanned 的元数据字段填充（仅用于分布统计，不用于最终 Display）
         let scanned = FullStats::new(job_type.clone(), job_id.clone(), command.clone(), log_path.clone());
         Self {
+            skipped_count: 0,
             scanned,
             new: DeltaCounts::default(),
             changed: DeltaCounts::default(),
@@ -546,6 +553,7 @@ impl IncrementalStats {
 
     pub fn update_from_message(&mut self, message: &StorageEntryMessage) {
         match message {
+            StorageEntryMessage::CopySkipped { .. } => self.skipped_count = self.skipped_count.saturating_add(1),
             StorageEntryMessage::Scanned(entry) | StorageEntryMessage::Packaged(entry) => {
                 for view in ObservedView::all(entry) {
                     self.scanned.update(&view);
@@ -657,6 +665,7 @@ impl fmt::Display for IncrementalStats {
         writeln!(f, "   └─ Avg Dir Depth: {avg_dir_depth:>15.1}")?;
         writeln!(f)?;
 
+        writeln!(f, "  Skipped entries: {}", self.skipped_count)?;
         fmt_time_range_table(f, &s.time_range_stats, s.total_count(), s.total_size())?;
         fmt_file_size_range_table(f, &s.file_size_range_stats, s.regular_file_count, s.regular_file_size)?;
         fmt_top_extensions(f, s.get_top_extensions(), s.regular_file_count, s.regular_file_size)?;
@@ -677,10 +686,17 @@ pub enum StatsKind {
 }
 
 impl StatsKind {
+    pub fn skipped_count(&self) -> u64 {
+        match self {
+            Self::Full(stats) => stats.skipped_count,
+            Self::Incremental(stats) => stats.skipped_count,
+        }
+    }
     pub(crate) fn scan_prefix(&self, counts: &ScanCounts) -> Self {
         match self {
             Self::Full(value) => Self::Full(value.scan_prefix(counts)),
             Self::Incremental(value) => Self::Incremental(IncrementalStats {
+                skipped_count: value.skipped_count,
                 scanned: value.scanned.scan_prefix(counts),
                 new: value.new.clone(),
                 changed: value.changed.clone(),

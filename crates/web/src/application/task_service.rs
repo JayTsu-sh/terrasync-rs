@@ -310,6 +310,7 @@ fn execution_stats_from_report(report: &ProgressReport) -> ExecutionStats {
             transferred_bytes,
             error_count,
         } => ExecutionStats {
+            skipped_count: report.skipped_count,
             scanned_files: *scanned_files,
             scanned_dirs: *scanned_dirs,
             total_bytes: *total_bytes,
@@ -329,6 +330,7 @@ fn execution_stats_from_report(report: &ProgressReport) -> ExecutionStats {
             error_count,
             ..
         } => ExecutionStats {
+            skipped_count: report.skipped_count,
             scanned_files: scanned_files.saturating_add(*scanned_symlinks),
             scanned_dirs: *scanned_dirs,
             total_bytes: *scanned_size,

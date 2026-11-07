@@ -9,6 +9,7 @@ use crate::consumer::stats::callback_state::CallbackState;
 use crate::consumer::stats::{FullStats, ProgressBar, ProgressDetail, StatisticConsumer, StatsKind};
 use crate::error::AppError;
 use crate::file_copy::CopyOptions;
+use crate::file_copy::prepare_directory;
 use crate::file_copy::transfer as copy_transfer;
 use crate::file_copy::{VersionCopyScope, copy_versions};
 use crate::receiver::ReceiverConfig;
@@ -27,6 +28,108 @@ use tokio::time::Instant;
 use transport::in_process::create_in_process_pair;
 
 type TestResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
+
+#[tokio::test]
+#[ignore = "requires isolated real S3 slash-key source and destinations"]
+async fn nonempty_slash_objects_skip_filesystems_but_copy_complete_keys_and_history_to_objects() -> TestResult {
+    let source = create_storage(
+        &std::env::var("LAB_MIGRATION_SLASH_SOURCE_URL")?,
+        CreateStorageOptions::default(),
+    )
+    .await?;
+    let scan = source
+        .walkdir(
+            None,
+            WalkOptions {
+                include_tags: true,
+                ..Default::default()
+            },
+        )
+        .await?;
+    let mut entries = Vec::new();
+    while let Some(message) = scan.next().await {
+        if let StorageEntryMessage::Scanned(entry) = message {
+            entries.push(entry);
+        }
+    }
+    if let Some(error) = scan.take_error() {
+        return Err(error.into());
+    }
+    assert!(entries.iter().any(|entry| entry.path().as_str() == "a/"));
+    let root = TempDir::new()?;
+    let targets = [
+        (root.path().to_str().ok_or("invalid temp root")?.to_string(), true),
+        (format!("{}/slash", std::env::var("LAB_MIGRATION_LATEST_URL")?), false),
+        (format!("{}/slash", std::env::var("LAB_MIGRATION_HISTORY_URL")?), false),
+    ];
+    for (url, filesystem) in targets {
+        let destination = create_storage(&url, CreateStorageOptions::default()).await?;
+        let mut broadcaster = BroadcastForwarder::new(128);
+        let mut receiver = broadcaster.subscribe();
+        let mut consumer = StatisticConsumer {
+            stats: StatsKind::Full(FullStats::new(
+                JobType::Copy,
+                "slash-objects".into(),
+                String::new(),
+                String::new(),
+            )),
+            progress_bar: ProgressBar::new(JobType::Copy),
+            job_dir: String::new(),
+            callback_url: if filesystem {
+                Some(CallbackEndpoint::parse(&std::env::var("LAB_MIGRATION_CALLBACK_URL")?)?)
+            } else {
+                None
+            },
+            generation_committed: None,
+            scan_snapshot: None,
+            callback: CallbackState::default(),
+            pb_handle: None,
+        };
+        for entry in &entries {
+            if entry.history().is_some() {
+                copy_versions(
+                    ObservedItem::all(entry),
+                    &source,
+                    &destination,
+                    CopyOptions {
+                        transfer_mode: TransferMode::Direct,
+                        ..Default::default()
+                    },
+                    "slash-objects",
+                    &broadcaster,
+                    VersionCopyScope::WholeEntry,
+                )
+                .await?;
+            } else {
+                assert!(prepare_directory(entry, &destination).await?);
+            }
+        }
+        let mut skipped = 0;
+        while let Ok(message) = receiver.try_recv() {
+            if let StorageEntryMessage::CopySkipped { entry, reason } = &message {
+                assert_eq!(entry.path().as_str(), "a/");
+                assert!(!reason.is_empty());
+                skipped += 1;
+            }
+            assert!(!matches!(
+                &message,
+                StorageEntryMessage::Error { .. } | StorageEntryMessage::CopyVersionFailed { .. }
+            ));
+            consumer.update_statistics(&message);
+        }
+        assert_eq!(skipped, usize::from(filesystem));
+        let report = consumer.to_report(true);
+        assert_eq!(report.skipped_count, u64::from(filesystem));
+        assert!(matches!(report.detail, ProgressDetail::Full { error_count: 0, .. }));
+        if filesystem {
+            assert_eq!(tokio::fs::read(root.path().join("a/file")).await?, b"child");
+            assert!(root.path().join("empty").is_dir());
+            StatisticConsumer::send_final_callback(&Arc::new(Mutex::new(consumer)), None).await;
+        }
+        println!("slash_object filesystem={filesystem} skipped_entries={skipped} error_count=0 child_copied=true");
+    }
+    Ok(())
+}
 
 #[tokio::test]
 #[ignore = "requires isolated real versioned S3 source and target"]

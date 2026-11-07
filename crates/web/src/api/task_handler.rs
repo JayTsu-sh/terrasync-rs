@@ -168,6 +168,7 @@ fn progress_report_to_snapshot(report: &ProgressReport) -> Result<serde_json::Va
             "speed_bytes_per_sec": report.speed_bytes_per_sec,
         }),
     };
+    snapshot["skipped_count"] = serde_json::to_value(report.skipped_count)?;
     snapshot["task_error_count"] = serde_json::to_value(report.task_error_count)?;
     snapshot["diagnostics_complete"] = serde_json::to_value(report.diagnostics_complete)?;
     if let Some(scan) = &report.scan {

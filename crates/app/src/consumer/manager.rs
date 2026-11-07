@@ -883,6 +883,7 @@ mod resume_tests {
             callback: Default::default(),
         };
         stats.progress_bar.restore(&ProgressReport {
+            skipped_count: 0,
             diagnostics_complete: false,
             task_error_count: 0,
             job_id: "resume".into(),

@@ -23,6 +23,7 @@ use transport::traits::SenderTransport;
 use crate::broadcast::BroadcastForwarder;
 use crate::error::{AppError, Result};
 use crate::file_copy::copy_versions;
+use crate::file_copy::selection::skip_unrepresentable;
 use crate::file_copy::{CopyOptions, VersionCopyScope};
 use crate::receiver::ReceiverConfig;
 use crate::tar_pack;
@@ -60,6 +61,9 @@ pub async fn sender_worker(
         match msg {
             StorageEntryMessage::Diagnostic { .. } => broadcaster.broadcast(msg).await?,
             StorageEntryMessage::Scanned(entry) => {
+                if skip_unrepresentable(&entry, &dest_storage, broadcaster).await? {
+                    continue;
+                }
                 if blocked_history
                     .as_ref()
                     .is_some_and(|(path, kind, _)| path != entry.path() || *kind != entry.kind())

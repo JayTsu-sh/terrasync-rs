@@ -119,6 +119,9 @@ const scanSpeed = (progress: TaskProgressSnapshot) =>
           </span>
         </div>
       </div>
+      <div v-if="isSyncType && (liveProgress.skipped_count ?? 0) > 0" class="mt-4 text-sm text-gray-600" data-testid="live-copy-skips">
+        已跳过 {{ formatNumber(liveProgress.skipped_count ?? 0) }} 个目标无法表示的条目，源端已保留。
+      </div>
     </div>
     <div v-else-if="isRunning && !liveProgress" class="bg-blue-50 border border-blue-200 rounded-[10px] p-5 mb-6">
       <div class="flex items-center justify-center py-6 text-gray-400">
@@ -163,8 +166,8 @@ const scanSpeed = (progress: TaskProgressSnapshot) =>
                 class="flex justify-between items-center px-4 py-2.5 border-b border-gray-100 transition-colors hover:bg-gray-50"
               >
                 <span class="text-sm text-gray-500">跳过</span>
-                <span class="text-base font-semibold text-gray-700 tabular-nums"
-                  >{{ formatNumber(scanStats.scanned_dirs) }} 个</span
+                <span class="text-base font-semibold text-gray-700 tabular-nums" data-testid="copy-skipped-count"
+                  >{{ formatNumber(scanStats.skipped_count ?? 0) }} 个</span
                 >
               </div>
               <div

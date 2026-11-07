@@ -110,6 +110,8 @@ impl EntryChange {
 pub enum StorageEntryMessage {
     /// 文件被扫描到
     Scanned(Arc<ObservedEntry>),
+    /// 源对象有内容，但目标无法表示；不属于复制成功或失败，不授权删除源项。
+    CopySkipped { entry: Arc<ObservedEntry>, reason: String },
     /// 新增文件
     New(ObservedItem),
     /// 一个历史分段 entry 的全部所选版本已复制并通过元数据校验；版本行另行落库。

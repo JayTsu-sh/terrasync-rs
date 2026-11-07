@@ -611,6 +611,10 @@ pub(crate) async fn recv_file_list_and_data_phase(
                 // 附带 decision 供 Sender 侧统计正确分类）或 Classified（MetadataOnly/Skip，
                 // Receiver 本地执行/判定，此前零 wire 流量，见 issue #23）
                 for nf in &page.files {
+                    if state.skip_unrepresentable(transport, dest_storage, nf.ndx, &nf.entry).await? {
+                        dest_index.mark_matched(&nf.entry.entry);
+                        continue;
+                    }
                     if let Some(version) = nf.entry.view().version() {
                         dest_index.mark_matched(&nf.entry.entry);
                         if !keeps_history && (!version.is_latest() || version.is_delete_marker()) { continue; }
@@ -654,7 +658,7 @@ pub(crate) async fn recv_file_list_and_data_phase(
                         &mut dest_index,
                         session_config.delete_target,
                     )
-                    .await;
+                    .await?;
             }
             Some(SenderMsg::FileListError { path, reason }) => {
                 receive_failure = Some(AppError::CopyError(format!("Source listing failed at {path}: {reason}")));

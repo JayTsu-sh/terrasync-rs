@@ -11,6 +11,7 @@ use tokio_util::task::AbortOnDropHandle;
 
 use crate::error::{AppError, Result, StorageError};
 use crate::file_copy::metadata::copied_metadata_plan;
+use crate::file_copy::selection::unrepresentable_object;
 use crate::storage_factory::StorageContext;
 
 /// 调用方必须先排空复制和数据库消费者，并完成目标目录元数据与代次提交。
@@ -31,7 +32,7 @@ pub(crate) async fn remove_confirmed_sources(
 
 async fn remove_entry(source: &StorageContext, destination: &StorageContext, entry: &ObservedEntry) -> Result<()> {
     // 存储根和虚拟目录不是本次传输拥有的可删除实体。
-    if entry.path().as_str().is_empty() {
+    if entry.path().as_str().is_empty() || unrepresentable_object(entry, destination).is_some() {
         return Ok(());
     }
     if entry.history().is_some() || source.storage().holds_directory_objects() {
@@ -87,9 +88,32 @@ async fn remove_entry(source: &StorageContext, destination: &StorageContext, ent
 mod tests {
     use super::*;
     use crate::file_copy::{CopyOptions, copy_file, metadata::set_entry_metadata};
+    use crate::observed_fixtures::observation;
     use crate::scan::observe_path;
     use crate::storage_factory::{CreateStorageOptions, create_storage};
+    use data_mover::model::BackendKind;
     use std::path::Path;
+
+    #[tokio::test]
+    async fn skipped_slash_object_never_reaches_source_purge() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        std::fs::write(root.path().join("a"), b"retained")?;
+        let storage = create_storage(root.path().to_str().unwrap(), CreateStorageOptions::default()).await?;
+        let entry = observation(
+            BackendKind::S3,
+            "a/".into(),
+            EntryKind::File,
+            8,
+            [0; 3],
+            None,
+            None,
+            None,
+            None,
+        );
+        remove_entry(&storage, &storage, &entry).await?;
+        assert_eq!(std::fs::read(root.path().join("a"))?, b"retained");
+        Ok(())
+    }
 
     #[tokio::test]
     async fn changed_source_is_retained_and_cleanup_never_recurses() -> Result<()> {

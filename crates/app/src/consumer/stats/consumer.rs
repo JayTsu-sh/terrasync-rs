@@ -179,6 +179,13 @@ impl StatisticConsumer {
     pub fn update_statistics(&mut self, message: &StorageEntryMessage) {
         trace!("Updating statistics for message: {:?}", message);
         self.stats.update_from_message(message);
+        if let StorageEntryMessage::CopySkipped { entry, reason } = message {
+            let retained = self
+                .callback
+                .outbox
+                .enqueue("copy", "copy_skipped", reason, Some(entry.path().as_str()));
+            self.callback.diagnostics_incomplete |= !retained;
+        }
         self.progress_bar.update_statistics(message);
         if let StorageEntryMessage::CopyVersionFailed {
             entry,
@@ -249,6 +256,7 @@ impl StatisticConsumer {
     fn report_for_scan(&self, is_final: bool, snapshot: Option<&ScanSnapshot>) -> ProgressReport {
         let mut report = self.progress_bar.to_report(self.stats.job_id());
         report.is_final = is_final;
+        report.skipped_count = self.stats.skipped_count();
         report.task_error_count = self.callback.task_error_count;
         report.generation_committed = self.generation_committed;
         report.scan = snapshot.cloned();

@@ -362,6 +362,8 @@ pub enum ReceiverMsg {
 
     /// 对已广告的观察完成分类，不重复发送其快照。
     ClassifiedObservation { ndx: i32, decision: TransferDecision },
+    /// 目标无法表示此 entry；不产生传输请求或复制成功事实。
+    CopySkipped { ndx: i32, reason: String },
 
     // ── NDX 级别 ack（双进程模式） ──
     /// 文件写入成功
@@ -421,13 +423,14 @@ pub enum ReceiverMsg {
 /// payload 与 source evidence。新旧 wire 不兼容，不提供双协议解码。
 ///
 /// 8：remote expert terminal 新增 staged metadata phase。新旧 wire 不兼容，不提供双协议解码。
-pub const PROTOCOL_VERSION: u32 = 12;
+/// 13：新增不产生传输成功事实的 CopySkipped 分类，要求对端理解其统计与保留语义。
+pub const PROTOCOL_VERSION: u32 = 13;
 
 /// 当前 binary 能接受的最低对端协议版本
 ///
 /// 对端版本低于此值时握手拒绝，避免 bincode schema 不兼容导致反序列化失败
 /// 或部分文件已写入、部分未写入的"半执行"不一致状态。
-pub const MIN_SUPPORTED_PROTOCOL_VERSION: u32 = 12;
+pub const MIN_SUPPORTED_PROTOCOL_VERSION: u32 = 13;
 
 /// 完整性校验使用的 hash 算法
 ///
@@ -1178,5 +1181,15 @@ mod tests {
             HandshakeResult::Accepted { .. } => {}
             other => panic!("相同版本应握手成功，got {other:?}"),
         }
+    }
+
+    #[test]
+    fn negotiate_rejects_a_peer_without_copy_skip_support() {
+        let current = ProtocolHandshake::current();
+        let mut old = current.clone();
+        old.protocol_version = 12;
+        old.min_supported_version = 12;
+        assert!(matches!(current.negotiate(&old), HandshakeResult::Rejected { .. }));
+        assert!(matches!(old.negotiate(&current), HandshakeResult::Rejected { .. }));
     }
 }

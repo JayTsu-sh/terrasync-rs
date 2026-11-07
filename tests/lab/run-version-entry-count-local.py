@@ -191,6 +191,44 @@ def run_inside():
         assert client.get_object(Bucket=buckets[kind], Key="payload")["Body"].read() == b"payload"
         print(f"independent S3 inspection kind={kind} version_records={len(records)} payload=verified", flush=True)
 
+    for index in range(20):
+        client.put_object(Bucket=buckets["source"], Key="slash/a/", Body=f"slash-{index}".encode())
+    client.put_object(Bucket=buckets["source"], Key="slash/a/file", Body=b"child")
+    client.put_object(Bucket=buckets["source"], Key="slash/empty/", Body=b"")
+    slash_before = [item for item in client.list_object_versions(Bucket=buckets["source"], Prefix="slash/a/").get("Versions", []) if item["Key"] == "slash/a/"]
+    assert slash_before
+    slash_history_count = len(slash_before)
+    print(f"slash fixture source_versions={slash_history_count} put_requests=20; provider may store slash keys as one null version", flush=True)
+    environment["LAB_MIGRATION_SLASH_SOURCE_URL"] = environment["LAB_MIGRATION_SOURCE_URL"] + "/slash"
+    callback_reports.clear()
+    callback = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Callback)
+    callback.daemon_threads = True
+    threading.Thread(target=callback.serve_forever, daemon=True).start()
+    environment["LAB_MIGRATION_CALLBACK_URL"] = f"http://127.0.0.1:{callback.server_port}/progress"
+    try:
+        subprocess.run([
+            "cargo", "test", "--offline", "--locked", "-p", "app", "--lib",
+            "storage_tests::s3_versions::nonempty_slash_objects_skip_filesystems_but_copy_complete_keys_and_history_to_objects",
+            "--", "--ignored", "--exact", "--nocapture",
+        ], cwd=ROOT, env=environment, check=True)
+        assert len(callback_reports) == 2, callback_reports
+        assert all(report["skipped_count"] == 1 and report["detail"]["error_count"] == 0 for report in callback_reports)
+        events = [event for report in callback_reports for event in (report.get("diagnostics") or {}).get("events", [])]
+        assert len(events) == 1 and events[0]["code"] == "copy_skipped" and events[0]["path"] == "a/", events
+        assert callback_reports[-1]["diagnostics_complete"]
+        for kind, count in (("source", slash_history_count), ("latest", 1), ("history", slash_history_count)):
+            versions = client.list_object_versions(Bucket=buckets[kind], Prefix="slash/a/").get("Versions", [])
+            assert len([item for item in versions if item["Key"] == "slash/a/"]) == count, (kind, versions)
+            assert client.get_object(Bucket=buckets[kind], Key="slash/a/")["Body"].read() == b"slash-19"
+            assert client.get_object(Bucket=buckets[kind], Key="slash/a/file")["Body"].read() == b"child"
+            assert client.get_object(Bucket=buckets[kind], Key="slash/empty/")["Body"].read() == b""
+        slash_after = [item for item in client.list_object_versions(Bucket=buckets["source"], Prefix="slash/a/").get("Versions", []) if item["Key"] == "slash/a/"]
+        assert {(item["VersionId"], item["Size"]) for item in slash_before} == {(item["VersionId"], item["Size"]) for item in slash_after}
+        print(f"independent S3 inspection slash_key latest=1 history={slash_history_count} source={slash_history_count} child=preserved empty_marker=preserved callback_skip=1 errors=0", flush=True)
+    finally:
+        callback.shutdown()
+        callback.server_close()
+
 
 if __name__ == "__main__":
     if "--inside" in sys.argv:

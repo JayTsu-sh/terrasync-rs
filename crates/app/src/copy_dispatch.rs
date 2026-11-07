@@ -26,6 +26,7 @@ impl CopyQueues {
         let mut hash = DefaultHasher::new();
         match &message {
             StorageEntryMessage::Scanned(entry)
+            | StorageEntryMessage::CopySkipped { entry, .. }
             | StorageEntryMessage::CopyEntryCompleted { entry, .. }
             | StorageEntryMessage::Packaged(entry)
             | StorageEntryMessage::Deleted(entry)

@@ -56,6 +56,15 @@ also check that later versions and history segments stop publishing, with failur
 the delivered entry boundaries. Its container and volumes are removed on exit. This check does
 not cover ClickHouse acknowledgement, callback outages, or the shared network recovery window.
 
+The runner also seeds a nonempty `a/`, `a/file`, and an empty marker. It verifies one
+`copy_skipped` callback event and cumulative `skipped_count=1` with zero errors to Local;
+object destinations preserve the complete key, bytes, child, marker, and the history actually
+exposed by the source provider. The cached RustFS image stores slash keys as one `null` version
+even in a versioned bucket: the runner records the pre-copy version list and requires the
+source to remain identical afterwards; it does not claim a real 20-version slash-key history.
+The 20-version skip-count and remote classification cases use deterministic observations.
+Ordinary `payload` version history is independently checked against 20 real versions above.
+
 The same runner also disconnects a required event consumer while another consumer's queue is
 full. Against real versioned S3 it checks that the sender returns a typed failure after the
 first published version, starts no later history version or delivered entry, releases its

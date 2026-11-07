@@ -61,6 +61,7 @@ export interface ExecutionStats {
   scanned_dirs: number
   total_bytes: number
   transferred_bytes: number
+  skipped_count?: number
   error_count: number
   duration_secs: number
   avg_speed_bytes_per_sec: number
@@ -249,6 +250,7 @@ export async function deleteExecution(id: string): Promise<void> {
 }
 
 export interface TaskProgressSnapshot {
+  skipped_count?: number
   task_error_count?: number
   diagnostics_complete?: boolean
   scanned_files: number

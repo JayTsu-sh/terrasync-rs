@@ -205,6 +205,7 @@ impl IncrementalStorageEntryRecord {
         let now = i64::try_from(SystemTime::now().duration_since(SystemTime::UNIX_EPOCH)?.as_nanos())?;
         let (entry, operation, comment) = match message {
             StorageEntryMessage::CopyEntryCompleted { .. }
+            | StorageEntryMessage::CopySkipped { .. }
             | StorageEntryMessage::CopyVersionFailed { .. }
             | StorageEntryMessage::Diagnostic { .. } => {
                 return Ok(Vec::new());
@@ -403,6 +404,27 @@ mod tests {
                 "version_id":"v1", "tags":"{\"a\":\"1\",\"b\":\"2\"}",
             })
         );
+        Ok(())
+    }
+
+    #[test]
+    fn copy_skip_does_not_create_an_incremental_success_or_deletion_record() -> Result<()> {
+        let entry = Arc::new(observation(
+            BackendKind::S3,
+            "a/".into(),
+            EntryKind::File,
+            7,
+            [0; 3],
+            None,
+            None,
+            None,
+            Some((Some("v1".into()), true, false)),
+        ));
+        let skipped = StorageEntryMessage::CopySkipped {
+            entry,
+            reason: "target cannot represent object content".into(),
+        };
+        assert!(IncrementalStorageEntryRecord::from_message(&skipped)?.is_empty());
         Ok(())
     }
 }
