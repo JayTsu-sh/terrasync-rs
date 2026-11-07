@@ -1,0 +1,297 @@
+//! 复制完成后的目标清理与 rename；任务调度和通知生命周期仍由父模块负责。
+use std::{
+    collections::HashMap,
+    path::PathBuf,
+    sync::{Arc, atomic::AtomicU64},
+};
+
+use data_mover::{
+    model::{BackendKind, ObservedEntry},
+    qos::QosManager,
+};
+use db::{ClickHouseDatabase, DeletionStatus};
+use task_model::{
+    ChangeKind, ErrorEvent, ObservedEntryExt, StorageEntryMessage, TargetRetention, TargetRetentionReason, TransferMode,
+};
+use tracing::error;
+
+use super::SyncOrchestrator;
+use crate::broadcast::BroadcastForwarder;
+use crate::error::{AppError, Result};
+use crate::file_copy::{CopyOptions, HdfsCopyContext, copy_file};
+use crate::file_copy::{metadata as copy_metadata, namespace as copy_namespace};
+use crate::rename::{RenameOptions, RenameOutcome, rename_or_copy};
+use crate::rm::progress as deletion;
+use crate::storage_factory::StorageContext;
+use crate::sync::{CommitRecorder, ResumeOpts};
+
+impl SyncOrchestrator {
+    /// rename 后的内容与元数据必须完成，才能确认该条目的新状态。
+    #[allow(clippy::too_many_arguments)]
+    async fn sync_renamed_file_changes(
+        kind: ChangeKind, entry: &Arc<ObservedEntry>, src: &StorageContext, dest: &StorageContext,
+        qos: Option<QosManager>, integrity: bool, _source_reserved: bool, bytes: Option<Arc<AtomicU64>>, job_id: &str,
+        job_dir: &str, transfer_mode: TransferMode,
+    ) -> Result<()> {
+        let mut metadata_applied = false;
+        if kind != ChangeKind::MetadataOnly {
+            let hdfs = if dest.storage().kind() == BackendKind::Hdfs {
+                Some(HdfsCopyContext::from_job(job_id, transfer_mode)?)
+            } else {
+                None
+            };
+            let recorder = if hdfs.is_some() && transfer_mode == TransferMode::Checkpoint {
+                Some(CommitRecorder::start(job_dir, entry, src.block_size()).await?)
+            } else {
+                None
+            };
+            let hdfs = hdfs.map(|context| {
+                recorder.as_ref().map_or(context.clone(), |recorder| {
+                    context.with_commit_callback(recorder.callback())
+                })
+            });
+            let result = copy_file(
+                src,
+                dest,
+                entry,
+                CopyOptions {
+                    transfer_mode,
+                    qos,
+                    enable_integrity_check: integrity,
+                    bytes_counter: bytes,
+                    ..Default::default()
+                },
+                hdfs.as_ref(),
+            )
+            .await;
+            if let Some(recorder) = recorder {
+                recorder.finish(result).await?;
+            } else {
+                result?;
+            }
+            metadata_applied = true;
+        }
+        if !metadata_applied {
+            copy_metadata::set_entry_metadata(dest.storage(), entry).await?;
+        }
+        Ok(())
+    }
+
+    /// DB 写入由 [`DatabaseConsumer`](crate::consumer::DatabaseConsumer) 在收到 `Deleted` / `Renamed` /
+    /// `Error` 消息后自动完成（走和 handler workers 同一套批量重试逻辑）；本函数只负责
+    /// 「物理操作 + 广播结果消息」。保留首个类型化错误，处理完当前阶段后返回。
+    ///
+    /// # 两遍处理设计
+    ///
+    /// **第一遍**：收集所有 `DeletionStatus`，从中提取「目录名发生变化的 rename」
+    /// 构建 `renamed_dirs` 映射（`old_dir_path` → `new_dir_path`）。
+    ///
+    /// **第二遍**：顺序执行物理操作。对每条 `Renamed(from, to)` 判断是否跳过：
+    /// - `from.name != to.name`：目录/文件本身改了名字 → 必须调用 `rename_or_copy`
+    /// - `from.name == to.name` 且 `from.parent` 在 `renamed_dirs` 中且映射到 `to.parent`：
+    ///   父目录的 NFS RENAME 已传递性地移动了这个子条目 → 跳过物理操作
+    /// - `from.name == to.name` 但父目录未在 `renamed_dirs` 中（跨父目录 move）：
+    ///   没有父目录 rename 代为处理 → 必须调用 `rename_or_copy`
+    ///
+    /// 对于 rename 成功后检测到内容或元数据也同时变化的普通文件，额外执行内容拷贝
+    /// 或元数据更新（处理「rename + data/metadata changed」复合场景）。
+    #[allow(clippy::too_many_arguments)]
+    pub(super) async fn apply_deletions_and_renames(
+        db: &ClickHouseDatabase, src_storage: Arc<StorageContext>, dest_storage: Arc<StorageContext>,
+        is_source_reserved: bool, broadcaster: &BroadcastForwarder<StorageEntryMessage>, enable_integrity_check: bool,
+        qos_manager: Option<QosManager>, bytes_counter: Option<Arc<AtomicU64>>, job_id: &str, job_dir: &str,
+        transfer_mode: TransferMode,
+    ) -> Result<()> {
+        let deletion_iter = db.detect_deleted_items().await?;
+        let mut failure: Option<AppError> = None;
+
+        // 第一遍：收集目录 rename 计划及待确认状态。
+        // 映射同时保存目标路径和实际移动确认，计划存在不代表子树已经移动。
+        // 收录所有 is_dir=true 的 Renamed 条目（包括同名跨父目录 move 如 d3/d3_4 → d4/d3_4）。
+        // 用于判断某条目的父目录是否正在被 rename，若是则子条目无需单独执行物理操作。
+        let statuses: Vec<DeletionStatus> = deletion_iter.collect();
+        let mut renamed_dirs: HashMap<PathBuf, (PathBuf, bool)> = statuses
+            .iter()
+            .filter_map(|s| {
+                if let DeletionStatus::Renamed(from, to) = s
+                    && from.get_is_dir()
+                {
+                    return Some((
+                        from.get_relative_path().to_path_buf(),
+                        (to.get_relative_path().to_path_buf(), false),
+                    ));
+                }
+                None
+            })
+            .collect();
+
+        // 无句柄的源历史按 path/version 连续返回；同一 key 的保留决定只交付一次。
+        let mut last_preserved_path = None;
+        // 第二遍：按顺序执行物理操作
+        for status in statuses {
+            match status {
+                DeletionStatus::Deleted(entry) => {
+                    // 搬迁不将源缺失反向删除目标；rename 仍需推进，不能跳过整个阶段。
+                    if !is_source_reserved {
+                        if last_preserved_path.as_ref() == Some(entry.path()) {
+                            continue;
+                        }
+                        last_preserved_path = Some(entry.path().clone());
+                        broadcaster
+                            .broadcast(StorageEntryMessage::TargetPreserved {
+                                retention: Box::new(TargetRetention::entry(
+                                    entry.path(),
+                                    TargetRetentionReason::SourceCleanupPolicy,
+                                )),
+                                reason: "源端删除迁移保留目标；本轮未观察到该源项，未核验其存在性".into(),
+                            })
+                            .await?;
+                        continue;
+                    }
+                    let entry_arc = Arc::new(entry);
+                    let result = if entry_arc.get_is_dir() {
+                        deletion::delete_dir_all(dest_storage.storage(), &entry_arc).await
+                    } else {
+                        copy_namespace::delete_file(dest_storage.storage(), &entry_arc).await
+                    };
+                    match result {
+                        Ok(()) => {
+                            broadcaster.broadcast(StorageEntryMessage::Deleted(entry_arc)).await?;
+                        }
+                        Err(error) if error.is_not_found() => {
+                            broadcaster.broadcast(StorageEntryMessage::Deleted(entry_arc)).await?;
+                        }
+                        Err(e) => {
+                            error!("Phase B: Failed to delete {:?}: {}", entry_arc.get_relative_path(), e);
+                            broadcaster
+                                .broadcast(StorageEntryMessage::Error {
+                                    event: ErrorEvent::Delete,
+                                    path: entry_arc.get_relative_path().to_path_buf(),
+                                    entry: Some(entry_arc.clone()),
+                                    reason: format!("{e}"),
+                                })
+                                .await?;
+                            failure.get_or_insert(e.into());
+                        }
+                    }
+                }
+                DeletionStatus::Renamed(from, to) => {
+                    let from_arc = Arc::new(*from);
+                    let to_arc = Arc::new(*to);
+
+                    // 父目录正在被 rename 时，NFS RENAME 已传递性地移动了子条目，无需重复操作。
+                    // from_parent 分配仅在同名情况下进行，避免对名字不同的 rename 做无效分配。
+                    let skip_physical = from_arc.get_name() == to_arc.get_name() && {
+                        let from_parent = from_arc.get_relative_path().parent().map(PathBuf::from);
+                        let to_parent = to_arc.get_relative_path().parent().map(PathBuf::from);
+                        match (from_parent, to_parent) {
+                            (Some(fp), Some(tp)) => renamed_dirs
+                                .get(&fp)
+                                .is_some_and(|(path, completed)| *completed && path == &tp),
+                            _ => false,
+                        }
+                    };
+
+                    let dest_op_result = if skip_physical {
+                        Ok(RenameOutcome::Moved)
+                    } else {
+                        rename_or_copy(
+                            from_arc.clone(),
+                            to_arc.clone(),
+                            src_storage.clone(),
+                            dest_storage.clone(),
+                            RenameOptions {
+                                enable_integrity_check,
+                                enable_acl: false,
+                                resume: ResumeOpts {
+                                    job_id: job_id.into(),
+                                    job_dir: job_dir.into(),
+                                    transfer_mode,
+                                },
+                                qos: qos_manager.clone(),
+                                bytes: bytes_counter.clone(),
+                                events: broadcaster,
+                            },
+                        )
+                        .await
+                    };
+
+                    match dest_op_result {
+                        Ok(outcome) => {
+                            if outcome == RenameOutcome::Moved
+                                && let Some((_, completed)) = renamed_dirs.get_mut(from_arc.get_relative_path())
+                            {
+                                *completed = true;
+                            }
+                            // Phase A 不再把路径已变的文件判为 Changed（Fix 2a），
+                            // 此处补足 rename+changed 文件的内容/元数据同步，并广播 Changed 消息供消费者统计。
+                            if outcome == RenameOutcome::Moved
+                                && !from_arc.get_is_dir()
+                                && !from_arc.get_is_symlink()
+                                && let Some(kind) = ChangeKind::from_entry_diff(&from_arc, &to_arc)
+                            {
+                                let result = Self::sync_renamed_file_changes(
+                                    kind,
+                                    &to_arc,
+                                    &src_storage,
+                                    &dest_storage,
+                                    qos_manager.clone(),
+                                    enable_integrity_check,
+                                    true,
+                                    bytes_counter.clone(),
+                                    job_id,
+                                    job_dir,
+                                    transfer_mode,
+                                )
+                                .await;
+                                if let Err(error) = result {
+                                    broadcaster
+                                        .broadcast(StorageEntryMessage::Error {
+                                            event: ErrorEvent::Copy,
+                                            path: to_arc.get_relative_path().to_path_buf(),
+                                            entry: Some(to_arc.clone()),
+                                            reason: error.to_string(),
+                                        })
+                                        .await?;
+                                    failure.get_or_insert(error);
+                                    continue;
+                                }
+                                broadcaster
+                                    .broadcast(StorageEntryMessage::Changed {
+                                        entry: to_arc.clone().into(),
+                                        kind,
+                                    })
+                                    .await?;
+                            }
+
+                            broadcaster
+                                .broadcast(StorageEntryMessage::Renamed((from_arc, to_arc)))
+                                .await?;
+                        }
+                        Err(e) => {
+                            error!(
+                                "Phase B: Failed to rename {:?} → {:?}: {}",
+                                from_arc.get_relative_path(),
+                                to_arc.get_relative_path(),
+                                e
+                            );
+                            broadcaster
+                                .broadcast(StorageEntryMessage::Error {
+                                    event: ErrorEvent::Rename,
+                                    path: to_arc.get_relative_path().to_path_buf(),
+                                    entry: Some(to_arc.clone()),
+                                    reason: format!("{e}"),
+                                })
+                                .await?;
+                            failure.get_or_insert(e.into());
+                        }
+                    }
+                }
+            }
+        }
+        match failure {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    }
+}
