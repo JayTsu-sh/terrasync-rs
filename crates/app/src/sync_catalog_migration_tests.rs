@@ -1,4 +1,4 @@
-//! 保留源端后切换搬迁：基线无变化不传数据，仍清理对应源项。
+//! 源保留策略切换：未变化项可搬迁，已搬走的项不能反向删除目标。
 
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
@@ -9,6 +9,7 @@ use db::catalogue::ComparisonMode;
 use db::{ClickHouseConfig, ClickHouseDatabase, DatabaseError};
 use task_model::TransferMode;
 use tempfile::tempdir;
+use tokio_util::sync::CancellationToken;
 use utils::app_config::ClickHouseMode;
 use uuid::Uuid;
 
@@ -48,7 +49,7 @@ async fn unchanged_copy_is_deleted(config: &ClickHouseConfig) -> Result<()> {
     drop(database);
     let metadata = std::fs::metadata(target_root.path().join("payload"))?;
     let database = ClickHouseDatabase::connect(config, "unchanged_move").await?;
-    assert_eq!(determine_sync_type(&database, false).await?, ScanType::Incremental);
+    assert_eq!(determine_sync_type(&database).await?, ScanType::Incremental);
     database.begin_copy_generation("same-source-target", false).await?;
     let current = Arc::new(observe_path(source.storage(), Path::new("payload")).await?);
     let changes = database
@@ -75,9 +76,62 @@ async fn unchanged_copy_is_deleted(config: &ClickHouseConfig) -> Result<()> {
     Ok(())
 }
 
+async fn moved_copy_is_retained(config: &ClickHouseConfig, incomplete: bool) -> Result<()> {
+    let source_root = tempdir()?;
+    let target_root = tempdir()?;
+    std::fs::write(source_root.path().join("payload"), b"moved payload")?;
+    let source = create_storage(&source_root.path().to_string_lossy(), CreateStorageOptions::default()).await?;
+    let target = create_storage(&target_root.path().to_string_lossy(), CreateStorageOptions::default()).await?;
+    let entry = Arc::new(observe_path(source.storage(), Path::new("payload")).await?);
+    let job = format!("moved_then_retained_{incomplete}");
+    let database = ClickHouseDatabase::connect(config, &job).await?;
+    database.initialize().await?;
+    database.begin_copy_generation("same-source-target", false).await?;
+    copy_file(
+        &source,
+        &target,
+        &entry,
+        CopyOptions {
+            transfer_mode: TransferMode::Direct,
+            ..Default::default()
+        },
+        None,
+    )
+    .await?;
+    database.batch_insert_base_record(&[Arc::clone(&entry)]).await?;
+    source
+        .storage()
+        .namespace()?
+        .purge_observed(&entry, CancellationToken::new())
+        .await?;
+    if !incomplete {
+        database.commit_scan_generation().await?;
+    }
+    drop(database);
+    let before = std::fs::metadata(target_root.path().join("payload"))?;
+    let database = ClickHouseDatabase::connect(config, &job).await?;
+    assert_eq!(determine_sync_type(&database).await?, ScanType::Full);
+    database.begin_copy_generation("same-source-target", true).await?;
+    assert_eq!(database.get_count("base").await?, 0);
+    assert_eq!(database.detect_deleted_items().await?.count(), 0);
+    database.commit_scan_generation().await?;
+    assert!(!source_root.path().join("payload").exists());
+    assert_eq!(std::fs::read(target_root.path().join("payload"))?, b"moved payload");
+    let after = std::fs::metadata(target_root.path().join("payload"))?;
+    assert_eq!(
+        (before.ino(), before.ctime(), before.ctime_nsec()),
+        (after.ino(), after.ctime(), after.ctime_nsec())
+    );
+    eprintln!(
+        "moved-then-retained cluster={} incomplete={incomplete} next_full=true reverse_deletions=0 target_inode_and_ctime_unchanged=true",
+        config.cluster.is_some()
+    );
+    Ok(())
+}
+
 #[tokio::test]
 #[ignore = "requires owned ClickHouse pair from run-notification-archive-local.py --copy-generations"]
-async fn real_retained_copy_becomes_incremental_move_without_rewriting_the_target() -> Result<()> {
+async fn real_copy_source_policy_transitions_preserve_target_data() -> Result<()> {
     let dsn = std::env::var("LAB_COPY_GENERATION_DSN")
         .map_err(|_| AppError::ConfigError("LAB_COPY_GENERATION_DSN must select an isolated server".into()))?;
     let admin = Client::default().with_url(&dsn).with_user("default");
@@ -106,7 +160,14 @@ async fn real_retained_copy_becomes_incremental_move_without_rewriting_the_targe
             .execute()
             .await
             .map_err(DatabaseError::from)?;
-        let result = unchanged_copy_is_deleted(&config).await;
+        let result: Result<()> = async {
+            unchanged_copy_is_deleted(&config).await?;
+            for incomplete in [false, true] {
+                moved_copy_is_retained(&config, incomplete).await?;
+            }
+            Ok(())
+        }
+        .await;
         let cleanup = admin
             .query(&format!("DROP DATABASE {}{on_cluster} SYNC", config.database))
             .execute()

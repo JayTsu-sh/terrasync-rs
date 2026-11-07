@@ -14,10 +14,10 @@ use crate::{broadcast::BroadcastForwarder, error::Result, scan::ScanType};
 #[path = "sync_catalog_migration_tests.rs"]
 mod migration_tests;
 
-pub(crate) async fn determine_sync_type(db: &ClickHouseDatabase, source_reserved: bool) -> Result<ScanType> {
+pub(crate) async fn determine_sync_type(db: &ClickHouseDatabase) -> Result<ScanType> {
     let previous = db.copy_catalogue_source_reserved().await?;
     Ok(match previous {
-        Some(previous_reserved) if source_reserved || previous_reserved => ScanType::Incremental,
+        Some(true) => ScanType::Incremental,
         _ => ScanType::Full,
     })
 }
@@ -70,21 +70,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn deleting_source_uses_incremental_only_after_a_source_retaining_generation() -> Result<()> {
-        for (previous, reserved, expected) in [
-            (None, false, ScanType::Full),
-            (None, true, ScanType::Full),
-            (Some(false), false, ScanType::Full),
-            (Some(false), true, ScanType::Incremental),
-            (Some(true), false, ScanType::Incremental),
-            (Some(true), true, ScanType::Incremental),
+    async fn only_a_source_retaining_generation_can_be_an_incremental_baseline() -> Result<()> {
+        for (previous, expected) in [
+            (None, ScanType::Full),
+            (Some(false), ScanType::Full),
+            (Some(true), ScanType::Incremental),
         ] {
             let mock = Mock::new();
             let database = fixture_database(&mock);
             mock.add(handlers::provide([1u64]));
             mock.add(handlers::provide([1u64]));
             mock.add(handlers::provide(previous));
-            assert_eq!(determine_sync_type(&database, reserved).await?, expected);
+            assert_eq!(determine_sync_type(&database).await?, expected);
         }
         Ok(())
     }
@@ -95,7 +92,7 @@ mod tests {
         let database = fixture_database(&mock);
         mock.add(handlers::failure(StatusCode::FORBIDDEN));
         assert!(matches!(
-            determine_sync_type(&database, false).await,
+            determine_sync_type(&database).await,
             Err(AppError::DatabaseError(_))
         ));
     }

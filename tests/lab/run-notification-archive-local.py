@@ -174,7 +174,7 @@ def run_copy_generations():
         ], cwd=ROOT, env=environment, check=True)
         subprocess.run([
             "cargo", "test", "--offline", "--locked", "-p", "app", "--lib",
-            "real_retained_copy_becomes_incremental_move_without_rewriting_the_target",
+            "real_copy_source_policy_transitions_preserve_target_data",
             "--", "--ignored", "--nocapture",
         ], cwd=ROOT, env=environment, check=True)
     finally:

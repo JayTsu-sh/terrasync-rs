@@ -273,12 +273,13 @@
 
         <h3 id="baseline">3.2　base 清理与代次选择</h3>
         <div class="table-wrap"><table>
-          <caption>当前启用源端删除时，按上一复制代次选择；上一代全量／增量、成功／失败均适用</caption>
+          <caption>按上一复制代次的源保留策略选择；上一代全量／增量、成功／失败均适用</caption>
           <thead><tr><th scope="col">上一代</th><th scope="col">当前代</th><th scope="col">模式与基线</th></tr></thead>
           <tbody>
             <tr><td>无复制代次，或仅有扫描</td><td>保留或删除源端</td><td>全量；启动扫描前确认清空该 job 的 base。</td></tr>
             <tr><td>保留源端</td><td>删除源端</td><td>增量；复用已入库的复制事实；已复制且未变化项不重传数据，核验目标后仍删源，缺失或变化项先复制就绪再删源。</td></tr>
             <tr><td>删除源端</td><td>删除源端</td><td>重新全量；清空旧 base，处理当前源端，不复用已搬走对象的记录。</td></tr>
+            <tr><td>删除源端</td><td>保留源端</td><td>重新全量；清空旧 base，避免将上轮正常搬走的源项误判为反向目标删除。已存在的目标数据保留。</td></tr>
             <tr><td>保留源端</td><td>保留源端</td><td>增量；失败也重新枚举比较，不恢复扫描位置。</td></tr>
           </tbody>
         </table></div>

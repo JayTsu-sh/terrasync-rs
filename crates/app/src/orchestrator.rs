@@ -310,7 +310,7 @@ impl SyncOrchestrator {
             None
         };
         let scan_type = if let Some(database) = db_instance.as_ref() {
-            determine_sync_type(database, app_config.sync.is_source_reserved).await?
+            determine_sync_type(database).await?
         } else {
             ScanType::Full
         };

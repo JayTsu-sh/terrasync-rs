@@ -124,7 +124,7 @@ async fn source_policy_controls_baseline_reuse_even_after_an_incomplete_generati
                     copy_request_key: "same-endpoints".into(),
                     copy_source_reserved: previous_reserved,
                 }]));
-                let reset = !previous_reserved && !source_reserved;
+                let reset = !previous_reserved;
                 let mutation = if reset || incomplete {
                     Some(mock.add(handlers::record_ddl()))
                 } else {

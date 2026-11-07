@@ -96,8 +96,10 @@ impl Fixture {
     }
 }
 
-async fn transition(fixture: &Fixture, previous_reserved: bool, incomplete: bool, empty: bool) -> Result<()> {
-    let job = format!("policy_{previous_reserved}_{incomplete}_{empty}");
+async fn transition(
+    fixture: &Fixture, previous_reserved: bool, current_reserved: bool, incomplete: bool, empty: bool,
+) -> Result<()> {
+    let job = format!("policy_{previous_reserved}_{current_reserved}_{incomplete}_{empty}");
     let first = fixture.open(&job).await?;
     first.initialize().await?;
     assert_eq!(first.copy_catalogue_source_reserved().await?, None);
@@ -122,7 +124,7 @@ async fn transition(fixture: &Fixture, previous_reserved: bool, incomplete: bool
     drop(first);
     let next = fixture.open(&job).await?;
     assert_eq!(next.copy_catalogue_source_reserved().await?, Some(previous_reserved));
-    let status = next.begin_copy_generation("same-endpoints", false).await?;
+    let status = next.begin_copy_generation("same-endpoints", current_reserved).await?;
     assert_eq!(
         status,
         if incomplete && previous_reserved {
@@ -133,18 +135,21 @@ async fn transition(fixture: &Fixture, previous_reserved: bool, incomplete: bool
     );
     let expected = u64::from(previous_reserved && !empty);
     assert_eq!(next.get_count("base").await?, expected);
-    assert_eq!(next.copy_catalogue_source_reserved().await?, Some(false));
+    assert_eq!(next.copy_catalogue_source_reserved().await?, Some(current_reserved));
     next.commit_scan_generation().await?;
     drop(next);
     let third = fixture.open(&job).await?;
-    assert_eq!(third.copy_catalogue_source_reserved().await?, Some(false));
+    assert_eq!(third.copy_catalogue_source_reserved().await?, Some(current_reserved));
     assert_eq!(
         third.begin_copy_generation("same-endpoints", false).await?,
         CopyGenerationStatus::Fresh
     );
-    assert_eq!(third.get_count("base").await?, 0);
+    assert_eq!(
+        third.get_count("base").await?,
+        if current_reserved { expected } else { 0 }
+    );
     eprintln!(
-        "copy-generation cluster={} previous_reserved={previous_reserved} incomplete={incomplete} missing_rows={empty} retained={expected} next_full_empty=true",
+        "copy-generation cluster={} previous_reserved={previous_reserved} current_reserved={current_reserved} incomplete={incomplete} missing_rows={empty} retained={expected}",
         fixture.config.cluster.is_some()
     );
     Ok(())
@@ -184,9 +189,11 @@ async fn real_copy_generation_policies() -> Result<()> {
         let fixture = Fixture::new(cluster).await?;
         let result: Result<()> = async {
             for previous_reserved in [false, true] {
-                for incomplete in [false, true] {
-                    for empty in [false, true] {
-                        transition(&fixture, previous_reserved, incomplete, empty).await?;
+                for current_reserved in [false, true] {
+                    for incomplete in [false, true] {
+                        for empty in [false, true] {
+                            transition(&fixture, previous_reserved, current_reserved, incomplete, empty).await?;
+                        }
                     }
                 }
             }

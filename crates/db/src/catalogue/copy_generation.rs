@@ -1,4 +1,4 @@
-//! 复制代次准备：保留源端的事实可复用，连续删除源端的代次重新全量。
+//! 复制代次准备：保留源端的事实可复用，已删源的基线不再复用。
 
 use std::collections::HashSet;
 use std::sync::atomic::Ordering;
@@ -19,7 +19,7 @@ use crate::schema::records::StorageEntryRecord;
 /// 复制代次是否正在利用失败轮次留下的确认事实。
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CopyGenerationStatus {
-    /// 首轮、连续删除源端或上一轮已经结束，不恢复未完成代次。
+    /// 首轮、上一轮删除源端或上一轮已经结束，不恢复未完成代次。
     Fresh,
     /// 上轮复制未结束；保留确认事实，重新扫描并做增量比较。
     Recovering,
@@ -55,13 +55,13 @@ impl ClickHouseDatabase {
         let saved = self.copy_generation_state().await?;
         // scan_state 只保存已提交 C；所有失败重试复用 W=1-C，开始时不能先发布 W。
         let previous = saved.scan_state;
-        let reset = !source_reserved && !saved.copy_source_reserved;
+        let reset = !saved.copy_source_reserved;
         let recovering = !reset && !saved.copy_request_key.is_empty() && saved.copy_in_progress;
         if !saved.copy_request_key.is_empty() && saved.copy_request_key != request_key {
             return Err(DatabaseError::ConfigError("incomplete copy belongs to unknown or different source/destination/options; restore the original settings or choose a new job id".into()));
         }
         if saved.copy_request_key.is_empty() || reset {
-            // 首次复制及连续删除源端的代次不复用旧基线；清理确认后才启动扫描。
+            // 首次复制及上一轮删除源端的代次不复用旧基线；清理确认后才启动扫描。
             let base = self.catalogue_storage_table(&get_scan_base_table_name(&self.job_id))?;
             self.execute(&format!("TRUNCATE TABLE {base} SYNC"), &[]).await?;
         }

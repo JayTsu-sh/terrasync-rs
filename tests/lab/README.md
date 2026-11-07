@@ -85,12 +85,16 @@ replay itself.
 isolated ClickHouse pair for migration-generation tests. Against both Single and the
 one-shard/two-replica Cluster it checks previous source-retaining/deleting policies,
 completed/incomplete generations, present/missing copy rows, policy persistence on reopen
-and commit, and clearing the base for the next source-deleting generation. A controlled
+and commit, and clearing the base after a source-deleting generation for either current
+source policy. A controlled
 proxy disconnects and silently stalls policy reads: the typed failure must propagate,
 the policy must remain unchanged, and each request returns within its bounded timeout.
 A real Local copy then verifies that switching to source deletion classifies an unchanged
 entry without copy work, deletes its source, and leaves the target bytes, inode and ctime
-unchanged. These are catalogue/cleanup contract checks; they do not validate the pending
+unchanged. After a real Local copy and protected source purge, both a completed and an
+incomplete source-deleting generation must switch to full when retaining the source again,
+with no reverse-delete candidates and the existing target bytes, inode and ctime unchanged.
+These are catalogue/cleanup contract checks; they do not validate the pending
 change to delete before asynchronous database confirmation, the whole-job failure callback,
 version-history purge, six-replica topology or throughput/RSS targets.
 
