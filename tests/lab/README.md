@@ -98,6 +98,16 @@ These are catalogue/cleanup contract checks; they do not validate the pending
 change to delete before asynchronous database confirmation, the whole-job failure callback,
 version-history purge, six-replica topology or throughput/RSS targets.
 
+`python3 tests/lab/run-notification-archive-local.py --retention-events` checks the
+existing source-deleting migration's target-preservation branch against real Single and
+two-replica ClickHouse, real Local target contents, and an HTTP 204 callback. Twenty
+deterministic S3 history observations plus one directory produce two entry-level retention
+events, no delete/rename/error counts, and 21 preserved base rows. The HTTP receiver checks
+structured unknown-presence details; sender checks details cleared after receipt, cumulative
+count retained, and final reports still queryable in ClickHouse. S3 source history is a
+deterministic fixture, not a real S3 protocol run. This does not validate the pending relative
+window plan, source-presence probing, or whole-job throughput/RSS.
+
 `python3 tests/lab/run-notification-archive-local.py --rename-generations` uses real
 ClickHouse Single and the two-replica Cluster to compare the same file/directory,
 verify its persisted state changed, inject a connection failure, and reopen with

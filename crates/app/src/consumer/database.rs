@@ -235,6 +235,7 @@ impl Consumer for DatabaseConsumer {
                         }
                         StorageEntryMessage::CopyVersionFailed { .. }
                         | StorageEntryMessage::CopySkipped { .. }
+                        | StorageEntryMessage::TargetPreserved { .. }
                         | StorageEntryMessage::Diagnostic { .. } => {}
                     }
 

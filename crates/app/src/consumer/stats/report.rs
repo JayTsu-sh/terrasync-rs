@@ -54,6 +54,7 @@ pub enum ProgressDetail {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProgressReport {
+    pub target_preserved_count: u64,
     #[serde(default)]
     pub skipped_count: u64,
     pub job_id: String,

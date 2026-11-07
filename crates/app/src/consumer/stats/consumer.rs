@@ -16,8 +16,8 @@ use std::time::Duration;
 // 外部crate
 use data_mover::model::{EntryKind, ObservedEntry};
 use reqwest::redirect::Policy;
-use task_model::StorageEntryMessage;
 use task_model::observation::{EntryStatistics, ObservedScanEvent, ObservedView};
+use task_model::{RetentionScope, StorageEntryMessage};
 use tokio::sync::{Mutex, mpsc};
 use tokio::task::JoinHandle;
 use tokio::time::{Instant, timeout};
@@ -179,6 +179,13 @@ impl StatisticConsumer {
     pub fn update_statistics(&mut self, message: &StorageEntryMessage) {
         trace!("Updating statistics for message: {:?}", message);
         self.stats.update_from_message(message);
+        if let StorageEntryMessage::TargetPreserved { retention, reason } = message {
+            if retention.scope == RetentionScope::Entry {
+                self.callback.target_preserved_count = self.callback.target_preserved_count.saturating_add(1);
+            }
+            let retained = self.callback.outbox.enqueue_retention(retention, reason);
+            self.callback.diagnostics_incomplete |= !retained;
+        }
         if let StorageEntryMessage::CopySkipped { entry, reason } = message {
             let retained = self
                 .callback
@@ -257,6 +264,7 @@ impl StatisticConsumer {
         let mut report = self.progress_bar.to_report(self.stats.job_id());
         report.is_final = is_final;
         report.skipped_count = self.stats.skipped_count();
+        report.target_preserved_count = self.callback.target_preserved_count;
         report.task_error_count = self.callback.task_error_count;
         report.generation_committed = self.generation_committed;
         report.scan = snapshot.cloned();

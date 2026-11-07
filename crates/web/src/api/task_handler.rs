@@ -215,7 +215,7 @@ mod progress_tests {
     #[test]
     fn incremental_snapshot_counts_links_like_the_full_snapshot() -> Result<()> {
         let report: ProgressReport = serde_json::from_value(serde_json::json!({
-            "job_id":"links", "job_type":"IncrementalScan", "elapsed_secs":1.0,
+            "target_preserved_count":0, "job_id":"links", "job_type":"IncrementalScan", "elapsed_secs":1.0,
             "speed_bytes_per_sec":0.0, "is_final":true,
             "detail":{"kind":"Incremental", "scanned_files":10, "scanned_dirs":2,
                 "scanned_symlinks":4, "scanned_size":0, "transferred_bytes":0,
@@ -236,7 +236,7 @@ mod progress_tests {
         let empty = serde_json::json!({"directories":0,"regular_files":0,"symlinks":0,"block_devices":0,
             "character_devices":0,"fifos":0,"sockets":0,"unknown":0});
         let report: ProgressReport = serde_json::from_value(serde_json::json!({
-            "job_id":"scan", "job_type":"FullScan", "elapsed_secs":1.0, "speed_bytes_per_sec":0.0,
+            "target_preserved_count":0, "job_id":"scan", "job_type":"FullScan", "elapsed_secs":1.0, "speed_bytes_per_sec":0.0,
             "is_final":false, "detail":{"kind":"Full","scanned_files":2,"scanned_dirs":1,
                 "total_bytes":10,"transferred_bytes":0,"error_count":3},
             "scan":{"scanned_entries":3,"filtered_entries":0,"retained_entries":3,"complete":false,

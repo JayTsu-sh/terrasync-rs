@@ -383,7 +383,7 @@ async fn callback_http_failure_retries_same_batch_and_only_acknowledges_committe
     outbox.enqueue("scan", "reset", "first", None);
     let batch = outbox.prepare_batch().unwrap();
     let report = serde_json::json!({
-        "job_id":"task", "job_type":"FullScan", "elapsed_secs":1.0, "speed_bytes_per_sec":0.0,
+        "target_preserved_count":0, "job_id":"task", "job_type":"FullScan", "elapsed_secs":1.0, "speed_bytes_per_sec":0.0,
         "is_final":false, "callback_identity":identity, "diagnostics":batch,
         "detail":{"kind":"Full","scanned_files":0,"scanned_dirs":0,"total_bytes":0,"transferred_bytes":0,"error_count":1}
     });

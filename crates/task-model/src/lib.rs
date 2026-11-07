@@ -5,10 +5,12 @@ mod event;
 mod facts;
 pub mod metadata;
 pub mod observation;
+mod retention;
 mod transfer;
 pub use error::{Result, TaskModelError};
 pub use event::{ChangeKind, EntryChange, ErrorEvent, StorageEntryMessage};
 pub use facts::ObservedEntryExt;
+pub use retention::{RetentionScope, SourcePresence, TargetRetention, TargetRetentionReason};
 pub use transfer::TransferMode;
 
 #[cfg(test)]

@@ -52,6 +52,7 @@ pub struct CallbackState {
     pub archived_diagnostics: bool,
     pub diagnostics_incomplete: bool,
     pub task_error_count: u64,
+    pub target_preserved_count: u64,
     pub pending_acknowledgements: Vec<NotificationRecord>,
     pub unconfirmed_archive: Vec<NotificationRecord>,
     #[serde(skip)]
@@ -73,6 +74,7 @@ impl Default for CallbackState {
             archived_diagnostics: false,
             diagnostics_incomplete: false,
             task_error_count: 0,
+            target_preserved_count: 0,
             pending_acknowledgements: Vec::new(),
             unconfirmed_archive: Vec::new(),
             journal: DiagnosticJournal::default(),
@@ -106,6 +108,7 @@ impl CallbackState {
                 self.archived_diagnostics = false;
                 self.diagnostics_incomplete = false;
                 self.task_error_count = 0;
+                self.target_preserved_count = 0;
                 self.pending_acknowledgements.clear();
                 self.unconfirmed_archive.clear();
                 self.journal.reset_delivery();
@@ -151,6 +154,7 @@ impl CallbackState {
         self.archived_diagnostics = saved.archived_diagnostics || self.journal.database.is_some();
         self.diagnostics_incomplete = saved.diagnostics_incomplete;
         self.task_error_count = saved.task_error_count;
+        self.target_preserved_count = saved.target_preserved_count;
         self.pending_acknowledgements = saved.pending_acknowledgements;
         self.unconfirmed_archive = saved.unconfirmed_archive;
         self.journal.reset_delivery();

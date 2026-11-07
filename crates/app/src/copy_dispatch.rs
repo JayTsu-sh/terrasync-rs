@@ -25,6 +25,9 @@ impl CopyQueues {
     pub(crate) async fn send(&self, message: StorageEntryMessage) -> Result<()> {
         let mut hash = DefaultHasher::new();
         match &message {
+            StorageEntryMessage::TargetPreserved { retention, .. } => {
+                retention.source_path.as_deref().unwrap_or_default().hash(&mut hash)
+            }
             StorageEntryMessage::Scanned(entry)
             | StorageEntryMessage::CopySkipped { entry, .. }
             | StorageEntryMessage::CopyEntryCompleted { entry, .. }

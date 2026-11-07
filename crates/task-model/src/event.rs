@@ -1,5 +1,5 @@
 //! 任务分类与观察事件；不承担数据库、网络和存储 I/O。
-use crate::{ObservedEntryExt, observation::ObservedItem};
+use crate::{ObservedEntryExt, TargetRetention, observation::ObservedItem};
 use data_mover_model::{BackendKind, ObservedEntry};
 use serde::{Deserialize, Serialize};
 use std::{fmt, path::PathBuf, sync::Arc};
@@ -108,6 +108,11 @@ impl EntryChange {
 /// 文件操作消息枚举，用于在扫描/同步过程中传递文件状态变化
 #[derive(Debug, Clone)]
 pub enum StorageEntryMessage {
+    /// 最终决定保留目标，逐项或范围事实不增加复制失败／删除成功计数。
+    TargetPreserved {
+        retention: Box<TargetRetention>,
+        reason: String,
+    },
     /// 文件被扫描到
     Scanned(Arc<ObservedEntry>),
     /// 源对象有内容，但目标无法表示；不属于复制成功或失败，不授权删除源项。

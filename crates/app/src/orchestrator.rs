@@ -45,7 +45,7 @@ use data_mover::qos::QosManager;
 use db::ClickHouseDatabase;
 use db::{self, DeletionStatus, INCREMENTAL_SCAN_TABLE_BASE_NAME};
 use futures::FutureExt;
-use task_model::{ChangeKind, EntryChange, ErrorEvent, StorageEntryMessage};
+use task_model::{ChangeKind, EntryChange, ErrorEvent, StorageEntryMessage, TargetRetention, TargetRetentionReason};
 use tokio::sync::Semaphore;
 use tokio::task::JoinHandle;
 use tracing::{Instrument, error, info, info_span, trace, warn};
@@ -84,6 +84,10 @@ use crate::{dir_walker, tar_pack};
 #[cfg(test)]
 #[path = "orchestrator_rename_tests.rs"]
 mod rename_tests;
+
+#[cfg(test)]
+#[path = "orchestrator_retention_tests.rs"]
+mod retention_tests;
 
 /// 大文件日志阈值（512 MiB）
 const LARGE_FILE_LOG_THRESHOLD: u64 = 512 * 1024 * 1024;
@@ -1556,12 +1560,27 @@ impl SyncOrchestrator {
             })
             .collect();
 
+        // 无句柄的源历史按 path/version 连续返回；同一 key 的保留决定只交付一次。
+        let mut last_preserved_path = None;
         // 第二遍：按顺序执行物理操作
         for status in statuses {
             match status {
                 DeletionStatus::Deleted(entry) => {
                     // 搬迁不将源缺失反向删除目标；rename 仍需推进，不能跳过整个阶段。
                     if !is_source_reserved {
+                        if last_preserved_path.as_ref() == Some(entry.path()) {
+                            continue;
+                        }
+                        last_preserved_path = Some(entry.path().clone());
+                        broadcaster
+                            .broadcast(StorageEntryMessage::TargetPreserved {
+                                retention: Box::new(TargetRetention::entry(
+                                    entry.path(),
+                                    TargetRetentionReason::SourceCleanupPolicy,
+                                )),
+                                reason: "源端删除迁移保留目标；本轮未观察到该源项，未核验其存在性".into(),
+                            })
+                            .await?;
                         continue;
                     }
                     let entry_arc = Arc::new(entry);

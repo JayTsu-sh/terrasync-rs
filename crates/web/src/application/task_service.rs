@@ -355,7 +355,7 @@ mod configuration_tests {
     #[test]
     fn execution_summary_includes_incremental_symlinks() -> Result<()> {
         let report: ProgressReport = serde_json::from_value(serde_json::json!({
-            "job_id":"links", "job_type":"IncrementalScan", "elapsed_secs":1.0,
+            "target_preserved_count":0, "job_id":"links", "job_type":"IncrementalScan", "elapsed_secs":1.0,
             "speed_bytes_per_sec":0.0, "is_final":true,
             "detail":{"kind":"Incremental", "scanned_files":10, "scanned_dirs":2,
                 "scanned_symlinks":4, "scanned_size":0, "transferred_bytes":0,

@@ -3,6 +3,7 @@
 use std::collections::VecDeque;
 
 use serde::{Deserialize, Serialize};
+use task_model::{RetentionScope, TargetRetention};
 
 /// 单个回调的轮次、执行尝试和递增序号；时间相同而身份不同视为冲突。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -25,6 +26,8 @@ pub struct DiagnosticEvent {
     pub code: String,
     pub message: String,
     pub path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retention: Option<Box<TargetRetention>>,
 }
 
 /// ACK 前保持不变的明细批次；省略数也只能随对应批次确认。
@@ -132,8 +135,20 @@ impl DiagnosticOutbox {
             code: safe_diagnostic_label(code),
             message: safe_diagnostic_text(message),
             path: path.map(safe_diagnostic_text),
+            retention: None,
         };
         self.pending.push_back(event);
+        true
+    }
+
+    pub fn enqueue_retention(&mut self, retention: &TargetRetention, reason: &str) -> bool {
+        if !self.enqueue("target", "target_preserved", reason, retention.source_path.as_deref()) {
+            return false;
+        }
+        if let Some(event) = self.pending.back_mut() {
+            event.retention = Some(Box::new(retention.clone()));
+            event.sanitize();
+        }
         true
     }
 
@@ -220,6 +235,10 @@ impl DiagnosticEvent {
         self.code = safe_diagnostic_label(&self.code);
         self.message = safe_diagnostic_text(&self.message);
         self.path = self.path.as_deref().map(safe_diagnostic_text);
+        if let Some(retention) = &mut self.retention {
+            retention.source_path = retention.source_path.as_deref().map(safe_diagnostic_text);
+            retention.target_path = retention.target_path.as_deref().map(safe_diagnostic_text);
+        }
     }
 
     pub(crate) fn is_bounded(&self) -> bool {
@@ -233,6 +252,13 @@ impl DiagnosticEvent {
                 .path
                 .as_ref()
                 .is_none_or(|text| text.len() <= MAX_DIAGNOSTIC_TEXT_BYTES)
+            && self.retention.as_ref().is_none_or(|retention| {
+                (retention.scope != RetentionScope::Entry
+                    || (retention.source_path.is_some() && retention.target_path.is_some()))
+                    && [&retention.source_path, &retention.target_path]
+                        .into_iter()
+                        .all(|path| path.as_ref().is_none_or(|path| path.len() <= MAX_DIAGNOSTIC_TEXT_BYTES))
+            })
     }
 }
 

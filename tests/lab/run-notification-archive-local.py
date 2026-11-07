@@ -4,6 +4,7 @@
 import os
 import http.client
 import http.server
+import json
 from pathlib import Path
 import subprocess
 import sys
@@ -73,7 +74,7 @@ def run_isolated():
                 containers.append(container)
             print(f"isolated notification image={docker('inspect', containers[0], '--format', '{{.Image}}')}", flush=True)
             pid = docker("inspect", containers[0], "--format", "{{.State.Pid}}")
-            suite = [flag for flag in ("--copy-generations", "--rename-generations") if flag in sys.argv]
+            suite = [flag for flag in ("--copy-generations", "--rename-generations", "--retention-events") if flag in sys.argv]
             subprocess.run(["nsenter", "-t", pid, "-n", sys.executable, __file__, "--inside", *suite], cwd=ROOT, check=True)
         except BaseException:
             for container in containers:
@@ -156,6 +157,9 @@ def run_copy_generations():
     environment["LAB_COPY_GENERATION_DSN"] = f"http://{address}"
     environment["LAB_COPY_GENERATION_CONTROL"] = address
     try:
+        if "--retention-events" in sys.argv:
+            run_retention_events(environment)
+            return
         if "--rename-generations" in sys.argv:
             subprocess.run([
                 "cargo", "test", "--offline", "--locked", "-p", "db", "--lib",
@@ -183,6 +187,41 @@ def run_copy_generations():
         proxy.server_close()
 
 
+def run_retention_events(environment):
+    reports = []
+
+    class Callback(http.server.BaseHTTPRequestHandler):
+        def log_message(self, *_):
+            pass
+
+        def do_POST(self):
+            reports.append(json.loads(self.rfile.read(int(self.headers["Content-Length"]))))
+            self.send_response(204)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+
+    callback = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Callback)
+    callback.daemon_threads = True
+    threading.Thread(target=callback.serve_forever, daemon=True).start()
+    environment["LAB_TARGET_RETENTION_CALLBACK_URL"] = f"http://127.0.0.1:{callback.server_port}/progress"
+    try:
+        subprocess.run([
+            "cargo", "test", "--offline", "--locked", "-p", "app", "--lib",
+            "real_retention_events_preserve_targets_and_archive_successful_callbacks",
+            "--", "--ignored", "--nocapture",
+        ], cwd=ROOT, env=environment, check=True)
+        assert len(reports) == 4, reports
+        events = [event for report in reports for event in (report.get("diagnostics") or {}).get("events", [])]
+        assert len(events) == 4, events
+        assert all(report["target_preserved_count"] == 2 and report["detail"]["error_count"] == 0 and report["detail"]["deleted_count"] == 0 for report in reports), reports
+        assert all(event["code"] == "target_preserved" and event["retention"]["source_presence"] == "unknown" and event["retention"]["reason"] == "source_cleanup_policy" for event in events), events
+        assert all(report["diagnostics_complete"] for report in reports if not report.get("diagnostics")), reports
+        print("independent HTTP callback inspection deployments=2 retained_entries=2 errors=0 details=4 HTTP_204=accepted", flush=True)
+    finally:
+        callback.shutdown()
+        callback.server_close()
+
+
 def run_inside():
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
     for port in (8123, 8124):
@@ -196,7 +235,7 @@ def run_inside():
             time.sleep(0.2)
         else:
             raise RuntimeError(f"ClickHouse readiness timed out on port {port}")
-    if any(flag in sys.argv for flag in ("--copy-generations", "--rename-generations")):
+    if any(flag in sys.argv for flag in ("--copy-generations", "--rename-generations", "--retention-events")):
         run_copy_generations()
         return
     environment = dict(os.environ)

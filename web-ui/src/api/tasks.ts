@@ -142,6 +142,21 @@ export interface DiagnosticEvent {
   code: string
   message: string
   path: string | null
+  retention?: {
+    source_path: string | null
+    target_path: string | null
+    scope: 'entry' | 'source_range'
+    source_presence: 'unknown' | 'present' | 'absent'
+    reason:
+      | 'source_deletion_unconfirmed'
+      | 'source_cleanup_policy'
+      | 'filtered_selection'
+      | 'incomplete_enumeration'
+      | 'ambiguous_identity'
+      | 'source_query_failed'
+      | 'baseline_unavailable'
+      | 'stale_evidence'
+  }
 }
 
 export interface DiagnosticPage {
@@ -250,6 +265,7 @@ export async function deleteExecution(id: string): Promise<void> {
 }
 
 export interface TaskProgressSnapshot {
+  target_preserved_count?: number
   skipped_count?: number
   task_error_count?: number
   diagnostics_complete?: boolean
