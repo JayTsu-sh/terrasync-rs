@@ -44,6 +44,7 @@ use data_mover::model::ObservedEntry;
 use data_mover::qos::QosManager;
 use db::ClickHouseDatabase;
 use db::{self, DeletionStatus, INCREMENTAL_SCAN_TABLE_BASE_NAME};
+use futures::FutureExt;
 use task_model::{ChangeKind, EntryChange, ErrorEvent, StorageEntryMessage};
 use tokio::sync::Semaphore;
 use tokio::task::JoinHandle;
@@ -319,8 +320,9 @@ impl SyncOrchestrator {
 
         match &self.mode {
             SyncMode::Local => match scan_type {
-                ScanType::Full => self.run_sync(observation_plan).await,
-                ScanType::Incremental => self.run_incremental_sync(observation_plan).await,
+                // 任务边界隔离管线状态机的布局，避免继续嵌套到 CLI／Web 入口。
+                ScanType::Full => self.run_sync(observation_plan).boxed_local().await,
+                ScanType::Incremental => self.run_incremental_sync(observation_plan).boxed_local().await,
             },
             // 双进程模式本就是 compare-based（DestIndex 实时比对目标端），Full/Incremental
             // 在 wire protocol 和执行路径上是同一套代码，ScanType 对 Remote 是 no-op
