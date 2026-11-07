@@ -98,6 +98,8 @@ def run_inside():
     retained = client.list_object_versions(Bucket=buckets["source"], Prefix="payload")
     assert len(retained.get("Versions", [])) == 20 and not retained.get("DeleteMarkers"), retained
     print("independent S3 inspection closed_consumer target_versions=1 source_versions=20 next_version_or_entry=not_started", flush=True)
+    from target_metadata_failure import run as target_metadata_failure
+    target_metadata_failure(ROOT, environment, client, buckets)
     tag_refusals = 0
     data_refusals = 0
     fault = "tags"

@@ -31,11 +31,17 @@ pub enum StorageError {
     MetadataVerification(#[from] MetadataVerificationError),
     #[error("目标发布状态与复制结果不一致，禁止删源: {path}")]
     TargetPublicationChanged { path: StoragePath },
-    #[error("源端元数据获取失败，数据已保留且禁止删源: {path} version={version:?}, failures={failures:?}")]
+    #[error("源端元数据获取失败，禁止删源: {path} version={version:?}, failures={failures:?}")]
     SourceMetadataAcquisitionFailed {
         path: StoragePath,
         version: Option<String>,
         failures: Vec<MetadataObservationFailure>,
+    },
+    #[error("复制失败: {data}; 元数据准备同时失败: {metadata}")]
+    TransferAndMetadata {
+        #[source]
+        data: Box<StorageError>,
+        metadata: Box<StorageError>,
     },
     #[error("源端版本永久清理不可用，已保留所有历史: {path}")]
     PermanentVersionCleanupUnavailable { path: StoragePath },

@@ -30,6 +30,9 @@ use transport::in_process::create_in_process_pair;
 
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
+#[path = "s3_version_target_metadata.rs"]
+mod target_metadata;
+
 async fn segmented_sender(
     source: Arc<StorageContext>, destination: Arc<StorageContext>, entry: &Arc<ObservedEntry>, cap: usize,
 ) -> TestResult<(Result<(), AppError>, Vec<StorageEntryMessage>)> {

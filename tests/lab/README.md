@@ -80,6 +80,17 @@ source to remain identical afterwards; it does not claim a real 20-version slash
 The 20-version skip-count and remote classification cases use deterministic observations.
 Ordinary `payload` version history is independently checked against 20 real versions above.
 
+An additional target proxy refuses every tag PUT with HTTP 403 while forwarding data
+operations to the real S3 service. Whole-entry quick/full copies and history segments
+of size 1/7 must each retain all 20 data versions and count one failed entry. The two
+whole-entry runs deliver 40 concrete version errors to an HTTP 204 callback, each
+reporting 140 copied bytes. Independent inspection reads every retained target
+version and checks the original 20 source versions. Proxy counters require 80 data
+PUTs, 80 tag refusals and exactly 20 full-verification data GETs: metadata failure
+must not skip selected data verification. These checks cover the app's captured
+metadata-plan integration and data-only failure evidence; they do not prove source
+purge readiness or metadata repair without retransmission in the next generation.
+
 It also counts source tag requests through a deny-on-unneeded-read proxy. An explicit metadata
 scope for filesystem output reads only the child and empty marker tags (two requests), while
 the nonempty slash object's tag endpoint is denied and must receive no request. Latest-only

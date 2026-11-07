@@ -26,6 +26,9 @@ mod metadata_copy_tests;
 pub(crate) mod namespace;
 pub(crate) mod selection;
 pub(crate) mod transfer;
+#[cfg(test)]
+#[path = "file_copy/transfer_contract_tests.rs"]
+mod transfer_contract_tests;
 mod version_failure;
 pub(crate) use version_failure::VersionFailureContext;
 

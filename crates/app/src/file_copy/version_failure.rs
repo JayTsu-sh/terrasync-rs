@@ -2,7 +2,7 @@
 
 use data_mover::metadata::RefusalCause;
 use data_mover::model::BackendKind;
-use data_mover::transfer::TransferSide;
+use data_mover::transfer::{TransferPhase, TransferSide};
 
 use crate::error::StorageError;
 
@@ -15,6 +15,7 @@ pub(crate) struct VersionFailureContext {
 impl VersionFailureContext {
     pub fn for_error(error: &StorageError, source: BackendKind, destination: BackendKind) -> Self {
         let (phase, backend, metadata_only) = match error {
+            StorageError::TransferAndMetadata { data, .. } => return Self::for_error(data, source, destination),
             StorageError::SourceMetadataAcquisitionFailed { .. } => ("source_metadata".into(), source, true),
             StorageError::MetadataPlan(error) => {
                 let backend = match error.cause() {
@@ -27,6 +28,11 @@ impl VersionFailureContext {
             }
             StorageError::MetadataApplication(_) => ("target_metadata_apply".into(), destination, true),
             StorageError::MetadataVerification(_) => ("target_metadata_verify".into(), destination, true),
+            StorageError::Transfer(error)
+                if error.phase() == TransferPhase::Metadata && error.published_data().is_some() =>
+            {
+                ("target_metadata_apply".into(), destination, true)
+            }
             StorageError::Transfer(error) => (
                 format!("{:?}", error.phase()),
                 if error.side() == TransferSide::Source {

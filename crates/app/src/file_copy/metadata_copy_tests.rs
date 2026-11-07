@@ -8,7 +8,7 @@ use std::sync::{
 
 use data_mover::model::{FailureClass, MetadataFamily, MetadataObservation, MetadataObservations, Transience};
 
-use super::{CopyOptions, copy_file};
+use super::{CopyOptions, VersionFailureContext, copy_file, transfer};
 use crate::error::{AppError, Result, StorageError};
 use crate::scan::observe_path;
 use crate::storage_factory::{CreateStorageOptions, create_storage};
@@ -70,5 +70,59 @@ async fn failed_source_metadata_does_not_block_data_and_reports_every_failed_fam
     assert_eq!(std::fs::read(target_root.path().join("file"))?, b"readable payload");
     assert_eq!(std::fs::read(source_root.path().join("file"))?, b"readable payload");
     assert_eq!(bytes.load(Ordering::Relaxed), b"readable payload".len() as u64);
+    Ok(())
+}
+
+#[tokio::test]
+async fn data_and_source_metadata_failures_are_both_preserved_with_zero_completed_bytes()
+-> std::result::Result<(), Box<dyn std::error::Error>> {
+    let source_root = tempfile::tempdir()?;
+    let target_root = tempfile::tempdir()?;
+    std::fs::write(source_root.path().join("file"), b"payload")?;
+    std::fs::write(target_root.path().join("file"), b"old target")?;
+    let source = create_storage(source_root.path().to_str().unwrap(), CreateStorageOptions::default()).await?;
+    let target = create_storage(target_root.path().to_str().unwrap(), CreateStorageOptions::default()).await?;
+    let entry = Arc::new(
+        observe_path(source.storage(), Path::new("file")).await?.with_metadata(
+            MetadataObservations::new(
+                MetadataObservation::NotRequested,
+                MetadataObservation::NotRequested,
+                MetadataObservation::NotRequested,
+                MetadataObservation::NotRequested,
+                MetadataObservation::Failed {
+                    class: FailureClass::Timeout,
+                    transience: Transience::Transient,
+                },
+            )
+            .map_err(StorageError::from)?,
+        ),
+    );
+    std::fs::remove_file(source_root.path().join("file"))?;
+    let bytes = Arc::new(AtomicU64::new(0));
+    let error = transfer::copy_current(
+        &source,
+        &target,
+        &entry,
+        &CopyOptions {
+            bytes_counter: Some(bytes.clone()),
+            ..Default::default()
+        },
+        None,
+    )
+    .await
+    .unwrap_err();
+    let StorageError::TransferAndMetadata { data, metadata } = &error else {
+        panic!("both causes must remain typed: {error:?}");
+    };
+    assert!(matches!(data.as_ref(), StorageError::Transfer(_)));
+    assert!(
+        matches!(metadata.as_ref(), StorageError::SourceMetadataAcquisitionFailed { failures, .. } if failures.len() == 1)
+    );
+    let context = VersionFailureContext::for_error(&error, source.roles.kind(), target.roles.kind());
+    assert!(!context.metadata_only);
+    assert!(error.to_string().contains("源端元数据获取失败"));
+    assert!(error.to_string().contains("Timeout"));
+    assert_eq!(bytes.load(Ordering::Relaxed), 0);
+    assert_eq!(std::fs::read(target_root.path().join("file"))?, b"old target");
     Ok(())
 }
