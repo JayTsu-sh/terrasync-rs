@@ -26,14 +26,17 @@ impl CopyQueues {
         let mut hash = DefaultHasher::new();
         match &message {
             StorageEntryMessage::Scanned(entry)
+            | StorageEntryMessage::CopyEntryCompleted { entry, .. }
             | StorageEntryMessage::Packaged(entry)
             | StorageEntryMessage::Deleted(entry)
             | StorageEntryMessage::IntegrityChecked(entry) => entry.path().as_str().hash(&mut hash),
-            StorageEntryMessage::New(item) | StorageEntryMessage::Changed { entry: item, .. } => {
-                item.entry.path().as_str().hash(&mut hash)
-            }
+            StorageEntryMessage::New(item)
+            | StorageEntryMessage::Changed { entry: item, .. }
+            | StorageEntryMessage::CopyVersionFailed { entry: item, .. } => item.entry.path().as_str().hash(&mut hash),
             StorageEntryMessage::Renamed((_, to)) => to.path().as_str().hash(&mut hash),
-            StorageEntryMessage::Error { path, .. } => path.hash(&mut hash),
+            StorageEntryMessage::Error { path, .. } | StorageEntryMessage::Diagnostic { path, .. } => {
+                path.hash(&mut hash)
+            }
             StorageEntryMessage::TarManifest { tar_path, .. } => tar_path.hash(&mut hash),
         }
         let index = hash.finish() as usize % self.senders.len();

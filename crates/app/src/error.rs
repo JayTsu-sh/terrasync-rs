@@ -47,6 +47,12 @@ impl Display for CopyStep {
 /// 应用程序的专用错误枚举
 #[derive(Error, Debug)]
 pub enum AppError {
+    #[error("{source}")]
+    ReportedCopyFailure {
+        #[source]
+        source: Box<AppError>,
+        data_failed: bool,
+    },
     #[error("Failed to {step} {path:?}: {source}")]
     CopyEntryFailed {
         step: CopyStep,
@@ -279,6 +285,21 @@ pub enum AppError {
 pub type Result<T> = std::result::Result<T, AppError>;
 
 impl AppError {
+    pub(crate) fn is_reported_copy_failure(&self) -> bool {
+        match self {
+            Self::ReportedCopyFailure { .. } => true,
+            Self::CopyEntryFailed { source, .. } => source.is_reported_copy_failure(),
+            _ => false,
+        }
+    }
+
+    pub(crate) fn reported_copy_data_failed(&self) -> bool {
+        match self {
+            Self::ReportedCopyFailure { data_failed, .. } => *data_failed,
+            Self::CopyEntryFailed { source, .. } => source.reported_copy_data_failed(),
+            _ => false,
+        }
+    }
     pub(crate) fn copy_entry_failure(step: CopyStep, path: &Path, source: impl Into<Self>) -> Self {
         Self::CopyEntryFailed {
             step,
@@ -289,7 +310,7 @@ impl AppError {
 
     pub fn storage_error(&self) -> Option<&StorageError> {
         match self {
-            Self::CopyEntryFailed { source, .. } => source.storage_error(),
+            Self::CopyEntryFailed { source, .. } | Self::ReportedCopyFailure { source, .. } => source.storage_error(),
             Self::StorageError(error) => Some(error),
             Self::ScanStorageAndDatabaseFailure { source, .. } => Some(source),
             _ => None,

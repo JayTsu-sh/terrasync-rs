@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use indicatif::{ProgressBar as IndicatifBar, ProgressStyle};
 use task_model::StorageEntryMessage;
-use task_model::observation::EntryStatistics;
+use task_model::observation::{EntryProgress, EntryStatistics};
 use tracing::info;
 
 use super::accumulator::{IncrementalStats, fmt_elapsed, format_bytes};
@@ -289,11 +289,26 @@ impl ProgressBar {
         let (entry, operation) = match message {
             StorageEntryMessage::Scanned(entry) | StorageEntryMessage::Packaged(entry) => (entry, "scanned"),
             StorageEntryMessage::New(item) => {
+                if matches!(&self.counters, CounterSet::Full(_)) && item.entry.history().is_some() {
+                    return;
+                }
                 let operation = match &self.counters {
                     CounterSet::Full(_) => "scanned",
                     CounterSet::Incremental(_) => "new",
                 };
                 self.update_observed(operation, &item.view());
+                return;
+            }
+            StorageEntryMessage::CopyEntryCompleted { entry, logical_bytes } => {
+                if matches!(&self.counters, CounterSet::Full(_)) {
+                    self.update_observed(
+                        "scanned",
+                        &EntryProgress {
+                            entry,
+                            logical_bytes: *logical_bytes,
+                        },
+                    );
+                }
                 return;
             }
             StorageEntryMessage::Changed { entry, .. } => {
@@ -306,7 +321,10 @@ impl ProgressBar {
                 CounterSet::Full(_) => (entry, "scanned"),
                 CounterSet::Incremental(_) => return,
             },
-            StorageEntryMessage::Error { .. } => {
+            StorageEntryMessage::Error { .. }
+            | StorageEntryMessage::CopyVersionFailed {
+                first_in_entry: true, ..
+            } => {
                 match &self.counters {
                     CounterSet::Full(c) => {
                         c.error_count.fetch_add(1, Ordering::Relaxed);
@@ -317,7 +335,11 @@ impl ProgressBar {
                 }
                 return;
             }
-            StorageEntryMessage::TarManifest { .. } => return,
+            StorageEntryMessage::Diagnostic { .. }
+            | StorageEntryMessage::TarManifest { .. }
+            | StorageEntryMessage::CopyVersionFailed {
+                first_in_entry: false, ..
+            } => return,
         };
         for view in task_model::observation::ObservedView::all(entry) {
             match &self.counters {

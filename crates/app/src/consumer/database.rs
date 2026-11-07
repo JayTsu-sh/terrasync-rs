@@ -206,7 +206,9 @@ impl Consumer for DatabaseConsumer {
                             )
                             .await;
                         }
-                        StorageEntryMessage::IntegrityChecked(_) | StorageEntryMessage::Packaged(_) => {
+                        StorageEntryMessage::IntegrityChecked(_)
+                        | StorageEntryMessage::Packaged(_)
+                        | StorageEntryMessage::CopyEntryCompleted { .. } => {
                             // 完整性检查/Packaged 操作，不做数据库操作
                         }
                         StorageEntryMessage::TarManifest {
@@ -231,6 +233,7 @@ impl Consumer for DatabaseConsumer {
                                 "db: error entry, skipping"
                             );
                         }
+                        StorageEntryMessage::CopyVersionFailed { .. } | StorageEntryMessage::Diagnostic { .. } => {}
                     }
 
                     processed_count += 1;

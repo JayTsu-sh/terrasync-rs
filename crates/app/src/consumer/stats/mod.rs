@@ -14,6 +14,9 @@ pub mod progress_bar;
 pub(crate) mod recovery_progress;
 pub mod report;
 
+#[cfg(test)]
+mod entry_count_tests;
+
 // 重新导出：上层只需 `use crate::consumer::stats::*` 即可拿到常用类型
 pub use accumulator::{
     DeltaCounts, ErrorStats, FileSizeRange, FullStats, IncrementalStats, StatsKind, TimeRange,

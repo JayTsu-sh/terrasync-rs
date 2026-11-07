@@ -23,7 +23,7 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 
 // 外部crate
-use crate::file_copy::CopyOptions;
+use crate::file_copy::{CopyOptions, VersionCopyScope};
 use crate::storage_factory::StorageContext;
 use data_mover::model::ObservedEntry;
 use data_mover::qos::QosManager;
@@ -263,7 +263,7 @@ pub(crate) async fn process_versioned_entry(
             },
             &resume.job_id,
             &broadcaster,
-            change,
+            VersionCopyScope::SelectedVersion(change),
         )
         .await;
     }
@@ -752,7 +752,7 @@ mod native_completion_tests {
     }
 
     #[test]
-    fn completion_shares_history_and_counts_each_selected_version_once() {
+    fn completion_shares_version_facts_and_counts_the_whole_entry_once() {
         let entry = history(false);
         let mut stats = FullStats::new(JobType::Copy, "selected".into(), String::new(), String::new());
         let completed: Vec<_> = crate::file_copy::selected_copy_items(&entry, true).collect();
@@ -764,7 +764,12 @@ mod native_completion_tests {
             let event = StorageEntryMessage::New(item);
             stats.update_from_message(&event);
         }
-        assert_eq!(stats.regular_file_count, 3);
+        assert_eq!(stats.regular_file_count, 0);
+        stats.update_from_message(&StorageEntryMessage::CopyEntryCompleted {
+            entry: Arc::clone(&entry),
+            logical_bytes: 37,
+        });
+        assert_eq!(stats.regular_file_count, 1);
         assert_eq!(stats.regular_file_size, 37);
         assert_eq!(ids, ["old", "null", "latest"]);
 

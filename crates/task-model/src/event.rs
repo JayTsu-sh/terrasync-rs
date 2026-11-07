@@ -1,6 +1,6 @@
 //! 任务分类与观察事件；不承担数据库、网络和存储 I/O。
 use crate::{ObservedEntryExt, observation::ObservedItem};
-use data_mover_model::ObservedEntry;
+use data_mover_model::{BackendKind, ObservedEntry};
 use serde::{Deserialize, Serialize};
 use std::{fmt, path::PathBuf, sync::Arc};
 
@@ -112,6 +112,25 @@ pub enum StorageEntryMessage {
     Scanned(Arc<ObservedEntry>),
     /// 新增文件
     New(ObservedItem),
+    /// 一个历史分段 entry 的全部所选版本已复制并通过元数据校验；版本行另行落库。
+    CopyEntryCompleted {
+        entry: Arc<ObservedEntry>,
+        logical_bytes: u64,
+    },
+    /// 版本错误逐条交付；同一 entry 仅首个错误推进失败计数。
+    CopyVersionFailed {
+        entry: ObservedItem,
+        phase: String,
+        backend: BackendKind,
+        reason: String,
+        first_in_entry: bool,
+    },
+    /// 仅交付具体原因；entry 级失败由对应执行结果计数，避免阶段间重复累计。
+    Diagnostic {
+        event: ErrorEvent,
+        path: PathBuf,
+        reason: String,
+    },
     /// 文件已变更（kind 区分 data/metadata/both）
     Changed { entry: ObservedItem, kind: ChangeKind },
     /// 文件已删除

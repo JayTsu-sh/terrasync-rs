@@ -12,7 +12,7 @@ use task_model::ObservedEntryExt;
 // 外部 crate
 use crate::storage_factory::StorageContext;
 use crate::task_stream::AsyncReceiver;
-use data_mover::model::ObservedEntry;
+use data_mover::model::{EntryKind, ObservedEntry, StoragePath};
 use data_mover::qos::QosManager;
 use task_model::StorageEntryMessage;
 use tracing::{error, info};
@@ -22,11 +22,10 @@ use transport::traits::SenderTransport;
 // 内部模块
 use crate::broadcast::BroadcastForwarder;
 use crate::error::{AppError, Result};
-use crate::file_copy::CopyOptions;
 use crate::file_copy::copy_versions;
+use crate::file_copy::{CopyOptions, VersionCopyScope};
 use crate::receiver::ReceiverConfig;
 use crate::tar_pack;
-use task_model::EntryChange;
 use task_model::observation::ObservedItem;
 
 /// Sender worker 配置
@@ -52,10 +51,18 @@ pub async fn sender_worker(
 ) -> Result<()> {
     info!("[Sender Worker {}] Started", worker_id);
     let mut failure = None;
+    let mut blocked_history: Option<(StoragePath, EntryKind, String)> = None;
 
     while let Some(msg) = walkdir_iter.next().await {
         match msg {
+            StorageEntryMessage::Diagnostic { .. } => broadcaster.broadcast(msg).await,
             StorageEntryMessage::Scanned(entry) => {
+                if blocked_history
+                    .as_ref()
+                    .is_some_and(|(path, kind, _)| path != entry.path() || *kind != entry.kind())
+                {
+                    blocked_history = None;
+                }
                 active_entry_counter.fetch_add(1, Ordering::Relaxed);
                 entry_counter.fetch_add(1, Ordering::Relaxed);
                 size_counter.fetch_add(entry.get_size(), Ordering::Relaxed);
@@ -70,6 +77,25 @@ pub async fn sender_worker(
                 }
 
                 let result = if entry.history().is_some() {
+                    if let Some((_, _, reason)) = &blocked_history {
+                        for (index, item) in ObservedItem::all(&entry).enumerate() {
+                            broadcaster
+                                .broadcast(StorageEntryMessage::CopyVersionFailed {
+                                    entry: item,
+                                    phase: "blocked_by_prior_version".into(),
+                                    backend: dest_storage.storage().kind(),
+                                    reason: format!(
+                                        "历史分段 {} 未执行：此前版本的数据复制失败：{reason}",
+                                        entry.history().map_or(0, |history| history.segment())
+                                    ),
+                                    // 分段交付的每个 entry 独立计数，段内版本共享一次失败。
+                                    first_in_entry: index == 0,
+                                })
+                                .await;
+                        }
+                        active_entry_counter.fetch_sub(1, Ordering::Relaxed);
+                        continue;
+                    }
                     // 同一路径的分段由固定 worker 顺序复制，不经过第二级竞争队列。
                     copy_versions(
                         ObservedItem::all(&entry),
@@ -84,13 +110,16 @@ pub async fn sender_worker(
                         },
                         &copy_config.job_id,
                         broadcaster,
-                        EntryChange::New,
+                        VersionCopyScope::WholeEntry,
                     )
                     .await
                 } else {
                     send_entry(worker_id, &transport, &entry).await
                 };
                 if let Err(error) = result {
+                    if error.reported_copy_data_failed() {
+                        blocked_history = Some((entry.path().clone(), entry.kind(), error.to_string()));
+                    }
                     failure.get_or_insert(error);
                 }
 

@@ -116,6 +116,7 @@ impl StorageContext {
     async fn walkdir_with_root_policy(
         &self, sub: Option<&Path>, options: WalkOptions, report_root: bool,
     ) -> Result<WalkDirAsyncIterator> {
+        let migration_metadata = options.observation_plan.is_some();
         let required_tags = match options.observation_plan {
             Some(plan) => plan.tags() == ObservationMode::Required,
             None => tags_required(&self.roles, options.include_tags)?,
@@ -191,11 +192,9 @@ impl StorageContext {
                             reason
                         },
                     },
-                    TraversalItem::ObservationFailure(failure) => StorageEntryMessage::Error {
-                        event: ErrorEvent::Scan,
-                        path: PathBuf::from(failure.path.as_str()),
-                        entry: None,
-                        reason: {
+                    TraversalItem::ObservationFailure(failure) => {
+                        let path = PathBuf::from(failure.path.as_str());
+                        let reason = {
                             let error = StorageError::TraversalObservation(failure);
                             let reason = error.to_string();
                             stored_error
@@ -203,8 +202,22 @@ impl StorageContext {
                                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                                 .get_or_insert(error);
                             reason
-                        },
-                    },
+                        };
+                        if migration_metadata {
+                            StorageEntryMessage::Diagnostic {
+                                event: ErrorEvent::Scan,
+                                path,
+                                reason,
+                            }
+                        } else {
+                            StorageEntryMessage::Error {
+                                event: ErrorEvent::Scan,
+                                path,
+                                entry: None,
+                                reason,
+                            }
+                        }
+                    }
                     _ => continue,
                 };
                 if tx.send(message).await.is_err() {

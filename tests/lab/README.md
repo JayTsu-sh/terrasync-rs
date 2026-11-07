@@ -43,6 +43,18 @@ identifier and call `cleanup-run.sh` from an `always()` step.
 
 Management traffic uses `10.131.9.0/20`. Test data uses `10.10.1.0/24`.
 Credentials are provisioned on the self-hosted runner and must not be committed.
+
+`python3 tests/lab/run-version-entry-count-local.py` provides an isolated real S3 check for
+versioned-source full-copy accounting. It requires local `docker`, `nsenter`, `boto3`, cached
+Rust dependencies, and a cached RustFS image (`MIGRATION_S3_IMAGE` overrides the image).
+It seeds 20 versions, runs the app copy pipeline into latest-only and versioned targets, checks
+one completed entry in the statistics/progress report, and independently verifies one versus
+20 destination versions and the retained source. A proxy then denies source tag reads: all
+20 data versions must remain published, failure accounting must be one entry, and a real HTTP
+callback must receive and acknowledge all 20 version-specific reasons. Denied source data reads
+also check that later versions and history segments stop publishing, with failure counts following
+the delivered entry boundaries. Its container and volumes are removed on exit. This check does
+not cover ClickHouse acknowledgement, callback outages, or the shared network recovery window.
 NFS fixtures use UID/GID 1000 to match the non-root GitHub runner, allowing
 metadata preservation to be verified without privileged local writes.
 

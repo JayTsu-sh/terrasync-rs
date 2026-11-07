@@ -59,6 +59,7 @@ use crate::consumer::ConsumerManager;
 use crate::copy_completion;
 use crate::copy_execution::{CopyLease, begin_copy_catalogue};
 use crate::error::{AppError, Result};
+use crate::file_copy::VersionFailureContext;
 #[cfg(feature = "license")]
 use crate::integrity_check::verify_storage_time;
 use crate::migration_plan::MigrationPlan;
@@ -526,14 +527,33 @@ impl SyncOrchestrator {
                                             entry.get_relative_path(),
                                             e
                                         );
-                                        bc.broadcast(StorageEntryMessage::Error {
-                                            event: ErrorEvent::Copy,
-                                            path: entry.get_relative_path().to_path_buf(),
-                                            entry: Some(entry.clone()),
-                                            reason: format!("{e}"),
+                                        let context = e.storage_error().map_or_else(
+                                            || VersionFailureContext {
+                                                phase: "copy_entry".into(),
+                                                backend: dest.storage().kind(),
+                                                metadata_only: false,
+                                            },
+                                            |error| {
+                                                VersionFailureContext::for_error(
+                                                    error,
+                                                    src.storage().kind(),
+                                                    dest.storage().kind(),
+                                                )
+                                            },
+                                        );
+                                        let data_failed = !context.metadata_only;
+                                        bc.broadcast(StorageEntryMessage::CopyVersionFailed {
+                                            entry: entry.clone().into(),
+                                            phase: context.phase,
+                                            backend: context.backend,
+                                            reason: e.to_string(),
+                                            first_in_entry: true,
                                         })
                                         .await;
-                                        failure.get_or_insert(e);
+                                        failure.get_or_insert(AppError::ReportedCopyFailure {
+                                            source: Box::new(e),
+                                            data_failed,
+                                        });
                                     }
                                 }
                             }
@@ -672,11 +692,11 @@ impl SyncOrchestrator {
         let consumers_result = finish_phase(consumer_handles).await;
         let source_result = walkdir_iter.take_error().map_or(Ok(()), |error| Err(error.into()));
         let result: Result<()> = async {
-            source_result
-                .and(senders_result)
+            senders_result
                 .and(receivers_result)
                 .and(consumers_result)
-                .and(source_dispatch_result)?;
+                .and(source_dispatch_result)
+                .and(source_result)?;
             if let Some(database) = &database {
                 let destination = Arc::new(
                     create_storage_for_role(
@@ -705,7 +725,7 @@ impl SyncOrchestrator {
         }
         .await;
         if let Err(error) = &result {
-            consumer_manager.record_task_failures(&[error.to_string()]).await;
+            consumer_manager.record_task_error(&error).await;
         }
         consumer_manager.end_lifecycle().await;
         result?;
@@ -1278,7 +1298,7 @@ impl SyncOrchestrator {
             if let Some(ref qos_mgr) = qos_manager {
                 qos_mgr.shutdown();
             }
-            consumer_manager.record_task_failures(&[error.to_string()]).await;
+            consumer_manager.record_task_error(&error).await;
             consumer_manager.end_lifecycle().await;
             return Err(error);
         }
@@ -1353,7 +1373,7 @@ impl SyncOrchestrator {
         }
         .await;
         if let Err(error) = &result {
-            consumer_manager.record_task_failures(&[error.to_string()]).await;
+            consumer_manager.record_task_error(&error).await;
         }
         consumer_manager.end_lifecycle().await;
         result?;

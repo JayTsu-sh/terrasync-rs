@@ -21,6 +21,39 @@ pub trait EntryStatistics {
     fn get_is_regular_file(&self) -> bool;
     fn get_mtime(&self) -> i64;
 }
+
+/// entry 阶段计数借用原始观察，字节数使用该阶段实际选择的版本载荷总量。
+pub struct EntryProgress<'a> {
+    pub entry: &'a ObservedEntry,
+    pub logical_bytes: u64,
+}
+
+impl EntryStatistics for EntryProgress<'_> {
+    fn get_size(&self) -> u64 {
+        self.logical_bytes
+    }
+    fn get_name(&self) -> &str {
+        ObservedEntryExt::get_name(self.entry)
+    }
+    fn get_relative_path(&self) -> &Path {
+        ObservedEntryExt::get_relative_path(self.entry)
+    }
+    fn get_extension(&self) -> Option<&str> {
+        ObservedEntryExt::get_extension(self.entry)
+    }
+    fn get_is_dir(&self) -> bool {
+        ObservedEntryExt::get_is_dir(self.entry)
+    }
+    fn get_is_symlink(&self) -> bool {
+        ObservedEntryExt::get_is_symlink(self.entry)
+    }
+    fn get_is_regular_file(&self) -> bool {
+        ObservedEntryExt::get_is_regular_file(self.entry)
+    }
+    fn get_mtime(&self) -> i64 {
+        ObservedEntryExt::get_mtime(self.entry)
+    }
+}
 impl EntryStatistics for ObservedEntry {
     fn get_size(&self) -> u64 {
         ObservedEntryExt::get_size(self)

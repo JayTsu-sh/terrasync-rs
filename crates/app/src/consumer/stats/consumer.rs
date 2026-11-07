@@ -155,9 +155,37 @@ impl StatisticConsumer {
         trace!("Updating statistics for message: {:?}", message);
         self.stats.update_from_message(message);
         self.progress_bar.update_statistics(message);
+        if let StorageEntryMessage::CopyVersionFailed {
+            entry,
+            phase,
+            backend,
+            reason,
+            ..
+        } = message
+        {
+            let version = if entry.view().version_id().is_empty() {
+                "current"
+            } else {
+                entry.view().version_id()
+            };
+            let reason = safe_diagnostic_text(&format!(
+                "version={} backend={backend:?} phase={phase}: {reason}",
+                version
+            ));
+            let path = entry.view().source_path().ok();
+            self.callback.outbox.enqueue(
+                "copy",
+                "copy_version_failed",
+                &reason,
+                path.as_ref().map(|path| path.as_str()),
+            );
+            self.callback.runtime.current_error = Some(reason);
+            self.callback.runtime.state = ScanRuntimePhase::Failed;
+        }
         if let StorageEntryMessage::Error {
             event, path, reason, ..
-        } = message
+        }
+        | StorageEntryMessage::Diagnostic { event, path, reason } = message
         {
             let reason = safe_diagnostic_text(reason);
             self.callback

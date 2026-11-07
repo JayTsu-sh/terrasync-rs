@@ -7,16 +7,17 @@ use data_mover::storage::CopiedValueTarget;
 use data_mover::transfer::TransferPolicy;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
-use task_model::observation::ObservedItem;
+use task_model::observation::{EntryStatistics, ObservedItem};
 use task_model::{EntryChange, StorageEntryMessage};
 use task_model::{ObservedEntryExt, TransferMode};
 use tokio_util::sync::CancellationToken;
+use tracing::error;
 
 use crate::byte_resume::CommitCallback;
 use crate::storage_factory::StorageContext;
 use data_mover::model::ObservedEntry;
 
-use crate::error::{AppError, Result};
+use crate::error::{AppError, Result, StorageError};
 
 pub(crate) mod metadata;
 #[cfg(test)]
@@ -24,6 +25,8 @@ pub(crate) mod metadata;
 mod metadata_copy_tests;
 pub(crate) mod namespace;
 pub(crate) mod transfer;
+mod version_failure;
+pub(crate) use version_failure::VersionFailureContext;
 
 #[derive(Clone, Default)]
 pub struct CopyOptions {
@@ -108,7 +111,7 @@ pub(crate) async fn copy_file(
             .ok_or_else(|| AppError::ConfigError("HDFS recoverable copy requires a stable job identity".to_string()))?;
         options.transfer_mode = context.transfer_mode();
         transfer::copy_current(from, to, entry, &options, Some(context.transfer_identity())).await?;
-        (context.on_committed)(0, entry.get_size());
+        (context.on_committed)(0, ObservedEntryExt::get_size(entry.as_ref()));
     } else {
         transfer::copy_entry(from, to, entry, options).await?;
     }
@@ -118,17 +121,47 @@ pub(crate) async fn copy_file(
 /// 全量与增量共用源端确认的逐版本顺序；每个目标版本提交后才发送对应的完成事件。
 pub(crate) async fn copy_versions<I: Iterator<Item = ObservedItem> + Send>(
     items: I, from: &StorageContext, to: &StorageContext, options: CopyOptions, job_id: &str,
-    broadcaster: &BroadcastForwarder<StorageEntryMessage>, change: EntryChange,
+    broadcaster: &BroadcastForwarder<StorageEntryMessage>, scope: VersionCopyScope,
 ) -> Result<()> {
+    let change = match scope {
+        VersionCopyScope::WholeEntry => EntryChange::New,
+        VersionCopyScope::SelectedVersion(change) => change,
+    };
     let keep_history = to.storage().staged_destination()?.keeps_history().await?;
     let hdfs = if to.storage().kind() == BackendKind::Hdfs {
         Some(HdfsCopyContext::from_job(job_id, options.transfer_mode)?)
     } else {
         None
     };
+    let mut completed_entry = None;
+    let mut logical_bytes = 0_u64;
+    let mut first_failure: Option<StorageError> = None;
+    let mut data_failed = false;
     for item in items.filter(|item| retain_version(item, keep_history)) {
-        if !to.storage().holds_directory_objects() && item.entry.kind() == EntryKind::Directory {
-            copy_namespace::create_dir_all(to.storage(), &item.entry).await?;
+        if data_failed {
+            broadcaster
+                .broadcast(StorageEntryMessage::CopyVersionFailed {
+                    entry: item,
+                    phase: "blocked_by_prior_version".into(),
+                    backend: to.storage().kind(),
+                    reason: format!(
+                        "此前版本的数据复制失败，未执行此版本：{}",
+                        first_failure.as_ref().map(ToString::to_string).unwrap_or_default()
+                    ),
+                    first_in_entry: false,
+                })
+                .await;
+            continue;
+        }
+        if scope == VersionCopyScope::WholeEntry
+            && completed_entry
+                .as_ref()
+                .is_some_and(|completed| !Arc::ptr_eq(completed, &item.entry))
+        {
+            return Err(AppError::CopyError("WholeEntry 复制范围不能混入其他 entry".into()));
+        }
+        let result = if !to.storage().holds_directory_objects() && item.entry.kind() == EntryKind::Directory {
+            copy_namespace::create_dir_all(to.storage(), &item.entry).await
         } else {
             transfer::copy_item(
                 from,
@@ -137,11 +170,66 @@ pub(crate) async fn copy_versions<I: Iterator<Item = ObservedItem> + Send>(
                 &options,
                 hdfs.as_ref().map(HdfsCopyContext::transfer_identity),
             )
-            .await?;
+            .await
+        };
+        if let Err(error) = result {
+            if matches!(scope, VersionCopyScope::SelectedVersion(_)) {
+                return Err(error.into());
+            }
+            let context = VersionFailureContext::for_error(&error, from.storage().kind(), to.storage().kind());
+            error!(
+                path = %item.entry.path(),
+                version = item.view().version_id(),
+                phase = %context.phase,
+                backend = ?context.backend,
+                error = %error,
+                "版本复制失败"
+            );
+            broadcaster
+                .broadcast(StorageEntryMessage::CopyVersionFailed {
+                    entry: item,
+                    phase: context.phase,
+                    backend: context.backend,
+                    reason: error.to_string(),
+                    first_in_entry: first_failure.is_none(),
+                })
+                .await;
+            if context.metadata_only {
+                first_failure.get_or_insert(error);
+            } else {
+                data_failed = true;
+                // 后续版本被阻断时必须指向实际的数据错误，不能误用此前的元数据错误。
+                first_failure = Some(error);
+            }
+            // 数据已经发布；元数据失败不阻断该 entry 后续版本的数据复制。
+            continue;
         }
+        logical_bytes = logical_bytes
+            .checked_add(item.view().payload().get_size())
+            .ok_or_else(|| AppError::CopyError("所选版本的复制字节总量超出统计上限".into()))?;
+        completed_entry.get_or_insert_with(|| Arc::clone(&item.entry));
         broadcaster.broadcast(change.message(item)).await;
     }
+    if let Some(error) = first_failure {
+        return Err(AppError::ReportedCopyFailure {
+            source: Box::new(AppError::StorageError(error)),
+            data_failed,
+        });
+    }
+    if scope == VersionCopyScope::WholeEntry
+        && let Some(entry) = completed_entry
+    {
+        broadcaster
+            .broadcast(StorageEntryMessage::CopyEntryCompleted { entry, logical_bytes })
+            .await;
+    }
     Ok(())
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub(crate) enum VersionCopyScope {
+    WholeEntry,
+    SelectedVersion(EntryChange),
 }
 
 /// 借用原生历史选择目标实际保留的版本，不分配或复制版本列表。

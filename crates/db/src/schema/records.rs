@@ -204,6 +204,11 @@ impl IncrementalStorageEntryRecord {
     pub fn from_message(message: &StorageEntryMessage) -> Result<Vec<Self>> {
         let now = i64::try_from(SystemTime::now().duration_since(SystemTime::UNIX_EPOCH)?.as_nanos())?;
         let (entry, operation, comment) = match message {
+            StorageEntryMessage::CopyEntryCompleted { .. }
+            | StorageEntryMessage::CopyVersionFailed { .. }
+            | StorageEntryMessage::Diagnostic { .. } => {
+                return Ok(Vec::new());
+            }
             StorageEntryMessage::Scanned(entry) => (entry, "scanned", None),
             StorageEntryMessage::Packaged(entry) => (entry, "packaged", None),
             StorageEntryMessage::New(item) => {

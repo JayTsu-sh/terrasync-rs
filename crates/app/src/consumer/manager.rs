@@ -607,6 +607,13 @@ impl ConsumerManager {
         }
     }
 
+    pub(crate) async fn record_task_error(&self, error: &AppError) {
+        // 版本执行器已经交付 entry 失败及逐版本原因，收尾不能再增加一次相同失败。
+        if !error.is_reported_copy_failure() {
+            self.record_task_failures(&[error.to_string()]).await;
+        }
+    }
+
     /// 设置纯增量扫描在最终回调中暴露的 generation 提交分类。
     pub async fn set_generation_committed(&self, committed: bool) {
         if let Some(stats_consumer) = &self.stats_consumer {
@@ -648,8 +655,71 @@ impl Drop for ConsumerManager {
 mod resume_tests {
     use super::*;
     use crate::consumer::stats::ProgressDetail;
+    use crate::observed_fixtures::observation;
+    use data_mover::model::{BackendKind, EntryKind};
     use db::EntrySummary as StorageEntryRecord;
     use db::scan::{ScanEventSummary, ScanResumeSummary};
+
+    #[tokio::test]
+    async fn already_reported_version_failure_is_not_counted_again_at_task_finish() -> Result<()> {
+        let stats = StatisticConsumer {
+            stats: StatsKind::Full(FullStats::new(
+                JobType::Copy,
+                "version-failure".into(),
+                String::new(),
+                String::new(),
+            )),
+            progress_bar: ProgressBar::new(JobType::Copy),
+            job_dir: String::new(),
+            callback_url: None,
+            generation_committed: None,
+            pb_handle: None,
+            scan_snapshot: None,
+            callback: Default::default(),
+        };
+        let manager = ConsumerManager {
+            consumers: vec![],
+            stats_consumer: Some(Arc::new(Mutex::new(stats))),
+            callback_guard: None,
+        };
+        let source = AppError::CopyError("version v2 upload refused".into());
+        let failure = AppError::ReportedCopyFailure {
+            source: Box::new(source),
+            data_failed: true,
+        };
+        let entry = observation(
+            BackendKind::S3,
+            "payload".into(),
+            EntryKind::File,
+            7,
+            [0; 3],
+            None,
+            None,
+            None,
+            Some((Some("v2".into()), true, false)),
+        );
+        manager
+            .record_statistics([StorageEntryMessage::CopyVersionFailed {
+                entry: Arc::new(entry).into(),
+                phase: "Publish".into(),
+                backend: BackendKind::S3,
+                reason: failure.to_string(),
+                first_in_entry: true,
+            }])
+            .await;
+        manager.record_task_error(&failure).await;
+        let consumer = manager
+            .stats_consumer
+            .as_ref()
+            .ok_or_else(|| AppError::CopyError("test statistics missing".into()))?
+            .lock()
+            .await;
+        assert!(matches!(
+            consumer.to_report(true).detail,
+            ProgressDetail::Full { error_count: 1, .. }
+        ));
+        Ok(())
+    }
 
     #[tokio::test]
     async fn reconciled_special_events_keep_callback_totals_and_checkpoint_counts() -> Result<()> {

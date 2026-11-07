@@ -6,7 +6,7 @@ use std::time::{Instant, SystemTime};
 
 // 外部crate
 use serde::{Deserialize, Serialize};
-use task_model::observation::{EntryStatistics, ObservedView};
+use task_model::observation::{EntryProgress, EntryStatistics, ObservedView};
 use task_model::{ErrorEvent, StorageEntryMessage};
 use tracing::trace;
 
@@ -312,8 +312,17 @@ impl FullStats {
                     self.update(&view);
                 }
             }
-            StorageEntryMessage::New(item) => self.update(&item.view()),
+            StorageEntryMessage::New(item) if item.entry.history().is_none() => self.update(&item.view()),
+            StorageEntryMessage::CopyEntryCompleted { entry, logical_bytes } => {
+                self.update(&EntryProgress {
+                    entry,
+                    logical_bytes: *logical_bytes,
+                });
+            }
             StorageEntryMessage::Error { event, .. } => self.error_stats.record(*event),
+            StorageEntryMessage::CopyVersionFailed {
+                first_in_entry: true, ..
+            } => self.error_stats.record(ErrorEvent::Copy),
             _ => {}
         }
     }
@@ -555,6 +564,9 @@ impl IncrementalStats {
                 }
             }
             StorageEntryMessage::Error { event, .. } => self.error_stats.record(*event),
+            StorageEntryMessage::CopyVersionFailed {
+                first_in_entry: true, ..
+            } => self.error_stats.record(ErrorEvent::Copy),
             _ => {}
         }
     }
