@@ -417,3 +417,15 @@ secondary broadcast-disconnected error. The runner removes its own containers on
 exit. This is consumer/notification evidence, not a claim that active storage I/O,
 walker initialization and all workers already share cancellation, or that the
 migration meets throughput/RSS targets.
+
+
+The Unix Local protected-purge regression captures source observations, copies the
+data, rewrites the source with equal-length bytes and restores mtime. The new source
+must remain, and the previous target bytes must remain. A second application test
+keeps an unmigrated `.data-mover-other-task` subtree when directory purge is refused.
+Native tests additionally cover persisted snapshots, missing change evidence,
+hidden files/symlinks/subtrees, idempotence and normal child cleanup. Callback-outbox
+tests check concrete ctime, nonempty-directory and injected read-only refusal causes;
+the read-only callback case is diagnostic injection, not a real read-only mount.
+No claim of concurrent-writer exclusion, atomic compare-and-unlink, power-cut or
+network-mount certification follows from these tests.

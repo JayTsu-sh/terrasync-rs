@@ -794,7 +794,14 @@ mod resume_tests {
 
     #[tokio::test]
     async fn source_cleanup_failure_reports_known_paths_and_presence_without_double_entry_errors() -> Result<()> {
-        for (present, persistence) in [(false, false), (true, false), (false, true)] {
+        for (present, persistence, purge) in [
+            (false, false, None),
+            (true, false, None),
+            (false, true, None),
+            (false, false, Some("source mtime/ctime changed")),
+            (false, false, Some("source directory is not empty")),
+            (false, false, Some("read-only source filesystem")),
+        ] {
             let statistics = StatisticConsumer {
                 stats: StatsKind::Full(FullStats::new(
                     JobType::Copy,
@@ -819,7 +826,25 @@ mod resume_tests {
                 copy_pipeline_prepared: false,
             };
             let path = StoragePath::new("payload").map_err(StorageError::from)?;
-            let source = if persistence {
+            let source = if let Some(diagnostic) = purge {
+                StorageError::SourcePurgeRefused {
+                    path,
+                    source: StorageRoleFailure::Entry(
+                        EntryOperationFailure::new(
+                            StoragePath::new("payload").map_err(StorageError::from)?,
+                            Operation::Namespace,
+                            if diagnostic.starts_with("read-only") {
+                                FailureClass::PermissionDenied
+                            } else {
+                                FailureClass::Conflict
+                            },
+                            Transience::Permanent,
+                            diagnostic,
+                        )
+                        .map_err(StorageError::from)?,
+                    ),
+                }
+            } else if persistence {
                 StorageError::TargetPersistenceUnconfirmed {
                     path,
                     source: StorageRoleFailure::Entry(
@@ -879,6 +904,9 @@ mod resume_tests {
             if persistence {
                 assert!(event.message.contains("injected target sync failure"));
             }
+            if let Some(diagnostic) = purge {
+                assert!(event.message.contains(diagnostic), "{}", event.message);
+            }
             let retention = event
                 .retention
                 .as_ref()
@@ -896,7 +924,9 @@ mod resume_tests {
             );
             assert_eq!(
                 retention.reason,
-                if persistence {
+                if purge.is_some() {
+                    TargetRetentionReason::SourceDeletionUnconfirmed
+                } else if persistence {
                     TargetRetentionReason::TargetPersistenceUnconfirmed
                 } else if present {
                     TargetRetentionReason::StaleEvidence

@@ -79,6 +79,7 @@ pub(crate) async fn report_failure(result: Result<()>, reports: &ConsumerManager
             Some(StorageError::TargetPersistenceUnconfirmed { .. }) => {
                 TargetRetentionReason::TargetPersistenceUnconfirmed
             }
+            Some(StorageError::SourcePurgeRefused { .. }) => TargetRetentionReason::SourceDeletionUnconfirmed,
             _ => TargetRetentionReason::StaleEvidence,
         };
         let mut retention = TargetRetention::entry(&path(entry_path)?, reason);
@@ -164,7 +165,10 @@ async fn remove_entry(
         .namespace()?
         .purge_observed(entry, check.cancel.clone())
         .await
-        .map_err(StorageError::from)?;
+        .map_err(|source| StorageError::SourcePurgeRefused {
+            path: entry.path().clone(),
+            source,
+        })?;
     Ok(())
 }
 
@@ -369,3 +373,8 @@ mod tests {
 #[path = "source_cleanup/persistence_tests.rs"]
 #[allow(clippy::unwrap_used)]
 mod persistence_tests;
+
+#[cfg(all(test, unix))]
+#[path = "source_cleanup/purge_tests.rs"]
+#[allow(clippy::unwrap_used)]
+mod purge_tests;

@@ -32,8 +32,14 @@ pub enum StorageError {
     MetadataVerification(#[from] MetadataVerificationError),
     #[error("目标发布状态与复制结果不一致，禁止删源: {path}")]
     TargetPublicationChanged { path: StoragePath },
-    #[error("目标端持久化确认失败，保留源端: {path}: {source}; {}", persistence_diagnostic(.source))]
+    #[error("目标端持久化确认失败，保留源端: {path}: {source}; {}", role_diagnostic(.source))]
     TargetPersistenceUnconfirmed {
+        path: StoragePath,
+        #[source]
+        source: StorageRoleFailure,
+    },
+    #[error("源端受保护清理失败，保留未确认删除的源项: {path}: {source}; {}", role_diagnostic(.source))]
+    SourcePurgeRefused {
         path: StoragePath,
         #[source]
         source: StorageRoleFailure,
@@ -173,6 +179,7 @@ impl StorageError {
             || matches!(self,
                 Self::Role(StorageRoleFailure::Entry(error))
                 | Self::TargetPersistenceUnconfirmed { source: StorageRoleFailure::Entry(error), .. }
+                | Self::SourcePurgeRefused { source: StorageRoleFailure::Entry(error), .. }
                 if error.class() == FailureClass::Cancelled)
             || matches!(self, Self::DirectPatch(error) if error.is_cancelled())
     }
@@ -183,7 +190,7 @@ impl From<TransferFailure> for StorageError {
     }
 }
 // role 的 Display 只展示类别；这里显式选用契约已脱敏的诊断供任务日志及 callback 使用。
-fn persistence_diagnostic(source: &StorageRoleFailure) -> &str {
+fn role_diagnostic(source: &StorageRoleFailure) -> &str {
     match source {
         StorageRoleFailure::Entry(error) => error.diagnostic(),
         StorageRoleFailure::Session(error) => error.diagnostic(),
