@@ -34,6 +34,7 @@ use crate::storage_factory::StorageContext;
 #[cfg(windows)]
 use crate::storage_factory::backend_kind_from_location;
 use data_mover::qos::QosManager;
+use data_mover::storage::NamespaceReadPolicy;
 use db::ClickHouseDatabase;
 use db::{self, INCREMENTAL_SCAN_TABLE_BASE_NAME};
 use futures::FutureExt;
@@ -570,6 +571,11 @@ impl SyncOrchestrator {
                     .copy_database_execution()
                     .map(|execution| execution.token().clone()),
             )
+            .with_file_list_read_policy(NamespaceReadPolicy {
+                operation_timeout: Duration::from_secs(app_config.scan.operation_timeout_secs),
+                recovery_window: Duration::from_secs(app_config.scan.recovery_window_secs),
+                retry_interval: Duration::from_millis(100),
+            })
             .walk()
             .await?;
 
@@ -1004,6 +1010,11 @@ impl SyncOrchestrator {
                     .copy_database_execution()
                     .map(|execution| execution.token().clone()),
             )
+            .with_file_list_read_policy(NamespaceReadPolicy {
+                operation_timeout: Duration::from_secs(app_config.scan.operation_timeout_secs),
+                recovery_window: Duration::from_secs(app_config.scan.recovery_window_secs),
+                retry_interval: Duration::from_millis(100),
+            })
             .walk()
             .await?;
 

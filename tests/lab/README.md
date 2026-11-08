@@ -465,5 +465,24 @@ which waits for native traversal completion. Local producer tests cover a full
 128-entry buffer, parent cancellation, completed-but-undelivered buffers, normal
 EOF, concurrent join waiters and a typed producer panic. The copy data-cancellation
 and comparison suites exercise the actual full/incremental orchestration around
-this scope. File-list point reads and initialization are separate pending work;
+this scope. File-list point-read integration is covered below; initialization remains pending;
 these checks do not certify whole-task or storage-network deadlines.
+
+
+`run-notification-archive-local.py --copy-file-list-cancel` runs the same 16
+Single/Cluster full/incremental Direct/Checkpoint failures through file-list
+selection, with 8 actual checkpoint resumptions and 32 HTTP 204 final summaries.
+File-list point reads use the existing native bounded namespace-observation API;
+no data-mover public API was added by this file-list step. The reused
+read_source_observation API was introduced earlier in this optimization at native
+commit 123cc8f, rather than being an original main API. Their 1000-entry queue participates in the
+same cancellation and producer join ownership as directory traversal.
+`run-source-metadata-guard.py --file-list`, under the same required owned-prefix
+prepare/cleanup lifecycle, provisions four read-only-observed NFS fixtures and
+checks flash recovery, sustained disconnect, silent timeout and in-flight
+cancellation. Server-side reads independently check all four retained payloads.
+Observed times were about 24 ms, 3.3 s, 4.0 s and 251 ms with a 1 s detection limit
+and a 3 s recovery budget. The actual migration configuration defaults to a 30 s
+detection limit, so those test timings do not certify the default whole task.
+These are separate real NFS and ClickHouse link tests, not a combined outage or
+whole-job throughput/RSS acceptance. The lab prefix was cleaned after this run.

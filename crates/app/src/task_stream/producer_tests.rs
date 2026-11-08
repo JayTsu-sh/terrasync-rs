@@ -5,17 +5,59 @@ use std::{
     time::Duration,
 };
 
+use data_mover::storage::NamespaceReadPolicy;
 use tokio::{sync::Notify, task::yield_now, time::timeout};
 use tokio_util::sync::CancellationToken;
 
 use super::AsyncReceiver;
 use crate::{
+    config::initialize_scan_config,
+    dir_walker::DirectoryWalker,
     error::{Result as AppResult, StorageError},
+    scan::ScanType,
     scan::source::{WalkDirAsyncIterator, WalkOptions},
     storage_factory::{StorageRole, create_storage_for_role},
 };
 
 type TestResult = Result<(), Box<dyn Error>>;
+
+async fn file_list_walk(
+    count: usize, cancel: CancellationToken,
+) -> AppResult<(tempfile::TempDir, WalkDirAsyncIterator)> {
+    let root = tempfile::tempdir()?;
+    let selection = root.path().join("selection.txt");
+    let mut names = String::new();
+    for index in 0..count {
+        let name = format!("entry-{index}");
+        std::fs::write(root.path().join(&name), b"data")?;
+        names.push_str(&name);
+        names.push('\n');
+    }
+    std::fs::write(&selection, names)?;
+    let config = initialize_scan_config(
+        "file-list-lifecycle",
+        &root.path().to_string_lossy(),
+        0,
+        ScanType::Full,
+        &None,
+        &None,
+        2,
+        false,
+        &Some(selection.to_string_lossy().into_owned()),
+        false,
+        0,
+    )?;
+    let iterator = DirectoryWalker::new(config)
+        .with_cancellation(Some(cancel))
+        .with_file_list_read_policy(NamespaceReadPolicy {
+            operation_timeout: Duration::from_secs(1),
+            recovery_window: Duration::from_secs(3),
+            retry_interval: Duration::from_millis(10),
+        })
+        .walk()
+        .await?;
+    Ok((root, iterator))
+}
 
 async fn local_walk(count: usize, cancel: CancellationToken) -> AppResult<(tempfile::TempDir, WalkDirAsyncIterator)> {
     let root = tempfile::tempdir()?;
@@ -170,5 +212,53 @@ async fn producer_panic_preserves_preceding_real_stream_failure() -> TestResult 
         }
         error => panic!("expected both typed causes: {error:?}"),
     }
+    Ok(())
+}
+
+#[tokio::test]
+async fn file_list_normal_eof_preserves_all_buffered_entries() -> TestResult {
+    let parent = CancellationToken::new();
+    let (_root, iterator) = file_list_walk(17, parent.clone()).await?;
+    timeout(Duration::from_secs(2), iterator.wait_for_producer()).await?;
+    let mut count = 0;
+    while iterator.next().await.is_some() {
+        count += 1;
+    }
+    assert_eq!(count, 17);
+    assert!(iterator.take_error().is_none());
+    assert!(!parent.is_cancelled());
+    Ok(())
+}
+
+#[tokio::test]
+async fn file_list_backpressure_is_cancelled_and_joined_without_source_mutation() -> TestResult {
+    let parent = CancellationToken::new();
+    let (root, iterator) = file_list_walk(1100, parent.clone()).await?;
+    timeout(Duration::from_secs(5), async {
+        while !iterator.rx.is_full() {
+            yield_now().await;
+        }
+    })
+    .await?;
+    parent.cancel();
+    assert!(iterator.next().await.is_none());
+    timeout(Duration::from_secs(1), iterator.wait_for_producer()).await?;
+    let error = iterator.take_error();
+    assert!(error.as_ref().is_some_and(StorageError::is_cancelled), "{error:?}");
+    for index in 0..1100 {
+        assert_eq!(std::fs::read(root.path().join(format!("entry-{index}")))?, b"data");
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn cancelled_empty_file_list_is_not_successful_enumeration() -> TestResult {
+    let parent = CancellationToken::new();
+    parent.cancel();
+    let (_root, iterator) = file_list_walk(0, parent).await?;
+    assert!(iterator.next().await.is_none());
+    timeout(Duration::from_secs(1), iterator.wait_for_producer()).await?;
+    let error = iterator.take_error();
+    assert!(error.as_ref().is_some_and(StorageError::is_cancelled), "{error:?}");
     Ok(())
 }

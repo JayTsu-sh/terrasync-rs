@@ -1,13 +1,15 @@
-use crate::scan::{observe_path, observe_path_with_plan};
+use crate::scan::observe_path_with_read_policy;
 use data_mover::model::ObservationPlan;
+use data_mover::storage::NamespaceReadPolicy;
 // 标准库
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use crate::error::StorageError;
-use crate::scan::source::{WalkDirAsyncIterator, WalkOptions};
+use crate::scan::source::{WalkDirAsyncIterator, WalkOptions, deliver};
 use crate::storage_factory::StorageContext;
 use task_model::{ErrorEvent, StorageEntryMessage};
 use tokio_util::sync::CancellationToken;
@@ -25,6 +27,7 @@ pub struct DirectoryWalker {
     operation_timeout: Option<std::time::Duration>,
     recovery_window: Option<std::time::Duration>,
     cancel: Option<CancellationToken>,
+    file_list_read_policy: NamespaceReadPolicy,
 }
 
 impl DirectoryWalker {
@@ -35,12 +38,23 @@ impl DirectoryWalker {
             operation_timeout: None,
             recovery_window: None,
             cancel: None,
+            // 独立调用默认不重试；复制任务显式传入配置中的检测与恢复预算。
+            file_list_read_policy: NamespaceReadPolicy {
+                operation_timeout: Duration::from_secs(30),
+                recovery_window: Duration::ZERO,
+                retry_interval: Duration::from_millis(100),
+            },
         }
     }
 
     /// 取消本次枚举，不反向取消调用方持有的任务信号。
-    pub fn with_cancellation(mut self, cancel: Option<CancellationToken>) -> Self {
+    pub(crate) fn with_cancellation(mut self, cancel: Option<CancellationToken>) -> Self {
         self.cancel = cancel;
+        self
+    }
+
+    pub(crate) fn with_file_list_read_policy(mut self, policy: NamespaceReadPolicy) -> Self {
+        self.file_list_read_policy = policy;
         self
     }
 
@@ -64,7 +78,16 @@ impl DirectoryWalker {
             let storage = self.source_storage().await?;
 
             // 从文件列表创建迭代器
-            walkdir_from_file_list(storage, file_list_path, self.config.observation_plan)
+            walkdir_from_file_list(
+                storage,
+                file_list_path,
+                self.config.observation_plan,
+                self.file_list_read_policy,
+                self.cancel
+                    .as_ref()
+                    .map(CancellationToken::child_token)
+                    .unwrap_or_default(),
+            )
         } else {
             // 使用现有的walkdir扫描方式
             let depth = if self.config.depth > 0 {
@@ -121,7 +144,8 @@ impl DirectoryWalker {
 /// - 成功时返回 `WalkDirAsyncIterator`
 /// - 失败时返回包含错误信息的 `Err`
 fn walkdir_from_file_list(
-    storage: StorageContext, file_list_path: &str, plan: Option<ObservationPlan>,
+    storage: StorageContext, file_list_path: &str, plan: Option<ObservationPlan>, policy: NamespaceReadPolicy,
+    cancel: CancellationToken,
 ) -> Result<WalkDirAsyncIterator> {
     // 从文件中读取文件路径
     let file = File::open(file_list_path).map_err(|e| AppError::ScanError(format!("Failed to open file list: {e}")))?;
@@ -158,22 +182,38 @@ fn walkdir_from_file_list(
 
     // 启动一个异步任务，遍历文件列表并发送StorageEntryMessage
     let span = info_span!("dir_walker");
-    tokio::spawn(
+    let producer_cancel = cancel.clone();
+    let task = tokio::spawn(
         async move {
+            let cancel_on_drop = producer_cancel.clone().drop_guard();
             for relative_path in file_paths_iter {
+                if producer_cancel.is_cancelled() {
+                    stored_error
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .get_or_insert(StorageError::Cancelled);
+                    break;
+                }
                 match relative_path {
                     Ok(file_path) => {
                         // 尝试获取文件的ObservedEntry
-                        let observation = match plan {
-                            Some(plan) => observe_path_with_plan(storage.storage(), &file_path, plan).await,
-                            None => observe_path(storage.storage(), &file_path).await,
-                        };
+                        let observation = observe_path_with_read_policy(
+                            storage.storage(),
+                            &file_path,
+                            plan,
+                            policy,
+                            &producer_cancel,
+                        )
+                        .await;
                         match observation {
                             Ok(metadata) => {
                                 // 发送Scanned消息到通道
                                 let msg = StorageEntryMessage::Scanned(std::sync::Arc::new(metadata));
-                                if let Err(e) = tx.send(msg).await {
-                                    error!("Failed to send storage entry: {}", e);
+                                if !deliver(&tx, &producer_cancel, msg).await {
+                                    stored_error
+                                        .lock()
+                                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                        .get_or_insert(StorageError::Cancelled);
                                     break;
                                 }
                             }
@@ -191,9 +231,7 @@ fn walkdir_from_file_list(
                                     entry: None,
                                     reason,
                                 };
-                                if let Err(e) = tx.send(msg).await {
-                                    error!("Failed to send error: {}", e);
-                                }
+                                deliver(&tx, &producer_cancel, msg).await;
                                 break;
                             }
                         }
@@ -212,18 +250,25 @@ fn walkdir_from_file_list(
                             entry: None,
                             reason,
                         };
-                        if let Err(e) = tx.send(msg).await {
-                            error!("Failed to send error: {}", e);
-                        }
+                        deliver(&tx, &producer_cancel, msg).await;
                         break;
                     }
                 }
             }
+            if producer_cancel.is_cancelled() {
+                stored_error
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .get_or_insert(StorageError::Cancelled);
+            }
+            cancel_on_drop.disarm();
         }
         .instrument(span),
     );
 
-    Ok(WalkDirAsyncIterator::new(rx).with_error(terminal_error))
+    Ok(WalkDirAsyncIterator::new(rx)
+        .with_error(terminal_error)
+        .with_producer(task, cancel))
 }
 
 /// 通用的目录遍历函数 - 作为便捷的包装器
@@ -236,15 +281,15 @@ pub async fn walkdir(config: ScanConfig) -> Result<crate::scan::source::WalkDirA
 pub async fn scan_walkdir(
     config: ScanConfig, operation_timeout: std::time::Duration, recovery_window: std::time::Duration,
 ) -> Result<WalkDirAsyncIterator> {
-    DirectoryWalker {
-        config,
-        operation_timeout: Some(operation_timeout),
-        recovery_window: Some(recovery_window),
-        cancel: None,
-    }
-    .walk()
-    .await
+    let mut walker = DirectoryWalker::new(config);
+    walker.operation_timeout = Some(operation_timeout);
+    walker.recovery_window = Some(recovery_window);
+    walker.walk().await
 }
+
+#[cfg(all(test, unix))]
+#[path = "dir_walker/file_list_real_tests.rs"]
+mod file_list_real_tests;
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
@@ -288,7 +333,17 @@ mod tests {
         let paths = root.path().join("files.txt");
         fs::write(&paths, b"missing-file\n").await?;
         let storage = create_storage_for_role(root.path().to_str().unwrap(), None, false, StorageRole::Source).await?;
-        let iterator = walkdir_from_file_list(storage, paths.to_str().unwrap(), None)?;
+        let iterator = walkdir_from_file_list(
+            storage,
+            paths.to_str().unwrap(),
+            None,
+            NamespaceReadPolicy {
+                operation_timeout: Duration::from_secs(1),
+                recovery_window: Duration::from_secs(3),
+                retry_interval: Duration::from_millis(100),
+            },
+            CancellationToken::new(),
+        )?;
         while iterator.next().await.is_some() {}
         assert!(iterator.take_error().is_some_and(|error| error.is_not_found()));
         Ok(())

@@ -8,9 +8,11 @@ import http.server
 import os
 from pathlib import Path
 import selectors
+import shlex
 import socket
 import socketserver
 import subprocess
+import sys
 import threading
 
 
@@ -21,6 +23,16 @@ def run():
     state = {"mode": "normal", "sockets": set(), "drops": 0}
     lock = threading.Lock()
     stopped = threading.Event()
+    file_list = "--file-list" in sys.argv
+
+    def file_list_fixture(verify=False):
+        root = f"/srv/nfs/v4/ci/{run_id}"
+        action = "assert path.read_bytes() == b'native file-list observation'" if verify else "path.write_bytes(b'native file-list observation')"
+        script = f"from pathlib import Path\nroot = Path({root!r})\nfor mode in ('flash', 'disconnect', 'stall', 'cancel'):\n path = root / ('file-list-' + mode)\n {action}\n"
+        subprocess.run([
+            "ssh", "-i", os.environ["LAB_SSH_KEY"], "-o", "BatchMode=yes", "-o", "ConnectTimeout=5",
+            "root@10.131.9.12", "python3 -c " + shlex.quote(script),
+        ], check=True, capture_output=True, text=True)
 
     def disconnect():
         with lock:
@@ -98,8 +110,14 @@ def run():
         LAB_SOURCE_GUARD_NFS_URL=f"nfs://127.0.0.1:{relay.server_address[1]}/srv/nfs/v4:/ci/{run_id}?version=4.1&noresvport=true&uid=1000&gid=1000",
         LAB_SOURCE_GUARD_CONTROL=f"127.0.0.1:{control.server_port}")
     try:
-        subprocess.run(["cargo", "test", "-p", "app", "--lib", "source_cleanup::real_tests::", "--locked", "--", "--ignored", "--nocapture", "--test-threads=1"],
+        if file_list:
+            file_list_fixture()
+        selected = "dir_walker::file_list_real_tests::" if file_list else "source_cleanup::real_tests::"
+        subprocess.run(["cargo", "test", "-p", "app", "--lib", selected, "--locked", "--", "--ignored", "--nocapture", "--test-threads=1"],
             cwd=Path(__file__).resolve().parents[2], env=environment, check=True, timeout=240)
+        if file_list:
+            file_list_fixture(verify=True)
+            print("independent NFS file-list source inspection retained_files=4 payloads_unchanged=true", flush=True)
         assert state["drops"] >= 1, "flash was not injected"
         print("independent NFS relay flash_injected=true fault_scope=owned_connections server_configuration_unchanged=true", flush=True)
     finally:

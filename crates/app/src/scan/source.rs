@@ -297,7 +297,7 @@ impl StorageContext {
 }
 
 /// 交付背压不能阻塞取消；接收端关闭时同步停止本次原生遍历。
-async fn deliver(
+pub(crate) async fn deliver(
     tx: &async_channel::Sender<StorageEntryMessage>, cancel: &CancellationToken, message: StorageEntryMessage,
 ) -> bool {
     let delivered = tokio::select! {

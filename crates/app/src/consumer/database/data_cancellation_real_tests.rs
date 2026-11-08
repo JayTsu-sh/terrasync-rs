@@ -77,7 +77,7 @@ fn verify_payload(path: &Path) -> Result<()> {
     Ok(())
 }
 
-async fn case(fixture: &Fixture, incremental: bool, mode: TransferMode, fault: &str) -> Result<()> {
+async fn case(fixture: &Fixture, incremental: bool, mode: TransferMode, fault: &str, file_list: bool) -> Result<()> {
     let source = tempfile::tempdir()?;
     let target = tempfile::tempdir()?;
     let directory = tempfile::tempdir()?;
@@ -118,6 +118,11 @@ async fn case(fixture: &Fixture, incremental: bool, mode: TransferMode, fault: &
         SyncOrchestrator::new_local(command.clone()).run().await?;
     }
     create_payload(&source.path().join("payload"))?;
+    if file_list {
+        let selection = directory.path().join("selection.txt");
+        std::fs::write(&selection, b"ledger\npayload\n")?;
+        command.file_list = Some(selection.to_string_lossy().into_owned());
+    }
     command.qos = Some("16MiB/s".into());
     command.source_cleanup = SourceCleanupPolicy::DeleteSelectedReady;
     let orchestrator = SyncOrchestrator::new_local(command.clone());
@@ -174,7 +179,7 @@ async fn case(fixture: &Fixture, incremental: bool, mode: TransferMode, fault: &
         verify_payload(&source.path().join("payload"))?;
     }
     eprintln!(
-        "copy-data-cancel cluster={} incremental={incremental} checkpoint={} fault={fault} fault_to_stop_ms={} source_retained=true direct_cleanup_or_checkpoint_resume=true",
+        "copy-data-cancel cluster={} incremental={incremental} checkpoint={} file_list={file_list} fault={fault} fault_to_stop_ms={} source_retained=true direct_cleanup_or_checkpoint_resume=true",
         fixture.config.cluster.is_some(),
         mode == TransferMode::Checkpoint,
         elapsed.as_millis()
@@ -182,9 +187,7 @@ async fn case(fixture: &Fixture, incremental: bool, mode: TransferMode, fault: &
     Ok(())
 }
 
-#[tokio::test]
-#[ignore = "requires --copy-data-cancel owned real ClickHouse pair, fault proxy and callback"]
-async fn real_database_fault_cancels_active_direct_and_checkpoint_data() -> Result<()> {
+async fn run_cases(file_list: bool) -> Result<()> {
     AppConfig::init(
         Some(include_str!("../../../../cli/src/resources/default_config.toml")),
         None,
@@ -195,7 +198,7 @@ async fn real_database_fault_cancels_active_direct_and_checkpoint_data() -> Resu
             for incremental in [false, true] {
                 for mode in [TransferMode::Direct, TransferMode::Checkpoint] {
                     for fault in ["running_disconnect", "running_stall"] {
-                        case(&fixture, incremental, mode, fault).await?;
+                        case(&fixture, incremental, mode, fault, file_list).await?;
                     }
                 }
             }
@@ -207,4 +210,16 @@ async fn real_database_fault_cancels_active_direct_and_checkpoint_data() -> Resu
         cleanup?;
     }
     Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires --copy-data-cancel owned real ClickHouse pair, fault proxy and callback"]
+async fn real_database_fault_cancels_active_direct_and_checkpoint_data() -> Result<()> {
+    run_cases(false).await
+}
+
+#[tokio::test]
+#[ignore = "requires --copy-file-list-cancel owned real ClickHouse pair, fault proxy and callback"]
+async fn real_database_fault_cancels_file_list_direct_and_checkpoint_data() -> Result<()> {
+    run_cases(true).await
 }

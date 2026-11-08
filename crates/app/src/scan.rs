@@ -9,7 +9,9 @@ use utils::app_config::AppConfig;
 
 mod observation;
 pub use observation::observe_path;
+#[cfg(test)]
 pub(crate) use observation::observe_path_with_plan;
+pub(crate) use observation::observe_path_with_read_policy;
 mod packaging;
 mod recovery;
 pub mod source;

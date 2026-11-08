@@ -84,7 +84,7 @@ def run_isolated():
                 print(f"isolated S3 image={docker('inspect', containers[-1], '--format', '{{.Image}}')}", flush=True)
             print(f"isolated notification image={docker('inspect', containers[0], '--format', '{{.Image}}')}", flush=True)
             pid = docker("inspect", containers[0], "--format", "{{.State.Pid}}")
-            suite = [flag for flag in ("--copy-generations", "--catalogue-recovery", "--consumer-recovery", "--copy-execution", "--copy-data-cancel", "--rename-generations", "--retention-events", "--source-absence", "--request-policy", "--copy-contracts", "--version-catalogue", "--mutable-catalogue", "--version-metadata", "--scan-wire") if flag in sys.argv]
+            suite = [flag for flag in ("--copy-generations", "--catalogue-recovery", "--consumer-recovery", "--copy-execution", "--copy-data-cancel", "--copy-file-list-cancel", "--rename-generations", "--retention-events", "--source-absence", "--request-policy", "--copy-contracts", "--version-catalogue", "--mutable-catalogue", "--version-metadata", "--scan-wire") if flag in sys.argv]
             subprocess.run(["nsenter", "-t", pid, "-n", sys.executable, __file__, "--inside", *suite], cwd=ROOT, check=True)
         except BaseException:
             for container in containers:
@@ -246,8 +246,8 @@ def run_copy_generations():
     environment["LAB_COPY_GENERATION_DSN"] = f"http://{address}"
     environment["LAB_COPY_GENERATION_CONTROL"] = address
     try:
-        if "--copy-data-cancel" in sys.argv:
-            run_copy_data_cancellation(environment)
+        if "--copy-data-cancel" in sys.argv or "--copy-file-list-cancel" in sys.argv:
+            run_copy_data_cancellation(environment, file_list="--copy-file-list-cancel" in sys.argv)
             return
         if "--copy-execution" in sys.argv:
             run_copy_execution(environment)
@@ -473,7 +473,7 @@ def run_version_catalogue(environment):
         source_proxy.server_close()
 
 
-def run_copy_data_cancellation(environment):
+def run_copy_data_cancellation(environment, file_list=False):
     reports = []
     class Callback(http.server.BaseHTTPRequestHandler):
         def log_message(self, *_):
@@ -490,7 +490,7 @@ def run_copy_data_cancellation(environment):
     try:
         subprocess.run([
             "cargo", "test", "--offline", "--locked", "-p", "app", "--lib",
-            "real_database_fault_cancels_active_direct_and_checkpoint_data", "--", "--ignored", "--nocapture",
+            "real_database_fault_cancels_file_list_direct_and_checkpoint_data" if file_list else "real_database_fault_cancels_active_direct_and_checkpoint_data", "--", "--ignored", "--nocapture",
         ], cwd=ROOT, env=environment, check=True)
         summaries = [report for report in reports if report["is_final"] and not report.get("diagnostics")]
         assert len(summaries) == 32 and all(report["diagnostics_complete"] for report in summaries), summaries
@@ -698,7 +698,7 @@ def run_inside():
             time.sleep(0.2)
         else:
             raise RuntimeError(f"ClickHouse readiness timed out on port {port}")
-    if any(flag in sys.argv for flag in ("--copy-generations", "--catalogue-recovery", "--consumer-recovery", "--copy-execution", "--copy-data-cancel", "--rename-generations", "--retention-events", "--source-absence", "--request-policy", "--copy-contracts", "--version-catalogue", "--mutable-catalogue", "--version-metadata", "--scan-wire")):
+    if any(flag in sys.argv for flag in ("--copy-generations", "--catalogue-recovery", "--consumer-recovery", "--copy-execution", "--copy-data-cancel", "--copy-file-list-cancel", "--rename-generations", "--retention-events", "--source-absence", "--request-policy", "--copy-contracts", "--version-catalogue", "--mutable-catalogue", "--version-metadata", "--scan-wire")):
         run_copy_generations()
         return
     environment = dict(os.environ)

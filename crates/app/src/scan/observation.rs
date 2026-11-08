@@ -1,12 +1,13 @@
 //! 元数据观察与 opaque 编码；运行时直接交付原生观察，不投影为后端条目。
-use crate::error::storage::{Result, operation};
+use crate::error::storage::{Result, StorageError, operation};
 use crate::storage_factory::path;
 use data_mover::model::*;
 use data_mover::storage::StorageRoleFailure;
-use data_mover::storage::{Storage, observe_descriptor};
+use data_mover::storage::{NamespaceReadPolicy, Storage, observe_descriptor, read_source_observation};
 use data_mover::transfer::{DirectoryObjectAction, DirectoryObjectDestination, directory_object_action};
 use std::path::Path;
 use task_model::metadata::MetadataScope;
+use tokio_util::sync::CancellationToken;
 
 #[derive(Clone, Copy)]
 pub(crate) struct ObservationValidation {
@@ -106,6 +107,21 @@ pub(crate) async fn observe_path_with_plan(
 ) -> Result<ObservedEntry> {
     let descriptor = storage.namespace()?.stat(&path(value)?).await?;
     Ok(observe_descriptor(storage, descriptor, plan).await?)
+}
+
+/// 文件列表的点查询复用原生只读恢复；不在任务层复制协议重试。
+pub(crate) async fn observe_path_with_read_policy(
+    storage: &Storage, value: &Path, plan: Option<ObservationPlan>, policy: NamespaceReadPolicy,
+    cancel: &CancellationToken,
+) -> Result<ObservedEntry> {
+    let plan = match plan {
+        Some(plan) => plan,
+        None => observation_plan(tags_required(storage, true)?),
+    };
+    read_source_observation(storage, &path(value)?, plan, policy, cancel)
+        .await?
+        .entry
+        .ok_or_else(|| StorageError::FileNotFound(value.display().to_string()))
 }
 
 /// 验证原生历史分段顺序，不积累整段历史，也不复制逐版本条目。
