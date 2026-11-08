@@ -198,7 +198,12 @@ async fn equal_digests_of_two_short_reads_do_not_authorize_source_deletion() -> 
     probe(&mut source, ReadBehavior::Short)?;
     probe(&mut target, ReadBehavior::Short)?;
     let error = remove_entry(&source, &target, &entry, &full_check()).await.unwrap_err();
-    assert!(matches!(error.storage_error(), Some(StorageError::MismatchData(_))));
+    assert!(
+        matches!(error.storage_error(), Some(StorageError::SourceCleanupContentUnverified {
+        side: NativeIntegritySide::Source,
+        source: StorageRoleFailure::Entry(failure), ..
+    }) if failure.class() == FailureClass::Protocol && failure.diagnostic().contains("expected=7, actual=4"))
+    );
     assert_eq!(std::fs::read(source_root.path().join("file"))?, b"payload");
     assert_eq!(std::fs::read(target_root.path().join("file"))?, b"payload");
     Ok(())
