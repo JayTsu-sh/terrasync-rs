@@ -168,51 +168,62 @@ async fn wait_for_mount_init(pools: &[(&AtomicUsize, &AtomicUsize, &str)], expec
 /// 失败时指数退避重试，避免 portmapper 被突发请求打满。
 async fn create_storage_pair_with_retry(
     semaphore: &Semaphore, src_path: &str, dest_path: &str, block_size: Option<usize>, worker_label: &str,
+    cancel: Option<&CancellationToken>,
 ) -> Result<StoragePair> {
-    let mut last_error = None;
+    let initialize = async {
+        let mut last_error = None;
 
-    for attempt in 0..=STORAGE_PAIR_MAX_RETRIES {
-        let permit = semaphore
-            .acquire()
-            .await
-            .map_err(|_| AppError::ConfigError("Mount semaphore closed".to_string()))?;
+        for attempt in 0..=STORAGE_PAIR_MAX_RETRIES {
+            let permit = semaphore
+                .acquire()
+                .await
+                .map_err(|_| AppError::ConfigError("Mount semaphore closed".to_string()))?;
 
-        match StoragePair::new(src_path, dest_path, block_size).await {
-            Ok(pair) => {
-                if attempt > 0 {
-                    info!(
-                        "{}: StoragePair created successfully after {} retries",
-                        worker_label, attempt
-                    );
+            match StoragePair::new(src_path, dest_path, block_size).await {
+                Ok(pair) => {
+                    if attempt > 0 {
+                        info!(
+                            "{}: StoragePair created successfully after {} retries",
+                            worker_label, attempt
+                        );
+                    }
+                    return Ok(pair);
                 }
-                return Ok(pair);
-            }
-            Err(e) => {
-                warn!(
-                    "{}: StoragePair creation failed (attempt {}/{}): {}",
-                    worker_label,
-                    attempt + 1,
-                    STORAGE_PAIR_MAX_RETRIES + 1,
-                    e
-                );
-                last_error = Some(e);
-                // 显式释放 permit 后再进入退避等待，避免退避期间占用 mount 槽位
-                drop(permit);
+                Err(e) => {
+                    warn!(
+                        "{}: StoragePair creation failed (attempt {}/{}): {}",
+                        worker_label,
+                        attempt + 1,
+                        STORAGE_PAIR_MAX_RETRIES + 1,
+                        e
+                    );
+                    last_error = Some(e);
+                    // 显式释放 permit 后再进入退避等待，避免退避期间占用 mount 槽位
+                    drop(permit);
 
-                if attempt < STORAGE_PAIR_MAX_RETRIES {
-                    // 使用较长的退避：nfs-rs 绑定特权端口失败后端口进入 TIME_WAIT，
-                    // 过短的退避（200ms）无法避开同一端口被再次选中。
-                    // 2s/4s/8s 给 nfs-rs 更大概率在下次尝试时随机到可用端口。
-                    let backoff_ms = 2000u64 * (1u64 << attempt);
-                    tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+                    if attempt < STORAGE_PAIR_MAX_RETRIES {
+                        // 使用较长的退避：nfs-rs 绑定特权端口失败后端口进入 TIME_WAIT，
+                        // 过短的退避（200ms）无法避开同一端口被再次选中。
+                        // 2s/4s/8s 给 nfs-rs 更大概率在下次尝试时随机到可用端口。
+                        let backoff_ms = 2000u64 * (1u64 << attempt);
+                        tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+                    }
                 }
             }
         }
-    }
 
-    Err(last_error.unwrap_or_else(|| {
-        AppError::ConfigError(format!("{worker_label}: StoragePair creation exhausted all retries"))
-    }))
+        Err(last_error.unwrap_or_else(|| {
+            AppError::ConfigError(format!("{worker_label}: StoragePair creation exhausted all retries"))
+        }))
+    };
+    match cancel {
+        Some(cancel) => tokio::select! {
+            biased;
+            () = cancel.cancelled() => Err(StorageError::Cancelled.into()),
+            result = initialize => result,
+        },
+        None => initialize.await,
+    }
 }
 
 /// Sync 编排器
@@ -667,10 +678,11 @@ impl SyncOrchestrator {
             let mount_sem = mount_semaphore.clone();
             let alive_counter = alive_receivers.clone();
             let done_counter = mount_done_receivers.clone();
+            let execution = consumer_manager.copy_database_execution();
 
             let span = info_span!("receiver_worker", recv_id = recv_id);
             let handle = tokio::spawn(
-                async move {
+                CopyDatabaseExecution::run_optional_child(execution, async move {
                     // 每个 worker 创建自己的 StoragePair（带限流重试，防止 portmapper 过载）
                     let storage_pair = match create_storage_pair_with_retry(
                         &mount_sem,
@@ -678,6 +690,7 @@ impl SyncOrchestrator {
                         &dest_path,
                         block_size,
                         &format!("Receiver {recv_id}"),
+                        cfg.cancel.as_ref(),
                     )
                     .await
                     {
@@ -766,7 +779,7 @@ impl SyncOrchestrator {
                         Some(error) => Err(error),
                         None => Ok(()),
                     }
-                }
+                })
                 .instrument(span),
             );
             receiver_handles.push(handle);
@@ -806,10 +819,11 @@ impl SyncOrchestrator {
             let mount_sem = mount_semaphore.clone();
             let alive_counter = alive_senders.clone();
             let done_counter = mount_done_senders.clone();
+            let execution = consumer_manager.copy_database_execution();
 
             let span = info_span!("sender_worker", worker_id = worker_id);
             let handle = tokio::spawn(
-                async move {
+                CopyDatabaseExecution::run_optional_child(execution, async move {
                     // 每个 Sender worker 创建自己的 StoragePair（带限流重试，防止 portmapper 过载）
                     let storage_pair = match create_storage_pair_with_retry(
                         &mount_sem,
@@ -817,6 +831,7 @@ impl SyncOrchestrator {
                         &dest_path,
                         block_size,
                         &format!("Sender {worker_id}"),
+                        copy_cfg.cancel.as_ref(),
                     )
                     .await
                     {
@@ -838,7 +853,7 @@ impl SyncOrchestrator {
                         worker_id, wi, src, dest, transport, &bc, &cfg, qos, bt, &copy_cfg, aec, ec, sc,
                     )
                     .await
-                }
+                })
                 .instrument(span),
             );
             sender_handles.push(handle);
@@ -1402,6 +1417,10 @@ pub(crate) fn create_qos_manager(qos: Option<&String>, peak_qos_rate: f32, iops:
         },
     }
 }
+
+#[cfg(test)]
+#[path = "orchestrator_cancellation_tests.rs"]
+mod cancellation_tests;
 
 #[cfg(test)]
 mod mount_concurrency_tests {

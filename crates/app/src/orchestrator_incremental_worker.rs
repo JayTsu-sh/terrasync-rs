@@ -68,6 +68,7 @@ pub(super) async fn spawn_handlers(
                     &dest_path_c,
                     block_size,
                     &format!("Handler {handler_id}"),
+                    resume_opts.cancel.as_ref(),
                 )
                 .await
                 {

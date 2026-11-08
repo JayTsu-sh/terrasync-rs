@@ -641,3 +641,30 @@ TargetPersistenceUnconfirmed 及 PermissionDenied／Connectivity／Timeout／Can
 本用例不执行整轮 CLI、数据库或外部 callback，不覆盖非版本化真实目标、其他 S3 厂商、
 NAS 桶持久化、掉电、全历史永久删除、统一网络预算或整轮吞吐／RSS。已有目标的内容由独立
 夹具核验，此用例验证删源门槛，不冒充完整数据复制／全量数据校验。当前删源仍等待数据库收尾。
+
+### 全量 worker 的共享失败与初始化取消
+
+`sender::cancellation_tests` 在旧实现中分别复现预取消仍发请求、等待扫描输入不退出、
+发送背压无法取消三个 500 ms 超时；修复后与原有三个 Sender 回归一起通过。
+作用域复用 CopyDatabaseExecution，模拟一个 worker 的原始 TimedOut 终态错误后，
+等待发送的 worker 及时退出；两个结果持有同一个原始错误，活动计数归零、发送 future 释放。
+该确定性作用域用例只构造数据库对象，不发查询，不冒充实际 ClickHouse 故障。
+另两项单测覆盖挂载槽位等待取消、初始化失败后在重试预算耗尽前取消，并核验配额释放。
+
+`python3 tests/lab/run-copy-worker-cancellation-local.py --binary <app-lib-test-binary>`
+运行精确 ignored 用例
+`orchestrator::cancellation_tests::real_storage_initialization_observes_cancellation_without_source_or_object_mutation`。
+runner 先用 --list 确认测试存在，然后创建独占 RustFS 容器、桶、哨兵版本和 Local 源文件。
+正常初始化发送一次真实 S3 请求；取消场景在请求抵达代理后等待 250 ms 再取消，
+未返回响应的初始化总计约 301 ms，取消发出后不到一秒返回 Cancelled。
+父进程独立核验源内容、mode／size／mtime／ctime 和哨兵原版本／内容未改变，
+零数据 GET、零修改请求、无未完成上传，测试进程退出后代理连接全部关闭。
+容器、网络命名空间、tmpfs 和临时源文件随 runner 清理，未改共享服务或防火墙。
+
+全量 Sender／Receiver 的终态失败接入既有共享复制执行域，等待输入、命令发送、
+挂载配额、初始化与退避均响应已有取消信号；启用该执行域的增量初始化同样接入。
+本机 Rust 1.98.1 的 workspace 检查、Clippy、测试和 16 项串行远程进程回归通过，已有警告保留。
+上述物理验证限于 Local／S3 的初始化，不代表其他协议初始化的后台资源回收、
+常驻进程内 SDK 池立即关闭、复制中断网的统一检测／恢复预算、实际 ClickHouse／callback
+或整轮吞吐／RSS 已验收。没有数据库执行域的任务仍按原配置工作。
+这一步补齐清理队列所依赖的取消链路，源清理目前仍等待数据库收尾。

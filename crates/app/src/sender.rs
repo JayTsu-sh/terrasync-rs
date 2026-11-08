@@ -15,6 +15,7 @@ use crate::task_stream::AsyncReceiver;
 use data_mover::model::ObservedEntry;
 use data_mover::qos::QosManager;
 use task_model::StorageEntryMessage;
+use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
 use transport::message::SenderMsg;
 use transport::traits::SenderTransport;
@@ -22,12 +23,16 @@ use transport::traits::SenderTransport;
 // 内部模块
 use crate::broadcast::BroadcastForwarder;
 use crate::copy_history::{HistoryCompletion, HistoryCopyContext, HistoryCopyPolicy, HistoryCopyWorker};
-use crate::error::{AppError, Result};
+use crate::error::{AppError, Result, StorageError};
 use crate::file_copy::CopyOptions;
 use crate::file_copy::selection::skip_unrepresentable;
 use crate::receiver::ReceiverConfig;
 use crate::tar_pack;
 use task_model::observation::EntryProgress;
+
+#[cfg(test)]
+#[path = "sender_cancellation_tests.rs"]
+mod cancellation_tests;
 
 /// Sender worker 配置
 pub struct SenderWorkerConfig {
@@ -75,7 +80,16 @@ pub async fn sender_worker(
         },
     );
 
-    while let Some(msg) = walkdir_iter.next().await {
+    loop {
+        let next = match copy_config.cancel.as_ref() {
+            Some(cancel) => tokio::select! {
+                biased;
+                () = cancel.cancelled() => return Err(StorageError::Cancelled.into()),
+                message = walkdir_iter.next() => message,
+            },
+            None => walkdir_iter.next().await,
+        };
+        let Some(msg) = next else { break };
         if broadcaster.is_closed() {
             break;
         }
@@ -112,7 +126,7 @@ pub async fn sender_worker(
                     );
                 }
 
-                let result = send_entry(worker_id, &transport, &entry).await;
+                let result = send_entry(worker_id, &transport, &entry, copy_config.cancel.as_ref()).await;
                 active_entry_counter.fetch_sub(1, Ordering::Relaxed);
                 if let Err(error) = result {
                     if error.stops_event_pipeline() {
@@ -175,8 +189,20 @@ pub async fn sender_worker(
     failure.map_or(history_result, Err)
 }
 
-async fn send_entry(worker_id: usize, transport: &Arc<dyn SenderTransport>, entry: &Arc<ObservedEntry>) -> Result<()> {
-    if let Err(error) = transport.send(SenderMsg::CopyEntry { entry: entry.clone() }).await {
+async fn send_entry(
+    worker_id: usize, transport: &Arc<dyn SenderTransport>, entry: &Arc<ObservedEntry>,
+    cancel: Option<&CancellationToken>,
+) -> Result<()> {
+    let sending = transport.send(SenderMsg::CopyEntry { entry: entry.clone() });
+    let result = match cancel {
+        Some(cancel) => tokio::select! {
+            biased;
+            () = cancel.cancelled() => return Err(StorageError::Cancelled.into()),
+            result = sending => result,
+        },
+        None => sending.await,
+    };
+    if let Err(error) = result {
         error!(
             "[Sender Worker {}] Failed to send CopyEntry for {:?}: {}",
             worker_id,
