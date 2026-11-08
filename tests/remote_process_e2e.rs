@@ -602,7 +602,7 @@ fn test_remote_process_e2e_large_multi_chunk_file_mux() {
         .arg(&src_dir)
         .arg(&dest_dir);
 
-    sender_cmd.assert().success();
+    let sender_assertion = sender_cmd.assert().success();
 
     let receiver_status = wait_for_child_exit(&mut receiver_child, RECEIVER_EXIT_TIMEOUT);
     let (receiver_stdout, receiver_stderr) = drain_output(&mut receiver_child);
@@ -617,6 +617,15 @@ fn test_remote_process_e2e_large_multi_chunk_file_mux() {
         ),
     }
 
+    assert!(
+        rel_paths.iter().all(|path| dest_dir.join(path).is_file()),
+        "目标缺少文件，逐项状态={:?}\nSender 输出={:?}\nReceiver stdout={receiver_stdout}\nReceiver stderr={receiver_stderr}",
+        rel_paths
+            .iter()
+            .map(|path| (path, dest_dir.join(path).is_file()))
+            .collect::<Vec<_>>(),
+        sender_assertion.get_output(),
+    );
     assert_dest_matches_src(&src_dir, &dest_dir, &rel_paths);
 }
 
