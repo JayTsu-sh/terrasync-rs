@@ -1,8 +1,8 @@
-//! 只消费本次重新选中且目标已确认落库的事实；不清理范围外的旧源项。
+//! 清理本次选中且目标就绪的源项：有界窗口可先于入库，其余事实流式查询数据库收尾。
 
-use std::{path::Path, sync::Arc, time::Duration};
+use std::{collections::HashMap, path::Path, sync::Arc, time::Duration};
 
-use data_mover::model::{EntryKind, ObservedEntry, SourceVersion};
+use data_mover::model::{EntryIdentityKey, EntryKind, ObservedEntry, SourceVersion, StoragePath};
 use data_mover::storage::NamespaceReadPolicy;
 use db::ClickHouseDatabase;
 use task_model::observation::ObservedView;
@@ -21,6 +21,10 @@ use task_model::{SourcePresence, TargetRetention, TargetRetentionReason};
 mod verification;
 use verification::verify_source_metadata;
 mod content;
+mod ready_window;
+pub(crate) use ready_window::{EarlyCleanup, FullCleanupStage};
+
+type CompletedChecks = HashMap<StoragePath, EntryIdentityKey>;
 
 #[cfg(all(test, unix))]
 #[path = "source_cleanup_real_tests.rs"]
@@ -31,6 +35,7 @@ pub(crate) struct SourceCleanupCheck {
     read_policy: NamespaceReadPolicy,
     cancel: CancellationToken,
     verify_content: bool,
+    prechecked: Option<Arc<CompletedChecks>>,
 }
 
 impl SourceCleanupCheck {
@@ -43,12 +48,26 @@ impl SourceCleanupCheck {
             },
             cancel,
             verify_content: false,
+            prechecked: None,
         }
     }
 
     pub(crate) fn with_content_verification(mut self, enabled: bool) -> Self {
         self.verify_content = enabled;
         self
+    }
+
+    pub(crate) fn with_prechecked(mut self, entries: CompletedChecks) -> Self {
+        if !entries.is_empty() {
+            self.prechecked = Some(Arc::new(entries));
+        }
+        self
+    }
+
+    fn is_prechecked(&self, entry: &ObservedEntry) -> bool {
+        self.prechecked
+            .as_ref()
+            .is_some_and(|entries| entries.get(entry.path()) == Some(&entry.identity_key()))
     }
 }
 
@@ -62,6 +81,9 @@ pub(crate) async fn remove_confirmed_sources(
         database.query_current_copy_entries(None, None, None, sender).await
     }));
     while let Some(entry) = receiver.recv().await {
+        if check.is_prechecked(&entry) {
+            continue;
+        }
         // 一旦清理失败就停止发出新删除，避免断连后继续扩大未知副作用。
         remove_entry(&source, &destination, &entry, &check)
             .await

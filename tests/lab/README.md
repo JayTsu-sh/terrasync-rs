@@ -711,3 +711,61 @@ Single／双副本 ClickHouse 和 HTTP 204 callback，共 12 轮迁移。
 Single／双副本的 12 轮迁移及 HTTP 204／报告归档再验证通过。
 短读由确定性 role 注入，真实网络矩阵覆盖正常读取、权限、断连、静默、取消与恢复，
 未将两者混称为真实网络截断已验证。
+
+### 全量删源的有界就绪窗口
+
+最新实现对启用数据库的全量删源增加一个普通条目窗口：仅取最先完成的
+`concurrency.clamp(1, 64)` 次候选，不随总 entry 数增加编码次数；Arc 保留原观察，
+原值快照临时编码后立即释放，按编码长度四倍加 1024 的权重控制总准入不超过 8 MiB。
+这不是严格 RSS 上限，临时编码、allocator 及现有广播队列均计入实测。
+所有复制与枚举成功且没有选中目录／历史流程时，窗口先核验目标、确认持久性、
+复核源并受保护删除，与数据库最终冲刷并行。范围外、超预算、目录、对象源及历史流程
+仍沿用原收尾路径；本项没有实现全部条目的异步删源，也没有新增磁盘暂存或公开存储接口。
+
+`python3 tests/lab/run-notification-archive-local.py --copy-ready-cleanup`
+运行精确 ignored 用例
+`copy_execution::ready_cleanup_tests::real_full_move_ready_window_does_not_wait_for_fact_receipts`。
+真实 Local＋Single／双副本 ClickHouse 共 12 轮，覆盖成功、INSERT 转发前 403、
+目录退回原流程、窗口外条目、数据读取失败、元数据写入失败。
+父进程在真实事实 INSERT 尚未转发时核验窗口内源已删除、目标数据正确；
+窗口外及目录项保留到回执释放。数据失败的未完成目标清除，元数据失败的两端数据保留。
+权限失败使用独占目录中 uid/gid 65534 子进程，不修改共享权限。
+HTTP 204 callback 核验具体原因，数据库核验失败／成功代次、最终报告及空 base。
+
+`python3 tests/lab/run-source-ready-nfs.py` 运行精确 ignored 用例
+`copy_execution::ready_cleanup_nfs_tests::real_nfs_full_move_ready_window_and_combined_failure`。
+复用实验室授权的 PVE SSH／qm guest exec 通道，仅创建随机独占 NFS 前缀；
+两个隔离 ClickHouse 容器使用 localhost 随机端口，不修改共享服务、导出或防火墙。
+真实 v3／v4.1、quick／full、Single／双副本的 8 轮正常用例，在 INSERT 转发前通过
+服务端独立读取核验源消失、目标数据与 mode 正确。另两轮 v4.1 用私有 RPC 代理拦住
+源 REMOVE，在确认该请求到达后拒绝事实写入：源未删除、目标正确，任务保留数据库原因，
+callback 同时包含具体源路径及 source_deletion_unconfirmed／Unknown，最终报告入库。
+这些用例不把取消的未知结果当作源仍存在的证据，源是否存在由独立服务端检查确认。
+所有独占前缀、容器、代理、临时程序及文件均在 runner 退出时清理。
+
+本项正常开销 A/B 使用同机 Rust 1.98.1、dev debug=0、incremental=0，
+基线 `da72f50`，变更版只增加就绪窗口产品逻辑。每种场景以
+before／after／after／before／before／after 顺序各运行三次；
+每轮新建 3000 个 1 KiB 文件，目录场景为 100×30，创建数据不计时；
+并发 16、批次 100000、unordered、Direct、quick，使用同一隔离 Single ClickHouse。
+`/usr/bin/time` 记录进程整轮耗时与峰值 RSS，另以 50 ms 间隔采样实际 CLI 的 RSS；
+时间包含数据库与删源收尾，独立核验数据、源删除及 base 清空。
+
+| 场景 | before 耗时三次／秒 | after 耗时三次／秒 | before 峰值 RSS 三次／KiB | after 峰值 RSS 三次／KiB |
+| --- | --- | --- | --- | --- |
+| 保留源、不落库 | 0.54 / 0.43 / 0.53 | 0.53 / 0.53 / 0.43 | 166492 / 174256 / 172148 | 164468 / 169868 / 167344 |
+| 平铺删源、落库 | 5.53 / 5.27 / 5.10 | 5.66 / 5.33 / 5.20 | 199000 / 214536 / 207764 | 203188 / 205612 / 202844 |
+| 目录删源、落库 | 5.07 / 4.87 / 4.97 | 4.87 / 5.11 / 4.97 | 234176 / 225980 / 223844 | 226164 / 230728 / 221612 |
+
+耗时中位数变化分别为 0%、+1.14%、0%，RSS 中位数变化为 −2.79%、−2.20%、+0.08%。
+原始样本与每轮日志位于 `/tmp/terrasync-ready-window-perf/`；基线／变更程序 SHA-256
+分别为 `67cac56a0443fa9fbd46b9609c626741e6590f3329362dee7d7eeeaef1b47134`、
+`5ee66e95d0c00dbee7f5bbd03182cb859b7dde4e91a01372c15a74ba2ba31e97`。
+这一小样本只能限定本项 Local 正常开销，不能证明加速、release 达标或约 200 MiB 目标已满足；
+目录场景仍超过该目标。它与 PR #135／#137 的纯 NFS 扫描基线工作量不同，不直接计算差值。
+大规模、续扫、NFS 性能、目录／历史异步删源、全部后端及统一网络预算仍需后续验收。
+
+本项最终 Rust 检查已通过：fmt、workspace/all-targets check 与 Clippy、workspace 测试、
+16 项串行远程进程回归；本机使用 Rust 1.98.1，保留已有大型错误类型等警告。
+架构审查结论：迁移时序与组合错误在 app，目标持久性和受保护删除复用 data-mover，
+NFS 协议继续由 backend／SDK 负责；未增加公开存储入口，也未改变 SDK。

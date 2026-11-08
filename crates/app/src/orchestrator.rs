@@ -67,7 +67,7 @@ use crate::migration_plan::MigrationPlan;
 use crate::receiver::{ReceiverConfig, process_entry_on_receiver};
 use crate::scan::ScanType;
 use crate::sender::{SenderWorkerConfig, sender_worker};
-use crate::source_cleanup::{self, SourceCleanupCheck, remove_confirmed_sources};
+use crate::source_cleanup::{self, EarlyCleanup, FullCleanupStage, SourceCleanupCheck, remove_confirmed_sources};
 use crate::storage_factory::{StorageRole, create_storage_for_role};
 #[cfg(windows)]
 use crate::sync::check_admin_privileges;
@@ -597,6 +597,11 @@ impl SyncOrchestrator {
             .await?;
         consumer_manager.begin_lifecycle().await;
         let consumer_handles = consumer_manager.start_consumers(&mut broadcaster).await?;
+        let early_cleanup = if !is_source_reserved && database.is_some() {
+            Some(FullCleanupStage::start(&mut broadcaster, copy_concurrency))
+        } else {
+            None
+        };
         let bytes_tracker = consumer_manager.get_bytes_tracker().await;
 
         // ── 5. 解析 block_size + QoS ──
@@ -679,6 +684,7 @@ impl SyncOrchestrator {
             let alive_counter = alive_receivers.clone();
             let done_counter = mount_done_receivers.clone();
             let execution = consumer_manager.copy_database_execution();
+            let cleanup_connections = early_cleanup.as_ref().map(FullCleanupStage::connections);
 
             let span = info_span!("receiver_worker", recv_id = recv_id);
             let handle = tokio::spawn(
@@ -708,6 +714,9 @@ impl SyncOrchestrator {
                     done_counter.fetch_add(1, Ordering::Release);
                     let src = storage_pair.get_src_storage().clone();
                     let dest = storage_pair.get_dest_storage().clone();
+                    if let Some(connections) = cleanup_connections {
+                        let _ = connections.set((src.clone(), dest.clone()));
+                    }
 
                     // 从 transport 拉消息处理（MPMC，N 个 worker 竞争消费）
                     let mut failure = None;
@@ -894,49 +903,75 @@ impl SyncOrchestrator {
         }
 
         drop(broadcaster);
-        let consumers_result = finish_phase(consumer_handles).await;
         let source_result = walkdir_iter.take_error().map_or(Ok(()), |error| Err(error.into()));
+        let pipeline_result = senders_result
+            .and(receivers_result)
+            .and(source_dispatch_result)
+            .and(source_result);
+        let copy_ready = pipeline_result.is_ok();
+        let cleanup_check = SourceCleanupCheck::new(
+            Duration::from_secs(app_config.scan.operation_timeout_secs),
+            Duration::from_secs(app_config.scan.recovery_window_secs),
+            consumer_manager
+                .copy_database_execution()
+                .map(|execution| execution.token().clone())
+                .unwrap_or_default(),
+        );
+        let early = async {
+            match early_cleanup {
+                Some(stage) => stage.complete(copy_ready, cleanup_check.clone()).await,
+                None => Ok(EarlyCleanup::default()),
+            }
+        };
+        // 就绪窗口不等待数据库冲刷；两条链路均收束，失败时保留两类原始原因。
+        let (consumers_result, early_result) = tokio::join!(finish_phase(consumer_handles), early);
         let result: Result<()> = async {
             // 消费者关闭会使 worker 返回广播错误；优先保留导致关闭的真实原因。
-            consumers_result
-                .and(senders_result)
-                .and(receivers_result)
-                .and(source_dispatch_result)
-                .and(source_result)?;
+            let early = match (consumers_result.and(pipeline_result), early_result) {
+                (Ok(()), Ok(completed)) => completed,
+                (Err(source), Err(cleanup)) => {
+                    return Err(AppError::MigrationAndSourceCleanupFailed {
+                        source: Box::new(source),
+                        cleanup: Box::new(cleanup),
+                    });
+                }
+                (Err(error), Ok(_)) | (Ok(()), Err(error)) => return Err(error),
+            };
             if let Some(database) = &database {
-                let destination = Arc::new(
-                    create_storage_for_role(
-                        &c.dest_path,
-                        block_size.map(|size| size as u64),
-                        false,
-                        StorageRole::Destination,
+                let destination = if let Some((_, destination)) = &early.connections {
+                    destination.clone()
+                } else {
+                    Arc::new(
+                        create_storage_for_role(
+                            &c.dest_path,
+                            block_size.map(|size| size as u64),
+                            false,
+                            StorageRole::Destination,
+                        )
+                        .await?,
                     )
-                    .await?,
-                );
+                };
                 copy_completion::complete(database.clone(), destination.clone()).await?;
                 if !is_source_reserved {
                     // 全量文件已在传输阶段执行所选校验；增量跳过项由增量清理入口补齐数据校验。
-                    let source = Arc::new(
-                        create_storage_for_role(
-                            &c.src_path,
-                            block_size.map(|size| size as u64),
-                            false,
-                            StorageRole::Source,
+                    let source = if let Some((source, _)) = &early.connections {
+                        source.clone()
+                    } else {
+                        Arc::new(
+                            create_storage_for_role(
+                                &c.src_path,
+                                block_size.map(|size| size as u64),
+                                false,
+                                StorageRole::Source,
+                            )
+                            .await?,
                         )
-                        .await?,
-                    );
+                    };
                     remove_confirmed_sources(
                         database.clone(),
                         source,
                         destination,
-                        SourceCleanupCheck::new(
-                            Duration::from_secs(app_config.scan.operation_timeout_secs),
-                            Duration::from_secs(app_config.scan.recovery_window_secs),
-                            consumer_manager
-                                .copy_database_execution()
-                                .map(|execution| execution.token().clone())
-                                .unwrap_or_default(),
-                        ),
+                        cleanup_check.with_prechecked(early.checked),
                     )
                     .await?;
                 }

@@ -64,6 +64,12 @@ pub enum AppError {
         source: Box<AppError>,
         database: DatabaseError,
     },
+    #[error("迁移执行失败: {source}; 源清理同时失败: {cleanup}")]
+    MigrationAndSourceCleanupFailed {
+        #[source]
+        source: Box<AppError>,
+        cleanup: Box<AppError>,
+    },
     #[error("历史版本分段顺序无效: {path:?}, expected={expected}, actual={actual}")]
     CopyHistoryOrder { path: PathBuf, expected: u32, actual: u32 },
     #[error("历史版本没有完整结束: {path:?}, last_version={last_version:?}")]
@@ -366,6 +372,9 @@ pub type Result<T> = std::result::Result<T, AppError>;
 impl AppError {
     pub(crate) fn source_cleanup_entry(&self) -> Option<(&Path, &Self)> {
         match self {
+            Self::MigrationAndSourceCleanupFailed { source, cleanup } => {
+                cleanup.source_cleanup_entry().or_else(|| source.source_cleanup_entry())
+            }
             Self::CopyExecutionStopped { source } => source.source_cleanup_entry(),
             Self::CopyEntryFailed {
                 step: CopyStep::SourceCleanup,
@@ -417,6 +426,9 @@ impl AppError {
 
     pub fn storage_error(&self) -> Option<&StorageError> {
         match self {
+            Self::MigrationAndSourceCleanupFailed { source, cleanup } => {
+                source.storage_error().or_else(|| cleanup.storage_error())
+            }
             Self::CopyExecutionStopped { source } => source.storage_error(),
             Self::CopyEntryFailed { source, .. }
             | Self::ReportedCopyFailure { source, .. }

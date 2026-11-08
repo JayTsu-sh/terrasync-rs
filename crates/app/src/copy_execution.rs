@@ -38,6 +38,12 @@ mod mutable_tests;
 #[cfg(test)]
 #[path = "copy_plan_tests.rs"]
 mod plan_tests;
+#[cfg(all(test, unix))]
+#[path = "copy_ready_cleanup_nfs_tests.rs"]
+mod ready_cleanup_nfs_tests;
+#[cfg(all(test, unix))]
+#[path = "copy_ready_cleanup_tests.rs"]
+mod ready_cleanup_tests;
 #[cfg(test)]
 #[path = "copy_request_tests.rs"]
 mod request_tests;
