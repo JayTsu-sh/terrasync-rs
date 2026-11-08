@@ -99,6 +99,8 @@ pub struct ReceiverConfig {
     pub job_dir: String,
     /// 显式选定的写入模式。
     pub transfer_mode: TransferMode,
+    /// 当前任务的取消信号；独立调用方可以不绑定任务。
+    pub cancel: Option<CancellationToken>,
 }
 
 /// 单进程模式的 Receiver 主 task（R1 + R2 合一）
@@ -203,6 +205,9 @@ pub(crate) async fn process_entry_on_receiver(
     let span = info_span!("recv_entry", path = %relative_path.display());
 
     async {
+        if config.cancel.as_ref().is_some_and(CancellationToken::is_cancelled) {
+            return Err(StorageError::Cancelled.into());
+        }
         if prepare_directory(entry, dest_storage).await? {
         } else if entry.get_is_symlink() {
             let target_path = copy_namespace::read_symlink(src_storage.storage(), entry)
@@ -217,6 +222,7 @@ pub(crate) async fn process_entry_on_receiver(
                 job_id: config.job_id.clone(),
                 job_dir: config.job_dir.clone(),
                 transfer_mode: config.transfer_mode,
+                cancel: config.cancel.clone(),
             };
             if dest_storage.as_ref().storage().kind() == BackendKind::Hdfs {
                 let hdfs = HdfsCopyContext::from_job(&config.job_id, config.transfer_mode)?;
@@ -237,7 +243,7 @@ pub(crate) async fn process_entry_on_receiver(
                         qos: qos_manager,
                         enable_integrity_check: config.enable_integrity_check,
                         bytes_counter,
-                        ..Default::default()
+                        cancel: config.cancel.clone(),
                     },
                     Some(&hdfs),
                 )
@@ -257,7 +263,7 @@ pub(crate) async fn process_entry_on_receiver(
                         qos: qos_manager,
                         enable_integrity_check: config.enable_integrity_check,
                         bytes_counter,
-                        ..Default::default()
+                        cancel: config.cancel.clone(),
                     },
                     &config.job_dir,
                 )
@@ -272,7 +278,7 @@ pub(crate) async fn process_entry_on_receiver(
                         qos: qos_manager,
                         enable_integrity_check: config.enable_integrity_check,
                         bytes_counter,
-                        ..Default::default()
+                        cancel: config.cancel.clone(),
                     },
                     None,
                 )

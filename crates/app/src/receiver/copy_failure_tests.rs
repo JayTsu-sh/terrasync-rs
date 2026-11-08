@@ -24,6 +24,7 @@ fn config() -> ReceiverConfig {
         enable_acl: false,
         is_source_reserved: true,
         transfer_mode: TransferMode::Direct,
+        cancel: None,
     }
 }
 

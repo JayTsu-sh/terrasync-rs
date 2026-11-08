@@ -406,3 +406,6 @@ async fn real_copy_consumers_recover_and_stop_after_final_failure() -> Result<()
 
 #[path = "execution_real_tests.rs"]
 mod execution_tests;
+
+#[path = "data_cancellation_real_tests.rs"]
+mod data_cancellation_tests;

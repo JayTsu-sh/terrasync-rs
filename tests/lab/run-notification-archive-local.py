@@ -84,7 +84,7 @@ def run_isolated():
                 print(f"isolated S3 image={docker('inspect', containers[-1], '--format', '{{.Image}}')}", flush=True)
             print(f"isolated notification image={docker('inspect', containers[0], '--format', '{{.Image}}')}", flush=True)
             pid = docker("inspect", containers[0], "--format", "{{.State.Pid}}")
-            suite = [flag for flag in ("--copy-generations", "--catalogue-recovery", "--consumer-recovery", "--copy-execution", "--rename-generations", "--retention-events", "--source-absence", "--request-policy", "--copy-contracts", "--version-catalogue", "--mutable-catalogue", "--version-metadata", "--scan-wire") if flag in sys.argv]
+            suite = [flag for flag in ("--copy-generations", "--catalogue-recovery", "--consumer-recovery", "--copy-execution", "--copy-data-cancel", "--rename-generations", "--retention-events", "--source-absence", "--request-policy", "--copy-contracts", "--version-catalogue", "--mutable-catalogue", "--version-metadata", "--scan-wire") if flag in sys.argv]
             subprocess.run(["nsenter", "-t", pid, "-n", sys.executable, __file__, "--inside", *suite], cwd=ROOT, check=True)
         except BaseException:
             for container in containers:
@@ -126,7 +126,7 @@ def run_copy_generations():
                 self.end_headers()
                 self.wfile.write(payload)
                 return
-            if self.path not in ("/normal", "/disconnect", "/stall", "/startup_disconnect", "/startup_stall", "/reject_prepare",
+            if self.path not in ("/normal", "/disconnect", "/stall", "/startup_disconnect", "/startup_stall", "/running_disconnect", "/running_stall", "/reject_prepare",
                                  "/compare_flash", "/compare_lost", "/compare_disconnect", "/compare_stall", "/compare_recover_stall", "/compare_reject",
                                  "/batch_flash", "/batch_lost", "/batch_disconnect", "/batch_stall", "/batch_recover_stall", "/batch_reject"):
                 self.send_error(404)
@@ -187,6 +187,15 @@ def run_copy_generations():
                         state = "normal"
                     else:
                         fault = "normal"
+                # 运行期只中断数据路径，通知可用；执行开始取消后再恢复数据连接。
+                if fault.startswith("running_"):
+                    if b"KILL QUERY" in query.upper():
+                        # 只在数据执行已经请求停止时恢复；通知通道可用不能掩盖数据故障。
+                        state = fault = "normal"
+                    elif "notifications_" in urllib.parse.unquote(self.path) or b"notifications_" in body:
+                        fault = "normal"
+                    else:
+                        fault = fault.split("_", 1)[1]
                 # 启动探测持续失败；进入通知归档后恢复数据库，单独验证最终通知链路。
                 if fault.startswith("startup_"):
                     if "notifications_" in urllib.parse.unquote(self.path) or b"notifications_" in body:
@@ -237,6 +246,9 @@ def run_copy_generations():
     environment["LAB_COPY_GENERATION_DSN"] = f"http://{address}"
     environment["LAB_COPY_GENERATION_CONTROL"] = address
     try:
+        if "--copy-data-cancel" in sys.argv:
+            run_copy_data_cancellation(environment)
+            return
         if "--copy-execution" in sys.argv:
             run_copy_execution(environment)
             return
@@ -461,6 +473,44 @@ def run_version_catalogue(environment):
         source_proxy.server_close()
 
 
+def run_copy_data_cancellation(environment):
+    reports = []
+    class Callback(http.server.BaseHTTPRequestHandler):
+        def log_message(self, *_):
+            pass
+        def do_POST(self):
+            reports.append(json.loads(self.rfile.read(int(self.headers["Content-Length"]))))
+            self.send_response(204)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+    callback = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Callback)
+    callback.daemon_threads = True
+    threading.Thread(target=callback.serve_forever, daemon=True).start()
+    environment["LAB_COPY_DATA_CANCEL_CALLBACK"] = f"http://127.0.0.1:{callback.server_port}/callback"
+    try:
+        subprocess.run([
+            "cargo", "test", "--offline", "--locked", "-p", "app", "--lib",
+            "real_database_fault_cancels_active_direct_and_checkpoint_data", "--", "--ignored", "--nocapture",
+        ], cwd=ROOT, env=environment, check=True)
+        summaries = [report for report in reports if report["is_final"] and not report.get("diagnostics")]
+        assert len(summaries) == 32 and all(report["diagnostics_complete"] for report in summaries), summaries
+        failed = [report for report in summaries if report["task_error_count"] == 1]
+        assert len(failed) == 16 and all(report["migration"]["phase"] == "failed" for report in failed), failed
+        for failed_report in failed:
+            attempt = failed_report["callback_identity"]["attempt_id"]
+            causes = [event for report in reports
+                      if report["callback_identity"]["attempt_id"] == attempt
+                      for event in (report.get("diagnostics") or {}).get("events", [])]
+            assert any("ClickHouse unavailable after" in event["message"] for event in causes), causes
+        resumed = [report for report in summaries if report["migration"]["generation"] >= 2 and report["task_error_count"] == 0]
+        # 增量基线轮只有 generation=1，成功的后续轮都来自检查点恢复。
+        assert len(resumed) == 8 and all(report["detail"]["transferred_bytes"] < 256 * 1024 * 1024 for report in resumed), resumed
+        print("independent data cancellation callback inspection deployments=2 failed_runs=16 checkpoint_resumptions=8 HTTP_204=accepted diagnostics_complete=true", flush=True)
+    finally:
+        callback.shutdown()
+        callback.server_close()
+
+
 def run_copy_execution(environment):
     reports = []
     class Callback(http.server.BaseHTTPRequestHandler):
@@ -648,7 +698,7 @@ def run_inside():
             time.sleep(0.2)
         else:
             raise RuntimeError(f"ClickHouse readiness timed out on port {port}")
-    if any(flag in sys.argv for flag in ("--copy-generations", "--catalogue-recovery", "--consumer-recovery", "--copy-execution", "--rename-generations", "--retention-events", "--source-absence", "--request-policy", "--copy-contracts", "--version-catalogue", "--mutable-catalogue", "--version-metadata", "--scan-wire")):
+    if any(flag in sys.argv for flag in ("--copy-generations", "--catalogue-recovery", "--consumer-recovery", "--copy-execution", "--copy-data-cancel", "--rename-generations", "--retention-events", "--source-absence", "--request-policy", "--copy-contracts", "--version-catalogue", "--mutable-catalogue", "--version-metadata", "--scan-wire")):
         run_copy_generations()
         return
     environment = dict(os.environ)

@@ -11,10 +11,9 @@ use crate::{
     tar_pack,
     task_stream::AsyncReceiver,
 };
-use data_mover::qos::QosManager;
 use std::sync::{
     Arc,
-    atomic::{AtomicU64, AtomicUsize, Ordering},
+    atomic::{AtomicUsize, Ordering},
 };
 use task_model::{
     ChangeKind, ErrorEvent, ObservedEntryExt, StorageEntryMessage, TargetRetention, TargetRetentionReason,
@@ -24,8 +23,8 @@ use tracing::{Instrument, error, info, info_span};
 
 pub(super) async fn spawn_handlers(
     c: &SyncJobConfig, handler_inputs: Vec<AsyncReceiver<StorageEntryMessage>>,
-    broadcaster: BroadcastForwarder<StorageEntryMessage>, qos_manager: Option<QosManager>,
-    bytes_tracker: Option<Arc<AtomicU64>>, block_size: Option<usize>, history_policy: HistoryCopyPolicy,
+    broadcaster: BroadcastForwarder<StorageEntryMessage>, options: CopyOptions, block_size: Option<usize>,
+    history_policy: HistoryCopyPolicy,
 ) -> Vec<JoinHandle<Result<()>>> {
     let copy_concurrency = handler_inputs.len();
     let is_source_reserved = c.source_cleanup.retains_source();
@@ -44,14 +43,16 @@ pub(super) async fn spawn_handlers(
         let src_path_c = src_path_str.clone();
         let dest_path_c = dest_path_str.clone();
         let bc = broadcaster.clone();
-        let qos = qos_manager.clone();
-        let bt = bytes_tracker.clone();
-        let enable_integrity_check = c.enable_integrity_check;
+        let qos = options.qos.clone();
+        let bt = options.bytes_counter.clone();
+        let transfer_options = options.clone();
+        let enable_integrity_check = options.enable_integrity_check;
         let enable_acl = c.enable_acl;
         let resume_opts = ResumeOpts {
             job_id: c.job_id.clone(),
             job_dir: c.job_dir.clone(),
-            transfer_mode: c.transfer_mode,
+            transfer_mode: options.transfer_mode,
+            cancel: options.cancel.clone(),
         };
         let mount_sem = mount_semaphore.clone();
         let alive_counter = alive_handlers.clone();
@@ -93,13 +94,7 @@ pub(super) async fn spawn_handlers(
                         destination: dest.clone(),
                         broadcaster: bc.clone(),
                         job_id: resume_opts.job_id.clone(),
-                        options: CopyOptions {
-                            transfer_mode: resume_opts.transfer_mode,
-                            qos: qos.clone(),
-                            enable_integrity_check,
-                            bytes_counter: bt.clone(),
-                            cancel: None,
-                        },
+                        options: transfer_options,
                     },
                     history_policy,
                 );

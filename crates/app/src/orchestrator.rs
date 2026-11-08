@@ -59,7 +59,7 @@ use crate::copy_execution::{CopyDatabaseExecution, CopyLease, begin_copy_catalog
 use crate::copy_history::{HistoryCompletion, HistoryCopyPolicy};
 use crate::dir_walker;
 use crate::error::{AppError, Result};
-use crate::file_copy::VersionFailureContext;
+use crate::file_copy::{CopyOptions, VersionFailureContext};
 #[cfg(feature = "license")]
 use crate::integrity_check::verify_storage_time;
 use crate::migration_plan::MigrationPlan;
@@ -625,6 +625,9 @@ impl SyncOrchestrator {
             is_source_reserved,
             job_dir: c.job_dir.clone(),
             transfer_mode: c.transfer_mode,
+            cancel: consumer_manager
+                .copy_database_execution()
+                .map(|execution| execution.token().clone()),
         });
 
         // ── 8.5. 创建 mount 限流信号量 + countdown latch 计数器（Sender + Receiver 共享） ──
@@ -1056,8 +1059,15 @@ impl SyncOrchestrator {
             c,
             handler_inputs,
             broadcaster.clone(),
-            qos_manager.clone(),
-            bytes_tracker.clone(),
+            CopyOptions {
+                transfer_mode: c.transfer_mode,
+                qos: qos_manager.clone(),
+                bytes_counter: bytes_tracker.clone(),
+                enable_integrity_check: c.enable_integrity_check,
+                cancel: consumer_manager
+                    .copy_database_execution()
+                    .map(|execution| execution.token().clone()),
+            },
             block_size,
             HistoryCopyPolicy {
                 active_entry_limit: incremental_scan_concurrency,

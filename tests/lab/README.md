@@ -441,3 +441,19 @@ whole-run time includes preparation and reporting. The runner independently chec
 24 final HTTP 204 summaries, original failure causes, recovered counts and preserved
 source/previous target. This does not certify active storage-I/O cancellation or a
 whole-task deadline with large files or stalled backend initialization.
+
+
+`run-notification-archive-local.py --copy-data-cancel` interrupts the task-owned
+ClickHouse data/probe path after real Local payload bytes are already written.
+The notification archive path stays available; the data path is restored only
+after the execution requests query cancellation. Single and two-replica Cluster,
+full and incremental, Direct and Checkpoint each cover disconnect and silent
+requests. The 256 MiB payload is source-throttled; Checkpoint injection waits
+until more than the native 64 MiB automatic checkpoint boundary has been written.
+The runner checks that failed runs retain the source, Direct removes its owned
+partial output, and Checkpoint reruns reuse actual bytes rather than merely
+leaving a partial file. It also checks HTTP 204 final summaries and error totals.
+This covers cancellation propagated from the database execution to ordinary
+Local file transfers. It does not certify cancellation of traversal, directory
+or metadata operations, backend initialization, rename or remote transfer, nor
+storage-network recovery or whole-task throughput and RSS.

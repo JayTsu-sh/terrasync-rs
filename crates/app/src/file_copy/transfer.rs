@@ -204,7 +204,11 @@ async fn execute_native(
     if let Some(data) = data
         && let Some(counter) = &options.bytes_counter
     {
-        counter.fetch_add(data.transferred_bytes, Ordering::Relaxed);
+        // 原生完成量包含已复用字节；本轮传输只累计新增且已确认的目标数据。
+        counter.fetch_add(
+            data.transferred_bytes.saturating_sub(data.reused_bytes),
+            Ordering::Relaxed,
+        );
     }
     match result {
         Ok(outcome) => Ok(outcome),

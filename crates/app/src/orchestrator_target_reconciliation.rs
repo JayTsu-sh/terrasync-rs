@@ -222,6 +222,7 @@ impl SyncOrchestrator {
                                 job_id: job_id.into(),
                                 job_dir: job_dir.into(),
                                 transfer_mode,
+                                cancel: None,
                             },
                         )
                         .await
@@ -241,6 +242,7 @@ impl SyncOrchestrator {
                                     job_id: job_id.into(),
                                     job_dir: job_dir.into(),
                                     transfer_mode,
+                                    cancel: None,
                                 },
                                 qos: qos_manager.clone(),
                                 bytes: bytes_counter.clone(),

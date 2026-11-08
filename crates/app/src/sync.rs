@@ -11,6 +11,7 @@ use crate::file_copy::metadata as copy_metadata;
 use crate::file_copy::namespace as copy_namespace;
 use crate::file_copy::transfer as copy_transfer;
 use data_mover::model::BackendKind;
+use tokio_util::sync::CancellationToken;
 // 标准库
 use crate::file_copy::{CopyOptions, HdfsCopyContext, copy_file, prepare_directory};
 use std::sync::Arc;
@@ -39,7 +40,7 @@ use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken}
 // 内部模块
 use crate::broadcast::BroadcastForwarder;
 use crate::byte_resume::ByteResumeStore;
-use crate::error::{AppError, Result};
+use crate::error::{AppError, Result, StorageError};
 use crate::storage_factory::{StorageRole, create_storage_for_role};
 
 /// 存储资源管理器 - 统一管理源和目标存储实例
@@ -312,6 +313,9 @@ async fn process_entry_inner(
     let span = info_span!("process_entry", path = %relative_path.display());
 
     async {
+    if resume.cancel.as_ref().is_some_and(CancellationToken::is_cancelled) {
+        return Err(StorageError::Cancelled.into());
+    }
     trace!(
         "Processing entry: {:?} with parameters: enable_integrity_check: {:?}, enable_acl: {:?}, is_source_reserved: {:?}",
         relative_path, enable_integrity_check, opts.enable_acl, is_source_reserved
@@ -360,7 +364,7 @@ async fn process_entry_inner(
                 qos: qos_manager,
                 enable_integrity_check,
                 bytes_counter,
-                ..Default::default()
+                cancel: resume.cancel.clone(),
             },
             Some(&hdfs),
         )
@@ -380,7 +384,7 @@ async fn process_entry_inner(
                 qos: qos_manager,
                 enable_integrity_check,
                 bytes_counter,
-                ..Default::default()
+                cancel: resume.cancel.clone(),
             },
             &resume.job_dir,
         )
@@ -402,7 +406,7 @@ async fn process_entry_inner(
                 qos: qos_manager,
                 enable_integrity_check,
                 bytes_counter,
-                ..Default::default()
+                cancel: resume.cancel.clone(),
             },
         )
         .await?;
@@ -426,6 +430,7 @@ pub(crate) struct ResumeOpts {
     pub job_dir: String,
     /// 显式选定的写入模式。
     pub transfer_mode: TransferMode,
+    pub cancel: Option<CancellationToken>,
 }
 
 pub(crate) struct CommitRecorder {
