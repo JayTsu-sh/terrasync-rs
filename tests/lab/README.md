@@ -543,3 +543,17 @@ toolchain, non-S3 protocol cancellation and formal whole-job performance/RSS A/B
 were not established by this step. Architecture review kept read cancellation in
 the existing backend-independent metadata verifier, generation/base lifetime in db,
 and task error classification in the application. No new outward Native API was added.
+
+## NFS 目标持久化与删源原语
+
+`source_cleanup::real_tests::target_nfs::real_target_nfs_persistence_gates_source_removal`
+是 app lib 的 ignored 真实回归，需准备独占的 NFSv4.1 目标前缀和 COMMIT 感知的私有代理。
+使用 data-mover 实验室的 RPC framing／XID 代理，通过 `LAB_NFS_DIRECT_PROXY_URL`
+配置目标、`LAB_SOURCE_GUARD_CONTROL` 配置该代理的 HTTP 控制地址。只影响本次测试连接。
+
+已执行 quick／full 正常确认，以及 COMMIT 闪断、持续断连、静默超时、取消、响应丢失：
+正常和恢复后确认成功才删除 Local 源文件；三个未确认场景保留源文件并返回准确的
+TargetPersistenceUnconfirmed 类型。独立读取检查七个目标内容正确且无传输产物。
+该测试调用生产删源原语，不运行数据库、整个 CLI 或外部 callback；不能冒充上述链路
+及 pNFS DS、目录／链接持久化、吞吐／RSS 的组合验收。准备、二进制部署和精确前缀清理
+由实验室执行方负责，本次前缀及私有代理均已清理。

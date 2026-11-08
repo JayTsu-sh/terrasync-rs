@@ -227,3 +227,6 @@ async fn real_nfs_mode_change_after_copy_retains_source_and_unchanged_mode_can_b
     );
     Ok(())
 }
+
+#[path = "source_cleanup_target_nfs_real_tests.rs"]
+mod target_nfs;
