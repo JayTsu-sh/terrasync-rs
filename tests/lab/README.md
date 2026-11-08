@@ -596,3 +596,25 @@ V4.1 闪断和丢回复恢复；v3 对已经发送的删源请求保留不确定
 本轮实验前缀、私有服务和工作节点产物均已清理。并发源修改、统一任务故障预算、整轮
 CLI／ClickHouse／callback、NFSv4.0／4.2／pNFS、掉电及吞吐／RSS 仍不在上述验收范围。
 当前源清理仍位于数据库收尾后；本轮没有解除该屏障。
+
+### NFS 元数据计划的实际请求审计
+
+`migration_plan::nfs_real_tests::real_nfs_metadata_plan_controls_acl_reads_and_preserves_data_on_failure`
+是 app lib ignored 真实用例，使用原生 `run-nfs-direct-contract.py --contract metadata-plan
+--test-name <该用例名>` 及独占源前缀，通过 `LAB_METADATA_PLAN_TARGET_URL` 指定独立目标子前缀。
+对象目标计划使用 S3 能力投影，实际复制目标为 NFS；该用例不宣称已运行 S3 服务。
+
+锁定 nfs-rs fdc541c、data-mover a655be9 后，实际 GETATTR／LOOKUP／READDIR 掩码审计
+记录 118 次属性请求、零隐式 ACL、三次显式 ACL 查询和两次注入的权限拒绝。
+在切换 ACL 故障阶段前，代理先确认省略阶段无任何 ACL 查询；拒绝响应保留真实 RPC、
+SEQUENCE 和 PUTFH 身份，且仍可在同一连接上读取后续 ACL。
+源元数据失败时实际 copy_file 完成全部字节，返回 PublishedDataMetadata 和
+SourceMetadataAcquisitionFailed 的 ACL／PermissionDenied 原因；目标数据、源数据保留，
+源清理被拒绝。需要的 ACL 原值可通过 EntrySnapshot 往返并用于复制。
+独立服务端读取核验三组源／目标内容、完成的权限模式及无传输产物。
+
+同一 SDK 通过原有 v3 五类、v4.1 六类受保护删源网络回归，元数据夹具在故障后仍完整。
+应用精确 Git 依赖再运行审计与 v3／v4.1 原有源／目标复核用例，通过对应 Rust CI 和
+16 项远程进程串行回归（本机 Rust 1.98.1）；原生完整 make ci 通过。
+本轮不覆盖整轮 CLI、真实 S3 目标、ClickHouse／callback、统一任务网络预算、掉电或吞吐／RSS。
+本轮独占前缀、私有代理及 HTTP 服务、工作节点产物均已清理。

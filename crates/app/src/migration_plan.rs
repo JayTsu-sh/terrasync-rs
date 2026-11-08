@@ -23,7 +23,7 @@ mod tests {
     use data_mover::model::AclEncoding;
     use data_mover::storage::{CopiedOwnershipTarget, CopiedTimestampTarget};
 
-    const OBJECT_TARGET: CopiedMetadataTarget = CopiedMetadataTarget {
+    pub(super) const OBJECT_TARGET: CopiedMetadataTarget = CopiedMetadataTarget {
         timestamps: CopiedTimestampTarget::NotStored,
         ownership: CopiedOwnershipTarget::Unsupported,
         acl: CopiedAclTarget::Unsupported,
@@ -190,3 +190,7 @@ impl MigrationPlan {
         }
     }
 }
+
+#[cfg(all(test, unix))]
+#[path = "migration_plan_nfs_real_tests.rs"]
+mod nfs_real_tests;
