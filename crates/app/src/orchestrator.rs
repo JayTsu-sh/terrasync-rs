@@ -57,7 +57,7 @@ use crate::consumer::ConsumerManager;
 use crate::copy_completion;
 use crate::copy_execution::{CopyDatabaseExecution, CopyLease, begin_copy_catalogue, compile_copy_request};
 use crate::copy_history::{HistoryCompletion, HistoryCopyPolicy};
-use crate::dir_walker;
+use crate::dir_walker::DirectoryWalker;
 use crate::error::{AppError, Result};
 use crate::file_copy::{CopyOptions, VersionFailureContext};
 #[cfg(feature = "license")]
@@ -564,7 +564,14 @@ impl SyncOrchestrator {
         )?);
 
         // 先建立枚举，再启动后台消费者；连接失败时没有待收尾的 worker。
-        let walkdir_iter = dir_walker::walkdir(scan_config).await?;
+        let walkdir_iter = DirectoryWalker::new(scan_config)
+            .with_cancellation(
+                consumer_manager
+                    .copy_database_execution()
+                    .map(|execution| execution.token().clone()),
+            )
+            .walk()
+            .await?;
 
         // ── 4. 广播器 + 消费者 ──
         let mut broadcaster = BroadcastForwarder::new(DEFAULT_CHANNEL_CAPACITY);
@@ -847,6 +854,7 @@ impl SyncOrchestrator {
         let senders_result = finish_phase(sender_handles).await;
         walkdir_iter.close();
         let source_dispatch_result = finish_phase(vec![source_dispatch]).await;
+        walkdir_iter.wait_for_producer().await;
 
         // ── 12. 关闭管线（和原始 sync_inner 一致） ──
         // Sender workers 全部完成 → 不再发 CopyEntry
@@ -990,7 +998,14 @@ impl SyncOrchestrator {
         let batch_size = consumer_config.db_config.batch_size as usize;
 
         // 枚举初始化失败时尚未启动 Phase A 的后台任务。
-        let walkdir_iter = dir_walker::walkdir(scan_config).await?;
+        let walkdir_iter = DirectoryWalker::new(scan_config)
+            .with_cancellation(
+                consumer_manager
+                    .copy_database_execution()
+                    .map(|execution| execution.token().clone()),
+            )
+            .walk()
+            .await?;
 
         // ── 4. 消费者管理器 + 共享生命周期（跨 Phase A/B 共用同一份统计累积） ──
         consumer_manager
@@ -1167,6 +1182,7 @@ impl SyncOrchestrator {
         let scan_result = finish_phase(scan_worker_handles).await;
         walkdir_iter.close();
         let scan_dispatch_result = finish_phase(vec![scan_dispatch]).await;
+        walkdir_iter.wait_for_producer().await;
 
         // ── 15. 关闭 detect_broadcaster → dispatch task 的 file_op_rx 耗尽 ──
         // scan workers 已全部退出，其 detect_broadcaster clone 均已 drop；

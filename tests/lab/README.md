@@ -457,3 +457,13 @@ This covers cancellation propagated from the database execution to ordinary
 Local file transfers. It does not certify cancellation of traversal, directory
 or metadata operations, backend initialization, rename or remote transfer, nor
 storage-network recovery or whole-task throughput and RSS.
+
+
+The native directory iterator now shares the local copy execution cancellation
+signal. Its channel owner can cancel backpressure and explicitly join the adapter,
+which waits for native traversal completion. Local producer tests cover a full
+128-entry buffer, parent cancellation, completed-but-undelivered buffers, normal
+EOF, concurrent join waiters and a typed producer panic. The copy data-cancellation
+and comparison suites exercise the actual full/incremental orchestration around
+this scope. File-list point reads and initialization are separate pending work;
+these checks do not certify whole-task or storage-network deadlines.

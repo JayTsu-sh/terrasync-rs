@@ -113,6 +113,12 @@ pub enum StorageError {
     IoError(#[from] std::io::Error),
     #[error(transparent)]
     TaskJoinError(#[from] JoinError),
+    #[error("stream producer failed: {source}; preceding stream failure: {preceding}")]
+    StreamProducerFailed {
+        #[source]
+        source: JoinError,
+        preceding: Box<StorageError>,
+    },
     #[error(transparent)]
     Role(#[from] StorageRoleFailure),
     #[error(transparent)]

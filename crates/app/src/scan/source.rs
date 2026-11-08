@@ -49,6 +49,9 @@ impl StorageContext {
             .directory_object_metadata(options.metadata_scope.directory_object_output)
             .max_inflight_operations(NonZeroUsize::new(options.concurrency).unwrap_or(NonZeroUsize::MIN))
             .max_depth(options.depth.and_then(NonZeroUsize::new));
+        if let Some(cancel) = &options.cancel {
+            request = request.cancel(cancel.child_token());
+        }
         if blocks {
             request = request.order(TraversalOrder::Blocks);
         }
@@ -122,6 +125,7 @@ impl StorageContext {
         let request = self
             .traversal_request(sub, &options, false)?
             .report_root_directory_object(report_root);
+        let cancel = request.cancel.clone();
         let scan = self.start_traversal(request, &options)?;
         let mut session = scan.session;
         let guard = scan.failure;
@@ -131,7 +135,9 @@ impl StorageContext {
         let package = PackageFilter::new(&options);
         let root = sub.unwrap_or(Path::new("")).to_path_buf();
         let (tx, rx) = async_channel::bounded(128);
-        tokio::spawn(async move {
+        let producer_cancel = cancel.clone();
+        let task = tokio::spawn(async move {
+            let cancel_on_drop = producer_cancel.clone().drop_guard();
             let mut histories = HistorySequence::default();
             while let Some(item) = session.next_item().await {
                 let message = match item {
@@ -146,15 +152,19 @@ impl StorageContext {
                                 .lock()
                                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                                 .get_or_insert(error);
-                            let _ = tx
-                                .send(StorageEntryMessage::Error {
+                            deliver(
+                                &tx,
+                                &producer_cancel,
+                                StorageEntryMessage::Error {
                                     event: ErrorEvent::Scan,
                                     path: root.clone(),
                                     entry: None,
                                     reason,
-                                })
-                                .await;
-                            return;
+                                },
+                            )
+                            .await;
+                            producer_cancel.cancel();
+                            break;
                         }
                         let projected = *entry;
                         let relative = projected
@@ -166,8 +176,8 @@ impl StorageContext {
                         } else {
                             StorageEntryMessage::Scanned(Arc::new(projected))
                         };
-                        if tx.send(message).await.is_err() {
-                            return;
+                        if !deliver(&tx, &producer_cancel, message).await {
+                            break;
                         }
                         continue;
                     }
@@ -218,27 +228,32 @@ impl StorageContext {
                     }
                     _ => continue,
                 };
-                if tx.send(message).await.is_err() {
-                    return;
+                if !deliver(&tx, &producer_cancel, message).await {
+                    break;
                 }
             }
-            if !histories.is_complete() {
+            if !histories.is_complete() && !producer_cancel.is_cancelled() {
                 stored_error
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .get_or_insert_with(|| operation("incomplete object history"));
-                let _ = tx
-                    .send(StorageEntryMessage::Error {
+                deliver(
+                    &tx,
+                    &producer_cancel,
+                    StorageEntryMessage::Error {
                         event: ErrorEvent::Scan,
                         path: PathBuf::new(),
                         entry: None,
                         reason: "incomplete object history".into(),
-                    })
-                    .await;
-                return;
+                    },
+                )
+                .await;
+                producer_cancel.cancel();
             }
+            // 提前结束交付时也必须消费到 EOF，才能等待原生完成证据。
+            while session.next_item().await.is_some() {}
             match session.finish().await {
-                Ok(TraversalOutcome::Completed(_)) => {}
+                Ok(TraversalOutcome::Completed(_)) if !producer_cancel.is_cancelled() => {}
                 result => {
                     let reason = format!("traversal did not complete: {result:?}");
                     let error = match result {
@@ -249,20 +264,26 @@ impl StorageContext {
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner)
                         .get_or_insert(error);
-                    let _ = tx
-                        .send(StorageEntryMessage::Error {
+                    deliver(
+                        &tx,
+                        &producer_cancel,
+                        StorageEntryMessage::Error {
                             event: ErrorEvent::Scan,
                             path: PathBuf::new(),
                             entry: None,
                             reason,
-                        })
-                        .await;
+                        },
+                    )
+                    .await;
                 }
             }
+            // 正常 EOF 不取消信号，仍允许消费者排空已经交付的缓冲。
+            cancel_on_drop.disarm();
         });
         Ok(AsyncReceiver::new(rx)
             .with_scan_failure(terminal_error, guard)
-            .with_recovery(recovery))
+            .with_recovery(recovery)
+            .with_producer(task, cancel))
     }
     /// 交付原生目录块；历史顺序和必需事实在编号／传输前完成准入。
     pub fn directory_inventory(&self, options: &WalkOptions) -> Result<DirectoryInventory> {
@@ -273,6 +294,21 @@ impl StorageContext {
             ended: false,
         })
     }
+}
+
+/// 交付背压不能阻塞取消；接收端关闭时同步停止本次原生遍历。
+async fn deliver(
+    tx: &async_channel::Sender<StorageEntryMessage>, cancel: &CancellationToken, message: StorageEntryMessage,
+) -> bool {
+    let delivered = tokio::select! {
+        biased;
+        () = cancel.cancelled() => false,
+        result = tx.send(message) => result.is_ok(),
+    };
+    if !delivered {
+        cancel.cancel();
+    }
+    delivered
 }
 /// 有界原生目录流，不持有 NDX、wire 页或整棵目录的观察。
 pub struct DirectoryInventory {
@@ -475,6 +511,8 @@ fn validation_for(storage: &Storage, options: &WalkOptions) -> Result<Observatio
 
 #[derive(Debug, Clone)]
 pub struct WalkOptions {
+    /// 所属任务的取消信号；遍历创建独立子信号，不反向取消任务。
+    pub cancel: Option<CancellationToken>,
     /// 固定本执行的过滤时间；独立遍历可以显式保留实时判定。
     pub filter_time_anchor: Option<i64>,
     pub observation_plan: Option<ObservationPlan>,
@@ -495,6 +533,7 @@ pub struct WalkOptions {
 impl Default for WalkOptions {
     fn default() -> Self {
         Self {
+            cancel: None,
             filter_time_anchor: None,
             observation_plan: None,
             metadata_scope: MetadataScope::default(),

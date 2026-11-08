@@ -10,6 +10,7 @@ use crate::error::StorageError;
 use crate::scan::source::{WalkDirAsyncIterator, WalkOptions};
 use crate::storage_factory::StorageContext;
 use task_model::{ErrorEvent, StorageEntryMessage};
+use tokio_util::sync::CancellationToken;
 // 外部crate
 use tracing::{Instrument, error, info, info_span};
 
@@ -23,6 +24,7 @@ pub struct DirectoryWalker {
     config: ScanConfig,
     operation_timeout: Option<std::time::Duration>,
     recovery_window: Option<std::time::Duration>,
+    cancel: Option<CancellationToken>,
 }
 
 impl DirectoryWalker {
@@ -32,7 +34,14 @@ impl DirectoryWalker {
             config,
             operation_timeout: None,
             recovery_window: None,
+            cancel: None,
         }
+    }
+
+    /// 取消本次枚举，不反向取消调用方持有的任务信号。
+    pub fn with_cancellation(mut self, cancel: Option<CancellationToken>) -> Self {
+        self.cancel = cancel;
+        self
     }
 
     async fn source_storage(&self) -> Result<StorageContext> {
@@ -77,6 +86,7 @@ impl DirectoryWalker {
                 .walkdir(
                     None,
                     WalkOptions {
+                        cancel: self.cancel.clone(),
                         filter_time_anchor: self.config.filter_time_anchor,
                         observation_plan: self.config.observation_plan,
                         metadata_scope: self.config.metadata_scope,
@@ -230,6 +240,7 @@ pub async fn scan_walkdir(
         config,
         operation_timeout: Some(operation_timeout),
         recovery_window: Some(recovery_window),
+        cancel: None,
     }
     .walk()
     .await
