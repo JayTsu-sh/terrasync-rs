@@ -511,3 +511,35 @@ empty base and retained previous target data. This tests unconfirmed outcomes an
 reporting; it does not certify a task-wide three-second recovery budget, automatic
 in-process recovery of every terminal mutation, unknown older server requests,
 cross-host exclusion, earlier per-file asynchronous source purge, or throughput/RSS.
+
+### Published metadata verification cancellation
+
+The pinned data-mover revision `378bd9e4667563ad7960ba9c91e1895fb15cd40d`
+cancels in-flight read-only verification through its existing `verify_published`
+entry. Its `tests/lab/run-version-metadata-local.py` runner independently checked
+historical/current HEAD, tags GET and empty-plan stat stalls against an owned
+versioned RustFS container: cancellation issued after 250 ms returned typed
+`Cancelled` in 252–254 ms, both original versions and tags were unchanged, and
+there was no payload GET or mutation. Five deterministic read phases additionally
+cover independent permissions and release of pending futures. These are verification
+cancellation checks, not whole-task recovery-budget or throughput/RSS acceptance.
+
+The task-layer regression
+`cargo test --locked -p app cancelled_published_verification_retains_both_copies_in_every_transfer_mode`
+passed Direct/Checkpoint × quick/full with real Local payloads and a pending target
+metadata role. Cancellation retained `PublishedDataMetadata` and the typed verification
+cause; both source and published target content remained present.
+
+After pinning, `--version-metadata` passed eight Single/Cluster × latest/history ×
+quick/full combinations and independently checked 56 HTTP 204 callback summaries,
+32 failed logical entries and 80 detailed version causes. Metadata retries made no
+body replays and retained one/four destination versions respectively. These cases
+retain their sources and do not establish permanent source-history deletion.
+
+Native `make ci` (including strict all-target Clippy) and the main repository's Rust
+CI command set passed; the latter includes 16 serial remote-process tests and retains
+its existing nonfatal Clippy diagnostics. Local checks used rustc 1.98.1; CI's 1.95
+toolchain, non-S3 protocol cancellation and formal whole-job performance/RSS A/B
+were not established by this step. Architecture review kept read cancellation in
+the existing backend-independent metadata verifier, generation/base lifetime in db,
+and task error classification in the application. No new outward Native API was added.
