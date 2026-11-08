@@ -795,8 +795,8 @@ Native 按两者较粗的实际精度比较时间，保留原始时间、身份�
 
 故障注入限于源 DELETE 的 403、持续断连、静默超时、丢回执，以及目标 CopyObject／tags PUT 的 403。
 数据／tags 失败均未发源 DELETE，每个失败 entry 计一；tags 失败的两端数据保留。
-数据拒绝发生在 CopyObject 发布前，目标不存在；callback 还如实保留原生失败输出清理的
-Unsupported 次因。这不代表 S3 已写入部分数据后的清理能力已经完成。
+数据拒绝发生在 CopyObject 发布前，目标不存在。后续接入的本次写入回执清理消除了
+未写入情况下无意义的 Unsupported 次因；发布后数据校验失败的清理另见下节。
 8 条源清理未确认事件带 `payload` 路径及 Unknown；父进程另外证实拒绝／断网时源仍在，
 丢回执时源已消失。12 次下一代全部为 Full，源已消失时目标保留。
 HTTP 204 接收具体后端、阶段、路径及 HTTP 403／AccessDenied 原因；36 份最终汇总保存到数据库，
@@ -814,3 +814,59 @@ Native 完整 make ci 通过；这些秒级值使用测试显式超时，不作�
 app 默认库测试 328 项通过、45 项 ignored，物理夹具单独显式执行，不能把其他 ignored 当作通过。
 本机 Rust 1.98.1，保留已有警告。架构审查确认：任务层仅决定就绪与清理时序，
 精度处理和精确对象删除均在 S3 backend，不增加任务层协议分支或新存储入口。
+
+### S3 Direct 发布后数据失败的本次输出清理
+
+固定 data-mover `7d9016c1`，只替换两个 manifest revision 与 13 个 Git 包来源；
+SDK 仍为 `fdc541cc`。复用已有 FailedDataCleanup::RemoveOwned 和 remove_failed_direct，
+没有新增公开函数或类型。backend 私有状态保存原始写入成功回执，按回显的不可变版本 ID
+精确删除，或对可变／null 槽 fresh HEAD 核对大小与 ETag 后删除。推断出内容相同的旧对象、
+未知写入、缺少版本证据和已替换目标均不能授权删除；NAS 输出尚未认证，仍明确保留。
+默认 Keep、普通 discard 和元数据失败不删除最终数据。可变 HEAD＋DELETE 不是原子条件删除，
+继续要求排除并发写入。
+
+原生 60 个隔离 RustFS 场景通过，覆盖小文件原生复制、12 MiB multipart、非空尾斜杠流式 PUT、
+未开版本／开版本目标，以及回读损坏、回读 403、数据／tags 写入 403、清理 403、持续断连、
+静默超时、丢 DELETE 回执和在途取消。独立读取确认源各版本与旧目标版本保留，只清理本次
+有确认回执的输出，无删除标记。尾斜杠在 RustFS 开版本桶中实际为 null 单槽，如实按可变槽验证。
+现有 VerifyRequest.cancel 覆盖在途只读 HEAD／GET，真实取消返回 Cancelled，不再等 SDK GET 超时。
+不确定 DELETE 保持 Unknown，不因父进程另查到目标已消失就伪报确认成功；未增加盲重试。
+
+上节原有 36 轮真实任务扩为 48 轮全部通过：Single／双副本 ClickHouse 各新增发布后回读损坏、
+失败输出清理 403、清理成功但回执丢失三种失败和同 job ID 下一代恢复。
+六个新增失败均未发源 DELETE，各按一个 entry 计错且 task_error_count=0。
+HTTP 204 callback 保留原始 checksum mismatch；清理失败同时带 PermissionDenied 或 Connectivity／Unknown，
+每个有确认回执的输出恰好一次目标 DELETE。成功清理及丢回执后的实际目标不存在；清理 403 保留目标；
+下一代均走 Full 并完成复制与源清理。48 份最终报告存入 ClickHouse，删源代次 base 清空。
+测试损坏的是代理回读响应，不冒充真实磁盘损坏。最初夹具只处理 HTTP 200，漏掉实际 Range GET 的
+206；修正并审计实际 206 注入后才计上述通过。首次离线启动缺少新 Git revision，先 fetch 后重跑。
+
+架构审查：任务层仍负责就绪、统计、代次和通知；通用传输引擎保留显式清理授权；
+写入归属、版本检查、精确 DELETE 和读请求取消在 S3 backend，无新任务层协议分支或 SDK 修改。
+原生完整 CI 范围通过：初次 make ci 的批量链接因本机构建盘耗尽失败；前置守卫、feature 和严格 Clippy
+已通过，剩余 52 个等价顺序步骤及最终 fmt 全通过。ignored 的其他环境不算通过。
+本项不等同所有厂商、NAS、物理掉电、全部源历史清理、统一网络预算或整轮迁移性能验收。
+
+主项目最终 fmt、workspace/all-targets check 与 Clippy、workspace 测试和 16 项串行远程进程回归均通过；
+本机 Rust 1.98.1，保留已有警告。默认 app 库测试 328 项通过、45 项 ignored；
+上述实际外部夹具单独显式执行，未执行的 ignored 不计通过。
+
+本项正常路径同机 A/B 六轮，基线为主项目 `4100426`／Native `cd1ede0b`，变更为 Native `7d9016c1`。
+两份 dev debug=0／incremental=0／Rust 1.98.1 程序，在同一独占 2 CPU RustFS 服务上按
+before、after、after、before、before、after 交错执行；每轮 1000 个 1 KiB 普通 S3 对象，
+源保留、无数据库、unordered／Direct／quick、并发 16、批次 100000，包含原始 tags。
+计时仅覆盖完整 CLI 进程；轮后独立核验全部目标字节／tags、源项保留及无残留 upload。
+
+| 样本 | before 耗时／秒 | after 耗时／秒 | before 峰值 RSS／KiB | after 峰值 RSS／KiB |
+| --- | --- | --- | --- | --- |
+| 1 | 4.50 | 4.40 | 197172 | 194456 |
+| 2 | 4.30 | 4.30 | 195384 | 196028 |
+| 3 | 4.39 | 4.30 | 197376 | 199172 |
+
+耗时中位数 4.39→4.30 秒（−2.05%），RSS 中位数 192.55→191.43 MiB（−0.58%）。
+这些小样本显示本项未出现明显正常开销增长，不能据此宣称加速、release 或整轮规模达标；
+不替代此前仍超约 200 MiB 的 Local 目录场景或大规模／其他后端验收。
+原始样本、配置、运行日志与程序位于 `/tmp/terrasync-s3-direct-cleanup-perf/`，
+基线／变更程序 SHA-256 分别为 `b8a57a2d85059136721041d70c86d2ddb34d863e00069c790dc6c40a5f07b028`、
+`cd743d8c7d2862e0d90b17aa53fe6ff9194a648f66fafbc14388113e316630fc`。
+该性能夹具及功能夹具的独占容器均已清理。

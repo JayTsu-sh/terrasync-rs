@@ -62,7 +62,7 @@ def run(repository, environment):
                 if target == "local":
                     if key != "slash/":
                         assert (root / prefix / "target" / key).read_bytes() == body
-                elif mode == "data":
+                elif mode in ("data", "verify", "cleanupunknown"):
                     assert not client.list_objects_v2(Bucket=buckets[target], Prefix=f"{prefix}/{key}").get("Contents"), (prefix, key)
                 else:
                     assert client.get_object(Bucket=buckets[target], Key=f"{prefix}/{key}")["Body"].read() == body
@@ -77,8 +77,10 @@ def run(repository, environment):
                 assert {record["Key"] for record in history["Versions"]} == {prefix + "/" + key for key in keys}
             if state["initial"] == "lostack":
                 assert state["forwarded_deletes"] == 1
-            if mode in ("data", "metadata"):
+            if mode in ("data", "metadata", "verify", "cleanup403", "cleanupunknown"):
                 assert state["forwarded_deletes"] == 0
+            if state["initial"] in ("verify", "cleanup403", "cleanupunknown"):
+                assert state["target_deletes"] == 1, (prefix, state)
             state["inspections"] += 1
             print(f"independent object cleanup prefix={prefix} mode={mode} source_remaining={sorted(remaining)} target_data_verified=true fault_to_final_report_ms={state.get('fault_to_final_report_ms')}", flush=True)
 
@@ -99,7 +101,7 @@ def run(repository, environment):
                         with guard:
                             assert prefix not in states
                             states[prefix] = dict(initial=mode, mode=mode, target=target, keys=keys,
-                                                  forwarded_deletes=0, source_tags=0, affected=0,
+                                                  forwarded_deletes=0, target_deletes=0, source_tags=0, affected=0,
                                                   first_fault=None, inspections=0, fact_released=False,
                                                   deleted=threading.Event())
                             active[0] = prefix
@@ -159,7 +161,11 @@ def run(repository, environment):
                         state["source_tags"] += 1
                     data_failure = not source and self.command == "PUT" and "tagging" not in query and mode == "data"
                     metadata_failure = not source and self.command == "PUT" and "tagging" in query and mode == "metadata"
-                    affected = (deleting and mode != "normal") or data_failure or metadata_failure
+                    target_deleting = not database and not source and self.command == "DELETE" and "uploadId" not in query
+                    verifying = not database and not source and self.command == "GET" and "tagging" not in query and path.endswith("/" + prefix + "/payload") and mode in ("verify", "cleanup403", "cleanupunknown")
+                    if target_deleting:
+                        state["target_deletes"] += 1
+                    affected = (deleting and mode != "normal") or data_failure or metadata_failure or verifying or (target_deleting and mode in ("cleanup403", "cleanupunknown"))
                     if affected:
                         state["affected"] += 1
                         state["first_fault"] = state["first_fault"] or time.monotonic()
@@ -172,7 +178,7 @@ def run(repository, environment):
                         inspect(prefix, "normal")
                         state["fact_released"] = True
                         print(f"independent ordinary S3 source deleted before fact forwarded prefix={prefix}", flush=True)
-                if affected and mode in ("readonly", "data", "metadata"):
+                if (affected and mode in ("readonly", "data", "metadata")) or (target_deleting and mode == "cleanup403"):
                     payload = f"<Error><Code>AccessDenied</Code><Message>owned object {mode} refusal</Message></Error>".encode()
                     self.send_response(403)
                     self.send_header("Content-Length", str(len(payload)))
@@ -201,13 +207,17 @@ def run(repository, environment):
                         with guard:
                             state["forwarded_deletes"] += 1
                             state["deleted"].set()
-                    if deleting and mode == "lostack":
+                    if verifying and response.status in (200, 206):
+                        print(f"owned corrupt read mode={mode} status={response.status} path={path}", flush=True)
+                        assert payload, (prefix, self.path)
+                        payload = bytes([payload[0] ^ 1]) + payload[1:]
+                    if (deleting and mode == "lostack") or (target_deleting and mode == "cleanupunknown"):
                         self.close_connection = True
                         self.connection.shutdown(socket.SHUT_RDWR)
                         return
                     self.send_response(response.status)
                     for name, value in response.getheaders():
-                        if name.lower() not in ("connection", "content-length", "transfer-encoding"):
+                        if name.lower() not in ("connection", "content-length", "transfer-encoding") and not (verifying and name.lower().startswith("x-amz-checksum")):
                             self.send_header(name, value)
                     self.send_header("Content-Length", response.getheader("Content-Length", "0") if self.command == "HEAD" else str(len(payload)))
                     self.end_headers()
@@ -234,12 +244,12 @@ def run(repository, environment):
                             "copy_execution::object_cleanup_tests::real_unversioned_object_source_cleanup_and_failures",
                             "--", "--ignored", "--exact", "--nocapture", "--test-threads=1"],
                            cwd=repository, env=environment, check=True, timeout=360)
-            assert len(states) == 24 and all(state["inspections"] == (2 if state["initial"] != "normal" or state["target"] == "latest" else 1) for state in states.values()), states
+            assert len(states) == 30 and all(state["inspections"] == (2 if state["initial"] != "normal" or state["target"] == "latest" else 1) for state in states.values()), states
             assert sum(state["fact_released"] for state in states.values()) == 4, states
             assert all(state["affected"] for state in states.values() if state["initial"] != "normal"), states
             summaries = [report for report in reports if report["is_final"] and not report.get("diagnostics")]
-            assert len(summaries) == 36 and all(report["diagnostics_complete"] for report in summaries), summaries
-            assert sum(report["migration"]["phase"] == "failed" for report in summaries) == 12
+            assert len(summaries) == 48 and all(report["diagnostics_complete"] for report in summaries), summaries
+            assert sum(report["migration"]["phase"] == "failed" for report in summaries) == 18
             events = {event["event_id"]: event for report in reports
                       for event in (report.get("diagnostics") or {}).get("events", [])}
             purge = [event for event in events.values() if event.get("retention", {}).get("reason") == "source_deletion_unconfirmed"]
@@ -252,13 +262,30 @@ def run(repository, environment):
                 assert len(detailed) == 2, detailed
                 assert all(event["path"] == "payload" and "HTTP=403" in event["message"] and "code=AccessDenied" in event["message"]
                            and "backend=S3" in event["message"] and "phase=" in event["message"] for event in detailed.values()), detailed
+                if mode == "data":
+                    assert all("direct data cleanup failed" not in event["message"] for event in detailed.values()), detailed
                 if mode == "metadata":
                     assert all("phase=target_metadata_apply" in event["message"] for event in detailed.values()), detailed
                 print(f"callback object failure mode={mode} details=" + json.dumps([event["message"] for event in detailed.values()]), flush=True)
+            for mode in ("verify", "cleanup403", "cleanupunknown"):
+                failures = [report for report in summaries if report["job_id"].endswith("_" + mode) and report["migration"]["phase"] == "failed"]
+                assert len(failures) == 2 and all(report["detail"]["error_count"] == 1 and report["task_error_count"] == 0 for report in failures), failures
+                detailed = {event["event_id"]: event for report in reports if report["job_id"].endswith("_" + mode)
+                            for event in (report.get("diagnostics") or {}).get("events", []) if event["code"] == "copy_version_failed"}
+                assert len(detailed) == 2 and all(event["path"] == "payload" and "S3 published checksum mismatch" in event["message"] for event in detailed.values()), detailed
+                if mode == "verify":
+                    assert all("direct data cleanup failed" not in event["message"] for event in detailed.values()), detailed
+                if mode != "verify":
+                    assert all("direct data cleanup failed" in event["message"] for event in detailed.values()), detailed
+                if mode == "cleanup403":
+                    assert all("PermissionDenied" in event["message"] for event in detailed.values()), detailed
+                if mode == "cleanupunknown":
+                    assert all("Unknown" in event["message"] for event in detailed.values()), detailed
+                print(f"callback postpublication failure mode={mode} details=" + json.dumps([event["message"] for event in detailed.values()]), flush=True)
             for role, bucket in buckets.items():
                 assert client.get_object(Bucket=bucket, Key="sentinel")["Body"].read() == b"retain sentinel"
                 assert not client.list_multipart_uploads(Bucket=bucket).get("Uploads")
-            print("independent ordinary object cleanup deployments=2 normal=12 failures=12 recovery=12 HTTP_204=true final_reports_saved=true base_empty=true all_recovery_generations_full=true", flush=True)
+            print("independent ordinary object cleanup deployments=2 normal=12 failures=18 recovery=18 HTTP_204=true final_reports_saved=true base_empty=true all_recovery_generations_full=true", flush=True)
         finally:
             stopped.set()
             relay.shutdown()

@@ -72,7 +72,13 @@ async fn report(config: &ClickHouseConfig, command: &SyncJobConfig, sequence: u6
     assert!(report.is_final && report.diagnostics_complete);
     assert_eq!(
         report.task_error_count,
-        u64::from(failed && !matches!(command.job_id.rsplit('_').next(), Some("data" | "metadata")))
+        u64::from(
+            failed
+                && !matches!(
+                    command.job_id.rsplit('_').next(),
+                    Some("data" | "metadata" | "verify" | "cleanup403" | "cleanupunknown")
+                )
+        )
     );
     Ok(())
 }
@@ -87,12 +93,12 @@ async fn round(config: &ClickHouseConfig, command: &SyncJobConfig, mode: &str, s
     .map_err(|_| AppError::ConfigError("owned object cleanup job timed out".into()))?;
     if mode == "normal" {
         result?;
-    } else if matches!(mode, "data" | "metadata") {
+    } else if matches!(mode, "data" | "metadata" | "verify" | "cleanup403" | "cleanupunknown") {
         assert!(
             result.as_ref().is_err_and(AppError::is_reported_copy_failure),
             "{result:?}"
         );
-        assert_eq!(result.unwrap_err().reported_copy_data_failed(), mode == "data");
+        assert_eq!(result.unwrap_err().reported_copy_data_failed(), mode != "metadata");
     } else {
         let error = result.unwrap_err();
         assert!(error.source_cleanup_entry().is_some(), "{error}");
@@ -199,6 +205,9 @@ async fn real_unversioned_object_source_cleanup_and_failures() -> Result<()> {
             }
             for mode in ["readonly", "disconnect", "stall", "lostack", "data", "metadata"] {
                 case(&config, deployment, "latest", false, mode).await?;
+            }
+            for mode in ["verify", "cleanup403", "cleanupunknown"] {
+                case(&config, deployment, "latest", true, mode).await?;
             }
             Ok(())
         }
