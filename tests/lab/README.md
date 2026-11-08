@@ -486,3 +486,28 @@ and a 3 s recovery budget. The actual migration configuration defaults to a 30 s
 detection limit, so those test timings do not certify the default whole task.
 These are separate real NFS and ClickHouse link tests, not a combined outage or
 whole-job throughput/RSS acceptance. The lab prefix was cleaned after this run.
+
+
+### Source-deleting generation base retirement
+
+`python3 tests/lab/run-notification-archive-local.py --copy-generations` also runs
+`real_source_deleted_base_retirement` on the isolated Single and two-replica
+Cluster. Eighteen cases cover Completed/Failed/Cancelled retirement, both physical
+replicas empty, other-job isolation, delayed old mutations preserving newer copy
+and sequence-zero scan rows, disconnect, silent stalls, cancellation of the
+retirement future, and lost mutation acknowledgements. Retrying the same retirement
+is idempotent. Current-execution base writers are rejected after closure; generation
+policy remains queryable. The existing 32 policy transitions and real Local
+unchanged/selected source cleanup additionally assert empty base at completion,
+before another generation begins. An intentionally unfinalized crash fixture keeps
+its facts until the next full preparation.
+
+`--request-policy` adds six whole-job retirement failures and six following full
+runs across both deployments. An owned proxy affects only the final base mutation;
+real Local source files have already moved. It independently verifies target bytes,
+Failed generation and archived final report, explicit base-retirement cause via
+HTTP 204, one task error with zero file-copy errors, and next-generation Full with
+empty base and retained previous target data. This tests unconfirmed outcomes and
+reporting; it does not certify a task-wide three-second recovery budget, automatic
+in-process recovery of every terminal mutation, unknown older server requests,
+cross-host exclusion, earlier per-file asynchronous source purge, or throughput/RSS.
