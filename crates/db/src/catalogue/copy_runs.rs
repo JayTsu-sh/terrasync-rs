@@ -6,7 +6,7 @@ use task_model::migration::{CopyGeneration, CopyGenerationPhase};
 use utils::sanitize_job_id;
 
 use super::{ClickHouseDatabase, layout::CatalogueEngine};
-use crate::{DatabaseError, Result, execution::read::QuorumRead};
+use crate::{DatabaseError, Result, execution::read::QuorumRead, get_scan_base_table_name};
 
 const MAX_DESCRIPTOR_BYTES: usize = 1024 * 1024;
 
@@ -101,7 +101,8 @@ impl ClickHouseDatabase {
         .await
     }
 
-    /// 只有持有本执行域的调用方可以结束该代次；拒绝请求没有可覆盖的已接受记录。
+    /// 调用方先收束 worker、目录收尾及源清理；删源代次结束后不保留增量 base。
+    /// 清理只修改本代及更早的复制事实，新代和普通扫描的事实不能被延迟清理删除。
     pub async fn finish_copy_generation(&self, phase: CopyGenerationPhase) -> Result<()> {
         if !matches!(
             phase,
@@ -111,16 +112,54 @@ impl ClickHouseDatabase {
                 field: "terminal_phase",
             });
         }
-        let mut lifecycle = self.generation_lifecycle.lock().await;
-        let committed = lifecycle.committed;
-        let Some(generation) = &mut lifecycle.copy_generation else {
+        let lifecycle = self.generation_lifecycle.lock().await;
+        let Some(generation) = lifecycle.copy_generation.clone() else {
             return Ok(());
         };
-        if phase == CopyGenerationPhase::Completed && !committed {
+        if phase == CopyGenerationPhase::Completed && !lifecycle.committed {
             return Err(DatabaseError::CopyGenerationInvalid {
                 field: "uncommitted_completion",
             });
         }
+        drop(lifecycle);
+        // 不能持有 state 等待在途 base 写入，否则会与读取代次身份的 writer 互锁。
+        let mut base = if generation.request.source_cleanup.retains_source() {
+            None
+        } else {
+            Some(self.generation_lifecycle.base_closed.write().await)
+        };
+        let cleanup = if let Some(closed) = base.as_mut() {
+            **closed = true;
+            self.retire_copy_base(&generation)
+                .await
+                .map_err(|source| DatabaseError::CopyBaseRetirementFailed {
+                    sequence: generation.sequence,
+                    source: Box::new(source),
+                })
+        } else {
+            Ok(())
+        };
+        let terminal = if cleanup.is_err() && phase == CopyGenerationPhase::Completed {
+            CopyGenerationPhase::Failed
+        } else {
+            phase
+        };
+        let reporting = self.save_copy_terminal(terminal).await;
+        match (cleanup, reporting) {
+            (Ok(()), result) | (result, Ok(())) => result,
+            (Err(cleanup), Err(reporting)) => Err(DatabaseError::CopyBaseRetirementReportingFailed {
+                cleanup: Box::new(cleanup),
+                reporting: Box::new(reporting),
+            }),
+        }
+    }
+
+    async fn save_copy_terminal(&self, phase: CopyGenerationPhase) -> Result<()> {
+        let mut lifecycle = self.generation_lifecycle.lock().await;
+        let generation = lifecycle
+            .copy_generation
+            .as_mut()
+            .ok_or(DatabaseError::CopyExecutionUnavailable)?;
         if generation.phase != phase {
             generation.revision = generation
                 .revision
@@ -131,6 +170,49 @@ impl ClickHouseDatabase {
             generation.phase = phase;
         }
         self.save_copy_generation(generation).await
+    }
+
+    async fn retire_copy_base(&self, generation: &CopyGeneration) -> Result<()> {
+        let current = self.latest_copy_generation().await?;
+        if !current.is_some_and(|current| {
+            current.sequence == generation.sequence && current.request.execution_id == generation.request.execution_id
+        }) {
+            return Err(DatabaseError::CopyGenerationInvalid {
+                field: "stale_base_retirement",
+            });
+        }
+        let table = get_scan_base_table_name(&self.job_id);
+        if !self.table_exists(&table).await? {
+            return Ok(());
+        }
+        if generation.baseline_prepared && !self.copy_baseline_available(generation).await? {
+            return Err(DatabaseError::CopyGenerationInvalid {
+                field: "stale_base_retirement",
+            });
+        }
+        // 序列条件必须位于服务端 mutation 内，不能只凭之前的 latest 查询执行全表清理。
+        // 普通扫描序列为零；未知归属的行保持原样并明确报错，避免误删后来扫描的数据。
+        let storage = self.catalogue_storage_table(&table)?;
+        self.execute(
+            &format!(
+                "ALTER TABLE {storage} DELETE WHERE copy_sequence>0 AND copy_sequence<=? SETTINGS mutations_sync=2"
+            ),
+            &[Value::from(generation.sequence)],
+        )
+        .await?;
+        let query = self.catalogue_query_table(&table)?;
+        let remaining = self
+            .sync_client
+            .query(&format!("SELECT count() FROM {query}"))
+            .fetch_quorum_one::<u64>()
+            .await?;
+        if remaining != 0 {
+            return Err(DatabaseError::CopyBaseRetirementIncomplete {
+                sequence: generation.sequence,
+                remaining,
+            });
+        }
+        Ok(())
     }
 
     pub async fn current_copy_generation(&self) -> Result<CopyGeneration> {

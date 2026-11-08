@@ -84,6 +84,7 @@ impl ClickHouseDatabase {
         &self, table_name: &str, inputs: CatalogueInputs<'_>, use_async_client: bool,
     ) -> Result<()> {
         check_scan_cancellation()?;
+        let _base = self.base_write_guard().await?;
         let versions = self.catalogue_versions().await;
         let mut views = CatalogueViews::new(inputs, versions).peekable();
         if views.peek().is_none() {

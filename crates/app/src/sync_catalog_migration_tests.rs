@@ -68,12 +68,14 @@ async fn unchanged_copy_is_deleted(config: &ClickHouseConfig) -> Result<()> {
     assert!(changes.is_empty(), "unchanged entries must produce no copy work");
     copy_completion::complete(database.clone(), Arc::clone(&target)).await?;
     remove_confirmed_sources(
-        database,
+        database.clone(),
         source,
         target,
         SourceCleanupCheck::new(Duration::from_secs(1), Duration::from_secs(3), CancellationToken::new()),
     )
     .await?;
+    database.finish_copy_generation(CopyGenerationPhase::Completed).await?;
+    assert_eq!(database.get_count("base").await?, 0);
     assert!(!source_root.path().join("payload").exists());
     assert_eq!(
         std::fs::read(target_root.path().join("payload"))?,
@@ -86,7 +88,7 @@ async fn unchanged_copy_is_deleted(config: &ClickHouseConfig) -> Result<()> {
         (after.ctime(), after.ctime_nsec())
     );
     eprintln!(
-        "unchanged-move cluster={} classification=unchanged copy_work=0 source_deleted=true target_inode_and_ctime_unchanged=true",
+        "unchanged-move cluster={} classification=unchanged copy_work=0 source_deleted=true base_empty_at_completion=true target_inode_and_ctime_unchanged=true",
         config.cluster.is_some()
     );
     Ok(())
@@ -125,6 +127,9 @@ async fn moved_copy_is_retained(config: &ClickHouseConfig, incomplete: bool) -> 
     if !incomplete {
         database.commit_scan_generation().await?;
         database.finish_copy_generation(CopyGenerationPhase::Completed).await?;
+        assert_eq!(database.get_count("base").await?, 0);
+    } else {
+        assert_eq!(database.get_count("base").await?, 1);
     }
     drop(database);
     let before = std::fs::metadata(target_root.path().join("payload"))?;
@@ -245,12 +250,14 @@ async fn only_current_selection_authorizes_source_cleanup(config: &ClickHouseCon
     File::open(target_root.path().join("outside-dir"))?.set_times(FileTimes::new().set_modified(untouched_time))?;
     copy_completion::complete(database.clone(), Arc::clone(&target)).await?;
     remove_confirmed_sources(
-        database,
+        database.clone(),
         source,
         target,
         SourceCleanupCheck::new(Duration::from_secs(1), Duration::from_secs(3), CancellationToken::new()),
     )
     .await?;
+    database.finish_copy_generation(CopyGenerationPhase::Completed).await?;
+    assert_eq!(database.get_count("base").await?, 0);
     assert!(!source_root.path().join("selected").exists());
     assert_eq!(std::fs::read(source_root.path().join("outside"))?, b"outside");
     assert!(source_root.path().join("outside-dir").is_dir());
@@ -262,7 +269,7 @@ async fn only_current_selection_authorizes_source_cleanup(config: &ClickHouseCon
         assert_eq!(std::fs::read(target_root.path().join(name))?, name.as_bytes());
     }
     eprintln!(
-        "selected-cleanup cluster={} uncommitted_rounds=3 old_state_collides_with_working=true unchanged_copy_work=0 only_selected_source_deleted=true old_source_and_directory_preserved=true unselected_target_mtime_untouched=true",
+        "selected-cleanup cluster={} uncommitted_rounds=3 old_state_collides_with_working=true unchanged_copy_work=0 only_selected_source_deleted=true base_empty_at_completion=true old_source_and_directory_preserved=true unselected_target_mtime_untouched=true",
         config.cluster.is_some()
     );
     Ok(())

@@ -403,6 +403,7 @@ async fn real_copy_requests_freeze_cleanup_and_report_preflight_rejections() -> 
             local_rejections(&config).await?;
             local_pipeline_reports(&config).await?;
             super::plan_tests::transitions(&config).await?;
+            super::plan_tests::retirement_failures(&config).await?;
             super::plan_tests::lifecycle_edges(&config).await
         }
         .await;

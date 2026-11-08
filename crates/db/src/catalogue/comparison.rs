@@ -457,6 +457,7 @@ impl JoinStrategy {
 impl ClickHouseDatabase {
     /// 将临时表记录合并到主表（INSERT INTO SELECT），可排除指定路径
     pub async fn insert_temp_to_base_table(&self, excluded_paths: &[(String, String, bool)]) -> Result<()> {
+        let _base = self.base_write_guard().await?;
         let temp_table_name = self
             .scan_temp_table_name
             .as_deref()

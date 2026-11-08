@@ -35,6 +35,20 @@ pub enum DatabaseError {
         #[source]
         source: serde_json::Error,
     },
+    #[error("删源代次的 base 清理尚未确认，仍有 {remaining} 行；代次 {sequence}")]
+    CopyBaseRetirementIncomplete { sequence: u64, remaining: u64 },
+    #[error("删源代次 {sequence} 的 base 清理失败: {source}")]
+    CopyBaseRetirementFailed {
+        sequence: u64,
+        #[source]
+        source: Box<DatabaseError>,
+    },
+    #[error("删源代次 base 清理失败: {cleanup}; 失败代次记录保存也失败: {reporting}")]
+    CopyBaseRetirementReportingFailed {
+        #[source]
+        cleanup: Box<DatabaseError>,
+        reporting: Box<DatabaseError>,
+    },
     #[error(transparent)]
     MigrationPolicy(#[from] task_model::TaskModelError),
     #[error("本轮复制执行身份尚未准备，拒绝查询删源或目录收尾候选")]

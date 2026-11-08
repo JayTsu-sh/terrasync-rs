@@ -64,6 +64,11 @@ impl ClickHouseDatabase {
         if entries.is_empty() {
             return Ok(());
         }
+        let _base = if temporary {
+            None
+        } else {
+            Some(self.base_write_guard().await?)
+        };
         let access = self.native_access().await?;
         let table = if temporary { &access.stage } else { &access.base };
         let generation = self.get_cached_scan_state().await?;
@@ -125,6 +130,7 @@ impl ClickHouseDatabase {
         Ok(())
     }
     pub(crate) async fn merge_native(&self) -> Result<()> {
+        let _base = self.base_write_guard().await?;
         let access = self.native_access().await?;
         self.sync_client
             .query(&format!(

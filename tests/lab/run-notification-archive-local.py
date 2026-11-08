@@ -128,7 +128,8 @@ def run_copy_generations():
                 return
             if self.path not in ("/normal", "/disconnect", "/stall", "/startup_disconnect", "/startup_stall", "/running_disconnect", "/running_stall", "/reject_prepare",
                                  "/compare_flash", "/compare_lost", "/compare_disconnect", "/compare_stall", "/compare_recover_stall", "/compare_reject",
-                                 "/batch_flash", "/batch_lost", "/batch_disconnect", "/batch_stall", "/batch_recover_stall", "/batch_reject"):
+                                 "/batch_flash", "/batch_lost", "/batch_disconnect", "/batch_stall", "/batch_recover_stall", "/batch_reject",
+                                 "/retirement_flash", "/retirement_disconnect", "/retirement_stall", "/retirement_lost", "/retirement_cancel"):
                 self.send_error(404)
                 return
             with guard:
@@ -155,10 +156,20 @@ def run_copy_generations():
             else:
                 body = self.rfile.read(int(self.headers.get("Content-Length", "0")))
             query = urllib.parse.unquote_plus(self.path).encode() + body[:256]
+            is_retirement = b"ALTER TABLE" in query.upper() and b"COPY_SEQUENCE>0" in query.upper()
             is_compare = b"AS CHANGE_CODE" in query.upper()
             is_insert = b"INSERT INTO" in query.upper() and b"BASE_" in query.upper()
             with guard:
                 fault = state
+                if fault.startswith("retirement_"):
+                    if not is_retirement:
+                        fault = "normal"
+                    else:
+                        fault = "batch_" + fault.removeprefix("retirement_")
+                        if state in ("retirement_flash", "retirement_lost"):
+                            state = "normal"
+                        if fault == "batch_cancel":
+                            fault = "batch_stall"
                 if is_insert:
                     batch_stats["writes"] += 1
                     token = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query).get("insert_deduplication_token", [])
@@ -175,7 +186,7 @@ def run_copy_generations():
                         fault = "batch_" + fault.removeprefix("compare_")
                         if state in ("compare_flash", "compare_lost", "compare_recover_stall"):
                             state = "normal"
-                if fault.startswith("batch_") and not comparison_fault:
+                if fault.startswith("batch_") and not comparison_fault and not is_retirement:
                     if not is_insert:
                         fault = "normal"
                     elif fault in ("batch_flash", "batch_lost", "batch_recover_stall"):
@@ -316,6 +327,10 @@ def run_copy_generations():
                 "--", "--ignored", "--nocapture",
             ], cwd=ROOT, env=environment, check=True)
             return
+        subprocess.run([
+            "cargo", "test", "--offline", "--locked", "-p", "db", "--lib",
+            "real_source_deleted_base_retirement", "--", "--ignored", "--nocapture",
+        ], cwd=ROOT, env=environment, check=True)
         subprocess.run([
             "cargo", "test", "--offline", "--locked", "-p", "db", "--lib",
             "real_copy_generation_policies", "--", "--ignored", "--nocapture",
@@ -642,6 +657,21 @@ def run_request_policy(environment):
         assert all(report["migration"]["phase"] == "failed"
                    and not report["migration"]["baseline_prepared"] for report in accepted_failures), accepted_failures
         print("independent lifecycle HTTP inspection prepare_failure=2 mirror_conflict=2 binding_after_base_drop=2 recovered_successful_runs=10", flush=True)
+        retired = [report for report in reports if report["job_id"].startswith("retirement_callback_")
+                   and report["is_final"] and not report.get("diagnostics")]
+        assert len(retired) == 12 and all(report["diagnostics_complete"] for report in retired), retired
+        failures = [report for report in retired if report["task_error_count"] == 1]
+        successes = [report for report in retired if report["task_error_count"] == 0]
+        assert len(failures) == len(successes) == 6, retired
+        for report in failures:
+            assert report["migration"]["phase"] == "failed", report
+            assert report["detail"]["error_count"] == 0, report
+            attempt = report["callback_identity"]["attempt_id"]
+            causes = [event for delivered in reports if delivered["callback_identity"]["attempt_id"] == attempt
+                      for event in (delivered.get("diagnostics") or {}).get("events", [])]
+            assert any("base 清理失败" in event["message"] for event in causes), causes
+        assert all(report["migration"]["phase"] == "completed" and report["migration"]["plan"]["mode"] == "full" for report in successes), successes
+        print("independent retirement HTTP inspection failed_runs=6 recovered_full_runs=6 base_cleanup_cause_delivered=true final_reports_archived=true HTTP_204=accepted", flush=True)
         serialized = json.dumps(reports)
         assert "policy-secret" not in serialized and "policy-access" not in serialized and "policy auth secret" not in serialized, serialized
         print("independent request-policy HTTP inspection deployments=2 rejections=18 local_preflight=14 task_errors_each=1 HTTP_204=accepted credentials=redacted", flush=True)
