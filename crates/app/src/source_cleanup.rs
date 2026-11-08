@@ -138,11 +138,21 @@ async fn remove_entry(
     if entry.path().as_str().is_empty() || unrepresentable_object(entry, destination).is_some() {
         return Ok(());
     }
-    if entry.history().is_some() || source.storage().holds_directory_objects() {
+    if entry.history().is_some() {
         return Err(StorageError::PermanentVersionCleanupUnavailable {
             path: entry.path().clone(),
         }
         .into());
+    }
+    if source.storage().holds_directory_objects() && entry.kind() == EntryKind::Directory {
+        if entry.directory_marker_object().is_some() {
+            return Err(StorageError::DirectoryMarkerCleanupUnavailable {
+                path: entry.path().clone(),
+            }
+            .into());
+        }
+        // 纯前缀没有可删除实体；子对象各自核验，绝不把前缀递归删除。
+        return Ok(());
     }
     // 只核验目标与落库的原始事实；删源改变的目录 mtime 和已经消失的源项不回写目标。
     let target = copied_metadata_plan(

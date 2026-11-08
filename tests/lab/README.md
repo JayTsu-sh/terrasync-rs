@@ -719,7 +719,7 @@ Single／双副本的 12 轮迁移及 HTTP 204／报告归档再验证通过。
 原值快照临时编码后立即释放，按编码长度四倍加 1024 的权重控制总准入不超过 8 MiB。
 这不是严格 RSS 上限，临时编码、allocator 及现有广播队列均计入实测。
 所有复制与枚举成功且没有选中目录／历史流程时，窗口先核验目标、确认持久性、
-复核源并受保护删除，与数据库最终冲刷并行。范围外、超预算、目录、对象源及历史流程
+复核源并受保护删除，与数据库最终冲刷并行。范围外、超预算、目录及历史流程
 仍沿用原收尾路径；本项没有实现全部条目的异步删源，也没有新增磁盘暂存或公开存储接口。
 
 `python3 tests/lab/run-notification-archive-local.py --copy-ready-cleanup`
@@ -769,3 +769,48 @@ before／after／after／before／before／after 顺序各运行三次；
 16 项串行远程进程回归；本机使用 Rust 1.98.1，保留已有大型错误类型等警告。
 架构审查结论：迁移时序与组合错误在 app，目标持久性和受保护删除复用 data-mover，
 NFS 协议继续由 backend／SDK 负责；未增加公开存储入口，也未改变 SDK。
+
+### 普通未版本化 S3 源的受保护清理
+
+`python3 tests/lab/run-notification-archive-local.py --copy-object-cleanup`
+运行精确 ignored 用例
+`copy_execution::object_cleanup_tests::real_unversioned_object_source_cleanup_and_failures`。
+使用已有隔离 RustFS 与 Single／双副本 ClickHouse 夹具，只访问独占桶／前缀和本机 HTTP 204 callback。
+先在旧代码复现未开版本的 `tree/file` 被 PermanentVersionCleanupUnavailable 拒绝清理，
+再发现并修复 Native 对 LIST 毫秒／HEAD 秒直接比较的误判；最终固定 data-mover `cd1ede0b`。
+依赖图只替换 13 个 Git 包的精确来源及两个 manifest revision，SDK 保持 `fdc541cc`。
+
+普通无历史对象复用 Namespace::purge_observed；虚拟前缀不对应删除实体，不递归处理。
+没有选中目录／历史且符合窗口预算时，对象源也能先于入库确认清理；
+真实目录标记与历史条目仍明确报错保留，不当成普通当前对象删除。
+Native 按两者较粗的实际精度比较时间，保留原始时间、身份／ETag／大小及缺失时间检查；
+源元数据仍复核，无额外请求或新公开接口。排除并发写入的要求不变，同一 HEAD 时间刻度内
+同 ETag 的变化不能由这个头检测；不宣称原子 compare-and-unlink。
+
+36 轮真实迁移包括 12 轮正常、12 轮失败和 12 轮同 job ID 恢复。
+正常覆盖 Local／普通 S3／版本化 S3 目标和 quick／full，两种数据库部署均检查最终字节、
+对象 tags、源实际存在性、代次和报告。Local 目标没有源 tags GET，非空尾斜杠对象保留并交付
+跳过事件；对象目标保留完整 key。4 轮普通 S3 目标的事实 INSERT 在转发前等待真实源 DELETE，
+父进程核验源消失、目标字节／tags 正确后才放行，不以请求发出代替实际就绪。
+
+故障注入限于源 DELETE 的 403、持续断连、静默超时、丢回执，以及目标 CopyObject／tags PUT 的 403。
+数据／tags 失败均未发源 DELETE，每个失败 entry 计一；tags 失败的两端数据保留。
+数据拒绝发生在 CopyObject 发布前，目标不存在；callback 还如实保留原生失败输出清理的
+Unsupported 次因。这不代表 S3 已写入部分数据后的清理能力已经完成。
+8 条源清理未确认事件带 `payload` 路径及 Unknown；父进程另外证实拒绝／断网时源仍在，
+丢回执时源已消失。12 次下一代全部为 Full，源已消失时目标保留。
+HTTP 204 接收具体后端、阶段、路径及 HTTP 403／AccessDenied 原因；36 份最终汇总保存到数据库，
+所有删源代次 base 清空。S3 诊断保留脱敏的状态与错误码，不要求回传任意原始服务端消息。
+
+从首个注入请求到最终汇总，断连约 145／237 ms、静默超时约 1097／1244 ms；
+Native 普通桶／版本化桶另各通过 7 类真实角色回归，取消约 253 ms。
+普通对象成功清理仅一次 payload HEAD、零数据 GET；闪断／丢回执的角色恢复由测试显式重试。
+Native 完整 make ci 通过；这些秒级值使用测试显式超时，不作为默认／统一任务预算已满足的证据。
+本项不认证其他 S3 厂商、NAS、真实掉电、历史永久删源、目录标记或整轮吞吐／RSS；
+也不把两次迁移代次之间的恢复当作同代次自动重试。
+
+锁定后的最终程序再次运行全部 36 轮通过，版本化目标的每个原始 key 只有一个版本且无删除标记。
+主仓库 fmt、workspace/all-targets check 与 Clippy、workspace 测试及 16 项串行远程回归通过；
+app 默认库测试 328 项通过、45 项 ignored，物理夹具单独显式执行，不能把其他 ignored 当作通过。
+本机 Rust 1.98.1，保留已有警告。架构审查确认：任务层仅决定就绪与清理时序，
+精度处理和精确对象删除均在 S3 backend，不增加任务层协议分支或新存储入口。

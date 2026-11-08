@@ -35,6 +35,9 @@ pub(crate) struct CopyLease {
 #[cfg(test)]
 #[path = "copy_mutable_object_tests.rs"]
 mod mutable_tests;
+#[cfg(all(test, unix))]
+#[path = "copy_object_cleanup_tests.rs"]
+mod object_cleanup_tests;
 #[cfg(test)]
 #[path = "copy_plan_tests.rs"]
 mod plan_tests;

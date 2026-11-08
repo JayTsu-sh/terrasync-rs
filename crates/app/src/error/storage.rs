@@ -81,6 +81,8 @@ pub enum StorageError {
     HistoricalPublicationUnconfirmed { path: StoragePath, source_version: String },
     #[error("源端版本永久清理不可用，已保留所有历史: {path}")]
     PermanentVersionCleanupUnavailable { path: StoragePath },
+    #[error("目录标记对象的目标就绪核验尚未接通，保留源对象: {path}")]
+    DirectoryMarkerCleanupUnavailable { path: StoragePath },
     #[error(transparent)]
     Observation(EntryObservationFailure),
     #[error("incomplete object history")]

@@ -65,9 +65,6 @@ impl FullCleanupStage {
             .connections
             .get()
             .ok_or_else(|| AppError::ConfigError("已复制条目缺少本执行存储上下文，保留源端".into()))?;
-        if source.storage().holds_directory_objects() {
-            return Ok(EarlyCleanup::default());
-        }
         let mut completed = EarlyCleanup {
             connections: Some((source.clone(), target.clone())),
             ..Default::default()
