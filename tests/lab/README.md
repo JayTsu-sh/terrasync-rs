@@ -393,3 +393,13 @@ root rename round trips, file/directory sync failure and cancellation; app tests
 check that persistence refusal keeps both copies and reports a typed cause. This is
 not power-cut, network-target persistence/ownership, task-wide deadlines,
 ClickHouse/callback outages or full migration performance.
+
+Ordinary file-copy requests explicitly opt in to data-mover's owned Direct failure
+cleanup. The four `file_copy::transfer_contract_tests` verify removal of created
+and overwritten Local bad output, source retention, typed diagnostic preservation,
+and metadata-failure data retention and byte accounting. Native coverage adds
+eight backend and five engine real-file tests, including cancellation with settled
+writers, replacement refusal and publication uncertainty. Only Unix Local implements
+the removal role; post-publication data verification, other adapters and generated
+streams remain separate work. These functional results do not establish throughput
+or RSS parity.

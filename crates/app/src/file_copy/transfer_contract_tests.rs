@@ -76,7 +76,9 @@ impl Metadata for MetadataReadOnly {
 struct MetadataBatchProbe {
     inner: Arc<dyn StagedDestination>,
     fail: bool,
+    fail_verify: bool,
     calls: AtomicU64,
+    cleanup_calls: AtomicU64,
 }
 
 #[async_trait]
@@ -116,7 +118,24 @@ impl StagedDestination for MetadataBatchProbe {
     async fn verify(
         &self, stage: &PreparedStage, request: VerifyRequest,
     ) -> std::result::Result<VerificationEvidence, StorageRoleFailure> {
-        self.inner.verify(stage, request).await
+        let evidence = self.inner.verify(stage, request).await?;
+        if self.fail_verify {
+            return Err(StorageRoleFailure::Entry(
+                EntryOperationFailure::new(
+                    stage.final_destination().path().clone(),
+                    Operation::Verify,
+                    FailureClass::Protocol,
+                    Transience::Permanent,
+                    "injected final data verification failure",
+                )
+                .unwrap(),
+            ));
+        }
+        Ok(evidence)
+    }
+    async fn remove_failed_direct(&self, stage: PreparedStage) -> std::result::Result<(), StorageRoleFailure> {
+        self.cleanup_calls.fetch_add(1, Ordering::Relaxed);
+        self.inner.remove_failed_direct(stage).await
     }
     async fn apply_metadata_batch(
         &self, stage: &PreparedStage, mutations: Vec<MetadataMutation>, cancel: CancellationToken,
@@ -180,6 +199,8 @@ async fn captured_metadata_is_batched_once_without_source_reread_or_later_target
             let probe = Arc::new(MetadataBatchProbe {
                 inner: target.roles.staged_destination()?,
                 fail: false,
+                fail_verify: false,
+                cleanup_calls: AtomicU64::new(0),
                 calls: AtomicU64::new(0),
             });
             let target_calls = guard_metadata(&mut target, false, Some(probe.clone()))?;
@@ -229,6 +250,8 @@ async fn failed_metadata_keeps_published_data_and_counts_its_bytes_in_both_modes
             let probe = Arc::new(MetadataBatchProbe {
                 inner: target.roles.staged_destination()?,
                 fail: true,
+                fail_verify: false,
+                cleanup_calls: AtomicU64::new(0),
                 calls: AtomicU64::new(0),
             });
             let target_calls = guard_metadata(&mut target, false, Some(probe.clone()))?;
@@ -317,6 +340,49 @@ async fn a_plan_without_mode_keeps_private_creation_and_existing_direct_permissi
             assert_eq!(std::fs::read(target_root.path().join("file"))?, b"payload");
             assert_eq!(std::fs::read(source_root.path().join("file"))?, b"payload");
         }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn direct_data_failure_removes_owned_target_while_source_and_typed_reason_survive() -> TestResult {
+    for existing in [false, true] {
+        let source_root = tempfile::tempdir()?;
+        let target_root = tempfile::tempdir()?;
+        std::fs::write(source_root.path().join("file"), b"source payload")?;
+        if existing {
+            std::fs::write(target_root.path().join("file"), b"old payload")?;
+        }
+        let source = create_storage(&source_root.path().to_string_lossy(), CreateStorageOptions::default()).await?;
+        let mut target = create_storage(&target_root.path().to_string_lossy(), CreateStorageOptions::default()).await?;
+        let entry = Arc::new(observe_path(source.storage(), Path::new("file")).await?);
+        let role = Arc::new(MetadataBatchProbe {
+            inner: target.roles.staged_destination()?,
+            fail: false,
+            fail_verify: true,
+            calls: AtomicU64::new(0),
+            cleanup_calls: AtomicU64::new(0),
+        });
+        guard_metadata(&mut target, false, Some(role.clone()))?;
+        let failure = transfer::copy_current(
+            &source,
+            &target,
+            &entry,
+            &CopyOptions {
+                enable_integrity_check: true,
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(&failure, StorageError::Transfer(error)
+            if error.phase() == TransferPhase::Verify && error.cleanup_failure().is_none()));
+        assert!(failure.to_string().contains("injected final data verification failure"));
+        assert_eq!(role.cleanup_calls.load(Ordering::Relaxed), 1);
+        assert!(!target_root.path().join("file").exists());
+        assert_eq!(std::fs::read(source_root.path().join("file"))?, b"source payload");
     }
     Ok(())
 }

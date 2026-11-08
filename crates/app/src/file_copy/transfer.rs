@@ -7,8 +7,8 @@ use data_mover::metadata::MetadataPlan;
 use data_mover::model::{EntryKind, ObservedEntry};
 use data_mover::storage::DeleteMarkerOutcome;
 use data_mover::transfer::{
-    self, MetadataFailurePolicy, MetadataTransferMode, ReadBackVerification, TransferIdentity, TransferOutcome,
-    TransferRequest,
+    self, FailedDataCleanup, MetadataFailurePolicy, MetadataTransferMode, ReadBackVerification, TransferIdentity,
+    TransferOutcome, TransferRequest,
 };
 use task_model::TransferMode;
 use task_model::observation::{EntryStatistics, ObservedItem};
@@ -177,6 +177,7 @@ async fn execute_native(
         options.cancel.clone().unwrap_or_default(),
     )?
     .with_transfer_policy(transfer_policy(options.transfer_mode))
+    .with_failed_data_cleanup(FailedDataCleanup::RemoveOwned)
     .with_metadata_mode(MetadataTransferMode::CallerManaged)
     .with_read_back_verification(if options.enable_integrity_check {
         ReadBackVerification::Enabled
