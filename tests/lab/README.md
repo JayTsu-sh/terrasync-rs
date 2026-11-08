@@ -557,3 +557,18 @@ TargetPersistenceUnconfirmed 类型。独立读取检查七个目标内容正确
 该测试调用生产删源原语，不运行数据库、整个 CLI 或外部 callback；不能冒充上述链路
 及 pNFS DS、目录／链接持久化、吞吐／RSS 的组合验收。准备、二进制部署和精确前缀清理
 由实验室执行方负责，本次前缀及私有代理均已清理。
+
+
+### NFS 目录与符号链接目标
+
+`source_cleanup::real_tests::target_nfs::real_target_nfs_nonfile_persistence_gates_source_removal`
+使用同一个 app lib ignored 真实测试入口和独占目标前缀，代理选择 `--contract nonfile`
+并触发实际 `lookup_path`。每种类型覆盖正常、闪断、持续断连、静默超时、取消和丢回复：
+6 个正常／恢复场景确认后删除 Local 源，6 个未确认场景保留源，返回准确的
+TargetPersistenceUnconfirmed 分类；服务端独立检查 12 个目标类型和断链原值。
+代理确认两个实际丢回复及全程零文件 COMMIT。该测试不运行整轮 CLI、ClickHouse 或 callback。
+
+锁定 data-mover 26063b0 和 nfs-rs 7d984b4 后，上述 12 个场景和原有普通文件 7 个场景
+均已执行通过；普通文件确认了一次匹配 XID 的 COMMIT 回复丢失，独立检查 7 个目标内容。
+实验独占前缀和代理已清理。目录／链接静默检测仍约 15 秒，普通文件约 18 秒；
+不据此宣称统一任务网络预算、真实 pNFS DS 或整轮吞吐／RSS 已验收。

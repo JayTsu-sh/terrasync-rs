@@ -66,9 +66,9 @@ reqwest      = { version = "0.13", default-features = false, features = ["rustls
 url          = "2.5"
 
 # 外部 fork（固定精确提交，保证可复现）
-data-mover = { git = "https://github.com/JayTsu-sh/data-mover-rs.git", rev = "4ed69ed93f20ef7ddf1d794f56f8ad0ed1b02b4c" }
+data-mover = { git = "https://github.com/JayTsu-sh/data-mover-rs.git", rev = "26063b06f7cf9b2837ae7b13641ae3f7372d3687" }
 
-data-mover-model = { git = "https://github.com/JayTsu-sh/data-mover-rs.git", rev = "4ed69ed93f20ef7ddf1d794f56f8ad0ed1b02b4c" }
+data-mover-model = { git = "https://github.com/JayTsu-sh/data-mover-rs.git", rev = "26063b06f7cf9b2837ae7b13641ae3f7372d3687" }
 
 # 内部 path crate
 app          = { path = "crates/app" }
