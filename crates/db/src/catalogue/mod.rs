@@ -7,6 +7,7 @@ use tokio::sync::OnceCell;
 
 use self::layout::ClusterCatalogue;
 use self::lifecycle::CatalogueLifecycle;
+use crate::ClickHouseConfig;
 
 mod comparison;
 mod connection;
@@ -44,6 +45,8 @@ mod record_tests;
 ///
 /// 提供与ClickHouse数据库交互的所有操作功能，包括表的创建、数据的插入、查询和删除等。
 pub struct ClickHouseDatabase {
+    /// 只在构造执行专属传输时复用；不向调用方暴露认证信息。
+    connection_config: Arc<ClickHouseConfig>,
     /// ClickHouse同步客户端，用于执行同步操作如查询和简单插入
     sync_client: Client,
     catalogue_cluster: Option<ClusterCatalogue>,

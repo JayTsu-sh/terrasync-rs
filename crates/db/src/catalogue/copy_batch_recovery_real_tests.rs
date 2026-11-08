@@ -11,7 +11,7 @@ use tokio_util::sync::CancellationToken;
 
 use super::Fixture;
 use crate::execution::base_client;
-use crate::execution::queries::{ScanQueryCancellation, with_scan_cancellation};
+use crate::execution::queries::with_scan_cancellation;
 use crate::migration_fixtures::request;
 use crate::observed_fixtures::observation;
 use crate::scan::rows::NativeScanRecord;
@@ -102,7 +102,7 @@ fn completions() -> Result<Vec<CopyCompletion>> {
 
 async fn case(fixture: &Fixture, history: bool, mode: &str) -> Result<()> {
     let job = format!("batch_{history}_{mode}");
-    let mut database = fixture.open(&job).await?;
+    let database = fixture.open(&job).await?;
     let mut descriptor = request("batch-recovery", true);
     descriptor.binding.target_history = history;
     database.begin_copy_generation(&descriptor).await?;
@@ -115,9 +115,7 @@ async fn case(fixture: &Fixture, history: bool, mode: &str) -> Result<()> {
             &[],
         )
         .await?;
-    let cancellation = ScanQueryCancellation::new(&fixture.config, fixture.config.cluster_name()?, &job)?;
-    database.sync_client = cancellation.data_client(&fixture.config)?;
-    database.async_client = cancellation.data_client(&fixture.config)?;
+    let (database, cancellation) = database.with_query_cancellation()?;
     let execution = cancellation.execution();
     let watch = DatabaseExecutionMonitor::start(cancellation.clone(), CancellationToken::new())?;
     fixture

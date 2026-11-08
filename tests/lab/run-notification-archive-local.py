@@ -84,7 +84,7 @@ def run_isolated():
                 print(f"isolated S3 image={docker('inspect', containers[-1], '--format', '{{.Image}}')}", flush=True)
             print(f"isolated notification image={docker('inspect', containers[0], '--format', '{{.Image}}')}", flush=True)
             pid = docker("inspect", containers[0], "--format", "{{.State.Pid}}")
-            suite = [flag for flag in ("--copy-generations", "--catalogue-recovery", "--rename-generations", "--retention-events", "--source-absence", "--request-policy", "--copy-contracts", "--version-catalogue", "--mutable-catalogue", "--version-metadata", "--scan-wire") if flag in sys.argv]
+            suite = [flag for flag in ("--copy-generations", "--catalogue-recovery", "--consumer-recovery", "--rename-generations", "--retention-events", "--source-absence", "--request-policy", "--copy-contracts", "--version-catalogue", "--mutable-catalogue", "--version-metadata", "--scan-wire") if flag in sys.argv]
             subprocess.run(["nsenter", "-t", pid, "-n", sys.executable, __file__, "--inside", *suite], cwd=ROOT, check=True)
         except BaseException:
             for container in containers:
@@ -212,6 +212,9 @@ def run_copy_generations():
     environment["LAB_COPY_GENERATION_DSN"] = f"http://{address}"
     environment["LAB_COPY_GENERATION_CONTROL"] = address
     try:
+        if "--consumer-recovery" in sys.argv:
+            run_consumer_recovery(environment)
+            return
         if "--catalogue-recovery" in sys.argv:
             subprocess.run([
                 "cargo", "test", "--offline", "--locked", "-p", "db", "--lib",
@@ -430,6 +433,41 @@ def run_version_catalogue(environment):
         source_proxy.server_close()
 
 
+def run_consumer_recovery(environment):
+    reports = []
+
+    class Callback(http.server.BaseHTTPRequestHandler):
+        def log_message(self, *_):
+            pass
+
+        def do_POST(self):
+            reports.append(json.loads(self.rfile.read(int(self.headers["Content-Length"]))))
+            self.send_response(204)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+
+    callback = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Callback)
+    callback.daemon_threads = True
+    threading.Thread(target=callback.serve_forever, daemon=True).start()
+    environment["LAB_COPY_CONSUMER_CALLBACK"] = f"http://127.0.0.1:{callback.server_port}/callback"
+    try:
+        subprocess.run([
+            "cargo", "test", "--offline", "--locked", "-p", "app", "--lib",
+            "real_copy_consumers_recover_and_stop_after_final_failure", "--", "--ignored", "--nocapture",
+        ], cwd=ROOT, env=environment, check=True)
+        summaries = [report for report in reports if report["is_final"] and not report.get("diagnostics")]
+        assert len(summaries) == 6 and all(report["diagnostics_complete"] for report in summaries), summaries
+        failed = [report for report in summaries if report["task_error_count"] == 1]
+        assert len(failed) == 4 and all(report["migration"]["phase"] == "failed" for report in failed), failed
+        causes = [event for report in reports for event in (report.get("diagnostics") or {}).get("events", [])
+                  if "owned batch rejection" in event["message"]]
+        assert len(causes) >= 4, causes
+        print("independent consumer callback inspection deployments=2 full_and_incremental=true failed_runs=4 original_database_cause=true HTTP_204=accepted", flush=True)
+    finally:
+        callback.shutdown()
+        callback.server_close()
+
+
 def run_request_policy(environment):
     reports = []
 
@@ -546,7 +584,7 @@ def run_inside():
             time.sleep(0.2)
         else:
             raise RuntimeError(f"ClickHouse readiness timed out on port {port}")
-    if any(flag in sys.argv for flag in ("--copy-generations", "--catalogue-recovery", "--rename-generations", "--retention-events", "--source-absence", "--request-policy", "--copy-contracts", "--version-catalogue", "--mutable-catalogue", "--version-metadata", "--scan-wire")):
+    if any(flag in sys.argv for flag in ("--copy-generations", "--catalogue-recovery", "--consumer-recovery", "--rename-generations", "--retention-events", "--source-absence", "--request-policy", "--copy-contracts", "--version-catalogue", "--mutable-catalogue", "--version-metadata", "--scan-wire")):
         run_copy_generations()
         return
     environment = dict(os.environ)

@@ -403,3 +403,17 @@ writers, replacement refusal and publication uncertainty. Only Unix Local implem
 the removal role; post-publication data verification, other adapters and generated
 streams remain separate work. These functional results do not establish throughput
 or RSS parity.
+
+
+`run-notification-archive-local.py --consumer-recovery` provisions its own Single
+and two-replica Cluster ClickHouse pair, fault proxy and HTTP 204 callback. It runs
+the actual full/incremental fact consumer through normal writes, recovered faults,
+lost committed acknowledgements, persistent disconnect, silent timeout, permission
+refusal, cancellation, idle faults and final-batch faults. Queued later batches must
+stop after a final failure; the original catalogue must still archive a final
+report and expose it through the notification read API. Four complete migration
+runs also check that database refusal reaches the final callback instead of a
+secondary broadcast-disconnected error. The runner removes its own containers on
+exit. This is consumer/notification evidence, not a claim that active storage I/O,
+walker initialization and all workers already share cancellation, or that the
+migration meets throughput/RSS targets.

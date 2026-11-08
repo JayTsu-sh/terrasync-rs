@@ -9,12 +9,19 @@ use db::ClickHouseDatabase;
 use db::error::DatabaseError;
 use task_model::{CopyCompletion, CopyReadiness, StorageEntryMessage};
 use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 use tracing::{Instrument, debug, error, info, info_span, trace};
 
 // 内部模块
 use crate::config::{ConsumerConfig, JobType};
 use crate::consumer::traits::Consumer;
 use crate::error::Result;
+
+mod execution;
+use execution::ConsumerExecution;
+#[cfg(test)]
+#[path = "database/recovery_real_tests.rs"]
+mod recovery_real_tests;
 
 #[derive(Default)]
 struct DatabaseFailures {
@@ -49,6 +56,7 @@ pub struct DatabaseConsumer {
     /// 批量插入的大小阈值
     batch_size: u32,
     job_type: JobType,
+    cancel: CancellationToken,
 }
 
 // 为StorageEntryMessage实现Consumer trait
@@ -68,248 +76,266 @@ impl Consumer for DatabaseConsumer {
         &mut self, mut receiver: mpsc::Receiver<StorageEntryMessage>,
     ) -> Result<tokio::task::JoinHandle<Result<()>>> {
         // 获取数据库引用和批量大小的克隆
-        let db = self.db.clone();
+        let mut db = self.db.clone();
         let batch_size = self.batch_size;
         let job_type = self.job_type.clone();
+        let execution = ConsumerExecution::prepare(
+            &mut db,
+            matches!(job_type, JobType::Copy | JobType::IncrementalCopy),
+            self.cancel.clone(),
+        )?;
         debug!("[DatabaseConsumer] Starting consumer with batch size: {}", batch_size);
 
         let span = info_span!("consumer", kind = "database");
         let handle = tokio::spawn(
             async move {
-                // 预分配容量以优化性能
-                let mut current_message_batch: Vec<StorageEntryMessage> = Vec::with_capacity(batch_size as usize);
-                let mut current_insert_entry_batch: Vec<CopyCompletion> = Vec::with_capacity(batch_size as usize);
-                let mut current_delete_entry_batch: Vec<String> = Vec::with_capacity(batch_size as usize);
-                let mut processed_count = 0;
-                let mut processed_errors = DatabaseFailures::default();
+                let work = async {
+                    // 预分配容量以优化性能
+                    let mut current_message_batch: Vec<StorageEntryMessage> = Vec::with_capacity(batch_size as usize);
+                    let mut current_insert_entry_batch: Vec<CopyCompletion> = Vec::with_capacity(batch_size as usize);
+                    let mut current_delete_entry_batch: Vec<String> = Vec::with_capacity(batch_size as usize);
+                    let mut processed_count = 0;
+                    let mut processed_errors = DatabaseFailures::default();
 
-                while let Some(message) = receiver.recv().await {
-                    match message {
-                        StorageEntryMessage::Scanned(entry) => {
-                            trace!(path = %entry.get_relative_path().display(), "db: scanned");
-                            // 全量扫描场景：将扫描到的条目插入基础表
-                            // 其他场景（如增量扫描）Scanned 仅用于统计，无需入库
-                            if job_type == JobType::Scan {
-                                for item in ObservedItem::all(&entry) {
+                    while let Some(message) = execution.receive(&mut receiver).await? {
+                        match message {
+                            StorageEntryMessage::Scanned(entry) => {
+                                trace!(path = %entry.get_relative_path().display(), "db: scanned");
+                                // 全量扫描场景：将扫描到的条目插入基础表
+                                // 其他场景（如增量扫描）Scanned 仅用于统计，无需入库
+                                if job_type == JobType::Scan {
+                                    for item in ObservedItem::all(&entry) {
+                                        DatabaseConsumer::batch_insert_base_record(
+                                            &db,
+                                            &item,
+                                            &mut current_insert_entry_batch,
+                                            batch_size,
+                                            &mut processed_errors,
+                                        )
+                                        .await;
+                                    }
+                                }
+                            }
+                            StorageEntryMessage::CopyItemCompleted { completion, change } => {
+                                if job_type != JobType::Copy && completion.readiness == CopyReadiness::Ready {
+                                    Self::batch_insert_incremental_record(
+                                        &db,
+                                        &change.message(completion.item.clone()),
+                                        &mut current_message_batch,
+                                        batch_size,
+                                        &mut processed_errors,
+                                    )
+                                    .await;
+                                }
+                                Self::batch_insert_copy_completion(
+                                    &db,
+                                    completion,
+                                    &mut current_insert_entry_batch,
+                                    batch_size,
+                                    &mut processed_errors,
+                                )
+                                .await;
+                            }
+                            StorageEntryMessage::New(entry) => {
+                                trace!(path = %entry.get_relative_path().display(), "db: new entry");
+
+                                // 全量拷贝(Copy)和增量拷贝(IncrementalCopy)都需要插入基础表；
+                                // 增量扫描(IncrementalScan)无需插入基础表（临时表导入主表时已处理）。
+                                if job_type == JobType::Copy || job_type == JobType::IncrementalCopy {
                                     DatabaseConsumer::batch_insert_base_record(
                                         &db,
-                                        &item,
+                                        &entry,
                                         &mut current_insert_entry_batch,
                                         batch_size,
                                         &mut processed_errors,
                                     )
                                     .await;
                                 }
-                            }
-                        }
-                        StorageEntryMessage::CopyItemCompleted { completion, change } => {
-                            if job_type != JobType::Copy && completion.readiness == CopyReadiness::Ready {
-                                Self::batch_insert_incremental_record(
-                                    &db,
-                                    &change.message(completion.item.clone()),
-                                    &mut current_message_batch,
-                                    batch_size,
-                                    &mut processed_errors,
-                                )
-                                .await;
-                            }
-                            Self::batch_insert_copy_completion(
-                                &db,
-                                completion,
-                                &mut current_insert_entry_batch,
-                                batch_size,
-                                &mut processed_errors,
-                            )
-                            .await;
-                        }
-                        StorageEntryMessage::New(entry) => {
-                            trace!(path = %entry.get_relative_path().display(), "db: new entry");
 
-                            // 全量拷贝(Copy)和增量拷贝(IncrementalCopy)都需要插入基础表；
-                            // 增量扫描(IncrementalScan)无需插入基础表（临时表导入主表时已处理）。
-                            if job_type == JobType::Copy || job_type == JobType::IncrementalCopy {
-                                DatabaseConsumer::batch_insert_base_record(
-                                    &db,
-                                    &entry,
-                                    &mut current_insert_entry_batch,
-                                    batch_size,
-                                    &mut processed_errors,
-                                )
-                                .await;
+                                // 全量拷贝(Copy)只需入基础表，不需要增量记录。
+                                if job_type != JobType::Copy {
+                                    DatabaseConsumer::batch_insert_incremental_record(
+                                        &db,
+                                        &StorageEntryMessage::New(entry),
+                                        &mut current_message_batch,
+                                        batch_size,
+                                        &mut processed_errors,
+                                    )
+                                    .await;
+                                }
                             }
+                            StorageEntryMessage::Changed { entry, kind } => {
+                                trace!(path = %entry.get_relative_path().display(), kind = %kind, "db: changed entry");
 
-                            // 全量拷贝(Copy)只需入基础表，不需要增量记录。
-                            if job_type != JobType::Copy {
+                                // 只有在增量拷贝场景才需要更新数据库里的记录
+                                // 在增量扫描场景是不需要更新记录的,是因为在临时表导入主表时就已经更新了。
+                                if job_type == JobType::IncrementalCopy {
+                                    DatabaseConsumer::batch_insert_base_record(
+                                        &db,
+                                        &entry,
+                                        &mut current_insert_entry_batch,
+                                        batch_size,
+                                        &mut processed_errors,
+                                    )
+                                    .await;
+                                }
+
                                 DatabaseConsumer::batch_insert_incremental_record(
                                     &db,
-                                    &StorageEntryMessage::New(entry),
+                                    &StorageEntryMessage::Changed { entry, kind },
                                     &mut current_message_batch,
                                     batch_size,
                                     &mut processed_errors,
                                 )
                                 .await;
                             }
-                        }
-                        StorageEntryMessage::Changed { entry, kind } => {
-                            trace!(path = %entry.get_relative_path().display(), kind = %kind, "db: changed entry");
-
-                            // 只有在增量拷贝场景才需要更新数据库里的记录
-                            // 在增量扫描场景是不需要更新记录的,是因为在临时表导入主表时就已经更新了。
-                            if job_type == JobType::IncrementalCopy {
+                            StorageEntryMessage::Renamed((from_entry, to_entry)) => {
+                                trace!("[DatabaseConsumer] Renaming entry {:?} to {:?}", from_entry, to_entry);
+                                // 在增量拷贝和增量扫描场景均需要更新数据库里的记录
                                 DatabaseConsumer::batch_insert_base_record(
                                     &db,
-                                    &entry,
+                                    &Arc::clone(&to_entry).into(),
                                     &mut current_insert_entry_batch,
                                     batch_size,
                                     &mut processed_errors,
                                 )
                                 .await;
+
+                                DatabaseConsumer::batch_delete_base_record(
+                                    &db,
+                                    &from_entry,
+                                    &mut current_delete_entry_batch,
+                                    batch_size,
+                                    &mut processed_errors,
+                                )
+                                .await;
+
+                                DatabaseConsumer::batch_insert_incremental_record(
+                                    &db,
+                                    &StorageEntryMessage::Renamed((from_entry, to_entry)),
+                                    &mut current_message_batch,
+                                    batch_size,
+                                    &mut processed_errors,
+                                )
+                                .await;
                             }
+                            StorageEntryMessage::Deleted(entry) => {
+                                trace!(path = %entry.get_relative_path().display(), "db: deleted entry");
+                                // 在增量拷贝和增量扫描场景均需要删除数据库里的记录
+                                DatabaseConsumer::batch_delete_base_record(
+                                    &db,
+                                    &entry,
+                                    &mut current_delete_entry_batch,
+                                    batch_size,
+                                    &mut processed_errors,
+                                )
+                                .await;
 
-                            DatabaseConsumer::batch_insert_incremental_record(
-                                &db,
-                                &StorageEntryMessage::Changed { entry, kind },
-                                &mut current_message_batch,
-                                batch_size,
-                                &mut processed_errors,
-                            )
-                            .await;
-                        }
-                        StorageEntryMessage::Renamed((from_entry, to_entry)) => {
-                            trace!("[DatabaseConsumer] Renaming entry {:?} to {:?}", from_entry, to_entry);
-                            // 在增量拷贝和增量扫描场景均需要更新数据库里的记录
-                            DatabaseConsumer::batch_insert_base_record(
-                                &db,
-                                &Arc::clone(&to_entry).into(),
-                                &mut current_insert_entry_batch,
-                                batch_size,
-                                &mut processed_errors,
-                            )
-                            .await;
-
-                            DatabaseConsumer::batch_delete_base_record(
-                                &db,
-                                &from_entry,
-                                &mut current_delete_entry_batch,
-                                batch_size,
-                                &mut processed_errors,
-                            )
-                            .await;
-
-                            DatabaseConsumer::batch_insert_incremental_record(
-                                &db,
-                                &StorageEntryMessage::Renamed((from_entry, to_entry)),
-                                &mut current_message_batch,
-                                batch_size,
-                                &mut processed_errors,
-                            )
-                            .await;
-                        }
-                        StorageEntryMessage::Deleted(entry) => {
-                            trace!(path = %entry.get_relative_path().display(), "db: deleted entry");
-                            // 在增量拷贝和增量扫描场景均需要删除数据库里的记录
-                            DatabaseConsumer::batch_delete_base_record(
-                                &db,
-                                &entry,
-                                &mut current_delete_entry_batch,
-                                batch_size,
-                                &mut processed_errors,
-                            )
-                            .await;
-
-                            DatabaseConsumer::batch_insert_incremental_record(
-                                &db,
-                                &StorageEntryMessage::Deleted(entry),
-                                &mut current_message_batch,
-                                batch_size,
-                                &mut processed_errors,
-                            )
-                            .await;
-                        }
-                        StorageEntryMessage::IntegrityChecked(_)
-                        | StorageEntryMessage::Packaged(_)
-                        | StorageEntryMessage::CopyEntryCompleted { .. }
-                        | StorageEntryMessage::CopyEntryBoundary(_)
-                        | StorageEntryMessage::CopyEntryDeltaCompleted { .. } => {
-                            // 完整性检查/Packaged 操作，不做数据库操作
-                        }
-                        StorageEntryMessage::TarManifest {
-                            ref tar_path,
-                            ref entries,
-                        } => {
-                            trace!("[DatabaseConsumer] Received TarManifest for: {}", tar_path);
-                            if let Err(e) = db.batch_insert_tar_manifest(tar_path, entries).await {
-                                error!(
-                                    "[DatabaseConsumer] Failed to insert tar manifest for {}: {}",
-                                    tar_path, e
+                                DatabaseConsumer::batch_insert_incremental_record(
+                                    &db,
+                                    &StorageEntryMessage::Deleted(entry),
+                                    &mut current_message_batch,
+                                    batch_size,
+                                    &mut processed_errors,
+                                )
+                                .await;
+                            }
+                            StorageEntryMessage::IntegrityChecked(_)
+                            | StorageEntryMessage::Packaged(_)
+                            | StorageEntryMessage::CopyEntryCompleted { .. }
+                            | StorageEntryMessage::CopyEntryBoundary(_)
+                            | StorageEntryMessage::CopyEntryDeltaCompleted { .. } => {
+                                // 完整性检查/Packaged 操作，不做数据库操作
+                            }
+                            StorageEntryMessage::TarManifest {
+                                ref tar_path,
+                                ref entries,
+                            } => {
+                                trace!("[DatabaseConsumer] Received TarManifest for: {}", tar_path);
+                                if let Err(e) = db.batch_insert_tar_manifest(tar_path, entries).await {
+                                    error!(
+                                        "[DatabaseConsumer] Failed to insert tar manifest for {}: {}",
+                                        tar_path, e
+                                    );
+                                    processed_errors.record(1, e);
+                                }
+                            }
+                            StorageEntryMessage::Error {
+                                ref path, ref reason, ..
+                            } => {
+                                trace!(
+                                    path = %path.display(),
+                                    reason = %reason,
+                                    "db: error entry, skipping"
                                 );
-                                processed_errors.record(1, e);
                             }
+                            StorageEntryMessage::VersionMetadataChanged { .. }
+                            | StorageEntryMessage::CopyVersionFailed { .. }
+                            | StorageEntryMessage::CopySkipped { .. }
+                            | StorageEntryMessage::TargetPreserved { .. }
+                            | StorageEntryMessage::Diagnostic { .. } => {}
                         }
-                        StorageEntryMessage::Error {
-                            ref path, ref reason, ..
-                        } => {
-                            trace!(
-                                path = %path.display(),
-                                reason = %reason,
-                                "db: error entry, skipping"
-                            );
+
+                        processed_count += 1;
+                        // 允许缺失事实不等于允许脱库继续运行；最终失败后关闭必需消费者。
+                        if execution.stops_on_failure() && processed_errors.count() != 0 {
+                            return database_consumer_result(processed_errors);
                         }
-                        StorageEntryMessage::VersionMetadataChanged { .. }
-                        | StorageEntryMessage::CopyVersionFailed { .. }
-                        | StorageEntryMessage::CopySkipped { .. }
-                        | StorageEntryMessage::TargetPreserved { .. }
-                        | StorageEntryMessage::Diagnostic { .. } => {}
                     }
 
-                    processed_count += 1;
-                }
+                    // 通道已关闭，刷新所有剩余批次
+                    info!("[DatabaseConsumer] Channel closed, flushing remaining batches...");
+                    if !current_insert_entry_batch.is_empty() {
+                        debug!(
+                            "[DatabaseConsumer] Flushing {} remaining base insertion records",
+                            current_insert_entry_batch.len()
+                        );
+                        DatabaseConsumer::finalize_insert_base_record(
+                            &db,
+                            &mut current_insert_entry_batch,
+                            &mut processed_errors,
+                        )
+                        .await;
+                        if execution.stops_on_failure() && processed_errors.count() != 0 {
+                            return database_consumer_result(processed_errors);
+                        }
+                    }
+                    if !current_delete_entry_batch.is_empty() {
+                        debug!(
+                            "[DatabaseConsumer] Flushing {} remaining base deletion records",
+                            current_delete_entry_batch.len()
+                        );
+                        DatabaseConsumer::finalize_delete_base_record(
+                            &db,
+                            &mut current_delete_entry_batch,
+                            &mut processed_errors,
+                        )
+                        .await;
+                        if execution.stops_on_failure() && processed_errors.count() != 0 {
+                            return database_consumer_result(processed_errors);
+                        }
+                    }
+                    if !current_message_batch.is_empty() {
+                        debug!(
+                            "[DatabaseConsumer] Flushing {} remaining incremental records",
+                            current_message_batch.len()
+                        );
+                        DatabaseConsumer::finalize_insert_incremental_record(
+                            &db,
+                            &mut current_message_batch,
+                            &mut processed_errors,
+                        )
+                        .await;
+                    }
 
-                // 通道已关闭，刷新所有剩余批次
-                info!("[DatabaseConsumer] Channel closed, flushing remaining batches...");
-                if !current_insert_entry_batch.is_empty() {
-                    debug!(
-                        "[DatabaseConsumer] Flushing {} remaining base insertion records",
-                        current_insert_entry_batch.len()
+                    info!(
+                        "[DatabaseConsumer] Consumer task completed, total processed: {}, processed error: {}",
+                        processed_count,
+                        processed_errors.count()
                     );
-                    DatabaseConsumer::finalize_insert_base_record(
-                        &db,
-                        &mut current_insert_entry_batch,
-                        &mut processed_errors,
-                    )
-                    .await;
-                }
-                if !current_delete_entry_batch.is_empty() {
-                    debug!(
-                        "[DatabaseConsumer] Flushing {} remaining base deletion records",
-                        current_delete_entry_batch.len()
-                    );
-                    DatabaseConsumer::finalize_delete_base_record(
-                        &db,
-                        &mut current_delete_entry_batch,
-                        &mut processed_errors,
-                    )
-                    .await;
-                }
-                if !current_message_batch.is_empty() {
-                    debug!(
-                        "[DatabaseConsumer] Flushing {} remaining incremental records",
-                        current_message_batch.len()
-                    );
-                    DatabaseConsumer::finalize_insert_incremental_record(
-                        &db,
-                        &mut current_message_batch,
-                        &mut processed_errors,
-                    )
-                    .await;
-                }
-
-                info!(
-                    "[DatabaseConsumer] Consumer task completed, total processed: {}, processed error: {}",
-                    processed_count,
-                    processed_errors.count()
-                );
-                database_consumer_result(processed_errors)
+                    database_consumer_result(processed_errors)
+                };
+                execution.run(work).await
             }
             .instrument(span),
         );
@@ -325,6 +351,13 @@ impl Consumer for DatabaseConsumer {
 }
 
 impl DatabaseConsumer {
+    /// 将复制事实消费者接入任务取消；最终通知继续使用独立目录连接。
+    #[must_use]
+    pub fn with_cancellation(mut self, cancel: CancellationToken) -> Self {
+        self.cancel = cancel;
+        self
+    }
+
     /// 创建数据库消费者实例
     ///
     /// 根据提供的配置初始化数据库连接并创建消费者实例
@@ -368,6 +401,7 @@ impl DatabaseConsumer {
             db: database,
             batch_size: config.db_config.batch_size,
             job_type: config.job_type.clone(),
+            cancel: CancellationToken::new(),
         })
     }
 

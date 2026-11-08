@@ -854,9 +854,10 @@ impl SyncOrchestrator {
         let consumers_result = finish_phase(consumer_handles).await;
         let source_result = walkdir_iter.take_error().map_or(Ok(()), |error| Err(error.into()));
         let result: Result<()> = async {
-            senders_result
+            // 消费者关闭会使 worker 返回广播错误；优先保留导致关闭的真实原因。
+            consumers_result
+                .and(senders_result)
                 .and(receivers_result)
-                .and(consumers_result)
                 .and(source_dispatch_result)
                 .and(source_result)?;
             if let Some(database) = &database {
@@ -1177,10 +1178,10 @@ impl SyncOrchestrator {
             } else {
                 (enumeration_result, handler_result)
             };
-        let phase_a = enumeration_result
+        let phase_a = durable_result
+            .and(enumeration_result)
             .and(scan_result)
             .and(handler_result)
-            .and(durable_result)
             .and(dispatch_result)
             .and(scan_dispatch_result);
         if let Err(error) = phase_a {
