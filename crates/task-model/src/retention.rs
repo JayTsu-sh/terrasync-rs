@@ -28,6 +28,7 @@ pub enum TargetRetentionReason {
     SourceQueryFailed,
     BaselineUnavailable,
     StaleEvidence,
+    TargetPersistenceUnconfirmed,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

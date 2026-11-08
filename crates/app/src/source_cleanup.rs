@@ -74,10 +74,12 @@ pub(crate) async fn report_failure(result: Result<()>, reports: &ConsumerManager
         return Err(source);
     };
     let report = async {
-        let reason = if matches!(failure.storage_error(), Some(StorageError::NamespaceRead(_))) {
-            TargetRetentionReason::SourceQueryFailed
-        } else {
-            TargetRetentionReason::StaleEvidence
+        let reason = match failure.storage_error() {
+            Some(StorageError::NamespaceRead(_)) => TargetRetentionReason::SourceQueryFailed,
+            Some(StorageError::TargetPersistenceUnconfirmed { .. }) => {
+                TargetRetentionReason::TargetPersistenceUnconfirmed
+            }
+            _ => TargetRetentionReason::StaleEvidence,
         };
         let mut retention = TargetRetention::entry(&path(entry_path)?, reason);
         if matches!(
@@ -143,6 +145,16 @@ async fn remove_entry(
         }
         .into());
     }
+    // 可读且校验一致不代表已落盘；包括仅更新属性、未重新复制的数据和目录。
+    destination
+        .storage()
+        .namespace()?
+        .persist_observed(&target, check.cancel.clone())
+        .await
+        .map_err(|source| StorageError::TargetPersistenceUnconfirmed {
+            path: entry.path().clone(),
+            source,
+        })?;
     if !verify_source_metadata(source, entry, check).await? {
         return Ok(());
     }
@@ -352,3 +364,8 @@ mod tests {
         Ok(())
     }
 }
+
+#[cfg(all(test, unix))]
+#[path = "source_cleanup/persistence_tests.rs"]
+#[allow(clippy::unwrap_used)]
+mod persistence_tests;

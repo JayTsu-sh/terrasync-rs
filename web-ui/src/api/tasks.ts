@@ -157,6 +157,7 @@ export interface DiagnosticEvent {
       | 'source_query_failed'
       | 'baseline_unavailable'
       | 'stale_evidence'
+      | 'target_persistence_unconfirmed'
   }
 }
 

@@ -32,6 +32,12 @@ pub enum StorageError {
     MetadataVerification(#[from] MetadataVerificationError),
     #[error("目标发布状态与复制结果不一致，禁止删源: {path}")]
     TargetPublicationChanged { path: StoragePath },
+    #[error("目标端持久化确认失败，保留源端: {path}: {source}; {}", persistence_diagnostic(.source))]
+    TargetPersistenceUnconfirmed {
+        path: StoragePath,
+        #[source]
+        source: StorageRoleFailure,
+    },
     #[error("复制后源端元数据发生变化，保留源端: {path}, families={families:?}")]
     SourceMetadataChanged {
         path: StoragePath,
@@ -164,7 +170,10 @@ impl StorageError {
     pub fn is_cancelled(&self) -> bool {
         matches!(self, Self::Cancelled)
             || matches!(self, Self::NamespaceRead(NamespaceReadFailure::Cancelled { .. }))
-            || matches!(self, Self::Role(StorageRoleFailure::Entry(error)) if error.class() == FailureClass::Cancelled)
+            || matches!(self,
+                Self::Role(StorageRoleFailure::Entry(error))
+                | Self::TargetPersistenceUnconfirmed { source: StorageRoleFailure::Entry(error), .. }
+                if error.class() == FailureClass::Cancelled)
             || matches!(self, Self::DirectPatch(error) if error.is_cancelled())
     }
 }
@@ -173,6 +182,14 @@ impl From<TransferFailure> for StorageError {
         Self::Transfer(Box::new(value))
     }
 }
+// role 的 Display 只展示类别；这里显式选用契约已脱敏的诊断供任务日志及 callback 使用。
+fn persistence_diagnostic(source: &StorageRoleFailure) -> &str {
+    match source {
+        StorageRoleFailure::Entry(error) => error.diagnostic(),
+        StorageRoleFailure::Session(error) => error.diagnostic(),
+    }
+}
+
 pub type Result<T> = std::result::Result<T, StorageError>;
 pub(crate) fn operation(error: impl Into<String>) -> StorageError {
     StorageError::OperationError(error.into())

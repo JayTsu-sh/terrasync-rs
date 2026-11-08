@@ -372,5 +372,9 @@ A counting namespace delegates to the real NFS role and requires zero purge call
 when metadata observation fails. The relay affects only its own sockets; no
 server, firewall, export or SSH configuration is changed. The caller must always
 execute cleanup, including after test failure. This verifies source observation
-and purge admission, not target durability/ownership, task-wide deadlines,
+and purge admission, with the Unix Local target persistence barrier now on that path.
+Real local-filesystem persistence tests separately cover stale inode/root bindings,
+root rename round trips, file/directory sync failure and cancellation; app tests
+check that persistence refusal keeps both copies and reports a typed cause. This is
+not power-cut, network-target persistence/ownership, task-wide deadlines,
 ClickHouse/callback outages or full migration performance.

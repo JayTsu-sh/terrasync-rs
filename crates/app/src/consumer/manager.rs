@@ -784,8 +784,8 @@ mod resume_tests {
     use crate::observed_fixtures::observation;
     use crate::source_cleanup;
     use data_mover::model::{BackendKind, EntryKind};
-    use data_mover::model::{MetadataFamily, StoragePath};
-    use data_mover::storage::{NamespaceReadCause, NamespaceReadFailure};
+    use data_mover::model::{EntryOperationFailure, FailureClass, MetadataFamily, Operation, StoragePath, Transience};
+    use data_mover::storage::{NamespaceReadCause, NamespaceReadFailure, StorageRoleFailure};
     use db::DatabaseError;
     use db::EntrySummary as StorageEntryRecord;
     use db::scan::{ScanEventSummary, ScanResumeSummary};
@@ -794,7 +794,7 @@ mod resume_tests {
 
     #[tokio::test]
     async fn source_cleanup_failure_reports_known_paths_and_presence_without_double_entry_errors() -> Result<()> {
-        for present in [false, true] {
+        for (present, persistence) in [(false, false), (true, false), (false, true)] {
             let statistics = StatisticConsumer {
                 stats: StatsKind::Full(FullStats::new(
                     JobType::Copy,
@@ -819,7 +819,21 @@ mod resume_tests {
                 copy_pipeline_prepared: false,
             };
             let path = StoragePath::new("payload").map_err(StorageError::from)?;
-            let source = if present {
+            let source = if persistence {
+                StorageError::TargetPersistenceUnconfirmed {
+                    path,
+                    source: StorageRoleFailure::Entry(
+                        EntryOperationFailure::new(
+                            StoragePath::new("payload").map_err(StorageError::from)?,
+                            Operation::Publish,
+                            FailureClass::Protocol,
+                            Transience::Permanent,
+                            "injected target sync failure",
+                        )
+                        .map_err(StorageError::from)?,
+                    ),
+                }
+            } else if present {
                 StorageError::SourceMetadataChanged {
                     path,
                     families: vec![MetadataFamily::OwnershipMode],
@@ -862,6 +876,9 @@ mod resume_tests {
                 .iter()
                 .find(|event| event.code == "target_preserved")
                 .ok_or_else(|| AppError::ConfigError("missing retention event".into()))?;
+            if persistence {
+                assert!(event.message.contains("injected target sync failure"));
+            }
             let retention = event
                 .retention
                 .as_ref()
@@ -879,7 +896,9 @@ mod resume_tests {
             );
             assert_eq!(
                 retention.reason,
-                if present {
+                if persistence {
+                    TargetRetentionReason::TargetPersistenceUnconfirmed
+                } else if present {
                     TargetRetentionReason::StaleEvidence
                 } else {
                     TargetRetentionReason::SourceQueryFailed
