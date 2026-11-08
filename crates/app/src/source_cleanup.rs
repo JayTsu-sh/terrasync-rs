@@ -20,6 +20,7 @@ use task_model::{SourcePresence, TargetRetention, TargetRetentionReason};
 
 mod verification;
 use verification::verify_source_metadata;
+mod content;
 
 #[cfg(all(test, unix))]
 #[path = "source_cleanup_real_tests.rs"]
@@ -29,6 +30,7 @@ mod real_tests;
 pub(crate) struct SourceCleanupCheck {
     read_policy: NamespaceReadPolicy,
     cancel: CancellationToken,
+    verify_content: bool,
 }
 
 impl SourceCleanupCheck {
@@ -40,7 +42,13 @@ impl SourceCleanupCheck {
                 retry_interval: Duration::from_millis(100),
             },
             cancel,
+            verify_content: false,
         }
+    }
+
+    pub(crate) fn with_content_verification(mut self, enabled: bool) -> Self {
+        self.verify_content = enabled;
+        self
     }
 }
 
@@ -164,6 +172,10 @@ async fn remove_entry(
         })?;
     if !verify_source_metadata(source, entry, check).await? {
         return Ok(());
+    }
+    // 增量跳过／仅修改属性的条目没有本轮数据传输回读，也必须执行用户选择的全量校验。
+    if check.verify_content && entry.kind() == EntryKind::File {
+        content::verify(source, destination, entry, &target, check).await?;
     }
     // 仅删除文件、链接本身或空目录；过滤掉或并发新增的子项会阻止目录删除。
     source
@@ -384,3 +396,8 @@ mod persistence_tests;
 #[path = "source_cleanup/purge_tests.rs"]
 #[allow(clippy::unwrap_used)]
 mod purge_tests;
+
+#[cfg(all(test, unix))]
+#[path = "source_cleanup/content_tests.rs"]
+#[allow(clippy::unwrap_used)]
+mod content_tests;

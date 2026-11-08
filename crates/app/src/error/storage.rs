@@ -1,4 +1,5 @@
 use data_mover::error::StorageError as NativeStorageError;
+use data_mover::integrity::IntegritySide as NativeIntegritySide;
 use data_mover::metadata::MetadataVerificationError;
 use data_mover::model::MetadataFamily;
 use data_mover::model::MetadataObservationFailure;
@@ -35,6 +36,13 @@ pub enum StorageError {
     #[error("目标端持久化确认失败，保留源端: {path}: {source}; {}", role_diagnostic(.source))]
     TargetPersistenceUnconfirmed {
         path: StoragePath,
+        #[source]
+        source: StorageRoleFailure,
+    },
+    #[error("删源前数据全量校验未完成，保留源端: {path}, side={side:?}: {source}; {}", role_diagnostic(.source))]
+    SourceCleanupContentUnverified {
+        path: StoragePath,
+        side: NativeIntegritySide,
         #[source]
         source: StorageRoleFailure,
     },
@@ -185,7 +193,11 @@ impl StorageError {
             || matches!(self,
                 Self::Role(StorageRoleFailure::Entry(error))
                 | Self::TargetPersistenceUnconfirmed { source: StorageRoleFailure::Entry(error), .. }
+                | Self::SourceCleanupContentUnverified { source: StorageRoleFailure::Entry(error), .. }
                 | Self::SourcePurgeRefused { source: StorageRoleFailure::Entry(error), .. }
+                if error.class() == FailureClass::Cancelled)
+            || matches!(self,
+                Self::SourceCleanupContentUnverified { source: StorageRoleFailure::Session(error), .. }
                 if error.class() == FailureClass::Cancelled)
             || matches!(self, Self::DirectPatch(error) if error.is_cancelled())
     }

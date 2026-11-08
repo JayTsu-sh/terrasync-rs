@@ -668,3 +668,36 @@ runner 先用 --list 确认测试存在，然后创建独占 RustFS 容器、桶
 常驻进程内 SDK 池立即关闭、复制中断网的统一检测／恢复预算、实际 ClickHouse／callback
 或整轮吞吐／RSS 已验收。没有数据库执行域的任务仍按原配置工作。
 这一步补齐清理队列所依赖的取消链路，源清理目前仍等待数据库收尾。
+
+### 增量搬迁跳过项的数据全量校验
+
+`source_cleanup::content_tests` 在旧实现复现相同长度、相同 mtime 的坏目标被放行并删源。
+修复后，显式全量校验复用原生完整性比较，绑定原始源观察及已确认目标身份，
+检查实际源读取量和两端 BLAKE3；源／目标读取失败保留原始类型、出错侧与诊断。
+新增 5 项确定性测试覆盖内容损坏、quick 零内容读取、空／非空文件的 full 双端读取、
+双方同时短读、源／目标读取权限／连接／取消错误及读取中取消，原有清理测试继续通过。
+全量复制沿用传输阶段的数据校验，增量删源补齐跳过／仅修改属性条目；
+两种清理入口都接入既有复制执行的取消信号。
+
+`python3 tests/lab/run-source-content-local.py --binary <app-lib-test-binary>`
+运行精确 ignored 用例
+`source_cleanup::content_tests::real_existing_s3_content_verification_gates_source_removal`。
+独占 RustFS 的 9 类验证包括 quick、full、相同大小的错误内容、403、持续断连、
+静默超时、取消、闪断后显式重试及超时后显式重试。quick 零数据 GET，正常 full 一次
+固定最新版本 ID 的 GET；断连约 15 ms、配置的静默检测约 1 秒、取消约 270 ms。
+重试由用例显式恢复代理后发起，不作为产品自动恢复已验收的证据。
+父进程用独立 boto3 检查三个版本的内容／身份及哨兵未改变，无修改请求和未完成上传，
+测试进程退出后连接全部关闭；源文件只在相应校验成功后删除。
+
+`python3 tests/lab/run-notification-archive-local.py --copy-content` 覆盖真实 Local、
+Single／双副本 ClickHouse 和 HTTP 204 callback，共 12 轮迁移。
+每组先 full 保留源，再 incremental 删除源，分别验证未变化、目标损坏、
+源仅改 mode 且目标损坏。第二轮数据传输均为零；4 个损坏项保留两端，2 个正常项删源。
+独立父进程检查文件及 4 条逐项 callback 原因；Rust 用例核验终态、空 base、
+累计 task_error_count／target_preserved_count 和数据库保存的最终报告。
+范围级计划保留事件独立核验，不能混入逐项保留数量。
+两个 runner 都清理各自的容器、网络命名空间和临时数据，未改共享服务或防火墙。
+
+这些证据不覆盖所有协议、保留源增量的 full 校验、自动网络恢复、掉电或整轮吞吐／RSS。
+增量中本轮已复制的条目仍可能多一次 full 回读；尚未以持久化的数据校验证据去重。
+未新增本地扫描暂存，删源与数据库收尾的解耦仍待实现。

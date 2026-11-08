@@ -915,6 +915,7 @@ impl SyncOrchestrator {
                 );
                 copy_completion::complete(database.clone(), destination.clone()).await?;
                 if !is_source_reserved {
+                    // 全量文件已在传输阶段执行所选校验；增量跳过项由增量清理入口补齐数据校验。
                     let source = Arc::new(
                         create_storage_for_role(
                             &c.src_path,
@@ -931,7 +932,10 @@ impl SyncOrchestrator {
                         SourceCleanupCheck::new(
                             Duration::from_secs(app_config.scan.operation_timeout_secs),
                             Duration::from_secs(app_config.scan.recovery_window_secs),
-                            CancellationToken::new(),
+                            consumer_manager
+                                .copy_database_execution()
+                                .map(|execution| execution.token().clone())
+                                .unwrap_or_default(),
                         ),
                     )
                     .await?;
@@ -1333,8 +1337,12 @@ impl SyncOrchestrator {
                     SourceCleanupCheck::new(
                         Duration::from_secs(app_config.scan.operation_timeout_secs),
                         Duration::from_secs(app_config.scan.recovery_window_secs),
-                        CancellationToken::new(),
-                    ),
+                        consumer_manager
+                            .copy_database_execution()
+                            .map(|execution| execution.token().clone())
+                            .unwrap_or_default(),
+                    )
+                    .with_content_verification(c.enable_integrity_check),
                 )
                 .await?;
             }

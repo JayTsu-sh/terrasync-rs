@@ -84,7 +84,7 @@ def run_isolated():
                 print(f"isolated S3 image={docker('inspect', containers[-1], '--format', '{{.Image}}')}", flush=True)
             print(f"isolated notification image={docker('inspect', containers[0], '--format', '{{.Image}}')}", flush=True)
             pid = docker("inspect", containers[0], "--format", "{{.State.Pid}}")
-            suite = [flag for flag in ("--copy-generations", "--catalogue-recovery", "--consumer-recovery", "--copy-execution", "--copy-data-cancel", "--copy-file-list-cancel", "--rename-generations", "--retention-events", "--source-absence", "--request-policy", "--copy-contracts", "--version-catalogue", "--mutable-catalogue", "--version-metadata", "--scan-wire") if flag in sys.argv]
+            suite = [flag for flag in ("--copy-generations", "--copy-content", "--catalogue-recovery", "--consumer-recovery", "--copy-execution", "--copy-data-cancel", "--copy-file-list-cancel", "--rename-generations", "--retention-events", "--source-absence", "--request-policy", "--copy-contracts", "--version-catalogue", "--mutable-catalogue", "--version-metadata", "--scan-wire") if flag in sys.argv]
             subprocess.run(["nsenter", "-t", pid, "-n", sys.executable, __file__, "--inside", *suite], cwd=ROOT, check=True)
         except BaseException:
             for container in containers:
@@ -257,6 +257,9 @@ def run_copy_generations():
     environment["LAB_COPY_GENERATION_DSN"] = f"http://{address}"
     environment["LAB_COPY_GENERATION_CONTROL"] = address
     try:
+        if "--copy-content" in sys.argv:
+            run_copy_content(environment)
+            return
         if "--copy-data-cancel" in sys.argv or "--copy-file-list-cancel" in sys.argv:
             run_copy_data_cancellation(environment, file_list="--copy-file-list-cancel" in sys.argv)
             return
@@ -345,6 +348,55 @@ def run_copy_generations():
         proxy.shutdown()
         proxy.server_close()
 
+
+
+def run_copy_content(environment):
+    reports = []
+
+    class Callback(http.server.BaseHTTPRequestHandler):
+        def log_message(self, *_):
+            pass
+
+        def do_POST(self):
+            reports.append(json.loads(self.rfile.read(int(self.headers["Content-Length"]))))
+            self.send_response(204)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+
+    callback = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Callback)
+    callback.daemon_threads = True
+    threading.Thread(target=callback.serve_forever, daemon=True).start()
+    try:
+        with tempfile.TemporaryDirectory(prefix="ts-copy-content-") as directory:
+            environment["LAB_COPY_CONTENT_ROOT"] = directory
+            environment["LAB_COPY_CONTENT_CALLBACK"] = f"http://127.0.0.1:{callback.server_port}/callback"
+            subprocess.run([
+                "cargo", "test", "--offline", "--locked", "-p", "app", "--lib",
+                "real_incremental_move_checks_existing_data_before_source_removal",
+                "--", "--ignored", "--nocapture", "--test-threads=1",
+            ], cwd=ROOT, env=environment, check=True)
+            summaries = [report for report in reports if report["is_final"] and not report.get("diagnostics")]
+            assert len(summaries) == 12 and all(report["diagnostics_complete"] for report in summaries), summaries
+            failed = [report for report in summaries if report["migration"]["phase"] == "failed"]
+            assert len(failed) == 4 and all(report["task_error_count"] == report["target_preserved_count"] == 1 for report in failed), failed
+            events = {event["event_id"]: event for report in reports
+                      for event in (report.get("diagnostics") or {}).get("events", [])}
+            retained = [event for event in events.values()
+                        if event["code"] == "target_preserved" and event.get("retention", {}).get("scope") == "entry"]
+            assert len(retained) == 4, retained
+            for event in retained:
+                assert event["retention"]["source_path"] == event["retention"]["target_path"] == "payload", event
+                assert "Data mismatch" in event["message"], event
+            for deployment in ("single", "cluster"):
+                for case in ("unchanged", "corrupt", "metadata"):
+                    root = Path(directory) / f"{deployment}-{case}"
+                    source = root / "source" / "payload"
+                    assert (root / "target" / "payload").read_bytes() == (b"source!" if case == "unchanged" else b"damaged")
+                    assert not source.exists() if case == "unchanged" else source.read_bytes() == b"source!"
+            print("independent content migration inspection deployments=2 rounds=12 corrupted_sources_retained=4 confirmed_sources_removed=2 callback_causes=4 HTTP_204=accepted final_reports_saved=true", flush=True)
+    finally:
+        callback.shutdown()
+        callback.server_close()
 
 
 def run_version_catalogue(environment):
@@ -728,7 +780,7 @@ def run_inside():
             time.sleep(0.2)
         else:
             raise RuntimeError(f"ClickHouse readiness timed out on port {port}")
-    if any(flag in sys.argv for flag in ("--copy-generations", "--catalogue-recovery", "--consumer-recovery", "--copy-execution", "--copy-data-cancel", "--copy-file-list-cancel", "--rename-generations", "--retention-events", "--source-absence", "--request-policy", "--copy-contracts", "--version-catalogue", "--mutable-catalogue", "--version-metadata", "--scan-wire")):
+    if any(flag in sys.argv for flag in ("--copy-generations", "--copy-content", "--catalogue-recovery", "--consumer-recovery", "--copy-execution", "--copy-data-cancel", "--copy-file-list-cancel", "--rename-generations", "--retention-events", "--source-absence", "--request-policy", "--copy-contracts", "--version-catalogue", "--mutable-catalogue", "--version-metadata", "--scan-wire")):
         run_copy_generations()
         return
     environment = dict(os.environ)

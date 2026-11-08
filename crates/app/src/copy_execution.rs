@@ -41,6 +41,9 @@ mod plan_tests;
 #[cfg(test)]
 #[path = "copy_request_tests.rs"]
 mod request_tests;
+#[cfg(all(test, unix))]
+#[path = "copy_source_content_tests.rs"]
+mod source_content_tests;
 #[cfg(test)]
 #[path = "copy_version_metadata_tests.rs"]
 mod version_metadata_tests;
