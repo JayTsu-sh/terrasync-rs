@@ -77,6 +77,53 @@ async fn failed_incremental_history(config: &ClickHouseConfig, command: &SyncJob
     Ok(())
 }
 
+async fn failed_unconfirmed_history(config: &ClickHouseConfig, command: &SyncJobConfig, sequence: u64) -> Result<()> {
+    let result = SyncOrchestrator::new_local(command.clone()).run().await;
+    let error = result
+        .err()
+        .ok_or_else(|| AppError::ConfigError("unconfirmed version unexpectedly accepted".into()))?;
+    assert!(
+        error.is_reported_copy_failure() && error.reported_copy_data_failed(),
+        "{error}"
+    );
+    let database = ClickHouseDatabase::connect(config, &command.job_id).await?;
+    assert_eq!(database.get_count("base").await?, 0);
+    let generation = database
+        .latest_copy_generation()
+        .await?
+        .ok_or_else(|| AppError::ConfigError("unconfirmed generation required".into()))?;
+    assert_eq!(generation.phase, CopyGenerationPhase::Failed);
+    assert_eq!(generation.sequence, sequence);
+    assert_eq!(
+        generation.plan.mode,
+        if sequence == 1 {
+            MigrationMode::Full
+        } else {
+            MigrationMode::Incremental
+        }
+    );
+    let client = Client::default()
+        .with_url(&config.dsn)
+        .with_user("default")
+        .with_database(&config.database);
+    let raw = client.query(&format!("SELECT payload_json FROM notifications_{} FINAL WHERE kind=2 AND attempt_id=? ORDER BY sequence DESC LIMIT 1", command.job_id))
+        .bind(&generation.request.execution_id).fetch_one::<String>().await.map_err(DatabaseError::from)?;
+    let saved: FinalCallbackReport = serde_json::from_str(&raw)?;
+    let report: ProgressReport = serde_json::from_str(&saved.payload_json)?;
+    assert!(report.is_final && report.diagnostics_complete);
+    assert_eq!(report.task_error_count, 0);
+    assert!(matches!(
+        report.detail,
+        ProgressDetail::Full { error_count: 1, .. }
+            | ProgressDetail::Incremental {
+                scanned_files: 1,
+                error_count: 1,
+                ..
+            }
+    ));
+    Ok(())
+}
+
 async fn run_round(config: &ClickHouseConfig, command: &SyncJobConfig, expected_bytes: u64, rows: u64) -> Result<u64> {
     SyncOrchestrator::new_local(command.clone()).run().await?;
     let database = ClickHouseDatabase::connect(config, &command.job_id).await?;
@@ -205,6 +252,20 @@ async fn copy_versions_case(config: &ClickHouseConfig, prefix: &str) -> Result<(
     run_round(config, &history, 0, 6).await?;
     control_action("data-fault", prefix).await?;
     failed_incremental_history(config, &failed).await?;
+    let endpoint = |name: &str| -> Result<String> {
+        std::env::var(name).map_err(|_| AppError::ConfigError("owned unconfirmed endpoint required".into()))
+    };
+    let mut unconfirmed = history.clone();
+    unconfirmed.job_id = "version_unconfirmed_history".into();
+    unconfirmed.src_path = format!("{}/{prefix}", endpoint("LAB_VERSION_UNCONFIRMED_SOURCE")?);
+    unconfirmed.dest_path = format!("{}/{prefix}/unconfirmed", endpoint("LAB_VERSION_UNCONFIRMED_TARGET")?);
+    for sequence in 1..=3 {
+        failed_unconfirmed_history(config, &unconfirmed, sequence).await?;
+    }
+    let mut unconfirmed_metadata = unconfirmed;
+    unconfirmed_metadata.job_id = "version_unconfirmed_metadata".into();
+    unconfirmed_metadata.dest_path.push_str("-metadata");
+    failed_unconfirmed_history(config, &unconfirmed_metadata, 1).await?;
     control_action("marker", prefix).await?;
     assert_eq!(
         run_round(config, &latest, 0, 1).await?,
@@ -212,7 +273,7 @@ async fn copy_versions_case(config: &ClickHouseConfig, prefix: &str) -> Result<(
         "已识别删除标记的保留决定必须明确进入 callback"
     );
     eprintln!(
-        "version-catalogue cluster={} real_rounds=9 latest_rows=1 history_rows=6 unchanged_bytes=0 changed_versions=2 logical_entries_per_change=1 failed_entries=1 failed_version_details=2 latest_marker_preserves_target_with_callback=true reports_archived=true",
+        "version-catalogue cluster={} real_rounds=13 latest_rows=1 history_rows=6 unchanged_bytes=0 changed_versions=2 logical_entries_per_change=1 failed_entries=1 failed_version_details=2 latest_marker_preserves_target_with_callback=true reports_archived=true",
         config.cluster.is_some()
     );
     Ok(())
@@ -254,7 +315,8 @@ async fn real_versioned_copy_catalogues_follow_destination_history() -> Result<(
             global.database.enabled = true;
             global.database.clickhouse = config.clone();
         })?;
-        let result = copy_versions_case(&config, if cluster { "cluster" } else { "single" }).await;
+        // 大型端到端夹具的 future 放在堆上，避免多层迁移调用占满测试线程默认栈。
+        let result = Box::pin(copy_versions_case(&config, if cluster { "cluster" } else { "single" })).await;
         let cleanup = admin
             .query(&format!("DROP DATABASE {}{on_cluster} SYNC", config.database))
             .execute()

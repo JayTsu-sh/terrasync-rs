@@ -63,7 +63,7 @@ pub enum StorageError {
         version: Option<String>,
         failures: Vec<MetadataObservationFailure>,
     },
-    #[error("复制失败: {data}; 元数据准备同时失败: {metadata}")]
+    #[error("复制失败: {data}; 元数据处理同时失败: {metadata}")]
     TransferAndMetadata {
         #[source]
         data: Box<StorageError>,
@@ -77,7 +77,9 @@ pub enum StorageError {
     },
     #[error("缺少实际目标版本映射，保留数据且不重新发布旧版本: {path} source_version={source_version}")]
     TargetVersionUnconfirmed { path: StoragePath, source_version: String },
-    #[error("上轮历史数据发布结果未确认，保留所有源和目标版本，禁止重放旧数据: {path} source_version={source_version}")]
+    #[error(
+        "历史数据发布结果未确认，保留所有源和目标版本，禁止重放旧数据及继续发布后续版本: {path} source_version={source_version}"
+    )]
     HistoricalPublicationUnconfirmed { path: StoragePath, source_version: String },
     #[error("源端版本永久清理不可用，已保留所有历史: {path}")]
     PermanentVersionCleanupUnavailable { path: StoragePath },

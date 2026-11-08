@@ -870,3 +870,66 @@ before、after、after、before、before、after 交错执行；每轮 1000 个 
 基线／变更程序 SHA-256 分别为 `b8a57a2d85059136721041d70c86d2ddb34d863e00069c790dc6c40a5f07b028`、
 `cd743d8c7d2862e0d90b17aa53fe6ff9194a648f66fafbc14388113e316630fc`。
 该性能夹具及功能夹具的独占容器均已清理。
+
+### Direct 历史发布的版本确认与顺序阻断
+
+固定 Native `7f029054`，复用已有 PublicationEvidence／TransferOutcome.destination_version，
+以及本次写入回执的私有状态，没有新公开函数、类型或 SDK 修改。Direct 返回的创建版本只来自
+本次成功写入的原始回执，内容相同的旧版本或 HEAD／LIST 推断版本不能作为本次创建证明；
+数据可能已满足普通当前复制要求，而创建版本仍为 None。正常有版本回执的写入继续返回实际 ID。
+普通发布只增加一次现有私有回执锁的读取，不增加存储请求或按条目累计的常驻集合。
+
+任务层区分两类缺失：仅重试元数据时缺少既有目标绑定仍走原来的属性错误；新复制历史数据
+缺少确认的目标版本则使用既有 HistoricalPublicationUnconfirmed，阻止该 entry 后续版本的数据发布。
+若已发布数据的元数据同时失败且目标版本也未确认，复用 TransferAndMetadata 保留两个有类型原因，
+按数据发布未确认阻断；有确认版本的普通元数据失败继续保留数据并允许后续历史版本的数据复制。
+不会把元数据失败改成坏数据删除，也不会保存没有确认映射的完成条目。
+
+`--version-catalogue` 现有真实夹具扩为 26 轮：两种数据库部署各保留原有 9 轮；新增同 job ID
+三代“缺少版本回执”的失败，以及一轮同时发生 tags 403 的失败。代理在本次 CopyObject 成功响应
+移除版本头，并拒绝目标版本 LIST，独立 boto3 通过真实服务读取，核验每种故障 key 都只有一个
+最老版本的数据（payload-0）、没有删除标记；仅发一个 CopyObject，后续五个源版本被阻止。
+第二、三代为 Incremental，既不重放旧数据，也不增加目标版本；源六个历史版本保留。
+既有最新删除标记保留目标场景继续通过，测试自己写入的一个源删除标记被独立区分。
+
+26 份最终报告已保存，HTTP 204 接收明细；16 轮成功、10 轮失败，每个失败 entry 只计一且
+没有重复 task_error。共有 52 条版本错误细节、42 条后续版本阻断；组合故障同时保留历史发布
+未确认及 PutObjectTagging 的 PermissionDenied／HTTP 403。失败的首次全量没有成功完成条目，
+现有 Full.scanned_files 仍是成功条目计数；增量扫描数为一。本项核验失败 entry 计数为一，
+不声称已统一全量／增量扫描与完成数的命名／呈现。
+
+先在旧代码复现缺少目标版本被误归为 metadata-only，后续版本仍发布；修改后先运行 24 轮通过，
+再在新依赖下加入组合故障，26 轮通过。扩充的测试 future 曾触及测试线程默认栈，
+改为 Box::pin 大型测试 case 后复跑通过，未提高产品运行时栈限制。
+Native 已有 13 项 Direct 单元回归、13 项真实原生复制、60 项真实失败数据清理、
+完整 CI 范围分步和最终严格 Clippy 通过。原生对 checkpointed ambiguous-completion 的
+旧断言仍明确保留，AtomicReplace／Checkpointed 的推断版本及恢复证据留待下一项；
+历史永久删源仍明确拒绝，不以本项 Direct 确认代替全部历史目标就绪证明。
+
+新依赖与本次任务层修改的最终 Rust 五项检查均通过：fmt、workspace/all-targets check、
+workspace/all-targets Clippy、workspace 测试、16 项串行远程进程回归。
+本机 Rust 1.98.1，保留已有警告；app 328 项库测试通过、45 项 ignored。
+另外再次完整运行普通对象清理的 48 轮真实任务，通过 Source 删除、数据／元数据失败保留、
+清理未知结果、HTTP 204、最终报告和 base 清空的独立核验。外部夹具之外的 ignored 不计通过。
+架构审查确认：S3 原始回执仍由 backend 单一私有状态管理；任务层只判断本次历史迁移是否有
+所需目标绑定及错误是否阻断后续版本，复用已有类型保存组合原因；HTTP／版本列表注入只在测试夹具。
+新增大型测试 case 的 heap future 不改变产品执行策略或运行时栈配置。
+
+本项另以 `eace467`／Native `7d9016c1` 为基线，和 Native `7f029054` 加本次任务层修改，
+在同一独占 2 CPU RustFS 上进行六轮正常 A/B；复用上一节配置：每轮 1000 个 1 KiB 对象含 tags，
+保留源、无数据库、unordered／Direct／quick、并发 16、批次 100000，dev debug=0／incremental=0／
+Rust 1.98.1，两份程序按 before、after、after、before、before、after 交错。
+
+| 样本 | before 耗时／秒 | after 耗时／秒 | before 峰值 RSS／KiB | after 峰值 RSS／KiB |
+| --- | --- | --- | --- | --- |
+| 1 | 4.40 | 4.50 | 194620 | 196792 |
+| 2 | 4.50 | 4.60 | 196516 | 193984 |
+| 3 | 4.50 | 4.50 | 196444 | 193512 |
+
+耗时中位数均为 4.50 秒，RSS 中位数 191.84→189.44 MiB（−1.25%）。
+计时仅覆盖完整 CLI，轮后核验全部目标数据／tags、源保留及无残留 upload。
+本项小样本未见明显正常开销增长，不作为加速、release、大规模历史或全部后端达标结论。
+完整样本、配置、程序与日志在 `/tmp/terrasync-direct-version-perf/`；两份程序 SHA-256 为
+`cd743d8c7d2862e0d90b17aa53fe6ff9194a648f66fafbc14388113e316630fc`、
+`eb508dce9ce5c321db34f392918d8781e4498672019d52eb5b18e710c73f7b96`。
+功能和性能夹具的独占容器均已清理。

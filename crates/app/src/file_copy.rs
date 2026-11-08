@@ -37,6 +37,7 @@ mod transfer_contract_tests;
 mod verification_cancel_tests;
 mod version_failure;
 pub(crate) use version_failure::VersionFailureContext;
+use version_failure::confirmed_target_version;
 
 #[derive(Clone, Default)]
 pub struct CopyOptions {
@@ -234,16 +235,12 @@ pub(crate) async fn copy_versions<I: Iterator<Item = ObservedItem> + Send>(
             )
             .await
         };
-        let result = result.and_then(|version| {
-            let version = version.filter(|value| !value.is_empty());
-            if keep_history && item.view().version().is_some() && version.is_none() {
-                return Err(StorageError::TargetVersionUnconfirmed {
-                    path: item.view().source_path()?,
-                    source_version: item.view().version_id().to_owned(),
-                });
-            }
-            Ok(version)
-        });
+        let result = confirmed_target_version(
+            result,
+            item.view(),
+            keep_history,
+            change == EntryChange::Changed(ChangeKind::MetadataOnly),
+        );
         if let Err(error) = &result {
             if let Some(data) = error.published_data() {
                 broadcaster
