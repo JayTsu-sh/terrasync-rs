@@ -15,7 +15,7 @@ use crate::execution::queries::{ScanQueryCancellation, with_scan_cancellation};
 use crate::migration_fixtures::request;
 use crate::observed_fixtures::observation;
 use crate::scan::rows::NativeScanRecord;
-use crate::{DatabaseError, Result};
+use crate::{DatabaseError, DatabaseExecutionMonitor, Result};
 use data_mover::model::{BackendKind, EntryKind, HistoryOrder, ObjectHistory};
 use task_model::observation::ObservedItem;
 use task_model::{CopyCompletion, CopyReadiness};
@@ -119,7 +119,7 @@ async fn case(fixture: &Fixture, history: bool, mode: &str) -> Result<()> {
     database.sync_client = cancellation.data_client(&fixture.config)?;
     database.async_client = cancellation.data_client(&fixture.config)?;
     let execution = cancellation.execution();
-    let watch = execution.start_monitor()?;
+    let watch = DatabaseExecutionMonitor::start(cancellation.clone(), CancellationToken::new())?;
     fixture
         .fault(if mode == "cancel" { "batch_stall" } else { mode })
         .await?;

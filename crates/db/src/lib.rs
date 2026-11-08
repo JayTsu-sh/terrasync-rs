@@ -40,6 +40,7 @@ pub use catalogue::{
 };
 pub use config::ClickHouseConfig; // 配置相关类型
 pub use error::{DatabaseError, Result}; // 错误处理相关类型
+pub use execution::DatabaseExecutionMonitor;
 
 /// 根据 `job_id` 生成扫描基础表名
 ///
