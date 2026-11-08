@@ -210,19 +210,12 @@ pub(crate) async fn set_item_metadata(
     let plan = captured_metadata_plan(storage, view)?;
     let metadata = storage.metadata()?;
     let path = view.source_path()?;
-    if let Some(version) = target_version {
-        plan.apply_to_version(metadata.as_ref(), &path, version, CancellationToken::new())
-            .await?;
-    } else {
-        plan.apply(metadata.as_ref(), &path, CancellationToken::new()).await?;
-    }
-    Ok(if let Some(version) = target_version {
-        plan.verify_version(storage, &path, version, CancellationToken::new())
-            .await?
-    } else {
-        plan.verify_published(storage, &path, None, CancellationToken::new())
-            .await?
-    })
+    let version = target_version.map_or(SourceVersion::Current, |id| SourceVersion::Id(id.to_owned()));
+    plan.apply(metadata.as_ref(), &path, &version, CancellationToken::new())
+        .await?;
+    Ok(plan
+        .verify_published(storage, &path, &version, None, CancellationToken::new())
+        .await?)
 }
 
 pub(crate) async fn apply_acl(storage: &Storage, value: &Path, acl: AclMetadata) -> Result<()> {
@@ -260,9 +253,14 @@ pub(crate) async fn apply_acl(storage: &Storage, value: &Path, acl: AclMetadata)
         EntryKind::File,
     )
     .map_err(StorageError::from)?;
-    plan.apply(&*storage.metadata()?, &path(value)?, CancellationToken::new())
-        .await
-        .map_err(StorageError::from)?;
+    plan.apply(
+        &*storage.metadata()?,
+        &path(value)?,
+        &SourceVersion::Current,
+        CancellationToken::new(),
+    )
+    .await
+    .map_err(StorageError::from)?;
     Ok(())
 }
 

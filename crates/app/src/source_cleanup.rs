@@ -2,7 +2,7 @@
 
 use std::{path::Path, sync::Arc, time::Duration};
 
-use data_mover::model::{EntryKind, ObservedEntry};
+use data_mover::model::{EntryKind, ObservedEntry, SourceVersion};
 use data_mover::storage::NamespaceReadPolicy;
 use db::ClickHouseDatabase;
 use task_model::observation::ObservedView;
@@ -122,7 +122,13 @@ async fn remove_entry(
             version_index: None,
         },
     )?
-    .verify_published(destination.storage(), entry.path(), None, check.cancel.clone())
+    .verify_published(
+        destination.storage(),
+        entry.path(),
+        &SourceVersion::Current,
+        None,
+        check.cancel.clone(),
+    )
     .await
     .map_err(StorageError::from)?;
     if target.kind != entry.kind() || (entry.kind() == EntryKind::File && target.size != entry.size()) {

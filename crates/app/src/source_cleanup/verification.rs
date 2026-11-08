@@ -1,9 +1,10 @@
 //! 删源前重读已捕获的源属性；不扩大元数据范围，也不把 atime 或自身删子项造成的目录 mtime 变化当作冲突。
 use super::SourceCleanupCheck;
+use crate::error::storage::operation;
 use data_mover::model::{
     MetadataFamily, MetadataObservation, MetadataObservations, ObservationMode, ObservationPlan, ObservedEntry,
 };
-use data_mover::storage::read_source_observation;
+use data_mover::storage::{NamespaceReadOutcome, read_namespace_entry};
 use task_model::metadata::metadata_digests;
 
 use crate::error::{Result, StorageError};
@@ -57,18 +58,23 @@ fn changed_families(expected: &MetadataObservations, current: &MetadataObservati
 pub(super) async fn verify_source_metadata(
     source: &StorageContext, expected: &ObservedEntry, check: &SourceCleanupCheck,
 ) -> Result<bool> {
-    let Some(current) = read_source_observation(
+    let result = read_namespace_entry(
         source.storage(),
         expected.path(),
-        source_plan(expected.metadata()),
+        Some(source_plan(expected.metadata())),
         check.read_policy,
         &check.cancel,
     )
     .await
-    .map_err(StorageError::from)?
-    .entry
-    else {
-        return Ok(false);
+    .map_err(StorageError::from)?;
+    let current = match result {
+        NamespaceReadOutcome::Observation {
+            entry: Some(current), ..
+        } => current,
+        NamespaceReadOutcome::Observation { entry: None, .. } => return Ok(false),
+        NamespaceReadOutcome::Descriptor { .. } => {
+            return Err(operation("source metadata read returned no observation").into());
+        }
     };
     let failures: Vec<_> = current.metadata().failures().collect();
     if !failures.is_empty() {

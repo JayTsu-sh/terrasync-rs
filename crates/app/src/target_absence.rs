@@ -2,7 +2,7 @@
 use std::time::Duration;
 
 use data_mover::model::ObservedEntry;
-use data_mover::storage::{NamespaceReadPolicy, read_namespace_entry};
+use data_mover::storage::{NamespaceReadOutcome, NamespaceReadPolicy, read_namespace_entry};
 use task_model::{SourcePresence, StorageEntryMessage, TargetRetention, TargetRetentionReason};
 use tokio_util::sync::CancellationToken;
 
@@ -44,12 +44,13 @@ impl SourceAbsenceCheck {
         match read_namespace_entry(
             source.storage(),
             entry.path(),
+            None,
             self.read_policy,
             &CancellationToken::new(),
         )
         .await
         {
-            Ok(result) if result.descriptor.is_none() => Ok(true),
+            Ok(NamespaceReadOutcome::Descriptor { descriptor: None, .. }) => Ok(true),
             Ok(_) => {
                 preserve(
                     events,

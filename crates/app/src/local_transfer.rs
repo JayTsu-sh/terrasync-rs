@@ -137,6 +137,7 @@ fn request_for(config: &LocalTransferConfig, entry: &ObservedEntry) -> Result<Tr
     let request = TransferRequest::from_observation(
         config.source.clone(),
         entry.clone(),
+        None,
         config.destination.clone(),
         config.cancel.clone(),
     )?

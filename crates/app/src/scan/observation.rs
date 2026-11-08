@@ -3,7 +3,9 @@ use crate::error::storage::{Result, StorageError, operation};
 use crate::storage_factory::path;
 use data_mover::model::*;
 use data_mover::storage::StorageRoleFailure;
-use data_mover::storage::{NamespaceReadPolicy, Storage, observe_descriptor, read_source_observation};
+use data_mover::storage::{
+    NamespaceReadOutcome, NamespaceReadPolicy, Storage, observe_descriptor, read_namespace_entry,
+};
 use data_mover::transfer::{DirectoryObjectAction, DirectoryObjectDestination, directory_object_action};
 use std::path::Path;
 use task_model::metadata::MetadataScope;
@@ -118,10 +120,12 @@ pub(crate) async fn observe_path_with_read_policy(
         Some(plan) => plan,
         None => observation_plan(tags_required(storage, true)?),
     };
-    read_source_observation(storage, &path(value)?, plan, policy, cancel)
-        .await?
-        .entry
-        .ok_or_else(|| StorageError::FileNotFound(value.display().to_string()))
+    match read_namespace_entry(storage, &path(value)?, Some(plan), policy, cancel).await? {
+        NamespaceReadOutcome::Observation { entry, .. } => {
+            entry.ok_or_else(|| StorageError::FileNotFound(value.display().to_string()))
+        }
+        NamespaceReadOutcome::Descriptor { .. } => Err(operation("source metadata read returned no observation")),
+    }
 }
 
 /// 验证原生历史分段顺序，不积累整段历史，也不复制逐版本条目。

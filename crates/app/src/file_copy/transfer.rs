@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use data_mover::metadata::MetadataPlan;
-use data_mover::model::{EntryKind, ObservedEntry};
+use data_mover::model::{EntryKind, ObservedEntry, SourceVersion};
 use data_mover::storage::DeleteMarkerOutcome;
 use data_mover::transfer::{
     self, FailedDataCleanup, MetadataFailurePolicy, MetadataTransferMode, ReadBackVerification, TransferIdentity,
@@ -151,6 +151,7 @@ async fn execute_file(
         .verify_published(
             destination.storage(),
             &view.source_path()?,
+            &SourceVersion::Current,
             outcome.destination_version.as_deref(),
             options.cancel.clone().unwrap_or_default(),
         )
@@ -169,7 +170,7 @@ async fn execute_native(
     source: &StorageContext, destination: &StorageContext, entry: &Arc<ObservedEntry>, version_index: Option<usize>,
     options: &CopyOptions, identity: Option<&str>, metadata: Option<&Arc<MetadataPlan>>,
 ) -> Result<TransferOutcome> {
-    let mut request = TransferRequest::from_shared_observation(
+    let mut request = TransferRequest::from_observation(
         source.roles.clone(),
         Arc::clone(entry),
         version_index,
