@@ -572,3 +572,27 @@ TargetPersistenceUnconfirmed 分类；服务端独立检查 12 个目标类型�
 均已执行通过；普通文件确认了一次匹配 XID 的 COMMIT 回复丢失，独立检查 7 个目标内容。
 实验独占前缀和代理已清理。目录／链接静默检测仍约 15 秒，普通文件约 18 秒；
 不据此宣称统一任务网络预算、真实 pNFS DS 或整轮吞吐／RSS 已验收。
+
+### NFS 源端受保护清理接入
+
+`source_cleanup::real_tests::source_nfs::real_source_nfs_purge_uses_target_ready_and_original_source_facts`
+是 app lib ignored 真实用例，需独立准备 `LAB_SOURCE_PURGE_NFS_URL` 和
+`LAB_SOURCE_PURGE_TARGET_URL` 两个独占 NFS 子前缀。用例自行从临时 Local 源准备数据，
+通过生产复制和删源原语验证 quick/full、重复清理、恢复 mtime 的等长改写、源端／目标端
+改权限、非空目录拒绝及子项后删除空目录、断链的精确复制。NFSv3 和 v4.1 均已通过；
+独立服务端读取核验目标内容、保留的改写源、mode 差异、相同 mtime、目录子项和链接原值，
+并检查无传输产物。该用例不运行整轮 CLI、数据库或 callback。
+
+对应 data-mover 的 REMOVE 感知私有代理分别验证 v3 五类及 v4.1 六类故障。
+V4.1 闪断和丢回复恢复；v3 对已经发送的删源请求保留不确定结果，包括闪断和丢回复。
+丢回复时 v3 源可已删除，不能把 Unknown 当成“源仍存在”。所有尝试均有完整的目标备份，
+旧观察不会删除后续的同名替换项。静默检测仍约 v3 5 秒／v4.1 15 秒，取消约 253／252 ms。
+合成 BADSESSION 不重建会话重发 REMOVE；不冒充真实服务端重启。
+
+本轮依赖固定为 data-mover a4ecf4f、nfs-rs 1478d8b；两仓库对应 Rust 检查已完成。
+原生 make ci 链接遇到磁盘空间不足后，逐组执行并补齐所有剩余测试、文档、示例及 Local E2E，
+不是一次完整 make ci 命令成功。应用 workspace 检查、Clippy、测试和 16 项远程进程串行
+回归通过，使用本机 rustc 1.98.1；SDK 另使用 Rust 1.95.0 完成规定 Rust 检查。
+本轮实验前缀、私有服务和工作节点产物均已清理。并发源修改、统一任务故障预算、整轮
+CLI／ClickHouse／callback、NFSv4.0／4.2／pNFS、掉电及吞吐／RSS 仍不在上述验收范围。
+当前源清理仍位于数据库收尾后；本轮没有解除该屏障。
