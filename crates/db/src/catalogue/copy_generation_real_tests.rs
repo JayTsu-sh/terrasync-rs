@@ -721,3 +721,6 @@ async fn real_rename_after_failed_comparison_of_the_same_item() -> Result<()> {
     }
     Ok(())
 }
+
+#[path = "copy_batch_recovery_real_tests.rs"]
+mod batch_recovery;

@@ -120,6 +120,21 @@ across broadcaster clones; blocked sends to other queues are cancelled. This is 
 for stopping safely when diagnostic persistence fails, not validation of diagnostic spill or
 replay itself.
 
+`python3 tests/lab/run-notification-archive-local.py --catalogue-recovery` checks
+catalogue batch replay within the shared database execution scope. Its 32 cases
+cover Single/one-shard-two-replica Cluster, latest/history target slots, normal,
+flash disconnect, committed write with a lost acknowledgement, recovered timeout,
+persistent disconnect/stall, permission rejection and cancellation. The proxy
+checks one deduplication token across retries. Merge thresholds are reduced only
+on owned test tables; raw reads without FINAL must contain exactly one batch,
+with the same sequence, execution, working state, target-version mapping,
+readiness and native metadata snapshots. Successful probes do not reset the failed
+write's window: sustained loss exits around 3.05 seconds, silent loss around 4.2
+seconds with the 1-second detection budget, and cancellation around 0.5 seconds.
+HTTP 403 is attempted once. This validates the batch mechanism; copy-worker shared
+scope integration, early source removal, directory finalization and throughput/RSS
+acceptance remain separate work.
+
 `python3 tests/lab/run-notification-archive-local.py --copy-generations` reuses the
 isolated ClickHouse pair for migration-generation tests. Against both Single and the
 one-shard/two-replica Cluster it checks previous source-retaining/deleting policies,

@@ -84,7 +84,7 @@ def run_isolated():
                 print(f"isolated S3 image={docker('inspect', containers[-1], '--format', '{{.Image}}')}", flush=True)
             print(f"isolated notification image={docker('inspect', containers[0], '--format', '{{.Image}}')}", flush=True)
             pid = docker("inspect", containers[0], "--format", "{{.State.Pid}}")
-            suite = [flag for flag in ("--copy-generations", "--rename-generations", "--retention-events", "--source-absence", "--request-policy", "--copy-contracts", "--version-catalogue", "--mutable-catalogue", "--version-metadata", "--scan-wire") if flag in sys.argv]
+            suite = [flag for flag in ("--copy-generations", "--catalogue-recovery", "--rename-generations", "--retention-events", "--source-absence", "--request-policy", "--copy-contracts", "--version-catalogue", "--mutable-catalogue", "--version-metadata", "--scan-wire") if flag in sys.argv]
             subprocess.run(["nsenter", "-t", pid, "-n", sys.executable, __file__, "--inside", *suite], cwd=ROOT, check=True)
         except BaseException:
             for container in containers:
@@ -98,6 +98,7 @@ def run_isolated():
 def run_copy_generations():
     """Reuse the owned ClickHouse pair for copy-generation state and read faults."""
     state = "normal"
+    batch_stats = {"writes": 0, "lost": 0, "tokens": set()}
     guard = threading.Lock()
     release = threading.Event()
 
@@ -107,11 +108,21 @@ def run_copy_generations():
 
         def do_GET(self):
             nonlocal state
-            if self.path not in ("/normal", "/disconnect", "/stall", "/startup_disconnect", "/startup_stall", "/reject_prepare"):
+            if self.path == "/batch_stats":
+                with guard:
+                    payload = json.dumps({"writes": batch_stats["writes"], "lost": batch_stats["lost"], "tokens": len(batch_stats["tokens"])}).encode()
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+                return
+            if self.path not in ("/normal", "/disconnect", "/stall", "/startup_disconnect", "/startup_stall", "/reject_prepare",
+                                 "/batch_flash", "/batch_lost", "/batch_disconnect", "/batch_stall", "/batch_recover_stall", "/batch_reject"):
                 self.send_error(404)
                 return
             with guard:
                 state = self.path[1:]
+                batch_stats.update(writes=0, lost=0, tokens=set())
             self.send_response(200)
             self.send_header("Content-Length", "0")
             self.end_headers()
@@ -131,8 +142,19 @@ def run_copy_generations():
                 body = b"".join(chunks)
             else:
                 body = self.rfile.read(int(self.headers.get("Content-Length", "0")))
+            query = urllib.parse.unquote_plus(self.path).encode() + body[:256]
+            is_insert = b"INSERT INTO" in query.upper() and b"BASE_" in query.upper()
             with guard:
                 fault = state
+                if is_insert:
+                    batch_stats["writes"] += 1
+                    token = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query).get("insert_deduplication_token", [])
+                    batch_stats["tokens"].update(token)
+                if fault.startswith("batch_"):
+                    if not is_insert:
+                        fault = "normal"
+                    elif fault in ("batch_flash", "batch_lost", "batch_recover_stall"):
+                        state = "normal"
                 # 接受记录已入库后，仅拒绝本次基线准备，不阻塞后续终态归档。
                 if fault == "reject_prepare":
                     query = urllib.parse.unquote(self.path).encode() + body
@@ -146,14 +168,14 @@ def run_copy_generations():
                         state = fault = "normal"
                     else:
                         fault = fault.removeprefix("startup_")
-            if fault == "disconnect":
+            if fault in ("disconnect", "batch_disconnect", "batch_flash"):
                 self.close_connection = True
                 return
-            if fault == "reject_prepare":
-                self.send_error(403, "owned prepare rejection")
+            if fault in ("reject_prepare", "batch_reject"):
+                self.send_error(403, "owned prepare rejection" if fault == "reject_prepare" else "owned batch rejection")
                 return
-            if fault == "stall":
-                release.wait(10)
+            if fault in ("stall", "batch_stall", "batch_recover_stall"):
+                release.wait(1.2 if fault == "batch_recover_stall" else 10)
                 self.close_connection = True
                 return
             connection = http.client.HTTPConnection("127.0.0.1", 8123, timeout=15)
@@ -164,6 +186,12 @@ def run_copy_generations():
                 connection.request("POST", self.path, body=body, headers=headers)
                 response = connection.getresponse()
                 payload = response.read()
+                if fault == "batch_lost":
+                    assert response.status == 200, (response.status, payload[:512])
+                    with guard:
+                        batch_stats["lost"] += 1
+                    self.close_connection = True
+                    return
                 self.send_response(response.status)
                 for key, value in response.getheaders():
                     if key.lower() not in ("content-length", "transfer-encoding", "connection"):
@@ -184,6 +212,12 @@ def run_copy_generations():
     environment["LAB_COPY_GENERATION_DSN"] = f"http://{address}"
     environment["LAB_COPY_GENERATION_CONTROL"] = address
     try:
+        if "--catalogue-recovery" in sys.argv:
+            subprocess.run([
+                "cargo", "test", "--offline", "--locked", "-p", "db", "--lib",
+                "real_copy_batches_recover_with_frozen_facts", "--", "--ignored", "--nocapture",
+            ], cwd=ROOT, env=environment, check=True)
+            return
         if "--scan-wire" in sys.argv:
             environment["LAB_CLICKHOUSE_DSN"] = environment["LAB_COPY_GENERATION_DSN"]
             environment["LAB_CLICKHOUSE_CLUSTER"] = "notification_cluster"
@@ -512,7 +546,7 @@ def run_inside():
             time.sleep(0.2)
         else:
             raise RuntimeError(f"ClickHouse readiness timed out on port {port}")
-    if any(flag in sys.argv for flag in ("--copy-generations", "--rename-generations", "--retention-events", "--source-absence", "--request-policy", "--copy-contracts", "--version-catalogue", "--mutable-catalogue", "--version-metadata", "--scan-wire")):
+    if any(flag in sys.argv for flag in ("--copy-generations", "--catalogue-recovery", "--rename-generations", "--retention-events", "--source-absence", "--request-policy", "--copy-contracts", "--version-catalogue", "--mutable-catalogue", "--version-metadata", "--scan-wire")):
         run_copy_generations()
         return
     environment = dict(os.environ)

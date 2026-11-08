@@ -12,8 +12,10 @@ use tracing::{debug, info};
 use super::ClickHouseDatabase;
 use super::versions::{CatalogueInputs, CatalogueViews};
 use crate::error::{DatabaseError, Result};
-use crate::execution::queries::ScanExecute;
-use crate::execution::queries::check_scan_cancellation;
+use crate::execution::queries::{
+    ScanExecute, check_scan_cancellation, execute_request, execution_active, idempotent_insert_client,
+};
+use crate::execution::recovery::RequestSafety;
 use crate::get_incremental_scan_base_table_name;
 use crate::get_scan_base_table_name;
 use crate::get_tar_manifest_table_name;
@@ -79,10 +81,11 @@ impl ClickHouseDatabase {
     }
 
     async fn insert_copy_views(
-        &self, table_name: &str, views: CatalogueInputs<'_>, use_async_client: bool,
+        &self, table_name: &str, inputs: CatalogueInputs<'_>, use_async_client: bool,
     ) -> Result<()> {
+        check_scan_cancellation()?;
         let versions = self.catalogue_versions().await;
-        let mut views = CatalogueViews::new(views, versions).peekable();
+        let mut views = CatalogueViews::new(inputs, versions).peekable();
         if views.peek().is_none() {
             return Ok(());
         }
@@ -106,35 +109,44 @@ impl ClickHouseDatabase {
             table_name, current_state
         );
 
-        let mut record_count = 0;
-
         let client = if use_async_client {
             &self.async_client
         } else {
             &self.sync_client
         };
         let client = self.catalogue_write_client(client).with_validation(false);
+        // 同一逻辑批次共用去重身份；有恢复作用域时用同步批次提交，避免异步缓冲确认不明。
+        let client = if execution_active() {
+            idempotent_insert_client(&client).with_option("async_insert", "0")
+        } else {
+            client
+        };
+        // W、执行身份、顺序和版本槽在恢复循环外冻结，重试不改变记录语义。
+        let record_count = execute_request(RequestSafety::IdempotentWrite, || async {
+            let mut record_count = 0;
+            let mut insert = client
+                .insert::<NativeScanRecord>(table_name)
+                .await
+                .map_err(DatabaseError::from)?;
 
-        let mut insert = client
-            .insert::<NativeScanRecord>(table_name)
-            .await
-            .map_err(DatabaseError::from)?;
-
-        for (view, completion) in views {
-            let mut record = NativeScanRecord::capture(view, current_state)?;
-            if let Some(completion) = completion {
-                record.copy_path_confirmed = completion.readiness == CopyReadiness::Ready;
-                record.copy_data_confirmed = true;
-                record.copy_target_version = completion.target_version.as_deref();
+            for (view, completion) in CatalogueViews::new(inputs, versions) {
+                let mut record = NativeScanRecord::capture(view, current_state)?;
+                if let Some(completion) = completion {
+                    record.copy_path_confirmed = completion.readiness == CopyReadiness::Ready;
+                    record.copy_data_confirmed = true;
+                    record.copy_target_version = completion.target_version.as_deref();
+                }
+                record.version_id = versions.key(view);
+                record.copy_execution_id = &copy_execution_id;
+                record.copy_sequence = copy_sequence;
+                insert.write(&record).await.map_err(DatabaseError::from)?;
+                record_count += 1;
             }
-            record.version_id = versions.key(view);
-            record.copy_execution_id = &copy_execution_id;
-            record.copy_sequence = copy_sequence;
-            insert.write(&record).await.map_err(DatabaseError::from)?;
-            record_count += 1;
-        }
 
-        insert.end().await.map_err(DatabaseError::from)?;
+            insert.end().await.map_err(DatabaseError::from)?;
+            Ok(record_count)
+        })
+        .await?;
 
         info!("Successfully inserted {} records to table {}", record_count, table_name);
         Ok(())
