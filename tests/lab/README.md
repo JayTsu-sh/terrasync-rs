@@ -618,3 +618,26 @@ SourceMetadataAcquisitionFailed 的 ACL／PermissionDenied 原因；目标数据
 16 项远程进程串行回归（本机 Rust 1.98.1）；原生完整 make ci 通过。
 本轮不覆盖整轮 CLI、真实 S3 目标、ClickHouse／callback、统一任务网络预算、掉电或吞吐／RSS。
 本轮独占前缀、私有代理及 HTTP 服务、工作节点产物均已清理。
+
+### S3 目标持久化与已复制项删源
+
+`source_cleanup::real_tests::target_s3::real_target_s3_persistence_gates_unchanged_source_removal`
+是 app lib ignored 真实用例，使用 data-mover 的隔离 RustFS runner：
+`tests/lab/run-source-purge-local.py --namespace-persistence`，并以
+`LAB_S3_PURGE_TEST_BINARY` 指定编译好的 app lib 测试程序，`LAB_S3_PURGE_TEST_NAME` 指定上述精确名称。
+先用 `--list` 确认测试存在，防止过滤为空被当作通过。runner 创建独占版本化桶和前缀，
+播种三份相同内容的目标版本及哨兵；Local 源文件与既有目标一致，用于模拟本轮跳过数据的项。
+测试只在 Namespace::persist_observed 调用前启用代理故障，前面的目标属性校验正常运行。
+
+锁定 data-mover fbf59c0 后，成功、权限拒绝、持续断连、静默超时、取消、闪断恢复和超时恢复
+7 类场景通过。只有目标确认成功才删除 Local 源项；持久化拒绝保留源内容，错误携带
+TargetPersistenceUnconfirmed 及 PermissionDenied／Connectivity／Timeout／Cancelled。
+断连约 6 ms、静默检测约 1 s、取消约 256 ms；瞬时失败保留源后，用例显式恢复代理并重试才删除；不冒充应用自动重试已验收。
+独立 boto3 检查确认各前缀的三个原版本与哨兵保持不变，代理累计数据 GET 和写操作均为零。
+原生存储 role 的另 7 类真实回归通过；S3 库 408 项测试通过（2 项 ignored），完整 make ci 通过。
+应用 workspace 检查、Clippy、测试和 16 项串行远程进程回归通过（本机 Rust 1.98.1，保留已有警告）；
+最终 workspace 测试程序另复跑同一物理矩阵通过。容器、网络命名空间和 tmpfs 随 runner 退出清理，未修改防火墙或共享服务。
+
+本用例不执行整轮 CLI、数据库或外部 callback，不覆盖非版本化真实目标、其他 S3 厂商、
+NAS 桶持久化、掉电、全历史永久删除、统一网络预算或整轮吞吐／RSS。已有目标的内容由独立
+夹具核验，此用例验证删源门槛，不冒充完整数据复制／全量数据校验。当前删源仍等待数据库收尾。

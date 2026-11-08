@@ -233,3 +233,6 @@ mod target_nfs;
 
 #[path = "source_cleanup_source_nfs_real_tests.rs"]
 mod source_nfs;
+
+#[path = "source_cleanup_target_s3_real_tests.rs"]
+mod target_s3;
