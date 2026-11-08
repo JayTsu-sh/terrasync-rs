@@ -39,6 +39,7 @@ use crate::consumer::stats::{
 };
 use crate::consumer::stats::{callback_state::CallbackState, journal};
 use crate::consumer::traits::Consumer;
+use crate::copy_execution::CopyDatabaseExecution;
 use crate::error::{AppError, Result};
 use crate::scan::statistics::{ScanCapabilities, ScanCounts, ScanSnapshot};
 use data_mover::traversal::TraversalRecoveryStatus;
@@ -55,6 +56,7 @@ pub struct ConsumerManager {
     callback_guard: Option<CallbackGuard>,
     notification_database: Option<ClickHouseDatabase>,
     copy_pipeline_prepared: bool,
+    copy_database_execution: Option<CopyDatabaseExecution>,
 }
 
 /// 扫描工作任务共享统计状态，不持有生命周期守卫或其他消费者。
@@ -548,6 +550,18 @@ impl ConsumerManager {
         Ok(Self::with_database_consumer(consumer_config, None, database))
     }
 
+    pub(crate) fn set_copy_database_execution(&mut self, execution: Option<CopyDatabaseExecution>) -> Result<()> {
+        if self.copy_pipeline_prepared {
+            return Err(AppError::ConfigError("复制事实消费者准备后不能替换执行域".into()));
+        }
+        self.copy_database_execution = execution;
+        Ok(())
+    }
+
+    pub(crate) fn copy_database_execution(&self) -> Option<CopyDatabaseExecution> {
+        self.copy_database_execution.clone()
+    }
+
     /// 复制准入完成后挂接事实消费者；准入前创建的通知状态继续使用同一身份。
     pub(crate) async fn prepare_copy_consumers(
         &mut self, config: &ConsumerConfig, database: Option<ClickHouseDatabase>,
@@ -559,7 +573,11 @@ impl ConsumerManager {
             return Err(AppError::ConfigError("复制消费者需要复制任务类型".into()));
         }
         let consumer = match (config.db_config.enabled, database) {
-            (true, Some(database)) => Some(DatabaseConsumer::with_database(config, database).await?),
+            (true, Some(database)) => Some(
+                DatabaseConsumer::with_database(config, database)
+                    .await?
+                    .with_shared_execution(self.copy_database_execution.clone()),
+            ),
             (false, None) => None,
             _ => {
                 return Err(AppError::ConfigError(
@@ -592,6 +610,7 @@ impl ConsumerManager {
             callback_guard: None,
             notification_database,
             copy_pipeline_prepared: false,
+            copy_database_execution: None,
         };
         if let Some(consumer) = consumer {
             manager.add_consumer(Box::new(consumer));
@@ -824,6 +843,7 @@ mod resume_tests {
                 callback_guard: None,
                 notification_database: None,
                 copy_pipeline_prepared: false,
+                copy_database_execution: None,
             };
             let path = StoragePath::new("payload").map_err(StorageError::from)?;
             let source = if let Some(diagnostic) = purge {
@@ -962,6 +982,7 @@ mod resume_tests {
             callback_guard: None,
             notification_database: None,
             copy_pipeline_prepared: false,
+            copy_database_execution: None,
         };
         let source = AppError::CopyError("version v2 upload refused".into());
         let failure = AppError::ReportedCopyFailure {
@@ -1026,6 +1047,7 @@ mod resume_tests {
             callback_guard: None,
             notification_database: None,
             copy_pipeline_prepared: false,
+            copy_database_execution: None,
         };
         let special: StorageEntryRecord = serde_json::from_value(serde_json::json!({
             "name":"fifo", "relative_path":"fifo", "size":0, "ext":null, "ctime":0, "mtime":0, "atime":0,
@@ -1169,6 +1191,7 @@ mod resume_tests {
             callback_guard: None,
             notification_database: None,
             copy_pipeline_prepared: false,
+            copy_database_execution: None,
         };
         let json = manager.statistics_checkpoint().await?;
         assert!(

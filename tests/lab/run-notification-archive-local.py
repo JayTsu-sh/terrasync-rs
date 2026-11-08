@@ -84,7 +84,7 @@ def run_isolated():
                 print(f"isolated S3 image={docker('inspect', containers[-1], '--format', '{{.Image}}')}", flush=True)
             print(f"isolated notification image={docker('inspect', containers[0], '--format', '{{.Image}}')}", flush=True)
             pid = docker("inspect", containers[0], "--format", "{{.State.Pid}}")
-            suite = [flag for flag in ("--copy-generations", "--catalogue-recovery", "--consumer-recovery", "--rename-generations", "--retention-events", "--source-absence", "--request-policy", "--copy-contracts", "--version-catalogue", "--mutable-catalogue", "--version-metadata", "--scan-wire") if flag in sys.argv]
+            suite = [flag for flag in ("--copy-generations", "--catalogue-recovery", "--consumer-recovery", "--copy-execution", "--rename-generations", "--retention-events", "--source-absence", "--request-policy", "--copy-contracts", "--version-catalogue", "--mutable-catalogue", "--version-metadata", "--scan-wire") if flag in sys.argv]
             subprocess.run(["nsenter", "-t", pid, "-n", sys.executable, __file__, "--inside", *suite], cwd=ROOT, check=True)
         except BaseException:
             for container in containers:
@@ -99,6 +99,7 @@ def run_copy_generations():
     """Reuse the owned ClickHouse pair for copy-generation state and read faults."""
     state = "normal"
     batch_stats = {"writes": 0, "lost": 0, "tokens": set()}
+    comparison_stats = {"reads": 0, "first": None}
     guard = threading.Lock()
     release = threading.Event()
 
@@ -108,6 +109,15 @@ def run_copy_generations():
 
         def do_GET(self):
             nonlocal state
+            if self.path == "/compare_stats":
+                with guard:
+                    first = comparison_stats["first"]
+                    payload = json.dumps({"reads": comparison_stats["reads"], "elapsed_ms": None if first is None else int((time.monotonic() - first) * 1000)}).encode()
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+                return
             if self.path == "/batch_stats":
                 with guard:
                     payload = json.dumps({"writes": batch_stats["writes"], "lost": batch_stats["lost"], "tokens": len(batch_stats["tokens"])}).encode()
@@ -117,12 +127,14 @@ def run_copy_generations():
                 self.wfile.write(payload)
                 return
             if self.path not in ("/normal", "/disconnect", "/stall", "/startup_disconnect", "/startup_stall", "/reject_prepare",
+                                 "/compare_flash", "/compare_lost", "/compare_disconnect", "/compare_stall", "/compare_recover_stall", "/compare_reject",
                                  "/batch_flash", "/batch_lost", "/batch_disconnect", "/batch_stall", "/batch_recover_stall", "/batch_reject"):
                 self.send_error(404)
                 return
             with guard:
                 state = self.path[1:]
                 batch_stats.update(writes=0, lost=0, tokens=set())
+                comparison_stats.update(reads=0, first=None)
             self.send_response(200)
             self.send_header("Content-Length", "0")
             self.end_headers()
@@ -143,6 +155,7 @@ def run_copy_generations():
             else:
                 body = self.rfile.read(int(self.headers.get("Content-Length", "0")))
             query = urllib.parse.unquote_plus(self.path).encode() + body[:256]
+            is_compare = b"AS CHANGE_CODE" in query.upper()
             is_insert = b"INSERT INTO" in query.upper() and b"BASE_" in query.upper()
             with guard:
                 fault = state
@@ -150,7 +163,19 @@ def run_copy_generations():
                     batch_stats["writes"] += 1
                     token = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query).get("insert_deduplication_token", [])
                     batch_stats["tokens"].update(token)
-                if fault.startswith("batch_"):
+                comparison_fault = fault.startswith("compare_")
+                if is_compare:
+                    comparison_stats["reads"] += 1
+                    if comparison_fault and comparison_stats["first"] is None:
+                        comparison_stats["first"] = time.monotonic()
+                if comparison_fault:
+                    if not is_compare:
+                        fault = "normal"
+                    else:
+                        fault = "batch_" + fault.removeprefix("compare_")
+                        if state in ("compare_flash", "compare_lost", "compare_recover_stall"):
+                            state = "normal"
+                if fault.startswith("batch_") and not comparison_fault:
                     if not is_insert:
                         fault = "normal"
                     elif fault in ("batch_flash", "batch_lost", "batch_recover_stall"):
@@ -172,7 +197,7 @@ def run_copy_generations():
                 self.close_connection = True
                 return
             if fault in ("reject_prepare", "batch_reject"):
-                self.send_error(403, "owned prepare rejection" if fault == "reject_prepare" else "owned batch rejection")
+                self.send_error(403, "owned prepare rejection" if fault == "reject_prepare" else ("owned comparison rejection" if comparison_fault else "owned batch rejection"))
                 return
             if fault in ("stall", "batch_stall", "batch_recover_stall"):
                 release.wait(1.2 if fault == "batch_recover_stall" else 10)
@@ -212,6 +237,9 @@ def run_copy_generations():
     environment["LAB_COPY_GENERATION_DSN"] = f"http://{address}"
     environment["LAB_COPY_GENERATION_CONTROL"] = address
     try:
+        if "--copy-execution" in sys.argv:
+            run_copy_execution(environment)
+            return
         if "--consumer-recovery" in sys.argv:
             run_consumer_recovery(environment)
             return
@@ -433,6 +461,42 @@ def run_version_catalogue(environment):
         source_proxy.server_close()
 
 
+def run_copy_execution(environment):
+    reports = []
+    class Callback(http.server.BaseHTTPRequestHandler):
+        def log_message(self, *_):
+            pass
+        def do_POST(self):
+            reports.append(json.loads(self.rfile.read(int(self.headers["Content-Length"]))))
+            self.send_response(204)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+    callback = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Callback)
+    callback.daemon_threads = True
+    threading.Thread(target=callback.serve_forever, daemon=True).start()
+    environment["LAB_COPY_EXECUTION_CALLBACK"] = f"http://127.0.0.1:{callback.server_port}/callback"
+    try:
+        subprocess.run([
+            "cargo", "test", "--offline", "--locked", "-p", "app", "--lib",
+            "real_copy_comparison_uses_task_database_execution", "--", "--ignored", "--nocapture",
+        ], cwd=ROOT, env=environment, check=True)
+        summaries = [report for report in reports if report["is_final"] and not report.get("diagnostics")]
+        assert len(summaries) == 24 and all(report["diagnostics_complete"] for report in summaries), summaries
+        failed = [report for report in summaries if report["task_error_count"] == 1]
+        assert len(failed) == 6 and all(report["migration"]["phase"] == "failed" for report in failed), failed
+        attempts = [report for report in summaries if report["migration"]["generation"] == 2]
+        assert len(attempts) == 12, attempts
+        recovered = [report for report in attempts if report["task_error_count"] == 0]
+        assert len(recovered) == 6 and all(report["migration"]["phase"] == "completed" and report["detail"]["new_count"] == 4 for report in recovered), recovered
+        causes = [event for report in reports for event in (report.get("diagnostics") or {}).get("events", [])
+                  if "owned comparison rejection" in event["message"]]
+        assert len(causes) >= 2, causes
+        print("independent task execution callback inspection deployments=2 recovered_comparisons=6 failed_comparisons=6 original_rejection_preserved=true HTTP_204=accepted", flush=True)
+    finally:
+        callback.shutdown()
+        callback.server_close()
+
+
 def run_consumer_recovery(environment):
     reports = []
 
@@ -584,7 +648,7 @@ def run_inside():
             time.sleep(0.2)
         else:
             raise RuntimeError(f"ClickHouse readiness timed out on port {port}")
-    if any(flag in sys.argv for flag in ("--copy-generations", "--catalogue-recovery", "--consumer-recovery", "--rename-generations", "--retention-events", "--source-absence", "--request-policy", "--copy-contracts", "--version-catalogue", "--mutable-catalogue", "--version-metadata", "--scan-wire")):
+    if any(flag in sys.argv for flag in ("--copy-generations", "--catalogue-recovery", "--consumer-recovery", "--copy-execution", "--rename-generations", "--retention-events", "--source-absence", "--request-policy", "--copy-contracts", "--version-catalogue", "--mutable-catalogue", "--version-metadata", "--scan-wire")):
         run_copy_generations()
         return
     environment = dict(os.environ)

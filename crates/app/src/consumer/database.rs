@@ -15,6 +15,7 @@ use tracing::{Instrument, debug, error, info, info_span, trace};
 // 内部模块
 use crate::config::{ConsumerConfig, JobType};
 use crate::consumer::traits::Consumer;
+use crate::copy_execution::CopyDatabaseExecution;
 use crate::error::Result;
 
 mod execution;
@@ -57,6 +58,7 @@ pub struct DatabaseConsumer {
     batch_size: u32,
     job_type: JobType,
     cancel: CancellationToken,
+    shared_execution: Option<CopyDatabaseExecution>,
 }
 
 // 为StorageEntryMessage实现Consumer trait
@@ -83,6 +85,7 @@ impl Consumer for DatabaseConsumer {
             &mut db,
             matches!(job_type, JobType::Copy | JobType::IncrementalCopy),
             self.cancel.clone(),
+            self.shared_execution.clone(),
         )?;
         debug!("[DatabaseConsumer] Starting consumer with batch size: {}", batch_size);
 
@@ -351,6 +354,11 @@ impl Consumer for DatabaseConsumer {
 }
 
 impl DatabaseConsumer {
+    pub(crate) fn with_shared_execution(mut self, execution: Option<CopyDatabaseExecution>) -> Self {
+        self.shared_execution = execution;
+        self
+    }
+
     /// 将复制事实消费者接入任务取消；最终通知继续使用独立目录连接。
     #[must_use]
     pub fn with_cancellation(mut self, cancel: CancellationToken) -> Self {
@@ -402,6 +410,7 @@ impl DatabaseConsumer {
             batch_size: config.db_config.batch_size,
             job_type: config.job_type.clone(),
             cancel: CancellationToken::new(),
+            shared_execution: None,
         })
     }
 

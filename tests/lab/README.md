@@ -429,3 +429,15 @@ tests check concrete ctime, nonempty-directory and injected read-only refusal ca
 the read-only callback case is diagnostic injection, not a real read-only mount.
 No claim of concurrent-writer exclusion, atomic compare-and-unlink, power-cut or
 network-mount certification follows from these tests.
+
+
+`run-notification-archive-local.py --copy-execution` exercises the task-owned database
+scope through actual incremental comparison workers and both consumer phases. Twelve
+Single/Cluster attempts cover comparison disconnect, lost read response, recovered
+silent timeout, persistent timeout and permission refusal. Each starts with a normal
+one-file full copy, which also catches excessive nested async-poll stack usage without
+raising the test stack. Fault timing starts at the first affected comparison request;
+whole-run time includes preparation and reporting. The runner independently checks
+24 final HTTP 204 summaries, original failure causes, recovered counts and preserved
+source/previous target. This does not certify active storage-I/O cancellation or a
+whole-task deadline with large files or stalled backend initialization.

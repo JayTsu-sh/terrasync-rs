@@ -55,7 +55,7 @@ use crate::broadcast::{BroadcastForwarder, DEFAULT_CHANNEL_CAPACITY};
 use crate::config::{JobType, SyncJobConfig, initialize_consumer_config, initialize_scan_config};
 use crate::consumer::ConsumerManager;
 use crate::copy_completion;
-use crate::copy_execution::{CopyLease, begin_copy_catalogue, compile_copy_request};
+use crate::copy_execution::{CopyDatabaseExecution, CopyLease, begin_copy_catalogue, compile_copy_request};
 use crate::copy_history::{HistoryCompletion, HistoryCopyPolicy};
 use crate::dir_walker;
 use crate::error::{AppError, Result};
@@ -387,9 +387,20 @@ impl SyncOrchestrator {
         } else {
             None
         };
-        let mut result = self
-            .run_planned_local(observation_plan, &request, app_config, consumers, db_instance.clone())
-            .await;
+        let mut pipeline_database = db_instance.clone();
+        let execution = pipeline_database
+            .as_mut()
+            .map(|database| CopyDatabaseExecution::prepare(database, CancellationToken::new()))
+            .transpose()?;
+        consumers.set_copy_database_execution(execution.clone())?;
+        // 任务边界堆存 future，避免编排状态机与数据库恢复层的 poll 栈叠加。
+        let work = self
+            .run_planned_local(observation_plan, &request, app_config, consumers, pipeline_database)
+            .boxed_local();
+        let mut result = match execution {
+            Some(execution) => execution.run(work).await,
+            None => work.await,
+        };
         if let Some(database) = db_instance {
             let phase = if result.is_ok() {
                 CopyGenerationPhase::Completed
@@ -1070,10 +1081,11 @@ impl SyncOrchestrator {
             let database_clone = database_clone.clone();
             let detect_broadcaster = detect_broadcaster.clone();
             let broadcaster = broadcaster.clone();
+            let execution = consumer_manager.copy_database_execution();
 
             let span = info_span!("scan_worker", worker_id = worker_id);
             let handle = tokio::spawn(
-                async move {
+                CopyDatabaseExecution::run_optional_child(execution, async move {
                     info!("Scan worker {}: Started processing", worker_id);
 
                     let mut current_batch = Vec::with_capacity(batch_size);
@@ -1134,7 +1146,7 @@ impl SyncOrchestrator {
 
                     info!("Scan worker {}: Completed processing", worker_id);
                     Ok(())
-                }
+                })
                 .instrument(span),
             );
 

@@ -53,6 +53,17 @@ impl Display for CopyStep {
 /// 应用程序的专用错误枚举
 #[derive(Error, Debug)]
 pub enum AppError {
+    #[error("迁移执行因子任务失败而停止: {source}")]
+    CopyExecutionStopped {
+        #[source]
+        source: Arc<AppError>,
+    },
+    #[error("迁移执行失败: {source}; 数据库同时不可用: {database}")]
+    CopyExecutionAndDatabaseFailed {
+        #[source]
+        source: Box<AppError>,
+        database: DatabaseError,
+    },
     #[error("历史版本分段顺序无效: {path:?}, expected={expected}, actual={actual}")]
     CopyHistoryOrder { path: PathBuf, expected: u32, actual: u32 },
     #[error("历史版本没有完整结束: {path:?}, last_version={last_version:?}")]
@@ -355,19 +366,21 @@ pub type Result<T> = std::result::Result<T, AppError>;
 impl AppError {
     pub(crate) fn source_cleanup_entry(&self) -> Option<(&Path, &Self)> {
         match self {
+            Self::CopyExecutionStopped { source } => source.source_cleanup_entry(),
             Self::CopyEntryFailed {
                 step: CopyStep::SourceCleanup,
                 path,
                 source,
             } => Some((path, source)),
-            Self::MigrationFinalizationFailed { source, .. } | Self::MigrationReportingFailed { source, .. } => {
-                source.source_cleanup_entry()
-            }
+            Self::MigrationFinalizationFailed { source, .. }
+            | Self::MigrationReportingFailed { source, .. }
+            | Self::CopyExecutionAndDatabaseFailed { source, .. } => source.source_cleanup_entry(),
             _ => None,
         }
     }
     pub(crate) fn is_reported_copy_failure(&self) -> bool {
         match self {
+            Self::CopyExecutionStopped { source } => source.is_reported_copy_failure(),
             Self::ReportedCopyFailure { .. } => true,
             Self::CopyEntryFailed { source, .. } => source.is_reported_copy_failure(),
             _ => false,
@@ -377,6 +390,7 @@ impl AppError {
     #[cfg(test)]
     pub(crate) fn reported_copy_data_failed(&self) -> bool {
         match self {
+            Self::CopyExecutionStopped { source } => source.reported_copy_data_failed(),
             Self::ReportedCopyFailure { data_failed, .. } => *data_failed,
             Self::CopyEntryFailed { source, .. } => source.reported_copy_data_failed(),
             _ => false,
@@ -392,6 +406,7 @@ impl AppError {
 
     pub(crate) fn stops_event_pipeline(&self) -> bool {
         match self {
+            Self::CopyExecutionStopped { source } => source.stops_event_pipeline(),
             Self::ConsumerDisconnected { .. } => true,
             Self::CopyEntryFailed { source, .. } | Self::ReportedCopyFailure { source, .. } => {
                 source.stops_event_pipeline()
@@ -402,7 +417,10 @@ impl AppError {
 
     pub fn storage_error(&self) -> Option<&StorageError> {
         match self {
-            Self::CopyEntryFailed { source, .. } | Self::ReportedCopyFailure { source, .. } => source.storage_error(),
+            Self::CopyExecutionStopped { source } => source.storage_error(),
+            Self::CopyEntryFailed { source, .. }
+            | Self::ReportedCopyFailure { source, .. }
+            | Self::CopyExecutionAndDatabaseFailed { source, .. } => source.storage_error(),
             Self::StorageError(error) => Some(error),
             Self::ScanStorageAndDatabaseFailure { source, .. } => Some(source),
             _ => None,

@@ -1,5 +1,6 @@
 //! 实际消费者的固定批次恢复、失败停收及独立终态归档。
 use std::{
+    error::Error as StdError,
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -296,6 +297,10 @@ async fn case(fixture: &Fixture, incremental: bool, mode: &str) -> Result<()> {
     Ok(())
 }
 
+fn has_database_cause(error: &(dyn StdError + 'static)) -> bool {
+    error.downcast_ref::<DatabaseError>().is_some() || error.source().is_some_and(has_database_cause)
+}
+
 async fn pipeline_case(fixture: &Fixture, incremental: bool) -> Result<()> {
     let source = tempfile::tempdir()?;
     let target = tempfile::tempdir()?;
@@ -345,7 +350,7 @@ async fn pipeline_case(fixture: &Fixture, incremental: bool) -> Result<()> {
     let error = result
         .err()
         .ok_or_else(|| AppError::ConfigError("migration concealed consumer rejection".into()))?;
-    assert!(matches!(error, AppError::DatabaseError(_)), "{error}");
+    assert!(has_database_cause(&error), "{error}");
     assert!(error.to_string().contains("owned batch rejection"), "{error}");
     for index in 0..64 {
         assert!(source.path().join(format!("payload-{index}")).exists());
@@ -398,3 +403,6 @@ async fn real_copy_consumers_recover_and_stop_after_final_failure() -> Result<()
     }
     Ok(())
 }
+
+#[path = "execution_real_tests.rs"]
+mod execution_tests;
