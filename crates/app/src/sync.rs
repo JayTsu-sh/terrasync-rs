@@ -375,10 +375,13 @@ async fn process_entry_inner(
             entry,
             &src_storage,
             &dest_storage,
-            enable_integrity_check,
-            is_source_reserved,
-            qos_manager,
-            bytes_counter,
+            CopyOptions {
+                transfer_mode: resume.transfer_mode,
+                qos: qos_manager,
+                enable_integrity_check,
+                bytes_counter,
+                ..Default::default()
+            },
             &resume.job_dir,
         )
         .await?;
@@ -615,9 +618,8 @@ pub(crate) fn should_resume(
 /// 以原生 Checkpoint 策略复制大文件；恢复路径与已确认范围只由目标引擎发现。
 /// 本地记录器保留现有产品进度收尾，不向引擎提供 `.part` 路径或缺失区间。
 pub(crate) async fn copy_file_with_resume(
-    entry: &Arc<ObservedEntry>, src_storage: &StorageContext, dest_storage: &StorageContext,
-    enable_integrity_check: bool, _is_source_reserved: bool, qos_manager: Option<QosManager>,
-    bytes_counter: Option<Arc<AtomicU64>>, job_dir: &str,
+    entry: &Arc<ObservedEntry>, src_storage: &StorageContext, dest_storage: &StorageContext, options: CopyOptions,
+    job_dir: &str,
 ) -> Result<()> {
     let recorder = CommitRecorder::start(job_dir, entry, src_storage.block_size()).await?;
 
@@ -627,10 +629,7 @@ pub(crate) async fn copy_file_with_resume(
         entry,
         CopyOptions {
             transfer_mode: TransferMode::Checkpoint,
-            qos: qos_manager,
-            enable_integrity_check,
-            bytes_counter,
-            ..Default::default()
+            ..options
         },
     )
     .await;

@@ -252,10 +252,13 @@ pub(crate) async fn process_entry_on_receiver(
                     entry,
                     src_storage,
                     dest_storage,
-                    config.enable_integrity_check,
-                    config.is_source_reserved,
-                    qos_manager,
-                    bytes_counter,
+                    CopyOptions {
+                        transfer_mode: config.transfer_mode,
+                        qos: qos_manager,
+                        enable_integrity_check: config.enable_integrity_check,
+                        bytes_counter,
+                        ..Default::default()
+                    },
                     &config.job_dir,
                 )
                 .await?;
