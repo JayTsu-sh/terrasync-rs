@@ -1322,3 +1322,134 @@ ignored 条目保留。初次额外真实夹具修正了 SELECT 位于 HTTP body
 `/tmp/terrasync-history-data-perf/`，程序 `/tmp/run_history_data_local_perf.py` 与复测脚本，
 变更前 SHA-256 `6a0511a748c6bbfb625af15d9c6f5954dfafe22409ee48b386769af17a712cd6`，
 变更后 `f1d75f8d40a117eaf592d948576472185ffe66547a8f98b093e69174d9a0f6e6`。
+
+
+### Historical data and deletion-marker readiness (2026-11-09)
+
+The full-migration plan's file-history cleanup now uses data-mover revision
+`45e70fa8d79d010643a357154bf30f33e2b93d5d`. Existing selected-version descriptions
+can represent a deletion marker as non-data with a partial one-record history.
+Existing persistence confirmation checks its precise ID; changing that descriptor's
+selector to Current additionally requires the same marker to remain the unique
+latest record. The application preserves published bindings and original segment
+positions, verifies every data version and marker, and only then requests permanent
+source purge. Ordinary transfer still refuses markers before destination mutation.
+The backend owns response parsing, marker identity, current-binding pagination and
+persistence; the application owns selected-history completeness and copy policy.
+No new public data-mover type/function or nfs-rs change was introduced.
+
+Native commits `b8d1c21`, `cd54bda` and `45e70fa` each passed the complete 53-step CI scope
+(including feature/architecture checks, strict Clippy, libraries, integration targets,
+doctests, examples and Local E2E) with Rust 1.98.1. Evidence is in
+`/tmp/native-marker-observation-ci{,-driver}.log` and
+`/tmp/native-null-anchor-ci{,-driver}.log`. Actual marker HEADs were probed with boto3
+(`/tmp/native-marker-real-head-probe.log`), and fifteen real marker persistence
+scenarios passed (`/tmp/native-null-anchor-markers-real3.log`): HEAD permission refusal,
+HEAD/LIST connectivity, stall and cancellation; explicit HEAD recovery after disconnect/stall; malformed
+marker/version headers; permanent marker removal and current replacement. Independent
+checks found no payload GET or mutation by confirmation or rejected transfer.
+Four real suspended-bucket null-slot cases and the red/green normalized-null regression
+are under `/tmp/native-null-anchor-*`; unchanged data/markers can be purged, while
+same-identity replacements with changed time are retained before any DELETE. These
+are RustFS storage contracts, not a claim about every vendor or a unified retry budget.
+
+Final architecture review found and fixed an additional pagination proof issue before Main
+commit: the current-marker confirmation compared an opaque continuation against a relative
+path. `45e70fa` consumes every continuation unchanged until real EOF. Deterministic and
+real SDK tests first reproduced erroneous readiness despite a page-two disconnect; the
+fixed seventeen-mode suite passes, with six actual RustFS one-record pages and five
+MinIO-shaped opaque tokens in the normal case, and typed Connectivity with all records
+retained on page two. The read-only fixture's boto3 side obtains real MaxKeys=1 pages;
+the proxy decorates/round-trips only the continuation. Evidence:
+`/tmp/native-marker-pagination-{red,green}.log`, `-{red,green}-real.log`, and
+`/tmp/native-marker-pagination-ci{,-driver}.log` (53/53). Prefix confirmation can include
+neighboring names; it does not assume the cursor is a lexical key or a relative path.
+
+Main checks are `/tmp/terrasync-history-marker-pagination-final-{fmt,check,clippy,tests,remote}.log`
+and `-ci-driver.log`: all five passed, including 16 serial remote-process cases;
+existing large-error and other project warnings remain. The meaningful source-marker
+unit covers immutable marker evidence, mixed timestamp precision and changed/missing
+null evidence without calling ordinary current-path or content reads.
+
+Run the owned real fixture with the usual external Cargo target/profile environment:
+
+```sh
+python3 tests/lab/run-notification-archive-local.py --copy-versioned-source-cleanup
+python3 tests/lab/run-notification-archive-local.py --copy-object-cleanup
+LAB_OBJECT_HISTORY_ONLY=true python3 tests/lab/run-notification-archive-local.py --copy-versioned-source-cleanup
+```
+
+The final versioned run passed 126 generations (36 normal, 56 faulted, 34 recovery)
+across Single and replicated Cluster, including quick/full with the latest record a
+marker; independently checked all source records were permanently gone, current last.
+New faults remove a real historical target marker, replace the target current binding,
+stall marker HEAD, or remove an old source marker after publication: source histories
+are retained, completed target data preserved, and HTTP 204 diagnostics include exact
+source/target marker IDs and cause. For these readiness faults each path has one task error, no additional
+copy-data error, and scans one logical entry. An additional 40-generation focused run
+passed (20 normal, 20 failures). Retain-full then delete-incremental now also covers
+three data versions plus two markers: base 5→0, zero transfer bytes, original target
+version IDs unchanged, and all source history removed after full verification.
+The ordinary fixture passed 48 generations (12 normal, 18 faulted, 18 recovery).
+Logs: `/tmp/terrasync-history-marker-{full126,ordinary48}-after-pagination-real.log` and
+`/tmp/terrasync-history-marker-focused40-real.log`. Reports remain queryable, diagnostics
+are drained by HTTP 204, and deleting generations leave base empty. The earlier
+122-generation run remains under `-full122-real.log`; it predates the added mixed-marker
+incremental case and is not counted as the expanded final suite.
+
+Normal-path performance uses physical copies of the complete CLI, not feature-mixed
+Cargo executables. Before: main `54cb831` production code / Native `69814a5`, SHA-256
+`f1d75f8d40a117eaf592d948576472185ffe66547a8f98b093e69174d9a0f6e6`.
+Final after: this feature's production code / Native `45e70fa`, SHA-256
+`260c0115eabead3e05ad3aa958098744ed0eac5f9996a27ca375eab225eb934b`.
+Fixed binaries and metadata are in `/tmp/terrasync-history-marker-perf/`;
+the final pair is recorded in `final-binaries.json`.
+The final 24 measurements use 3000 × 1 KiB Local files, flat and 100 × 30 tree,
+DeleteSource, Single ClickHouse limited to 2 CPU/1536 MiB, 16/100000,
+unordered/Direct/quick, dev, no callback, and no concurrent task build/CI/functional
+suite. The predefined order is ABBAABBAABBA per scenario, six samples per version.
+Each run independently checks target bytes, source file/directory removal,
+nanosecond directory mtime/mode, empty base and saved final report. No callback means
+the planned target-retention status remains undelivered (`diagnostics_complete=false`);
+this is not callback success.
+
+| Scenario | Median seconds before → final after | Time change | Median peak RSS MiB before → after | RSS change |
+| --- | --- | --- | --- | --- |
+| Flat, six pairs | 5.265 → 5.375 | +2.09% | 201.28 → 197.82 | -1.72% |
+| Tree, six pairs | 5.170 → 5.170 | 0.00% | 204.37 → 203.76 | -0.30% |
+
+Final raw samples, 50 ms RSS, stdout, stderr, time files and summary are in
+`/tmp/terrasync-history-marker-perf/final-local/`; the driver is
+`/tmp/run_history_marker_final_local_perf.py`, log
+`/tmp/terrasync-history-marker-final-local-perf.log`. The fixed threshold checker
+passes both scenarios. Highest final-after RSS was 210.46 MiB. Directory median
+remains above roughly 200 MiB; release/large/other-backend scope and uninterrupted
+memory growth remain uncertified.
+
+Earlier diagnosis is preserved separately. The pre-pagination candidate / Native
+`cd54bda` SHA-256 was `fc95679cb5dd49964b4b3d0fff12a1e080f9ca172fa0156c6c6f024a28c26e5b`.
+Its initial twelve ABBAAB measurements breached flat time (+6.90%). Before changing
+code, a fixed additional twelve BAABBA measurements captured CPU user/system time.
+No code/configuration changed during that experiment; all 24 candidate samples,
+including the breach, are in `combined-{results,summary}.json`, with raw records in
+`local/` and `local-reversal/`. Candidate combined flat/tree time changed -3.13%/-1.01%,
+and reversal median CPU -1.06%/-1.74%; a stable fixed-cost regression was not supported.
+These are not speedup claims. Those earlier candidate samples are not mixed into the
+final 45e70fa program's 24 measurements above.
+
+The first focused run had a fixture-only mistake: invisible current keys were treated
+as empty history even though five original records were correctly retained. The
+inspector now checks visible objects and actual version sets separately; the failed
+log remains `-focused36-real.log`. An initial Main link failed from ENOSPC. Only unused
+old-revision .rlib/.rmeta artifacts in this task's external cache were released; current
+builds, source, all fixed benchmark binaries and samples were preserved. The subsequent
+complete checks passed. No production change was made to hide either test limitation.
+
+This step covers file histories, including deletion markers. Directory-object marker
+cleanup remains guarded. All-entry asynchronous source cleanup, database-independent
+directory finalization, uniform stage counters and a shared cross-stage network-jitter
+budget/execution fence are separate pending work; the read-only cancellation and
+explicit recovery tests above do not certify those goals. All owned containers/volumes
+were cleaned after each run. Final review keeps S3 decoding in its adapter, selection
+and completeness in the task layer, and bounded row-by-row proof rather than a retained
+full-history/completed-key set; the library continuation tracker still has its own bound.

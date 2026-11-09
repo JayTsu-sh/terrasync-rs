@@ -1,7 +1,7 @@
 //! 逐行核验历史目标，仅在完整分段及所有所选版本均就绪后永久清理源 key。
 use std::{path::Path, sync::Arc};
 
-use data_mover::model::{EntryKind, ObservedEntry, SourceVersion, StoragePath};
+use data_mover::model::{EntryKind, ObservedEntry, SourceVersion, StoragePath, VersionRecord};
 use data_mover::storage::SourceDescriptor;
 use db::catalogue::CopyCatalogueEntry;
 
@@ -134,7 +134,12 @@ impl HistoryCleanup {
         };
         let result: Result<()> = async {
             let anchor = group.anchor()?;
-            if !verification::verify_source_metadata(source, anchor, check).await? {
+            // 当前删除标记隐藏普通路径；其精确身份已逐版本确认，purge 会再次复核当前锚点。
+            let latest_marker = anchor
+                .history()
+                .and_then(|history| history.latest())
+                .is_some_and(VersionRecord::is_delete_marker);
+            if !latest_marker && !verification::verify_source_metadata(source, anchor, check).await? {
                 return Err(StorageError::SourceHistoryCurrentUnconfirmed {
                     path: group.path.clone(),
                 }
@@ -182,7 +187,7 @@ async fn verify_version(
     verification::verify_source_version(source, view, check)
         .await
         .map_err(|error| verification_failure(row, "source_metadata", error))?;
-    if check.verify_content {
+    if check.verify_content && view.version().is_some_and(|record| !record.is_delete_marker()) {
         content::verify(
             source,
             target,
@@ -201,7 +206,7 @@ async fn verify_target(
     row: &CopyCatalogueEntry, target: &StorageContext, check: &SourceCleanupCheck,
 ) -> Result<SourceDescriptor> {
     let view = row.completion.item.view();
-    if view.entry.kind() != EntryKind::File || view.version().is_none_or(|record| record.is_delete_marker()) {
+    if view.entry.kind() != EntryKind::File || view.version().is_none() {
         return Err(StorageError::PermanentVersionCleanupUnavailable {
             path: view.entry.path().clone(),
         }
@@ -216,18 +221,28 @@ async fn verify_target(
             source_version: view.version_id().into(),
         })?;
     let target_version = SourceVersion::Id(version.into());
-    let descriptor = captured_metadata_plan(target.storage(), view)?
+    let marker = view.version().is_some_and(VersionRecord::is_delete_marker);
+    let mut descriptor = captured_metadata_plan(target.storage(), view)?
         .verify_published(
             target.storage(),
             view.entry.path(),
             &target_version,
-            view.version().filter(|record| record.is_latest()).map(|_| version),
+            view.version()
+                .filter(|record| record.is_latest() && !record.is_delete_marker())
+                .map(|_| version),
             check.cancel.clone(),
         )
         .await
         .map_err(StorageError::from)?;
-    if descriptor.kind != EntryKind::File || descriptor.size != view.version().and_then(|record| record.size()) {
+    if descriptor.kind != EntryKind::File
+        || descriptor.size != view.version().and_then(VersionRecord::size)
+        || (marker && verification::selected_marker(&descriptor).is_none())
+    {
         return Err(StorageError::TargetPublicationChanged { path: descriptor.path }.into());
+    }
+    if marker && view.version().is_some_and(VersionRecord::is_latest) {
+        // 保留目标实测身份，只收紧 selector；当前绑定的协议检查归 namespace 所有。
+        descriptor.version = SourceVersion::Current;
     }
     target
         .storage()

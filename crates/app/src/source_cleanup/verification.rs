@@ -3,10 +3,10 @@ use super::SourceCleanupCheck;
 use crate::error::storage::operation;
 use data_mover::model::{
     EntryKind, EntryOperationFailure, FailureClass, MetadataFamily, MetadataObservation, MetadataObservations,
-    ObservationMode, ObservationPlan, ObservedEntry, Operation, SourceVersion, Transience,
+    ObservationMode, ObservationPlan, ObservedEntry, Operation, SourceVersion, Transience, VersionRecord,
 };
-use data_mover::storage::StorageRoleFailure;
 use data_mover::storage::{NamespaceReadOutcome, read_namespace_entry};
+use data_mover::storage::{SourceDescriptor, StorageRoleFailure};
 use task_model::metadata::metadata_digests;
 use task_model::observation::ObservedView;
 use tokio::time::timeout;
@@ -100,12 +100,32 @@ pub(super) async fn verify_source_metadata(
     Ok(true)
 }
 
+/// 选中标记是没有数据体的单版本描述，不能由 size=None 或虚拟前缀单独推断。
+pub(super) fn selected_marker(descriptor: &SourceDescriptor) -> Option<&VersionRecord> {
+    let history = descriptor.listing.history.as_ref()?;
+    (descriptor.listing.listing_only
+        && descriptor.size.is_none()
+        && descriptor.content_version.is_none()
+        && history.records().len() == 1)
+        .then(|| &history.records()[0])
+        .filter(|record| record.is_delete_marker() && record.identity() == &descriptor.source_identity)
+}
+
 /// 指定历史版本使用已有 read／metadata role，不把旧版本属性与当前源混比。
 pub(super) async fn verify_source_version(
     source: &StorageContext, expected: ObservedView<'_>, check: &SourceCleanupCheck,
 ) -> Result<()> {
     let path = expected.source_path()?;
     let operation = async {
+        let failures: Vec<_> = expected.metadata().failures().collect();
+        if !failures.is_empty() {
+            return Err(StorageError::SourceMetadataAcquisitionFailed {
+                path: path.clone(),
+                version: Some(expected.version_id().into()),
+                failures,
+            }
+            .into());
+        }
         let version = SourceVersion::Id(expected.version_id().into());
         let descriptor = source
             .storage()
@@ -122,6 +142,33 @@ pub(super) async fn verify_source_version(
                 reason: "源历史版本身份或大小发生变化",
             }
             .into());
+        }
+        if let Some(wanted) = expected.version().filter(|record| record.is_delete_marker()) {
+            let confirmed = selected_marker(&descriptor).is_some_and(|actual| {
+                if actual.version_id() != wanted.version_id() {
+                    return false;
+                }
+                if wanted.version_id().is_some() {
+                    return true;
+                }
+                // null 槽可被替换；按双方共同精度比较修改时间，缺失证据时保留源。
+                wanted.modified().zip(actual.modified()).is_some_and(|(before, after)| {
+                    let quantum = before
+                        .precision()
+                        .quantum_nanos()
+                        .max(after.precision().quantum_nanos());
+                    before.unix_nanos().div_euclid(quantum) == after.unix_nanos().div_euclid(quantum)
+                })
+            });
+            return if confirmed {
+                Ok(())
+            } else {
+                Err(StorageError::HistoryCleanupUnconfirmed {
+                    path: path.clone(),
+                    reason: "源删除标记缺少匹配的类型或修改证据",
+                }
+                .into())
+            };
         }
         let facts = source
             .storage()
@@ -308,3 +355,7 @@ mod tests {
         Ok(())
     }
 }
+
+#[cfg(test)]
+#[path = "marker_tests.rs"]
+mod marker_tests;

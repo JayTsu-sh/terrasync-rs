@@ -76,6 +76,24 @@ async fn report(config: &ClickHouseConfig, command: &SyncJobConfig, sequence: u6
     let saved: FinalCallbackReport = serde_json::from_str(&raw)?;
     let report: ProgressReport = serde_json::from_str(&saved.payload_json)?;
     assert!(report.is_final && report.diagnostics_complete);
+    if command
+        .job_id
+        .rsplit('_')
+        .next()
+        .is_some_and(|mode| mode.starts_with("history"))
+    {
+        assert!(
+            matches!(
+                report.detail,
+                ProgressDetail::Full {
+                    scanned_files: 1,
+                    error_count: 0,
+                    ..
+                }
+            ),
+            "{report:?}"
+        );
+    }
     assert_eq!(
         report.task_error_count,
         u64::from(
@@ -108,7 +126,16 @@ async fn round(config: &ClickHouseConfig, command: &SyncJobConfig, mode: &str, s
         assert_eq!(result.unwrap_err().reported_copy_data_failed(), mode != "metadata");
     } else if matches!(
         mode,
-        "historytags" | "historysource" | "historymissing" | "historygap" | "historydisconnect" | "historystall"
+        "historytags"
+            | "historysource"
+            | "historymissing"
+            | "historygap"
+            | "historydisconnect"
+            | "historystall"
+            | "historymarkermissing"
+            | "historymarkerreplace"
+            | "historymarkerstall"
+            | "historymarkersource"
     ) {
         let error = result.unwrap_err();
         assert!(error.source_cleanup_entry().is_some(), "{error}");
@@ -119,19 +146,17 @@ async fn round(config: &ClickHouseConfig, command: &SyncJobConfig, mode: &str, s
             ),
             "{error}"
         );
-    } else if matches!(mode, "historyguard" | "missingcurrent" | "metaread" | "metachanged") {
+    } else if matches!(mode, "missingcurrent" | "metaread" | "metachanged") {
         let error = result.unwrap_err();
         assert!(error.source_cleanup_entry().is_some(), "{error}");
-        let accepted = match (mode, error.storage_error()) {
-            ("historyguard", Some(StorageError::HistoryCleanupVerification { source, .. })) => {
-                matches!(source.as_ref(), StorageError::PermanentVersionCleanupUnavailable { .. })
-            }
-            ("historyguard", Some(StorageError::PermanentVersionCleanupUnavailable { .. }))
-            | ("missingcurrent", Some(StorageError::SourceHistoryCurrentUnconfirmed { .. }))
-            | ("metaread", Some(StorageError::NamespaceRead(_)))
-            | ("metachanged", Some(StorageError::SourceMetadataChanged { .. })) => true,
-            _ => false,
-        };
+        let accepted = matches!(
+            (mode, error.storage_error()),
+            (
+                "missingcurrent",
+                Some(StorageError::SourceHistoryCurrentUnconfirmed { .. })
+            ) | ("metaread", Some(StorageError::NamespaceRead(_)))
+                | ("metachanged", Some(StorageError::SourceMetadataChanged { .. }))
+        );
         assert!(accepted, "{error}");
     } else {
         let error = result.unwrap_err();
@@ -187,7 +212,7 @@ async fn case(config: &ClickHouseConfig, deployment: &str, target: &str, full: b
     command.concurrency = Some(2);
     command.progress_callback_url = Some(CallbackEndpoint::parse(&environment("LAB_OBJECT_CLEANUP_CALLBACK")?)?);
     control(&format!("arm/{prefix}/{mode}")).await?;
-    let result_mode = if matches!(mode, "large" | "historydata") {
+    let result_mode = if matches!(mode, "large" | "historydata" | "historyguard" | "historylatestmarker") {
         "normal"
     } else {
         mode
@@ -203,8 +228,9 @@ async fn case(config: &ClickHouseConfig, deployment: &str, target: &str, full: b
 }
 
 async fn history_cases(config: &ClickHouseConfig, deployment: &str) -> Result<()> {
-    case(config, deployment, "history", false, "historyguard").await?;
     for full in [false, true] {
+        case(config, deployment, "history", full, "historyguard").await?;
+        case(config, deployment, "history", full, "historylatestmarker").await?;
         case(config, deployment, "history", full, "historydata").await?;
     }
     for mode in [
@@ -214,23 +240,35 @@ async fn history_cases(config: &ClickHouseConfig, deployment: &str) -> Result<()
         "historygap",
         "historydisconnect",
         "historystall",
+        "historymarkermissing",
+        "historymarkerreplace",
+        "historymarkerstall",
+        "historymarkersource",
     ] {
         case(config, deployment, "history", false, mode).await?;
     }
-    Box::pin(unchanged_versioned_move(config, deployment, false, true)).await?;
+    Box::pin(unchanged_versioned_move(
+        config,
+        deployment,
+        false,
+        Some("historyunchanged"),
+    ))
+    .await?;
+    Box::pin(unchanged_versioned_move(
+        config,
+        deployment,
+        false,
+        Some("historymarkerunchanged"),
+    ))
+    .await?;
     Ok(())
 }
 
 async fn unchanged_versioned_move(
-    config: &ClickHouseConfig, deployment: &str, corrupt: bool, history_target: bool,
+    config: &ClickHouseConfig, deployment: &str, corrupt: bool, history_mode: Option<&str>,
 ) -> Result<()> {
-    let mode = if history_target {
-        "historyunchanged"
-    } else if corrupt {
-        "unchangedbad"
-    } else {
-        "unchanged"
-    };
+    let history_target = history_mode.is_some();
+    let mode = history_mode.unwrap_or(if corrupt { "unchangedbad" } else { "unchanged" });
     let target = if history_target { "history" } else { "latest" };
     let prefix = format!("{deployment}-{target}-full-{mode}");
     let root = PathBuf::from(environment("LAB_OBJECT_CLEANUP_ROOT")?).join(&prefix);
@@ -277,7 +315,14 @@ async fn unchanged_versioned_move(
         let database = ClickHouseDatabase::connect(config, &command.job_id).await?;
         assert_eq!(
             database.get_count("base").await?,
-            u64::from(sequence == 1) * if history_target { 3 } else { 1 }
+            u64::from(sequence == 1)
+                * if mode == "historymarkerunchanged" {
+                    5
+                } else if history_target {
+                    3
+                } else {
+                    1
+                }
         );
         let generation = database
             .latest_copy_generation()
@@ -414,7 +459,7 @@ async fn real_unversioned_object_source_cleanup_and_failures() -> Result<()> {
                 }
                 Box::pin(history_cases(&config, deployment)).await?;
                 for corrupt in [false, true] {
-                    Box::pin(unchanged_versioned_move(&config, deployment, corrupt, false)).await?;
+                    Box::pin(unchanged_versioned_move(&config, deployment, corrupt, None)).await?;
                 }
                 case(&config, deployment, "latest", false, "large").await?;
             }

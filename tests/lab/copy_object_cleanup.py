@@ -19,6 +19,8 @@ from botocore.config import Config
 
 
 HISTORY_DATA_MODES = ("historydata", "historytags", "historysource", "historymissing", "historygap", "historydisconnect", "historystall")
+HISTORY_MARKER_MODES = ("historylatestmarker", "historymarkermissing", "historymarkerreplace", "historymarkerstall", "historymarkersource")
+HISTORY_HIDDEN_MODES = (*HISTORY_MARKER_MODES, "historymarkerunchanged")
 HISTORY_PLAIN_MODES = (*HISTORY_DATA_MODES, "historyunchanged")
 
 BODY = b"ordinary object data"
@@ -61,7 +63,7 @@ def run(repository, environment, *, versioned_source=False):
                 Bucket=buckets["source"], Prefix=prefix + "/").get("Contents", [])}
             source_removed = mode == "normal" or (mode == "lostack" and not versioned_source)
             expected_remaining = ({"slash/"} if target == "local" and state["initial"] == "normal" else set()) if source_removed else set(keys)
-            if mode == "missingcurrent":
+            if mode == "missingcurrent" or state["initial"] in HISTORY_HIDDEN_MODES:
                 expected_remaining = set()
             assert set(remaining) == expected_remaining, (prefix, mode, remaining, expected_remaining)
             if versioned_source:
@@ -69,7 +71,7 @@ def run(repository, environment, *, versioned_source=False):
                 records = history.get("Versions", []) + history.get("DeleteMarkers", [])
                 for key in keys:
                     actual = {item["VersionId"] for item in records if item["Key"] == f"{prefix}/{key}"}
-                    expected = set(state["source_versions"][key]) if key in expected_remaining or mode == "missingcurrent" else set()
+                    expected = set(state["source_versions"][key]) if key in expected_remaining or mode == "missingcurrent" or (state["initial"] in HISTORY_HIDDEN_MODES and mode != "normal") else set()
                     if mode in ("lostack", "partial", "malformed"):
                         expected -= {version for deleted_key, version in state["deleted_versions"] if deleted_key == f"{prefix}/{key}"}
                     assert actual == expected, (prefix, mode, key, actual, expected)
@@ -94,19 +96,22 @@ def run(repository, environment, *, versioned_source=False):
                 elif mode in ("data", "verify", "cleanupunknown"):
                     assert not client.list_objects_v2(Bucket=buckets[target], Prefix=f"{prefix}/{key}").get("Contents"), (prefix, key)
                 else:
-                    assert client.get_object(Bucket=buckets[target], Key=f"{prefix}/{key}")["Body"].read() == body
+                    selector = {"VersionId": state["target_data_versions"][-1]} if state["initial"] in HISTORY_HIDDEN_MODES else {}
+                    assert client.get_object(Bucket=buckets[target], Key=f"{prefix}/{key}", **selector)["Body"].read() == body
                     if mode == "normal":
-                        assert client.get_object_tagging(Bucket=buckets[target], Key=f"{prefix}/{key}")["TagSet"] == state["source_tags_expected"]
+                        assert client.get_object_tagging(Bucket=buckets[target], Key=f"{prefix}/{key}", **selector)["TagSet"] == state["source_tags_expected"]
             if target == "local":
                 assert state["source_tags"] == 0, (prefix, "Local target must not request source tags", state)
             if target == "history":
                 history = client.list_object_versions(Bucket=buckets[target], Prefix=prefix + "/")
-                assert len(history.get("DeleteMarkers", [])) == (len(keys) if versioned_source and state["initial"] not in HISTORY_PLAIN_MODES else 0), (prefix, history)
-                assert len(history.get("Versions", [])) == len(keys) * (2 if state["initial"] == "historymissing" else 3 if versioned_source else 1), (prefix, history)
+                markers = 2 if state["initial"] in HISTORY_HIDDEN_MODES else len(keys) if versioned_source and state["initial"] not in HISTORY_PLAIN_MODES else 0
+                if state["initial"] == "historymarkermissing": markers -= 1
+                assert len(history.get("DeleteMarkers", [])) == markers, (prefix, history)
+                assert len(history.get("Versions", [])) == len(keys) * (4 if state["initial"] == "historymarkerreplace" else 2 if state["initial"] == "historymissing" else 3 if versioned_source else 1), (prefix, history)
                 assert {record["Key"] for record in history["Versions"]} == {prefix + "/" + key for key in keys}
                 if versioned_source:
                     assert [client.get_object(Bucket=buckets[target], Key=record["Key"], VersionId=record["VersionId"])["Body"].read()
-                            for record in history["Versions"]] == ([BODY, b"old-1"] if state["initial"] == "historymissing" else [BODY, b"old-1", b"old-0"]), history
+                            for record in history["Versions"]] == ([b"replacement", BODY, b"old-1", b"old-0"] if state["initial"] == "historymarkerreplace" else [BODY, b"old-1"] if state["initial"] == "historymissing" else [BODY, b"old-1", b"old-0"]), history
             if state["initial"] == "lostack":
                 expected_deletes = (len(state["source_versions"]["payload"]) if mode == "normal"
                                     else len(state["batch_requests"][0])) if versioned_source else 1
@@ -115,8 +120,8 @@ def run(repository, environment, *, versioned_source=False):
                 assert state["forwarded_deletes"] == 0
             if state["initial"] in ("verify", "cleanup403", "cleanupunknown"):
                 assert state["target_deletes"] == 1, (prefix, state)
-            if state["initial"] in ("unchanged", "unchangedbad", "historyunchanged"):
-                expected_writes = 3 if state["initial"] == "historyunchanged" else 2 if state["initial"] == "unchangedbad" and mode == "normal" else 1
+            if state["initial"] in ("unchanged", "unchangedbad", "historyunchanged", "historymarkerunchanged"):
+                expected_writes = 3 if state["initial"] in ("historyunchanged", "historymarkerunchanged") else 2 if state["initial"] == "unchangedbad" and mode == "normal" else 1
                 assert state["target_data_writes"] == expected_writes, (prefix, mode, state)
             if state["initial"] == "large":
                 assert state["source_tags"] == 2 and state["source_data_reads"] == 0 and state["target_data_writes"] == 1, (prefix, state)
@@ -158,6 +163,8 @@ def run(repository, environment, *, versioned_source=False):
                             if versioned_source and mode == "partial":
                                 client.put_object(Bucket=buckets["source"], Key=f"{prefix}/{key}", Body=b"accepted-old", Tagging="proof=accepted-old")
                             created = client.put_object(Bucket=buckets["source"], Key=f"{prefix}/{key}", Body=body, Tagging="proof=raw")
+                            if mode in HISTORY_HIDDEN_MODES:
+                                created = client.delete_object(Bucket=buckets["source"], Key=f"{prefix}/{key}")
                             latest_versions[key] = created.get("VersionId", "null")
                             if versioned_source:
                                 history_pages = list(client.get_paginator("list_object_versions").paginate(Bucket=buckets["source"], Prefix=f"{prefix}/{key}"))
@@ -168,7 +175,7 @@ def run(repository, environment, *, versioned_source=False):
                                     # 当前 RustFS 将非空尾斜杠对象保存在可变 null 槽，不虚构四个历史。
                                     assert source_versions[key] == {"null"}, (prefix, key, history)
                                 else:
-                                    assert len(source_versions[key]) == (256 if mode == "large" else 101 if mode == "batchmany" else 5 if mode == "partial" else 3 if mode in HISTORY_PLAIN_MODES else 4), (prefix, key, history)
+                                    assert len(source_versions[key]) == (256 if mode == "large" else 101 if mode == "batchmany" else 5 if mode == "partial" else 3 if mode in HISTORY_PLAIN_MODES else 5 if mode in HISTORY_HIDDEN_MODES else 4), (prefix, key, history)
                         with guard:
                             assert prefix not in states
                             states[prefix] = dict(initial=mode, mode=mode, target=target, keys=keys,
@@ -177,8 +184,9 @@ def run(repository, environment, *, versioned_source=False):
                                                   deleted=threading.Event(), source_versions=source_versions, deleted_versions=[], batch_requests=[],
                                                   source_payloads=dict(keys), source_tags_expected=[{"Key": "proof", "Value": "raw"}],
                                                   cleanup_seen=False, target_data_writes=0, source_data_reads=0, latest_versions=latest_versions,
-                                                  target_data_versions=[], history_fault=False,
-                                                  source_data_versions=source_data_versions if versioned_source else [])
+                                                  target_data_versions=[], target_marker_versions=[], history_fault=False,
+                                                  source_data_versions=source_data_versions if versioned_source else [],
+                                                  source_marker_versions=[item["VersionId"] for page in history_pages for item in page.get("DeleteMarkers", []) if item["Key"] == f"{prefix}/payload"] if versioned_source else [])
                             active[0] = prefix
                     elif action == "recover":
                         with guard:
@@ -268,6 +276,23 @@ def run(repository, environment, *, versioned_source=False):
                                 bucket = buckets["source"] if mode == "historysource" else buckets["history"]
                                 version = state["source_data_versions"][-1] if mode == "historysource" else state["target_data_versions"][0]
                                 client.put_object_tagging(Bucket=bucket, Key=key, VersionId=version, Tagging={"TagSet": [{"Key": "proof", "Value": "changed"}]})
+                    if mode in HISTORY_MARKER_MODES[1:] and not state["history_fault"]:
+                        wanted = state["target_marker_versions"][-1:] if mode == "historymarkerreplace" else state["target_marker_versions"][:1]
+                        ready = len(state["target_data_versions"]) == 3 and len(state["target_marker_versions"]) == 2
+                        if ready and not database and not source and self.command == "HEAD" and query.get("versionId", [None])[0] in wanted:
+                            state["history_fault"] = True
+                            state["affected"] += 1
+                            state["first_fault"] = time.monotonic()
+                            key = f"{prefix}/payload"
+                            if mode == "historymarkermissing":
+                                client.delete_object(Bucket=buckets["history"], Key=key, VersionId=wanted[0])
+                            elif mode == "historymarkerreplace":
+                                client.put_object(Bucket=buckets["history"], Key=key, Body=b"replacement")
+                            elif mode == "historymarkersource":
+                                records = client.list_object_versions(Bucket=buckets["source"], Prefix=key)["DeleteMarkers"]
+                                version = next(record["VersionId"] for record in records if not record["IsLatest"])
+                                client.delete_object(Bucket=buckets["source"], Key=key, VersionId=version)
+                                state["source_versions"]["payload"].remove(version)
                     mutating_observation = versioned_source and source and self.command == "HEAD" and "versionId" not in query and path.endswith("/" + prefix + "/payload") and mode in ("missingcurrent", "sourcechanged", "metaread", "metachanged", "contradictory") and not state["cleanup_seen"]
                     if mutating_observation:
                         state["cleanup_seen"] = True
@@ -350,9 +375,10 @@ def run(repository, environment, *, versioned_source=False):
                     return
                 historical_network = state and state["history_fault"] and (
                     (mode == "historydisconnect" and not database and not source and self.command == "HEAD")
-                    or (mode == "historystall" and source and self.command == "GET" and "tagging" in query))
+                    or (mode == "historystall" and source and self.command == "GET" and "tagging" in query)
+                    or (mode == "historymarkerstall" and not database and not source and self.command == "HEAD" and query.get("versionId", [None])[0] in state["target_marker_versions"]))
                 if historical_network:
-                    if mode == "historystall":
+                    if mode in ("historystall", "historymarkerstall"):
                         stopped.wait(15)
                     self.close_connection = True
                     try:
@@ -382,6 +408,10 @@ def run(repository, environment, *, versioned_source=False):
                         if created_version := response.getheader("x-amz-version-id"):
                             with guard:
                                 state["target_data_versions"].append(created_version)
+                    if target_deleting and "versionId" not in query and 200 <= response.status < 300:
+                        if created_version := response.getheader("x-amz-version-id"):
+                            with guard:
+                                state["target_marker_versions"].append(created_version)
                     rewritten = source and "versions" in query and mode == "contradictory" and state["cleanup_seen"] and response.status == 200
                     if rewritten:
                         document = ET.fromstring(payload)
@@ -452,20 +482,31 @@ def run(repository, environment, *, versioned_source=False):
                            cwd=repository, env=environment, check=True, timeout=360)
             if environment.get("LAB_OBJECT_HISTORY_ONLY") == "true":
                 summaries = [report for report in reports if report["is_final"] and not report.get("diagnostics")]
-                assert len(states) == 20 and len(summaries) == 22 and all(report["diagnostics_complete"] for report in summaries)
-                assert sum(report["migration"]["phase"] == "failed" for report in summaries) == 14
+                assert len(states) == 36 and len(summaries) == 40 and all(report["diagnostics_complete"] for report in summaries)
+                assert sum(report["migration"]["phase"] == "failed" for report in summaries) == 20
                 assert all(state["history_fault"] for state in states.values() if state["initial"] in HISTORY_DATA_MODES and state["initial"] != "historydata")
-                for mode in HISTORY_DATA_MODES[1:]:
+                assert all(state["history_fault"] for state in states.values() if state["initial"] in HISTORY_MARKER_MODES[1:])
+                for mode in (*HISTORY_DATA_MODES[1:], *HISTORY_MARKER_MODES[1:]):
                     failed = [report for report in summaries if report["job_id"].endswith("_" + mode)]
                     assert len(failed) == 2 and all(report["task_error_count"] == 1 and report["detail"]["error_count"] == 0 for report in failed)
-                print("independent focused history readiness deployments=2 normal=8 failure=14 callback_HTTP204=true source_retained_on_fault=true", flush=True)
+                for prefix, state in states.items():
+                    if state["initial"] not in HISTORY_MARKER_MODES[1:]: continue
+                    job = "objclean_" + prefix.replace("-", "_")
+                    details = [event for report in reports if report["job_id"] == job
+                               for event in (report.get("diagnostics") or {}).get("events", [])
+                               if event["code"] == "target_preserved" and event.get("path") == "payload"]
+                    assert len(details) == 1, (prefix, details)
+                    message = details[0]["message"]
+                    assert any("source_version=" + version + " " in message for version in state["source_marker_versions"]), (prefix, message)
+                    assert any('target_version=Some("' + version + '") ' in message for version in state["target_marker_versions"]), (prefix, message)
+                print("independent focused history readiness deployments=2 normal=20 failure=20 callback_HTTP204=true source_retained_on_fault=true", flush=True)
                 return
-            assert len(states) == (68 if versioned_source else 30) and all(state["inspections"] == (3 if state["initial"] == "unchangedbad" else 2 if state["initial"] not in ("normal", "historyguard", "missingcurrent", "large", *HISTORY_DATA_MODES) or (not versioned_source and state["target"] == "latest") else 1) for state in states.values()), states
+            assert len(states) == (84 if versioned_source else 30) and all(state["inspections"] == (3 if state["initial"] == "unchangedbad" else 2 if state["initial"] not in ("normal", "historyguard", "missingcurrent", "large", *HISTORY_DATA_MODES, *HISTORY_MARKER_MODES) or (not versioned_source and state["target"] == "latest") else 1) for state in states.values()), states
             assert sum(state["fact_released"] for state in states.values()) == (0 if versioned_source else 4), states
-            assert all(state["affected"] for state in states.values() if state["initial"] not in ("normal", "historyguard", "unchanged", "large", "historydata", "historyunchanged")), states
+            assert all(state["affected"] for state in states.values() if state["initial"] not in ("normal", "historyguard", "unchanged", "large", "historydata", "historyunchanged", "historymarkerunchanged", "historylatestmarker")), states
             summaries = [report for report in reports if report["is_final"] and not report.get("diagnostics")]
-            assert len(summaries) == (108 if versioned_source else 48) and all(report["diagnostics_complete"] for report in summaries), summaries
-            assert sum(report["migration"]["phase"] == "failed" for report in summaries) == (50 if versioned_source else 18)
+            assert len(summaries) == (126 if versioned_source else 48) and all(report["diagnostics_complete"] for report in summaries), summaries
+            assert sum(report["migration"]["phase"] == "failed" for report in summaries) == (56 if versioned_source else 18)
             events = {event["event_id"]: event for report in reports
                       for event in (report.get("diagnostics") or {}).get("events", [])}
             purge = [event for event in events.values() if event.get("retention", {}).get("reason") == "source_deletion_unconfirmed"]
@@ -475,10 +516,12 @@ def run(repository, environment, *, versioned_source=False):
                 assert len(large) == 2 and all(report["detail"]["scanned_files"] == 1 and report["detail"]["transferred_bytes"] == len(BODY) and report["task_error_count"] == 0 for report in large), large
                 for mode, reason in (("missingcurrent", "无法重新确认版本化源"), ("sourcechanged", "source history changed"),
                                      ("metaread", "PermissionDenied"), ("metachanged", "Tags"),
-                                     ("historyguard", "永久清理不可用"), ("unchangedbad", "Content"),
+                                     ("unchangedbad", "Content"),
                                      ("historytags", "Tags"), ("historysource", "Tags"),
                                      ("historymissing", "NotFound"), ("historygap", "段内事实缺失"),
-                                     ("historydisconnect", "Connectivity"), ("historystall", "Timeout")):
+                                     ("historydisconnect", "Connectivity"), ("historystall", "Timeout"),
+                                     ("historymarkermissing", "NotFound"), ("historymarkerreplace", "Conflict"),
+                                     ("historymarkerstall", "Timeout"), ("historymarkersource", "NotFound")):
                     failures = [report for report in summaries if report["job_id"].endswith("_" + mode) and report["migration"]["phase"] == "failed"]
                     assert len(failures) == 2 and all(report["task_error_count"] == 1 for report in failures), failures
                     details = [event for report in reports if report["job_id"].endswith("_" + mode)
@@ -537,7 +580,7 @@ def run(repository, environment, *, versioned_source=False):
             for role, bucket in buckets.items():
                 assert client.get_object(Bucket=bucket, Key="sentinel")["Body"].read() == b"retain sentinel"
                 assert not client.list_multipart_uploads(Bucket=bucket).get("Uploads")
-            print(f"independent object cleanup source_versioned={versioned_source} deployments=2 normal={24 if versioned_source else 12} failures={50 if versioned_source else 18} recovery={34 if versioned_source else 18} HTTP_204=true final_reports_saved=true source_deleting_base_empty=true all_recovery_generations_full=true unchanged_incremental_has_no_data_recopy={versioned_source} large_history_records_per_key={256 if versioned_source else 0}", flush=True)
+            print(f"independent object cleanup source_versioned={versioned_source} deployments=2 normal={36 if versioned_source else 12} failures={56 if versioned_source else 18} recovery={34 if versioned_source else 18} HTTP_204=true final_reports_saved=true source_deleting_base_empty=true all_recovery_generations_full=true unchanged_incremental_has_no_data_recopy={versioned_source} large_history_records_per_key={256 if versioned_source else 0}", flush=True)
         finally:
             stopped.set()
             relay.shutdown()
