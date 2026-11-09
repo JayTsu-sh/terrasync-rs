@@ -1,6 +1,7 @@
 """Real unversioned S3 source cleanup, isolated services and independent final reads."""
 import http.client
 import http.server
+import copy
 import json
 import os
 from pathlib import Path
@@ -11,6 +12,7 @@ import threading
 import time
 import urllib.parse
 import uuid
+import xml.etree.ElementTree as ET
 
 import boto3
 from botocore.config import Config
@@ -220,7 +222,7 @@ def run(repository, environment, *, versioned_source=False):
                         state["source_tags"] += 1
                     if source and self.command == "GET" and "tagging" not in query and path.endswith("/" + prefix + "/payload"):
                         state["source_data_reads"] += 1
-                    mutating_observation = versioned_source and source and self.command == "HEAD" and "versionId" not in query and path.endswith("/" + prefix + "/payload") and mode in ("missingcurrent", "sourcechanged", "metaread", "metachanged") and not state["cleanup_seen"]
+                    mutating_observation = versioned_source and source and self.command == "HEAD" and "versionId" not in query and path.endswith("/" + prefix + "/payload") and mode in ("missingcurrent", "sourcechanged", "metaread", "metachanged", "contradictory") and not state["cleanup_seen"]
                     if mutating_observation:
                         state["cleanup_seen"] = True
                         key = f"{prefix}/payload"
@@ -285,6 +287,16 @@ def run(repository, environment, *, versioned_source=False):
                     connection.request(self.command, self.path, body=body, headers=headers)
                     response = connection.getresponse()
                     payload = response.read()
+                    rewritten = source and "versions" in query and mode == "contradictory" and state["cleanup_seen"] and response.status == 200
+                    if rewritten:
+                        document = ET.fromstring(payload)
+                        if document.tag.startswith("{"):
+                            ET.register_namespace("", document.tag[1:].partition("}")[0])
+                        latest = next(node for node in document if node.tag.rsplit("}", 1)[-1] == "Version" and node.find("{*}IsLatest").text == "true")
+                        duplicate = copy.deepcopy(latest)
+                        duplicate.find("{*}IsLatest").text = "false"
+                        document.insert(list(document).index(latest) + 1, duplicate)
+                        payload = ET.tostring(document, encoding="utf-8")
                     if deleting:
                         with guard:
                             if versioned_source:
@@ -302,7 +314,7 @@ def run(repository, environment, *, versioned_source=False):
                         return
                     self.send_response(response.status)
                     for name, value in response.getheaders():
-                        if name.lower() not in ("connection", "content-length", "transfer-encoding") and not (verifying and name.lower().startswith("x-amz-checksum")):
+                        if name.lower() not in ("connection", "content-length", "transfer-encoding") and not ((verifying or rewritten) and name.lower().startswith("x-amz-checksum")):
                             self.send_header(name, value)
                     self.send_header("Content-Length", response.getheader("Content-Length", "0") if self.command == "HEAD" else str(len(payload)))
                     self.end_headers()
@@ -330,16 +342,16 @@ def run(repository, environment, *, versioned_source=False):
                             "copy_execution::object_cleanup_tests::real_unversioned_object_source_cleanup_and_failures",
                             "--", "--ignored", "--exact", "--nocapture", "--test-threads=1"],
                            cwd=repository, env=environment, check=True, timeout=360)
-            assert len(states) == (42 if versioned_source else 30) and all(state["inspections"] == (3 if state["initial"] == "unchangedbad" else 2 if state["initial"] not in ("normal", "historyguard", "missingcurrent", "large") or (not versioned_source and state["target"] == "latest") else 1) for state in states.values()), states
+            assert len(states) == (44 if versioned_source else 30) and all(state["inspections"] == (3 if state["initial"] == "unchangedbad" else 2 if state["initial"] not in ("normal", "historyguard", "missingcurrent", "large") or (not versioned_source and state["target"] == "latest") else 1) for state in states.values()), states
             assert sum(state["fact_released"] for state in states.values()) == (0 if versioned_source else 4), states
             assert all(state["affected"] for state in states.values() if state["initial"] not in ("normal", "historyguard", "unchanged", "large")), states
             summaries = [report for report in reports if report["is_final"] and not report.get("diagnostics")]
-            assert len(summaries) == (72 if versioned_source else 48) and all(report["diagnostics_complete"] for report in summaries), summaries
-            assert sum(report["migration"]["phase"] == "failed" for report in summaries) == (30 if versioned_source else 18)
+            assert len(summaries) == (76 if versioned_source else 48) and all(report["diagnostics_complete"] for report in summaries), summaries
+            assert sum(report["migration"]["phase"] == "failed" for report in summaries) == (32 if versioned_source else 18)
             events = {event["event_id"]: event for report in reports
                       for event in (report.get("diagnostics") or {}).get("events", [])}
             purge = [event for event in events.values() if event.get("retention", {}).get("reason") == "source_deletion_unconfirmed"]
-            assert len(purge) == (12 if versioned_source else 8) and all(event["retention"]["source_presence"] == "unknown" and event["path"] == "payload" for event in purge), purge
+            assert len(purge) == (14 if versioned_source else 8) and all(event["retention"]["source_presence"] == "unknown" and event["path"] == "payload" for event in purge), purge
             if versioned_source:
                 large = [report for report in summaries if report["job_id"].endswith("_large")]
                 assert len(large) == 2 and all(report["detail"]["scanned_files"] == 1 and report["detail"]["transferred_bytes"] == len(BODY) and report["task_error_count"] == 0 for report in large), large
@@ -351,6 +363,9 @@ def run(repository, environment, *, versioned_source=False):
                     details = [event for report in reports if report["job_id"].endswith("_" + mode)
                                for event in (report.get("diagnostics") or {}).get("events", []) if event["code"] == "target_preserved" and event.get("path") == "payload"]
                     assert len(details) == 2 and all(reason in event["message"] for event in details), (mode, details)
+                contradictory = [event for report in reports if report["job_id"].endswith("_contradictory")
+                                 for event in (report.get("diagnostics") or {}).get("events", []) if event["code"] == "target_preserved" and event.get("path") == "payload"]
+                assert len(contradictory) == 2 and all("current and historical" in event["message"] and "Protocol" in event["message"] for event in contradictory), contradictory
             for mode in ("data", "metadata"):
                 failures = [report for report in summaries if report["job_id"].endswith("_" + mode) and report["migration"]["phase"] == "failed"]
                 assert len(failures) == 2 and all(report["detail"]["error_count"] == 1 for report in failures), failures
@@ -382,7 +397,7 @@ def run(repository, environment, *, versioned_source=False):
             for role, bucket in buckets.items():
                 assert client.get_object(Bucket=bucket, Key="sentinel")["Body"].read() == b"retain sentinel"
                 assert not client.list_multipart_uploads(Bucket=bucket).get("Uploads")
-            print(f"independent object cleanup source_versioned={versioned_source} deployments=2 normal={16 if versioned_source else 12} failures={30 if versioned_source else 18} recovery={26 if versioned_source else 18} HTTP_204=true final_reports_saved=true source_deleting_base_empty=true all_recovery_generations_full=true unchanged_incremental_has_no_data_recopy={versioned_source} large_history_records_per_key={256 if versioned_source else 0}", flush=True)
+            print(f"independent object cleanup source_versioned={versioned_source} deployments=2 normal={16 if versioned_source else 12} failures={32 if versioned_source else 18} recovery={28 if versioned_source else 18} HTTP_204=true final_reports_saved=true source_deleting_base_empty=true all_recovery_generations_full=true unchanged_incremental_has_no_data_recopy={versioned_source} large_history_records_per_key={256 if versioned_source else 0}", flush=True)
         finally:
             stopped.set()
             relay.shutdown()

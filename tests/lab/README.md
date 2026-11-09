@@ -1130,3 +1130,35 @@ source_cleanup 25 项通过／8 项 ignored，最后 app/all-targets Clippy 通�
 `fcb480c4a6efe557339efe1b14509374ac09b076cd85c1601e6a0398d6b99238`、
 `86924b205a1b19b2445394b78d684ab1284e217521caceae96fb58bc13ecd4b7`。
 Native 始终为 `8bfa329c`，本项独占容器全部清理。
+
+### 矛盾源版本清单在删除前拒绝（Native e294de47）
+
+固定 Native `e294de476202bfdb94bd493cb229ad5590ee5842`，沿用已有 purge_observed 与
+Protocol／Permanent；同批次同一版本 ID 同时标为当前和历史时，不得将当前记录排入旧历史删除。
+null 槽按相同规则处理，不新增公开接口、SDK 修改或正常路径请求。原生单元覆盖数据／标记、
+真实／null ID 及两种顺序共八个组合；两项新增单元已先验证旧版失败，再验证修复通过。
+真实 RustFS 清单注入覆盖数据／标记与两种顺序四组，独立读取原版本及哨兵完整保留、零删除。
+原生历史清理共 11 组、普通源清理 7 组通过；backend 416 项通过／2 项 ignored。
+原生完整 CI 范围分步通过，首次 Clippy 的夹具长度和随后示例链接空间问题已修正并补跑，
+最终严格 Clippy、全部示例及 Local E2E 通过；未将首次失败写成一次性全绿。
+
+主项目 `--copy-versioned-source-cleanup` 现为 Single／双副本共 76 轮：16 正常、32 失败、
+28 恢复。两种部署分别在目标已就绪后的源读取阶段启用矛盾清单，独立核验源四条历史及哨兵
+保留、零源删除、目标数据／tags 正确；HTTP 204 交付的路径明细包含 current and historical
+与 Protocol 原因，任务错误计一，最终报告保存、base 清空。下一代 Full 恢复并清除全部历史。
+共享 runner 的普通源 48 轮亦通过；主项目 fmt、workspace/all-targets check／Clippy、
+workspace 测试和 16 项串行远程回归通过（Rust 1.98.1，保留既有警告）。
+保护只基于当前批次可见证据，不声称全历史清单或并发写入下的原子保证；既定 key 独占要求不变。
+
+正常公共路径另与主项目 `f2d9a20`／Native `8bfa329c` 做十二轮交错 A/B；本次只换 Native
+清单保护。每轮 3000×1 KiB Local，平铺／100×30 目录、删源落库、独占 2 CPU Single
+ClickHouse、16／100000、unordered／Direct／quick，Rust 1.98.1 dev debug=0／incremental=0，
+构建与功能回归结束后计时。平铺耗时中位数 5.42→5.46 秒（+0.74%），峰值 RSS
+202.66→202.60 MiB；目录 5.28→5.03 秒（−4.73%），RSS 223.59→223.71 MiB（+0.06%），
+变更版目录最大约 226.55 MiB。每轮独立核验全部内容、源文件／目录删除、目录纳秒 mtime／mode、
+base 与最终报告；未配置 callback 的计划保留事件待外部接收，diagnostics_complete=false。
+小样本未见明显公共路径开销增长，不宣称加速、约 200 MiB 目标或新历史路径大规模性能达标。
+原始十二轮、50 ms RSS 采样、日志与程序在 `/tmp/terrasync-purge-conflicting-current-perf/`。
+基线／变更 SHA-256 为
+`86924b205a1b19b2445394b78d684ab1284e217521caceae96fb58bc13ecd4b7`、
+`e2ff05fe74da33b7cb41012a86aeffc39ea268a714b1e9faa3d9bb5b6b21445e`；独占容器已清理。

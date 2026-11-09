@@ -141,6 +141,7 @@ async fn round(config: &ClickHouseConfig, command: &SyncJobConfig, mode: &str, s
                     "readonly" => FailureClass::PermissionDenied,
                     "stall" => FailureClass::Timeout,
                     "sourcechanged" => FailureClass::Conflict,
+                    "contradictory" => FailureClass::Protocol,
                     _ => FailureClass::Connectivity,
                 }
             );
@@ -344,7 +345,13 @@ async fn real_unversioned_object_source_cleanup_and_failures() -> Result<()> {
                 case(&config, deployment, "latest", true, mode).await?;
             }
             if environment("LAB_OBJECT_CLEANUP_VERSIONED").is_ok_and(|value| value == "true") {
-                for mode in ["missingcurrent", "sourcechanged", "metaread", "metachanged"] {
+                for mode in [
+                    "missingcurrent",
+                    "sourcechanged",
+                    "metaread",
+                    "metachanged",
+                    "contradictory",
+                ] {
                     case(&config, deployment, "latest", false, mode).await?;
                 }
                 case(&config, deployment, "history", false, "historyguard").await?;
