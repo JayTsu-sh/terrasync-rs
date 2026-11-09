@@ -10,24 +10,7 @@ use crate::copy_dispatch::{CopyQueues, partition_scan};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
-use task_model::ObservedEntryExt;
 use task_model::TransferMode;
-
-/// RAII guard：构造时 +1，Drop 时 -1，确保计数器在 panic/early-return 时也能正确回收。
-struct AtomicCounterGuard<'a>(&'a AtomicUsize);
-
-impl<'a> AtomicCounterGuard<'a> {
-    fn increment(counter: &'a AtomicUsize) -> Self {
-        counter.fetch_add(1, Ordering::Relaxed);
-        Self(counter)
-    }
-}
-
-impl Drop for AtomicCounterGuard<'_> {
-    fn drop(&mut self) {
-        self.0.fetch_sub(1, Ordering::Relaxed);
-    }
-}
 
 // 外部 crate
 use crate::storage_factory::StorageContext;
@@ -47,8 +30,7 @@ use tokio::sync::Semaphore;
 use tokio::task::JoinHandle;
 use tracing::{Instrument, error, info, info_span, trace, warn};
 use transport::in_process::create_in_process_pair;
-use transport::message::SenderMsg;
-use transport::traits::{ReceiverTransport, SenderTransport};
+use transport::traits::SenderTransport;
 use utils::app_config::AppConfig;
 
 // 内部模块
@@ -60,11 +42,11 @@ use crate::copy_execution::{CopyDatabaseExecution, CopyLease, begin_copy_catalog
 use crate::copy_history::{HistoryCompletion, HistoryCopyPolicy};
 use crate::dir_walker::DirectoryWalker;
 use crate::error::{AppError, Result};
-use crate::file_copy::{CopyOptions, VersionFailureContext};
+use crate::file_copy::CopyOptions;
 #[cfg(feature = "license")]
 use crate::integrity_check::verify_storage_time;
 use crate::migration_plan::MigrationPlan;
-use crate::receiver::{ReceiverConfig, process_entry_on_receiver};
+use crate::receiver::{LocalCopyReceiver, ReceiverConfig};
 use crate::scan::ScanType;
 use crate::sender::{SenderWorkerConfig, sender_worker};
 use crate::source_cleanup::{self, EarlyCleanup, FullCleanupStage, SourceCleanupCheck, remove_confirmed_sources};
@@ -718,76 +700,19 @@ impl SyncOrchestrator {
                         let _ = connections.set((src.clone(), dest.clone()));
                     }
 
-                    // 从 transport 拉消息处理（MPMC，N 个 worker 竞争消费）
-                    let mut failure = None;
-                    while let Some(msg) = rt.recv().await {
-                        match msg {
-                            SenderMsg::CopyEntry { entry } => {
-                                let _guard = AtomicCounterGuard::increment(&task_counter);
-                                match process_entry_on_receiver(&entry, &src, &dest, &cfg, qos.clone(), bt.clone())
-                                    .await
-                                {
-                                    Ok(()) => {
-                                        bc.broadcast(StorageEntryMessage::New(entry.into())).await?;
-                                    }
-                                    Err(e) => {
-                                        error!(
-                                            "Receiver {}: CopyEntry failed {:?}: {}",
-                                            recv_id,
-                                            entry.get_relative_path(),
-                                            e
-                                        );
-                                        let context = e.storage_error().map_or_else(
-                                            || VersionFailureContext {
-                                                phase: "copy_entry".into(),
-                                                backend: dest.storage().kind(),
-                                                metadata_only: false,
-                                            },
-                                            |error| {
-                                                VersionFailureContext::for_error(
-                                                    error,
-                                                    src.storage().kind(),
-                                                    dest.storage().kind(),
-                                                )
-                                            },
-                                        );
-                                        let data_failed = !context.metadata_only;
-                                        bc.broadcast(StorageEntryMessage::CopyVersionFailed {
-                                            entry: entry.clone().into(),
-                                            phase: context.phase,
-                                            backend: context.backend,
-                                            reason: e.to_string(),
-                                            first_in_entry: true,
-                                        })
-                                        .await?;
-                                        failure.get_or_insert(AppError::ReportedCopyFailure {
-                                            source: Box::new(e),
-                                            data_failed,
-                                        });
-                                    }
-                                }
-                            }
-                            SenderMsg::TarPacked {
-                                tar_entry,
-                                manifest_entries,
-                            } => {
-                                let tar_path = tar_entry.get_relative_path().to_string_lossy().to_string();
-                                bc.broadcast(StorageEntryMessage::New(tar_entry.into())).await?;
-                                bc.broadcast(StorageEntryMessage::TarManifest {
-                                    tar_path,
-                                    entries: manifest_entries,
-                                })
-                                .await?;
-                            }
-                            _ => {}
-                        }
+                    LocalCopyReceiver {
+                        id: recv_id,
+                        transport: rt,
+                        source: src,
+                        destination: dest,
+                        config: cfg,
+                        qos,
+                        bytes: bt,
+                        broadcaster: bc,
+                        active: task_counter,
                     }
-                    // recv() 返回 None 时自然退出（sender_transport 被 drop 后 channel 关闭）
-                    info!("Receiver {}: Completed", recv_id);
-                    match failure {
-                        Some(error) => Err(error),
-                        None => Ok(()),
-                    }
+                    .run()
+                    .await
                 })
                 .instrument(span),
             );
