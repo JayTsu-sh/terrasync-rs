@@ -2,9 +2,9 @@
 
 use std::time::{Duration, Instant};
 
-use clickhouse::{error::Error as ClickHouseError, query::Query};
+use clickhouse::{RowOwned, RowRead, error::Error as ClickHouseError, query::Query};
 use data_mover::model::ObservedEntry;
-use task_model::ChangeKind;
+use task_model::{ChangeKind, CopyCompletion};
 use tokio::sync::mpsc;
 use tracing::{debug, trace};
 use utils::sanitize_job_id;
@@ -15,9 +15,9 @@ use crate::error::{DatabaseError, Result};
 use crate::execution::queries::{check_scan_cancellation, scan_retry_delay};
 use crate::execution::read::QuorumRead;
 use crate::get_scan_base_table_name;
-use crate::schema::columns::SNAPSHOT_COLUMNS;
+use crate::schema::columns::{COPY_SNAPSHOT_COLUMNS, SNAPSHOT_COLUMNS};
 use crate::schema::identity::PERSISTED_IDENTITY_PREFIX;
-use crate::schema::records::{SnapshotRow, StorageEntryRecord};
+use crate::schema::records::{CopySnapshotRow, SnapshotRow, StorageEntryRecord};
 
 fn records_to_entry_iter(records: Vec<StorageEntryRecord>) -> Result<Box<dyn Iterator<Item = ObservedEntry> + Send>> {
     let entries = records
@@ -158,13 +158,15 @@ impl ClickHouseDatabase {
         &self, is_dir: Option<bool>, is_symlink: Option<bool>, extension: Option<String>,
         tx: mpsc::Sender<ObservedEntry>,
     ) -> Result<()> {
-        self.query_entries(None, is_dir, is_symlink, extension, tx).await
+        let query = self.entries_query(None, is_dir, is_symlink, extension, SNAPSHOT_COLUMNS);
+        self.send_catalogue_records(query, tx, SnapshotRow::into_observation)
+            .await
     }
 
-    /// 只交付本次重新选中且目标已确认的事实；旧 C/W 相等不构成执行授权。
+    /// 交付本次重新选中且目标已确认的源事实及实际目标版本；旧 C/W 相等不构成执行授权。
     pub async fn query_current_copy_entries(
         &self, is_dir: Option<bool>, is_symlink: Option<bool>, extension: Option<String>,
-        tx: mpsc::Sender<ObservedEntry>,
+        tx: mpsc::Sender<CopyCompletion>,
     ) -> Result<()> {
         let execution = self
             .generation_lifecycle
@@ -173,14 +175,15 @@ impl ClickHouseDatabase {
             .copy_execution_id
             .clone()
             .ok_or(DatabaseError::CopyExecutionUnavailable)?;
-        self.query_entries(Some(execution), is_dir, is_symlink, extension, tx)
+        let query = self.entries_query(Some(execution), is_dir, is_symlink, extension, COPY_SNAPSHOT_COLUMNS);
+        self.send_catalogue_records(query, tx, CopySnapshotRow::into_completion)
             .await
     }
 
-    async fn query_entries(
+    fn entries_query(
         &self, execution: Option<String>, is_dir: Option<bool>, is_symlink: Option<bool>, extension: Option<String>,
-        tx: mpsc::Sender<ObservedEntry>,
-    ) -> Result<()> {
+        columns: &str,
+    ) -> Query {
         let base_table_name = get_scan_base_table_name(&self.job_id);
         debug!("[query_storage_entry] base table name: {}", base_table_name);
 
@@ -211,7 +214,7 @@ impl ClickHouseDatabase {
 
         // 子项先于父目录收尾，避免父目录的只读权限阻断子项元数据和清理。
         let query = format!(
-            "SELECT {SNAPSHOT_COLUMNS} FROM {base_table_name} FINAL {where_clause} ORDER BY length(splitByChar('/', relative_path)) DESC, relative_path"
+            "SELECT {columns} FROM {base_table_name} FINAL {where_clause} ORDER BY length(splitByChar('/', relative_path)) DESC, relative_path, history_segment, history_index"
         );
 
         let mut q = self.sync_client.query(&query);
@@ -221,12 +224,14 @@ impl ClickHouseDatabase {
         if let Some(ext) = ext_bind {
             q = q.bind(ext);
         }
-        self.send_catalogue_records(q, tx).await
+        q
     }
 }
 
 impl ClickHouseDatabase {
-    pub(super) async fn send_catalogue_records(&self, query: Query, tx: mpsc::Sender<ObservedEntry>) -> Result<()> {
+    async fn send_catalogue_records<R: RowOwned + RowRead, T>(
+        &self, query: Query, tx: mpsc::Sender<T>, decode: fn(R) -> Result<T>,
+    ) -> Result<()> {
         let started = Instant::now();
         let mut delivered = false;
         let mut retrying = false;
@@ -237,11 +242,11 @@ impl ClickHouseDatabase {
             } else {
                 query.clone()
             };
-            let mut cursor = request.fetch::<SnapshotRow>()?;
+            let mut cursor = request.fetch::<R>()?;
             loop {
                 match cursor.next().await {
                     Ok(Some(record)) => {
-                        tx.send(record.into_observation()?).await.map_err(|error| {
+                        tx.send(decode(record)?).await.map_err(|error| {
                             DatabaseError::QueryError(format!("Failed to send storage entry: {error}"))
                         })?;
                         delivered = true;

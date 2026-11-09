@@ -5,9 +5,11 @@ use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use clickhouse::Client;
+use data_mover::model::ObservedEntry;
 use db::catalogue::ClickHouseDatabase;
 use db::{ClickHouseConfig, CopyGenerationStatus, DatabaseError};
 use task_model::ObservedEntryExt;
+use task_model::observation::ObservedItem;
 use tempfile::TempDir;
 use tokio::sync::{Notify, oneshot};
 use tokio::time::{Duration, timeout};
@@ -50,7 +52,10 @@ async fn directory_query_failure_stays_typed_and_drains_updates() -> Result<()> 
     std::fs::create_dir(destination.path().join("present"))?;
     let (sender, receiver) = mpsc::channel(2);
     let query = tokio::spawn(async move {
-        sender.send(entry).await.map_err(|_| AppError::ScanWorkerStopped)?;
+        sender
+            .send(ObservedItem::from(Arc::new(entry)).into())
+            .await
+            .map_err(|_| AppError::ScanWorkerStopped)?;
         Err(DatabaseError::ConfigError("directory query regression fixture".into()).into())
     });
     let result = apply_directories(query, receiver, target(&destination).await?).await;
@@ -71,8 +76,14 @@ async fn directory_write_failure_stays_typed_and_drains_later_updates() -> Resul
     std::fs::create_dir(destination.path().join("present"))?;
     let (sender, receiver) = mpsc::channel(2);
     let query = tokio::spawn(async move {
-        sender.send(missing).await.map_err(|_| AppError::ScanWorkerStopped)?;
-        sender.send(present).await.map_err(|_| AppError::ScanWorkerStopped)?;
+        sender
+            .send(ObservedItem::from(Arc::new(missing)).into())
+            .await
+            .map_err(|_| AppError::ScanWorkerStopped)?;
+        sender
+            .send(ObservedItem::from(Arc::new(present)).into())
+            .await
+            .map_err(|_| AppError::ScanWorkerStopped)?;
         Ok(())
     });
     let result = apply_directories(query, receiver, target(&destination).await?).await;

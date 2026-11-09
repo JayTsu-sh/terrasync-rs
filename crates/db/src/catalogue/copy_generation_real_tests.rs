@@ -9,7 +9,8 @@ use clickhouse::Client;
 use serde::Deserialize;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
-use tokio::time::timeout;
+use tokio::sync::mpsc;
+use tokio::time::{sleep, timeout};
 use utils::app_config::ClickHouseMode;
 use uuid::Uuid;
 
@@ -20,7 +21,7 @@ use crate::execution::base_client;
 use crate::observed_fixtures::observation;
 use crate::schema::identity::encoded_file_handle;
 use crate::{ClickHouseConfig, ClickHouseDatabase, DatabaseError, Result};
-use data_mover::model::{BackendKind, EntryKind, HistoryOrder, ObjectHistory, ObservedEntry};
+use data_mover::model::{BackendKind, EntryKind, HistoryOrder, ObjectHistory, ObservedEntry, VersionRecord};
 use task_model::observation::ObservedItem;
 use task_model::{ChangeKind, CopyCompletion, CopyReadiness, EntryChange};
 
@@ -426,6 +427,185 @@ async fn delayed_copy_ack_cannot_restore_metadata_readiness(fixture: &Fixture) -
     Ok(())
 }
 
+async fn read_current_completions(database: &ClickHouseDatabase) -> Result<Vec<CopyCompletion>> {
+    let (sender, mut receiver) = mpsc::channel(1);
+    let collect = async {
+        let mut rows = Vec::new();
+        while let Some(row) = receiver.recv().await {
+            rows.push(row);
+        }
+        rows
+    };
+    let (result, rows) = tokio::join!(database.query_current_copy_entries(None, None, None, sender), collect);
+    result?;
+    Ok(rows)
+}
+
+async fn copy_binding_read_faults(fixture: &Fixture, database: &ClickHouseDatabase) -> Result<()> {
+    for fault in ["disconnect", "stall", "flash", "cancel"] {
+        fixture
+            .fault(if fault == "flash" {
+                "disconnect"
+            } else if fault == "cancel" {
+                "stall"
+            } else {
+                fault
+            })
+            .await?;
+        let started = Instant::now();
+        if fault == "cancel" {
+            assert!(
+                timeout(Duration::from_millis(250), read_current_completions(database))
+                    .await
+                    .is_err()
+            );
+        } else {
+            let read = read_current_completions(database);
+            let result = if fault == "flash" {
+                let restore = async {
+                    sleep(Duration::from_millis(100)).await;
+                    fixture.fault("normal").await
+                };
+                let (result, restored) = tokio::join!(read, restore);
+                restored?;
+                result
+            } else {
+                read.await
+            };
+            assert!(
+                matches!(
+                    result,
+                    Err(DatabaseError::ClickHouseError(_) | DatabaseError::RequestOutcomeUnconfirmed { .. })
+                ),
+                "{result:?}"
+            );
+        }
+        let elapsed = started.elapsed();
+        fixture.fault("normal").await?;
+        assert!(elapsed < Duration::from_secs(6), "{fault}: {elapsed:?}");
+        assert_eq!(read_current_completions(database).await?.len(), 3);
+        eprintln!(
+            "copy-binding-read cluster={} fault={fault} elapsed={elapsed:?} explicit_retry_recovers=true no_read_authority_inferred=true",
+            fixture.config.cluster.is_some()
+        );
+    }
+    Ok(())
+}
+
+async fn selected_copy_bindings_roundtrip(fixture: &Fixture, history_target: bool) -> Result<()> {
+    let job = format!("read_copy_bindings_{history_target}");
+    let descriptor = || {
+        let mut descriptor = request("copy-binding-readback", true);
+        descriptor.binding.target_history = history_target;
+        descriptor
+    };
+    let versions: Vec<_> = [
+        (Some("old"), false, false),
+        (None, false, true),
+        (Some("new"), true, false),
+    ]
+    .into_iter()
+    .map(|(id, latest, marker)| {
+        observation(
+            BackendKind::S3,
+            "payload".into(),
+            EntryKind::File,
+            7,
+            [0, 11, 0],
+            None,
+            None,
+            (!marker).then(|| vec![("raw".into(), id.unwrap_or("null").into())]),
+            Some((id.map(str::to_owned), latest, marker)),
+        )
+    })
+    .collect();
+    let records = versions
+        .iter()
+        .flat_map(|entry| {
+            entry
+                .history()
+                .into_iter()
+                .flat_map(|history| history.records().iter().cloned())
+        })
+        .collect();
+    let entries: Vec<_> = versions[2]
+        .clone()
+        .with_history(Some(Box::new(ObjectHistory::whole(records, HistoryOrder::Server)?)))?
+        .into_segments(1)
+        .into_iter()
+        .map(Arc::new)
+        .collect();
+    let selected: Vec<_> = entries
+        .iter()
+        .flat_map(ObservedItem::all)
+        .filter(|item| history_target || item.view().version().is_some_and(VersionRecord::is_latest))
+        .collect();
+    let database = fixture.open(&job).await?;
+    database.begin_copy_generation(&descriptor()).await?;
+    let mut completions: Vec<_> = selected
+        .into_iter()
+        .map(|item| CopyCompletion {
+            target_version: Some(format!("target-{}", item.view().version_id())),
+            item,
+            readiness: CopyReadiness::Ready,
+        })
+        .collect();
+    completions[0].readiness = CopyReadiness::DataOnly;
+    database.batch_insert_copy_completions(&completions).await?;
+    let ready = read_current_completions(&database).await?;
+    assert_eq!(ready.len(), completions.len() - 1, "数据完成不代表元数据就绪");
+    completions[0].readiness = CopyReadiness::Ready;
+    completions[0].target_version = None;
+    database.batch_insert_copy_completions(&completions[..1]).await?;
+    let missing = read_current_completions(&database).await?;
+    assert_eq!(missing.len(), completions.len());
+    assert_eq!(missing[0].target_version, None, "缺少绑定不能从源版本推断");
+    completions[0].target_version = Some(format!("target-{}", completions[0].item.view().version_id()));
+    database.batch_insert_copy_completions(&completions[..1]).await?;
+    let check = |ready: &[CopyCompletion]| {
+        assert_eq!(ready.len(), completions.len());
+        for (actual, expected) in ready.iter().zip(&completions) {
+            assert_eq!(actual.readiness, CopyReadiness::Ready);
+            assert_eq!(actual.item.view().version_id(), expected.item.view().version_id());
+            assert_eq!(actual.item.view().metadata(), expected.item.view().metadata());
+            assert_eq!(actual.target_version, expected.target_version);
+            assert!(
+                actual
+                    .item
+                    .entry
+                    .history()
+                    .is_some_and(|history| history.records().len() == 1)
+            );
+        }
+    };
+    check(&read_current_completions(&database).await?);
+    if history_target {
+        copy_binding_read_faults(fixture, &database).await?;
+    }
+    database.commit_scan_generation().await?;
+    database.finish_copy_generation(CopyGenerationPhase::Completed).await?;
+    let next = database.new_execution_scope();
+    next.begin_copy_generation(&descriptor()).await?;
+    assert!(
+        read_current_completions(&next).await?.is_empty(),
+        "上轮事实没有本次选中授权"
+    );
+    assert!(
+        next.compare_catalogue_batch(&entries, ComparisonMode::AwaitCopyAcknowledgement)
+            .await?
+            .is_empty()
+    );
+    check(&read_current_completions(&next).await?);
+    next.commit_scan_generation().await?;
+    next.finish_copy_generation(CopyGenerationPhase::Completed).await?;
+    eprintln!(
+        "copy-binding-readback cluster={} history_target={history_target} selected_versions={} source_order=true raw_metadata_and_actual_bindings=true data_only_excluded=true missing_binding_not_inferred=true current_execution_required=true",
+        fixture.config.cluster.is_some(),
+        completions.len()
+    );
+    Ok(())
+}
+
 #[tokio::test]
 #[ignore = "requires an isolated ClickHouse pair and fault proxy from run-notification-archive-local.py --copy-generations"]
 async fn real_copy_generation_policies() -> Result<()> {
@@ -442,6 +622,8 @@ async fn real_copy_generation_policies() -> Result<()> {
                 }
             }
             delayed_copy_ack_cannot_restore_metadata_readiness(&fixture).await?;
+            selected_copy_bindings_roundtrip(&fixture, false).await?;
+            selected_copy_bindings_roundtrip(&fixture, true).await?;
             version_slots(&fixture, false).await?;
             version_slots(&fixture, true).await?;
             read_faults(&fixture).await

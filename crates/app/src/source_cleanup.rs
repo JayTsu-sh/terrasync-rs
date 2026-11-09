@@ -80,7 +80,8 @@ pub(crate) async fn remove_confirmed_sources(
     let query = AbortOnDropHandle::new(tokio::spawn(async move {
         database.query_current_copy_entries(None, None, None, sender).await
     }));
-    while let Some(entry) = receiver.recv().await {
+    while let Some(completion) = receiver.recv().await {
+        let entry = completion.item.entry;
         if check.is_prechecked(&entry) {
             continue;
         }
