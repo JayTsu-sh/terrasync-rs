@@ -1652,3 +1652,138 @@ performance samples, so their planned retention events are undelivered
 certify a 200 MiB ceiling, release/large workloads, sustained memory growth,
 other backends or the shared cross-stage network-jitter budget. Database-independent
 directory finalization and all-entry asynchronous cleanup remain pending.
+
+
+### Reported entry failure must drain already published facts (2026-11-09)
+
+Main commit `d241814` distinguishes an already reported entry outcome from a
+fatal execution/database failure. Both still fail the task. The former leaves
+the fact scope open to drain; the latter saves the original typed cause and
+cancels peers. A later fatal peer cannot be hidden by an earlier reported entry
+result at the root. Storage/copy layers keep their original responsibilities;
+there is no additional IO, buffer, per-file receipt or source-deletion gate.
+
+The existing 56-generation metadata regression failed on both main 229e8dd in
+an isolated clean worktree and the metadata-cancellation candidate: source tags
+were denied, but the expected one DataOnly fact disappeared before flush.
+A deterministic red test confirmed `run_child` cancelled the fact scope for
+`ReportedCopyFailure`. The isolated fix and its two regression tests passed
+five Rust CI checks, app 350 passed/47 ignored and 16 remote-process scenarios.
+The temporary worktree was removed after cherry-picking the independent fix.
+Its build-generated npm lockfile change was restored and not committed.
+
+The real 56-generation suite then passes Single/two-replica, latest/history,
+quick/full, repeated source-tag acquisition and destination-tag application
+failures, recovery and old-version-only metadata changes. It retains all raw
+facts and actual target-version bindings, with zero body replay in the six
+incremental rounds per case. Independent HTTP 204 inspection checks 32 failed
+logical entries, 80 version causes, 40 source observation errors and 40
+conservative retained ranges, no extra task errors, and queryable final reports.
+A separate final run covers 16 real database disconnect/stall failures and eight
+checkpoint recoveries, checking retained sources, Direct cleanup, checkpoint
+reuse and complete callbacks. Fault-to-stop time includes detection and final
+notification and is not a universal three-second recovery claim.
+
+Evidence: `/tmp/terrasync-metadata-cancel-{baseline-version56,version56}-real.log`
+are the two original failing runs;
+`/tmp/terrasync-reported-entry-fact-drain-red-runtime.log` is the focused red;
+`/tmp/terrasync-reported-entry-fact-drain-{focused,version56-real,final-active-data-real}.log`
+are successful focused, metadata and final fatal-database checks.
+`/tmp/terrasync-reported-entry-fact-drain-ci-results.json` records final five-check
+results; the driver is `-final-ci-driver.log`. Existing typed large-error warnings
+remain. This fixes deterministic lost facts after reported copy errors, without
+removing the existing allowance for genuinely unavailable asynchronous facts.
+
+### Metadata-only cancellation and matched normal-path measurements (2026-11-09)
+
+`python3 tests/lab/run-notification-archive-local.py --metadata-cancel` runs six
+real S3 cases, using owned held tags PUT/GET requests for ordinary metadata-only
+updates, selected current updates and explicitly bound historical updates.
+The existing app metadata helpers now accept the caller's optional cancellation
+and share it between application and readback. Ordinary incremental workers
+forward their existing token instead of recreating default options, and the
+selected-version workflow forwards `CopyOptions.cancel`. No data-mover public
+function/type was added. Other helper callsites explicitly retain their previous
+independent execution semantics; directory finalization, rename and remote
+session cancellation remain pending work.
+
+Two new deterministic tests cover pre-cancelled updates and in-flight application/
+verification in both workflows, with typed cancellation, no success publication,
+and both bodies retained. Three additional actual-worker regressions cover an
+open idle producer, 128 queued metadata entries and a prior real metadata error.
+The incremental worker checks cancellation before dequeue, closes its input and
+settles started history; it does not drop in-flight storage work or count
+unstarted entries as failures. These cases exit within 0.5 seconds and preserve
+the earlier typed cause. Their red and green logs are
+`/tmp/terrasync-incremental-metadata-queue-cancel-{red,focused}.log`.
+The real S3 function-level cancellation cases return
+within one second of the caller signal. The independent target proxy observes
+zero data GET, data PUT or DELETE, exactly one held request per case and exact
+historical version selectors. Recovery applies only tags; source/target bodies,
+record count and current head remain correct. This is not a full CLI user-cancel,
+NFS/other-protocol or shared network-jitter-budget certification.
+
+After integrating the independent fact-drain fix, five Rust CI checks pass again:
+app 355 passed/48 ignored, all 16 serial remote-process scenarios, Rust 1.98.1.
+The 56-generation metadata suite and six real S3 cancellations pass on the
+combined source. Final logs are `/tmp/terrasync-metadata-cancel-final-{fmt,check,clippy,tests,remote}.log`
+and `-final-{six,version56,active-data}-real.log`. The final sequential CI/runtime/
+build driver and results are `/tmp/terrasync-metadata-cancel-final-validation-{driver.log,results.json}`;
+five-check results are `/tmp/terrasync-metadata-cancel-final-ci-results.json`.
+This final run also repeats all 16 real database failures/eight checkpoint recoveries.
+The red is `/tmp/terrasync-metadata-cancel-red.log`. The first new S3 fixture
+wrongly rejected the normal bucket-versioning connection probe; only its proxy
+was fixed. That failed run is preserved at
+`/tmp/terrasync-metadata-cancel-bucket-probe-fixture-first-real.log`.
+
+Fixed full-CLI before SHA-256 (229e8dd):
+`44749452931678ac92f09bcde0e49b666b4921ebfcba958e0c59107a8f682a7c`.
+After (d241814 plus metadata cancellation and incremental queue guard):
+`3e13852acce572092bd4e272807cae63f93f41beaf6bd243bc30c5e236a92418`.
+Both use Native 45e70fa, Rust 1.98.1 dev/debug0, 16/100000 and
+unordered/Direct/quick. Single ClickHouse has 2 CPU/1536 MiB and a 512-thread
+global pool, identical for both binaries. Per scenario ABBAABBAABBA gives six
+samples per version, 36 measured runs total. Local full DeleteSource uses
+3000 × 1 KiB in a 100 × 30 tree. Incremental RetainSource uses 3000 flat files,
+unchanged or 30 mode changes, with zero measured data transfer. Its 24 bootstrap
+full runs are separately saved and excluded from incremental timing. No task
+build, CI or functional suite runs during measurement. Every run checks source/
+target data, directory nanosecond mtime/mode where applicable, exact base count,
+actual generation and final report, with 50 ms RSS samples.
+
+| Scenario | Median seconds before → after | Time change | Median peak RSS MiB before → after | RSS change |
+| --- | --- | --- | --- | --- |
+| Full tree/delete | 5.245 → 5.200 | −0.86% | 196.01 → 194.89 | −0.57% |
+| Incremental unchanged | 1.930 → 1.880 | −2.59% | 176.58 → 172.81 | −2.13% |
+| Incremental 1% metadata | 2.110 → 2.060 | −2.37% | 180.78 → 182.25 | +0.81% |
+
+The respective full 5%/incremental 10% time limits pass. Highest after RSS is
+198.06 MiB. These samples establish comparable normal-path costs for this scope,
+not a general speedup, 200 MiB cap, release/large/other-backend or uninterrupted
+growth certification. No callback is configured in performance runs: full
+Preserve status is undelivered (`diagnostics_complete=false`); unchanged/metadata
+incremental has no pending events. Neither is external callback receipt proof.
+
+Raw records, bootstrap logs, RSS, time/stdout/stderr, fixed binaries, hashes and
+owned server logs/state are at `/tmp/terrasync-metadata-cancel-perf/`;
+`final-binaries.json` records the final pair. The earlier pre-queue-guard candidate
+and its separate 36 samples remain in `local-final-pool512/` and are not mixed;
+final rows/summary are `local-final-queue-guard/{results,summary}.json`, driver
+`/tmp/run_metadata_cancel_queue_guard_local_perf.py`, log
+`/tmp/terrasync-metadata-cancel-queue-guard-local-perf.log`. Containers/volumes are removed.
+Initial lab qualification is preserved separately: 12 full samples under pool192
+preceded a first baseline incremental health-probe timeout; a fresh identical
+container also failed with no OOM. Only changing the global pool 192→512 made
+that same before-binary incremental pass in 1.86s with zero changes/data. The
+observed container process count increased 227→274, supporting pool starvation.
+Final measurements use pool512 for both; they do not mix the earlier pool192
+samples. `first-2cpu-default-threads/`, `fresh-incremental-probe/` and
+`pool512-incremental-probe/` retain all failures, logs and state. Product fault
+budgets and migration concurrency were not changed to make the benchmark pass.
+
+Final architecture review keeps failure/cancellation policy in the existing
+execution scope, metadata actions in existing copy helpers and protocol safety
+in Native roles. Caller tokens are cloned with bounded in-flight work; no whole-task
+error collection or new durable side channel is introduced. Database-independent
+directory finalization, all-entry asynchronous cleanup, uniform stage counters,
+and cross-stage fault budgets/jitter handling remain pending in the full plan.

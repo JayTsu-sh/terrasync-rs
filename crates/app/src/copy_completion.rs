@@ -119,7 +119,7 @@ async fn apply_directories(
         let task_entry = entry.clone();
         let task = tasks.spawn(async move {
             trace!(path = ?entry.get_relative_path(), "Updating directory metadata");
-            copy_metadata::set_entry_metadata(target.storage(), &entry).await?;
+            copy_metadata::set_entry_metadata(target.storage(), &entry, None).await?;
             Ok(())
         });
         paths.insert(task.id(), task_entry);

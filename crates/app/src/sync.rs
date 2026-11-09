@@ -285,14 +285,17 @@ pub(crate) async fn process_entry(
 /// 仍执行 `set_entry_metadata` + ACL / xattr 复制。
 pub(crate) async fn process_metadata_only_entry(
     entry: &Arc<ObservedEntry>, src_storage: Arc<StorageContext>, dest_storage: Arc<StorageContext>, enable_acl: bool,
-    is_source_reserved: bool, broadcaster: &BroadcastForwarder<StorageEntryMessage>,
+    is_source_reserved: bool, broadcaster: &BroadcastForwarder<StorageEntryMessage>, cancel: Option<CancellationToken>,
 ) -> Result<()> {
     let opts = ProcessEntryOpts {
         enable_integrity_check: false,
         enable_acl,
         is_source_reserved,
         skip_data_copy: true,
-        resume: ResumeOpts::default(),
+        resume: ResumeOpts {
+            cancel,
+            ..Default::default()
+        },
     };
     process_entry_inner(entry, src_storage, dest_storage, opts, None, None, broadcaster).await
 }
@@ -347,7 +350,7 @@ async fn process_entry_inner(
     } else if skip_data_copy {
         // MetadataOnly 变更：chmod/chown 导致 mode/uid/gid 变了但内容未变，跳过 copy_file
         trace!("Skipping data copy (metadata-only change): {:?}", relative_path);
-        copy_metadata::set_entry_metadata(dest_storage.storage(), entry)
+        copy_metadata::set_entry_metadata(dest_storage.storage(), entry, resume.cancel.clone())
             .await?;
     } else if dest_storage.as_ref().storage().kind() == BackendKind::Hdfs {
         let hdfs = HdfsCopyContext::from_job(&resume.job_id, resume.transfer_mode)?;

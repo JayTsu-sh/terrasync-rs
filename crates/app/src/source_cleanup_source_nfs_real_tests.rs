@@ -127,7 +127,7 @@ async fn directory(
     let entry = observe_path(source.storage(), Path::new(name)).await?;
     assert!(prepare_directory(&entry, target).await?);
     let child = copy(source, target, "app-source-directory/child", false).await?;
-    set_entry_metadata(target.storage(), &entry).await?;
+    set_entry_metadata(target.storage(), &entry, None).await?;
     assert!(matches!(
         remove_entry(source, target, &entry, check, None).await,
         Err(AppError::StorageError(StorageError::SourcePurgeRefused { .. }))
@@ -147,10 +147,10 @@ async fn link(
     symlink(raw, root.join(name))?;
     let seed = observe_path(local.storage(), Path::new(name)).await?;
     namespace::create_symlink(source.storage(), &seed, raw).await?;
-    set_entry_metadata(source.storage(), &seed).await?;
+    set_entry_metadata(source.storage(), &seed, None).await?;
     let entry = observe_path(source.storage(), Path::new(name)).await?;
     namespace::create_symlink(target.storage(), &entry, raw).await?;
-    set_entry_metadata(target.storage(), &entry).await?;
+    set_entry_metadata(target.storage(), &entry, None).await?;
     remove_entry(source, target, &entry, check, None).await?;
     absent(source, name).await?;
     assert_eq!(

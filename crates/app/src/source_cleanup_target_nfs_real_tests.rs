@@ -141,7 +141,7 @@ async fn nonfile_case(kind: EntryKind, fault: Option<&str>) -> Result<()> {
     } else {
         namespace::create_symlink(target.storage(), &entry, Path::new("../opaque/missing")).await?;
     }
-    set_entry_metadata(target.storage(), &entry).await?;
+    set_entry_metadata(target.storage(), &entry, None).await?;
     if let Some(fault) = fault {
         control(&format!("commit-{fault}")).await?;
     }

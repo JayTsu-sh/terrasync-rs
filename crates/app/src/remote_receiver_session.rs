@@ -147,7 +147,7 @@ impl RemoteSessionState {
                 true
             }
             TransferDecision::MetadataOnly => {
-                if let Err(error) = copy_metadata::set_entry_metadata(dest.storage(), &entry.entry).await {
+                if let Err(error) = copy_metadata::set_entry_metadata(dest.storage(), &entry.entry, None).await {
                     let _ = transport
                         .send(ReceiverMsg::EntryError {
                             entry: Arc::clone(&entry.entry),
@@ -390,7 +390,7 @@ impl RemoteSessionState {
     /// 在所有文件 durable outcome 完成后恢复目录 metadata。
     pub(crate) async fn finalize_directories(&self, dest: &StorageContext) {
         for entry in &self.created_dirs {
-            if let Err(error) = copy_metadata::set_entry_metadata(dest.storage(), entry).await {
+            if let Err(error) = copy_metadata::set_entry_metadata(dest.storage(), entry, None).await {
                 warn!(
                     "[Receiver Remote] 回写目录元数据 {:?} 失败: {}",
                     entry.get_relative_path(),

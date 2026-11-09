@@ -71,7 +71,7 @@ async fn source_directory_with_unmigrated_hidden_data_is_retained() -> Result<()
     let source = create_storage(&source_root.path().to_string_lossy(), CreateStorageOptions::default()).await?;
     let target = create_storage(&target_root.path().to_string_lossy(), CreateStorageOptions::default()).await?;
     let entry = observe_path(source.storage(), Path::new("tree")).await?;
-    set_entry_metadata(target.storage(), &entry).await?;
+    set_entry_metadata(target.storage(), &entry, None).await?;
     assert_refusal(
         remove_entry(&source, &target, &entry, &check(), None)
             .await

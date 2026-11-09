@@ -719,7 +719,7 @@ async fn published_metadata_applies_and_clears_tags_without_inventing_timestamps
     let (root, destination, probe) = published_metadata_destination(false).await;
     let tag = ObjectTag::new("test", "captured").unwrap();
     for tags in [vec![tag.clone()], Vec::new()] {
-        copy_metadata::set_entry_metadata(destination.storage(), &captured_tags(tags))
+        copy_metadata::set_entry_metadata(destination.storage(), &captured_tags(tags), None)
             .await
             .unwrap();
     }
@@ -733,7 +733,7 @@ async fn published_metadata_applies_and_clears_tags_without_inventing_timestamps
 #[tokio::test]
 async fn published_metadata_preserves_typed_application_failure() {
     let (_, destination, _) = published_metadata_destination(true).await;
-    let error = copy_metadata::set_entry_metadata(destination.storage(), &captured_tags(Vec::new()))
+    let error = copy_metadata::set_entry_metadata(destination.storage(), &captured_tags(Vec::new()), None)
         .await
         .unwrap_err();
     let StorageError::MetadataApplication(failure) = error else {
@@ -750,6 +750,7 @@ async fn successful_metadata_write_with_wrong_read_back_keeps_target_data_and_fa
     let error = copy_metadata::set_entry_metadata(
         destination.storage(),
         &captured_tags(vec![ObjectTag::new("tag", "expected").unwrap()]),
+        None,
     )
     .await
     .unwrap_err();
@@ -782,7 +783,7 @@ async fn published_directory_keeps_setgid_without_fabricating_numeric_owner() {
         mode: Some(0o2775),
     })))
     .unwrap();
-    copy_metadata::set_entry_metadata(destination.storage(), &source)
+    copy_metadata::set_entry_metadata(destination.storage(), &source, None)
         .await
         .unwrap();
     assert_eq!(

@@ -35,7 +35,7 @@ pub async fn disk_commit_task(
                 if let Err(error) = copy_namespace::create_dir_all(dest.storage(), &entry).await {
                     warn!("[dc] create_dir {:?}: {error}", entry.get_relative_path());
                 }
-                let _ = copy_metadata::set_entry_metadata(dest.storage(), &entry).await;
+                let _ = copy_metadata::set_entry_metadata(dest.storage(), &entry, None).await;
                 progress.dirs_created.fetch_add(1, Ordering::Relaxed);
                 let _ = ack_tx.send(DcAck::Entry(ReceiverMsg::EntrySuccess { entry }));
             }

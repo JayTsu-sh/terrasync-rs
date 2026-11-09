@@ -73,7 +73,7 @@ impl SyncOrchestrator {
             metadata_applied = true;
         }
         if !metadata_applied {
-            copy_metadata::set_entry_metadata(dest.storage(), entry).await?;
+            copy_metadata::set_entry_metadata(dest.storage(), entry, None).await?;
         }
         Ok(())
     }

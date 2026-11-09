@@ -83,7 +83,7 @@ async fn persistence_errors_keep_both_files_and_directories_and_preserve_the_typ
                 create_storage(&target_root.path().to_string_lossy(), CreateStorageOptions::default()).await?;
             let entry = Arc::new(observe_path(source.storage(), Path::new(name)).await?);
             if directory {
-                set_entry_metadata(target.storage(), &entry).await?;
+                set_entry_metadata(target.storage(), &entry, None).await?;
             } else {
                 copy_file(&source, &target, &entry, CopyOptions::default(), None).await?;
             }
@@ -121,7 +121,7 @@ async fn later_metadata_only_updates_are_persisted_before_source_removal() -> Re
     copy_file(&source, &target, &entry, CopyOptions::default(), None).await?;
     std::fs::set_permissions(source_root.path().join("file"), std::fs::Permissions::from_mode(0o640))?;
     let entry = observe_path(source.storage(), Path::new("file")).await?;
-    set_entry_metadata(target.storage(), &entry).await?;
+    set_entry_metadata(target.storage(), &entry, None).await?;
     remove_entry(&source, &target, &entry, &check(), None).await?;
     assert!(!source_root.path().join("file").exists());
     assert_eq!(std::fs::read(target_root.path().join("file"))?, b"payload");

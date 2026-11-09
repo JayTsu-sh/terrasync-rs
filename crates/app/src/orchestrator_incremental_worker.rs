@@ -4,7 +4,7 @@ use crate::{
     broadcast::BroadcastForwarder,
     config::SyncJobConfig,
     copy_history::{HistoryCopyContext, HistoryCopyPolicy, HistoryCopyWorker},
-    error::{AppError, Result},
+    error::{AppError, Result, StorageError},
     file_copy::CopyOptions,
     file_copy::selection::SkipTracker,
     sync::{ResumeOpts, process_entry, process_metadata_only_entry},
@@ -20,6 +20,10 @@ use task_model::{
 };
 use tokio::{sync::Semaphore, task::JoinHandle};
 use tracing::{Instrument, error, info, info_span};
+
+#[cfg(test)]
+#[path = "orchestrator_incremental_cancellation_tests.rs"]
+mod cancellation_tests;
 
 pub(super) async fn spawn_handlers(
     c: &SyncJobConfig, handler_inputs: Vec<AsyncReceiver<StorageEntryMessage>>,
@@ -99,7 +103,24 @@ pub(super) async fn spawn_handlers(
                     },
                     history_policy,
                 );
-                while let Some(message) = rx.next().await {
+                loop {
+                    let next = match resume_opts.cancel.as_ref() {
+                        Some(cancel) => tokio::select! {
+                            biased;
+                            () = cancel.cancelled() => {
+                                // 释放派发端背压；未开始的排队条目不生成复制失败。
+                                rx.close();
+                                let history_result = history.finish().await;
+                                return match failure {
+                                    Some(error) => Err(error),
+                                    None => history_result.and(Err(StorageError::Cancelled.into())),
+                                };
+                            }
+                            message = rx.next() => message,
+                        },
+                        None => rx.next().await,
+                    };
+                    let Some(message) = next else { break };
                     if history.process(&message).await? {
                         continue;
                     }
@@ -171,6 +192,7 @@ pub(super) async fn spawn_handlers(
                                     enable_acl,
                                     is_source_reserved,
                                     &bc,
+                                    resume_opts.cancel.clone(),
                                 )
                                 .await
                             } else {

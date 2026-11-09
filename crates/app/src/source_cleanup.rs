@@ -378,7 +378,7 @@ mod tests {
         let directory = observe_path(source.storage(), Path::new("tree")).await?;
         let file = Arc::new(observe_path(source.storage(), Path::new("tree/file")).await?);
         copy_file(&source, &target, &file, CopyOptions::default(), None).await?;
-        set_entry_metadata(target.storage(), &directory).await?;
+        set_entry_metadata(target.storage(), &directory, None).await?;
         let expected = std::fs::metadata(target_root.path().join("tree"))?.modified()?;
         remove_entry(&source, &target, &file).await?;
         remove_entry(&source, &target, &directory).await?;
@@ -413,7 +413,7 @@ mod tests {
             let entry = observe_path(source.storage(), Path::new(name)).await?;
             if directory {
                 std::fs::create_dir(target_root.path().join(name))?;
-                set_entry_metadata(target.storage(), &entry).await?;
+                set_entry_metadata(target.storage(), &entry, None).await?;
             } else {
                 copy_file(&source, &target, &Arc::new(entry.clone()), CopyOptions::default(), None).await?;
             }

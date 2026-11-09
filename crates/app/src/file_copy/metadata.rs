@@ -180,7 +180,9 @@ pub(crate) async fn set_metadata(
     Ok(())
 }
 
-pub(crate) async fn set_entry_metadata(storage: &Storage, entry: &ObservedEntry) -> Result<()> {
+pub(crate) async fn set_entry_metadata(
+    storage: &Storage, entry: &ObservedEntry, cancel: Option<CancellationToken>,
+) -> Result<()> {
     let view = ObservedView {
         entry,
         version_index: entry
@@ -188,7 +190,7 @@ pub(crate) async fn set_entry_metadata(storage: &Storage, entry: &ObservedEntry)
             .and_then(|history| history.records().iter().position(|record| record.is_latest())),
     }
     .payload();
-    set_item_metadata(storage, view, None).await.map(|_| ())
+    set_item_metadata(storage, view, None, cancel).await.map(|_| ())
 }
 
 /// 核对捕获结果并编译计划；不查询源端，也不应用目标元数据。
@@ -205,17 +207,15 @@ pub(crate) fn captured_metadata_plan(storage: &Storage, view: ObservedView<'_>) 
 }
 
 pub(crate) async fn set_item_metadata(
-    storage: &Storage, view: ObservedView<'_>, target_version: Option<&str>,
+    storage: &Storage, view: ObservedView<'_>, target_version: Option<&str>, cancel: Option<CancellationToken>,
 ) -> Result<SourceDescriptor> {
     let plan = captured_metadata_plan(storage, view)?;
+    let cancel = cancel.unwrap_or_default();
     let metadata = storage.metadata()?;
     let path = view.source_path()?;
     let version = target_version.map_or(SourceVersion::Current, |id| SourceVersion::Id(id.to_owned()));
-    plan.apply(metadata.as_ref(), &path, &version, CancellationToken::new())
-        .await?;
-    Ok(plan
-        .verify_published(storage, &path, &version, None, CancellationToken::new())
-        .await?)
+    plan.apply(metadata.as_ref(), &path, &version, cancel.clone()).await?;
+    Ok(plan.verify_published(storage, &path, &version, None, cancel).await?)
 }
 
 pub(crate) async fn apply_acl(storage: &Storage, value: &Path, acl: AclMetadata) -> Result<()> {

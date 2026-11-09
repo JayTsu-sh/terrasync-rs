@@ -710,7 +710,7 @@ pub(crate) async fn recv_file_list_and_data_phase(
                 if let Err(e) = copy_namespace::create_dir_all(dest_storage.storage(), &entry).await {
                     warn!("[Receiver Remote] create_dir {:?}: {}", entry.get_relative_path(), e);
                 }
-                let _ = copy_metadata::set_entry_metadata(dest_storage.storage(), &entry).await;
+                let _ = copy_metadata::set_entry_metadata(dest_storage.storage(), &entry, None).await;
                 progress.dirs_created.fetch_add(1, Ordering::Relaxed);
                 let _ = transport.send(ReceiverMsg::EntrySuccess { entry }).await;
             }

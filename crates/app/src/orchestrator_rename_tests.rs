@@ -60,7 +60,7 @@ async fn apply_case(config: &ClickHouseConfig, directory: bool) -> Result<()> {
         Arc::new(create_storage(&source_root.path().to_string_lossy(), CreateStorageOptions::default()).await?);
     let target =
         Arc::new(create_storage(&target_root.path().to_string_lossy(), CreateStorageOptions::default()).await?);
-    set_entry_metadata(target.storage(), &entry("old")).await?;
+    set_entry_metadata(target.storage(), &entry("old"), None).await?;
     database.batch_insert_base_record(&[entry("old").into()]).await?;
     database.commit_scan_generation().await?;
     database.finish_copy_generation(CopyGenerationPhase::Completed).await?;

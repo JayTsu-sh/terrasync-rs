@@ -181,7 +181,7 @@ async fn only_current_selection_authorizes_source_cleanup(config: &ClickHouseCon
     for name in ["selected", "outside", "outside-dir"] {
         let entry = Arc::new(observe_path(source.storage(), Path::new(name)).await?);
         if name == "outside-dir" {
-            set_entry_metadata(target.storage(), &entry).await?;
+            set_entry_metadata(target.storage(), &entry, None).await?;
         } else {
             copy_file(
                 &source,
