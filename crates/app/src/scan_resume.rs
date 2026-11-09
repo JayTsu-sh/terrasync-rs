@@ -26,7 +26,7 @@ use utils::app_config::AppConfig;
 
 use crate::{
     config::{JobType, initialize_consumer_config},
-    consumer::{ConsumerManager, ScanStatistics},
+    consumer::{ConsumerManager, TaskStatistics},
     error::{AppError, Result},
     storage_factory::{StorageRole, create_storage_for_role},
 };
@@ -181,7 +181,7 @@ pub(crate) async fn run_persisted(request: ScanRequest<'_>, config: AppConfig) -
         // 累计数与目录贡献必须来自同一已确认检查点；旧检查点无法补出过滤计数。
         consumers.restore_statistics(&state.statistics).await?;
         if (!state.checkpoint.is_empty() || state.observed_entries > 0)
-            && !consumers.scan_statistics().snapshot().await.is_some_and(|scan| scan.valid_checkpoint(state.observed_entries)) {
+            && !consumers.task_statistics().snapshot().await.is_some_and(|scan| scan.valid_checkpoint(state.observed_entries)) {
             return Err(AppError::ScanError("Saved scan checkpoint lacks consistent directory statistics; reset this job's scan records before starting a new round".into()));
         }
         consumers
@@ -291,7 +291,7 @@ async fn run(
 }
 
 async fn flush_batch(
-    database: &mut ScanStore, state: &ScanResumeState, consumers: &ScanStatistics, batch: &mut Vec<Arc<ObservedEntry>>,
+    database: &mut ScanStore, state: &ScanResumeState, consumers: &TaskStatistics, batch: &mut Vec<Arc<ObservedEntry>>,
     cancel: &ScanCancellation,
 ) -> Result<()> {
     cancel.check()?;

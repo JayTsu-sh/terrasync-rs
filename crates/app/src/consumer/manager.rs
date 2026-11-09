@@ -60,13 +60,24 @@ pub struct ConsumerManager {
     copy_database_execution: Option<CopyDatabaseExecution>,
 }
 
-/// 扫描工作任务共享统计状态，不持有生命周期守卫或其他消费者。
+/// 工作任务共享统计状态，不持有生命周期守卫或其他消费者。
 #[derive(Clone)]
-pub(crate) struct ScanStatistics {
+pub(crate) struct TaskStatistics {
     inner: Option<Arc<Mutex<StatisticConsumer>>>,
 }
 
-impl ScanStatistics {
+impl TaskStatistics {
+    /// 扫描条目按实际输入流更新，变更事件落盘后更新；保存游标前等待两者处理完成。
+    pub(crate) async fn record_statistics(&self, messages: impl IntoIterator<Item = StorageEntryMessage>) {
+        if let Some(sc) = &self.inner {
+            for message in messages {
+                if let Err(error) = journal::record(sc, &message).await {
+                    StatisticConsumer::diagnostic_failure(sc, error).await;
+                }
+            }
+        }
+    }
+
     pub(crate) async fn restore_scan_counts(&self, counts: ScanCounts) {
         if let Some(sc) = &self.inner {
             let mut sc = sc.lock().await;
@@ -292,17 +303,17 @@ impl ConsumerManager {
         }
         Ok(())
     }
-    pub(crate) fn scan_statistics(&self) -> ScanStatistics {
-        ScanStatistics {
+    pub(crate) fn task_statistics(&self) -> TaskStatistics {
+        TaskStatistics {
             inner: self.stats_consumer.clone(),
         }
     }
 
     pub async fn record_observations(&self, entries: &[Arc<ObservedEntry>]) {
-        self.scan_statistics().record_observations(entries).await;
+        self.task_statistics().record_observations(entries).await;
     }
     pub async fn record_observed_events(&self, events: &[ObservedScanEvent]) {
-        self.scan_statistics().record_observed_events(events).await;
+        self.task_statistics().record_observed_events(events).await;
     }
     pub async fn record_final_events(&self, events: &[ScanFinalEvent]) {
         if let Some(sc) = &self.stats_consumer {
@@ -314,13 +325,7 @@ impl ConsumerManager {
     }
     /// 扫描条目按实际输入流更新，变更事件落盘后更新；保存游标前等待两者处理完成。
     pub async fn record_statistics(&self, messages: impl IntoIterator<Item = StorageEntryMessage>) {
-        if let Some(sc) = &self.stats_consumer {
-            for message in messages {
-                if let Err(error) = journal::record(sc, &message).await {
-                    StatisticConsumer::diagnostic_failure(sc, error).await;
-                }
-            }
-        }
+        self.task_statistics().record_statistics(messages).await;
     }
 
     /// 最终报告以持久化唯一条目为准；恢复时重放的目录不能重复计入结果统计。
@@ -480,7 +485,7 @@ impl ConsumerManager {
     }
 
     pub async fn statistics_checkpoint(&self) -> Result<String> {
-        self.scan_statistics().statistics_checkpoint().await
+        self.task_statistics().statistics_checkpoint().await
     }
 
     pub async fn restore_statistics(&self, saved: &str) -> Result<()> {

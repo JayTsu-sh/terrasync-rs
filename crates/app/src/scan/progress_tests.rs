@@ -75,7 +75,7 @@ fn block(path: &str, count: u64, revision: u64, complete: bool) -> DirectoryStat
 #[tokio::test]
 async fn live_300_checkpoint_200_and_resume_to_1000_preserve_new_errors_and_diagnostics() -> Result<()> {
     let manager = manager().await?;
-    let statistics = manager.scan_statistics();
+    let statistics = manager.task_statistics();
     let mut progress = ScanProgress::new(TraversalOrder::Blocks, ScanCounts::default(), None);
     progress.push(block("a", 200, 1, true), &statistics).await?;
     let prefix = progress.checkpoint_counts()?.clone();
@@ -123,7 +123,7 @@ async fn live_300_checkpoint_200_and_resume_to_1000_preserve_new_errors_and_diag
 #[tokio::test]
 async fn unordered_root_restart_drops_attempt_counts_and_does_not_offer_a_checkpoint() -> Result<()> {
     let manager = manager().await?;
-    let statistics = manager.scan_statistics();
+    let statistics = manager.task_statistics();
     let mut progress = ScanProgress::new(TraversalOrder::Unordered, ScanCounts::default(), None);
     progress.push(block("a", 100, 1, false), &statistics).await?;
     progress.push(block("b", 200, 1, false), &statistics).await?;
@@ -149,7 +149,7 @@ async fn unordered_root_restart_drops_attempt_counts_and_does_not_offer_a_checkp
 #[tokio::test]
 async fn recovery_marker_must_match_the_confirmed_cursor_and_order() -> Result<()> {
     let manager = manager().await?;
-    let statistics = manager.scan_statistics();
+    let statistics = manager.task_statistics();
     let mut progress = ScanProgress::new(TraversalOrder::Blocks, ScanCounts::default(), Some(vec![1]));
     assert!(
         progress

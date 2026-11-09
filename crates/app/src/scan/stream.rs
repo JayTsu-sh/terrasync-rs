@@ -7,7 +7,7 @@ use crate::scan::source::WalkDirAsyncIterator;
 use crate::scan::source::{ResumableScan, ResumableScanItem, ScanSourceMode, WalkOptions};
 use crate::{
     config::{JobType, initialize_consumer_config},
-    consumer::{ConsumerManager, ScanStatistics},
+    consumer::{ConsumerManager, TaskStatistics},
     error::{AppError, Result},
     scan::{ScanRequest, cancellation::ScanCancellation, progress::ScanProgress},
     storage_factory::{StorageRole, create_storage_for_role},
@@ -56,7 +56,7 @@ pub(super) async fn run(request: ScanRequest<'_>, config: AppConfig) -> Result<(
     manager
         .initialize_scan_statistics(&storage, options.include_tags, None)
         .await?;
-    let statistics = manager.scan_statistics();
+    let statistics = manager.task_statistics();
     let recovery_progress = statistics.watch_recovery(source.recovery_status()).await;
     let mut progress = ScanProgress::new(order, Default::default(), None);
     manager.begin_lifecycle().await;
@@ -111,7 +111,7 @@ fn streaming_order() -> TraversalOrder {
 }
 
 async fn consume_observed(
-    source: &mut ResumableScan, statistics: &ScanStatistics, progress: &mut ScanProgress, cancel: &ScanCancellation,
+    source: &mut ResumableScan, statistics: &TaskStatistics, progress: &mut ScanProgress, cancel: &ScanCancellation,
 ) -> Result<()> {
     let mut entries = Vec::<Arc<ObservedEntry>>::with_capacity(256);
     let mut tick = interval(Duration::from_millis(100));
