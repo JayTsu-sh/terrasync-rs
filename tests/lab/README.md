@@ -1162,3 +1162,25 @@ base 与最终报告；未配置 callback 的计划保留事件待外部接收�
 基线／变更 SHA-256 为
 `86924b205a1b19b2445394b78d684ab1284e217521caceae96fb58bc13ecd4b7`、
 `e2ff05fe74da33b7cb41012a86aeffc39ea268a714b1e9faa3d9bb5b6b21445e`；独占容器已清理。
+
+### Native 版本批量删除的阶段证据（尚未接入任务）
+
+Native `d1e69a5` 已扩展已有 S3Protocol::delete_objects，复用 SourceVersion，支持精确版本／
+标记／null 槽，100 项／请求，逐 key＋ID 回执和完整逐项错误，版本批次失败后停止后续提交。
+普通 Current 删除保持历史保留语义，丢回执不盲重放；未新增公开入口、类型或 SDK 修改。
+Native backend 429 项通过／3 项 ignored，新私有 SDK 契约另外显式执行 19 个真实场景通过，
+原有历史清理 11 场景、完整 CI 范围分步及最终严格 Clippy 通过（Rust 1.98.1）。
+首次夹具 Clippy 行数问题已经修正并补跑；完整实验入口与范围在 Native 的 tests/lab/README.md。
+
+同一固定测试程序、独占 1 CPU／768 MiB RustFS、dev debug=0／incremental=0，六轮交错清理
+128 条历史中的 127 条旧记录，包含 null 与标记，当前版本／哨兵完整保留；串行 delete_version
+为 127 次请求，批量为 100＋27 的两次请求。删除阶段耗时中位数 10617.775→230.613 ms，
+整个测试进程 10.68→0.30 s，峰值 RSS 28.6875→30.00 MiB。基于同一 SDK 程序的两条调用路径，
+不等于两个产品版本或含就绪／源复核的完整 purge，更不等于 CLI／ClickHouse／callback、
+release 或整轮大规模迁移性能达标。日志 `/tmp/native-exact-bulk-perf6.log`，样本／固定程序
+`/tmp/native-exact-bulk-perf/`，程序 SHA-256
+`6e5897f390101828714e7cdf802674481b85593d735c9b04a1b47e1d53a6b4ed`；独占容器已清理。
+
+本仓库仍固定 Native e294de47；新批量能力尚未用于源清理。后续须先让批内所有版本原因保持
+有类型传播并进入 callback，失败 entry／任务不能因版本数量重复累计，才切换旧历史清理批次；
+当前版本必须独立最后删除。完整历史目标核验、逐项异步删源及整轮 RSS 等未完成项不变。
