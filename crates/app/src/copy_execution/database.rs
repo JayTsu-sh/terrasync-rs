@@ -68,6 +68,8 @@ impl CopyDatabaseExecution {
     pub(crate) async fn run_child(&self, work: impl Future<Output = Result<()>>) -> Result<()> {
         match self.scope(work).await {
             Ok(()) => Ok(()),
+            // 已逐项报告的复制结果仍使整轮失败，但不能中断待冲刷的完成事实。
+            Err(error) if error.is_reported_copy_failure() => Err(error),
             Err(error) => {
                 // 先保存原始类型再唤醒其他 worker，避免诱发的取消覆盖最初原因。
                 let source = self.child_failure.get_or_init(|| Arc::new(error));
@@ -93,7 +95,10 @@ impl CopyDatabaseExecution {
         let execution = self.queries.execution();
         let result = self.scope(work).await;
         let monitored = monitor.finish().await;
-        let result = if result.is_ok() && self.child_failure.get().is_some() {
+        // 已交付的逐项失败不能遮住其他 worker 保存的执行级根因。
+        let result = if (result.is_ok() || result.as_ref().is_err_and(AppError::is_reported_copy_failure))
+            && self.child_failure.get().is_some()
+        {
             Err(self.stopped_error())
         } else {
             result
@@ -131,5 +136,89 @@ impl CopyDatabaseExecution {
             (Err(source), Ok(())) => Err(source),
             (Ok(()), monitoring) => monitoring.map_err(Into::into),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{Error as IoError, ErrorKind};
+    use utils::app_config::ClickhouseConfig;
+
+    #[tokio::test]
+    async fn reported_entry_failure_keeps_the_fact_scope_open_for_drain() -> Result<()> {
+        for data_failed in [false, true] {
+            // 只构造执行身份，不连接数据库；事实冲刷在真实故障回归中验证。
+            let config = ClickhouseConfig {
+                mode: Default::default(),
+                cluster: None,
+                dsn: "http://127.0.0.1:9".into(),
+                database: "fixture".into(),
+                username: "fixture".into(),
+                password: None,
+                dial_timeout: 1,
+                read_timeout: 1,
+            };
+            let token = CancellationToken::new();
+            let mut database = ClickHouseDatabase::new(&config, "reported_entry")?;
+            let execution = CopyDatabaseExecution::prepare(&mut database, token.clone())?;
+            let result = execution
+                .run_child(async {
+                    Err(AppError::ReportedCopyFailure {
+                        source: Box::new(IoError::new(ErrorKind::PermissionDenied, "owned entry refusal").into()),
+                        data_failed,
+                    })
+                })
+                .await;
+            assert!(
+                !token.is_cancelled(),
+                "reported entry outcome must not cancel pending fact writes"
+            );
+            assert!(execution.child_failure.get().is_none());
+            assert!(
+                matches!(result, Err(AppError::ReportedCopyFailure { source, data_failed: actual })
+                if actual == data_failed && matches!(source.as_ref(), AppError::IoError(error) if error.kind() == ErrorKind::PermissionDenied))
+            );
+            execution.run_child(async { Ok(()) }).await?;
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn fatal_peer_failure_is_not_hidden_by_an_earlier_reported_entry_result() -> Result<()> {
+        let config = ClickhouseConfig {
+            mode: Default::default(),
+            cluster: None,
+            dsn: "http://127.0.0.1:9".into(),
+            database: "fixture".into(),
+            username: "fixture".into(),
+            password: None,
+            dial_timeout: 1,
+            read_timeout: 1,
+        };
+        let token = CancellationToken::new();
+        let mut database = ClickHouseDatabase::new(&config, "reported_then_fatal")?;
+        let execution = CopyDatabaseExecution::prepare(&mut database, token.clone())?;
+        let result = execution
+            .run(async {
+                let reported = execution
+                    .run_child(async {
+                        Err(AppError::ReportedCopyFailure {
+                            source: Box::new(IoError::new(ErrorKind::PermissionDenied, "owned entry refusal").into()),
+                            data_failed: false,
+                        })
+                    })
+                    .await;
+                let fatal = execution
+                    .run_child(async { Err(IoError::new(ErrorKind::ConnectionAborted, "owned fatal peer").into()) })
+                    .await;
+                assert!(matches!(fatal, Err(AppError::CopyExecutionStopped { .. })));
+                reported
+            })
+            .await;
+        assert!(token.is_cancelled());
+        assert!(matches!(result, Err(AppError::CopyExecutionStopped { source })
+            if matches!(source.as_ref(), AppError::IoError(error) if error.kind() == ErrorKind::ConnectionAborted)));
+        Ok(())
     }
 }
