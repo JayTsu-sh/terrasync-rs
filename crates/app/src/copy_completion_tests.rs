@@ -4,6 +4,11 @@ use std::future::pending;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::config::{ConsoleConfig, ConsumerConfig, JobType};
+use crate::consumer::{
+    ConsumerManager,
+    stats::{ProgressDetail, callback_state::StatisticsCheckpoint},
+};
 use clickhouse::Client;
 use data_mover::model::ObservedEntry;
 use db::catalogue::ClickHouseDatabase;
@@ -13,7 +18,7 @@ use task_model::observation::ObservedItem;
 use tempfile::TempDir;
 use tokio::sync::{Notify, oneshot};
 use tokio::time::{Duration, timeout};
-use utils::app_config::ClickHouseMode;
+use utils::app_config::{ClickHouseMode, DatabaseConfig};
 
 use super::*;
 use crate::storage_factory::{StorageRole, create_storage_for_role};
@@ -68,7 +73,7 @@ async fn directory_query_failure_stays_typed_and_drains_updates() -> Result<()> 
             .map_err(|_| AppError::ScanWorkerStopped)?;
         Err(DatabaseError::ConfigError("directory query regression fixture".into()).into())
     });
-    let result = apply_directories(query, receiver, target(&destination).await?).await;
+    let result = apply_directories(query, receiver, target(&destination).await?, None).await;
     assert!(matches!(
         result,
         Err(AppError::DatabaseError(DatabaseError::ConfigError(_)))
@@ -96,7 +101,7 @@ async fn directory_write_failure_stays_typed_and_drains_later_updates() -> Resul
             .map_err(|_| AppError::ScanWorkerStopped)?;
         Ok(())
     });
-    let result = apply_directories(query, receiver, target(&destination).await?).await;
+    let result = apply_directories(query, receiver, target(&destination).await?, None).await;
     assert!(matches!(result, Err(AppError::StorageError(_))));
     verify_mtime(&destination, "present", expected)
 }
@@ -109,7 +114,7 @@ async fn directory_query_panic_is_observed() -> Result<()> {
         let _sender = sender;
         panic!("directory query regression fixture");
     });
-    let result = apply_directories(query, receiver, target(&destination).await?).await;
+    let result = apply_directories(query, receiver, target(&destination).await?, None).await;
     assert!(matches!(result, Err(AppError::TaskJoinError(error)) if error.is_panic()));
     Ok(())
 }
@@ -134,7 +139,7 @@ async fn cancelled_metadata_stage_does_not_detach_query() -> Result<()> {
         drop(sender);
         Ok(())
     });
-    let task = tokio::spawn(apply_directories(query, receiver, target(&destination).await?));
+    let task = tokio::spawn(apply_directories(query, receiver, target(&destination).await?, None));
     ready.await.map_err(|_| AppError::ScanWorkerStopped)?;
     task.abort();
     assert!(matches!(task.await, Err(error) if error.is_cancelled()));
@@ -201,7 +206,7 @@ async fn isolated_generation_case(mode: ClickHouseMode) -> Result<()> {
             .begin_copy_generation(&request("directory-completion-regression", true))
             .await?;
         database.batch_insert_base_record(&[Arc::new(entry.clone())]).await?;
-        let result = complete(database.clone(), target(&destination).await?).await;
+        let result = complete(database.clone(), target(&destination).await?, None).await;
         if !matches!(result, Err(AppError::StorageError(_))) {
             return Err(AppError::CopyError(format!(
                 "metadata failure was not reported: {result:?}"
@@ -218,7 +223,7 @@ async fn isolated_generation_case(mode: ClickHouseMode) -> Result<()> {
         }
         std::fs::create_dir(destination.path().join("missing"))?;
         database.batch_insert_base_record(&[Arc::new(entry.clone())]).await?;
-        complete(database.clone(), target(&destination).await?).await?;
+        complete(database.clone(), target(&destination).await?, None).await?;
         verify_mtime(&destination, "missing", entry.get_mtime())?;
         if database
             .begin_copy_generation(&request("directory-completion-regression", true))
@@ -252,4 +257,165 @@ async fn single_metadata_failure_keeps_generation_dirty_until_retry_succeeds() -
 #[ignore = "requires explicitly configured real ClickHouse cluster; isolated database and local directories only"]
 async fn cluster_metadata_failure_keeps_generation_dirty_until_retry_succeeds() -> Result<()> {
     isolated_generation_case(ClickHouseMode::Cluster).await
+}
+
+fn statistics_manager(job_type: JobType) -> Result<ConsumerManager> {
+    ConsumerManager::statistics_only(&ConsumerConfig {
+        job_id: "directory-errors".into(),
+        job_type,
+        job_dir: String::new(),
+        db_config: DatabaseConfig {
+            enabled: false,
+            batch_size: 256,
+            clickhouse: ClickHouseConfig {
+                mode: ClickHouseMode::Single,
+                cluster: None,
+                dsn: "http://127.0.0.1:1".into(),
+                dial_timeout: 1,
+                read_timeout: 1,
+                database: "default".into(),
+                username: "default".into(),
+                password: None,
+            },
+        },
+        console_config: ConsoleConfig {
+            raw_command_line: String::new(),
+        },
+        progress_callback_url: None,
+    })
+}
+
+#[tokio::test]
+async fn every_failed_directory_is_reported_once_and_later_directories_finish() -> Result<()> {
+    for job_type in [JobType::Copy, JobType::IncrementalCopy] {
+        let source = TempDir::new()?;
+        let destination = TempDir::new()?;
+        let manager = statistics_manager(job_type)?;
+        let first = directory_entry(&source, "missing-first").await?;
+        let second = directory_entry(&source, "missing-second").await?;
+        let present = directory_entry(&source, "present").await?;
+        let expected = present.get_mtime();
+        std::fs::create_dir(destination.path().join("present"))?;
+        let (sender, receiver) = mpsc::channel(3);
+        let query = tokio::spawn(async move {
+            for entry in [first, second, present] {
+                sender
+                    .send(catalogue(entry))
+                    .await
+                    .map_err(|_| AppError::ScanWorkerStopped)?;
+            }
+            Ok(())
+        });
+        let result = apply_directories(
+            query,
+            receiver,
+            target(&destination).await?,
+            Some(manager.task_statistics()),
+        )
+        .await;
+        let error = result
+            .err()
+            .ok_or_else(|| AppError::ConfigError("missing metadata failure".into()))?;
+        manager.record_task_error(&error).await;
+        let saved: StatisticsCheckpoint = serde_json::from_str(&manager.statistics_checkpoint().await?)?;
+        let events = saved.callback.outbox.archive_prefix();
+        assert_eq!(events.len(), 2, "each failed directory needs its own diagnostic");
+        for name in ["missing-first", "missing-second"] {
+            assert!(
+                events.iter().any(|event| event.path.as_deref() == Some(name)
+                    && event.message.contains("directory_metadata_finalize")
+                    && event.message.contains("backend=Local")
+                    && event.code == "Copy"),
+                "missing path/phase/backend: {events:?}"
+            );
+        }
+        assert!(matches!(
+            saved.report.detail,
+            ProgressDetail::Full { error_count: 2, .. } | ProgressDetail::Incremental { error_count: 2, .. }
+        ));
+        assert_eq!(
+            saved.report.task_error_count, 0,
+            "already reported directory failures must not be counted again"
+        );
+        assert!(
+            matches!(error, AppError::ReportedCopyFailure { source, data_failed: false }
+            if matches!(*source, AppError::StorageError(_)))
+        );
+        verify_mtime(&destination, "present", expected)?;
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn directory_worker_panic_retains_path_and_typed_failure() -> Result<()> {
+    let source = TempDir::new()?;
+    let manager = statistics_manager(JobType::Copy)?;
+    let entry = Arc::new(directory_entry(&source, "panicked-directory").await?);
+    let mut tasks: JoinSet<Result<()>> = JoinSet::new();
+    let task = tasks.spawn(async { panic!("owned directory worker panic") });
+    let mut paths = HashMap::from([(task.id(), entry)]);
+    let mut failure = None;
+    let result = tasks.join_next_with_id().await.ok_or(AppError::ScanWorkerStopped)?;
+    record_update(
+        result,
+        &mut paths,
+        &mut failure,
+        &DirectoryMetadataProgressBar::new(),
+        BackendKind::Local,
+        Some(&manager.task_statistics()),
+    )
+    .await;
+    assert!(paths.is_empty());
+    assert!(matches!(failure, Some(AppError::TaskJoinError(error)) if error.is_panic()));
+    let saved: StatisticsCheckpoint = serde_json::from_str(&manager.statistics_checkpoint().await?)?;
+    let events = saved.callback.outbox.archive_prefix();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].path.as_deref(), Some("panicked-directory"));
+    assert!(events[0].message.contains("owned directory worker panic"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn query_failure_does_not_hide_already_failed_directory() -> Result<()> {
+    let source = TempDir::new()?;
+    let destination = TempDir::new()?;
+    let manager = statistics_manager(JobType::Copy)?;
+    let entry = directory_entry(&source, "missing-directory").await?;
+    let (sender, receiver) = mpsc::channel(1);
+    let query = tokio::spawn(async move {
+        sender
+            .send(catalogue(entry))
+            .await
+            .map_err(|_| AppError::ScanWorkerStopped)?;
+        Err(DatabaseError::ConfigError("owned directory query failure".into()).into())
+    });
+    let result = apply_directories(
+        query,
+        receiver,
+        target(&destination).await?,
+        Some(manager.task_statistics()),
+    )
+    .await;
+    let error = result.err().ok_or(AppError::ScanWorkerStopped)?;
+    assert!(matches!(error, AppError::DatabaseError(DatabaseError::ConfigError(_))));
+    manager.record_task_error(&error).await;
+    let saved: StatisticsCheckpoint = serde_json::from_str(&manager.statistics_checkpoint().await?)?;
+    let events = saved.callback.outbox.archive_prefix();
+    assert_eq!(events.len(), 2);
+    assert!(
+        events
+            .iter()
+            .any(|event| event.path.as_deref() == Some("missing-directory"))
+    );
+    assert!(
+        events
+            .iter()
+            .any(|event| event.message.contains("owned directory query failure"))
+    );
+    assert_eq!(saved.report.task_error_count, 1);
+    assert!(matches!(
+        saved.report.detail,
+        ProgressDetail::Full { error_count: 1, .. }
+    ));
+    Ok(())
 }

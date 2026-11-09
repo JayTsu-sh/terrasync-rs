@@ -1577,3 +1577,78 @@ unordered／Direct／quick、删源、隔离 Single ClickHouse；S3 额外隔离
 没有新增逐项数据库回执、协议恢复循环或全量常驻集合。剩余范围包括文件系统／历史
 全部条目的异步清理、无数据库目录收尾、统一阶段统计、统一防抖／预算和 release／
 大规模／全后端约 200 MiB 验收；本步骤的受控结果不替代这些目标。
+
+
+### Directory metadata failures and complete callback pages (2026-11-09)
+
+`python3 tests/lab/run-notification-archive-local.py --directory-completion` runs
+10 migration generations against isolated Single/two-replica ClickHouse: two
+retain-source bootstraps, two full failures, two incremental failures, and four
+recovery full migrations. Each failure uses an owned uid-65534 child, 70 existing
+root-owned writable target directories and one child-owned target directory.
+File writes succeed while final owner/mode/timestamp writes fail on the 70
+root-owned directories. The child checks every source/target body remains and
+the writable directory still receives its original mtime. This exercises real
+permission failures; it is not a network-outage or NFS claim.
+
+The independent HTTP receiver returns 204 and verifies 280 unique `Copy` errors
+across bounded pages, every directory path, `backend=Local`,
+`phase=directory_metadata_finalize`, no omitted events, and cumulative error
+counts of 70 with zero additional task errors after delivery. Planned retention
+status shares the same pages and is checked separately without incrementing
+error counts. Each final report is independently queried from ClickHouse.
+Recovery uses the same job, requires Full after a deleting generation, verifies
+all target bodies/mtime, source directory removal and empty base. All owned
+containers, volumes, databases and local prefixes are removed on exit.
+
+Three new deterministic tests cover Full/Incremental entry counting, multiple
+failed directories plus a later successful directory, a panicked worker's path
+and typed cause, and simultaneous query/update failure diagnostics. Existing
+query-type, drain and cancellation assertions remain unchanged. The production
+change uses existing `Error(Copy)` and the diagnostic journal; at most 32 task IDs
+retain their directory snapshots, rather than a whole-task error collection.
+`ReportedCopyFailure` preserves the original typed cause and prevents the final
+coordinator counting the first directory failure again. A separate query failure
+is still a task error. Statistics workers share `TaskStatistics` without owning
+other consumers or lifecycle guards. No public data-mover API was added.
+
+Five Rust CI checks passed using Rust 1.98.1, including workspace tests (app
+348 passed/47 ignored) and all 16 serial remote-process scenarios. Existing
+large-error warnings remain. Logs are `/tmp/terrasync-directory-errors-{fmt,check,clippy,tests,remote}.log`
+and results `/tmp/terrasync-directory-errors-ci-results.json`. Real permission
+and callback results are `/tmp/terrasync-directory-errors-reviewed-real.log` (including
+the final writable-directory mtime assertion); the original
+12 ready-window generations also pass in
+`/tmp/terrasync-directory-errors-ready-window-real.log`.
+The first independent checker mistakenly treated planned retention events as
+Copy errors; its failed run is preserved at
+`/tmp/terrasync-directory-errors-retention-fixture-first-real.log`. Production
+code was not changed to accommodate that checker. The red regression before
+error reporting is `/tmp/terrasync-directory-errors-red.log`.
+
+The fixed full-CLI before SHA-256 is
+`a11d52c4005fea9b7e45d800e59b31a73ada1e1ea1bae838ea5f52f4adf86ee4`
+(main 83b4f92 production code); after is
+`44749452931678ac92f09bcde0e49b666b4921ebfcba958e0c59107a8f682a7c`.
+Both use Native 45e70fa, dev/debug0 and Rust 1.98.1. The 24 normal-path
+measurements use 3000 × 1 KiB Local files, flat and 100 × 30 tree, each in
+ABBAABBAABBA order, 16/100000, unordered/Direct/quick/DeleteSource,
+Single ClickHouse limited to 2 CPU/1536 MiB. No task build, CI or functional suite
+runs during measurement. Each run checks data, source cleanup, nanosecond directory
+mtime/mode, empty base and saved final report, and samples RSS every 50 ms.
+
+| Scenario | Median seconds before → after | Time change | Median peak RSS MiB before → after | RSS change |
+| --- | --- | --- | --- | --- |
+| Flat | 5.235 → 5.320 | +1.62% | 161.79 → 160.53 | −0.78% |
+| Tree | 5.120 → 5.110 | −0.20% | 207.89 → 210.27 | +1.15% |
+
+The fixed 5% time checker passes both. Maximum after RSS is 215.23 MiB.
+Fixed binaries, hashes and all raw time/RSS/stdout/stderr records are under
+`/tmp/terrasync-directory-errors-perf/`, driver
+`/tmp/run_directory_errors_local_perf.py`, log
+`/tmp/terrasync-directory-errors-local-perf.log`. No callback is configured for
+performance samples, so their planned retention events are undelivered
+(`diagnostics_complete=false`), not external delivery success. This does not
+certify a 200 MiB ceiling, release/large workloads, sustained memory growth,
+other backends or the shared cross-stage network-jitter budget. Database-independent
+directory finalization and all-entry asynchronous cleanup remain pending.

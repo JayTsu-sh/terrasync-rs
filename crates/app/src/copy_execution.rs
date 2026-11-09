@@ -32,6 +32,9 @@ pub(crate) struct CopyLease {
     _guard: JobLease,
 }
 
+#[cfg(all(test, unix))]
+#[path = "copy_completion_real_tests.rs"]
+mod directory_completion_tests;
 #[cfg(test)]
 #[path = "copy_mutable_object_tests.rs"]
 mod mutable_tests;

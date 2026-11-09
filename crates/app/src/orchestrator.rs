@@ -885,7 +885,12 @@ impl SyncOrchestrator {
                         .await?,
                     )
                 };
-                copy_completion::complete(database.clone(), destination.clone()).await?;
+                copy_completion::complete(
+                    database.clone(),
+                    destination.clone(),
+                    Some(consumer_manager.task_statistics()),
+                )
+                .await?;
                 if !is_source_reserved {
                     // 全量文件已在传输阶段执行所选校验；增量跳过项由增量清理入口补齐数据校验。
                     let source = if let Some((source, _)) = &early.connections {
@@ -1288,7 +1293,12 @@ impl SyncOrchestrator {
         let result: Result<()> = async {
             let destination = phase_b_dest_storage?;
             phase_b_consumers?;
-            copy_completion::complete(database.clone(), destination.clone()).await?;
+            copy_completion::complete(
+                database.clone(),
+                destination.clone(),
+                Some(consumer_manager.task_statistics()),
+            )
+            .await?;
             if !is_source_reserved {
                 let source = Arc::new(
                     create_storage_for_role(

@@ -84,7 +84,7 @@ def run_isolated():
                 print(f"isolated S3 image={docker('inspect', containers[-1], '--format', '{{.Image}}')}", flush=True)
             print(f"isolated notification image={docker('inspect', containers[0], '--format', '{{.Image}}')}", flush=True)
             pid = docker("inspect", containers[0], "--format", "{{.State.Pid}}")
-            suite = [flag for flag in ("--copy-generations", "--copy-content", "--copy-ready-cleanup", "--copy-object-cleanup", "--copy-versioned-source-cleanup", "--catalogue-recovery", "--consumer-recovery", "--copy-execution", "--copy-data-cancel", "--copy-file-list-cancel", "--rename-generations", "--retention-events", "--source-absence", "--request-policy", "--copy-contracts", "--version-catalogue", "--mutable-catalogue", "--version-metadata", "--scan-wire") if flag in sys.argv]
+            suite = [flag for flag in ("--copy-generations", "--copy-content", "--copy-ready-cleanup", "--directory-completion", "--copy-object-cleanup", "--copy-versioned-source-cleanup", "--catalogue-recovery", "--consumer-recovery", "--copy-execution", "--copy-data-cancel", "--copy-file-list-cancel", "--rename-generations", "--retention-events", "--source-absence", "--request-policy", "--copy-contracts", "--version-catalogue", "--mutable-catalogue", "--version-metadata", "--scan-wire") if flag in sys.argv]
             subprocess.run(["nsenter", "-t", pid, "-n", sys.executable, __file__, "--inside", *suite], cwd=ROOT, check=True)
         except BaseException:
             for container in containers:
@@ -260,6 +260,10 @@ def run_copy_generations():
         if "--copy-object-cleanup" in sys.argv or "--copy-versioned-source-cleanup" in sys.argv:
             from copy_object_cleanup import run
             run(ROOT, environment, versioned_source="--copy-versioned-source-cleanup" in sys.argv)
+            return
+        if "--directory-completion" in sys.argv:
+            from directory_completion import run
+            run(ROOT, environment)
             return
         if "--copy-ready-cleanup" in sys.argv:
             from copy_ready_cleanup import run
@@ -855,7 +859,7 @@ def run_inside():
             time.sleep(0.2)
         else:
             raise RuntimeError(f"ClickHouse readiness timed out on port {port}")
-    if any(flag in sys.argv for flag in ("--copy-generations", "--copy-content", "--copy-ready-cleanup", "--copy-object-cleanup", "--copy-versioned-source-cleanup", "--catalogue-recovery", "--consumer-recovery", "--copy-execution", "--copy-data-cancel", "--copy-file-list-cancel", "--rename-generations", "--retention-events", "--source-absence", "--request-policy", "--copy-contracts", "--version-catalogue", "--mutable-catalogue", "--version-metadata", "--scan-wire")):
+    if any(flag in sys.argv for flag in ("--copy-generations", "--copy-content", "--copy-ready-cleanup", "--directory-completion", "--copy-object-cleanup", "--copy-versioned-source-cleanup", "--catalogue-recovery", "--consumer-recovery", "--copy-execution", "--copy-data-cancel", "--copy-file-list-cancel", "--rename-generations", "--retention-events", "--source-absence", "--request-policy", "--copy-contracts", "--version-catalogue", "--mutable-catalogue", "--version-metadata", "--scan-wire")):
         run_copy_generations()
         return
     environment = dict(os.environ)

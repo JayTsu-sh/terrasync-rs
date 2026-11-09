@@ -66,7 +66,7 @@ async fn unchanged_copy_is_deleted(config: &ClickHouseConfig) -> Result<()> {
         .compare_catalogue_batch(&[current], ComparisonMode::AwaitCopyAcknowledgement)
         .await?;
     assert!(changes.is_empty(), "unchanged entries must produce no copy work");
-    copy_completion::complete(database.clone(), Arc::clone(&target)).await?;
+    copy_completion::complete(database.clone(), Arc::clone(&target), None).await?;
     remove_confirmed_sources(
         database.clone(),
         source,
@@ -252,7 +252,7 @@ async fn only_current_selection_authorizes_source_cleanup(config: &ClickHouseCon
     assert_eq!(state, 0, "新代次统一回标旧事实，执行身份仍负责限定本轮清理范围");
     let untouched_time = UNIX_EPOCH + Duration::from_secs(1_234_567);
     File::open(target_root.path().join("outside-dir"))?.set_times(FileTimes::new().set_modified(untouched_time))?;
-    copy_completion::complete(database.clone(), Arc::clone(&target)).await?;
+    copy_completion::complete(database.clone(), Arc::clone(&target), None).await?;
     remove_confirmed_sources(
         database.clone(),
         source,
