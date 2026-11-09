@@ -1478,3 +1478,102 @@ Direct／Checkpointed 的 16 个持续断连／静默超时故障及 8 次检查
 架构审查确认队列取消归 receiver，执行最初原因和跨 worker 取消继续复用
 CopyDatabaseExecution；未复制协议重试、未直接丢弃在途传输，也未改变源清理证据。
 本小步骤未单独认证正常吞吐或约 200 MiB，完整程序性能继续单独验收。
+
+
+### 普通对象逐项异步删源（2026-11-09）
+
+全量、启用数据库、普通 File 且无 history 的对象到对象路线，复用现有 namespace 的
+`allows_paged_delete` 与目录对象能力选择。在复制数据、所需元数据及所选校验成功、
+New 事实进入有界消费者队列后，复用源快照绑定的已校验目标描述，做当前目标持久性、源元数据和受保护
+purge，不等待逐项事实入库。物理目录、历史、打包及 file-list 路线沿用原屏障。
+未修改 data-mover 或 nfs-rs，Native 仍固定 `45e70fa`，无新增公开存储入口或类型。
+
+ReadyFileCleanup 保持原清理的一项在途上限，等待者最多随复制并发存在，每个 worker
+至多一个清理 future；不增加完成路径集合、待删除队列或磁盘暂存。失败先记录最初原因并
+取消共享执行，再释放 mutex；另外只保留唯一在途清理的实际错误，数据库先失败也能报告
+该路径的保留／未知结果。完整成功后以执行内覆盖证明跳过普通文件的后续数据库核验，
+历史及目录照常收尾，不把证明用于失败轮或后续代次。
+
+两个确定性门闩及一个实际 Local 源快照绑定回归通过，原有清理测试不改变行为，日志为
+`/tmp/terrasync-streamed-object-gate-pair-tests.log`。
+五项 Rust CI 全部通过（包括 16 个串行远程进程场景）：
+`/tmp/terrasync-published-target-proof-reviewed-ci-results.json` 及同名前缀各检查日志。
+最终全 workspace/all-targets Clippy 为
+`/tmp/terrasync-published-target-proof-reviewed-clippy.log`；既有大错误类型等 warning
+保留。工具链 Rust 1.98.1，未在 CI 配置的 1.95 工具链上另跑。
+
+真实专项命令（沿用外置 Cargo target/profile 环境）：
+
+```sh
+LAB_OBJECT_STREAM_ONLY=true python3 tests/lab/run-notification-archive-local.py --copy-object-cleanup
+LAB_OBJECT_COMBINED_ONLY=true python3 tests/lab/run-notification-archive-local.py --copy-object-cleanup
+```
+
+前者在 Single／双副本、quick／full、最新状态／历史目标共 8 轮，每轮 98 个文件。
+独立阻塞最后一个数据 PUT 和 base 事实转发，先确认 96 个源对象已删除、相应目标内容正确，
+最后一个源仍在；最后核验恰好 98 次删除、没有删后源读取、恰好 98 次目标 tags 校验、98 个扫描文件、零错误、完整
+HTTP 204 诊断／可查询报告及 base=0。专项持有请求使用 30 秒读取／操作时限，生产默认及
+普通故障场景仍保持各自原时限。日志：
+`/tmp/terrasync-published-target-proof-final-eight-real.log`。
+
+后者在真实 DELETE 在途时拒绝数据库事实，两个失败轮及两个恢复轮均通过；失败源及
+已复制目标保留，callback 同时有数据库原因和 source_deletion_unconfirmed 的具体路径，
+一项任务错误、零复制数据错误，恢复后 base=0，最终报告可查。日志：
+`/tmp/terrasync-published-target-proof-final-combined-real.log`。
+最终组合另重跑普通对象 48 轮、版本化源 126 轮、持续数据库故障 16 场景及 8 次检查点
+复用，全部通过，日志为 `/tmp/terrasync-published-target-proof-final-{ordinary48,versioned126,active-data}-real.log`，
+汇总 `/tmp/terrasync-published-target-proof-final-real-results.json`。
+
+失败样本 `/tmp/terrasync-streamed-object-eight-real{,2,3,4,5}.log` 保留：先修正夹具初始化
+尚无 active state 的处理；随后出现默认 dev 栈溢出，测试入口单独 Box 和缩短 match
+临时值都未解决。GDB `/tmp/terrasync-streamed-object-gdb-real.log` 定位实际 Receiver→S3
+SDK HEAD 调用链；最终仅把符合条件的清理 future 放堆上（每 worker 一项）后，默认线程栈
+通过，没有使用 RUST_MIN_STACK。第五轮已证明前 96 个源提前删除，但故意持有尾部请求超过
+原一秒检测时限；专项夹具独立调整时限后完整通过，原断连／静默超时故障仍用原配置。
+
+最终生产代码的 48 轮固定程序 A/B：每组 ABBAABBAABBA、6 前／6 后，dev、16／100000、
+unordered／Direct／quick、删源、隔离 Single ClickHouse；S3 额外隔离 RustFS、256 个文件含
+嵌套前缀。每轮独立核验数据、tags／目录 ns mtime 与 mode、源删除、base、最终报告，
+50 ms RSS 采样，无本轮构建／CI／功能测试并行。全部通过 5% 耗时阈值。
+
+| 场景 | 耗时中位数（秒） | 变化 | 峰值 RSS 中位数（MiB） | 变化 |
+| --- | --- | --- | --- | --- |
+| Local 平铺 3000×1 KiB | 5.060→5.090 | +0.59% | 202.59→203.06 | +0.23% |
+| Local 目录 100×30×1 KiB | 5.055→4.965 | -1.78% | 218.32→220.81 | +1.14% |
+| S3→最新状态目标 256×1 KiB | 8.595→6.580 | -23.44% | 218.92→221.85 | +1.34% |
+| S3→历史目标 256×1 KiB | 8.425→6.670 | -20.83% | 219.05→224.48 | +2.48% |
+
+最大峰值 228.60 MiB，约 200 MiB 未全面达成；不以这些有限样本认证大规模／release／
+全后端或持续增长。无 callback 配置，diagnostics_complete=false 为计划内保留事件，
+不冒充外部接收成功。固定前程序为主项目 2d5cdc7／Native45，SHA-256
+`260c0115eabead3e05ad3aa958098744ed0eac5f9996a27ca375eab225eb934b`；
+修复后程序为本步骤生产实现，SHA-256
+`a11d52c4005fea9b7e45d800e59b31a73ada1e1ea1bae838ea5f52f4adf86ee4`。
+固定程序及元数据 `/tmp/terrasync-streamed-object-perf/published-proof-binaries.json`，
+最终原始样本／RSS／汇总在 `published-proof-{local,s3}/`，脚本为
+`/tmp/run_streamed_object_published_proof_{local,s3}_perf.py`，日志为
+`/tmp/terrasync-streamed-object-published-proof-{local,s3}-perf.log`。
+
+原候选 SHA75afd0 的 Local24 通过，但 S3 历史目标先回退6.23%；反向12轮后合并
+12前／12后仍回退约7.30%，未按达标提交。固定同一清理连接的8轮试验未改善（+4.64%），
+代码撤回；并发一的8轮对照基本持平（-0.12%），说明应继续检查并发等待。
+真实 red 回归 `/tmp/terrasync-streamed-object-target-proof-red-real.log` 在6.41秒明确断言
+98个文件发生196次目标tags读取：复制刚校验过，清理又在门闩内重复读取。
+随后扩展应用内既有复制结果为私有字段、不可克隆、绑定源 Arc 的 CopiedPublication，
+成功的数据／元数据校验才能构造；不同源快照（即使同路径／同身份）不能消费。
+即时清理以其当前目标身份持久性复核，源属性复核和受保护purge仍执行；其他清理传None
+保持原路径。CommitRecorder.finish保留原收尾语义并泛化返回值，续传也能交付该事实。
+没有新增Native接口或共享输出缓存。实际Local绑定用例及真实green8轮通过，目标tags
+恰好98次，默认栈验证继续通过。
+
+原始失败候选样本 `s3/`、反向 `s3-reverse/`、未采用 `context-probe/`、并发一
+`s3-concurrency-one/` 和对应脚本／日志均保留，未混入最终程序统计。
+诊断日志 `/tmp/terrasync-streamed-object-{s3,s3-reverse,context-probe,s3-concurrency-one}-perf.log`。
+这些实测及一读预算回归定位了重复目标核验和串行等待；不把未改善的连接池假设写成原因。
+
+
+架构审查：receiver 所有复制结果与调用时机，source_cleanup 所有能力判定、清理门闩、
+执行内覆盖和实际原因，协议安全由 Native 所有，数据库与最终通知沿用现有模块。
+没有新增逐项数据库回执、协议恢复循环或全量常驻集合。剩余范围包括文件系统／历史
+全部条目的异步清理、无数据库目录收尾、统一阶段统计、统一防抖／预算和 release／
+大规模／全后端约 200 MiB 验收；本步骤的受控结果不替代这些目标。

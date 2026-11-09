@@ -29,6 +29,7 @@ mod metadata_copy_tests;
 pub(crate) mod namespace;
 pub(crate) mod selection;
 pub(crate) mod transfer;
+pub(crate) use transfer::CopiedPublication;
 #[cfg(test)]
 #[path = "file_copy/transfer_contract_tests.rs"]
 mod transfer_contract_tests;
@@ -115,17 +116,17 @@ pub(crate) async fn prepare_directory(entry: &ObservedEntry, to: &StorageContext
 pub(crate) async fn copy_file(
     from: &StorageContext, to: &StorageContext, entry: &Arc<ObservedEntry>, mut options: CopyOptions,
     hdfs: Option<&HdfsCopyContext>,
-) -> Result<()> {
+) -> Result<Option<CopiedPublication>> {
     if to.roles.kind() == BackendKind::Hdfs {
         let context = hdfs
             .ok_or_else(|| AppError::ConfigError("HDFS recoverable copy requires a stable job identity".to_string()))?;
         options.transfer_mode = context.transfer_mode();
         transfer::copy_current(from, to, entry, &options, Some(context.transfer_identity())).await?;
         (context.on_committed)(0, ObservedEntryExt::get_size(entry.as_ref()));
+        Ok(None)
     } else {
-        transfer::copy_entry(from, to, entry, options).await?;
+        Ok(transfer::copy_entry(from, to, entry, options).await?)
     }
-    Ok(())
 }
 
 /// 全量与增量共用源端确认的逐版本顺序；每个目标版本提交后才发送对应的完成事件。

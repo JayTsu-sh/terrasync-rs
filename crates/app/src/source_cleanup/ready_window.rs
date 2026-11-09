@@ -1,4 +1,4 @@
-//! 无目录收尾时先清理有界就绪窗口；其他事实继续由数据库流式收尾，不暂存扫描到本地磁盘。
+//! 连接逐项对象清理与整轮成功证明；其他路线保持有界窗口及数据库收尾，不落本地磁盘。
 use std::{
     collections::VecDeque,
     path::Path,
@@ -9,8 +9,10 @@ use data_mover::model::{EntryKind, ModelValueError, ObservedEntry};
 use task_model::StorageEntryMessage;
 use tokio_util::task::AbortOnDropHandle;
 
-use super::{CompletedChecks, SourceCleanupCheck, remove_entry};
+use super::ready_files::can_stream_files;
+use super::{CompletedChecks, ReadyFileCleanup, SourceCleanupCheck, remove_entry};
 use crate::broadcast::BroadcastForwarder;
+use crate::copy_execution::CopyDatabaseExecution;
 use crate::error::{AppError, CopyStep, Result, StorageError};
 use crate::file_copy::selection::unrepresentable_object;
 use crate::storage_factory::StorageContext;
@@ -24,27 +26,47 @@ pub(crate) type CleanupConnections = Arc<OnceLock<ConnectedStorages>>;
 pub(crate) struct FullCleanupStage {
     connections: CleanupConnections,
     collector: AbortOnDropHandle<ReadyWindow>,
+    ready_files: Option<Arc<ReadyFileCleanup>>,
 }
 
 #[derive(Default)]
 pub(crate) struct EarlyCleanup {
     pub(crate) connections: Option<ConnectedStorages>,
     pub(crate) checked: CompletedChecks,
+    pub(crate) streamed_files: bool,
 }
 
 impl FullCleanupStage {
-    pub(crate) fn start(broadcaster: &mut BroadcastForwarder<StorageEntryMessage>, concurrency: usize) -> Self {
+    pub(crate) fn start(
+        broadcaster: &mut BroadcastForwarder<StorageEntryMessage>, concurrency: usize,
+        streaming: Option<(SourceCleanupCheck, CopyDatabaseExecution)>,
+    ) -> Self {
+        let connections = Arc::new(OnceLock::<ConnectedStorages>::new());
+        let ready_files = streaming.map(|(check, execution)| Arc::new(ReadyFileCleanup::new(check, execution)));
+        let can_stream = ready_files.is_some();
+        let observed_connections = connections.clone();
         let mut receiver = broadcaster.subscribe();
         let collector = AbortOnDropHandle::new(tokio::spawn(async move {
             let mut window = ReadyWindow::new(concurrency);
+            let mut streaming = None;
             while let Some(message) = receiver.recv().await {
-                window.observe(message);
+                if streaming.is_none() {
+                    streaming = observed_connections
+                        .get()
+                        .map(|(source, target)| can_stream && can_stream_files(source, target));
+                }
+                if streaming == Some(true) {
+                    window.disable();
+                } else {
+                    window.observe(message);
+                }
             }
             window
         }));
         Self {
-            connections: Arc::new(OnceLock::new()),
+            connections,
             collector,
+            ready_files,
         }
     }
 
@@ -52,11 +74,32 @@ impl FullCleanupStage {
         self.connections.clone()
     }
 
-    /// 必须先关闭广播，并证明扫描及全部复制成功；数据库消费者可以仍在冲刷。
+    pub(crate) fn ready_files(&self) -> Option<Arc<ReadyFileCleanup>> {
+        self.ready_files.clone()
+    }
+
+    /// 必须先关闭广播，并证明扫描、复制及逐项清理成功；数据库消费者可以仍在冲刷。
     pub(crate) async fn complete(self, copy_ready: bool, check: SourceCleanupCheck) -> Result<EarlyCleanup> {
         let mut window = self.collector.await.map_err(AppError::from)?;
+        if let Some(error) = self.ready_files.as_ref().and_then(|cleanup| cleanup.failure()) {
+            return Err(error);
+        }
         if let Some(error) = window.failure.take() {
             return Err(error);
+        }
+        if copy_ready
+            && self.ready_files.is_some()
+            && let Some((source, target)) = self
+                .connections
+                .get()
+                .filter(|(source, target)| can_stream_files(source, target))
+        {
+            // 全部普通文件 ACK 已经过同一个就绪清理入口；无需按总量常驻记录已完成路径。
+            return Ok(EarlyCleanup {
+                connections: Some((source.clone(), target.clone())),
+                streamed_files: true,
+                ..Default::default()
+            });
         }
         if !copy_ready || window.disabled || window.entries.is_empty() {
             return Ok(EarlyCleanup::default());
@@ -74,9 +117,11 @@ impl FullCleanupStage {
                 continue;
             }
             // 首个失败后不发新删除；在途只有本项，其未知结果仍带原始路径返回。
-            remove_entry(source, target, &entry, &check).await.map_err(|source| {
-                AppError::copy_entry_failure(CopyStep::SourceCleanup, Path::new(entry.path().as_str()), source)
-            })?;
+            remove_entry(source, target, &entry, &check, None)
+                .await
+                .map_err(|source| {
+                    AppError::copy_entry_failure(CopyStep::SourceCleanup, Path::new(entry.path().as_str()), source)
+                })?;
             completed.checked.insert(entry.path().clone(), entry.identity_key());
         }
         Ok(completed)

@@ -97,7 +97,11 @@ async fn real_target_s3_persistence_gates_unchanged_source_removal() -> Result<(
     let entry = observe_path(source.storage(), Path::new("payload")).await?;
     let check = SourceCleanupCheck::new(Duration::from_secs(1), Duration::from_secs(3), CancellationToken::new());
     let started = Instant::now();
-    let result = timeout(Duration::from_secs(8), remove_entry(&source, &target, &entry, &check)).await;
+    let result = timeout(
+        Duration::from_secs(8),
+        remove_entry(&source, &target, &entry, &check, None),
+    )
+    .await;
     let elapsed = started.elapsed();
     fs::write(&control, "normal")?;
     let result = result.map_err(|_| AppError::ConfigError("S3 target persistence test deadline exceeded".into()))?;
@@ -129,7 +133,7 @@ async fn real_target_s3_persistence_gates_unchanged_source_removal() -> Result<(
             assert!(elapsed < Duration::from_secs(1));
         }
         if matches!(fault.as_str(), "flash" | "recover_stall") {
-            remove_entry(&source, &target, &entry, &check).await?;
+            remove_entry(&source, &target, &entry, &check, None).await?;
             assert!(!root.path().join("payload").exists());
         }
     }

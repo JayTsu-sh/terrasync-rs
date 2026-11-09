@@ -262,6 +262,7 @@ mod tests {
             &target,
             &failed,
             &SourceCleanupCheck::new(Duration::from_secs(1), Duration::from_secs(3), CancellationToken::new()),
+            None,
         )
         .await
         .unwrap_err();
@@ -345,7 +346,8 @@ mod tests {
                 &source,
                 &target,
                 &entry,
-                &SourceCleanupCheck::new(Duration::from_secs(1), Duration::from_secs(3), CancellationToken::new())
+                &SourceCleanupCheck::new(Duration::from_secs(1), Duration::from_secs(3), CancellationToken::new()),
+                None
             )
             .await
             .is_err()

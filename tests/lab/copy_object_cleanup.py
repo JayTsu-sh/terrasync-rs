@@ -133,6 +133,8 @@ def run(repository, environment, *, versioned_source=False):
                 state["failed_requested_versions"] = [item for batch in state["batch_requests"] for item in batch]
                 assert len(state["batch_requests"]) == 1, (prefix, state)
                 assert all(version != state["latest_versions"]["payload"] for _, version in state["deleted_versions"]), state
+            if state["initial"] == "stream":
+                assert state["target_tag_reads"] == len(keys), (prefix, "target metadata must be verified once and its bound descriptor reused", state["target_tag_reads"], len(keys))
             state["inspections"] += 1
             print(f"independent object cleanup prefix={prefix} mode={mode} source_remaining={sorted(remaining)} target_data_verified=true fault_to_final_report_ms={state.get('fault_to_final_report_ms')}", flush=True)
 
@@ -148,6 +150,10 @@ def run(repository, environment, *, versioned_source=False):
                         keys = {"payload": BODY}
                         if mode == "normal" and (target != "latest" or versioned_source):
                             keys.update({"tree/file": NESTED, "slash/": SLASH})
+                        if mode == "stream":
+                            assert not versioned_source and target in ("latest", "history")
+                            keys = {f"f{index:03}": BODY for index in range(96)}
+                            keys.update({"tree/file": NESTED, "zz-tail": BODY})
                         source_versions = {}
                         latest_versions = {}
                         for key, body in keys.items():
@@ -184,6 +190,9 @@ def run(repository, environment, *, versioned_source=False):
                                                   deleted=threading.Event(), source_versions=source_versions, deleted_versions=[], batch_requests=[],
                                                   source_payloads=dict(keys), source_tags_expected=[{"Key": "proof", "Value": "raw"}],
                                                   cleanup_seen=False, target_data_writes=0, source_data_reads=0, latest_versions=latest_versions,
+                                                  deleted_keys=set(), tail_ready=threading.Event(), tail_released=False,
+                                                  delete_started=threading.Event(), database_failed=threading.Event(),
+                                                  fact_forwarded_before_tail=False, reads_after_delete=0, target_tag_reads=0,
                                                   target_data_versions=[], target_marker_versions=[], history_fault=False,
                                                   source_data_versions=source_data_versions if versioned_source else [],
                                                   source_marker_versions=[item["VersionId"] for page in history_pages for item in page.get("DeleteMarkers", []) if item["Key"] == f"{prefix}/payload"] if versioned_source else [])
@@ -293,6 +302,8 @@ def run(repository, environment, *, versioned_source=False):
                                 version = next(record["VersionId"] for record in records if not record["IsLatest"])
                                 client.delete_object(Bucket=buckets["source"], Key=key, VersionId=version)
                                 state["source_versions"]["payload"].remove(version)
+                    if state and state["initial"] == "stream" and source and self.command in ("GET", "HEAD") and len(parts) > 1:
+                        state["reads_after_delete"] += int(parts[1].removeprefix(prefix + "/") in state["deleted_keys"])
                     mutating_observation = versioned_source and source and self.command == "HEAD" and "versionId" not in query and path.endswith("/" + prefix + "/payload") and mode in ("missingcurrent", "sourcechanged", "metaread", "metachanged", "contradictory") and not state["cleanup_seen"]
                     if mutating_observation:
                         state["cleanup_seen"] = True
@@ -311,6 +322,8 @@ def run(repository, environment, *, versioned_source=False):
                             tags = [{"Key": "proof", "Value": "changed"}]
                             client.put_object_tagging(Bucket=buckets["source"], Key=key, Tagging={"TagSet": tags})
                             state["source_tags_expected"] = tags
+                    if state and not database and not source and self.command == "GET" and "tagging" in query and len(parts) > 1 and parts[1].removeprefix(prefix + "/") in state["keys"]:
+                        state["target_tag_reads"] += 1
                     source_metadata_failure = versioned_source and source and self.command == "GET" and "tagging" in query and mode == "metaread" and state["cleanup_seen"]
                     data_failure = not source and self.command == "PUT" and "tagging" not in query and mode == "data"
                     if not database and not source and self.command == "PUT" and "tagging" not in query:
@@ -358,6 +371,47 @@ def run(repository, environment, *, versioned_source=False):
                         self.end_headers()
                         self.wfile.write(payload)
                         return
+                if state and mode == "dbanddelete":
+                    sql = query.get("query", [""])[0].upper()
+                    if database and "INSERT INTO" in sql and "BASE_OBJCLEAN_" in sql:
+                        assert state["delete_started"].wait(8), (prefix, "DELETE must be in flight before the database fails")
+                        payload = b"owned database readiness refusal"
+                        self.send_response(403)
+                        self.send_header("Content-Length", str(len(payload)))
+                        self.end_headers()
+                        self.wfile.write(payload)
+                        state["database_failed"].set()
+                        return
+                    if deleting:
+                        state["delete_started"].set()
+                        assert state["database_failed"].wait(8), (prefix, "database fault was never delivered")
+                        payload = b"<Error><Code>AccessDenied</Code><Message>owned source deletion refusal</Message></Error>"
+                        self.send_response(403)
+                        self.send_header("Content-Length", str(len(payload)))
+                        self.end_headers()
+                        try:
+                            self.wfile.write(payload)
+                        except (BrokenPipeError, ConnectionResetError):
+                            pass
+                        return
+                if state and state["initial"] == "stream":
+                    if not database and not source and self.command == "PUT" and "tagging" not in query and path.endswith("/zz-tail"):
+                        assert state["tail_ready"].wait(20), (prefix, "more than 64 earlier files must be deleted while the last copy is blocked")
+                        for index in range(96):
+                            key = f"{prefix}/f{index:03}"
+                            assert client.get_object(Bucket=buckets[state["target"]], Key=key)["Body"].read() == BODY
+                        assert client.get_object(Bucket=buckets["source"], Key=f"{prefix}/zz-tail")["Body"].read() == BODY
+                        assert not state["fact_forwarded_before_tail"], state
+                        state["tail_released"] = True
+                        print(f"independent streaming prefix={prefix} earlier_sources_deleted=96 tail_source_present=true tail_copy_blocked=true base_facts_not_forwarded=true", flush=True)
+                    if database and "INSERT INTO" in query.get("query", [""])[0].upper() and "BASE_OBJCLEAN_" in query.get("query", [""])[0].upper():
+                        assert state["tail_ready"].wait(20), (prefix, "source cleanup cannot wait for database acknowledgement")
+                        # Hold until the target-tail probe verifies the unconfirmed earlier copies.
+                        deadline = time.monotonic() + 20
+                        while not state["tail_released"]:
+                            assert time.monotonic() < deadline
+                            time.sleep(0.005)
+                        state["fact_forwarded_before_tail"] = not state["tail_released"]
                 if database:
                     sql = query.get("query", [""])[0].upper()
                     held = not versioned_source and state and state["initial"] == "normal" and state["target"] == "latest" and not state["fact_released"] and "INSERT INTO" in sql and "FORMAT ROWBINARY" in sql and "BASE_OBJCLEAN_" in sql
@@ -436,6 +490,10 @@ def run(repository, environment, *, versioned_source=False):
                                     state["deleted_versions"].append((parts[1], query["versionId"][0]))
                                 state["forwarded_deletes"] += 1
                             state["deleted"].set()
+                            if state["initial"] == "stream":
+                                state["deleted_keys"].add(parts[1].removeprefix(prefix + "/"))
+                                if all(f"f{index:03}" in state["deleted_keys"] for index in range(96)):
+                                    state["tail_ready"].set()
                     if bulk and mode == "malformed":
                         document = ET.fromstring(payload)
                         first = next(node for node in document if node.tag.rsplit("}", 1)[-1] == "Deleted")
@@ -469,7 +527,8 @@ def run(repository, environment, *, versioned_source=False):
         relay.daemon_threads = True
         threading.Thread(target=relay.serve_forever, daemon=True).start()
         address = f"127.0.0.1:{relay.server_port}"
-        environment = dict(environment, S3_CONNECT_TIMEOUT="1", S3_READ_TIMEOUT="1", S3_OPERATION_TIMEOUT="2",
+        held_stream = environment.get("LAB_OBJECT_STREAM_ONLY") == "true"
+        environment = dict(environment, S3_CONNECT_TIMEOUT="1", S3_READ_TIMEOUT="30" if held_stream else "1", S3_OPERATION_TIMEOUT="30" if held_stream else "2",
                            LAB_OBJECT_CLEANUP_CONTROL=address, LAB_OBJECT_CLEANUP_CALLBACK=f"http://{address}/callback",
                            LAB_OBJECT_CLEANUP_ROOT=str(root), LAB_COPY_GENERATION_DSN=f"http://{address}",
                            LAB_OBJECT_CLEANUP_VERSIONED=str(versioned_source).lower())
@@ -480,6 +539,29 @@ def run(repository, environment, *, versioned_source=False):
                             "copy_execution::object_cleanup_tests::real_unversioned_object_source_cleanup_and_failures",
                             "--", "--ignored", "--exact", "--nocapture", "--test-threads=1"],
                            cwd=repository, env=environment, check=True, timeout=360)
+            if environment.get("LAB_OBJECT_COMBINED_ONLY") == "true":
+                summaries = [report for report in reports if report["is_final"] and not report.get("diagnostics")]
+                assert len(states) == 2 and len(summaries) == 4 and all(report["diagnostics_complete"] for report in summaries)
+                failures = [report for report in summaries if report["migration"]["phase"] == "failed"]
+                assert len(failures) == 2 and all(report["task_error_count"] == 1 and report["detail"]["error_count"] == 0 for report in failures)
+                for prefix, state in states.items():
+                    assert state["delete_started"].is_set() and state["database_failed"].is_set() and state["inspections"] == 2
+                    job = "objclean_" + prefix.replace("-", "_")
+                    events = [event for report in reports if report["job_id"] == job for event in (report.get("diagnostics") or {}).get("events", [])]
+                    retained = [event for event in events if event["code"] == "target_preserved" and event.get("path") == "payload"]
+                    assert len(retained) == 1 and retained[0]["retention"]["reason"] == "source_deletion_unconfirmed", (prefix, events)
+                    assert any("owned database readiness refusal" in event["message"] for event in events), (prefix, events)
+                print("independent concurrent database/delete failure deployments=2 failed=2 recovery=2 actual_cleanup_path_preserved=true source_retained=true callback_HTTP204=true reports_saved=true", flush=True)
+                return
+            if environment.get("LAB_OBJECT_STREAM_ONLY") == "true":
+                summaries = [report for report in reports if report["is_final"] and not report.get("diagnostics")]
+                assert len(states) == len(summaries) == 8
+                assert all(state["tail_released"] and not state["fact_forwarded_before_tail"] and state["reads_after_delete"] == 0
+                           and state["forwarded_deletes"] == len(state["keys"]) == 98 and state["inspections"] == 1 for state in states.values()), states
+                assert all(report["diagnostics_complete"] and report["migration"]["phase"] == "completed" and report["task_error_count"] == 0
+                           and report["detail"]["error_count"] == 0 and report["detail"]["scanned_files"] == 98 for report in summaries), summaries
+                print("independent streaming cleanup deployments=2 verification=quick+full targets=latest+history generations=8 files_per_generation=98 early_deleted=96 no_duplicate_source_read_or_delete=true HTTP204=true", flush=True)
+                return
             if environment.get("LAB_OBJECT_HISTORY_ONLY") == "true":
                 summaries = [report for report in reports if report["is_final"] and not report.get("diagnostics")]
                 assert len(states) == 36 and len(summaries) == 40 and all(report["diagnostics_complete"] for report in summaries)

@@ -1,4 +1,4 @@
-//! 清理本次选中且目标就绪的源项：有界窗口可先于入库，其余事实流式查询数据库收尾。
+//! 清理本次选中且目标就绪的源项：普通对象可逐项先于入库，其他路线保留窗口及数据库收尾。
 
 use std::{collections::HashMap, path::Path, sync::Arc, time::Duration};
 
@@ -13,8 +13,8 @@ use tokio_util::task::AbortOnDropHandle;
 use crate::consumer::ConsumerManager;
 use crate::error::CopyStep;
 use crate::error::{AppError, Result, StorageError};
-use crate::file_copy::metadata::captured_metadata_plan;
 use crate::file_copy::selection::unrepresentable_object;
+use crate::file_copy::{CopiedPublication, metadata::captured_metadata_plan};
 use crate::storage_factory::{StorageContext, path};
 use task_model::{SourcePresence, TargetRetention, TargetRetentionReason};
 
@@ -22,6 +22,8 @@ mod verification;
 use verification::verify_source_metadata;
 mod content;
 mod history;
+mod ready_files;
+pub(crate) use ready_files::{ReadyFileCleanup, can_stream_files};
 mod ready_window;
 pub(crate) use ready_window::{EarlyCleanup, FullCleanupStage};
 
@@ -37,6 +39,7 @@ pub(crate) struct SourceCleanupCheck {
     cancel: CancellationToken,
     verify_content: bool,
     prechecked: Option<Arc<CompletedChecks>>,
+    streamed_files: bool,
 }
 
 impl SourceCleanupCheck {
@@ -50,6 +53,7 @@ impl SourceCleanupCheck {
             cancel,
             verify_content: false,
             prechecked: None,
+            streamed_files: false,
         }
     }
 
@@ -58,7 +62,9 @@ impl SourceCleanupCheck {
         self
     }
 
-    pub(crate) fn with_prechecked(mut self, entries: CompletedChecks) -> Self {
+    /// 仅完整成功执行可以证明全部普通文件已走逐项清理；不扩展到历史、目录或后续代次。
+    pub(crate) fn with_prechecked(mut self, entries: CompletedChecks, streamed_files: bool) -> Self {
+        self.streamed_files = streamed_files;
         if !entries.is_empty() {
             self.prechecked = Some(Arc::new(entries));
         }
@@ -66,9 +72,11 @@ impl SourceCleanupCheck {
     }
 
     fn is_prechecked(&self, entry: &ObservedEntry) -> bool {
-        self.prechecked
-            .as_ref()
-            .is_some_and(|entries| entries.get(entry.path()) == Some(&entry.identity_key()))
+        (self.streamed_files && ready_files::ordinary_file(entry))
+            || self
+                .prechecked
+                .as_ref()
+                .is_some_and(|entries| entries.get(entry.path()) == Some(&entry.identity_key()))
     }
 }
 
@@ -101,7 +109,7 @@ pub(crate) async fn remove_confirmed_sources(
             continue;
         }
         // 一旦清理失败就停止发出新删除，避免断连后继续扩大未知副作用。
-        remove_entry(&source, &destination, &entry, &check)
+        remove_entry(&source, &destination, &entry, &check, None)
             .await
             .map_err(|source| {
                 AppError::copy_entry_failure(CopyStep::SourceCleanup, Path::new(entry.path().as_str()), source)
@@ -157,6 +165,7 @@ pub(crate) async fn report_failure(result: Result<()>, reports: &ConsumerManager
 
 async fn remove_entry(
     source: &StorageContext, destination: &StorageContext, entry: &ObservedEntry, check: &SourceCleanupCheck,
+    published: Option<CopiedPublication>,
 ) -> Result<()> {
     // 存储根和虚拟目录不是本次传输拥有的可删除实体。
     if entry.path().as_str().is_empty() || unrepresentable_object(entry, destination).is_some() {
@@ -190,18 +199,29 @@ async fn remove_entry(
         // 纯前缀没有可删除实体；子对象各自核验，绝不把前缀递归删除。
         return Ok(());
     }
-    // 只核验目标与落库的原始事实；删源改变的目录 mtime 和已经消失的源项不回写目标。
+    // 只核验目标与复制时捕获的原始事实；删源改变的目录 mtime 和已经消失的源项不回写目标。
     let view = ObservedView { entry, version_index };
-    let target = captured_metadata_plan(destination.storage(), view)?
-        .verify_published(
-            destination.storage(),
-            entry.path(),
-            &SourceVersion::Current,
-            None,
-            check.cancel.clone(),
-        )
-        .await
-        .map_err(StorageError::from)?;
+    let target = match published {
+        Some(published) => {
+            if !ready_files::ordinary_file(entry) || !can_stream_files(source, destination) {
+                return Err(StorageError::TargetPublicationChanged {
+                    path: entry.path().clone(),
+                }
+                .into());
+            }
+            published.into_target(entry)?
+        }
+        None => captured_metadata_plan(destination.storage(), view)?
+            .verify_published(
+                destination.storage(),
+                entry.path(),
+                &SourceVersion::Current,
+                None,
+                check.cancel.clone(),
+            )
+            .await
+            .map_err(StorageError::from)?,
+    };
     if target.kind != entry.kind() || (entry.kind() == EntryKind::File && target.size != entry.size()) {
         return Err(StorageError::TargetPublicationChanged {
             path: entry.path().clone(),
@@ -273,6 +293,7 @@ mod tests {
             destination,
             entry,
             &SourceCleanupCheck::new(Duration::from_secs(1), Duration::from_secs(3), CancellationToken::new()),
+            None,
         )
         .await
     }

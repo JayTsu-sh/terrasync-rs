@@ -13,7 +13,7 @@ use crate::file_copy::transfer as copy_transfer;
 use data_mover::model::BackendKind;
 use tokio_util::sync::CancellationToken;
 // 标准库
-use crate::file_copy::{CopyOptions, HdfsCopyContext, copy_file, prepare_directory};
+use crate::file_copy::{CopiedPublication, CopyOptions, HdfsCopyContext, copy_file, prepare_directory};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use task_model::ObservedEntryExt;
@@ -500,7 +500,7 @@ impl CommitRecorder {
         self.callback.clone()
     }
 
-    pub(crate) async fn finish(self, result: Result<()>) -> Result<()> {
+    pub(crate) async fn finish<T>(self, result: Result<T>) -> Result<T> {
         drop(self.callback);
         let _ = self.shutdown.send(());
         let _ = self.drain.await;
@@ -512,7 +512,10 @@ impl CommitRecorder {
             );
         }
         match result {
-            Ok(()) => self.store.finalize_done().await,
+            Ok(value) => {
+                self.store.finalize_done().await?;
+                Ok(value)
+            }
             Err(error) => {
                 let _ = self.store.flush().await;
                 Err(error)
@@ -625,7 +628,7 @@ pub(crate) fn should_resume(
 pub(crate) async fn copy_file_with_resume(
     entry: &Arc<ObservedEntry>, src_storage: &StorageContext, dest_storage: &StorageContext, options: CopyOptions,
     job_dir: &str,
-) -> Result<()> {
+) -> Result<Option<CopiedPublication>> {
     let recorder = CommitRecorder::start(job_dir, entry, src_storage.block_size()).await?;
 
     let res = copy_transfer::copy_checkpointed(

@@ -14,6 +14,7 @@ use crate::{
     broadcast::BroadcastForwarder,
     error::{AppError, Result, StorageError},
     file_copy::VersionFailureContext,
+    source_cleanup::{ReadyFileCleanup, can_stream_files},
     storage_factory::StorageContext,
 };
 
@@ -27,6 +28,7 @@ pub(crate) struct LocalCopyReceiver {
     pub(crate) bytes: Option<Arc<AtomicU64>>,
     pub(crate) broadcaster: BroadcastForwarder<StorageEntryMessage>,
     pub(crate) active: Arc<AtomicUsize>,
+    pub(crate) cleanup: Option<Arc<ReadyFileCleanup>>,
 }
 
 impl LocalCopyReceiver {
@@ -41,7 +43,9 @@ impl LocalCopyReceiver {
             bytes: bt,
             broadcaster: bc,
             active: task_counter,
+            cleanup,
         } = self;
+        let cleanup = cleanup.filter(|_| can_stream_files(&src, &dest));
         // 从 transport 拉消息处理（MPMC，N 个 worker 竞争消费）
         let mut failure = None;
         loop {
@@ -62,9 +66,15 @@ impl LocalCopyReceiver {
             match msg {
                 SenderMsg::CopyEntry { entry } => {
                     let _guard = AtomicCounterGuard::increment(&task_counter);
-                    match process_entry_on_receiver(&entry, &src, &dest, &cfg, qos.clone(), bt.clone()).await {
-                        Ok(()) => {
-                            bc.broadcast(StorageEntryMessage::New(entry.into())).await?;
+                    // 在进入清理 await 前释放已完成复制 future，避免同一 match 临时值跨越两个阶段。
+                    let copied = process_entry_on_receiver(&entry, &src, &dest, &cfg, qos.clone(), bt.clone()).await;
+                    match copied {
+                        Ok(published) => {
+                            bc.broadcast(StorageEntryMessage::New(entry.clone().into())).await?;
+                            if let Some(cleanup) = &cleanup {
+                                // 原生 SDK 的大 future 不嵌入整个接收循环；每个 worker 至多持有一项。
+                                Box::pin(cleanup.remove(&src, &dest, &entry, published)).await?;
+                            }
                         }
                         Err(e) => {
                             error!(

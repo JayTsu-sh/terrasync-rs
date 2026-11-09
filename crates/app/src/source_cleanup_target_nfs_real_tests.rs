@@ -51,7 +51,7 @@ async fn case(name: &str, full: bool, fault: Option<&str>) -> Result<()> {
     let cancel = CancellationToken::new();
     let check = SourceCleanupCheck::new(Duration::from_secs(1), Duration::from_secs(3), cancel.clone());
     let started = Instant::now();
-    let operation = remove_entry(&source, &target, &entry, &check);
+    let operation = remove_entry(&source, &target, &entry, &check, None);
     let result = if fault == Some("cancel") {
         let (result, sent) = tokio::join!(operation, cancel_at_commit(cancel));
         assert!(sent?.elapsed() < Duration::from_secs(1));
@@ -147,7 +147,7 @@ async fn nonfile_case(kind: EntryKind, fault: Option<&str>) -> Result<()> {
     }
     let cancel = CancellationToken::new();
     let check = SourceCleanupCheck::new(Duration::from_secs(1), Duration::from_secs(3), cancel.clone());
-    let operation = remove_entry(&source, &target, &entry, &check);
+    let operation = remove_entry(&source, &target, &entry, &check, None);
     let result = if fault == Some("cancel") {
         let (result, sent) = tokio::join!(operation, cancel_at_commit(cancel));
         assert!(sent?.elapsed() < Duration::from_secs(1));

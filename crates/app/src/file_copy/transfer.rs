@@ -1,11 +1,11 @@
 //! 将任务策略编译为唯一的原生传输请求；恢复和发布仍由 data-mover 负责。
 
-use std::sync::Arc;
 use std::sync::atomic::Ordering;
+use std::{fmt, ptr, sync::Arc};
 
 use data_mover::metadata::MetadataPlan;
 use data_mover::model::{EntryKind, ObservedEntry, SourceVersion};
-use data_mover::storage::DeleteMarkerOutcome;
+use data_mover::storage::{DeleteMarkerOutcome, SourceDescriptor};
 use data_mover::transfer::{
     self, FailedDataCleanup, MetadataFailurePolicy, MetadataTransferMode, ReadBackVerification, TransferIdentity,
     TransferOutcome, TransferRequest,
@@ -17,6 +17,34 @@ use super::metadata::captured_metadata_plan;
 use super::{CopyOptions, transfer_policy};
 use crate::error::storage::{Result, StorageError};
 use crate::storage_factory::StorageContext;
+
+/// 只由成功的数据／元数据校验构造，绑定同一个不可变源观察，供即时清理复用。
+pub(crate) struct CopiedPublication {
+    entry: Arc<ObservedEntry>,
+    target: SourceDescriptor,
+}
+
+impl fmt::Debug for CopiedPublication {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CopiedPublication")
+            .field("path", self.entry.path())
+            .finish_non_exhaustive()
+    }
+}
+
+impl CopiedPublication {
+    pub(crate) fn into_target(mut self, entry: &ObservedEntry) -> Result<SourceDescriptor> {
+        if !ptr::eq(self.entry.as_ref(), entry) || self.target.path != *entry.path() {
+            return Err(StorageError::TargetPublicationChanged {
+                path: entry.path().clone(),
+            });
+        }
+        // 持久性复核必须仍命中当前发布，不能只确认一个已成为历史的版本。
+        self.target.version = SourceVersion::Current;
+        Ok(self.target)
+    }
+}
 
 pub(crate) fn validate_transfer_mode(destination: &StorageContext, mode: TransferMode) -> Result<()> {
     let staged = destination.roles.staged_destination()?;
@@ -53,7 +81,12 @@ pub(crate) fn validate_stream_transfer_mode(destination: &StorageContext, mode: 
 
 pub(crate) async fn copy_entry(
     source: &StorageContext, destination: &StorageContext, entry: &Arc<ObservedEntry>, options: CopyOptions,
-) -> Result<()> {
+) -> Result<Option<CopiedPublication>> {
+    if entry.kind() == EntryKind::File && entry.history().is_none() {
+        validate_transfer_mode(destination, options.transfer_mode)?;
+        let (_, published) = execute_file(source, destination, entry, None, &options, None).await?;
+        return Ok(Some(published));
+    }
     let keep_history = entry.history().is_some() && destination.roles.staged_destination()?.keeps_history().await?;
     for item in ObservedItem::all(entry) {
         if item
@@ -65,7 +98,7 @@ pub(crate) async fn copy_entry(
         }
         copy_item(source, destination, &item, &options, None).await?;
     }
-    Ok(())
+    Ok(None)
 }
 
 pub(crate) async fn copy_item(
@@ -89,7 +122,7 @@ pub(crate) async fn copy_item(
             _ => None,
         });
     }
-    let outcome = execute_file(source, destination, &item.entry, item.version_index, options, identity).await?;
+    let (outcome, _) = execute_file(source, destination, &item.entry, item.version_index, options, identity).await?;
     Ok(outcome.destination_version)
 }
 
@@ -98,22 +131,25 @@ pub(crate) async fn copy_current(
     identity: Option<&str>,
 ) -> Result<TransferOutcome> {
     validate_transfer_mode(destination, options.transfer_mode)?;
-    execute_file(source, destination, entry, None, options, identity).await
+    execute_file(source, destination, entry, None, options, identity)
+        .await
+        .map(|(outcome, _)| outcome)
 }
 
 pub(crate) async fn copy_checkpointed(
     source: &StorageContext, destination: &StorageContext, entry: &Arc<ObservedEntry>, mut options: CopyOptions,
-) -> Result<()> {
+) -> Result<Option<CopiedPublication>> {
     options.transfer_mode = TransferMode::Checkpoint;
-    let outcome = copy_current(source, destination, entry, &options, None).await?;
+    validate_transfer_mode(destination, options.transfer_mode)?;
+    let (outcome, published) = execute_file(source, destination, entry, None, &options, None).await?;
     tracing::debug!(transferred_bytes = outcome.transferred_bytes, reused_bytes = outcome.reused_bytes, recovery = ?outcome.recovery, "checkpointed transfer completed");
-    Ok(())
+    Ok(Some(published))
 }
 
 async fn execute_file(
     source: &StorageContext, destination: &StorageContext, entry: &Arc<ObservedEntry>, version_index: Option<usize>,
     options: &CopyOptions, identity: Option<&str>,
-) -> Result<TransferOutcome> {
+) -> Result<(TransferOutcome, CopiedPublication)> {
     let item = ObservedItem {
         entry: Arc::clone(entry),
         version_index,
@@ -163,7 +199,13 @@ async fn execute_file(
     if target.kind != EntryKind::File || target.size != Some(view.get_size()) {
         return Err(StorageError::TargetPublicationChanged { path: target.path });
     }
-    Ok(outcome)
+    Ok((
+        outcome,
+        CopiedPublication {
+            entry: entry.clone(),
+            target,
+        },
+    ))
 }
 
 async fn execute_native(

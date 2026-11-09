@@ -579,8 +579,23 @@ impl SyncOrchestrator {
             .await?;
         consumer_manager.begin_lifecycle().await;
         let consumer_handles = consumer_manager.start_consumers(&mut broadcaster).await?;
+        let cleanup_check = SourceCleanupCheck::new(
+            Duration::from_secs(app_config.scan.operation_timeout_secs),
+            Duration::from_secs(app_config.scan.recovery_window_secs),
+            consumer_manager
+                .copy_database_execution()
+                .map(|execution| execution.token().clone())
+                .unwrap_or_default(),
+        );
         let early_cleanup = if !is_source_reserved && database.is_some() {
-            Some(FullCleanupStage::start(&mut broadcaster, copy_concurrency))
+            let streaming = if c.packaged || c.file_list.is_some() {
+                None
+            } else {
+                consumer_manager
+                    .copy_database_execution()
+                    .map(|execution| (cleanup_check.clone(), execution))
+            };
+            Some(FullCleanupStage::start(&mut broadcaster, copy_concurrency, streaming))
         } else {
             None
         };
@@ -667,6 +682,7 @@ impl SyncOrchestrator {
             let done_counter = mount_done_receivers.clone();
             let execution = consumer_manager.copy_database_execution();
             let cleanup_connections = early_cleanup.as_ref().map(FullCleanupStage::connections);
+            let ready_files = early_cleanup.as_ref().and_then(FullCleanupStage::ready_files);
 
             let span = info_span!("receiver_worker", recv_id = recv_id);
             let handle = tokio::spawn(
@@ -710,6 +726,7 @@ impl SyncOrchestrator {
                         bytes: bt,
                         broadcaster: bc,
                         active: task_counter,
+                        cleanup: ready_files,
                     }
                     .run()
                     .await
@@ -834,14 +851,6 @@ impl SyncOrchestrator {
             .and(source_dispatch_result)
             .and(source_result);
         let copy_ready = pipeline_result.is_ok();
-        let cleanup_check = SourceCleanupCheck::new(
-            Duration::from_secs(app_config.scan.operation_timeout_secs),
-            Duration::from_secs(app_config.scan.recovery_window_secs),
-            consumer_manager
-                .copy_database_execution()
-                .map(|execution| execution.token().clone())
-                .unwrap_or_default(),
-        );
         let early = async {
             match early_cleanup {
                 Some(stage) => stage.complete(copy_ready, cleanup_check.clone()).await,
@@ -896,7 +905,7 @@ impl SyncOrchestrator {
                         database.clone(),
                         source,
                         destination,
-                        cleanup_check.with_prechecked(early.checked),
+                        cleanup_check.with_prechecked(early.checked, early.streamed_files),
                     )
                     .await?;
                 }

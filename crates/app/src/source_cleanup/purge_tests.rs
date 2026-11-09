@@ -50,7 +50,9 @@ async fn equal_length_source_rewrite_with_restored_mtime_is_retained_after_copy(
     assert_eq!(before.len(), after.len());
     assert_eq!(before.modified()?, after.modified()?);
     assert_refusal(
-        remove_entry(&source, &target, &entry, &check()).await.unwrap_err(),
+        remove_entry(&source, &target, &entry, &check(), None)
+            .await
+            .unwrap_err(),
         "ctime",
     );
     assert_eq!(std::fs::read(&file)?, b"newest");
@@ -71,7 +73,9 @@ async fn source_directory_with_unmigrated_hidden_data_is_retained() -> Result<()
     let entry = observe_path(source.storage(), Path::new("tree")).await?;
     set_entry_metadata(target.storage(), &entry).await?;
     assert_refusal(
-        remove_entry(&source, &target, &entry, &check()).await.unwrap_err(),
+        remove_entry(&source, &target, &entry, &check(), None)
+            .await
+            .unwrap_err(),
         "not empty",
     );
     assert_eq!(std::fs::read(&hidden)?, b"unowned source data");

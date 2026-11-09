@@ -70,7 +70,7 @@ async fn rewritten(
         )
         .await?;
     assert!(matches!(
-        remove_entry(source, target, &entry, check).await,
+        remove_entry(source, target, &entry, check, None).await,
         Err(AppError::StorageError(StorageError::SourcePurgeRefused { .. }))
     ));
     Ok(())
@@ -100,7 +100,7 @@ async fn changed_mode(
         .metadata()?
         .apply(entry.path(), MetadataMutation::Mode(mode), CancellationToken::new())
         .await?;
-    let result = remove_entry(source, target, &entry, check).await;
+    let result = remove_entry(source, target, &entry, check, None).await;
     if change_source {
         assert!(matches!(
             result,
@@ -129,12 +129,12 @@ async fn directory(
     let child = copy(source, target, "app-source-directory/child", false).await?;
     set_entry_metadata(target.storage(), &entry).await?;
     assert!(matches!(
-        remove_entry(source, target, &entry, check).await,
+        remove_entry(source, target, &entry, check, None).await,
         Err(AppError::StorageError(StorageError::SourcePurgeRefused { .. }))
     ));
     source.storage().namespace()?.stat(child.path()).await?;
-    remove_entry(source, target, &child, check).await?;
-    remove_entry(source, target, &entry, check).await?;
+    remove_entry(source, target, &child, check, None).await?;
+    remove_entry(source, target, &entry, check, None).await?;
     absent(source, name).await?;
     Ok(())
 }
@@ -151,7 +151,7 @@ async fn link(
     let entry = observe_path(source.storage(), Path::new(name)).await?;
     namespace::create_symlink(target.storage(), &entry, raw).await?;
     set_entry_metadata(target.storage(), &entry).await?;
-    remove_entry(source, target, &entry, check).await?;
+    remove_entry(source, target, &entry, check, None).await?;
     absent(source, name).await?;
     assert_eq!(
         target.storage().namespace()?.read_link(entry.path()).await?,
@@ -180,8 +180,8 @@ async fn real_source_nfs_purge_uses_target_ready_and_original_source_facts() -> 
         let name = if full { "app-source-full" } else { "app-source-quick" };
         seed(&local, &source, root.path(), name, b"guarded payload").await?;
         let entry = copy(&source, &target, name, full).await?;
-        remove_entry(&source, &target, &entry, &check).await?;
-        remove_entry(&source, &target, &entry, &check).await?;
+        remove_entry(&source, &target, &entry, &check, None).await?;
+        remove_entry(&source, &target, &entry, &check, None).await?;
         absent(&source, name).await?;
     }
     rewritten(&local, &source, &target, root.path(), &check).await?;

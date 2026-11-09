@@ -64,6 +64,7 @@ async fn fixture(
                 transfer_mode: TransferMode::Direct,
                 cancel: Some(cancel),
             }),
+            cleanup: None,
             qos: None,
             bytes: None,
             broadcaster: BroadcastForwarder::new(4),

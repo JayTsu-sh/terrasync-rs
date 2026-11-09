@@ -31,7 +31,9 @@ fn environment(name: &str) -> Result<String> {
 async fn control(action: &str) -> Result<()> {
     let address = environment("LAB_OBJECT_CLEANUP_CONTROL")?;
     // 独占种子准备不计迁移耗时，控制请求单独容纳大历史或百版本故障的写入。
-    let budget = if action.starts_with("arm/") && (action.ends_with("/large") || action.ends_with("/batchmany")) {
+    let budget = if action.starts_with("arm/")
+        && (action.ends_with("/large") || action.ends_with("/batchmany") || action.ends_with("/stream"))
+    {
         60
     } else {
         5
@@ -146,6 +148,17 @@ async fn round(config: &ClickHouseConfig, command: &SyncJobConfig, mode: &str, s
             ),
             "{error}"
         );
+    } else if mode == "dbanddelete" {
+        let error = result.unwrap_err();
+        assert!(error.source_cleanup_entry().is_some(), "{error}");
+        assert!(
+            error.to_string().contains("owned database readiness refusal"),
+            "{error}"
+        );
+        assert!(
+            matches!(error.storage_error(), Some(StorageError::SourcePurgeRefused { .. })),
+            "{error}"
+        );
     } else if matches!(mode, "missingcurrent" | "metaread" | "metachanged") {
         let error = result.unwrap_err();
         assert!(error.source_cleanup_entry().is_some(), "{error}");
@@ -212,14 +225,17 @@ async fn case(config: &ClickHouseConfig, deployment: &str, target: &str, full: b
     command.concurrency = Some(2);
     command.progress_callback_url = Some(CallbackEndpoint::parse(&environment("LAB_OBJECT_CLEANUP_CALLBACK")?)?);
     control(&format!("arm/{prefix}/{mode}")).await?;
-    let result_mode = if matches!(mode, "large" | "historydata" | "historyguard" | "historylatestmarker") {
+    let result_mode = if matches!(
+        mode,
+        "large" | "historydata" | "historyguard" | "historylatestmarker" | "stream"
+    ) {
         "normal"
     } else {
         mode
     };
     round(config, &command, result_mode, 1).await?;
     control(&format!("inspect/{prefix}/{result_mode}")).await?;
-    if !matches!(mode, "normal" | "missingcurrent" | "large") && !mode.starts_with("history") {
+    if !matches!(mode, "normal" | "missingcurrent" | "large" | "stream") && !mode.starts_with("history") {
         control(&format!("recover/{prefix}/{mode}")).await?;
         round(config, &command, "normal", 2).await?;
         control(&format!("inspect/{prefix}/normal")).await?;
@@ -425,6 +441,18 @@ async fn real_unversioned_object_source_cleanup_and_failures() -> Result<()> {
         })?;
         let deployment = if cluster { "cluster" } else { "single" };
         let result: Result<()> = async {
+            if environment("LAB_OBJECT_COMBINED_ONLY").is_ok_and(|value| value == "true") {
+                AppConfig::override_with(|global| global.database.batch_size = 1)?;
+                return Box::pin(case(&config, deployment, "latest", false, "dbanddelete")).await;
+            }
+            if environment("LAB_OBJECT_STREAM_ONLY").is_ok_and(|value| value == "true") {
+                for target in ["latest", "history"] {
+                    for full in [false, true] {
+                        Box::pin(case(&config, deployment, target, full, "stream")).await?;
+                    }
+                }
+                return Ok(());
+            }
             if environment("LAB_OBJECT_HISTORY_ONLY").is_ok_and(|value| value == "true") {
                 return Box::pin(history_cases(&config, deployment)).await;
             }

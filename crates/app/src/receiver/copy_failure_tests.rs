@@ -31,7 +31,9 @@ fn config() -> ReceiverConfig {
 async fn copy(
     entry: &Arc<ObservedEntry>, source: &Arc<StorageContext>, destination: &Arc<StorageContext>,
 ) -> Result<()> {
-    process_entry_on_receiver(entry, source, destination, &config(), None, None).await
+    process_entry_on_receiver(entry, source, destination, &config(), None, None)
+        .await
+        .map(|_| ())
 }
 
 #[tokio::test]

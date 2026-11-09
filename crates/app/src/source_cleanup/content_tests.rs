@@ -103,7 +103,7 @@ async fn full_verification_keeps_source_when_existing_target_has_equal_size_and_
     assert_eq!(std::fs::metadata(&target_file)?.len(), before.len());
     assert_eq!(std::fs::metadata(&target_file)?.modified()?, before.modified()?);
 
-    let result = remove_entry(&source, &target, &entry, &full_check()).await;
+    let result = remove_entry(&source, &target, &entry, &full_check(), None).await;
     assert!(
         result.is_err(),
         "full verification must reject corrupted target: {result:?}"
@@ -133,7 +133,7 @@ async fn quick_verification_reads_no_payload_and_full_verification_reads_both_em
             let source_reads = probe(&mut source, ReadBehavior::Pass)?;
             let target_reads = probe(&mut target, ReadBehavior::Pass)?;
             let check = full_check().with_content_verification(full);
-            remove_entry(&source, &target, &entry, &check).await?;
+            remove_entry(&source, &target, &entry, &check, None).await?;
             assert_eq!(source_reads.reads.load(Ordering::SeqCst), usize::from(full));
             assert_eq!(target_reads.reads.load(Ordering::SeqCst), usize::from(full));
             assert!(!source_root.path().join("file").exists());
@@ -168,7 +168,9 @@ async fn unreadable_source_or_target_preserves_both_and_attributes_the_original_
                 },
                 ReadBehavior::Fail(class),
             )?;
-            let error = remove_entry(&source, &target, &entry, &full_check()).await.unwrap_err();
+            let error = remove_entry(&source, &target, &entry, &full_check(), None)
+                .await
+                .unwrap_err();
             assert_eq!(
                 error.storage_error().is_some_and(StorageError::is_cancelled),
                 class == FailureClass::Cancelled
@@ -197,7 +199,9 @@ async fn equal_digests_of_two_short_reads_do_not_authorize_source_deletion() -> 
     copy_file(&source, &target, &entry, CopyOptions::default(), None).await?;
     probe(&mut source, ReadBehavior::Short)?;
     probe(&mut target, ReadBehavior::Short)?;
-    let error = remove_entry(&source, &target, &entry, &full_check()).await.unwrap_err();
+    let error = remove_entry(&source, &target, &entry, &full_check(), None)
+        .await
+        .unwrap_err();
     assert!(
         matches!(error.storage_error(), Some(StorageError::SourceCleanupContentUnverified {
         side: NativeIntegritySide::Source,
@@ -225,7 +229,7 @@ async fn cancellation_during_content_read_preserves_both_sides() -> Result<()> {
         check.cancel.cancel();
     };
     let (result, ()) = tokio::time::timeout(Duration::from_secs(1), async {
-        tokio::join!(remove_entry(&source, &target, &entry, &check), cancel)
+        tokio::join!(remove_entry(&source, &target, &entry, &check, None), cancel)
     })
     .await
     .unwrap();
@@ -271,9 +275,12 @@ async fn real_existing_s3_content_verification_gates_source_removal() -> Result<
         None
     };
     let started = tokio::time::Instant::now();
-    let result = tokio::time::timeout(Duration::from_secs(8), remove_entry(&source, &target, &entry, &check))
-        .await
-        .unwrap();
+    let result = tokio::time::timeout(
+        Duration::from_secs(8),
+        remove_entry(&source, &target, &entry, &check, None),
+    )
+    .await
+    .unwrap();
     let elapsed = started.elapsed();
     if let Some(task) = cancel_task {
         task.await?;
@@ -326,7 +333,7 @@ async fn real_existing_s3_content_verification_gates_source_removal() -> Result<
             assert_eq!(std::fs::read(root.join("payload"))?, b"verified payload");
             if matches!(fault.as_str(), "flash" | "recover_stall") {
                 std::fs::write(environment("LAB_CONTENT_CONTROL")?, "normal")?;
-                remove_entry(&source, &target, &entry, &check).await?;
+                remove_entry(&source, &target, &entry, &check, None).await?;
                 assert!(!root.join("payload").exists());
             }
         }

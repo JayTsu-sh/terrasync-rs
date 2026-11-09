@@ -88,7 +88,9 @@ async fn persistence_errors_keep_both_files_and_directories_and_preserve_the_typ
                 copy_file(&source, &target, &entry, CopyOptions::default(), None).await?;
             }
             refuse(&mut target, class)?;
-            let error = remove_entry(&source, &target, &entry, &check()).await.unwrap_err();
+            let error = remove_entry(&source, &target, &entry, &check(), None)
+                .await
+                .unwrap_err();
             assert_eq!(
                 error.storage_error().is_some_and(StorageError::is_cancelled),
                 class == FailureClass::Cancelled
@@ -120,7 +122,7 @@ async fn later_metadata_only_updates_are_persisted_before_source_removal() -> Re
     std::fs::set_permissions(source_root.path().join("file"), std::fs::Permissions::from_mode(0o640))?;
     let entry = observe_path(source.storage(), Path::new("file")).await?;
     set_entry_metadata(target.storage(), &entry).await?;
-    remove_entry(&source, &target, &entry, &check()).await?;
+    remove_entry(&source, &target, &entry, &check(), None).await?;
     assert!(!source_root.path().join("file").exists());
     assert_eq!(std::fs::read(target_root.path().join("file"))?, b"payload");
     assert_eq!(

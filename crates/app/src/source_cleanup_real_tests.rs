@@ -120,7 +120,11 @@ async fn fault_case(fault: &str, quoted_root: &str) -> Result<()> {
         }
     });
     let start = Instant::now();
-    let result = timeout(Duration::from_secs(8), remove_entry(&source, &target, &entry, &check)).await;
+    let result = timeout(
+        Duration::from_secs(8),
+        remove_entry(&source, &target, &entry, &check, None),
+    )
+    .await;
     let elapsed = start.elapsed();
     control("normal").await?;
     watcher.await?;
@@ -210,14 +214,14 @@ async fn real_nfs_mode_change_after_copy_retains_source_and_unchanged_mode_can_b
         if changed {
             remote(&format!("import os\nos.chmod({quoted_root}+'/changed',0o750)")).await?;
         }
-        let result = remove_entry(&source, &target, &entry, &check).await;
+        let result = remove_entry(&source, &target, &entry, &check, None).await;
         if changed {
             assert!(
                 matches!(result, Err(AppError::StorageError(StorageError::SourceMetadataChanged { families, .. })) if families == [MetadataFamily::OwnershipMode])
             );
         } else {
             result?;
-            remove_entry(&source, &target, &entry, &check).await?;
+            remove_entry(&source, &target, &entry, &check, None).await?;
         }
         assert_eq!(std::fs::read(target_root.path().join(name))?, b"payload");
     }

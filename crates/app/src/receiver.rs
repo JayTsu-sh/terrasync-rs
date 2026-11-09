@@ -10,7 +10,9 @@ use data_mover::model::BackendKind;
 use transport::acl::decode_acl;
 // 标准库
 use crate::error::StorageError;
-use crate::file_copy::{CopyOptions, HdfsCopyContext, copied_tags_required, copy_file, prepare_directory};
+use crate::file_copy::{
+    CopiedPublication, CopyOptions, HdfsCopyContext, copied_tags_required, copy_file, prepare_directory,
+};
 use data_mover::model::FailureClass;
 use std::path::{Component, Path};
 use std::sync::Arc;
@@ -135,7 +137,7 @@ pub async fn receiver_task(
                 )
                 .await
                 {
-                    Ok(()) => {
+                    Ok(_) => {
                         if let Err(e) = transport.send(ReceiverMsg::EntrySuccess { entry }).await {
                             warn!("[Receiver] Failed to send EntrySuccess: {}", e);
                         }
@@ -203,7 +205,7 @@ pub async fn receiver_task(
 pub(crate) async fn process_entry_on_receiver(
     entry: &Arc<ObservedEntry>, src_storage: &Arc<StorageContext>, dest_storage: &Arc<StorageContext>,
     config: &ReceiverConfig, qos_manager: Option<QosManager>, bytes_counter: Option<Arc<AtomicU64>>,
-) -> Result<()> {
+) -> Result<Option<CopiedPublication>> {
     let relative_path = entry.get_relative_path();
     let span = info_span!("recv_entry", path = %relative_path.display());
 
@@ -212,6 +214,7 @@ pub(crate) async fn process_entry_on_receiver(
             return Err(StorageError::Cancelled.into());
         }
         if prepare_directory(entry, dest_storage).await? {
+            Ok(None)
         } else if entry.get_is_symlink() {
             let target_path = copy_namespace::read_symlink(src_storage.storage(), entry)
                 .await
@@ -219,6 +222,7 @@ pub(crate) async fn process_entry_on_receiver(
             copy_namespace::create_symlink(dest_storage.storage(), entry, &target_path)
                 .await
                 .map_err(|e| AppError::copy_entry_failure(CopyStep::CreateDestinationLink, relative_path, e))?;
+            Ok(None)
         } else {
             // 所有文件使用同一显式策略；检查点及原子发布由上游管理。
             let resume = ResumeOpts {
@@ -227,7 +231,7 @@ pub(crate) async fn process_entry_on_receiver(
                 transfer_mode: config.transfer_mode,
                 cancel: config.cancel.clone(),
             };
-            if dest_storage.as_ref().storage().kind() == BackendKind::Hdfs {
+            let published = if dest_storage.as_ref().storage().kind() == BackendKind::Hdfs {
                 let hdfs = HdfsCopyContext::from_job(&config.job_id, config.transfer_mode)?;
                 let recorder = if config.transfer_mode == TransferMode::Checkpoint {
                     Some(CommitRecorder::start(&config.job_dir, entry, src_storage.block_size()).await?)
@@ -252,9 +256,9 @@ pub(crate) async fn process_entry_on_receiver(
                 )
                 .await;
                 if let Some(recorder) = recorder {
-                    recorder.finish(result).await?;
+                    recorder.finish(result).await?
                 } else {
-                    result?;
+                    result?
                 }
             } else if should_resume(&resume, entry, src_storage, dest_storage) {
                 copy_file_with_resume(
@@ -270,7 +274,7 @@ pub(crate) async fn process_entry_on_receiver(
                     },
                     &config.job_dir,
                 )
-                .await?;
+                .await?
             } else {
                 copy_file(
                     src_storage,
@@ -290,9 +294,8 @@ pub(crate) async fn process_entry_on_receiver(
             };
 
             // 普通传输和检查点传输都在发布前应用协商后的元数据。
+            Ok(published)
         }
-
-        Ok(())
     }
     .instrument(span)
     .await

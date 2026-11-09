@@ -125,7 +125,7 @@ fn prechecked_facts_are_bound_to_both_path_and_source_identity() {
     );
     let mut completed = CompletedChecks::new();
     completed.insert(original.path().clone(), original.identity_key());
-    let check = check().with_prechecked(completed);
+    let check = check().with_prechecked(completed, false);
     assert!(check.is_prechecked(&original));
     assert!(!check.is_prechecked(&other_path));
     assert!(!check.is_prechecked(&replacement));
@@ -144,7 +144,7 @@ async fn cleanup_runs_only_after_full_copy_gate_and_does_not_require_a_database(
         let item = Arc::new(observe_path(source.storage(), Path::new("file")).await?);
         copy_file(&source, &target, &item, CopyOptions::default(), None).await?;
         let mut broadcaster = BroadcastForwarder::new(2);
-        let stage = FullCleanupStage::start(&mut broadcaster, 2);
+        let stage = FullCleanupStage::start(&mut broadcaster, 2, None);
         assert!(stage.connections().set((source, target)).is_ok());
         broadcaster.broadcast(StorageEntryMessage::New(item.into())).await?;
         assert!(source_root.path().join("file").exists());
@@ -166,7 +166,7 @@ async fn first_target_failure_stops_new_deletions_and_preserves_each_source() ->
     let target =
         Arc::new(create_storage(&target_root.path().to_string_lossy(), CreateStorageOptions::default()).await?);
     let mut broadcaster = BroadcastForwarder::new(2);
-    let stage = FullCleanupStage::start(&mut broadcaster, 2);
+    let stage = FullCleanupStage::start(&mut broadcaster, 2, None);
     assert!(stage.connections().set((source.clone(), target.clone())).is_ok());
     for name in ["a", "b"] {
         std::fs::write(source_root.path().join(name), b"verified")?;

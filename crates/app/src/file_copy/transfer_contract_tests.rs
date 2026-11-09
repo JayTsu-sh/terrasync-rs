@@ -386,3 +386,34 @@ async fn direct_data_failure_removes_owned_target_while_source_and_typed_reason_
     }
     Ok(())
 }
+
+#[tokio::test]
+async fn copied_publication_cannot_authorize_another_source_snapshot() -> TestResult {
+    let source_root = tempfile::tempdir()?;
+    let target_root = tempfile::tempdir()?;
+    std::fs::write(source_root.path().join("file"), b"verified source")?;
+    let source = create_storage(&source_root.path().to_string_lossy(), CreateStorageOptions::default()).await?;
+    let target = create_storage(&target_root.path().to_string_lossy(), CreateStorageOptions::default()).await?;
+    let entry = Arc::new(observe_path(source.storage(), Path::new("file")).await?);
+    for original in [false, true] {
+        let published = transfer::copy_entry(&source, &target, &entry, CopyOptions::default())
+            .await?
+            .ok_or("ordinary file did not return its verified publication")?;
+        let snapshot = entry.as_ref().clone();
+        let expected = if original { entry.as_ref() } else { &snapshot };
+        let checked = published.into_target(expected);
+        if original {
+            let checked = checked?;
+            assert_eq!(checked.path, *entry.path());
+            assert!(
+                checked.version.version_id().is_none(),
+                "durability confirmation must check Current"
+            );
+        } else {
+            assert!(matches!(checked, Err(StorageError::TargetPublicationChanged { .. })));
+        }
+        assert_eq!(std::fs::read(source_root.path().join("file"))?, b"verified source");
+        assert_eq!(std::fs::read(target_root.path().join("file"))?, b"verified source");
+    }
+    Ok(())
+}
