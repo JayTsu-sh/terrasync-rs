@@ -12,10 +12,11 @@ use db::catalogue::CopyCatalogueEntry;
 use task_model::{ErrorEvent, ObservedEntryExt, StorageEntryMessage};
 use tokio::sync::mpsc::{self, Receiver};
 use tokio::task::{Id, JoinError, JoinHandle, JoinSet};
-use tokio_util::task::AbortOnDropHandle;
+use tokio_util::{sync::CancellationToken, task::AbortOnDropHandle};
 use tracing::{Instrument, info, info_span, trace, warn};
 
 use crate::consumer::{TaskStatistics, stats::DirectoryMetadataProgressBar};
+use crate::copy_execution::CopyDatabaseExecution;
 use crate::error::{AppError, Result};
 
 const DIRECTORY_CONCURRENCY: usize = 32;
@@ -46,9 +47,20 @@ impl Drop for DirectoryProgress {
 
 pub(crate) async fn complete(
     database: ClickHouseDatabase, destination: Arc<StorageContext>, statistics: Option<TaskStatistics>,
+    execution: Option<CopyDatabaseExecution>,
 ) -> Result<()> {
+    if let Some(execution) = &execution
+        && execution.token().is_cancelled()
+    {
+        return Err(execution.stopped_error());
+    }
     if destination.storage().kind() != BackendKind::S3 {
-        update_directories(database.clone(), destination, statistics).await?;
+        update_directories(database.clone(), destination, statistics, execution.clone()).await?;
+    }
+    if let Some(execution) = &execution
+        && execution.token().is_cancelled()
+    {
+        return Err(execution.stopped_error());
     }
     database.commit_scan_generation().await?;
     Ok(())
@@ -56,30 +68,51 @@ pub(crate) async fn complete(
 
 async fn update_directories(
     database: ClickHouseDatabase, destination: Arc<StorageContext>, statistics: Option<TaskStatistics>,
+    execution: Option<CopyDatabaseExecution>,
 ) -> Result<()> {
     let (sender, receiver) = mpsc::channel(1000);
+    let query_execution = execution.clone();
     let query = tokio::spawn(
         async move {
-            database
-                .query_current_copy_entries(Some(true), None, None, sender)
-                .await?;
-            info!("Query selected current-copy directories completed");
-            Ok(())
+            CopyDatabaseExecution::run_optional_child(query_execution, async move {
+                database
+                    .query_current_copy_entries(Some(true), None, None, sender)
+                    .await?;
+                info!("Query selected current-copy directories completed");
+                Ok(())
+            })
+            .await
         }
         .instrument(info_span!("directory_metadata_query")),
     );
-    apply_directories(query, receiver, destination, statistics).await
+    apply_directories(query, receiver, destination, statistics, execution).await
 }
 
 async fn apply_directories(
     query: JoinHandle<Result<()>>, mut receiver: Receiver<CopyCatalogueEntry>, destination: Arc<StorageContext>,
-    statistics: Option<TaskStatistics>,
+    statistics: Option<TaskStatistics>, execution: Option<CopyDatabaseExecution>,
 ) -> Result<()> {
     // 调用方取消整个收尾 future 时，查询与进度线程也随所属执行域释放。
-    let query = AbortOnDropHandle::new(query);
-    let mut updates = DirectoryUpdates::new(destination, statistics);
+    let cancel = execution
+        .as_ref()
+        .map(|execution| execution.token().clone())
+        .unwrap_or_default();
+    let mut query = AbortOnDropHandle::new(query);
+    let mut updates = DirectoryUpdates::new(destination, statistics, cancel.clone());
     let mut depth = None;
-    while let Some(completion) = receiver.recv().await {
+    loop {
+        let completion = tokio::select! {
+            biased;
+            () = cancel.cancelled() => {
+                receiver.close();
+                query.abort();
+                break;
+            }
+            completion = receiver.recv() => match completion {
+                Some(completion) => completion,
+                None => break,
+            }
+        };
         let entry = completion.completion.item.entry;
         let entry_depth = entry.path().as_str().split('/').count();
         // 查询按深度倒序；父目录收紧权限前，必须完成所有更深目录。
@@ -90,23 +123,44 @@ async fn apply_directories(
         updates.push(entry).await;
     }
     updates.drain().await;
-    let query_result = query.await.map_err(AppError::from).and_then(|result| result);
-    query_result?;
+    let query_result = tokio::select! {
+        biased;
+        () = cancel.cancelled() => {
+            query.abort();
+            match query.await {
+                Err(error) if error.is_cancelled() => Ok(Ok(())),
+                result => result,
+            }
+        }
+        result = &mut query => result,
+    };
+    query_result.map_err(AppError::from)??;
+    if let Some(execution) = &execution
+        && cancel.is_cancelled()
+    {
+        return Err(execution.stopped_error());
+    }
     updates.finish()
+}
+
+enum DirectoryUpdate {
+    Applied,
+    NotStarted,
 }
 
 /// 目录更新的在途状态和逐项诊断；不持有查询或消费者生命周期。
 struct DirectoryUpdates {
     failure: Option<AppError>,
     paths: HashMap<Id, Arc<ObservedEntry>>,
-    tasks: JoinSet<Result<()>>,
+    tasks: JoinSet<Result<DirectoryUpdate>>,
     progress: DirectoryProgress,
     destination: Arc<StorageContext>,
     statistics: Option<TaskStatistics>,
+    cancel: CancellationToken,
 }
 
 impl DirectoryUpdates {
-    fn new(destination: Arc<StorageContext>, statistics: Option<TaskStatistics>) -> Self {
+    fn new(destination: Arc<StorageContext>, statistics: Option<TaskStatistics>, cancel: CancellationToken) -> Self {
         let progress = DirectoryProgress::new();
         let tasks = JoinSet::new();
         // 与在途任务同生命周期，panic 也能定位目录；数量不超过并发上限。
@@ -118,6 +172,7 @@ impl DirectoryUpdates {
             progress,
             destination,
             statistics,
+            cancel,
         }
     }
 
@@ -126,12 +181,20 @@ impl DirectoryUpdates {
         while self.tasks.len() >= DIRECTORY_CONCURRENCY {
             self.join_next().await;
         }
+        // 等待深度屏障或并发槽期间可能取消；后续目录不再进入存储操作。
+        if self.cancel.is_cancelled() {
+            return;
+        }
+        let cancel = self.cancel.clone();
         let target = self.destination.clone();
         let task_entry = entry.clone();
         let task = self.tasks.spawn(async move {
+            if cancel.is_cancelled() {
+                return Ok(DirectoryUpdate::NotStarted);
+            }
             trace!(path = ?entry.get_relative_path(), "Updating directory metadata");
-            copy_metadata::set_entry_metadata(target.storage(), &entry, None).await?;
-            Ok(())
+            copy_metadata::set_entry_metadata(target.storage(), &entry, Some(cancel)).await?;
+            Ok(DirectoryUpdate::Applied)
         });
         self.paths.insert(task.id(), task_entry);
     }
@@ -162,16 +225,17 @@ impl DirectoryUpdates {
         })
     }
 
-    async fn record_update(&mut self, result: std::result::Result<(Id, Result<()>), JoinError>) {
+    async fn record_update(&mut self, result: std::result::Result<(Id, Result<DirectoryUpdate>), JoinError>) {
         let (id, result) = match result {
             Ok((id, result)) => (id, result),
             Err(error) => (error.id(), Err(error.into())),
         };
         let entry = self.paths.remove(&id);
         match result {
-            Ok(()) => {
+            Ok(DirectoryUpdate::Applied) => {
                 self.progress.bar.increment_dir_count();
             }
+            Ok(DirectoryUpdate::NotStarted) => {}
             Err(error) => {
                 // 所有最终失败逐项交付；返回值仍保留首个有类型原因，不累计整轮明细。
                 if let (Some(statistics), Some(entry)) = (&self.statistics, entry) {

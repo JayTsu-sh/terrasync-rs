@@ -73,7 +73,7 @@ async fn directory_query_failure_stays_typed_and_drains_updates() -> Result<()> 
             .map_err(|_| AppError::ScanWorkerStopped)?;
         Err(DatabaseError::ConfigError("directory query regression fixture".into()).into())
     });
-    let result = apply_directories(query, receiver, target(&destination).await?, None).await;
+    let result = apply_directories(query, receiver, target(&destination).await?, None, None).await;
     assert!(matches!(
         result,
         Err(AppError::DatabaseError(DatabaseError::ConfigError(_)))
@@ -101,7 +101,7 @@ async fn directory_write_failure_stays_typed_and_drains_later_updates() -> Resul
             .map_err(|_| AppError::ScanWorkerStopped)?;
         Ok(())
     });
-    let result = apply_directories(query, receiver, target(&destination).await?, None).await;
+    let result = apply_directories(query, receiver, target(&destination).await?, None, None).await;
     assert!(matches!(result, Err(AppError::StorageError(_))));
     verify_mtime(&destination, "present", expected)
 }
@@ -114,7 +114,7 @@ async fn directory_query_panic_is_observed() -> Result<()> {
         let _sender = sender;
         panic!("directory query regression fixture");
     });
-    let result = apply_directories(query, receiver, target(&destination).await?, None).await;
+    let result = apply_directories(query, receiver, target(&destination).await?, None, None).await;
     assert!(matches!(result, Err(AppError::TaskJoinError(error)) if error.is_panic()));
     Ok(())
 }
@@ -139,7 +139,13 @@ async fn cancelled_metadata_stage_does_not_detach_query() -> Result<()> {
         drop(sender);
         Ok(())
     });
-    let task = tokio::spawn(apply_directories(query, receiver, target(&destination).await?, None));
+    let task = tokio::spawn(apply_directories(
+        query,
+        receiver,
+        target(&destination).await?,
+        None,
+        None,
+    ));
     ready.await.map_err(|_| AppError::ScanWorkerStopped)?;
     task.abort();
     assert!(matches!(task.await, Err(error) if error.is_cancelled()));
@@ -206,7 +212,7 @@ async fn isolated_generation_case(mode: ClickHouseMode) -> Result<()> {
             .begin_copy_generation(&request("directory-completion-regression", true))
             .await?;
         database.batch_insert_base_record(&[Arc::new(entry.clone())]).await?;
-        let result = complete(database.clone(), target(&destination).await?, None).await;
+        let result = complete(database.clone(), target(&destination).await?, None, None).await;
         if !matches!(result, Err(AppError::StorageError(_))) {
             return Err(AppError::CopyError(format!(
                 "metadata failure was not reported: {result:?}"
@@ -223,7 +229,7 @@ async fn isolated_generation_case(mode: ClickHouseMode) -> Result<()> {
         }
         std::fs::create_dir(destination.path().join("missing"))?;
         database.batch_insert_base_record(&[Arc::new(entry.clone())]).await?;
-        complete(database.clone(), target(&destination).await?, None).await?;
+        complete(database.clone(), target(&destination).await?, None, None).await?;
         verify_mtime(&destination, "missing", entry.get_mtime())?;
         if database
             .begin_copy_generation(&request("directory-completion-regression", true))
@@ -311,6 +317,7 @@ async fn every_failed_directory_is_reported_once_and_later_directories_finish() 
             receiver,
             target(&destination).await?,
             Some(manager.task_statistics()),
+            None,
         )
         .await;
         let error = result
@@ -352,7 +359,11 @@ async fn directory_worker_panic_retains_path_and_typed_failure() -> Result<()> {
     let manager = statistics_manager(JobType::Copy)?;
     let entry = Arc::new(directory_entry(&source, "panicked-directory").await?);
     let destination = TempDir::new()?;
-    let mut updates = DirectoryUpdates::new(target(&destination).await?, Some(manager.task_statistics()));
+    let mut updates = DirectoryUpdates::new(
+        target(&destination).await?,
+        Some(manager.task_statistics()),
+        CancellationToken::new(),
+    );
     let task = updates.tasks.spawn(async { panic!("owned directory worker panic") });
     updates.paths.insert(task.id(), entry);
     let result = updates
@@ -390,6 +401,7 @@ async fn query_failure_does_not_hide_already_failed_directory() -> Result<()> {
         receiver,
         target(&destination).await?,
         Some(manager.task_statistics()),
+        None,
     )
     .await;
     let error = result.err().ok_or(AppError::ScanWorkerStopped)?;
@@ -415,3 +427,6 @@ async fn query_failure_does_not_hide_already_failed_directory() -> Result<()> {
     ));
     Ok(())
 }
+
+#[path = "copy_completion_cancel_tests.rs"]
+mod cancellation_tests;

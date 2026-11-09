@@ -1787,3 +1787,115 @@ in Native roles. Caller tokens are cloned with bounded in-flight work; no whole-
 error collection or new durable side channel is introduced. Database-independent
 directory finalization, all-entry asynchronous cleanup, uniform stage counters,
 and cross-stage fault budgets/jitter handling remain pending in the full plan.
+
+## Directory completion cancellation and bound-root isolation
+
+`python3 tests/lab/run-directory-cancel-nfs.py` uses the existing VM 104 NFSv4.1
+export through PVE (`LAB_PVE_SSH_KEY`, default the existing laboratory key), fresh
+localhost-only ClickHouse ports and an owned `nightly-directory-cancel-*` prefix.
+It changes no export, service, firewall or unrelated data. Set
+`LAB_DATA_MOVER_ROOT` when the companion repository is not the default sibling;
+its existing bounded RPC decoder is reused. The runner removes its services,
+containers and exact owned prefix on exit.
+
+A real directory-only catalogue SELECT arms the private NFS relay after all data
+copy workers finish. The relay suppresses three directory SETATTR requests and
+then disconnects only this job's ClickHouse data connections; notification storage
+and HTTP 204 callback remain available. The fault is one-shot. It is released only
+on an observed cancellation request or this job's independent terminal generation
+request after leaving the execution scope. An idle execution can join every
+request before its optional KILL QUERY manager runs, so the test does not require
+that particular management RPC. No fixed delay hides an active fault.
+
+The final exact-revision run passed ten generations across Single and a
+one-shard/two-replica deployment: two retain-source full baselines, two failed full
+moves, two failed incremental moves, and four full recovery moves. File timestamps
+are normal filesystem timestamps, each root/entry has different bytes, and
+independent guest reads use O_NOATIME. Every failure retained all source payloads
+and target data. The four callbacks delivered all twelve directory paths with
+backend, finalization phase and cancelled/unconfirmed write causes; counts remained
+three entry errors and one task error after HTTP 204, with no omitted diagnostics.
+The failed incrementals transferred zero file data. Recovery restored exact
+nanosecond directory mtime and mode, purged source contents and retired all base
+facts. Both failed and successful final reports were independently queried from
+ClickHouse. Fault injection to the first independent terminal-generation request
+was 3.59–3.99 seconds; whole failed tasks including finalization/reporting took
+6.40–8.63 seconds. Neither number proves the detection or shared recovery budget
+for all backends, a whole CLI user-cancel path, or cross-generation late-write fencing.
+
+Six new deterministic cases cover pre-cancel before query/commit, 128 queued
+entries, idle query ownership, 32 started writes without admitting entry 33, an
+already-completed query failure, and the saved execution root cause. The directory
+module passed thirteen tests (two existing environment cases ignored). The final
+five Rust CI checks passed: app 361 passed/49 ignored and sixteen remote-process
+cases passed. The earlier 70-directory permission regression also passed ten
+real generations, delivering 280 errors with no omissions, preserving source/data,
+completing a writable sibling, and recovering with correct directory metadata.
+
+The controlled tests exposed a separate NFS bound-prefix cache defect. Independent
+Native v3/v4.1 cases first proved that changing B/item changed A/item instead;
+57e5d00 updates the existing cache-root identifier when binding the actual root
+FH. e426d09 adds in-flight cancellation to the existing Metadata::apply token.
+Neither introduces a public function/type or SDK change. Both Native changes
+completed the entire CI scope in documented sequential steps; the root fix also
+reran all sixteen metadata fault cases. With 57e5d00, the complete application
+matrix passed under ordinary atime; no production timestamp check or persistence
+check was relaxed. Prior failed atime and fixed-time experiments remain archived
+as diagnostic evidence and are not successful acceptance samples.
+
+The common isolated ClickHouse profile now uses a global thread pool of 512;
+its two-CPU/1536-MiB limits and product timeouts are unchanged. The old 192 profile
+failed in the replicated permission test with probe/diagnostic timeouts; the
+unchanged suite passed at 512. The earlier fixed-program incremental benchmark
+had independently demonstrated the same pool-capacity issue. The private NFS
+runner and both benchmark binaries use this same profile. Guest Agent briefly
+became unavailable during one preparation attempt; read-only probes recovered
+and its exact potentially-created prefix was cleaned. No VM restart or service
+change was performed.
+
+Final evidence on the development host:
+
+- `/tmp/terrasync-directory-cancel-final-ci-results.json` and the five CI logs.
+- `/tmp/terrasync-directory-cancel-final-nfs10-real.log`, including exact callback
+  counts, zero incremental replay and independent source/target checks.
+- `/tmp/terrasync-directory-cancel-final-permission10-pool512-real.log`;
+  the failed 192-profile log is preserved separately as
+  `/tmp/terrasync-directory-cancel-final-permission10-real.log`.
+- `/tmp/native-nfs-metadata-cancel-final-real-driver.log`,
+  `/tmp/native-nfs-prefix-cache-{red,green}-real.log`,
+  `/tmp/native-nfs-prefix-cache-metadata16-real.log` and both Native CI scopes.
+- The first fixture's KILL assumption, the repeated rearming, ordinary-atime
+  failures and Guest Agent preparation failure remain in the
+  `/tmp/terrasync-directory-cancel-*-real.log` diagnostic series.
+
+The fixed before/after CLI benchmark used Rust 1.98.1 dev/debug=0,
+16 workers/100000 batch, unordered/Direct/quick and the shared Single ClickHouse
+profile. ABBAABBAABBA per scenario produced 36 measured runs, with 24 separate
+unmeasured incremental full baselines. No task-owned build, CI or functional test
+ran alongside measurement. Every body, source retention/deletion, mode, directory
+nanosecond mtime, generation/base state and saved final report was checked.
+Incremental data transfer was zero. Fifty-millisecond RSS samples and GNU time
+peaks are retained with each result.
+
+| Scenario | Median seconds before → after | Change | Median peak RSS MiB before → after | RSS change |
+| --- | --- | --- | --- | --- |
+| Full move, 3000 × 1 KiB, 100 directories | 5.555 → 5.605 | +0.90% | 219.68 → 222.35 | +1.21% |
+| Retained-source unchanged incremental, 3000 files | 1.855 → 1.865 | +0.54% | 233.93 → 239.38 | +2.33% |
+| Retained-source incremental, 30 mode changes | 2.190 → 2.060 | −5.94% | 241.85 → 233.96 | −3.26% |
+
+Time passed the respective 5%/10% gates, with comparable memory overhead.
+After max RSS was 243.72 MiB: this sample does not satisfy a universal 200-MiB
+bound, certify large/release/all-backend behavior, or measure sustained growth.
+No callback was configured in performance runs; full planned-retention diagnostics
+were pending and cannot be counted as externally delivered. Before SHA-256 is
+`3e13852acce572092bd4e272807cae63f93f41beaf6bd243bc30c5e236a92418`;
+after is `90d7a5645609070ec8396304c156c0203c0752eff936d46bc20da7ce322d76b4`.
+Exact binaries, hashes, all raw/summary results, bootstrap runs, sampled RSS and
+server diagnostics are under `/tmp/terrasync-directory-cancel-perf/`.
+
+Final architecture review keeps migration/source-deletion decisions in the task
+layer, execution cancellation in the existing copy_execution domain, bounded
+directory work/path diagnostics in copy_completion, and protocol/binding behavior
+in Native. No ClickHouse/callback policy was moved into storage. Directory/root
+metadata without a database, asynchronous source cleanup for every entry class,
+unified stage counters and shared fault/late-write control remain plan items.

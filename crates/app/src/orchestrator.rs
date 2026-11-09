@@ -889,6 +889,7 @@ impl SyncOrchestrator {
                     database.clone(),
                     destination.clone(),
                     Some(consumer_manager.task_statistics()),
+                    consumer_manager.copy_database_execution(),
                 )
                 .await?;
                 if !is_source_reserved {
@@ -1297,6 +1298,7 @@ impl SyncOrchestrator {
                 database.clone(),
                 destination.clone(),
                 Some(consumer_manager.task_statistics()),
+                consumer_manager.copy_database_execution(),
             )
             .await?;
             if !is_source_reserved {

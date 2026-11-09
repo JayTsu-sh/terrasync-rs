@@ -33,6 +33,9 @@ pub(crate) struct CopyLease {
 }
 
 #[cfg(all(test, unix))]
+#[path = "copy_completion_cancel_real_tests.rs"]
+mod directory_cancel_tests;
+#[cfg(all(test, unix))]
 #[path = "copy_completion_real_tests.rs"]
 mod directory_completion_tests;
 #[cfg(test)]

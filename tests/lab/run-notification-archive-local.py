@@ -38,7 +38,7 @@ def configuration(replica):
       <interserver_http_port>{interserver_port}</interserver_http_port>
       <interserver_http_host>127.0.0.1</interserver_http_host>
       <max_server_memory_usage>1073741824</max_server_memory_usage>
-      <max_thread_pool_size>192</max_thread_pool_size>
+      <max_thread_pool_size>512</max_thread_pool_size>
       <background_schedule_pool_size>4</background_schedule_pool_size>
       <background_message_broker_schedule_pool_size>2</background_message_broker_schedule_pool_size>
       <background_distributed_schedule_pool_size>2</background_distributed_schedule_pool_size>
