@@ -902,8 +902,8 @@ before、after、after、before、before、after 交错执行；每轮 1000 个 
 再在新依赖下加入组合故障，26 轮通过。扩充的测试 future 曾触及测试线程默认栈，
 改为 Box::pin 大型测试 case 后复跑通过，未提高产品运行时栈限制。
 Native 已有 13 项 Direct 单元回归、13 项真实原生复制、60 项真实失败数据清理、
-完整 CI 范围分步和最终严格 Clippy 通过。原生对 checkpointed ambiguous-completion 的
-旧断言仍明确保留，AtomicReplace／Checkpointed 的推断版本及恢复证据留待下一项；
+完整 CI 范围分步和最终严格 Clippy 通过。在本步骤完成时，checkpointed ambiguous-completion 仍保留旧断言；
+AtomicReplace／Checkpointed 的推断版本及恢复证据由下一节继续处理；
 历史永久删源仍明确拒绝，不以本项 Direct 确认代替全部历史目标就绪证明。
 
 新依赖与本次任务层修改的最终 Rust 五项检查均通过：fmt、workspace/all-targets check、
@@ -933,3 +933,65 @@ Rust 1.98.1，两份程序按 before、after、after、before、before、after �
 `cd743d8c7d2862e0d90b17aa53fe6ff9194a648f66fafbc14388113e316630fc`、
 `eb508dce9ce5c321db34f392918d8781e4498672019d52eb5b18e710c73f7b96`。
 功能和性能夹具的独占容器均已清理。
+
+### 全部 S3 发布模式与 checkpoint 的创建版本证据
+
+后续固定 Native `8bfa329c`，将同一约束扩展到 AtomicReplace／Checkpointed 的普通、流式、
+最终路径和恢复路径。现有 S3WriteFacts 分开保存观测到的读回版本与本次写入原始回执：
+HEAD／LIST 推断只固定读回，不授予创建版本证明。Direct 继续复用原有私有清理回执。
+不增加公开接口、SDK 修改、普通路径存储请求或按总 entry 数保留的集合。
+
+私有 S3 checkpoint 格式更新为 DMS3CP02，分别保存读回 pin 和原始回执；拒绝旧布局、截断、
+超过 4 KiB 或相互矛盾的版本证据。保存过的真实成功回执可以恢复创建版本，Ready 或丢回执后
+推断完成的恢复则仍为 None。恢复保留实际观测版本，不能把相同内容的替换版本当成原目标。
+四处恢复成功日志保留原始有类型协议原因；已恢复错误不会进入 callback 错误统计。
+
+原生 backend 414 项通过／2 项 ignored、transfer 329 项通过／1 项 ignored；完整 CI 范围
+分步完成 52 项，最终严格 Clippy 通过。真实 RustFS 原生复制 33 场景覆盖 Direct 13、
+AtomicReplace 10、Checkpointed 10：正常 quick／full、拒绝、断连、静默超时、闪断后显式重试、
+丢响应、相同旧内容及缺失版本头。独立核验内容、版本数量、源和哨兵保留、无 marker／残余 upload；
+恢复日志含原始 Connectivity。非 Direct 的元数据拒绝及在途取消不在这 33 场景内，
+本项不宣称统一操作预算或这两个分支已经修复。
+
+另以生成的 9 MiB 源和真实 S3 目标运行五个 checkpoint 场景：保存 ACK、Complete 响应丢失、
+发布指针拒绝后的 Ready 恢复，以及两种确认状态下的同内容版本替换。确认与未确认的版本返回值
+符合上述约束，替换均返回 Conflict；每次只创建一个 upload、上传两 part、完成一次，
+恢复不重传。独立读取所有目标版本及哨兵，核对状态根清理／保留和没有未完成 upload。
+这是目标角色及实际 checkpoint 恢复验证，不能替代完整 CLI、数据库、callback 或掉电验收。
+原有 Direct 失败数据清理 60 场景亦完整复跑通过。
+
+主项目版本目录真实回归已扩为 28 轮：Single／双副本数据库各新增一轮 Checkpointed 历史发布
+缺少版本头的失败；该分支允许正常版本 LIST，验证观测结果不能冒充创建回执。独立核验每个
+故障目标只有 payload-0 的一个版本，源六个版本保留，后续五个版本被阻止。其余 26 轮亦重跑，
+共 16 轮成功、12 轮失败；每个失败 entry 计一、task_error 为零，64 条版本明细包含 52 条阻断，
+组合故障仍保留发布未确认及 tags PermissionDenied／HTTP 403。28 份最终报告已入库，HTTP 204
+接收全部明细；缺失回执的任务没有伪造 base 完成事实。普通对象清理 48 轮亦完整重跑通过。
+新增小对象 Checkpointed 案例走原生复制而非大文件数据续传；真正恢复证据由上述五个目标角色
+场景分别验证，未将二者混称完整 CLI 断点续传验收。
+
+扩充后端到端夹具再次触及默认测试线程栈，将三个测试辅助函数中的大型 orchestrator future
+放到堆上后，默认线程栈完整通过；未修改生产执行策略或栈限制。主项目 fmt、workspace/all-targets
+check 与 Clippy、workspace 测试、16 项串行远程进程回归通过，本机 Rust 1.98.1，已有警告保留；
+fixture 调整后补跑 app/all-targets Clippy。架构审查：读回 pin／原始回执及 checkpoint codec
+集中在 S3 backend，任务层沿用历史绑定检查，ClickHouse／callback 留在主项目；未引入跨层
+协议判断、新的恢复循环或公开入口。历史永久删源尚未接通。
+
+本项以主项目 `efac930`／Native `7f029054` 为基线和本次固定 `8bfa329c` 的程序交错执行六轮
+正常 A/B。仍为独占 2 CPU RustFS、每轮 1000 个 1 KiB 对象含 tags、保留源、无数据库、
+unordered／Direct／quick、并发 16、批次 100000，dev debug=0／incremental=0／Rust 1.98.1；
+计时前已结束本项重型构建和故障夹具。
+
+| 样本 | before 耗时／秒 | after 耗时／秒 | before 峰值 RSS／KiB | after 峰值 RSS／KiB |
+| --- | --- | --- | --- | --- |
+| 1 | 4.65 | 4.30 | 192696 | 190424 |
+| 2 | 4.40 | 4.50 | 186984 | 191600 |
+| 3 | 4.49 | 4.50 | 182056 | 185644 |
+
+耗时中位数 4.49→4.50 秒（+0.22%），RSS 中位数 182.60→185.96 MiB（+1.84%）。
+每轮完整 CLI 结束后独立核验全部目标字节／tags、源保留及无未完成 upload。
+该小样本正常 Direct 路径没有明显开销增长，不作为 Checkpointed／AtomicReplace 吞吐、
+release、大规模历史、全部后端或约 200 MiB 目标的整体验收结论。
+样本、配置、程序和日志保存在 `/tmp/terrasync-all-policy-version-perf/`；程序 SHA-256 为
+`eb508dce9ce5c321db34f392918d8781e4498672019d52eb5b18e710c73f7b96`、
+`9c9353fe01172d365de6218fa4380f46b6cca23ca4a3171f73c10ebf25fef4ec`。
+本项独占容器全部清理，未修改 nfs-rs。

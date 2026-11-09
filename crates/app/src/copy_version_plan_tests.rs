@@ -44,7 +44,7 @@ async fn control_action(action: &str, prefix: &str) -> Result<()> {
 }
 
 async fn failed_incremental_history(config: &ClickHouseConfig, command: &SyncJobConfig) -> Result<()> {
-    let result = SyncOrchestrator::new_local(command.clone()).run().await;
+    let result = Box::pin(SyncOrchestrator::new_local(command.clone()).run()).await;
     assert!(result.as_ref().is_err_and(AppError::is_reported_copy_failure));
     let database = ClickHouseDatabase::connect(config, &command.job_id).await?;
     let generation = database
@@ -78,7 +78,7 @@ async fn failed_incremental_history(config: &ClickHouseConfig, command: &SyncJob
 }
 
 async fn failed_unconfirmed_history(config: &ClickHouseConfig, command: &SyncJobConfig, sequence: u64) -> Result<()> {
-    let result = SyncOrchestrator::new_local(command.clone()).run().await;
+    let result = Box::pin(SyncOrchestrator::new_local(command.clone()).run()).await;
     let error = result
         .err()
         .ok_or_else(|| AppError::ConfigError("unconfirmed version unexpectedly accepted".into()))?;
@@ -125,7 +125,7 @@ async fn failed_unconfirmed_history(config: &ClickHouseConfig, command: &SyncJob
 }
 
 async fn run_round(config: &ClickHouseConfig, command: &SyncJobConfig, expected_bytes: u64, rows: u64) -> Result<u64> {
-    SyncOrchestrator::new_local(command.clone()).run().await?;
+    Box::pin(SyncOrchestrator::new_local(command.clone()).run()).await?;
     let database = ClickHouseDatabase::connect(config, &command.job_id).await?;
     assert_eq!(database.get_count("base").await?, rows);
     let generation = database
@@ -266,6 +266,15 @@ async fn copy_versions_case(config: &ClickHouseConfig, prefix: &str) -> Result<(
     unconfirmed_metadata.job_id = "version_unconfirmed_metadata".into();
     unconfirmed_metadata.dest_path.push_str("-metadata");
     failed_unconfirmed_history(config, &unconfirmed_metadata, 1).await?;
+    let mut unconfirmed_checkpointed = history.clone();
+    unconfirmed_checkpointed.job_id = "version_unconfirmed_checkpointed".into();
+    unconfirmed_checkpointed.transfer_mode = TransferMode::Checkpoint;
+    unconfirmed_checkpointed.src_path = format!("{}/{prefix}", endpoint("LAB_VERSION_UNCONFIRMED_SOURCE")?);
+    unconfirmed_checkpointed.dest_path = format!(
+        "{}/{prefix}/unconfirmed-checkpointed",
+        endpoint("LAB_VERSION_UNCONFIRMED_TARGET")?
+    );
+    failed_unconfirmed_history(config, &unconfirmed_checkpointed, 1).await?;
     control_action("marker", prefix).await?;
     assert_eq!(
         run_round(config, &latest, 0, 1).await?,
@@ -273,7 +282,7 @@ async fn copy_versions_case(config: &ClickHouseConfig, prefix: &str) -> Result<(
         "已识别删除标记的保留决定必须明确进入 callback"
     );
     eprintln!(
-        "version-catalogue cluster={} real_rounds=13 latest_rows=1 history_rows=6 unchanged_bytes=0 changed_versions=2 logical_entries_per_change=1 failed_entries=1 failed_version_details=2 latest_marker_preserves_target_with_callback=true reports_archived=true",
+        "version-catalogue cluster={} real_rounds=14 latest_rows=1 history_rows=6 unchanged_bytes=0 changed_versions=2 logical_entries_per_change=1 failed_entries=1 failed_version_details=2 latest_marker_preserves_target_with_callback=true reports_archived=true",
         config.cluster.is_some()
     );
     Ok(())

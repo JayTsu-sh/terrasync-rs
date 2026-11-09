@@ -479,7 +479,7 @@ def run_version_catalogue(environment):
     source_proxy.daemon_threads = True
     threading.Thread(target=source_proxy.serve_forever, daemon=True).start()
     environment["LAB_VERSION_CATALOGUE_FAULT_SOURCE"] = f"s3://migration-test:migration-test-isolated-only@{buckets['source']}.127.0.0.1:{source_proxy.server_port}"
-    unconfirmed_copies = {(prefix, mode): 0 for prefix in seeded for mode in ("unconfirmed", "unconfirmed-metadata")}
+    unconfirmed_copies = {(prefix, mode): 0 for prefix in seeded for mode in ("unconfirmed", "unconfirmed-metadata", "unconfirmed-checkpointed")}
     unconfirmed_metadata_denials = {prefix: 0 for prefix in seeded}
     class UnconfirmedProxy(http.server.BaseHTTPRequestHandler):
         def log_message(self, *_):
@@ -494,7 +494,8 @@ def run_version_catalogue(environment):
             if metadata_denial:
                 prefix = next(prefix for prefix in seeded if f"/{prefix}/" in parsed.path)
                 unconfirmed_metadata_denials[prefix] += 1
-            if (target and "versions" in query) or metadata_denial:
+            allow_checkpointed_observation = any("/unconfirmed-checkpointed/" in value for value in query.get("prefix", []))
+            if (target and "versions" in query and not allow_checkpointed_observation) or metadata_denial:
                 payload = b"<Error><Code>AccessDenied</Code><Message>unconfirmed version catalogue unavailable</Message></Error>"
                 self.send_response(403)
                 self.send_header("Content-Length", str(len(payload)))
@@ -575,7 +576,7 @@ def run_version_catalogue(environment):
             failed = client.list_object_versions(Bucket=buckets["history"], Prefix=prefix + "/failure/payload")
             assert len(failed.get("Versions", [])) == 4 and not failed.get("DeleteMarkers"), failed
             assert data_refusals[prefix] == 1, data_refusals
-            for mode in ("unconfirmed", "unconfirmed-metadata"):
+            for mode in ("unconfirmed", "unconfirmed-metadata", "unconfirmed-checkpointed"):
                 uncertain = client.list_object_versions(Bucket=buckets["history"], Prefix=f"{prefix}/{mode}/payload")
                 assert len(uncertain.get("Versions", [])) == 1 and not uncertain.get("DeleteMarkers"), uncertain
                 assert unconfirmed_copies[prefix, mode] == 1, unconfirmed_copies
@@ -585,14 +586,14 @@ def run_version_catalogue(environment):
             assert len(source.get("Versions", [])) == 6 and len(source.get("DeleteMarkers", [])) == 1, source
         print("independent S3 catalogue inspection deployments=2 latest_current_payload=true target_history_versions=6 no_duplicate_replay=true source_versions_retained=6 source_delete_markers=1 latest_marker_target_preserved=true ordered_payloads=true failed_target_versions=4 denied_data_reads_per_failed_entry=1", flush=True)
         summaries = [report for report in reports if report["is_final"] and not report.get("diagnostics")]
-        assert len(summaries) == 26 and all(report["task_error_count"] == 0 and report["diagnostics_complete"] for report in summaries), summaries
+        assert len(summaries) == 28 and all(report["task_error_count"] == 0 and report["diagnostics_complete"] for report in summaries), summaries
         failures = [report for report in summaries if report["detail"]["error_count"] == 1]
-        assert len(failures) == 10 and all(report["job_id"] in ("version_failed_history", "version_unconfirmed_history", "version_unconfirmed_metadata") and report["migration"]["phase"] == "failed" for report in failures), failures
-        uncertain_events = [event for report in reports if report["job_id"] in ("version_unconfirmed_history", "version_unconfirmed_metadata")
+        assert len(failures) == 12 and all(report["job_id"] in ("version_failed_history", "version_unconfirmed_history", "version_unconfirmed_metadata", "version_unconfirmed_checkpointed") and report["migration"]["phase"] == "failed" for report in failures), failures
+        uncertain_events = [event for report in reports if report["job_id"] in ("version_unconfirmed_history", "version_unconfirmed_metadata", "version_unconfirmed_checkpointed")
                             for event in (report.get("diagnostics") or {}).get("events", []) if event["code"] == "copy_version_failed"]
-        assert len(uncertain_events) == 48, uncertain_events
-        assert sum("historical_publication_unconfirmed" in event["message"] for event in uncertain_events) == 48, uncertain_events
-        assert sum("blocked_by_prior_version" in event["message"] for event in uncertain_events) == 40, uncertain_events
+        assert len(uncertain_events) == 60, uncertain_events
+        assert sum("historical_publication_unconfirmed" in event["message"] for event in uncertain_events) == 60, uncertain_events
+        assert sum("blocked_by_prior_version" in event["message"] for event in uncertain_events) == 50, uncertain_events
         metadata_events = [event for report in reports if report["job_id"] == "version_unconfirmed_metadata"
                            for event in (report.get("diagnostics") or {}).get("events", []) if event["code"] == "copy_version_failed"]
         assert len(metadata_events) == 12 and all("PermissionDenied" in event["message"] and "HTTP=403" in event["message"] for event in metadata_events), metadata_events
@@ -604,7 +605,7 @@ def run_version_catalogue(environment):
         markers = [event for report in reports for event in (report.get("diagnostics") or {}).get("events", [])
                    if event.get("retention", {}).get("source_path") == "payload"]
         assert len(markers) == 2 and all(event["retention"]["reason"] == "source_deletion_unconfirmed" for event in markers), markers
-        print("independent S3 callback inspection successful_rounds=16 failed_entries=10 version_error_details=52 blocked_versions=42 unconfirmed_repeated_generations=3 unconfirmed_target_versions_per_key=1 metadata_and_publication_causes_preserved=true latest_delete_marker_retention_entries=2 task_errors=0 HTTP_204=accepted", flush=True)
+        print("independent S3 callback inspection successful_rounds=16 failed_entries=12 version_error_details=64 blocked_versions=52 unconfirmed_repeated_generations=3 unconfirmed_target_versions_per_key=1 metadata_and_publication_causes_preserved=true latest_delete_marker_retention_entries=2 task_errors=0 HTTP_204=accepted", flush=True)
     finally:
         control.shutdown()
         control.server_close()
