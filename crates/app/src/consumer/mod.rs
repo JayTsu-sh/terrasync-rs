@@ -10,6 +10,7 @@
 // 子模块声明（按字母顺序排序）
 /// 消费者管理器，用于协调和管理多个消费者
 mod manager;
+mod purge_reporting;
 /// 统计信息消费者，用于收集和展示任务统计信息
 pub mod stats;
 

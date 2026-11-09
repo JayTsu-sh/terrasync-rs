@@ -14,8 +14,8 @@ use async_trait::async_trait;
 use data_mover::model::MetadataFamily;
 use data_mover::model::{ObservedEntry, StoragePath, SymlinkTarget};
 use data_mover::storage::{
-    ListRequest, ListingStream, Namespace, NamespaceReadFailure, PurgeOutcome, SourceDescriptor, StorageBuilder,
-    StorageRoleFailure,
+    ListRequest, ListingStream, Namespace, NamespaceReadFailure, PurgeFailure, PurgeOutcome, SourceDescriptor,
+    StorageBuilder, StorageRoleFailure,
 };
 use tokio::process::Command;
 use tokio::{
@@ -69,7 +69,7 @@ impl Namespace for CountPurge {
     }
     async fn purge_observed(
         &self, entry: &ObservedEntry, cancel: CancellationToken,
-    ) -> std::result::Result<PurgeOutcome, StorageRoleFailure> {
+    ) -> std::result::Result<PurgeOutcome, PurgeFailure> {
         self.calls.fetch_add(1, Ordering::SeqCst);
         self.inner.purge_observed(entry, cancel).await
     }

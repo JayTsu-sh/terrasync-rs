@@ -26,6 +26,7 @@ use tokio::sync::Mutex;
 use tracing::{Instrument, debug, error, info_span, warn};
 
 // 内部模块
+use super::purge_reporting;
 use super::stats::callback_state::{SavedStatistics, StatisticsCheckpoint};
 use super::stats::recovery_progress::RecoveryProgress;
 use crate::broadcast::BroadcastForwarder;
@@ -755,6 +756,11 @@ impl ConsumerManager {
         // 版本执行器已经交付 entry 失败及逐版本原因，收尾不能再增加一次相同失败。
         if !error.is_reported_copy_failure() {
             self.record_task_failures(&[error.to_string()]).await;
+            if let Some(consumer) = &self.stats_consumer
+                && let Err(reporting) = purge_reporting::record(consumer, error).await
+            {
+                StatisticConsumer::diagnostic_failure(consumer, reporting).await;
+            }
         }
     }
 
@@ -862,7 +868,8 @@ mod resume_tests {
                             diagnostic,
                         )
                         .map_err(StorageError::from)?,
-                    ),
+                    )
+                    .into(),
                 }
             } else if persistence {
                 StorageError::TargetPersistenceUnconfirmed {
@@ -1219,3 +1226,7 @@ mod resume_tests {
         Ok(())
     }
 }
+
+#[cfg(test)]
+#[path = "purge_reporting_tests.rs"]
+mod purge_reporting_tests;

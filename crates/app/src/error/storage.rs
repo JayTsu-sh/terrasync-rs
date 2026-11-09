@@ -1,3 +1,5 @@
+use std::iter;
+
 use data_mover::error::StorageError as NativeStorageError;
 use data_mover::integrity::IntegritySide as NativeIntegritySide;
 use data_mover::metadata::MetadataVerificationError;
@@ -16,7 +18,7 @@ use data_mover::{
     probes::ProbeFailure,
     storage::{
         BackendConnectError, CapabilityUnavailable, CreateDirectoryAllFailure, DeleteTreeTerminalFailure,
-        NamespaceReadFailure, StorageRoleFailure,
+        NamespaceReadFailure, PurgeFailure, StorageRoleFailure,
     },
     tar_pack::TarFailure,
     transfer::{DirectPatchError, TransferFailure, TransferOutcome, TransferValueError},
@@ -46,11 +48,11 @@ pub enum StorageError {
         #[source]
         source: StorageRoleFailure,
     },
-    #[error("源端受保护清理失败，保留未确认删除的源项: {path}: {source}; {}", role_diagnostic(.source))]
+    #[error("源端受保护清理失败，保留未确认删除的源项: {path}: {source}; {}", role_diagnostic(.source.source.as_ref()))]
     SourcePurgeRefused {
         path: StoragePath,
         #[source]
-        source: StorageRoleFailure,
+        source: PurgeFailure,
     },
     #[error("复制后源端元数据发生变化，保留源端: {path}, families={families:?}")]
     SourceMetadataChanged {
@@ -200,11 +202,16 @@ impl StorageError {
                 Self::Role(StorageRoleFailure::Entry(error))
                 | Self::TargetPersistenceUnconfirmed { source: StorageRoleFailure::Entry(error), .. }
                 | Self::SourceCleanupContentUnverified { source: StorageRoleFailure::Entry(error), .. }
-                | Self::SourcePurgeRefused { source: StorageRoleFailure::Entry(error), .. }
                 if error.class() == FailureClass::Cancelled)
             || matches!(self,
                 Self::SourceCleanupContentUnverified { source: StorageRoleFailure::Session(error), .. }
                 if error.class() == FailureClass::Cancelled)
+            || matches!(self, Self::SourcePurgeRefused { source, .. } if
+            iter::once(source.source.as_ref()).chain(source.additional.iter().map(|(_, cause)| cause))
+            .any(|cause| match cause {
+                StorageRoleFailure::Entry(cause) => cause.class() == FailureClass::Cancelled,
+                StorageRoleFailure::Session(cause) => cause.class() == FailureClass::Cancelled,
+            }))
             || matches!(self, Self::DirectPatch(error) if error.is_cancelled())
     }
 }

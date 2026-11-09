@@ -30,8 +30,8 @@ fn environment(name: &str) -> Result<String> {
 
 async fn control(action: &str) -> Result<()> {
     let address = environment("LAB_OBJECT_CLEANUP_CONTROL")?;
-    // 大历史的独占种子准备不计迁移耗时，控制请求单独容纳 256 次版本写入。
-    let budget = if action.starts_with("arm/") && action.ends_with("/large") {
+    // 独占种子准备不计迁移耗时，控制请求单独容纳大历史或百版本故障的写入。
+    let budget = if action.starts_with("arm/") && (action.ends_with("/large") || action.ends_with("/batchmany")) {
         60
     } else {
         5
@@ -131,17 +131,17 @@ async fn round(config: &ClickHouseConfig, command: &SyncJobConfig, mode: &str, s
             "{error}"
         );
         if let Some(StorageError::SourcePurgeRefused { source, .. }) = error.storage_error() {
-            let class = match source {
+            let class = match source.source.as_ref() {
                 StorageRoleFailure::Entry(cause) => cause.class(),
                 StorageRoleFailure::Session(cause) => cause.class(),
             };
             assert_eq!(
                 class,
                 match mode {
-                    "readonly" => FailureClass::PermissionDenied,
+                    "readonly" | "partial" | "batchmany" => FailureClass::PermissionDenied,
                     "stall" => FailureClass::Timeout,
                     "sourcechanged" => FailureClass::Conflict,
-                    "contradictory" => FailureClass::Protocol,
+                    "contradictory" | "malformed" => FailureClass::Protocol,
                     _ => FailureClass::Connectivity,
                 }
             );
@@ -351,6 +351,9 @@ async fn real_unversioned_object_source_cleanup_and_failures() -> Result<()> {
                     "metaread",
                     "metachanged",
                     "contradictory",
+                    "partial",
+                    "malformed",
+                    "batchmany",
                 ] {
                     case(&config, deployment, "latest", false, mode).await?;
                 }

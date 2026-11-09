@@ -67,10 +67,10 @@ def run(repository, environment, *, versioned_source=False):
                 for key in keys:
                     actual = {item["VersionId"] for item in records if item["Key"] == f"{prefix}/{key}"}
                     expected = set(state["source_versions"][key]) if key in expected_remaining or mode == "missingcurrent" else set()
-                    if mode == "lostack":
+                    if mode in ("lostack", "partial", "malformed"):
                         expected -= {version for deleted_key, version in state["deleted_versions"] if deleted_key == f"{prefix}/{key}"}
                     assert actual == expected, (prefix, mode, key, actual, expected)
-                if mode not in ("normal", "lostack"):
+                if mode not in ("normal", "lostack", "partial", "malformed"):
                     assert not state["deleted_versions"], (prefix, state)
                 for key in keys:
                     deleted = [version for deleted_key, version in state["deleted_versions"] if deleted_key == f"{prefix}/{key}"]
@@ -105,7 +105,8 @@ def run(repository, environment, *, versioned_source=False):
                     assert [client.get_object(Bucket=buckets[target], Key=record["Key"], VersionId=record["VersionId"])["Body"].read()
                             for record in history["Versions"]] == [BODY, b"old-1", b"old-0"], history
             if state["initial"] == "lostack":
-                expected_deletes = len(state["source_versions"]["payload"]) if versioned_source and mode == "normal" else 1
+                expected_deletes = (len(state["source_versions"]["payload"]) if mode == "normal"
+                                    else len(state["batch_requests"][0])) if versioned_source else 1
                 assert state["forwarded_deletes"] == expected_deletes
             if mode in ("data", "metadata", "verify", "cleanup403", "cleanupunknown"):
                 assert state["forwarded_deletes"] == 0
@@ -117,6 +118,13 @@ def run(repository, environment, *, versioned_source=False):
             if state["initial"] == "large":
                 assert state["source_tags"] == 2 and state["source_data_reads"] == 0 and state["target_data_writes"] == 1, (prefix, state)
                 assert len(state["source_versions"]["payload"]) == 256 and state["forwarded_deletes"] == 256, (prefix, state)
+            if state["initial"] in ("large", "batchmany"):
+                assert state["batch_requests"] and all(1 <= len(batch) <= 100 for batch in state["batch_requests"]), state
+            if mode in ("partial", "malformed", "batchmany"):
+                state["failed_deleted_versions"] = list(state["deleted_versions"])
+                state["failed_requested_versions"] = [item for batch in state["batch_requests"] for item in batch]
+                assert len(state["batch_requests"]) == 1, (prefix, state)
+                assert all(version != state["latest_versions"]["payload"] for _, version in state["deleted_versions"]), state
             state["inspections"] += 1
             print(f"independent object cleanup prefix={prefix} mode={mode} source_remaining={sorted(remaining)} target_data_verified=true fault_to_final_report_ms={state.get('fault_to_final_report_ms')}", flush=True)
 
@@ -135,11 +143,16 @@ def run(repository, environment, *, versioned_source=False):
                         source_versions = {}
                         latest_versions = {}
                         for key, body in keys.items():
-                            if versioned_source:
+                            if versioned_source and mode == "batchmany":
+                                for _ in range(100):
+                                    client.put_object(Bucket=buckets["source"], Key=f"{prefix}/{key}", Body=b"old-0", Tagging="proof=old-0")
+                            elif versioned_source:
                                 for _ in range(85 if mode == "large" else 1):
                                     client.put_object(Bucket=buckets["source"], Key=f"{prefix}/{key}", Body=b"old-0", Tagging="proof=old-0")
                                     client.delete_object(Bucket=buckets["source"], Key=f"{prefix}/{key}")
                                     client.put_object(Bucket=buckets["source"], Key=f"{prefix}/{key}", Body=b"old-1", Tagging="proof=old-1")
+                            if versioned_source and mode == "partial":
+                                client.put_object(Bucket=buckets["source"], Key=f"{prefix}/{key}", Body=b"accepted-old", Tagging="proof=accepted-old")
                             created = client.put_object(Bucket=buckets["source"], Key=f"{prefix}/{key}", Body=body, Tagging="proof=raw")
                             latest_versions[key] = created.get("VersionId", "null")
                             if versioned_source:
@@ -150,13 +163,13 @@ def run(repository, environment, *, versioned_source=False):
                                     # 当前 RustFS 将非空尾斜杠对象保存在可变 null 槽，不虚构四个历史。
                                     assert source_versions[key] == {"null"}, (prefix, key, history)
                                 else:
-                                    assert len(source_versions[key]) == (256 if mode == "large" else 4), (prefix, key, history)
+                                    assert len(source_versions[key]) == (256 if mode == "large" else 101 if mode == "batchmany" else 5 if mode == "partial" else 4), (prefix, key, history)
                         with guard:
                             assert prefix not in states
                             states[prefix] = dict(initial=mode, mode=mode, target=target, keys=keys,
                                                   forwarded_deletes=0, target_deletes=0, source_tags=0, affected=0,
                                                   first_fault=None, inspections=0, fact_released=False,
-                                                  deleted=threading.Event(), source_versions=source_versions, deleted_versions=[],
+                                                  deleted=threading.Event(), source_versions=source_versions, deleted_versions=[], batch_requests=[],
                                                   source_payloads=dict(keys), source_tags_expected=[{"Key": "proof", "Value": "raw"}],
                                                   cleanup_seen=False, target_data_writes=0, source_data_reads=0, latest_versions=latest_versions)
                             active[0] = prefix
@@ -217,7 +230,8 @@ def run(repository, environment, *, versioned_source=False):
                     prefix = active[0]
                     state = states.get(prefix)
                     mode = state["mode"] if state else "normal"
-                    deleting = source and self.command == "DELETE"
+                    bulk = source and self.command == "POST" and "delete" in query
+                    deleting = source and (self.command == "DELETE" or bulk)
                     if source and self.command == "GET" and "tagging" in query:
                         state["source_tags"] += 1
                     if source and self.command == "GET" and "tagging" not in query and path.endswith("/" + prefix + "/payload"):
@@ -254,6 +268,40 @@ def run(repository, environment, *, versioned_source=False):
                         state["affected"] += 1
                         state["first_fault"] = state["first_fault"] or time.monotonic()
                 body = self.read_body()
+                selected = []
+                if bulk:
+                    selected = [(node.find("{*}Key").text, node.find("{*}VersionId").text)
+                                for node in ET.fromstring(body) if node.tag.rsplit("}", 1)[-1] == "Object"]
+                    assert selected and len(selected) <= 100 and all(version for _, version in selected), selected
+                    with guard:
+                        state["batch_requests"].append(selected)
+                        for key, version in selected:
+                            relative = key.removeprefix(prefix + "/")
+                            assert version != state["latest_versions"][relative], (prefix, selected)
+                    if mode in ("partial", "batchmany"):
+                        denied = selected[:2] if mode == "partial" else selected
+                        accepted = selected[2:] if mode == "partial" else []
+                        actual = client.delete_objects(Bucket=buckets["source"], Delete={"Objects": [
+                            {"Key": key, "VersionId": version} for key, version in accepted], "Quiet": False}) if accepted else {}
+                        reply = ET.Element("DeleteResult")
+                        for item in actual.get("Deleted", []):
+                            node = ET.SubElement(reply, "Deleted")
+                            ET.SubElement(node, "Key").text = item["Key"]
+                            ET.SubElement(node, "VersionId").text = item["VersionId"]
+                        for key, version in denied:
+                            node = ET.SubElement(reply, "Error")
+                            ET.SubElement(node, "Key").text = key
+                            ET.SubElement(node, "VersionId").text = version
+                            ET.SubElement(node, "Code").text = "AccessDenied"
+                        with guard:
+                            state["deleted_versions"].extend((item["Key"], item["VersionId"]) for item in actual.get("Deleted", []))
+                            state["forwarded_deletes"] += len(actual.get("Deleted", []))
+                        payload = ET.tostring(reply)
+                        self.send_response(200)
+                        self.send_header("Content-Length", str(len(payload)))
+                        self.end_headers()
+                        self.wfile.write(payload)
+                        return
                 if database:
                     sql = query.get("query", [""])[0].upper()
                     held = not versioned_source and state and state["initial"] == "normal" and state["target"] == "latest" and not state["fact_released"] and "INSERT INTO" in sql and "FORMAT ROWBINARY" in sql and "BASE_OBJCLEAN_" in sql
@@ -299,11 +347,24 @@ def run(repository, environment, *, versioned_source=False):
                         payload = ET.tostring(document, encoding="utf-8")
                     if deleting:
                         with guard:
-                            if versioned_source:
-                                assert "versionId" in query and len(query["versionId"]) == 1, (self.command, self.path)
-                                state["deleted_versions"].append((parts[1], query["versionId"][0]))
-                            state["forwarded_deletes"] += 1
+                            if bulk:
+                                acknowledged = [(node.find("{*}Key").text, node.find("{*}VersionId").text)
+                                                for node in ET.fromstring(payload) if node.tag.rsplit("}", 1)[-1] == "Deleted"]
+                                assert len(acknowledged) == len(selected), (prefix, payload)
+                                state["deleted_versions"].extend(acknowledged)
+                                state["forwarded_deletes"] += len(acknowledged)
+                            else:
+                                if versioned_source:
+                                    assert "versionId" in query and len(query["versionId"]) == 1, (self.command, self.path)
+                                    state["deleted_versions"].append((parts[1], query["versionId"][0]))
+                                state["forwarded_deletes"] += 1
                             state["deleted"].set()
+                    if bulk and mode == "malformed":
+                        document = ET.fromstring(payload)
+                        first = next(node for node in document if node.tag.rsplit("}", 1)[-1] == "Deleted")
+                        first.remove(first.find("{*}VersionId"))
+                        payload = ET.tostring(document)
+                        rewritten = True
                     if verifying and response.status in (200, 206):
                         print(f"owned corrupt read mode={mode} status={response.status} path={path}", flush=True)
                         assert payload, (prefix, self.path)
@@ -342,16 +403,16 @@ def run(repository, environment, *, versioned_source=False):
                             "copy_execution::object_cleanup_tests::real_unversioned_object_source_cleanup_and_failures",
                             "--", "--ignored", "--exact", "--nocapture", "--test-threads=1"],
                            cwd=repository, env=environment, check=True, timeout=360)
-            assert len(states) == (44 if versioned_source else 30) and all(state["inspections"] == (3 if state["initial"] == "unchangedbad" else 2 if state["initial"] not in ("normal", "historyguard", "missingcurrent", "large") or (not versioned_source and state["target"] == "latest") else 1) for state in states.values()), states
+            assert len(states) == (50 if versioned_source else 30) and all(state["inspections"] == (3 if state["initial"] == "unchangedbad" else 2 if state["initial"] not in ("normal", "historyguard", "missingcurrent", "large") or (not versioned_source and state["target"] == "latest") else 1) for state in states.values()), states
             assert sum(state["fact_released"] for state in states.values()) == (0 if versioned_source else 4), states
             assert all(state["affected"] for state in states.values() if state["initial"] not in ("normal", "historyguard", "unchanged", "large")), states
             summaries = [report for report in reports if report["is_final"] and not report.get("diagnostics")]
-            assert len(summaries) == (76 if versioned_source else 48) and all(report["diagnostics_complete"] for report in summaries), summaries
-            assert sum(report["migration"]["phase"] == "failed" for report in summaries) == (32 if versioned_source else 18)
+            assert len(summaries) == (88 if versioned_source else 48) and all(report["diagnostics_complete"] for report in summaries), summaries
+            assert sum(report["migration"]["phase"] == "failed" for report in summaries) == (38 if versioned_source else 18)
             events = {event["event_id"]: event for report in reports
                       for event in (report.get("diagnostics") or {}).get("events", [])}
             purge = [event for event in events.values() if event.get("retention", {}).get("reason") == "source_deletion_unconfirmed"]
-            assert len(purge) == (14 if versioned_source else 8) and all(event["retention"]["source_presence"] == "unknown" and event["path"] == "payload" for event in purge), purge
+            assert len(purge) == (20 if versioned_source else 8) and all(event["retention"]["source_presence"] == "unknown" and event["path"] == "payload" for event in purge), purge
             if versioned_source:
                 large = [report for report in summaries if report["job_id"].endswith("_large")]
                 assert len(large) == 2 and all(report["detail"]["scanned_files"] == 1 and report["detail"]["transferred_bytes"] == len(BODY) and report["task_error_count"] == 0 for report in large), large
@@ -363,6 +424,25 @@ def run(repository, environment, *, versioned_source=False):
                     details = [event for report in reports if report["job_id"].endswith("_" + mode)
                                for event in (report.get("diagnostics") or {}).get("events", []) if event["code"] == "target_preserved" and event.get("path") == "payload"]
                     assert len(details) == 2 and all(reason in event["message"] for event in details), (mode, details)
+                for mode, count, cause in [("partial", 2, "AccessDenied"), ("malformed", 2, "Protocol"), ("batchmany", 100, "AccessDenied")]:
+                    for prefix, state in states.items():
+                        if state["initial"] != mode:
+                            continue
+                        details = {event["event_id"]: event for report in reports if report["job_id"] == "objclean_" + prefix.replace("-", "_")
+                                   for event in (report.get("diagnostics") or {}).get("events", []) if event["code"] == "Delete"}
+                        assert len(details) == count and all(cause in event["message"] and event["path"] == "payload" for event in details.values()), (mode, prefix, details)
+                        # Only submitted data versions can have failed bulk receipts. A marker
+                        # retained after that failure was never submitted and has no invented cause.
+                        expected_ids = {version for key, version in state["failed_requested_versions"] if key.endswith("/payload")}
+                        if mode == "partial":
+                            expected_ids -= {version for key, version in state["failed_deleted_versions"] if key.endswith("/payload")}
+                        actual_ids = {event["message"].split("source_version=", 1)[1].split(" phase=", 1)[0] for event in details.values()}
+                        assert actual_ids == expected_ids, (prefix, actual_ids, expected_ids)
+                        failed = [report for report in summaries if report["job_id"] == "objclean_" + prefix.replace("-", "_") and report["migration"]["phase"] == "failed"]
+                        assert len(failed) == 1 and failed[0]["task_error_count"] == 1 and failed[0]["detail"]["error_count"] == 0 and failed[0]["detail"]["scanned_files"] == 1, failed
+                        if mode == "batchmany":
+                            batches = [report["diagnostics"] for report in reports if report["job_id"] == failed[0]["job_id"] and report.get("diagnostics")]
+                            assert len({batch["batch_id"] for batch in batches}) >= 2 and all(len(batch["events"]) <= 64 for batch in batches), batches
                 contradictory = [event for report in reports if report["job_id"].endswith("_contradictory")
                                  for event in (report.get("diagnostics") or {}).get("events", []) if event["code"] == "target_preserved" and event.get("path") == "payload"]
                 assert len(contradictory) == 2 and all("current and historical" in event["message"] and "Protocol" in event["message"] for event in contradictory), contradictory
@@ -397,7 +477,7 @@ def run(repository, environment, *, versioned_source=False):
             for role, bucket in buckets.items():
                 assert client.get_object(Bucket=bucket, Key="sentinel")["Body"].read() == b"retain sentinel"
                 assert not client.list_multipart_uploads(Bucket=bucket).get("Uploads")
-            print(f"independent object cleanup source_versioned={versioned_source} deployments=2 normal={16 if versioned_source else 12} failures={32 if versioned_source else 18} recovery={28 if versioned_source else 18} HTTP_204=true final_reports_saved=true source_deleting_base_empty=true all_recovery_generations_full=true unchanged_incremental_has_no_data_recopy={versioned_source} large_history_records_per_key={256 if versioned_source else 0}", flush=True)
+            print(f"independent object cleanup source_versioned={versioned_source} deployments=2 normal={16 if versioned_source else 12} failures={38 if versioned_source else 18} recovery={34 if versioned_source else 18} HTTP_204=true final_reports_saved=true source_deleting_base_empty=true all_recovery_generations_full=true unchanged_incremental_has_no_data_recopy={versioned_source} large_history_records_per_key={256 if versioned_source else 0}", flush=True)
         finally:
             stopped.set()
             relay.shutdown()

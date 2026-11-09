@@ -19,7 +19,7 @@ use uuid::Uuid;
 
 use super::determine_sync_type;
 use crate::copy_completion;
-use crate::error::{AppError, Result};
+use crate::error::{AppError, Result, StorageError};
 use crate::file_copy::metadata::set_entry_metadata;
 use crate::file_copy::{CopyOptions, copy_file};
 use crate::scan::{ScanType, observe_path};
@@ -123,7 +123,11 @@ async fn moved_copy_is_retained(config: &ClickHouseConfig, incomplete: bool) -> 
         .storage()
         .namespace()?
         .purge_observed(&entry, CancellationToken::new())
-        .await?;
+        .await
+        .map_err(|source| StorageError::SourcePurgeRefused {
+            path: entry.path().clone(),
+            source,
+        })?;
     if !incomplete {
         database.commit_scan_generation().await?;
         database.finish_copy_generation(CopyGenerationPhase::Completed).await?;

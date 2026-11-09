@@ -77,7 +77,7 @@ async fn case(config: &ClickHouseConfig, deployment: &str, dialect: &str, name: 
         assert!(matches!(path.to_str(), Some("a" | "b")));
         match source.storage_error() {
             Some(StorageError::SourcePurgeRefused { source, .. }) => {
-                let (class, transience) = match source {
+                let (class, transience) = match source.source.as_ref() {
                     StorageRoleFailure::Entry(failure) => (failure.class(), failure.transience()),
                     StorageRoleFailure::Session(failure) => (failure.class(), failure.transience()),
                 };

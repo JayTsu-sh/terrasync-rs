@@ -1173,7 +1173,7 @@ Native backend 429 项通过／3 项 ignored，新私有 SDK 契约另外显式�
 首次夹具 Clippy 行数问题已经修正并补跑；完整实验入口与范围在 Native 的 tests/lab/README.md。
 
 同一固定测试程序、独占 1 CPU／768 MiB RustFS、dev debug=0／incremental=0，六轮交错清理
-128 条历史中的 127 条旧记录，包含 null 与标记，当前版本／哨兵完整保留；串行 delete_version
+128 条历史中的 127 条旧记录（125 条数据版本、一个 null、一个标记），当前版本／哨兵完整保留；串行 delete_version
 为 127 次请求，批量为 100＋27 的两次请求。删除阶段耗时中位数 10617.775→230.613 ms，
 整个测试进程 10.68→0.30 s，峰值 RSS 28.6875→30.00 MiB。基于同一 SDK 程序的两条调用路径，
 不等于两个产品版本或含就绪／源复核的完整 purge，更不等于 CLI／ClickHouse／callback、
@@ -1181,6 +1181,82 @@ release 或整轮大规模迁移性能达标。日志 `/tmp/native-exact-bulk-pe
 `/tmp/native-exact-bulk-perf/`，程序 SHA-256
 `6e5897f390101828714e7cdf802674481b85593d735c9b04a1b47e1d53a6b4ed`；独占容器已清理。
 
-本仓库仍固定 Native e294de47；新批量能力尚未用于源清理。后续须先让批内所有版本原因保持
+上述阶段本仓库固定 Native e294de47；当时新批量能力尚未用于源清理。须先让批内所有版本原因保持
 有类型传播并进入 callback，失败 entry／任务不能因版本数量重复累计，才切换旧历史清理批次；
 当前版本必须独立最后删除。完整历史目标核验、逐项异步删源及整轮 RSS 等未完成项不变。
+
+
+### 专用永久清理错误与任务内的有界批量历史清理
+
+用户确认后新增 PurgeFailure，仅扩展既有 Namespace::purge_observed 的错误返回；首个原始
+StorageRoleFailure 作为标准 source 保留，精确版本可选，其余逐版本原因受单批 100 项限制。
+Local／NFS 与默认文件系统包装原来的单项原因，通用 role 错误未增加版本批次分支。
+主项目固定 Native `69814a5f112ae6f2eccde284fd6556f6e745a069`：旧数据版本分批删除，
+历史删除标记按精确 ID 逐个删除，重列举复核当前锚点，当前项独立最后删除。
+
+真实 256 历史场景曾暴露服务端差异：同 key 的多个历史标记放在一个 DeleteObjects 请求时，
+当前 RustFS 确认所有 ID，却每批只实际删除一个。独立 boto3 最小复现请求两个标记，确认两个、
+剩下一个；两秒后仍存在，单条精确删除后消失。实际 Namespace 五条历史的回归在修复前返回
+六条已删除；修复后正确返回五条，且一批数据、两条旧标记、最后当前项共四次删除请求。
+旧 SDK 性能夹具仅有一个标记，不能证明多标记路径。底层同时拒绝前批确认 ID 再次出现在列表，
+保留当前项并报告 Protocol，避免重复提交／虚增统计；生产临时状态仍按 100 条有界。
+
+应用复用 Diagnostic／Delete 和现有归档／HTTP 2xx 机制交付版本、阶段和原始原因；
+不虚构列举故障的版本，不把未提交的标记写成删除失败。逐版本明细不增加数据失败或任务计数，
+整项源清理失败累计一次任务错误，并保留未确认删除的源项和目标。成功接收后清理该批明细，
+累计统计不清零；通知错误保持现有归属。三项专门单元验证逐版本原因、无版本整项故障和附加
+取消原因，包含 ACK 后统计保留；未新增操作入口或改动 nfs-rs。
+
+Single／双副本真实版本化源夹具现为 88 轮：16 轮正常、38 轮失败、34 轮恢复。新增每种部署
+各一组部分拒绝、畸形回执、100 条拒绝与后续全量恢复，核验真实已删除／保留的历史 ID、
+最新版本最后删除、目标内容／tags、base 清空及最终报告入库。部分失败只报告两条真实拒绝；
+畸形回执报告两条实际提交的数据版本，保留尚未提交的标记及当前项；100 条拒绝的 entry 只计
+一次任务错误，至少两批 callback 明细且每批不超过 64 事件。208 条新增逐版本原因通过
+HTTP 204 接收；取消／网络／源变化／历史目标拒绝及原有恢复亦通过。大历史两种部署均精确
+删除 256 条记录，不增加数据 GET 或目标复制次数：源 tags 两次，目标数据写入一次。
+原始日志 `/tmp/terrasync-marker-safe-versioned88-real.log`。
+
+主项目 fmt、workspace/all-targets 检查与 Clippy、workspace 测试（不含 root 包）和
+16 项串行远程进程回归通过；同一依赖下普通源清理 48 轮全部复跑通过。工具链为 Rust 1.98.1，
+已有警告及 ignored 条目保留，不计为真实后端验收。上述错误契约没有解除历史目标整体就绪
+核验的安全门槛，也不宣称逐项异步删源、统一阶段统计或整个优化方案已经完成。
+
+架构审查：批量回执核对和标记差异留在 Native S3 adapter；专用错误属于 namespace role，
+通用 StorageRoleFailure 保持 entry／session 轴。应用的逐版本事件集中 consumer/purge_reporting，
+计数仍归 ConsumerManager／StatisticConsumer，未向 SDK 引入 callback／ClickHouse 概念。
+没有新增重复恢复循环、对外操作入口或按总版本数常驻的任务状态；新增原因受批次约束。
+
+整轮版本化源对照使用固定的变更前／后 CLI，基线为 `6477f5b`／Native e294de47，
+各跑三轮交错（before、after、after、before、before、after），dev debug=0／incremental=0，
+Rust 1.98.1。独占 2 CPU／1536 MiB Single ClickHouse、1 CPU／768 MiB RustFS；128 条
+源历史含 42 个删除标记及 null，目标非版本化 S3，最新内容 1 KiB 含 tags、删源、Direct／quick，
+并发 16、批次 100000。种子准备在计时前完成；整个 CLI 进程计时含复制、校验、源清理、数据库
+收尾及报告，无其他 CI／构建并发。源清理从 128 次单条请求变为一次批量加 43 次单条；
+整轮耗时中位数 12.15→3.65 秒（-69.96%），峰值 RSS 中位数 201.28125→202.7109375 MiB
+（+0.71%），变更后最大 203.18359375 MiB。每轮独立验证 128 个唯一删除 ID、当前项最后删除、
+源历史清空、目标内容／tags、两端哨兵、base 清空及最终报告；源 tags 两次、数据 GET 零次、
+目标数据 PUT 一次。性能场景无 callback 配置，其交付证据来自另行运行的 88 轮故障回归。
+
+六轮样本、50 ms RSS 采样、日志、固定程序与校验和在
+`/tmp/terrasync-purge-failure-history-perf/`，程序 `/tmp/run_purge_failure_history_perf.py`，
+日志 `/tmp/terrasync-marker-safe-history-perf.log`。基线 SHA-256 为
+`e2ff05fe74da33b7cb41012a86aeffc39ea268a714b1e9faa3d9bb5b6b21445e`，变更为
+`6a0511a748c6bbfb625af15d9c6f5954dfafe22409ee48b386769af17a712cd6`。
+该有限历史规模的收益不代表 release、任意版本数、其他对象设备或全后端约 200 MiB 目标达标。
+
+普通 Local 公共路径另跑十二轮交错对照，使用同一前／后 CLI、Single ClickHouse、3000 个
+1 KiB 文件、删源、并发 16／批次 100000，unordered／Direct／quick；平铺与 100×30 目录
+各六轮。计时含整轮数据库和目录收尾，50 ms RSS 采样；每轮验证全部目标内容、源文件／
+目录删除、目录 ns mtime／mode、base 和最终报告。无 callback 配置，保守范围事件作为未
+交付诊断保留，diagnostics_complete=false 不被当成通知已完成。
+
+| 场景 | 耗时中位数（秒） | 峰值 RSS 中位数（MiB） | 变更后最大 RSS（MiB） |
+| --- | --- | --- | --- |
+| 平铺 3000 文件 | 5.32→5.52（+3.76%） | 198.15→196.41（-0.88%） | 204.57 |
+| 100×30 目录 | 4.97→4.97（0%） | 219.70→221.82（+0.96%） | 222.73 |
+
+有限样本中开销与优化前相当，平铺耗时变化小于 5%；目录 RSS 仍高于约 200 MiB 目标。
+不宣称普通路径加速或大规模／release 性能达标。十二轮样本、日志和 RSS 采样在
+`/tmp/terrasync-purge-failure-local-perf/`，脚本 `/tmp/run_purge_failure_local_perf.py`，
+日志 `/tmp/terrasync-marker-safe-local-perf.log`；固定程序与上面的版本化对照相同。
+两组性能测试及全部故障夹具的独占容器均已清理。

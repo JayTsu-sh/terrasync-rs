@@ -24,8 +24,9 @@ fn check() -> SourceCleanupCheck {
 fn assert_refusal(error: AppError, diagnostic: &str) {
     assert!(error.to_string().contains(diagnostic), "{error}");
     assert!(matches!(error,
-        AppError::StorageError(StorageError::SourcePurgeRefused { source: StorageRoleFailure::Entry(failure), .. })
-        if failure.class() == FailureClass::Conflict && failure.diagnostic().contains(diagnostic)));
+        AppError::StorageError(StorageError::SourcePurgeRefused { source, .. })
+        if matches!(source.source.as_ref(), StorageRoleFailure::Entry(failure)
+            if failure.class() == FailureClass::Conflict && failure.diagnostic().contains(diagnostic))));
 }
 
 #[tokio::test]
