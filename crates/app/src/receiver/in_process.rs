@@ -12,7 +12,7 @@ use transport::{in_process::InProcessReceiverTransport, message::SenderMsg, trai
 use super::{ReceiverConfig, process_entry_on_receiver};
 use crate::{
     broadcast::BroadcastForwarder,
-    error::{AppError, Result},
+    error::{AppError, Result, StorageError},
     file_copy::VersionFailureContext,
     storage_factory::StorageContext,
 };
@@ -44,7 +44,21 @@ impl LocalCopyReceiver {
         } = self;
         // 从 transport 拉消息处理（MPMC，N 个 worker 竞争消费）
         let mut failure = None;
-        while let Some(msg) = rt.recv().await {
+        loop {
+            let next = match cfg.cancel.as_ref() {
+                Some(cancel) => tokio::select! {
+                    biased;
+                    () = cancel.cancelled() => {
+                        // 关闭生产端并停止取队列；未开始的条目不虚构逐项复制失败。
+                        rt.close().await?;
+                        return Err(failure.unwrap_or_else(|| StorageError::Cancelled.into()));
+                    }
+                    message = rt.recv() => message,
+                },
+                None => rt.recv().await,
+            };
+            let Some(msg) = next else { break };
+
             match msg {
                 SenderMsg::CopyEntry { entry } => {
                     let _guard = AtomicCounterGuard::increment(&task_counter);
@@ -124,3 +138,7 @@ impl Drop for AtomicCounterGuard<'_> {
         self.0.fetch_sub(1, Ordering::Relaxed);
     }
 }
+
+#[cfg(test)]
+#[path = "in_process_cancellation_tests.rs"]
+mod cancellation_tests;

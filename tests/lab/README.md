@@ -1453,3 +1453,28 @@ explicit recovery tests above do not certify those goals. All owned containers/v
 were cleaned after each run. Final review keeps S3 decoding in its adapter, selection
 and completeness in the task layer, and bounded row-by-row proof rather than a retained
 full-history/completed-key set; the library continuation tracker still has its own bound.
+
+
+### 单进程接收队列取消（2026-11-09）
+
+结构提交 `02bfa9a` 将已有接收循环、结果广播、错误和活动计数移入
+`receiver/in_process`，没有行为或测试调整。随后单独修复接收队列取消：
+共享执行已取消时不再取出排队项，复用 transport.close 关闭生产端；
+空闲等待可退出，已有真实失败仍按原类型返回。未开始项不产生虚构的逐项失败；
+已经在途的复制仍由原生取消和清理收束。
+
+结构、行为两步分别通过五项 Rust CI，证据为
+`/tmp/terrasync-copy-receiver-{extract,cancel}-ci-results.json` 和对应检查日志；
+已有大错误类型等 warning 保留，没有新增存储接口。新增三个确定性回归验证
+128 项预取消队列、空闲等待及此前真实失败的保留，原测试未改。
+
+真实故障命令为 `python3 tests/lab/run-notification-archive-local.py --copy-data-cancel`
+（使用上述外置 Cargo target 和 dev/test profile 环境）。证据
+`/tmp/terrasync-copy-receiver-cancel-active-data-real.log`：Single／双副本、全量／增量、
+Direct／Checkpointed 的 16 个持续断连／静默超时故障及 8 次检查点复用均通过；
+独立核验源完整、Direct 坏目标移除、恢复字节少于整文件、32 个 HTTP 204 终态汇总
+诊断完整，数据库原始原因仍在 callback 且最终报告可查询。注入到收尾约 3.3～6.3 秒，
+含检测、收束和通知，不证明统一三秒或所有后端的防抖预算。独占 ClickHouse 容器已清理。
+架构审查确认队列取消归 receiver，执行最初原因和跨 worker 取消继续复用
+CopyDatabaseExecution；未复制协议重试、未直接丢弃在途传输，也未改变源清理证据。
+本小步骤未单独认证正常吞吐或约 200 MiB，完整程序性能继续单独验收。
