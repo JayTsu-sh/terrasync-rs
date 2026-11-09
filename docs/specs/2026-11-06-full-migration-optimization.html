@@ -960,6 +960,16 @@
         <p>主项目 Single／双副本版本化源回归扩为 76 轮，16 轮正常、32 轮失败、28 轮恢复；新增矛盾清单在目标就绪后才注入，独立核验源四条历史完整保留、零源删除、目标内容／tags 正确。HTTP 204 明细包含具体 current and historical 与 Protocol 原因，失败任务累计一，最终报告入库且 base 清空；下一代 Full 恢复清理成功。普通源 48 轮及主项目五项 Rust 检查（含 16 项串行远程回归）亦通过。普通 Local 公共路径另做十二轮交错 A/B，平铺耗时中位数 5.42→5.46 秒、RSS 202.66→202.60 MiB，目录 5.28→5.03 秒、RSS 223.59→223.71 MiB；每轮独立核验目标、源清理、目录属性、base 和报告。小样本未见明显开销增长，目录 RSS 仍高于优化目标，不宣称加速或整轮规模性能达标。上述保护不证明跨批次或并发写入原子性，不改变历史目标整体核验及统一阶段统计的未完成状态；正常路径开销及验证范围见实验室说明。</p>
         <p><strong>既有批量删除接口的版本扩展（Native 层）：</strong>Native <code>d1e69a5</code> 扩展已有 S3Protocol::delete_objects，用已有 SourceVersion 选择当前项或指定版本，不新增公开入口、类型或 SDK 修改。Current 保留 quiet 及历史保留语义；Id（含 null）按 key＋ID 核对逐版本回执，每个请求至多 100 项。非法／重复／歧义选择器和 NAS 版本请求在修改前拒绝，版本批次失败后停止后续提交；缺失、未知或重复回执不能确认成功，已识别的逐版本错误及脱敏 code 继续保留，异常回执的额外分类和诊断按输入批次限制。</p>
         <p>该扩展通过 429 项 backend 测试（3 项 ignored），新增私有 SDK 契约随后显式运行 19 个真实场景，包含数据／删除标记／null、部分失败、异常回执、断连、超时、丢弃调用方等待及丢回执；Current 丢回执不盲重试，原历史与哨兵保留。原有 11 个历史清理场景、完整 CI 范围分步及最终严格 Clippy 通过。六轮同一程序协议层对照中，127 个旧版本的请求数 127→2，删除阶段中位数 10617.775→230.613 毫秒，进程峰值 RSS 中位数 28.69→30.00 MiB；这些只证明 SDK 批量能力，不代表整轮迁移收益。主项目仍固定 e294de47，源历史仍按串行受保护流程清理；须先完成批量错误的有类型传播、逐版本 callback 明细且 entry 不重复计数，再接入当前版本最后删除的清理路径。完整范围见实验室说明。</p>
+        <div class="note warn"><p><strong>待人工确认：永久清理的专用失败类型。</strong>既有 purge_observed 只返回一个 StorageRoleFailure，无法把同一批内多个版本的有类型原因交给应用。把版本批次塞进通用 StorageRoleFailure 的源码验证已暴露非局部影响：递归目标删除、目录创建和命名空间只读恢复等无关流程也必须处理它；这些流程的 entry／session 分类不能自然表达同一 key 的多个版本原因。不建议为了避免新类型而污染通用错误轴，也不把其他版本原因压成字符串或只保留首因。</p>
+        <p>建议仅扩展已有 Namespace::purge_observed 的错误返回契约为一个新公开 PurgeFailure 类型，不新增操作入口；保留首个 StorageRoleFailure 作为 std::error::Error::source，首项版本可选（列举／锚点故障不虚构版本），其余失败保存 SourceVersion 与原始 StorageRoleFailure，数量受单批至多 100 项限制。其他 backend 的单项失败按同一类型包装，不改变其删除行为；通用扫描、传输、目录创建及递归目标删除仍使用原来的 StorageRoleFailure。应用按 entry 计一次失败，逐版本原因走已有有界 Diagnostic／Delete 事件交付，并保留目标和所有未确认删除的源项。</p>
+        <pre><code>Namespace::purge_observed(...) -&gt; Result&lt;PurgeOutcome, PurgeFailure&gt;
+
+pub struct PurgeFailure {
+    pub version: Option&lt;SourceVersion&gt;,
+    pub source: StorageRoleFailure,
+    pub additional: Vec&lt;(SourceVersion, StorageRoleFailure)&gt;,
+}</code></pre>
+        <p>本项尚未新增该公开类型或切换永久清理。Native 仓库 AGENTS.md 要求确需新增对外接口时取得人工明确确认；已有批量删除扩展及相关验证不依赖这项批准。若获批准，再补齐各 backend 包装、批次取消／未知结果、完整逐版本通知、一次 entry 计数与真实任务故障验证。</p></div>
         <ol>
           <li>把已知不迁移对象的元数据裁剪前移到扫描 plan，保留过滤所需属性，验证无无用途额外调用。</li>
           <li>在已统一的非续传 Direct／续传 Checkpointed 产品选择之上，补齐 NFS／CIFS 能力及数据失败清理；同时补齐目标持久化屏障，避免目标未 ready 就删源。</li>
