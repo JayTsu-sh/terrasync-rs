@@ -77,105 +77,116 @@ async fn apply_directories(
 ) -> Result<()> {
     // 调用方取消整个收尾 future 时，查询与进度线程也随所属执行域释放。
     let query = AbortOnDropHandle::new(query);
-    let progress = DirectoryProgress::new();
-    let mut tasks = JoinSet::new();
-    // 与在途任务同生命周期，panic 也能定位目录；数量不超过并发上限。
-    let mut paths = HashMap::with_capacity(DIRECTORY_CONCURRENCY);
-    let mut failure = None;
+    let mut updates = DirectoryUpdates::new(destination, statistics);
     let mut depth = None;
     while let Some(completion) = receiver.recv().await {
         let entry = completion.completion.item.entry;
         let entry_depth = entry.path().as_str().split('/').count();
         // 查询按深度倒序；父目录收紧权限前，必须完成所有更深目录。
         if depth.is_some_and(|previous| previous != entry_depth) {
-            while let Some(result) = tasks.join_next_with_id().await {
-                record_update(
-                    result,
-                    &mut paths,
-                    &mut failure,
-                    &progress.bar,
-                    destination.storage().kind(),
-                    statistics.as_ref(),
-                )
-                .await;
-            }
+            updates.drain().await;
         }
         depth = Some(entry_depth);
-        // 及时回收已结束任务，任务集合连同完成结果也保持有界。
-        while tasks.len() >= DIRECTORY_CONCURRENCY {
-            if let Some(result) = tasks.join_next_with_id().await {
-                record_update(
-                    result,
-                    &mut paths,
-                    &mut failure,
-                    &progress.bar,
-                    destination.storage().kind(),
-                    statistics.as_ref(),
-                )
-                .await;
-            }
+        updates.push(entry).await;
+    }
+    updates.drain().await;
+    let query_result = query.await.map_err(AppError::from).and_then(|result| result);
+    query_result?;
+    updates.finish()
+}
+
+/// 目录更新的在途状态和逐项诊断；不持有查询或消费者生命周期。
+struct DirectoryUpdates {
+    failure: Option<AppError>,
+    paths: HashMap<Id, Arc<ObservedEntry>>,
+    tasks: JoinSet<Result<()>>,
+    progress: DirectoryProgress,
+    destination: Arc<StorageContext>,
+    statistics: Option<TaskStatistics>,
+}
+
+impl DirectoryUpdates {
+    fn new(destination: Arc<StorageContext>, statistics: Option<TaskStatistics>) -> Self {
+        let progress = DirectoryProgress::new();
+        let tasks = JoinSet::new();
+        // 与在途任务同生命周期，panic 也能定位目录；数量不超过并发上限。
+        let paths = HashMap::with_capacity(DIRECTORY_CONCURRENCY);
+        Self {
+            failure: None,
+            paths,
+            tasks,
+            progress,
+            destination,
+            statistics,
         }
-        let target = destination.clone();
+    }
+
+    async fn push(&mut self, entry: Arc<ObservedEntry>) {
+        // 及时回收已结束任务，任务集合连同完成结果也保持有界。
+        while self.tasks.len() >= DIRECTORY_CONCURRENCY {
+            self.join_next().await;
+        }
+        let target = self.destination.clone();
         let task_entry = entry.clone();
-        let task = tasks.spawn(async move {
+        let task = self.tasks.spawn(async move {
             trace!(path = ?entry.get_relative_path(), "Updating directory metadata");
             copy_metadata::set_entry_metadata(target.storage(), &entry, None).await?;
             Ok(())
         });
-        paths.insert(task.id(), task_entry);
+        self.paths.insert(task.id(), task_entry);
     }
-    while let Some(result) = tasks.join_next_with_id().await {
-        record_update(
-            result,
-            &mut paths,
-            &mut failure,
-            &progress.bar,
-            destination.storage().kind(),
-            statistics.as_ref(),
-        )
-        .await;
-    }
-    let query_result = query.await.map_err(AppError::from).and_then(|result| result);
-    query_result?;
-    failure.map_or(Ok(()), |source| {
-        Err(if statistics.is_some() {
-            AppError::ReportedCopyFailure {
-                source: Box::new(source),
-                data_failed: false,
-            }
-        } else {
-            source
-        })
-    })
-}
 
-async fn record_update(
-    result: std::result::Result<(Id, Result<()>), JoinError>, paths: &mut HashMap<Id, Arc<ObservedEntry>>,
-    failure: &mut Option<AppError>, progress: &DirectoryMetadataProgressBar, backend: BackendKind,
-    statistics: Option<&TaskStatistics>,
-) {
-    let (id, result) = match result {
-        Ok((id, result)) => (id, result),
-        Err(error) => (error.id(), Err(error.into())),
-    };
-    let entry = paths.remove(&id);
-    match result {
-        Ok(()) => {
-            progress.increment_dir_count();
+    async fn join_next(&mut self) -> bool {
+        if let Some(result) = self.tasks.join_next_with_id().await {
+            self.record_update(result).await;
+            true
+        } else {
+            false
         }
-        Err(error) => {
-            // 所有最终失败逐项交付；返回值仍保留首个有类型原因，不累计整轮明细。
-            if let (Some(statistics), Some(entry)) = (statistics, entry) {
-                statistics
-                    .record_statistics([StorageEntryMessage::Error {
-                        event: ErrorEvent::Copy,
-                        path: entry.get_relative_path().to_path_buf(),
-                        entry: Some(entry),
-                        reason: format!("backend={backend:?} phase=directory_metadata_finalize: {error}"),
-                    }])
-                    .await;
+    }
+
+    async fn drain(&mut self) {
+        while self.join_next().await {}
+    }
+
+    fn finish(self) -> Result<()> {
+        self.failure.map_or(Ok(()), |source| {
+            Err(if self.statistics.is_some() {
+                AppError::ReportedCopyFailure {
+                    source: Box::new(source),
+                    data_failed: false,
+                }
+            } else {
+                source
+            })
+        })
+    }
+
+    async fn record_update(&mut self, result: std::result::Result<(Id, Result<()>), JoinError>) {
+        let (id, result) = match result {
+            Ok((id, result)) => (id, result),
+            Err(error) => (error.id(), Err(error.into())),
+        };
+        let entry = self.paths.remove(&id);
+        match result {
+            Ok(()) => {
+                self.progress.bar.increment_dir_count();
             }
-            failure.get_or_insert(error);
+            Err(error) => {
+                // 所有最终失败逐项交付；返回值仍保留首个有类型原因，不累计整轮明细。
+                if let (Some(statistics), Some(entry)) = (&self.statistics, entry) {
+                    let backend = self.destination.storage().kind();
+                    statistics
+                        .record_statistics([StorageEntryMessage::Error {
+                            event: ErrorEvent::Copy,
+                            path: entry.get_relative_path().to_path_buf(),
+                            entry: Some(entry),
+                            reason: format!("backend={backend:?} phase=directory_metadata_finalize: {error}"),
+                        }])
+                        .await;
+                }
+                self.failure.get_or_insert(error);
+            }
         }
     }
 }

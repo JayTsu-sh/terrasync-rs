@@ -351,22 +351,18 @@ async fn directory_worker_panic_retains_path_and_typed_failure() -> Result<()> {
     let source = TempDir::new()?;
     let manager = statistics_manager(JobType::Copy)?;
     let entry = Arc::new(directory_entry(&source, "panicked-directory").await?);
-    let mut tasks: JoinSet<Result<()>> = JoinSet::new();
-    let task = tasks.spawn(async { panic!("owned directory worker panic") });
-    let mut paths = HashMap::from([(task.id(), entry)]);
-    let mut failure = None;
-    let result = tasks.join_next_with_id().await.ok_or(AppError::ScanWorkerStopped)?;
-    record_update(
-        result,
-        &mut paths,
-        &mut failure,
-        &DirectoryMetadataProgressBar::new(),
-        BackendKind::Local,
-        Some(&manager.task_statistics()),
-    )
-    .await;
-    assert!(paths.is_empty());
-    assert!(matches!(failure, Some(AppError::TaskJoinError(error)) if error.is_panic()));
+    let destination = TempDir::new()?;
+    let mut updates = DirectoryUpdates::new(target(&destination).await?, Some(manager.task_statistics()));
+    let task = updates.tasks.spawn(async { panic!("owned directory worker panic") });
+    updates.paths.insert(task.id(), entry);
+    let result = updates
+        .tasks
+        .join_next_with_id()
+        .await
+        .ok_or(AppError::ScanWorkerStopped)?;
+    updates.record_update(result).await;
+    assert!(updates.paths.is_empty());
+    assert!(matches!(updates.failure, Some(AppError::TaskJoinError(error)) if error.is_panic()));
     let saved: StatisticsCheckpoint = serde_json::from_str(&manager.statistics_checkpoint().await?)?;
     let events = saved.callback.outbox.archive_prefix();
     assert_eq!(events.len(), 1);
