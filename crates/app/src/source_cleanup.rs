@@ -2,7 +2,7 @@
 
 use std::{collections::HashMap, path::Path, sync::Arc, time::Duration};
 
-use data_mover::model::{EntryIdentityKey, EntryKind, ObservedEntry, SourceVersion, StoragePath};
+use data_mover::model::{EntryIdentityKey, EntryKind, ObservedEntry, SourceVersion, StoragePath, VersionRecord};
 use data_mover::storage::NamespaceReadPolicy;
 use db::ClickHouseDatabase;
 use task_model::observation::ObservedView;
@@ -13,7 +13,7 @@ use tokio_util::task::AbortOnDropHandle;
 use crate::consumer::ConsumerManager;
 use crate::error::CopyStep;
 use crate::error::{AppError, Result, StorageError};
-use crate::file_copy::metadata::copied_metadata_plan;
+use crate::file_copy::metadata::captured_metadata_plan;
 use crate::file_copy::selection::unrepresentable_object;
 use crate::storage_factory::{StorageContext, path};
 use task_model::{SourcePresence, TargetRetention, TargetRetentionReason};
@@ -110,7 +110,9 @@ pub(crate) async fn report_failure(result: Result<()>, reports: &ConsumerManager
             Some(StorageError::TargetPersistenceUnconfirmed { .. }) => {
                 TargetRetentionReason::TargetPersistenceUnconfirmed
             }
-            Some(StorageError::SourcePurgeRefused { .. }) => TargetRetentionReason::SourceDeletionUnconfirmed,
+            Some(StorageError::SourcePurgeRefused { .. } | StorageError::SourceHistoryCurrentUnconfirmed { .. }) => {
+                TargetRetentionReason::SourceDeletionUnconfirmed
+            }
             _ => TargetRetentionReason::StaleEvidence,
         };
         let mut retention = TargetRetention::entry(&path(entry_path)?, reason);
@@ -139,12 +141,24 @@ async fn remove_entry(
     if entry.path().as_str().is_empty() || unrepresentable_object(entry, destination).is_some() {
         return Ok(());
     }
-    if entry.history().is_some() {
-        return Err(StorageError::PermanentVersionCleanupUnavailable {
-            path: entry.path().clone(),
+    let version_index = match entry.history() {
+        Some(history)
+            if entry.kind() == EntryKind::File
+                && history.records().len() == 1
+                && history.current().is_some_and(VersionRecord::is_latest)
+                && !destination.storage().staged_destination()?.keeps_history().await? =>
+        {
+            Some(0)
         }
-        .into());
-    }
+        Some(_) => {
+            // 历史目标仍须逐个绑定核验全部所需版本，不能凭一行就绪事实授权整 key 清理。
+            return Err(StorageError::PermanentVersionCleanupUnavailable {
+                path: entry.path().clone(),
+            }
+            .into());
+        }
+        None => None,
+    };
     if source.storage().holds_directory_objects() && entry.kind() == EntryKind::Directory {
         if entry.directory_marker_object().is_some() {
             return Err(StorageError::DirectoryMarkerCleanupUnavailable {
@@ -156,22 +170,17 @@ async fn remove_entry(
         return Ok(());
     }
     // 只核验目标与落库的原始事实；删源改变的目录 mtime 和已经消失的源项不回写目标。
-    let target = copied_metadata_plan(
-        destination.storage(),
-        ObservedView {
-            entry,
-            version_index: None,
-        },
-    )?
-    .verify_published(
-        destination.storage(),
-        entry.path(),
-        &SourceVersion::Current,
-        None,
-        check.cancel.clone(),
-    )
-    .await
-    .map_err(StorageError::from)?;
+    let view = ObservedView { entry, version_index };
+    let target = captured_metadata_plan(destination.storage(), view)?
+        .verify_published(
+            destination.storage(),
+            entry.path(),
+            &SourceVersion::Current,
+            None,
+            check.cancel.clone(),
+        )
+        .await
+        .map_err(StorageError::from)?;
     if target.kind != entry.kind() || (entry.kind() == EntryKind::File && target.size != entry.size()) {
         return Err(StorageError::TargetPublicationChanged {
             path: entry.path().clone(),
@@ -203,7 +212,16 @@ async fn remove_entry(
             path: entry.path().clone(),
             source,
         })?;
-    if !verify_source_metadata(source, entry, check).await? {
+    // 历史容器的属性不代表最新版本；按扫描时捕获的该版本原值复核当前源。
+    let expected = version_index.map(|_| entry.clone().with_metadata(view.metadata().clone()));
+    if !verify_source_metadata(source, expected.as_ref().unwrap_or(entry), check).await? {
+        if version_index.is_some() {
+            // 当前不可见不证明全部历史已清空，也不能据此忽略刚出现的删除标记。
+            return Err(StorageError::SourceHistoryCurrentUnconfirmed {
+                path: entry.path().clone(),
+            }
+            .into());
+        }
         return Ok(());
     }
     // 增量跳过／仅修改属性的条目没有本轮数据传输回读，也必须执行用户选择的全量校验。

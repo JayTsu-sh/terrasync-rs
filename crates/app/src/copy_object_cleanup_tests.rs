@@ -20,7 +20,7 @@ use uuid::Uuid;
 use super::tests::job;
 use crate::callback::CallbackEndpoint;
 use crate::config::SyncJobConfig;
-use crate::consumer::stats::{ProgressReport, delivery::FinalCallbackReport};
+use crate::consumer::stats::{ProgressDetail, ProgressReport, delivery::FinalCallbackReport};
 use crate::error::{AppError, Result, StorageError};
 use crate::orchestrator::SyncOrchestrator;
 
@@ -30,7 +30,13 @@ fn environment(name: &str) -> Result<String> {
 
 async fn control(action: &str) -> Result<()> {
     let address = environment("LAB_OBJECT_CLEANUP_CONTROL")?;
-    timeout(Duration::from_secs(5), async {
+    // 大历史的独占种子准备不计迁移耗时，控制请求单独容纳 256 次版本写入。
+    let budget = if action.starts_with("arm/") && action.ends_with("/large") {
+        60
+    } else {
+        5
+    };
+    timeout(Duration::from_secs(budget), async {
         let mut stream = TcpStream::connect(&address).await?;
         stream
             .write_all(format!("GET /{action} HTTP/1.0\r\nHost: {address}\r\n\r\n").as_bytes())
@@ -85,8 +91,9 @@ async fn report(config: &ClickHouseConfig, command: &SyncJobConfig, sequence: u6
 
 async fn round(config: &ClickHouseConfig, command: &SyncJobConfig, mode: &str, sequence: u64) -> Result<()> {
     let started = tokio::time::Instant::now();
+    let budget = if command.job_id.ends_with("_large") { 90 } else { 35 };
     let result = timeout(
-        Duration::from_secs(35),
+        Duration::from_secs(budget),
         SyncOrchestrator::new_local(command.clone()).run(),
     )
     .await
@@ -99,6 +106,23 @@ async fn round(config: &ClickHouseConfig, command: &SyncJobConfig, mode: &str, s
             "{result:?}"
         );
         assert_eq!(result.unwrap_err().reported_copy_data_failed(), mode != "metadata");
+    } else if matches!(mode, "historyguard" | "missingcurrent" | "metaread" | "metachanged") {
+        let error = result.unwrap_err();
+        assert!(error.source_cleanup_entry().is_some(), "{error}");
+        assert!(
+            matches!(
+                (mode, error.storage_error()),
+                (
+                    "historyguard",
+                    Some(StorageError::PermanentVersionCleanupUnavailable { .. })
+                ) | (
+                    "missingcurrent",
+                    Some(StorageError::SourceHistoryCurrentUnconfirmed { .. })
+                ) | ("metaread", Some(StorageError::NamespaceRead(_)))
+                    | ("metachanged", Some(StorageError::SourceMetadataChanged { .. }))
+            ),
+            "{error}"
+        );
     } else {
         let error = result.unwrap_err();
         assert!(error.source_cleanup_entry().is_some(), "{error}");
@@ -116,6 +140,7 @@ async fn round(config: &ClickHouseConfig, command: &SyncJobConfig, mode: &str, s
                 match mode {
                     "readonly" => FailureClass::PermissionDenied,
                     "stall" => FailureClass::Timeout,
+                    "sourcechanged" => FailureClass::Conflict,
                     _ => FailureClass::Connectivity,
                 }
             );
@@ -151,12 +176,116 @@ async fn case(config: &ClickHouseConfig, deployment: &str, target: &str, full: b
     command.concurrency = Some(2);
     command.progress_callback_url = Some(CallbackEndpoint::parse(&environment("LAB_OBJECT_CLEANUP_CALLBACK")?)?);
     control(&format!("arm/{prefix}/{mode}")).await?;
-    round(config, &command, mode, 1).await?;
-    control(&format!("inspect/{prefix}/{mode}")).await?;
-    if mode != "normal" {
+    let result_mode = if mode == "large" { "normal" } else { mode };
+    round(config, &command, result_mode, 1).await?;
+    control(&format!("inspect/{prefix}/{result_mode}")).await?;
+    if !matches!(mode, "normal" | "historyguard" | "missingcurrent" | "large") {
         control(&format!("recover/{prefix}/{mode}")).await?;
         round(config, &command, "normal", 2).await?;
         control(&format!("inspect/{prefix}/normal")).await?;
+    }
+    Ok(())
+}
+
+async fn unchanged_versioned_move(config: &ClickHouseConfig, deployment: &str, corrupt: bool) -> Result<()> {
+    let mode = if corrupt { "unchangedbad" } else { "unchanged" };
+    let prefix = format!("{deployment}-latest-full-{mode}");
+    let root = PathBuf::from(environment("LAB_OBJECT_CLEANUP_ROOT")?).join(&prefix);
+    std::fs::create_dir_all(root.join("job"))?;
+    let mut command = job(&root.join("job"));
+    command.job_id = format!("objclean_{deployment}_latest_full_{mode}");
+    command.src_path = format!("{}/{prefix}", environment("LAB_OBJECT_CLEANUP_SOURCE")?);
+    command.dest_path = format!("{}/{prefix}", environment("LAB_OBJECT_CLEANUP_LATEST")?);
+    command.enable_integrity_check = true;
+    command.concurrency = Some(2);
+    command.progress_callback_url = Some(CallbackEndpoint::parse(&environment("LAB_OBJECT_CLEANUP_CALLBACK")?)?);
+    control(&format!("arm/{prefix}/{mode}")).await?;
+    for sequence in 1..=if corrupt { 3 } else { 2 } {
+        command.source_cleanup = SourceCleanupPolicy::from_reserved(sequence == 1);
+        if sequence == 2 && corrupt {
+            control(&format!("damage/{prefix}/{mode}")).await?;
+        } else if sequence == 3 {
+            control(&format!("recover/{prefix}/normal")).await?;
+        }
+        let failed = sequence == 2 && corrupt;
+        let result = timeout(
+            Duration::from_secs(35),
+            Box::pin(SyncOrchestrator::new_local(command.clone()).run()),
+        )
+        .await
+        .map_err(|_| AppError::ConfigError("owned unchanged historical move timed out".into()))?;
+        if failed {
+            let error = result.unwrap_err();
+            assert!(error.source_cleanup_entry().is_some(), "{error}");
+            assert!(
+                matches!(error.storage_error(), Some(StorageError::MismatchData(_))),
+                "{error}"
+            );
+        } else {
+            result?;
+        }
+        let database = ClickHouseDatabase::connect(config, &command.job_id).await?;
+        assert_eq!(database.get_count("base").await?, u64::from(sequence == 1));
+        let generation = database
+            .latest_copy_generation()
+            .await?
+            .ok_or_else(|| AppError::ConfigError("unchanged generation missing".into()))?;
+        assert_eq!(generation.sequence, sequence);
+        assert_eq!(
+            generation.plan.mode,
+            if sequence == 2 {
+                MigrationMode::Incremental
+            } else {
+                MigrationMode::Full
+            }
+        );
+        assert_eq!(
+            generation.phase,
+            if failed {
+                CopyGenerationPhase::Failed
+            } else {
+                CopyGenerationPhase::Completed
+            }
+        );
+        let client = Client::default()
+            .with_url(&config.dsn)
+            .with_user("default")
+            .with_database(&config.database);
+        let raw = client.query(&format!("SELECT payload_json FROM notifications_{} FINAL WHERE kind=2 AND attempt_id=? ORDER BY sequence DESC LIMIT 1", command.job_id))
+            .bind(&generation.request.execution_id).fetch_one::<String>().await.map_err(DatabaseError::from)?;
+        let saved: FinalCallbackReport = serde_json::from_str(&raw)?;
+        let report: ProgressReport = serde_json::from_str(&saved.payload_json)?;
+        assert!(report.is_final && report.diagnostics_complete);
+        assert_eq!(report.task_error_count, u64::from(failed));
+        if sequence == 2 {
+            assert!(
+                matches!(
+                    report.detail,
+                    ProgressDetail::Incremental {
+                        scanned_files: 1,
+                        new_count: 0,
+                        changed_count: 0,
+                        transferred_bytes: 0,
+                        error_count: 0,
+                        ..
+                    }
+                ),
+                "{report:?}"
+            );
+        }
+        let inspection = if sequence == 1 {
+            "retained"
+        } else if failed {
+            "unverified"
+        } else {
+            "normal"
+        };
+        control(&format!("inspect/{prefix}/{inspection}")).await?;
+        eprintln!(
+            "unchanged-versioned-move cluster={} corrupt={corrupt} generation={sequence} incremental={} failed={failed} reports_archived=true base_retained_only_while_source_reserved=true",
+            config.cluster.is_some(),
+            sequence == 2
+        );
     }
     Ok(())
 }
@@ -198,7 +327,12 @@ async fn real_unversioned_object_source_cleanup_and_failures() -> Result<()> {
         })?;
         let deployment = if cluster { "cluster" } else { "single" };
         let result: Result<()> = async {
-            for target in ["local", "latest", "history"] {
+            let targets = if environment("LAB_OBJECT_CLEANUP_VERSIONED").is_ok_and(|value| value == "true") {
+                vec!["local", "latest"]
+            } else {
+                vec!["local", "latest", "history"]
+            };
+            for target in targets {
                 for full in [false, true] {
                     case(&config, deployment, target, full, "normal").await?;
                 }
@@ -208,6 +342,16 @@ async fn real_unversioned_object_source_cleanup_and_failures() -> Result<()> {
             }
             for mode in ["verify", "cleanup403", "cleanupunknown"] {
                 case(&config, deployment, "latest", true, mode).await?;
+            }
+            if environment("LAB_OBJECT_CLEANUP_VERSIONED").is_ok_and(|value| value == "true") {
+                for mode in ["missingcurrent", "sourcechanged", "metaread", "metachanged"] {
+                    case(&config, deployment, "latest", false, mode).await?;
+                }
+                case(&config, deployment, "history", false, "historyguard").await?;
+                for corrupt in [false, true] {
+                    Box::pin(unchanged_versioned_move(&config, deployment, corrupt)).await?;
+                }
+                case(&config, deployment, "latest", false, "large").await?;
             }
             Ok(())
         }

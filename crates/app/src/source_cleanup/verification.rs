@@ -100,6 +100,7 @@ pub(super) async fn verify_source_metadata(
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+    use crate::error::AppError;
     use crate::file_copy::{CopyOptions, copy_file};
     use crate::scan::observe_path_with_plan;
     use crate::source_cleanup::{SourceCleanupCheck, remove_entry};
@@ -114,6 +115,47 @@ mod tests {
     use std::time::Duration;
     use std::{path::Path, sync::Arc};
     use tokio_util::sync::CancellationToken;
+
+    #[tokio::test]
+    async fn failed_captured_source_metadata_blocks_cleanup_before_any_source_mutation() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let target_root = tempfile::tempdir()?;
+        std::fs::write(root.path().join("file"), b"retained payload")?;
+        let source = create_storage(root.path().to_str().unwrap(), CreateStorageOptions::default()).await?;
+        let target = create_storage(target_root.path().to_str().unwrap(), CreateStorageOptions::default()).await?;
+        let entry =
+            Arc::new(observe_path_with_plan(source.storage(), Path::new("file"), ObservationPlan::default()).await?);
+        copy_file(&source, &target, &entry, CopyOptions::default(), None).await?;
+        let facts = entry.metadata();
+        let failed = entry.as_ref().clone().with_metadata(
+            MetadataObservations::new(
+                MetadataObservation::Failed {
+                    class: FailureClass::PermissionDenied,
+                    transience: Transience::Permanent,
+                },
+                facts.xattrs().clone(),
+                facts.tags().clone(),
+                facts.ownership_mode().clone(),
+                facts.timestamps().clone(),
+            )
+            .map_err(StorageError::from)?,
+        );
+        let error = remove_entry(
+            &source,
+            &target,
+            &failed,
+            &SourceCleanupCheck::new(Duration::from_secs(1), Duration::from_secs(3), CancellationToken::new()),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            AppError::StorageError(StorageError::SourceMetadataAcquisitionFailed { .. })
+        ));
+        assert_eq!(std::fs::read(root.path().join("file"))?, b"retained payload");
+        assert_eq!(std::fs::read(target_root.path().join("file"))?, b"retained payload");
+        Ok(())
+    }
 
     struct MissingAttribute(Arc<dyn Metadata>);
 
