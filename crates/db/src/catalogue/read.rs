@@ -19,6 +19,16 @@ use crate::schema::columns::{COPY_SNAPSHOT_COLUMNS, SNAPSHOT_COLUMNS};
 use crate::schema::identity::PERSISTED_IDENTITY_PREFIX;
 use crate::schema::records::{CopySnapshotRow, SnapshotRow, StorageEntryRecord};
 
+/// 本执行的已确认版本及扫描时的完整分段位置；单版本 snapshot 本身不携带这些边界。
+#[derive(Clone, Debug)]
+pub struct CopyCatalogueEntry {
+    pub completion: CopyCompletion,
+    pub history_segment: u32,
+    pub history_index: u32,
+    pub history_records: u32,
+    pub history_complete: bool,
+}
+
 fn records_to_entry_iter(records: Vec<StorageEntryRecord>) -> Result<Box<dyn Iterator<Item = ObservedEntry> + Send>> {
     let entries = records
         .into_iter()
@@ -166,7 +176,7 @@ impl ClickHouseDatabase {
     /// 交付本次重新选中且目标已确认的源事实及实际目标版本；旧 C/W 相等不构成执行授权。
     pub async fn query_current_copy_entries(
         &self, is_dir: Option<bool>, is_symlink: Option<bool>, extension: Option<String>,
-        tx: mpsc::Sender<CopyCompletion>,
+        tx: mpsc::Sender<CopyCatalogueEntry>,
     ) -> Result<()> {
         let execution = self
             .generation_lifecycle
@@ -191,6 +201,7 @@ impl ClickHouseDatabase {
         let mut ext_bind: Option<String> = None;
         if execution.is_some() {
             where_conditions.push("copy_execution_id = ?".into());
+            where_conditions.push("copy_data_confirmed".into());
         }
 
         if let Some(dir_val) = is_dir {

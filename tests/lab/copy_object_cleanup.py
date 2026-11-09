@@ -18,6 +18,9 @@ import boto3
 from botocore.config import Config
 
 
+HISTORY_DATA_MODES = ("historydata", "historytags", "historysource", "historymissing", "historygap", "historydisconnect", "historystall")
+HISTORY_PLAIN_MODES = (*HISTORY_DATA_MODES, "historyunchanged")
+
 BODY = b"ordinary object data"
 NESTED = b"nested object data"
 SLASH = b"nonempty directory object"
@@ -98,12 +101,12 @@ def run(repository, environment, *, versioned_source=False):
                 assert state["source_tags"] == 0, (prefix, "Local target must not request source tags", state)
             if target == "history":
                 history = client.list_object_versions(Bucket=buckets[target], Prefix=prefix + "/")
-                assert len(history.get("DeleteMarkers", [])) == (len(keys) if versioned_source else 0), (prefix, history)
-                assert len(history.get("Versions", [])) == len(keys) * (3 if versioned_source else 1), (prefix, history)
+                assert len(history.get("DeleteMarkers", [])) == (len(keys) if versioned_source and state["initial"] not in HISTORY_PLAIN_MODES else 0), (prefix, history)
+                assert len(history.get("Versions", [])) == len(keys) * (2 if state["initial"] == "historymissing" else 3 if versioned_source else 1), (prefix, history)
                 assert {record["Key"] for record in history["Versions"]} == {prefix + "/" + key for key in keys}
                 if versioned_source:
                     assert [client.get_object(Bucket=buckets[target], Key=record["Key"], VersionId=record["VersionId"])["Body"].read()
-                            for record in history["Versions"]] == [BODY, b"old-1", b"old-0"], history
+                            for record in history["Versions"]] == ([BODY, b"old-1"] if state["initial"] == "historymissing" else [BODY, b"old-1", b"old-0"]), history
             if state["initial"] == "lostack":
                 expected_deletes = (len(state["source_versions"]["payload"]) if mode == "normal"
                                     else len(state["batch_requests"][0])) if versioned_source else 1
@@ -112,8 +115,8 @@ def run(repository, environment, *, versioned_source=False):
                 assert state["forwarded_deletes"] == 0
             if state["initial"] in ("verify", "cleanup403", "cleanupunknown"):
                 assert state["target_deletes"] == 1, (prefix, state)
-            if state["initial"] in ("unchanged", "unchangedbad"):
-                expected_writes = 2 if state["initial"] == "unchangedbad" and mode == "normal" else 1
+            if state["initial"] in ("unchanged", "unchangedbad", "historyunchanged"):
+                expected_writes = 3 if state["initial"] == "historyunchanged" else 2 if state["initial"] == "unchangedbad" and mode == "normal" else 1
                 assert state["target_data_writes"] == expected_writes, (prefix, mode, state)
             if state["initial"] == "large":
                 assert state["source_tags"] == 2 and state["source_data_reads"] == 0 and state["target_data_writes"] == 1, (prefix, state)
@@ -149,7 +152,8 @@ def run(repository, environment, *, versioned_source=False):
                             elif versioned_source:
                                 for _ in range(85 if mode == "large" else 1):
                                     client.put_object(Bucket=buckets["source"], Key=f"{prefix}/{key}", Body=b"old-0", Tagging="proof=old-0")
-                                    client.delete_object(Bucket=buckets["source"], Key=f"{prefix}/{key}")
+                                    if mode not in HISTORY_PLAIN_MODES:
+                                        client.delete_object(Bucket=buckets["source"], Key=f"{prefix}/{key}")
                                     client.put_object(Bucket=buckets["source"], Key=f"{prefix}/{key}", Body=b"old-1", Tagging="proof=old-1")
                             if versioned_source and mode == "partial":
                                 client.put_object(Bucket=buckets["source"], Key=f"{prefix}/{key}", Body=b"accepted-old", Tagging="proof=accepted-old")
@@ -158,12 +162,13 @@ def run(repository, environment, *, versioned_source=False):
                             if versioned_source:
                                 history_pages = list(client.get_paginator("list_object_versions").paginate(Bucket=buckets["source"], Prefix=f"{prefix}/{key}"))
                                 history = history_pages[0]
+                                source_data_versions = [item["VersionId"] for page in history_pages for item in page.get("Versions", []) if item["Key"] == f"{prefix}/{key}"]
                                 source_versions[key] = {item["VersionId"] for page in history_pages for item in page.get("Versions", []) + page.get("DeleteMarkers", []) if item["Key"] == f"{prefix}/{key}"}
                                 if key.endswith("/"):
                                     # 当前 RustFS 将非空尾斜杠对象保存在可变 null 槽，不虚构四个历史。
                                     assert source_versions[key] == {"null"}, (prefix, key, history)
                                 else:
-                                    assert len(source_versions[key]) == (256 if mode == "large" else 101 if mode == "batchmany" else 5 if mode == "partial" else 4), (prefix, key, history)
+                                    assert len(source_versions[key]) == (256 if mode == "large" else 101 if mode == "batchmany" else 5 if mode == "partial" else 3 if mode in HISTORY_PLAIN_MODES else 4), (prefix, key, history)
                         with guard:
                             assert prefix not in states
                             states[prefix] = dict(initial=mode, mode=mode, target=target, keys=keys,
@@ -171,7 +176,9 @@ def run(repository, environment, *, versioned_source=False):
                                                   first_fault=None, inspections=0, fact_released=False,
                                                   deleted=threading.Event(), source_versions=source_versions, deleted_versions=[], batch_requests=[],
                                                   source_payloads=dict(keys), source_tags_expected=[{"Key": "proof", "Value": "raw"}],
-                                                  cleanup_seen=False, target_data_writes=0, source_data_reads=0, latest_versions=latest_versions)
+                                                  cleanup_seen=False, target_data_writes=0, source_data_reads=0, latest_versions=latest_versions,
+                                                  target_data_versions=[], history_fault=False,
+                                                  source_data_versions=source_data_versions if versioned_source else [])
                             active[0] = prefix
                     elif action == "recover":
                         with guard:
@@ -226,6 +233,7 @@ def run(repository, environment, *, versioned_source=False):
                 parts = path.lstrip("/").split("/", 1)
                 database = parts[0] not in buckets.values()
                 source = parts[0] == buckets["source"]
+                body = self.read_body()
                 with guard:
                     prefix = active[0]
                     state = states.get(prefix)
@@ -236,6 +244,30 @@ def run(repository, environment, *, versioned_source=False):
                         state["source_tags"] += 1
                     if source and self.command == "GET" and "tagging" not in query and path.endswith("/" + prefix + "/payload"):
                         state["source_data_reads"] += 1
+                    if mode in HISTORY_DATA_MODES and mode != "historydata" and not state["history_fault"]:
+                        historical_target_head = not database and not source and self.command == "HEAD" and query.get("versionId", [None])[0] in state["target_data_versions"][:1] and len(state["target_data_versions"]) == 3
+                        sql = query.get("query", [""])[0] or (body.decode("utf-8", errors="replace") if database else "")
+                        historical_read = database and "HISTORY_RECORDS" in sql.upper() and "COPY_PATH_CONFIRMED" in sql.upper() and "SELECT" in sql.upper()
+                        if (mode == "historygap" and historical_read) or (mode != "historygap" and historical_target_head):
+                            state["history_fault"] = True
+                            state["affected"] += 1
+                            state["first_fault"] = time.monotonic()
+                            key = f"{prefix}/payload"
+                            if mode == "historygap":
+                                changed = sql.replace(" ORDER BY", " AND source_version_id != '" + state["source_data_versions"][1] + "' ORDER BY")
+                                assert changed != sql, "history query ordering clause missing"
+                                if "query" in query:
+                                    query["query"] = [changed]
+                                    self.path = urllib.parse.urlunsplit(("", "", parsed.path, urllib.parse.urlencode(query, doseq=True), ""))
+                                else:
+                                    body = changed.encode()
+                                print("owned historical catalogue middle-row gap injected", flush=True)
+                            elif mode == "historymissing":
+                                client.delete_object(Bucket=buckets["history"], Key=key, VersionId=state["target_data_versions"][0])
+                            elif mode in ("historytags", "historysource"):
+                                bucket = buckets["source"] if mode == "historysource" else buckets["history"]
+                                version = state["source_data_versions"][-1] if mode == "historysource" else state["target_data_versions"][0]
+                                client.put_object_tagging(Bucket=bucket, Key=key, VersionId=version, Tagging={"TagSet": [{"Key": "proof", "Value": "changed"}]})
                     mutating_observation = versioned_source and source and self.command == "HEAD" and "versionId" not in query and path.endswith("/" + prefix + "/payload") and mode in ("missingcurrent", "sourcechanged", "metaread", "metachanged", "contradictory") and not state["cleanup_seen"]
                     if mutating_observation:
                         state["cleanup_seen"] = True
@@ -267,7 +299,6 @@ def run(repository, environment, *, versioned_source=False):
                     if affected:
                         state["affected"] += 1
                         state["first_fault"] = state["first_fault"] or time.monotonic()
-                body = self.read_body()
                 selected = []
                 if bulk:
                     selected = [(node.find("{*}Key").text, node.find("{*}VersionId").text)
@@ -317,6 +348,18 @@ def run(repository, environment, *, versioned_source=False):
                     self.end_headers()
                     self.wfile.write(payload)
                     return
+                historical_network = state and state["history_fault"] and (
+                    (mode == "historydisconnect" and not database and not source and self.command == "HEAD")
+                    or (mode == "historystall" and source and self.command == "GET" and "tagging" in query))
+                if historical_network:
+                    if mode == "historystall":
+                        stopped.wait(15)
+                    self.close_connection = True
+                    try:
+                        self.connection.shutdown(socket.SHUT_RDWR)
+                    except OSError:
+                        pass
+                    return
                 if deleting and mode in ("disconnect", "stall"):
                     if mode == "stall":
                         stopped.wait(15)
@@ -335,6 +378,10 @@ def run(repository, environment, *, versioned_source=False):
                     connection.request(self.command, self.path, body=body, headers=headers)
                     response = connection.getresponse()
                     payload = response.read()
+                    if not database and not source and self.command == "PUT" and "tagging" not in query and response.status == 200:
+                        if created_version := response.getheader("x-amz-version-id"):
+                            with guard:
+                                state["target_data_versions"].append(created_version)
                     rewritten = source and "versions" in query and mode == "contradictory" and state["cleanup_seen"] and response.status == 200
                     if rewritten:
                         document = ET.fromstring(payload)
@@ -403,12 +450,22 @@ def run(repository, environment, *, versioned_source=False):
                             "copy_execution::object_cleanup_tests::real_unversioned_object_source_cleanup_and_failures",
                             "--", "--ignored", "--exact", "--nocapture", "--test-threads=1"],
                            cwd=repository, env=environment, check=True, timeout=360)
-            assert len(states) == (50 if versioned_source else 30) and all(state["inspections"] == (3 if state["initial"] == "unchangedbad" else 2 if state["initial"] not in ("normal", "historyguard", "missingcurrent", "large") or (not versioned_source and state["target"] == "latest") else 1) for state in states.values()), states
+            if environment.get("LAB_OBJECT_HISTORY_ONLY") == "true":
+                summaries = [report for report in reports if report["is_final"] and not report.get("diagnostics")]
+                assert len(states) == 20 and len(summaries) == 22 and all(report["diagnostics_complete"] for report in summaries)
+                assert sum(report["migration"]["phase"] == "failed" for report in summaries) == 14
+                assert all(state["history_fault"] for state in states.values() if state["initial"] in HISTORY_DATA_MODES and state["initial"] != "historydata")
+                for mode in HISTORY_DATA_MODES[1:]:
+                    failed = [report for report in summaries if report["job_id"].endswith("_" + mode)]
+                    assert len(failed) == 2 and all(report["task_error_count"] == 1 and report["detail"]["error_count"] == 0 for report in failed)
+                print("independent focused history readiness deployments=2 normal=8 failure=14 callback_HTTP204=true source_retained_on_fault=true", flush=True)
+                return
+            assert len(states) == (68 if versioned_source else 30) and all(state["inspections"] == (3 if state["initial"] == "unchangedbad" else 2 if state["initial"] not in ("normal", "historyguard", "missingcurrent", "large", *HISTORY_DATA_MODES) or (not versioned_source and state["target"] == "latest") else 1) for state in states.values()), states
             assert sum(state["fact_released"] for state in states.values()) == (0 if versioned_source else 4), states
-            assert all(state["affected"] for state in states.values() if state["initial"] not in ("normal", "historyguard", "unchanged", "large")), states
+            assert all(state["affected"] for state in states.values() if state["initial"] not in ("normal", "historyguard", "unchanged", "large", "historydata", "historyunchanged")), states
             summaries = [report for report in reports if report["is_final"] and not report.get("diagnostics")]
-            assert len(summaries) == (88 if versioned_source else 48) and all(report["diagnostics_complete"] for report in summaries), summaries
-            assert sum(report["migration"]["phase"] == "failed" for report in summaries) == (38 if versioned_source else 18)
+            assert len(summaries) == (108 if versioned_source else 48) and all(report["diagnostics_complete"] for report in summaries), summaries
+            assert sum(report["migration"]["phase"] == "failed" for report in summaries) == (50 if versioned_source else 18)
             events = {event["event_id"]: event for report in reports
                       for event in (report.get("diagnostics") or {}).get("events", [])}
             purge = [event for event in events.values() if event.get("retention", {}).get("reason") == "source_deletion_unconfirmed"]
@@ -418,7 +475,10 @@ def run(repository, environment, *, versioned_source=False):
                 assert len(large) == 2 and all(report["detail"]["scanned_files"] == 1 and report["detail"]["transferred_bytes"] == len(BODY) and report["task_error_count"] == 0 for report in large), large
                 for mode, reason in (("missingcurrent", "无法重新确认版本化源"), ("sourcechanged", "source history changed"),
                                      ("metaread", "PermissionDenied"), ("metachanged", "Tags"),
-                                     ("historyguard", "永久清理不可用"), ("unchangedbad", "Content")):
+                                     ("historyguard", "永久清理不可用"), ("unchangedbad", "Content"),
+                                     ("historytags", "Tags"), ("historysource", "Tags"),
+                                     ("historymissing", "NotFound"), ("historygap", "段内事实缺失"),
+                                     ("historydisconnect", "Connectivity"), ("historystall", "Timeout")):
                     failures = [report for report in summaries if report["job_id"].endswith("_" + mode) and report["migration"]["phase"] == "failed"]
                     assert len(failures) == 2 and all(report["task_error_count"] == 1 for report in failures), failures
                     details = [event for report in reports if report["job_id"].endswith("_" + mode)
@@ -477,7 +537,7 @@ def run(repository, environment, *, versioned_source=False):
             for role, bucket in buckets.items():
                 assert client.get_object(Bucket=bucket, Key="sentinel")["Body"].read() == b"retain sentinel"
                 assert not client.list_multipart_uploads(Bucket=bucket).get("Uploads")
-            print(f"independent object cleanup source_versioned={versioned_source} deployments=2 normal={16 if versioned_source else 12} failures={38 if versioned_source else 18} recovery={34 if versioned_source else 18} HTTP_204=true final_reports_saved=true source_deleting_base_empty=true all_recovery_generations_full=true unchanged_incremental_has_no_data_recopy={versioned_source} large_history_records_per_key={256 if versioned_source else 0}", flush=True)
+            print(f"independent object cleanup source_versioned={versioned_source} deployments=2 normal={24 if versioned_source else 12} failures={50 if versioned_source else 18} recovery={34 if versioned_source else 18} HTTP_204=true final_reports_saved=true source_deleting_base_empty=true all_recovery_generations_full=true unchanged_incremental_has_no_data_recopy={versioned_source} large_history_records_per_key={256 if versioned_source else 0}", flush=True)
         finally:
             stopped.set()
             relay.shutdown()

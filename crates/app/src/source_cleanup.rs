@@ -21,6 +21,7 @@ use task_model::{SourcePresence, TargetRetention, TargetRetentionReason};
 mod verification;
 use verification::verify_source_metadata;
 mod content;
+mod history;
 mod ready_window;
 pub(crate) use ready_window::{EarlyCleanup, FullCleanupStage};
 
@@ -80,8 +81,22 @@ pub(crate) async fn remove_confirmed_sources(
     let query = AbortOnDropHandle::new(tokio::spawn(async move {
         database.query_current_copy_entries(None, None, None, sender).await
     }));
+    let target_history = destination.storage().staged_destination()?.keeps_history().await?;
+    let mut histories = history::HistoryCleanup::default();
     while let Some(completion) = receiver.recv().await {
-        let entry = completion.item.entry;
+        let entry = completion.completion.item.entry.clone();
+        if histories.has_other_path(entry.path()) {
+            histories.finish(&source, &check).await?;
+        }
+        if target_history && entry.history().is_some() {
+            histories
+                .observe(completion, &source, &destination, &check)
+                .await
+                .map_err(|source| {
+                    AppError::copy_entry_failure(CopyStep::SourceCleanup, Path::new(entry.path().as_str()), source)
+                })?;
+            continue;
+        }
         if check.is_prechecked(&entry) {
             continue;
         }
@@ -92,7 +107,12 @@ pub(crate) async fn remove_confirmed_sources(
                 AppError::copy_entry_failure(CopyStep::SourceCleanup, Path::new(entry.path().as_str()), source)
             })?;
     }
-    query.await.map_err(AppError::from)??;
+    query
+        .await
+        .map_err(AppError::from)
+        .and_then(|result| result.map_err(AppError::from))
+        .map_err(|error| histories.query_failed(error))?;
+    histories.finish(&source, &check).await?;
     Ok(())
 }
 
@@ -105,7 +125,11 @@ pub(crate) async fn report_failure(result: Result<()>, reports: &ConsumerManager
         return Err(source);
     };
     let report = async {
-        let reason = match failure.storage_error() {
+        let storage = failure.storage_error().map(|error| match error {
+            StorageError::HistoryCleanupVerification { source, .. } => source.as_ref(),
+            other => other,
+        });
+        let reason = match storage {
             Some(StorageError::NamespaceRead(_)) => TargetRetentionReason::SourceQueryFailed,
             Some(StorageError::TargetPersistenceUnconfirmed { .. }) => {
                 TargetRetentionReason::TargetPersistenceUnconfirmed
@@ -116,10 +140,7 @@ pub(crate) async fn report_failure(result: Result<()>, reports: &ConsumerManager
             _ => TargetRetentionReason::StaleEvidence,
         };
         let mut retention = TargetRetention::entry(&path(entry_path)?, reason);
-        if matches!(
-            failure.storage_error(),
-            Some(StorageError::SourceMetadataChanged { .. })
-        ) {
+        if matches!(storage, Some(StorageError::SourceMetadataChanged { .. })) {
             retention.source_presence = SourcePresence::Present;
         }
         reports.record_target_retention(retention, source.to_string()).await
@@ -226,7 +247,7 @@ async fn remove_entry(
     }
     // 增量跳过／仅修改属性的条目没有本轮数据传输回读，也必须执行用户选择的全量校验。
     if check.verify_content && entry.kind() == EntryKind::File {
-        content::verify(source, destination, entry, &target, check).await?;
+        content::verify(source, destination, entry, &target, check, false).await?;
     }
     // 仅删除文件、链接本身或空目录；过滤掉或并发新增的子项会阻止目录删除。
     source

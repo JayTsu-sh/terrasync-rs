@@ -47,6 +47,8 @@ macro_rules! file_scan_base_columns {
     metadata_hash Nullable(String) DEFAULT NULL,
     history_segment UInt32 DEFAULT 0,
     history_index UInt32 DEFAULT 0,
+    history_records UInt32 DEFAULT 0,
+    history_complete Bool DEFAULT true,
     INDEX identity_key_idx identity_key TYPE bloom_filter GRANULARITY 1
 "
     };
@@ -89,8 +91,7 @@ pub(crate) const FILE_SCAN_COLUMNS_LIST: &str = "name, relative_path, size, ext,
 pub(crate) const SNAPSHOT_COLUMNS: &str = "relative_path,backend_kind,backend_id,entry_snapshot";
 
 /// 已确认复制事实回读同时携带实际目标版本；源版本仍由原生 snapshot 表达。
-pub(crate) const COPY_SNAPSHOT_COLUMNS: &str =
-    "relative_path,backend_kind,backend_id,entry_snapshot,source_version_id,copy_target_version";
+pub(crate) const COPY_SNAPSHOT_COLUMNS: &str = "relative_path,backend_kind,backend_id,entry_snapshot,source_version_id,copy_target_version,history_segment,history_index,history_records,history_complete";
 
 pub(crate) static CATALOGUE_COLUMNS: LazyLock<String> =
     LazyLock::new(|| format!("{},backend_kind,backend_id,entry_snapshot", FILE_SCAN_COLUMNS_LIST));

@@ -33,6 +33,7 @@ pub use notifications::{
     MAX_NOTIFICATION_BATCH_BYTES, MAX_NOTIFICATION_BATCH_RECORDS, MAX_NOTIFICATION_RECORD_BYTES, NotificationCursor,
     NotificationKind, NotificationRecord,
 };
+pub use read::CopyCatalogueEntry;
 
 #[cfg(test)]
 mod baseline_tests;

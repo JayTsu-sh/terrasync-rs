@@ -1260,3 +1260,65 @@ Rust 1.98.1。独占 2 CPU／1536 MiB Single ClickHouse、1 CPU／768 MiB RustFS
 `/tmp/terrasync-purge-failure-local-perf/`，脚本 `/tmp/run_purge_failure_local_perf.py`，
 日志 `/tmp/terrasync-marker-safe-local-perf.log`；固定程序与上面的版本化对照相同。
 两组性能测试及全部故障夹具的独占容器均已清理。
+
+
+### 历史目标的数据版本整体就绪与永久清理（不含删除标记）
+
+在专用清理错误接入之后，历史目标现可清理只含数据版本的文件历史：已有
+query_current_copy_entries 扩展回读 CopyCatalogueEntry，保留 CopyCompletion 的实际目标绑定，
+同时返回原始 history_segment／history_index／history_records／history_complete。
+单版本 snapshot 仍保留全部原值；它自己的 complete 不再被当作整 key 完整性的证据。
+新增两个边界列由 Single／Cluster 共用记录与列定义写入；这是首个开发格式调整，不提供旧表
+兼容或迁移。查询同时要求本执行、路径与数据已确认，不从缺失绑定推断实际目标 ID。
+
+产品逐行检查首段首项、段内连续、段长一致、段间连续及完整末段的最后当前记录。
+每个实际目标版本核对所需元数据、类型／大小及持久性，再按精确源版本复核捕获的源属性。
+全量校验逐个读取旧源／目标版本；当前目标仍按当前发布绑定核对，避免把旧版本的 pin 用来
+替代当前发布状态。一个 key 只保留一份位置状态和一个最新快照，不缓存完整历史／已完成集合。
+最后一个 key 等数据库流成功结束后才清理；已知路径的查询失败保留原始类型和路径上下文。
+全部所需版本成功后重新确认当前源，再由 Native 受保护永久清理全部历史、当前项最后删除。
+
+历史版本错误包含源／目标版本、阶段和已有脱敏诊断，保持原始有类型原因；整项清理只计一次
+任务错误。MetadataVerification::Cancelled 及历史包装中的取消保持取消分类。包含任何删除标记
+或目录标记的历史仍明确拒绝清理；不把“数据版本已就绪”扩大为“删除标记也已核验”。
+本步骤未修改 data-mover、nfs-rs 或新建存储操作入口，也未接通全部条目先于入库的清理。
+
+六个边界单元覆盖跨段、缺前缀、缺中间项、重放、边界矛盾、缺当前项、查询失败路径／原始类型
+和取消。新增数据库单元验证投影仍是一条版本，但原始位置和段长独立保留、非法长度拒绝。
+Single／双副本的既有三组真实代次测试通过，新增检查分段 0/1/2、段长 1、末段标记、当前执行
+授权以及旧映射与原始元数据；原有断连、静默超时、闪断恢复和取消读取也通过。
+原始日志 `/tmp/terrasync-history-data-generations-real.log`。
+
+版本化源真实全套扩为 108 轮：24 正常、50 失败、34 恢复，两种部署均独立核验源／目标历史、
+base 和最终报告，HTTP 204 排空明细。新增 quick／full 的三数据版本迁移；旧目标 tags 改变、
+源历史 tags 改变、旧目标版本真实缺失、数据库中间行被省略、目标断连、源历史 tags 读取静默
+超时均保留三条源历史且零源删除，并交付具体版本／阶段／原因。断连注入到最终回调约
+156／244 ms，源静默超时约 1192／1284 ms；这是本地受控代理结果，不是统一故障窗口认证。
+同 job ID 上代保留源、本代删源的历史目标增量两轮也通过：先保留三条基线，下一代不重新发布
+数据、transferred_bytes=0、按一个 entry 计数，逐版本全量校验后源历史清空、base=0、目标仍
+恰好三个原发布版本。删除标记保护和已有 256 历史的最新状态目标场景保持通过。
+聚焦入口为在现有 --copy-versioned-source-cleanup 之前设置 LAB_OBJECT_HISTORY_ONLY=true，
+仅执行两种部署共 22 轮（8 正常、14 失败）；不把该聚焦结果当作 108 轮全套通过。
+原始日志 `/tmp/terrasync-history-data108-real.log` 与 `/tmp/terrasync-history-focused22-real.log`。
+
+普通源 48 轮及主项目五项 Rust 检查（含 16 项远程进程回归）通过，Rust 1.98.1；已有警告和
+ignored 条目保留。初次额外真实夹具修正了 SELECT 位于 HTTP body 的故障注入位置及 bootstrap
+尚无活动状态的处理；测试大 future 放堆上，未提高产品栈限制。初次 Clippy 的新增测试 unwrap
+已改为显式检查并复跑通过。取消、源变化和元数据错误保持失败关闭；统一预算／闪断防抖、
+真实历史路径在途取消、历史删除标记、无数据库目录收尾、大规模／release 仍未在本步认证。
+
+架构审查：分段边界与查询投影属于 db，Single／Cluster 共用，不在 app 拼 SQL；完整性状态和
+删源决策集中 source_cleanup/history，校验借用现有 metadata／read／integrity／namespace roles，
+没有应用内 S3 协议或存储重试循环。逐版本原因复用产品通知与累计统计，未增加无界版本集合。
+
+普通 Local 路径对 0af0d90 的固定 CLI 做交错 dev A/B，3000×1 KiB，删源、Single ClickHouse、
+并发 16／批次 100000、unordered／Direct／quick；无 callback 配置。每轮核验目标、源删除、
+目录 ns mtime／mode、base 和最终报告，50 ms RSS 采样。首次平铺六轮耗时中位数 +6.21%，
+超过 5% 后原样保留样本并交错复测；第二组六轮为 +3.56%。合并两轮各六个程序样本，平铺
+5.52→5.675 秒（+2.81%），RSS 185.15→185.65 MiB（+0.27%，变更后最高 196.85 MiB）；
+目录三对样本 5.01→5.17 秒（+3.19%），RSS 183.57→183.82 MiB（+0.13%，最高 190.06 MiB）。
+不将单轮波动隐去或宣称已定位固定性能回退；这些有限样本不认证所有规模／后端约 200 MiB。
+性能期间无 CI／构建并发，独占容器已清理。样本及两组原始结果在
+`/tmp/terrasync-history-data-perf/`，程序 `/tmp/run_history_data_local_perf.py` 与复测脚本，
+变更前 SHA-256 `6a0511a748c6bbfb625af15d9c6f5954dfafe22409ee48b386769af17a712cd6`，
+变更后 `f1d75f8d40a117eaf592d948576472185ffe66547a8f98b093e69174d9a0f6e6`。

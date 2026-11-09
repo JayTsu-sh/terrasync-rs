@@ -83,6 +83,17 @@ pub enum StorageError {
         "历史数据发布结果未确认，保留所有源和目标版本，禁止重放旧数据及继续发布后续版本: {path} source_version={source_version}"
     )]
     HistoricalPublicationUnconfirmed { path: StoragePath, source_version: String },
+    #[error("历史整体就绪未确认，保留源历史: {path}: {reason}")]
+    HistoryCleanupUnconfirmed { path: StoragePath, reason: &'static str },
+    #[error("历史删源核验失败，保留源历史: {path} source_version={version} target_version={target_version:?} phase={phase}: {source}; {}", history_diagnostic(.source))]
+    HistoryCleanupVerification {
+        path: StoragePath,
+        version: String,
+        target_version: Option<String>,
+        phase: &'static str,
+        #[source]
+        source: Box<StorageError>,
+    },
     #[error("源端版本永久清理不可用，已保留所有历史: {path}")]
     PermanentVersionCleanupUnavailable { path: StoragePath },
     #[error("无法重新确认版本化源的当前对象，不能认定全部历史已删除，保留源历史: {path}")]
@@ -196,8 +207,10 @@ impl StorageError {
             || matches!(self, Self::Role(StorageRoleFailure::Entry(error)) if error.class() == FailureClass::NotFound)
     }
     pub fn is_cancelled(&self) -> bool {
-        matches!(self, Self::Cancelled)
-            || matches!(self, Self::NamespaceRead(NamespaceReadFailure::Cancelled { .. }))
+        matches!(
+            self,
+            Self::Cancelled | Self::MetadataVerification(MetadataVerificationError::Cancelled)
+        ) || matches!(self, Self::NamespaceRead(NamespaceReadFailure::Cancelled { .. }))
             || matches!(self,
                 Self::Role(StorageRoleFailure::Entry(error))
                 | Self::TargetPersistenceUnconfirmed { source: StorageRoleFailure::Entry(error), .. }
@@ -212,6 +225,7 @@ impl StorageError {
                 StorageRoleFailure::Entry(cause) => cause.class() == FailureClass::Cancelled,
                 StorageRoleFailure::Session(cause) => cause.class() == FailureClass::Cancelled,
             }))
+            || matches!(self, Self::HistoryCleanupVerification { source, .. } if source.is_cancelled())
             || matches!(self, Self::DirectPatch(error) if error.is_cancelled())
     }
 }
@@ -221,6 +235,16 @@ impl From<TransferFailure> for StorageError {
     }
 }
 // role 的 Display 只展示类别；这里显式选用契约已脱敏的诊断供任务日志及 callback 使用。
+fn history_diagnostic(error: &StorageError) -> &str {
+    match error {
+        StorageError::Role(cause)
+        | StorageError::TargetPersistenceUnconfirmed { source: cause, .. }
+        | StorageError::SourceCleanupContentUnverified { source: cause, .. }
+        | StorageError::MetadataVerification(MetadataVerificationError::Read(cause)) => role_diagnostic(cause),
+        _ => "",
+    }
+}
+
 fn role_diagnostic(source: &StorageRoleFailure) -> &str {
     match source {
         StorageRoleFailure::Entry(error) => error.diagnostic(),

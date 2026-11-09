@@ -94,7 +94,7 @@ async fn round(config: &ClickHouseConfig, command: &SyncJobConfig, mode: &str, s
     let budget = if command.job_id.ends_with("_large") { 90 } else { 35 };
     let result = timeout(
         Duration::from_secs(budget),
-        SyncOrchestrator::new_local(command.clone()).run(),
+        Box::pin(SyncOrchestrator::new_local(command.clone()).run()),
     )
     .await
     .map_err(|_| AppError::ConfigError("owned object cleanup job timed out".into()))?;
@@ -106,23 +106,33 @@ async fn round(config: &ClickHouseConfig, command: &SyncJobConfig, mode: &str, s
             "{result:?}"
         );
         assert_eq!(result.unwrap_err().reported_copy_data_failed(), mode != "metadata");
-    } else if matches!(mode, "historyguard" | "missingcurrent" | "metaread" | "metachanged") {
+    } else if matches!(
+        mode,
+        "historytags" | "historysource" | "historymissing" | "historygap" | "historydisconnect" | "historystall"
+    ) {
         let error = result.unwrap_err();
         assert!(error.source_cleanup_entry().is_some(), "{error}");
         assert!(
             matches!(
-                (mode, error.storage_error()),
-                (
-                    "historyguard",
-                    Some(StorageError::PermanentVersionCleanupUnavailable { .. })
-                ) | (
-                    "missingcurrent",
-                    Some(StorageError::SourceHistoryCurrentUnconfirmed { .. })
-                ) | ("metaread", Some(StorageError::NamespaceRead(_)))
-                    | ("metachanged", Some(StorageError::SourceMetadataChanged { .. }))
+                error.storage_error(),
+                Some(StorageError::HistoryCleanupVerification { .. } | StorageError::HistoryCleanupUnconfirmed { .. })
             ),
             "{error}"
         );
+    } else if matches!(mode, "historyguard" | "missingcurrent" | "metaread" | "metachanged") {
+        let error = result.unwrap_err();
+        assert!(error.source_cleanup_entry().is_some(), "{error}");
+        let accepted = match (mode, error.storage_error()) {
+            ("historyguard", Some(StorageError::HistoryCleanupVerification { source, .. })) => {
+                matches!(source.as_ref(), StorageError::PermanentVersionCleanupUnavailable { .. })
+            }
+            ("historyguard", Some(StorageError::PermanentVersionCleanupUnavailable { .. }))
+            | ("missingcurrent", Some(StorageError::SourceHistoryCurrentUnconfirmed { .. }))
+            | ("metaread", Some(StorageError::NamespaceRead(_)))
+            | ("metachanged", Some(StorageError::SourceMetadataChanged { .. })) => true,
+            _ => false,
+        };
+        assert!(accepted, "{error}");
     } else {
         let error = result.unwrap_err();
         assert!(error.source_cleanup_entry().is_some(), "{error}");
@@ -177,10 +187,14 @@ async fn case(config: &ClickHouseConfig, deployment: &str, target: &str, full: b
     command.concurrency = Some(2);
     command.progress_callback_url = Some(CallbackEndpoint::parse(&environment("LAB_OBJECT_CLEANUP_CALLBACK")?)?);
     control(&format!("arm/{prefix}/{mode}")).await?;
-    let result_mode = if mode == "large" { "normal" } else { mode };
+    let result_mode = if matches!(mode, "large" | "historydata") {
+        "normal"
+    } else {
+        mode
+    };
     round(config, &command, result_mode, 1).await?;
     control(&format!("inspect/{prefix}/{result_mode}")).await?;
-    if !matches!(mode, "normal" | "historyguard" | "missingcurrent" | "large") {
+    if !matches!(mode, "normal" | "missingcurrent" | "large") && !mode.starts_with("history") {
         control(&format!("recover/{prefix}/{mode}")).await?;
         round(config, &command, "normal", 2).await?;
         control(&format!("inspect/{prefix}/normal")).await?;
@@ -188,15 +202,50 @@ async fn case(config: &ClickHouseConfig, deployment: &str, target: &str, full: b
     Ok(())
 }
 
-async fn unchanged_versioned_move(config: &ClickHouseConfig, deployment: &str, corrupt: bool) -> Result<()> {
-    let mode = if corrupt { "unchangedbad" } else { "unchanged" };
-    let prefix = format!("{deployment}-latest-full-{mode}");
+async fn history_cases(config: &ClickHouseConfig, deployment: &str) -> Result<()> {
+    case(config, deployment, "history", false, "historyguard").await?;
+    for full in [false, true] {
+        case(config, deployment, "history", full, "historydata").await?;
+    }
+    for mode in [
+        "historytags",
+        "historysource",
+        "historymissing",
+        "historygap",
+        "historydisconnect",
+        "historystall",
+    ] {
+        case(config, deployment, "history", false, mode).await?;
+    }
+    Box::pin(unchanged_versioned_move(config, deployment, false, true)).await?;
+    Ok(())
+}
+
+async fn unchanged_versioned_move(
+    config: &ClickHouseConfig, deployment: &str, corrupt: bool, history_target: bool,
+) -> Result<()> {
+    let mode = if history_target {
+        "historyunchanged"
+    } else if corrupt {
+        "unchangedbad"
+    } else {
+        "unchanged"
+    };
+    let target = if history_target { "history" } else { "latest" };
+    let prefix = format!("{deployment}-{target}-full-{mode}");
     let root = PathBuf::from(environment("LAB_OBJECT_CLEANUP_ROOT")?).join(&prefix);
     std::fs::create_dir_all(root.join("job"))?;
     let mut command = job(&root.join("job"));
-    command.job_id = format!("objclean_{deployment}_latest_full_{mode}");
+    command.job_id = format!("objclean_{deployment}_{target}_full_{mode}");
     command.src_path = format!("{}/{prefix}", environment("LAB_OBJECT_CLEANUP_SOURCE")?);
-    command.dest_path = format!("{}/{prefix}", environment("LAB_OBJECT_CLEANUP_LATEST")?);
+    command.dest_path = format!(
+        "{}/{prefix}",
+        environment(if history_target {
+            "LAB_OBJECT_CLEANUP_HISTORY"
+        } else {
+            "LAB_OBJECT_CLEANUP_LATEST"
+        })?
+    );
     command.enable_integrity_check = true;
     command.concurrency = Some(2);
     command.progress_callback_url = Some(CallbackEndpoint::parse(&environment("LAB_OBJECT_CLEANUP_CALLBACK")?)?);
@@ -226,7 +275,10 @@ async fn unchanged_versioned_move(config: &ClickHouseConfig, deployment: &str, c
             result?;
         }
         let database = ClickHouseDatabase::connect(config, &command.job_id).await?;
-        assert_eq!(database.get_count("base").await?, u64::from(sequence == 1));
+        assert_eq!(
+            database.get_count("base").await?,
+            u64::from(sequence == 1) * if history_target { 3 } else { 1 }
+        );
         let generation = database
             .latest_copy_generation()
             .await?
@@ -328,6 +380,9 @@ async fn real_unversioned_object_source_cleanup_and_failures() -> Result<()> {
         })?;
         let deployment = if cluster { "cluster" } else { "single" };
         let result: Result<()> = async {
+            if environment("LAB_OBJECT_HISTORY_ONLY").is_ok_and(|value| value == "true") {
+                return Box::pin(history_cases(&config, deployment)).await;
+            }
             let targets = if environment("LAB_OBJECT_CLEANUP_VERSIONED").is_ok_and(|value| value == "true") {
                 vec!["local", "latest"]
             } else {
@@ -357,9 +412,9 @@ async fn real_unversioned_object_source_cleanup_and_failures() -> Result<()> {
                 ] {
                     case(&config, deployment, "latest", false, mode).await?;
                 }
-                case(&config, deployment, "history", false, "historyguard").await?;
+                Box::pin(history_cases(&config, deployment)).await?;
                 for corrupt in [false, true] {
-                    Box::pin(unchanged_versioned_move(&config, deployment, corrupt)).await?;
+                    Box::pin(unchanged_versioned_move(&config, deployment, corrupt, false)).await?;
                 }
                 case(&config, deployment, "latest", false, "large").await?;
             }

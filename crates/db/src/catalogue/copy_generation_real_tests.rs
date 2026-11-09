@@ -16,7 +16,7 @@ use uuid::Uuid;
 
 use super::CopyGenerationStatus;
 use crate::DeletionStatus;
-use crate::catalogue::ComparisonMode;
+use crate::catalogue::{ComparisonMode, CopyCatalogueEntry};
 use crate::execution::base_client;
 use crate::observed_fixtures::observation;
 use crate::schema::identity::encoded_file_handle;
@@ -428,11 +428,11 @@ async fn delayed_copy_ack_cannot_restore_metadata_readiness(fixture: &Fixture) -
 }
 
 async fn read_current_completions(database: &ClickHouseDatabase) -> Result<Vec<CopyCompletion>> {
-    let (sender, mut receiver) = mpsc::channel(1);
+    let (sender, mut receiver) = mpsc::channel::<CopyCatalogueEntry>(1);
     let collect = async {
         let mut rows = Vec::new();
         while let Some(row) = receiver.recv().await {
-            rows.push(row);
+            rows.push(row.completion);
         }
         rows
     };
@@ -579,6 +579,27 @@ async fn selected_copy_bindings_roundtrip(fixture: &Fixture, history_target: boo
         }
     };
     check(&read_current_completions(&database).await?);
+    let (sender, mut receiver) = mpsc::channel::<CopyCatalogueEntry>(1);
+    let positions = async {
+        let mut index = 0;
+        while let Some(row) = receiver.recv().await {
+            assert_eq!(row.history_segment, if history_target { index } else { 2 });
+            assert_eq!(row.history_index, 0);
+            assert_eq!(row.history_records, 1);
+            assert_eq!(row.history_complete, row.history_segment == 2);
+            assert!(
+                row.completion
+                    .item
+                    .entry
+                    .history()
+                    .is_some_and(|history| history.records().len() == 1)
+            );
+            index += 1;
+        }
+        assert_eq!(index, if history_target { 3 } else { 1 });
+    };
+    let (read, ()) = tokio::join!(database.query_current_copy_entries(None, None, None, sender), positions);
+    read?;
     if history_target {
         copy_binding_read_faults(fixture, &database).await?;
     }

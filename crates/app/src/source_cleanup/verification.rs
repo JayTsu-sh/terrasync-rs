@@ -2,10 +2,14 @@
 use super::SourceCleanupCheck;
 use crate::error::storage::operation;
 use data_mover::model::{
-    MetadataFamily, MetadataObservation, MetadataObservations, ObservationMode, ObservationPlan, ObservedEntry,
+    EntryKind, EntryOperationFailure, FailureClass, MetadataFamily, MetadataObservation, MetadataObservations,
+    ObservationMode, ObservationPlan, ObservedEntry, Operation, SourceVersion, Transience,
 };
+use data_mover::storage::StorageRoleFailure;
 use data_mover::storage::{NamespaceReadOutcome, read_namespace_entry};
 use task_model::metadata::metadata_digests;
+use task_model::observation::ObservedView;
+use tokio::time::timeout;
 
 use crate::error::{Result, StorageError};
 use crate::storage_factory::StorageContext;
@@ -18,7 +22,7 @@ fn requested<T>(fact: &MetadataObservation<T>) -> ObservationMode {
     }
 }
 
-fn source_plan(facts: &MetadataObservations) -> ObservationPlan {
+pub(super) fn source_plan(facts: &MetadataObservations) -> ObservationPlan {
     ObservationPlan::default()
         .with_acl(requested(facts.acl()))
         .with_xattrs(requested(facts.xattrs()))
@@ -27,7 +31,7 @@ fn source_plan(facts: &MetadataObservations) -> ObservationPlan {
         .with_timestamps(ObservationMode::InlineOnly)
 }
 
-fn changed_families(expected: &MetadataObservations, current: &MetadataObservations) -> Vec<MetadataFamily> {
+pub(super) fn changed_families(expected: &MetadataObservations, current: &MetadataObservations) -> Vec<MetadataFamily> {
     let mut changed = Vec::new();
     if expected.ownership_mode().value().is_some()
         && expected.ownership_mode().value() != current.ownership_mode().value()
@@ -94,6 +98,72 @@ pub(super) async fn verify_source_metadata(
         .into());
     }
     Ok(true)
+}
+
+/// 指定历史版本使用已有 read／metadata role，不把旧版本属性与当前源混比。
+pub(super) async fn verify_source_version(
+    source: &StorageContext, expected: ObservedView<'_>, check: &SourceCleanupCheck,
+) -> Result<()> {
+    let path = expected.source_path()?;
+    let operation = async {
+        let version = SourceVersion::Id(expected.version_id().into());
+        let descriptor = source
+            .storage()
+            .read_source()?
+            .describe_version(&path, &version)
+            .await?;
+        if descriptor.kind != EntryKind::File
+            || descriptor.version != version
+            || descriptor.size != expected.version().and_then(|record| record.size())
+            || &descriptor.source_identity != expected.source_identity()
+        {
+            return Err(StorageError::HistoryCleanupUnconfirmed {
+                path: path.clone(),
+                reason: "源历史版本身份或大小发生变化",
+            }
+            .into());
+        }
+        let facts = source
+            .storage()
+            .metadata()?
+            .observe_copy_bound_version(
+                &path,
+                expected.source_identity(),
+                &version,
+                source_plan(expected.metadata()),
+            )
+            .await?
+            .observations;
+        let failures: Vec<_> = facts.failures().collect();
+        if !failures.is_empty() {
+            return Err(StorageError::SourceMetadataAcquisitionFailed {
+                path: path.clone(),
+                version: Some(expected.version_id().into()),
+                failures,
+            }
+            .into());
+        }
+        let families = changed_families(expected.metadata(), &facts);
+        if !families.is_empty() {
+            return Err(StorageError::SourceMetadataChanged {
+                path: path.clone(),
+                families,
+            }
+            .into());
+        }
+        Ok(())
+    };
+    tokio::select! {
+        biased;
+        () = check.cancel.cancelled() => Err(StorageError::Cancelled.into()),
+        result = timeout(check.read_policy.operation_timeout, operation) => match result {
+            Ok(result) => result,
+            Err(_) => Err(StorageRoleFailure::Entry(EntryOperationFailure::new(
+                path, Operation::Observe, FailureClass::Timeout, Transience::Transient,
+                "historical source verification exceeded operation timeout",
+            ).map_err(StorageError::from)?).into()),
+        },
+    }
 }
 
 #[cfg(test)]

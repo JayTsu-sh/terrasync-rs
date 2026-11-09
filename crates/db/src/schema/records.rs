@@ -1,5 +1,7 @@
 //! `ClickHouse` 目录行及事件行的编码；查询和任务入口不暴露 SQL 行 DTO。
 
+use crate::catalogue::CopyCatalogueEntry;
+
 use std::{collections::BTreeMap, path::Path, sync::Arc, time::SystemTime};
 
 use data_mover::model::{BackendIdentity, BackendKind};
@@ -144,10 +146,14 @@ pub(crate) struct CopySnapshotRow {
     entry_snapshot: Vec<u8>,
     source_version_id: String,
     copy_target_version: Option<String>,
+    history_segment: u32,
+    history_index: u32,
+    history_records: u32,
+    history_complete: bool,
 }
 
 impl CopySnapshotRow {
-    pub(crate) fn into_completion(self) -> Result<CopyCompletion> {
+    pub(crate) fn into_completion(self) -> Result<CopyCatalogueEntry> {
         let backend = BackendIdentity::new(self.backend_kind.parse()?, self.backend_id)?;
         let entry = decode_observation(&self.relative_path, &self.entry_snapshot, &backend)?;
         if entry.history().is_some_and(|history| history.records().len() != 1) {
@@ -162,10 +168,31 @@ impl CopySnapshotRow {
                 field: "source_version_id",
             });
         }
-        Ok(CopyCompletion {
-            item,
-            target_version: self.copy_target_version.filter(|value| !value.is_empty()),
-            readiness: CopyReadiness::Ready,
+        if item.entry.history().is_some() {
+            if self.history_records == 0 || self.history_index >= self.history_records {
+                return Err(DatabaseError::ObservationProjectionMismatch {
+                    field: "history_position",
+                });
+            }
+        } else if self.history_segment != 0
+            || self.history_index != 0
+            || self.history_records != 0
+            || !self.history_complete
+        {
+            return Err(DatabaseError::ObservationProjectionMismatch {
+                field: "history_position",
+            });
+        }
+        Ok(CopyCatalogueEntry {
+            completion: CopyCompletion {
+                item,
+                target_version: self.copy_target_version.filter(|value| !value.is_empty()),
+                readiness: CopyReadiness::Ready,
+            },
+            history_segment: self.history_segment,
+            history_index: self.history_index,
+            history_records: self.history_records,
+            history_complete: self.history_complete,
         })
     }
 }
@@ -380,6 +407,10 @@ mod tests {
             entry_snapshot: record.entry_snapshot.as_bytes().to_vec(),
             source_version_id: record.source_version_id.into(),
             copy_target_version: binding.map(str::to_owned),
+            history_segment: record.history_segment,
+            history_index: record.history_index,
+            history_records: record.history_records,
+            history_complete: record.history_complete,
         })
     }
 
@@ -397,7 +428,9 @@ mod tests {
                 Some(vec![("raw".into(), "original".into())]),
                 Some((version.map(str::to_owned), true, false)),
             );
-            let completion = copied_row(&entry, Some(0), Some("actual-target-v9"))?.into_completion()?;
+            let completion = copied_row(&entry, Some(0), Some("actual-target-v9"))?
+                .into_completion()?
+                .completion;
             assert_eq!(completion.readiness, CopyReadiness::Ready);
             assert_eq!(completion.target_version.as_deref(), Some("actual-target-v9"));
             assert_eq!(completion.item.version_index, Some(0));
@@ -407,6 +440,61 @@ mod tests {
                 entry.history().unwrap().records()[0].metadata().unwrap()
             );
             assert_eq!(completion.item.entry, Arc::new(entry));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn copy_readback_keeps_original_segment_positions_and_rejects_invalid_lengths() -> Result<()> {
+        let records = (0..3)
+            .map(|index| {
+                observation(
+                    BackendKind::S3,
+                    "payload".into(),
+                    EntryKind::File,
+                    7,
+                    [0; 3],
+                    None,
+                    None,
+                    None,
+                    Some((Some(format!("v{index}")), index == 2, false)),
+                )
+                .history()
+                .unwrap()
+                .records()[0]
+                    .clone()
+            })
+            .collect();
+        let base = observation(
+            BackendKind::S3,
+            "payload".into(),
+            EntryKind::File,
+            7,
+            [0; 3],
+            None,
+            None,
+            None,
+            None,
+        )
+        .with_history(Some(Box::new(ObjectHistory::whole(records, HistoryOrder::Server)?)))?;
+        for entry in base.into_segments(2) {
+            let history = entry.history().unwrap();
+            for index in 0..history.records().len() {
+                let row = copied_row(&entry, Some(index), Some("target"))?.into_completion()?;
+                assert_eq!(row.history_segment, history.segment());
+                assert_eq!(row.history_index, index as u32);
+                assert_eq!(row.history_records, history.records().len() as u32);
+                assert_eq!(row.history_complete, history.is_complete());
+                assert_eq!(row.completion.item.entry.history().unwrap().records().len(), 1);
+                let mut bad = copied_row(&entry, Some(index), Some("target"))?;
+                bad.history_records = 0;
+                assert!(matches!(
+                    bad.into_completion(),
+                    Err(DatabaseError::ObservationProjectionMismatch {
+                        field: "history_position"
+                    })
+                ));
+            }
         }
         Ok(())
     }
@@ -425,7 +513,7 @@ mod tests {
             None,
         );
         for binding in [None, Some("")] {
-            let completion = copied_row(&entry, None, binding)?.into_completion()?;
+            let completion = copied_row(&entry, None, binding)?.into_completion()?.completion;
             assert_eq!(completion.target_version, None);
             assert_eq!(completion.item.version_index, None);
             assert_eq!(completion.item.entry, Arc::new(entry.clone()));

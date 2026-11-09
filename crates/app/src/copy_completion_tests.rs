@@ -18,6 +18,16 @@ use utils::app_config::ClickHouseMode;
 use super::*;
 use crate::storage_factory::{StorageRole, create_storage_for_role};
 
+fn catalogue(entry: ObservedEntry) -> CopyCatalogueEntry {
+    CopyCatalogueEntry {
+        completion: ObservedItem::from(Arc::new(entry)).into(),
+        history_segment: 0,
+        history_index: 0,
+        history_records: 0,
+        history_complete: true,
+    }
+}
+
 async fn target(root: &TempDir) -> Result<Arc<StorageContext>> {
     Ok(Arc::new(
         create_storage_for_role(&root.path().to_string_lossy(), None, false, StorageRole::Destination).await?,
@@ -53,7 +63,7 @@ async fn directory_query_failure_stays_typed_and_drains_updates() -> Result<()> 
     let (sender, receiver) = mpsc::channel(2);
     let query = tokio::spawn(async move {
         sender
-            .send(ObservedItem::from(Arc::new(entry)).into())
+            .send(catalogue(entry))
             .await
             .map_err(|_| AppError::ScanWorkerStopped)?;
         Err(DatabaseError::ConfigError("directory query regression fixture".into()).into())
@@ -77,11 +87,11 @@ async fn directory_write_failure_stays_typed_and_drains_later_updates() -> Resul
     let (sender, receiver) = mpsc::channel(2);
     let query = tokio::spawn(async move {
         sender
-            .send(ObservedItem::from(Arc::new(missing)).into())
+            .send(catalogue(missing))
             .await
             .map_err(|_| AppError::ScanWorkerStopped)?;
         sender
-            .send(ObservedItem::from(Arc::new(present)).into())
+            .send(catalogue(present))
             .await
             .map_err(|_| AppError::ScanWorkerStopped)?;
         Ok(())

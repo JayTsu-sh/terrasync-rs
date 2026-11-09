@@ -151,6 +151,8 @@ pub(super) struct ClusterNativeScanRecord<'a> {
     pub metadata_hash: Option<&'a str>,
     pub history_segment: u32,
     pub history_index: u32,
+    pub history_records: u32,
+    pub history_complete: bool,
 }
 impl<'a> ClusterNativeScanRecord<'a> {
     pub fn new(job_id: &'a str, epoch: u64, batch_id: u64, record: &'a NativeScanRecord<'_>) -> Self {
@@ -192,6 +194,8 @@ impl<'a> ClusterNativeScanRecord<'a> {
             metadata_hash: record.metadata_hash.as_deref(),
             history_segment: record.history_segment,
             history_index: record.history_index,
+            history_records: record.history_records,
+            history_complete: record.history_complete,
         }
     }
 }

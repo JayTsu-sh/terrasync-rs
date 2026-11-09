@@ -7,7 +7,8 @@ use std::thread::JoinHandle as ThreadHandle;
 use crate::storage_factory::StorageContext;
 use data_mover::model::BackendKind;
 use db::ClickHouseDatabase;
-use task_model::{CopyCompletion, ObservedEntryExt};
+use db::catalogue::CopyCatalogueEntry;
+use task_model::ObservedEntryExt;
 use tokio::sync::mpsc::{self, Receiver};
 use tokio::task::{JoinError, JoinHandle, JoinSet};
 use tokio_util::task::AbortOnDropHandle;
@@ -66,7 +67,7 @@ async fn update_directories(database: ClickHouseDatabase, destination: Arc<Stora
 }
 
 async fn apply_directories(
-    query: JoinHandle<Result<()>>, mut receiver: Receiver<CopyCompletion>, destination: Arc<StorageContext>,
+    query: JoinHandle<Result<()>>, mut receiver: Receiver<CopyCatalogueEntry>, destination: Arc<StorageContext>,
 ) -> Result<()> {
     // 调用方取消整个收尾 future 时，查询与进度线程也随所属执行域释放。
     let query = AbortOnDropHandle::new(query);
@@ -75,7 +76,7 @@ async fn apply_directories(
     let mut failure = None;
     let mut depth = None;
     while let Some(completion) = receiver.recv().await {
-        let entry = completion.item.entry;
+        let entry = completion.completion.item.entry;
         let entry_depth = entry.path().as_str().split('/').count();
         // 查询按深度倒序；父目录收紧权限前，必须完成所有更深目录。
         if depth.is_some_and(|previous| previous != entry_depth) {
