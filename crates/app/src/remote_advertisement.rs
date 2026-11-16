@@ -287,7 +287,7 @@ pub async fn advertise_remote(
     mut session: TraversalSession, page_size: NonZeroUsize, sink: &mut dyn RemoteAdvertisementSink,
 ) -> Result<RemoteAdvertisement> {
     let mut projection = AdvertisementProjection::new(page_size.get());
-    while let Some(item) = session.next_item().await {
+    while let Some(item) = session.next_item(&mut Vec::new()).await {
         match item {
             TraversalItem::Entry(entry) => {
                 if let Some(page) = projection.push_entry(*entry)? {

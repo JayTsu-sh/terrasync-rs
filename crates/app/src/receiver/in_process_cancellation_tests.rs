@@ -17,7 +17,7 @@ use transport::{
     traits::SenderTransport,
 };
 
-use super::LocalCopyReceiver;
+use super::{LocalCopyExecutor, LocalCopyReceiver};
 use crate::{
     broadcast::BroadcastForwarder,
     error::{AppError, StorageError},
@@ -51,24 +51,26 @@ async fn fixture(
         source,
         target,
         LocalCopyReceiver {
-            id: 0,
             transport: Arc::new(receiver),
-            source: source_storage,
-            destination,
-            config: Arc::new(ReceiverConfig {
-                job_id: "receiver_cancel".into(),
-                enable_integrity_check: false,
-                enable_acl: false,
-                is_source_reserved: true,
-                job_dir: String::new(),
-                transfer_mode: TransferMode::Direct,
-                cancel: Some(cancel),
-            }),
-            cleanup: None,
-            qos: None,
-            bytes: None,
-            broadcaster: BroadcastForwarder::new(4),
-            active: Arc::new(AtomicUsize::new(0)),
+            executor: LocalCopyExecutor {
+                id: 0,
+                source: source_storage,
+                destination,
+                config: Arc::new(ReceiverConfig {
+                    job_id: "receiver_cancel".into(),
+                    enable_integrity_check: false,
+                    enable_acl: false,
+                    is_source_reserved: true,
+                    job_dir: String::new(),
+                    transfer_mode: TransferMode::Direct,
+                    cancel: Some(cancel),
+                }),
+                cleanup: None,
+                qos: None,
+                bytes: None,
+                broadcaster: BroadcastForwarder::new(4),
+                active: Arc::new(AtomicUsize::new(0)),
+            },
         },
         sender,
     ))
@@ -78,12 +80,12 @@ async fn fixture(
 async fn cancelled_receiver_does_not_drain_queued_entries_or_emit_invented_failures() -> TestResult {
     let token = CancellationToken::new();
     let (source, target, mut receiver, sender) = fixture(token.clone()).await?;
-    let mut events = receiver.broadcaster.subscribe();
-    let item = Arc::new(observe_path(receiver.source.storage(), Path::new("file")).await?);
+    let mut events = receiver.executor.broadcaster.subscribe();
+    let item = Arc::new(observe_path(receiver.executor.source.storage(), Path::new("file")).await?);
     for _ in 0..128 {
         sender.send(SenderMsg::CopyEntry { entry: item.clone() }).await?;
     }
-    let active = receiver.active.clone();
+    let active = receiver.executor.active.clone();
     token.cancel();
     assert!(matches!(
         timeout(Duration::from_millis(500), receiver.run()).await?,
@@ -119,8 +121,8 @@ async fn idle_receiver_exits_on_cancellation_with_producer_still_open() -> TestR
 async fn cancellation_preserves_a_previously_reported_real_failure() -> TestResult {
     let token = CancellationToken::new();
     let (source, target, mut receiver, sender) = fixture(token.clone()).await?;
-    let mut events = receiver.broadcaster.subscribe();
-    let item = Arc::new(observe_path(receiver.source.storage(), Path::new("file")).await?);
+    let mut events = receiver.executor.broadcaster.subscribe();
+    let item = Arc::new(observe_path(receiver.executor.source.storage(), Path::new("file")).await?);
     std::fs::remove_file(source.path().join("file"))?;
     sender.send(SenderMsg::CopyEntry { entry: item }).await?;
     let cancel = async {

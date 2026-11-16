@@ -139,7 +139,7 @@ impl StorageContext {
         let task = tokio::spawn(async move {
             let cancel_on_drop = producer_cancel.clone().drop_guard();
             let mut histories = HistorySequence::default();
-            while let Some(item) = session.next_item().await {
+            while let Some(item) = session.next_item(&mut Vec::new()).await {
                 let message = match item {
                     TraversalItem::Resumed(_) => {
                         histories = HistorySequence::default();
@@ -251,7 +251,7 @@ impl StorageContext {
                 producer_cancel.cancel();
             }
             // 提前结束交付时也必须消费到 EOF，才能等待原生完成证据。
-            while session.next_item().await.is_some() {}
+            while session.next_item(&mut Vec::new()).await.is_some() {}
             match session.finish().await {
                 Ok(TraversalOutcome::Completed(_)) if !producer_cancel.is_cancelled() => {}
                 result => {
@@ -323,7 +323,7 @@ impl DirectoryInventory {
         if self.ended {
             return None;
         }
-        match self.session.next_item().await {
+        match self.session.next_item(&mut Vec::new()).await {
             Some(TraversalItem::Resumed(event)) => {
                 self.histories = HistorySequence::default();
                 Some(Ok(TraversalItem::Resumed(event)))
@@ -381,15 +381,16 @@ impl ResumableScan {
     /// 放弃未确认的尾部条目，等待遍历真正停止；不把取消时的部分历史当成完成证据。
     pub async fn stop(mut self) -> Result<TraversalOutcome> {
         self.cancel.cancel();
-        while self.session.next_item().await.is_some() {}
+        while self.session.next_item(&mut Vec::new()).await.is_some() {}
         self.session.finish().await.map_err(StorageError::from)
     }
     pub async fn next(&mut self) -> Option<Result<ResumableScanItem>> {
+        let mut completed = Vec::new();
         loop {
             let item = tokio::select! {
                 biased;
                 () = self.guard.failed() => return self.guard.failure().map(|failure| Err(failure.into())),
-                item = self.session.next_item() => item,
+                item = self.session.next_item(&mut completed) => item,
             };
             let Some(item) = item else { break };
             match item {

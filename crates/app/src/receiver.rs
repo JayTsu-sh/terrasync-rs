@@ -41,7 +41,7 @@ use crate::remote_receiver_session::{RemoteReceiverSession, RemoteSessionState};
 use crate::sync::{CommitRecorder, ResumeOpts, copy_file_with_resume, parse_size, should_resume};
 
 mod in_process;
-pub(crate) use in_process::LocalCopyReceiver;
+pub(crate) use in_process::{LocalCopyExecutor, LocalCopyReceiver};
 
 // ============================================================
 // Receiver 进度跟踪（原子计数器，支持多 Receiver 聚合）

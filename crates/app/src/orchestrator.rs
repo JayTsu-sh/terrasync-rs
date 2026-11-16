@@ -47,7 +47,7 @@ use crate::file_copy::CopyOptions;
 #[cfg(feature = "license")]
 use crate::integrity_check::verify_storage_time;
 use crate::migration_plan::MigrationPlan;
-use crate::receiver::{LocalCopyReceiver, ReceiverConfig};
+use crate::receiver::{LocalCopyExecutor, LocalCopyReceiver, ReceiverConfig};
 use crate::scan::ScanType;
 use crate::sender::{SenderWorkerConfig, sender_worker};
 use crate::source_cleanup::{self, EarlyCleanup, FullCleanupStage, SourceCleanupCheck, remove_confirmed_sources};
@@ -768,16 +768,18 @@ impl SyncOrchestrator {
                     }
 
                     LocalCopyReceiver {
-                        id: recv_id,
                         transport: rt,
-                        source: src,
-                        destination: dest,
-                        config: cfg,
-                        qos,
-                        bytes: bt,
-                        broadcaster: bc,
-                        active: task_counter,
-                        cleanup: ready_files,
+                        executor: LocalCopyExecutor {
+                            id: recv_id,
+                            source: src,
+                            destination: dest,
+                            config: cfg,
+                            qos,
+                            bytes: bt,
+                            broadcaster: bc,
+                            active: task_counter,
+                            cleanup: ready_files,
+                        },
                     }
                     .run()
                     .await

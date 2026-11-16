@@ -59,7 +59,7 @@ pub async fn run_local_transfer(
     let mut report = LocalTransferReport::default();
     let mut attempts = JoinSet::<Attempt>::new();
 
-    while let Some(item) = session.next_item().await {
+    while let Some(item) = session.next_item(&mut Vec::new()).await {
         match item {
             TraversalItem::Entry(entry) => {
                 report.observed_entries += 1;

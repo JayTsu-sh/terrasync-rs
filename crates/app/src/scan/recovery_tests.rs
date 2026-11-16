@@ -100,7 +100,7 @@ async fn ordinary_traversal_deadline_applies_without_recovery_configuration() {
             "reconnect capability must not select a recovery budget"
         );
         timeout(Duration::from_secs(1), async {
-            while execution.session.next_item().await.is_some() {}
+            while execution.session.next_item(&mut Vec::new()).await.is_some() {}
         })
         .await
         .unwrap();
@@ -129,7 +129,7 @@ async fn a_caller_can_select_a_recovery_window_without_inheriting_the_scan_budge
         .unwrap();
     assert!(execution.recovery.is_some());
     timeout(Duration::from_secs(1), async {
-        while execution.session.next_item().await.is_some() {}
+        while execution.session.next_item(&mut Vec::new()).await.is_some() {}
     })
     .await
     .unwrap();

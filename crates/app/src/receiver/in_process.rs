@@ -4,7 +4,7 @@ use std::sync::{
     atomic::{AtomicU64, AtomicUsize, Ordering},
 };
 
-use data_mover::qos::QosManager;
+use data_mover::{model::ObservedEntry, qos::QosManager};
 use task_model::{ObservedEntryExt, StorageEntryMessage};
 use tracing::{error, info};
 use transport::{in_process::InProcessReceiverTransport, message::SenderMsg, traits::ReceiverTransport};
@@ -13,14 +13,29 @@ use super::{ReceiverConfig, process_entry_on_receiver};
 use crate::{
     broadcast::BroadcastForwarder,
     error::{AppError, Result, StorageError},
-    file_copy::VersionFailureContext,
+    file_copy::{CopiedPublication, VersionFailureContext},
     source_cleanup::{ReadyFileCleanup, can_stream_files},
     storage_factory::StorageContext,
 };
 
 pub(crate) struct LocalCopyReceiver {
-    pub(crate) id: usize,
     pub(crate) transport: Arc<InProcessReceiverTransport>,
+    pub(crate) executor: LocalCopyExecutor,
+}
+
+/// 单项工作与结果保留所有权，终态广播只在执行结束后发生。
+pub(crate) struct LocalCopyWork {
+    pub(crate) entry: Arc<ObservedEntry>,
+}
+
+pub(crate) struct LocalCopyCompletion {
+    pub(crate) work: LocalCopyWork,
+    pub(crate) result: Result<Option<CopiedPublication>>,
+}
+
+#[derive(Clone)]
+pub(crate) struct LocalCopyExecutor {
+    pub(crate) id: usize,
     pub(crate) source: Arc<StorageContext>,
     pub(crate) destination: Arc<StorageContext>,
     pub(crate) config: Arc<ReceiverConfig>,
@@ -34,22 +49,16 @@ pub(crate) struct LocalCopyReceiver {
 impl LocalCopyReceiver {
     pub(crate) async fn run(self) -> Result<()> {
         let Self {
-            id: recv_id,
             transport: rt,
-            source: src,
-            destination: dest,
-            config: cfg,
-            qos,
-            bytes: bt,
-            broadcaster: bc,
-            active: task_counter,
-            cleanup,
+            mut executor,
         } = self;
-        let cleanup = cleanup.filter(|_| can_stream_files(&src, &dest));
+        executor.cleanup = executor
+            .cleanup
+            .filter(|_| can_stream_files(&executor.source, &executor.destination));
         // 从 transport 拉消息处理（MPMC，N 个 worker 竞争消费）
         let mut failure = None;
         loop {
-            let next = match cfg.cancel.as_ref() {
+            let next = match executor.config.cancel.as_ref() {
                 Some(cancel) => tokio::select! {
                     biased;
                     () = cancel.cancelled() => {
@@ -65,48 +74,13 @@ impl LocalCopyReceiver {
 
             match msg {
                 SenderMsg::CopyEntry { entry } => {
-                    let _guard = AtomicCounterGuard::increment(&task_counter);
-                    // 在进入清理 await 前释放已完成复制 future，避免同一 match 临时值跨越两个阶段。
-                    let copied = process_entry_on_receiver(&entry, &src, &dest, &cfg, qos.clone(), bt.clone()).await;
-                    match copied {
-                        Ok(published) => {
-                            bc.broadcast(StorageEntryMessage::New(entry.clone().into())).await?;
-                            if let Some(cleanup) = &cleanup {
-                                // 原生 SDK 的大 future 不嵌入整个接收循环；每个 worker 至多持有一项。
-                                Box::pin(cleanup.remove(&src, &dest, &entry, published)).await?;
-                            }
+                    let _guard = AtomicCounterGuard::increment(&executor.active);
+                    let completion = executor.execute(LocalCopyWork { entry }).await;
+                    if let Err(error) = executor.publish(completion).await {
+                        if !error.is_reported_copy_failure() {
+                            return Err(error);
                         }
-                        Err(e) => {
-                            error!(
-                                "Receiver {}: CopyEntry failed {:?}: {}",
-                                recv_id,
-                                entry.get_relative_path(),
-                                e
-                            );
-                            let context = e.storage_error().map_or_else(
-                                || VersionFailureContext {
-                                    phase: "copy_entry".into(),
-                                    backend: dest.storage().kind(),
-                                    metadata_only: false,
-                                },
-                                |error| {
-                                    VersionFailureContext::for_error(error, src.storage().kind(), dest.storage().kind())
-                                },
-                            );
-                            let data_failed = !context.metadata_only;
-                            bc.broadcast(StorageEntryMessage::CopyVersionFailed {
-                                entry: entry.clone().into(),
-                                phase: context.phase,
-                                backend: context.backend,
-                                reason: e.to_string(),
-                                first_in_entry: true,
-                            })
-                            .await?;
-                            failure.get_or_insert(AppError::ReportedCopyFailure {
-                                source: Box::new(e),
-                                data_failed,
-                            });
-                        }
+                        failure.get_or_insert(error);
                     }
                 }
                 SenderMsg::TarPacked {
@@ -114,21 +88,95 @@ impl LocalCopyReceiver {
                     manifest_entries,
                 } => {
                     let tar_path = tar_entry.get_relative_path().to_string_lossy().to_string();
-                    bc.broadcast(StorageEntryMessage::New(tar_entry.into())).await?;
-                    bc.broadcast(StorageEntryMessage::TarManifest {
-                        tar_path,
-                        entries: manifest_entries,
-                    })
-                    .await?;
+                    executor
+                        .broadcaster
+                        .broadcast(StorageEntryMessage::New(tar_entry.into()))
+                        .await?;
+                    executor
+                        .broadcaster
+                        .broadcast(StorageEntryMessage::TarManifest {
+                            tar_path,
+                            entries: manifest_entries,
+                        })
+                        .await?;
                 }
                 _ => {}
             }
         }
         // recv() 返回 None 时自然退出（sender_transport 被 drop 后 channel 关闭）
-        info!("Receiver {}: Completed", recv_id);
+        info!("Receiver {}: Completed", executor.id);
         match failure {
             Some(error) => Err(error),
             None => Ok(()),
+        }
+    }
+}
+
+impl LocalCopyExecutor {
+    pub(crate) async fn execute(&self, work: LocalCopyWork) -> LocalCopyCompletion {
+        let result = process_entry_on_receiver(
+            &work.entry,
+            &self.source,
+            &self.destination,
+            &self.config,
+            self.qos.clone(),
+            self.bytes.clone(),
+        )
+        .await;
+        LocalCopyCompletion { work, result }
+    }
+
+    pub(crate) async fn publish(&self, completion: LocalCopyCompletion) -> Result<()> {
+        let LocalCopyCompletion {
+            work: LocalCopyWork { entry },
+            result,
+        } = completion;
+        match result {
+            Ok(published) => {
+                self.broadcaster
+                    .broadcast(StorageEntryMessage::New(entry.clone().into()))
+                    .await?;
+                if let Some(cleanup) = &self.cleanup {
+                    Box::pin(cleanup.remove(&self.source, &self.destination, &entry, published)).await?;
+                }
+                Ok(())
+            }
+            Err(error) => {
+                error!(
+                    "Receiver {}: CopyEntry failed {:?}: {}",
+                    self.id,
+                    entry.get_relative_path(),
+                    error
+                );
+                let context = error.storage_error().map_or_else(
+                    || VersionFailureContext {
+                        phase: "copy_entry".into(),
+                        backend: self.destination.storage().kind(),
+                        metadata_only: false,
+                    },
+                    |error| {
+                        VersionFailureContext::for_error(
+                            error,
+                            self.source.storage().kind(),
+                            self.destination.storage().kind(),
+                        )
+                    },
+                );
+                let data_failed = !context.metadata_only;
+                self.broadcaster
+                    .broadcast(StorageEntryMessage::CopyVersionFailed {
+                        entry: entry.into(),
+                        phase: context.phase,
+                        backend: context.backend,
+                        reason: error.to_string(),
+                        first_in_entry: true,
+                    })
+                    .await?;
+                Err(AppError::ReportedCopyFailure {
+                    source: Box::new(error),
+                    data_failed,
+                })
+            }
         }
     }
 }
