@@ -88,6 +88,7 @@ impl StatisticConsumer {
     pub fn finalize(&mut self) {
         if let Some(handle) = self.pb_handle.take() {
             self.progress_bar.finish();
+            handle.thread().unpark();
             if let Err(e) = handle.join() {
                 error!("[ProgressBar] Display thread panicked: {e:?}");
             }
@@ -677,12 +678,12 @@ mod tests {
 
 /// 兜底 join display 线程（panic/提前 drop 路径）。
 ///
-/// display 线程 `finish()` 后最多还要一轮 `DISPLAY_INTERVAL_SECS` 才退出，直接 join 会阻塞
-/// 当前线程（可能是 tokio worker）~2s，故派发到独立 std thread。
+/// 先发布结束状态并唤醒 display；兜底回收仍派发到独立 std thread，避免阻塞 tokio worker。
 impl Drop for StatisticConsumer {
     fn drop(&mut self) {
         if let Some(handle) = self.pb_handle.take() {
             self.progress_bar.finish();
+            handle.thread().unpark();
             std::thread::spawn(move || {
                 if let Err(e) = handle.join() {
                     error!("[ProgressBar] Display thread panicked during drop: {e:?}");
@@ -695,3 +696,7 @@ impl Drop for StatisticConsumer {
 #[cfg(test)]
 #[path = "callback_tests.rs"]
 mod callback_tests;
+
+#[cfg(test)]
+#[path = "consumer_wakeup_tests.rs"]
+mod wakeup_tests;

@@ -37,6 +37,9 @@ impl DirectoryProgress {
 impl Drop for DirectoryProgress {
     fn drop(&mut self) {
         self.bar.finish();
+        if let Some(reporter) = self.reporter.as_ref() {
+            reporter.thread().unpark();
+        }
         if let Some(reporter) = self.reporter.take()
             && let Err(error) = reporter.join()
         {

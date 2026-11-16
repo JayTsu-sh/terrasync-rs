@@ -2,9 +2,11 @@ use crate::migration_fixtures::request;
 use crate::scan::observe_path;
 use std::future::pending;
 use std::path::Path;
+use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::config::{ConsoleConfig, ConsumerConfig, JobType};
+use crate::consumer::stats::progress_bar::wakeup_tests::parked_directory_reporter;
 use crate::consumer::{
     ConsumerManager,
     stats::{ProgressDetail, callback_state::StatisticsCheckpoint},
@@ -430,3 +432,23 @@ async fn query_failure_does_not_hide_already_failed_directory() -> Result<()> {
 
 #[path = "copy_completion_cancel_tests.rs"]
 mod cancellation_tests;
+
+#[test]
+fn progress_wakeup_directory_drop_finishes_before_waking_and_joining() {
+    let bar = DirectoryMetadataProgressBar::new();
+    assert_eq!(bar.increment_dir_count(), 1);
+    let mut reporter = parked_directory_reporter(&bar);
+    let progress = DirectoryProgress {
+        bar,
+        reporter: reporter.handle.take(),
+    };
+    let owner = thread::spawn(move || drop(progress));
+    let woke = reporter.stopped_without_rescue();
+    owner
+        .join()
+        .unwrap_or_else(|error| panic!("owned reporter join failed: {error:?}"));
+    assert!(
+        woke,
+        "DirectoryProgress::Drop must wake the finished reporter before joining"
+    );
+}

@@ -5,6 +5,7 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::thread;
 use std::time::{Duration, Instant};
 
 use indicatif::{ProgressBar as IndicatifBar, ProgressStyle};
@@ -22,7 +23,7 @@ use crate::scan::statistics::ScanSnapshot;
 const DISPLAY_INTERVAL_SECS: u64 = 2;
 /// 进度信息写入日志的节流间隔（秒）
 const LOG_INTERVAL_SECS: u64 = 30;
-/// finish 检测粒度（毫秒）：每 100ms 检查一次，最坏 join 等待时间即为此值
+/// 未主动唤醒时，结束状态的兜底检查间隔（毫秒）。
 const FINISH_POLL_MS: u64 = 100;
 
 #[derive(Debug, Default)]
@@ -32,16 +33,27 @@ struct ScanProgressCounters {
     retained: AtomicU64,
 }
 
-/// 分段等待直到 `is_finished` 返回 true 或超时。
-/// 将大 sleep 拆成 `FINISH_POLL_MS` 小段，大幅缩短 join 等待时间。
+/// 等待固定刷新期限，结束时可由 owner 唤醒；重复或伪唤醒不能提前刷新。
 fn sleep_interruptible(checks: u64, is_finished: impl Fn() -> bool) {
-    for _ in 0..checks {
-        std::thread::sleep(Duration::from_millis(FINISH_POLL_MS));
-        if is_finished() {
+    sleep_interruptible_with(checks, is_finished, Instant::now, thread::park_timeout);
+}
+
+fn sleep_interruptible_with(
+    checks: u64, is_finished: impl Fn() -> bool, now: impl Fn() -> Instant, mut wait: impl FnMut(Duration),
+) {
+    let deadline = now() + Duration::from_millis(checks * FINISH_POLL_MS);
+    while !is_finished() {
+        let remaining = deadline.saturating_duration_since(now());
+        if remaining.is_zero() {
             break;
         }
+        wait(remaining.min(Duration::from_millis(FINISH_POLL_MS)));
     }
 }
+
+#[cfg(test)]
+#[path = "progress_wakeup_tests.rs"]
+pub(crate) mod wakeup_tests;
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 // CounterSet — 全量 / 增量计数器
