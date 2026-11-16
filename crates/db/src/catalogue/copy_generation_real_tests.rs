@@ -135,7 +135,9 @@ async fn transition(
     }
     if !incomplete {
         first.commit_scan_generation().await?;
-        first.finish_copy_generation(CopyGenerationPhase::Completed).await?;
+        first
+            .finish_copy_generation(CopyGenerationPhase::Completed, None)
+            .await?;
     }
     drop(first);
     let next = fixture.open(&job).await?;
@@ -155,7 +157,8 @@ async fn transition(
     assert_eq!(next.get_count("base").await?, expected);
     assert_eq!(next.copy_catalogue_source_reserved().await?, Some(current_reserved));
     next.commit_scan_generation().await?;
-    next.finish_copy_generation(CopyGenerationPhase::Completed).await?;
+    next.finish_copy_generation(CopyGenerationPhase::Completed, None)
+        .await?;
     drop(next);
     let third = fixture.open(&job).await?;
     assert_eq!(third.copy_catalogue_source_reserved().await?, Some(current_reserved));
@@ -259,7 +262,9 @@ async fn version_slots(fixture: &Fixture, history_target: bool) -> Result<()> {
     database.batch_insert_base_record(&initial).await?;
     assert_eq!(database.get_count("base").await?, if history_target { 2 } else { 1 });
     database.commit_scan_generation().await?;
-    database.finish_copy_generation(CopyGenerationPhase::Completed).await?;
+    database
+        .finish_copy_generation(CopyGenerationPhase::Completed, None)
+        .await?;
     let updated = versions(&["old", "current", "new"])?;
     let database = database.new_execution_scope();
     database.begin_copy_generation(&descriptor()).await?;
@@ -387,7 +392,7 @@ async fn delayed_copy_ack_cannot_restore_metadata_readiness(fixture: &Fixture) -
             readiness: CopyReadiness::DataOnly,
         }])
         .await?;
-    first.finish_copy_generation(CopyGenerationPhase::Failed).await?;
+    first.finish_copy_generation(CopyGenerationPhase::Failed, None).await?;
     let next = first.new_execution_scope();
     next.begin_copy_generation(&request("delayed-metadata", true)).await?;
     let compare = || {
@@ -604,7 +609,9 @@ async fn selected_copy_bindings_roundtrip(fixture: &Fixture, history_target: boo
         copy_binding_read_faults(fixture, &database).await?;
     }
     database.commit_scan_generation().await?;
-    database.finish_copy_generation(CopyGenerationPhase::Completed).await?;
+    database
+        .finish_copy_generation(CopyGenerationPhase::Completed, None)
+        .await?;
     let next = database.new_execution_scope();
     next.begin_copy_generation(&descriptor()).await?;
     assert!(
@@ -618,7 +625,8 @@ async fn selected_copy_bindings_roundtrip(fixture: &Fixture, history_target: boo
     );
     check(&read_current_completions(&next).await?);
     next.commit_scan_generation().await?;
-    next.finish_copy_generation(CopyGenerationPhase::Completed).await?;
+    next.finish_copy_generation(CopyGenerationPhase::Completed, None)
+        .await?;
     eprintln!(
         "copy-binding-readback cluster={} history_target={history_target} selected_versions={} source_order=true raw_metadata_and_actual_bindings=true data_only_excluded=true missing_binding_not_inferred=true current_execution_required=true",
         fixture.config.cluster.is_some(),
@@ -696,7 +704,9 @@ async fn source_cleanup_never_suppresses_new_paths_with_stable_identity(fixture:
             .batch_insert_base_record(&[rename_entry("old", directory)])
             .await?;
         database.commit_scan_generation().await?;
-        database.finish_copy_generation(CopyGenerationPhase::Completed).await?;
+        database
+            .finish_copy_generation(CopyGenerationPhase::Completed, None)
+            .await?;
         let database = database.new_execution_scope();
         database
             .begin_copy_generation(&request("same-endpoints", false))
@@ -727,7 +737,9 @@ async fn rename_after_changed_state(fixture: &Fixture, directory: bool, interrup
         .batch_insert_base_record(&[rename_entry("old", directory)])
         .await?;
     first.commit_scan_generation().await?;
-    first.finish_copy_generation(CopyGenerationPhase::Completed).await?;
+    first
+        .finish_copy_generation(CopyGenerationPhase::Completed, None)
+        .await?;
     let committed = first.query_scan_state().await?;
     drop(first);
     for round in 0..interruptions {
@@ -820,7 +832,9 @@ async fn reused_paths_are_copied_before_replacing_confirmed_target_facts(fixture
     let original = [entry("a", b"identity-a"), entry("b", b"identity-b")];
     database.batch_insert_base_record(&original).await?;
     database.commit_scan_generation().await?;
-    database.finish_copy_generation(CopyGenerationPhase::Completed).await?;
+    database
+        .finish_copy_generation(CopyGenerationPhase::Completed, None)
+        .await?;
     let database = database.new_execution_scope();
     database.begin_copy_generation(&request("same-endpoints", true)).await?;
     let observed = [entry("a", b"identity-b"), entry("b", b"identity-a")];
@@ -843,13 +857,17 @@ async fn reused_paths_are_copied_before_replacing_confirmed_target_facts(fixture
     database.batch_insert_completed_records(&completed).await?;
     assert_eq!(database.detect_deleted_items().await?.count(), 0);
     database.commit_scan_generation().await?;
-    database.finish_copy_generation(CopyGenerationPhase::Completed).await?;
+    database
+        .finish_copy_generation(CopyGenerationPhase::Completed, None)
+        .await?;
     let database = fixture.open("occupied_rename").await?;
     database.initialize().await?;
     database.begin_copy_generation(&request("same-endpoints", true)).await?;
     database.batch_insert_base_record(&original).await?;
     database.commit_scan_generation().await?;
-    database.finish_copy_generation(CopyGenerationPhase::Completed).await?;
+    database
+        .finish_copy_generation(CopyGenerationPhase::Completed, None)
+        .await?;
     let database = database.new_execution_scope();
     database.begin_copy_generation(&request("same-endpoints", true)).await?;
     let current = [entry("b", b"identity-a")];
@@ -889,7 +907,9 @@ async fn successful_rounds_advance_once_while_reusing_bindings(fixture: &Fixture
             );
             assert_eq!(database.get_cached_scan_state().await?, 1 - committed);
             database.commit_scan_generation().await?;
-            database.finish_copy_generation(CopyGenerationPhase::Completed).await?;
+            database
+                .finish_copy_generation(CopyGenerationPhase::Completed, None)
+                .await?;
             assert_eq!(database.query_scan_state().await?, Some(1 - committed));
             eprintln!(
                 "state-cycle cluster={} source_reserved={reserved} round={round} committed_before={committed} committed_after={} marker_confirmed=true",

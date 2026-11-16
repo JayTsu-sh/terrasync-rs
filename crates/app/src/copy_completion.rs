@@ -17,6 +17,7 @@ use tracing::{Instrument, info, info_span, trace, warn};
 
 use crate::consumer::{TaskStatistics, stats::DirectoryMetadataProgressBar};
 use crate::copy_execution::CopyDatabaseExecution;
+use crate::copy_root::CopyRootMetadata;
 use crate::error::{AppError, Result};
 
 const DIRECTORY_CONCURRENCY: usize = 32;
@@ -50,20 +51,26 @@ impl Drop for DirectoryProgress {
 
 pub(crate) async fn complete(
     database: ClickHouseDatabase, destination: Arc<StorageContext>, statistics: Option<TaskStatistics>,
-    execution: Option<CopyDatabaseExecution>,
+    execution: Option<CopyDatabaseExecution>, root: Option<&CopyRootMetadata>,
 ) -> Result<()> {
     if let Some(execution) = &execution
         && execution.token().is_cancelled()
     {
         return Err(execution.stopped_error());
     }
+    if let Some(root) = root {
+        root.verify_target_binding(&destination).await?;
+    }
     if destination.storage().kind() != BackendKind::S3 {
-        update_directories(database.clone(), destination, statistics, execution.clone()).await?;
+        update_directories(database.clone(), destination.clone(), statistics, execution.clone()).await?;
     }
     if let Some(execution) = &execution
         && execution.token().is_cancelled()
     {
         return Err(execution.stopped_error());
+    }
+    if let Some(root) = root {
+        root.finish(&destination).await?;
     }
     database.commit_scan_generation().await?;
     Ok(())

@@ -269,11 +269,14 @@ async fn case(fixture: &Fixture, incremental: bool, mode: &str) -> Result<()> {
         database.commit_scan_generation().await?;
     }
     database
-        .finish_copy_generation(if recovered {
-            CopyGenerationPhase::Completed
-        } else {
-            CopyGenerationPhase::Failed
-        })
+        .finish_copy_generation(
+            if recovered {
+                CopyGenerationPhase::Completed
+            } else {
+                CopyGenerationPhase::Failed
+            },
+            None,
+        )
         .await?;
     let report = NotificationRecord::new(
         "consumer-round".into(),

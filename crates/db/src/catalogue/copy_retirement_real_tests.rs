@@ -64,7 +64,9 @@ async fn independent_replicas_are_empty(fixture: &Fixture, job: &str) -> Result<
 
 async fn phases_and_job_isolation(fixture: &Fixture) -> Result<()> {
     let neighbor = seeded(fixture, "retained_neighbor", true).await?;
-    neighbor.finish_copy_generation(CopyGenerationPhase::Completed).await?;
+    neighbor
+        .finish_copy_generation(CopyGenerationPhase::Completed, None)
+        .await?;
     for (index, phase) in [
         CopyGenerationPhase::Completed,
         CopyGenerationPhase::Failed,
@@ -76,7 +78,9 @@ async fn phases_and_job_isolation(fixture: &Fixture) -> Result<()> {
         let job = format!("retired_phase_{index}");
         // 上一保留源代次的范围外事实也属于该 job 的 base 生命周期。
         let first = seeded(fixture, &job, true).await?;
-        first.finish_copy_generation(CopyGenerationPhase::Completed).await?;
+        first
+            .finish_copy_generation(CopyGenerationPhase::Completed, None)
+            .await?;
         let moving = first.new_execution_scope();
         moving
             .begin_copy_generation(&request("retirement-endpoints", false))
@@ -85,7 +89,7 @@ async fn phases_and_job_isolation(fixture: &Fixture) -> Result<()> {
         if phase == CopyGenerationPhase::Completed {
             moving.commit_scan_generation().await?;
         }
-        moving.finish_copy_generation(phase).await?;
+        moving.finish_copy_generation(phase, None).await?;
         independent_replicas_are_empty(fixture, &job).await?;
         assert_eq!(moving.latest_copy_generation().await?.map(|g| g.phase), Some(phase));
         assert_eq!(moving.copy_catalogue_source_reserved().await?, Some(false));
@@ -103,7 +107,7 @@ async fn delayed_cleanup_preserves_new_copy_and_unowned_scan_rows(fixture: &Fixt
     let job = "retirement_fence";
     let old = seeded(fixture, job, false).await?;
     let sequence = old.current_copy_generation().await?.sequence;
-    old.finish_copy_generation(CopyGenerationPhase::Completed).await?;
+    old.finish_copy_generation(CopyGenerationPhase::Completed, None).await?;
     let next = old.new_execution_scope();
     next.begin_copy_generation(&request("retirement-endpoints", true))
         .await?;
@@ -112,7 +116,7 @@ async fn delayed_cleanup_preserves_new_copy_and_unowned_scan_rows(fixture: &Fixt
     generic.batch_insert_base_record(&[entry("generic_scan")]).await?;
     assert_eq!(count(fixture, job).await?, 2);
     assert!(matches!(
-        old.finish_copy_generation(CopyGenerationPhase::Completed).await,
+        old.finish_copy_generation(CopyGenerationPhase::Completed, None).await,
         Err(DatabaseError::CopyBaseRetirementFailed { source, .. }) if matches!(*source, DatabaseError::CopyGenerationInvalid { field: "stale_base_retirement" })
     ));
     // 绕过客户端闸门重放旧 mutation，模拟先前响应丢失后的延迟执行。
@@ -146,7 +150,7 @@ async fn faults_keep_explicit_outcomes_and_allow_idempotent_retry(fixture: &Fixt
             } else {
                 Duration::from_secs(8)
             },
-            database.finish_copy_generation(CopyGenerationPhase::Completed),
+            database.finish_copy_generation(CopyGenerationPhase::Completed, None),
         )
         .await;
         let elapsed = start.elapsed();
@@ -171,7 +175,9 @@ async fn faults_keep_explicit_outcomes_and_allow_idempotent_retry(fixture: &Fixt
         let remaining = count(fixture, &job).await?;
         assert_eq!(remaining, u64::from(mode != "lost"));
         assert!(database.batch_insert_base_record(&[entry("late_ack")]).await.is_err());
-        database.finish_copy_generation(CopyGenerationPhase::Completed).await?;
+        database
+            .finish_copy_generation(CopyGenerationPhase::Completed, None)
+            .await?;
         independent_replicas_are_empty(fixture, &job).await?;
         assert_eq!(
             database.latest_copy_generation().await?.map(|g| g.phase),

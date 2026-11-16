@@ -149,7 +149,7 @@ async fn cleanup_runs_only_after_full_copy_gate_and_does_not_require_a_database(
         broadcaster.broadcast(StorageEntryMessage::New(item.into())).await?;
         assert!(source_root.path().join("file").exists());
         drop(broadcaster);
-        let done = stage.complete(copy_ready, check()).await?;
+        let done = stage.complete(copy_ready, check(), None).await?;
         assert_eq!(done.checked.len(), usize::from(copy_ready));
         assert_eq!(source_root.path().join("file").exists(), !copy_ready);
         assert_eq!(std::fs::read(target_root.path().join("file"))?, b"verified");
@@ -176,7 +176,7 @@ async fn first_target_failure_stops_new_deletions_and_preserves_each_source() ->
     }
     std::fs::write(target_root.path().join("a"), b"different length")?;
     drop(broadcaster);
-    let Err(failure) = stage.complete(true, check()).await else {
+    let Err(failure) = stage.complete(true, check(), None).await else {
         panic!("unverified target must not authorize purge");
     };
     assert_eq!(
@@ -203,4 +203,59 @@ fn combined_task_and_cleanup_errors_keep_the_path_and_both_diagnostics() {
         Some(Path::new("file"))
     );
     assert!(error.storage_error().is_some_and(StorageError::is_cancelled));
+}
+
+#[tokio::test]
+async fn early_file_cleanup_finishes_root_metadata_once_without_a_database_receipt() -> Result<()> {
+    use crate::{copy_root::CopyRootMetadata, migration_plan::MigrationPlan};
+    use data_mover::storage::NamespaceReadPolicy;
+    use std::fs::{File, FileTimes};
+    use std::os::unix::fs::MetadataExt;
+    use std::time::UNIX_EPOCH;
+
+    let source_root = tempfile::tempdir()?;
+    let target_root = tempfile::tempdir()?;
+    std::fs::write(source_root.path().join("file"), b"root and file ready")?;
+    let expected = UNIX_EPOCH + Duration::from_nanos(1_700_000_000_123_456_789);
+    File::open(source_root.path())?.set_times(FileTimes::new().set_modified(expected))?;
+    let source =
+        Arc::new(create_storage(&source_root.path().to_string_lossy(), CreateStorageOptions::default()).await?);
+    let target =
+        Arc::new(create_storage(&target_root.path().to_string_lossy(), CreateStorageOptions::default()).await?);
+    let plan = MigrationPlan::compile(&source, &target, false).await?;
+    let metadata = CopyRootMetadata::new(
+        source.clone(),
+        target.clone(),
+        plan.root_metadata,
+        plan.observation,
+        NamespaceReadPolicy {
+            operation_timeout: Duration::from_secs(1),
+            recovery_window: Duration::from_secs(3),
+            retry_interval: Duration::from_millis(10),
+        },
+        CancellationToken::new(),
+        true,
+    );
+    metadata.capture().await?;
+    let entry = Arc::new(observe_path(source.storage(), Path::new("file")).await?);
+    copy_file(&source, &target, &entry, CopyOptions::default(), None).await?;
+    let mut broadcaster = BroadcastForwarder::new(2);
+    let stage = FullCleanupStage::start(&mut broadcaster, 2, None);
+    assert!(stage.connections().set((source, target.clone())).is_ok());
+    broadcaster.broadcast(StorageEntryMessage::New(entry.into())).await?;
+    drop(broadcaster);
+    let done = stage.complete(true, check(), Some(&metadata)).await?;
+    assert_eq!(done.checked.len(), 1);
+    assert!(!source_root.path().join("file").exists());
+    assert_eq!(std::fs::read(target_root.path().join("file"))?, b"root and file ready");
+    assert_eq!(std::fs::metadata(target_root.path())?.modified()?, expected);
+    let before = std::fs::metadata(target_root.path())?;
+    metadata.finish(&target).await?;
+    let after = std::fs::metadata(target_root.path())?;
+    assert_eq!(
+        (before.ctime(), before.ctime_nsec()),
+        (after.ctime(), after.ctime_nsec()),
+        "根已确认后不能重复写属性"
+    );
+    Ok(())
 }

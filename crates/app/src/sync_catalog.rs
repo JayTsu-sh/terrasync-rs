@@ -100,6 +100,7 @@ mod tests {
         execution_id: String,
         revision: u64,
         descriptor: String,
+        root_snapshot: String,
     }
     #[derive(serde::Serialize, clickhouse::Row)]
     struct StateRow {
@@ -136,6 +137,7 @@ mod tests {
             if let Some(reserved) = previous {
                 let request = request("preview", reserved);
                 let generation = CopyGeneration {
+                    root_snapshot: None,
                     sequence: 1,
                     revision: 3,
                     plan: CopyGenerationPlan::decide(&request, None, false)?,
@@ -149,6 +151,7 @@ mod tests {
                     revision: 3,
                     execution_id: generation.request.execution_id.clone(),
                     descriptor: serde_json::to_string(&generation)?,
+                    root_snapshot: String::new(),
                 }]));
                 if reserved {
                     mock.add(handlers::provide([1u64]));

@@ -40,6 +40,7 @@ use crate::consumer::ConsumerManager;
 use crate::copy_completion;
 use crate::copy_execution::{CopyDatabaseExecution, CopyLease, begin_copy_catalogue, compile_copy_request};
 use crate::copy_history::{HistoryCompletion, HistoryCopyPolicy};
+use crate::copy_root::CopyRootMetadata;
 use crate::dir_walker::DirectoryWalker;
 use crate::error::{AppError, Result};
 use crate::file_copy::CopyOptions;
@@ -74,6 +75,10 @@ mod rename_tests;
 #[cfg(test)]
 #[path = "orchestrator_retention_tests.rs"]
 mod retention_tests;
+
+#[cfg(all(test, unix))]
+#[path = "orchestrator_root_error_tests.rs"]
+mod root_error_tests;
 
 /// 大文件日志阈值（512 MiB）
 const LARGE_FILE_LOG_THRESHOLD: u64 = 512 * 1024 * 1024;
@@ -334,9 +339,10 @@ impl SyncOrchestrator {
                 "Packaged sync supports Direct only; generated archives do not support --resume".into(),
             ));
         }
-        let (observation_plan, request) = {
-            let destination = create_storage_for_role(&c.dest_path, None, true, StorageRole::Destination).await?;
-            let source = create_storage_for_role(&c.src_path, None, false, StorageRole::Source).await?;
+        let (observation_plan, request, root_source, root_destination) = {
+            let destination =
+                Arc::new(create_storage_for_role(&c.dest_path, None, true, StorageRole::Destination).await?);
+            let source = Arc::new(create_storage_for_role(&c.src_path, None, false, StorageRole::Source).await?);
             if !c.source_cleanup.retains_source() && source.storage().identity() == destination.storage().identity() {
                 return Err(AppError::ConfigError("移动任务的源端和目标端不能是同一存储根".into()));
             }
@@ -360,7 +366,7 @@ impl SyncOrchestrator {
                 consumers.copy_attempt_id().await?,
             )
             .await?;
-            (Some(plan), request)
+            (Some(plan), request, source, destination)
         };
 
         // 模式选择与代次准备共用独占权，避免读取旧策略后被另一执行切换代次。
@@ -387,9 +393,35 @@ impl SyncOrchestrator {
             .map(|database| CopyDatabaseExecution::prepare(database, CancellationToken::new()))
             .transpose()?;
         consumers.set_copy_database_execution(execution.clone())?;
+        let root_metadata = CopyRootMetadata::new(
+            root_source,
+            root_destination,
+            observation_plan.as_ref().is_some_and(|plan| plan.root_metadata),
+            observation_plan
+                .as_ref()
+                .map(|plan| plan.observation)
+                .unwrap_or_default(),
+            NamespaceReadPolicy {
+                operation_timeout: Duration::from_secs(app_config.scan.operation_timeout_secs),
+                recovery_window: Duration::from_secs(app_config.scan.recovery_window_secs),
+                retry_interval: Duration::from_millis(100),
+            },
+            execution
+                .as_ref()
+                .map(|execution| execution.token().clone())
+                .unwrap_or_default(),
+            !c.source_cleanup.retains_source(),
+        );
         // 任务边界堆存 future，避免编排状态机与数据库恢复层的 poll 栈叠加。
         let work = self
-            .run_planned_local(observation_plan, &request, app_config, consumers, pipeline_database)
+            .run_planned_local(
+                observation_plan,
+                &request,
+                app_config,
+                consumers,
+                pipeline_database,
+                &root_metadata,
+            )
             .boxed_local();
         let mut result = match execution {
             Some(execution) => execution.run(work).await,
@@ -401,7 +433,20 @@ impl SyncOrchestrator {
             } else {
                 CopyGenerationPhase::Failed
             };
-            let finalization = database.finish_copy_generation(phase).await;
+            let finalization = match root_metadata.snapshot() {
+                Ok(snapshot) => database.finish_copy_generation(phase, snapshot).await,
+                Err(error) => {
+                    // 原值编码错误也必须交付；仍尝试保存失败终态，不伪造根事实。
+                    result = match result {
+                        Ok(()) => Err(error),
+                        Err(source) => Err(AppError::MigrationAndRootMetadataFailed {
+                            source: Box::new(source),
+                            metadata: Box::new(error),
+                        }),
+                    };
+                    database.finish_copy_generation(CopyGenerationPhase::Failed, None).await
+                }
+            };
             if let Ok(generation) = database.current_copy_generation().await {
                 consumers.set_migration_report(generation.report()).await;
                 if let Err(source) = result {
@@ -435,7 +480,7 @@ impl SyncOrchestrator {
 
     async fn run_planned_local(
         &self, observation_plan: Option<MigrationPlan>, request: &CopyRequestDescriptor, app_config: &AppConfig,
-        consumers: &mut ConsumerManager, database: Option<ClickHouseDatabase>,
+        consumers: &mut ConsumerManager, database: Option<ClickHouseDatabase>, root_metadata: &CopyRootMetadata,
     ) -> Result<()> {
         let report = if let Some(database) = &database {
             begin_copy_catalogue(database, request).await?;
@@ -455,50 +500,56 @@ impl SyncOrchestrator {
         info!(mode=?report.plan.mode, target_cleanup=?report.plan.target_cleanup, reasons=?report.plan.reasons,
             filter_evaluated_at=report.filter_evaluated_at, generation=?report.generation, "Migration execution plan");
         consumers.set_migration_report(report.clone()).await;
-        if report.plan.target_cleanup == TargetCleanupPolicy::Preserve {
-            let reason = if !request.source_cleanup.retains_source()
-                || report.plan.reasons.contains(&MigrationReason::PreviousSourceDeleted)
-            {
-                TargetRetentionReason::SourceCleanupPolicy
-            } else if request.selection.is_filtered()
-                || request.selection.relative_time
-                || report.plan.reasons.contains(&MigrationReason::SelectionChanged)
-            {
-                TargetRetentionReason::FilteredSelection
-            } else {
-                TargetRetentionReason::BaselineUnavailable
-            };
-            consumers
-                .record_target_retention_range(
-                    reason,
-                    format!("本轮采用 Preserve，原因 {:?}；未展开的旧目标范围全部保留，不逐项回源查询，也不推断缺失删除或破坏性 rename", report.plan.reasons),
-                )
-                .await?;
-        }
-        // 任务边界隔离管线状态机的布局，避免继续嵌套到 CLI／Web 入口。
-        match report.plan.mode {
-            MigrationMode::Full => {
-                self.run_sync(observation_plan, app_config, consumers, database)
+        root_metadata.capture().await?;
+        let result = async {
+            if report.plan.target_cleanup == TargetCleanupPolicy::Preserve {
+                let reason = if !request.source_cleanup.retains_source()
+                    || report.plan.reasons.contains(&MigrationReason::PreviousSourceDeleted)
+                {
+                    TargetRetentionReason::SourceCleanupPolicy
+                } else if request.selection.is_filtered()
+                    || request.selection.relative_time
+                    || report.plan.reasons.contains(&MigrationReason::SelectionChanged)
+                {
+                    TargetRetentionReason::FilteredSelection
+                } else {
+                    TargetRetentionReason::BaselineUnavailable
+                };
+                consumers
+                    .record_target_retention_range(
+                        reason,
+                        format!("本轮采用 Preserve，原因 {:?}；未展开的旧目标范围全部保留，不逐项回源查询，也不推断缺失删除或破坏性 rename", report.plan.reasons),
+                    )
+                    .await?;
+            }
+            // 任务边界隔离管线状态机的布局，避免继续嵌套到 CLI／Web 入口。
+            match report.plan.mode {
+                MigrationMode::Full => {
+                    self.run_sync(observation_plan, app_config, consumers, database, root_metadata)
+                        .boxed_local()
+                        .await
+                }
+                MigrationMode::Incremental => {
+                    self.run_incremental_sync(
+                        observation_plan,
+                        app_config,
+                        consumers,
+                        database.ok_or_else(|| AppError::ConfigError("增量迁移需要已准备的复制目录".into()))?,
+                        root_metadata,
+                    )
                     .boxed_local()
                     .await
-            }
-            MigrationMode::Incremental => {
-                self.run_incremental_sync(
-                    observation_plan,
-                    app_config,
-                    consumers,
-                    database.ok_or_else(|| AppError::ConfigError("增量迁移需要已准备的复制目录".into()))?,
-                )
-                .boxed_local()
-                .await
+                }
             }
         }
+        .await;
+        root_metadata.retain_capture_failure(result)
     }
 
     /// 全量同步 — 通过 transport 连接 sender workers 和 receiver tasks
     async fn run_sync(
         &self, observation_plan: Option<MigrationPlan>, app_config: &AppConfig, consumer_manager: &mut ConsumerManager,
-        database: Option<ClickHouseDatabase>,
+        database: Option<ClickHouseDatabase>, root_metadata: &CopyRootMetadata,
     ) -> Result<()> {
         let c = &self.config;
 
@@ -853,7 +904,11 @@ impl SyncOrchestrator {
         let copy_ready = pipeline_result.is_ok();
         let early = async {
             match early_cleanup {
-                Some(stage) => stage.complete(copy_ready, cleanup_check.clone()).await,
+                Some(stage) => {
+                    stage
+                        .complete(copy_ready, cleanup_check.clone(), Some(root_metadata))
+                        .await
+                }
                 None => Ok(EarlyCleanup::default()),
             }
         };
@@ -890,6 +945,7 @@ impl SyncOrchestrator {
                     destination.clone(),
                     Some(consumer_manager.task_statistics()),
                     consumer_manager.copy_database_execution(),
+                    Some(root_metadata),
                 )
                 .await?;
                 if !is_source_reserved {
@@ -915,6 +971,9 @@ impl SyncOrchestrator {
                     )
                     .await?;
                 }
+            } else if root_metadata.enabled() {
+                let destination = create_storage_for_role(&c.dest_path, None, false, StorageRole::Destination).await?;
+                root_metadata.finish(&destination).await?;
             }
             Ok(())
         }
@@ -932,7 +991,7 @@ impl SyncOrchestrator {
     ///   喂给同一组 consumers（`DatabaseConsumer` 自动完成 incremental 表写入 + base 表修正）
     async fn run_incremental_sync(
         &self, observation_plan: Option<MigrationPlan>, app_config: &AppConfig, consumer_manager: &mut ConsumerManager,
-        database: ClickHouseDatabase,
+        database: ClickHouseDatabase, root_metadata: &CopyRootMetadata,
     ) -> Result<()> {
         let c = &self.config;
 
@@ -1299,6 +1358,7 @@ impl SyncOrchestrator {
                 destination.clone(),
                 Some(consumer_manager.task_statistics()),
                 consumer_manager.copy_database_execution(),
+                Some(root_metadata),
             )
             .await?;
             if !is_source_reserved {

@@ -53,7 +53,9 @@ async fn unchanged_copy_is_deleted(config: &ClickHouseConfig) -> Result<()> {
     .await?;
     database.batch_insert_base_record(&[Arc::clone(&entry)]).await?;
     database.commit_scan_generation().await?;
-    database.finish_copy_generation(CopyGenerationPhase::Completed).await?;
+    database
+        .finish_copy_generation(CopyGenerationPhase::Completed, None)
+        .await?;
     drop(database);
     let metadata = std::fs::metadata(target_root.path().join("payload"))?;
     let database = ClickHouseDatabase::connect(config, "unchanged_move").await?;
@@ -66,7 +68,7 @@ async fn unchanged_copy_is_deleted(config: &ClickHouseConfig) -> Result<()> {
         .compare_catalogue_batch(&[current], ComparisonMode::AwaitCopyAcknowledgement)
         .await?;
     assert!(changes.is_empty(), "unchanged entries must produce no copy work");
-    copy_completion::complete(database.clone(), Arc::clone(&target), None, None).await?;
+    copy_completion::complete(database.clone(), Arc::clone(&target), None, None, None).await?;
     remove_confirmed_sources(
         database.clone(),
         source,
@@ -74,7 +76,9 @@ async fn unchanged_copy_is_deleted(config: &ClickHouseConfig) -> Result<()> {
         SourceCleanupCheck::new(Duration::from_secs(1), Duration::from_secs(3), CancellationToken::new()),
     )
     .await?;
-    database.finish_copy_generation(CopyGenerationPhase::Completed).await?;
+    database
+        .finish_copy_generation(CopyGenerationPhase::Completed, None)
+        .await?;
     assert_eq!(database.get_count("base").await?, 0);
     assert!(!source_root.path().join("payload").exists());
     assert_eq!(
@@ -130,7 +134,9 @@ async fn moved_copy_is_retained(config: &ClickHouseConfig, incomplete: bool) -> 
         })?;
     if !incomplete {
         database.commit_scan_generation().await?;
-        database.finish_copy_generation(CopyGenerationPhase::Completed).await?;
+        database
+            .finish_copy_generation(CopyGenerationPhase::Completed, None)
+            .await?;
         assert_eq!(database.get_count("base").await?, 0);
     } else {
         assert_eq!(database.get_count("base").await?, 1);
@@ -145,7 +151,9 @@ async fn moved_copy_is_retained(config: &ClickHouseConfig, incomplete: bool) -> 
     assert_eq!(database.get_count("base").await?, 0);
     assert_eq!(database.detect_deleted_items().await?.count(), 0);
     database.commit_scan_generation().await?;
-    database.finish_copy_generation(CopyGenerationPhase::Completed).await?;
+    database
+        .finish_copy_generation(CopyGenerationPhase::Completed, None)
+        .await?;
     assert!(!source_root.path().join("payload").exists());
     assert_eq!(std::fs::read(target_root.path().join("payload"))?, b"moved payload");
     let after = std::fs::metadata(target_root.path().join("payload"))?;
@@ -199,7 +207,9 @@ async fn only_current_selection_authorizes_source_cleanup(config: &ClickHouseCon
     }
     database.batch_insert_base_record(&entries).await?;
     database.commit_scan_generation().await?;
-    database.finish_copy_generation(CopyGenerationPhase::Completed).await?;
+    database
+        .finish_copy_generation(CopyGenerationPhase::Completed, None)
+        .await?;
     drop(database);
     let client = Client::default()
         .with_url(&config.dsn)
@@ -226,7 +236,9 @@ async fn only_current_selection_authorizes_source_cleanup(config: &ClickHouseCon
         );
         if round == 3 {
             database.commit_scan_generation().await?;
-            database.finish_copy_generation(CopyGenerationPhase::Completed).await?;
+            database
+                .finish_copy_generation(CopyGenerationPhase::Completed, None)
+                .await?;
         }
     }
     // 下一轮 W=1，准备前未选中的旧记录也恰为 1；不能靠这个相等关系授权删除。
@@ -252,7 +264,7 @@ async fn only_current_selection_authorizes_source_cleanup(config: &ClickHouseCon
     assert_eq!(state, 0, "新代次统一回标旧事实，执行身份仍负责限定本轮清理范围");
     let untouched_time = UNIX_EPOCH + Duration::from_secs(1_234_567);
     File::open(target_root.path().join("outside-dir"))?.set_times(FileTimes::new().set_modified(untouched_time))?;
-    copy_completion::complete(database.clone(), Arc::clone(&target), None, None).await?;
+    copy_completion::complete(database.clone(), Arc::clone(&target), None, None, None).await?;
     remove_confirmed_sources(
         database.clone(),
         source,
@@ -260,7 +272,9 @@ async fn only_current_selection_authorizes_source_cleanup(config: &ClickHouseCon
         SourceCleanupCheck::new(Duration::from_secs(1), Duration::from_secs(3), CancellationToken::new()),
     )
     .await?;
-    database.finish_copy_generation(CopyGenerationPhase::Completed).await?;
+    database
+        .finish_copy_generation(CopyGenerationPhase::Completed, None)
+        .await?;
     assert_eq!(database.get_count("base").await?, 0);
     assert!(!source_root.path().join("selected").exists());
     assert_eq!(std::fs::read(source_root.path().join("outside"))?, b"outside");

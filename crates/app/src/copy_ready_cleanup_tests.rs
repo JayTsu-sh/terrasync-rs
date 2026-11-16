@@ -3,7 +3,7 @@
 use std::{
     env,
     fs::{File, FileTimes, Permissions},
-    os::unix::fs::PermissionsExt,
+    os::unix::fs::{PermissionsExt, chown},
     path::{Path, PathBuf},
     time::{Duration, UNIX_EPOCH},
 };
@@ -103,6 +103,12 @@ async fn case(config: &ClickHouseConfig, deployment: &str, name: &str) -> Result
     std::fs::create_dir(root.join("target"))?;
     for directory in [&root, &root.join("source"), &root.join("target")] {
         std::fs::set_permissions(directory, Permissions::from_mode(0o777))?;
+    }
+    if matches!(name, "metadata" | "data") {
+        // 非特权子进程须能迁移根属性，只在文件本身保留本例的故障。
+        for role in ["source", "target"] {
+            chown(root.join(role), Some(65534), Some(65534))?;
+        }
     }
     let paths: Vec<&str> = match name {
         "directory" => {

@@ -45,6 +45,7 @@ fn request() -> CopyRequestDescriptor {
 
 fn previous(request: CopyRequestDescriptor, phase: CopyGenerationPhase, prepared: bool) -> CopyGeneration {
     CopyGeneration {
+        root_snapshot: None,
         sequence: 1,
         revision: 1,
         plan: CopyGenerationPlan::decide(&request, None, false).unwrap(),

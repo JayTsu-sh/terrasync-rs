@@ -42,6 +42,7 @@ pub mod consumer;
 
 mod copy_completion;
 mod copy_execution;
+mod copy_root;
 mod job_execution;
 pub mod local_transfer;
 #[cfg(test)]

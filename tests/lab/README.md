@@ -2,6 +2,12 @@
 
 The lab is shared by `nfs-rs`, `data-mover-rs`, and `terrasync-rs`.
 
+Evidence availability, November 16: the older `/tmp` artifacts cited below did
+not survive the environment refresh. Their dated execution figures are
+historical summaries, not inspectable evidence for the current working tree.
+The current independent root-metadata revalidation subsection records durable
+results and explicitly separates software, performance and field acceptance.
+
 `python3 tests/lab/run-notification-archive-local.py --mutable-catalogue` runs
 24 real migration rounds across Single and two-replica ClickHouse, ordinary and
 suspended-version S3 sources, and latest-only and versioned destinations. An owned
@@ -1899,3 +1905,299 @@ directory work/path diagnostics in copy_completion, and protocol/binding behavio
 in Native. No ClickHouse/callback policy was moved into storage. Directory/root
 metadata without a database, asynchronous source cleanup for every entry class,
 unified stage counters and shared fault/late-write control remain plan items.
+
+
+### Root metadata capture and completion (2026-11-10 historical record)
+
+The execution figures and `/tmp` paths in this subsection are historical
+summaries from November 10. The temporary raw logs and fixed binaries did not
+survive the environment refresh. They cannot be inspected as current evidence
+or used to accept the November 16 working tree. Current independent results and
+remaining gates are recorded in the following subsection.
+
+The task owns one root observation captured before content enumeration. Filesystem
+roots use the same selected raw metadata plan as entries; object-store virtual
+roots are omitted. Root facts are stored in the existing generations table's
+binary `root_snapshot String` column, separately from bounded descriptor JSON.
+The SQL transport uses hex/unhex rather than a JSON Value per byte. Readback
+validates source binding, empty root path, directory kind and absence of history.
+Root facts do not enter base or entry counts. A large-raw roundtrip, idempotent
+terminal saves and invalid-root rejection are covered by database tests.
+
+After all target namespace mutations, the task applies/verifies root metadata,
+confirms required persistence for source deletion, and commits the generation.
+The bounded early-file window must also finalize root metadata first: its
+eligibility already excludes every child directory and unfinished content.
+It runs concurrently with fact draining, and its private completion proof avoids
+reapplying root attributes at the later empty-directory finish. The original
+unconfirmed-receipt source-deletion behavior is preserved. A real root cancellation
+initially exposed premature flat-file deletion; that failed run was recorded at
+`/tmp/terrasync-root-cancel-nfs-second-real.log`, and was not passing evidence.
+The first attempt stopped at a misplaced test assertion caught by compilation.
+
+Local/NFS reuse their existing Metadata/Namespace/persist_observed operations;
+Native commits `1fcac13f5af9d29ee02986467e7c781cd52e459d` and
+`69a5ce8df627ddeccd797fc201f1f9a00cbb2494` add root-path support without a new public
+function/type. Root creation/deletion remain refused. Native unit suites passed
+141 Local and 280 NFS tests. Both complete CI scopes passed the existing 53-step
+sequence (bounded example-artifact release and the unchanged Local E2E tests).
+The initial Local examples link ran out of disk; its driver records failure,
+and the retry succeeded. The initial NFS Clippy rejected an oversized test helper;
+it was extracted and the entire scope rerun. This is not a claim that one unchanged
+`make ci` invocation passed. No nfs-rs changes were needed.
+
+The real NFS v3/v4.1 root contract reuses the existing metadata-cancel relay:
+select `--test-name direct::metadata_cancel::real_nfs_root_metadata_fault_contract`
+with `--contract metadata-cancel`. Sixteen actual cases cover mode flash,
+disconnect, silent timeout, cancellation and lost acknowledgement per dialect;
+owner/time cancellation per dialect; v4.1 ACL SET/readback cancellation. Each
+explicit recovery is independently inspected on VM 104 for body and requested
+attributes, with root deletion refused. Cancellation returned under one second;
+uncancelled silent loss still uses the existing per-protocol detection times.
+No VM/service/export/firewall changes were made, and exact owned prefixes were
+removed. Windows root ACL and other filesystem backend certification remain out
+of this evidence.
+
+Run product matrices with:
+
+```bash
+python3 tests/lab/run-directory-cancel-nfs.py --root-metadata
+python3 tests/lab/run-directory-cancel-nfs.py --root-metadata --source-metadata-failure
+```
+
+The first injects a root SETATTR stall plus ClickHouse data-channel disconnect.
+Its private decoder selects the root's 0750 mutation, rather than guessing from
+request counts or directory-query timing. The second changes exactly the first
+source-root ACL reply to PermissionDenied while preserving successful SEQUENCE;
+file metadata/data calls still succeed. Both run Single/two-replica Full and
+Incremental failures, two bootstrap generations and four recoveries: 20 jobs in
+all. Every failed job keeps all three source files and complete target bodies,
+counts zero entry errors and one precise task error, saves raw root facts and the
+final report, and completes HTTP 204 diagnostics without omissions. Root facts
+never increase the three-file/zero-directory scan or base count. Failed unchanged
+incrementals transfer zero data bytes. Recovery is Full after a source-deleting
+attempt and confirms root nanosecond mtime/mode, empty source and retired base.
+Fault injection to unscoped terminal request was 3.60–4.65 seconds including
+recognition; this is not a global strict-three-second certification. A final root
+namespace read failure stops admission rather than starting another content-scan
+recovery window. Independent metadata acquisition failure still allows data copy.
+
+The unchanged directory-cancellation matrix passed 10 jobs/12 entry causes;
+the permission matrix passed 10 jobs/280 entry causes; the ready-window suite
+passed 12 jobs, including deletion before unforwarded receipts, rejected facts,
+directory deferral, bounded fallback and metadata/data failures. Unprivileged
+fixtures now own their source/target roots so only the originally intended
+files/subdirectories receive permission faults. Their failure/count assertions
+were preserved. The original combined command with both lab flags executes only
+the directory suite; the ready-window suite was run separately.
+
+Five Rust CI checks passed, including 365 app tests and 16 serial remote-process
+tests (52 app environment tests remain ignored in default CI). Latest app Clippy
+and the isolated no-database empty/nonempty-root test also passed. Existing
+large-AppError and other repository warnings remain; they were not suppressed.
+The earlier CI failure was a mock row missing the new binary column; the fixture
+was updated and all five checks rerun.
+
+Fixed CLI A/B used Rust 1.98.1 dev/debug=0, 16 workers/100000 batch,
+unordered/Direct/quick, Single ClickHouse 2 CPU/1536 MiB/pool512 and no callback.
+ABBAABBAABBA for four scenarios produced 48 measured runs plus 24 separate
+unmeasured incremental Full baselines. No task-owned build, CI or functional test
+ran during measurement. Bodies, source states, child directory metadata, base,
+generation and saved reports were independently checked. The after program also
+checked root nanosecond mtime/mode, raw column and root exclusion from counters;
+the before program retains its known root-metadata gap. The no-database case is
+flat and has no ClickHouse final report. Incremental transferred bytes are zero.
+RSS samples use 50 ms intervals plus GNU time peaks.
+
+| Scenario | Median seconds before → after | Change | Median peak RSS MiB before → after |
+| --- | --- | --- | --- |
+| Full move, 3000 × 1 KiB/100 directories | 5.235 → 5.225 | −0.19% | 223.04 → 223.99 |
+| Unchanged retained-source incremental | 1.770 → 1.860 | +5.08% | 243.79 → 239.58 |
+| Retained-source incremental, 30 mode changes | 2.065 → 2.060 | −0.24% | 243.39 → 239.09 |
+| No-database retained-source Full, 3000 flat files | 0.530 → 0.480 | −9.43% | 163.36 → 168.58 |
+
+All respective 5%/10% time gates passed, with comparable memory overhead. The
+after maximum was 248.47 MiB; these finite dev samples do not establish a universal
+200-MiB bound, release/large/all-backend performance, or sustained growth. No
+callback was configured in benchmarks; database-enabled Full diagnostics remain
+pending, not externally received. Before SHA-256 is
+`90d7a5645609070ec8396304c156c0203c0752eff936d46bc20da7ce322d76b4`; after is
+`3fa0624743a5e143a641eb4f667f19bad08bf95b21cec65894fe891c5dcd774f`.
+
+Historical evidence locations (no longer available in the current environment):
+
+- `/tmp/terrasync-root-final-ci-results.json`, five CI logs,
+  `/tmp/terrasync-root-final-reviewed-clippy.log`, `/tmp/terrasync-root-final-no-db.log`.
+- `/tmp/terrasync-root-cancel-nfs-third-real.log` and
+  `/tmp/terrasync-root-source-acquisition-first-real.log` (20 passing jobs).
+- `/tmp/terrasync-root-old-directory-cancel-real.log`,
+  `/tmp/terrasync-root-old-directory-ready-first-real.log` (directory permissions),
+  `/tmp/terrasync-root-ready-window-first-real.log`.
+- `/tmp/native-local-root-{red,first-green,ci-driver,ci-remaining-retry-driver}.log`,
+  `/tmp/native-nfs-root-{red,focused,ci-driver,ci-remaining-driver}.log`,
+  `/tmp/native-nfs-root-metadata16-real/{results.json,*.log}`.
+- `/tmp/terrasync-root-perf/` for both binary identities, all measured/bootstrap
+  results, raw RSS, summaries and isolated server diagnostics.
+- Initial compile/mock-row failures, the actual premature-deletion reproduction,
+  Native Clippy failure and owned cache-release inventories remain in the matching
+  `/tmp/terrasync-root-*` and `/tmp/native-*-root-*` diagnostic series.
+
+Final architecture review keeps root observation/proof in copy_root, ordering and
+commit in copy_completion, source-deletion permission in the task cleanup layer,
+binary persistence/deployment differences in db, and protocol root support in
+Native. This closes root metadata only. Bounded completion for every no-database
+child directory, all-entry asynchronous source deletion, unified stage counts,
+and shared fault/late-write control remain plan work.
+
+### Root metadata independent revalidation (2026-11-16)
+
+Independent `dev_test_runner` execution and `dev_gatekeeper` review are separate
+from implementation and its targeted self-tests. The frozen root-feature tree
+at `3d97ccf1096db68cef3b2779400a15decfd85361` plus its recorded diff passed
+the five Rust CI commands: formatting, workspace/all-target check and Clippy,
+workspace tests excluding the root package, and serial remote-process E2E.
+App results were **370 passed / 52 ignored**, database results **144 passed /
+40 ignored**, and remote-process results **16 passed**. The isolated ignored
+Local no-database empty/nonempty-root case also passed. Existing Clippy warnings
+remain. Raw commands, exit codes, source manifests and the reviewed diff are at
+`/root/.cache/terrasync-validation-20261116/independent-software/`.
+Subsequent runtime changes need new source-bound validation.
+
+The passive lab observer was independently reviewed before execution. Its
+frozen manifest SHA-256 is
+`498a6a173da6c59c15ff369fd85ee572e4968f29b7ef8de4e96430900d1ccba9`.
+It records existing successful ClickHouse reads and callback requests/responses;
+it does not add a query or probe before forwarding `DROP`. Decoding happens
+after the original suite finishes. Missing or undecodable required evidence
+does not become a pass. Some permission-suite generations have no original base
+count query; those counts remain unverified rather than inferred.
+
+The first `root-source-acl` attempt failed during environment preparation:
+VM104 could not start `python3`, returning I/O error and status 29. No product
+migration round, database fact or callback was produced, and the remaining
+suites were stopped. After the user authorized restart and then snapshot-backed
+filesystem repair, the guest root was repaired and independently checked;
+guest execution and NFS/RPC recovered. This is environment recovery, not product
+fault acceptance. Evidence is under `independent-lab/root-source-acl/` and
+`independent-lab-after-vm-reset/recovery-acceptance/` in the same persistent
+results directory. This initial attempt did not validate the product fault
+suites or Native root contract; their subsequent execution is recorded below.
+
+Independent Local A/B used the original fixed baseline (`3d97ccf`, Native
+`57e5d00`) and the frozen root feature (Native `69a5ce8`). Binary SHA-256:
+
+- Before: `6a92778dfadbe1165f87592a69534be77714b9750578f0f7d8688f3a9b8d748a`.
+- After: `ebe846b8e84f8d95a2ea6fbfb32b69bcc964b6f5908dd6fd695e55e07f5730e9`.
+
+All 48 measured samples and 24 separate incremental bootstrap runs were retained.
+The reviewed results are:
+
+| Scenario | Median seconds before → after | Change | Time gate |
+| --- | --- | --- | --- |
+| Full move, 3000 × 1 KiB/100 directories | 5.175 → 5.225 | +0.97% | Pass, 5% |
+| Unchanged retained-source incremental | 1.855 → 1.765 | −4.85% | Pass, 10% |
+| Retained-source incremental, 30 mode changes | 1.930 → 1.965 | +1.81% | Pass, 10% |
+| No-database retained-source Full, 3000 flat files | 0.430 → 0.530 | +23.26% | **Fail, 5%** |
+
+Performance acceptance therefore failed overall. No-database median peak RSS
+changed by about +0.02%; the maximum after RSS across scenarios was 250.34 MiB.
+These finite dev samples do not establish a 200-MiB bound or large-scale behavior.
+Raw results, 50-ms RSS samples, GNU time records, correctness checks, binary and
+helper identities, and resource supervision are retained in
+`/root/.cache/terrasync-validation-20261116/independent-performance/`.
+
+An independently executed 8-round thread trace and two empty-root traces showed
+that synchronous progress-thread joins can actually wait 5–100 ms for the
+existing sleep polling to end. They support fixing that unnecessary shutdown
+delay while retaining root metadata application and readback. The tracing itself
+increased each run to roughly 8–9.6 seconds; it does not prove the complete cause
+of the untraced regression or replace fresh performance acceptance. Evidence is
+at `independent-performance-diagnosis/run-20261116T0728Z/` in the persistent
+results directory. The failure above remains part of the evidence; the final
+revalidation below uses a new frozen implementation and separate samples.
+
+#### Final accepted results for this batch
+
+The independent progress-thread fix is committed as `9693136`. It wakes each
+reporter after publishing completion, retains the fixed display deadline and
+100-ms fallback, and preserves final callback/statistics ordering. Eight new
+deterministic regressions passed. The final combined root-feature tree passed
+the same five Rust CI commands: **app 378 passed / 52 ignored**, **db 144 passed /
+40 ignored**, **remote process 16 passed**, and the isolated ignored no-database
+root case **1 passed / 429 filtered**. Clippy still emits warnings. Final software
+evidence is in `independent-software-progress-wakeup/`.
+
+The final after CLI SHA-256 is
+`1e5132d820b7a11add879c4806a66221bdc5227e5b1b225677d4757c5467edc1`;
+the fixed original baseline SHA remains `6a92778d…`. Separate results in
+`independent-performance-progress-wakeup/` contain all 48 measured runs and
+24 incremental bootstrap runs, using the same configuration and sequence:
+
+| Scenario | Median seconds before → after | Change | Median peak RSS MiB before → after |
+| --- | --- | --- | --- |
+| Full move, 3000 × 1 KiB/100 directories | 4.995 → 4.940 | −1.10% | 222.68 → 226.27 |
+| Unchanged retained-source incremental | 1.785 → 1.670 | −6.44% | 243.81 → 238.88 |
+| Retained-source incremental, 30 mode changes | 2.005 → 1.865 | −6.98% | 245.90 → 244.00 |
+| No-database retained-source Full, 3000 flat files | 0.430 → 0.430 | 0.00% | 165.17 → 166.99 |
+
+All four time gates passed with comparable median memory overhead. Maximum
+after RSS was 252.73 MiB; this does not establish a 200-MiB bound or certify
+release, large/deep trees, other backends or sustained memory behavior.
+
+The independent product suites in `independent-lab-final/` ran 52 rounds:
+
+| Suite | Rounds | Product test exit | Observer exit | Evidence boundary |
+| --- | --- | --- | --- | --- |
+| Source-root ACL refusal | 10 | 0 | 0 | All root snapshots, final reports and base reads captured |
+| Root mutation cancellation + CH fault | 10 | 0 | 0 | Same per-round evidence; failed source files retained |
+| Child-directory cancellation + CH fault | 10 | 0 | **2** | Two successful retained bootstrap rounds never query base; those counts remain unverified |
+| Directory permission failures | 10 | 0 | 0 | 280 failure causes; two unqueried bootstrap counts explicitly unverified |
+| Ready cleanup before fact receipts | 12 | 0 | 0 | Receipt/rejection, directory deferral, bounded fallback and data/metadata failure cases |
+
+The directory observer's original `complete=false` and exit 2 are preserved.
+Independent review confirmed that its missing reads were not lost responses:
+the original non-root bootstrap branch does not query base. All four failed and
+four recovery rounds did read base zero. This is acceptance of the suite's
+original contract with a named unverified subitem, not complete observer
+acceptance. No extra query was added to a fault path or cleanup.
+
+Raw callback requests and their actual HTTP 204 response headers are retained
+for all five suites. Source/target bodies, source retention on failure, recovery,
+task/entry counters, persisted final reports and root snapshot bindings were
+independently checked where required. Root facts remain outside ordinary base
+and counters. Product root suites use NFS v4.1. Their end-to-end or
+fault-to-terminal timings include detection and other stages and do not prove
+a shared three-second recovery window. ClickHouse reads certify the observed
+node and moment, not every replica.
+
+The unchanged Native `69a5ce8` root contract additionally passed **8 groups /
+16 actual cases** on NFS v3 and v4.1. Mode covers flash, disconnect, silent stall,
+cancellation and lost acknowledgement on both dialects; owner/time cancellation
+is tested on both, and v4.1 ACL SET/readback cancellation separately. Test binary
+SHA-256 is `28f85cf31608ff567ce301ec682f63f8890cb2bebadfccc95c3724bcc112d0da`.
+Each group has nonzero actual RPC fault counters, explicit recovery, independent
+server body/attribute inspection, confirmed process-group shutdown and removal
+of its own UUID prefix. All `cleanup_pending` values are false.
+
+Native evidence is in `native-root-final/`. Cancellation tests assert return
+within one second and preserve Cancelled/Unknown with unconfirmed write outcome;
+logged latency was zero at millisecond resolution. Silent-stall detection was
+about 5 seconds for v3 and 15 seconds for v4.1, not an identified-failure recovery
+measurement. ACL inspection compares owner/mode and presence/raw bytes of both
+server POSIX ACL xattrs (both absent in these fixtures); it does not independently
+certify every NFSv4 ACE. Birth/ctime/atime and all xattr/tag bytes are not broadly
+certified by this batch.
+
+Source contents and artifacts were frozen throughout acceptance. Current
+product suites have actual before/after 559-file manifests; Native has matching
+1189-file manifests. The earlier software/performance binding was strengthened
+by combining the original complete snapshot, reviewed repair manifest and
+current full comparison (`supplemental-binding/`), explicitly not a fabricated
+contemporaneous full pre-test snapshot. Runtime contents did not change when
+the independent fix was committed. Final documentation edits are separate.
+
+Independent gatekeeping accepts the root-metadata batch within these limits.
+All-entry asynchronous cleanup, bounded completion for every no-database child
+directory, unified stage counters and shared fault/late-write control remain
+plan work. The overall optimization plan is not complete. Historical Native
+53-step CI summaries above still have no surviving raw evidence in this session.

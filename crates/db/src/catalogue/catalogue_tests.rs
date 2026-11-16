@@ -345,7 +345,9 @@ async fn incomplete_copy_keeps_unacknowledged_rename_pending() -> Result<()> {
     let original = fixture.entry("old", 10, "aa");
     database.batch_insert_base_record(&[original]).await?;
     database.commit_scan_generation().await?;
-    database.finish_copy_generation(CopyGenerationPhase::Completed).await?;
+    database
+        .finish_copy_generation(CopyGenerationPhase::Completed, None)
+        .await?;
     database = database.new_execution_scope();
     assert_eq!(
         database
@@ -383,7 +385,9 @@ async fn incomplete_copy_keeps_unacknowledged_rename_pending() -> Result<()> {
     retry.update_base_record(&changed).await?;
     retry.batch_delete_base_record(&["old".into()]).await?;
     retry.commit_scan_generation().await?;
-    retry.finish_copy_generation(CopyGenerationPhase::Completed).await?;
+    retry
+        .finish_copy_generation(CopyGenerationPhase::Completed, None)
+        .await?;
     retry.drop_scan_temporary_table().await?;
     assert_eq!(retry.get_count("base").await?, 1);
     drop(retry);
@@ -430,7 +434,9 @@ async fn empty_unconfirmed_copy_remains_dirty_until_commit() -> Result<()> {
     );
     assert_eq!(retry.get_count("base").await?, 0);
     retry.commit_scan_generation().await?;
-    retry.finish_copy_generation(CopyGenerationPhase::Completed).await?;
+    retry
+        .finish_copy_generation(CopyGenerationPhase::Completed, None)
+        .await?;
     drop(retry);
     let clean = ClickHouseDatabase::new(&fixture.config, "empty_copy")?;
     assert_eq!(
@@ -440,7 +446,9 @@ async fn empty_unconfirmed_copy_remains_dirty_until_commit() -> Result<()> {
         CopyGenerationStatus::Fresh
     );
     clean.commit_scan_generation().await?;
-    clean.finish_copy_generation(CopyGenerationPhase::Completed).await?;
+    clean
+        .finish_copy_generation(CopyGenerationPhase::Completed, None)
+        .await?;
     // The same two generation values and identical payload recur across rounds.
     // Replica block deduplication must not suppress the new started marker/commit.
     for _ in 0..4 {
@@ -455,7 +463,8 @@ async fn empty_unconfirmed_copy_remains_dirty_until_commit() -> Result<()> {
             Some(CopyGenerationPhase::Prepared)
         );
         next.commit_scan_generation().await?;
-        next.finish_copy_generation(CopyGenerationPhase::Completed).await?;
+        next.finish_copy_generation(CopyGenerationPhase::Completed, None)
+            .await?;
         assert_eq!(
             next.latest_copy_generation().await?.map(|generation| generation.phase),
             Some(CopyGenerationPhase::Completed)
@@ -508,7 +517,9 @@ async fn history_copy_recovery_keeps_the_group_and_does_not_delete_the_replayed_
     database.begin_copy_generation(&history_request()).await?;
     database.batch_insert_base_record(&[Arc::clone(&segments[0])]).await?;
     database.commit_scan_generation().await?;
-    database.finish_copy_generation(CopyGenerationPhase::Completed).await?;
+    database
+        .finish_copy_generation(CopyGenerationPhase::Completed, None)
+        .await?;
     let mut database = database.new_execution_scope();
     database.begin_copy_generation(&history_request()).await?;
     drop(database); // A later source/metadata failure left this round uncommitted.
@@ -569,7 +580,9 @@ async fn history_copy_recovery_keeps_the_group_and_does_not_delete_the_replayed_
     assert_eq!(records.len(), 3);
     assert!(records.iter().any(|record| record.version_id == "z-old"));
     database.commit_scan_generation().await?;
-    database.finish_copy_generation(CopyGenerationPhase::Completed).await?;
+    database
+        .finish_copy_generation(CopyGenerationPhase::Completed, None)
+        .await?;
     database.drop_scan_temporary_table().await?;
     Ok(())
 }
@@ -689,7 +702,9 @@ async fn copy_comparison_binds_new_and_changed_versions_in_source_order() -> Res
         .batch_insert_base_record(&[Arc::new(observe(None, 10, true))])
         .await?;
     database.commit_scan_generation().await?;
-    database.finish_copy_generation(CopyGenerationPhase::Completed).await?;
+    database
+        .finish_copy_generation(CopyGenerationPhase::Completed, None)
+        .await?;
     let database = database.new_execution_scope();
     database.begin_copy_generation(&descriptor()).await?;
     // suspended bucket 的 null 被覆盖，随后恢复版本化并写入新版本。
@@ -733,7 +748,9 @@ async fn copy_comparison_binds_new_and_changed_versions_in_source_order() -> Res
         .await?;
     assert_eq!(database.detect_deleted_items().await?.count(), 0);
     database.commit_scan_generation().await?;
-    database.finish_copy_generation(CopyGenerationPhase::Completed).await?;
+    database
+        .finish_copy_generation(CopyGenerationPhase::Completed, None)
+        .await?;
     let rows = fixture.rows("mixed_history").await?;
     assert_eq!(
         rows.iter()
@@ -897,7 +914,9 @@ async fn unacknowledged_marker_removal_keeps_its_intent_after_restart() -> Resul
         .await?;
     assert!(rows >= 2, "the regression must preserve obsolete physical rows");
     database.commit_scan_generation().await?;
-    database.finish_copy_generation(CopyGenerationPhase::Completed).await?;
+    database
+        .finish_copy_generation(CopyGenerationPhase::Completed, None)
+        .await?;
     let database = database.new_execution_scope();
     let virtual_directory = Arc::new(marker.as_ref().clone().with_directory_marker_object(None)?);
     database.begin_copy_generation(&request("marker-binding", true)).await?;
@@ -929,7 +948,9 @@ async fn unacknowledged_marker_removal_keeps_its_intent_after_restart() -> Resul
         .batch_insert_completed_records(&[replay.into_iter().next().unwrap().item])
         .await?;
     retry.commit_scan_generation().await?;
-    retry.finish_copy_generation(CopyGenerationPhase::Completed).await?;
+    retry
+        .finish_copy_generation(CopyGenerationPhase::Completed, None)
+        .await?;
     assert!(fixture.rows("marker_retry").await?[0].marker_state.is_none());
     Ok(())
 }

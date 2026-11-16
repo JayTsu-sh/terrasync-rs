@@ -8,7 +8,7 @@ use std::time::SystemTimeError;
 
 // 外部crate
 use data_mover::error::StorageError as DataMoverStorageError;
-use data_mover::model::SnapshotDecodeError;
+use data_mover::model::{BackendKind, SnapshotDecodeError};
 use data_mover::transfer::{TransferFailure, TransferValueError};
 use data_mover::traversal::TraversalTerminalFailure;
 use db::error::DatabaseError;
@@ -53,6 +53,19 @@ impl Display for CopyStep {
 /// 应用程序的专用错误枚举
 #[derive(Error, Debug)]
 pub enum AppError {
+    #[error("根目录元数据失败 backend={backend:?} phase={phase}: {source}")]
+    CopyRootMetadataFailure {
+        backend: BackendKind,
+        phase: &'static str,
+        #[source]
+        source: Arc<StorageError>,
+    },
+    #[error("迁移失败: {source}; 根目录元数据同时失败: {metadata}")]
+    MigrationAndRootMetadataFailed {
+        #[source]
+        source: Box<AppError>,
+        metadata: Box<AppError>,
+    },
     #[error("迁移执行因子任务失败而停止: {source}")]
     CopyExecutionStopped {
         #[source]
@@ -370,12 +383,40 @@ pub enum AppError {
 pub type Result<T> = std::result::Result<T, AppError>;
 
 impl AppError {
+    /// 同一次根观察由 Arc 身份标识；组合错误的另一分支也可能已携带该失败。
+    pub(crate) fn contains_copy_root_failure(&self, observed: &Arc<StorageError>) -> bool {
+        match self {
+            Self::CopyRootMetadataFailure { source, .. } => Arc::ptr_eq(source, observed),
+            Self::MigrationAndRootMetadataFailed { source, metadata } => {
+                source.contains_copy_root_failure(observed) || metadata.contains_copy_root_failure(observed)
+            }
+            Self::MigrationAndSourceCleanupFailed { source, cleanup } => {
+                source.contains_copy_root_failure(observed) || cleanup.contains_copy_root_failure(observed)
+            }
+            Self::MigrationReportingFailed { source, reporting } => {
+                source.contains_copy_root_failure(observed) || reporting.contains_copy_root_failure(observed)
+            }
+            Self::CopyExecutionStopped { source } | Self::DiagnosticJournalStopped { source } => {
+                source.contains_copy_root_failure(observed)
+            }
+            Self::CopyExecutionAndDatabaseFailed { source, .. }
+            | Self::MigrationFinalizationFailed { source, .. }
+            | Self::ReportedCopyFailure { source, .. }
+            | Self::CopyEntryFailed { source, .. }
+            | Self::FileCommitStage { source, .. }
+            | Self::SenderSessionStage { source, .. } => source.contains_copy_root_failure(observed),
+            Self::RemoteExpertPayloadInterrupted { peer, .. } => peer.contains_copy_root_failure(observed),
+            _ => false,
+        }
+    }
+
     pub(crate) fn source_cleanup_entry(&self) -> Option<(&Path, &Self)> {
         match self {
             Self::MigrationAndSourceCleanupFailed { source, cleanup } => {
                 cleanup.source_cleanup_entry().or_else(|| source.source_cleanup_entry())
             }
             Self::CopyExecutionStopped { source } => source.source_cleanup_entry(),
+            Self::MigrationAndRootMetadataFailed { source, .. } => source.source_cleanup_entry(),
             Self::CopyEntryFailed {
                 step: CopyStep::SourceCleanup,
                 path,
@@ -417,6 +458,9 @@ impl AppError {
         match self {
             Self::CopyExecutionStopped { source } => source.stops_event_pipeline(),
             Self::ConsumerDisconnected { .. } => true,
+            Self::MigrationAndRootMetadataFailed { source, metadata } => {
+                source.stops_event_pipeline() || metadata.stops_event_pipeline()
+            }
             Self::CopyEntryFailed { source, .. } | Self::ReportedCopyFailure { source, .. } => {
                 source.stops_event_pipeline()
             }
@@ -429,6 +473,10 @@ impl AppError {
             Self::MigrationAndSourceCleanupFailed { source, cleanup } => {
                 source.storage_error().or_else(|| cleanup.storage_error())
             }
+            Self::MigrationAndRootMetadataFailed { source, metadata } => {
+                source.storage_error().or_else(|| metadata.storage_error())
+            }
+            Self::CopyRootMetadataFailure { source, .. } => Some(source),
             Self::CopyExecutionStopped { source } => source.storage_error(),
             Self::CopyEntryFailed { source, .. }
             | Self::ReportedCopyFailure { source, .. }

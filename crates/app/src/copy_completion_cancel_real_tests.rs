@@ -3,6 +3,7 @@
 use std::{env, time::Duration};
 
 use clickhouse::Client;
+use data_mover::model::{BackendIdentity, EntryKind, ObservedEntry};
 use db::{ClickHouseConfig, ClickHouseDatabase, DatabaseError};
 use task_model::{
     SourceCleanupPolicy,
@@ -48,10 +49,30 @@ async fn control(action: &str) -> Result<()> {
     .map_err(|_| AppError::ConfigError("owned directory control timeout".into()))?
 }
 
-async fn saved(config: &ClickHouseConfig, command: &SyncJobConfig, mode: MigrationMode, failed: bool) -> Result<()> {
+async fn saved(
+    config: &ClickHouseConfig, command: &SyncJobConfig, mode: MigrationMode, failed: bool, root_only: bool,
+) -> Result<()> {
     let database = ClickHouseDatabase::connect(config, &command.job_id).await?;
     let generation = database.latest_copy_generation().await?.unwrap();
     assert_eq!(generation.plan.mode, mode);
+    if root_only {
+        let binding = &generation.request.binding.source;
+        let backend = BackendIdentity::new(
+            binding.backend_kind.parse().map_err(DatabaseError::from)?,
+            binding.namespace.clone(),
+        )
+        .map_err(DatabaseError::from)?;
+        let root = ObservedEntry::decode_snapshot(
+            generation
+                .root_snapshot
+                .as_deref()
+                .ok_or_else(|| AppError::ConfigError("root raw snapshot not saved".into()))?,
+            &backend,
+        )
+        .map_err(DatabaseError::from)?;
+        assert_eq!(root.kind(), EntryKind::Directory);
+        assert!(root.path().as_str().is_empty());
+    }
     assert_eq!(
         generation.phase,
         if failed {
@@ -81,8 +102,31 @@ async fn saved(config: &ClickHouseConfig, command: &SyncJobConfig, mode: Migrati
             ..
         } => (*error_count, *transferred_bytes),
     };
+    if root_only {
+        match &report.detail {
+            ProgressDetail::Full {
+                scanned_files,
+                scanned_dirs,
+                ..
+            }
+            | ProgressDetail::Incremental {
+                scanned_files,
+                scanned_dirs,
+                ..
+            } => {
+                assert_eq!((*scanned_files, *scanned_dirs), (3, 0), "根不能进入普通 entry 统计");
+            }
+        }
+        if !failed && command.source_cleanup.retains_source() {
+            assert_eq!(database.get_count("base").await?, 3, "根原值不能成为普通 base entry");
+        }
+    }
     if failed {
-        assert_eq!((errors, report.task_error_count), (3, 1), "{report:?}");
+        assert_eq!(
+            (errors, report.task_error_count),
+            (if root_only { 0 } else { 3 }, 1),
+            "{report:?}"
+        );
         if mode == MigrationMode::Incremental {
             assert_eq!(bytes, 0, "目录属性变化不能重传未变文件数据");
         }
@@ -96,7 +140,9 @@ async fn saved(config: &ClickHouseConfig, command: &SyncJobConfig, mode: Migrati
     Ok(())
 }
 
-async fn case(config: &ClickHouseConfig, deployment: &str, incremental: bool) -> Result<()> {
+async fn case(
+    config: &ClickHouseConfig, deployment: &str, incremental: bool, root_only: bool, source_capture: bool,
+) -> Result<()> {
     let name = if incremental { "incremental" } else { "full" };
     let directory = tempfile::tempdir()?;
     let run = environment("LAB_DIRECTORY_CANCEL_RUN")?;
@@ -109,6 +155,13 @@ async fn case(config: &ClickHouseConfig, deployment: &str, incremental: bool) ->
         "nfs://127.0.0.1{prefix}/target?version=4.1&noresvport=true&uid=0&gid=0&nfsport={}",
         environment("LAB_DIRECTORY_CANCEL_NFS_PORT")?
     );
+    if source_capture {
+        command.src_path = format!(
+            "nfs://127.0.0.1{prefix}/source?version=4.1&noresvport=true&uid=0&gid=0&nfsport={}",
+            environment("LAB_DIRECTORY_CANCEL_SOURCE_PORT")?
+        );
+        command.enable_acl = true;
+    }
     command.progress_callback_url = Some(CallbackEndpoint::parse(&format!(
         "http://{}/callback",
         environment("LAB_DIRECTORY_CANCEL_CONTROL")?
@@ -116,7 +169,7 @@ async fn case(config: &ClickHouseConfig, deployment: &str, incremental: bool) ->
     if incremental {
         command.source_cleanup = SourceCleanupPolicy::Retain;
         SyncOrchestrator::new_local(command.clone()).run().await?;
-        saved(config, &command, MigrationMode::Full, false).await?;
+        saved(config, &command, MigrationMode::Full, false, root_only).await?;
     }
     command.source_cleanup = SourceCleanupPolicy::DeleteSelectedReady;
     control(&format!("arm/{deployment}/{name}")).await?;
@@ -142,6 +195,7 @@ async fn case(config: &ClickHouseConfig, deployment: &str, incremental: bool) ->
             MigrationMode::Full
         },
         true,
+        root_only,
     )
     .await?;
     control(&format!("failed/{deployment}/{name}")).await?;
@@ -151,7 +205,7 @@ async fn case(config: &ClickHouseConfig, deployment: &str, incremental: bool) ->
     )
     .await
     .map_err(|_| AppError::ConfigError("owned directory recovery timed out".into()))??;
-    saved(config, &command, MigrationMode::Full, false).await?;
+    saved(config, &command, MigrationMode::Full, false, root_only).await?;
     control(&format!("recovered/{deployment}/{name}")).await?;
     println!(
         "directory cancellation deployment={deployment} mode={name} source_kept_until_ready=true recovery_full=true final_report_saved=true"
@@ -162,6 +216,22 @@ async fn case(config: &ClickHouseConfig, deployment: &str, incremental: bool) ->
 #[tokio::test]
 #[ignore = "requires run-directory-cancel-nfs.py, owned NFS prefixes and isolated ClickHouse"]
 async fn real_directory_metadata_cancellation_keeps_sources_and_recovers() -> Result<()> {
+    run_matrix(false, false).await
+}
+
+#[tokio::test]
+#[ignore = "requires run-directory-cancel-nfs.py --root-metadata and owned NFS/ClickHouse"]
+async fn real_root_metadata_cancellation_keeps_sources_and_recovers() -> Result<()> {
+    run_matrix(true, false).await
+}
+
+#[tokio::test]
+#[ignore = "requires run-directory-cancel-nfs.py --root-metadata --source-metadata-failure"]
+async fn real_root_metadata_acquisition_failure_copies_data_and_preserves_sources() -> Result<()> {
+    run_matrix(true, true).await
+}
+
+async fn run_matrix(root_only: bool, source_capture: bool) -> Result<()> {
     AppConfig::init(Some(include_str!("../../cli/src/resources/default_config.toml")), None)?;
     let dsn = format!("http://{}", environment("LAB_DIRECTORY_CANCEL_CONTROL")?);
     let admin = Client::default().with_url(&dsn).with_user("default");
@@ -196,7 +266,14 @@ async fn real_directory_metadata_cancellation_keeps_sources_and_recovers() -> Re
         })?;
         let result: Result<()> = async {
             for incremental in [false, true] {
-                case(&config, if cluster { "cluster" } else { "single" }, incremental).await?;
+                case(
+                    &config,
+                    if cluster { "cluster" } else { "single" },
+                    incremental,
+                    root_only,
+                    source_capture,
+                )
+                .await?;
             }
             Ok(())
         }

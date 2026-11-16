@@ -1,6 +1,9 @@
 use std::{sync::Arc, time::Duration};
 
-use data_mover::model::{BackendKind, EntryKind};
+use data_mover::model::{
+    BackendKind, EntryKind, ExtendedAttribute, MetadataObservation, MetadataObservations, MetadataProvenance,
+    ObservedEntry, OwnershipMode,
+};
 use tokio::time::timeout;
 
 use clickhouse::{
@@ -44,6 +47,7 @@ fn database(mock: &Mock) -> Result<ClickHouseDatabase> {
 fn prior(binding: &str, reserved: bool, phase: CopyGenerationPhase, prepared: bool) -> CopyGeneration {
     let request = request(binding, reserved);
     CopyGeneration {
+        root_snapshot: None,
         sequence: 4,
         revision: 3,
         plan: CopyGenerationPlan::decide(&request, None, false).unwrap_or_else(|error| panic!("fixture: {error}")),
@@ -60,6 +64,7 @@ fn expect_previous(mock: &Mock, previous: Option<&CopyGeneration>, committed: u8
         sequence: generation.sequence,
         execution_id: generation.request.execution_id.clone(),
         revision: generation.revision,
+        root_snapshot: hex::encode(generation.root_snapshot.as_deref().unwrap_or_default()),
         descriptor: serde_json::to_string(generation).unwrap_or_else(|error| panic!("fixture: {error}")),
     });
     mock.add(handlers::provide(rows));
@@ -116,7 +121,9 @@ async fn accepted_policy_precedes_clear_and_copy_commit_keeps_its_execution_stam
     database.commit_scan_generation().await?;
     assert!(commit.query().await.contains(&command.execution_id));
     let finish = mock.add(handlers::record_ddl());
-    database.finish_copy_generation(CopyGenerationPhase::Completed).await?;
+    database
+        .finish_copy_generation(CopyGenerationPhase::Completed, None)
+        .await?;
     assert!(finish.query().await.contains("completed"));
     assert_eq!(
         database.current_copy_generation().await?.phase,
@@ -207,6 +214,7 @@ fn provide_generation(mock: &Mock, generation: &CopyGeneration) {
         sequence: generation.sequence,
         execution_id: generation.request.execution_id.clone(),
         revision: generation.revision,
+        root_snapshot: hex::encode(generation.root_snapshot.as_deref().unwrap_or_default()),
         descriptor: serde_json::to_string(generation).unwrap_or_else(|error| panic!("fixture: {error}")),
     }]));
 }
@@ -244,8 +252,11 @@ async fn source_deletion_completion_waits_for_writers_then_closes_all_base_entry
     let terminal = mock.add(handlers::record_ddl());
     let writer = database.base_write_guard().await?;
     let cloned = database.clone();
-    let mut finishing =
-        tokio::spawn(async move { cloned.finish_copy_generation(CopyGenerationPhase::Completed).await });
+    let mut finishing = tokio::spawn(async move {
+        cloned
+            .finish_copy_generation(CopyGenerationPhase::Completed, None)
+            .await
+    });
     assert!(timeout(Duration::from_millis(50), &mut finishing).await.is_err());
     drop(writer);
     finishing
@@ -292,7 +303,7 @@ async fn failed_or_cancelled_source_deletion_still_retires_the_base() -> Result<
         mock.add(handlers::record_ddl());
         mock.add(handlers::provide([0u64]));
         mock.add(handlers::record_ddl());
-        database.finish_copy_generation(phase).await?;
+        database.finish_copy_generation(phase, None).await?;
         assert_eq!(database.current_copy_generation().await?.phase, phase);
         assert!(database.base_write_guard().await.is_err());
     }
@@ -307,7 +318,7 @@ async fn cleanup_refuses_a_newer_execution_before_mutating_any_base_rows() -> Re
     provide_generation(&mock, &generation);
     let terminal = mock.add(handlers::record_ddl());
     assert!(matches!(
-        database.finish_copy_generation(CopyGenerationPhase::Completed).await,
+        database.finish_copy_generation(CopyGenerationPhase::Completed, None).await,
         Err(DatabaseError::CopyBaseRetirementFailed { source, .. }) if matches!(*source, DatabaseError::CopyGenerationInvalid { field: "stale_base_retirement" })
     ));
     assert!(terminal.query().await.contains("failed"));
@@ -327,7 +338,7 @@ async fn rows_outside_the_owned_copy_range_are_retained_and_reported_as_unconfir
     mock.add(handlers::provide([2u64]));
     mock.add(handlers::record_ddl());
     assert!(matches!(
-        database.finish_copy_generation(CopyGenerationPhase::Completed).await,
+        database.finish_copy_generation(CopyGenerationPhase::Completed, None).await,
         Err(DatabaseError::CopyBaseRetirementFailed { source, .. }) if matches!(*source, DatabaseError::CopyBaseRetirementIncomplete { remaining: 2, sequence: 4 })
     ));
     assert_eq!(
@@ -345,8 +356,188 @@ async fn cleanup_and_terminal_record_failures_keep_both_typed_causes() -> Result
     mock.add(handlers::failure(StatusCode::FORBIDDEN));
     mock.add(handlers::failure(StatusCode::FORBIDDEN));
     assert!(matches!(
-        database.finish_copy_generation(CopyGenerationPhase::Completed).await,
+        database
+            .finish_copy_generation(CopyGenerationPhase::Completed, None)
+            .await,
         Err(DatabaseError::CopyBaseRetirementReportingFailed { .. })
     ));
+    Ok(())
+}
+
+#[tokio::test]
+async fn root_raw_column_roundtrips_large_values_without_consuming_descriptor_budget() -> Result<()> {
+    let mock = Mock::new();
+    let database = database(&mock)?;
+    let mut generation = prior("root-raw", true, CopyGenerationPhase::Prepared, true);
+    generation.request.binding.source.namespace = "terrasync-fixture".into();
+    let root = observation(
+        BackendKind::Local,
+        "".into(),
+        EntryKind::Directory,
+        0,
+        [0, 1_700_000_000_123_456_789, 0],
+        Some(OwnershipMode {
+            uid: 1000,
+            gid: 1001,
+            mode: 0o750,
+        }),
+        Some(vec![1]),
+        None,
+        None,
+    );
+    let original = root.metadata();
+    let metadata = MetadataObservations::new(
+        original.acl().clone(),
+        MetadataObservation::Value {
+            value: vec![ExtendedAttribute::new(b"user.large-raw".to_vec(), vec![254; 400_000])?],
+            provenance: MetadataProvenance::AdditionalCall,
+        },
+        original.tags().clone(),
+        original.ownership_mode().clone(),
+        original.timestamps().clone(),
+    )?;
+    let root = root.with_metadata(metadata);
+    let snapshot = root.try_encode_snapshot()?.as_bytes().to_vec();
+    {
+        let mut lifecycle = database.generation_lifecycle.lock().await;
+        lifecycle.committed = true;
+        lifecycle.copy_generation = Some(generation.clone());
+    }
+    let saved = mock.add(handlers::record_ddl());
+    database
+        .finish_copy_generation(CopyGenerationPhase::Completed, Some(snapshot.clone()))
+        .await?;
+    let sql = saved.query().await;
+    assert!(sql.contains("root_snapshot"));
+    assert!(!sql.contains("root_snapshot\":null"));
+    generation = database.current_copy_generation().await?;
+    assert_eq!(generation.revision, 4);
+    assert_eq!(generation.root_snapshot.as_deref(), Some(snapshot.as_slice()));
+    let descriptor =
+        serde_json::to_string(&generation).map_err(|source| DatabaseError::CopyGenerationJson { source })?;
+    assert!(descriptor.len() < 10_000);
+    assert!(!descriptor.contains("root_snapshot"));
+    for supplied in [Some(snapshot.clone()), None] {
+        mock.add(handlers::record_ddl());
+        database
+            .finish_copy_generation(CopyGenerationPhase::Completed, supplied)
+            .await?;
+        assert_eq!(database.current_copy_generation().await?, generation);
+    }
+    provide_generation(&mock, &generation);
+    let stored = database
+        .latest_copy_generation()
+        .await?
+        .ok_or(DatabaseError::CopyExecutionUnavailable)?;
+    assert_eq!(stored, generation);
+    let restored = ObservedEntry::decode_snapshot(
+        stored.root_snapshot.as_deref().unwrap_or_default(),
+        root.source_identity().backend(),
+    )?;
+    assert_eq!(restored, root);
+    assert!(
+        !serde_json::to_string(&stored.report())
+            .map_err(|source| DatabaseError::CopyGenerationJson { source })?
+            .contains("root_snapshot")
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn invalid_root_snapshot_does_not_change_terminal_phase_or_revision() -> Result<()> {
+    let mock = Mock::new();
+    let database = database(&mock)?;
+    let mut generation = prior("root-invalid", true, CopyGenerationPhase::Prepared, true);
+    generation.request.binding.source.namespace = "terrasync-fixture".into();
+    {
+        let mut lifecycle = database.generation_lifecycle.lock().await;
+        lifecycle.committed = true;
+        lifecycle.copy_generation = Some(generation.clone());
+    }
+    assert!(
+        database
+            .finish_copy_generation(CopyGenerationPhase::Completed, Some(vec![1, 2, 3]))
+            .await
+            .is_err()
+    );
+    for (path, kind) in [("child", EntryKind::Directory), ("", EntryKind::File)] {
+        let entry = observation(
+            BackendKind::Local,
+            path.into(),
+            kind,
+            0,
+            [0; 3],
+            None,
+            Some(vec![1]),
+            None,
+            None,
+        );
+        let raw = entry.try_encode_snapshot()?.as_bytes().to_vec();
+        assert!(matches!(
+            database
+                .finish_copy_generation(CopyGenerationPhase::Completed, Some(raw))
+                .await,
+            Err(DatabaseError::CopyGenerationInvalid { field: "root_snapshot" })
+        ));
+    }
+    assert_eq!(database.current_copy_generation().await?, generation);
+    mock.add(handlers::record_ddl());
+    database
+        .finish_copy_generation(CopyGenerationPhase::Failed, None)
+        .await?;
+    assert_eq!(
+        database.current_copy_generation().await?.phase,
+        CopyGenerationPhase::Failed
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn invalid_root_input_cannot_close_or_retire_a_source_deleting_baseline() -> Result<()> {
+    let mut inputs = vec![(vec![1, 2, 3], false)];
+    for (path, kind) in [("child", EntryKind::Directory), ("", EntryKind::File)] {
+        let entry = observation(
+            BackendKind::Local,
+            path.into(),
+            kind,
+            0,
+            [0; 3],
+            None,
+            Some(vec![1]),
+            None,
+            None,
+        );
+        inputs.push((entry.try_encode_snapshot()?.as_bytes().to_vec(), true));
+    }
+    for phase in [
+        CopyGenerationPhase::Completed,
+        CopyGenerationPhase::Failed,
+        CopyGenerationPhase::Cancelled,
+    ] {
+        for (snapshot, encoded) in &inputs {
+            let mock = Mock::new();
+            let (database, mut generation) = retirement_fixture(&mock).await?;
+            generation.request.binding.source.namespace = "terrasync-fixture".into();
+            database.generation_lifecycle.lock().await.copy_generation = Some(generation.clone());
+            // 不提供任何 SQL 响应：输入验证必须早于 base 关闭、查询或删除。
+            let result = database.finish_copy_generation(phase, Some(snapshot.clone())).await;
+            if *encoded {
+                assert!(
+                    matches!(
+                        result,
+                        Err(DatabaseError::CopyGenerationInvalid { field: "root_snapshot" })
+                    ),
+                    "{phase:?}: {result:?}"
+                );
+            } else {
+                assert!(
+                    matches!(result, Err(DatabaseError::SnapshotDecode(_))),
+                    "{phase:?}: {result:?}"
+                );
+            }
+            assert_eq!(database.current_copy_generation().await?, generation);
+            assert!(database.base_write_guard().await.is_ok());
+        }
+    }
     Ok(())
 }

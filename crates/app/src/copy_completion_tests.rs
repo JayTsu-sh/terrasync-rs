@@ -214,7 +214,7 @@ async fn isolated_generation_case(mode: ClickHouseMode) -> Result<()> {
             .begin_copy_generation(&request("directory-completion-regression", true))
             .await?;
         database.batch_insert_base_record(&[Arc::new(entry.clone())]).await?;
-        let result = complete(database.clone(), target(&destination).await?, None, None).await;
+        let result = complete(database.clone(), target(&destination).await?, None, None, None).await;
         if !matches!(result, Err(AppError::StorageError(_))) {
             return Err(AppError::CopyError(format!(
                 "metadata failure was not reported: {result:?}"
@@ -231,7 +231,7 @@ async fn isolated_generation_case(mode: ClickHouseMode) -> Result<()> {
         }
         std::fs::create_dir(destination.path().join("missing"))?;
         database.batch_insert_base_record(&[Arc::new(entry.clone())]).await?;
-        complete(database.clone(), target(&destination).await?, None, None).await?;
+        complete(database.clone(), target(&destination).await?, None, None, None).await?;
         verify_mtime(&destination, "missing", entry.get_mtime())?;
         if database
             .begin_copy_generation(&request("directory-completion-regression", true))

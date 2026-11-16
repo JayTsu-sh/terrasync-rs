@@ -13,6 +13,7 @@ use super::ready_files::can_stream_files;
 use super::{CompletedChecks, ReadyFileCleanup, SourceCleanupCheck, remove_entry};
 use crate::broadcast::BroadcastForwarder;
 use crate::copy_execution::CopyDatabaseExecution;
+use crate::copy_root::CopyRootMetadata;
 use crate::error::{AppError, CopyStep, Result, StorageError};
 use crate::file_copy::selection::unrepresentable_object;
 use crate::storage_factory::StorageContext;
@@ -79,7 +80,9 @@ impl FullCleanupStage {
     }
 
     /// 必须先关闭广播，并证明扫描、复制及逐项清理成功；数据库消费者可以仍在冲刷。
-    pub(crate) async fn complete(self, copy_ready: bool, check: SourceCleanupCheck) -> Result<EarlyCleanup> {
+    pub(crate) async fn complete(
+        self, copy_ready: bool, check: SourceCleanupCheck, root: Option<&CopyRootMetadata>,
+    ) -> Result<EarlyCleanup> {
         let mut window = self.collector.await.map_err(AppError::from)?;
         if let Some(error) = self.ready_files.as_ref().and_then(|cleanup| cleanup.failure()) {
             return Err(error);
@@ -108,6 +111,11 @@ impl FullCleanupStage {
             .connections
             .get()
             .ok_or_else(|| AppError::ConfigError("已复制条目缺少本执行存储上下文，保留源端".into()))?;
+        // 窗口遇到任何子目录会禁用；全部内容已结束且没有子目录收尾，先确认根属性。
+        // 保持与数据库冲刷并发，不能用根收尾重新引入逐项入库等待。
+        if let Some(root) = root {
+            root.finish(target).await?;
+        }
         let mut completed = EarlyCleanup {
             connections: Some((source.clone(), target.clone())),
             ..Default::default()

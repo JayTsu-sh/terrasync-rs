@@ -63,7 +63,9 @@ async fn apply_case(config: &ClickHouseConfig, directory: bool) -> Result<()> {
     set_entry_metadata(target.storage(), &entry("old"), None).await?;
     database.batch_insert_base_record(&[entry("old").into()]).await?;
     database.commit_scan_generation().await?;
-    database.finish_copy_generation(CopyGenerationPhase::Completed).await?;
+    database
+        .finish_copy_generation(CopyGenerationPhase::Completed, None)
+        .await?;
     let database = database.new_execution_scope();
     database.begin_copy_generation(&request("same-plan", reserved)).await?;
     assert!(

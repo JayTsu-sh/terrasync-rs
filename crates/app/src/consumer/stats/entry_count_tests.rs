@@ -246,6 +246,7 @@ fn incremental_inventory_keeps_entry_counts_and_selected_bytes_across_history_se
             request.binding.target_history = history_target;
             consumer.migration = Some(
                 CopyGeneration {
+                    root_snapshot: None,
                     sequence: 1,
                     revision: 2,
                     plan: CopyGenerationPlan::decide(&request, None, false).unwrap(),

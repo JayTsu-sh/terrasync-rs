@@ -38,7 +38,7 @@ async fn precancelled_completion_never_queries_or_commits_generation() -> TestRe
     let (database, execution) = execution(cancel)?;
     let result = timeout(
         Duration::from_millis(300),
-        complete(database, target(&destination).await?, None, Some(execution)),
+        complete(database, target(&destination).await?, None, Some(execution), None),
     )
     .await?;
     assert!(
@@ -260,7 +260,7 @@ async fn cancelled_completion_preserves_the_saved_execution_root_cause() -> Test
         .run_child(async { Err(AppError::ConfigError("owned execution root cause".into())) })
         .await;
     assert!(first.is_err());
-    let result = complete(database, target(&destination).await?, None, Some(execution)).await;
+    let result = complete(database, target(&destination).await?, None, Some(execution), None).await;
     assert!(matches!(result, Err(AppError::CopyExecutionStopped { source })
         if matches!(source.as_ref(), AppError::ConfigError(reason) if reason == "owned execution root cause")));
     Ok(())

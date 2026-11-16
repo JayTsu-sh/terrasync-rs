@@ -74,7 +74,9 @@ async fn deletion_case(config: &ClickHouseConfig, present: bool, directory: bool
     }
     database.batch_insert_base_record(&old).await?;
     database.commit_scan_generation().await?;
-    database.finish_copy_generation(CopyGenerationPhase::Completed).await?;
+    database
+        .finish_copy_generation(CopyGenerationPhase::Completed, None)
+        .await?;
     let database = database.new_execution_scope();
     database.begin_copy_generation(&request("same", true)).await?;
     if !present {
@@ -227,7 +229,9 @@ async fn hardlink_case(config: &ClickHouseConfig) -> Result<()> {
         .batch_insert_base_record(&[stable_entry(&source, "old").await?])
         .await?;
     database.commit_scan_generation().await?;
-    database.finish_copy_generation(CopyGenerationPhase::Completed).await?;
+    database
+        .finish_copy_generation(CopyGenerationPhase::Completed, None)
+        .await?;
     let database = database.new_execution_scope();
     database.begin_copy_generation(&request("same", true)).await?;
     assert!(

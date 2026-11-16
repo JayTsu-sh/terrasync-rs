@@ -143,6 +143,9 @@ async fn case(config: &ClickHouseConfig, deployment: &str, incremental: bool) ->
     for directory in [&root, &root.join("source"), &root.join("target"), &root.join("job")] {
         writable(directory)?;
     }
+    // 根元数据现在也必需可迁移；本夹具只在 70 个子目录注入所有权拒绝。
+    owned(&root.join("source"))?;
+    owned(&root.join("target"))?;
     owned(&root.join("job"))?;
     for index in 0..=FAILED_DIRECTORIES {
         let path = root.join("source").join(format!("d{index:03}"));

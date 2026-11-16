@@ -14,6 +14,7 @@ pub(crate) struct MigrationPlan {
     pub observation: ObservationPlan,
     pub scope: MetadataScope,
     pub additional_reads: Vec<MetadataRead>,
+    pub root_metadata: bool,
 }
 
 #[cfg(test)]
@@ -94,10 +95,13 @@ pub(crate) struct MetadataRead {
 
 impl MigrationPlan {
     pub async fn compile(source: &StorageContext, destination: &StorageContext, acl: bool) -> Result<Self> {
+        let root_metadata =
+            !source.storage().holds_directory_objects() && !destination.storage().holds_directory_objects();
         let source = source.storage().metadata()?.observation_capabilities();
         let target = destination.storage().staged_destination()?.copied_metadata_target();
         let mut plan = Self::from_capabilities(source, target, acl);
         plan.scope = Self::scope_for(destination).await?;
+        plan.root_metadata = root_metadata;
         Ok(plan)
     }
 
@@ -167,6 +171,7 @@ impl MigrationPlan {
             })
             .collect();
         Self {
+            root_metadata: false,
             filter_time_anchor: now_secs(),
             observation,
             scope: MetadataScope::default(),
@@ -179,8 +184,15 @@ impl MigrationPlan {
             filter_time_anchor_epoch = self.filter_time_anchor,
             latest_metadata_only = self.scope.latest_version_only,
             directory_object_metadata = self.scope.directory_object_output,
+            root_metadata = self.root_metadata,
+            root_source_stat_calls = usize::from(self.root_metadata),
             "Migration version metadata selection"
         );
+        if self.root_metadata {
+            tracing::info!(
+                "根目录在扫描前单独获取一次 stat 及本计划选中的原值；全部子项完成后回读目标身份并应用／校验根属性。删源还需前后持久性复核。此计费按角色调用描述，实际 RPC 取决于协议、ACL 和 xattr 大小，不按每个 entry 叠加"
+            );
+        }
         if !self.scope.directory_object_output {
             tracing::info!("已知非空尾斜杠对象省略输出元数据额外读取；过滤依赖仍按计划获取");
         }

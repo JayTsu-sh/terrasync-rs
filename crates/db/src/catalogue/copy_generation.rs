@@ -79,6 +79,7 @@ impl ClickHouseDatabase {
                 .as_ref()
                 .is_some_and(|prior| prior.phase != CopyGenerationPhase::Completed);
         lifecycle.copy_generation = Some(CopyGeneration {
+            root_snapshot: None,
             sequence,
             revision: 1,
             request: request.clone(),

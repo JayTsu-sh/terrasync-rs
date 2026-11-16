@@ -161,6 +161,10 @@ pub struct CopyGeneration {
     pub phase: CopyGenerationPhase,
     /// 准备完成后失败／取消也可复用已确认事实；仅 Accepted 不能证明准备完成。
     pub baseline_prepared: bool,
+    /// 扫描前捕获的根目录原值；数据库以独立二进制列保存，不挤占请求 JSON 的大小预算。
+    /// 根不是普通迁移 entry，也不作为端点删除候选；callback 不包含此原值。
+    #[serde(skip)]
+    pub root_snapshot: Option<Vec<u8>>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

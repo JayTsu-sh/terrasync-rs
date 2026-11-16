@@ -81,7 +81,9 @@ async fn preserve_case(config: &ClickHouseConfig) -> Result<()> {
     entries.push(Arc::new(observe_path(source.storage(), Path::new("folder")).await?));
     database.batch_insert_base_record(&entries).await?;
     database.commit_scan_generation().await?;
-    database.finish_copy_generation(CopyGenerationPhase::Completed).await?;
+    database
+        .finish_copy_generation(CopyGenerationPhase::Completed, None)
+        .await?;
     std::fs::remove_file(source_root.path().join("payload"))?;
     std::fs::remove_dir(source_root.path().join("folder"))?;
     let database = database.new_execution_scope();

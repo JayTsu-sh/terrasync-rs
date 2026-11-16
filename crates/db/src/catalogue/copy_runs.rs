@@ -1,8 +1,9 @@
 //! 独立于 base 的已接受代次；结构化请求、实际计划和准备状态使用同一份记录。
 use clickhouse::error::Error as ClickHouseError;
+use data_mover::model::{BackendIdentity, EntryKind, ObservedEntry};
 use serde::Deserialize;
 use serde_json::Value;
-use task_model::migration::{CopyGeneration, CopyGenerationPhase};
+use task_model::migration::{CopyGeneration, CopyGenerationPhase, CopyRequestDescriptor};
 use utils::sanitize_job_id;
 
 use super::{ClickHouseDatabase, layout::CatalogueEngine};
@@ -17,6 +18,7 @@ pub(super) struct CopyRunRow {
     pub execution_id: String,
     pub revision: u64,
     pub descriptor: String,
+    pub root_snapshot: String,
 }
 
 impl ClickHouseDatabase {
@@ -28,7 +30,7 @@ impl ClickHouseDatabase {
         let table = self.copy_runs_table();
         self.create_catalogue_table_identified(
             &table,
-            "sequence UInt64, execution_id String, revision UInt64, descriptor String",
+            "sequence UInt64, execution_id String, revision UInt64, descriptor String, root_snapshot String",
             "sequence",
             CatalogueEngine::ReplacingVersion("revision"),
             Some(&table),
@@ -46,7 +48,7 @@ impl ClickHouseDatabase {
         let row = match self
             .sync_client
             .query(&format!(
-                "SELECT sequence,execution_id,revision,descriptor FROM {table} FINAL ORDER BY sequence DESC LIMIT 1"
+                "SELECT sequence,execution_id,revision,descriptor,hex(root_snapshot) AS root_snapshot FROM {table} FINAL ORDER BY sequence DESC LIMIT 1"
             ))
             .fetch_quorum_one::<CopyRunRow>()
             .await
@@ -60,9 +62,15 @@ impl ClickHouseDatabase {
                 field: "descriptor_size",
             });
         }
-        let generation: CopyGeneration =
+        let mut generation: CopyGeneration =
             serde_json::from_str(&row.descriptor).map_err(|source| DatabaseError::CopyGenerationJson { source })?;
         generation.request.validate()?;
+        if !row.root_snapshot.is_empty() {
+            generation.root_snapshot = Some(
+                hex::decode(row.root_snapshot).map_err(|source| DatabaseError::CopyRootSnapshotEncoding { source })?,
+            );
+        }
+        validate_root_snapshot(&generation.request, generation.root_snapshot.as_deref())?;
         if row.sequence == 0
             || row.sequence != generation.sequence
             || row.execution_id != generation.request.execution_id
@@ -80,6 +88,7 @@ impl ClickHouseDatabase {
     }
 
     pub(super) async fn save_copy_generation(&self, generation: &CopyGeneration) -> Result<()> {
+        validate_root_snapshot(&generation.request, generation.root_snapshot.as_deref())?;
         let descriptor =
             serde_json::to_string(generation).map_err(|source| DatabaseError::CopyGenerationJson { source })?;
         if descriptor.len() > MAX_DESCRIPTOR_BYTES {
@@ -88,14 +97,18 @@ impl ClickHouseDatabase {
             });
         }
         let table = self.copy_runs_table();
+        // 二进制经 hex 绑定而非逐字节 JSON Value 数组，控制大 ACL/xattr 的临时内存。
         // 重试使用同一 sequence／execution_id／revision 和原文，不将超时解释成未执行。
         self.execute(
-            &format!("INSERT INTO {table} (sequence,execution_id,revision,descriptor) VALUES (?,?,?,?)"),
+            &format!(
+                "INSERT INTO {table} (sequence,execution_id,revision,descriptor,root_snapshot) VALUES (?,?,?,?,unhex(?))"
+            ),
             &[
                 Value::from(generation.sequence),
                 Value::from(generation.request.execution_id.clone()),
                 Value::from(generation.revision),
                 Value::from(descriptor),
+                Value::from(hex::encode(generation.root_snapshot.as_deref().unwrap_or_default())),
             ],
         )
         .await
@@ -103,7 +116,9 @@ impl ClickHouseDatabase {
 
     /// 调用方先收束 worker、目录收尾及源清理；删源代次结束后不保留增量 base。
     /// 清理只修改本代及更早的复制事实，新代和普通扫描的事实不能被延迟清理删除。
-    pub async fn finish_copy_generation(&self, phase: CopyGenerationPhase) -> Result<()> {
+    pub async fn finish_copy_generation(
+        &self, phase: CopyGenerationPhase, root_snapshot: Option<Vec<u8>>,
+    ) -> Result<()> {
         if !matches!(
             phase,
             CopyGenerationPhase::Completed | CopyGenerationPhase::Failed | CopyGenerationPhase::Cancelled
@@ -121,6 +136,7 @@ impl ClickHouseDatabase {
                 field: "uncommitted_completion",
             });
         }
+        validate_root_snapshot(&generation.request, root_snapshot.as_deref())?;
         drop(lifecycle);
         // 不能持有 state 等待在途 base 写入，否则会与读取代次身份的 writer 互锁。
         let mut base = if generation.request.source_cleanup.retains_source() {
@@ -144,7 +160,7 @@ impl ClickHouseDatabase {
         } else {
             phase
         };
-        let reporting = self.save_copy_terminal(terminal).await;
+        let reporting = self.save_copy_terminal(terminal, root_snapshot).await;
         match (cleanup, reporting) {
             (Ok(()), result) | (result, Ok(())) => result,
             (Err(cleanup), Err(reporting)) => Err(DatabaseError::CopyBaseRetirementReportingFailed {
@@ -154,13 +170,17 @@ impl ClickHouseDatabase {
         }
     }
 
-    async fn save_copy_terminal(&self, phase: CopyGenerationPhase) -> Result<()> {
+    async fn save_copy_terminal(&self, phase: CopyGenerationPhase, root_snapshot: Option<Vec<u8>>) -> Result<()> {
         let mut lifecycle = self.generation_lifecycle.lock().await;
         let generation = lifecycle
             .copy_generation
             .as_mut()
             .ok_or(DatabaseError::CopyExecutionUnavailable)?;
-        if generation.phase != phase {
+        validate_root_snapshot(&generation.request, root_snapshot.as_deref())?;
+        let root_changed = root_snapshot
+            .as_ref()
+            .is_some_and(|snapshot| generation.root_snapshot.as_ref() != Some(snapshot));
+        if generation.phase != phase || root_changed {
             generation.revision = generation
                 .revision
                 .checked_add(1)
@@ -168,6 +188,9 @@ impl ClickHouseDatabase {
                     field: "revision_overflow",
                 })?;
             generation.phase = phase;
+            if let Some(snapshot) = root_snapshot {
+                generation.root_snapshot = Some(snapshot);
+            }
         }
         self.save_copy_generation(generation).await
     }
@@ -223,4 +246,18 @@ impl ClickHouseDatabase {
             .clone()
             .ok_or(DatabaseError::CopyExecutionUnavailable)
     }
+}
+
+/// 根原值沿用普通 entry 的原生编码及后端绑定，不能把任意文件／历史写成根事实。
+fn validate_root_snapshot(request: &CopyRequestDescriptor, snapshot: Option<&[u8]>) -> Result<()> {
+    let Some(snapshot) = snapshot else {
+        return Ok(());
+    };
+    let binding = &request.binding.source;
+    let backend = BackendIdentity::new(binding.backend_kind.parse()?, binding.namespace.clone())?;
+    let entry = ObservedEntry::decode_snapshot(snapshot, &backend)?;
+    if !entry.path().as_str().is_empty() || entry.kind() != EntryKind::Directory || entry.history().is_some() {
+        return Err(DatabaseError::CopyGenerationInvalid { field: "root_snapshot" });
+    }
+    Ok(())
 }
