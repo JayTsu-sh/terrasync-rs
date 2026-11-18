@@ -751,7 +751,7 @@ def run_request_policy(environment):
     environment["LAB_REQUEST_POLICY_CALLBACK_URL"] = f"http://127.0.0.1:{callback.server_port}/progress"
     try:
         subprocess.run([
-            "cargo", "test", "--offline", "--locked", "-p", "app", "--lib",
+            "cargo", "test", "--offline", "--locked", "-p", "app", "--features", "remote", "--lib",
             "real_copy_requests_freeze_cleanup_and_report_preflight_rejections",
             "--", "--ignored", "--nocapture",
         ], cwd=ROOT, env=environment, check=True)
