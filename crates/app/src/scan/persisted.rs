@@ -459,18 +459,18 @@ mod tests {
 
 /// 清理一个扫描作业的数据；表布局及其他作业隔离由数据库层负责。
 pub async fn clear_scan(job_id: &str) -> Result<()> {
-    let config = AppConfig::fetch()?;
-    if !config.database.enabled {
+    let config = AppConfig::fetch_database()?;
+    if !config.enabled {
         return Err(AppError::ConfigError("ClickHouse is not enabled".into()));
     }
-    let store = ScanStore::new(&config.database.clickhouse, job_id)?;
+    let store = ScanStore::new(&config.clickhouse, job_id)?;
     store.clear_job().await?;
     Ok(())
 }
 
 /// 根据持久化轮次识别执行类型，不能用作业目录是否存在来区分全量续扫和增量。
 pub async fn scan_execution_is_incremental(job_id: &str) -> Result<bool> {
-    let config = AppConfig::fetch()?;
-    let store = ScanStore::new(&config.database.clickhouse, job_id)?;
+    let config = AppConfig::fetch_database()?;
+    let store = ScanStore::new(&config.clickhouse, job_id)?;
     Ok(store.resume_execution_is_incremental().await?)
 }
