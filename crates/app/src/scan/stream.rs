@@ -4,20 +4,19 @@ use crate::broadcast::BroadcastForwarder;
 use crate::error::StorageError;
 #[cfg(test)]
 use crate::scan::source::WalkDirAsyncIterator;
-use crate::scan::source::{ResumableScan, ResumableScanItem, ScanSourceMode, WalkOptions};
+use crate::scan::source::{ResumableScan, ResumableScanItem, ScanSourceMode};
 use crate::{
     config::{JobType, initialize_consumer_config},
     consumer::{ConsumerManager, TaskStatistics},
     error::{AppError, Result},
-    scan::{ScanRequest, cancellation::ScanCancellation, progress::ScanProgress},
+    scan::{ScanRequest, cancellation::ScanCancellation, progress::ScanProgress, walk_options},
     storage_factory::{StorageRole, create_storage_for_role},
 };
-use data_mover::filter::parse_filter_expression;
 use data_mover::{
     model::ObservedEntry,
     traversal::{TraversalOrder, TraversalOutcome},
 };
-use std::{num::NonZeroUsize, sync::Arc, time::Duration};
+use std::{sync::Arc, time::Duration};
 #[cfg(test)]
 use task_model::StorageEntryMessage;
 #[cfg(test)]
@@ -30,16 +29,12 @@ pub(super) async fn run(request: ScanRequest<'_>, config: AppConfig) -> Result<(
     let storage = cancel
         .interrupt(create_storage_for_role(request.path, None, false, StorageRole::Source))
         .await??;
-    let options = WalkOptions {
-        depth: NonZeroUsize::new(request.depth as usize).map(NonZeroUsize::get),
-        match_expressions: request.include.as_deref().map(parse_filter_expression).transpose()?,
-        exclude_expressions: request.exclude.as_deref().map(parse_filter_expression).transpose()?,
-        concurrency: config.scan.concurrency,
-        include_tags: config.scan.include_tags,
-        operation_timeout: Some(Duration::from_secs(config.scan.operation_timeout_secs)),
-        recovery_window: Some(Duration::from_secs(config.scan.recovery_window_secs)),
-        ..Default::default()
-    };
+    let options = walk_options(
+        request.depth,
+        request.include.as_deref(),
+        request.exclude.as_deref(),
+        &config.scan,
+    )?;
     let order = streaming_order();
     let mut source = storage.scan_source(&options, ScanSourceMode::Streaming { order }, cancel.token().clone())?;
     let failure = source.failure_signal();

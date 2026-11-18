@@ -5,8 +5,7 @@ use utils::app_config::AppConfig;
 
 use app::callback::CallbackEndpoint;
 use app::error::AppError;
-use app::scan::{ScanRequest, scan};
-use app::scan_resume::{clear_scan, scan_execution_is_incremental};
+use app::scan::{ScanRequest, clear_scan, scan, scan_execution_is_incremental};
 use dashmap::{DashMap, mapref::entry::Entry};
 use std::time::Duration;
 use tokio::select;

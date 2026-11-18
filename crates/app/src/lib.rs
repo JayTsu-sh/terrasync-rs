@@ -59,7 +59,6 @@ mod migration_plan;
 /// SyncOrchestrator 封装全量与增量迁移流程
 mod orchestrator;
 mod rename;
-pub mod scan_resume;
 mod source_cleanup;
 mod sync_catalog;
 mod target_absence;

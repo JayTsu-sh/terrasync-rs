@@ -2,18 +2,17 @@
 use crate::job_execution::JobLease;
 use std::{
     mem::take,
-    num::NonZeroUsize,
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use crate::scan::source::{ScanSourceMode, WalkOptions};
-use crate::scan::{
+use super::source::{ScanSourceMode, WalkOptions};
+use super::{
     ScanRequest,
     cancellation::{self, ScanCancellation},
+    walk_options,
 };
 use crate::storage_factory::{StorageContext, canonicalize_path};
-use data_mover::filter::parse_filter_expression;
 use data_mover::model::ObservedEntry;
 use data_mover::traversal::{Resumable, TraversalOrder};
 use db::scan::ScanResumeStatistics;
@@ -35,7 +34,7 @@ mod input;
 mod pipeline;
 mod workers;
 
-pub(crate) async fn run_persisted(request: ScanRequest<'_>, config: AppConfig) -> Result<()> {
+pub(super) async fn run_persisted(request: ScanRequest<'_>, config: AppConfig) -> Result<()> {
     let ScanRequest {
         job_id,
         job_dir,
@@ -63,16 +62,7 @@ pub(crate) async fn run_persisted(request: ScanRequest<'_>, config: AppConfig) -
         _=cancel.cancelled()=>return Err(AppError::ObservationScanCancelled),
         storage=create_storage_for_role(&source, None, false, StorageRole::Source)=>storage?,
     };
-    let options = WalkOptions {
-        operation_timeout: Some(Duration::from_secs(config.scan.operation_timeout_secs)),
-        recovery_window: Some(Duration::from_secs(config.scan.recovery_window_secs)),
-        depth: NonZeroUsize::new(depth as usize).map(NonZeroUsize::get),
-        match_expressions: include.as_deref().map(parse_filter_expression).transpose()?,
-        exclude_expressions: exclude.as_deref().map(parse_filter_expression).transpose()?,
-        concurrency: config.scan.concurrency,
-        include_tags: config.scan.include_tags,
-        ..Default::default()
-    };
+    let options = walk_options(depth, include.as_deref(), exclude.as_deref(), &config.scan)?;
     // 只持久化源身份和有效扫描选项的摘要，不保存凭据。
     let identity = storage.storage().identity();
     let request_key = request_key(
