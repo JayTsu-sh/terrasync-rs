@@ -19,7 +19,9 @@ use remote_sender_session::{classification_to_stats_message, entry_error_stats_m
 #[cfg(test)]
 use task_model::TransferMode;
 
+use std::fs;
 use std::net::SocketAddr;
+use std::path::Path;
 use std::sync::Arc;
 #[cfg(test)]
 use std::sync::{Mutex, PoisonError};
@@ -32,133 +34,220 @@ use crate::storage_factory::{StorageRole, create_storage_for_role};
 use data_mover::filter::parse_filter_expression;
 #[cfg(test)]
 use data_mover::model::ObservedEntry;
+use data_mover::redact_storage_url;
+use data_mover::time_util::now_secs;
+use db::ClickHouseDatabase;
 use rustls::pki_types::CertificateDer;
 #[cfg(test)]
-use task_model::{ChangeKind, ErrorEvent, StorageEntryMessage};
+use task_model::ChangeKind;
+use task_model::{ErrorEvent, StorageEntryMessage};
 use tokio::sync::Mutex as AsyncMutex;
 use tracing::{info, warn};
 use transport::error::TransportError;
 #[cfg(test)]
-use transport::message::DestIndex;
-#[cfg(test)]
 use transport::message::TransferDecision;
 use transport::message::{HandshakeResult, ProtocolHandshake, ReceiverMsg, SenderMsg, SessionConfig};
+use transport::quic;
 use transport::traits::SenderTransport;
 use utils::app_config::AppConfig;
 use utils::logger;
 
-use crate::config::{JobType, SyncJobConfig};
+use crate::config::{JobType, SyncJobConfig, redact_command_line};
+use crate::consumer::stats::callback_state::CallbackState;
 use crate::consumer::stats::{IncrementalStats, ProgressBar, StatisticConsumer, StatsKind};
 use crate::error::{AppError, Result};
 use crate::orchestrator::create_qos_manager;
+use crate::remote_receiver_session::receive;
 #[cfg(test)]
-use crate::remote_receiver_session::RemoteSessionState;
+use crate::remote_receiver_session::{DestIndex, RemoteSessionState};
 use crate::sync::parse_size;
 
-/// 双进程全量同步 — Sender 侧入口
+/// 监听一个 Sender 连接。写出证书并在成功发送终态后等待连接关闭。
+pub async fn serve(listen_addr: SocketAddr, dest_path: &str, tls_cert_out: &Path, token: Option<&str>) -> Result<()> {
+    let dest_storage = Arc::new(create_storage_for_role(dest_path, None, true, StorageRole::Destination).await?);
+    info!("Created destination storage for: {}", redact_storage_url(dest_path));
+
+    let (endpoint, cert_der) = quic::bind(listen_addr)?;
+
+    // Sender 连接前需读取证书，因此必须在 accept 前写出。
+    if let Err(e) = fs::write(tls_cert_out, &cert_der) {
+        warn!(
+            "无法写入 TLS 证书到 '{}': {}。Sender 侧将无法验证服务端身份。",
+            tls_cert_out.display(),
+            e
+        );
+    } else {
+        info!(
+            "Server TLS cert written to '{}'. Pass this to Sender: --tls-server-cert {}",
+            tls_cert_out.display(),
+            tls_cert_out.display()
+        );
+    }
+
+    let receiver_transport = quic::accept_connection(&endpoint).await?;
+    info!("Accepted QUIC connection");
+    receive(&receiver_transport, dest_storage, token).await?;
+
+    // 等待 Sender 收到 AllDone 并关闭连接，避免退出时丢掉仍在发送队列里的终态。
+    endpoint.wait_idle().await;
+
+    info!("Receiver daemon completed");
+    Ok(())
+}
+
+/// 双进程全量同步，连接远端 Receiver。
 ///
 /// 依次执行：QUIC 连接 → 握手协商 → Token 鉴权 → `SessionConfig`；随后文件列表发送与
 /// 请求处理+Ack 收集并发运行（见模块文档）。
-pub(crate) async fn run(
+pub async fn send(
     config: &SyncJobConfig, remote_addr: &str, tls_cert_bytes: Option<&[u8]>, auth_token: Option<&str>,
 ) -> Result<()> {
-    info!("[Sender Remote] Connecting to Receiver at {}", remote_addr);
-
-    // ── 1. 连接 QUIC ──
-    let addr: SocketAddr = remote_addr
-        .parse()
-        .map_err(|e| AppError::CopyError(format!("Invalid remote address '{remote_addr}': {e}")))?;
-    let server_cert = tls_cert_bytes.map(|b| CertificateDer::from(b.to_vec()));
-    let transport = transport::quic::connect(addr, "localhost", server_cert).await?;
-    info!("[Sender Remote] Connected");
-
-    // ── 2. 握手：协商协议版本与能力，不兼容则在发送任何 FilePage/CopyEntry 前中止 ──
-    let copy_tags = negotiate_handshake(&transport).await?;
-
-    // ── 2.5 Token 鉴权：握手通过后、SessionConfig 之前，鉴权失败则中止连接 ──
-    send_and_check_auth(&transport, auth_token).await?;
-
-    // ── 3. 发送 SessionConfig ──
-    transport
-        .send(SenderMsg::SessionConfig(SessionConfig {
-            transfer_mode: config.transfer_mode,
-            src_path: config.src_path.clone(),
-            qos: config.qos.clone(),
-            peak_qos_rate: config.peak_qos_rate,
-            iops: config.iops,
-            enable_integrity_check: config.enable_integrity_check,
-            enable_acl: config.enable_acl,
-            is_source_reserved: true,
-            block_size: config.block_size.clone(),
-            delete_target: config.delete_target,
-            delta_size_threshold: config.delta_size_threshold.clone(),
-        }))
-        .await?;
-
-    // ── 3.5 结构化统计报表（Sender 侧，复用本地 StatisticConsumer/IncrementalStats——
+    let app_config = AppConfig::fetch()?;
+    let notification_database = app_config
+        .database
+        .enabled
+        .then(|| ClickHouseDatabase::new(&app_config.database.clickhouse, &config.job_id))
+        .transpose()?;
+    // raw 命令行已经丢失 argv 边界；按实际鉴权值脱敏，包含空格的 token 也不会残留。
+    let command = match auth_token.filter(|token| !token.is_empty()) {
+        Some(token) => config.raw_command_line.replace(token, "***"),
+        None => config.raw_command_line.clone(),
+    };
+    // 先建立通知生命周期，连接、握手、鉴权及准入错误也进入最终报告。
+    // 结构化统计报表（Sender 侧，复用本地 StatisticConsumer/IncrementalStats——
     //    双进程远端不分 full/incremental，报表形状本身就是 delta 语义，与 orchestrator
     //    的 ScanType 路由无关，统一用 JobType::IncrementalCopy）──
     let stats_consumer = Arc::new(AsyncMutex::new(StatisticConsumer {
         stats: StatsKind::Incremental(IncrementalStats::new(
             JobType::IncrementalCopy,
             config.job_id.clone(),
-            config.raw_command_line.clone(),
+            redact_command_line(&command),
             logger::get_current_app_log_path(),
         )),
         progress_bar: ProgressBar::new(JobType::IncrementalCopy),
         job_dir: config.job_dir.clone(),
         callback_url: config.progress_callback_url.clone(),
         generation_committed: None,
+        migration: None,
         pb_handle: None,
         scan_snapshot: None,
-        callback: Default::default(),
+        callback: CallbackState::with_database(notification_database.clone()),
     }));
     let callback_guard = StatisticConsumer::begin(stats_consumer.clone()).await;
 
-    // ── 4. 创建源端 storage + directory_pages ──
-    let block_size = match &config.block_size {
-        Some(s) => Some(parse_size(s)?),
-        None => None,
-    };
-    let src_storage = Arc::new(
-        create_storage_for_role(
-            &config.src_path,
-            block_size.map(|s| s as u64),
-            false,
-            StorageRole::Source,
-        )
-        .await?,
-    );
-    let match_expr = config.r#match.as_deref().and_then(|e| parse_filter_expression(e).ok());
-    let exclude_expr = config.exclude.as_deref().and_then(|e| parse_filter_expression(e).ok());
-    let app_config = AppConfig::fetch()?;
-    let walkdir_iter = directory_pages(
-        &src_storage,
-        WalkOptions {
-            match_expressions: match_expr,
-            exclude_expressions: exclude_expr,
-            concurrency: app_config.scan.concurrency,
-            include_tags: app_config.scan.include_tags || copy_tags,
-            ..Default::default()
-        },
-    )?;
-
-    // ── 5. QoS 管理器；checkpoint lifecycle 由 negotiated session 持有 ──
     let qos_manager = create_qos_manager(config.qos.as_ref(), config.peak_qos_rate, config.iops);
-    let checkpoint_path = std::path::PathBuf::from(&config.job_dir).join("remote_checkpoint.json");
+    let filter_time_anchor = now_secs();
+    info!(
+        filter_time_anchor_epoch = filter_time_anchor,
+        "Remote migration filter time selected"
+    );
+    let mut connection = None;
+    let result = async {
+        if !config.source_cleanup.retains_source() {
+            return Err(AppError::RemoteSourceCleanupUnavailable);
+        }
+        if config.packaged {
+            return Err(AppError::ConfigError("双进程模式不支持打包迁移".into()));
+        }
+        if let Some(database) = &notification_database {
+            database.ping().await?;
+        }
+        info!("[Sender Remote] Connecting to Receiver at {}", remote_addr);
 
-    // ── 6+7+8. 文件列表发送 与 请求处理+Ack收集 并发运行（流水线，无阶段 barrier） ──
-    let summary = RemoteSenderSession::new(RemoteSenderSessionDeps {
-        transport: &transport,
-        src_storage: &src_storage,
-        walkdir_iter: &walkdir_iter,
-        qos: qos_manager.as_ref(),
-        enable_acl: config.enable_acl,
-        checkpoint_path: &checkpoint_path,
-        stats_consumer: &stats_consumer,
-    })
-    .run()
-    .await?;
+        // ── 1. 连接 QUIC ──
+        let addr: SocketAddr = remote_addr
+            .parse()
+            .map_err(|e| AppError::CopyError(format!("Invalid remote address '{remote_addr}': {e}")))?;
+        let server_cert = tls_cert_bytes.map(|b| CertificateDer::from(b.to_vec()));
+        let transport = &*connection.insert(transport::quic::connect(addr, "localhost", server_cert).await?);
+        info!("[Sender Remote] Connected");
+
+        // ── 2. 握手：协商协议版本与能力，不兼容则在发送任何 FilePage/CopyEntry 前中止 ──
+        let copy_tags = negotiate_handshake(transport).await?;
+
+        // ── 2.5 Token 鉴权：握手通过后、SessionConfig 之前，鉴权失败则中止连接 ──
+        send_and_check_auth(transport, auth_token).await?;
+
+        // ── 3. 发送 SessionConfig ──
+        transport
+            .send(SenderMsg::SessionConfig(SessionConfig {
+                transfer_mode: config.transfer_mode,
+                src_path: config.src_path.clone(),
+                qos: config.qos.clone(),
+                peak_qos_rate: config.peak_qos_rate,
+                iops: config.iops,
+                enable_integrity_check: config.enable_integrity_check,
+                enable_acl: config.enable_acl,
+                is_source_reserved: config.source_cleanup.retains_source(),
+                block_size: config.block_size.clone(),
+                delete_target: config.delete_target,
+                delta_size_threshold: config.delta_size_threshold.clone(),
+            }))
+            .await?;
+
+        // ── 4. 创建源端 storage + directory_pages ──
+        let block_size = match &config.block_size {
+            Some(s) => Some(parse_size(s)?),
+            None => None,
+        };
+        let src_storage = Arc::new(
+            create_storage_for_role(
+                &config.src_path,
+                block_size.map(|s| s as u64),
+                false,
+                StorageRole::Source,
+            )
+            .await?,
+        );
+        let match_expr = config.r#match.as_deref().map(parse_filter_expression).transpose()?;
+        let exclude_expr = config.exclude.as_deref().map(parse_filter_expression).transpose()?;
+        let walkdir_iter = directory_pages(
+            &src_storage,
+            WalkOptions {
+                filter_time_anchor: Some(filter_time_anchor),
+                match_expressions: match_expr,
+                exclude_expressions: exclude_expr,
+                concurrency: app_config.scan.concurrency,
+                include_tags: app_config.scan.include_tags || copy_tags,
+                ..Default::default()
+            },
+        )?;
+
+        // ── 5. QoS 管理器；checkpoint lifecycle 由 negotiated session 持有 ──
+        let checkpoint_path = std::path::PathBuf::from(&config.job_dir).join("remote_checkpoint.json");
+
+        // ── 6+7+8. 文件列表发送 与 请求处理+Ack收集 并发运行（流水线，无阶段 barrier） ──
+        RemoteSenderSession::new(RemoteSenderSessionDeps {
+            transport,
+            src_storage: &src_storage,
+            walkdir_iter: &walkdir_iter,
+            qos: qos_manager.as_ref(),
+            enable_acl: config.enable_acl,
+            checkpoint_path: &checkpoint_path,
+            stats_consumer: &stats_consumer,
+        })
+        .run()
+        .await
+    }
+    .await;
+    if let Some(ref qos) = qos_manager {
+        qos.shutdown();
+    }
+    let close = match connection {
+        Some(transport) => transport.close().await,
+        None => Ok(()),
+    };
+    if let Err(error) = &result
+        && !matches!(error, AppError::DiagnosticJournalStopped { .. })
+    {
+        record_remote_task_failure(&stats_consumer, error.to_string()).await;
+    }
+    if let Err(error) = &close {
+        record_remote_task_failure(&stats_consumer, error.to_string()).await;
+    }
+    StatisticConsumer::end_with_database(stats_consumer, callback_guard, notification_database.as_ref(), false).await;
+    let summary = result?;
+    close?;
     info!(
         "[Sender Remote] File list sent: {} pages, {} entries",
         summary.page_count, summary.advertised_entries
@@ -168,15 +257,21 @@ pub(crate) async fn run(
         "[Sender Remote] Complete: {} success, {} errors",
         summary.success_count, summary.error_count
     );
-
-    // ── 9. 资源清理 ──
-    if let Some(ref qos) = qos_manager {
-        qos.shutdown();
-    }
-    transport.close().await?;
-    // 结束统计报表生命周期：abort 回调循环 → 发最终回调(is_final=true) → 打印终态报表
-    StatisticConsumer::end(stats_consumer, callback_guard).await;
     finalize_run_result(summary.error_count)
+}
+
+async fn record_remote_task_failure(consumer: &Arc<AsyncMutex<StatisticConsumer>>, reason: String) {
+    let mut state = consumer.lock().await;
+    state.callback.task_error_count = state.callback.task_error_count.saturating_add(1);
+    drop(state);
+    let message = StorageEntryMessage::Diagnostic {
+        event: ErrorEvent::Copy,
+        path: Default::default(),
+        reason,
+    };
+    if let Err(error) = StatisticConsumer::record_message(consumer, &message).await {
+        warn!(%error, "Remote task diagnostic could not be retained");
+    }
 }
 
 /// 双进程模式下 entry 级失败（部分或全部）不再影响进程退出码——与单进程语义对齐，
@@ -251,6 +346,7 @@ async fn send_and_check_auth(transport: &(dyn SenderTransport + 'static), auth_t
 #[cfg(test)]
 #[allow(clippy::expect_used, clippy::unwrap_used)]
 mod tests {
+    use crate::callback::CallbackEndpoint;
     use std::collections::HashMap;
     use std::fs;
     use std::fs::File;
@@ -281,8 +377,7 @@ mod tests {
         };
         create_storage_for_role(path, block_size, ensure_dir, role).await
     }
-    use crate::consumer::stats::{JobSummary, ProgressDetail, ProgressReport};
-    use crate::receiver::receiver_task_remote;
+    use crate::report::{JobSummary, ProgressDetail, ProgressReport};
 
     /// 构造测试用 `Arc<AsyncMutex<StatisticConsumer>>`：不设 `callback_url`（不起 HTTP
     /// 回调循环），不调用 `begin()`/`end()`（这些测试只关心 `send_file_list_phase`/
@@ -299,6 +394,7 @@ mod tests {
             job_dir: String::new(),
             callback_url: None,
             generation_committed: None,
+            migration: None,
             pb_handle: None,
             scan_snapshot: None,
             callback: Default::default(),
@@ -360,15 +456,14 @@ mod tests {
         let (sender_transport, receiver_transport) = create_in_process_pair();
 
         // Receiver 侧：调用公开入口，与生产环境走同一条代码路径
-        let receiver_handle =
-            tokio::spawn(async move { receiver_task_remote(&receiver_transport, dest_storage, None).await });
+        let receiver_handle = tokio::spawn(async move { receive(&receiver_transport, dest_storage, None).await });
 
         // Sender 侧：握手 + 鉴权 + SessionConfig（顺序不变），随后文件列表与请求/ack 并发
         negotiate_handshake(&sender_transport).await.unwrap();
         send_and_check_auth(&sender_transport, None).await.unwrap();
         sender_transport
             .send(SenderMsg::SessionConfig(SessionConfig {
-                transfer_mode: TransferMode::Atomic,
+                transfer_mode: TransferMode::Direct,
                 src_path: src_dir.path().to_string_lossy().to_string(),
                 qos: None,
                 peak_qos_rate: 1.0,
@@ -663,7 +758,7 @@ mod tests {
         }
     }
 
-    /// 起 Receiver（`receiver_task_remote`）+ 跑 Sender 侧握手/鉴权/`SessionConfig` +
+    /// 起 Receiver（`receive`）+ 跑 Sender 侧握手/鉴权/`SessionConfig` +
     /// 文件列表与请求/ack 并发处理，返回 `(success_count, error_count)`。
     /// `sender_transport` 可传入包装过的 transport（如 `HashMismatchInjector`），
     /// 复用生产代码路径验证 redo 状态机。
@@ -681,14 +776,13 @@ mod tests {
         )
         .unwrap();
 
-        let receiver_handle =
-            tokio::spawn(async move { receiver_task_remote(&receiver_transport, dest_storage, None).await });
+        let receiver_handle = tokio::spawn(async move { receive(&receiver_transport, dest_storage, None).await });
 
         negotiate_handshake(sender_transport).await.unwrap();
         send_and_check_auth(sender_transport, None).await.unwrap();
         sender_transport
             .send(SenderMsg::SessionConfig(SessionConfig {
-                transfer_mode: TransferMode::Atomic,
+                transfer_mode: TransferMode::Direct,
                 src_path: src_dir.to_string_lossy().to_string(),
                 qos: None,
                 peak_qos_rate: 1.0,
@@ -746,14 +840,13 @@ mod tests {
         )
         .unwrap();
 
-        let receiver_handle =
-            tokio::spawn(async move { receiver_task_remote(&receiver_transport, dest_storage, None).await });
+        let receiver_handle = tokio::spawn(async move { receive(&receiver_transport, dest_storage, None).await });
 
         negotiate_handshake(sender_transport).await.unwrap();
         send_and_check_auth(sender_transport, None).await.unwrap();
         sender_transport
             .send(SenderMsg::SessionConfig(SessionConfig {
-                transfer_mode: TransferMode::Atomic,
+                transfer_mode: TransferMode::Direct,
                 src_path: src_dir.to_string_lossy().to_string(),
                 qos: None,
                 peak_qos_rate: 1.0,
@@ -1551,12 +1644,12 @@ mod tests {
 
     // ============================================================
     // Receiver 分类信号正确性（issue #23 测试计划 2）：双端真实 StorageContext +
-    // receiver_task_remote，验证 New/Changed(含 MetadataOnly)/Skip/Deleted 五类判定
+    // receive，验证 New/Changed(含 MetadataOnly)/Skip/Deleted 五类判定
     // 各自产生正确的 wire 信号，且执行动作（是否传输/是否本地改元数据/是否删除）与
     // 判定一致。
     // ============================================================
 
-    /// 起 `receiver_task_remote` 并完成握手（`delta_enabled=false` 时构造 delta:false
+    /// 起 `receive` 并完成握手（`delta_enabled=false` 时构造 delta:false
     /// 的本端能力集触发降级协商，走 `TransferRequest{decision:DeltaTransfer}` 而非
     /// `DeltaTransferRequest`）+ 鉴权 + `SessionConfig`，返回
     /// `(sender_transport, receiver_handle)`。`delta_size_threshold` 恒为 `None`
@@ -1575,8 +1668,7 @@ mod tests {
         delta_size_threshold: Option<String>,
     ) -> (InProcessSenderTransport, JoinHandle<Result<()>>) {
         let (sender_transport, receiver_transport) = create_in_process_pair();
-        let receiver_handle =
-            tokio::spawn(async move { receiver_task_remote(&receiver_transport, dest_storage, None).await });
+        let receiver_handle = tokio::spawn(async move { receive(&receiver_transport, dest_storage, None).await });
 
         if delta_enabled {
             negotiate_handshake(&sender_transport).await.unwrap();
@@ -1600,7 +1692,7 @@ mod tests {
         send_and_check_auth(&sender_transport, None).await.unwrap();
         sender_transport
             .send(SenderMsg::SessionConfig(SessionConfig {
-                transfer_mode: TransferMode::Atomic,
+                transfer_mode: TransferMode::Direct,
                 src_path: String::new(),
                 qos: None,
                 peak_qos_rate: 1.0,
@@ -1660,7 +1752,7 @@ mod tests {
             .unwrap();
     }
 
-    /// 跳过间歇性到达的 `Progress` 快照：`receiver_task_remote` 内 `progress_reporter`
+    /// 跳过间歇性到达的 `Progress` 快照：`receive` 内 `progress_reporter`
     /// 每 5s 上报一次，`tokio::time::interval` 首个 tick 立即触发（tokio 默认行为），
     /// 可能与本测试关心的分类信号交错到达，与断言无关，跳过后返回下一条非 `Progress`
     /// 消息（真正非预期的消息仍会被调用方的 `other => panic!` 分支捕获，不会被此函数
@@ -2086,7 +2178,8 @@ mod tests {
                 &mut dest_index,
                 true,
             )
-            .await;
+            .await
+            .unwrap();
 
         match recv_skip_progress(&sender_transport).await {
             Some(ReceiverMsg::EntryError { entry, reason }) => {
@@ -2336,13 +2429,13 @@ mod tests {
         (format!("http://{addr}"), bodies)
     }
 
-    /// callback payload 结构 + 频率：`StatisticConsumer` 按 `remote_sync::run()` 的同一套
+    /// callback payload 结构 + 频率：`StatisticConsumer` 按 `remote_sync::send()` 的同一套
     /// 构造方式（`JobType::IncrementalCopy`）跑一轮 begin → 喂消息 → 等待跨过一个周期
     /// 回调间隔 → end，断言周期性(非 final) + 恰好一次 final 回调都送达，payload 结构为
     /// `ProgressReport`/`ProgressDetail::Incremental`/`FinalStats`（与本地 `IncrementalCopy`
     /// 任务完全同构——同一 Rust 类型，天然保证）。
     ///
-    /// 不经真实 QUIC/`remote_sync::run()`：callback 机制完全活在 `StatisticConsumer` 内部，
+    /// 不经真实 QUIC/`remote_sync::send()`：callback 机制完全活在 `StatisticConsumer` 内部，
     /// 与 transport 无关；`run()` 到这里的唯一接线是一行
     /// `callback_url: config.progress_callback_url.clone()`（类型检查即可保证正确），
     /// 双进程整条链路已由 `tests/remote_process_e2e.rs` + 本文件的分类信号测试覆盖，
@@ -2360,8 +2453,9 @@ mod tests {
             )),
             progress_bar: ProgressBar::new(JobType::IncrementalCopy),
             job_dir: String::new(),
-            callback_url: Some(callback_url),
+            callback_url: Some(CallbackEndpoint::parse(&callback_url).unwrap()),
             generation_committed: None,
+            migration: None,
             pb_handle: None,
             scan_snapshot: None,
             callback: Default::default(),

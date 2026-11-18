@@ -164,6 +164,10 @@ async function onSubmit() {
             <NInput v-model:value="form.block_size" placeholder="自适应" />
           </NFormItem>
 
+          <NFormItem v-if="form.task_type === 'sync'" label="文件断点续传">
+            <NCheckbox v-model:checked="form.copy_resume">保留有效的文件传输进度</NCheckbox>
+          </NFormItem>
+
           <NFormItem v-if="showAdvanced" label="完整性检查">
             <NCheckbox v-model:checked="form.enable_integrity_check" />
           </NFormItem>

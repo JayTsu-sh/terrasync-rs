@@ -188,119 +188,89 @@ fn test_current_state_propagation() {
 
 #[test]
 fn test_classify_single_fh_is_deleted() {
-    let fh_records = vec![make_record("a.txt", Some("abc"), 100)];
-    let mut groups = HashMap::new();
-    groups.insert(
-        make_record("_", Some("abc"), 0).file_handle.unwrap(),
-        vec![make_record("a.txt", Some("abc"), 100)],
-    );
-
-    let result = classify_deletion_status(vec![], fh_records, &groups).unwrap();
-    assert_eq!(result.len(), 1);
-    assert!(matches!(result[0], DeletionStatus::Deleted(_)));
+    let old = vec![make_record("a.txt", Some("abc"), 100)];
+    let result = classify_deletion_status(vec![], old, &HashMap::new()).unwrap();
+    assert!(matches!(result.as_slice(), [DeletionStatus::Deleted(_)]));
 }
 
 #[test]
 fn test_classify_two_fh_is_renamed() {
-    let fh_records = vec![make_record("old.txt", Some("abc"), 100)];
-    let mut groups = HashMap::new();
-    groups.insert(
-        make_record("_", Some("abc"), 0).file_handle.unwrap(),
-        vec![
-            make_record("old.txt", Some("abc"), 100),
-            make_record("new.txt", Some("abc"), 200),
-        ],
-    );
-
-    let result = classify_deletion_status(vec![], fh_records, &groups).unwrap();
-    assert_eq!(result.len(), 1);
-    match &result[0] {
-        DeletionStatus::Renamed(from, to) => {
-            assert_eq!(from.get_ctime(), 100);
-            assert_eq!(to.get_ctime(), 200);
-        }
-        DeletionStatus::Deleted(_) => panic!("Expected Renamed"),
-    }
+    let old = vec![make_record("old.txt", Some("abc"), 100)];
+    let key = old[0].file_handle.clone().unwrap();
+    let groups = HashMap::from([(key, vec![make_record("new.txt", Some("abc"), 200)])]);
+    let result = classify_deletion_status(vec![], old, &groups).unwrap();
+    assert!(matches!(result.as_slice(), [DeletionStatus::Renamed(from, to)]
+        if from.get_relative_path().to_str()==Some("old.txt") && to.get_relative_path().to_str()==Some("new.txt")));
 }
 
 #[test]
-fn test_classify_renamed_reverses_ctime_order() {
-    let fh_records = vec![make_record("old.txt", Some("abc"), 200)];
-    let mut groups = HashMap::new();
-    groups.insert(
-        make_record("_", Some("abc"), 0).file_handle.unwrap(),
-        vec![
-            make_record("new.txt", Some("abc"), 200),
-            make_record("old.txt", Some("abc"), 100),
-        ],
-    );
-
-    let result = classify_deletion_status(vec![], fh_records, &groups).unwrap();
-    assert_eq!(result.len(), 1);
-    match &result[0] {
-        DeletionStatus::Renamed(from, to) => {
-            // ctime 小的是 from，大的是 to，与 groups 中顺序无关
-            assert_eq!(from.get_ctime(), 100);
-            assert_eq!(to.get_ctime(), 200);
-        }
-        DeletionStatus::Deleted(_) => panic!("Expected Renamed"),
-    }
+fn test_classify_renamed_does_not_use_ctime_order() {
+    let old = vec![make_record("old.txt", Some("abc"), 200)];
+    let key = old[0].file_handle.clone().unwrap();
+    let groups = HashMap::from([(key, vec![make_record("new.txt", Some("abc"), 100)])]);
+    let result = classify_deletion_status(vec![], old, &groups).unwrap();
+    assert!(matches!(result.as_slice(), [DeletionStatus::Renamed(from, to)]
+        if from.get_ctime()==200 && to.get_ctime()==100));
 }
 
 #[test]
-fn test_classify_fh_not_in_groups() {
-    let fh_records = vec![make_record("x.txt", Some("xyz"), 100)];
-    let groups = HashMap::new(); // 空 groups
-
-    let result = classify_deletion_status(vec![], fh_records, &groups).unwrap();
-    assert_eq!(result.len(), 1);
-    assert!(matches!(result[0], DeletionStatus::Deleted(_)));
+fn test_classify_empty_current_group_is_deleted() {
+    let old = vec![make_record("old.txt", Some("abc"), 100)];
+    let key = old[0].file_handle.clone().unwrap();
+    let groups = HashMap::from([(key, vec![])]);
+    let result = classify_deletion_status(vec![], old, &groups).unwrap();
+    assert!(matches!(result.as_slice(), [DeletionStatus::Deleted(_)]));
 }
 
 #[test]
 fn test_classify_mixed() {
     let no_fh = vec![make_record("a.txt", None, 100), make_record("b.txt", None, 200)];
-    let fh_records = vec![
+    let old = vec![
         make_record("c.txt", Some("fh_a"), 100),
         make_record("d.txt", Some("fh_b"), 100),
-        make_record("e.txt", Some("fh_c"), 100),
     ];
-    let mut groups = HashMap::new();
-    // fh_a: 1 条 → Deleted
-    groups.insert(
-        make_record("_", Some("fh_a"), 0).file_handle.unwrap(),
-        vec![make_record("c.txt", Some("fh_a"), 100)],
+    let groups = HashMap::from([(
+        old[1].file_handle.clone().unwrap(),
+        vec![make_record("d_new.txt", Some("fh_b"), 200)],
+    )]);
+    let result = classify_deletion_status(no_fh, old, &groups).unwrap();
+    assert_eq!(
+        result
+            .iter()
+            .filter(|s| matches!(s, DeletionStatus::Deleted(_)))
+            .count(),
+        3
     );
-    // fh_b: 2 条 → Renamed
-    groups.insert(
-        make_record("_", Some("fh_b"), 0).file_handle.unwrap(),
-        vec![
-            make_record("d.txt", Some("fh_b"), 100),
-            make_record("d_new.txt", Some("fh_b"), 200),
-        ],
+    assert_eq!(
+        result
+            .iter()
+            .filter(|s| matches!(s, DeletionStatus::Renamed(_, _)))
+            .count(),
+        1
     );
-    // fh_c: 3 条 → 跳过 (error log)
-    groups.insert(
-        make_record("_", Some("fh_c"), 0).file_handle.unwrap(),
-        vec![
-            make_record("e1.txt", Some("fh_c"), 100),
-            make_record("e2.txt", Some("fh_c"), 200),
-            make_record("e3.txt", Some("fh_c"), 300),
-        ],
-    );
+}
 
-    let result = classify_deletion_status(no_fh, fh_records, &groups).unwrap();
-    // 2 Deleted (no_fh) + 1 Deleted (fh_a) + 1 Renamed (fh_b) + 0 (fh_c skipped)
-    let deleted_count = result
-        .iter()
-        .filter(|s| matches!(s, DeletionStatus::Deleted(_)))
-        .count();
-    let renamed_count = result
-        .iter()
-        .filter(|s| matches!(s, DeletionStatus::Renamed(_, _)))
-        .count();
-    assert_eq!(deleted_count, 3);
-    assert_eq!(renamed_count, 1);
+#[test]
+fn ambiguous_or_conflicting_rename_is_an_error_instead_of_a_silent_skip() {
+    for (old_paths, current_paths) in [
+        (vec!["old"], vec!["new", "alias"]),
+        (vec!["old", "old_alias"], vec!["new"]),
+        (vec!["old"], vec!["old"]),
+    ] {
+        let old: Vec<_> = old_paths
+            .into_iter()
+            .map(|p| make_record(p, Some("identity"), 0))
+            .collect();
+        let current = current_paths
+            .into_iter()
+            .map(|p| make_record(p, Some("identity"), 0))
+            .collect();
+        let groups = HashMap::from([(old[0].file_handle.clone().unwrap(), current)]);
+        assert!(matches!(
+            classify_deletion_status(vec![], old, &groups),
+            Err(DatabaseError::RenameAssociationInvalid { .. })
+        ));
+    }
 }
 
 // ═══ 1.4 JoinStrategy 测试（优化 7 核心逻辑）═══
@@ -332,18 +302,18 @@ fn test_join_strategy_from_file_handle_status() {
 
 #[test]
 fn test_detect_new_sql_path_mode() {
-    let sql = JoinStrategy::Path.build_detect_new_sql("temp_x", "base_y");
-    assert!(sql.contains("NOT IN (SELECT relative_path, version_id FROM base_y)"));
+    let sql = JoinStrategy::Path.build_detect_new_sql("temp_x", "base_y", false);
+    assert!(sql.contains("NOT IN (SELECT relative_path, version_id FROM base_y FINAL WHERE copy_data_confirmed)"));
     assert!(sql.contains("FROM temp_x"));
-    assert!(!sql.contains("FINAL"));
+    assert!(sql.contains("FINAL"));
 }
 
 #[test]
 fn test_detect_new_sql_fh_mode() {
-    let sql = JoinStrategy::FileHandle.build_detect_new_sql("temp_x", "base_y");
+    let sql = JoinStrategy::FileHandle.build_detect_new_sql("temp_x", "base_y", false);
     assert!(sql.contains("file_handle NOT IN"));
-    assert!(sql.contains("FROM base_y WHERE file_handle IS NOT NULL"));
-    assert!(!sql.contains("FINAL"));
+    assert!(sql.contains("FROM base_y FINAL WHERE copy_data_confirmed AND file_handle IS NOT NULL"));
+    assert!(sql.contains("FINAL"));
 }
 
 /// 验证 NULL-safe 元数据等价比较的 SQL 形式：每个属性必须有 `IS NULL AND ... IS NULL` 兜底，
@@ -362,7 +332,7 @@ fn assert_null_safe_meta_clauses(sql: &str) {
 
 #[test]
 fn test_detect_changed_sql_path_mode_data_only() {
-    let sql = JoinStrategy::Path.build_detect_changed_sql("temp_x", "base_y", ChangeKind::DataOnly);
+    let sql = JoinStrategy::Path.build_detect_changed_sql("temp_x", "base_y", ChangeKind::DataOnly, false, false);
     assert!(sql.contains("LIMIT 1 BY (relative_path, version_id)"));
     // DataOnly 条件：内容变了 + 属性未变
     assert!(sql.contains("t.size != f.size OR t.mtime != f.mtime"));
@@ -372,7 +342,7 @@ fn test_detect_changed_sql_path_mode_data_only() {
 
 #[test]
 fn test_detect_changed_sql_path_mode_metadata_only() {
-    let sql = JoinStrategy::Path.build_detect_changed_sql("temp_x", "base_y", ChangeKind::MetadataOnly);
+    let sql = JoinStrategy::Path.build_detect_changed_sql("temp_x", "base_y", ChangeKind::MetadataOnly, false, false);
     // MetadataOnly 条件：内容未变 + 属性变了
     assert!(sql.contains("t.size = f.size AND t.mtime = f.mtime"));
     assert_null_safe_meta_clauses(&sql);
@@ -382,7 +352,7 @@ fn test_detect_changed_sql_path_mode_metadata_only() {
 
 #[test]
 fn test_detect_changed_sql_path_mode_both() {
-    let sql = JoinStrategy::Path.build_detect_changed_sql("temp_x", "base_y", ChangeKind::Both);
+    let sql = JoinStrategy::Path.build_detect_changed_sql("temp_x", "base_y", ChangeKind::Both, false, false);
     // Both 条件：内容和属性都变了
     assert!(sql.contains("t.size != f.size OR t.mtime != f.mtime"));
     assert_null_safe_meta_clauses(&sql);
@@ -391,7 +361,7 @@ fn test_detect_changed_sql_path_mode_both() {
 
 #[test]
 fn test_detect_changed_sql_fh_mode_data_only() {
-    let sql = JoinStrategy::FileHandle.build_detect_changed_sql("temp_x", "base_y", ChangeKind::DataOnly);
+    let sql = JoinStrategy::FileHandle.build_detect_changed_sql("temp_x", "base_y", ChangeKind::DataOnly, false, false);
     // 路径等值条件：仅对路径未变的条目判 Changed，避免把 rename+changed 误判为纯 Changed
     assert!(sql.contains("LIMIT 1 BY (file_handle, relative_path)"));
     assert!(sql.contains("t.file_handle = f.file_handle"));
@@ -402,7 +372,8 @@ fn test_detect_changed_sql_fh_mode_data_only() {
 
 #[test]
 fn test_detect_changed_sql_fh_mode_metadata_only() {
-    let sql = JoinStrategy::FileHandle.build_detect_changed_sql("temp_x", "base_y", ChangeKind::MetadataOnly);
+    let sql =
+        JoinStrategy::FileHandle.build_detect_changed_sql("temp_x", "base_y", ChangeKind::MetadataOnly, false, false);
     assert!(sql.contains("t.size = f.size AND t.mtime = f.mtime"));
     assert_null_safe_meta_clauses(&sql);
     assert!(sql.contains("NOT ifNull(t.uid = f.uid"));
@@ -410,7 +381,7 @@ fn test_detect_changed_sql_fh_mode_metadata_only() {
 
 #[test]
 fn test_detect_changed_sql_fh_mode_both() {
-    let sql = JoinStrategy::FileHandle.build_detect_changed_sql("temp_x", "base_y", ChangeKind::Both);
+    let sql = JoinStrategy::FileHandle.build_detect_changed_sql("temp_x", "base_y", ChangeKind::Both, false, false);
     assert!(sql.contains("t.size != f.size OR t.mtime != f.mtime"));
     assert_null_safe_meta_clauses(&sql);
     assert!(sql.contains("NOT ifNull(t.gid = f.gid"));
@@ -418,7 +389,7 @@ fn test_detect_changed_sql_fh_mode_both() {
 
 #[test]
 fn test_detect_deleted_sql() {
-    let sql = JoinStrategy::build_detect_deleted_sql("base_y");
+    let sql = JoinStrategy::build_detect_deleted_sql("base_y", false);
     assert!(sql.contains("FINAL"));
     assert!(sql.contains("current_state = ?"));
     assert!(!sql.contains("LIMIT 1 BY"));
@@ -426,10 +397,12 @@ fn test_detect_deleted_sql() {
 
 #[test]
 fn test_batch_fh_query_sql() {
-    let sql = JoinStrategy::build_batch_fh_query_sql("base_y", 3);
+    let sql = JoinStrategy::build_batch_fh_query_sql("base_y", 3, false);
     assert!(sql.contains("file_handle IN (?, ?, ?)"));
     assert!(sql.contains("LIMIT 1 BY (relative_path, version_id)"));
-    assert!(!sql.contains("FINAL"));
+    assert!(sql.contains("FINAL"));
+    assert!(sql.contains("current_state = ?"));
+    assert!(!sql.contains("ORDER BY file_handle, ctime"));
 }
 
 // ═══ 1.5 表名 & 宏测试 ═══

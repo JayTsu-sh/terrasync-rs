@@ -2,9 +2,9 @@
 
 use std::time::{Duration, Instant};
 
-use clickhouse::{error::Error as ClickHouseError, query::Query};
+use clickhouse::{RowOwned, RowRead, error::Error as ClickHouseError, query::Query};
 use data_mover::model::ObservedEntry;
-use task_model::ChangeKind;
+use task_model::{ChangeKind, CopyCompletion};
 use tokio::sync::mpsc;
 use tracing::{debug, trace};
 use utils::sanitize_job_id;
@@ -15,9 +15,19 @@ use crate::error::{DatabaseError, Result};
 use crate::execution::queries::{check_scan_cancellation, scan_retry_delay};
 use crate::execution::read::QuorumRead;
 use crate::get_scan_base_table_name;
-use crate::schema::columns::SNAPSHOT_COLUMNS;
+use crate::schema::columns::{COPY_SNAPSHOT_COLUMNS, SNAPSHOT_COLUMNS};
 use crate::schema::identity::PERSISTED_IDENTITY_PREFIX;
-use crate::schema::records::{SnapshotRow, StorageEntryRecord};
+use crate::schema::records::{CopySnapshotRow, SnapshotRow, StorageEntryRecord};
+
+/// 本执行的已确认版本及扫描时的完整分段位置；单版本 snapshot 本身不携带这些边界。
+#[derive(Clone, Debug)]
+pub struct CopyCatalogueEntry {
+    pub completion: CopyCompletion,
+    pub history_segment: u32,
+    pub history_index: u32,
+    pub history_records: u32,
+    pub history_complete: bool,
+}
 
 fn records_to_entry_iter(records: Vec<StorageEntryRecord>) -> Result<Box<dyn Iterator<Item = ObservedEntry> + Send>> {
     let entries = records
@@ -90,12 +100,13 @@ impl ClickHouseDatabase {
 
     /// 检测临时表中新增的文件（不存在于主表）
     pub async fn detect_new_items(&self) -> Result<Box<dyn Iterator<Item = ObservedEntry> + Send>> {
+        let copy_only = self.generation_lifecycle.lock().await.copy_generation.is_some();
         if self.is_copy_recovery().await {
             return records_to_entry_iter(self.copy_replay_items().await?);
         }
         let records = self
             .detect_items("new", |temp_table, base_table, strategy| {
-                strategy.build_detect_new_sql(temp_table, base_table)
+                strategy.build_detect_new_sql(temp_table, base_table, copy_only)
             })
             .await?;
 
@@ -103,22 +114,23 @@ impl ClickHouseDatabase {
     }
 
     pub async fn detect_changed_items(&self) -> Result<Box<dyn Iterator<Item = (ObservedEntry, ChangeKind)> + Send>> {
+        let copy_only = self.generation_lifecycle.lock().await.copy_generation.is_some();
         if self.is_copy_recovery().await {
             return Ok(Box::new(std::iter::empty()));
         }
         // 分别查询三种变更（三类条件互斥），用 try_join! 并发执行以降低整体延迟
         let (data_only, metadata_only, both, marker_removed) = tokio::try_join!(
             self.detect_items("changed(data)", |temp, base, strategy| {
-                strategy.build_detect_changed_sql(temp, base, ChangeKind::DataOnly)
+                strategy.build_detect_changed_sql(temp, base, ChangeKind::DataOnly, false, copy_only)
             }),
             self.detect_items("changed(meta)", |temp, base, strategy| {
-                strategy.build_detect_changed_sql(temp, base, ChangeKind::MetadataOnly)
+                strategy.build_detect_changed_sql(temp, base, ChangeKind::MetadataOnly, false, copy_only)
             }),
             self.detect_items("changed(both)", |temp, base, strategy| {
-                strategy.build_detect_changed_sql(temp, base, ChangeKind::Both)
+                strategy.build_detect_changed_sql(temp, base, ChangeKind::Both, false, copy_only)
             }),
             self.detect_items("changed(marker removed)", |temp, base, strategy| {
-                strategy.build_detect_changed_sql(temp, base, ChangeKind::DirectoryMarkerRemoved)
+                strategy.build_detect_changed_sql(temp, base, ChangeKind::DirectoryMarkerRemoved, false, copy_only)
             }),
         )?;
 
@@ -156,11 +168,41 @@ impl ClickHouseDatabase {
         &self, is_dir: Option<bool>, is_symlink: Option<bool>, extension: Option<String>,
         tx: mpsc::Sender<ObservedEntry>,
     ) -> Result<()> {
+        let query = self.entries_query(None, is_dir, is_symlink, extension, SNAPSHOT_COLUMNS);
+        self.send_catalogue_records(query, tx, SnapshotRow::into_observation)
+            .await
+    }
+
+    /// 交付本次重新选中且目标已确认的源事实及实际目标版本；旧 C/W 相等不构成执行授权。
+    pub async fn query_current_copy_entries(
+        &self, is_dir: Option<bool>, is_symlink: Option<bool>, extension: Option<String>,
+        tx: mpsc::Sender<CopyCatalogueEntry>,
+    ) -> Result<()> {
+        let execution = self
+            .generation_lifecycle
+            .lock()
+            .await
+            .copy_execution_id
+            .clone()
+            .ok_or(DatabaseError::CopyExecutionUnavailable)?;
+        let query = self.entries_query(Some(execution), is_dir, is_symlink, extension, COPY_SNAPSHOT_COLUMNS);
+        self.send_catalogue_records(query, tx, CopySnapshotRow::into_completion)
+            .await
+    }
+
+    fn entries_query(
+        &self, execution: Option<String>, is_dir: Option<bool>, is_symlink: Option<bool>, extension: Option<String>,
+        columns: &str,
+    ) -> Query {
         let base_table_name = get_scan_base_table_name(&self.job_id);
         debug!("[query_storage_entry] base table name: {}", base_table_name);
 
-        let mut where_conditions = Vec::new();
+        let mut where_conditions = vec!["copy_path_confirmed".to_string()];
         let mut ext_bind: Option<String> = None;
+        if execution.is_some() {
+            where_conditions.push("copy_execution_id = ?".into());
+            where_conditions.push("copy_data_confirmed".into());
+        }
 
         if let Some(dir_val) = is_dir {
             where_conditions.push(format!("is_dir = {dir_val}"));
@@ -181,18 +223,26 @@ impl ClickHouseDatabase {
             format!("WHERE {}", where_conditions.join(" AND "))
         };
 
-        let query = format!("SELECT {SNAPSHOT_COLUMNS} FROM {base_table_name} FINAL {where_clause}");
+        // 子项先于父目录收尾，避免父目录的只读权限阻断子项元数据和清理。
+        let query = format!(
+            "SELECT {columns} FROM {base_table_name} FINAL {where_clause} ORDER BY length(splitByChar('/', relative_path)) DESC, relative_path, history_segment, history_index"
+        );
 
         let mut q = self.sync_client.query(&query);
+        if let Some(execution) = execution {
+            q = q.bind(execution);
+        }
         if let Some(ext) = ext_bind {
             q = q.bind(ext);
         }
-        self.send_catalogue_records(q, tx).await
+        q
     }
 }
 
 impl ClickHouseDatabase {
-    pub(super) async fn send_catalogue_records(&self, query: Query, tx: mpsc::Sender<ObservedEntry>) -> Result<()> {
+    async fn send_catalogue_records<R: RowOwned + RowRead, T>(
+        &self, query: Query, tx: mpsc::Sender<T>, decode: fn(R) -> Result<T>,
+    ) -> Result<()> {
         let started = Instant::now();
         let mut delivered = false;
         let mut retrying = false;
@@ -203,11 +253,11 @@ impl ClickHouseDatabase {
             } else {
                 query.clone()
             };
-            let mut cursor = request.fetch::<SnapshotRow>()?;
+            let mut cursor = request.fetch::<R>()?;
             loop {
                 match cursor.next().await {
                     Ok(Some(record)) => {
-                        tx.send(record.into_observation()?).await.map_err(|error| {
+                        tx.send(decode(record)?).await.map_err(|error| {
                             DatabaseError::QueryError(format!("Failed to send storage entry: {error}"))
                         })?;
                         delivered = true;

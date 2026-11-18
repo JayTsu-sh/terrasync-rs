@@ -13,6 +13,7 @@
 //!
 //! 运行：`cargo test -p terrasync-rs --test remote_process_e2e -- --nocapture`
 
+#![cfg(feature = "remote")]
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 #![allow(clippy::pedantic)]
 
@@ -233,7 +234,6 @@ fn test_remote_process_e2e_handshake_and_sync() {
         .arg("sync")
         .arg("--id")
         .arg("remote_e2e_test")
-        .arg("--in-place")
         .arg("--remote")
         .arg(&listen_addr)
         .arg("--tls-server-cert")
@@ -330,7 +330,6 @@ fn test_remote_process_e2e_dir_mtime_preserved() {
         .arg("sync")
         .arg("--id")
         .arg("remote_dir_mtime_test")
-        .arg("--in-place")
         .arg("--remote")
         .arg(&listen_addr)
         .arg("--tls-server-cert")
@@ -409,7 +408,6 @@ fn test_remote_process_e2e_correct_token_succeeds() {
         .arg("sync")
         .arg("--id")
         .arg("remote_e2e_token_ok")
-        .arg("--in-place")
         .arg("--remote")
         .arg(&listen_addr)
         .arg("--tls-server-cert")
@@ -489,17 +487,24 @@ fn test_remote_process_e2e_wrong_token_rejected() {
         .arg("sync")
         .arg("--id")
         .arg("remote_e2e_token_bad")
-        .arg("--in-place")
         .arg("--remote")
         .arg(&listen_addr)
         .arg("--tls-server-cert")
         .arg(&cert_path)
         .arg("--token")
-        .arg("wrong-token")
+        .arg("wrong token secret")
         .arg(&src_dir)
         .arg(&dest_dir);
 
-    sender_cmd.assert().failure();
+    let output = sender_cmd.assert().failure().get_output().clone();
+    let sender_stdout = String::from_utf8_lossy(&output.stdout);
+    let sender_stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        sender_stdout.contains("Task errors: 1"),
+        "鉴权失败必须进入最终任务统计: {sender_stdout}"
+    );
+    assert!(!sender_stdout.contains("wrong token secret"));
+    assert!(!sender_stderr.contains("wrong token secret"));
 
     // Receiver 收到非法 token 后也会以非零码退出（鉴权失败向上传播为进程错误）
     let receiver_status = wait_for_child_exit(&mut receiver_child, RECEIVER_EXIT_TIMEOUT);
@@ -591,7 +596,6 @@ fn test_remote_process_e2e_large_multi_chunk_file_mux() {
         .arg("sync")
         .arg("--id")
         .arg("remote_e2e_mux_large_file")
-        .arg("--in-place")
         .arg("--remote")
         .arg(&listen_addr)
         .arg("--tls-server-cert")
@@ -599,7 +603,7 @@ fn test_remote_process_e2e_large_multi_chunk_file_mux() {
         .arg(&src_dir)
         .arg(&dest_dir);
 
-    sender_cmd.assert().success();
+    let sender_assertion = sender_cmd.assert().success();
 
     let receiver_status = wait_for_child_exit(&mut receiver_child, RECEIVER_EXIT_TIMEOUT);
     let (receiver_stdout, receiver_stderr) = drain_output(&mut receiver_child);
@@ -614,6 +618,15 @@ fn test_remote_process_e2e_large_multi_chunk_file_mux() {
         ),
     }
 
+    assert!(
+        rel_paths.iter().all(|path| dest_dir.join(path).is_file()),
+        "目标缺少文件，逐项状态={:?}\nSender 输出={:?}\nReceiver stdout={receiver_stdout}\nReceiver stderr={receiver_stderr}",
+        rel_paths
+            .iter()
+            .map(|path| (path, dest_dir.join(path).is_file()))
+            .collect::<Vec<_>>(),
+        sender_assertion.get_output(),
+    );
     assert_dest_matches_src(&src_dir, &dest_dir, &rel_paths);
 }
 
@@ -678,7 +691,6 @@ fn test_remote_process_e2e_credit_window_large_file_no_deadlock() {
         .arg("sync")
         .arg("--id")
         .arg("remote_e2e_credit_window_large_file")
-        .arg("--in-place")
         .arg("--remote")
         .arg(&listen_addr)
         .arg("--tls-server-cert")
@@ -761,7 +773,6 @@ fn test_remote_process_e2e_without_delete_target_keeps_orphan() {
         .arg("sync")
         .arg("--id")
         .arg("remote_e2e_no_delete_target")
-        .arg("--in-place")
         .arg("--remote")
         .arg(&listen_addr)
         .arg("--tls-server-cert")
@@ -833,7 +844,6 @@ fn test_remote_process_e2e_delete_target_removes_orphan() {
         .arg("sync")
         .arg("--id")
         .arg("remote_e2e_delete_target")
-        .arg("--in-place")
         .arg("--remote")
         .arg(&listen_addr)
         .arg("--tls-server-cert")
@@ -908,7 +918,6 @@ fn test_remote_process_e2e_delete_target_preserves_existing_subdir() {
         .arg("sync")
         .arg("--id")
         .arg("remote_e2e_preserve_subdir_seed")
-        .arg("--in-place")
         .arg("--remote")
         .arg(&listen_addr)
         .arg("--tls-server-cert")
@@ -964,7 +973,6 @@ fn test_remote_process_e2e_delete_target_preserves_existing_subdir() {
         .arg("sync")
         .arg("--id")
         .arg("remote_e2e_preserve_subdir")
-        .arg("--in-place")
         .arg("--remote")
         .arg(&listen_addr)
         .arg("--tls-server-cert")
@@ -1033,7 +1041,7 @@ fn parse_changed_total(stdout: &str) -> u64 {
 #[test]
 #[serial]
 fn test_remote_process_e2e_delta_sync_transfers_changed_content() {
-    let modes: [&[&str]; 3] = [&["--in-place"], &["--resume"], &[]];
+    let modes: [&[&str]; 2] = [&["--resume"], &[]];
     for flags in modes {
         let tmp = tempfile::tempdir().expect("create tempdir");
         let tmp_path = tmp.path();
@@ -1087,7 +1095,6 @@ fn test_remote_process_e2e_delta_sync_transfers_changed_content() {
             .arg("sync")
             .arg("--id")
             .arg("remote_delta_seed")
-            .arg("--in-place")
             .arg("--remote")
             .arg(&listen_addr)
             .arg("--tls-server-cert")
@@ -1262,7 +1269,6 @@ fn test_remote_process_e2e_delta_size_threshold_downgrades_to_full() {
         .arg("sync")
         .arg("--id")
         .arg("remote_delta_threshold_seed")
-        .arg("--in-place")
         .arg("--remote")
         .arg(&listen_addr)
         .arg("--tls-server-cert")
@@ -1316,7 +1322,6 @@ fn test_remote_process_e2e_delta_size_threshold_downgrades_to_full() {
         .arg("sync")
         .arg("--id")
         .arg("remote_delta_threshold_verify")
-        .arg("--in-place")
         .arg("--remote")
         .arg(&listen_addr)
         .arg("--tls-server-cert")
@@ -1409,7 +1414,6 @@ fn test_remote_process_e2e_symlink_synced() {
         .arg("sync")
         .arg("--id")
         .arg("remote_symlink_e2e")
-        .arg("--in-place")
         .arg("--remote")
         .arg(&listen_addr)
         .arg("--tls-server-cert")
@@ -1652,7 +1656,6 @@ fn test_remote_process_e2e_receiver_killed_sender_exits_nonzero() {
         .arg("sync")
         .arg("--id")
         .arg("remote_receiver_killed")
-        .arg("--in-place")
         .arg("--remote")
         .arg(&listen_addr)
         .arg("--tls-server-cert")
@@ -1745,7 +1748,6 @@ fn test_remote_process_e2e_uid_gid_preserved() {
         .arg("sync")
         .arg("--id")
         .arg("remote_uid_gid_e2e")
-        .arg("--in-place")
         .arg("--remote")
         .arg(&listen_addr)
         .arg("--tls-server-cert")
@@ -1868,7 +1870,6 @@ fn test_remote_process_e2e_partial_failure_exit_zero_with_nonzero_report() {
         .arg("sync")
         .arg("--id")
         .arg("remote_partial_failure_e2e")
-        .arg("--in-place")
         .arg("--remote")
         .arg(&listen_addr)
         .arg("--tls-server-cert")

@@ -2,18 +2,17 @@
 use crate::job_execution::JobLease;
 use std::{
     mem::take,
-    num::NonZeroUsize,
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use crate::scan::source::{ScanSourceMode, WalkOptions};
-use crate::scan::{
+use super::source::{ScanSourceMode, WalkOptions};
+use super::{
     ScanRequest,
     cancellation::{self, ScanCancellation},
+    walk_options,
 };
 use crate::storage_factory::{StorageContext, canonicalize_path};
-use data_mover::filter::parse_filter_expression;
 use data_mover::model::ObservedEntry;
 use data_mover::traversal::{Resumable, TraversalOrder};
 use db::scan::ScanResumeStatistics;
@@ -26,7 +25,7 @@ use utils::app_config::AppConfig;
 
 use crate::{
     config::{JobType, initialize_consumer_config},
-    consumer::{ConsumerManager, ScanStatistics},
+    consumer::{ConsumerManager, TaskStatistics},
     error::{AppError, Result},
     storage_factory::{StorageRole, create_storage_for_role},
 };
@@ -35,7 +34,7 @@ mod input;
 mod pipeline;
 mod workers;
 
-pub(crate) async fn run_persisted(request: ScanRequest<'_>, config: AppConfig) -> Result<()> {
+pub(super) async fn run_persisted(request: ScanRequest<'_>, config: AppConfig) -> Result<()> {
     let ScanRequest {
         job_id,
         job_dir,
@@ -63,16 +62,7 @@ pub(crate) async fn run_persisted(request: ScanRequest<'_>, config: AppConfig) -
         _=cancel.cancelled()=>return Err(AppError::ObservationScanCancelled),
         storage=create_storage_for_role(&source, None, false, StorageRole::Source)=>storage?,
     };
-    let options = WalkOptions {
-        operation_timeout: Some(Duration::from_secs(config.scan.operation_timeout_secs)),
-        recovery_window: Some(Duration::from_secs(config.scan.recovery_window_secs)),
-        depth: NonZeroUsize::new(depth as usize).map(NonZeroUsize::get),
-        match_expressions: include.as_deref().map(parse_filter_expression).transpose()?,
-        exclude_expressions: exclude.as_deref().map(parse_filter_expression).transpose()?,
-        concurrency: config.scan.concurrency,
-        include_tags: config.scan.include_tags,
-        ..Default::default()
-    };
+    let options = walk_options(depth, include.as_deref(), exclude.as_deref(), &config.scan)?;
     // 只持久化源身份和有效扫描选项的摘要，不保存凭据。
     let identity = storage.storage().identity();
     let request_key = request_key(
@@ -175,14 +165,13 @@ pub(crate) async fn run_persisted(request: ScanRequest<'_>, config: AppConfig) -
         } else {
             JobType::Scan
         };
-        let mut consumer_config = initialize_consumer_config(job_id, job_dir, kind, command, &config, callback_url)?;
-        // 本管道负责数据库持久化确认；manager 只消费统计信息。
-        consumer_config.db_config.enabled = false;
-        let mut consumers = ConsumerManager::new(&consumer_config).await?;
+        let consumer_config = initialize_consumer_config(job_id, job_dir, kind, command, &config, callback_url)?;
+        // 本管道确认扫描事实；manager 管理统计及独立的最终报告。
+        let mut consumers = ConsumerManager::statistics_only(&consumer_config)?;
         // 累计数与目录贡献必须来自同一已确认检查点；旧检查点无法补出过滤计数。
         consumers.restore_statistics(&state.statistics).await?;
         if (!state.checkpoint.is_empty() || state.observed_entries > 0)
-            && !consumers.scan_statistics().snapshot().await.is_some_and(|scan| scan.valid_checkpoint(state.observed_entries)) {
+            && !consumers.task_statistics().snapshot().await.is_some_and(|scan| scan.valid_checkpoint(state.observed_entries)) {
             return Err(AppError::ScanError("Saved scan checkpoint lacks consistent directory statistics; reset this job's scan records before starting a new round".into()));
         }
         consumers
@@ -292,7 +281,7 @@ async fn run(
 }
 
 async fn flush_batch(
-    database: &mut ScanStore, state: &ScanResumeState, consumers: &ScanStatistics, batch: &mut Vec<Arc<ObservedEntry>>,
+    database: &mut ScanStore, state: &ScanResumeState, consumers: &TaskStatistics, batch: &mut Vec<Arc<ObservedEntry>>,
     cancel: &ScanCancellation,
 ) -> Result<()> {
     cancel.check()?;
@@ -470,18 +459,18 @@ mod tests {
 
 /// 清理一个扫描作业的数据；表布局及其他作业隔离由数据库层负责。
 pub async fn clear_scan(job_id: &str) -> Result<()> {
-    let config = AppConfig::fetch()?;
-    if !config.database.enabled {
+    let config = AppConfig::fetch_database()?;
+    if !config.enabled {
         return Err(AppError::ConfigError("ClickHouse is not enabled".into()));
     }
-    let store = ScanStore::new(&config.database.clickhouse, job_id)?;
+    let store = ScanStore::new(&config.clickhouse, job_id)?;
     store.clear_job().await?;
     Ok(())
 }
 
 /// 根据持久化轮次识别执行类型，不能用作业目录是否存在来区分全量续扫和增量。
 pub async fn scan_execution_is_incremental(job_id: &str) -> Result<bool> {
-    let config = AppConfig::fetch()?;
-    let store = ScanStore::new(&config.database.clickhouse, job_id)?;
+    let config = AppConfig::fetch_database()?;
+    let store = ScanStore::new(&config.clickhouse, job_id)?;
     Ok(store.resume_execution_is_incremental().await?)
 }

@@ -378,11 +378,25 @@ impl AppConfig {
     ///
     /// 相比旧实现（每次 clone `ConfigBuilder` + build），开销大幅降低。
     pub fn fetch() -> Result<AppConfig> {
+        Self::snapshot(Self::clone)
+    }
+
+    /// 角色挂载每次使用当前存储配置，重试可以看到最新配置。
+    pub fn fetch_storage() -> Result<StorageConfig> {
+        Self::snapshot(|config| config.storage.clone())
+    }
+
+    /// 查询或清理扫描作业前读取当前数据库配置。
+    pub fn fetch_database() -> Result<DatabaseConfig> {
+        Self::snapshot(|config| config.database.clone())
+    }
+
+    fn snapshot<T>(select: impl FnOnce(&Self) -> T) -> Result<T> {
         let lock = CONFIG
             .get()
             .ok_or_else(|| UtilsError::ConfigConversionError("Config not initialized".to_string()))?;
-        let r = lock.read()?;
-        Ok(r.clone())
+        let config = lock.read()?;
+        Ok(select(&config))
     }
 
     /// 校验配置值的合理性，在 `init()` 中 build 后调用
@@ -616,6 +630,36 @@ username = "default"
         let error = config.validate().unwrap_err().to_string();
         assert!(error.contains("storage.source.hdfs.kerberos"));
         assert!(!error.contains("hdfs/user@EXAMPLE.COM"));
+    }
+
+    #[test]
+    fn connection_config_reads_updates_while_tasks_keep_their_snapshots() -> Result<()> {
+        AppConfig::init(Some(BASE_CONFIG), None)?;
+        let started_task = AppConfig::fetch()?;
+        let current_batch_size = started_task.database.batch_size.saturating_add(1);
+        let updated_hdfs = HdfsClientConfig {
+            config_dir: Some(PathBuf::from("/etc/role-config")),
+            ..HdfsClientConfig::default()
+        };
+
+        AppConfig::override_with(|config| {
+            config.database.batch_size = current_batch_size;
+            config.storage.source.hdfs = Some(updated_hdfs);
+        })?;
+
+        assert_ne!(started_task.database.batch_size, current_batch_size);
+        assert!(started_task.storage.source.hdfs.is_none());
+        assert_eq!(AppConfig::fetch_database()?.batch_size, current_batch_size);
+        let latest_storage = AppConfig::fetch_storage()?;
+        assert_eq!(
+            latest_storage
+                .source
+                .hdfs
+                .as_ref()
+                .and_then(|hdfs| hdfs.config_dir.as_deref()),
+            Some(Path::new("/etc/role-config"))
+        );
+        Ok(())
     }
 
     #[test]

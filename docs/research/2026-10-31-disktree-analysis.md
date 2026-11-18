@@ -72,7 +72,7 @@ disktree 是围绕“发现占用 → 逐层定位 → 标记 → 复核 → 清
 
 源码依据：
 - [前端依赖](../../web-ui/package.json)、[图表注册](../../web-ui/src/composables/useEChartsLoader.ts)、[当前分析界面](../../web-ui/src/components/ScanAnalysis.vue)、[图表选项](../../web-ui/src/composables/useAnalyticsCharts.ts)。
-- [AnalyticsService](../../crates/web/src/application/analytics_service.rs)、[分析接口](../../crates/web/src/api/analytics_handler.rs)、[FinalStats](../../crates/app/src/consumer/stats/report.rs)。
+- [AnalyticsService](../../crates/web/src/application/analytics_service.rs)、[分析接口](../../crates/web/src/api/analytics_handler.rs)、[FinalStats](../../crates/app/src/report.rs)。
 - [ClickHouse 表结构与发布机制](../../crates/db/src/clickhouse.rs)、[中立观测行](../../crates/db/src/observation_record.rs)、[GUI task runner](../../crates/web/src/infrastructure/task_runner.rs)。
 
 ### 7.1 应先解决的数据语义
@@ -85,7 +85,7 @@ disktree 是围绕“发现占用 → 逐层定位 → 标记 → 复核 → 清
 
 ### 7.2 现有分析中应顺带修正的口径问题
 
-- 后端 TimeRangeStatEntry 已包含 total_size，但 Web TimeEntry 只输出 count。补出容量即可支持“旧数据占多少容量”，不需要重新扫描。[报告类型](../../crates/app/src/consumer/stats/report.rs)、[接口转换](../../crates/web/src/application/analytics_service.rs)。
+- 后端 TimeRangeStatEntry 已包含 total_size，但 Web TimeEntry 只输出 count。补出容量即可支持“旧数据占多少容量”，不需要重新扫描。[报告类型](../../crates/app/src/report.rs)、[接口转换](../../crates/web/src/application/analytics_service.rs)。
 - FullStats 当前时间桶更新包含目录和符号链接，而饼图 tooltip 写“文件数”。应统一统计对象，或明确写成条目数；年龄着色也应避免用一个最新修改的子文件代表整个大目录。[聚合实现](../../crates/app/src/consumer/stats/accumulator.rs)、[前端图表](../../web-ui/src/composables/useAnalyticsCharts.ts)。
 - 无扩展名文件当前不会进入 extension_stats；不能用扩展名桶容量的合计作为所有文件的可靠总量。应补无扩展名桶，并明确分布图分母。[聚合实现](../../crates/app/src/consumer/stats/accumulator.rs)。
 - 时间桶从 HashMap 转为 Vec 时未显式按年龄排序，前端却按数组位置配暖冷色。应为桶增加稳定 key/顺序。

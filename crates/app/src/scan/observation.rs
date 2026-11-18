@@ -1,13 +1,45 @@
 //! 元数据观察与 opaque 编码；运行时直接交付原生观察，不投影为后端条目。
-use crate::error::storage::{Result, operation};
+use crate::error::storage::{Result, StorageError, operation};
 use crate::storage_factory::path;
 use data_mover::model::*;
 use data_mover::storage::StorageRoleFailure;
-use data_mover::storage::{Storage, observe_descriptor};
+use data_mover::storage::{
+    NamespaceReadOutcome, NamespaceReadPolicy, Storage, observe_descriptor, read_namespace_entry,
+};
+use data_mover::transfer::{DirectoryObjectAction, DirectoryObjectDestination, directory_object_action};
 use std::path::Path;
+use task_model::metadata::MetadataScope;
+use tokio_util::sync::CancellationToken;
+
+#[derive(Clone, Copy)]
+pub(crate) struct ObservationValidation {
+    required_tags: bool,
+    scope: MetadataScope,
+}
+
+impl ObservationValidation {
+    pub fn new(required_tags: bool, scope: MetadataScope) -> Self {
+        Self { required_tags, scope }
+    }
+
+    pub fn validate(self, entry: &ObservedEntry) -> Result<()> {
+        if !self.required_tags {
+            return Ok(());
+        }
+        let omitted = !self.scope.directory_object_output
+            && matches!(
+                directory_object_action(entry, DirectoryObjectDestination::new(false, None)),
+                DirectoryObjectAction::Skip(_)
+            );
+        if !omitted {
+            validate_required_tags(entry, self.scope.latest_version_only)?;
+        }
+        Ok(())
+    }
+}
 
 /// 必须复制的事实失败后不能继续发布观察或把缺失事实解释成 Omit。
-pub(crate) fn validate_required_tags(entry: &ObservedEntry) -> Result<()> {
+pub(crate) fn validate_required_tags(entry: &ObservedEntry, latest_only: bool) -> Result<()> {
     fn check(path: &StoragePath, facts: &MetadataObservations) -> Result<()> {
         let (class, transience) = match facts.tags() {
             MetadataObservation::Value { .. } | MetadataObservation::NotApplicable => return Ok(()),
@@ -25,7 +57,11 @@ pub(crate) fn validate_required_tags(entry: &ObservedEntry) -> Result<()> {
         .into())
     }
     if let Some(history) = entry.history() {
-        for record in history.records().iter().filter(|record| !record.is_delete_marker()) {
+        for record in history
+            .records()
+            .iter()
+            .filter(|record| !record.is_delete_marker() && (!latest_only || record.is_latest()))
+        {
             if let Some(metadata) = record.metadata() {
                 check(entry.path(), metadata)?;
             } else {
@@ -64,9 +100,32 @@ pub(crate) fn tags_required(storage: &Storage, include_tags: bool) -> Result<boo
 
 /// 捕获单个任务路径所需的复制事实；IO 和模型构造由原生角色完成。
 pub async fn observe_path(storage: &Storage, value: &Path) -> Result<ObservedEntry> {
-    let descriptor = storage.namespace()?.stat(&path(value)?).await?;
     let plan = observation_plan(tags_required(storage, true)?);
+    observe_path_with_plan(storage, value, plan).await
+}
+
+pub(crate) async fn observe_path_with_plan(
+    storage: &Storage, value: &Path, plan: ObservationPlan,
+) -> Result<ObservedEntry> {
+    let descriptor = storage.namespace()?.stat(&path(value)?).await?;
     Ok(observe_descriptor(storage, descriptor, plan).await?)
+}
+
+/// 文件列表的点查询复用原生只读恢复；不在任务层复制协议重试。
+pub(crate) async fn observe_path_with_read_policy(
+    storage: &Storage, value: &Path, plan: Option<ObservationPlan>, policy: NamespaceReadPolicy,
+    cancel: &CancellationToken,
+) -> Result<ObservedEntry> {
+    let plan = match plan {
+        Some(plan) => plan,
+        None => observation_plan(tags_required(storage, true)?),
+    };
+    match read_namespace_entry(storage, &path(value)?, Some(plan), policy, cancel).await? {
+        NamespaceReadOutcome::Observation { entry, .. } => {
+            entry.ok_or_else(|| StorageError::FileNotFound(value.display().to_string()))
+        }
+        NamespaceReadOutcome::Descriptor { .. } => Err(operation("source metadata read returned no observation")),
+    }
 }
 
 /// 验证原生历史分段顺序，不积累整段历史，也不复制逐版本条目。
@@ -76,10 +135,8 @@ pub(crate) struct HistorySequence {
     next_segment: u32,
 }
 impl HistorySequence {
-    pub fn check(&mut self, entry: &ObservedEntry, tags: bool) -> Result<()> {
-        if tags {
-            validate_required_tags(entry)?;
-        }
+    pub fn check(&mut self, entry: &ObservedEntry, validation: ObservationValidation) -> Result<()> {
+        validation.validate(entry)?;
         if let Some(history) = entry.history() {
             if self.path.is_none() {
                 self.path = Some(entry.path().clone());
@@ -115,7 +172,7 @@ mod required_tags_tests {
     #[test]
     fn failed_required_tags_block_the_object_and_keep_the_typed_cause() {
         let entry = directory_marker("folder", Vec::new());
-        assert!(validate_required_tags(&entry).is_ok());
+        assert!(validate_required_tags(&entry, false).is_ok());
         let marker = entry.directory_marker_object().unwrap();
         let facts = MetadataObservations::new(
             MetadataObservation::NotApplicable,
@@ -130,7 +187,7 @@ mod required_tags_tests {
         .unwrap();
         let marker = marker.clone().with_metadata(facts);
         let entry = entry.with_directory_marker_object(Some(Box::new(marker))).unwrap();
-        match validate_required_tags(&entry) {
+        match validate_required_tags(&entry, false) {
             Err(StorageError::Role(StorageRoleFailure::Entry(error))) => {
                 assert_eq!(error.path().as_str(), "folder/");
                 assert_eq!(error.class(), FailureClass::Timeout);
@@ -153,11 +210,11 @@ mod required_tags_tests {
             None,
             Some((Some("v1".into()), true, false)),
         );
-        assert!(validate_required_tags(&entry).is_err());
+        assert!(validate_required_tags(&entry, false).is_err());
         let structural = directory_marker("folder", Vec::new())
             .with_directory_marker_object(None)
             .unwrap();
-        assert!(validate_required_tags(&structural).is_ok());
+        assert!(validate_required_tags(&structural, false).is_ok());
         assert_eq!(
             observation_plan(true).mode(MetadataFamily::Tags),
             ObservationMode::Required
@@ -168,3 +225,7 @@ mod required_tags_tests {
 #[cfg(test)]
 #[path = "observation_failures_tests.rs"]
 mod failure_tests;
+
+#[cfg(test)]
+#[path = "observation_scope_tests.rs"]
+mod scope_tests;

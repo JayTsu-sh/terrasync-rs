@@ -1,6 +1,6 @@
 //! 任务分类与观察事件；不承担数据库、网络和存储 I/O。
-use crate::{ObservedEntryExt, observation::ObservedItem};
-use data_mover_model::ObservedEntry;
+use crate::{CopyCompletion, MetadataTargetVersion, ObservedEntryExt, TargetRetention, observation::ObservedItem};
+use data_mover_model::{BackendKind, ObservedEntry};
 use serde::{Deserialize, Serialize};
 use std::{fmt, path::PathBuf, sync::Arc};
 
@@ -108,10 +108,54 @@ impl EntryChange {
 /// 文件操作消息枚举，用于在扫描/同步过程中传递文件状态变化
 #[derive(Debug, Clone)]
 pub enum StorageEntryMessage {
+    /// 最终决定保留目标，逐项或范围事实不增加复制失败／删除成功计数。
+    TargetPreserved {
+        retention: Box<TargetRetention>,
+        reason: String,
+    },
     /// 文件被扫描到
     Scanned(Arc<ObservedEntry>),
+    /// 源对象有内容，但目标无法表示；不属于复制成功或失败，不授权删除源项。
+    CopySkipped { entry: Arc<ObservedEntry>, reason: String },
     /// 新增文件
     New(ObservedItem),
+    /// 逐项完成事实只负责持久化；逻辑 entry 的成功／失败仍由边界事件计数。
+    CopyItemCompleted {
+        completion: CopyCompletion,
+        change: EntryChange,
+    },
+    /// 历史版本的元数据工作携带实际目标版本，不重新复制数据。
+    VersionMetadataChanged {
+        entry: ObservedItem,
+        target: MetadataTargetVersion,
+    },
+    /// 一个逻辑 entry 的全部历史分段及所选版本复制完成；版本行另行落库。
+    CopyEntryCompleted {
+        entry: Arc<ObservedEntry>,
+        logical_bytes: u64,
+    },
+    /// 增量比较流的分段边界；即使本段没有变化版本也必须交付，用于有界收尾。
+    CopyEntryBoundary(Arc<ObservedEntry>),
+    /// 一个逻辑 entry 的全部增量版本交付完成；逐版本 ACK 只负责事实入库。
+    CopyEntryDeltaCompleted {
+        entry: Arc<ObservedEntry>,
+        change: EntryChange,
+        logical_bytes: u64,
+    },
+    /// 版本错误逐条交付；同一 entry 仅首个错误推进失败计数。
+    CopyVersionFailed {
+        entry: ObservedItem,
+        phase: String,
+        backend: BackendKind,
+        reason: String,
+        first_in_entry: bool,
+    },
+    /// 仅交付具体原因；entry 级失败由对应执行结果计数，避免阶段间重复累计。
+    Diagnostic {
+        event: ErrorEvent,
+        path: PathBuf,
+        reason: String,
+    },
     /// 文件已变更（kind 区分 data/metadata/both）
     Changed { entry: ObservedItem, kind: ChangeKind },
     /// 文件已删除

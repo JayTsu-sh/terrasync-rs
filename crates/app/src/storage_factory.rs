@@ -60,7 +60,7 @@ pub async fn create_storage_for_role(
 ) -> Result<StorageContext> {
     let storage_type = backend_kind_from_location(path);
     let storage = if matches!(storage_type, BackendKind::Hdfs) {
-        AppConfig::fetch()?.storage
+        AppConfig::fetch_storage()?
     } else {
         StorageConfig::default()
     };

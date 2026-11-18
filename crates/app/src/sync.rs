@@ -11,19 +11,17 @@ use crate::file_copy::metadata as copy_metadata;
 use crate::file_copy::namespace as copy_namespace;
 use crate::file_copy::transfer as copy_transfer;
 use data_mover::model::BackendKind;
+use tokio_util::sync::CancellationToken;
 // 标准库
-use crate::file_copy::{HdfsCopyContext, copy_file, copy_versions, prepare_directory};
-use std::iter::once;
+use crate::file_copy::{CopiedPublication, CopyOptions, HdfsCopyContext, copy_file, prepare_directory};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use task_model::ObservedEntryExt;
-use task_model::observation::ObservedItem;
-use task_model::{EntryChange, TransferMode};
+use task_model::TransferMode;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 
 // 外部crate
-use crate::file_copy::CopyOptions;
 use crate::storage_factory::StorageContext;
 use data_mover::model::ObservedEntry;
 use data_mover::qos::QosManager;
@@ -42,7 +40,9 @@ use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken}
 // 内部模块
 use crate::broadcast::BroadcastForwarder;
 use crate::byte_resume::ByteResumeStore;
-use crate::error::{AppError, Result};
+use crate::config::SyncJobConfig;
+use crate::error::{AppError, Result, StorageError};
+use crate::orchestrator::SyncOrchestrator;
 use crate::storage_factory::{StorageRole, create_storage_for_role};
 
 /// 存储资源管理器 - 统一管理源和目标存储实例
@@ -152,58 +152,14 @@ pub(crate) fn parse_size(size: &str) -> Result<usize> {
     ))
 }
 
-/// 执行文件复制操作
-///
-/// 该函数是文件复制功能的主入口，负责：
-/// 1. 初始化应用配置和扫描配置
-/// 2. 初始化消费者配置和管理器
-/// 3. 创建通信通道
-/// 4. 启动目录扫描
-/// 5. 处理扫描结果并执行复制
-/// 6. 管理重试机制
-/// 7. 验证文件一致性
-///
-/// # 参数
-/// - `config`: 同步任务的完整配置，详见 [`SyncJobConfig`](crate::config::SyncJobConfig)
-///
-/// # 返回值
-/// - 成功时返回`Ok(())`
-/// - 失败时返回包含错误信息的`Err`
+/// 执行本地迁移，按本次请求和已有代次选择全量或增量。
 #[instrument(skip_all, fields(
     job_id = %config.job_id,
     src = %redact_storage_url(&config.src_path),
     dest = %redact_storage_url(&config.dest_path),
 ))]
-pub async fn sync(config: crate::config::SyncJobConfig) -> Result<()> {
-    crate::orchestrator::SyncOrchestrator::new_local(config).run().await
-}
-
-/// 执行增量文件复制操作
-///
-/// 该函数执行增量复制操作，基于数据库中记录的上次扫描结果，只复制变更的文件。
-/// 主要流程包括：
-/// 1. 加载应用配置
-/// 2. 初始化扫描配置
-/// 3. 初始化消费者配置和管理器
-/// 4. 创建通信通道
-/// 5. 启动目录扫描（只扫描变更文件）
-/// 6. 处理扫描结果并执行复制
-/// 7. 管理重试机制
-/// 8. 验证文件一致性
-///
-/// # 参数
-/// - `config`: 同步任务的完整配置，详见 [`SyncJobConfig`](crate::config::SyncJobConfig)
-///
-/// # 返回值
-/// - 成功时返回`Ok(())`
-/// - 失败时返回包含错误信息的`Err`
-#[instrument(skip_all, fields(
-    job_id = %config.job_id,
-    src = %redact_storage_url(&config.src_path),
-    dest = %redact_storage_url(&config.dest_path),
-))]
-pub async fn incremental_sync(config: crate::config::SyncJobConfig) -> Result<()> {
-    crate::orchestrator::SyncOrchestrator::new_local(config).run().await
+pub async fn sync(config: SyncJobConfig) -> Result<()> {
+    SyncOrchestrator::new_local(config).run().await
 }
 
 #[cfg(windows)]
@@ -241,48 +197,6 @@ pub(crate) fn check_admin_privileges() -> Result<bool> {
             Err(AppError::CopyError("无法获取令牌信息，可能是权限不足".to_string()))
         }
     }
-}
-
-pub(crate) async fn process_versioned_entry(
-    item: &ObservedItem, src_storage: Arc<StorageContext>, dest_storage: Arc<StorageContext>,
-    broadcaster: BroadcastForwarder<StorageEntryMessage>, qos_manager: Option<QosManager>,
-    enable_integrity_check: bool, enable_acl: bool, is_source_reserved: bool, bytes_counter: Option<Arc<AtomicU64>>,
-    resume: ResumeOpts, change: EntryChange,
-) -> Result<()> {
-    if item.entry.history().is_some() {
-        return copy_versions(
-            once(item.clone()),
-            &src_storage,
-            &dest_storage,
-            CopyOptions {
-                transfer_mode: resume.transfer_mode,
-                qos: qos_manager,
-                enable_integrity_check,
-                is_source_reserved,
-                bytes_counter,
-                cancel: None,
-            },
-            &resume.job_id,
-            &broadcaster,
-            change,
-        )
-        .await;
-    }
-    process_entry(
-        &item.entry,
-        src_storage,
-        dest_storage,
-        enable_integrity_check,
-        enable_acl,
-        is_source_reserved,
-        qos_manager,
-        bytes_counter,
-        &broadcaster,
-        resume,
-    )
-    .await?;
-    broadcaster.broadcast(change.message(item.clone())).await;
-    Ok(())
 }
 
 /// `process_entry` / `process_entry_inner` 的标志位组合
@@ -329,14 +243,17 @@ pub(crate) async fn process_entry(
 /// 仍执行 `set_entry_metadata` + ACL / xattr 复制。
 pub(crate) async fn process_metadata_only_entry(
     entry: &Arc<ObservedEntry>, src_storage: Arc<StorageContext>, dest_storage: Arc<StorageContext>, enable_acl: bool,
-    is_source_reserved: bool, broadcaster: &BroadcastForwarder<StorageEntryMessage>,
+    is_source_reserved: bool, broadcaster: &BroadcastForwarder<StorageEntryMessage>, cancel: Option<CancellationToken>,
 ) -> Result<()> {
     let opts = ProcessEntryOpts {
         enable_integrity_check: false,
         enable_acl,
         is_source_reserved,
         skip_data_copy: true,
-        resume: ResumeOpts::default(),
+        resume: ResumeOpts {
+            cancel,
+            ..Default::default()
+        },
     };
     process_entry_inner(entry, src_storage, dest_storage, opts, None, None, broadcaster).await
 }
@@ -348,7 +265,7 @@ async fn process_entry_inner(
 ) -> Result<()> {
     let ProcessEntryOpts {
         enable_integrity_check,
-        enable_acl,
+        enable_acl: _,
         is_source_reserved,
         skip_data_copy,
         resume,
@@ -357,9 +274,12 @@ async fn process_entry_inner(
     let span = info_span!("process_entry", path = %relative_path.display());
 
     async {
+    if resume.cancel.as_ref().is_some_and(CancellationToken::is_cancelled) {
+        return Err(StorageError::Cancelled.into());
+    }
     trace!(
         "Processing entry: {:?} with parameters: enable_integrity_check: {:?}, enable_acl: {:?}, is_source_reserved: {:?}",
-        relative_path, enable_integrity_check, enable_acl, is_source_reserved
+        relative_path, enable_integrity_check, opts.enable_acl, is_source_reserved
     );
 
     if entry.history().is_some() && !skip_data_copy {
@@ -371,22 +291,6 @@ async fn process_entry_inner(
         match copy_namespace::read_symlink(src_storage.storage(), entry).await {
             Ok(target_path) => {
                 copy_namespace::create_symlink(dest_storage.storage(), entry, &target_path).await?;
-
-                if !is_source_reserved {
-                    trace!("Is not source reserved, removing symlink {:?}", relative_path);
-                    if let Err(e) = copy_namespace::delete_file(src_storage.storage(), entry).await {
-                        error!("Failed to remove existing symlink {:?}: {}", relative_path, e);
-                        broadcaster
-                            .broadcast(StorageEntryMessage::Error {
-                                event: ErrorEvent::SymlinkOp,
-                                path: relative_path.to_path_buf(),
-                                entry: Some(Arc::clone(entry)),
-                                reason: format!("{e}"),
-                            })
-                            .await;
-                        return Err(e.into());
-                    }
-                }
             }
             Err(e) => {
                 error!("Failed to read symlink {:?}: {}", relative_path, e);
@@ -397,14 +301,14 @@ async fn process_entry_inner(
                         entry: Some(Arc::clone(entry)),
                         reason: format!("{e}"),
                     })
-                    .await;
+                    .await?;
                 return Err(e.into());
             }
         }
     } else if skip_data_copy {
         // MetadataOnly 变更：chmod/chown 导致 mode/uid/gid 变了但内容未变，跳过 copy_file
         trace!("Skipping data copy (metadata-only change): {:?}", relative_path);
-        copy_metadata::set_entry_metadata(dest_storage.storage(), entry)
+        copy_metadata::set_entry_metadata(dest_storage.storage(), entry, resume.cancel.clone())
             .await?;
     } else if dest_storage.as_ref().storage().kind() == BackendKind::Hdfs {
         let hdfs = HdfsCopyContext::from_job(&resume.job_id, resume.transfer_mode)?;
@@ -416,13 +320,12 @@ async fn process_entry_inner(
             &src_storage,
             &dest_storage,
             entry,
-            crate::file_copy::CopyOptions {
+            CopyOptions {
                 transfer_mode: resume.transfer_mode,
                 qos: qos_manager,
                 enable_integrity_check,
-                is_source_reserved,
                 bytes_counter,
-                ..Default::default()
+                cancel: resume.cancel.clone(),
             },
             Some(&hdfs),
         )
@@ -437,71 +340,43 @@ async fn process_entry_inner(
             entry,
             &src_storage,
             &dest_storage,
-            enable_integrity_check,
-            is_source_reserved,
-            qos_manager,
-            bytes_counter,
+            CopyOptions {
+                transfer_mode: resume.transfer_mode,
+                qos: qos_manager,
+                enable_integrity_check,
+                bytes_counter,
+                cancel: resume.cancel.clone(),
+            },
             &resume.job_dir,
         )
         .await?;
 
-        // data-mover 在发布文件前应用协商后的元数据。
+        // 复制入口复用扫描观察应用并校验元数据。
 
         debug!("Copied file (resumable) {:?}", relative_path);
     } else {
         debug!("Copying file {:?}", relative_path);
 
-        // 调用 data_mover 的 copy_file（处理 QoS、完整性检查、源文件删除）
+        // 传输入口处理 QoS、所选校验及元数据；源清理由任务层单独执行
         copy_transfer::copy_entry(
             &src_storage,
             &dest_storage,
             entry,
-            crate::file_copy::CopyOptions {
+            CopyOptions {
                 transfer_mode: resume.transfer_mode,
                 qos: qos_manager,
                 enable_integrity_check,
-                is_source_reserved,
                 bytes_counter,
-                ..Default::default()
+                cancel: resume.cancel.clone(),
             },
         )
         .await?;
 
-        // data-mover 在发布文件前应用协商后的元数据。
+        // 复制入口复用扫描观察应用并校验元数据。
 
         debug!("Copied file {:?}", relative_path);
     }
 
-    // ACL 复制（目录和文件均需要，symlink 除外）
-    // 支持 Local→Local（Windows）、CIFS→CIFS（跨平台）、NFS→NFS（NFSv4+），其他组合静默跳过
-    if enable_acl && !entry.get_is_symlink() {
-        if let Err(err) = copy_metadata::copy_acl((&src_storage).storage(), (&dest_storage).storage(), relative_path).await {
-            error!("Failed to copy ACL for {:?}: {}", relative_path, err);
-            broadcaster
-                .broadcast(StorageEntryMessage::Error {
-                    event: ErrorEvent::CopyAcl,
-                    path: relative_path.to_path_buf(),
-                    entry: Some(Arc::clone(entry)),
-                    reason: format!("{err}"),
-                })
-                .await;
-            return Err(err.into());
-        }
-
-        // xattr 复制（仅 NFSv4.1→NFSv4.1，其他组合静默跳过）
-        if let Err(err) = copy_metadata::copy_xattr((&src_storage).storage(), (&dest_storage).storage(), relative_path).await {
-            error!("Failed to copy xattr for {:?}: {}", relative_path, err);
-            broadcaster
-                .broadcast(StorageEntryMessage::Error {
-                    event: ErrorEvent::CopyXattr,
-                    path: relative_path.to_path_buf(),
-                    entry: Some(Arc::clone(entry)),
-                    reason: format!("{err}"),
-                })
-                .await;
-            return Err(err.into());
-        }
-    }
 
     Ok(())
     }.instrument(span).await
@@ -516,6 +391,7 @@ pub(crate) struct ResumeOpts {
     pub job_dir: String,
     /// 显式选定的写入模式。
     pub transfer_mode: TransferMode,
+    pub cancel: Option<CancellationToken>,
 }
 
 pub(crate) struct CommitRecorder {
@@ -585,7 +461,7 @@ impl CommitRecorder {
         self.callback.clone()
     }
 
-    pub(crate) async fn finish(self, result: Result<()>) -> Result<()> {
+    pub(crate) async fn finish<T>(self, result: Result<T>) -> Result<T> {
         drop(self.callback);
         let _ = self.shutdown.send(());
         let _ = self.drain.await;
@@ -597,7 +473,10 @@ impl CommitRecorder {
             );
         }
         match result {
-            Ok(()) => self.store.finalize_done().await,
+            Ok(value) => {
+                self.store.finalize_done().await?;
+                Ok(value)
+            }
             Err(error) => {
                 let _ = self.store.flush().await;
                 Err(error)
@@ -708,58 +587,24 @@ pub(crate) fn should_resume(
 /// 以原生 Checkpoint 策略复制大文件；恢复路径与已确认范围只由目标引擎发现。
 /// 本地记录器保留现有产品进度收尾，不向引擎提供 `.part` 路径或缺失区间。
 pub(crate) async fn copy_file_with_resume(
-    entry: &Arc<ObservedEntry>, src_storage: &StorageContext, dest_storage: &StorageContext,
-    enable_integrity_check: bool, is_source_reserved: bool, qos_manager: Option<QosManager>,
-    bytes_counter: Option<Arc<AtomicU64>>, job_dir: &str,
-) -> Result<()> {
+    entry: &Arc<ObservedEntry>, src_storage: &StorageContext, dest_storage: &StorageContext, options: CopyOptions,
+    job_dir: &str,
+) -> Result<Option<CopiedPublication>> {
     let recorder = CommitRecorder::start(job_dir, entry, src_storage.block_size()).await?;
 
     let res = copy_transfer::copy_checkpointed(
         src_storage,
         dest_storage,
         entry,
-        crate::file_copy::CopyOptions {
+        CopyOptions {
             transfer_mode: TransferMode::Checkpoint,
-            qos: qos_manager,
-            enable_integrity_check,
-            is_source_reserved,
-            bytes_counter,
-            ..Default::default()
+            ..options
         },
     )
     .await;
 
     let result = res.map_err(AppError::from);
     recorder.finish(result).await
-}
-
-/// 处理单个文件或目录的复制
-pub(crate) async fn process_rename_entry(
-    from_entry: Arc<ObservedEntry>, to_entry: Arc<ObservedEntry>, src_storage: Arc<StorageContext>,
-    dest_storage: Arc<StorageContext>, is_source_reserved: bool,
-) -> Result<()> {
-    let from_path = from_entry.get_relative_path();
-    let to_path = to_entry.get_relative_path();
-    let span = info_span!("process_rename", from = %from_path.display(), to = %to_path.display());
-
-    async {
-        trace!("rename file: {:?} to {:?}", from_path, to_path);
-
-        dest_storage
-            .roles
-            .namespace()?
-            .rename(from_entry.path(), to_entry.path())
-            .await?;
-
-        if !is_source_reserved {
-            // 如果源文件不是保留文件，删除源文件
-            copy_namespace::delete_file(src_storage.storage(), to_entry.as_ref()).await?;
-        }
-
-        Ok(())
-    }
-    .instrument(span)
-    .await
 }
 
 #[cfg(test)]
@@ -807,7 +652,7 @@ mod native_completion_tests {
     }
 
     #[test]
-    fn completion_shares_history_and_counts_each_selected_version_once() {
+    fn completion_shares_version_facts_and_counts_the_whole_entry_once() {
         let entry = history(false);
         let mut stats = FullStats::new(JobType::Copy, "selected".into(), String::new(), String::new());
         let completed: Vec<_> = crate::file_copy::selected_copy_items(&entry, true).collect();
@@ -819,7 +664,12 @@ mod native_completion_tests {
             let event = StorageEntryMessage::New(item);
             stats.update_from_message(&event);
         }
-        assert_eq!(stats.regular_file_count, 3);
+        assert_eq!(stats.regular_file_count, 0);
+        stats.update_from_message(&StorageEntryMessage::CopyEntryCompleted {
+            entry: Arc::clone(&entry),
+            logical_bytes: 37,
+        });
+        assert_eq!(stats.regular_file_count, 1);
         assert_eq!(stats.regular_file_size, 37);
         assert_eq!(ids, ["old", "null", "latest"]);
 

@@ -11,20 +11,21 @@
 // 标准库
 use app::scan::ScanRequest;
 use std::fs;
+#[cfg(feature = "remote")]
 use std::net::SocketAddr;
-use std::sync::Arc;
-use task_model::TransferMode;
+#[cfg(feature = "remote")]
+use std::path::Path;
+use task_model::{SourceCleanupPolicy, TransferMode};
 use tokio::signal::ctrl_c;
 use tokio_util::sync::CancellationToken;
 
 // 外部crate
 use app::config::SyncJobConfig;
-use app::orchestrator::SyncOrchestrator;
 use app::prelude::{integrity_check, parse_bandwidth_string, rm, scan, sync};
-use app::storage_factory::{StorageRole, create_storage_for_role};
+#[cfg(feature = "remote")]
+use app::remote_sync::{send, serve};
 use data_mover::redact_storage_url;
 use tracing::info;
-use transport::quic;
 use utils::app_config::AppConfig;
 #[cfg(target_os = "windows")]
 use {
@@ -72,6 +73,7 @@ pub fn validate_block_size(s: &str) -> Result<String> {
 
 /// 校验 `delta_size_threshold` 格式（同 `validate_block_size`，复用 `parse_bandwidth_string`
 /// 单位解析）
+#[cfg(feature = "remote")]
 pub fn validate_delta_size_threshold(s: &str) -> Result<String> {
     match parse_bandwidth_string(s) {
         Ok(_) => Ok(s.to_string()),
@@ -174,9 +176,11 @@ pub async fn scan_cmd(
 pub async fn sync_cmd(
     job_id: &str, src_path: &Option<String>, dest_path: &Option<String>, enable_integrity_check: bool,
     enable_acl: bool, r#match: &Option<String>, exclude: &Option<String>, qos: &Option<String>, peak_qos_rate: f32,
-    iops: Option<u32>, block_size: &Option<String>, delta_size_threshold: &Option<String>, file_list: &Option<String>,
-    packaged: bool, package_depth: Option<usize>, remote: &Option<String>, tls_server_cert: &Option<String>,
-    token: &Option<String>, raw_command_line: String, resume: bool, in_place: bool, delete_target: bool,
+    iops: Option<u32>, block_size: &Option<String>, #[cfg(feature = "remote")] delta_size_threshold: &Option<String>,
+    file_list: &Option<String>, packaged: bool, package_depth: Option<usize>,
+    #[cfg(feature = "remote")] remote: &Option<String>, #[cfg(feature = "remote")] tls_server_cert: &Option<String>,
+    #[cfg(feature = "remote")] token: &Option<String>, raw_command_line: String, resume: bool,
+    #[cfg(feature = "remote")] delete_target: bool,
 ) -> Result<()> {
     let config = AppConfig::fetch()?;
 
@@ -202,6 +206,7 @@ pub async fn sync_cmd(
     let effective_block_size = block_size.as_ref().or(config.sync.block_size.as_ref()).cloned();
 
     // 双进程模式提示
+    #[cfg(feature = "remote")]
     if let Some(addr) = remote {
         info!("Remote mode enabled, connecting to Receiver at {}", addr);
     }
@@ -223,6 +228,7 @@ pub async fn sync_cmd(
         job_dir_pre_existing,
         src_path: src_path_str.to_string(),
         dest_path: dest_path_str.to_string(),
+        source_cleanup: SourceCleanupPolicy::from_reserved(config.sync.is_source_reserved),
         enable_integrity_check: effective_enable_integrity_check,
         enable_acl: effective_enable_acl,
         r#match: effective_match,
@@ -230,19 +236,26 @@ pub async fn sync_cmd(
         qos: effective_qos,
         peak_qos_rate: effective_peak_qos_rate,
         block_size: effective_block_size,
+        #[cfg(feature = "remote")]
         delta_size_threshold: delta_size_threshold.clone(),
+        #[cfg(not(feature = "remote"))]
+        delta_size_threshold: None,
         file_list: file_list.clone(),
         iops,
         packaged,
         package_depth: package_depth.unwrap_or(0),
         raw_command_line,
         progress_callback_url: None,
-        transfer_mode: TransferMode::from_flags(resume, in_place),
+        transfer_mode: TransferMode::from_resume(resume),
+        #[cfg(feature = "remote")]
         delete_target,
+        #[cfg(not(feature = "remote"))]
+        delete_target: false,
         concurrency: None,
     };
 
     // 双进程模式：通过 QUIC 连接远端 Receiver
+    #[cfg(feature = "remote")]
     if let Some(remote_addr) = remote {
         // 加载服务端证书（防 MITM）
         let tls_cert_bytes: Option<Vec<u8>> = match tls_server_cert {
@@ -260,8 +273,7 @@ pub async fn sync_cmd(
             None => None,
         };
 
-        return SyncOrchestrator::new_remote(config, remote_addr, tls_cert_bytes, token.clone())
-            .run()
+        return send(&config, remote_addr, tls_cert_bytes.as_deref(), token.as_deref())
             .await
             .map_err(CliError::AppError);
     }
@@ -371,6 +383,7 @@ pub async fn gui_cmd(host: &str, port: u16) -> Result<()> {
 ///
 /// 监听 QUIC 连接，接收 Sender 的分页文件列表，比较后请求传输。
 /// 生成的 TLS 证书写入 `tls_cert_out`，Sender 侧通过 `--tls-server-cert` 加载以防 MITM。
+#[cfg(feature = "remote")]
 pub async fn serve_cmd(listen: &str, dest_path: &str, tls_cert_out: &str, token: &Option<String>) -> Result<()> {
     info!(
         "Starting Receiver daemon on {}, dest: {}",
@@ -383,44 +396,6 @@ pub async fn serve_cmd(listen: &str, dest_path: &str, tls_cert_out: &str, token:
         .parse()
         .map_err(|e| CliError::InvalidParameter(format!("Invalid listen address: {e}")))?;
 
-    // 3. 创建目标端 StorageContext
-    let dest_storage = Arc::new(create_storage_for_role(dest_path, None, true, StorageRole::Destination).await?);
-    info!("Created destination storage for: {}", redact_storage_url(dest_path));
-
-    // 4. bind QUIC endpoint，生成服务端证书 DER（不等待连接）
-    let (endpoint, cert_der) = quic::bind(listen_addr)?;
-
-    // 5. 将服务端 TLS 证书写入文件（供 Sender 侧 --tls-server-cert 使用）
-    //    必须在等待连接（accept_connection）之前写入：Sender 在发起连接前就要读取该文件，
-    //    若放到连接建立之后写会形成死锁。
-    if let Err(e) = std::fs::write(tls_cert_out, &cert_der) {
-        tracing::warn!(
-            "无法写入 TLS 证书到 '{}': {}。Sender 侧将无法验证服务端身份。",
-            tls_cert_out,
-            e
-        );
-    } else {
-        info!(
-            "Server TLS cert written to '{}'. Pass this to Sender: --tls-server-cert {}",
-            tls_cert_out, tls_cert_out
-        );
-    }
-
-    // 6. 等待并接受 Sender 的 QUIC 连接
-    let receiver_transport = quic::accept_connection(&endpoint).await?;
-    info!("Accepted QUIC connection");
-
-    // 7. 启动双进程 receiver task
-    app::receiver::receiver_task_remote(&receiver_transport, dest_storage, token.as_deref())
-        .await
-        .map_err(CliError::AppError)?;
-
-    // 8. 等连接真正关闭再退出进程：write_all() 返回 Ok 只表示数据进入了 quinn 本地发送队列，
-    //    不代表已经送达对端；若这里立即 return，进程退出会连带丢弃尚未真正发出的最后几帧
-    //    （EntrySuccess/Progress/AllDone）。Sender 收到 AllDone 后会主动关闭连接，wait_idle()
-    //    等的正是这个信号；兜底走 quinn 默认 30s idle timeout，不会无限等待。
-    endpoint.wait_idle().await;
-
-    info!("Receiver daemon completed");
+    serve(listen_addr, dest_path, Path::new(tls_cert_out), token.as_deref()).await?;
     Ok(())
 }

@@ -1,5 +1,11 @@
-use futures::future::join_all;
-use tokio::sync::mpsc;
+use futures::future::try_join_all;
+use std::fmt;
+use std::sync::{
+    Arc,
+    atomic::{AtomicUsize, Ordering},
+};
+use thiserror::Error;
+use tokio::sync::{mpsc, mpsc::error::SendError};
 use tracing::trace;
 
 /// 默认广播通道容量（条目数）。
@@ -8,10 +14,29 @@ use tracing::trace;
 /// 副本曾导致调整时遗漏；现统一在此处 SSOT。
 pub const DEFAULT_CHANNEL_CAPACITY: usize = 1000;
 
+#[derive(Error)]
+#[error("required consumer {consumer_index} disconnected: {source}")]
+pub struct BroadcastError<T> {
+    pub consumer_index: usize,
+    #[source]
+    pub source: SendError<T>,
+}
+
+impl<T> fmt::Debug for BroadcastError<T> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // 消息可能带完整元数据，错误诊断不输出载荷。
+        formatter
+            .debug_struct("BroadcastError")
+            .field("consumer_index", &self.consumer_index)
+            .finish_non_exhaustive()
+    }
+}
+
 #[derive(Clone)]
 pub struct BroadcastForwarder<T> {
     buffer: usize,
     senders: Vec<mpsc::Sender<T>>,
+    failed_consumer: Arc<AtomicUsize>,
 }
 
 impl<T> BroadcastForwarder<T>
@@ -22,6 +47,7 @@ where
         Self {
             buffer,
             senders: Vec::new(),
+            failed_consumer: Arc::new(AtomicUsize::new(usize::MAX)),
         }
     }
 
@@ -32,14 +58,97 @@ where
         rx
     }
 
+    pub fn is_closed(&self) -> bool {
+        self.failed_consumer.load(Ordering::Relaxed) != usize::MAX
+    }
+
     /// 广播消息，等待所有消费者通道有空位（背压）。
     ///
-    /// 消费者已退出（Receiver 被丢弃）时，对应的发送失败会被静默忽略，
-    /// 这与 `tokio::sync::broadcast` 的行为一致。
+    /// 必需消费者退出立即返回类型化错误，不等待其他已满通道。
+    /// 已接收消息的消费者不会回滚；调用方必须阻止后续成功及源删除阶段。
     /// 当所有 `BroadcastForwarder` 克隆体都被丢弃时，所有消费者的通道自动关闭。
-    pub async fn broadcast(&self, msg: T) {
+    pub async fn broadcast(&self, msg: T) -> Result<(), BroadcastError<T>> {
+        let consumer_index = self.failed_consumer.load(Ordering::Relaxed);
+        if consumer_index != usize::MAX {
+            return Err(BroadcastError {
+                consumer_index,
+                source: SendError(msg),
+            });
+        }
         trace!("Broadcasting message: {:?}", msg);
-        let futures: Vec<_> = self.senders.iter().map(|s| s.send(msg.clone())).collect();
-        join_all(futures).await;
+        let sends = self.senders.iter().enumerate().map(|(consumer_index, sender)| {
+            let message = msg.clone();
+            async move {
+                sender
+                    .send(message)
+                    .await
+                    .map_err(|source| BroadcastError { consumer_index, source })
+            }
+        });
+        match try_join_all(sends).await {
+            Ok(_) => Ok(()),
+            Err(error) => {
+                let _ = self.failed_consumer.compare_exchange(
+                    usize::MAX,
+                    error.consumer_index,
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                );
+                Err(error)
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+    use tokio::time::timeout;
+
+    #[tokio::test]
+    async fn closed_consumer_fails_while_another_queue_is_full_and_preserves_failed_message() {
+        let mut forwarder = BroadcastForwarder::new(1);
+        let mut full = forwarder.subscribe();
+        let closed = forwarder.subscribe();
+        forwarder.broadcast("first").await.unwrap();
+        let peer = forwarder.clone();
+        drop(closed);
+        let failure = timeout(Duration::from_millis(100), forwarder.broadcast("credential-canary"))
+            .await
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(failure.consumer_index, 1);
+        assert!(peer.is_closed());
+        assert_eq!(peer.broadcast("later").await.unwrap_err().consumer_index, 1);
+        assert_eq!(failure.source.0, "credential-canary");
+        assert!(!format!("{failure:?} {failure}").contains("credential-canary"));
+        assert_eq!(full.recv().await, Some("first"));
+        assert!(
+            full.try_recv().is_err(),
+            "blocked send must be cancelled on peer failure"
+        );
+    }
+
+    #[tokio::test]
+    async fn slow_consumers_keep_backpressure_and_cancelled_waits_do_not_deliver_later() {
+        let mut forwarder = BroadcastForwarder::new(1);
+        let mut first = forwarder.subscribe();
+        let mut second = forwarder.subscribe();
+        forwarder.broadcast(1).await.unwrap();
+        assert!(
+            timeout(Duration::from_millis(20), forwarder.broadcast(2))
+                .await
+                .is_err()
+        );
+        assert_eq!(first.recv().await, Some(1));
+        assert_eq!(second.recv().await, Some(1));
+        forwarder.broadcast(3).await.unwrap();
+        assert_eq!(first.recv().await, Some(3));
+        assert_eq!(second.recv().await, Some(3));
+        drop(forwarder);
+        assert_eq!(first.recv().await, None);
+        assert_eq!(second.recv().await, None);
     }
 }

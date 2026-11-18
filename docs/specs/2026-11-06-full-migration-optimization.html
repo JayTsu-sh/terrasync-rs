@@ -1,0 +1,1124 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="description" content="TerraSync 全量迁移优化方案：保留或删除源端时的目录元数据、扫描计划、多版本顺序、故障恢复、校验与统计契约。">
+  <title>全量迁移优化方案 · TerraSync</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --bg: #f4f6f8;
+      --paper: #fff;
+      --ink: #182a3b;
+      --muted: #526477;
+      --line: #dce4ea;
+      --accent: #086c63;
+      --accent-bg: #eaf5f2;
+      --warn: #86520c;
+      --warn-bg: #fff5e4;
+      --nav-width: 254px;
+      --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+      --mono: ui-monospace, SFMono-Regular, Consolas, "Liberation Mono", monospace;
+    }
+    * { box-sizing: border-box; }
+    html { scroll-behavior: smooth; scroll-padding-top: 24px; }
+    body { margin: 0; color: var(--ink); background: var(--bg); font: 15px/1.85 var(--sans); }
+    a { color: var(--accent); text-underline-offset: 3px; overflow-wrap: anywhere; }
+    a:hover { text-decoration-thickness: 2px; }
+    a:focus-visible, button:focus-visible { outline: 3px solid #c27a16; outline-offset: 4px; border-radius: 3px; }
+    .skip { position: absolute; left: 12px; top: -100px; padding: 8px 14px; background: var(--paper); z-index: 10; }
+    .skip:focus { top: 12px; }
+    .layout { max-width: 1480px; margin: auto; display: grid; grid-template-columns: var(--nav-width) minmax(0, 1fr); }
+    .sidebar { position: sticky; top: 0; align-self: start; height: 100vh; overflow-y: auto; padding: 34px 23px; border-right: 1px solid var(--line); }
+    .brand { font: 700 12px/1.5 var(--mono); letter-spacing: .12em; color: var(--accent); }
+    .sidebar h2 { font-size: 17px; margin: 8px 0 4px; }
+    .sidebar p { margin: 0 0 20px; color: var(--muted); font-size: 12px; }
+    .sidebar nav a { display: block; padding: 7px 9px; margin: 3px -9px; border-radius: 6px; text-decoration: none; color: var(--muted); font-size: 13px; }
+    .sidebar nav a:hover { background: #e6eeed; color: var(--accent); }
+    .sidebar nav a.major { margin-top: 16px; font-weight: 700; color: var(--ink); }
+    .sidebar .nav-note { margin-top: 28px; padding-top: 18px; border-top: 1px solid var(--line); }
+    main { min-width: 0; padding: 36px 42px 70px; }
+    .hero { padding: 34px 38px; background: #142d3b; border-radius: 15px; color: #fff; }
+    .eyebrow { margin: 0 0 12px; font: 12px/1.6 var(--mono); color: #b0ddd0; letter-spacing: .12em; }
+    h1 { font-size: clamp(28px, 3vw, 40px); line-height: 1.35; letter-spacing: -.025em; margin: 0 0 16px; }
+    .hero .lead { max-width: 780px; margin: 0; color: #dbe6ec; font-size: 16px; }
+    .meta { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 22px; }
+    .badge { display: inline-block; padding: 4px 10px; border: 1px solid #66828f; border-radius: 5px; font-size: 12px; color: #e1edf1; }
+    .principles { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; margin: 20px 0 30px; }
+    .principle { background: var(--paper); border: 1px solid var(--line); border-radius: 9px; padding: 18px 20px; }
+    .principle span { display: block; font: 11px/1.5 var(--mono); color: var(--accent); margin-bottom: 8px; }
+    .principle strong { display: block; font-size: 16px; }
+    .principle p { margin: 7px 0 0; font-size: 13px; color: var(--muted); }
+    section { background: var(--paper); border: 1px solid var(--line); border-radius: 12px; padding: 28px 32px; margin: 22px 0; }
+    section > :first-child { margin-top: 0; }
+    section > :last-child { margin-bottom: 0; }
+    h2 { font-size: 23px; line-height: 1.5; letter-spacing: -.02em; margin: 0 0 18px; }
+    h2 .index { font: 13px/1.5 var(--mono); color: var(--accent); display: block; margin-bottom: 4px; }
+    h3 { margin: 30px 0 12px; font-size: 18px; line-height: 1.6; }
+    h4 { font-size: 15px; margin: 22px 0 8px; }
+    p { margin: 12px 0; }
+    ul, ol { padding-left: 24px; margin: 12px 0; }
+    li { padding-left: 3px; margin: 7px 0; }
+    code { font: .87em/1.6 var(--mono); background: #edf2f5; color: #25485c; padding: 2px 5px; border-radius: 4px; overflow-wrap: anywhere; }
+    .note { border-left: 4px solid var(--accent); background: var(--accent-bg); padding: 13px 17px; margin: 18px 0; border-radius: 0 7px 7px 0; }
+    .note.warn { border-left-color: #be811d; background: var(--warn-bg); color: var(--warn); }
+    .note p { margin: 3px 0; }
+    .table-wrap { max-width: 100%; overflow-x: auto; margin: 16px 0; border: 1px solid var(--line); border-radius: 8px; }
+    table { width: 100%; border-collapse: collapse; font-size: 13px; line-height: 1.8; }
+    caption { text-align: left; padding: 12px 14px; font-weight: 700; background: #f1f5f7; }
+    th, td { padding: 12px 14px; text-align: left; vertical-align: top; border-bottom: 1px solid var(--line); overflow-wrap: anywhere; }
+    th { background: #f1f5f7; font-weight: 650; }
+    tbody tr:last-child td, tbody tr:last-child th { border-bottom: 0; }
+    tbody th { min-width: 120px; background: #f8fafb; }
+    .matrix { min-width: 640px; }
+    .muted { color: var(--muted); }
+    .small { font-size: 12px; }
+    .flow { list-style: none; padding: 0; margin: 22px 0; display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 10px; counter-reset: stage; }
+    .flow li { counter-increment: stage; margin: 0; padding: 14px; background: #f1f6f6; border: 1px solid #d0e2dd; border-radius: 8px; font-size: 13px; }
+    .flow li::before { content: counter(stage, decimal-leading-zero); display: block; color: var(--accent); font: 700 12px/1.5 var(--mono); margin-bottom: 8px; }
+    .flow strong { display: block; font-size: 14px; margin-bottom: 5px; }
+    .flow p { margin: 0; color: var(--muted); font-size: 12px; }
+    .example { margin: 18px 0; background: #f4f7fa; padding: 19px 20px; border-radius: 8px; }
+    .example p { margin: 4px 0; }
+    .metrics { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; margin: 12px 0; }
+    .metric { padding: 12px 15px; background: var(--paper); border: 1px solid var(--line); border-radius: 7px; }
+    .metric b { display: block; font-size: 25px; font-weight: 650; color: var(--accent); line-height: 1.4; }
+    .metric span { color: var(--muted); font-size: 12px; }
+    .metric.pending b { color: var(--warn); }
+    .source-list li { margin-bottom: 13px; }
+    .source-list code { font-size: 11px; }
+    .section-intro { color: var(--muted); margin-top: -6px; }
+    footer { margin: 28px 0 0; font-size: 12px; color: var(--muted); text-align: center; }
+    .tools { display: flex; justify-content: flex-end; margin-bottom: 12px; }
+    .print-button { appearance: none; padding: 7px 13px; border: 1px solid #bdcdd7; border-radius: 6px; background: var(--paper); color: var(--ink); font: 13px/1.5 var(--sans); cursor: pointer; }
+    .print-button:hover { border-color: var(--accent); color: var(--accent); }
+    @media (max-width: 1100px) {
+      :root { --nav-width: 220px; }
+      main { padding: 26px 24px 50px; }
+      section { padding: 25px; }
+      .hero { padding: 28px; }
+      .flow { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    }
+    @media (max-width: 780px) {
+      .layout { display: block; }
+      .sidebar { position: static; width: auto; height: auto; padding: 20px; border-right: 0; border-bottom: 1px solid var(--line); }
+      .sidebar h2 { font-size: 16px; }
+      .sidebar p { margin-bottom: 10px; }
+      .sidebar nav { display: flex; gap: 5px 14px; flex-wrap: wrap; }
+      .sidebar nav a, .sidebar nav a.major { margin: 0; padding: 3px 0; font-size: 12px; }
+      .sidebar nav .sub, .sidebar .nav-note { display: none; }
+      main { padding: 20px 14px 40px; }
+      .hero { padding: 25px 23px; }
+      .principles { grid-template-columns: 1fr; gap: 8px; margin-bottom: 20px; }
+      .principle { padding: 13px 18px; }
+      .principle span { display: inline; margin-right: 8px; }
+      .principle strong { display: inline; font-size: 14px; }
+      section { padding: 22px 18px; }
+      h2 { font-size: 21px; }
+      h3 { font-size: 17px; }
+      th, td { padding: 10px; }
+      .metrics { gap: 6px; }
+      .metric { padding: 10px; }
+      .metric b { font-size: 22px; }
+    }
+    @media (max-width: 390px) { .flow, .metrics { grid-template-columns: 1fr; } }
+    @media (prefers-reduced-motion: reduce) { html { scroll-behavior: auto; } }
+    @page { size: A4; margin: 16mm 13mm; }
+    @media print {
+      body { font-size: 10pt; background: #fff; color: #000; }
+      .layout { display: block; max-width: none; }
+      .sidebar, .tools, .skip { display: none; }
+      main { padding: 0; }
+      .hero { background: #fff; color: #000; border: 1px solid #aaa; padding: 18px; }
+      .hero .lead, .eyebrow, .badge { color: #333; }
+      .badge { border-color: #aaa; }
+      h1 { font-size: 25pt; }
+      h2 { font-size: 17pt; }
+      h3 { font-size: 13pt; }
+      section { border: 0; padding: 0; margin: 24px 0; }
+      h2, h3, h4 { break-after: avoid; }
+      .principle, .flow li, .example, .note, tr { break-inside: avoid; }
+      .flow { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .table-wrap { overflow: visible; border-radius: 0; }
+      table { font-size: 9pt; }
+      .matrix { min-width: 0; }
+      th, td { padding: 7px 8px; }
+      thead { display: table-header-group; }
+      a { color: #000; }
+      footer { text-align: left; }
+    }
+  </style>
+</head>
+<body>
+  <a class="skip" href="#main">跳到正文</a>
+  <div class="layout">
+    <aside class="sidebar" aria-label="文档导航">
+      <div class="brand">TERRASYNC / DESIGN</div>
+      <h2>全量迁移优化方案</h2>
+      <p>设计建议 · 更新于 2026-11-16</p>
+      <nav aria-label="目录">
+        <a class="major" href="#overview">01　范围与设计原则</a>
+        <a class="major" href="#current">02　当前实现与缺口</a>
+        <a class="major" href="#keep-source">03　保留源端的全量迁移</a>
+        <a class="sub" href="#keep-mtime">目录 mtime 与 blocks</a>
+        <a class="sub" href="#baseline">新全量的 base 清理</a>
+        <a class="sub" href="#generation-planning">代次与过滤场景决策</a>
+        <a class="sub" href="#missing-source-confirmation">未命中项的存在性确认</a>
+        <a class="sub" href="#versions">跨 entry 的多版本顺序</a>
+        <a class="sub" href="#slash-key-objects">非空尾斜杠对象的目标适配</a>
+        <a class="sub" href="#metadata-plan">扫描与元数据计划</a>
+        <a class="sub" href="#metadata-persistence">元数据分类与摘要持久化</a>
+        <a class="sub" href="#metadata-fetch">合并读取与增量比较</a>
+        <a class="sub" href="#network">网络中断与优雅退出</a>
+        <a class="sub" href="#retry-report">偶发失败与上报</a>
+        <a class="major" href="#move-source">04　删除源端的全量迁移</a>
+        <a class="sub" href="#ready-contract">目标就绪与安全删除</a>
+        <a class="sub" href="#directory-cleanup">目录删除与收尾</a>
+        <a class="sub" href="#fault-matrix">异常故障矩阵</a>
+        <a class="sub" href="#verification">校验时机与内容</a>
+        <a class="sub" href="#file-transfer-mode">文件续传与 Direct 模式</a>
+        <a class="sub" href="#target-failure-cleanup">数据与元数据失败的目标清理</a>
+        <a class="sub" href="#delete-failure">删除失败与恢复</a>
+        <a class="sub" href="#permanent-version-delete">版本化源永久删除</a>
+        <a class="major" href="#statistics">05　统计与状态呈现</a>
+        <a class="major" href="#delivery">06　职责与实施优先级</a>
+        <a class="major" href="#acceptance">07　验收与未验证范围</a>
+        <a class="sub" href="#full-migration-performance">全量迁移性能与内存目标</a>
+        <a class="major" href="#references">08　代码与协议依据</a>
+      </nav>
+      <p class="nav-note">独立 HTML，可离线阅读正文。代码链接指向同一仓库内的源文件；外部协议资料需要联网。支持浏览器打印为 PDF。</p>
+    </aside>
+
+    <main id="main">
+      <div class="tools"><button class="print-button" type="button" onclick="window.print()">打印 / 导出 PDF</button></div>
+      <header class="hero">
+        <p class="eyebrow">FULL MIGRATION · CORRECTNESS &amp; RECOVERY</p>
+        <h1>全量迁移优化方案</h1>
+        <p class="lead">围绕目录元数据、多版本顺序、扫描计划、网络故障、校验、源端清理和统计，分别定义保留源端与删除源端时的完成条件。</p>
+        <div class="meta">
+          <span class="badge">分析日期：2026-11-06</span>
+          <span class="badge">最近更新：2026-11-16</span>
+          <span class="badge">状态：设计建议，待实施验收</span>
+          <span class="badge">分析阶段未修改运行时代码</span>
+        </div>
+      </header>
+
+      <div class="principles" aria-label="三项设计原则">
+        <div class="principle"><span>01 / ORDER</span><strong>扫描顺序与完成顺序分开</strong><p>采用 unordered 扫描；复制、重试与发布仍需完成屏障。</p></div>
+        <div class="principle"><span>02 / SAFETY</span><strong>目标就绪后删除，异步入库</strong><p>数据、元数据、所选校验及目标持久性成功后删源，不等待逐文件入库。</p></div>
+        <div class="principle"><span>03 / RETRY</span><strong>按上一代源保留策略选模式</strong><p>保留源端的基线可供增量；连续删除源端的代次重新全量。</p></div>
+      </div>
+
+      <section id="overview">
+        <h2><span class="index">01 / SCOPE</span>范围与设计原则</h2>
+        <p>本方案覆盖保留源端的复制，以及目标就绪后删除源端的搬迁。全量不支持断点续扫。保留源端任务失败后重新扫描并增量比较；当前删除源端时，上一代保留源端则做增量，上一代删除源端则重新全量，不复用其基线。这条代次规则同时覆盖上一代成功、失败和取消。</p>
+        <p>推荐优先完善现有 unordered 扫描、路径分派和目录统一收尾机制。只有需要提前完成子树时，再引入目录完成屏障；不将切换 blocks 或合并全部历史版本作为正确性的替代方案。</p>
+        <div class="note"><p><strong>完成条件：</strong>保留源端时，目标文件和目录达到约定状态；删除源端时，还要确认迁移范围内的源项清理完成。结果未知、清理失败和通知失败分别表达。</p></div>
+        <div class="note warn"><p><strong>删除硬约束：</strong>任何数据或所需元数据复制、应用、校验错误尚未解决，目标发布或持久性未确认，都不得删除对应源对象。目标就绪并复核源身份后可以删除，ClickHouse 记录异步批量写入；允许少量记录缺失，不为此增加逐文件确认或专门对账流程。版本化源必须先完成该 key 按目标策略要求的全部迁移结果，再永久清理全部源历史。</p></div>
+        <div class="note warn"><p><strong>版本化源的确定规则：</strong>非多版本目标只复制最新可见版本，多版本目标按源历史顺序复制；启用删除源端时，两种目标都永久删除已迁移 key 的全部源历史记录，包括数据版本与 delete marker。非多版本目标不保存旧历史是本迁移策略的既定语义，不能据此拒绝全部历史清理，也不能声称目标保留了完整历史。</p></div>
+        <div class="note"><p><strong>版本入库与计数：</strong>非版本化目标在 ClickHouse 中只保存最新版本／最新状态，不落旧历史版本明细；版本化目标保存所复制的历史版本。无论一个 entry 含多少版本，统计只计一次，不能以版本数或入库行数替代 entry 数。</p></div>
+        <div class="note"><p><strong>错误上报口径：</strong>所有最终未恢复的错误都必须在 callback 中明确体现，不限于复制错误。配置预算内重试后恢复成功的错误仅记录日志，不进入 callback 错误明细或错误计数；恢复过程中不能提前授权删除，恢复后仍需重新确认全部前置条件。</p></div>
+        <div class="note"><p><strong>校验策略：</strong>默认快速校验，仅校验计划要求的元数据；命令行显式要求全量校验时，同时校验文件数据与元数据。保留源端、删除源端两种模式遵循同一选择，删除前必须通过所选校验并确认目标就绪，不等待单项入库。快速校验通过不等于内容已校验。</p></div>
+        <div class="note"><p><strong>源端元数据获取失败：</strong>在仍可定位和读取源对象数据时，元数据未获取成功不阻断数据复制。数据结果与元数据错误分别记录，明确提示“源端元数据获取失败”；最终未恢复时进入 callback，重试恢复成功仅记日志。不能把数据复制成功当成完整迁移成功，也不能因数据已入库就删除元数据仍失败的源对象。</p></div>
+        <div class="note"><p><strong>扫描前确定元数据 plan：</strong>提前列明获取／跳过类别、额外请求成本和预算。源元数据在扫描阶段获取，原值与分类摘要共同保存到 ClickHouse；增量比较查询按需一次带出原值供后续复制复用，不因原值较大改为仅存摘要、二次查库或复制时回源重取。普通 NFS→S3 无用途 ACL／xattr 明确跳过，不发额外请求。</p></div>
+        <div class="note warn"><p><strong>网络中断处理：</strong>单次超时／连接异常先作为疑似故障，在短而有界的确认窗口内复核，防止网络抖动误触发退出。疑似期间暂停相关新增工作与源删除；稳定恢复后按副作用证据安全继续，仍未知对象保持删除阻断，该次抖动仅记日志。持续失败确认中断后优雅退出并 callback，窗口不被并发或反复抖动重置。</p></div>
+        <div class="note"><p><strong>失败后再次执行：</strong>上一代保留源端时，下一次可增量比较已经入库的复制事实，缺失记录允许重新复制；当前删除源端且上一代也删除源端时，必须重新全量并清空旧 base。不会为了恢复删除代次的少量入库缺失而新增目标端对账、持久化回执或本地扫描暂存。</p></div>
+        <div class="note"><p><strong>文件传输模式：</strong>支持文件级断点续传，对应 data-mover 的 Checkpointed；不启用续传时固定使用 Direct，不再增加 Atomic 选择参数。文件续传状态不决定全量／增量扫描选择，也不表示支持断点续扫。</p></div>
+        <div class="note warn"><p><strong>目标数据清理：</strong>数据复制最终失败时，删除本次失败复制产生的对应目标数据及失效续传状态；仅元数据获取、应用或校验失败时，保留已复制目标数据。两种情况都不得删除源端，清理失败或结果未知必须准确记录并在 callback 上报。</p></div>
+        <div class="note"><p><strong>非空尾斜杠对象：</strong>对象 key 以 / 结尾且内容非空时，目标为非对象存储则自动忽略该对象并保留源端；目标为对象存储则保留原始 key，正常复制内容与所需元数据／版本历史。只忽略该实际对象，不剪枝同前缀下的其他对象。</p></div>
+        <div class="note"><p><strong>本次全量迁移的性能目标：</strong>与优化前相比，整轮性能和内存开销均应相当。元数据观察、摘要、校验、异步批量入库、源清理和目录收尾全部计入。不以小概率入库缺失为由引入常态逐对象等待或额外持久化链路。</p></div>
+        <p>当前处于首次开发阶段，可直接调整任务契约、状态格式、表结构及 callback，无需设计旧版本兼容层。当前数据正确性、幂等、恢复和性能约束仍然有效。</p>
+        <p class="muted small">证据边界：初次源码分析基于 data-mover <code>173a4ce3c9103fca44728cd780b3b74ac992bb5f</code>；后续落地情况见实施进展。当前 Cargo.toml 锁定 <code>69a5ce8df627ddeccd797fc201f1f9a00cbb2494</code>；方案和验收目标不代表已经实现或通过实测。</p>
+      </section>
+
+      <section id="current">
+        <h2><span class="index">02 / FINDINGS</span>当前实现与缺口</h2>
+        <div class="table-wrap">
+          <table class="matrix">
+            <caption>源码现状及其设计影响</caption>
+            <thead><tr><th scope="col">主题</th><th scope="col">当前实现</th><th scope="col">需要补齐的语义</th></tr></thead>
+            <tbody>
+              <tr><th scope="row">目录元数据</th><td><a href="../../crates/app/src/copy_completion.rs">copy_completion::complete</a> 在非 S3 目标统一更新目录，再提交代次，当前依赖数据库提供原始目录观察。</td><td>补齐无数据库收尾与最终校验；删除子项会改变源目录 mtime，必须使用删除前捕获的原值。异步入库不应成为逐文件删除屏障。</td></tr>
+              <tr><th scope="row">复制代次</th><td><a href="../../crates/db/src/catalogue/copy_generation.rs">begin_copy_generation</a> 负责基线清理及失败事实复用。</td><td>当前删除源端且上一代删除源端时重新全量并清空 base；上一代保留源端时允许增量，包含其失败轮次。明确持久化上一代的源保留策略。</td></tr>
+              <tr><th scope="row">失败后的任务选择</th><td><a href="../../crates/app/src/orchestrator.rs">run</a> 选择全量／增量，<a href="../../crates/app/src/copy_execution.rs">begin_copy_catalogue</a> 校验任务绑定。</td><td>按上一代源保留策略选择；不能把所有失败任务一律转增量，也不能因本代启用删除就拒绝复用上一代保留源端的基线。</td></tr>
+              <tr><th scope="row">历史版本</th><td><a href="../../crates/app/src/copy_dispatch.rs">CopyQueues</a> 按路径分派；历史分段在同一 sender worker 顺序执行。</td><td>需区分失败阶段：前序数据复制／发布失败或未知时阻断后续数据发布；单独源元数据获取失败不阻断有序数据复制，但阻断该 key 的完整迁移确认及源清理。</td></tr>
+              <tr><th scope="row">元数据摘要与快照</th><td><a href="../../crates/db/src/schema/columns.rs">表结构</a> 同时包含 entry_snapshot 和 metadata_hash。<a href="../../crates/db/src/scan/candidate_cache.rs">现有 hash</a> 用于候选事件缓存，普通基线写入可置空，且不覆盖完整 ACL／xattr。</td><td>不能把现有缓存 hash 当成完整迁移元数据指纹。摘要与原值的职责、读取投影及保留期限应分别定义。</td></tr>
+              <tr><th scope="row">增量元数据范围</th><td><a href="../../crates/db/src/catalogue/comparison.rs">复制目录比较</a> 的元数据判据主要为 mode／uid／gid；<a href="../../crates/db/src/scan/compare.rs">原生扫描比较</a> 的目录分支优先处理目录标记。</td><td>必须将对象 tags、NFS ACL、xattr 及其他计划要求的元数据纳入文件和目录的增量比较；快照中保存了原值不等于比较逻辑已覆盖。</td></tr>
+              <tr><th scope="row">普通文件搬迁</th><td><a href="../../crates/app/src/file_copy/transfer.rs">execute_file</a> 调用 data-mover transfer，之后由 app 应用／校验元数据；源清理由独立阶段执行。锁定依赖已无 move_file。</td><td>改为完整目标就绪后受保护删除，再异步记账；复用 transfer 与 purge_observed，不能在仅数据 transfer 返回时提前删除。补齐目标持久性及全部源历史永久清理。</td></tr>
+              <tr><th scope="row">命令行校验选择</th><td><a href="../../crates/cli/src/commands_enum.rs">Sync 参数</a> 已有 --enable-integrity-check；<a href="../../crates/cli/src/commands.rs">当前命令处理</a> 还会读取配置文件回退值。</td><td>统一为默认 quick 元数据校验、显式参数 full 数据及元数据校验；参数未开启不等于不校验元数据。CLI／Web 和配置解析须共同落实明确的校验模式。</td></tr>
+              <tr><th scope="row">文件传输模式</th><td><a href="../../crates/task-model/src/transfer.rs">TransferMode::from_resume</a> 将 --resume／Web 文件续传选择映射为 Checkpoint，否则为 Direct，默认值也是 Direct；<a href="../../crates/app/src/file_copy.rs">transfer_policy</a> 仅映射 Checkpointed／Direct。</td><td>产品 Atomic 分支及 --in-place／--no-resume 入口已移除，远程协议升为 v14。NFS／CIFS Direct、失败目标清理及目标持久性仍需分别补齐，不把文件续传误写成扫描续扫。</td></tr>
+              <tr><th scope="row">源元数据获取与数据复制</th><td><a href="../../crates/app/src/scan/observation.rs">validate_required_tags</a> 会在观察准入时拒绝缺失的必需 tags；其他观察和传输路径也可能将元数据失败作为整项操作失败。</td><td>数据仍可读取时必须继续生成和执行数据复制任务，携带分类元数据失败。扫描、data-mover 与任务层需共同支持“数据完成，元数据失败”的结果，不能提前丢弃对象或静默忽略错误。</td></tr>
+              <tr><th scope="row">软链接与 ACL</th><td><a href="../../crates/app/src/receiver.rs">process_entry_on_receiver</a> 对源软链接删除失败、ACL 复制失败只记日志；ACL 处理位于文件搬迁之后。</td><td>统一严格错误传播；必需元数据应在源端删除前完成，不能将这些失败折叠为 entry 成功。</td></tr>
+              <tr><th scope="row">超时与退出</th><td><a href="../../crates/app/src/dir_walker.rs">DirectoryWalker::new</a> 默认没有设置 operation timeout 和 recovery window，普通全量遍历使用这个入口。</td><td>需显式设置有界检测和取消收尾；识别网络中断后快速进入终止流程，不持续重连，也不能借用独立扫描路径的恢复能力作为优雅退出已达标的证据。</td></tr>
+              <tr><th scope="row">统计与诊断</th><td><a href="../../crates/app/src/consumer/stats/report.rs">ProgressDetail::Full</a> 主要是数量、字节和错误数；已有<a href="../../crates/app/src/consumer/stats/diagnostics.rs">有界诊断发件箱与批次身份</a>。</td><td>增加目标就绪、删除结果、目录收尾、结果未知等状态。最终未恢复错误都进入 callback；重试后恢复错误仅写日志。现有有界队列的省略计数不能代替完整最终错误上报。</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <section id="keep-source">
+        <h2><span class="index">03 / COPY</span>保留源端的全量迁移</h2>
+        <p class="section-intro">对应问题：目录 mtime、base 清理、统计、多版本顺序、扫描 plan、网络故障和偶发复制失败。</p>
+
+        <h3 id="keep-mtime">3.1　目录 mtime：保留统一收尾，补齐完成屏障</h3>
+        <p>目录 mtime 应在目标目录中最后一次创建、删除、rename 等目录项操作之后设置。扫描结束或 blocks 的目录块结束，只能证明枚举阶段推进，不能证明异步复制和发布已经结束。</p>
+        <ol>
+          <li>扫描时捕获源目录原始元数据，包括迁移根目录和空目录。</li>
+          <li>先创建目标目录，并保留后续写入、遍历和收尾所需权限。</li>
+          <li>并发迁移内容，等待所有目标命名空间操作、重试和未知结果对账结束。</li>
+          <li>应用目录最终元数据并回读确认；全部必需操作成功后，才确认任务完成。</li>
+        </ol>
+        <p>只恢复 mtime 时，全局命名空间操作结束后可以并发执行。最终 mode、ACL 可能收紧父目录权限，应采用从深到浅的顺序，避免阻断后代收尾。</p>
+        <p>补齐无数据库模式的目录跟踪与收尾。跟踪队列和在途任务有界，不为全部扫描项常驻明细，不新增本地扫描暂存。ClickHouse 仍承担配置启用时的事实及最终报告保存，但单项入库确认不再授权源删除。</p>
+        <div class="note"><p><strong>blocks 的适用点：</strong>未来需要提前完成某个子树时，可结合 blocks 的枚举边界，增加“枚举完整 + 相关 worker 全部确认 + 无待重试或未知操作”的目录完成屏障。blocks 本身不是该屏障。</p></div>
+
+        <h3 id="baseline">3.2　base 清理与代次选择</h3>
+        <div class="table-wrap"><table>
+          <caption>任务绑定相同、确认事实可复用时的基础规则；全量／增量、成功／失败均适用</caption>
+          <thead><tr><th scope="col">上一代</th><th scope="col">当前代</th><th scope="col">模式与基线</th></tr></thead>
+          <tbody>
+            <tr><td>无复制代次，或仅有扫描</td><td>保留或删除源端</td><td>全量；启动扫描前确认清空该 job 的 base。</td></tr>
+            <tr><td>保留源端</td><td>删除源端</td><td>增量；复用已入库的复制事实；已复制且未变化项不重传数据，核验目标后仍删源，缺失或变化项先复制就绪再删源。</td></tr>
+            <tr><td>删除源端</td><td>删除源端</td><td>重新全量；清空旧 base，处理当前源端，不复用已搬走对象的记录。</td></tr>
+            <tr><td>删除源端</td><td>保留源端</td><td>重新全量；清空旧 base，避免将上轮正常搬走的源项误判为反向目标删除。已存在的目标数据保留。</td></tr>
+            <tr><td>保留源端</td><td>保留源端</td><td>增量；失败也重新枚举比较，不恢复扫描位置。</td></tr>
+          </tbody>
+        </table></div>
+        <p>代次选择使用开始时持久化的源保留策略，不能只看最后成功代次，否则失败或取消的删除任务会被误判。模式判定、执行独占、旧执行收束、任务绑定及 base 准备在任务层／db 统一处理。查询失败明确上报，不根据 job_dir 存在与否猜测模式。</p>
+        <p><strong>删源迁移的 base 生命周期：</strong>本轮复制、目录元数据收尾及源清理仍需使用 base，不能中途全表清空；这些操作结束且所有写入者已收束后，清空该 job 的全部 base 内容，不留下后续增量基线。正常失败收尾也尝试清理；强制退出或清理未确认时，在下一轮取得独占并收束旧执行后强制清理。只清理 base，不删除独立的代次源保留策略、最终报告或错误归档；不把这次整轮清理放进逐文件删源的等待链路。</p>
+        <p class="muted small">当前已在 finish_copy_generation 接入删源代次的终态 base 回收（70cb4cb）：成功、失败和取消均尝试清理，先等待并关闭本执行已知 base 写入入口，再按代次条件同步清理并核对空表。服务端条件只清理本代及更早的非零复制序列，保护新复制代次与普通扫描；未知归属残留明确报错，不能扩大删除范围或伪报 Completed。Single／双副本 Cluster 已独立核对物理副本为空、其他 job 保留、延迟清理安全，以及实际 Local 删源完成后立即空表；独立代次策略和最终报告仍保留。强制退出、未确认的旧远端写入及跨主机执行互斥仍需按执行隔离约束处理，本步骤不代表分布式 fencing 或逐文件异步删源已经完成。</p>
+        <p>新全量顺序：取得独占 → 确认旧执行停止 → 清理本 job 的 base 与本轮临时状态 → 确认清理 → 启动扫描。Single／Cluster 的物理表及副本差异归 db；不能将发出异步 DELETE 当作清空确认，也不能清理其他 job。</p>
+        <p>异步入库缺失是允许的低概率代价：保留源端时，增量可能重新复制；删除源端后，下一删除代次重新全量，不要求补记已搬走对象。不会为了记账完整性新增目标对账、持久回执或本地暂存。源缺失不得触发删除任务对目标的反向删除。</p>
+        <p>版本化目标的同次运行重试仍需核实发布归属，防止响应丢失时盲目重放；代次规则不消除存储协议的幂等要求。每轮身份隔离和旧执行收束仍有效，不能让晚到写入污染新代次。</p>
+        <h4 id="generation-planning">3.2.1　统一计划：迁移模式与目标清理分别决策</h4>
+        <p><strong>已确定的时间窗口策略：Incremental + Preserve。</strong>上一代保留源端、任务绑定及复制契约可复用时，时间窗口变化仍按增量处理：重新枚举并按当前过滤条件比较，复用已确认目标事实，只复制本轮命中的新增／变化项。对本轮未观察项保留目标及确认事实，不因窗口变化强制全量，不逐项回源确认后改为目标删除。上一代删源、本轮无可复用确认事实等全量条件仍优先适用；相同 job ID 的源／目标绑定变化则报错退出。</p>
+        <p>计划由 app 的迁移模块统一生成，CLI 和 Web 只提交结构化请求并展示结果；db 负责状态、确认事实和 Single／Cluster 的准备与清理，data-mover 负责过滤语义、能力和存储操作。job ID 用于定位对应数据库／作业命名空间内的历史，不能单独证明源根、目标根及复制契约相同。原始命令行用于脱敏审计，不能靠解析其字符串或读取 job_dir 来决定模式。</p>
+        <p>当前源保留设置来自配置，同一条 sync 命令也可能产生不同策略。入口应将配置优先级解析后的有效策略固定到本轮请求，计划及 worker 使用同一不可变值，避免并发任务重复读取可变化的全局配置而产生分歧。</p>
+        <div class="table-wrap"><table>
+          <caption>统一计划的独立决策；完整接入及各字段实现进度见实施章节</caption>
+          <thead><tr><th scope="col">字段</th><th scope="col">含义</th><th scope="col">示例</th></tr></thead>
+          <tbody>
+            <tr><td>mode</td><td>是否复用上一代已确认复制事实；不决定是否重新枚举源端。</td><td>Full / Incremental</td></tr>
+            <tr><td>source_cleanup</td><td>是否对本轮命中且目标就绪的源项执行受保护清理。</td><td>Retain / DeleteSelectedReady</td></tr>
+            <tr><td>target_cleanup</td><td>是否允许根据已证实的源缺失清理目标；独立于删源开关。时间窗口变化固定 Preserve。</td><td>Preserve / ConfirmAbsentWithinScope（其他允许清理的任务）</td></tr>
+            <tr><td>baseline_action</td><td>复用确认事实，或在新全量前使旧基线失效并确认清空。</td><td>ReuseConfirmed / Reset</td></tr>
+            <tr><td>selection</td><td>match、exclude、文件清单、遍历规则版本及本轮固定时间基准。</td><td>相对时间命中，目标保留</td></tr>
+            <tr><td>reasons</td><td>完整的机器可读决策原因，正常选择不计为错误。</td><td>NoPreviousMigration / PreviousDeletesSource / RelativeTimePreserveTarget</td></tr>
+          </tbody>
+        </table></div>
+        <p>全量表示不按上一代 base 跳过迁移项；增量表示复用可信确认事实。两者都重新枚举当前源范围、重新执行过滤，不支持断点续扫。文件 Checkpointed／Direct 和单文件是否复用有效续传片段是另一个维度。远程路径也必须执行相同计划，不能在选择后把 mode 当成无操作，或者仅凭目标 mtime／size 就跳过计划要求的处理。</p>
+        <div class="table-wrap"><table>
+          <caption>代次及基线决策矩阵；在任何破坏性操作前先检查绑定和状态读取结果</caption>
+          <thead><tr><th scope="col">场景</th><th scope="col">本轮</th><th scope="col">模式与处理</th></tr></thead>
+          <tbody>
+            <tr><td>没有上一迁移代次，或仅有普通扫描记录</td><td>保留／删除源端</td><td>Full；扫描事实不能冒充已完成目标复制的事实。</td></tr>
+            <tr><td>上一代保留源端，全量成功</td><td>保留源端</td><td>Incremental；命中新项或数据／元数据变化项才执行对应工作。</td></tr>
+            <tr><td>上一代保留源端，增量成功</td><td>保留源端</td><td>Incremental；同样复用确认事实。</td></tr>
+            <tr><td>上一代保留源端，基线准备完成后失败／取消</td><td>保留源端</td><td>Incremental；重新枚举，仅复用已确认事实。合法但为空的确认集合仍可进入增量，实际会复制所有本轮命中项。</td></tr>
+            <tr><td>上一代保留源端且事实可复用</td><td>删除源端</td><td>Incremental；已复制且未变项不重传，但必须按本轮要求核验目标，再清理本轮命中的源项。</td></tr>
+            <tr><td>上一代删除源端；不论全量／增量、成功／失败／取消</td><td>保留源端</td><td>Full；不复用可能已搬空源端的基线，不把已搬走项反向删除到目标。</td></tr>
+            <tr><td>上一代删除源端；不论全量／增量、成功／失败／取消</td><td>删除源端</td><td>Full；上一代 base 为空也不能误认成没有历史策略。</td></tr>
+            <tr><td>基线丢失、准备未完成、损坏或无法解释其复制契约</td><td>保留／删除源端</td><td>不能复用；可明确重建时 Full，未知写入／旧执行未收束等情况先报错，不能先清表再猜测。</td></tr>
+            <tr><td>job ID 相同，实际源根、目标根或路径映射变了</td><td>任意</td><td>报错退出；不自动转为 Full，不清空旧 base，不覆盖原绑定或上一已接受代次。错误明确进入 callback。</td></tr>
+            <tr><td>数据库关闭，没有可靠的代次记录</td><td>保留源端</td><td>Full；不读取原始命令行或目录存在状态猜测上一代。无数据库搬迁能力须单独实现和验收。</td></tr>
+            <tr><td>配置启用的数据库读取失败、权限拒绝或结果未知</td><td>任意</td><td>有类型错误并通知；不能当作“无上代”自动 Full，也不能清空历史。</td></tr>
+          </tbody>
+        </table></div>
+        <div class="table-wrap"><table>
+          <caption>过滤场景：假设上一代保留源端且确认事实可复用</caption>
+          <thead><tr><th scope="col">场景</th><th scope="col">推荐模式</th><th scope="col">目标与基线处理</th></tr></thead>
+          <tbody>
+            <tr><td>无过滤；范围稳定</td><td>Incremental</td><td>是否同步源端真实删除由独立目标清理策略决定。</td></tr>
+            <tr><td>相同静态过滤，例如扩展名、大小或绝对日期</td><td>Incremental</td><td>本轮重新过滤。属性变化也可能导致出界，缺失仍不直接证明源删除。</td></tr>
+            <tr><td>相同 modified &gt; 7d；文件由 6 天变成 8 天，刚进入窗口</td><td>Incremental</td><td>当前命中即查确认事实：无记录则复制，有相同目标事实则按要求跳过数据或补元数据。</td></tr>
+            <tr><td>相同 modified &lt; 7d；文件由 6 天变成 8 天，离开窗口</td><td>Incremental + Preserve</td><td>不删除目标，保留该路径最后确认的目标事实，不把它记为 Deleted。</td></tr>
+            <tr><td>文件修改后重新进入窗口</td><td>Incremental + Preserve</td><td>重新比较身份、数据及所需元数据；有变化则更新。仅时间重入且事实相同，不重复复制。</td></tr>
+            <tr><td>match 或 exclude 含相对时间；任意 AND／OR 分支</td><td>Incremental + Preserve</td><td>根据解析后的表达式识别，不能只检查字符串中的 d、字段名或当前短路命中分支。</td></tr>
+            <tr><td>过滤表达式或文件清单发生变化</td><td>可复用确认事实时仍可 Incremental + Preserve</td><td>重新枚举新范围；旧记录只表示目标曾被确认，不作为当前源清单。若复制契约同时改变且无法复核，才重建或拒绝。</td></tr>
+            <tr><td>只改变空白、引号等表达形式</td><td>不因原始命令文本变化强制 Full</td><td>使用保留求值顺序、剪枝语义及 DSL 版本的遍历指纹；无法证明等价时仍不得据缺失清理目标。</td></tr>
+            <tr><td>过滤语法错误或分析失败</td><td>不启动迁移</td><td>明确报错；绝不能用 .ok() 将解析失败变成无过滤。</td></tr>
+            <tr><td>时间窗口迁移同时显式请求目标镜像删除</td><td>配置冲突，报错退出</td><td>窗口迁移固定保留目标，不能切换为缺失确认后清理，也不能静默忽略显式参数。</td></tr>
+          </tbody>
+        </table></div>
+        <p><strong>保留确认事实不等于保存所有旧版本：</strong>非版本化目标按逻辑目标路径保留最后一次确认的最新状态，不能因为窗口外记录保留而累积该路径全部源版本；版本化目标才保存所复制历史及其发布关联。正常迁移未命中项、计划内忽略对象和真实复制失败也必须分开。单纯清空窗口外记录会让重入项重复制，在版本化目标还可能产生重复历史。</p>
+        <p>确认事实按逻辑目标路径／要求保留的版本维护，不为同一路径每轮另存一套无界历史快照。进程不常驻加载整个旧 base；数据库中的事实保留与目标中仍保留的数据相对应。若另行淘汰确认事实以控制数据库容量，必须接受后续复核／重复制成本，不能把事实淘汰当作源端真实删除。</p>
+        <p>目标保留计划下，可以省去纯粹为了删除而枚举所有旧 base 缺失项的阶段。比较阶段仍须处理新路径：若稳定句柄相同但当前源路径尚无目标确认，不能把它当成无变化后又跳过 rename 阶段；应复制到新路径并保留旧目标，或在取得真实旧源缺失证据后执行受保护 rename。只在最终 delete 分支加 continue 不足以完成本方案。</p>
+        <h4 id="missing-source-confirmation">3.2.2　本轮未观察项：何时必须回源确认</h4>
+        <div class="note warn"><p><strong>源缺失判定的统一保守规则：</strong>凡是不能可靠确定源项已删除的场景，一律保留目标，不执行基于缺失的目标删除或破坏性 rename。包括过滤出界、目录剪枝、扫描不完整、元数据缺失、基线缺失、源端访问失败、返回语义不明确及证据已失效等情况。只有明确的源缺失证据、本轮目标清理许可、目标归属核验和有效执行身份同时满足，才允许相应清理；时间窗口及删源迁移的 Preserve 计划即使取得源缺失证据也继续保留目标。</p><p>不能将保守保留记成删除成功，不能因未确认的源删除而撤销目标确认事实。网络、权限等最终未恢复错误仍须准确进入 callback；重试恢复的错误仅写日志。此规则针对由源缺失推导的目标清理；本次失败复制产物的清理，以及显式的基线失效／整轮清空，仍遵循各自既定契约，不能冒充源项删除。</p></div>
+        <p><strong>所有最终保守保留决定必须在 callback 中体现：</strong>不能只记日志或静默 continue。对已识别的 entry 交付保留事件，说明源／目标路径、源存在性实际状态和保留原因；未取得存在性证据时明确 Unknown，不能伪报源存在、已过滤或删除成功。共享事件代码为 target_preserved，结构化 retention 字段进入 CLI／Web 共用任务契约；retention.scope 为 entry 时表示整个逻辑路径／key，包括该路径已保留的目标版本。</p>
+        <div class="table-wrap"><table>
+          <caption>保守保留 callback 的必要信息；通用通知字段已接入，各决策场景继续接入</caption>
+          <thead><tr><th scope="col">信息</th><th scope="col">要求</th></tr></thead>
+          <tbody>
+            <tr><td>job_id、execution_id、event_id</td><td>定位作业与本执行，重试交付使用同一事件身份。</td></tr>
+            <tr><td>source_path、target_path、适用版本范围</td><td>已知 entry 逐项明确，不以只有总数代替已识别项的明细。</td></tr>
+            <tr><td>action、source_presence</td><td>明确 target_preserved，实际存在性为 Unknown／Present 等可信状态；不能把未核验解释成 NotFound。</td></tr>
+            <tr><td>reason_code、reason</td><td>说明未观察、过滤／剪枝、枚举不完整、权限／网络失败、元数据不足或证据失效等实际原因，原因不明则如实说明。</td></tr>
+            <tr><td>事件级别及原始故障</td><td>计划内保留作为状态事件，不增加 error_count；最终未恢复故障携带真实类型与阶段并按既定 entry／任务口径计错，不能重复计数。</td></tr>
+            <tr><td>累计保留数与交付明细</td><td>只累计实际作出决定的 entry，不按版本数、发送次数累加。HTTP 2xx 后清理该批明细，累计数继续保留。</td></tr>
+          </tbody>
+        </table></div>
+        <p>保留事件共用有界、分页的通知及归档机制，最终报告在可用 ClickHouse 中独立保存；callback 自身发送失败的原因仍只写日志。已恢复的暂时故障不能夹带在保留事件中冒充最终错误；最终仍无法确认时再交付具体保留决定与未恢复原因。</p>
+        <p>对没有逐项展开的窗口外集合，callback 明确报告适用范围、Preserve 策略及未逐项核验，不能虚构逐路径原因或已知数量；对已经识别的 entry 则完整交付明细。扫描中断时报告受影响范围和实际故障，不为所有尚未访问项伪造错误，也不为补报路径而逐项回源增加 stat／HEAD。</p>
+        <p><strong>“本轮未观察到”既不等于“被过滤”，也不等于“源端不存在”。</strong>它还可能来自目录剪枝、未完成枚举、访问失败或源端变化。只有已经取得本项观察且实际过滤不匹配，才可明确标记为本轮不在范围。默认 Preserve 时不需要为全部未观察项逐个 stat／HEAD；只有准备执行目标删除、依赖旧路径消失的 rename，或必须报告“已证实源删除”时，才按需确认。显式使基线失效／整轮清空不需要为每个旧项回源，不能把这种记账清理说成源项已删除。</p>
+        <div class="note"><p><strong>时间窗口变化固定采用增量＋保留目标：</strong>不为全部窗口外旧项增加 stat／HEAD，真实源删除也不自动传播到目标；重新命中时比较保留的确认事实，避免无变化数据重复复制。即使其他操作已经证实源 NotFound，该计划仍保留目标。正常日志和最终报告明确记录 Incremental、Preserve 及本轮时间基准。</p></div>
+        <p><strong>删源迁移固定保留目标：</strong>DeleteSelectedReady 与基于源缺失反向清理目标不能混用。它只删除本轮已就绪的源项，源消失正是预期结果；即使另行确认了源 NotFound，也不能据此清理已迁移目标。若用户同时显式要求这种目标镜像行为，计划应拒绝冲突配置，不能静默改变其含义。</p>
+        <div class="table-wrap"><table>
+          <caption>存在性确认与操作许可</caption>
+          <thead><tr><th scope="col">场景／确认结果</th><th scope="col">解释</th><th scope="col">操作与上报</th></tr></thead>
+          <tbody>
+            <tr><td>本轮已取得观察，过滤结果为不匹配</td><td>当前不在迁移范围；已有存在证据，无须仅为保留目标再读一次。</td><td>保留目标及确认事实，本轮不删该源项，不计删除成功。</td></tr>
+            <tr><td>只有旧 base 记录；本轮无该项观察；目标策略 Preserve</td><td>源存在性未知。</td><td>不执行额外查询，保留目标与事实；不能伪报“已过滤”或“源已删除”。</td></tr>
+            <tr><td>准备清理目标；回源确认原路径仍存在且不匹配当前过滤</td><td>过滤出界，非真实删除。</td><td>保留目标和确认事实，不执行目标删除。</td></tr>
+            <tr><td>原路径存在且仍满足当前过滤</td><td>可能是枚举遗漏、并发变化或新身份占据旧路径。</td><td>按本轮观察重新排队比较／复制，或报告无法完成；不按缺失删除目标。</td></tr>
+            <tr><td>依赖角色返回明确、可信的 NotFound</td><td>仅能确认查询所指定路径／版本语义下缺失。</td><td>Preserve 下仍保留目标；只有显式清理策略和目标归属复核同时允许，才受保护清理对应目标。</td></tr>
+            <tr><td>源端超时、断连、权限拒绝、取消或未知结果</td><td>不能确认存在性，不是 NotFound。</td><td>禁止据此删除／rename。短暂错误恢复只记日志；最终未恢复原因进 callback，网络故障按共享预算停止。</td></tr>
+            <tr><td>源存在，但过滤依赖的必需元数据未取得</td><td>SelectionUnknown，不能猜成命中或出界。</td><td>明确报错并禁止相关删除；已有可靠命中证据且只是复制所需元数据缺失时，仍可复制可读取数据并报告元数据错误。</td></tr>
+            <tr><td>扫描失败／取消，未完整枚举</td><td>不能构造完整缺失集合。</td><td>停止缺失推导的清理；保留确认事实，按异常代次恢复，不为每个未访问项伪造删除错误。</td></tr>
+            <tr><td>S3 当前 HEAD 为 NotFound，但仍有历史版本</td><td>最新删除标记／当前不可见不代表全部历史不存在。</td><td>按目标版本策略判断最新状态；不得据此删除版本化目标的历史。源历史永久清理只在本轮目标就绪后按既定 key 级规则授权。</td></tr>
+            <tr><td>旧路径缺失、新路径命中，源身份可可靠关联</td><td>可能为真实 rename；不能仅凭相同句柄忽略硬链接多义性。</td><td>Preserve 计划优先复制新路径并保留旧目标；需要物理 rename 时补齐源缺失、唯一关联及目标归属证据。目录只在整棵受影响范围得到证明时移动。</td></tr>
+            <tr><td>目标已被其他执行修改，或目标清理失败／结果未知</td><td>旧确认事实不足以授权当前目标破坏。</td><td>保护现存目标、保留可解释事实并报告具体原因；不能先删数据库记录再把清理报成功。</td></tr>
+          </tbody>
+        </table></div>
+        <p>确认操作使用正确源实例、根路径和版本语义；根据存储角色的有类型结果分类，不能匹配错误字符串。并发和待处理队列有界，优先使用后端真实具备的批量能力，不承诺 S3 可以一次 HEAD 多个对象。单项请求超时、故障恢复及取消共用本轮预算，不能每个候选重新开启约 3 秒窗口。源缺失确认与目标删除之间仍可能并发变化，必须使用目标观察／版本条件进行受保护操作；需要严格一致视图时使用可证明的快照或写入约束，不能把一次 stat 说成跨端原子保证。</p>
+        <h4 id="generation-contract">3.2.3　持久化、时间与异常代次契约</h4>
+        <p><strong>需要在 ClickHouse 保存代次描述：</strong>以作业命名空间、job ID 和 execution_id 标识，每轮记录结构化任务类型、解析配置后的有效策略及实际决策，不仅保存原始命令文本。记录独立于 base，删源任务清空 base 后仍能查询上一已开始迁移。原始命令行只作脱敏审计；普通检查／扫描既不能假装生成了复制确认事实，也不能因它是“上一条命令”就覆盖应参考的上一迁移策略。</p>
+        <div class="table-wrap"><table>
+          <caption>按用途持久化，不解析上一条命令文本</caption>
+          <thead><tr><th scope="col">信息</th><th scope="col">建议内容与用途</th></tr></thead>
+          <tbody>
+            <tr><td>代次身份与命令语义</td><td>作业命名空间、job_id、generation／execution_id、任务类型及有序修订；原始命令文本、有效参数快照分别保存，策略只使用后者。</td></tr>
+            <tr><td>作业绑定</td><td>源／目标规范化实例身份、根路径、路径映射及目标版本语义；不包含密码、签名 URL 或 token。</td></tr>
+            <tr><td>上一已开始迁移</td><td>execution_id、source_cleanup、实际 mode、状态及 reasons；开始时持久化，不能只查询最后成功代次，也不能把检查／普通扫描命令当成新的复制基线。</td></tr>
+            <tr><td>复制确认事实的契约</td><td>版本映射、元数据复制／映射规则、观察格式版本、可复用状态和确认路径；它表示目标事实，不是本轮源清单。</td></tr>
+            <tr><td>本轮选择</td><td>原始过滤表达式、解析后的遍历指纹、match／exclude 的相对时间依赖、文件清单内容摘要、filter_evaluated_at。</td></tr>
+            <tr><td>准备与收尾状态</td><td>基线是否可用、Reset 是否完成、本轮写入者及清理是否收束。它独立于“当前设置保留源端”，避免准备失败后误复用旧删源基线。</td></tr>
+            <tr><td>不影响基线的运行参数</td><td>并发、带宽／IOPS、日志和 callback 地址变化不触发 Full。校验升级则对复用项补做本轮要求的校验；续传片段由 data-mover 独立核验。</td></tr>
+          </tbody>
+        </table></div>
+        <p>每轮开始前确认保存已接受计划，准备阶段和终态按同一执行身份更新；这是一轮少量状态写入，不是逐文件入库确认。未接受的语法错误等请求不改变“上一迁移策略”；接受后的失败／取消保留其已声明的源清理策略和准备状态。写入确认丢失时按同一身份确认结果或失败退出，不能在策略是否持久化未知时先启动删源。</p>
+        <p>策略查询取上一已开始迁移及其基线状态，不能只取最后成功代次；最后成功基线的提交标记另行保留。执行修订必须防止迟到的开始／运行状态覆盖终态；跨执行先后由合法的执行所有者及代次次序保证，不能把 ClickHouse 的普通查询、机器时间戳或 MAX+1 当作分布式锁。db 对上层返回统一的代次上下文，CLI／Web 不分别选择“哪个表哪条命令算上一代”。</p>
+        <p>将目前混合源／目标、原始过滤字符串、文件清单及传输开关的 request_key 拆为绑定、复制契约和选择描述，不能因为 filter 改变就直接报源／目标不匹配。相同 job ID 的源／目标绑定变化一律报错退出，检查必须先于基线清理、本轮接受记录覆盖和复制／删源调度；不能通过自动全量、重置或重新绑定继续运行。过滤范围变化在 Preserve 下允许继续比较既有目标事实。复制契约变化若要求补 ACL 等元数据，先取得并应用／校验，不能只凭旧数据成功跳过。无法解释旧确认事实时安全重建或拒绝。</p>
+        <p>在现有 migration_plan 模块集中生成任务计划，元数据观察计划作为其中一部分；用纯选择函数接收已读取的历史描述和当前结构化请求，返回计划，不在函数内部连接数据库。copy_execution 承担独占、持久化接受计划和基线准备等副作用。CLI／Web 调用相同的 app 入口，不能各自组织一次“读历史→选模式→清表”，也不引入多个相互覆盖的计划对象。</p>
+        <p>每个新执行固定一个 filter_evaluated_at：同轮所有 worker、额外确认、匹配和重试共用；新一轮重跑按新的时间计算，文件续传不冻结旧窗口，也不恢复旧扫描位置。稳定过滤定义的指纹不包含本轮时间，否则每轮会被误判为不兼容；本轮请求和报告另行绑定时间。data-mover 已提供 should_skip_at 及 DslTraversalFilter::with_time_anchor，由原生规则按显式时钟判定；app 不替换表达式字符串，也不另写比较器。稳定的 selection_key 不包含本轮时钟，续扫 resume_key 另行绑定时钟，不能跨窗口续扫。</p>
+        <p>当前依赖已有 has_relative_time_condition，可遍历 match 与 exclude 的所有分支；现有 logically_equivalent 只证明布尔表达式等价，不证明目录剪枝、缺失字段和短路求值的遍历结果等价。应复用原生有版本的遍历指纹并保留顺序，不将布尔交换律作为基线／扫描兼容证明。</p>
+        <ol>
+          <li>严格解析当前结构化请求，取得作业独占并收束旧执行；读取上一迁移描述、基线可用性及目标实际能力。外部依赖不可用时明确报错，不猜测。</li>
+          <li>用无副作用的选择函数生成完整计划与原因：先判绑定及复制契约，再判可用确认事实与上一代是否删源，最后确定过滤、目标清理及 rename 许可。</li>
+          <li>在任何复制或删源前持久化本轮已接受计划；基线准备设为未完成。执行 Reset 或确认 Reuse 后，才标记准备就绪并启动数据流水线。解析失败等未接受请求不覆盖上一迁移策略。</li>
+          <li>重新枚举所有本轮范围，源与过滤计划在各入口一致；变化项复制，不变项按本轮校验要求复用。Preserve 下不根据缺失执行目标删除／推断 rename，也不让新路径被“相同句柄”比较吞掉。</li>
+          <li>删源任务只清理本轮命中且当前目标已就绪的项；不能遍历历史 base 将窗口外项一并删除。源缺失、权限、网络和元数据失败分别处理，不能由数据库旧确认标记单独授权。</li>
+          <li>整轮成功时提交 C；异常轮次保持 C，反复失败复用 W=1−C。对保留源端的可复用事实，重复准备不清空历史窗口外事实，也不把新路径观察升级为目标路径确认。</li>
+          <li>收束本轮写入和目录／源清理后处理基线生命周期：保留源端时保留目标确认事实；删源时按既定契约清空该 job 的 base，独立保留代次描述与最终报告。陈旧执行的延迟写入／清理必须隔离。真实网络失败、取消和未知写入结果分别验收。</li>
+        </ol>
+        <p><strong>二值 state 不是本轮选中证明：</strong>保留窗口外确认事实后，某个旧 current_state 经过多轮翻转可能碰巧等于本轮 W；不能用这一相等关系授权删源，也不能把所有旧 state 行当作真实源删除。源清理使用本执行实际观察到的选中项及当前目标就绪证据，保持流式和有界；需要持久化成员关系时绑定执行身份，不依赖两态标记跨轮推断。该约束与失败轮次 C／W 幂等同时成立。</p>
+        <p>复用还要求目标确认事实仍有效：本程序曾失败写入、清理或无法确认发布结果的路径，不能只凭旧成功行跳过。数据结果未知时安全重复制或由协议确定归属；版本化目标不能盲目重放已有历史。仅元数据失败则保留数据并补齐／报错，不把数据保留当作整项已就绪。</p>
+        <p>统计中只对真正完成的删除计成功；未观察、明确出界、存在性未知、复制跳过和源清理分别表达。旧确认事实数量不计入本轮 scanned／copied。若为了性能没有枚举全部旧缺失候选，则不为统计补做全量回源，也不伪报已知数量。决策模式、原因、时间基准和目标清理策略作为正常计划字段进入日志／报告；所有最终未恢复的故障进入 callback，恢复成功的错误仅进日志。</p>
+        <p>正常路径只增加每 job 的少量计划读写和一次过滤分析，不能在每个 worker 或 entry 重新查询上代命令。已观察项不重复 stat，Preserve 下不为全部窗口外事实发 HEAD；确认候选有界流式处理。真实吞吐／RSS 对照须计入新计划、存在性读取、目录收尾、异步入库和基线维护，不以牺牲事实保留或错误上报换性能。</p>
+        <p><strong>建议实施顺序：</strong>先修复所有入口的严格过滤解析，建立统一计划和决策表；再拆分绑定／选择／复制契约并实现 Preserve 下的确认事实复用及新路径复制；随后接入按需源存在性确认、目标受保护操作和原生固定时钟；最后接入本执行选中项的删源授权、基线收尾及统一报告。结构调整与行为修改分开提交；每一步在 CLI／Web、本地／远程当前入口逐项验收，不以只新增枚举类型代替实际执行语义。</p>
+        <p><strong>验证矩阵：</strong>逐项覆盖上代保留／删除 × 本代保留／删除 × 完成／失败／取消；时间窗口进入／离开／重入及同轮跨阈值；match／exclude／剪枝／过滤语法错误；新旧路径及硬链接多义；源存在／NotFound／权限拒绝／闪断／持续断连／静默超时／取消；S3 最新状态与历史版本；新路径已有目标／已移动但未确认；CLI 与 Web 相同输入的计划一致；CH 单机／集群、旧执行延迟清理及整轮性能。用可控时钟验证时间场景，真实路径验证协议故障，不能用 mock 或既有 source-policy 测试冒充本方案已通过。</p>
+        <p class="muted small">本节的统一迁移计划、代次绑定、独立目标清理策略、保留事实跨轮复用及固定过滤时间已接入本地迁移入口；范围内按需源存在性确认和保留决定通知已有对应验证。凡是源缺失、目标归属或执行证据不足，仍保留目标并交付原因。早期 Single／双副本及 HTTP 204 的确定性历史观察测试只证明状态、基线与通知契约；真实 S3 及后续代次证据见实施进度。远程统一代次执行、完整历史目标就绪、异步删源及整轮性能／RSS 仍需继续完成。</p>
+
+        <h3 id="copy-statistics">3.3　统计：扫描、目标完成与收尾分别展示</h3>
+        <p>扫描、复制、校验、入库、失败及跳过计数均以 entry 为单位：一个版本化源 entry 无论含 1 个还是多个版本，在相应阶段最多计一次，不展开成版本计数。数据量仍按实际计划复制的数据累计，不能用入库历史行数增加文件／entry 数。</p>
+        <p>扫描完整前，不估算完整总量；部分成功时保留准确成功事实。即使数据传输达到 100%，仍应展示“正在校验”或“正在恢复目录元数据”。完整字段及异常示例见<a href="#statistics">统计与状态呈现</a>。</p>
+
+        <h4 id="rename-recovery">异常增量后的 rename：状态幂等，观察与目标路径分开</h4>
+        <p>精确复现前提：先全量成功；下一增量必须已经比较选定文件或目录，并查询确认该项 current_state 已改变，再异常退出。之后 rename 的必须是这同一项。对尚未比较的项 rename、只改内存状态或随机中断，都不能代替本例。多轮异常／rename 继续作用于同一稳定源身份。</p>
+        <div class="table-wrap"><table>
+          <thead><tr><th scope="col">事实</th><th scope="col">用途与推进条件</th></tr></thead>
+          <tbody>
+            <tr><td>已提交代次 C</td><td>只在整轮成功时推进。开始复制不改 C；失败、取消及重复启动均保留它。</td></tr>
+            <tr><td>未提交代次 W = 1 − C</td><td>同一失败基线的所有重试复用 W。开始时幂等清除未确认路径观察，将已确认路径的扫描标记回置 C；本轮看到才标 W，不以反复翻转状态模拟新代次。</td></tr>
+            <tr><td>目标路径确认 copy_path_confirmed</td><td>表示目标路径已由复制／rename 成功结果确认，供后续增量比较。新观察路径不能仅因进入 base 就取得该标记；继承确认须匹配路径、版本及可用源身份。此标记不等同于完整目标就绪，也不是本次源删除的入库门槛。</td></tr>
+            <tr><td>当前源观察</td><td>本轮完整枚举得到的路径、稳定身份及元数据；与已确认目标的缺失路径关联，不能将前轮尚未执行的 rename 路径当作目标位置。</td></tr>
+          </tbody>
+        </table></div>
+        <p>关联方向明确为“已确认旧目标路径 → 当前源路径”。按稳定身份取得唯一关联，不依赖 ctime 排序、混合历史记录恰有两条或某次旧 state 值。没有待执行 rename 的当前观察，或新路径已完成复制确认时，旧路径按删除候选处理；路径被另一身份占用时先复制，不能覆盖旧事实后假装 rename 已完成。本轮已复制的新目标不能再被旧路径覆盖。多义／冲突关联返回有类型错误并明确上报，不能仅写日志然后静默遗漏。</p>
+        <p>目标旧路径已消失可能是上轮物理移动成功但记账未完成。恢复时从当前源路径重新复制，按所选校验确认，不直接相信现存新目标数据。父目录只有实际移动成功后，其子项才可跳过物理 rename；只在计划中、执行失败或降级创建目录，都不能证明子树已经移动。</p>
+        <p>删除源端的增量也必须处理 rename，只跳过由源缺失产生的反向目标删除。完成目标 rename／恢复复制后，源清理仍遵循统一目标就绪条件，不能在 rename 分支提前直接删除源对象。</p>
+        <p class="muted small">实现边界：当前使用有类型错误阻止多义关联猜测，自动处理任意硬链接多义关联仍需扩展。真实 ClickHouse 回归覆盖单机／双副本、文件／目录及多次异常后的状态与关联；完整进程 SIGKILL、真实 NFS／CIFS 身份和整轮 callback 仍按故障矩阵单独验收。</p>
+        <h3 id="versions">3.4　多版本：有界分段，同一对象串行推进</h3>
+        <p>不建议将全部历史版本放入单个 entry。版本数量很大时，会增加内存占用、首条交付延迟和失败重放成本。保留有界历史分段，沿用路径固定分派机制。</p>
+        <ul>
+          <li>同一对象按源端明确提供的历史顺序处理，不按 version_id 字符串排序。</li>
+          <li>同一对象同时最多有一个版本处于提交阶段，不同对象并行执行。</li>
+          <li>某版本数据复制／发布失败或结果未知时，阻断该对象后续数据版本发布。单独源元数据获取失败不阻断按历史顺序继续复制数据；逐版本保留元数据失败，整 key 不得确认完整就绪或清理源历史。</li>
+          <li>本次运行内按已确认版本事实进行有界重试；上一代保留源端时失败后可增量，重新枚举并核验已发布版本；连续删除源端时重新全量，不从扫描版本边界续扫。版本化目标写入响应丢失时先核实，不能盲目重放并生成额外版本。</li>
+        </ul>
+        <div class="table-wrap">
+          <table>
+            <caption>版本化源的复制范围与删除范围</caption>
+            <thead><tr><th scope="col">目标实际能力</th><th scope="col">复制行为</th><th scope="col">启用删除源端时</th></tr></thead>
+            <tbody>
+              <tr><th scope="row">非多版本目标</th><td>只复制最新可见数据版本及其约定元数据，不依次覆盖历史版本。最新记录为 delete marker 时，投影为目标对象不存在，并确认该状态，不能回退复制更早数据。</td><td>最新状态完成校验、目标发布／不存在状态确认以后，永久清理该 key 的全部源数据版本和 delete marker。</td></tr>
+              <tr><th scope="row">多版本目标</th><td>按源端明确的历史顺序复制全部数据版本及 delete marker，保存源／目标版本映射。</td><td>该 key 的全部历史在目标完成校验、发布后，永久清理该 key 的全部源数据版本和 delete marker。</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>目标是否保留多版本由已连接目标实例的实际能力和版本配置决定，不能只按 backend 类型推断。源端版本 ID 与目标新生成的版本 ID 分别记录，不要求相同。未启用删除源端时，两种复制路径都保留源历史。</p>
+        <h4 id="version-catalogue">ClickHouse 内容范围与目标复制范围一致</h4>
+        <div class="table-wrap">
+          <table class="matrix">
+            <thead><tr><th scope="col">目标</th><th scope="col">ClickHouse 中的迁移记录</th><th scope="col">entry 计数</th></tr></thead>
+            <tbody>
+              <tr><th scope="row">非版本化目标</th><td>每个 key 只保留最新版本／最新状态及所需元数据。最新源版本 ID 是比较字段，不能作为累积保留旧源版本的理由；最新为 delete marker 时记录最新不存在状态，不回退保存旧数据版本。</td><td>一个实际交付并纳入该迁移阶段的 entry 计一次，不因源有很多历史版本增加次数。</td></tr>
+              <tr><th scope="row">版本化目标</th><td>保留实际复制的各历史数据版本与 delete marker、源／目标版本映射、历史顺序及对应元数据结果，并关联其 entry 身份。</td><td>一个 entry 即使对应多条版本记录，阶段完成仍只计一次；部分版本完成不能把整 entry 提前算作完成。</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>非版本化目标必须在数据库投影和写入之前选择最新状态，扫描临时记录、迁移基线与 entry_snapshot 都不能携带完整旧历史，再仅靠查询过滤隐藏历史。后续增量的新最新版本替换该 key 的最新事实，不按不同源 versionId 累积源历史记录。</p>
+        <p>版本化目标按每个实际复制版本持久化对应事实，snapshot 应表示对应版本，不能把整个历史容器在每条版本行重复保存。存储行需要表达 entry 与版本的关联；统计由 entry 阶段事实推进，不能通过 count(*) 推导迁移 entry 数。</p>
+        <p>非版本化目标启用删除源端时，ClickHouse 只增加按 key 的全部历史清理授权、状态及必要汇总，不另外持久化全量源历史版本清单。具体版本 ID 在清理时从源端有界流式获取和删除，下一删除代次重新全量列举当前剩余历史；不因源端要删全部历史而将旧历史灌入数据库。</p>
+        <p>复制范围与删除范围明确分开：非多版本目标仅保留最新状态，但源端仍清理全部历史；多版本目标保留全部历史，再清理源历史。清理范围限定于本 job 已纳入迁移的 key，不扩展为整个 bucket 或被过滤 key 的清空。</p>
+        <p>上一代保留源端时，下一代删除源端的增量路径必须覆盖未变化对象：已复制且源端未变化时跳过数据传输，但仍需确认当前目标就绪、复核源身份并删除对应源项；不能因没有产生复制任务而漏掉源清理。上一代已删除源端时，新删除代次重新全量，避免依赖可能缺失的迁移记录。</p>
+
+        <h4 id="slash-key-objects">非空且 key 以 / 结尾的对象</h4>
+        <p>对象存储中的 key 尾部是 /，并不意味着对象没有数据。扫描需保留原始 key、真实对象大小及对象身份，结合目标存储模型决定行为，不能仅凭后缀将非空对象折叠为目录标记。</p>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th scope="col">目标</th><th scope="col">复制与扫描行为</th><th scope="col">源清理及上报</th></tr></thead>
+            <tbody>
+              <tr><th scope="row">非对象存储</th><td>若实际选择复制的对象 key 以 / 结尾且大小大于零，自动忽略该对象，不创建对应普通文件、不读取其内容，也不为其追加无用途元数据请求。若同前缀还有其他对象，仍正常枚举和迁移它们；需要时可为子对象创建目标目录。</td><td>这是计划内跳过，不是复制错误。该 key 不取得成功迁移或源清理授权，源数据及全部源历史保留；callback 和统计明确跳过数量、已知字节及原因。</td></tr>
+              <tr><th scope="row">对象存储</th><td>正常复制非空对象及计划要求的元数据，精确保留末尾 /，不能去掉斜杠或只创建零字节标记。非多版本目标仅复制最新状态，多版本目标按历史复制，均遵循既定版本策略。</td><td>按实际复制、所需元数据、所选校验及目标持久性判断就绪，入库独立统计；满足全部源清理前置条件后才可永久删除该 key 的源历史。</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>例如对象 bucket 中 a/ 的内容为非空数据，同时存在 a/file.txt：迁移到 NFS 时只跳过 a/ 这个对象，a/file.txt 继续复制；迁移到另一个对象存储时，a/ 的非空内容与 a/file.txt 都应保留。目标目录删除或源前缀清理不能顺带删除被跳过的 a/ 源对象。</p>
+        <p>任务事件使用 CopySkipped 区分跳过与成功／失败，报告单独累计 skipped_count。callback 中的 copy_skipped 明细在 HTTP 2xx 后清除，累计跳过数保留；版本历史不按版本数放大此计数。跳过事件不写入复制成功基线，也不授权删源；全量、增量及双进程分类使用同一目标表示能力判断。当前实测范围以实验室说明为准；扫描前置裁剪额外元数据读取及已知跳过字节的展示仍需单独验收。</p>
+        <p>此规则在扫描 plan 中列为按 key 后缀和实际大小决定的目标适配策略，并在枚举后、额外元数据读取前应用；元数据尚未取得不应影响该对象已知的跳过判定。零字节目录标记按其既定规则处理，不将“非空尾斜杠对象自动忽略”扩大为所有以 / 结尾的 key 都忽略。</p>
+
+        <h3 id="metadata-plan">3.5　扫描前编译 plan：明确元数据范围及额外读取成本</h3>
+        <p>连接源、目标并取得实例能力后，在启动扫描前编译一次任务计划。backend 类型用于确定候选规则，实际协议版本、权限、目标版本配置、对象类型、过滤及迁移要求共同决定最终 plan；不能在复制 worker 中才临时判断需要哪些源元数据。</p>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th scope="col">元数据策略</th><th scope="col">获取与缺失处理</th></tr></thead>
+            <tbody>
+              <tr><th scope="row">必需</th><td>扫描阶段优先使用 inline 事实，不足时按 plan 发出额外读取。获取失败不阻断仍可执行的数据复制，但该类元数据保持失败／待补齐，不能通过完整校验或授权源删除。显式要求目标无法表达的属性时准确报错，不能冒充完成。</td></tr>
+              <tr><th scope="row">允许明确损失</th><td>定义允许的精度损失、所有者／ACL 映射等转换，记录具体损失后按约定继续。</td></tr>
+              <tr><th scope="row">不迁移／不适用</th><td>plan 明确跳过及原因，不发额外读取，不计算或比较无关属性摘要，不参与目标校验。此类有意跳过不是获取失败，也不阻断源删除；已要求但实际获取失败的类别不能事后改成跳过。</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>计划覆盖身份、类型、大小、版本、mtime、ownership、mode、ACL、xattr、tags、软链接目标及目录标记，并区分用途。计划要求的元数据在扫描阶段取得原值并计算分类摘要或记录失败，成功原值与摘要共同入库；不将首次观察拖到复制阶段，也不以原值较大为由省略持久化再额外回源。不为任务不会使用的字段增加 IO。</p>
+        <div class="table-wrap">
+          <table class="matrix">
+            <caption>plan 至少明确的内容</caption>
+            <thead><tr><th scope="col">维度</th><th scope="col">计划内容</th></tr></thead>
+            <tbody>
+              <tr><th scope="row">类别及用途</th><td>每类属性用于数据定位、过滤、增量比较、复制、校验还是目录收尾；标明对象类型、实际需要复制的版本范围，以及非空尾斜杠对象在非对象目标上自动跳过的适配规则。</td></tr>
+              <tr><th scope="row">获取或跳过</th><td>决定 inline 复用、扫描阶段额外获取或 Omit／NotApplicable；逐项标明依据，例如目标不承载、源不适用、无过滤或显式映射依赖。</td></tr>
+              <tr><th scope="row">协议请求与成本</th><td>列出哪些属性共享一次 listing／stat／GETATTR，哪些需要 ACL、xattr、HEAD、GetObjectTagging 等额外调用；标明预计调用数量或估算规则、返回体大小／内存风险。无法预知的数量标为未知并在运行中测量，不能写成零成本。</td></tr>
+              <tr><th scope="row">原值入库与比较返回</th><td>计划要求的成功元数据保存原值与摘要，明确唯一原值载体和比较查询返回字段。增量比较在同一次查询中按需带出原值／snapshot，不再增加按 key 二次取原值或复制阶段回源读取；跳过项不获取也不伪造原值。</td></tr>
+              <tr><th scope="row">预算与调度</th><td>为额外读取设置有界并发、条目及字节预算、操作超时和统一重试窗口；明确网络疑似故障的短确认窗口、探测次数／间隔和确认条件，不让每类读取、每个 worker 重新开启故障预算。</td></tr>
+              <tr><th scope="row">结果与传递</th><td>扫描输出观察值、分类摘要、来源和失败状态；复制、增量比较及源元数据预期值共用同一观察。失败按既定规则继续数据复制、报告错误并阻断源删除。</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="table-wrap">
+          <table class="matrix">
+            <caption>典型 plan 选择：以目标实际能力和显式任务需求为准</caption>
+            <thead><tr><th scope="col">场景</th><th scope="col">扫描阶段获取</th><th scope="col">扫描前明确跳过</th></tr></thead>
+            <tbody>
+              <tr><th scope="row">NFS → S3</th><td>复用 listing／stat 中定位数据、大小、增量比较等所需基础事实。若无属性映射或过滤依赖，不为 POSIX 权限和 ACL 等字段追加读取。</td><td>源 NFS ACL、xattr 等在本计划中没有复制、比较、过滤或映射用途的属性；不因源支持它们就自动读取，也不把 NFS ACL 当作 S3 ACL 直接复制。</td></tr>
+              <tr><th scope="row">NFS → NFS</th><td>基础事实，以及源、目标均支持且计划要求的 ACL／xattr；额外读取在扫描阶段合并或有界执行。</td><td>协议实例不适用或计划明确不迁移的属性；显式必需但无法支持的属性应报出计划错误。</td></tr>
+              <tr><th scope="row">S3 → S3</th><td>基础对象事实，以及计划要求的 tags 和其他可迁移对象属性；额外 HEAD／GetObjectTagging 在扫描阶段执行并复用结果。</td><td>无关的文件系统 ACL、POSIX mode 等不适用属性；不追加无法用于本次迁移的读取。</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>例如 NFS→S3 的 plan 可明确记为“ACL：Omit，原因：目标无对应迁移用途，额外请求 0；xattr：Omit，原因同上”。若用户另行要求将这些值编码到对象 metadata，或过滤条件实际依赖它们，则属于明确需求，重新纳入扫描获取和成本估算，不能继续宣称零调用。</p>
+        <div class="note"><p><strong>本地目录遍历管线已接入的扫描范围：</strong><a href="../../crates/app/src/migration_plan.rs">MigrationPlan</a> 在扫描前查询目标是否保留历史、是否承载尾斜杠对象，将 MetadataScope 同时交给全量／增量扫描与观察校验。data-mover 对已知非空且不会迁移的尾斜杠对象仅省略输出属性，仍保留过滤依赖；空标记、未知大小、同前缀子项不扩大跳过。只获取最新版本输出元数据时，历史身份和分段顺序仍完整保留，旧版本未请求的属性不触发必需属性缺失错误。纯扫描默认观察范围不变；文件清单入口的范围接入仍待补齐，远程握手尚未传播该目标范围，不能据此宣称远程端已完成相同优化。</p><p>验证证据：隔离真实 S3 代理把非空尾斜杠对象及旧版本 tags 端点设为拒绝访问，实际无多余请求；尾斜杠场景只有子项和空标记的 2 次标签读取，20 版本场景仅对最新版本读取 1 次、20 条历史记录仍保留。原有源 tags 拒绝测试仍交付 20 版本数据、按 1 个失败 entry 统计并通过 HTTP callback 交付 20 条具体原因。另有原生 unordered／blocks、过滤用途及版本范围组合测试；这些证据不代表整轮吞吐／RSS 或统一断网恢复已通过。</p></div>
+        <p>版本化源到非版本化目标时，仅对最新可见数据版本获取计划要求的元数据并入库，不为不复制的旧版本额外读内容、ACL、tags 等。启用源删除时，清理阶段从源端流式列举旧版本身份，不将其作为历史迁移记录落库。版本化目标则对每个实际复制的数据版本获取对应元数据，delete marker 不发无意义的数据版本元数据请求。</p>
+        <p>“值为空”“不支持”“未请求”“请求失败”必须区分。源端没有可迁移的目录 mtime 时，不能用默认时间冒充源值；必需元数据获取失败不能静默变成 Omit。</p>
+        <p>源元数据获取结果与数据读取准入分开。ACL、xattr、tags、mtime、ownership／mode 等获取失败时，保留失败类别、原因及已知源身份，并继续复制可读取的数据；缺失值不能被解释成清空目标属性或写入默认权限。若定位源对象或实际数据读取本身也失败，则按真实的数据读取错误处理，不能伪报复制成功。</p>
+        <p>扫描仍须交付可执行数据复制的 entry，而不是因单个元数据观察失败丢弃对象或停止整条数据流水线。data-mover 需要将“数据传输／发布结果”和“元数据获取／应用结果”分别返回；源元数据缺失不能在数据传输开始前触发全项拒绝，也不能只靠 app 捕获异常后声称已经完成数据复制。</p>
+        <p>单个对象 ACL 等元数据获取失败，与已识别的存储网络中断分开分类。前者在数据仍可读时继续数据复制；一旦确认是源、目标或 ClickHouse 网络中断，优雅退出策略优先，不能为继续数据复制而持续发出失败请求。</p>
+        <p>plan 的需求与可读说明由任务层统一确定，能力查询、请求分组、扫描观察及后续应用归 data-mover，协议获取细节归客户端。CLI／Web 共用同一计划与成本说明；不能让各 worker 再各自推断类别或重新回源。</p>
+
+        <h4 id="metadata-persistence">3.5.1　分类持久化：原值与摘要共同保存，比较时一次带出</h4>
+        <p>增量元数据比较覆盖计划要求的 tags、NFS ACL 及其他属性。ClickHouse 保存成功获取的元数据原值（raw）和分类摘要，不再采用“大 raw 只存摘要、复制时重新查询源端”的策略。原值用于比较结果交付、元数据应用及收尾，摘要用于快速筛选和定位变化类别。</p>
+        <div class="table-wrap">
+          <table class="matrix">
+            <caption>建议的增量比较类别；按 backend 实例与迁移计划选择，未支持类别不能静默丢弃</caption>
+            <thead><tr><th scope="col">类别</th><th scope="col">内容</th><th scope="col">基线与原值策略</th></tr></thead>
+            <tbody>
+              <tr><th scope="row">基础属性</th><td>类型、身份、大小、版本等内容判据，以及 mode、uid、gid。</td><td>保留高频查询所需标量。mode／uid／gid 本身很小，全部替换为单独 hash 不一定节省空间，还会削弱查询与诊断。</td></tr>
+              <tr><th scope="row">ACL</th><td>NFSv4 ACL、POSIX access／default ACL 或其他支持的安全描述，含编码与继承语义。</td><td>保存 ACL 原值、acl_digest、编码和观察状态，比较返回需要的原值供复制应用；与 mode／ownership 的顺序和回读校验共同规划。</td></tr>
+              <tr><th scope="row">扩展属性</th><td>计划要求的 xattr 名称与二进制值，区分删除和空值。</td><td>保存完整所选原值、xattrs_digest、状态及选择规则；以 xattr 承载的 ACL 明确归属，避免重复存储、读取和覆盖。</td></tr>
+              <tr><th scope="row">对象标签</th><td>实际计划中的完整 tags 集合，包括增加、修改及删除。</td><td>保存原值、tags_digest 和观察状态，比较查询带出并应用完整期望集合，不能仅追加标签。</td></tr>
+              <tr><th scope="row">时间属性</th><td>mtime，以及明确选择迁移的 atime／创建时间；区分文件和目录。</td><td>保留目录最终收尾所需原值及精度。atime 可能被读取改变，不默认作为变化触发项；ctime 不作为可任意恢复的目标字段。</td></tr>
+              <tr><th scope="row">其他对象属性</th><td>实例支持且计划要求的 Content-Type、Cache-Control、自定义对象 metadata 等可迁移属性。</td><td>保存对应属性组摘要、字段选择规则与状态。扩展观察和应用能力后才能宣称覆盖，不能仅新增一个 hash 字段就算支持。</td></tr>
+              <tr><th scope="row">类型专属事实</th><td>软链接目标、目录标记及版本删除标记等。</td><td>保存明确的类型事实并产生对应操作；不能将所有类型变更都强行归为普通文件元数据更新。</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>扫描阶段取得一份与源身份／版本绑定的原值，同时生成对应摘要并入库；失败类别保留真实失败状态，不伪造默认原值。增量比较查询既判定变化，也在同一返回结果中按后续需要带出旧／新原值或原生 snapshot 及身份，避免比较结束后再按 key 发起第二次原值查询。当前 entry 已持有的原值可直接共享，不为复用而重复序列化或查询。</p>
+        <p>可先在数据库端利用摘要筛选变化集合，再于同一比较查询中返回这些对象所需的原值；无变更对象无需向应用批量回传大型 raw。复制与目录收尾消费比较结果携带的原值，不为取得相同 ACL／xattr／tags 再查 ClickHouse 或回源。必要的源身份一致性检查、读取失败后的重试和新一轮增量扫描仍按既定规则处理，不能与常态重复取值混为一谈。</p>
+        <p>原值较大时，以唯一原值载体、压缩编码和有界读取控制成本，而不是删掉原值。可使用 entry_snapshot 承载对应 entry／版本的原生事实，避免同时在独立 raw 列、snapshot 及每条历史行重复存同一 payload；摘要和必要索引字段独立投影。版本化目标每条记录只包含该实际复制版本，非版本化目标仍只保存最新状态，不因存 raw 扩大历史入库范围。</p>
+        <p>目录原始 mtime、mode 和 ACL 等收尾原值在扫描时捕获，正常路径共享该观察并异步入库，收尾不能重读已因子项删除改变的时间。入库缺失或进程崩溃导致无法取得原值时，要明确报告目录元数据未完成，不能伪造原值或成功；不为记账完整性增加逐文件确认。</p>
+        <p>采用条目数与字节双重约束的批次、按需投影及流式消费，避免把全部大型原值常驻内存。验收需同时证明比较结果能直接用于后续复制、没有额外原值查询、原值没有重复保存，并保持整轮性能和内存与优化前相当。</p>
+        <p>不建议对整个序列化 entry 求一个 hash 作为所有变化的判据。路径、执行身份、统计、采集来源等不是可迁移元数据语义，atime 等易变值也不应无条件导致重复更新。分类摘要能定位变化的类别，并只调度需要的元数据操作。</p>
+
+        <h4>3.5.2　摘要契约：按语义规范化，观察状态独立保存</h4>
+        <ul>
+          <li>使用稳定算法，例如仓库已有的 BLAKE3，摘要可按二进制 32 字节保存，避免不必要的十六进制膨胀。hash 格式版本、类别、编码和字段选择规则须参与摘要定义。</li>
+          <li>tags 和 xattr 按稳定键顺序编码，保留二进制值、字段边界及长度，避免返回顺序造成假变化。ACL 使用保持语义的规范化规则，尤其不能任意排序 NFSv4 ACE；无法安全规范化时保留有序编码。</li>
+          <li>每类分别保存 Value、空集合、NotRequested、NotApplicable、Unsupported、Failed 等状态；失败或未获取不能生成一个“空 hash”并据此判为未变化。</li>
+          <li>必需类别获取失败时保留元数据错误并按预算重试，数据可读则继续复制；最终未恢复时任务不能报告完整成功。只在两次观察覆盖范围一致、成功且摘要契约一致时判断未变化，缺失或失败摘要不能等同于未变化。</li>
+          <li>源端变化检测比较“当前源观察”与“上次成功同步所对应的源观察”。目标回读则比较经过 UID 映射、ACL 转换和时间精度处理后的期望值，不能直接要求跨 backend 的源 hash 与目标 hash 相同。</li>
+          <li>hash 相同是摘要层面的相等判据，存在碰撞风险；删除源端仍需数据复制成功、所选 quick／full 校验通过、目标发布及所需持久性确认。元数据摘要相同不能直接授权删除，也不能冒充 full 模式的数据内容校验。</li>
+        </ul>
+
+        <h4 id="metadata-fetch">3.5.3　扫描执行：按 plan 合并额外读取，复制阶段复用</h4>
+        <p>存储分类与接口合并是两个独立优化。把原值换成 hash，只能直接减少数据库传输或存储；如果后端不直接提供可信元数据摘要，计算本轮 ACL／tags／xattr 的 hash 仍须读取对应原值。</p>
+        <ol>
+          <li>任务层在扫描前合并过滤、增量比较、复制和校验需求，结合源、目标实例编译 ObservationPlan；剔除无用途类别，明确保留类别的额外读取成本。</li>
+          <li>优先复用 listing／stat 已返回的 inline 事实。data-mover 根据 backend 能力组织读取，不让 app 为每个类别再次独立 stat。</li>
+          <li>扫描阶段执行所有计划要求的源元数据读取。能在同一协议请求中返回的属性合并读取；必须分开的请求有界并发，并共用故障预算与取消域。</li>
+          <li>扫描交付原值、摘要及失败状态并按目标版本范围入库，增量比较一次带出所需原值供复制和收尾复用。复制阶段不为相同 ACL／xattr／tags 再取原值；扫描重试、源变化重新观察和失败后增量扫描仍需可追踪。</li>
+          <li>跨请求观察不等于原子快照。需绑定源身份，并核验足以覆盖相关元数据类别的变化证据；不能仅以数据版本相同保证 ACL／tags 同时未变化。</li>
+        </ol>
+        <div class="table-wrap">
+          <table class="matrix">
+            <caption>协议层合并能力与限制</caption>
+            <thead><tr><th scope="col">backend</th><th scope="col">可采用的优化</th><th scope="col">限制与现状</th></tr></thead>
+            <tbody>
+              <tr><th scope="row">NFSv4</th><td>协议 GETATTR 支持按属性 bitmap 同时请求多个属性，ACL 也是定义的属性；在服务端与客户端支持时可合并 mode、owner、时间、ACL 等获取。</td><td>这是协议允许的优化，并非当前实现已具备。当前 data-mover NFS 元数据适配器按需额外获取 ACL 和 xattr；xattr／named attributes 不能一概视为同一次 GETATTR 可获得。</td></tr>
+              <tr><th scope="row">S3 对象</th><td>复用 LIST／HEAD 已返回的事实，避免重复 HEAD；按计划补取所需对象属性和 tags。</td><td>HEAD 与 GetObjectTagging 是不同 API，不能承诺一次请求拿齐。PutObjectTagging 可修改已有对象版本的 tags，因此仅凭数据版本／ETag 不足以跳过 tags 比较。</td></tr>
+              <tr><th scope="row">其他 backend</th><td>利用实际实例能够批量返回的属性集合；统一观察接口可封装多个必要协议操作。</td><td>“一次上层 observe 调用”不等于“一次网络请求”。应报告真实 RPC 数、字节、延迟及正常路径成本。</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>只有 backend 明确保证某个廉价变化标记覆盖所需类别，才可用该标记跳过相应原值读取。size／mtime 一样不能证明 ACL、xattr 或 tags 没变。没有此类保证时，要严格识别这些类别的独立变化，就必须每轮观察它们；hash 无法消除这部分 IO。</p>
+        <p>大 ACL 或 xattr 随 listing 批量返回可能降低每页条目数并增加带宽，因此合并方案按实例能力和实测成本选择，不默认把全部元数据塞进每个目录页。</p>
+        <p>这里限定的是源元数据观察：目标元数据回读和 full 模式的数据内容校验仍在目标写入后的相应阶段执行，不可能前移为源扫描的成功证据。必要的源身份一致性检查也须在计划中明确，不能借此隐式重新读取整套源元数据。</p>
+        <p class="muted small">协议依据：<a href="https://www.rfc-editor.org/rfc/rfc7530.html#section-16.7.4">NFSv4 GETATTR 属性 bitmap</a>、<a href="https://www.rfc-editor.org/rfc/rfc7530.html#section-5.7">NFSv4 ACL 属性</a>、<a href="https://docs.aws.amazon.com/AmazonS3/latest/API/API_HeadObject.html">S3 HeadObject</a>、<a href="https://docs.aws.amazon.com/AmazonS3/latest/API/API_GetObjectTagging.html">GetObjectTagging</a> 和 <a href="https://docs.aws.amazon.com/AmazonS3/latest/API/API_PutObjectTagging.html">PutObjectTagging</a>。</p>
+
+        <h4>3.5.4　增量确认：分类比较，成功后才推进同步基线</h4>
+        <p>比较按“内容判据 + 各元数据类别”分别进行。数据无变更证据而 tags、NFS ACL、xattr 或其他必需属性发生变化时，生成元数据更新任务，并携带变化类别集合。mtime 等弱内容判据变化时，是否能只更新元数据取决于是否另有可信内容证据，不能直接跳过数据检查。</p>
+        <p>目录同样参与 ACL、ownership／mode、时间及支持的其他元数据比较，不能只比较目录标记。更新计划应处理字段删除、空集合和继承等语义，并在应用相互影响的 mode／ACL 等操作后校验最终结果。</p>
+        <p>本轮扫描观察与上次成功同步基线分开：元数据复制或校验失败时，不得把新摘要写成“已成功同步基线”，否则下一轮会把尚未迁移的变化当成无变更。仅当对应必需类别成功应用并校验后，才通过 ClickHouse 确认推进成功事实；失败类别保留待处理状态。</p>
+        <p>数据已复制、源元数据获取失败时，允许将数据传输／发布事实与元数据失败分别写入 ClickHouse，但不能写成完整对象就绪或获得删除授权。下一代按源保留策略选择全量／增量，在新扫描阶段按 plan 获取仍需补齐的元数据，后续核验已复制数据并应用、校验这些值，避免无必要地重复制数据；若 backend 修复某类元数据实际需要重写对象或历史版本，则按其能力及历史顺序处理并报告真实工作量。</p>
+        <div class="note"><p><strong>示例：</strong>size／mtime 不变而 tags、NFS ACL 或 xattr 单独变化，仍必须生成更新任务。删除前所需元数据必须应用并校验成功；异步入库完成与否独立统计。</p></div>
+
+        <h3 id="network">3.6　网络中断：先做有界防抖确认，确认后尽早退出</h3>
+        <p>单次超时、连接重置先进入 suspected，短确认窗口复核实际依赖；稳定恢复后继续，持续失败才进入 stopping 并以网络错误收尾。下一次任务按上一代源保留策略选择全量或增量。</p>
+        <ol>
+          <li>所有扫描、元数据读取、传输、发布、数据库及删除操作具备有界请求等待。断连和静默丢包／超时分开记录检测耗时；批处理、空闲和背压期间也需有界感知故障。</li>
+          <li>首次疑似网络故障先暂停相关依赖的新调度与源删除准入，不把部分数据或未知提交当成成功，也不立即发出终态失败 callback。</li>
+          <li>同一依赖的并发错误合并为一次故障事件，用少量有界、无业务写入副作用的真实存储／数据库请求或既有请求结果复核。不能仅凭 ping、一次 TCP 建连或一条请求成功就认定全部业务已恢复；失败操作及未知副作用还需对账。</li>
+          <li>窗口内满足 plan 稳定恢复条件后，按副作用证据安全继续；仍未知对象保持单独阻断与对账，不能解除其删除限制。该次短抖动只写日志。若仍失败、反复抖动未达到稳定条件或窗口耗尽，确认中断；事件首次异常时间不因其他请求重置。网络确认不要求在窗口内完成整文件重传。</li>
+          <li>确认中断后立即停止新工作、预取和排队消费，传播取消并永久关闭本次执行的源删除准入。不能继续处理队列或再启动长重连循环。</li>
+          <li>按协议能力取消在途请求或等待其在受控期限内收束，回收 worker、连接与后台任务。进度线程、查询任务和收尾任务也随执行结束，不依赖无限等待某个阻塞调用返回。</li>
+          <li>已获确定证据的操作保留成功事实；已发出但未能确认的写入、发布、ClickHouse 提交或源删除记录为结果未知，不能因取消或超时改写为未执行。已确定的数据复制失败进入对应目标清理，网络使清理无法完成时记录待清理／未知，不持续重连等待。</li>
+          <li>在可用 ClickHouse 中异步保存事实和最终报告，callback 准确区分业务完成与数据库缺失。数据库持续不可达按预算停止新调度、收束在途操作；已就绪并删除的对象不回滚，不为保存记录无限等待。</li>
+          <li>发送最终 callback，按受控超时与既定重试上限收尾，实际未交付则明确记录发送失败；全部后台操作收束后退出，不能把前台返回当作后台已经停止。</li>
+        </ol>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th scope="col">阶段／依赖</th><th scope="col">检测与退出规则</th></tr></thead>
+            <tbody>
+              <tr><th scope="row">源端／ClickHouse 扫描</th><td>首次疑似异常后，以统一短窗口完成防抖确认及有限恢复，同一事件不超过仓库约 3 秒的恢复上限；不得在确认后重新开启另一个 3 秒窗口。检测请求耗时另报，窗口耗尽或提前确认持续中断后直接收束。</td></tr>
+              <tr><th scope="row">连接、元数据、复制及发布</th><td>初始化与运行共用疑似→复核→稳定恢复／确认中断的判定；plan 明确操作超时、短确认窗口及收束边界。确认后立即终止，不让各层 SDK／worker 独立重试叠加等待。</td></tr>
+              <tr><th scope="row">写入或发布超时</th><td>保留结果未知状态，依据发布证据对账；不能将超时等价为未执行。</td></tr>
+              <tr><th scope="row">权限、认证、只读、容量不足</th><td>按实际原因分类，不作为普通断网持续重试。</td></tr>
+              <tr><th scope="row">故障期间取消</th><td>停止新增调度，秒级响应取消，处理在途与未知结果，并收束后台任务生命周期。</td></tr>
+              <tr><th scope="row">callback 不可达</th><td>发送有超时，最终通知首次失败后最多再重试 3 次；准确最终报告及任务／执行身份独立保存到可用 ClickHouse，发送失败原因只记日志，随后结束。不把通知交付失败改写为迁移成功或已交付。</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>只有确认持续中断并导致本次执行终止的网络错误进入 callback，明确依赖与脱敏 endpoint、阶段和路径／版本、错误码与 cause、首次异常及确认时间、防抖结果、已完成量、未完成／未知结果及收束状态。已稳定恢复的短时抖动只留日志；一旦进入 stopping，即使随后网络恢复，也不撤销失败或重新开启本次源删除。</p>
+        <p>探测并发、频率和持续时间有界，同一依赖共享事件与确认结果，防止 worker 各自判定引起探测风暴或相互反复暂停／恢复。权限、认证、只读、限流等按实际类型处理，不能全部当成断网；防抖也不能成为无限等待网络恢复的理由。</p>
+        <p>日志记录完整故障、取消传播、收束和发送过程。callback 端点本身因断网无法接收时，不能承诺送达；按已有失败载荷规则留存可查询证据。最终报告必须区分“迁移已失败”“通知待交付／失败”和“数据库事实未确认”。</p>
+
+        <h3 id="retry-report">3.7　偶发失败：按阶段重试，仅最终未恢复错误进入 callback</h3>
+        <p>可重试的单对象错误、限流等，可在次数与总时间双重限制内退避重试并加入抖动；权限错误、不支持的必需元数据、无效配置不应持续重试。疑似网络故障只在统一短确认窗口中复核／有限恢复，确认持续中断后直接优雅退出，不在单对象重试循环中再等待网络。源对象变化时重新观察或报告冲突。</p>
+        <p>重试单位为“对象的具体阶段”。目标数据已确认发布后，单独源元数据获取失败应重试元数据阶段，后续清理或记账失败也不应触发无必要的整文件重复制。历史前序数据发布失败／未知时阻断后序数据发布；单独元数据获取失败不阻断可执行的数据复制，但必须保留未完成状态并阻断源删除。</p>
+        <p>每次失败、退避、重试和最终恢复结果都写入日志，并保留任务、执行、对象、版本、阶段及实际原因。预算内恢复成功的错误不进入 callback 错误明细、current_error 或累计错误计数，也不回放到终态 callback；重试期间可展示 recovering 阶段及尝试进度，不提前发送仍可能恢复的错误。</p>
+        <p>不可重试的错误、重试预算耗尽仍失败的操作，以及退出时仍无法确认结果的操作，必须形成最终错误进入 callback。覆盖初始化与计划准入、扫描、全部元数据获取／复制、数据复制、校验、目标发布、ClickHouse、源端删除、目录收尾及取消过程中的实际收尾错误；不能只记日志、只报首个原因，或只增加一个没有明细的总数。正常取消状态与取消期间发生的实际错误分开表达。</p>
+        <div class="table-wrap">
+          <table>
+            <caption>建议错误明细契约</caption>
+            <thead><tr><th scope="col">字段组</th><th scope="col">内容</th></tr></thead>
+            <tbody>
+              <tr><th scope="row">身份</th><td>job_id、轮次、执行尝试、可去重事件 ID、对象路径与版本。</td></tr>
+              <tr><th scope="row">位置与原因</th><td>源端／目标端／数据库／通知、操作阶段、稳定错误码、有类型的 cause、脱敏可读说明。源元数据获取失败明确使用“源端元数据获取失败”提示，附元数据类别、路径／版本、实际原因及数据复制是否已完成，不能笼统标作数据复制失败。</td></tr>
+              <tr><th scope="row">恢复信息</th><td>是否可重试、已用尝试次数、首次／最近失败时间、最终未恢复或结果未知状态。预算内恢复成功的过程只留日志，不进入该 callback 错误集合。</td></tr>
+              <tr><th scope="row">副作用证据</th><td>目标是否已发布、发布身份、源删除是否已发出、结果是否未知、建议恢复动作。</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>复用有界诊断发件箱和批次身份，但最终未恢复错误不得因队列容量而只留省略数。完整最终错误持久化到可用 ClickHouse，按有界批次生成 callback 并按事件／批次身份去重确认；积压通过持久化分页读取及背压处理，不在内存保留全部明细。累计错误数、待发送数、已确认数和明细完整性分别呈现，不能把截断列表或只有日志／查询引用视为已完整上报。</p>
+        <p>callback 是外部 HTTP 接口，HTTP 2xx 即接收成功，无需返回 batch_id 或特定响应体；3xx 不视为成功且不自动跳转。每批成功后清理该批待发错误明细，累计 entry 错误数和任务错误数始终保留。ClickHouse 的内部确认只表示发送方已记录该批 HTTP 接收结果，避免重发，不表示外部业务已处理完成；确认写入失败不能将同进程已经收到 2xx 的明细再次主动发送。崩溃发生在接收与确认之间仍可能重复，外部按事件身份幂等。</p>
+        <p>实现按最多 64 条归档前缀与分页读写，通过持久化和背压控制内存；内部待确认记录最多 128 条，未知归档前缀最多 64 条。未恢复 checkpoint 且无错误时无需访问诊断表，不增加源端元数据读取。最终明细可分批发送，再以无明细汇总报告的 diagnostics_complete 表示完整性；预算耗尽、遗漏或确认未完成必须为 false。分批终态报告序号递增，接收端不能仅因已收到首个终态就忽略最后汇总。</p>
+        <p>终态载荷须明确实际任务状态、全部最终错误累计数及错误明细交付是否完成；未发送完的明细保留为待交付，不得宣称 callback 已完整送达。callback 自身发送失败的原因只记录日志，不写入 ClickHouse，也不能递归触发无限错误通知。</p>
+        <p>终态 callback 首次失败后最多再重试 3 次；准确最终报告及任务／执行身份独立保存到可用 ClickHouse，供外部应用查询；不以 callback 是否配置或投递成功作为保存条件。发送失败原因只记日志，不入库，HTTP 2xx 后仍保留报告原文。通知失败不改变任务实际结果，也不能标记为已交付。ClickHouse 与 callback 同时不可用时由上层处理，不增加专门兜底存储。</p>
+      </section>
+
+      <section id="move-source">
+        <h2><span class="index">04 / MOVE</span>删除源端的全量迁移</h2>
+        <p class="section-intro">对应问题：逐文件删除、目录删除时机、故障安全、校验、统计、blocks 与删除失败。</p>
+
+        <h3 id="ready-contract">4.1　目标就绪后删除，ClickHouse 异步入库</h3>
+        <p>用户确认接受异步入库最终失败导致的少量迁移记录缺失。删除资格来自目标副本就绪，单项 ClickHouse 确认不再是删除前置条件；不以小概率记账失败降低全量正常吞吐。</p>
+        <div class="note warn"><p><strong>统一删除准入：</strong>所需数据复制成功、元数据应用及校验成功、所选 quick／full 校验通过、最终发布及 backend 所需持久性确定、执行与源身份有效，且未取消。任一未解决数据／元数据错误阻断相应对象；版本化源任一所需版本失败阻断整个 key 的历史清理。数据库入库结果独立处理。</p></div>
+        <ol class="flow" aria-label="文件安全搬迁状态顺序">
+          <li><strong>观察源对象</strong><p>捕获身份、版本及所需元数据，绑定本轮计划。</p></li>
+          <li><strong>复制并校验</strong><p>完成数据；quick 校验元数据，full 还校验内容。</p></li>
+          <li><strong>确认目标就绪</strong><p>完成元数据、发布及所需稳定写入，结果确定。</p></li>
+          <li><strong>复核并删除源端</strong><p>确认源身份、执行及取消状态，调用受保护删除。</p></li>
+          <li><strong>异步批量入库</strong><p>目标事实及删除结果有界排队，不等待单项确认。</p></li>
+          <li><strong>独立记录结果</strong><p>搬迁与入库分别计数；最终数据库错误明确上报。</p></li>
+        </ol>
+        <p>目标就绪事实可以在删除前进入异步队列，但源删除不等待该批落库。队列按条数及字节有界；背压和任务级故障仍可停止新调度。正常结束收束写入，持续故障有界退出，不无限等待，不回滚已安全完成的搬迁。</p>
+        <div class="table-wrap"><table class="matrix">
+          <caption>业务完成与记账确认分别表达</caption>
+          <thead><tr><th scope="col">环节</th><th scope="col">契约</th></tr></thead>
+          <tbody>
+            <tr><th scope="row">目标就绪</th><td>只依据实际复制、所需元数据、校验、发布及持久性；进入队列或扫描记录不能伪造就绪。</td></tr>
+            <tr><th scope="row">版本策略</th><td>非版本化目标只要求最新状态；版本化目标要求按顺序迁移的所需历史全部成功。两者都在 key 整体就绪后永久清理全部源历史。</td></tr>
+            <tr><th scope="row">入库确认</th><td>只有 db 按 Single／Cluster 契约确认才计已入库；一个 entry 跨版本／批次仍计一次。绑定 job、代次、执行、源及目标身份，不把排队算入库。</td></tr>
+            <tr><th scope="row">失败或未知</th><td>按同一幂等身份有界重试；最终未恢复错误进入 callback，已就绪或已删除结果保持真实，允许记录缺失。</td></tr>
+            <tr><th scope="row">下一代</th><td>上一代保留源端时增量可重复制缺失项；连续删除源端时重新全量当前源端，不要求目标对账补记。</td></tr>
+          </tbody>
+        </table></div>
+        <p>当前 data-mover 已无 move_file。优先复用 transfer 与 Namespace::purge_observed：app 在 CallerManaged 元数据应用／校验后判断完整就绪，再调用库受保护清理。不能把原始 transfer 返回当成 app 元数据已成功。若未来封装 move 接口，其就绪边界必须包含调用方所需元数据与所选校验，不能重复传输、强制 full 或等待数据库。</p>
+        <div class="note warn"><p><strong>并发修改边界：</strong>两次 stat 不能消除最后检查与删除之间的替换竞态。没有条件删除能力时需要源命名空间独占或停写；目标也需避免覆盖已确认副本。拒绝源目标同一对象、别名及破坏扫描的重叠范围。</p></div>
+
+        <h3 id="directory-cleanup">4.2　目录原值、目标收尾与源空目录清理</h3>
+        <ol>
+          <li>扫描时捕获源目录原始 mtime、mode、ownership、所需 ACL／xattr；当前执行复用原始观察并异步入库，不能在子项删除后以重新读取的时间替代原值。</li>
+          <li>目录后代复制完成、目标命名空间修改结束后，应用并校验目标目录最终元数据；blocks 顺序本身不构成 worker 完成屏障。</li>
+          <li>对应后代处理已结束、源目录为空、目录目标元数据就绪且没有未知操作时，从深到浅受保护删除空目录；迁移根默认保留，不等待目录事实入库。</li>
+          <li>目录结果异步记账。若中断且未入库导致原始目录元数据不可用，明确报告目录收尾未完成，不伪造原值；不为记账缺失新增逐文件确认或专门持久化回执。</li>
+        </ol>
+        <p>失败、过滤、新增或未枚举内容保留；源目录非空不能升级为递归删除。普通文件可在自身目标就绪后删除，目录按真实后代完成状态收尾。需要保证目标整树先就绪的模式，应使用明确的子树完成屏障，不能由扫描顺序或数据库写入顺序推断。所有跟踪状态必须有界。</p>
+        <h3 id="fault-matrix">4.3　异常故障矩阵：证据不足不删源</h3>
+        <div class="table-wrap">
+          <table class="matrix">
+            <thead><tr><th scope="col">故障／异常</th><th scope="col">源端处理</th><th scope="col">恢复与上报</th></tr></thead>
+            <tbody>
+              <tr><th scope="row">源数据读取最终失败</th><td>保留源文件。</td><td>若本次已产生目标数据，清理对应失败产物；尚未写入则不删除其他已有目标。按阶段准确报告数据失败与清理结果。</td></tr>
+              <tr><th scope="row">源元数据获取失败，数据仍可读</th><td>继续数据复制，保留源对象；版本化源阻断该 key 的全部历史清理。</td><td>数据与元数据结果分别入库；预算内恢复仅记日志，最终未恢复在 callback 明确提示“源端元数据获取失败”，不能标记完整校验成功或删除授权。</td></tr>
+              <tr><th scope="row">目标数据写入最终失败</th><td>保留源文件。</td><td>依据本次写入／stage 身份删除对应失败数据，失效相关续传状态；清理失败或未知也进入 callback，不确认目标就绪。</td></tr>
+              <tr><th scope="row">full 模式内容校验最终失败</th><td>保留源文件，版本化源阻断该 key 的历史清理。</td><td>作为数据失败清理本次错误目标数据，不能静默降为 quick 放行。</td></tr>
+              <tr><th scope="row">仅元数据复制／校验失败</th><td>保留源文件，禁止删除授权。</td><td>保留已复制目标数据，记录失败类别与待补齐状态；后续增量按能力修复元数据，不按普通数据复制失败清理目标。</td></tr>
+              <tr><th scope="row">数据失败后的目标清理失败</th><td>保留源文件。</td><td>分别记录原始数据错误和清理错误，残留标记为待清理／未知；下一次增量先处理残留，不能将失效断点继续作为正常续传。</td></tr>
+              <tr><th scope="row">任何数据／元数据复制或校验错误</th><td>保留对应源对象；版本化源阻断整个 key 的清理。</td><td>预算内恢复仅记日志；最终未恢复必须在 callback 明确上报。恢复后重新满足目标就绪及身份检查即可删除，不等待单项入库。</td></tr>
+              <tr><th scope="row">发布超时／响应丢失</th><td>目标结果未确认前不删除。</td><td>标记结果未知，核对发布身份及最终对象；版本化目标禁止盲目重放。</td></tr>
+              <tr><th scope="row">未确认目标持久性</th><td>保留源文件。</td><td>等待 backend 所需的稳定写入／提交证据，读回一致本身不足以替代持久性。</td></tr>
+              <tr><th scope="row">目标就绪后源端断网</th><td>经防抖确认持续断网后，停止新工作与源删除。</td><td>优雅退出并 callback；下一删除代次重新全量处理当前源端，已有目标不会仅因源端缺失被删除。</td></tr>
+              <tr><th scope="row">删除超时／响应丢失</th><td>不盲目再次删除同一路径。</td><td>标记删除结果未知，重新观察源身份并对账。</td></tr>
+              <tr><th scope="row">源路径被新对象替换</th><td>保留新对象。</td><td>报告身份冲突；原对象的迁移证据不能授权删除新对象。</td></tr>
+              <tr><th scope="row">目标被覆盖／身份改变</th><td>暂停尚未执行的删除。</td><td>旧就绪证据失效，重新核验或报告冲突。</td></tr>
+              <tr><th scope="row">ClickHouse 未启用</th><td>不把缺少逐文件入库作为删源障碍；目标就绪门槛不变。</td><td>明确无数据库时缺少持久基线／报告和代次证据，默认全量；目录收尾等不依赖数据库的能力仍须实际实现，不能据本方案声称已经可用。</td></tr>
+              <tr><th scope="row">ClickHouse 不可用／写入失败</th><td>已就绪对象允许先删除；确认持续故障后停止新调度并有界退出，不回滚已完成搬迁。</td><td>最终未恢复数据库错误进入 callback，允许记录缺失；保留源端的后续增量可重复制，连续删除代次重新全量。</td></tr>
+              <tr><th scope="row">ClickHouse 确认丢失／超时</th><td>不撤销已成立的目标就绪与删除资格。</td><td>同一幂等身份进行有界批量重试，入库结果未明不能计作已入库；已删除源项的记录允许缺失。</td></tr>
+              <tr><th scope="row">删除成功后记账失败／崩溃</th><td>保留目标副本，不回滚搬迁。</td><td>接受缺失记录；下一删除代次全量处理当前源端，不新增目标对账或补记系统。缺失源项不会触发目标删除。</td></tr>
+              <tr><th scope="row">源只读／权限不足</th><td>保留源文件和已就绪目标。</td><td>标记清理失败；原因消除后复核身份，仅重试删除。</td></tr>
+              <tr><th scope="row">指定版本删除失败／受保护</th><td>保留未成功删除的源版本。</td><td>按版本报告权限、Object Lock、保留策略或 MFA 等原因；不能退回不带版本 ID 的逻辑删除，也不能自动绕过保护。</td></tr>
+              <tr><th scope="row">版本永久删除响应丢失</th><td>只对原源版本身份对账或重试。</td><td>查询指定版本及版本清单，不能以当前 key 的 GET 返回不存在判定历史版本已删除；不得误删同 key 新增的版本。</td></tr>
+              <tr><th scope="row">用户取消</th><td>停止新删除。</td><td>收束在途操作，保留已发删除的实际或未知结果。</td></tr>
+              <tr><th scope="row">旧执行未停止／并发接管</th><td>不允许新执行继续删除。</td><td>先收束旧执行，确认身份和副作用，再允许接管。</td></tr>
+              <tr><th scope="row">目录非空／枚举不完整</th><td>保留目录及残留项。</td><td>报告未完成、过滤保留或并发新增，不升级为递归删除。</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>NFS 的目标就绪必须包含 backend 对所需稳定存储的确认，不能只依据客户端缓存或回读一致。稳定写入与 COMMIT 的协议处理归客户端和 data-mover，见 <a href="https://www.rfc-editor.org/rfc/rfc7530.html#section-16.3.5">NFSv4 COMMIT 语义</a>。</p>
+        <p>历史版本、软链接、归档同样先确认目标就绪再受保护删除，异步记账。归档发布不能直接授权递归删除源目录；逐项依据已校验清单和源身份清理，保留新建、变化及未纳入清单的对象。</p>
+
+        <h3 id="verification">4.4　校验：默认 quick，仅显式 full 校验数据内容</h3>
+        <p>默认快速校验（quick）仅校验元数据。通过命令行参数显式要求全量校验（full）时，同时校验文件数据内容与元数据。此规则同时适用于保留源端和删除源端，删除模式不再隐式强制 full。</p>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th scope="col">模式</th><th scope="col">选择与范围</th><th scope="col">删除前要求</th></tr></thead>
+            <tbody>
+              <tr><th scope="row">quick（默认）</th><td>未开启全量校验参数时采用。比较类型、大小及计划要求的 mtime、mode、ownership、ACL、xattr、tags 等元数据；不做文件内容哈希比对或为内容验证额外回读完整文件。</td><td>数据复制成功、全部所需元数据校验通过、发布及所需持久性确定，不等待单项 ClickHouse 入库。</td></tr>
+              <tr><th scope="row">full（显式）</th><td>以现有 --enable-integrity-check 参数作为显式选择入口，语义为内容校验加全部 quick 元数据校验；具体实现仍待修改。</td><td>除 quick 的全部条件外，所复制数据版本的内容校验必须成功，才能取得完整就绪事实并进入删除流程。</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>CLI、配置解析和 Web 任务契约统一输出明确的 verification_mode。未指定全量校验时默认 quick；不能将旧布尔 false 解释成完全不校验，也不能让删除路径无视所选模式强制全量内容回读。校验模式参与执行身份绑定，运行内重试和失败后增量均不能把旧 quick 事实直接冒充 full 成功。</p>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th scope="col">对象／维度</th><th scope="col">校验内容与时机</th></tr></thead>
+            <tbody>
+              <tr><th scope="row">普通文件数据</th><td>两种模式都要求传输成功。quick 对类型、长度等元数据进行比较；full 额外验证内容摘要，源摘要绑定本次读取对象，目标执行对应强度的回读或 backend 可证明的内容校验。</td></tr>
+              <tr><th scope="row">普通文件元数据</th><td>按计划验证 mtime、mode、ownership、ACL、xattr、tags 等必需项；在删除之前完成。</td></tr>
+              <tr><th scope="row">软链接</th><td>校验链接目标本身及约定元数据，不跟随链接校验其指向的文件。</td></tr>
+              <tr><th scope="row">目录</th><td>后代命名空间操作结束后，恢复并验证目录最终元数据，再确认目录完成。</td></tr>
+              <tr><th scope="row">时间精度与读取副作用</th><td>按协商精度和允许转换比较；不可设置的 ctime 不作为复制成功条件。内容回读可能改变 atime，必要时在回读后恢复最终时间，再确认元数据。</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>quick 校验不能证明文件内容一致，但属于本方案允许的默认删除前校验策略；不能把同大小、同 mtime 或元数据摘要相同表述为内容已验证。full 模式任何数据不匹配，以及两种模式任何必需元数据失败，均阻断对应源删除；单项 ClickHouse 未确认不阻断目标已就绪对象。不得在 full 失败后自动降为 quick，也不得为通过性能验收将 full 工作量排除在其整轮结果之外。</p>
+        <p>源元数据获取失败时，quick 对应类别的校验应为无法完成／失败，而非成功；full 仍可完成可读取数据的内容校验，但元数据缺失同样阻止整项校验通过。两种模式均应继续执行仍可完成的数据复制，并报告元数据错误，不因缺失元数据跳过数据任务。</p>
+
+        <h3 id="move-statistics">4.5　统计：目标成功不等于搬迁完成</h3>
+        <p>增加“目标已就绪”“源文件已删除”“删除待重试”“删除失败”“删除结果未知”和“源目录清理进度”。清理失败不能记为复制失败，也不能计作已搬迁完成。</p>
+        <p>源端为空不能单独作为成功依据，必须结合本轮计划和已确认事实判断；扫描未完成时，源端剩余量仍可能未知。示例及计数规则见<a href="#statistics">统计与状态呈现</a>。</p>
+
+        <h3 id="move-blocks">4.6　扫描模式与代次选择独立，不支持断点续扫</h3>
+        <p>全量采用 unordered 扫描，加全局完成屏障、目录最终元数据和从深到浅的空目录删除。不创建、保存或恢复扫描 checkpoint，不为全量增加 blocks 续扫、确认扫描块或定时保存扫描游标的机制。</p>
+        <p>上一代保留源端时，新任务可增量重新枚举；当前删除源端且上一代删除源端时，新代次全量重新枚举并清空 base。都不从扫描断点继续。文件字节级续传独立选择；源缺失不得在删除源端任务中触发目标副本删除。</p>
+        <p>本次运行内保留可重试单对象错误的有限重试、取消及未知副作用记录；已识别网络中断则立即进入优雅退出。文件传输的原子发布、分块等协议机制不等于扫描续扫，不因移除扫描 checkpoint 而省略删除前的可靠证据。</p>
+        <p>未来若单纯为了提前完成子树评估 blocks，也只涉及枚举与完成屏障，不引入全量断点续扫要求。独立扫描命令或其他场景已有的续扫规范不扩大为本次全量迁移的实现范围。</p>
+
+        <h4 id="file-transfer-mode">文件级断点续传；不续传固定使用 Direct</h4>
+        <p>文件支持断点续传，扫描不支持断点续扫，两者独立。统一使用 sync 的 --resume 选择文件续传；未启用时固定为 Direct，不新增 --transfer-mode atomic|direct，也不提供 AtomicReplace 作为本迁移流程的选择。</p>
+        <div class="table-wrap">
+          <table class="matrix">
+            <thead><tr><th scope="col">参数</th><th scope="col">本项目模式 / data-mover 全称</th><th scope="col">行为</th></tr></thead>
+            <tbody>
+              <tr><th scope="row">--resume</th><td>Checkpoint / TransferPolicy::Checkpointed</td><td>使用目标支持的文件传输检查点。增量重新枚举到文件时，核验源身份、版本、传输绑定和状态，复用仍有效且未因数据失败失效的已确认部分，不恢复扫描位置。</td></tr>
+              <tr><th scope="row">未启用 --resume</th><td>Direct / TransferPolicy::Direct</td><td>直接写最终对象，不使用 staging／原子 rename／续传检查点；中途可能出现部分内容，数据复制最终失败后必须清理本次失败产物。</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>CLI、Web 和 plan 统一解析为 Checkpointed 或 Direct 并记录执行绑定。--in-place／--no-resume 及产品 Atomic 入口已移除，不能无视“非续传使用 Direct”静默切换。quick／full 校验是另一维选择，两种传输模式都适用，不能相互隐式覆盖。Atomic 在 data-mover 中的全称仍是 TransferPolicy::AtomicReplace，但不属于本方案选择范围。</p>
+        <p>扫描前 plan 检查所选模式及远程传输路线的真实能力。若某 backend 的 Direct 能力尚未提供，应在 data-mover／客户端补齐后支持，不得伪装 Direct、静默改模式或绕过删除前持久性要求；未满足能力时准确报告计划错误。Checkpointed 的有效粒度和小文件是否省略检查点也需如实说明。</p>
+        <p>续传前匹配源身份／版本、目标和已持久化传输状态；源变化、绑定不符或数据已最终失败时不能复用旧断点。仍有效的文件中断状态可供下一次增量复用，但数据最终失败必须清理并失效断点，此文件下一次从头传输。两者不能混同，也不能以“支持断点续传”为由保留已经判定失败的数据。</p>
+
+        <h4 id="target-failure-cleanup">目标清理：数据失败删除，元数据失败保留</h4>
+        <div class="table-wrap">
+          <table class="matrix">
+            <thead><tr><th scope="col">最终结果</th><th scope="col">目标处理</th><th scope="col">源端与再次执行</th></tr></thead>
+            <tbody>
+              <tr><th scope="row">数据读取／写入／内容校验失败</th><td>清理本次失败复制产生的目标数据、stage／分段上传等产物及关联失效续传状态，记录清理是否确认完成。</td><td>不删除源端；下一次增量先确认残留已清理，再重新复制该失败文件。</td></tr>
+              <tr><th scope="row">仅元数据获取／应用／校验失败</th><td>保留已复制目标数据，记录数据完成与元数据失败，不作为整项就绪。</td><td>不删除源端；下一次增量补齐元数据，避免无必要的整文件重复制。</td></tr>
+              <tr><th scope="row">仅 ClickHouse 入库失败／未知</th><td>保留有效目标数据，不把记账错误当成数据复制错误。</td><td>目标就绪即可删除源端；独立报告入库失败／未知，允许缺失记录。</td></tr>
+              <tr><th scope="row">目标发布结果未知</th><td>先保留未知事实并按发布身份对账，不把“未知”自动判成“数据失败”盲目删除。</td><td>不删除源端；确定实际结果后执行对应清理或确认流程。</td></tr>
+              <tr><th scope="row">目标数据清理失败／未知</th><td>标记待清理／未知，不宣称已删除；数据错误和清理错误分别上报 callback。</td><td>不删除源端；下一次增量优先对账清理，不能使用已经失效的断点。</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>预算内的调用错误尚可安全重试时，先按阶段重试；最终成功只留日志，不执行失败清理。最终确认数据失败后，两种传输模式均执行上述清理；若数据和元数据都失败，以数据失败的目标清理规则处理。</p>
+        <p>清理绑定本次执行的目标对象／版本／stage 身份，不能误删本次未修改的既有成功副本、同 key 的其他成功历史版本或其他写入方的新数据。若 Direct 已覆盖已有目标并最终失败，当前受影响数据作为本次失败产物清理，不能宣称恢复了覆盖前内容；未曾写入目标时不删除无关已有副本。版本化目标精确清理失败复制产生的版本或上传，不能用不带版本身份的删除制造新的 delete marker。具体清理动作与证据由 data-mover／客户端负责，任务层记录结果与后续增量动作。</p>
+        <p>网络中断仍需尽早优雅退出。应清理的数据在网络不可达时不可能保证即时删除：只在受控收尾期限内尝试，未确认完成就记录待清理／未知并明确 callback，随后退出，不为清理持续重连。任何被标为数据失败待清理的前缀都不能再作为正常续传依据。</p>
+
+        <h3 id="delete-failure">4.7　删除失败：保留目标，本轮按阶段重试</h3>
+        <p>源端删除过程中确认网络中断，立即停止新增删除并优雅退出，不持续重试等待重连。只读、权限不足、对象锁或保留策略限制应准确上报并停止无效重试。当前操作的安全重试只重试删除；下一代按上一代源保留策略选择模式，连续删除源端仍重新全量，可能重新复制剩余项，不要求专门对账系统。</p>
+        <p>重试删除前，复核当前目标就绪证据仍有效、源路径仍指向原对象及执行身份有效；不要求单项 ClickHouse 记录已确认。删除曾返回未知时，即使路径重新存在，也不能直接继续删除，因为它可能已经是新文件。</p>
+        <h4 id="permanent-version-delete">版本化源：两类目标都永久清理全部源历史</h4>
+        <p>版本化源端的删除是对该迁移 key 全部历史记录的永久清理，与目标只保留最新状态还是保留完整历史无关。执行层逐条指定源 versionId 删除数据版本与已有 delete marker，不能新增 delete marker 代替。协议依据见 <a href="https://docs.aws.amazon.com/AmazonS3/latest/API/API_DeleteObject.html">S3 DeleteObject</a> 与 <a href="https://docs.aws.amazon.com/AmazonS3/latest/userguide/ManagingDelMarkers.html">delete marker 永久删除</a>。</p>
+        <ol>
+          <li>按目标策略完成扫描和复制投影。非版本化目标只将最新状态写入 ClickHouse；版本化目标写入所复制的历史版本。删除源历史仍需遍历该 key 的全部源版本，但非版本化目标不因此把旧历史明细存入数据库。</li>
+          <li>非版本化目标：只复制最新可见数据版本，按 quick／full 校验该版本与约定元数据；最新为 delete marker 且缺少可靠的目标归属／源历史缺失证明时保留目标并在 callback 体现。版本化目标：按历史迁移全部数据版本及标记，quick 校验元数据，full 再校验所复制数据内容。不复制的旧数据只在源清理时流式列举，不落入非版本化目标的迁移历史。</li>
+          <li>确认目标策略要求的整体就绪：非版本化目标只要求最新状态成功，版本化目标要求全部所需历史成功。复核源身份后永久清理全部源历史，目标事实及清理结果异步入库，不等单项确认。</li>
+          <li>前置事实确认后，有界读取源端剩余版本 ID 并永久清理，保留当前版本／标记最后处理。非版本化目标只维护按 key 的清理状态及必要汇总，不保存历史版本行；失败后重新列举剩余历史，不依赖存储扫描游标或一次把历史加载到内存。</li>
+          <li>先清理非当前历史版本与标记，当前版本或当前 delete marker 最后处理，避免清理过程中将旧版本重新暴露为当前可见内容。当前身份变化时重新核验，不删除计划外新版本；并发源修改仍需满足既定独占或条件操作要求。</li>
+          <li>每次永久删除绑定源 backend、key 和源 versionId。非版本化目标更新按 key 的清理状态，不新增旧版本迁移行；版本化目标可更新已有历史版本的源清理结果。具体错误与操作身份按诊断契约记录，不能用目标版本 ID、当前版本或新版本代替原删除对象。</li>
+        </ol>
+        <p>普通版本 ID 可用于精确指定删除对象；对于 versioning suspended 等情况下可能被替换的 null 版本，必须显式传递 null 版本身份，并增加相应身份校验、条件删除或独占控制，不能将字符串 null 当作不可变版本保证。</p>
+        <p>源清理的迁移主计数同样按 entry，不能按永久删除的版本条数增加。该 key 的全部源历史确认清空后，关联 entry 才能确认源清理完成，各 entry 只计一次；逐版本操作留作协议及诊断事实，不充当文件／entry 完成数。源逻辑不可见不等于全部历史已永久删除，也不证明释放了多少存储空间。</p>
+        <p>为满足“全部历史删除”，迁移与清理期间必须对该源 key 停写或取得实际有效的独占控制。若仍发现新版本或历史清单变化，停止该 key 的新增删除并报告冲突，重新迁移所需的最新状态／新增历史后再确认；不能静默保留新增版本却报告源端已全部清空，也不能未经重新确认就删除它们。</p>
+        <p>非多版本目标只保留最新状态、随后删除源端全部历史是本方案的既定迁移语义，不增加“必须先保存旧版本副本”的限制。必须准确保存目标策略和清理授权；不能把未复制旧版本记录为目标迁移成功，也不能把其永久删除统计为复制版本数。</p>
+        <p>锁定的 data-mover 已提供 transfer 与受保护 purge_observed，当前没有 move_file。复用现有职责边界，必要的版本身份校验、指定版本永久删除及协议恢复归库；app 在目标整体就绪后调用清理并异步记录结果。源永久删除与目标回放 delete marker 是不同操作。</p>
+      </section>
+
+      <section id="statistics">
+        <h2><span class="index">05 / OBSERVABILITY</span>统计与状态呈现</h2>
+        <p>以持久化、已确认事实为累计统计依据，运行中状态单独展示。CLI、Web、查询接口和 callback 共用同一口径。版本化源以 entry 计数，一个 entry 内无论有多少历史版本，在每个阶段最多计一次；ClickHouse 历史行数不能作为 entry 数。</p>
+        <div class="table-wrap">
+          <table class="matrix">
+            <thead><tr><th scope="col">类别</th><th scope="col">建议展示</th><th scope="col">异常场景要求</th></tr></thead>
+            <tbody>
+              <tr><th scope="row">扫描</th><td>已访问、已过滤、目标不支持表示而按规则跳过、已纳入计划；目录、普通文件、软链接及真实对象分别按语义记录；扫描是否完整。</td><td>非空尾斜杠对象到非对象目标时单独统计跳过数量、已知字节和原因，不计作复制失败或成功，不触发源删除，也不剪枝子对象。扫描失败时不得宣称掌握完整总量。</td></tr>
+              <tr><th scope="row">计划规模</th><td>纳入计划的 entry 数及实际需复制的逻辑字节数。</td><td>一个 entry 含多个版本仍只计一次；源历史枚举数、目标版本行数及删除请求次数不增加主计数。同一逻辑 entry 的历史分段共用完成边界，多个分段不增加 entry 数，也不按版本展开。</td></tr>
+              <tr><th scope="row">执行中</th><td>排队、复制／校验、整体就绪、源删除、异步入库、重试及依赖恢复。</td><td>删除与入库是独立进度；入库待确认不阻断已就绪对象的删除，不把短暂恢复计为最终失败。</td></tr>
+              <tr><th scope="row">目标结果</th><td>按 entry 的数据完成、元数据待补齐／失败、入库确认、整体就绪、最终失败及未知结果。</td><td>entry 内所需版本全部满足对应阶段条件才计该阶段完成；仅部分版本成功不提前加一。元数据失败可已有数据完成，但整体就绪与删除资格仍未成立。</td></tr>
+              <tr><th scope="row">目录收尾</th><td>待处理、元数据已确认、失败；源目录待删除／已删除。</td><td>数据传输完毕不等于目录完成；非空目录单独报告原因。</td></tr>
+              <tr><th scope="row">源端清理</th><td>按 entry 的源清理完成、待清理、失败及未知结果。</td><td>版本化源关联 key 的全部历史清理确认完成，entry 才计一次；删除多个版本不增加 entry 数，部分清理不得算作完成。</td></tr>
+              <tr><th scope="row">性能</th><td>逻辑完成字节、实际传输字节、重传字节、复用字节、校验读取字节、速率与耗时。</td><td>重传不增加逻辑完成字节，校验流量不冒充迁移有效吞吐。</td></tr>
+              <tr><th scope="row">任务与通知</th><td>实际任务状态、当前阶段、完成条件、全部最终未恢复错误及其明细交付状态。</td><td>预算内重试恢复错误仅留日志，不进入 callback 错误集合；最终未恢复错误不得遗漏。通知失败独立表达，不能改变迁移事实或将未交付载荷标为已交付。</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <h3>正常场景</h3>
+        <div class="example"><p><strong>版本化 entry 示例：</strong>一个 entry 包含 20 个数据版本，目标非版本化时只复制并入库最新版本，复制完成计数为 1；目标版本化时复制并入库 20 条版本记录，复制完成计数仍为 1。若仅完成其中 19 个，entry 的完整复制完成数为 0，显示执行中或部分完成。</p><p>字节与数量分开：非版本化目标只累计最新所选数据的逻辑字节，版本化目标累计实际所选版本的数据字节；重传字节单列，不把版本数转换为 entry 数。</p></div>
+        <p>保留源端时可展示“文件复制与校验完成，正在恢复目录元数据”；删除源端时分别展示目标就绪、源清理及异步入库进度。只有对应阶段事实成立才增加该阶段计数。</p>
+        <div class="note"><p><strong>异步入库示例：</strong>100 个文件目标已就绪，其中 80 个确认入库，20 个仍在异步队列。100 个都可在复核源身份后删除；入库确认数仍是 80，不以删除数补算。若这 20 个最终入库失败，保留目标并报告数据库错误，允许记录缺失。</p></div>
+        <h3>清理失败场景</h3>
+        <div class="example" aria-label="源端只读时的统计示例">
+          <p><strong>示例：1000 个文件在目标就绪，其中 20 个因源端只读未删除；入库进度独立展示。</strong></p>
+          <div class="metrics">
+            <div class="metric"><b>1,000</b><span>目标文件已就绪</span></div>
+            <div class="metric"><b>980</b><span>源文件已删除</span></div>
+            <div class="metric pending"><b>20</b><span>清理失败：源端只读</span></div>
+          </div>
+          <p>任务结果：数据迁移完成，源端清理未完成。后续仅复核并恢复清理，不重复增加目标完成数，不重新复制这 20 个文件。</p>
+        </div>
+        <h3>计数与代次规则</h3>
+        <ul>
+          <li>每个 entry 有可识别的身份及关联版本，阶段完成按 entry 去重；重试、重复广播或 ClickHouse 多行确认不能重复加一。可复用基线的增量分别展示本次处理与已知累计事实；重新全量不继承旧删除代次的累计数，重扫不重复累计，也不从扫描 checkpoint 还原累计数。</li>
+          <li>同一 entry 多个版本或多个元数据类别失败，失败 entry 数只计一次，callback 仍保留全部最终错误明细。无 entry 的任务级错误独立呈现，不能伪造一个文件计数。</li>
+          <li>callback 错误明细及错误计数仅包含最终未恢复错误，预算内重试后成功的错误只写日志；重试期间不提前上报临时错误，也不在终态重新发送已恢复过程。执行阶段／尝试进度与错误集合分开。</li>
+          <li>目标就绪、源删除确认等累计里程碑可以重叠；排队、执行中、待重试等当前状态必须按明确定义计算，不能把不同口径简单相加。</li>
+          <li>扫描不完整或结果未知时，总量、剩余量和完成百分比标注不完整／未知，不做估算补偿。</li>
+          <li>清理失败、数据失败、目录元数据失败、取消、未知结果与通知失败分别表达，不共用一个 error_count 解释全部结果。</li>
+        </ul>
+      </section>
+
+      <section id="delivery">
+        <h2><span class="index">06 / DELIVERY</span>职责与实施优先级</h2>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th scope="col">所属层</th><th scope="col">负责内容</th></tr></thead>
+            <tbody>
+              <tr><th scope="row">任务层 / app</th><td>代次选择、迁移及元数据策略、执行身份、目标就绪门槛、受保护源清理调度；异步发布事实、统计及最终通知，CLI／Web 共用。</td></tr>
+              <tr><th scope="row">db</th><td>新全量清理、上一代源保留策略、有界批量异步写入及真实确认、发布／删除结果和报告持久化；集中 Single／Cluster 差异。确认不再授权删除。</td></tr>
+              <tr><th scope="row">data-mover</th><td>存储能力、元数据观察与应用、传输校验、发布证据、受保护删除及调用方指定的恢复预算执行。</td></tr>
+              <tr><th scope="row">协议客户端</th><td>连接和协议恢复、稳定写入、COMMIT、条件操作与有类型协议错误，提供实际可证明的操作结果。</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>不在 CLI、Web、sender、receiver 各自实现 backend 特判和恢复循环。目录统一收尾应形成明确模块边界，数据复制与源删除共享同一套错误和状态转换契约。</p>
+        <div class="table-wrap">
+          <table class="matrix">
+            <caption>实施与验收清单；完成范围见下方进度，不能据此认定整体完成</caption>
+            <thead><tr><th scope="col">优先级</th><th scope="col">工作</th><th scope="col">可独立验收的结果</th></tr></thead>
+            <tbody>
+              <tr><th scope="row">P0</th><td>统一目标就绪、受保护删除、元数据要求、结果未知和错误通知。</td><td>未解决数据／元数据错误阻断相应源删除；单项入库失败不阻断目标已就绪对象，最终错误明确 callback，恢复错误仅日志。</td></tr>
+              <tr><th scope="row">P0</th><td>目标就绪后删除并异步入库；按目标策略确认最新状态或全部历史，再永久清理整个源 key。</td><td>删除不等待单项 ClickHouse 确认；持久性／元数据失败不删源，不降级为逻辑删除，队列及批次有界。</td></tr>
+              <tr><th scope="row">P1</th><td>持久化上一代源保留策略并统一模式选择、base 清理及执行隔离。</td><td>保留源端→删除源端走增量，连续删除源端重新全量，含上一代失败／取消；新全量清空基线，增量保留可复用事实，不维护扫描 checkpoint。</td></tr>
+              <tr><th scope="row">P1</th><td>扫描前编译读取 plan，扫描取得原值与摘要共同入库，增量比较在同一次查询中带出所需原值供后续复用。</td><td>NFS→S3 无用途 ACL／xattr 请求为零；无比较后的二次原值查询或常态复制回源。获取失败继续可读数据复制但报错且不授权删除。</td></tr>
+              <tr><th scope="row">P1</th><td>完善目录统一收尾、空目录删除和多版本阶段判定。</td><td>目录元数据准确，非空目录保留；前序数据发布失败阻断后序，单独源元数据获取失败不阻断有序数据复制，但禁止整 key 清理。</td></tr>
+              <tr><th scope="row">P1</th><td>统一为文件续传 Checkpointed、非续传 Direct，在 plan 校验实际能力，并区分数据与元数据失败的目标清理。</td><td>数据最终失败清理目标及失效断点，元数据失败保留数据；网络不可达清理结果准确上报，失败后增量不得复用失效前缀。</td></tr>
+              <tr><th scope="row">P2</th><td>按实际需求增加子树完成屏障，再评估 blocks 带来的调度收益。</td><td>保持有界内存和正确性，以同模式基线证明性能收益。</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <h3>当前进度与后续顺序</h3>
+        <p>迁移目录扫描已共用本执行固定的过滤时间：本地全量／增量使用同一计划时钟，打包的祖先判定也复用该时钟；远程发送端固定一次后交给原生目录枚举。独立扫描未指定时钟时保持实时语义。底层已验证真实 Local 的 unordered／blocks 窗口选择以及跨时钟 checkpoint 拒绝。本地代次记录现已保存过滤时间，过滤定义指纹不包含时钟；时间窗口变化采用增量＋Preserve。文件清单支持基本的重新枚举；与过滤、打包或历史目标组合时明确拒绝，避免静默扩大选择。</p>
+        <p>CLI／Web 已将有效源保留配置固定为任务请求的 SourceCleanupPolicy，单进程准入、代次入库、worker 及收尾共用该值，不再反复读取可变全局源保留设置。Single／双副本 Cluster 实测覆盖连续未提交代次中全局值与请求相反，入库仍采用请求策略。双进程受保护删源尚未具备，现明确拒绝；连接、握手、鉴权与能力准入已纳入远程通知生命周期，失败明细经 HTTP 2xx 清理，累计任务错误及最终报告继续保存在 ClickHouse。实测拒绝删源和无效地址两类请求，均未创建复制基线或访问源／目标，callback 与归档命令行脱敏。该准入验证不代表远程统一迁移计划已完成。</p>
+        <p>本地迁移已在存储连接／计划／枚举准备之前创建通知状态，全量和增量共用入口负责最终错误及报告收尾。消费者开始前确定统计类型并挂接本轮数据库，不重建通知身份。Single／双副本 Cluster 的真实 HTTP 204 验证覆盖打包准入、过滤解析、文件清单缺失、绑定变化、无效数据库配置及 ClickHouse 启动探测断连／超时；原源文件保留，绑定拒绝也保留旧目标与 base，最终任务错误仅计一次。无效数据库配置返回原类型错误并通知外部，不降级执行复制；此时数据库自身不可用，不能归档报告。网络用例在通知归档开始时恢复数据库，最终报告可查。另验证正常全量再增量的实际目标内容、独立执行身份和未配置 callback 时的报告归档。本步不代表统一运行中网络恢复／取消或性能验收完成。</p>
+        <p>单进程增量收尾已集中到目标清理模块：旧记录未被本轮观察到，不能直接触发删除或 rename；非历史条目须按需确认旧源路径确实缺失，源仍存在时保留目标并报告 Present。旧源仍在的同身份 rename 候选改为复制新路径，保留旧目标及确认事实；历史或根目录证据不足时报告 Unknown，不将当前路径查询升级为完整历史缺失证明。源查询最终失败停止该清理阶段并交付已知 entry 与剩余范围的保留事件；短时恢复仅日志。目录不再递归清除未知后代，非空删除失败明确报告。底层只读确认采用独立检测时限及调用方指定的单一恢复窗口。本步不代表目标所有权复核、跨存储原子性或远程收尾已全部完成。</p>
+        <p>复制事实现带本轮 copy_execution_id；未变化但本轮选中的条目也刷新该标识。删源查询和目录元数据收尾同时要求本轮身份及已确认目标路径，不能仅凭旧 C/W 相等或“曾经复制过”清理范围外源项。未建立复制执行域的调用明确报错，不退回查询整张 base。真实 Local＋Single／双副本 Cluster 已覆盖三轮比较后未提交、随后状态碰撞：准备阶段将范围外旧事实统一回标到 C，随后只有选中的未变化文件删源，没有重传，范围外源文件／目录和目标目录 mtime 均保留。本步骤不新增逐文件入库确认请求；仍复用现有批量事实写入。它不是完整的目标就绪凭据、分布式执行隔离或异步删源实现。</p>
+        <p>本地迁移已接通结构化代次计划。generations 表独立于 base 保存不可变绑定、有效选择／清单摘要、校验契约、运行参数、过滤时钟、实际全量／增量模式及保留原因；接受记录确认后才准备基线，准备失败也保存该代次。上一保留源代次有可用事实时增量，上一删源代次或未完成准备时全量。准备 mutation 以 copy_sequence 排除后续复制代次，增量每轮统一回标旧事实；这不提供跨主机任务锁或所有延迟写入的隔离保证。过滤、选择变化及本轮删源采用 Preserve，跳过推断删除／破坏性 rename，并通过有界 callback 明细明确报告未展开范围未核验；契约增强时对本轮选择重新复制，单纯续传／限速变化不触发重复制。</p>
+        <p>真实 Local＋Single／双副本 Cluster 已执行 include、exclude 及组合条件共 48 次成功迁移：窗口移出再移入、跳过已确认数据、范围外事实保留、保留转删源、连续删源及删源后保留均核验实际字节数、源／目标内容和归档计划。另覆盖接受后基线准备被真实 HTTP 403 拒绝、下轮全量恢复、mirror 冲突拒绝、base 删除后绑定仍不可改变，以及删源增量 rename 复制新路径并保留旧目标。正常日志、callback 和 ClickHouse 最终报告共用实际计划与执行身份。远程统一代次计划、完整历史语义及整轮性能／内存验收仍待完成。</p>
+        <p>非版本化目标的事实键现已归一为每路径一个目标槽（version_id 为空），真实源版本写入 source_version_id 和原生 snapshot；历史目标仍按原始版本键保存全部历史。暂存、分类、复制 ACK 与未变化事实提升共用该作用域；源版本变化即使大小／mtime 相同也会识别为数据变化，旧历史不再为最新目标产生复制工作。准备覆盖前，同一批 INSERT 撤销旧就绪证明并保留旧原值；未确认行作为墓碑保留，不能仅删除这些物理行而复活 ReplacingMergeTree 中更早的成功快照。新 ACK 才恢复目标槽的就绪状态。真实数据库用例保留同键旧物理行，连续失败并让源回退旧版本，仍须重新复制；本步不增加逐文件数据库等待。</p>
+        <p>真实 RustFS＋Single／双副本 Cluster 已完成 18 轮迁移，其中 16 轮成功、2 轮按注入失败：源端四个不同内容的版本全量复制，同一 entry 新增两个版本后增量复制，再执行无变化增量、数据拒绝失败及最新删除标记场景。非历史目标 base 始终一行，成功历史目标从四行增至六行，独立读取核验完整顺序／内容、源历史保留及无重复发布；各轮字节、entry 计数与最终报告归档同时检查。失败场景只发起首个新版本的数据 GET，后续版本被阻断，失败 entry 计一、逐版本实际原因及阻断原因经 HTTP 204 交付；原四个成功目标版本保留。最新记录为删除标记时，非历史目标保留原有内容、累计保留数为一、错误数为零。共享扫描表还通过双副本真实 schema、暂存重放及原生观察读写回归。</p>
+        <p>增量数据比较还须检查已持久化的源 identity_key，不能仅比较大小、mtime 和 source_version_id；非版本化／null 版本被覆盖时这些字段可能全相同。该键来自 backend 的原生身份事实，复用现有列，不新增源查询或内容读取；身份相同仍不等于内容已通过 full 校验。真实 RustFS 回归通过只读代理固定时间、保留实际 ETag／内容／版本号，覆盖 Single／双副本 Cluster、普通／null 源和两类目标：覆盖后复制一次、随后无变化不复制，独立核验目标及保留的源数据。</p>
+        <p>全量和增量共用逻辑 entry 的历史分组执行器，逐版本 ACK 负责事实入库，只有完整历史结束才增加一次成功数；同一组的最终失败只累计一次，callback 仍逐版本保留原因。增量比较即使某段无变化也交付分段边界，避免跨批次丢失收尾；在途状态按扫描并发设上限，不保留完整历史或已完成 key 集合。真实 S3 的 20 版本全量验证覆盖分段大小 1／7 的成功和源 tags 获取失败，以及大小 20／10 的数据失败：成功目标保留全部版本、完成数为一；元数据失败仍复制全部版本数据、失败数为一且有 20 条错误，无重复 tags 读取；数据失败阻断后续历史。历史目标文件大小分布按键的最大版本分桶。上述证据不代表历史元数据重试映射、未知发布恢复、永久删历史或吞吐／RSS 验收已经完成。</p>
+        <p>文件传输的产品契约已收敛：CLI 的 --resume 与 Web 独立的“文件断点续传”选择共用 Checkpoint／Direct，默认 Direct；全量和增量的扫描方式不由该参数决定。移除 Atomic 及旧参数入口，远程协议 v14 拒绝旧模式线格式。data-mover 归档已接受显式策略，本产品打包采用 Direct，生成流不支持文件内续传；Unix Local 以打开的 inode 保护全部清单输入、覆盖跨根硬链接，S3 按完整对象位置拒绝跨前缀覆盖源，借用清单迭代器而不再缓存一份完整清单。原生完整 CI 与隔离真实 S3 的单 PUT／multipart、权限拒绝、断连／超时后恢复验证通过；前端单元及浏览器验证覆盖续传选择保存及与扫描续扫隔离。这一步不等于 NFS／CIFS Direct、数据最终失败的受保护清理、源删除前持久性或整轮性能已完成。</p>
+        <p>普通文件复制现将扫描捕获并编译的元数据计划以 Arc 交给 data-mover，在发布前一次批量应用；应用层随后校验所发布版本，不再重复写元数据。源获取／计划错误延后到可读数据复制之后返回，数据与源元数据同时失败时保留两项有类型原因。显式的数据保留策略允许元数据应用失败后继续发布并完成所选数据校验，仍返回错误及独立的数据完成事实：计入已复制字节、逐版本报告原因，不生成完整就绪或删源授权。取消、数据校验或发布失败不转换为元数据成功；崩溃留下的数据单独发布检查点缺少完整元数据绑定，不能恢复成整项成功。捕获计划没有 mode 时，新文件保持私有权限，已有 Direct 文件按原规则保留权限。</p>
+        <p>真实 Local 的 Direct／Checkpoint 与 quick／full 组合验证元数据批量应用一次、源元数据重新读取为零、发布后重复元数据写入为零，元数据失败时保留目标／源数据并记录实际完成字节。隔离真实 S3 额外拒绝目标 tags：两种校验模式及分段大小 1／7 均保留全部 20 个目标数据版本、失败 entry 计一；两次完整 entry 的 40 条具体原因经 HTTP 204 交付，每轮完成字节为 140。代理计数核验 80 次数据 PUT、80 次 tags 拒绝及 full 的 20 次目标数据 GET，独立读取核验每个保留版本和源历史。该测试只验证首次复制的数据保留；后续元数据修复和目标版本映射见下一段，受保护失败数据清理及目标就绪后异步删源仍待完成。</p>
+        <p>复制事实现区分 copy_data_confirmed 和 copy_path_confirmed，实际目标版本写入 copy_target_version。元数据失败且原生传输确认数据已发布并完成所选数据校验时，异步记录 DataOnly；它允许后续只修复元数据，但不能作为删源或旧目标删除依据。分类阶段批量关联目标版本，无逐 entry 查询；原值、摘要及失败事实继续入库。历史元数据写入与校验显式选择目标版本，禁止退回当前 head；最新目标仍只保存一个最新槽。正常完成也使用同一完成事实，逻辑 entry 的完成／失败计数与逐版本事实分开。</p>
+        <p>失败代次不再一律拒绝历史元数据修复：已绑定目标版本的 MetadataOnly 可以继续；缺少精确映射的元数据工作，以及上轮未完成且需再次发布历史数据的工作，按具体版本保守报错，保留所有源／目标版本，不能盲目重放旧数据而改变当前版本。一般历史数据失败恢复、未知发布结果处理仍待完成。增量扫描中的可选元数据失败继续交付观察及错误诊断，worker 可以复制可读数据；同项已计数失败不重复增加任务错误。未命中选择的读取错误仍保留扫描诊断，不能静默丢弃。</p>
+        <p>隔离真实 RustFS＋Single／双副本 Cluster 已执行 56 轮：latest／history 目标、quick／full 各组合均连续两次源 tags 读取失败、两次目标 tags 写入失败，随后恢复、无变化再运行、只修改最旧源版本 tags。六轮增量的数据重传字节均为零；独立读取确认目标只有 1／4 个版本、所有数据与 tags 正确，最新 head 始终为 version-3。56 份最终汇总、32 次失败 entry、80 条逐版本原因、40 条源观察诊断及 40 条保守保留范围均经 HTTP 204 接收，任务错误未重复累计。这是元数据修复和计数证据，不代表历史数据失败恢复、删源就绪或完整性能／内存已验收。</p>
+        <p>Direct 的 S3 小对象数据路径现已允许使用服务端 CopyObject：两端原生亲和一致、普通源对象同时满足目标单 PUT 阈值与原生单复制限制时，在数据阶段完成复制，随后应用元数据。默认阈值为 8 MiB；较大对象、非空尾斜杠源对象保留原有流式 Direct 路径，不改变 key 或传输模式。快速校验不读取对象数据，全量校验仍读取源和所发布目标；没有暂存 key、上传或续传检查点。失败／取消未确认的数据不计为已完成字节，元数据失败继续按失败报告并保留数据，不能授权删源。</p>
+        <p>该路径已在隔离真实版本化 S3 上覆盖 quick／full、目标 tags 拒绝、权限拒绝、持续断连、静默超时、取消、恢复重试及成功响应丢失。独立检查确认每个完成复制仅有一个目标版本、源端完整保留、无 staging／upload／删除标记；quick 的数据 GET 为零，full 为源／目标各一次。测试使用 1 秒读超时和 2 秒操作超时，超时约 1 秒返回、复制中取消约 253 毫秒返回；这些是该请求路径的功能证据，不能代替任务级网络抖动预算、完整迁移吞吐或 RSS 验收。大对象原生 Direct、源删除前就绪确认和受保护的失败数据清理仍待推进。</p>
+        <p>删源前现已再次捕获本轮原本取得的源属性，比较 mode／uid／gid 及 ACL、xattr、tags 的语义摘要；未请求属性不新增读取。读取失败或原值变化均保留源项，属性接口的 NotFound 不能冒充源路径缺失。源文件身份／大小／mtime 和链接目标继续由原生清理角色复核；目录不因本程序删除子项产生的 mtime 变化误报属性冲突。源观察调用复用 data-mover 的同一只读窗口，迁移层显式传入扫描配置的检测时限及恢复预算；默认检测时限仍是 30 秒，识别后窗口默认 3 秒。</p>
+        <p>真实 NFS v4.1 验证了未变化源可删除、复制后 mode 改变保留源及目标、重复清理幂等。仅对测试连接注入闪断、持续断连、静默丢包和取消：闪断恢复后成功清理，另外三例删除调用均为零，独立服务端检查源内容保留；测试指定 1 秒检测／3 秒恢复，持续断连约 3.4 秒、静默丢包约 4 秒、取消约 251 毫秒。它不代表默认 30 秒检测的同等耗时，也不代表目标核验、实际删除 RPC 或整个任务都已具备统一网络预算。</p>
+        <p>目标持久化确认已接入单进程删源门槛，覆盖 Unix Local 普通文件、目录、未变化的数据和后续仅更新元数据的文件。最后一次目标校验取得的描述符交给 data-mover：复核 identity、kind、size 和变化证据，执行文件及目录链 fsync；每次核验根路径并同步根外祖先，覆盖新建 endpoint 根和同一根 inode 移走再移回。不读文件体、不重放数据、不创建 stage。同步失败、目标变化或能力不支持均保留源及目标，callback 以 target_persistence_unconfirmed 和具体路径、原因报告，源端存在性未重验时保持 Unknown。该能力当前不支持软链接、Windows 及其他目标 backend；不把可读／校验一致伪装为持久。正在执行的系统 fsync 不能被强行抢占，断电、网络挂载及整轮性能尚无验收结论。 本轮另通过原生 Local 的 6 项持久化测试、任务层 10 项相关测试和上述真实 NFS 故障回归；未把普通单元测试中忽略的实验室用例当作通过。</p>
+        <p>源清理失败的逐项 callback 状态携带已识别源／目标路径：确认属性变化时标记 Present，读取或其他证据不足时保持 Unknown；保留事件不重复增加复制失败 entry 数，最终任务错误继续累计。该状态通过既有有界明细机制交付，完整终态报告照常归档。当前清理仍在数据库收尾之后执行；Unix Local 以外的目标持久化、所有权凭据、全部历史永久删除、异步记账及完整吞吐／RSS 验收仍待完成。</p>
+        <p>普通文件的全量／增量传输现显式选择 Direct 数据失败清理。data-mover 默认仍保留原语义，只有授权的 Transfer／发布前 Verify 失败保留独立清理句柄；它不是可恢复的 unpublished stage。Unix Local 核验新建／已有、初始 inode 与变化事实、独立修改意图，以及当前根、父目录和末尾 inode；仅清理本次拥有的坏结果，未修改或无法归因的原目标保留，替换路径拒绝。清理失败与原始复制错误同时保留到诊断中，源端不删除。元数据错误、已发布数据的元数据错误、未知发布／持久化错误均保留目标数据。原生 8 项后端和 5 项引擎测试覆盖真实文件、取消后写任务收束及替换保护，产品 4 项复制契约测试验证实际选项和行为。没有为默认 Direct 增加逐文件 stat；该证据不能代替整轮吞吐／RSS。当前清理机制仅 Unix Local 实现，其他协议、发布后数据校验失败和 expert／生成流仍需补齐。</p>
+        <p>目录事实批次在共享数据库执行作用域内已使用固定去重身份及同步批次提交，恢复循环外冻结 W、代次执行身份、序号和目标版本槽；重试借用原批次重新生成行，不复制整个 snapshot 清单，不重跑数据传输。真实 Single／双副本 Cluster 的 32 组用例覆盖最新／历史目标、确认丢失、闪断、超时恢复、持续断连、静默丢包、403 和取消；不使用 FINAL 掩盖重复行，原始行数、原值、版本映射及 DataOnly／Ready 均保持一致。持续故障下探测成功不重置失败写窗口。普通全量／增量复制事实消费者现已接入该恢复作用域；提前删源、目录收尾和任务统一取消仍需继续接入，不能据此宣称已取消数据库收尾屏障或达到性能目标。</p>
+        <p>复制事实消费者使用独立可取消传输，同时保留已接受的代次身份和部署配置。持续故障在共享预算耗尽后关闭必需队列；明确的权限拒绝不当作断网重试。空闲、背压和末批刷新也由同一监测域收束；最终通知和代次收尾使用原目录连接，不被事实传输取消。worker 因必需消费者退出而产生广播错误时，最终任务优先保留消费者的真实原因，避免 callback 只剩“通道关闭”。真实 Single／双副本 Cluster 的全量／增量消费者共 60 组用例通过，覆盖排队批次、空闲及末批刷新；另有 4 轮完整迁移验证 HTTP 204 callback 保留原始数据库拒绝原因，失败代次和最终报告仍可查。持续写断连约 3 秒、静默写超时及收尾约 4.3 秒、主动取消约 0.5 秒；空闲断连约 4 秒、空闲静默超时约 5 秒，包含 1 秒探测间隔及检测时间。普通数据传输与原生目录流现已按下文接入取消；初始化及其他操作仍待统一，不能据此宣称整轮故障控制已完成。</p>
+        <p>Unix Local 的受保护删源已将扫描时的 mtime／ctime 变化证据保存到 backend 私有事实，并随原始 snapshot 保留；等长改写并恢复 mtime、缺少变化证据时均拒绝删除。编码复用已有属性，不增加 stat；阻塞清理仅捕获路径、身份、大小和固定长度变化 token，不复制 ACL／xattr／tags 原值。目录 purge 使用严格 remove_dir，任何隐藏子项也阻止删除，不复用普通 delete 的 artifact 递归清理；已清理授权子项导致的目录 mtime／ctime 变化不构成冲突。应用层保留有类型错误并向 callback 暴露已脱敏的具体拒绝原因，不能只输出通用冲突类别。该保护仍依赖文件系统时间精度及调用方排除并发写入；非 Unix 保守拒绝，不宣称原子 compare-and-unlink、网络挂载或断电验证，也不替代增量内容比较及目标就绪证据。</p>
+        <p>本地迁移的增量比较 worker 与 Phase A／B 事实消费者现共享任务持有的数据库执行域：同一恢复窗口、取消标记和精确查询身份，不能由每个 worker 重置窗口；通知与代次最终记录仍用独立连接。首个最终子任务错误先以有类型原因保存，再取消其他数据库工作，避免诱发的取消遮住原始原因。真实 Single／双副本 Cluster 新增 12 轮比较故障验证，覆盖闪断、读响应丢失、静默恢复、持续断连、静默超时和 403；恢复轮复制 4 个新增文件且原目标保留，失败轮保留源与原目标，callback 均经 HTTP 204 接收。首个故障请求至最终报告，持续断连约 3.1–3.3 秒、静默超时约 4.4–4.6 秒；整轮另计初始化。任务边界显式堆存 future，已在默认测试栈上回归正常复制和故障路径，防止多层异步 poll 栈叠加。在途普通传输与原生目录流的接入和大文件故障测量见下文；初始化及其他操作的统一取消、解除删源的数据库收尾屏障和吞吐／RSS 验收仍待完成。</p>
+        <p>普通文件与历史版本传输现将任务数据库执行域的取消信号传给原生 Direct／Checkpoint 请求；本轮已取消时不再开始新的 entry 数据复制。协议请求取消、已发出写入的排空、失败输出归属核验和检查点恢复仍由 data-mover 负责，应用层不增加存储重试循环。真实 Single／双副本 Cluster 使用限速的 256 MiB Local 文件，在已有数据写入后中断数据库数据／探测路径；通知归档路径保持可用，数据路径在执行请求取消后恢复。测试覆盖全量／增量、Direct／Checkpoint、持续断连／静默超时，核验源保留、Direct 未完成输出清理，以及跨过 64 MiB 自动检查点后恢复轮的实际传输字节减少。原生逻辑完成量包含 reused_bytes；应用层的 transferred_bytes 已扣除复用量，文件数和逻辑完成大小仍保留完整文件口径，元数据错误时已确认数据也遵循同一计量。16 组故障用例、8 次检查点恢复和 32 份 HTTP 204 最终汇总已通过，所有失败 callback 均保留原始 ClickHouse 原因；故障注入至任务返回约 3.3–6.2 秒，包含探测、恢复窗口和收尾。原生目录流和 file_list 点查询也已按下文接入；初始化、目录／独立元数据、rename、远端复制及存储网络恢复仍待继续，删源的数据库收尾屏障和吞吐／RSS 验收也未完成。</p>
+        <p>本地全量／增量的原生目录遍历已绑定同一任务取消信号，枚举持有独立子信号，关闭目录流不会反向取消父任务。队列背压可以被取消打断，协调者在读取扫描终态及进入后处理前等待生产任务和原生完成证据；生产任务异常优先于关闭缓冲产生的取消，若此前已有真实错误则一起保留有类型原因。7 项生产任务回归，以及接入后的 16 组数据故障、8 次检查点恢复和 12 组增量比较故障回归已通过。正常 EOF 不取消已交付缓冲，允许完整排空；取消后被丢弃的缓冲不能用原生已完成冒充应用交付完整。本步骤覆盖原生目录流及其生产任务生命周期；file_list 点查询的后续接入见下文，初始化、独立元数据、rename、源／目标网络共享恢复和整轮性能仍未完成。</p>
+        <p>file_list 点查询现通过既有 read_namespace_entry 的可选 ObservationPlan 复用 NamespaceReadPolicy，并绑定同一任务的子取消信号；复制任务显式采用配置中的检测时限和恢复窗口，独立调用默认 30 秒检测且不自动恢复。原始元数据计划继续控制读取范围，不增加其他属性查询；准确 stat NotFound 与属性读取失败分开处理，错误保留原生首末原因。文件列表队列也能中断背压，并由协调者等待生产任务结束。真实 Single／双副本 Cluster 的文件列表全量／增量、Direct／Checkpoint 共 16 组故障、8 次检查点恢复和 32 份 HTTP 204 汇总通过；另在独占真实 NFS v4.1 前缀中验证点查询闪断恢复约 24 毫秒、持续断连约 3.3 秒、静默超时约 4 秒、在途取消约 251 毫秒，4 个源文件内容完整保留且前缀已清理。两个链路分别验证，不冒充 NFS 整个迁移与 ClickHouse 同时故障的组合验收；初始化、其他存储操作统一恢复、提前异步删源及吞吐／RSS 仍待推进。文件列表这一步未增加 data-mover 对外接口，应用配置入口限于 crate 内部；read_source_observation 是本轮此前于 2026-11-08 07:30（北京时间）在原生提交 123cc8f 新增，不能将“当前可复用”表述为原 main 已有。它复用 observe_descriptor 的观察构造和 read_namespace_entry 共用的内部恢复机制，新增语义为 stat、属性及链接读取共用同一恢复预算；随后在 3b34f32 之前的接口收敛中已移除该新入口，当前统一从 read_namespace_entry 传入可选观察计划。</p>
+        <p>删源代次终态 base 回收已落地（70cb4cb），复用既有代次结束入口与 Single／Cluster 布局层，不增加逐文件确认。复制／临时合并／原生写入共用执行内读写闸门；终态等待在途写入后关闭新事实，只有确认空表才允许成功结束。清理失败和报告保存失败保留双方有类型原因，callback 明确标为 base 清理失败而非文件复制失败。真实数据库 18 组回收场景、32 组代次切换及 Local 源清理验证通过；完整任务另覆盖 6 次终态清理失败和 6 次下一全量恢复，HTTP 204 独立检查原因、累计任务错误及 ClickHouse 最终报告。这里的取消场景包含清理 future 被取消，不冒充整个 CLI 的取消验收；闪断后幂等重试验证不等于整轮共享恢复预算已经接通。源清理仍等待数据库和目录收尾，提前删源、统一故障控制及整轮吞吐／RSS 对比继续待实施。</p>
+        <p>元数据只读校验已补齐在途取消（data-mover 378bd9e，应用接入 69386b9），沿用 MetadataPlan::verify_published 和原有 Cancelled 错误，不新增公开接口。stat、当前 HEAD、历史 HEAD、tags 和独立权限读取共用取消边界；空计划也不忽略取消。确定性测试覆盖五处等待并确认 future 释放；任务层 Direct／Checkpoint 与 quick／full 四种组合也确认取消错误保留已发布证据，源和目标内容均保留。真实版本化 S3 的四处读取阻塞在发出取消后约 252–254 毫秒返回，两个历史版本的内容与 tags 均未改变，未发生数据 GET 或写入。两仓库对应 Rust CI 检查通过；应用另复跑真实 Single／Cluster、latest／history、quick／full 共 8 组版本化元数据迁移和 56 份 HTTP 204 callback，目标版本分别保持 1／4，元数据重试不重传内容。上述版本化应用用例保留源端，不代表永久删源已经接通。这一步不代表所有 backend 的句柄回收、故障识别和共享恢复预算已验收，也不改变当前源清理等待数据库收尾的顺序；完整吞吐与 RSS 对比仍未完成。</p>
+        <p>NFS 普通文件 Direct 已补齐（data-mover fe40a1b），应用固定依赖同步到该提交，对应 Rust CI 检查及 16 项独立远程进程测试通过（本机 rustc 1.98.1，未据此宣称 CI 的 1.95 工具链已运行）；复用原有传输与清理入口，扩展 CREATE／OPEN 返回实际 FH，合并冗余创建接口，不新增公开入口。最终名称直接可见，完整输入后调整长度；源／目标别名、目标替换、已进入元数据阶段及已发布数据均受保护。失败关闭最多再等待 3 秒，关闭未知或已发出写入但属性未变时不冒充清理成功；要求稳定写入时按有界批次提交，不保留整份文件的未稳定数据。NFS 后端 258 项测试、原生 make ci、最小 feature 契约编译通过；真实 Linux v3／v4.1 覆盖 quick／full、长文件覆盖、空文件、部分写失败清理、只读父目录内可写文件、实际所有权拒绝保留数据及 FH 保护，服务端独立核验内容、权限与无临时产物。真实 v4.1 私有连接代理另覆盖闪断、持续断连、静默丢包、取消与丢响应：持续断连约 0.96 秒、role future 取消约 252 毫秒，静默丢包仍约 48 秒，不能据此声称已满足任务统一检测／恢复预算；不冒充完整请求或 CLI 取消验收。实验前缀及代理资源已清理。本步不代表 NFS／CIFS 归档或远程 Direct、NFS 删源前独立持久化、全部历史永久清理或整轮吞吐／RSS 已完成；源清理当前仍等待数据库收尾。</p>
+        <p>NFS 已发布普通文件的独立持久化确认已接通（data-mover 4ed69ed，应用固定依赖同步更新）。沿用 Namespace::persist_observed，扩展现有 stat 的 fresh 选择、open_read 的实际 FH 返回及 checkpoint 的整文件 COMMIT 选择；不新增对外入口，不创建传输状态，不改权限、不回读内容。确认前后从端点根解析路径，核对 FH、类型、大小、mtime／ctime、mode 与 ownership；COMMIT、CLOSE 和最终复核全部成功才返回就绪，关闭最多另等 3 秒，双故障保留双方诊断。断连／超时原因保持 Connectivity／Timeout，同时保留 Unknown，不能将不确定确认当成可删源事实。原生 265 项 NFS 测试、完整 make ci、最小 feature 编译及真实 v3／v4.1 普通、空、0444 文件与文件／祖先替换验证通过。v4.1 的五类故障在实际 COMMIT 和匹配 XID 上触发，确认了一次真实提交响应丢失；闪断和丢响应恢复，持续断连约 0.63 秒、静默超时约 18 秒返回，取消在信号发出后立即返回。应用原有删源原语另通过真实 NFS 目标 7 组场景：quick／full 及恢复后才删除 Local 源文件，持续断连、超时、取消时源文件保留，服务端独立核验全部目标内容。对应应用 Rust CI 和 16 项远程进程测试通过，实验前缀已清理。这是普通文件与删源原语的验证，不代表完整 CLI／ClickHouse／callback 组合、目录／软链接、真实 pNFS DS、统一网络预算或整轮性能／RSS 验收；当前数据库收尾屏障仍未解除。</p>
+        <p>NFS 目录与符号链接的持久化确认已在原生实现补齐（data-mover 26063b0）。复用现有 persist_observed，前后从端点根重新观察路径并核验绑定及变化证据；依赖 NFS namespace／SETATTR 的同步稳定完成契约，不对目录或链接执行普通文件 OPEN／COMMIT。真实 Linux v3／v4.1 验证空目录、只读目录、创建子项后恢复精确纳秒 mtime、断链及目录／链接替换保护，服务端独立核验内容、mode 和链接原值。实际 v4.1 lookup_path 与 XID 故障验证覆盖两种类型的闪断、断连、静默丢包、取消及丢回复：恢复的故障仅留日志，断连约 0.32 秒、静默超时约 15 秒返回，取消约 252 毫秒；全程无文件 COMMIT。只读未缓存回复的重查归属 nfs-rs（固定提交 7d984b4），最多用新 sequence 查询一次且沿用操作截止时间，修改操作不重发；data-mover 无对应重试循环或新增公开入口。SDK 使用 Rust 1.95 通过全目标检查、严格 Clippy、699 项库测试、48 项文档测试及启用 Python bindings 的 711 项 Rust 测试；原生 267 项 NFS 测试、最小 feature 编译和 make ci 各检查项分步完成，空间不足造成的链接中断后已续跑并补齐示例测试。应用已锁定同一精确依赖并通过真实 NFS 目标的目录／链接 12 场景，以及普通文件原有 7 场景：确认成功后才删除 Local 源，断连、超时及取消时保留源并返回有类型的持久化未确认错误；服务端独立核验全部目标且无传输产物。对应应用 workspace 检查、Clippy 和测试通过，远程进程串行回归重跑 16 项通过（本机 Rust 1.98.1）；首轮曾出现 mux 大文件场景缺少小文件，单项 40 次、四并发 200 次及 20 轮保留前置场景的 14 项子集均未复现，原因尚未确认，不能据此宣称该偶发问题已修复。真实前缀和代理已清理。上述证据不代表完整 CLI／数据库／callback、真实 pNFS DS、NFSv4.2 物理链路、统一网络预算或吞吐／RSS 验收；删源仍等待数据库收尾。</p>
+        <p>NFS 源端的受保护清理已补齐（data-mover 24dcc77，应用固定依赖 a4ecf4f；属性缺失处理为 7f0632f）。沿用 Namespace::purge_observed，并扩展原有 NFS delete 的原观察参数；从端点前缀重新解析父目录，再通过同一父句柄查询叶子，核对 FH、类型、文件大小、mtime／ctime 及已捕获权限，只执行一次 REMOVE／RMDIR。目录允许自身删子项造成的时间变化，但仍核对身份、权限并拒绝非空目录，不递归，也不清除隐藏传输产物。取消和未知执行结果保留 Unknown；只有权威名称缺失才视为 AlreadyAbsent。会话重放身份丢失时不新建会话盲重发修改操作（nfs-rs 638c8e4），缺失字段不能用默认零值作为证据（1478d8b，固定长度返回位图）。请求但缺失的所有权／时间元数据标记失败，未请求的类别不报错；可用的类型、大小及句柄仍可用于读取数据。真实 Linux v3／v4.1 正常原语验证涵盖普通文件、重复清理、恢复 mtime 的等长改写、文件／缓存父目录替换、子项后空目录、隐藏子项、断链、权限拒绝及端点根保护；独立读取核验备份、被拒绝源项和替换项。两协议均覆盖闪断、持续断连、静默丢包、取消和丢删除回复；v4.1 的闪断／丢回复恢复，另用私有代理合成 BADSESSION 确认零新 EXCHANGE_ID。v3 对闪断／断连／丢回复保留不确定状态，丢回复时源可能已删；所有场景的备份均完整，旧观察不会删除随后出现的同名项。静默检测仍约 v3 5 秒／v4.1 15 秒，取消约 253／252 毫秒；不据此宣称统一任务故障预算已满足。原生 277 项 NFS 测试、严格 Clippy、最小 feature 及 make ci 各检查项分步通过，链接空间不足后逐组补齐了全部 workspace 测试、示例、文档和 Local E2E。应用锁定精确依赖后，真实 v3／v4.1 源／目标原语已验证 quick／full、重复清理、恢复 mtime 的等长改写、源／目标改权限、子项先删及断链，服务端独立核验内容、权限差异、恢复的 mtime、链接原值与无传输产物；对应应用 Rust CI 和 16 项串行远程进程回归通过（本机 Rust 1.98.1）。实验前缀、工作节点产物及私有服务已清理。该能力要求调用方先确认目标就绪并排除并发源／祖先修改，不提供原子的 compare-and-unlink，时间精度受服务端限制；NFSv4.0／4.2 等未验收协议保持 Unsupported。这些结果不代替完整 CLI／ClickHouse／callback、历史版本永久清理、掉电或整轮吞吐／RSS 验收；当前应用源清理仍等待数据库与目录收尾，提前逐项删源和异步记账继续待实施。</p>
+        <p>NFS 的隐式 ACL 读取已从基础属性请求中移除（nfs-rs fdc541c；data-mover a655be9）。继续使用现有 get_acl，不新增公开方法、请求类型或恢复策略；普通 GETATTR、LOOKUP 与目录列举不再因为 ACL 的权限拒绝丢失整份基础属性，也避免基础响应中的 ACL 被丢弃后再次读取。先用协议回归复现旧查询因 ACL 返回 ACCESS，再验证基础字段可读且显式 ACL 仍准确失败。Rust 1.95 检查、严格 Clippy、702 项库测试、48 项文档测试与 714 项 Python bindings Rust 测试通过。真实 Linux NFSv4.1 的私有代理审计了 118 次 GETATTR／LOOKUP／READDIR 属性请求，隐式 ACL 为零，三次显式 ACL 查询中两次注入 ACCESS；省略阶段没有 ACL 查询。对象目标使用 S3 能力投影，实际数据目标仍为 NFS，不冒充真实 S3 目标验收。任务原语在源 ACL 获取失败时完成数据交付，保留 PublishedDataMetadata 及 ACL／PermissionDenied 类型原因，保留源并拒绝清理；成功的 ACL 原值通过快照往返及复制验证。独立服务端读取确认三组源、目标内容和已完成的权限模式一致、无传输产物。新 SDK 另通过 v3 五类／v4.1 六类受保护删源网络故障回归，备份和随后同名项受保护，元数据计划夹具也未受影响；静默检测仍为约 5／15 秒，取消约 252 毫秒。原生精确 Git 依赖的完整 make ci 通过；应用锁定同一依赖后复跑上述协议审计，以及真实 v3／v4.1 的原有目标就绪与源项复核场景，均通过。应用 workspace 检查、Clippy、测试及 16 项串行远程进程回归通过（本机 Rust 1.98.1）。这一步落实 NFS 扫描计划对昂贵 ACL 读取的控制，不代表全部协议的额外读取合并、实际 ClickHouse／外部 callback、统一网络预算或整轮吞吐／RSS 已验收；源清理仍在数据库收尾后。</p>
+        <p><strong>最新方案变更：</strong>目标就绪后删除、异步入库及上述代次规则替代此前“入库确认后删源”和“一切失败转增量”。最新实现仅对下述普通条目的有界就绪窗口解除入库等待，其余清理仍在数据库收尾后执行；本节较早段落记录的是对应步骤完成时的行为。</p>
+        <p>S3 对象目标的持久化确认已接通（data-mover fbf59c0，应用锁定同一精确 revision）。扩展原有 Namespace::persist_observed 和 S3BucketCapabilities，不新增公开函数或类型；对象桶依赖完整写入的持久化契约，只用一次 fresh HEAD 复核端点、对象身份、大小、ETag 和已记录的 Last-Modified，指定历史版本时复用现有 head_version 与版本回显检查。空对象、非空尾斜杠 key 均按真实对象处理；虚拟目录、删除标记、证据不足、目标替换以及尚未认证的 NAS 桶不能据此确认就绪，不将 HEAD 可读或 ETag 等于 MD5 当作持久化依据。原生 S3 库 408 项测试通过（另 2 项 ignored），完整 make ci 通过；隔离真实 RustFS 覆盖成功、权限拒绝、持续断连、静默超时、取消、闪断恢复和超时恢复，所有原版本和哨兵保留，零数据 GET、零写入。应用另在最后一次持久化 HEAD 精确注入同样 7 类故障，已复制而本轮跳过数据的 Local 源项只在目标就绪后删除；失败时保留源内容及 TargetPersistenceUnconfirmed 的具体类型原因，用例显式恢复代理并重试后才删除源。应用断连约 6 毫秒、静默检测约 1 秒、取消约 256 毫秒；这是测试显式超时，不代表统一产品预算已完成。应用 workspace 检查、Clippy、测试及 16 项串行远程进程回归通过（本机 Rust 1.98.1，保留已有警告）；最终测试程序另复跑同一真实故障矩阵通过。隔离容器已清理。上述物理证据限定版本化 RustFS 与删源原语，尚不代表全部 S3 厂商／非版本化目标、NAS 持久化、历史永久删源、完整 CLI／ClickHouse／外部 callback、掉电或整轮吞吐／RSS；当前源清理仍在数据库收尾后。</p>
+        <p>全量 worker 的终态失败现复用原有 CopyDatabaseExecution 作用域，与增量路径共用首个有类型原因及取消信号；Sender 的输入等待和 CopyEntry 发送背压、初始化的挂载槽位／连接／退避均可中断。不新增 data-mover 公开接口，只扩展现有内部初始化参数。先在旧代码中复现三项 500 毫秒取消超时，再验证修复后五项定向用例及原有 Sender 错误传播回归；其他 worker 因取消退出时仍持有最初的 TimedOut 原因，活动计数归零。独占真实 RustFS 的正常与静默初始化取消通过：实际请求到达后等待 250 毫秒发出取消，总计约 301 毫秒、信号发出后不到一秒返回；独立父进程核验 Local 源内容和属性、目标哨兵版本及内容均未变，零数据 GET、零修改、无上传，测试进程退出后连接关闭。应用 workspace 检查、Clippy、测试及 16 项串行远程进程回归通过（本机 Rust 1.98.1，保留已有警告），独占容器已清理。这一步覆盖已有共享执行域的取消传播，不代表其他协议初始化回收、常驻 SDK 池、无数据库任务、复制期间统一网络预算、真实 ClickHouse／外部 callback 或整轮吞吐／RSS 已完成；删源与数据库收尾的解耦仍在后续实施。</p>
+        <p>复制代次在失败重试中保持已提交 C 和固定 W；目标路径确认与扫描观察分开，rename 不再依赖混合历史恰好两行。代次源保留策略已持久化：连续删除源端重新全量，保留后切换删除走增量；未变化 entry 不产生复制工作且仍清理源项的契约已通过 Local／ClickHouse Single 和双副本 Cluster 验证。这不代表逐文件异步记账改造已完成。已落地的通知链路使用 HTTP 2xx 确认接收，分页归档及发送错误，累计计数不随明细清理而减少。非空尾斜杠对象已接入单进程及双进程跳过分类，单独统计 skipped_count，不生成成功基线或删源授权；Web 不再将目录数展示为跳过数。真实服务与浏览器证据及其限制见 <a href="../../tests/lab/README.md">实验室说明</a>。</p>
+        <p>增量搬迁的显式全量校验已覆盖跳过数据传输与仅修改属性的条目：删源前复用原生完整性比较，绑定原始源观察及刚核验、确认持久性的目标身份，要求实际源读取长度完整且两端 BLAKE3 一致；校验失败不删除两端数据。默认 quick 不增加数据读取，全量复制继续复用传输阶段所选校验，避免再读一轮。全量／增量清理都使用本执行已有取消信号。确定性回归先复现相同长度和 mtime 的坏目标被误放行，再覆盖短读、读取权限／连接错误及取消；真实 RustFS 的 9 类回归验证版本 ID 固定的 GET、403、断连、约 1 秒静默检测、约 270 毫秒取消及显式恢复重试，所有目标原版本与哨兵保留。真实 Local＋ClickHouse Single／双副本 Cluster 共 12 轮验证先全量保留源、再增量搬迁：第二轮不重传数据，损坏项全部保留，正常项删除；4 条逐项保留原因通过 HTTP 204 callback 接收，最终报告保存到数据库，终态 base 清空。这些用例不代表自动重试、所有 backend、保留源增量的全量校验或吞吐／RSS 已完成；增量中本轮已重新复制的数据可能额外回读，仍需优化和测量。源清理目前仍等待数据库收尾，未接入本地扫描暂存。</p>
+        <p>完整性引擎另已补上双端声明长度检查，固定 data-mover 提交 <code>bea56a42</code>：同样的短读摘要不能作为 full 成功证据。已知长度不符时保留具体出错侧、<code>Read / Protocol</code> 类型及期望／实际字节数，未知长度维持读到 EOF 的原契约；仅元数据比较不新增内容读取。原生 44 项完整性测试及完整 <code>make ci</code> 通过；锁定依赖后，真实 S3 九类读取回归与 Single／双副本的 12 轮迁移、HTTP 204 原因交付及最终报告保存再次通过。公开函数、类型和参数未增加，SDK 依赖及其余依赖图未变；短读本身由确定性 role 用例注入，不能冒充真实网络截断或整轮性能验收。</p>
+        <p><strong>普通条目的有界就绪窗口：</strong>全量删源且启用数据库时，复用现有完成广播与 Receiver 的存储连接，保留最先完成的至多 <code>min(concurrency, 64)</code> 项。扫描、Sender、Receiver 与分发全部成功，且所选条目中没有目录或版本历史时，这个窗口可以并行于数据库消费者收尾执行目标元数据核验、持久性确认、源属性复核与受保护删除；不会等待逐项入库。出现复制错误则整个窗口不删源，首个清理失败后不开始新的删除。含目录／历史的场景、超预算及窗口以外的项沿用数据库后的原路径；这是部分接入，不是全部条目的异步删源。</p>
+        <p>窗口保留 Arc 观察而不复制原值；每轮最多尝试上述固定数量的快照编码，临时编码立即释放，以编码长度四倍加容器余量作准入权重，合计不超过 8 MiB。不新增本地磁盘暂存，不把权重预算当作严格 RSS 上限，临时编码与原广播队列仍需计入测量。后续数据库清理仅对相同路径、相同源身份跳过已完成项。数据库和在途源清理同时失败时保留两个原始类型原因及具体源路径，未知删除结果不伪装成源仍存在；已搬迁目标不回滚。</p>
+        <p>真实 Local＋Single／双副本 ClickHouse 共 12 轮验证提前清理、写入 403、目录退回原流程、窗口外收尾、数据失败清除未完成目标及元数据失败保留两端数据。父进程在事实 INSERT 转发前核验源已删除且目标正确；数据库拒绝后任务失败、最终原因经 HTTP 204 交付、报告保存且 base 清空。真实 NFS v3／v4.1 的 quick／full 与两种部署另有 8 轮正常迁移；两轮 v4.1 在拦住源 REMOVE 的同时拒绝数据库写入，callback 同时报告数据库原因及带路径的 source_deletion_unconfirmed／Unknown，服务端独立检查源保留、目标正确。实验资源均已清理；本机 Rust 1.98.1 的 fmt、workspace/all-targets 检查、Clippy、workspace 测试及 16 项串行远程进程回归通过，保留已有警告。这些结果不代替物理掉电、所有后端、完整统一网络预算或全部目录／历史删源。</p>
+        <p>本项同机 Local dev 构建 A/B 共 18 轮，每轮 3000 个 1 KiB 文件，并发 16、批次 100000、unordered／Direct／quick。相对 <code>da72f50</code>，保留源不落库、平铺删源及 100 目录删源的耗时中位数分别为 0.53→0.53、5.27→5.33、4.97→4.97 秒；峰值 RSS 中位数为 168.11→163.42、202.89→198.43、220.68→220.86 MiB。小样本波动不能证明加速，且目录 RSS 仍高于约 200 MiB 的优化目标。该对比只衡量本项正常开销，不等同 release、NFS 大规模迁移、历史 PR 扫描基线或整体性能验收；完整采样与复现条件见 <a href="../../tests/lab/README.md">实验室说明</a>。</p>
+        <p><strong>普通未版本化对象源：</strong>已移除任务层对全部对象源删源的统一拒绝，普通无历史对象复用已有 <code>Namespace::purge_observed</code>，纯虚拟前缀没有删除实体，绝不按前缀递归清理。符合上述窗口条件的普通 S3 对象也可先于入库确认删除。历史版本与真实目录标记继续明确报错并保留，未将其当作普通当前对象删除。Native 修复固定为 <code>cd1ede0b</code>：LIST 的毫秒和 HEAD 的 HTTP 秒按两者较粗精度比较，原始时间仍保留；身份、ETag、大小、缺失时间及源元数据核验继续生效，没有额外存储请求或新公开接口。相同 ETag 且处于同一 HEAD 时间刻度内的变化不能靠该头识别，仍要求排除并发源写入。</p>
+        <p>真实 RustFS＋Single／双副本 ClickHouse 的 36 轮迁移已核验：12 轮正常复制覆盖 Local、普通 S3、版本化 S3 目标与 quick／full；12 轮注入源 DELETE 权限拒绝、断连、静默超时、丢回执及目标数据／tags 写入拒绝；另 12 轮同 job ID 恢复全部选择 Full，包含源已消失而目标保留的情况。4 轮在事实 INSERT 转发前独立检查 S3 源已删除、目标字节与 tags 正确。复制到 Local 不读取源 tags，非空尾斜杠源保留并通过跳过事件通知；对象目标保留完整 key 和内容。数据与 tags 失败均未发源 DELETE，数据拒绝发生在 CopyObject 发布前，未创建目标；tags 失败保留数据。后者不等同 S3 部分数据写入失败后的清理能力已完成。</p>
+        <p>8 条源删除未确认事件均带路径和 Unknown，独立查询区分实际源仍在与丢回执后已删除；数据／tags 失败各按 entry 计一，HTTP 204 收到的具体原因包含后端、阶段及脱敏后的 HTTP 403／AccessDenied，最终报告保存且删源代次 base 清空。原生另有普通桶／版本化桶各 7 类真实故障验证，正常普通对象只用一次 HEAD、零数据 GET；约 1 秒静默检测和 253 毫秒取消采用测试显式配置，不代表默认或统一任务预算。闪断／丢回执的原生恢复由用例显式重试，不冒充应用自动恢复。完整 Native make ci 通过；其他厂商、NAS、物理掉电及本项之外的整轮性能目标仍未验收。</p>
+        <p><strong>S3 Direct 失败数据清理：</strong>后续固定 Native <code>7d9016c1</code>，复用既有 RemoveOwned／remove_failed_direct，未新增公开函数、类型或 SDK 修改。本次原始写入成功回执授予清理权限：不可变版本按实际回显 ID 精确删除，可变／null 槽先 fresh HEAD 核对大小和 ETag；未知写入、相同旧内容的推断、缺失版本回显、目标替换与尚未认证的 NAS 输出不获删除权限。发布后的数据校验失败保留显式清理授权；默认 Keep、普通 discard 和元数据失败保留最终数据。可变 HEAD＋DELETE 不是原子条件操作，继续要求排除并发写入。既有 VerifyRequest.cancel 现覆盖在途只读 HEAD／GET；DELETE 回执不明保留 Unknown，原始数据错误和清理次因共同交付。</p>
+        <p>原生隔离 RustFS 的 60 场景通过，覆盖小文件原生复制、12 MiB multipart、非空尾斜杠流式写、未开版本／开版本目标及回读／写入／清理权限、断连、静默超时、丢回执和取消；独立检查源各版本与旧目标版本保留、仅本次确认输出被清理。尾斜杠在测试服务中实际是 null 单槽，未冒充不可变版本。前述应用 36 轮扩为 48 轮并全量复跑通过：两种 ClickHouse 部署各增加发布后回读损坏、清理拒绝和清理丢回执的失败／下一代恢复；新增失败均未删源，每个 entry 计一且无重复任务错误，HTTP 204 明细同时保留 checksum mismatch 及清理 PermissionDenied 或 Connectivity／Unknown，48 份最终报告已入库且 base 清空。代理修改实际 Range GET 的 HTTP 206 响应，不作为真实磁盘损坏证据。原生完整 CI 范围分步通过，批量链接初次磁盘不足如实记录；主项目 fmt、workspace/all-targets 检查、Clippy、workspace 测试及 16 项串行远程进程回归均通过（本机 Rust 1.98.1，保留已有警告）。其他厂商、NAS、全部源历史、物理掉电、默认统一预算和整轮性能仍需验收。</p>
+        <p>本项正常 S3 路径另做同机 dev A/B 六轮，每轮 1000 个 1 KiB 对象含 tags、保留源、无数据库、unordered／Direct／quick、并发 16、批次 100000，两份固定程序交错执行各三次。耗时中位数 4.39→4.30 秒，峰值 RSS 中位数 192.55→191.43 MiB；轮后独立核验全部目标字节／tags、源保留及无残留 upload。小样本未见明显开销增长，不作为加速、release、大规模或全部后端达标结论；此前 Local 目录 RSS 超约 200 MiB 的限制仍存在。完整样本、程序校验和及范围见 <a href="../../tests/lab/README.md">实验室说明</a>，独占容器均已清理。</p>
+        <p><strong>Direct 历史发布版本确认：</strong>后续固定 Native <code>7f029054</code>，复用既有 PublicationEvidence／TransferOutcome.destination_version 和私有原始写入回执，不新增公开函数、类型或 SDK 修改。Direct 只把本次成功回执的版本 ID 当作本次创建版本；同内容旧对象、丢回执后的 HEAD／LIST 推断、成功响应未回显版本，都不能据此返回新建版本证明。普通数据仍可就绪，而创建版本为 None；历史任务必须据此阻止后续版本。新复制的历史数据缺少绑定现使用既有 HistoricalPublicationUnconfirmed，属性重试缺少旧绑定仍保留原有元数据错误语义；若数据发布未确认与元数据错误并存，复用已有组合错误保留两个具体原因并阻断，目标数据保留。</p>
+        <p>最新真实版本目录夹具共 26 轮，通过 Single／双副本数据库验证：原有 18 轮，加上两种部署各三代缺少回执及一轮缺少回执同时 tags 403 的失败。独立读取证明每个故障 key 仅有最初复制的一个 payload-0 版本，后续五个源版本被阻止；第二、三代增量未重复发布，源六个历史版本保留。26 份最终报告入库，HTTP 204 接收全部明细，10 个失败 entry 各计一且无重复任务错误；52 条版本细节包含 42 条阻断，组合故障同时说明发布未确认及 PermissionDenied／HTTP 403。全量失败的成功条目计数仍为零，本项未统一扫描／完成字段命名。Native 的 13 个 Direct 单元、13 个真实原生复制及 60 个失败数据清理回归通过，完整 CI 范围分步通过。新依赖下普通对象清理 48 轮亦完整复跑通过；主项目 fmt、workspace/all-targets 检查与 Clippy、workspace 测试及 16 项串行远程进程回归通过（Rust 1.98.1，已有警告保留）。本步骤完成时该确认限定 Direct；AtomicReplace／Checkpointed 及恢复证据由后续步骤处理，源历史永久清理继续明确拒绝，尚未以 Direct 的进展解除该安全门槛。</p>
+        <p>该版本确认与任务阻断另对 <code>eace467</code> 做六轮同机 dev A/B，沿用 1000 个 1 KiB 对象含 tags、保留源、无数据库、unordered／Direct／quick、并发 16、批次 100000。耗时中位数均为 4.50 秒，峰值 RSS 中位数 191.84→189.44 MiB；每轮独立核验目标内容／tags、源保留及无残留 upload，未与重型 CI 同时计时。小样本未见明显正常开销增长，尚不代替大规模历史、release 或全部后端验收。原始样本与程序校验和见 <a href="../../tests/lab/README.md">实验室说明</a>，独占容器已清理。</p>
+        <p><strong>全部 S3 模式与 checkpoint 的版本证据：</strong>后续固定 Native <code>8bfa329c</code>，同一创建版本约束已扩至 AtomicReplace／Checkpointed 的普通、流式及恢复路径。沿用现有 S3WriteFacts 分别保存读回 pin 和原始写入回执；HEAD／LIST 推断只允许固定读回，不证明本次创建。私有 checkpoint 改为 DMS3CP02，分别保存两种证据，拒绝旧布局、截断、超过 4 KiB 或矛盾值；保存过的实际 ACK 可以恢复创建版本，Ready／未知完成推断继续返回 None，同时保留版本替换保护。四处恢复日志保留原始有类型故障，已恢复错误不进入 callback。不新增公开接口、SDK 修改或正常路径存储请求。</p>
+        <p>Native backend 414 项、transfer 329 项通过，完整 CI 范围 52 项分步及最终严格 Clippy 通过；真实原生复制 33 场景、9 MiB 目标 checkpoint 恢复 5 场景及原有失败清理 60 场景均通过。真实恢复区分已保存 ACK、Complete 响应丢失、发布指针失败及同内容版本替换，独立核验每个目标版本、上传次数和产物收尾。非 Direct 的元数据拒绝及在途取消未纳入 33 场景，目标角色 checkpoint 验证不等于完整 CLI／数据库／callback 或掉电验收；源历史永久清理仍须全部历史就绪证据后才能接入。主项目真实版本目录扩至 28 轮（Single／双副本各新增一轮 Checkpointed 缺少回执且允许版本 LIST），16 轮成功、12 轮失败，每个失败 entry 计一，64 条版本明细含 52 条阻断，HTTP 204 接收明细且 28 份最终报告入库；每个故障 key 仍只有一个最老 payload 版本。普通对象清理 48 轮、主项目五项 Rust 检查及最终 app Clippy 通过。夹具默认线程栈溢出通过将大型测试 future 放堆上解决，未提高产品栈限制。本项没有解除全部源历史清理门槛，也未统一统计呈现。详细范围见 <a href="../../tests/lab/README.md">实验室说明</a>。</p>
+        <p>本项对 <code>efac930</code>／Native <code>7f029054</code> 做同机六轮正常 dev A/B，配置仍为独占 2 CPU RustFS、1000 个 1 KiB 对象含 tags、保留源、无数据库、unordered／Direct／quick、并发 16、批次 100000。耗时中位数 4.49→4.50 秒（+0.22%），峰值 RSS 中位数 182.60→185.96 MiB（+1.84%），每轮独立核验完整内容／tags、源保留及无残留 upload。该小样本未见明显正常开销增长，不代表 Checkpointed／AtomicReplace、release、大规模历史或全后端达标；此前 Local 目录 RSS 限制仍在。原始样本与校验和见实验室说明，独占容器全部清理。</p>
+        <p><strong>复制事实的目标绑定回读：</strong>已有 query_current_copy_entries 现返回已有 CopyCompletion，把单个选中源版本的 snapshot、原始元数据和实际 copy_target_version 一起流式交付，按历史分段及段内索引排序；继续限制为本次执行选中且路径已确认的记录。普通目录查询仍保持原最小投影。私有解码核对源版本与 snapshot，一条快照混入多个版本或字段不一致时返回有类型错误；缺失绑定保留 None，不从源版本推断。目录收尾及普通源清理已同步调用契约，不增加逐版本数据库请求、全库常驻集合、data-mover 接口或 SDK 修改。该步骤只补齐回读契约，历史源删除仍须全部目标历史校验、持久化与源复核后才能接入。</p>
+        <p>该回读契约通过三个解码单元测试和 Single／双副本四组真实绑定验证，八组实际查询故障覆盖断连、静默超时、闪断及取消：显式 1 秒读超时下检测约 1.002 秒，取消约 251 毫秒，恢复重读保留原绑定，不视为统一任务预算；原有代次策略／base 回收、28 轮版本目录和 48 轮普通清理亦重跑通过。主项目五项 Rust 检查及最后 db Clippy 通过（Rust 1.98.1，已有警告保留）。正常路径另做 12 轮同机 dev A/B：3000 个 1 KiB Local 文件、平铺／100×30 目录、删源落库、同一隔离 Single ClickHouse、并发 16、批次 100000、unordered／Direct／quick。平铺耗时中位数 5.38→5.37 秒，RSS 203.02→203.05 MiB；目录耗时 5.02→5.12 秒（+1.99%），RSS 218.82→220.17 MiB（+0.62%），仍超约 200 MiB 目标。每轮核验内容、源删除、base 和最终报告，目录另核验原始纳秒 mtime／mode。无 callback 时待交付保留状态仍使 diagnostics_complete 为 false，不把入库当作外部接收。范围、样本和校验和见实验室说明，独占容器全部清理。</p>
+        <p><strong>版本化源到最新状态目标的永久清理：</strong>应用现仅放行“单个最新可见文件版本＋目标不保留历史”的事实：目标数据、所需元数据、quick／full 及持久化确认成功后，按所选版本原始元数据重新复核当前源，再复用既有 purge_observed 永久清理全部旧版本／标记、最后删除当前版本。源历史容器属性不能替代所选版本属性，任何捕获失败先行拒绝删除；当前对象被删除标记遮蔽或不可见时，明确上报无法确认全部历史已删除并保留。历史目标继续拒绝清理，须补齐每个数据版本及标记的整体核验。不新增 data-mover 接口、SDK 修改或应用内 S3 协议删除循环。</p>
+        <p>Single／双副本 72 轮已通过，覆盖 Local／非版本化 S3、quick／full、数据及元数据失败、删除／失败数据清理的拒绝、断连、超时及丢响应，另覆盖删除前新源版本、当前删除标记、tags 改变与读取失败；独立核验真实版本集合、目标和 HTTP 204／最终报告。保留源 Full 后的删源 Incremental 对未变化条目不重传数据，仍执行 full 校验；等长坏目标明确失败、全部源历史保留，下一轮 Full 修复后才删除。历史目标的保护场景源全部保留。新源路线仍等待数据库收尾，尚未实现该路线逐项异步删除；其他目标、物理掉电、跨主机排他控制、统一预算与整轮规模性能仍待验证。普通源 48 轮、主项目五项 Rust 检查、最终 app 测试及 Clippy 通过，已有警告保留；本项未统一阶段统计呈现。详细范围见实验室说明。</p>
+        <p>其中两个大历史用例各有 256 条源记录，跨越 128 条分段／清理批次边界：只迁移最新载荷，entry 完成计一；代理核验源 tags GET 两次、源数据 GET 零次、目标数据发布 PUT 一次，256 次永久删除全部指定 ID 且当前版本最后。两轮迁移及报告核验约 34.3／35.4 秒，包含现有串行历史清理，尚未单独分解阶段耗时或认证大规模吞吐。仅扩大该夹具总期限，产品预算未改变；未覆盖超过 1000 条的版本列表分页。此处不把功能通过表述为历史清理性能已经达标。</p>
+        <p>公共清理门槛另对 <code>e8ad0eb</code> 做十二轮普通 Local 清理 A/B：同机 dev、3000 个 1 KiB 文件、平铺／100×30 目录、删源落库、同一独占 Single ClickHouse、16／100000、unordered／Direct／quick。耗时中位数分别 5.32→5.42 秒（+1.88%）、5.11→5.17 秒（+1.17%），RSS 中位数分别 195.70→197.35 MiB（+0.84%）、198.45→200.04 MiB（+0.80%），最大约 200.57 MiB；逐轮核验内容、源删除、base、报告及目录纳秒 mtime／mode。小样本未见明显公共路径回归，不表明此前约 220 MiB 已修复；旧版拒绝历史源清理，不能据此冒充新历史路线吞吐对照。约 200 MiB、release、其他后端及大规模验收仍未完成。样本及校验和见实验室说明。</p>
+        <p><strong>矛盾版本清单保护：</strong>后续固定 Native <code>e294de47</code>，永久清理在同一个有界批次发现同一规范化版本 ID 同时被列为当前和历史时，返回 Protocol／Permanent，尚未发出该批删除；null 槽同样处理。数据版本与删除标记、两种出现顺序均有确定性与真实清单注入验证，原生历史清理 11 组和普通源清理 7 组通过；backend 416 项通过、2 项 ignored，完整 Rust CI 范围分步通过，严格 Clippy、示例及 Local E2E 通过。本项没有增加公开接口、SDK 修改或正常存储请求。</p>
+        <p>主项目 Single／双副本版本化源回归扩为 76 轮，16 轮正常、32 轮失败、28 轮恢复；新增矛盾清单在目标就绪后才注入，独立核验源四条历史完整保留、零源删除、目标内容／tags 正确。HTTP 204 明细包含具体 current and historical 与 Protocol 原因，失败任务累计一，最终报告入库且 base 清空；下一代 Full 恢复清理成功。普通源 48 轮及主项目五项 Rust 检查（含 16 项串行远程回归）亦通过。普通 Local 公共路径另做十二轮交错 A/B，平铺耗时中位数 5.42→5.46 秒、RSS 202.66→202.60 MiB，目录 5.28→5.03 秒、RSS 223.59→223.71 MiB；每轮独立核验目标、源清理、目录属性、base 和报告。小样本未见明显开销增长，目录 RSS 仍高于优化目标，不宣称加速或整轮规模性能达标。上述保护不证明跨批次或并发写入原子性，不改变历史目标整体核验及统一阶段统计的未完成状态；正常路径开销及验证范围见实验室说明。</p>
+        <p><strong>既有批量删除接口的版本扩展（Native 层）：</strong>Native <code>d1e69a5</code> 扩展已有 S3Protocol::delete_objects，用已有 SourceVersion 选择当前项或指定版本，不新增公开入口、类型或 SDK 修改。Current 保留 quiet 及历史保留语义；Id（含 null）按 key＋ID 核对逐版本回执，每个请求至多 100 项。非法／重复／歧义选择器和 NAS 版本请求在修改前拒绝，版本批次失败后停止后续提交；缺失、未知或重复回执不能确认成功，已识别的逐版本错误及脱敏 code 继续保留，异常回执的额外分类和诊断按输入批次限制。</p>
+        <p>该扩展通过 429 项 backend 测试（3 项 ignored），新增私有 SDK 契约随后显式运行 19 个真实场景，包含数据／删除标记／null、部分失败、异常回执、断连、超时、丢弃调用方等待及丢回执；Current 丢回执不盲重试，原历史与哨兵保留。原有 11 个历史清理场景、完整 CI 范围分步及最终严格 Clippy 通过。六轮同一程序协议层对照中，127 个旧版本的请求数 127→2，删除阶段中位数 10617.775→230.613 毫秒，进程峰值 RSS 中位数 28.69→30.00 MiB；这些只证明 SDK 批量能力，不代表整轮迁移收益。此阶段主项目固定 e294de47，源历史按串行受保护流程清理；后续须先完成批量错误的有类型传播、逐版本 callback 明细且 entry 不重复计数，再接入当前版本最后删除的清理路径。完整范围见实验室说明。</p>
+        <div class="note"><p><strong>已获人工确认并落地：永久清理的专用失败类型。</strong>既有 purge_observed 只返回一个 StorageRoleFailure，无法把同一批内多个版本的有类型原因交给应用。把版本批次塞进通用 StorageRoleFailure 的源码验证已暴露非局部影响：递归目标删除、目录创建和命名空间只读恢复等无关流程也必须处理它；这些流程的 entry／session 分类不能自然表达同一 key 的多个版本原因。不建议为了避免新类型而污染通用错误轴，也不把其他版本原因压成字符串或只保留首因。</p>
+        <p>本次仅扩展已有 Namespace::purge_observed 的错误返回契约为一个新公开 PurgeFailure 类型，不新增操作入口；保留首个 StorageRoleFailure 作为 std::error::Error::source，首项版本可选（列举／锚点故障不虚构版本），其余失败保存 SourceVersion 与原始 StorageRoleFailure，数量受单批至多 100 项限制。其他 backend 的单项失败按同一类型包装，不改变其删除行为；通用扫描、传输、目录创建及递归目标删除仍使用原来的 StorageRoleFailure。应用按 entry 计一次失败，逐版本原因走已有有界 Diagnostic／Delete 事件交付，并保留目标和所有未确认删除的源项。</p>
+        <pre><code>Namespace::purge_observed(...) -&gt; Result&lt;PurgeOutcome, PurgeFailure&gt;
+
+pub struct PurgeFailure {
+    pub version: Option&lt;SourceVersion&gt;,
+    pub source: Box&lt;StorageRoleFailure&gt;,
+    pub additional: Vec&lt;(SourceVersion, StorageRoleFailure)&gt;,
+}</code></pre>
+        <p>用户已于 2026-11-09 明确允许新增专用 PurgeFailure；已实现各 backend 包装、旧历史批量清理、取消／未知结果及逐版本通知。主项目固定 Native <code>69814a5f</code>；首因采用 Box 限制普通返回值和 future 状态，仅在错误时分配。批量回执属于 S3 adapter，专用失败属于 namespace role，逐版本通知集中在产品 consumer，计数仍由既有统计层负责；未新增操作入口或修改 nfs-rs。</p>
+        <p>真实回归发现当前 RustFS 对同 key 的多个历史删除标记批量请求会确认全部 ID，却只实际删除一个。独立 boto3 双标记复现及两秒延迟复查证实残留，实际 Namespace 五条历史曾被计为六条。现保留旧数据版本的批量删除，将历史标记按精确 ID 逐个删除；每批最多 100 条临时记录，重列举发现前批已确认 ID 再次出现即报 Protocol 并保留当前项，当前项仍独立最后删除。旧 SDK 阶段的 127 条记录仅含一个删除标记，不能证明多标记路径。</p>
+        <p>Native 完整 CI 范围 53 步、13 项真实历史清理和 7 项当前源清理通过；主项目五项 Rust 检查含 16 项串行远程进程回归通过，工具链为 Rust 1.98.1，已有警告保留。Single／双副本版本化源扩至 88 轮（16 正常、38 失败、34 恢复），普通源 48 轮复跑通过。新增部分拒绝、畸形回执、100 条拒绝及恢复，独立核验实际历史 ID、目标内容／tags、base 与最终报告；208 条新增逐版本原因经 HTTP 204 接收，100 条拒绝按一项任务错误累计且明细每批至多 64 条。未提交的标记不虚构失败；成功接收后清理明细，累计统计保留。两种部署的大历史均精确清理 256 条，源 tags 两次、数据 GET 零次、目标数据复制一次。</p>
+        <p>与 <code>6477f5b</code>／Native <code>e294de47</code> 的完整 CLI 做同机六轮交错 dev A/B：版本化源 128 条历史含 42 个删除标记，目标为非版本化 S3，1 KiB 最新内容含 tags、删源、Direct／quick、并发 16、批次 100000，独占 2 CPU Single ClickHouse 与 1 CPU RustFS。源清理请求 128 次单条 → 一次批量加 43 次单条，整轮耗时中位数 12.15→3.65 秒（约减少 70.0%），峰值 RSS 中位数 201.28→202.71 MiB（约增加 0.7%）。每轮验证全部源历史清空、当前项最后删除、目标数据／tags、哨兵、base 与最终报告入库；此性能场景未配置 callback，交付行为由上面的真实回归单独证明。原始日志及 50 毫秒采样见实验室说明。</p>
+        <p>普通 Local 公共路径另做十二轮交错对照，仍为删源、Single ClickHouse、3000 个 1 KiB 文件、并发 16／批次 100000、unordered／Direct／quick。平铺耗时中位数 5.32→5.52 秒（+3.76%）、RSS 198.15→196.41 MiB；100×30 目录耗时 4.97→4.97 秒、RSS 219.70→221.82 MiB。每轮独立核验目标、源清理、目录 ns mtime／mode、base 与报告。有限样本中公共路径开销相当，目录 RSS 仍高于约 200 MiB 目标，不宣称普通路径加速或大规模性能达标。完整配置、固定程序校验和和原始样本见 <a href="../../tests/lab/README.md">实验室说明</a>，独占容器已清理。</p>
+        <p>本项只完成专用错误和旧历史批量清理的接入，完整历史目标就绪核验、逐项异步删源、统一阶段统计和更大规模／release／全后端内存目标仍需后续验收。</p></div>
+        <div class="note"><p><strong>历史目标的数据版本整体核验（先行阶段）：</strong>已有 query_current_copy_entries 扩展为回读 CopyCatalogueEntry，携带实际目标绑定、原始分段、段内索引、段长与末段标记；源版本 snapshot 仍只含一个版本及全部原值。Single／Cluster 共用两项新增边界列与读写，首个开发格式不增加旧表兼容／迁移。回读要求当前执行、路径和数据均已确认。</p>
+        <p>应用按 key 流式核验首段首项、段内／段间连续和完整末段的最后当前记录，不把单版本快照的 complete 当作完整历史。逐个目标版本检查元数据、类型／大小及持久性，按精确源版本复核原始属性；full 逐个读取旧源／目标版本，当前发布状态仍单独绑定。整组成功后重读当前源并受保护永久清理，当前项最后删除；最后一组等查询流成功结束后才删除，查询失败保留已知路径和原始类型。只保留一组位置状态与一个当前快照，不持有完整历史或完成项集合。</p>
+        <p>只含数据版本的文件历史在该阶段接通；文件删除标记在下一阶段补齐核验，目录标记继续保留保护。历史错误包含源／目标版本、阶段与脱敏原因，保持有类型 source；一项只计一次任务错误，元数据核验取消保持取消分类。复用既有 metadata、read、integrity、namespace 和通知机制，本步未修改 data-mover／nfs-rs 或新建存储入口，全部条目异步删源及统一故障控制仍待推进。</p>
+        <p>六项边界／取消单元及新增投影检查、三组真实数据库代次测试通过；Single／双副本检查原始分段 0/1/2、段长、末段、绑定与执行授权。版本化源全套为 108 轮（24 正常、50 失败、34 恢复），普通源 48 轮和主项目五项检查含 16 项远程进程回归通过（Rust 1.98.1，已有警告保留）。新增 quick／full 三版本迁移，以及旧目标 tags 变化、源历史 tags 变化、目标旧版本缺失、中间数据库事实缺失、目标断连、源历史读取静默超时；故障均零源删除，完整交付 callback 并保存报告。目标断连至最终通知约 156／244 毫秒，源静默超时约 1192／1284 毫秒；不把此结果作为统一故障预算／防抖认证。</p>
+        <p>历史目标也覆盖同 job ID 上代保留源、本代删源的增量：三条基线全部跳过数据发布，按一个 entry 计数、传输字节为零，逐版本 full 校验后源历史清空且 base 为零，目标恰好保留原三个版本。正常／故障均独立读取数据、历史与报告，HTTP 204 排空明细；原有删除标记保护与最新状态目标的 256 历史回归保持通过。</p>
+        <p>普通 Local 公共路径对 <code>0af0d90</code> 做同机交错 dev A/B，3000 个 1 KiB 文件、删源、Single ClickHouse、并发 16／批次 100000、unordered／Direct／quick。首轮平铺 +6.21% 的样本保留并复测，第二轮为 +3.56%；两轮各六个样本合并后耗时中位数 5.52→5.675 秒（+2.81%）、RSS 185.15→185.65 MiB（+0.27%）。目录三对样本 5.01→5.17 秒（+3.19%）、RSS 183.57→183.82 MiB（+0.13%）。每轮核验内容、源清理、目录属性、base 和报告；有限样本不等于全部规模／release／后端的性能和内存认证。完整证据、校验和与未测范围见 <a href="../../tests/lab/README.md">实验室说明</a>，独占容器已清理。</p></div>
+        <ol>
+          <li>把已知不迁移对象的元数据裁剪前移到扫描 plan，保留过滤所需属性，验证无无用途额外调用。</li>
+          <li>在已统一的非续传 Direct／续传 Checkpointed 产品选择之上，补齐 NFS／CIFS 能力及数据失败清理；同时补齐目标持久化屏障，避免目标未 ready 就删源。</li>
+          <li>在最新状态基线归一化及按 entry 交付计数之上，在已保存目标版本映射和元数据重试之上，完成历史数据失败／发布结果未知时的安全增量重试。</li>
+          <li>在最新状态目标已接通源历史永久清理的基础上，补齐历史目标整体核验及清理，并推进逐项异步删源，覆盖未知结果、只读、源变化及目录收尾。</li>
+          <li>补齐统一故障控制、剩余元数据类别、无数据库目录收尾及超大终态报告等边界。</li>
+          <li>按同模式基线执行完整迁移的吞吐、峰值 RSS 和故障矩阵验收。前述单项通过不代替整轮目标。</li>
+        </ol>
+        <p>结构重构与行为修复分别提交。每个实现步骤应形成语义完整、可独立验证的改动；不以增加抽象或减少文件数量作为架构优化证据。整轮性能和内存与优化前相当是所有实施阶段的验收条件，不能推迟到 P2 才考虑。</p>
+        <div class="note" id="history-marker-readiness-20261109"><p><strong>文件历史目标的数据与删除标记整体就绪（2026-11-09）：</strong>主项目固定 Native <code>45e70fa8d79d010643a357154bf30f33e2b93d5d</code>。扩展既有 S3ObjectFacts、ReadSource::describe_version 和 Namespace::persist_observed 契约，不新增公开操作或类型：指定版本的删除标记可返回仅含一个非完整历史记录、listing_only=true、size=None 的不可读描述；Current 仍表达当前对象缺失。普通 transfer 在 Describe 阶段拒绝标记，零长度读取也不能把它当作空文件。S3 协议头和 404／405 解码留在 backend，应用只使用中立的记录类型、选择器和实际版本绑定。</p>
+        <p>每个数据版本继续核验实际目标绑定、已捕获元数据与所选 quick／full 策略。每个删除标记按实际目标 ID 做精确 HEAD 和持久性复核，最新标记另外要求其仍为唯一当前记录；后者通过精确 key 的分页版本清单验证，只保留一个当前记录及冲突事实，并复用有界游标跟踪。源标记使用精确版本描述复核身份，null 槽还须按共同时间精度验证原始修改证据；标记没有数据体，不额外读取 tags／数据。只有原始分段、段内位置和所有所选记录全部就绪，才调用既有 purge_observed 永久清理源历史、最后删除当前记录。最新源标记不走普通 Current stat，但 purge 仍重新核验原始当前锚点；目录标记仍拒绝清理。</p>
+        <p>另修复 null 清源保护条件：模型将字面量 null 规范化为无真实版本 ID，不能用 Some(&quot;null&quot;) 判断是否比较修改时间。确定性回归先复现旧条件误放行，再验证同一 null 数据／标记槽变化时拒绝清理，未变化及真实不可变 ID 保持原有语义。真实 suspended RustFS 的四个场景验证未变化可删、实际替换保留、零数据 GET 与哨兵完整。标记持久性的首十五场景覆盖 HEAD 权限拒绝、HEAD／LIST 的断连／静默超时／取消、HEAD 的显式闪断／超时恢复、无效类型／版本头、实际标记丢失及当前替换；全部只读，并经真实 transfer 证明拒绝发生在目标准备前。Native 三项独立提交各完成 53 步 CI 范围检查。最终审查另以确定性与真实 SDK 回归复现“不透明游标被当作相对 key 比较而提前返回就绪”，已移除该判断；追加正常六页／后续页断连两个场景，共十七个标记场景通过。游标原样返回直到真实 EOF，prefix 中可能包含邻居项，但只核验精确 key；有界游标和取消仍有效。</p>
+        <p>主项目 Single／双副本完整版本化源回归扩为 126 轮：36 轮正常、56 轮失败、34 轮恢复；普通对象 48 轮及专项历史 40 轮亦通过。新场景包括最新记录就是删除标记的 quick／full、目标历史标记缺失、当前绑定被替换、标记 HEAD 超时与源历史标记被移除。任一未恢复核验失败保留其余源历史，callback 包含准确源／目标版本、阶段和原因；一个 entry 只计一次任务失败，复制成功的数据不因元数据核验失败而回滚。所有明细以 HTTP 204 接收，最终报告归档且删源代次 base 清空。上代保留源、本代增量删源另覆盖五条混合历史：base 5→0，原三个数据版本与两个目标标记的 ID 均保留，传输字节为零，full 复核后全部源历史删除。</p>
+        <p>最终 revision 的主项目五项 Rust 检查（含 16 个串行进程回归）通过，既有大错误类型等 warning 保留；126＋48 轮整套迁移亦在最终依赖组合下重跑通过。固定前后 CLI、3000 个 1 KiB Local 文件、平铺／100×30 目录、16／100000、unordered／Direct／quick、删源与隔离 Single ClickHouse 做最终程序的 24 轮交错 dev A/B，每轮核验内容、源清理、目录纳秒 mtime／mode、base 和最终报告。平铺中位数 5.265→5.375 秒（+2.09%），RSS 201.28→197.82 MiB（-1.72%）；目录 5.170→5.170 秒（持平），RSS 204.37→203.76 MiB（-0.30%），最高 210.46 MiB。分页修复前候选程序的首轮平铺曾 +6.90% 超阈值，未据此改代码；预先固定反向顺序再测十二轮，合并该候选的全部二十四轮后未证实稳定固定开销回归。早期样本和两组程序全部保留，没有混入最终程序这二十四轮的统计。无 callback 的性能场景 diagnostics_complete=false，不冒充外部接收成功；小样本也不代表大规模／release 或所有后端已经达标。</p>
+        <p>职责审查：协议解释和对象持久性由 backend 所有，普通 transfer 只拒绝不可读的中立描述；应用负责所选版本、完整分段与数据／元数据就绪编排，数据库和通知沿用既有链路，无完整历史或已完成 key 常驻集合。本项没有修改 nfs-rs；逐项异步删源扩展至全部 entry、脱离数据库的目录收尾、统一阶段统计、跨阶段网络抖动恢复／执行隔离及大规模／release／全后端约 200 MiB 验收仍需继续。当前 readonly 检测、取消与显式恢复证据不等同于任务已具备统一三秒恢复窗口。详细日志、校验和及限制见实验室说明。</p></div>
+        <div class="note" id="local-receiver-cancellation-20261109"><p><strong>单进程接收队列取消收束（2026-11-09）：</strong>复制接收循环先独立移入 receiver/in_process，编排层继续所有 worker、存储连接和生命周期。行为修复另行实施：共享执行取消优先于取出排队消息，关闭已有 transport；未开始条目不再被逐个调用并虚构复制失败。空闲接收也立即响应取消，已有真实复制失败保持原始类型及已发送明细。在途传输仍完成原生取消与必要清理，不直接丢弃传输 future。</p>
+        <p>三个确定性回归覆盖预先取消的 128 项队列、生产端仍开启的空闲等待，以及真实源消失失败后取消；原接收测试不变。结构提交和行为修复各自通过五项 Rust CI（含 16 个串行远程进程场景）。真实 Single／双副本的全量／增量、Direct／Checkpointed 共 16 个持续断连／静默超时失败场景通过，8 次后续检查点复用通过；独立核验源仍在、Direct 坏目标清除、Checkpointed 状态保留并复用、HTTP 204 排空诊断、最终报告可查。故障注入至本轮收尾约 3.3～6.3 秒，含检测及通知，不当作所有链路统一三秒窗口。此步骤不改变删源门槛、元数据就绪或断网防抖策略，吞吐与全后端验收仍按后续完整程序单独记录。</p></div>
+        <div class="note" id="streamed-object-cleanup-20261109"><p><strong>普通对象逐项异步删源（2026-11-09）：</strong>全量删源且启用数据库时，对源／目标均能保存目录对象、源 namespace 明确允许分页删除的普通文件，在 Receiver 完成数据、所需元数据及所选 quick／full 校验、交付有界复制事实之后，立即消费同一源快照绑定的已校验目标描述，执行目标当前发布／持久性核验、源属性复核和受保护 purge。此路线覆盖超过 64 项及嵌套纯前缀；目录、历史版本、打包和 file-list 路线继续使用既有收尾屏障。应用根据角色能力选择，不新增存储协议分支、data-mover 公开接口、类型或 nfs-rs 修改。</p>
+        <p>逐项清理沿用单项在途上限，等待者随复制并发有界；每个 worker 最多持有一个清理 future，没有按总 entry 数增长的完成路径集合、待删队列或逐项数据库确认。首个最终清理错误先保存原始类型并取消共享执行，再释放清理门闩。唯一在途清理的真实错误另行保留，数据库先失败也能交付具体路径、保留动作及未知删除结果。只有整轮扫描、复制和逐项清理全部成功，才以本次执行的覆盖事实跳过数据库收尾中的这些普通文件；历史与目录仍逐项处理，失败／后续代次不借用这个证明。</p>
+        <p>两个确定性门闩用例验证首个目标持久性失败阻止下一项，以及并发执行失败保留实际清理路径／原因；另一实际 Local 复制用例验证证明只能被原始源快照消费。真实 Single／双副本、quick／full、最新状态／历史目标共八轮，每轮 98 个文件：最后一个数据 PUT 阻塞且 base 事实尚未转发时，前 96 个源对象已删除、目标内容正确，最后一个源仍在；整轮恰好 98 次删除，没有删后重复源读取，目标 tags 校验恰好 98 次，报告累计 98 个文件且零错误。另四轮真实用例先令 DELETE 在途，再拒绝数据库事实：失败轮源保留、复制数据保留，callback 同时包含数据库原始原因和具体清理路径，任务错误为一、复制错误为零；两种部署的下一全量代次恢复成功，报告入库、base 清空。</p>
+        <p>最终生产代码通过五项 Rust CI（含 16 个串行远程进程场景）、普通对象 48 轮、版本化源 126 轮及在途数据库故障 16 场景／8 次检查点复用；HTTP 204 明细排空、最终报告及源／目标均独立核验。增加清理 future 后曾在默认 dev 线程栈上复现 S3 SDK HEAD 栈溢出，GDB 定位接收调用链；只放置测试入口或缩短 match 临时值均不足，最终仅对符合条件的清理 future 做有界堆分配，默认线程栈重跑通过。夹具的初始空状态错误和有意阻塞超过原一秒读取时限的失败样本均保留，专项阻塞夹具使用独立时限，原故障用例时限保持原值。</p>
+        <p>最终生产实现使用固定 CLI 做四组共 48 轮 dev A/B，每组 ABBAABBAABBA、各六个前／后样本；16／100000、unordered／Direct／quick、删源、隔离 Single ClickHouse，两组 S3 另使用隔离 RustFS 并包含嵌套前缀。整轮计时包括入库、清理和收尾，每轮核验数据／元数据、源删除、base 和最终报告；测试期间无本轮构建／CI／功能回归并行。四组均通过 5% 耗时阈值，RSS 最大中位数变化约 +2.48%，最高峰值 228.60 MiB，约 200 MiB 尚未全面达成。</p>
+        <div class="table-wrap"><table><thead><tr><th>场景</th><th>耗时中位数（秒）</th><th>变化</th><th>峰值 RSS 中位数（MiB）</th><th>变化</th></tr></thead><tbody><tr><td>Local 平铺 3000×1 KiB</td><td>5.060→5.090</td><td>+0.59%</td><td>202.59→203.06</td><td>+0.23%</td></tr><tr><td>Local 目录 100×30×1 KiB</td><td>5.055→4.965</td><td>-1.78%</td><td>218.32→220.81</td><td>+1.14%</td></tr><tr><td>S3→最新状态目标 256×1 KiB</td><td>8.595→6.580</td><td>-23.44%</td><td>218.92→221.85</td><td>+1.34%</td></tr><tr><td>S3→历史目标 256×1 KiB</td><td>8.425→6.670</td><td>-20.83%</td><td>219.05→224.48</td><td>+2.48%</td></tr></tbody></table></div>
+        <p>原候选程序的 S3 历史目标曾回退 6.23%，反向复测后全部样本合并仍回退约 7.30%，因此没有按达标提交。固定连接的单变量试验未改善，代码撤回；并发一时基本持平。随后真实回归先复现 98 个文件的目标 tags 被读取 196 次：清理在串行门闩内重复了复制刚完成的元数据校验。扩展应用内既有复制返回值，交付绑定同一不可变源快照、字段私有的 CopiedPublication；仅即时普通对象清理复用目标描述，仍以原身份核验 Current 持久性、重读源属性并受保护删除。错误源快照不能消费此证明，目录／历史／独立清理保持原有完整校验。修复后每轮目标 tags 恰好读取 98 次，最终两组 S3 耗时分别约降 23.44%／20.83%。原候选、未采纳试验及最终修复程序的全部样本和各自校验和独立保留，没有混算。性能用例未配置 callback，diagnostics_complete=false 是计划内状态，不冒充外部已接收；这些有限 dev 样本也不代替大规模、release 或所有后端验收。</p>
+
+        <p>职责审查：receiver 交付复制就绪事实并调用任务清理用例；source_cleanup 集中能力选择、门闩、覆盖证明和原始清理原因；协议安全及持久性继续由原生角色所有，执行取消和通知复用已有机制。文件系统／历史全部条目的异步删源、无数据库目录收尾、统一阶段统计、跨阶段防抖／故障预算、release／大规模／全后端约 200 MiB 验收仍待推进。本次正常与故障证据不代表这些剩余目标均已完成。详情及原始日志见<a href="../../tests/lab/README.md">实验室说明</a>。</p></div>
+        <div class="note" id="directory-errors-20261109"><p><strong>目录收尾逐项错误（2026-11-09）：</strong>全量／增量的目录最终元数据失败逐项复用已有 Error(Copy) 诊断，包含路径、目标 backend、directory_metadata_finalize 阶段与实际原因。任务 ID 关联的源观察最多保留 32 项，panic 同样保留目录路径；不常驻整轮失败清单。保留深度倒序、同层有界并发、查询及更新收束和首个有类型返回原因，已上报的目录失败不再额外计作一次任务错误。查询本身失败仍独立计错，不能覆盖已交付的目录原因。没有增加 data-mover 对外接口。</p>
+          <p>新增三项回归覆盖全量／增量多目录失败、worker panic、查询与目录同时失败；既有查询类型、后续成功更新及取消收束断言保留。真实 Single／双副本共 10 轮：2 次保源基线、4 次失败、4 次恢复，逐轮注入 70 个目录权限错误并保留 1 个可写目录；独立 HTTP 204 检查 280 条错误跨页完整交付、累计错误各 70／任务错误 0、源及目标数据保留、最终报告可查。恢复后重新全量，核对目标 mtime、源目录清理及 base 为空。原有 12 轮就绪窗口回归与五项 Rust CI 通过（Rust 1.98.1，包含 16 项远程进程回归；既有警告保留）。首次独立检查器将计划内保留目标状态也算作错误，修正检查器后重跑，原始日志保留。</p>
+          <p>固定完整 CLI 与前一步对照，3000 × 1 KiB、平铺／100 × 30 目录树各 ABBAABBAABBA，合计 24 次；16／100000、unordered／Direct／quick、删源、Single ClickHouse、dev，测量期间无本任务构建／CI／功能验证。耗时中位数平铺 5.235→5.320 秒（+1.62%）、目录树 5.120→5.110 秒（−0.20%）；峰值 RSS 中位数 161.79→160.53 MiB（−0.78%）、207.89→210.27 MiB（+1.15%），最高 215.23 MiB。该样本符合性能相当目标，不代表约 200 MiB、release／大规模／全后端目标均通过。无 callback 的性能样本仍保留未交付状态，不能视为交付成功。</p>
+          <p>职责审查：copy_completion 负责目录工作、失败上下文和完成门槛；TaskStatistics 只持有共享统计状态，复用现有诊断归档／分页／HTTP 接收流程，不持有消费者生命周期。元数据原始观察、存储操作和源清理仍由原有模块负责。本项未改变网络预算／防抖、删源门槛或入库策略；无数据库目录收尾、全部 entry 异步删源、统一阶段统计及跨阶段故障控制继续待实施。详见<a href="../../tests/lab/README.md">实验室说明</a>。</p></div>
+        <div class="note" id="reported-entry-facts-20261109"><p><strong>逐项失败后的事实排空（2026-11-09，d241814）：</strong>修复已逐项上报的复制结果被当作执行级失败、提前取消共享数据库信号的问题。ReportedCopyFailure 仍使整轮失败，同时允许已发布数据／目标版本绑定的完成事实正常冲刷；其他执行及数据库故障继续保存最初有类型原因并取消。最终聚合不能让较早的逐项失败遮住后续致命根因。没有增加入库等待或删源授权条件。</p>
+          <p>在 229e8dd 隔离工作树和本次令牌改动上均复现：源 tags 拒绝后，首轮预期 1 条的数据完成事实为 0；新单测直接证明执行信号被过早取消。修复后 Single／双副本、最新／历史目标、quick／full 共 56 轮通过，连续四轮元数据失败后恢复均无数据重传，原始事实和版本绑定保留；80 条版本错误、40 条源观察错误及 40 条保留范围通过 HTTP 204 完整交付，逻辑失败各计 1。另有两项确定性回归及 16 个真实数据库断连／静默超时失败、8 次检查点恢复通过，未屏蔽真正执行故障。该步骤单独通过五项 Rust CI，未修改存储协议或新增公开接口。</p></div>
+        <div class="note" id="metadata-only-cancel-20261109"><p><strong>元数据更新复用 worker 取消信号（2026-11-09）：</strong>扩展现有 app 内部 set_entry_metadata／set_item_metadata 参数，元数据应用和回读核验共用调用方令牌。普通增量不再重新构造丢失取消信号的默认参数，逐版本元数据更新沿用 CopyOptions.cancel；没有扩展或新增 data-mover 公开入口。增量 worker 在读取队列前优先响应取消，关闭输入并收束已开始历史；不丢弃在途存储操作，未开始条目不虚构错误。该步骤的其他调用方仍保留原来的独立执行语义；目录后续接入见<a href="#directory-cancel-20261109">目录取消进展</a>，rename、远端会话等链路仍待覆盖。</p>
+          <p>新增预先取消及写入／回读在途取消回归，验证有类型错误、无成功事实和源／目标数据保留；三项真实 worker 回归覆盖空闲生产端仍开启、128 项排队输入及此前真实元数据错误，取消后 0.5 秒内退出并保留原始原因。六个真实 S3 受控阻塞覆盖普通更新、当前版本选择及指定历史版本，取消到函数返回均小于 1 秒；目标数据 GET／PUT／DELETE 均为 0，恢复只更新 tags，历史记录数、绑定及当前 head 不变。该验证是存储调用层取消，不是完整 CLI 用户取消、NFS／其他协议或共享网络防抖窗口认证。合并 d241814 后，56 轮元数据任务、五项 Rust CI（app 355 通过／48 忽略，远程进程 16 项）再次通过，最终报告和 callback 证据完整。</p>
+          <p>固定完整 CLI、Native 45e70fa、Rust 1.98.1 dev，16／100000、unordered／Direct／quick，Single ClickHouse 2 CPU／1536 MiB。每场景 ABBAABBAABBA，共 36 次；全量目录树 3000 × 1 KiB／100 目录删源，增量 3000 文件保源，含无变更及 30 项 mode 变化。24 次增量基线全量准备单独保存，不计入增量计时；测量期间无本任务构建／CI／功能验证。全量耗时 5.245→5.200 秒（−0.86%），无变更增量 1.930→1.880 秒（−2.59%），1% 元数据增量 2.110→2.060 秒（−2.37%）；峰值 RSS 中位数分别为 196.01→194.89 MiB（−0.57%）、176.58→172.81 MiB（−2.13%）、180.78→182.25 MiB（+0.81%），最高 198.06 MiB。全量 5%／增量 10% 时间门槛通过，增量实际数据传输为 0；这组小样本不构成普遍提速或约 200 MiB 上限认证。</p>
+          <p>环境校准有独立证据：旧基线在全新容器的无变更增量也因探测超时失败；仅将 ClickHouse 全局线程池上限 192→512，其他配置及产品预算不变后，同一基线成功。最终新旧程序统一使用 512，不混入先前 192 配置下的 12 个全量样本；故障、容器状态和全部原始结果保留。性能样本不配置 callback，全量保留状态未交付，不能当作外部接收成功。职责审查保持执行故障策略位于 copy_execution、元数据取消位于既有复制链路，正常路径不增加 IO、计时器、整轮明细或持久化屏障。原始日志、哈希及限制见<a href="../../tests/lab/README.md">实验室说明</a>；无数据库目录收尾、全部 entry 异步删源、统一阶段统计及跨阶段故障控制仍待推进。</p></div>
+        <div class="note" id="directory-cancel-20261109"><p><strong>目录收尾接入执行取消（2026-11-09）：</strong>先以 f41b792 将目录在途工作、路径和逐项错误收拢到私有 DirectoryUpdates，再扩展现有收尾函数传入 CopyDatabaseExecution。目录查询复用同一执行域，元数据应用与回读共用现有令牌；查询等待、并发槽／深度屏障、任务首次执行和代次提交前均感知取消。停止领取后续目录，收束已开始的操作并逐项保留失败路径，未启动项不伪造成功或错误；保留先前执行根因及已完成查询的有类型错误。仍维持 32 项上限、子目录先于父目录和原有删源门槛，不增加逐文件数据库回执等待。</p>
+          <p>data-mover e426d09 修复 NFS Metadata::apply 只在调用前检查取消的问题：在途元数据写入及 ACL 读回也响应既有令牌，预先取消准确标为 Metadata；在途取消保留 Cancelled／Unknown 和未确认结果。另以 57e5d00 独立修复绑定子目录后未更新目录缓存根标识的问题。旧代码在 v3／v4.1 上修改 B 的相对目录会错误修改 A；修复后三行生产代码复用现有缓存身份构造，使实际 RPC 根与缓存命名空间一致。两个协议的独立权限／不同内容检查，以及 16 个元数据故障用例通过，两项提交均完成完整 CI 检查范围。没有新增 data-mover 公开函数／类型，没有修改 nfs-rs，没有放宽时间戳核验或持久性保护。</p>
+          <p>六项新确定性回归覆盖预先取消、128 项排队、空闲查询、32 项在途／第 33 项不再启动、查询错误及执行根因保留；目录模块共 13 项通过、2 项环境测试按原方式忽略。五项 Rust CI 通过（app 361 通过／49 忽略，远程进程 16 项）。真实 NFSv4.1 目录修改阻塞叠加 ClickHouse 数据连接中断，Single／双副本共 10 轮：2 次保源基线、2 次全量失败、2 次增量失败、4 次按删源代次策略重新全量恢复。正常文件时间戳和不同源目录内容下，12 条目录错误及未确认写入原因完整通过 HTTP 204 交付，失败各计 3 个 entry／1 个任务错误，无遗漏；增量数据重传为 0。失败源项全部保留，恢复后目录纳秒 mtime／mode 正确、源端清空、base 为 0，最终报告可从 ClickHouse 查询。注入故障到观察到执行域结束后的代次收尾请求为 3.59–3.99 秒，整轮含报告为 6.40–8.63 秒；这不等于完整统一故障预算或所有协议网络检测已经达标。</p>
+          <p>原有 70 目录权限故障／恢复的 10 轮回归同样通过，280 条错误完整分页、累计计数经 HTTP 204 保留、已报告目录错误不重复计任务错误。初次复测的 ClickHouse 192 线程池配置在双副本阶段耗尽探测／归档预算；与此前固定旧程序的性能诊断一致，实验配置统一为 512，CPU／内存限制和产品超时预算不变。早期测试代理把 KILL QUERY 视为必经请求也已纠正：无在途 SQL 时管理任务可以直接收束；代理只在明确观察到独立代次收尾请求或取消请求后恢复，且同次故障只触发一次，不靠定时放行。原始失败日志和成功复测均保留，不将旧失败样本混入通过结论。</p>
+          <p>固定新旧完整 CLI、Rust 1.98.1 dev／debug=0，16／100000、unordered／Direct／quick，Single ClickHouse 2 CPU／1536 MiB／512 线程池。每场景 ABBAABBAABBA，共 36 次，另存 24 次增量基线准备；测量期间没有本任务构建或功能验证。全量 3000 × 1 KiB／100 目录删源：5.555→5.605 秒（+0.90%），峰值 RSS 中位数 219.68→222.35 MiB（+1.21%）；无变更增量：1.855→1.865 秒（+0.54%），233.93→239.38 MiB（+2.33%）；30 项 mode 变化增量：2.190→2.060 秒（−5.94%），241.85→233.96 MiB（−3.26%）。全量 5%／增量 10% 时间门槛通过，内存开销与固定旧程序相当，增量数据传输为 0。新程序最高 243.72 MiB，本轮没有达到普遍约 200 MiB 目标；也不构成 release、大规模、其他 backend 或持续增长验收。原始 36 次数据、逐次 RSS、服务状态及二进制哈希完整保留；旧／新 SHA-256 前缀分别为 3e13852a／90d7a564，新 Native 精确固定 57e5d00。性能不配置 callback，全量保留状态未交付，不能视为外部接收成功。</p>
+          <p>职责审查：迁移及删源策略保留在任务层，执行取消由已有 copy_execution 管理，目录有界调度及诊断由 copy_completion 持有，NFS 协议取消与根绑定修复归 data-mover；没有把 ClickHouse／callback 策略下沉存储库。无数据库目录及根元数据收尾、全部 entry 异步删源、统一阶段统计、跨执行迟到写入保护和共享网络防抖仍待推进。验证入口、原始日志与限制见<a href="../../tests/lab/README.md">实验室说明</a>。</p></div>
+        <div class="note" id="root-metadata-20261110"><p><strong>根目录原值与最终收尾（2026-11-10 实现记录）：</strong>新增私有 <a href="../../crates/app/src/copy_root.rs">copy_root</a>，在内容扫描前捕获文件系统根目录的计划内原值；最后一个目标命名空间操作后应用并回读确认根属性。有／无数据库、空根和非空根均执行，根不进入普通队列或 base，不增加文件／目录计数，不成为端点删除候选。对象存储的虚拟根按 plan 省略。源属性获取失败仍复制可读数据，最终明确报告并阻断源清理；命名空间读取最终失败或取消停止准入，不另起内容扫描重置该故障恢复窗口。</p>
+          <p><strong>历史证据边界：</strong>本块中的 11 月 10 日执行数字是历史摘要，原始 /tmp 日志和固定程序已随环境刷新丢失，不能作为当前工作树的可检查证据或本轮验收结论。11 月 16 日首次复验曾有性能失败和现场待验收项，最终状态见<a href="#root-revalidation-20261116">下方独立复验结果</a>。</p>
+          <p>小窗口提前删源的真实故障回归曾暴露其早于根收尾的问题。现在仅在完整内容阶段已结束、窗口确认没有任何子目录收尾时，先完成根属性及所需持久性，再清理已就绪文件；仍与异步数据库冲刷并发。成功证明只在本执行内保留一次，后续零目录查询不重复写根属性。存在子目录时仍由 copy_completion 按深到浅收尾，根最后完成；全部必需收尾成功后提交代次，再进入剩余源清理。未增加逐文件入库确认门槛。</p>
+          <p><a href="../../crates/db/src/catalogue/copy_runs.rs">现有代次表</a>增加独立 root_snapshot 二进制 String 列，保存原生完整快照；命令 descriptor JSON 仍保持原大小预算。传输参数以 hex／unhex 绑定，避免为大 ACL／xattr 逐字节构建 JSON Value 数组。读取核验源绑定、根路径、目录类型及非历史属性；重复终态／同原值不增加 revision，非法快照不能改变终态。原值不进入 callback，不删除独立的代次或最终报告。</p>
+          <p>data-mover 分别以 1fcac13、69a5ce8 扩展现有 Local Metadata、NFS Namespace／persist_observed 对根路径的支持；根创建和根删除仍拒绝，没有新增公开函数或类型。Linux 实际文件及 NFS v3／v4.1 的 16 项根元数据故障通过，覆盖闪断、持续断连、静默超时、取消、丢确认及显式恢复；取消返回小于 1 秒。Native 两次完整 CI 范围按既有 53 步方式执行通过，首次 Local examples 链接曾因磁盘不足失败，释放本任务已完成缓存后重跑通过，不宣称一次原样 make ci 全绿。</p>
+          <p>五项 Rust CI 通过（app 365 项，52 项环境测试保持忽略；远程进程 16 项），并执行最新 app Clippy 与无数据库空根／非空根实测。真实 Single／双副本各覆盖全量及增量：根 SETATTR 与数据库故障组合、源根 ACL 权限拒绝两组各 10 轮，合计 20 轮；失败均保留三个源文件和完整目标数据，每轮任务错误 1／entry 错误 0，HTTP 204、最终报告及原值可查，增量未变数据重传为零，恢复后源为空且 base 为空。组合故障从注入到无执行域终态请求约 3.60–4.65 秒，包含检测，不作为统一严格 3 秒认证。原有目录取消 10 轮、70 目录权限矩阵 10 轮／280 条原因，以及提前窗口 12 轮也通过；非特权夹具现在授权根属性，仅在原指定文件／子目录注入拒绝，没有放宽原错误断言。</p>
+          <p>固定 CLI 以 Rust 1.98.1 dev／debug=0、16／100000、unordered／Direct／quick，Single ClickHouse 2 CPU／1536 MiB／512 线程池，每场景 ABBAABBAABBA，共 48 次，另有 24 次增量基线准备；测量期间无本任务构建或故障验证。各轮核对内容、源状态、原有目录属性、base／代次／最终报告；新程序另外核对根的纳秒 mtime、mode、独立原值列和根不计数。旧程序的已知根属性缺失保留为修复前事实。</p>
+          <div class="table-wrap"><table><caption>11 月 10 日历史 A/B 摘要；原始证据已不可用，不作为当前验收</caption><thead><tr><th scope="col">场景</th><th scope="col">整轮耗时中位数</th><th scope="col">耗时变化</th><th scope="col">峰值 RSS 中位数</th></tr></thead><tbody>
+            <tr><td>全量搬迁，3000 × 1 KiB／100 目录</td><td>5.235 → 5.225 秒</td><td>−0.19%</td><td>223.04 → 223.99 MiB</td></tr>
+            <tr><td>保源无变更增量，3000 文件</td><td>1.770 → 1.860 秒</td><td>+5.08%</td><td>243.79 → 239.58 MiB</td></tr>
+            <tr><td>保源增量，30 项 mode 变化</td><td>2.065 → 2.060 秒</td><td>−0.24%</td><td>243.39 → 239.09 MiB</td></tr>
+            <tr><td>无数据库保源全量，3000 个平铺文件</td><td>0.530 → 0.480 秒</td><td>−9.43%</td><td>163.36 → 168.58 MiB</td></tr>
+          </tbody></table></div>
+          <p>本样本符合全量 5%／增量 10% 时间门槛，内存开销相当；新程序最高 248.47 MiB，不能称约 200 MiB、release／大规模／全后端或持续增长验收已完成。无数据库样本没有 ClickHouse 报告；未配置 callback 的有数据库全量样本保留未交付状态，不能称外部接收成功。职责审查将根原值和完成证明集中 copy_root、目录顺序和提交集中 copy_completion、源清理许可留在任务层、二进制存储及 Single／Cluster 差异留在 db，协议根路径支持留在 Native。无数据库全部子目录的有界收尾、全部 entry 异步删源、统一阶段统计及共享故障／迟到写入控制仍待推进。完整证据见<a href="../../tests/lab/README.md">实验室说明</a>。</p></div>
+        <div class="note" id="root-revalidation-20261116"><p><strong>独立复验状态（2026-11-16，本批约定范围通过）：</strong>实现者仅做针对性自测，完整检查由独立 dev_test_runner 执行、dev_gatekeeper 复核。最终根目录功能与进度唤醒修复组合工作树通过五项 Rust CI：app 378 通过／52 忽略，db 144 通过／40 忽略，远程进程 16 项通过，另行执行的无数据库空根／非空根用例 1 项通过。既有 Clippy 警告仍存在。进度唤醒修复已独立提交为 9693136；不减少元数据应用或回读，保持最终 callback 与累计统计顺序。</p>
+          <p>本轮另补充非法 root_snapshot 在关闭或清理 base 前即拒绝的回归，以及源根属性获取错误在 Preserve 诊断提前失败时仍被保留的回归。同一错误实例避免重复上报，不同根错误与原执行原因同时保留。</p>
+          <p>首次现场准备因 VM104 执行 I/O 错误而失败，原失败保留；经人工授权快照、ext4 修复和恢复检查后，正式五套产品矩阵共 52 轮按各自原契约通过：源根 ACL 拒绝 10 轮、根取消 10 轮、子目录取消 10 轮、目录权限 10 轮、提前清理窗口 12 轮。两套根场景逐轮有根原值、最终报告与 base 读取，失败保源、目标数据正确，恢复后完成清理。目录取消的原观察器退出码 2／complete=false 保留：两个成功保源基线轮原本不查询 base，计数未验证；故障及恢复各轮均实际读取 base 为 0。权限套件同类两项未查询计数也明确未验证，不补热路径查询、不改写原结果。</p>
+          <p>最初无数据库全量样本 0.430→0.530 秒（+23.26%）的失败证据完整保留。追加线程跟踪证实进度轮询确有约 5–100 毫秒的同步回收等待，但不认定其解释全部原回归。完成独立唤醒修复后，以新固定程序重新进行四场景各 ABBAABBAABBA，共 48 次测量及 24 次增量准备：全量删源 4.995→4.940 秒（−1.10%）、无变更增量 1.785→1.670 秒（−6.44%）、30 项 mode 增量 2.005→1.865 秒（−6.98%）、无数据库全量 0.430→0.430 秒（0.00%），均满足各自 5%／10% 门槛。峰值 RSS 中位数变化分别 +1.61%、−2.02%、−0.77%、+1.10%，最高 252.73 MiB；不构成普遍约 200 MiB、release、大规模或持续增长验收。</p>
+          <p>Native 69a5ce8 的 NFS v3／v4.1 根契约完成 8 组 16 个真实故障案例：两协议的 mode 闪断、断连、静默超时、取消、丢确认，owner／time 取消，以及 v4.1 ACL 写入／读回取消。各组实际 RPC 命中、显式恢复、服务端内容及属性核验、全进程组收束与独占前缀清理均有原始证据。取消断言小于 1 秒，保留 Cancelled／Unknown 和未确认写结果；静默检测约 v3 5 秒、v4.1 15 秒，不是识别后的统一 3 秒恢复证明。ACL 独立证据仅含 uid／gid／mode 和 access／default POSIX xattr 存在性及原值，两者在夹具中均缺失；不外推为完整 NFSv4 ACE 认证。</p>
+          <p>最终程序 SHA-256 为 <code>1e5132d820b7a11add879c4806a66221bdc5227e5b1b225677d4757c5467edc1</code>。正式产品矩阵有实际前后 559 文件清单，Native 有 1189 文件清单；较早软件／性能阶段采用原始完整快照、修复清单和当前全量比对组成的证据链，明确不是事后伪造测试前完整快照。原始日志、样本、故障入口、程序及未覆盖范围见<a href="../../tests/lab/README.md">实验室说明</a>，保存在开发机 <code>/root/.cache/terrasync-validation-20261116/</code>。本批根元数据功能通过约定范围；无数据库全部子目录有界收尾、全部 entry 异步清理、统一阶段统计与共享故障／迟到写入控制仍待推进，整体方案未完成。</p></div>
+      </section>
+
+      <section id="acceptance">
+        <h2><span class="index">07 / VALIDATION</span>验收与未验证范围</h2>
+        <p>实现后对受影响真实链路实施受控故障注入，至少覆盖闪断、持续断连、静默丢包／超时、恢复、取消与进程崩溃。单元测试和正常路径成功不能替代真实故障验证。</p>
+        <div class="table-wrap">
+          <table class="matrix">
+            <thead><tr><th scope="col">验收维度</th><th scope="col">必须核对的结果</th></tr></thead>
+            <tbody>
+              <tr><th scope="row">目录与元数据</th><td>根目录、空目录、深层目录、限制性权限、失败后重试；文件数据完成后目录 mtime 不再被本轮操作改变；必需元数据真实读回一致。</td></tr>
+              <tr><th scope="row">校验模式</th><td>未开启命令行全量校验参数时仅执行 quick 元数据校验；显式开启时 full 同时校验数据与元数据。验证删除路径不额外强制 full，full 失败不降级；同大小同 mtime 但内容不同的样例必须被 full 检出，quick 不得声称检测或证明内容一致。CLI／Web、恢复绑定、ClickHouse 和 callback 中模式一致。</td></tr>
+              <tr><th scope="row">分类元数据增量</th><td>size／mtime 不变而仅 tags、NFS ACL、xattr、mode／owner 或其他所选属性变化；覆盖文件与目录、属性删除与空集合、ACE 顺序、源目标映射、获取失败及应用失败后的再次增量，确保不漏更新或错误推进基线。</td></tr>
+              <tr><th scope="row">源元数据获取失败</th><td>分别注入 ACL、xattr、tags、时间及权限获取失败，验证数据仍实际复制且按模式检查；ClickHouse 分别记录数据成功与元数据失败，源端不删除。验证最终未恢复 callback 提示明确、恢复成功仅日志、历史后续数据可按顺序复制、失败后增量补齐缺失类别。</td></tr>
+              <tr><th scope="row">扫描 plan 与额外读取</th><td>扫描前输出类别、用途、额外调用估算、预算及原值载体和比较返回字段；NFS→S3 无依赖时 ACL／xattr 读取为零。所需源原值在扫描获取并入库，复制复用；覆盖版本选择、过滤／映射依赖、读取失败、目标回读和 full 校验阶段。</td></tr>
+              <tr><th scope="row">原值与比较查询</th><td>验证大型 raw 与摘要均被正确保存且未重复承载；增量比较同一次查询返回后续所需原值，复制无二次查库或常态回源。覆盖旧／新值差异、缺失／失败状态、目录原始值、历史入库范围及失败后增量，测量查询次数、返回字节、数据库存储和峰值 RSS。</td></tr>
+              <tr><th scope="row">摘要与获取成本</th><td>验证摘要确定性、观察状态区别、原值恢复引用和目录收尾；测量每对象实际 RPC 数、请求字节、摘要与快照存储量，不能将减少 SQL 列读取声称为减少源端 RPC。</td></tr>
+              <tr><th scope="row">安全删除</th><td>证明目标数据、元数据、所选校验及持久性早于源删除；刻意延迟／丢失单项入库仍可删除。覆盖普通文件、软链接、目录、历史、归档、源替换、只读、非空目录及未知结果。</td></tr>
+              <tr><th scope="row">多版本</th><td>分别验证非版本化目标仅复制并入库最新状态、版本化目标复制并入库历史，源端均永久清理全部历史；覆盖最新为 delete marker、目标预存同 key、跨 entry、长历史和部分确认。覆盖 null 版本、受保护版本、删除响应丢失及源新增版本，确认非版本化目标不因清理额外落库历史，清理后源版本清单为空才完成。</td></tr>
+              <tr><th scope="row">版本入库与 entry 统计</th><td>同一 entry 包含多个版本：非版本化目标的 base、临时迁移记录和 snapshot 只保存最新状态；版本化目标保存所复制历史及 entry 关联，但两者对应阶段完成都只计一次。覆盖部分版本成功、多个版本失败、跨批次入库、重复 ACK、重扫和历史分段 entry，验证不按数据库行数或版本数累计。</td></tr>
+              <tr><th scope="row">非空尾斜杠对象</th><td>构造 a/ 非空对象与同前缀 a/file.txt：到非对象目标仅跳过 a/，子对象继续迁移且源 a/ 全部历史不删除；到对象目标验证完整 key、非空内容、所需元数据和版本顺序。零字节标记不误跳过，callback 跳过原因与计数准确，不将该记录计作失败或迁移成功。</td></tr>
+              <tr><th scope="row">代次选择与隔离</th><td>保留源端全量／增量→删除源端增量；删除源端全量／增量→下一删除代次全量，含上一代成功／失败／取消及零入库事实。核验新全量清空、增量复用、旧执行隔离、无扫描 checkpoint、不因源缺失误删目标。</td></tr>
+              <tr><th scope="row">文件传输与目标清理</th><td>验证启用文件续传为 Checkpointed、否则 Direct，不存在 Atomic 选择分支。数据最终失败后对应目标产物删除、断点失效；元数据失败和仅数据库失败保留已复制数据。覆盖有效中断续传、源变化、Direct 部分目标、失败版本精确清理、清理超时／失败和下一次增量优先清理，兼顾快速退出与准确 callback。</td></tr>
+              <tr><th scope="row">网络防抖与退出</th><td>覆盖单次超时、窗口内稳定恢复、反复抖动和持续断网，涉及初始化、扫描、元数据、传输、发布、数据库、删除及空闲／背压。短抖动不误退出且仅写日志，确认持续中断后尽早收束并 callback；记录检测、防抖、停止调度与源删除、收束、通知及退出耗时，验证窗口不被并发或分页重置、探测有界、未知副作用不被抹去。</td></tr>
+              <tr><th scope="row">数据库与通知</th><td>覆盖 Single／Cluster 的异步批量写入、响应丢失、写入失败及删除后崩溃，允许缺失记录而不删除有效目标。保留源端的增量允许重复制缺失项；连续删除代次全量。最终错误 callback、可用 ClickHouse 保存报告，通知失败原因不入库。</td></tr>
+              <tr><th scope="row">统计</th><td>累计数与实际源／目标逐项核对；恢复不重复计数；重传不增加逻辑完成量；扫描不完整与结果未知准确呈现。</td></tr>
+              <tr><th scope="row">错误与删除准入</th><td>注入数据、ACL、xattr、tags 等复制／校验错误，验证相应对象或 key 不删源；仅数据库错误独立处理，不伪装数据失败。验证预算内恢复仅日志，最终错误全部 callback，多版本失败计 entry 一次但逐版本说明原因。</td></tr>
+              <tr><th scope="row">性能与资源</th><td>主要与固定优化前版本做完整全量迁移 A/B，性能和内存开销均应相当；分别验证保留源端与删除源端，报告整轮耗时、有效吞吐、持续及峰值 RSS、ClickHouse 开销。扫描不落库基线仅作对应模式的辅助验收，队列、批次和在途工作有界。</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <h3 id="full-migration-performance">7.1　全量迁移目标：性能与内存开销均与优化前相当</h3>
+        <p>本方案的主要验收对象是完整全量迁移，主要基线为固定的优化前运行时代码版本，不是单独的扫描吞吐或不落库扫描。保留源端与删除源端分别对比；不得用一个模式的收益抵消另一个模式的退化。</p>
+        <div class="table-wrap">
+          <table class="matrix">
+            <caption>优化前后 A/B 的比较契约</caption>
+            <thead><tr><th scope="col">维度</th><th scope="col">要求</th></tr></thead>
+            <tbody>
+              <tr><th scope="row">环境与工作量</th><td>固定硬件、网络、源／目标 backend、ClickHouse 部署、并发和数据集，分别对 Checkpointed、Direct 做同模式前后比较；对齐源／目标初始状态及冷热缓存条件。每次删除模式运行都从等价源数据重新开始，不能因前次执行删走部分文件而减少工作量。</td></tr>
+              <tr><th scope="row">配置与语义</th><td>默认 quick 为主要验收路径，显式 full 单独验收，同模式 A/B。保持可对齐的元数据、版本和过滤选项一致，标明旧实现缺失的新保证或强制内容回读等差异；不能将 quick 与 full 混比，也不能关闭元数据校验或目标持久性确认换取持平。</td></tr>
+              <tr><th scope="row">时间与吞吐</th><td>从任务启动到实际终态计时，包含初始化、base 清理、扫描、全部元数据获取与摘要、传输、校验、异步批量入库收束、删除、目录收尾及任务收束；展示有效逻辑字节／整轮时间和条目吞吐，不排除尾部等待或正常通知成本。</td></tr>
+              <tr><th scope="row">内存</th><td>比较同范围进程的持续 RSS、峰值 RSS 和运行曲线；单进程／双进程按实际部署一致统计，双进程同时报告各端与总量。增加数据量与长历史后，不出现按总 entry 数增长的常驻明细或持续内存爬升。</td></tr>
+              <tr><th scope="row">依赖开销</th><td>同时报告受控同负载下的 ClickHouse CPU／内存、写入与读取字节，以及真实存储 RPC 数。不能把应用内存转移为数据库或其他进程的明显额外开销后宣称总体持平。</td></tr>
+              <tr><th scope="row">代表场景</th><td>覆盖小文件密集、大文件、大平铺目录、深层目录、长版本历史，以及较大 ACL／xattr／tags；分别记录正常路径和受影响故障恢复场景，故障场景排除人为暂停但计入实际恢复、重放和对账成本。</td></tr>
+              <tr><th scope="row">结论口径</th><td>重复同环境 A/B，报告中位数、波动和相对差值；只有整轮性能与内存均处于正常测量波动内、没有稳定可复现的退化，才认定与优化前相当。不擅自将“相当”放宽为固定允许退化比例。</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>使用有界批量 ClickHouse 写入和限时刷新，复制／清理路径只负责提交事实，不等待单项持久化确认。正常终态收束异步写入；持续数据库故障按预算退出并报告缺失，不为小概率记账失败增加同步屏障或额外回执。复用元数据观察并流式计算摘要，减少重复序列化和无用途 IO。</p>
+        <p>队列、批次、在途观察和缓存同时考虑条目数与字节预算，原值与摘要持久化后按需投影、压缩和流式读取，避免巨大 ACL／xattr 常驻或重复存储。增量比较同次查询返回所需原值，不用额外查库或回源换取表面存储节省；全部成本和收益以完整正确性及实测为准。</p>
+        <p>本方案不包含全量断点续扫验收。独立扫描场景已有的 unordered／blocks、checkpoint 及专项性能规范仅在其对应范围适用，不能替代本次完整全量迁移及失败后增量的前后对比。“全量扫描损失不超过 5%”“增量扫描损失不超过 10%”及约 200 MiB 的通用内存优化目标，不作为整轮全量迁移“性能和内存相当”的替代判据。</p>
+        <div class="note warn"><p><strong>本次验证范围：</strong>本方案仍含待实现项目，不能据文档认定全量优化已经完成。通知链路的真实 ClickHouse 单机／集群和 HTTP 故障用例见 <a href="../../tests/lab/README.md">实验室验证说明</a>及对应测试；其证据不代表完整迁移的全部存储故障矩阵或性能／RSS 目标已通过。每次提交以实际执行结果报告已验证范围。</p></div>
+      </section>
+
+      <section id="references">
+        <h2><span class="index">08 / REFERENCES</span>代码与协议依据</h2>
+        <p class="muted small">相对链接以本文件位于 docs/specs/ 为基准，可在原仓库内打开。HTML 单独拷贝后正文和样式仍可阅读，仓库相对链接需要保留目录结构。</p>
+        <ol class="source-list">
+          <li><a href="../development.md">开发规范</a>：产品职责、扫描顺序、checkpoint、统计、性能和首次开发约束。</li>
+          <li><a href="../external-dependency-failures.md">外部依赖故障约束</a>：检测、恢复预算、取消、未知写入与最终通知。</li>
+          <li><a href="../architecture-review.md">架构审查要求</a>：职责归属、模块边界和规则集中。</li>
+          <li><a href="../../crates/app/src/rename.rs">rename.rs</a>：目标路径移动及旧路径缺失后的恢复复制。</li>
+          <li><a href="../../crates/app/src/copy_completion.rs">copy_completion.rs</a>：目录统一收尾与代次提交。<a href="../../crates/app/src/orchestrator.rs">orchestrator.rs</a>：全量／增量任务入口与收尾调用。</li>
+          <li><a href="../../crates/app/src/copy_dispatch.rs">copy_dispatch.rs</a>、<a href="../../crates/app/src/sender.rs">sender.rs</a>、<a href="../../crates/app/src/file_copy.rs">file_copy.rs</a>、<a href="../../crates/app/src/copy_history.rs">copy_history.rs</a>：路径分派、历史分组收尾和逐版本处理。</li>
+          <li><a href="../../crates/app/src/file_copy/transfer.rs">file_copy/transfer.rs</a>、<a href="../../crates/app/src/receiver.rs">receiver.rs</a>、<a href="../../crates/app/src/sync.rs">sync.rs</a>：传输策略、源删除和应用层元数据处理。</li>
+          <li><a href="../../crates/app/src/scan/observation.rs">scan/observation.rs</a>、<a href="../../crates/app/src/scan/source.rs">scan/source.rs</a>、<a href="../../crates/app/src/dir_walker.rs">dir_walker.rs</a>：观察计划、历史准入及扫描入口。</li>
+          <li><a href="../../crates/db/src/scan/candidate_cache.rs">scan/candidate_cache.rs</a>、<a href="../../crates/db/src/scan/compare.rs">scan/compare.rs</a>、<a href="../../crates/db/src/catalogue/comparison.rs">catalogue/comparison.rs</a>：缓存摘要范围和当前增量比较判据。<a href="../../crates/db/src/schema/records.rs">schema/records.rs</a>：原生快照回读契约。</li>
+          <li><a href="../../crates/db/src/catalogue/copy_generation.rs">catalogue/copy_generation.rs</a>、<a href="../../crates/app/src/copy_execution.rs">copy_execution.rs</a>、<a href="../../crates/app/src/job_execution.rs">job_execution.rs</a>：代次恢复、保守拒绝和执行互斥范围。</li>
+          <li><a href="../../crates/app/src/consumer/stats/report.rs">stats/report.rs</a>、<a href="../../crates/app/src/consumer/stats/diagnostics.rs">stats/diagnostics.rs</a>：当前统计字段和有界诊断明细。</li>
+          <li><a href="../../crates/app/src/tar_pack.rs">tar_pack.rs</a>、<a href="../../tests/scenarios/migration-generations.md">迁移代次测试场景</a>：打包源清理及待实现／执行的场景规格，不能据此认定通过。</li>
+          <li><a href="../../Cargo.toml">Cargo.toml</a> 锁定 data-mover <code>378bd9e4667563ad7960ba9c91e1895fb15cd40d</code>。当前使用 transfer 及 Namespace::purge_observed；旧 move_file 入口已移除，不能据旧实现推断当前删除行为。</li>
+          <li><a href="https://www.rfc-editor.org/rfc/rfc7530.html#section-16.3.5">RFC 7530 §16.3.5 · NFSv4 COMMIT</a>：稳定存储与提交语义。</li>
+          <li><a href="https://docs.aws.amazon.com/AmazonS3/latest/userguide/DeletingObjectVersions.html">Amazon S3 · 删除对象版本</a>：delete marker 与指定版本永久删除的区别。</li>
+        </ol>
+      </section>
+      <footer>TerraSync · 全量迁移优化方案 · 更新于 2026-11-16 · 历史 /tmp 原始证据已不可用；当前实施结论以独立复验为准</footer>
+    </main>
+  </div>
+</body>
+</html>

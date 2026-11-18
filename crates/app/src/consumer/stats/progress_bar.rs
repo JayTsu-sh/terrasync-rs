@@ -5,24 +5,25 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::thread;
 use std::time::{Duration, Instant};
 
 use indicatif::{ProgressBar as IndicatifBar, ProgressStyle};
-use task_model::StorageEntryMessage;
-use task_model::observation::EntryStatistics;
+use task_model::observation::{EntryProgress, EntryStatistics};
+use task_model::{EntryChange, StorageEntryMessage};
 use tracing::info;
 
 use super::accumulator::{IncrementalStats, fmt_elapsed, format_bytes};
-use super::report::{ProgressDetail, ProgressReport};
 use crate::config::JobType;
 use crate::error::{AppError, Result};
+use crate::report::{ProgressDetail, ProgressReport};
 use crate::scan::statistics::ScanSnapshot;
 
 /// 进度条 display 线程刷新间隔（秒）
 const DISPLAY_INTERVAL_SECS: u64 = 2;
 /// 进度信息写入日志的节流间隔（秒）
 const LOG_INTERVAL_SECS: u64 = 30;
-/// finish 检测粒度（毫秒）：每 100ms 检查一次，最坏 join 等待时间即为此值
+/// 未主动唤醒时，结束状态的兜底检查间隔（毫秒）。
 const FINISH_POLL_MS: u64 = 100;
 
 #[derive(Debug, Default)]
@@ -32,16 +33,27 @@ struct ScanProgressCounters {
     retained: AtomicU64,
 }
 
-/// 分段等待直到 `is_finished` 返回 true 或超时。
-/// 将大 sleep 拆成 `FINISH_POLL_MS` 小段，大幅缩短 join 等待时间。
+/// 等待固定刷新期限，结束时可由 owner 唤醒；重复或伪唤醒不能提前刷新。
 fn sleep_interruptible(checks: u64, is_finished: impl Fn() -> bool) {
-    for _ in 0..checks {
-        std::thread::sleep(Duration::from_millis(FINISH_POLL_MS));
-        if is_finished() {
+    sleep_interruptible_with(checks, is_finished, Instant::now, thread::park_timeout);
+}
+
+fn sleep_interruptible_with(
+    checks: u64, is_finished: impl Fn() -> bool, now: impl Fn() -> Instant, mut wait: impl FnMut(Duration),
+) {
+    let deadline = now() + Duration::from_millis(checks * FINISH_POLL_MS);
+    while !is_finished() {
+        let remaining = deadline.saturating_duration_since(now());
+        if remaining.is_zero() {
             break;
         }
+        wait(remaining.min(Duration::from_millis(FINISH_POLL_MS)));
     }
 }
+
+#[cfg(test)]
+#[path = "progress_wakeup_tests.rs"]
+pub(crate) mod wakeup_tests;
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 // CounterSet — 全量 / 增量计数器
@@ -287,8 +299,14 @@ impl ProgressBar {
     /// 根据消息类型更新对应的原子计数器
     pub fn update_statistics(&self, message: &StorageEntryMessage) {
         let (entry, operation) = match message {
+            StorageEntryMessage::TargetPreserved { .. } => return,
             StorageEntryMessage::Scanned(entry) | StorageEntryMessage::Packaged(entry) => (entry, "scanned"),
             StorageEntryMessage::New(item) => {
+                if item.entry.history().is_some()
+                    && (matches!(&self.counters, CounterSet::Full(_)) || self.job_type == JobType::IncrementalCopy)
+                {
+                    return;
+                }
                 let operation = match &self.counters {
                     CounterSet::Full(_) => "scanned",
                     CounterSet::Incremental(_) => "new",
@@ -296,8 +314,45 @@ impl ProgressBar {
                 self.update_observed(operation, &item.view());
                 return;
             }
+            StorageEntryMessage::CopyEntryCompleted { entry, logical_bytes } => {
+                if matches!(&self.counters, CounterSet::Full(_)) {
+                    self.update_observed(
+                        "scanned",
+                        &EntryProgress {
+                            entry,
+                            logical_bytes: *logical_bytes,
+                            count_entry: true,
+                            distribution_bytes: None,
+                        },
+                    );
+                }
+                return;
+            }
             StorageEntryMessage::Changed { entry, .. } => {
+                if self.job_type == JobType::IncrementalCopy && entry.entry.history().is_some() {
+                    return;
+                }
                 self.update_observed("changed", &entry.view());
+                return;
+            }
+            StorageEntryMessage::CopyEntryDeltaCompleted {
+                entry,
+                change,
+                logical_bytes,
+            } => {
+                let operation = match change {
+                    EntryChange::New => "new",
+                    EntryChange::Changed(_) => "changed",
+                };
+                self.update_observed(
+                    operation,
+                    &EntryProgress {
+                        entry,
+                        logical_bytes: *logical_bytes,
+                        count_entry: true,
+                        distribution_bytes: None,
+                    },
+                );
                 return;
             }
             StorageEntryMessage::Deleted(entry) => (entry, "deleted"),
@@ -306,7 +361,10 @@ impl ProgressBar {
                 CounterSet::Full(_) => (entry, "scanned"),
                 CounterSet::Incremental(_) => return,
             },
-            StorageEntryMessage::Error { .. } => {
+            StorageEntryMessage::Error { .. }
+            | StorageEntryMessage::CopyVersionFailed {
+                first_in_entry: true, ..
+            } => {
                 match &self.counters {
                     CounterSet::Full(c) => {
                         c.error_count.fetch_add(1, Ordering::Relaxed);
@@ -317,7 +375,15 @@ impl ProgressBar {
                 }
                 return;
             }
-            StorageEntryMessage::TarManifest { .. } => return,
+            StorageEntryMessage::CopyItemCompleted { .. }
+            | StorageEntryMessage::VersionMetadataChanged { .. }
+            | StorageEntryMessage::Diagnostic { .. }
+            | StorageEntryMessage::CopyEntryBoundary(_)
+            | StorageEntryMessage::CopySkipped { .. }
+            | StorageEntryMessage::TarManifest { .. }
+            | StorageEntryMessage::CopyVersionFailed {
+                first_in_entry: false, ..
+            } => return,
         };
         for view in task_model::observation::ObservedView::all(entry) {
             match &self.counters {
@@ -333,21 +399,26 @@ impl ProgressBar {
         match &self.counters {
             CounterSet::Full(c) if operation == "scanned" => {
                 if entry.get_is_dir() {
-                    c.total_dir_count.fetch_add(1, Ordering::Relaxed);
+                    c.total_dir_count
+                        .fetch_add(entry.entry_count() as u64, Ordering::Relaxed);
                 } else {
-                    c.total_file_count.fetch_add(1, Ordering::Relaxed);
+                    c.total_file_count
+                        .fetch_add(entry.entry_count() as u64, Ordering::Relaxed);
                 }
-                c.total_count.fetch_add(1, Ordering::Relaxed);
+                c.total_count.fetch_add(entry.entry_count() as u64, Ordering::Relaxed);
                 c.total_size.fetch_add(entry.get_size(), Ordering::Relaxed);
             }
             CounterSet::Incremental(c) => {
                 if operation == "scanned" {
                     if entry.get_is_dir() {
-                        c.scanned_dir_count.fetch_add(1, Ordering::Relaxed);
+                        c.scanned_dir_count
+                            .fetch_add(entry.entry_count() as u64, Ordering::Relaxed);
                     } else if entry.get_is_symlink() {
-                        c.scanned_symlink_count.fetch_add(1, Ordering::Relaxed);
+                        c.scanned_symlink_count
+                            .fetch_add(entry.entry_count() as u64, Ordering::Relaxed);
                     } else if entry.get_is_regular_file() {
-                        c.scanned_regular_file_count.fetch_add(1, Ordering::Relaxed);
+                        c.scanned_regular_file_count
+                            .fetch_add(entry.entry_count() as u64, Ordering::Relaxed);
                     }
                     c.scanned_size.fetch_add(entry.get_size(), Ordering::Relaxed);
                 } else {
@@ -357,7 +428,7 @@ impl ProgressBar {
                         "rename" => (&c.renamed_count, &c.renamed_size),
                         _ => (&c.changed_count, &c.changed_size),
                     };
-                    count.fetch_add(1, Ordering::Relaxed);
+                    count.fetch_add(entry.entry_count() as u64, Ordering::Relaxed);
                     size.fetch_add(entry.get_size(), Ordering::Relaxed);
                 }
             }
@@ -578,6 +649,10 @@ impl ProgressBar {
         };
 
         ProgressReport {
+            target_preserved_count: 0,
+            skipped_count: 0,
+            diagnostics_complete: false,
+            task_error_count: 0,
             job_id: job_id.to_string(),
             job_type: self.job_type.to_callback_name().to_string(),
             elapsed_secs,
@@ -585,6 +660,7 @@ impl ProgressBar {
             detail,
             is_final: false,
             generation_committed: None,
+            migration: None,
             final_stats: None,
             scan: None,
             callback_identity: None,

@@ -18,25 +18,31 @@ use std::time::{Duration, Instant};
 // 外部crate
 use data_mover::model::ObservedEntry;
 use db::ClickHouseDatabase;
+use task_model::migration::{CopyGenerationPhase, MigrationMode, MigrationReport};
 use task_model::observation::ObservedScanEvent;
 use task_model::{ErrorEvent, StorageEntryMessage};
+use task_model::{TargetRetention, TargetRetentionReason};
 use tokio::sync::Mutex;
 use tracing::{Instrument, debug, error, info_span, warn};
 
 // 内部模块
+use super::purge_reporting;
 use super::stats::callback_state::{SavedStatistics, StatisticsCheckpoint};
 use super::stats::recovery_progress::RecoveryProgress;
 use crate::broadcast::BroadcastForwarder;
 use crate::config::{ConsumerConfig, JobType};
 use crate::consumer::DatabaseConsumer;
-#[cfg(test)]
-use crate::consumer::stats::ProgressReport;
-use crate::consumer::stats::{FileSizeRange, ProgressDetail, TimeRange};
+use crate::consumer::stats::{FileSizeRange, TimeRange};
 use crate::consumer::stats::{
     FullStats, IncrementalStats, ProgressBar, StatisticConsumer, StatsKind, consumer::CallbackGuard,
 };
+use crate::consumer::stats::{callback_state::CallbackState, journal};
 use crate::consumer::traits::Consumer;
+use crate::copy_execution::CopyDatabaseExecution;
 use crate::error::{AppError, Result};
+use crate::report::ProgressDetail;
+#[cfg(test)]
+use crate::report::ProgressReport;
 use crate::scan::statistics::{ScanCapabilities, ScanCounts, ScanSnapshot};
 use data_mover::traversal::TraversalRecoveryStatus;
 use db::scan::ScanFinalEvent;
@@ -50,15 +56,29 @@ pub struct ConsumerManager {
     stats_consumer: Option<Arc<Mutex<StatisticConsumer>>>,
     /// `begin_lifecycle()` 启动的周期 HTTP 回调守卫，在 `end_lifecycle()` 中 abort + 复用 client
     callback_guard: Option<CallbackGuard>,
+    notification_database: Option<ClickHouseDatabase>,
+    copy_pipeline_prepared: bool,
+    copy_database_execution: Option<CopyDatabaseExecution>,
 }
 
-/// 扫描工作任务共享统计状态，不持有生命周期守卫或其他消费者。
+/// 工作任务共享统计状态，不持有生命周期守卫或其他消费者。
 #[derive(Clone)]
-pub(crate) struct ScanStatistics {
+pub(crate) struct TaskStatistics {
     inner: Option<Arc<Mutex<StatisticConsumer>>>,
 }
 
-impl ScanStatistics {
+impl TaskStatistics {
+    /// 扫描条目按实际输入流更新，变更事件落盘后更新；保存游标前等待两者处理完成。
+    pub(crate) async fn record_statistics(&self, messages: impl IntoIterator<Item = StorageEntryMessage>) {
+        if let Some(sc) = &self.inner {
+            for message in messages {
+                if let Err(error) = journal::record(sc, &message).await {
+                    StatisticConsumer::diagnostic_failure(sc, error).await;
+                }
+            }
+        }
+    }
+
     pub(crate) async fn restore_scan_counts(&self, counts: ScanCounts) {
         if let Some(sc) = &self.inner {
             let mut sc = sc.lock().await;
@@ -190,6 +210,84 @@ impl ScanStatistics {
 }
 
 impl ConsumerManager {
+    pub(crate) async fn copy_attempt_id(&self) -> Result<String> {
+        let consumer = self
+            .stats_consumer
+            .as_ref()
+            .ok_or_else(|| AppError::ConfigError("迁移通知状态未创建".into()))?;
+        Ok(consumer.lock().await.callback.identity.attempt_id.clone())
+    }
+
+    pub(crate) async fn set_migration_report(&self, report: MigrationReport) {
+        if let Some(consumer) = &self.stats_consumer {
+            let mut consumer = consumer.lock().await;
+            if !self.copy_pipeline_prepared {
+                let job_type = match report.plan.mode {
+                    MigrationMode::Full => JobType::Copy,
+                    MigrationMode::Incremental => JobType::IncrementalCopy,
+                };
+                Self::reset_copy_statistics(&mut consumer, job_type);
+            }
+            consumer.migration = Some(report);
+        }
+    }
+
+    pub(crate) async fn finish_unpersisted_migration(&self, phase: CopyGenerationPhase) {
+        if let Some(consumer) = &self.stats_consumer {
+            let mut consumer = consumer.lock().await;
+            if let Some(report) = &mut consumer.migration
+                && report.generation.is_none()
+            {
+                report.phase = phase;
+            }
+        }
+    }
+
+    pub(crate) async fn record_target_retention_range(
+        &self, reason: TargetRetentionReason, message: String,
+    ) -> Result<()> {
+        self.record_target_retention(TargetRetention::source_range(reason), message)
+            .await
+    }
+
+    pub(crate) async fn record_target_retention(&self, retention: TargetRetention, message: String) -> Result<()> {
+        if let Some(consumer) = &self.stats_consumer {
+            StatisticConsumer::record_message(
+                consumer,
+                &StorageEntryMessage::TargetPreserved {
+                    retention: Box::new(retention),
+                    reason: message,
+                },
+            )
+            .await?;
+        }
+        Ok(())
+    }
+
+    fn reset_copy_statistics(state: &mut StatisticConsumer, job_type: JobType) {
+        let (job_id, command, log_path) = match &state.stats {
+            StatsKind::Full(summary) => (
+                summary.job_id.clone(),
+                summary.command.clone(),
+                summary.log_path.clone(),
+            ),
+            StatsKind::Incremental(summary) => (
+                summary.job_id.clone(),
+                summary.command.clone(),
+                summary.log_path.clone(),
+            ),
+        };
+        state.stats = match job_type {
+            JobType::Copy => StatsKind::Full(FullStats::new(JobType::Copy, job_id, command, log_path)),
+            _ => StatsKind::Incremental(IncrementalStats::new(
+                JobType::IncrementalCopy,
+                job_id,
+                command,
+                log_path,
+            )),
+        };
+        state.progress_bar = ProgressBar::new(job_type);
+    }
     pub(crate) async fn initialize_scan_statistics(
         &self, storage: &crate::storage_factory::StorageContext, tags: bool, round: Option<i64>,
     ) -> Result<()> {
@@ -206,17 +304,17 @@ impl ConsumerManager {
         }
         Ok(())
     }
-    pub(crate) fn scan_statistics(&self) -> ScanStatistics {
-        ScanStatistics {
+    pub(crate) fn task_statistics(&self) -> TaskStatistics {
+        TaskStatistics {
             inner: self.stats_consumer.clone(),
         }
     }
 
     pub async fn record_observations(&self, entries: &[Arc<ObservedEntry>]) {
-        self.scan_statistics().record_observations(entries).await;
+        self.task_statistics().record_observations(entries).await;
     }
     pub async fn record_observed_events(&self, events: &[ObservedScanEvent]) {
-        self.scan_statistics().record_observed_events(events).await;
+        self.task_statistics().record_observed_events(events).await;
     }
     pub async fn record_final_events(&self, events: &[ScanFinalEvent]) {
         if let Some(sc) = &self.stats_consumer {
@@ -228,12 +326,7 @@ impl ConsumerManager {
     }
     /// 扫描条目按实际输入流更新，变更事件落盘后更新；保存游标前等待两者处理完成。
     pub async fn record_statistics(&self, messages: impl IntoIterator<Item = StorageEntryMessage>) {
-        if let Some(sc) = &self.stats_consumer {
-            let mut sc = sc.lock().await;
-            for message in messages {
-                sc.update_statistics(&message);
-            }
-        }
+        self.task_statistics().record_statistics(messages).await;
     }
 
     /// 最终报告以持久化唯一条目为准；恢复时重放的目录不能重复计入结果统计。
@@ -393,7 +486,7 @@ impl ConsumerManager {
     }
 
     pub async fn statistics_checkpoint(&self) -> Result<String> {
-        self.scan_statistics().statistics_checkpoint().await
+        self.task_statistics().statistics_checkpoint().await
     }
 
     pub async fn restore_statistics(&self, saved: &str) -> Result<()> {
@@ -451,15 +544,47 @@ impl ConsumerManager {
         } else {
             None
         };
-        Ok(Self::with_database_consumer(consumer_config, consumer))
+        Ok(Self::with_database_consumer(consumer_config, consumer, None))
     }
 
-    /// A copy pipeline explicitly shares the catalogue that began its generation.
-    pub(crate) async fn with_database(
-        consumer_config: &ConsumerConfig, database: Option<ClickHouseDatabase>,
-    ) -> Result<Self> {
-        let consumer = match (consumer_config.db_config.enabled, database) {
-            (true, Some(database)) => Some(DatabaseConsumer::with_database(consumer_config, database).await?),
+    /// 扫描管道自行确认事实写入；这里仅管理统计和独立的最终报告归档。
+    pub(crate) fn statistics_only(consumer_config: &ConsumerConfig) -> Result<Self> {
+        let database = consumer_config
+            .db_config
+            .enabled
+            .then(|| ClickHouseDatabase::new(&consumer_config.db_config.clickhouse, &consumer_config.job_id))
+            .transpose()?;
+        Ok(Self::with_database_consumer(consumer_config, None, database))
+    }
+
+    pub(crate) fn set_copy_database_execution(&mut self, execution: Option<CopyDatabaseExecution>) -> Result<()> {
+        if self.copy_pipeline_prepared {
+            return Err(AppError::ConfigError("复制事实消费者准备后不能替换执行域".into()));
+        }
+        self.copy_database_execution = execution;
+        Ok(())
+    }
+
+    pub(crate) fn copy_database_execution(&self) -> Option<CopyDatabaseExecution> {
+        self.copy_database_execution.clone()
+    }
+
+    /// 复制准入完成后挂接事实消费者；准入前创建的通知状态继续使用同一身份。
+    pub(crate) async fn prepare_copy_consumers(
+        &mut self, config: &ConsumerConfig, database: Option<ClickHouseDatabase>,
+    ) -> Result<()> {
+        if self.copy_pipeline_prepared || self.callback_guard.is_some() || !self.consumers.is_empty() {
+            return Err(AppError::ConfigError("复制消费者只能在生命周期开始前准备一次".into()));
+        }
+        if !matches!(config.job_type, JobType::Copy | JobType::IncrementalCopy) {
+            return Err(AppError::ConfigError("复制消费者需要复制任务类型".into()));
+        }
+        let consumer = match (config.db_config.enabled, database) {
+            (true, Some(database)) => Some(
+                DatabaseConsumer::with_database(config, database)
+                    .await?
+                    .with_shared_execution(self.copy_database_execution.clone()),
+            ),
             (false, None) => None,
             _ => {
                 return Err(AppError::ConfigError(
@@ -467,14 +592,32 @@ impl ConsumerManager {
                 ));
             }
         };
-        Ok(Self::with_database_consumer(consumer_config, consumer))
+        if let Some(state) = &self.stats_consumer {
+            let mut state = state.lock().await;
+            Self::reset_copy_statistics(&mut state, config.job_type.clone());
+        }
+        if let Some(consumer) = consumer {
+            self.add_consumer(Box::new(consumer));
+        }
+        self.copy_pipeline_prepared = true;
+        Ok(())
     }
 
-    fn with_database_consumer(consumer_config: &ConsumerConfig, consumer: Option<DatabaseConsumer>) -> Self {
+    fn with_database_consumer(
+        consumer_config: &ConsumerConfig, consumer: Option<DatabaseConsumer>,
+        notification_database: Option<ClickHouseDatabase>,
+    ) -> Self {
+        let notification_database = consumer
+            .as_ref()
+            .map(|consumer| consumer.database().clone())
+            .or(notification_database);
         let mut manager = Self {
             consumers: Vec::new(),
             stats_consumer: None,
             callback_guard: None,
+            notification_database,
+            copy_pipeline_prepared: false,
+            copy_database_execution: None,
         };
         if let Some(consumer) = consumer {
             manager.add_consumer(Box::new(consumer));
@@ -497,9 +640,10 @@ impl ConsumerManager {
                     job_dir,
                     callback_url,
                     generation_committed: None,
+                    migration: None,
                     pb_handle: None,
                     scan_snapshot: None,
-                    callback: Default::default(),
+                    callback: CallbackState::with_database(manager.notification_database.clone()),
                 },
                 JobType::IncrementalScan | JobType::IncrementalCopy => StatisticConsumer {
                     stats: StatsKind::Incremental(IncrementalStats::new(job_type.clone(), job_id, command, log_path)),
@@ -507,9 +651,10 @@ impl ConsumerManager {
                     job_dir,
                     callback_url,
                     generation_committed: None,
+                    migration: None,
                     pb_handle: None,
                     scan_snapshot: None,
-                    callback: Default::default(),
+                    callback: CallbackState::with_database(manager.notification_database.clone()),
                 },
             };
             manager.stats_consumer = Some(Arc::new(Mutex::new(sc)));
@@ -564,11 +709,7 @@ impl ConsumerManager {
             let stats_consumer_clone = stats_consumer.clone();
             let span = info_span!("consumer", kind = "statistics");
             let stats_handle = tokio::spawn(
-                async move {
-                    StatisticConsumer::process(stats_consumer_clone, stats_rx).await;
-                    Ok(())
-                }
-                .instrument(span),
+                async move { StatisticConsumer::process(stats_consumer_clone, stats_rx).await }.instrument(span),
             );
             handles.push(stats_handle);
             debug!("Statistic consumer process task started successfully");
@@ -596,14 +737,36 @@ impl ConsumerManager {
         let Some(stats_consumer) = &self.stats_consumer else {
             return;
         };
-        let mut stats_consumer = stats_consumer.lock().await;
         for reason in failures {
-            stats_consumer.update_statistics(&StorageEntryMessage::Error {
+            let mut state = stats_consumer.lock().await;
+            state.callback.task_error_count = state.callback.task_error_count.saturating_add(1);
+            drop(state);
+            let message = StorageEntryMessage::Diagnostic {
                 event: ErrorEvent::Scan,
                 path: PathBuf::new(),
-                entry: None,
                 reason: reason.clone(),
-            });
+            };
+            if let Err(error) = journal::record(stats_consumer, &message).await {
+                StatisticConsumer::diagnostic_failure(stats_consumer, error).await;
+            }
+        }
+    }
+
+    pub(crate) async fn record_task_error(&self, error: &AppError) {
+        if (error.stops_event_pipeline() || matches!(error, AppError::DiagnosticJournalStopped { .. }))
+            && let Some(consumer) = &self.stats_consumer
+            && consumer.lock().await.callback.journal.terminal.is_some()
+        {
+            return;
+        }
+        // 版本执行器已经交付 entry 失败及逐版本原因，收尾不能再增加一次相同失败。
+        if !error.is_reported_copy_failure() {
+            self.record_task_failures(&[error.to_string()]).await;
+            if let Some(consumer) = &self.stats_consumer
+                && let Err(reporting) = purge_reporting::record(consumer, error).await
+            {
+                StatisticConsumer::diagnostic_failure(consumer, reporting).await;
+            }
         }
     }
 
@@ -621,14 +784,14 @@ impl ConsumerManager {
     pub async fn end_lifecycle(&mut self) {
         if let Some(sc) = self.stats_consumer.clone() {
             let callback = self.callback_guard.take();
-            StatisticConsumer::end(sc, callback).await;
+            StatisticConsumer::end_with_database(sc, callback, self.notification_database.as_ref(), false).await;
         }
     }
 
     pub(crate) async fn end_cancelled_lifecycle(&mut self) {
         if let Some(sc) = self.stats_consumer.clone() {
             let callback = self.callback_guard.take();
-            StatisticConsumer::end_cancelled(sc, callback).await;
+            StatisticConsumer::end_with_database(sc, callback, self.notification_database.as_ref(), true).await;
         }
     }
 }
@@ -648,8 +811,230 @@ impl Drop for ConsumerManager {
 mod resume_tests {
     use super::*;
     use crate::consumer::stats::ProgressDetail;
+    use crate::error::{CopyStep, StorageError};
+    use crate::observed_fixtures::observation;
+    use crate::source_cleanup;
+    use data_mover::model::{BackendKind, EntryKind};
+    use data_mover::model::{EntryOperationFailure, FailureClass, MetadataFamily, Operation, StoragePath, Transience};
+    use data_mover::storage::{NamespaceReadCause, NamespaceReadFailure, StorageRoleFailure};
+    use db::DatabaseError;
     use db::EntrySummary as StorageEntryRecord;
     use db::scan::{ScanEventSummary, ScanResumeSummary};
+    use std::path::Path;
+    use task_model::{RetentionScope, SourcePresence};
+
+    #[tokio::test]
+    async fn source_cleanup_failure_reports_known_paths_and_presence_without_double_entry_errors() -> Result<()> {
+        for (present, persistence, purge) in [
+            (false, false, None),
+            (true, false, None),
+            (false, true, None),
+            (false, false, Some("source mtime/ctime changed")),
+            (false, false, Some("source directory is not empty")),
+            (false, false, Some("read-only source filesystem")),
+        ] {
+            let statistics = StatisticConsumer {
+                stats: StatsKind::Full(FullStats::new(
+                    JobType::Copy,
+                    "source-cleanup-failure".into(),
+                    String::new(),
+                    String::new(),
+                )),
+                progress_bar: ProgressBar::new(JobType::Copy),
+                job_dir: String::new(),
+                callback_url: None,
+                generation_committed: None,
+                migration: None,
+                pb_handle: None,
+                scan_snapshot: None,
+                callback: Default::default(),
+            };
+            let manager = ConsumerManager {
+                consumers: vec![],
+                stats_consumer: Some(Arc::new(Mutex::new(statistics))),
+                callback_guard: None,
+                notification_database: None,
+                copy_pipeline_prepared: false,
+                copy_database_execution: None,
+            };
+            let path = StoragePath::new("payload").map_err(StorageError::from)?;
+            let source = if let Some(diagnostic) = purge {
+                StorageError::SourcePurgeRefused {
+                    path,
+                    source: StorageRoleFailure::Entry(
+                        EntryOperationFailure::new(
+                            StoragePath::new("payload").map_err(StorageError::from)?,
+                            Operation::Namespace,
+                            if diagnostic.starts_with("read-only") {
+                                FailureClass::PermissionDenied
+                            } else {
+                                FailureClass::Conflict
+                            },
+                            Transience::Permanent,
+                            diagnostic,
+                        )
+                        .map_err(StorageError::from)?,
+                    )
+                    .into(),
+                }
+            } else if persistence {
+                StorageError::TargetPersistenceUnconfirmed {
+                    path,
+                    source: StorageRoleFailure::Entry(
+                        EntryOperationFailure::new(
+                            StoragePath::new("payload").map_err(StorageError::from)?,
+                            Operation::Publish,
+                            FailureClass::Protocol,
+                            Transience::Permanent,
+                            "injected target sync failure",
+                        )
+                        .map_err(StorageError::from)?,
+                    ),
+                }
+            } else if present {
+                StorageError::SourceMetadataChanged {
+                    path,
+                    families: vec![MetadataFamily::OwnershipMode],
+                }
+            } else {
+                StorageError::NamespaceRead(NamespaceReadFailure::Operation {
+                    path,
+                    attempts: 3,
+                    first: Box::new(NamespaceReadCause::ObservationTimeout),
+                    last: Box::new(NamespaceReadCause::ObservationTimeout),
+                })
+            };
+            let error = AppError::copy_entry_failure(CopyStep::SourceCleanup, Path::new("payload"), source);
+            let error = AppError::MigrationFinalizationFailed {
+                source: Box::new(error),
+                finalization: DatabaseError::ConfigError("injected finalization failure".into()),
+            };
+            let result = source_cleanup::report_failure(Err(error), &manager).await;
+            let error = result
+                .err()
+                .ok_or_else(|| AppError::ConfigError("cleanup failure disappeared".into()))?;
+            manager.record_task_error(&error).await;
+            let mut state = manager
+                .stats_consumer
+                .as_ref()
+                .ok_or_else(|| AppError::ConfigError("test statistics missing".into()))?
+                .lock()
+                .await;
+            let report = state.to_report(true);
+            assert_eq!(report.task_error_count, 1);
+            assert_eq!(report.target_preserved_count, 1);
+            assert!(matches!(report.detail, ProgressDetail::Full { error_count: 0, .. }));
+            let batch = state
+                .callback
+                .outbox
+                .prepare_batch()
+                .ok_or_else(|| AppError::ConfigError("missing cleanup callback details".into()))?;
+            let event = batch
+                .events
+                .iter()
+                .find(|event| event.code == "target_preserved")
+                .ok_or_else(|| AppError::ConfigError("missing retention event".into()))?;
+            if persistence {
+                assert!(event.message.contains("injected target sync failure"));
+            }
+            if let Some(diagnostic) = purge {
+                assert!(event.message.contains(diagnostic), "{}", event.message);
+            }
+            let retention = event
+                .retention
+                .as_ref()
+                .ok_or_else(|| AppError::ConfigError("missing retention context".into()))?;
+            assert_eq!(retention.scope, RetentionScope::Entry);
+            assert_eq!(retention.source_path.as_deref(), Some("payload"));
+            assert_eq!(retention.target_path.as_deref(), Some("payload"));
+            assert_eq!(
+                retention.source_presence,
+                if present {
+                    SourcePresence::Present
+                } else {
+                    SourcePresence::Unknown
+                }
+            );
+            assert_eq!(
+                retention.reason,
+                if purge.is_some() {
+                    TargetRetentionReason::SourceDeletionUnconfirmed
+                } else if persistence {
+                    TargetRetentionReason::TargetPersistenceUnconfirmed
+                } else if present {
+                    TargetRetentionReason::StaleEvidence
+                } else {
+                    TargetRetentionReason::SourceQueryFailed
+                }
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn already_reported_version_failure_is_not_counted_again_at_task_finish() -> Result<()> {
+        let stats = StatisticConsumer {
+            stats: StatsKind::Full(FullStats::new(
+                JobType::Copy,
+                "version-failure".into(),
+                String::new(),
+                String::new(),
+            )),
+            progress_bar: ProgressBar::new(JobType::Copy),
+            job_dir: String::new(),
+            callback_url: None,
+            generation_committed: None,
+            migration: None,
+            pb_handle: None,
+            scan_snapshot: None,
+            callback: Default::default(),
+        };
+        let manager = ConsumerManager {
+            consumers: vec![],
+            stats_consumer: Some(Arc::new(Mutex::new(stats))),
+            callback_guard: None,
+            notification_database: None,
+            copy_pipeline_prepared: false,
+            copy_database_execution: None,
+        };
+        let source = AppError::CopyError("version v2 upload refused".into());
+        let failure = AppError::ReportedCopyFailure {
+            source: Box::new(source),
+            data_failed: true,
+        };
+        let entry = observation(
+            BackendKind::S3,
+            "payload".into(),
+            EntryKind::File,
+            7,
+            [0; 3],
+            None,
+            None,
+            None,
+            Some((Some("v2".into()), true, false)),
+        );
+        manager
+            .record_statistics([StorageEntryMessage::CopyVersionFailed {
+                entry: Arc::new(entry).into(),
+                phase: "Publish".into(),
+                backend: BackendKind::S3,
+                reason: failure.to_string(),
+                first_in_entry: true,
+            }])
+            .await;
+        manager.record_task_error(&failure).await;
+        let consumer = manager
+            .stats_consumer
+            .as_ref()
+            .ok_or_else(|| AppError::CopyError("test statistics missing".into()))?
+            .lock()
+            .await;
+        assert!(matches!(
+            consumer.to_report(true).detail,
+            ProgressDetail::Full { error_count: 1, .. }
+        ));
+        Ok(())
+    }
 
     #[tokio::test]
     async fn reconciled_special_events_keep_callback_totals_and_checkpoint_counts() -> Result<()> {
@@ -664,6 +1049,7 @@ mod resume_tests {
             job_dir: String::new(),
             callback_url: None,
             generation_committed: None,
+            migration: None,
             pb_handle: None,
             scan_snapshot: None,
             callback: Default::default(),
@@ -672,12 +1058,15 @@ mod resume_tests {
             consumers: vec![],
             stats_consumer: Some(Arc::new(Mutex::new(stats))),
             callback_guard: None,
+            notification_database: None,
+            copy_pipeline_prepared: false,
+            copy_database_execution: None,
         };
         let special: StorageEntryRecord = serde_json::from_value(serde_json::json!({
             "name":"fifo", "relative_path":"fifo", "size":0, "ext":null, "ctime":0, "mtime":0, "atime":0,
             "mode":null, "storage_type":"nas", "is_symlink":false, "is_dir":false, "is_regular_file":false,
             "hard_links":1, "current_state":0, "uid":null, "gid":null, "ino":null, "file_handle":null,
-            "version_id":"", "tags":null
+            "version_id":"", "tags":null, "metadata_digests":[]
         }))?;
         manager
             .record_final_events(&[
@@ -779,11 +1168,16 @@ mod resume_tests {
             job_dir: String::new(),
             callback_url: None,
             generation_committed: None,
+            migration: None,
             pb_handle: None,
             scan_snapshot: None,
             callback: Default::default(),
         };
         stats.progress_bar.restore(&ProgressReport {
+            target_preserved_count: 0,
+            skipped_count: 0,
+            diagnostics_complete: false,
+            task_error_count: 0,
             job_id: "resume".into(),
             job_type: "scan".into(),
             elapsed_secs: 12.0,
@@ -802,11 +1196,15 @@ mod resume_tests {
             diagnostics: None,
             scan_runtime: None,
             generation_committed: None,
+            migration: None,
         })?;
         let manager = ConsumerManager {
             consumers: vec![],
             stats_consumer: Some(Arc::new(Mutex::new(stats))),
             callback_guard: None,
+            notification_database: None,
+            copy_pipeline_prepared: false,
+            copy_database_execution: None,
         };
         let json = manager.statistics_checkpoint().await?;
         assert!(
@@ -834,3 +1232,7 @@ mod resume_tests {
         Ok(())
     }
 }
+
+#[cfg(test)]
+#[path = "purge_reporting_tests.rs"]
+mod purge_reporting_tests;

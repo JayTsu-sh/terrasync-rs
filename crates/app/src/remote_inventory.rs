@@ -4,10 +4,39 @@ use crate::scan::source::WalkOptions;
 use crate::storage_factory::StorageContext;
 use async_channel::Receiver;
 use data_mover::traversal::{TraversalItem, TraversalOutcome};
+use std::collections::HashMap;
 use std::sync::Arc;
 use task_model::ObservedEntryExt;
 use task_model::observation::ObservedItem;
 use transport::directory::{DirPageResult, NdxEntry};
+
+/// NDX → `ObservedEntry` 的映射表
+#[derive(Debug, Default)]
+pub(crate) struct NdxTable {
+    entries: HashMap<i32, ObservedItem>,
+}
+
+impl NdxTable {
+    /// 从 `DirPageResult` 批量插入
+    pub(crate) fn ingest_page(&mut self, page: &DirPageResult) {
+        for nf in &page.files {
+            self.entries.insert(nf.ndx, nf.entry.clone());
+        }
+        for ns in &page.subdirs {
+            self.entries.insert(ns.ndx, ns.entry.clone());
+        }
+    }
+
+    /// 按 NDX 查找 entry
+    pub(crate) fn get(&self, ndx: i32) -> Option<&ObservedItem> {
+        self.entries.get(&ndx)
+    }
+
+    /// 当前条目数
+    pub(crate) fn len(&self) -> usize {
+        self.entries.len()
+    }
+}
 
 /// 远端清单生成器交付的产品事件。
 #[derive(Debug)]

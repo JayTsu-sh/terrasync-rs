@@ -33,9 +33,14 @@ pub const SCAN_STATE_TABLE_BASE_NAME: &str = "state";
 pub const TAR_MANIFEST_TABLE_BASE_NAME: &str = "tar_manifest";
 
 // 类型重导出，方便外部使用
-pub use catalogue::{ClickHouseDatabase, CopyGenerationStatus, DeletionStatus};
+pub use catalogue::{
+    ClickHouseDatabase, CopyGenerationStatus, DeletionStatus, MAX_NOTIFICATION_BATCH_BYTES,
+    MAX_NOTIFICATION_BATCH_RECORDS, MAX_NOTIFICATION_RECORD_BYTES, NotificationCursor, NotificationKind,
+    NotificationRecord,
+};
 pub use config::ClickHouseConfig; // 配置相关类型
 pub use error::{DatabaseError, Result}; // 错误处理相关类型
+pub use execution::DatabaseExecutionMonitor;
 
 /// 根据 `job_id` 生成扫描基础表名
 ///
@@ -88,5 +93,9 @@ pub(crate) fn generate_scan_temp_table_name() -> String {
 #[cfg(test)]
 #[path = "../../../tests/support/observed.rs"]
 mod observed_fixtures;
+
+#[cfg(test)]
+#[path = "../../../tests/support/migration.rs"]
+mod migration_fixtures;
 
 pub use schema::entry::EntrySummary;

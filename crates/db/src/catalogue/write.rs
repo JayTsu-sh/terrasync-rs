@@ -4,24 +4,23 @@ use std::sync::Arc;
 
 use data_mover::model::ObservedEntry;
 use serde_json::Value;
-use task_model::StorageEntryMessage;
-use task_model::observation::{ObservedItem, ObservedView, ObservedViews};
+use task_model::observation::ObservedItem;
+use task_model::{CopyCompletion, CopyReadiness, StorageEntryMessage};
 use tracing::trace;
 use tracing::{debug, info};
 
 use super::ClickHouseDatabase;
+use super::versions::{CatalogueInputs, CatalogueViews};
 use crate::error::{DatabaseError, Result};
-use crate::execution::queries::ScanExecute;
-use crate::execution::queries::check_scan_cancellation;
+use crate::execution::queries::{
+    ScanExecute, check_scan_cancellation, execute_request, execution_active, idempotent_insert_client,
+};
+use crate::execution::recovery::RequestSafety;
 use crate::get_incremental_scan_base_table_name;
 use crate::get_scan_base_table_name;
 use crate::get_tar_manifest_table_name;
 use crate::scan::rows::NativeScanRecord;
 use crate::schema::records::{IncrementalStorageEntryRecord, TarManifestRecord};
-
-fn observation_views(entry: &Arc<ObservedEntry>) -> ObservedViews<'_> {
-    ObservedView::all(entry)
-}
 
 impl ClickHouseDatabase {
     /// 执行SQL语句，支持参数化查询
@@ -74,32 +73,42 @@ impl ClickHouseDatabase {
     }
 
     /// 通用批量插入方法，支持同步和异步客户端模式
-    pub(super) async fn batch_insert<'a>(
-        &self, table_name: &str, records: &'a [Arc<ObservedEntry>], use_async_client: bool,
+    pub(super) async fn batch_insert(
+        &self, table_name: &str, records: &[Arc<ObservedEntry>], use_async_client: bool,
     ) -> Result<()> {
-        self.insert_views(
-            table_name,
-            Box::new(records.iter().flat_map(observation_views)),
-            use_async_client,
-        )
-        .await
+        self.insert_copy_views(table_name, CatalogueInputs::Observed(records), use_async_client)
+            .await
     }
 
-    pub(super) async fn insert_views<'a>(
-        &self, table_name: &str, views: Box<dyn Iterator<Item = ObservedView<'a>> + Send + 'a>, use_async_client: bool,
+    async fn insert_copy_views(
+        &self, table_name: &str, inputs: CatalogueInputs<'_>, use_async_client: bool,
     ) -> Result<()> {
-        let mut views = views.peekable();
+        check_scan_cancellation()?;
+        let _base = self.base_write_guard().await?;
+        let versions = self.catalogue_versions().await;
+        let mut views = CatalogueViews::new(inputs, versions).peekable();
         if views.peek().is_none() {
             return Ok(());
         }
         let current_state = self.get_cached_scan_state().await?;
+        let (copy_execution_id, copy_sequence) = {
+            let lifecycle = self.generation_lifecycle.lock().await;
+            if lifecycle.copy_generation.is_some() && lifecycle.working.is_none() {
+                return Err(DatabaseError::CopyExecutionUnavailable);
+            }
+            (
+                lifecycle.copy_execution_id.clone().unwrap_or_default(),
+                lifecycle
+                    .copy_generation
+                    .as_ref()
+                    .map_or(0, |generation| generation.sequence),
+            )
+        };
         let _write = self.catalogue_write_guard().await;
         debug!(
             "During batch inserting to table {}, current_state: {:?}",
             table_name, current_state
         );
-
-        let mut record_count = 0;
 
         let client = if use_async_client {
             &self.async_client
@@ -107,19 +116,38 @@ impl ClickHouseDatabase {
             &self.sync_client
         };
         let client = self.catalogue_write_client(client).with_validation(false);
+        // 同一逻辑批次共用去重身份；有恢复作用域时用同步批次提交，避免异步缓冲确认不明。
+        let client = if execution_active() {
+            idempotent_insert_client(&client).with_option("async_insert", "0")
+        } else {
+            client
+        };
+        // W、执行身份、顺序和版本槽在恢复循环外冻结，重试不改变记录语义。
+        let record_count = execute_request(RequestSafety::IdempotentWrite, || async {
+            let mut record_count = 0;
+            let mut insert = client
+                .insert::<NativeScanRecord>(table_name)
+                .await
+                .map_err(DatabaseError::from)?;
 
-        let mut insert = client
-            .insert::<NativeScanRecord>(table_name)
-            .await
-            .map_err(DatabaseError::from)?;
+            for (view, completion) in CatalogueViews::new(inputs, versions) {
+                let mut record = NativeScanRecord::capture(view, current_state)?;
+                if let Some(completion) = completion {
+                    record.copy_path_confirmed = completion.readiness == CopyReadiness::Ready;
+                    record.copy_data_confirmed = true;
+                    record.copy_target_version = completion.target_version.as_deref();
+                }
+                record.version_id = versions.key(view);
+                record.copy_execution_id = &copy_execution_id;
+                record.copy_sequence = copy_sequence;
+                insert.write(&record).await.map_err(DatabaseError::from)?;
+                record_count += 1;
+            }
 
-        for view in views {
-            let record = NativeScanRecord::capture(view, current_state)?;
-            insert.write(&record).await.map_err(DatabaseError::from)?;
-            record_count += 1;
-        }
-
-        insert.end().await.map_err(DatabaseError::from)?;
+            insert.end().await.map_err(DatabaseError::from)?;
+            Ok(record_count)
+        })
+        .await?;
 
         info!("Successfully inserted {} records to table {}", record_count, table_name);
         Ok(())
@@ -186,7 +214,13 @@ impl ClickHouseDatabase {
 
     pub async fn batch_insert_completed_records(&self, records: &[ObservedItem]) -> Result<()> {
         let table = get_scan_base_table_name(&self.job_id);
-        self.insert_views(&table, Box::new(records.iter().map(ObservedItem::view)), true)
+        self.insert_copy_views(&table, CatalogueInputs::Selected(records), true)
+            .await
+    }
+
+    pub async fn batch_insert_copy_completions(&self, records: &[CopyCompletion]) -> Result<()> {
+        let table = get_scan_base_table_name(&self.job_id);
+        self.insert_copy_views(&table, CatalogueInputs::Copied(records), true)
             .await
     }
 

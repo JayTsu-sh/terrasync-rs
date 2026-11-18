@@ -14,7 +14,7 @@ pub(super) struct PackageFilter {
 impl PackageFilter {
     pub(super) fn new(options: &WalkOptions) -> Self {
         Self {
-            dsl: DslTraversalFilter::new(options.match_expressions.clone(), options.exclude_expressions.clone()),
+            dsl: options.dsl_filter(),
             enabled: options.packaged && options.match_expressions.is_some(),
             extra_depth: options.package_depth,
             maximum: options.depth.filter(|v| *v > 0),

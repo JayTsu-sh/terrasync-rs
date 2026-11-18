@@ -1,9 +1,8 @@
 use std::sync::Arc;
 
-use app::consumer::ProgressReport;
-use app::consumer::stats::ProgressDetail;
-use app::consumer::stats::diagnostics::{CallbackAck, safe_diagnostic_text};
+use app::report::{ProgressDetail, ProgressReport};
 use serde::Deserialize;
+use task_model::diagnostics::{CallbackAck, safe_diagnostic_text};
 use tracing::info;
 
 use crate::domain::execution::{ExecutionStats, LogLevel, TaskExecution, TaskLog};
@@ -310,6 +309,7 @@ fn execution_stats_from_report(report: &ProgressReport) -> ExecutionStats {
             transferred_bytes,
             error_count,
         } => ExecutionStats {
+            skipped_count: report.skipped_count,
             scanned_files: *scanned_files,
             scanned_dirs: *scanned_dirs,
             total_bytes: *total_bytes,
@@ -329,6 +329,7 @@ fn execution_stats_from_report(report: &ProgressReport) -> ExecutionStats {
             error_count,
             ..
         } => ExecutionStats {
+            skipped_count: report.skipped_count,
             scanned_files: scanned_files.saturating_add(*scanned_symlinks),
             scanned_dirs: *scanned_dirs,
             total_bytes: *scanned_size,
@@ -353,7 +354,7 @@ mod configuration_tests {
     #[test]
     fn execution_summary_includes_incremental_symlinks() -> Result<()> {
         let report: ProgressReport = serde_json::from_value(serde_json::json!({
-            "job_id":"links", "job_type":"IncrementalScan", "elapsed_secs":1.0,
+            "target_preserved_count":0, "job_id":"links", "job_type":"IncrementalScan", "elapsed_secs":1.0,
             "speed_bytes_per_sec":0.0, "is_final":true,
             "detail":{"kind":"Incremental", "scanned_files":10, "scanned_dirs":2,
                 "scanned_symlinks":4, "scanned_size":0, "transferred_bytes":0,

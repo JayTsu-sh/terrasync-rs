@@ -6,8 +6,8 @@ use std::time::{Instant, SystemTime};
 
 // 外部crate
 use serde::{Deserialize, Serialize};
-use task_model::observation::{EntryStatistics, ObservedView};
-use task_model::{ErrorEvent, StorageEntryMessage};
+use task_model::observation::{EntryProgress, EntryStatistics, ObservedView};
+use task_model::{EntryChange, ErrorEvent, StorageEntryMessage};
 use tracing::trace;
 
 // 内部模块
@@ -146,6 +146,7 @@ pub fn format_bytes(bytes: f64, with_decimals: bool) -> String {
 /// 按目录、普通文件、软链接和其余类型保存数量与大小
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FullStats {
+    pub skipped_count: u64,
     // 类型计数及大小
     pub dir_count: usize,
     pub dir_size: i64,
@@ -194,6 +195,7 @@ impl FullStats {
         );
         result.set_scan_counts(counts);
         result.error_stats = self.error_stats.clone();
+        result.skipped_count = self.skipped_count;
         result.start_time = self.start_time;
         result
     }
@@ -210,6 +212,7 @@ impl FullStats {
     }
     pub fn new(job_type: JobType, job_id: String, command: String, log_path: String) -> Self {
         Self {
+            skipped_count: 0,
             dir_count: 0,
             dir_size: 0,
             regular_file_count: 0,
@@ -254,29 +257,30 @@ impl FullStats {
     /// 根据 entry 类型更新对应维度的统计
     pub fn update(&mut self, entry: &impl EntryStatistics) {
         let size = entry.get_size() as i64;
+        let count = entry.entry_count();
         let name_len = entry.get_name().len();
 
-        self.total_name_length += name_len as i64;
+        self.total_name_length += (name_len * count) as i64;
         if name_len > self.max_name_length {
             self.max_name_length = name_len;
         }
 
         if entry.get_is_dir() {
-            self.dir_count += 1;
+            self.dir_count += count;
             self.dir_size += size;
             let depth = calculate_depth(entry.get_relative_path());
-            self.total_dir_depth += depth as i64;
+            self.total_dir_depth += (depth * count) as i64;
             if depth > self.max_dir_depth {
                 self.max_dir_depth = depth;
             }
         } else if entry.get_is_symlink() {
-            self.symlink_count += 1;
+            self.symlink_count += count;
             self.symlink_size += size;
         } else if entry.get_is_regular_file() {
-            self.regular_file_count += 1;
+            self.regular_file_count += count;
             self.regular_file_size += size;
         } else {
-            self.other_entry_count += 1;
+            self.other_entry_count += count;
             self.other_entry_size += size;
         }
         self.update_distributions(entry, entry.get_is_regular_file());
@@ -285,25 +289,27 @@ impl FullStats {
     /// 扫描标量只取目录确认快照；此处只观察可选分布，不再累加条目数。
     pub(crate) fn update_distributions(&mut self, entry: &impl EntryStatistics, regular: bool) {
         let size = entry.get_size() as i64;
+        let count = entry.entry_count();
         if regular {
             if let Some(ext) = entry.get_extension() {
                 let value = self.extension_stats.entry(ext.to_lowercase()).or_insert((0, 0));
                 value.0 += size;
-                value.1 += 1;
+                value.1 += count;
             }
-            let range = calculate_file_size_range(entry.get_size());
+            let range = calculate_file_size_range(entry.distribution_size());
             let value = self.file_size_range_stats.entry(range).or_insert((0, 0));
             value.0 += size;
-            value.1 += 1;
+            value.1 += count;
         }
         let range = calculate_time_range(entry.get_mtime());
         let value = self.time_range_stats.entry(range).or_insert((0, 0));
         value.0 += size;
-        value.1 += 1;
+        value.1 += count;
     }
 
     pub fn update_from_message(&mut self, message: &StorageEntryMessage) {
         match message {
+            StorageEntryMessage::CopySkipped { .. } => self.skipped_count = self.skipped_count.saturating_add(1),
             StorageEntryMessage::Scanned(entry)
             | StorageEntryMessage::Packaged(entry)
             | StorageEntryMessage::IntegrityChecked(entry) => {
@@ -312,8 +318,19 @@ impl FullStats {
                     self.update(&view);
                 }
             }
-            StorageEntryMessage::New(item) => self.update(&item.view()),
+            StorageEntryMessage::New(item) if item.entry.history().is_none() => self.update(&item.view()),
+            StorageEntryMessage::CopyEntryCompleted { entry, logical_bytes } => {
+                self.update(&EntryProgress {
+                    entry,
+                    logical_bytes: *logical_bytes,
+                    count_entry: true,
+                    distribution_bytes: None,
+                });
+            }
             StorageEntryMessage::Error { event, .. } => self.error_stats.record(*event),
+            StorageEntryMessage::CopyVersionFailed {
+                first_in_entry: true, ..
+            } => self.error_stats.record(ErrorEvent::Copy),
             _ => {}
         }
     }
@@ -354,6 +371,7 @@ impl fmt::Display for FullStats {
         writeln!(f, "   └─ Total Time: {elapsed:.1}s")?;
         writeln!(f)?;
 
+        writeln!(f, "  Skipped entries: {}", self.skipped_count)?;
         writeln!(f, "  Basic Statistics:")?;
         #[rustfmt::skip]
         writeln!(f, "   ├─ Dirs:          {:>12}  ({})", self.dir_count, format_bytes(self.dir_size as f64, true))?;
@@ -483,16 +501,16 @@ impl DeltaCounts {
     pub fn add(&mut self, entry: &impl EntryStatistics) {
         let size = entry.get_size() as i64;
         if entry.get_is_dir() {
-            self.dir_count += 1;
+            self.dir_count += entry.entry_count();
             self.dir_size += size;
         } else if entry.get_is_symlink() {
-            self.symlink_count += 1;
+            self.symlink_count += entry.entry_count();
             self.symlink_size += size;
         } else if entry.get_is_regular_file() {
-            self.regular_file_count += 1;
+            self.regular_file_count += entry.entry_count();
             self.regular_file_size += size;
         } else {
-            self.other_entry_count += 1;
+            self.other_entry_count += entry.entry_count();
             self.other_entry_size += size;
         }
     }
@@ -500,6 +518,7 @@ impl DeltaCounts {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IncrementalStats {
+    pub skipped_count: u64,
     pub scanned: FullStats,
     pub new: DeltaCounts,
     pub changed: DeltaCounts,
@@ -521,6 +540,7 @@ impl IncrementalStats {
         // scanned 的元数据字段填充（仅用于分布统计，不用于最终 Display）
         let scanned = FullStats::new(job_type.clone(), job_id.clone(), command.clone(), log_path.clone());
         Self {
+            skipped_count: 0,
             scanned,
             new: DeltaCounts::default(),
             changed: DeltaCounts::default(),
@@ -537,13 +557,38 @@ impl IncrementalStats {
 
     pub fn update_from_message(&mut self, message: &StorageEntryMessage) {
         match message {
+            StorageEntryMessage::CopySkipped { .. } => self.skipped_count = self.skipped_count.saturating_add(1),
             StorageEntryMessage::Scanned(entry) | StorageEntryMessage::Packaged(entry) => {
                 for view in ObservedView::all(entry) {
                     self.scanned.update(&view);
                 }
             }
-            StorageEntryMessage::New(item) => self.new.add(&item.view()),
-            StorageEntryMessage::Changed { entry, .. } => self.changed.add(&entry.view()),
+            StorageEntryMessage::New(item)
+                if self.job_type != JobType::IncrementalCopy || item.entry.history().is_none() =>
+            {
+                self.new.add(&item.view())
+            }
+            StorageEntryMessage::Changed { entry, .. }
+                if self.job_type != JobType::IncrementalCopy || entry.entry.history().is_none() =>
+            {
+                self.changed.add(&entry.view())
+            }
+            StorageEntryMessage::CopyEntryDeltaCompleted {
+                entry,
+                change,
+                logical_bytes,
+            } => {
+                let progress = EntryProgress {
+                    entry,
+                    logical_bytes: *logical_bytes,
+                    count_entry: true,
+                    distribution_bytes: None,
+                };
+                match change {
+                    EntryChange::New => self.new.add(&progress),
+                    EntryChange::Changed(_) => self.changed.add(&progress),
+                }
+            }
             StorageEntryMessage::Deleted(entry) => {
                 for view in ObservedView::all(entry) {
                     self.deleted.add(&view);
@@ -555,6 +600,9 @@ impl IncrementalStats {
                 }
             }
             StorageEntryMessage::Error { event, .. } => self.error_stats.record(*event),
+            StorageEntryMessage::CopyVersionFailed {
+                first_in_entry: true, ..
+            } => self.error_stats.record(ErrorEvent::Copy),
             _ => {}
         }
     }
@@ -645,6 +693,7 @@ impl fmt::Display for IncrementalStats {
         writeln!(f, "   └─ Avg Dir Depth: {avg_dir_depth:>15.1}")?;
         writeln!(f)?;
 
+        writeln!(f, "  Skipped entries: {}", self.skipped_count)?;
         fmt_time_range_table(f, &s.time_range_stats, s.total_count(), s.total_size())?;
         fmt_file_size_range_table(f, &s.file_size_range_stats, s.regular_file_count, s.regular_file_size)?;
         fmt_top_extensions(f, s.get_top_extensions(), s.regular_file_count, s.regular_file_size)?;
@@ -665,10 +714,17 @@ pub enum StatsKind {
 }
 
 impl StatsKind {
+    pub fn skipped_count(&self) -> u64 {
+        match self {
+            Self::Full(stats) => stats.skipped_count,
+            Self::Incremental(stats) => stats.skipped_count,
+        }
+    }
     pub(crate) fn scan_prefix(&self, counts: &ScanCounts) -> Self {
         match self {
             Self::Full(value) => Self::Full(value.scan_prefix(counts)),
             Self::Incremental(value) => Self::Incremental(IncrementalStats {
+                skipped_count: value.skipped_count,
                 scanned: value.scanned.scan_prefix(counts),
                 new: value.new.clone(),
                 changed: value.changed.clone(),

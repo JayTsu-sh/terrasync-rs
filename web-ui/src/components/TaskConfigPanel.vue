@@ -27,6 +27,7 @@ const configItems = computed<ConfigItem[]>(() => {
   }
   items.push({ label: '并发度', value: props.task.config.concurrency == null ? '使用全局设置' : String(props.task.config.concurrency) })
   if (props.task.task_type === 'scan') items.push({ label: '断点续扫', value: props.task.config.scan_resume ? '启用' : '未启用' })
+  if (props.task.task_type === 'sync') items.push({ label: '文件断点续传', value: props.task.config.copy_resume ? '启用' : '未启用' })
   if (props.task.task_type === 'scan') items.push({ label: '扫描深度', value: props.task.config.depth ? String(props.task.config.depth) : '不限' })
   if (showAdvanced.value) {
     items.push({ label: '完整性检查', value: props.task.config.enable_integrity_check ? '是' : '否' })

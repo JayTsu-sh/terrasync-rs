@@ -1,4 +1,10 @@
+use std::iter;
+
 use data_mover::error::StorageError as NativeStorageError;
+use data_mover::integrity::IntegritySide as NativeIntegritySide;
+use data_mover::metadata::MetadataVerificationError;
+use data_mover::model::MetadataFamily;
+use data_mover::model::MetadataObservationFailure;
 use data_mover::qos::SourceQosSetupError;
 use data_mover::storage::EntryObservationFailure;
 use task_model::TaskModelError;
@@ -12,10 +18,10 @@ use data_mover::{
     probes::ProbeFailure,
     storage::{
         BackendConnectError, CapabilityUnavailable, CreateDirectoryAllFailure, DeleteTreeTerminalFailure,
-        StorageRoleFailure,
+        NamespaceReadFailure, PurgeFailure, StorageRoleFailure,
     },
     tar_pack::TarFailure,
-    transfer::{DirectPatchError, MoveFailure, TransferFailure, TransferValueError},
+    transfer::{DirectPatchError, TransferFailure, TransferOutcome, TransferValueError},
     traversal::{
         FailureScope, ObservationFailure, ScanSetupError, TraversalConfigurationError, TraversalTerminalFailure,
     },
@@ -23,6 +29,77 @@ use data_mover::{
 use task_model::TransferMode;
 #[derive(Debug, thiserror::Error)]
 pub enum StorageError {
+    #[error(transparent)]
+    NamespaceRead(#[from] NamespaceReadFailure),
+    #[error(transparent)]
+    MetadataVerification(#[from] MetadataVerificationError),
+    #[error("目标发布状态与复制结果不一致，禁止删源: {path}")]
+    TargetPublicationChanged { path: StoragePath },
+    #[error("目标端持久化确认失败，保留源端: {path}: {source}; {}", role_diagnostic(.source))]
+    TargetPersistenceUnconfirmed {
+        path: StoragePath,
+        #[source]
+        source: StorageRoleFailure,
+    },
+    #[error("删源前数据全量校验未完成，保留源端: {path}, side={side:?}: {source}; {}", role_diagnostic(.source))]
+    SourceCleanupContentUnverified {
+        path: StoragePath,
+        side: NativeIntegritySide,
+        #[source]
+        source: StorageRoleFailure,
+    },
+    #[error("源端受保护清理失败，保留未确认删除的源项: {path}: {source}; {}", role_diagnostic(.source.source.as_ref()))]
+    SourcePurgeRefused {
+        path: StoragePath,
+        #[source]
+        source: PurgeFailure,
+    },
+    #[error("复制后源端元数据发生变化，保留源端: {path}, families={families:?}")]
+    SourceMetadataChanged {
+        path: StoragePath,
+        families: Vec<MetadataFamily>,
+    },
+    #[error("源端元数据获取失败，禁止删源: {path} version={version:?}, failures={failures:?}")]
+    SourceMetadataAcquisitionFailed {
+        path: StoragePath,
+        version: Option<String>,
+        failures: Vec<MetadataObservationFailure>,
+    },
+    #[error("复制失败: {data}; 元数据处理同时失败: {metadata}")]
+    TransferAndMetadata {
+        #[source]
+        data: Box<StorageError>,
+        metadata: Box<StorageError>,
+    },
+    #[error("数据已发布，但元数据未就绪，禁止删源: {source}")]
+    PublishedDataMetadata {
+        data: Box<TransferOutcome>,
+        #[source]
+        source: Box<StorageError>,
+    },
+    #[error("缺少实际目标版本映射，保留数据且不重新发布旧版本: {path} source_version={source_version}")]
+    TargetVersionUnconfirmed { path: StoragePath, source_version: String },
+    #[error(
+        "历史数据发布结果未确认，保留所有源和目标版本，禁止重放旧数据及继续发布后续版本: {path} source_version={source_version}"
+    )]
+    HistoricalPublicationUnconfirmed { path: StoragePath, source_version: String },
+    #[error("历史整体就绪未确认，保留源历史: {path}: {reason}")]
+    HistoryCleanupUnconfirmed { path: StoragePath, reason: &'static str },
+    #[error("历史删源核验失败，保留源历史: {path} source_version={version} target_version={target_version:?} phase={phase}: {source}; {}", history_diagnostic(.source))]
+    HistoryCleanupVerification {
+        path: StoragePath,
+        version: String,
+        target_version: Option<String>,
+        phase: &'static str,
+        #[source]
+        source: Box<StorageError>,
+    },
+    #[error("源端版本永久清理不可用，已保留所有历史: {path}")]
+    PermanentVersionCleanupUnavailable { path: StoragePath },
+    #[error("无法重新确认版本化源的当前对象，不能认定全部历史已删除，保留源历史: {path}")]
+    SourceHistoryCurrentUnconfirmed { path: StoragePath },
+    #[error("目录标记对象的目标就绪核验尚未接通，保留源对象: {path}")]
+    DirectoryMarkerCleanupUnavailable { path: StoragePath },
     #[error(transparent)]
     Observation(EntryObservationFailure),
     #[error("incomplete object history")]
@@ -63,6 +140,12 @@ pub enum StorageError {
     IoError(#[from] std::io::Error),
     #[error(transparent)]
     TaskJoinError(#[from] JoinError),
+    #[error("stream producer failed: {source}; preceding stream failure: {preceding}")]
+    StreamProducerFailed {
+        #[source]
+        source: JoinError,
+        preceding: Box<StorageError>,
+    },
     #[error(transparent)]
     Role(#[from] StorageRoleFailure),
     #[error(transparent)]
@@ -108,18 +191,41 @@ pub enum StorageError {
     #[error(transparent)]
     Transfer(Box<TransferFailure>),
     #[error(transparent)]
-    Move(Box<MoveFailure>),
-    #[error(transparent)]
     Archive(Box<TarFailure>),
 }
 impl StorageError {
+    pub(crate) fn published_data(&self) -> Option<&TransferOutcome> {
+        match self {
+            Self::PublishedDataMetadata { data, .. } => Some(data),
+            Self::Transfer(error) => error.published_data(),
+            Self::TransferAndMetadata { data, .. } => data.published_data(),
+            _ => None,
+        }
+    }
     pub fn is_not_found(&self) -> bool {
         matches!(self, Self::FileNotFound(_) | Self::DirectoryNotFound(_))
             || matches!(self, Self::Role(StorageRoleFailure::Entry(error)) if error.class() == FailureClass::NotFound)
     }
     pub fn is_cancelled(&self) -> bool {
-        matches!(self, Self::Cancelled)
-            || matches!(self, Self::Role(StorageRoleFailure::Entry(error)) if error.class() == FailureClass::Cancelled)
+        matches!(
+            self,
+            Self::Cancelled | Self::MetadataVerification(MetadataVerificationError::Cancelled)
+        ) || matches!(self, Self::NamespaceRead(NamespaceReadFailure::Cancelled { .. }))
+            || matches!(self,
+                Self::Role(StorageRoleFailure::Entry(error))
+                | Self::TargetPersistenceUnconfirmed { source: StorageRoleFailure::Entry(error), .. }
+                | Self::SourceCleanupContentUnverified { source: StorageRoleFailure::Entry(error), .. }
+                if error.class() == FailureClass::Cancelled)
+            || matches!(self,
+                Self::SourceCleanupContentUnverified { source: StorageRoleFailure::Session(error), .. }
+                if error.class() == FailureClass::Cancelled)
+            || matches!(self, Self::SourcePurgeRefused { source, .. } if
+            iter::once(source.source.as_ref()).chain(source.additional.iter().map(|(_, cause)| cause))
+            .any(|cause| match cause {
+                StorageRoleFailure::Entry(cause) => cause.class() == FailureClass::Cancelled,
+                StorageRoleFailure::Session(cause) => cause.class() == FailureClass::Cancelled,
+            }))
+            || matches!(self, Self::HistoryCleanupVerification { source, .. } if source.is_cancelled())
             || matches!(self, Self::DirectPatch(error) if error.is_cancelled())
     }
 }
@@ -128,16 +234,29 @@ impl From<TransferFailure> for StorageError {
         Self::Transfer(Box::new(value))
     }
 }
+// role 的 Display 只展示类别；这里显式选用契约已脱敏的诊断供任务日志及 callback 使用。
+fn history_diagnostic(error: &StorageError) -> &str {
+    match error {
+        StorageError::Role(cause)
+        | StorageError::TargetPersistenceUnconfirmed { source: cause, .. }
+        | StorageError::SourceCleanupContentUnverified { source: cause, .. }
+        | StorageError::MetadataVerification(MetadataVerificationError::Read(cause)) => role_diagnostic(cause),
+        _ => "",
+    }
+}
+
+fn role_diagnostic(source: &StorageRoleFailure) -> &str {
+    match source {
+        StorageRoleFailure::Entry(error) => error.diagnostic(),
+        StorageRoleFailure::Session(error) => error.diagnostic(),
+    }
+}
+
 pub type Result<T> = std::result::Result<T, StorageError>;
 pub(crate) fn operation(error: impl Into<String>) -> StorageError {
     StorageError::OperationError(error.into())
 }
 
-impl From<MoveFailure> for StorageError {
-    fn from(value: MoveFailure) -> Self {
-        Self::Move(Box::new(value))
-    }
-}
 impl From<TarFailure> for StorageError {
     fn from(value: TarFailure) -> Self {
         Self::Archive(Box::new(value))

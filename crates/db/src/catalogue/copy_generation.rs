@@ -1,67 +1,127 @@
-//! 复制目录仅在物理操作与数据库确认全部完成后结束轮次；失败轮次保守重放。
-
-use std::collections::HashSet;
-use std::sync::atomic::Ordering;
-
-use clickhouse::error::Error as ClickHouseError;
+//! 先记录已接受策略，再准备本执行的基线；上一删源轮次一律重新全量。
 use serde::Deserialize;
 use serde_json::Value;
+use std::collections::HashSet;
+use std::sync::atomic::Ordering;
+use task_model::migration::{
+    CopyGeneration, CopyGenerationPhase, CopyGenerationPlan, CopyRequestDescriptor, MigrationMode,
+};
 
 use super::ClickHouseDatabase;
-use super::lifecycle::ScanGenerationLifecycle;
-use crate::DeletionStatus;
 use crate::error::{DatabaseError, Result};
 use crate::execution::read::QuorumRead;
-use crate::get_scan_base_table_name;
-use crate::get_scan_state_table_name;
 use crate::schema::columns::CATALOGUE_COLUMNS as FILE_SCAN_COLUMNS_LIST;
 use crate::schema::records::StorageEntryRecord;
+use crate::{DeletionStatus, get_scan_base_table_name, get_scan_state_table_name};
 
-/// Whether an unfinished copy generation must replay unacknowledged target operations.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CopyGenerationStatus {
-    /// 首轮或上一轮全部确认成功，沿用正常增量比较。
     Fresh,
-    /// 上轮复制没有确认完成，必须重放源项或拒绝不安全的恢复。
     Recovering,
 }
 
 #[derive(Deserialize, clickhouse::Row)]
+#[cfg_attr(test, derive(serde::Serialize))]
 struct CopyState {
     scan_state: u8,
-    baseline_committed: bool,
-    copy_in_progress: bool,
-    copy_request_key: String,
+    copy_execution_id: String,
 }
 
+#[cfg(test)]
+#[path = "copy_generation_real_tests.rs"]
+mod real_tests;
+#[cfg(test)]
+#[path = "copy_generation_tests.rs"]
+mod tests;
+
 impl ClickHouseDatabase {
-    pub async fn begin_copy_generation(&self, request_key: &str) -> Result<CopyGenerationStatus> {
-        if request_key.is_empty() {
-            return Err(DatabaseError::ConfigError(
-                "copy generation requires a source/destination recovery binding".into(),
-            ));
-        }
+    /// 同一执行域只接受一次代次；调用方持有 job 独占权，不能把它当作跨主机锁。
+    pub async fn begin_copy_generation(&self, request: &CopyRequestDescriptor) -> Result<CopyGenerationStatus> {
+        request.validate()?;
         let mut lifecycle = self.generation_lifecycle.lock().await;
-        let saved = self.copy_generation_state().await?;
-        let previous = saved.scan_state;
-        let recovering = saved.copy_in_progress || (!saved.baseline_committed && self.copy_base_has_rows().await?);
-        if recovering && (saved.copy_request_key.is_empty() || saved.copy_request_key != request_key) {
-            return Err(DatabaseError::ConfigError("incomplete copy belongs to unknown or different source/destination/options; restore the original settings or choose a new job id".into()));
+        if lifecycle.copy_generation.is_some() {
+            return Err(DatabaseError::CopyGenerationInvalid {
+                field: "execution_scope_reused",
+            });
         }
-        let working = 1 - previous;
-        if recovering {
-            let base = self.catalogue_storage_table(&get_scan_base_table_name(&self.job_id))?;
-            self.execute(&format!("ALTER TABLE {base} UPDATE current_state={previous} WHERE current_state!={previous} SETTINGS mutations_sync=2"), &[]).await?;
+        self.create_copy_runs_table().await?;
+        let previous = self.latest_copy_generation().await?;
+        let available = if let Some(previous) = &previous {
+            self.copy_baseline_available(previous).await?
+        } else {
+            if self.table_exists(&get_scan_state_table_name(&self.job_id)).await?
+                && !self.copy_generation_state().await?.copy_execution_id.is_empty()
+            {
+                return Err(DatabaseError::CopyGenerationInvalid {
+                    field: "binding_unavailable",
+                });
+            }
+            false
+        };
+        let plan = CopyGenerationPlan::decide(request, previous.as_ref(), available)?;
+        if previous
+            .as_ref()
+            .is_some_and(|prior| prior.request.execution_id == request.execution_id)
+        {
+            return Err(DatabaseError::CopyGenerationInvalid {
+                field: "execution_id_reused",
+            });
+        }
+        let sequence = previous
+            .as_ref()
+            .map_or(0, |prior| prior.sequence)
+            .checked_add(1)
+            .ok_or(DatabaseError::CopyGenerationInvalid {
+                field: "sequence_overflow",
+            })?;
+        let recovering = plan.mode == MigrationMode::Incremental
+            && previous
+                .as_ref()
+                .is_some_and(|prior| prior.phase != CopyGenerationPhase::Completed);
+        lifecycle.copy_generation = Some(CopyGeneration {
+            root_snapshot: None,
+            sequence,
+            revision: 1,
+            request: request.clone(),
+            plan,
+            phase: CopyGenerationPhase::Accepted,
+            baseline_prepared: false,
+        });
+        // 接受记录在清基线、回标及启动扫描之前确认，准备失败也不会误用更早轮次。
+        let generation = lifecycle
+            .copy_generation
+            .as_mut()
+            .ok_or(DatabaseError::CopyExecutionUnavailable)?;
+        self.save_copy_generation(generation).await?;
+        self.initialize().await?;
+        let saved = self.copy_generation_state().await?;
+        let committed = saved.scan_state;
+        let working = 1 - committed;
+        let base = self.catalogue_storage_table(&get_scan_base_table_name(&self.job_id))?;
+        if generation.plan.mode == MigrationMode::Full {
+            self.execute(
+                &format!("ALTER TABLE {base} DELETE WHERE copy_sequence < ? SETTINGS mutations_sync=2"),
+                &[Value::from(sequence)],
+            )
+            .await?;
+        } else {
+            // 未确认行作为墓碑保留；只删这些物理行会复活同键更早的已确认快照。
+            // 比较和收尾均排除它们，只有新的复制 ACK 才能恢复该目标槽的就绪证明。
+            // 范围外事实跨多轮保留；每轮统一回到 C，观察之后才写 W。
+            self.execute(&format!("ALTER TABLE {base} UPDATE current_state={committed} WHERE current_state!={committed} AND copy_sequence < ? SETTINGS mutations_sync=2"),
+                &[Value::from(sequence)]).await?;
         }
         let table = get_scan_state_table_name(&self.job_id);
-        self.execute(&format!(
-            "INSERT INTO {table} (id,scan_state,baseline_committed,copy_in_progress,copy_request_key) VALUES (1,{working},false,true,?)"
-        ), &[Value::from(request_key)]).await?;
-        *lifecycle = ScanGenerationLifecycle {
-            working: Some(working),
-            copy_recovery: recovering,
-            ..Default::default()
-        };
+        self.execute(&format!("INSERT INTO {table} (id,scan_state,baseline_committed,copy_execution_id) VALUES (1,{committed},false,?)"),
+            &[Value::from(request.execution_id.clone())]).await?;
+        generation.baseline_prepared = true;
+        generation.phase = CopyGenerationPhase::Prepared;
+        generation.revision = 2;
+        self.save_copy_generation(generation).await?;
+        lifecycle.working = Some(working);
+        lifecycle.copy_recovery = false;
+        lifecycle.copy_generation_recovering = recovering;
+        lifecycle.copy_execution_id = Some(request.execution_id.clone());
         self.cached_scan_state.store(working, Ordering::Relaxed);
         Ok(if recovering {
             CopyGenerationStatus::Recovering
@@ -70,11 +130,25 @@ impl ClickHouseDatabase {
         })
     }
 
+    pub async fn copy_baseline_available(&self, previous: &CopyGeneration) -> Result<bool> {
+        if !previous.baseline_prepared
+            || !self.table_exists(&get_scan_base_table_name(&self.job_id)).await?
+            || !self.table_exists(&get_scan_state_table_name(&self.job_id)).await?
+        {
+            return Ok(false);
+        }
+        Ok(self.copy_generation_state().await?.copy_execution_id == previous.request.execution_id)
+    }
+
     async fn copy_generation_state(&self) -> Result<CopyState> {
         let table = get_scan_state_table_name(&self.job_id);
-        let state = self.sync_client.query(&format!(
-            "SELECT scan_state, baseline_committed, copy_in_progress, copy_request_key FROM {table} FINAL WHERE id=1"
-        )).fetch_quorum_one::<CopyState>().await?;
+        let state = self
+            .sync_client
+            .query(&format!(
+                "SELECT scan_state,copy_execution_id FROM {table} FINAL WHERE id=1"
+            ))
+            .fetch_quorum_one::<CopyState>()
+            .await?;
         if state.scan_state > 1 {
             return Err(DatabaseError::ConversionError(format!(
                 "Invalid copy generation {}; expected 0 or 1",
@@ -84,18 +158,9 @@ impl ClickHouseDatabase {
         Ok(state)
     }
 
-    async fn copy_base_has_rows(&self) -> Result<bool> {
-        let table = get_scan_base_table_name(&self.job_id);
-        match self
-            .sync_client
-            .query(&format!("SELECT 1 FROM {table} LIMIT 1"))
-            .fetch_quorum_one::<u8>()
-            .await
-        {
-            Ok(_) => Ok(true),
-            Err(DatabaseError::ClickHouseError(ClickHouseError::RowNotFound)) => Ok(false),
-            Err(error) => Err(error),
-        }
+    /// 本轮是否接续未完成的复制代次；不改变已确认事实的增量比较。
+    pub async fn copy_generation_recovering(&self) -> bool {
+        self.generation_lifecycle.lock().await.copy_generation_recovering
     }
 
     pub(super) async fn is_copy_recovery(&self) -> bool {

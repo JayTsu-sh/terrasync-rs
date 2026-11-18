@@ -1,5 +1,5 @@
-use app::consumer::stats::diagnostics::{CallbackAck, CallbackIdentity, DiagnosticBatch, DiagnosticEvent};
 use serde::{Deserialize, Serialize};
+use task_model::diagnostics::{CallbackAck, CallbackIdentity, DiagnosticBatch, DiagnosticEvent};
 
 use super::execution::ExecutionStats;
 
@@ -28,7 +28,7 @@ pub struct DiagnosticPage {
 
 /// `TaskProgress` 值对象 — 实时任务进度
 ///
-/// `snapshot_json` 存储 `app::consumer::stats::ProgressReport` 的 JSON 序列化，
+/// `snapshot_json` 存储 `app::report::ProgressReport` 的 JSON 序列化，
 /// 避免逐列拆解 + 22 列的 mirror type 问题。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaskProgress {

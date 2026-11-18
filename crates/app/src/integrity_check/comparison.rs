@@ -235,7 +235,7 @@ mod tests {
         .await?;
         let entry = observe_path(source.storage(), Path::new("nested")).await?;
         copy_namespace::create_dir_all(destination.storage(), &entry).await?;
-        copy_metadata::set_entry_metadata(destination.storage(), &entry).await?;
+        copy_metadata::set_entry_metadata(destination.storage(), &entry, None).await?;
         compare_entry(
             &source,
             &destination,

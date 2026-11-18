@@ -2,6 +2,8 @@
 use crate::{ClickHouseConfig, Result};
 use clickhouse::Client;
 
+mod monitor;
+pub use monitor::DatabaseExecutionMonitor;
 pub(crate) mod queries;
 pub(crate) mod recovery;
 pub(crate) mod transport;

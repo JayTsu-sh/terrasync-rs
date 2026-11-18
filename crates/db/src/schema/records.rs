@@ -1,10 +1,13 @@
 //! `ClickHouse` 目录行及事件行的编码；查询和任务入口不暴露 SQL 行 DTO。
 
-use std::{collections::BTreeMap, path::Path, time::SystemTime};
+use crate::catalogue::CopyCatalogueEntry;
+
+use std::{collections::BTreeMap, path::Path, sync::Arc, time::SystemTime};
 
 use data_mover::model::{BackendIdentity, BackendKind};
 use serde::{Deserialize, Serialize};
-use task_model::observation::ObservedView;
+use task_model::observation::{ObservedItem, ObservedView};
+use task_model::{CopyCompletion, CopyReadiness};
 use {
     data_mover::model::ObservedEntry,
     task_model::{ObservedEntryExt, StorageEntryMessage},
@@ -19,6 +22,7 @@ use crate::schema::entry::EntrySummary;
 pub(crate) struct ExcludeRecord<'a> {
     pub relative_path: &'a str,
     pub version_id: &'a str,
+    pub data_unchanged: bool,
 }
 
 /// 文件扫描记录结构体
@@ -66,6 +70,7 @@ pub(crate) struct StorageEntryRecord {
     /// 文件标签
     pub tags: Option<String>,
     pub marker_state: Option<String>,
+    pub metadata_digests: Vec<String>,
     pub backend_kind: String,
     pub backend_id: String,
     pub entry_snapshot: Vec<u8>,
@@ -103,6 +108,7 @@ impl StorageEntryRecord {
             version_id: fields.version_id,
             tags: fields.tags,
             marker_state: fields.marker_state,
+            metadata_digests: fields.metadata_digests,
             backend_kind: entry.backend_kind().as_str().into(),
             backend_id: entry.source_identity().backend().stable_id().into(),
             entry_snapshot: entry.try_encode_snapshot()?.as_bytes().to_vec(),
@@ -128,6 +134,66 @@ impl SnapshotRow {
     pub(crate) fn into_observation(self) -> Result<ObservedEntry> {
         let backend = BackendIdentity::new(self.backend_kind.parse()?, self.backend_id)?;
         decode_observation(&self.relative_path, &self.entry_snapshot, &backend)
+    }
+}
+
+/// 每行只含一个已选源版本的快照和对应目标绑定，不重新拼造历史或推断目标版本。
+#[derive(Deserialize, clickhouse::Row)]
+pub(crate) struct CopySnapshotRow {
+    relative_path: String,
+    backend_kind: String,
+    backend_id: String,
+    entry_snapshot: Vec<u8>,
+    source_version_id: String,
+    copy_target_version: Option<String>,
+    history_segment: u32,
+    history_index: u32,
+    history_records: u32,
+    history_complete: bool,
+}
+
+impl CopySnapshotRow {
+    pub(crate) fn into_completion(self) -> Result<CopyCatalogueEntry> {
+        let backend = BackendIdentity::new(self.backend_kind.parse()?, self.backend_id)?;
+        let entry = decode_observation(&self.relative_path, &self.entry_snapshot, &backend)?;
+        if entry.history().is_some_and(|history| history.records().len() != 1) {
+            return Err(DatabaseError::ObservationProjectionMismatch { field: "history" });
+        }
+        let item = ObservedItem {
+            version_index: entry.history().map(|_| 0),
+            entry: Arc::new(entry),
+        };
+        if item.view().version_id() != self.source_version_id {
+            return Err(DatabaseError::ObservationProjectionMismatch {
+                field: "source_version_id",
+            });
+        }
+        if item.entry.history().is_some() {
+            if self.history_records == 0 || self.history_index >= self.history_records {
+                return Err(DatabaseError::ObservationProjectionMismatch {
+                    field: "history_position",
+                });
+            }
+        } else if self.history_segment != 0
+            || self.history_index != 0
+            || self.history_records != 0
+            || !self.history_complete
+        {
+            return Err(DatabaseError::ObservationProjectionMismatch {
+                field: "history_position",
+            });
+        }
+        Ok(CopyCatalogueEntry {
+            completion: CopyCompletion {
+                item,
+                target_version: self.copy_target_version.filter(|value| !value.is_empty()),
+                readiness: CopyReadiness::Ready,
+            },
+            history_segment: self.history_segment,
+            history_index: self.history_index,
+            history_records: self.history_records,
+            history_complete: self.history_complete,
+        })
     }
 }
 
@@ -191,6 +257,7 @@ pub(crate) struct IncrementalStorageEntryRecord {
     /// 文件标签
     pub tags: Option<String>,
     pub marker_state: Option<String>,
+    pub metadata_digests: Vec<String>,
     /// 记录创建时间
     pub create_at: i64,
     /// 备注信息（如重命名时的源路径）
@@ -201,6 +268,20 @@ impl IncrementalStorageEntryRecord {
     pub fn from_message(message: &StorageEntryMessage) -> Result<Vec<Self>> {
         let now = i64::try_from(SystemTime::now().duration_since(SystemTime::UNIX_EPOCH)?.as_nanos())?;
         let (entry, operation, comment) = match message {
+            StorageEntryMessage::CopyItemCompleted { completion, change } => {
+                return Self::from_message(&change.message(completion.item.clone()));
+            }
+            StorageEntryMessage::VersionMetadataChanged { .. } => return Ok(Vec::new()),
+            StorageEntryMessage::CopyEntryBoundary(_) | StorageEntryMessage::CopyEntryDeltaCompleted { .. } => {
+                return Ok(Vec::new());
+            }
+            StorageEntryMessage::TargetPreserved { .. } => return Ok(Vec::new()),
+            StorageEntryMessage::CopyEntryCompleted { .. }
+            | StorageEntryMessage::CopySkipped { .. }
+            | StorageEntryMessage::CopyVersionFailed { .. }
+            | StorageEntryMessage::Diagnostic { .. } => {
+                return Ok(Vec::new());
+            }
             StorageEntryMessage::Scanned(entry) => (entry, "scanned", None),
             StorageEntryMessage::Packaged(entry) => (entry, "packaged", None),
             StorageEntryMessage::New(item) => {
@@ -309,10 +390,179 @@ impl<'a> TarManifestRecord<'a> {
 mod tests {
     use super::*;
     use crate::observed_fixtures::observation;
+    use crate::scan::rows::NativeScanRecord;
     use data_mover::model::{EntryKind, HistoryOrder, ObjectHistory};
     use serde_json::json;
     use std::sync::Arc;
     use task_model::observation::ObservedItem;
+
+    fn copied_row(
+        entry: &ObservedEntry, version_index: Option<usize>, binding: Option<&str>,
+    ) -> Result<CopySnapshotRow> {
+        let record = NativeScanRecord::capture(ObservedView { entry, version_index }, 1)?;
+        Ok(CopySnapshotRow {
+            relative_path: record.relative_path.into_owned(),
+            backend_kind: record.backend_kind.into(),
+            backend_id: record.backend_id.into(),
+            entry_snapshot: record.entry_snapshot.as_bytes().to_vec(),
+            source_version_id: record.source_version_id.into(),
+            copy_target_version: binding.map(str::to_owned),
+            history_segment: record.history_segment,
+            history_index: record.history_index,
+            history_records: record.history_records,
+            history_complete: record.history_complete,
+        })
+    }
+
+    #[test]
+    fn copy_readback_preserves_selected_version_raw_metadata_and_target_binding() -> Result<()> {
+        for version in [Some("source-v1"), None] {
+            let entry = observation(
+                BackendKind::S3,
+                "payload".into(),
+                EntryKind::File,
+                37,
+                [0; 3],
+                None,
+                None,
+                Some(vec![("raw".into(), "original".into())]),
+                Some((version.map(str::to_owned), true, false)),
+            );
+            let completion = copied_row(&entry, Some(0), Some("actual-target-v9"))?
+                .into_completion()?
+                .completion;
+            assert_eq!(completion.readiness, CopyReadiness::Ready);
+            assert_eq!(completion.target_version.as_deref(), Some("actual-target-v9"));
+            assert_eq!(completion.item.version_index, Some(0));
+            assert_eq!(completion.item.view().version_id(), version.unwrap_or("null"));
+            assert_eq!(
+                completion.item.view().metadata(),
+                entry.history().unwrap().records()[0].metadata().unwrap()
+            );
+            assert_eq!(completion.item.entry, Arc::new(entry));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn copy_readback_keeps_original_segment_positions_and_rejects_invalid_lengths() -> Result<()> {
+        let records = (0..3)
+            .map(|index| {
+                observation(
+                    BackendKind::S3,
+                    "payload".into(),
+                    EntryKind::File,
+                    7,
+                    [0; 3],
+                    None,
+                    None,
+                    None,
+                    Some((Some(format!("v{index}")), index == 2, false)),
+                )
+                .history()
+                .unwrap()
+                .records()[0]
+                    .clone()
+            })
+            .collect();
+        let base = observation(
+            BackendKind::S3,
+            "payload".into(),
+            EntryKind::File,
+            7,
+            [0; 3],
+            None,
+            None,
+            None,
+            None,
+        )
+        .with_history(Some(Box::new(ObjectHistory::whole(records, HistoryOrder::Server)?)))?;
+        for entry in base.into_segments(2) {
+            let history = entry.history().unwrap();
+            for index in 0..history.records().len() {
+                let row = copied_row(&entry, Some(index), Some("target"))?.into_completion()?;
+                assert_eq!(row.history_segment, history.segment());
+                assert_eq!(row.history_index, index as u32);
+                assert_eq!(row.history_records, history.records().len() as u32);
+                assert_eq!(row.history_complete, history.is_complete());
+                assert_eq!(row.completion.item.entry.history().unwrap().records().len(), 1);
+                let mut bad = copied_row(&entry, Some(index), Some("target"))?;
+                bad.history_records = 0;
+                assert!(matches!(
+                    bad.into_completion(),
+                    Err(DatabaseError::ObservationProjectionMismatch {
+                        field: "history_position"
+                    })
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn copy_readback_never_invents_an_absent_target_binding() -> Result<()> {
+        let entry = observation(
+            BackendKind::Local,
+            "payload".into(),
+            EntryKind::File,
+            7,
+            [0; 3],
+            None,
+            None,
+            None,
+            None,
+        );
+        for binding in [None, Some("")] {
+            let completion = copied_row(&entry, None, binding)?.into_completion()?.completion;
+            assert_eq!(completion.target_version, None);
+            assert_eq!(completion.item.version_index, None);
+            assert_eq!(completion.item.entry, Arc::new(entry.clone()));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn copy_readback_rejects_mismatched_source_version_and_multi_version_snapshots() -> Result<()> {
+        let mut entry = observation(
+            BackendKind::S3,
+            "payload".into(),
+            EntryKind::File,
+            7,
+            [0; 3],
+            None,
+            None,
+            None,
+            Some((Some("source-v1".into()), false, false)),
+        );
+        let mut wrong = copied_row(&entry, Some(0), Some("target-v1"))?;
+        wrong.source_version_id = "other-source-version".into();
+        assert!(matches!(
+            wrong.into_completion(),
+            Err(DatabaseError::ObservationProjectionMismatch {
+                field: "source_version_id"
+            })
+        ));
+        let latest = observation(
+            BackendKind::S3,
+            "payload".into(),
+            EntryKind::File,
+            9,
+            [0; 3],
+            None,
+            None,
+            None,
+            Some((Some("source-v2".into()), true, false)),
+        );
+        let mut records = entry.history().unwrap().records().to_vec();
+        records.extend_from_slice(latest.history().unwrap().records());
+        entry = entry.with_history(Some(Box::new(ObjectHistory::whole(records, HistoryOrder::Server)?)))?;
+        let whole = copied_row(&entry, None, Some("target-v1"))?;
+        assert!(matches!(
+            whole.into_completion(),
+            Err(DatabaseError::ObservationProjectionMismatch { field: "history" })
+        ));
+        Ok(())
+    }
 
     #[test]
     fn narrow_snapshot_projection_keeps_the_complete_native_observation() -> Result<()> {
@@ -395,6 +645,27 @@ mod tests {
                 "version_id":"v1", "tags":"{\"a\":\"1\",\"b\":\"2\"}",
             })
         );
+        Ok(())
+    }
+
+    #[test]
+    fn copy_skip_does_not_create_an_incremental_success_or_deletion_record() -> Result<()> {
+        let entry = Arc::new(observation(
+            BackendKind::S3,
+            "a/".into(),
+            EntryKind::File,
+            7,
+            [0; 3],
+            None,
+            None,
+            None,
+            Some((Some("v1".into()), true, false)),
+        ));
+        let skipped = StorageEntryMessage::CopySkipped {
+            entry,
+            reason: "target cannot represent object content".into(),
+        };
+        assert!(IncrementalStorageEntryRecord::from_message(&skipped)?.is_empty());
         Ok(())
     }
 }

@@ -3,13 +3,14 @@
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use app::consumer::stats::diagnostics::{CallbackAck, CallbackIdentity, DiagnosticBatch, DiagnosticOutbox};
+use app::consumer::stats::diagnostics::DiagnosticOutbox;
 use axum::Router;
 use axum::http::StatusCode;
 use axum::routing::post;
 use chrono::Utc;
 use sqlx::SqlitePool;
 use sqlx::sqlite::SqlitePoolOptions;
+use task_model::diagnostics::{CallbackAck, CallbackIdentity, DiagnosticBatch};
 use tokio::net::TcpListener;
 use tokio_util::task::AbortOnDropHandle;
 
@@ -180,6 +181,9 @@ async fn rounds_attempts_and_final_reports_cannot_move_progress_backwards() -> R
         ),
         (identity("r2", "a3", 4, 5, 2), "finished", true, true),
         (identity("r2", "a3", 4, 5, 3), "late periodic", false, false),
+        (identity("r2", "a3", 4, 5, 4), "final detail page", true, true),
+        (identity("r2", "a3", 4, 5, 5), "complete summary", true, true),
+        (identity("r2", "a3", 4, 5, 4), "late detail page", false, true),
     ] {
         let report = progress(text, is_final);
         let receipt = repo
@@ -193,7 +197,10 @@ async fn rounds_attempts_and_final_reports_cannot_move_progress_backwards() -> R
             .await?;
         assert_eq!(receipt.accepted, accepted, "{text}");
     }
-    assert_eq!(repo.find_by_task_id("task").await?.unwrap().report_json, "finished");
+    assert_eq!(
+        repo.find_by_task_id("task").await?.unwrap().report_json,
+        "complete summary"
+    );
     Ok(())
 }
 
@@ -377,7 +384,7 @@ async fn callback_http_failure_retries_same_batch_and_only_acknowledges_committe
     outbox.enqueue("scan", "reset", "first", None);
     let batch = outbox.prepare_batch().unwrap();
     let report = serde_json::json!({
-        "job_id":"task", "job_type":"FullScan", "elapsed_secs":1.0, "speed_bytes_per_sec":0.0,
+        "target_preserved_count":0, "job_id":"task", "job_type":"FullScan", "elapsed_secs":1.0, "speed_bytes_per_sec":0.0,
         "is_final":false, "callback_identity":identity, "diagnostics":batch,
         "detail":{"kind":"Full","scanned_files":0,"scanned_dirs":0,"total_bytes":0,"transferred_bytes":0,"error_count":1}
     });

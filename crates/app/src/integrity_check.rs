@@ -12,9 +12,11 @@
 //! S3 目标没有真实目录对象，因此目录 entry 跳过目标 metadata 查询；文件的
 //! POSIX 元数据跳过策略由 data-mover 统一处理。
 
+use crate::callback::CallbackEndpoint;
 use crate::file_copy::metadata as copy_metadata;
 #[cfg(feature = "license")]
 use data_mover::probes::probe_server_time;
+use task_model::metadata::MetadataScope;
 mod comparison;
 #[cfg(feature = "license")]
 use crate::storage_factory::backend_kind_from_location;
@@ -39,7 +41,9 @@ use crate::storage_factory::StorageContext;
 use data_mover::model::ObservedEntry;
 use data_mover::redact_storage_url;
 use task_model::StorageEntryMessage;
-use tracing::{Instrument, debug, error, info, info_span, instrument, warn};
+#[cfg(feature = "license")]
+use tracing::warn;
+use tracing::{Instrument, debug, error, info, info_span, instrument};
 
 use crate::broadcast::{BroadcastForwarder, DEFAULT_CHANNEL_CAPACITY};
 use crate::config::{JobType, ScanConfig, initialize_consumer_config};
@@ -48,6 +52,7 @@ use crate::dir_walker;
 use crate::error::{AppError, Result};
 use crate::scan::ScanType;
 use crate::storage_factory::{StorageRole, create_storage_for_role};
+use crate::task_stream::finish_phase;
 
 // ─────────────────────────────────────────────────
 // Integrity Check 数据模型
@@ -290,7 +295,9 @@ impl CheckContext {
     }
 
     /// 处理一条 walkdir 消息：根据 entry 类型分派到对应 helper，并增加计数 + 广播。
-    async fn dispatch(&self, entry: Arc<ObservedEntry>, broadcaster: &BroadcastForwarder<StorageEntryMessage>) {
+    async fn dispatch(
+        &self, entry: Arc<ObservedEntry>, broadcaster: &BroadcastForwarder<StorageEntryMessage>,
+    ) -> Result<()> {
         let relative_path = entry.get_relative_path().to_path_buf();
         let error_reason = if entry.get_is_symlink() {
             let result = self.process_entry(entry.as_ref(), &relative_path, "symlink").await;
@@ -317,12 +324,13 @@ impl CheckContext {
                     entry: Some(entry),
                     reason,
                 })
-                .await;
+                .await?;
         } else {
             broadcaster
                 .broadcast(StorageEntryMessage::IntegrityChecked(entry))
-                .await;
+                .await?;
         }
+        Ok(())
     }
 }
 
@@ -351,7 +359,7 @@ impl CheckContext {
 #[allow(clippy::too_many_arguments)]
 pub async fn integrity_check(
     job_id: String, job_dir: String, src_path: &str, dest_path: &str, quick: bool, auto_fix: bool,
-    raw_command_line: String, progress_callback_url: Option<String>,
+    raw_command_line: String, progress_callback_url: Option<CallbackEndpoint>,
 ) -> Result<()> {
     integrity_check_with_concurrency(
         job_id,
@@ -370,7 +378,7 @@ pub async fn integrity_check(
 #[allow(clippy::too_many_arguments)]
 pub async fn integrity_check_with_concurrency(
     job_id: String, job_dir: String, src_path: &str, dest_path: &str, quick: bool, auto_fix: bool,
-    raw_command_line: String, progress_callback_url: Option<String>, concurrency: Option<usize>,
+    raw_command_line: String, progress_callback_url: Option<CallbackEndpoint>, concurrency: Option<usize>,
 ) -> Result<()> {
     info!(
         "Starting integrity check between {} and {}",
@@ -394,6 +402,7 @@ pub async fn integrity_check_with_concurrency(
     )?);
 
     let scan_config = ScanConfig {
+        filter_time_anchor: None,
         job_id: job_id.clone(),
         path: src_path.to_string(),
         depth: 0,
@@ -404,6 +413,8 @@ pub async fn integrity_check_with_concurrency(
         match_expressions: None,
         exclude_expressions: None,
         include_tags: false,
+        observation_plan: None,
+        metadata_scope: MetadataScope::default(),
         file_list: None,
         packaged: false,
         package_depth: 0,
@@ -462,7 +473,7 @@ pub async fn integrity_check_with_concurrency(
                     Ok(s) => Arc::new(s),
                     Err(e) => {
                         error!("Worker {}: Failed to create src storage: {}", worker_id, e);
-                        return;
+                        return Err(e);
                     }
                 };
                 let dest_storage =
@@ -470,7 +481,7 @@ pub async fn integrity_check_with_concurrency(
                         Ok(s) => Arc::new(s),
                         Err(e) => {
                             error!("Worker {}: Failed to create dest storage: {}", worker_id, e);
-                            return;
+                            return Err(e);
                         }
                     };
                 let ctx = CheckContext {
@@ -486,7 +497,7 @@ pub async fn integrity_check_with_concurrency(
 
                 while let Some(msg) = walkdir_iter.next().await {
                     match msg {
-                        StorageEntryMessage::Scanned(entry) => ctx.dispatch(entry, &broadcaster).await,
+                        StorageEntryMessage::Scanned(entry) => ctx.dispatch(entry, &broadcaster).await?,
                         StorageEntryMessage::Error {
                             path, entry, reason, ..
                         } => {
@@ -503,11 +514,12 @@ pub async fn integrity_check_with_concurrency(
                                     entry,
                                     reason,
                                 })
-                                .await;
+                                .await?;
                         }
                         _ => {}
                     }
                 }
+                Ok(())
             }
             .instrument(span),
         );
@@ -515,10 +527,9 @@ pub async fn integrity_check_with_concurrency(
         worker_handles.push(handle);
     }
 
-    for handle in worker_handles {
-        if let Err(e) = handle.await {
-            error!("Integrity check worker panicked: {}", e);
-        }
+    let workers_result = finish_phase(worker_handles).await;
+    if workers_result.is_err() {
+        walkdir_iter.close();
     }
 
     let issues = Arc::try_unwrap(issues)
@@ -531,28 +542,12 @@ pub async fn integrity_check_with_concurrency(
 
     drop(broadcaster);
 
-    let mut all_successful = true;
-    for handle in consumer_handles {
-        match handle.await {
-            Ok(Ok(())) => debug!("Consumer task completed successfully"),
-            Ok(Err(e)) => {
-                error!("Consumer task failed: {}", e);
-                all_successful = false;
-            }
-            Err(e) => {
-                error!("Consumer task panicked: {}", e);
-                all_successful = false;
-            }
-        }
+    let result = workers_result.and(finish_phase(consumer_handles).await);
+    if let Err(error) = &result {
+        consumer_manager.record_task_error(error).await;
     }
-
-    if all_successful {
-        info!("All consumer tasks completed successfully");
-    } else {
-        warn!("Some consumer tasks failed or panicked");
-    }
-
     consumer_manager.end_lifecycle().await;
+    result?;
     if let Some(error) = walkdir_iter.take_error() {
         return Err(error.into());
     }

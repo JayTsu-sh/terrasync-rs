@@ -1,7 +1,7 @@
 //! Blocks 以完整目录前缀提交；Unordered 仅保留活跃目录，恢复时从根重新开始。
 use super::statistics::ScanCounts;
 use crate::{
-    consumer::ScanStatistics,
+    consumer::TaskStatistics,
     error::{AppError, Result},
 };
 use data_mover::traversal::{Checkpoint, DirectoryStatistics, ListingOutcome, TraversalOrder, TraversalResume};
@@ -25,7 +25,7 @@ impl ScanProgress {
             cursor,
         }
     }
-    pub(crate) async fn push(&mut self, value: DirectoryStatistics, statistics: &ScanStatistics) -> Result<()> {
+    pub(crate) async fn push(&mut self, value: DirectoryStatistics, statistics: &TaskStatistics) -> Result<()> {
         let key = value.path.as_str().to_owned();
         if self.order == TraversalOrder::Blocks && self.active.keys().any(|path| path != &key) {
             return Err(AppError::ScanError(
@@ -85,7 +85,7 @@ impl ScanProgress {
         }
         Ok(())
     }
-    pub(crate) async fn resumed(&mut self, event: &TraversalResume, statistics: &ScanStatistics) -> Result<()> {
+    pub(crate) async fn resumed(&mut self, event: &TraversalResume, statistics: &TaskStatistics) -> Result<()> {
         let selected = event.checkpoint.as_ref().map(Checkpoint::as_bytes);
         let counts = if self.order == TraversalOrder::Blocks {
             if selected != self.cursor.as_deref() {

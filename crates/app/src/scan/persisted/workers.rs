@@ -5,7 +5,7 @@ use super::{
 };
 use crate::scan::cancellation::ScanCancellation;
 use crate::{
-    consumer::{ScanStatistics, observed::Delivery},
+    consumer::{TaskStatistics, observed::Delivery},
     error::{AppError, Result},
 };
 use data_mover::model::ObservedEntry;
@@ -24,7 +24,7 @@ pub(super) const WORKERS: usize = 4;
 
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn consume(
-    database: &mut ScanStore, template: ScanStore, state: ScanResumeState, statistics: ScanStatistics,
+    database: &mut ScanStore, template: ScanStore, state: ScanResumeState, statistics: TaskStatistics,
     receiver: mpsc::Receiver<Delivery<Entries>>, control: mpsc::Receiver<SaveState>, batch_size: usize,
     cancel: ScanCancellation,
 ) -> Result<()> {
@@ -167,7 +167,7 @@ async fn barrier(senders: &[mpsc::Sender<Delivery<Entries>>]) -> Result<()> {
 }
 
 async fn work(
-    mut database: ScanStore, state: ScanResumeState, statistics: ScanStatistics,
+    mut database: ScanStore, state: ScanResumeState, statistics: TaskStatistics,
     mut receiver: mpsc::Receiver<Delivery<Entries>>, batch_size: usize, cancel: &ScanCancellation,
 ) -> Result<()> {
     let mut batch = Vec::with_capacity(batch_size);
@@ -282,7 +282,7 @@ mod tests {
                 &mut database,
                 template,
                 state,
-                manager.scan_statistics(),
+                manager.task_statistics(),
                 receiver,
                 commands,
                 100_000,

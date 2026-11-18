@@ -10,6 +10,7 @@
 // 子模块声明（按字母顺序排序）
 /// 消费者管理器，用于协调和管理多个消费者
 mod manager;
+mod purge_reporting;
 /// 统计信息消费者，用于收集和展示任务统计信息
 pub mod stats;
 
@@ -23,8 +24,8 @@ pub mod traits;
 
 pub use database::DatabaseConsumer;
 pub use manager::ConsumerManager;
-pub(crate) use manager::ScanStatistics;
-pub use stats::{JobResult, ProgressReport, StatisticConsumer};
+pub(crate) use manager::TaskStatistics;
+pub use stats::StatisticConsumer;
 pub use traits::Consumer;
 
 pub(crate) mod observed;

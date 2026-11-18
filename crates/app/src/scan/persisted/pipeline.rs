@@ -6,7 +6,7 @@ use crate::scan::progress::ScanProgress;
 use crate::scan::source::{ResumableScan, ResumableScanItem};
 use crate::{
     consumer::{
-        ConsumerManager, ScanStatistics,
+        ConsumerManager, TaskStatistics,
         observed::{Delivery, ObservedForwarder},
     },
     error::{AppError, Result},
@@ -67,7 +67,7 @@ pub(super) async fn consume(
 ) -> Result<()> {
     let failure = source.failure_signal();
     let initial = statistics
-        .scan_statistics()
+        .task_statistics()
         .snapshot()
         .await
         .map_or_else(Default::default, |scan| scan.counts);
@@ -95,7 +95,7 @@ pub(super) async fn consume(
     let windows = if state.incremental || resume { 3 } else { 1 };
     let prefetch_capacity = Some(batch_size.saturating_mul(writer_workers).saturating_mul(windows));
     let mut producer_state = state.clone();
-    let producer_statistics = statistics.scan_statistics();
+    let producer_statistics = statistics.task_statistics();
     let recovery_progress = producer_statistics.watch_recovery(source.recovery_status()).await;
     let count_statistics = producer_statistics.clone();
     let producer_cancel = cancel.clone();
@@ -117,7 +117,7 @@ pub(super) async fn consume(
     let statistics_task = AbortOnDropHandle::new(tokio::spawn(async move {
         count(&count_statistics, stat_rx).await;
     }));
-    let writer_statistics = statistics.scan_statistics();
+    let writer_statistics = statistics.task_statistics();
     let writer = async {
         let result = if let Some(template) = template {
             workers::consume(
@@ -264,7 +264,7 @@ mod outcome_tests {
     }
 }
 
-async fn count(statistics: &ScanStatistics, mut receiver: mpsc::Receiver<Delivery<Entries>>) {
+async fn count(statistics: &TaskStatistics, mut receiver: mpsc::Receiver<Delivery<Entries>>) {
     while let Some(message) = receiver.recv().await {
         match message {
             Delivery::Data(entries) => statistics.record_observations(&entries).await,
@@ -275,7 +275,7 @@ async fn count(statistics: &ScanStatistics, mut receiver: mpsc::Receiver<Deliver
     }
 }
 async fn write(
-    database: &mut ScanStore, state: ScanResumeState, statistics: &ScanStatistics,
+    database: &mut ScanStore, state: ScanResumeState, statistics: &TaskStatistics,
     mut receiver: mpsc::Receiver<Delivery<Entries>>, mut control: mpsc::Receiver<SaveState>, batch_size: usize,
     cancel: &ScanCancellation,
 ) -> Result<()> {
@@ -329,7 +329,7 @@ async fn save(control: &mpsc::Sender<SaveState>, state: &mut ScanResumeState, ac
     Ok(())
 }
 async fn produce(
-    source: ResumableScan, state: &mut ScanResumeState, statistics: &ScanStatistics,
+    source: ResumableScan, state: &mut ScanResumeState, statistics: &TaskStatistics,
     forwarder: ObservedForwarder<Entries>, control: mpsc::Sender<SaveState>, cancel: ScanCancellation,
     prefetch_capacity: Option<usize>, progress: ScanProgress,
 ) -> Result<()> {
@@ -352,7 +352,7 @@ async fn produce(
 }
 
 async fn produce_items(
-    source: &mut ScanInput, state: &mut ScanResumeState, statistics: &ScanStatistics,
+    source: &mut ScanInput, state: &mut ScanResumeState, statistics: &TaskStatistics,
     forwarder: ObservedForwarder<Entries>, control: mpsc::Sender<SaveState>, cancel: ScanCancellation,
     mut progress: ScanProgress,
 ) -> Result<()> {

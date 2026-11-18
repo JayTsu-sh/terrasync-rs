@@ -2,7 +2,7 @@
 use crate::error::storage::{Result, StorageError, operation};
 use crate::storage_factory::path;
 use data_mover::model::*;
-use data_mover::storage::Storage;
+use data_mover::storage::{CopiedAclTarget, MetadataMutation, SourceDescriptor, Storage};
 use std::path::Path;
 use tokio_util::sync::CancellationToken;
 
@@ -38,8 +38,38 @@ pub(crate) fn copied_metadata_plan(destination: &Storage, entry: ObservedView<'_
         _ => TimestampTargetCapability::Unsupported,
     };
     let policies = MetadataPolicies::default()
+        .with_acl(
+            if !matches!(target.map(|target| target.acl), Some(CopiedAclTarget::Encoding(_)))
+                || matches!(
+                    entry.metadata().acl(),
+                    MetadataObservation::NotRequested | MetadataObservation::NotApplicable
+                )
+            {
+                MetadataPolicy::Omit
+            } else {
+                MetadataPolicy::RequireExact
+            },
+        )
+        .with_xattrs(
+            if !target.is_some_and(|target| target.xattrs == CopiedValueTarget::Supported)
+                || matches!(
+                    entry.metadata().xattrs(),
+                    MetadataObservation::NotRequested | MetadataObservation::NotApplicable
+                )
+            {
+                MetadataPolicy::Omit
+            } else {
+                MetadataPolicy::RequireExact
+            },
+        )
         .with_ownership_mode(
-            if ownership.is_some() && owner_permitted && ownership_target == OwnershipTarget::Numeric {
+            if !matches!(
+                entry.metadata().ownership_mode(),
+                MetadataObservation::NotRequested | MetadataObservation::NotApplicable
+            ) && matches!(
+                target.map(|target| target.ownership),
+                Some(CopiedOwnershipTarget::Numeric)
+            ) {
                 MetadataPolicy::RequireExact
             } else if ownership.is_none() && mode.is_none() {
                 MetadataPolicy::BestEffort
@@ -56,17 +86,31 @@ pub(crate) fn copied_metadata_plan(destination: &Storage, entry: ObservedView<'_
                 MetadataPolicy::BestEffort
             },
         )
-        .with_tags(if entry.metadata().tags().value().is_some() {
-            MetadataPolicy::BestEffort
-        } else {
-            MetadataPolicy::Omit
-        });
+        .with_tags(
+            if !target.is_some_and(|target| target.tags == CopiedValueTarget::Supported)
+                || matches!(
+                    entry.metadata().tags(),
+                    MetadataObservation::NotRequested | MetadataObservation::NotApplicable
+                )
+            {
+                MetadataPolicy::Omit
+            } else {
+                MetadataPolicy::RequireExact
+            },
+        );
     Ok(compile_copied_metadata_plan(
         &MetadataPlanRequest {
             observations: entry.metadata(),
             target: MetadataTarget {
-                acl: AclTarget::NotApplicable,
-                xattrs: ValueTarget::NotApplicable,
+                acl: match target.map(|target| target.acl) {
+                    Some(CopiedAclTarget::Encoding(encoding)) => AclTarget::Encoding(encoding),
+                    _ => AclTarget::NotApplicable,
+                },
+                xattrs: if target.is_some_and(|target| target.xattrs == CopiedValueTarget::Supported) {
+                    ValueTarget::Supported
+                } else {
+                    ValueTarget::NotApplicable
+                },
                 tags: if target.is_some_and(|target| target.tags == CopiedValueTarget::Supported) {
                     ValueTarget::Supported
                 } else {
@@ -80,7 +124,7 @@ pub(crate) fn copied_metadata_plan(destination: &Storage, entry: ObservedView<'_
         },
         ownership.is_none().then_some(mode).flatten(),
         false,
-        false,
+        true,
         entry.entry.kind(),
     )?)
 }
@@ -136,37 +180,45 @@ pub(crate) async fn set_metadata(
     Ok(())
 }
 
-pub(crate) async fn set_entry_metadata(storage: &Storage, entry: &ObservedEntry) -> Result<()> {
+pub(crate) async fn set_entry_metadata(
+    storage: &Storage, entry: &ObservedEntry, cancel: Option<CancellationToken>,
+) -> Result<()> {
     let view = ObservedView {
         entry,
-        version_index: None,
+        version_index: entry
+            .history()
+            .and_then(|history| history.records().iter().position(|record| record.is_latest())),
     }
     .payload();
-    let plan = copied_metadata_plan(storage, view)?;
-    plan.apply(
-        storage.metadata()?.as_ref(),
-        &view.source_path()?,
-        CancellationToken::new(),
-    )
-    .await?;
-    Ok(())
+    set_item_metadata(storage, view, None, cancel).await.map(|_| ())
 }
 
-pub(crate) async fn copy_xattr(from: &Storage, to: &Storage, value: &Path) -> Result<()> {
-    let p = path(value)?;
-    let facts = from
-        .metadata()?
-        .observe(&p, ObservationPlan::default().with_xattrs(ObservationMode::BestEffort))
-        .await?;
-    let parts: MetadataObservationParts = facts.into();
-    if let MetadataObservation::Value { value: attrs, .. } = parts.xattrs {
-        to.metadata()?
-            .apply(&p, MetadataMutation::Xattrs(attrs), CancellationToken::new())
-            .await?;
+/// 核对捕获结果并编译计划；不查询源端，也不应用目标元数据。
+pub(crate) fn captured_metadata_plan(storage: &Storage, view: ObservedView<'_>) -> Result<MetadataPlan> {
+    let failures: Vec<_> = view.metadata().failures().collect();
+    if !failures.is_empty() {
+        return Err(StorageError::SourceMetadataAcquisitionFailed {
+            path: view.source_path()?,
+            version: view.version().map(|_| view.version_id().to_owned()),
+            failures,
+        });
     }
-    Ok(())
+    copied_metadata_plan(storage, view)
 }
 
+pub(crate) async fn set_item_metadata(
+    storage: &Storage, view: ObservedView<'_>, target_version: Option<&str>, cancel: Option<CancellationToken>,
+) -> Result<SourceDescriptor> {
+    let plan = captured_metadata_plan(storage, view)?;
+    let cancel = cancel.unwrap_or_default();
+    let metadata = storage.metadata()?;
+    let path = view.source_path()?;
+    let version = target_version.map_or(SourceVersion::Current, |id| SourceVersion::Id(id.to_owned()));
+    plan.apply(metadata.as_ref(), &path, &version, cancel.clone()).await?;
+    Ok(plan.verify_published(storage, &path, &version, None, cancel).await?)
+}
+
+#[cfg(any(feature = "remote", test))]
 pub(crate) async fn apply_acl(storage: &Storage, value: &Path, acl: AclMetadata) -> Result<()> {
     let target = storage.staged_destination()?.copied_metadata_target();
     let acl_target = match target.map(|v| v.acl) {
@@ -202,14 +254,18 @@ pub(crate) async fn apply_acl(storage: &Storage, value: &Path, acl: AclMetadata)
         EntryKind::File,
     )
     .map_err(StorageError::from)?;
-    plan.apply(&*storage.metadata()?, &path(value)?, CancellationToken::new())
-        .await
-        .map_err(StorageError::from)?;
+    plan.apply(
+        &*storage.metadata()?,
+        &path(value)?,
+        &SourceVersion::Current,
+        CancellationToken::new(),
+    )
+    .await
+    .map_err(StorageError::from)?;
     Ok(())
 }
 
-use data_mover::storage::{CopiedAclTarget, MetadataMutation};
-
+#[cfg(feature = "remote")]
 pub(crate) async fn observe_acl(storage: &Storage, value: &Path) -> Result<Option<AclMetadata>> {
     let facts = storage
         .metadata()?
@@ -223,11 +279,4 @@ pub(crate) async fn observe_acl(storage: &Storage, value: &Path) -> Result<Optio
         MetadataObservation::Value { value, .. } => Some(value),
         _ => None,
     })
-}
-
-pub(crate) async fn copy_acl(from: &Storage, to: &Storage, value: &Path) -> Result<()> {
-    if let Some(acl) = observe_acl(from, value).await? {
-        apply_acl(to, value, acl).await?;
-    }
-    Ok(())
 }

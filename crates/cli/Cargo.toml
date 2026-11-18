@@ -6,6 +6,8 @@ description = "CLI interface for terrasync"
 edition = "2024"
 
 [features]
+default = ["remote"]
+remote = ["app/remote"]
 license = ["dep:licensing", "app/license"]
 gui = ["dep:web"]
 lab-fault-injection = ["app/lab-fault-injection"]
@@ -16,7 +18,6 @@ app        = { workspace = true }
 licensing  = { workspace = true, optional = true }
 data-mover = { workspace = true }
 rustls     = { workspace = true }
-transport  = { workspace = true, features = ["quic"] }
 web        = { workspace = true, optional = true }
 chrono     = { workspace = true }
 tracing    = { workspace = true }

@@ -8,8 +8,8 @@ use std::{error::Error, os::unix::fs::MetadataExt, path::Path, sync::Arc};
 use task_model::TransferMode;
 
 #[tokio::test]
-async fn direct_updates_existing_inode_while_atomic_and_checkpoint_replace_it() -> Result<(), Box<dyn Error>> {
-    for mode in [TransferMode::Direct, TransferMode::Atomic, TransferMode::Checkpoint] {
+async fn direct_updates_existing_inode_while_checkpoint_replaces_it() -> Result<(), Box<dyn Error>> {
+    for mode in [TransferMode::Direct, TransferMode::Checkpoint] {
         for size in [17, 256 * 1024 + 13] {
             let source_root = tempfile::tempdir()?;
             let target_root = tempfile::tempdir()?;
@@ -35,7 +35,6 @@ async fn direct_updates_existing_inode_while_atomic_and_checkpoint_replace_it() 
                 &entry,
                 CopyOptions {
                     transfer_mode: mode,
-                    is_source_reserved: true,
                     enable_integrity_check: true,
                     ..Default::default()
                 },

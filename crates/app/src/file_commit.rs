@@ -29,11 +29,12 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, warn};
-use transport::message::{DcAck, FileOutcome, SessionConfig};
+use transport::message::SessionConfig;
 
 // 内部模块
+use crate::disk_commit::{DcAck, FileOutcome};
 use crate::error::{AppError, Result};
-use crate::receiver::{ReceiverProgress, validate_relative_path};
+use crate::remote_receiver_session::{ReceiverProgress, validate_relative_path};
 
 /// 当前正在流式写入的文件上下文。
 struct ActiveFile {
@@ -219,12 +220,9 @@ impl FileCommitter {
             debug!("[dc] rejecting full chunk for non-matching active stream");
             return;
         }
-        if active
-            .tx_inner
-            .send(StreamChunk::from(PositionedChunk::from(chunk)))
-            .await
-            .is_err()
-        {
+        let DataChunk { offset, data } = chunk;
+        let positioned = PositionedChunk { offset, data };
+        if active.tx_inner.send(StreamChunk::from(positioned)).await.is_err() {
             debug!(
                 "[dc] write channel closed early for {:?}",
                 active.entry.get_relative_path()
@@ -352,7 +350,7 @@ impl FileCommitter {
             CommitOutcome::SizeMismatch => FileOutcome::SizeMismatch,
             CommitOutcome::HardError(error) => FileOutcome::HardError(error.to_string()),
         };
-        let _ = self.ack_tx.send(DcAck::FileOutcome { ndx, outcome });
+        let _ = self.ack_tx.send(DcAck { ndx, outcome });
     }
 }
 

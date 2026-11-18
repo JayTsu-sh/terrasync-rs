@@ -1,7 +1,6 @@
 use std::net::SocketAddr;
 
-use app::consumer::ProgressReport;
-use app::consumer::stats::ProgressDetail;
+use app::report::{ProgressDetail, ProgressReport};
 use axum::Json;
 use axum::extract::ConnectInfo;
 use axum::extract::rejection::JsonRejection;
@@ -168,6 +167,9 @@ fn progress_report_to_snapshot(report: &ProgressReport) -> Result<serde_json::Va
             "speed_bytes_per_sec": report.speed_bytes_per_sec,
         }),
     };
+    snapshot["skipped_count"] = serde_json::to_value(report.skipped_count)?;
+    snapshot["task_error_count"] = serde_json::to_value(report.task_error_count)?;
+    snapshot["diagnostics_complete"] = serde_json::to_value(report.diagnostics_complete)?;
     if let Some(scan) = &report.scan {
         snapshot["scan"] = serde_json::to_value(scan)?;
     }
@@ -185,7 +187,7 @@ pub struct CallbackQuery {
     pub execution_id: Option<String>,
 }
 
-/// 接收本机回调，仅在持久化成功后返回批次 ACK。
+/// 接收本机回调，仅在事务提交后返回 HTTP 2xx；响应体的批次信息可供调用方参考。
 pub async fn update_progress(
     ConnectInfo(peer): ConnectInfo<SocketAddr>, State(state): State<AppState>, Path(id): Path<String>,
     Query(query): Query<CallbackQuery>, Json(report): Json<ProgressReport>,
@@ -212,7 +214,7 @@ mod progress_tests {
     #[test]
     fn incremental_snapshot_counts_links_like_the_full_snapshot() -> Result<()> {
         let report: ProgressReport = serde_json::from_value(serde_json::json!({
-            "job_id":"links", "job_type":"IncrementalScan", "elapsed_secs":1.0,
+            "target_preserved_count":0, "job_id":"links", "job_type":"IncrementalScan", "elapsed_secs":1.0,
             "speed_bytes_per_sec":0.0, "is_final":true,
             "detail":{"kind":"Incremental", "scanned_files":10, "scanned_dirs":2,
                 "scanned_symlinks":4, "scanned_size":0, "transferred_bytes":0,
@@ -233,7 +235,7 @@ mod progress_tests {
         let empty = serde_json::json!({"directories":0,"regular_files":0,"symlinks":0,"block_devices":0,
             "character_devices":0,"fifos":0,"sockets":0,"unknown":0});
         let report: ProgressReport = serde_json::from_value(serde_json::json!({
-            "job_id":"scan", "job_type":"FullScan", "elapsed_secs":1.0, "speed_bytes_per_sec":0.0,
+            "target_preserved_count":0, "job_id":"scan", "job_type":"FullScan", "elapsed_secs":1.0, "speed_bytes_per_sec":0.0,
             "is_final":false, "detail":{"kind":"Full","scanned_files":2,"scanned_dirs":1,
                 "total_bytes":10,"transferred_bytes":0,"error_count":3},
             "scan":{"scanned_entries":3,"filtered_entries":0,"retained_entries":3,"complete":false,

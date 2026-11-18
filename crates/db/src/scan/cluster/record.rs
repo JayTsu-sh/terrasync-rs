@@ -32,6 +32,7 @@ pub(super) struct ClusterIncrementalStorageEntryRecord<'a> {
     pub version_id: &'a str,
     pub tags: Option<&'a str>,
     pub marker_state: Option<&'a str>,
+    pub metadata_digests: &'a [String],
     pub create_at: i64,
     pub comment: Option<&'a str>,
 }
@@ -64,6 +65,7 @@ impl<'a> ClusterIncrementalStorageEntryRecord<'a> {
             version_id: &record.version_id,
             tags: record.tags.as_deref(),
             marker_state: record.marker_state.as_deref(),
+            metadata_digests: &record.metadata_digests,
             create_at: record.create_at,
             comment: record.comment.as_deref(),
         }
@@ -136,7 +138,9 @@ pub(super) struct ClusterNativeScanRecord<'a> {
     pub version_id: &'a str,
     pub tags: Option<&'a str>,
     pub marker_state: Option<&'a str>,
+    pub metadata_digests: &'a [String],
     pub identity_key: &'a str,
+    pub source_version_id: &'a str,
     pub backend_kind: &'static str,
     pub backend_id: &'a str,
     pub entry_kind: &'static str,
@@ -147,6 +151,8 @@ pub(super) struct ClusterNativeScanRecord<'a> {
     pub metadata_hash: Option<&'a str>,
     pub history_segment: u32,
     pub history_index: u32,
+    pub history_records: u32,
+    pub history_complete: bool,
 }
 impl<'a> ClusterNativeScanRecord<'a> {
     pub fn new(job_id: &'a str, epoch: u64, batch_id: u64, record: &'a NativeScanRecord<'_>) -> Self {
@@ -174,8 +180,10 @@ impl<'a> ClusterNativeScanRecord<'a> {
             ino: record.ino,
             file_handle: record.file_handle.as_deref(),
             version_id: record.version_id,
+            source_version_id: record.source_version_id,
             tags: record.tags.as_deref(),
             marker_state: record.marker_state.as_deref(),
+            metadata_digests: &record.metadata_digests,
             identity_key: &record.identity_key,
             backend_kind: record.backend_kind,
             backend_id: record.backend_id,
@@ -186,6 +194,8 @@ impl<'a> ClusterNativeScanRecord<'a> {
             metadata_hash: record.metadata_hash.as_deref(),
             history_segment: record.history_segment,
             history_index: record.history_index,
+            history_records: record.history_records,
+            history_complete: record.history_complete,
         }
     }
 }
@@ -203,7 +213,8 @@ mod tests {
             "ext":"dat", "ctime":11, "mtime":12, "atime":13, "mode":420, "storage_type":"nas",
             "is_symlink":false, "is_dir":false, "is_regular_file":true, "hard_links":2,
             "current_state":1, "uid":1000, "gid":1001, "ino":42, "file_handle":"abcd",
-            "version_id":"v1", "tags":"[]", "create_at":17, "comment":"old/source.dat"
+            "version_id":"v1", "tags":"[]", "metadata_digests":["acl", "xattrs", "tags"],
+            "create_at":17, "comment":"old/source.dat"
         }))?;
         let mut expected = serde_json::to_value(&record)?;
         expected["job_id"] = json!("job");

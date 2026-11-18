@@ -1,9 +1,12 @@
 //! watch 只通知当前状态；累计数字直接读取恢复生产方，结束前再采样一次。
-use super::{callback_state::ScanRuntimePhase, consumer::StatisticConsumer, diagnostics::safe_diagnostic_text};
+use super::consumer::StatisticConsumer;
+use crate::report::ScanRuntimePhase;
 use data_mover::traversal::{TraversalRecoveryCounters, TraversalRecoveryState, TraversalRecoveryStatus};
 use std::sync::Arc;
+use task_model::diagnostics::safe_diagnostic_text;
 use tokio::sync::Mutex;
 use tokio_util::task::AbortOnDropHandle;
+use tracing::warn;
 
 type Consumer = Arc<Mutex<StatisticConsumer>>;
 
@@ -82,12 +85,10 @@ fn apply(
         .saturating_add(counters.successful_recoveries);
     match state {
         TraversalRecoveryState::Running { .. } => {
-            if new_fault {
-                callback.outbox.enqueue(
-                    "storage",
-                    "network_recovered",
-                    "Network recovery completed; cumulative counts are available in scan_runtime",
-                    None,
+            if new_fault || callback.runtime.state == ScanRuntimePhase::Recovering {
+                warn!(
+                    network_faults = faults,
+                    "Storage connection recovered; transient errors are not callback diagnostics"
                 );
             }
             callback.runtime.state = ScanRuntimePhase::Running;
@@ -97,25 +98,13 @@ fn apply(
             first_failure: failure, ..
         } => {
             if new_fault {
-                callback.outbox.enqueue(
-                    "storage",
-                    "network_fault",
-                    &failure.to_string(),
-                    Some(failure.path.as_str()),
-                );
+                warn!(cause = %safe_diagnostic_text(&failure.to_string()), "Storage connection recovery in progress");
             }
             callback.runtime.state = ScanRuntimePhase::Recovering;
-            callback.runtime.current_error = Some(safe_diagnostic_text(&failure.to_string()));
+            callback.runtime.current_error = None;
         }
         TraversalRecoveryState::Failed { failure } => {
-            if new_fault {
-                callback.outbox.enqueue(
-                    "storage",
-                    "network_fault",
-                    &failure.to_string(),
-                    Some(failure.path.as_str()),
-                );
-            }
+            // 原始终态错误由任务协调者通过同一明细流水线记录；watch 只更新当前状态。
             callback.runtime.state = ScanRuntimePhase::Failed;
             callback.runtime.current_error = Some(safe_diagnostic_text(&failure.to_string()));
         }
@@ -143,6 +132,7 @@ mod tests {
             job_dir: String::new(),
             callback_url: None,
             generation_committed: None,
+            migration: None,
             scan_snapshot: None,
             callback: Default::default(),
             pb_handle: None,
@@ -174,6 +164,7 @@ mod tests {
                 (6, 13, 5)
             );
             assert_eq!(runtime.state, ScanRuntimePhase::Running);
+            assert_eq!(consumer.callback.outbox.pending_len(), 0);
         }
     }
 }

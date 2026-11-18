@@ -1,14 +1,24 @@
 //! 扫描统一入口：落库使用持久化检查点，不落库使用轻量流式统计。
-use crate::error::{AppError, Result};
-use crate::scan_resume::run_persisted;
+use std::{num::NonZeroUsize, time::Duration};
+
+use data_mover::filter::parse_filter_expression;
 #[cfg(feature = "license")]
 use licensing::{get_global_license, verify::quick_verify};
 use tokio_util::sync::CancellationToken;
-use utils::app_config::AppConfig;
+use utils::app_config::{AppConfig, ScanConfig};
+
+use self::source::WalkOptions;
+use crate::callback::CallbackEndpoint;
+use crate::error::{AppError, Result};
 
 mod observation;
 pub use observation::observe_path;
+#[cfg(test)]
+pub(crate) use observation::observe_path_with_plan;
+pub(crate) use observation::observe_path_with_read_policy;
 mod packaging;
+mod persisted;
+pub use persisted::{clear_scan, scan_execution_is_incremental};
 mod recovery;
 pub mod source;
 
@@ -43,7 +53,7 @@ pub struct ScanRequest<'a> {
     pub exclude: &'a Option<String>,
     pub command: String,
     pub cancel: CancellationToken,
-    pub callback_url: Option<String>,
+    pub callback_url: Option<CallbackEndpoint>,
     pub concurrency: Option<usize>,
 }
 
@@ -63,10 +73,23 @@ pub async fn scan(request: ScanRequest<'_>) -> Result<()> {
         config.scan.concurrency = concurrency;
     }
     if config.database.enabled {
-        run_persisted(request, config).await
+        persisted::run_persisted(request, config).await
     } else {
         stream::run(request, config).await
     }
+}
+
+fn walk_options(depth: u32, include: Option<&str>, exclude: Option<&str>, config: &ScanConfig) -> Result<WalkOptions> {
+    Ok(WalkOptions {
+        depth: NonZeroUsize::new(depth as usize).map(NonZeroUsize::get),
+        match_expressions: include.map(parse_filter_expression).transpose()?,
+        exclude_expressions: exclude.map(parse_filter_expression).transpose()?,
+        concurrency: config.concurrency,
+        include_tags: config.include_tags,
+        operation_timeout: Some(Duration::from_secs(config.operation_timeout_secs)),
+        recovery_window: Some(Duration::from_secs(config.recovery_window_secs)),
+        ..WalkOptions::default()
+    })
 }
 
 #[cfg(test)]

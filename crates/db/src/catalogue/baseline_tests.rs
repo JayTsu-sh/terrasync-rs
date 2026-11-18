@@ -3,9 +3,11 @@
 use super::ClickHouseDatabase;
 use crate::ClickHouseConfig;
 use crate::execution::base_client;
+use crate::migration_fixtures::request;
 use crate::{DatabaseError, Result};
 use clickhouse::test::{Mock, handlers};
 use std::time::{SystemTime, UNIX_EPOCH};
+use tokio::sync::mpsc;
 
 fn mocked_database(mock: &Mock, job: &str) -> ClickHouseDatabase {
     let mut database = ClickHouseDatabase::new(
@@ -27,6 +29,19 @@ fn mocked_database(mock: &Mock, job: &str) -> ClickHouseDatabase {
 }
 
 #[tokio::test]
+async fn copy_finalization_without_execution_authority_never_queries_the_catalogue() -> Result<()> {
+    let mock = Mock::new();
+    let database = mocked_database(&mock, "no_copy_execution");
+    let (sender, mut receiver) = mpsc::channel(1);
+    assert!(matches!(
+        database.query_current_copy_entries(None, None, None, sender).await,
+        Err(DatabaseError::CopyExecutionUnavailable)
+    ));
+    assert!(receiver.recv().await.is_none());
+    Ok(())
+}
+
+#[tokio::test]
 async fn fresh_initialization_keeps_the_baseline_uncommitted() -> Result<()> {
     let mock = Mock::new();
     let database = mocked_database(&mock, "initial_baseline");
@@ -38,8 +53,7 @@ async fn fresh_initialization_keeps_the_baseline_uncommitted() -> Result<()> {
     database.initialize().await?;
     let ddl = schema.query().await;
     assert!(ddl.contains("baseline_committed Bool DEFAULT false"));
-    assert!(ddl.contains("copy_in_progress Bool DEFAULT false"));
-    assert!(ddl.contains("copy_request_key String DEFAULT ''"));
+    assert!(ddl.contains("copy_execution_id String DEFAULT ''"));
     let insert = initial.query().await;
     assert!(insert.contains("(id, scan_state, baseline_committed)"));
     assert!(insert.ends_with("VALUES (1, 0, false)"), "{insert}");
@@ -165,19 +179,25 @@ async fn real_fresh_state_supports_copy_recovery_and_committed_baseline() -> Res
     database.initialize().await?;
     assert!(!database.has_committed_baseline().await?);
     assert_eq!(
-        database.begin_copy_generation("source-to-target").await?,
+        database
+            .begin_copy_generation(&request("source-to-target", true))
+            .await?,
         super::CopyGenerationStatus::Fresh
     );
     drop(database);
     let database = ClickHouseDatabase::new(&config, "fresh_copy").unwrap();
     assert_eq!(
-        database.begin_copy_generation("source-to-target").await?,
+        database
+            .begin_copy_generation(&request("source-to-target", true))
+            .await?,
         super::CopyGenerationStatus::Recovering
     );
     database.commit_scan_generation().await?;
     assert!(database.has_committed_baseline().await?);
     assert_eq!(
-        database.begin_copy_generation("another-source-to-target").await?,
+        database
+            .begin_copy_generation(&request("another-source-to-target", true))
+            .await?,
         super::CopyGenerationStatus::Fresh
     );
     Ok(())

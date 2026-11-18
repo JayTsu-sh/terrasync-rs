@@ -6,6 +6,7 @@ description = "The application core code"
 edition = "2024"
 
 [features]
+remote = ["transport/quic", "dep:rustls"]
 license = ["dep:licensing"]
 lab-fault-injection = []
 
@@ -22,6 +23,7 @@ db            = { workspace = true }
 futures       = { workspace = true }
 indicatif     = "0.18.4"
 reqwest       = { workspace = true }
+url           = { workspace = true }
 rustc-hash    = { workspace = true }
 licensing     = { workspace = true, optional = true }
 bincode       = { workspace = true }
@@ -32,8 +34,8 @@ data-mover    = { workspace = true }
 sync-delta    = { workspace = true }
 thiserror     = { workspace = true }
 tokio         = { workspace = true }
-rustls        = { workspace = true }
-transport     = { workspace = true, features = ["quic"] }
+rustls        = { workspace = true, optional = true }
+transport     = { workspace = true }
 tokio-util    = { workspace = true, features = ["rt"] }
 utils         = { workspace = true }
 uuid          = { workspace = true }

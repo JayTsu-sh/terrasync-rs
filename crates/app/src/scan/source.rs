@@ -1,7 +1,11 @@
-use super::observation::{HistorySequence, observation_plan, tags_required, validate_required_tags};
+use super::observation::{HistorySequence, ObservationValidation, observation_plan, tags_required};
 use crate::error::storage::{Result, StorageError, operation};
 use crate::storage_factory::{StorageContext, path};
+use data_mover::filter::FilterExpression;
+use data_mover::model::{ObservationMode, ObservationPlan};
+use data_mover::storage::Storage;
 use task_model::ObservedEntryExt;
+use task_model::metadata::MetadataScope;
 
 use super::packaging::PackageFilter;
 use crate::task_stream::AsyncReceiver;
@@ -36,19 +40,25 @@ impl StorageContext {
     fn traversal_request(&self, sub: Option<&Path>, options: &WalkOptions, blocks: bool) -> Result<TraversalRequest> {
         let root = path(sub.unwrap_or(Path::new("")))?;
         let mut request = TraversalRequest::new(root)
-            .observation_plan(observation_plan(tags_required(&self.roles, options.include_tags)?))
+            .observation_plan(
+                options
+                    .observation_plan
+                    .unwrap_or(observation_plan(tags_required(&self.roles, options.include_tags)?)),
+            )
+            .latest_metadata_only(options.metadata_scope.latest_version_only)
+            .directory_object_metadata(options.metadata_scope.directory_object_output)
             .max_inflight_operations(NonZeroUsize::new(options.concurrency).unwrap_or(NonZeroUsize::MIN))
             .max_depth(options.depth.and_then(NonZeroUsize::new));
+        if let Some(cancel) = &options.cancel {
+            request = request.cancel(cancel.child_token());
+        }
         if blocks {
             request = request.order(TraversalOrder::Blocks);
         }
         if options.packaged {
             request = request.filter(Arc::new(PackageFilter::new(options)));
         } else if options.match_expressions.is_some() || options.exclude_expressions.is_some() {
-            request = request.filter(Arc::new(DslTraversalFilter::new(
-                options.match_expressions.clone(),
-                options.exclude_expressions.clone(),
-            )));
+            request = request.filter(Arc::new(options.dsl_filter()));
         }
         Ok(request)
     }
@@ -85,7 +95,7 @@ impl StorageContext {
             guard: scan.failure,
             recovery: scan.recovery,
             history: None,
-            include_tags: tags_required(&self.roles, options.include_tags)?,
+            validation: validation_for(&self.roles, options)?,
             cancel,
         })
     }
@@ -110,10 +120,12 @@ impl StorageContext {
     async fn walkdir_with_root_policy(
         &self, sub: Option<&Path>, options: WalkOptions, report_root: bool,
     ) -> Result<WalkDirAsyncIterator> {
-        let required_tags = tags_required(&self.roles, options.include_tags)?;
+        let migration_metadata = options.observation_plan.is_some();
+        let validation = validation_for(&self.roles, &options)?;
         let request = self
             .traversal_request(sub, &options, false)?
             .report_root_directory_object(report_root);
+        let cancel = request.cancel.clone();
         let scan = self.start_traversal(request, &options)?;
         let mut session = scan.session;
         let guard = scan.failure;
@@ -123,30 +135,36 @@ impl StorageContext {
         let package = PackageFilter::new(&options);
         let root = sub.unwrap_or(Path::new("")).to_path_buf();
         let (tx, rx) = async_channel::bounded(128);
-        tokio::spawn(async move {
+        let producer_cancel = cancel.clone();
+        let task = tokio::spawn(async move {
+            let cancel_on_drop = producer_cancel.clone().drop_guard();
             let mut histories = HistorySequence::default();
-            while let Some(item) = session.next_item().await {
+            while let Some(item) = session.next_item(&mut Vec::new()).await {
                 let message = match item {
                     TraversalItem::Resumed(_) => {
                         histories = HistorySequence::default();
                         continue;
                     }
                     TraversalItem::Entry(entry) => {
-                        if let Err(error) = histories.check(&entry, required_tags) {
+                        if let Err(error) = histories.check(&entry, validation) {
                             let reason = error.to_string();
                             stored_error
                                 .lock()
                                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                                 .get_or_insert(error);
-                            let _ = tx
-                                .send(StorageEntryMessage::Error {
+                            deliver(
+                                &tx,
+                                &producer_cancel,
+                                StorageEntryMessage::Error {
                                     event: ErrorEvent::Scan,
                                     path: root.clone(),
                                     entry: None,
                                     reason,
-                                })
-                                .await;
-                            return;
+                                },
+                            )
+                            .await;
+                            producer_cancel.cancel();
+                            break;
                         }
                         let projected = *entry;
                         let relative = projected
@@ -158,8 +176,8 @@ impl StorageContext {
                         } else {
                             StorageEntryMessage::Scanned(Arc::new(projected))
                         };
-                        if tx.send(message).await.is_err() {
-                            return;
+                        if !deliver(&tx, &producer_cancel, message).await {
+                            break;
                         }
                         continue;
                     }
@@ -182,11 +200,9 @@ impl StorageContext {
                             reason
                         },
                     },
-                    TraversalItem::ObservationFailure(failure) => StorageEntryMessage::Error {
-                        event: ErrorEvent::Scan,
-                        path: PathBuf::from(failure.path.as_str()),
-                        entry: None,
-                        reason: {
+                    TraversalItem::ObservationFailure(failure) => {
+                        let path = PathBuf::from(failure.path.as_str());
+                        let reason = {
                             let error = StorageError::TraversalObservation(failure);
                             let reason = error.to_string();
                             stored_error
@@ -194,31 +210,50 @@ impl StorageContext {
                                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                                 .get_or_insert(error);
                             reason
-                        },
-                    },
+                        };
+                        if migration_metadata {
+                            StorageEntryMessage::Diagnostic {
+                                event: ErrorEvent::Scan,
+                                path,
+                                reason,
+                            }
+                        } else {
+                            StorageEntryMessage::Error {
+                                event: ErrorEvent::Scan,
+                                path,
+                                entry: None,
+                                reason,
+                            }
+                        }
+                    }
                     _ => continue,
                 };
-                if tx.send(message).await.is_err() {
-                    return;
+                if !deliver(&tx, &producer_cancel, message).await {
+                    break;
                 }
             }
-            if !histories.is_complete() {
+            if !histories.is_complete() && !producer_cancel.is_cancelled() {
                 stored_error
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .get_or_insert_with(|| operation("incomplete object history"));
-                let _ = tx
-                    .send(StorageEntryMessage::Error {
+                deliver(
+                    &tx,
+                    &producer_cancel,
+                    StorageEntryMessage::Error {
                         event: ErrorEvent::Scan,
                         path: PathBuf::new(),
                         entry: None,
                         reason: "incomplete object history".into(),
-                    })
-                    .await;
-                return;
+                    },
+                )
+                .await;
+                producer_cancel.cancel();
             }
+            // 提前结束交付时也必须消费到 EOF，才能等待原生完成证据。
+            while session.next_item(&mut Vec::new()).await.is_some() {}
             match session.finish().await {
-                Ok(TraversalOutcome::Completed(_)) => {}
+                Ok(TraversalOutcome::Completed(_)) if !producer_cancel.is_cancelled() => {}
                 result => {
                     let reason = format!("traversal did not complete: {result:?}");
                     let error = match result {
@@ -229,34 +264,55 @@ impl StorageContext {
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner)
                         .get_or_insert(error);
-                    let _ = tx
-                        .send(StorageEntryMessage::Error {
+                    deliver(
+                        &tx,
+                        &producer_cancel,
+                        StorageEntryMessage::Error {
                             event: ErrorEvent::Scan,
                             path: PathBuf::new(),
                             entry: None,
                             reason,
-                        })
-                        .await;
+                        },
+                    )
+                    .await;
                 }
             }
+            // 正常 EOF 不取消信号，仍允许消费者排空已经交付的缓冲。
+            cancel_on_drop.disarm();
         });
         Ok(AsyncReceiver::new(rx)
             .with_scan_failure(terminal_error, guard)
-            .with_recovery(recovery))
+            .with_recovery(recovery)
+            .with_producer(task, cancel))
     }
     /// 交付原生目录块；历史顺序和必需事实在编号／传输前完成准入。
     pub fn directory_inventory(&self, options: &WalkOptions) -> Result<DirectoryInventory> {
         Ok(DirectoryInventory {
-            required_tags: tags_required(&self.roles, options.include_tags)?,
+            validation: validation_for(&self.roles, options)?,
             session: self.traversal(None, options, true)?,
             histories: HistorySequence::default(),
             ended: false,
         })
     }
 }
+
+/// 交付背压不能阻塞取消；接收端关闭时同步停止本次原生遍历。
+pub(crate) async fn deliver(
+    tx: &async_channel::Sender<StorageEntryMessage>, cancel: &CancellationToken, message: StorageEntryMessage,
+) -> bool {
+    let delivered = tokio::select! {
+        biased;
+        () = cancel.cancelled() => false,
+        result = tx.send(message) => result.is_ok(),
+    };
+    if !delivered {
+        cancel.cancel();
+    }
+    delivered
+}
 /// 有界原生目录流，不持有 NDX、wire 页或整棵目录的观察。
 pub struct DirectoryInventory {
-    required_tags: bool,
+    validation: ObservationValidation,
     session: TraversalSession,
     histories: HistorySequence,
     ended: bool,
@@ -267,12 +323,12 @@ impl DirectoryInventory {
         if self.ended {
             return None;
         }
-        match self.session.next_item().await {
+        match self.session.next_item(&mut Vec::new()).await {
             Some(TraversalItem::Resumed(event)) => {
                 self.histories = HistorySequence::default();
                 Some(Ok(TraversalItem::Resumed(event)))
             }
-            Some(TraversalItem::Entry(entry)) => match self.histories.check(&entry, self.required_tags) {
+            Some(TraversalItem::Entry(entry)) => match self.histories.check(&entry, self.validation) {
                 Ok(()) => Some(Ok(TraversalItem::Entry(entry))),
                 Err(error) => {
                     self.ended = true;
@@ -305,7 +361,7 @@ pub enum ResumableScanItem {
 }
 
 pub struct ResumableScan {
-    include_tags: bool,
+    validation: ObservationValidation,
     session: TraversalSession,
     recovery: Option<TraversalRecoveryStatus>,
     guard: ScanFailureSignal,
@@ -325,15 +381,16 @@ impl ResumableScan {
     /// 放弃未确认的尾部条目，等待遍历真正停止；不把取消时的部分历史当成完成证据。
     pub async fn stop(mut self) -> Result<TraversalOutcome> {
         self.cancel.cancel();
-        while self.session.next_item().await.is_some() {}
+        while self.session.next_item(&mut Vec::new()).await.is_some() {}
         self.session.finish().await.map_err(StorageError::from)
     }
     pub async fn next(&mut self) -> Option<Result<ResumableScanItem>> {
+        let mut completed = Vec::new();
         loop {
             let item = tokio::select! {
                 biased;
                 () = self.guard.failed() => return self.guard.failure().map(|failure| Err(failure.into())),
-                item = self.session.next_item() => item,
+                item = self.session.next_item(&mut completed) => item,
             };
             let Some(item) = item else { break };
             match item {
@@ -345,10 +402,8 @@ impl ResumableScan {
                     return Some(Ok(ResumableScanItem::Statistics(statistics)));
                 }
                 TraversalItem::Entry(entry) => {
-                    if self.include_tags {
-                        if let Err(error) = validate_required_tags(&entry) {
-                            return Some(Err(error));
-                        }
+                    if let Err(error) = self.validation.validate(&entry) {
+                        return Some(Err(error));
                     }
                     if let Some(history) = entry.history() {
                         let expected = self.history.get_or_insert_with(|| (entry.path().as_str().into(), 0));
@@ -427,7 +482,7 @@ mod stopping_tests {
             guard: ScanFailureSignal::source(&storage.roles, None).unwrap().1,
             session,
             history: Some(("partial-history".into(), 1)),
-            include_tags: false,
+            validation: ObservationValidation::new(false, MetadataScope::default()),
             cancel: cancel.clone(),
         };
         let finished = Arc::new(AtomicBool::new(false));
@@ -447,8 +502,22 @@ mod stopping_tests {
 
 pub type WalkDirAsyncIterator = AsyncReceiver<StorageEntryMessage>;
 
+fn validation_for(storage: &Storage, options: &WalkOptions) -> Result<ObservationValidation> {
+    let required_tags = match options.observation_plan {
+        Some(plan) => plan.tags() == ObservationMode::Required,
+        None => tags_required(storage, options.include_tags)?,
+    };
+    Ok(ObservationValidation::new(required_tags, options.metadata_scope))
+}
+
 #[derive(Debug, Clone)]
 pub struct WalkOptions {
+    /// 所属任务的取消信号；遍历创建独立子信号，不反向取消任务。
+    pub cancel: Option<CancellationToken>,
+    /// 固定本执行的过滤时间；独立遍历可以显式保留实时判定。
+    pub filter_time_anchor: Option<i64>,
+    pub observation_plan: Option<ObservationPlan>,
+    pub metadata_scope: MetadataScope,
     /// 单个远程存储操作的等待上限；独立于自动恢复，不包含消费者背压。
     pub operation_timeout: Option<std::time::Duration>,
     /// 调用方显式选择的故障恢复窗口；None 直接报告失败，不自动重连。
@@ -465,6 +534,10 @@ pub struct WalkOptions {
 impl Default for WalkOptions {
     fn default() -> Self {
         Self {
+            cancel: None,
+            filter_time_anchor: None,
+            observation_plan: None,
+            metadata_scope: MetadataScope::default(),
             operation_timeout: None,
             recovery_window: None,
             depth: None,
@@ -478,4 +551,12 @@ impl Default for WalkOptions {
     }
 }
 
-use data_mover::filter::FilterExpression;
+impl WalkOptions {
+    pub(crate) fn dsl_filter(&self) -> DslTraversalFilter {
+        let filter = DslTraversalFilter::new(self.match_expressions.clone(), self.exclude_expressions.clone());
+        match self.filter_time_anchor {
+            Some(epoch) => filter.with_time_anchor(epoch),
+            None => filter,
+        }
+    }
+}

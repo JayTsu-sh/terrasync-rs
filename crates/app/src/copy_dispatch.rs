@@ -25,15 +25,28 @@ impl CopyQueues {
     pub(crate) async fn send(&self, message: StorageEntryMessage) -> Result<()> {
         let mut hash = DefaultHasher::new();
         match &message {
+            StorageEntryMessage::TargetPreserved { retention, .. } => {
+                retention.source_path.as_deref().unwrap_or_default().hash(&mut hash)
+            }
             StorageEntryMessage::Scanned(entry)
+            | StorageEntryMessage::CopyEntryBoundary(entry)
+            | StorageEntryMessage::CopySkipped { entry, .. }
+            | StorageEntryMessage::CopyEntryCompleted { entry, .. }
+            | StorageEntryMessage::CopyEntryDeltaCompleted { entry, .. }
             | StorageEntryMessage::Packaged(entry)
             | StorageEntryMessage::Deleted(entry)
             | StorageEntryMessage::IntegrityChecked(entry) => entry.path().as_str().hash(&mut hash),
-            StorageEntryMessage::New(item) | StorageEntryMessage::Changed { entry: item, .. } => {
-                item.entry.path().as_str().hash(&mut hash)
+            StorageEntryMessage::CopyItemCompleted { completion, .. } => {
+                completion.item.entry.path().as_str().hash(&mut hash)
             }
+            StorageEntryMessage::New(item)
+            | StorageEntryMessage::VersionMetadataChanged { entry: item, .. }
+            | StorageEntryMessage::Changed { entry: item, .. }
+            | StorageEntryMessage::CopyVersionFailed { entry: item, .. } => item.entry.path().as_str().hash(&mut hash),
             StorageEntryMessage::Renamed((_, to)) => to.path().as_str().hash(&mut hash),
-            StorageEntryMessage::Error { path, .. } => path.hash(&mut hash),
+            StorageEntryMessage::Error { path, .. } | StorageEntryMessage::Diagnostic { path, .. } => {
+                path.hash(&mut hash)
+            }
             StorageEntryMessage::TarManifest { tar_path, .. } => tar_path.hash(&mut hash),
         }
         let index = hash.finish() as usize % self.senders.len();

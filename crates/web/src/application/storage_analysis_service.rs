@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use app::consumer::stats::report::ProgressReport;
+use app::report::ProgressReport;
 
 use crate::domain::analysis::{AnalysisRepository, AnalysisTreeQuery, StorageAnalysis};
 use crate::domain::endpoint::EndpointConfig;
@@ -210,7 +210,7 @@ mod tests {
                 .bind(status).execute(&pool).await.unwrap();
         }
         let report = serde_json::json!({
-            "job_id":"task", "job_type":"scan", "elapsed_secs":1, "speed_bytes_per_sec":0,
+            "target_preserved_count":0, "job_id":"task", "job_type":"scan", "elapsed_secs":1, "speed_bytes_per_sec":0,
             "detail":{"kind":"Full","scanned_files":expected_files,"scanned_dirs":1,"total_bytes":123,"transferred_bytes":0,"error_count":0},
             "is_final":true,
             "final_stats":{"dirs":1,"dir_size":0,"regular_files":expected_files,"regular_file_size":123,"symlinks":0,"symlink_size":0,

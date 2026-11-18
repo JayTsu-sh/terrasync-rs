@@ -12,13 +12,17 @@ pub mod ace;
 pub mod task_stream;
 
 pub mod broadcast;
+pub mod callback;
 mod copy_dispatch;
+mod copy_history;
 
 /// 双进程模式 Receiver 落盘任务模块
 ///
 /// 串行消费 `DiskCommitMsg`，通过 expert destination 流式写入受控 stage，
 /// 提交时由引擎读回校验并发布
-pub mod disk_commit;
+#[cfg(any(feature = "remote", test))]
+mod disk_commit;
+#[cfg(any(feature = "remote", test))]
 mod file_commit;
 mod file_copy;
 pub mod storage_factory;
@@ -38,28 +42,35 @@ pub mod config;
 /// 负责管理不同类型的消费者，如存储条目消费者和统计消费者
 pub mod consumer;
 
+/// 任务进度、回调与最终结果的公开报告契约。
+pub mod report;
+
 mod copy_completion;
 mod copy_execution;
+mod copy_root;
 mod job_execution;
 pub mod local_transfer;
+#[cfg(test)]
+#[path = "../../../tests/support/migration.rs"]
+mod migration_fixtures;
+mod migration_plan;
 /// Sync 编排器模块
 ///
-/// SyncOrchestrator 封装 sync/incremental_sync 的核心逻辑
-pub mod orchestrator;
-pub mod scan_resume;
+/// SyncOrchestrator 封装全量与增量迁移流程
+mod orchestrator;
+mod rename;
+mod source_cleanup;
 mod sync_catalog;
+mod target_absence;
 
+#[cfg(any(feature = "remote", test))]
 mod remote_inventory;
-/// 双进程远端同步（Sender 侧）
-///
-/// 将 run_sync_remote 的各阶段逻辑提取为独立函数，降低单函数复杂度
+/// 双进程模式的发送与接收入口。
+#[cfg(feature = "remote")]
 pub mod remote_sync;
 
-/// 双进程远端同步 Receiver 会话
-///
-/// 封装一次已协商会话的生命周期；当前版本保留既有事件循环作为内部实现，
-/// 后续重构可在不扩大调用方 interface 的前提下逐步迁移会话状态。
-pub mod remote_receiver_session;
+#[cfg(any(feature = "remote", test))]
+mod remote_receiver_session;
 
 /// 双进程 remote advertisement：opaque snapshot paging 与 session-local NDX。
 pub mod remote_advertisement;
@@ -125,14 +136,12 @@ pub mod prelude {
     pub use crate::error::{AppError, Result};
     /// 完整性检查
     pub use crate::integrity_check::integrity_check;
-    /// Sync 编排器
-    pub use crate::orchestrator::SyncOrchestrator;
     /// 文件删除功能
     pub use crate::rm::rm;
     /// 文件扫描功能
     pub use crate::scan::{ScanRequest, ScanType, scan};
     /// 文件复制功能
-    pub use crate::sync::{incremental_sync, sync};
+    pub use crate::sync::sync;
 }
 
 #[cfg(test)]

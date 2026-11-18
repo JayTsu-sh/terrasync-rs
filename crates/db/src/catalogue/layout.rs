@@ -23,16 +23,24 @@ pub(super) struct ClusterCatalogue {
 #[derive(Clone, Copy)]
 pub(super) enum CatalogueEngine {
     Replacing,
+    ReplacingVersion(&'static str),
     MergeTree,
 }
 
 impl CatalogueEngine {
     fn name(self, replicated: bool) -> &'static str {
         match (self, replicated) {
-            (Self::Replacing, false) => "ReplacingMergeTree",
-            (Self::Replacing, true) => "ReplicatedReplacingMergeTree",
+            (Self::Replacing | Self::ReplacingVersion(_), false) => "ReplacingMergeTree",
+            (Self::Replacing | Self::ReplacingVersion(_), true) => "ReplicatedReplacingMergeTree",
             (Self::MergeTree, false) => "MergeTree",
             (Self::MergeTree, true) => "ReplicatedMergeTree",
+        }
+    }
+
+    fn version(self) -> Result<String> {
+        match self {
+            Self::ReplacingVersion(column) => identifier(column),
+            Self::Replacing | Self::MergeTree => Ok(String::new()),
         }
     }
 }
@@ -75,20 +83,33 @@ impl ClusterCatalogue {
     }
 
     fn create_statements(
-        &self, table: &str, columns: &str, order: &str, engine: CatalogueEngine,
+        &self, table: &str, columns: &str, order: &str, engine: CatalogueEngine, identity: Option<&str>,
     ) -> Result<[String; 2]> {
         let local = Self::local(table)?;
         let public = identifier(table)?;
         let on_cluster = self.on_cluster()?;
-        // 同名目录表可以重建；独立 Keeper 路径避免复用尚未清理的副本状态。
-        let path = format!(
-            "/terrasync/catalogue/{}/{}/{{shard}}",
-            self.database,
-            Uuid::new_v4().simple()
+        // 普通目录重建使用独立 Keeper 路径；持久表显式绑定身份以便重试部分 DDL。
+        let table_id = identity.map_or_else(
+            || Uuid::new_v4().simple().to_string(),
+            |identity| {
+                let mut hash = blake3::Hasher::new();
+                hash.update(b"terrasync/persistent-table/v1\0");
+                hash.update(&(self.cluster.len() as u64).to_le_bytes());
+                hash.update(self.cluster.as_bytes());
+                hash.update(identity.as_bytes());
+                hash.finalize().to_hex().to_string()
+            },
         );
+        let path = format!("/terrasync/catalogue/{}/{}/{{shard}}", self.database, table_id);
+        let version = engine.version()?;
+        let version = if version.is_empty() {
+            version
+        } else {
+            format!(", {version}")
+        };
         let engine = engine.name(true);
         let local_sql = format!(
-            "CREATE TABLE IF NOT EXISTS {local} {on_cluster} ({columns}) ENGINE = {engine}('{path}', '{{replica}}') \
+            "CREATE TABLE IF NOT EXISTS {local} {on_cluster} ({columns}) ENGINE = {engine}('{path}', '{{replica}}'{version}) \
              ORDER BY {order} SETTINGS allow_nullable_key = 1"
         );
         // 同一 job 的所有目录表落在同一 shard，跨表比较不会拆散相同路径或硬链接。
@@ -122,7 +143,9 @@ impl ClickHouseDatabase {
     pub(super) async fn create_catalogue_exclusions(&self, table: &str) -> Result<()> {
         if self.catalogue_cluster.is_none() {
             self.execute(
-                &format!("CREATE TABLE {table} (relative_path String, version_id String) ENGINE = Memory"),
+                &format!(
+                    "CREATE TABLE {table} (relative_path String, version_id String,data_unchanged Bool) ENGINE = Memory"
+                ),
                 &[],
             )
             .await?;
@@ -130,22 +153,23 @@ impl ClickHouseDatabase {
         }
         self.create_catalogue_table(
             table,
-            "relative_path String, version_id String",
+            "relative_path String, version_id String,data_unchanged Bool",
             "(relative_path, version_id)",
             CatalogueEngine::MergeTree,
         )
         .await
     }
 
-    pub(super) async fn write_catalogue_exclusions(&self, table: &str, paths: &[(String, String)]) -> Result<()> {
+    pub(super) async fn write_catalogue_exclusions(&self, table: &str, paths: &[(String, String, bool)]) -> Result<()> {
         let _write = self.catalogue_write_guard().await;
         let client = self.catalogue_write_client(&self.sync_client);
         let mut insert = client.insert::<ExcludeRecord<'_>>(table).await?;
-        for (path, version) in paths {
+        for (path, version, data_unchanged) in paths {
             insert
                 .write(&ExcludeRecord {
                     relative_path: path.as_str(),
                     version_id: version.as_str(),
+                    data_unchanged: *data_unchanged,
                 })
                 .await?;
         }
@@ -156,15 +180,23 @@ impl ClickHouseDatabase {
     pub(super) async fn create_catalogue_table(
         &self, table: &str, columns: &str, order: &str, engine: CatalogueEngine,
     ) -> Result<()> {
+        self.create_catalogue_table_identified(table, columns, order, engine, None)
+            .await
+    }
+
+    /// 持久通知表使用稳定建表身份，部分集群 DDL 重试时不能分裂 Keeper 路径。
+    pub(super) async fn create_catalogue_table_identified(
+        &self, table: &str, columns: &str, order: &str, engine: CatalogueEngine, identity: Option<&str>,
+    ) -> Result<()> {
         let Some(cluster) = &self.catalogue_cluster else {
             self.execute(&format!(
-                "CREATE TABLE IF NOT EXISTS {table} ({columns}) ENGINE = {}() ORDER BY {order} SETTINGS allow_nullable_key = 1, {SINGLE_WRITE_SETTINGS}",
-                engine.name(false)
+                "CREATE TABLE IF NOT EXISTS {table} ({columns}) ENGINE = {}({}) ORDER BY {order} SETTINGS allow_nullable_key = 1, {SINGLE_WRITE_SETTINGS}",
+                engine.name(false), engine.version()?
             ), &[]).await?;
             return Ok(());
         };
         self.validate_catalogue_frontend(table).await?;
-        let [local, public] = cluster.create_statements(table, columns, order, engine)?;
+        let [local, public] = cluster.create_statements(table, columns, order, engine, identity)?;
         self.execute(&local, &[]).await?;
         self.execute(
             &public,

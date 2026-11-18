@@ -1,82 +1,50 @@
-//! Sync 编排器
-//!
-//! SyncOrchestrator 封装 sync/incremental_sync 的核心逻辑，
-//! 通过 Transport 抽象层连接 Sender 和 Receiver，支持单进程和双进程两种模式。
+//! 本地迁移入口及其共用的挂载、统计和限速机制。
 
-use crate::file_copy::metadata as copy_metadata;
-use crate::file_copy::namespace as copy_namespace;
-use crate::file_copy::transfer as copy_transfer;
-use crate::rm::progress as deletion;
-use data_mover::model::BackendKind;
-// 标准库
-use crate::copy_dispatch::{CopyQueues, partition_scan};
-use crate::file_copy::{HdfsCopyContext, copy_file};
-use std::collections::HashMap;
-use std::path::PathBuf;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::time::Duration;
-use task_model::ObservedEntryExt;
-use task_model::TransferMode;
+use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
+    },
+    time::Duration,
+};
 
-/// RAII guard：构造时 +1，Drop 时 -1，确保计数器在 panic/early-return 时也能正确回收。
-struct AtomicCounterGuard<'a>(&'a AtomicUsize);
-
-impl<'a> AtomicCounterGuard<'a> {
-    fn increment(counter: &'a AtomicUsize) -> Self {
-        counter.fetch_add(1, Ordering::Relaxed);
-        Self(counter)
-    }
-}
-
-impl Drop for AtomicCounterGuard<'_> {
-    fn drop(&mut self) {
-        self.0.fetch_sub(1, Ordering::Relaxed);
-    }
-}
-
-// 外部 crate
-use crate::storage_factory::StorageContext;
-#[cfg(windows)]
-use crate::storage_factory::backend_kind_from_location;
-use data_mover::model::ObservedEntry;
 use data_mover::qos::QosManager;
-use db::ClickHouseDatabase;
-use db::{self, DeletionStatus, INCREMENTAL_SCAN_TABLE_BASE_NAME};
-use task_model::{ChangeKind, EntryChange, ErrorEvent, StorageEntryMessage};
+use task_model::migration::CopyGenerationPhase;
 use tokio::sync::Semaphore;
 use tokio::task::JoinHandle;
-use tracing::{Instrument, error, info, info_span, trace, warn};
-use transport::in_process::create_in_process_pair;
-use transport::message::SenderMsg;
-use transport::traits::{ReceiverTransport, SenderTransport};
+use tokio_util::sync::CancellationToken;
+use tracing::{Instrument, error, info, info_span, warn};
 use utils::app_config::AppConfig;
 
-// 内部模块
-use crate::broadcast::{BroadcastForwarder, DEFAULT_CHANNEL_CAPACITY};
-use crate::config::{JobType, SyncJobConfig, initialize_consumer_config, initialize_scan_config};
+use crate::config::{JobType, SyncJobConfig, initialize_consumer_config};
 use crate::consumer::ConsumerManager;
-use crate::copy_completion;
-use crate::copy_execution::{CopyLease, begin_copy_catalogue};
-use crate::error::{AppError, Result};
-use crate::file_copy::copied_tags_required;
-#[cfg(feature = "license")]
-use crate::integrity_check::verify_storage_time;
-use crate::receiver::{ReceiverConfig, process_entry_on_receiver};
-use crate::scan::ScanType;
-use crate::sender::{SenderWorkerConfig, sender_worker};
-use crate::storage_factory::{StorageRole, create_storage_for_role};
-#[cfg(windows)]
-use crate::sync::check_admin_privileges;
-use crate::sync::{
-    CommitRecorder, ResumeOpts, StoragePair, parse_size, process_entry, process_metadata_only_entry,
-    process_rename_entry, process_versioned_entry,
-};
-use crate::sync_catalog::{batch_processing_to_generate_message, determine_sync_type, finish_phase};
-use crate::{dir_walker, tar_pack};
+use crate::error::{AppError, Result, StorageError};
+use crate::source_cleanup;
+use crate::sync::StoragePair;
 
-/// 大文件日志阈值（512 MiB）
-const LARGE_FILE_LOG_THRESHOLD: u64 = 512 * 1024 * 1024;
+mod full;
+mod incremental;
+mod local;
+
+#[cfg(test)]
+#[path = "orchestrator_absence_tests.rs"]
+mod absence_tests;
+#[path = "orchestrator_incremental_worker.rs"]
+mod incremental_worker;
+#[path = "orchestrator_target_reconciliation.rs"]
+mod target_reconciliation;
+
+#[cfg(test)]
+#[path = "orchestrator_rename_tests.rs"]
+mod rename_tests;
+
+#[cfg(test)]
+#[path = "orchestrator_retention_tests.rs"]
+mod retention_tests;
+
+#[cfg(all(test, unix))]
+#[path = "orchestrator_root_error_tests.rs"]
+mod root_error_tests;
 
 /// `StoragePair` 创建失败后的最大重试次数
 const STORAGE_PAIR_MAX_RETRIES: usize = 3;
@@ -150,1175 +118,124 @@ async fn wait_for_mount_init(pools: &[(&AtomicUsize, &AtomicUsize, &str)], expec
 /// 失败时指数退避重试，避免 portmapper 被突发请求打满。
 async fn create_storage_pair_with_retry(
     semaphore: &Semaphore, src_path: &str, dest_path: &str, block_size: Option<usize>, worker_label: &str,
+    cancel: Option<&CancellationToken>,
 ) -> Result<StoragePair> {
-    let mut last_error = None;
+    let initialize = async {
+        let mut last_error = None;
 
-    for attempt in 0..=STORAGE_PAIR_MAX_RETRIES {
-        let permit = semaphore
-            .acquire()
-            .await
-            .map_err(|_| AppError::ConfigError("Mount semaphore closed".to_string()))?;
+        for attempt in 0..=STORAGE_PAIR_MAX_RETRIES {
+            let permit = semaphore
+                .acquire()
+                .await
+                .map_err(|_| AppError::ConfigError("Mount semaphore closed".to_string()))?;
 
-        match StoragePair::new(src_path, dest_path, block_size).await {
-            Ok(pair) => {
-                if attempt > 0 {
-                    info!(
-                        "{}: StoragePair created successfully after {} retries",
-                        worker_label, attempt
-                    );
+            match StoragePair::new(src_path, dest_path, block_size).await {
+                Ok(pair) => {
+                    if attempt > 0 {
+                        info!(
+                            "{}: StoragePair created successfully after {} retries",
+                            worker_label, attempt
+                        );
+                    }
+                    return Ok(pair);
                 }
-                return Ok(pair);
-            }
-            Err(e) => {
-                warn!(
-                    "{}: StoragePair creation failed (attempt {}/{}): {}",
-                    worker_label,
-                    attempt + 1,
-                    STORAGE_PAIR_MAX_RETRIES + 1,
-                    e
-                );
-                last_error = Some(e);
-                // 显式释放 permit 后再进入退避等待，避免退避期间占用 mount 槽位
-                drop(permit);
+                Err(e) => {
+                    warn!(
+                        "{}: StoragePair creation failed (attempt {}/{}): {}",
+                        worker_label,
+                        attempt + 1,
+                        STORAGE_PAIR_MAX_RETRIES + 1,
+                        e
+                    );
+                    last_error = Some(e);
+                    // 显式释放 permit 后再进入退避等待，避免退避期间占用 mount 槽位
+                    drop(permit);
 
-                if attempt < STORAGE_PAIR_MAX_RETRIES {
-                    // 使用较长的退避：nfs-rs 绑定特权端口失败后端口进入 TIME_WAIT，
-                    // 过短的退避（200ms）无法避开同一端口被再次选中。
-                    // 2s/4s/8s 给 nfs-rs 更大概率在下次尝试时随机到可用端口。
-                    let backoff_ms = 2000u64 * (1u64 << attempt);
-                    tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+                    if attempt < STORAGE_PAIR_MAX_RETRIES {
+                        // 使用较长的退避：nfs-rs 绑定特权端口失败后端口进入 TIME_WAIT，
+                        // 过短的退避（200ms）无法避开同一端口被再次选中。
+                        // 2s/4s/8s 给 nfs-rs 更大概率在下次尝试时随机到可用端口。
+                        let backoff_ms = 2000u64 * (1u64 << attempt);
+                        tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+                    }
                 }
             }
         }
+
+        Err(last_error.unwrap_or_else(|| {
+            AppError::ConfigError(format!("{worker_label}: StoragePair creation exhausted all retries"))
+        }))
+    };
+    match cancel {
+        Some(cancel) => tokio::select! {
+            biased;
+            () = cancel.cancelled() => Err(StorageError::Cancelled.into()),
+            result = initialize => result,
+        },
+        None => initialize.await,
     }
-
-    Err(last_error.unwrap_or_else(|| {
-        AppError::ConfigError(format!("{worker_label}: StoragePair creation exhausted all retries"))
-    }))
 }
 
-/// Sync 编排器
-///
-/// 统一管理 sync 和 `incremental_sync` 的执行流程。
-/// 单进程模式下通过 `InProcessTransport` 连接 sender 和 receiver task。
-/// 双进程模式下通过 QUIC Transport 连接远端 Receiver（Phase 3）。
-/// Sync 模式
-enum SyncMode {
-    /// 单进程：src+dest 在同一进程
-    Local,
-    /// 双进程：通过 QUIC 连接远端 Receiver
-    Remote {
-        remote_addr: String,
-        /// 服务端 DER 证书（来自 `serve --tls-cert-out`），None 时跳过验证（输出 WARNING）
-        tls_server_cert: Option<Vec<u8>>,
-        /// Token 鉴权（与 `serve --token` 配对），None 时发送空 token
-        auth_token: Option<String>,
-    },
-}
-
-pub struct SyncOrchestrator {
+/// 按已提交基线和复制策略编排单进程全量或增量迁移。
+pub(crate) struct SyncOrchestrator {
     config: SyncJobConfig,
-    mode: SyncMode,
+    #[cfg(test)]
+    filter_time: Option<i64>,
 }
 
 impl SyncOrchestrator {
+    #[cfg(test)]
+    pub(crate) fn with_filter_time(mut self, epoch: i64) -> Self {
+        self.filter_time = Some(epoch);
+        self
+    }
     /// 创建单进程模式的编排器
-    pub fn new_local(config: SyncJobConfig) -> Self {
+    pub(crate) fn new_local(config: SyncJobConfig) -> Self {
         Self {
             config,
-            mode: SyncMode::Local,
+            #[cfg(test)]
+            filter_time: None,
         }
     }
 
-    /// 创建双进程模式的编排器（Sender 侧，连接远端 Receiver）
-    ///
-    /// `tls_server_cert`: 服务端 DER 证书字节（来自 `serve --tls-cert-out`），
-    /// 传入 `None` 时跳过 TLS 验证（输出 WARNING）。
-    /// `auth_token`: 与 Receiver `serve --token` 配对的鉴权 token，`None` 时发送空 token。
-    pub fn new_remote(
-        config: SyncJobConfig, remote_addr: &str, tls_server_cert: Option<Vec<u8>>, auth_token: Option<String>,
-    ) -> Self {
-        Self {
-            config,
-            mode: SyncMode::Remote {
-                remote_addr: remote_addr.to_string(),
-                tls_server_cert,
-                auth_token,
-            },
-        }
-    }
-
-    /// 执行 sync 管线
-    ///
-    /// 根据已提交数据库基线和复制策略选择；启用数据库时构造失败直接上报。
-    pub async fn run(&self) -> Result<()> {
-        // 自动判定 ScanType
-        let c = &self.config;
-        info!(transfer_mode = ?c.transfer_mode, "Sync transfer mode selected");
-        if c.packaged && c.transfer_mode != TransferMode::Atomic {
-            return Err(AppError::ConfigError(
-                "Packaged sync supports only Atomic mode; use --in-place".into(),
-            ));
-        }
-        let copy_tags = match self.mode {
-            SyncMode::Local => {
-                let destination = create_storage_for_role(&c.dest_path, None, true, StorageRole::Destination).await?;
-                copy_transfer::validate_transfer_mode(&destination, c.transfer_mode)?;
-                copied_tags_required(&destination)?
-            }
-            SyncMode::Remote { .. } => false,
-        };
-
+    /// 按数据库基线和复制策略执行本地迁移。
+    pub(crate) async fn run(&self) -> Result<()> {
         let app_config = AppConfig::fetch()?;
-        // database.enabled=true 时必须成功构造；false 时忽略错误（未启用），走文件系统兜底
-        let db_instance = if app_config.database.enabled {
-            Some(ClickHouseDatabase::connect(&app_config.database.clickhouse, &c.job_id).await?)
-        } else {
-            None
-        };
-        let scan_type = if !app_config.database.enabled || !app_config.sync.is_source_reserved {
-            ScanType::Full
-        } else {
-            determine_sync_type(db_instance.as_ref(), c.job_dir_pre_existing).await
-        };
-
-        info!("SyncOrchestrator: determined scan_type={}", scan_type);
-
-        match &self.mode {
-            SyncMode::Local => match scan_type {
-                ScanType::Full => self.run_sync(copy_tags).await,
-                ScanType::Incremental => self.run_incremental_sync(copy_tags).await,
-            },
-            // 双进程模式本就是 compare-based（DestIndex 实时比对目标端），Full/Incremental
-            // 在 wire protocol 和执行路径上是同一套代码，ScanType 对 Remote 是 no-op
-            // （issue #23：不存在需要新写的"远端增量模式"）。
-            SyncMode::Remote {
-                remote_addr,
-                tls_server_cert,
-                auth_token,
-            } => {
-                self.run_sync_remote(remote_addr, tls_server_cert.as_deref(), auth_token.as_deref())
-                    .await
-            }
-        }
-    }
-
-    /// 全量同步 — 通过 transport 连接 sender workers 和 receiver tasks
-    async fn run_sync(&self, copy_tags: bool) -> Result<()> {
         let c = &self.config;
-
-        // ── License 校验 ──
-        #[cfg(feature = "license")]
-        {
-            if let Ok(license) = licensing::get_global_license() {
-                licensing::verify::quick_verify(license)?;
-            }
-            verify_storage_time(&c.dest_path).await?;
-        }
-
-        info!(
-            "Starting sync via orchestrator: job_id({}), src({}), dest({})",
-            c.job_id,
-            data_mover::redact_storage_url(&c.src_path),
-            data_mover::redact_storage_url(&c.dest_path)
-        );
-
-        // ── 1. 加载配置 ──
-        let app_config = AppConfig::fetch()?;
-        let _lease = CopyLease::acquire(&app_config.database.clickhouse, c)?;
-        let is_source_reserved = app_config.sync.is_source_reserved;
-        let copy_concurrency = c.concurrency.unwrap_or(app_config.sync.concurrency);
-
-        let block_size = match &c.block_size {
-            Some(s) => Some(parse_size(s)?),
-            None => None,
-        };
-
-        // ── 2. 初始化扫描配置 ──
-        let scan_config = initialize_scan_config(
-            &c.job_id,
-            &c.src_path,
-            0,
-            ScanType::Full,
-            &c.r#match,
-            &c.exclude,
-            c.concurrency.unwrap_or(app_config.scan.concurrency),
-            app_config.scan.include_tags || copy_tags,
-            &c.file_list,
-            c.packaged,
-            c.package_depth,
-        )?;
-
-        // ── 3. 初始化消费者配置 + 数据库 ──
-        let consumer_config = Arc::new(initialize_consumer_config(
+        let mut notifications = initialize_consumer_config(
             &c.job_id,
             &c.job_dir,
             JobType::Copy,
             c.raw_command_line.clone(),
             &app_config,
             c.progress_callback_url.clone(),
-        )?);
-
-        let database = if consumer_config.db_config.enabled {
-            let database: ClickHouseDatabase =
-                ClickHouseDatabase::connect(&consumer_config.db_config.clickhouse, &c.job_id).await?;
-            database.initialize().await?;
-            begin_copy_catalogue(&database, c, block_size, is_source_reserved).await?;
-            Some(database)
-        } else {
-            None
-        };
-
-        // 先建立枚举，再启动后台消费者；连接失败时没有待收尾的 worker。
-        let walkdir_iter = dir_walker::walkdir(scan_config).await?;
-
-        // ── 4. 广播器 + 消费者 ──
-        let mut broadcaster = BroadcastForwarder::new(DEFAULT_CHANNEL_CAPACITY);
-        let mut consumer_manager = ConsumerManager::with_database(consumer_config.as_ref(), database.clone()).await?;
-        consumer_manager.begin_lifecycle().await;
-        let consumer_handles = consumer_manager.start_consumers(&mut broadcaster).await?;
-        let bytes_tracker = consumer_manager.get_bytes_tracker().await;
-
-        // ── 5. 解析 block_size + QoS ──
-
-        // Windows 管理员权限检查
-        #[cfg(windows)]
-        {
-            if matches!(backend_kind_from_location(&c.src_path), BackendKind::Local)
-                && matches!(backend_kind_from_location(&c.dest_path), BackendKind::Local)
-            {
-                match check_admin_privileges() {
-                    Ok(true) => println!("✓ Running with administrator privileges\n"),
-                    Ok(false) => {
-                        eprintln!("⚠ Warning: Not running with administrator privileges");
-                        eprintln!("   It is recommended to rerun this program as an administrator\n");
-                    }
-                    Err(e) => eprintln!("⚠ Unable to check privilege status: {}", e),
-                }
-            }
-        }
-
-        let qos_manager = create_qos_manager(c.qos.as_ref(), c.peak_qos_rate, c.iops);
-
-        // ── 6. 原子计数器 + 统计 reporter ──
-        let active_entry_counter = Arc::new(AtomicUsize::new(0));
-        let entry_counter = Arc::new(AtomicUsize::new(0));
-        let size_counter = Arc::new(AtomicU64::new(0));
-        let active_tokio_task_counter = Arc::new(AtomicUsize::new(0));
-        // mount 完成标志：reporter 在 mount 期间仅打 INFO，避免误报 WARN。
-        let mount_completed = Arc::new(AtomicBool::new(false));
-
-        let stats_handle = Self::spawn_stats_reporter(
-            active_entry_counter.clone(),
-            entry_counter.clone(),
-            size_counter.clone(),
-            active_tokio_task_counter.clone(),
-            copy_concurrency,
-            mount_completed.clone(),
-        );
-
-        // ── 8. 创建 Transport ──
-        let (sender_transport, receiver_transport) = create_in_process_pair();
-        let sender_transport: Arc<dyn SenderTransport> = Arc::new(sender_transport);
-        let receiver_transport = Arc::new(receiver_transport);
-
-        let receiver_config = Arc::new(ReceiverConfig {
-            job_id: c.job_id.clone(),
-            enable_integrity_check: c.enable_integrity_check,
-            enable_acl: c.enable_acl,
-            is_source_reserved,
-            job_dir: c.job_dir.clone(),
-            transfer_mode: c.transfer_mode,
-        });
-
-        // ── 8.5. 创建 mount 限流信号量 + countdown latch 计数器（Sender + Receiver 共享） ──
-        // 容量按 storage 类型选择：仅 NFS 因 portmapper / 特权端口冲突需要限速，
-        // CIFS/SMB / S3 / 本地放开到 NON_NFS_MOUNT_CONCURRENCY 让 16 个握手并行完成。
-        let mount_semaphore = Arc::new(Semaphore::new(mount_concurrency_for_pair(&c.src_path, &c.dest_path)));
-        let alive_senders = Arc::new(AtomicUsize::new(0));
-        let alive_receivers = Arc::new(AtomicUsize::new(0));
-        let mount_done_senders = Arc::new(AtomicUsize::new(0));
-        let mount_done_receivers = Arc::new(AtomicUsize::new(0));
-
-        // ── 9. 启动 N 个 Receiver worker（每个创建自己的 StoragePair，和原始 sync_inner 一致） ──
-        let mut receiver_handles = Vec::new();
-        for recv_id in 0..copy_concurrency {
-            let rt = receiver_transport.clone();
-            let src_path = c.src_path.clone();
-            let dest_path = c.dest_path.clone();
-
-            let cfg = receiver_config.clone();
-            let qos = qos_manager.clone();
-            let bt = bytes_tracker.clone();
-            let bc = broadcaster.clone();
-            let task_counter = active_tokio_task_counter.clone();
-            let mount_sem = mount_semaphore.clone();
-            let alive_counter = alive_receivers.clone();
-            let done_counter = mount_done_receivers.clone();
-
-            let span = info_span!("receiver_worker", recv_id = recv_id);
-            let handle = tokio::spawn(
-                async move {
-                    // 每个 worker 创建自己的 StoragePair（带限流重试，防止 portmapper 过载）
-                    let storage_pair = match create_storage_pair_with_retry(
-                        &mount_sem,
-                        &src_path,
-                        &dest_path,
-                        block_size,
-                        &format!("Receiver {recv_id}"),
-                    )
-                    .await
-                    {
-                        Ok(pair) => pair,
-                        Err(e) => {
-                            error!(
-                                "Receiver {}: Failed to create StoragePair after retries: {}",
-                                recv_id, e
-                            );
-                            done_counter.fetch_add(1, Ordering::Release);
-                            return Err(e);
-                        }
-                    };
-                    alive_counter.fetch_add(1, Ordering::Relaxed);
-                    done_counter.fetch_add(1, Ordering::Release);
-                    let src = storage_pair.get_src_storage().clone();
-                    let dest = storage_pair.get_dest_storage().clone();
-
-                    // 从 transport 拉消息处理（MPMC，N 个 worker 竞争消费）
-                    let mut failure = None;
-                    while let Some(msg) = rt.recv().await {
-                        match msg {
-                            SenderMsg::CopyEntry { entry } => {
-                                let _guard = AtomicCounterGuard::increment(&task_counter);
-                                match process_entry_on_receiver(&entry, &src, &dest, &cfg, qos.clone(), bt.clone())
-                                    .await
-                                {
-                                    Ok(()) => {
-                                        bc.broadcast(StorageEntryMessage::New(entry.into())).await;
-                                    }
-                                    Err(e) => {
-                                        error!(
-                                            "Receiver {}: CopyEntry failed {:?}: {}",
-                                            recv_id,
-                                            entry.get_relative_path(),
-                                            e
-                                        );
-                                        bc.broadcast(StorageEntryMessage::Error {
-                                            event: ErrorEvent::Copy,
-                                            path: entry.get_relative_path().to_path_buf(),
-                                            entry: Some(entry.clone()),
-                                            reason: format!("{e}"),
-                                        })
-                                        .await;
-                                        failure.get_or_insert(e);
-                                    }
-                                }
-                            }
-                            SenderMsg::TarPacked {
-                                tar_entry,
-                                manifest_entries,
-                            } => {
-                                let tar_path = tar_entry.get_relative_path().to_string_lossy().to_string();
-                                bc.broadcast(StorageEntryMessage::New(tar_entry.into())).await;
-                                bc.broadcast(StorageEntryMessage::TarManifest {
-                                    tar_path,
-                                    entries: manifest_entries,
-                                })
-                                .await;
-                            }
-                            _ => {}
-                        }
-                    }
-                    // recv() 返回 None 时自然退出（sender_transport 被 drop 后 channel 关闭）
-                    info!("Receiver {}: Completed", recv_id);
-                    match failure {
-                        Some(error) => Err(error),
-                        None => Ok(()),
-                    }
-                }
-                .instrument(span),
-            );
-            receiver_handles.push(handle);
-        }
-
-        // 只有实际 worker 持有接收端；全部挂载失败时生产端能收到关闭错误。
-        drop(receiver_transport);
-
-        // ── 10. 启动 N 个 Sender worker（S1） ──
-        let sender_config = Arc::new(SenderWorkerConfig {
-            enable_integrity_check: c.enable_integrity_check,
-            enable_acl: c.enable_acl,
-            is_source_reserved,
-            large_file_log_threshold: LARGE_FILE_LOG_THRESHOLD,
-        });
-
-        let (sender_inputs, source_dispatch) = partition_scan(
-            walkdir_iter.clone(),
-            copy_concurrency,
-            DEFAULT_CHANNEL_CAPACITY / copy_concurrency.max(1),
-        );
-        let mut sender_handles = Vec::new();
-
-        for (worker_id, wi) in sender_inputs.into_iter().enumerate() {
-            let src_path = c.src_path.clone();
-            let dest_path = c.dest_path.clone();
-            let transport = sender_transport.clone();
-            let bc = broadcaster.clone();
-            let cfg = sender_config.clone();
-            let copy_cfg = receiver_config.clone();
-            let qos = qos_manager.clone();
-            let bt = bytes_tracker.clone();
-            let aec = active_entry_counter.clone();
-            let ec = entry_counter.clone();
-            let sc = size_counter.clone();
-            let mount_sem = mount_semaphore.clone();
-            let alive_counter = alive_senders.clone();
-            let done_counter = mount_done_senders.clone();
-
-            let span = info_span!("sender_worker", worker_id = worker_id);
-            let handle = tokio::spawn(
-                async move {
-                    // 每个 Sender worker 创建自己的 StoragePair（带限流重试，防止 portmapper 过载）
-                    let storage_pair = match create_storage_pair_with_retry(
-                        &mount_sem,
-                        &src_path,
-                        &dest_path,
-                        block_size,
-                        &format!("Sender {worker_id}"),
-                    )
-                    .await
-                    {
-                        Ok(pair) => pair,
-                        Err(e) => {
-                            error!(
-                                "Sender {}: Failed to create StoragePair after retries: {}",
-                                worker_id, e
-                            );
-                            done_counter.fetch_add(1, Ordering::Release);
-                            return Err(e);
-                        }
-                    };
-                    alive_counter.fetch_add(1, Ordering::Relaxed);
-                    done_counter.fetch_add(1, Ordering::Release);
-                    let src = storage_pair.get_src_storage().clone();
-                    let dest = storage_pair.get_dest_storage().clone();
-                    sender_worker(
-                        worker_id, wi, src, dest, transport, &bc, &cfg, qos, bt, &copy_cfg, aec, ec, sc,
-                    )
-                    .await
-                }
-                .instrument(span),
-            );
-            sender_handles.push(handle);
-        }
-
-        // ── 10.5. 等待所有 worker 完成 mount 初始化，输出存活汇总 ──
-        wait_for_mount_init(
-            &[
-                (&mount_done_senders, &alive_senders, "Sender"),
-                (&mount_done_receivers, &alive_receivers, "Receiver"),
-            ],
-            copy_concurrency,
-        )
-        .await;
-        // 通知 stats_reporter：mount 期已结束，后续 active_tasks 不足才视为异常。
-        mount_completed.store(true, Ordering::Release);
-
-        // ── 11. 等待 Sender workers 完成 ──
-        let senders_result = finish_phase(sender_handles).await;
-        walkdir_iter.close();
-        let source_dispatch_result = finish_phase(vec![source_dispatch]).await;
-
-        // ── 12. 关闭管线（和原始 sync_inner 一致） ──
-        // Sender workers 全部完成 → 不再发 CopyEntry
-        // drop sender_transport → S→R channel 关闭 → 所有 Receiver 的 recv() 返回 None → 退出
-        drop(sender_transport);
-
-        // 等所有 Receiver worker 退出（退出时 broadcaster clone 也 drop）
-        let receivers_result = finish_phase(receiver_handles).await;
-
-        // ── 13. Cleanup ──
-        stats_handle.abort();
-        let _ = stats_handle.await;
-
-        if let Some(ref qos_mgr) = qos_manager {
-            qos_mgr.shutdown();
-        }
-
-        drop(broadcaster);
-        let consumers_result = finish_phase(consumer_handles).await;
-        let source_result = walkdir_iter.take_error().map_or(Ok(()), |error| Err(error.into()));
-        let result: Result<()> = async {
-            source_result
-                .and(senders_result)
-                .and(receivers_result)
-                .and(consumers_result)
-                .and(source_dispatch_result)?;
-            if let Some(database) = &database {
-                let destination = Arc::new(
-                    create_storage_for_role(
-                        &c.dest_path,
-                        block_size.map(|size| size as u64),
-                        false,
-                        StorageRole::Destination,
-                    )
-                    .await?,
-                );
-                copy_completion::complete(database.clone(), destination).await?;
-            }
-            Ok(())
-        }
-        .await;
-        if let Err(error) = &result {
-            consumer_manager.record_task_failures(&[error.to_string()]).await;
-        }
-        consumer_manager.end_lifecycle().await;
-        result?;
-
-        info!("Copy job {} completed successfully via orchestrator", c.job_id);
-        Ok(())
-    }
-
-    /// 增量同步 — 双阶段流水线：
-    /// - Phase A：scan workers → DB 比对 → handler workers 拷贝 → 通过 `broadcaster_a` 喂给 consumers
-    /// - Barrier：`drop(broadcaster_a)` + `await phase_a_handles`（base 表冲刷完毕）
-    /// - Phase B：`detect_deleted_items` → 执行 dest 物理删除/重命名 → 通过 `broadcaster_b`
-    ///   喂给同一组 consumers（`DatabaseConsumer` 自动完成 incremental 表写入 + base 表修正）
-    async fn run_incremental_sync(&self, copy_tags: bool) -> Result<()> {
-        let c = &self.config;
-
-        // ── License 校验 ──
-        #[cfg(feature = "license")]
-        {
-            if let Ok(license) = licensing::get_global_license() {
-                licensing::verify::quick_verify(license)?;
-            }
-            verify_storage_time(&c.dest_path).await?;
-        }
-
-        info!(
-            "Starting incremental sync via orchestrator: job_id({}), src({}), dest({})",
-            c.job_id,
-            data_mover::redact_storage_url(&c.src_path),
-            data_mover::redact_storage_url(&c.dest_path)
-        );
-
-        // ── 1. 加载配置 ──
-        let app_config = AppConfig::fetch()?;
-        let _lease = CopyLease::acquire(&app_config.database.clickhouse, c)?;
-        let is_source_reserved = app_config.sync.is_source_reserved;
-        let copy_concurrency = c.concurrency.unwrap_or(app_config.sync.concurrency);
-
-        let block_size = match &c.block_size {
-            Some(s) => Some(parse_size(s)?),
-            None => None,
-        };
-
-        // ── 2. 初始化扫描配置（增量不支持 file_list） ──
-        let scan_config = initialize_scan_config(
-            &c.job_id,
-            &c.src_path,
-            0,
-            ScanType::Incremental,
-            &c.r#match,
-            &c.exclude,
-            c.concurrency.unwrap_or(app_config.scan.concurrency),
-            app_config.scan.include_tags || copy_tags,
-            &None,
-            c.packaged,
-            c.package_depth,
         )?;
-
-        // ── 3. 初始化消费者配置 + 数据库 ──
-        let consumer_config = Arc::new(initialize_consumer_config(
-            &c.job_id,
-            &c.job_dir,
-            JobType::IncrementalCopy,
-            c.raw_command_line.clone(),
-            &app_config,
-            c.progress_callback_url.clone(),
-        )?);
-
-        let database: ClickHouseDatabase =
-            ClickHouseDatabase::connect(&consumer_config.db_config.clickhouse, &c.job_id).await?;
-
-        if let Err(e) = database.create_table(INCREMENTAL_SCAN_TABLE_BASE_NAME).await {
-            return Err(AppError::DatabaseError(e));
-        }
-
-        begin_copy_catalogue(&database, c, block_size, is_source_reserved).await?;
-
-        let batch_size = consumer_config.db_config.batch_size as usize;
-
-        // 枚举初始化失败时尚未启动 Phase A 的后台任务。
-        let walkdir_iter = dir_walker::walkdir(scan_config).await?;
-
-        // ── 4. 消费者管理器 + 共享生命周期（跨 Phase A/B 共用同一份统计累积） ──
-        let mut consumer_manager =
-            ConsumerManager::with_database(consumer_config.as_ref(), Some(database.clone())).await?;
-        consumer_manager.begin_lifecycle().await;
-        let bytes_tracker = consumer_manager.get_bytes_tracker().await;
-
-        // ── 4.1. Phase A 广播器 + 消费者任务 ──
-        let mut broadcaster = BroadcastForwarder::new(DEFAULT_CHANNEL_CAPACITY);
-        let consumer_handles = consumer_manager.start_consumers(&mut broadcaster).await?;
-
-        // ── 5. 检测广播器 + MPMC 通道 ──
-        // scan workers → detect_broadcaster → dispatch_task → async_channel(MPMC) → N handler workers → broadcaster
-        let mut detect_broadcaster = BroadcastForwarder::<StorageEntryMessage>::new(DEFAULT_CHANNEL_CAPACITY);
-        let mut file_op_rx = detect_broadcaster.subscribe();
-        let (work_queues, handler_inputs) =
-            CopyQueues::new(copy_concurrency, DEFAULT_CHANNEL_CAPACITY / copy_concurrency.max(1));
-
-        // ── 6. 并发度 + block_size ──
-        let incremental_scan_concurrency = c.concurrency.unwrap_or(app_config.scan.concurrency);
-
-        info!(
-            "Using scan concurrency: {}, copy concurrency: {}, block_size: {:?}",
-            incremental_scan_concurrency, copy_concurrency, block_size
-        );
-
-        // ── 7. Windows 管理员权限检查 ──
-        #[cfg(windows)]
-        {
-            if matches!(backend_kind_from_location(&c.src_path), BackendKind::Local)
-                && matches!(backend_kind_from_location(&c.dest_path), BackendKind::Local)
-            {
-                match check_admin_privileges() {
-                    Ok(true) => println!("✓ Running with administrator privileges\n"),
-                    Ok(false) => {
-                        eprintln!("⚠ Warning: Not running with administrator privileges");
-                        eprintln!("   It is recommended to rerun this program as an administrator\n");
-                    }
-                    Err(e) => eprintln!("⚠ Unable to check privilege status: {}", e),
-                }
+        // 此时尚未连接存储或改变基线；准入失败也使用同一最终报告通道。
+        let (mut consumers, initialization_error) = match ConsumerManager::statistics_only(&notifications) {
+            Ok(consumers) => (consumers, None),
+            Err(error) => {
+                // 数据库配置无效时仍通知外部；原错误返回，不把无数据库当成迁移降级。
+                notifications.db_config.enabled = false;
+                (ConsumerManager::statistics_only(&notifications)?, Some(error))
             }
-        }
-
-        // ── 8. QoS + 版本化对象缓冲 ──
-        let qos_manager = create_qos_manager(c.qos.as_ref(), c.peak_qos_rate, c.iops);
-
-        // ── 10. 启动 dispatch task：detect_broadcaster → async_channel（MPMC） ──
-        let dispatch_span = info_span!("inc_dispatch");
-        let dispatch_handle: JoinHandle<Result<()>> = tokio::spawn(
-            async move {
-                while let Some(msg) = file_op_rx.recv().await {
-                    if work_queues.send(msg).await.is_err() {
-                        return Err(AppError::ConsumerError(
-                            "Incremental sync handler channel closed".into(),
-                        ));
-                    }
-                }
-                info!("Dispatch task completed");
-                Ok(())
-            }
-            .instrument(dispatch_span),
-        );
-
-        // ── 10.5. 创建 mount 限流信号量 + 完成计数器 ──
-        // 容量按 storage 类型选择（详见 sync 路径同名注释）。
-        let mount_semaphore = Arc::new(Semaphore::new(mount_concurrency_for_pair(&c.src_path, &c.dest_path)));
-        let alive_handlers = Arc::new(AtomicUsize::new(0));
-        let mount_done_handlers = Arc::new(AtomicUsize::new(0));
-
-        // ── 11. 启动 N 个 handler worker（MPMC 竞争消费，每个 worker 独立 StoragePair） ──
-        let mut handler_handles = Vec::new();
-        let src_path_str = c.src_path.clone();
-        let dest_path_str = c.dest_path.clone();
-
-        for (handler_id, rx) in handler_inputs.into_iter().enumerate() {
-            let src_path_c = src_path_str.clone();
-            let dest_path_c = dest_path_str.clone();
-            let bc = broadcaster.clone();
-            let qos = qos_manager.clone();
-            let bt = bytes_tracker.clone();
-            let enable_integrity_check = c.enable_integrity_check;
-            let enable_acl = c.enable_acl;
-            let resume_opts = ResumeOpts {
-                job_id: c.job_id.clone(),
-                job_dir: c.job_dir.clone(),
-                transfer_mode: c.transfer_mode,
-            };
-            let mount_sem = mount_semaphore.clone();
-            let alive_counter = alive_handlers.clone();
-            let done_counter = mount_done_handlers.clone();
-
-            let span = info_span!("inc_handler_worker", handler_id);
-            let handle = tokio::spawn(
-                async move {
-                    // 每个 worker 创建独立 StoragePair（带限流重试，防止 portmapper 过载）
-                    let storage_pair = match create_storage_pair_with_retry(
-                        &mount_sem,
-                        &src_path_c,
-                        &dest_path_c,
-                        block_size,
-                        &format!("Handler {handler_id}"),
-                    )
-                    .await
-                    {
-                        Ok(pair) => pair,
-                        Err(e) => {
-                            error!(
-                                "Handler worker {}: Failed to create StoragePair after retries: {}",
-                                handler_id, e
-                            );
-                            done_counter.fetch_add(1, Ordering::Release);
-                            return Err(e);
-                        }
-                    };
-                    alive_counter.fetch_add(1, Ordering::Relaxed);
-                    done_counter.fetch_add(1, Ordering::Release);
-                    let src = storage_pair.get_src_storage().clone();
-                    let dest = storage_pair.get_dest_storage().clone();
-
-                    let mut failure: Option<AppError> = None;
-                    while let Some(message) = rx.next().await {
-                        match message {
-                            StorageEntryMessage::New(ref entry) => {
-                                if entry.get_version_id().is_some() {
-                                    if let Err(error) = process_versioned_entry(
-                                        entry,
-                                        src.clone(),
-                                        dest.clone(),
-                                        bc.clone(),
-                                        qos.clone(),
-                                        enable_integrity_check,
-                                        enable_acl,
-                                        is_source_reserved,
-                                        bt.clone(),
-                                        resume_opts.clone(),
-                                        EntryChange::New,
-                                    )
-                                    .await
-                                    {
-                                        failure.get_or_insert(error);
-                                    }
-                                } else {
-                                    match process_entry(
-                                        &entry.entry,
-                                        src.clone(),
-                                        dest.clone(),
-                                        enable_integrity_check,
-                                        enable_acl,
-                                        is_source_reserved,
-                                        qos.clone(),
-                                        bt.clone(),
-                                        &bc,
-                                        resume_opts.clone(),
-                                    )
-                                    .await
-                                    {
-                                        Ok(()) => bc.broadcast(message.clone()).await,
-                                        Err(e) => {
-                                            error!(
-                                                "Handler {}: Failed to process new entry {:?}: {}",
-                                                handler_id,
-                                                entry.get_relative_path(),
-                                                e
-                                            );
-                                            bc.broadcast(StorageEntryMessage::Error {
-                                                event: ErrorEvent::Copy,
-                                                path: entry.get_relative_path().to_path_buf(),
-                                                entry: Some(Arc::clone(&entry.entry)),
-                                                reason: format!("{e}"),
-                                            })
-                                            .await;
-                                            failure.get_or_insert(e.into());
-                                        }
-                                    }
-                                }
-                            }
-                            StorageEntryMessage::Changed { ref entry, kind } => {
-                                // MetadataOnly：chmod/chown 变更，跳过 copy_file 只同步属性
-                                let result = if entry.entry.history().is_some() {
-                                    process_versioned_entry(
-                                        entry,
-                                        src.clone(),
-                                        dest.clone(),
-                                        bc.clone(),
-                                        qos.clone(),
-                                        enable_integrity_check,
-                                        enable_acl,
-                                        is_source_reserved,
-                                        bt.clone(),
-                                        resume_opts.clone(),
-                                        EntryChange::Changed(kind),
-                                    )
-                                    .await
-                                } else if kind == ChangeKind::DirectoryMarkerRemoved {
-                                    copy_namespace::remove_directory_marker(dest.storage(), &entry.entry)
-                                        .await
-                                        .map_err(AppError::from)
-                                } else if kind == ChangeKind::MetadataOnly {
-                                    process_metadata_only_entry(
-                                        &entry.entry,
-                                        src.clone(),
-                                        dest.clone(),
-                                        enable_acl,
-                                        is_source_reserved,
-                                        &bc,
-                                    )
-                                    .await
-                                } else {
-                                    process_entry(
-                                        &entry.entry,
-                                        src.clone(),
-                                        dest.clone(),
-                                        enable_integrity_check,
-                                        enable_acl,
-                                        is_source_reserved,
-                                        qos.clone(),
-                                        bt.clone(),
-                                        &bc,
-                                        resume_opts.clone(),
-                                    )
-                                    .await
-                                };
-                                match result {
-                                    Ok(()) if entry.entry.history().is_some() => {}
-                                    Ok(()) => bc.broadcast(message.clone()).await,
-                                    Err(e) => {
-                                        error!(
-                                            "Handler {}: Failed to process changed entry {:?} (kind={}): {}",
-                                            handler_id,
-                                            entry.get_relative_path(),
-                                            kind,
-                                            e
-                                        );
-                                        bc.broadcast(StorageEntryMessage::Error {
-                                            event: ErrorEvent::Copy,
-                                            path: entry.get_relative_path().to_path_buf(),
-                                            entry: Some(Arc::clone(&entry.entry)),
-                                            reason: format!("{e}"),
-                                        })
-                                        .await;
-                                        failure.get_or_insert(e.into());
-                                    }
-                                }
-                            }
-                            StorageEntryMessage::Deleted(ref entry) => {
-                                // 删除操作幂等化：NotFound 视为成功
-                                let result = if entry.get_is_dir() {
-                                    trace!("Deleting directory: {:?}", entry.get_relative_path());
-                                    deletion::delete_dir_all(dest.storage(), entry).await
-                                } else {
-                                    trace!("Deleting file: {:?}", entry.get_relative_path());
-                                    copy_namespace::delete_file(dest.storage(), entry).await
-                                };
-                                match result {
-                                    Ok(()) => bc.broadcast(message.clone()).await,
-                                    Err(error) if error.is_not_found() => {
-                                        trace!("Already deleted, skipping: {:?}", entry.get_relative_path());
-                                        bc.broadcast(message.clone()).await;
-                                    }
-                                    Err(e) => {
-                                        error!(
-                                            "Handler {}: Failed to delete {:?}: {}",
-                                            handler_id,
-                                            entry.get_relative_path(),
-                                            e
-                                        );
-                                        bc.broadcast(StorageEntryMessage::Error {
-                                            event: ErrorEvent::Delete,
-                                            path: entry.get_relative_path().to_path_buf(),
-                                            entry: Some(entry.clone()),
-                                            reason: format!("{e}"),
-                                        })
-                                        .await;
-                                        failure.get_or_insert(e.into());
-                                    }
-                                }
-                            }
-                            StorageEntryMessage::Renamed((ref from_entry, ref to_entry)) => {
-                                if from_entry.get_name() == to_entry.get_name() {
-                                    // 同名 rename（父目录移动）：直接广播
-                                    bc.broadcast(message.clone()).await;
-                                } else {
-                                    match process_rename_entry(
-                                        from_entry.clone(),
-                                        to_entry.clone(),
-                                        src.clone(),
-                                        dest.clone(),
-                                        is_source_reserved,
-                                    )
-                                    .await
-                                    {
-                                        Ok(()) => bc.broadcast(message.clone()).await,
-                                        Err(e) => {
-                                            error!(
-                                                "Handler {}: Failed to rename {:?} to {:?}: {}",
-                                                handler_id,
-                                                from_entry.get_relative_path(),
-                                                to_entry.get_relative_path(),
-                                                e
-                                            );
-                                            bc.broadcast(StorageEntryMessage::Error {
-                                                event: ErrorEvent::Rename,
-                                                path: to_entry.get_relative_path().to_path_buf(),
-                                                entry: Some(to_entry.clone()),
-                                                reason: format!("{e}"),
-                                            })
-                                            .await;
-                                            failure.get_or_insert(e.into());
-                                        }
-                                    }
-                                }
-                            }
-                            StorageEntryMessage::Packaged(ref entry) => {
-                                info!("Packing directory {:?}", entry.get_relative_path());
-
-                                match tar_pack::pack_directory(
-                                    &src,
-                                    &dest,
-                                    entry,
-                                    is_source_reserved,
-                                    qos.clone(),
-                                    bt.clone(),
-                                )
-                                .await
-                                {
-                                    Ok((tar_entry, manifest)) => {
-                                        let tar_path = tar_entry.get_relative_path().to_string_lossy().to_string();
-                                        bc.broadcast(StorageEntryMessage::New(Arc::new(tar_entry).into())).await;
-                                        bc.broadcast(StorageEntryMessage::TarManifest {
-                                            tar_path,
-                                            entries: manifest,
-                                        })
-                                        .await;
-                                    }
-                                    Err(e) => {
-                                        error!(
-                                            "Handler {}: Pack failed for {:?}: {}",
-                                            handler_id,
-                                            entry.get_relative_path(),
-                                            e
-                                        );
-                                        bc.broadcast(StorageEntryMessage::Error {
-                                            event: ErrorEvent::Pack,
-                                            path: entry.get_relative_path().to_path_buf(),
-                                            entry: Some(entry.clone()),
-                                            reason: format!("{e}"),
-                                        })
-                                        .await;
-                                        failure.get_or_insert(e.into());
-                                    }
-                                }
-                            }
-                            _ => {
-                                // Scanned、Copyed、IntegrityChecked 不会经由 detect_broadcaster 到达此处
-                            }
-                        }
-                    }
-
-                    info!("Handler worker {} completed", handler_id);
-                    match failure {
-                        Some(error) => Err(error),
-                        None => Ok(()),
-                    }
-                }
-                .instrument(span),
-            );
-            handler_handles.push(handle);
-        }
-        // drop work_rx 本体（只有 clone 在 worker 手里）
-
-        // ── 11.5. 等待所有 handler worker 完成 mount 初始化，输出存活汇总 ──
-        wait_for_mount_init(&[(&mount_done_handlers, &alive_handlers, "Handler")], copy_concurrency).await;
-
-        // ── 13. 启动 N 个 scan worker（walkdir → batch → DB compare → detect_broadcaster） ──
-        let database_clone = database.clone();
-        let mut scan_worker_handles = Vec::new();
-
-        let (scan_inputs, scan_dispatch) = partition_scan(
-            walkdir_iter.clone(),
-            incremental_scan_concurrency,
-            DEFAULT_CHANNEL_CAPACITY / incremental_scan_concurrency.max(1),
-        );
-        for (worker_id, worker_walkdir_iter) in scan_inputs.into_iter().enumerate() {
-            let database_clone = database_clone.clone();
-            let detect_broadcaster = detect_broadcaster.clone();
-            let broadcaster = broadcaster.clone();
-
-            let span = info_span!("scan_worker", worker_id = worker_id);
-            let handle = tokio::spawn(
-                async move {
-                    info!("Scan worker {}: Started processing", worker_id);
-
-                    let mut current_batch = Vec::with_capacity(batch_size);
-
-                    while let Some(msg) = worker_walkdir_iter.next().await {
-                        match msg {
-                            StorageEntryMessage::Scanned(ref entry) => {
-                                trace!(
-                                    "Scan worker {}: Received StorageEntry from walkdir: {:?}",
-                                    worker_id, entry
-                                );
-
-                                broadcaster.broadcast(StorageEntryMessage::Scanned(entry.clone())).await;
-
-                                current_batch.push(entry.clone());
-
-                                if current_batch.len() >= batch_size {
-                                    let batch = std::mem::take(&mut current_batch);
-                                    let db = database_clone.clone();
-
-                                    batch_processing_to_generate_message(
-                                        &db,
-                                        &batch,
-                                        detect_broadcaster.clone(),
-                                        false,
-                                        false,
-                                    )
-                                    .await?;
-                                }
-                            }
-                            StorageEntryMessage::Error {
-                                ref path, ref reason, ..
-                            } => {
-                                error!(
-                                    "Scan worker {}: Walkdir error for {}: {}",
-                                    worker_id,
-                                    path.display(),
-                                    reason
-                                );
-                                broadcaster.broadcast(msg.clone()).await;
-                            }
-                            _ => {}
-                        }
-                    }
-
-                    // 处理最后一批数据
-                    if !current_batch.is_empty() {
-                        let db = database_clone.clone();
-                        let batch = current_batch;
-
-                        batch_processing_to_generate_message(&db, &batch, detect_broadcaster, true, false).await?;
-                    }
-
-                    info!("Scan worker {}: Completed processing", worker_id);
-                    Ok(())
-                }
-                .instrument(span),
-            );
-
-            scan_worker_handles.push(handle);
-        }
-
-        // ── 14. 等待 scan workers 完成 ──
-        let scan_result = finish_phase(scan_worker_handles).await;
-        walkdir_iter.close();
-        let scan_dispatch_result = finish_phase(vec![scan_dispatch]).await;
-
-        // ── 15. 关闭 detect_broadcaster → dispatch task 的 file_op_rx 耗尽 ──
-        // scan workers 已全部退出，其 detect_broadcaster clone 均已 drop；
-        // 主 detect_broadcaster clone drop 触发 dispatch task EOF。
-        drop(detect_broadcaster);
-
-        // ── 16. 等待 dispatch 与 handler 全部结束，再检查阶段结果 ──
-        let dispatch_result = match dispatch_handle.await {
-            Ok(result) => result,
-            Err(error) => Err(error.into()),
         };
-        let handler_result = finish_phase(handler_handles).await;
-        info!("All handler workers completed");
-
-        // ── 18. 关闭 Phase A 广播器 → 等待 Phase A 消费者完成（同步屏障） ──
-        // handler workers 已全部退出（其 bc clone 均已 drop）；
-        // 主 broadcaster clone drop → 消费者通道 EOF → DatabaseConsumer 刷入所有
-        // Phase A 的 New/Changed 条目 → base 表完整，detect_deleted_items 才有完整依据。
-        drop(broadcaster);
-        let durable_result = finish_phase(consumer_handles).await;
-        let enumeration_result = walkdir_iter.take_error().map_or(Ok(()), |error| Err(error.into()));
-        // 未完整比对或未持久化的条目不能作为删除依据。
-        let phase_a = enumeration_result
-            .and(scan_result)
-            .and(handler_result)
-            .and(durable_result)
-            .and(dispatch_result)
-            .and(scan_dispatch_result);
-        if let Err(error) = phase_a {
-            if let Some(ref qos_mgr) = qos_manager {
-                qos_mgr.shutdown();
-            }
-            consumer_manager.record_task_failures(&[error.to_string()]).await;
-            consumer_manager.end_lifecycle().await;
-            return Err(error);
-        }
-        info!("Phase A complete; base table ready for delete/rename detection");
-
-        // ── 19. Phase B：在 Phase A 屏障之后，起一轮新的 broadcaster + 同一组 consumer 任务 ──
-        // `apply_deletions_and_renames` 只负责「检测 + 执行物理操作 + 广播结果消息」，
-        // DatabaseConsumer 走 Deleted/Renamed 分支自动完成 base/incremental 表的批量写入。
-        let mut broadcaster_b = BroadcastForwarder::new(DEFAULT_CHANNEL_CAPACITY);
-        let phase_b_handles = consumer_manager.start_consumers(&mut broadcaster_b).await?;
-
-        // dest storage 提升到 async 块外，供后续 update_directory_metadata 复用，避免二次挂载
-        let phase_b_dest_storage: Result<Arc<StorageContext>> = async {
-            let dest_storage_phase_b = Arc::new(
-                create_storage_for_role(
-                    &c.dest_path,
-                    block_size.map(|s| s as u64),
-                    false,
-                    StorageRole::Destination,
-                )
-                .await?,
-            );
-            let src_storage_phase_b = Arc::new(
-                create_storage_for_role(&c.src_path, block_size.map(|s| s as u64), false, StorageRole::Source).await?,
-            );
-
-            Self::apply_deletions_and_renames(
-                &database,
-                src_storage_phase_b.clone(),
-                dest_storage_phase_b.clone(),
-                is_source_reserved,
-                &broadcaster_b,
-                c.enable_integrity_check,
-                qos_manager.clone(),
-                bytes_tracker.clone(),
-                &c.job_id,
-                &c.job_dir,
-                c.transfer_mode,
-            )
-            .await?;
-
-            Ok(dest_storage_phase_b)
-        }
-        .await;
-
-        // ── 21. 关闭 Phase B 广播器 → 等待 Phase B 消费者完成（incremental 表冲刷完毕） ──
-        drop(broadcaster_b);
-        let phase_b_consumers = finish_phase(phase_b_handles).await;
-
-        // QoS 在两阶段都走完之后才关闭，保留 Phase B 物理操作期间的限速效果
-        if let Some(ref qos_mgr) = qos_manager {
-            qos_mgr.shutdown();
-        }
-
-        let result: Result<()> = async {
-            let destination = phase_b_dest_storage?;
-            phase_b_consumers?;
-            copy_completion::complete(database.clone(), destination).await
-        }
-        .await;
+        let result = match initialization_error {
+            Some(error) => Err(error),
+            None => self.run_local_prepared(&app_config, &mut consumers).await,
+        };
+        let result = source_cleanup::report_failure(result, &consumers).await;
+        consumers
+            .finish_unpersisted_migration(if result.is_ok() {
+                CopyGenerationPhase::Completed
+            } else {
+                CopyGenerationPhase::Failed
+            })
+            .await;
         if let Err(error) = &result {
-            consumer_manager.record_task_failures(&[error.to_string()]).await;
+            consumers.record_task_error(error).await;
         }
-        consumer_manager.end_lifecycle().await;
-        result?;
-
-        info!(
-            "Incremental sync job {} completed successfully via orchestrator",
-            c.job_id
-        );
-        Ok(())
-    }
-
-    /// 双进程全量同步 — Sender 侧：`directory_pages` 分页 → QUIC → Receiver 比较 + 写入
-    async fn run_sync_remote(
-        &self, remote_addr: &str, tls_cert_bytes: Option<&[u8]>, auth_token: Option<&str>,
-    ) -> Result<()> {
-        crate::remote_sync::run(&self.config, remote_addr, tls_cert_bytes, auth_token).await
+        consumers.end_lifecycle().await;
+        result
     }
 
     /// 启动统计 reporter task
@@ -1357,254 +274,6 @@ impl SyncOrchestrator {
             .instrument(span),
         )
     }
-
-    /// rename 后的内容与元数据必须完成，才能确认该条目的新状态。
-    #[allow(clippy::too_many_arguments)]
-    async fn sync_renamed_file_changes(
-        kind: ChangeKind, entry: &Arc<ObservedEntry>, src: &StorageContext, dest: &StorageContext,
-        qos: Option<QosManager>, integrity: bool, source_reserved: bool, bytes: Option<Arc<AtomicU64>>, job_id: &str,
-        job_dir: &str, transfer_mode: TransferMode,
-    ) -> Result<()> {
-        let mut metadata_applied = false;
-        if kind != ChangeKind::MetadataOnly {
-            let hdfs = if dest.storage().kind() == BackendKind::Hdfs {
-                Some(HdfsCopyContext::from_job(job_id, transfer_mode)?)
-            } else {
-                None
-            };
-            let recorder = if hdfs.is_some() && transfer_mode == TransferMode::Checkpoint {
-                Some(CommitRecorder::start(job_dir, entry, src.block_size()).await?)
-            } else {
-                None
-            };
-            let hdfs = hdfs.map(|context| {
-                recorder.as_ref().map_or(context.clone(), |recorder| {
-                    context.with_commit_callback(recorder.callback())
-                })
-            });
-            let result = copy_file(
-                src,
-                dest,
-                entry,
-                crate::file_copy::CopyOptions {
-                    transfer_mode,
-                    qos,
-                    enable_integrity_check: integrity,
-                    is_source_reserved: source_reserved,
-                    bytes_counter: bytes,
-                    ..Default::default()
-                },
-                hdfs.as_ref(),
-            )
-            .await;
-            if let Some(recorder) = recorder {
-                recorder.finish(result).await?;
-            } else {
-                result?;
-            }
-            metadata_applied = true;
-        }
-        if !metadata_applied {
-            copy_metadata::set_entry_metadata(dest.storage(), entry).await?;
-        }
-        Ok(())
-    }
-
-    /// DB 写入由 [`DatabaseConsumer`](crate::consumer::DatabaseConsumer) 在收到 `Deleted` / `Renamed` /
-    /// `Error` 消息后自动完成（走和 handler workers 同一套批量重试逻辑）；本函数只负责
-    /// 「物理操作 + 广播结果消息」。保留首个类型化错误，处理完当前阶段后返回。
-    ///
-    /// # 两遍处理设计
-    ///
-    /// **第一遍**：收集所有 `DeletionStatus`，从中提取「目录名发生变化的 rename」
-    /// 构建 `renamed_dirs` 映射（`old_dir_path` → `new_dir_path`）。
-    ///
-    /// **第二遍**：顺序执行物理操作。对每条 `Renamed(from, to)` 判断是否跳过：
-    /// - `from.name != to.name`：目录/文件本身改了名字 → 必须调用 `process_rename_entry`
-    /// - `from.name == to.name` 且 `from.parent` 在 `renamed_dirs` 中且映射到 `to.parent`：
-    ///   父目录的 NFS RENAME 已传递性地移动了这个子条目 → 跳过物理操作
-    /// - `from.name == to.name` 但父目录未在 `renamed_dirs` 中（跨父目录 move）：
-    ///   没有父目录 rename 代为处理 → 必须调用 `process_rename_entry`
-    ///
-    /// 对于 rename 成功后检测到内容或元数据也同时变化的普通文件，额外执行内容拷贝
-    /// 或元数据更新（处理「rename + data/metadata changed」复合场景）。
-    #[allow(clippy::too_many_arguments)]
-    async fn apply_deletions_and_renames(
-        db: &ClickHouseDatabase, src_storage: Arc<StorageContext>, dest_storage: Arc<StorageContext>,
-        is_source_reserved: bool, broadcaster: &BroadcastForwarder<StorageEntryMessage>, enable_integrity_check: bool,
-        qos_manager: Option<QosManager>, bytes_counter: Option<Arc<AtomicU64>>, job_id: &str, job_dir: &str,
-        transfer_mode: TransferMode,
-    ) -> Result<()> {
-        let deletion_iter = db.detect_deleted_items().await?;
-        let mut failure: Option<AppError> = None;
-
-        // 第一遍：一次性收集，构建「所有目录 rename」映射表。
-        // 映射语义：renamed_dirs[old_dir_path] = new_dir_path
-        // 收录所有 is_dir=true 的 Renamed 条目（包括同名跨父目录 move 如 d3/d3_4 → d4/d3_4）。
-        // 用于判断某条目的父目录是否正在被 rename，若是则子条目无需单独执行物理操作。
-        let statuses: Vec<DeletionStatus> = deletion_iter.collect();
-        let renamed_dirs: HashMap<PathBuf, PathBuf> = statuses
-            .iter()
-            .filter_map(|s| {
-                if let DeletionStatus::Renamed(from, to) = s
-                    && from.get_is_dir()
-                {
-                    return Some((
-                        from.get_relative_path().to_path_buf(),
-                        to.get_relative_path().to_path_buf(),
-                    ));
-                }
-                None
-            })
-            .collect();
-
-        // 第二遍：按顺序执行物理操作
-        for status in statuses {
-            match status {
-                DeletionStatus::Deleted(entry) => {
-                    let entry_arc = Arc::new(entry);
-                    let result = if entry_arc.get_is_dir() {
-                        deletion::delete_dir_all(dest_storage.storage(), &entry_arc).await
-                    } else {
-                        copy_namespace::delete_file(dest_storage.storage(), &entry_arc).await
-                    };
-                    match result {
-                        Ok(()) => {
-                            broadcaster.broadcast(StorageEntryMessage::Deleted(entry_arc)).await;
-                        }
-                        Err(error) if error.is_not_found() => {
-                            broadcaster.broadcast(StorageEntryMessage::Deleted(entry_arc)).await;
-                        }
-                        Err(e) => {
-                            error!("Phase B: Failed to delete {:?}: {}", entry_arc.get_relative_path(), e);
-                            broadcaster
-                                .broadcast(StorageEntryMessage::Error {
-                                    event: ErrorEvent::Delete,
-                                    path: entry_arc.get_relative_path().to_path_buf(),
-                                    entry: Some(entry_arc.clone()),
-                                    reason: format!("{e}"),
-                                })
-                                .await;
-                            failure.get_or_insert(e.into());
-                        }
-                    }
-                }
-                DeletionStatus::Renamed(from, to) => {
-                    let from_arc = Arc::new(*from);
-                    let to_arc = Arc::new(*to);
-
-                    // 父目录正在被 rename 时，NFS RENAME 已传递性地移动了子条目，无需重复操作。
-                    // from_parent 分配仅在同名情况下进行，避免对名字不同的 rename 做无效分配。
-                    let skip_physical = from_arc.get_name() == to_arc.get_name() && {
-                        let from_parent = from_arc.get_relative_path().parent().map(PathBuf::from);
-                        let to_parent = to_arc.get_relative_path().parent().map(PathBuf::from);
-                        match (from_parent, to_parent) {
-                            (Some(fp), Some(tp)) => renamed_dirs.get(&fp).is_some_and(|d| d == &tp),
-                            _ => false,
-                        }
-                    };
-
-                    let dest_op_result = if skip_physical {
-                        Ok(())
-                    } else {
-                        process_rename_entry(
-                            from_arc.clone(),
-                            to_arc.clone(),
-                            src_storage.clone(),
-                            dest_storage.clone(),
-                            true,
-                        )
-                        .await
-                    };
-
-                    match dest_op_result {
-                        Ok(()) => {
-                            // Phase A 不再把路径已变的文件判为 Changed（Fix 2a），
-                            // 此处补足 rename+changed 文件的内容/元数据同步，并广播 Changed 消息供消费者统计。
-                            if !from_arc.get_is_dir()
-                                && !from_arc.get_is_symlink()
-                                && let Some(kind) = ChangeKind::from_entry_diff(&from_arc, &to_arc)
-                            {
-                                let result = Self::sync_renamed_file_changes(
-                                    kind,
-                                    &to_arc,
-                                    &src_storage,
-                                    &dest_storage,
-                                    qos_manager.clone(),
-                                    enable_integrity_check,
-                                    true,
-                                    bytes_counter.clone(),
-                                    job_id,
-                                    job_dir,
-                                    transfer_mode,
-                                )
-                                .await;
-                                if let Err(error) = result {
-                                    broadcaster
-                                        .broadcast(StorageEntryMessage::Error {
-                                            event: ErrorEvent::Copy,
-                                            path: to_arc.get_relative_path().to_path_buf(),
-                                            entry: Some(to_arc.clone()),
-                                            reason: error.to_string(),
-                                        })
-                                        .await;
-                                    failure.get_or_insert(error);
-                                    continue;
-                                }
-                                broadcaster
-                                    .broadcast(StorageEntryMessage::Changed {
-                                        entry: to_arc.clone().into(),
-                                        kind,
-                                    })
-                                    .await;
-                            }
-
-                            if !is_source_reserved {
-                                if let Err(error) = copy_namespace::delete_file(src_storage.storage(), &to_arc).await
-                                    && !error.is_not_found()
-                                {
-                                    broadcaster
-                                        .broadcast(StorageEntryMessage::Error {
-                                            event: ErrorEvent::Delete,
-                                            path: to_arc.get_relative_path().to_path_buf(),
-                                            entry: Some(to_arc.clone()),
-                                            reason: error.to_string(),
-                                        })
-                                        .await;
-                                    failure.get_or_insert(error.into());
-                                    continue;
-                                }
-                            }
-                            broadcaster
-                                .broadcast(StorageEntryMessage::Renamed((from_arc, to_arc)))
-                                .await;
-                        }
-                        Err(e) => {
-                            error!(
-                                "Phase B: Failed to rename {:?} → {:?}: {}",
-                                from_arc.get_relative_path(),
-                                to_arc.get_relative_path(),
-                                e
-                            );
-                            broadcaster
-                                .broadcast(StorageEntryMessage::Error {
-                                    event: ErrorEvent::Rename,
-                                    path: to_arc.get_relative_path().to_path_buf(),
-                                    entry: Some(to_arc.clone()),
-                                    reason: format!("{e}"),
-                                })
-                                .await;
-                            failure.get_or_insert(e.into());
-                        }
-                    }
-                }
-            }
-        }
-        match failure {
-            Some(error) => Err(error),
-            None => Ok(()),
-        }
-    }
 }
 
 /// 创建 `QoS` 管理器（crate 内共享，供 orchestrator 和 `remote_sync` 调用）
@@ -1629,6 +298,10 @@ pub(crate) fn create_qos_manager(qos: Option<&String>, peak_qos_rate: f32, iops:
         },
     }
 }
+
+#[cfg(test)]
+#[path = "orchestrator_cancellation_tests.rs"]
+mod cancellation_tests;
 
 #[cfg(test)]
 mod mount_concurrency_tests {

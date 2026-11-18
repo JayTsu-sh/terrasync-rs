@@ -1,17 +1,38 @@
 //! One task's catalogue coordination. Only explicit catalogue clones share this state.
-use tokio::sync::{Mutex, MutexGuard};
+use task_model::migration::CopyGeneration;
+use tokio::sync::{Mutex, MutexGuard, RwLock, RwLockReadGuard};
+
+use super::ClickHouseDatabase;
+use crate::{DatabaseError, Result};
 
 #[derive(Default)]
 pub(super) struct ScanGenerationLifecycle {
     pub working: Option<u8>,
     pub committed: bool,
     pub copy_recovery: bool,
+    pub copy_generation_recovering: bool,
+    pub copy_execution_id: Option<String>,
+    pub copy_generation: Option<CopyGeneration>,
 }
 
 #[derive(Default)]
 pub(super) struct CatalogueLifecycle {
     state: Mutex<ScanGenerationLifecycle>,
     pub writes: Mutex<()>,
+    /// 只约束 base 事实；通知、代次记录和最终报告不受清理屏障限制。
+    pub base_closed: RwLock<bool>,
+}
+
+impl ClickHouseDatabase {
+    pub(super) async fn base_write_guard(&self) -> Result<RwLockReadGuard<'_, bool>> {
+        let guard = self.generation_lifecycle.base_closed.read().await;
+        if *guard {
+            return Err(DatabaseError::CopyGenerationInvalid {
+                field: "base_writes_closed",
+            });
+        }
+        Ok(guard)
+    }
 }
 
 impl CatalogueLifecycle {

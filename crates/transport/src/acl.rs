@@ -1,6 +1,6 @@
 //! 远端 ACL 帧的编码；借用已捕获的原生载荷，不在序列化前复制 ACL 字节。
 
-use data_mover::model::{AclEncoding, AclMetadata};
+use data_mover_model::{AclEncoding, AclMetadata};
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Result, TransportError};

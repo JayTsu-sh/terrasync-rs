@@ -5,6 +5,7 @@ const BASE = '/api/v1'
 
 export interface TaskConfig {
   scan_resume?: boolean
+  copy_resume?: boolean
   match_expr?: string
   exclude_expr?: string
   depth?: number
@@ -61,6 +62,7 @@ export interface ExecutionStats {
   scanned_dirs: number
   total_bytes: number
   transferred_bytes: number
+  skipped_count?: number
   error_count: number
   duration_secs: number
   avg_speed_bytes_per_sec: number
@@ -133,6 +135,7 @@ export interface CallbackIdentity {
 }
 
 export interface DiagnosticEvent {
+  sequence: number
   event_id: string
   round_id: string
   attempt_id: string
@@ -140,6 +143,22 @@ export interface DiagnosticEvent {
   code: string
   message: string
   path: string | null
+  retention?: {
+    source_path: string | null
+    target_path: string | null
+    scope: 'entry' | 'source_range'
+    source_presence: 'unknown' | 'present' | 'absent'
+    reason:
+      | 'source_deletion_unconfirmed'
+      | 'source_cleanup_policy'
+      | 'filtered_selection'
+      | 'incomplete_enumeration'
+      | 'ambiguous_identity'
+      | 'source_query_failed'
+      | 'baseline_unavailable'
+      | 'stale_evidence'
+      | 'target_persistence_unconfirmed'
+  }
 }
 
 export interface DiagnosticPage {
@@ -248,6 +267,10 @@ export async function deleteExecution(id: string): Promise<void> {
 }
 
 export interface TaskProgressSnapshot {
+  target_preserved_count?: number
+  skipped_count?: number
+  task_error_count?: number
+  diagnostics_complete?: boolean
   scanned_files: number
   scanned_dirs: number
   total_bytes: number

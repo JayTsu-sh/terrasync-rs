@@ -3,27 +3,37 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicU8;
 
 use clickhouse::Client;
+use tokio::sync::OnceCell;
 
 use self::layout::ClusterCatalogue;
 use self::lifecycle::CatalogueLifecycle;
+use crate::ClickHouseConfig;
 
 mod comparison;
 mod connection;
 mod copy_generation;
+mod copy_runs;
 mod deletion;
 mod generation;
 mod layout;
 mod lifecycle;
 mod native;
+mod notifications;
 mod read;
 mod scan_resume;
 mod scan_resume_statistics;
 mod tables;
+mod versions;
 mod write;
 
 pub use comparison::{CatalogueChange, ComparisonMode};
 pub use copy_generation::CopyGenerationStatus;
 pub use deletion::DeletionStatus;
+pub use notifications::{
+    MAX_NOTIFICATION_BATCH_BYTES, MAX_NOTIFICATION_BATCH_RECORDS, MAX_NOTIFICATION_RECORD_BYTES, NotificationCursor,
+    NotificationKind, NotificationRecord,
+};
+pub use read::CopyCatalogueEntry;
 
 #[cfg(test)]
 mod baseline_tests;
@@ -36,6 +46,8 @@ mod record_tests;
 ///
 /// 提供与ClickHouse数据库交互的所有操作功能，包括表的创建、数据的插入、查询和删除等。
 pub struct ClickHouseDatabase {
+    /// 只在构造执行专属传输时复用；不向调用方暴露认证信息。
+    connection_config: Arc<ClickHouseConfig>,
     /// ClickHouse同步客户端，用于执行同步操作如查询和简单插入
     sync_client: Client,
     catalogue_cluster: Option<ClusterCatalogue>,
@@ -51,4 +63,6 @@ pub struct ClickHouseDatabase {
     resume_base_has_typed_handles: Option<bool>,
     /// 由本任务显式克隆的目录实例共享的代次与写入协调状态
     generation_lifecycle: Arc<CatalogueLifecycle>,
+    /// 通知表按需初始化，正常无错误任务不为诊断额外建表。
+    notifications_initialized: Arc<OnceCell<()>>,
 }

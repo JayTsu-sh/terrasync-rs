@@ -62,6 +62,21 @@ test.describe('任务详情页信息展示', () => {
 })
 
 test.describe('执行历史', () => {
+  test('迁移报告分别显示目录数量与跳过数量', async ({ page }) => {
+    const task = makeTask({ ...completedTask, id: 't-skip', name: 'skipped-objects', task_type: 'sync', dest_endpoint_id: 'ep-local-1' })
+    const execution = mockExecutions[0]!
+    await setupApiMocks(page, { tasks: [task], executions: [{ ...execution, task_id: task.id,
+      stats: { ...execution.stats!, skipped_count: 2, scanned_dirs: 9, error_count: 0 },
+    }] })
+    await page.goto('/tasks/t-skip')
+    await page.getByText('运行记录').click()
+    await expect(page.getByTestId('copy-skipped-count')).toHaveText('2 个')
+    await page.getByText('查看报告').first().click()
+    await expect(page.getByTestId('copy-skipped-count')).toBeHidden()
+    await page.getByText('查看报告').first().click()
+    await expect(page.getByTestId('copy-skipped-count')).toHaveText('2 个')
+  })
+
   test('运行记录 Tab 显示执行表格', async ({ page }) => {
     await setupApiMocks(page, { tasks: [completedTask] })
     await page.goto('/tasks/t-done')

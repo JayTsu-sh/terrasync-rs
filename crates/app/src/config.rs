@@ -1,4 +1,6 @@
-use task_model::TransferMode;
+use data_mover::model::ObservationPlan;
+use task_model::metadata::MetadataScope;
+use task_model::{SourceCleanupPolicy, TransferMode};
 // 标准库
 // 无
 
@@ -11,6 +13,7 @@ use utils::app_config::AppConfig;
 use utils::app_config::DatabaseConfig;
 
 // 内部模块
+use crate::callback::CallbackEndpoint;
 use crate::error::Result;
 use crate::scan::ScanType;
 
@@ -69,7 +72,11 @@ pub struct ScanConfig {
     pub exclude: String,
     pub match_expressions: Option<FilterExpression>,
     pub exclude_expressions: Option<FilterExpression>,
+    /// 迁移任务固定本轮过滤时间；独立扫描未指定时保持既有实时语义。
+    pub filter_time_anchor: Option<i64>,
     pub include_tags: bool,
+    pub observation_plan: Option<ObservationPlan>,
+    pub metadata_scope: MetadataScope,
     pub file_list: Option<String>,
     pub packaged: bool,
     pub package_depth: usize,
@@ -90,23 +97,25 @@ pub struct ConsumerConfig {
     pub console_config: ConsoleConfig,
     /// 进度回调 URL（由环境变量 `TERRASYNC_PROGRESS_CALLBACK_URL` 拼接而成）
     /// 当 web 层启动任务时设置，CLI 模式下为 None
-    pub progress_callback_url: Option<String>,
+    pub progress_callback_url: Option<CallbackEndpoint>,
 }
 
 /// Sync/IncrementalSync 的统一任务配置
 ///
-/// 整合 `sync()/incremental_sync()` 的所有参数，供 `SyncOrchestrator` 使用。
-/// `scan_type` 由 `SyncOrchestrator::run()` 自动判定（查数据库 base 表，fallback 文件系统）。
+/// 本地与远端迁移任务的执行参数。
+/// `scan_type` 由任务层依据持久化代次策略判定；数据库故障直接上报。
 #[derive(Debug, Clone)]
 #[allow(clippy::struct_excessive_bools)] // 配置结构按用途分组的开关集合，重构为枚举会失去可读性
 pub struct SyncJobConfig {
     pub job_id: String,
     pub job_dir: String,
     /// `job_dir` 是否在本次调用前已经存在（由调用方 snapshot 注入）
-    /// 用于 app 层判定 `ScanType` 的文件系统 fallback（数据库不可达时）
+    /// 不作为迁移模式或数据库故障的替代依据。
     pub job_dir_pre_existing: bool,
     pub src_path: String,
     pub dest_path: String,
+    /// CLI／Web 在接受任务时固定，后续代次记录和源清理共用此值。
+    pub source_cleanup: SourceCleanupPolicy,
     pub enable_integrity_check: bool,
     pub enable_acl: bool,
     pub r#match: Option<String>,
@@ -124,12 +133,12 @@ pub struct SyncJobConfig {
     pub package_depth: usize,
     pub raw_command_line: String,
     /// 进度回调 URL（web 层注入，CLI 为 None）
-    pub progress_callback_url: Option<String>,
+    pub progress_callback_url: Option<CallbackEndpoint>,
     /// 文件写入模式，由 CLI 参数优先级显式确定。
     pub transfer_mode: TransferMode,
     /// `--delete-target`：仅 `--remote` 双进程模式生效，控制是否清理目标端多余文件
     /// （目标端存在但源端已不存在的条目）。本地模式的孤儿清理由 DB diff 驱动、
-    /// 无条件执行，不受此字段影响（两套机制并存但互不干扰）。
+    /// 须经策略及源端存在性确认，不受此远程开关影响。
     pub delete_target: bool,
     pub concurrency: Option<usize>,
 }
@@ -148,9 +157,12 @@ pub fn initialize_scan_config(
         concurrency,
         r#match: r#match.clone().unwrap_or_default(),
         exclude: exclude.clone().unwrap_or_default(),
-        match_expressions: r#match.as_deref().and_then(|expr| parse_filter_expression(expr).ok()),
-        exclude_expressions: exclude.as_deref().and_then(|expr| parse_filter_expression(expr).ok()),
+        match_expressions: r#match.as_deref().map(parse_filter_expression).transpose()?,
+        exclude_expressions: exclude.as_deref().map(parse_filter_expression).transpose()?,
+        filter_time_anchor: None,
         include_tags,
+        observation_plan: None,
+        metadata_scope: MetadataScope::default(),
         file_list: file_list.clone(),
         packaged,
         package_depth,
@@ -164,7 +176,7 @@ pub fn initialize_scan_config(
 /// `progress_callback_url`：完整的 HTTP 回调 URL（web 层传入，CLI 传 `None`）
 pub fn initialize_consumer_config(
     job_id: &str, job_dir: &str, job_type: JobType, raw_command_line: String, app_config: &AppConfig,
-    progress_callback_url: Option<String>,
+    progress_callback_url: Option<CallbackEndpoint>,
 ) -> Result<ConsumerConfig> {
     let db_config = app_config.database.clone();
 
@@ -185,6 +197,65 @@ pub fn initialize_consumer_config(
 #[cfg(test)]
 mod redaction_tests {
     use super::*;
+    use crate::error::AppError;
+    use std::mem::discriminant;
+
+    #[test]
+    fn invalid_filters_return_the_typed_error_instead_of_admitting_every_entry() {
+        for (expression, is_exclude) in [("invalid_field == 1", false), ("size > invalid", true)] {
+            let expected = match parse_filter_expression(expression) {
+                Err(error) => error,
+                Ok(_) => panic!("fixture must be rejected by the native parser"),
+            };
+            let (include, exclude) = if is_exclude {
+                (None, Some(expression.into()))
+            } else {
+                (Some(expression.into()), None)
+            };
+            let result = initialize_scan_config(
+                "invalid-filter",
+                "unused",
+                0,
+                ScanType::Full,
+                &include,
+                &exclude,
+                1,
+                false,
+                &None,
+                false,
+                0,
+            );
+            match result {
+                Err(AppError::ScanFilter(actual)) => {
+                    assert_eq!(discriminant(&actual), discriminant(&expected));
+                    assert_eq!(actual.to_string(), expected.to_string());
+                }
+                other => panic!("invalid filter must fail closed: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn absent_and_valid_filters_keep_their_distinct_selection() -> Result<()> {
+        for include in [None, Some("modified < 7d".into())] {
+            let config = initialize_scan_config(
+                "valid-filter",
+                "unused",
+                0,
+                ScanType::Full,
+                &include,
+                &None,
+                1,
+                false,
+                &None,
+                false,
+                0,
+            )?;
+            assert_eq!(config.match_expressions.is_some(), include.is_some());
+            assert!(config.exclude_expressions.is_none());
+        }
+        Ok(())
+    }
 
     #[test]
     fn command_line_redacts_storage_credentials_and_preserves_other_arguments() {

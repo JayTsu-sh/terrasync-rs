@@ -19,14 +19,15 @@ use crate::{
 };
 
 impl ClickHouseDatabase {
-    /// 创建主扫描表（ReplacingMergeTree，按 `relative_path` + `version_id` 排序）
+    /// 复制事实按代次选择同键最新版本，旧执行的延迟 ACK 不得恢复已撤销的就绪证明。
+    /// 普通扫描的 copy_sequence 为零，同代内仍沿用最后写入的状态。
     pub async fn create_scan_base_table(&self) -> Result<()> {
         let table_name = get_scan_base_table_name(&self.job_id);
         self.create_catalogue_table(
             &table_name,
             FILE_SCAN_COLUMNS_DEFINITION,
             "(relative_path, version_id)",
-            CatalogueEngine::Replacing,
+            CatalogueEngine::ReplacingVersion("copy_sequence"),
         )
         .await?;
         self.validate_scan_base_table().await
@@ -56,7 +57,7 @@ impl ClickHouseDatabase {
         self.create_catalogue_table(
             &table_name,
             "id UInt8, scan_state UInt8, baseline_committed Bool DEFAULT false, \
-             copy_in_progress Bool DEFAULT false, copy_request_key String DEFAULT ''",
+             copy_execution_id String DEFAULT ''",
             "id",
             CatalogueEngine::Replacing,
         )
@@ -134,9 +135,12 @@ impl ClickHouseDatabase {
         Ok(dropped_tables)
     }
 
-    /// 表存在只代表本任务已有复制目录；恢复资格由 begin_copy_generation 判断。
-    pub async fn copy_catalogue_exists(&self) -> Result<bool> {
-        self.table_exists(&get_scan_base_table_name(&self.job_id)).await
+    /// 返回上一复制代次的源保留策略；普通扫描不构成可复用的复制基线。
+    pub async fn copy_catalogue_source_reserved(&self) -> Result<Option<bool>> {
+        Ok(self
+            .latest_copy_generation()
+            .await?
+            .map(|generation| generation.request.source_cleanup.retains_source()))
     }
 
     /// 检查指定表名是否存在于当前数据库中

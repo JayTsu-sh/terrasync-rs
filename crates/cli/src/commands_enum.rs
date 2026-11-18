@@ -10,9 +10,11 @@ use clap::Subcommand;
 
 // 内部模块
 use crate::commands::{
-    validate_block_size, validate_delta_size_threshold, validate_iops, validate_peak_qos_rate, validate_qos_format,
-    validate_storage_path,
+    validate_block_size, validate_iops, validate_peak_qos_rate, validate_qos_format, validate_storage_path,
 };
+
+#[cfg(feature = "remote")]
+use crate::commands::validate_delta_size_threshold;
 
 /// ACE子命令枚举
 #[derive(Subcommand, Debug)]
@@ -138,8 +140,9 @@ pub enum Commands {
         block_size: Option<String>,
 
         /// 超过此大小时跳过 delta 并全量传输，例如 512MiB、1GiB。
-        /// Atomic/Checkpoint 默认 512MiB；Direct 默认不限制文件大小。
+        /// Checkpoint 默认 512MiB；Direct 默认不限制文件大小。
         /// 仅用于 --remote 双进程模式。
+        #[cfg(feature = "remote")]
         #[arg(long, value_parser = validate_delta_size_threshold)]
         delta_size_threshold: Option<String>,
 
@@ -157,39 +160,36 @@ pub enum Commands {
 
         /// Connect to a remote Receiver daemon for dual-process sync.
         /// Format: HOST:PORT (e.g. 192.168.1.100:9876)
+        #[cfg(feature = "remote")]
         #[arg(long, value_name = "HOST:PORT")]
         remote: Option<String>,
 
         /// Server TLS certificate file for verifying the Receiver (防 MITM).
         /// Copy from the Receiver's --tls-cert-out output.
+        #[cfg(feature = "remote")]
         #[arg(long, value_name = "FILE", requires = "remote")]
         tls_server_cert: Option<String>,
 
         /// Auth token to present to the Receiver (must match its --token).
         /// Only used together with --remote.
+        #[cfg(feature = "remote")]
         #[arg(long, requires = "remote")]
         token: Option<String>,
 
-        /// 使用 Checkpoint 模式；与 --in-place 同时指定时优先。
+        /// 启用文件断点续传；不启用时使用 Direct，不恢复扫描位置。
         #[arg(long, default_value_t = false)]
         resume: bool,
 
-        /// 未启用 --resume 时使用 Atomic 模式；两者均省略时使用 Direct。
-        #[arg(long, default_value_t = false)]
-        in_place: bool,
-
-        /// 兼容旧参数：Direct 已是默认模式。
-        #[arg(long, hide = true, conflicts_with = "resume")]
-        no_resume: bool,
-
         /// Delete files/directories on the destination that no longer exist on the source.
         /// Only effective in `--remote` (dual-process) mode.
+        #[cfg(feature = "remote")]
         #[arg(long, default_value_t = false)]
         delete_target: bool,
     },
 
     /// Start a Receiver daemon for dual-process sync (destination side).
     /// Listens for incoming QUIC connections from a Sender.
+    #[cfg(feature = "remote")]
     Serve {
         /// Listen address and port
         #[arg(long, default_value = "0.0.0.0:9876")]

@@ -14,7 +14,7 @@ async-trait   = { workspace = true }
 bytes         = { workspace = true, features = ["serde"] }
 serde         = { workspace = true, features = ["rc"] }
 serde_json    = { workspace = true }
-data-mover    = { workspace = true }
+data-mover-model = { workspace = true }
 thiserror     = { workspace = true }
 tokio         = { version = "1.51.1", features = ["sync"] }
 
@@ -27,6 +27,7 @@ tracing = { workspace = true, optional = true }
 zstd    = { version = "0.13", optional = true }
 
 [dev-dependencies]
+data-mover = { workspace = true }
 tokio = { version = "1.51.1", features = ["full", "test-util"] }
 
 [lints]

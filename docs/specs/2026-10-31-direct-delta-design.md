@@ -12,9 +12,9 @@
 
 ## 方案
 
-CLI 优先级为 `--resume` → Checkpointed，否则 `--in-place` → AtomicReplace，否则 Direct。
+CLI 和 Web 的文件续传选择均为启用时 Checkpointed，否则 Direct。
 全量、增量、版本化 S3 队列及 rename 后的数据重拷贝都携带同一策略。不支持时明确报错，
-不自动切换模式。旧 `--no-resume` 只保留解析兼容，与 `--resume` 互斥。
+不自动切换模式。产品 Atomic 及 `--in-place`／`--no-resume` 入口已移除，文件续传不恢复扫描位置。
 
 双进程 Unix Local 的 Direct 使用上游 `DirectPatchSession`：接收阶段保持 basis 不变，
 消费所有引用并计算完整摘要，仅暂存与目标不同的区间；确认源端证据并复核 basis 后才应用补丁。
@@ -28,24 +28,25 @@ Local 后台校验停止；调用方父令牌与其他文件不受会话释放�
 开始应用补丁后的取消可能保留部分更新，须重新生成 basis 后重试。
 
 原地补丁需要独立的 `supports_sparse_patch` / `patch_direct` 能力，不能复用先截断文件的普通
-positioned writer。当前仅 Unix Local 支持；其他远端目标应显式使用 Atomic/Checkpoint。
-Direct 默认不受 512MiB 门槛限制，但保留用户显式设置的门槛。Atomic/Checkpoint 保持旧门槛。
+positioned writer。当前仅 Unix Local 支持；其他远端目标可选择其支持的 Checkpoint，不得静默切换模式。
+Direct 默认不受 512MiB 门槛限制，但保留用户显式设置的门槛。Checkpoint 保持原门槛。
 
 ## 接口设计
 
-- `TransferMode::from_flags` 确定优先级，映射到 data-mover 的三种 `TransferPolicy`。
-- `SyncJobConfig`、worker 恢复上下文及 `SessionConfig` 传递模式；wire v10 拒绝旧端混用。
+- `TransferMode::from_resume` 统一选择，映射到 data-mover 的 Checkpointed／Direct。
+- `SyncJobConfig`、worker 恢复上下文及 `SessionConfig` 传递模式；wire v14 拒绝旧模式线格式混用。
 - `StreamChunk` 的同位置提示只由 Receiver 重建器在读取 basis 后产生，不信任外部跳过指令。
 - 连续 Match 合并为最多 2MiB 的读取；重建器使用实际 basis 长度，支持增长和缩短。
 - Matcher 对重复内容优先引用同位置，字面量分片最多 1MiB；rolling checksum 按5552字节批量
   取模，保持原值并降低签名 CPU 开销。
-- HDFS 的应用进度记录仅在 Checkpoint 模式启用，Direct/Atomic 不生成恢复记录。
+- HDFS 的应用进度记录仅在 Checkpoint 模式启用，Direct 不生成恢复记录。
 
 ## 影响范围
 
 涉及 CLI、app 编排/全量/增量/重建流程、storage-adapter、transport 会话和实验室脚本。
-上游 data-mover PR #173 已先经独立审查和 CI 合入 main，依赖固定到 `4781406`。
-Web 任务继续显式使用 Checkpoint；tar API 仅支持 Atomic，其他选择明确拒绝。
+上游提供 DirectPatchSession，本次依赖固定为 `a57e456f899cd7a4165a41335a3a916c3258a9fd`。
+Web 文件续传默认关闭并独立保存；产品 tar 显式使用 Direct，不支持文件内续传。
+Unix Local 和 S3 归档逐清单保护源别名；其他后端的生成流 Direct 能力尚待补齐。
 
 Direct 不提供事务回滚和外部进程并发写隔离：接收中断不改 basis，应用补丁途中失败可能留下
 部分更新，重试必须重新生成签名。Checkpoint 的目标前缀可复用，但当前 wire 重跑仍重放数据/
@@ -53,7 +54,7 @@ delta token 来计算完整摘要，不能宣称网络字节级续传。签名�
 
 ## 验证方式
 
-覆盖 CLI 四种参数组合及顺序、原 inode/硬链接语义、能力拒绝、块移动与重叠引用、增长缩短、
+覆盖 CLI 两种参数选择及旧参数拒绝、原 inode/硬链接语义、能力拒绝、块移动与重叠引用、增长缩短、
 不完整输入、失败锁定、basis 并发变化以及 Checkpoint 前缀复用；回归全量与 delta 的 redo。
 
 使用真实 CLI、ClickHouse、版本化 S3 和 NFS 验证全量/增量模式贯穿。

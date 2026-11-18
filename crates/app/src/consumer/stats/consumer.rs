@@ -9,29 +9,34 @@
 //! 三段式编排；不再暴露一站式 `run`。
 
 // 标准库
-use std::net::IpAddr;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 use std::time::Duration;
 
 // 外部crate
 use data_mover::model::{EntryKind, ObservedEntry};
-use reqwest::Response;
-use task_model::StorageEntryMessage;
-use task_model::observation::{EntryStatistics, ObservedScanEvent, ObservedView};
+use reqwest::redirect::Policy;
+use task_model::migration::MigrationReport;
+use task_model::observation::{EntryProgress, EntryStatistics, ObservedScanEvent, ObservedView};
+use task_model::{RetentionScope, StorageEntryMessage};
 use tokio::sync::{Mutex, mpsc};
 use tokio::task::JoinHandle;
-use tokio::time::timeout;
+use tokio::time::{Instant, timeout};
 use tracing::{error, info, trace, warn};
 
 // 内部模块
 use super::accumulator::StatsKind;
-use super::callback_state::{CallbackState, ScanRuntimePhase, errors};
-use super::diagnostics::{CallbackAck, safe_diagnostic_text};
+use super::callback_state::{CallbackState, errors};
+use super::delivery::{self, DeliveryError, PreparedCallback};
+use super::journal;
 use super::progress_bar::ProgressBar;
-use super::report::ProgressDetail;
-use super::report::ProgressReport;
+use crate::callback::CallbackEndpoint;
+use crate::config::JobType;
+use crate::error::{AppError, Result};
+use crate::report::{ProgressDetail, ProgressReport, ScanRuntimePhase};
 use crate::scan::statistics::{ScanCounts, ScanSnapshot};
+use db::ClickHouseDatabase;
+use task_model::diagnostics::{MAX_DIAGNOSTIC_BATCH_EVENTS, safe_diagnostic_text};
 
 /// HTTP 进度回调间隔（秒）
 const CALLBACK_INTERVAL_SECS: u64 = 2;
@@ -44,9 +49,10 @@ pub struct StatisticConsumer {
     pub stats: StatsKind,
     pub progress_bar: ProgressBar,
     pub job_dir: String,
-    pub callback_url: Option<String>,
+    pub callback_url: Option<CallbackEndpoint>,
     /// 纯增量扫描的 generation 是否成功提交；其他任务保持 `None`。
     pub generation_committed: Option<bool>,
+    pub migration: Option<MigrationReport>,
     pub scan_snapshot: Option<ScanSnapshot>,
     pub callback: CallbackState,
     /// progress bar display 线程句柄，`finalize()` join 以确保正常退出
@@ -54,6 +60,24 @@ pub struct StatisticConsumer {
 }
 
 impl StatisticConsumer {
+    pub(crate) async fn record_message(consumer: &Arc<Mutex<Self>>, message: &StorageEntryMessage) -> Result<()> {
+        match journal::record(consumer, message).await {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                Self::diagnostic_failure(consumer, error).await;
+                Err(AppError::DiagnosticJournalStopped {
+                    source: consumer
+                        .lock()
+                        .await
+                        .callback
+                        .journal
+                        .terminal
+                        .clone()
+                        .unwrap_or_else(|| Arc::new(AppError::DiagnosticDeliveryUnavailable)),
+                })
+            }
+        }
+    }
     /// 启动终端进度条（后台线程），并将句柄保存在 `self.pb_handle` 中。
     pub fn start_progress_bar(&mut self) {
         self.pb_handle = Some(self.progress_bar.start());
@@ -63,6 +87,7 @@ impl StatisticConsumer {
     pub fn finalize(&mut self) {
         if let Some(handle) = self.pb_handle.take() {
             self.progress_bar.finish();
+            handle.thread().unpark();
             if let Err(e) = handle.join() {
                 error!("[ProgressBar] Display thread panicked: {e:?}");
             }
@@ -72,6 +97,9 @@ impl StatisticConsumer {
             println!("{scan}\nErrors: {}", errors(&self.stats).total());
         } else {
             println!("{}", self.stats);
+        }
+        if self.callback.task_error_count > 0 {
+            println!("Task errors: {}", self.callback.task_error_count);
         }
     }
 
@@ -153,16 +181,71 @@ impl StatisticConsumer {
 
     pub fn update_statistics(&mut self, message: &StorageEntryMessage) {
         trace!("Updating statistics for message: {:?}", message);
+        if let StorageEntryMessage::Scanned(entry) = message
+            && let StatsKind::Incremental(stats) = &mut self.stats
+            && matches!(stats.job_type, JobType::IncrementalCopy)
+        {
+            let inventory =
+                EntryProgress::copy_inventory(entry, self.migration.as_ref().is_some_and(|plan| !plan.target_history));
+            stats.scanned.update(&inventory);
+            self.progress_bar.update_observed("scanned", &inventory);
+            return;
+        }
         self.stats.update_from_message(message);
+        if let StorageEntryMessage::TargetPreserved { retention, reason } = message {
+            if retention.scope == RetentionScope::Entry {
+                self.callback.target_preserved_count = self.callback.target_preserved_count.saturating_add(1);
+            }
+            let retained = self.callback.outbox.enqueue_retention(retention, reason);
+            self.callback.diagnostics_incomplete |= !retained;
+        }
+        if let StorageEntryMessage::CopySkipped { entry, reason } = message {
+            let retained = self
+                .callback
+                .outbox
+                .enqueue("copy", "copy_skipped", reason, Some(entry.path().as_str()));
+            self.callback.diagnostics_incomplete |= !retained;
+        }
         self.progress_bar.update_statistics(message);
-        if let StorageEntryMessage::Error {
-            event, path, reason, ..
+        if let StorageEntryMessage::CopyVersionFailed {
+            entry,
+            phase,
+            backend,
+            reason,
+            ..
         } = message
         {
+            let version = if entry.view().version_id().is_empty() {
+                "current"
+            } else {
+                entry.view().version_id()
+            };
+            let reason = safe_diagnostic_text(&format!(
+                "version={} backend={backend:?} phase={phase}: {reason}",
+                version
+            ));
+            let path = entry.view().source_path().ok();
+            let retained = self.callback.outbox.enqueue(
+                "copy",
+                "copy_version_failed",
+                &reason,
+                path.as_ref().map(|path| path.as_str()),
+            );
+            self.callback.diagnostics_incomplete |= !retained;
+            self.callback.runtime.current_error = Some(reason);
+            self.callback.runtime.state = ScanRuntimePhase::Failed;
+        }
+        if let StorageEntryMessage::Error {
+            event, path, reason, ..
+        }
+        | StorageEntryMessage::Diagnostic { event, path, reason } = message
+        {
             let reason = safe_diagnostic_text(reason);
-            self.callback
+            let retained = self
+                .callback
                 .outbox
                 .enqueue("operation", &format!("{event:?}"), &reason, path.to_str());
+            self.callback.diagnostics_incomplete |= !retained;
             self.callback.runtime.current_error = Some(reason);
             self.callback.runtime.state = ScanRuntimePhase::Failed;
         }
@@ -193,7 +276,11 @@ impl StatisticConsumer {
     fn report_for_scan(&self, is_final: bool, snapshot: Option<&ScanSnapshot>) -> ProgressReport {
         let mut report = self.progress_bar.to_report(self.stats.job_id());
         report.is_final = is_final;
+        report.skipped_count = self.stats.skipped_count();
+        report.target_preserved_count = self.callback.target_preserved_count;
+        report.task_error_count = self.callback.task_error_count;
         report.generation_committed = self.generation_committed;
+        report.migration = self.migration.clone();
         report.scan = snapshot.cloned();
         report.callback_identity = Some(self.callback.identity.clone());
         if snapshot.is_some() {
@@ -260,72 +347,60 @@ impl StatisticConsumer {
         report
     }
 
-    async fn post_callback(consumer: &Arc<Mutex<Self>>, client: &reqwest::Client, url: &str, is_final: bool) -> bool {
-        let report = {
-            let mut consumer = consumer.lock().await;
-            consumer.callback.identity.sequence = consumer.callback.identity.sequence.saturating_add(1);
-            let batch = consumer.callback.outbox.prepare_batch();
-            let mut report = consumer.to_report(is_final);
-            report.diagnostics = batch;
-            report
-        };
-        let response = match client
-            .post(url)
-            .json(&report)
-            .send()
-            .await
-            .and_then(Response::error_for_status)
-        {
-            Ok(response) => response,
+    pub(crate) async fn post_callback(
+        consumer: &Arc<Mutex<Self>>, client: &reqwest::Client, url: &CallbackEndpoint, is_final: bool,
+    ) -> Option<bool> {
+        let gate = consumer.lock().await.callback.journal.delivery.clone();
+        let _guard = gate.lock().await;
+        let prepared = match PreparedCallback::prepare(consumer, is_final).await {
+            Ok(value) => value,
             Err(error) => {
-                warn!(%error, "Progress callback failed; batch retained");
-                return false;
+                Self::diagnostic_failure(consumer, error).await;
+                return None;
             }
         };
-        let Some(batch) = report.diagnostics else { return true };
-        let ack = match response.json::<CallbackAck>().await {
-            Ok(ack) if ack.batch_id.as_deref() == Some(batch.batch_id.as_str()) => ack,
-            _ => {
-                warn!("Progress callback did not acknowledge the diagnostic batch");
-                return false;
-            }
-        };
-        if let Some(batch_id) = ack.batch_id {
-            consumer.lock().await.callback.outbox.ack(&batch_id);
+        if let Err(error) = prepared.send(client, url).await {
+            let state = consumer.lock().await;
+            warn!(job_id = %state.stats.job_id(), %error, "Progress callback failed; batch retained");
+            return None;
         }
-        true
+        prepared.received(consumer).await;
+        let failed = consumer.lock().await.callback.journal.failed;
+        if !failed && let Err(error) = journal::confirm_pending(consumer, false).await {
+            Self::diagnostic_failure(consumer, error).await;
+        }
+        Some(prepared.batch_id.is_some())
+    }
+
+    pub(crate) async fn diagnostic_failure(consumer: &Arc<Mutex<Self>>, error: AppError) {
+        warn!(error = %safe_diagnostic_text(&error.to_string()), "Diagnostic persistence is incomplete");
+        let mut state = consumer.lock().await;
+        if state.callback.journal.terminal.is_none() {
+            state.callback.task_error_count = state.callback.task_error_count.saturating_add(1);
+            state
+                .callback
+                .outbox
+                .enqueue("diagnostics", "journal_unavailable", &error.to_string(), None);
+        }
+        state.callback.diagnostics_incomplete = true;
+        state.callback.journal.failed = true;
+        state.callback.journal.terminal.get_or_insert_with(|| Arc::new(error));
     }
 
     // ─── HTTP 回调 ───
 
-    fn callback_is_loopback(url: &str) -> bool {
-        let Ok(parsed) = reqwest::Url::parse(url) else {
-            return false;
-        };
-        let Some(host) = parsed.host_str() else {
-            return false;
-        };
-        let address_host = host.trim_start_matches('[').trim_end_matches(']');
-        host.eq_ignore_ascii_case("localhost")
-            || address_host
-                .parse::<IpAddr>()
-                .is_ok_and(|address| address.is_loopback())
-    }
-
     /// 构建共享的 HTTP 客户端（带超时），供回调循环和最终回调复用。
     /// 本机回调绕过系统代理，外部回调继续遵循代理环境变量。
-    fn build_callback_client(url: &str) -> Option<reqwest::Client> {
-        let mut builder = reqwest::Client::builder().timeout(Duration::from_secs(10));
-        if Self::callback_is_loopback(url) {
+    pub(crate) fn build_callback_client(url: &CallbackEndpoint) -> std::result::Result<reqwest::Client, DeliveryError> {
+        let mut builder = reqwest::Client::builder()
+            .timeout(Duration::from_secs(2))
+            .redirect(Policy::none());
+        if url.is_loopback() {
             builder = builder.no_proxy();
         }
-        match builder.build() {
-            Ok(c) => Some(c),
-            Err(e) => {
-                error!("[ProgressCallback] Failed to build HTTP client, aborting callbacks: {e}");
-                None
-            }
-        }
+        builder
+            .build()
+            .map_err(|error| DeliveryError::Http(error.without_url()))
     }
 
     /// 启动周期性 HTTP 回调任务（每 2 秒 POST `ProgressReport`）
@@ -333,14 +408,18 @@ impl StatisticConsumer {
     /// 仅在配置了 `callback_url` 时启动。
     /// 返回 ([`JoinHandle`], Client) 供调用方在消息循环结束后 abort 并复用 client；无 URL 返回 None。
     pub async fn start_callback_loop(consumer: Arc<Mutex<Self>>) -> Option<CallbackGuard> {
-        let url = {
+        let (url, job_id) = {
             let c = consumer.lock().await;
-            c.callback_url.clone()
+            (c.callback_url.clone()?, c.stats.job_id().to_owned())
         };
-
-        let url = url?;
-        let client = Self::build_callback_client(&url)?;
-        info!("[ProgressCallback] Starting callback loop → {url}");
+        let client = match Self::build_callback_client(&url) {
+            Ok(client) => client,
+            Err(error) => {
+                warn!(%job_id, %error, "Could not start callback loop");
+                return None;
+            }
+        };
+        info!(%job_id, "[ProgressCallback] Starting callback loop");
         let sc = consumer.clone();
         let loop_client = client.clone();
 
@@ -348,7 +427,12 @@ impl StatisticConsumer {
             let mut interval = tokio::time::interval(Duration::from_secs(CALLBACK_INTERVAL_SECS));
             loop {
                 interval.tick().await;
-                Self::post_callback(&sc, &loop_client, &url, false).await;
+                let until = Instant::now() + Duration::from_secs(1);
+                while let Some(had_details) = Self::post_callback(&sc, &loop_client, &url, false).await {
+                    if !had_details || Instant::now() >= until {
+                        break;
+                    }
+                }
             }
         });
         Some((handle, client))
@@ -356,29 +440,33 @@ impl StatisticConsumer {
 
     /// 发送最终回调（`is_final=true`），优先复用已有 client
     pub async fn send_final_callback(consumer: &Arc<Mutex<Self>>, client: Option<&reqwest::Client>) {
+        Self::send_final_with_database(consumer, client, None, Duration::from_secs(2)).await;
+    }
+
+    async fn send_final_with_database(
+        consumer: &Arc<Mutex<Self>>, client: Option<&reqwest::Client>, database: Option<&ClickHouseDatabase>,
+        budget: Duration,
+    ) {
         let url = consumer.lock().await.callback_url.clone();
-        let Some(url) = url else {
-            return;
+        let owned = match (&url, client) {
+            (Some(url), None) => match Self::build_callback_client(url) {
+                Ok(client) => Some(client),
+                Err(error) => {
+                    warn!(%error, "Final callback client could not be built; preserving final report");
+                    None
+                }
+            },
+            _ => None,
         };
-        let owned;
-        let client = match client {
-            Some(client) => client,
-            None => {
-                let Some(client) = Self::build_callback_client(&url) else {
-                    return;
-                };
-                owned = client;
-                &owned
-            }
-        };
-        loop {
-            if !Self::post_callback(consumer, client, &url, true).await {
-                break;
-            }
-            if consumer.lock().await.callback.outbox.prepare_batch().is_none() {
-                break;
-            }
-        }
+        delivery::send_final(
+            consumer,
+            client.or(owned.as_ref()),
+            url.as_ref(),
+            database,
+            budget,
+            budget.min(Duration::from_secs(1)),
+        )
+        .await;
     }
 
     // ─── 生命周期拆分 ───
@@ -396,29 +484,81 @@ impl StatisticConsumer {
     /// 消息循环：消费 rx 直到 channel 关闭。只更新累计统计与进度条，不涉及生命周期。
     ///
     /// 最小化持锁时间：每条消息更新后立即释放，避免 callback loop 饥饿。
-    pub async fn process(consumer: Arc<Mutex<Self>>, mut rx: mpsc::Receiver<StorageEntryMessage>) {
+    pub async fn process(consumer: Arc<Mutex<Self>>, mut rx: mpsc::Receiver<StorageEntryMessage>) -> Result<()> {
         while let Some(message) = rx.recv().await {
-            let mut c = consumer.lock().await;
-            c.update_statistics(&message);
+            if let Err(error) = journal::record(&consumer, &message).await {
+                rx.close();
+                Self::diagnostic_failure(&consumer, error).await;
+                // 已接受的有界缓冲继续累计；可用 callback 尽力排空，不能再生成新工作。
+                let deadline = Instant::now() + Duration::from_secs(2);
+                while let Ok(message) = rx.try_recv() {
+                    let mut state = consumer.lock().await;
+                    if state.callback.outbox.pending_len() >= MAX_DIAGNOSTIC_BATCH_EVENTS {
+                        drop(state);
+                        let url = consumer.lock().await.callback_url.clone();
+                        let remaining = deadline.saturating_duration_since(Instant::now());
+                        let mut delivered = false;
+                        if !remaining.is_zero()
+                            && let Some(url) = url
+                            && let Ok(client) = Self::build_callback_client(&url)
+                        {
+                            delivered = timeout(remaining, Self::post_callback(&consumer, &client, &url, false))
+                                .await
+                                .ok()
+                                .flatten()
+                                .is_some();
+                        }
+                        if !delivered {
+                            journal::log_unrouted(&consumer).await;
+                        }
+                        state = consumer.lock().await;
+                    }
+                    state.update_statistics(&message);
+                }
+                let state = consumer.lock().await;
+                return Err(AppError::DiagnosticJournalStopped {
+                    source: state
+                        .callback
+                        .journal
+                        .terminal
+                        .clone()
+                        .unwrap_or_else(|| Arc::new(AppError::DiagnosticDeliveryUnavailable)),
+                });
+            }
         }
+        if let Err(error) = journal::flush_all(&consumer).await {
+            Self::diagnostic_failure(&consumer, error).await;
+            return Err(AppError::DiagnosticJournalStopped {
+                source: consumer
+                    .lock()
+                    .await
+                    .callback
+                    .journal
+                    .terminal
+                    .clone()
+                    .unwrap_or_else(|| Arc::new(AppError::DiagnosticDeliveryUnavailable)),
+            });
+        }
+        Ok(())
     }
 
     /// 结束生命周期：abort HTTP 回调循环 → 发送 final 回调 → finalize（打印报告 + join 显示线程）。
     pub async fn end(consumer: Arc<Mutex<Self>>, callback: Option<CallbackGuard>) {
-        let budget = consumer
-            .lock()
-            .await
-            .scan_snapshot
-            .as_ref()
-            .map(|_| Duration::from_secs(2));
-        Self::end_with_budget(consumer, callback, budget).await;
+        Self::end_with_database(consumer, callback, None, false).await;
     }
 
-    pub(crate) async fn end_cancelled(consumer: Arc<Mutex<Self>>, callback: Option<CallbackGuard>) {
-        Self::end_with_budget(consumer, callback, Some(Duration::from_millis(500))).await;
-    }
-
-    async fn end_with_budget(consumer: Arc<Mutex<Self>>, callback: Option<CallbackGuard>, budget: Option<Duration>) {
+    pub(crate) async fn end_with_database(
+        consumer: Arc<Mutex<Self>>, callback: Option<CallbackGuard>, database: Option<&ClickHouseDatabase>,
+        cancelled: bool,
+    ) {
+        if let Some(database) = database {
+            consumer.lock().await.callback.journal.database = Some(database.clone());
+        }
+        let budget = if cancelled {
+            Duration::from_millis(500)
+        } else {
+            Duration::from_secs(2)
+        };
         let shared_client = if let Some((handle, client)) = callback {
             handle.abort();
             let _ = handle.await;
@@ -427,14 +567,7 @@ impl StatisticConsumer {
             None
         };
 
-        let callback = Self::send_final_callback(&consumer, shared_client.as_ref());
-        if let Some(budget) = budget {
-            if timeout(budget, callback).await.is_err() {
-                warn!("[ProgressCallback] Cancelled scan final report exceeded its time budget");
-            }
-        } else {
-            callback.await;
-        }
+        Self::send_final_with_database(&consumer, shared_client.as_ref(), database, budget).await;
 
         let mut c = consumer.lock().await;
         c.finalize();
@@ -444,6 +577,7 @@ impl StatisticConsumer {
 #[cfg(test)]
 mod tests {
     use super::StatisticConsumer;
+    use crate::callback::CallbackEndpoint;
     use crate::config::JobType;
     use crate::consumer::stats::{FullStats, IncrementalStats, ProgressBar, StatsKind};
     use crate::error::Result;
@@ -471,15 +605,16 @@ mod tests {
             )),
             progress_bar: ProgressBar::new(JobType::Scan),
             job_dir: String::new(),
-            callback_url: Some(format!("http://{address}/progress")),
+            callback_url: Some(CallbackEndpoint::parse(&format!("http://{address}/progress"))?),
             generation_committed: Some(false),
+            migration: None,
             pb_handle: None,
             scan_snapshot: None,
             callback: Default::default(),
         }));
         consumer.lock().await.start_progress_bar();
         let started = Instant::now();
-        StatisticConsumer::end_cancelled(consumer.clone(), None).await;
+        StatisticConsumer::end_with_database(consumer.clone(), None, None, true).await;
         stalled.abort();
         let _ = stalled.await;
         assert!(started.elapsed() < Duration::from_secs(2));
@@ -498,7 +633,7 @@ mod tests {
             "http://[::1]:3000/callback",
         ] {
             assert!(
-                StatisticConsumer::callback_is_loopback(url),
+                CallbackEndpoint::parse(url).is_ok_and(|endpoint| endpoint.is_loopback()),
                 "expected loopback URL: {url}"
             );
         }
@@ -509,7 +644,7 @@ mod tests {
             "not a URL",
         ] {
             assert!(
-                !StatisticConsumer::callback_is_loopback(url),
+                !CallbackEndpoint::parse(url).is_ok_and(|endpoint| endpoint.is_loopback()),
                 "expected external URL: {url}"
             );
         }
@@ -528,6 +663,7 @@ mod tests {
             job_dir: String::new(),
             callback_url: None,
             generation_committed: Some(false),
+            migration: None,
             pb_handle: None,
             scan_snapshot: None,
             callback: Default::default(),
@@ -541,12 +677,12 @@ mod tests {
 
 /// 兜底 join display 线程（panic/提前 drop 路径）。
 ///
-/// display 线程 `finish()` 后最多还要一轮 `DISPLAY_INTERVAL_SECS` 才退出，直接 join 会阻塞
-/// 当前线程（可能是 tokio worker）~2s，故派发到独立 std thread。
+/// 先发布结束状态并唤醒 display；兜底回收仍派发到独立 std thread，避免阻塞 tokio worker。
 impl Drop for StatisticConsumer {
     fn drop(&mut self) {
         if let Some(handle) = self.pb_handle.take() {
             self.progress_bar.finish();
+            handle.thread().unpark();
             std::thread::spawn(move || {
                 if let Err(e) = handle.join() {
                     error!("[ProgressBar] Display thread panicked during drop: {e:?}");
@@ -559,3 +695,7 @@ impl Drop for StatisticConsumer {
 #[cfg(test)]
 #[path = "callback_tests.rs"]
 mod callback_tests;
+
+#[cfg(test)]
+#[path = "consumer_wakeup_tests.rs"]
+mod wakeup_tests;

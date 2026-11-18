@@ -1,6 +1,6 @@
 //! Sender 侧逻辑
 //!
-//! 从 walkdir 接收 entry，通过 transport 发送给 Receiver 执行写入。
+//! 从遍历流接收条目，为本地全量复制 worker 分派工作。
 //! 单进程模式下发送 `CopyEntry` 命令（Receiver 自行读写）。
 //! 双进程模式下发送 `FileData` 数据流（Phase 3）。
 
@@ -15,22 +15,29 @@ use crate::task_stream::AsyncReceiver;
 use data_mover::model::ObservedEntry;
 use data_mover::qos::QosManager;
 use task_model::StorageEntryMessage;
+use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
-use transport::message::SenderMsg;
-use transport::traits::SenderTransport;
 
 // 内部模块
 use crate::broadcast::BroadcastForwarder;
-use crate::error::{AppError, Result};
+use crate::copy_history::{HistoryCompletion, HistoryCopyContext, HistoryCopyPolicy, HistoryCopyWorker};
+use crate::error::{AppError, Result, StorageError};
 use crate::file_copy::CopyOptions;
-use crate::file_copy::copy_versions;
+use crate::file_copy::selection::skip_unrepresentable;
 use crate::receiver::ReceiverConfig;
 use crate::tar_pack;
-use task_model::EntryChange;
-use task_model::observation::ObservedItem;
+use copy_queue::{CopyCommand, CopyCommandSink};
+use task_model::observation::EntryProgress;
+
+#[cfg(test)]
+#[path = "sender_cancellation_tests.rs"]
+mod cancellation_tests;
+
+pub(crate) mod copy_queue;
 
 /// Sender worker 配置
 pub struct SenderWorkerConfig {
+    pub target_history: Option<bool>,
     pub enable_integrity_check: bool,
     pub enable_acl: bool,
     pub is_source_reserved: bool,
@@ -39,23 +46,72 @@ pub struct SenderWorkerConfig {
 
 /// 单个 Sender worker task（S1）
 ///
-/// 从共享的 `walkdir_iter` 拉取 entry，通过 transport 发送给 Receiver。
-/// 单进程模式：发送 `CopyEntry` 命令。
-/// 双进程模式：读取源文件数据后发送 `FileData` 流（Phase 3）。
+/// 从共享的遍历流读取条目，把普通条目和打包结果放入本地工作队列。
 #[allow(clippy::too_many_arguments)]
-pub async fn sender_worker(
+pub(crate) async fn sender_worker(
     worker_id: usize, walkdir_iter: AsyncReceiver<StorageEntryMessage>, src_storage: Arc<StorageContext>,
-    dest_storage: Arc<StorageContext>, transport: Arc<dyn SenderTransport>,
+    dest_storage: Arc<StorageContext>, transport: Arc<dyn CopyCommandSink>,
     broadcaster: &BroadcastForwarder<StorageEntryMessage>, config: &SenderWorkerConfig,
     qos_manager: Option<QosManager>, bytes_tracker: Option<Arc<AtomicU64>>, copy_config: &ReceiverConfig,
     active_entry_counter: Arc<AtomicUsize>, entry_counter: Arc<AtomicUsize>, size_counter: Arc<AtomicU64>,
 ) -> Result<()> {
     info!("[Sender Worker {}] Started", worker_id);
     let mut failure = None;
+    let mut history = HistoryCopyWorker::new(
+        HistoryCopyContext {
+            source: src_storage.clone(),
+            destination: dest_storage.clone(),
+            broadcaster: broadcaster.clone(),
+            job_id: copy_config.job_id.clone(),
+            options: CopyOptions {
+                transfer_mode: copy_config.transfer_mode,
+                qos: qos_manager.clone(),
+                enable_integrity_check: copy_config.enable_integrity_check,
+                bytes_counter: bytes_tracker.clone(),
+                cancel: copy_config.cancel.clone(),
+            },
+        },
+        HistoryCopyPolicy {
+            active_entry_limit: 1,
+            target_history: config.target_history,
+            completion: HistoryCompletion::Full,
+            recovering: false,
+        },
+    );
 
-    while let Some(msg) = walkdir_iter.next().await {
+    loop {
+        let next = match copy_config.cancel.as_ref() {
+            Some(cancel) => tokio::select! {
+                biased;
+                () = cancel.cancelled() => return Err(StorageError::Cancelled.into()),
+                message = walkdir_iter.next() => message,
+            },
+            None => walkdir_iter.next().await,
+        };
+        let Some(msg) = next else { break };
+        if broadcaster.is_closed() {
+            break;
+        }
         match msg {
+            StorageEntryMessage::Diagnostic { .. } => broadcaster.broadcast(msg).await?,
             StorageEntryMessage::Scanned(entry) => {
+                if entry.history().is_some() {
+                    active_entry_counter.fetch_add(1, Ordering::Relaxed);
+                    if entry.history().is_some_and(|history| history.segment() == 0) {
+                        entry_counter.fetch_add(1, Ordering::Relaxed);
+                    }
+                    size_counter.fetch_add(
+                        EntryProgress::copy_inventory(&entry, !config.target_history.unwrap_or(true)).logical_bytes,
+                        Ordering::Relaxed,
+                    );
+                    let result = history.copy_segment(&entry).await;
+                    active_entry_counter.fetch_sub(1, Ordering::Relaxed);
+                    result?;
+                    continue;
+                }
+                if skip_unrepresentable(&entry, &dest_storage, broadcaster).await? {
+                    continue;
+                }
                 active_entry_counter.fetch_add(1, Ordering::Relaxed);
                 entry_counter.fetch_add(1, Ordering::Relaxed);
                 size_counter.fetch_add(entry.get_size(), Ordering::Relaxed);
@@ -69,33 +125,14 @@ pub async fn sender_worker(
                     );
                 }
 
-                let result = if entry.history().is_some() {
-                    // 同一路径的分段由固定 worker 顺序复制，不经过第二级竞争队列。
-                    copy_versions(
-                        ObservedItem::all(&entry),
-                        &src_storage,
-                        &dest_storage,
-                        CopyOptions {
-                            transfer_mode: copy_config.transfer_mode,
-                            qos: qos_manager.clone(),
-                            enable_integrity_check: copy_config.enable_integrity_check,
-                            is_source_reserved: copy_config.is_source_reserved,
-                            bytes_counter: bytes_tracker.clone(),
-                            cancel: None,
-                        },
-                        &copy_config.job_id,
-                        broadcaster,
-                        EntryChange::New,
-                    )
-                    .await
-                } else {
-                    send_entry(worker_id, &transport, &entry).await
-                };
+                let result = send_entry(worker_id, &transport, &entry, copy_config.cancel.as_ref()).await;
+                active_entry_counter.fetch_sub(1, Ordering::Relaxed);
                 if let Err(error) = result {
+                    if error.stops_event_pipeline() {
+                        return Err(error);
+                    }
                     failure.get_or_insert(error);
                 }
-
-                active_entry_counter.fetch_sub(1, Ordering::Relaxed);
             }
 
             StorageEntryMessage::Packaged(entry) => {
@@ -138,7 +175,7 @@ pub async fn sender_worker(
                 // 全量模式下与增量分支（orchestrator.rs 的 scan worker）对齐：把 walkdir
                 // 扫描错误广播出去，计入 ErrorStats.scan、进 ERROR STATISTICS 报表与
                 // progress error 计数（issue #57，此前只打日志，报表恒不体现）。
-                broadcaster.broadcast(msg.clone()).await;
+                broadcaster.broadcast(msg.clone()).await?;
                 failure.get_or_insert_with(|| AppError::ScanError(reason.clone()));
             }
 
@@ -147,11 +184,24 @@ pub async fn sender_worker(
     }
 
     info!("[Sender Worker {}] Completed", worker_id);
-    failure.map_or(Ok(()), Err)
+    let history_result = history.finish().await;
+    failure.map_or(history_result, Err)
 }
 
-async fn send_entry(worker_id: usize, transport: &Arc<dyn SenderTransport>, entry: &Arc<ObservedEntry>) -> Result<()> {
-    if let Err(error) = transport.send(SenderMsg::CopyEntry { entry: entry.clone() }).await {
+async fn send_entry(
+    worker_id: usize, transport: &Arc<dyn CopyCommandSink>, entry: &Arc<ObservedEntry>,
+    cancel: Option<&CancellationToken>,
+) -> Result<()> {
+    let sending = transport.send(CopyCommand::CopyEntry { entry: entry.clone() });
+    let result = match cancel {
+        Some(cancel) => tokio::select! {
+            biased;
+            () = cancel.cancelled() => return Err(StorageError::Cancelled.into()),
+            result = sending => result,
+        },
+        None => sending.await,
+    };
+    if let Err(error) = result {
         error!(
             "[Sender Worker {}] Failed to send CopyEntry for {:?}: {}",
             worker_id,
@@ -166,7 +216,7 @@ async fn send_entry(worker_id: usize, transport: &Arc<dyn SenderTransport>, entr
 #[allow(clippy::too_many_arguments)]
 async fn send_packaged_entry(
     worker_id: usize, entry: &Arc<ObservedEntry>, src_storage: &Arc<StorageContext>,
-    dest_storage: &Arc<StorageContext>, transport: &Arc<dyn SenderTransport>, config: &SenderWorkerConfig,
+    dest_storage: &Arc<StorageContext>, transport: &Arc<dyn CopyCommandSink>, config: &SenderWorkerConfig,
     qos_manager: Option<QosManager>, bytes_tracker: Option<Arc<AtomicU64>>,
 ) -> Result<()> {
     match tar_pack::pack_directory(
@@ -181,7 +231,7 @@ async fn send_packaged_entry(
     {
         Ok((tar_entry, manifest_entries)) => {
             transport
-                .send(SenderMsg::TarPacked {
+                .send(CopyCommand::TarPacked {
                     tar_entry: Arc::new(tar_entry),
                     manifest_entries,
                 })
@@ -195,14 +245,7 @@ async fn send_packaged_entry(
                 entry.get_relative_path(),
                 error
             );
-            if let Err(notification_error) = transport
-                .send(SenderMsg::EntryError {
-                    path: entry.get_relative_path().to_path_buf(),
-                    reason: error.to_string(),
-                    ndx: None,
-                })
-                .await
-            {
+            if let Err(notification_error) = transport.send(CopyCommand::PackFailed).await {
                 error!(
                     "[Sender Worker {}] Failed to send pack error: {}",
                     worker_id, notification_error
@@ -225,13 +268,11 @@ mod tests {
     use crate::task_stream::AsyncReceiver;
     use async_trait::async_trait;
     use task_model::ErrorEvent;
-    use transport::error::{Result as TransportResult, TransportError};
-    use transport::message::ReceiverMsg;
 
     use crate::storage_factory::{StorageRole, create_storage_for_role};
     use tempfile::tempdir;
-    use transport::in_process::create_in_process_pair;
 
+    use super::copy_queue::copy_queue;
     use super::*;
 
     async fn create_storage(path: &str, block_size: Option<u64>, _ensure_dir: bool) -> Result<StorageContext> {
@@ -255,13 +296,14 @@ mod tests {
         .unwrap();
         drop(tx);
 
-        let (sender_transport, _receiver_transport) = create_in_process_pair();
-        let transport: Arc<dyn SenderTransport> = Arc::new(sender_transport);
+        let (sender_transport, _receiver_transport) = copy_queue();
+        let transport: Arc<dyn CopyCommandSink> = Arc::new(sender_transport);
 
         let tmp = tempdir().unwrap();
         let storage = Arc::new(create_storage(tmp.path().to_str().unwrap(), None, false).await.unwrap());
 
         let config = SenderWorkerConfig {
+            target_history: None,
             enable_integrity_check: false,
             enable_acl: false,
             is_source_reserved: true,
@@ -288,6 +330,7 @@ mod tests {
                 is_source_reserved: true,
                 job_dir: String::new(),
                 transfer_mode: Default::default(),
+                cancel: None,
             },
             Arc::new(AtomicUsize::new(0)),
             Arc::new(AtomicUsize::new(0)),
@@ -310,30 +353,22 @@ mod tests {
 
     #[derive(Default)]
     struct RecordingTransport {
-        sent: Mutex<Vec<SenderMsg>>,
+        sent: Mutex<Vec<CopyCommand>>,
         failures: usize,
     }
 
     #[async_trait]
-    impl SenderTransport for RecordingTransport {
-        async fn send(&self, msg: SenderMsg) -> TransportResult<()> {
+    impl CopyCommandSink for RecordingTransport {
+        async fn send(&self, msg: CopyCommand) -> Result<()> {
             let mut sent = self.sent.lock().unwrap();
             let index = sent.len();
             sent.push(msg);
             if index < self.failures {
                 if index == 0 {
-                    return Err(TransportError::Io(IoError::new(ErrorKind::TimedOut, "first send")).into());
+                    return Err(IoError::new(ErrorKind::TimedOut, "first send").into());
                 }
-                return Err(TransportError::ChannelClosed);
+                return Err(AppError::CopyQueueClosed);
             }
-            Ok(())
-        }
-
-        async fn recv(&self) -> Option<ReceiverMsg> {
-            None
-        }
-
-        async fn close(&self) -> TransportResult<()> {
             Ok(())
         }
     }
@@ -356,7 +391,7 @@ mod tests {
     }
 
     async fn run_messages(
-        messages: Vec<StorageEntryMessage>, transport: Arc<dyn SenderTransport>, storage: Arc<StorageContext>,
+        messages: Vec<StorageEntryMessage>, transport: Arc<dyn CopyCommandSink>, storage: Arc<StorageContext>,
         active: Arc<AtomicUsize>, count: Arc<AtomicUsize>,
     ) -> Result<()> {
         let (tx, rx) = async_channel::bounded(messages.len().max(1));
@@ -365,6 +400,7 @@ mod tests {
         }
         drop(tx);
         let config = SenderWorkerConfig {
+            target_history: None,
             enable_integrity_check: false,
             enable_acl: false,
             is_source_reserved: true,
@@ -387,6 +423,7 @@ mod tests {
                 is_source_reserved: true,
                 job_dir: String::new(),
                 transfer_mode: Default::default(),
+                cancel: None,
             },
             active,
             count,
@@ -416,9 +453,7 @@ mod tests {
             count.clone(),
         )
         .await;
-        assert!(
-            matches!(result, Err(AppError::TransportError(TransportError::Io(error))) if error.kind() == ErrorKind::TimedOut)
-        );
+        assert!(matches!(result, Err(AppError::IoError(error)) if error.kind() == ErrorKind::TimedOut));
         assert_eq!(transport.sent.lock().unwrap().len(), 3);
         assert_eq!(count.load(Ordering::Relaxed), 3);
         assert_eq!(active.load(Ordering::Relaxed), 0);
@@ -447,8 +482,8 @@ mod tests {
         assert!(matches!(result, Err(AppError::StorageError(_))));
         let sent = transport.sent.lock().unwrap();
         assert_eq!(sent.len(), 2);
-        assert!(matches!(&sent[0], SenderMsg::EntryError { .. }));
-        assert!(matches!(&sent[1], SenderMsg::CopyEntry { .. }));
+        assert!(matches!(&sent[0], CopyCommand::PackFailed));
+        assert!(matches!(&sent[1], CopyCommand::CopyEntry { .. }));
         assert_eq!(active.load(Ordering::Relaxed), 0);
     }
 }

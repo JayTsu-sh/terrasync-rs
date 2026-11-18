@@ -1,10 +1,11 @@
 use app::error::StorageError;
 use std::sync::{Arc, OnceLock};
-use task_model::TransferMode;
+use task_model::{SourceCleanupPolicy, TransferMode};
+use utils::app_config::AppConfig;
 
+use app::callback::CallbackEndpoint;
 use app::error::AppError;
-use app::scan::{ScanRequest, scan};
-use app::scan_resume::{clear_scan, scan_execution_is_incremental};
+use app::scan::{ScanRequest, clear_scan, scan, scan_execution_is_incremental};
 use dashmap::{DashMap, mapref::entry::Entry};
 use std::time::Duration;
 use tokio::select;
@@ -35,15 +36,21 @@ pub fn set_progress_callback_base_url(url: String) {
 }
 
 /// 构造指定任务的完整回调 URL
-fn progress_callback_url_for(task_id: &str, execution_id: &str) -> Option<String> {
-    PROGRESS_CALLBACK_BASE_URL.get().map(|base| {
-        format!(
-            "{}/tasks/{}/progress?execution_id={}",
-            base.trim_end_matches('/'),
-            task_id,
-            execution_id
-        )
-    })
+fn progress_callback_url_for(task_id: &str, execution_id: &str) -> Result<Option<CallbackEndpoint>> {
+    PROGRESS_CALLBACK_BASE_URL
+        .get()
+        .map(|base| {
+            let value = format!(
+                "{}/tasks/{}/progress?execution_id={}",
+                base.trim_end_matches('/'),
+                task_id,
+                execution_id
+            );
+            CallbackEndpoint::parse(&value)
+                .map_err(AppError::from)
+                .map_err(WebError::from)
+        })
+        .transpose()
 }
 
 /// 最大并发任务数。`app::scan`/`sync` 内部使用了非 `Send` 的 `dyn Consumer`，
@@ -373,7 +380,7 @@ async fn run_migration_task(
             result.map_err(|_| WebError::ConnectionTestFailed("请先在设置中检查 ClickHouse 数据库配置".to_string()))?,
     }
 
-    let callback_url = progress_callback_url_for(task_id, execution_id);
+    let callback_url = progress_callback_url_for(task_id, execution_id)?;
 
     match task_type {
         TaskType::Scan => {
@@ -397,16 +404,17 @@ async fn run_migration_task(
             let dest = dest_url
                 .ok_or_else(|| WebError::ValidationError("Sync task requires destination endpoint".to_string()))?;
 
-            // 在调用 app 层之前 snapshot job_dir 预存在状态，用作 DB 不可达时的 fallback 信号
+            // 工作目录状态与任务请求一起记录，不用它代替数据库代次事实。
             let job_dir_pre_existing = std::path::Path::new(job_dir).exists();
 
-            // ScanType 由 app 层自动判定（查数据库 base 表，fallback 文件系统快照）
+            // 迁移模式由 app 层读取已持久化的代次策略决定。
             let config = app::config::SyncJobConfig {
                 job_id: job_id.to_string(),
                 job_dir: job_dir.to_string(),
                 job_dir_pre_existing,
                 src_path: source_url.to_string(),
                 dest_path: dest.to_string(),
+                source_cleanup: SourceCleanupPolicy::from_reserved(AppConfig::fetch()?.sync.is_source_reserved),
                 enable_integrity_check: task_config.enable_integrity_check,
                 enable_acl: task_config.enable_acl,
                 r#match: task_config.match_expr.clone(),
@@ -422,7 +430,7 @@ async fn run_migration_task(
                 package_depth: 0,
                 raw_command_line: format!("gui:sync {source_url} {dest}"),
                 progress_callback_url: callback_url,
-                transfer_mode: TransferMode::Checkpoint,
+                transfer_mode: TransferMode::from_resume(task_config.copy_resume),
                 // web 层是否暴露该参数为后续可选项，本次先给默认值保证编译通过
                 delete_target: false,
                 concurrency: task_config.concurrency,

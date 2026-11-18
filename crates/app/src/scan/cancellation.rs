@@ -2,7 +2,7 @@
 use crate::error::{AppError, Result};
 use data_mover::traversal::ScanFailureSignal;
 use db::{
-    DatabaseError,
+    DatabaseError, DatabaseExecutionMonitor,
     scan::{ScanDatabaseExecution, ScanQueryCancellation, with_scan_cancellation},
 };
 use std::result::Result as OperationResult;
@@ -11,10 +11,7 @@ use std::{
     sync::{Arc, OnceLock},
     time::Duration,
 };
-use tokio::{
-    select,
-    time::{sleep, timeout},
-};
+use tokio::select;
 use tokio_util::{sync::CancellationToken, task::AbortOnDropHandle};
 use tracing::warn;
 
@@ -104,44 +101,9 @@ pub(crate) async fn scope<T>(
             "Scan cancellation is already bound to another database execution".into(),
         ));
     }
-    let connectivity = database.start_monitor()?;
-    let finished = CancellationToken::new();
-    let done = finished.clone();
-    let terminal = database.clone();
-    let watcher = AbortOnDropHandle::new(tokio::spawn(async move {
-        select! {
-            biased;
-            _=cancel.cancelled()=>queries.begin_cancellation(),
-            _=done.cancelled()=>return,
-            failure=terminal.failed()=>{
-                if failure.is_none() { return; }
-                cancel.cancel();
-                queries.begin_cancellation();
-            }
-        }
-        let mut warned = false;
-        loop {
-            // 不把管理请求的网络等待无限叠加到取消耗时；失败时仍等原请求自然退出。
-            let response = timeout(Duration::from_secs(2), queries.cancel()).await;
-            if !matches!(response, Ok(Ok(()))) && !warned {
-                warn!("Query cancellation unavailable; waiting for current requests to complete");
-                warned = true;
-            }
-            if done.is_cancelled() {
-                break;
-            }
-            select! {
-                _=done.cancelled()=>break,
-                _=sleep(Duration::from_millis(100))=>{},
-            }
-        }
-    }));
+    let monitor = DatabaseExecutionMonitor::start(queries, cancel.requested.clone())?;
     let result = work.await;
-    finished.cancel();
-    // 所有业务请求均已确认结束，此时终止仅针对本执行的管理轮询。
-    watcher.abort();
-    let _ = watcher.await;
-    let monitored = connectivity.finish().await;
+    let monitored = monitor.finish().await;
     let failure = database.failure();
     let recovery_window = database.recovery_window();
     let result = fold_database_failure(result, failure, recovery_window);
@@ -208,6 +170,7 @@ mod tests {
         Arc,
         atomic::{AtomicBool, Ordering},
     };
+    use tokio::time::timeout;
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
         net::TcpListener,

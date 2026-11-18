@@ -23,14 +23,17 @@ fn config() -> ReceiverConfig {
         enable_integrity_check: true,
         enable_acl: false,
         is_source_reserved: true,
-        transfer_mode: TransferMode::Atomic,
+        transfer_mode: TransferMode::Direct,
+        cancel: None,
     }
 }
 
 async fn copy(
     entry: &Arc<ObservedEntry>, source: &Arc<StorageContext>, destination: &Arc<StorageContext>,
 ) -> Result<()> {
-    process_entry_on_receiver(entry, source, destination, &config(), None, None).await
+    process_entry_on_receiver(entry, source, destination, &config(), None, None)
+        .await
+        .map(|_| ())
 }
 
 #[tokio::test]

@@ -16,6 +16,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use serde::Deserialize;
 use smol_str::SmolStr;
 use std::{fmt, sync::Arc};
+use task_model::metadata::metadata_digests;
 use tokio::task::yield_now;
 use tracing::warn;
 use {
@@ -77,6 +78,7 @@ struct Baseline {
     uid: Option<u32>,
     gid: Option<u32>,
     is_dir: bool,
+    metadata_digests: Vec<String>,
     identity_changed: bool,
     previous_generation: bool,
 }
@@ -137,18 +139,19 @@ async fn cache_checkpoint() -> Result<()> {
 }
 impl Baseline {
     fn change(&self, item: &ObservedItem) -> Option<ChangeKind> {
-        if self.is_dir {
-            let marker = directory_marker_state(&item.entry);
-            return if self.marker_state.is_some() && marker.is_none() {
-                Some(ChangeKind::DirectoryMarkerRemoved)
-            } else {
-                (self.marker_state != marker).then_some(ChangeKind::DataOnly)
-            };
+        let marker = directory_marker_state(&item.entry);
+        if self.is_dir && self.marker_state.is_some() && marker.is_none() {
+            return Some(ChangeKind::DirectoryMarkerRemoved);
         }
         let view = item.view();
-        let data = self.size != view.get_size() || self.mtime != view.get_mtime();
+        let data = (!self.is_dir && (self.size != view.get_size() || self.mtime != view.get_mtime()))
+            || self.marker_state != marker;
         // 与行投影使用同一组独立权限事实，保留未知值与真实零值的区别。
-        let meta = self.mode != view.mode() || self.uid != view.uid() || self.gid != view.gid();
+        let meta = self.mode != view.mode()
+            || self.uid != view.uid()
+            || self.gid != view.gid()
+            || self.metadata_digests != metadata_digests(view.metadata())
+            || (self.is_dir && self.mtime != view.get_mtime());
         match (data, meta) {
             (true, true) => Some(ChangeKind::Both),
             (true, false) => Some(ChangeKind::DataOnly),
@@ -300,7 +303,7 @@ impl NativeScanAccess<'_> {
             if end == start {
                 return self.baselines(first, last, by_handle).await;
             }
-            rows.extend(self.read_query(&format!("SELECT relative_path,version_id,size,mtime,mode,uid,gid,is_dir,marker_state,({identity_changed}) AS identity_changed,NOT ({}) AS previous_generation FROM {} {} PREWHERE {} AND (relative_path,version_id) IN ? WHERE {} ORDER BY relative_path,version_id LIMIT 1 BY relative_path,version_id",self.active,self.base,self.final_clause,self.scope,self.live))
+            rows.extend(self.read_query(&format!("SELECT relative_path,version_id,size,mtime,mode,uid,gid,is_dir,metadata_digests,marker_state,({identity_changed}) AS identity_changed,NOT ({}) AS previous_generation FROM {} {} PREWHERE {} AND (relative_path,version_id) IN ? WHERE {} ORDER BY relative_path,version_id LIMIT 1 BY relative_path,version_id",self.active,self.base,self.final_clause,self.scope,self.live))
                 .bind(&keys[start..end]).fetch_quorum_all::<Baseline>().await?);
             start = end;
         }
@@ -321,7 +324,7 @@ impl NativeScanAccess<'_> {
         let identity_changed = self.identity_changed(by_handle);
         // 动态 staging 集合保持 WHERE，保留索引剪枝；稀疏字面量集合可使用 PREWHERE。
         let sql = format!(
-            "SELECT relative_path,version_id,size,mtime,mode,uid,gid,is_dir,marker_state,({identity_changed}) AS identity_changed,NOT ({}) AS previous_generation FROM {} {} WHERE {} AND {} AND relative_path BETWEEN ? AND ? AND {key} IN (SELECT {key} FROM {} WHERE {}) ORDER BY relative_path,version_id LIMIT 1 BY relative_path,version_id",
+            "SELECT relative_path,version_id,size,mtime,mode,uid,gid,is_dir,metadata_digests,marker_state,({identity_changed}) AS identity_changed,NOT ({}) AS previous_generation FROM {} {} WHERE {} AND {} AND relative_path BETWEEN ? AND ? AND {key} IN (SELECT {key} FROM {} WHERE {}) ORDER BY relative_path,version_id LIMIT 1 BY relative_path,version_id",
             self.active, self.base, self.final_clause, self.scope, self.live, self.stage, self.stage_scope
         );
         Ok(self
@@ -580,13 +583,15 @@ fn resolve_final_events(
 mod tests {
     use super::*;
     use crate::execution::read::tests::server;
+    use crate::observed_fixtures::with_times;
     use crate::scan::rows::NativeScanRecord;
     use crate::scan::with_scan_cancellation;
     use clickhouse::Compression;
     use clickhouse::test::{Mock, handlers};
     use data_mover::model::{
-        BackendIdentity, BackendKind, EntryKind, IdentityStrength, ObservedEntry, PermissionFacts, PrincipalIdentity,
-        SourceIdentity, StoragePath,
+        AclEncoding, AclMetadata, BackendIdentity, BackendKind, EntryKind, ExtendedAttribute, IdentityStrength,
+        MetadataObservation, MetadataObservations, MetadataProvenance, ObjectTag, ObservedEntry, PermissionFacts,
+        PrincipalIdentity, SourceIdentity, StoragePath,
     };
     use task_model::observation::ObservedView;
     use tokio_util::sync::CancellationToken;
@@ -620,6 +625,7 @@ mod tests {
             uid: row.uid,
             gid: row.gid,
             is_dir: row.is_dir,
+            metadata_digests: row.metadata_digests,
             identity_changed: false,
             previous_generation: true,
         })
@@ -667,6 +673,87 @@ mod tests {
             ..Default::default()
         })))?);
         assert_eq!(previous.change(&changed.into()), Some(ChangeKind::MetadataOnly));
+        Ok(())
+    }
+
+    #[test]
+    fn tags_acl_and_xattrs_changes_are_detected_without_data_changes_and_keep_raw() -> Result<()> {
+        let facts = |family, value| -> Result<_> {
+            let observation = |value| MetadataObservation::Value {
+                value,
+                provenance: MetadataProvenance::Inline,
+            };
+            Ok(MetadataObservations::new(
+                if family == 0 {
+                    observation(AclMetadata::new(AclEncoding::NfsV4, vec![value])?)
+                } else {
+                    MetadataObservation::NotRequested
+                },
+                if family == 1 {
+                    MetadataObservation::Value {
+                        value: vec![ExtendedAttribute::new(b"user.test".to_vec(), vec![value])?],
+                        provenance: MetadataProvenance::Inline,
+                    }
+                } else {
+                    MetadataObservation::NotRequested
+                },
+                if family == 2 {
+                    MetadataObservation::Value {
+                        value: vec![ObjectTag::new("tag", value.to_string())?],
+                        provenance: MetadataProvenance::Inline,
+                    }
+                } else {
+                    MetadataObservation::NotRequested
+                },
+                MetadataObservation::NotRequested,
+                MetadataObservation::NotRequested,
+            )?)
+        };
+        for family in 0..3 {
+            let original =
+                observation("metadata", IdentityStrength::StableWithinBackend)?.with_metadata(facts(family, 1)?);
+            let previous = baseline(&original)?;
+            let changed = Arc::new(original.with_metadata(facts(family, 2)?));
+            assert_eq!(
+                previous.change(&Arc::clone(&changed).into()),
+                Some(ChangeKind::MetadataOnly)
+            );
+            let row = NativeScanRecord::capture(
+                ObservedView {
+                    entry: &changed,
+                    version_index: None,
+                },
+                0,
+            )?;
+            let restored =
+                ObservedEntry::decode_snapshot(row.entry_snapshot.as_bytes(), changed.source_identity().backend())?;
+            assert_eq!(restored.metadata(), changed.metadata());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn directory_permissions_and_mtime_participate_in_metadata_comparison() -> Result<()> {
+        let seed = observation("dir", IdentityStrength::StableWithinBackend)?;
+        let original = ObservedEntry::new(
+            seed.path().clone(),
+            EntryKind::Directory,
+            None,
+            None,
+            seed.source_identity().clone(),
+        )?
+        .with_permissions(Some(Box::new(PermissionFacts {
+            mode: Some(0o750),
+            ..Default::default()
+        })))?;
+        let previous = baseline(&original)?;
+        let chmod = Arc::new(original.clone().with_permissions(Some(Box::new(PermissionFacts {
+            mode: Some(0o700),
+            ..Default::default()
+        })))?);
+        assert_eq!(previous.change(&chmod.into()), Some(ChangeKind::MetadataOnly));
+        let touched = Arc::new(with_times(original, None, Some(123)));
+        assert_eq!(previous.change(&touched.into()), Some(ChangeKind::MetadataOnly));
         Ok(())
     }
 

@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use app::consumer::stats::report::{FinalStats, ProgressReport};
+use app::report::{FinalStats, ProgressReport};
 use serde::Serialize;
 use tracing::{debug, warn};
 

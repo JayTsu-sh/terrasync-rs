@@ -28,6 +28,59 @@ pub(crate) struct ScanCancellationDeadline;
 /// 使用thiserror库实现错误处理和转换
 #[derive(Error, Debug)]
 pub enum DatabaseError {
+    #[error("根目录原值编码无效: {source}")]
+    CopyRootSnapshotEncoding {
+        #[source]
+        source: hex::FromHexError,
+    },
+    #[error("迁移代次记录无效: {field}")]
+    CopyGenerationInvalid { field: &'static str },
+    #[error("迁移代次记录序列化失败: {source}")]
+    CopyGenerationJson {
+        #[source]
+        source: serde_json::Error,
+    },
+    #[error("删源代次的 base 清理尚未确认，仍有 {remaining} 行；代次 {sequence}")]
+    CopyBaseRetirementIncomplete { sequence: u64, remaining: u64 },
+    #[error("删源代次 {sequence} 的 base 清理失败: {source}")]
+    CopyBaseRetirementFailed {
+        sequence: u64,
+        #[source]
+        source: Box<DatabaseError>,
+    },
+    #[error("删源代次 base 清理失败: {cleanup}; 失败代次记录保存也失败: {reporting}")]
+    CopyBaseRetirementReportingFailed {
+        #[source]
+        cleanup: Box<DatabaseError>,
+        reporting: Box<DatabaseError>,
+    },
+    #[error(transparent)]
+    MigrationPolicy(#[from] task_model::TaskModelError),
+    #[error("本轮复制执行身份尚未准备，拒绝查询删源或目录收尾候选")]
+    CopyExecutionUnavailable,
+    #[error(
+        "Cannot determine rename for {path}: {reason}; confirmed missing paths={confirmed_paths}, current observed paths={observed_paths}"
+    )]
+    RenameAssociationInvalid {
+        path: String,
+        reason: &'static str,
+        confirmed_paths: usize,
+        observed_paths: usize,
+    },
+    #[error("Notification request timed out; its outcome is unconfirmed: {source}")]
+    NotificationRequestTimedOut {
+        #[source]
+        source: tokio::time::error::Elapsed,
+    },
+    #[error("Invalid notification archive field: {field}")]
+    NotificationRecordInvalid { field: &'static str },
+    #[error("Invalid notification JSON payload: {source}")]
+    NotificationPayloadJson {
+        #[source]
+        source: serde_json::Error,
+    },
+    #[error("Notification archive batch exceeds bounds: records={records}, payload_bytes={bytes}")]
+    NotificationBatchTooLarge { records: usize, bytes: usize },
     #[error("ClickHouse probe could not reach all nodes required by scan snapshot publication")]
     ClusterProbeIncomplete,
     #[error("ClickHouse connectivity monitor ended unexpectedly")]
@@ -192,8 +245,9 @@ impl From<clickhouse::error::Error> for DatabaseError {
 
 impl DatabaseError {
     /// 日志只暴露稳定分类和服务端数字码，原始响应可能含 SQL 或绑定值，留在 typed cause 中。
-    pub(crate) fn diagnostic_class(&self) -> (&'static str, Option<u32>) {
+    pub fn diagnostic_class(&self) -> (&'static str, Option<u32>) {
         match self {
+            Self::RenameAssociationInvalid { .. } => ("rename_association_invalid", None),
             Self::ScanRequestFailed { source } | Self::ScanDatabaseUnavailable { source, .. } => {
                 source.diagnostic_class()
             }
@@ -219,9 +273,9 @@ impl DatabaseError {
             _ => false,
         }
     }
-    pub(crate) fn is_transient_connectivity_failure(&self) -> bool {
+    pub fn is_transient_connectivity_failure(&self) -> bool {
         match self {
-            Self::ProbeTimeout { .. } | Self::ClusterProbeIncomplete => true,
+            Self::ProbeTimeout { .. } | Self::ClusterProbeIncomplete | Self::NotificationRequestTimedOut { .. } => true,
             Self::ScanRequestFailed { source } | Self::ScanDatabaseUnavailable { source, .. } => {
                 source.is_transient_connectivity_failure()
             }

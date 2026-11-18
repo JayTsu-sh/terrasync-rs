@@ -8,7 +8,7 @@ use std::time::SystemTimeError;
 
 // 外部crate
 use data_mover::error::StorageError as DataMoverStorageError;
-use data_mover::model::SnapshotDecodeError;
+use data_mover::model::{BackendKind, SnapshotDecodeError};
 use data_mover::transfer::{TransferFailure, TransferValueError};
 use data_mover::traversal::TraversalTerminalFailure;
 use db::error::DatabaseError;
@@ -16,7 +16,11 @@ use db::error::DatabaseError;
 use licensing::error::LicenseError;
 use serde_json::Error as JsonError;
 pub mod storage;
+use crate::broadcast::BroadcastError;
+use crate::callback::CallbackEndpointError;
+use std::sync::Arc;
 pub use storage::StorageError;
+use task_model::StorageEntryMessage;
 use thiserror::Error;
 use tokio::task::JoinError;
 use transport::error::TransportError;
@@ -32,6 +36,7 @@ pub enum CopyStep {
     ReadSourceLink,
     CreateDestinationLink,
     Transfer,
+    SourceCleanup,
 }
 
 impl Display for CopyStep {
@@ -40,6 +45,7 @@ impl Display for CopyStep {
             Self::ReadSourceLink => "read source symlink",
             Self::CreateDestinationLink => "create destination symlink",
             Self::Transfer => "transfer file",
+            Self::SourceCleanup => "clean up source entry",
         })
     }
 }
@@ -47,6 +53,104 @@ impl Display for CopyStep {
 /// 应用程序的专用错误枚举
 #[derive(Error, Debug)]
 pub enum AppError {
+    #[error("根目录元数据失败 backend={backend:?} phase={phase}: {source}")]
+    CopyRootMetadataFailure {
+        backend: BackendKind,
+        phase: &'static str,
+        #[source]
+        source: Arc<StorageError>,
+    },
+    #[error("迁移失败: {source}; 根目录元数据同时失败: {metadata}")]
+    MigrationAndRootMetadataFailed {
+        #[source]
+        source: Box<AppError>,
+        metadata: Box<AppError>,
+    },
+    #[error("迁移执行因子任务失败而停止: {source}")]
+    CopyExecutionStopped {
+        #[source]
+        source: Arc<AppError>,
+    },
+    #[error("迁移执行失败: {source}; 数据库同时不可用: {database}")]
+    CopyExecutionAndDatabaseFailed {
+        #[source]
+        source: Box<AppError>,
+        database: DatabaseError,
+    },
+    #[error("迁移执行失败: {source}; 源清理同时失败: {cleanup}")]
+    MigrationAndSourceCleanupFailed {
+        #[source]
+        source: Box<AppError>,
+        cleanup: Box<AppError>,
+    },
+    #[error("历史版本分段顺序无效: {path:?}, expected={expected}, actual={actual}")]
+    CopyHistoryOrder { path: PathBuf, expected: u32, actual: u32 },
+    #[error("历史版本没有完整结束: {path:?}, last_version={last_version:?}")]
+    CopyHistoryIncomplete {
+        path: PathBuf,
+        last_version: Option<String>,
+    },
+    #[error("活跃历史 entry 超出有界协议: {path:?}, limit={limit}")]
+    CopyHistoryCapacity { path: PathBuf, limit: usize },
+    #[error("历史版本分段编号超出范围: {path:?}")]
+    CopyHistorySegmentOverflow { path: PathBuf },
+    #[error("历史版本选择无效: {path:?}, version_index={version_index:?}")]
+    CopyHistorySelection {
+        path: PathBuf,
+        version_index: Option<usize>,
+    },
+    #[error("历史分段内版本顺序无效: {path:?}, segment={segment}, previous={previous}, actual={actual}")]
+    CopyHistoryVersionOrder {
+        path: PathBuf,
+        segment: u32,
+        previous: usize,
+        actual: usize,
+    },
+    #[error("历史 entry 的版本字节总量超出统计范围: {path:?}")]
+    CopyHistoryBytesOverflow { path: PathBuf },
+    #[error(transparent)]
+    MigrationPolicy(#[from] task_model::TaskModelError),
+    #[error("迁移失败: {source}; 代次收尾也失败: {finalization}")]
+    MigrationFinalizationFailed {
+        #[source]
+        source: Box<AppError>,
+        finalization: DatabaseError,
+    },
+    #[error("迁移失败: {source}; 保留目标的范围明细也未能记录: {reporting}")]
+    MigrationReportingFailed {
+        #[source]
+        source: Box<AppError>,
+        reporting: Box<AppError>,
+    },
+    #[error("双进程模式尚未提供目标就绪后受保护删除源端的能力；已拒绝任务，未启动复制")]
+    RemoteSourceCleanupUnavailable,
+    #[error("Diagnostic processing stopped: {source}")]
+    DiagnosticJournalStopped {
+        #[source]
+        source: Arc<AppError>,
+    },
+    #[error("Diagnostic database unavailable after bounded recovery: {source}")]
+    DiagnosticDatabaseUnavailable {
+        #[source]
+        source: Arc<DatabaseError>,
+    },
+    #[error("Unresolved diagnostics could not be retained or acknowledged within the delivery budget")]
+    DiagnosticDeliveryUnavailable,
+    #[error("Invalid archived diagnostic record: {field}")]
+    DiagnosticArchiveInvalid { field: &'static str },
+    #[error("{source}")]
+    ConsumerDisconnected {
+        #[source]
+        source: Box<BroadcastError<StorageEntryMessage>>,
+    },
+    #[error("Invalid progress callback endpoint: {0}")]
+    CallbackEndpoint(#[from] CallbackEndpointError),
+    #[error("{source}")]
+    ReportedCopyFailure {
+        #[source]
+        source: Box<AppError>,
+        data_failed: bool,
+    },
     #[error("Failed to {step} {path:?}: {source}")]
     CopyEntryFailed {
         step: CopyStep,
@@ -203,6 +307,8 @@ pub enum AppError {
     /// Transport 层错误
     #[error("{0}")]
     TransportError(#[from] TransportError),
+    #[error("Channel closed")]
+    CopyQueueClosed,
 
     /// IO错误
     /// 当IO操作失败时触发
@@ -279,6 +385,69 @@ pub enum AppError {
 pub type Result<T> = std::result::Result<T, AppError>;
 
 impl AppError {
+    /// 同一次根观察由 Arc 身份标识；组合错误的另一分支也可能已携带该失败。
+    pub(crate) fn contains_copy_root_failure(&self, observed: &Arc<StorageError>) -> bool {
+        match self {
+            Self::CopyRootMetadataFailure { source, .. } => Arc::ptr_eq(source, observed),
+            Self::MigrationAndRootMetadataFailed { source, metadata } => {
+                source.contains_copy_root_failure(observed) || metadata.contains_copy_root_failure(observed)
+            }
+            Self::MigrationAndSourceCleanupFailed { source, cleanup } => {
+                source.contains_copy_root_failure(observed) || cleanup.contains_copy_root_failure(observed)
+            }
+            Self::MigrationReportingFailed { source, reporting } => {
+                source.contains_copy_root_failure(observed) || reporting.contains_copy_root_failure(observed)
+            }
+            Self::CopyExecutionStopped { source } | Self::DiagnosticJournalStopped { source } => {
+                source.contains_copy_root_failure(observed)
+            }
+            Self::CopyExecutionAndDatabaseFailed { source, .. }
+            | Self::MigrationFinalizationFailed { source, .. }
+            | Self::ReportedCopyFailure { source, .. }
+            | Self::CopyEntryFailed { source, .. }
+            | Self::FileCommitStage { source, .. }
+            | Self::SenderSessionStage { source, .. } => source.contains_copy_root_failure(observed),
+            Self::RemoteExpertPayloadInterrupted { peer, .. } => peer.contains_copy_root_failure(observed),
+            _ => false,
+        }
+    }
+
+    pub(crate) fn source_cleanup_entry(&self) -> Option<(&Path, &Self)> {
+        match self {
+            Self::MigrationAndSourceCleanupFailed { source, cleanup } => {
+                cleanup.source_cleanup_entry().or_else(|| source.source_cleanup_entry())
+            }
+            Self::CopyExecutionStopped { source } => source.source_cleanup_entry(),
+            Self::MigrationAndRootMetadataFailed { source, .. } => source.source_cleanup_entry(),
+            Self::CopyEntryFailed {
+                step: CopyStep::SourceCleanup,
+                path,
+                source,
+            } => Some((path, source)),
+            Self::MigrationFinalizationFailed { source, .. }
+            | Self::MigrationReportingFailed { source, .. }
+            | Self::CopyExecutionAndDatabaseFailed { source, .. } => source.source_cleanup_entry(),
+            _ => None,
+        }
+    }
+    pub(crate) fn is_reported_copy_failure(&self) -> bool {
+        match self {
+            Self::CopyExecutionStopped { source } => source.is_reported_copy_failure(),
+            Self::ReportedCopyFailure { .. } => true,
+            Self::CopyEntryFailed { source, .. } => source.is_reported_copy_failure(),
+            _ => false,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reported_copy_data_failed(&self) -> bool {
+        match self {
+            Self::CopyExecutionStopped { source } => source.reported_copy_data_failed(),
+            Self::ReportedCopyFailure { data_failed, .. } => *data_failed,
+            Self::CopyEntryFailed { source, .. } => source.reported_copy_data_failed(),
+            _ => false,
+        }
+    }
     pub(crate) fn copy_entry_failure(step: CopyStep, path: &Path, source: impl Into<Self>) -> Self {
         Self::CopyEntryFailed {
             step,
@@ -287,9 +456,33 @@ impl AppError {
         }
     }
 
+    pub(crate) fn stops_event_pipeline(&self) -> bool {
+        match self {
+            Self::CopyExecutionStopped { source } => source.stops_event_pipeline(),
+            Self::ConsumerDisconnected { .. } => true,
+            Self::MigrationAndRootMetadataFailed { source, metadata } => {
+                source.stops_event_pipeline() || metadata.stops_event_pipeline()
+            }
+            Self::CopyEntryFailed { source, .. } | Self::ReportedCopyFailure { source, .. } => {
+                source.stops_event_pipeline()
+            }
+            _ => false,
+        }
+    }
+
     pub fn storage_error(&self) -> Option<&StorageError> {
         match self {
-            Self::CopyEntryFailed { source, .. } => source.storage_error(),
+            Self::MigrationAndSourceCleanupFailed { source, cleanup } => {
+                source.storage_error().or_else(|| cleanup.storage_error())
+            }
+            Self::MigrationAndRootMetadataFailed { source, metadata } => {
+                source.storage_error().or_else(|| metadata.storage_error())
+            }
+            Self::CopyRootMetadataFailure { source, .. } => Some(source),
+            Self::CopyExecutionStopped { source } => source.storage_error(),
+            Self::CopyEntryFailed { source, .. }
+            | Self::ReportedCopyFailure { source, .. }
+            | Self::CopyExecutionAndDatabaseFailed { source, .. } => source.storage_error(),
             Self::StorageError(error) => Some(error),
             Self::ScanStorageAndDatabaseFailure { source, .. } => Some(source),
             _ => None,
@@ -300,6 +493,14 @@ impl AppError {
 impl From<StorageRoleFailure> for AppError {
     fn from(source: StorageRoleFailure) -> Self {
         Self::StorageError(source.into())
+    }
+}
+
+impl From<BroadcastError<StorageEntryMessage>> for AppError {
+    fn from(source: BroadcastError<StorageEntryMessage>) -> Self {
+        Self::ConsumerDisconnected {
+            source: Box::new(source),
+        }
     }
 }
 impl From<CapabilityUnavailable> for AppError {

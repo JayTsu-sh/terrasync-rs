@@ -2,23 +2,72 @@
 
 use std::fs::File;
 
+use crate::migration_plan::MigrationPlan;
+use crate::storage_factory::StorageContext;
 use blake3::Hasher;
+use data_mover::{
+    DslTraversalFilter,
+    filter::{FilterExpression, parse_filter_expression},
+};
 use db::ClickHouseDatabase;
 use db::CopyGenerationStatus;
+use task_model::migration::{
+    CopyBinding, CopyContract, CopyRequestDescriptor, CopyRuntimeSettings, CopySelection, FileSelection,
+    NamespaceBinding, PathMapping, VerificationLevel,
+};
 use tokio::task::spawn_blocking;
 use tracing::info;
-use utils::app_config::ClickhouseConfig;
+use utils::app_config::{AppConfig, ClickhouseConfig};
 
 use crate::job_execution::JobLease;
 use crate::{
     config::SyncJobConfig,
     error::{AppError, Result},
-    storage_factory::{StorageRole, create_storage_for_role},
 };
+
+mod database;
+pub(crate) use database::CopyDatabaseExecution;
 
 pub(crate) struct CopyLease {
     _guard: JobLease,
 }
+
+#[cfg(all(test, unix))]
+#[path = "copy_completion_cancel_real_tests.rs"]
+mod directory_cancel_tests;
+#[cfg(all(test, unix))]
+#[path = "copy_completion_real_tests.rs"]
+mod directory_completion_tests;
+#[cfg(test)]
+#[path = "copy_mutable_object_tests.rs"]
+mod mutable_tests;
+#[cfg(all(test, unix))]
+#[path = "copy_object_cleanup_tests.rs"]
+mod object_cleanup_tests;
+#[cfg(test)]
+#[path = "copy_plan_tests.rs"]
+mod plan_tests;
+#[cfg(all(test, unix))]
+#[path = "copy_ready_cleanup_nfs_tests.rs"]
+mod ready_cleanup_nfs_tests;
+#[cfg(all(test, unix))]
+#[path = "copy_ready_cleanup_tests.rs"]
+mod ready_cleanup_tests;
+#[cfg(test)]
+#[path = "copy_request_tests.rs"]
+mod request_tests;
+#[cfg(all(test, unix))]
+#[path = "copy_root_real_tests.rs"]
+mod root_metadata_tests;
+#[cfg(all(test, unix))]
+#[path = "copy_source_content_tests.rs"]
+mod source_content_tests;
+#[cfg(test)]
+#[path = "copy_version_metadata_tests.rs"]
+mod version_metadata_tests;
+#[cfg(test)]
+#[path = "copy_version_plan_tests.rs"]
+mod version_tests;
 impl CopyLease {
     pub(crate) fn acquire(connection: &ClickhouseConfig, job: &SyncJobConfig) -> Result<Self> {
         Ok(Self {
@@ -27,83 +76,102 @@ impl CopyLease {
     }
 }
 
-pub(crate) async fn begin_copy_catalogue(
-    database: &ClickHouseDatabase, job: &SyncJobConfig, block_size: Option<usize>, source_reserved: bool,
-) -> Result<()> {
-    // 身份不包含凭据；恢复计划变化必须在任何 payload 或回标前被拒绝。
-    let source = create_storage_for_role(
-        &job.src_path,
-        block_size.map(|value| value as u64),
-        false,
-        StorageRole::Source,
-    )
-    .await?;
-    let target = create_storage_for_role(
-        &job.dest_path,
-        block_size.map(|value| value as u64),
-        true,
-        StorageRole::Destination,
-    )
-    .await?;
-    let source = source.storage().identity();
-    let target_identity = target.storage().identity();
-    let history = target.storage().staged_destination()?.keeps_history().await?;
-    let list_digest = if let Some(path) = job.file_list.clone() {
+pub(crate) async fn compile_copy_request(
+    job: &SyncJobConfig, source: &StorageContext, target: &StorageContext, metadata: &MigrationPlan,
+    config: &AppConfig, execution_id: String,
+) -> Result<CopyRequestDescriptor> {
+    let include = job.r#match.as_deref().map(parse_filter_expression).transpose()?;
+    let exclude = job.exclude.as_deref().map(parse_filter_expression).transpose()?;
+    let relative_time = include
+        .iter()
+        .chain(exclude.iter())
+        .any(FilterExpression::has_relative_time_condition);
+    if job.file_list.is_some()
+        && (include.is_some() || exclude.is_some() || job.packaged || !metadata.scope.latest_version_only)
+    {
+        return Err(AppError::ConfigError(
+            "文件清单暂不支持同时使用过滤、打包或历史目标；已拒绝，避免扩大选择或遗漏历史".into(),
+        ));
+    }
+    let native_filter = DslTraversalFilter::new(include, exclude);
+    let file_list = if let Some(path) = job.file_list.clone() {
         Some(
-            spawn_blocking(move || -> Result<String> {
+            spawn_blocking(move || -> Result<FileSelection> {
                 let mut digest = Hasher::new();
-                digest.update_reader(File::open(path)?)?;
-                Ok(digest.finalize().to_hex().to_string())
+                digest.update_reader(File::open(&path)?)?;
+                Ok(FileSelection {
+                    path,
+                    digest: digest.finalize().to_hex().to_string(),
+                })
             })
             .await??,
         )
     } else {
         None
     };
-    let request_key = blake3::hash(&serde_json::to_vec(&(
-        source.kind().as_str(),
-        source.stable_id(),
-        target_identity.kind().as_str(),
-        target_identity.stable_id(),
-        source_reserved,
-        history,
-        &job.r#match,
-        &job.exclude,
-        &job.file_list,
-        job.packaged,
-        job.package_depth,
-        job.enable_acl,
-        job.enable_integrity_check,
-        job.transfer_mode,
-        list_digest,
-    ))?)
-    .to_hex()
-    .to_string();
-    let status = database.begin_copy_generation(&request_key).await?;
-    require_safe_copy_recovery(status, source_reserved, history)?;
-    if status == CopyGenerationStatus::Recovering && job.file_list.is_some() {
-        return Err(AppError::ConfigError(
-            "文件清单复制未完成，不支持改用完整目录自动续作；请核对未完成条目".into(),
-        ));
+    let mut definition = Hasher::new();
+    definition.update(b"terrasync/copy-selection/v1\0");
+    definition.update(native_filter.selection_key());
+    definition.update(&[u8::from(file_list.is_some())]);
+    if let Some(list) = &file_list {
+        definition.update(list.digest.as_bytes());
     }
-    if status == CopyGenerationStatus::Recovering {
-        info!("Recovering incomplete copy by replaying the full source and reconciling target paths");
-    }
-    Ok(())
+    let namespace = |storage: &StorageContext| {
+        let identity = storage.storage().identity();
+        NamespaceBinding {
+            backend_kind: identity.kind().as_str().into(),
+            namespace: identity.stable_id().into(),
+        }
+    };
+    Ok(CopyRequestDescriptor {
+        execution_id,
+        binding: CopyBinding {
+            source: namespace(source),
+            target: namespace(target),
+            target_history: !metadata.scope.latest_version_only,
+            mapping: if job.packaged {
+                PathMapping::Packaged {
+                    depth: job.package_depth,
+                }
+            } else {
+                PathMapping::Relative
+            },
+        },
+        source_cleanup: job.source_cleanup,
+        selection: CopySelection {
+            include: job.r#match.clone(),
+            exclude: job.exclude.clone(),
+            file_list,
+            definition_key: definition.finalize().to_hex().to_string(),
+            relative_time,
+        },
+        contract: CopyContract {
+            acl: job.enable_acl,
+            verification: if job.enable_integrity_check {
+                VerificationLevel::Full
+            } else {
+                VerificationLevel::Quick
+            },
+        },
+        runtime: CopyRuntimeSettings {
+            transfer_mode: job.transfer_mode,
+            scan_concurrency: job.concurrency.unwrap_or(config.scan.concurrency),
+            copy_concurrency: job.concurrency.unwrap_or(config.sync.concurrency),
+            block_size: job.block_size.clone(),
+            delta_size_threshold: job.delta_size_threshold.clone(),
+            qos: job.qos.clone(),
+            peak_qos_rate: job.peak_qos_rate,
+            iops: job.iops,
+        },
+        filter_evaluated_at: metadata.filter_time_anchor,
+        delete_target: job.delete_target,
+    })
 }
 
-fn require_safe_copy_recovery(status: CopyGenerationStatus, source_reserved: bool, target_history: bool) -> Result<()> {
+pub(crate) async fn begin_copy_catalogue(database: &ClickHouseDatabase, request: &CopyRequestDescriptor) -> Result<()> {
+    let status = database.begin_copy_generation(request).await?;
     if status == CopyGenerationStatus::Recovering {
-        if !source_reserved {
-            return Err(AppError::ConfigError(
-                "上次移动任务未完成，不能按源缺失项自动清理目标；请核对已搬运数据后恢复任务".into(),
-            ));
-        }
-        if target_history {
-            return Err(AppError::ConfigError(
-                "上次复制未完成，版本化目标无法确认未应答的写入；请先核对目标版本，禁止自动重放".into(),
-            ));
-        }
+        info!("Continuing failed migration with a fresh incremental scan over confirmed copy facts");
     }
     Ok(())
 }
@@ -113,15 +181,16 @@ mod tests {
     use super::*;
     use std::fs::OpenOptions;
     use std::path::Path;
-    use task_model::TransferMode;
+    use task_model::{SourceCleanupPolicy, TransferMode};
 
-    fn job(directory: &Path) -> SyncJobConfig {
+    pub(super) fn job(directory: &Path) -> SyncJobConfig {
         SyncJobConfig {
             job_id: directory.to_string_lossy().into_owned(),
             job_dir: directory.to_string_lossy().into_owned(),
             job_dir_pre_existing: false,
             src_path: String::new(),
             dest_path: String::new(),
+            source_cleanup: SourceCleanupPolicy::Retain,
             enable_integrity_check: false,
             enable_acl: false,
             r#match: None,
@@ -191,13 +260,5 @@ mod tests {
         drop(file);
         assert!(CopyLease::acquire(&connection(), &job).is_ok());
         Ok(())
-    }
-
-    #[test]
-    fn only_preserved_sources_and_overwritable_targets_allow_automatic_recovery() {
-        assert!(require_safe_copy_recovery(CopyGenerationStatus::Fresh, false, true).is_ok());
-        assert!(require_safe_copy_recovery(CopyGenerationStatus::Recovering, true, false).is_ok());
-        assert!(require_safe_copy_recovery(CopyGenerationStatus::Recovering, false, false).is_err());
-        assert!(require_safe_copy_recovery(CopyGenerationStatus::Recovering, true, true).is_err());
     }
 }

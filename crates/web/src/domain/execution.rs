@@ -1,5 +1,5 @@
 use super::storage_failure::StorageFailureDetail;
-use app::consumer::stats::report::{ScanRuntimeState, ScanSnapshot};
+use app::report::{ScanRuntimeState, ScanSnapshot};
 use serde::{Deserialize, Serialize};
 
 use super::task::TaskStatus;
@@ -7,6 +7,8 @@ use super::task::TaskStatus;
 /// 执行统计数据（值对象）
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExecutionStats {
+    #[serde(default)]
+    pub skipped_count: u64,
     pub scanned_files: u64,
     pub scanned_dirs: u64,
     pub total_bytes: u64,

@@ -19,6 +19,7 @@ use serde::{Serialize, Serializer};
 use std::borrow::Cow;
 use std::path::Path;
 use std::sync::Arc;
+use task_model::metadata::metadata_digests;
 #[cfg(test)]
 use task_model::observation::ObservedItem;
 use task_model::observation::{EntryStatistics, ObservedScanEvent, ObservedView, timestamp_nanos};
@@ -47,7 +48,7 @@ pub(crate) fn directory_marker_state(entry: &ObservedEntry) -> Option<String> {
     Some(hash.finalize().to_hex().to_string())
 }
 
-pub(crate) const OBSERVED_COLUMNS: &str = "name,relative_path,size,ext,ctime,mtime,atime,mode,storage_type,is_symlink,is_dir,is_regular_file,hard_links,current_state,uid,gid,ino,file_handle,version_id,tags,marker_state,identity_key,backend_kind,backend_id,entry_kind,size_observed,modified_unix_nanos,entry_snapshot,metadata_hash,history_segment,history_index";
+pub(crate) const OBSERVED_COLUMNS: &str = "name,relative_path,size,ext,ctime,mtime,atime,mode,storage_type,is_symlink,is_dir,is_regular_file,hard_links,current_state,uid,gid,ino,file_handle,version_id,source_version_id,tags,marker_state,metadata_digests,identity_key,backend_kind,backend_id,entry_kind,size_observed,modified_unix_nanos,entry_snapshot,metadata_hash,history_segment,history_index,history_records,history_complete,copy_execution_id,copy_sequence";
 
 /// 比较集合只传输主键和身份；完整观察在事件持久化后直接写入 base。
 #[derive(Serialize, clickhouse::Row)]
@@ -108,6 +109,7 @@ struct ScanRowFields<'a> {
     version_id: &'a str,
     tags: Option<String>,
     marker_state: Option<String>,
+    pub metadata_digests: Vec<String>,
 }
 impl<'a> ScanRowFields<'a> {
     fn capture(view: ObservedView<'a>, generation: u8) -> Result<Self> {
@@ -147,6 +149,7 @@ impl<'a> ScanRowFields<'a> {
             version_id: view.version_id(),
             tags,
             marker_state: directory_marker_state(entry),
+            metadata_digests: metadata_digests(view.metadata()),
         })
     }
     fn legacy(self) -> StorageEntryRecord {
@@ -172,6 +175,7 @@ impl<'a> ScanRowFields<'a> {
             version_id: self.version_id.into(),
             tags: self.tags,
             marker_state: self.marker_state,
+            metadata_digests: self.metadata_digests,
         }
     }
 }
@@ -201,8 +205,10 @@ pub(crate) struct NativeScanRecord<'a> {
     pub ino: Option<u64>,
     pub file_handle: Option<String>,
     pub version_id: &'a str,
+    pub source_version_id: &'a str,
     pub tags: Option<String>,
     pub marker_state: Option<String>,
+    pub metadata_digests: Vec<String>,
     pub identity_key: String,
     pub backend_kind: &'static str,
     pub backend_id: &'a str,
@@ -214,6 +220,13 @@ pub(crate) struct NativeScanRecord<'a> {
     pub metadata_hash: Option<String>,
     pub history_segment: u32,
     pub history_index: u32,
+    pub history_records: u32,
+    pub history_complete: bool,
+    pub copy_execution_id: &'a str,
+    pub copy_sequence: u64,
+    pub copy_path_confirmed: bool,
+    pub copy_data_confirmed: bool,
+    pub copy_target_version: Option<&'a str>,
 }
 // 请求边界按载荷预算划分，不能把调用方的批次固定切成千行 HTTP 请求。
 // 预算只统计本请求拥有的编码／字符串，借用的观察由调用方持有。
@@ -250,6 +263,7 @@ impl<'a> Iterator for NativeWriteBatches<'a> {
             retained_bytes = retained_bytes
                 .saturating_add(row.entry_snapshot.as_bytes().len())
                 .saturating_add(row.tags.as_ref().map_or(0, String::len))
+                .saturating_add(row.metadata_digests.iter().map(String::len).sum::<usize>())
                 .saturating_add(row.identity_key.len())
                 .saturating_add(row.file_handle.as_ref().map_or(0, String::len));
             rows.push(row);
@@ -307,8 +321,10 @@ impl<'a> NativeScanRecord<'a> {
             ino: fields.ino,
             file_handle: fields.file_handle,
             version_id: fields.version_id,
+            source_version_id: fields.version_id,
             tags: fields.tags,
             marker_state: fields.marker_state,
+            metadata_digests: fields.metadata_digests,
             identity_key: hex::encode(identity.identity_key().as_bytes()),
             backend_kind: entry.backend_kind().as_str().into(),
             backend_id: entry.source_identity().backend().stable_id(),
@@ -319,6 +335,13 @@ impl<'a> NativeScanRecord<'a> {
             metadata_hash: None,
             history_segment: entry.history().map_or(0, |history| history.segment()),
             history_index: view.version_index.unwrap_or_default() as u32,
+            history_records: entry.history().map_or(0, |history| history.records().len() as u32),
+            history_complete: entry.history().is_none_or(|history| history.is_complete()),
+            copy_execution_id: "",
+            copy_sequence: 0,
+            copy_path_confirmed: true,
+            copy_data_confirmed: true,
+            copy_target_version: None,
         })
     }
     #[cfg(test)]
@@ -367,6 +390,7 @@ impl<'a> NativeScanRecord<'a> {
             version_id: self.version_id,
             tags: self.tags,
             marker_state: self.marker_state,
+            metadata_digests: self.metadata_digests,
         }
         .legacy()
     }
@@ -424,6 +448,7 @@ pub(crate) fn incremental_record(
         version_id: record.version_id,
         tags: record.tags,
         marker_state: record.marker_state,
+        metadata_digests: record.metadata_digests,
     }
 }
 
