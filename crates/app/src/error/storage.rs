@@ -7,7 +7,7 @@ use data_mover::model::MetadataFamily;
 use data_mover::model::MetadataObservationFailure;
 use data_mover::qos::SourceQosSetupError;
 use data_mover::storage::EntryObservationFailure;
-use task_model::TaskModelError;
+use task_model::{TaskModelError, diagnostics::safe_diagnostic_text};
 use tokio::task::JoinError;
 
 use crate::integrity_check::{MismatchDataField, MismatchMetaField};
@@ -146,7 +146,7 @@ pub enum StorageError {
         source: JoinError,
         preceding: Box<StorageError>,
     },
-    #[error(transparent)]
+    #[error("{0}; {diagnostic}", diagnostic = safe_diagnostic_text(role_diagnostic(.0)))]
     Role(#[from] StorageRoleFailure),
     #[error(transparent)]
     MetadataPlan(#[from] MetadataPlanError),
@@ -160,11 +160,11 @@ pub enum StorageError {
     BackendConnect(#[from] BackendConnectError),
     #[error(transparent)]
     TransferValue(#[from] TransferValueError),
-    #[error(transparent)]
+    #[error("{0}{diagnostic}", diagnostic = traversal_diagnostic_suffix(.0))]
     Traversal(#[from] TraversalTerminalFailure),
     #[error(transparent)]
     TraversalConfiguration(#[from] TraversalConfigurationError),
-    #[error("Scan failed at {path} ({scope:?}, delivered={delivered:?}): {source}")]
+    #[error("Scan failed at {path} ({scope:?}, delivered={delivered:?}): {source}; {}", safe_diagnostic_text(.source.diagnostic()))]
     TraversalEntry {
         path: StoragePath,
         scope: FailureScope,
@@ -237,8 +237,7 @@ impl From<TransferFailure> for StorageError {
 // role 的 Display 只展示类别；这里显式选用契约已脱敏的诊断供任务日志及 callback 使用。
 fn history_diagnostic(error: &StorageError) -> &str {
     match error {
-        StorageError::Role(cause)
-        | StorageError::TargetPersistenceUnconfirmed { source: cause, .. }
+        StorageError::TargetPersistenceUnconfirmed { source: cause, .. }
         | StorageError::SourceCleanupContentUnverified { source: cause, .. }
         | StorageError::MetadataVerification(MetadataVerificationError::Read(cause)) => role_diagnostic(cause),
         _ => "",
@@ -250,6 +249,17 @@ fn role_diagnostic(source: &StorageRoleFailure) -> &str {
         StorageRoleFailure::Entry(error) => error.diagnostic(),
         StorageRoleFailure::Session(error) => error.diagnostic(),
     }
+}
+
+fn traversal_diagnostic_suffix(source: &TraversalTerminalFailure) -> String {
+    let diagnostic = match source {
+        TraversalTerminalFailure::Session(error) => Some(error.diagnostic()),
+        TraversalTerminalFailure::ConsumerSource(error) => Some(error.diagnostic()),
+        _ => None,
+    };
+    diagnostic.map_or_else(String::new, |diagnostic| {
+        format!("; {}", safe_diagnostic_text(diagnostic))
+    })
 }
 
 pub type Result<T> = std::result::Result<T, StorageError>;
@@ -280,3 +290,7 @@ impl From<EntryObservationFailure> for StorageError {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "storage_diagnostic_tests.rs"]
+mod diagnostic_tests;
