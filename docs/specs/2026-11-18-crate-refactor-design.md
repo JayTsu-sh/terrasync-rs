@@ -2,7 +2,7 @@
 
 建议保留现有 workspace 成员。先让 CLI 和 Web 通过同一组任务入口使用 `app`，让 `transport` 专注两个进程之间交换的消息，再把本地复制和远端会话各自的执行状态收回 `app`。第一笔改动是迁移 callback 诊断契约，可以独立交付。整轮使用现有 `db` 和 data-mover 接口。
 
-方案基线为 `feat/full-migration-optimization` 的 `b54f997` **加当前工作树**，包括尚未提交的受控遍历、复制及源端清理改动。工作树中的两个 data-mover 依赖均锁定在 `349d59c1`。实施前须在实际起点记录提交、diff 和未跟踪的相关源码，用同一份源码采集对照结果。下文的验收条件均用于后续实现。
+本轮提交以 `feat/full-migration-optimization` 的 `b54f997` 为基线，构建使用该分支锁定的 data-mover `e001d068`。受控遍历、复制及源端清理的本地改动仍在原工作树，该工作树使用 data-mover `349d59c1`。包含这些本地改动的验证结果只适用于当时的组合快照，候选提交以其独立工作树的验证结果为准。
 
 ## 目标结构与职责
 
@@ -24,13 +24,13 @@
 | `execution` | `job_execution`、`copy_execution` 中已有的租约、故障监控与取消控制 | 执行身份、首个有类型故障、在途操作收束。扫描游标归 scan，复制代次提交归迁移流程 |
 | `reporting` | `consumer/stats`、callback 及交付逻辑 | 进度投影、累计统计、批次身份、诊断发件箱及终态归档。Web 只依赖报告值和接收契约 |
 
-暂时把远端编排放在 `app::migration::remote`。Sender 使用本项目的源端观察、过滤和统计，Receiver 使用目标端元数据、校验、发布及错误类型。现在单列 remote crate，会要求 app 与它相互依赖，或把这些内部细节都公开。将来出现独立发布 Receiver 或第二个真实调用方，且会话可以通过少量输入、事件和结果独立运行时，再评估拆 crate。
+本轮将远端入口收至 `app::remote_sync`，发送与接收会话分别由 `remote_sender_session` 和 `remote_receiver_session` 负责。Sender 使用本项目的源端观察、过滤和统计，Receiver 使用目标端元数据、校验、发布及错误类型。将来出现独立发布 Receiver 或第二个真实调用方，且会话可以通过少量输入、事件和结果独立运行时，再评估拆 crate。
 
 有一处明确的范围边界。Web 的目录聚合查询会根据 ClickHouse 部署选择 `base_<job>` 或 `base`，并在集群模式追加过滤。目前 db 没有对应的聚合查询接口。本轮将这项布局知识限制在现有分析仓储；将来扩大 db 范围时，再让 Web 按任务、路径和统计维度查询。[分析查询实现](../../crates/web/src/infrastructure/analysis_repo.rs) · [复制代次决策](../../crates/db/src/catalogue/copy_generation.rs)
 
 ## 双进程与 NDX 的处理决定
 
-当前生产调用链是 `sync --remote → remote_sync::run → directory_pages → RemoteSenderSession`。对端通过 `serve → receiver_task_remote → RemoteReceiverSession::run` 进入消息循环。Sender 在发页前登记可请求条目，一边发清单一边处理请求和确认。Receiver 用自己的目标存储比较条目，选择跳过、全量或差分，等待写入结果并通知 Sender。可选的目标多余项删除由 Receiver 执行。远端 checkpoint 保存已完成路径，扫描 checkpoint 保存遍历恢复位置，两者分别验证。[Sender 入口](../../crates/app/src/remote_sync.rs) · [Sender 会话](../../crates/app/src/remote_sync/remote_sender_session.rs) · [Receiver 入口](../../crates/app/src/receiver.rs) · [Receiver 会话](../../crates/app/src/remote_receiver_session.rs)
+候选提交的调用链是 `sync --remote → remote_sync::send → directory_pages → RemoteSenderSession`。对端通过 `serve → remote_sync::serve → remote_receiver_session::receive → RemoteReceiverSession::run` 进入消息循环。Sender 在发页前登记可请求条目，一边发清单一边处理请求和确认。Receiver 用自己的目标存储比较条目，选择跳过、全量或差分，等待写入结果并通知 Sender。可选的目标多余项删除由 Receiver 执行。远端 checkpoint 保存已完成路径，扫描 checkpoint 保存遍历恢复位置，两者分别验证。[远端入口](../../crates/app/src/remote_sync.rs) · [Sender 会话](../../crates/app/src/remote_sync/remote_sender_session.rs) · [Receiver 会话](../../crates/app/src/remote_receiver_session.rs)
 
 | 机制 | 回答的问题 | 处置 |
 | --- | --- | --- |
@@ -41,7 +41,7 @@
 
 **Blocks 已经解决目录枚举分组；逐项 NDX 仍是双进程会话的关联依据。** 当前一页可含整个目录，页队列有界也限制不了单页大小。Sender 的 NDX 表、已完成路径集合和 Receiver 的终态记录要分别量测。`TransferDone` 在控制流上可能先于数据到达，不能用它或 `DirectoryListed` 驱逐仍可被引用的项。[清单生成](../../crates/app/src/remote_inventory.rs) · [Blocks 入口](../../crates/app/src/scan/source.rs) · [现行协议与索引](../../crates/transport/src/message.rs)
 
-仓库另有 opaque advertisement 和 expert transfer 实现及测试。对应设计记录的是当时的 v6、v8，当前协议版本和最低版本均为 v14，生产入口仍走上述目录页链路。切换清单格式、启用新的传输流程或调整 NDX 生命周期都应作为独立行为变更，分别给出两端失败和恢复证据。[Advertisement 设计](2026-09-01-remote-advertisement-design.md) · [Expert transfer 设计](2026-09-02-remote-expert-transfer-design.md)
+仓库另有 opaque advertisement 和 expert transfer 实现及测试。对应设计记录的是当时的 v6、v8。候选提交的协议版本和最低版本均为 v14，入口仍走上述目录页链路。合入审查时 GitHub `main` 的 `60775af` 使用 v12。切换清单格式、启用新的传输流程或调整 NDX 生命周期都应作为独立行为变更，分别给出两端失败和恢复证据。[候选协议](../../crates/transport/src/message.rs) · [Advertisement 设计](2026-09-01-remote-advertisement-design.md) · [Expert transfer 设计](2026-09-02-remote-expert-transfer-design.md)
 
 ## 实施顺序
 
@@ -63,9 +63,9 @@ B 批次先从改动前的 v14 编码记录代表性固定字节样本，包含 
 
 ### C　收拢双进程会话并隔离本地队列
 
-1. **合并 Receiver 会话入口和主循环。** 将 `receiver.rs` 中的 `recv_file_list_and_data_phase` 归入 `RemoteReceiverSession`，让同一会话拥有唯一读取循环、在途请求和落盘结果。保留容量 16 的落盘命令队列以及由主循环并发排空的无界 ACK 通道，避免两侧互等待，下游接纳数据后才归还额度。验证控制流先到 `TransferDone`、数据迟到、关闭中仍有磁盘任务等情况。最终进度和 `AllDone` 应在已请求项取得终态、落盘任务收束后发出。[Receiver 实现](../../crates/app/src/receiver.rs) · [会话顺序测试](../../crates/app/src/remote_receiver_session.rs)
+1. **合并 Receiver 会话入口和主循环。** 将 `receiver.rs` 中的 `recv_file_list_and_data_phase` 归入 `RemoteReceiverSession`，让同一会话拥有唯一读取循环、在途请求和落盘结果。保留容量 16 的落盘命令队列以及由主循环并发排空的无界 ACK 通道，避免两侧互等待，下游接纳数据后才归还额度。验证控制流先到 `TransferDone`、数据迟到、关闭中仍有磁盘任务等情况。最终进度和 `AllDone` 应在已请求项取得终态、落盘任务收束后发出。[会话实现与顺序测试](../../crates/app/src/remote_receiver_session.rs)
 2. **让 CLI 调用两个远端用例。** 将 `serve_cmd` 中的目标存储创建、bind、证书写出、accept、单次接收和成功后的 `wait_idle` 收入 app 接收用例。CLI 保留参数解析；Sender 同步改为通过 app 远端发送入口启动。保留证书先于 accept 写出、写证书失败告警、版本和 token 校验、连接错误的类型及退出语义。远端仍拒绝源端删除和打包；逐项失败计入报告，会话失败通过调用结果返回。验收默认 CLI 启动两进程、证书与鉴权、断连退出、最终文件和报告。[CLI 现有时序](../../crates/cli/src/commands.rs) · [真实子进程测试](../../tests/remote_process_e2e.rs)
-3. **替换普通本地全量路径上的消息队列。** 在 app 本地迁移模块内用现有有界 MPMC 通道表示条目、打包结果及错误。同步迁移 sender worker、`LocalCopyReceiver` 和 `AppError` 的相关分支。逐条核对容量 128、多个 worker 竞争领取、队列满时取消、生产者关闭后的排空和故障来源。继续复用 `LocalCopyExecutor`；工作树中的受控遍历路径单独覆盖。远端协议测试仍可在内存 transport 上驱动。[现有队列](../../crates/transport/src/in_process.rs) · [本地执行器](../../crates/app/src/receiver/in_process.rs) · [受控路径分派](../../crates/app/src/orchestrator.rs)
+3. **替换普通本地全量路径上的消息队列。** 在 app 本地迁移模块内用现有有界 MPMC 通道表示条目、打包结果及错误。同步迁移 sender worker、`LocalCopyReceiver` 和 `AppError` 的相关分支。逐条核对容量 128、多个 worker 竞争领取、队列满时取消、生产者关闭后的排空和故障来源。复用 `LocalCopyExecutor`。远端协议测试仍可在内存 transport 上驱动。[本地队列与测试](../../crates/app/src/sender/copy_queue.rs) · [本地执行器](../../crates/app/src/receiver/in_process.rs) · [全量路径分派](../../crates/app/src/orchestrator/full.rs)
 4. **最后接 Cargo feature。** 建立 `terrasync-rs/remote → cli/remote → app/remote → transport/quic`，由默认根构建启用。Web 的 app 依赖使用本地功能；若 cli 有默认 remote，根依赖 cli 时须关闭其默认 feature 并显式转发。删除 CLI 的直接 transport 依赖并迁移其错误转换；对 app 的远端模块、测试、examples 及相应错误分支按需加 feature 条件。分别检查独立 Web、本地根二进制、默认根二进制和 GUI 构建。目标是前两者的正常依赖图不启用 `transport/quic`，默认二进制仍提供两种远端角色。[根 features](../../Cargo.toml) · [app 依赖](../../crates/app/Cargo.toml) · [直接使用 QUIC 的 lab 测试](../../crates/app/tests/direct_cancel_real.rs)
 
 ### D　收拢本地迁移、扫描与执行配置

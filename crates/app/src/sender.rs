@@ -26,6 +26,7 @@ use crate::file_copy::CopyOptions;
 use crate::file_copy::selection::skip_unrepresentable;
 use crate::receiver::ReceiverConfig;
 use crate::tar_pack;
+use copy_queue::{CopyCommand, CopyCommandSink};
 use task_model::observation::EntryProgress;
 
 #[cfg(test)]
@@ -33,7 +34,6 @@ use task_model::observation::EntryProgress;
 mod cancellation_tests;
 
 pub(crate) mod copy_queue;
-use copy_queue::{CopyCommand, CopyCommandSink};
 
 /// Sender worker 配置
 pub struct SenderWorkerConfig {
