@@ -591,7 +591,9 @@ fn transfer_failure(ndx: SessionNdx, source: TransferFailure) -> AppError {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use crate::error::AppError;
+    #[cfg(feature = "remote")]
     use rustls::crypto::ring::default_provider;
+    #[cfg(feature = "remote")]
     use rustls::pki_types::CertificateDer;
     use tokio::sync::Mutex;
     use tokio::{fs, time};
@@ -599,6 +601,7 @@ mod tests {
     use transport::message::{
         RemoteStageDisposition, RemoteTransferFailure, RemoteTransferPhase, RemoteTransferSide, SourceQosSnapshot,
     };
+    #[cfg(feature = "remote")]
     use transport::quic::receiver::local_addr;
 
     use std::collections::VecDeque;
@@ -618,13 +621,18 @@ mod tests {
     use data_mover::transfer::{TransferIdentity, TransferPolicy};
     use tempfile::tempdir;
     use tokio_util::sync::CancellationToken;
+    #[cfg(feature = "remote")]
     use transport::message::{
         AdvertisedObservation, AdvertisementEvent, AdvertisementTerminal, HandshakeResult, ObservationPage,
-        ProtocolHandshake, ReceiverMsg, RemoteSourceEvent, SenderMsg, SessionNdx,
+        ProtocolHandshake,
     };
+    use transport::message::{ReceiverMsg, RemoteSourceEvent, SenderMsg, SessionNdx};
     use transport::prelude::create_in_process_pair_with_capacity;
+    #[cfg(feature = "remote")]
     use transport::quic;
-    use transport::traits::{ReceiverTransport, SenderTransport};
+    use transport::traits::ReceiverTransport;
+    #[cfg(feature = "remote")]
+    use transport::traits::SenderTransport;
 
     use super::{
         RemoteExpertDestinationRequest, RemoteExpertSourceRequest, receive_remote_destination, serve_remote_source,
@@ -958,6 +966,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(feature = "remote")]
     async fn real_quic_runs_the_same_local_expert_state_machine() -> TestResult {
         let _ = default_provider().install_default();
         let source_root = tempdir()?;

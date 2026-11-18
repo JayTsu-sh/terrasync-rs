@@ -377,7 +377,7 @@ mod tests {
         };
         create_storage_for_role(path, block_size, ensure_dir, role).await
     }
-    use crate::consumer::stats::{JobSummary, ProgressDetail, ProgressReport};
+    use crate::report::{JobSummary, ProgressDetail, ProgressReport};
 
     /// 构造测试用 `Arc<AsyncMutex<StatisticConsumer>>`：不设 `callback_url`（不起 HTTP
     /// 回调循环），不调用 `begin()`/`end()`（这些测试只关心 `send_file_list_phase`/

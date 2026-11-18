@@ -13,6 +13,7 @@
 //!
 //! 运行：`cargo test -p terrasync-rs --test remote_process_e2e -- --nocapture`
 
+#![cfg(feature = "remote")]
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 #![allow(clippy::pedantic)]
 

@@ -1,4 +1,5 @@
 //! 由 lab runner 启动真实 Receiver；本测试通过真实 QUIC 在指定阶段主动关闭连接。
+#![cfg(feature = "remote")]
 #![allow(clippy::unwrap_used)]
 use app::scan::observe_path;
 use std::{env, error::Error, path::Path, sync::Arc, time::Duration};

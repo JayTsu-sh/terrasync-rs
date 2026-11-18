@@ -3,6 +3,7 @@ use crate::file_copy::namespace as copy_namespace;
 use data_mover::model::BackendKind;
 use data_mover::model::EntryKind;
 use data_mover::qos::QosManager;
+#[cfg(any(feature = "remote", test))]
 use data_mover::storage::CopiedValueTarget;
 use data_mover::transfer::TransferPolicy;
 use std::sync::Arc;
@@ -93,6 +94,7 @@ impl HdfsCopyContext {
 }
 
 /// 复制契约取决于已连接目标实例的能力，不受扫描展示开关影响。
+#[cfg(any(feature = "remote", test))]
 pub(crate) fn copied_tags_required(to: &StorageContext) -> crate::error::storage::Result<bool> {
     Ok(to
         .storage()

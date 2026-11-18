@@ -20,7 +20,9 @@ mod copy_history;
 ///
 /// 串行消费 `DiskCommitMsg`，通过 expert destination 流式写入受控 stage，
 /// 提交时由引擎读回校验并发布
+#[cfg(any(feature = "remote", test))]
 mod disk_commit;
+#[cfg(any(feature = "remote", test))]
 mod file_commit;
 mod file_copy;
 pub mod storage_factory;
@@ -62,10 +64,13 @@ mod source_cleanup;
 mod sync_catalog;
 mod target_absence;
 
+#[cfg(any(feature = "remote", test))]
 mod remote_inventory;
 /// 双进程模式的发送与接收入口。
+#[cfg(feature = "remote")]
 pub mod remote_sync;
 
+#[cfg(any(feature = "remote", test))]
 mod remote_receiver_session;
 
 /// 双进程 remote advertisement：opaque snapshot paging 与 session-local NDX。

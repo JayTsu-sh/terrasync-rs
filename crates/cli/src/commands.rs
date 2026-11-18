@@ -11,7 +11,9 @@
 // 标准库
 use app::scan::ScanRequest;
 use std::fs;
+#[cfg(feature = "remote")]
 use std::net::SocketAddr;
+#[cfg(feature = "remote")]
 use std::path::Path;
 use task_model::{SourceCleanupPolicy, TransferMode};
 use tokio::signal::ctrl_c;
@@ -20,6 +22,7 @@ use tokio_util::sync::CancellationToken;
 // 外部crate
 use app::config::SyncJobConfig;
 use app::prelude::{integrity_check, parse_bandwidth_string, rm, scan, sync};
+#[cfg(feature = "remote")]
 use app::remote_sync::{send, serve};
 use data_mover::redact_storage_url;
 use tracing::info;
@@ -70,6 +73,7 @@ pub fn validate_block_size(s: &str) -> Result<String> {
 
 /// 校验 `delta_size_threshold` 格式（同 `validate_block_size`，复用 `parse_bandwidth_string`
 /// 单位解析）
+#[cfg(feature = "remote")]
 pub fn validate_delta_size_threshold(s: &str) -> Result<String> {
     match parse_bandwidth_string(s) {
         Ok(_) => Ok(s.to_string()),
@@ -172,9 +176,11 @@ pub async fn scan_cmd(
 pub async fn sync_cmd(
     job_id: &str, src_path: &Option<String>, dest_path: &Option<String>, enable_integrity_check: bool,
     enable_acl: bool, r#match: &Option<String>, exclude: &Option<String>, qos: &Option<String>, peak_qos_rate: f32,
-    iops: Option<u32>, block_size: &Option<String>, delta_size_threshold: &Option<String>, file_list: &Option<String>,
-    packaged: bool, package_depth: Option<usize>, remote: &Option<String>, tls_server_cert: &Option<String>,
-    token: &Option<String>, raw_command_line: String, resume: bool, delete_target: bool,
+    iops: Option<u32>, block_size: &Option<String>, #[cfg(feature = "remote")] delta_size_threshold: &Option<String>,
+    file_list: &Option<String>, packaged: bool, package_depth: Option<usize>,
+    #[cfg(feature = "remote")] remote: &Option<String>, #[cfg(feature = "remote")] tls_server_cert: &Option<String>,
+    #[cfg(feature = "remote")] token: &Option<String>, raw_command_line: String, resume: bool,
+    #[cfg(feature = "remote")] delete_target: bool,
 ) -> Result<()> {
     let config = AppConfig::fetch()?;
 
@@ -200,6 +206,7 @@ pub async fn sync_cmd(
     let effective_block_size = block_size.as_ref().or(config.sync.block_size.as_ref()).cloned();
 
     // 双进程模式提示
+    #[cfg(feature = "remote")]
     if let Some(addr) = remote {
         info!("Remote mode enabled, connecting to Receiver at {}", addr);
     }
@@ -229,7 +236,10 @@ pub async fn sync_cmd(
         qos: effective_qos,
         peak_qos_rate: effective_peak_qos_rate,
         block_size: effective_block_size,
+        #[cfg(feature = "remote")]
         delta_size_threshold: delta_size_threshold.clone(),
+        #[cfg(not(feature = "remote"))]
+        delta_size_threshold: None,
         file_list: file_list.clone(),
         iops,
         packaged,
@@ -237,11 +247,15 @@ pub async fn sync_cmd(
         raw_command_line,
         progress_callback_url: None,
         transfer_mode: TransferMode::from_resume(resume),
+        #[cfg(feature = "remote")]
         delete_target,
+        #[cfg(not(feature = "remote"))]
+        delete_target: false,
         concurrency: None,
     };
 
     // 双进程模式：通过 QUIC 连接远端 Receiver
+    #[cfg(feature = "remote")]
     if let Some(remote_addr) = remote {
         // 加载服务端证书（防 MITM）
         let tls_cert_bytes: Option<Vec<u8>> = match tls_server_cert {
@@ -369,6 +383,7 @@ pub async fn gui_cmd(host: &str, port: u16) -> Result<()> {
 ///
 /// 监听 QUIC 连接，接收 Sender 的分页文件列表，比较后请求传输。
 /// 生成的 TLS 证书写入 `tls_cert_out`，Sender 侧通过 `--tls-server-cert` 加载以防 MITM。
+#[cfg(feature = "remote")]
 pub async fn serve_cmd(listen: &str, dest_path: &str, tls_cert_out: &str, token: &Option<String>) -> Result<()> {
     info!(
         "Starting Receiver daemon on {}, dest: {}",

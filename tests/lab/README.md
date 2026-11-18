@@ -38,7 +38,7 @@ source purge readiness, whole-job network budgets or throughput/RSS.
 
 `verify-direct-cancel.py` 在真实远端 Local 目标和 QUIC 链路上验证 Direct 取消。
 先构建 `cargo build --release --bin terrasync` 和
-`cargo test -p app --test direct_cancel_real --no-run`；后者输出独立测试二进制路径。
+`cargo test -p app --features remote --test direct_cancel_real --no-run`；后者输出独立测试二进制路径。
 
 ```sh
 timeout 1200 python3 tests/lab/verify-direct-cancel.py \

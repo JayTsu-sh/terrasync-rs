@@ -264,14 +264,19 @@ pub async fn cli_match() -> error::Result<()> {
             peak_qos_rate,
             iops,
             block_size,
+            #[cfg(feature = "remote")]
             delta_size_threshold,
             file_list,
             packaged,
             package_depth,
+            #[cfg(feature = "remote")]
             remote,
+            #[cfg(feature = "remote")]
             tls_server_cert,
+            #[cfg(feature = "remote")]
             token,
             resume,
+            #[cfg(feature = "remote")]
             delete_target,
             ..
         } => {
@@ -287,19 +292,25 @@ pub async fn cli_match() -> error::Result<()> {
                 *peak_qos_rate,
                 *iops,
                 block_size,
+                #[cfg(feature = "remote")]
                 delta_size_threshold,
                 file_list,
                 *packaged,
                 *package_depth,
+                #[cfg(feature = "remote")]
                 remote,
+                #[cfg(feature = "remote")]
                 tls_server_cert,
+                #[cfg(feature = "remote")]
                 token,
                 raw_command_line,
                 *resume,
+                #[cfg(feature = "remote")]
                 *delete_target,
             )
             .await?;
         }
+        #[cfg(feature = "remote")]
         Commands::Serve {
             listen,
             dest_path,

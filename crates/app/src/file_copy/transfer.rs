@@ -67,6 +67,7 @@ pub(crate) fn validate_transfer_mode(destination: &StorageContext, mode: Transfe
     Ok(())
 }
 
+#[cfg(any(feature = "remote", test))]
 pub(crate) fn validate_stream_transfer_mode(destination: &StorageContext, mode: TransferMode) -> Result<()> {
     validate_transfer_mode(destination, mode)?;
     if mode == TransferMode::Direct && !destination.roles.staged_destination()?.supports_sparse_patch() {

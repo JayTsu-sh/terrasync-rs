@@ -218,6 +218,7 @@ pub(crate) async fn set_item_metadata(
     Ok(plan.verify_published(storage, &path, &version, None, cancel).await?)
 }
 
+#[cfg(any(feature = "remote", test))]
 pub(crate) async fn apply_acl(storage: &Storage, value: &Path, acl: AclMetadata) -> Result<()> {
     let target = storage.staged_destination()?.copied_metadata_target();
     let acl_target = match target.map(|v| v.acl) {
@@ -264,6 +265,7 @@ pub(crate) async fn apply_acl(storage: &Storage, value: &Path, acl: AclMetadata)
     Ok(())
 }
 
+#[cfg(feature = "remote")]
 pub(crate) async fn observe_acl(storage: &Storage, value: &Path) -> Result<Option<AclMetadata>> {
     let facts = storage
         .metadata()?

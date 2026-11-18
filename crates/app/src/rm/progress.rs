@@ -3,6 +3,7 @@ use crate::storage_factory::path;
 use data_mover::model::*;
 use data_mover::storage::Storage;
 use std::path::{Path, PathBuf};
+#[cfg(any(feature = "remote", test))]
 use task_model::ObservedEntryExt;
 use tokio_util::sync::CancellationToken;
 
@@ -65,6 +66,7 @@ pub async fn delete_dir_all_with_progress(
     Ok(AsyncReceiver::new(rx))
 }
 
+#[cfg(any(feature = "remote", test))]
 pub async fn delete_dir_all(storage: &Storage, entry: &ObservedEntry) -> Result<()> {
     let events = delete_dir_all_with_progress(storage, Some(entry.get_relative_path()), 4).await?;
     let mut failure = None;

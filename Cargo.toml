@@ -72,7 +72,7 @@ data-mover-model = { git = "https://github.com/JayTsu-sh/data-mover-rs.git", rev
 
 # 内部 path crate
 app          = { path = "crates/app" }
-cli          = { path = "crates/cli" }
+cli          = { path = "crates/cli", default-features = false }
 db           = { path = "crates/db" }
 licensing    = { path = "crates/licensing" }
 sync-delta   = { path = "crates/sync-delta" }
@@ -114,10 +114,13 @@ unimplemented = "warn"
 
 [features]
 # 默认特性（运行 `cargo build` 时不指定任何特性时启用）
-default = ["basic"]
+default = ["basic", "remote"]
 
 # 基本功能（始终包含）
 basic = []
+
+# 双进程 Sender 与 Receiver
+remote = ["cli/remote"]
 
 # Profiling 特性（启用 tokio-console 客户端用于性能/异步任务分析）
 profiling = ["dep:console-subscriber"]
@@ -132,7 +135,7 @@ lab-fault-injection = ["cli/lab-fault-injection"]
 gui = ["cli/gui"]
 
 [dependencies]
-cli = { workspace = true }
+cli = { workspace = true, default-features = false }
 console-subscriber = { version = "0.5.0", optional = true }
 mimalloc = "0.1"
 tokio = { workspace = true }

@@ -10,7 +10,7 @@
 //!
 //! ## 设计：字节级 credit 窗口
 //!
-//! [`SenderCreditState`] 用一个互斥账本和 `Notify` 实现全局字节配额：Sender 每发送一条 Data
+//! `SenderCreditState` 用一个互斥账本和 `Notify` 实现全局字节配额：Sender 每发送一条 Data
 //! 类消息前按 payload 字节数原子扣减（不足则挂起）；Receiver 消费后调用
 //! [`SenderCreditState::grant`] 补充。acquire 与 grant 共用同一个线性化临界区，因此
 //! outstanding 不会超过窗口，也不存在互相漂移的镜像账本。
@@ -33,7 +33,7 @@
 //!
 //! ## 重连即重置语义
 //!
-//! [`SenderCreditState`] 是 `QuicSenderTransport` 的内部字段，随连接对象一起创建/销毁；断线
+//! `SenderCreditState` 是 `QuicSenderTransport` 的内部字段，随连接对象一起创建/销毁；断线
 //! 重连会创建全新的 `QuicSenderTransport`（含全新的 `SenderCreditState`，满窗口重新开始）。
 //! **不做持久化**——这是有意为之：credit 窗口描述的是"当前这条连接上，Sender 已发但
 //! Receiver 尚未确认消费的字节数"，连接断开的瞬间这个状态本身就已经失去意义（在途的
@@ -74,10 +74,12 @@
 //! 依据。测试应断言阻塞、恢复、消息可见性和 typed terminal outcome，而非内部计数值。
 
 use crate::message::RemoteSourceEvent;
+#[cfg(any(feature = "quic", test))]
 use std::sync::Mutex;
 use task_model::ObservedEntryExt;
 
 // 外部 crate
+#[cfg(any(feature = "quic", test))]
 use tokio::sync::Notify;
 
 // 内部模块
@@ -183,11 +185,13 @@ impl Default for ReceiverCreditState {
 }
 
 /// 字节级 credit 流控窗口（issue #59 方案 b），语义与死锁防护见模块文档
+#[cfg(any(feature = "quic", test))]
 pub(crate) struct SenderCreditState {
     ledger: Mutex<SenderCreditLedger>,
     notify: Notify,
 }
 
+#[cfg(any(feature = "quic", test))]
 struct SenderCreditLedger {
     available: u64,
     capacity: u64,
@@ -195,6 +199,7 @@ struct SenderCreditLedger {
 }
 
 /// Separates transport-internal grants from application-visible messages.
+#[cfg(any(feature = "quic", test))]
 pub(crate) enum SenderCreditOutcome {
     Consumed(CreditGrantOutcome),
     Forward(ReceiverMsg),
@@ -202,11 +207,13 @@ pub(crate) enum SenderCreditOutcome {
 
 /// Exact result of applying a grant without allowing capacity inflation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg(any(feature = "quic", test))]
 pub(crate) struct CreditGrantOutcome {
     pub(crate) applied: u64,
     pub(crate) discarded: u64,
 }
 
+#[cfg(any(feature = "quic", test))]
 impl SenderCreditState {
     /// 用指定窗口大小构造；生产路径固定使用 [`DEFAULT_CREDIT_WINDOW_BYTES`]
     /// （见 `quic::sender::connect`），测试注入更小的窗口以触发阻塞/授信路径。

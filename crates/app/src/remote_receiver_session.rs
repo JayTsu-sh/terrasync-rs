@@ -11,7 +11,9 @@ use std::num::NonZeroUsize;
 use std::path::{Component, Path};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, Instant};
+#[cfg(any(feature = "remote", test))]
+use std::time::Duration;
+use std::time::Instant;
 use task_model::TransferMode;
 use task_model::observation::ObservedItem;
 use task_model::{ObservedEntryExt, StorageEntryMessage};
@@ -20,19 +22,23 @@ use tokio_util::sync::CancellationToken;
 use crate::error::storage::Result as StorageResult;
 use crate::storage_factory::StorageContext;
 use data_mover::model::{FailureClass, ObservedEntry};
+#[cfg(feature = "remote")]
 use data_mover::redact_storage_url;
 use tokio::sync::mpsc::{self, Receiver, Sender};
+#[cfg(feature = "remote")]
 use tokio::time::interval;
 use tracing::{debug, error, info, warn};
 use transport::acl::decode_acl;
 use transport::chunk::DataChunk;
 use transport::directory::DirPageResult;
+#[cfg(feature = "remote")]
 use transport::error::TransportError;
 use transport::flow_control::{ReceiverCreditState, payload_credit_cost};
 use transport::message::{
-    BlockSignature, FeatureFlags, HandshakeResult, ProgressSnapshot, ProtocolHandshake, ReceiverMsg, SenderMsg,
-    SessionConfig, TransferDecision,
+    BlockSignature, FeatureFlags, ProgressSnapshot, ReceiverMsg, SenderMsg, SessionConfig, TransferDecision,
 };
+#[cfg(feature = "remote")]
+use transport::message::{HandshakeResult, ProtocolHandshake};
 use transport::traits::ReceiverTransport;
 
 use crate::byte_resume::is_part_file;
@@ -106,6 +112,7 @@ impl ReceiverProgress {
 ///
 /// `expected_token`：`serve --token` 配置的期望值；为 `None` 时跳过鉴权（向后兼容，
 /// 未配置 token 时不校验，仍需完成 `Auth` 消息交换以保持协议阶段一致）。
+#[cfg(feature = "remote")]
 pub(crate) async fn receive(
     transport: &(dyn ReceiverTransport + 'static), dest_storage: Arc<StorageContext>, expected_token: Option<&str>,
 ) -> Result<()> {
@@ -173,6 +180,7 @@ pub(crate) async fn receive(
 ///
 /// 版本不兼容时发送 `Rejected` 后立即返回错误，不进入 `SessionConfig` / 文件列表阶段，
 /// 确保拒绝发生在任何 `FilePage` / `TransferRequest` / `CopyEntry` 之前。
+#[cfg(feature = "remote")]
 async fn recv_and_negotiate_handshake(
     transport: &(dyn ReceiverTransport + 'static), destination: &StorageContext,
 ) -> Result<FeatureFlags> {
@@ -211,6 +219,7 @@ async fn recv_and_negotiate_handshake(
 /// `expected_token` 为 `None` 时（Receiver 未配置 `--token`）接受任意 token，仅记录日志；
 /// 配置了 token 时必须与 Sender 提供的值完全一致，否则回复失败并 `close()` 连接，
 /// 确保鉴权失败发生在 `SessionConfig` / 文件列表 / 数据阶段之前。
+#[cfg(feature = "remote")]
 async fn recv_and_check_auth(
     transport: &(dyn ReceiverTransport + 'static), expected_token: Option<&str>,
 ) -> Result<()> {
@@ -246,6 +255,7 @@ async fn recv_and_check_auth(
 }
 
 /// 阶段 0：等待并返回 SessionConfig，忽略非预期消息
+#[cfg(feature = "remote")]
 async fn recv_session_config(transport: &(dyn ReceiverTransport + 'static)) -> Result<SessionConfig> {
     loop {
         match transport.recv().await {
@@ -1565,6 +1575,7 @@ mod tests {
         .unwrap();
         let page = match walk.recv().await.ok() {
             Some(NdxEvent::Page(page)) => page,
+            Some(NdxEvent::Error { path, reason }) => panic!("listing failed for {path}: {reason}"),
             other => panic!("expected one file page, got {other:?}"),
         };
         let ndx = page.files[0].ndx;

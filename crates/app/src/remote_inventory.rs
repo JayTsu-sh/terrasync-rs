@@ -17,10 +17,6 @@ pub(crate) struct NdxTable {
 }
 
 impl NdxTable {
-    pub(crate) fn new() -> Self {
-        Self::default()
-    }
-
     /// 从 `DirPageResult` 批量插入
     pub(crate) fn ingest_page(&mut self, page: &DirPageResult) {
         for nf in &page.files {

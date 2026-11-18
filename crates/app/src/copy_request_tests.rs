@@ -20,6 +20,7 @@ use crate::consumer::stats::{ProgressDetail, ProgressReport};
 use crate::error::{AppError, Result};
 use crate::migration_plan::MigrationPlan;
 use crate::orchestrator::SyncOrchestrator;
+#[cfg(feature = "remote")]
 use crate::remote_sync::send;
 use crate::scan::observe_path;
 use crate::storage_factory::{StorageRole, create_storage_for_role};
@@ -71,6 +72,7 @@ async fn frozen_catalogue(config: &ClickHouseConfig) -> Result<()> {
     Ok(())
 }
 
+#[cfg(feature = "remote")]
 async fn remote_rejection(config: &ClickHouseConfig, retain: bool) -> Result<()> {
     let directory = tempfile::tempdir()?;
     let mut command = job(directory.path());
@@ -392,8 +394,11 @@ async fn real_copy_requests_freeze_cleanup_and_report_preflight_rejections() -> 
         })?;
         let result: Result<()> = async {
             frozen_catalogue(&config).await?;
-            remote_rejection(&config, false).await?;
-            remote_rejection(&config, true).await?;
+            #[cfg(feature = "remote")]
+            {
+                remote_rejection(&config, false).await?;
+                remote_rejection(&config, true).await?;
+            }
             local_rejections(&config).await?;
             local_pipeline_reports(&config).await?;
             super::plan_tests::transitions(&config).await?;

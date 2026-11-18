@@ -17,6 +17,7 @@ pub(crate) async fn create_dir_all(storage: &Storage, entry: &ObservedEntry) -> 
 }
 
 /// 只移除目录本身的零字节对象，保留同前缀下所有后代及历史对象。
+#[cfg(any(feature = "remote", test))]
 pub(crate) async fn remove_directory_marker(storage: &Storage, entry: &ObservedEntry) -> Result<()> {
     if !storage.holds_directory_objects() {
         return Ok(());

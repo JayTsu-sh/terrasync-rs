@@ -21,7 +21,7 @@ mod entry_count_tests;
 
 // 重新导出：上层只需 `use crate::consumer::stats::*` 即可拿到常用类型
 #[cfg(test)]
-pub(crate) use crate::report::{JobSummary, ProgressDetail, ProgressReport};
+pub(crate) use crate::report::{ProgressDetail, ProgressReport};
 pub use accumulator::{
     DeltaCounts, ErrorStats, FileSizeRange, FullStats, IncrementalStats, StatsKind, TimeRange,
     calculate_file_size_range, calculate_time_range, format_bytes, print_integrity_check_result,

@@ -6,6 +6,8 @@ description = "CLI interface for terrasync"
 edition = "2024"
 
 [features]
+default = ["remote"]
+remote = ["app/remote"]
 license = ["dep:licensing", "app/license"]
 gui = ["dep:web"]
 lab-fault-injection = ["app/lab-fault-injection"]

@@ -182,7 +182,7 @@ impl<'a> RemoteSenderSession<'a> {
     }
 
     pub(super) async fn run(self) -> Result<RemoteSenderSessionSummary> {
-        let ndx_table = Mutex::new(NdxTable::new());
+        let ndx_table = Mutex::new(NdxTable::default());
         let mut ledger = SenderSessionLedger::new();
         let mut completed_paths = load_checkpoint(self.deps.checkpoint_path).await;
         if !completed_paths.is_empty() {
