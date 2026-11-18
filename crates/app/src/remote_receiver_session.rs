@@ -29,14 +29,18 @@ use transport::chunk::DataChunk;
 use transport::directory::DirPageResult;
 use transport::flow_control::{ReceiverCreditState, payload_credit_cost};
 use transport::message::{
-    BlockSignature, DcAck, DestIndex, DiskCommitMsg, FeatureFlags, FileOutcome, NdxTable, ProgressSnapshot,
-    ReceiverMsg, SessionConfig, TransferDecision,
+    BlockSignature, FeatureFlags, ProgressSnapshot, ReceiverMsg, SessionConfig, TransferDecision,
 };
 use transport::traits::ReceiverTransport;
 
 use crate::byte_resume::is_part_file;
+use crate::disk_commit::{DcAck, DiskCommitMsg, FileOutcome};
 use crate::error::Result;
 use crate::receiver::{ReceiverProgress, recv_file_list_and_data_phase, validate_relative_path};
+use crate::remote_inventory::NdxTable;
+
+mod dest_index;
+pub(crate) use dest_index::DestIndex;
 
 /// 一次会话的请求与终态账本。
 ///
@@ -596,15 +600,8 @@ impl RemoteSessionState {
         dc_join
             .await
             .map_err(|error| crate::error::AppError::CopyError(format!("disk-commit task join: {error}")))??;
-        while let Ok(ack) = ack_rx.try_recv() {
-            match ack {
-                DcAck::Entry(ack) => {
-                    let _ = self.handle_entry_outcome(transport, ack).await;
-                }
-                DcAck::FileOutcome { ndx, outcome } => {
-                    let _ = self.handle_file_outcome(transport, progress, ndx, outcome).await;
-                }
-            }
+        while let Ok(DcAck { ndx, outcome }) = ack_rx.try_recv() {
+            let _ = self.handle_file_outcome(transport, progress, ndx, outcome).await;
         }
         self.finalize_directories(dest).await;
         Ok(())
@@ -642,14 +639,6 @@ impl RemoteSessionState {
         }
         let _ = transport.send(ack).await;
         self.is_complete()
-    }
-
-    pub(crate) async fn handle_entry_outcome(
-        &mut self, transport: &(dyn ReceiverTransport + 'static), ack: ReceiverMsg,
-    ) -> bool {
-        let _ = transport.send(ack).await;
-        self.ledger.record_unindexed_terminal();
-        self.ledger.is_complete()
     }
 
     fn redo_or_error(&mut self, ndx: i32, reason: &str) -> (ReceiverMsg, bool) {
@@ -746,7 +735,7 @@ impl RemoteReceiverSession {
 mod tests {
     use crate::scan::observe_path;
     use std::fs;
-    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Duration;
@@ -1135,6 +1124,80 @@ mod tests {
             .expect("empty session should finish after TransferDone")
             .unwrap()
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn session_creates_directory_and_symlink_and_acknowledges_both() {
+        let src = tempdir().unwrap();
+        let dest = tempdir().unwrap();
+        let directory_path = PathBuf::from("sub");
+        let link_path = PathBuf::from("link.txt");
+        let target = PathBuf::from("target.txt");
+        fs::create_dir(src.path().join(&directory_path)).unwrap();
+        fs::set_permissions(src.path().join(&directory_path), fs::Permissions::from_mode(0o755)).unwrap();
+        symlink(&target, src.path().join(&link_path)).unwrap();
+
+        let source = create_storage(src.path().to_str().unwrap(), None, false).await.unwrap();
+        let directory = Arc::new(observe_path(source.storage(), &directory_path).await.unwrap());
+        let link = Arc::new(observe_path(source.storage(), &link_path).await.unwrap());
+        let destination = Arc::new(create_storage(dest.path().to_str().unwrap(), None, true).await.unwrap());
+        let (sender, receiver) = create_in_process_pair();
+        let (_progress_tx, progress_rx) = mpsc::channel(1);
+        let mut session = RemoteReceiverSession::new(
+            destination,
+            session_config(),
+            FeatureFlags::current(),
+            u64::MAX,
+            Arc::new(ReceiverProgress::new()),
+        );
+
+        let ndx = 7;
+        for message in [
+            SenderMsg::CreateDir { entry: directory },
+            SenderMsg::FilePage(DirPageResult {
+                dir_path: String::new(),
+                ndx_start: ndx,
+                files: vec![NdxEntry {
+                    ndx,
+                    entry: link.clone().into(),
+                }],
+                subdirs: Vec::new(),
+                gap_ndx: ndx + 1,
+            }),
+            SenderMsg::FileListDone,
+            SenderMsg::CreateSymlink {
+                entry: link,
+                target: target.clone(),
+            },
+            SenderMsg::TransferDone,
+        ] {
+            sender.send(message).await.unwrap();
+        }
+        tokio::time::timeout(Duration::from_secs(2), session.run(&receiver, progress_rx))
+            .await
+            .unwrap()
+            .unwrap();
+        receiver.close().await.unwrap();
+
+        assert!(matches!(sender.recv().await, Some(ReceiverMsg::EntrySuccess { entry })
+            if entry.get_relative_path() == directory_path));
+        assert!(
+            matches!(sender.recv().await, Some(ReceiverMsg::TransferRequest { ndx: requested, decision: TransferDecision::FullTransfer })
+            if requested == ndx)
+        );
+        assert!(matches!(sender.recv().await, Some(ReceiverMsg::RequestsDone)));
+        assert!(matches!(sender.recv().await, Some(ReceiverMsg::EntrySuccess { entry })
+            if entry.get_relative_path() == link_path));
+
+        let directory_metadata = fs::metadata(dest.path().join(directory_path)).unwrap();
+        assert!(directory_metadata.is_dir());
+        assert_eq!(directory_metadata.permissions().mode() & 0o777, 0o755);
+        let link = dest.path().join(link_path);
+        let metadata = fs::symlink_metadata(&link).unwrap();
+        assert!(metadata.file_type().is_symlink());
+        let owner = fs::metadata(dest.path()).unwrap();
+        assert_eq!((metadata.uid(), metadata.gid()), (owner.uid(), owner.gid()));
+        assert_eq!(fs::read_link(link).unwrap(), target);
     }
 
     #[tokio::test]

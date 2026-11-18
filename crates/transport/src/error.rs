@@ -1,5 +1,5 @@
 // 外部 crate
-use data_mover::model::ModelValueError;
+use data_mover_model::ModelValueError;
 use thiserror::Error;
 
 /// Transport 层错误类型

@@ -21,7 +21,7 @@ use transport::chunk::DataChunk;
 
 use crate::error::StorageError;
 use crate::error::storage::Result as StorageResult;
-use crate::remote_inventory::{DirectoryPages, NdxEvent};
+use crate::remote_inventory::{DirectoryPages, NdxEvent, NdxTable};
 use crate::storage_factory::StorageContext;
 use data_mover::model::ObservedEntry;
 use data_mover::qos::QosManager;
@@ -31,7 +31,7 @@ use task_model::{ChangeKind, ErrorEvent, StorageEntryMessage};
 use tokio::sync::Mutex as AsyncMutex;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
-use transport::message::{BlockSignature, NdxTable, ProgressSnapshot, ReceiverMsg, SenderMsg, TransferDecision};
+use transport::message::{BlockSignature, ProgressSnapshot, ReceiverMsg, SenderMsg, TransferDecision};
 use transport::traits::SenderTransport;
 
 use super::{AppError, Result, StatisticConsumer};

@@ -20,7 +20,7 @@ mod copy_history;
 ///
 /// 串行消费 `DiskCommitMsg`，通过 expert destination 流式写入受控 stage，
 /// 提交时由引擎读回校验并发布
-pub mod disk_commit;
+mod disk_commit;
 mod file_commit;
 mod file_copy;
 pub mod storage_factory;

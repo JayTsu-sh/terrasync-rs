@@ -1,21 +1,18 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
-use transport::chunk::DataChunk;
-// 用 in-process transport 断言 Sender 流式发送序列 + 源 hash 正确。
-#[path = "../../../tests/support/observed.rs"]
-mod observed_fixtures;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use task_model::TransferMode;
+use transport::chunk::DataChunk;
 
-use app::disk_commit::disk_commit_task;
-use app::receiver::ReceiverProgress;
-use app::storage_factory::{StorageContext, create_storage};
+use super::{DcAck, DiskCommitMsg, FileOutcome, disk_commit_task};
+use crate::receiver::ReceiverProgress;
+use crate::storage_factory::{CreateStorageOptions, StorageContext, create_storage};
 use bytes::Bytes;
 use data_mover::model::ObservedEntry;
 use tokio_util::sync::CancellationToken;
-use transport::message::{DcAck, DiskCommitMsg, FileOutcome, ReceiverMsg, SessionConfig};
+use transport::message::SessionConfig;
 
 // ============================================================
 // disk_commit_task 测试辅助
@@ -23,17 +20,14 @@ use transport::message::{DcAck, DiskCommitMsg, FileOutcome, ReceiverMsg, Session
 
 // 在 dir 上建一个 Local StorageContext（不写任何数据文件）。
 async fn local_storage(dir: &std::path::Path) -> Arc<StorageContext> {
-    let storage = create_storage(
-        &dir.to_string_lossy(),
-        app::storage_factory::CreateStorageOptions::new(None, false),
-    )
-    .await
-    .unwrap();
+    let storage = create_storage(&dir.to_string_lossy(), CreateStorageOptions::new(None, false))
+        .await
+        .unwrap();
     Arc::new(storage)
 }
 
 // 构造一个 NAS ObservedEntry（测试用最小字段集，relative_path=name）。
-fn make_nas_entry(name: &str, is_dir: bool, is_symlink: bool, size: u64, mode: u32) -> Arc<ObservedEntry> {
+fn make_nas_entry(name: &str, size: u64, mode: u32) -> Arc<ObservedEntry> {
     // 使用实际执行身份；成功路径不能隐含调用方具有 chown 到 root 的权限。
     let owner = tempfile::tempfile().unwrap().metadata().unwrap();
     Arc::new({
@@ -41,13 +35,7 @@ fn make_nas_entry(name: &str, is_dir: bool, is_symlink: bool, size: u64, mode: u
         crate::observed_fixtures::observation(
             data_mover::model::BackendKind::Nfs,
             fixture_path,
-            if is_dir {
-                data_mover::model::EntryKind::Directory
-            } else if is_symlink {
-                data_mover::model::EntryKind::Symlink
-            } else {
-                data_mover::model::EntryKind::File
-            },
+            data_mover::model::EntryKind::File,
             size,
             [0, 0, 0],
             Some(data_mover::model::OwnershipMode {
@@ -67,12 +55,7 @@ fn make_nas_entry(name: &str, is_dir: bool, is_symlink: bool, size: u64, mode: u
 // 不落盘——最终文件由 disk_commit_task 写入。
 fn entry_for(_root: &std::path::Path, name: &str, size: usize) -> (Arc<ObservedEntry>, Vec<u8>) {
     let bytes: Vec<u8> = (0..size).map(|i| (i % 251) as u8).collect();
-    (make_nas_entry(name, false, false, size as u64, 0o644), bytes)
-}
-
-// 构造一个目录 ObservedEntry（is_dir=true）。
-fn dir_entry(name: &str) -> Arc<ObservedEntry> {
-    make_nas_entry(name, true, false, 0, 0o755)
+    (make_nas_entry(name, size as u64, 0o644), bytes)
 }
 
 // 构造 SessionConfig，仅关心 enable_integrity_check，其余取默认。
@@ -104,8 +87,7 @@ fn chunkify(bytes: &[u8], chunk_size: usize) -> Vec<(u64, Bytes)> {
     out
 }
 
-// 起 disk_commit_task，喂消息，收集 ack DcAck（目录/符号链接透传 ReceiverMsg；
-// 文件传输结果为 FileOutcome，redo 决策已上移到 Receiver 主 task，dc task 只上报 outcome）。
+// 驱动落盘任务，收集由 Receiver 会话处理的文件终态。
 async fn run_dc(dest: Arc<StorageContext>, session: SessionConfig, msgs: Vec<DiskCommitMsg>) -> Vec<DcAck> {
     run_dc_inner(dest, session, msgs, true).await.0
 }
@@ -147,15 +129,11 @@ async fn dc_writes_full_file_and_acks_success() {
     let session = session_cfg(true);
     let src_hash = blake3::hash(&bytes).to_hex().to_string();
 
-    let mut msgs = vec![
-        DiskCommitMsg::CreateDir {
-            entry: dir_entry("sub"),
-        },
-        DiskCommitMsg::FileBegin {
-            ndx: 0,
-            entry: entry.clone().into(),
-        },
-    ];
+    std::fs::create_dir(tmp.path().join("sub")).unwrap();
+    let mut msgs = vec![DiskCommitMsg::FileBegin {
+        ndx: 0,
+        entry: entry.clone().into(),
+    }];
     for (off, c) in chunkify(&bytes, 1 << 20) {
         msgs.push(DiskCommitMsg::FileChunk {
             ndx: 0,
@@ -169,15 +147,9 @@ async fn dc_writes_full_file_and_acks_success() {
     });
 
     let acks = run_dc(dest, session, msgs).await;
-    // CreateDir：无 redo 语义，直接透传 EntrySuccess
-    assert!(
-        acks.iter()
-            .any(|a| matches!(a, DcAck::Entry(ReceiverMsg::EntrySuccess { .. })))
-    );
-    // FileCommit 校验通过：上报 FileOutcome::Success（不再是 dc task 自行发的 EntrySuccess）
     assert!(acks.iter().any(|a| matches!(
         a,
-        DcAck::FileOutcome {
+        DcAck {
             ndx: 0,
             outcome: FileOutcome::Success
         }
@@ -218,7 +190,7 @@ async fn dc_hash_mismatch_rejects_and_cleans_part() {
     // dc task 不再自行决定 redo/error，只如实上报 HashMismatch；由 Receiver 主 task 决策
     assert!(acks.iter().any(|a| matches!(
         a,
-        DcAck::FileOutcome {
+        DcAck {
             ndx: 0,
             outcome: FileOutcome::HashMismatch
         }
@@ -233,7 +205,7 @@ async fn dc_hash_mismatch_rejects_and_cleans_part() {
 async fn dc_size_mismatch_without_integrity_rejects_and_cleans_part() {
     let tmp = tempfile::tempdir().unwrap();
     let dest = local_storage(tmp.path()).await;
-    let entry = make_nas_entry("truncated.bin", false, false, 4096, 0o644);
+    let entry = make_nas_entry("truncated.bin", 4096, 0o644);
     let acks = run_dc(
         dest,
         session_cfg(false),
@@ -260,7 +232,7 @@ async fn dc_size_mismatch_without_integrity_rejects_and_cleans_part() {
 
     assert!(acks.iter().any(|ack| matches!(
         ack,
-        DcAck::FileOutcome {
+        DcAck {
             ndx: 3,
             outcome: FileOutcome::SizeMismatch
         }
@@ -295,40 +267,12 @@ async fn dc_zero_byte_file() {
     .await;
     assert!(acks.iter().any(|a| matches!(
         a,
-        DcAck::FileOutcome {
+        DcAck {
             ndx: 0,
             outcome: FileOutcome::Success
         }
     )));
     assert_eq!(std::fs::metadata(tmp.path().join("empty.bin")).unwrap().len(), 0);
-}
-
-#[tokio::test]
-async fn dc_creates_symlink() {
-    let tmp = tempfile::tempdir().unwrap();
-    let dest = local_storage(tmp.path()).await;
-    let link = make_nas_entry("link.txt", false, true, 0, 0o777);
-    let acks = run_dc(
-        dest,
-        session_cfg(false),
-        vec![DiskCommitMsg::CreateSymlink {
-            entry: link,
-            target: PathBuf::from("target.txt"),
-        }],
-    )
-    .await;
-    assert!(
-        acks.iter()
-            .any(|a| matches!(a, DcAck::Entry(ReceiverMsg::EntrySuccess { .. })))
-    );
-    let lm = std::fs::symlink_metadata(tmp.path().join("link.txt")).unwrap();
-    assert!(lm.file_type().is_symlink());
-    let owner = std::fs::metadata(tmp.path()).unwrap();
-    assert_eq!((lm.uid(), lm.gid()), (owner.uid(), owner.gid()));
-    assert_eq!(
-        std::fs::read_link(tmp.path().join("link.txt")).unwrap(),
-        PathBuf::from("target.txt")
-    );
 }
 
 // 钉死回归：裸 FileCommit（无前置 FileBegin）不产生任何 ack，也不 panic。
@@ -437,7 +381,7 @@ async fn dc_channel_close_settles_and_cleans_active_file() {
 async fn dc_progress_counts_only_successful_commit() {
     let success_tmp = tempfile::tempdir().unwrap();
     let success_dest = local_storage(success_tmp.path()).await;
-    let success_entry = make_nas_entry("success.bin", false, false, 4, 0o644);
+    let success_entry = make_nas_entry("success.bin", 4, 0o644);
     let (_acks, success_progress) = run_dc_inner(
         success_dest,
         session_cfg(false),
@@ -467,7 +411,7 @@ async fn dc_progress_counts_only_successful_commit() {
 
     let failed_tmp = tempfile::tempdir().unwrap();
     let failed_dest = local_storage(failed_tmp.path()).await;
-    let failed_entry = make_nas_entry("failed.bin", false, false, 8, 0o644);
+    let failed_entry = make_nas_entry("failed.bin", 8, 0o644);
     let (_acks, failed_progress) = run_dc_inner(
         failed_dest,
         session_cfg(false),
@@ -534,7 +478,7 @@ async fn dc_second_begin_does_not_replace_active_file() {
 
     assert!(acks.iter().any(|ack| matches!(
         ack,
-        DcAck::FileOutcome {
+        DcAck {
             ndx: 1,
             outcome: FileOutcome::Success
         }
@@ -587,8 +531,8 @@ async fn dc_delta_commit_does_not_commit_full_active_file() {
 async fn dc_delta_token_for_another_entry_does_not_mutate_active_file() {
     let tmp = tempfile::tempdir().unwrap();
     let dest = local_storage(tmp.path()).await;
-    let active = make_nas_entry("active.bin", false, false, 5, 0o644);
-    let other = make_nas_entry("other.bin", false, false, 5, 0o644);
+    let active = make_nas_entry("active.bin", 5, 0o644);
+    let other = make_nas_entry("other.bin", 5, 0o644);
 
     let acks = run_dc(
         dest,
@@ -614,7 +558,7 @@ async fn dc_delta_token_for_another_entry_does_not_mutate_active_file() {
 
     assert!(acks.iter().any(|ack| matches!(
         ack,
-        DcAck::FileOutcome {
+        DcAck {
             ndx: 7,
             outcome: FileOutcome::SizeMismatch
         }
@@ -627,8 +571,8 @@ async fn dc_delta_token_for_another_entry_does_not_mutate_active_file() {
 async fn dc_mode_mismatched_data_does_not_mutate_active_file() {
     let tmp = tempfile::tempdir().unwrap();
     let dest = local_storage(tmp.path()).await;
-    let full = make_nas_entry("full.bin", false, false, 4, 0o644);
-    let delta = make_nas_entry("delta.bin", false, false, 5, 0o644);
+    let full = make_nas_entry("full.bin", 4, 0o644);
+    let delta = make_nas_entry("delta.bin", 5, 0o644);
 
     let (acks, progress) = run_dc_inner(
         dest,
@@ -684,7 +628,7 @@ async fn dc_mode_mismatched_data_does_not_mutate_active_file() {
         acks.iter()
             .filter(|ack| matches!(
                 ack,
-                DcAck::FileOutcome {
+                DcAck {
                     outcome: FileOutcome::Success,
                     ..
                 }
@@ -707,7 +651,7 @@ async fn dc_mode_mismatched_data_does_not_mutate_active_file() {
 async fn dc_abort_during_delta_cleans_part_without_outcome() {
     let tmp = tempfile::tempdir().unwrap();
     let dest = local_storage(tmp.path()).await;
-    let entry = make_nas_entry("delta-abort.bin", false, false, 5, 0o644);
+    let entry = make_nas_entry("delta-abort.bin", 5, 0o644);
     let acks = run_dc(
         dest,
         session_cfg(false),
@@ -734,7 +678,7 @@ async fn dc_abort_during_delta_cleans_part_without_outcome() {
 async fn dc_commands_without_begin_and_duplicate_commit_do_not_duplicate_outcomes() {
     let tmp = tempfile::tempdir().unwrap();
     let dest = local_storage(tmp.path()).await;
-    let entry = make_nas_entry("once.bin", false, false, 4, 0o644);
+    let entry = make_nas_entry("once.bin", 4, 0o644);
     let acks = run_dc(
         dest,
         session_cfg(false),
@@ -779,7 +723,7 @@ async fn dc_commands_without_begin_and_duplicate_commit_do_not_duplicate_outcome
     assert_eq!(acks.len(), 1);
     assert!(matches!(
         &acks[0],
-        DcAck::FileOutcome {
+        DcAck {
             ndx: 4,
             outcome: FileOutcome::Success
         }
@@ -790,7 +734,7 @@ async fn dc_commands_without_begin_and_duplicate_commit_do_not_duplicate_outcome
 async fn dc_failed_begin_then_commit_reports_one_outcome() {
     let tmp = tempfile::tempdir().unwrap();
     let dest = local_storage(tmp.path()).await;
-    let entry = make_nas_entry("../escape.bin", false, false, 4, 0o644);
+    let entry = make_nas_entry("../escape.bin", 4, 0o644);
     let acks = run_dc(
         dest,
         session_cfg(false),
@@ -811,7 +755,7 @@ async fn dc_failed_begin_then_commit_reports_one_outcome() {
     assert_eq!(acks.len(), 1);
     assert!(matches!(
         &acks[0],
-        DcAck::FileOutcome {
+        DcAck {
             ndx: 9,
             outcome: FileOutcome::HardError(_)
         }
@@ -838,7 +782,7 @@ async fn dc_delta_reconstructs_from_basis_and_literal_tokens() {
         std::fs::hard_link(tmp.path().join("basis.bin"), tmp.path().join("old-basis.bin")).unwrap();
 
         let new_content = b"AAAAAXXXXXCCCCCDDDDD"; // block0 命中 + 字面量替换 block1 + block2/3 命中
-        let entry = make_nas_entry("basis.bin", false, false, new_content.len() as u64, 0o644);
+        let entry = make_nas_entry("basis.bin", new_content.len() as u64, 0o644);
         let source_hash = blake3::hash(new_content).to_hex().to_string();
 
         let msgs = vec![
@@ -875,7 +819,7 @@ async fn dc_delta_reconstructs_from_basis_and_literal_tokens() {
         let acks = run_dc(dest, session, msgs).await;
         assert!(acks.iter().any(|a| matches!(
             a,
-            DcAck::FileOutcome {
+            DcAck {
                 ndx: 0,
                 outcome: FileOutcome::Success
             }
@@ -900,7 +844,7 @@ async fn dc_delta_zero_tokens_produces_empty_file() {
     let tmp = tempfile::tempdir().unwrap();
     let dest = local_storage(tmp.path()).await;
     std::fs::write(tmp.path().join("shrink.bin"), b"old content here").unwrap();
-    let entry = make_nas_entry("shrink.bin", false, false, 0, 0o644);
+    let entry = make_nas_entry("shrink.bin", 0, 0o644);
 
     let acks = run_dc(
         dest,
@@ -922,7 +866,7 @@ async fn dc_delta_zero_tokens_produces_empty_file() {
 
     assert!(acks.iter().any(|a| matches!(
         a,
-        DcAck::FileOutcome {
+        DcAck {
             ndx: 0,
             outcome: FileOutcome::Success
         }
@@ -938,7 +882,7 @@ async fn dc_delta_basis_read_failure_reports_hard_error_and_cleans_part() {
     let dest = local_storage(tmp.path()).await;
     // 故意不落盘 "missing.bin"：resume_prepare(resume=false) 不依赖目标文件预先存在，
     // 但 DeltaMatch 触发的 basis 区间读会因文件不存在而失败。
-    let entry = make_nas_entry("missing.bin", false, false, 10, 0o644);
+    let entry = make_nas_entry("missing.bin", 10, 0o644);
 
     let acks = run_dc(
         dest,
@@ -969,7 +913,7 @@ async fn dc_delta_basis_read_failure_reports_hard_error_and_cleans_part() {
     assert!(
         acks.iter().any(|a| matches!(
             a,
-            DcAck::FileOutcome {
+            DcAck {
                 ndx: 0,
                 outcome: FileOutcome::HardError(_)
             }
@@ -986,7 +930,7 @@ async fn dc_direct_abort_cancels_one_file_and_allows_the_next_commit() {
     let tmp = tempfile::tempdir().unwrap();
     std::fs::write(tmp.path().join("file"), b"AAAABBBB").unwrap();
     let dest = local_storage(tmp.path()).await;
-    let entry = make_nas_entry("file", false, false, 8, 0o644);
+    let entry = make_nas_entry("file", 8, 0o644);
     let mut session = session_cfg(true);
     session.transfer_mode = TransferMode::Direct;
     let messages = vec![
@@ -1028,7 +972,7 @@ async fn dc_direct_abort_cancels_one_file_and_allows_the_next_commit() {
     assert_eq!(acks.len(), 1);
     assert!(matches!(
         &acks[0],
-        DcAck::FileOutcome {
+        DcAck {
             ndx: 1,
             outcome: FileOutcome::Success
         }

@@ -42,8 +42,6 @@ use tokio::sync::Mutex as AsyncMutex;
 use tracing::{info, warn};
 use transport::error::TransportError;
 #[cfg(test)]
-use transport::message::DestIndex;
-#[cfg(test)]
 use transport::message::TransferDecision;
 use transport::message::{HandshakeResult, ProtocolHandshake, ReceiverMsg, SenderMsg, SessionConfig};
 use transport::traits::SenderTransport;
@@ -56,7 +54,7 @@ use crate::consumer::stats::{IncrementalStats, ProgressBar, StatisticConsumer, S
 use crate::error::{AppError, Result};
 use crate::orchestrator::create_qos_manager;
 #[cfg(test)]
-use crate::remote_receiver_session::RemoteSessionState;
+use crate::remote_receiver_session::{DestIndex, RemoteSessionState};
 use crate::sync::parse_size;
 
 /// 双进程全量同步 — Sender 侧入口

@@ -1,5 +1,5 @@
 //! wire 只编码原生 opaque snapshot；后端身份随上下文传递以核验解码结果。
-use data_mover::model::{BackendIdentity, BackendKind, ObservedEntry};
+use data_mover_model::{BackendIdentity, BackendKind, ObservedEntry};
 use serde::{
     Deserialize, Deserializer, Serialize, Serializer, de::Error as DeError, ser::Error as SerError, ser::SerializeSeq,
 };

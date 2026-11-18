@@ -30,14 +30,15 @@ use tokio_util::sync::CancellationToken;
 use tracing::{Instrument, debug, error, info, info_span, trace, warn};
 use transport::error::TransportError;
 use transport::message::{
-    DcAck, DestIndex, DiskCommitMsg, FeatureFlags, HandshakeResult, ProgressSnapshot, ProtocolHandshake, ReceiverMsg,
-    SenderMsg, SessionConfig, TransferDecision,
+    FeatureFlags, HandshakeResult, ProgressSnapshot, ProtocolHandshake, ReceiverMsg, SenderMsg, SessionConfig,
+    TransferDecision,
 };
 use transport::traits::ReceiverTransport;
 
 // 内部模块
+use crate::disk_commit::{DcAck, DiskCommitMsg, disk_commit_task};
 use crate::error::{AppError, CopyStep, Result};
-use crate::remote_receiver_session::{RemoteReceiverSession, RemoteSessionState};
+use crate::remote_receiver_session::{DestIndex, RemoteReceiverSession, RemoteSessionState};
 use crate::sync::{CommitRecorder, ResumeOpts, copy_file_with_resume, parse_size, should_resume};
 
 mod in_process;
@@ -574,7 +575,7 @@ pub(crate) async fn recv_file_list_and_data_phase(
     let (ack_tx, mut ack_rx) = tokio::sync::mpsc::unbounded_channel::<DcAck>();
     let disk_cancel = CancellationToken::new();
     let _cancel_on_drop = disk_cancel.clone().drop_guard();
-    let dc_join = tokio::spawn(crate::disk_commit::disk_commit_task(
+    let dc_join = tokio::spawn(disk_commit_task(
         dest_storage.clone(),
         session_config.clone(),
         dc_rx,
@@ -591,21 +592,10 @@ pub(crate) async fn recv_file_list_and_data_phase(
             Some(snapshot) = progress_rx.recv() => {
                 let _ = transport.send(ReceiverMsg::Progress(snapshot)).await;
             }
-            // ── disk-commit task 回流的 ack（目录/符号链接直接透传；全量文件 outcome
-            //    交 session outcome policy 做统一 redo 决策）──
-            Some(dc_ack) = ack_rx.recv() => {
-                match dc_ack {
-                    DcAck::Entry(ack) => {
-                        if state.handle_entry_outcome(transport, ack).await {
-                            info!("[Receiver Remote] All transfers complete");
-                            break;
-                        }
-                    }
-                    DcAck::FileOutcome { ndx, outcome } => {
-                        if state.handle_file_outcome(transport, progress, ndx, outcome).await {
-                            break;
-                        }
-                    }
+            // 落盘结果由会话统一决定确认、重试或失败。
+            Some(DcAck { ndx, outcome }) = ack_rx.recv() => {
+                if state.handle_file_outcome(transport, progress, ndx, outcome).await {
+                    break;
                 }
             }
             msg = transport.recv() => {
