@@ -749,6 +749,9 @@ def run_request_policy(environment):
     callback.daemon_threads = True
     threading.Thread(target=callback.serve_forever, daemon=True).start()
     environment["LAB_REQUEST_POLICY_CALLBACK_URL"] = f"http://127.0.0.1:{callback.server_port}/progress"
+    # Debug 模式的多轮迁移用例会叠加多个大型 future，给测试线程预留独立栈空间。
+    environment = dict(environment)
+    environment.setdefault("RUST_MIN_STACK", str(8 * 1024 * 1024))
     try:
         subprocess.run([
             "cargo", "test", "--offline", "--locked", "-p", "app", "--features", "remote", "--lib",
