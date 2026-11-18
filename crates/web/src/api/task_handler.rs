@@ -1,7 +1,6 @@
 use std::net::SocketAddr;
 
-use app::consumer::ProgressReport;
-use app::consumer::stats::ProgressDetail;
+use app::report::{ProgressDetail, ProgressReport};
 use axum::Json;
 use axum::extract::ConnectInfo;
 use axum::extract::rejection::JsonRejection;

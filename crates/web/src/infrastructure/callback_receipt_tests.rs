@@ -3,13 +3,14 @@
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use app::consumer::stats::diagnostics::{CallbackAck, CallbackIdentity, DiagnosticBatch, DiagnosticOutbox};
+use app::consumer::stats::diagnostics::DiagnosticOutbox;
 use axum::Router;
 use axum::http::StatusCode;
 use axum::routing::post;
 use chrono::Utc;
 use sqlx::SqlitePool;
 use sqlx::sqlite::SqlitePoolOptions;
+use task_model::diagnostics::{CallbackAck, CallbackIdentity, DiagnosticBatch};
 use tokio::net::TcpListener;
 use tokio_util::task::AbortOnDropHandle;
 

@@ -32,9 +32,7 @@ use super::stats::recovery_progress::RecoveryProgress;
 use crate::broadcast::BroadcastForwarder;
 use crate::config::{ConsumerConfig, JobType};
 use crate::consumer::DatabaseConsumer;
-#[cfg(test)]
-use crate::consumer::stats::ProgressReport;
-use crate::consumer::stats::{FileSizeRange, ProgressDetail, TimeRange};
+use crate::consumer::stats::{FileSizeRange, TimeRange};
 use crate::consumer::stats::{
     FullStats, IncrementalStats, ProgressBar, StatisticConsumer, StatsKind, consumer::CallbackGuard,
 };
@@ -42,6 +40,9 @@ use crate::consumer::stats::{callback_state::CallbackState, journal};
 use crate::consumer::traits::Consumer;
 use crate::copy_execution::CopyDatabaseExecution;
 use crate::error::{AppError, Result};
+use crate::report::ProgressDetail;
+#[cfg(test)]
+use crate::report::ProgressReport;
 use crate::scan::statistics::{ScanCapabilities, ScanCounts, ScanSnapshot};
 use data_mover::traversal::TraversalRecoveryStatus;
 use db::scan::ScanFinalEvent;

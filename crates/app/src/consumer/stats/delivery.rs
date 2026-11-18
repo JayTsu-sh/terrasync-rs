@@ -5,6 +5,7 @@ use db::scan::with_scan_cancellation;
 use db::{ClickHouseDatabase, DatabaseError, NotificationKind, NotificationRecord};
 use reqwest::{Client, StatusCode};
 use serde::{Deserialize, Serialize};
+use task_model::diagnostics::{CallbackIdentity, DiagnosticBatch};
 use thiserror::Error;
 use tokio::{
     sync::Mutex,
@@ -13,11 +14,7 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 use tracing::warn;
 
-use super::{
-    consumer::StatisticConsumer,
-    diagnostics::{CallbackIdentity, DiagnosticBatch},
-    journal,
-};
+use super::{consumer::StatisticConsumer, journal};
 use crate::callback::CallbackEndpoint;
 use crate::error::Result;
 

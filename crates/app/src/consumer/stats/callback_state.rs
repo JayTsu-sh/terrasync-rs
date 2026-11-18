@@ -1,14 +1,15 @@
 //! 回调状态独立于可回退的扫描游标；ACK 只清明细，不清累计错误或恢复状态。
 use super::journal::{self, DiagnosticJournal};
-use super::report::ProgressReport;
 use super::{
     accumulator::{ErrorStats, StatsKind},
-    diagnostics::{CallbackIdentity, DiagnosticOutbox, MAX_DIAGNOSTIC_BATCH_EVENTS},
+    diagnostics::DiagnosticOutbox,
 };
 use crate::error::{AppError, Result};
+use crate::report::{ProgressReport, ScanRuntimePhase, ScanRuntimeState};
 use db::{ClickHouseDatabase, NotificationRecord};
 use serde::{Deserialize, Serialize};
 use std::time::{SystemTime, UNIX_EPOCH};
+use task_model::diagnostics::{CallbackIdentity, MAX_DIAGNOSTIC_BATCH_EVENTS};
 use uuid::Uuid;
 
 #[derive(Deserialize, Serialize)]
@@ -24,24 +25,6 @@ pub(crate) struct StatisticsCheckpoint {
 pub(crate) enum SavedStatistics {
     Current(StatisticsCheckpoint),
     Previous((StatsKind, ProgressReport)),
-}
-
-#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ScanRuntimePhase {
-    #[default]
-    Running,
-    Recovering,
-    Failed,
-}
-
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
-pub struct ScanRuntimeState {
-    pub state: ScanRuntimePhase,
-    pub network_faults: u64,
-    pub recovery_attempts: u64,
-    pub successful_recoveries: u64,
-    pub current_error: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]

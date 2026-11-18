@@ -1,7 +1,9 @@
 //! watch 只通知当前状态；累计数字直接读取恢复生产方，结束前再采样一次。
-use super::{callback_state::ScanRuntimePhase, consumer::StatisticConsumer, diagnostics::safe_diagnostic_text};
+use super::consumer::StatisticConsumer;
+use crate::report::ScanRuntimePhase;
 use data_mover::traversal::{TraversalRecoveryCounters, TraversalRecoveryState, TraversalRecoveryStatus};
 use std::sync::Arc;
+use task_model::diagnostics::safe_diagnostic_text;
 use tokio::sync::Mutex;
 use tokio_util::task::AbortOnDropHandle;
 use tracing::warn;

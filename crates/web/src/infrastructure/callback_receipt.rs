@@ -2,10 +2,10 @@
 
 use std::{cmp::Ordering, collections::BTreeMap};
 
-use app::consumer::stats::diagnostics::{
+use sqlx::{QueryBuilder, Sqlite, Transaction};
+use task_model::diagnostics::{
     CallbackAck, CallbackIdentity, DiagnosticBatch, DiagnosticEvent, MAX_DIAGNOSTIC_BATCH_EVENTS,
 };
-use sqlx::{QueryBuilder, Sqlite, Transaction};
 
 use crate::domain::progress::{ProgressReceipt, ProgressSubmission};
 use crate::error::{Result, WebError};

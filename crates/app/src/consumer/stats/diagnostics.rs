@@ -3,52 +3,11 @@
 use std::collections::VecDeque;
 
 use serde::{Deserialize, Serialize};
-use task_model::{RetentionScope, TargetRetention};
+use task_model::TargetRetention;
+use task_model::diagnostics::{
+    DiagnosticBatch, DiagnosticEvent, MAX_DIAGNOSTIC_BATCH_EVENTS, safe_diagnostic_label, safe_diagnostic_text,
+};
 
-/// 单个回调的轮次、执行尝试和递增序号；时间相同而身份不同视为冲突。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CallbackIdentity {
-    pub round_id: String,
-    pub attempt_id: String,
-    pub round_started_at_millis: u64,
-    pub attempt_started_at_millis: u64,
-    pub sequence: u64,
-}
-
-/// 可独立去重的诊断事件；不参与错误累计数字的扣减。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct DiagnosticEvent {
-    pub sequence: u64,
-    pub event_id: String,
-    pub round_id: String,
-    pub attempt_id: String,
-    pub origin: String,
-    pub code: String,
-    pub message: String,
-    pub path: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub retention: Option<Box<TargetRetention>>,
-}
-
-/// ACK 前保持不变的明细批次；省略数也只能随对应批次确认。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct DiagnosticBatch {
-    pub batch_id: String,
-    pub events: Vec<DiagnosticEvent>,
-    pub omitted_count: u64,
-}
-
-/// 内部 Web 接口可返回的批次信息；发送端只依据 HTTP 2xx，不要求此响应体。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CallbackAck {
-    pub batch_id: Option<String>,
-}
-
-/// 单事件消息和路径的 UTF-8 字节上限。
-pub const MAX_DIAGNOSTIC_TEXT_BYTES: usize = 2048;
-const MAX_DIAGNOSTIC_LABEL_BYTES: usize = 128;
-/// 单批明细最大数量，同时也是接收端校验上限。
-pub const MAX_DIAGNOSTIC_BATCH_EVENTS: usize = 64;
 /// 发件箱硬上限，防止错误风暴导致无界内存增长。
 pub const MAX_DIAGNOSTIC_QUEUE_EVENTS: usize = 512;
 
@@ -102,7 +61,7 @@ impl DiagnosticOutbox {
                 .iter()
                 .all(|event| event.round_id == self.round_id && !event.attempt_id.is_empty() && event.is_bounded())
             && self.in_flight.as_ref().is_none_or(|batch| {
-                is_digest(&batch.batch_id)
+                batch.has_digest_id()
                     && batch.events.len() <= self.batch_size
                     && batch.omitted_count <= self.omitted_count
                     && self.pending.iter().take(batch.events.len()).eq(batch.events.iter())
@@ -228,100 +187,41 @@ impl DiagnosticOutbox {
     }
 }
 
-impl DiagnosticEvent {
-    /// 接收端可再次调用，避免未经脱敏的外部回调直接落库。
-    pub fn sanitize(&mut self) {
-        self.origin = safe_diagnostic_label(&self.origin);
-        self.code = safe_diagnostic_label(&self.code);
-        self.message = safe_diagnostic_text(&self.message);
-        self.path = self.path.as_deref().map(safe_diagnostic_text);
-        if let Some(retention) = &mut self.retention {
-            retention.source_path = retention.source_path.as_deref().map(safe_diagnostic_text);
-            retention.target_path = retention.target_path.as_deref().map(safe_diagnostic_text);
-        }
-    }
-
-    pub(crate) fn is_bounded(&self) -> bool {
-        self.sequence > 0
-            && is_digest(&self.event_id)
-            && [&self.origin, &self.code]
-                .into_iter()
-                .all(|text| text.len() <= MAX_DIAGNOSTIC_LABEL_BYTES)
-            && self.message.len() <= MAX_DIAGNOSTIC_TEXT_BYTES
-            && self
-                .path
-                .as_ref()
-                .is_none_or(|text| text.len() <= MAX_DIAGNOSTIC_TEXT_BYTES)
-            && self.retention.as_ref().is_none_or(|retention| {
-                (retention.scope != RetentionScope::Entry
-                    || (retention.source_path.is_some() && retention.target_path.is_some()))
-                    && [&retention.source_path, &retention.target_path]
-                        .into_iter()
-                        .all(|path| path.as_ref().is_none_or(|path| path.len() <= MAX_DIAGNOSTIC_TEXT_BYTES))
-            })
-    }
-}
-
-fn is_digest(value: &str) -> bool {
-    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
-}
-
-/// 将内联 URL 整体隐藏，并隐藏常见凭据键值；限制 UTF-8 字节长度。
-pub fn safe_diagnostic_text(text: &str) -> String {
-    let mut result = String::new();
-    for token in text_prefix(text, MAX_DIAGNOSTIC_TEXT_BYTES).split_whitespace() {
-        if !result.is_empty() {
-            result.push(' ');
-        }
-        let lower = token.to_ascii_lowercase();
-        let secret_key = [
-            "password",
-            "passwd",
-            "secret",
-            "token",
-            "credential",
-            "authorization",
-            "access_key",
-            "secret_key",
-        ]
-        .into_iter()
-        .any(|key| lower.contains(key));
-        if token.contains("://") || secret_key {
-            result.push_str("[redacted]");
-        } else {
-            result.extend(
-                token
-                    .chars()
-                    .map(|character| if character.is_control() { '\u{fffd}' } else { character }),
-            );
-        }
-        // 凭据可能是独立值、带空格赋值或多词授权头，保守隐藏后续文本。
-        if secret_key {
-            break;
-        }
-        if result.len() > MAX_DIAGNOSTIC_TEXT_BYTES {
-            break;
-        }
-    }
-    text_prefix(&result, MAX_DIAGNOSTIC_TEXT_BYTES).to_string()
-}
-
-fn safe_diagnostic_label(text: &str) -> String {
-    text_prefix(&safe_diagnostic_text(text), MAX_DIAGNOSTIC_LABEL_BYTES).to_string()
-}
-
-fn text_prefix(text: &str, limit: usize) -> &str {
-    let mut end = text.len().min(limit);
-    while !text.is_char_boundary(end) {
-        end -= 1;
-    }
-    &text[..end]
-}
-
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+    use task_model::{RetentionScope, SourcePresence, TargetRetentionReason};
+
+    #[test]
+    fn diagnostic_batch_preserves_callback_json_and_durable_ids() {
+        let mut outbox = DiagnosticOutbox::new("round".into(), "attempt".into(), 4, 2);
+        assert!(outbox.enqueue("scan", "failure", "failed s3://private.example/bucket", None));
+        assert!(outbox.enqueue_retention(
+            &TargetRetention {
+                source_path: Some("source/data".into()),
+                target_path: Some("s3://private.example/target".into()),
+                scope: RetentionScope::Entry,
+                source_presence: SourcePresence::Unknown,
+                reason: TargetRetentionReason::SourceDeletionUnconfirmed,
+            },
+            "preserved",
+        ));
+        let batch = outbox.prepare_batch().unwrap();
+        let expected = concat!(
+            r#"{"batch_id":"f523c7b0c15955f7f2b6096403bd100fffe523c70815f0ef815728394d11e8bb","events":["#,
+            r#"{"sequence":1,"event_id":"68eb21f79c026fcd0c25133c7958e4debcacd884ba8460d99dfa382f8375b8c1","#,
+            r#""round_id":"round","attempt_id":"attempt","origin":"scan","code":"failure","#,
+            r#""message":"failed [redacted]","path":null},"#,
+            r#"{"sequence":2,"event_id":"46798af2f361f19ffc67e61cd1be7b2b781eaa21034abc1840c3f60922520200","#,
+            r#""round_id":"round","attempt_id":"attempt","origin":"target","code":"target_preserved","#,
+            r#""message":"preserved","path":"source/data","retention":{"source_path":"source/data","#,
+            r#""target_path":"[redacted]","scope":"entry","source_presence":"unknown","#,
+            r#""reason":"source_deletion_unconfirmed"}}],"omitted_count":0}"#,
+        );
+        assert_eq!(serde_json::to_string(&batch).unwrap(), expected);
+        assert_eq!(serde_json::from_str::<DiagnosticBatch>(expected).unwrap(), batch);
+    }
 
     #[test]
     fn retries_keep_batch_and_ack_preserves_concurrent_events() {
@@ -383,17 +283,6 @@ mod tests {
         let next = outbox.prepare_batch().unwrap();
         assert_eq!(next.events[0].attempt_id, "second");
         assert_ne!(next.events[0].event_id, batch.events[0].event_id);
-    }
-
-    #[test]
-    fn diagnostic_text_is_bounded_and_redacts_inline_urls_and_credentials() {
-        let text = safe_diagnostic_text("failed (s3://alice:secret@host/path?token=value), password=hunter token abc");
-        for secret in ["alice", "hunter", "abc", "value"] {
-            assert!(!text.contains(secret));
-        }
-        assert!(safe_diagnostic_text(&"界".repeat(2000)).len() <= MAX_DIAGNOSTIC_TEXT_BYTES);
-        assert!(!safe_diagnostic_text("error password = hunter").contains("hunter"));
-        assert!(!safe_diagnostic_text("Authorization: Bearer abcdef").contains("abcdef"));
     }
 
     #[test]

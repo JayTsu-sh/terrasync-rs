@@ -1,13 +1,14 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 use super::super::callback_state::CallbackState;
 use super::super::callback_state::errors;
-use super::super::diagnostics::CallbackAck;
-use super::super::{FullStats, ProgressBar, StatsKind, diagnostics::DiagnosticBatch, report::ProgressReport};
+use super::super::{FullStats, ProgressBar, StatsKind};
 use super::*;
 use crate::config::JobType;
+use crate::report::ProgressReport;
 use clickhouse::Client as DatabaseClient;
 use db::ClickHouseConfig;
 use std::{env, thread};
+use task_model::diagnostics::{CallbackAck, DiagnosticBatch};
 use task_model::{ErrorEvent, StorageEntryMessage};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},

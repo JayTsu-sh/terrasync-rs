@@ -1,5 +1,5 @@
 use super::storage_failure::StorageFailureDetail;
-use app::consumer::stats::report::{ScanRuntimeState, ScanSnapshot};
+use app::report::{ScanRuntimeState, ScanSnapshot};
 use serde::{Deserialize, Serialize};
 
 use super::task::TaskStatus;

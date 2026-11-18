@@ -40,7 +40,9 @@ use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken}
 // 内部模块
 use crate::broadcast::BroadcastForwarder;
 use crate::byte_resume::ByteResumeStore;
+use crate::config::SyncJobConfig;
 use crate::error::{AppError, Result, StorageError};
+use crate::orchestrator::SyncOrchestrator;
 use crate::storage_factory::{StorageRole, create_storage_for_role};
 
 /// 存储资源管理器 - 统一管理源和目标存储实例
@@ -150,58 +152,14 @@ pub(crate) fn parse_size(size: &str) -> Result<usize> {
     ))
 }
 
-/// 执行文件复制操作
-///
-/// 该函数是文件复制功能的主入口，负责：
-/// 1. 初始化应用配置和扫描配置
-/// 2. 初始化消费者配置和管理器
-/// 3. 创建通信通道
-/// 4. 启动目录扫描
-/// 5. 处理扫描结果并执行复制
-/// 6. 管理重试机制
-/// 7. 验证文件一致性
-///
-/// # 参数
-/// - `config`: 同步任务的完整配置，详见 [`SyncJobConfig`](crate::config::SyncJobConfig)
-///
-/// # 返回值
-/// - 成功时返回`Ok(())`
-/// - 失败时返回包含错误信息的`Err`
+/// 执行本地迁移，按本次请求和已有代次选择全量或增量。
 #[instrument(skip_all, fields(
     job_id = %config.job_id,
     src = %redact_storage_url(&config.src_path),
     dest = %redact_storage_url(&config.dest_path),
 ))]
-pub async fn sync(config: crate::config::SyncJobConfig) -> Result<()> {
-    crate::orchestrator::SyncOrchestrator::new_local(config).run().await
-}
-
-/// 执行增量文件复制操作
-///
-/// 该函数执行增量复制操作，基于数据库中记录的上次扫描结果，只复制变更的文件。
-/// 主要流程包括：
-/// 1. 加载应用配置
-/// 2. 初始化扫描配置
-/// 3. 初始化消费者配置和管理器
-/// 4. 创建通信通道
-/// 5. 启动目录扫描（只扫描变更文件）
-/// 6. 处理扫描结果并执行复制
-/// 7. 管理重试机制
-/// 8. 验证文件一致性
-///
-/// # 参数
-/// - `config`: 同步任务的完整配置，详见 [`SyncJobConfig`](crate::config::SyncJobConfig)
-///
-/// # 返回值
-/// - 成功时返回`Ok(())`
-/// - 失败时返回包含错误信息的`Err`
-#[instrument(skip_all, fields(
-    job_id = %config.job_id,
-    src = %redact_storage_url(&config.src_path),
-    dest = %redact_storage_url(&config.dest_path),
-))]
-pub async fn incremental_sync(config: crate::config::SyncJobConfig) -> Result<()> {
-    crate::orchestrator::SyncOrchestrator::new_local(config).run().await
+pub async fn sync(config: SyncJobConfig) -> Result<()> {
+    SyncOrchestrator::new_local(config).run().await
 }
 
 #[cfg(windows)]

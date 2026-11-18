@@ -1,9 +1,8 @@
 use std::sync::Arc;
 
-use app::consumer::ProgressReport;
-use app::consumer::stats::ProgressDetail;
-use app::consumer::stats::diagnostics::{CallbackAck, safe_diagnostic_text};
+use app::report::{ProgressDetail, ProgressReport};
 use serde::Deserialize;
+use task_model::diagnostics::{CallbackAck, safe_diagnostic_text};
 use tracing::info;
 
 use crate::domain::execution::{ExecutionStats, LogLevel, TaskExecution, TaskLog};

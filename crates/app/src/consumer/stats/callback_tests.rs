@@ -1,6 +1,5 @@
 //! 真实 HTTP 失败重试时批次不变，ACK 不清并发新事件和累计数字。
 #![allow(clippy::unwrap_used)]
-use super::super::diagnostics::CallbackAck;
 use super::*;
 use crate::{
     config::JobType,
@@ -9,6 +8,7 @@ use crate::{
 use std::fmt;
 use std::sync::Mutex as StdMutex;
 use task_model::ErrorEvent;
+use task_model::diagnostics::CallbackAck;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpListener,

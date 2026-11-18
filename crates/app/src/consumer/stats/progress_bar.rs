@@ -14,9 +14,9 @@ use task_model::{EntryChange, StorageEntryMessage};
 use tracing::info;
 
 use super::accumulator::{IncrementalStats, fmt_elapsed, format_bytes};
-use super::report::{ProgressDetail, ProgressReport};
 use crate::config::JobType;
 use crate::error::{AppError, Result};
+use crate::report::{ProgressDetail, ProgressReport};
 use crate::scan::statistics::ScanSnapshot;
 
 /// 进度条 display 线程刷新间隔（秒）

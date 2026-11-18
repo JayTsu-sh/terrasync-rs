@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use app::consumer::stats::report::ProgressReport;
+use app::report::ProgressReport;
 
 use crate::domain::analysis::{AnalysisRepository, AnalysisTreeQuery, StorageAnalysis};
 use crate::domain::endpoint::EndpointConfig;

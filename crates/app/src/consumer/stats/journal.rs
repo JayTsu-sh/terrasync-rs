@@ -4,6 +4,7 @@ use std::{fmt, future::Future, sync::Arc, time::Duration};
 use db::scan::with_scan_cancellation;
 use db::{ClickHouseDatabase, DatabaseError, NotificationCursor, NotificationKind, NotificationRecord};
 use task_model::StorageEntryMessage;
+use task_model::diagnostics::{DiagnosticBatch, DiagnosticEvent, MAX_DIAGNOSTIC_BATCH_EVENTS};
 use tokio::{
     sync::Mutex,
     time::{Instant, sleep, timeout},
@@ -11,10 +12,7 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 use tracing::warn;
 
-use super::{
-    consumer::StatisticConsumer,
-    diagnostics::{DiagnosticBatch, DiagnosticEvent, MAX_DIAGNOSTIC_BATCH_EVENTS},
-};
+use super::consumer::StatisticConsumer;
 use crate::error::{AppError, Result};
 
 type Consumer = Arc<Mutex<StatisticConsumer>>;

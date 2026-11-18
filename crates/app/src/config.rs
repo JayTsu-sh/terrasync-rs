@@ -102,7 +102,7 @@ pub struct ConsumerConfig {
 
 /// Sync/IncrementalSync 的统一任务配置
 ///
-/// 整合 `sync()/incremental_sync()` 的所有参数，供 `SyncOrchestrator` 使用。
+/// 本地与远端迁移任务的执行参数。
 /// `scan_type` 由任务层依据持久化代次策略判定；数据库故障直接上报。
 #[derive(Debug, Clone)]
 #[allow(clippy::struct_excessive_bools)] // 配置结构按用途分组的开关集合，重构为枚举会失去可读性

@@ -26,18 +26,17 @@ use tracing::{error, info, trace, warn};
 
 // 内部模块
 use super::accumulator::StatsKind;
-use super::callback_state::{CallbackState, ScanRuntimePhase, errors};
+use super::callback_state::{CallbackState, errors};
 use super::delivery::{self, DeliveryError, PreparedCallback};
-use super::diagnostics::{MAX_DIAGNOSTIC_BATCH_EVENTS, safe_diagnostic_text};
 use super::journal;
 use super::progress_bar::ProgressBar;
-use super::report::ProgressDetail;
-use super::report::ProgressReport;
 use crate::callback::CallbackEndpoint;
 use crate::config::JobType;
 use crate::error::{AppError, Result};
+use crate::report::{ProgressDetail, ProgressReport, ScanRuntimePhase};
 use crate::scan::statistics::{ScanCounts, ScanSnapshot};
 use db::ClickHouseDatabase;
+use task_model::diagnostics::{MAX_DIAGNOSTIC_BATCH_EVENTS, safe_diagnostic_text};
 
 /// HTTP 进度回调间隔（秒）
 const CALLBACK_INTERVAL_SECS: u64 = 2;

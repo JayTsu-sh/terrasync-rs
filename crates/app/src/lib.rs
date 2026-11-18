@@ -40,6 +40,9 @@ pub mod config;
 /// 负责管理不同类型的消费者，如存储条目消费者和统计消费者
 pub mod consumer;
 
+/// 任务进度、回调与最终结果的公开报告契约。
+pub mod report;
+
 mod copy_completion;
 mod copy_execution;
 mod copy_root;
@@ -51,7 +54,7 @@ mod migration_fixtures;
 mod migration_plan;
 /// Sync 编排器模块
 ///
-/// SyncOrchestrator 封装 sync/incremental_sync 的核心逻辑
+/// SyncOrchestrator 封装全量与增量迁移流程
 pub mod orchestrator;
 mod rename;
 pub mod scan_resume;
@@ -142,7 +145,7 @@ pub mod prelude {
     /// 文件扫描功能
     pub use crate::scan::{ScanRequest, ScanType, scan};
     /// 文件复制功能
-    pub use crate::sync::{incremental_sync, sync};
+    pub use crate::sync::sync;
 }
 
 #[cfg(test)]
