@@ -57,7 +57,7 @@ mod migration_plan;
 /// Sync 编排器模块
 ///
 /// SyncOrchestrator 封装全量与增量迁移流程
-pub mod orchestrator;
+mod orchestrator;
 mod rename;
 pub mod scan_resume;
 mod source_cleanup;
@@ -137,8 +137,6 @@ pub mod prelude {
     pub use crate::error::{AppError, Result};
     /// 完整性检查
     pub use crate::integrity_check::integrity_check;
-    /// Sync 编排器
-    pub use crate::orchestrator::SyncOrchestrator;
     /// 文件删除功能
     pub use crate::rm::rm;
     /// 文件扫描功能
