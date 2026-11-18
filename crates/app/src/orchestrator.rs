@@ -29,8 +29,6 @@ use task_model::{StorageEntryMessage, TargetRetentionReason};
 use tokio::sync::Semaphore;
 use tokio::task::JoinHandle;
 use tracing::{Instrument, error, info, info_span, trace, warn};
-use transport::in_process::create_in_process_pair;
-use transport::traits::SenderTransport;
 use utils::app_config::AppConfig;
 
 // 内部模块
@@ -49,6 +47,7 @@ use crate::integrity_check::verify_storage_time;
 use crate::migration_plan::MigrationPlan;
 use crate::receiver::{LocalCopyExecutor, LocalCopyReceiver, ReceiverConfig};
 use crate::scan::ScanType;
+use crate::sender::copy_queue::{CopyCommandSink, copy_queue};
 use crate::sender::{SenderWorkerConfig, sender_worker};
 use crate::source_cleanup::{self, EarlyCleanup, FullCleanupStage, SourceCleanupCheck, remove_confirmed_sources};
 use crate::storage_factory::{StorageRole, create_storage_for_role};
@@ -490,7 +489,7 @@ impl SyncOrchestrator {
         root_metadata.retain_capture_failure(result)
     }
 
-    /// 全量同步 — 通过 transport 连接 sender workers 和 receiver tasks
+    /// 全量同步 — 由本地有界队列调度 sender 和 receiver workers
     async fn run_sync(
         &self, observation_plan: Option<MigrationPlan>, app_config: &AppConfig, consumer_manager: &mut ConsumerManager,
         database: Option<ClickHouseDatabase>, root_metadata: &CopyRootMetadata,
@@ -634,10 +633,9 @@ impl SyncOrchestrator {
             mount_completed.clone(),
         );
 
-        // ── 8. 创建 Transport ──
-        let (sender_transport, receiver_transport) = create_in_process_pair();
-        let sender_transport: Arc<dyn SenderTransport> = Arc::new(sender_transport);
-        let receiver_transport = Arc::new(receiver_transport);
+        // ── 8. 创建本地工作队列 ──
+        let (command_sender, command_receiver) = copy_queue();
+        let command_sender: Arc<dyn CopyCommandSink> = Arc::new(command_sender);
 
         let receiver_config = Arc::new(ReceiverConfig {
             job_id: c.job_id.clone(),
@@ -663,7 +661,7 @@ impl SyncOrchestrator {
         // ── 9. 启动 N 个 Receiver worker（每个创建自己的 StoragePair，和原始 sync_inner 一致） ──
         let mut receiver_handles = Vec::new();
         for recv_id in 0..copy_concurrency {
-            let rt = receiver_transport.clone();
+            let commands = command_receiver.clone();
             let src_path = c.src_path.clone();
             let dest_path = c.dest_path.clone();
 
@@ -712,7 +710,7 @@ impl SyncOrchestrator {
                     }
 
                     LocalCopyReceiver {
-                        transport: rt,
+                        commands,
                         executor: LocalCopyExecutor {
                             id: recv_id,
                             source: src,
@@ -734,7 +732,7 @@ impl SyncOrchestrator {
         }
 
         // 只有实际 worker 持有接收端；全部挂载失败时生产端能收到关闭错误。
-        drop(receiver_transport);
+        drop(command_receiver);
 
         // ── 10. 启动 N 个 Sender worker（S1） ──
         let sender_config = Arc::new(SenderWorkerConfig {
@@ -755,7 +753,7 @@ impl SyncOrchestrator {
         for (worker_id, wi) in sender_inputs.into_iter().enumerate() {
             let src_path = c.src_path.clone();
             let dest_path = c.dest_path.clone();
-            let transport = sender_transport.clone();
+            let commands = command_sender.clone();
             let bc = broadcaster.clone();
             let cfg = sender_config.clone();
             let copy_cfg = receiver_config.clone();
@@ -798,7 +796,7 @@ impl SyncOrchestrator {
                     let src = storage_pair.get_src_storage().clone();
                     let dest = storage_pair.get_dest_storage().clone();
                     sender_worker(
-                        worker_id, wi, src, dest, transport, &bc, &cfg, qos, bt, &copy_cfg, aec, ec, sc,
+                        worker_id, wi, src, dest, commands, &bc, &cfg, qos, bt, &copy_cfg, aec, ec, sc,
                     )
                     .await
                 })
@@ -827,8 +825,8 @@ impl SyncOrchestrator {
 
         // ── 12. 关闭管线（和原始 sync_inner 一致） ──
         // Sender workers 全部完成 → 不再发 CopyEntry
-        // drop sender_transport → S→R channel 关闭 → 所有 Receiver 的 recv() 返回 None → 退出
-        drop(sender_transport);
+        // 释放最后一个发送端后，Receiver 排空队列并退出
+        drop(command_sender);
 
         // 等所有 Receiver worker 退出（退出时 broadcaster clone 也 drop）
         let receivers_result = finish_phase(receiver_handles).await;

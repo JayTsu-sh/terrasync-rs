@@ -1,6 +1,6 @@
 //! Sender 侧逻辑
 //!
-//! 从 walkdir 接收 entry，通过 transport 发送给 Receiver 执行写入。
+//! 从遍历流接收条目，为本地全量复制 worker 分派工作。
 //! 单进程模式下发送 `CopyEntry` 命令（Receiver 自行读写）。
 //! 双进程模式下发送 `FileData` 数据流（Phase 3）。
 
@@ -17,8 +17,6 @@ use data_mover::qos::QosManager;
 use task_model::StorageEntryMessage;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
-use transport::message::SenderMsg;
-use transport::traits::SenderTransport;
 
 // 内部模块
 use crate::broadcast::BroadcastForwarder;
@@ -34,6 +32,9 @@ use task_model::observation::EntryProgress;
 #[path = "sender_cancellation_tests.rs"]
 mod cancellation_tests;
 
+pub(crate) mod copy_queue;
+use copy_queue::{CopyCommand, CopyCommandSink};
+
 /// Sender worker 配置
 pub struct SenderWorkerConfig {
     pub target_history: Option<bool>,
@@ -45,13 +46,11 @@ pub struct SenderWorkerConfig {
 
 /// 单个 Sender worker task（S1）
 ///
-/// 从共享的 `walkdir_iter` 拉取 entry，通过 transport 发送给 Receiver。
-/// 单进程模式：发送 `CopyEntry` 命令。
-/// 双进程模式：读取源文件数据后发送 `FileData` 流（Phase 3）。
+/// 从共享的遍历流读取条目，把普通条目和打包结果放入本地工作队列。
 #[allow(clippy::too_many_arguments)]
-pub async fn sender_worker(
+pub(crate) async fn sender_worker(
     worker_id: usize, walkdir_iter: AsyncReceiver<StorageEntryMessage>, src_storage: Arc<StorageContext>,
-    dest_storage: Arc<StorageContext>, transport: Arc<dyn SenderTransport>,
+    dest_storage: Arc<StorageContext>, transport: Arc<dyn CopyCommandSink>,
     broadcaster: &BroadcastForwarder<StorageEntryMessage>, config: &SenderWorkerConfig,
     qos_manager: Option<QosManager>, bytes_tracker: Option<Arc<AtomicU64>>, copy_config: &ReceiverConfig,
     active_entry_counter: Arc<AtomicUsize>, entry_counter: Arc<AtomicUsize>, size_counter: Arc<AtomicU64>,
@@ -190,10 +189,10 @@ pub async fn sender_worker(
 }
 
 async fn send_entry(
-    worker_id: usize, transport: &Arc<dyn SenderTransport>, entry: &Arc<ObservedEntry>,
+    worker_id: usize, transport: &Arc<dyn CopyCommandSink>, entry: &Arc<ObservedEntry>,
     cancel: Option<&CancellationToken>,
 ) -> Result<()> {
-    let sending = transport.send(SenderMsg::CopyEntry { entry: entry.clone() });
+    let sending = transport.send(CopyCommand::CopyEntry { entry: entry.clone() });
     let result = match cancel {
         Some(cancel) => tokio::select! {
             biased;
@@ -217,7 +216,7 @@ async fn send_entry(
 #[allow(clippy::too_many_arguments)]
 async fn send_packaged_entry(
     worker_id: usize, entry: &Arc<ObservedEntry>, src_storage: &Arc<StorageContext>,
-    dest_storage: &Arc<StorageContext>, transport: &Arc<dyn SenderTransport>, config: &SenderWorkerConfig,
+    dest_storage: &Arc<StorageContext>, transport: &Arc<dyn CopyCommandSink>, config: &SenderWorkerConfig,
     qos_manager: Option<QosManager>, bytes_tracker: Option<Arc<AtomicU64>>,
 ) -> Result<()> {
     match tar_pack::pack_directory(
@@ -232,7 +231,7 @@ async fn send_packaged_entry(
     {
         Ok((tar_entry, manifest_entries)) => {
             transport
-                .send(SenderMsg::TarPacked {
+                .send(CopyCommand::TarPacked {
                     tar_entry: Arc::new(tar_entry),
                     manifest_entries,
                 })
@@ -246,14 +245,7 @@ async fn send_packaged_entry(
                 entry.get_relative_path(),
                 error
             );
-            if let Err(notification_error) = transport
-                .send(SenderMsg::EntryError {
-                    path: entry.get_relative_path().to_path_buf(),
-                    reason: error.to_string(),
-                    ndx: None,
-                })
-                .await
-            {
+            if let Err(notification_error) = transport.send(CopyCommand::PackFailed).await {
                 error!(
                     "[Sender Worker {}] Failed to send pack error: {}",
                     worker_id, notification_error
@@ -276,13 +268,11 @@ mod tests {
     use crate::task_stream::AsyncReceiver;
     use async_trait::async_trait;
     use task_model::ErrorEvent;
-    use transport::error::{Result as TransportResult, TransportError};
-    use transport::message::ReceiverMsg;
 
     use crate::storage_factory::{StorageRole, create_storage_for_role};
     use tempfile::tempdir;
-    use transport::in_process::create_in_process_pair;
 
+    use super::copy_queue::copy_queue;
     use super::*;
 
     async fn create_storage(path: &str, block_size: Option<u64>, _ensure_dir: bool) -> Result<StorageContext> {
@@ -306,8 +296,8 @@ mod tests {
         .unwrap();
         drop(tx);
 
-        let (sender_transport, _receiver_transport) = create_in_process_pair();
-        let transport: Arc<dyn SenderTransport> = Arc::new(sender_transport);
+        let (sender_transport, _receiver_transport) = copy_queue();
+        let transport: Arc<dyn CopyCommandSink> = Arc::new(sender_transport);
 
         let tmp = tempdir().unwrap();
         let storage = Arc::new(create_storage(tmp.path().to_str().unwrap(), None, false).await.unwrap());
@@ -363,30 +353,22 @@ mod tests {
 
     #[derive(Default)]
     struct RecordingTransport {
-        sent: Mutex<Vec<SenderMsg>>,
+        sent: Mutex<Vec<CopyCommand>>,
         failures: usize,
     }
 
     #[async_trait]
-    impl SenderTransport for RecordingTransport {
-        async fn send(&self, msg: SenderMsg) -> TransportResult<()> {
+    impl CopyCommandSink for RecordingTransport {
+        async fn send(&self, msg: CopyCommand) -> Result<()> {
             let mut sent = self.sent.lock().unwrap();
             let index = sent.len();
             sent.push(msg);
             if index < self.failures {
                 if index == 0 {
-                    return Err(TransportError::Io(IoError::new(ErrorKind::TimedOut, "first send")).into());
+                    return Err(IoError::new(ErrorKind::TimedOut, "first send").into());
                 }
-                return Err(TransportError::ChannelClosed);
+                return Err(AppError::CopyQueueClosed);
             }
-            Ok(())
-        }
-
-        async fn recv(&self) -> Option<ReceiverMsg> {
-            None
-        }
-
-        async fn close(&self) -> TransportResult<()> {
             Ok(())
         }
     }
@@ -409,7 +391,7 @@ mod tests {
     }
 
     async fn run_messages(
-        messages: Vec<StorageEntryMessage>, transport: Arc<dyn SenderTransport>, storage: Arc<StorageContext>,
+        messages: Vec<StorageEntryMessage>, transport: Arc<dyn CopyCommandSink>, storage: Arc<StorageContext>,
         active: Arc<AtomicUsize>, count: Arc<AtomicUsize>,
     ) -> Result<()> {
         let (tx, rx) = async_channel::bounded(messages.len().max(1));
@@ -471,9 +453,7 @@ mod tests {
             count.clone(),
         )
         .await;
-        assert!(
-            matches!(result, Err(AppError::TransportError(TransportError::Io(error))) if error.kind() == ErrorKind::TimedOut)
-        );
+        assert!(matches!(result, Err(AppError::IoError(error)) if error.kind() == ErrorKind::TimedOut));
         assert_eq!(transport.sent.lock().unwrap().len(), 3);
         assert_eq!(count.load(Ordering::Relaxed), 3);
         assert_eq!(active.load(Ordering::Relaxed), 0);
@@ -502,8 +482,8 @@ mod tests {
         assert!(matches!(result, Err(AppError::StorageError(_))));
         let sent = transport.sent.lock().unwrap();
         assert_eq!(sent.len(), 2);
-        assert!(matches!(&sent[0], SenderMsg::EntryError { .. }));
-        assert!(matches!(&sent[1], SenderMsg::CopyEntry { .. }));
+        assert!(matches!(&sent[0], CopyCommand::PackFailed));
+        assert!(matches!(&sent[1], CopyCommand::CopyEntry { .. }));
         assert_eq!(active.load(Ordering::Relaxed), 0);
     }
 }

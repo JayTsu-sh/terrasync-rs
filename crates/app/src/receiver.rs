@@ -15,9 +15,7 @@ use crate::storage_factory::StorageContext;
 use data_mover::model::ObservedEntry;
 use data_mover::qos::QosManager;
 use tokio_util::sync::CancellationToken;
-use tracing::{Instrument, debug, error, info, info_span, trace, warn};
-use transport::message::{ReceiverMsg, SenderMsg};
-use transport::traits::ReceiverTransport;
+use tracing::{Instrument, info_span};
 
 // 内部模块
 use crate::error::{AppError, CopyStep, Result};
@@ -39,96 +37,6 @@ pub struct ReceiverConfig {
     pub transfer_mode: TransferMode,
     /// 当前任务的取消信号；独立调用方可以不绑定任务。
     pub cancel: Option<CancellationToken>,
-}
-
-/// 单进程模式的 Receiver 主 task（R1 + R2 合一）
-///
-/// 从 transport 接收 `SenderMsg`，调用任务复制用例与原生存储角色执行写入。
-/// 每完成一个 entry 后通过 transport 发送 `ReceiverMsg::EntrySuccess` 或 `EntryError`。
-///
-/// 单进程模式下收到 `CopyEntry` 消息时，Receiver 有 src+dest storage，
-/// 直接调用 `process_entry_on_receiver()` 完成完整复制。
-pub async fn receiver_task(
-    transport: &(dyn ReceiverTransport + 'static), src_storage: Arc<StorageContext>, dest_storage: Arc<StorageContext>,
-    config: &ReceiverConfig, qos_manager: Option<QosManager>, bytes_tracker: Option<Arc<AtomicU64>>,
-) -> Result<()> {
-    info!("[Receiver] Started");
-
-    while let Some(msg) = transport.recv().await {
-        match msg {
-            // ── 单进程模式：命令模式 ──
-            SenderMsg::CopyEntry { entry } => {
-                trace!("[Receiver] CopyEntry: {:?}", entry.get_relative_path());
-
-                match process_entry_on_receiver(
-                    &entry,
-                    &src_storage,
-                    &dest_storage,
-                    config,
-                    qos_manager.clone(),
-                    bytes_tracker.clone(),
-                )
-                .await
-                {
-                    Ok(_) => {
-                        if let Err(e) = transport.send(ReceiverMsg::EntrySuccess { entry }).await {
-                            warn!("[Receiver] Failed to send EntrySuccess: {}", e);
-                        }
-                    }
-                    Err(e) => {
-                        error!("[Receiver] CopyEntry failed for {:?}: {}", entry.get_relative_path(), e);
-                        if let Err(send_err) = transport
-                            .send(ReceiverMsg::EntryError {
-                                entry,
-                                reason: format!("{e}"),
-                            })
-                            .await
-                        {
-                            warn!("[Receiver] Failed to send EntryError: {}", send_err);
-                        }
-                    }
-                }
-            }
-
-            // ── 单进程模式：tar 打包结果（Sender 完成打包后通知 Receiver） ──
-            SenderMsg::TarPacked {
-                tar_entry,
-                manifest_entries,
-            } => {
-                trace!("[Receiver] TarPacked: {:?}", tar_entry.get_relative_path());
-                if let Err(e) = transport
-                    .send(ReceiverMsg::TarSuccess {
-                        tar_entry,
-                        manifest_entries,
-                    })
-                    .await
-                {
-                    warn!("[Receiver] Failed to send TarSuccess: {}", e);
-                }
-            }
-
-            // ── 控制消息 ──
-            SenderMsg::TransferDone => {
-                info!("[Receiver] Received TransferDone, shutting down");
-                if let Err(e) = transport.send(ReceiverMsg::AllDone).await {
-                    warn!("[Receiver] Failed to send AllDone: {}", e);
-                }
-                break;
-            }
-
-            SenderMsg::EntryError { path, reason, .. } => {
-                error!("[Receiver] Sender reported error for {}: {}", path.display(), reason);
-            }
-
-            // 双进程模式的消息（Phase 3 实现）
-            _ => {
-                debug!("[Receiver] Ignoring unhandled message type (dual-process mode, Phase 3)");
-            }
-        }
-    }
-
-    info!("[Receiver] Completed");
-    Ok(())
 }
 
 /// 在 Receiver 侧执行完整的 entry 复制（对应原 `process_entry`）

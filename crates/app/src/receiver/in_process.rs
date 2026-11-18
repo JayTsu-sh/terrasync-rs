@@ -4,22 +4,23 @@ use std::sync::{
     atomic::{AtomicU64, AtomicUsize, Ordering},
 };
 
+use async_channel::Receiver;
 use data_mover::{model::ObservedEntry, qos::QosManager};
 use task_model::{ObservedEntryExt, StorageEntryMessage};
 use tracing::{error, info};
-use transport::{in_process::InProcessReceiverTransport, message::SenderMsg, traits::ReceiverTransport};
 
 use super::{ReceiverConfig, process_entry_on_receiver};
 use crate::{
     broadcast::BroadcastForwarder,
     error::{AppError, Result, StorageError},
     file_copy::{CopiedPublication, VersionFailureContext},
+    sender::copy_queue::CopyCommand,
     source_cleanup::{ReadyFileCleanup, can_stream_files},
     storage_factory::StorageContext,
 };
 
 pub(crate) struct LocalCopyReceiver {
-    pub(crate) transport: Arc<InProcessReceiverTransport>,
+    pub(crate) commands: Receiver<CopyCommand>,
     pub(crate) executor: LocalCopyExecutor,
 }
 
@@ -48,14 +49,11 @@ pub(crate) struct LocalCopyExecutor {
 
 impl LocalCopyReceiver {
     pub(crate) async fn run(self) -> Result<()> {
-        let Self {
-            transport: rt,
-            mut executor,
-        } = self;
+        let Self { commands, mut executor } = self;
         executor.cleanup = executor
             .cleanup
             .filter(|_| can_stream_files(&executor.source, &executor.destination));
-        // 从 transport 拉消息处理（MPMC，N 个 worker 竞争消费）
+        // 从本地工作队列领取任务（MPMC，N 个 worker 竞争消费）
         let mut failure = None;
         loop {
             let next = match executor.config.cancel.as_ref() {
@@ -63,17 +61,17 @@ impl LocalCopyReceiver {
                     biased;
                     () = cancel.cancelled() => {
                         // 关闭生产端并停止取队列；未开始的条目不虚构逐项复制失败。
-                        rt.close().await?;
+                        commands.close();
                         return Err(failure.unwrap_or_else(|| StorageError::Cancelled.into()));
                     }
-                    message = rt.recv() => message,
+                    message = commands.recv() => message,
                 },
-                None => rt.recv().await,
+                None => commands.recv().await,
             };
-            let Some(msg) = next else { break };
+            let Ok(msg) = next else { break };
 
             match msg {
-                SenderMsg::CopyEntry { entry } => {
+                CopyCommand::CopyEntry { entry } => {
                     let _guard = AtomicCounterGuard::increment(&executor.active);
                     let completion = executor.execute(LocalCopyWork { entry }).await;
                     if let Err(error) = executor.publish(completion).await {
@@ -83,7 +81,7 @@ impl LocalCopyReceiver {
                         failure.get_or_insert(error);
                     }
                 }
-                SenderMsg::TarPacked {
+                CopyCommand::TarPacked {
                     tar_entry,
                     manifest_entries,
                 } => {
@@ -100,10 +98,10 @@ impl LocalCopyReceiver {
                         })
                         .await?;
                 }
-                _ => {}
+                CopyCommand::PackFailed => {}
             }
         }
-        // recv() 返回 None 时自然退出（sender_transport 被 drop 后 channel 关闭）
+        // 生产端全部退出后排空队列，然后结束
         info!("Receiver {}: Completed", executor.id);
         match failure {
             Some(error) => Err(error),

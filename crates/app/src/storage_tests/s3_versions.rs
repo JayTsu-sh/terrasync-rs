@@ -14,6 +14,7 @@ use crate::file_copy::transfer as copy_transfer;
 use crate::file_copy::{VersionCopyScope, copy_versions};
 use crate::receiver::ReceiverConfig;
 use crate::scan::source::WalkOptions;
+use crate::sender::copy_queue::copy_queue;
 use crate::sender::{SenderWorkerConfig, sender_worker};
 use crate::storage_factory::{CreateStorageOptions, StorageContext, create_storage};
 use crate::task_stream::AsyncReceiver;
@@ -26,7 +27,6 @@ use task_model::{ErrorEvent, StorageEntryMessage, TransferMode};
 use tempfile::TempDir;
 use tokio::sync::Mutex;
 use tokio::time::Instant;
-use transport::in_process::create_in_process_pair;
 
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
@@ -44,7 +44,7 @@ async fn segmented_sender(
     drop(tx);
     let mut broadcaster = BroadcastForwarder::new(64);
     let mut received = broadcaster.subscribe();
-    let (transport, _receiver_transport) = create_in_process_pair();
+    let (transport, _receiver_transport) = copy_queue();
     let active = Arc::new(AtomicUsize::new(0));
     let visited = Arc::new(AtomicUsize::new(0));
     let result = sender_worker(
@@ -301,7 +301,7 @@ async fn required_consumer_failure_stops_history_worker_before_next_version_or_e
         })
         .await?;
     drop(broadcaster.subscribe());
-    let (transport, _receiver_transport) = create_in_process_pair();
+    let (transport, _receiver_transport) = copy_queue();
     let active = Arc::new(AtomicUsize::new(0));
     let visited = Arc::new(AtomicUsize::new(0));
     let started = Instant::now();
@@ -390,7 +390,7 @@ async fn data_failure_blocks_later_versions_and_counts_each_delivered_entry_once
         );
         let mut broadcaster = BroadcastForwarder::new(64);
         let mut receiver = broadcaster.subscribe();
-        let (transport, _receiver_transport) = create_in_process_pair();
+        let (transport, _receiver_transport) = copy_queue();
         let active = Arc::new(AtomicUsize::new(0));
         let result = sender_worker(
             0,

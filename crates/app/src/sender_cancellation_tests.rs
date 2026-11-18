@@ -20,14 +20,13 @@ use db::ClickHouseDatabase;
 use task_model::StorageEntryMessage;
 use tokio::{sync::Notify, task::yield_now, time::timeout};
 use tokio_util::sync::CancellationToken;
-use transport::{
-    error::Result as TransportResult,
-    message::{ReceiverMsg, SenderMsg},
-    traits::SenderTransport,
-};
 use utils::app_config::ClickhouseConfig;
 
-use super::{SenderWorkerConfig, sender_worker};
+use super::{
+    SenderWorkerConfig,
+    copy_queue::{CopyCommand, CopyCommandSink},
+    sender_worker,
+};
 use crate::{
     broadcast::BroadcastForwarder,
     copy_execution::CopyDatabaseExecution,
@@ -55,18 +54,12 @@ impl Drop for MarkDrop<'_> {
 }
 
 #[async_trait]
-impl SenderTransport for BlockedTransport {
-    async fn send(&self, _message: SenderMsg) -> TransportResult<()> {
+impl CopyCommandSink for BlockedTransport {
+    async fn send(&self, _message: CopyCommand) -> Result<()> {
         let _guard = MarkDrop(&self.dropped);
         self.attempts.fetch_add(1, Ordering::SeqCst);
         self.started.notify_one();
         pending().await
-    }
-    async fn recv(&self) -> Option<ReceiverMsg> {
-        None
-    }
-    async fn close(&self) -> TransportResult<()> {
-        Ok(())
     }
 }
 

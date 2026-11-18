@@ -307,6 +307,8 @@ pub enum AppError {
     /// Transport 层错误
     #[error("{0}")]
     TransportError(#[from] TransportError),
+    #[error("Channel closed")]
+    CopyQueueClosed,
 
     /// IO错误
     /// 当IO操作失败时触发

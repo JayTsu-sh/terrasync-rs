@@ -8,14 +8,11 @@ use std::{
     time::Duration,
 };
 
+use crate::sender::copy_queue::{CopyCommand, copy_queue};
+use async_channel::Sender;
 use task_model::{StorageEntryMessage, TransferMode};
 use tokio::{task::yield_now, time::timeout};
 use tokio_util::sync::CancellationToken;
-use transport::{
-    in_process::{InProcessSenderTransport, create_in_process_pair_with_capacity},
-    message::SenderMsg,
-    traits::SenderTransport,
-};
 
 use super::{LocalCopyExecutor, LocalCopyReceiver};
 use crate::{
@@ -35,7 +32,7 @@ async fn fixture(
         tempfile::TempDir,
         tempfile::TempDir,
         LocalCopyReceiver,
-        InProcessSenderTransport,
+        Sender<CopyCommand>,
     ),
     Box<dyn std::error::Error>,
 > {
@@ -46,12 +43,12 @@ async fn fixture(
         Arc::new(create_storage(&source.path().to_string_lossy(), CreateStorageOptions::default()).await?);
     let destination =
         Arc::new(create_storage(&target.path().to_string_lossy(), CreateStorageOptions::default()).await?);
-    let (sender, receiver) = create_in_process_pair_with_capacity(128);
+    let (sender, receiver) = copy_queue();
     Ok((
         source,
         target,
         LocalCopyReceiver {
-            transport: Arc::new(receiver),
+            commands: receiver,
             executor: LocalCopyExecutor {
                 id: 0,
                 source: source_storage,
@@ -83,7 +80,7 @@ async fn cancelled_receiver_does_not_drain_queued_entries_or_emit_invented_failu
     let mut events = receiver.executor.broadcaster.subscribe();
     let item = Arc::new(observe_path(receiver.executor.source.storage(), Path::new("file")).await?);
     for _ in 0..128 {
-        sender.send(SenderMsg::CopyEntry { entry: item.clone() }).await?;
+        sender.send(CopyCommand::CopyEntry { entry: item.clone() }).await?;
     }
     let active = receiver.executor.active.clone();
     token.cancel();
@@ -91,7 +88,7 @@ async fn cancelled_receiver_does_not_drain_queued_entries_or_emit_invented_failu
         timeout(Duration::from_millis(500), receiver.run()).await?,
         Err(AppError::StorageError(StorageError::Cancelled))
     ));
-    assert!(sender.send(SenderMsg::TransferDone).await.is_err());
+    assert!(sender.send(CopyCommand::PackFailed).await.is_err());
     assert!(events.recv().await.is_none());
     assert_eq!(active.load(Ordering::SeqCst), 0);
     assert_eq!(std::fs::read(source.path().join("file"))?, b"retained source");
@@ -112,7 +109,7 @@ async fn idle_receiver_exits_on_cancellation_with_producer_still_open() -> TestR
     })
     .await?;
     assert!(matches!(result, Err(AppError::StorageError(StorageError::Cancelled))));
-    assert!(sender.send(SenderMsg::TransferDone).await.is_err());
+    assert!(sender.send(CopyCommand::PackFailed).await.is_err());
     assert_eq!(std::fs::read_dir(target.path())?.count(), 0);
     Ok(())
 }
@@ -124,7 +121,7 @@ async fn cancellation_preserves_a_previously_reported_real_failure() -> TestResu
     let mut events = receiver.executor.broadcaster.subscribe();
     let item = Arc::new(observe_path(receiver.executor.source.storage(), Path::new("file")).await?);
     std::fs::remove_file(source.path().join("file"))?;
-    sender.send(SenderMsg::CopyEntry { entry: item }).await?;
+    sender.send(CopyCommand::CopyEntry { entry: item }).await?;
     let cancel = async {
         let event = events.recv().await.ok_or("missing real copy failure")?;
         assert!(matches!(
