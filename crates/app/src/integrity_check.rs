@@ -41,6 +41,8 @@ use crate::storage_factory::StorageContext;
 use data_mover::model::ObservedEntry;
 use data_mover::redact_storage_url;
 use task_model::StorageEntryMessage;
+#[cfg(feature = "license")]
+use tracing::warn;
 use tracing::{Instrument, debug, error, info, info_span, instrument};
 
 use crate::broadcast::{BroadcastForwarder, DEFAULT_CHANNEL_CAPACITY};
