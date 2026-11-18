@@ -19,7 +19,9 @@ use remote_sender_session::{classification_to_stats_message, entry_error_stats_m
 #[cfg(test)]
 use task_model::TransferMode;
 
+use std::fs;
 use std::net::SocketAddr;
+use std::path::Path;
 use std::sync::Arc;
 #[cfg(test)]
 use std::sync::{Mutex, PoisonError};
@@ -32,6 +34,7 @@ use crate::storage_factory::{StorageRole, create_storage_for_role};
 use data_mover::filter::parse_filter_expression;
 #[cfg(test)]
 use data_mover::model::ObservedEntry;
+use data_mover::redact_storage_url;
 use data_mover::time_util::now_secs;
 use db::ClickHouseDatabase;
 use rustls::pki_types::CertificateDer;
@@ -44,6 +47,7 @@ use transport::error::TransportError;
 #[cfg(test)]
 use transport::message::TransferDecision;
 use transport::message::{HandshakeResult, ProtocolHandshake, ReceiverMsg, SenderMsg, SessionConfig};
+use transport::quic;
 use transport::traits::SenderTransport;
 use utils::app_config::AppConfig;
 use utils::logger;
@@ -53,15 +57,49 @@ use crate::consumer::stats::callback_state::CallbackState;
 use crate::consumer::stats::{IncrementalStats, ProgressBar, StatisticConsumer, StatsKind};
 use crate::error::{AppError, Result};
 use crate::orchestrator::create_qos_manager;
+use crate::remote_receiver_session::receive;
 #[cfg(test)]
 use crate::remote_receiver_session::{DestIndex, RemoteSessionState};
 use crate::sync::parse_size;
 
-/// 双进程全量同步 — Sender 侧入口
+/// 监听一个 Sender 连接。写出证书并在成功发送终态后等待连接关闭。
+pub async fn serve(listen_addr: SocketAddr, dest_path: &str, tls_cert_out: &Path, token: Option<&str>) -> Result<()> {
+    let dest_storage = Arc::new(create_storage_for_role(dest_path, None, true, StorageRole::Destination).await?);
+    info!("Created destination storage for: {}", redact_storage_url(dest_path));
+
+    let (endpoint, cert_der) = quic::bind(listen_addr)?;
+
+    // Sender 连接前需读取证书，因此必须在 accept 前写出。
+    if let Err(e) = fs::write(tls_cert_out, &cert_der) {
+        warn!(
+            "无法写入 TLS 证书到 '{}': {}。Sender 侧将无法验证服务端身份。",
+            tls_cert_out.display(),
+            e
+        );
+    } else {
+        info!(
+            "Server TLS cert written to '{}'. Pass this to Sender: --tls-server-cert {}",
+            tls_cert_out.display(),
+            tls_cert_out.display()
+        );
+    }
+
+    let receiver_transport = quic::accept_connection(&endpoint).await?;
+    info!("Accepted QUIC connection");
+    receive(&receiver_transport, dest_storage, token).await?;
+
+    // 等待 Sender 收到 AllDone 并关闭连接，避免退出时丢掉仍在发送队列里的终态。
+    endpoint.wait_idle().await;
+
+    info!("Receiver daemon completed");
+    Ok(())
+}
+
+/// 双进程全量同步，连接远端 Receiver。
 ///
 /// 依次执行：QUIC 连接 → 握手协商 → Token 鉴权 → `SessionConfig`；随后文件列表发送与
 /// 请求处理+Ack 收集并发运行（见模块文档）。
-pub(crate) async fn run(
+pub async fn send(
     config: &SyncJobConfig, remote_addr: &str, tls_cert_bytes: Option<&[u8]>, auth_token: Option<&str>,
 ) -> Result<()> {
     let app_config = AppConfig::fetch()?;
@@ -340,7 +378,6 @@ mod tests {
         create_storage_for_role(path, block_size, ensure_dir, role).await
     }
     use crate::consumer::stats::{JobSummary, ProgressDetail, ProgressReport};
-    use crate::receiver::receiver_task_remote;
 
     /// 构造测试用 `Arc<AsyncMutex<StatisticConsumer>>`：不设 `callback_url`（不起 HTTP
     /// 回调循环），不调用 `begin()`/`end()`（这些测试只关心 `send_file_list_phase`/
@@ -419,8 +456,7 @@ mod tests {
         let (sender_transport, receiver_transport) = create_in_process_pair();
 
         // Receiver 侧：调用公开入口，与生产环境走同一条代码路径
-        let receiver_handle =
-            tokio::spawn(async move { receiver_task_remote(&receiver_transport, dest_storage, None).await });
+        let receiver_handle = tokio::spawn(async move { receive(&receiver_transport, dest_storage, None).await });
 
         // Sender 侧：握手 + 鉴权 + SessionConfig（顺序不变），随后文件列表与请求/ack 并发
         negotiate_handshake(&sender_transport).await.unwrap();
@@ -722,7 +758,7 @@ mod tests {
         }
     }
 
-    /// 起 Receiver（`receiver_task_remote`）+ 跑 Sender 侧握手/鉴权/`SessionConfig` +
+    /// 起 Receiver（`receive`）+ 跑 Sender 侧握手/鉴权/`SessionConfig` +
     /// 文件列表与请求/ack 并发处理，返回 `(success_count, error_count)`。
     /// `sender_transport` 可传入包装过的 transport（如 `HashMismatchInjector`），
     /// 复用生产代码路径验证 redo 状态机。
@@ -740,8 +776,7 @@ mod tests {
         )
         .unwrap();
 
-        let receiver_handle =
-            tokio::spawn(async move { receiver_task_remote(&receiver_transport, dest_storage, None).await });
+        let receiver_handle = tokio::spawn(async move { receive(&receiver_transport, dest_storage, None).await });
 
         negotiate_handshake(sender_transport).await.unwrap();
         send_and_check_auth(sender_transport, None).await.unwrap();
@@ -805,8 +840,7 @@ mod tests {
         )
         .unwrap();
 
-        let receiver_handle =
-            tokio::spawn(async move { receiver_task_remote(&receiver_transport, dest_storage, None).await });
+        let receiver_handle = tokio::spawn(async move { receive(&receiver_transport, dest_storage, None).await });
 
         negotiate_handshake(sender_transport).await.unwrap();
         send_and_check_auth(sender_transport, None).await.unwrap();
@@ -1610,12 +1644,12 @@ mod tests {
 
     // ============================================================
     // Receiver 分类信号正确性（issue #23 测试计划 2）：双端真实 StorageContext +
-    // receiver_task_remote，验证 New/Changed(含 MetadataOnly)/Skip/Deleted 五类判定
+    // receive，验证 New/Changed(含 MetadataOnly)/Skip/Deleted 五类判定
     // 各自产生正确的 wire 信号，且执行动作（是否传输/是否本地改元数据/是否删除）与
     // 判定一致。
     // ============================================================
 
-    /// 起 `receiver_task_remote` 并完成握手（`delta_enabled=false` 时构造 delta:false
+    /// 起 `receive` 并完成握手（`delta_enabled=false` 时构造 delta:false
     /// 的本端能力集触发降级协商，走 `TransferRequest{decision:DeltaTransfer}` 而非
     /// `DeltaTransferRequest`）+ 鉴权 + `SessionConfig`，返回
     /// `(sender_transport, receiver_handle)`。`delta_size_threshold` 恒为 `None`
@@ -1634,8 +1668,7 @@ mod tests {
         delta_size_threshold: Option<String>,
     ) -> (InProcessSenderTransport, JoinHandle<Result<()>>) {
         let (sender_transport, receiver_transport) = create_in_process_pair();
-        let receiver_handle =
-            tokio::spawn(async move { receiver_task_remote(&receiver_transport, dest_storage, None).await });
+        let receiver_handle = tokio::spawn(async move { receive(&receiver_transport, dest_storage, None).await });
 
         if delta_enabled {
             negotiate_handshake(&sender_transport).await.unwrap();
@@ -1719,7 +1752,7 @@ mod tests {
             .unwrap();
     }
 
-    /// 跳过间歇性到达的 `Progress` 快照：`receiver_task_remote` 内 `progress_reporter`
+    /// 跳过间歇性到达的 `Progress` 快照：`receive` 内 `progress_reporter`
     /// 每 5s 上报一次，`tokio::time::interval` 首个 tick 立即触发（tokio 默认行为），
     /// 可能与本测试关心的分类信号交错到达，与断言无关，跳过后返回下一条非 `Progress`
     /// 消息（真正非预期的消息仍会被调用方的 `other => panic!` 分支捕获，不会被此函数
@@ -2396,13 +2429,13 @@ mod tests {
         (format!("http://{addr}"), bodies)
     }
 
-    /// callback payload 结构 + 频率：`StatisticConsumer` 按 `remote_sync::run()` 的同一套
+    /// callback payload 结构 + 频率：`StatisticConsumer` 按 `remote_sync::send()` 的同一套
     /// 构造方式（`JobType::IncrementalCopy`）跑一轮 begin → 喂消息 → 等待跨过一个周期
     /// 回调间隔 → end，断言周期性(非 final) + 恰好一次 final 回调都送达，payload 结构为
     /// `ProgressReport`/`ProgressDetail::Incremental`/`FinalStats`（与本地 `IncrementalCopy`
     /// 任务完全同构——同一 Rust 类型，天然保证）。
     ///
-    /// 不经真实 QUIC/`remote_sync::run()`：callback 机制完全活在 `StatisticConsumer` 内部，
+    /// 不经真实 QUIC/`remote_sync::send()`：callback 机制完全活在 `StatisticConsumer` 内部，
     /// 与 transport 无关；`run()` 到这里的唯一接线是一行
     /// `callback_url: config.progress_callback_url.clone()`（类型检查即可保证正确），
     /// 双进程整条链路已由 `tests/remote_process_e2e.rs` + 本文件的分类信号测试覆盖，

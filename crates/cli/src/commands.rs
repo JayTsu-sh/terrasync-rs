@@ -12,19 +12,17 @@
 use app::scan::ScanRequest;
 use std::fs;
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::path::Path;
 use task_model::{SourceCleanupPolicy, TransferMode};
 use tokio::signal::ctrl_c;
 use tokio_util::sync::CancellationToken;
 
 // 外部crate
 use app::config::SyncJobConfig;
-use app::orchestrator::SyncOrchestrator;
 use app::prelude::{integrity_check, parse_bandwidth_string, rm, scan, sync};
-use app::storage_factory::{StorageRole, create_storage_for_role};
+use app::remote_sync::{send, serve};
 use data_mover::redact_storage_url;
 use tracing::info;
-use transport::quic;
 use utils::app_config::AppConfig;
 #[cfg(target_os = "windows")]
 use {
@@ -261,8 +259,7 @@ pub async fn sync_cmd(
             None => None,
         };
 
-        return SyncOrchestrator::new_remote(config, remote_addr, tls_cert_bytes, token.clone())
-            .run()
+        return send(&config, remote_addr, tls_cert_bytes.as_deref(), token.as_deref())
             .await
             .map_err(CliError::AppError);
     }
@@ -384,44 +381,6 @@ pub async fn serve_cmd(listen: &str, dest_path: &str, tls_cert_out: &str, token:
         .parse()
         .map_err(|e| CliError::InvalidParameter(format!("Invalid listen address: {e}")))?;
 
-    // 3. 创建目标端 StorageContext
-    let dest_storage = Arc::new(create_storage_for_role(dest_path, None, true, StorageRole::Destination).await?);
-    info!("Created destination storage for: {}", redact_storage_url(dest_path));
-
-    // 4. bind QUIC endpoint，生成服务端证书 DER（不等待连接）
-    let (endpoint, cert_der) = quic::bind(listen_addr)?;
-
-    // 5. 将服务端 TLS 证书写入文件（供 Sender 侧 --tls-server-cert 使用）
-    //    必须在等待连接（accept_connection）之前写入：Sender 在发起连接前就要读取该文件，
-    //    若放到连接建立之后写会形成死锁。
-    if let Err(e) = std::fs::write(tls_cert_out, &cert_der) {
-        tracing::warn!(
-            "无法写入 TLS 证书到 '{}': {}。Sender 侧将无法验证服务端身份。",
-            tls_cert_out,
-            e
-        );
-    } else {
-        info!(
-            "Server TLS cert written to '{}'. Pass this to Sender: --tls-server-cert {}",
-            tls_cert_out, tls_cert_out
-        );
-    }
-
-    // 6. 等待并接受 Sender 的 QUIC 连接
-    let receiver_transport = quic::accept_connection(&endpoint).await?;
-    info!("Accepted QUIC connection");
-
-    // 7. 启动双进程 receiver task
-    app::receiver::receiver_task_remote(&receiver_transport, dest_storage, token.as_deref())
-        .await
-        .map_err(CliError::AppError)?;
-
-    // 8. 等连接真正关闭再退出进程：write_all() 返回 Ok 只表示数据进入了 quinn 本地发送队列，
-    //    不代表已经送达对端；若这里立即 return，进程退出会连带丢弃尚未真正发出的最后几帧
-    //    （EntrySuccess/Progress/AllDone）。Sender 收到 AllDone 后会主动关闭连接，wait_idle()
-    //    等的正是这个信号；兜底走 quinn 默认 30s idle timeout，不会无限等待。
-    endpoint.wait_idle().await;
-
-    info!("Receiver daemon completed");
+    serve(listen_addr, dest_path, Path::new(tls_cert_out), token.as_deref()).await?;
     Ok(())
 }

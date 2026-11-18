@@ -17,7 +17,7 @@ use transport::message::SessionConfig;
 
 use crate::error::{Result, StorageError};
 use crate::file_commit::{FileCommitter, FileTransferMode};
-use crate::receiver::ReceiverProgress;
+use crate::remote_receiver_session::ReceiverProgress;
 use crate::storage_factory::StorageContext;
 
 /// SPSC channel 消息，用于 Receiver 主 task 与 disk-commit task 之间的通信

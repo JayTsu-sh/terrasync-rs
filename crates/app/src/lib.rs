@@ -63,16 +63,10 @@ mod sync_catalog;
 mod target_absence;
 
 mod remote_inventory;
-/// 双进程远端同步（Sender 侧）
-///
-/// 将 run_sync_remote 的各阶段逻辑提取为独立函数，降低单函数复杂度
+/// 双进程模式的发送与接收入口。
 pub mod remote_sync;
 
-/// 双进程远端同步 Receiver 会话
-///
-/// 封装一次已协商会话的生命周期；当前版本保留既有事件循环作为内部实现，
-/// 后续重构可在不扩大调用方 interface 的前提下逐步迁移会话状态。
-pub mod remote_receiver_session;
+mod remote_receiver_session;
 
 /// 双进程 remote advertisement：opaque snapshot paging 与 session-local NDX。
 pub mod remote_advertisement;

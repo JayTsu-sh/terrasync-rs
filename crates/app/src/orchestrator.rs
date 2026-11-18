@@ -213,28 +213,9 @@ async fn create_storage_pair_with_retry(
     }
 }
 
-/// Sync 编排器
-///
-/// 统一管理 sync 和 `incremental_sync` 的执行流程。
-/// 单进程模式下通过 `InProcessTransport` 连接 sender 和 receiver task。
-/// 双进程模式下通过 QUIC Transport 连接远端 Receiver（Phase 3）。
-/// Sync 模式
-enum SyncMode {
-    /// 单进程：src+dest 在同一进程
-    Local,
-    /// 双进程：通过 QUIC 连接远端 Receiver
-    Remote {
-        remote_addr: String,
-        /// 服务端 DER 证书（来自 `serve --tls-cert-out`），None 时跳过验证（输出 WARNING）
-        tls_server_cert: Option<Vec<u8>>,
-        /// Token 鉴权（与 `serve --token` 配对），None 时发送空 token
-        auth_token: Option<String>,
-    },
-}
-
+/// 按已提交基线和复制策略编排单进程全量或增量迁移。
 pub struct SyncOrchestrator {
     config: SyncJobConfig,
-    mode: SyncMode,
     #[cfg(test)]
     filter_time: Option<i64>,
 }
@@ -249,50 +230,13 @@ impl SyncOrchestrator {
     pub fn new_local(config: SyncJobConfig) -> Self {
         Self {
             config,
-            mode: SyncMode::Local,
             #[cfg(test)]
             filter_time: None,
         }
     }
 
-    /// 创建双进程模式的编排器（Sender 侧，连接远端 Receiver）
-    ///
-    /// `tls_server_cert`: 服务端 DER 证书字节（来自 `serve --tls-cert-out`），
-    /// 传入 `None` 时跳过 TLS 验证（输出 WARNING）。
-    /// `auth_token`: 与 Receiver `serve --token` 配对的鉴权 token，`None` 时发送空 token。
-    pub fn new_remote(
-        config: SyncJobConfig, remote_addr: &str, tls_server_cert: Option<Vec<u8>>, auth_token: Option<String>,
-    ) -> Self {
-        Self {
-            config,
-            mode: SyncMode::Remote {
-                remote_addr: remote_addr.to_string(),
-                tls_server_cert,
-                auth_token,
-            },
-            #[cfg(test)]
-            filter_time: None,
-        }
-    }
-
-    /// 执行 sync 管线
-    ///
-    /// 根据已提交数据库基线和复制策略选择；启用数据库时构造失败直接上报。
+    /// 按数据库基线和复制策略执行本地迁移。
     pub async fn run(&self) -> Result<()> {
-        match &self.mode {
-            SyncMode::Local => self.run_local().await,
-            SyncMode::Remote {
-                remote_addr,
-                tls_server_cert,
-                auth_token,
-            } => {
-                self.run_sync_remote(remote_addr, tls_server_cert.as_deref(), auth_token.as_deref())
-                    .await
-            }
-        }
-    }
-
-    async fn run_local(&self) -> Result<()> {
         let app_config = AppConfig::fetch()?;
         let c = &self.config;
         let mut notifications = initialize_consumer_config(
@@ -1399,13 +1343,6 @@ impl SyncOrchestrator {
             c.job_id
         );
         Ok(())
-    }
-
-    /// 双进程全量同步 — Sender 侧：`directory_pages` 分页 → QUIC → Receiver 比较 + 写入
-    async fn run_sync_remote(
-        &self, remote_addr: &str, tls_cert_bytes: Option<&[u8]>, auth_token: Option<&str>,
-    ) -> Result<()> {
-        crate::remote_sync::run(&self.config, remote_addr, tls_cert_bytes, auth_token).await
     }
 
     /// 启动统计 reporter task

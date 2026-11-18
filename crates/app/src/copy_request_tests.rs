@@ -20,6 +20,7 @@ use crate::consumer::stats::{ProgressDetail, ProgressReport};
 use crate::error::{AppError, Result};
 use crate::migration_plan::MigrationPlan;
 use crate::orchestrator::SyncOrchestrator;
+use crate::remote_sync::send;
 use crate::scan::observe_path;
 use crate::storage_factory::{StorageRole, create_storage_for_role};
 
@@ -85,14 +86,7 @@ async fn remote_rejection(config: &ClickHouseConfig, retain: bool) -> Result<()>
             .map_err(|_| AppError::ConfigError("owned callback URL required".into()))?,
     )?);
     AppConfig::override_with(|global| global.sync.is_source_reserved = !retain)?;
-    let result = SyncOrchestrator::new_remote(
-        command.clone(),
-        "invalid-remote-address",
-        None,
-        Some("policy auth secret".into()),
-    )
-    .run()
-    .await;
+    let result = send(&command, "invalid-remote-address", None, Some("policy auth secret")).await;
     if retain {
         assert!(matches!(result, Err(AppError::CopyError(_))));
     } else {

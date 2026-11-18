@@ -34,7 +34,7 @@ use transport::message::SessionConfig;
 // 内部模块
 use crate::disk_commit::{DcAck, FileOutcome};
 use crate::error::{AppError, Result};
-use crate::receiver::{ReceiverProgress, validate_relative_path};
+use crate::remote_receiver_session::{ReceiverProgress, validate_relative_path};
 
 /// 当前正在流式写入的文件上下文。
 struct ActiveFile {

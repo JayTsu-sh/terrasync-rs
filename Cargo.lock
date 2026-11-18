@@ -1219,7 +1219,6 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tracing",
- "transport",
  "utils",
  "web",
 ]

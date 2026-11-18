@@ -64,10 +64,6 @@ pub enum CliError {
     #[error("{0}")]
     LicenseError(#[from] licensing::error::LicenseError),
 
-    /// Transport 层错误
-    #[error("{0}")]
-    TransportError(#[from] transport::error::TransportError),
-
     /// 存储层错误
     #[error("{0}")]
     StorageError(#[from] StorageError),

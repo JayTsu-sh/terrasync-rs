@@ -7,7 +7,7 @@ use task_model::TransferMode;
 use transport::chunk::DataChunk;
 
 use super::{DcAck, DiskCommitMsg, FileOutcome, disk_commit_task};
-use crate::receiver::ReceiverProgress;
+use crate::remote_receiver_session::ReceiverProgress;
 use crate::storage_factory::{CreateStorageOptions, StorageContext, create_storage};
 use bytes::Bytes;
 use data_mover::model::ObservedEntry;
