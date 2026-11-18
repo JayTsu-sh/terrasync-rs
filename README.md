@@ -24,6 +24,7 @@ Rust Terrasync支持通过Feature机制启用可选功能，您可以在构建�
 | Feature     | 描述                   | 依赖关系                                          |
 | ----------- | ---------------------- | ------------------------------------------------- |
 | `basic`     | 基本功能（始终包含）   | -                                                 |
+| `remote`    | Sender／Receiver 双进程同步 | `cli/remote` → `app/remote` → `transport/quic` |
 | `gui`       | 启用Web GUI管理界面    | `cli/gui` → `web`                                 |
 | `profiling` | 启用性能分析支持       | -                                                 |
 
@@ -41,7 +42,8 @@ cargo build --all-features
 
 ### 默认Feature
 
-- 运行`cargo build`（不指定任何Feature）时，默认启用`basic` Feature
+- 运行 `cargo build` 时默认启用 `basic` 和 `remote`，提供 `sync --remote` 与 `serve`。
+- 使用 `cargo build --no-default-features` 构建本地 CLI。
 - 您可以通过修改`Cargo.toml`文件中的`default`字段来自定义默认启用的Feature
 
 ### Feature详细说明

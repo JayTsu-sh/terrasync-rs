@@ -50,14 +50,14 @@
 ### A　收窄任务入口和共享报告契约
 
 1. **先迁诊断值类型。** 从 `app/consumer/stats/diagnostics.rs` 将 `CallbackIdentity`、`DiagnosticEvent`、`DiagnosticBatch`、`CallbackAck`、双方校验用的限制和纯脱敏／校验逻辑迁入 `task-model`。将现有 crate 私有的 `DiagnosticEvent::is_bounded` 作为模型校验入口提供给 app，再同步更新发送端、Web 接收端和测试。`DiagnosticOutbox` 的队列、修订号、重试、归档留在 app。用同一组 JSON 样本对迁移前后序列化、缺省字段、重试批次 ID、重复投递、终态序号和累计数做对照。[诊断实现](../../crates/app/src/consumer/stats/diagnostics.rs) · [Web 回执事务测试](../../crates/web/src/infrastructure/callback_receipt_tests.rs)
-2. **整理 Web 使用的进度报告入口。** 将 `ProgressReport`、`FinalStats` 等实际使用类型通过 app 的报告模块提供，逐个消除 Web 对 `app::consumer::stats` 的导入。`ScanSnapshot` 间接使用 data-mover 遍历计数，先由既有统计实现生成唯一快照，再导出报告。验收 Web 端的进度、终态和扫描分类数，同时检查 `task-model` 的正常依赖图。[报告定义](../../crates/app/src/consumer/stats/report.rs) · [扫描统计](../../crates/app/src/scan/statistics.rs)
+2. **整理 Web 使用的进度报告入口。** 将 `ProgressReport`、`FinalStats` 等实际使用类型通过 app 的报告模块提供，逐个消除 Web 对 `app::consumer::stats` 的导入。`ScanSnapshot` 间接使用 data-mover 遍历计数，先由既有统计实现生成唯一快照，再导出报告。验收 Web 端的进度、终态和扫描分类数，同时检查 `task-model` 的正常依赖图。[报告定义](../../crates/app/src/report.rs) · [扫描统计](../../crates/app/src/scan/statistics.rs)
 3. **合并本地迁移入口。** `sync` 和 `incremental_sync` 都调用 `new_local(config).run()`。统一到 `sync(SyncJobConfig)`，检索并迁移 CLI、Web、prelude、examples 和测试。扫描沿用 `scan(ScanRequest)`。保留 CLI 配置覆盖顺序、Web 重置语义和 app 的代次选择，对照有效请求与最终报告。远端 Sender 的配置和连接参数由远端用例接收。[同步入口](../../crates/app/src/sync.rs) · [CLI 参数组装](../../crates/cli/src/commands.rs) · [Web 任务执行](../../crates/web/src/infrastructure/task_runner.rs)
 
 ### B　让 transport 只承担跨进程通信
 
 1. **移出存储 SDK 转换。** `DataChunk` 保留在 transport，在 app 的 `file_commit` 消费端构造 `PositionedChunk { offset, data }`，直接移动 `Bytes`。不能把原有 `From<DataChunk> for PositionedChunk` 原样搬进 app，Rust 的孤儿规则不允许。将 transport 中其余模型引用改到已锁定的 `data-mover-model`，共享测试夹具需要完整 SDK 时放在 dev-dependencies。验收正常依赖树中没有完整 `data-mover`，且大文件分块和偏移读写通过。[wire 数据块](../../crates/transport/src/chunk.rs) · [存储消费点](../../crates/app/src/file_commit.rs)
 2. **移动会话状态。** 将 `NdxTable` 移入 app 远端 Sender，将 `DestIndex` 及目标分类移入 Receiver；`DirPageResult`、`NdxEntry`、`TransferDecision` 等实际在线上传输的类型留在 transport。同步移动索引测试。验收同一页的差分选择、源端失败、重试和 ACK 去重结果。[消息与索引实现](../../crates/transport/src/message.rs)
-3. **移动落盘任务消息。** 将 `DiskCommitMsg`、`DcAck`、`FileOutcome` 移至 app 的远端落盘模块，保留向 wire ACK 的现有映射。`dual_process_streaming` 里直接驱动内部消息的用例可随模块迁入，保留断言；根包的真实双进程测试套件继续走公开命令。验收偏移、哈希错误、空文件、abort、重复 commit、清理及唯一完成结果。[落盘实现](../../crates/app/src/disk_commit.rs) · [流式落盘测试](../../crates/app/tests/dual_process_streaming.rs)
+3. **移动落盘任务消息。** 将 `DiskCommitMsg`、`DcAck`、`FileOutcome` 移至 app 的远端落盘模块，保留向 wire ACK 的现有映射。`dual_process_streaming` 里直接驱动内部消息的用例可随模块迁入，保留断言；根包的真实双进程测试套件继续走公开命令。验收偏移、哈希错误、空文件、abort、重复 commit、清理及唯一完成结果。[落盘实现](../../crates/app/src/disk_commit.rs) · [流式落盘测试](../../crates/app/src/disk_commit/tests.rs)
 
 B 批次先从改动前的 v14 编码记录代表性固定字节样本，包含 `CopyEntry`、`TarPacked` 之后仍在线上使用的枚举变体。序列化枚举顺序变化会改变 bincode 字节。迁移后应能解出原样本，并为同一消息编码出相同字节。该对照用于发现本轮结构变更引入的线协议变化。[QUIC 帧实现](../../crates/transport/src/quic/framing.rs) · [QUIC 往返测试](../../crates/transport/tests/quic_roundtrip.rs)
 
@@ -71,8 +71,8 @@ B 批次先从改动前的 v14 编码记录代表性固定字节样本，包含 
 ### D　收拢本地迁移、扫描与执行配置
 
 1. **按执行阶段拆本地编排。** 将 `run_local_prepared`、`run_planned_local`、全量与增量执行体依次迁入 local，沿用 `JobLease`、`CopyDatabaseExecution`、`copy_completion`、`source_cleanup`。先让全量和增量调用同一套已有收尾逻辑，再调整文件布局。普通文件取得目标就绪证据、复核源与身份后可清理源，和数据库批量冲刷并行。目录及根元数据有自己的提交条件。增量必须等待阶段 A 的扫描、复制和消费者冲刷成功后，才进入阶段 B 的删除／重命名。统计生命周期跨两阶段只开始和结束一次。[本地编排](../../crates/app/src/orchestrator.rs) · [提交收尾](../../crates/app/src/copy_completion.rs) · [迁移代次场景](../../tests/scenarios/migration-generations.md)
-2. **以 scan 入口整合扫描实现。** 保留无数据库流式扫描和启用数据库时的持久化扫描路由。普通扫描用 Unordered，显式续扫用 Blocks；远端清单的 Blocks 选择独立于此。复用同一观察与过滤配置，持久化路径单独拥有确认游标、统计快照及重放去重。生产 checkpoint 至少间隔 60 秒且等完整目录块完成。验证大平铺目录中断、恢复后精确计数、用户取消与内部故障区分、在途数据库写结果未知的情况。[扫描入口](../../crates/app/src/scan.rs) · [持久化扫描](../../crates/app/src/scan_resume.rs)
-3. **最后调整配置读取。** 枚举 Web 写入全局 `AppConfig` 和 app 运行中再次读取的地点。先用一次“任务启动后更新配置”的对照记录当前行为。能在任务开始时确定的参数，通过已有请求或执行上下文传入有效配置；任何改变进行中任务行为的决定单独提案。保留 db 使用的配置类型路径、CLI 覆盖优先级和许可检查时机。[全局配置](../../crates/utils/src/app_config.rs) · [Web 配置更新](../../crates/web/src/infrastructure/clickhouse_config.rs)
+2. **以 scan 入口整合扫描实现。** 保留无数据库流式扫描和启用数据库时的持久化扫描路由。普通扫描用 Unordered，显式续扫用 Blocks；远端清单的 Blocks 选择独立于此。复用同一观察与过滤配置，持久化路径单独拥有确认游标、统计快照及重放去重。生产 checkpoint 至少间隔 60 秒且等完整目录块完成。验证大平铺目录中断、恢复后精确计数、用户取消与内部故障区分、在途数据库写结果未知的情况。[扫描入口](../../crates/app/src/scan.rs) · [持久化扫描](../../crates/app/src/scan/persisted.rs)
+3. **最后调整配置读取。** 枚举 Web 写入全局 `AppConfig` 和 app 运行中再次读取的地点。先用一次“任务启动后更新配置”的对照记录当前行为。能在任务开始时确定的参数，通过已有请求或执行上下文传入有效配置；HDFS 角色配置继续在每次挂载时读取，作业查询和清理也读取当前数据库配置。这些调用只复制所需的配置段。任何改变进行中任务行为的决定单独提案。保留 db 使用的配置类型路径、CLI 覆盖优先级和许可检查时机。[全局配置](../../crates/utils/src/app_config.rs) · [Web 配置更新](../../crates/web/src/infrastructure/clickhouse_config.rs)
 
 ## 验收与交付
 
@@ -80,8 +80,8 @@ B 批次先从改动前的 v14 编码记录代表性固定字节样本，包含 
 
 | 批次 | 定向命令，在仓库根运行 | 通过条件 |
 | --- | --- | --- |
-| A | `cargo test --locked -p task-model -p app -p web` | 报告 JSON、重试身份、脱敏、SQLite 回执幂等、终态排序和 CLI／Web 的迁移代次对照一致 |
-| B | `cargo test --locked -p transport --features quic`；迁移前运行 `cargo test --locked -p app --test dual_process_streaming`，测试迁入私有模块后运行 `cargo test --locked -p app --lib` 并逐项核对原用例；用 `cargo tree --locked -p transport -e normal` 查依赖 | wire 字节样本一致，落盘与 ACK 用例通过，完整 SDK 从 transport 正常依赖消失 |
+| A | `cargo test --locked -p task-model -p app -p web --features app/remote` | 报告 JSON、重试身份、脱敏、SQLite 回执幂等、终态排序和 CLI／Web 的迁移代次对照一致 |
+| B | `cargo test --locked -p transport --features quic`；落盘及会话运行 `cargo test --locked -p app --features remote --lib`，逐项核对原用例；用 `cargo tree --locked -p transport -e normal` 查依赖 | wire 字节样本一致，落盘与 ACK 用例通过，完整 SDK 从 transport 正常依赖消失 |
 | C | `cargo check --locked -p app --no-default-features --all-targets`、`cargo check --locked -p web`、`cargo check --locked -p terrasync-rs --no-default-features`、`cargo check --locked -p terrasync-rs --features gui,license`；`cargo test --locked --test remote_process_e2e -- --test-threads=1` | 单独用 `cargo tree --locked -p web -e normal,features` 和 `cargo tree --locked -p terrasync-rs --no-default-features -e normal,features` 检查 QUIC feature。默认 CLI 的远端命令、满队列取消、两端退出码、报告和文件均符合基线 |
 | D | `cargo test --locked -p app --lib`（其中扫描定向运行 `cargo test --locked -p app --lib scan`）。按受影响路径执行代次矩阵、实验室故障与性能对照 | 全量／增量选择、源端留删、目标内容及元数据、checkpoint 与累计值一致；失败和取消后旧执行收束 |
 
