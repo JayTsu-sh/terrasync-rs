@@ -9,6 +9,7 @@ use std::sync::{
 };
 
 use async_trait::async_trait;
+use data_mover::metadata::ApplicationFailureKind;
 #[cfg(unix)]
 use data_mover::model::{EntryKind, ObservedEntry};
 use data_mover::model::{
@@ -72,9 +73,15 @@ impl Metadata for MetadataReadOnly {
     }
 }
 
+#[derive(Clone, Copy)]
+enum MetadataFault {
+    Refused,
+    BatchFailed,
+}
+
 struct MetadataBatchProbe {
     inner: Arc<dyn StagedDestination>,
-    fail: bool,
+    fault: Option<MetadataFault>,
     fail_verify: bool,
     calls: AtomicU64,
     cleanup_calls: AtomicU64,
@@ -139,13 +146,23 @@ impl StagedDestination for MetadataBatchProbe {
     async fn apply_metadata_batch(
         &self, stage: &PreparedStage, mutations: Vec<MetadataMutation>, cancel: CancellationToken,
     ) -> std::result::Result<(), MetadataBatchFailure> {
-        self.calls.fetch_add(1, Ordering::Relaxed);
-        if self.fail {
-            return Err(MetadataBatchFailure::whole_batch(
-                mutations.len(),
-                0,
-                Some(refused("injected staged metadata refusal")),
-            ));
+        let previous = self.calls.fetch_add(1, Ordering::Relaxed);
+        if let Some(fault) = self.fault
+            && previous == 0
+        {
+            assert!(!mutations.is_empty());
+            return Err(match fault {
+                MetadataFault::Refused => MetadataBatchFailure {
+                    failed_index: 0,
+                    completed: 0,
+                    error: Some(refused("injected staged metadata refusal")),
+                },
+                MetadataFault::BatchFailed => MetadataBatchFailure::whole_batch(
+                    mutations.len(),
+                    0,
+                    Some(refused("injected staged metadata batch failure")),
+                ),
+            });
         }
         self.inner.apply_metadata_batch(stage, mutations, cancel).await
     }
@@ -197,7 +214,7 @@ async fn captured_metadata_is_batched_once_without_source_reread_or_later_target
             let source_calls = guard_metadata(&mut source, true, None)?;
             let probe = Arc::new(MetadataBatchProbe {
                 inner: target.roles.staged_destination()?,
-                fail: false,
+                fault: None,
                 fail_verify: false,
                 cleanup_calls: AtomicU64::new(0),
                 calls: AtomicU64::new(0),
@@ -235,62 +252,90 @@ async fn captured_metadata_is_batched_once_without_source_reread_or_later_target
 }
 
 #[tokio::test]
-async fn failed_metadata_keeps_published_data_and_counts_its_bytes_in_both_modes() -> TestResult {
+async fn refused_metadata_keeps_published_data_and_counts_its_bytes_in_both_modes() -> TestResult {
     for mode in [TransferMode::Direct, TransferMode::Checkpoint] {
         for integrity in [false, true] {
-            let source_root = tempfile::tempdir()?;
-            let target_root = tempfile::tempdir()?;
-            std::fs::write(source_root.path().join("file"), b"payload")?;
-            std::fs::write(target_root.path().join("file"), b"old")?;
-            let source = create_storage(source_root.path().to_str().unwrap(), CreateStorageOptions::default()).await?;
-            let mut target =
-                create_storage(target_root.path().to_str().unwrap(), CreateStorageOptions::default()).await?;
-            let entry = Arc::new(observe_path(source.storage(), Path::new("file")).await?);
-            let probe = Arc::new(MetadataBatchProbe {
-                inner: target.roles.staged_destination()?,
-                fail: true,
-                fail_verify: false,
-                cleanup_calls: AtomicU64::new(0),
-                calls: AtomicU64::new(0),
-            });
-            let target_calls = guard_metadata(&mut target, false, Some(probe.clone()))?;
-            let bytes = Arc::new(AtomicU64::new(0));
-            let error = transfer::copy_current(
-                &source,
-                &target,
-                &entry,
-                &CopyOptions {
-                    transfer_mode: mode,
-                    enable_integrity_check: integrity,
-                    bytes_counter: Some(bytes.clone()),
-                    ..Default::default()
-                },
-                None,
-            )
-            .await
-            .unwrap_err();
-            let StorageError::Transfer(failure) = &error else {
-                panic!("expected typed metadata transfer failure: {error:?}");
-            };
-            assert_eq!(failure.phase(), TransferPhase::Metadata);
-            assert_eq!(
-                failure
-                    .published_data()
-                    .ok_or("data evidence missing")?
-                    .blake3
-                    .is_some(),
-                integrity
-            );
-            let context = VersionFailureContext::for_error(&error, source.roles.kind(), target.roles.kind());
-            assert!(context.metadata_only);
-            assert_eq!(context.phase, "target_metadata_apply");
-            assert!(error.to_string().contains("injected staged metadata refusal"));
-            assert_eq!(target_calls.load(Ordering::Relaxed), 0);
-            assert_eq!(bytes.load(Ordering::Relaxed), 7);
-            assert_eq!(std::fs::read(target_root.path().join("file"))?, b"payload");
-            assert_eq!(std::fs::read(source_root.path().join("file"))?, b"payload");
+            assert_metadata_failure_data(mode, integrity, MetadataFault::Refused).await?;
         }
     }
+    Ok(())
+}
+
+#[tokio::test]
+async fn metadata_batch_failure_only_counts_direct_data_written_at_the_final_path() -> TestResult {
+    for mode in [TransferMode::Direct, TransferMode::Checkpoint] {
+        for integrity in [false, true] {
+            assert_metadata_failure_data(mode, integrity, MetadataFault::BatchFailed).await?;
+        }
+    }
+    Ok(())
+}
+
+async fn assert_metadata_failure_data(mode: TransferMode, integrity: bool, fault: MetadataFault) -> TestResult {
+    let source_root = tempfile::tempdir()?;
+    let target_root = tempfile::tempdir()?;
+    std::fs::write(source_root.path().join("file"), b"payload")?;
+    std::fs::write(target_root.path().join("file"), b"old")?;
+    let source = create_storage(source_root.path().to_str().unwrap(), CreateStorageOptions::default()).await?;
+    let mut target = create_storage(target_root.path().to_str().unwrap(), CreateStorageOptions::default()).await?;
+    let entry = Arc::new(observe_path(source.storage(), Path::new("file")).await?);
+    let probe = Arc::new(MetadataBatchProbe {
+        inner: target.roles.staged_destination()?,
+        fault: Some(fault),
+        fail_verify: false,
+        cleanup_calls: AtomicU64::new(0),
+        calls: AtomicU64::new(0),
+    });
+    let target_calls = guard_metadata(&mut target, false, Some(probe.clone()))?;
+    let bytes = Arc::new(AtomicU64::new(0));
+    let error = transfer::copy_current(
+        &source,
+        &target,
+        &entry,
+        &CopyOptions {
+            transfer_mode: mode,
+            enable_integrity_check: integrity,
+            bytes_counter: Some(bytes.clone()),
+            ..Default::default()
+        },
+        None,
+    )
+    .await
+    .unwrap_err();
+    let StorageError::Transfer(failure) = &error else {
+        panic!("expected typed metadata transfer failure: {error:?}");
+    };
+    assert_eq!(failure.phase(), TransferPhase::Metadata);
+    let (kind, message) = match fault {
+        MetadataFault::Refused => (ApplicationFailureKind::Refused, "injected staged metadata refusal"),
+        MetadataFault::BatchFailed => (
+            ApplicationFailureKind::BatchFailed,
+            "injected staged metadata batch failure",
+        ),
+    };
+    assert_eq!(failure.metadata_failure().ok_or("metadata cause missing")?.kind(), kind);
+    let data_ready = mode == TransferMode::Direct || matches!(fault, MetadataFault::Refused);
+    assert_eq!(
+        failure.published_data().map(|data| data.blake3.is_some()),
+        data_ready.then_some(integrity)
+    );
+    assert_eq!(failure.final_destination_changed(), data_ready);
+    let context = VersionFailureContext::for_error(&error, source.roles.kind(), target.roles.kind());
+    assert_eq!(context.metadata_only, data_ready);
+    assert_eq!(
+        context.phase,
+        if data_ready {
+            "target_metadata_apply"
+        } else {
+            "Metadata"
+        }
+    );
+    assert!(error.to_string().contains(message));
+    assert_eq!(target_calls.load(Ordering::Relaxed), 0);
+    assert_eq!(bytes.load(Ordering::Relaxed), if data_ready { 7 } else { 0 });
+    let expected_target: &[u8] = if data_ready { b"payload" } else { b"old" };
+    assert_eq!(std::fs::read(target_root.path().join("file"))?, expected_target);
+    assert_eq!(std::fs::read(source_root.path().join("file"))?, b"payload");
     Ok(())
 }
 
@@ -358,7 +403,7 @@ async fn direct_data_failure_removes_owned_target_while_source_and_typed_reason_
         let entry = Arc::new(observe_path(source.storage(), Path::new("file")).await?);
         let role = Arc::new(MetadataBatchProbe {
             inner: target.roles.staged_destination()?,
-            fail: false,
+            fault: None,
             fail_verify: true,
             calls: AtomicU64::new(0),
             cleanup_calls: AtomicU64::new(0),
