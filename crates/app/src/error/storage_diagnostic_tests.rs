@@ -160,3 +160,22 @@ fn appended_diagnostics_are_redacted_before_display_and_callback_batch() {
         }
     }
 }
+
+#[test]
+fn anchored_target_publication_change_preserves_native_verification_cause() {
+    let path = StoragePath::new("directory").unwrap();
+    let error = StorageError::TargetPublicationChanged {
+        path: path.clone(),
+        source: Some(Box::new(StorageError::MetadataVerification(
+            MetadataVerificationError::VersionChanged { path: path.clone() },
+        ))),
+    };
+    assert!(error.to_string().contains(path.as_str()));
+    assert!(matches!(
+        error.source().and_then(|cause| cause.downcast_ref::<Box<StorageError>>()).map(Box::as_ref),
+        Some(StorageError::MetadataVerification(MetadataVerificationError::VersionChanged { path: actual }))
+            if actual == &path
+    ));
+    let manual = StorageError::TargetPublicationChanged { path, source: None };
+    assert!(manual.source().is_none());
+}
