@@ -594,6 +594,8 @@ async fn cancellation_drains_known_metadata_diagnostic_without_future_entry() ->
     let mut executor = executor(source.path(), target.path(), cancel.clone()).await?;
     fault_metadata(Arc::make_mut(&mut executor.source), "bad", Some(known.clone()), false)?;
     let mut options = options();
+    // slow 可能先被列出，必须给触发取消信号的 bad 留一个观察槽。
+    options.concurrency = 2;
     options.observation_plan = Some(options.observation_plan.unwrap().with_acl(ObservationMode::BestEffort));
     let cancelling = async {
         known.cancelled().await;
@@ -707,6 +709,8 @@ async fn source_session_cause_survives_cancellation_and_never_becomes_consumer_f
     let mut executor = executor(source.path(), target.path(), cancel.clone()).await?;
     fault_metadata(Arc::make_mut(&mut executor.source), "bad", Some(known.clone()), true)?;
     let mut options = options();
+    // slow 可能先被列出，必须给触发取消信号的 bad 留一个观察槽。
+    options.concurrency = 2;
     options.observation_plan = Some(options.observation_plan.unwrap().with_acl(ObservationMode::BestEffort));
     let cancelling = async {
         known.cancelled().await;
