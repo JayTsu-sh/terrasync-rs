@@ -77,6 +77,7 @@ impl Metadata for MetadataReadOnly {
 enum MetadataFault {
     Refused,
     BatchFailed,
+    WriteUnconfirmed,
 }
 
 struct MetadataBatchProbe {
@@ -155,6 +156,7 @@ impl StagedDestination for MetadataBatchProbe {
                 MetadataFault::Refused => MetadataBatchFailure {
                     failed_index: 0,
                     completed: 0,
+                    write_unconfirmed: false,
                     error: Some(refused("injected staged metadata refusal")),
                 },
                 MetadataFault::BatchFailed => MetadataBatchFailure::whole_batch(
@@ -162,6 +164,12 @@ impl StagedDestination for MetadataBatchProbe {
                     0,
                     Some(refused("injected staged metadata batch failure")),
                 ),
+                MetadataFault::WriteUnconfirmed => MetadataBatchFailure {
+                    failed_index: 0,
+                    completed: 0,
+                    write_unconfirmed: true,
+                    error: Some(refused("injected unconfirmed staged metadata write")),
+                },
             });
         }
         self.inner.apply_metadata_batch(stage, mutations, cancel).await
@@ -262,10 +270,12 @@ async fn refused_metadata_keeps_published_data_and_counts_its_bytes_in_both_mode
 }
 
 #[tokio::test]
-async fn metadata_batch_failure_only_counts_direct_data_written_at_the_final_path() -> TestResult {
+async fn unconfirmed_metadata_only_counts_direct_data_written_at_the_final_path() -> TestResult {
     for mode in [TransferMode::Direct, TransferMode::Checkpoint] {
         for integrity in [false, true] {
-            assert_metadata_failure_data(mode, integrity, MetadataFault::BatchFailed).await?;
+            for fault in [MetadataFault::BatchFailed, MetadataFault::WriteUnconfirmed] {
+                assert_metadata_failure_data(mode, integrity, fault).await?;
+            }
         }
     }
     Ok(())
@@ -311,6 +321,10 @@ async fn assert_metadata_failure_data(mode: TransferMode, integrity: bool, fault
         MetadataFault::BatchFailed => (
             ApplicationFailureKind::BatchFailed,
             "injected staged metadata batch failure",
+        ),
+        MetadataFault::WriteUnconfirmed => (
+            ApplicationFailureKind::WriteUnconfirmed,
+            "injected unconfirmed staged metadata write",
         ),
     };
     assert_eq!(failure.metadata_failure().ok_or("metadata cause missing")?.kind(), kind);
