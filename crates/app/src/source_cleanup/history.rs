@@ -230,6 +230,7 @@ async fn verify_target(
             view.version()
                 .filter(|record| record.is_latest() && !record.is_delete_marker())
                 .map(|_| version),
+            None,
             check.cancel.clone(),
         )
         .await
@@ -238,7 +239,11 @@ async fn verify_target(
         || descriptor.size != view.version().and_then(VersionRecord::size)
         || (marker && verification::selected_marker(&descriptor).is_none())
     {
-        return Err(StorageError::TargetPublicationChanged { path: descriptor.path }.into());
+        return Err(StorageError::TargetPublicationChanged {
+            path: descriptor.path,
+            source: None,
+        }
+        .into());
     }
     if marker && view.version().is_some_and(VersionRecord::is_latest) {
         // 保留目标实测身份，只收紧 selector；当前绑定的协议检查归 namespace 所有。

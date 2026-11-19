@@ -29,6 +29,8 @@ use crate::tar_pack;
 use copy_queue::{CopyCommand, CopyCommandSink};
 use task_model::observation::EntryProgress;
 
+pub(crate) mod controlled;
+
 #[cfg(test)]
 #[path = "sender_cancellation_tests.rs"]
 mod cancellation_tests;

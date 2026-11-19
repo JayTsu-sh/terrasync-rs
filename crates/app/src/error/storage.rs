@@ -13,7 +13,7 @@ use tokio::task::JoinError;
 use crate::integrity_check::{MismatchDataField, MismatchMetaField};
 use data_mover::traversal::RemoteScanFailure;
 use data_mover::{
-    metadata::{MetadataApplicationFailure, MetadataPlanError},
+    metadata::{ApplicationFailureKind, MetadataApplicationFailure, MetadataPlanError},
     model::{BackendKind, EntryOperationFailure, FailureClass, ModelValueError, StoragePath},
     probes::ProbeFailure,
     storage::{
@@ -34,7 +34,11 @@ pub enum StorageError {
     #[error(transparent)]
     MetadataVerification(#[from] MetadataVerificationError),
     #[error("目标发布状态与复制结果不一致，禁止删源: {path}")]
-    TargetPublicationChanged { path: StoragePath },
+    TargetPublicationChanged {
+        path: StoragePath,
+        #[source]
+        source: Option<Box<StorageError>>,
+    },
     #[error("目标端持久化确认失败，保留源端: {path}: {source}; {}", role_diagnostic(.source))]
     TargetPersistenceUnconfirmed {
         path: StoragePath,
@@ -210,7 +214,8 @@ impl StorageError {
         matches!(
             self,
             Self::Cancelled | Self::MetadataVerification(MetadataVerificationError::Cancelled)
-        ) || matches!(self, Self::NamespaceRead(NamespaceReadFailure::Cancelled { .. }))
+        ) || matches!(self, Self::MetadataApplication(error) if error.kind() == ApplicationFailureKind::Cancelled)
+            || matches!(self, Self::NamespaceRead(NamespaceReadFailure::Cancelled { .. }))
             || matches!(self,
                 Self::Role(StorageRoleFailure::Entry(error))
                 | Self::TargetPersistenceUnconfirmed { source: StorageRoleFailure::Entry(error), .. }

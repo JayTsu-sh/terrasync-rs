@@ -22,7 +22,10 @@ use crate::error::{AppError, CopyStep, Result};
 use crate::sync::{CommitRecorder, ResumeOpts, copy_file_with_resume, should_resume};
 
 mod in_process;
-pub(crate) use in_process::{LocalCopyExecutor, LocalCopyReceiver};
+pub(crate) use in_process::{
+    LocalCopyCompletion, LocalCopyExecutor, LocalCopyOutcome, LocalCopyPhase, LocalCopyPhaseProof, LocalCopyReceiver,
+    LocalCopyWork,
+};
 
 /// Receiver 运行时配置
 #[allow(clippy::struct_excessive_bools)] // 按用途分组的开关集合，重构为枚举会失去可读性

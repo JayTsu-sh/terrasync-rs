@@ -38,6 +38,7 @@ impl CopiedPublication {
         if !ptr::eq(self.entry.as_ref(), entry) || self.target.path != *entry.path() {
             return Err(StorageError::TargetPublicationChanged {
                 path: entry.path().clone(),
+                source: None,
             });
         }
         // 持久性复核必须仍命中当前发布，不能只确认一个已成为历史的版本。
@@ -190,6 +191,7 @@ async fn execute_file(
             &view.source_path()?,
             &SourceVersion::Current,
             outcome.destination_version.as_deref(),
+            None,
             options.cancel.clone().unwrap_or_default(),
         )
         .await
@@ -198,7 +200,10 @@ async fn execute_file(
             source: Box::new(error.into()),
         })?;
     if target.kind != EntryKind::File || target.size != Some(view.get_size()) {
-        return Err(StorageError::TargetPublicationChanged { path: target.path });
+        return Err(StorageError::TargetPublicationChanged {
+            path: target.path,
+            source: None,
+        });
     }
     Ok((
         outcome,

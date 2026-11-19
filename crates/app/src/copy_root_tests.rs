@@ -10,6 +10,11 @@ use crate::{
     migration_plan::MigrationPlan,
     storage_factory::{StorageRole, create_storage_for_role},
 };
+use async_trait::async_trait;
+use data_mover::{
+    model::{FailureClass, MetadataObservations},
+    storage::{Metadata, MetadataMutation, StorageBuilder, StorageRoleFailure},
+};
 use db::DatabaseError;
 
 async fn roots(source: &Path, target: &Path, cancel: CancellationToken) -> Result<CopyRootMetadata> {
@@ -90,6 +95,131 @@ async fn replaced_target_root_is_refused_before_any_directory_finalization() -> 
     assert_eq!(std::fs::metadata(&held)?.permissions().mode() & 0o7777, 0o777);
     assert_eq!(std::fs::metadata(&target)?.permissions().mode() & 0o7777, 0o711);
     assert!(source.path().is_dir());
+    Ok(())
+}
+
+struct UnboundRootMetadata(Arc<dyn Metadata>);
+
+#[async_trait]
+impl Metadata for UnboundRootMetadata {
+    async fn observe(
+        &self, path: &StoragePath, plan: ObservationPlan,
+    ) -> std::result::Result<MetadataObservations, StorageRoleFailure> {
+        self.0.observe(path, plan).await
+    }
+
+    async fn apply(
+        &self, path: &StoragePath, mutation: MetadataMutation, cancel: CancellationToken,
+    ) -> std::result::Result<(), StorageRoleFailure> {
+        self.0.apply(path, mutation, cancel).await
+    }
+}
+
+fn omit_directory_binding(destination: &mut Arc<StorageContext>) -> Result<()> {
+    let destination = Arc::make_mut(destination);
+    destination.roles = StorageBuilder::new(
+        destination.roles.identity().clone(),
+        destination.roles.capabilities().clone(),
+    )
+    .namespace(destination.roles.namespace()?)
+    .read_source(destination.roles.read_source()?)
+    .staged_destination(destination.roles.staged_destination()?)
+    .metadata(Arc::new(UnboundRootMetadata(destination.roles.metadata()?)))
+    .build()
+    .unwrap_or_else(|error| panic!("construct unbound metadata role: {error}"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn ordinary_root_finalization_succeeds_without_directory_binding() -> Result<()> {
+    let source = tempfile::tempdir()?;
+    let expected = UNIX_EPOCH + Duration::from_nanos(1_700_000_000_123_456_789);
+    std::fs::set_permissions(source.path(), Permissions::from_mode(0o750))?;
+    File::open(source.path())?.set_times(FileTimes::new().set_modified(expected))?;
+    for require_persistence in [false, true] {
+        let target = tempfile::tempdir()?;
+        std::fs::set_permissions(target.path(), Permissions::from_mode(0o711))?;
+        let mut root = roots(source.path(), target.path(), CancellationToken::new()).await?;
+        root.require_persistence = require_persistence;
+        omit_directory_binding(root.destination.as_mut().ok_or(AppError::ScanWorkerStopped)?)?;
+        let destination = root.destination.clone().ok_or(AppError::ScanWorkerStopped)?;
+        root.capture().await?;
+        assert!(root.directory_bindings().is_none());
+        std::fs::write(target.path().join("copied"), b"target")?;
+        root.finish(&destination).await?;
+        let actual = std::fs::metadata(target.path())?;
+        assert_eq!(actual.permissions().mode() & 0o7777, 0o750);
+        assert_eq!(actual.modified()?, expected);
+        assert_eq!(std::fs::read(target.path().join("copied"))?, b"target");
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn ordinary_root_finalization_checks_identity_before_an_unbound_write() -> Result<()> {
+    let source = tempfile::tempdir()?;
+    let parent = tempfile::tempdir()?;
+    let target = parent.path().join("target");
+    let held = parent.path().join("held");
+    std::fs::create_dir(&target)?;
+    std::fs::set_permissions(source.path(), Permissions::from_mode(0o750))?;
+    std::fs::set_permissions(&target, Permissions::from_mode(0o777))?;
+    let mut root = roots(source.path(), &target, CancellationToken::new()).await?;
+    root.require_persistence = false;
+    omit_directory_binding(root.destination.as_mut().ok_or(AppError::ScanWorkerStopped)?)?;
+    root.capture().await?;
+    std::fs::rename(&target, &held)?;
+    std::fs::create_dir(&target)?;
+    std::fs::set_permissions(&target, Permissions::from_mode(0o711))?;
+    let mut destination =
+        Arc::new(create_storage_for_role(&target.to_string_lossy(), None, false, StorageRole::Destination).await?);
+    omit_directory_binding(&mut destination)?;
+    let failure = root
+        .finish(&destination)
+        .await
+        .err()
+        .ok_or(AppError::ScanWorkerStopped)?;
+    assert!(matches!(
+        failure,
+        AppError::CopyRootMetadataFailure {
+            phase: "root_target_binding",
+            ..
+        }
+    ));
+    assert!(matches!(
+        failure.storage_error(),
+        Some(StorageError::TargetPublicationChanged { .. })
+    ));
+    assert_eq!(std::fs::metadata(&held)?.permissions().mode() & 0o7777, 0o777);
+    assert_eq!(std::fs::metadata(&target)?.permissions().mode() & 0o7777, 0o711);
+    Ok(())
+}
+
+#[tokio::test]
+async fn root_finalization_keeps_its_binding_guarantee_after_reopening_the_target() -> Result<()> {
+    let source = tempfile::tempdir()?;
+    let target = tempfile::tempdir()?;
+    std::fs::set_permissions(source.path(), Permissions::from_mode(0o750))?;
+    std::fs::set_permissions(target.path(), Permissions::from_mode(0o711))?;
+    let mut root = roots(source.path(), target.path(), CancellationToken::new()).await?;
+    root.require_persistence = false;
+    root.capture().await?;
+    assert!(root.directory_bindings().is_some());
+    let mut destination = Arc::new(
+        create_storage_for_role(&target.path().to_string_lossy(), None, false, StorageRole::Destination).await?,
+    );
+    omit_directory_binding(&mut destination)?;
+    let failure = root
+        .finish(&destination)
+        .await
+        .err()
+        .ok_or(AppError::ScanWorkerStopped)?;
+    assert!(
+        matches!(failure.storage_error(), Some(StorageError::MetadataApplication(error))
+        if matches!(error.storage_error(), Some(StorageRoleFailure::Entry(error))
+            if error.class() == FailureClass::Unsupported))
+    );
+    assert_eq!(std::fs::metadata(target.path())?.permissions().mode() & 0o7777, 0o711);
     Ok(())
 }
 
@@ -185,5 +315,53 @@ async fn retaining_capture_failure_preserves_a_distinct_root_failure() -> Result
     };
     assert!(!Arc::ptr_eq(&first, &second));
     assert!(Arc::ptr_eq(&second, &captured));
+    Ok(())
+}
+
+#[tokio::test]
+async fn weak_target_identity_refuses_controlled_directory_admission() -> Result<()> {
+    let source = tempfile::tempdir()?;
+    let target = tempfile::tempdir()?;
+    let mut root = roots(source.path(), target.path(), CancellationToken::new()).await?;
+    root.capture().await?;
+    assert!(root.directory_bindings().is_some());
+    let prepared = root.prepared.take();
+    let Some(RootPreparation::Ready(mut prepared_target)) = prepared else {
+        panic!("real local target must be prepared");
+    };
+    assert!(prepared_target.supports_bound_metadata);
+    prepared_target.identity = SourceIdentity::new(
+        prepared_target.identity.backend().clone(),
+        IdentityStrength::PathScoped,
+        b"root-path",
+    )
+    .map_err(StorageError::from)?;
+    assert!(root.prepared.set(RootPreparation::Ready(prepared_target)).is_ok());
+    assert!(
+        root.directory_bindings().is_none(),
+        "HDFS-like path identity must retain ordinary scan path"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn weak_source_identity_is_allowed_with_stable_target_in_retain_source_mode() -> Result<()> {
+    let source = tempfile::tempdir()?;
+    let target = tempfile::tempdir()?;
+    let mut root = roots(source.path(), target.path(), CancellationToken::new()).await?;
+    root.require_persistence = false;
+    root.capture().await?;
+    let captured = root.captured.take().ok_or(AppError::ScanWorkerStopped)?;
+    let weak = SourceIdentity::new(
+        captured.source_identity().backend().clone(),
+        IdentityStrength::PathScoped,
+        b"source-root-path",
+    )
+    .map_err(StorageError::from)?;
+    let entry =
+        ObservedEntry::new(StoragePath::root(), EntryKind::Directory, None, None, weak).map_err(StorageError::from)?;
+    assert!(root.captured.set(Arc::new(entry)).is_ok());
+    // 保留源任务只要求目标可识别替换；不把HDFS等源的路径身份误当删源许可。
+    assert!(root.directory_bindings().is_some());
     Ok(())
 }

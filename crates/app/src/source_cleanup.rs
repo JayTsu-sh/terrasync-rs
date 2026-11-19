@@ -206,6 +206,7 @@ async fn remove_entry(
             if !ready_files::ordinary_file(entry) || !can_stream_files(source, destination) {
                 return Err(StorageError::TargetPublicationChanged {
                     path: entry.path().clone(),
+                    source: None,
                 }
                 .into());
             }
@@ -217,6 +218,7 @@ async fn remove_entry(
                 entry.path(),
                 &SourceVersion::Current,
                 None,
+                None,
                 check.cancel.clone(),
             )
             .await
@@ -225,6 +227,7 @@ async fn remove_entry(
     if target.kind != entry.kind() || (entry.kind() == EntryKind::File && target.size != entry.size()) {
         return Err(StorageError::TargetPublicationChanged {
             path: entry.path().clone(),
+            source: None,
         }
         .into());
     }
@@ -240,6 +243,7 @@ async fn remove_entry(
     {
         return Err(StorageError::TargetPublicationChanged {
             path: entry.path().clone(),
+            source: None,
         }
         .into());
     }

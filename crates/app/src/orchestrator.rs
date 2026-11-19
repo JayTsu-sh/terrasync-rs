@@ -21,6 +21,10 @@ use crate::consumer::ConsumerManager;
 use crate::error::{AppError, Result, StorageError};
 use crate::source_cleanup;
 use crate::sync::StoragePair;
+use data_mover::traversal::ScanFailureSignal;
+use tokio::task::JoinSet;
+
+use crate::receiver::LocalCopyExecutor;
 
 mod full;
 mod incremental;
@@ -41,6 +45,14 @@ mod rename_tests;
 #[cfg(test)]
 #[path = "orchestrator_retention_tests.rs"]
 mod retention_tests;
+
+#[cfg(all(test, unix))]
+#[path = "orchestrator_controlled_tests.rs"]
+mod controlled_tests;
+
+#[cfg(all(test, unix))]
+#[path = "orchestrator_controlled_real_tests.rs"]
+mod controlled_real_tests;
 
 #[cfg(all(test, unix))]
 #[path = "orchestrator_root_error_tests.rs"]
@@ -174,6 +186,38 @@ async fn create_storage_pair_with_retry(
         },
         None => initialize.await,
     }
+}
+
+/// 收束已启动的接收端初始化；源故障必须能打断挂载等待。
+async fn collect_controlled_receivers(
+    mut mounts: JoinSet<Result<LocalCopyExecutor>>, source_guard: &ScanFailureSignal, task_cancel: &CancellationToken,
+) -> (Vec<LocalCopyExecutor>, Option<AppError>) {
+    let mut executors = Vec::new();
+    let mut failure = None;
+    let mut source_seen = false;
+    while !mounts.is_empty() {
+        tokio::select! {
+            biased;
+            () = source_guard.failed(), if !source_seen => {
+                source_seen = true;
+                task_cancel.cancel();
+            }
+            result = mounts.join_next() => {
+                let Some(result) = result else { break };
+                match result.unwrap_or_else(|error| Err(error.into())) {
+                    Ok(executor) => executors.push(executor),
+                    // 同一共享取消产生的派生错误不冒充新的挂载原因。
+                    Err(error) if error.storage_error().is_some_and(StorageError::is_cancelled) => {}
+                    Err(error) => { failure.get_or_insert(error); task_cancel.cancel(); }
+                }
+            }
+        }
+    }
+    // 即使源故障早于任何mount的准入，也保留同一共享取消事实。
+    if source_guard.failure().is_some() {
+        task_cancel.cancel();
+    }
+    (executors, failure)
 }
 
 /// 按已提交基线和复制策略编排单进程全量或增量迁移。

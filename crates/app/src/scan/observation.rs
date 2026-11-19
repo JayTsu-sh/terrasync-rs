@@ -107,7 +107,7 @@ pub async fn observe_path(storage: &Storage, value: &Path) -> Result<ObservedEnt
 pub(crate) async fn observe_path_with_plan(
     storage: &Storage, value: &Path, plan: ObservationPlan,
 ) -> Result<ObservedEntry> {
-    let descriptor = storage.namespace()?.stat(&path(value)?).await?;
+    let descriptor = storage.namespace()?.stat(&path(value)?, false).await?;
     Ok(observe_descriptor(storage, descriptor, plan).await?)
 }
 

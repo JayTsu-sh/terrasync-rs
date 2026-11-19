@@ -2,7 +2,9 @@
 use std::path::Path;
 use std::sync::{Arc, OnceLock};
 
-use data_mover::model::{BackendKind, EntryKind, ObservationPlan, ObservedEntry, SourceIdentity, StoragePath};
+use data_mover::model::{
+    BackendKind, EntryKind, IdentityStrength, ObservationPlan, ObservedEntry, SourceIdentity, StoragePath,
+};
 use data_mover::storage::{NamespaceReadOutcome, NamespaceReadPolicy, SourceDescriptor, read_namespace_entry};
 use task_model::observation::ObservedItem;
 use tokio_util::sync::CancellationToken;
@@ -30,8 +32,19 @@ impl RootFailure {
 
 enum RootPreparation {
     Omitted,
-    Ready(SourceIdentity),
+    Ready(RootTarget),
     Failed(RootFailure),
+}
+
+struct RootTarget {
+    identity: SourceIdentity,
+    supports_bound_metadata: bool,
+}
+
+impl RootTarget {
+    fn can_bind_metadata(&self) -> bool {
+        self.supports_bound_metadata && self.identity.strength() == IdentityStrength::StableWithinBackend
+    }
 }
 
 pub(crate) struct CopyRootMetadata {
@@ -66,6 +79,18 @@ impl CopyRootMetadata {
 
     pub(crate) fn enabled(&self) -> bool {
         self.source.is_some()
+    }
+
+    pub(crate) fn cancellation(&self) -> CancellationToken {
+        self.cancel.clone()
+    }
+
+    pub(crate) fn directory_bindings(&self) -> Option<(Arc<StorageContext>, Arc<StorageContext>)> {
+        // 目标必须能按同一身份完成 Prepare 与 Finalize；这里不授予删源许可。
+        if !matches!(self.prepared.get(), Some(RootPreparation::Ready(target)) if target.can_bind_metadata()) {
+            return None;
+        }
+        Some((self.source.clone()?, self.destination.clone()?))
     }
 
     /// 获取失败留到内容复制后报告；不把元数据拒绝变成可读数据的准入失败。
@@ -124,13 +149,19 @@ impl CopyRootMetadata {
             if descriptor.kind != EntryKind::Directory {
                 return Err(StorageError::TargetPublicationChanged {
                     path: StoragePath::root(),
+                    source: None,
                 });
             }
-            Ok(Some(descriptor.source_identity))
+            phase = "root_target_metadata_capability";
+            let supports_bound_metadata = target.storage().metadata()?.supports_bound_directory_metadata();
+            Ok(Some(RootTarget {
+                identity: descriptor.source_identity,
+                supports_bound_metadata,
+            }))
         }
         .await;
         match outcome {
-            Ok(Some(identity)) => RootPreparation::Ready(identity),
+            Ok(Some(target)) => RootPreparation::Ready(target),
             Ok(None) => RootPreparation::Omitted,
             Err(source_error) => RootPreparation::Failed(RootFailure {
                 backend,
@@ -178,16 +209,17 @@ impl CopyRootMetadata {
             } => Ok(descriptor),
             _ => Err(StorageError::TargetPublicationChanged {
                 path: StoragePath::root(),
+                source: None,
             }),
         }
     }
 
     /// 调用方在内容阶段结束后重开目标根；对子目录和根收尾核对相同端点身份。
     pub(crate) async fn verify_target_binding(&self, target: &StorageContext) -> Result<()> {
-        let Some(RootPreparation::Ready(identity)) = self.prepared.get() else {
+        let Some(RootPreparation::Ready(root)) = self.prepared.get() else {
             return Ok(());
         };
-        self.confirm_target(target, identity).await.map(|_| ())
+        self.confirm_target(target, &root.identity).await.map(|_| ())
     }
 
     async fn confirm_target(&self, target: &StorageContext, identity: &SourceIdentity) -> Result<SourceDescriptor> {
@@ -197,6 +229,7 @@ impl CopyRootMetadata {
             if &descriptor.source_identity != identity || descriptor.kind != EntryKind::Directory {
                 return Err(StorageError::TargetPublicationChanged {
                     path: StoragePath::root(),
+                    source: None,
                 });
             }
             if self.require_persistence {
@@ -214,10 +247,10 @@ impl CopyRootMetadata {
 
     /// 全部子项的命名空间操作之后执行；根元数据就绪前不授权源清理。
     pub(crate) async fn finish(&self, target: &StorageContext) -> Result<()> {
-        let identity = match self.prepared.get() {
+        let root = match self.prepared.get() {
             Some(RootPreparation::Omitted) => return Ok(()),
             Some(RootPreparation::Failed(failure)) => return Err(failure.error()),
-            Some(RootPreparation::Ready(identity)) => identity,
+            Some(RootPreparation::Ready(root)) => root,
             None => return Err(AppError::ConfigError("root metadata not captured".into())),
         };
         if self.finalized.get().is_some() {
@@ -227,18 +260,36 @@ impl CopyRootMetadata {
             .captured
             .get()
             .ok_or_else(|| AppError::ConfigError("root observation missing".into()))?;
-        self.confirm_target(target, identity).await?;
+        let anchor = root.can_bind_metadata().then(|| root.identity.identity_key());
+        if anchor.is_none() || self.require_persistence {
+            self.confirm_target(target, &root.identity).await?;
+        }
         let outcome = async {
             let namespace = target.storage().namespace()?;
             let item = ObservedItem::from(entry.clone());
-            let after = set_item_metadata(target.storage(), item.view(), None, Some(self.cancel.clone())).await?;
-            if &after.source_identity != identity {
+            let after =
+                set_item_metadata(target.storage(), item.view(), None, anchor, Some(self.cancel.clone())).await?;
+            if after.source_identity != root.identity || after.kind != EntryKind::Directory {
                 return Err(StorageError::TargetPublicationChanged {
                     path: StoragePath::root(),
+                    source: None,
                 });
             }
+            let current = if anchor.is_some() {
+                after
+            } else {
+                // 普通回读描述可能来自已改名的旧句柄；仍须核对当前路径。
+                let current = self.read_target(target).await?;
+                if current.source_identity != root.identity || current.kind != EntryKind::Directory {
+                    return Err(StorageError::TargetPublicationChanged {
+                        path: StoragePath::root(),
+                        source: None,
+                    });
+                }
+                current
+            };
             if self.require_persistence {
-                namespace.persist_observed(&after, self.cancel.clone()).await?;
+                namespace.persist_observed(&current, self.cancel.clone()).await?;
             }
             Ok(())
         }

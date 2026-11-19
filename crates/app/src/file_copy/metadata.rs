@@ -2,14 +2,15 @@
 use crate::error::storage::{Result, StorageError, operation};
 use crate::storage_factory::path;
 use data_mover::model::*;
-use data_mover::storage::{CopiedAclTarget, MetadataMutation, SourceDescriptor, Storage};
+use data_mover::storage::{CopiedAclTarget, MetadataMutation, SourceDescriptor, Storage, StorageRoleFailure};
 use std::path::Path;
 use tokio_util::sync::CancellationToken;
 
 use data_mover::{
     metadata::{
-        AclTarget, MetadataPlan, MetadataPlanRequest, MetadataPolicies, MetadataPolicy, MetadataTarget,
-        OwnershipTarget, TimestampTarget, TimestampTargetCapability, ValueTarget, compile_copied_metadata_plan,
+        AclTarget, ApplicationFailureKind, MetadataPlan, MetadataPlanRequest, MetadataPolicies, MetadataPolicy,
+        MetadataTarget, MetadataVerificationError, OwnershipTarget, TimestampTarget, TimestampTargetCapability,
+        ValueTarget, compile_copied_metadata_plan,
     },
     storage::{CopiedOwnershipTarget, CopiedTimestampTarget, CopiedValueTarget},
 };
@@ -190,7 +191,7 @@ pub(crate) async fn set_entry_metadata(
             .and_then(|history| history.records().iter().position(|record| record.is_latest())),
     }
     .payload();
-    set_item_metadata(storage, view, None, cancel).await.map(|_| ())
+    set_item_metadata(storage, view, None, None, cancel).await.map(|_| ())
 }
 
 /// 核对捕获结果并编译计划；不查询源端，也不应用目标元数据。
@@ -207,15 +208,56 @@ pub(crate) fn captured_metadata_plan(storage: &Storage, view: ObservedView<'_>) 
 }
 
 pub(crate) async fn set_item_metadata(
-    storage: &Storage, view: ObservedView<'_>, target_version: Option<&str>, cancel: Option<CancellationToken>,
+    storage: &Storage, view: ObservedView<'_>, target_version: Option<&str>, current_anchor: Option<EntryIdentityKey>,
+    cancel: Option<CancellationToken>,
 ) -> Result<SourceDescriptor> {
     let plan = captured_metadata_plan(storage, view)?;
     let cancel = cancel.unwrap_or_default();
     let metadata = storage.metadata()?;
     let path = view.source_path()?;
     let version = target_version.map_or(SourceVersion::Current, |id| SourceVersion::Id(id.to_owned()));
-    plan.apply(metadata.as_ref(), &path, &version, cancel.clone()).await?;
-    Ok(plan.verify_published(storage, &path, &version, None, cancel).await?)
+    if let Some(identity) = current_anchor {
+        if version != SourceVersion::Current {
+            return Err(StorageError::TargetPublicationChanged { path, source: None });
+        }
+        if let Err(source) = plan
+            .apply_bound_directory(metadata.as_ref(), &path, identity, cancel.clone())
+            .await
+        {
+            return if source.kind() != ApplicationFailureKind::Cancelled
+                && matches!(source.storage_error(), Some(StorageRoleFailure::Entry(error)) if error.class() == FailureClass::Conflict)
+            {
+                Err(StorageError::TargetPublicationChanged {
+                    path,
+                    source: Some(Box::new(source.into())),
+                })
+            } else {
+                Err(source.into())
+            };
+        }
+    } else {
+        plan.apply(metadata.as_ref(), &path, &version, cancel.clone()).await?;
+    }
+    match plan
+        .verify_published(storage, &path, &version, None, current_anchor, cancel)
+        .await
+    {
+        Err(source) if current_anchor.is_some() && verification_conflict(&source) => {
+            Err(StorageError::TargetPublicationChanged {
+                path,
+                source: Some(Box::new(source.into())),
+            })
+        }
+        result => result.map_err(StorageError::from),
+    }
+}
+
+fn verification_conflict(error: &MetadataVerificationError) -> bool {
+    match error {
+        MetadataVerificationError::VersionChanged { .. } => true,
+        MetadataVerificationError::Read(StorageRoleFailure::Entry(error)) => error.class() == FailureClass::Conflict,
+        _ => false,
+    }
 }
 
 #[cfg(any(feature = "remote", test))]

@@ -62,6 +62,16 @@ impl StorageContext {
         }
         Ok(request)
     }
+    pub(crate) fn consumer_traversal(
+        &self, options: &WalkOptions, budget: NonZeroUsize, window: NonZeroUsize,
+    ) -> Result<(TraversalSession, ScanFailureSignal)> {
+        let mut request = self.traversal_request(None, options, false)?;
+        request.consumer_completion_budget = Some(budget);
+        request.consumer_max_inflight = window;
+        let (source, failure) = ScanFailureSignal::source(&self.roles, options.operation_timeout)?;
+        Ok((source.traverse(request), failure))
+    }
+
     fn traversal(&self, sub: Option<&Path>, options: &WalkOptions, blocks: bool) -> Result<TraversalSession> {
         let (source, _) = ScanFailureSignal::source(&self.roles, options.operation_timeout)?;
         Ok(source.traverse(self.traversal_request(sub, options, blocks)?))

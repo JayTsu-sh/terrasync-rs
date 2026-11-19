@@ -41,7 +41,7 @@ async fn copy(source: &StorageContext, target: &StorageContext, name: &str, full
 
 async fn absent(source: &StorageContext, name: &str) -> Result<()> {
     assert!(
-        matches!(source.storage().namespace()?.stat(&path(Path::new(name))?).await,
+        matches!(source.storage().namespace()?.stat(&path(Path::new(name))?, false).await,
         Err(StorageRoleFailure::Entry(error)) if error.class() == FailureClass::NotFound)
     );
     Ok(())
@@ -112,7 +112,7 @@ async fn changed_mode(
             Err(AppError::StorageError(StorageError::MetadataVerification(_)))
         ));
     }
-    source.storage().namespace()?.stat(entry.path()).await?;
+    source.storage().namespace()?.stat(entry.path(), false).await?;
     Ok(())
 }
 
@@ -132,7 +132,7 @@ async fn directory(
         remove_entry(source, target, &entry, check, None).await,
         Err(AppError::StorageError(StorageError::SourcePurgeRefused { .. }))
     ));
-    source.storage().namespace()?.stat(child.path()).await?;
+    source.storage().namespace()?.stat(child.path(), false).await?;
     remove_entry(source, target, &child, check, None).await?;
     remove_entry(source, target, &entry, check, None).await?;
     absent(source, name).await?;
