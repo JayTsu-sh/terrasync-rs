@@ -16,10 +16,9 @@ use data_mover::model::{
     StoragePath, Transience,
 };
 use data_mover::storage::{
-    ByteStream, CheckpointObservation, CopiedMetadataTarget, DestinationPrepareRequest, Metadata, MetadataMutation,
-    PrepareRequest, PreparedStage, PublicationEvidence, PublicationFailure, PublishRequest, StagedDestination,
-    StagedMetadataApplicationFailure, StorageBuilder, StorageRoleFailure, VerificationEvidence, VerifyRequest,
-    WriteEvidence,
+    ByteStream, CheckpointObservation, CopiedMetadataTarget, DestinationPrepareRequest, Metadata, MetadataBatchFailure,
+    MetadataMutation, PrepareRequest, PreparedStage, PublicationEvidence, PublicationFailure, PublishRequest,
+    StagedDestination, StorageBuilder, StorageRoleFailure, VerificationEvidence, VerifyRequest, WriteEvidence,
 };
 use data_mover::transfer::TransferPhase;
 use task_model::TransferMode;
@@ -139,10 +138,10 @@ impl StagedDestination for MetadataBatchProbe {
     }
     async fn apply_metadata_batch(
         &self, stage: &PreparedStage, mutations: Vec<MetadataMutation>, cancel: CancellationToken,
-    ) -> std::result::Result<(), StagedMetadataApplicationFailure> {
+    ) -> std::result::Result<(), MetadataBatchFailure> {
         self.calls.fetch_add(1, Ordering::Relaxed);
         if self.fail {
-            return Err(StagedMetadataApplicationFailure::whole_batch(
+            return Err(MetadataBatchFailure::whole_batch(
                 mutations.len(),
                 0,
                 Some(refused("injected staged metadata refusal")),

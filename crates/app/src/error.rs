@@ -53,6 +53,33 @@ impl Display for CopyStep {
 /// 应用程序的专用错误枚举
 #[derive(Error, Debug)]
 pub enum AppError {
+    #[error("复制失败: {source}; 源端元数据同时获取失败: {metadata}")]
+    CopyAndSourceMetadataFailed {
+        #[source]
+        source: Box<AppError>,
+        metadata: Box<StorageError>,
+    },
+    #[error("复制启动失败: {startup}; 原生扫描收束同时失败: {source}")]
+    CopyStartupAndTraversalFailed {
+        #[source]
+        source: Box<AppError>,
+        startup: Box<AppError>,
+    },
+    #[error("目录目标身份状态超出预算: path={path:?}, count_limit={count_limit}, byte_limit={byte_limit}")]
+    CopyDirectoryBudget {
+        path: PathBuf,
+        count_limit: usize,
+        byte_limit: usize,
+    },
+    #[error("复制 worker 失败，目标写结果未知: path={path:?}, phase={phase}: {source}")]
+    CopyWorkerFailed {
+        path: PathBuf,
+        phase: &'static str,
+        #[source]
+        source: JoinError,
+    },
+    #[error("受控复制工作协议无效: {reason}")]
+    CopyWorkProtocol { reason: &'static str },
     #[error("根目录元数据失败 backend={backend:?} phase={phase}: {source}")]
     CopyRootMetadataFailure {
         backend: BackendKind,
@@ -483,6 +510,7 @@ impl AppError {
             Self::CopyEntryFailed { source, .. }
             | Self::ReportedCopyFailure { source, .. }
             | Self::CopyExecutionAndDatabaseFailed { source, .. } => source.storage_error(),
+            Self::CopyAndSourceMetadataFailed { source, .. } => source.storage_error(),
             Self::StorageError(error) => Some(error),
             Self::ScanStorageAndDatabaseFailure { source, .. } => Some(source),
             _ => None,

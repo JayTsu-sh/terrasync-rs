@@ -21,7 +21,7 @@ struct StalledNamespace;
 
 #[async_trait]
 impl Namespace for StalledNamespace {
-    async fn stat(&self, path: &StoragePath) -> StdResult<SourceDescriptor, StorageRoleFailure> {
+    async fn stat(&self, path: &StoragePath, _: bool) -> StdResult<SourceDescriptor, StorageRoleFailure> {
         Ok(SourceDescriptor::new(
             path.clone(),
             EntryKind::Directory,

@@ -49,8 +49,8 @@ struct ObjectNamespace {
 
 #[async_trait]
 impl Namespace for ObjectNamespace {
-    async fn stat(&self, path: &StoragePath) -> Result<SourceDescriptor, StorageRoleFailure> {
-        self.inner.stat(path).await
+    async fn stat(&self, path: &StoragePath, fresh: bool) -> Result<SourceDescriptor, StorageRoleFailure> {
+        self.inner.stat(path, fresh).await
     }
     fn list(&self, request: ListRequest) -> ListingStream {
         self.inner.list(request)

@@ -58,8 +58,8 @@ struct CountPurge {
 
 #[async_trait]
 impl Namespace for CountPurge {
-    async fn stat(&self, path: &StoragePath) -> std::result::Result<SourceDescriptor, StorageRoleFailure> {
-        self.inner.stat(path).await
+    async fn stat(&self, path: &StoragePath, fresh: bool) -> std::result::Result<SourceDescriptor, StorageRoleFailure> {
+        self.inner.stat(path, fresh).await
     }
     fn list(&self, request: ListRequest) -> ListingStream {
         self.inner.list(request)
@@ -225,7 +225,7 @@ async fn real_nfs_mode_change_after_copy_retains_source_and_unchanged_mode_can_b
         }
         assert_eq!(std::fs::read(target_root.path().join(name))?, b"payload");
     }
-    remote(&format!("from pathlib import Path\nimport os\nr=Path({quoted_root})\nassert not (r/'unchanged').exists()\np=r/'changed'\nassert p.read_bytes()==b'payload' and os.stat(p).st_mode & 0o777 == 0o750")).await?;
+    remote(&format!("from pathlib import Path\nimport os\nr=Path({quoted_root})\nassert not (r/'unchanged').exists()\np=r/'changed'\nassert p.read_bytes()==b'payload' and os.stat(p, false).st_mode & 0o777 == 0o750")).await?;
     eprintln!(
         "real NFS v4.1 unchanged_source_deleted=true source_mode_change_retained=true target_data_preserved=true repeated_cleanup_idempotent=true"
     );

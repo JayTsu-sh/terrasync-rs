@@ -32,8 +32,8 @@ struct ArmPersistence {
 
 #[async_trait]
 impl Namespace for ArmPersistence {
-    async fn stat(&self, path: &StoragePath) -> std::result::Result<SourceDescriptor, StorageRoleFailure> {
-        self.inner.stat(path).await
+    async fn stat(&self, path: &StoragePath, fresh: bool) -> std::result::Result<SourceDescriptor, StorageRoleFailure> {
+        self.inner.stat(path, fresh).await
     }
     fn list(&self, request: ListRequest) -> ListingStream {
         self.inner.list(request)

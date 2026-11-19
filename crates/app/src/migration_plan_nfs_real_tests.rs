@@ -109,8 +109,8 @@ async fn denied(source: &StorageContext, target: &StorageContext, plan: &Migrati
             .await
             .is_err()
     );
-    source.storage().namespace()?.stat(entry.path()).await?;
-    target.storage().namespace()?.stat(entry.path()).await?;
+    source.storage().namespace()?.stat(entry.path(), false).await?;
+    target.storage().namespace()?.stat(entry.path(), false).await?;
     let required = plan.observation.with_acl(ObservationMode::Required);
     assert!(
         matches!(source.storage().metadata()?.observe(entry.path(), required).await,

@@ -225,9 +225,15 @@ pub(crate) async fn copy_versions<I: Iterator<Item = ObservedItem> + Send>(
                 }
                 _ => None,
             };
-            metadata::set_item_metadata(to.storage(), item.view().payload(), version, options.cancel.clone())
-                .await
-                .map(|_| version.map(str::to_owned))
+            metadata::set_item_metadata(
+                to.storage(),
+                item.view().payload(),
+                version,
+                None,
+                options.cancel.clone(),
+            )
+            .await
+            .map(|_| version.map(str::to_owned))
         } else {
             transfer::copy_item(
                 from,

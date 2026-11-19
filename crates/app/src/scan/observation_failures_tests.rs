@@ -77,8 +77,8 @@ struct FailingLink {
 
 #[async_trait]
 impl Namespace for FailingLink {
-    async fn stat(&self, path: &StoragePath) -> Result<SourceDescriptor, StorageRoleFailure> {
-        self.inner.stat(path).await
+    async fn stat(&self, path: &StoragePath, fresh: bool) -> Result<SourceDescriptor, StorageRoleFailure> {
+        self.inner.stat(path, fresh).await
     }
     fn list(&self, request: ListRequest) -> ListingStream {
         self.inner.list(request)
