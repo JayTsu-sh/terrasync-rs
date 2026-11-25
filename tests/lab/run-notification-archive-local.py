@@ -108,6 +108,7 @@ def run_copy_generations():
     comparison_stats = {"reads": 0, "first": None}
     guard = threading.Lock()
     release = threading.Event()
+    state_read_hit = threading.Event()
 
     class Proxy(http.server.BaseHTTPRequestHandler):
         def log_message(self, *_):
@@ -115,6 +116,10 @@ def run_copy_generations():
 
         def do_GET(self):
             nonlocal state
+            if self.path == "/state_read_hit":
+                self.send_response(200 if state_read_hit.is_set() else 404)
+                self.end_headers()
+                return
             if self.path == "/compare_stats":
                 with guard:
                     first = comparison_stats["first"]
@@ -135,11 +140,13 @@ def run_copy_generations():
             if self.path not in ("/normal", "/disconnect", "/stall", "/startup_disconnect", "/startup_stall", "/running_disconnect", "/running_stall", "/reject_prepare",
                                  "/compare_flash", "/compare_lost", "/compare_disconnect", "/compare_stall", "/compare_recover_stall", "/compare_reject",
                                  "/batch_flash", "/batch_lost", "/batch_disconnect", "/batch_stall", "/batch_recover_stall", "/batch_reject",
-                                 "/retirement_flash", "/retirement_disconnect", "/retirement_stall", "/retirement_lost", "/retirement_cancel"):
+                                 "/retirement_flash", "/retirement_disconnect", "/retirement_stall", "/retirement_lost", "/retirement_cancel",
+                                 "/state_read_flash", "/state_read_disconnect", "/state_read_stall"):
                 self.send_error(404)
                 return
             with guard:
                 state = self.path[1:]
+                state_read_hit.clear()
                 batch_stats.update(writes=0, lost=0, tokens=set())
                 comparison_stats.update(reads=0, first=None)
             self.send_response(200)
@@ -165,8 +172,18 @@ def run_copy_generations():
             is_retirement = b"ALTER TABLE" in query.upper() and b"COPY_SEQUENCE>0" in query.upper()
             is_compare = b"AS CHANGE_CODE" in query.upper()
             is_insert = b"INSERT INTO" in query.upper() and b"BASE_" in query.upper()
+            is_state_read = b"SELECT" in query.upper() and (
+                b"COPY_BASELINE_SEQUENCE" in query.upper() or b"MAX(STATE_VERSION)" in query.upper())
             with guard:
                 fault = state
+                if fault.startswith("state_read_"):
+                    if is_state_read:
+                        state_read_hit.set()
+                        fault = "batch_" + fault.removeprefix("state_read_")
+                        if state == "state_read_flash":
+                            state = "normal"
+                    else:
+                        fault = "normal"
                 if fault.startswith("retirement_"):
                     if not is_retirement:
                         fault = "normal"
@@ -192,7 +209,7 @@ def run_copy_generations():
                         fault = "batch_" + fault.removeprefix("compare_")
                         if state in ("compare_flash", "compare_lost", "compare_recover_stall"):
                             state = "normal"
-                if fault.startswith("batch_") and not comparison_fault and not is_retirement:
+                if fault.startswith("batch_") and not comparison_fault and not is_retirement and not is_state_read:
                     if not is_insert:
                         fault = "normal"
                     elif fault in ("batch_flash", "batch_lost", "batch_recover_stall"):
@@ -352,14 +369,12 @@ def run_copy_generations():
                 "--", "--ignored", "--nocapture",
             ], cwd=ROOT, env=environment, check=True)
             return
-        subprocess.run([
-            "cargo", "test", "--offline", "--locked", "-p", "db", "--lib",
-            "real_source_deleted_base_retirement", "--", "--ignored", "--nocapture",
-        ], cwd=ROOT, env=environment, check=True)
-        subprocess.run([
-            "cargo", "test", "--offline", "--locked", "-p", "db", "--lib",
-            "real_copy_generation_policies", "--", "--ignored", "--nocapture",
-        ], cwd=ROOT, env=environment, check=True)
+        for case in ("real_versioned_copy_state_reads_are_bounded", "real_source_deleted_base_retirement",
+                     "real_copy_generation_policies"):
+            subprocess.run([
+                "cargo", "test", "--offline", "--locked", "-p", "db", "--lib",
+                case, "--", "--ignored", "--nocapture",
+            ], cwd=ROOT, env=environment, check=True)
         subprocess.run([
             "cargo", "test", "--offline", "--locked", "-p", "app", "--lib",
             "real_copy_source_policy_transitions_preserve_target_data",

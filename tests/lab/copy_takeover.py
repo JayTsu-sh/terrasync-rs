@@ -185,7 +185,7 @@ read_timeout = 60
             assert gate.received.wait(30), f"no old database write intercepted. See {case_logs}"
             if not hold_state:
                 assert b"\x07changed" in gate.payload and b"\x05added" in gate.payload, case_logs
-            wait_for(lambda: record_contents(source) == {"unchanged": b"stable"},
+            wait_for(lambda: {path.name for path in source.iterdir()} == {"unchanged"},
                      f"ready files were not cleaned before receipt. See {case_logs}")
             assert record_contents(target) == {"changed": changed, "added": added, "unchanged": b"stable"}
             previous = generations(database, job)[-1]
@@ -228,6 +228,13 @@ read_timeout = 60
             print(f"takeover after_sigkill job={job} successor_generation=3 successor_mode=full "
                   f"published_bytes={detail['transferred_bytes']} recovered_ms={elapsed_ms}", flush=True)
 
+            storage = ([(f"{database}.base_{job}", 8123)] if selected is None else
+                       [(f"{database}.__catalogue_base_{job}", 8123 + 2 * selected + replica)
+                        for replica in range(2)])
+            if not hold_state:
+                for table, port in storage:
+                    sql(f"ALTER TABLE {table} MODIFY SETTING max_bytes_to_merge_at_max_space_in_pool=1", port)
+
             # Send the exact old request after the new generation has completed.
             gate.release.set()
             assert gate.finished.wait(30) and gate.status == 200, (gate.status, case_logs)
@@ -242,6 +249,9 @@ read_timeout = 60
                 by_path = {row["relative_path"]: row for row in base(database, job)}
                 assert by_path["changed"]["copy_execution_id"] == successor_id, by_path
                 assert by_path["added"]["copy_execution_id"] == previous_id, by_path
+                for table, port in storage:
+                    physical = rows(f"SELECT copy_execution_id FROM {table} WHERE relative_path='changed'", port)
+                    assert {row["copy_execution_id"] for row in physical} == {previous_id, successor_id}, physical
 
             assert finish(launch("next_incremental", True, contender_dir), "next incremental") == 0, case_logs
             _, detail = check_completed(database, job, 4, "incremental")
@@ -258,11 +268,15 @@ read_timeout = 60
 
             # An incremental after another restart must remember the last full boundary
             # and still reconcile a real deletion based on the retained catalogue.
-            (source / "unchanged").unlink()
+            (source / "changed").unlink()
             assert finish(launch("real_deletion", True, contender_dir), "real deletion") == 0, case_logs
             _, detail = check_completed(database, job, 5, "incremental")
             assert detail["deleted_count"] == 1 and detail["transferred_bytes"] == 0, detail
-            assert record_contents(target) == {"changed": fresh, "added": added}
+            assert record_contents(target) == {"unchanged": b"stable", "added": added}
+            # 基线之外的旧版本也须随路径删除，否则普通扫描可再次观察到该路径。
+            for table, port in storage:
+                stale = rows(f"SELECT copy_execution_id FROM {table} WHERE relative_path='changed'", port)
+                assert not stale, (job, table, port, stale)
             print(f"takeover valid_deletion job={job} reported_deleted={detail['deleted_count']} "
                   f"stale_target_retained=true transferred_bytes={detail['transferred_bytes']}", flush=True)
             return []

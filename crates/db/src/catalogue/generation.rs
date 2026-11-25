@@ -7,7 +7,7 @@ use serde_json::Value;
 use tracing::debug;
 
 use super::ClickHouseDatabase;
-use super::lifecycle::ScanGenerationLifecycle;
+use super::lifecycle::{CopyFactRange, ScanGenerationLifecycle};
 use crate::error::{DatabaseError, Result};
 use crate::execution::queries::execute_request;
 use crate::execution::queries::idempotent_insert_client;
@@ -100,10 +100,12 @@ impl ClickHouseDatabase {
     }
 
     pub(super) async fn publish_copy_scan_state(
-        &self, scan_state: u8, baseline_committed: bool, version: u64, execution_id: &str,
+        &self, scan_state: u8, baseline_committed: bool, execution_id: &str, facts: CopyFactRange,
     ) -> Result<()> {
         let table = get_scan_state_table_name(&self.job_id);
-        self.execute(&format!("INSERT INTO {table} (id,scan_state,baseline_committed,copy_execution_id,state_version) VALUES (1,{scan_state},{baseline_committed},?,{version})"),
+        let version = copy_state_version(facts.last)? + u64::from(baseline_committed);
+        let baseline = facts.first;
+        self.execute(&format!("INSERT INTO {table} (id,scan_state,baseline_committed,copy_execution_id,state_version,copy_baseline_sequence) VALUES (1,{scan_state},{baseline_committed},?,{version},{baseline})"),
             &[Value::from(execution_id)]).await
     }
 
@@ -155,13 +157,10 @@ impl ClickHouseDatabase {
             return Ok(());
         }
         if let Some(execution_id) = &lifecycle.copy_execution_id {
-            let generation = lifecycle
-                .copy_generation
-                .as_ref()
+            let facts = lifecycle
+                .copy_fact_range
                 .ok_or(DatabaseError::CopyExecutionUnavailable)?;
-            let version = copy_state_version(generation.sequence)? + 1;
-            self.publish_copy_scan_state(working, true, version, execution_id)
-                .await?;
+            self.publish_copy_scan_state(working, true, execution_id, facts).await?;
         } else {
             self.insert_scan_state(working).await?;
         }

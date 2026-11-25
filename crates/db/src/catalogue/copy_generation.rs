@@ -28,6 +28,7 @@ struct CopyState {
     scan_state: u8,
     copy_execution_id: String,
     state_version: u64,
+    copy_baseline_sequence: u64,
 }
 
 #[cfg(test)]
@@ -49,8 +50,8 @@ impl ClickHouseDatabase {
         }
         self.create_copy_runs_table().await?;
         let previous = self.latest_copy_generation().await?;
-        let available = if let Some(previous) = &previous {
-            self.copy_baseline_available(previous).await?
+        let baseline = if let Some(previous) = &previous {
+            self.bound_copy_baseline(previous).await?
         } else {
             if self.table_exists(&get_scan_state_table_name(&self.job_id)).await?
                 && !self.copy_generation_state().await?.copy_execution_id.is_empty()
@@ -59,9 +60,9 @@ impl ClickHouseDatabase {
                     field: "binding_unavailable",
                 });
             }
-            false
+            None
         };
-        let plan = CopyGenerationPlan::decide(request, previous.as_ref(), available)?;
+        let plan = CopyGenerationPlan::decide(request, previous.as_ref(), baseline.is_some())?;
         if previous
             .as_ref()
             .is_some_and(|prior| prior.request.execution_id == request.execution_id)
@@ -77,7 +78,7 @@ impl ClickHouseDatabase {
             .ok_or(DatabaseError::CopyGenerationInvalid {
                 field: "sequence_overflow",
             })?;
-        let state_version = copy_state_version(sequence)?;
+        copy_state_version(sequence)?;
         let recovering = plan.mode == MigrationMode::Incremental
             && previous
                 .as_ref()
@@ -85,13 +86,9 @@ impl ClickHouseDatabase {
         let first = if plan.mode == MigrationMode::Full {
             sequence
         } else {
-            let prior = previous.as_ref().ok_or(DatabaseError::CopyExecutionUnavailable)?;
-            if prior.plan.mode == MigrationMode::Full {
-                prior.sequence
-            } else {
-                self.latest_full_copy_sequence(prior.sequence).await?
-            }
+            baseline.ok_or(DatabaseError::CopyExecutionUnavailable)?
         };
+        let facts = CopyFactRange { first, last: sequence };
         lifecycle.copy_generation = Some(CopyGeneration {
             root_snapshot: None,
             sequence,
@@ -129,7 +126,7 @@ impl ClickHouseDatabase {
             .predicate();
             self.execute(&format!("ALTER TABLE {base} UPDATE current_state={committed} WHERE current_state!={committed} AND {facts} SETTINGS mutations_sync=2"), &[]).await?;
         }
-        self.publish_copy_scan_state(committed, false, state_version, &request.execution_id)
+        self.publish_copy_scan_state(committed, false, &request.execution_id, facts)
             .await?;
         generation.baseline_prepared = true;
         generation.phase = CopyGenerationPhase::Prepared;
@@ -139,7 +136,7 @@ impl ClickHouseDatabase {
         lifecycle.copy_recovery = false;
         lifecycle.copy_generation_recovering = recovering;
         lifecycle.copy_execution_id = Some(request.execution_id.clone());
-        lifecycle.copy_fact_range = Some(CopyFactRange { first, last: sequence });
+        lifecycle.copy_fact_range = Some(facts);
         self.cached_scan_state.store(working, Ordering::Relaxed);
         Ok(if recovering {
             CopyGenerationStatus::Recovering
@@ -149,13 +146,32 @@ impl ClickHouseDatabase {
     }
 
     pub async fn copy_baseline_available(&self, previous: &CopyGeneration) -> Result<bool> {
+        Ok(self.bound_copy_baseline(previous).await?.is_some())
+    }
+
+    /// 全量起点随准备与提交状态写入，后继只继承上一已绑定的起点。
+    async fn bound_copy_baseline(&self, previous: &CopyGeneration) -> Result<Option<u64>> {
         if !previous.baseline_prepared
             || !self.table_exists(&get_scan_base_table_name(&self.job_id)).await?
             || !self.table_exists(&get_scan_state_table_name(&self.job_id)).await?
         {
-            return Ok(false);
+            return Ok(None);
         }
-        Ok(self.copy_generation_state().await?.copy_execution_id == previous.request.execution_id)
+        let state = self.copy_generation_state().await?;
+        if state.copy_execution_id != previous.request.execution_id {
+            return Ok(None);
+        }
+        let baseline = state.copy_baseline_sequence;
+        let prepared_version = copy_state_version(previous.sequence)?;
+        if !(prepared_version..=prepared_version + 1).contains(&state.state_version)
+            || baseline > previous.sequence
+            || (previous.plan.mode == MigrationMode::Full && baseline != previous.sequence)
+        {
+            return Err(DatabaseError::CopyGenerationInvalid {
+                field: "copy_baseline_sequence",
+            });
+        }
+        Ok(Some(baseline))
     }
 
     async fn copy_generation_state(&self) -> Result<CopyState> {
@@ -163,7 +179,7 @@ impl ClickHouseDatabase {
         let state = self
             .sync_client
             .query(&format!(
-                "SELECT scan_state,copy_execution_id,state_version FROM {table} FINAL WHERE id=1"
+                "SELECT scan_state,copy_execution_id,state_version,copy_baseline_sequence FROM {table} FINAL WHERE id=1"
             ))
             .fetch_quorum_one::<CopyState>()
             .await?;
@@ -173,7 +189,9 @@ impl ClickHouseDatabase {
                 state.scan_state
             )));
         }
-        if !state.copy_execution_id.is_empty() && state.state_version == 0 {
+        if (!state.copy_execution_id.is_empty() && state.state_version == 0)
+            || state.copy_execution_id.is_empty() != (state.copy_baseline_sequence == 0)
+        {
             return Err(DatabaseError::CopyGenerationInvalid {
                 field: "copy_state_version",
             });

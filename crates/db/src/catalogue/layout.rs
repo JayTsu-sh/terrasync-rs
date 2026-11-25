@@ -263,8 +263,9 @@ impl ClickHouseDatabase {
     pub(super) fn catalogue_delete_statement(
         &self, table: &str, placeholders: &str, facts: Option<CopyFactRange>,
     ) -> Result<String> {
-        let facts = CopyFactRange::and_predicate(facts);
-        let condition = format!("relative_path IN ({placeholders}){facts}");
+        // 已对账删除的路径一并清理更早事实，避免删去新版本后旧行重新成为 FINAL 的结果。
+        let through = facts.map_or_else(String::new, |facts| format!(" AND copy_sequence<={}", facts.last));
+        let condition = format!("relative_path IN ({placeholders}){through}");
         match &self.catalogue_cluster {
             Some(_) => Ok(format!(
                 "ALTER TABLE {} DELETE WHERE {condition} SETTINGS mutations_sync = 2",

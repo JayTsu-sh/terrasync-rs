@@ -107,6 +107,7 @@ mod tests {
         scan_state: u8,
         copy_execution_id: String,
         state_version: u64,
+        copy_baseline_sequence: u64,
     }
 
     fn fixture_database(mock: &Mock) -> ClickHouseDatabase {
@@ -161,6 +162,7 @@ mod tests {
                         scan_state: 1,
                         copy_execution_id: generation.request.execution_id,
                         state_version: 4,
+                        copy_baseline_sequence: 1,
                     }]));
                 }
             } else {

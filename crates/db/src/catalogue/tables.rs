@@ -57,7 +57,7 @@ impl ClickHouseDatabase {
         self.create_catalogue_table(
             &table_name,
             "id UInt8, scan_state UInt8, baseline_committed Bool DEFAULT false, \
-             copy_execution_id String DEFAULT '', state_version UInt64 DEFAULT 0",
+             copy_execution_id String DEFAULT '', state_version UInt64 DEFAULT 0, copy_baseline_sequence UInt64 DEFAULT 0",
             "id",
             CatalogueEngine::ReplacingVersion("state_version"),
         )
