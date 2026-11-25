@@ -8,6 +8,8 @@ use task_model::migration::{
 };
 
 use super::ClickHouseDatabase;
+use super::generation::copy_state_version;
+use super::lifecycle::CopyFactRange;
 use crate::error::{DatabaseError, Result};
 use crate::execution::read::QuorumRead;
 use crate::schema::columns::CATALOGUE_COLUMNS as FILE_SCAN_COLUMNS_LIST;
@@ -25,6 +27,8 @@ pub enum CopyGenerationStatus {
 struct CopyState {
     scan_state: u8,
     copy_execution_id: String,
+    state_version: u64,
+    copy_baseline_sequence: u64,
 }
 
 #[cfg(test)]
@@ -46,8 +50,8 @@ impl ClickHouseDatabase {
         }
         self.create_copy_runs_table().await?;
         let previous = self.latest_copy_generation().await?;
-        let available = if let Some(previous) = &previous {
-            self.copy_baseline_available(previous).await?
+        let baseline = if let Some(previous) = &previous {
+            self.bound_copy_baseline(previous).await?
         } else {
             if self.table_exists(&get_scan_state_table_name(&self.job_id)).await?
                 && !self.copy_generation_state().await?.copy_execution_id.is_empty()
@@ -56,9 +60,9 @@ impl ClickHouseDatabase {
                     field: "binding_unavailable",
                 });
             }
-            false
+            None
         };
-        let plan = CopyGenerationPlan::decide(request, previous.as_ref(), available)?;
+        let plan = CopyGenerationPlan::decide(request, previous.as_ref(), baseline.is_some())?;
         if previous
             .as_ref()
             .is_some_and(|prior| prior.request.execution_id == request.execution_id)
@@ -74,10 +78,17 @@ impl ClickHouseDatabase {
             .ok_or(DatabaseError::CopyGenerationInvalid {
                 field: "sequence_overflow",
             })?;
+        copy_state_version(sequence)?;
         let recovering = plan.mode == MigrationMode::Incremental
             && previous
                 .as_ref()
                 .is_some_and(|prior| prior.phase != CopyGenerationPhase::Completed);
+        let first = if plan.mode == MigrationMode::Full {
+            sequence
+        } else {
+            baseline.ok_or(DatabaseError::CopyExecutionUnavailable)?
+        };
+        let facts = CopyFactRange { first, last: sequence };
         lifecycle.copy_generation = Some(CopyGeneration {
             root_snapshot: None,
             sequence,
@@ -108,12 +119,15 @@ impl ClickHouseDatabase {
             // 未确认行作为墓碑保留；只删这些物理行会复活同键更早的已确认快照。
             // 比较和收尾均排除它们，只有新的复制 ACK 才能恢复该目标槽的就绪证明。
             // 范围外事实跨多轮保留；每轮统一回到 C，观察之后才写 W。
-            self.execute(&format!("ALTER TABLE {base} UPDATE current_state={committed} WHERE current_state!={committed} AND copy_sequence < ? SETTINGS mutations_sync=2"),
-                &[Value::from(sequence)]).await?;
+            let facts = CopyFactRange {
+                first,
+                last: sequence - 1,
+            }
+            .predicate();
+            self.execute(&format!("ALTER TABLE {base} UPDATE current_state={committed} WHERE current_state!={committed} AND {facts} SETTINGS mutations_sync=2"), &[]).await?;
         }
-        let table = get_scan_state_table_name(&self.job_id);
-        self.execute(&format!("INSERT INTO {table} (id,scan_state,baseline_committed,copy_execution_id) VALUES (1,{committed},false,?)"),
-            &[Value::from(request.execution_id.clone())]).await?;
+        self.publish_copy_scan_state(committed, false, &request.execution_id, facts)
+            .await?;
         generation.baseline_prepared = true;
         generation.phase = CopyGenerationPhase::Prepared;
         generation.revision = 2;
@@ -122,6 +136,7 @@ impl ClickHouseDatabase {
         lifecycle.copy_recovery = false;
         lifecycle.copy_generation_recovering = recovering;
         lifecycle.copy_execution_id = Some(request.execution_id.clone());
+        lifecycle.copy_fact_range = Some(facts);
         self.cached_scan_state.store(working, Ordering::Relaxed);
         Ok(if recovering {
             CopyGenerationStatus::Recovering
@@ -131,13 +146,32 @@ impl ClickHouseDatabase {
     }
 
     pub async fn copy_baseline_available(&self, previous: &CopyGeneration) -> Result<bool> {
+        Ok(self.bound_copy_baseline(previous).await?.is_some())
+    }
+
+    /// 全量起点随准备与提交状态写入，后继只继承上一已绑定的起点。
+    async fn bound_copy_baseline(&self, previous: &CopyGeneration) -> Result<Option<u64>> {
         if !previous.baseline_prepared
             || !self.table_exists(&get_scan_base_table_name(&self.job_id)).await?
             || !self.table_exists(&get_scan_state_table_name(&self.job_id)).await?
         {
-            return Ok(false);
+            return Ok(None);
         }
-        Ok(self.copy_generation_state().await?.copy_execution_id == previous.request.execution_id)
+        let state = self.copy_generation_state().await?;
+        if state.copy_execution_id != previous.request.execution_id {
+            return Ok(None);
+        }
+        let baseline = state.copy_baseline_sequence;
+        let prepared_version = copy_state_version(previous.sequence)?;
+        if !(prepared_version..=prepared_version + 1).contains(&state.state_version)
+            || baseline > previous.sequence
+            || (previous.plan.mode == MigrationMode::Full && baseline != previous.sequence)
+        {
+            return Err(DatabaseError::CopyGenerationInvalid {
+                field: "copy_baseline_sequence",
+            });
+        }
+        Ok(Some(baseline))
     }
 
     async fn copy_generation_state(&self) -> Result<CopyState> {
@@ -145,7 +179,7 @@ impl ClickHouseDatabase {
         let state = self
             .sync_client
             .query(&format!(
-                "SELECT scan_state,copy_execution_id FROM {table} FINAL WHERE id=1"
+                "SELECT scan_state,copy_execution_id,state_version,copy_baseline_sequence FROM {table} FINAL WHERE id=1"
             ))
             .fetch_quorum_one::<CopyState>()
             .await?;
@@ -154,6 +188,13 @@ impl ClickHouseDatabase {
                 "Invalid copy generation {}; expected 0 or 1",
                 state.scan_state
             )));
+        }
+        if (!state.copy_execution_id.is_empty() && state.state_version == 0)
+            || state.copy_execution_id.is_empty() != (state.copy_baseline_sequence == 0)
+        {
+            return Err(DatabaseError::CopyGenerationInvalid {
+                field: "copy_state_version",
+            });
         }
         Ok(state)
     }
@@ -202,12 +243,13 @@ impl ClickHouseDatabase {
 
     async fn replayed_paths(&self, old: &[StorageEntryRecord], working: u8) -> Result<HashSet<String>> {
         let table = self.catalogue_query_table(&get_scan_base_table_name(&self.job_id))?;
+        let facts = CopyFactRange::and_predicate(self.copy_fact_range().await?);
         let paths: HashSet<_> = old.iter().map(|row| row.relative_path.as_str()).collect();
         let paths: Vec<_> = paths.into_iter().collect();
         let mut active = HashSet::new();
         for paths in bounded_keys(&paths, |path| path.len()) {
             let placeholders = vec!["?"; paths.len()].join(",");
-            let mut query = self.sync_client.query(&format!("SELECT DISTINCT relative_path FROM {table} FINAL WHERE current_state={working} AND relative_path IN ({placeholders})"));
+            let mut query = self.sync_client.query(&format!("SELECT DISTINCT relative_path FROM {table} FINAL WHERE current_state={working}{facts} AND relative_path IN ({placeholders})"));
             for path in paths {
                 query = query.bind(*path);
             }
@@ -218,13 +260,14 @@ impl ClickHouseDatabase {
 
     async fn retire_copy_versions(&self, keys: &[(String, String)], working: u8) -> Result<()> {
         let table = self.catalogue_storage_table(&get_scan_base_table_name(&self.job_id))?;
+        let facts = CopyFactRange::and_predicate(self.copy_fact_range().await?);
         for keys in bounded_keys(keys, |(path, version)| path.len().saturating_add(version.len())) {
             let placeholders = vec!["(?,?)"; keys.len()].join(",");
             let values: Vec<_> = keys
                 .iter()
                 .flat_map(|(path, version)| [Value::from(path.clone()), Value::from(version.clone())])
                 .collect();
-            self.execute(&format!("ALTER TABLE {table} DELETE WHERE current_state!={working} AND (relative_path,version_id) IN ({placeholders}) SETTINGS mutations_sync=2"), &values).await?;
+            self.execute(&format!("ALTER TABLE {table} DELETE WHERE current_state!={working}{facts} AND (relative_path,version_id) IN ({placeholders}) SETTINGS mutations_sync=2"), &values).await?;
         }
         Ok(())
     }

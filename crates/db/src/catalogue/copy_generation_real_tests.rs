@@ -11,6 +11,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tokio::time::{sleep, timeout};
+use tokio_util::sync::CancellationToken;
 use utils::app_config::ClickHouseMode;
 use uuid::Uuid;
 
@@ -18,9 +19,10 @@ use super::CopyGenerationStatus;
 use crate::DeletionStatus;
 use crate::catalogue::{ComparisonMode, CopyCatalogueEntry};
 use crate::execution::base_client;
+use crate::execution::queries::with_scan_cancellation;
 use crate::observed_fixtures::observation;
 use crate::schema::identity::encoded_file_handle;
-use crate::{ClickHouseConfig, ClickHouseDatabase, DatabaseError, Result};
+use crate::{ClickHouseConfig, ClickHouseDatabase, DatabaseError, DatabaseExecutionMonitor, Result};
 use data_mover::model::{BackendKind, EntryKind, HistoryOrder, ObjectHistory, ObservedEntry, VersionRecord};
 use task_model::observation::ObservedItem;
 use task_model::{ChangeKind, CopyCompletion, CopyReadiness, EntryChange, StorageEntryMessage};
@@ -200,6 +202,101 @@ async fn read_faults(fixture: &Fixture) -> Result<()> {
         assert_eq!(database.copy_catalogue_source_reserved().await?, Some(false));
         eprintln!(
             "copy-generation cluster={} fault={fault} elapsed={elapsed:?} typed_error=true policy_preserved=true",
+            fixture.config.cluster.is_some()
+        );
+    }
+    Ok(())
+}
+
+async fn versioned_state_read_faults(fixture: &Fixture, copying: bool) -> Result<()> {
+    let database = fixture.open(&format!("versioned_state_{copying}")).await?;
+    database
+        .begin_copy_generation(&request("versioned-state", true))
+        .await?;
+    database.commit_scan_generation().await?;
+    database
+        .finish_copy_generation(CopyGenerationPhase::Completed, None)
+        .await?;
+    let previous = database.current_copy_generation().await?;
+    for (fault, cancelling) in [
+        ("state_read_disconnect", false),
+        ("state_read_stall", false),
+        ("state_read_stall", true),
+        ("state_read_flash", false),
+    ] {
+        let (scoped, queries) = database.with_query_cancellation()?;
+        let execution = queries.execution();
+        let cancellation = CancellationToken::new();
+        let monitor = DatabaseExecutionMonitor::start(queries, cancellation.clone())?;
+        fixture.fault(fault).await?;
+        let stop = cancellation.clone();
+        let trigger = tokio::spawn(async move {
+            if cancelling {
+                sleep(Duration::from_millis(250)).await;
+                stop.cancel();
+            }
+        });
+        let started = Instant::now();
+        let operation = async {
+            if copying {
+                assert!(scoped.copy_baseline_available(&previous).await?);
+            } else {
+                scoped.insert_scan_state(0).await?;
+            }
+            Ok::<(), DatabaseError>(())
+        };
+        let result = timeout(
+            Duration::from_secs(6),
+            with_scan_cancellation(cancellation, Some(execution.clone()), operation),
+        )
+        .await;
+        let elapsed = started.elapsed();
+        trigger.await?;
+        monitor.finish().await?;
+        fixture.fault("state_read_hit").await?;
+        fixture.fault("normal").await?;
+        let result = result.map_err(|_| DatabaseError::ConfigError("versioned state read exceeded deadline".into()))?;
+        let recovered = fault == "state_read_flash";
+        if !recovered {
+            // 代理静默时，关闭在途连接没有服务端的终止确认。
+            assert!(
+                matches!(&result, Err(error) if error.is_confirmed_scan_cancellation()
+                    || error.is_transient_connectivity_failure()
+                    || matches!(error, DatabaseError::ScanTerminationUnconfirmed { .. })),
+                "{result:?}"
+            );
+        }
+        if recovered || cancelling {
+            assert!(execution.failure().is_none());
+        } else {
+            assert!(
+                execution
+                    .failure()
+                    .is_some_and(|source| source.is_transient_connectivity_failure())
+            );
+            assert_eq!(execution.recovery_window(), Duration::from_secs(3));
+            let detection = if fault == "state_read_stall" {
+                Duration::from_secs(u64::from(fixture.config.read_timeout))
+            } else {
+                Duration::ZERO
+            };
+            assert!(
+                elapsed < detection + execution.recovery_window() + Duration::from_millis(750),
+                "{elapsed:?}"
+            );
+        }
+        if cancelling {
+            assert!(elapsed < Duration::from_secs(1), "{elapsed:?}");
+        }
+        if recovered {
+            result?;
+        }
+        assert_eq!(
+            database.copy_baseline_available(&previous).await?,
+            copying || !recovered
+        );
+        eprintln!(
+            "versioned-state cluster={} copying={copying} fault={fault} cancelled={cancelling} elapsed={elapsed:?} recovered={recovered}",
             fixture.config.cluster.is_some()
         );
     }
@@ -737,6 +834,23 @@ async fn real_copy_generation_policies() -> Result<()> {
             version_slots(&fixture, false).await?;
             version_slots(&fixture, true).await?;
             read_faults(&fixture).await
+        }
+        .await;
+        let cleanup = fixture.cleanup().await;
+        result?;
+        cleanup?;
+    }
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires the isolated ClickHouse state-read fault proxy"]
+async fn real_versioned_copy_state_reads_are_bounded() -> Result<()> {
+    for cluster in [false, true] {
+        let fixture = Fixture::new(cluster).await?;
+        let result = async {
+            versioned_state_read_faults(&fixture, false).await?;
+            versioned_state_read_faults(&fixture, true).await
         }
         .await;
         let cleanup = fixture.cleanup().await;

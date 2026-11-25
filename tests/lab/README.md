@@ -745,6 +745,27 @@ HTTP 204 callback 核验具体原因，数据库核验失败／成功代次、�
 均核对本轮字节与新增／修改计数。持续故障时检查已完成的搬迁保留、未变化的源文件仍在，
 并记录从故障注入至第一次重试及终态返回的耗时。增量范围为 Local 目标和有界提前清理窗口。
 
+在上述命令末尾加 `--multi-shard` 可用三个分片、每分片两个真实 ClickHouse 容器复跑。该选项
+也适用于 `--consumer-recovery` 和 `--copy-data-cancel`。集群目录按作业路由，单个作业的事实位于
+同一分片。测试使用私有网络和独占数据库，退出时销毁容器。
+
+跨进程接管通过实际 CLI 验证，使用 `LAB_TERRASYNC_BIN` 指向本次构建的二进制，使用
+`LAB_TAKEOVER_LOG_DIR` 指定一个尚不存在的子目录保存各进程日志。
+
+```sh
+cargo build --locked --bin terrasync
+LAB_TERRASYNC_BIN=/absolute/path/to/target/debug/terrasync \
+LAB_TAKEOVER_LOG_DIR=/absolute/path/to/new-process-logs \
+python3 tests/lab/run-notification-archive-local.py --multi-shard --copy-takeover
+```
+
+用例分别扣住旧进程的事实 INSERT 或代次提交 INSERT，核对已搬迁目标和最新代次，再从相同或不同作业目录
+启动第二进程，跨目录时另验证普通扫描不能与复制争用该作业。强制结束旧进程后从竞争进程的目录接管，
+核对全量恢复、实际传输字节和已搬迁目标，再向真实库重放旧请求并要求成功入库。通过直接读表核对事实和有效
+状态，再运行两轮增量，验证目标保留和真实删除。保留同一路径的新旧底层物理行，确认真实删除后一并清理旧事实。
+Direct、Checkpointed 和迟到状态场景均覆盖单机及集群各分片，副本路由由直接读表验证。违规时退出非零并保留逐进程日志。
+该实验覆盖同一 Linux 网络命名空间中使用同一 ClickHouse DSN 的多个进程。
+
 `python3 tests/lab/run-source-ready-nfs.py` 运行精确 ignored 用例
 `copy_execution::ready_cleanup_nfs_tests::real_nfs_full_move_ready_window_and_combined_failure`。
 复用实验室授权的 PVE SSH／qm guest exec 通道，仅创建随机独占 NFS 前缀；

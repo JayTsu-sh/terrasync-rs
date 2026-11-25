@@ -75,6 +75,8 @@ fn expect_previous(mock: &Mock, previous: Option<&CopyGeneration>, committed: u8
             mock.add(handlers::provide([CopyState {
                 scan_state: committed,
                 copy_execution_id: previous.request.execution_id.clone(),
+                state_version: previous.sequence * 3,
+                copy_baseline_sequence: previous.sequence,
             }]));
         }
     } else {
@@ -82,6 +84,8 @@ fn expect_previous(mock: &Mock, previous: Option<&CopyGeneration>, committed: u8
         mock.add(handlers::provide([CopyState {
             scan_state: committed,
             copy_execution_id: String::new(),
+            state_version: 0,
+            copy_baseline_sequence: 0,
         }]));
     }
 }
@@ -95,6 +99,8 @@ fn expect_accepted_and_initialized(mock: &Mock, committed: u8, old_execution: &s
     mock.add(handlers::provide([CopyState {
         scan_state: committed,
         copy_execution_id: old_execution.into(),
+        state_version: if old_execution.is_empty() { 0 } else { 12 },
+        copy_baseline_sequence: if old_execution.is_empty() { 0 } else { 4 },
     }]));
     accepted
 }
@@ -162,7 +168,12 @@ async fn failed_retained_copy_rebases_without_removing_unconfirmed_tombstones() 
         database.begin_copy_generation(&request("bound", true)).await?,
         CopyGenerationStatus::Recovering
     );
-    assert!(rebase.query().await.contains("current_state!=0 AND copy_sequence < 5"));
+    assert!(
+        rebase
+            .query()
+            .await
+            .contains("current_state!=0 AND copy_sequence BETWEEN 4 AND 4")
+    );
     assert_eq!(
         database.current_copy_generation().await?.plan.mode,
         MigrationMode::Incremental
@@ -239,6 +250,8 @@ fn expect_retirement_owner(mock: &Mock, generation: &CopyGeneration) {
     mock.add(handlers::provide([CopyState {
         scan_state: 1,
         copy_execution_id: generation.request.execution_id.clone(),
+        state_version: generation.sequence * 3,
+        copy_baseline_sequence: generation.sequence,
     }]));
 }
 

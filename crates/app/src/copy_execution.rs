@@ -69,7 +69,7 @@ mod version_metadata_tests;
 #[path = "copy_version_plan_tests.rs"]
 mod version_tests;
 impl CopyLease {
-    pub(crate) fn acquire(connection: &ClickhouseConfig, job: &SyncJobConfig) -> Result<Self> {
+    pub(crate) fn acquire(connection: Option<&ClickhouseConfig>, job: &SyncJobConfig) -> Result<Self> {
         Ok(Self {
             _guard: JobLease::acquire(connection, &job.job_id, &job.job_dir)?,
         })
@@ -229,19 +229,19 @@ mod tests {
         let first = tempfile::tempdir()?;
         let second = tempfile::tempdir()?;
         let mut job = job(first.path());
-        let lease = CopyLease::acquire(&connection(), &job)?;
+        let lease = CopyLease::acquire(Some(&connection()), &job)?;
         job.job_dir = second.path().to_string_lossy().into_owned();
-        assert!(CopyLease::acquire(&connection(), &job).is_err());
+        assert!(CopyLease::acquire(Some(&connection()), &job).is_err());
         let mut other_user = connection();
         other_user.username = "another-database-user".into();
-        assert!(CopyLease::acquire(&other_user, &job).is_err());
+        assert!(CopyLease::acquire(Some(&other_user), &job).is_err());
         drop(lease);
-        assert!(CopyLease::acquire(&connection(), &job).is_ok());
+        assert!(CopyLease::acquire(Some(&connection()), &job).is_ok());
         Ok(())
     }
 
     #[test]
-    fn file_lock_failure_releases_the_process_registration() -> Result<()> {
+    fn directory_lock_failure_releases_the_job_identity_lock() -> Result<()> {
         let directory = tempfile::tempdir()?;
         let job = job(directory.path());
         let file = OpenOptions::new()
@@ -254,11 +254,11 @@ mod tests {
             source,
         })?;
         assert!(matches!(
-            CopyLease::acquire(&connection(), &job),
-            Err(AppError::JobExecutionLock { .. })
+            CopyLease::acquire(Some(&connection()), &job),
+            Err(AppError::JobExecutionBusy { .. })
         ));
         drop(file);
-        assert!(CopyLease::acquire(&connection(), &job).is_ok());
+        assert!(CopyLease::acquire(Some(&connection()), &job).is_ok());
         Ok(())
     }
 }

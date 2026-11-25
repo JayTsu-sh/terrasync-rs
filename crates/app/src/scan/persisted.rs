@@ -55,7 +55,7 @@ pub(super) async fn run_persisted(request: ScanRequest<'_>, config: AppConfig) -
         ));
     }
     tokio::fs::create_dir_all(job_dir).await?;
-    let _lease = JobLease::acquire(&config.database.clickhouse, job_id, job_dir)?;
+    let _lease = JobLease::acquire(Some(&config.database.clickhouse), job_id, job_dir)?;
     let source = canonicalize_path(path)?;
     let storage = select! {
         biased;

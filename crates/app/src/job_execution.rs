@@ -1,68 +1,96 @@
-//! 同一数据库作业的执行互斥，扫描和复制共用注册与文件锁。
+//! 扫描和复制按相同的 ClickHouse DSN、数据库名与作业 ID 互斥。
 use crate::error::{AppError, Result};
-use dashmap::{DashMap, mapref::entry::Entry};
+#[cfg(not(target_os = "linux"))]
+use std::env::home_dir;
+#[cfg(not(target_os = "linux"))]
+use std::io::Error;
+use std::io::ErrorKind;
+#[cfg(target_os = "linux")]
+use std::os::linux::net::SocketAddrExt;
+#[cfg(target_os = "linux")]
+use std::os::unix::net::{SocketAddr, UnixListener};
 use std::{
-    fs::{File, OpenOptions, create_dir_all},
+    fs::{File, OpenOptions, TryLockError, create_dir_all},
     path::Path,
-    sync::OnceLock,
 };
 use utils::{app_config::ClickhouseConfig, sanitize_job_id};
 
-static ACTIVE: OnceLock<DashMap<String, ()>> = OnceLock::new();
-
-/// 同进程按数据库身份和作业互斥；跨进程通过同一 `job_dir` 的文件锁互斥。
+/// 数据库作业锁与工作目录无关；目录锁另保护同一目录中的本地恢复文件。
 pub(crate) struct JobLease {
-    key: String,
     _file: File,
+    _identity: Option<IdentityLock>,
 }
 
 impl JobLease {
-    pub(crate) fn acquire(connection: &ClickhouseConfig, job_id: &str, job_dir: &str) -> Result<Self> {
-        let key = blake3::hash(&serde_json::to_vec(&(
-            &connection.dsn,
-            &connection.database,
-            sanitize_job_id(job_id),
-        ))?)
-        .to_hex()
-        .to_string();
-        let active = ACTIVE.get_or_init(DashMap::new);
-        match active.entry(key.clone()) {
-            Entry::Occupied(_) => {
-                return Err(AppError::ConfigError(
-                    "同一数据库作业已有执行，不能并发扫描或复制".into(),
-                ));
-            }
-            Entry::Vacant(entry) => {
-                entry.insert(());
-            }
-        }
-        let file = (|| {
-            create_dir_all(job_dir)?;
-            let file = OpenOptions::new()
-                .create(true)
-                .truncate(false)
-                .write(true)
-                .open(Path::new(job_dir).join("job.lock"))?;
-            file.try_lock().map_err(|source| AppError::JobExecutionLock {
+    pub(crate) fn acquire(connection: Option<&ClickhouseConfig>, job_id: &str, job_dir: &str) -> Result<Self> {
+        let lock_error = |source: TryLockError| match source {
+            TryLockError::WouldBlock => AppError::JobExecutionBusy {
+                job_id: job_id.to_owned(),
+            },
+            source => AppError::JobExecutionLock {
                 job_id: job_id.to_owned(),
                 source,
-            })?;
-            Ok(file)
-        })();
-        match file {
-            Ok(file) => Ok(Self { key, _file: file }),
-            Err(error) => {
-                active.remove(&key);
-                Err(error)
-            }
-        }
+            },
+        };
+        let identity = if let Some(connection) = connection {
+            let key = blake3::hash(&serde_json::to_vec(&(
+                &connection.dsn,
+                &connection.database,
+                sanitize_job_id(job_id),
+            ))?)
+            .to_hex()
+            .to_string();
+            Some(lock_job_identity(&key).map_err(lock_error)?)
+        } else {
+            None
+        };
+        create_dir_all(job_dir)?;
+        let file = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(Path::new(job_dir).join("job.lock"))?;
+        file.try_lock().map_err(lock_error)?;
+        Ok(Self {
+            _file: file,
+            _identity: identity,
+        })
     }
 }
 
-impl Drop for JobLease {
-    fn drop(&mut self) {
-        if let Some(active) = ACTIVE.get() {
-            active.remove(&self.key);
-        }
-    }
+#[cfg(target_os = "linux")]
+type IdentityLock = UnixListener;
+
+#[cfg(target_os = "linux")]
+fn lock_job_identity(key: &str) -> std::result::Result<IdentityLock, TryLockError> {
+    // 抽象 Unix 地址在同一网络命名空间内唯一，最后一个 FD 关闭时由内核释放。
+    let address = SocketAddr::from_abstract_name(format!("terrasync-job-{key}")).map_err(TryLockError::Error)?;
+    UnixListener::bind_addr(&address).map_err(|error| match error.kind() {
+        ErrorKind::AddrInUse => TryLockError::WouldBlock,
+        _ => TryLockError::Error(error),
+    })
+}
+
+#[cfg(not(target_os = "linux"))]
+type IdentityLock = File;
+
+#[cfg(not(target_os = "linux"))]
+fn lock_job_identity(key: &str) -> std::result::Result<IdentityLock, TryLockError> {
+    // 用户目录固定锁文件位置，保留文件以免删除后两个进程锁住不同对象。
+    let home = home_dir().filter(|path| path.is_absolute()).ok_or_else(|| {
+        TryLockError::Error(Error::new(
+            ErrorKind::NotFound,
+            "Cannot resolve home directory for the TerraSync job lock",
+        ))
+    })?;
+    let directory = home.join(".terrasync").join("locks");
+    create_dir_all(&directory).map_err(TryLockError::Error)?;
+    let lock = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(directory.join(key))
+        .map_err(TryLockError::Error)?;
+    lock.try_lock()?;
+    Ok(lock)
 }

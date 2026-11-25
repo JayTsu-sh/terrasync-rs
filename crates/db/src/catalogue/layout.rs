@@ -5,6 +5,7 @@ use tokio::sync::MutexGuard;
 use uuid::Uuid;
 
 use super::ClickHouseDatabase;
+use super::lifecycle::CopyFactRange;
 use crate::config::ClickHouseConfig;
 use crate::error::{DatabaseError, Result};
 use crate::schema::identifier;
@@ -259,16 +260,18 @@ impl ClickHouseDatabase {
         }
     }
 
-    pub(super) fn catalogue_delete_statement(&self, table: &str, placeholders: &str) -> Result<String> {
+    pub(super) fn catalogue_delete_statement(
+        &self, table: &str, placeholders: &str, facts: Option<CopyFactRange>,
+    ) -> Result<String> {
+        // 已对账删除的路径一并清理更早事实，避免删去新版本后旧行重新成为 FINAL 的结果。
+        let through = facts.map_or_else(String::new, |facts| format!(" AND copy_sequence<={}", facts.last));
+        let condition = format!("relative_path IN ({placeholders}){through}");
         match &self.catalogue_cluster {
             Some(_) => Ok(format!(
-                "ALTER TABLE {} DELETE WHERE relative_path IN ({placeholders}) SETTINGS mutations_sync = 2",
+                "ALTER TABLE {} DELETE WHERE {condition} SETTINGS mutations_sync = 2",
                 self.catalogue_storage_table(table)?
             )),
-            None => Ok(format!(
-                "DELETE FROM {} WHERE relative_path IN ({placeholders})",
-                identifier(table)?
-            )),
+            None => Ok(format!("DELETE FROM {} WHERE {condition}", identifier(table)?)),
         }
     }
 
