@@ -274,6 +274,8 @@ export interface TaskProgressSnapshot {
   scanned_files: number
   scanned_dirs: number
   total_bytes: number
+  transferred_bytes: number
+  in_flight_bytes: number
   error_count: number
   elapsed_secs: number
   speed_bytes_per_sec: number

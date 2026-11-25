@@ -3,6 +3,7 @@
 //!
 //! 另保留独立的 `DirectoryMetadataProgressBar`（目录元数据同步进度）。
 
+use crate::copy_bytes::CopyBytes;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
@@ -114,7 +115,7 @@ pub struct ProgressBar {
     pb: IndicatifBar,
     job_type: JobType,
     start_time: Instant,
-    real_time_bytes: Arc<AtomicU64>,
+    real_time_bytes: Arc<CopyBytes>,
     counters: CounterSet,
     rate: RateTracker,
     scan_progress: Arc<ScanProgressCounters>,
@@ -142,10 +143,10 @@ impl ProgressBar {
                     (&c.total_count, scanned_files.saturating_add(*scanned_dirs)),
                     (&c.total_size, *total_bytes),
                     (&c.error_count, *error_count),
-                    (&self.real_time_bytes, *transferred_bytes),
                 ] {
                     counter.store(value, Ordering::Relaxed);
                 }
+                self.real_time_bytes.restore_published(*transferred_bytes);
             }
             (
                 CounterSet::Incremental(c),
@@ -180,10 +181,10 @@ impl ProgressBar {
                     (&c.deleted_size, *deleted_size),
                     (&c.renamed_count, *renamed_count),
                     (&c.renamed_size, *renamed_size),
-                    (&self.real_time_bytes, *transferred_bytes),
                 ] {
                     counter.store(value, Ordering::Relaxed);
                 }
+                self.real_time_bytes.restore_published(*transferred_bytes);
             }
             _ => return Err(AppError::ConfigError("Saved scan progress kind differs".into())),
         }
@@ -232,7 +233,7 @@ impl ProgressBar {
             pb,
             job_type,
             start_time: now,
-            real_time_bytes: Arc::new(AtomicU64::new(0)),
+            real_time_bytes: Arc::new(CopyBytes::default()),
             counters,
             rate: RateTracker {
                 last_update_time: None,
@@ -244,8 +245,8 @@ impl ProgressBar {
         }
     }
 
-    /// 获取 `real_time_bytes` 原子计数器（Copy job 使用 chunk 粒度带宽）
-    pub fn get_real_time_bytes_counter(&self) -> Arc<AtomicU64> {
+    /// 复制任务的已发布量和目标写入进度。
+    pub fn get_real_time_bytes_counter(&self) -> Arc<CopyBytes> {
         self.real_time_bytes.clone()
     }
 
@@ -453,11 +454,15 @@ impl ProgressBar {
         let total_file_count = c.total_file_count.load(Ordering::Relaxed);
         let total_dir_count = c.total_dir_count.load(Ordering::Relaxed);
         let total_size = c.total_size.load(Ordering::Relaxed);
-        let real_time_bytes = self.real_time_bytes.load(Ordering::Relaxed);
+        let (published, in_flight) = self.real_time_bytes.snapshot();
         let current_time = Instant::now();
 
         let is_copy_job = matches!(self.job_type, JobType::Copy);
-        let current_bytes = if is_copy_job { real_time_bytes } else { total_size };
+        let current_bytes = if is_copy_job {
+            published.saturating_add(in_flight)
+        } else {
+            total_size
+        };
         let last_bytes = self.rate.last_bytes;
 
         let elapsed = self.start_time.elapsed().as_secs_f64();
@@ -466,16 +471,16 @@ impl ProgressBar {
         // 更新速率快照
         self.rate.last_update_time = Some(current_time);
         self.rate.last_count = total_count;
-        self.rate.last_bytes = if is_copy_job { real_time_bytes } else { total_size };
+        self.rate.last_bytes = current_bytes;
         self.pb.set_position(total_count);
 
-        let display_size = if is_copy_job { real_time_bytes } else { total_size };
+        let display_size = if is_copy_job { published } else { total_size };
         let formatted_size = format_bytes(display_size as f64, true);
         let formatted_size_rate = format_bytes(size_rate, true);
         let formatted_time = fmt_elapsed(elapsed);
         let op = self.job_type.to_operation_name();
 
-        let msg = match self.job_type {
+        let mut msg = match self.job_type {
             JobType::Scan => {
                 let scanned = self.scan_progress.scanned.load(Ordering::Relaxed);
                 let filtered = self.scan_progress.filtered.load(Ordering::Relaxed);
@@ -491,6 +496,9 @@ impl ProgressBar {
             ),
         };
 
+        if is_copy_job {
+            msg.push_str(&format!(" | In flight: {}", format_bytes(in_flight as f64, true)));
+        }
         self.log_and_set_msg(&msg);
     }
 
@@ -503,12 +511,16 @@ impl ProgressBar {
         let scanned_dir = c.scanned_dir_count.load(Ordering::Relaxed);
         let scanned_symlink = c.scanned_symlink_count.load(Ordering::Relaxed);
         let scanned_size = c.scanned_size.load(Ordering::Relaxed);
-        let real_time_bytes = self.real_time_bytes.load(Ordering::Relaxed);
+        let (published, in_flight) = self.real_time_bytes.snapshot();
         let current_time = Instant::now();
 
         let scanned_count = scanned_file + scanned_dir + scanned_symlink;
         let is_copy = matches!(self.job_type, JobType::IncrementalCopy);
-        let current_bytes = if is_copy { real_time_bytes } else { scanned_size };
+        let current_bytes = if is_copy {
+            published.saturating_add(in_flight)
+        } else {
+            scanned_size
+        };
         let last_bytes = self.rate.last_bytes;
 
         let elapsed = self.start_time.elapsed().as_secs_f64();
@@ -517,7 +529,7 @@ impl ProgressBar {
         // 更新速率快照
         self.rate.last_update_time = Some(current_time);
         self.rate.last_count = scanned_count;
-        self.rate.last_bytes = if is_copy { real_time_bytes } else { scanned_size };
+        self.rate.last_bytes = current_bytes;
         self.pb.set_position(scanned_count);
 
         let new_count = c.new_count.load(Ordering::Relaxed);
@@ -542,6 +554,13 @@ impl ProgressBar {
             msg = format!("Scanned: {scanned} | Filtered: {filtered} | Retained: {retained}\n{msg}");
         }
 
+        if is_copy {
+            msg.push_str(&format!(
+                " | Published: {} | In flight: {}",
+                format_bytes(published as f64, true),
+                format_bytes(in_flight as f64, true)
+            ));
+        }
         self.log_and_set_msg(&msg);
     }
 
@@ -605,7 +624,7 @@ impl ProgressBar {
     /// 构建实时进度报告（用于 Web 回调）
     pub fn to_report(&self, job_id: &str) -> ProgressReport {
         let elapsed_secs = self.start_time.elapsed().as_secs_f64();
-        let real_time = self.real_time_bytes.load(Ordering::Relaxed);
+        let (real_time, in_flight_bytes) = self.real_time_bytes.snapshot();
 
         let (is_copy, primary_bytes) = match &self.counters {
             CounterSet::Full(c) => {
@@ -618,7 +637,11 @@ impl ProgressBar {
             }
         };
 
-        let speed_bytes = if is_copy { real_time } else { primary_bytes };
+        let speed_bytes = if is_copy {
+            real_time.saturating_add(in_flight_bytes)
+        } else {
+            primary_bytes
+        };
         let speed = if elapsed_secs > 0.0 {
             speed_bytes as f64 / elapsed_secs
         } else {
@@ -660,6 +683,7 @@ impl ProgressBar {
             job_type: self.job_type.to_callback_name().to_string(),
             elapsed_secs,
             speed_bytes_per_sec: speed,
+            in_flight_bytes,
             detail,
             is_final: false,
             generation_committed: None,

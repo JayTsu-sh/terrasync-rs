@@ -1,6 +1,7 @@
 //! 本地真实复制与受控 role 故障；远程链路和性能另行验收。
 #![allow(clippy::unwrap_used)]
 use super::{ControlledCopyCounters, DirectoryBudget, run};
+use crate::copy_bytes::CopyBytes;
 use crate::{
     broadcast::BroadcastForwarder,
     error::{AppError, StorageError},
@@ -976,7 +977,7 @@ async fn metadata_failure_continuation(directory: bool) -> TestResult {
     std::fs::write(source.path().join(bad), b"readable but source metadata denied")?;
     std::fs::write(source.path().join(good), b"ordinary readable following sibling")?;
     let mut executor = executor(source.path(), target.path(), CancellationToken::new()).await?;
-    let bytes = Arc::new(AtomicU64::new(0));
+    let bytes = Arc::new(CopyBytes::default());
     executor.bytes = Some(bytes.clone());
     install_metadata_fault(
         Arc::make_mut(&mut executor.source),
@@ -1008,7 +1009,7 @@ async fn metadata_failure_continuation(directory: bool) -> TestResult {
     assert!(result.as_ref().is_err_and(AppError::is_reported_copy_failure));
     assert_eq!(entries, if directory { 3 } else { 2 });
     assert_eq!(
-        bytes.load(Ordering::SeqCst),
+        bytes.published(),
         u64::try_from(b"readable but source metadata denied".len() + b"ordinary readable following sibling".len())
             .unwrap()
     );
@@ -1284,7 +1285,7 @@ async fn source_directory_metadata_failure_keeps_children_and_later_sibling_with
         }))
         .build()?;
     let applied = target_metadata_probe(Arc::make_mut(&mut executor.destination), false)?;
-    let bytes = Arc::new(AtomicU64::new(0));
+    let bytes = Arc::new(CopyBytes::default());
     executor.bytes = Some(bytes.clone());
     let mut options = options();
     options.observation_plan = Some(options.observation_plan.unwrap().with_acl(ObservationMode::BestEffort));
@@ -1292,7 +1293,7 @@ async fn source_directory_metadata_failure_keeps_children_and_later_sibling_with
     assert!(result.as_ref().is_err_and(AppError::is_reported_copy_failure));
     assert_eq!(std::fs::read(target.path().join("bad/child"))?, b"child");
     assert_eq!(std::fs::read(target.path().join("good"))?, b"sibling");
-    assert_eq!(bytes.load(Ordering::SeqCst), 12);
+    assert_eq!(bytes.published(), 12);
     assert_eq!(applied.load(Ordering::SeqCst), 0);
     assert_eq!(events.len(), 3);
     assert_eq!(

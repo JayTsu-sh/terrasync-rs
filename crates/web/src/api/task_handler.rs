@@ -141,12 +141,14 @@ fn progress_report_to_snapshot(report: &ProgressReport) -> Result<serde_json::Va
             scanned_files,
             scanned_dirs,
             total_bytes,
+            transferred_bytes,
             error_count,
             ..
         } => serde_json::json!({
             "scanned_files": scanned_files,
             "scanned_dirs": scanned_dirs,
             "total_bytes": total_bytes,
+            "transferred_bytes": transferred_bytes,
             "error_count": error_count,
             "elapsed_secs": report.elapsed_secs,
             "speed_bytes_per_sec": report.speed_bytes_per_sec,
@@ -156,17 +158,20 @@ fn progress_report_to_snapshot(report: &ProgressReport) -> Result<serde_json::Va
             scanned_symlinks,
             scanned_dirs,
             scanned_size,
+            transferred_bytes,
             error_count,
             ..
         } => serde_json::json!({
             "scanned_files": scanned_files.saturating_add(*scanned_symlinks),
             "scanned_dirs": scanned_dirs,
             "total_bytes": scanned_size,
+            "transferred_bytes": transferred_bytes,
             "error_count": error_count,
             "elapsed_secs": report.elapsed_secs,
             "speed_bytes_per_sec": report.speed_bytes_per_sec,
         }),
     };
+    snapshot["in_flight_bytes"] = serde_json::to_value(report.in_flight_bytes)?;
     snapshot["skipped_count"] = serde_json::to_value(report.skipped_count)?;
     snapshot["task_error_count"] = serde_json::to_value(report.task_error_count)?;
     snapshot["diagnostics_complete"] = serde_json::to_value(report.diagnostics_complete)?;
@@ -210,6 +215,8 @@ pub async fn update_progress(
 #[cfg(test)]
 mod progress_tests {
     use super::*;
+    use std::error::Error;
+    use std::result::Result as StdResult;
 
     #[test]
     fn incremental_snapshot_counts_links_like_the_full_snapshot() -> Result<()> {
@@ -225,6 +232,27 @@ mod progress_tests {
         let snapshot = progress_report_to_snapshot(&report)?;
         assert_eq!(snapshot["scanned_files"], 14);
         assert_eq!(snapshot["scanned_dirs"], 2);
+        Ok(())
+    }
+
+    #[test]
+    fn copy_snapshots_preserve_logical_in_flight_and_published_bytes() -> StdResult<(), Box<dyn Error>> {
+        let full = serde_json::json!({"kind":"Full", "scanned_files":1, "scanned_dirs":0,
+            "total_bytes":100, "transferred_bytes":40, "error_count":0});
+        let incremental = serde_json::json!({"kind":"Incremental", "scanned_files":1, "scanned_dirs":0,
+            "scanned_symlinks":0, "scanned_size":100, "transferred_bytes":40, "error_count":0,
+            "new_count":1, "new_size":100, "changed_count":0, "changed_size":0,
+            "deleted_count":0, "deleted_size":0, "renamed_count":0, "renamed_size":0});
+        for (job_type, detail) in [("FullCopy", full), ("IncrementalCopy", incremental)] {
+            let report: ProgressReport = serde_json::from_value(serde_json::json!({
+                "target_preserved_count":0, "job_id":"copy", "job_type":job_type, "elapsed_secs":1.0,
+                "speed_bytes_per_sec":55.0, "in_flight_bytes":15, "is_final":false, "detail":detail
+            }))?;
+            let snapshot = progress_report_to_snapshot(&report)?;
+            assert_eq!(snapshot["total_bytes"], 100);
+            assert_eq!(snapshot["transferred_bytes"], 40);
+            assert_eq!(snapshot["in_flight_bytes"], 15);
+        }
         Ok(())
     }
 

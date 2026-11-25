@@ -31,6 +31,7 @@ pub mod storage_factory;
 ///
 /// 为多块大文件记录已落盘 offset 区间，支持中断后从未完成位置续传
 pub mod byte_resume;
+pub mod copy_bytes;
 
 /// 配置管理模块
 ///
@@ -150,3 +151,6 @@ mod observed_fixtures;
 
 #[cfg(test)]
 mod storage_tests;
+
+#[cfg(all(test, target_os = "linux"))]
+mod copy_progress_real_tests;

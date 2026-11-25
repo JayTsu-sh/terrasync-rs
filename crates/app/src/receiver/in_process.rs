@@ -1,7 +1,8 @@
 //! 单进程 Receiver 的就绪事实广播与失败收束；不发送双进程协议回执。
+use crate::copy_bytes::CopyBytes;
 use std::sync::{
     Arc,
-    atomic::{AtomicU64, AtomicUsize, Ordering},
+    atomic::{AtomicUsize, Ordering},
 };
 
 use async_channel::Receiver;
@@ -82,7 +83,7 @@ pub(crate) struct LocalCopyExecutor {
     pub(crate) destination: Arc<StorageContext>,
     pub(crate) config: Arc<ReceiverConfig>,
     pub(crate) qos: Option<QosManager>,
-    pub(crate) bytes: Option<Arc<AtomicU64>>,
+    pub(crate) bytes: Option<Arc<CopyBytes>>,
     pub(crate) broadcaster: BroadcastForwarder<StorageEntryMessage>,
     pub(crate) active: Arc<AtomicUsize>,
     pub(crate) cleanup: Option<Arc<ReadyFileCleanup>>,

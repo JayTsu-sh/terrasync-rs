@@ -1,4 +1,5 @@
 use crate::broadcast::BroadcastForwarder;
+use crate::copy_bytes::CopyBytes;
 use crate::file_copy::namespace as copy_namespace;
 use data_mover::model::BackendKind;
 use data_mover::model::EntryKind;
@@ -7,7 +8,6 @@ use data_mover::qos::QosManager;
 use data_mover::storage::CopiedValueTarget;
 use data_mover::transfer::TransferPolicy;
 use std::sync::Arc;
-use std::sync::atomic::AtomicU64;
 use task_model::observation::{EntryStatistics, ObservedItem};
 use task_model::{
     ChangeKind, CopyCompletion, CopyReadiness, EntryChange, MetadataTargetVersion, StorageEntryMessage,
@@ -47,7 +47,7 @@ pub struct CopyOptions {
     pub transfer_mode: TransferMode,
     pub qos: Option<QosManager>,
     pub enable_integrity_check: bool,
-    pub bytes_counter: Option<Arc<AtomicU64>>,
+    pub bytes_counter: Option<Arc<CopyBytes>>,
     pub cancel: Option<CancellationToken>,
 }
 

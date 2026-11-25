@@ -1,6 +1,6 @@
 //! 目标 rename 的执行与缺失旧路径恢复；复制复用同一任务策略，不信任未确认发布。
+use crate::copy_bytes::CopyBytes;
 use std::sync::Arc;
-use std::sync::atomic::AtomicU64;
 
 use data_mover::model::ObservedEntry;
 use data_mover::qos::QosManager;
@@ -17,7 +17,7 @@ pub(crate) struct RenameOptions<'a> {
     pub enable_acl: bool,
     pub resume: ResumeOpts,
     pub qos: Option<QosManager>,
-    pub bytes: Option<Arc<AtomicU64>>,
+    pub bytes: Option<Arc<CopyBytes>>,
     pub events: &'a BroadcastForwarder<StorageEntryMessage>,
 }
 
@@ -67,7 +67,6 @@ mod tests {
     use crate::scan::observe_path;
     use crate::storage_factory::{CreateStorageOptions, create_storage};
     use std::path::Path;
-    use std::sync::atomic::Ordering;
     use task_model::TransferMode;
     use tempfile::tempdir;
 
@@ -86,7 +85,7 @@ mod tests {
         std::fs::rename(target_root.path().join("old"), target_root.path().join("intermediate"))?;
         std::fs::write(target_root.path().join("current"), b"unconfirmed or partial data")?;
         let events = BroadcastForwarder::new(4);
-        let bytes = Arc::new(AtomicU64::new(0));
+        let bytes = Arc::new(CopyBytes::default());
         let result = rename_or_copy(
             from,
             to,
@@ -118,7 +117,7 @@ mod tests {
             std::fs::read(target_root.path().join("intermediate"))?,
             b"previous payload"
         );
-        assert_eq!(bytes.load(Ordering::Relaxed), 22);
+        assert_eq!(bytes.published(), 22);
         Ok(())
     }
 
@@ -135,7 +134,7 @@ mod tests {
         let from = Arc::new(observe_path(target.storage(), Path::new("old")).await?);
         let to = Arc::new(observe_path(source.storage(), Path::new("new")).await?);
         let events = BroadcastForwarder::new(4);
-        let bytes = Arc::new(AtomicU64::new(0));
+        let bytes = Arc::new(CopyBytes::default());
         let result = rename_or_copy(
             from,
             to,
@@ -155,7 +154,7 @@ mod tests {
         assert!(!target_root.path().join("old").exists());
         assert_eq!(std::fs::read(target_root.path().join("new"))?, b"payload");
         assert!(source_root.path().join("new").exists());
-        assert_eq!(bytes.load(Ordering::Relaxed), 0);
+        assert_eq!(bytes.published(), 0);
         Ok(())
     }
 }

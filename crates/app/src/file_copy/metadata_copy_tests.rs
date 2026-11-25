@@ -1,10 +1,8 @@
 #![allow(clippy::unwrap_used)]
 
+use crate::copy_bytes::CopyBytes;
 use std::path::Path;
-use std::sync::{
-    Arc,
-    atomic::{AtomicU64, Ordering},
-};
+use std::sync::Arc;
 
 use data_mover::model::{FailureClass, MetadataFamily, MetadataObservation, MetadataObservations, Transience};
 
@@ -36,7 +34,7 @@ async fn failed_source_metadata_does_not_block_data_and_reports_every_failed_fam
         )
         .map_err(StorageError::from)?,
     );
-    let bytes = Arc::new(AtomicU64::new(0));
+    let bytes = Arc::new(CopyBytes::default());
     let error = copy_file(
         &source,
         &target,
@@ -77,7 +75,7 @@ async fn failed_source_metadata_does_not_block_data_and_reports_every_failed_fam
     }
     assert_eq!(std::fs::read(target_root.path().join("file"))?, b"readable payload");
     assert_eq!(std::fs::read(source_root.path().join("file"))?, b"readable payload");
-    assert_eq!(bytes.load(Ordering::Relaxed), b"readable payload".len() as u64);
+    assert_eq!(bytes.published(), b"readable payload".len() as u64);
     Ok(())
 }
 
@@ -106,7 +104,7 @@ async fn data_and_source_metadata_failures_are_both_preserved_with_zero_complete
         ),
     );
     std::fs::remove_file(source_root.path().join("file"))?;
-    let bytes = Arc::new(AtomicU64::new(0));
+    let bytes = Arc::new(CopyBytes::default());
     let error = transfer::copy_current(
         &source,
         &target,
@@ -130,7 +128,7 @@ async fn data_and_source_metadata_failures_are_both_preserved_with_zero_complete
     assert!(!context.metadata_only);
     assert!(error.to_string().contains("源端元数据获取失败"));
     assert!(error.to_string().contains("Timeout"));
-    assert_eq!(bytes.load(Ordering::Relaxed), 0);
+    assert_eq!(bytes.published(), 0);
     assert_eq!(std::fs::read(target_root.path().join("file"))?, b"old target");
     Ok(())
 }

@@ -162,7 +162,11 @@ export async function setupApiMocks(page: Page, overrides?: MockOverrides) {
   // Task progress (real-time polling)
   await page.route(/\/api\/v1\/tasks\/[^/]+\/progress$/, async (route: Route) => {
     await route.fulfill({
-      json: { scanned_files: 1200, scanned_dirs: 50, total_bytes: 536870912, error_count: 0, elapsed_secs: 30, speed_bytes_per_sec: 17895697 },
+      json: {
+        scanned_files: 1200, scanned_dirs: 50, total_bytes: 512 * 1024 ** 2,
+        transferred_bytes: 128 * 1024 ** 2, in_flight_bytes: 16 * 1024 ** 2,
+        error_count: 0, elapsed_secs: 30, speed_bytes_per_sec: 17895697,
+      },
     })
   })
 

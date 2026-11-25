@@ -1,12 +1,12 @@
 //! 单进程复制，负责从源存储读取并写入目标存储。
 
+use crate::copy_bytes::CopyBytes;
 use crate::file_copy::local::copy_file_for_job;
 use crate::file_copy::namespace as copy_namespace;
 // 标准库
 use crate::error::StorageError;
 use crate::file_copy::{CopiedPublication, CopyOptions, prepare_directory};
 use std::sync::Arc;
-use std::sync::atomic::AtomicU64;
 use task_model::ObservedEntryExt;
 use task_model::TransferMode;
 
@@ -47,7 +47,7 @@ pub struct ReceiverConfig {
 /// 单进程模式下 Receiver 拥有 src+dest storage，可以直接调用 `copy_file`。
 pub(crate) async fn process_entry_on_receiver(
     entry: &Arc<ObservedEntry>, src_storage: &Arc<StorageContext>, dest_storage: &Arc<StorageContext>,
-    config: &ReceiverConfig, qos_manager: Option<QosManager>, bytes_counter: Option<Arc<AtomicU64>>,
+    config: &ReceiverConfig, qos_manager: Option<QosManager>, bytes_counter: Option<Arc<CopyBytes>>,
 ) -> Result<Option<CopiedPublication>> {
     let relative_path = entry.get_relative_path();
     let span = info_span!("recv_entry", path = %relative_path.display());

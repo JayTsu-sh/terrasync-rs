@@ -1,6 +1,7 @@
 //! 真实 Local 数据与拒绝重复元数据调用的 role，验证任务层确实使用捕获计划。
 #![allow(clippy::unwrap_used)]
 #[cfg(unix)]
+use crate::copy_bytes::CopyBytes;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::sync::{
@@ -228,7 +229,7 @@ async fn captured_metadata_is_batched_once_without_source_reread_or_later_target
                 calls: AtomicU64::new(0),
             });
             let target_calls = guard_metadata(&mut target, false, Some(probe.clone()))?;
-            let bytes = Arc::new(AtomicU64::new(0));
+            let bytes = Arc::new(CopyBytes::default());
             let outcome = transfer::copy_current(
                 &source,
                 &target,
@@ -251,7 +252,7 @@ async fn captured_metadata_is_batched_once_without_source_reread_or_later_target
                 ),
                 (0, 0)
             );
-            assert_eq!(bytes.load(Ordering::Relaxed), 7);
+            assert_eq!(bytes.published(), 7);
             assert_eq!(std::fs::read(target_root.path().join("file"))?, b"payload");
             assert_eq!(std::fs::read(source_root.path().join("file"))?, b"payload");
         }
@@ -297,7 +298,7 @@ async fn assert_metadata_failure_data(mode: TransferMode, integrity: bool, fault
         calls: AtomicU64::new(0),
     });
     let target_calls = guard_metadata(&mut target, false, Some(probe.clone()))?;
-    let bytes = Arc::new(AtomicU64::new(0));
+    let bytes = Arc::new(CopyBytes::default());
     let error = transfer::copy_current(
         &source,
         &target,
@@ -346,7 +347,7 @@ async fn assert_metadata_failure_data(mode: TransferMode, integrity: bool, fault
     );
     assert!(error.to_string().contains(message));
     assert_eq!(target_calls.load(Ordering::Relaxed), 0);
-    assert_eq!(bytes.load(Ordering::Relaxed), if data_ready { 7 } else { 0 });
+    assert_eq!(bytes.published(), if data_ready { 7 } else { 0 });
     let expected_target: &[u8] = if data_ready { b"payload" } else { b"old" };
     assert_eq!(std::fs::read(target_root.path().join("file"))?, expected_target);
     assert_eq!(std::fs::read(source_root.path().join("file"))?, b"payload");

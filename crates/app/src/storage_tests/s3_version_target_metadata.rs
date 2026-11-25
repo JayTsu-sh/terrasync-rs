@@ -1,6 +1,5 @@
 //! 真实 S3 目标 tags 写入失败仍保留所有数据版本，按 entry 计错并交付具体原因。
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
 
 use data_mover::model::{ObservationMode, ObservationPlan, ObservedEntry};
 use task_model::StorageEntryMessage;
@@ -120,7 +119,7 @@ async fn whole_entry(source: &StorageContext, entry: &Arc<ObservedEntry>, integr
         failed_entries += usize::from(*first_in_entry);
         consumer.update_statistics(&message);
     }
-    assert_eq!((failures, failed_entries, bytes.load(Ordering::Relaxed)), (20, 1, 140));
+    assert_eq!((failures, failed_entries, bytes.published()), (20, 1, 140));
     assert!(matches!(
         consumer.to_report(true).detail,
         ProgressDetail::Full {

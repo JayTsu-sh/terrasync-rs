@@ -7,6 +7,7 @@
 //! 4. 并发复制控制
 //! 5. 重试机制集成
 
+use crate::copy_bytes::CopyBytes;
 use crate::file_copy::metadata as copy_metadata;
 use crate::file_copy::namespace as copy_namespace;
 use tokio_util::sync::CancellationToken;
@@ -14,7 +15,6 @@ use tokio_util::sync::CancellationToken;
 use crate::file_copy::local::copy_file_for_job;
 use crate::file_copy::{CopyOptions, prepare_directory};
 use std::sync::Arc;
-use std::sync::atomic::AtomicU64;
 use task_model::ObservedEntryExt;
 use task_model::TransferMode;
 
@@ -223,7 +223,7 @@ pub(crate) struct ProcessEntryOpts {
 pub(crate) async fn process_entry(
     entry: &Arc<ObservedEntry>, src_storage: Arc<StorageContext>, dest_storage: Arc<StorageContext>,
     enable_integrity_check: bool, enable_acl: bool, is_source_reserved: bool, qos_manager: Option<QosManager>,
-    bytes_counter: Option<Arc<AtomicU64>>, broadcaster: &BroadcastForwarder<StorageEntryMessage>, resume: ResumeOpts,
+    bytes_counter: Option<Arc<CopyBytes>>, broadcaster: &BroadcastForwarder<StorageEntryMessage>, resume: ResumeOpts,
 ) -> Result<()> {
     let opts = ProcessEntryOpts {
         enable_integrity_check,
@@ -267,7 +267,7 @@ pub(crate) async fn process_metadata_only_entry(
 
 async fn process_entry_inner(
     entry: &Arc<ObservedEntry>, src_storage: Arc<StorageContext>, dest_storage: Arc<StorageContext>,
-    opts: ProcessEntryOpts, qos_manager: Option<QosManager>, bytes_counter: Option<Arc<AtomicU64>>,
+    opts: ProcessEntryOpts, qos_manager: Option<QosManager>, bytes_counter: Option<Arc<CopyBytes>>,
     broadcaster: &BroadcastForwarder<StorageEntryMessage>,
 ) -> Result<()> {
     let ProcessEntryOpts {

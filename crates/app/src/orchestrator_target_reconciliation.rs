@@ -1,9 +1,6 @@
 //! 复制完成后的目标清理与 rename；任务调度和通知生命周期仍由父模块负责。
-use std::{
-    collections::HashMap,
-    path::PathBuf,
-    sync::{Arc, atomic::AtomicU64},
-};
+use crate::copy_bytes::CopyBytes;
+use std::{collections::HashMap, path::PathBuf, sync::Arc};
 
 use data_mover::{
     model::{BackendKind, ObservedEntry},
@@ -142,7 +139,7 @@ impl SyncOrchestrator {
     #[allow(clippy::too_many_arguments)]
     async fn sync_renamed_file_changes(
         kind: ChangeKind, entry: &Arc<ObservedEntry>, src: &StorageContext, dest: &StorageContext,
-        qos: Option<QosManager>, integrity: bool, _source_reserved: bool, bytes: Option<Arc<AtomicU64>>, job_id: &str,
+        qos: Option<QosManager>, integrity: bool, _source_reserved: bool, bytes: Option<Arc<CopyBytes>>, job_id: &str,
         job_dir: &str, transfer_mode: TransferMode,
     ) -> Result<()> {
         let mut metadata_applied = false;
@@ -211,7 +208,7 @@ impl SyncOrchestrator {
     pub(super) async fn apply_deletions_and_renames(
         db: &ClickHouseDatabase, src_storage: Arc<StorageContext>, dest_storage: Arc<StorageContext>,
         is_source_reserved: bool, broadcaster: &BroadcastForwarder<StorageEntryMessage>, enable_integrity_check: bool,
-        qos_manager: Option<QosManager>, bytes_counter: Option<Arc<AtomicU64>>, job_id: &str, job_dir: &str,
+        qos_manager: Option<QosManager>, bytes_counter: Option<Arc<CopyBytes>>, job_id: &str, job_dir: &str,
         transfer_mode: TransferMode, source_absence: SourceAbsenceCheck,
     ) -> Result<()> {
         let deletion_iter = db.detect_deleted_items().await?;

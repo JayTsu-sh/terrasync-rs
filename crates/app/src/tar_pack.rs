@@ -1,3 +1,4 @@
+use crate::copy_bytes::CopyBytes;
 use crate::scan::observe_path;
 // 标准库
 use crate::scan::source::WalkOptions;
@@ -6,8 +7,6 @@ use data_mover::tar_pack::{self, TarRequest};
 use data_mover::transfer::TransferPolicy;
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::AtomicU64;
-use std::sync::atomic::Ordering;
 use task_model::ObservedEntryExt;
 
 // 内部模块
@@ -33,7 +32,7 @@ use crate::error::{AppError, Result};
 /// - `manifest_list`: tar 内所有条目的列表（供后续写入 manifest 表）
 pub async fn pack_directory(
     src_storage: &StorageContext, dest_storage: &StorageContext, dir_entry: &ObservedEntry, is_source_reserved: bool,
-    qos: Option<QosManager>, bytes_counter: Option<Arc<AtomicU64>>,
+    qos: Option<QosManager>, bytes_counter: Option<Arc<CopyBytes>>,
 ) -> Result<(ObservedEntry, Arc<[Arc<ObservedEntry>]>)> {
     if !is_source_reserved {
         return Err(AppError::ConfigError(
@@ -70,7 +69,7 @@ pub async fn pack_directory(
     let outcome = tar_pack::pack(request).await.map_err(StorageError::from)?;
     let tar_size = outcome.transferred_bytes;
     if let Some(counter) = bytes_counter {
-        counter.fetch_add(tar_size, Ordering::Relaxed);
+        counter.add_published(tar_size);
     }
 
     info!(
@@ -157,13 +156,13 @@ mod tests {
         .await?;
         let target = create_storage(target_root.path().to_str().unwrap(), CreateStorageOptions::default()).await?;
         let directory = observe_path(source.storage(), Path::new("tree")).await?;
-        let counter = Arc::new(AtomicU64::new(0));
+        let counter = Arc::new(CopyBytes::default());
         let (tar_entry, manifest) =
             pack_directory(&source, &target, &directory, true, None, Some(Arc::clone(&counter))).await?;
         let archive = std::fs::read(target_root.path().join("tree.tar"))?;
         assert_eq!(tar_entry.path().as_str(), "tree.tar");
         assert_eq!(tar_entry.get_size(), archive.len() as u64);
-        assert_eq!(counter.load(Ordering::Relaxed), archive.len() as u64);
+        assert_eq!(counter.published(), archive.len() as u64);
         assert!(archive.len() > 2048);
         assert!(archive.windows(name.len()).any(|bytes| bytes == name.as_bytes()));
         assert!(archive.windows(7).any(|bytes| bytes == b"archive"));

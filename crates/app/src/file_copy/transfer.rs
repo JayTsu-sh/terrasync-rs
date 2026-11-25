@@ -1,6 +1,5 @@
 //! 将任务策略编译为唯一的原生传输请求；恢复和发布仍由 data-mover 负责。
 
-use std::sync::atomic::Ordering;
 use std::{fmt, ptr, sync::Arc};
 
 use data_mover::metadata::MetadataPlan;
@@ -244,21 +243,29 @@ async fn execute_native(
     if let Some(qos) = &options.qos {
         request = request.with_source_qos(qos.source_group(source.block_size)?);
     }
+    let writes = options
+        .bytes_counter
+        .as_ref()
+        .filter(|_| version_index.is_none() && entry.history().is_none() && entry.kind() == EntryKind::File)
+        .map(|totals| totals.track());
+    if let Some(writes) = &writes {
+        request = request.with_write_observer(writes.observer());
+    }
     // 这里只建立目标事实；源清理由任务层在就绪复核后决定。
     let result = transfer::transfer(request).await;
-    let data = match &result {
-        Ok(outcome) => Some(outcome),
-        Err(failure) => failure.published_data(),
-    };
-    if let Some(data) = data
+    // 普通文件在观察器收到发布回执时结算。版本和其他既有路径按执行结果累计。
+    if writes.is_none()
         && let Some(counter) = &options.bytes_counter
     {
-        // 原生完成量包含已复用字节；本轮传输只累计新增且已确认的目标数据。
-        counter.fetch_add(
-            data.transferred_bytes.saturating_sub(data.reused_bytes),
-            Ordering::Relaxed,
-        );
+        let data = match &result {
+            Ok(outcome) => Some(outcome),
+            Err(failure) => failure.published_data(),
+        };
+        if let Some(data) = data {
+            counter.add_published(data.transferred_bytes.saturating_sub(data.reused_bytes));
+        }
     }
+    drop(writes);
     match result {
         Ok(outcome) => Ok(outcome),
         Err(failure) => Err(failure
