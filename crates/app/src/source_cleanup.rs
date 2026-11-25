@@ -25,7 +25,7 @@ mod history;
 mod ready_files;
 pub(crate) use ready_files::{ReadyFileCleanup, can_stream_files};
 mod ready_window;
-pub(crate) use ready_window::{EarlyCleanup, FullCleanupStage};
+pub(crate) use ready_window::{CleanupConnections, ReadyCleanupStage, finish_with_ready_cleanup};
 
 type CompletedChecks = HashMap<StoragePath, EntryIdentityKey>;
 

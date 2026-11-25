@@ -11,6 +11,7 @@ use std::{
 use data_mover::model::BackendKind;
 use data_mover::storage::NamespaceReadPolicy;
 use db::ClickHouseDatabase;
+use task_model::migration::MigrationMode;
 use tokio::sync::Semaphore;
 use tracing::{Instrument, error, info, info_span};
 use utils::app_config::AppConfig;
@@ -33,7 +34,7 @@ use crate::migration_plan::MigrationPlan;
 use crate::receiver::{LocalCopyExecutor, LocalCopyReceiver, ReceiverConfig};
 use crate::scan::ScanType;
 use crate::sender::{SenderWorkerConfig, sender_worker};
-use crate::source_cleanup::{EarlyCleanup, FullCleanupStage, SourceCleanupCheck};
+use crate::source_cleanup::{ReadyCleanupStage, SourceCleanupCheck, finish_with_ready_cleanup};
 #[cfg(windows)]
 use crate::storage_factory::backend_kind_from_location;
 use crate::storage_factory::{StorageRole, create_storage_for_role};
@@ -193,7 +194,12 @@ impl SyncOrchestrator {
                     .copy_database_execution()
                     .map(|execution| (cleanup_check.clone(), execution))
             };
-            Some(FullCleanupStage::start(&mut broadcaster, copy_concurrency, streaming))
+            Some(ReadyCleanupStage::start(
+                &mut broadcaster,
+                copy_concurrency,
+                MigrationMode::Full,
+                streaming,
+            ))
         } else {
             None
         };
@@ -362,8 +368,8 @@ impl SyncOrchestrator {
                 let alive_counter = alive_receivers.clone();
                 let done_counter = mount_done_receivers.clone();
                 let execution = consumer_manager.copy_database_execution();
-                let cleanup_connections = early_cleanup.as_ref().map(FullCleanupStage::connections);
-                let ready_files = early_cleanup.as_ref().and_then(FullCleanupStage::ready_files);
+                let cleanup_connections = early_cleanup.as_ref().map(ReadyCleanupStage::connections);
+                let ready_files = early_cleanup.as_ref().and_then(ReadyCleanupStage::ready_files);
 
                 let span = info_span!("receiver_worker", recv_id = recv_id);
                 let handle = tokio::spawn(
@@ -535,31 +541,15 @@ impl SyncOrchestrator {
         }
 
         drop(broadcaster);
-        let copy_ready = pipeline_result.is_ok();
-        let early = async {
-            match early_cleanup {
-                Some(stage) => {
-                    stage
-                        .complete(copy_ready, cleanup_check.clone(), Some(root_metadata))
-                        .await
-                }
-                None => Ok(EarlyCleanup::default()),
-            }
-        };
-        // 就绪窗口不等待数据库冲刷；两条链路均收束，失败时保留两类原始原因。
-        let (consumers_result, early_result) = tokio::join!(finish_phase(consumer_handles), early);
+        let early = finish_with_ready_cleanup(
+            consumer_handles,
+            pipeline_result,
+            early_cleanup,
+            cleanup_check.clone(),
+            root_metadata,
+        )
+        .await?;
         let result: Result<()> = async {
-            // 消费者关闭会使 worker 返回广播错误；优先保留导致关闭的真实原因。
-            let early = match (consumers_result.and(pipeline_result), early_result) {
-                (Ok(()), Ok(completed)) => completed,
-                (Err(source), Err(cleanup)) => {
-                    return Err(AppError::MigrationAndSourceCleanupFailed {
-                        source: Box::new(source),
-                        cleanup: Box::new(cleanup),
-                    });
-                }
-                (Err(error), Ok(_)) | (Ok(()), Err(error)) => return Err(error),
-            };
             if let Some(database) = &database {
                 let destination = if let Some((_, destination)) = &early.connections {
                     destination.clone()

@@ -738,6 +738,13 @@ Single／双副本的 12 轮迁移及 HTTP 204／报告归档再验证通过。
 权限失败使用独占目录中 uid/gid 65534 子进程，不修改共享权限。
 HTTP 204 callback 核验具体原因，数据库核验失败／成功代次、最终报告及空 base。
 
+同一命令也在两种 ClickHouse 部署上各运行 5 轮增量搬迁。先保留源建立基线，再新增和
+修改各一个普通文件。扣住本轮的 base INSERT，独立核对两个目标的内容、新增和修改的
+源文件已清理、未变化的源文件仍存在。随后分别放行、返回 403、在写入成功后丢弃回执、
+持续断开或静默阻塞。代理检查丢失回执后重投使用同一去重标识，callback 和已归档终态
+均核对本轮字节与新增／修改计数。持续故障时检查已完成的搬迁保留、未变化的源文件仍在，
+并记录从故障注入至第一次重试及终态返回的耗时。增量范围为 Local 目标和有界提前清理窗口。
+
 `python3 tests/lab/run-source-ready-nfs.py` 运行精确 ignored 用例
 `copy_execution::ready_cleanup_nfs_tests::real_nfs_full_move_ready_window_and_combined_failure`。
 复用实验室授权的 PVE SSH／qm guest exec 通道，仅创建随机独占 NFS 前缀；

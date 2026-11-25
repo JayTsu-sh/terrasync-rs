@@ -6,7 +6,8 @@ use std::{
 };
 
 use data_mover::model::{EntryKind, ModelValueError, ObservedEntry};
-use task_model::StorageEntryMessage;
+use task_model::{ChangeKind, StorageEntryMessage, migration::MigrationMode};
+use tokio::task::JoinHandle;
 use tokio_util::task::AbortOnDropHandle;
 
 use super::ready_files::can_stream_files;
@@ -17,6 +18,7 @@ use crate::copy_root::CopyRootMetadata;
 use crate::error::{AppError, CopyStep, Result, StorageError};
 use crate::file_copy::selection::unrepresentable_object;
 use crate::storage_factory::StorageContext;
+use crate::task_stream::finish_phase;
 
 const MAX_ENTRIES: usize = 64;
 const MAX_BYTES: usize = 8 * 1024 * 1024;
@@ -24,7 +26,7 @@ const MAX_BYTES: usize = 8 * 1024 * 1024;
 type ConnectedStorages = (Arc<StorageContext>, Arc<StorageContext>);
 pub(crate) type CleanupConnections = Arc<OnceLock<ConnectedStorages>>;
 
-pub(crate) struct FullCleanupStage {
+pub(crate) struct ReadyCleanupStage {
     connections: CleanupConnections,
     collector: AbortOnDropHandle<ReadyWindow>,
     ready_files: Option<Arc<ReadyFileCleanup>>,
@@ -37,9 +39,9 @@ pub(crate) struct EarlyCleanup {
     pub(crate) streamed_files: bool,
 }
 
-impl FullCleanupStage {
+impl ReadyCleanupStage {
     pub(crate) fn start(
-        broadcaster: &mut BroadcastForwarder<StorageEntryMessage>, concurrency: usize,
+        broadcaster: &mut BroadcastForwarder<StorageEntryMessage>, concurrency: usize, mode: MigrationMode,
         streaming: Option<(SourceCleanupCheck, CopyDatabaseExecution)>,
     ) -> Self {
         let connections = Arc::new(OnceLock::<ConnectedStorages>::new());
@@ -48,7 +50,7 @@ impl FullCleanupStage {
         let observed_connections = connections.clone();
         let mut receiver = broadcaster.subscribe();
         let collector = AbortOnDropHandle::new(tokio::spawn(async move {
-            let mut window = ReadyWindow::new(concurrency);
+            let mut window = ReadyWindow::new(concurrency, mode);
             let mut streaming = None;
             while let Some(message) = receiver.recv().await {
                 if streaming.is_none() {
@@ -136,7 +138,31 @@ impl FullCleanupStage {
     }
 }
 
+/// 广播关闭后，会合异步入库及已就绪的源清理，并保留两条链路的错误。
+pub(crate) async fn finish_with_ready_cleanup(
+    consumers: Vec<JoinHandle<Result<()>>>, pipeline: Result<()>, stage: Option<ReadyCleanupStage>,
+    check: SourceCleanupCheck, root: &CopyRootMetadata,
+) -> Result<EarlyCleanup> {
+    let early = async {
+        match stage {
+            Some(stage) => stage.complete(pipeline.is_ok(), check, Some(root)).await,
+            None => Ok(EarlyCleanup::default()),
+        }
+    };
+    let (consumers, cleanup) = tokio::join!(finish_phase(consumers), early);
+    // 消费者关闭会使 worker 报广播错误，优先保留导致关闭的真实原因。
+    match (consumers.and(pipeline), cleanup) {
+        (Ok(()), Ok(completed)) => Ok(completed),
+        (Err(source), Err(cleanup)) => Err(AppError::MigrationAndSourceCleanupFailed {
+            source: Box::new(source),
+            cleanup: Box::new(cleanup),
+        }),
+        (Err(error), Ok(_)) | (Ok(()), Err(error)) => Err(error),
+    }
+}
+
 struct ReadyWindow {
+    mode: MigrationMode,
     entries: VecDeque<(Arc<ObservedEntry>, usize)>,
     bytes: usize,
     limit: usize,
@@ -146,8 +172,9 @@ struct ReadyWindow {
 }
 
 impl ReadyWindow {
-    fn new(concurrency: usize) -> Self {
+    fn new(concurrency: usize, mode: MigrationMode) -> Self {
         Self {
+            mode,
             entries: VecDeque::new(),
             bytes: 0,
             limit: concurrency.clamp(1, MAX_ENTRIES),
@@ -163,6 +190,19 @@ impl ReadyWindow {
         }
         let item = match message {
             StorageEntryMessage::New(item) => item,
+            StorageEntryMessage::Changed {
+                entry,
+                kind: ChangeKind::DataOnly | ChangeKind::Both,
+            } if self.mode == MigrationMode::Incremental && entry.entry.kind() == EntryKind::File => entry,
+            // 未变化的子目录不会产生 New，也要等目录属性收尾后再清理。
+            StorageEntryMessage::Scanned(entry)
+                if self.mode == MigrationMode::Incremental
+                    && entry.kind() == EntryKind::Directory
+                    && !entry.path().as_str().is_empty() =>
+            {
+                self.disable();
+                return;
+            }
             StorageEntryMessage::CopyEntryCompleted { .. }
             | StorageEntryMessage::CopyItemCompleted { .. }
             | StorageEntryMessage::CopyEntryBoundary(_) => {
@@ -173,6 +213,9 @@ impl ReadyWindow {
         };
         if item.entry.kind() == EntryKind::Directory || item.entry.history().is_some() || item.version_index.is_some() {
             self.disable();
+            return;
+        }
+        if self.mode == MigrationMode::Incremental && item.entry.kind() != EntryKind::File {
             return;
         }
         // 只对固定窗口尝试编码；普通大迁移不会逐 entry 增加一次序列化。
