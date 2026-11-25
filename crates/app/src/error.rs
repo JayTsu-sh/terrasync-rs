@@ -191,7 +191,9 @@ pub enum AppError {
         source: Box<StorageError>,
         database: Box<DatabaseError>,
     },
-    #[error("同一数据库作业 {job_id} 已有执行，无法获取作业锁: {source}")]
+    #[error("同一数据库作业 {job_id} 已有执行")]
+    JobExecutionBusy { job_id: String },
+    #[error("无法获取数据库作业 {job_id} 的执行锁: {source}")]
     JobExecutionLock { job_id: String, source: TryLockError },
     /// 中立 traversal 的 session/runtime 终态失败。
     #[error("Traversal terminal failure: {0}")]

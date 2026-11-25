@@ -151,7 +151,6 @@ dependencies = [
  "bytes 1.12.1",
  "chrono",
  "clickhouse",
- "dashmap",
  "data-mover",
  "db",
  "futures",

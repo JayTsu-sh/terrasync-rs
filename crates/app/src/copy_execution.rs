@@ -241,7 +241,7 @@ mod tests {
     }
 
     #[test]
-    fn file_lock_failure_releases_the_process_registration() -> Result<()> {
+    fn directory_lock_failure_releases_the_job_identity_lock() -> Result<()> {
         let directory = tempfile::tempdir()?;
         let job = job(directory.path());
         let file = OpenOptions::new()
@@ -255,7 +255,7 @@ mod tests {
         })?;
         assert!(matches!(
             CopyLease::acquire(&connection(), &job),
-            Err(AppError::JobExecutionLock { .. })
+            Err(AppError::JobExecutionBusy { .. })
         ));
         drop(file);
         assert!(CopyLease::acquire(&connection(), &job).is_ok());
