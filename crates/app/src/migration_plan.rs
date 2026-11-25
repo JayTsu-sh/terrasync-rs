@@ -1,6 +1,8 @@
 //! 扫描前统一选择可迁移的元数据；worker 不再各自推断或追加源端读取。
 
-use data_mover::model::{MetadataCapabilities, MetadataFamily, ObservationMode, ObservationPlan, ObservationSupport};
+use data_mover::model::{
+    BackendKind, MetadataCapabilities, MetadataFamily, ObservationMode, ObservationPlan, ObservationSupport,
+};
 use data_mover::storage::{CopiedAclTarget, CopiedMetadataTarget, CopiedValueTarget};
 use data_mover::time_util::now_secs;
 use task_model::metadata::MetadataScope;
@@ -95,8 +97,10 @@ pub(crate) struct MetadataRead {
 
 impl MigrationPlan {
     pub async fn compile(source: &StorageContext, destination: &StorageContext, acl: bool) -> Result<Self> {
-        let root_metadata =
-            !source.storage().holds_directory_objects() && !destination.storage().holds_directory_objects();
+        // HDFS 的路径身份包含会随子项写入而变化的目录 mtime，无法用于跨阶段绑定目标根。
+        let root_metadata = destination.storage().kind() != BackendKind::Hdfs
+            && !source.storage().holds_directory_objects()
+            && !destination.storage().holds_directory_objects();
         let source = source.storage().metadata()?.observation_capabilities();
         let target = destination.storage().staged_destination()?.copied_metadata_target();
         let mut plan = Self::from_capabilities(source, target, acl);

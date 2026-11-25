@@ -1144,6 +1144,7 @@ python tools/log_analyzer.py --app /tmp/app.json.log --error /tmp/error.log -o /
 
 未知 POSIX mode 在数据库和 wire 投影中保持为空，真实 `000` 权限仍会保留。
 文件元数据由传输引擎在发布前协商应用；目录及仅属性更新按目标存储能力处理。
+复制到 HDFS 时跳过目标根目录自身的元数据设置。文件和子目录继续按目标能力处理。
 真实环境可使用 `tests/lab/run-e2e.sh`、`tests/lab/run-hdfs-e2e.sh` 和完整性专项脚本复验，
 验证报告保留在本地测试目录。
 
