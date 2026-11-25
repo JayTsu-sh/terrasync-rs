@@ -15,13 +15,15 @@ import urllib.parse
 import uuid
 
 
-class FactGate:
-    def __init__(self, job):
+class WriteGate:
+    def __init__(self, job, hold_state):
         self.job = job
+        self.hold_state = hold_state
         self.received = threading.Event()
         self.release = threading.Event()
         self.finished = threading.Event()
         self.status = None
+        self.payload = None
 
 
 def sql(query, port=8123):
@@ -115,7 +117,8 @@ def record_contents(directory):
     return {path.name: path.read_bytes() for path in directory.iterdir()}
 
 
-def run_case(binary, logs, relay_port, set_gate, database, job, shards, selected, checkpoint, separate_directory):
+def run_case(binary, logs, relay_port, set_gate, database, job, shards, selected, checkpoint, separate_directory,
+             hold_state=False):
     cluster = selected is not None
     case_logs = logs / job
     case_logs.mkdir()
@@ -151,12 +154,13 @@ dial_timeout = 5
 read_timeout = 60
 """)
 
-        def launch(name, retain, directory=work):
-            command = [str(binary), "-c", str(fixture / f"retain-{retain}.toml"), "sync", "--id", job]
+        def launch(name, retain, directory=work, subcommand="sync"):
+            command = [str(binary), "-c", str(fixture / f"retain-{retain}.toml"), subcommand, "--id", job]
             if checkpoint:
                 command.append("--resume")
+            operands = [str(source), str(target)] if subcommand == "sync" else [str(source)]
             with (case_logs / f"{name}.log").open("wb") as output:
-                return subprocess.Popen(command + [str(source), str(target)], cwd=directory,
+                return subprocess.Popen(command + operands, cwd=directory,
                                         stdout=output, stderr=subprocess.STDOUT)
 
         def finish(process, name):
@@ -174,11 +178,13 @@ read_timeout = 60
         changed, added, fresh = b"published by old execution", b"already moved", b"written after takeover"
         (source / "changed").write_bytes(changed)
         (source / "added").write_bytes(added)
-        gate = FactGate(job)
+        gate = WriteGate(job, hold_state)
         set_gate(gate)
         old = launch("old", False)
         try:
-            assert gate.received.wait(30), f"no ordinary fact intercepted. See {case_logs}"
+            assert gate.received.wait(30), f"no old database write intercepted. See {case_logs}"
+            if not hold_state:
+                assert b"\x07changed" in gate.payload and b"\x05added" in gate.payload, case_logs
             wait_for(lambda: record_contents(source) == {"unchanged": b"stable"},
                      f"ready files were not cleaned before receipt. See {case_logs}")
             assert record_contents(target) == {"changed": changed, "added": added, "unchanged": b"stable"}
@@ -197,9 +203,13 @@ read_timeout = 60
             print(f"takeover live_owner job={job} different_job_dir={separate_directory} "
                   f"contender_status={contender_code} lock_rejected={locked} "
                   f"current_generation={latest['sequence']} elapsed_ms={elapsed_ms}", flush=True)
+            if not locked or latest != previous:
+                return ["live_owner_other_directory" if separate_directory else "live_owner_same_directory"]
             if separate_directory:
-                return [] if locked and latest == previous else ["live_owner_other_directory"]
-            assert locked and latest == previous, (contender_code, latest, case_logs)
+                code = finish(launch("scan_contender", True, alternate, "scan"), "scan contender")
+                assert code != 0 and "已有执行" in (case_logs / "scan_contender.log").read_text(), case_logs
+                assert generations(database, job)[-1] == previous and old.poll() is None, case_logs
+                print(f"takeover scan_contender job={job} locked=true current_generation=2", flush=True)
             assert record_contents(source) == {"unchanged": b"stable"}
             assert record_contents(target) == {"changed": changed, "added": added, "unchanged": b"stable"}
 
@@ -207,7 +217,7 @@ read_timeout = 60
             old.kill()
             assert old.wait(timeout=5) == -signal.SIGKILL
             (source / "changed").write_bytes(fresh)
-            assert finish(launch("successor", True), "successor") == 0, case_logs
+            assert finish(launch("successor", True, contender_dir), "successor") == 0, case_logs
             successor, detail = check_completed(database, job, 3, "full")
             elapsed_ms = round((time.monotonic() - killed) * 1000)
             successor_id = successor["request"]["execution_id"]
@@ -220,23 +230,42 @@ read_timeout = 60
 
             # Send the exact old request after the new generation has completed.
             gate.release.set()
-            assert gate.finished.wait(30) and gate.status is not None, (gate.status, case_logs)
-            by_path = {row["relative_path"]: row for row in base(database, job)}
-            assert by_path["changed"]["copy_execution_id"] == successor_id, by_path
-            old_only_fact = by_path.get("added")
-            if old_only_fact is not None:
-                assert old_only_fact["copy_execution_id"] == previous_id, by_path
+            assert gate.finished.wait(30) and gate.status == 200, (gate.status, case_logs)
+            if hold_state:
+                state = rows(f"SELECT copy_execution_id,baseline_committed FROM {database}.state_{job} FINAL WHERE id=1")
+                state_preserved = state == [{"copy_execution_id": successor_id, "baseline_committed": True}]
+                print(f"takeover late_state job={job} old_commit_status={gate.status} "
+                      f"successor_state_preserved={state_preserved}", flush=True)
+                if not state_preserved:
+                    return ["late_old_state_overwrote_successor"]
+            else:
+                by_path = {row["relative_path"]: row for row in base(database, job)}
+                assert by_path["changed"]["copy_execution_id"] == successor_id, by_path
+                assert by_path["added"]["copy_execution_id"] == previous_id, by_path
 
-            assert finish(launch("next_incremental", True), "next incremental") == 0, case_logs
+            assert finish(launch("next_incremental", True, contender_dir), "next incremental") == 0, case_logs
             _, detail = check_completed(database, job, 4, "incremental")
             assert (target / "changed").read_bytes() == fresh
             late_target_retained = (target / "added").exists()
             if late_target_retained:
                 assert (target / "added").read_bytes() == added
-            print(f"takeover late_fact job={job} old_insert_status={gate.status} old_only_fact={old_only_fact is not None} "
-                  f"newer_same_key_won=true old_only_target_retained={late_target_retained} "
+            print(f"takeover subsequent_incremental job={job} held_state={hold_state} "
+                  f"old_only_target_retained={late_target_retained} "
                   f"reported_deleted={detail['deleted_count']}", flush=True)
-            return [] if late_target_retained and detail["deleted_count"] == 0 else ["late_old_fact_reintroduced_deletion"]
+            if not late_target_retained or detail["deleted_count"] != 0:
+                return ["late_old_fact_reintroduced_deletion"]
+            assert detail["transferred_bytes"] == 0, detail
+
+            # An incremental after another restart must remember the last full boundary
+            # and still reconcile a real deletion based on the retained catalogue.
+            (source / "unchanged").unlink()
+            assert finish(launch("real_deletion", True, contender_dir), "real deletion") == 0, case_logs
+            _, detail = check_completed(database, job, 5, "incremental")
+            assert detail["deleted_count"] == 1 and detail["transferred_bytes"] == 0, detail
+            assert record_contents(target) == {"changed": fresh, "added": added}
+            print(f"takeover valid_deletion job={job} reported_deleted={detail['deleted_count']} "
+                  f"stale_target_retained=true transferred_bytes={detail['transferred_bytes']}", flush=True)
+            return []
         finally:
             if old.poll() is None:
                 old.kill()
@@ -267,10 +296,15 @@ def run(shards):
             query = (urllib.parse.unquote_plus(self.path).encode() + body[:160]).upper()
             with guard:
                 gate = selected_gate
-                held = (gate is not None and not gate.received.is_set()
-                        and f"BASE_{gate.job}".upper().encode() in query
-                        and b"INSERT INTO" in query and b"FORMAT ROWBINARY" in query)
+                held = False
+                if gate is not None and not gate.received.is_set() and b"INSERT INTO" in query:
+                    if gate.hold_state:
+                        held = (f"STATE_{gate.job}".upper().encode() in query
+                                and b"BASELINE_COMMITTED" in query and b",TRUE," in query)
+                    else:
+                        held = f"BASE_{gate.job}".upper().encode() in query and b"FORMAT ROWBINARY" in query
                 if held:
+                    gate.payload = body
                     gate.received.set()
             if held and not gate.release.wait(120):
                 self.send_error(504, "owned fixture did not release the held write")
@@ -312,18 +346,21 @@ def run(shards):
             on_cluster = " ON CLUSTER notification_cluster" if cluster else ""
             sql(f"CREATE DATABASE {database}{on_cluster}")
             try:
-                for separate_dir in (False, True):
-                    prefix = f"takeover_{'cluster' if cluster else 'single'}_{'other' if separate_dir else 'same'}"
+                for separate_dir, hold_state, checkpoint in (
+                    (False, False, False), (True, False, True), (True, True, False)
+                ):
+                    variant = "state" if hold_state else "other" if separate_dir else "same"
+                    prefix = f"takeover_{'cluster' if cluster else 'single'}_{variant}"
                     placements = rows(
                         f"SELECT number,cityHash64(concat('{prefix}_',toString(number))) % {shards} AS shard FROM numbers(64)"
                     )
-                    locations = range(shards) if cluster and not separate_dir else (0,) if cluster else (None,)
+                    locations = range(shards) if cluster else (None,)
                     for selected in locations:
                         number = next(row["number"] for row in placements
                                       if selected is None or int(row["shard"]) == selected)
                         job = f"{prefix}_{number}"
                         results = run_case(binary, logs, server.server_port, set_gate, database, job,
-                                           shards, selected, selected == 1, separate_dir)
+                                           shards, selected, checkpoint, separate_dir, hold_state)
                         failures.extend((job, result) for result in results)
             finally:
                 sql(f"DROP DATABASE {database}{on_cluster} SYNC")

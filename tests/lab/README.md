@@ -759,12 +759,12 @@ LAB_TAKEOVER_LOG_DIR=/absolute/path/to/new-process-logs \
 python3 tests/lab/run-notification-archive-local.py --multi-shard --copy-takeover
 ```
 
-用例先扣住旧进程的事实 INSERT，核对已搬迁目标和最新代次，再启动相同或不同作业目录的第二进程。
-同目录场景随后强制结束旧进程，确认新执行全量恢复、记账正确且保留目标，再向真实库提交旧 INSERT。
-下一轮增量核对同名新事实胜出，以及仅在旧请求中的文件仍保留在目标端。单机运行一次，集群分别在三个
-分片运行，并通过各副本直接读表验证实际路由。不同作业目录在单机和集群各验证一次。违规会在所有案例结束
-后以非零退出，保留逐进程日志。GitHub `main` 的 `d223292` 会复现不同目录接受重复执行，以及旧事实
-迟到后下一轮增量反向删除已搬迁目标。该实验覆盖同一主机上的多个进程。
+用例分别扣住旧进程的事实 INSERT 或代次提交 INSERT，核对已搬迁目标和最新代次，再从相同或不同作业目录
+启动第二进程，跨目录时另验证普通扫描不能与复制争用该作业。强制结束旧进程后从竞争进程的目录接管，
+核对全量恢复、实际传输字节和已搬迁目标，再向真实库
+重放旧请求并要求成功入库。通过直接读表核对事实和有效状态，再运行两轮增量，验证目标保留和真实删除。
+Direct、Checkpointed 和迟到状态场景均覆盖单机及集群各分片，副本路由由直接读表验证。违规时退出非零并保留逐进程日志。
+该实验覆盖同一 Linux 网络命名空间中使用同一 ClickHouse DSN 的多个进程。
 
 `python3 tests/lab/run-source-ready-nfs.py` 运行精确 ignored 用例
 `copy_execution::ready_cleanup_nfs_tests::real_nfs_full_move_ready_window_and_combined_failure`。
