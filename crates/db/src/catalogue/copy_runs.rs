@@ -40,19 +40,29 @@ impl ClickHouseDatabase {
 
     /// base 被清空或普通扫描覆盖后，原绑定及上一已接受请求仍然可查询。
     pub async fn latest_copy_generation(&self) -> Result<Option<CopyGeneration>> {
+        self.read_copy_generation(None).await
+    }
+
+    pub(super) async fn read_copy_generation(&self, execution_id: Option<&str>) -> Result<Option<CopyGeneration>> {
         let table = self.copy_runs_table();
         if !self.table_exists(&table).await? {
             return Ok(None);
         }
         let table = self.catalogue_query_table(&table)?;
-        let row = match self
-            .sync_client
-            .query(&format!(
-                "SELECT sequence,execution_id,revision,descriptor,hex(root_snapshot) AS root_snapshot FROM {table} FINAL ORDER BY sequence DESC LIMIT 1"
-            ))
-            .fetch_quorum_one::<CopyRunRow>()
-            .await
-        {
+        let filter = if execution_id.is_some() {
+            " WHERE execution_id=?"
+        } else {
+            ""
+        };
+        let sql = format!(
+            "SELECT sequence,execution_id,revision,descriptor,hex(root_snapshot) AS root_snapshot FROM {table} FINAL{filter} ORDER BY sequence DESC LIMIT 1"
+        );
+        let query = self.sync_client.query(&sql);
+        let query = match execution_id {
+            Some(execution_id) => query.bind(execution_id),
+            None => query,
+        };
+        let row = match query.fetch_quorum_one::<CopyRunRow>().await {
             Ok(row) => row,
             Err(DatabaseError::ClickHouseError(ClickHouseError::RowNotFound)) => return Ok(None),
             Err(error) => return Err(error),

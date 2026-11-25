@@ -35,6 +35,9 @@ pub(super) struct ClusterIncrementalStorageEntryRecord<'a> {
     pub metadata_digests: &'a [String],
     pub create_at: i64,
     pub comment: Option<&'a str>,
+    pub copy_execution_id: &'a str,
+    pub source_presence: Option<&'a str>,
+    pub target_outcome: Option<&'a str>,
 }
 
 impl<'a> ClusterIncrementalStorageEntryRecord<'a> {
@@ -68,6 +71,9 @@ impl<'a> ClusterIncrementalStorageEntryRecord<'a> {
             metadata_digests: &record.metadata_digests,
             create_at: record.create_at,
             comment: record.comment.as_deref(),
+            copy_execution_id: &record.copy_execution_id,
+            source_presence: record.source_presence.as_deref(),
+            target_outcome: record.target_outcome.as_deref(),
         }
     }
 }
@@ -209,12 +215,13 @@ mod tests {
     #[test]
     fn borrowed_event_row_preserves_every_owned_column() -> Result<()> {
         let record: IncrementalStorageEntryRecord = serde_json::from_value(json!({
-            "operation_type":"rename", "name":"目标.dat", "relative_path":"nested/目标.dat", "size":37,
+            "operation_type":"source_deleted", "name":"目标.dat", "relative_path":"nested/目标.dat", "size":37,
             "ext":"dat", "ctime":11, "mtime":12, "atime":13, "mode":420, "storage_type":"nas",
             "is_symlink":false, "is_dir":false, "is_regular_file":true, "hard_links":2,
             "current_state":1, "uid":1000, "gid":1001, "ino":42, "file_handle":"abcd",
             "version_id":"v1", "tags":"[]", "metadata_digests":["acl", "xattrs", "tags"],
-            "create_at":17, "comment":"old/source.dat"
+            "create_at":17, "comment":"已核验源缺失", "copy_execution_id":"attempt",
+            "source_presence":"absent", "target_outcome":"already_absent"
         }))?;
         let mut expected = serde_json::to_value(&record)?;
         expected["job_id"] = json!("job");

@@ -77,6 +77,9 @@ pub struct ProgressReport {
     pub elapsed_secs: f64,
     pub speed_bytes_per_sec: f64,
     pub detail: ProgressDetail,
+    /// 当前文件尚未发布的本轮确认写入字节。
+    #[serde(default)]
+    pub in_flight_bytes: u64,
     pub is_final: bool,
     #[serde(default)]
     pub diagnostics_complete: bool,

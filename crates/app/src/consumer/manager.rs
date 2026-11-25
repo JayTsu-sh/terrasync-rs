@@ -10,9 +10,9 @@
 //! - 单阶段调用方（scan / sync / integrity_check）仍然只调一次 `start_consumers`。
 
 // 标准库
+use crate::copy_bytes::CopyBytes;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::AtomicU64;
 use std::time::{Duration, Instant};
 
 // 外部crate
@@ -720,7 +720,7 @@ impl ConsumerManager {
     }
 
     /// 获取 per-chunk 实时字节计数器，用于在 `copy_file` 中每个 chunk 写入后更新带宽统计
-    pub async fn get_bytes_tracker(&self) -> Option<Arc<AtomicU64>> {
+    pub async fn get_bytes_tracker(&self) -> Option<Arc<CopyBytes>> {
         match &self.stats_consumer {
             Some(sc) => Some(sc.lock().await.get_bytes_tracker()),
             None => None,
@@ -1182,6 +1182,7 @@ mod resume_tests {
             job_type: "scan".into(),
             elapsed_secs: 12.0,
             speed_bytes_per_sec: 0.0,
+            in_flight_bytes: 0,
             detail: ProgressDetail::Full {
                 scanned_files: 7,
                 scanned_dirs: 2,

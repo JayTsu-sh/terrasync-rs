@@ -1,5 +1,8 @@
 //! 任务分类与观察事件；不承担数据库、网络和存储 I/O。
-use crate::{CopyCompletion, MetadataTargetVersion, ObservedEntryExt, TargetRetention, observation::ObservedItem};
+use crate::{
+    CopyCompletion, MetadataTargetVersion, ObservedEntryExt, SourcePresence, TargetDeletionOutcome, TargetRetention,
+    observation::ObservedItem,
+};
 use data_mover_model::{BackendKind, ObservedEntry};
 use serde::{Deserialize, Serialize};
 use std::{fmt, path::PathBuf, sync::Arc};
@@ -160,6 +163,13 @@ pub enum StorageEntryMessage {
     Changed { entry: ObservedItem, kind: ChangeKind },
     /// 文件已删除
     Deleted(Arc<ObservedEntry>),
+    /// 增量审查的逐项结果，独立于目录变更和删除成功计数。
+    TargetDeletion {
+        entry: Arc<ObservedEntry>,
+        source: SourcePresence,
+        outcome: TargetDeletionOutcome,
+        reason: Option<String>,
+    },
     /// 文件被重命名，(from, to)
     Renamed((Arc<ObservedEntry>, Arc<ObservedEntry>)),
     /// 文件完整性检查完成

@@ -40,8 +40,17 @@ fn consumer_config(job: &str, config: &ClickHouseConfig) -> ConsumerConfig {
     }
 }
 
-async fn deletion_case(config: &ClickHouseConfig, present: bool, directory: bool, known_child: bool) -> Result<()> {
-    let job = format!("absence_{present}_{directory}_{known_child}");
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TargetFixture {
+    Matching,
+    NonEmptyDirectory,
+}
+
+async fn deletion_case(
+    config: &ClickHouseConfig, present: bool, directory: bool, known_child: bool, target_fixture: TargetFixture,
+) -> Result<()> {
+    let conflicts = target_fixture == TargetFixture::NonEmptyDirectory;
+    let job = format!("absence_{present}_{directory}_{known_child}_{conflicts}");
     let database = ClickHouseDatabase::connect(config, &job).await?;
     database.initialize().await?;
     database.create_table(INCREMENTAL_SCAN_TABLE_BASE_NAME).await?;
@@ -78,7 +87,8 @@ async fn deletion_case(config: &ClickHouseConfig, present: bool, directory: bool
         .finish_copy_generation(CopyGenerationPhase::Completed, None)
         .await?;
     let database = database.new_execution_scope();
-    database.begin_copy_generation(&request("same", true)).await?;
+    let run = request("same", true);
+    database.begin_copy_generation(&run).await?;
     if !present {
         if known_child {
             std::fs::remove_file(source_root.path().join("entry/known"))?;
@@ -88,6 +98,12 @@ async fn deletion_case(config: &ClickHouseConfig, present: bool, directory: bool
         } else {
             std::fs::remove_file(source_root.path().join("entry"))?;
         }
+    }
+    if conflicts {
+        let target_path = target_root.path().join("entry");
+        std::fs::remove_file(&target_path)?;
+        std::fs::create_dir(&target_path)?;
+        std::fs::write(target_path.join("child"), b"keep")?;
     }
     // 本轮未给 compare_catalogue_batch 交付 entry，模拟过滤或未命中的旧确认事实。
     let mut events = BroadcastForwarder::new(8);
@@ -109,8 +125,16 @@ async fn deletion_case(config: &ClickHouseConfig, present: bool, directory: bool
         SourceAbsenceCheck::new(Duration::from_secs(1), Duration::from_secs(3)),
     )
     .await;
-    assert_eq!(result.is_ok(), present || !directory || known_child);
-    let messages: Vec<_> = std::iter::from_fn(|| received.try_recv().ok()).collect();
+    assert_eq!(result.is_ok(), !conflicts && (present || !directory || known_child));
+    let messages: Vec<_> = std::iter::from_fn(|| received.try_recv().ok())
+        .filter_map(|message| match message {
+            StorageEntryMessage::TargetDeletion { entry, outcome, .. } if outcome.confirms_absence() => {
+                Some(StorageEntryMessage::Deleted(entry))
+            }
+            StorageEntryMessage::TargetDeletion { .. } => None,
+            message => Some(message),
+        })
+        .collect();
     if present {
         assert!(
             matches!(messages.as_slice(), [StorageEntryMessage::TargetPreserved { retention, .. }] if retention.source_presence == SourcePresence::Present)
@@ -119,7 +143,7 @@ async fn deletion_case(config: &ClickHouseConfig, present: bool, directory: bool
         assert!(
             matches!(messages.as_slice(), [StorageEntryMessage::Deleted(child), StorageEntryMessage::Deleted(parent)] if child.path().as_str() == "entry/known" && parent.path().as_str() == "entry")
         );
-    } else if directory {
+    } else if directory || conflicts {
         assert!(messages.iter().any(|message| matches!(message, StorageEntryMessage::TargetPreserved { retention, .. } if retention.source_presence == SourcePresence::Absent)));
         assert!(
             !messages
@@ -131,7 +155,33 @@ async fn deletion_case(config: &ClickHouseConfig, present: bool, directory: bool
     }
     drop(events);
     writer.await??;
-    let retained = present || (directory && !known_child);
+    let page = database
+        .incremental_copy_changes(&run.execution_id, 0, 10)
+        .await?
+        .ok_or(DatabaseError::CopyExecutionUnavailable)?;
+    if !directory || known_child {
+        assert_eq!(page.changes.len(), 1);
+        let change = &page.changes[0];
+        assert_eq!(change.path, if known_child { "entry/known" } else { "entry" });
+        if present {
+            assert_eq!(change.kind, "deletion_unconfirmed");
+            assert_eq!(change.source_presence.as_deref(), Some("present"));
+            assert_eq!(change.target_outcome.as_deref(), Some("preserved"));
+        } else {
+            assert_eq!(change.kind, "source_deleted");
+            assert_eq!(change.source_presence.as_deref(), Some("absent"));
+            assert_eq!(
+                change.target_outcome.as_deref(),
+                Some(if conflicts { "failed" } else { "deleted" })
+            );
+            if conflicts {
+                assert!(change.reason.as_ref().is_some_and(|reason| !reason.is_empty()));
+            }
+        }
+    } else {
+        assert!(page.changes.is_empty());
+    }
+    let retained = present || conflicts || (directory && !known_child);
     assert_eq!(database.get_count("base").await?, u64::from(retained));
     assert_eq!(target_root.path().join("entry").exists(), retained);
     if directory && !known_child {
@@ -140,8 +190,11 @@ async fn deletion_case(config: &ClickHouseConfig, present: bool, directory: bool
             b"unowned child"
         );
     }
+    if conflicts {
+        assert_eq!(std::fs::read(target_root.path().join("entry/child"))?, b"keep");
+    }
     eprintln!(
-        "source-absence cluster={} present={present} directory={directory} known_child={known_child} target_retained={retained} recursive_delete=false",
+        "source-absence cluster={} present={present} directory={directory} known_child={known_child} target_conflict={conflicts} target_retained={retained} recursive_delete=false",
         config.cluster.is_some()
     );
     Ok(())
@@ -322,10 +375,11 @@ async fn real_source_absence_guards_target_mutations() -> Result<()> {
         let result: Result<()> = async {
             for present in [false, true] {
                 for directory in [false, true] {
-                    deletion_case(&config, present, directory, false).await?;
+                    deletion_case(&config, present, directory, false, TargetFixture::Matching).await?;
                 }
             }
-            deletion_case(&config, false, true, true).await?;
+            deletion_case(&config, false, true, true, TargetFixture::Matching).await?;
+            deletion_case(&config, false, false, false, TargetFixture::NonEmptyDirectory).await?;
             hardlink_case(&config).await
         }
         .await;

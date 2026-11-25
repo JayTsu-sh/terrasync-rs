@@ -7,6 +7,7 @@ use crate::config::JobType;
 use crate::report::ProgressReport;
 use clickhouse::Client as DatabaseClient;
 use db::ClickHouseConfig;
+use std::time::SystemTime;
 use std::{env, thread};
 use task_model::diagnostics::{CallbackAck, DiagnosticBatch};
 use task_model::{ErrorEvent, StorageEntryMessage};
@@ -70,6 +71,7 @@ pub(crate) enum Reply {
 pub(crate) struct Server {
     pub(crate) endpoint: CallbackEndpoint,
     pub(crate) bodies: Arc<Mutex<Vec<String>>>,
+    pub(crate) received_at: Arc<Mutex<Vec<SystemTime>>>,
     handle: JoinHandle<()>,
 }
 
@@ -118,12 +120,15 @@ pub(crate) async fn server(mut replies: Vec<Reply>) -> Server {
     .unwrap();
     let bodies = Arc::new(Mutex::new(Vec::new()));
     let recorded = bodies.clone();
+    let received_at = Arc::new(Mutex::new(Vec::new()));
+    let timestamps = Arc::clone(&received_at);
     let handle = tokio::spawn(async move {
         // 每个连接独立处理，静默连接不能阻塞后续重试的 accept。
         let mut connections = Vec::new();
         for reply in replies {
             let (mut stream, _) = listener.accept().await.unwrap();
             let raw = body(&mut stream).await;
+            timestamps.lock().await.push(SystemTime::now());
             let report: ProgressReport = serde_json::from_str(&raw).unwrap();
             recorded.lock().await.push(raw);
             if matches!(reply, Reply::Disconnect) {
@@ -155,6 +160,7 @@ pub(crate) async fn server(mut replies: Vec<Reply>) -> Server {
     Server {
         endpoint,
         bodies,
+        received_at,
         handle,
     }
 }

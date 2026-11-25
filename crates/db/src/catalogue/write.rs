@@ -169,6 +169,13 @@ impl ClickHouseDatabase {
                 Ok(records)
             })?;
 
+        let mut records = records;
+        let execution_id = self.generation_lifecycle.lock().await.copy_execution_id.clone();
+        if let Some(execution_id) = execution_id {
+            for record in &mut records {
+                record.copy_execution_id.clone_from(&execution_id);
+            }
+        }
         let record_count = records.len();
 
         let client = self.catalogue_write_client(&self.async_client);

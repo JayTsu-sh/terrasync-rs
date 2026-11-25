@@ -46,11 +46,14 @@ test.describe('任务详情页信息展示', () => {
     await expect(page.getByText('NAS-01')).toBeVisible()
   })
 
-  test('running 任务不显示编辑按钮', async ({ page }) => {
+  test('running 迁移独立显示逻辑、在途和已发布数据量且不允许编辑', async ({ page }) => {
     await setupApiMocks(page, { tasks: [runningTask] })
     await page.goto('/tasks/t-running')
 
     await expect(page.getByRole('button', { name: '编辑' })).toBeHidden()
+    await expect(page.getByText('512.0 MB', { exact: true })).toBeVisible()
+    await expect(page.getByTestId('copy-in-flight-bytes')).toHaveText('16.0 MB')
+    await expect(page.getByTestId('copy-published-bytes')).toHaveText('128.0 MB')
   })
 
   test('非 running 任务显示编辑按钮', async ({ page }) => {

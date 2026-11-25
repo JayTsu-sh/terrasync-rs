@@ -1,9 +1,6 @@
 //! 复制完成后的目标清理与 rename；任务调度和通知生命周期仍由父模块负责。
-use std::{
-    collections::HashMap,
-    path::PathBuf,
-    sync::{Arc, atomic::AtomicU64},
-};
+use crate::copy_bytes::CopyBytes;
+use std::{collections::HashMap, path::PathBuf, sync::Arc};
 
 use data_mover::{
     model::{BackendKind, ObservedEntry},
@@ -11,27 +8,138 @@ use data_mover::{
 };
 use db::{ClickHouseDatabase, DeletionStatus};
 use task_model::{
-    ChangeKind, ErrorEvent, ObservedEntryExt, SourcePresence, StorageEntryMessage, TargetRetention,
-    TargetRetentionReason, TransferMode,
+    ChangeKind, ErrorEvent, ObservedEntryExt, SourcePresence, StorageEntryMessage, TargetDeletionOutcome,
+    TargetRetention, TargetRetentionReason, TransferMode,
 };
 use tracing::error;
 
 use super::SyncOrchestrator;
 use crate::broadcast::BroadcastForwarder;
 use crate::error::{AppError, Result};
+use crate::file_copy::local::CommitRecorder;
 use crate::file_copy::{CopyOptions, HdfsCopyContext, copy_file};
 use crate::file_copy::{metadata as copy_metadata, namespace as copy_namespace};
 use crate::rename::{RenameOptions, RenameOutcome, rename_or_copy};
 use crate::storage_factory::StorageContext;
-use crate::sync::{CommitRecorder, ResumeOpts, process_entry};
+use crate::sync::{ResumeOpts, process_entry};
 use crate::target_absence::{SourceAbsenceCheck, preserve};
+
+async fn publish_target_deletion(
+    broadcaster: &BroadcastForwarder<StorageEntryMessage>, entry: &Arc<ObservedEntry>, source: SourcePresence,
+    outcome: TargetDeletionOutcome, reason: Option<String>,
+) -> Result<()> {
+    if entry.get_is_regular_file() && entry.history().is_none() {
+        broadcaster
+            .broadcast(StorageEntryMessage::TargetDeletion {
+                entry: Arc::clone(entry),
+                source,
+                outcome,
+                reason,
+            })
+            .await?;
+    } else if outcome.confirms_absence() {
+        broadcaster
+            .broadcast(StorageEntryMessage::Deleted(Arc::clone(entry)))
+            .await?;
+    }
+    Ok(())
+}
+
+/// 目标清理复用既有缺失证明和错误传播，逐项结果随原广播批处理。
+async fn reconcile_target_deletion(
+    source: &StorageContext, destination: &StorageContext, entry: &Arc<ObservedEntry>, is_source_reserved: bool,
+    events: &BroadcastForwarder<StorageEntryMessage>, source_absence: SourceAbsenceCheck,
+) -> Result<Option<AppError>> {
+    // 搬迁不将源缺失反向删除目标；rename 仍需推进，不能跳过整个阶段。
+    if !is_source_reserved {
+        let reason = "源端删除迁移保留目标；本轮未观察到该源项，未核验其存在性";
+        events
+            .broadcast(StorageEntryMessage::TargetPreserved {
+                retention: Box::new(TargetRetention::entry(
+                    entry.path(),
+                    TargetRetentionReason::SourceCleanupPolicy,
+                )),
+                reason: reason.into(),
+            })
+            .await?;
+        publish_target_deletion(
+            events,
+            entry,
+            SourcePresence::Unknown,
+            TargetDeletionOutcome::Preserved,
+            Some(reason.into()),
+        )
+        .await?;
+        return Ok(None);
+    }
+    let source_presence = match source_absence.confirm(source, entry, events).await {
+        Ok(presence) => presence,
+        Err(error) => {
+            let _ = publish_target_deletion(
+                events,
+                entry,
+                SourcePresence::Unknown,
+                TargetDeletionOutcome::Failed,
+                Some(error.to_string()),
+            )
+            .await;
+            return Err(error);
+        }
+    };
+    if source_presence != SourcePresence::Absent {
+        publish_target_deletion(
+            events,
+            entry,
+            source_presence,
+            TargetDeletionOutcome::Preserved,
+            Some("源端缺失未获确认，保留目标".into()),
+        )
+        .await?;
+        return Ok(None);
+    }
+    // 仅删除本条目或空目录；未核验的后代不能据此授权删除。
+    let outcome = match copy_namespace::delete_file(destination.storage(), entry).await {
+        Ok(()) => TargetDeletionOutcome::Deleted,
+        Err(error) if error.is_not_found() => TargetDeletionOutcome::AlreadyAbsent,
+        Err(error) => {
+            preserve(
+                events,
+                entry,
+                SourcePresence::Absent,
+                TargetRetentionReason::StaleEvidence,
+                format!("源路径已确认缺失，但目标删除未获成功确认；保留尚存部分，删除结果可能未知: {error}"),
+            )
+            .await?;
+            publish_target_deletion(
+                events,
+                entry,
+                source_presence,
+                TargetDeletionOutcome::Failed,
+                Some(error.to_string()),
+            )
+            .await?;
+            error!("Phase B: Failed to delete {:?}: {}", entry.get_relative_path(), error);
+            events
+                .broadcast(StorageEntryMessage::Error {
+                    event: ErrorEvent::Delete,
+                    path: entry.get_relative_path().to_path_buf(),
+                    entry: Some(Arc::clone(entry)),
+                    reason: error.to_string(),
+                })
+                .await?;
+            return Ok(Some(error.into()));
+        }
+    };
+    publish_target_deletion(events, entry, source_presence, outcome, None).await?;
+    Ok(None)
+}
 
 impl SyncOrchestrator {
     /// rename 后的内容与元数据必须完成，才能确认该条目的新状态。
     #[allow(clippy::too_many_arguments)]
     async fn sync_renamed_file_changes(
         kind: ChangeKind, entry: &Arc<ObservedEntry>, src: &StorageContext, dest: &StorageContext,
-        qos: Option<QosManager>, integrity: bool, _source_reserved: bool, bytes: Option<Arc<AtomicU64>>, job_id: &str,
+        qos: Option<QosManager>, integrity: bool, _source_reserved: bool, bytes: Option<Arc<CopyBytes>>, job_id: &str,
         job_dir: &str, transfer_mode: TransferMode,
     ) -> Result<()> {
         let mut metadata_applied = false;
@@ -100,7 +208,7 @@ impl SyncOrchestrator {
     pub(super) async fn apply_deletions_and_renames(
         db: &ClickHouseDatabase, src_storage: Arc<StorageContext>, dest_storage: Arc<StorageContext>,
         is_source_reserved: bool, broadcaster: &BroadcastForwarder<StorageEntryMessage>, enable_integrity_check: bool,
-        qos_manager: Option<QosManager>, bytes_counter: Option<Arc<AtomicU64>>, job_id: &str, job_dir: &str,
+        qos_manager: Option<QosManager>, bytes_counter: Option<Arc<CopyBytes>>, job_id: &str, job_dir: &str,
         transfer_mode: TransferMode, source_absence: SourceAbsenceCheck,
     ) -> Result<()> {
         let deletion_iter = db.detect_deleted_items().await?;
@@ -139,60 +247,24 @@ impl SyncOrchestrator {
                         continue;
                     }
                     last_preserved_path = Some(entry.path().clone());
-                    // 搬迁不将源缺失反向删除目标；rename 仍需推进，不能跳过整个阶段。
-                    if !is_source_reserved {
-                        broadcaster
-                            .broadcast(StorageEntryMessage::TargetPreserved {
-                                retention: Box::new(TargetRetention::entry(
-                                    entry.path(),
-                                    TargetRetentionReason::SourceCleanupPolicy,
-                                )),
-                                reason: "源端删除迁移保留目标；本轮未观察到该源项，未核验其存在性".into(),
-                            })
-                            .await?;
-                        continue;
-                    }
-                    if !source_absence.confirm(&src_storage, &entry, broadcaster).await? {
-                        continue;
-                    }
-                    let entry_arc = Arc::new(entry);
-                    // 仅删除本条目或空目录；未核验的后代永远不递归清理。
-                    let result = copy_namespace::delete_file(dest_storage.storage(), &entry_arc).await;
-                    match result {
-                        Ok(()) => {
-                            broadcaster.broadcast(StorageEntryMessage::Deleted(entry_arc)).await?;
-                        }
-                        Err(error) if error.is_not_found() => {
-                            broadcaster.broadcast(StorageEntryMessage::Deleted(entry_arc)).await?;
-                        }
-                        Err(e) => {
-                            preserve(
-                                broadcaster,
-                                &entry_arc,
-                                SourcePresence::Absent,
-                                TargetRetentionReason::StaleEvidence,
-                                format!(
-                                    "源路径已确认缺失，但目标删除未获成功确认；保留尚存部分，删除结果可能未知: {e}"
-                                ),
-                            )
-                            .await?;
-                            error!("Phase B: Failed to delete {:?}: {}", entry_arc.get_relative_path(), e);
-                            broadcaster
-                                .broadcast(StorageEntryMessage::Error {
-                                    event: ErrorEvent::Delete,
-                                    path: entry_arc.get_relative_path().to_path_buf(),
-                                    entry: Some(entry_arc.clone()),
-                                    reason: format!("{e}"),
-                                })
-                                .await?;
-                            failure.get_or_insert(e.into());
-                        }
+                    if let Some(error) = reconcile_target_deletion(
+                        &src_storage,
+                        &dest_storage,
+                        &Arc::new(entry),
+                        is_source_reserved,
+                        broadcaster,
+                        source_absence,
+                    )
+                    .await?
+                    {
+                        failure.get_or_insert(error);
                     }
                 }
                 DeletionStatus::Renamed(from, to) => {
                     let from_arc = Arc::new(*from);
                     let to_arc = Arc::new(*to);
-                    let old_source_absent = source_absence.confirm(&src_storage, &from_arc, broadcaster).await?;
+                    let old_source_absent =
+                        source_absence.confirm(&src_storage, &from_arc, broadcaster).await? == SourcePresence::Absent;
                     // 父目录正在被 rename 时，NFS RENAME 已传递性地移动了子条目，无需重复操作。
                     // from_parent 分配仅在同名情况下进行，避免对名字不同的 rename 做无效分配。
                     let skip_physical = from_arc.get_name() == to_arc.get_name() && {

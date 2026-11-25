@@ -9,8 +9,8 @@
 //! 三段式编排；不再暴露一站式 `run`。
 
 // 标准库
+use crate::copy_bytes::CopyBytes;
 use std::sync::Arc;
-use std::sync::atomic::AtomicU64;
 use std::time::Duration;
 
 // 外部crate
@@ -252,7 +252,7 @@ impl StatisticConsumer {
     }
 
     /// 获取 per-chunk 实时字节计数器（Copy job 使用）
-    pub fn get_bytes_tracker(&self) -> Arc<AtomicU64> {
+    pub fn get_bytes_tracker(&self) -> Arc<CopyBytes> {
         self.progress_bar.get_real_time_bytes_counter()
     }
 

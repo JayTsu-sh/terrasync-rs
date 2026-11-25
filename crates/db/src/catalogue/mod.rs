@@ -11,6 +11,7 @@ use crate::ClickHouseConfig;
 
 mod comparison;
 mod connection;
+mod copy_changes;
 mod copy_generation;
 mod copy_runs;
 mod deletion;
@@ -27,6 +28,7 @@ mod versions;
 mod write;
 
 pub use comparison::{CatalogueChange, ComparisonMode};
+pub use copy_changes::{CopyChange, CopyChangeCount, CopyChangePage};
 pub use copy_generation::CopyGenerationStatus;
 pub use deletion::DeletionStatus;
 pub use notifications::{

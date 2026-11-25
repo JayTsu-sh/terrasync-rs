@@ -12,7 +12,6 @@ use std::collections::HashSet;
 use std::num::NonZeroUsize;
 use std::path::Path;
 use std::path::PathBuf;
-use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex, PoisonError};
 use task_model::ObservedEntryExt;
 use task_model::observation::ObservedItem;
@@ -692,7 +691,7 @@ pub(super) async fn apply_progress(stats_consumer: &Arc<AsyncMutex<StatisticCons
         .lock()
         .await
         .get_bytes_tracker()
-        .store(snapshot.bytes_transferred, Ordering::Relaxed);
+        .restore_published(snapshot.bytes_transferred);
     info!(
         "[Sender Remote] [{}] Progress: {} files ({}) transferred, {} dirs, {} skipped, {} errors, {:.1}s, {}/s",
         snapshot.receiver_id,

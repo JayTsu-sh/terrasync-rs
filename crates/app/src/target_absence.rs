@@ -29,7 +29,7 @@ impl SourceAbsenceCheck {
     /// 这里只确认被查询的当前路径；历史行与虚拟目录不能升级为整 key／子树删除授权。
     pub async fn confirm(
         self, source: &StorageContext, entry: &ObservedEntry, events: &BroadcastForwarder<StorageEntryMessage>,
-    ) -> Result<bool> {
+    ) -> Result<SourcePresence> {
         if entry.path().as_str().is_empty() || entry.history().is_some() || entry.directory_marker_object().is_some() {
             preserve(
                 events,
@@ -39,7 +39,7 @@ impl SourceAbsenceCheck {
                 "未获得根目录、完整版本历史或目录对象的缺失证明，保留目标",
             )
             .await?;
-            return Ok(false);
+            return Ok(SourcePresence::Unknown);
         }
         match read_namespace_entry(
             source.storage(),
@@ -50,7 +50,7 @@ impl SourceAbsenceCheck {
         )
         .await
         {
-            Ok(NamespaceReadOutcome::Descriptor { descriptor: None, .. }) => Ok(true),
+            Ok(NamespaceReadOutcome::Descriptor { descriptor: None, .. }) => Ok(SourcePresence::Absent),
             Ok(_) => {
                 preserve(
                     events,
@@ -60,7 +60,7 @@ impl SourceAbsenceCheck {
                     "源路径仍存在；本轮未命中不代表源端已删除，保留目标",
                 )
                 .await?;
-                Ok(false)
+                Ok(SourcePresence::Present)
             }
             Err(error) => {
                 preserve(

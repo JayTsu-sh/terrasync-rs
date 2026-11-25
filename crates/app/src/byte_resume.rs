@@ -58,35 +58,19 @@ impl IntervalSet {
         set
     }
 
-    /// 插入 [start, end)，与重叠或相邻（end == 下一段 start）的区间自动合并。
-    pub fn insert(&mut self, start: u64, end: u64) {
+    /// 合并 [start, end)，返回本次新增覆盖的字节数。
+    pub fn insert(&mut self, start: u64, end: u64) -> u64 {
         if start >= end {
-            return;
+            return 0;
         }
-        let mut result = Vec::with_capacity(self.intervals.len() + 1);
-        let (mut ns, mut ne) = (start, end);
-        let mut placed = false;
-        for &(s, e) in &self.intervals {
-            if e < ns {
-                // 完全在新区间左侧（e == ns 视为相邻，落入合并分支）
-                result.push((s, e));
-            } else if s > ne {
-                // 完全在新区间右侧（s == ne 视为相邻，落入合并分支）
-                if !placed {
-                    result.push((ns, ne));
-                    placed = true;
-                }
-                result.push((s, e));
-            } else {
-                // 重叠或相邻 → 合并
-                ns = ns.min(s);
-                ne = ne.max(e);
-            }
-        }
-        if !placed {
-            result.push((ns, ne));
-        }
-        self.intervals = result;
+        let first = self.intervals.partition_point(|&(_, right)| right < start);
+        let last = self.intervals.partition_point(|&(left, _)| left <= end);
+        let merged = &self.intervals[first..last];
+        let covered: u64 = merged.iter().map(|&(left, right)| right - left).sum();
+        let start = merged.first().map_or(start, |&(left, _)| left.min(start));
+        let end = merged.last().map_or(end, |&(_, right)| right.max(end));
+        drop(self.intervals.splice(first..last, [(start, end)]));
+        end - start - covered
     }
 
     /// 返回 [0, total) 范围内尚未覆盖的缺失区间。

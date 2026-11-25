@@ -23,7 +23,7 @@ use crate::schema::identity::encoded_file_handle;
 use crate::{ClickHouseConfig, ClickHouseDatabase, DatabaseError, Result};
 use data_mover::model::{BackendKind, EntryKind, HistoryOrder, ObjectHistory, ObservedEntry, VersionRecord};
 use task_model::observation::ObservedItem;
-use task_model::{ChangeKind, CopyCompletion, CopyReadiness, EntryChange};
+use task_model::{ChangeKind, CopyCompletion, CopyReadiness, EntryChange, StorageEntryMessage};
 
 #[derive(Deserialize, clickhouse::Row)]
 struct VersionSlotRow {
@@ -635,6 +635,87 @@ async fn selected_copy_bindings_roundtrip(fixture: &Fixture, history_target: boo
     Ok(())
 }
 
+async fn archived_incremental_changes_are_scoped_and_paginated(fixture: &Fixture) -> Result<()> {
+    let database = fixture.open("archived_changes").await?;
+    let first = request("archived-changes", true);
+    database.begin_copy_generation(&first).await?;
+    database.create_incremental_scan_table().await?;
+    database.commit_scan_generation().await?;
+    database
+        .finish_copy_generation(CopyGenerationPhase::Completed, None)
+        .await?;
+    assert!(
+        database
+            .incremental_copy_changes(&first.execution_id, 0, 2)
+            .await?
+            .is_none()
+    );
+
+    let database = database.new_execution_scope();
+    let run = request("archived-changes", true);
+    database.begin_copy_generation(&run).await?;
+    let file = |path| rename_entry(path, false);
+    let new = StorageEntryMessage::New(file("added").into());
+    database
+        .batch_insert_incremental_record(&[
+            new.clone(),
+            new,
+            StorageEntryMessage::Changed {
+                entry: file("content").into(),
+                kind: ChangeKind::DataOnly,
+            },
+            StorageEntryMessage::Changed {
+                entry: file("metadata").into(),
+                kind: ChangeKind::MetadataOnly,
+            },
+            StorageEntryMessage::Changed {
+                entry: file("both").into(),
+                kind: ChangeKind::Both,
+            },
+            StorageEntryMessage::Renamed((file("old"), file("renamed"))),
+        ])
+        .await?;
+    database
+        .finish_copy_generation(CopyGenerationPhase::Failed, None)
+        .await?;
+
+    let other = database.new_execution_scope();
+    let next_run = request("archived-changes", true);
+    other.begin_copy_generation(&next_run).await?;
+    other
+        .batch_insert_incremental_record(&[StorageEntryMessage::New(file("another-run").into())])
+        .await?;
+
+    let first_page = other
+        .incremental_copy_changes(&run.execution_id, 0, 2)
+        .await?
+        .ok_or(DatabaseError::CopyExecutionUnavailable)?;
+    assert_eq!(first_page.phase, CopyGenerationPhase::Failed);
+    assert_eq!(first_page.counts.len(), 5);
+    assert!(first_page.counts.iter().all(|count| count.count == 1));
+    assert_eq!(first_page.next_offset, Some(2));
+    assert_eq!(
+        first_page
+            .changes
+            .iter()
+            .map(|row| row.path.as_str())
+            .collect::<Vec<_>>(),
+        ["added", "both"]
+    );
+    let last = other
+        .incremental_copy_changes(&run.execution_id, 2, 3)
+        .await?
+        .ok_or(DatabaseError::CopyExecutionUnavailable)?;
+    assert_eq!(last.next_offset, None);
+    assert_eq!(
+        last.changes.iter().map(|row| row.kind.as_str()).collect::<Vec<_>>(),
+        ["data_changed", "metadata_changed", "rename"]
+    );
+    assert_eq!(last.changes[2].previous_path.as_deref(), Some("old"));
+    assert_eq!(last.changes[2].path, "renamed");
+    Ok(())
+}
+
 #[tokio::test]
 #[ignore = "requires an isolated ClickHouse pair and fault proxy from run-notification-archive-local.py --copy-generations"]
 async fn real_copy_generation_policies() -> Result<()> {
@@ -927,6 +1008,7 @@ async fn real_rename_after_failed_comparison_of_the_same_item() -> Result<()> {
     for cluster in [false, true] {
         let fixture = Fixture::new(cluster).await?;
         let result: Result<()> = async {
+            archived_incremental_changes_are_scoped_and_paginated(&fixture).await?;
             for directory in [false, true] {
                 for interruptions in [1, 2, 5] {
                     rename_after_changed_state(&fixture, directory, interruptions).await?;

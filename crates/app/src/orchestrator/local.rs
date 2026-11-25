@@ -201,7 +201,7 @@ impl SyncOrchestrator {
             }
         };
         info!(mode=?report.plan.mode, target_cleanup=?report.plan.target_cleanup, reasons=?report.plan.reasons,
-            filter_evaluated_at=report.filter_evaluated_at, generation=?report.generation, "Migration execution plan");
+            filter_evaluated_at=report.filter_evaluated_at, generation=?report.generation, execution_id=%report.execution_id, "Migration execution plan");
         consumers.set_migration_report(report.clone()).await;
         root_metadata.capture().await?;
         let result = async {

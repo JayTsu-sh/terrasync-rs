@@ -94,9 +94,21 @@ const scanSpeed = (progress: TaskProgressSnapshot) =>
           }}</span>
         </div>
         <div class="flex flex-col items-center gap-1">
-          <span class="text-xs text-gray-400 font-medium">数据量</span>
+          <span class="text-xs text-gray-400 font-medium">{{ isSyncType ? '逻辑数据量' : '数据量' }}</span>
           <span class="text-xl font-semibold text-gray-700 tabular-nums">{{
             formatBytes(liveProgress.total_bytes)
+          }}</span>
+        </div>
+        <div v-if="isSyncType" class="flex flex-col items-center gap-1">
+          <span class="text-xs text-gray-400 font-medium">在途写入</span>
+          <span class="text-xl font-semibold text-gray-700 tabular-nums" data-testid="copy-in-flight-bytes">{{
+            formatBytes(liveProgress.in_flight_bytes)
+          }}</span>
+        </div>
+        <div v-if="isSyncType" class="flex flex-col items-center gap-1">
+          <span class="text-xs text-gray-400 font-medium">已发布传输量</span>
+          <span class="text-xl font-semibold text-gray-700 tabular-nums" data-testid="copy-published-bytes">{{
+            formatBytes(liveProgress.transferred_bytes)
           }}</span>
         </div>
         <div class="flex flex-col items-center gap-1">

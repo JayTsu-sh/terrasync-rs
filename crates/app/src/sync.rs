@@ -7,27 +7,26 @@
 //! 4. 并发复制控制
 //! 5. 重试机制集成
 
+use crate::copy_bytes::CopyBytes;
 use crate::file_copy::metadata as copy_metadata;
 use crate::file_copy::namespace as copy_namespace;
-use crate::file_copy::transfer as copy_transfer;
-use data_mover::model::BackendKind;
 use tokio_util::sync::CancellationToken;
 // 标准库
-use crate::file_copy::{CopiedPublication, CopyOptions, HdfsCopyContext, copy_file, prepare_directory};
+use crate::file_copy::local::copy_file_for_job;
+use crate::file_copy::{CopyOptions, prepare_directory};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 use task_model::ObservedEntryExt;
 use task_model::TransferMode;
-use tokio::sync::{mpsc, oneshot};
-use tokio::task::JoinHandle;
 
 // 外部crate
 use crate::storage_factory::StorageContext;
 use data_mover::model::ObservedEntry;
 use data_mover::qos::QosManager;
 use data_mover::redact_storage_url;
+use db::{ClickHouseDatabase, catalogue::CopyChangePage};
 use task_model::{ErrorEvent, StorageEntryMessage};
-use tracing::{Instrument, debug, error, info, info_span, instrument, trace, warn};
+use tracing::{Instrument, error, info, info_span, instrument, trace};
+use utils::app_config::AppConfig;
 #[cfg(windows)]
 use windows_sys::Win32::Foundation::CloseHandle;
 #[cfg(windows)]
@@ -39,7 +38,6 @@ use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken}
 
 // 内部模块
 use crate::broadcast::BroadcastForwarder;
-use crate::byte_resume::ByteResumeStore;
 use crate::config::SyncJobConfig;
 use crate::error::{AppError, Result, StorageError};
 use crate::orchestrator::SyncOrchestrator;
@@ -162,6 +160,15 @@ pub async fn sync(config: SyncJobConfig) -> Result<()> {
     SyncOrchestrator::new_local(config).run().await
 }
 
+/// 按任务及执行身份读取已归档的增量复制明细。
+pub async fn incremental_copy_changes(
+    job_id: &str, execution_id: &str, offset: u64, limit: u32,
+) -> Result<Option<CopyChangePage>> {
+    let config = AppConfig::fetch_database()?;
+    let db = ClickHouseDatabase::new(&config.clickhouse, job_id)?;
+    Ok(db.incremental_copy_changes(execution_id, offset, limit).await?)
+}
+
 #[cfg(windows)]
 pub(crate) fn check_admin_privileges() -> Result<bool> {
     #[allow(unsafe_code)]
@@ -216,7 +223,7 @@ pub(crate) struct ProcessEntryOpts {
 pub(crate) async fn process_entry(
     entry: &Arc<ObservedEntry>, src_storage: Arc<StorageContext>, dest_storage: Arc<StorageContext>,
     enable_integrity_check: bool, enable_acl: bool, is_source_reserved: bool, qos_manager: Option<QosManager>,
-    bytes_counter: Option<Arc<AtomicU64>>, broadcaster: &BroadcastForwarder<StorageEntryMessage>, resume: ResumeOpts,
+    bytes_counter: Option<Arc<CopyBytes>>, broadcaster: &BroadcastForwarder<StorageEntryMessage>, resume: ResumeOpts,
 ) -> Result<()> {
     let opts = ProcessEntryOpts {
         enable_integrity_check,
@@ -260,7 +267,7 @@ pub(crate) async fn process_metadata_only_entry(
 
 async fn process_entry_inner(
     entry: &Arc<ObservedEntry>, src_storage: Arc<StorageContext>, dest_storage: Arc<StorageContext>,
-    opts: ProcessEntryOpts, qos_manager: Option<QosManager>, bytes_counter: Option<Arc<AtomicU64>>,
+    opts: ProcessEntryOpts, qos_manager: Option<QosManager>, bytes_counter: Option<Arc<CopyBytes>>,
     broadcaster: &BroadcastForwarder<StorageEntryMessage>,
 ) -> Result<()> {
     let ProcessEntryOpts {
@@ -310,55 +317,8 @@ async fn process_entry_inner(
         trace!("Skipping data copy (metadata-only change): {:?}", relative_path);
         copy_metadata::set_entry_metadata(dest_storage.storage(), entry, resume.cancel.clone())
             .await?;
-    } else if dest_storage.as_ref().storage().kind() == BackendKind::Hdfs {
-        let hdfs = HdfsCopyContext::from_job(&resume.job_id, resume.transfer_mode)?;
-        let recorder = if resume.transfer_mode == TransferMode::Checkpoint {
-            Some(CommitRecorder::start(&resume.job_dir, entry, src_storage.block_size()).await?)
-        } else { None };
-        let hdfs = recorder.as_ref().map_or(hdfs.clone(), |recorder| hdfs.with_commit_callback(recorder.callback()));
-        let result = copy_file(
-            &src_storage,
-            &dest_storage,
-            entry,
-            CopyOptions {
-                transfer_mode: resume.transfer_mode,
-                qos: qos_manager,
-                enable_integrity_check,
-                bytes_counter,
-                cancel: resume.cancel.clone(),
-            },
-            Some(&hdfs),
-        )
-        .await
-        .map(|_| ());
-        if let Some(recorder) = recorder { recorder.finish(result).await?; } else { result?; }
-        debug!("Copied file through HDFS recoverable lifecycle {:?}", relative_path);
-    } else if should_resume(&resume, entry, &src_storage, &dest_storage) {
-        // 多块大文件：字节级断点续传（全量建 .part / 增量续 .part）
-        debug!("Copying file (resumable) {:?}", relative_path);
-        copy_file_with_resume(
-            entry,
-            &src_storage,
-            &dest_storage,
-            CopyOptions {
-                transfer_mode: resume.transfer_mode,
-                qos: qos_manager,
-                enable_integrity_check,
-                bytes_counter,
-                cancel: resume.cancel.clone(),
-            },
-            &resume.job_dir,
-        )
-        .await?;
-
-        // 复制入口复用扫描观察应用并校验元数据。
-
-        debug!("Copied file (resumable) {:?}", relative_path);
     } else {
-        debug!("Copying file {:?}", relative_path);
-
-        // 传输入口处理 QoS、所选校验及元数据；源清理由任务层单独执行
-        copy_transfer::copy_entry(
+        copy_file_for_job(
             &src_storage,
             &dest_storage,
             entry,
@@ -369,12 +329,11 @@ async fn process_entry_inner(
                 bytes_counter,
                 cancel: resume.cancel.clone(),
             },
+            &resume.job_id,
+            &resume.job_dir,
+            |error| error,
         )
         .await?;
-
-        // 复制入口复用扫描观察应用并校验元数据。
-
-        debug!("Copied file {:?}", relative_path);
     }
 
 
@@ -392,219 +351,6 @@ pub(crate) struct ResumeOpts {
     /// 显式选定的写入模式。
     pub transfer_mode: TransferMode,
     pub cancel: Option<CancellationToken>,
-}
-
-pub(crate) struct CommitRecorder {
-    store: Arc<ByteResumeStore>,
-    callback: crate::byte_resume::CommitCallback,
-    drain: JoinHandle<()>,
-    shutdown: oneshot::Sender<()>,
-    dropped: Arc<AtomicU64>,
-    path: std::path::PathBuf,
-}
-
-impl CommitRecorder {
-    pub(crate) async fn start(job_dir: &str, entry: &ObservedEntry, block_size: u64) -> Result<Self> {
-        if job_dir.trim().is_empty() {
-            return Err(AppError::ConfigError(
-                "recoverable copy requires a persistent job directory".to_string(),
-            ));
-        }
-        let path = entry.get_relative_path().to_path_buf();
-        let store = ByteResumeStore::open(job_dir, &path, entry.get_size(), entry.get_mtime(), block_size).await?;
-        const CAPACITY: usize = 65_536;
-        let (tx, mut rx) = mpsc::channel::<(u64, u64)>(CAPACITY);
-        let store_task = store.clone();
-        let (shutdown, mut shutdown_rx) = oneshot::channel();
-        let drain = tokio::spawn(async move {
-            loop {
-                tokio::select! {
-                    biased;
-                    _ = &mut shutdown_rx => {
-                        rx.close();
-                        while let Some((offset, length)) = rx.recv().await {
-                            if let Err(error) = store_task.mark_committed(offset, length).await {
-                                warn!("byte-resume mark_committed failed: {error}");
-                            }
-                        }
-                        break;
-                    }
-                    message = rx.recv() => match message {
-                        Some((offset, length)) => {
-                            if let Err(error) = store_task.mark_committed(offset, length).await {
-                                warn!("byte-resume mark_committed failed: {error}");
-                            }
-                        }
-                        None => break,
-                    }
-                }
-            }
-        });
-        let dropped = Arc::new(AtomicU64::new(0));
-        let callback_dropped = dropped.clone();
-        let callback = Arc::new(move |offset, length| {
-            if tx.try_send((offset, length)).is_err() {
-                callback_dropped.fetch_add(1, Ordering::Relaxed);
-            }
-        });
-        Ok(Self {
-            store,
-            callback,
-            drain,
-            shutdown,
-            dropped,
-            path,
-        })
-    }
-
-    pub(crate) fn callback(&self) -> crate::byte_resume::CommitCallback {
-        self.callback.clone()
-    }
-
-    pub(crate) async fn finish<T>(self, result: Result<T>) -> Result<T> {
-        drop(self.callback);
-        let _ = self.shutdown.send(());
-        let _ = self.drain.await;
-        let dropped = self.dropped.load(Ordering::Relaxed);
-        if dropped > 0 {
-            warn!(
-                "byte-resume: {dropped} commit records were dropped for {}; retry remains conservative",
-                self.path.display()
-            );
-        }
-        match result {
-            Ok(value) => {
-                self.store.finalize_done().await?;
-                Ok(value)
-            }
-            Err(error) => {
-                let _ = self.store.flush().await;
-                Err(error)
-            }
-        }
-    }
-}
-
-#[cfg(test)]
-#[allow(clippy::items_after_test_module)]
-mod commit_recorder_tests {
-    use crate::scan::observe_path;
-    use std::path::Path;
-    use std::time::Duration;
-
-    use crate::storage_factory::{CreateStorageOptions, create_storage};
-
-    use super::CommitRecorder;
-
-    #[tokio::test]
-    async fn finish_does_not_wait_for_external_callback_clones() {
-        let source_root = tempfile::tempdir().unwrap_or_else(|error| panic!("source tempdir: {error}"));
-        let job_root = tempfile::tempdir().unwrap_or_else(|error| panic!("job tempdir: {error}"));
-        tokio::fs::write(source_root.path().join("payload.bin"), b"payload")
-            .await
-            .unwrap_or_else(|error| panic!("write source: {error}"));
-        let source = create_storage(
-            source_root
-                .path()
-                .to_str()
-                .unwrap_or_else(|| panic!("source path is not UTF-8")),
-            CreateStorageOptions::new(None, false),
-        )
-        .await
-        .unwrap_or_else(|error| panic!("create source storage: {error}"));
-        let entry = observe_path(source.storage(), Path::new("payload.bin"))
-            .await
-            .unwrap_or_else(|error| panic!("source metadata: {error}"));
-        let recorder = CommitRecorder::start(
-            job_root
-                .path()
-                .to_str()
-                .unwrap_or_else(|| panic!("job path is not UTF-8")),
-            &entry,
-            4,
-        )
-        .await
-        .unwrap_or_else(|error| panic!("start recorder: {error}"));
-        let external_callback = recorder.callback();
-        external_callback(0, 4);
-
-        tokio::time::timeout(Duration::from_secs(1), recorder.finish(Ok(())))
-            .await
-            .unwrap_or_else(|error| panic!("finish must use explicit shutdown: {error}"))
-            .unwrap_or_else(|error| panic!("finish recorder: {error}"));
-
-        drop(external_callback);
-    }
-
-    #[tokio::test]
-    async fn start_rejects_missing_persistent_job_directory() {
-        let source_root = tempfile::tempdir().unwrap_or_else(|error| panic!("source tempdir: {error}"));
-        tokio::fs::write(source_root.path().join("payload.bin"), b"payload")
-            .await
-            .unwrap_or_else(|error| panic!("write source: {error}"));
-        let source = create_storage(
-            source_root
-                .path()
-                .to_str()
-                .unwrap_or_else(|| panic!("source path is not UTF-8")),
-            CreateStorageOptions::new(None, false),
-        )
-        .await
-        .unwrap_or_else(|error| panic!("create source storage: {error}"));
-        let entry = observe_path(source.storage(), Path::new("payload.bin"))
-            .await
-            .unwrap_or_else(|error| panic!("source metadata: {error}"));
-
-        assert!(CommitRecorder::start("", &entry, 4).await.is_err());
-        assert!(CommitRecorder::start("   ", &entry, 4).await.is_err());
-    }
-}
-
-/// 该存储是否为 S3。
-fn is_s3(storage: &StorageContext) -> bool {
-    storage.storage().kind() == BackendKind::S3
-}
-
-/// 该 entry 是否应走字节级断点续传：启用 + 多块大文件（全后端：Local/NFS/CIFS/S3）。
-///
-/// - **源端 S3**：data-mover `read_data_intervals` 以 Range GET 只读缺失区间。
-/// - **目标端 S3**：走 multipart part 粒度续传——进度真值是目标端 in-progress
-///   multipart upload（ListParts 反推缺失区间），本地状态文件仅作进度参考；
-///   额外要求 size > 目标端 block_size（part 大小下限），单 part 文件续传无意义
-///   （中断即全丢），走普通拷贝即可。
-/// - **S3 多版本路径**：版本化源固定 version_id，并遵循同一显式策略。
-pub(crate) fn should_resume(
-    resume: &ResumeOpts, entry: &ObservedEntry, src: &StorageContext, dest: &StorageContext,
-) -> bool {
-    resume.transfer_mode == TransferMode::Checkpoint
-        && !resume.job_dir.is_empty()
-        && !entry.get_is_dir()
-        && !entry.get_is_symlink()
-        && entry.get_size() > src.block_size()
-        && (!is_s3(dest) || entry.get_size() > dest.block_size())
-}
-
-/// 以原生 Checkpoint 策略复制大文件；恢复路径与已确认范围只由目标引擎发现。
-/// 本地记录器保留现有产品进度收尾，不向引擎提供 `.part` 路径或缺失区间。
-pub(crate) async fn copy_file_with_resume(
-    entry: &Arc<ObservedEntry>, src_storage: &StorageContext, dest_storage: &StorageContext, options: CopyOptions,
-    job_dir: &str,
-) -> Result<Option<CopiedPublication>> {
-    let recorder = CommitRecorder::start(job_dir, entry, src_storage.block_size()).await?;
-
-    let res = copy_transfer::copy_checkpointed(
-        src_storage,
-        dest_storage,
-        entry,
-        CopyOptions {
-            transfer_mode: TransferMode::Checkpoint,
-            ..options
-        },
-    )
-    .await;
-
-    let result = res.map_err(AppError::from);
-    recorder.finish(result).await
 }
 
 #[cfg(test)]

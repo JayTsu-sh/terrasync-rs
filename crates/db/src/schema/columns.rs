@@ -81,6 +81,8 @@ pub(crate) const FILE_INCREMENTAL_SCAN_COLUMNS_DEFINITION: &str = file_scan_base
     r#"
     ,create_at DateTime64(9),
     comment Nullable(String),
+    source_presence Nullable(String),
+    target_outcome Nullable(String),
 "#
 );
 

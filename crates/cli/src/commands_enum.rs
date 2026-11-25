@@ -84,6 +84,23 @@ pub enum AceCommands {
 
 #[derive(Subcommand, Debug)]
 pub enum Commands {
+    /// List archived changes from one incremental sync execution.
+    CopyChanges {
+        /// Sync job identifier.
+        job_id: String,
+
+        /// Migration execution identity from the progress report or execution log.
+        execution_id: String,
+
+        /// First logical change to return.
+        #[arg(long, default_value_t = 0)]
+        offset: u64,
+
+        /// Number of changes per page (1–200).
+        #[arg(long, default_value_t = 50, value_parser = clap::value_parser!(u32).range(1..=200))]
+        limit: u32,
+    },
+
     /// Run the replicate operation
     Sync {
         /// Job ID for tracking

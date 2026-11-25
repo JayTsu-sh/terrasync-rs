@@ -373,10 +373,15 @@ terrasync sync [OPTIONS] [SRC_PATH] [DEST_PATH]
     --block-size <SIZE>         块大小，如 2MiB, 16MiB 等。也可在配置文件 [sync] block_size 中设置
 ```
 
-**增量同步功能：**
-- 当使用相同的作业ID再次执行同步时，系统会自动执行增量同步
-- 增量同步仅处理上次同步后新增或修改的文件，显著提高同步效率
-- 系统通过检查jobs目录下是否存在对应作业ID的目录来判断是否执行增量同步
+#### 查看增量复制明细
+
+使用相同作业 ID 再次运行单进程同步时，TerraSync 根据数据库中的复制代次、基线和源端保留策略决定是否执行增量复制。使用进度报告的 `migration.execution_id` 或任务日志中的执行 ID 查询该轮归档明细。
+
+```bash
+terrasync -c config.toml copy-changes my_sync <EXECUTION_ID> --limit 50
+```
+
+结果包含执行阶段、各类普通文件的数量和路径。修改分为内容变化、仅元数据变化和两者均变化。已识别的重命名保留旧路径和新路径。删除相关行分别显示源端存在性和目标端处理结果。按保留策略跳过逐项核验时，输出中的目标清理策略说明该范围。执行失败、中断或仍在进行时，查询返回已归档的范围。若还有结果，命令会打印下一页的 `--offset`。
 
 **跨协议同步支持：**
 Rust Terrasync 支持在不同存储协议之间进行文件同步，包括：
@@ -1139,6 +1144,7 @@ python tools/log_analyzer.py --app /tmp/app.json.log --error /tmp/error.log -o /
 
 未知 POSIX mode 在数据库和 wire 投影中保持为空，真实 `000` 权限仍会保留。
 文件元数据由传输引擎在发布前协商应用；目录及仅属性更新按目标存储能力处理。
+复制到 HDFS 时跳过目标根目录自身的元数据设置。文件和子目录继续按目标能力处理。
 真实环境可使用 `tests/lab/run-e2e.sh`、`tests/lab/run-hdfs-e2e.sh` 和完整性专项脚本复验，
 验证报告保留在本地测试目录。
 

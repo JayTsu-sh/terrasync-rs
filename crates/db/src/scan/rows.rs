@@ -424,6 +424,9 @@ pub(crate) fn incremental_record(
     record: StorageEntryRecord, operation: &str, comment: Option<String>, event_time: i64,
 ) -> IncrementalStorageEntryRecord {
     IncrementalStorageEntryRecord {
+        copy_execution_id: String::new(),
+        source_presence: None,
+        target_outcome: None,
         operation_type: operation.into(),
         create_at: event_time,
         comment,

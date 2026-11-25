@@ -5,6 +5,7 @@
 //! 双进程模式下发送 `FileData` 数据流（Phase 3）。
 
 // 标准库
+use crate::copy_bytes::CopyBytes;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use task_model::ObservedEntryExt;
@@ -54,7 +55,7 @@ pub(crate) async fn sender_worker(
     worker_id: usize, walkdir_iter: AsyncReceiver<StorageEntryMessage>, src_storage: Arc<StorageContext>,
     dest_storage: Arc<StorageContext>, transport: Arc<dyn CopyCommandSink>,
     broadcaster: &BroadcastForwarder<StorageEntryMessage>, config: &SenderWorkerConfig,
-    qos_manager: Option<QosManager>, bytes_tracker: Option<Arc<AtomicU64>>, copy_config: &ReceiverConfig,
+    qos_manager: Option<QosManager>, bytes_tracker: Option<Arc<CopyBytes>>, copy_config: &ReceiverConfig,
     active_entry_counter: Arc<AtomicUsize>, entry_counter: Arc<AtomicUsize>, size_counter: Arc<AtomicU64>,
 ) -> Result<()> {
     info!("[Sender Worker {}] Started", worker_id);
@@ -219,7 +220,7 @@ async fn send_entry(
 async fn send_packaged_entry(
     worker_id: usize, entry: &Arc<ObservedEntry>, src_storage: &Arc<StorageContext>,
     dest_storage: &Arc<StorageContext>, transport: &Arc<dyn CopyCommandSink>, config: &SenderWorkerConfig,
-    qos_manager: Option<QosManager>, bytes_tracker: Option<Arc<AtomicU64>>,
+    qos_manager: Option<QosManager>, bytes_tracker: Option<Arc<CopyBytes>>,
 ) -> Result<()> {
     match tar_pack::pack_directory(
         src_storage,

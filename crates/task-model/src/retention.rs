@@ -10,6 +10,21 @@ pub enum SourcePresence {
     Absent,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TargetDeletionOutcome {
+    Deleted,
+    AlreadyAbsent,
+    Preserved,
+    Failed,
+}
+
+impl TargetDeletionOutcome {
+    /// 目标删除已得到成功或目标原已缺失的证据。
+    pub const fn confirms_absence(self) -> bool {
+        matches!(self, Self::Deleted | Self::AlreadyAbsent)
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RetentionScope {
