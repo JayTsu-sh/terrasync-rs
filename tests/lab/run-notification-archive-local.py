@@ -22,8 +22,15 @@ def docker(*arguments):
     return subprocess.check_output(["docker", *arguments], text=True).strip()
 
 
-def configuration(replica):
-    http_port, native_port, interserver_port = (8123, 9000, 9009) if replica == 1 else (8124, 9001, 9010)
+def configuration(replica, shards=1):
+    http_port, native_port, interserver_port = 8122 + replica, 8999 + replica, 9008 + replica
+    remote_shards = "".join(
+        "<shard><internal_replication>true</internal_replication>"
+        + "".join(f"<replica><host>127.0.0.1</host><port>{port}</port></replica>"
+                  for port in (9000 + 2 * shard, 9001 + 2 * shard))
+        + "</shard>"
+        for shard in range(shards)
+    )
     keeper = """
       <keeper_server><tcp_port>9181</tcp_port><server_id>1</server_id>
         <log_storage_path>/var/lib/clickhouse/coordination/log</log_storage_path>
@@ -43,24 +50,22 @@ def configuration(replica):
       <background_message_broker_schedule_pool_size>2</background_message_broker_schedule_pool_size>
       <background_distributed_schedule_pool_size>2</background_distributed_schedule_pool_size>
       <mark_cache_size>33554432</mark_cache_size><uncompressed_cache_size>16777216</uncompressed_cache_size>
-      <macros><shard>01</shard><replica>r{replica}</replica></macros>
+      <macros><shard>{(replica + 1) // 2:02d}</shard><replica>r{replica}</replica></macros>
       <zookeeper><node><host>127.0.0.1</host><port>9181</port></node></zookeeper>
-      <remote_servers><notification_cluster><shard><internal_replication>true</internal_replication>
-        <replica><host>127.0.0.1</host><port>9000</port></replica>
-        <replica><host>127.0.0.1</host><port>9001</port></replica>
-      </shard></notification_cluster></remote_servers>
+      <remote_servers><notification_cluster>{remote_shards}</notification_cluster></remote_servers>
       {keeper}
     </clickhouse>"""
 
 
 def run_isolated():
     image = os.environ.get("NOTIFICATION_CLICKHOUSE_IMAGE", "clickhouse/clickhouse-server:26.3-alpine")
+    shards = 3 if "--multi-shard" in sys.argv else 1
     containers = []
     with tempfile.TemporaryDirectory(prefix="ts-notification-archive-") as directory:
         try:
-            for replica in (1, 2):
+            for replica in range(1, 2 * shards + 1):
                 config = Path(directory) / f"r{replica}.xml"
-                config.write_text(configuration(replica))
+                config.write_text(configuration(replica, shards))
                 network = "none" if replica == 1 else f"container:{containers[0]}"
                 container = docker(
                     "run", "-d", "--name", f"ts-notification-r{replica}-{uuid.uuid4().hex[:12]}",
@@ -85,6 +90,7 @@ def run_isolated():
             print(f"isolated notification image={docker('inspect', containers[0], '--format', '{{.Image}}')}", flush=True)
             pid = docker("inspect", containers[0], "--format", "{{.State.Pid}}")
             suite = [flag for flag in ("--copy-generations", "--copy-content", "--copy-ready-cleanup", "--directory-completion", "--copy-object-cleanup", "--copy-versioned-source-cleanup", "--catalogue-recovery", "--consumer-recovery", "--copy-execution", "--copy-data-cancel", "--copy-file-list-cancel", "--rename-generations", "--retention-events", "--source-absence", "--request-policy", "--copy-contracts", "--version-catalogue", "--mutable-catalogue", "--version-metadata", "--metadata-cancel", "--scan-wire") if flag in sys.argv]
+            suite.extend(flag for flag in ("--multi-shard", "--copy-takeover") if flag in sys.argv)
             subprocess.run(["nsenter", "-t", pid, "-n", sys.executable, __file__, "--inside", *suite], cwd=ROOT, check=True)
         except BaseException:
             for container in containers:
@@ -857,7 +863,8 @@ def run_retention_events(environment):
 
 def run_inside():
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-    for port in (8123, 8124):
+    shards = 3 if "--multi-shard" in sys.argv else 1
+    for port in range(8123, 8123 + 2 * shards):
         for _ in range(100):
             try:
                 with opener.open(f"http://127.0.0.1:{port}/ping", timeout=1) as response:
@@ -868,6 +875,19 @@ def run_inside():
             time.sleep(0.2)
         else:
             raise RuntimeError(f"ClickHouse readiness timed out on port {port}")
+    if shards > 1:
+        query = ("SELECT shard_num,replica_num,port FROM system.clusters "
+                 "WHERE cluster='notification_cluster' ORDER BY shard_num,replica_num FORMAT TSV")
+        with opener.open("http://127.0.0.1:8123", data=query.encode(), timeout=5) as response:
+            assert response.read().decode().splitlines() == [
+                f"{shard + 1}\t{replica + 1}\t{9000 + 2 * shard + replica}"
+                for shard in range(shards) for replica in range(2)
+            ]
+        print(f"isolated ClickHouse shards={shards} replicas_per_shard=2", flush=True)
+    if "--copy-takeover" in sys.argv:
+        from copy_takeover import run
+        run(shards)
+        return
     if any(flag in sys.argv for flag in ("--copy-generations", "--copy-content", "--copy-ready-cleanup", "--directory-completion", "--copy-object-cleanup", "--copy-versioned-source-cleanup", "--catalogue-recovery", "--consumer-recovery", "--copy-execution", "--copy-data-cancel", "--copy-file-list-cancel", "--rename-generations", "--retention-events", "--source-absence", "--request-policy", "--copy-contracts", "--version-catalogue", "--mutable-catalogue", "--version-metadata", "--metadata-cancel", "--scan-wire")):
         run_copy_generations()
         return
