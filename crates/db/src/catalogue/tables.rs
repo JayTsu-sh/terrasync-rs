@@ -89,7 +89,7 @@ impl ClickHouseDatabase {
         self.create_catalogue_table(
             &table_name,
             FILE_INCREMENTAL_SCAN_COLUMNS_DEFINITION,
-            "(operation_type, relative_path, create_at)",
+            "(copy_execution_id, operation_type, relative_path, create_at)",
             CatalogueEngine::Replacing,
         )
         .await?;

@@ -24,6 +24,7 @@ use app::config::SyncJobConfig;
 use app::prelude::{integrity_check, parse_bandwidth_string, rm, scan, sync};
 #[cfg(feature = "remote")]
 use app::remote_sync::{send, serve};
+use app::sync::incremental_copy_changes;
 use data_mover::redact_storage_url;
 use tracing::info;
 use utils::app_config::AppConfig;
@@ -35,6 +36,27 @@ use {
 
 // 内部模块
 use crate::error::{CliError, Result};
+
+pub async fn copy_changes_cmd(job_id: &str, execution_id: &str, offset: u64, limit: u32) -> Result<()> {
+    let page = incremental_copy_changes(job_id, execution_id, offset, limit)
+        .await?
+        .ok_or_else(|| CliError::InvalidParameter("incremental copy execution not found for this job".into()))?;
+    println!("Execution {} | {:?} | archived results", page.execution_id, page.phase);
+    for count in page.counts {
+        println!("{} {}", count.kind, count.count);
+    }
+    for change in page.changes {
+        if let Some(previous_path) = change.previous_path {
+            println!("{} {:?} -> {:?}", change.kind, previous_path, change.path);
+        } else {
+            println!("{} {:?}", change.kind, change.path);
+        }
+    }
+    if let Some(next) = page.next_offset {
+        println!("Next page --offset {next}");
+    }
+    Ok(())
+}
 
 // ==================== 参数校验函数 ====================
 

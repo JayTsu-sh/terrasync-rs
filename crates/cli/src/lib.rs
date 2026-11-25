@@ -319,6 +319,14 @@ pub async fn cli_match() -> error::Result<()> {
         } => {
             commands::serve_cmd(listen, dest_path, tls_cert_out, token).await?;
         }
+        Commands::CopyChanges {
+            job_id,
+            execution_id,
+            offset,
+            limit,
+        } => {
+            commands::copy_changes_cmd(job_id, execution_id, *offset, *limit).await?;
+        }
         Commands::Config => commands::config()?,
         #[cfg(feature = "license")]
         Commands::Activate => {} // 已在上方处理

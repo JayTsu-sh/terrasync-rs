@@ -23,8 +23,10 @@ use crate::storage_factory::StorageContext;
 use data_mover::model::ObservedEntry;
 use data_mover::qos::QosManager;
 use data_mover::redact_storage_url;
+use db::{ClickHouseDatabase, catalogue::CopyChangePage};
 use task_model::{ErrorEvent, StorageEntryMessage};
 use tracing::{Instrument, error, info, info_span, instrument, trace};
+use utils::app_config::AppConfig;
 #[cfg(windows)]
 use windows_sys::Win32::Foundation::CloseHandle;
 #[cfg(windows)]
@@ -156,6 +158,15 @@ pub(crate) fn parse_size(size: &str) -> Result<usize> {
 ))]
 pub async fn sync(config: SyncJobConfig) -> Result<()> {
     SyncOrchestrator::new_local(config).run().await
+}
+
+/// 按任务及执行身份读取已归档的增量复制明细。
+pub async fn incremental_copy_changes(
+    job_id: &str, execution_id: &str, offset: u64, limit: u32,
+) -> Result<Option<CopyChangePage>> {
+    let config = AppConfig::fetch_database()?;
+    let db = ClickHouseDatabase::new(&config.clickhouse, job_id)?;
+    Ok(db.incremental_copy_changes(execution_id, offset, limit).await?)
 }
 
 #[cfg(windows)]

@@ -214,6 +214,7 @@ fn decode_observation(relative_path: &str, snapshot: &[u8], backend: &BackendIde
 /// 对应 `FILE_INCREMENTAL_SCAN_COLUMNS_DEFINITION` 中的列定义
 #[derive(Debug, Clone, Serialize, Deserialize, clickhouse::Row)]
 pub(crate) struct IncrementalStorageEntryRecord {
+    pub copy_execution_id: String,
     /// 操作类型：new, changed, deleted, rename
     pub operation_type: String,
     /// 文件或目录的名称
