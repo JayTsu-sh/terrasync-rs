@@ -18,18 +18,11 @@ use utils::{app_config::ClickhouseConfig, sanitize_job_id};
 /// 数据库作业锁与工作目录无关；目录锁另保护同一目录中的本地恢复文件。
 pub(crate) struct JobLease {
     _file: File,
-    _identity: IdentityLock,
+    _identity: Option<IdentityLock>,
 }
 
 impl JobLease {
-    pub(crate) fn acquire(connection: &ClickhouseConfig, job_id: &str, job_dir: &str) -> Result<Self> {
-        let key = blake3::hash(&serde_json::to_vec(&(
-            &connection.dsn,
-            &connection.database,
-            sanitize_job_id(job_id),
-        ))?)
-        .to_hex()
-        .to_string();
+    pub(crate) fn acquire(connection: Option<&ClickhouseConfig>, job_id: &str, job_dir: &str) -> Result<Self> {
         let lock_error = |source: TryLockError| match source {
             TryLockError::WouldBlock => AppError::JobExecutionBusy {
                 job_id: job_id.to_owned(),
@@ -39,7 +32,18 @@ impl JobLease {
                 source,
             },
         };
-        let identity = lock_job_identity(&key).map_err(lock_error)?;
+        let identity = if let Some(connection) = connection {
+            let key = blake3::hash(&serde_json::to_vec(&(
+                &connection.dsn,
+                &connection.database,
+                sanitize_job_id(job_id),
+            ))?)
+            .to_hex()
+            .to_string();
+            Some(lock_job_identity(&key).map_err(lock_error)?)
+        } else {
+            None
+        };
         create_dir_all(job_dir)?;
         let file = OpenOptions::new()
             .create(true)

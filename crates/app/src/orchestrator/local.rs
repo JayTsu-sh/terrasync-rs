@@ -73,7 +73,8 @@ impl SyncOrchestrator {
         };
 
         // 模式选择与代次准备共用独占权，避免读取旧策略后被另一执行切换代次。
-        let _lease = CopyLease::acquire(&app_config.database.clickhouse, c)?;
+        let connection = app_config.database.enabled.then_some(&app_config.database.clickhouse);
+        let _lease = CopyLease::acquire(connection, c)?;
         if !c.source_cleanup.retains_source() && !app_config.database.enabled {
             return Err(AppError::ConfigError(
                 "当前移动任务要求启用 ClickHouse 目录和代次记录".into(),
