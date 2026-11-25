@@ -15,6 +15,18 @@ use crate::execution::read::QuorumRead;
 use crate::execution::recovery::RequestSafety;
 use crate::{get_scan_base_table_name, get_scan_state_table_name};
 
+// 每次复制代次留出准备、提交和普通扫描覆盖三个版本，旧请求的到达顺序不能改变胜者。
+const STATE_VERSIONS_PER_COPY: u64 = 3;
+
+pub(super) fn copy_state_version(sequence: u64) -> Result<u64> {
+    sequence
+        .checked_mul(STATE_VERSIONS_PER_COPY)
+        .filter(|version| *version <= u64::MAX - (STATE_VERSIONS_PER_COPY - 1))
+        .ok_or(DatabaseError::CopyGenerationInvalid {
+            field: "state_version_overflow",
+        })
+}
+
 impl ClickHouseDatabase {
     /// 查询 `scan_state` 表，返回 id=1 的 `scan_state` 值。
     ///
@@ -45,15 +57,29 @@ impl ClickHouseDatabase {
         Ok(state)
     }
 
-    /// 插入或更新扫描状态（id=1，利用 `ReplacingMergeTree` 自动去重）
+    /// 普通扫描覆盖当前复制代次的状态；后续复制使用更高代次写入。
     pub async fn insert_scan_state(&self, scan_state: u8) -> Result<()> {
-        self.insert_scan_state_with_baseline(scan_state, true).await
+        let table = get_scan_state_table_name(&self.job_id);
+        let current = self
+            .sync_client
+            .query(&format!("SELECT max(state_version) FROM {table} WHERE id=1"))
+            .fetch_quorum_one::<u64>()
+            .await?;
+        let version = if current == 0 {
+            0
+        } else {
+            copy_state_version(current / STATE_VERSIONS_PER_COPY)? + (STATE_VERSIONS_PER_COPY - 1)
+        };
+        self.insert_scan_state_with_baseline(scan_state, true, version).await
     }
 
-    pub(super) async fn insert_scan_state_with_baseline(&self, scan_state: u8, baseline_committed: bool) -> Result<()> {
+    pub(super) async fn insert_scan_state_with_baseline(
+        &self, scan_state: u8, baseline_committed: bool, version: u64,
+    ) -> Result<()> {
         let _write = self.catalogue_write_guard().await;
         let table_name = get_scan_state_table_name(&self.job_id);
-        let insert_sql = format!("INSERT INTO {table_name} (id, scan_state, baseline_committed) VALUES (?, ?, ?)");
+        let insert_sql =
+            format!("INSERT INTO {table_name} (id, scan_state, baseline_committed, state_version) VALUES (?, ?, ?, ?)");
 
         debug!("Inserting scan state: id=1, scan_state={}", scan_state);
 
@@ -63,13 +89,22 @@ impl ClickHouseDatabase {
                 .query(&insert_sql)
                 .bind(1u8)
                 .bind(scan_state)
-                .bind(baseline_committed);
+                .bind(baseline_committed)
+                .bind(version);
             async move { query.execute().await.map_err(DatabaseError::from) }
         })
         .await?;
 
         debug!("Inserted scan state record: id=1, scan_state={}", scan_state);
         Ok(())
+    }
+
+    pub(super) async fn publish_copy_scan_state(
+        &self, scan_state: u8, baseline_committed: bool, version: u64, execution_id: &str,
+    ) -> Result<()> {
+        let table = get_scan_state_table_name(&self.job_id);
+        self.execute(&format!("INSERT INTO {table} (id,scan_state,baseline_committed,copy_execution_id,state_version) VALUES (1,{scan_state},{baseline_committed},?,{version})"),
+            &[Value::from(execution_id)]).await
     }
 
     /// 将上次未提交的 working 快照重新标记为 committed，作为同 generation 重试的基线。
@@ -120,8 +155,13 @@ impl ClickHouseDatabase {
             return Ok(());
         }
         if let Some(execution_id) = &lifecycle.copy_execution_id {
-            let table = get_scan_state_table_name(&self.job_id);
-            self.execute(&format!("INSERT INTO {table} (id,scan_state,baseline_committed,copy_execution_id) VALUES (1,{working},true,?)"), &[Value::from(execution_id.clone())]).await?;
+            let generation = lifecycle
+                .copy_generation
+                .as_ref()
+                .ok_or(DatabaseError::CopyExecutionUnavailable)?;
+            let version = copy_state_version(generation.sequence)? + 1;
+            self.publish_copy_scan_state(working, true, version, execution_id)
+                .await?;
         } else {
             self.insert_scan_state(working).await?;
         }

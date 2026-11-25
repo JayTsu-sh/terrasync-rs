@@ -13,6 +13,27 @@ pub(super) struct ScanGenerationLifecycle {
     pub copy_generation_recovering: bool,
     pub copy_execution_id: Option<String>,
     pub copy_generation: Option<CopyGeneration>,
+    pub copy_fact_range: Option<CopyFactRange>,
+}
+
+/// 最近一次全量到本次执行的复制事实。全量清理之后到达的旧写入也要排除。
+#[derive(Clone, Copy)]
+pub(super) struct CopyFactRange {
+    pub first: u64,
+    pub last: u64,
+}
+
+impl CopyFactRange {
+    pub fn predicate(self) -> String {
+        format!(
+            "copy_sequence BETWEEN {} AND {} AND copy_execution_id!=''",
+            self.first, self.last
+        )
+    }
+
+    pub fn and_predicate(range: Option<Self>) -> String {
+        range.map_or_else(String::new, |range| format!(" AND {}", range.predicate()))
+    }
 }
 
 #[derive(Default)]
@@ -24,6 +45,14 @@ pub(super) struct CatalogueLifecycle {
 }
 
 impl ClickHouseDatabase {
+    pub(super) async fn copy_fact_range(&self) -> Result<Option<CopyFactRange>> {
+        let lifecycle = self.generation_lifecycle.lock().await;
+        match (lifecycle.copy_generation.as_ref(), lifecycle.copy_fact_range) {
+            (Some(_), None) => Err(DatabaseError::CopyExecutionUnavailable),
+            (_, range) => Ok(range),
+        }
+    }
+
     pub(super) async fn base_write_guard(&self) -> Result<RwLockReadGuard<'_, bool>> {
         let guard = self.generation_lifecycle.base_closed.read().await;
         if *guard {

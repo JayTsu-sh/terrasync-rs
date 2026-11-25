@@ -8,6 +8,8 @@ use task_model::migration::{
 };
 
 use super::ClickHouseDatabase;
+use super::generation::copy_state_version;
+use super::lifecycle::CopyFactRange;
 use crate::error::{DatabaseError, Result};
 use crate::execution::read::QuorumRead;
 use crate::schema::columns::CATALOGUE_COLUMNS as FILE_SCAN_COLUMNS_LIST;
@@ -25,6 +27,7 @@ pub enum CopyGenerationStatus {
 struct CopyState {
     scan_state: u8,
     copy_execution_id: String,
+    state_version: u64,
 }
 
 #[cfg(test)]
@@ -74,10 +77,21 @@ impl ClickHouseDatabase {
             .ok_or(DatabaseError::CopyGenerationInvalid {
                 field: "sequence_overflow",
             })?;
+        let state_version = copy_state_version(sequence)?;
         let recovering = plan.mode == MigrationMode::Incremental
             && previous
                 .as_ref()
                 .is_some_and(|prior| prior.phase != CopyGenerationPhase::Completed);
+        let first = if plan.mode == MigrationMode::Full {
+            sequence
+        } else {
+            let prior = previous.as_ref().ok_or(DatabaseError::CopyExecutionUnavailable)?;
+            if prior.plan.mode == MigrationMode::Full {
+                prior.sequence
+            } else {
+                self.latest_full_copy_sequence(prior.sequence).await?
+            }
+        };
         lifecycle.copy_generation = Some(CopyGeneration {
             root_snapshot: None,
             sequence,
@@ -108,12 +122,15 @@ impl ClickHouseDatabase {
             // 未确认行作为墓碑保留；只删这些物理行会复活同键更早的已确认快照。
             // 比较和收尾均排除它们，只有新的复制 ACK 才能恢复该目标槽的就绪证明。
             // 范围外事实跨多轮保留；每轮统一回到 C，观察之后才写 W。
-            self.execute(&format!("ALTER TABLE {base} UPDATE current_state={committed} WHERE current_state!={committed} AND copy_sequence < ? SETTINGS mutations_sync=2"),
-                &[Value::from(sequence)]).await?;
+            let facts = CopyFactRange {
+                first,
+                last: sequence - 1,
+            }
+            .predicate();
+            self.execute(&format!("ALTER TABLE {base} UPDATE current_state={committed} WHERE current_state!={committed} AND {facts} SETTINGS mutations_sync=2"), &[]).await?;
         }
-        let table = get_scan_state_table_name(&self.job_id);
-        self.execute(&format!("INSERT INTO {table} (id,scan_state,baseline_committed,copy_execution_id) VALUES (1,{committed},false,?)"),
-            &[Value::from(request.execution_id.clone())]).await?;
+        self.publish_copy_scan_state(committed, false, state_version, &request.execution_id)
+            .await?;
         generation.baseline_prepared = true;
         generation.phase = CopyGenerationPhase::Prepared;
         generation.revision = 2;
@@ -122,6 +139,7 @@ impl ClickHouseDatabase {
         lifecycle.copy_recovery = false;
         lifecycle.copy_generation_recovering = recovering;
         lifecycle.copy_execution_id = Some(request.execution_id.clone());
+        lifecycle.copy_fact_range = Some(CopyFactRange { first, last: sequence });
         self.cached_scan_state.store(working, Ordering::Relaxed);
         Ok(if recovering {
             CopyGenerationStatus::Recovering
@@ -145,7 +163,7 @@ impl ClickHouseDatabase {
         let state = self
             .sync_client
             .query(&format!(
-                "SELECT scan_state,copy_execution_id FROM {table} FINAL WHERE id=1"
+                "SELECT scan_state,copy_execution_id,state_version FROM {table} FINAL WHERE id=1"
             ))
             .fetch_quorum_one::<CopyState>()
             .await?;
@@ -154,6 +172,11 @@ impl ClickHouseDatabase {
                 "Invalid copy generation {}; expected 0 or 1",
                 state.scan_state
             )));
+        }
+        if !state.copy_execution_id.is_empty() && state.state_version == 0 {
+            return Err(DatabaseError::CopyGenerationInvalid {
+                field: "copy_state_version",
+            });
         }
         Ok(state)
     }
@@ -202,12 +225,13 @@ impl ClickHouseDatabase {
 
     async fn replayed_paths(&self, old: &[StorageEntryRecord], working: u8) -> Result<HashSet<String>> {
         let table = self.catalogue_query_table(&get_scan_base_table_name(&self.job_id))?;
+        let facts = CopyFactRange::and_predicate(self.copy_fact_range().await?);
         let paths: HashSet<_> = old.iter().map(|row| row.relative_path.as_str()).collect();
         let paths: Vec<_> = paths.into_iter().collect();
         let mut active = HashSet::new();
         for paths in bounded_keys(&paths, |path| path.len()) {
             let placeholders = vec!["?"; paths.len()].join(",");
-            let mut query = self.sync_client.query(&format!("SELECT DISTINCT relative_path FROM {table} FINAL WHERE current_state={working} AND relative_path IN ({placeholders})"));
+            let mut query = self.sync_client.query(&format!("SELECT DISTINCT relative_path FROM {table} FINAL WHERE current_state={working}{facts} AND relative_path IN ({placeholders})"));
             for path in paths {
                 query = query.bind(*path);
             }
@@ -218,13 +242,14 @@ impl ClickHouseDatabase {
 
     async fn retire_copy_versions(&self, keys: &[(String, String)], working: u8) -> Result<()> {
         let table = self.catalogue_storage_table(&get_scan_base_table_name(&self.job_id))?;
+        let facts = CopyFactRange::and_predicate(self.copy_fact_range().await?);
         for keys in bounded_keys(keys, |(path, version)| path.len().saturating_add(version.len())) {
             let placeholders = vec!["(?,?)"; keys.len()].join(",");
             let values: Vec<_> = keys
                 .iter()
                 .flat_map(|(path, version)| [Value::from(path.clone()), Value::from(version.clone())])
                 .collect();
-            self.execute(&format!("ALTER TABLE {table} DELETE WHERE current_state!={working} AND (relative_path,version_id) IN ({placeholders}) SETTINGS mutations_sync=2"), &values).await?;
+            self.execute(&format!("ALTER TABLE {table} DELETE WHERE current_state!={working}{facts} AND (relative_path,version_id) IN ({placeholders}) SETTINGS mutations_sync=2"), &values).await?;
         }
         Ok(())
     }

@@ -43,6 +43,25 @@ impl ClickHouseDatabase {
         self.read_copy_generation(None).await
     }
 
+    /// 代次历史保留每次全量的起点，迟到的 base 写入不能改变它。
+    pub(super) async fn latest_full_copy_sequence(&self, through: u64) -> Result<u64> {
+        let table = self.catalogue_query_table(&self.copy_runs_table())?;
+        let sequence = self
+            .sync_client
+            .query(&format!(
+                "SELECT max(sequence) FROM {table} FINAL WHERE sequence<=? AND JSONExtractString(descriptor,'plan','mode')='full'"
+            ))
+            .bind(through)
+            .fetch_quorum_one::<u64>()
+            .await?;
+        if sequence == 0 || sequence > through {
+            return Err(DatabaseError::CopyGenerationInvalid {
+                field: "full_baseline_sequence",
+            });
+        }
+        Ok(sequence)
+    }
+
     pub(super) async fn read_copy_generation(&self, execution_id: Option<&str>) -> Result<Option<CopyGeneration>> {
         let table = self.copy_runs_table();
         if !self.table_exists(&table).await? {

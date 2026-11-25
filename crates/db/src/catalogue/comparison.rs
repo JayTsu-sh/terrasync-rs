@@ -11,6 +11,7 @@ use task_model::{ChangeKind, EntryChange, MetadataTargetVersion};
 use tracing::{debug, info};
 
 use super::ClickHouseDatabase;
+use super::lifecycle::CopyFactRange;
 use super::versions::CatalogueVersions;
 use crate::scan::rows::OBSERVED_COLUMNS;
 use crate::schema::columns::{
@@ -61,7 +62,7 @@ impl ClickHouseDatabase {
             .as_deref()
             .ok_or_else(|| DatabaseError::TableNotFound("catalogue comparison staging".into()))?;
         let temporary = self.catalogue_query_table(temporary)?;
-        let (force_copy, preserve_target, copy_only) = {
+        let (force_copy, preserve_target) = {
             let lifecycle = self.generation_lifecycle.lock().await;
             (
                 lifecycle
@@ -72,34 +73,29 @@ impl ClickHouseDatabase {
                     .copy_generation
                     .as_ref()
                     .is_some_and(|generation| generation.plan.target_cleanup == TargetCleanupPolicy::Preserve),
-                lifecycle.copy_generation.is_some(),
             )
         };
+        let facts = self.copy_fact_range().await?;
+        let base = self.catalogue_query_table(&get_scan_base_table_name(&self.job_id))?;
         let query = if force_copy || self.is_copy_recovery().await {
-            let base = self.catalogue_query_table(&get_scan_base_table_name(&self.job_id))?;
+            let facts = CopyFactRange::and_predicate(facts);
             format!(
-                "SELECT t.relative_path,t.version_id,toUInt8(if(t.is_dir = 1 AND t.marker_state IS NULL AND f.marker_state IS NOT NULL,4,0)) AS change_code,CAST(NULL AS Nullable(String)) AS target_version FROM {temporary} t LEFT JOIN (SELECT relative_path,version_id,marker_state FROM {base} FINAL ORDER BY relative_path,version_id LIMIT 1 BY relative_path,version_id) f USING (relative_path,version_id)"
+                "SELECT t.relative_path,t.version_id,toUInt8(if(t.is_dir = 1 AND t.marker_state IS NULL AND f.marker_state IS NOT NULL,4,0)) AS change_code,CAST(NULL AS Nullable(String)) AS target_version FROM {temporary} t LEFT JOIN (SELECT relative_path,version_id,marker_state FROM {base} FINAL WHERE true{facts} ORDER BY relative_path,version_id LIMIT 1 BY relative_path,version_id) f USING (relative_path,version_id)"
             )
         } else {
-            let base = self.catalogue_query_table(&get_scan_base_table_name(&self.job_id))?;
             let strategy = if preserve_target {
                 JoinStrategy::CopyPath
             } else {
-                let (temporary_handles, baseline_handles) = self.check_file_handle_status(&temporary, &base).await?;
+                let (temporary_handles, baseline_handles) =
+                    self.check_file_handle_status(&temporary, &base, facts).await?;
                 JoinStrategy::from_file_handle_status(temporary_handles, baseline_handles)
             };
             let queries = [
-                strategy.build_detect_new_sql(&temporary, &base, copy_only),
-                strategy.build_detect_changed_sql(&temporary, &base, ChangeKind::DataOnly, false, copy_only),
-                strategy.build_detect_changed_sql(&temporary, &base, ChangeKind::MetadataOnly, true, copy_only),
-                strategy.build_detect_changed_sql(&temporary, &base, ChangeKind::Both, false, copy_only),
-                strategy.build_detect_changed_sql(
-                    &temporary,
-                    &base,
-                    ChangeKind::DirectoryMarkerRemoved,
-                    false,
-                    copy_only,
-                ),
+                strategy.build_detect_new_sql(&temporary, &base, facts),
+                strategy.build_detect_changed_sql(&temporary, &base, ChangeKind::DataOnly, false, facts),
+                strategy.build_detect_changed_sql(&temporary, &base, ChangeKind::MetadataOnly, true, facts),
+                strategy.build_detect_changed_sql(&temporary, &base, ChangeKind::Both, false, facts),
+                strategy.build_detect_changed_sql(&temporary, &base, ChangeKind::DirectoryMarkerRemoved, false, facts),
             ];
             queries
                 .into_iter()
@@ -271,15 +267,6 @@ pub(super) enum JoinStrategy {
 }
 
 impl JoinStrategy {
-    fn confirmation_filter(data: bool, copy_only: bool) -> &'static str {
-        match (data, copy_only) {
-            (true, true) => "copy_data_confirmed AND copy_sequence>0 AND copy_execution_id!=''",
-            (false, true) => "copy_path_confirmed AND copy_sequence>0 AND copy_execution_id!=''",
-            (true, false) => "copy_data_confirmed",
-            (false, false) => "copy_path_confirmed",
-        }
-    }
-
     /// 根据临时表和主表的 `file_handle` 统计信息决定 JOIN 策略
     ///
     /// 策略只取决于「是否存在 `file_handle`」，与表是否为空无关：
@@ -299,30 +286,30 @@ impl JoinStrategy {
 
     /// 构建 `detect_new` SQL：temp 中存在但 base 中不存在的记录
     ///
-    pub(super) fn build_detect_new_sql(&self, temp: &str, base: &str, copy_only: bool) -> String {
-        let confirmed = Self::confirmation_filter(true, copy_only);
+    pub(super) fn build_detect_new_sql(&self, temp: &str, base: &str, facts: Option<CopyFactRange>) -> String {
+        let facts = CopyFactRange::and_predicate(facts);
         let columns = &*FILE_SCAN_COLUMNS_LIST_WITH_T_PREFIX;
         match self {
             Self::CopyPath => format!(
                 "SELECT {columns} FROM {temp} as t WHERE (t.relative_path,t.version_id,ifNull(t.file_handle,''),t.entry_kind) NOT IN \
-                 (SELECT relative_path,version_id,ifNull(file_handle,''),entry_kind FROM {base} FINAL WHERE {confirmed} \
+                 (SELECT relative_path,version_id,ifNull(file_handle,''),entry_kind FROM {base} FINAL WHERE copy_data_confirmed{facts} \
                   AND (relative_path,version_id) IN (SELECT relative_path,version_id FROM {temp})) \
                  ORDER BY t.relative_path,t.history_segment,t.history_index,t.version_id"
             ),
             Self::Path => format!(
                 "SELECT {columns} FROM {temp} as t \
                  WHERE (t.relative_path, t.version_id) NOT IN \
-                 (SELECT relative_path, version_id FROM {base} FINAL WHERE {confirmed}) \
+                 (SELECT relative_path, version_id FROM {base} FINAL WHERE copy_data_confirmed{facts}) \
                  ORDER BY t.relative_path, t.history_segment, t.history_index, t.version_id"
             ),
             Self::FileHandle => format!(
                 "SELECT {columns} FROM {temp} as t \
                  WHERE t.file_handle NOT IN \
-                 (SELECT file_handle FROM {base} FINAL WHERE {confirmed} AND file_handle IS NOT NULL) \
+                 (SELECT file_handle FROM {base} FINAL WHERE copy_data_confirmed{facts} AND file_handle IS NOT NULL) \
                  OR (t.relative_path,t.version_id) IN \
                  (SELECT p.relative_path,p.version_id FROM {temp} p \
                   JOIN (SELECT relative_path,version_id,file_handle FROM {base} FINAL \
-                        WHERE {confirmed} AND (relative_path,version_id) IN \
+                        WHERE copy_data_confirmed{facts} AND (relative_path,version_id) IN \
                         (SELECT relative_path,version_id FROM {temp})) f \
                   ON p.relative_path=f.relative_path AND p.version_id=f.version_id \
                   WHERE NOT ifNull(p.file_handle=f.file_handle,p.file_handle IS NULL AND f.file_handle IS NULL)) \
@@ -338,9 +325,9 @@ impl JoinStrategy {
     /// - `MetadataOnly`：大小、mtime、真实源版本及身份均未变；元数据变了
     /// - `Both`：内容和属性都变了
     pub(super) fn build_detect_changed_sql(
-        &self, temp: &str, base: &str, kind: ChangeKind, include_binding: bool, copy_only: bool,
+        &self, temp: &str, base: &str, kind: ChangeKind, include_binding: bool, facts: Option<CopyFactRange>,
     ) -> String {
-        let confirmed = Self::confirmation_filter(true, copy_only);
+        let facts = CopyFactRange::and_predicate(facts);
         let binding = if include_binding {
             ",f.copy_target_version AS copy_target_version"
         } else {
@@ -400,7 +387,7 @@ impl JoinStrategy {
                 "SELECT {t_columns} FROM {temp} t \
                  JOIN (SELECT relative_path, version_id, source_version_id, identity_key, size, mtime, mode, uid, gid, is_dir, marker_state, metadata_digests,copy_path_confirmed{binding_column}{identity_columns} \
                        FROM {base} FINAL \
-                       WHERE {confirmed} AND (relative_path, version_id) IN \
+                       WHERE copy_data_confirmed{facts} AND (relative_path, version_id) IN \
                              (SELECT relative_path, version_id FROM {temp}) \
                        ORDER BY relative_path, version_id \
                        LIMIT 1 BY (relative_path, version_id) \
@@ -412,7 +399,7 @@ impl JoinStrategy {
                 "SELECT {t_columns} FROM {temp} t \
                  JOIN (SELECT file_handle, relative_path, source_version_id, identity_key, size, mtime, mode, uid, gid, is_dir, marker_state, metadata_digests,copy_path_confirmed{binding_column} \
                        FROM {base} FINAL \
-                       WHERE {confirmed} AND file_handle IN \
+                       WHERE copy_data_confirmed{facts} AND file_handle IN \
                              (SELECT file_handle FROM {temp} WHERE file_handle IS NOT NULL) \
                        ORDER BY file_handle, relative_path \
                        LIMIT 1 BY (file_handle, relative_path) \
@@ -426,28 +413,24 @@ impl JoinStrategy {
 
     /// 构建 `detect_deleted` SQL：base 中 old-state 的记录
     /// 使用 FINAL 确保 `ReplacingMergeTree` 去重后再按 `current_state` 过滤
-    pub(super) fn build_detect_deleted_sql(base: &str, copy_only: bool) -> String {
-        let confirmed = Self::confirmation_filter(false, copy_only);
+    pub(super) fn build_detect_deleted_sql(base: &str, facts: Option<CopyFactRange>) -> String {
+        let facts = CopyFactRange::and_predicate(facts);
         let columns = &*FILE_SCAN_COLUMNS_LIST;
         format!(
             "SELECT {columns} FROM {base} FINAL \
-             WHERE current_state = ? AND {confirmed} \
+             WHERE current_state = ? AND copy_path_confirmed{facts} \
              ORDER BY relative_path, version_id"
         )
     }
 
     /// 构建批量 `file_handle` 查询 SQL（优化 2）
-    pub(super) fn build_batch_fh_query_sql(base: &str, batch_size: usize, copy_only: bool) -> String {
-        let origin = if copy_only {
-            " AND copy_sequence>0 AND copy_execution_id!=''"
-        } else {
-            ""
-        };
+    pub(super) fn build_batch_fh_query_sql(base: &str, batch_size: usize, facts: Option<CopyFactRange>) -> String {
+        let facts = CopyFactRange::and_predicate(facts);
         let columns = &*FILE_SCAN_COLUMNS_LIST;
         let placeholders = vec!["?"; batch_size].join(", ");
         format!(
             "SELECT {columns} FROM {base} FINAL \
-             WHERE file_handle IN ({placeholders}) AND current_state = ? AND (? OR NOT copy_path_confirmed){origin} \
+             WHERE file_handle IN ({placeholders}) AND current_state = ? AND (? OR NOT copy_path_confirmed){facts} \
              ORDER BY file_handle, relative_path, version_id \
              LIMIT 1 BY (relative_path, version_id)"
         )
@@ -473,6 +456,7 @@ impl ClickHouseDatabase {
             .as_ref()
             .map(|generation| (generation.request.execution_id.clone(), generation.sequence));
         let copying = copy_identity.is_some();
+        let facts = CopyFactRange::and_predicate(self.copy_fact_range().await?);
         let columns = if copying {
             format!("{OBSERVED_COLUMNS},copy_path_confirmed,copy_data_confirmed,copy_target_version")
         } else {
@@ -491,7 +475,7 @@ impl ClickHouseDatabase {
                     "{observed},(f.copy_path_confirmed AND {same}),(f.copy_data_confirmed AND {same}),f.copy_target_version"
                 ),
                 format!(
-                    "{temp_table_name} t LEFT JOIN (SELECT relative_path,version_id,file_handle,copy_path_confirmed,copy_data_confirmed,copy_target_version FROM {base_table_name} FINAL WHERE (relative_path,version_id) IN (SELECT relative_path,version_id FROM {temp_table_name})) f ON t.relative_path=f.relative_path AND t.version_id=f.version_id"
+                    "{temp_table_name} t LEFT JOIN (SELECT relative_path,version_id,file_handle,copy_path_confirmed,copy_data_confirmed,copy_target_version FROM {base_table_name} FINAL WHERE (relative_path,version_id) IN (SELECT relative_path,version_id FROM {temp_table_name}){facts}) f ON t.relative_path=f.relative_path AND t.version_id=f.version_id"
                 ),
             )
         } else {
@@ -543,7 +527,7 @@ impl ClickHouseDatabase {
                     .join(",");
                 insert_sql = format!(
                     "{insert_sql} UNION ALL SELECT {pending},false,(f.copy_data_confirmed AND (f.relative_path,f.version_id) IN (SELECT relative_path,version_id FROM {exclude_query_table} WHERE data_unchanged)),f.copy_target_version FROM (SELECT {OBSERVED_COLUMNS},copy_data_confirmed,copy_target_version FROM {base_table_name} FINAL \
-                     WHERE (relative_path,version_id) IN (SELECT relative_path,version_id FROM {exclude_query_table})) AS f \
+                     WHERE (relative_path,version_id) IN (SELECT relative_path,version_id FROM {exclude_query_table}){facts}) AS f \
                      WHERE NOT (f.is_dir AND f.marker_state IS NOT NULL AND (f.relative_path,f.version_id) IN \
                      (SELECT relative_path,version_id FROM {temp_table_name} WHERE is_dir AND marker_state IS NULL))"
                 );

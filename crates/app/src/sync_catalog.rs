@@ -106,6 +106,7 @@ mod tests {
     struct StateRow {
         scan_state: u8,
         copy_execution_id: String,
+        state_version: u64,
     }
 
     fn fixture_database(mock: &Mock) -> ClickHouseDatabase {
@@ -159,6 +160,7 @@ mod tests {
                     mock.add(handlers::provide([StateRow {
                         scan_state: 1,
                         copy_execution_id: generation.request.execution_id,
+                        state_version: 4,
                     }]));
                 }
             } else {

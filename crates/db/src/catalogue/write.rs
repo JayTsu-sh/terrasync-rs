@@ -64,7 +64,9 @@ impl ClickHouseDatabase {
             return Ok(());
         }
 
-        let delete_query = self.catalogue_delete_statement(table_name, &vec!["?"; deleted_paths.len()].join(", "))?;
+        let facts = self.copy_fact_range().await?;
+        let delete_query =
+            self.catalogue_delete_statement(table_name, &vec!["?"; deleted_paths.len()].join(", "), facts)?;
         let paths = deleted_paths.iter().cloned().map(Value::from).collect::<Vec<_>>();
         self.execute(&delete_query, &paths).await?;
 

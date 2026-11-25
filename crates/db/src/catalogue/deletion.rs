@@ -7,6 +7,7 @@ use tracing::{debug, trace};
 
 use super::ClickHouseDatabase;
 use super::comparison::JoinStrategy;
+use super::lifecycle::CopyFactRange;
 use crate::execution::read::QuorumRead;
 use crate::get_scan_base_table_name;
 use crate::schema::records::StorageEntryRecord;
@@ -99,9 +100,8 @@ impl ClickHouseDatabase {
         let current_state = self.get_cached_scan_state().await?;
         debug!("During detect_deleted_items, current_state is {}", current_state);
 
-        // 第一步：查询所有 old-state 记录（LIMIT 1 BY 替代 FINAL）
-        let copy_only = self.generation_lifecycle.lock().await.copy_generation.is_some();
-        let query = JoinStrategy::build_detect_deleted_sql(&base_table_name, copy_only);
+        let facts = self.copy_fact_range().await?;
+        let query = JoinStrategy::build_detect_deleted_sql(&base_table_name, facts);
 
         let rows = self
             .sync_client
@@ -120,7 +120,7 @@ impl ClickHouseDatabase {
             ));
         }
 
-        let deletion_statuses = self.classify_deleted_candidates(&base_table_name, rows).await?;
+        let deletion_statuses = self.classify_deleted_candidates(&base_table_name, rows, facts).await?;
 
         debug!("Found {} deleted or renamed entries", deletion_statuses.len());
 
@@ -128,9 +128,8 @@ impl ClickHouseDatabase {
     }
     /// Classify candidate rows after the query and recovery decision, without copying observations.
     async fn classify_deleted_candidates(
-        &self, base_table_name: &str, rows: Vec<StorageEntryRecord>,
+        &self, base_table_name: &str, rows: Vec<StorageEntryRecord>, facts: Option<CopyFactRange>,
     ) -> Result<Vec<DeletionStatus>> {
-        let copy_only = self.generation_lifecycle.lock().await.copy_generation.is_some();
         let (no_fh_records, fh_records): (Vec<_>, Vec<_>) =
             rows.into_iter().partition(|record| record.file_handle.is_none());
         let unique_fh_set: HashSet<String> = fh_records
@@ -145,18 +144,17 @@ impl ClickHouseDatabase {
             const BATCH_SIZE: usize = 10_000;
             let unique_fh_list: Vec<&str> = unique_fh_set.iter().map(String::as_str).collect();
             let current_state = self.get_cached_scan_state().await?;
-            let copying = self.generation_lifecycle.lock().await.copy_generation.is_some();
 
             // 每批 10K 个 fh，避免 SQL 过长
             for chunk in unique_fh_list.chunks(BATCH_SIZE) {
-                let batch_query = JoinStrategy::build_batch_fh_query_sql(base_table_name, chunk.len(), copy_only);
+                let batch_query = JoinStrategy::build_batch_fh_query_sql(base_table_name, chunk.len(), facts);
 
                 let mut q = self.sync_client.query(&batch_query);
                 for fh in chunk {
                     q = q.bind(*fh);
                 }
                 // 复制已经确认的新目标不能再被旧路径覆盖；纯扫描仍关联全部当前观察。
-                let q = q.bind(current_state).bind(!copying);
+                let q = q.bind(current_state).bind(facts.is_none());
                 let batch_rows = q.fetch_quorum_all::<StorageEntryRecord>().await?;
 
                 for row in batch_rows {

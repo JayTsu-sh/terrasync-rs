@@ -57,9 +57,9 @@ impl ClickHouseDatabase {
         self.create_catalogue_table(
             &table_name,
             "id UInt8, scan_state UInt8, baseline_committed Bool DEFAULT false, \
-             copy_execution_id String DEFAULT ''",
+             copy_execution_id String DEFAULT '', state_version UInt64 DEFAULT 0",
             "id",
-            CatalogueEngine::Replacing,
+            CatalogueEngine::ReplacingVersion("state_version"),
         )
         .await?;
         Ok(())
@@ -161,7 +161,7 @@ impl ClickHouseDatabase {
         self.create_table(SCAN_BASE_TABLE_BASE_NAME).await?;
         self.create_table(SCAN_STATE_TABLE_BASE_NAME).await?;
         if self.query_scan_state().await?.is_none() {
-            self.insert_scan_state_with_baseline(0, false).await?;
+            self.insert_scan_state_with_baseline(0, false, 0).await?;
         }
         Ok(())
     }

@@ -54,9 +54,10 @@ async fn fresh_initialization_keeps_the_baseline_uncommitted() -> Result<()> {
     let ddl = schema.query().await;
     assert!(ddl.contains("baseline_committed Bool DEFAULT false"));
     assert!(ddl.contains("copy_execution_id String DEFAULT ''"));
+    assert!(ddl.contains("ReplacingMergeTree(`state_version`)"));
     let insert = initial.query().await;
-    assert!(insert.contains("(id, scan_state, baseline_committed)"));
-    assert!(insert.ends_with("VALUES (1, 0, false)"), "{insert}");
+    assert!(insert.contains("(id, scan_state, baseline_committed, state_version)"));
+    assert!(insert.ends_with("VALUES (1, 0, false, 0)"), "{insert}");
 
     // 重连不能把已经建好的表当成已完成基线。
     let reopened = mocked_database(&mock, "initial_baseline");
@@ -83,11 +84,12 @@ async fn generation_commit_publishes_generation_and_baseline_in_one_row() -> Res
     let mock = Mock::new();
     let database = mocked_database(&mock, "committed_baseline");
     database.generation_lifecycle.lock().await.working = Some(1);
+    mock.add(handlers::provide([4u64]));
     let committed = mock.add(handlers::record_ddl());
     database.commit_scan_generation().await?;
     let insert = committed.query().await;
-    assert!(insert.contains("(id, scan_state, baseline_committed)"));
-    assert!(insert.ends_with("VALUES (1, 1, true)"), "{insert}");
+    assert!(insert.contains("(id, scan_state, baseline_committed, state_version)"));
+    assert!(insert.ends_with("VALUES (1, 1, true, 5)"), "{insert}");
     // 重新初始化必须保留已提交的状态行。
     mock.add(handlers::record_ddl());
     mock.add(handlers::provide(["relative_path, version_id".to_string()]));

@@ -11,6 +11,7 @@ use utils::sanitize_job_id;
 
 use super::ClickHouseDatabase;
 use super::comparison::JoinStrategy;
+use super::lifecycle::CopyFactRange;
 use crate::error::{DatabaseError, Result};
 use crate::execution::queries::{check_scan_cancellation, scan_retry_delay};
 use crate::execution::read::QuorumRead;
@@ -40,7 +41,8 @@ fn records_to_entry_iter(records: Vec<StorageEntryRecord>) -> Result<Box<dyn Ite
 impl ClickHouseDatabase {
     /// 通用检测方法：对比临时表与主表，按 `query_builder` 构建 SQL 查询符合条件的记录
     pub(super) async fn detect_items(
-        &self, query_type: &str, query_builder: impl Fn(&str, &str, &JoinStrategy) -> String,
+        &self, query_type: &str, facts: Option<CopyFactRange>,
+        query_builder: impl Fn(&str, &str, &JoinStrategy) -> String,
     ) -> Result<Vec<StorageEntryRecord>> {
         let temp_table_name = self
             .scan_temp_table_name
@@ -48,7 +50,9 @@ impl ClickHouseDatabase {
             .ok_or_else(|| DatabaseError::TableNotFound("Temporary table not created".to_string()))?;
         let base_table_name = get_scan_base_table_name(&self.job_id);
 
-        let (temp_non_null, base_non_null) = self.check_file_handle_status(temp_table_name, &base_table_name).await?;
+        let (temp_non_null, base_non_null) = self
+            .check_file_handle_status(temp_table_name, &base_table_name, facts)
+            .await?;
 
         let strategy = JoinStrategy::from_file_handle_status(temp_non_null, base_non_null);
 
@@ -68,12 +72,13 @@ impl ClickHouseDatabase {
     /// 返回 (`temp_non_null`, `base_non_null`)：两表各自非 NULL `file_handle` 的数量，
     /// 用于决定 JOIN 策略（见 `JoinStrategy::from_file_handle_status`）。
     pub(super) async fn check_file_handle_status(
-        &self, temp_table_name: &str, base_table_name: &str,
+        &self, temp_table_name: &str, base_table_name: &str, facts: Option<CopyFactRange>,
     ) -> Result<(usize, usize)> {
+        let filter = facts.map_or_else(String::new, |range| format!(" WHERE {}", range.predicate()));
         let query = format!(
             "SELECT t.non_null, b.non_null \
              FROM (SELECT if(countIf(file_handle IS NOT NULL AND NOT startsWith(file_handle, '{PERSISTED_IDENTITY_PREFIX}')) = 0, count(file_handle), 0) AS non_null FROM {temp_table_name}) t \
-             CROSS JOIN (SELECT if(countIf(file_handle IS NOT NULL AND NOT startsWith(file_handle, '{PERSISTED_IDENTITY_PREFIX}')) = 0, count(file_handle), 0) AS non_null FROM {base_table_name}) b"
+             CROSS JOIN (SELECT if(countIf(file_handle IS NOT NULL AND NOT startsWith(file_handle, '{PERSISTED_IDENTITY_PREFIX}')) = 0, count(file_handle), 0) AS non_null FROM {base_table_name}{filter}) b"
         );
 
         debug!(
@@ -100,13 +105,13 @@ impl ClickHouseDatabase {
 
     /// 检测临时表中新增的文件（不存在于主表）
     pub async fn detect_new_items(&self) -> Result<Box<dyn Iterator<Item = ObservedEntry> + Send>> {
-        let copy_only = self.generation_lifecycle.lock().await.copy_generation.is_some();
         if self.is_copy_recovery().await {
             return records_to_entry_iter(self.copy_replay_items().await?);
         }
+        let facts = self.copy_fact_range().await?;
         let records = self
-            .detect_items("new", |temp_table, base_table, strategy| {
-                strategy.build_detect_new_sql(temp_table, base_table, copy_only)
+            .detect_items("new", facts, |temp_table, base_table, strategy| {
+                strategy.build_detect_new_sql(temp_table, base_table, facts)
             })
             .await?;
 
@@ -114,23 +119,23 @@ impl ClickHouseDatabase {
     }
 
     pub async fn detect_changed_items(&self) -> Result<Box<dyn Iterator<Item = (ObservedEntry, ChangeKind)> + Send>> {
-        let copy_only = self.generation_lifecycle.lock().await.copy_generation.is_some();
         if self.is_copy_recovery().await {
             return Ok(Box::new(std::iter::empty()));
         }
+        let facts = self.copy_fact_range().await?;
         // 分别查询三种变更（三类条件互斥），用 try_join! 并发执行以降低整体延迟
         let (data_only, metadata_only, both, marker_removed) = tokio::try_join!(
-            self.detect_items("changed(data)", |temp, base, strategy| {
-                strategy.build_detect_changed_sql(temp, base, ChangeKind::DataOnly, false, copy_only)
+            self.detect_items("changed(data)", facts, |temp, base, strategy| {
+                strategy.build_detect_changed_sql(temp, base, ChangeKind::DataOnly, false, facts)
             }),
-            self.detect_items("changed(meta)", |temp, base, strategy| {
-                strategy.build_detect_changed_sql(temp, base, ChangeKind::MetadataOnly, false, copy_only)
+            self.detect_items("changed(meta)", facts, |temp, base, strategy| {
+                strategy.build_detect_changed_sql(temp, base, ChangeKind::MetadataOnly, false, facts)
             }),
-            self.detect_items("changed(both)", |temp, base, strategy| {
-                strategy.build_detect_changed_sql(temp, base, ChangeKind::Both, false, copy_only)
+            self.detect_items("changed(both)", facts, |temp, base, strategy| {
+                strategy.build_detect_changed_sql(temp, base, ChangeKind::Both, false, facts)
             }),
-            self.detect_items("changed(marker removed)", |temp, base, strategy| {
-                strategy.build_detect_changed_sql(temp, base, ChangeKind::DirectoryMarkerRemoved, false, copy_only)
+            self.detect_items("changed(marker removed)", facts, |temp, base, strategy| {
+                strategy.build_detect_changed_sql(temp, base, ChangeKind::DirectoryMarkerRemoved, false, facts)
             }),
         )?;
 
