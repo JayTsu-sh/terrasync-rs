@@ -41,13 +41,25 @@ pub async fn copy_changes_cmd(job_id: &str, execution_id: &str, offset: u64, lim
     let page = incremental_copy_changes(job_id, execution_id, offset, limit)
         .await?
         .ok_or_else(|| CliError::InvalidParameter("incremental copy execution not found for this job".into()))?;
-    println!("Execution {} | {:?} | archived results", page.execution_id, page.phase);
+    println!(
+        "Execution {} | {:?} | target cleanup {:?} | archived results",
+        page.execution_id, page.phase, page.target_cleanup
+    );
     for count in page.counts {
         println!("{} {}", count.kind, count.count);
     }
     for change in page.changes {
         if let Some(previous_path) = change.previous_path {
             println!("{} {:?} -> {:?}", change.kind, previous_path, change.path);
+        } else if let (Some(source), Some(target)) = (change.source_presence, change.target_outcome) {
+            println!(
+                "{} {:?} source={} target={} {:?}",
+                change.kind,
+                change.path,
+                source,
+                target,
+                change.reason.unwrap_or_default()
+            );
         } else {
             println!("{} {:?}", change.kind, change.path);
         }

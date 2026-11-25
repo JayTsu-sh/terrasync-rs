@@ -589,6 +589,9 @@ impl IncrementalStats {
                     EntryChange::Changed(_) => self.changed.add(&progress),
                 }
             }
+            StorageEntryMessage::TargetDeletion { entry, outcome, .. } if outcome.confirms_absence() => {
+                self.deleted.add(entry.as_ref());
+            }
             StorageEntryMessage::Deleted(entry) => {
                 for view in ObservedView::all(entry) {
                     self.deleted.add(&view);

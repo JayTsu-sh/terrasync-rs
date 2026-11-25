@@ -15,7 +15,7 @@ pub use copy::{CopyCompletion, CopyReadiness, MetadataTargetVersion};
 pub use error::{Result, TaskModelError};
 pub use event::{ChangeKind, EntryChange, ErrorEvent, StorageEntryMessage};
 pub use facts::ObservedEntryExt;
-pub use retention::{RetentionScope, SourcePresence, TargetRetention, TargetRetentionReason};
+pub use retention::{RetentionScope, SourcePresence, TargetDeletionOutcome, TargetRetention, TargetRetentionReason};
 pub use source_cleanup::SourceCleanupPolicy;
 pub use transfer::TransferMode;
 

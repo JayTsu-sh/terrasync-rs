@@ -299,7 +299,10 @@ impl ProgressBar {
     /// 根据消息类型更新对应的原子计数器
     pub fn update_statistics(&self, message: &StorageEntryMessage) {
         let (entry, operation) = match message {
-            StorageEntryMessage::TargetPreserved { .. } => return,
+            StorageEntryMessage::TargetDeletion { entry, outcome, .. } if outcome.confirms_absence() => {
+                (entry, "deleted")
+            }
+            StorageEntryMessage::TargetPreserved { .. } | StorageEntryMessage::TargetDeletion { .. } => return,
             StorageEntryMessage::Scanned(entry) | StorageEntryMessage::Packaged(entry) => (entry, "scanned"),
             StorageEntryMessage::New(item) => {
                 if item.entry.history().is_some()

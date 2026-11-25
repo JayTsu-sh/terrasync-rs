@@ -2,7 +2,7 @@
 
 use clickhouse::Row;
 use serde::{Deserialize, Serialize};
-use task_model::migration::{CopyGenerationPhase, MigrationMode};
+use task_model::migration::{CopyGenerationPhase, MigrationMode, TargetCleanupPolicy};
 
 use super::ClickHouseDatabase;
 use crate::execution::read::QuorumRead;
@@ -15,6 +15,9 @@ pub struct CopyChange {
     pub kind: String,
     pub path: String,
     pub previous_path: Option<String>,
+    pub source_presence: Option<String>,
+    pub target_outcome: Option<String>,
+    pub reason: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Row, Serialize)]
@@ -27,6 +30,7 @@ pub struct CopyChangeCount {
 pub struct CopyChangePage {
     pub execution_id: String,
     pub phase: CopyGenerationPhase,
+    pub target_cleanup: TargetCleanupPolicy,
     pub counts: Vec<CopyChangeCount>,
     pub changes: Vec<CopyChange>,
     pub next_offset: Option<u64>,
@@ -47,6 +51,7 @@ impl ClickHouseDatabase {
         let mut page = CopyChangePage {
             execution_id: execution_id.to_owned(),
             phase: generation.phase,
+            target_cleanup: generation.plan.target_cleanup,
             counts: Vec::new(),
             changes: Vec::new(),
             next_offset: None,
@@ -58,10 +63,12 @@ impl ClickHouseDatabase {
         let table = self.catalogue_query_table(&table)?;
         // 按逻辑条目投影，重试写入同一个已完成变更时，计数和分页都只保留一次。
         let changes = format!(
-            "SELECT DISTINCT operation_type AS kind, relative_path AS path, if(operation_type='rename',comment,NULL) AS previous_path
+            "SELECT DISTINCT operation_type AS kind, relative_path AS path,
+                if(operation_type='rename',comment,NULL) AS previous_path, source_presence,
+                target_outcome, if(target_outcome IS NULL,NULL,comment) AS reason
              FROM {table}
              WHERE copy_execution_id=? AND is_regular_file AND operation_type IN
-             ('new','data_changed','metadata_changed','both_changed','rename')"
+             ('new','data_changed','metadata_changed','both_changed','rename','source_deleted','deletion_unconfirmed')"
         );
         page.counts = self
             .sync_client
@@ -74,7 +81,9 @@ impl ClickHouseDatabase {
         let limit = limit.clamp(1, MAX_PAGE_SIZE) as usize;
         page.changes = self
             .sync_client
-            .query(&format!("{changes} ORDER BY path,kind,previous_path LIMIT ? OFFSET ?"))
+            .query(&format!(
+                "{changes} ORDER BY path,kind,previous_path,source_presence,target_outcome,reason LIMIT ? OFFSET ?"
+            ))
             .bind(execution_id)
             .bind(limit + 1)
             .bind(offset)

@@ -78,7 +78,8 @@ async fn deletion_case(config: &ClickHouseConfig, present: bool, directory: bool
         .finish_copy_generation(CopyGenerationPhase::Completed, None)
         .await?;
     let database = database.new_execution_scope();
-    database.begin_copy_generation(&request("same", true)).await?;
+    let run = request("same", true);
+    database.begin_copy_generation(&run).await?;
     if !present {
         if known_child {
             std::fs::remove_file(source_root.path().join("entry/known"))?;
@@ -110,7 +111,15 @@ async fn deletion_case(config: &ClickHouseConfig, present: bool, directory: bool
     )
     .await;
     assert_eq!(result.is_ok(), present || !directory || known_child);
-    let messages: Vec<_> = std::iter::from_fn(|| received.try_recv().ok()).collect();
+    let messages: Vec<_> = std::iter::from_fn(|| received.try_recv().ok())
+        .filter_map(|message| match message {
+            StorageEntryMessage::TargetDeletion { entry, outcome, .. } if outcome.confirms_absence() => {
+                Some(StorageEntryMessage::Deleted(entry))
+            }
+            StorageEntryMessage::TargetDeletion { .. } => None,
+            message => Some(message),
+        })
+        .collect();
     if present {
         assert!(
             matches!(messages.as_slice(), [StorageEntryMessage::TargetPreserved { retention, .. }] if retention.source_presence == SourcePresence::Present)
@@ -131,6 +140,26 @@ async fn deletion_case(config: &ClickHouseConfig, present: bool, directory: bool
     }
     drop(events);
     writer.await??;
+    let page = database
+        .incremental_copy_changes(&run.execution_id, 0, 10)
+        .await?
+        .ok_or(DatabaseError::CopyExecutionUnavailable)?;
+    if !directory || known_child {
+        assert_eq!(page.changes.len(), 1);
+        let change = &page.changes[0];
+        assert_eq!(change.path, if known_child { "entry/known" } else { "entry" });
+        if present {
+            assert_eq!(change.kind, "deletion_unconfirmed");
+            assert_eq!(change.source_presence.as_deref(), Some("present"));
+            assert_eq!(change.target_outcome.as_deref(), Some("preserved"));
+        } else {
+            assert_eq!(change.kind, "source_deleted");
+            assert_eq!(change.source_presence.as_deref(), Some("absent"));
+            assert_eq!(change.target_outcome.as_deref(), Some("deleted"));
+        }
+    } else {
+        assert!(page.changes.is_empty());
+    }
     let retained = present || (directory && !known_child);
     assert_eq!(database.get_count("base").await?, u64::from(retained));
     assert_eq!(target_root.path().join("entry").exists(), retained);

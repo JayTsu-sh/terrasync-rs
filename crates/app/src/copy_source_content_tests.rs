@@ -86,14 +86,7 @@ async fn case(config: &ClickHouseConfig, deployment: &str, case: &str) -> Result
         }
     );
     assert_eq!(database.get_count("base").await?, 0);
-    let client = Client::default()
-        .with_url(&config.dsn)
-        .with_user("default")
-        .with_database(&config.database);
-    let raw = client.query(&format!("SELECT payload_json FROM notifications_{} FINAL WHERE kind=2 AND attempt_id=? ORDER BY sequence DESC LIMIT 1",command.job_id))
-        .bind(&generation.request.execution_id).fetch_one::<String>().await.map_err(DatabaseError::from)?;
-    let saved: FinalCallbackReport = serde_json::from_str(&raw)?;
-    let report: ProgressReport = serde_json::from_str(&saved.payload_json)?;
+    let report = final_report(config, &command.job_id, &generation.request.execution_id).await?;
     assert!(report.is_final && report.diagnostics_complete);
     assert_eq!(report.task_error_count, u64::from(damaged));
     assert_eq!(report.target_preserved_count, u64::from(damaged));
@@ -113,6 +106,111 @@ async fn case(config: &ClickHouseConfig, deployment: &str, case: &str) -> Result
     println!(
         "content migration deployment={deployment} case={case} generations=2 second_mode=incremental second_data_bytes=0 source_retained={damaged} base_empty=true final_report_saved=true"
     );
+    Ok(())
+}
+
+async fn final_report(config: &ClickHouseConfig, job: &str, execution_id: &str) -> Result<ProgressReport> {
+    let client = Client::default()
+        .with_url(&config.dsn)
+        .with_user("default")
+        .with_database(&config.database);
+    let raw = client
+        .query(&format!("SELECT payload_json FROM notifications_{job} FINAL WHERE kind=2 AND attempt_id=? ORDER BY sequence DESC LIMIT 1"))
+        .bind(execution_id)
+        .fetch_one::<String>()
+        .await
+        .map_err(DatabaseError::from)?;
+    let saved: FinalCallbackReport = serde_json::from_str(&raw)?;
+    Ok(serde_json::from_str(&saved.payload_json)?)
+}
+
+async fn incremental_reports_actual_bytes_and_paths(config: &ClickHouseConfig, deployment: &str) -> Result<()> {
+    let root = PathBuf::from(environment("LAB_COPY_CONTENT_ROOT")?).join(format!("{deployment}-bytes"));
+    let source = root.join("source");
+    let target = root.join("target");
+    std::fs::create_dir_all(&source)?;
+    std::fs::create_dir(&target)?;
+    for name in ["content", "metadata", "both", "removed", "already_absent"] {
+        std::fs::write(source.join(name), b"abc")?;
+        std::fs::set_permissions(source.join(name), Permissions::from_mode(0o640))?;
+    }
+    let mut command = job(&root.join("job"));
+    command.job_id = "content_bytes".into();
+    command.src_path = source.to_string_lossy().into_owned();
+    command.dest_path = target.to_string_lossy().into_owned();
+    command.progress_callback_url = Some(CallbackEndpoint::parse(&environment("LAB_COPY_CONTENT_CALLBACK")?)?);
+    command.concurrency = Some(2);
+    SyncOrchestrator::new_local(command.clone()).run().await?;
+    let database = ClickHouseDatabase::connect(config, &command.job_id).await?;
+    let first = database
+        .latest_copy_generation()
+        .await?
+        .ok_or(DatabaseError::CopyExecutionUnavailable)?;
+    let full = final_report(config, &command.job_id, &first.request.execution_id).await?;
+    assert!(matches!(
+        full.detail,
+        ProgressDetail::Full {
+            transferred_bytes: 15,
+            ..
+        }
+    ));
+
+    std::fs::write(source.join("added"), b"added")?;
+    std::fs::write(source.join("content"), b"content")?;
+    std::fs::write(source.join("both"), b"both")?;
+    for name in ["metadata", "both"] {
+        std::fs::set_permissions(source.join(name), Permissions::from_mode(0o600))?;
+    }
+    std::fs::remove_file(source.join("removed"))?;
+    std::fs::remove_file(source.join("already_absent"))?;
+    std::fs::remove_file(target.join("already_absent"))?;
+    SyncOrchestrator::new_local(command.clone()).run().await?;
+    let run = database
+        .latest_copy_generation()
+        .await?
+        .ok_or(DatabaseError::CopyExecutionUnavailable)?;
+    let report = final_report(config, &command.job_id, &run.request.execution_id).await?;
+    assert!(
+        matches!(
+            report.detail,
+            ProgressDetail::Incremental {
+                transferred_bytes: 16,
+                new_count: 1,
+                changed_count: 3,
+                deleted_count: 2,
+                ..
+            }
+        ),
+        "{:?}",
+        report.detail
+    );
+    assert_eq!(std::fs::read(target.join("content"))?, b"content");
+    assert_eq!(std::fs::read(target.join("metadata"))?, b"abc");
+    assert_eq!(
+        std::fs::metadata(target.join("metadata"))?.permissions().mode() & 0o777,
+        0o600
+    );
+    assert!(!target.join("removed").exists());
+    let page = database
+        .incremental_copy_changes(&run.request.execution_id, 0, 10)
+        .await?
+        .ok_or(DatabaseError::CopyExecutionUnavailable)?;
+    assert_eq!(
+        page.changes
+            .iter()
+            .map(|row| (row.path.as_str(), row.kind.as_str()))
+            .collect::<Vec<_>>(),
+        [
+            ("added", "new"),
+            ("already_absent", "source_deleted"),
+            ("both", "both_changed"),
+            ("content", "data_changed"),
+            ("metadata", "metadata_changed"),
+            ("removed", "source_deleted"),
+        ]
+    );
+    assert_eq!(page.changes[1].target_outcome.as_deref(), Some("already_absent"));
+    assert_eq!(page.changes[5].target_outcome.as_deref(), Some("deleted"));
     Ok(())
 }
 
@@ -152,10 +250,11 @@ async fn real_incremental_move_checks_existing_data_before_source_removal() -> R
             global.database.clickhouse = config.clone();
         })?;
         let result: Result<()> = async {
+            let deployment = if cluster { "cluster" } else { "single" };
             for name in ["unchanged", "corrupt", "metadata"] {
-                case(&config, if cluster { "cluster" } else { "single" }, name).await?;
+                case(&config, deployment, name).await?;
             }
-            Ok(())
+            incremental_reports_actual_bytes_and_paths(&config, deployment).await
         }
         .await;
         let cleanup = admin

@@ -243,6 +243,26 @@ impl Consumer for DatabaseConsumer {
                                 )
                                 .await;
                             }
+                            ref detail @ StorageEntryMessage::TargetDeletion { ref entry, outcome, .. } => {
+                                if outcome.confirms_absence() {
+                                    Self::batch_delete_base_record(
+                                        &db,
+                                        entry,
+                                        &mut current_delete_entry_batch,
+                                        batch_size,
+                                        &mut processed_errors,
+                                    )
+                                    .await;
+                                }
+                                Self::batch_insert_incremental_record(
+                                    &db,
+                                    detail,
+                                    &mut current_message_batch,
+                                    batch_size,
+                                    &mut processed_errors,
+                                )
+                                .await;
+                            }
                             StorageEntryMessage::IntegrityChecked(_)
                             | StorageEntryMessage::Packaged(_)
                             | StorageEntryMessage::CopyEntryCompleted { .. }

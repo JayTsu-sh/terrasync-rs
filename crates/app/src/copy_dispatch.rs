@@ -34,6 +34,7 @@ impl CopyQueues {
             | StorageEntryMessage::CopyEntryCompleted { entry, .. }
             | StorageEntryMessage::CopyEntryDeltaCompleted { entry, .. }
             | StorageEntryMessage::Packaged(entry)
+            | StorageEntryMessage::TargetDeletion { entry, .. }
             | StorageEntryMessage::Deleted(entry)
             | StorageEntryMessage::IntegrityChecked(entry) => entry.path().as_str().hash(&mut hash),
             StorageEntryMessage::CopyItemCompleted { completion, .. } => {

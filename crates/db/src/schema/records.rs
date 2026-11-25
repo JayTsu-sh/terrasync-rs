@@ -6,8 +6,9 @@ use std::{collections::BTreeMap, path::Path, sync::Arc, time::SystemTime};
 
 use data_mover::model::{BackendIdentity, BackendKind};
 use serde::{Deserialize, Serialize};
+use task_model::diagnostics::safe_diagnostic_text;
 use task_model::observation::{ObservedItem, ObservedView};
-use task_model::{CopyCompletion, CopyReadiness};
+use task_model::{CopyCompletion, CopyReadiness, SourcePresence, TargetDeletionOutcome};
 use {
     data_mover::model::ObservedEntry,
     task_model::{ObservedEntryExt, StorageEntryMessage},
@@ -215,6 +216,8 @@ fn decode_observation(relative_path: &str, snapshot: &[u8], backend: &BackendIde
 #[derive(Debug, Clone, Serialize, Deserialize, clickhouse::Row)]
 pub(crate) struct IncrementalStorageEntryRecord {
     pub copy_execution_id: String,
+    pub source_presence: Option<String>,
+    pub target_outcome: Option<String>,
     /// 操作类型：new, changed, deleted, rename
     pub operation_type: String,
     /// 文件或目录的名称
@@ -294,6 +297,39 @@ impl IncrementalStorageEntryRecord {
                 return Ok(vec![incremental_record(row, kind.as_state_str(), None, now)]);
             }
             StorageEntryMessage::Deleted(entry) => (entry, "deleted", None),
+            StorageEntryMessage::TargetDeletion {
+                entry,
+                source,
+                outcome,
+                reason,
+            } => {
+                let operation = if *source == SourcePresence::Absent {
+                    "source_deleted"
+                } else {
+                    "deletion_unconfirmed"
+                };
+                let mut rows = Self::observed_rows(entry, operation, reason.as_deref().map(safe_diagnostic_text), now)?;
+                for row in &mut rows {
+                    row.source_presence = Some(
+                        match source {
+                            SourcePresence::Unknown => "unverified",
+                            SourcePresence::Present => "present",
+                            SourcePresence::Absent => "absent",
+                        }
+                        .into(),
+                    );
+                    row.target_outcome = Some(
+                        match outcome {
+                            TargetDeletionOutcome::Deleted => "deleted",
+                            TargetDeletionOutcome::AlreadyAbsent => "already_absent",
+                            TargetDeletionOutcome::Preserved => "preserved",
+                            TargetDeletionOutcome::Failed => "failed",
+                        }
+                        .into(),
+                    );
+                }
+                return Ok(rows);
+            }
             StorageEntryMessage::IntegrityChecked(entry) => (entry, "integrity_checked", None),
             StorageEntryMessage::Renamed((from, to)) => (to, "rename", Some(from.path().as_str().to_owned())),
             StorageEntryMessage::Error {
