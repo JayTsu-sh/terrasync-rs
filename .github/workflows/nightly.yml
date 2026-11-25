@@ -77,3 +77,29 @@ jobs:
       - name: Cleanup
         if: always()
         run: tests/lab/cleanup-run.sh "$RUN_ID"
+
+  copy-takeover:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@1.95.0
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release --locked --bin terrasync
+      - name: Multi-shard ClickHouse copy takeover
+        env:
+          TAKEOVER_RESULTS: ${{ runner.temp }}/terrasync-copy-takeover
+        shell: bash
+        run: |
+          mkdir -p "$TAKEOVER_RESULTS"
+          sudo -n env LAB_TERRASYNC_BIN="$GITHUB_WORKSPACE/target/release/terrasync" \
+            LAB_TAKEOVER_LOG_DIR="$TAKEOVER_RESULTS/processes" \
+            python3 tests/lab/run-notification-archive-local.py --multi-shard --copy-takeover \
+            2>&1 | tee "$TAKEOVER_RESULTS/run.log"
+      - name: Upload copy takeover evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: copy-takeover-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/terrasync-copy-takeover
+          if-no-files-found: warn

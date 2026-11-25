@@ -751,6 +751,8 @@ HTTP 204 callback 核验具体原因，数据库核验失败／成功代次、�
 
 跨进程接管通过实际 CLI 验证，使用 `LAB_TERRASYNC_BIN` 指向本次构建的二进制，使用
 `LAB_TAKEOVER_LOG_DIR` 指定一个尚不存在的子目录保存各进程日志。
+需要 Linux Docker 及进入容器网络命名空间的权限（`nsenter`）。nightly 的 `copy-takeover` 作业在独立的
+GitHub 托管 runner 上构建 release CLI 并运行此测试，上传包含总日志及逐进程日志的 `copy-takeover-*` 产物。
 
 ```sh
 cargo build --locked --bin terrasync
