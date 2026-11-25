@@ -26,7 +26,7 @@ use uuid::Uuid;
 use super::tests::job;
 use crate::callback::CallbackEndpoint;
 use crate::config::SyncJobConfig;
-use crate::consumer::stats::{ProgressReport, delivery::FinalCallbackReport};
+use crate::consumer::stats::{ProgressDetail, ProgressReport, delivery::FinalCallbackReport};
 use crate::error::{AppError, Result};
 use crate::orchestrator::SyncOrchestrator;
 
@@ -82,19 +82,25 @@ pub(super) async fn check_report(config: &ClickHouseConfig, command: &SyncJobCon
         }
     );
     assert_eq!(database.get_count("base").await?, 0);
-    let client = Client::default()
-        .with_url(&config.dsn)
-        .with_user("default")
-        .with_database(&config.database);
-    let raw = client.query(&format!("SELECT payload_json FROM notifications_{} FINAL WHERE kind=2 AND attempt_id=? ORDER BY sequence DESC LIMIT 1",command.job_id))
-        .bind(&generation.request.execution_id).fetch_one::<String>().await.map_err(DatabaseError::from)?;
-    let saved: FinalCallbackReport = serde_json::from_str(&raw)?;
-    let report: ProgressReport = serde_json::from_str(&saved.payload_json)?;
+    let report = saved_report(config, command, &generation.request.execution_id).await?;
     assert!(report.is_final && report.diagnostics_complete);
     if command.job_id.ends_with("reject") {
         assert_eq!(report.task_error_count, 1);
     }
     Ok(())
+}
+
+async fn saved_report(
+    config: &ClickHouseConfig, command: &SyncJobConfig, execution_id: &str,
+) -> Result<ProgressReport> {
+    let client = Client::default()
+        .with_url(&config.dsn)
+        .with_user("default")
+        .with_database(&config.database);
+    let raw = client.query(&format!("SELECT payload_json FROM notifications_{} FINAL WHERE kind=2 AND attempt_id=? ORDER BY sequence DESC LIMIT 1",command.job_id))
+        .bind(execution_id).fetch_one::<String>().await.map_err(DatabaseError::from)?;
+    let saved: FinalCallbackReport = serde_json::from_str(&raw)?;
+    Ok(serde_json::from_str(&saved.payload_json)?)
 }
 
 async fn case(config: &ClickHouseConfig, deployment: &str, name: &str) -> Result<()> {
@@ -169,6 +175,106 @@ async fn case(config: &ClickHouseConfig, deployment: &str, name: &str) -> Result
     }
     control(&format!("finish/{deployment}/{name}")).await?;
     println!("ready cleanup deployment={deployment} case={name} full=true final_report_saved=true base_empty=true");
+    Ok(())
+}
+
+async fn incremental_case(config: &ClickHouseConfig, deployment: &str, name: &str) -> Result<()> {
+    let root = PathBuf::from(environment("LAB_READY_ROOT")?).join(format!("{deployment}-{name}"));
+    let source = root.join("source");
+    let target = root.join("target");
+    std::fs::create_dir_all(&source)?;
+    std::fs::create_dir(&target)?;
+    std::fs::write(source.join("a"), b"old content")?;
+    std::fs::write(source.join("previous"), b"unchanged")?;
+
+    let mut migration = command(&root, deployment, name)?;
+    migration.enable_integrity_check = true;
+    let baseline = SyncJobConfig {
+        source_cleanup: SourceCleanupPolicy::Retain,
+        ..migration.clone()
+    };
+    SyncOrchestrator::new_local(baseline).run().await?;
+    std::fs::write(source.join("a"), BODY)?;
+    std::fs::write(source.join("b"), BODY)?;
+
+    let mut active_config = config.clone();
+    if name == "incremental_stall" {
+        active_config.read_timeout = 1;
+        AppConfig::override_with(|global| global.database.clickhouse = active_config)?;
+    }
+    control(&format!("arm/{deployment}/{name}")).await?;
+    let result = timeout(
+        Duration::from_secs(40),
+        SyncOrchestrator::new_local(migration.clone()).run(),
+    )
+    .await;
+    if name == "incremental_stall" {
+        AppConfig::override_with(|global| global.database.clickhouse = config.clone())?;
+    }
+    let result = result.map_err(|_| AppError::ConfigError("owned incremental cleanup job timed out".into()))?;
+    let failed = matches!(
+        name,
+        "incremental_reject" | "incremental_disconnect" | "incremental_stall"
+    );
+    if name == "incremental_reject" {
+        assert!(
+            result
+                .as_ref()
+                .is_err_and(|error| error.to_string().contains("owned ready fact rejection")),
+            "{result:?}"
+        );
+    } else if failed {
+        assert!(
+            result
+                .as_ref()
+                .is_err_and(|error| error.to_string().contains("ClickHouse unavailable after")),
+            "{result:?}"
+        );
+    } else {
+        result?;
+    }
+    control(&format!("finish/{deployment}/{name}")).await?;
+    for path in ["a", "b"] {
+        assert!(!source.join(path).exists(), "{path} was retained after publication");
+        assert_eq!(std::fs::read(target.join(path))?, BODY);
+    }
+    assert_eq!(source.join("previous").exists(), failed);
+    assert_eq!(std::fs::read(target.join("previous"))?, b"unchanged");
+
+    let database = ClickHouseDatabase::connect(config, &migration.job_id).await?;
+    let generation = database
+        .latest_copy_generation()
+        .await?
+        .ok_or_else(|| AppError::ConfigError("incremental generation missing".into()))?;
+    assert_eq!(generation.sequence, 2);
+    assert_eq!(generation.plan.mode, MigrationMode::Incremental);
+    assert_eq!(
+        generation.phase,
+        if failed {
+            CopyGenerationPhase::Failed
+        } else {
+            CopyGenerationPhase::Completed
+        }
+    );
+    if !failed {
+        assert_eq!(database.get_count("base").await?, 0);
+    }
+    let report = saved_report(config, &migration, &generation.request.execution_id).await?;
+    assert!(report.is_final && report.diagnostics_complete);
+    assert_eq!(report.task_error_count, u64::from(failed));
+    assert!(
+        matches!(
+            report.detail,
+            ProgressDetail::Incremental { new_count: 1, changed_count: 1, transferred_bytes, .. }
+                if transferred_bytes == (BODY.len() * 2) as u64
+        ),
+        "{:?}",
+        report.detail
+    );
+    println!(
+        "ready cleanup deployment={deployment} case={name} incremental=true phase={:?}",
+        generation.phase
+    );
     Ok(())
 }
 
@@ -265,8 +371,18 @@ async fn real_full_move_ready_window_does_not_wait_for_fact_receipts() -> Result
             global.database.clickhouse = config.clone();
         })?;
         let result: Result<()> = async {
+            let deployment = if cluster { "cluster" } else { "single" };
             for name in ["success", "reject", "directory", "fallback", "data", "metadata"] {
-                case(&config, if cluster { "cluster" } else { "single" }, name).await?;
+                case(&config, deployment, name).await?;
+            }
+            for name in [
+                "incremental_success",
+                "incremental_reject",
+                "incremental_lost",
+                "incremental_disconnect",
+                "incremental_stall",
+            ] {
+                incremental_case(&config, deployment, name).await?;
             }
             Ok(())
         }

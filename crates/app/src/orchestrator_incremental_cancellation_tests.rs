@@ -77,6 +77,7 @@ async fn worker() -> TestResult<Worker> {
             completion: HistoryCompletion::Incremental,
             recovering: false,
         },
+        None,
     )
     .await;
     let task = tasks.pop().ok_or("worker was not created")?;

@@ -7,6 +7,7 @@ use crate::{
     error::{AppError, Result, StorageError},
     file_copy::CopyOptions,
     file_copy::selection::SkipTracker,
+    source_cleanup::CleanupConnections,
     sync::{ResumeOpts, process_entry, process_metadata_only_entry},
     tar_pack,
     task_stream::AsyncReceiver,
@@ -28,7 +29,7 @@ mod cancellation_tests;
 pub(super) async fn spawn_handlers(
     c: &SyncJobConfig, handler_inputs: Vec<AsyncReceiver<StorageEntryMessage>>,
     broadcaster: BroadcastForwarder<StorageEntryMessage>, options: CopyOptions, block_size: Option<usize>,
-    history_policy: HistoryCopyPolicy,
+    history_policy: HistoryCopyPolicy, cleanup_connections: Option<CleanupConnections>,
 ) -> Vec<JoinHandle<Result<()>>> {
     let copy_concurrency = handler_inputs.len();
     let is_source_reserved = c.source_cleanup.retains_source();
@@ -61,6 +62,7 @@ pub(super) async fn spawn_handlers(
         let mount_sem = mount_semaphore.clone();
         let alive_counter = alive_handlers.clone();
         let done_counter = mount_done_handlers.clone();
+        let cleanup_connections = cleanup_connections.clone();
 
         let span = info_span!("inc_handler_worker", handler_id);
         let handle = tokio::spawn(
@@ -90,6 +92,9 @@ pub(super) async fn spawn_handlers(
                 done_counter.fetch_add(1, Ordering::Release);
                 let src = storage_pair.get_src_storage().clone();
                 let dest = storage_pair.get_dest_storage().clone();
+                if let Some(connections) = cleanup_connections {
+                    let _ = connections.set((src.clone(), dest.clone()));
+                }
 
                 let mut failure: Option<AppError> = None;
                 let mut skipped = SkipTracker::default();

@@ -11,6 +11,7 @@ use std::{
 use data_mover::model::BackendKind;
 use data_mover::storage::NamespaceReadPolicy;
 use db::ClickHouseDatabase;
+use task_model::migration::MigrationMode;
 use tokio::sync::Semaphore;
 use tracing::{Instrument, error, info, info_span};
 use utils::app_config::AppConfig;
@@ -33,7 +34,7 @@ use crate::migration_plan::MigrationPlan;
 use crate::receiver::{LocalCopyExecutor, LocalCopyReceiver, ReceiverConfig};
 use crate::scan::ScanType;
 use crate::sender::{SenderWorkerConfig, sender_worker};
-use crate::source_cleanup::{FullCleanupStage, SourceCleanupCheck, finish_with_ready_cleanup};
+use crate::source_cleanup::{ReadyCleanupStage, SourceCleanupCheck, finish_with_ready_cleanup};
 #[cfg(windows)]
 use crate::storage_factory::backend_kind_from_location;
 use crate::storage_factory::{StorageRole, create_storage_for_role};
@@ -193,7 +194,12 @@ impl SyncOrchestrator {
                     .copy_database_execution()
                     .map(|execution| (cleanup_check.clone(), execution))
             };
-            Some(FullCleanupStage::start(&mut broadcaster, copy_concurrency, streaming))
+            Some(ReadyCleanupStage::start(
+                &mut broadcaster,
+                copy_concurrency,
+                MigrationMode::Full,
+                streaming,
+            ))
         } else {
             None
         };
@@ -362,8 +368,8 @@ impl SyncOrchestrator {
                 let alive_counter = alive_receivers.clone();
                 let done_counter = mount_done_receivers.clone();
                 let execution = consumer_manager.copy_database_execution();
-                let cleanup_connections = early_cleanup.as_ref().map(FullCleanupStage::connections);
-                let ready_files = early_cleanup.as_ref().and_then(FullCleanupStage::ready_files);
+                let cleanup_connections = early_cleanup.as_ref().map(ReadyCleanupStage::connections);
+                let ready_files = early_cleanup.as_ref().and_then(ReadyCleanupStage::ready_files);
 
                 let span = info_span!("receiver_worker", recv_id = recv_id);
                 let handle = tokio::spawn(

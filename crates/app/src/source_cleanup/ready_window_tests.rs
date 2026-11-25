@@ -6,10 +6,10 @@ use data_mover::model::{
     BackendKind, EntryKind, ExtendedAttribute, MetadataObservation, MetadataObservationParts, MetadataProvenance,
     ObservedEntry,
 };
-use task_model::StorageEntryMessage;
+use task_model::{ChangeKind, StorageEntryMessage, migration::MigrationMode};
 use tokio_util::sync::CancellationToken;
 
-use super::{FullCleanupStage, MAX_BYTES, MAX_ENTRIES, ReadyWindow, observation_weight};
+use super::{MAX_BYTES, MAX_ENTRIES, ReadyCleanupStage, ReadyWindow, observation_weight};
 use crate::broadcast::BroadcastForwarder;
 use crate::error::{AppError, CopyStep, Result, StorageError};
 use crate::file_copy::{CopyOptions, copy_file};
@@ -26,7 +26,7 @@ fn entry(path: &str, kind: EntryKind) -> Arc<ObservedEntry> {
         0,
         [0; 3],
         None,
-        None,
+        path.is_empty().then(|| b"root".to_vec()),
         None,
         None,
     ))
@@ -38,7 +38,7 @@ fn check() -> SourceCleanupCheck {
 
 #[test]
 fn retained_entries_are_bounded_and_only_ready_events_are_used() {
-    let mut tail = ReadyWindow::new(3);
+    let mut tail = ReadyWindow::new(3, MigrationMode::Full);
     let first = entry("first", EntryKind::File);
     let weak = Arc::downgrade(&first);
     tail.observe(StorageEntryMessage::New(first.into()));
@@ -56,8 +56,8 @@ fn retained_entries_are_bounded_and_only_ready_events_are_used() {
         ["first", "a", "b"]
     );
     assert_eq!(tail.attempts, 3);
-    assert_eq!(ReadyWindow::new(usize::MAX).limit, MAX_ENTRIES);
-    assert_eq!(ReadyWindow::new(0).limit, 1);
+    assert_eq!(ReadyWindow::new(usize::MAX, MigrationMode::Full).limit, MAX_ENTRIES);
+    assert_eq!(ReadyWindow::new(0, MigrationMode::Full).limit, 1);
 }
 
 #[test]
@@ -70,12 +70,41 @@ fn directory_or_history_boundary_disables_the_entire_early_phase() {
         },
     ] {
         // 目录或历史项即使排在已满窗口之后，仍须阻止提前清理。
-        let mut tail = ReadyWindow::new(1);
+        let mut tail = ReadyWindow::new(1, MigrationMode::Full);
         tail.observe(StorageEntryMessage::New(entry("before", EntryKind::File).into()));
         tail.observe(boundary);
         tail.observe(StorageEntryMessage::New(entry("after", EntryKind::File).into()));
         assert!(tail.disabled && tail.entries.is_empty() && tail.bytes == 0);
     }
+}
+
+#[test]
+fn incremental_window_admits_new_data_and_defers_existing_data_and_subdirectories() {
+    let mut window = ReadyWindow::new(4, MigrationMode::Incremental);
+    window.observe(StorageEntryMessage::Scanned(entry("", EntryKind::Directory)));
+    window.observe(StorageEntryMessage::Scanned(entry("unchanged", EntryKind::File)));
+    window.observe(StorageEntryMessage::Changed {
+        entry: entry("metadata", EntryKind::File).into(),
+        kind: ChangeKind::MetadataOnly,
+    });
+    window.observe(StorageEntryMessage::New(entry("new", EntryKind::File).into()));
+    window.observe(StorageEntryMessage::Changed {
+        entry: entry("changed", EntryKind::File).into(),
+        kind: ChangeKind::Both,
+    });
+    assert_eq!(
+        window
+            .entries
+            .iter()
+            .map(|(entry, _)| entry.path().as_str())
+            .collect::<Vec<_>>(),
+        ["new", "changed"]
+    );
+    window.observe(StorageEntryMessage::Scanned(entry(
+        "unchanged-dir",
+        EntryKind::Directory,
+    )));
+    assert!(window.disabled && window.entries.is_empty());
 }
 
 fn large_entry(path: &str, payload_bytes: usize) -> Arc<ObservedEntry> {
@@ -93,7 +122,7 @@ fn large_entry(path: &str, payload_bytes: usize) -> Arc<ObservedEntry> {
 
 #[test]
 fn metadata_byte_admission_keeps_a_bounded_window_and_rejects_an_oversized_fact() {
-    let mut tail = ReadyWindow::new(64);
+    let mut tail = ReadyWindow::new(64, MigrationMode::Full);
     let first = large_entry("first", 1024 * 1024);
     let second = large_entry("second", 1024 * 1024);
     assert!(observation_weight(&first).unwrap() > MAX_BYTES / 2);
@@ -144,7 +173,7 @@ async fn cleanup_runs_only_after_full_copy_gate_and_does_not_require_a_database(
         let item = Arc::new(observe_path(source.storage(), Path::new("file")).await?);
         copy_file(&source, &target, &item, CopyOptions::default(), None).await?;
         let mut broadcaster = BroadcastForwarder::new(2);
-        let stage = FullCleanupStage::start(&mut broadcaster, 2, None);
+        let stage = ReadyCleanupStage::start(&mut broadcaster, 2, MigrationMode::Full, None);
         assert!(stage.connections().set((source, target)).is_ok());
         broadcaster.broadcast(StorageEntryMessage::New(item.into())).await?;
         assert!(source_root.path().join("file").exists());
@@ -166,7 +195,7 @@ async fn first_target_failure_stops_new_deletions_and_preserves_each_source() ->
     let target =
         Arc::new(create_storage(&target_root.path().to_string_lossy(), CreateStorageOptions::default()).await?);
     let mut broadcaster = BroadcastForwarder::new(2);
-    let stage = FullCleanupStage::start(&mut broadcaster, 2, None);
+    let stage = ReadyCleanupStage::start(&mut broadcaster, 2, MigrationMode::Full, None);
     assert!(stage.connections().set((source.clone(), target.clone())).is_ok());
     for name in ["a", "b"] {
         std::fs::write(source_root.path().join(name), b"verified")?;
@@ -240,7 +269,7 @@ async fn early_file_cleanup_finishes_root_metadata_once_without_a_database_recei
     let entry = Arc::new(observe_path(source.storage(), Path::new("file")).await?);
     copy_file(&source, &target, &entry, CopyOptions::default(), None).await?;
     let mut broadcaster = BroadcastForwarder::new(2);
-    let stage = FullCleanupStage::start(&mut broadcaster, 2, None);
+    let stage = ReadyCleanupStage::start(&mut broadcaster, 2, MigrationMode::Full, None);
     assert!(stage.connections().set((source, target.clone())).is_ok());
     broadcaster.broadcast(StorageEntryMessage::New(entry.into())).await?;
     drop(broadcaster);

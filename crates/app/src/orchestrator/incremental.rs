@@ -7,7 +7,7 @@ use data_mover::model::BackendKind;
 use data_mover::storage::NamespaceReadPolicy;
 use db::{ClickHouseDatabase, INCREMENTAL_SCAN_TABLE_BASE_NAME};
 use task_model::StorageEntryMessage;
-use task_model::migration::TargetCleanupPolicy;
+use task_model::migration::{MigrationMode, TargetCleanupPolicy};
 use tokio::task::JoinHandle;
 use tracing::{Instrument, error, info, info_span, trace};
 use utils::app_config::AppConfig;
@@ -27,7 +27,7 @@ use crate::file_copy::CopyOptions;
 use crate::integrity_check::verify_storage_time;
 use crate::migration_plan::MigrationPlan;
 use crate::scan::ScanType;
-use crate::source_cleanup::SourceCleanupCheck;
+use crate::source_cleanup::{ReadyCleanupStage, SourceCleanupCheck, finish_with_ready_cleanup};
 #[cfg(windows)]
 use crate::storage_factory::backend_kind_from_location;
 use crate::storage_factory::{StorageContext, StorageRole, create_storage_for_role};
@@ -136,6 +136,17 @@ impl SyncOrchestrator {
         // ── 4.1. Phase A 广播器 + 消费者任务 ──
         let mut broadcaster = BroadcastForwarder::new(DEFAULT_CHANNEL_CAPACITY);
         let consumer_handles = consumer_manager.start_consumers(&mut broadcaster).await?;
+        let cleanup_check = SourceCleanupCheck::new(
+            Duration::from_secs(app_config.scan.operation_timeout_secs),
+            Duration::from_secs(app_config.scan.recovery_window_secs),
+            consumer_manager
+                .copy_database_execution()
+                .map(|execution| execution.token().clone())
+                .unwrap_or_default(),
+        )
+        .with_content_verification(c.enable_integrity_check);
+        let early_cleanup = (!is_source_reserved && !c.packaged && c.file_list.is_none())
+            .then(|| ReadyCleanupStage::start(&mut broadcaster, copy_concurrency, MigrationMode::Incremental, None));
 
         // ── 5. 检测广播器 + MPMC 通道 ──
         // scan workers → detect_broadcaster → dispatch_task → async_channel(MPMC) → N handler workers → broadcaster
@@ -209,6 +220,7 @@ impl SyncOrchestrator {
                 completion: HistoryCompletion::Incremental,
                 recovering: database.copy_generation_recovering().await,
             },
+            early_cleanup.as_ref().map(ReadyCleanupStage::connections),
         )
         .await;
 
@@ -321,9 +333,8 @@ impl SyncOrchestrator {
         // 主 broadcaster clone drop → 消费者通道 EOF → DatabaseConsumer 刷入所有
         // Phase A 的 New/Changed 条目 → base 表完整，detect_deleted_items 才有完整依据。
         drop(broadcaster);
-        let durable_result = finish_phase(consumer_handles).await;
         let enumeration_result = walkdir_iter.take_error().map_or(Ok(()), |error| Err(error.into()));
-        // 未完整比对或未持久化的条目不能作为删除依据。
+        // 目标删除和重命名仍依赖完整比较及持久化。就绪窗口只处理本轮已复制的源端文件。
         // 元数据读取诊断已随观察交付；优先返回 worker 已计数的同项失败，避免再记任务错误。
         let (enumeration_result, handler_result) =
             if matches!(
@@ -335,18 +346,28 @@ impl SyncOrchestrator {
             } else {
                 (enumeration_result, handler_result)
             };
-        let phase_a = durable_result
-            .and(enumeration_result)
+        let phase_a = enumeration_result
             .and(scan_result)
             .and(handler_result)
             .and(dispatch_result)
             .and(scan_dispatch_result);
-        if let Err(error) = phase_a {
-            if let Some(ref qos_mgr) = qos_manager {
-                qos_mgr.shutdown();
+        let early = match finish_with_ready_cleanup(
+            consumer_handles,
+            phase_a,
+            early_cleanup,
+            cleanup_check.clone(),
+            root_metadata,
+        )
+        .await
+        {
+            Ok(completed) => completed,
+            Err(error) => {
+                if let Some(ref qos_mgr) = qos_manager {
+                    qos_mgr.shutdown();
+                }
+                return Err(error);
             }
-            return Err(error);
-        }
+        };
         info!("Phase A complete; base table ready for delete/rename detection");
 
         // ── 19. Phase B：在 Phase A 屏障之后，起一轮新的 broadcaster + 同一组 consumer 任务 ──
@@ -410,17 +431,9 @@ impl SyncOrchestrator {
             phase_b_consumers?;
             // 增量跳过项由清理阶段补齐所选的数据校验。
             let cleanup = (!is_source_reserved).then(|| RemainingSourceCleanup {
-                source: None,
+                source: early.connections.map(|(source, _)| source),
                 block_size,
-                check: SourceCleanupCheck::new(
-                    Duration::from_secs(app_config.scan.operation_timeout_secs),
-                    Duration::from_secs(app_config.scan.recovery_window_secs),
-                    consumer_manager
-                        .copy_database_execution()
-                        .map(|execution| execution.token().clone())
-                        .unwrap_or_default(),
-                )
-                .with_content_verification(c.enable_integrity_check),
+                check: cleanup_check.with_prechecked(early.checked, early.streamed_files),
             });
             self.complete_persisted(&database, destination, consumer_manager, root_metadata, cleanup)
                 .await?;
