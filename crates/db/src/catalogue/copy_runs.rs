@@ -50,12 +50,12 @@ impl ClickHouseDatabase {
         }
         let table = self.catalogue_query_table(&table)?;
         let filter = if execution_id.is_some() {
-            "WHERE execution_id=?"
+            " WHERE execution_id=?"
         } else {
             ""
         };
         let sql = format!(
-            "SELECT sequence,execution_id,revision,descriptor,hex(root_snapshot) AS root_snapshot FROM {table} FINAL {filter} ORDER BY sequence DESC LIMIT 1"
+            "SELECT sequence,execution_id,revision,descriptor,hex(root_snapshot) AS root_snapshot FROM {table} FINAL{filter} ORDER BY sequence DESC LIMIT 1"
         );
         let query = self.sync_client.query(&sql);
         let query = match execution_id {
