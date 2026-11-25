@@ -258,8 +258,11 @@ async fn versioned_state_read_faults(fixture: &Fixture, copying: bool) -> Result
         let result = result.map_err(|_| DatabaseError::ConfigError("versioned state read exceeded deadline".into()))?;
         let recovered = fault == "state_read_flash";
         if !recovered {
+            // 代理静默时，关闭在途连接没有服务端的终止确认。
             assert!(
-                matches!(&result, Err(error) if error.is_confirmed_scan_cancellation() || error.is_transient_connectivity_failure()),
+                matches!(&result, Err(error) if error.is_confirmed_scan_cancellation()
+                    || error.is_transient_connectivity_failure()
+                    || matches!(error, DatabaseError::ScanTerminationUnconfirmed { .. })),
                 "{result:?}"
             );
         }
