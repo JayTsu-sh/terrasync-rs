@@ -19,11 +19,12 @@ use tracing::error;
 use super::SyncOrchestrator;
 use crate::broadcast::BroadcastForwarder;
 use crate::error::{AppError, Result};
+use crate::file_copy::local::CommitRecorder;
 use crate::file_copy::{CopyOptions, HdfsCopyContext, copy_file};
 use crate::file_copy::{metadata as copy_metadata, namespace as copy_namespace};
 use crate::rename::{RenameOptions, RenameOutcome, rename_or_copy};
 use crate::storage_factory::StorageContext;
-use crate::sync::{CommitRecorder, ResumeOpts, process_entry};
+use crate::sync::{ResumeOpts, process_entry};
 use crate::target_absence::{SourceAbsenceCheck, preserve};
 
 impl SyncOrchestrator {

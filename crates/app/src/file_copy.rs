@@ -23,6 +23,7 @@ use data_mover::model::ObservedEntry;
 
 use crate::error::{AppError, Result, StorageError};
 
+pub(crate) mod local;
 pub(crate) mod metadata;
 #[cfg(test)]
 #[path = "file_copy/metadata_copy_tests.rs"]

@@ -1,10 +1,10 @@
 //! 单进程复制，负责从源存储读取并写入目标存储。
 
+use crate::file_copy::local::copy_file_for_job;
 use crate::file_copy::namespace as copy_namespace;
-use data_mover::model::BackendKind;
 // 标准库
 use crate::error::StorageError;
-use crate::file_copy::{CopiedPublication, CopyOptions, HdfsCopyContext, copy_file, prepare_directory};
+use crate::file_copy::{CopiedPublication, CopyOptions, prepare_directory};
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 use task_model::ObservedEntryExt;
@@ -19,7 +19,6 @@ use tracing::{Instrument, info_span};
 
 // 内部模块
 use crate::error::{AppError, CopyStep, Result};
-use crate::sync::{CommitRecorder, ResumeOpts, copy_file_with_resume, should_resume};
 
 mod in_process;
 pub(crate) use in_process::{
@@ -68,77 +67,22 @@ pub(crate) async fn process_entry_on_receiver(
                 .map_err(|e| AppError::copy_entry_failure(CopyStep::CreateDestinationLink, relative_path, e))?;
             Ok(None)
         } else {
-            // 所有文件使用同一显式策略；检查点及原子发布由上游管理。
-            let resume = ResumeOpts {
-                job_id: config.job_id.clone(),
-                job_dir: config.job_dir.clone(),
-                transfer_mode: config.transfer_mode,
-                cancel: config.cancel.clone(),
-            };
-            let published = if dest_storage.as_ref().storage().kind() == BackendKind::Hdfs {
-                let hdfs = HdfsCopyContext::from_job(&config.job_id, config.transfer_mode)?;
-                let recorder = if config.transfer_mode == TransferMode::Checkpoint {
-                    Some(CommitRecorder::start(&config.job_dir, entry, src_storage.block_size()).await?)
-                } else {
-                    None
-                };
-                let hdfs = recorder
-                    .as_ref()
-                    .map_or(hdfs.clone(), |recorder| hdfs.with_commit_callback(recorder.callback()));
-                let result = copy_file(
-                    src_storage,
-                    dest_storage,
-                    entry,
-                    CopyOptions {
-                        transfer_mode: config.transfer_mode,
-                        qos: qos_manager,
-                        enable_integrity_check: config.enable_integrity_check,
-                        bytes_counter,
-                        cancel: config.cancel.clone(),
-                    },
-                    Some(&hdfs),
-                )
-                .await;
-                if let Some(recorder) = recorder {
-                    recorder.finish(result).await?
-                } else {
-                    result?
-                }
-            } else if should_resume(&resume, entry, src_storage, dest_storage) {
-                copy_file_with_resume(
-                    entry,
-                    src_storage,
-                    dest_storage,
-                    CopyOptions {
-                        transfer_mode: config.transfer_mode,
-                        qos: qos_manager,
-                        enable_integrity_check: config.enable_integrity_check,
-                        bytes_counter,
-                        cancel: config.cancel.clone(),
-                    },
-                    &config.job_dir,
-                )
-                .await?
-            } else {
-                copy_file(
-                    src_storage,
-                    dest_storage,
-                    entry,
-                    CopyOptions {
-                        transfer_mode: config.transfer_mode,
-                        qos: qos_manager,
-                        enable_integrity_check: config.enable_integrity_check,
-                        bytes_counter,
-                        cancel: config.cancel.clone(),
-                    },
-                    None,
-                )
-                .await
-                .map_err(|e| AppError::copy_entry_failure(CopyStep::Transfer, relative_path, e))?
-            };
-
-            // 普通传输和检查点传输都在发布前应用协商后的元数据。
-            Ok(published)
+            copy_file_for_job(
+                src_storage,
+                dest_storage,
+                entry,
+                CopyOptions {
+                    transfer_mode: config.transfer_mode,
+                    qos: qos_manager,
+                    enable_integrity_check: config.enable_integrity_check,
+                    bytes_counter,
+                    cancel: config.cancel.clone(),
+                },
+                &config.job_id,
+                &config.job_dir,
+                |error| AppError::copy_entry_failure(CopyStep::Transfer, relative_path, error),
+            )
+            .await
         }
     }
     .instrument(span)
