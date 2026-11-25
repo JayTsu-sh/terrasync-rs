@@ -7,6 +7,7 @@ use std::{
 
 use data_mover::model::{EntryKind, ModelValueError, ObservedEntry};
 use task_model::StorageEntryMessage;
+use tokio::task::JoinHandle;
 use tokio_util::task::AbortOnDropHandle;
 
 use super::ready_files::can_stream_files;
@@ -17,6 +18,7 @@ use crate::copy_root::CopyRootMetadata;
 use crate::error::{AppError, CopyStep, Result, StorageError};
 use crate::file_copy::selection::unrepresentable_object;
 use crate::storage_factory::StorageContext;
+use crate::task_stream::finish_phase;
 
 const MAX_ENTRIES: usize = 64;
 const MAX_BYTES: usize = 8 * 1024 * 1024;
@@ -133,6 +135,29 @@ impl FullCleanupStage {
             completed.checked.insert(entry.path().clone(), entry.identity_key());
         }
         Ok(completed)
+    }
+}
+
+/// 广播关闭后，会合异步入库及已就绪的源清理，并保留两条链路的错误。
+pub(crate) async fn finish_with_ready_cleanup(
+    consumers: Vec<JoinHandle<Result<()>>>, pipeline: Result<()>, stage: Option<FullCleanupStage>,
+    check: SourceCleanupCheck, root: &CopyRootMetadata,
+) -> Result<EarlyCleanup> {
+    let early = async {
+        match stage {
+            Some(stage) => stage.complete(pipeline.is_ok(), check, Some(root)).await,
+            None => Ok(EarlyCleanup::default()),
+        }
+    };
+    let (consumers, cleanup) = tokio::join!(finish_phase(consumers), early);
+    // 消费者关闭会使 worker 报广播错误，优先保留导致关闭的真实原因。
+    match (consumers.and(pipeline), cleanup) {
+        (Ok(()), Ok(completed)) => Ok(completed),
+        (Err(source), Err(cleanup)) => Err(AppError::MigrationAndSourceCleanupFailed {
+            source: Box::new(source),
+            cleanup: Box::new(cleanup),
+        }),
+        (Err(error), Ok(_)) | (Ok(()), Err(error)) => Err(error),
     }
 }
 
