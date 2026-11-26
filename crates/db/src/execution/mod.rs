@@ -2,6 +2,7 @@
 use crate::{ClickHouseConfig, Result};
 use clickhouse::Client;
 
+pub(crate) mod commit;
 mod monitor;
 pub use monitor::DatabaseExecutionMonitor;
 pub(crate) mod queries;
