@@ -17,10 +17,18 @@ import urllib.parse
 import uuid
 
 ROOT = Path(__file__).resolve().parents[2]
+STOP_SIGNALS = (signal.SIGINT, signal.SIGTERM)
 
 
 def docker(*arguments):
     return subprocess.check_output(["docker", *arguments], text=True).strip()
+
+
+def cancel_isolated(_signum, _frame):
+    # 收尾有自己的时限，重复信号不得跳过正在进行的清理。
+    for signum in STOP_SIGNALS:
+        signal.signal(signum, signal.SIG_IGN)
+    raise KeyboardInterrupt
 
 
 def start_isolated_container(containers, name, *arguments):
@@ -32,7 +40,7 @@ def start_isolated_container(containers, name, *arguments):
             cancel_deadline = time.monotonic() + 5
 
     # 先登记本轮的容器名，中断时给 Docker 有界时间返回。
-    previous = {signum: signal.signal(signum, defer_interrupt) for signum in (signal.SIGINT, signal.SIGTERM)}
+    previous = {signum: signal.signal(signum, defer_interrupt) for signum in STOP_SIGNALS}
     try:
         containers.append(name)
         command = ["docker", "run", "--name", name, *arguments]
@@ -47,7 +55,7 @@ def start_isolated_container(containers, name, *arguments):
         for signum, handler in previous.items():
             signal.signal(signum, handler)
     if cancel_deadline is not None:
-        raise KeyboardInterrupt
+        cancel_isolated(None, None)
     if code:
         raise subprocess.CalledProcessError(code, command)
 
@@ -1138,5 +1146,6 @@ if __name__ == "__main__":
     if "--inside" in sys.argv:
         run_inside()
     else:
-        signal.signal(signal.SIGTERM, signal.default_int_handler)
+        for signum in STOP_SIGNALS:
+            signal.signal(signum, cancel_isolated)
         run_isolated()
