@@ -328,6 +328,7 @@ impl FullStats {
                 });
             }
             StorageEntryMessage::Error { event, .. } => self.error_stats.record(*event),
+            StorageEntryMessage::CopyChangeFailed { .. } => self.error_stats.record(ErrorEvent::Copy),
             StorageEntryMessage::CopyVersionFailed {
                 first_in_entry: true, ..
             } => self.error_stats.record(ErrorEvent::Copy),
@@ -603,6 +604,7 @@ impl IncrementalStats {
                 }
             }
             StorageEntryMessage::Error { event, .. } => self.error_stats.record(*event),
+            StorageEntryMessage::CopyChangeFailed { .. } => self.error_stats.record(ErrorEvent::Copy),
             StorageEntryMessage::CopyVersionFailed {
                 first_in_entry: true, ..
             } => self.error_stats.record(ErrorEvent::Copy),

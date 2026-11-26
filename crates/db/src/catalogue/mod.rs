@@ -28,7 +28,7 @@ mod versions;
 mod write;
 
 pub use comparison::{CatalogueChange, ComparisonMode};
-pub use copy_changes::{CopyChange, CopyChangeCount, CopyChangePage};
+pub use copy_changes::{CopyChange, CopyChangeArchiveCoverage, CopyChangeCount, CopyChangePage};
 pub use copy_generation::CopyGenerationStatus;
 pub use deletion::DeletionStatus;
 pub use notifications::{

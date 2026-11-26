@@ -413,10 +413,11 @@ def run_copy_content(environment):
                 "--", "--ignored", "--nocapture", "--test-threads=1",
             ], cwd=ROOT, env=environment, check=True)
             summaries = [report for report in reports if report["is_final"] and not report.get("diagnostics")]
-            assert len(summaries) == 16 and all(report["diagnostics_complete"] for report in summaries), summaries
+            assert len(summaries) == 20 and all(report["diagnostics_complete"] for report in summaries), summaries
             byte_rounds = [report for report in summaries if report["job_id"] == "content_bytes"]
             assert sorted(report["detail"]["transferred_bytes"] for report in byte_rounds) == [15, 15, 16, 16], byte_rounds
-            failed = [report for report in summaries if report["migration"]["phase"] == "failed"]
+            failed = [report for report in summaries if report["migration"]["phase"] == "failed"
+                      and report["job_id"] != "content_failed_changes"]
             assert len(failed) == 4 and all(report["task_error_count"] == report["target_preserved_count"] == 1 for report in failed), failed
             events = {event["event_id"]: event for report in reports
                       for event in (report.get("diagnostics") or {}).get("events", [])}
@@ -432,7 +433,15 @@ def run_copy_content(environment):
                     source = root / "source" / "payload"
                     assert (root / "target" / "payload").read_bytes() == (b"source!" if case == "unchanged" else b"damaged")
                     assert not source.exists() if case == "unchanged" else source.read_bytes() == b"source!"
-            print("independent content migration inspection deployments=2 rounds=16 published_bytes_checked=true corrupted_sources_retained=4 confirmed_sources_removed=2 callback_causes=4 HTTP_204=accepted final_reports_saved=true", flush=True)
+            failed_changes = [report for report in summaries if report["job_id"] == "content_failed_changes"
+                              and report["migration"]["phase"] == "failed"]
+            assert len(failed_changes) == 2, failed_changes
+            for report in failed_changes:
+                attempt = report["callback_identity"]["attempt_id"]
+                paths = {event["path"] for event in events.values()
+                         if event["attempt_id"] == attempt and event["code"] == "Copy"}
+                assert paths == {"added", "changed"}, paths
+            print("independent content migration inspection deployments=2 rounds=20 published_bytes_checked=true failed_change_paths_checked=true corrupted_sources_retained=4 confirmed_sources_removed=2 callback_causes=4 HTTP_204=accepted final_reports_saved=true", flush=True)
     finally:
         callback.shutdown()
         callback.server_close()

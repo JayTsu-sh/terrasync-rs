@@ -7,9 +7,10 @@ use std::{
 };
 
 use clickhouse::Client;
+use db::catalogue::CopyChangeArchiveCoverage;
 use db::{ClickHouseConfig, ClickHouseDatabase, DatabaseError};
 use task_model::{
-    SourceCleanupPolicy,
+    RetentionScope, SourceCleanupPolicy, SourcePresence, TargetRetentionReason,
     migration::{CopyGenerationPhase, MigrationMode},
 };
 use utils::app_config::{AppConfig, ClickHouseMode};
@@ -34,6 +35,7 @@ async fn case(config: &ClickHouseConfig, deployment: &str, case: &str) -> Result
     let source_file = source.join("payload");
     let target_file = target.join("payload");
     std::fs::write(&source_file, b"source!")?;
+    std::fs::write(source.join("old-only"), b"retained at the target")?;
     std::fs::set_permissions(&source_file, Permissions::from_mode(0o640))?;
     let mut command = job(&root.join("job"));
     command.job_id = format!("content_{case}");
@@ -44,6 +46,7 @@ async fn case(config: &ClickHouseConfig, deployment: &str, case: &str) -> Result
     command.progress_callback_url = Some(CallbackEndpoint::parse(&environment("LAB_COPY_CONTENT_CALLBACK")?)?);
     SyncOrchestrator::new_local(command.clone()).run().await?;
     assert_eq!(std::fs::read(&target_file)?, b"source!");
+    std::fs::remove_file(source.join("old-only"))?;
     let damaged = case != "unchanged";
     if damaged {
         let before = std::fs::metadata(&target_file)?;
@@ -86,6 +89,27 @@ async fn case(config: &ClickHouseConfig, deployment: &str, case: &str) -> Result
         }
     );
     assert_eq!(database.get_count("base").await?, 0);
+    let page = database
+        .incremental_copy_changes(&generation.request.execution_id, 0, 1)
+        .await?
+        .ok_or(DatabaseError::CopyExecutionUnavailable)?;
+    let retained = page
+        .target_preserved_range
+        .ok_or(DatabaseError::CopyExecutionUnavailable)?;
+    assert_eq!(retained.scope, RetentionScope::SourceRange);
+    assert_eq!(retained.source_presence, SourcePresence::Unknown);
+    assert_eq!(retained.reason, TargetRetentionReason::SourceCleanupPolicy);
+    assert!(retained.source_path.is_none() && retained.target_path.is_none());
+    assert!(page.changes.iter().all(|row| row.path != "old-only"));
+    assert_eq!(std::fs::read(target.join("old-only"))?, b"retained at the target");
+    assert_eq!(
+        page.archive_coverage,
+        if damaged {
+            CopyChangeArchiveCoverage::Partial
+        } else {
+            CopyChangeArchiveCoverage::Complete
+        }
+    );
     let report = final_report(config, &command.job_id, &generation.request.execution_id).await?;
     assert!(report.is_final && report.diagnostics_complete);
     assert_eq!(report.task_error_count, u64::from(damaged));
@@ -210,7 +234,74 @@ async fn incremental_reports_actual_bytes_and_paths(config: &ClickHouseConfig, d
         ]
     );
     assert_eq!(page.changes[1].target_outcome.as_deref(), Some("already_absent"));
+    assert_eq!(page.changes[2].target_outcome.as_deref(), Some("completed"));
     assert_eq!(page.changes[5].target_outcome.as_deref(), Some("deleted"));
+    assert_eq!(page.archive_coverage, CopyChangeArchiveCoverage::Complete);
+    Ok(())
+}
+
+async fn incremental_archives_failed_changes(config: &ClickHouseConfig, deployment: &str) -> Result<()> {
+    let root = PathBuf::from(environment("LAB_COPY_CONTENT_ROOT")?).join(format!("{deployment}-failed-changes"));
+    let source = root.join("source");
+    let target = root.join("target");
+    std::fs::create_dir_all(&source)?;
+    std::fs::create_dir(&target)?;
+    std::fs::write(source.join("changed"), b"original")?;
+    let mut command = job(&root.join("job"));
+    command.job_id = "content_failed_changes".into();
+    command.src_path = source.to_string_lossy().into_owned();
+    command.dest_path = target.to_string_lossy().into_owned();
+    command.concurrency = Some(2);
+    command.progress_callback_url = Some(CallbackEndpoint::parse(&environment("LAB_COPY_CONTENT_CALLBACK")?)?);
+    SyncOrchestrator::new_local(command.clone()).run().await?;
+
+    std::fs::write(source.join("changed"), b"changed contents")?;
+    std::fs::write(source.join("added"), b"new contents")?;
+    std::fs::remove_file(target.join("changed"))?;
+    for path in ["added", "changed"] {
+        std::fs::create_dir(target.join(path))?;
+        std::fs::write(target.join(path).join("keep"), b"keep")?;
+    }
+    assert!(SyncOrchestrator::new_local(command.clone()).run().await.is_err());
+
+    let database = ClickHouseDatabase::connect(config, &command.job_id).await?;
+    let run = database
+        .latest_copy_generation()
+        .await?
+        .ok_or(DatabaseError::CopyExecutionUnavailable)?;
+    let page = database
+        .incremental_copy_changes(&run.request.execution_id, 0, 10)
+        .await?
+        .ok_or(DatabaseError::CopyExecutionUnavailable)?;
+    assert_eq!(page.phase, CopyGenerationPhase::Failed);
+    assert_eq!(page.archive_coverage, CopyChangeArchiveCoverage::Partial);
+    assert_eq!(
+        page.changes
+            .iter()
+            .map(|row| (row.path.as_str(), row.kind.as_str(), row.target_outcome.as_deref()))
+            .collect::<Vec<_>>(),
+        [
+            ("added", "new", Some("failed")),
+            ("changed", "data_changed", Some("failed")),
+        ]
+    );
+    assert!(
+        page.changes
+            .iter()
+            .all(|row| row.reason.as_ref().is_some_and(|reason| !reason.is_empty()))
+    );
+    let report = final_report(config, &command.job_id, &run.request.execution_id).await?;
+    assert!(matches!(
+        report.detail,
+        ProgressDetail::Incremental {
+            new_count: 0,
+            changed_count: 0,
+            transferred_bytes: 0,
+            ..
+        }
+    ));
+    assert_eq!(std::fs::read(source.join("added"))?, b"new contents");
+    assert_eq!(std::fs::read(source.join("changed"))?, b"changed contents");
     Ok(())
 }
 
@@ -254,7 +345,8 @@ async fn real_incremental_move_checks_existing_data_before_source_removal() -> R
             for name in ["unchanged", "corrupt", "metadata"] {
                 case(&config, deployment, name).await?;
             }
-            incremental_reports_actual_bytes_and_paths(&config, deployment).await
+            incremental_reports_actual_bytes_and_paths(&config, deployment).await?;
+            incremental_archives_failed_changes(&config, deployment).await
         }
         .await;
         let cleanup = admin

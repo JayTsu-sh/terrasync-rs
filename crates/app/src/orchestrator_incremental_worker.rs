@@ -17,7 +17,7 @@ use std::sync::{
     atomic::{AtomicUsize, Ordering},
 };
 use task_model::{
-    ChangeKind, ErrorEvent, ObservedEntryExt, StorageEntryMessage, TargetRetention, TargetRetentionReason,
+    ChangeKind, EntryChange, ErrorEvent, ObservedEntryExt, StorageEntryMessage, TargetRetention, TargetRetentionReason,
 };
 use tokio::{sync::Semaphore, task::JoinHandle};
 use tracing::{Instrument, error, info, info_span};
@@ -164,10 +164,9 @@ pub(super) async fn spawn_handlers(
                                         entry.get_relative_path(),
                                         e
                                     );
-                                    bc.broadcast(StorageEntryMessage::Error {
-                                        event: ErrorEvent::Copy,
-                                        path: entry.get_relative_path().to_path_buf(),
-                                        entry: Some(Arc::clone(&entry.entry)),
+                                    bc.broadcast(StorageEntryMessage::CopyChangeFailed {
+                                        entry: entry.clone(),
+                                        change: EntryChange::New,
                                         reason: format!("{e}"),
                                     })
                                     .await?;
@@ -225,10 +224,9 @@ pub(super) async fn spawn_handlers(
                                         kind,
                                         e
                                     );
-                                    bc.broadcast(StorageEntryMessage::Error {
-                                        event: ErrorEvent::Copy,
-                                        path: entry.get_relative_path().to_path_buf(),
-                                        entry: Some(Arc::clone(&entry.entry)),
+                                    bc.broadcast(StorageEntryMessage::CopyChangeFailed {
+                                        entry: entry.clone(),
+                                        change: EntryChange::Changed(kind),
                                         reason: format!("{e}"),
                                     })
                                     .await?;

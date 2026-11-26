@@ -268,6 +268,8 @@ pub(crate) struct IncrementalStorageEntryRecord {
     pub comment: Option<String>,
 }
 
+pub(crate) const COPY_CHANGE_FAILURE_PREFIX: &str = "copy_failed_";
+
 impl IncrementalStorageEntryRecord {
     pub fn from_message(message: &StorageEntryMessage) -> Result<Vec<Self>> {
         let now = i64::try_from(SystemTime::now().duration_since(SystemTime::UNIX_EPOCH)?.as_nanos())?;
@@ -295,6 +297,14 @@ impl IncrementalStorageEntryRecord {
             StorageEntryMessage::Changed { entry, kind } => {
                 let row = capture_summary(entry.view(), 0)?;
                 return Ok(vec![incremental_record(row, kind.as_state_str(), None, now)]);
+            }
+            StorageEntryMessage::CopyChangeFailed { entry, change, reason } => {
+                let summary = capture_summary(entry.view(), 0)?;
+                // 共享事件表也向普通扫描提供历史；失败行不能被识别为成功的新增或修改。
+                let operation = format!("{COPY_CHANGE_FAILURE_PREFIX}{}", change.as_state_str());
+                let mut row = incremental_record(summary, &operation, Some(safe_diagnostic_text(reason)), now);
+                row.target_outcome = Some("failed".into());
+                return Ok(vec![row]);
             }
             StorageEntryMessage::Deleted(entry) => (entry, "deleted", None),
             StorageEntryMessage::TargetDeletion {

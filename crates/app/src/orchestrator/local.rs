@@ -6,8 +6,7 @@ use data_mover::storage::NamespaceReadPolicy;
 use db::ClickHouseDatabase;
 use futures::FutureExt;
 use task_model::migration::{
-    CopyGenerationPhase, CopyGenerationPlan, CopyRequestDescriptor, MigrationMode, MigrationReason, MigrationReport,
-    TargetCleanupPolicy,
+    CopyGenerationPhase, CopyGenerationPlan, CopyRequestDescriptor, MigrationMode, MigrationReport,
 };
 use task_model::{TargetRetentionReason, TransferMode};
 use tokio_util::sync::CancellationToken;
@@ -206,22 +205,10 @@ impl SyncOrchestrator {
         consumers.set_migration_report(report.clone()).await;
         root_metadata.capture().await?;
         let result = async {
-            if report.plan.target_cleanup == TargetCleanupPolicy::Preserve {
-                let reason = if !request.source_cleanup.retains_source()
-                    || report.plan.reasons.contains(&MigrationReason::PreviousSourceDeleted)
-                {
-                    TargetRetentionReason::SourceCleanupPolicy
-                } else if request.selection.is_filtered()
-                    || request.selection.relative_time
-                    || report.plan.reasons.contains(&MigrationReason::SelectionChanged)
-                {
-                    TargetRetentionReason::FilteredSelection
-                } else {
-                    TargetRetentionReason::BaselineUnavailable
-                };
+            if let Some(retention) = report.plan.target_preservation() {
                 consumers
-                    .record_target_retention_range(
-                        reason,
+                    .record_target_retention(
+                        retention,
                         format!("本轮采用 Preserve，原因 {:?}；未展开的旧目标范围全部保留，不逐项回源查询，也不推断缺失删除或破坏性 rename", report.plan.reasons),
                     )
                     .await?;

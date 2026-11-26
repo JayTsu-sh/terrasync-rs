@@ -366,6 +366,7 @@ impl ProgressBar {
                 CounterSet::Incremental(_) => return,
             },
             StorageEntryMessage::Error { .. }
+            | StorageEntryMessage::CopyChangeFailed { .. }
             | StorageEntryMessage::CopyVersionFailed {
                 first_in_entry: true, ..
             } => {

@@ -100,6 +100,13 @@ pub enum EntryChange {
     Changed(ChangeKind),
 }
 impl EntryChange {
+    pub fn as_state_str(self) -> &'static str {
+        match self {
+            Self::New => "new",
+            Self::Changed(kind) => kind.as_state_str(),
+        }
+    }
+
     pub fn message(self, item: ObservedItem) -> StorageEntryMessage {
         match self {
             Self::New => StorageEntryMessage::New(item),
@@ -161,6 +168,12 @@ pub enum StorageEntryMessage {
     },
     /// 文件已变更（kind 区分 data/metadata/both）
     Changed { entry: ObservedItem, kind: ChangeKind },
+    /// 已识别新增或修改，但复制未完成。此事件不能更新复制基线。
+    CopyChangeFailed {
+        entry: ObservedItem,
+        change: EntryChange,
+        reason: String,
+    },
     /// 文件已删除
     Deleted(Arc<ObservedEntry>),
     /// 增量审查的逐项结果，独立于目录变更和删除成功计数。

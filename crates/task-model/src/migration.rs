@@ -1,7 +1,7 @@
 //! 迁移代次的纯策略；不访问配置、数据库或存储。
 use serde::{Deserialize, Serialize};
 
-use crate::{Result, SourceCleanupPolicy, TaskModelError, TransferMode};
+use crate::{Result, SourceCleanupPolicy, TargetRetention, TargetRetentionReason, TaskModelError, TransferMode};
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct NamespaceBinding {
@@ -195,6 +195,26 @@ impl CopyGeneration {
 }
 
 impl CopyGenerationPlan {
+    /// 整段保留以已接受的计划为依据。没有逐项核验时只报告范围。
+    pub fn target_preservation(&self) -> Option<TargetRetention> {
+        if self.target_cleanup != TargetCleanupPolicy::Preserve {
+            return None;
+        }
+        let reason = if self.reasons.contains(&MigrationReason::SourceCleanup)
+            || self.reasons.contains(&MigrationReason::PreviousSourceDeleted)
+        {
+            TargetRetentionReason::SourceCleanupPolicy
+        } else if self.reasons.contains(&MigrationReason::FilteredSelection)
+            || self.reasons.contains(&MigrationReason::RelativeTimeWindow)
+            || self.reasons.contains(&MigrationReason::SelectionChanged)
+        {
+            TargetRetentionReason::FilteredSelection
+        } else {
+            TargetRetentionReason::BaselineUnavailable
+        };
+        Some(TargetRetention::source_range(reason))
+    }
+
     pub fn decide(
         request: &CopyRequestDescriptor, previous: Option<&CopyGeneration>, baseline_available: bool,
     ) -> Result<Self> {

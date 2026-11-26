@@ -42,6 +42,7 @@ impl CopyQueues {
             }
             StorageEntryMessage::New(item)
             | StorageEntryMessage::VersionMetadataChanged { entry: item, .. }
+            | StorageEntryMessage::CopyChangeFailed { entry: item, .. }
             | StorageEntryMessage::Changed { entry: item, .. }
             | StorageEntryMessage::CopyVersionFailed { entry: item, .. } => item.entry.path().as_str().hash(&mut hash),
             StorageEntryMessage::Renamed((_, to)) => to.path().as_str().hash(&mut hash),
