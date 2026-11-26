@@ -1,7 +1,7 @@
 use data_mover::traversal::{ScanFailureSignal, TraversalRecoveryStatus};
 use std::sync::Arc;
 
-use crate::error::{Result, StorageError};
+use crate::error::{AppError, Result, StorageError};
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
@@ -174,9 +174,18 @@ impl<T> AsyncReceiver<T> {
     }
 }
 
-/// 排空同一阶段的所有任务后返回首个类型化错误；调用方仅在成功后推进删除阶段。
+/// 完整等待后台任务；校验等非迁移入口仍返回首个错误。
 pub(crate) async fn finish_phase(tasks: Vec<JoinHandle<Result<()>>>) -> Result<()> {
-    let mut failure = None;
+    drain_phase(tasks).await.into_iter().next().map_or(Ok(()), Err)
+}
+
+/// 迁移仅在所有阶段任务成功退出后推进，并保留每个任务的终态。
+pub(crate) async fn finish_copy_phase(tasks: Vec<JoinHandle<Result<()>>>) -> Result<()> {
+    combine_copy_results(drain_phase(tasks).await.into_iter().map(Err))
+}
+
+async fn drain_phase(tasks: Vec<JoinHandle<Result<()>>>) -> Vec<AppError> {
+    let mut failures = Vec::new();
     for task in tasks {
         let result = match task.await {
             Ok(result) => result,
@@ -184,13 +193,26 @@ pub(crate) async fn finish_phase(tasks: Vec<JoinHandle<Result<()>>>) -> Result<(
         };
         if let Err(error) = result {
             error!(%error, "Catalogue phase task failed");
-            failure.get_or_insert(error);
+            failures.push(error);
         }
     }
-    match failure {
-        Some(error) => Err(error),
-        None => Ok(()),
+    failures
+}
+
+/// 结果数由后台角色和 worker 数量决定，不随条目数增长。
+pub(crate) fn combine_copy_results(results: impl IntoIterator<Item = Result<()>>) -> Result<()> {
+    let mut failures = results.into_iter().filter_map(Result::err);
+    let Some(source) = failures.next() else {
+        return Ok(());
+    };
+    let additional: Vec<_> = failures.collect();
+    if additional.is_empty() {
+        return Err(source);
     }
+    Err(AppError::CopyPhaseFailures {
+        source: Box::new(source),
+        additional,
+    })
 }
 
 #[cfg(test)]

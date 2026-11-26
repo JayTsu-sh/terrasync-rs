@@ -95,9 +95,24 @@ pub enum AppError {
     },
     #[error("迁移执行因子任务失败而停止: {source}")]
     CopyExecutionStopped {
+        phase: &'static str,
         #[source]
         source: Arc<AppError>,
     },
+    #[error("迁移阶段 {phase} 失败: {source}")]
+    CopyPhaseFailure {
+        phase: &'static str,
+        #[source]
+        source: Box<AppError>,
+    },
+    #[error("迁移阶段失败: {source}，另有 {} 个收尾结果", additional.len())]
+    CopyPhaseFailures {
+        #[source]
+        source: Box<AppError>,
+        additional: Vec<AppError>,
+    },
+    #[error("Copy handler channel closed")]
+    CopyHandlerChannelClosed,
     #[error("迁移执行失败: {source}; 数据库同时不可用: {database}")]
     CopyExecutionAndDatabaseFailed {
         #[source]
@@ -414,6 +429,24 @@ pub enum AppError {
 pub type Result<T> = std::result::Result<T, AppError>;
 
 impl AppError {
+    pub(crate) fn in_copy_phase(self, phase: &'static str) -> Self {
+        Self::CopyPhaseFailure {
+            phase,
+            source: Box::new(self),
+        }
+    }
+
+    /// 只在已有具体失败时忽略这些由流水线停止产生的结果。
+    pub(crate) fn is_copy_stop_consequence(&self) -> bool {
+        match self {
+            Self::CopyPhaseFailure { source, .. } => source.is_copy_stop_consequence(),
+            Self::StorageError(error) => error.is_cancelled(),
+            Self::DatabaseError(error) => error.is_confirmed_scan_cancellation(),
+            Self::CopyQueueClosed | Self::CopyHandlerChannelClosed | Self::ConsumerDisconnected { .. } => true,
+            _ => false,
+        }
+    }
+
     /// 同一次根观察由 Arc 身份标识；组合错误的另一分支也可能已携带该失败。
     pub(crate) fn contains_copy_root_failure(&self, observed: &Arc<StorageError>) -> bool {
         match self {
@@ -424,14 +457,21 @@ impl AppError {
             Self::MigrationAndSourceCleanupFailed { source, cleanup } => {
                 source.contains_copy_root_failure(observed) || cleanup.contains_copy_root_failure(observed)
             }
+            Self::CopyPhaseFailures { source, additional } => {
+                source.contains_copy_root_failure(observed)
+                    || additional
+                        .iter()
+                        .any(|error| error.contains_copy_root_failure(observed))
+            }
             Self::MigrationReportingFailed { source, reporting } => {
                 source.contains_copy_root_failure(observed) || reporting.contains_copy_root_failure(observed)
             }
-            Self::CopyExecutionStopped { source } | Self::DiagnosticJournalStopped { source } => {
+            Self::CopyExecutionStopped { source, .. } | Self::DiagnosticJournalStopped { source } => {
                 source.contains_copy_root_failure(observed)
             }
             Self::CopyExecutionAndDatabaseFailed { source, .. }
             | Self::MigrationFinalizationFailed { source, .. }
+            | Self::CopyPhaseFailure { source, .. }
             | Self::ReportedCopyFailure { source, .. }
             | Self::CopyEntryFailed { source, .. }
             | Self::FileCommitStage { source, .. }
@@ -446,7 +486,11 @@ impl AppError {
             Self::MigrationAndSourceCleanupFailed { source, cleanup } => {
                 cleanup.source_cleanup_entry().or_else(|| source.source_cleanup_entry())
             }
-            Self::CopyExecutionStopped { source } => source.source_cleanup_entry(),
+            Self::CopyExecutionStopped { source, .. } => source.source_cleanup_entry(),
+            Self::CopyPhaseFailure { source, .. } => source.source_cleanup_entry(),
+            Self::CopyPhaseFailures { source, additional } => source
+                .source_cleanup_entry()
+                .or_else(|| additional.iter().find_map(Self::source_cleanup_entry)),
             Self::MigrationAndRootMetadataFailed { source, .. } => source.source_cleanup_entry(),
             Self::CopyEntryFailed {
                 step: CopyStep::SourceCleanup,
@@ -461,9 +505,13 @@ impl AppError {
     }
     pub(crate) fn is_reported_copy_failure(&self) -> bool {
         match self {
-            Self::CopyExecutionStopped { source } => source.is_reported_copy_failure(),
+            Self::CopyExecutionStopped { source, .. } => source.is_reported_copy_failure(),
             Self::ReportedCopyFailure { .. } => true,
             Self::CopyEntryFailed { source, .. } => source.is_reported_copy_failure(),
+            Self::CopyPhaseFailure { source, .. } => source.is_reported_copy_failure(),
+            Self::CopyPhaseFailures { source, additional } => {
+                source.is_reported_copy_failure() && additional.iter().all(Self::is_reported_copy_failure)
+            }
             _ => false,
         }
     }
@@ -482,7 +530,7 @@ impl AppError {
     #[cfg(test)]
     pub(crate) fn reported_copy_data_failed(&self) -> bool {
         match self {
-            Self::CopyExecutionStopped { source } => source.reported_copy_data_failed(),
+            Self::CopyExecutionStopped { source, .. } => source.reported_copy_data_failed(),
             Self::ReportedCopyFailure { data_failed, .. } => *data_failed,
             Self::CopyEntryFailed { source, .. } => source.reported_copy_data_failed(),
             _ => false,
@@ -498,7 +546,11 @@ impl AppError {
 
     pub(crate) fn stops_event_pipeline(&self) -> bool {
         match self {
-            Self::CopyExecutionStopped { source } => source.stops_event_pipeline(),
+            Self::CopyExecutionStopped { source, .. } => source.stops_event_pipeline(),
+            Self::CopyPhaseFailure { source, .. } => source.stops_event_pipeline(),
+            Self::CopyPhaseFailures { source, additional } => {
+                source.stops_event_pipeline() || additional.iter().any(Self::stops_event_pipeline)
+            }
             Self::ConsumerDisconnected { .. } => true,
             Self::MigrationAndRootMetadataFailed { source, metadata } => {
                 source.stops_event_pipeline() || metadata.stops_event_pipeline()
@@ -519,7 +571,11 @@ impl AppError {
                 source.storage_error().or_else(|| metadata.storage_error())
             }
             Self::CopyRootMetadataFailure { source, .. } => Some(source),
-            Self::CopyExecutionStopped { source } => source.storage_error(),
+            Self::CopyExecutionStopped { source, .. } => source.storage_error(),
+            Self::CopyPhaseFailure { source, .. } => source.storage_error(),
+            Self::CopyPhaseFailures { source, additional } => source
+                .storage_error()
+                .or_else(|| additional.iter().find_map(Self::storage_error)),
             Self::CopyEntryFailed { source, .. }
             | Self::ReportedCopyFailure { source, .. }
             | Self::CopyExecutionAndDatabaseFailed { source, .. } => source.storage_error(),

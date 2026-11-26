@@ -36,7 +36,7 @@ use crate::sync::check_admin_privileges;
 use crate::sync::parse_size;
 use crate::sync_catalog::batch_processing_to_generate_message;
 use crate::target_absence::SourceAbsenceCheck;
-use crate::task_stream::finish_phase;
+use crate::task_stream::{combine_copy_results, finish_copy_phase};
 
 impl SyncOrchestrator {
     /// 增量同步 — 双阶段流水线：
@@ -188,11 +188,7 @@ impl SyncOrchestrator {
         let dispatch_handle: JoinHandle<Result<()>> = tokio::spawn(
             async move {
                 while let Some(msg) = file_op_rx.recv().await {
-                    if work_queues.send(msg).await.is_err() {
-                        return Err(AppError::ConsumerError(
-                            "Incremental sync handler channel closed".into(),
-                        ));
-                    }
+                    work_queues.send(msg).await?;
                 }
                 info!("Dispatch task completed");
                 Ok(())
@@ -241,7 +237,7 @@ impl SyncOrchestrator {
 
             let span = info_span!("scan_worker", worker_id = worker_id);
             let handle = tokio::spawn(
-                CopyDatabaseExecution::run_optional_child(execution, async move {
+                CopyDatabaseExecution::run_optional_child(execution, "incremental_compare", async move {
                     info!("Scan worker {}: Started processing", worker_id);
 
                     let mut current_batch = Vec::with_capacity(batch_size);
@@ -310,9 +306,9 @@ impl SyncOrchestrator {
         }
 
         // ── 14. 等待 scan workers 完成 ──
-        let scan_result = finish_phase(scan_worker_handles).await;
+        let scan_result = finish_copy_phase(scan_worker_handles).await;
         walkdir_iter.close();
-        let scan_dispatch_result = finish_phase(vec![scan_dispatch]).await;
+        let scan_dispatch_result = finish_copy_phase(vec![scan_dispatch]).await;
         walkdir_iter.wait_for_producer().await;
 
         // ── 15. 关闭 detect_broadcaster → dispatch task 的 file_op_rx 耗尽 ──
@@ -325,7 +321,7 @@ impl SyncOrchestrator {
             Ok(result) => result,
             Err(error) => Err(error.into()),
         };
-        let handler_result = finish_phase(handler_handles).await;
+        let handler_result = finish_copy_phase(handler_handles).await;
         info!("All handler workers completed");
 
         // ── 18. 关闭 Phase A 广播器 → 等待 Phase A 消费者完成（同步屏障） ──
@@ -346,11 +342,16 @@ impl SyncOrchestrator {
             } else {
                 (enumeration_result, handler_result)
             };
-        let phase_a = enumeration_result
-            .and(scan_result)
-            .and(handler_result)
-            .and(dispatch_result)
-            .and(scan_dispatch_result);
+        let phase_a = combine_copy_results(
+            [
+                ("incremental_compare", scan_result),
+                ("incremental_enumerate", enumeration_result),
+                ("incremental_copy", handler_result),
+                ("incremental_dispatch", dispatch_result),
+                ("incremental_scan_dispatch", scan_dispatch_result),
+            ]
+            .map(|(phase, result)| result.map_err(|error| error.in_copy_phase(phase))),
+        );
         let early = match finish_with_ready_cleanup(
             consumer_handles,
             phase_a,
@@ -425,7 +426,11 @@ impl SyncOrchestrator {
 
         // ── 21. 关闭 Phase B 广播器 → 等待 Phase B 消费者完成（incremental 表冲刷完毕） ──
         drop(broadcaster_b);
-        let phase_b_consumers = finish_phase(phase_b_handles).await;
+        let phase_b_consumers = finish_copy_phase(phase_b_handles)
+            .await
+            .map_err(|error| error.in_copy_phase("incremental_reconciliation_flush"));
+        let phase_b_dest_storage =
+            phase_b_dest_storage.map_err(|error| error.in_copy_phase("incremental_reconcile_target"));
 
         // QoS 在两阶段都走完之后才关闭，保留 Phase B 物理操作期间的限速效果
         if let Some(ref qos_mgr) = qos_manager {
@@ -450,7 +455,8 @@ impl SyncOrchestrator {
                 check: cleanup_check.with_prechecked(early.checked, early.streamed_files),
             });
             self.complete_persisted(&database, destination, consumer_manager, root_metadata, cleanup)
-                .await?;
+                .await
+                .map_err(|error| error.in_copy_phase("incremental_completion"))?;
             Ok(())
         }
         .await;

@@ -90,7 +90,7 @@ def run_isolated():
             print(f"isolated notification image={docker('inspect', containers[0], '--format', '{{.Image}}')}", flush=True)
             pid = docker("inspect", containers[0], "--format", "{{.State.Pid}}")
             suite = [flag for flag in ("--copy-generations", "--copy-content", "--copy-ready-cleanup", "--directory-completion", "--copy-object-cleanup", "--copy-versioned-source-cleanup", "--catalogue-recovery", "--consumer-recovery", "--copy-execution", "--copy-data-cancel", "--copy-file-list-cancel", "--rename-generations", "--retention-events", "--source-absence", "--request-policy", "--copy-contracts", "--version-catalogue", "--mutable-catalogue", "--version-metadata", "--metadata-cancel", "--scan-wire") if flag in sys.argv]
-            suite.extend(flag for flag in ("--multi-shard", "--copy-takeover", "--scan-generation-result", "--copy-generation-result") if flag in sys.argv)
+            suite.extend(flag for flag in ("--multi-shard", "--copy-takeover", "--scan-generation-result", "--copy-generation-result", "--copy-independent-failures") if flag in sys.argv)
             subprocess.run(["nsenter", "-t", pid, "-n", sys.executable, __file__, "--inside", *suite], cwd=ROOT, check=True)
         except BaseException:
             for container in containers:
@@ -726,7 +726,8 @@ def run_copy_execution(environment):
         ], cwd=ROOT, env=environment, check=True)
         summaries = [report for report in reports if report["is_final"] and not report.get("diagnostics")]
         assert len(summaries) == 24 and all(report["diagnostics_complete"] for report in summaries), summaries
-        failed = [report for report in summaries if report["task_error_count"] == 1]
+        # 恢复未完成的独立请求可能各有一条原因。
+        failed = [report for report in summaries if report["task_error_count"] > 0]
         assert len(failed) == 6 and all(report["migration"]["phase"] == "failed" for report in failed), failed
         attempts = [report for report in summaries if report["migration"]["generation"] == 2]
         assert len(attempts) == 12, attempts
@@ -765,7 +766,7 @@ def run_consumer_recovery(environment):
         ], cwd=ROOT, env=environment, check=True)
         summaries = [report for report in reports if report["is_final"] and not report.get("diagnostics")]
         assert len(summaries) == 6 and all(report["diagnostics_complete"] for report in summaries), summaries
-        failed = [report for report in summaries if report["task_error_count"] == 1]
+        failed = [report for report in summaries if report["task_error_count"] > 0]
         assert len(failed) == 4 and all(report["migration"]["phase"] == "failed" for report in failed), failed
         causes = [event for report in reports for event in (report.get("diagnostics") or {}).get("events", [])
                   if "owned batch rejection" in event["message"]]
@@ -922,6 +923,10 @@ def run_inside():
         print(f"isolated ClickHouse shards={shards} replicas_per_shard=2", flush=True)
     if "--copy-generation-result" in sys.argv:
         from copy_generation_result import run
+        run()
+        return
+    if "--copy-independent-failures" in sys.argv:
+        from copy_independent_failures import run
         run()
         return
     if "--scan-generation-result" in sys.argv:

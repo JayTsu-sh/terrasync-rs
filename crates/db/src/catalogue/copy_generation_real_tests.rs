@@ -227,7 +227,7 @@ async fn versioned_state_read_faults(fixture: &Fixture, copying: bool) -> Result
         let (scoped, queries) = database.with_query_cancellation()?;
         let execution = queries.execution();
         let cancellation = CancellationToken::new();
-        let monitor = DatabaseExecutionMonitor::start(queries, cancellation.clone())?;
+        let monitor = DatabaseExecutionMonitor::start(queries, cancellation.clone(), None)?;
         fixture.fault(fault).await?;
         let stop = cancellation.clone();
         let trigger = tokio::spawn(async move {

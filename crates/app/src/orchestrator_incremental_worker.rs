@@ -10,7 +10,7 @@ use crate::{
     source_cleanup::CleanupConnections,
     sync::{ResumeOpts, process_entry, process_metadata_only_entry},
     tar_pack,
-    task_stream::AsyncReceiver,
+    task_stream::{AsyncReceiver, combine_copy_results},
 };
 use std::sync::{
     Arc,
@@ -116,10 +116,8 @@ pub(super) async fn spawn_handlers(
                                 // 释放派发端背压；未开始的排队条目不生成复制失败。
                                 rx.close();
                                 let history_result = history.finish().await;
-                                return match failure {
-                                    Some(error) => Err(error),
-                                    None => history_result.and(Err(StorageError::Cancelled.into())),
-                                };
+                                return combine_copy_results([failure.map_or(Ok(()), Err), history_result])
+                                    .and(Err(StorageError::Cancelled.into()));
                             }
                             message = rx.next() => message,
                         },
@@ -279,7 +277,7 @@ pub(super) async fn spawn_handlers(
                                         reason: format!("{e}"),
                                     })
                                     .await?;
-                                    failure.get_or_insert(e);
+                                    failure.get_or_insert_with(|| e.with_reported_copy_failure(false));
                                 }
                             }
                         }
@@ -291,10 +289,7 @@ pub(super) async fn spawn_handlers(
 
                 info!("Handler worker {} completed", handler_id);
                 let history_result = history.finish().await;
-                match failure {
-                    Some(error) => Err(error),
-                    None => history_result,
-                }
+                combine_copy_results([failure.map_or(Ok(()), Err), history_result])
             }
             .instrument(span),
         );

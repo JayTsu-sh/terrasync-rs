@@ -55,7 +55,7 @@ impl ConsumerExecution {
     pub(super) async fn run(&self, work: impl Future<Output = Result<()>>) -> Result<()> {
         match &self.database {
             Some(database) if self.owns_monitor => database.run(work).await,
-            Some(database) => database.run_child(work).await,
+            Some(database) => database.run_child("catalogue_flush", work).await,
             None => work.await,
         }
     }

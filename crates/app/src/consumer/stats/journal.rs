@@ -7,7 +7,7 @@ use task_model::StorageEntryMessage;
 use task_model::diagnostics::{DiagnosticBatch, DiagnosticEvent, MAX_DIAGNOSTIC_BATCH_EVENTS};
 use tokio::{
     sync::Mutex,
-    time::{Instant, sleep, timeout},
+    time::{Instant, sleep, timeout, timeout_at},
 };
 use tokio_util::sync::CancellationToken;
 use tracing::warn;
@@ -183,30 +183,66 @@ pub(crate) async fn log_unrouted(consumer: &Consumer) {
 }
 
 pub(crate) async fn record(consumer: &Consumer, message: &StorageEntryMessage) -> Result<()> {
-    {
+    if is_diagnostic(message) {
+        return record_diagnostic(consumer, None, |state| state.update_statistics(message)).await;
+    }
+    let mut state = consumer.lock().await;
+    state.update_statistics(message);
+    match state.callback.journal.terminal.clone() {
+        Some(source) => Err(AppError::DiagnosticJournalStopped { source }),
+        None => Ok(()),
+    }
+}
+
+pub(crate) fn diagnostic_deadline() -> Instant {
+    Instant::now() + RECOVERY
+}
+
+pub(crate) async fn record_diagnostic(
+    consumer: &Consumer, deadline: Option<Instant>, update: impl FnOnce(&mut StatisticConsumer),
+) -> Result<()> {
+    // 旧消费路径在日志已终止时立即交还其失败，避免等待其他生产者。
+    if deadline.is_none() {
         let mut state = consumer.lock().await;
         if let Some(source) = state.callback.journal.terminal.clone() {
-            state.update_statistics(message);
+            update(&mut state);
             return Err(AppError::DiagnosticJournalStopped { source });
-        }
-        if !is_diagnostic(message) {
-            state.update_statistics(message);
-            return Ok(());
         }
     }
     let gate = consumer.lock().await.callback.journal.producer.clone();
-    let _guard = gate.lock().await;
+    let _guard = match deadline {
+        Some(deadline) => match timeout_at(deadline, gate.lock()).await {
+            Ok(guard) => guard,
+            Err(_) => {
+                let mut state = consumer.lock().await;
+                update(&mut state);
+                return Err(AppError::DiagnosticDeliveryUnavailable);
+            }
+        },
+        None => gate.lock().await,
+    };
+    // 迁移收尾的批次共享一次提交明细的预算，终止归档后也可用现有回调排空前缀。
     if consumer.lock().await.callback.outbox.pending_len() >= MAX_DIAGNOSTIC_BATCH_EVENTS {
-        if let Err(error) = flush(consumer).await {
+        let flushed = match deadline {
+            Some(deadline) => timeout_at(deadline, flush(consumer))
+                .await
+                .unwrap_or(Err(AppError::DiagnosticDeliveryUnavailable)),
+            None => flush(consumer).await,
+        };
+        if let Err(error) = flushed {
             let mut state = consumer.lock().await;
             state.callback.journal.failed = true;
             state.callback.diagnostics_incomplete = true;
-            state.update_statistics(message);
+            update(&mut state);
             return Err(error);
         }
     }
-    consumer.lock().await.update_statistics(message);
-    Ok(())
+    let mut state = consumer.lock().await;
+    update(&mut state);
+    match state.callback.journal.terminal.clone() {
+        Some(source) => Err(AppError::DiagnosticJournalStopped { source }),
+        None => Ok(()),
+    }
 }
 
 pub(crate) async fn flush(consumer: &Consumer) -> Result<()> {

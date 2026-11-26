@@ -18,7 +18,7 @@ use crate::copy_root::CopyRootMetadata;
 use crate::error::{AppError, CopyStep, Result, StorageError};
 use crate::file_copy::selection::unrepresentable_object;
 use crate::storage_factory::StorageContext;
-use crate::task_stream::finish_phase;
+use crate::task_stream::{combine_copy_results, finish_copy_phase};
 
 const MAX_ENTRIES: usize = 64;
 const MAX_BYTES: usize = 8 * 1024 * 1024;
@@ -149,9 +149,10 @@ pub(crate) async fn finish_with_ready_cleanup(
             None => Ok(EarlyCleanup::default()),
         }
     };
-    let (consumers, cleanup) = tokio::join!(finish_phase(consumers), early);
-    // 消费者关闭会使 worker 报广播错误，优先保留导致关闭的真实原因。
-    match (consumers.and(pipeline), cleanup) {
+    let (consumers, cleanup) = tokio::join!(finish_copy_phase(consumers), early);
+    // 同一根因可经消费者与 worker 同时返回，报告按因果身份合并。
+    let consumers = consumers.map_err(|error| error.in_copy_phase("catalogue_flush"));
+    match (combine_copy_results([consumers, pipeline]), cleanup) {
         (Ok(()), Ok(completed)) => Ok(completed),
         (Err(source), Err(cleanup)) => Err(AppError::MigrationAndSourceCleanupFailed {
             source: Box::new(source),

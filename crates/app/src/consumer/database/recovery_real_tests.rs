@@ -229,7 +229,7 @@ async fn case(fixture: &Fixture, incremental: bool, mode: &str) -> Result<()> {
         let error = result
             .err()
             .ok_or_else(|| AppError::ConfigError("fault incorrectly reported success".into()))?;
-        assert!(matches!(error, AppError::DatabaseError(_)), "{error}");
+        assert!(has_database_cause(&error), "{error}");
         if matches!(mode, "batch_reject" | "final_reject") {
             assert!(error.to_string().contains("owned batch rejection"), "{error}");
         }

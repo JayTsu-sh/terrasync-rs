@@ -61,6 +61,9 @@ class Relay(http.server.BaseHTTPRequestHandler):
             self.send_response(204)
             self.end_headers()
             return
+        self.handle_database(body)
+
+    def handle_database(self, body):
         query = (urllib.parse.unquote_plus(self.path).encode() + body[:256]).upper()
         fault = self.server.fault
         commit = b"INSERT INTO STATE_MIG_RESULT " in query and b"BASELINE_COMMITTED" in query and b",TRUE," in query

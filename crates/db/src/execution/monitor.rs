@@ -24,8 +24,13 @@ impl DatabaseExecutionMonitor {
     ///
     /// # Errors
     /// 同一执行重复启动连通性监测时返回配置错误。
-    pub fn start(queries: ScanQueryCancellation, cancel: CancellationToken) -> Result<Self> {
-        let database = queries.execution();
+    pub fn start(
+        queries: ScanQueryCancellation, cancel: CancellationToken, phase: Option<&'static str>,
+    ) -> Result<Self> {
+        let mut database = queries.execution();
+        if let Some(phase) = phase {
+            database = database.with_request_phase(phase);
+        }
         let connectivity = database.start_monitor()?;
         let finished = CancellationToken::new();
         let done = finished.clone();

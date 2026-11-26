@@ -92,6 +92,12 @@ pub enum DatabaseError {
         #[source]
         source: Arc<DatabaseError>,
     },
+    #[error("ClickHouse 请求在 {phase} 阶段失败: {source}")]
+    RequestFailureInPhase {
+        phase: &'static str,
+        #[source]
+        source: Box<DatabaseError>,
+    },
     #[error("ClickHouse unavailable after {recovery_window:?} recovery: {source}; termination: {termination:?}")]
     ScanDatabaseUnavailable {
         recovery_window: Duration,
@@ -127,6 +133,11 @@ pub enum DatabaseError {
         #[source]
         source: Box<DatabaseError>,
         cleanup: Box<DatabaseError>,
+    },
+    #[error("ClickHouse comparison staging cleanup exceeded the shutdown deadline: {source}")]
+    ComparisonCleanupTimeout {
+        #[source]
+        source: tokio::time::error::Elapsed,
     },
 
     /// `ClickHouse` 数据库相关错误
@@ -253,11 +264,13 @@ impl DatabaseError {
             Self::ScanRequestFailed { source } | Self::ScanDatabaseUnavailable { source, .. } => {
                 source.diagnostic_class()
             }
+            Self::RequestFailureInPhase { source, .. } => source.diagnostic_class(),
             Self::ScanTerminationUnconfirmed { .. } => ("termination_unconfirmed", None),
             Self::RequestOutcomeUnconfirmed { .. } => ("request_unconfirmed", None),
             Self::ProbeTimeout { .. } => ("probe_timeout", None),
             Self::ClusterProbeIncomplete => ("cluster_unavailable", None),
             Self::ConnectivityMonitorStopped => ("monitor_stopped", None),
+            Self::ComparisonCleanupTimeout { .. } => ("comparison_cleanup_timeout", None),
             Self::ScanCancelled => ("cancelled", None),
             Self::ClickHouseError(clickhouse::error::Error::BadResponse(message)) => {
                 ("server_response", server_error_code(message))
@@ -282,6 +295,7 @@ impl DatabaseError {
     pub(crate) fn request_was_not_sent(&self) -> bool {
         match self {
             Self::ScanRequestFailed { source } => source.request_was_not_sent(),
+            Self::RequestFailureInPhase { source, .. } => source.request_was_not_sent(),
             Self::ClickHouseError(clickhouse::error::Error::Network(error)) => error
                 .downcast_ref::<HyperClientError>()
                 .is_some_and(HyperClientError::is_connect),
@@ -294,6 +308,7 @@ impl DatabaseError {
             Self::ScanRequestFailed { source } | Self::ScanDatabaseUnavailable { source, .. } => {
                 source.is_transient_connectivity_failure()
             }
+            Self::RequestFailureInPhase { source, .. } => source.is_transient_connectivity_failure(),
             Self::RequestOutcomeUnconfirmed { .. } => true,
             Self::ClickHouseError(source) => match source {
                 clickhouse::error::Error::Network(_) | clickhouse::error::Error::TimedOut => true,
@@ -310,6 +325,7 @@ impl DatabaseError {
     pub fn is_confirmed_scan_cancellation(&self) -> bool {
         match self {
             Self::ScanCancelled => true,
+            Self::RequestFailureInPhase { source, .. } => source.is_confirmed_scan_cancellation(),
             Self::ClickHouseError(clickhouse::error::Error::BadResponse(message)) => {
                 let code = server_error_code(message);
                 // 服务端明确确认 QUERY_WAS_CANCELLED / QUERY_WAS_CANCELLED_BY_CLIENT。

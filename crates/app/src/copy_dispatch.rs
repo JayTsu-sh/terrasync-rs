@@ -57,7 +57,7 @@ impl CopyQueues {
         self.senders[index]
             .send(message)
             .await
-            .map_err(|_| AppError::ConsumerError("Copy handler channel closed".into()))
+            .map_err(|_| AppError::CopyHandlerChannelClosed)
     }
 }
 

@@ -28,9 +28,9 @@ use tokio::sync::Mutex;
 use tracing::{Instrument, debug, error, info_span, warn};
 
 // 内部模块
-use super::purge_reporting;
 use super::stats::callback_state::{SavedStatistics, StatisticsCheckpoint};
 use super::stats::recovery_progress::RecoveryProgress;
+use super::{migration_reporting, purge_reporting};
 use crate::broadcast::BroadcastForwarder;
 use crate::config::{ConsumerConfig, JobType};
 use crate::consumer::DatabaseConsumer;
@@ -764,10 +764,16 @@ impl ConsumerManager {
         if !error.is_reported_copy_failure() {
             self.record_task_failures(&[error.to_string()]).await;
             if let Some(consumer) = &self.stats_consumer
-                && let Err(reporting) = purge_reporting::record(consumer, error).await
+                && let Err(reporting) = purge_reporting::record(consumer, error, None).await
             {
                 StatisticConsumer::diagnostic_failure(consumer, reporting).await;
             }
+        }
+    }
+
+    pub(crate) async fn record_migration_error(&self, error: &AppError) {
+        if let Some(consumer) = &self.stats_consumer {
+            migration_reporting::record(consumer, error).await;
         }
     }
 
@@ -815,6 +821,7 @@ mod resume_tests {
     use crate::error::{CopyStep, StorageError};
     use crate::observed_fixtures::observation;
     use crate::source_cleanup;
+    use crate::task_stream::combine_copy_results;
     use data_mover::model::{BackendKind, EntryKind};
     use data_mover::model::{EntryOperationFailure, FailureClass, MetadataFamily, Operation, StoragePath, Transience};
     use data_mover::storage::{NamespaceReadCause, NamespaceReadFailure, StorageRoleFailure};
@@ -973,7 +980,7 @@ mod resume_tests {
     }
 
     #[tokio::test]
-    async fn already_reported_version_failure_is_not_counted_again_at_task_finish() -> Result<()> {
+    async fn migration_reports_independent_causes_without_recounting_propagated_or_entry_errors() -> Result<()> {
         let stats = StatisticConsumer {
             stats: StatsKind::Full(FullStats::new(
                 JobType::Copy,
@@ -1023,17 +1030,48 @@ mod resume_tests {
                 first_in_entry: true,
             }])
             .await;
-        manager.record_task_error(&failure).await;
-        let consumer = manager
+        let first = Arc::new(DatabaseError::RequestFailureInPhase {
+            phase: "catalogue_flush",
+            source: Box::new(DatabaseError::ConfigError("same failure text".into())),
+        });
+        let second = Arc::new(DatabaseError::ConfigError("same failure text".into()));
+        let propagated = Arc::new(AppError::DatabaseError(DatabaseError::ScanRequestFailed {
+            source: Arc::clone(&first),
+        }));
+        let result = combine_copy_results([
+            Err(failure),
+            Err(AppError::CopyExecutionStopped {
+                phase: "incremental_compare",
+                source: Arc::clone(&propagated),
+            }
+            .in_copy_phase("incremental_compare")),
+            Err(AppError::CopyExecutionStopped {
+                phase: "catalogue_flush",
+                source: propagated,
+            }),
+            Err(AppError::from(DatabaseError::ScanRequestFailed { source: first })),
+            Err(AppError::from(DatabaseError::ScanRequestFailed { source: second })),
+            Err(AppError::CopyHandlerChannelClosed),
+        ]);
+        let error = result.err().ok_or(AppError::ScanWorkerStopped)?;
+        manager.record_migration_error(&error).await;
+        let mut consumer = manager
             .stats_consumer
             .as_ref()
             .ok_or_else(|| AppError::CopyError("test statistics missing".into()))?
             .lock()
             .await;
-        assert!(matches!(
-            consumer.to_report(true).detail,
-            ProgressDetail::Full { error_count: 1, .. }
-        ));
+        let report = consumer.to_report(true);
+        assert!(matches!(report.detail, ProgressDetail::Full { error_count: 1, .. }));
+        assert_eq!(report.task_error_count, 2);
+        let batch = consumer
+            .callback
+            .outbox
+            .prepare_batch()
+            .ok_or(AppError::DiagnosticDeliveryUnavailable)?;
+        assert_eq!(batch.events.len(), 3);
+        assert_eq!(batch.events[1].origin, "catalogue_flush");
+        assert_ne!(batch.events[1].event_id, batch.events[2].event_id);
         Ok(())
     }
 

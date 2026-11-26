@@ -84,7 +84,7 @@ async fn update_directories(
     let query_execution = execution.clone();
     let query = tokio::spawn(
         async move {
-            CopyDatabaseExecution::run_optional_child(query_execution, async move {
+            CopyDatabaseExecution::run_optional_child(query_execution, "directory_completion_query", async move {
                 database
                     .query_current_copy_entries(Some(true), None, None, sender)
                     .await?;

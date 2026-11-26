@@ -46,9 +46,10 @@ impl ReadyFileCleanup {
     }
 
     pub(super) fn failure(&self) -> Option<AppError> {
-        self.failure
-            .get()
-            .map(|source| AppError::CopyExecutionStopped { source: source.clone() })
+        self.failure.get().map(|source| AppError::CopyExecutionStopped {
+            phase: "source_cleanup",
+            source: source.clone(),
+        })
     }
 
     pub(crate) async fn remove(
@@ -66,13 +67,16 @@ impl ReadyFileCleanup {
             guard = self.serial.lock() => guard,
         };
         self.execution
-            .run_child(async {
+            .run_child("source_cleanup", async {
                 if let Err(source) = remove_entry(source, destination, entry, &self.check, published).await {
                     let error =
                         AppError::copy_entry_failure(CopyStep::SourceCleanup, Path::new(entry.path().as_str()), source);
                     // 全局最初原因可能来自数据库；单独保留唯一在途清理的实际原因及未知结果。
                     let source = self.failure.get_or_init(|| Arc::new(error)).clone();
-                    return Err(AppError::CopyExecutionStopped { source });
+                    return Err(AppError::CopyExecutionStopped {
+                        phase: "source_cleanup",
+                        source,
+                    });
                 }
                 Ok(())
             })

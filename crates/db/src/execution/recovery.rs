@@ -6,7 +6,7 @@ use crate::{
     execution::transport::{ScanHttpCancellation, build_client},
 };
 use clickhouse::{Client, query::Query};
-use rustc_hash::FxHashSet;
+use rustc_hash::FxHashMap;
 use std::{
     future::Future,
     sync::{
@@ -40,8 +40,8 @@ pub(crate) enum RequestSafety {
 #[derive(Default)]
 struct Recovery {
     started: Option<Instant>,
-    failed: FxHashSet<u64>,
-    cause: Option<Arc<DatabaseError>>,
+    failed: FxHashMap<u64, Arc<DatabaseError>>,
+    first_operation: Option<u64>,
 }
 
 struct Inner {
@@ -63,6 +63,7 @@ struct Inner {
 #[derive(Clone)]
 pub struct ScanDatabaseExecution {
     inner: Arc<Inner>,
+    request_phase: Option<&'static str>,
 }
 
 pub struct ConnectivityWatch {
@@ -81,10 +82,9 @@ impl Drop for MonitorExit {
             && !self.execution.inner.stopping.is_cancelled()
             && self.execution.failure().is_none()
         {
-            self.execution
-                .inner
-                .terminal
-                .send_replace(Some(Arc::new(DatabaseError::ConnectivityMonitorStopped)));
+            self.execution.inner.terminal.send_replace(Some(
+                self.execution.recovery_cause(DatabaseError::ConnectivityMonitorStopped),
+            ));
         }
     }
 }
@@ -98,12 +98,30 @@ impl ConnectivityWatch {
 }
 
 impl ScanDatabaseExecution {
+    /// 在真实请求首次报告失败时保存其阶段，其他 worker 观察到同一失败时沿用原阶段。
+    pub fn with_request_phase(mut self, phase: &'static str) -> Self {
+        self.request_phase = Some(phase);
+        self
+    }
+
+    fn recovery_cause(&self, error: DatabaseError) -> Arc<DatabaseError> {
+        match (self.request_phase, error) {
+            (Some(_), DatabaseError::ScanRequestFailed { source }) => source,
+            (Some(phase), error) => Arc::new(DatabaseError::RequestFailureInPhase {
+                phase,
+                source: Box::new(error),
+            }),
+            (None, error) => Arc::new(error),
+        }
+    }
+
     pub(crate) fn new(config: &ClickHouseConfig) -> Result<Self> {
         let mut probe = config.clone();
         probe.dial_timeout = probe.dial_timeout.min(1);
         probe.read_timeout = probe.read_timeout.min(1);
         let (terminal, _) = watch::channel(None);
         Ok(Self {
+            request_phase: None,
             inner: Arc::new(Inner {
                 origin: Instant::now(),
                 last_ack_millis: AtomicU64::new(0),
@@ -135,6 +153,14 @@ impl ScanDatabaseExecution {
     }
     pub fn failure(&self) -> Option<Arc<DatabaseError>> {
         self.inner.terminal.borrow().clone()
+    }
+    /// 耗尽窗口时仍未恢复的探测失败，供复制执行与其余独立失败一起交付。
+    pub async fn unresolved_probe_failure(&self) -> Option<Arc<DatabaseError>> {
+        if self.inner.expired.load(Ordering::Acquire) {
+            self.inner.recovery.lock().await.failed.get(&0).cloned()
+        } else {
+            None
+        }
     }
     pub fn recovery_window(&self) -> Duration {
         if self.inner.expired.load(Ordering::Acquire) {
@@ -190,7 +216,10 @@ impl ScanDatabaseExecution {
         }
         let mut state = self.inner.recovery.lock().await;
         state.failed.remove(&operation);
-        debug!(operation, unresolved_operations = ?state.failed, "ClickHouse request acknowledged during recovery");
+        if state.first_operation == Some(operation) {
+            state.first_operation = state.failed.keys().copied().min();
+        }
+        debug!(operation, unresolved_operations = ?state.failed.keys(), "ClickHouse request acknowledged during recovery");
         if state.failed.is_empty() {
             *state = Recovery::default();
             self.inner.recovering.store(false, Ordering::Release);
@@ -208,8 +237,12 @@ impl ScanDatabaseExecution {
             );
         }
         state.started.get_or_insert_with(Instant::now);
-        state.failed.insert(operation);
-        state.cause.get_or_insert(error);
+        let cause = state.failed.entry(operation).or_insert_with(|| error.clone());
+        if cause.request_was_not_sent() && !error.request_was_not_sent() {
+            // 重试一旦可能已发出，不再用早先的连接拒绝代表这次操作。
+            *cause = error;
+        }
+        state.first_operation.get_or_insert(operation);
         self.inner.recovering.store(true, Ordering::Release);
         self.inner.changed.notify_waiters();
     }
@@ -219,10 +252,10 @@ impl ScanDatabaseExecution {
         let deadline = state.started.map(|start| start + RECOVERY_WINDOW);
         if deadline.is_some_and(|deadline| Instant::now() >= deadline)
             && self.failure().is_none()
-            && let Some(cause) = &state.cause
+            && let Some(cause) = state.first_operation.and_then(|id| state.failed.get(&id))
         {
             self.inner.expired.store(true, Ordering::Release);
-            warn!(unresolved_operations = ?state.failed, "ClickHouse connection recovery window exhausted");
+            warn!(unresolved_operations = ?state.failed.keys(), "ClickHouse connection recovery window exhausted");
             self.inner.terminal.send_replace(Some(cause.clone()));
             self.inner.changed.notify_waiters();
         }
@@ -239,7 +272,7 @@ impl ScanDatabaseExecution {
                 return Err(DatabaseError::ScanCancelled);
             }
             if !self.inner.recovering.load(Ordering::Acquire)
-                || self.inner.recovery.lock().await.failed.contains(&operation)
+                || self.inner.recovery.lock().await.failed.contains_key(&operation)
             {
                 return Ok(());
             }
@@ -260,7 +293,7 @@ impl ScanDatabaseExecution {
         if let Some(id) = parent {
             return match operation().await {
                 Err(error) if error.is_transient_connectivity_failure() && !self.inner.stopping.is_cancelled() => {
-                    let source = Arc::new(error);
+                    let source = self.recovery_cause(error);
                     self.failed_operation(id, source.clone()).await;
                     Err(DatabaseError::ScanRequestFailed { source })
                 }
@@ -268,8 +301,14 @@ impl ScanDatabaseExecution {
             };
         }
         let id = self.inner.next_operation.fetch_add(1, Ordering::Relaxed);
+        let mut first_failure = None;
         loop {
-            self.before_request(id).await?;
+            if let Err(error) = self.before_request(id).await {
+                return Err(match first_failure {
+                    Some(source) if self.request_phase.is_some() => DatabaseError::ScanRequestFailed { source },
+                    _ => error,
+                });
+            }
             match REQUEST_SCOPE.scope((self.clone(), id), operation()).await {
                 Ok(result) => {
                     self.recovered(id).await;
@@ -277,7 +316,12 @@ impl ScanDatabaseExecution {
                 }
                 Err(error) if error.is_transient_connectivity_failure() && !self.inner.stopping.is_cancelled() => {
                     let not_sent = error.request_was_not_sent();
-                    let source = Arc::new(error);
+                    let current = self.recovery_cause(error);
+                    let source = first_failure.get_or_insert_with(|| current.clone());
+                    if source.request_was_not_sent() && !not_sent {
+                        *source = current;
+                    }
+                    let source = Arc::clone(source);
                     self.failed_operation(id, source.clone()).await;
                     if matches!(safety, RequestSafety::UnconfirmedWrite) && !not_sent {
                         warn!(
@@ -302,7 +346,7 @@ impl ScanDatabaseExecution {
         if !error.is_transient_connectivity_failure() || self.inner.stopping.is_cancelled() {
             return error;
         }
-        let source = Arc::new(error);
+        let source = self.recovery_cause(error);
         let id = self.inner.next_operation.fetch_add(1, Ordering::Relaxed);
         self.failed_operation(id, source.clone()).await;
         self.wait_for_end().await;
@@ -354,19 +398,19 @@ impl ScanDatabaseExecution {
             match result {
                 Ok(Ok(1)) => self.recovered(0).await,
                 Ok(Ok(_)) => {
-                    self.failed_operation(0, Arc::new(DatabaseError::ClusterProbeIncomplete))
+                    self.failed_operation(0, self.recovery_cause(DatabaseError::ClusterProbeIncomplete))
                         .await
                 }
                 Ok(Err(error)) => {
                     let error = DatabaseError::from(error);
                     if !error.is_transient_connectivity_failure() {
-                        self.inner.terminal.send_replace(Some(Arc::new(error)));
+                        self.inner.terminal.send_replace(Some(self.recovery_cause(error)));
                         return;
                     }
-                    self.failed_operation(0, Arc::new(error)).await;
+                    self.failed_operation(0, self.recovery_cause(error)).await;
                 }
                 Err(error) => {
-                    self.failed_operation(0, Arc::new(DatabaseError::ProbeTimeout { source: error }))
+                    self.failed_operation(0, self.recovery_cause(DatabaseError::ProbeTimeout { source: error }))
                         .await
                 }
             }
