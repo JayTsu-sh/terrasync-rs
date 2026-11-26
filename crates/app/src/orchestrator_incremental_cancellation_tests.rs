@@ -137,10 +137,11 @@ async fn incremental_cancel_preserves_the_metadata_failure_already_reported() ->
         .ok_or("metadata error missing")?;
     assert!(matches!(
         event,
-        StorageEntryMessage::Error {
-            event: ErrorEvent::Copy,
-            ..
-        }
+        StorageEntryMessage::CopyChangeFailed {
+            entry,
+            change: EntryChange::Changed(ChangeKind::MetadataOnly),
+            reason,
+        } if entry.entry.path().as_str() == "file" && !reason.is_empty()
     ));
     worker.cancel.cancel();
     let result = timeout(Duration::from_millis(500), worker.task).await??;
