@@ -680,14 +680,25 @@ def run_copy_data_cancellation(environment, file_list=False):
         assert len(failed) == 16 and all(report["migration"]["phase"] == "failed" for report in failed), failed
         for failed_report in failed:
             attempt = failed_report["callback_identity"]["attempt_id"]
-            causes = [event for report in reports
-                      if report["callback_identity"]["attempt_id"] == attempt
+            attempt_reports = [report for report in reports
+                               if report.get("callback_identity", {}).get("attempt_id") == attempt]
+            active = [report for report in attempt_reports
+                      if not report["is_final"] and report["in_flight_bytes"] > 0]
+            assert active, attempt_reports
+            # The ledger is the only other file and is already present in incremental runs.
+            published_limit = 0 if failed_report["detail"]["kind"] == "Incremental" else len(b"confirmed ledger")
+            assert all(report["detail"]["transferred_bytes"] <= published_limit for report in active), active
+            assert failed_report["in_flight_bytes"] == 0 and (
+                max(report["detail"]["transferred_bytes"] for report in active)
+                <= failed_report["detail"]["transferred_bytes"] <= published_limit
+            ), failed_report
+            causes = [event for report in attempt_reports
                       for event in (report.get("diagnostics") or {}).get("events", [])]
             assert any("ClickHouse unavailable after" in event["message"] for event in causes), causes
         resumed = [report for report in summaries if report["migration"]["generation"] >= 2 and report["task_error_count"] == 0]
         # 增量基线轮只有 generation=1，成功的后续轮都来自检查点恢复。
         assert len(resumed) == 8 and all(report["detail"]["transferred_bytes"] < 256 * 1024 * 1024 for report in resumed), resumed
-        print("independent data cancellation callback inspection deployments=2 failed_runs=16 checkpoint_resumptions=8 HTTP_204=accepted diagnostics_complete=true", flush=True)
+        print("independent data cancellation callback inspection deployments=2 failed_runs=16 checkpoint_resumptions=8 observed_in_flight=true terminal_in_flight_zero=true cancelled_payload_not_published=true HTTP_204=accepted diagnostics_complete=true", flush=True)
     finally:
         callback.shutdown()
         callback.server_close()
