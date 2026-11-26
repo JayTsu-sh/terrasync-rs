@@ -2,10 +2,12 @@
 
 use clickhouse::Row;
 use serde::{Deserialize, Serialize};
+use task_model::TargetRetention;
 use task_model::migration::{CopyGenerationPhase, MigrationMode, TargetCleanupPolicy};
 
 use super::ClickHouseDatabase;
 use crate::execution::read::QuorumRead;
+use crate::schema::records::COPY_CHANGE_FAILURE_PREFIX;
 use crate::{Result, get_incremental_scan_base_table_name};
 
 const MAX_PAGE_SIZE: u32 = 200;
@@ -23,7 +25,16 @@ pub struct CopyChange {
 #[derive(Debug, Deserialize, Row, Serialize)]
 pub struct CopyChangeCount {
     pub kind: String,
+    pub target_outcome: String,
     pub count: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CopyChangeArchiveCoverage {
+    Complete,
+    Partial,
+    Unavailable,
 }
 
 #[derive(Debug, Serialize)]
@@ -31,6 +42,8 @@ pub struct CopyChangePage {
     pub execution_id: String,
     pub phase: CopyGenerationPhase,
     pub target_cleanup: TargetCleanupPolicy,
+    pub archive_coverage: CopyChangeArchiveCoverage,
+    pub target_preserved_range: Option<TargetRetention>,
     pub counts: Vec<CopyChangeCount>,
     pub changes: Vec<CopyChange>,
     pub next_offset: Option<u64>,
@@ -52,6 +65,8 @@ impl ClickHouseDatabase {
             execution_id: execution_id.to_owned(),
             phase: generation.phase,
             target_cleanup: generation.plan.target_cleanup,
+            archive_coverage: CopyChangeArchiveCoverage::Unavailable,
+            target_preserved_range: generation.target_preservation(),
             counts: Vec::new(),
             changes: Vec::new(),
             next_offset: None,
@@ -60,20 +75,34 @@ impl ClickHouseDatabase {
         if !self.table_exists(&table).await? {
             return Ok(Some(page));
         }
+        page.archive_coverage = if generation.phase == CopyGenerationPhase::Completed {
+            CopyChangeArchiveCoverage::Complete
+        } else {
+            CopyChangeArchiveCoverage::Partial
+        };
         let table = self.catalogue_query_table(&table)?;
         // 按逻辑条目投影，重试写入同一个已完成变更时，计数和分页都只保留一次。
         let changes = format!(
-            "SELECT DISTINCT operation_type AS kind, relative_path AS path,
-                if(operation_type='rename',comment,NULL) AS previous_path, source_presence,
-                target_outcome, if(target_outcome IS NULL,NULL,comment) AS reason
+            "SELECT DISTINCT replaceOne(operation_type, '{COPY_CHANGE_FAILURE_PREFIX}', '') AS kind, relative_path AS path,
+                multiIf(operation_type='rename',comment,
+                    operation_type='{COPY_CHANGE_FAILURE_PREFIX}rename',
+                    JSONExtractString(ifNull(comment,''),'previous_path'),NULL) AS previous_path,
+                source_presence,
+                toNullable(ifNull(target_outcome, 'completed')) AS target_outcome,
+                multiIf(operation_type='{COPY_CHANGE_FAILURE_PREFIX}rename',
+                    JSONExtractString(ifNull(comment,''),'reason'),
+                    startsWith(operation_type, '{COPY_CHANGE_FAILURE_PREFIX}')
+                    OR operation_type IN ('source_deleted','deletion_unconfirmed'),comment,NULL) AS reason
              FROM {table}
-             WHERE copy_execution_id=? AND is_regular_file AND operation_type IN
-             ('new','data_changed','metadata_changed','both_changed','rename','source_deleted','deletion_unconfirmed')"
+             WHERE copy_execution_id=? AND is_regular_file AND
+             (operation_type IN ('new','data_changed','metadata_changed','both_changed','rename','source_deleted','deletion_unconfirmed')
+              OR startsWith(operation_type, '{COPY_CHANGE_FAILURE_PREFIX}'))"
         );
         page.counts = self
             .sync_client
             .query(&format!(
-                "SELECT kind,count() AS count FROM ({changes}) GROUP BY kind ORDER BY kind"
+                "SELECT kind,assumeNotNull(target_outcome) AS target_outcome,count() AS count
+                 FROM ({changes}) GROUP BY kind,target_outcome ORDER BY kind,target_outcome"
             ))
             .bind(execution_id)
             .fetch_quorum_all()

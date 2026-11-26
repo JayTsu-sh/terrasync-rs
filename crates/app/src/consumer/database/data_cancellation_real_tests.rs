@@ -128,11 +128,8 @@ async fn case(fixture: &Fixture, incremental: bool, mode: TransferMode, fault: &
     let orchestrator = SyncOrchestrator::new_local(command.clone());
     let run = timeout(Duration::from_secs(25), orchestrator.run());
     // 原生 Local 自动检查点阈值为 64 MiB；先跨过屏障，才能验证真实复用。
-    let minimum_written = if mode == TransferMode::Checkpoint {
-        80 * 1024 * 1024
-    } else {
-        CHUNK_BYTES as u64
-    };
+    // Direct 也要跨过一次周期回调，确保取消前观察到正的在途字节。
+    let minimum_written = if mode == TransferMode::Checkpoint { 80 } else { 56 } * 1024 * 1024;
     let inject = async {
         for _ in 0..240 {
             if partial_payload_exists(target.path(), minimum_written)? {

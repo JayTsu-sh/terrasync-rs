@@ -163,6 +163,8 @@ pub(crate) fn is_diagnostic(message: &StorageEntryMessage) -> bool {
     matches!(
         message,
         StorageEntryMessage::Error { .. }
+            | StorageEntryMessage::CopyChangeFailed { .. }
+            | StorageEntryMessage::CopyRenameFailed { .. }
             | StorageEntryMessage::Diagnostic { .. }
             | StorageEntryMessage::CopyVersionFailed { .. }
             | StorageEntryMessage::CopySkipped { .. }

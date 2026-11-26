@@ -138,7 +138,16 @@ pub(crate) async fn read_symlink(storage: &Storage, entry: &ObservedEntry) -> Re
     }
 }
 
-pub(crate) async fn create_symlink(storage: &Storage, entry: &ObservedEntry, target: &Path) -> Result<()> {
+pub(crate) async fn create_symlink(
+    storage: &Storage, entry: &ObservedEntry, target: &Path, cancel: Option<&CancellationToken>,
+) -> Result<()> {
+    let check_active = || {
+        if cancel.is_some_and(CancellationToken::is_cancelled) {
+            return Err(StorageError::Cancelled);
+        }
+        Ok(())
+    };
+    check_active()?;
     let name = path(entry.get_relative_path())?;
     if let Some(parent) = entry.get_relative_path().parent() {
         storage::create_directory_all(storage, &path(parent)?)
@@ -146,8 +155,13 @@ pub(crate) async fn create_symlink(storage: &Storage, entry: &ObservedEntry, tar
             .map_err(StorageError::from)?;
     }
     // 旧产品支持用链接替换已有目录项；角色接口显式要求调用方删除。
-    match storage.namespace()?.stat(&name, false).await {
-        Ok(_) => storage.namespace()?.delete(&name).await?,
+    check_active()?;
+    let namespace = storage.namespace()?;
+    match namespace.stat(&name, false).await {
+        Ok(_) => {
+            check_active()?;
+            namespace.delete(&name).await?;
+        }
         Err(StorageRoleFailure::Entry(e)) if e.class() == FailureClass::NotFound => {}
         Err(e) => return Err(e.into()),
     }
@@ -167,8 +181,8 @@ pub(crate) async fn create_symlink(storage: &Storage, entry: &ObservedEntry, tar
         SymlinkTargetEncoding::UnixBytes
     };
     let target = SymlinkTarget::new(encoding, bytes)?;
-    Ok(storage
-        .namespace()?
+    check_active()?;
+    Ok(namespace
         .create_symlink(storage::CreateSymlinkRequest {
             path: name,
             target,

@@ -9,6 +9,7 @@ use std::{
 };
 
 use clickhouse::Client;
+use db::catalogue::CopyChangeArchiveCoverage;
 use db::{ClickHouseConfig, ClickHouseDatabase, DatabaseError};
 use task_model::{
     SourceCleanupPolicy,
@@ -84,6 +85,22 @@ pub(super) async fn check_report(config: &ClickHouseConfig, command: &SyncJobCon
     assert_eq!(database.get_count("base").await?, 0);
     let report = saved_report(config, command, &generation.request.execution_id).await?;
     assert!(report.is_final && report.diagnostics_complete);
+    let files = if command.job_id.ends_with("_data") {
+        0
+    } else if command.job_id.ends_with("fallback") {
+        4
+    } else {
+        2
+    };
+    assert!(
+        matches!(
+            report.detail,
+            ProgressDetail::Full { transferred_bytes, .. } if transferred_bytes == (files * BODY.len()) as u64
+        ),
+        "{}: {:?}",
+        command.job_id,
+        report.detail
+    );
     if command.job_id.ends_with("reject") {
         assert_eq!(report.task_error_count, 1);
     }
@@ -159,6 +176,10 @@ async fn case(config: &ClickHouseConfig, deployment: &str, name: &str) -> Result
             assert_eq!(root.join("source").join(path).exists(), retained);
             if !retained {
                 assert_eq!(std::fs::read(root.join("target").join(path))?, BODY);
+                assert_eq!(
+                    std::fs::metadata(root.join("target").join(path))?.permissions().mode() & 0o777,
+                    0o644
+                );
             }
         }
         if name == "directory" {
@@ -258,6 +279,32 @@ async fn incremental_case(config: &ClickHouseConfig, deployment: &str, name: &st
     );
     if !failed {
         assert_eq!(database.get_count("base").await?, 0);
+    }
+    let page = database
+        .incremental_copy_changes(&generation.request.execution_id, 0, 10)
+        .await?
+        .ok_or(DatabaseError::CopyExecutionUnavailable)?;
+    assert_eq!(
+        page.archive_coverage,
+        if failed {
+            CopyChangeArchiveCoverage::Partial
+        } else {
+            CopyChangeArchiveCoverage::Complete
+        }
+    );
+    if !failed {
+        assert_eq!(
+            page.changes
+                .iter()
+                .map(|row| (row.path.as_str(), row.kind.as_str(), row.target_outcome.as_deref()))
+                .collect::<Vec<_>>(),
+            [
+                ("a", "data_changed", Some("completed")),
+                ("b", "new", Some("completed"))
+            ]
+        );
+        assert_eq!(page.counts.len(), 2);
+        assert!(page.counts.iter().all(|row| row.count == 1));
     }
     let report = saved_report(config, &migration, &generation.request.execution_id).await?;
     assert!(report.is_final && report.diagnostics_complete);

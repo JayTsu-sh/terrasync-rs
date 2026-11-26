@@ -408,6 +408,12 @@ impl SyncOrchestrator {
                     SourceAbsenceCheck::new(
                         Duration::from_secs(app_config.scan.operation_timeout_secs),
                         Duration::from_secs(app_config.scan.recovery_window_secs),
+                    )
+                    .with_cancellation(
+                        consumer_manager
+                            .copy_database_execution()
+                            .map(|execution| execution.token().clone())
+                            .unwrap_or_default(),
                     ),
                 )
                 .await?;
@@ -427,8 +433,16 @@ impl SyncOrchestrator {
         }
 
         let result: Result<()> = async {
-            let destination = phase_b_dest_storage?;
-            phase_b_consumers?;
+            let destination = match (phase_b_dest_storage, phase_b_consumers) {
+                (Ok(destination), Ok(())) => destination,
+                (Err(source), Err(reporting)) => {
+                    return Err(AppError::MigrationReportingFailed {
+                        source: Box::new(source),
+                        reporting: Box::new(reporting),
+                    });
+                }
+                (Err(error), Ok(())) | (Ok(_), Err(error)) => return Err(error),
+            };
             // 增量跳过项由清理阶段补齐所选的数据校验。
             let cleanup = (!is_source_reserved).then(|| RemainingSourceCleanup {
                 source: early.connections.map(|(source, _)| source),

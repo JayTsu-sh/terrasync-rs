@@ -100,6 +100,13 @@ pub enum EntryChange {
     Changed(ChangeKind),
 }
 impl EntryChange {
+    pub fn as_state_str(self) -> &'static str {
+        match self {
+            Self::New => "new",
+            Self::Changed(kind) => kind.as_state_str(),
+        }
+    }
+
     pub fn message(self, item: ObservedItem) -> StorageEntryMessage {
         match self {
             Self::New => StorageEntryMessage::New(item),
@@ -161,6 +168,19 @@ pub enum StorageEntryMessage {
     },
     /// 文件已变更（kind 区分 data/metadata/both）
     Changed { entry: ObservedItem, kind: ChangeKind },
+    /// 已识别新增或修改，但复制未完成。此事件不能更新复制基线。
+    CopyChangeFailed {
+        entry: ObservedItem,
+        change: EntryChange,
+        reason: String,
+    },
+    /// 改名或改名后的属性／内容更新未完成；保留已识别的两个路径。
+    CopyRenameFailed {
+        from: Arc<ObservedEntry>,
+        to: Arc<ObservedEntry>,
+        change: Option<ChangeKind>,
+        reason: String,
+    },
     /// 文件已删除
     Deleted(Arc<ObservedEntry>),
     /// 增量审查的逐项结果，独立于目录变更和删除成功计数。
@@ -172,6 +192,8 @@ pub enum StorageEntryMessage {
     },
     /// 文件被重命名，(from, to)
     Renamed((Arc<ObservedEntry>, Arc<ObservedEntry>)),
+    /// 旧目标路径已不存在，使用当前源内容恢复已识别的重命名。
+    CopyRenameRecovered((Arc<ObservedEntry>, Arc<ObservedEntry>)),
     /// 文件完整性检查完成
     IntegrityChecked(Arc<ObservedEntry>),
     /// 目录需要打包为 tar（仅在 --packaged 模式下由 walkdir 发射）
@@ -194,4 +216,20 @@ pub enum StorageEntryMessage {
         /// 错误原因
         reason: String,
     },
+}
+
+impl StorageEntryMessage {
+    /// 返回应计入条目失败统计的事件。明细交付可以保留同一条目的多个原因。
+    pub fn counted_error(&self) -> Option<ErrorEvent> {
+        match self {
+            Self::Error { event, .. } => Some(*event),
+            Self::CopyRenameFailed { change: None, .. } => Some(ErrorEvent::Rename),
+            Self::CopyChangeFailed { .. }
+            | Self::CopyRenameFailed { .. }
+            | Self::CopyVersionFailed {
+                first_in_entry: true, ..
+            } => Some(ErrorEvent::Copy),
+            _ => None,
+        }
+    }
 }

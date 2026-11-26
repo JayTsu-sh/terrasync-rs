@@ -8,22 +8,27 @@ use task_model::migration::CopyGenerationPhase;
 use clickhouse::Client;
 use data_mover::model::{BackendKind, EntryKind};
 use db::catalogue::ComparisonMode;
-use db::{ClickHouseConfig, ClickHouseDatabase, DatabaseError};
-use task_model::{StorageEntryMessage, TransferMode};
+use db::{ClickHouseConfig, ClickHouseDatabase, DatabaseError, INCREMENTAL_SCAN_TABLE_BASE_NAME};
+use task_model::{ChangeKind, StorageEntryMessage, TransferMode};
 use tempfile::tempdir;
+use tokio_util::sync::CancellationToken;
 use utils::app_config::ClickHouseMode;
 use uuid::Uuid;
 
 use super::SyncOrchestrator;
 use crate::broadcast::BroadcastForwarder;
-use crate::error::{AppError, Result};
+use crate::error::{AppError, Result, StorageError};
 use crate::file_copy::metadata::set_entry_metadata;
 use crate::observed_fixtures::observation;
 use crate::storage_factory::{CreateStorageOptions, create_storage};
 
-async fn apply_case(config: &ClickHouseConfig, directory: bool) -> Result<()> {
+async fn apply_case(config: &ClickHouseConfig, case: &str) -> Result<()> {
     let reserved = true;
-    let job = format!("rename_{reserved}_{directory}");
+    let directory = case == "directory";
+    let changed_failure = case == "change_failed";
+    let rename_failure = case == "rename_failed";
+    let cancelled = case == "cancelled";
+    let job = format!("rename_{case}");
     let database = ClickHouseDatabase::connect(config, &job).await?;
     database.initialize().await?;
     database.begin_copy_generation(&request("same-plan", true)).await?;
@@ -38,6 +43,10 @@ async fn apply_case(config: &ClickHouseConfig, directory: bool) -> Result<()> {
         std::fs::write(source_root.path().join("new"), b"payload")?;
         std::fs::write(target_root.path().join("old"), b"payload")?;
     }
+    if rename_failure {
+        std::fs::create_dir(target_root.path().join("new"))?;
+        std::fs::write(target_root.path().join("new/keep"), b"unowned target")?;
+    }
     let kind = if directory {
         EntryKind::Directory
     } else {
@@ -48,7 +57,7 @@ async fn apply_case(config: &ClickHouseConfig, directory: bool) -> Result<()> {
             BackendKind::Nfs,
             path.into(),
             kind,
-            7,
+            if changed_failure && path == "new" { 8 } else { 7 },
             [0; 3],
             None,
             Some(b"stable-source".to_vec()),
@@ -67,7 +76,8 @@ async fn apply_case(config: &ClickHouseConfig, directory: bool) -> Result<()> {
         .finish_copy_generation(CopyGenerationPhase::Completed, None)
         .await?;
     let database = database.new_execution_scope();
-    database.begin_copy_generation(&request("same-plan", reserved)).await?;
+    let run = request("same-plan", reserved);
+    database.begin_copy_generation(&run).await?;
     assert!(
         database
             .compare_catalogue_batch(&[entry("new").into()], ComparisonMode::AwaitCopyAcknowledgement)
@@ -76,7 +86,11 @@ async fn apply_case(config: &ClickHouseConfig, directory: bool) -> Result<()> {
     );
     let mut events = BroadcastForwarder::new(8);
     let mut received = events.subscribe();
-    SyncOrchestrator::apply_deletions_and_renames(
+    let cancel = CancellationToken::new();
+    if cancelled {
+        cancel.cancel();
+    }
+    let result = SyncOrchestrator::apply_deletions_and_renames(
         &database,
         source,
         target,
@@ -88,22 +102,85 @@ async fn apply_case(config: &ClickHouseConfig, directory: bool) -> Result<()> {
         &job,
         "",
         TransferMode::Direct,
-        SourceAbsenceCheck::new(Duration::from_secs(1), Duration::from_secs(3)),
+        SourceAbsenceCheck::new(Duration::from_secs(1), Duration::from_secs(3)).with_cancellation(cancel),
     )
-    .await?;
+    .await;
     assert!(
         source_root.path().join("new").exists(),
         "source purge belongs to target-ready cleanup"
     );
-    assert!(!target_root.path().join("old").exists());
-    let path = if directory { "new/child" } else { "new" };
-    assert_eq!(std::fs::read(target_root.path().join(path))?, b"payload");
-    assert!(
-        matches!(received.try_recv(), Ok(StorageEntryMessage::Renamed((from, to)))
-        if from.path().as_str()=="old" && to.path().as_str()=="new")
+    assert_eq!(
+        database
+            .current_copy_generation()
+            .await?
+            .target_reconciliation_completed,
+        Some(!cancelled),
     );
+    if cancelled {
+        assert!(matches!(result, Err(AppError::StorageError(StorageError::Cancelled))));
+        assert_eq!(std::fs::read(target_root.path().join("old"))?, b"payload");
+        assert!(!target_root.path().join("new").exists());
+        assert!(received.try_recv().is_err());
+        return Ok(());
+    }
+    assert_eq!(target_root.path().join("old").exists(), rename_failure);
+    let path = if directory { "new/child" } else { "new" };
+    if changed_failure || rename_failure {
+        assert!(result.is_err());
+        let Ok(event) = received.try_recv() else {
+            panic!("failed rename must publish its classified outcome");
+        };
+        assert!(matches!(
+            &event,
+            StorageEntryMessage::CopyRenameFailed { from, to, change, reason }
+            if from.path().as_str() == "old" && to.path().as_str() == "new"
+                && *change == changed_failure.then_some(ChangeKind::DataOnly) && !reason.is_empty()
+        ));
+        assert!(
+            received.try_recv().is_err(),
+            "failed follow-up must not publish a baseline success"
+        );
+        database.create_table(INCREMENTAL_SCAN_TABLE_BASE_NAME).await?;
+        database.batch_insert_incremental_record(&[event]).await?;
+        let page = database
+            .incremental_copy_changes(&run.execution_id, 0, 10)
+            .await?
+            .ok_or(DatabaseError::CopyExecutionUnavailable)?;
+        assert_eq!(page.changes.len(), if changed_failure { 2 } else { 1 });
+        let rename = page
+            .changes
+            .iter()
+            .find(|row| row.kind == "rename")
+            .ok_or(DatabaseError::CopyExecutionUnavailable)?;
+        assert_eq!(rename.previous_path.as_deref(), Some("old"));
+        assert_eq!(rename.path, "new");
+        assert_eq!(
+            rename.target_outcome.as_deref(),
+            Some(if changed_failure {
+                "moved_update_failed"
+            } else {
+                "failed"
+            })
+        );
+        assert!(rename.reason.as_ref().is_some_and(|reason| !reason.is_empty()));
+        assert!(page.counts.iter().all(|row| row.count == 1));
+        if changed_failure {
+            assert!(
+                page.changes
+                    .iter()
+                    .any(|row| row.kind == "data_changed" && row.target_outcome.as_deref() == Some("failed"))
+            );
+        }
+    } else {
+        result?;
+        assert_eq!(std::fs::read(target_root.path().join(path))?, b"payload");
+        assert!(
+            matches!(received.try_recv(), Ok(StorageEntryMessage::Renamed((from, to)))
+            if from.path().as_str()=="old" && to.path().as_str()=="new")
+        );
+    }
     eprintln!(
-        "rename-apply cluster={} source_reserved={reserved} directory={directory} target_moved=true source_not_purged_early=true",
+        "rename-apply cluster={} source_reserved={reserved} case={case} source_not_purged_early=true",
         config.cluster.is_some()
     );
     Ok(())
@@ -141,8 +218,8 @@ async fn real_retained_incremental_applies_confirmed_rename() -> Result<()> {
             .await
             .map_err(DatabaseError::from)?;
         let result: Result<()> = async {
-            for directory in [false, true] {
-                apply_case(&config, directory).await?;
+            for case in ["file", "directory", "change_failed", "rename_failed", "cancelled"] {
+                apply_case(&config, case).await?;
             }
             Ok(())
         }

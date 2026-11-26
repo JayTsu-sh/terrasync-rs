@@ -18,7 +18,7 @@ use data_mover::model::{EntryKind, ObservedEntry};
 use reqwest::redirect::Policy;
 use task_model::migration::MigrationReport;
 use task_model::observation::{EntryProgress, EntryStatistics, ObservedScanEvent, ObservedView};
-use task_model::{RetentionScope, StorageEntryMessage};
+use task_model::{ErrorEvent, RetentionScope, StorageEntryMessage};
 use tokio::sync::{Mutex, mpsc};
 use tokio::task::JoinHandle;
 use tokio::time::{Instant, timeout};
@@ -235,16 +235,25 @@ impl StatisticConsumer {
             self.callback.runtime.current_error = Some(reason);
             self.callback.runtime.state = ScanRuntimePhase::Failed;
         }
-        if let StorageEntryMessage::Error {
-            event, path, reason, ..
-        }
-        | StorageEntryMessage::Diagnostic { event, path, reason } = message
-        {
+        let diagnostic = match message {
+            StorageEntryMessage::Error {
+                event, path, reason, ..
+            }
+            | StorageEntryMessage::Diagnostic { event, path, reason } => Some((*event, path.to_str(), reason)),
+            StorageEntryMessage::CopyChangeFailed { entry, reason, .. } => {
+                Some((ErrorEvent::Copy, Some(entry.entry.path().as_str()), reason))
+            }
+            StorageEntryMessage::CopyRenameFailed { to, reason, .. } => message
+                .counted_error()
+                .map(|event| (event, Some(to.path().as_str()), reason)),
+            _ => None,
+        };
+        if let Some((event, path, reason)) = diagnostic {
             let reason = safe_diagnostic_text(reason);
             let retained = self
                 .callback
                 .outbox
-                .enqueue("operation", &format!("{event:?}"), &reason, path.to_str());
+                .enqueue("operation", &format!("{event:?}"), &reason, path);
             self.callback.diagnostics_incomplete |= !retained;
             self.callback.runtime.current_error = Some(reason);
             self.callback.runtime.state = ScanRuntimePhase::Failed;

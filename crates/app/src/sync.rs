@@ -297,7 +297,7 @@ async fn process_entry_inner(
     } else if entry.get_is_symlink() {
         match copy_namespace::read_symlink(src_storage.storage(), entry).await {
             Ok(target_path) => {
-                copy_namespace::create_symlink(dest_storage.storage(), entry, &target_path).await?;
+                copy_namespace::create_symlink(dest_storage.storage(), entry, &target_path, resume.cancel.as_ref()).await?;
             }
             Err(e) => {
                 error!("Failed to read symlink {:?}: {}", relative_path, e);

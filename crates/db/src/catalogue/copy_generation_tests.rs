@@ -54,6 +54,7 @@ fn prior(binding: &str, reserved: bool, phase: CopyGenerationPhase, prepared: bo
         request,
         phase,
         baseline_prepared: prepared,
+        target_reconciliation_completed: None,
     }
 }
 

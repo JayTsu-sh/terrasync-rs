@@ -143,7 +143,7 @@ pub enum AppError {
         source: Box<AppError>,
         finalization: DatabaseError,
     },
-    #[error("迁移失败: {source}; 保留目标的范围明细也未能记录: {reporting}")]
+    #[error("迁移失败: {source}; 迁移明细报告同时失败: {reporting}")]
     MigrationReportingFailed {
         #[source]
         source: Box<AppError>,
@@ -465,6 +465,17 @@ impl AppError {
             Self::ReportedCopyFailure { .. } => true,
             Self::CopyEntryFailed { source, .. } => source.is_reported_copy_failure(),
             _ => false,
+        }
+    }
+
+    pub(crate) fn with_reported_copy_failure(self, metadata_only: bool) -> Self {
+        let data_failed = !metadata_only
+            && self
+                .storage_error()
+                .is_none_or(|error| error.published_data().is_none());
+        Self::ReportedCopyFailure {
+            source: Box::new(self),
+            data_failed,
         }
     }
 

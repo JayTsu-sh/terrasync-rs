@@ -231,7 +231,19 @@ async fn namespace_symlinks_and_recursive_delete_use_storage_roles() -> TestResu
         data_mover::model::SymlinkTarget::new(data_mover::model::SymlinkTargetEncoding::UnixBytes, b"b/data".to_vec())?,
     )?
     .with_metadata(original.metadata().clone());
-    copy_namespace::create_symlink(storage.storage(), &link, Path::new("b/data")).await?;
+    let cancel = CancellationToken::new();
+    cancel.cancel();
+    tokio::fs::write(root.path().join("a/link"), b"existing destination").await?;
+    assert!(
+        copy_namespace::create_symlink(storage.storage(), &link, Path::new("b/data"), Some(&cancel))
+            .await
+            .is_err_and(|error| error.is_cancelled())
+    );
+    assert_eq!(
+        tokio::fs::read(root.path().join("a/link")).await?,
+        b"existing destination"
+    );
+    copy_namespace::create_symlink(storage.storage(), &link, Path::new("b/data"), None).await?;
     assert_eq!(
         copy_namespace::read_symlink(storage.storage(), &link).await?,
         Path::new("b/data")

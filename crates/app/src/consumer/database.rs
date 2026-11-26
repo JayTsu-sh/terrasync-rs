@@ -192,12 +192,13 @@ impl Consumer for DatabaseConsumer {
                                 )
                                 .await;
                             }
-                            StorageEntryMessage::Renamed((from_entry, to_entry)) => {
+                            ref detail @ (StorageEntryMessage::Renamed((ref from_entry, ref to_entry))
+                            | StorageEntryMessage::CopyRenameRecovered((ref from_entry, ref to_entry))) => {
                                 trace!("[DatabaseConsumer] Renaming entry {:?} to {:?}", from_entry, to_entry);
                                 // 在增量拷贝和增量扫描场景均需要更新数据库里的记录
                                 DatabaseConsumer::batch_insert_base_record(
                                     &db,
-                                    &Arc::clone(&to_entry).into(),
+                                    &Arc::clone(to_entry).into(),
                                     &mut current_insert_entry_batch,
                                     batch_size,
                                     &mut processed_errors,
@@ -206,7 +207,7 @@ impl Consumer for DatabaseConsumer {
 
                                 DatabaseConsumer::batch_delete_base_record(
                                     &db,
-                                    &from_entry,
+                                    from_entry,
                                     &mut current_delete_entry_batch,
                                     batch_size,
                                     &mut processed_errors,
@@ -215,7 +216,7 @@ impl Consumer for DatabaseConsumer {
 
                                 DatabaseConsumer::batch_insert_incremental_record(
                                     &db,
-                                    &StorageEntryMessage::Renamed((from_entry, to_entry)),
+                                    detail,
                                     &mut current_message_batch,
                                     batch_size,
                                     &mut processed_errors,
@@ -237,6 +238,17 @@ impl Consumer for DatabaseConsumer {
                                 DatabaseConsumer::batch_insert_incremental_record(
                                     &db,
                                     &StorageEntryMessage::Deleted(entry),
+                                    &mut current_message_batch,
+                                    batch_size,
+                                    &mut processed_errors,
+                                )
+                                .await;
+                            }
+                            ref detail @ (StorageEntryMessage::CopyChangeFailed { .. }
+                            | StorageEntryMessage::CopyRenameFailed { .. }) => {
+                                Self::batch_insert_incremental_record(
+                                    &db,
+                                    detail,
                                     &mut current_message_batch,
                                     batch_size,
                                     &mut processed_errors,

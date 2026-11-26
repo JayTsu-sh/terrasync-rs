@@ -413,10 +413,11 @@ def run_copy_content(environment):
                 "--", "--ignored", "--nocapture", "--test-threads=1",
             ], cwd=ROOT, env=environment, check=True)
             summaries = [report for report in reports if report["is_final"] and not report.get("diagnostics")]
-            assert len(summaries) == 16 and all(report["diagnostics_complete"] for report in summaries), summaries
+            assert len(summaries) == 20 and all(report["diagnostics_complete"] for report in summaries), summaries
             byte_rounds = [report for report in summaries if report["job_id"] == "content_bytes"]
             assert sorted(report["detail"]["transferred_bytes"] for report in byte_rounds) == [15, 15, 16, 16], byte_rounds
-            failed = [report for report in summaries if report["migration"]["phase"] == "failed"]
+            failed = [report for report in summaries if report["migration"]["phase"] == "failed"
+                      and report["job_id"] != "content_failed_changes"]
             assert len(failed) == 4 and all(report["task_error_count"] == report["target_preserved_count"] == 1 for report in failed), failed
             events = {event["event_id"]: event for report in reports
                       for event in (report.get("diagnostics") or {}).get("events", [])}
@@ -432,7 +433,16 @@ def run_copy_content(environment):
                     source = root / "source" / "payload"
                     assert (root / "target" / "payload").read_bytes() == (b"source!" if case == "unchanged" else b"damaged")
                     assert not source.exists() if case == "unchanged" else source.read_bytes() == b"source!"
-            print("independent content migration inspection deployments=2 rounds=16 published_bytes_checked=true corrupted_sources_retained=4 confirmed_sources_removed=2 callback_causes=4 HTTP_204=accepted final_reports_saved=true", flush=True)
+            failed_changes = [report for report in summaries if report["job_id"] == "content_failed_changes"
+                              and report["migration"]["phase"] == "failed"]
+            assert len(failed_changes) == 2, failed_changes
+            for report in failed_changes:
+                assert report["detail"]["error_count"] == 2 and report["task_error_count"] == 0, report
+                attempt = report["callback_identity"]["attempt_id"]
+                paths = {event["path"] for event in events.values()
+                         if event["attempt_id"] == attempt and event["code"] == "Copy"}
+                assert paths == {"added", "changed"}, paths
+            print("independent content migration inspection deployments=2 rounds=20 published_bytes_checked=true failed_change_paths_checked=true corrupted_sources_retained=4 confirmed_sources_removed=2 callback_causes=4 HTTP_204=accepted final_reports_saved=true", flush=True)
     finally:
         callback.shutdown()
         callback.server_close()
@@ -671,14 +681,25 @@ def run_copy_data_cancellation(environment, file_list=False):
         assert len(failed) == 16 and all(report["migration"]["phase"] == "failed" for report in failed), failed
         for failed_report in failed:
             attempt = failed_report["callback_identity"]["attempt_id"]
-            causes = [event for report in reports
-                      if report["callback_identity"]["attempt_id"] == attempt
+            attempt_reports = [report for report in reports
+                               if report.get("callback_identity", {}).get("attempt_id") == attempt]
+            active = [report for report in attempt_reports
+                      if not report["is_final"] and report["in_flight_bytes"] > 0]
+            assert active, attempt_reports
+            # The ledger is the only other file and is already present in incremental runs.
+            published_limit = 0 if failed_report["detail"]["kind"] == "Incremental" else len(b"confirmed ledger")
+            assert all(report["detail"]["transferred_bytes"] <= published_limit for report in active), active
+            assert failed_report["in_flight_bytes"] == 0 and (
+                max(report["detail"]["transferred_bytes"] for report in active)
+                <= failed_report["detail"]["transferred_bytes"] <= published_limit
+            ), failed_report
+            causes = [event for report in attempt_reports
                       for event in (report.get("diagnostics") or {}).get("events", [])]
             assert any("ClickHouse unavailable after" in event["message"] for event in causes), causes
         resumed = [report for report in summaries if report["migration"]["generation"] >= 2 and report["task_error_count"] == 0]
         # 增量基线轮只有 generation=1，成功的后续轮都来自检查点恢复。
         assert len(resumed) == 8 and all(report["detail"]["transferred_bytes"] < 256 * 1024 * 1024 for report in resumed), resumed
-        print("independent data cancellation callback inspection deployments=2 failed_runs=16 checkpoint_resumptions=8 HTTP_204=accepted diagnostics_complete=true", flush=True)
+        print("independent data cancellation callback inspection deployments=2 failed_runs=16 checkpoint_resumptions=8 observed_in_flight=true terminal_in_flight_zero=true cancelled_payload_not_published=true HTTP_204=accepted diagnostics_complete=true", flush=True)
     finally:
         callback.shutdown()
         callback.server_close()

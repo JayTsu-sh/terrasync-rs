@@ -8,14 +8,15 @@ use data_mover::{
 };
 use db::{ClickHouseDatabase, DeletionStatus};
 use task_model::{
-    ChangeKind, ErrorEvent, ObservedEntryExt, SourcePresence, StorageEntryMessage, TargetDeletionOutcome,
+    ChangeKind, EntryChange, ErrorEvent, ObservedEntryExt, SourcePresence, StorageEntryMessage, TargetDeletionOutcome,
     TargetRetention, TargetRetentionReason, TransferMode,
 };
+use tokio_util::sync::CancellationToken;
 use tracing::error;
 
 use super::SyncOrchestrator;
 use crate::broadcast::BroadcastForwarder;
-use crate::error::{AppError, Result};
+use crate::error::{AppError, Result, StorageError};
 use crate::file_copy::local::CommitRecorder;
 use crate::file_copy::{CopyOptions, HdfsCopyContext, copy_file};
 use crate::file_copy::{metadata as copy_metadata, namespace as copy_namespace};
@@ -48,7 +49,7 @@ async fn publish_target_deletion(
 /// 目标清理复用既有缺失证明和错误传播，逐项结果随原广播批处理。
 async fn reconcile_target_deletion(
     source: &StorageContext, destination: &StorageContext, entry: &Arc<ObservedEntry>, is_source_reserved: bool,
-    events: &BroadcastForwarder<StorageEntryMessage>, source_absence: SourceAbsenceCheck,
+    events: &BroadcastForwarder<StorageEntryMessage>, source_absence: &SourceAbsenceCheck,
 ) -> Result<Option<AppError>> {
     // 搬迁不将源缺失反向删除目标；rename 仍需推进，不能跳过整个阶段。
     if !is_source_reserved {
@@ -75,14 +76,16 @@ async fn reconcile_target_deletion(
     let source_presence = match source_absence.confirm(source, entry, events).await {
         Ok(presence) => presence,
         Err(error) => {
-            let _ = publish_target_deletion(
-                events,
-                entry,
-                SourcePresence::Unknown,
-                TargetDeletionOutcome::Failed,
-                Some(error.to_string()),
-            )
-            .await;
+            if !source_absence.cancellation().is_cancelled() {
+                let _ = publish_target_deletion(
+                    events,
+                    entry,
+                    SourcePresence::Unknown,
+                    TargetDeletionOutcome::Failed,
+                    Some(error.to_string()),
+                )
+                .await;
+            }
             return Err(error);
         }
     };
@@ -98,6 +101,7 @@ async fn reconcile_target_deletion(
         return Ok(None);
     }
     // 仅删除本条目或空目录；未核验的后代不能据此授权删除。
+    source_absence.check_active()?;
     let outcome = match copy_namespace::delete_file(destination.storage(), entry).await {
         Ok(()) => TargetDeletionOutcome::Deleted,
         Err(error) if error.is_not_found() => TargetDeletionOutcome::AlreadyAbsent,
@@ -127,7 +131,7 @@ async fn reconcile_target_deletion(
                     reason: error.to_string(),
                 })
                 .await?;
-            return Ok(Some(error.into()));
+            return Ok(Some(AppError::from(error).with_reported_copy_failure(false)));
         }
     };
     publish_target_deletion(events, entry, source_presence, outcome, None).await?;
@@ -139,8 +143,8 @@ impl SyncOrchestrator {
     #[allow(clippy::too_many_arguments)]
     async fn sync_renamed_file_changes(
         kind: ChangeKind, entry: &Arc<ObservedEntry>, src: &StorageContext, dest: &StorageContext,
-        qos: Option<QosManager>, integrity: bool, _source_reserved: bool, bytes: Option<Arc<CopyBytes>>, job_id: &str,
-        job_dir: &str, transfer_mode: TransferMode,
+        qos: Option<QosManager>, integrity: bool, bytes: Option<Arc<CopyBytes>>, job_id: &str, job_dir: &str,
+        transfer_mode: TransferMode, cancel: CancellationToken,
     ) -> Result<()> {
         let mut metadata_applied = false;
         if kind != ChangeKind::MetadataOnly {
@@ -168,7 +172,7 @@ impl SyncOrchestrator {
                     qos,
                     enable_integrity_check: integrity,
                     bytes_counter: bytes,
-                    ..Default::default()
+                    cancel: Some(cancel.clone()),
                 },
                 hdfs.as_ref(),
             )
@@ -181,7 +185,7 @@ impl SyncOrchestrator {
             metadata_applied = true;
         }
         if !metadata_applied {
-            copy_metadata::set_entry_metadata(dest.storage(), entry, None).await?;
+            copy_metadata::set_entry_metadata(dest.storage(), entry, Some(cancel)).await?;
         }
         Ok(())
     }
@@ -211,6 +215,7 @@ impl SyncOrchestrator {
         qos_manager: Option<QosManager>, bytes_counter: Option<Arc<CopyBytes>>, job_id: &str, job_dir: &str,
         transfer_mode: TransferMode, source_absence: SourceAbsenceCheck,
     ) -> Result<()> {
+        source_absence.check_active()?;
         let deletion_iter = db.detect_deleted_items().await?;
         let mut failure: Option<AppError> = None;
 
@@ -240,170 +245,201 @@ impl SyncOrchestrator {
         // 无句柄的源历史按 path/version 连续返回；同一 key 的保留决定只交付一次。
         let mut last_preserved_path = None;
         // 第二遍：按顺序执行物理操作
-        for status in statuses {
-            match status {
-                DeletionStatus::Deleted(entry) => {
-                    if last_preserved_path.as_ref() == Some(entry.path()) {
-                        continue;
-                    }
-                    last_preserved_path = Some(entry.path().clone());
-                    if let Some(error) = reconcile_target_deletion(
-                        &src_storage,
-                        &dest_storage,
-                        &Arc::new(entry),
-                        is_source_reserved,
-                        broadcaster,
-                        source_absence,
-                    )
-                    .await?
-                    {
-                        failure.get_or_insert(error);
-                    }
-                }
-                DeletionStatus::Renamed(from, to) => {
-                    let from_arc = Arc::new(*from);
-                    let to_arc = Arc::new(*to);
-                    let old_source_absent =
-                        source_absence.confirm(&src_storage, &from_arc, broadcaster).await? == SourcePresence::Absent;
-                    // 父目录正在被 rename 时，NFS RENAME 已传递性地移动了子条目，无需重复操作。
-                    // from_parent 分配仅在同名情况下进行，避免对名字不同的 rename 做无效分配。
-                    let skip_physical = from_arc.get_name() == to_arc.get_name() && {
-                        let from_parent = from_arc.get_relative_path().parent().map(PathBuf::from);
-                        let to_parent = to_arc.get_relative_path().parent().map(PathBuf::from);
-                        match (from_parent, to_parent) {
-                            (Some(fp), Some(tp)) => renamed_dirs
-                                .get(&fp)
-                                .is_some_and(|(path, completed)| *completed && path == &tp),
-                            _ => false,
+        let processing = async {
+            for status in statuses {
+                source_absence.check_active()?;
+                match status {
+                    DeletionStatus::Deleted(entry) => {
+                        if last_preserved_path.as_ref() == Some(entry.path()) {
+                            continue;
                         }
-                    };
-
-                    let dest_op_result = if !old_source_absent {
-                        // 同一身份也可能是硬链接；旧源仍在或证据不足时复制新路径并保留旧事实。
-                        process_entry(
-                            &to_arc,
-                            src_storage.clone(),
-                            dest_storage.clone(),
-                            enable_integrity_check,
-                            false,
-                            true,
-                            qos_manager.clone(),
-                            bytes_counter.clone(),
+                        last_preserved_path = Some(entry.path().clone());
+                        if let Some(error) = reconcile_target_deletion(
+                            &src_storage,
+                            &dest_storage,
+                            &Arc::new(entry),
+                            is_source_reserved,
                             broadcaster,
-                            ResumeOpts {
-                                job_id: job_id.into(),
-                                job_dir: job_dir.into(),
-                                transfer_mode,
-                                cancel: None,
-                            },
+                            &source_absence,
                         )
-                        .await
-                        .map(|()| RenameOutcome::Copied)
-                    } else if skip_physical {
-                        Ok(RenameOutcome::Moved)
-                    } else {
-                        rename_or_copy(
-                            from_arc.clone(),
-                            to_arc.clone(),
-                            src_storage.clone(),
-                            dest_storage.clone(),
-                            RenameOptions {
+                        .await?
+                        {
+                            failure.get_or_insert(error);
+                        }
+                    }
+                    DeletionStatus::Renamed(from, to) => {
+                        let from_arc = Arc::new(*from);
+                        let to_arc = Arc::new(*to);
+                        let old_source_absent = source_absence.confirm(&src_storage, &from_arc, broadcaster).await?
+                            == SourcePresence::Absent;
+                        source_absence.check_active()?;
+                        // 父目录正在被 rename 时，NFS RENAME 已传递性地移动了子条目，无需重复操作。
+                        // from_parent 分配仅在同名情况下进行，避免对名字不同的 rename 做无效分配。
+                        let skip_physical = from_arc.get_name() == to_arc.get_name() && {
+                            let from_parent = from_arc.get_relative_path().parent().map(PathBuf::from);
+                            let to_parent = to_arc.get_relative_path().parent().map(PathBuf::from);
+                            match (from_parent, to_parent) {
+                                (Some(fp), Some(tp)) => renamed_dirs
+                                    .get(&fp)
+                                    .is_some_and(|(path, completed)| *completed && path == &tp),
+                                _ => false,
+                            }
+                        };
+
+                        let dest_op_result = if !old_source_absent {
+                            // 同一身份也可能是硬链接；旧源仍在或证据不足时复制新路径并保留旧事实。
+                            process_entry(
+                                &to_arc,
+                                src_storage.clone(),
+                                dest_storage.clone(),
                                 enable_integrity_check,
-                                enable_acl: false,
-                                resume: ResumeOpts {
+                                false,
+                                true,
+                                qos_manager.clone(),
+                                bytes_counter.clone(),
+                                broadcaster,
+                                ResumeOpts {
                                     job_id: job_id.into(),
                                     job_dir: job_dir.into(),
                                     transfer_mode,
-                                    cancel: None,
+                                    cancel: Some(source_absence.cancellation().clone()),
                                 },
-                                qos: qos_manager.clone(),
-                                bytes: bytes_counter.clone(),
-                                events: broadcaster,
-                            },
-                        )
-                        .await
-                    };
-
-                    match dest_op_result {
-                        Ok(outcome) => {
-                            if outcome == RenameOutcome::Moved
-                                && let Some((_, completed)) = renamed_dirs.get_mut(from_arc.get_relative_path())
-                            {
-                                *completed = true;
-                            }
-                            // Phase A 不再把路径已变的文件判为 Changed（Fix 2a），
-                            // 此处补足 rename+changed 文件的内容/元数据同步，并广播 Changed 消息供消费者统计。
-                            if outcome == RenameOutcome::Moved
-                                && !from_arc.get_is_dir()
-                                && !from_arc.get_is_symlink()
-                                && let Some(kind) = ChangeKind::from_entry_diff(&from_arc, &to_arc)
-                            {
-                                let result = Self::sync_renamed_file_changes(
-                                    kind,
-                                    &to_arc,
-                                    &src_storage,
-                                    &dest_storage,
-                                    qos_manager.clone(),
+                            )
+                            .await
+                            .map(|()| RenameOutcome::Copied)
+                        } else if skip_physical {
+                            Ok(RenameOutcome::Moved)
+                        } else {
+                            rename_or_copy(
+                                from_arc.clone(),
+                                to_arc.clone(),
+                                src_storage.clone(),
+                                dest_storage.clone(),
+                                RenameOptions {
                                     enable_integrity_check,
-                                    true,
-                                    bytes_counter.clone(),
-                                    job_id,
-                                    job_dir,
-                                    transfer_mode,
-                                )
-                                .await;
-                                if let Err(error) = result {
+                                    enable_acl: false,
+                                    resume: ResumeOpts {
+                                        job_id: job_id.into(),
+                                        job_dir: job_dir.into(),
+                                        transfer_mode,
+                                        cancel: Some(source_absence.cancellation().clone()),
+                                    },
+                                    qos: qos_manager.clone(),
+                                    bytes: bytes_counter.clone(),
+                                    events: broadcaster,
+                                },
+                            )
+                            .await
+                        };
+
+                        match dest_op_result {
+                            Ok(outcome) => {
+                                if outcome == RenameOutcome::Moved
+                                    && let Some((_, completed)) = renamed_dirs.get_mut(from_arc.get_relative_path())
+                                {
+                                    *completed = true;
+                                }
+                                // Phase A 不再把路径已变的文件判为 Changed（Fix 2a），
+                                // 此处补足 rename+changed 文件的内容/元数据同步，并广播 Changed 消息供消费者统计。
+                                if old_source_absent
+                                    && from_arc.get_is_regular_file()
+                                    && let Some(kind) = ChangeKind::from_entry_diff(&from_arc, &to_arc)
+                                {
+                                    let result = if outcome == RenameOutcome::Moved {
+                                        Self::sync_renamed_file_changes(
+                                            kind,
+                                            &to_arc,
+                                            &src_storage,
+                                            &dest_storage,
+                                            qos_manager.clone(),
+                                            enable_integrity_check,
+                                            bytes_counter.clone(),
+                                            job_id,
+                                            job_dir,
+                                            transfer_mode,
+                                            source_absence.cancellation().clone(),
+                                        )
+                                        .await
+                                    } else {
+                                        // 回退已经复制当前源内容并完成属性，无需重复写入。
+                                        Ok(())
+                                    };
+                                    if let Err(error) = result {
+                                        broadcaster
+                                            .broadcast(StorageEntryMessage::CopyRenameFailed {
+                                                from: from_arc,
+                                                to: to_arc,
+                                                change: Some(kind),
+                                                reason: format!("目标已移动，后续内容或属性更新未完成: {error}"),
+                                            })
+                                            .await?;
+                                        failure.get_or_insert_with(|| {
+                                            error.with_reported_copy_failure(kind == ChangeKind::MetadataOnly)
+                                        });
+                                        continue;
+                                    }
                                     broadcaster
-                                        .broadcast(StorageEntryMessage::Error {
-                                            event: ErrorEvent::Copy,
-                                            path: to_arc.get_relative_path().to_path_buf(),
-                                            entry: Some(to_arc.clone()),
-                                            reason: error.to_string(),
+                                        .broadcast(StorageEntryMessage::Changed {
+                                            entry: to_arc.clone().into(),
+                                            kind,
                                         })
                                         .await?;
-                                    failure.get_or_insert(error);
-                                    continue;
                                 }
-                                broadcaster
-                                    .broadcast(StorageEntryMessage::Changed {
-                                        entry: to_arc.clone().into(),
-                                        kind,
-                                    })
-                                    .await?;
-                            }
 
-                            if old_source_absent {
-                                broadcaster
-                                    .broadcast(StorageEntryMessage::Renamed((from_arc, to_arc)))
-                                    .await?;
-                            } else {
-                                broadcaster.broadcast(StorageEntryMessage::New(to_arc.into())).await?;
+                                if old_source_absent {
+                                    let paths = (from_arc, to_arc);
+                                    let event = match outcome {
+                                        RenameOutcome::Moved => StorageEntryMessage::Renamed(paths),
+                                        RenameOutcome::Copied => StorageEntryMessage::CopyRenameRecovered(paths),
+                                    };
+                                    broadcaster.broadcast(event).await?;
+                                } else {
+                                    broadcaster.broadcast(StorageEntryMessage::New(to_arc.into())).await?;
+                                }
                             }
-                        }
-                        Err(e) => {
-                            error!(
-                                "Phase B: Failed to rename {:?} → {:?}: {}",
-                                from_arc.get_relative_path(),
-                                to_arc.get_relative_path(),
-                                e
-                            );
-                            broadcaster
-                                .broadcast(StorageEntryMessage::Error {
-                                    event: ErrorEvent::Rename,
-                                    path: to_arc.get_relative_path().to_path_buf(),
-                                    entry: Some(to_arc.clone()),
-                                    reason: format!("{e}"),
-                                })
-                                .await?;
-                            failure.get_or_insert(e);
+                            Err(e) => {
+                                if source_absence.cancellation().is_cancelled()
+                                    && e.storage_error().is_some_and(StorageError::is_cancelled)
+                                {
+                                    return Err(e);
+                                }
+                                error!(
+                                    "Phase B: Failed to rename {:?} → {:?}: {}",
+                                    from_arc.get_relative_path(),
+                                    to_arc.get_relative_path(),
+                                    e
+                                );
+                                let reason = e.to_string();
+                                let event = if old_source_absent {
+                                    StorageEntryMessage::CopyRenameFailed {
+                                        from: from_arc,
+                                        to: to_arc,
+                                        change: None,
+                                        reason,
+                                    }
+                                } else {
+                                    StorageEntryMessage::CopyChangeFailed {
+                                        entry: to_arc.into(),
+                                        change: EntryChange::New,
+                                        reason,
+                                    }
+                                };
+                                broadcaster.broadcast(event).await?;
+                                failure.get_or_insert_with(|| e.with_reported_copy_failure(false));
+                            }
                         }
                     }
                 }
             }
+            db.mark_copy_target_reconciliation_completed()
+                .await
+                .map_err(AppError::from)
         }
-        match failure {
-            Some(error) => Err(error),
-            None => Ok(()),
+        .await;
+        match processing {
+            Err(error) if source_absence.cancellation().is_cancelled() => Err(failure.unwrap_or(error)),
+            Err(error) => Err(error),
+            Ok(()) => failure.map_or(Ok(()), Err),
         }
     }
 }

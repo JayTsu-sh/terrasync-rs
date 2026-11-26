@@ -1128,7 +1128,7 @@ impl RemoteReceiverSession {
                         }
                         continue;
                     }
-                    match copy_namespace::create_symlink(dest_storage.storage(), &entry, &target).await {
+                    match copy_namespace::create_symlink(dest_storage.storage(), &entry, &target, None).await {
                         Ok(()) => {
                             progress.files_transferred.fetch_add(1, Ordering::Relaxed);
                             let _ = transport.send(ReceiverMsg::EntrySuccess { entry }).await;

@@ -97,6 +97,7 @@ impl ClickHouseDatabase {
             plan,
             phase: CopyGenerationPhase::Accepted,
             baseline_prepared: false,
+            target_reconciliation_completed: Some(false),
         });
         // 接受记录在清基线、回标及启动扫描之前确认，准备失败也不会误用更早轮次。
         let generation = lifecycle

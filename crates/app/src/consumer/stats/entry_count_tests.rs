@@ -253,6 +253,7 @@ fn incremental_inventory_keeps_entry_counts_and_selected_bytes_across_history_se
                     request,
                     phase: CopyGenerationPhase::Prepared,
                     baseline_prepared: true,
+                    target_reconciliation_completed: None,
                 }
                 .report(),
             );

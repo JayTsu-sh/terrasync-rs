@@ -1,7 +1,7 @@
 //! 迁移代次的纯策略；不访问配置、数据库或存储。
 use serde::{Deserialize, Serialize};
 
-use crate::{Result, SourceCleanupPolicy, TaskModelError, TransferMode};
+use crate::{Result, SourceCleanupPolicy, TargetRetention, TargetRetentionReason, TaskModelError, TransferMode};
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct NamespaceBinding {
@@ -161,6 +161,9 @@ pub struct CopyGeneration {
     pub phase: CopyGenerationPhase,
     /// 准备完成后失败／取消也可复用已确认事实；仅 Accepted 不能证明准备完成。
     pub baseline_prepared: bool,
+    /// 只有已知执行才记录目标逐项对账是否收束；旧执行可能没有此证据。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_reconciliation_completed: Option<bool>,
     /// 扫描前捕获的根目录原值；数据库以独立二进制列保存，不挤占请求 JSON 的大小预算。
     /// 根不是普通迁移 entry，也不作为端点删除候选；callback 不包含此原值。
     #[serde(skip)]
@@ -180,6 +183,18 @@ pub struct MigrationReport {
 }
 
 impl CopyGeneration {
+    pub fn incomplete_target_preservation(&self) -> Option<TargetRetention> {
+        (self.target_reconciliation_completed == Some(false)
+            && matches!(self.phase, CopyGenerationPhase::Failed | CopyGenerationPhase::Cancelled))
+        .then(|| TargetRetention::source_range(TargetRetentionReason::IncompleteEnumeration))
+    }
+
+    pub fn target_preservation(&self) -> Option<TargetRetention> {
+        self.plan
+            .target_preservation()
+            .or_else(|| self.incomplete_target_preservation())
+    }
+
     pub fn report(&self) -> MigrationReport {
         MigrationReport {
             generation: Some(self.sequence),
@@ -195,6 +210,26 @@ impl CopyGeneration {
 }
 
 impl CopyGenerationPlan {
+    /// 整段保留以已接受的计划为依据。没有逐项核验时只报告范围。
+    pub fn target_preservation(&self) -> Option<TargetRetention> {
+        if self.target_cleanup != TargetCleanupPolicy::Preserve {
+            return None;
+        }
+        let reason = if self.reasons.contains(&MigrationReason::SourceCleanup)
+            || self.reasons.contains(&MigrationReason::PreviousSourceDeleted)
+        {
+            TargetRetentionReason::SourceCleanupPolicy
+        } else if self.reasons.contains(&MigrationReason::FilteredSelection)
+            || self.reasons.contains(&MigrationReason::RelativeTimeWindow)
+            || self.reasons.contains(&MigrationReason::SelectionChanged)
+        {
+            TargetRetentionReason::FilteredSelection
+        } else {
+            TargetRetentionReason::BaselineUnavailable
+        };
+        Some(TargetRetention::source_range(reason))
+    }
+
     pub fn decide(
         request: &CopyRequestDescriptor, previous: Option<&CopyGeneration>, baseline_available: bool,
     ) -> Result<Self> {

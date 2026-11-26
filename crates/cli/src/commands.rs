@@ -42,27 +42,35 @@ pub async fn copy_changes_cmd(job_id: &str, execution_id: &str, offset: u64, lim
         .await?
         .ok_or_else(|| CliError::InvalidParameter("incremental copy execution not found for this job".into()))?;
     println!(
-        "Execution {} | {:?} | target cleanup {:?} | archived results",
-        page.execution_id, page.phase, page.target_cleanup
+        "Execution {} | {:?} | target cleanup {:?} | archive coverage {:?}",
+        page.execution_id, page.phase, page.target_cleanup, page.archive_coverage
     );
+    if let Some(range) = page.target_preserved_range {
+        println!(
+            "Target preserved scope={:?} source=unverified reason={:?}",
+            range.scope, range.reason
+        );
+    }
     for count in page.counts {
-        println!("{} {}", count.kind, count.count);
+        println!("{} {} target={}", count.kind, count.count, count.target_outcome);
     }
     for change in page.changes {
+        print!("{} ", change.kind);
         if let Some(previous_path) = change.previous_path {
-            println!("{} {:?} -> {:?}", change.kind, previous_path, change.path);
-        } else if let (Some(source), Some(target)) = (change.source_presence, change.target_outcome) {
-            println!(
-                "{} {:?} source={} target={} {:?}",
-                change.kind,
-                change.path,
-                source,
-                target,
-                change.reason.unwrap_or_default()
-            );
+            print!("{:?} -> {:?}", previous_path, change.path);
         } else {
-            println!("{} {:?}", change.kind, change.path);
+            print!("{:?}", change.path);
         }
+        if let Some(source) = change.source_presence {
+            print!(" source={source}");
+        }
+        if let Some(target) = change.target_outcome {
+            print!(" target={target}");
+        }
+        if let Some(reason) = change.reason {
+            print!(" {reason:?}");
+        }
+        println!();
     }
     if let Some(next) = page.next_offset {
         println!("Next page --offset {next}");

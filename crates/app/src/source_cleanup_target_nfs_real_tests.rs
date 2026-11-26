@@ -139,7 +139,7 @@ async fn nonfile_case(kind: EntryKind, fault: Option<&str>) -> Result<()> {
     if kind == EntryKind::Directory {
         assert!(prepare_directory(&entry, &target).await?);
     } else {
-        namespace::create_symlink(target.storage(), &entry, Path::new("../opaque/missing")).await?;
+        namespace::create_symlink(target.storage(), &entry, Path::new("../opaque/missing"), None).await?;
     }
     set_entry_metadata(target.storage(), &entry, None).await?;
     if let Some(fault) = fault {
