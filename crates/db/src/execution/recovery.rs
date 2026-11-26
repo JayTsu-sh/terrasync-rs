@@ -404,6 +404,8 @@ impl ScanDatabaseExecution {
                 Ok(Err(error)) => {
                     let error = DatabaseError::from(error);
                     if !error.is_transient_connectivity_failure() {
+                        // 本次探测已收到明确的终态，不能把它先前的瞬时失败另计一次。
+                        self.recovered(0).await;
                         self.inner.terminal.send_replace(Some(self.recovery_cause(error)));
                         return;
                     }

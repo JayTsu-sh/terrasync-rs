@@ -224,6 +224,7 @@ pub(crate) async fn record_diagnostic(
     // 迁移收尾的批次共享一次提交明细的预算，终止归档后也可用现有回调排空前缀。
     if consumer.lock().await.callback.outbox.pending_len() >= MAX_DIAGNOSTIC_BATCH_EVENTS {
         let flushed = match deadline {
+            Some(deadline) if Instant::now() >= deadline => Err(AppError::DiagnosticDeliveryUnavailable),
             Some(deadline) => timeout_at(deadline, flush(consumer))
                 .await
                 .unwrap_or(Err(AppError::DiagnosticDeliveryUnavailable)),

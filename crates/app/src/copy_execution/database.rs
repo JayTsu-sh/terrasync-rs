@@ -1,5 +1,6 @@
 //! 复制执行的数据库作用域；最终报告使用独立传输。
 use std::future::Future;
+use std::pin::Pin;
 use std::sync::{Arc, OnceLock};
 
 use db::{
@@ -67,10 +68,17 @@ impl CopyDatabaseExecution {
     }
 
     /// 子任务不另起 monitor，最终数据库故障立即停止同一执行的新请求。
-    pub(crate) async fn run_child(&self, phase: &'static str, work: impl Future<Output = Result<()>>) -> Result<()> {
+    pub(crate) fn run_child<F>(&self, phase: &'static str, work: F) -> impl Future<Output = Result<()>>
+    where
+        F: Future<Output = Result<()>>,
+    {
+        self.run_scoped_child(phase, Box::pin(work))
+    }
+
+    async fn run_scoped_child(
+        &self, phase: &'static str, work: Pin<Box<impl Future<Output = Result<()>>>>,
+    ) -> Result<()> {
         let database = self.queries.execution().with_request_phase(phase);
-        // 在 worker 边界堆存管线 future，避免阶段和数据库作用域叠加大状态机。
-        let work = Box::pin(work);
         match with_scan_cancellation(self.cancel.clone(), Some(database), work).await {
             Ok(()) => Ok(()),
             // 已逐项报告的复制结果仍使整轮失败，但不能中断待冲刷的完成事实。
@@ -89,12 +97,16 @@ impl CopyDatabaseExecution {
         }
     }
 
-    pub(crate) async fn run_optional_child(
+    pub(crate) fn run_optional_child(
         execution: Option<Self>, phase: &'static str, work: impl Future<Output = Result<()>>,
-    ) -> Result<()> {
-        match execution {
-            Some(execution) => execution.run_child(phase, work).await,
-            None => work.await,
+    ) -> impl Future<Output = Result<()>> {
+        // 在外层异步作用域构建前堆存 worker，避免重复复制大状态机。
+        let work = Box::pin(work);
+        async move {
+            match execution {
+                Some(execution) => execution.run_scoped_child(phase, work).await,
+                None => work.await,
+            }
         }
     }
 

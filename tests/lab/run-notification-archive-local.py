@@ -767,7 +767,13 @@ def run_consumer_recovery(environment):
         summaries = [report for report in reports if report["is_final"] and not report.get("diagnostics")]
         assert len(summaries) == 6 and all(report["diagnostics_complete"] for report in summaries), summaries
         failed = [report for report in summaries if report["task_error_count"] > 0]
-        assert len(failed) == 4 and all(report["migration"]["phase"] == "failed" for report in failed), failed
+        assert len(failed) == 4, failed
+        for report in failed:
+            migration = report.get("migration")
+            if migration is None:
+                assert "generation_commit_result" not in report, report
+            else:
+                assert migration["phase"] == "failed" and report["generation_commit_result"] == "not_committed", report
         causes = [event for report in reports for event in (report.get("diagnostics") or {}).get("events", [])
                   if "owned batch rejection" in event["message"]]
         assert len(causes) >= 4, causes
