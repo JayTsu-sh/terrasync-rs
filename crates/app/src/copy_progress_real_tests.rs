@@ -3,6 +3,7 @@
 use std::{
     env, fs,
     io::{self, Seek, SeekFrom, Write},
+    os::unix::fs::PermissionsExt,
     path::Path,
     process::Stdio,
     time::{Duration, UNIX_EPOCH},
@@ -28,6 +29,7 @@ use crate::sync::sync;
 
 const MIB: u64 = 1024 * 1024;
 const FILE: &str = "payload";
+const FILE_MODE: u32 = 0o640;
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
 
 #[tokio::test]
@@ -112,6 +114,7 @@ fn fixture(root: &Path, total: u64) -> TestResult {
     file.set_len(total)?;
     file.seek(SeekFrom::End(-7))?;
     file.write_all(b"payload")?;
+    file.set_permissions(fs::Permissions::from_mode(FILE_MODE))?;
     file.sync_all()?;
     Ok(())
 }
@@ -245,6 +248,10 @@ async fn check_finished(child: &mut Child, receiver: &Server, root: &Path, reuse
     assert_eq!(
         fs::read(root.join("source").join(FILE))?,
         fs::read(root.join("target").join(FILE))?
+    );
+    assert_eq!(
+        fs::metadata(root.join("target").join(FILE))?.permissions().mode() & 0o777,
+        FILE_MODE
     );
     Ok(())
 }

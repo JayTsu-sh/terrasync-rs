@@ -17,10 +17,13 @@ use data_mover::model::{
     EntryOperationFailure, FailureClass, MetadataCapabilities, MetadataObservations, ObservationPlan, Operation,
     StoragePath, Transience,
 };
+#[cfg(unix)]
+use data_mover::storage::artifacts::{ArtifactKind, artifact_name};
 use data_mover::storage::{
     ByteStream, CheckpointObservation, CopiedMetadataTarget, DestinationPrepareRequest, Metadata, MetadataBatchFailure,
-    MetadataMutation, PrepareRequest, PreparedStage, PublicationEvidence, PublicationFailure, PublishRequest,
-    StagedDestination, StorageBuilder, StorageRoleFailure, VerificationEvidence, VerifyRequest, WriteEvidence,
+    MetadataMutation, PositionedByteStream, PrepareRequest, PreparedStage, PublicationEvidence, PublicationFailure,
+    PublishRequest, StagedDestination, StorageBuilder, StorageRoleFailure, VerificationEvidence, VerifyRequest,
+    WriteEvidence,
 };
 use data_mover::transfer::TransferPhase;
 use task_model::TransferMode;
@@ -85,12 +88,24 @@ struct MetadataBatchProbe {
     inner: Arc<dyn StagedDestination>,
     fault: Option<MetadataFault>,
     fail_verify: bool,
+    keep_published_checkpoint: bool,
     calls: AtomicU64,
     cleanup_calls: AtomicU64,
 }
 
 #[async_trait]
 impl StagedDestination for MetadataBatchProbe {
+    fn supports_hash_checkpoint(&self) -> bool {
+        self.keep_published_checkpoint && self.inner.supports_hash_checkpoint()
+    }
+    async fn persist_hash_checkpoint(&self, stage: &PreparedStage) -> std::result::Result<(), StorageRoleFailure> {
+        self.inner.persist_hash_checkpoint(stage).await
+    }
+    async fn write_checkpointed(
+        &self, stage: &PreparedStage, input: PositionedByteStream,
+    ) -> std::result::Result<WriteEvidence, StorageRoleFailure> {
+        self.inner.write_checkpointed(stage, input).await
+    }
     fn supports_direct(&self) -> bool {
         self.inner.supports_direct()
     }
@@ -208,6 +223,48 @@ fn guard_metadata(
     Ok(unexpected)
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn recovering_a_confirmed_publication_does_not_count_its_bytes_twice() -> TestResult {
+    const SIZE: u64 = 72 * 1024 * 1024;
+    let source_root = tempfile::tempdir()?;
+    let target_root = tempfile::tempdir()?;
+    std::fs::File::create(source_root.path().join("file"))?.set_len(SIZE)?;
+    let source = create_storage(&source_root.path().to_string_lossy(), CreateStorageOptions::default()).await?;
+    let mut target = create_storage(&target_root.path().to_string_lossy(), CreateStorageOptions::default()).await?;
+    let entry = Arc::new(observe_path(source.storage(), Path::new("file")).await?);
+    let probe = Arc::new(MetadataBatchProbe {
+        inner: target.roles.staged_destination()?,
+        fault: None,
+        fail_verify: false,
+        keep_published_checkpoint: true,
+        calls: AtomicU64::new(0),
+        cleanup_calls: AtomicU64::new(0),
+    });
+    guard_metadata(&mut target, false, Some(probe))?;
+    let bytes = Arc::new(CopyBytes::default());
+    let options = CopyOptions {
+        transfer_mode: TransferMode::Checkpoint,
+        bytes_counter: Some(bytes.clone()),
+        ..Default::default()
+    };
+    let first = transfer::copy_current(&source, &target, &entry, &options, None).await?;
+    assert_eq!(first.reused_bytes, 0);
+    assert_eq!(bytes.snapshot(), (SIZE, 0));
+    // 探针故意省略发布后的指针清理，第二个请求必须识别同一已发布结果。
+    assert!(
+        target_root
+            .path()
+            .join(artifact_name("file", ArtifactKind::Pointer))
+            .is_file()
+    );
+    let replay = transfer::copy_current(&source, &target, &entry, &options, None).await?;
+    assert_eq!(replay.reused_bytes, SIZE);
+    assert_eq!(bytes.snapshot(), (SIZE, 0));
+    assert_eq!(std::fs::metadata(target_root.path().join("file"))?.len(), SIZE);
+    Ok(())
+}
+
 #[tokio::test]
 async fn captured_metadata_is_batched_once_without_source_reread_or_later_target_write() -> TestResult {
     for mode in [TransferMode::Direct, TransferMode::Checkpoint] {
@@ -225,6 +282,7 @@ async fn captured_metadata_is_batched_once_without_source_reread_or_later_target
                 inner: target.roles.staged_destination()?,
                 fault: None,
                 fail_verify: false,
+                keep_published_checkpoint: false,
                 cleanup_calls: AtomicU64::new(0),
                 calls: AtomicU64::new(0),
             });
@@ -294,6 +352,7 @@ async fn assert_metadata_failure_data(mode: TransferMode, integrity: bool, fault
         inner: target.roles.staged_destination()?,
         fault: Some(fault),
         fail_verify: false,
+        keep_published_checkpoint: false,
         cleanup_calls: AtomicU64::new(0),
         calls: AtomicU64::new(0),
     });
@@ -420,6 +479,7 @@ async fn direct_data_failure_removes_owned_target_while_source_and_typed_reason_
             inner: target.roles.staged_destination()?,
             fault: None,
             fail_verify: true,
+            keep_published_checkpoint: false,
             calls: AtomicU64::new(0),
             cleanup_calls: AtomicU64::new(0),
         });
