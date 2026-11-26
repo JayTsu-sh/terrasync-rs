@@ -117,7 +117,7 @@ async fn failed_http_retries_same_batch_and_ack_preserves_new_errors() {
         progress_bar: ProgressBar::new(JobType::Scan),
         job_dir: String::new(),
         callback_url: Some(url.clone()),
-        generation_committed: None,
+        generation_commit_result: None,
         migration: None,
         scan_snapshot: None,
         callback: CallbackState::default(),

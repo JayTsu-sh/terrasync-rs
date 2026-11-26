@@ -184,6 +184,9 @@ fn progress_report_to_snapshot(report: &ProgressReport) -> Result<serde_json::Va
     if let Some(runtime) = &report.scan_runtime {
         snapshot["scan_runtime"] = serde_json::to_value(runtime)?;
     }
+    if let Some(outcome) = report.generation_commit_result {
+        snapshot["generation_commit_result"] = serde_json::to_value(outcome)?;
+    }
     Ok(snapshot)
 }
 
@@ -217,6 +220,7 @@ mod progress_tests {
     use super::*;
     use std::error::Error;
     use std::result::Result as StdResult;
+    use task_model::GenerationCommitResult;
 
     #[test]
     fn incremental_snapshot_counts_links_like_the_full_snapshot() -> Result<()> {
@@ -262,7 +266,7 @@ mod progress_tests {
             "character_devices":0,"fifos":0,"sockets":0,"unknown":0});
         let empty = serde_json::json!({"directories":0,"regular_files":0,"symlinks":0,"block_devices":0,
             "character_devices":0,"fifos":0,"sockets":0,"unknown":0});
-        let report: ProgressReport = serde_json::from_value(serde_json::json!({
+        let mut report: ProgressReport = serde_json::from_value(serde_json::json!({
             "target_preserved_count":0, "job_id":"scan", "job_type":"FullScan", "elapsed_secs":1.0, "speed_bytes_per_sec":0.0,
             "is_final":false, "detail":{"kind":"Full","scanned_files":2,"scanned_dirs":1,
                 "total_bytes":10,"transferred_bytes":0,"error_count":3},
@@ -286,6 +290,13 @@ mod progress_tests {
         assert_eq!(snapshot["scan"]["distributions_reconciled"], true);
         assert_eq!(snapshot["scan"]["capabilities"]["symlinks"], "unsupported");
         assert_eq!(snapshot["scan_runtime"]["current_error"], "connection reset");
+        assert!(snapshot.get("generation_commit_result").is_none());
+        report.is_final = true;
+        report.generation_commit_result = Some(GenerationCommitResult::Committed);
+        assert_eq!(
+            progress_report_to_snapshot(&report)?["generation_commit_result"],
+            "committed"
+        );
         Ok(())
     }
 }

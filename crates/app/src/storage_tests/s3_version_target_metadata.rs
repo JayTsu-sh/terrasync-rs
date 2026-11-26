@@ -29,7 +29,7 @@ fn consumer(integrity: bool) -> TestResult<StatisticConsumer> {
         callback_url: Some(CallbackEndpoint::parse(&std::env::var(
             "LAB_TARGET_METADATA_CALLBACK",
         )?)?),
-        generation_committed: None,
+        generation_commit_result: None,
         migration: None,
         scan_snapshot: None,
         callback: CallbackState::default(),

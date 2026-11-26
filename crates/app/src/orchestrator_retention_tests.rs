@@ -118,7 +118,7 @@ async fn preserve_case(config: &ClickHouseConfig) -> Result<()> {
             &std::env::var("LAB_TARGET_RETENTION_CALLBACK_URL")
                 .map_err(|_| AppError::ConfigError("owned callback URL required".into()))?,
         )?),
-        generation_committed: None,
+        generation_commit_result: None,
         migration: None,
         scan_snapshot: None,
         callback: CallbackState::with_database(Some(database.clone())),

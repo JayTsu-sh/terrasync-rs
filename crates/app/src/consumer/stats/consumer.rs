@@ -18,7 +18,7 @@ use data_mover::model::{EntryKind, ObservedEntry};
 use reqwest::redirect::Policy;
 use task_model::migration::MigrationReport;
 use task_model::observation::{EntryProgress, EntryStatistics, ObservedScanEvent, ObservedView};
-use task_model::{ErrorEvent, RetentionScope, StorageEntryMessage};
+use task_model::{ErrorEvent, GenerationCommitResult, RetentionScope, StorageEntryMessage};
 use tokio::sync::{Mutex, mpsc};
 use tokio::task::JoinHandle;
 use tokio::time::{Instant, timeout};
@@ -50,8 +50,8 @@ pub struct StatisticConsumer {
     pub progress_bar: ProgressBar,
     pub job_dir: String,
     pub callback_url: Option<CallbackEndpoint>,
-    /// 纯增量扫描的 generation 是否成功提交；其他任务保持 `None`。
-    pub generation_committed: Option<bool>,
+    /// 持久化任务的代次提交结果。
+    pub generation_commit_result: Option<GenerationCommitResult>,
     pub migration: Option<MigrationReport>,
     pub scan_snapshot: Option<ScanSnapshot>,
     pub callback: CallbackState,
@@ -97,6 +97,9 @@ impl StatisticConsumer {
             println!("{scan}\nErrors: {}", errors(&self.stats).total());
         } else {
             println!("{}", self.stats);
+        }
+        if let Some(outcome) = self.generation_commit_result {
+            println!("Generation commit result: {outcome}");
         }
         if self.callback.task_error_count > 0 {
             println!("Task errors: {}", self.callback.task_error_count);
@@ -288,7 +291,9 @@ impl StatisticConsumer {
         report.skipped_count = self.stats.skipped_count();
         report.target_preserved_count = self.callback.target_preserved_count;
         report.task_error_count = self.callback.task_error_count;
-        report.generation_committed = self.generation_committed;
+        if is_final {
+            report.generation_commit_result = self.generation_commit_result;
+        }
         report.migration = self.migration.clone();
         report.scan = snapshot.cloned();
         report.callback_identity = Some(self.callback.identity.clone());
@@ -585,7 +590,7 @@ impl StatisticConsumer {
 
 #[cfg(test)]
 mod tests {
-    use super::StatisticConsumer;
+    use super::{GenerationCommitResult, StatisticConsumer};
     use crate::callback::CallbackEndpoint;
     use crate::config::JobType;
     use crate::consumer::stats::{FullStats, IncrementalStats, ProgressBar, StatsKind};
@@ -615,7 +620,7 @@ mod tests {
             progress_bar: ProgressBar::new(JobType::Scan),
             job_dir: String::new(),
             callback_url: Some(CallbackEndpoint::parse(&format!("http://{address}/progress"))?),
-            generation_committed: Some(false),
+            generation_commit_result: Some(GenerationCommitResult::NotCommitted),
             migration: None,
             pb_handle: None,
             scan_snapshot: None,
@@ -671,16 +676,22 @@ mod tests {
             progress_bar: ProgressBar::new(JobType::IncrementalScan),
             job_dir: String::new(),
             callback_url: None,
-            generation_committed: Some(false),
+            generation_commit_result: Some(GenerationCommitResult::NotCommitted),
             migration: None,
             pb_handle: None,
             scan_snapshot: None,
             callback: Default::default(),
         };
 
-        assert_eq!(consumer.to_report(true).generation_committed, Some(false));
-        consumer.generation_committed = Some(true);
-        assert_eq!(consumer.to_report(true).generation_committed, Some(true));
+        assert_eq!(
+            consumer.to_report(true).generation_commit_result,
+            Some(GenerationCommitResult::NotCommitted)
+        );
+        consumer.generation_commit_result = Some(GenerationCommitResult::Committed);
+        assert_eq!(
+            consumer.to_report(true).generation_commit_result,
+            Some(GenerationCommitResult::Committed)
+        );
     }
 }
 

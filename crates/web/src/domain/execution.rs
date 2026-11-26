@@ -1,6 +1,7 @@
 use super::storage_failure::StorageFailureDetail;
 use app::report::{ScanRuntimeState, ScanSnapshot};
 use serde::{Deserialize, Serialize};
+use task_model::GenerationCommitResult;
 
 use super::task::TaskStatus;
 
@@ -20,6 +21,8 @@ pub struct ExecutionStats {
     pub scan: Option<ScanSnapshot>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scan_runtime: Option<ScanRuntimeState>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub generation_commit_result: Option<GenerationCommitResult>,
 }
 
 /// 执行类型

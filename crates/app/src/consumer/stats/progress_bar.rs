@@ -682,7 +682,7 @@ impl ProgressBar {
             in_flight_bytes,
             detail,
             is_final: false,
-            generation_committed: None,
+            generation_commit_result: None,
             migration: None,
             final_stats: None,
             scan: None,

@@ -6,6 +6,14 @@ pub const RUNNING: u8 = 0;
 pub const FINALIZING: u8 = 1;
 pub const COMPLETED: u8 = 2;
 pub const ABANDONED: u8 = 3;
+/// 恢复或放弃前暂停发布，直到已到达数据库的旧请求退出。
+pub const RECOVERING: u8 = 4;
+
+#[derive(Clone, Copy, Debug)]
+pub enum ScanRecovery {
+    Resume,
+    Restart,
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize, clickhouse::Row)]
 pub struct ScanResumeState {
@@ -29,7 +37,7 @@ pub struct ScanResumeState {
 
 impl ScanResumeState {
     pub(crate) fn validate_envelope(&self) -> Result<()> {
-        if self.schema_version != 1 || self.id != 1 || self.generation > 1 || self.phase > ABANDONED {
+        if self.schema_version != 1 || self.id != 1 || self.generation > 1 || self.phase > RECOVERING {
             return Err(DatabaseError::ConversionError(
                 "Unsupported or invalid scan resume state".into(),
             ));
@@ -47,6 +55,20 @@ impl ScanResumeState {
         Ok(())
     }
 
+    /// 恢复和回查都要求轮次身份与代次同时匹配。
+    pub(crate) fn matches_commit(&self, generation: u8, epoch: i64) -> Result<bool> {
+        self.validate_envelope()?;
+        if epoch == self.event_time && self.needs_commit_reconciliation() && generation == self.generation {
+            return Ok(true);
+        }
+        if epoch >= self.event_time || generation != 1 - self.generation {
+            return Err(DatabaseError::TransactionError(
+                "Saved scan round conflicts with the committed generation".into(),
+            ));
+        }
+        Ok(false)
+    }
+
     pub fn advance(&mut self) -> Result<()> {
         self.version = self
             .version
@@ -55,8 +77,16 @@ impl ScanResumeState {
         Ok(())
     }
 
+    pub const fn is_active_phase(phase: u8) -> bool {
+        matches!(phase, RUNNING | FINALIZING | RECOVERING)
+    }
+
     pub const fn active(&self) -> bool {
-        self.phase == RUNNING || self.phase == FINALIZING
+        Self::is_active_phase(self.phase)
+    }
+
+    pub const fn needs_commit_reconciliation(&self) -> bool {
+        matches!(self.phase, FINALIZING | RECOVERING)
     }
 }
 

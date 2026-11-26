@@ -10,6 +10,7 @@ use std::sync::Arc;
 use task_model::observation::ObservedScanEvent;
 
 mod checkpoint;
+mod commit;
 pub(crate) mod model;
 pub use model::*;
 pub(crate) mod candidate_cache;
@@ -129,9 +130,6 @@ impl ScanStore {
     pub async fn capture_scan_baseline(&self) -> Result<String> {
         self.cuts.capture().await
     }
-    pub async fn restore_scan_baseline(&self, state: &ScanResumeState) -> Result<()> {
-        self.cuts.restore(&state.baseline_snapshot).await
-    }
     /// 调用方已经过 writer 屏障；不可变快照 ACK 之后才提交统计与源游标。
     pub async fn seal_resume_state(&self, state: &mut ScanResumeState) -> Result<()> {
         state.checkpoint_snapshot = self.cuts.capture().await?;
@@ -139,10 +137,7 @@ impl ScanStore {
         self.cleanup_scan_snapshots(state).await?;
         Ok(())
     }
-    pub async fn restore_scan_checkpoint(&self, state: &ScanResumeState) -> Result<()> {
-        self.cuts.restore(&state.checkpoint_snapshot).await
-    }
-    /// 清理失败只留下可回收对象，不把已经提交的 manifest 改判失败。
+    /// 中间快照清理可延后。提交后的快照清理错误交由任务终态报告。
     pub async fn cleanup_scan_snapshots(&self, state: &ScanResumeState) -> Result<()> {
         let keep = if state.active() {
             vec![state.baseline_snapshot.as_str(), state.checkpoint_snapshot.as_str()]
@@ -150,7 +145,7 @@ impl ScanStore {
             Vec::new()
         };
         if let Err(error) = self.cuts.cleanup(&keep).await {
-            if matches!(error, DatabaseError::ScanCancelled) {
+            if state.phase == COMPLETED || matches!(error, DatabaseError::ScanCancelled) {
                 return Err(error);
             }
             tracing::warn!(%error, "Deferred scan metadata snapshot cleanup");
@@ -280,9 +275,7 @@ impl ScanStore {
         ping()->Result<()>;
         resume_execution_is_incremental()->Result<bool>;
         save_resume_state(state:&ScanResumeState)->Result<()>;
-        restore_resume_generation(state:&ScanResumeState)->Result<bool>;
         begin_scan_generation()->Result<u8>;
-        commit_scan_generation()->Result<()>;
         resume_event_epoch(now:i64)->Result<i64>;
         cleanup_resume_batch()->Result<()>;
 

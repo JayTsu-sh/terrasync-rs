@@ -51,15 +51,18 @@ impl ClickHouseDatabase {
         Ok(())
     }
 
-    /// 创建扫描状态表（id=1, `scan_state` 0/1）
+    /// 创建扫描状态表（id=1, `scan_state` 0/1）。
+    /// 复制版本决定高位顺序，同版本的普通扫描以轮次时间戳排序，迟到的旧发布不能覆盖新基线。
     pub async fn create_scan_state_table(&self) -> Result<()> {
         let table_name = get_scan_state_table_name(&self.job_id);
         self.create_catalogue_table(
             &table_name,
             "id UInt8, scan_state UInt8, baseline_committed Bool DEFAULT false, \
-             copy_execution_id String DEFAULT '', state_version UInt64 DEFAULT 0, copy_baseline_sequence UInt64 DEFAULT 0",
+             copy_execution_id String DEFAULT '', state_version UInt64 DEFAULT 0, copy_baseline_sequence UInt64 DEFAULT 0, \
+             scan_epoch Int64 DEFAULT 0, \
+             commit_order UInt128 MATERIALIZED bitOr(bitShiftLeft(toUInt128(state_version),64),toUInt128(scan_epoch))",
             "id",
-            CatalogueEngine::ReplacingVersion("state_version"),
+            CatalogueEngine::ReplacingVersion("commit_order"),
         )
         .await?;
         Ok(())

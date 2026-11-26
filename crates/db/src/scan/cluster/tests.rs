@@ -257,7 +257,7 @@ async fn cluster_shared_tables_isolate_jobs_and_resume_rounds() -> Result<()> {
     full.phase = FINALIZING;
     full.version += 1;
     a.save_resume_state(&full).await?;
-    a.commit_scan_generation().await?;
+    a.persisted_scan_commit_query(&full).execute_idempotent_scan().await?;
     assert!(
         a.restore_resume_generation(&full).await?,
         "recover committed finalization"
@@ -341,7 +341,10 @@ async fn cluster_shared_tables_isolate_jobs_and_resume_rounds() -> Result<()> {
     incremental.phase = FINALIZING;
     incremental.version += 1;
     resumed.save_resume_state(&incremental).await?;
-    resumed.commit_scan_generation().await?;
+    resumed
+        .persisted_scan_commit_query(&incremental)
+        .execute_idempotent_scan()
+        .await?;
     resumed.cleanup_resume_batch().await?;
     let tables: u64 = admin
         .clone()
@@ -641,7 +644,10 @@ async fn cluster_native_key_stage_replays_events_before_direct_base_write() -> R
     full.phase = FINALIZING;
     full.version += 1;
     store.save_resume_state(&full).await?;
-    store.commit_scan_generation().await?;
+    store
+        .persisted_scan_commit_query(&full)
+        .execute_idempotent_scan()
+        .await?;
     let incremental = state(epoch + 10, true, 0);
     store.save_resume_state(&incremental).await?;
     let entries = vec![
@@ -722,7 +728,14 @@ async fn cluster_native_parallel_unchanged_batches_never_create_candidates() -> 
         })
         .collect::<Result<Vec<_>>>()?;
     store.write_native(&entries, false).await?;
-    store.commit_scan_generation().await?;
+    let mut full = state(epoch, false, 1);
+    full.phase = FINALIZING;
+    full.advance()?;
+    store.save_resume_state(&full).await?;
+    store
+        .persisted_scan_commit_query(&full)
+        .execute_idempotent_scan()
+        .await?;
     store.save_resume_state(&state(epoch + 10, true, 0)).await?;
     let barrier = Arc::new(Barrier::new(4));
     let mut workers: JoinSet<Result<()>> = JoinSet::new();
@@ -779,7 +792,10 @@ async fn cluster_native_parallel_batches_preserve_reused_paths_and_hardlinks() -
     full.phase = FINALIZING;
     full.version += 1;
     store.save_resume_state(&full).await?;
-    store.commit_scan_generation().await?;
+    store
+        .persisted_scan_commit_query(&full)
+        .execute_idempotent_scan()
+        .await?;
     let incremental = state(epoch + 10, true, 0);
     store.save_resume_state(&incremental).await?;
     let first = vec![
@@ -860,7 +876,10 @@ async fn cluster_native_replayed_path_restoring_original_identity_is_not_deleted
     full.phase = FINALIZING;
     full.version += 1;
     store.save_resume_state(&full).await?;
-    store.commit_scan_generation().await?;
+    store
+        .persisted_scan_commit_query(&full)
+        .execute_idempotent_scan()
+        .await?;
     let incremental = state(epoch + 10, true, 0);
     store.save_resume_state(&incremental).await?;
     let entries = vec![
@@ -907,7 +926,10 @@ async fn cluster_shared_native_observations_roundtrip_merge_replay_and_deletions
     full.phase = FINALIZING;
     full.version += 1;
     store.save_resume_state(&full).await?;
-    store.commit_scan_generation().await?;
+    store
+        .persisted_scan_commit_query(&full)
+        .execute_idempotent_scan()
+        .await?;
     let incremental = state(epoch + 10, true, 0);
     store.save_resume_state(&incremental).await?;
     store.begin_resume_batch().await?;
@@ -1322,7 +1344,14 @@ async fn cluster_native_path_scoped_unchanged_batches_never_create_events() -> R
         })
         .collect::<Result<Vec<_>>>()?;
     store.write_native(&entries, false).await?;
-    store.commit_scan_generation().await?;
+    let mut full = state(epoch, false, 1);
+    full.phase = FINALIZING;
+    full.advance()?;
+    store.save_resume_state(&full).await?;
+    store
+        .persisted_scan_commit_query(&full)
+        .execute_idempotent_scan()
+        .await?;
     store.save_resume_state(&state(epoch + 10, true, 0)).await?;
     let mut workers: JoinSet<Result<()>> = JoinSet::new();
     for worker in 0..4 {

@@ -264,6 +264,19 @@ impl DatabaseError {
             _ => ("database_error", None),
         }
     }
+    /// SDK 在网关给出正文时会丢掉 HTTP 状态。无法识别的提交响应需要据持久记录查证。
+    pub(crate) fn scan_commit_response(source: clickhouse::error::Error) -> Self {
+        if matches!(
+            &source,
+            clickhouse::error::Error::BadResponse(message)
+                if server_error_code(message).is_none()
+                    && !matches!(message.as_str(), "400 Bad Request" | "401 Unauthorized" | "403 Forbidden")
+        ) {
+            return Self::RequestOutcomeUnconfirmed { source };
+        }
+        Self::from(source)
+    }
+
     pub(crate) fn request_was_not_sent(&self) -> bool {
         match self {
             Self::ScanRequestFailed { source } => source.request_was_not_sent(),
@@ -279,7 +292,8 @@ impl DatabaseError {
             Self::ScanRequestFailed { source } | Self::ScanDatabaseUnavailable { source, .. } => {
                 source.is_transient_connectivity_failure()
             }
-            Self::RequestOutcomeUnconfirmed { source } | Self::ClickHouseError(source) => match source {
+            Self::RequestOutcomeUnconfirmed { .. } => true,
+            Self::ClickHouseError(source) => match source {
                 clickhouse::error::Error::Network(_) | clickhouse::error::Error::TimedOut => true,
                 clickhouse::error::Error::Other(error) => error.is::<std::io::Error>(),
                 clickhouse::error::Error::BadResponse(message) => matches!(

@@ -1,6 +1,10 @@
 //! Real CLI termination and restart against ClickHouse.
 #![cfg(feature = "lab-fault-injection")]
 
+use app::{
+    callback::CallbackEndpoint,
+    scan::{ScanRequest, scan},
+};
 use clickhouse::{Client, query::Query};
 use std::{
     collections::BTreeSet,
@@ -10,6 +14,8 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tokio::time::sleep;
+use tokio_util::sync::CancellationToken;
+use utils::app_config::AppConfig;
 
 type Result<T = ()> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
@@ -965,4 +971,32 @@ async fn killed_scan_resumes_full_and_incremental_without_skips_or_duplicate_eve
         .fetch_all::<(String,String,i64,String)>().await?;
     assert_eq!(final_events.len(), 4, "unexpected durable events: {final_events:?}");
     Ok(())
+}
+
+#[tokio::test]
+#[ignore = "run via the isolated scan generation callback lab"]
+async fn scan_generation_callback_entrypoint() -> Result {
+    let config = std::env::var("LAB_SCAN_CALLBACK_CONFIG")?;
+    let root = std::env::var("LAB_SCAN_CALLBACK_SOURCE")?;
+    let job_dir = std::env::var("LAB_SCAN_CALLBACK_JOB_DIR")?;
+    let endpoint = CallbackEndpoint::parse(&std::env::var("LAB_SCAN_CALLBACK_URL")?)?;
+    AppConfig::init(
+        Some(include_str!("../../cli/src/resources/default_config.toml")),
+        Some(Path::new(&config)),
+    )?;
+    let result = scan(ScanRequest {
+        resume: std::env::var_os("LAB_SCAN_CALLBACK_RESUME").is_some(),
+        job_id: "scan_result",
+        job_dir: &job_dir,
+        path: &root,
+        depth: 0,
+        include: &None,
+        exclude: &None,
+        command: "scan callback lab".into(),
+        cancel: CancellationToken::new(),
+        callback_url: Some(endpoint),
+        concurrency: None,
+    })
+    .await;
+    result.map_err(Into::into)
 }

@@ -28,7 +28,7 @@ mod clickhouse_integration_tests {
     use db::scan::{ScanFinalEvent, ScanStore};
     use db::{ClickHouseConfig, DatabaseError, DeletionStatus};
     use task_model::observation::{ObservedItem, ObservedScanEvent};
-    use task_model::{ChangeKind, ObservedEntryExt};
+    use task_model::{ChangeKind, GenerationCommitResult, ObservedEntryExt};
     use tokio::sync::mpsc;
 
     // 使用原子计数器确保每个测试用例都有唯一的job_id
@@ -353,7 +353,11 @@ mod clickhouse_integration_tests {
         state.phase = FINALIZING;
         state.advance().unwrap();
         database.save_resume_state(&state).await.unwrap();
-        database.commit_scan_generation().await.unwrap();
+        ScanStore::new(&config, &job)
+            .unwrap()
+            .commit_scan_generation(&state, &mut GenerationCommitResult::NotCommitted)
+            .await
+            .unwrap();
         drop(database);
         let database = ClickHouseDatabase::new(&config, &job).unwrap();
         assert!(database.restore_resume_generation(&state).await.unwrap());
@@ -537,7 +541,10 @@ mod clickhouse_integration_tests {
         state.phase = 1;
         state.advance().unwrap();
         store.save_resume_state(&state).await.unwrap();
-        store.commit_scan_generation().await.unwrap();
+        store
+            .commit_scan_generation(&state, &mut GenerationCommitResult::NotCommitted)
+            .await
+            .unwrap();
         state.generation = store.begin_scan_generation().await.unwrap();
         state.incremental = true;
         state.phase = 0;
@@ -609,7 +616,13 @@ mod clickhouse_integration_tests {
             store.resume_event_statistics(state.event_time).await.unwrap(),
             after_finalize.events
         );
-        store.commit_scan_generation().await.unwrap();
+        state.phase = db::scan::FINALIZING;
+        state.advance().unwrap();
+        store.save_resume_state(&state).await.unwrap();
+        store
+            .commit_scan_generation(&state, &mut GenerationCommitResult::NotCommitted)
+            .await
+            .unwrap();
         store.cleanup_resume_batch().await.unwrap();
         cleanup.cleanup().await;
     }

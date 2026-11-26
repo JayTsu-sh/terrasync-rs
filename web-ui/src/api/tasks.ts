@@ -68,6 +68,7 @@ export interface ExecutionStats {
   avg_speed_bytes_per_sec: number
   scan?: ScanSnapshot
   scan_runtime?: ScanRuntimeState
+  generation_commit_result?: GenerationCommitResult
 }
 
 export interface EntryKindCounts {
@@ -117,6 +118,8 @@ export interface ScanSnapshot {
 }
 
 export type StatisticSupport = 'supported' | 'unsupported' | 'not_applicable' | 'unknown'
+
+export type GenerationCommitResult = 'committed' | 'not_committed' | 'pending_confirmation'
 
 export interface ScanRuntimeState {
   state: 'running' | 'recovering' | 'failed'
@@ -281,6 +284,7 @@ export interface TaskProgressSnapshot {
   speed_bytes_per_sec: number
   scan?: ScanSnapshot
   scan_runtime?: ScanRuntimeState
+  generation_commit_result?: GenerationCommitResult
   callback_identity?: CallbackIdentity
 }
 

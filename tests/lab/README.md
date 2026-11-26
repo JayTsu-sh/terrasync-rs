@@ -34,6 +34,25 @@ source observation diagnostics and conservative retained ranges separately.
 This does not establish recovery for ambiguous historical data publication,
 source purge readiness, whole-job network budgets or throughput/RSS.
 
+## 扫描代次提交结果
+
+先用 `cargo build --locked --features lab-fault-injection --bin terrasync` 构建 CLI，
+再用 `cargo test --locked -p app --features lab-fault-injection --test scan_resume --no-run`
+取得回调测试程序路径。通过隔离实验室运行：
+
+```sh
+LAB_TERRASYNC_BIN=/path/to/terrasync \
+LAB_SCAN_CALLBACK_DRIVER=/path/to/scan_resume-HASH \
+LAB_SCAN_RESULT_LOG_DIR=/path/to/new-results \
+python3 tests/lab/run-notification-archive-local.py --scan-generation-result
+```
+
+测试启动 ClickHouse 单机和两副本集群，核对 CLI、真实 HTTP 204 回调和归档报告。
+覆盖全量、增量、续扫、提交前失败保留基线、提交后清理失败、提交响应中断、
+回查断连和超时、重启后查证和补提。实验在回滚期间和补提之前重放旧提交，
+并在发布前、发布应答丢失和发布后清理三个阶段取消任务。还验证同作业复制接管和纯流式省略字段。
+实验室只使用本轮容器和数据库，保留每轮 CLI 日志及 JSON 证据。
+
 ## Direct 取消回归
 
 `verify-direct-cancel.py` 在真实远端 Local 目标和 QUIC 链路上验证 Direct 取消。

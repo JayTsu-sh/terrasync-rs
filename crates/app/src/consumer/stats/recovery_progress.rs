@@ -131,7 +131,7 @@ mod tests {
             progress_bar: ProgressBar::new(JobType::Scan),
             job_dir: String::new(),
             callback_url: None,
-            generation_committed: None,
+            generation_commit_result: None,
             migration: None,
             scan_snapshot: None,
             callback: Default::default(),

@@ -8,7 +8,7 @@ use crate::execution::queries::{
 };
 use crate::execution::read::QuorumRead;
 use crate::execution::{ScanDatabaseExecution, queries::execute_request, recovery::RequestSafety};
-use crate::scan::FINALIZING;
+use crate::scan::ScanResumeState;
 use crate::{ClickHouseConfig, DatabaseError, Result, execution::base_client, schema::identifier};
 use clickhouse::{
     Client,
@@ -61,7 +61,7 @@ impl ScanCuts {
             query
         };
         match query.fetch_quorum_one::<u8>().await {
-            Ok(phase) if phase <= FINALIZING => Err(DatabaseError::TransactionError(
+            Ok(phase) if ScanResumeState::is_active_phase(phase) => Err(DatabaseError::TransactionError(
                 "This database job has an unfinished scan; resume or reset it before other metadata operations".into(),
             )),
             Err(DatabaseError::ClickHouseError(ClickHouseError::RowNotFound)) | Ok(_) => Ok(()),
