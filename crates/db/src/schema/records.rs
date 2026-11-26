@@ -317,7 +317,12 @@ impl IncrementalStorageEntryRecord {
                 let summary = capture_summary(ObservedItem::from(to.clone()).view(), 0)?;
                 let reason = safe_diagnostic_text(reason);
                 let comment = json!({ "previous_path": from.path().as_str(), "reason": reason }).to_string();
-                let mut rows = vec![Self::failed_copy_change(summary.clone(), "rename", comment, now)];
+                let mut rename = Self::failed_copy_change(summary.clone(), "rename", comment, now);
+                // 移动已经成功，后续更新错误不撤销这个物理结果，也不确认新的复制基线。
+                if change.is_some() {
+                    rename.target_outcome = Some("moved_update_failed".into());
+                }
+                let mut rows = vec![rename];
                 if let Some(change) = change {
                     rows.push(Self::failed_copy_change(summary, change.as_state_str(), reason, now));
                 }
@@ -359,6 +364,13 @@ impl IncrementalStorageEntryRecord {
             }
             StorageEntryMessage::IntegrityChecked(entry) => (entry, "integrity_checked", None),
             StorageEntryMessage::Renamed((from, to)) => (to, "rename", Some(from.path().as_str().to_owned())),
+            StorageEntryMessage::CopyRenameRecovered((from, to)) => {
+                let mut rows = Self::observed_rows(to, "rename", Some(from.path().as_str().to_owned()), now)?;
+                for row in &mut rows {
+                    row.target_outcome = Some("copied".into());
+                }
+                return Ok(rows);
+            }
             StorageEntryMessage::Error {
                 event,
                 path,

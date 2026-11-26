@@ -367,7 +367,9 @@ impl ProgressBar {
                 return;
             }
             StorageEntryMessage::Deleted(entry) => (entry, "deleted"),
-            StorageEntryMessage::Renamed((_, entry)) => (entry, "rename"),
+            StorageEntryMessage::Renamed((_, entry)) | StorageEntryMessage::CopyRenameRecovered((_, entry)) => {
+                (entry, "rename")
+            }
             StorageEntryMessage::IntegrityChecked(entry) => match &self.counters {
                 CounterSet::Full(_) => (entry, "scanned"),
                 CounterSet::Incremental(_) => return,

@@ -143,7 +143,7 @@ pub enum AppError {
         source: Box<AppError>,
         finalization: DatabaseError,
     },
-    #[error("迁移失败: {source}; 保留目标的范围明细也未能记录: {reporting}")]
+    #[error("迁移失败: {source}; 迁移明细报告同时失败: {reporting}")]
     MigrationReportingFailed {
         #[source]
         source: Box<AppError>,

@@ -192,6 +192,8 @@ pub enum StorageEntryMessage {
     },
     /// 文件被重命名，(from, to)
     Renamed((Arc<ObservedEntry>, Arc<ObservedEntry>)),
+    /// 旧目标路径已不存在，使用当前源内容恢复已识别的重命名。
+    CopyRenameRecovered((Arc<ObservedEntry>, Arc<ObservedEntry>)),
     /// 文件完整性检查完成
     IntegrityChecked(Arc<ObservedEntry>),
     /// 目录需要打包为 tar（仅在 --packaged 模式下由 walkdir 发射）

@@ -31,6 +31,14 @@ pub(crate) async fn rename_or_copy(
     from: Arc<ObservedEntry>, to: Arc<ObservedEntry>, source: Arc<StorageContext>, target: Arc<StorageContext>,
     options: RenameOptions<'_>,
 ) -> Result<RenameOutcome> {
+    if options
+        .resume
+        .cancel
+        .as_ref()
+        .is_some_and(|cancel| cancel.is_cancelled())
+    {
+        return Err(StorageError::Cancelled.into());
+    }
     match target
         .roles
         .namespace()?

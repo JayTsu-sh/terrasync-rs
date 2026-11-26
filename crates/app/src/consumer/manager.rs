@@ -748,6 +748,12 @@ impl ConsumerManager {
     }
 
     pub(crate) async fn record_task_error(&self, error: &AppError) {
+        let error = match error {
+            AppError::MigrationReportingFailed { source, reporting } if source.is_reported_copy_failure() => {
+                reporting.as_ref()
+            }
+            error => error,
+        };
         if (error.stops_event_pipeline() || matches!(error, AppError::DiagnosticJournalStopped { .. }))
             && let Some(consumer) = &self.stats_consumer
             && consumer.lock().await.callback.journal.terminal.is_some()

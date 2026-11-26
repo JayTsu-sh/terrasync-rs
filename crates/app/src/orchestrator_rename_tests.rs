@@ -11,12 +11,13 @@ use db::catalogue::ComparisonMode;
 use db::{ClickHouseConfig, ClickHouseDatabase, DatabaseError, INCREMENTAL_SCAN_TABLE_BASE_NAME};
 use task_model::{ChangeKind, StorageEntryMessage, TransferMode};
 use tempfile::tempdir;
+use tokio_util::sync::CancellationToken;
 use utils::app_config::ClickHouseMode;
 use uuid::Uuid;
 
 use super::SyncOrchestrator;
 use crate::broadcast::BroadcastForwarder;
-use crate::error::{AppError, Result};
+use crate::error::{AppError, Result, StorageError};
 use crate::file_copy::metadata::set_entry_metadata;
 use crate::observed_fixtures::observation;
 use crate::storage_factory::{CreateStorageOptions, create_storage};
@@ -26,6 +27,7 @@ async fn apply_case(config: &ClickHouseConfig, case: &str) -> Result<()> {
     let directory = case == "directory";
     let changed_failure = case == "change_failed";
     let rename_failure = case == "rename_failed";
+    let cancelled = case == "cancelled";
     let job = format!("rename_{case}");
     let database = ClickHouseDatabase::connect(config, &job).await?;
     database.initialize().await?;
@@ -84,6 +86,10 @@ async fn apply_case(config: &ClickHouseConfig, case: &str) -> Result<()> {
     );
     let mut events = BroadcastForwarder::new(8);
     let mut received = events.subscribe();
+    let cancel = CancellationToken::new();
+    if cancelled {
+        cancel.cancel();
+    }
     let result = SyncOrchestrator::apply_deletions_and_renames(
         &database,
         source,
@@ -96,13 +102,27 @@ async fn apply_case(config: &ClickHouseConfig, case: &str) -> Result<()> {
         &job,
         "",
         TransferMode::Direct,
-        SourceAbsenceCheck::new(Duration::from_secs(1), Duration::from_secs(3)),
+        SourceAbsenceCheck::new(Duration::from_secs(1), Duration::from_secs(3)).with_cancellation(cancel),
     )
     .await;
     assert!(
         source_root.path().join("new").exists(),
         "source purge belongs to target-ready cleanup"
     );
+    assert_eq!(
+        database
+            .current_copy_generation()
+            .await?
+            .target_reconciliation_completed,
+        Some(!cancelled),
+    );
+    if cancelled {
+        assert!(matches!(result, Err(AppError::StorageError(StorageError::Cancelled))));
+        assert_eq!(std::fs::read(target_root.path().join("old"))?, b"payload");
+        assert!(!target_root.path().join("new").exists());
+        assert!(received.try_recv().is_err());
+        return Ok(());
+    }
     assert_eq!(target_root.path().join("old").exists(), rename_failure);
     let path = if directory { "new/child" } else { "new" };
     if changed_failure || rename_failure {
@@ -134,13 +154,23 @@ async fn apply_case(config: &ClickHouseConfig, case: &str) -> Result<()> {
             .ok_or(DatabaseError::CopyExecutionUnavailable)?;
         assert_eq!(rename.previous_path.as_deref(), Some("old"));
         assert_eq!(rename.path, "new");
-        assert_eq!(rename.target_outcome.as_deref(), Some("failed"));
-        assert!(rename.reason.as_ref().is_some_and(|reason| !reason.is_empty()));
-        assert!(
-            page.counts
-                .iter()
-                .all(|row| row.count == 1 && row.target_outcome == "failed")
+        assert_eq!(
+            rename.target_outcome.as_deref(),
+            Some(if changed_failure {
+                "moved_update_failed"
+            } else {
+                "failed"
+            })
         );
+        assert!(rename.reason.as_ref().is_some_and(|reason| !reason.is_empty()));
+        assert!(page.counts.iter().all(|row| row.count == 1));
+        if changed_failure {
+            assert!(
+                page.changes
+                    .iter()
+                    .any(|row| row.kind == "data_changed" && row.target_outcome.as_deref() == Some("failed"))
+            );
+        }
     } else {
         result?;
         assert_eq!(std::fs::read(target_root.path().join(path))?, b"payload");
@@ -188,7 +218,7 @@ async fn real_retained_incremental_applies_confirmed_rename() -> Result<()> {
             .await
             .map_err(DatabaseError::from)?;
         let result: Result<()> = async {
-            for case in ["file", "directory", "change_failed", "rename_failed"] {
+            for case in ["file", "directory", "change_failed", "rename_failed", "cancelled"] {
                 apply_case(&config, case).await?;
             }
             Ok(())

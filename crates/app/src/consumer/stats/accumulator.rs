@@ -601,7 +601,7 @@ impl IncrementalStats {
                     self.deleted.add(&view);
                 }
             }
-            StorageEntryMessage::Renamed((_, to_entry)) => {
+            StorageEntryMessage::Renamed((_, to_entry)) | StorageEntryMessage::CopyRenameRecovered((_, to_entry)) => {
                 for view in ObservedView::all(to_entry) {
                     self.renamed.add(&view);
                 }

@@ -297,6 +297,9 @@ async fn process_entry_inner(
     } else if entry.get_is_symlink() {
         match copy_namespace::read_symlink(src_storage.storage(), entry).await {
             Ok(target_path) => {
+                if resume.cancel.as_ref().is_some_and(CancellationToken::is_cancelled) {
+                    return Err(StorageError::Cancelled.into());
+                }
                 copy_namespace::create_symlink(dest_storage.storage(), entry, &target_path).await?;
             }
             Err(e) => {
