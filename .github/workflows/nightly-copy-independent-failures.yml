@@ -14,7 +14,7 @@ permissions:
 jobs:
   copy-independent-failures:
     runs-on: ubuntu-24.04
-    timeout-minutes: 60
+    timeout-minutes: 80
     strategy:
       fail-fast: false
       matrix:
@@ -26,8 +26,11 @@ jobs:
       COPY_FAILURE_DIR: terrasync-copy-independent-failures
     steps:
       - uses: actions/checkout@v5
+        timeout-minutes: 3
       - uses: dtolnay/rust-toolchain@1.95.0
+        timeout-minutes: 5
       - uses: Swatinem/rust-cache@v2
+        timeout-minutes: 5
       - name: Build CLI
         timeout-minutes: 30
         shell: bash
@@ -53,6 +56,7 @@ jobs:
           printf 'COPY_CALLBACK_DRIVER=%s\n' "$callback_driver" >> "$GITHUB_ENV"
           sha256sum "$callback_driver" >> "$RUNNER_TEMP/$COPY_FAILURE_DIR/build.txt"
       - name: Multi-shard ClickHouse independent copy failures
+        timeout-minutes: 7
         env:
           COPY_FAILURE_MODE: ${{ matrix.mode }}
         shell: bash
@@ -69,6 +73,7 @@ jobs:
             2>&1 | tee "$results/run.log"
       - name: Upload independent copy failure evidence
         if: always()
+        timeout-minutes: 5
         uses: actions/upload-artifact@v4
         with:
           name: copy-independent-failures-${{ matrix.mode }}-${{ github.run_id }}-${{ github.run_attempt }}
