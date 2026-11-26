@@ -2,12 +2,16 @@
 #![allow(clippy::unwrap_used)]
 #[cfg(unix)]
 use crate::copy_bytes::CopyBytes;
+#[cfg(unix)]
+use std::fs::{File, FileTimes};
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::sync::{
     Arc,
     atomic::{AtomicU64, Ordering},
 };
+#[cfg(unix)]
+use std::time::{Duration, SystemTime};
 
 use async_trait::async_trait;
 use data_mover::metadata::ApplicationFailureKind;
@@ -229,7 +233,11 @@ async fn recovering_a_confirmed_publication_does_not_count_its_bytes_twice() -> 
     const SIZE: u64 = 72 * 1024 * 1024;
     let source_root = tempfile::tempdir()?;
     let target_root = tempfile::tempdir()?;
-    std::fs::File::create(source_root.path().join("file"))?.set_len(SIZE)?;
+    let source_file = File::create(source_root.path().join("file"))?;
+    source_file.set_len(SIZE)?;
+    // relatime 下读取也不能改变本用例所复用的源属性事实。
+    source_file.set_times(FileTimes::new().set_accessed(SystemTime::now() + Duration::from_secs(3600)))?;
+    let original_access = source_file.metadata()?.accessed()?;
     let source = create_storage(&source_root.path().to_string_lossy(), CreateStorageOptions::default()).await?;
     let mut target = create_storage(&target_root.path().to_string_lossy(), CreateStorageOptions::default()).await?;
     let entry = Arc::new(observe_path(source.storage(), Path::new("file")).await?);
@@ -250,6 +258,7 @@ async fn recovering_a_confirmed_publication_does_not_count_its_bytes_twice() -> 
     };
     let first = transfer::copy_current(&source, &target, &entry, &options, None).await?;
     assert_eq!(first.reused_bytes, 0);
+    assert_eq!(source_file.metadata()?.accessed()?, original_access);
     assert_eq!(bytes.snapshot(), (SIZE, 0));
     // 探针故意省略发布后的指针清理，第二个请求必须识别同一已发布结果。
     assert!(
