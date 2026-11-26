@@ -361,7 +361,9 @@ impl SyncOrchestrator {
                                             reason: error.to_string(),
                                         })
                                         .await?;
-                                    failure.get_or_insert(error);
+                                    failure.get_or_insert_with(|| {
+                                        error.with_reported_copy_failure(kind == ChangeKind::MetadataOnly)
+                                    });
                                     continue;
                                 }
                                 broadcaster
@@ -403,7 +405,7 @@ impl SyncOrchestrator {
                                 }
                             };
                             broadcaster.broadcast(event).await?;
-                            failure.get_or_insert(e);
+                            failure.get_or_insert_with(|| e.with_reported_copy_failure(false));
                         }
                     }
                 }

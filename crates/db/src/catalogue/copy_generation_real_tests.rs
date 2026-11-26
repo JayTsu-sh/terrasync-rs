@@ -782,12 +782,21 @@ async fn archived_incremental_changes_are_scoped_and_paginated(fixture: &Fixture
     other
         .batch_insert_incremental_record(&[StorageEntryMessage::New(file("another-run").into())])
         .await?;
+    other.mark_copy_target_reconciliation_completed().await?;
+    other.finish_copy_generation(CopyGenerationPhase::Failed, None).await?;
+    let failed_after_reconciliation = other
+        .incremental_copy_changes(&next_run.execution_id, 0, 5)
+        .await?
+        .ok_or(DatabaseError::CopyExecutionUnavailable)?;
+    assert_eq!(failed_after_reconciliation.phase, CopyGenerationPhase::Failed);
+    assert!(failed_after_reconciliation.target_preserved_range.is_none());
 
     let first_page = other
         .incremental_copy_changes(&run.execution_id, 0, 2)
         .await?
         .ok_or(DatabaseError::CopyExecutionUnavailable)?;
     assert_eq!(first_page.phase, CopyGenerationPhase::Failed);
+    assert!(first_page.target_preserved_range.is_some());
     assert_eq!(first_page.counts.len(), 5);
     assert!(first_page.counts.iter().all(|count| count.count == 1));
     assert_eq!(first_page.next_offset, Some(2));

@@ -437,6 +437,7 @@ def run_copy_content(environment):
                               and report["migration"]["phase"] == "failed"]
             assert len(failed_changes) == 2, failed_changes
             for report in failed_changes:
+                assert report["detail"]["error_count"] == 2 and report["task_error_count"] == 0, report
                 attempt = report["callback_identity"]["attempt_id"]
                 paths = {event["path"] for event in events.values()
                          if event["attempt_id"] == attempt and event["code"] == "Copy"}

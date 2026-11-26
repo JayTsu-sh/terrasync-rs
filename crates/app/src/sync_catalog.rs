@@ -146,6 +146,7 @@ mod tests {
                     request,
                     phase: CopyGenerationPhase::Completed,
                     baseline_prepared: true,
+                    target_reconciliation_completed: None,
                 };
                 mock.add(handlers::provide([1u64]));
                 mock.add(handlers::provide([RunRow {

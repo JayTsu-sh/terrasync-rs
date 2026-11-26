@@ -256,6 +256,17 @@ impl ClickHouseDatabase {
             .clone()
             .ok_or(DatabaseError::CopyExecutionUnavailable)
     }
+
+    /// 仅记录本次执行已收束的目标对账，随终态一起归档。
+    pub async fn mark_copy_target_reconciliation_completed(&self) -> Result<()> {
+        let mut lifecycle = self.generation_lifecycle.lock().await;
+        let generation = lifecycle
+            .copy_generation
+            .as_mut()
+            .ok_or(DatabaseError::CopyExecutionUnavailable)?;
+        generation.target_reconciliation_completed = Some(true);
+        Ok(())
+    }
 }
 
 /// 根原值沿用普通 entry 的原生编码及后端绑定，不能把任意文件／历史写成根事实。

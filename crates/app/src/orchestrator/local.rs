@@ -5,10 +5,10 @@ use std::{sync::Arc, time::Duration};
 use data_mover::storage::NamespaceReadPolicy;
 use db::ClickHouseDatabase;
 use futures::FutureExt;
+use task_model::TransferMode;
 use task_model::migration::{
     CopyGenerationPhase, CopyGenerationPlan, CopyRequestDescriptor, MigrationMode, MigrationReport,
 };
-use task_model::{TargetRetentionReason, TransferMode};
 use tokio_util::sync::CancellationToken;
 use tracing::info;
 use utils::app_config::AppConfig;
@@ -152,10 +152,12 @@ impl SyncOrchestrator {
             };
             if let Ok(generation) = database.current_copy_generation().await {
                 consumers.set_migration_report(generation.report()).await;
-                if let Err(source) = result {
+                if let Some(retention) = generation.incomplete_target_preservation()
+                    && let Err(source) = result
+                {
                     result = match consumers
-                        .record_target_retention_range(
-                            TargetRetentionReason::IncompleteEnumeration,
+                        .record_target_retention(
+                            retention,
                             "本轮迁移未完整收尾，未展开的旧目标范围全部保留，未逐项确认源缺失".into(),
                         )
                         .await

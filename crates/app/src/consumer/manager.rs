@@ -18,10 +18,12 @@ use std::time::{Duration, Instant};
 // 外部crate
 use data_mover::model::ObservedEntry;
 use db::ClickHouseDatabase;
+use task_model::TargetRetention;
+#[cfg(test)]
+use task_model::TargetRetentionReason;
 use task_model::migration::{CopyGenerationPhase, MigrationMode, MigrationReport};
 use task_model::observation::ObservedScanEvent;
 use task_model::{ErrorEvent, StorageEntryMessage};
-use task_model::{TargetRetention, TargetRetentionReason};
 use tokio::sync::Mutex;
 use tracing::{Instrument, debug, error, info_span, warn};
 
@@ -241,13 +243,6 @@ impl ConsumerManager {
                 report.phase = phase;
             }
         }
-    }
-
-    pub(crate) async fn record_target_retention_range(
-        &self, reason: TargetRetentionReason, message: String,
-    ) -> Result<()> {
-        self.record_target_retention(TargetRetention::source_range(reason), message)
-            .await
     }
 
     pub(crate) async fn record_target_retention(&self, retention: TargetRetention, message: String) -> Result<()> {
@@ -759,7 +754,7 @@ impl ConsumerManager {
         {
             return;
         }
-        // 版本执行器已经交付 entry 失败及逐版本原因，收尾不能再增加一次相同失败。
+        // 已交付的条目失败由对应事件计数，任务收尾不能再增加一次相同失败。
         if !error.is_reported_copy_failure() {
             self.record_task_failures(&[error.to_string()]).await;
             if let Some(consumer) = &self.stats_consumer

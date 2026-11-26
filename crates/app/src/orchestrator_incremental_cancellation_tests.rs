@@ -146,9 +146,10 @@ async fn incremental_cancel_preserves_the_metadata_failure_already_reported() ->
     worker.cancel.cancel();
     let result = timeout(Duration::from_millis(500), worker.task).await??;
     assert!(matches!(
-        result,
-        Err(AppError::StorageError(StorageError::MetadataApplication(_)))
+        result.as_ref().err().and_then(AppError::storage_error),
+        Some(StorageError::MetadataApplication(_))
     ));
+    assert!(result.is_err_and(|error| error.is_reported_copy_failure()));
     assert!(worker.messages.try_recv().is_err());
     Ok(())
 }

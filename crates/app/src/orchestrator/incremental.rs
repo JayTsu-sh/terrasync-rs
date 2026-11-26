@@ -411,6 +411,7 @@ impl SyncOrchestrator {
                     ),
                 )
                 .await?;
+                database.mark_copy_target_reconciliation_completed().await?;
             }
 
             Ok(dest_storage_phase_b)

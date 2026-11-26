@@ -170,7 +170,7 @@ pub(super) async fn spawn_handlers(
                                         reason: format!("{e}"),
                                     })
                                     .await?;
-                                    failure.get_or_insert(e);
+                                    failure.get_or_insert_with(|| e.with_reported_copy_failure(false));
                                 }
                             }
                         }
@@ -230,7 +230,9 @@ pub(super) async fn spawn_handlers(
                                         reason: format!("{e}"),
                                     })
                                     .await?;
-                                    failure.get_or_insert(e);
+                                    failure.get_or_insert_with(|| {
+                                        e.with_reported_copy_failure(kind == ChangeKind::MetadataOnly)
+                                    });
                                 }
                             }
                         }

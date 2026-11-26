@@ -52,6 +52,7 @@ fn previous(request: CopyRequestDescriptor, phase: CopyGenerationPhase, prepared
         request,
         phase,
         baseline_prepared: prepared,
+        target_reconciliation_completed: None,
     }
 }
 

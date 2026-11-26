@@ -468,6 +468,17 @@ impl AppError {
         }
     }
 
+    pub(crate) fn with_reported_copy_failure(self, metadata_only: bool) -> Self {
+        let data_failed = !metadata_only
+            && self
+                .storage_error()
+                .is_none_or(|error| error.published_data().is_none());
+        Self::ReportedCopyFailure {
+            source: Box::new(self),
+            data_failed,
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn reported_copy_data_failed(&self) -> bool {
         match self {
