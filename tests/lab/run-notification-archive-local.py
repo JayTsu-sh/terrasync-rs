@@ -6,6 +6,7 @@ import http.client
 import http.server
 import json
 from pathlib import Path
+import signal
 import subprocess
 import sys
 import tempfile
@@ -18,8 +19,25 @@ import uuid
 ROOT = Path(__file__).resolve().parents[2]
 
 
-def docker(*arguments):
-    return subprocess.check_output(["docker", *arguments], text=True).strip()
+def docker(*arguments, start_new_session=False):
+    return subprocess.check_output(["docker", *arguments], text=True, start_new_session=start_new_session).strip()
+
+
+def start_isolated_container(containers, *arguments):
+    interrupted = False
+
+    def defer_interrupt(_signum, _frame):
+        nonlocal interrupted
+        interrupted = True
+
+    # Docker 创建成功后先登记 ID，再让外层执行清理。
+    previous = signal.signal(signal.SIGINT, defer_interrupt)
+    try:
+        containers.append(docker("run", *arguments, start_new_session=True))
+    finally:
+        signal.signal(signal.SIGINT, previous)
+    if interrupted:
+        raise KeyboardInterrupt
 
 
 def configuration(replica, shards=1):
@@ -67,8 +85,8 @@ def run_isolated():
                 config = Path(directory) / f"r{replica}.xml"
                 config.write_text(configuration(replica, shards))
                 network = "none" if replica == 1 else f"container:{containers[0]}"
-                container = docker(
-                    "run", "-d", "--name", f"ts-notification-r{replica}-{uuid.uuid4().hex[:12]}",
+                start_isolated_container(
+                    containers, "-d", "--name", f"ts-notification-r{replica}-{uuid.uuid4().hex[:12]}",
                     "--network", network, "--memory=1536m", "--cpus=2",
                     "--tmpfs", "/var/lib/clickhouse:rw,size=384m,mode=1777",
                     "--tmpfs", "/var/log/clickhouse-server:rw,size=32m,mode=1777",
@@ -76,16 +94,15 @@ def run_isolated():
                     "--mount", f"type=bind,src={config},dst=/etc/clickhouse-server/config.d/notifications.xml,readonly",
                     image,
                 )
-                containers.append(container)
             if any(flag in sys.argv for flag in ("--version-catalogue", "--mutable-catalogue", "--version-metadata", "--metadata-cancel", "--copy-object-cleanup", "--copy-versioned-source-cleanup")):
-                containers.append(docker(
-                    "run", "-d", "--name", f"ts-version-catalogue-{uuid.uuid4().hex[:12]}",
+                start_isolated_container(
+                    containers, "-d", "--name", f"ts-version-catalogue-{uuid.uuid4().hex[:12]}",
                     "--network", f"container:{containers[0]}", "--memory=768m", "--cpus=1",
                     "--tmpfs", "/data:rw,size=128m,mode=1777", "--label", "codex.task=version-catalogue",
                     "-e", "RUSTFS_ADDRESS=0.0.0.0:19000", "-e", "RUSTFS_CONSOLE_ADDRESS=0.0.0.0:19001",
                     "-e", "RUSTFS_ACCESS_KEY=migration-test", "-e", "RUSTFS_SECRET_KEY=migration-test-isolated-only",
                     os.environ.get("MIGRATION_S3_IMAGE", "rustfs/rustfs:latest"), "/data",
-                ))
+                )
                 print(f"isolated S3 image={docker('inspect', containers[-1], '--format', '{{.Image}}')}", flush=True)
             print(f"isolated notification image={docker('inspect', containers[0], '--format', '{{.Image}}')}", flush=True)
             pid = docker("inspect", containers[0], "--format", "{{.State.Pid}}")
