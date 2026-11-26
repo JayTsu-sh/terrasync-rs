@@ -101,7 +101,7 @@ pub(crate) async fn scope<T>(
             "Scan cancellation is already bound to another database execution".into(),
         ));
     }
-    let monitor = DatabaseExecutionMonitor::start(queries, cancel.requested.clone())?;
+    let monitor = DatabaseExecutionMonitor::start(queries, cancel.requested.clone(), None)?;
     let result = work.await;
     let monitored = monitor.finish().await;
     let failure = database.failure();

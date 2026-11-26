@@ -117,7 +117,7 @@ async fn case(fixture: &Fixture, history: bool, mode: &str) -> Result<()> {
         .await?;
     let (database, cancellation) = database.with_query_cancellation()?;
     let execution = cancellation.execution();
-    let watch = DatabaseExecutionMonitor::start(cancellation.clone(), CancellationToken::new())?;
+    let watch = DatabaseExecutionMonitor::start(cancellation.clone(), CancellationToken::new(), None)?;
     fixture
         .fault(if mode == "cancel" { "batch_stall" } else { mode })
         .await?;

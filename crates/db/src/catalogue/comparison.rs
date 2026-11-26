@@ -1,6 +1,7 @@
 //! 比对批次的暂存、分类、发布及清理。分类结果重新绑定输入观察，保留源端版本顺序。
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use data_mover::model::ObservedEntry;
 use serde::Deserialize;
@@ -8,6 +9,8 @@ use serde_json::Value;
 use task_model::migration::TargetCleanupPolicy;
 use task_model::observation::{ObservedItem, ObservedView};
 use task_model::{ChangeKind, EntryChange, MetadataTargetVersion};
+use tokio::time::timeout;
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, info};
 
 use super::ClickHouseDatabase;
@@ -20,7 +23,7 @@ use crate::schema::columns::{
 };
 use crate::{
     error::{DatabaseError, Result},
-    execution::read::QuorumRead,
+    execution::{base_client, read::QuorumRead, with_scan_cancellation},
     get_scan_base_table_name,
 };
 
@@ -32,6 +35,17 @@ mod session_tests;
 pub enum ComparisonMode {
     PublishObserved,
     AwaitCopyAcknowledgement,
+}
+
+fn with_cleanup<T>(operation: Result<T>, cleanup: Result<()>) -> Result<T> {
+    match (operation, cleanup) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Err(source), Ok(())) | (Ok(_), Err(source)) => Err(source),
+        (Err(source), Err(cleanup)) => Err(DatabaseError::CatalogueBatchCleanupFailed {
+            source: Box::new(source),
+            cleanup: Box::new(cleanup),
+        }),
+    }
 }
 
 /// 只携带分类所需的主键，不重新解码或复制输入观察。
@@ -241,15 +255,55 @@ impl ClickHouseDatabase {
             Ok(changes)
         }
         .await;
-        let cleanup = database.drop_scan_temporary_table().await;
-        match (operation, cleanup) {
-            (Ok(changes), Ok(())) => Ok(changes),
-            (Err(source), Ok(())) | (Ok(_), Err(source)) => Err(source),
-            (Err(source), Err(cleanup)) => Err(DatabaseError::CatalogueBatchCleanupFailed {
-                source: Box::new(source),
-                cleanup: Box::new(cleanup),
-            }),
+        let cleanup = match database.scan_temp_table_name.as_deref() {
+            Some(table) => {
+                database
+                    .drop_comparison_table(
+                        table,
+                        mode == ComparisonMode::AwaitCopyAcknowledgement,
+                        operation.is_err(),
+                    )
+                    .await
+            }
+            None => Ok(()),
+        };
+        with_cleanup(operation, cleanup)
+    }
+
+    async fn drop_comparison_table(&self, table: &str, copying: bool, operation_failed: bool) -> Result<()> {
+        if copying && operation_failed {
+            return self.drop_comparison_table_bounded(table).await;
         }
+        let result = self.drop_catalogue_table(table).await;
+        if copying
+            && result.as_ref().is_err_and(|error| {
+                error.is_confirmed_scan_cancellation()
+                    || matches!(
+                        error,
+                        DatabaseError::ScanTerminationUnconfirmed { .. } | DatabaseError::ScanRequestFailed { .. }
+                    )
+            })
+        {
+            let retry = self.drop_comparison_table_bounded(table).await;
+            return if retry.is_ok() {
+                Ok(())
+            } else {
+                with_cleanup(result, retry)
+            };
+        }
+        result
+    }
+
+    async fn drop_comparison_table_bounded(&self, table: &str) -> Result<()> {
+        // 本批最多两张已确认建成的暂存表，额外预算合计不超过一秒。
+        let mut cleanup = self.clone();
+        cleanup.sync_client = base_client(&self.connection_config)?;
+        timeout(
+            Duration::from_millis(500),
+            with_scan_cancellation(CancellationToken::new(), None, cleanup.drop_catalogue_table(table)),
+        )
+        .await
+        .map_err(|source| DatabaseError::ComparisonCleanupTimeout { source })?
     }
 }
 
@@ -497,48 +551,52 @@ impl ClickHouseDatabase {
             // 增量拷贝：Memory 排除表 + NOT IN 过滤
             let exclude_table = format!("exclude_{}", uuid::Uuid::new_v4().simple());
 
-            // 1. 创建 Memory 排除表
+            // 只清理已确认建成的表，避免 DROP 先于未知结果的 CREATE 到达。
             self.create_catalogue_exclusions(&exclude_table).await?;
+            let operation = async {
 
-            // 2. 写入排除路径，与同作业其它 quorum 写入保持顺序。
-            self.write_catalogue_exclusions(&exclude_table, excluded_paths).await?;
+                // 2. 写入排除路径，与同作业其它 quorum 写入保持顺序。
+                self.write_catalogue_exclusions(&exclude_table, excluded_paths).await?;
 
-            // 3. 带过滤的 INSERT INTO SELECT
-            let exclude_query_table = self.catalogue_query_table(&exclude_table)?;
-            let mut insert_sql = format!(
-                "INSERT INTO {base_table_name} ({columns}) SELECT {projection} FROM {from} \
-                 WHERE (t.relative_path, t.version_id) NOT IN \
-                 (SELECT relative_path, version_id FROM {exclude_query_table})"
-            );
-            if copying {
-                // 可变目标开始覆盖前撤销旧就绪证明，保留原值供诊断；失败后源版本回退也必须重复制。
-                // 与本批观察同一条 INSERT，避免增加逐项请求或确认；保留标记对象的决定不触碰旧证明。
-                let (_, sequence) = copy_identity.as_ref().ok_or(DatabaseError::CopyExecutionUnavailable)?;
-                let state = self.get_cached_scan_state().await?;
-                let pending = OBSERVED_COLUMNS
-                    .split(',')
-                    .map(|name| match name {
-                        "copy_execution_id" => "?".to_owned(),
-                        "copy_sequence" => format!("toUInt64({sequence})"),
-                        "current_state" => format!("toUInt8({state})"),
-                        _ => format!("f.{name}"),
-                    })
-                    .collect::<Vec<_>>()
-                    .join(",");
-                insert_sql = format!(
-                    "{insert_sql} UNION ALL SELECT {pending},false,(f.copy_data_confirmed AND (f.relative_path,f.version_id) IN (SELECT relative_path,version_id FROM {exclude_query_table} WHERE data_unchanged)),f.copy_target_version FROM (SELECT {OBSERVED_COLUMNS},copy_data_confirmed,copy_target_version FROM {base_table_name} FINAL \
-                     WHERE (relative_path,version_id) IN (SELECT relative_path,version_id FROM {exclude_query_table}){facts}) AS f \
-                     WHERE NOT (f.is_dir AND f.marker_state IS NOT NULL AND (f.relative_path,f.version_id) IN \
-                     (SELECT relative_path,version_id FROM {temp_table_name} WHERE is_dir AND marker_state IS NULL))"
+                // 3. 带过滤的 INSERT INTO SELECT
+                let exclude_query_table = self.catalogue_query_table(&exclude_table)?;
+                let mut insert_sql = format!(
+                    "INSERT INTO {base_table_name} ({columns}) SELECT {projection} FROM {from} \
+                     WHERE (t.relative_path, t.version_id) NOT IN \
+                     (SELECT relative_path, version_id FROM {exclude_query_table})"
                 );
+                if copying {
+                    // 可变目标开始覆盖前撤销旧就绪证明，保留原值供诊断；失败后源版本回退也必须重复制。
+                    // 与本批观察同一条 INSERT，避免增加逐项请求或确认；保留标记对象的决定不触碰旧证明。
+                    let (_, sequence) = copy_identity.as_ref().ok_or(DatabaseError::CopyExecutionUnavailable)?;
+                    let state = self.get_cached_scan_state().await?;
+                    let pending = OBSERVED_COLUMNS
+                        .split(',')
+                        .map(|name| match name {
+                            "copy_execution_id" => "?".to_owned(),
+                            "copy_sequence" => format!("toUInt64({sequence})"),
+                            "current_state" => format!("toUInt8({state})"),
+                            _ => format!("f.{name}"),
+                        })
+                        .collect::<Vec<_>>()
+                        .join(",");
+                    insert_sql = format!(
+                        "{insert_sql} UNION ALL SELECT {pending},false,(f.copy_data_confirmed AND (f.relative_path,f.version_id) IN (SELECT relative_path,version_id FROM {exclude_query_table} WHERE data_unchanged)),f.copy_target_version FROM (SELECT {OBSERVED_COLUMNS},copy_data_confirmed,copy_target_version FROM {base_table_name} FINAL \
+                         WHERE (relative_path,version_id) IN (SELECT relative_path,version_id FROM {exclude_query_table}){facts}) AS f \
+                         WHERE NOT (f.is_dir AND f.marker_state IS NOT NULL AND (f.relative_path,f.version_id) IN \
+                         (SELECT relative_path,version_id FROM {temp_table_name} WHERE is_dir AND marker_state IS NULL))"
+                    );
+                }
+                let parameters = copy_identity
+                    .as_ref()
+                    .map_or_else(Vec::new, |(execution, _)| vec![Value::from(execution.clone())]);
+                self.execute(&insert_sql, &parameters).await
             }
-            let parameters = copy_identity
-                .as_ref()
-                .map_or_else(Vec::new, |(execution, _)| vec![Value::from(execution.clone())]);
-            self.execute(&insert_sql, &parameters).await?;
-
-            // 4. 清理排除表
-            self.drop_catalogue_table(&exclude_table).await?;
+            .await;
+            let cleanup = self
+                .drop_comparison_table(&exclude_table, copying, operation.is_err())
+                .await;
+            with_cleanup(operation, cleanup)?;
         }
 
         info!(

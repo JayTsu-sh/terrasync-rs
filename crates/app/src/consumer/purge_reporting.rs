@@ -5,11 +5,14 @@ use data_mover::model::SourceVersion;
 use data_mover::storage::StorageRoleFailure;
 use task_model::{ErrorEvent, StorageEntryMessage};
 use tokio::sync::Mutex;
+use tokio::time::Instant;
 
 use super::stats::{StatisticConsumer, journal};
 use crate::error::{AppError, Result, StorageError};
 
-pub(super) async fn record(consumer: &Arc<Mutex<StatisticConsumer>>, error: &AppError) -> Result<()> {
+pub(super) async fn record(
+    consumer: &Arc<Mutex<StatisticConsumer>>, error: &AppError, deadline: Option<Instant>,
+) -> Result<()> {
     let Some((path, failure)) = error.source_cleanup_entry() else {
         return Ok(());
     };
@@ -29,15 +32,12 @@ pub(super) async fn record(consumer: &Arc<Mutex<StatisticConsumer>>, error: &App
             StorageRoleFailure::Entry(cause) => cause.diagnostic(),
             StorageRoleFailure::Session(cause) => cause.diagnostic(),
         };
-        journal::record(
-            consumer,
-            &StorageEntryMessage::Diagnostic {
-                event: ErrorEvent::Delete,
-                path: path.to_path_buf(),
-                reason: format!("source_version={version} phase=SourceCleanup: {cause}; {diagnostic}"),
-            },
-        )
-        .await?;
+        let message = StorageEntryMessage::Diagnostic {
+            event: ErrorEvent::Delete,
+            path: path.to_path_buf(),
+            reason: format!("source_version={version} phase=SourceCleanup: {cause}; {diagnostic}"),
+        };
+        journal::record_diagnostic(consumer, deadline, |state| state.update_statistics(&message)).await?;
     }
     Ok(())
 }

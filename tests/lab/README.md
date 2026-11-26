@@ -78,6 +78,10 @@ python3 tests/lab/run-notification-archive-local.py --copy-generation-result
 `python3 tests/lab/copy_generation_nfs.py`，可在独占 NFS 4.1 前缀复测待确认与后续多轮恢复。
 它用稳定文件身份验证真实重命名及零重传，并撤销本次挂载和前缀。
 
+同一 runner 的 `--copy-independent-failures --multi-shard` 覆盖增量比较阶段并发失败。
+代理等两个 worker 都发出比较请求，再让真实 ClickHouse 返回不同的查询错误。
+验证两个根因各计一次、目标保留、基线未发布；设置回调驱动时再验证 HTTP 重放沿用同一事件身份及累计值。
+
 ## Direct 取消回归
 
 `verify-direct-cancel.py` 在真实远端 Local 目标和 QUIC 链路上验证 Direct 取消。

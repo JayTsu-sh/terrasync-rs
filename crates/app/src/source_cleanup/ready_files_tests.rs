@@ -150,7 +150,9 @@ async fn failure_case(peer_failed: bool) -> TestResult {
     if peer_failed {
         assert!(
             execution
-                .run_child(async { Err(IoError::new(ErrorKind::TimedOut, "owned peer failure").into()) })
+                .run_child("fixture", async {
+                    Err(IoError::new(ErrorKind::TimedOut, "owned peer failure").into())
+                })
                 .await
                 .is_err()
         );
@@ -159,7 +161,8 @@ async fn failure_case(peer_failed: bool) -> TestResult {
     let (first, second) = timeout(Duration::from_secs(2), async { tokio::join!(first, second) }).await?;
     let first = first?.err().ok_or("readiness failure was lost")?;
     if peer_failed {
-        assert!(first.to_string().contains("owned peer failure"));
+        assert!(first.to_string().contains("owned readiness refusal"));
+        assert!(execution.stopped_error().to_string().contains("owned peer failure"));
         assert!(execution.stopped_error().source_cleanup_entry().is_none());
     } else {
         assert_eq!(first.source_cleanup_entry().map(|(path, _)| path), Some(Path::new("a")));

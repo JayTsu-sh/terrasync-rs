@@ -41,7 +41,7 @@ use crate::storage_factory::{StorageRole, create_storage_for_role};
 #[cfg(windows)]
 use crate::sync::check_admin_privileges;
 use crate::sync::parse_size;
-use crate::task_stream::finish_phase;
+use crate::task_stream::{combine_copy_results, finish_copy_phase};
 use std::num::NonZeroUsize;
 
 use tokio::task::JoinSet;
@@ -373,7 +373,7 @@ impl SyncOrchestrator {
 
                 let span = info_span!("receiver_worker", recv_id = recv_id);
                 let handle = tokio::spawn(
-                    CopyDatabaseExecution::run_optional_child(execution, async move {
+                    CopyDatabaseExecution::run_optional_child(execution, "full_copy_receive", async move {
                         // 每个 worker 创建自己的 StoragePair（带限流重试，防止 portmapper 过载）
                         let storage_pair = match create_storage_pair_with_retry(
                             &mount_sem,
@@ -463,7 +463,7 @@ impl SyncOrchestrator {
 
                 let span = info_span!("sender_worker", worker_id = worker_id);
                 let handle = tokio::spawn(
-                    CopyDatabaseExecution::run_optional_child(execution, async move {
+                    CopyDatabaseExecution::run_optional_child(execution, "full_copy_send", async move {
                         // 每个 Sender worker 创建自己的 StoragePair（带限流重试，防止 portmapper 过载）
                         let storage_pair = match create_storage_pair_with_retry(
                             &mount_sem,
@@ -512,9 +512,9 @@ impl SyncOrchestrator {
             mount_completed.store(true, Ordering::Release);
 
             // ── 11. 等待 Sender workers 完成 ──
-            let senders_result = finish_phase(sender_handles).await;
+            let senders_result = finish_copy_phase(sender_handles).await;
             walkdir_iter.close();
-            let source_dispatch_result = finish_phase(vec![source_dispatch]).await;
+            let source_dispatch_result = finish_copy_phase(vec![source_dispatch]).await;
             walkdir_iter.wait_for_producer().await;
 
             // ── 12. 关闭管线（和原始 sync_inner 一致） ──
@@ -523,13 +523,18 @@ impl SyncOrchestrator {
             drop(command_sender);
 
             // 等所有 Receiver worker 退出（退出时 broadcaster clone 也 drop）
-            let receivers_result = finish_phase(receiver_handles).await;
+            let receivers_result = finish_copy_phase(receiver_handles).await;
 
             let source_result = walkdir_iter.take_error().map_or(Ok(()), |error| Err(error.into()));
-            senders_result
-                .and(receivers_result)
-                .and(source_dispatch_result)
-                .and(source_result)
+            combine_copy_results(
+                [
+                    ("full_copy_send", senders_result),
+                    ("full_copy_receive", receivers_result),
+                    ("full_copy_dispatch", source_dispatch_result),
+                    ("full_copy_enumerate", source_result),
+                ]
+                .map(|(phase, result)| result.map_err(|error| error.in_copy_phase(phase))),
+            )
         };
 
         // ── 13. Cleanup ──

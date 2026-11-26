@@ -16,6 +16,95 @@ fn disconnected() -> DatabaseError {
 }
 
 #[tokio::test(start_paused = true)]
+async fn peer_observes_the_original_phase_of_an_exhausted_request() {
+    let server = Blackhole::start(false).await;
+    let execution = ScanDatabaseExecution::new(&server.config).unwrap();
+    let original = execution
+        .clone()
+        .with_request_phase("catalogue_flush")
+        .request(RequestSafety::UnconfirmedWrite, || async {
+            Err::<(), _>(disconnected())
+        })
+        .await;
+    let peer = execution
+        .clone()
+        .with_request_phase("incremental_compare")
+        .request(RequestSafety::ReadOnly, || async { Ok(()) })
+        .await;
+    assert!(matches!(
+        (original, peer),
+        (Err(DatabaseError::ScanRequestFailed { source: origin }), Err(DatabaseError::ScanRequestFailed { source: observed }))
+            if Arc::ptr_eq(&origin, &observed)
+                && matches!(origin.as_ref(), DatabaseError::RequestFailureInPhase { phase: "catalogue_flush", .. })
+    ));
+    server.stop().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn simultaneous_unrecovered_requests_return_their_own_causes() {
+    let server = Blackhole::start(false).await;
+    let execution = ScanDatabaseExecution::new(&server.config).unwrap();
+    let both_started = Barrier::new(2);
+    let run = |phase| {
+        let execution = execution.clone().with_request_phase(phase);
+        let both_started = &both_started;
+        async move {
+            let calls = AtomicUsize::new(0);
+            execution
+                .request(RequestSafety::ReadOnly, || async {
+                    if calls.fetch_add(1, Ordering::Relaxed) == 0 {
+                        both_started.wait().await;
+                    }
+                    Err::<(), _>(disconnected())
+                })
+                .await
+        }
+    };
+    let (flush, comparison) = tokio::join!(run("catalogue_flush"), run("incremental_compare"));
+    assert!(matches!(
+        (flush, comparison),
+        (Err(DatabaseError::ScanRequestFailed { source: left }), Err(DatabaseError::ScanRequestFailed { source: right }))
+            if !Arc::ptr_eq(&left, &right)
+                && matches!(left.as_ref(), DatabaseError::RequestFailureInPhase { phase: "catalogue_flush", .. })
+                && matches!(right.as_ref(), DatabaseError::RequestFailureInPhase { phase: "incremental_compare", .. })
+    ));
+    server.stop().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_retry_with_unknown_write_outcome_supersedes_the_earlier_connect_refusal() {
+    let server = Blackhole::start(false).await;
+    let execution = ScanDatabaseExecution::new(&server.config)
+        .unwrap()
+        .with_request_phase("catalogue_flush");
+    let closed = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", closed.local_addr().unwrap());
+    drop(closed);
+    let client = Client::default().with_url(url);
+    let first = DatabaseError::from(client.query("SELECT 1").execute().await.unwrap_err());
+    assert!(first.request_was_not_sent());
+    let mut first = Some(first);
+    let final_result = execution
+        .request(RequestSafety::UnconfirmedWrite, || {
+            let source = first
+                .take()
+                .unwrap_or_else(|| DatabaseError::RequestOutcomeUnconfirmed {
+                    source: ClickHouseError::BadResponse("owned unconfirmed outcome".into()),
+                });
+            async { Err::<(), _>(source) }
+        })
+        .await;
+    assert!(matches!(
+        final_result,
+        Err(DatabaseError::ScanRequestFailed { source })
+            if matches!(source.as_ref(), DatabaseError::RequestFailureInPhase { source, .. }
+                if matches!(source.as_ref(), DatabaseError::RequestOutcomeUnconfirmed { .. }))
+            && Arc::ptr_eq(&source, &execution.failure().unwrap())
+    ));
+    server.stop().await;
+}
+
+#[tokio::test(start_paused = true)]
 async fn transient_reads_recover_and_release_the_shared_write_gate() {
     let server = Blackhole::start(false).await;
     let execution = ScanDatabaseExecution::new(&server.config).unwrap();

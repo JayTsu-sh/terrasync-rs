@@ -276,7 +276,7 @@ impl SyncOrchestrator {
             })
             .await;
         if let Err(error) = &result {
-            consumers.record_task_error(error).await;
+            consumers.record_migration_error(error).await;
         }
         consumers.end_lifecycle().await;
         result

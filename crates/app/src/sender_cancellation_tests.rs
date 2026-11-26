@@ -178,8 +178,11 @@ async fn peer_failure_releases_send_backpressure_and_preserves_the_original_type
     let execution = CopyDatabaseExecution::prepare(&mut database, token.clone())?;
     let transport = Arc::new(BlockedTransport::default());
     let active = Arc::new(AtomicUsize::new(0));
-    let operation = execution.run_child(run(receiver, storage, transport.clone(), token, active.clone()));
-    let failure = execution.run_child(async {
+    let operation = execution.run_child(
+        "fixture",
+        run(receiver, storage, transport.clone(), token, active.clone()),
+    );
+    let failure = execution.run_child("fixture", async {
         transport.started.notified().await;
         Err(IoError::new(ErrorKind::TimedOut, "original receiver failure").into())
     });
@@ -187,8 +190,8 @@ async fn peer_failure_releases_send_backpressure_and_preserves_the_original_type
         timeout(Duration::from_millis(500), async { tokio::join!(operation, failure) }).await?;
     match (sender_result, peer_result) {
         (
-            Err(AppError::CopyExecutionStopped { source: first }),
-            Err(AppError::CopyExecutionStopped { source: peer }),
+            Err(AppError::CopyExecutionStopped { source: first, .. }),
+            Err(AppError::CopyExecutionStopped { source: peer, .. }),
         ) => {
             assert!(Arc::ptr_eq(&first, &peer));
             assert!(matches!(first.as_ref(), AppError::IoError(cause) if cause.kind() == ErrorKind::TimedOut));

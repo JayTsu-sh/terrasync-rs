@@ -278,6 +278,7 @@ async fn retaining_capture_failure_finds_the_same_observation_in_a_second_branch
     let error = AppError::MigrationAndSourceCleanupFailed {
         source: Box::new(AppError::ConfigError("consumer failed independently".into())),
         cleanup: Box::new(AppError::CopyExecutionStopped {
+            phase: "source_cleanup",
             source: Arc::new(error),
         }),
     };

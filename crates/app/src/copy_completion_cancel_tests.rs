@@ -257,11 +257,13 @@ async fn cancelled_completion_preserves_the_saved_execution_root_cause() -> Test
     let destination = TempDir::new()?;
     let (database, execution) = execution(CancellationToken::new())?;
     let first = execution
-        .run_child(async { Err(AppError::ConfigError("owned execution root cause".into())) })
+        .run_child("fixture", async {
+            Err(AppError::ConfigError("owned execution root cause".into()))
+        })
         .await;
     assert!(first.is_err());
     let result = complete(database, target(&destination).await?, None, Some(execution), None).await;
-    assert!(matches!(result, Err(AppError::CopyExecutionStopped { source })
+    assert!(matches!(result, Err(AppError::CopyExecutionStopped { source, .. })
         if matches!(source.as_ref(), AppError::ConfigError(reason) if reason == "owned execution root cause")));
     Ok(())
 }
