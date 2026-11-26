@@ -36,16 +36,15 @@ source purge readiness, whole-job network budgets or throughput/RSS.
 
 ## 扫描代次提交结果
 
-先用 `cargo build --locked --features lab-fault-injection --bin terrasync` 构建 CLI，
-再用 `cargo test --locked -p app --features lab-fault-injection --test scan_resume --no-run`
-取得回调测试程序路径。通过隔离实验室运行：
-
 ```sh
-LAB_TERRASYNC_BIN=/path/to/terrasync \
-LAB_SCAN_CALLBACK_DRIVER=/path/to/scan_resume-HASH \
-LAB_SCAN_RESULT_LOG_DIR=/path/to/new-results \
-python3 tests/lab/run-notification-archive-local.py --scan-generation-result
+python3 tests/lab/run-scan-generation-result.py
 ```
+
+使用 Linux、Python 3.11+、Cargo、Docker 和 `nsenter`。构建以调用者身份运行，
+隔离实验使用 root 或 `sudo -n`。入口从 Cargo 输出取得启用 `lab-fault-injection`
+的 CLI 和回调驱动，在启动 ClickHouse 前核验两者并记录 SHA-256。构建缓存和本轮
+可执行文件位于 Cargo 的目标目录。默认在临时目录保留构建日志、回调测试列表、
+运行日志和场景报告，也可以用 `--output-dir` 指定一个新目录。
 
 测试启动 ClickHouse 单机和两副本集群，核对 CLI、真实 HTTP 204 回调和归档报告。
 覆盖全量、增量、续扫、提交前失败保留基线、提交后清理失败、提交响应中断、
