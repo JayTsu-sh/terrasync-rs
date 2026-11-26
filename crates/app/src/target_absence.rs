@@ -73,7 +73,10 @@ impl SourceAbsenceCheck {
                 Ok(SourcePresence::Present)
             }
             Err(error) => {
-                self.check_active()?;
+                let error = StorageError::from(error);
+                if error.is_cancelled() {
+                    return Err(error.into());
+                }
                 preserve(
                     events,
                     entry,
@@ -82,7 +85,7 @@ impl SourceAbsenceCheck {
                     format!("源端存在性确认失败，保留目标并停止清理: {error}"),
                 )
                 .await?;
-                Err(StorageError::from(error).into())
+                Err(error.into())
             }
         }
     }

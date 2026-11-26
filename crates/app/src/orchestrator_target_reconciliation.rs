@@ -76,15 +76,16 @@ async fn reconcile_target_deletion(
     let source_presence = match source_absence.confirm(source, entry, events).await {
         Ok(presence) => presence,
         Err(error) => {
-            source_absence.check_active()?;
-            let _ = publish_target_deletion(
-                events,
-                entry,
-                SourcePresence::Unknown,
-                TargetDeletionOutcome::Failed,
-                Some(error.to_string()),
-            )
-            .await;
+            if !source_absence.cancellation().is_cancelled() {
+                let _ = publish_target_deletion(
+                    events,
+                    entry,
+                    SourcePresence::Unknown,
+                    TargetDeletionOutcome::Failed,
+                    Some(error.to_string()),
+                )
+                .await;
+            }
             return Err(error);
         }
     };
@@ -369,7 +370,7 @@ impl SyncOrchestrator {
                                                 from: from_arc,
                                                 to: to_arc,
                                                 change: Some(kind),
-                                                reason: error.to_string(),
+                                                reason: format!("目标已移动，后续内容或属性更新未完成: {error}"),
                                             })
                                             .await?;
                                         failure.get_or_insert_with(|| {

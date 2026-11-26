@@ -62,7 +62,7 @@ pub(crate) async fn process_entry_on_receiver(
             let target_path = copy_namespace::read_symlink(src_storage.storage(), entry)
                 .await
                 .map_err(|e| AppError::copy_entry_failure(CopyStep::ReadSourceLink, relative_path, e))?;
-            copy_namespace::create_symlink(dest_storage.storage(), entry, &target_path)
+            copy_namespace::create_symlink(dest_storage.storage(), entry, &target_path, config.cancel.as_ref())
                 .await
                 .map_err(|e| AppError::copy_entry_failure(CopyStep::CreateDestinationLink, relative_path, e))?;
             Ok(None)
