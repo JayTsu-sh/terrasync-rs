@@ -23,7 +23,7 @@ use task_model::TargetRetention;
 use task_model::TargetRetentionReason;
 use task_model::migration::{CopyGenerationPhase, MigrationMode, MigrationReport};
 use task_model::observation::ObservedScanEvent;
-use task_model::{ErrorEvent, StorageEntryMessage};
+use task_model::{ErrorEvent, GenerationCommitResult, StorageEntryMessage};
 use tokio::sync::Mutex;
 use tracing::{Instrument, debug, error, info_span, warn};
 
@@ -634,7 +634,7 @@ impl ConsumerManager {
                     progress_bar: ProgressBar::new(job_type),
                     job_dir,
                     callback_url,
-                    generation_committed: None,
+                    generation_commit_result: None,
                     migration: None,
                     pb_handle: None,
                     scan_snapshot: None,
@@ -645,7 +645,7 @@ impl ConsumerManager {
                     progress_bar: ProgressBar::new(job_type),
                     job_dir,
                     callback_url,
-                    generation_committed: None,
+                    generation_commit_result: None,
                     migration: None,
                     pb_handle: None,
                     scan_snapshot: None,
@@ -771,10 +771,10 @@ impl ConsumerManager {
         }
     }
 
-    /// 设置纯增量扫描在最终回调中暴露的 generation 提交分类。
-    pub async fn set_generation_committed(&self, committed: bool) {
+    /// 设置持久化代次在终态报告中的提交结果。
+    pub async fn set_generation_commit_result(&self, result: GenerationCommitResult) {
         if let Some(stats_consumer) = &self.stats_consumer {
-            stats_consumer.lock().await.generation_committed = Some(committed);
+            stats_consumer.lock().await.generation_commit_result = Some(result);
         }
     }
 
@@ -844,7 +844,7 @@ mod resume_tests {
                 progress_bar: ProgressBar::new(JobType::Copy),
                 job_dir: String::new(),
                 callback_url: None,
-                generation_committed: None,
+                generation_commit_result: None,
                 migration: None,
                 pb_handle: None,
                 scan_snapshot: None,
@@ -984,7 +984,7 @@ mod resume_tests {
             progress_bar: ProgressBar::new(JobType::Copy),
             job_dir: String::new(),
             callback_url: None,
-            generation_committed: None,
+            generation_commit_result: None,
             migration: None,
             pb_handle: None,
             scan_snapshot: None,
@@ -1049,7 +1049,7 @@ mod resume_tests {
             progress_bar: ProgressBar::new(JobType::IncrementalScan),
             job_dir: String::new(),
             callback_url: None,
-            generation_committed: None,
+            generation_commit_result: None,
             migration: None,
             pb_handle: None,
             scan_snapshot: None,
@@ -1168,7 +1168,7 @@ mod resume_tests {
             progress_bar: ProgressBar::new(JobType::Scan),
             job_dir: String::new(),
             callback_url: None,
-            generation_committed: None,
+            generation_commit_result: None,
             migration: None,
             pb_handle: None,
             scan_snapshot: None,
@@ -1197,7 +1197,7 @@ mod resume_tests {
             callback_identity: None,
             diagnostics: None,
             scan_runtime: None,
-            generation_committed: None,
+            generation_commit_result: None,
             migration: None,
         })?;
         let manager = ConsumerManager {

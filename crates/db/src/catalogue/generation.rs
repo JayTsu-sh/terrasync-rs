@@ -2,7 +2,7 @@
 
 use std::sync::atomic::Ordering;
 
-use clickhouse::error::Error as ClickHouseError;
+use clickhouse::{error::Error as ClickHouseError, query::Query};
 use serde_json::Value;
 use tracing::debug;
 
@@ -13,7 +13,7 @@ use crate::execution::queries::execute_request;
 use crate::execution::queries::idempotent_insert_client;
 use crate::execution::read::QuorumRead;
 use crate::execution::recovery::RequestSafety;
-use crate::{get_scan_base_table_name, get_scan_state_table_name};
+use crate::{get_scan_base_table_name, get_scan_state_table_name, scan::ScanResumeState};
 
 // 每次复制代次留出准备、提交和普通扫描覆盖三个版本，旧请求的到达顺序不能改变胜者。
 const STATE_VERSIONS_PER_COPY: u64 = 3;
@@ -59,18 +59,50 @@ impl ClickHouseDatabase {
 
     /// 普通扫描覆盖当前复制代次的状态；后续复制使用更高代次写入。
     pub async fn insert_scan_state(&self, scan_state: u8) -> Result<()> {
+        let version = self.ordinary_scan_state_version().await?;
+        self.insert_scan_state_with_baseline(scan_state, true, version).await
+    }
+
+    async fn ordinary_scan_state_version(&self) -> Result<u64> {
         let table = get_scan_state_table_name(&self.job_id);
         let current = self
             .sync_client
             .query(&format!("SELECT max(state_version) FROM {table} WHERE id=1"))
             .fetch_quorum_one::<u64>()
             .await?;
-        let version = if current == 0 {
-            0
+        if current == 0 {
+            Ok(0)
         } else {
-            copy_state_version(current / STATE_VERSIONS_PER_COPY)? + (STATE_VERSIONS_PER_COPY - 1)
-        };
-        self.insert_scan_state_with_baseline(scan_state, true, version).await
+            Ok(copy_state_version(current / STATE_VERSIONS_PER_COPY)? + (STATE_VERSIONS_PER_COPY - 1))
+        }
+    }
+
+    pub(crate) async fn persisted_scan_commit_query(&self, state: &ScanResumeState) -> Result<Query> {
+        let version = self.ordinary_scan_state_version().await?;
+        let table = get_scan_state_table_name(&self.job_id);
+        let manifest = self.resume_table();
+        let client = idempotent_insert_client(&self.sync_client);
+        Ok(client
+            .query(&format!(
+                "INSERT INTO {table} (id,scan_state,baseline_committed,state_version,scan_epoch) \
+                 SELECT 1,?,true,?,? WHERE throwIf((SELECT argMax(tuple(event_time,generation,phase,version),version) \
+                 FROM {manifest} WHERE id=1) != tuple(?,?,?,?), 'Scan manifest changed before commit')=0"
+            ))
+            .bind(state.generation)
+            .bind(version)
+            .bind(state.event_time)
+            .bind(state.event_time)
+            .bind(state.generation)
+            .bind(state.phase)
+            .bind(state.version))
+    }
+
+    pub(crate) async fn persisted_scan_state(&self) -> Result<(u8, i64)> {
+        let table = get_scan_state_table_name(&self.job_id);
+        self.sync_client
+            .query(&format!("SELECT scan_state,scan_epoch FROM {table} FINAL WHERE id=1"))
+            .fetch_quorum_one()
+            .await
     }
 
     pub(super) async fn insert_scan_state_with_baseline(

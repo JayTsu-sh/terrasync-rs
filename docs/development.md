@@ -18,7 +18,7 @@ AI 工作流程以根目录 [AGENTS.md](../AGENTS.md) 为准，产品约束按�
 
 这是当前开发与验收目标，不代表现有实现已经全部达标。存储／服务连通性的故障矩阵与通知策略统一见 [故障约束](external-dependency-failures.md)；本页不重复定义超时与重试规则。
 
-复制目录状态表 `state_*` 使用 `ReplacingMergeTree(state_version)` 或对应的集群物理表引擎。复制准备与提交同时保存执行身份和全量基线起点 `copy_baseline_sequence`。升级已有旧结构的作业时，先停跑并备份状态表，再移除旧表，由下一次复制初始化新表并重新全量。集群需要移除分布式状态表及各节点的对应物理状态表 `__catalogue_state_*`。扫描与复制的跨目录互斥以相同 ClickHouse DSN、数据库名和规范化作业 ID 为范围，Linux 进程需在同一网络命名空间。
+目录状态表 `state_*` 使用 `ReplacingMergeTree(commit_order)` 或对应的集群物理表引擎。替换顺序先比较复制的 `state_version`，再比较普通扫描的 `scan_epoch`，防止迟到的旧提交覆盖新基线。复制准备与提交同时保存执行身份和全量基线起点 `copy_baseline_sequence`。升级已有旧结构的作业时，先停跑并备份状态表，再移除旧表，由下一次复制初始化新表并重新全量。集群需要移除分布式状态表及各节点的对应物理状态表 `__catalogue_state_*`。扫描与复制的跨目录互斥以相同 ClickHouse DSN、数据库名和规范化作业 ID 为范围，Linux 进程需在同一网络命名空间。
 
 ## 按场景查阅
 

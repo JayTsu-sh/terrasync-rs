@@ -199,7 +199,7 @@ async fn nonempty_slash_objects_skip_filesystems_but_copy_complete_keys_and_hist
             } else {
                 None
             },
-            generation_committed: None,
+            generation_commit_result: None,
             migration: None,
             scan_snapshot: None,
             callback: CallbackState::default(),
@@ -513,7 +513,7 @@ async fn metadata_failures_copy_every_version_but_count_one_failed_entry() -> Te
             .as_deref()
             .map(CallbackEndpoint::parse)
             .transpose()?,
-        generation_committed: None,
+        generation_commit_result: None,
         migration: None,
         scan_snapshot: None,
         callback: CallbackState::default(),

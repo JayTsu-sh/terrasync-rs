@@ -18,12 +18,13 @@ use data_mover::{
 };
 use db::{
     scan::ScanStore,
-    scan::{FINALIZING, ScanResumeState},
+    scan::{FINALIZING, ScanRecovery, ScanResumeState},
 };
 use std::{
     sync::Arc,
     time::{Duration, Instant},
 };
+use task_model::GenerationCommitResult;
 #[cfg(feature = "lab-fault-injection")]
 use tokio::time::sleep;
 use tokio::{
@@ -52,7 +53,15 @@ pub(super) struct SaveState {
 impl SaveState {
     pub(super) async fn execute(mut self, database: &ScanStore) -> Result<()> {
         match self.action {
-            SaveAction::Restore => database.restore_scan_checkpoint(&self.state).await?,
+            SaveAction::Restore => {
+                database
+                    .recover_scan_generation(
+                        &mut self.state,
+                        ScanRecovery::Resume,
+                        &mut GenerationCommitResult::NotCommitted,
+                    )
+                    .await?;
+            }
             SaveAction::Capture => database.seal_resume_state(&mut self.state).await?,
             SaveAction::ManifestOnly => database.save_resume_state(&self.state).await?,
         }

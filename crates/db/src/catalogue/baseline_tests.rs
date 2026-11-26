@@ -54,7 +54,7 @@ async fn fresh_initialization_keeps_the_baseline_uncommitted() -> Result<()> {
     let ddl = schema.query().await;
     assert!(ddl.contains("baseline_committed Bool DEFAULT false"));
     assert!(ddl.contains("copy_execution_id String DEFAULT ''"));
-    assert!(ddl.contains("ReplacingMergeTree(`state_version`)"));
+    assert!(ddl.contains("ReplacingMergeTree(`commit_order`)"));
     let insert = initial.query().await;
     assert!(insert.contains("(id, scan_state, baseline_committed, state_version)"));
     assert!(insert.ends_with("VALUES (1, 0, false, 0)"), "{insert}");

@@ -7,12 +7,13 @@ use data_mover::model::{
 use db::{
     ClickHouseConfig, ClickHouseDatabase, Result,
     scan::ScanStore,
-    scan::{RUNNING, ScanResumeState},
+    scan::{RUNNING, ScanRecovery, ScanResumeState},
 };
 use std::{
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
+use task_model::GenerationCommitResult;
 use task_model::observation::{ObservedItem, ObservedScanEvent};
 use tokio::time::sleep;
 use utils::app_config::ClickHouseMode;
@@ -237,7 +238,13 @@ async fn exercise(fixture: &Fixture) -> Result<()> {
         .execute()
         .await?;
     eprintln!("stage: restore checkpoint");
-    store.restore_scan_checkpoint(&state).await?;
+    store
+        .recover_scan_generation(
+            &mut state,
+            ScanRecovery::Resume,
+            &mut GenerationCommitResult::NotCommitted,
+        )
+        .await?;
     assert_eq!(fixture.rows("base", job).await?, ["old", "prefix"]);
     assert_eq!(fixture.rows("incremental", job).await?, ["old", "prefix"]);
     assert_eq!(fixture.rows("base", "scan_b").await?, ["unrelated"]);
@@ -289,26 +296,53 @@ async fn exercise(fixture: &Fixture) -> Result<()> {
             .bind(&fixture.config.database).fetch_one().await?;
         assert!(pending > 0, "the fixture must leave an old destructive DDL outstanding");
         eprintln!("stage: restore checkpoint");
-        store.restore_scan_checkpoint(&state).await?;
+        store
+            .recover_scan_generation(
+                &mut state,
+                ScanRecovery::Resume,
+                &mut GenerationCommitResult::NotCommitted,
+            )
+            .await?;
         fixture.write(job, "after_restore", 1).await?;
         tokio::time::sleep(std::time::Duration::from_secs(3)).await;
         assert_eq!(fixture.rows("base", job).await?, ["after_restore", "old", "prefix"]);
     }
     assert!(ClickHouseDatabase::connect(&fixture.config, job).await.is_err());
-    store.restore_scan_baseline(&state).await?;
+    store
+        .recover_scan_generation(
+            &mut state,
+            ScanRecovery::Restart,
+            &mut GenerationCommitResult::NotCommitted,
+        )
+        .await?;
     assert_eq!(fixture.rows("base", job).await?, ["old"]);
     assert_eq!(fixture.rows("incremental", job).await?, ["old"]);
     // 合法空快照必须清除尾部；快照缺失与空快照不能混为一谈。
     let mut empty_state = state.clone();
     empty_state.checkpoint_snapshot = empty;
     // empty 已被 seal 后的 GC 回收，缺失必须 fail closed，且不能改动 working。
-    assert!(store.restore_scan_checkpoint(&empty_state).await.is_err());
+    assert!(
+        store
+            .recover_scan_generation(
+                &mut empty_state,
+                ScanRecovery::Resume,
+                &mut GenerationCommitResult::NotCommitted
+            )
+            .await
+            .is_err()
+    );
     assert_eq!(fixture.rows("base", job).await?, ["old"]);
     let empty_store = fixture.store("empty_job").await?;
     let empty = empty_store.capture_scan_baseline().await?;
     fixture.write("empty_job", "ghost", 1).await?;
     empty_state.checkpoint_snapshot = empty;
-    empty_store.restore_scan_checkpoint(&empty_state).await?;
+    empty_store
+        .recover_scan_generation(
+            &mut empty_state,
+            ScanRecovery::Resume,
+            &mut GenerationCommitResult::NotCommitted,
+        )
+        .await?;
     assert!(fixture.rows("base", "empty_job").await?.is_empty());
     assert_eq!(fixture.rows("base", "scan_b").await?, ["unrelated"]);
     Ok(())

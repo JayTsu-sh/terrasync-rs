@@ -183,7 +183,7 @@ pub(crate) fn consumer(endpoint: &CallbackEndpoint) -> Arc<Mutex<StatisticConsum
         progress_bar: ProgressBar::new(JobType::Copy),
         job_dir: String::new(),
         callback_url: Some(endpoint.clone()),
-        generation_committed: None,
+        generation_commit_result: None,
         migration: None,
         scan_snapshot: None,
         callback,

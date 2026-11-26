@@ -16,7 +16,7 @@ use super::lifecycle::ScanGenerationLifecycle;
 use crate::execution::queries::{ScanExecute, execute_request, idempotent_insert_client};
 use crate::execution::read::QuorumRead;
 use crate::execution::recovery::RequestSafety;
-use crate::scan::model::{ABANDONED, FINALIZING, RUNNING, ScanResumeState};
+use crate::scan::model::{ABANDONED, ScanResumeState};
 use crate::schema::columns::FILE_SCAN_COLUMNS_DEFINITION;
 use crate::schema::records::IncrementalStorageEntryRecord;
 use crate::{DatabaseError, Result, get_incremental_scan_base_table_name, get_scan_base_table_name};
@@ -139,20 +139,9 @@ impl ClickHouseDatabase {
     /// 返回 true 表示前一个进程退出前已提交最终代次。
     pub async fn restore_resume_generation(&self, state: &ScanResumeState) -> Result<bool> {
         self.validate_scan_base_table().await?;
-        let committed = self
-            .query_scan_state()
-            .await?
-            .ok_or_else(|| DatabaseError::TransactionError("Scan resume generation is missing".into()))?;
-        if committed == state.generation {
-            if state.phase != FINALIZING {
-                return Err(DatabaseError::TransactionError(
-                    "Saved running scan conflicts with the committed generation".into(),
-                ));
-            }
+        let (generation, epoch) = self.persisted_scan_state().await?;
+        if state.matches_commit(generation, epoch)? {
             return Ok(true);
-        }
-        if committed != 1 - state.generation {
-            return Err(DatabaseError::TransactionError("Invalid scan resume generation".into()));
         }
         *self.generation_lifecycle.lock().await = ScanGenerationLifecycle {
             working: Some(state.generation),
@@ -307,6 +296,7 @@ impl ClickHouseDatabase {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::scan::RUNNING;
 
     fn state() -> ScanResumeState {
         ScanResumeState {
@@ -360,7 +350,7 @@ impl ClickHouseDatabase {
                 .fetch_quorum_one::<(bool, u8)>()
                 .await
             {
-                Ok((incremental, phase)) if phase == RUNNING || phase == FINALIZING => return Ok(incremental),
+                Ok((incremental, phase)) if ScanResumeState::is_active_phase(phase) => return Ok(incremental),
                 Ok(_) | Err(DatabaseError::ClickHouseError(ClickHouseError::RowNotFound)) => {}
                 Err(error) => return Err(error.into()),
             }

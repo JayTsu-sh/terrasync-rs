@@ -15,10 +15,10 @@ use super::{
 use crate::storage_factory::{StorageContext, canonicalize_path};
 use data_mover::model::ObservedEntry;
 use data_mover::traversal::{Resumable, TraversalOrder};
-use db::scan::ScanResumeStatistics;
-use db::scan::{COMPLETED, FINALIZING, RUNNING, ScanResumeState};
+use db::scan::{COMPLETED, FINALIZING, RUNNING, ScanRecovery, ScanResumeState};
 use db::scan::{ScanFinalEvent, ScanStore};
-use task_model::{ErrorEvent, StorageEntryMessage};
+use db::{DatabaseError, scan::ScanResumeStatistics};
+use task_model::GenerationCommitResult;
 use tokio::{join, select, task::spawn_blocking};
 use tracing::{info, warn};
 use utils::app_config::AppConfig;
@@ -56,58 +56,70 @@ pub(super) async fn run_persisted(request: ScanRequest<'_>, config: AppConfig) -
     }
     tokio::fs::create_dir_all(job_dir).await?;
     let _lease = JobLease::acquire(Some(&config.database.clickhouse), job_id, job_dir)?;
-    let source = canonicalize_path(path)?;
-    let storage = select! {
-        biased;
-        _=cancel.cancelled()=>return Err(AppError::ObservationScanCancelled),
-        storage=create_storage_for_role(&source, None, false, StorageRole::Source)=>storage?,
-    };
-    let options = walk_options(depth, include.as_deref(), exclude.as_deref(), &config.scan)?;
-    // 只持久化源身份和有效扫描选项的摘要，不保存凭据。
-    let identity = storage.storage().identity();
-    let request_key = request_key(
-        identity.kind().as_str(),
-        identity.stable_id(),
-        depth,
-        include,
-        exclude,
-        options.include_tags,
-        resume,
-    )?;
     let mut database = ScanStore::new(&config.database.clickhouse, job_id)?;
     let queries = database.query_cancellation();
     let cancellation = ScanCancellation::new(cancel.clone());
-    cancellation::scope(queries, cancellation.clone(), async {
-        cancellation.check()?;
+    let mut consumer_config =
+        initialize_consumer_config(job_id, job_dir, JobType::Scan, command, &config, callback_url)?;
+    let mut consumers = None;
+    let mut outcome = GenerationCommitResult::NotCommitted;
+    // 续扫必须先读到并验证轮次，才能给本次尝试附上代次结论。
+    let mut report_generation = !resume;
+    // 此 future 包含编排与批处理，堆上 pin 避免 CLI 与 Web 调用方嵌套大栈帧。
+    let work = Box::pin(async {
+        let source = canonicalize_path(path)?;
+        let storage = select! {
+            biased;
+            _=cancel.cancelled()=>return Err(AppError::ObservationScanCancelled),
+            storage=create_storage_for_role(&source, None, false, StorageRole::Source)=>storage?,
+        };
+        let options = walk_options(depth, include.as_deref(), exclude.as_deref(), &config.scan)?;
+        // 只持久化源身份和有效扫描选项的摘要，不保存凭据。
+        let identity = storage.storage().identity();
+        let request_key = request_key(
+            identity.kind().as_str(),
+            identity.stable_id(),
+            depth,
+            include,
+            exclude,
+            options.include_tags,
+            resume,
+        )?;
         cancellation.operation(database.ping()).await?;
-        cancellation.check()?;
         let mut old = cancellation.operation(database.load_resume_state()).await?;
-        cancellation.check()?;
-        let mut already_committed = false;
-        let mut state = if let Some(state) = old.as_ref().filter(|state| state.active() && resume) {
+        let resuming = resume && old.as_ref().is_some_and(ScanResumeState::active);
+        let incremental = if let Some(state) = old.as_ref().filter(|_| resuming) {
             state.validate(&request_key)?;
+            report_generation = true;
+            if state.needs_commit_reconciliation() {
+                outcome = GenerationCommitResult::PendingConfirmation;
+            }
+            state.incremental
+        } else {
+            report_generation = true;
+            settle_previous_generation(&database, old.as_mut(), &cancellation).await?;
+            cancellation.operation(database.has_baseline()).await?
+        };
+        consumer_config.job_type = if incremental {
+            JobType::IncrementalScan
+        } else {
+            JobType::Scan
+        };
+        // 扫描管道确认事实，manager 负责统计与终态交付。
+        let consumers = consumers.insert(ConsumerManager::statistics_only(&consumer_config)?);
+
+        let mut state = if let Some(state) = old.as_mut().filter(|_| resuming) {
+            initialize_report(consumers, state, &storage, options.include_tags).await?;
             if !cancellation.operation(database.results_exist()).await? {
                 return Err(AppError::ScanError(
                     "Saved scan results are missing; refusing to resume".into(),
                 ));
             }
-            if cancellation
-                .operation(database.restore_resume_generation(state))
-                .await?
-            {
-                let mut completed = state.clone();
-                completed.phase = COMPLETED;
-                completed.checkpoint.clear();
-                completed.advance()?;
-                cancellation.operation(database.save_resume_state(&completed)).await?;
-                cancellation.operation(database.cleanup_scan_snapshots(&completed)).await?;
-                if let Err(error) = cancellation.operation(database.cleanup_resume_batch()).await {
-                    warn!(%error, "Completed scan; deferred batch-table cleanup");
-                }
-                info!("Recovered the previous scan's completed generation commit");
-                already_committed = true;
-            } else {
-                cancellation.operation(database.restore_scan_checkpoint(state)).await?;
+            cancellation
+                .operation(database.recover_scan_generation(state, ScanRecovery::Resume, &mut outcome))
+                .await?;
+            if state.incremental && outcome == GenerationCommitResult::NotCommitted {
+                cancellation.operation(database.prepare_incremental()).await?;
             }
             info!(
                 entries = state.observed_entries,
@@ -116,103 +128,126 @@ pub(super) async fn run_persisted(request: ScanRequest<'_>, config: AppConfig) -
             );
             state.clone()
         } else {
-            if let Some(state) = old.as_mut().filter(|state| state.active()) {
-                let committed = state.phase == FINALIZING && cancellation.operation(database.restore_resume_generation(state)).await?;
-                if committed {
-                    state.phase = COMPLETED;
-                    state.checkpoint.clear();
-                    state.advance()?;
-                    cancellation.operation(database.save_resume_state(state)).await?;
-                } else {
-                    cancellation.operation(database.restore_scan_baseline(state)).await?;
-                }
-            }
-            let incremental = cancellation.operation(database.has_baseline()).await?;
-            cancellation.operation(database.initialize()).await?;
-            cancellation.operation(database.prepare_incremental()).await?;
-            let baseline_snapshot = cancellation.operation(database.capture_scan_baseline()).await?;
-            let generation = cancellation.operation(database.begin_scan_generation()).await?;
-            // begin 可能写入旧轮次的 ABANDONED manifest；新轮版本必须严格超过它。
-            let previous = cancellation.operation(database.load_resume_state()).await?;
-            let now = i64::try_from(SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos())?;
-            let event_time = cancellation.operation(database.resume_event_epoch(now)).await?;
-            let mut fresh = ScanResumeState {
-                id: 1,
-                schema_version: 1,
-                version: previous.as_ref().map_or(0, |value| value.version),
-                request_key,
-                generation,
-                incremental,
-                phase: RUNNING,
-                event_time,
-                observed_entries: 0,
-                checkpoint: Vec::new(),
-                statistics: String::new(),
-                checkpoint_snapshot: baseline_snapshot.clone(),
-                baseline_snapshot,
-            };
-            fresh.advance()?;
-            cancellation.operation(database.save_resume_state(&fresh)).await?;
-            cancellation.operation(database.cleanup_scan_snapshots(&fresh)).await?;
-            info!("Starting a scan with durable ClickHouse checkpoints");
-            fresh
+            let state = begin_generation(&database, request_key, incremental, &cancellation).await?;
+            initialize_report(consumers, &state, &storage, options.include_tags).await?;
+            state
         };
-        if state.incremental {
-            cancellation.operation(database.prepare_incremental()).await?;
-        }
-        let kind = if state.incremental {
-            JobType::IncrementalScan
-        } else {
-            JobType::Scan
-        };
-        let consumer_config = initialize_consumer_config(job_id, job_dir, kind, command, &config, callback_url)?;
-        // 本管道确认扫描事实；manager 管理统计及独立的最终报告。
-        let mut consumers = ConsumerManager::statistics_only(&consumer_config)?;
-        // 累计数与目录贡献必须来自同一已确认检查点；旧检查点无法补出过滤计数。
-        consumers.restore_statistics(&state.statistics).await?;
-        if (!state.checkpoint.is_empty() || state.observed_entries > 0)
-            && !consumers.task_statistics().snapshot().await.is_some_and(|scan| scan.valid_checkpoint(state.observed_entries)) {
-            return Err(AppError::ScanError("Saved scan checkpoint lacks consistent directory statistics; reset this job's scan records before starting a new round".into()));
-        }
-        consumers
-            .initialize_scan_statistics(&storage, options.include_tags, Some(state.event_time))
-            .await?;
         consumers.begin_lifecycle().await;
-        let result = if already_committed {
-            Ok(())
+        if outcome == GenerationCommitResult::Committed {
+            info!("Recovered the previous scan's completed generation commit");
+            finish_generation(&database, &mut state, &cancellation).await
         } else {
             run(
                 &storage,
                 &options,
                 &mut database,
                 &mut state,
-                &consumers,
+                consumers,
                 config.database.batch_size.max(1) as usize,
-                cancellation.clone(), resume,
+                cancellation.clone(),
+                resume,
+                &mut outcome,
             )
             .await
-        };
-        if let Err(error) = &result
-            && !cancel.is_cancelled()
-        {
-            consumers
-                .record_statistics([StorageEntryMessage::Error {
-                    event: ErrorEvent::Scan,
-                    path: Default::default(),
-                    entry: None,
-                    reason: error.to_string(),
-                }])
-                .await;
         }
-        consumers.set_generation_committed(result.is_ok()).await;
-        if cancellation.token().is_cancelled() {
-            consumers.end_cancelled_lifecycle().await;
-        } else {
-            consumers.end_lifecycle().await;
+    });
+    let result = cancellation::scope(queries, cancellation.clone(), work).await;
+    let mut consumers = match consumers {
+        Some(consumers) => consumers,
+        None => ConsumerManager::statistics_only(&consumer_config)?,
+    };
+    if let Err(error) = &result
+        && !matches!(error, AppError::ObservationScanCancelled)
+    {
+        consumers.record_task_error(error).await;
+    }
+    if report_generation {
+        consumers.set_generation_commit_result(outcome).await;
+    }
+    if cancel.is_cancelled() {
+        consumers.end_cancelled_lifecycle().await;
+    } else {
+        consumers.end_lifecycle().await;
+    }
+    result
+}
+
+async fn initialize_report(
+    consumers: &ConsumerManager, state: &ScanResumeState, storage: &StorageContext, include_tags: bool,
+) -> Result<()> {
+    let restored = consumers.restore_statistics(&state.statistics).await;
+    consumers
+        .initialize_scan_statistics(storage, include_tags, Some(state.event_time))
+        .await?;
+    restored?;
+    // 累计数与目录贡献必须来自同一已确认检查点。
+    if (!state.checkpoint.is_empty() || state.observed_entries > 0)
+        && !consumers
+            .task_statistics()
+            .snapshot()
+            .await
+            .is_some_and(|scan| scan.valid_checkpoint(state.observed_entries))
+    {
+        return Err(AppError::ScanError(
+            "Saved scan checkpoint lacks consistent directory statistics; reset this job's scan records before starting a new round".into(),
+        ));
+    }
+    Ok(())
+}
+
+async fn settle_previous_generation(
+    database: &ScanStore, old: Option<&mut ScanResumeState>, cancel: &ScanCancellation,
+) -> Result<()> {
+    if let Some(state) = old.filter(|state| state.active()) {
+        let mut outcome = GenerationCommitResult::NotCommitted;
+        cancel
+            .operation(database.recover_scan_generation(state, ScanRecovery::Restart, &mut outcome))
+            .await?;
+        if outcome == GenerationCommitResult::Committed {
+            complete_manifest(database, state, cancel).await?;
         }
-        result
-    })
-    .await
+    }
+    Ok(())
+}
+
+async fn begin_generation(
+    database: &ScanStore, request_key: String, incremental: bool, cancel: &ScanCancellation,
+) -> Result<ScanResumeState> {
+    cancel.operation(database.initialize()).await?;
+    cancel.operation(database.prepare_incremental()).await?;
+    let baseline_snapshot = cancel.operation(database.capture_scan_baseline()).await?;
+    let generation = cancel.operation(database.begin_scan_generation()).await?;
+    // begin 可能改写 manifest。新轮次的版本和身份必须严格前进，即使时钟回拨或没有变更事件。
+    let previous = cancel.operation(database.load_resume_state()).await?;
+    let now = i64::try_from(SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos())?;
+    let now = now.max(
+        previous
+            .as_ref()
+            .map_or(0, |state| state.event_time)
+            .checked_add(1)
+            .ok_or(DatabaseError::ConversionError("Scan epoch overflow".into()))?,
+    );
+    let event_time = cancel.operation(database.resume_event_epoch(now)).await?;
+    let mut fresh = ScanResumeState {
+        id: 1,
+        schema_version: 1,
+        version: previous.as_ref().map_or(0, |value| value.version),
+        request_key,
+        generation,
+        incremental,
+        phase: RUNNING,
+        event_time,
+        observed_entries: 0,
+        checkpoint: Vec::new(),
+        statistics: String::new(),
+        checkpoint_snapshot: baseline_snapshot.clone(),
+        baseline_snapshot,
+    };
+    fresh.advance()?;
+    cancel.operation(database.save_resume_state(&fresh)).await?;
+    cancel.operation(database.cleanup_scan_snapshots(&fresh)).await?;
+    info!("Starting a scan with durable ClickHouse checkpoints");
+    Ok(fresh)
 }
 
 fn request_key(
@@ -237,6 +272,7 @@ fn checkpoint_interval() -> Duration {
 async fn run(
     storage: &StorageContext, options: &WalkOptions, database: &mut ScanStore, state: &mut ScanResumeState,
     consumers: &ConsumerManager, batch_size: usize, cancel: ScanCancellation, resume: bool,
+    outcome: &mut GenerationCommitResult,
 ) -> Result<()> {
     if state.phase == RUNNING {
         let mode = if resume {
@@ -258,6 +294,7 @@ async fn run(
     consumers.reconcile_scan_statistics(statistics).await;
     cancel.check()?;
     state.statistics = consumers.statistics_checkpoint().await?;
+    state.phase = FINALIZING;
     state.advance()?;
     if state.incremental {
         cancel.operation(database.seal_resume_state(state)).await?;
@@ -266,13 +303,21 @@ async fn run(
         cancel.operation(database.save_resume_state(state)).await?;
     }
     cancel.check()?;
-    cancel.operation(database.commit_scan_generation()).await?;
-    cancel.check()?;
-    state.statistics = consumers.statistics_checkpoint().await?;
+    cancel
+        .operation(database.commit_scan_generation(state, outcome))
+        .await?;
+    finish_generation(database, state, &cancel).await
+}
+
+async fn complete_manifest(database: &ScanStore, state: &mut ScanResumeState, cancel: &ScanCancellation) -> Result<()> {
     state.phase = COMPLETED;
     state.checkpoint.clear();
     state.advance()?;
-    cancel.operation(database.save_resume_state(state)).await?;
+    cancel.operation(database.save_resume_state(state)).await
+}
+
+async fn finish_generation(database: &ScanStore, state: &mut ScanResumeState, cancel: &ScanCancellation) -> Result<()> {
+    complete_manifest(database, state, cancel).await?;
     cancel.operation(database.cleanup_scan_snapshots(state)).await?;
     if let Err(error) = cancel.operation(database.cleanup_resume_batch()).await {
         warn!(%error, "Completed scan; deferred batch-table cleanup");

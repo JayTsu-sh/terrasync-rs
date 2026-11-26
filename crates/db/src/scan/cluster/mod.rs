@@ -12,8 +12,8 @@ use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::{Mutex, OnceCell};
 
-use clickhouse::Client;
 use clickhouse::error::Error as ClickHouseError;
+use clickhouse::{Client, query::Query};
 use serde::{Deserialize, Serialize};
 use utils::sanitize_job_id;
 
@@ -22,8 +22,10 @@ use crate::config::ClickHouseConfig;
 use crate::error::{DatabaseError, Result};
 #[cfg(test)]
 use crate::execution::base_client;
+#[cfg(test)]
+use crate::scan::FINALIZING;
+use crate::scan::ScanResumeState;
 use crate::scan::ScanResumeStatistics;
-use crate::scan::{FINALIZING, ScanResumeState};
 use crate::schema::columns::FILE_SCAN_COLUMNS_LIST;
 use crate::schema::columns::{FILE_INCREMENTAL_SCAN_COLUMNS_DEFINITION, FILE_SCAN_COLUMNS_DEFINITION};
 #[cfg(test)]
@@ -411,7 +413,7 @@ impl ClusterScanStore {
             .fetch_quorum_one::<(bool, u8)>()
             .await
         {
-            Ok((incremental, phase)) if phase <= FINALIZING => return Ok(incremental),
+            Ok((incremental, phase)) if ScanResumeState::is_active_phase(phase) => return Ok(incremental),
             Ok(_) | Err(DatabaseError::ClickHouseError(ClickHouseError::RowNotFound)) => {}
             Err(error) => return Err(error),
         }
@@ -439,50 +441,35 @@ impl ClusterScanStore {
     pub(crate) async fn restore_resume_generation(&self, state: &ScanResumeState) -> Result<bool> {
         self.epoch.store(state.event_time as u64, Ordering::Relaxed);
         self.generation.store(state.generation, Ordering::Relaxed);
-        if let Some(committed) = self.committed().await? {
-            if committed.epoch == state.event_time as u64 {
-                if state.phase != FINALIZING {
-                    return Err(DatabaseError::TransactionError(
-                        "Running checkpoint conflicts with completed epoch".into(),
-                    ));
-                }
-                return Ok(true);
-            }
-            if committed.generation == state.generation {
-                return Err(DatabaseError::TransactionError(
-                    "Saved scan generation conflicts with baseline".into(),
-                ));
-            }
+        self.persisted_scan_matches_commit(state).await
+    }
+
+    pub(crate) async fn persisted_scan_matches_commit(&self, state: &ScanResumeState) -> Result<bool> {
+        match self.committed().await? {
+            Some(committed) => state.matches_commit(committed.generation, i64::try_from(committed.epoch)?),
+            None => Ok(false),
         }
-        Ok(false)
     }
-    pub(crate) async fn commit_scan_generation(&self) -> Result<()> {
+
+    pub(crate) fn persisted_scan_commit_query(&self, state: &ScanResumeState) -> Query {
         let client = idempotent_insert_client(&self.client);
-        retry_quorum(RequestSafety::IdempotentWrite, || async {
-            let database = identifier(&self.database)?;
-            let epoch = self.epoch.load(Ordering::Relaxed);
-            let generation: u8 = self
-                .client
-                .query(&format!(
-                    "SELECT generation FROM {database}.scan_resume FINAL WHERE job_id=?"
-                ))
-                .bind(&self.job_id)
-                .fetch_quorum_one()
-                .await?;
-            let mut insert = client.insert::<CommittedScan>("state").await?;
-            insert
-                .write(&CommittedScan {
-                    job_id: self.job_id.clone(),
-                    generation,
-                    epoch,
-                    ver: epoch as i64,
-                })
-                .await?;
-            insert.end().await?;
-            Ok(())
-        })
-        .await
+        client
+            .query(
+                "INSERT INTO state (job_id,generation,epoch,ver) \
+                 SELECT ?,?,?,fromUnixTimestamp64Nano(?) WHERE throwIf((SELECT argMax(tuple(event_time,generation,phase,version),version) \
+                 FROM scan_resume WHERE job_id=?) != tuple(?,?,?,?), 'Scan manifest changed before commit')=0",
+            )
+            .bind(&self.job_id)
+            .bind(state.generation)
+            .bind(state.event_time)
+            .bind(state.event_time)
+            .bind(&self.job_id)
+            .bind(state.event_time)
+            .bind(state.generation)
+            .bind(state.phase)
+            .bind(state.version)
     }
+
     pub(crate) async fn resume_event_epoch(&self, now: i64) -> Result<i64> {
         let database = identifier(&self.database)?;
         let last: i64 = self

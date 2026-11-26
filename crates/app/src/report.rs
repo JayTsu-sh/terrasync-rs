@@ -6,7 +6,7 @@
 //! - `FinalStats` — 最终分布统计（附加到 `ProgressReport` 的 final 回调）
 
 use serde::{Deserialize, Serialize};
-use task_model::migration::MigrationReport;
+use task_model::{GenerationCommitResult, migration::MigrationReport};
 
 pub use crate::consumer::stats::{DeltaCounts, ErrorStats};
 pub use crate::scan::statistics::ScanSnapshot;
@@ -94,7 +94,7 @@ pub struct ProgressReport {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scan_runtime: Option<ScanRuntimeState>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub generation_committed: Option<bool>,
+    pub generation_commit_result: Option<GenerationCommitResult>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub migration: Option<MigrationReport>,
     #[serde(skip_serializing_if = "Option::is_none")]

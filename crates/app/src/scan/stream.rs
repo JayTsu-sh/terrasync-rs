@@ -87,7 +87,6 @@ pub(super) async fn run(request: ScanRequest<'_>, config: AppConfig) -> Result<(
     {
         manager.record_task_failures(&[error.to_string()]).await;
     }
-    manager.set_generation_committed(result.is_ok()).await;
     if cancel.token().is_cancelled() {
         manager.end_cancelled_lifecycle().await;
     } else {

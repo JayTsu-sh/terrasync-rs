@@ -319,6 +319,7 @@ fn execution_stats_from_report(report: &ProgressReport) -> ExecutionStats {
             avg_speed_bytes_per_sec: report.speed_bytes_per_sec,
             scan: report.scan.clone(),
             scan_runtime: report.scan_runtime.clone(),
+            generation_commit_result: report.generation_commit_result,
         },
         ProgressDetail::Incremental {
             scanned_files,
@@ -339,6 +340,7 @@ fn execution_stats_from_report(report: &ProgressReport) -> ExecutionStats {
             avg_speed_bytes_per_sec: report.speed_bytes_per_sec,
             scan: report.scan.clone(),
             scan_runtime: report.scan_runtime.clone(),
+            generation_commit_result: report.generation_commit_result,
         },
     }
 }
@@ -352,10 +354,10 @@ mod configuration_tests {
     use sqlx::sqlite::SqlitePoolOptions;
 
     #[test]
-    fn execution_summary_includes_incremental_symlinks() -> Result<()> {
+    fn execution_summary_includes_incremental_symlinks_and_commit_result() -> Result<()> {
         let report: ProgressReport = serde_json::from_value(serde_json::json!({
             "target_preserved_count":0, "job_id":"links", "job_type":"IncrementalScan", "elapsed_secs":1.0,
-            "speed_bytes_per_sec":0.0, "is_final":true,
+            "speed_bytes_per_sec":0.0, "is_final":true, "generation_commit_result":"pending_confirmation",
             "detail":{"kind":"Incremental", "scanned_files":10, "scanned_dirs":2,
                 "scanned_symlinks":4, "scanned_size":0, "transferred_bytes":0,
                 "error_count":0, "new_count":0, "new_size":0, "changed_count":0,
@@ -365,6 +367,10 @@ mod configuration_tests {
         let stats = execution_stats_from_report(&report);
         assert_eq!(stats.scanned_files, 14);
         assert_eq!(stats.scanned_dirs, 2);
+        assert_eq!(
+            serde_json::to_value(&stats)?["generation_commit_result"],
+            "pending_confirmation"
+        );
         Ok(())
     }
 
