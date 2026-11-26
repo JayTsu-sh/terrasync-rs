@@ -1,5 +1,5 @@
 //! One task's catalogue coordination. Only explicit catalogue clones share this state.
-use task_model::migration::CopyGeneration;
+use task_model::{GenerationCommitResult, migration::CopyGeneration};
 use tokio::sync::{Mutex, MutexGuard, RwLock, RwLockReadGuard};
 
 use super::ClickHouseDatabase;
@@ -8,7 +8,7 @@ use crate::{DatabaseError, Result};
 #[derive(Default)]
 pub(super) struct ScanGenerationLifecycle {
     pub working: Option<u8>,
-    pub committed: bool,
+    pub commit_result: Option<GenerationCommitResult>,
     pub copy_recovery: bool,
     pub copy_generation_recovering: bool,
     pub copy_execution_id: Option<String>,

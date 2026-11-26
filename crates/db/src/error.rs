@@ -56,6 +56,8 @@ pub enum DatabaseError {
     },
     #[error(transparent)]
     MigrationPolicy(#[from] task_model::TaskModelError),
+    #[error("本轮复制代次提交仍待确认")]
+    CopyGenerationCommitUnconfirmed,
     #[error("本轮复制执行身份尚未准备，拒绝查询删源或目录收尾候选")]
     CopyExecutionUnavailable,
     #[error(

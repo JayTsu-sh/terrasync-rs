@@ -14,6 +14,7 @@ use clickhouse::{
     },
 };
 use hyper::StatusCode;
+use task_model::GenerationCommitResult;
 use task_model::TaskModelError;
 use task_model::migration::{CopyGeneration, CopyGenerationPhase, CopyGenerationPlan, MigrationMode};
 
@@ -236,7 +237,7 @@ async fn retirement_fixture(mock: &Mock) -> Result<(ClickHouseDatabase, CopyGene
     let generation = prior("retirement", false, CopyGenerationPhase::Prepared, true);
     let mut lifecycle = database.generation_lifecycle.lock().await;
     lifecycle.working = Some(1);
-    lifecycle.committed = true;
+    lifecycle.commit_result = Some(GenerationCommitResult::Committed);
     lifecycle.copy_execution_id = Some(generation.request.execution_id.clone());
     lifecycle.copy_generation = Some(generation.clone());
     drop(lifecycle);
@@ -414,7 +415,7 @@ async fn root_raw_column_roundtrips_large_values_without_consuming_descriptor_bu
     let snapshot = root.try_encode_snapshot()?.as_bytes().to_vec();
     {
         let mut lifecycle = database.generation_lifecycle.lock().await;
-        lifecycle.committed = true;
+        lifecycle.commit_result = Some(GenerationCommitResult::Committed);
         lifecycle.copy_generation = Some(generation.clone());
     }
     let saved = mock.add(handlers::record_ddl());
@@ -465,7 +466,7 @@ async fn invalid_root_snapshot_does_not_change_terminal_phase_or_revision() -> R
     generation.request.binding.source.namespace = "terrasync-fixture".into();
     {
         let mut lifecycle = database.generation_lifecycle.lock().await;
-        lifecycle.committed = true;
+        lifecycle.commit_result = Some(GenerationCommitResult::Committed);
         lifecycle.copy_generation = Some(generation.clone());
     }
     assert!(

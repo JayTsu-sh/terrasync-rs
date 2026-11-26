@@ -4,13 +4,15 @@ use std::sync::atomic::Ordering;
 
 use clickhouse::{error::Error as ClickHouseError, query::Query};
 use serde_json::Value;
-use tracing::debug;
+use task_model::GenerationCommitResult;
+use tracing::{debug, info};
 
 use super::ClickHouseDatabase;
 use super::lifecycle::{CopyFactRange, ScanGenerationLifecycle};
 use crate::error::{DatabaseError, Result};
-use crate::execution::queries::execute_request;
+use crate::execution::commit::commit_with_readback;
 use crate::execution::queries::idempotent_insert_client;
+use crate::execution::queries::{ScanExecute, execute_request};
 use crate::execution::read::QuorumRead;
 use crate::execution::recovery::RequestSafety;
 use crate::{get_scan_base_table_name, get_scan_state_table_name, scan::ScanResumeState};
@@ -131,14 +133,33 @@ impl ClickHouseDatabase {
         Ok(())
     }
 
-    pub(super) async fn publish_copy_scan_state(
-        &self, scan_state: u8, baseline_committed: bool, execution_id: &str, facts: CopyFactRange,
+    pub(super) async fn prepare_copy_scan_state(
+        &self, scan_state: u8, execution_id: &str, facts: CopyFactRange,
     ) -> Result<()> {
+        let _write = self.catalogue_write_guard().await;
+        self.copy_scan_state_query(scan_state, false, execution_id, facts)?
+            .execute_scan()
+            .await
+    }
+
+    fn copy_scan_state_query(
+        &self, scan_state: u8, committed: bool, execution_id: &str, facts: CopyFactRange,
+    ) -> Result<Query> {
         let table = get_scan_state_table_name(&self.job_id);
-        let version = copy_state_version(facts.last)? + u64::from(baseline_committed);
+        let version = copy_state_version(facts.last)? + u64::from(committed);
         let baseline = facts.first;
-        self.execute(&format!("INSERT INTO {table} (id,scan_state,baseline_committed,copy_execution_id,state_version,copy_baseline_sequence) VALUES (1,{scan_state},{baseline_committed},?,{version},{baseline})"),
-            &[Value::from(execution_id)]).await
+        let client = self.catalogue_write_client(&self.sync_client);
+        Ok(client.query(&format!("INSERT INTO {table} (id,scan_state,baseline_committed,copy_execution_id,state_version,copy_baseline_sequence) VALUES (1,{scan_state},{committed},?,{version},{baseline})"))
+            .bind(execution_id))
+    }
+
+    /// 结果属于本进程已接受的复制代次，供终态报告使用。
+    pub async fn copy_generation_commit_result(&self) -> Option<GenerationCommitResult> {
+        let lifecycle = self.generation_lifecycle.lock().await;
+        lifecycle
+            .copy_generation
+            .as_ref()
+            .map(|_| lifecycle.commit_result.unwrap_or(GenerationCommitResult::NotCommitted))
     }
 
     /// 将上次未提交的 working 快照重新标记为 committed，作为同 generation 重试的基线。
@@ -185,19 +206,36 @@ impl ClickHouseDatabase {
         let working = lifecycle
             .working
             .ok_or_else(|| DatabaseError::TransactionError("Cannot commit scan generation before begin".to_string()))?;
-        if lifecycle.committed {
+        if lifecycle.commit_result == Some(GenerationCommitResult::Committed) {
             return Ok(());
         }
         if let Some(execution_id) = &lifecycle.copy_execution_id {
             let facts = lifecycle
                 .copy_fact_range
                 .ok_or(DatabaseError::CopyExecutionUnavailable)?;
-            self.publish_copy_scan_state(working, true, execution_id, facts).await?;
+            if lifecycle.commit_result == Some(GenerationCommitResult::PendingConfirmation) {
+                if !self.copy_scan_commit_confirmed(working, execution_id, facts).await? {
+                    return Err(DatabaseError::CopyGenerationCommitUnconfirmed);
+                }
+            } else {
+                let _write = self.catalogue_write_guard().await;
+                let query = self.copy_scan_state_query(working, true, execution_id, facts)?;
+                let mut outcome = GenerationCommitResult::NotCommitted;
+                let result = commit_with_readback(query, async || {
+                    let confirmed = self.copy_scan_commit_confirmed(working, execution_id, facts).await?;
+                    if confirmed {
+                        info!(sequence = facts.last, %execution_id, "Confirmed copy generation after losing the commit response");
+                    }
+                    Ok(confirmed)
+                }, &mut outcome).await;
+                lifecycle.commit_result = Some(outcome);
+                result?;
+            }
         } else {
             self.insert_scan_state(working).await?;
         }
         self.cached_scan_state.store(working, Ordering::Relaxed);
-        lifecycle.committed = true;
+        lifecycle.commit_result = Some(GenerationCommitResult::Committed);
         lifecycle.copy_recovery = false;
         Ok(())
     }
