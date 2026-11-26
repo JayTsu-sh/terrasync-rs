@@ -19,25 +19,54 @@ import uuid
 ROOT = Path(__file__).resolve().parents[2]
 
 
-def docker(*arguments, start_new_session=False):
-    return subprocess.check_output(["docker", *arguments], text=True, start_new_session=start_new_session).strip()
+def docker(*arguments):
+    return subprocess.check_output(["docker", *arguments], text=True).strip()
 
 
-def start_isolated_container(containers, *arguments):
-    interrupted = False
+def start_isolated_container(containers, name, *arguments):
+    cancel_deadline = None
 
     def defer_interrupt(_signum, _frame):
-        nonlocal interrupted
-        interrupted = True
+        nonlocal cancel_deadline
+        if cancel_deadline is None:
+            cancel_deadline = time.monotonic() + 5
 
-    # Docker 创建成功后先登记 ID，再让外层执行清理。
+    # 先登记本轮的容器名，中断时给 Docker 有界时间返回。
     previous = signal.signal(signal.SIGINT, defer_interrupt)
     try:
-        containers.append(docker("run", *arguments, start_new_session=True))
+        containers.append(name)
+        command = ["docker", "run", "--name", name, *arguments]
+        with subprocess.Popen(command, stdout=subprocess.DEVNULL, start_new_session=True) as launch:
+            while launch.poll() is None:
+                if cancel_deadline is not None and time.monotonic() >= cancel_deadline:
+                    launch.kill()
+                    break
+                time.sleep(0.05)
+            code = launch.wait()
     finally:
         signal.signal(signal.SIGINT, previous)
-    if interrupted:
+    if cancel_deadline is not None:
         raise KeyboardInterrupt
+    if code:
+        raise subprocess.CalledProcessError(code, command)
+
+
+def run_in_network_namespace(pid, suite):
+    command = ["nsenter", "-t", pid, "-n", sys.executable, __file__, "--inside", *suite]
+    with subprocess.Popen(command, cwd=ROOT, start_new_session=True) as child:
+        try:
+            code = child.wait()
+        except KeyboardInterrupt:
+            try:
+                os.killpg(child.pid, signal.SIGTERM)
+                child.wait(timeout=5)
+            except ProcessLookupError:
+                pass
+            except subprocess.TimeoutExpired:
+                os.killpg(child.pid, signal.SIGKILL)
+            raise
+    if code:
+        raise subprocess.CalledProcessError(code, command)
 
 
 def configuration(replica, shards=1):
@@ -86,7 +115,7 @@ def run_isolated():
                 config.write_text(configuration(replica, shards))
                 network = "none" if replica == 1 else f"container:{containers[0]}"
                 start_isolated_container(
-                    containers, "-d", "--name", f"ts-notification-r{replica}-{uuid.uuid4().hex[:12]}",
+                    containers, f"ts-notification-r{replica}-{uuid.uuid4().hex[:12]}", "-d",
                     "--network", network, "--memory=1536m", "--cpus=2",
                     "--tmpfs", "/var/lib/clickhouse:rw,size=384m,mode=1777",
                     "--tmpfs", "/var/log/clickhouse-server:rw,size=32m,mode=1777",
@@ -96,7 +125,7 @@ def run_isolated():
                 )
             if any(flag in sys.argv for flag in ("--version-catalogue", "--mutable-catalogue", "--version-metadata", "--metadata-cancel", "--copy-object-cleanup", "--copy-versioned-source-cleanup")):
                 start_isolated_container(
-                    containers, "-d", "--name", f"ts-version-catalogue-{uuid.uuid4().hex[:12]}",
+                    containers, f"ts-version-catalogue-{uuid.uuid4().hex[:12]}", "-d",
                     "--network", f"container:{containers[0]}", "--memory=768m", "--cpus=1",
                     "--tmpfs", "/data:rw,size=128m,mode=1777", "--label", "codex.task=version-catalogue",
                     "-e", "RUSTFS_ADDRESS=0.0.0.0:19000", "-e", "RUSTFS_CONSOLE_ADDRESS=0.0.0.0:19001",
@@ -108,14 +137,27 @@ def run_isolated():
             pid = docker("inspect", containers[0], "--format", "{{.State.Pid}}")
             suite = [flag for flag in ("--copy-generations", "--copy-content", "--copy-ready-cleanup", "--directory-completion", "--copy-object-cleanup", "--copy-versioned-source-cleanup", "--catalogue-recovery", "--consumer-recovery", "--copy-execution", "--copy-data-cancel", "--copy-file-list-cancel", "--rename-generations", "--retention-events", "--source-absence", "--request-policy", "--copy-contracts", "--version-catalogue", "--mutable-catalogue", "--version-metadata", "--metadata-cancel", "--scan-wire") if flag in sys.argv]
             suite.extend(flag for flag in ("--multi-shard", "--copy-takeover", "--scan-generation-result", "--copy-generation-result", "--copy-independent-failures") if flag in sys.argv)
-            subprocess.run(["nsenter", "-t", pid, "-n", sys.executable, __file__, "--inside", *suite], cwd=ROOT, check=True)
+            run_in_network_namespace(pid, suite)
         except BaseException:
             for container in containers:
-                print(docker("logs", "--tail=25", container), file=sys.stderr)
+                try:
+                    subprocess.run(["docker", "logs", "--tail=25", container], stdout=sys.stderr, timeout=3)
+                except subprocess.TimeoutExpired:
+                    print(f"Docker logs timed out for {container}", file=sys.stderr)
             raise
         finally:
+            failures = []
             for container in reversed(containers):
-                docker("rm", "-f", "-v", container)
+                try:
+                    removal = subprocess.run(["docker", "rm", "-f", "-v", container],
+                                             capture_output=True, text=True, timeout=5)
+                except subprocess.TimeoutExpired:
+                    failures.append(f"removal timed out for {container}")
+                else:
+                    if removal.returncode and "No such container:" not in removal.stderr:
+                        failures.append(f"{container}: {removal.stderr.strip()}")
+            if failures:
+                raise RuntimeError("Docker cleanup failed: " + "; ".join(failures))
 
 
 def run_copy_generations():

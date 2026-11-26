@@ -19,10 +19,18 @@ FEATURE = "lab-fault-injection"
 CALLBACK_TEST = "scan_generation_callback_entrypoint"
 
 
+def show(line):
+    try:
+        print(line, end="", flush=True)
+    except BrokenPipeError:
+        with open(os.devnull, "w") as sink:
+            os.dup2(sink.fileno(), sys.stdout.fileno())
+
+
 def build_binary(command, name, kind, results, binaries, environment):
     messages = results / f"{name}.cargo.jsonl"
     diagnostics = results / f"{name}.cargo.stderr.log"
-    print(f"Building {name}; diagnostics: {diagnostics}", flush=True)
+    show(f"Building {name}; diagnostics: {diagnostics}\n")
     with messages.open("w") as stdout, diagnostics.open("w") as stderr:
         run_command(["cargo", *command, "--locked", "--features", FEATURE, "--message-format=json"],
                     environment=environment, stdout=stdout, stderr=stderr)
@@ -72,8 +80,8 @@ def run_command(command, *, stdout=None, stderr=None, environment=None, transcri
                 cancel(interrupted, None)
             if transcript is not None:
                 for line in child.stdout:
-                    print(line, end="", flush=True)
                     transcript.write(line)
+                    show(line)
             code = child.wait()
             if interrupted is not None:
                 code = 128 + interrupted
@@ -148,7 +156,7 @@ def main():
     else:
         results = args.output_dir.resolve()
         results.mkdir(mode=0o700, parents=True)
-    print(f"Scan generation evidence: {results}", flush=True)
+    show(f"Scan generation evidence: {results}\n")
     try:
         return build_and_run(results)
     except (OSError, RuntimeError, subprocess.CalledProcessError, json.JSONDecodeError) as error:
