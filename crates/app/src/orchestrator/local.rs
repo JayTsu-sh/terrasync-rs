@@ -131,6 +131,9 @@ impl SyncOrchestrator {
             None => work.await,
         };
         if let Some(database) = db_instance {
+            if let Some(outcome) = database.copy_generation_commit_result().await {
+                consumers.set_generation_commit_result(outcome).await;
+            }
             let phase = if result.is_ok() {
                 CopyGenerationPhase::Completed
             } else {
@@ -151,7 +154,11 @@ impl SyncOrchestrator {
                 }
             };
             if let Ok(generation) = database.current_copy_generation().await {
-                consumers.set_migration_report(generation.report()).await;
+                let mut report = generation.report();
+                if finalization.is_err() {
+                    report.phase = CopyGenerationPhase::Failed;
+                }
+                consumers.set_migration_report(report).await;
                 if let Some(retention) = generation.incomplete_target_preservation()
                     && let Err(source) = result
                 {

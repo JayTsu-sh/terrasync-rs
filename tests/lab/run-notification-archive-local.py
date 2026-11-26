@@ -90,7 +90,7 @@ def run_isolated():
             print(f"isolated notification image={docker('inspect', containers[0], '--format', '{{.Image}}')}", flush=True)
             pid = docker("inspect", containers[0], "--format", "{{.State.Pid}}")
             suite = [flag for flag in ("--copy-generations", "--copy-content", "--copy-ready-cleanup", "--directory-completion", "--copy-object-cleanup", "--copy-versioned-source-cleanup", "--catalogue-recovery", "--consumer-recovery", "--copy-execution", "--copy-data-cancel", "--copy-file-list-cancel", "--rename-generations", "--retention-events", "--source-absence", "--request-policy", "--copy-contracts", "--version-catalogue", "--mutable-catalogue", "--version-metadata", "--metadata-cancel", "--scan-wire") if flag in sys.argv]
-            suite.extend(flag for flag in ("--multi-shard", "--copy-takeover", "--scan-generation-result") if flag in sys.argv)
+            suite.extend(flag for flag in ("--multi-shard", "--copy-takeover", "--scan-generation-result", "--copy-generation-result") if flag in sys.argv)
             subprocess.run(["nsenter", "-t", pid, "-n", sys.executable, __file__, "--inside", *suite], cwd=ROOT, check=True)
         except BaseException:
             for container in containers:
@@ -920,6 +920,10 @@ def run_inside():
                 for shard in range(shards) for replica in range(2)
             ]
         print(f"isolated ClickHouse shards={shards} replicas_per_shard=2", flush=True)
+    if "--copy-generation-result" in sys.argv:
+        from copy_generation_result import run
+        run()
+        return
     if "--scan-generation-result" in sys.argv:
         from scan_generation_result import run
         run()

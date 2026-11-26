@@ -105,6 +105,7 @@ def check_completed(database, job, sequence, mode):
     assert (current["sequence"], current["phase"], current["plan"]["mode"]) == (sequence, "completed", mode), current
     execution_id = current["request"]["execution_id"]
     report = archive(database, job, execution_id)
+    assert report["generation_commit_result"] == "committed", report
     assert report["is_final"] and report["task_error_count"] == 0, report
     # CLI 无 callback。计划内保留事件允许留在已归档的最终报告中。
     diagnostics = report.get("diagnostics") or {}

@@ -127,7 +127,7 @@ impl ClickHouseDatabase {
             .predicate();
             self.execute(&format!("ALTER TABLE {base} UPDATE current_state={committed} WHERE current_state!={committed} AND {facts} SETTINGS mutations_sync=2"), &[]).await?;
         }
-        self.publish_copy_scan_state(committed, false, &request.execution_id, facts)
+        self.prepare_copy_scan_state(committed, &request.execution_id, facts)
             .await?;
         generation.baseline_prepared = true;
         generation.phase = CopyGenerationPhase::Prepared;
@@ -173,6 +173,16 @@ impl ClickHouseDatabase {
             });
         }
         Ok(Some(baseline))
+    }
+
+    pub(super) async fn copy_scan_commit_confirmed(
+        &self, generation: u8, execution_id: &str, facts: CopyFactRange,
+    ) -> Result<bool> {
+        let state = self.copy_generation_state().await?;
+        Ok(state.state_version == copy_state_version(facts.last)? + 1
+            && state.copy_execution_id == execution_id
+            && state.copy_baseline_sequence == facts.first
+            && state.scan_state == generation)
     }
 
     async fn copy_generation_state(&self) -> Result<CopyState> {

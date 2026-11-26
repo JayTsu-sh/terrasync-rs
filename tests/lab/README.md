@@ -53,6 +53,31 @@ python3 tests/lab/run-notification-archive-local.py --scan-generation-result
 并在发布前、发布应答丢失和发布后清理三个阶段取消任务。还验证同作业复制接管和纯流式省略字段。
 实验室只使用本轮容器和数据库，保留每轮 CLI 日志及 JSON 证据。
 
+## 迁移代次提交结果
+
+构建 `cargo build --locked --bin terrasync` 后运行：
+
+```sh
+LAB_TERRASYNC_BIN=/path/to/terrasync \
+LAB_COPY_RESULT_LOG_DIR=/path/to/new-results \
+python3 tests/lab/run-notification-archive-local.py --copy-generation-result
+```
+
+单机和集群均以同一作业 ID 运行全量、增量、中途故障、重启和后续两轮增量，
+逐轮核对终态、目录状态、数据库变更明细、文件内容及权限。故障覆盖提交前拒绝、
+提交应答丢失后的已确认和待确认、静默应答超时、删源后目录事实清理失败。
+待确认用例扣留 ClickHouse 回查响应，验证恢复预算耗尽后按执行身份取消仍在运行的查询、
+关闭客户端连接及归档终态。
+还检查删源后的全量重建、范围外目标保留及无数据库任务。支持 `--multi-shard`。
+
+用 `cargo test --locked -p app --test copy_generation_result --no-run` 构建真实回调驱动，
+以 `LAB_COPY_RESULT_CALLBACK_DRIVER` 指定测试二进制。驱动调用与 CLI 共用的迁移入口，
+对照实际 HTTP 回调与 ClickHouse 归档。另行运行不设置该变量的 CLI 矩阵。
+
+在获准访问现有 VM 104 的主机上，把 runner 换成
+`python3 tests/lab/copy_generation_nfs.py`，可在独占 NFS 4.1 前缀复测待确认与后续多轮恢复。
+它用稳定文件身份验证真实重命名及零重传，并撤销本次挂载和前缀。
+
 ## Direct 取消回归
 
 `verify-direct-cancel.py` 在真实远端 Local 目标和 QUIC 链路上验证 Direct 取消。

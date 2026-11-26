@@ -3,6 +3,7 @@ use clickhouse::error::Error as ClickHouseError;
 use data_mover::model::{BackendIdentity, EntryKind, ObservedEntry};
 use serde::Deserialize;
 use serde_json::Value;
+use task_model::GenerationCommitResult;
 use task_model::migration::{CopyGeneration, CopyGenerationPhase, CopyRequestDescriptor};
 use utils::sanitize_job_id;
 
@@ -141,7 +142,8 @@ impl ClickHouseDatabase {
         let Some(generation) = lifecycle.copy_generation.clone() else {
             return Ok(());
         };
-        if phase == CopyGenerationPhase::Completed && !lifecycle.committed {
+        if phase == CopyGenerationPhase::Completed && lifecycle.commit_result != Some(GenerationCommitResult::Committed)
+        {
             return Err(DatabaseError::CopyGenerationInvalid {
                 field: "uncommitted_completion",
             });
