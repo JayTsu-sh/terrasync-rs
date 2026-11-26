@@ -276,6 +276,16 @@ async fn incremental_archives_failed_changes(config: &ClickHouseConfig, deployme
     assert_eq!(page.phase, CopyGenerationPhase::Failed);
     assert_eq!(page.archive_coverage, CopyChangeArchiveCoverage::Partial);
     assert_eq!(
+        page.target_preserved_range.map(|range| range.reason),
+        Some(TargetRetentionReason::IncompleteEnumeration)
+    );
+    assert_eq!(page.counts.len(), 2);
+    assert!(
+        page.counts
+            .iter()
+            .all(|row| row.count == 1 && row.target_outcome == "failed")
+    );
+    assert_eq!(
         page.changes
             .iter()
             .map(|row| (row.path.as_str(), row.kind.as_str(), row.target_outcome.as_deref()))

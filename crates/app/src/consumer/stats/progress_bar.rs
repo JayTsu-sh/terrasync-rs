@@ -299,6 +299,13 @@ impl ProgressBar {
 
     /// 根据消息类型更新对应的原子计数器
     pub fn update_statistics(&self, message: &StorageEntryMessage) {
+        if message.counted_error().is_some() {
+            match &self.counters {
+                CounterSet::Full(c) => c.error_count.fetch_add(1, Ordering::Relaxed),
+                CounterSet::Incremental(c) => c.error_count.fetch_add(1, Ordering::Relaxed),
+            };
+            return;
+        }
         let (entry, operation) = match message {
             StorageEntryMessage::TargetDeletion { entry, outcome, .. } if outcome.confirms_absence() => {
                 (entry, "deleted")
@@ -365,30 +372,16 @@ impl ProgressBar {
                 CounterSet::Full(_) => (entry, "scanned"),
                 CounterSet::Incremental(_) => return,
             },
-            StorageEntryMessage::Error { .. }
-            | StorageEntryMessage::CopyChangeFailed { .. }
-            | StorageEntryMessage::CopyVersionFailed {
-                first_in_entry: true, ..
-            } => {
-                match &self.counters {
-                    CounterSet::Full(c) => {
-                        c.error_count.fetch_add(1, Ordering::Relaxed);
-                    }
-                    CounterSet::Incremental(c) => {
-                        c.error_count.fetch_add(1, Ordering::Relaxed);
-                    }
-                }
-                return;
-            }
             StorageEntryMessage::CopyItemCompleted { .. }
             | StorageEntryMessage::VersionMetadataChanged { .. }
             | StorageEntryMessage::Diagnostic { .. }
             | StorageEntryMessage::CopyEntryBoundary(_)
             | StorageEntryMessage::CopySkipped { .. }
             | StorageEntryMessage::TarManifest { .. }
-            | StorageEntryMessage::CopyVersionFailed {
-                first_in_entry: false, ..
-            } => return,
+            | StorageEntryMessage::Error { .. }
+            | StorageEntryMessage::CopyChangeFailed { .. }
+            | StorageEntryMessage::CopyRenameFailed { .. }
+            | StorageEntryMessage::CopyVersionFailed { .. } => return,
         };
         for view in task_model::observation::ObservedView::all(entry) {
             match &self.counters {

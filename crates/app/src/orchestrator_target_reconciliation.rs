@@ -8,7 +8,7 @@ use data_mover::{
 };
 use db::{ClickHouseDatabase, DeletionStatus};
 use task_model::{
-    ChangeKind, ErrorEvent, ObservedEntryExt, SourcePresence, StorageEntryMessage, TargetDeletionOutcome,
+    ChangeKind, EntryChange, ErrorEvent, ObservedEntryExt, SourcePresence, StorageEntryMessage, TargetDeletionOutcome,
     TargetRetention, TargetRetentionReason, TransferMode,
 };
 use tracing::error;
@@ -354,10 +354,10 @@ impl SyncOrchestrator {
                                 .await;
                                 if let Err(error) = result {
                                     broadcaster
-                                        .broadcast(StorageEntryMessage::Error {
-                                            event: ErrorEvent::Copy,
-                                            path: to_arc.get_relative_path().to_path_buf(),
-                                            entry: Some(to_arc.clone()),
+                                        .broadcast(StorageEntryMessage::CopyRenameFailed {
+                                            from: from_arc,
+                                            to: to_arc,
+                                            change: Some(kind),
                                             reason: error.to_string(),
                                         })
                                         .await?;
@@ -387,14 +387,22 @@ impl SyncOrchestrator {
                                 to_arc.get_relative_path(),
                                 e
                             );
-                            broadcaster
-                                .broadcast(StorageEntryMessage::Error {
-                                    event: ErrorEvent::Rename,
-                                    path: to_arc.get_relative_path().to_path_buf(),
-                                    entry: Some(to_arc.clone()),
-                                    reason: format!("{e}"),
-                                })
-                                .await?;
+                            let reason = e.to_string();
+                            let event = if old_source_absent {
+                                StorageEntryMessage::CopyRenameFailed {
+                                    from: from_arc,
+                                    to: to_arc,
+                                    change: None,
+                                    reason,
+                                }
+                            } else {
+                                StorageEntryMessage::CopyChangeFailed {
+                                    entry: to_arc.into(),
+                                    change: EntryChange::New,
+                                    reason,
+                                }
+                            };
+                            broadcaster.broadcast(event).await?;
                             failure.get_or_insert(e);
                         }
                     }

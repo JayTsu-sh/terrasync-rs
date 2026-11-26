@@ -243,7 +243,8 @@ impl Consumer for DatabaseConsumer {
                                 )
                                 .await;
                             }
-                            ref detail @ StorageEntryMessage::CopyChangeFailed { .. } => {
+                            ref detail @ (StorageEntryMessage::CopyChangeFailed { .. }
+                            | StorageEntryMessage::CopyRenameFailed { .. }) => {
                                 Self::batch_insert_incremental_record(
                                     &db,
                                     detail,

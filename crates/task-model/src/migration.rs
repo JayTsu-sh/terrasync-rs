@@ -180,6 +180,13 @@ pub struct MigrationReport {
 }
 
 impl CopyGeneration {
+    pub fn target_preservation(&self) -> Option<TargetRetention> {
+        self.plan.target_preservation().or_else(|| {
+            matches!(self.phase, CopyGenerationPhase::Failed | CopyGenerationPhase::Cancelled)
+                .then(|| TargetRetention::source_range(TargetRetentionReason::IncompleteEnumeration))
+        })
+    }
+
     pub fn report(&self) -> MigrationReport {
         MigrationReport {
             generation: Some(self.sequence),

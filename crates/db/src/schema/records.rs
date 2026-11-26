@@ -6,6 +6,7 @@ use std::{collections::BTreeMap, path::Path, sync::Arc, time::SystemTime};
 
 use data_mover::model::{BackendIdentity, BackendKind};
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 use task_model::diagnostics::safe_diagnostic_text;
 use task_model::observation::{ObservedItem, ObservedView};
 use task_model::{CopyCompletion, CopyReadiness, SourcePresence, TargetDeletionOutcome};
@@ -300,11 +301,27 @@ impl IncrementalStorageEntryRecord {
             }
             StorageEntryMessage::CopyChangeFailed { entry, change, reason } => {
                 let summary = capture_summary(entry.view(), 0)?;
-                // 共享事件表也向普通扫描提供历史；失败行不能被识别为成功的新增或修改。
-                let operation = format!("{COPY_CHANGE_FAILURE_PREFIX}{}", change.as_state_str());
-                let mut row = incremental_record(summary, &operation, Some(safe_diagnostic_text(reason)), now);
-                row.target_outcome = Some("failed".into());
-                return Ok(vec![row]);
+                return Ok(vec![Self::failed_copy_change(
+                    summary,
+                    change.as_state_str(),
+                    safe_diagnostic_text(reason),
+                    now,
+                )]);
+            }
+            StorageEntryMessage::CopyRenameFailed {
+                from,
+                to,
+                change,
+                reason,
+            } => {
+                let summary = capture_summary(ObservedItem::from(to.clone()).view(), 0)?;
+                let reason = safe_diagnostic_text(reason);
+                let comment = json!({ "previous_path": from.path().as_str(), "reason": reason }).to_string();
+                let mut rows = vec![Self::failed_copy_change(summary.clone(), "rename", comment, now)];
+                if let Some(change) = change {
+                    rows.push(Self::failed_copy_change(summary, change.as_state_str(), reason, now));
+                }
+                return Ok(rows);
             }
             StorageEntryMessage::Deleted(entry) => (entry, "deleted", None),
             StorageEntryMessage::TargetDeletion {
@@ -368,6 +385,14 @@ impl IncrementalStorageEntryRecord {
             }
         };
         Self::observed_rows(entry, operation, comment, now)
+    }
+
+    fn failed_copy_change(summary: EntrySummary, kind: &str, comment: String, now: i64) -> Self {
+        // 共享事件表也向普通扫描提供历史；失败行不能被识别为一次成功的变更。
+        let operation = format!("{COPY_CHANGE_FAILURE_PREFIX}{kind}");
+        let mut row = incremental_record(summary, &operation, Some(comment), now);
+        row.target_outcome = Some("failed".into());
+        row
     }
 
     fn observed_rows(entry: &ObservedEntry, operation: &str, comment: Option<String>, now: i64) -> Result<Vec<Self>> {

@@ -308,6 +308,10 @@ impl FullStats {
     }
 
     pub fn update_from_message(&mut self, message: &StorageEntryMessage) {
+        if let Some(error) = message.counted_error() {
+            self.error_stats.record(error);
+            return;
+        }
         match message {
             StorageEntryMessage::CopySkipped { .. } => self.skipped_count = self.skipped_count.saturating_add(1),
             StorageEntryMessage::Scanned(entry)
@@ -327,11 +331,6 @@ impl FullStats {
                     distribution_bytes: None,
                 });
             }
-            StorageEntryMessage::Error { event, .. } => self.error_stats.record(*event),
-            StorageEntryMessage::CopyChangeFailed { .. } => self.error_stats.record(ErrorEvent::Copy),
-            StorageEntryMessage::CopyVersionFailed {
-                first_in_entry: true, ..
-            } => self.error_stats.record(ErrorEvent::Copy),
             _ => {}
         }
     }
@@ -557,6 +556,10 @@ impl IncrementalStats {
     }
 
     pub fn update_from_message(&mut self, message: &StorageEntryMessage) {
+        if let Some(error) = message.counted_error() {
+            self.error_stats.record(error);
+            return;
+        }
         match message {
             StorageEntryMessage::CopySkipped { .. } => self.skipped_count = self.skipped_count.saturating_add(1),
             StorageEntryMessage::Scanned(entry) | StorageEntryMessage::Packaged(entry) => {
@@ -603,11 +606,6 @@ impl IncrementalStats {
                     self.renamed.add(&view);
                 }
             }
-            StorageEntryMessage::Error { event, .. } => self.error_stats.record(*event),
-            StorageEntryMessage::CopyChangeFailed { .. } => self.error_stats.record(ErrorEvent::Copy),
-            StorageEntryMessage::CopyVersionFailed {
-                first_in_entry: true, ..
-            } => self.error_stats.record(ErrorEvent::Copy),
             _ => {}
         }
     }

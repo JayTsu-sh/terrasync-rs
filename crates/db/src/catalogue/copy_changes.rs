@@ -25,6 +25,7 @@ pub struct CopyChange {
 #[derive(Debug, Deserialize, Row, Serialize)]
 pub struct CopyChangeCount {
     pub kind: String,
+    pub target_outcome: String,
     pub count: u64,
 }
 
@@ -65,7 +66,7 @@ impl ClickHouseDatabase {
             phase: generation.phase,
             target_cleanup: generation.plan.target_cleanup,
             archive_coverage: CopyChangeArchiveCoverage::Unavailable,
-            target_preserved_range: generation.plan.target_preservation(),
+            target_preserved_range: generation.target_preservation(),
             counts: Vec::new(),
             changes: Vec::new(),
             next_offset: None,
@@ -83,10 +84,15 @@ impl ClickHouseDatabase {
         // 按逻辑条目投影，重试写入同一个已完成变更时，计数和分页都只保留一次。
         let changes = format!(
             "SELECT DISTINCT replaceOne(operation_type, '{COPY_CHANGE_FAILURE_PREFIX}', '') AS kind, relative_path AS path,
-                if(operation_type='rename',comment,NULL) AS previous_path, source_presence,
+                multiIf(operation_type='rename',comment,
+                    operation_type='{COPY_CHANGE_FAILURE_PREFIX}rename',
+                    JSONExtractString(ifNull(comment,''),'previous_path'),NULL) AS previous_path,
+                source_presence,
                 toNullable(ifNull(target_outcome, 'completed')) AS target_outcome,
-                if(startsWith(operation_type, '{COPY_CHANGE_FAILURE_PREFIX}')
-                   OR operation_type IN ('source_deleted','deletion_unconfirmed'),comment,NULL) AS reason
+                multiIf(operation_type='{COPY_CHANGE_FAILURE_PREFIX}rename',
+                    JSONExtractString(ifNull(comment,''),'reason'),
+                    startsWith(operation_type, '{COPY_CHANGE_FAILURE_PREFIX}')
+                    OR operation_type IN ('source_deleted','deletion_unconfirmed'),comment,NULL) AS reason
              FROM {table}
              WHERE copy_execution_id=? AND is_regular_file AND
              (operation_type IN ('new','data_changed','metadata_changed','both_changed','rename','source_deleted','deletion_unconfirmed')
@@ -95,7 +101,8 @@ impl ClickHouseDatabase {
         page.counts = self
             .sync_client
             .query(&format!(
-                "SELECT kind,count() AS count FROM ({changes}) GROUP BY kind ORDER BY kind"
+                "SELECT kind,assumeNotNull(target_outcome) AS target_outcome,count() AS count
+                 FROM ({changes}) GROUP BY kind,target_outcome ORDER BY kind,target_outcome"
             ))
             .bind(execution_id)
             .fetch_quorum_all()

@@ -174,6 +174,13 @@ pub enum StorageEntryMessage {
         change: EntryChange,
         reason: String,
     },
+    /// 改名或改名后的属性／内容更新未完成；保留已识别的两个路径。
+    CopyRenameFailed {
+        from: Arc<ObservedEntry>,
+        to: Arc<ObservedEntry>,
+        change: Option<ChangeKind>,
+        reason: String,
+    },
     /// 文件已删除
     Deleted(Arc<ObservedEntry>),
     /// 增量审查的逐项结果，独立于目录变更和删除成功计数。
@@ -207,4 +214,20 @@ pub enum StorageEntryMessage {
         /// 错误原因
         reason: String,
     },
+}
+
+impl StorageEntryMessage {
+    /// 返回应计入条目失败统计的事件。明细交付可以保留同一条目的多个原因。
+    pub fn counted_error(&self) -> Option<ErrorEvent> {
+        match self {
+            Self::Error { event, .. } => Some(*event),
+            Self::CopyRenameFailed { change: None, .. } => Some(ErrorEvent::Rename),
+            Self::CopyChangeFailed { .. }
+            | Self::CopyRenameFailed { .. }
+            | Self::CopyVersionFailed {
+                first_in_entry: true, ..
+            } => Some(ErrorEvent::Copy),
+            _ => None,
+        }
+    }
 }

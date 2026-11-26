@@ -52,24 +52,25 @@ pub async fn copy_changes_cmd(job_id: &str, execution_id: &str, offset: u64, lim
         );
     }
     for count in page.counts {
-        println!("{} {}", count.kind, count.count);
+        println!("{} {} target={}", count.kind, count.count, count.target_outcome);
     }
     for change in page.changes {
+        print!("{} ", change.kind);
         if let Some(previous_path) = change.previous_path {
-            println!("{} {:?} -> {:?}", change.kind, previous_path, change.path);
+            print!("{:?} -> {:?}", previous_path, change.path);
         } else {
-            print!("{} {:?}", change.kind, change.path);
-            if let Some(source) = change.source_presence {
-                print!(" source={source}");
-            }
-            if let Some(target) = change.target_outcome {
-                print!(" target={target}");
-            }
-            if let Some(reason) = change.reason {
-                print!(" {reason:?}");
-            }
-            println!();
+            print!("{:?}", change.path);
         }
+        if let Some(source) = change.source_presence {
+            print!(" source={source}");
+        }
+        if let Some(target) = change.target_outcome {
+            print!(" target={target}");
+        }
+        if let Some(reason) = change.reason {
+            print!(" {reason:?}");
+        }
+        println!();
     }
     if let Some(next) = page.next_offset {
         println!("Next page --offset {next}");

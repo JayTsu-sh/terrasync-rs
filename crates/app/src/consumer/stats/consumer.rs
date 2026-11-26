@@ -243,6 +243,9 @@ impl StatisticConsumer {
             StorageEntryMessage::CopyChangeFailed { entry, reason, .. } => {
                 Some((ErrorEvent::Copy, Some(entry.entry.path().as_str()), reason))
             }
+            StorageEntryMessage::CopyRenameFailed { to, reason, .. } => message
+                .counted_error()
+                .map(|event| (event, Some(to.path().as_str()), reason)),
             _ => None,
         };
         if let Some((event, path, reason)) = diagnostic {
