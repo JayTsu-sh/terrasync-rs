@@ -32,7 +32,7 @@ def start_isolated_container(containers, name, *arguments):
             cancel_deadline = time.monotonic() + 5
 
     # 先登记本轮的容器名，中断时给 Docker 有界时间返回。
-    previous = signal.signal(signal.SIGINT, defer_interrupt)
+    previous = {signum: signal.signal(signum, defer_interrupt) for signum in (signal.SIGINT, signal.SIGTERM)}
     try:
         containers.append(name)
         command = ["docker", "run", "--name", name, *arguments]
@@ -44,7 +44,8 @@ def start_isolated_container(containers, name, *arguments):
                 time.sleep(0.05)
             code = launch.wait()
     finally:
-        signal.signal(signal.SIGINT, previous)
+        for signum, handler in previous.items():
+            signal.signal(signum, handler)
     if cancel_deadline is not None:
         raise KeyboardInterrupt
     if code:
@@ -59,11 +60,15 @@ def run_in_network_namespace(pid, suite):
         except KeyboardInterrupt:
             try:
                 os.killpg(child.pid, signal.SIGTERM)
-                child.wait(timeout=5)
+                deadline = time.monotonic() + 5
+                # 组长退出后仍可能有子进程持有日志管道。
+                while time.monotonic() < deadline:
+                    child.poll()
+                    os.killpg(child.pid, 0)
+                    time.sleep(0.05)
+                os.killpg(child.pid, signal.SIGKILL)
             except ProcessLookupError:
                 pass
-            except subprocess.TimeoutExpired:
-                os.killpg(child.pid, signal.SIGKILL)
             raise
     if code:
         raise subprocess.CalledProcessError(code, command)
@@ -1133,4 +1138,5 @@ if __name__ == "__main__":
     if "--inside" in sys.argv:
         run_inside()
     else:
+        signal.signal(signal.SIGTERM, signal.default_int_handler)
         run_isolated()
