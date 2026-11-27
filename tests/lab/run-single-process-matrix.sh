@@ -40,10 +40,19 @@ aggregate="$results_root/matrix.json"
 hdfs_root="$(hdfs_run_root "$run_id")/single-process-matrix"
 matrix_prefix="ci/$run_id/single-process-matrix"
 dxn_touched=false
+hdfs_touched=false
+hdfs_cleanup_config="$runtime_root/hdfs-cleanup.toml"
+cli_binary="${TERRASYNC_BINARY:-$target_root/release/terrasync}"
 
 cleanup() {
   local status="$?"
   trap - EXIT
+  if [[ "$hdfs_touched" == true ]]; then
+    if ! timeout --kill-after=5s 45s "$cli_binary" -c "$hdfs_cleanup_config" rm "$hdfs_root" >/dev/null 2>&1; then
+      echo "HDFS matrix cleanup failed for its run prefix" >&2
+      status=1
+    fi
+  fi
   if [[ "$dxn_touched" == true ]]; then
     for operation in abort-multipart-prefix delete-prefix; do
       LAB_S3_ACCESS_KEY="$LAB_DXN_S3_ACCESS_KEY" LAB_S3_SECRET_KEY="$LAB_DXN_S3_SECRET_KEY" \
@@ -60,6 +69,14 @@ cleanup() {
 trap cleanup EXIT
 
 mkdir -p "$runtime_root" "$results_root"
+cat > "$hdfs_cleanup_config" <<EOF
+[storage.destination.hdfs]
+config_dir = "$LAB_HDFS_CONFIG_DIR"
+[storage.destination.hdfs.kerberos]
+principal = "$LAB_HDFS_ADMIN_USER"
+keytab = "$LAB_HDFS_KEYTAB"
+cache = "FILE:$runtime_root/cleanup.ccache"
+EOF
 export LAB_HDFS_SOURCE_CCACHE="FILE:$runtime_root/source.ccache"
 export LAB_HDFS_DESTINATION_CCACHE="FILE:$runtime_root/destination.ccache"
 # Evidence is attributed to the current checkout and locked dependency graph. Rebuilding is
@@ -159,6 +176,9 @@ PY
   expected="$(sha256sum "$fixture" | cut -d' ' -f1)"
   source_root="$(storage_url source "$source" "$cell")"
   destination_root="$(storage_url destination "$destination" "$cell")"
+  if [[ "$source" == hdfs || "$destination" == hdfs ]]; then
+    hdfs_touched=true
+  fi
   if [[ "$source" == s3_dxn || "$destination" == s3_dxn ]]; then
     dxn_touched=true
   fi

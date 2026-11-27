@@ -9,8 +9,32 @@ for file in "$ci_dir/tunnel_key" "$ci_dir/known_hosts" "$ci_dir/client.keytab" "
   [[ -r "$file" ]] || { echo "HDFS tunnel prerequisite unavailable: $file" >&2; exit 2; }
 done
 [[ $# -gt 0 ]] || { echo 'HDFS tunnel requires a command' >&2; exit 2; }
+# The shared runner allows other OS users. Refuse to expose the forwarded ports
+# unless the root-owned, narrow output rules are still installed. Jobs running
+# as github-runner already share the same runner credentials and trust boundary.
+[[ "$(id -u)" == 1000 ]] || { echo 'HDFS tunnel requires the CI uid 1000' >&2; exit 2; }
+rules="$(sudo -n /usr/sbin/nft list table inet terrasync_hdfs)" || {
+  echo 'HDFS tunnel firewall cannot be verified' >&2; exit 2;
+}
+for rule in \
+  'ip daddr { 127.0.0.160, 127.0.0.162 } tcp dport 8020 meta skuid != 1000 reject' \
+  'ip daddr { 127.0.0.161, 127.0.0.163, 127.0.0.164 } tcp dport 9866 meta skuid != 1000 reject' \
+  'ip daddr 127.0.0.164 tcp dport 10088 meta skuid != 1000 reject'; do
+  [[ "$rules" == *"$rule"* ]] || { echo 'HDFS tunnel firewall rule missing' >&2; exit 2; }
+done
 runtime="$(mktemp -d "${RUNNER_TEMP:-/tmp}/terrasync-hdfs-tunnel.XXXXXXXX")"
 tunnel_pid=""
+command_pid=""
+terminate_command() {
+  trap - INT TERM HUP
+  if [[ -n "$command_pid" ]]; then
+    kill -TERM -- "-$command_pid" 2>/dev/null || true
+    wait "$command_pid" 2>/dev/null || true
+    command_pid=""
+  fi
+  exit 143
+}
+trap terminate_command INT TERM HUP
 cleanup() {
   local status=$?
   trap - EXIT
@@ -87,5 +111,10 @@ export LAB_HDFS_LOCATION='hdfs://terrasync-lab-ci%40HDFS.INTERNAL@hdfscluster/'
 export LAB_HDFS_ADMIN_USER='terrasync-lab-ci@HDFS.INTERNAL' LAB_HDFS_CONFIG_DIR="$runtime"
 export LAB_HDFS_KEYTAB="$ci_dir/client.keytab" LAB_HDFS_BASE_PATH='/tmp/terrasync-nightly/terrasync-lab-ci'
 export LAB_HDFS_FINGERPRINT='hdfscluster-kerberos/10.30.3.160+10.30.3.162/ssh-gateway-10.128.135.164'
-"$@"
+setsid "$@" &
+command_pid=$!
+command_status=0
+wait "$command_pid" || command_status=$?
+command_pid=""
+(( command_status == 0 )) || exit "$command_status"
 kill -0 "$tunnel_pid" 2>/dev/null || { echo 'HDFS tunnel exited during the command' >&2; exit 1; }

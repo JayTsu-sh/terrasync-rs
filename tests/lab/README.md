@@ -417,6 +417,13 @@ The runner-only directory `~/.local/share/terrasync-hdfs-ci` contains
 `terrasync-lab-ci@HDFS.INTERNAL` owns only its private test directory under
 `/tmp/terrasync-nightly/terrasync-lab-ci`. Protect these files as credentials.
 No node service keytab or HDFS administrator keytab belongs on the runner.
+The runner also installs `hdfs-runner/loopback.nft` at
+`/etc/terrasync-hdfs/loopback.nft`, enables the adjacent systemd service, and
+installs `hdfs-runner/sudoers-read-rules` through `visudo`. These rules reject
+access to the six local forward ports from every OS UID except the CI UID
+1000; the sudo rule permits only reading this nftables table. The wrapper
+checks the rules before opening a tunnel. Jobs using the same `github-runner`
+account share its credentials and remain in the same trust boundary.
 The wrapper is Nightly-specific; callers of the underlying scripts can still
 supply their own HDFS environment and `LAB_HDFS_BASE_PATH`.
 
