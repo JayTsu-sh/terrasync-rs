@@ -76,6 +76,7 @@ jobs:
             flock --wait 10800 /tmp/terrasync-lab-tests.lock tests/lab/run-e2e.sh "$RUN_ID"
       - name: TS-SINGLE 49-cell matrix (CIFS deferred)
         id: single_matrix
+        # 后续 HDFS 步骤使用本轮 CLI 清理矩阵写入的 HDFS 前缀。
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         env:
           TS_SINGLE_DEFER_CIFS: "true"

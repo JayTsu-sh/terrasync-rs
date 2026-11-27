@@ -17,6 +17,10 @@ if [[ "${TS_SINGLE_DEFER_CIFS:-false}" == true ]]; then
   cifs_enabled=false
 fi
 require_single_matrix_credentials "$cifs_enabled"
+if [[ ! "$LAB_DXN_S3_ENDPOINT" =~ ^http://[a-zA-Z0-9.-]+(:[0-9]+)?$ ]]; then
+  echo "LAB_DXN_S3_ENDPOINT must be an HTTP origin without credentials or a path" >&2
+  exit 2
+fi
 
 # The matrix driver is a separate process.  Export explicit, already-validated lab endpoints
 # and credentials rather than reconstructing them from a legacy storage URL in its argv.
@@ -43,8 +47,11 @@ cleanup() {
   if [[ "$dxn_touched" == true ]]; then
     for operation in abort-multipart-prefix delete-prefix; do
       LAB_S3_ACCESS_KEY="$LAB_DXN_S3_ACCESS_KEY" LAB_S3_SECRET_KEY="$LAB_DXN_S3_SECRET_KEY" \
-        python3 "$repo_root/tests/lab/s3_helper.py" "$operation" --endpoint "$LAB_DXN_S3_ENDPOINT" \
-          --bucket "$LAB_DXN_S3_BUCKET" --prefix "$matrix_prefix/" || status=1
+        timeout --kill-after=5s 45s python3 "$repo_root/tests/lab/s3_helper.py" "$operation" \
+          --endpoint "$LAB_DXN_S3_ENDPOINT" --bucket "$LAB_DXN_S3_BUCKET" --prefix "$matrix_prefix/" || {
+          echo "DXN $operation cleanup failed for $matrix_prefix/" >&2
+          status=1
+        }
     done
   fi
   rm -rf -- "$lab_root"
@@ -57,7 +64,9 @@ export LAB_HDFS_SOURCE_CCACHE="FILE:$runtime_root/source.ccache"
 export LAB_HDFS_DESTINATION_CCACHE="FILE:$runtime_root/destination.ccache"
 # Evidence is attributed to the current checkout and locked dependency graph. Rebuilding is
 # mandatory: accepting an executable left by another checkout would forge those commit identities.
-cargo build --release --locked --manifest-path "$repo_root/Cargo.toml" -p app --example single_process_matrix
+env -u LAB_DXN_S3_ACCESS_KEY -u LAB_DXN_S3_SECRET_KEY -u LAB_S3_ACCESS_KEY -u LAB_S3_SECRET_KEY \
+  -u LAB_CIFS_USERNAME -u LAB_CIFS_PASSWORD -u LAB_HDFS_KEYTAB \
+  cargo build --release --locked --manifest-path "$repo_root/Cargo.toml" -p app --example single_process_matrix
 
 profile_root_url() {
   local role="$1" profile="$2" host
@@ -134,7 +143,8 @@ profile_fingerprint() {
 }
 
 run_cell() {
-  local source="$1" destination="$2" cell="${source}__${destination}"
+  local source="$1" destination="$2"
+  local cell="${source}__${destination}"
   local fixture="$lab_root/$cell-fixture" readback="$lab_root/$cell-readback"
   local source_root destination_root expected actual started completed artifact
   fixture="$fixture/payload.bin"
@@ -170,13 +180,12 @@ PY
   if run_matrix_transfer local source "$(dirname "$fixture")" "$source" source "$source_root" "matrix-preload-$cell" && \
     run_matrix_transfer "$source" source "$source_root" "$destination" destination "$destination_root" "matrix-copy-$cell" && \
     run_matrix_transfer "$destination" destination "$destination_root" local destination "$(dirname "$readback")" "matrix-readback-$cell"; then
-    actual="$(sha256sum "$readback" | cut -d' ' -f1)"
-    [[ "$actual" == "$expected" ]] || {
+    if ! actual="$(sha256sum "$readback" | cut -d' ' -f1)" || [[ "$actual" != "$expected" ]]; then
       completed="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
       write_cell_result "$source" "$destination" failed "$started" "$completed" "$artifact"
-      echo "$cell readback mismatch" >&2
+      echo "$cell readback missing, unreadable, or checksum mismatch" >&2
       return 0
-    }
+    fi
     completed="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
     write_cell_result "$source" "$destination" passed "$started" "$completed" "$artifact"
     echo "TS-SINGLE/$cell passed"
