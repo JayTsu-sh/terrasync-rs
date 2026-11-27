@@ -72,7 +72,7 @@ def init(evidence, run_id, commit, dependency, source_state, profiles, deferred)
     })
     sync_directory(evidence.parent.parent)
     sync_directory(evidence.parent.parent.parent)
-    publish(evidence, "")
+    publish(evidence)
 
 
 def mark(evidence, field, value):
@@ -189,24 +189,44 @@ def attempt_paths(evidence):
     return sorted(evidence.glob("*.[0-9][0-9][0-9][0-9].json"))
 
 
-def publish(evidence, producer_outcome, lifecycle_outcome="", finalizer_outcome=""):
+def phase_status(run):
+    """Return the status dictated by phase outcomes, or None if evidence decides."""
+    lifecycle = run.get("lifecycle_outcome")
+    finalizer = run.get("initial_finalizer_outcome")
+    producer = run["producer"]
+    producer_outcome = run.get("producer_outcome")
+    if "cancelled" in (run.get("workflow_outcome"), producer, producer_outcome, lifecycle, finalizer):
+        return "cancelled"
+    if producer != "finished" or producer_outcome != "success":
+        return "incomplete"
+    if "failure" in (lifecycle, finalizer):
+        return "failed"
+    return None
+
+
+def record_outcomes(evidence, producer_outcome, lifecycle_outcome, finalizer_outcome):
+    if not any((producer_outcome, lifecycle_outcome, finalizer_outcome)):
+        return
     run_path = evidence.parent / "run.json"
-    report = read(run_path)
+    run = read(run_path)
     outcome_rank = {"success": 0, "failure": 1, "cancelled": 2}
+    changed = False
     for field, outcome in (("producer_outcome", producer_outcome),
                            ("lifecycle_outcome", lifecycle_outcome),
                            ("initial_finalizer_outcome", finalizer_outcome)):
-        previous = report.get(field, "")
+        previous = run.get(field, "")
         if outcome and (not previous or outcome_rank[outcome] > outcome_rank[previous]):
-            report[field] = outcome
-    durable_write(run_path, report)
-    producer_outcome = report.get("producer_outcome", "")
-    lifecycle_outcome = report.get("lifecycle_outcome", "")
-    finalizer_outcome = report.get("initial_finalizer_outcome", "")
+            run[field] = outcome
+            changed = True
+    if changed:
+        durable_write(run_path, run)
+
+
+def publish(evidence):
+    report = read(evidence.parent / "run.json")
+    overall = phase_status(report)
     touched = report.pop("touched")
-    producer = report.pop("producer")
-    was_cancelled = report.get("workflow_outcome") == "cancelled"
-    for field in ("workflow_outcome", "hdfs_target", "dxn_target"):
+    for field in ("producer", "workflow_outcome", "hdfs_target", "dxn_target"):
         report.pop(field, None)
     operations = [read(path) for path in attempt_paths(evidence)]
     latest = {op["operation"]: op for op in operations}
@@ -249,20 +269,15 @@ def publish(evidence, producer_outcome, lifecycle_outcome="", finalizer_outcome=
     }
     cells = [read(path) for path in sorted(path for path in evidence.glob("*__*.json") if path.name.count(".") == 1)]
     required_cleanup = ("hdfs", "s3_dxn") if report["deferred_profiles"] else ("hdfs", "s3_dxn", "cifs")
-    if was_cancelled or "cancelled" in (producer_outcome, lifecycle_outcome, finalizer_outcome, producer):
-        overall = "cancelled"
-    elif producer == "finished" and producer_outcome == "success":
+    if overall is None:
         cifs_ready = report["deferred_profiles"] or (ownership and report["cifs"]["setup"] == "passed")
         overall = "completed" if (
-            lifecycle_outcome != "failure" and finalizer_outcome != "failure"
-            and report["source_state"] == "clean"
+            report["source_state"] == "clean"
             and cifs_ready
             and all(cleanup[name] == "passed" for name in required_cleanup)
             and len(cells) == len(report["profiles"]) ** 2
             and all(item["outcome"] == "passed" for item in cells)
         ) else "failed"
-    else:
-        overall = "incomplete"
     report.update(status=overall, cleanup=cleanup, cells=cells, operations=operations)
     durable_write(evidence / "matrix.json", report)
 
@@ -280,8 +295,13 @@ def main(args):
         finish(*values)
     elif command == "cell":
         cell(evidence, *values)
+    elif command == "record-outcomes":
+        record_outcomes(evidence, *values)
     elif command == "publish":
-        publish(evidence, *values)
+        publish(evidence)
+    elif command == "validation":
+        run = read(evidence.parent / "run.json")
+        print("required" if phase_status(run) is None else "skipped")
     elif command == "interrupt":
         interrupt(evidence)
     elif command in {"status", "retryable"}:

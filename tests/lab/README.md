@@ -451,16 +451,17 @@ attempts must also confirm CIFS setup and HDFS, CIFS and DXN cleanup.
 `TS_SINGLE_DEFER_CIFS=true` runs the 49 non-CIFS pairs as a diagnostic.
 
 Recovery reports retain the producer outcome, the initial finalizer outcome,
-and the lifecycle step outcome separately when known. A successful recovery
-does not erase an initial finalizer failure: a finished, successful producer
-with a failed lifecycle or initial finalizer reports `failed`, even if cleanup eventually passes.
+and the lifecycle step outcome separately when known. The wrapper records the
+initial finalizer's exit outcome before releasing the lab lock. A finished,
+successful producer with a failed lifecycle or initial finalizer reports
+`failed`, even if cleanup eventually passes.
 A failed or interrupted producer remains `incomplete`; cancellation takes
 precedence. Known phase outcomes are persisted and cannot be downgraded by later
 reconciliation; an unavailable phase outcome is omitted rather than inferred.
 
 Dispatch Release validation from `main`. It defaults to the dispatch commit.
 A supplied branch, commit or tag must resolve to a commit reachable from
-`main` and include `TS-SINGLE lifecycle contract v3`. The job checks the
+`main` and include `TS-SINGLE lifecycle contract v4`. The job checks the
 selected checkout before starting lab checks or fixture setup.
 
 Enforcing the dispatch ref at runner admission requires GitHub runner-group
@@ -533,18 +534,31 @@ period and worker reaping. The producer performs the existing one-time HDFS
 cleanup with its active credentials and tunnel. Recovery handles CIFS and DXN
 only. A failed or interrupted HDFS cleanup stays visible in the gate evidence.
 
-Recorded cancellation remains in effect even if reconciliation succeeds. If
-Actions force-stops the job or the runner goes offline, use the same runner
-account, run ID, credentials and endpoints to rerun reconciliation under the lab lock.
-Supply the known terminal Actions outcome as the final argument. Omit it when
-the outcome is unknown to leave the report incomplete.
+Recorded cancellation remains in effect even if reconciliation succeeds.
+Cancelling a recovery changes the report status and preserves the original
+phase outcomes. If Actions force-stops the job or the runner goes offline,
+use the same runner account, run ID, credentials and endpoints to rerun
+reconciliation under the lab lock.
+Use the outcomes already stored for the run by omitting all three outcome
+arguments.
 
 ```sh
 flock --no-fork --wait 60 /tmp/terrasync-lab-tests.lock \
-  tests/lab/reconcile-single-process-matrix.sh "$RUN_ID" --direct cancelled
+  tests/lab/reconcile-single-process-matrix.sh "$RUN_ID" --direct
 ```
 
-Use the same command for Nightly and Release. Keep the private run state
+After `--direct`, the optional arguments are producer outcome, original
+lifecycle step outcome, and initial finalizer outcome, in that order. Each
+accepts `success`, `failure`, or `cancelled`. Pass `""` for each unknown
+outcome when supplying another one. This command records a known failure of
+the original Actions lifecycle step.
+
+```sh
+flock --no-fork --wait 60 /tmp/terrasync-lab-tests.lock \
+  tests/lab/reconcile-single-process-matrix.sh "$RUN_ID" --direct "" failure ""
+```
+
+These commands apply to Nightly and Release. Keep the private run state
 across retries and until the cleanup result has been verified.
 
 Nightly sets the DXN S3 endpoint and private test bucket through

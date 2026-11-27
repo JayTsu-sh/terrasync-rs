@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       ref:
-        description: Branch, commit, or tag with TS-SINGLE lifecycle contract v3 (defaults to the dispatch commit)
+        description: Branch, commit, or tag with TS-SINGLE lifecycle contract v4 (defaults to the dispatch commit)
         required: false
 
 permissions:
@@ -49,8 +49,8 @@ jobs:
           if [[ ! -x "$lifecycle" || ! -x tests/lab/run-single-process-matrix.sh ||
                 ! -x tests/lab/reconcile-single-process-matrix.sh || ! -x tests/lab/validate-single-process-matrix.py ||
                 ! -r tests/lab/run-single-matrix-operation.py ]] ||
-             ! grep -Fxq '# TS-SINGLE lifecycle contract v3' "$lifecycle"; then
-            echo '::error::The selected release ref does not support TS-SINGLE lifecycle contract v3. Select a ref containing the current matrix producer and reconciler.'
+             ! grep -Fxq '# TS-SINGLE lifecycle contract v4' "$lifecycle"; then
+            echo '::error::The selected release ref does not support TS-SINGLE lifecycle contract v4. Select a ref containing the current matrix producer and reconciler.'
             exit 2
           fi
       - uses: dtolnay/rust-toolchain@stable
@@ -82,7 +82,8 @@ jobs:
         timeout-minutes: 9
         env:
           MATRIX_OUTCOME: ${{ steps.single_matrix.outputs.producer_outcome }}
-          LIFECYCLE_OUTCOME: ${{ job.status == 'cancelled' && 'cancelled' || steps.single_matrix.outcome }}
+          LIFECYCLE_OUTCOME: ${{ steps.single_matrix.outcome }}
+          TS_SINGLE_WORKFLOW_CANCELLED: ${{ job.status == 'cancelled' }}
           FINALIZER_OUTCOME: ${{ steps.single_matrix.outputs.finalizer_outcome }}
           LAB_CIFS_NIGHTLY_USERNAME: ${{ secrets.LAB_CIFS_NIGHTLY_USERNAME }}
           LAB_CIFS_NIGHTLY_PASSWORD: ${{ secrets.LAB_CIFS_NIGHTLY_PASSWORD }}
@@ -95,7 +96,8 @@ jobs:
         timeout-minutes: 1
         env:
           MATRIX_OUTCOME: ${{ steps.single_matrix.outputs.producer_outcome }}
-          LIFECYCLE_OUTCOME: ${{ job.status == 'cancelled' && 'cancelled' || steps.single_matrix.outcome }}
+          LIFECYCLE_OUTCOME: ${{ steps.single_matrix.outcome }}
+          TS_SINGLE_WORKFLOW_CANCELLED: ${{ job.status == 'cancelled' }}
           FINALIZER_OUTCOME: ${{ steps.single_matrix.outputs.finalizer_outcome }}
         run: tests/lab/reconcile-single-process-matrix.sh "$RUN_ID" --report-only "$MATRIX_OUTCOME" "$LIFECYCLE_OUTCOME" "$FINALIZER_OUTCOME"
       - name: Upload TS-SINGLE matrix evidence

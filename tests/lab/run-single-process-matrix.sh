@@ -48,7 +48,7 @@ cleanup() {
     elif (( status != 0 )); then
       evidence mark producer failed || true
     fi
-    evidence publish "" || { if (( status == 0 )); then status=1; fi; }
+    evidence publish || { if (( status == 0 )); then status=1; fi; }
   fi
   rm -rf -- "$lab_root"
   exit "$status"
@@ -226,7 +226,7 @@ if [[ "$cifs_enabled" == true ]]; then
   cifs_action prepare source 5s
   cifs_action claim source 20s
   cifs_action verify destination 20s
-  evidence publish ""
+  evidence publish
 fi
 
 for source in "${profiles[@]}"; do

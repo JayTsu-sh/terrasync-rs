@@ -321,7 +321,8 @@ class SingleProcessMatrixTest(unittest.TestCase):
             self.assertNotIn("--hdfs-tunnel", workflow_text[reconcile:upload])
             self.assertEqual(workflow_text[reconcile:upload].count("steps.single_matrix.outputs.producer_outcome"), 2)
             self.assertEqual(workflow_text[reconcile:upload].count("steps.single_matrix.outputs.finalizer_outcome"), 2)
-            self.assertEqual(workflow_text[reconcile:upload].count("LIFECYCLE_OUTCOME: ${{ job.status == 'cancelled' && 'cancelled' || steps.single_matrix.outcome }}"), 2)
+            self.assertEqual(workflow_text[reconcile:upload].count("LIFECYCLE_OUTCOME: ${{ steps.single_matrix.outcome }}"), 2)
+            self.assertEqual(workflow_text[reconcile:upload].count("TS_SINGLE_WORKFLOW_CANCELLED: ${{ job.status == 'cancelled' }}"), 2)
             self.assertIn("always()", workflow_text[upload:])
             self.assertIn("~/.local/state/terrasync-single-matrix/", workflow_text[upload:])
         for secret in ("LAB_CIFS_NIGHTLY_USERNAME", "LAB_CIFS_NIGHTLY_PASSWORD"):
@@ -344,7 +345,7 @@ class SingleProcessMatrixTest(unittest.TestCase):
             (lab / "run-single-process-matrix.sh").touch(mode=0o700)
             (lab / "reconcile-single-process-matrix.sh").touch(mode=0o700)
             (lab / VALIDATOR_PATH.name).touch(mode=0o700)
-            for version, has_supervisor, expected in ((1, True, 2), (2, True, 2), (3, False, 2), (3, True, 0)):
+            for version, has_supervisor, expected in ((1, True, 2), (2, True, 2), (3, True, 2), (4, False, 2), (4, True, 0)):
                 with self.subTest(version=version, has_supervisor=has_supervisor):
                     lifecycle = lab / LIFECYCLE_PATH.name
                     lifecycle.write_text(f"#!/bin/bash\n# TS-SINGLE lifecycle contract v{version}\n")
@@ -371,12 +372,15 @@ class SingleProcessMatrixTest(unittest.TestCase):
                 #!/bin/bash
                 if flock --nonblock "$LOCK_FILE" true; then exit 10; fi
                 printf '%s\\n' "$*" >> "$EVENTS"
+                if [[ "$2" == --report-only ]]; then exit "$PUBLISH_STATUS"; fi
                 exit "$FINALIZER_STATUS"
             '''))
             for script in (producer, reconcile):
                 script.chmod(0o700)
             lock, events, output = (root / name for name in ("lock", "events", "output"))
-            for code, outcome, finalizer_status in ((0, "success", 0), (7, "failure", 0), (0, "success", 9), (7, "failure", 9)):
+            for code, finalizer_status, publish_status in ((0, 0, 0), (7, 0, 0), (0, 9, 0), (7, 9, 0), (0, 143, 0), (0, 0, 8)):
+                outcome = "failure" if code else "success"
+                finalizer_outcome = {0: "success", 143: "cancelled"}.get(finalizer_status, "failure")
                 env = {
                     **os.environ,
                     "LOCK_FILE": str(lock),
@@ -384,16 +388,19 @@ class SingleProcessMatrixTest(unittest.TestCase):
                     "GITHUB_OUTPUT": str(output),
                     "PRODUCER_STATUS": str(code),
                     "FINALIZER_STATUS": str(finalizer_status),
+                    "PUBLISH_STATUS": str(publish_status),
                 }
                 result = subprocess.run(
                     ["flock", "--no-fork", str(lock), str(lifecycle), "release-fixture", "--direct"],
                     env=env,
                     timeout=10,
                 )
-                self.assertEqual(result.returncode, code or finalizer_status)
-                self.assertEqual(events.read_text().splitlines()[-1], f"release-fixture --direct {outcome}")
-                expected = [f"producer_outcome={outcome}", f'finalizer_outcome={"failure" if finalizer_status else "success"}']
-                if finalizer_status == 0:
+                self.assertEqual(result.returncode, code or finalizer_status or publish_status)
+                self.assertEqual(events.read_text().splitlines()[-2:], [
+                    f"release-fixture --direct {outcome}", f"release-fixture --report-only {outcome}  {finalizer_outcome}",
+                ])
+                expected = [f"producer_outcome={outcome}", f"finalizer_outcome={finalizer_outcome}"]
+                if finalizer_status == publish_status == 0:
                     expected.append("reconciled=true")
                 self.assertEqual(output.read_text().splitlines()[-len(expected):], expected)
 
@@ -408,6 +415,7 @@ class SingleProcessMatrixTest(unittest.TestCase):
                 ("failed", "failure", "failure", "", "incomplete"),
                 ("running", "failure", "failure", "", "incomplete"),
                 ("finished", "success", "cancelled", "", "cancelled"),
+                ("cancelled", "success", "success", "", "cancelled"),
             ):
                 with self.subTest(mode=mode, producer=producer, lifecycle=lifecycle_outcome), tempfile.TemporaryDirectory() as directory:
                     state = pathlib.Path(directory) / "nightly-fixture"
@@ -423,14 +431,17 @@ class SingleProcessMatrixTest(unittest.TestCase):
                     for operation in report["operations"]:
                         (evidence / f'{operation["operation"]}.0001.json').write_text(json.dumps(operation))
                     if producer_outcome == "success" and lifecycle_outcome == "failure":
+                        unreadable_attempt = evidence / "cifs.delete.source.0002.json"
+                        unreadable_attempt.write_text("{")
                         initial = subprocess.run(
                             [str(ROOT / "tests/lab/reconcile-single-process-matrix.sh"), "nightly-fixture", "--direct", "success", "failure"],
-                            env={**os.environ, "TS_SINGLE_STATE_ROOT": directory, "RUNNER_TEMP": str(state / "missing")},
+                            env={**os.environ, "TS_SINGLE_STATE_ROOT": directory},
                             capture_output=True, text=True, timeout=15,
                         )
                         self.assertNotEqual(initial.returncode, 0, initial.stderr)
-                        self.assertIn("mktemp:", initial.stderr)
+                        self.assertIn("JSONDecodeError", initial.stderr)
                         self.assertEqual(json.loads((state / "run.json").read_text())["lifecycle_outcome"], "failure")
+                        unreadable_attempt.unlink()
                     result = subprocess.run(
                         [str(ROOT / "tests/lab/reconcile-single-process-matrix.sh"), "nightly-fixture", mode,
                          producer_outcome, lifecycle_outcome, finalizer],
@@ -464,6 +475,18 @@ class SingleProcessMatrixTest(unittest.TestCase):
                     for field in ("producer_outcome", "lifecycle_outcome", "initial_finalizer_outcome"):
                         if field in published:
                             self.assertEqual(retried[field], published[field])
+                    if producer_outcome == "success" and lifecycle_outcome == "failure":
+                        # Actions cancellation is independent of the original lifecycle step result.
+                        cancelled = subprocess.run(
+                            [str(ROOT / "tests/lab/reconcile-single-process-matrix.sh"), "nightly-fixture", mode, "", "failure", ""],
+                            env={**os.environ, "TS_SINGLE_STATE_ROOT": directory, "TS_SINGLE_WORKFLOW_CANCELLED": "true"},
+                            capture_output=True, text=True, timeout=15,
+                        )
+                        self.assertEqual(cancelled.returncode, 0, cancelled.stderr)
+                        report = json.loads((evidence / "matrix.json").read_text())
+                        self.assertEqual(report["status"], "cancelled")
+                        self.assertEqual(report["producer_outcome"], "success")
+                        self.assertEqual(report["lifecycle_outcome"], "failure")
 
     def test_hdfs_run_root_preserves_nameservice_case(self):
         command = (
@@ -697,15 +720,22 @@ class MatrixRunnerTest(unittest.TestCase):
         path.write_text(f"#!{sys.executable}\n" + program)
         path.chmod(0o700)
 
-    def start(self, mode, *, reconcile=False, workflow_outcome="", reconcile_mode="--direct", lifecycle=False):
+    def start(self, mode, *, reconcile=False, producer_outcome="", lifecycle_outcome="", finalizer_outcome="",
+              reconcile_mode="--direct", lifecycle=False, actions_output=True):
         script = "reconcile-single-process-matrix.sh" if reconcile else "run-single-process-matrix.sh"
         arguments = [str(ROOT / "tests" / "lab" / script), self.run_id]
         env = {**self.env, "MOCK_MODE": mode}
         if reconcile:
-            arguments += [reconcile_mode, workflow_outcome]
+            arguments = ["flock", "--no-fork", str(self.root / "lab.lock"), *arguments]
+            outcomes = (producer_outcome, lifecycle_outcome, finalizer_outcome)
+            if any(outcomes) or reconcile_mode != "--direct":
+                arguments += [reconcile_mode, *outcomes]
         if lifecycle:
             arguments = ["flock", "--no-fork", str(self.root / "lab.lock"), str(LIFECYCLE_PATH), self.run_id]
-            env["GITHUB_OUTPUT"] = str(self.root / "workflow-output")
+            if actions_output:
+                env["GITHUB_OUTPUT"] = str(self.root / "workflow-output")
+            else:
+                env.pop("GITHUB_OUTPUT", None)
         return subprocess.Popen(
             arguments,
             cwd=ROOT,
@@ -736,7 +766,7 @@ class MatrixRunnerTest(unittest.TestCase):
             report, events, stdout, stderr = self.finish(producer)
         if not reconcile:
             return producer, report, events, stdout, stderr
-        with self.start(mode, reconcile=True, workflow_outcome="success" if producer.returncode == 0 else "failure") as process:
+        with self.start(mode, reconcile=True, producer_outcome="success" if producer.returncode == 0 else "failure") as process:
             report, events, reconcile_stdout, reconcile_stderr = self.finish(process)
         status = process if process.returncode else producer
         return status, report, events, stdout + reconcile_stdout, stderr + reconcile_stderr
@@ -747,6 +777,7 @@ class MatrixRunnerTest(unittest.TestCase):
         self.assertEqual(process.returncode, 0, stderr)
         self.assertIn("64 independent cells", stdout)
         self.assertEqual((self.root / "workflow-output").read_text(), "producer_outcome=success\nfinalizer_outcome=success\nreconciled=true\n")
+        self.assertEqual(report["initial_finalizer_outcome"], "success")
         load_validator().validate_report(report)
         self.assertEqual(report["cifs"]["run_id"], self.run_id)
         self.assertEqual(events[:3], [
@@ -828,30 +859,58 @@ class MatrixRunnerTest(unittest.TestCase):
         )
         self.assertEqual(report["cleanup"]["cifs"], "passed")
 
-    def test_cleanup_recovery_preserves_known_producer_outcome_and_cancellation(self):
-        process, report, _, _, stderr = self.run_mock("cleanup_failure")
-        self.assertNotEqual(process.returncode, 0)
+    def test_failed_wrapper_finalizer_survives_argumentless_manual_recovery(self):
+        with self.start("cleanup_failure", lifecycle=True, actions_output=False) as process:
+            report, _, _, stderr = self.finish(process)
+        self.assertEqual(process.returncode, 1, stderr)
         self.assertIn("Connectivity", stderr)
         self.assertEqual(report["cifs"]["cleanup"], {"source": "failed", "destination": "passed"})
         self.assertEqual(report["status"], "failed")
-        # 旧 workflow 字段不应覆盖已持久化的生产结果。
         run_path = self.state / "run.json"
-        run_path.write_text(json.dumps({**json.loads(run_path.read_text()), "workflow_outcome": "success"}))
+        initial = json.loads(run_path.read_text())
+
         with self.start("", reconcile=True) as retry:
-            report, _, _, stderr = self.finish(retry)
+            report, events, stdout, stderr = self.finish(retry)
         self.assertEqual(retry.returncode, 0, stderr)
-        self.assertEqual(report["status"], "completed")
-        load_validator().validate_report(report)
+        self.assertEqual(report["cleanup"], {"hdfs": "passed", "s3_dxn": "passed", "cifs": "passed"})
+        self.assertEqual(report["status"], "failed")
+        for state in (initial, json.loads(run_path.read_text()), report):
+            self.assertEqual(state["producer_outcome"], "success")
+            self.assertEqual(state["initial_finalizer_outcome"], "failure")
+        self.assertNotIn("independent cells", stdout)
+        with self.assertRaisesRegex(ValueError, "matrix run must be completed"):
+            load_validator().validate_report(report)
         attempts = [op for op in report["operations"] if op["operation"] == "cifs.delete.source"]
         self.assertEqual([op["status"] for op in attempts], ["failed", "failed", "passed"])
         self.assertEqual(attempts[0]["write_outcome"], "not_indicated")
+        self.assertEqual(sum(event[0] == "--delete-hdfs-run" for event in events), 1)
         self.assertTrue(self.receipt.exists())
-        with self.start("", reconcile=True, workflow_outcome="cancelled", reconcile_mode="--report-only") as process:
-            report, _, _, _ = self.finish(process)
-        self.assertEqual(report["status"], "cancelled")
-        with self.start("", reconcile=True, workflow_outcome="success") as process:
-            report, _, _, _ = self.finish(process)
-        self.assertEqual(report["status"], "cancelled")
+
+    def test_cancelled_recovery_preserves_original_phase_outcomes(self):
+        self.run_mock("inaccessible", reconcile=False)
+        outcomes = {"producer_outcome": "failure", "lifecycle_outcome": "failure", "initial_finalizer_outcome": "failure"}
+        with self.start("", reconcile=True, reconcile_mode="--report-only", producer_outcome="failure",
+                        lifecycle_outcome="failure", finalizer_outcome="failure") as record:
+            report, _, _, stderr = self.finish(record)
+        self.assertEqual(record.returncode, 0, stderr)
+        self.assertEqual(report["status"], "incomplete")
+        self.assertEqual({key: report[key] for key in outcomes}, outcomes)
+
+        with self.start("kill_cleanup", reconcile=True) as cancelled:
+            self.stop_when_ready(cancelled, signal.SIGTERM)
+        self.assertEqual(cancelled.returncode, 143)
+        after_cancel = json.loads(self.report_path.read_text())
+        durable_after_cancel = json.loads((self.state / "run.json").read_text())
+
+        with self.start("", reconcile=True) as retry:
+            report, _, _, stderr = self.finish(retry)
+        self.assertEqual(retry.returncode, 0, stderr)
+        self.assertEqual(report["cleanup"]["cifs"], "passed")
+        self.assertEqual(durable_after_cancel["workflow_outcome"], "cancelled")
+        for published in (after_cancel, report):
+            self.assertEqual(published["status"], "cancelled")
+        for state in (after_cancel, durable_after_cancel, report):
+            self.assertEqual({key: state[key] for key in outcomes}, outcomes)
 
     def test_failed_producer_hdfs_cleanup_is_never_retried_by_reconciliation(self):
         with self.start("hdfs_cleanup_failure", lifecycle=True) as producer:
@@ -868,7 +927,7 @@ class MatrixRunnerTest(unittest.TestCase):
     def test_crash_after_hdfs_was_touched_only_recovers_cifs_and_dxn(self):
         with self.start("pause_hdfs") as producer:
             self.stop_when_ready(producer, signal.SIGKILL)
-        with self.start("", reconcile=True, workflow_outcome="cancelled") as retry:
+        with self.start("", reconcile=True, producer_outcome="cancelled") as retry:
             report, events, _, _ = self.finish(retry)
         self.assertEqual(retry.returncode, 0)
         self.assertEqual(report["status"], "cancelled")
@@ -879,7 +938,7 @@ class MatrixRunnerTest(unittest.TestCase):
         with self.start("pause_hdfs", lifecycle=True) as producer:
             self.stop_when_ready(producer, signal.SIGTERM)
         self.assertEqual(producer.returncode, 143)
-        with self.start("", reconcile=True, workflow_outcome="cancelled") as retry:
+        with self.start("", reconcile=True, producer_outcome="cancelled") as retry:
             report, events, _, _ = self.finish(retry)
         self.assertEqual(retry.returncode, 0)
         self.assertEqual(report["status"], "cancelled")
@@ -889,7 +948,7 @@ class MatrixRunnerTest(unittest.TestCase):
     def test_missing_receipt_blocks_reconciliation_with_a_claim_in_evidence(self):
         self.run_mock("inaccessible", reconcile=False)
         self.receipt.unlink()
-        with self.start("", reconcile=True, workflow_outcome="failure") as process:
+        with self.start("", reconcile=True, producer_outcome="failure") as process:
             report, events, _, stderr = self.finish(process)
         self.assertNotEqual(process.returncode, 0)
         self.assertIn("requires the private receipt", stderr)
@@ -898,7 +957,7 @@ class MatrixRunnerTest(unittest.TestCase):
 
     def test_peer_cleanup_rechecks_source_after_lost_delete_ack(self):
         self.run_mock("inaccessible", reconcile=False)
-        with self.start("lost_delete_ack", reconcile=True, workflow_outcome="failure") as process:
+        with self.start("lost_delete_ack", reconcile=True, producer_outcome="failure") as process:
             report, events, _, stderr = self.finish(process)
         self.assertEqual(process.returncode, 0, stderr)
         self.assertEqual(report["cleanup"]["cifs"], "passed")
@@ -941,7 +1000,7 @@ class MatrixRunnerTest(unittest.TestCase):
             self.stop_when_ready(producer, signal.SIGTERM)
         self.assertEqual(producer.returncode, 143)
         self.assertEqual((self.root / "workflow-output").read_text(), "producer_outcome=cancelled\n")
-        with self.start("", reconcile=True, workflow_outcome="cancelled") as process:
+        with self.start("", reconcile=True, producer_outcome="cancelled") as process:
             report, events, _, stderr = self.finish(process)
         self.assertEqual(process.returncode, 0, stderr)
         self.assertEqual(report["status"], "cancelled")
@@ -967,6 +1026,8 @@ class MatrixRunnerTest(unittest.TestCase):
         self.assertEqual(process.returncode, 143)
         self.assertFalse(pathlib.Path(f"/proc/{worker}").exists())
         self.assertEqual(report["status"], "cancelled")
+        self.assertEqual(report["initial_finalizer_outcome"], "cancelled")
+        self.assertNotIn("lifecycle_outcome", report)
         self.assertEqual([event[2] for event in events if event[0] == "--delete-cifs-run"], ["source"])
         self.assertEqual(report["cifs"]["cleanup"], {"source": "failed", "destination": "not_attempted"})
 
@@ -994,7 +1055,7 @@ class MatrixRunnerTest(unittest.TestCase):
             self.stop_when_ready(producer, signal.SIGKILL)
         self.assertTrue(self.receipt.exists())
         shutil.rmtree(self.lab_root)
-        with self.start("", reconcile=True, workflow_outcome="cancelled") as process:
+        with self.start("", reconcile=True, producer_outcome="cancelled") as process:
             report, _, _, stderr = self.finish(process)
         self.assertEqual(process.returncode, 0, stderr)
         self.assertEqual(report["status"], "cancelled")
@@ -1013,7 +1074,7 @@ class MatrixRunnerTest(unittest.TestCase):
         for late_commit in (False, True):
             if late_commit:
                 scope.mkdir(parents=True)
-            with self.start("", reconcile=True, workflow_outcome="cancelled") as process:
+            with self.start("", reconcile=True, producer_outcome="cancelled") as process:
                 report, _, _, stderr = self.finish(process)
             self.assertNotEqual(process.returncode, 0, stderr)
             self.assertEqual(report["cifs"]["cleanup"], {"source": "failed", "destination": "failed"})
@@ -1027,7 +1088,7 @@ class MatrixRunnerTest(unittest.TestCase):
         with self.start("kill_claim") as producer:
             self.stop_when_ready(producer, signal.SIGKILL)
         self.env["RUNNER_TEMP"] = str(self.root / "unavailable-runner-temp")
-        with self.start("", reconcile=True, workflow_outcome="cancelled", reconcile_mode="--report-only") as process:
+        with self.start("", reconcile=True, producer_outcome="cancelled", reconcile_mode="--report-only") as process:
             report, events, _, stderr = self.finish(process)
         self.assertEqual(process.returncode, 0, stderr)
         self.assertEqual(report["status"], "cancelled")
@@ -1037,7 +1098,7 @@ class MatrixRunnerTest(unittest.TestCase):
 
     def test_kill_after_marker_delete_preserves_the_interrupted_attempt_and_retries(self):
         self.run_mock("inaccessible", reconcile=False)
-        with self.start("kill_cleanup", reconcile=True, workflow_outcome="failure") as interrupted:
+        with self.start("kill_cleanup", reconcile=True, producer_outcome="failure") as interrupted:
             self.stop_when_ready(interrupted, signal.SIGKILL)
         self.assertEqual(json.loads(self.receipt.read_text())["phase"], "Finalizing")
         with self.start("", reconcile=True) as process:

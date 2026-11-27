@@ -26,7 +26,7 @@ finish() {
   trap - EXIT
   if [[ "$cancelled" == true ]]; then
     evidence mark workflow_outcome cancelled || true
-    evidence publish "$producer_outcome" cancelled "$finalizer_outcome" || true
+    evidence publish || true
     status=143
   fi
   if [[ -n "$cleanup_runtime" ]]; then rm -rf -- "$cleanup_runtime"; fi
@@ -34,15 +34,14 @@ finish() {
 }
 trap finish EXIT
 
-if [[ "$producer_outcome" == cancelled || "$lifecycle_outcome" == cancelled ]]; then
+evidence record-outcomes "$producer_outcome" "$lifecycle_outcome" "$finalizer_outcome"
+if [[ "${TS_SINGLE_WORKFLOW_CANCELLED:-false}" == true ||
+      "$producer_outcome" == cancelled || "$lifecycle_outcome" == cancelled ]]; then
   evidence mark workflow_outcome cancelled
 fi
 evidence interrupt
-if [[ "$mode" == --report-only ]]; then
-  evidence publish "$producer_outcome" "$lifecycle_outcome" "$finalizer_outcome"
-  exit
-fi
-evidence publish "$producer_outcome" "$lifecycle_outcome" "$finalizer_outcome"
+evidence publish
+[[ "$mode" == --direct ]] || exit 0
 
 check_cancelled() {
   [[ "$cancelled" == false ]] || exit 143
@@ -95,15 +94,13 @@ if evidence touched dxn && [[ "$(evidence status dxn.abort):$(evidence status dx
   fi
 fi
 check_cancelled
-evidence publish "$producer_outcome" "$lifecycle_outcome" "$finalizer_outcome"
+evidence publish
 (( status == 0 )) || exit "$status"
 if ! evidence touched hdfs || [[ "$(evidence status hdfs.delete)" == passed ]]; then
   rm -f -- "$binary"
 fi
 # 失败或取消继续保留证据，验收必须满足矩阵验证器。
-if [[ "$(evidence field producer_outcome)" == success &&
-      "$(evidence field lifecycle_outcome)" != failure && "$(evidence field lifecycle_outcome)" != cancelled &&
-      "$(evidence field initial_finalizer_outcome)" != failure && "$(evidence field initial_finalizer_outcome)" != cancelled &&
-      "$(evidence field workflow_outcome)" != cancelled ]]; then
+validation="$(evidence validation)"
+if [[ "$validation" == required ]]; then
   python3 "$repo_root/tests/lab/validate-single-process-matrix.py" "$aggregate"
 fi
