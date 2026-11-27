@@ -41,7 +41,7 @@ export NO_PROXY="${NO_PROXY:+${NO_PROXY},}${LAB_NO_PROXY_HOSTS}"
 export no_proxy="$NO_PROXY"
 
 clickhouse_query() {
-  curl --noproxy '*' --fail --silent --show-error \
+  curl --noproxy '*' --fail --silent --show-error --connect-timeout 5 --max-time 30 \
     --user "$LAB_CLICKHOUSE_USER:$LAB_CLICKHOUSE_PASSWORD" \
     --data-binary "$1" "$LAB_CLICKHOUSE_DSN/"
 }

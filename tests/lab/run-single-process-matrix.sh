@@ -48,8 +48,8 @@ hdfs_cleanup=not_attempted
 dxn_cleanup=not_attempted
 cleanup_resources() {
   local status=0
+  trap '' INT TERM HUP
   if [[ "$hdfs_touched" == true ]]; then
-    hdfs_touched=false
     if timeout --foreground --kill-after=5s 45s "$cli_binary" -c "$hdfs_cleanup_config" rm "$hdfs_root" >/dev/null 2>&1; then
       hdfs_cleanup=passed
     else
@@ -57,9 +57,9 @@ cleanup_resources() {
       hdfs_cleanup=failed
       status=1
     fi
+    hdfs_touched=false
   fi
   if [[ "$dxn_touched" == true ]]; then
-    dxn_touched=false
     dxn_cleanup=passed
     for operation in abort-multipart-prefix delete-prefix verify-clean-prefix; do
       LAB_S3_ACCESS_KEY="$LAB_DXN_S3_ACCESS_KEY" LAB_S3_SECRET_KEY="$LAB_DXN_S3_SECRET_KEY" \
@@ -70,7 +70,9 @@ cleanup_resources() {
           status=1
         }
     done
+    dxn_touched=false
   fi
+  trap - INT TERM HUP
   return "$status"
 }
 cleanup() {

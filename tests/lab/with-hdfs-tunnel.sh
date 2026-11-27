@@ -30,7 +30,7 @@ terminate_command() {
     # from keeping the tunnel and shared lab lock alive indefinitely.
     python3 -c 'import os, signal, sys, time
 signal.signal(signal.SIGTERM, signal.SIG_DFL)
-time.sleep(160)
+time.sleep(230)
 try:
     os.killpg(int(sys.argv[1]), signal.SIGKILL)
 except ProcessLookupError:
