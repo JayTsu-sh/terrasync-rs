@@ -453,13 +453,14 @@ attempts must also confirm CIFS setup and HDFS, CIFS and DXN cleanup.
 Recovery reports retain the producer outcome, the initial finalizer outcome,
 and the lifecycle step outcome separately when known. A successful recovery
 does not erase an initial finalizer failure: a finished, successful producer
-with a failed lifecycle reports `failed`, even if cleanup eventually passes.
+with a failed lifecycle or initial finalizer reports `failed`, even if cleanup eventually passes.
 A failed or interrupted producer remains `incomplete`; cancellation takes
-precedence. An unavailable phase outcome is omitted rather than inferred.
+precedence. Known phase outcomes are persisted and cannot be downgraded by later
+reconciliation; an unavailable phase outcome is omitted rather than inferred.
 
 Dispatch Release validation from `main`. It defaults to the dispatch commit.
 A supplied branch, commit or tag must resolve to a commit reachable from
-`main` and include `TS-SINGLE lifecycle contract v2`. The job checks the
+`main` and include `TS-SINGLE lifecycle contract v3`. The job checks the
 selected checkout before starting lab checks or fixture setup.
 
 Enforcing the dispatch ref at runner admission requires GitHub runner-group

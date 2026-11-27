@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# TS-SINGLE lifecycle contract v2
+# TS-SINGLE lifecycle contract v3
 # The caller holds the shared lab lock until this command exits.
 set -euo pipefail
 run_id="${1:?run id required}"

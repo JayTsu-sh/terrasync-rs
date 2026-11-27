@@ -344,7 +344,7 @@ class SingleProcessMatrixTest(unittest.TestCase):
             (lab / "run-single-process-matrix.sh").touch(mode=0o700)
             (lab / "reconcile-single-process-matrix.sh").touch(mode=0o700)
             (lab / VALIDATOR_PATH.name).touch(mode=0o700)
-            for version, has_supervisor, expected in ((1, True, 2), (2, False, 2), (2, True, 0)):
+            for version, has_supervisor, expected in ((1, True, 2), (2, True, 2), (3, False, 2), (3, True, 0)):
                 with self.subTest(version=version, has_supervisor=has_supervisor):
                     lifecycle = lab / LIFECYCLE_PATH.name
                     lifecycle.write_text(f"#!/bin/bash\n# TS-SINGLE lifecycle contract v{version}\n")
@@ -399,13 +399,15 @@ class SingleProcessMatrixTest(unittest.TestCase):
 
     def test_recovery_reports_producer_and_lifecycle_outcomes_separately(self):
         for mode in ("--direct", "--report-only"):
-            for producer, producer_outcome, lifecycle_outcome, expected in (
-                ("finished", "success", "failure", "failed"),
-                ("finished", "success", "success", "completed"),
-                ("finished", "failure", "failure", "incomplete"),
-                ("failed", "failure", "failure", "incomplete"),
-                ("running", "failure", "failure", "incomplete"),
-                ("finished", "success", "cancelled", "cancelled"),
+            for producer, producer_outcome, lifecycle_outcome, finalizer, expected in (
+                ("finished", "success", "failure", "", "failed"),
+                ("finished", "success", "", "failure", "failed"),
+                ("finished", "success", "success", "cancelled", "cancelled"),
+                ("finished", "success", "success", "", "completed"),
+                ("finished", "failure", "failure", "", "incomplete"),
+                ("failed", "failure", "failure", "", "incomplete"),
+                ("running", "failure", "failure", "", "incomplete"),
+                ("finished", "success", "cancelled", "", "cancelled"),
             ):
                 with self.subTest(mode=mode, producer=producer, lifecycle=lifecycle_outcome), tempfile.TemporaryDirectory() as directory:
                     state = pathlib.Path(directory) / "nightly-fixture"
@@ -422,13 +424,13 @@ class SingleProcessMatrixTest(unittest.TestCase):
                         (evidence / f'{operation["operation"]}.0001.json').write_text(json.dumps(operation))
                     if producer_outcome == "success" and lifecycle_outcome == "failure":
                         initial = subprocess.run(
-                            [str(ROOT / "tests/lab/reconcile-single-process-matrix.sh"), "nightly-fixture", "--direct", "success"],
+                            [str(ROOT / "tests/lab/reconcile-single-process-matrix.sh"), "nightly-fixture", "--direct", "success", "failure"],
                             env={**os.environ, "TS_SINGLE_STATE_ROOT": directory, "RUNNER_TEMP": str(state / "missing")},
                             capture_output=True, text=True, timeout=15,
                         )
                         self.assertNotEqual(initial.returncode, 0, initial.stderr)
                         self.assertIn("mktemp:", initial.stderr)
-                    finalizer = "failure" if lifecycle_outcome == "failure" else ""
+                        self.assertEqual(json.loads((state / "run.json").read_text())["lifecycle_outcome"], "failure")
                     result = subprocess.run(
                         [str(ROOT / "tests/lab/reconcile-single-process-matrix.sh"), "nightly-fixture", mode,
                          producer_outcome, lifecycle_outcome, finalizer],
@@ -438,11 +440,30 @@ class SingleProcessMatrixTest(unittest.TestCase):
                     published = json.loads((evidence / "matrix.json").read_text())
                     self.assertEqual(published["status"], expected)
                     self.assertEqual(published["producer_outcome"], producer_outcome)
-                    self.assertEqual(published["lifecycle_outcome"], lifecycle_outcome)
+                    self.assertEqual(published.get("lifecycle_outcome", ""), lifecycle_outcome)
                     if finalizer:
                         self.assertEqual(published["initial_finalizer_outcome"], finalizer)
+                    else:
+                        self.assertNotIn("initial_finalizer_outcome", published)
                     if expected == "failed":
                         self.assertEqual(published["cleanup"], {"hdfs": "passed", "s3_dxn": "passed", "cifs": "passed"})
+                    omitted = subprocess.run(
+                        [str(ROOT / "tests/lab/reconcile-single-process-matrix.sh"), "nightly-fixture", "--report-only", "success"],
+                        env={**os.environ, "TS_SINGLE_STATE_ROOT": directory}, capture_output=True, text=True, timeout=15,
+                    )
+                    self.assertEqual(omitted.returncode, 0, omitted.stderr)
+                    self.assertEqual(json.loads((evidence / "matrix.json").read_text())["status"], expected)
+                    retry = subprocess.run(
+                        [str(ROOT / "tests/lab/reconcile-single-process-matrix.sh"), "nightly-fixture", "--report-only",
+                         "success", "success", "success"],
+                        env={**os.environ, "TS_SINGLE_STATE_ROOT": directory}, capture_output=True, text=True, timeout=15,
+                    )
+                    self.assertEqual(retry.returncode, 0, retry.stderr)
+                    retried = json.loads((evidence / "matrix.json").read_text())
+                    self.assertEqual(retried["status"], expected)
+                    for field in ("producer_outcome", "lifecycle_outcome", "initial_finalizer_outcome"):
+                        if field in published:
+                            self.assertEqual(retried[field], published[field])
 
     def test_hdfs_run_root_preserves_nameservice_case(self):
         command = (
@@ -807,21 +828,20 @@ class MatrixRunnerTest(unittest.TestCase):
         )
         self.assertEqual(report["cleanup"]["cifs"], "passed")
 
-    def test_cleanup_failure_is_retained_after_a_successful_reconciliation(self):
+    def test_cleanup_recovery_preserves_known_producer_outcome_and_cancellation(self):
         process, report, _, _, stderr = self.run_mock("cleanup_failure")
         self.assertNotEqual(process.returncode, 0)
         self.assertIn("Connectivity", stderr)
         self.assertEqual(report["cifs"]["cleanup"], {"source": "failed", "destination": "passed"})
         self.assertEqual(report["status"], "failed")
-        # 模拟旧版本在清理开始前持久化生产进程的 success。
+        # 旧 workflow 字段不应覆盖已持久化的生产结果。
         run_path = self.state / "run.json"
         run_path.write_text(json.dumps({**json.loads(run_path.read_text()), "workflow_outcome": "success"}))
         with self.start("", reconcile=True) as retry:
             report, _, _, stderr = self.finish(retry)
         self.assertEqual(retry.returncode, 0, stderr)
-        self.assertEqual(report["status"], "incomplete")
-        with self.assertRaisesRegex(ValueError, "must be completed"):
-            load_validator().validate_report(report)
+        self.assertEqual(report["status"], "completed")
+        load_validator().validate_report(report)
         attempts = [op for op in report["operations"] if op["operation"] == "cifs.delete.source"]
         self.assertEqual([op["status"] for op in attempts], ["failed", "failed", "passed"])
         self.assertEqual(attempts[0]["write_outcome"], "not_indicated")

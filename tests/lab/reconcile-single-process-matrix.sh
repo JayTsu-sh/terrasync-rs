@@ -42,7 +42,7 @@ if [[ "$mode" == --report-only ]]; then
   evidence publish "$producer_outcome" "$lifecycle_outcome" "$finalizer_outcome"
   exit
 fi
-evidence publish ""
+evidence publish "$producer_outcome" "$lifecycle_outcome" "$finalizer_outcome"
 
 check_cancelled() {
   [[ "$cancelled" == false ]] || exit 143
@@ -101,6 +101,9 @@ if ! evidence touched hdfs || [[ "$(evidence status hdfs.delete)" == passed ]]; 
   rm -f -- "$binary"
 fi
 # 失败或取消继续保留证据，验收必须满足矩阵验证器。
-if [[ "$producer_outcome" == success && "$lifecycle_outcome" != failure && "$lifecycle_outcome" != cancelled && "$(evidence field workflow_outcome)" != cancelled ]]; then
+if [[ "$(evidence field producer_outcome)" == success &&
+      "$(evidence field lifecycle_outcome)" != failure && "$(evidence field lifecycle_outcome)" != cancelled &&
+      "$(evidence field initial_finalizer_outcome)" != failure && "$(evidence field initial_finalizer_outcome)" != cancelled &&
+      "$(evidence field workflow_outcome)" != cancelled ]]; then
   python3 "$repo_root/tests/lab/validate-single-process-matrix.py" "$aggregate"
 fi

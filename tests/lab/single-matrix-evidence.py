@@ -190,18 +190,24 @@ def attempt_paths(evidence):
 
 
 def publish(evidence, producer_outcome, lifecycle_outcome="", finalizer_outcome=""):
-    report = read(evidence.parent / "run.json")
+    run_path = evidence.parent / "run.json"
+    report = read(run_path)
+    outcome_rank = {"success": 0, "failure": 1, "cancelled": 2}
+    for field, outcome in (("producer_outcome", producer_outcome),
+                           ("lifecycle_outcome", lifecycle_outcome),
+                           ("initial_finalizer_outcome", finalizer_outcome)):
+        previous = report.get(field, "")
+        if outcome and (not previous or outcome_rank[outcome] > outcome_rank[previous]):
+            report[field] = outcome
+    durable_write(run_path, report)
+    producer_outcome = report.get("producer_outcome", "")
+    lifecycle_outcome = report.get("lifecycle_outcome", "")
+    finalizer_outcome = report.get("initial_finalizer_outcome", "")
     touched = report.pop("touched")
     producer = report.pop("producer")
     was_cancelled = report.get("workflow_outcome") == "cancelled"
     for field in ("workflow_outcome", "hdfs_target", "dxn_target"):
         report.pop(field, None)
-    if producer_outcome:
-        report["producer_outcome"] = producer_outcome
-    if lifecycle_outcome:
-        report["lifecycle_outcome"] = lifecycle_outcome
-    if finalizer_outcome:
-        report["initial_finalizer_outcome"] = finalizer_outcome
     operations = [read(path) for path in attempt_paths(evidence)]
     latest = {op["operation"]: op for op in operations}
 
@@ -243,12 +249,12 @@ def publish(evidence, producer_outcome, lifecycle_outcome="", finalizer_outcome=
     }
     cells = [read(path) for path in sorted(path for path in evidence.glob("*__*.json") if path.name.count(".") == 1)]
     required_cleanup = ("hdfs", "s3_dxn") if report["deferred_profiles"] else ("hdfs", "s3_dxn", "cifs")
-    if was_cancelled or producer_outcome == "cancelled" or lifecycle_outcome == "cancelled" or producer == "cancelled":
+    if was_cancelled or "cancelled" in (producer_outcome, lifecycle_outcome, finalizer_outcome, producer):
         overall = "cancelled"
     elif producer == "finished" and producer_outcome == "success":
         cifs_ready = report["deferred_profiles"] or (ownership and report["cifs"]["setup"] == "passed")
         overall = "completed" if (
-            lifecycle_outcome != "failure"
+            lifecycle_outcome != "failure" and finalizer_outcome != "failure"
             and report["source_state"] == "clean"
             and cifs_ready
             and all(cleanup[name] == "passed" for name in required_cleanup)
