@@ -40,15 +40,18 @@ runtime_root="$lab_root/runtime"
 results_root="${RUNNER_TEMP:-/tmp}/terrasync-harness-results/$run_id-single-process"
 aggregate="$results_root/matrix.json"
 hdfs_scope="${run_id%%-*}-$(printf %s "$run_id" | sha256sum | cut -d' ' -f1)-matrix"
+cifs_scope="$hdfs_scope"
 hdfs_run_root="$(hdfs_run_root "$hdfs_scope")"
 hdfs_base="${hdfs_run_root%/$hdfs_scope/hdfs}"
 hdfs_root="$hdfs_run_root/single-process-matrix"
 matrix_prefix="ci/$run_id/single-process-matrix"
 dxn_touched=false
 hdfs_touched=false
+cifs_touched=false
 
 hdfs_cleanup=not_attempted
 dxn_cleanup=not_attempted
+cifs_cleanup=not_attempted
 shielded_cleanup() (
   trap '' INT TERM HUP
   "$@"
@@ -56,6 +59,16 @@ shielded_cleanup() (
 cleanup_resources() {
   local status=0 cleanup_cancelled=false cleanup_exit
   trap 'cleanup_cancelled=true' INT TERM HUP
+  if [[ "$cifs_touched" == true ]]; then
+    if shielded_cleanup timeout --foreground --kill-after=5s 45s "$binary" --delete-cifs-run "$cifs_scope" >"$runtime_root/cifs-cleanup.log" 2>&1; then
+      cifs_cleanup=passed
+    else
+      echo 'CIFS scoped cleanup failed' >&2
+      cifs_cleanup=failed
+      status=1
+    fi
+    cifs_touched=false
+  fi
   if [[ "$hdfs_touched" == true ]]; then
     if shielded_cleanup timeout --foreground --kill-after=5s 45s "$binary" --delete-hdfs-run "$hdfs_base" "$hdfs_scope" >"$runtime_root/hdfs-cleanup.log" 2>&1; then
       hdfs_cleanup=passed
@@ -118,7 +131,7 @@ profile_root_url() {
     nfs40) printf 'nfs://%s%s:/%s?version=4.0&noresvport=true&uid=0&gid=0' "$LAB_NFS40_DATA" "$LAB_NFS40_EXPORT" "$matrix_prefix" ;;
     nfs41) printf 'nfs://%s%s:/%s?version=4.1&noresvport=true' "$host" "$LAB_NFS41_EXPORT" "$matrix_prefix" ;;
     cifs_fas2750)
-      printf '%s/%s/single-process-matrix' "$LAB_CIFS_WRITABLE_ROOT" "$run_id"
+      printf '%s/%s/single-process-matrix' "$LAB_CIFS_WRITABLE_ROOT" "$cifs_scope"
       ;;
     s3_standard|s3_dxn) printf '%s' "$matrix_prefix" ;;
     hdfs) printf '%s' "$hdfs_root" ;;
@@ -203,6 +216,9 @@ PY
   if [[ "$source" == hdfs || "$destination" == hdfs ]]; then
     hdfs_touched=true
   fi
+  if [[ "$source" == cifs_fas2750 || "$destination" == cifs_fas2750 ]]; then
+    cifs_touched=true
+  fi
   if [[ "$source" == s3_dxn || "$destination" == s3_dxn ]]; then
     dxn_touched=true
   fi
@@ -256,9 +272,9 @@ terrasync_commit="$(git -C "$repo_root" rev-parse HEAD)"
 data_mover_commit="$(sed -n 's/.*data-mover-rs\.git?rev=\([0-9a-f]*\)#.*/\1/p' "$repo_root/Cargo.lock" | head -1)"
 profiles_csv="$(IFS=,; printf '%s' "${profiles[*]}")"
 deferred_profiles_csv="$(IFS=,; printf '%s' "${deferred_profiles[*]}")"
-python3 - "$aggregate" "$results_root" "$run_id" "$terrasync_commit" "$data_mover_commit" "$profiles_csv" "$deferred_profiles_csv" "$hdfs_cleanup" "$dxn_cleanup" <<'PY'
+python3 - "$aggregate" "$results_root" "$run_id" "$terrasync_commit" "$data_mover_commit" "$profiles_csv" "$deferred_profiles_csv" "$hdfs_cleanup" "$dxn_cleanup" "$cifs_cleanup" <<'PY'
 import glob, json, os, sys
-output, root, run_id, terrasync, data_mover, profiles, deferred_profiles, hdfs_cleanup, dxn_cleanup = sys.argv[1:]
+output, root, run_id, terrasync, data_mover, profiles, deferred_profiles, hdfs_cleanup, dxn_cleanup, cifs_cleanup = sys.argv[1:]
 cells = []
 for path in sorted(glob.glob(os.path.join(root, "*__*.json"))):
     with open(path, encoding="utf-8") as handle:
@@ -272,7 +288,7 @@ report = {
     "mode": "terrasync_single_process",
     "profiles": profiles.split(",") if profiles else [],
     "deferred_profiles": deferred_profiles.split(",") if deferred_profiles else [],
-    "cleanup": {"hdfs": hdfs_cleanup, "s3_dxn": dxn_cleanup},
+    "cleanup": {"hdfs": hdfs_cleanup, "s3_dxn": dxn_cleanup, "cifs": cifs_cleanup},
     "cells": cells,
 }
 with open(output, "w", encoding="utf-8") as handle:

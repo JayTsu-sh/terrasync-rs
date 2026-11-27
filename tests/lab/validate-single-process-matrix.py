@@ -58,8 +58,8 @@ def validate_report(report):
     elif profiles != PROFILES:
         raise ValueError("non-default profile set requires an explicit deferred profile")
 
-    if report.get("cleanup") != {"hdfs": "passed", "s3_dxn": "passed"}:
-        raise ValueError("HDFS and DXN cleanup must pass")
+    if report.get("cleanup") != {"hdfs": "passed", "s3_dxn": "passed", "cifs": "not_attempted" if deferred else "passed"}:
+        raise ValueError("HDFS, DXN and active CIFS cleanup must pass")
 
     cells = report.get("cells")
     expected_count = len(profiles) ** 2

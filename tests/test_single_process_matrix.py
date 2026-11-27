@@ -45,7 +45,7 @@ class SingleProcessMatrixTest(unittest.TestCase):
             "dependency_commits": {"data-mover-rs": "b" * 40},
             "run_id": "release-matrix-test",
             "mode": "terrasync_single_process",
-            "cleanup": {"hdfs": "passed", "s3_dxn": "passed"},
+            "cleanup": {"hdfs": "passed", "s3_dxn": "passed", "cifs": "passed"},
             "cells": cells,
         }
 
@@ -74,6 +74,12 @@ class SingleProcessMatrixTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "cleanup must pass"):
             self.validator.validate_report(report)
 
+    def test_failed_cifs_cleanup_rejects_full_matrix(self):
+        report = self.report()
+        report["cleanup"]["cifs"] = "failed"
+        with self.assertRaisesRegex(ValueError, "cleanup must pass"):
+            self.validator.validate_report(report)
+
     def test_duplicate_pair_is_rejected(self):
         report = self.report()
         report["cells"][-1] = dict(report["cells"][0])
@@ -91,6 +97,7 @@ class SingleProcessMatrixTest(unittest.TestCase):
         active_profiles = [profile for profile in self.profiles if profile != "cifs_fas2750"]
         report["profiles"] = active_profiles
         report["deferred_profiles"] = ["cifs_fas2750"]
+        report["cleanup"]["cifs"] = "not_attempted"
         report["cells"] = [
             cell
             for cell in report["cells"]
@@ -112,6 +119,7 @@ class SingleProcessMatrixTest(unittest.TestCase):
 
     def test_validator_cli_reports_explicit_cifs_deferral(self):
         report = self.report()
+        report["cleanup"]["cifs"] = "not_attempted"
         active_profiles = [profile for profile in self.profiles if profile != "cifs_fas2750"]
         report["profiles"] = active_profiles
         report["deferred_profiles"] = ["cifs_fas2750"]
@@ -158,7 +166,8 @@ class SingleProcessMatrixTest(unittest.TestCase):
         self.assertIn("printf '%s/%s/%s?%s'", runner)
         self.assertIn("TS_SINGLE_DEFER_CIFS", runner)
         self.assertIn("deferred_profiles", runner)
-        self.assertIn("TS-SINGLE 49-cell matrix (CIFS deferred)", workflow)
+        self.assertIn("TS-SINGLE 64-cell matrix", workflow)
+        self.assertNotIn('TS_SINGLE_DEFER_CIFS: "true"', workflow)
         self.assertTrue(VALIDATOR_PATH.stat().st_mode & 0o111)
         self.assertTrue((ROOT / "tests" / "lab" / "run-single-process-matrix.sh").stat().st_mode & 0o111)
 

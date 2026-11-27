@@ -449,17 +449,17 @@ FAS2750 CIFS, standard S3, DXN S3, and HDFS. Every cell preloads its source,
 runs the protocol-neutral `Storage + run_local_transfer` single-process path,
 verifies every stream with copy-time BLAKE3, reads the destination back, and
 records the exact terrasync and data-mover commits. Its aggregate also requires
-successful HDFS and DXN prefix cleanup; the dedicated DXN test bucket must have
+successful HDFS, CIFS and DXN prefix cleanup; the dedicated DXN test bucket must have
 versioning disabled and its object/multipart prefix is checked afterward. This runner intentionally
 does not route through the legacy URL-dispatching CLI. FAS2750 and DXN
 credentials are CI secrets; reports contain only profile-level environment
 fingerprints.
 
-While FAS2750 CIFS root provisioning is explicitly deferred, nightly sets
-`TS_SINGLE_DEFER_CIFS=true`. This emits and validates the 49-cell product of
-the remaining seven profiles, with `cifs_fas2750` recorded in
-`deferred_profiles`; it is not a substitute for the 64-cell acceptance gate.
-Release validation remains on the full matrix.
+Nightly runs the full 64-cell matrix. For an explicitly degraded diagnostic run,
+`TS_SINGLE_DEFER_CIFS=true` emits the 49-cell product of the remaining seven
+profiles, with `cifs_fas2750` recorded in `deferred_profiles`; this does not
+replace the 64-cell acceptance gate. CIFS cleanup removes only the hashed
+per-run directory under the configured writable root and is required for a pass.
 
 Nightly sets the DXN S3 endpoint and private test bucket through
 `LAB_DXN_NIGHTLY_ENDPOINT` and `LAB_DXN_NIGHTLY_BUCKET` repository variables.

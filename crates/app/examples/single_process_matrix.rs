@@ -14,8 +14,9 @@ use async_trait::async_trait;
 use data_mover::model::{FailureClass, ModelValueError, ObservedEntry, StoragePath};
 use data_mover::storage::HdfsConfig;
 use data_mover::storage::{
-    BackendConfig, BackendConnectError, CifsBackendConfig, HdfsBackendConfig, LocalBackendConfig, NfsBackendConfig,
-    S3BackendConfig, StorageRoleFailure, connect_backend,
+    BackendConfig, BackendConnectError, CifsBackendConfig, DeleteTreeItem, DeleteTreeOutcome, DeleteTreeRequest,
+    HdfsBackendConfig, LocalBackendConfig, NfsBackendConfig, S3BackendConfig, StorageRoleFailure, connect_backend,
+    delete_tree,
 };
 use data_mover::transfer::{TransferFailure, TransferOutcome, TransferPolicy, TransferValueError};
 use data_mover::traversal::{TraversalCompletion, TraversalItem, TraversalOutcome, TraversalSession};
@@ -38,6 +39,8 @@ enum MatrixError {
     Usage,
     #[error("matrix transfer did not complete exactly one file without failures")]
     TransferFailed,
+    #[error("CIFS scoped cleanup did not complete successfully")]
+    CleanupFailed,
     #[error("non-zero matrix transfer limit is required")]
     InvalidLimit,
     #[error(transparent)]
@@ -264,9 +267,42 @@ fn hdfs_cleanup_target(
     Ok((location, path))
 }
 
+fn cifs_cleanup_target(base: &str, scope: &str) -> Result<StoragePath, MatrixError> {
+    let hash = scope
+        .strip_prefix("nightly-")
+        .or_else(|| scope.strip_prefix("release-"))
+        .and_then(|value| value.strip_suffix("-matrix"))
+        .ok_or(MatrixError::Usage)?;
+    if hash.len() != 64
+        || !hash.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        || base.is_empty()
+        || base.split('/').any(|part| {
+            part.is_empty()
+                || part == "."
+                || part == ".."
+                || !part.bytes().all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
+        })
+    {
+        return Err(MatrixError::Usage);
+    }
+    Ok(StoragePath::new(format!("{base}/{scope}"))?)
+}
+
 #[cfg(test)]
 mod cleanup_scope_tests {
-    use super::hdfs_cleanup_target;
+    use super::{cifs_cleanup_target, hdfs_cleanup_target};
+
+    #[test]
+    fn cifs_scope_is_a_hash_below_a_normalized_nonempty_base() {
+        let scope = format!("nightly-{}-matrix", "a".repeat(64));
+        assert!(cifs_cleanup_target("ci/terrasync-data-mover", &scope).is_ok());
+        for base in ["", "/", "ci/../production", "ci//production", "ci/."] {
+            assert!(cifs_cleanup_target(base, &scope).is_err());
+        }
+        for scope in ["nightly-important", "../production", "nightly-aa-matrix"] {
+            assert!(cifs_cleanup_target("ci/terrasync-data-mover", scope).is_err());
+        }
+    }
 
     #[test]
     fn permits_only_hashed_scopes_under_the_configured_base_and_nameservice() {
@@ -296,6 +332,50 @@ mod cleanup_scope_tests {
 #[tokio::main]
 async fn main() -> Result<(), MatrixError> {
     let args = env::args().skip(1).collect::<Vec<_>>();
+    if let [command, scope] = args.as_slice() {
+        if command == "--delete-cifs-run" {
+            let path = cifs_cleanup_target(&required("LAB_CIFS_WRITABLE_ROOT")?, scope)?;
+            let storage = connect_backend(BackendConfig::Cifs(CifsBackendConfig {
+                server: required("LAB_CIFS_DEST_DATA")?,
+                share: required("LAB_CIFS_SHARE")?,
+                root: None,
+                username: required("LAB_CIFS_USERNAME")?,
+                password: required("LAB_CIFS_PASSWORD")?,
+                ensure_dir: false,
+                signing_policy: Default::default(),
+                guest_policy: Default::default(),
+            }))
+            .await?;
+            match storage.namespace()?.stat(&path, false).await {
+                Ok(_) => (),
+                Err(StorageRoleFailure::Entry(error)) if error.class() == FailureClass::NotFound => return Ok(()),
+                Err(error) => return Err(error.into()),
+            }
+            let limit = NonZeroUsize::new(4).ok_or(MatrixError::InvalidLimit)?;
+            let mut deletion = delete_tree(
+                &storage,
+                DeleteTreeRequest {
+                    root: path,
+                    delete_root: true,
+                    max_inflight_operations: limit,
+                    max_buffered_items: limit,
+                    cancel: CancellationToken::new(),
+                },
+            )?;
+            let mut failed = false;
+            while let Some(item) = deletion.next_item().await {
+                if matches!(item, DeleteTreeItem::EntryFailure(_)) {
+                    failed = true;
+                }
+            }
+            if !matches!(deletion.finish().await, Ok(DeleteTreeOutcome::Completed(result)) if result.entry_failures == 0)
+                || failed
+            {
+                return Err(MatrixError::CleanupFailed);
+            }
+            return Ok(());
+        }
+    }
     if let [command, root, run_id] = args.as_slice() {
         if command == "--delete-hdfs-run" {
             let (location, path) = hdfs_cleanup_target(
