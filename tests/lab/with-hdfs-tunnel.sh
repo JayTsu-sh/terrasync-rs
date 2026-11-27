@@ -26,11 +26,11 @@ terminate_command() {
   trap '' INT TERM HUP
   if [[ -n "$command_pid" ]]; then
     kill -TERM -- "-$command_pid" 2>/dev/null || true
-    # HDFS and DXN cleanup each have bounded deadlines. Prevent a stuck child
+    # CIFS, HDFS and DXN cleanup each have bounded deadlines. Prevent a stuck child
     # from keeping the tunnel and shared lab lock alive indefinitely.
     python3 -c 'import os, signal, sys, time
 signal.signal(signal.SIGTERM, signal.SIG_DFL)
-time.sleep(230)
+time.sleep(350)
 try:
     os.killpg(int(sys.argv[1]), signal.SIGKILL)
 except ProcessLookupError:

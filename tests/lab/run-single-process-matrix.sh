@@ -57,16 +57,20 @@ shielded_cleanup() (
   "$@"
 )
 cleanup_resources() {
-  local status=0 cleanup_cancelled=false cleanup_exit
+  local status=0 cleanup_cancelled=false cleanup_exit role
   trap 'cleanup_cancelled=true' INT TERM HUP
   if [[ "$cifs_touched" == true ]]; then
-    if shielded_cleanup timeout --foreground --kill-after=5s 45s "$binary" --delete-cifs-run "$cifs_scope" >"$runtime_root/cifs-cleanup.log" 2>&1; then
-      cifs_cleanup=passed
-    else
-      echo 'CIFS scoped cleanup failed' >&2
-      cifs_cleanup=failed
-      status=1
-    fi
+    cifs_cleanup=passed
+    for role in source destination; do
+      if shielded_cleanup timeout --foreground --kill-after=5s 45s "$binary" --delete-cifs-run "$cifs_scope" "$role" >"$runtime_root/cifs-cleanup.log" 2>&1; then
+        :
+      else
+        cleanup_exit=$?
+        report_cifs_cleanup_failure "$cleanup_exit" "$runtime_root/cifs-cleanup.log"
+        cifs_cleanup=failed
+        status=1
+      fi
+    done
     cifs_touched=false
   fi
   if [[ "$hdfs_touched" == true ]]; then
@@ -121,6 +125,9 @@ export LAB_HDFS_DESTINATION_CCACHE="FILE:$runtime_root/destination.ccache"
 env -u LAB_DXN_S3_ACCESS_KEY -u LAB_DXN_S3_SECRET_KEY -u LAB_S3_ACCESS_KEY -u LAB_S3_SECRET_KEY \
   -u LAB_CIFS_USERNAME -u LAB_CIFS_PASSWORD -u LAB_HDFS_KEYTAB \
   cargo build --release --locked --manifest-path "$repo_root/Cargo.toml" -p app --example single_process_matrix
+if [[ "$cifs_enabled" == true ]]; then
+  "$binary" --validate-cifs-run "$cifs_scope"
+fi
 
 profile_root_url() {
   local role="$1" profile="$2" host

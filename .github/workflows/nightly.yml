@@ -76,6 +76,7 @@ jobs:
         id: single_matrix
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         env:
+          TS_SINGLE_DEFER_CIFS: "false"
           LAB_DXN_S3_ENDPOINT: ${{ vars.LAB_DXN_NIGHTLY_ENDPOINT }}
           LAB_DXN_S3_BUCKET: ${{ vars.LAB_DXN_NIGHTLY_BUCKET }}
           LAB_DXN_S3_ACCESS_KEY: ${{ secrets.LAB_DXN_NIGHTLY_ACCESS_KEY }}

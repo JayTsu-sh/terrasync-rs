@@ -15,8 +15,8 @@ use data_mover::model::{FailureClass, ModelValueError, ObservedEntry, StoragePat
 use data_mover::storage::HdfsConfig;
 use data_mover::storage::{
     BackendConfig, BackendConnectError, CifsBackendConfig, DeleteTreeItem, DeleteTreeOutcome, DeleteTreeRequest,
-    HdfsBackendConfig, LocalBackendConfig, NfsBackendConfig, S3BackendConfig, StorageRoleFailure, connect_backend,
-    delete_tree,
+    DeleteTreeTerminalFailure, HdfsBackendConfig, LocalBackendConfig, NfsBackendConfig, S3BackendConfig,
+    StorageRoleFailure, connect_backend, delete_tree,
 };
 use data_mover::transfer::{TransferFailure, TransferOutcome, TransferPolicy, TransferValueError};
 use data_mover::traversal::{TraversalCompletion, TraversalItem, TraversalOutcome, TraversalSession};
@@ -333,10 +333,21 @@ mod cleanup_scope_tests {
 async fn main() -> Result<(), MatrixError> {
     let args = env::args().skip(1).collect::<Vec<_>>();
     if let [command, scope] = args.as_slice() {
+        if command == "--validate-cifs-run" {
+            cifs_cleanup_target(&required("LAB_CIFS_WRITABLE_ROOT")?, scope)?;
+            return Ok(());
+        }
+    }
+    if let [command, scope, role] = args.as_slice() {
         if command == "--delete-cifs-run" {
             let path = cifs_cleanup_target(&required("LAB_CIFS_WRITABLE_ROOT")?, scope)?;
+            let server = match role.as_str() {
+                "source" => required("LAB_CIFS_SOURCE_DATA")?,
+                "destination" => required("LAB_CIFS_DEST_DATA")?,
+                _ => return Err(MatrixError::Usage),
+            };
             let storage = connect_backend(BackendConfig::Cifs(CifsBackendConfig {
-                server: required("LAB_CIFS_DEST_DATA")?,
+                server,
                 share: required("LAB_CIFS_SHARE")?,
                 root: None,
                 username: required("LAB_CIFS_USERNAME")?,
@@ -345,11 +356,26 @@ async fn main() -> Result<(), MatrixError> {
                 signing_policy: Default::default(),
                 guest_policy: Default::default(),
             }))
-            .await?;
+            .await
+            .map_err(|error| {
+                if let Some(failure) = error.session_failure() {
+                    eprintln!("CIFS_CLEANUP_FAILURE={:?}", failure.class());
+                } else {
+                    eprintln!("CIFS_CLEANUP_FAILURE=connection_unknown");
+                }
+                error
+            })?;
             match storage.namespace()?.stat(&path, false).await {
                 Ok(_) => (),
                 Err(StorageRoleFailure::Entry(error)) if error.class() == FailureClass::NotFound => return Ok(()),
-                Err(error) => return Err(error.into()),
+                Err(error) => {
+                    let class = match &error {
+                        StorageRoleFailure::Entry(failure) => failure.class(),
+                        StorageRoleFailure::Session(failure) => failure.class(),
+                    };
+                    eprintln!("CIFS_CLEANUP_FAILURE={class:?}");
+                    return Err(error.into());
+                }
             }
             let limit = NonZeroUsize::new(4).ok_or(MatrixError::InvalidLimit)?;
             let mut deletion = delete_tree(
@@ -364,16 +390,17 @@ async fn main() -> Result<(), MatrixError> {
             )?;
             let mut failed = false;
             while let Some(item) = deletion.next_item().await {
-                if matches!(item, DeleteTreeItem::EntryFailure(_)) {
+                if let DeleteTreeItem::EntryFailure(error) = item {
+                    eprintln!("CIFS_CLEANUP_FAILURE={:?}", error.class());
                     failed = true;
                 }
             }
-            if !matches!(deletion.finish().await, Ok(DeleteTreeOutcome::Completed(result)) if result.entry_failures == 0)
-                || failed
-            {
-                return Err(MatrixError::CleanupFailed);
+            match deletion.finish().await {
+                Ok(DeleteTreeOutcome::Completed(result)) if result.entry_failures == 0 && !failed => return Ok(()),
+                Err(DeleteTreeTerminalFailure::Session(error)) => eprintln!("CIFS_CLEANUP_FAILURE={:?}", error.class()),
+                _ => eprintln!("CIFS_CLEANUP_FAILURE=Internal"),
             }
-            return Ok(());
+            return Err(MatrixError::CleanupFailed);
         }
     }
     if let [command, root, run_id] = args.as_slice() {
