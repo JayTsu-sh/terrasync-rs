@@ -33,13 +33,16 @@ impl Cause {
         }
     }
 
+    pub(super) fn unknown_outcome(class: FailureClass) -> Self {
+        Self {
+            reason: Some("OutcomeUnknown"),
+            unknown: true,
+            ..Self::class(class)
+        }
+    }
+
     fn typed(class: FailureClass, operation: Operation, detail: &str) -> Self {
         let reason = smb_unknown_outcome(detail);
-        let class = match reason {
-            Some("TimedOut") => FailureClass::Timeout,
-            Some("ConnectionLost" | "SessionInvalidated") => FailureClass::Connectivity,
-            _ => class,
-        };
         Self {
             class: Some(class),
             operation: Some(operation),
@@ -197,6 +200,31 @@ mod tests {
     use data_mover::model::BackendKind;
 
     use super::*;
+
+    #[test]
+    fn cifs_unknown_outcomes_do_not_replace_the_typed_class_or_operation() {
+        for (detail, reason) in [
+            (
+                "Operation outcome is unknown because the request may have committed",
+                "OutcomeUnknown",
+            ),
+            ("Operation outcome is unknown after TimedOut", "TimedOut"),
+            (
+                "Operation outcome is unknown after SessionInvalidated",
+                "SessionInvalidated",
+            ),
+        ] {
+            let cause = Cause::typed(
+                FailureClass::Protocol,
+                Operation::Namespace,
+                &format!("CIFS delete: {detail}"),
+            );
+            assert_eq!(cause.class, Some(FailureClass::Protocol));
+            assert_eq!(cause.operation, Some(Operation::Namespace));
+            assert_eq!(cause.reason, Some(reason));
+            assert!(cause.unknown);
+        }
+    }
 
     #[test]
     fn pinned_cifs_connector_distinguishes_logon_transport_and_unknown() {

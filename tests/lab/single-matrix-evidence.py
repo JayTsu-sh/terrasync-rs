@@ -277,7 +277,13 @@ def main(args):
         if command == "status":
             print(attempt.get("status", "not_attempted"))
         else:
-            sys.exit(attempt.get("cause") not in {"Connectivity", "Timeout", "Killed"})
+            cause = attempt.get("cause")
+            unknown_write = attempt.get("write_outcome") == "unknown" and cause not in {
+                "Authentication", "PermissionDenied", "Conflict",
+            }
+            sys.exit(attempt.get("status") != "failed" or not (
+                unknown_write or cause in {"Connectivity", "Timeout", "Killed"}
+            ))
     elif command == "field":
         print(read(evidence.parent / "run.json").get(values[0], ""))
     elif command == "touched":

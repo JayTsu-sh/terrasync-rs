@@ -179,7 +179,12 @@ fn hdfs_client(role: &str) -> Result<HdfsConfig, MatrixError> {
     })
 }
 
-async fn connect(profile: &str, role: &str, root: &str) -> Result<data_mover::storage::Storage, MatrixError> {
+async fn connect(
+    profile: &str, role: &str, root: &str, cancel: &CancellationToken,
+) -> Result<data_mover::storage::Storage, MatrixError> {
+    if cancel.is_cancelled() {
+        return Err(MatrixError::Cancelled);
+    }
     let config = match profile {
         "local" => BackendConfig::Local(LocalBackendConfig {
             rename_context: None,
@@ -195,7 +200,7 @@ async fn connect(profile: &str, role: &str, root: &str) -> Result<data_mover::st
             ensure_dir: true,
             transfer_concurrency: None,
         }),
-        "cifs_fas2750" => return Ok(cifs::connect_cell(role, root).await?),
+        "cifs_fas2750" => return Ok(cifs::connect_cell(role, root, cancel).await?),
         "s3_standard" => BackendConfig::S3(S3BackendConfig {
             url: format!(
                 "s3://{}:{}@{}.{}:9000/{root}",
@@ -395,11 +400,11 @@ async fn main() -> Result<(), MatrixError> {
             cancel.cancel();
         });
     }
-    let source = connect(source_profile, source_role, source_root).await?;
+    let source = connect(source_profile, source_role, source_root, &cancel).await?;
     if cancel.is_cancelled() {
         return Err(MatrixError::Cancelled);
     }
-    let destination = connect(destination_profile, destination_role, destination_root).await?;
+    let destination = connect(destination_profile, destination_role, destination_root, &cancel).await?;
     if cancel.is_cancelled() {
         return Err(MatrixError::Cancelled);
     }

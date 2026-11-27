@@ -34,9 +34,11 @@ pub(super) enum CifsError {
     Receipt,
     #[error("CIFS run ownership could not be verified")]
     Ownership,
+    #[error("the exclusive CIFS run scope create has an unresolved outcome")]
+    ClaimOutcomeUnknown,
     #[error("CIFS run scope still exists after cleanup")]
     ScopeRemaining,
-    #[error("CIFS deletion cancelled")]
+    #[error("CIFS operation cancelled")]
     Cancelled,
     #[error("CIFS deletion returned inconsistent completion evidence")]
     Incomplete,
@@ -70,6 +72,7 @@ impl CifsError {
             Self::Credentials => Cause::class(FailureClass::Authentication),
             Self::InvalidScope | Self::Path(_) => Cause::class(FailureClass::InvalidInput),
             Self::Ownership | Self::ScopeRemaining => Cause::class(FailureClass::Conflict),
+            Self::ClaimOutcomeUnknown => Cause::unknown_outcome(FailureClass::Conflict),
             Self::Cancelled => Cause::class(FailureClass::Cancelled),
             _ => Cause::class(FailureClass::Internal),
         }
@@ -181,7 +184,10 @@ fn cell_path(role: Role, cell: &str) -> Result<StoragePath, CifsError> {
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 enum Phase {
-    Planned,
+    Prepared,
+    // 旧回执在发出 CREATE_NEW 前后都可能停留在 Planned。
+    #[serde(alias = "Planned")]
+    Creating,
     Created,
     Claimed,
     Ready,
@@ -203,7 +209,7 @@ impl OwnedScope {
             run_id: run_id.to_owned(),
             scope: format!("ts-matrix-{}", Uuid::new_v4().simple()),
             token: Uuid::new_v4().simple().to_string(),
-            phase: Phase::Planned,
+            phase: Phase::Prepared,
         }
         .persist(path, false)
     }
@@ -254,17 +260,37 @@ impl OwnedScope {
     async fn claim(&mut self, namespace: &dyn Namespace, receipt: &Path) -> Result<(), CifsFailure> {
         at(
             "claim_scope",
-            (self.phase == Phase::Planned).then_some(()).ok_or(CifsError::Receipt),
+            (self.phase == Phase::Prepared).then_some(()).ok_or(CifsError::Receipt),
         )?;
         let (scope, marker) = self.paths()?;
-        // 只有 CREATE_NEW 的明确成功才能授权继续。先保存该结果，再创建标记。
+        // 请求前持久化意图。只有 CREATE_NEW 的明确成功才能授权创建标记。
+        self.advance(Phase::Creating, receipt)?;
         at("create_scope", namespace.create_directory(&scope).await)?;
         self.advance(Phase::Created, receipt)?;
         at("create_marker", namespace.create_directory(&marker).await)?;
         self.advance(Phase::Claimed, receipt)
     }
 
+    fn check_claim_outcome(&self) -> Result<(), CifsFailure> {
+        if self.phase == Phase::Creating {
+            // 即使此刻查不到目录，服务端也可能稍后提交未确认的创建。
+            return at("check_ownership", Err(CifsError::ClaimOutcomeUnknown));
+        }
+        Ok(())
+    }
+
+    async fn confirm_absence(&self, storage: &Storage) -> Result<(), CifsFailure> {
+        self.check_claim_outcome()?;
+        let namespace = at("confirm_absence", storage.namespace())?;
+        let (scope, _) = self.paths()?;
+        if at("confirm_absence", directory_exists(namespace.as_ref(), &scope).await)? {
+            return at("confirm_absence", Err(CifsError::ScopeRemaining));
+        }
+        Ok(())
+    }
+
     async fn cleanup(&mut self, storage: &Storage, receipt: &Path) -> Result<(), CifsFailure> {
+        self.check_claim_outcome()?;
         let namespace = at("observe_scope", storage.namespace())?;
         let (scope, marker) = self.paths()?;
         if !at("observe_scope", directory_exists(namespace.as_ref(), &scope).await)? {
@@ -273,7 +299,9 @@ impl OwnedScope {
         // 已存在的目录必须有独占创建的确认记录。未知创建结果不能授权删除。
         at(
             "check_ownership",
-            (self.phase != Phase::Planned).then_some(()).ok_or(CifsError::Ownership),
+            (self.phase != Phase::Prepared)
+                .then_some(())
+                .ok_or(CifsError::Ownership),
         )?;
         let marker_present = at("observe_marker", directory_exists(namespace.as_ref(), &marker).await)?;
         if !marker_present && !matches!(self.phase, Phase::Created | Phase::Finalizing) {
@@ -302,10 +330,7 @@ impl OwnedScope {
             at("delete_marker", namespace.delete(&marker).await)?;
         }
         at("delete_scope", namespace.delete(&scope).await)?;
-        if at("confirm_absence", directory_exists(namespace.as_ref(), &scope).await)? {
-            return at("confirm_absence", Err(CifsError::ScopeRemaining));
-        }
-        Ok(())
+        self.confirm_absence(storage).await
     }
 }
 
@@ -368,7 +393,27 @@ pub(super) fn diagnostic_server(profile: &str, role: &str) -> Option<&'static st
     }
 }
 
-pub(super) async fn connect_cell(role: &str, cell: &str) -> Result<Storage, CifsFailure> {
+async fn prepare_cell(
+    storage: &Storage, marker: &StoragePath, cell: &StoragePath, cancel: &CancellationToken,
+) -> Result<(), CifsFailure> {
+    let namespace = at("observe_marker", storage.namespace())?;
+    tokio::select! {
+        biased;
+        () = cancel.cancelled() => return at("observe_marker", Err(CifsError::Cancelled)),
+        result = verify_marker(namespace.as_ref(), marker) => at("observe_marker", result)?,
+    }
+    // 取消后不再推进逐级创建。在途请求仍可能提交，由已确认拥有的运行范围负责清理。
+    if cancel.is_cancelled() {
+        return at("observe_marker", Err(CifsError::Cancelled));
+    }
+    tokio::select! {
+        biased;
+        () = cancel.cancelled() => at("create_cell", Err(CifsError::Cancelled)),
+        result = create_directory_all(storage, cell) => at("create_cell", result),
+    }
+}
+
+pub(super) async fn connect_cell(role: &str, cell: &str, cancel: &CancellationToken) -> Result<Storage, CifsFailure> {
     let role = at("cell_path", Role::parse(role))?;
     let result = async {
         let cell = at("cell_path", cell_path(role, cell))?;
@@ -382,15 +427,18 @@ pub(super) async fn connect_cell(role: &str, cell: &str) -> Result<Storage, Cifs
             "check_ownership",
             (owned.phase == Phase::Ready).then_some(()).ok_or(CifsError::Ownership),
         )?;
-        let storage = at("connect", role.connect(Some(owned.scope.clone())).await)?;
-        let namespace = at("observe_marker", storage.namespace())?;
         let marker = at("load_receipt", StoragePath::new(owned.marker_name()))?;
-        at("observe_marker", verify_marker(namespace.as_ref(), &marker).await)?;
-        at("create_cell", create_directory_all(&storage, &cell).await)?;
-        at(
-            "connect_cell",
-            role.connect(Some(format!("{}/{cell}", owned.scope))).await,
-        )
+        let storage = tokio::select! {
+            biased;
+            () = cancel.cancelled() => return at("connect", Err(CifsError::Cancelled)),
+            result = role.connect(Some(owned.scope.clone())) => at("connect", result)?,
+        };
+        prepare_cell(&storage, &marker, &cell, cancel).await?;
+        tokio::select! {
+            biased;
+            () = cancel.cancelled() => at("connect_cell", Err(CifsError::Cancelled)),
+            result = role.connect(Some(format!("{}/{cell}", owned.scope))) => at("connect_cell", result),
+        }
     }
     .await;
     report_failure(role, &result);
@@ -418,6 +466,7 @@ pub(super) enum Action {
     Claim,
     Verify,
     Delete,
+    Confirm,
 }
 
 impl Action {
@@ -427,6 +476,7 @@ impl Action {
             "--claim-cifs-run" => Some(Self::Claim),
             "--verify-cifs-run" => Some(Self::Verify),
             "--delete-cifs-run" => Some(Self::Delete),
+            "--confirm-cifs-run" => Some(Self::Confirm),
             _ => None,
         }
     }
@@ -442,10 +492,13 @@ impl Action {
         let receipt = at("load_receipt", receipt_path())?;
         match (&self, role) {
             (Self::Prepare, Role::Source) => return at("persist_receipt", OwnedScope::prepare(run_id, &receipt)),
-            (Self::Claim, Role::Source) | (Self::Verify, Role::Destination) | (Self::Delete, _) => (),
+            (Self::Claim, Role::Source) | (Self::Verify, Role::Destination) | (Self::Delete | Self::Confirm, _) => (),
             _ => return at("endpoint", Err(CifsError::InvalidScope)),
         }
         let mut owned = at("load_receipt", OwnedScope::from_receipt(run_id, &receipt))?;
+        if matches!(self, Self::Delete | Self::Confirm) {
+            owned.check_claim_outcome()?;
+        }
         let storage = at("connect", role.connect(None).await)?;
         match self {
             Self::Claim => {
@@ -465,6 +518,7 @@ impl Action {
                 owned.advance(Phase::Ready, &receipt)
             }
             Self::Delete => owned.cleanup(&storage, &receipt).await,
+            Self::Confirm => owned.confirm_absence(&storage).await,
             Self::Prepare => at("endpoint", Err(CifsError::InvalidScope)),
         }
     }
@@ -550,13 +604,16 @@ mod tests {
         )
     }
 
-    #[derive(Clone, Copy)]
+    #[derive(Clone)]
     enum Fault {
         CreateScopeAck,
+        CreateScopeDelayed,
         CreateMarkerAck,
         DeleteMarkerAck,
         DeleteScopeAck,
         ObserveMarkerDenied,
+        CancelOnMarker(CancellationToken),
+        CancelOnCreate(CancellationToken),
     }
 
     struct FaultyNamespace {
@@ -565,7 +622,10 @@ mod tests {
     }
 
     fn marker(path: &StoragePath) -> bool {
-        path.as_str().contains("/.owner-")
+        path.as_str()
+            .rsplit('/')
+            .next()
+            .is_some_and(|name| name.starts_with(".owner-"))
     }
 
     #[async_trait]
@@ -575,13 +635,26 @@ mod tests {
             if matches!(self.fault, Fault::ObserveMarkerDenied) && marker(path) {
                 return Err(failure(path, FailureClass::PermissionDenied));
             }
-            self.inner.stat(path, fresh).await
+            let result = self.inner.stat(path, fresh).await;
+            if let Fault::CancelOnMarker(cancel) = &self.fault {
+                assert!(marker(path));
+                cancel.cancel();
+            }
+            result
         }
 
         async fn create_directory(&self, path: &StoragePath) -> Result<(), StorageRoleFailure> {
+            if matches!(self.fault, Fault::CreateScopeDelayed) {
+                return Err(failure(path, FailureClass::Timeout));
+            }
             self.inner.create_directory(path).await?;
+            if let Fault::CancelOnCreate(cancel) = &self.fault {
+                assert_eq!(path.as_str(), MATRIX_DIR);
+                cancel.cancel();
+                return std::future::pending().await;
+            }
             if matches!(
-                (self.fault, marker(path)),
+                (&self.fault, marker(path)),
                 (Fault::CreateScopeAck, false) | (Fault::CreateMarkerAck, true)
             ) {
                 return Err(failure(path, FailureClass::Timeout));
@@ -596,7 +669,7 @@ mod tests {
         async fn delete(&self, path: &StoragePath) -> Result<(), StorageRoleFailure> {
             self.inner.delete(path).await?;
             if matches!(
-                (self.fault, path.as_str().contains('/'), marker(path)),
+                (&self.fault, path.as_str().contains('/'), marker(path)),
                 (Fault::DeleteMarkerAck, true, true) | (Fault::DeleteScopeAck, false, false)
             ) {
                 return Err(failure(path, FailureClass::Timeout));
@@ -646,16 +719,70 @@ mod tests {
             let error = owned.claim(source.namespace()?.as_ref(), &receipt).await.unwrap_err();
             assert_eq!(error.phase, "create_scope");
             let mut reload = OwnedScope::from_receipt(RUN_ID, &receipt)?;
-            assert_eq!(reload.phase, Phase::Planned);
+            assert_eq!(reload.phase, Phase::Creating);
             assert!(OwnedScope::from_receipt("release-100-1", &receipt).is_err());
             let sentinel = root.join(MATRIX_DIR).join("foreign-data");
             fs::create_dir_all(sentinel.parent().unwrap())?;
             fs::write(&sentinel, "peer data")?;
             assert!(matches!(
                 reload.cleanup(&source, &receipt).await.unwrap_err().source,
-                CifsError::Ownership
+                CifsError::ClaimOutcomeUnknown
             ));
             assert_eq!(fs::read_to_string(sentinel)?, "peer data");
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn absent_scope_cannot_clear_an_unconfirmed_create_that_commits_later() -> TestResult {
+        let (_temp, receipt, share, mut owned, source) = fixture().await?;
+        let peer = local(&share).await?;
+        owned.cleanup(&source, &receipt).await?;
+        let fault = faulty(&source, Fault::CreateScopeDelayed)?;
+        let error = owned.claim(fault.namespace()?.as_ref(), &receipt).await.unwrap_err();
+        assert_eq!(error.phase, "create_scope");
+        for endpoint in [&source, &peer] {
+            let mut receipt_state = OwnedScope::from_receipt(RUN_ID, &receipt)?;
+            assert_eq!(receipt_state.phase, Phase::Creating);
+            assert!(!share.join(&owned.scope).exists());
+            assert!(matches!(
+                receipt_state.cleanup(endpoint, &receipt).await.unwrap_err().source,
+                CifsError::ClaimOutcomeUnknown
+            ));
+            assert!(matches!(
+                receipt_state.confirm_absence(endpoint).await.unwrap_err().source,
+                CifsError::ClaimOutcomeUnknown
+            ));
+        }
+        let late_scope = share.join(&owned.scope);
+        fs::create_dir(&late_scope)?;
+        assert!(owned.cleanup(&peer, &receipt).await.is_err());
+        assert!(late_scope.exists());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cell_cancellation_stops_new_creates_and_keeps_inflight_outcomes_unknown() -> TestResult {
+        for during_create in [false, true] {
+            let (_temp, _receipt, share, _owned, storage) = fixture().await?;
+            let marker = StoragePath::new(".owner-fixture")?;
+            fs::create_dir(share.join(marker.as_str()))?;
+            let cancel = CancellationToken::new();
+            let fault = if during_create {
+                Fault::CancelOnCreate(cancel.clone())
+            } else {
+                Fault::CancelOnMarker(cancel.clone())
+            };
+            let storage = faulty(&storage, fault)?;
+            let cell = cell_path(Role::Source, "cifs_fas2750__local")?;
+            let error = prepare_cell(&storage, &marker, &cell, &cancel).await.unwrap_err();
+            assert!(matches!(error.source, CifsError::Cancelled));
+            assert_eq!(
+                error.phase,
+                if during_create { "create_cell" } else { "observe_marker" }
+            );
+            assert_eq!(share.join(MATRIX_DIR).exists(), during_create);
+            assert!(!share.join(cell.as_str()).exists());
         }
         Ok(())
     }
@@ -694,8 +821,15 @@ mod tests {
             assert_eq!(error.phase, phase);
             let mut reload = OwnedScope::from_receipt(RUN_ID, &receipt)?;
             assert_eq!(reload.phase, Phase::Finalizing);
+            if phase == "delete_marker" {
+                assert!(matches!(
+                    reload.confirm_absence(&destination).await.unwrap_err().source,
+                    CifsError::ScopeRemaining
+                ));
+                assert!(share.join(&owned.scope).exists());
+            }
             reload.cleanup(&destination, &receipt).await?;
-            reload.cleanup(&source, &receipt).await?;
+            reload.confirm_absence(&source).await?;
             assert!(!share.join(&owned.scope).exists());
             assert_eq!(fs::read_to_string(sentinel)?, "peer data");
             assert!(receipt.exists());

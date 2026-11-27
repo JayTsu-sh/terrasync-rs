@@ -387,7 +387,7 @@ runtime.
 
 The full `TS-SINGLE` matrix reads the dedicated CIFS identity from
 `LAB_CIFS_NIGHTLY_USERNAME` and `LAB_CIFS_NIGHTLY_PASSWORD`. Nightly and Release
-validation bind these Actions secrets only for the matrix step. The DXN profile
+validation bind these Actions secrets to the matrix and its recovery step. The DXN profile
 also requires `LAB_DXN_S3_ACCESS_KEY` and `LAB_DXN_S3_SECRET_KEY`.
 
 `run-e2e.sh` retains the directed 4-by-4 compatibility suite across Local,
@@ -445,8 +445,14 @@ matrix covers 64 ordered pairs of Local, NFSv3, NFSv4.0, NFSv4.1, FAS2750 CIFS,
 standard S3, DXN S3, and HDFS. Each cell preloads its source, uses the
 protocol-neutral `Storage + run_local_transfer` path, verifies the copy with
 BLAKE3 and compares the fixture and destination readback SHA-256 digests.
-The validator requires all 64 cells and confirmed HDFS, CIFS and DXN cleanup.
+The validator requires all 64 cells and checks that the latest operation
+attempts confirm CIFS setup and HDFS, CIFS and DXN cleanup.
 `TS_SINGLE_DEFER_CIFS=true` runs the 49 non-CIFS pairs as a diagnostic.
+
+Release validation defaults to the workflow dispatch commit. A supplied
+branch, commit or tag must include `run-and-reconcile-single-process-matrix.sh`
+with `TS-SINGLE lifecycle contract v1`. The workflow rejects older refs before
+starting lab checks or fixture setup.
 
 The producer requires a clean checkout, including untracked files. It captures
 HEAD and the resolved data-mover commit from the lockfile before building, then
@@ -463,8 +469,9 @@ lock. Path-based ownership checks depend on this exclusive-writer property.
 
 Before the first CIFS mutation, the driver durably records a receipt with the
 run ID, a random share-relative scope and a private marker token. It records
-the acknowledged exclusive scope create before creating the marker, then
-records the destination's marker verification before allowing any cell write.
+the create intent before sending the request and the acknowledged exclusive
+scope create before creating the marker. Cell writes require a record of the
+destination's marker verification.
 The driver derives each CIFS path from that receipt, the cell ID and the role.
 
 Reconciliation checks each endpoint with a fresh connection. It recursively
@@ -472,32 +479,39 @@ removes only the matrix data subtree, after verifying the receipt and its
 marker, then durably records that the subtree is gone before deleting the
 marker. If the marker deletion reply is lost, this state lets the other
 endpoint finish removing the scope, and fresh checks confirm absence on both
-endpoints. An unconfirmed scope create, collision, denied observation or
-unexpected marker absence leaves the existing scope for inspection. A receipt
-that records finalization cannot authorize recursive deletion of data that
-appears afterward.
+endpoints. An unconfirmed scope create leaves cleanup failed and retains the
+receipt and driver even when both endpoints currently show no directory. The
+pinned CIFS namespace API cannot establish whether the create may still commit
+or prove that a directory appearing later belongs to the run. A collision,
+denied observation or unexpected marker absence leaves the scope for inspection.
+A receipt that records finalization cannot authorize recursive deletion of data
+that appears afterward.
 
 The receipt, exact driver and incrementally written evidence live in the
 self-hosted runner account's persistent
 `~/.local/state/terrasync-single-matrix/<run-id>/` directory.
 `TS_SINGLE_STATE_ROOT` overrides the parent directory for manual runs. The
-run's temporary payloads and Kerberos caches are separate. Both workflows
-reconcile in a bounded `always()` step and upload the `evidence/` subdirectory
-on failure and cancellation. It includes operation attempts, interrupted or
-unknown write outcomes, and allowlisted role, phase and cause fields. The
-private receipt and raw backend output stay on the runner. The pinned
+run's temporary payloads and Kerberos caches are separate. Both workflows hold
+the shared lab lock from production through reconciliation. A bounded
+`always()` step tries to recover unfinished reconciliation. The workflows upload
+the `evidence/` subdirectory on failure and cancellation. It includes operation
+attempts, interrupted or unknown write outcomes, and allowlisted role, phase and
+cause fields. The private receipt and raw backend output stay on the runner. The pinned
 data-mover CIFS connector formats SMB connect errors as text. The report
 identifies known SMB statuses and transport errors with `adapter_diagnostic`
 provenance and leaves other connect causes unclassified.
 
 Claim and peer verification each have a 20-second deadline. Cell operations
-have 120 seconds, with four seconds after TERM before forced exit. CIFS cleanup
-allows 30 seconds per endpoint. When one endpoint confirms absence, the
-reconciler makes one fresh check through the other endpoint if its first check
-was interrupted by a transport failure or timeout. An interrupted matrix
-remains cancelled even if reconciliation succeeds. If Actions force-stops the
-job or the runner goes offline, use the same runner account, run ID, credentials
-and endpoints to rerun reconciliation under the lab lock.
+have 120 seconds, with four seconds after TERM before forced exit. CIFS cell
+preparation checks cancellation before directory creation and stops waiting
+when cancelled. The pinned API cannot withdraw an already submitted create,
+so its outcome stays unknown and the owned scope remains subject to
+reconciliation. CIFS cleanup allows 30 seconds per endpoint. When one endpoint
+confirms absence, the reconciler makes one fresh read-only check through the
+other endpoint after a transport failure, timeout or unknown mutation outcome.
+An interrupted matrix remains cancelled even if reconciliation succeeds. If
+Actions force-stops the job or the runner goes offline, use the same runner
+account, run ID, credentials and endpoints to rerun reconciliation under the lab lock.
 
 ```sh
 flock --no-fork --wait 60 /tmp/terrasync-lab-tests.lock \

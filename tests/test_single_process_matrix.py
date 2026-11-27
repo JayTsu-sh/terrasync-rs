@@ -7,6 +7,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import textwrap
 import time
 import uuid
 import unittest
@@ -14,6 +15,7 @@ import unittest
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 VALIDATOR_PATH = ROOT / "tests" / "lab" / "validate-single-process-matrix.py"
+LIFECYCLE_PATH = ROOT / "tests" / "lab" / "run-and-reconcile-single-process-matrix.sh"
 
 
 def load_validator():
@@ -62,6 +64,20 @@ class SingleProcessMatrixTest(unittest.TestCase):
             },
             "mode": "terrasync_single_process",
             "cleanup": {"hdfs": "passed", "s3_dxn": "passed", "cifs": "passed"},
+            "operations": [
+                {"operation": name, "status": "passed", "exit_code": 0, "write_outcome": outcome}
+                for name, outcome in (
+                    ("hdfs.delete", "acknowledged"),
+                    ("dxn.abort", "acknowledged"),
+                    ("dxn.delete", "acknowledged"),
+                    ("dxn.verify", "not_indicated"),
+                    ("cifs.prepare.source", "not_indicated"),
+                    ("cifs.claim.source", "acknowledged"),
+                    ("cifs.verify.destination", "not_indicated"),
+                    ("cifs.delete.source", "acknowledged"),
+                    ("cifs.delete.destination", "acknowledged"),
+                )
+            ],
             "cells": cells,
         }
 
@@ -83,6 +99,30 @@ class SingleProcessMatrixTest(unittest.TestCase):
 
     def test_complete_64_cell_report_passes(self):
         self.validator.validate_report(self.report())
+
+    def test_latest_operation_attempt_must_support_the_cleanup_summary(self):
+        for operation in ("cifs.delete.source", "hdfs.delete", "dxn.verify", "cifs.verify.destination"):
+            with self.subTest(operation=operation):
+                report = self.report()
+                success = next(item for item in report["operations"] if item["operation"] == operation)
+                failed = {**success, "status": "failed", "exit_code": 1, "write_outcome": "unknown"}
+                report["operations"].append(failed)
+                with self.assertRaisesRegex(ValueError, operation):
+                    self.validator.validate_report(report)
+                if operation == "cifs.delete.source":
+                    success = {**success, "write_outcome": "not_indicated"}
+                report["operations"].append(dict(success))
+                self.validator.validate_report(report)
+
+    def test_cleanup_summary_requires_operation_evidence_with_a_known_outcome(self):
+        for replacement in (None, {"write_outcome": "unknown"}, {"exit_code": 1}, {"status": "interrupted"}):
+            with self.subTest(replacement=replacement):
+                report = self.report()
+                success = report["operations"].pop()
+                if replacement is not None:
+                    report["operations"].append({**success, **replacement})
+                with self.assertRaisesRegex(ValueError, "cifs.delete.destination"):
+                    self.validator.validate_report(report)
 
     def test_failed_cleanup_rejects_an_otherwise_passing_matrix(self):
         report = self.report()
@@ -144,6 +184,8 @@ class SingleProcessMatrixTest(unittest.TestCase):
         report["profiles"] = active_profiles
         report["deferred_profiles"] = ["cifs_fas2750"]
         report["cleanup"]["cifs"] = "not_attempted"
+        cifs_operations = [item for item in report["operations"] if item["operation"].startswith("cifs.")]
+        report["operations"] = [item for item in report["operations"] if item not in cifs_operations]
         report["cifs"] = {
             "scope": None,
             "run_id": None,
@@ -156,6 +198,9 @@ class SingleProcessMatrixTest(unittest.TestCase):
             if cell["source_profile"] in active_profiles and cell["destination_profile"] in active_profiles
         ]
         self.validator.validate_report(report)
+        report["operations"].append(cifs_operations[0])
+        with self.assertRaisesRegex(ValueError, "deferred CIFS"):
+            self.validator.validate_report(report)
 
     def test_subset_without_explicit_cifs_deferral_is_rejected(self):
         report = self.report()
@@ -171,6 +216,7 @@ class SingleProcessMatrixTest(unittest.TestCase):
 
     def test_validator_cli_reports_explicit_cifs_deferral(self):
         report = self.report()
+        report["operations"] = [item for item in report["operations"] if not item["operation"].startswith("cifs.")]
         report["cleanup"]["cifs"] = "not_attempted"
         report["cifs"] = {
             "scope": None,
@@ -208,8 +254,7 @@ class SingleProcessMatrixTest(unittest.TestCase):
         workflow = (ROOT / ".github" / "workflows" / "nightly.yml").read_text(encoding="utf-8")
         release = (ROOT / ".github" / "workflows" / "release-validation.yml").read_text(encoding="utf-8")
         self.assertIn("profiles=(local nfs3 nfs40 nfs41 cifs_fas2750 s3_standard s3_dxn hdfs)", runner)
-        self.assertIn("run-single-process-matrix.sh", workflow)
-        self.assertIn("run-single-process-matrix.sh", release)
+        self.assertIn("run-single-process-matrix.sh", LIFECYCLE_PATH.read_text())
         self.assertNotIn("continue-on-error", workflow)
         self.assertNotIn("run_terrasync sync", runner)
         self.assertNotIn("run_terrasync integrity-check", runner)
@@ -232,7 +277,9 @@ class SingleProcessMatrixTest(unittest.TestCase):
             finalize = workflow_text.index("--report-only", reconcile)
             upload = workflow_text.index("Upload TS-SINGLE matrix evidence", finalize)
             self.assertIn("if: ${{ always() }}", workflow_text[:matrix])
+            self.assertIn(f'/tmp/terrasync-lab-tests.lock tests/lab/{LIFECYCLE_PATH.name}', workflow_text[matrix:reconcile])
             self.assertIn("always()", workflow_text[reconcile:finalize])
+            self.assertIn("steps.single_matrix.outputs.reconciled != 'true'", workflow_text[reconcile:finalize])
             self.assertIn("always()", workflow_text[upload:])
             self.assertIn("~/.local/state/terrasync-single-matrix/", workflow_text[upload:])
         for secret in ("LAB_CIFS_NIGHTLY_USERNAME", "LAB_CIFS_NIGHTLY_PASSWORD"):
@@ -240,6 +287,61 @@ class SingleProcessMatrixTest(unittest.TestCase):
             self.assertIn(f"${{{{ secrets.{secret} }}}}", release)
         self.assertTrue(VALIDATOR_PATH.stat().st_mode & 0o111)
         self.assertTrue((ROOT / "tests" / "lab" / "run-single-process-matrix.sh").stat().st_mode & 0o111)
+
+    def test_release_ref_preflight_rejects_legacy_producer_before_lab_setup(self):
+        release = (ROOT / ".github" / "workflows" / "release-validation.yml").read_text()
+        start = release.index("      - name: Verify release ref supports the matrix lifecycle")
+        end = release.index("\n      - ", start + 1)
+        self.assertLess(end, release.index("tests/lab/health-check.sh"))
+        self.assertIn("ref: ${{ inputs.ref || github.sha }}", release[:start])
+        command = textwrap.dedent(release[start:end].partition("        run: |\n")[2])
+        with tempfile.TemporaryDirectory() as directory:
+            lab = pathlib.Path(directory) / "tests" / "lab"
+            lab.mkdir(parents=True)
+            (lab / "run-single-process-matrix.sh").touch(mode=0o700)
+            for stage in ("legacy", "missing reconciliation", "compatible"):
+                if stage == "missing reconciliation":
+                    shutil.copy2(LIFECYCLE_PATH, lab)
+                if stage == "compatible":
+                    (lab / "reconcile-single-process-matrix.sh").touch(mode=0o700)
+                    (lab / VALIDATOR_PATH.name).touch(mode=0o700)
+                result = subprocess.run(["bash", "-ec", command], cwd=directory, capture_output=True, text=True)
+                self.assertEqual(result.returncode, 0 if stage == "compatible" else 2, result.stdout + result.stderr)
+                if stage != "compatible":
+                    self.assertIn("The selected release ref does not support", result.stdout)
+
+    @unittest.skipUnless(sys.platform.startswith("linux"), "lab locking uses Linux flock")
+    def test_producer_and_reconciler_share_the_lock_and_preserve_producer_status(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            lifecycle = pathlib.Path(shutil.copy2(LIFECYCLE_PATH, root))
+            producer = root / "run-single-process-matrix.sh"
+            reconcile = root / "reconcile-single-process-matrix.sh"
+            producer.write_text('#!/bin/bash\nexit "$PRODUCER_STATUS"\n')
+            reconcile.write_text(textwrap.dedent('''\
+                #!/bin/bash
+                if flock --nonblock "$LOCK_FILE" true; then exit 10; fi
+                printf '%s\\n' "$*" >> "$EVENTS"
+            '''))
+            for script in (producer, reconcile):
+                script.chmod(0o700)
+            lock, events, output = (root / name for name in ("lock", "events", "output"))
+            for code, outcome in ((0, "success"), (7, "failure")):
+                env = {
+                    **os.environ,
+                    "LOCK_FILE": str(lock),
+                    "EVENTS": str(events),
+                    "GITHUB_OUTPUT": str(output),
+                    "PRODUCER_STATUS": str(code),
+                }
+                result = subprocess.run(
+                    ["flock", "--no-fork", str(lock), str(lifecycle), "release-fixture", "--direct"],
+                    env=env,
+                    timeout=10,
+                )
+                self.assertEqual(result.returncode, code)
+                self.assertEqual(events.read_text().splitlines()[-1], f"release-fixture --direct {outcome}")
+                self.assertEqual(output.read_text().splitlines()[-2:], [f"producer_outcome={outcome}", "reconciled=true"])
 
     def test_hdfs_run_root_preserves_nameservice_case(self):
         command = (
@@ -304,10 +406,11 @@ def record(event):
     with (root / "events").open("a") as handle:
         handle.write(json.dumps(event) + "\n")
 
-def diagnostic(phase, role, cause_class, write_outcome="not_indicated"):
+def diagnostic(phase, role, cause_class, write_outcome="not_indicated", cause=None):
     print("MATRIX_DIAGNOSTIC=" + json.dumps({
         "phase": phase, "role": role, "endpoint": "10.128.61.200" if role == "source" else "10.128.61.201",
-        "class": cause_class, "operation": "Namespace", "provenance": "typed", "cause": None, "write_outcome": write_outcome,
+        "class": cause_class, "operation": "Namespace", "provenance": "adapter_diagnostic" if cause else "typed",
+        "cause": cause, "write_outcome": write_outcome,
     }), file=sys.stderr)
     print("MATRIX_DIAGNOSTIC=" + json.dumps({"phase": "redact-this-password"}), file=sys.stderr)
     print("redact-this-password", file=sys.stderr)
@@ -324,13 +427,18 @@ elif len(args) == 3:
     record(args)
     if action == "--prepare-cifs-run":
         assert role == "source"
-        save({"run_id": run_id, "scope": "mock-scope", "phase": "Planned", "token": "b" * 32})
+        save({"run_id": run_id, "scope": "mock-scope", "phase": "Prepared", "token": "b" * 32})
         sys.exit(0)
     state = json.loads(receipt.read_text())
     scope = root / "share" / state["scope"]
     marker = scope / ".owner"
     if action == "--claim-cifs-run":
-        assert role == "source" and state["phase"] == "Planned"
+        assert role == "source" and state["phase"] == "Prepared"
+        state["phase"] = "Creating"
+        save(state)
+        if mode == "kill_scope_create":
+            (root / "ready").touch()
+            signal.pause()
         scope.mkdir(parents=True)
         if mode == "collision":
             (scope / "peer-data").write_text("foreign")
@@ -349,13 +457,14 @@ elif len(args) == 3:
             diagnostic("observe_marker", role, "PermissionDenied")
         state["phase"] = "Ready"
         save(state)
-    elif action == "--delete-cifs-run":
+    elif action in ("--delete-cifs-run", "--confirm-cifs-run"):
         if mode == "cleanup_failure" and role == "source":
             diagnostic("connect", role, "Connectivity")
+        if state["phase"] == "Creating":
+            diagnostic("check_ownership", role, "Conflict", "unknown", "OutcomeUnknown")
         if not scope.is_dir():
             sys.exit(0)
-        if state["phase"] == "Planned":
-            diagnostic("check_ownership", role, "Conflict")
+        assert action == "--delete-cifs-run"
         if marker.exists():
             assert state["phase"] in ("Created", "Claimed", "Ready", "Finalizing")
             state["phase"] = "Finalizing"
@@ -365,7 +474,7 @@ elif len(args) == 3:
                 (root / "ready").touch()
                 signal.pause()
             if mode == "lost_delete_ack" and role == "source":
-                diagnostic("delete_marker", role, "Connectivity", "unknown")
+                diagnostic("delete_marker", role, "Protocol", "unknown", "OutcomeUnknown")
         assert state["phase"] == "Finalizing"
         scope.rmdir()
     else:
@@ -444,15 +553,19 @@ class MatrixRunnerTest(unittest.TestCase):
         path.write_text(f"#!{sys.executable}\n" + program)
         path.chmod(0o700)
 
-    def start(self, mode, *, reconcile=False, workflow_outcome="", reconcile_mode="--direct"):
+    def start(self, mode, *, reconcile=False, workflow_outcome="", reconcile_mode="--direct", lifecycle=False):
         script = "reconcile-single-process-matrix.sh" if reconcile else "run-single-process-matrix.sh"
         arguments = [str(ROOT / "tests" / "lab" / script), self.run_id]
+        env = {**self.env, "MOCK_MODE": mode}
         if reconcile:
             arguments += [reconcile_mode, workflow_outcome]
+        if lifecycle:
+            arguments = ["flock", "--no-fork", str(self.root / "lab.lock"), str(LIFECYCLE_PATH), self.run_id]
+            env["GITHUB_OUTPUT"] = str(self.root / "workflow-output")
         return subprocess.Popen(
             arguments,
             cwd=ROOT,
-            env={**self.env, "MOCK_MODE": mode},
+            env=env,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
@@ -484,9 +597,11 @@ class MatrixRunnerTest(unittest.TestCase):
         return process, report, events, stdout + reconcile_stdout, stderr + reconcile_stderr
 
     def test_64_cells_use_owned_paths_derived_from_cell_and_role(self):
-        process, report, events, stdout, stderr = self.run_mock("")
+        with self.start("", lifecycle=True) as process:
+            report, events, stdout, stderr = self.finish(process)
         self.assertEqual(process.returncode, 0, stderr)
         self.assertIn("64 independent cells", stdout)
+        self.assertEqual((self.root / "workflow-output").read_text(), "producer_outcome=success\nreconciled=true\n")
         load_validator().validate_report(report)
         self.assertEqual(report["cifs"]["run_id"], self.run_id)
         self.assertEqual(events[:3], [
@@ -581,12 +696,15 @@ class MatrixRunnerTest(unittest.TestCase):
     def test_peer_cleanup_rechecks_source_after_lost_delete_ack(self):
         self.run_mock("inaccessible", reconcile=False)
         with self.start("lost_delete_ack", reconcile=True, workflow_outcome="failure") as process:
-            report, _, _, stderr = self.finish(process)
+            report, events, _, stderr = self.finish(process)
         self.assertEqual(process.returncode, 0, stderr)
         self.assertEqual(report["cleanup"]["cifs"], "passed")
         source = [op for op in report["operations"] if op["operation"] == "cifs.delete.source"]
         self.assertEqual([op["status"] for op in source], ["failed", "passed"])
         self.assertEqual(source[0]["write_outcome"], "unknown")
+        self.assertEqual(source[0]["cause"], "Protocol")
+        self.assertEqual(source[0]["diagnostics"][0]["cause"], "OutcomeUnknown")
+        self.assertEqual(events[-1], ["--confirm-cifs-run", self.run_id, "source"])
 
     def test_failed_transfer_carries_phase_and_unknown_write_to_evidence(self):
         process, report, _, _, _ = self.run_mock("transfer_failure")
@@ -616,14 +734,17 @@ class MatrixRunnerTest(unittest.TestCase):
                 os.killpg(process.pid, signal.SIGKILL)
 
     def test_graceful_cancel_reaps_active_transfer_before_reconciliation(self):
-        with self.start("cancel") as producer:
+        with self.start("cancel", lifecycle=True) as producer:
             self.stop_when_ready(producer, signal.SIGTERM)
         self.assertEqual(producer.returncode, 143)
+        self.assertEqual((self.root / "workflow-output").read_text(), "producer_outcome=cancelled\n")
         with self.start("", reconcile=True, workflow_outcome="cancelled") as process:
             report, events, _, stderr = self.finish(process)
         self.assertEqual(process.returncode, 0, stderr)
         self.assertEqual(report["status"], "cancelled")
         self.assertEqual(report["cleanup"]["cifs"], "passed")
+        transfer = next(op for op in report["operations"] if op["operation"] == "local__cifs_fas2750.copy")
+        self.assertEqual((transfer["status"], transfer["cause"], transfer["write_outcome"]), ("failed", "Cancelled", "unknown"))
         self.assertLess(events.index(["transfer-stopped"]), next(i for i, event in enumerate(events) if event[0] == "--delete-cifs-run"))
 
     def test_kill_during_claim_recovers_from_durable_receipt_after_runtime_loss(self):
@@ -641,6 +762,24 @@ class MatrixRunnerTest(unittest.TestCase):
         self.assertFalse((self.root / "share/mock-scope").exists())
         claim = next(op for op in report["operations"] if op["operation"] == "cifs.claim.source")
         self.assertEqual(claim["write_outcome"], "unknown")
+
+    def test_unconfirmed_scope_create_keeps_driver_and_can_never_pass_by_absence(self):
+        with self.start("kill_scope_create") as producer:
+            self.stop_when_ready(producer, signal.SIGKILL)
+        scope = self.root / "share" / "mock-scope"
+        self.assertFalse(scope.exists())
+        for late_commit in (False, True):
+            if late_commit:
+                scope.mkdir(parents=True)
+            with self.start("", reconcile=True, workflow_outcome="cancelled") as process:
+                report, _, _, stderr = self.finish(process)
+            self.assertNotEqual(process.returncode, 0, stderr)
+            self.assertEqual(report["cifs"]["cleanup"], {"source": "failed", "destination": "failed"})
+            self.assertTrue(self.receipt.exists())
+            self.assertTrue((self.state / "driver").exists())
+            self.assertEqual(scope.exists(), late_commit)
+            deletes = [op for op in report["operations"] if op["operation"].startswith("cifs.delete.")]
+            self.assertTrue(deletes and all(op["write_outcome"] == "unknown" for op in deletes))
 
     def test_report_only_finalizes_interrupted_operations_without_remote_calls(self):
         with self.start("kill_claim") as producer:

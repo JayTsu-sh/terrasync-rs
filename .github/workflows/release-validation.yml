@@ -4,9 +4,8 @@ on:
   workflow_dispatch:
     inputs:
       ref:
-        description: Commit or tag to validate
-        required: true
-        default: main
+        description: Branch, commit, or tag with TS-SINGLE lifecycle contract v1 (defaults to the dispatch commit)
+        required: false
 
 permissions:
   contents: read
@@ -33,13 +32,34 @@ jobs:
     steps:
       - uses: actions/checkout@v5
         with:
-          ref: ${{ inputs.ref }}
+          ref: ${{ inputs.ref || github.sha }}
+          fetch-depth: 0
+      - name: Verify release ref belongs to main
+        shell: bash
+        run: |
+          git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main
+          if ! git merge-base --is-ancestor HEAD refs/remotes/origin/main; then
+            echo '::error::Release validation requires a commit reachable from the main branch.'
+            exit 2
+          fi
+      - name: Verify release ref supports the matrix lifecycle
+        shell: bash
+        run: |
+          lifecycle=tests/lab/run-and-reconcile-single-process-matrix.sh
+          if [[ ! -x "$lifecycle" || ! -x tests/lab/run-single-process-matrix.sh ||
+                ! -x tests/lab/reconcile-single-process-matrix.sh || ! -x tests/lab/validate-single-process-matrix.py ]] ||
+             ! grep -Fxq '# TS-SINGLE lifecycle contract v1' "$lifecycle"; then
+            echo '::error::The selected release ref does not support TS-SINGLE lifecycle contract v1. Select a ref containing the current matrix producer and reconciler.'
+            exit 2
+          fi
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
           cache-targets: false
       - run: tests/lab/health-check.sh
-      - run: tests/lab/prepare-run.sh "$RUN_ID"
+      - name: Prepare lab fixtures
+        id: prepare
+        run: tests/lab/prepare-run.sh "$RUN_ID"
       - name: Start from a clean release build
         run: cargo clean
       - run: flock --wait 10800 /tmp/terrasync-lab-tests.lock cargo test --workspace --all-features --exclude terrasync-rs --locked --no-fail-fast
@@ -54,13 +74,13 @@ jobs:
           TS_SINGLE_DEFER_CIFS: "false"
           LAB_CIFS_NIGHTLY_USERNAME: ${{ secrets.LAB_CIFS_NIGHTLY_USERNAME }}
           LAB_CIFS_NIGHTLY_PASSWORD: ${{ secrets.LAB_CIFS_NIGHTLY_PASSWORD }}
-        run: exec flock --no-fork --wait 10800 /tmp/terrasync-lab-tests.lock tests/lab/run-single-process-matrix.sh "$RUN_ID"
-      - name: Reconcile TS-SINGLE matrix
+        run: exec flock --no-fork --wait 10800 /tmp/terrasync-lab-tests.lock tests/lab/run-and-reconcile-single-process-matrix.sh "$RUN_ID" --direct
+      - name: Recover interrupted TS-SINGLE reconciliation
         id: reconcile_matrix
-        if: ${{ always() && steps.single_matrix.outcome != 'skipped' && steps.single_matrix.outcome != '' }}
+        if: ${{ always() && steps.single_matrix.outputs.reconciled != 'true' && steps.single_matrix.outcome != 'skipped' && steps.single_matrix.outcome != '' }}
         timeout-minutes: 9
         env:
-          MATRIX_OUTCOME: ${{ job.status == 'cancelled' && 'cancelled' || steps.single_matrix.outcome }}
+          MATRIX_OUTCOME: ${{ job.status == 'cancelled' && 'cancelled' || steps.single_matrix.outputs.producer_outcome || steps.single_matrix.outcome }}
           LAB_CIFS_NIGHTLY_USERNAME: ${{ secrets.LAB_CIFS_NIGHTLY_USERNAME }}
           LAB_CIFS_NIGHTLY_PASSWORD: ${{ secrets.LAB_CIFS_NIGHTLY_PASSWORD }}
         run: exec flock --no-fork --wait 60 /tmp/terrasync-lab-tests.lock tests/lab/reconcile-single-process-matrix.sh "$RUN_ID" --direct "$MATRIX_OUTCOME"
@@ -68,7 +88,7 @@ jobs:
         if: ${{ always() && steps.reconcile_matrix.outcome != 'success' && steps.reconcile_matrix.outcome != 'skipped' && steps.reconcile_matrix.outcome != '' }}
         timeout-minutes: 1
         env:
-          MATRIX_OUTCOME: ${{ job.status == 'cancelled' && 'cancelled' || steps.single_matrix.outcome }}
+          MATRIX_OUTCOME: ${{ job.status == 'cancelled' && 'cancelled' || steps.single_matrix.outputs.producer_outcome || steps.single_matrix.outcome }}
         run: tests/lab/reconcile-single-process-matrix.sh "$RUN_ID" --report-only "$MATRIX_OUTCOME"
       - name: Upload TS-SINGLE matrix evidence
         if: ${{ always() && steps.single_matrix.outcome != 'skipped' && steps.single_matrix.outcome != '' }}
@@ -93,5 +113,5 @@ jobs:
             release-sha256.txt
             build-manifest.txt
       - name: Cleanup
-        if: always()
+        if: ${{ always() && steps.prepare.outcome != 'skipped' && steps.prepare.outcome != '' }}
         run: tests/lab/cleanup-run.sh "$RUN_ID"

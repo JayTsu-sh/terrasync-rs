@@ -69,7 +69,7 @@ if [[ -f "$TS_SINGLE_CIFS_RECEIPT" ]]; then
   for role in "${cifs_failed[@]}"; do
     # 对端确认目录消失后，用新连接重查此前响应不明的端点。
     if [[ "$cifs_confirmed" == true ]] && evidence retryable "cifs.delete.$role"; then
-      cifs_action delete "$role" 30s || status=1
+      cifs_action confirm "$role" 30s || status=1
     else
       status=1
     fi

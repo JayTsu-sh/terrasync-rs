@@ -34,6 +34,46 @@ CELL_FIELDS = (
 )
 
 
+def validate_operation_evidence(operations, deferred):
+    if not isinstance(operations, list):
+        raise ValueError("operation evidence must be an array")
+    latest = {}
+    # The producer lists attempts oldest first within each operation.
+    for attempt in operations:
+        if not isinstance(attempt, dict) or not isinstance(attempt.get("operation"), str):
+            raise ValueError("each operation attempt must identify its operation")
+        name = attempt["operation"]
+        if deferred and name.startswith("cifs."):
+            raise ValueError("deferred CIFS must have no operation attempts")
+        latest[name] = attempt
+
+    required = {
+        "hdfs.delete": {"acknowledged"},
+        "dxn.abort": {"acknowledged"},
+        "dxn.delete": {"acknowledged"},
+        "dxn.verify": {"not_indicated"},
+    }
+    if not deferred:
+        required.update({
+            "cifs.prepare.source": {"not_indicated"},
+            "cifs.claim.source": {"acknowledged"},
+            "cifs.verify.destination": {"not_indicated"},
+            # A successful read-only recheck can confirm the same absence as a delete.
+            "cifs.delete.source": {"acknowledged", "not_indicated"},
+            "cifs.delete.destination": {"acknowledged", "not_indicated"},
+        })
+    for name, outcomes in required.items():
+        attempt = latest.get(name, {})
+        if (
+            attempt.get("status") != "passed"
+            or type(attempt.get("exit_code")) is not int
+            or attempt["exit_code"] != 0
+            or not isinstance(attempt.get("write_outcome"), str)
+            or attempt["write_outcome"] not in outcomes
+        ):
+            raise ValueError(f"latest operation attempt for {name} must confirm success")
+
+
 def validate_report(report):
     if report.get("schema_version") != 2:
         raise ValueError("schema_version must be 2")
@@ -86,6 +126,8 @@ def validate_report(report):
             raise ValueError("CIFS scope must identify this matrix run")
         if cifs.get("setup") != "passed" or cifs.get("cleanup") != {"source": "passed", "destination": "passed"}:
             raise ValueError("CIFS ownership verification and cleanup on both endpoints must pass")
+
+    validate_operation_evidence(report.get("operations"), deferred)
 
     cells = report.get("cells")
     expected_count = len(profiles) ** 2

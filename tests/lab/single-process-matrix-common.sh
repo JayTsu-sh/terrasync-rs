@@ -39,8 +39,9 @@ record_operation() {
 }
 
 cifs_action() {
-  local action="$1" role="$2" deadline="$3" mutates=false
+  local action="$1" role="$2" deadline="$3" mutates=false operation="$1"
   case "$action" in claim|delete) mutates=true ;; esac
-  record_operation "cifs.$action.$role" "$mutates" "$deadline" "cifs_fas2750:$role" -- \
+  if [[ "$action" == confirm ]]; then operation=delete; fi
+  record_operation "cifs.$operation.$role" "$mutates" "$deadline" "cifs_fas2750:$role" -- \
     "$binary" "--$action-cifs-run" "$run_id" "$role"
 }
