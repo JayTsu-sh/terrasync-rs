@@ -30,10 +30,12 @@ hdfs_root="$(hdfs_run_root "$run_id")"
 hdfs_source="$hdfs_root/source"
 hdfs_single_destination="$hdfs_root/single-destination"
 hdfs_remote_destination="$hdfs_root/remote-destination"
-database_name="$(clickhouse_database_name "${run_id}_hdfs")"
+database_nonce="$(python3 -c 'import secrets; print(secrets.token_hex(16))')"
+database_name="$(clickhouse_database_name "${run_id}_hdfs_${database_nonce}")"
 receiver_pid=""
 hdfs_touched=false
 database_created=false
+database_create_confirmed=false
 
 run_with_config() {
   local config="$1"
@@ -46,7 +48,7 @@ shielded_cleanup() (
   "$@"
 )
 cleanup_resources() {
-  local status=0 cleanup_cancelled=false
+  local status=0 cleanup_cancelled=false attempts attempt
   trap 'cleanup_cancelled=true' INT TERM HUP
   if [[ -n "$receiver_pid" ]]; then
     kill "$receiver_pid" 2>/dev/null || true
@@ -62,10 +64,18 @@ cleanup_resources() {
     hdfs_touched=false
   fi
   if [[ "$database_created" == true ]]; then
-    if ! shielded_cleanup clickhouse_query "DROP DATABASE IF EXISTS $database_name" >/dev/null 2>&1; then
-      echo 'HDFS certification database cleanup failed' >&2
-      status=1
-    fi
+    # A timed-out CREATE may still be executing. For an uncertain response,
+    # retry the idempotent drop over a short reconciliation window. The random
+    # database name is unique to this run and is never shared with other jobs.
+    attempts=1
+    [[ "$database_create_confirmed" == true ]] || attempts=3
+    for ((attempt=1; attempt<=attempts; attempt++)); do
+      if ! shielded_cleanup clickhouse_query "DROP DATABASE IF EXISTS $database_name" >/dev/null 2>&1; then
+        echo 'HDFS certification database cleanup failed' >&2
+        status=1
+      fi
+      (( attempt == attempts )) || shielded_cleanup sleep 1
+    done
     database_created=false
   fi
   trap - INT TERM HUP
@@ -75,7 +85,11 @@ cleanup_resources() {
 cleanup() {
   local status="$?"
   trap - EXIT
-  cleanup_resources || status=1
+  local cleanup_status=0
+  cleanup_resources || cleanup_status=$?
+  if (( cleanup_status == 143 )); then status=143
+  elif (( cleanup_status != 0 )); then status=1
+  fi
   rm -f "$single_config" "$sender_config" "$receiver_config" "$missing_config" "$invalid_config" \
     "$source_keytab" "$destination_keytab" "$runtime_root/source.ccache" "$runtime_root/destination.ccache"
   rm -rf -- "$lab_root"
@@ -87,7 +101,8 @@ mkdir -p "$runtime_root" "$fixture_root" "$results_root"
 install -m 0600 "$LAB_HDFS_KEYTAB" "$source_keytab"
 install -m 0600 "$LAB_HDFS_KEYTAB" "$destination_keytab"
 database_created=true
-clickhouse_query "CREATE DATABASE IF NOT EXISTS $database_name"
+clickhouse_query "CREATE DATABASE $database_name"
+database_create_confirmed=true
 
 write_base_config() {
   local output="$1"

@@ -83,7 +83,11 @@ cleanup_resources() {
 cleanup() {
   local status="$?"
   trap - EXIT
-  cleanup_resources || status=1
+  local cleanup_status=0
+  cleanup_resources || cleanup_status=$?
+  if (( cleanup_status == 143 )); then status=143
+  elif (( cleanup_status != 0 )); then status=1
+  fi
   rm -rf -- "$lab_root"
   exit "$status"
 }
