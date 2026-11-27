@@ -41,11 +41,21 @@ cleanup_evidence="$results_root/$run_id-hdfs-cleanup.json"
 
 write_cleanup_evidence() {
   python3 - "$cleanup_evidence" "$database_name" "$database_create_confirmed" "$database_cleanup" <<'PYJSON'
-import json, sys
+import json, os, sys, tempfile
+from pathlib import Path
 path, database, confirmed, cleanup = sys.argv[1:]
-with open(path, "w", encoding="utf-8") as out:
-    json.dump({"clickhouse_database": database, "create_confirmed": confirmed == "true", "cleanup": cleanup}, out)
-    out.write("\n")
+temporary = None
+try:
+    with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=Path(path).parent, delete=False) as out:
+        temporary = out.name
+        json.dump({"clickhouse_database": database, "create_confirmed": confirmed == "true", "cleanup": cleanup}, out)
+        out.write("\n")
+        out.flush()
+        os.fsync(out.fileno())
+    os.replace(temporary, path)
+finally:
+    if temporary and os.path.exists(temporary):
+        os.unlink(temporary)
 PYJSON
 }
 
