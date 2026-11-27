@@ -3,7 +3,6 @@
 import argparse
 import contextlib
 import ctypes
-import errno
 import fcntl
 import hashlib
 import json
@@ -32,6 +31,8 @@ ADMISSION_LIMIT = 30
 LOCK_LIMIT = 120
 ATTEMPT_LIMIT = 2400
 TERMINAL = {"passed", "failed", "cancelled", "unknown"}
+RELEASE_BINARIES = ("terrasync", "examples/single_process_matrix")
+BUILD_RECEIPT = "terrasync-lab-build.json"
 
 
 def atomic_json(path, data):
@@ -195,15 +196,50 @@ def locked():
         yield
 
 
-def copy_binary(source, destination):
-    if not source.is_file() or not os.access(source, os.X_OK):
-        raise RuntimeError(f"compiled lab binary unavailable: {source}")
-    try:
-        os.link(source.resolve(), destination)
-    except OSError as exc:
-        if exc.errno != errno.EXDEV:
-            raise
-        shutil.copy2(source, destination)
+def source_identity():
+    repo = HERE.parent.parent
+    git = ["git", "-C", str(repo)]
+    commit = subprocess.check_output(
+        [*git, "rev-parse", "HEAD"], text=True, timeout=5
+    ).strip()
+    if subprocess.check_output(
+        [*git, "status", "--porcelain", "--untracked-files=no"], text=True, timeout=5
+    ):
+        raise RuntimeError("HDFS certification requires a clean tracked checkout")
+    mover = re.search(
+        r"data-mover-rs\.git\?rev=([0-9a-f]{40})#",
+        (repo / "Cargo.lock").read_text(),
+    )
+    if not mover:
+        raise RuntimeError("data-mover revision is missing from Cargo.lock")
+    return {"terrasync_candidate": commit, "data_mover_candidate": mover[1]}
+
+
+def sha256(path):
+    with path.open("rb") as stream:
+        return hashlib.file_digest(stream, "sha256").hexdigest()
+
+
+def prepare_build():
+    target = Path(os.environ["CARGO_TARGET_DIR"]).resolve()
+    receipt = target / BUILD_RECEIPT
+    receipt.unlink(missing_ok=True)
+    candidate = source_identity()
+    cargo = ["cargo", "build", "--release", "--locked"]
+    repo = HERE.parent.parent
+    subprocess.run([*cargo, "--features", "lab-fault-injection"], cwd=repo, check=True)
+    subprocess.run(
+        [*cargo, "-p", "app", "--example", "single_process_matrix"],
+        cwd=repo,
+        check=True,
+    )
+    if candidate != source_identity():
+        raise RuntimeError("the checkout changed during the lab build")
+    binaries = {
+        binary: sha256(target / "release" / binary) for binary in RELEASE_BINARIES
+    }
+    atomic_json(receipt, {"candidate": candidate, "binaries": binaries})
+    return 0
 
 
 def claim(run_id):
@@ -212,37 +248,47 @@ def claim(run_id):
         record = read_optional(attempt / "state.json")
         if record is not None:
             return record, False
+        candidate = source_identity()
+        target = Path(os.environ["CARGO_TARGET_DIR"]).resolve()
+        receipt = read_optional(target / BUILD_RECEIPT)
+        if (
+            not isinstance(receipt, dict)
+            or receipt.get("candidate") != candidate
+            or not isinstance(receipt.get("binaries"), dict)
+        ):
+            raise RuntimeError(
+                "the lab build receipt is missing or for another checkout"
+            )
         # A launcher interrupted before publication could only have staged inert files.
         if attempt.exists():
             shutil.rmtree(attempt)
         attempt.mkdir(mode=0o700)
         work = attempt / "work"
         work.mkdir(mode=0o700)
-        for script in ("with-hdfs-tunnel.sh", "run-hdfs-e2e.sh", "common.sh"):
-            shutil.copy2(HERE / script, work / script)
-        target = Path(os.environ["CARGO_TARGET_DIR"]).resolve() / "release"
-        copy_binary(target / "terrasync", work / "terrasync")
-        copy_binary(
-            target / "examples/single_process_matrix", work / "single_process_matrix"
-        )
-        repo = HERE.parent.parent
-        commit = subprocess.check_output(
-            ["git", "-C", str(repo), "rev-parse", "HEAD"], text=True, timeout=5
-        ).strip()
-        mover = re.search(
-            r"data-mover-rs\.git\?rev=([0-9a-f]{40})#",
-            (repo / "Cargo.lock").read_text(),
-        )
-        if not mover:
-            raise RuntimeError("data-mover revision is missing from Cargo.lock")
+        try:
+            for script in ("with-hdfs-tunnel.sh", "run-hdfs-e2e.sh", "common.sh"):
+                shutil.copy2(HERE / script, work / script)
+            for binary in RELEASE_BINARIES:
+                staged = work / Path(binary).name
+                shutil.copy2(target / "release" / binary, staged)
+                expected_digest = receipt["binaries"].get(binary)
+                if not os.access(staged, os.X_OK) or sha256(staged) != expected_digest:
+                    raise RuntimeError(
+                        f"the staged {binary} does not match the lab build receipt"
+                    )
+        except (OSError, RuntimeError):
+            shutil.rmtree(attempt)
+            raise
         record = {
             "schema_version": 1,
             "run_id": run_id,
             "boot_id": BOOT,
             "created": time.time(),
             "lease": time.monotonic(),
-            "terrasync_candidate": commit,
-            "data_mover_candidate": mover[1],
+            **candidate,
+            "binary_sha256": {
+                binary: receipt["binaries"][binary] for binary in RELEASE_BINARIES
+            },
             "instances": {"clickhouse": "attempt_private", "hdfs": "lab_kerberos"},
             "admission": "open",
             "test": "pending",
@@ -354,8 +400,7 @@ def worker(run_id):
         gate_dir.mkdir(mode=0o700)
         pin = (HERE / "clickhouse.sha256").read_text().strip()
         binary_stat = CLICKHOUSE.stat()
-        with CLICKHOUSE.open("rb") as binary:
-            digest = hashlib.file_digest(binary, "sha256").hexdigest()
+        digest = sha256(CLICKHOUSE)
         if binary_stat.st_uid != 0 or binary_stat.st_mode & 0o022 or digest != pin:
             raise RuntimeError(
                 "ClickHouse binary differs from the approved installation"
@@ -635,8 +680,11 @@ def validate_installation(run_id):
 def run(run_id, output):
     if (STATE / run_id / "state.json").is_file():
         return publish(run_id, output)
+    stage = "admission_preflight"
     try:
         validate_installation(run_id)
+        stage = "staging"
+        _, new = claim(run_id)
     except (
         OSError,
         RuntimeError,
@@ -650,7 +698,7 @@ def run(run_id, output):
             {
                 "schema_version": 1,
                 "run_id": run_id,
-                "stage": "admission_preflight",
+                "stage": stage,
                 "reason": type(exc).__name__,
                 "test": "failed",
                 "local_cleanup": "not_attempted",
@@ -659,7 +707,6 @@ def run(run_id, output):
             },
         )
         raise
-    _, new = claim(run_id)
     if not new:
         return publish(run_id, output)
     interrupted = False
@@ -715,12 +762,15 @@ def main():
     os.umask(0o077)
     parser = argparse.ArgumentParser()
     parser.add_argument(
-        "command", choices=("run", "worker", "worker-exit", "reconcile", "sweep")
+        "command",
+        choices=("build", "run", "worker", "worker-exit", "reconcile", "sweep"),
     )
     parser.add_argument("run_id", nargs="?")
     parser.add_argument("--output", type=Path)
     parser.add_argument("--cancel", action="store_true")
     args = parser.parse_args()
+    if args.command == "build":
+        return prepare_build()
     if args.command == "sweep":
         unresolved = False
         if STATE.exists():

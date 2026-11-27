@@ -116,6 +116,10 @@ class HdfsLabTest(unittest.TestCase):
         self.events = self.cgroup_root / self.group.lstrip("/") / "cgroup.events"
         self.manager = FakeManager(unit, self.lab_lock)
         self.addCleanup(self.manager.close)
+        self.candidate = {
+            "terrasync_candidate": "a" * 40,
+            "data_mover_candidate": "b" * 40,
+        }
 
         self.now = 1000
         clock = SimpleNamespace(
@@ -132,16 +136,21 @@ class HdfsLabTest(unittest.TestCase):
                 BOOT="current-boot",
                 systemctl=self.manager,
                 service_commands=self.service_commands,
+                source_identity=lambda: self.candidate,
                 time=clock,
             )
         )
-        target = self.root / "target"
-        for binary in ("terrasync", "examples/single_process_matrix"):
-            path = target / "release" / binary
+        self.target = self.root / "target"
+        for binary in self.controller.RELEASE_BINARIES:
+            path = self.target / "release" / binary
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text("#!/bin/sh\nexit 99\n", encoding="utf-8")
             path.chmod(0o700)
-        self.enterContext(patch.dict(os.environ, {"CARGO_TARGET_DIR": str(target)}))
+        self.receipt = self.target / self.controller.BUILD_RECEIPT
+        self.enterContext(
+            patch.dict(os.environ, {"CARGO_TARGET_DIR": str(self.target)})
+        )
+        self.write_build_receipt()
         self.addCleanup(os.umask, os.umask(0o077))
         for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
             self.addCleanup(signal.signal, sig, signal.getsignal(sig))
@@ -158,6 +167,11 @@ class HdfsLabTest(unittest.TestCase):
 
     def record(self):
         return read_json(self.attempt / "state.json")
+
+    def write_build_receipt(self):
+        with patch.object(self.controller.subprocess, "run") as cargo:
+            self.assertEqual(self.cli("build"), 0)
+        self.assertEqual(cargo.call_count, 2)
 
     def worker_state(self, *, populated, active="active", **changes):
         record = self.record()
@@ -277,6 +291,41 @@ class HdfsLabTest(unittest.TestCase):
         self.assertEqual(read_json(self.diagnostics), original)
         self.assertEqual(self.manager.commands, [])
         self.assertFalse(self.certification.exists())
+
+    def test_run_requires_build_receipt_before_staging(self):
+        self.receipt.unlink()
+        self.manager.on_start = self.finish_worker
+        with self.assertRaisesRegex(RuntimeError, "build receipt"):
+            self.controller.run(RUN_ID, self.output)
+        self.assertFalse(self.attempt.exists())
+        self.assertEqual(self.manager.commands, [])
+        self.assertEqual(read_json(self.diagnostics)["stage"], "staging")
+
+    def test_run_rejects_receipt_from_another_checkout(self):
+        self.candidate["terrasync_candidate"] = "c" * 40
+        with self.assertRaisesRegex(RuntimeError, "another checkout"):
+            self.controller.run(RUN_ID, self.output)
+        self.assertFalse(self.attempt.exists())
+        self.assertEqual(self.manager.commands, [])
+
+    def test_run_rejects_changed_binary_and_removes_staged_files(self):
+        (self.target / "release/terrasync").write_bytes(b"other compilation")
+        with self.assertRaisesRegex(RuntimeError, "staged terrasync"):
+            self.controller.run(RUN_ID, self.output)
+        self.assertFalse(self.attempt.exists())
+        self.assertEqual(self.manager.commands, [])
+
+    def test_build_does_not_leave_receipt_after_failed_rebuild(self):
+        with (
+            patch.object(
+                self.controller.subprocess,
+                "run",
+                side_effect=subprocess.CalledProcessError(1, "cargo"),
+            ),
+            self.assertRaises(subprocess.CalledProcessError),
+        ):
+            self.cli("build")
+        self.assertFalse(self.receipt.exists())
 
     def test_same_run_invokes_once_after_start_response_is_lost(self):
         def start():

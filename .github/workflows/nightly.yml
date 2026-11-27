@@ -66,9 +66,7 @@ jobs:
       - name: Build lab CLI
         id: build
         if: ${{ !cancelled() && steps.prepare.outcome == 'success' }}
-        run: |
-          cargo build --release --locked --features lab-fault-injection
-          cargo build --release --locked -p app --example single_process_matrix
+        run: python3 tests/lab/hdfs_lab.py build
       - name: Storage and integrity E2E matrix
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         run: |

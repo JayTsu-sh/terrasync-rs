@@ -447,13 +447,15 @@ tests/lab/hdfs-runner/install-managed.sh github-runner "$APPROVED_CLICKHOUSE_SHA
 
 The installer enables the runner's lingering systemd user manager, its
 cleanup timer, and a private 2 GiB scratch tmpfs. The worker and service exit hook must match
-the checkout used by Nightly. The Actions step passes the
-run ID and locations of the compiled binaries through
-`python3 tests/lab/hdfs_lab.py run "$RUN_ID" --output "$OUTPUT_DIR"`.
-Run it as `github-runner` with `XDG_RUNTIME_DIR=/run/user/1000` and its
-user DBus socket. The runner UID shares the existing trust boundary across
-repositories. No changes to Docker, the existing ClickHouse service, or the
-HDFS SSH forwarding rules are needed.
+the checkout used by Nightly. Use a dedicated `CARGO_TARGET_DIR` and run
+`python3 tests/lab/hdfs_lab.py build` from a clean checkout. The build records
+both source revisions and both executable digests there. Run
+`python3 tests/lab/hdfs_lab.py run "$RUN_ID" --output "$OUTPUT_DIR"` with the
+same `CARGO_TARGET_DIR` as `github-runner`, with `XDG_RUNTIME_DIR=/run/user/1000`
+and its user D-Bus socket. Admission checks the receipt against the checkout
+and the copies it stages for the worker. The runner UID shares the existing
+trust boundary across repositories. Docker, shared ClickHouse, and the HDFS
+SSH forwards use their existing runner configuration.
 
 Each attempt gets a private loopback ClickHouse server and data directory.
 The systemd unit owns the test processes, SSH and ClickHouse in one cgroup.
