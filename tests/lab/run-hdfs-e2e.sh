@@ -5,6 +5,8 @@ source "$(dirname "$0")/common.sh"
 
 run_id="${1:?run id required}"
 validate_run_id "$run_id"
+export LAB_HDFS_LOCATION LAB_HDFS_ADMIN_USER LAB_HDFS_CONFIG_DIR LAB_HDFS_KEYTAB
+export LAB_HDFS_BASE_PATH="${LAB_HDFS_BASE_PATH:-/tmp/terrasync-nightly}"
 require_hdfs_credentials
 
 repo_root="$(cd "$(dirname "$0")/../.." && pwd)"
@@ -80,7 +82,7 @@ write_initial_evidence() {
   return "$status"
 }
 cleanup_resources() {
-  local status=0 cleanup_cancelled=false attempts attempt
+  local status=0 cleanup_cancelled=false attempts attempt cleanup_exit
   trap 'cleanup_cancelled=true' INT TERM HUP
   if [[ -n "$receiver_pid" ]]; then
     kill "$receiver_pid" 2>/dev/null || true
@@ -89,10 +91,13 @@ cleanup_resources() {
   fi
   if [[ "$hdfs_touched" == true ]]; then
     # Delete only this gate's directory relative to the dedicated HDFS base.
-    if ! LAB_HDFS_ADMIN_USER="$LAB_HDFS_ADMIN_USER" LAB_HDFS_CONFIG_DIR="$LAB_HDFS_CONFIG_DIR" \
+    if LAB_HDFS_ADMIN_USER="$LAB_HDFS_ADMIN_USER" LAB_HDFS_CONFIG_DIR="$LAB_HDFS_CONFIG_DIR" \
       LAB_HDFS_DESTINATION_CCACHE="$destination_cache" LAB_HDFS_KEYTAB="$destination_keytab" \
-      shielded_cleanup timeout --foreground --kill-after=5s 45s "$matrix_binary" --delete-hdfs-run "$hdfs_base" "$hdfs_scope" >/dev/null 2>&1; then
-      echo 'HDFS certification cleanup failed' >&2
+      shielded_cleanup timeout --foreground --kill-after=5s 45s "$matrix_binary" --delete-hdfs-run "$hdfs_base" "$hdfs_scope" >"$runtime_root/hdfs-cleanup.log" 2>&1; then
+      :
+    else
+      cleanup_exit=$?
+      report_hdfs_cleanup_failure "$cleanup_exit" "$runtime_root/hdfs-cleanup.log"
       status=1
     fi
     hdfs_touched=false

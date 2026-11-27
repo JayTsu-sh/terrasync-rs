@@ -55,6 +55,16 @@ class SingleProcessMatrixTest(unittest.TestCase):
             path.write_text(json.dumps(report), encoding="utf-8")
             return self.validator.validate(path)
 
+    def test_cleanup_diagnostics_only_use_typed_marker(self):
+        with tempfile.TemporaryDirectory() as directory:
+            log = pathlib.Path(directory) / "cleanup.log"
+            log.write_text("Authentication in path\nHDFS_CLEANUP_FAILURE=Capacity\nsecret-value\n")
+            command = 'source tests/lab/common.sh; report_hdfs_cleanup_failure 1 "$1"'
+            result = subprocess.run(["bash", "-c", command, "_", str(log)], cwd=ROOT, capture_output=True, text=True)
+            self.assertIn("Capacity", result.stderr)
+            self.assertNotIn("Authentication", result.stderr)
+            self.assertNotIn("secret-value", result.stderr)
+
     def test_complete_64_cell_report_passes(self):
         self.validator.validate_report(self.report())
 

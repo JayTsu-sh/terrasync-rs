@@ -424,6 +424,9 @@ access to the six local forward ports from every OS UID except the CI UID
 1000; the sudo rule permits only reading this nftables table. The wrapper
 checks the rules before opening a tunnel. Jobs using the same `github-runner`
 account share its credentials and remain in the same trust boundary.
+The HDFS connector currently does not expose a typed cause for every
+connection-stage failure, so cleanup reports `connection_unknown` when that
+cause is unavailable; operation-stage failures retain their typed class.
 The wrapper is Nightly-specific; callers of the underlying scripts can still
 supply their own HDFS environment and `LAB_HDFS_BASE_PATH`.
 

@@ -91,6 +91,19 @@ require_s3_credentials() {
   : "${LAB_S3_SECRET_KEY:?LAB_S3_SECRET_KEY is required}"
 }
 
+report_hdfs_cleanup_failure() {
+  local status="$1" log="$2" reason
+  case "$status" in
+    124|137) reason=timeout ;;
+    130|143) reason=cancelled ;;
+    *)
+      reason="$(sed -nE 's/^HDFS_CLEANUP_FAILURE=(Authentication|PermissionDenied|Connectivity|Timeout|InvalidInput|Unsupported|NotFound|Conflict|Capacity|Corruption|Protocol|Throttled|Cancelled|Internal|connection_unknown)$/\1/p' "$log" | head -1)"
+      reason="${reason:-storage_error}"
+      ;;
+  esac
+  echo "HDFS cleanup failed: $reason (exit $status)" >&2
+}
+
 require_hdfs_credentials() {
   : "${LAB_HDFS_CONFIG_DIR:?LAB_HDFS_CONFIG_DIR is required}"
   : "${LAB_HDFS_KEYTAB:?LAB_HDFS_KEYTAB is required}"

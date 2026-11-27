@@ -5,6 +5,8 @@ source "$(dirname "$0")/common.sh"
 
 run_id="${1:?run id required}"
 validate_run_id "$run_id"
+export LAB_HDFS_LOCATION LAB_HDFS_ADMIN_USER LAB_HDFS_CONFIG_DIR LAB_HDFS_KEYTAB
+export LAB_HDFS_BASE_PATH="${LAB_HDFS_BASE_PATH:-/tmp/terrasync-nightly}"
 profiles=(local nfs3 nfs40 nfs41 cifs_fas2750 s3_standard s3_dxn hdfs)
 deferred_profiles=()
 cifs_enabled=true
@@ -52,13 +54,14 @@ shielded_cleanup() (
   "$@"
 )
 cleanup_resources() {
-  local status=0 cleanup_cancelled=false
+  local status=0 cleanup_cancelled=false cleanup_exit
   trap 'cleanup_cancelled=true' INT TERM HUP
   if [[ "$hdfs_touched" == true ]]; then
-    if shielded_cleanup timeout --foreground --kill-after=5s 45s "$binary" --delete-hdfs-run "$hdfs_base" "$hdfs_scope" >/dev/null 2>&1; then
+    if shielded_cleanup timeout --foreground --kill-after=5s 45s "$binary" --delete-hdfs-run "$hdfs_base" "$hdfs_scope" >"$runtime_root/hdfs-cleanup.log" 2>&1; then
       hdfs_cleanup=passed
     else
-      echo "HDFS matrix cleanup failed for its run prefix" >&2
+      cleanup_exit=$?
+      report_hdfs_cleanup_failure "$cleanup_exit" "$runtime_root/hdfs-cleanup.log"
       hdfs_cleanup=failed
       status=1
     fi
