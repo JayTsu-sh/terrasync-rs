@@ -254,6 +254,29 @@ class HdfsLabTest(unittest.TestCase):
         ):
             self.controller.run(RUN_ID, self.output)
         self.assertFalse(self.attempt.exists())
+        diagnostic = read_json(self.diagnostics)
+        self.assertEqual(diagnostic["stage"], "admission_preflight")
+        self.assertEqual(diagnostic["test"], "failed")
+        self.assertEqual(diagnostic["hdfs_cleanup"], "not_attempted")
+        self.assertEqual(diagnostic["certification"], "withheld")
+        self.assertFalse(self.certification.exists())
+
+    def test_running_attempt_is_only_observed_by_a_same_id_caller(self):
+        self.controller.claim(RUN_ID)
+        self.worker_state(populated=True, test="running")
+        original = self.record()
+        self.advance(10)
+
+        def cancel_observer(seconds):
+            self.advance(seconds)
+            signal.raise_signal(signal.SIGTERM)
+
+        with patch.object(self.controller.time, "sleep", side_effect=cancel_observer):
+            self.assertEqual(self.controller.run(RUN_ID, self.output), 1)
+        self.assertEqual(self.record(), original)
+        self.assertEqual(read_json(self.diagnostics), original)
+        self.assertEqual(self.manager.commands, [])
+        self.assertFalse(self.certification.exists())
 
     def test_same_run_invokes_once_after_start_response_is_lost(self):
         def start():
@@ -455,16 +478,17 @@ class HdfsLabTest(unittest.TestCase):
         self.assertEqual(diagnostic["certification"], "published")
 
     def assert_rejects_evidence(self, filename, changes):
-        self.controller.claim(RUN_ID)
-        self.finish_worker()
-        path = self.work / filename
-        if changes is None:
-            path.unlink()
-        else:
-            report = read_json(path)
-            report.update(changes)
-            write_json(path, report)
+        def finish_with_bad_evidence():
+            self.finish_worker()
+            path = self.work / filename
+            if changes is None:
+                path.unlink()
+            else:
+                report = read_json(path)
+                report.update(changes)
+                write_json(path, report)
 
+        self.manager.on_start = finish_with_bad_evidence
         status = self.controller.run(RUN_ID, self.output)
         self.assertEqual((status, self.certification.exists()), (1, False))
         self.assert_withheld()
@@ -547,7 +571,7 @@ class HdfsLabTest(unittest.TestCase):
 
 
 class HdfsGateTest(unittest.TestCase):
-    def test_unexpected_negative_check_exit_stops_before_hdfs_writes(self):
+    def run_gate(self, cli_script, matrix_script=None):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             attempt = root / "attempt"
@@ -562,14 +586,11 @@ class HdfsGateTest(unittest.TestCase):
             keytab.touch()
             log = root / "calls"
             cli = root / "terrasync"
-            cli.write_text(
-                "#!/bin/sh\n"
-                'echo "$3" >> "$LAB_PROBE_LOG"\n'
-                "echo 'Error: Configuration error: HDFS Source role configuration is required' >&2\n"
-                "exit 124\n",
-                encoding="utf-8",
-            )
+            cli.write_text(cli_script, encoding="utf-8")
             cli.chmod(0o700)
+            matrix = root / "matrix"
+            matrix.write_text(matrix_script or cli_script, encoding="utf-8")
+            matrix.chmod(0o700)
             candidate = "a" * 40
             result = subprocess.run(
                 [str(LAB / "run-hdfs-e2e.sh"), "nightly-negative-timeout"],
@@ -588,24 +609,74 @@ class HdfsGateTest(unittest.TestCase):
                     "LAB_CLICKHOUSE_PASSWORD": "test-password",
                     "LAB_PROBE_LOG": str(log),
                     "TERRASYNC_BINARY": str(cli),
-                    "TERRASYNC_SINGLE_MATRIX_BINARY": str(cli),
+                    "TERRASYNC_SINGLE_MATRIX_BINARY": str(matrix),
                     "TERRASYNC_CANDIDATE": candidate,
                     "DATA_MOVER_CANDIDATE": candidate,
                 },
                 capture_output=True,
                 text=True,
-                timeout=5,
+                timeout=15,
                 check=False,
             )
-            self.assertNotEqual(result.returncode, 0)
-            self.assertIn(
-                "did not produce the expected rejection (exit 124)", result.stderr
+            return (
+                result,
+                log.read_text().splitlines(),
+                read_json(state / "hdfs-cleanup.json"),
+                (state / "gate-report.json").exists(),
             )
-            self.assertEqual(log.read_text().splitlines(), ["scan"])
-            self.assertEqual(
-                read_json(state / "hdfs-cleanup.json")["status"], "not_attempted"
-            )
-            self.assertFalse((state / "gate-report.json").exists())
+
+    def test_unexpected_negative_check_exit_stops_before_hdfs_writes(self):
+        result, calls, cleanup, certified = self.run_gate(
+            "#!/bin/sh\n"
+            'echo "$3" >> "$LAB_PROBE_LOG"\n'
+            "echo 'Error: Configuration error: HDFS Source role configuration is required' >&2\n"
+            "exit 124\n"
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(
+            "did not produce the expected rejection (exit 124)", result.stderr
+        )
+        self.assertEqual(calls, ["scan"])
+        self.assertEqual(cleanup["status"], "not_attempted")
+        self.assertFalse(certified)
+
+    def test_killed_receiver_leaves_hdfs_cleanup_unknown(self):
+        result, calls, cleanup, certified = self.run_gate(
+            """#!/bin/sh
+echo "$3" >> "$LAB_PROBE_LOG"
+case "$3" in
+  scan)
+    case "$2" in
+      */missing.toml)
+        echo 'Error: Configuration error: HDFS Source role configuration is required' >&2 ;;
+      */invalid.toml)
+        echo 'Error: failed to connect Hdfs backend: HDFS get storage root failed (Authentication): authentication failed' >&2 ;;
+    esac
+    exit 1 ;;
+  sync)
+    case " $* " in *" --remote "*) exit 1 ;; esac ;;
+  integrity-check) printf 'Checked: 1\\nAll Passed ✓\\n' ;;
+  serve)
+    trap '' TERM
+    printf ready > "$7"
+    while :; do sleep 0.1; done ;;
+esac
+""",
+            """#!/bin/sh
+if [ "$1" = --delete-hdfs-run ]; then
+  echo delete >> "$LAB_PROBE_LOG"
+else
+  printf 'terrasync-hdfs-nightly-negative-timeout\\n' > "$6/payload.bin"
+fi
+""",
+        )
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertEqual(calls.count("sync"), 3, calls)
+        self.assertIn("serve", calls)
+        self.assertNotIn("delete", calls)
+        self.assertEqual(cleanup["status"], "unknown")
+        self.assertEqual(cleanup["reason"], "receiver_terminated")
+        self.assertFalse(certified)
 
 
 if __name__ == "__main__":

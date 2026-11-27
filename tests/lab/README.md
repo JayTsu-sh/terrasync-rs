@@ -468,12 +468,14 @@ files and any retained lock in place for a later check or operator action.
 
 Persistent records live at
 `~/.local/state/terrasync-hdfs-managed/<run-id>/state.json`. A rerun with the
-same ID reads the recorded outcome. Certification requires the original
-caller to publish it. For a fresh attempt use a new run ID.
+same ID reports the current record immediately and succeeds only for an
+already published certification. The original caller owns the lease and
+certification. For a fresh attempt use a new run ID.
 Use `hdfs_lab.py reconcile <run-id> --cancel --output <directory>` to stop
 and inspect an attempt, or omit `--cancel` to observe an active one.
-The recovery command never issues HDFS operations. For an unknown or
-failed HDFS cleanup, use the recorded scope and routing details to locate
+The recovery command performs local operations only. A receiver that had
+to be terminated leaves the remote scope for manual verification. For an
+unknown or failed HDFS cleanup, use the recorded scope and routing details to locate
 the original cluster and verify it independently before manual cleanup.
 A known alias or routing fingerprint alone does not prove cluster identity.
 

@@ -104,23 +104,27 @@ cleanup() {
   trap - EXIT
   trap 'cancelled=true' INT TERM HUP
   if [[ -n "$receiver_pid" ]]; then
-    kill -TERM "$receiver_pid" 2>/dev/null || true
+    if kill -TERM "$receiver_pid" 2>/dev/null; then
+      hdfs_cleanup_reason_record=receiver_terminated
+    fi
     if ! await_receiver 5; then
+      hdfs_cleanup_reason_record=receiver_terminated
       kill -KILL "$receiver_pid" 2>/dev/null || true
       if ! await_receiver 2; then
         cancelled=true
       fi
     fi
-    if [[ "$cancelled" == false ]]; then
-      wait "$receiver_pid" 2>/dev/null || true
+    if [[ "$cancelled" == false && -z "$hdfs_cleanup_reason_record" ]] &&
+      ! wait "$receiver_pid" 2>/dev/null; then
+      hdfs_cleanup_reason_record=receiver_exit_unconfirmed
     fi
   fi
 
   case "$status" in
     124|129|130|137|143) cancelled=true ;;
   esac
-  # Only delete this attempt's scope. After cancellation or timeout, in-flight HDFS writes may still land.
-  if [[ "$hdfs_cleanup" == unknown && "$cancelled" == false ]]; then
+  # Pending HDFS writes can outlive a cancelled or force-stopped client.
+  if [[ "$hdfs_cleanup" == unknown && "$cancelled" == false && -z "$hdfs_cleanup_reason_record" ]]; then
     write_evidence gate-phase hdfs_cleanup || exit 1
     if LAB_HDFS_DESTINATION_CCACHE="$destination_cache" LAB_HDFS_KEYTAB="$destination_keytab" \
       timeout --foreground --kill-after=5s 45s "$matrix_binary" --delete-hdfs-run "$hdfs_base" "$hdfs_scope" >"$cleanup_log" 2>&1; then
@@ -136,6 +140,9 @@ cleanup() {
       status=1
     fi
     write_cleanup_evidence "$hdfs_cleanup" || status=1
+  elif [[ "$hdfs_cleanup" == unknown ]]; then
+    hdfs_cleanup_reason_record="${hdfs_cleanup_reason_record:-gate_interrupted}"
+    write_cleanup_evidence unknown || status=1
   fi
 
   rm -rf -- "$runtime_root" || status=1
@@ -381,5 +388,8 @@ write_evidence gate-phase receiver_exit
 await_receiver 30 || { echo 'HDFS receiver exit timed out' >&2; exit 124; }
 wait "$receiver_pid" || receiver_status=$?
 receiver_pid=""
-(( receiver_status == 0 ))
+if (( receiver_status != 0 )); then
+  hdfs_cleanup_reason_record=receiver_exit_unconfirmed
+  exit "$receiver_status"
+fi
 verify_destination remote "$hdfs_remote_destination"

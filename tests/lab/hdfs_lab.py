@@ -614,7 +614,7 @@ def publish(run_id, output, *, finalize=False, cancelled=lambda: False):
         return 0 if record["certification"] == "published" else 1
 
 
-def run(run_id, output):
+def validate_installation(run_id):
     # Refuse to stage anything if the installed service and manager are unavailable.
     observed = unit_state(run_id)
     if (
@@ -630,7 +630,38 @@ def run(run_id, output):
             raise RuntimeError(
                 "the runner's managed HDFS installation differs from this checkout"
             )
-    record, new = claim(run_id)
+
+
+def run(run_id, output):
+    if (STATE / run_id / "state.json").is_file():
+        return publish(run_id, output)
+    try:
+        validate_installation(run_id)
+    except (
+        OSError,
+        RuntimeError,
+        subprocess.SubprocessError,
+        ValueError,
+        KeyError,
+    ) as exc:
+        output.mkdir(parents=True, exist_ok=True)
+        atomic_json(
+            output / f"{run_id}-hdfs-cleanup.json",
+            {
+                "schema_version": 1,
+                "run_id": run_id,
+                "stage": "admission_preflight",
+                "reason": type(exc).__name__,
+                "test": "failed",
+                "local_cleanup": "not_attempted",
+                "hdfs_cleanup": "not_attempted",
+                "certification": "withheld",
+            },
+        )
+        raise
+    _, new = claim(run_id)
+    if not new:
+        return publish(run_id, output)
     interrupted = False
 
     def cancel(*_):
@@ -640,7 +671,7 @@ def run(run_id, output):
     for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
         signal.signal(sig, cancel)
 
-    if new and not interrupted:
+    if not interrupted:
         # A timeout is ambiguous. Do not resubmit; observe this exact unit.
         try:
             systemctl("start", "--no-block", unit(run_id), required=False)
@@ -655,7 +686,7 @@ def run(run_id, output):
         record = reconcile(run_id)
         if record["local_cleanup"] == "passed":
             result = publish(
-                run_id, output, finalize=new, cancelled=lambda: new and interrupted
+                run_id, output, finalize=True, cancelled=lambda: interrupted
             )
             return 143 if result and interrupted else result
         with locked():
