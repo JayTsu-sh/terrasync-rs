@@ -228,7 +228,7 @@ rm "$scan_source/deleted.txt"
 mv "$scan_source/renamed-from.txt" "$scan_source/renamed-to.txt"
 run_terrasync scan --id "$scan_job_id" "$scan_source"
 retry_commit="$(next_scan_commit "$scan_job_id" "$baseline_commit")"
-read -r retry_generation retry_epoch <<<"$retry_commit"
+read -r retry_generation _ <<<"$retry_commit"
 wrong_generation_rows="$(clickhouse_query "SELECT count() FROM $database_name.base_$scan_job_id FINAL WHERE current_state != $retry_generation FORMAT TSVRaw")"
 [[ "$wrong_generation_rows" == 0 ]] || {
   echo "incremental scan retry left $wrong_generation_rows base rows outside committed generation $retry_generation" >&2
@@ -249,7 +249,6 @@ expected_rows="$(
 retry_events="$(clickhouse_query "
 SELECT relative_path, if(operation_type IN ('data_changed','both_changed'), 'changed', operation_type)
 FROM $database_name.incremental_$scan_job_id FINAL
-WHERE toUnixTimestamp64Nano(create_at) >= $retry_epoch
 ORDER BY relative_path, operation_type")"
 expected_events="$(printf '%s\t%s\n' changed.txt changed deleted.txt deleted new.txt new renamed-from.txt deleted renamed-to.txt new)"
 [[ "$retry_events" == "$expected_events" ]] || {
@@ -273,10 +272,12 @@ rename_baseline="$(committed_scan "$rename_job_id")"
 ssh_lab_root "$LAB_SOURCE_MGMT" \
   "mv '$LAB_NFS41_EXPORT/ci/$run_id/$case_id/source/renamed-from.txt' '$LAB_NFS41_EXPORT/ci/$run_id/$case_id/source/renamed-to.txt'"
 run_terrasync scan --id "$rename_job_id" "$rename_source"
-rename_commit="$(next_scan_commit "$rename_job_id" "$rename_baseline")"
-read -r _ rename_epoch <<<"$rename_commit"
-rename_events="$(clickhouse_query "SELECT count() FROM $database_name.incremental_$rename_job_id FINAL WHERE toUnixTimestamp64Nano(create_at) >= $rename_epoch AND operation_type = 'rename' AND relative_path = 'renamed-to.txt' AND comment = 'renamed-from.txt' FORMAT TSVRaw")"
-[[ "$rename_events" == 1 ]] || { echo "NFS 4.1 incremental scan expected one Renamed event, got $rename_events" >&2; exit 1; }
+next_scan_commit "$rename_job_id" "$rename_baseline" >/dev/null
+rename_events="$(clickhouse_query "SELECT relative_path,operation_type,comment FROM $database_name.incremental_$rename_job_id FINAL FORMAT TSVRaw")"
+[[ "$rename_events" == $'renamed-to.txt\trename\trenamed-from.txt' ]] || {
+  printf 'NFS 4.1 incremental scan emitted unexpected events:\n%s\n' "$rename_events" >&2
+  exit 1
+}
 echo "NFS 4.1 incremental scan rename detection verified"
 
 # Preserve the former local-filter scenario.

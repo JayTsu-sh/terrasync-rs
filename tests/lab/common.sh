@@ -34,7 +34,9 @@ LAB_FIXTURE_GID="${LAB_FIXTURE_GID:-1000}"
 # AWS SDK/urllib3 proxy bypass matching is host based and does not consistently
 # honor the runner's CIDR entries. Keep all lab control/data traffic direct,
 # including the bucket-style hostnames constructed by run-e2e.sh.
-LAB_NO_PROXY_HOSTS="${LAB_SOURCE_MGMT},${LAB_DEST_MGMT},${LAB_WORKER_MGMT},${LAB_SOURCE_DATA},${LAB_DEST_DATA},${LAB_WORKER_DATA},${LAB_NFS40_DATA},${LAB_CIFS_SOURCE_DATA},${LAB_CIFS_DEST_DATA},${LAB_S3_BUCKET}.${LAB_SOURCE_DATA},${LAB_S3_BUCKET}.${LAB_DEST_DATA},${LAB_S3_BUCKET}.${LAB_WORKER_DATA}"
+LAB_DXN_S3_AUTHORITY="${LAB_DXN_S3_ENDPOINT#*://}"
+LAB_DXN_S3_HOST="${LAB_DXN_S3_AUTHORITY%%:*}"
+LAB_NO_PROXY_HOSTS="${LAB_SOURCE_MGMT},${LAB_DEST_MGMT},${LAB_WORKER_MGMT},${LAB_SOURCE_DATA},${LAB_DEST_DATA},${LAB_WORKER_DATA},${LAB_NFS40_DATA},${LAB_CIFS_SOURCE_DATA},${LAB_CIFS_DEST_DATA},${LAB_S3_BUCKET}.${LAB_SOURCE_DATA},${LAB_S3_BUCKET}.${LAB_DEST_DATA},${LAB_S3_BUCKET}.${LAB_WORKER_DATA},${LAB_DXN_S3_HOST},${LAB_DXN_S3_BUCKET}.${LAB_DXN_S3_HOST}"
 export NO_PROXY="${NO_PROXY:+${NO_PROXY},}${LAB_NO_PROXY_HOSTS}"
 export no_proxy="$NO_PROXY"
 
@@ -54,9 +56,10 @@ verify_integrity_report() {
   report="$("$@")" || status=$?
   printf '%s\n' "$report"
   (( status == 0 )) || return "$status"
-  if ! grep -Eq 'Checked:[[:space:]]+[1-9][0-9]*[[:space:]]*$' <<<"$report" ||
+  # 两套验收的目录下都只有一个 payload 文件。
+  if ! grep -Eq 'Checked:[[:space:]]+1[[:space:]]*$' <<<"$report" ||
     ! grep -Fq 'All Passed ✓' <<<"$report"; then
-    echo "integrity check must examine at least one entry and report no issues" >&2
+    echo "integrity check must examine the single payload and report no issues" >&2
     return 1
   fi
 }

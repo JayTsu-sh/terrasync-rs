@@ -11,7 +11,7 @@ from botocore.exceptions import ClientError
 def client(endpoint: str):
     return boto3.client(
         "s3",
-        endpoint_url=f"http://{endpoint}:9000",
+        endpoint_url=endpoint if endpoint.startswith(("http://", "https://")) else f"http://{endpoint}:9000",
         aws_access_key_id=os.environ["LAB_S3_ACCESS_KEY"],
         aws_secret_access_key=os.environ["LAB_S3_SECRET_KEY"],
         region_name="us-east-1",
@@ -59,7 +59,9 @@ elif args.command == "delete-prefix":
         page = s3.list_objects_v2(**kwargs)
         objects = [{"Key": item["Key"]} for item in page.get("Contents", [])]
         if objects:
-            s3.delete_objects(Bucket=args.bucket, Delete={"Objects": objects})
+            deleted = s3.delete_objects(Bucket=args.bucket, Delete={"Objects": objects})
+            if errors := deleted.get("Errors"):
+                raise SystemExit(f"could not delete {len(errors)} objects under the test prefix")
         if not page.get("IsTruncated"):
             break
         token = page["NextContinuationToken"]

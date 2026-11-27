@@ -34,10 +34,19 @@ runtime_root="$lab_root/runtime"
 results_root="${RUNNER_TEMP:-/tmp}/terrasync-harness-results/$run_id-single-process"
 aggregate="$results_root/matrix.json"
 hdfs_root="$(hdfs_run_root "$run_id")/single-process-matrix"
+matrix_prefix="ci/$run_id/single-process-matrix"
+dxn_touched=false
 
 cleanup() {
   local status="$?"
   trap - EXIT
+  if [[ "$dxn_touched" == true ]]; then
+    for operation in abort-multipart-prefix delete-prefix; do
+      LAB_S3_ACCESS_KEY="$LAB_DXN_S3_ACCESS_KEY" LAB_S3_SECRET_KEY="$LAB_DXN_S3_SECRET_KEY" \
+        python3 "$repo_root/tests/lab/s3_helper.py" "$operation" --endpoint "$LAB_DXN_S3_ENDPOINT" \
+          --bucket "$LAB_DXN_S3_BUCKET" --prefix "$matrix_prefix/" || status=1
+    done
+  fi
   rm -rf -- "$lab_root"
   exit "$status"
 }
@@ -51,18 +60,17 @@ export LAB_HDFS_DESTINATION_CCACHE="FILE:$runtime_root/destination.ccache"
 cargo build --release --locked --manifest-path "$repo_root/Cargo.toml" -p app --example single_process_matrix
 
 profile_root_url() {
-  local role="$1" profile="$2" host prefix
+  local role="$1" profile="$2" host
   [[ "$role" == source ]] && host="$LAB_SOURCE_DATA" || host="$LAB_DEST_DATA"
-  prefix="ci/$run_id/single-process-matrix"
   case "$profile" in
     local) printf '%s' "$lab_root" ;;
-    nfs3) printf 'nfs://%s%s:/%s?version=3&noresvport=true' "$host" "$LAB_NFS3_EXPORT" "$prefix" ;;
-    nfs40) printf 'nfs://%s%s:/%s?version=4.0&noresvport=true&uid=0&gid=0' "$LAB_NFS40_DATA" "$LAB_NFS40_EXPORT" "$prefix" ;;
-    nfs41) printf 'nfs://%s%s:/%s?version=4.1&noresvport=true' "$host" "$LAB_NFS41_EXPORT" "$prefix" ;;
+    nfs3) printf 'nfs://%s%s:/%s?version=3&noresvport=true' "$host" "$LAB_NFS3_EXPORT" "$matrix_prefix" ;;
+    nfs40) printf 'nfs://%s%s:/%s?version=4.0&noresvport=true&uid=0&gid=0' "$LAB_NFS40_DATA" "$LAB_NFS40_EXPORT" "$matrix_prefix" ;;
+    nfs41) printf 'nfs://%s%s:/%s?version=4.1&noresvport=true' "$host" "$LAB_NFS41_EXPORT" "$matrix_prefix" ;;
     cifs_fas2750)
       printf '%s/%s/single-process-matrix' "$LAB_CIFS_WRITABLE_ROOT" "$run_id"
       ;;
-    s3_standard|s3_dxn) printf '%s' "$prefix" ;;
+    s3_standard|s3_dxn) printf '%s' "$matrix_prefix" ;;
     hdfs) printf '%s' "$hdfs_root" ;;
     *) echo "unknown matrix profile: $profile" >&2; return 2 ;;
   esac
@@ -119,7 +127,7 @@ profile_fingerprint() {
     nfs41) printf '%s' 'shared-nfs41/10.10.1.12-to-10.10.1.13' ;;
     cifs_fas2750) printf '%s' 'fas2750/10.128.61.200+10.128.61.201/ontap_lisaauto_cifs' ;;
     s3_standard) printf '%s' 'shared-standard-s3/10.10.1.12-to-10.10.1.13' ;;
-    s3_dxn) printf '%s' 'shared-real-dxn/http://10.131.7.201:8184' ;;
+    s3_dxn) printf 'shared-real-dxn/%s' "$LAB_DXN_S3_ENDPOINT" ;;
     hdfs) printf '%s' 'hdfs-ha-kerberos/10.131.9.30+10.131.9.33' ;;
     *) echo "unknown matrix profile: $1" >&2; return 2 ;;
   esac
@@ -141,6 +149,9 @@ PY
   expected="$(sha256sum "$fixture" | cut -d' ' -f1)"
   source_root="$(storage_url source "$source" "$cell")"
   destination_root="$(storage_url destination "$destination" "$cell")"
+  if [[ "$source" == s3_dxn || "$destination" == s3_dxn ]]; then
+    dxn_touched=true
+  fi
 
   # The local backend treats its configured root as an existing storage
   # directory.  Remote backends establish their own namespace during
@@ -164,7 +175,7 @@ PY
       completed="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
       write_cell_result "$source" "$destination" failed "$started" "$completed" "$artifact"
       echo "$cell readback mismatch" >&2
-      return 1
+      return 0
     }
     completed="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
     write_cell_result "$source" "$destination" passed "$started" "$completed" "$artifact"
@@ -172,7 +183,7 @@ PY
   else
     completed="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
     write_cell_result "$source" "$destination" failed "$started" "$completed" "$artifact"
-    return 1
+    echo "TS-SINGLE/$cell failed" >&2
   fi
 }
 
@@ -182,6 +193,7 @@ for source in "${profiles[@]}"; do
   done
 done
 
+# 先保留各存储路径的结果，再由汇总校验判定整个验收。
 terrasync_commit="$(git -C "$repo_root" rev-parse HEAD)"
 data_mover_commit="$(sed -n 's/.*data-mover-rs\.git?rev=\([0-9a-f]*\)#.*/\1/p' "$repo_root/Cargo.lock" | head -1)"
 profiles_csv="$(IFS=,; printf '%s' "${profiles[*]}")"
