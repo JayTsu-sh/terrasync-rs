@@ -18,6 +18,10 @@ if [[ "${TS_SINGLE_DEFER_CIFS:-false}" == true ]]; then
   deferred_profiles=(cifs_fas2750)
   cifs_enabled=false
 fi
+if [[ "$cifs_enabled" == true ]]; then
+  echo 'CIFS matrix disabled: recursive cleanup containment has not been verified' >&2
+  exit 2
+fi
 require_single_matrix_credentials "$cifs_enabled"
 if [[ ! "$LAB_DXN_S3_ENDPOINT" =~ ^http://[a-zA-Z0-9.-]+(:[0-9]+)?$ ]]; then
   echo "LAB_DXN_S3_ENDPOINT must be an HTTP origin without credentials or a path" >&2
