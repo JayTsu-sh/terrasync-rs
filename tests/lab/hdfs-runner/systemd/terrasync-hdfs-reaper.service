@@ -1,0 +1,8 @@
+[Unit]
+Description=Reconcile local TerraSync HDFS certification resources
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 -E -s -B /opt/terrasync-hdfs-managed/hdfs_lab.py sweep
+TimeoutStartSec=60s
+UMask=0077

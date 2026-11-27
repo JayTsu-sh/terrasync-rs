@@ -430,18 +430,55 @@ cause is unavailable; operation-stage failures retain their typed class.
 The wrapper is Nightly-specific; callers of the underlying scripts can still
 supply their own HDFS environment and `LAB_HDFS_BASE_PATH`.
 
-`run-hdfs-e2e.sh` certifies the pinned `data-mover` revision against the HA,
-Kerberos-protected HDFS cluster. The runner provides `LAB_HDFS_LOCATION`,
-`LAB_HDFS_ADMIN_USER`, `LAB_HDFS_CONFIG_DIR`, and `LAB_HDFS_KEYTAB`. It covers
-HDFS-to-HDFS copy and full integrity in both single-process and separate QUIC
-sender/receiver modes. A separate data-only HDFS-to-local readback verifies
-each destination SHA-256 without requiring HDFS names to map to local UID/GID.
-The sender receives source credentials only and the receiver destination credentials only. Missing source configuration and an
-invalid keytab are negative gates, including a secret-leak assertion. All HDFS
-paths, ClickHouse databases, copied keytabs, credential caches, and generated
-0600 configs are scoped to the run id and removed by the exit trap. The JSON
-artifact follows `tests/lab/evidence-matrix.json` and records both exact commit
-identities.
+The HDFS certification runs the pinned `data-mover` revision against the
+lab's Kerberos HDFS cluster. It exercises single-process and separate QUIC
+sender/receiver HDFS copies, verifies the results through a data-only
+readback, and checks missing configuration and invalid credentials.
+
+On runner VM 102, install the managed certification from a reviewed checkout.
+The existing root-owned `/usr/bin/clickhouse` must match the SHA-256 approved
+for that runner. Run as the host administrator:
+
+```bash
+tests/lab/hdfs-runner/install-managed.sh github-runner "$APPROVED_CLICKHOUSE_SHA256"
+```
+
+The installer enables the runner's lingering systemd user manager, its
+cleanup timer, and a private 2 GiB scratch tmpfs. The Actions step passes the
+run ID and locations of the compiled binaries through
+`python3 tests/lab/hdfs_lab.py run "$RUN_ID" --output "$OUTPUT_DIR"`.
+Run it as `github-runner` with `XDG_RUNTIME_DIR=/run/user/1000` and its
+user DBus socket. The runner UID shares the existing trust boundary across
+repositories. No changes to Docker, the existing ClickHouse service, or the
+HDFS SSH forwarding rules are needed.
+
+Each attempt gets a private loopback ClickHouse server and data directory.
+The systemd unit owns the test processes, SSH and ClickHouse in one cgroup.
+It keeps a copy of the existing lab lock descriptor even if the main
+process is killed. Setup waits up to 120 seconds for the lock, the unit runs
+for up to 40 minutes, and stopping it allows up to 75 seconds before
+systemd signals remaining processes. The caller renews a 90-second lease.
+The independent timer stops abandoned attempts and reconciles local
+resources after verifying that the cgroup is empty. It checks the lease at
+30-second intervals. If it cannot prove quiescence, it leaves the private
+files and any retained lock in place for a later check or operator action.
+
+Persistent records live at
+`~/.local/state/terrasync-hdfs-managed/<run-id>/state.json`. A rerun with the
+same ID returns the recorded outcome. For a fresh attempt use a new run ID.
+Use `hdfs_lab.py reconcile <run-id> --cancel --output <directory>` to stop
+and inspect an attempt, or omit `--cancel` to observe an active one.
+The recovery command never issues HDFS operations. For an unknown or
+failed HDFS cleanup, use the recorded scope and routing details to locate
+the original cluster and verify it independently before manual cleanup.
+A known alias or routing fingerprint alone does not prove cluster identity.
+
+The workflow publishes a diagnostic artifact for failures and cancellations,
+with a separate certification artifact only after the gate, local cleanup,
+HDFS cleanup, and report publication have passed. Other Nightly storage
+and ClickHouse tests continue to exercise their existing database endpoints.
+Previously leaked databases on shared ClickHouse require a separate
+operator review.
 
 `run-single-process-matrix.sh` is the authoritative `TS-SINGLE` evidence gate.
 It emits 64 independent cell records for Local, NFSv3, NFSv4.0, NFSv4.1,

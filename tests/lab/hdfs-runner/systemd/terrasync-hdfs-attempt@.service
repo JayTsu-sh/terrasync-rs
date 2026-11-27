@@ -1,0 +1,19 @@
+[Unit]
+Description=TerraSync HDFS certification attempt %i
+
+[Service]
+Type=exec
+ExecStart=/usr/bin/python3 -E -s -B /opt/terrasync-hdfs-managed/hdfs_lab.py worker %i
+NotifyAccess=main
+FileDescriptorStoreMax=1
+FileDescriptorStorePreserve=yes
+KillMode=mixed
+TimeoutStopSec=75s
+RuntimeMaxSec=40min
+Restart=no
+OOMPolicy=stop
+UMask=0077
+MemoryMax=5G
+TasksMax=768
+CPUQuota=600%
+LimitFSIZE=1G
