@@ -73,13 +73,17 @@ jobs:
         run: cargo build --release --locked --features lab-fault-injection
       - name: Storage and integrity E2E matrix
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
-        run: flock --wait 10800 /tmp/terrasync-lab-tests.lock tests/lab/run-e2e.sh "$RUN_ID"
+        run: |
+          TERRASYNC_BINARY="$CARGO_TARGET_DIR/release/terrasync" \
+            flock --wait 10800 /tmp/terrasync-lab-tests.lock tests/lab/run-e2e.sh "$RUN_ID"
       - name: TS-SINGLE 49-cell matrix (CIFS deferred)
         id: single_matrix
-        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        if: ${{ !cancelled() && steps.prepare.outcome == 'success' }}
         env:
           TS_SINGLE_DEFER_CIFS: "true"
-        run: flock --wait 10800 /tmp/terrasync-lab-tests.lock tests/lab/run-single-process-matrix.sh "$RUN_ID"
+        run: |
+          TERRASYNC_SINGLE_MATRIX_BINARY="$CARGO_TARGET_DIR/release/examples/single_process_matrix" \
+            flock --wait 10800 /tmp/terrasync-lab-tests.lock tests/lab/run-single-process-matrix.sh "$RUN_ID"
       - name: Upload TS-SINGLE matrix evidence
         if: ${{ always() && steps.single_matrix.outcome != 'skipped' }}
         uses: actions/upload-artifact@v4
@@ -90,7 +94,10 @@ jobs:
       - name: HDFS single and remote process E2E
         id: hdfs
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
-        run: flock --wait 10800 /tmp/terrasync-lab-tests.lock tests/lab/run-hdfs-e2e.sh "$RUN_ID"
+        run: |
+          TERRASYNC_BINARY="$CARGO_TARGET_DIR/release/terrasync" \
+            flock --wait 10800 /tmp/terrasync-lab-tests.lock tests/lab/run-hdfs-e2e.sh "$RUN_ID"
+          test -s "$RUNNER_TEMP/terrasync-harness-results/$RUN_ID-hdfs.json"
       - name: Upload HDFS certification evidence
         if: ${{ always() && steps.hdfs.outcome != 'skipped' }}
         uses: actions/upload-artifact@v4
