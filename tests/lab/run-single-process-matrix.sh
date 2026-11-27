@@ -19,27 +19,17 @@ export LAB_DXN_S3_BUCKET LAB_DXN_S3_ENDPOINT LAB_DXN_S3_ACCESS_KEY LAB_DXN_S3_SE
 
 runtime_root="$lab_root/runtime"
 raw_log="$runtime_root/operation.log"
-cancelled=false
-trap 'cancelled=true' INT TERM HUP
+hdfs_touched=false
+watch_matrix_cancellation
 
-run_bounded() {
-  local deadline="$1" pid status=0
-  shift
-  [[ "$cancelled" == false ]] || return 143
-  timeout --foreground --kill-after=4s "$deadline" "$@" &
-  pid=$!
-  if [[ "$cancelled" == false ]]; then
-    wait "$pid" || status=$?
-  fi
-  if [[ "$cancelled" == true ]]; then
-    kill -TERM "$pid" 2>/dev/null || true
-    while kill -0 "$pid" 2>/dev/null; do
-      wait "$pid" || true
-    done
-    return 143
-  fi
-  return "$status"
-}
+cleanup_hdfs() (
+  # HDFS 只在生产进程退出时清理一次，沿用当前隧道和凭据。
+  trap '' INT TERM HUP
+  cancelled=false
+  matrix_kill_grace=5
+  record_operation hdfs.delete true 45s hdfs:destination -- \
+    "$binary" --delete-hdfs-run "$hdfs_base" "$hdfs_scope"
+)
 
 check_cancelled() {
   [[ "$cancelled" == false ]] || exit 143
@@ -49,6 +39,9 @@ cleanup() {
   local status="$?"
   trap - EXIT
   if [[ -f "$state_root/run.json" ]]; then
+    if [[ "$hdfs_touched" == true ]]; then
+      cleanup_hdfs || status=1
+    fi
     if [[ "$cancelled" == true ]] || (( status == 130 || status == 143 )); then
       status=143
       evidence mark producer cancelled || status=143
@@ -118,8 +111,8 @@ cp --reflink=auto "$target_root/release/examples/single_process_matrix" "$binary
 sync "$binary"
 check_cancelled
 hdfs_run_root="$(hdfs_run_root "$hdfs_scope")"
+hdfs_base="${hdfs_run_root%/$hdfs_scope/hdfs}"
 hdfs_root="$hdfs_run_root/single-process-matrix"
-evidence mark hdfs_target "$hdfs_run_root"
 evidence mark dxn_target "$LAB_DXN_S3_ENDPOINT/$LAB_DXN_S3_BUCKET"
 
 profile_root_url() {
@@ -194,8 +187,9 @@ PY
   expected="$(sha256sum "$fixture" | cut -d' ' -f1)"
   source_root="$(storage_url source "$source" "$cell")"
   destination_root="$(storage_url destination "$destination" "$cell")"
-  if [[ "$source" == hdfs || "$destination" == hdfs ]]; then
+  if [[ "$hdfs_touched" == false && ( "$source" == hdfs || "$destination" == hdfs ) ]]; then
     evidence mark touched hdfs
+    hdfs_touched=true
   fi
   if [[ "$source" == s3_dxn || "$destination" == s3_dxn ]]; then
     evidence mark touched dxn

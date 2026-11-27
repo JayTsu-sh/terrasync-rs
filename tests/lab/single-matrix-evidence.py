@@ -26,7 +26,7 @@ CAUSES = set(
     "TimedOut ConnectionLost SessionInvalidated OutcomeUnknown smb_logon_rejected smb_access_denied "
     "smb_io_timeout smb_session_lost smb_status smb_deadline smb_transport".split()
 )
-OUTCOMES = {"unknown", "not_indicated", "changed_or_unknown", "published"}
+OUTCOME_ORDER = ("not_indicated", "acknowledged", "published", "changed_or_unknown", "unknown")
 
 
 def read(path):
@@ -113,7 +113,7 @@ def redacted_diagnostics(log):
         "operation": OPERATIONS | {None},
         "provenance": {"typed", "classified", "adapter_diagnostic", "unclassified"},
         "cause": CAUSES | {None},
-        "write_outcome": OUTCOMES,
+        "write_outcome": OUTCOME_ORDER,
     }
     with open(log, encoding="utf-8", errors="replace") as handle:
         for line in handle:
@@ -153,7 +153,7 @@ def finish(path, exit_code, log):
         if diagnostics and exit_code not in (124, 130, 137, 143):
             status["write_outcome"] = max(
                 (item.get("write_outcome", status["write_outcome"]) for item in diagnostics),
-                key=("not_indicated", "published", "changed_or_unknown", "unknown").index,
+                key=OUTCOME_ORDER.index,
             )
         print(f"{status['operation']} failed: {cause} (exit {exit_code})", file=sys.stderr)
     durable_write(path, status)
@@ -193,7 +193,8 @@ def publish(evidence, workflow_outcome):
     report = read(evidence.parent / "run.json")
     touched = report.pop("touched")
     producer = report.pop("producer")
-    workflow_outcome = workflow_outcome or report.pop("workflow_outcome", "")
+    if report.get("workflow_outcome") == "cancelled":
+        workflow_outcome = "cancelled"
     for field in ("workflow_outcome", "hdfs_target", "dxn_target"):
         report.pop(field, None)
     operations = [read(path) for path in attempt_paths(evidence)]
@@ -239,7 +240,7 @@ def publish(evidence, workflow_outcome):
     required_cleanup = ("hdfs", "s3_dxn") if report["deferred_profiles"] else ("hdfs", "s3_dxn", "cifs")
     if workflow_outcome == "cancelled" or producer == "cancelled":
         overall = "cancelled"
-    elif producer == "finished" and workflow_outcome in ("", "success"):
+    elif producer == "finished" and workflow_outcome == "success":
         cifs_ready = report["deferred_profiles"] or (ownership and report["cifs"]["setup"] == "passed")
         overall = "completed" if (
             report["source_state"] == "clean"

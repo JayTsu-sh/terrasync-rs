@@ -445,14 +445,22 @@ matrix covers 64 ordered pairs of Local, NFSv3, NFSv4.0, NFSv4.1, FAS2750 CIFS,
 standard S3, DXN S3, and HDFS. Each cell preloads its source, uses the
 protocol-neutral `Storage + run_local_transfer` path, verifies the copy with
 BLAKE3 and compares the fixture and destination readback SHA-256 digests.
-The validator requires all 64 cells and checks that the latest operation
-attempts confirm CIFS setup and HDFS, CIFS and DXN cleanup.
+The validator requires all 64 cells. The latest preload, copy and readback
+attempts must succeed for each cell with the expected endpoints. The latest
+attempts must also confirm CIFS setup and HDFS, CIFS and DXN cleanup.
 `TS_SINGLE_DEFER_CIFS=true` runs the 49 non-CIFS pairs as a diagnostic.
 
-Release validation defaults to the workflow dispatch commit. A supplied
-branch, commit or tag must include `run-and-reconcile-single-process-matrix.sh`
-with `TS-SINGLE lifecycle contract v1`. The workflow rejects older refs before
-starting lab checks or fixture setup.
+Dispatch Release validation from `main`. It defaults to the dispatch commit.
+A supplied branch, commit or tag must resolve to a commit reachable from
+`main` and include `TS-SINGLE lifecycle contract v2`. The job checks the
+selected checkout before starting lab checks or fixture setup.
+
+Enforcing the dispatch ref at runner admission requires GitHub runner-group
+policy that allows only trusted workflow paths pinned to protected refs.
+Workflow YAML guards can be edited on other dispatch refs. Verify this policy
+for every runner with lab access before relying on the workflow as a security
+boundary.
+[GitHub runner-group policy](https://docs.github.com/en/rest/actions/self-hosted-runner-groups#update-a-self-hosted-runner-group-for-an-organization)
 
 The producer requires a clean checkout, including untracked files. It captures
 HEAD and the resolved data-mover commit from the lockfile before building, then
@@ -475,17 +483,19 @@ destination's marker verification.
 The driver derives each CIFS path from that receipt, the cell ID and the role.
 
 Reconciliation checks each endpoint with a fresh connection. It recursively
-removes only the matrix data subtree, after verifying the receipt and its
-marker, then durably records that the subtree is gone before deleting the
-marker. If the marker deletion reply is lost, this state lets the other
-endpoint finish removing the scope, and fresh checks confirm absence on both
+removes only the matrix data subtree. Before deleting the marker, the driver
+records whether the marker was verified on both endpoints during setup and
+still present when cleanup began. This evidence lets a retry remove a late
+cell create under the exact scope even after the marker is gone. Cell requests
+can only create descendants of the scope. Removing the empty scope prevents
+them from creating paths there afterward. Fresh checks confirm absence on both
 endpoints. An unconfirmed scope create leaves cleanup failed and retains the
 receipt and driver even when both endpoints currently show no directory. The
 pinned CIFS namespace API cannot establish whether the create may still commit
 or prove that a directory appearing later belongs to the run. A collision,
 denied observation or unexpected marker absence leaves the scope for inspection.
-A receipt that records finalization cannot authorize recursive deletion of data
-that appears afterward.
+Finalization without two-endpoint verification authorizes only non-recursive
+deletion of the private marker and empty scope.
 
 The receipt, exact driver and incrementally written evidence live in the
 self-hosted runner account's persistent
@@ -496,7 +506,8 @@ the shared lab lock from production through reconciliation. A bounded
 `always()` step tries to recover unfinished reconciliation. The workflows upload
 the `evidence/` subdirectory on failure and cancellation. It includes operation
 attempts, interrupted or unknown write outcomes, and allowlisted role, phase and
-cause fields. The private receipt and raw backend output stay on the runner. The pinned
+cause fields. Acknowledged mutations are recorded alongside any later error in
+the same attempt. The private receipt and raw backend output stay on the runner. The pinned
 data-mover CIFS connector formats SMB connect errors as text. The report
 identifies known SMB statuses and transport errors with `adapter_diagnostic`
 provenance and leaves other connect causes unclassified.
@@ -509,17 +520,24 @@ so its outcome stays unknown and the owned scope remains subject to
 reconciliation. CIFS cleanup allows 30 seconds per endpoint. When one endpoint
 confirms absence, the reconciler makes one fresh read-only check through the
 other endpoint after a transport failure, timeout or unknown mutation outcome.
-An interrupted matrix remains cancelled even if reconciliation succeeds. If
+The operation supervisor holds the locks through cancellation, the kill grace
+period and worker reaping. The producer performs the existing one-time HDFS
+cleanup with its active credentials and tunnel. Recovery handles CIFS and DXN
+only. A failed or interrupted HDFS cleanup stays visible in the gate evidence.
+
+Recorded cancellation remains in effect even if reconciliation succeeds. If
 Actions force-stops the job or the runner goes offline, use the same runner
 account, run ID, credentials and endpoints to rerun reconciliation under the lab lock.
+Supply the known terminal Actions outcome as the final argument. Omit it when
+the outcome is unknown to leave the report incomplete.
 
 ```sh
 flock --no-fork --wait 60 /tmp/terrasync-lab-tests.lock \
-  tests/lab/reconcile-single-process-matrix.sh "$RUN_ID" --hdfs-tunnel
+  tests/lab/reconcile-single-process-matrix.sh "$RUN_ID" --direct cancelled
 ```
 
-Use `--hdfs-tunnel` for Nightly and `--direct` for Release. Keep the private
-run state across retries and until the cleanup result has been verified.
+Use the same command for Nightly and Release. Keep the private run state
+across retries and until the cleanup result has been verified.
 
 Nightly sets the DXN S3 endpoint and private test bucket through
 `LAB_DXN_NIGHTLY_ENDPOINT` and `LAB_DXN_NIGHTLY_BUCKET` repository variables.

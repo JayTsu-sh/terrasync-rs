@@ -33,6 +33,14 @@ impl Cause {
         }
     }
 
+    pub(super) fn acknowledged_namespace() -> Self {
+        Self {
+            operation: Some(Operation::Namespace),
+            provenance: "typed",
+            ..Self::unclassified()
+        }
+    }
+
     pub(super) fn unknown_outcome(class: FailureClass) -> Self {
         Self {
             reason: Some("OutcomeUnknown"),

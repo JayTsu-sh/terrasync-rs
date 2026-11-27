@@ -92,19 +92,22 @@ jobs:
         if: ${{ always() && steps.single_matrix.outputs.reconciled != 'true' && steps.single_matrix.outcome != 'skipped' && steps.single_matrix.outcome != '' }}
         timeout-minutes: 9
         env:
-          MATRIX_OUTCOME: ${{ job.status == 'cancelled' && 'cancelled' || steps.single_matrix.outputs.producer_outcome || steps.single_matrix.outcome }}
+          MATRIX_OUTCOME: ${{ job.status == 'cancelled' && 'cancelled' || steps.single_matrix.outcome }}
           LAB_CIFS_NIGHTLY_USERNAME: ${{ secrets.LAB_CIFS_NIGHTLY_USERNAME }}
           LAB_CIFS_NIGHTLY_PASSWORD: ${{ secrets.LAB_CIFS_NIGHTLY_PASSWORD }}
           LAB_DXN_S3_ENDPOINT: ${{ vars.LAB_DXN_NIGHTLY_ENDPOINT }}
           LAB_DXN_S3_BUCKET: ${{ vars.LAB_DXN_NIGHTLY_BUCKET }}
           LAB_DXN_S3_ACCESS_KEY: ${{ secrets.LAB_DXN_NIGHTLY_ACCESS_KEY }}
           LAB_DXN_S3_SECRET_KEY: ${{ secrets.LAB_DXN_NIGHTLY_SECRET_KEY }}
-        run: exec flock --no-fork --wait 60 /tmp/terrasync-lab-tests.lock tests/lab/reconcile-single-process-matrix.sh "$RUN_ID" --hdfs-tunnel "$MATRIX_OUTCOME"
+        run: exec flock --no-fork --wait 60 /tmp/terrasync-lab-tests.lock tests/lab/reconcile-single-process-matrix.sh "$RUN_ID" --direct "$MATRIX_OUTCOME"
       - name: Finalize interrupted TS-SINGLE evidence
-        if: ${{ always() && steps.reconcile_matrix.outcome != 'success' && steps.reconcile_matrix.outcome != 'skipped' && steps.reconcile_matrix.outcome != '' }}
+        if: >-
+          ${{ always() && steps.single_matrix.outcome != 'skipped' && steps.single_matrix.outcome != '' &&
+              (cancelled() || (steps.reconcile_matrix.outcome != 'success' &&
+                               steps.reconcile_matrix.outcome != 'skipped' && steps.reconcile_matrix.outcome != '')) }}
         timeout-minutes: 1
         env:
-          MATRIX_OUTCOME: ${{ job.status == 'cancelled' && 'cancelled' || steps.single_matrix.outputs.producer_outcome || steps.single_matrix.outcome }}
+          MATRIX_OUTCOME: ${{ job.status == 'cancelled' && 'cancelled' || steps.single_matrix.outcome }}
         run: tests/lab/reconcile-single-process-matrix.sh "$RUN_ID" --report-only "$MATRIX_OUTCOME"
       - name: Upload TS-SINGLE matrix evidence
         if: ${{ always() && steps.single_matrix.outcome != 'skipped' && steps.single_matrix.outcome != '' }}

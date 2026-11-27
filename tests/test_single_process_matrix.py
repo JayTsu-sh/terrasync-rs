@@ -16,6 +16,7 @@ import unittest
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 VALIDATOR_PATH = ROOT / "tests" / "lab" / "validate-single-process-matrix.py"
 LIFECYCLE_PATH = ROOT / "tests" / "lab" / "run-and-reconcile-single-process-matrix.sh"
+OPERATION_PATH = ROOT / "tests" / "lab" / "run-single-matrix-operation.py"
 
 
 def load_validator():
@@ -32,6 +33,7 @@ class SingleProcessMatrixTest(unittest.TestCase):
 
     def report(self):
         cells = []
+        transfers = []
         for source in self.profiles:
             for destination in self.profiles:
                 cells.append({
@@ -47,6 +49,18 @@ class SingleProcessMatrixTest(unittest.TestCase):
                     "expected_sha256": "d" * 64,
                     "readback_sha256": "d" * 64,
                 })
+                for phase, endpoints in (
+                    ("preload", ["local:source", f"{source}:source"]),
+                    ("copy", [f"{source}:source", f"{destination}:destination"]),
+                    ("readback", [f"{destination}:destination", "local:destination"]),
+                ):
+                    transfers.append({
+                        "operation": f"{source}__{destination}.{phase}",
+                        "endpoints": endpoints,
+                        "status": "passed",
+                        "exit_code": 0,
+                        "write_outcome": "acknowledged",
+                    })
         run_id = "release-matrix-test"
         return {
             "schema_version": 2,
@@ -64,7 +78,7 @@ class SingleProcessMatrixTest(unittest.TestCase):
             },
             "mode": "terrasync_single_process",
             "cleanup": {"hdfs": "passed", "s3_dxn": "passed", "cifs": "passed"},
-            "operations": [
+            "operations": transfers + [
                 {"operation": name, "status": "passed", "exit_code": 0, "write_outcome": outcome}
                 for name, outcome in (
                     ("hdfs.delete", "acknowledged"),
@@ -99,6 +113,24 @@ class SingleProcessMatrixTest(unittest.TestCase):
 
     def test_complete_64_cell_report_passes(self):
         self.validator.validate_report(self.report())
+
+    def test_passing_cells_require_matching_attempts_for_each_phase(self):
+        for phase in ("preload", "copy", "readback"):
+            name = f"cifs_fas2750__hdfs.{phase}"
+            for replacement in (None, {"status": "failed"}, {"status": "interrupted"},
+                                {"exit_code": 1}, {"endpoints": []}, {"write_outcome": "unknown"}):
+                with self.subTest(phase=phase, replacement=replacement):
+                    report = self.report()
+                    success = next(attempt for attempt in report["operations"] if attempt["operation"] == name)
+                    if replacement is None:
+                        report["operations"].remove(success)
+                    else:
+                        report["operations"].append({**success, **replacement})
+                    with self.assertRaisesRegex(ValueError, name):
+                        self.validator.validate_report(report)
+                    if replacement is not None:
+                        report["operations"].append(success)
+                        self.validator.validate_report(report)
 
     def test_latest_operation_attempt_must_support_the_cleanup_summary(self):
         for operation in ("cifs.delete.source", "hdfs.delete", "dxn.verify", "cifs.verify.destination"):
@@ -184,7 +216,10 @@ class SingleProcessMatrixTest(unittest.TestCase):
         report["profiles"] = active_profiles
         report["deferred_profiles"] = ["cifs_fas2750"]
         report["cleanup"]["cifs"] = "not_attempted"
-        cifs_operations = [item for item in report["operations"] if item["operation"].startswith("cifs.")]
+        cifs_operations = [
+            item for item in report["operations"]
+            if item["operation"].startswith("cifs.") or "cifs_fas2750" in item["operation"]
+        ]
         report["operations"] = [item for item in report["operations"] if item not in cifs_operations]
         report["cifs"] = {
             "scope": None,
@@ -216,7 +251,10 @@ class SingleProcessMatrixTest(unittest.TestCase):
 
     def test_validator_cli_reports_explicit_cifs_deferral(self):
         report = self.report()
-        report["operations"] = [item for item in report["operations"] if not item["operation"].startswith("cifs.")]
+        report["operations"] = [
+            item for item in report["operations"]
+            if not item["operation"].startswith("cifs.") and "cifs_fas2750" not in item["operation"]
+        ]
         report["cleanup"]["cifs"] = "not_attempted"
         report["cifs"] = {
             "scope": None,
@@ -276,10 +314,12 @@ class SingleProcessMatrixTest(unittest.TestCase):
             reconcile = workflow_text.index("id: reconcile_matrix", matrix)
             finalize = workflow_text.index("--report-only", reconcile)
             upload = workflow_text.index("Upload TS-SINGLE matrix evidence", finalize)
-            self.assertIn("if: ${{ always() }}", workflow_text[:matrix])
+            self.assertIn("if: ${{ always()", workflow_text[:matrix])
             self.assertIn(f'/tmp/terrasync-lab-tests.lock tests/lab/{LIFECYCLE_PATH.name}', workflow_text[matrix:reconcile])
             self.assertIn("always()", workflow_text[reconcile:finalize])
             self.assertIn("steps.single_matrix.outputs.reconciled != 'true'", workflow_text[reconcile:finalize])
+            self.assertNotIn("--hdfs-tunnel", workflow_text[reconcile:upload])
+            self.assertNotIn("outputs.producer_outcome", workflow_text[reconcile:upload])
             self.assertIn("always()", workflow_text[upload:])
             self.assertIn("~/.local/state/terrasync-single-matrix/", workflow_text[upload:])
         for secret in ("LAB_CIFS_NIGHTLY_USERNAME", "LAB_CIFS_NIGHTLY_PASSWORD"):
@@ -294,21 +334,28 @@ class SingleProcessMatrixTest(unittest.TestCase):
         end = release.index("\n      - ", start + 1)
         self.assertLess(end, release.index("tests/lab/health-check.sh"))
         self.assertIn("ref: ${{ inputs.ref || github.sha }}", release[:start])
+        self.assertIn("github.ref == 'refs/heads/main'", release[:start])
         command = textwrap.dedent(release[start:end].partition("        run: |\n")[2])
         with tempfile.TemporaryDirectory() as directory:
             lab = pathlib.Path(directory) / "tests" / "lab"
             lab.mkdir(parents=True)
             (lab / "run-single-process-matrix.sh").touch(mode=0o700)
-            for stage in ("legacy", "missing reconciliation", "compatible"):
-                if stage == "missing reconciliation":
-                    shutil.copy2(LIFECYCLE_PATH, lab)
-                if stage == "compatible":
-                    (lab / "reconcile-single-process-matrix.sh").touch(mode=0o700)
-                    (lab / VALIDATOR_PATH.name).touch(mode=0o700)
-                result = subprocess.run(["bash", "-ec", command], cwd=directory, capture_output=True, text=True)
-                self.assertEqual(result.returncode, 0 if stage == "compatible" else 2, result.stdout + result.stderr)
-                if stage != "compatible":
-                    self.assertIn("The selected release ref does not support", result.stdout)
+            (lab / "reconcile-single-process-matrix.sh").touch(mode=0o700)
+            (lab / VALIDATOR_PATH.name).touch(mode=0o700)
+            for version, has_supervisor, expected in ((1, True, 2), (2, False, 2), (2, True, 0)):
+                with self.subTest(version=version, has_supervisor=has_supervisor):
+                    lifecycle = lab / LIFECYCLE_PATH.name
+                    lifecycle.write_text(f"#!/bin/bash\n# TS-SINGLE lifecycle contract v{version}\n")
+                    lifecycle.chmod(0o700)
+                    supervisor = lab / OPERATION_PATH.name
+                    if has_supervisor:
+                        supervisor.touch()
+                    else:
+                        supervisor.unlink(missing_ok=True)
+                    result = subprocess.run(["bash", "-ec", command], cwd=directory, capture_output=True, text=True)
+                    self.assertEqual(result.returncode, expected, result.stdout + result.stderr)
+                    if expected != 0:
+                        self.assertIn("The selected release ref does not support", result.stdout)
 
     @unittest.skipUnless(sys.platform.startswith("linux"), "lab locking uses Linux flock")
     def test_producer_and_reconciler_share_the_lock_and_preserve_producer_status(self):
@@ -406,12 +453,15 @@ def record(event):
     with (root / "events").open("a") as handle:
         handle.write(json.dumps(event) + "\n")
 
-def diagnostic(phase, role, cause_class, write_outcome="not_indicated", cause=None):
+def emit(phase, role, cause_class, write_outcome, cause=None):
     print("MATRIX_DIAGNOSTIC=" + json.dumps({
         "phase": phase, "role": role, "endpoint": "10.128.61.200" if role == "source" else "10.128.61.201",
         "class": cause_class, "operation": "Namespace", "provenance": "adapter_diagnostic" if cause else "typed",
         "cause": cause, "write_outcome": write_outcome,
     }), file=sys.stderr)
+
+def diagnostic(phase, role, cause_class, write_outcome="not_indicated", cause=None):
+    emit(phase, role, cause_class, write_outcome, cause)
     print("MATRIX_DIAGNOSTIC=" + json.dumps({"phase": "redact-this-password"}), file=sys.stderr)
     print("redact-this-password", file=sys.stderr)
     sys.exit(1)
@@ -420,6 +470,10 @@ def save(state):
     receipt.write_text(json.dumps(state))
 
 if args[0] == "--delete-hdfs-run":
+    record(args)
+    if mode == "hdfs_cleanup_failure":
+        print("HDFS_CLEANUP_FAILURE=PermissionDenied", file=sys.stderr)
+        sys.exit(1)
     sys.exit(0)
 elif len(args) == 3:
     action, actual_run, role = args
@@ -445,6 +499,9 @@ elif len(args) == 3:
             diagnostic("create_scope", role, "Conflict")
         state["phase"] = "Created"
         save(state)
+        if mode == "marker_denied":
+            emit("create_scope", role, None, "acknowledged")
+            diagnostic("create_marker", role, "PermissionDenied")
         marker.mkdir()
         if mode == "kill_claim":
             (root / "ready").touch()
@@ -453,7 +510,7 @@ elif len(args) == 3:
         save(state)
     elif action == "--verify-cifs-run":
         assert role == "destination" and marker.is_dir() and state["phase"] == "Claimed"
-        if mode == "inaccessible":
+        if mode in ("inaccessible", "cleanup_worker"):
             diagnostic("observe_marker", role, "PermissionDenied")
         state["phase"] = "Ready"
         save(state)
@@ -465,17 +522,26 @@ elif len(args) == 3:
         if not scope.is_dir():
             sys.exit(0)
         assert action == "--delete-cifs-run"
-        if marker.exists():
-            assert state["phase"] in ("Created", "Claimed", "Ready", "Finalizing")
+        assert state["phase"] in ("Created", "Claimed", "Ready", "Finalizing", "FinalizingReady")
+        if state["phase"] == "Ready":
+            state["phase"] = "FinalizingReady"
+        elif state["phase"] != "FinalizingReady":
             state["phase"] = "Finalizing"
-            save(state)
+        save(state)
+        if marker.exists():
             marker.rmdir()
             if mode == "kill_cleanup":
                 (root / "ready").touch()
                 signal.pause()
+            if mode == "cleanup_worker" and role == "source":
+                if os.fork() == 0:
+                    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+                    (root / "ready").write_text(str(os.getpid()))
+                    while True:
+                        signal.pause()
+                signal.pause()
             if mode == "lost_delete_ack" and role == "source":
                 diagnostic("delete_marker", role, "Protocol", "unknown", "OutcomeUnknown")
-        assert state["phase"] == "Finalizing"
         scope.rmdir()
     else:
         raise AssertionError(args)
@@ -491,6 +557,9 @@ else:
             record(["transfer-stopped"])
             sys.exit(1)
         signal.signal(signal.SIGTERM, stop)
+        (root / "ready").touch()
+        signal.pause()
+    if mode == "pause_hdfs" and destination == "hdfs":
         (root / "ready").touch()
         signal.pause()
     if mode == "transfer_failure" and destination == "cifs_fas2750":
@@ -574,7 +643,7 @@ class MatrixRunnerTest(unittest.TestCase):
 
     def finish(self, process):
         try:
-            stdout, stderr = process.communicate(timeout=80)
+            stdout, stderr = process.communicate(timeout=150)
         finally:
             if process.poll() is None:
                 os.killpg(process.pid, signal.SIGKILL)
@@ -594,7 +663,8 @@ class MatrixRunnerTest(unittest.TestCase):
             return producer, report, events, stdout, stderr
         with self.start(mode, reconcile=True, workflow_outcome="success" if producer.returncode == 0 else "failure") as process:
             report, events, reconcile_stdout, reconcile_stderr = self.finish(process)
-        return process, report, events, stdout + reconcile_stdout, stderr + reconcile_stderr
+        status = process if process.returncode else producer
+        return status, report, events, stdout + reconcile_stdout, stderr + reconcile_stderr
 
     def test_64_cells_use_owned_paths_derived_from_cell_and_role(self):
         with self.start("", lifecycle=True) as process:
@@ -615,6 +685,9 @@ class MatrixRunnerTest(unittest.TestCase):
             "matrix-copy-cifs_fas2750__cifs_fas2750",
         ], events)
         self.assertEqual([event[2] for event in events if event[0] == "--delete-cifs-run"], ["source", "destination"])
+        hdfs_delete = [event for event in events if event[0] == "--delete-hdfs-run"]
+        self.assertEqual(len(hdfs_delete), 1)
+        self.assertLess(events.index(hdfs_delete[0]), next(i for i, event in enumerate(events) if event[0] == "--delete-cifs-run"))
         self.assertTrue(self.receipt.exists())
         self.assertFalse(self.lab_root.exists() and (self.lab_root / "single-process-matrix").exists())
 
@@ -668,20 +741,76 @@ class MatrixRunnerTest(unittest.TestCase):
             ("10.128.61.201", "observe_marker", "PermissionDenied", "not_indicated"),
         )
 
+    def test_marker_failure_preserves_the_acknowledged_scope_create(self):
+        _, report, _, _, stderr = self.run_mock("marker_denied")
+        self.assertIn("PermissionDenied", stderr)
+        claim = next(op for op in report["operations"] if op["operation"] == "cifs.claim.source")
+        self.assertEqual((claim["status"], claim["cause"], claim["write_outcome"]),
+                         ("failed", "PermissionDenied", "acknowledged"))
+        self.assertEqual(
+            [(item["phase"], item["write_outcome"]) for item in claim["diagnostics"]],
+            [("create_scope", "acknowledged"), ("create_marker", "not_indicated")],
+        )
+        self.assertEqual(report["cleanup"]["cifs"], "passed")
+
     def test_cleanup_failure_is_retained_after_a_successful_reconciliation(self):
         process, report, _, _, stderr = self.run_mock("cleanup_failure")
         self.assertNotEqual(process.returncode, 0)
         self.assertIn("Connectivity", stderr)
         self.assertEqual(report["cifs"]["cleanup"], {"source": "failed", "destination": "passed"})
         self.assertEqual(report["status"], "failed")
+        # 模拟旧版本在清理开始前持久化生产进程的 success。
+        run_path = self.state / "run.json"
+        run_path.write_text(json.dumps({**json.loads(run_path.read_text()), "workflow_outcome": "success"}))
         with self.start("", reconcile=True) as retry:
             report, _, _, stderr = self.finish(retry)
         self.assertEqual(retry.returncode, 0, stderr)
-        load_validator().validate_report(report)
+        self.assertEqual(report["status"], "incomplete")
+        with self.assertRaisesRegex(ValueError, "must be completed"):
+            load_validator().validate_report(report)
         attempts = [op for op in report["operations"] if op["operation"] == "cifs.delete.source"]
         self.assertEqual([op["status"] for op in attempts], ["failed", "failed", "passed"])
         self.assertEqual(attempts[0]["write_outcome"], "not_indicated")
         self.assertTrue(self.receipt.exists())
+        with self.start("", reconcile=True, workflow_outcome="cancelled", reconcile_mode="--report-only") as process:
+            report, _, _, _ = self.finish(process)
+        self.assertEqual(report["status"], "cancelled")
+        with self.start("", reconcile=True, workflow_outcome="success") as process:
+            report, _, _, _ = self.finish(process)
+        self.assertEqual(report["status"], "cancelled")
+
+    def test_failed_producer_hdfs_cleanup_is_never_retried_by_reconciliation(self):
+        with self.start("hdfs_cleanup_failure", lifecycle=True) as producer:
+            report, events, _, stderr = self.finish(producer)
+        self.assertNotEqual(producer.returncode, 0)
+        self.assertIn("hdfs.delete failed: PermissionDenied", stderr)
+        self.assertEqual(report["cleanup"], {"hdfs": "failed", "s3_dxn": "passed", "cifs": "passed"})
+        self.assertEqual(sum(event[0] == "--delete-hdfs-run" for event in events), 1)
+        with self.start("", reconcile=True) as retry:
+            report, events, _, _ = self.finish(retry)
+        self.assertEqual(report["cleanup"]["hdfs"], "failed")
+        self.assertEqual(sum(event[0] == "--delete-hdfs-run" for event in events), 1)
+
+    def test_crash_after_hdfs_was_touched_only_recovers_cifs_and_dxn(self):
+        with self.start("pause_hdfs") as producer:
+            self.stop_when_ready(producer, signal.SIGKILL)
+        with self.start("", reconcile=True, workflow_outcome="cancelled") as retry:
+            report, events, _, _ = self.finish(retry)
+        self.assertEqual(retry.returncode, 0)
+        self.assertEqual(report["status"], "cancelled")
+        self.assertEqual(report["cleanup"], {"hdfs": "not_attempted", "s3_dxn": "passed", "cifs": "passed"})
+        self.assertNotIn("--delete-hdfs-run", [event[0] for event in events])
+
+    def test_graceful_cancel_after_hdfs_was_touched_cleans_up_in_producer(self):
+        with self.start("pause_hdfs", lifecycle=True) as producer:
+            self.stop_when_ready(producer, signal.SIGTERM)
+        self.assertEqual(producer.returncode, 143)
+        with self.start("", reconcile=True, workflow_outcome="cancelled") as retry:
+            report, events, _, _ = self.finish(retry)
+        self.assertEqual(retry.returncode, 0)
+        self.assertEqual(report["status"], "cancelled")
+        self.assertEqual(report["cleanup"], {"hdfs": "passed", "s3_dxn": "passed", "cifs": "passed"})
+        self.assertEqual(sum(event[0] == "--delete-hdfs-run" for event in events), 1)
 
     def test_missing_receipt_blocks_reconciliation_with_a_claim_in_evidence(self):
         self.run_mock("inaccessible", reconcile=False)
@@ -707,9 +836,9 @@ class MatrixRunnerTest(unittest.TestCase):
         self.assertEqual(events[-1], ["--confirm-cifs-run", self.run_id, "source"])
 
     def test_failed_transfer_carries_phase_and_unknown_write_to_evidence(self):
-        process, report, _, _, _ = self.run_mock("transfer_failure")
-        self.assertNotEqual(process.returncode, 0)
-        self.assertEqual(report["status"], "failed")
+        process, report, _, _, stderr = self.run_mock("transfer_failure")
+        self.assertNotEqual(process.returncode, 0, stderr)
+        self.assertEqual(report["status"], "failed", stderr)
         operation = next(op for op in report["operations"] if op["operation"] == "local__cifs_fas2750.copy")
         self.assertEqual(operation["write_outcome"], "unknown")
         self.assertEqual(operation["diagnostics"][0]["phase"], "Publish")
@@ -746,6 +875,45 @@ class MatrixRunnerTest(unittest.TestCase):
         transfer = next(op for op in report["operations"] if op["operation"] == "local__cifs_fas2750.copy")
         self.assertEqual((transfer["status"], transfer["cause"], transfer["write_outcome"]), ("failed", "Cancelled", "unknown"))
         self.assertLess(events.index(["transfer-stopped"]), next(i for i, event in enumerate(events) if event[0] == "--delete-cifs-run"))
+
+    def test_lifecycle_keeps_locks_until_cancelled_cleanup_workers_exit(self):
+        with self.start("cleanup_worker", lifecycle=True) as process:
+            deadline = time.monotonic() + 15
+            ready = self.root / "ready"
+            while not (ready.exists() and ready.stat().st_size):
+                self.assertIsNone(process.poll())
+                self.assertLess(time.monotonic(), deadline)
+                time.sleep(0.01)
+            worker = int(ready.read_text())
+            process.send_signal(signal.SIGTERM)
+            for lock in (self.root / "lab.lock", self.state / "run.lock"):
+                probe = subprocess.run(["flock", "--nonblock", str(lock), "true"], check=False)
+                self.assertEqual(probe.returncode, 1)
+            report, events, _, _ = self.finish(process)
+        self.assertEqual(process.returncode, 143)
+        self.assertFalse(pathlib.Path(f"/proc/{worker}").exists())
+        self.assertEqual(report["status"], "cancelled")
+        self.assertEqual([event[2] for event in events if event[0] == "--delete-cifs-run"], ["source"])
+        self.assertEqual(report["cifs"]["cleanup"], {"source": "failed", "destination": "not_attempted"})
+
+    def test_expired_operation_reaps_its_term_resistant_worker(self):
+        worker_path = self.root / "worker"
+        worker = textwrap.dedent("""\
+            import os, pathlib, signal, sys
+            if os.fork() == 0:
+                signal.signal(signal.SIGTERM, signal.SIG_IGN)
+                pathlib.Path(sys.argv[1]).write_text(str(os.getpid()))
+                while True:
+                    signal.pause()
+            signal.pause()
+            """)
+        result = subprocess.run(
+            [sys.executable, str(OPERATION_PATH), str(os.getpid()), "1s", "1",
+             sys.executable, "-c", worker, str(worker_path)],
+            timeout=8,
+        )
+        self.assertEqual(result.returncode, 137)
+        self.assertFalse(pathlib.Path(f"/proc/{worker_path.read_text()}").exists())
 
     def test_kill_during_claim_recovers_from_durable_receipt_after_runtime_loss(self):
         with self.start("kill_claim") as producer:

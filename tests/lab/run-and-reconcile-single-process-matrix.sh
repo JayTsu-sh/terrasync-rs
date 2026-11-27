@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# TS-SINGLE lifecycle contract v1
+# TS-SINGLE lifecycle contract v2
 # The caller holds the shared lab lock until this command exits.
 set -euo pipefail
 run_id="${1:?run id required}"
@@ -45,7 +45,7 @@ fi
 [[ "$cancelled" == false ]] || exit 143
 
 reconcile_status=0
-run_phase "$script_dir/reconcile-single-process-matrix.sh" "$run_id" "$mode" "$outcome" || reconcile_status=$?
+run_phase "$script_dir/reconcile-single-process-matrix.sh" "$run_id" --direct "$outcome" || reconcile_status=$?
 [[ "$cancelled" == false ]] || exit 143
 if (( reconcile_status == 0 )) && [[ -n "${GITHUB_OUTPUT:-}" ]]; then
   printf 'reconciled=true\n' >> "$GITHUB_OUTPUT"

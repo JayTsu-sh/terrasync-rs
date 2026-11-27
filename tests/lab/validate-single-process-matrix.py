@@ -34,7 +34,7 @@ CELL_FIELDS = (
 )
 
 
-def validate_operation_evidence(operations, deferred):
+def validate_operation_evidence(operations, profiles, deferred):
     if not isinstance(operations, list):
         raise ValueError("operation evidence must be an array")
     latest = {}
@@ -43,7 +43,7 @@ def validate_operation_evidence(operations, deferred):
         if not isinstance(attempt, dict) or not isinstance(attempt.get("operation"), str):
             raise ValueError("each operation attempt must identify its operation")
         name = attempt["operation"]
-        if deferred and name.startswith("cifs."):
+        if deferred and (name.startswith("cifs.") or "cifs_fas2750" in name.rpartition(".")[0].split("__")):
             raise ValueError("deferred CIFS must have no operation attempts")
         latest[name] = attempt
 
@@ -62,7 +62,7 @@ def validate_operation_evidence(operations, deferred):
             "cifs.delete.source": {"acknowledged", "not_indicated"},
             "cifs.delete.destination": {"acknowledged", "not_indicated"},
         })
-    for name, outcomes in required.items():
+    def confirm(name, outcomes, endpoints=None):
         attempt = latest.get(name, {})
         if (
             attempt.get("status") != "passed"
@@ -70,8 +70,22 @@ def validate_operation_evidence(operations, deferred):
             or attempt["exit_code"] != 0
             or not isinstance(attempt.get("write_outcome"), str)
             or attempt["write_outcome"] not in outcomes
+            or (endpoints is not None and attempt.get("endpoints") != endpoints)
         ):
             raise ValueError(f"latest operation attempt for {name} must confirm success")
+
+    for name, outcomes in required.items():
+        confirm(name, outcomes)
+    for source in profiles:
+        for destination in profiles:
+            cell = f"{source}__{destination}"
+            phases = {
+                "preload": ["local:source", f"{source}:source"],
+                "copy": [f"{source}:source", f"{destination}:destination"],
+                "readback": [f"{destination}:destination", "local:destination"],
+            }
+            for phase, endpoints in phases.items():
+                confirm(f"{cell}.{phase}", {"acknowledged"}, endpoints)
 
 
 def validate_report(report):
@@ -127,7 +141,7 @@ def validate_report(report):
         if cifs.get("setup") != "passed" or cifs.get("cleanup") != {"source": "passed", "destination": "passed"}:
             raise ValueError("CIFS ownership verification and cleanup on both endpoints must pass")
 
-    validate_operation_evidence(report.get("operations"), deferred)
+    validate_operation_evidence(report.get("operations"), profiles, deferred)
 
     cells = report.get("cells")
     expected_count = len(profiles) ** 2

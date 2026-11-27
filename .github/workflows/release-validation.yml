@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       ref:
-        description: Branch, commit, or tag with TS-SINGLE lifecycle contract v1 (defaults to the dispatch commit)
+        description: Branch, commit, or tag with TS-SINGLE lifecycle contract v2 (defaults to the dispatch commit)
         required: false
 
 permissions:
@@ -16,8 +16,8 @@ concurrency:
 
 jobs:
   release:
-    # Keep the job eligible for reconciliation when the matrix step is cancelled.
-    if: ${{ always() }}
+    # Runner access must also enforce the trusted workflow ref.
+    if: ${{ always() && github.ref == 'refs/heads/main' }}
     runs-on: [self-hosted, linux, x64, terrasync-lab, terrasync-rs]
     environment: release
     timeout-minutes: 360
@@ -47,9 +47,10 @@ jobs:
         run: |
           lifecycle=tests/lab/run-and-reconcile-single-process-matrix.sh
           if [[ ! -x "$lifecycle" || ! -x tests/lab/run-single-process-matrix.sh ||
-                ! -x tests/lab/reconcile-single-process-matrix.sh || ! -x tests/lab/validate-single-process-matrix.py ]] ||
-             ! grep -Fxq '# TS-SINGLE lifecycle contract v1' "$lifecycle"; then
-            echo '::error::The selected release ref does not support TS-SINGLE lifecycle contract v1. Select a ref containing the current matrix producer and reconciler.'
+                ! -x tests/lab/reconcile-single-process-matrix.sh || ! -x tests/lab/validate-single-process-matrix.py ||
+                ! -r tests/lab/run-single-matrix-operation.py ]] ||
+             ! grep -Fxq '# TS-SINGLE lifecycle contract v2' "$lifecycle"; then
+            echo '::error::The selected release ref does not support TS-SINGLE lifecycle contract v2. Select a ref containing the current matrix producer and reconciler.'
             exit 2
           fi
       - uses: dtolnay/rust-toolchain@stable
@@ -80,15 +81,18 @@ jobs:
         if: ${{ always() && steps.single_matrix.outputs.reconciled != 'true' && steps.single_matrix.outcome != 'skipped' && steps.single_matrix.outcome != '' }}
         timeout-minutes: 9
         env:
-          MATRIX_OUTCOME: ${{ job.status == 'cancelled' && 'cancelled' || steps.single_matrix.outputs.producer_outcome || steps.single_matrix.outcome }}
+          MATRIX_OUTCOME: ${{ job.status == 'cancelled' && 'cancelled' || steps.single_matrix.outcome }}
           LAB_CIFS_NIGHTLY_USERNAME: ${{ secrets.LAB_CIFS_NIGHTLY_USERNAME }}
           LAB_CIFS_NIGHTLY_PASSWORD: ${{ secrets.LAB_CIFS_NIGHTLY_PASSWORD }}
         run: exec flock --no-fork --wait 60 /tmp/terrasync-lab-tests.lock tests/lab/reconcile-single-process-matrix.sh "$RUN_ID" --direct "$MATRIX_OUTCOME"
       - name: Finalize interrupted TS-SINGLE evidence
-        if: ${{ always() && steps.reconcile_matrix.outcome != 'success' && steps.reconcile_matrix.outcome != 'skipped' && steps.reconcile_matrix.outcome != '' }}
+        if: >-
+          ${{ always() && steps.single_matrix.outcome != 'skipped' && steps.single_matrix.outcome != '' &&
+              (cancelled() || (steps.reconcile_matrix.outcome != 'success' &&
+                               steps.reconcile_matrix.outcome != 'skipped' && steps.reconcile_matrix.outcome != '')) }}
         timeout-minutes: 1
         env:
-          MATRIX_OUTCOME: ${{ job.status == 'cancelled' && 'cancelled' || steps.single_matrix.outputs.producer_outcome || steps.single_matrix.outcome }}
+          MATRIX_OUTCOME: ${{ job.status == 'cancelled' && 'cancelled' || steps.single_matrix.outcome }}
         run: tests/lab/reconcile-single-process-matrix.sh "$RUN_ID" --report-only "$MATRIX_OUTCOME"
       - name: Upload TS-SINGLE matrix evidence
         if: ${{ always() && steps.single_matrix.outcome != 'skipped' && steps.single_matrix.outcome != '' }}

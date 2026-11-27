@@ -25,6 +25,32 @@ evidence() {
   python3 "$repo_root/tests/lab/single-matrix-evidence.py" "$command" "$results_root" "$@"
 }
 
+watch_matrix_cancellation() {
+  cancelled=false
+  trap 'cancelled=true' INT TERM HUP
+}
+
+run_bounded() {
+  local deadline="$1" parent="$BASHPID" pid status=0
+  shift
+  [[ "$cancelled" == false ]] || return 143
+  # 监督进程独立于调用方的进程组。即使调用方被杀，它仍持锁直到操作及 worker 退出。
+  setsid python3 "$repo_root/tests/lab/run-single-matrix-operation.py" \
+    "$parent" "$deadline" "${matrix_kill_grace:-4}" "$@" &
+  pid=$!
+  if [[ "$cancelled" == false ]]; then
+    wait "$pid" || status=$?
+  fi
+  if [[ "$cancelled" == true ]]; then
+    kill -TERM "$pid" 2>/dev/null || true
+    while kill -0 "$pid" 2>/dev/null; do
+      wait "$pid" || true
+    done
+    return 143
+  fi
+  return "$status"
+}
+
 record_operation() {
   local name="$1" mutates="$2" deadline="$3" attempt status=0
   shift 3

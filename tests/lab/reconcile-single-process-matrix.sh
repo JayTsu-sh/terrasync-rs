@@ -5,55 +5,48 @@ source "$(dirname "$0")/single-process-matrix-common.sh"
 matrix_paths "${1:?run id required}"
 mode="${2:---direct}"
 workflow_outcome="${3:-}"
-case "$mode" in --direct|--hdfs-tunnel|--hdfs-only|--report-only) ;; *) exit 2 ;; esac
+case "$mode" in --direct|--report-only) ;; *) exit 2 ;; esac
+case "$workflow_outcome" in ''|success|failure|cancelled) ;; *) exit 2 ;; esac
+watch_matrix_cancellation
 # Matrix may have been cancelled before creating any state.
 [[ -d "$state_root" ]] || exit 0
-if [[ "$mode" == --hdfs-only ]]; then
-  # 子命令沿用父进程的运行锁，在 HDFS 隧道内使用相同回执。
-  flock --exclusive --nonblock 9
-else
-  exec 9>"$state_root/run.lock"
-  lock_wait=130
-  if [[ "$mode" == --report-only ]]; then lock_wait=20; fi
-  flock --exclusive --wait "$lock_wait" 9
-fi
+exec 9>"$state_root/run.lock"
+lock_wait=130
+if [[ "$mode" == --report-only ]]; then lock_wait=20; fi
+flock --exclusive --wait "$lock_wait" 9
 [[ -f "$state_root/run.json" ]] || exit 0
 
-if [[ "$mode" != --hdfs-only ]]; then
-  if [[ -n "$workflow_outcome" ]]; then
-    evidence mark workflow_outcome "$workflow_outcome"
+cleanup_runtime=""
+finish() {
+  local status=$?
+  trap - EXIT
+  if [[ "$cancelled" == true ]]; then
+    evidence mark workflow_outcome cancelled || true
+    evidence publish cancelled || true
+    status=143
   fi
-  evidence interrupt
-  if [[ "$mode" == --report-only ]]; then
-    evidence publish "$workflow_outcome"
-    exit
-  fi
+  if [[ -n "$cleanup_runtime" ]]; then rm -rf -- "$cleanup_runtime"; fi
+  exit "$status"
+}
+trap finish EXIT
+
+if [[ "$workflow_outcome" == cancelled ]]; then
+  evidence mark workflow_outcome cancelled
 fi
-
-cleanup_runtime="$(mktemp -d "${RUNNER_TEMP:-/tmp}/terrasync-matrix-cleanup.XXXXXXXX")"
-trap 'rm -rf -- "$cleanup_runtime"' EXIT
-raw_log="$cleanup_runtime/operation.log"
-run_bounded() {
-  local deadline="$1"
-  shift
-  timeout --foreground --kill-after=4s "$deadline" "$@"
-}
-
-delete_hdfs() {
-  local root
-  root="$(hdfs_run_root "$hdfs_scope")" || return
-  if [[ "$root" != "$(evidence field hdfs_target)" ]]; then
-    echo "HDFS_CLEANUP_FAILURE=InvalidInput" >&2
-    return 2
-  fi
-  export LAB_HDFS_DESTINATION_CCACHE="FILE:$cleanup_runtime/destination.ccache"
-  run_bounded 45s "$binary" --delete-hdfs-run "${root%/$hdfs_scope/hdfs}" "$hdfs_scope"
-}
-
-if [[ "$mode" == --hdfs-only ]]; then
-  delete_hdfs
+evidence interrupt
+if [[ "$mode" == --report-only ]]; then
+  evidence publish ""
   exit
 fi
+evidence publish ""
+
+check_cancelled() {
+  [[ "$cancelled" == false ]] || exit 143
+}
+
+check_cancelled
+cleanup_runtime="$(mktemp -d "${RUNNER_TEMP:-/tmp}/terrasync-matrix-cleanup.XXXXXXXX")"
+raw_log="$cleanup_runtime/operation.log"
 
 status=0
 if [[ -f "$TS_SINGLE_CIFS_RECEIPT" ]]; then
@@ -65,6 +58,7 @@ if [[ -f "$TS_SINGLE_CIFS_RECEIPT" ]]; then
     else
       cifs_failed+=("$role")
     fi
+    check_cancelled
   done
   for role in "${cifs_failed[@]}"; do
     # 对端确认目录消失后，用新连接重查此前响应不明的端点。
@@ -73,17 +67,11 @@ if [[ -f "$TS_SINGLE_CIFS_RECEIPT" ]]; then
     else
       status=1
     fi
+    check_cancelled
   done
 elif [[ "$(evidence status cifs.claim.source)" != not_attempted ]]; then
   echo "CIFS reconciliation requires the private receipt for $run_id" >&2
   status=1
-fi
-if evidence touched hdfs && [[ "$(evidence status hdfs.delete)" != passed ]]; then
-  hdfs_command=("$0" "$run_id" --hdfs-only)
-  if [[ "$mode" == --hdfs-tunnel ]]; then
-    hdfs_command=("$repo_root/tests/lab/with-hdfs-tunnel.sh" "${hdfs_command[@]}")
-  fi
-  record_operation hdfs.delete true 70s hdfs:destination -- "${hdfs_command[@]}" || status=1
 fi
 if evidence touched dxn && [[ "$(evidence status dxn.abort):$(evidence status dxn.delete):$(evidence status dxn.verify)" != passed:passed:passed ]]; then
   if [[ "$LAB_DXN_S3_ENDPOINT/$LAB_DXN_S3_BUCKET" != "$(evidence field dxn_target)" ]]; then
@@ -98,13 +86,17 @@ if evidence touched dxn && [[ "$(evidence status dxn.abort):$(evidence status dx
         record_operation "dxn.$operation" "$mutates" 30s s3_dxn -- \
         python3 "$repo_root/tests/lab/s3_helper.py" "${pair#*:}" \
           --endpoint "$LAB_DXN_S3_ENDPOINT" --bucket "$LAB_DXN_S3_BUCKET" --prefix "$matrix_prefix/" || status=1
+      check_cancelled
     done
   fi
 fi
+check_cancelled
 evidence publish "$workflow_outcome"
 (( status == 0 )) || exit "$status"
-rm -f -- "$binary"
+if ! evidence touched hdfs || [[ "$(evidence status hdfs.delete)" == passed ]]; then
+  rm -f -- "$binary"
+fi
 # 失败或取消继续保留证据，验收必须满足矩阵验证器。
-if [[ "$(evidence field producer)" == finished && "$(evidence field workflow_outcome)" != cancelled ]]; then
+if [[ "$workflow_outcome" == success && "$(evidence field workflow_outcome)" != cancelled ]]; then
   python3 "$repo_root/tests/lab/validate-single-process-matrix.py" "$aggregate"
 fi
