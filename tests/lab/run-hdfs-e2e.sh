@@ -36,6 +36,18 @@ receiver_pid=""
 hdfs_touched=false
 database_created=false
 database_create_confirmed=false
+database_cleanup=not_attempted
+cleanup_evidence="$results_root/$run_id-hdfs-cleanup.json"
+
+write_cleanup_evidence() {
+  python3 - "$cleanup_evidence" "$database_name" "$database_create_confirmed" "$database_cleanup" <<'PYJSON'
+import json, sys
+path, database, confirmed, cleanup = sys.argv[1:]
+with open(path, "w", encoding="utf-8") as out:
+    json.dump({"clickhouse_database": database, "create_confirmed": confirmed == "true", "cleanup": cleanup}, out)
+    out.write("\n")
+PYJSON
+}
 
 run_with_config() {
   local config="$1"
@@ -68,15 +80,18 @@ cleanup_resources() {
     # retry the idempotent drop over a short reconciliation window. The random
     # database name is unique to this run and is never shared with other jobs.
     attempts=1
-    [[ "$database_create_confirmed" == true ]] || attempts=3
+    database_cleanup=passed
+    [[ "$database_create_confirmed" == true ]] || { attempts=3; database_cleanup=uncertain; }
     for ((attempt=1; attempt<=attempts; attempt++)); do
       if ! shielded_cleanup clickhouse_query "DROP DATABASE IF EXISTS $database_name" >/dev/null 2>&1; then
         echo 'HDFS certification database cleanup failed' >&2
+        database_cleanup=failed
         status=1
       fi
       (( attempt == attempts )) || shielded_cleanup sleep 1
     done
     database_created=false
+    write_cleanup_evidence || status=1
   fi
   trap - INT TERM HUP
   [[ "$cleanup_cancelled" == false ]] || return 143
@@ -101,8 +116,10 @@ mkdir -p "$runtime_root" "$fixture_root" "$results_root"
 install -m 0600 "$LAB_HDFS_KEYTAB" "$source_keytab"
 install -m 0600 "$LAB_HDFS_KEYTAB" "$destination_keytab"
 database_created=true
+write_cleanup_evidence
 clickhouse_query "CREATE DATABASE $database_name"
 database_create_confirmed=true
+write_cleanup_evidence
 
 write_base_config() {
   local output="$1"
