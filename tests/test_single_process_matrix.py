@@ -319,7 +319,9 @@ class SingleProcessMatrixTest(unittest.TestCase):
             self.assertIn("always()", workflow_text[reconcile:finalize])
             self.assertIn("steps.single_matrix.outputs.reconciled != 'true'", workflow_text[reconcile:finalize])
             self.assertNotIn("--hdfs-tunnel", workflow_text[reconcile:upload])
-            self.assertIn("job.status == 'cancelled' && 'cancelled' || steps.single_matrix.outputs.producer_outcome || steps.single_matrix.outcome", workflow_text[reconcile:upload])
+            self.assertEqual(workflow_text[reconcile:upload].count("steps.single_matrix.outputs.producer_outcome"), 2)
+            self.assertEqual(workflow_text[reconcile:upload].count("steps.single_matrix.outputs.finalizer_outcome"), 2)
+            self.assertEqual(workflow_text[reconcile:upload].count("LIFECYCLE_OUTCOME: ${{ job.status == 'cancelled' && 'cancelled' || steps.single_matrix.outcome }}"), 2)
             self.assertIn("always()", workflow_text[upload:])
             self.assertIn("~/.local/state/terrasync-single-matrix/", workflow_text[upload:])
         for secret in ("LAB_CIFS_NIGHTLY_USERNAME", "LAB_CIFS_NIGHTLY_PASSWORD"):
@@ -369,26 +371,78 @@ class SingleProcessMatrixTest(unittest.TestCase):
                 #!/bin/bash
                 if flock --nonblock "$LOCK_FILE" true; then exit 10; fi
                 printf '%s\\n' "$*" >> "$EVENTS"
+                exit "$FINALIZER_STATUS"
             '''))
             for script in (producer, reconcile):
                 script.chmod(0o700)
             lock, events, output = (root / name for name in ("lock", "events", "output"))
-            for code, outcome in ((0, "success"), (7, "failure")):
+            for code, outcome, finalizer_status in ((0, "success", 0), (7, "failure", 0), (0, "success", 9), (7, "failure", 9)):
                 env = {
                     **os.environ,
                     "LOCK_FILE": str(lock),
                     "EVENTS": str(events),
                     "GITHUB_OUTPUT": str(output),
                     "PRODUCER_STATUS": str(code),
+                    "FINALIZER_STATUS": str(finalizer_status),
                 }
                 result = subprocess.run(
                     ["flock", "--no-fork", str(lock), str(lifecycle), "release-fixture", "--direct"],
                     env=env,
                     timeout=10,
                 )
-                self.assertEqual(result.returncode, code)
+                self.assertEqual(result.returncode, code or finalizer_status)
                 self.assertEqual(events.read_text().splitlines()[-1], f"release-fixture --direct {outcome}")
-                self.assertEqual(output.read_text().splitlines()[-2:], [f"producer_outcome={outcome}", "reconciled=true"])
+                expected = [f"producer_outcome={outcome}", f'finalizer_outcome={"failure" if finalizer_status else "success"}']
+                if finalizer_status == 0:
+                    expected.append("reconciled=true")
+                self.assertEqual(output.read_text().splitlines()[-len(expected):], expected)
+
+    def test_recovery_reports_producer_and_lifecycle_outcomes_separately(self):
+        for mode in ("--direct", "--report-only"):
+            for producer, producer_outcome, lifecycle_outcome, expected in (
+                ("finished", "success", "failure", "failed"),
+                ("finished", "success", "success", "completed"),
+                ("finished", "failure", "failure", "incomplete"),
+                ("failed", "failure", "failure", "incomplete"),
+                ("running", "failure", "failure", "incomplete"),
+                ("finished", "success", "cancelled", "cancelled"),
+            ):
+                with self.subTest(mode=mode, producer=producer, lifecycle=lifecycle_outcome), tempfile.TemporaryDirectory() as directory:
+                    state = pathlib.Path(directory) / "nightly-fixture"
+                    evidence = state / "evidence"
+                    evidence.mkdir(parents=True)
+                    report = self.report()
+                    run = {key: report[key] for key in ("schema_version", "repository", "exact_commit", "dependency_commits", "source_state", "run_id", "mode")}
+                    run.update(run_id="nightly-fixture", profiles=self.profiles, deferred_profiles=[], producer=producer, touched=["hdfs", "dxn"])
+                    (state / "run.json").write_text(json.dumps(run))
+                    (state / "cifs-receipt.json").write_text(json.dumps({"run_id": "nightly-fixture", "scope": "fixture"}))
+                    for cell in report["cells"]:
+                        (evidence / f'{cell["source_profile"]}__{cell["destination_profile"]}.json').write_text(json.dumps(cell))
+                    for operation in report["operations"]:
+                        (evidence / f'{operation["operation"]}.0001.json').write_text(json.dumps(operation))
+                    if producer_outcome == "success" and lifecycle_outcome == "failure":
+                        initial = subprocess.run(
+                            [str(ROOT / "tests/lab/reconcile-single-process-matrix.sh"), "nightly-fixture", "--direct", "success"],
+                            env={**os.environ, "TS_SINGLE_STATE_ROOT": directory, "RUNNER_TEMP": str(state / "missing")},
+                            capture_output=True, text=True, timeout=15,
+                        )
+                        self.assertNotEqual(initial.returncode, 0, initial.stderr)
+                        self.assertIn("mktemp:", initial.stderr)
+                    finalizer = "failure" if lifecycle_outcome == "failure" else ""
+                    result = subprocess.run(
+                        [str(ROOT / "tests/lab/reconcile-single-process-matrix.sh"), "nightly-fixture", mode,
+                         producer_outcome, lifecycle_outcome, finalizer],
+                        env={**os.environ, "TS_SINGLE_STATE_ROOT": directory}, capture_output=True, text=True, timeout=15,
+                    )
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    published = json.loads((evidence / "matrix.json").read_text())
+                    self.assertEqual(published["status"], expected)
+                    self.assertEqual(published["producer_outcome"], producer_outcome)
+                    self.assertEqual(published["lifecycle_outcome"], lifecycle_outcome)
+                    if finalizer:
+                        self.assertEqual(published["initial_finalizer_outcome"], finalizer)
+                    if expected == "failed":
+                        self.assertEqual(published["cleanup"], {"hdfs": "passed", "s3_dxn": "passed", "cifs": "passed"})
 
     def test_hdfs_run_root_preserves_nameservice_case(self):
         command = (
@@ -671,7 +725,7 @@ class MatrixRunnerTest(unittest.TestCase):
             report, events, stdout, stderr = self.finish(process)
         self.assertEqual(process.returncode, 0, stderr)
         self.assertIn("64 independent cells", stdout)
-        self.assertEqual((self.root / "workflow-output").read_text(), "producer_outcome=success\nreconciled=true\n")
+        self.assertEqual((self.root / "workflow-output").read_text(), "producer_outcome=success\nfinalizer_outcome=success\nreconciled=true\n")
         load_validator().validate_report(report)
         self.assertEqual(report["cifs"]["run_id"], self.run_id)
         self.assertEqual(events[:3], [

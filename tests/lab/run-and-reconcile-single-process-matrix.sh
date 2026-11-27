@@ -47,6 +47,10 @@ fi
 reconcile_status=0
 run_phase "$script_dir/reconcile-single-process-matrix.sh" "$run_id" --direct "$outcome" || reconcile_status=$?
 [[ "$cancelled" == false ]] || exit 143
+if [[ -n "${GITHUB_OUTPUT:-}" ]]; then
+  if (( reconcile_status == 0 )); then finalizer_outcome=success; else finalizer_outcome=failure; fi
+  printf 'finalizer_outcome=%s\n' "$finalizer_outcome" >> "$GITHUB_OUTPUT"
+fi
 if (( reconcile_status == 0 )) && [[ -n "${GITHUB_OUTPUT:-}" ]]; then
   printf 'reconciled=true\n' >> "$GITHUB_OUTPUT"
 fi

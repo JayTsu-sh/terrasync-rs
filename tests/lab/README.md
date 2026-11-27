@@ -450,6 +450,13 @@ attempts must succeed for each cell with the expected endpoints. The latest
 attempts must also confirm CIFS setup and HDFS, CIFS and DXN cleanup.
 `TS_SINGLE_DEFER_CIFS=true` runs the 49 non-CIFS pairs as a diagnostic.
 
+Recovery reports retain the producer outcome, the initial finalizer outcome,
+and the lifecycle step outcome separately when known. A successful recovery
+does not erase an initial finalizer failure: a finished, successful producer
+with a failed lifecycle reports `failed`, even if cleanup eventually passes.
+A failed or interrupted producer remains `incomplete`; cancellation takes
+precedence. An unavailable phase outcome is omitted rather than inferred.
+
 Dispatch Release validation from `main`. It defaults to the dispatch commit.
 A supplied branch, commit or tag must resolve to a commit reachable from
 `main` and include `TS-SINGLE lifecycle contract v2`. The job checks the

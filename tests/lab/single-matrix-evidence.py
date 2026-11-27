@@ -189,14 +189,19 @@ def attempt_paths(evidence):
     return sorted(evidence.glob("*.[0-9][0-9][0-9][0-9].json"))
 
 
-def publish(evidence, workflow_outcome):
+def publish(evidence, producer_outcome, lifecycle_outcome="", finalizer_outcome=""):
     report = read(evidence.parent / "run.json")
     touched = report.pop("touched")
     producer = report.pop("producer")
-    if report.get("workflow_outcome") == "cancelled":
-        workflow_outcome = "cancelled"
+    was_cancelled = report.get("workflow_outcome") == "cancelled"
     for field in ("workflow_outcome", "hdfs_target", "dxn_target"):
         report.pop(field, None)
+    if producer_outcome:
+        report["producer_outcome"] = producer_outcome
+    if lifecycle_outcome:
+        report["lifecycle_outcome"] = lifecycle_outcome
+    if finalizer_outcome:
+        report["initial_finalizer_outcome"] = finalizer_outcome
     operations = [read(path) for path in attempt_paths(evidence)]
     latest = {op["operation"]: op for op in operations}
 
@@ -238,12 +243,13 @@ def publish(evidence, workflow_outcome):
     }
     cells = [read(path) for path in sorted(path for path in evidence.glob("*__*.json") if path.name.count(".") == 1)]
     required_cleanup = ("hdfs", "s3_dxn") if report["deferred_profiles"] else ("hdfs", "s3_dxn", "cifs")
-    if workflow_outcome == "cancelled" or producer == "cancelled":
+    if was_cancelled or producer_outcome == "cancelled" or lifecycle_outcome == "cancelled" or producer == "cancelled":
         overall = "cancelled"
-    elif producer == "finished" and workflow_outcome == "success":
+    elif producer == "finished" and producer_outcome == "success":
         cifs_ready = report["deferred_profiles"] or (ownership and report["cifs"]["setup"] == "passed")
         overall = "completed" if (
-            report["source_state"] == "clean"
+            lifecycle_outcome != "failure"
+            and report["source_state"] == "clean"
             and cifs_ready
             and all(cleanup[name] == "passed" for name in required_cleanup)
             and len(cells) == len(report["profiles"]) ** 2

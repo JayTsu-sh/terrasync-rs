@@ -4,9 +4,13 @@ umask 077
 source "$(dirname "$0")/single-process-matrix-common.sh"
 matrix_paths "${1:?run id required}"
 mode="${2:---direct}"
-workflow_outcome="${3:-}"
+producer_outcome="${3:-}"
+lifecycle_outcome="${4:-}"
+finalizer_outcome="${5:-}"
 case "$mode" in --direct|--report-only) ;; *) exit 2 ;; esac
-case "$workflow_outcome" in ''|success|failure|cancelled) ;; *) exit 2 ;; esac
+case "$producer_outcome" in ''|success|failure|cancelled) ;; *) exit 2 ;; esac
+case "$lifecycle_outcome" in ''|success|failure|cancelled) ;; *) exit 2 ;; esac
+case "$finalizer_outcome" in ''|success|failure|cancelled) ;; *) exit 2 ;; esac
 watch_matrix_cancellation
 # Matrix may have been cancelled before creating any state.
 [[ -d "$state_root" ]] || exit 0
@@ -22,7 +26,7 @@ finish() {
   trap - EXIT
   if [[ "$cancelled" == true ]]; then
     evidence mark workflow_outcome cancelled || true
-    evidence publish cancelled || true
+    evidence publish "$producer_outcome" cancelled "$finalizer_outcome" || true
     status=143
   fi
   if [[ -n "$cleanup_runtime" ]]; then rm -rf -- "$cleanup_runtime"; fi
@@ -30,12 +34,12 @@ finish() {
 }
 trap finish EXIT
 
-if [[ "$workflow_outcome" == cancelled ]]; then
+if [[ "$producer_outcome" == cancelled || "$lifecycle_outcome" == cancelled ]]; then
   evidence mark workflow_outcome cancelled
 fi
 evidence interrupt
 if [[ "$mode" == --report-only ]]; then
-  evidence publish ""
+  evidence publish "$producer_outcome" "$lifecycle_outcome" "$finalizer_outcome"
   exit
 fi
 evidence publish ""
@@ -91,12 +95,12 @@ if evidence touched dxn && [[ "$(evidence status dxn.abort):$(evidence status dx
   fi
 fi
 check_cancelled
-evidence publish "$workflow_outcome"
+evidence publish "$producer_outcome" "$lifecycle_outcome" "$finalizer_outcome"
 (( status == 0 )) || exit "$status"
 if ! evidence touched hdfs || [[ "$(evidence status hdfs.delete)" == passed ]]; then
   rm -f -- "$binary"
 fi
 # 失败或取消继续保留证据，验收必须满足矩阵验证器。
-if [[ "$workflow_outcome" == success && "$(evidence field workflow_outcome)" != cancelled ]]; then
+if [[ "$producer_outcome" == success && "$lifecycle_outcome" != failure && "$lifecycle_outcome" != cancelled && "$(evidence field workflow_outcome)" != cancelled ]]; then
   python3 "$repo_root/tests/lab/validate-single-process-matrix.py" "$aggregate"
 fi
