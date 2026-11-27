@@ -169,9 +169,23 @@ class HdfsLabTest(unittest.TestCase):
         return read_json(self.attempt / "state.json")
 
     def write_build_receipt(self):
-        with patch.object(self.controller.subprocess, "run") as cargo:
+        artifacts = [
+            self.cargo_artifact(self.target / "release" / binary)
+            for binary in self.controller.RELEASE_BINARIES
+        ]
+        with patch.object(
+            self.controller.subprocess, "run", side_effect=artifacts
+        ) as cargo:
             self.assertEqual(self.cli("build"), 0)
         self.assertEqual(cargo.call_count, 2)
+
+    @staticmethod
+    def cargo_artifact(path):
+        return subprocess.CompletedProcess(
+            "cargo",
+            0,
+            json.dumps({"reason": "compiler-artifact", "executable": str(path)}),
+        )
 
     def worker_state(self, *, populated, active="active", **changes):
         record = self.record()
@@ -270,10 +284,25 @@ class HdfsLabTest(unittest.TestCase):
         self.assertFalse(self.attempt.exists())
         diagnostic = read_json(self.diagnostics)
         self.assertEqual(diagnostic["stage"], "admission_preflight")
+        self.assertEqual(diagnostic["reason"], "incompatible_service_commands")
         self.assertEqual(diagnostic["test"], "failed")
         self.assertEqual(diagnostic["hdfs_cleanup"], "not_attempted")
         self.assertEqual(diagnostic["certification"], "withheld")
         self.assertFalse(self.certification.exists())
+
+    def test_cancel_during_preflight_keeps_diagnostic_without_admission(self):
+        def interrupt(run_id):
+            signal.raise_signal(signal.SIGTERM)
+            return self.service_commands(run_id)
+
+        with patch.object(self.controller, "service_commands", side_effect=interrupt):
+            self.assertEqual(self.controller.run(RUN_ID, self.output), 143)
+        self.assertFalse(self.attempt.exists())
+        self.assertEqual(self.manager.commands, [])
+        diagnostic = read_json(self.diagnostics)
+        self.assertEqual(diagnostic["stage"], "admission_preflight")
+        self.assertEqual(diagnostic["test"], "cancelled")
+        self.assertEqual(diagnostic["hdfs_cleanup"], "not_attempted")
 
     def test_running_attempt_is_only_observed_by_a_same_id_caller(self):
         self.controller.claim(RUN_ID)
@@ -326,6 +355,33 @@ class HdfsLabTest(unittest.TestCase):
         ):
             self.cli("build")
         self.assertFalse(self.receipt.exists())
+
+    def test_build_rejects_cargo_output_in_another_target_layout(self):
+        artifact = self.cargo_artifact(
+            self.target / "x86_64-unknown-linux-gnu/release/terrasync"
+        )
+        with (
+            patch.object(self.controller.subprocess, "run", return_value=artifact),
+            self.assertRaisesRegex(RuntimeError, "expected host executable"),
+        ):
+            self.cli("build")
+        self.assertTrue((self.target / "release/terrasync").exists())
+        self.assertFalse(self.receipt.exists())
+
+    def test_observer_does_not_reexport_a_certification_without_build_proof(self):
+        self.manager.on_start = self.finish_worker
+        self.assertEqual(self.controller.run(RUN_ID, self.output), 0)
+        record = self.record()
+        record.pop("binary_sha256")
+        write_json(self.attempt / "state.json", record)
+
+        self.assertEqual(self.controller.run(RUN_ID, self.output), 1)
+        self.assertFalse(self.certification.exists())
+        self.assertEqual(self.record(), record)
+        diagnostic = self.assert_withheld()
+        self.assertEqual(
+            diagnostic["certification_reason"], "build_provenance_unavailable"
+        )
 
     def test_same_run_invokes_once_after_start_response_is_lost(self):
         def start():

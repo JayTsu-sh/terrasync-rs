@@ -448,8 +448,9 @@ tests/lab/hdfs-runner/install-managed.sh github-runner "$APPROVED_CLICKHOUSE_SHA
 The installer enables the runner's lingering systemd user manager, its
 cleanup timer, and a private 2 GiB scratch tmpfs. The worker and service exit hook must match
 the checkout used by Nightly. Use a dedicated `CARGO_TARGET_DIR` and run
-`python3 tests/lab/hdfs_lab.py build` from a clean checkout. The build records
-both source revisions and both executable digests there. Run
+`python3 tests/lab/hdfs_lab.py build` from a clean checkout. It verifies the
+host executable paths reported by Cargo and records both source revisions
+and both executable digests. Run
 `python3 tests/lab/hdfs_lab.py run "$RUN_ID" --output "$OUTPUT_DIR"` with the
 same `CARGO_TARGET_DIR` as `github-runner`, with `XDG_RUNTIME_DIR=/run/user/1000`
 and its user D-Bus socket. Admission checks the receipt against the checkout
@@ -471,7 +472,7 @@ files and any retained lock in place for a later check or operator action.
 Persistent records live at
 `~/.local/state/terrasync-hdfs-managed/<run-id>/state.json`. A rerun with the
 same ID reports the current record immediately and succeeds only for an
-already published certification. The original caller owns the lease and
+already published certification with build evidence. The original caller owns the lease and
 certification. For a fresh attempt use a new run ID.
 Use `hdfs_lab.py reconcile <run-id> --cancel --output <directory>` to stop
 and inspect an attempt, or omit `--cancel` to observe an active one.

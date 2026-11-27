@@ -13,6 +13,7 @@ import signal
 import stat
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -35,15 +36,25 @@ RELEASE_BINARIES = ("terrasync", "examples/single_process_matrix")
 BUILD_RECEIPT = "terrasync-lab-build.json"
 
 
+class AdmissionError(RuntimeError):
+    def __init__(self, reason, message):
+        super().__init__(message)
+        self.reason = reason
+
+
 def atomic_json(path, data):
-    temporary = path.with_suffix(".new")
-    with temporary.open("w", encoding="utf-8") as stream:
-        json.dump(data, stream, indent=2, sort_keys=True)
-        stream.write("\n")
-        stream.flush()
-        os.fsync(stream.fileno())
-    os.replace(temporary, path)
-    sync_directory(path.parent)
+    fd, name = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.")
+    temporary = Path(name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            json.dump(data, stream, indent=2, sort_keys=True)
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        temporary.replace(path)
+        sync_directory(path.parent)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def sync_directory(path):
@@ -164,7 +175,10 @@ def validate_service_commands(run_id):
         [command[:3] for command in entries] for entries in service_commands(run_id)
     ]
     if actual != expected:
-        raise RuntimeError("the runner has incompatible HDFS service commands")
+        raise AdmissionError(
+            "incompatible_service_commands",
+            "the runner has incompatible HDFS service commands",
+        )
 
 
 def quiescent(state, record):
@@ -205,7 +219,9 @@ def source_identity():
     if subprocess.check_output(
         [*git, "status", "--porcelain", "--untracked-files=no"], text=True, timeout=5
     ):
-        raise RuntimeError("HDFS certification requires a clean tracked checkout")
+        raise AdmissionError(
+            "dirty_checkout", "HDFS certification requires a clean tracked checkout"
+        )
     mover = re.search(
         r"data-mover-rs\.git\?rev=([0-9a-f]{40})#",
         (repo / "Cargo.lock").read_text(),
@@ -220,24 +236,50 @@ def sha256(path):
         return hashlib.file_digest(stream, "sha256").hexdigest()
 
 
+def cargo_binary(expected, *arguments):
+    result = subprocess.run(
+        [
+            "cargo",
+            "build",
+            "--release",
+            "--locked",
+            "--message-format=json-render-diagnostics",
+            *arguments,
+        ],
+        cwd=HERE.parent.parent,
+        stdout=subprocess.PIPE,
+        text=True,
+        check=True,
+    )
+    paths = []
+    for line in result.stdout.splitlines():
+        event = json.loads(line)
+        if event.get("reason") == "compiler-artifact" and event.get("executable"):
+            paths.append(Path(event["executable"]).resolve())
+    if paths != [expected]:
+        raise RuntimeError(
+            f"Cargo did not produce the expected host executable {expected}"
+        )
+    return sha256(expected)
+
+
 def prepare_build():
     target = Path(os.environ["CARGO_TARGET_DIR"]).resolve()
     receipt = target / BUILD_RECEIPT
     receipt.unlink(missing_ok=True)
     candidate = source_identity()
-    cargo = ["cargo", "build", "--release", "--locked"]
-    repo = HERE.parent.parent
-    subprocess.run([*cargo, "--features", "lab-fault-injection"], cwd=repo, check=True)
-    subprocess.run(
-        [*cargo, "-p", "app", "--example", "single_process_matrix"],
-        cwd=repo,
-        check=True,
-    )
+    cli, matrix = RELEASE_BINARIES
+    release = target / "release"
+    binaries = {
+        cli: cargo_binary(
+            release / cli, "--features", "lab-fault-injection", "--bin", "terrasync"
+        ),
+        matrix: cargo_binary(
+            release / matrix, "-p", "app", "--example", "single_process_matrix"
+        ),
+    }
     if candidate != source_identity():
         raise RuntimeError("the checkout changed during the lab build")
-    binaries = {
-        binary: sha256(target / "release" / binary) for binary in RELEASE_BINARIES
-    }
     atomic_json(receipt, {"candidate": candidate, "binaries": binaries})
     return 0
 
@@ -256,8 +298,9 @@ def claim(run_id):
             or receipt.get("candidate") != candidate
             or not isinstance(receipt.get("binaries"), dict)
         ):
-            raise RuntimeError(
-                "the lab build receipt is missing or for another checkout"
+            raise AdmissionError(
+                "build_receipt_mismatch",
+                "the lab build receipt is missing or for another checkout",
             )
         # A launcher interrupted before publication could only have staged inert files.
         if attempt.exists():
@@ -273,8 +316,9 @@ def claim(run_id):
                 shutil.copy2(target / "release" / binary, staged)
                 expected_digest = receipt["binaries"].get(binary)
                 if not os.access(staged, os.X_OK) or sha256(staged) != expected_digest:
-                    raise RuntimeError(
-                        f"the staged {binary} does not match the lab build receipt"
+                    raise AdmissionError(
+                        "build_binary_mismatch",
+                        f"the staged {binary} does not match the lab build receipt",
                     )
         except (OSError, RuntimeError):
             shutil.rmtree(attempt)
@@ -481,6 +525,18 @@ def service_passed(record):
     }
 
 
+def build_verified(record):
+    digests = record.get("binary_sha256", {})
+    return (
+        isinstance(digests, dict)
+        and digests.keys() == set(RELEASE_BINARIES)
+        and all(
+            isinstance(value, str) and re.fullmatch(r"[0-9a-f]{64}", value)
+            for value in digests.values()
+        )
+    )
+
+
 def record_service_exit(run_id):
     """Record the service manager's verdict before a stopped unit can be reset."""
     with locked():
@@ -600,6 +656,7 @@ def reconcile(run_id, cancel_requested=False, background=False):
         certified = (
             record["test"] == "passed"
             and record["hdfs_cleanup"] == "passed"
+            and build_verified(record)
             and gate is not None
             and gate.get("schema_version") == contract["schema_version"]
             and gate.get("run_id") == run_id
@@ -633,6 +690,14 @@ def publish(run_id, output, *, finalize=False, cancelled=lambda: False):
         ):
             record.update(test="unknown", certification="withheld")
             atomic_json(attempt / "state.json", record)
+        if record["certification"] in {"ready", "published"} and not build_verified(
+            record
+        ):
+            record = {
+                **record,
+                "certification": "withheld",
+                "certification_reason": "build_provenance_unavailable",
+            }
         output.mkdir(parents=True, exist_ok=True)
         certification = output / f"{run_id}-hdfs.json"
         if record["certification"] == "published" or (
@@ -666,48 +731,38 @@ def validate_installation(run_id):
         observed.get("LoadState") != "loaded"
         or observed.get("FileDescriptorStorePreserve") != "yes"
     ):
-        raise RuntimeError(
-            "the runner needs terrasync-hdfs-attempt@.service with FD preservation"
+        raise AdmissionError(
+            "incompatible_service_unit",
+            "the runner needs terrasync-hdfs-attempt@.service with FD preservation",
         )
     validate_service_commands(run_id)
     for file in ("hdfs_lab.py", "hdfs_lab_clickhouse.py", "evidence-matrix.json"):
         if (HERE / file).read_bytes() != (INSTALL / file).read_bytes():
-            raise RuntimeError(
-                "the runner's managed HDFS installation differs from this checkout"
+            raise AdmissionError(
+                "installation_mismatch",
+                "the runner's managed HDFS installation differs from this checkout",
             )
+
+
+def admission_diagnostic(run_id, output, stage, reason, *, interrupted):
+    output.mkdir(parents=True, exist_ok=True)
+    atomic_json(
+        output / f"{run_id}-hdfs-cleanup.json",
+        {
+            "schema_version": 1,
+            "run_id": run_id,
+            "stage": stage,
+            "reason": reason,
+            "test": "cancelled" if interrupted else "failed",
+            "local_cleanup": "not_attempted",
+            "hdfs_cleanup": "not_attempted",
+            "certification": "withheld",
+        },
+    )
 
 
 def run(run_id, output):
     if (STATE / run_id / "state.json").is_file():
-        return publish(run_id, output)
-    stage = "admission_preflight"
-    try:
-        validate_installation(run_id)
-        stage = "staging"
-        _, new = claim(run_id)
-    except (
-        OSError,
-        RuntimeError,
-        subprocess.SubprocessError,
-        ValueError,
-        KeyError,
-    ) as exc:
-        output.mkdir(parents=True, exist_ok=True)
-        atomic_json(
-            output / f"{run_id}-hdfs-cleanup.json",
-            {
-                "schema_version": 1,
-                "run_id": run_id,
-                "stage": stage,
-                "reason": type(exc).__name__,
-                "test": "failed",
-                "local_cleanup": "not_attempted",
-                "hdfs_cleanup": "not_attempted",
-                "certification": "withheld",
-            },
-        )
-        raise
-    if not new:
         return publish(run_id, output)
     interrupted = False
 
@@ -717,6 +772,29 @@ def run(run_id, output):
 
     for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
         signal.signal(sig, cancel)
+
+    stage = "admission_preflight"
+    try:
+        validate_installation(run_id)
+        if interrupted:
+            admission_diagnostic(run_id, output, stage, "cancelled", interrupted=True)
+            return 143
+        stage = "staging"
+        _, new = claim(run_id)
+    except (
+        OSError,
+        RuntimeError,
+        subprocess.SubprocessError,
+        ValueError,
+        KeyError,
+    ) as exc:
+        reason = exc.reason if isinstance(exc, AdmissionError) else type(exc).__name__
+        admission_diagnostic(run_id, output, stage, reason, interrupted=interrupted)
+        if interrupted:
+            return 143
+        raise
+    if not new:
+        return publish(run_id, output)
 
     if not interrupted:
         # A timeout is ambiguous. Do not resubmit; observe this exact unit.
