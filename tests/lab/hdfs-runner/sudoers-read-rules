@@ -1,0 +1,1 @@
+github-runner ALL=(root) NOPASSWD: /usr/sbin/nft list table inet terrasync_hdfs

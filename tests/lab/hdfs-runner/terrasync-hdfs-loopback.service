@@ -1,0 +1,11 @@
+[Unit]
+Description=Restrict TerraSync HDFS loopback tunnel to the CI account
+After=network-pre.target
+Before=network.target
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/sbin/nft -f /etc/terrasync-hdfs/loopback.nft
+ExecStop=/usr/sbin/nft delete table inet terrasync_hdfs
+[Install]
+WantedBy=multi-user.target

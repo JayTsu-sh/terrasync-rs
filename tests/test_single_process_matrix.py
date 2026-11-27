@@ -45,6 +45,7 @@ class SingleProcessMatrixTest(unittest.TestCase):
             "dependency_commits": {"data-mover-rs": "b" * 40},
             "run_id": "release-matrix-test",
             "mode": "terrasync_single_process",
+            "cleanup": {"hdfs": "passed", "s3_dxn": "passed"},
             "cells": cells,
         }
 
@@ -54,8 +55,24 @@ class SingleProcessMatrixTest(unittest.TestCase):
             path.write_text(json.dumps(report), encoding="utf-8")
             return self.validator.validate(path)
 
+    def test_cleanup_diagnostics_only_use_typed_marker(self):
+        with tempfile.TemporaryDirectory() as directory:
+            log = pathlib.Path(directory) / "cleanup.log"
+            log.write_text("Authentication in path\nHDFS_CLEANUP_FAILURE=Capacity\nsecret-value\n")
+            command = 'source tests/lab/common.sh; report_hdfs_cleanup_failure 1 "$1"'
+            result = subprocess.run(["bash", "-c", command, "_", str(log)], cwd=ROOT, capture_output=True, text=True)
+            self.assertIn("Capacity", result.stderr)
+            self.assertNotIn("Authentication", result.stderr)
+            self.assertNotIn("secret-value", result.stderr)
+
     def test_complete_64_cell_report_passes(self):
         self.validator.validate_report(self.report())
+
+    def test_failed_cleanup_rejects_an_otherwise_passing_matrix(self):
+        report = self.report()
+        report["cleanup"]["hdfs"] = "failed"
+        with self.assertRaisesRegex(ValueError, "cleanup must pass"):
+            self.validator.validate_report(report)
 
     def test_duplicate_pair_is_rejected(self):
         report = self.report()
@@ -144,6 +161,15 @@ class SingleProcessMatrixTest(unittest.TestCase):
         self.assertIn("TS-SINGLE 49-cell matrix (CIFS deferred)", workflow)
         self.assertTrue(VALIDATOR_PATH.stat().st_mode & 0o111)
         self.assertTrue((ROOT / "tests" / "lab" / "run-single-process-matrix.sh").stat().st_mode & 0o111)
+
+    def test_hdfs_run_root_preserves_nameservice_case(self):
+        command = (
+            'source tests/lab/common.sh; '
+            'LAB_HDFS_LOCATION="hdfs://HdfsCluster/"; '
+            'LAB_HDFS_ADMIN_USER="ci@EXAMPLE"; hdfs_run_root nightly-case'
+        )
+        result = subprocess.run(["bash", "-c", command], cwd=ROOT, capture_output=True, text=True, check=True)
+        self.assertIn("@HdfsCluster/", result.stdout)
 
     def test_hdfs_defaults_use_the_kerberos_ha_nameservice(self):
         common = (ROOT / "tests" / "lab" / "common.sh").read_text(encoding="utf-8")

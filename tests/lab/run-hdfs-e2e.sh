@@ -5,12 +5,15 @@ source "$(dirname "$0")/common.sh"
 
 run_id="${1:?run id required}"
 validate_run_id "$run_id"
+export LAB_HDFS_LOCATION LAB_HDFS_ADMIN_USER LAB_HDFS_CONFIG_DIR LAB_HDFS_KEYTAB
+export LAB_HDFS_BASE_PATH="${LAB_HDFS_BASE_PATH:-/tmp/terrasync-nightly}"
 require_hdfs_credentials
 
 repo_root="$(cd "$(dirname "$0")/../.." && pwd)"
 target_root="$(cargo metadata --format-version 1 --no-deps --manifest-path "$repo_root/Cargo.toml" | \
   python3 -c 'import json,sys; print(json.load(sys.stdin)["target_directory"])')"
 binary="${TERRASYNC_BINARY:-$target_root/release/terrasync}"
+matrix_binary="$target_root/release/examples/single_process_matrix"
 lab_root="/tmp/terrasync-lab/$run_id/hdfs"
 runtime_root="$lab_root/runtime"
 fixture_root="$lab_root/fixture"
@@ -25,12 +28,40 @@ destination_keytab="$runtime_root/destination.keytab"
 source_cache="FILE:$runtime_root/source.ccache"
 destination_cache="FILE:$runtime_root/destination.ccache"
 invalid_keytab="$runtime_root/does-not-exist.keytab"
-hdfs_root="$(hdfs_run_root "$run_id")"
+hdfs_scope="${run_id%%-*}-$(printf %s "$run_id" | sha256sum | cut -d' ' -f1)-e2e"
+hdfs_root="$(hdfs_run_root "$hdfs_scope")"
+hdfs_base="${hdfs_root%/$hdfs_scope/hdfs}"
 hdfs_source="$hdfs_root/source"
 hdfs_single_destination="$hdfs_root/single-destination"
 hdfs_remote_destination="$hdfs_root/remote-destination"
-database_name="$(clickhouse_database_name "${run_id}_hdfs")"
+database_nonce="$(python3 -c 'import secrets; print(secrets.token_hex(16))')"
+database_name="$(clickhouse_database_name "${run_id}_hdfs_${database_nonce}")"
 receiver_pid=""
+hdfs_touched=false
+database_created=false
+database_create_confirmed=false
+database_cleanup=not_attempted
+cleanup_evidence="$results_root/$run_id-hdfs-cleanup.json"
+
+write_cleanup_evidence() {
+  python3 - "$cleanup_evidence" "$database_name" "$database_create_confirmed" "$database_cleanup" <<'PYJSON'
+import json, os, sys, tempfile
+from pathlib import Path
+path, database, confirmed, cleanup = sys.argv[1:]
+temporary = None
+try:
+    with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=Path(path).parent, delete=False) as out:
+        temporary = out.name
+        json.dump({"clickhouse_database": database, "create_confirmed": confirmed == "true", "cleanup": cleanup}, out)
+        out.write("\n")
+        out.flush()
+        os.fsync(out.fileno())
+    os.replace(temporary, path)
+finally:
+    if temporary and os.path.exists(temporary):
+        os.unlink(temporary)
+PYJSON
+}
 
 run_with_config() {
   local config="$1"
@@ -38,17 +69,69 @@ run_with_config() {
   (cd "$runtime_root" && "$binary" -c "$config" "$@")
 }
 
-cleanup() {
-  local status="$?"
-  trap - EXIT
+shielded_cleanup() (
+  trap '' INT TERM HUP
+  "$@"
+)
+write_initial_evidence() {
+  local cancelled=false status=0
+  trap 'cancelled=true' INT TERM HUP
+  shielded_cleanup write_cleanup_evidence || status=$?
+  trap - INT TERM HUP
+  [[ "$cancelled" == false ]] || return 143
+  return "$status"
+}
+cleanup_resources() {
+  local status=0 cleanup_cancelled=false attempts attempt cleanup_exit
+  trap 'cleanup_cancelled=true' INT TERM HUP
   if [[ -n "$receiver_pid" ]]; then
     kill "$receiver_pid" 2>/dev/null || true
     wait "$receiver_pid" 2>/dev/null || true
+    receiver_pid=""
   fi
-  if [[ -f "$single_config" ]]; then
-    run_with_config "$single_config" rm "$hdfs_root" >/dev/null 2>&1 || true
+  if [[ "$hdfs_touched" == true ]]; then
+    # Delete only this gate's directory relative to the dedicated HDFS base.
+    if LAB_HDFS_ADMIN_USER="$LAB_HDFS_ADMIN_USER" LAB_HDFS_CONFIG_DIR="$LAB_HDFS_CONFIG_DIR" \
+      LAB_HDFS_DESTINATION_CCACHE="$destination_cache" LAB_HDFS_KEYTAB="$destination_keytab" \
+      shielded_cleanup timeout --foreground --kill-after=5s 45s "$matrix_binary" --delete-hdfs-run "$hdfs_base" "$hdfs_scope" >"$runtime_root/hdfs-cleanup.log" 2>&1; then
+      :
+    else
+      cleanup_exit=$?
+      report_hdfs_cleanup_failure "$cleanup_exit" "$runtime_root/hdfs-cleanup.log"
+      status=1
+    fi
+    hdfs_touched=false
   fi
-  clickhouse_query "DROP DATABASE IF EXISTS $database_name" >/dev/null 2>&1 || true
+  if [[ "$database_created" == true ]]; then
+    # A timed-out CREATE may still be executing. For an uncertain response,
+    # retry the idempotent drop over a short reconciliation window. The random
+    # database name is unique to this run and is never shared with other jobs.
+    attempts=1
+    database_cleanup=passed
+    [[ "$database_create_confirmed" == true ]] || { attempts=3; database_cleanup=uncertain; }
+    for ((attempt=1; attempt<=attempts; attempt++)); do
+      if ! shielded_cleanup clickhouse_query "DROP DATABASE IF EXISTS $database_name" >/dev/null 2>&1; then
+        echo 'HDFS certification database cleanup failed' >&2
+        database_cleanup=failed
+        status=1
+      fi
+      (( attempt == attempts )) || shielded_cleanup sleep 1
+    done
+    database_created=false
+    shielded_cleanup write_cleanup_evidence || status=1
+  fi
+  trap - INT TERM HUP
+  [[ "$cleanup_cancelled" == false ]] || return 143
+  return "$status"
+}
+cleanup() {
+  local status="$?"
+  trap - EXIT
+  local cleanup_status=0
+  cleanup_resources || cleanup_status=$?
+  if (( cleanup_status == 143 )); then status=143
+  elif (( cleanup_status != 0 )); then status=1
+  fi
   rm -f "$single_config" "$sender_config" "$receiver_config" "$missing_config" "$invalid_config" \
     "$source_keytab" "$destination_keytab" "$runtime_root/source.ccache" "$runtime_root/destination.ccache"
   rm -rf -- "$lab_root"
@@ -59,7 +142,11 @@ trap cleanup EXIT
 mkdir -p "$runtime_root" "$fixture_root" "$results_root"
 install -m 0600 "$LAB_HDFS_KEYTAB" "$source_keytab"
 install -m 0600 "$LAB_HDFS_KEYTAB" "$destination_keytab"
-clickhouse_query "CREATE DATABASE IF NOT EXISTS $database_name"
+database_created=true
+write_initial_evidence
+clickhouse_query "CREATE DATABASE $database_name"
+database_create_confirmed=true
+write_initial_evidence
 
 write_base_config() {
   local output="$1"
@@ -144,14 +231,32 @@ for sensitive_value in \
   fi
 done
 
-printf 'terrasync-hdfs-%s\n' "$run_id" > "$fixture_root/payload.txt"
-expected_hash="$(sha256sum "$fixture_root/payload.txt" | cut -d' ' -f1)"
+# Readback uses the protocol-neutral data path; HDFS names do not map to local numeric ownership.
+env -u LAB_HDFS_KEYTAB -u LAB_CIFS_USERNAME -u LAB_CIFS_PASSWORD \
+  cargo build --release --locked --manifest-path "$repo_root/Cargo.toml" -p app --example single_process_matrix
+hdfs_touched=true
+printf 'terrasync-hdfs-%s\n' "$run_id" > "$fixture_root/payload.bin"
+expected_hash="$(sha256sum "$fixture_root/payload.bin" | cut -d' ' -f1)"
+
+verify_destination() {
+  local mode="$1" destination="$2" readback="$lab_root/readback-$1" actual_hash
+  verify_integrity_report run_with_config "$single_config" integrity-check --id "hdfs-$mode-integrity-$run_id" \
+    "$hdfs_source" "$destination"
+  mkdir -p "$readback"
+  LAB_HDFS_ADMIN_USER="$LAB_HDFS_ADMIN_USER" LAB_HDFS_CONFIG_DIR="$LAB_HDFS_CONFIG_DIR" \
+    LAB_HDFS_KEYTAB="$source_keytab" LAB_HDFS_SOURCE_CCACHE="$source_cache" \
+    "$matrix_binary" hdfs source "$destination" local destination "$readback" "hdfs-$mode-readback-$run_id"
+  actual_hash="$(sha256sum "$readback/payload.bin" | cut -d' ' -f1)"
+  [[ "$actual_hash" == "$expected_hash" ]] || {
+    echo "HDFS $mode destination checksum mismatch" >&2
+    return 1
+  }
+}
 
 run_with_config "$single_config" sync --resume --id "hdfs-preload-$run_id" "$fixture_root" "$hdfs_source"
 run_with_config "$single_config" sync --resume --id "hdfs-single-$run_id" --enable-integrity-check \
   "$hdfs_source" "$hdfs_single_destination"
-run_with_config "$single_config" integrity-check --id "hdfs-single-integrity-$run_id" \
-  "$hdfs_source" "$hdfs_single_destination"
+verify_destination single "$hdfs_single_destination"
 
 receiver_cert="$runtime_root/receiver.der"
 receiver_log="$results_root/$run_id-hdfs-receiver.log"
@@ -173,8 +278,9 @@ run_with_config "$sender_config" sync --resume --id "hdfs-remote-$run_id" --enab
   "$hdfs_source" "$hdfs_remote_destination"
 wait "$receiver_pid"
 receiver_pid=""
-run_with_config "$single_config" integrity-check --id "hdfs-remote-integrity-$run_id" \
-  "$hdfs_source" "$hdfs_remote_destination"
+verify_destination remote "$hdfs_remote_destination"
+
+cleanup_resources
 
 report="$results_root/$run_id-hdfs.json"
 terrasync_candidate="$(git -C "$repo_root" rev-parse HEAD)"
@@ -199,6 +305,7 @@ with open(output, "w", encoding="utf-8") as handle:
             "sender_config_roles": ["source"],
             "receiver_config_roles": ["destination"]
         },
+        "cleanup": {"hdfs": "passed", "clickhouse": "passed"},
         "payload_sha256": payload_hash
     }, handle, indent=2, sort_keys=True)
     handle.write("\n")

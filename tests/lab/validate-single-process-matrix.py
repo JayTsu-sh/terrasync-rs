@@ -58,6 +58,9 @@ def validate_report(report):
     elif profiles != PROFILES:
         raise ValueError("non-default profile set requires an explicit deferred profile")
 
+    if report.get("cleanup") != {"hdfs": "passed", "s3_dxn": "passed"}:
+        raise ValueError("HDFS and DXN cleanup must pass")
+
     cells = report.get("cells")
     expected_count = len(profiles) ** 2
     if not isinstance(cells, list) or len(cells) != expected_count:

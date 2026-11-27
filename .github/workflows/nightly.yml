@@ -25,57 +25,90 @@ jobs:
       TERRASYNC_NFS41_DEST: 10.10.1.13:/srv/nfs/v4
       TERRASYNC_S3_SOURCE: http://10.10.1.12:9000
       TERRASYNC_S3_DEST: http://10.10.1.13:9000
-      LAB_HDFS_LOCATION: hdfs://hdfs%2Fterrasync-runner%40HDFS.LOCAL@hdfs-ha/
-      LAB_HDFS_ADMIN_USER: hdfs/terrasync-runner@HDFS.LOCAL
-      LAB_HDFS_CONFIG_DIR: /var/lib/data-mover-lab/hadoop
-      LAB_HDFS_KEYTAB: /var/lib/data-mover-lab/terrasync-runner.keytab
       LAB_CIFS_USERNAME: ${{ secrets.LAB_CIFS_USERNAME }}
       LAB_CIFS_PASSWORD: ${{ secrets.LAB_CIFS_PASSWORD }}
-      LAB_DXN_S3_ACCESS_KEY: ${{ secrets.LAB_DXN_S3_ACCESS_KEY }}
-      LAB_DXN_S3_SECRET_KEY: ${{ secrets.LAB_DXN_S3_SECRET_KEY }}
     steps:
       - uses: actions/checkout@v5
-      - name: Configure preinstalled Rust tools
-        run: echo "/home/github-runner/.cargo/bin" >> "$GITHUB_PATH"
+      - name: Isolate Cargo on the shared runner
+        shell: bash
+        run: |
+          build_root="$RUNNER_TEMP/terrasync-cargo/$RUN_ID"
+          mkdir -p -m 700 "$build_root/cargo"
+          if [[ -f "$HOME/.cargo/config.toml" ]]; then
+            install -m 600 "$HOME/.cargo/config.toml" "$build_root/cargo/config.toml"
+          fi
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          {
+            echo "CARGO_HOME=$build_root/cargo"
+            echo "CARGO_TARGET_DIR=$build_root/target"
+            echo "CARGO_BUILD_BUILD_DIR=$build_root/target"
+          } >> "$GITHUB_ENV"
       - name: Verify preinstalled Rust toolchain
         run: |
           test "$(rustc --version | cut -d' ' -f2)" = "1.95.0"
           cargo clippy --version
           cargo fmt --version
       - uses: Swatinem/rust-cache@v2
+        with:
+          cache-targets: false
       - run: tests/lab/health-check.sh
-      - run: tests/lab/prepare-run.sh "$RUN_ID"
+      - name: Prepare lab fixtures
+        id: prepare
+        run: tests/lab/prepare-run.sh "$RUN_ID"
       - run: flock --wait 10800 /tmp/terrasync-lab-tests.lock cargo test --workspace --exclude terrasync-rs --locked --no-fail-fast
       - name: TS-SINGLE matrix contract
-        run: python3 -m unittest tests/test_single_process_matrix.py
+        run: |
+          python3 -m unittest tests/test_single_process_matrix.py
+          cargo test --locked -p app --example single_process_matrix
       - name: Remote process E2E (serial)
         run: flock --wait 10800 /tmp/terrasync-lab-tests.lock cargo test --locked --test remote_process_e2e -- --test-threads=1
       - run: cargo clippy --workspace --all-targets --locked
-      - run: cargo build --release --locked --features lab-fault-injection
+      - name: Build lab CLI
+        id: build
+        if: ${{ !cancelled() && steps.prepare.outcome == 'success' }}
+        run: cargo build --release --locked --features lab-fault-injection
       - name: Storage and integrity E2E matrix
-        run: flock --wait 10800 /tmp/terrasync-lab-tests.lock tests/lab/run-e2e.sh "$RUN_ID"
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        run: |
+          TERRASYNC_BINARY="$CARGO_TARGET_DIR/release/terrasync" \
+            flock --wait 10800 /tmp/terrasync-lab-tests.lock tests/lab/run-e2e.sh "$RUN_ID"
       - name: TS-SINGLE 49-cell matrix (CIFS deferred)
+        id: single_matrix
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         env:
           TS_SINGLE_DEFER_CIFS: "true"
-        run: flock --wait 10800 /tmp/terrasync-lab-tests.lock tests/lab/run-single-process-matrix.sh "$RUN_ID"
+          LAB_DXN_S3_ENDPOINT: ${{ vars.LAB_DXN_NIGHTLY_ENDPOINT }}
+          LAB_DXN_S3_BUCKET: ${{ vars.LAB_DXN_NIGHTLY_BUCKET }}
+          LAB_DXN_S3_ACCESS_KEY: ${{ secrets.LAB_DXN_NIGHTLY_ACCESS_KEY }}
+          LAB_DXN_S3_SECRET_KEY: ${{ secrets.LAB_DXN_NIGHTLY_SECRET_KEY }}
+        run: |
+          : "${LAB_DXN_S3_ENDPOINT:?Set the LAB_DXN_NIGHTLY_ENDPOINT repository variable}"
+          : "${LAB_DXN_S3_BUCKET:?Set the LAB_DXN_NIGHTLY_BUCKET repository variable}"
+          TERRASYNC_SINGLE_MATRIX_BINARY="$CARGO_TARGET_DIR/release/examples/single_process_matrix" \
+            flock --wait 10800 /tmp/terrasync-lab-tests.lock tests/lab/with-hdfs-tunnel.sh tests/lab/run-single-process-matrix.sh "$RUN_ID"
       - name: Upload TS-SINGLE matrix evidence
-        if: always()
+        if: ${{ always() && steps.single_matrix.outcome != 'skipped' }}
         uses: actions/upload-artifact@v4
         with:
           name: single-process-matrix-${{ env.RUN_ID }}
           path: ${{ runner.temp }}/terrasync-harness-results/${{ env.RUN_ID }}-single-process
           if-no-files-found: error
       - name: HDFS single and remote process E2E
-        run: flock --wait 10800 /tmp/terrasync-lab-tests.lock tests/lab/run-hdfs-e2e.sh "$RUN_ID"
+        id: hdfs
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        run: |
+          TERRASYNC_BINARY="$CARGO_TARGET_DIR/release/terrasync" \
+            flock --wait 10800 /tmp/terrasync-lab-tests.lock tests/lab/with-hdfs-tunnel.sh tests/lab/run-hdfs-e2e.sh "$RUN_ID"
+          test -s "$RUNNER_TEMP/terrasync-harness-results/$RUN_ID-hdfs.json"
       - name: Upload HDFS certification evidence
-        if: always()
+        if: ${{ always() && steps.hdfs.outcome != 'skipped' }}
         uses: actions/upload-artifact@v4
         with:
           name: hdfs-certification-${{ env.RUN_ID }}
           path: ${{ runner.temp }}/terrasync-harness-results/${{ env.RUN_ID }}-hdfs*
           if-no-files-found: warn
       - name: Cleanup
-        if: always()
+        if: ${{ always() && steps.prepare.outcome != 'skipped' }}
         run: tests/lab/cleanup-run.sh "$RUN_ID"
 
   copy-takeover:

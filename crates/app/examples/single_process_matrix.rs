@@ -11,11 +11,11 @@ use std::path::PathBuf;
 use app::error::StorageError;
 use app::local_transfer::{LocalTransferConfig, LocalTransferSink, run_local_transfer};
 use async_trait::async_trait;
-use data_mover::model::{ModelValueError, ObservedEntry, StoragePath};
+use data_mover::model::{FailureClass, ModelValueError, ObservedEntry, StoragePath};
 use data_mover::storage::HdfsConfig;
 use data_mover::storage::{
     BackendConfig, BackendConnectError, CifsBackendConfig, HdfsBackendConfig, LocalBackendConfig, NfsBackendConfig,
-    S3BackendConfig, connect_backend,
+    S3BackendConfig, StorageRoleFailure, connect_backend,
 };
 use data_mover::transfer::{TransferFailure, TransferOutcome, TransferPolicy, TransferValueError};
 use data_mover::traversal::{TraversalCompletion, TraversalItem, TraversalOutcome, TraversalSession};
@@ -33,7 +33,7 @@ enum MatrixError {
     #[error("matrix profile is not one of the supported lab profiles")]
     UnknownProfile,
     #[error(
-        "usage: single_process_matrix SOURCE_PROFILE SOURCE_ROLE SOURCE_ROOT DESTINATION_PROFILE DESTINATION_ROLE DESTINATION_ROOT JOB_ID"
+        "usage: single_process_matrix SOURCE_PROFILE SOURCE_ROLE SOURCE_ROOT DESTINATION_PROFILE DESTINATION_ROLE DESTINATION_ROOT JOB_ID, or --delete-hdfs-run HDFS_BASE RUN_ID"
     )]
     Usage,
     #[error("matrix transfer did not complete exactly one file without failures")]
@@ -218,9 +218,128 @@ async fn session(
     Ok(session)
 }
 
+fn hdfs_cleanup_target(
+    root: &str, run_id: &str, configured_base: &str, configured_location: &str,
+) -> Result<(url::Url, StoragePath), MatrixError> {
+    let suffix = run_id
+        .strip_prefix("nightly-")
+        .or_else(|| run_id.strip_prefix("release-"))
+        .ok_or(MatrixError::Usage)?;
+    let hash = suffix
+        .strip_suffix("-matrix")
+        .or_else(|| suffix.strip_suffix("-e2e"))
+        .ok_or(MatrixError::Usage)?;
+    if hash.len() != 64 || !hash.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) {
+        return Err(MatrixError::Usage);
+    }
+    let mut location = url::Url::parse(root).map_err(|_| MatrixError::Usage)?;
+    let configured = url::Url::parse(configured_location).map_err(|_| MatrixError::Usage)?;
+    if location.scheme() != "hdfs"
+        || configured.scheme() != "hdfs"
+        || !location
+            .host_str()
+            .zip(configured.host_str())
+            .is_some_and(|(actual, expected)| actual == expected)
+        || location.port() != configured.port()
+        || location.password().is_some()
+        || location.query().is_some()
+        || location.fragment().is_some()
+        || location.path() != configured_base
+    {
+        return Err(MatrixError::Usage);
+    }
+    let base = location.path().trim_matches('/');
+    if base.is_empty()
+        || base.split('/').any(|part| {
+            part.is_empty()
+                || part == "."
+                || part == ".."
+                || !part.bytes().all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
+        })
+    {
+        return Err(MatrixError::Usage);
+    }
+    let path = StoragePath::new(format!("{base}/{run_id}"))?;
+    location.set_path("/");
+    Ok((location, path))
+}
+
+#[cfg(test)]
+mod cleanup_scope_tests {
+    use super::hdfs_cleanup_target;
+
+    #[test]
+    fn permits_only_hashed_scopes_under_the_configured_base_and_nameservice() {
+        let scope = format!("nightly-{}-matrix", "a".repeat(64));
+        let base = "/tmp/terrasync-nightly/ci";
+        let location = "hdfs://hdfscluster/";
+        let root = "hdfs://hdfscluster/tmp/terrasync-nightly/ci";
+        assert!(hdfs_cleanup_target(root, &scope, base, location).is_ok());
+        assert!(hdfs_cleanup_target(root, &scope, base, "hdfs://HdfsCluster/").is_err());
+        assert!(
+            hdfs_cleanup_target(
+                "hdfs://HdfsCluster/tmp/terrasync-nightly/ci",
+                &scope,
+                base,
+                "hdfs://HdfsCluster/"
+            )
+            .is_ok()
+        );
+        assert!(hdfs_cleanup_target(root, "nightly-important", base, location).is_err());
+        assert!(hdfs_cleanup_target(root, &format!("nightly-{}-other", "a".repeat(64)), base, location).is_err());
+        assert!(hdfs_cleanup_target("hdfs://hdfscluster/production", &scope, base, location).is_err());
+        assert!(hdfs_cleanup_target("hdfs://other/tmp/terrasync-nightly/ci", &scope, base, location).is_err());
+        assert!(hdfs_cleanup_target(root, &format!("nightly-{}-matrix", "A".repeat(64)), base, location).is_err());
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), MatrixError> {
     let args = env::args().skip(1).collect::<Vec<_>>();
+    if let [command, root, run_id] = args.as_slice() {
+        if command == "--delete-hdfs-run" {
+            let (location, path) = hdfs_cleanup_target(
+                root,
+                run_id,
+                &required("LAB_HDFS_BASE_PATH")?,
+                &required("LAB_HDFS_LOCATION")?,
+            )?;
+            let storage = match connect_backend(BackendConfig::Hdfs(HdfsBackendConfig {
+                location: location.to_string(),
+                client: hdfs_client("destination")?,
+                block_size: None,
+                ensure_dir: false,
+            }))
+            .await
+            {
+                Ok(storage) => storage,
+                Err(error) => {
+                    if let Some(failure) = error.session_failure() {
+                        eprintln!("HDFS_CLEANUP_FAILURE={:?}", failure.class());
+                    } else {
+                        eprintln!("HDFS_CLEANUP_FAILURE=connection_unknown");
+                    }
+                    return Err(error.into());
+                }
+            };
+            match storage.namespace()?.delete_subtree(&path, false).await {
+                Ok(()) => return Ok(()),
+                Err(data_mover::storage::StorageRoleFailure::Entry(error))
+                    if error.class() == FailureClass::NotFound =>
+                {
+                    return Ok(());
+                }
+                Err(error) => {
+                    let class = match &error {
+                        StorageRoleFailure::Entry(failure) => failure.class(),
+                        StorageRoleFailure::Session(failure) => failure.class(),
+                    };
+                    eprintln!("HDFS_CLEANUP_FAILURE={class:?}");
+                    return Err(error.into());
+                }
+            }
+        }
+    }
     if args.len() != 7 {
         return Err(MatrixError::Usage);
     }

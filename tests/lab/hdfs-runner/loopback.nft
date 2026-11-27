@@ -1,0 +1,8 @@
+table inet terrasync_hdfs {
+ chain output {
+  type filter hook output priority filter; policy accept;
+  ip daddr { 127.0.0.160, 127.0.0.162 } tcp dport 8020 meta skuid != 1000 reject
+  ip daddr { 127.0.0.161, 127.0.0.163, 127.0.0.164 } tcp dport 9866 meta skuid != 1000 reject
+  ip daddr 127.0.0.164 tcp dport 10088 meta skuid != 1000 reject
+ }
+}

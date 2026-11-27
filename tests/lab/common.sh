@@ -34,12 +34,14 @@ LAB_FIXTURE_GID="${LAB_FIXTURE_GID:-1000}"
 # AWS SDK/urllib3 proxy bypass matching is host based and does not consistently
 # honor the runner's CIDR entries. Keep all lab control/data traffic direct,
 # including the bucket-style hostnames constructed by run-e2e.sh.
-LAB_NO_PROXY_HOSTS="${LAB_SOURCE_MGMT},${LAB_DEST_MGMT},${LAB_WORKER_MGMT},${LAB_SOURCE_DATA},${LAB_DEST_DATA},${LAB_WORKER_DATA},${LAB_NFS40_DATA},${LAB_CIFS_SOURCE_DATA},${LAB_CIFS_DEST_DATA},${LAB_S3_BUCKET}.${LAB_SOURCE_DATA},${LAB_S3_BUCKET}.${LAB_DEST_DATA},${LAB_S3_BUCKET}.${LAB_WORKER_DATA}"
+LAB_DXN_S3_AUTHORITY="${LAB_DXN_S3_ENDPOINT#*://}"
+LAB_DXN_S3_HOST="${LAB_DXN_S3_AUTHORITY%%:*}"
+LAB_NO_PROXY_HOSTS="${LAB_SOURCE_MGMT},${LAB_DEST_MGMT},${LAB_WORKER_MGMT},${LAB_SOURCE_DATA},${LAB_DEST_DATA},${LAB_WORKER_DATA},${LAB_NFS40_DATA},${LAB_CIFS_SOURCE_DATA},${LAB_CIFS_DEST_DATA},${LAB_S3_BUCKET}.${LAB_SOURCE_DATA},${LAB_S3_BUCKET}.${LAB_DEST_DATA},${LAB_S3_BUCKET}.${LAB_WORKER_DATA},${LAB_DXN_S3_HOST},${LAB_DXN_S3_BUCKET}.${LAB_DXN_S3_HOST}"
 export NO_PROXY="${NO_PROXY:+${NO_PROXY},}${LAB_NO_PROXY_HOSTS}"
 export no_proxy="$NO_PROXY"
 
 clickhouse_query() {
-  curl --noproxy '*' --fail --silent --show-error \
+  curl --noproxy '*' --fail --silent --show-error --connect-timeout 5 --max-time 30 \
     --user "$LAB_CLICKHOUSE_USER:$LAB_CLICKHOUSE_PASSWORD" \
     --data-binary "$1" "$LAB_CLICKHOUSE_DSN/"
 }
@@ -47,6 +49,19 @@ clickhouse_query() {
 clickhouse_database_name() {
   local run_id="$1"
   printf 'terrasync_ci_%s' "${run_id//[^A-Za-z0-9_]/_}"
+}
+
+verify_integrity_report() {
+  local report status=0
+  report="$("$@")" || status=$?
+  printf '%s\n' "$report"
+  (( status == 0 )) || return "$status"
+  # 两套验收的目录下都只有一个 payload 文件。
+  if ! grep -Eq 'Checked:[[:space:]]+1[[:space:]]*$' <<<"$report" ||
+    ! grep -Fq 'All Passed ✓' <<<"$report"; then
+    echo "integrity check must examine the single payload and report no issues" >&2
+    return 1
+  fi
 }
 
 require_s3_credentials() {
@@ -74,6 +89,19 @@ require_s3_credentials() {
   fi
   : "${LAB_S3_ACCESS_KEY:?LAB_S3_ACCESS_KEY is required}"
   : "${LAB_S3_SECRET_KEY:?LAB_S3_SECRET_KEY is required}"
+}
+
+report_hdfs_cleanup_failure() {
+  local status="$1" log="$2" reason
+  case "$status" in
+    124|137) reason=timeout ;;
+    130|143) reason=cancelled ;;
+    *)
+      reason="$(sed -nE 's/^HDFS_CLEANUP_FAILURE=(Authentication|PermissionDenied|Connectivity|Timeout|InvalidInput|Unsupported|NotFound|Conflict|Capacity|Corruption|Protocol|Throttled|Cancelled|Internal|connection_unknown)$/\1/p' "$log" | head -1)"
+      reason="${reason:-storage_error}"
+      ;;
+  esac
+  echo "HDFS cleanup failed: $reason (exit $status)" >&2
 }
 
 require_hdfs_credentials() {
@@ -104,17 +132,25 @@ require_single_matrix_credentials() {
 hdfs_run_root() {
   local run_id="$1"
   validate_run_id "$run_id"
-  python3 - "$LAB_HDFS_LOCATION" "$LAB_HDFS_ADMIN_USER" "$run_id" <<'PY'
+  python3 - "$LAB_HDFS_LOCATION" "$LAB_HDFS_ADMIN_USER" "$run_id" "${LAB_HDFS_BASE_PATH:-/tmp/terrasync-nightly}" <<'PY'
+import re
 import sys
 import urllib.parse
 
-location, admin_user, run_id = sys.argv[1:]
+location, admin_user, run_id, base_path = sys.argv[1:]
 parsed = urllib.parse.urlsplit(location)
 if parsed.scheme != "hdfs" or parsed.password is not None or parsed.hostname is None:
     raise SystemExit("LAB_HDFS_LOCATION must be a password-free HDFS URL")
 user = urllib.parse.quote(admin_user, safe="")
-authority = parsed.hostname if parsed.port is None else f"{parsed.hostname}:{parsed.port}"
-print(f"hdfs://{user}@{authority}/tmp/terrasync-nightly/{run_id}/hdfs")
+# Nameservice IDs are configuration keys, so preserve their original case.
+# Accessing parsed.port also validates a present port before retaining the authority.
+_ = parsed.port
+authority = parsed.netloc.rsplit("@", 1)[-1]
+if not re.fullmatch(r"/[A-Za-z0-9._/-]+", base_path) or any(
+    part in ("", ".", "..") for part in base_path[1:].split("/")
+):
+    raise SystemExit("LAB_HDFS_BASE_PATH must be a normalized absolute path")
+print(f"hdfs://{user}@{authority}{base_path}/{run_id}/hdfs")
 PY
 }
 

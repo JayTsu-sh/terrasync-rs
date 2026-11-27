@@ -401,12 +401,42 @@ same-backend incremental synchronization and the local filter contract. The
 nightly workflow separately runs the real two-process QUIC tests. Each run uses
 an isolated ClickHouse database that is created and dropped for every run.
 
+Nightly reaches the five-node `hdfscluster` through `with-hdfs-tunnel.sh`:
+NameNodes `10.30.3.160/162`, DataNodes `10.30.3.161/163/164`, and the
+KDC on `.164`. The runner cannot route directly to this data network. The
+wrapper opens loopback-only SSH forwards through `10.128.135.164`, creates
+per-process Kerberos, HDFS and hostname configuration, and removes them and
+the tunnel afterward. Both HDFS gates hold the shared lab lock while the
+forwards are active. The gateway is a single point of failure for the test
+path; NameNode HA does not make the gateway highly available.
+
+The runner-only directory `~/.local/share/terrasync-hdfs-ci` contains
+`tunnel_key`, pinned `known_hosts`, `client.keytab`, and the extracted Ubuntu
+`libnss-wrapper` library under `pkg/usr/lib/x86_64-linux-gnu/`. The dedicated
+`terrasync-fwd` SSH key is restricted to the six required TCP destinations;
+`terrasync-lab-ci@HDFS.INTERNAL` owns only its private test directory under
+`/tmp/terrasync-nightly/terrasync-lab-ci`. Protect these files as credentials.
+No node service keytab or HDFS administrator keytab belongs on the runner.
+The runner also installs `hdfs-runner/loopback.nft` at
+`/etc/terrasync-hdfs/loopback.nft`, enables the adjacent systemd service, and
+installs `hdfs-runner/sudoers-read-rules` through `visudo`. These rules reject
+access to the six local forward ports from every OS UID except the CI UID
+1000; the sudo rule permits only reading this nftables table. The wrapper
+checks the rules before opening a tunnel. Jobs using the same `github-runner`
+account share its credentials and remain in the same trust boundary.
+The HDFS connector currently does not expose a typed cause for every
+connection-stage failure, so cleanup reports `connection_unknown` when that
+cause is unavailable; operation-stage failures retain their typed class.
+The wrapper is Nightly-specific; callers of the underlying scripts can still
+supply their own HDFS environment and `LAB_HDFS_BASE_PATH`.
+
 `run-hdfs-e2e.sh` certifies the pinned `data-mover` revision against the HA,
 Kerberos-protected HDFS cluster. The runner provides `LAB_HDFS_LOCATION`,
 `LAB_HDFS_ADMIN_USER`, `LAB_HDFS_CONFIG_DIR`, and `LAB_HDFS_KEYTAB`. It covers
 HDFS-to-HDFS copy and full integrity in both single-process and separate QUIC
-sender/receiver modes. The sender receives source credentials only and the
-receiver destination credentials only. Missing source configuration and an
+sender/receiver modes. A separate data-only HDFS-to-local readback verifies
+each destination SHA-256 without requiring HDFS names to map to local UID/GID.
+The sender receives source credentials only and the receiver destination credentials only. Missing source configuration and an
 invalid keytab are negative gates, including a secret-leak assertion. All HDFS
 paths, ClickHouse databases, copied keytabs, credential caches, and generated
 0600 configs are scoped to the run id and removed by the exit trap. The JSON
@@ -418,7 +448,9 @@ It emits 64 independent cell records for Local, NFSv3, NFSv4.0, NFSv4.1,
 FAS2750 CIFS, standard S3, DXN S3, and HDFS. Every cell preloads its source,
 runs the protocol-neutral `Storage + run_local_transfer` single-process path,
 verifies every stream with copy-time BLAKE3, reads the destination back, and
-records the exact terrasync and data-mover commits. This runner intentionally
+records the exact terrasync and data-mover commits. Its aggregate also requires
+successful HDFS and DXN prefix cleanup; the dedicated DXN test bucket must have
+versioning disabled and its object/multipart prefix is checked afterward. This runner intentionally
 does not route through the legacy URL-dispatching CLI. FAS2750 and DXN
 credentials are CI secrets; reports contain only profile-level environment
 fingerprints.
@@ -428,6 +460,15 @@ While FAS2750 CIFS root provisioning is explicitly deferred, nightly sets
 the remaining seven profiles, with `cifs_fas2750` recorded in
 `deferred_profiles`; it is not a substitute for the 64-cell acceptance gate.
 Release validation remains on the full matrix.
+
+Nightly sets the DXN S3 endpoint and private test bucket through
+`LAB_DXN_NIGHTLY_ENDPOINT` and `LAB_DXN_NIGHTLY_BUCKET` repository variables.
+The DXN test identity is supplied through `LAB_DXN_NIGHTLY_ACCESS_KEY` and
+`LAB_DXN_NIGHTLY_SECRET_KEY` Actions secrets. Its RGW HTTP endpoint must be
+reachable from the runner. The matrix cleans up objects and unfinished uploads
+under its own DXN prefix and records the configured endpoint in the evidence.
+If a transfer cell fails, the matrix records that failure and continues to
+collect results. The evidence validator still requires every active cell to pass.
 
 `run-source-metadata-guard.py` requires a unique `nightly-source-metadata-guard-*`
 prefix already held by a `prepare-run.sh` / `cleanup-run.sh` lifecycle and

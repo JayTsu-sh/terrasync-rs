@@ -11,7 +11,7 @@ from botocore.exceptions import ClientError
 def client(endpoint: str):
     return boto3.client(
         "s3",
-        endpoint_url=f"http://{endpoint}:9000",
+        endpoint_url=endpoint if endpoint.startswith(("http://", "https://")) else f"http://{endpoint}:9000",
         aws_access_key_id=os.environ["LAB_S3_ACCESS_KEY"],
         aws_secret_access_key=os.environ["LAB_S3_SECRET_KEY"],
         region_name="us-east-1",
@@ -22,7 +22,7 @@ def client(endpoint: str):
 parser = argparse.ArgumentParser()
 parser.add_argument(
     "command",
-    choices=["ensure-bucket", "put", "sha256", "exists", "delete-prefix", "abort-multipart-prefix"],
+    choices=["ensure-bucket", "put", "sha256", "exists", "delete-prefix", "abort-multipart-prefix", "assert-unversioned", "verify-clean-prefix"],
 )
 parser.add_argument("--endpoint", required=True)
 parser.add_argument("--bucket", required=True)
@@ -50,6 +50,14 @@ elif args.command == "exists":
         if error.response["Error"]["Code"] in ("404", "NoSuchKey", "NotFound"):
             raise SystemExit(1)
         raise
+elif args.command in ("assert-unversioned", "verify-clean-prefix"):
+    if s3.get_bucket_versioning(Bucket=args.bucket).get("Status") is not None:
+        raise SystemExit("test bucket versioning must be disabled")
+    if args.command == "verify-clean-prefix":
+        objects = s3.list_objects_v2(Bucket=args.bucket, Prefix=args.prefix, MaxKeys=1)
+        uploads = s3.list_multipart_uploads(Bucket=args.bucket, Prefix=args.prefix, MaxUploads=1)
+        if objects.get("KeyCount", 0) or uploads.get("Uploads"):
+            raise SystemExit("test prefix still has objects or multipart uploads")
 elif args.command == "delete-prefix":
     token = None
     while True:
@@ -59,7 +67,9 @@ elif args.command == "delete-prefix":
         page = s3.list_objects_v2(**kwargs)
         objects = [{"Key": item["Key"]} for item in page.get("Contents", [])]
         if objects:
-            s3.delete_objects(Bucket=args.bucket, Delete={"Objects": objects})
+            deleted = s3.delete_objects(Bucket=args.bucket, Delete={"Objects": objects})
+            if errors := deleted.get("Errors"):
+                raise SystemExit(f"could not delete {len(errors)} objects under the test prefix")
         if not page.get("IsTruncated"):
             break
         token = page["NextContinuationToken"]
