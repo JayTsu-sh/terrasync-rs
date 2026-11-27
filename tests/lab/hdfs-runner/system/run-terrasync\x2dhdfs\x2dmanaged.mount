@@ -1,0 +1,11 @@
+[Unit]
+Description=Bounded private scratch space for managed TerraSync HDFS certification
+
+[Mount]
+What=tmpfs
+Where=/run/terrasync-hdfs-managed
+Type=tmpfs
+Options=size=2G,nr_inodes=32768,mode=0700,uid=1000,nosuid,nodev,noexec
+
+[Install]
+WantedBy=multi-user.target

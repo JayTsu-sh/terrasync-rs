@@ -66,7 +66,7 @@ jobs:
       - name: Build lab CLI
         id: build
         if: ${{ !cancelled() && steps.prepare.outcome == 'success' }}
-        run: cargo build --release --locked --features lab-fault-injection
+        run: python3 tests/lab/hdfs_lab.py build
       - name: Storage and integrity E2E matrix
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         run: |
@@ -96,17 +96,39 @@ jobs:
       - name: HDFS single and remote process E2E
         id: hdfs
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        timeout-minutes: 45
         run: |
-          TERRASYNC_BINARY="$CARGO_TARGET_DIR/release/terrasync" \
-            flock --wait 10800 /tmp/terrasync-lab-tests.lock tests/lab/with-hdfs-tunnel.sh tests/lab/run-hdfs-e2e.sh "$RUN_ID"
-          test -s "$RUNNER_TEMP/terrasync-harness-results/$RUN_ID-hdfs.json"
+          export XDG_RUNTIME_DIR="/run/user/$(id -u)"
+          export DBUS_SESSION_BUS_ADDRESS="unix:path=$XDG_RUNTIME_DIR/bus"
+          exec python3 tests/lab/hdfs_lab.py run "$RUN_ID" \
+            --output "$RUNNER_TEMP/terrasync-harness-results"
+      - name: Reconcile HDFS attempt diagnostics
+        id: hdfs_reconcile
+        if: ${{ always() && steps.hdfs.outcome != 'skipped' && steps.hdfs.outcome != '' }}
+        timeout-minutes: 2
+        run: |
+          export XDG_RUNTIME_DIR="/run/user/$(id -u)"
+          export DBUS_SESSION_BUS_ADDRESS="unix:path=$XDG_RUNTIME_DIR/bus"
+          cancel=()
+          if [[ "$JOB_STATUS" == cancelled ]]; then cancel=(--cancel); fi
+          exec python3 tests/lab/hdfs_lab.py reconcile "$RUN_ID" "${cancel[@]}" \
+            --output "$RUNNER_TEMP/terrasync-harness-results"
+        env:
+          JOB_STATUS: ${{ job.status }}
+      - name: Upload HDFS attempt diagnostics
+        if: ${{ always() && steps.hdfs.outcome != 'skipped' && steps.hdfs.outcome != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: hdfs-diagnostics-${{ env.RUN_ID }}
+          path: ${{ runner.temp }}/terrasync-harness-results/${{ env.RUN_ID }}-hdfs-cleanup.json
+          if-no-files-found: warn
       - name: Upload HDFS certification evidence
-        if: ${{ always() && steps.hdfs.outcome != 'skipped' }}
+        if: ${{ !cancelled() && steps.hdfs.outcome == 'success' && steps.hdfs_reconcile.outcome == 'success' }}
         uses: actions/upload-artifact@v4
         with:
           name: hdfs-certification-${{ env.RUN_ID }}
-          path: ${{ runner.temp }}/terrasync-harness-results/${{ env.RUN_ID }}-hdfs*
-          if-no-files-found: warn
+          path: ${{ runner.temp }}/terrasync-harness-results/${{ env.RUN_ID }}-hdfs.json
+          if-no-files-found: error
       - name: Cleanup
         if: ${{ always() && steps.prepare.outcome != 'skipped' }}
         run: tests/lab/cleanup-run.sh "$RUN_ID"

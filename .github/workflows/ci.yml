@@ -40,6 +40,13 @@ jobs:
       - run: npm test
       - run: npm run build
 
+  lab-harness:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: HDFS attempt lifecycle contract
+        run: python3 -m unittest discover -s tests -p test_hdfs_lab.py
+
   mcp:
     runs-on: ubuntu-latest
     defaults:

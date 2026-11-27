@@ -1,0 +1,11 @@
+[Unit]
+Description=Check TerraSync HDFS certification attempts after runner loss
+
+[Timer]
+OnStartupSec=15s
+OnUnitInactiveSec=30s
+AccuracySec=2s
+Unit=terrasync-hdfs-reaper.service
+
+[Install]
+WantedBy=timers.target
