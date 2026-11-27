@@ -431,8 +431,9 @@ supply their own HDFS environment and `LAB_HDFS_BASE_PATH`.
 Kerberos-protected HDFS cluster. The runner provides `LAB_HDFS_LOCATION`,
 `LAB_HDFS_ADMIN_USER`, `LAB_HDFS_CONFIG_DIR`, and `LAB_HDFS_KEYTAB`. It covers
 HDFS-to-HDFS copy and full integrity in both single-process and separate QUIC
-sender/receiver modes. The sender receives source credentials only and the
-receiver destination credentials only. Missing source configuration and an
+sender/receiver modes. A separate data-only HDFS-to-local readback verifies
+each destination SHA-256 without requiring HDFS names to map to local UID/GID.
+The sender receives source credentials only and the receiver destination credentials only. Missing source configuration and an
 invalid keytab are negative gates, including a secret-leak assertion. All HDFS
 paths, ClickHouse databases, copied keytabs, credential caches, and generated
 0600 configs are scoped to the run id and removed by the exit trap. The JSON
@@ -444,7 +445,9 @@ It emits 64 independent cell records for Local, NFSv3, NFSv4.0, NFSv4.1,
 FAS2750 CIFS, standard S3, DXN S3, and HDFS. Every cell preloads its source,
 runs the protocol-neutral `Storage + run_local_transfer` single-process path,
 verifies every stream with copy-time BLAKE3, reads the destination back, and
-records the exact terrasync and data-mover commits. This runner intentionally
+records the exact terrasync and data-mover commits. Its aggregate also requires
+successful HDFS and DXN prefix cleanup; the dedicated DXN test bucket must have
+versioning disabled and its object/multipart prefix is checked afterward. This runner intentionally
 does not route through the legacy URL-dispatching CLI. FAS2750 and DXN
 credentials are CI secrets; reports contain only profile-level environment
 fingerprints.

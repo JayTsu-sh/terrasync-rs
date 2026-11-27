@@ -22,7 +22,7 @@ def client(endpoint: str):
 parser = argparse.ArgumentParser()
 parser.add_argument(
     "command",
-    choices=["ensure-bucket", "put", "sha256", "exists", "delete-prefix", "abort-multipart-prefix"],
+    choices=["ensure-bucket", "put", "sha256", "exists", "delete-prefix", "abort-multipart-prefix", "assert-unversioned", "verify-clean-prefix"],
 )
 parser.add_argument("--endpoint", required=True)
 parser.add_argument("--bucket", required=True)
@@ -50,6 +50,14 @@ elif args.command == "exists":
         if error.response["Error"]["Code"] in ("404", "NoSuchKey", "NotFound"):
             raise SystemExit(1)
         raise
+elif args.command in ("assert-unversioned", "verify-clean-prefix"):
+    if s3.get_bucket_versioning(Bucket=args.bucket).get("Status") is not None:
+        raise SystemExit("test bucket versioning must be disabled")
+    if args.command == "verify-clean-prefix":
+        objects = s3.list_objects_v2(Bucket=args.bucket, Prefix=args.prefix, MaxKeys=1)
+        uploads = s3.list_multipart_uploads(Bucket=args.bucket, Prefix=args.prefix, MaxUploads=1)
+        if objects.get("KeyCount", 0) or uploads.get("Uploads"):
+            raise SystemExit("test prefix still has objects or multipart uploads")
 elif args.command == "delete-prefix":
     token = None
     while True:

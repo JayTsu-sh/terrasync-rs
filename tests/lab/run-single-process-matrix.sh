@@ -50,7 +50,7 @@ cleanup_resources() {
   local status=0
   if [[ "$hdfs_touched" == true ]]; then
     hdfs_touched=false
-    if timeout --kill-after=5s 45s "$cli_binary" -c "$hdfs_cleanup_config" rm "$hdfs_root" >/dev/null 2>&1; then
+    if timeout --foreground --kill-after=5s 45s "$cli_binary" -c "$hdfs_cleanup_config" rm "$hdfs_root" >/dev/null 2>&1; then
       hdfs_cleanup=passed
     else
       echo "HDFS matrix cleanup failed for its run prefix" >&2
@@ -61,9 +61,9 @@ cleanup_resources() {
   if [[ "$dxn_touched" == true ]]; then
     dxn_touched=false
     dxn_cleanup=passed
-    for operation in abort-multipart-prefix delete-prefix; do
+    for operation in abort-multipart-prefix delete-prefix verify-clean-prefix; do
       LAB_S3_ACCESS_KEY="$LAB_DXN_S3_ACCESS_KEY" LAB_S3_SECRET_KEY="$LAB_DXN_S3_SECRET_KEY" \
-        timeout --kill-after=5s 45s python3 "$repo_root/tests/lab/s3_helper.py" "$operation" \
+        timeout --foreground --kill-after=5s 45s python3 "$repo_root/tests/lab/s3_helper.py" "$operation" \
           --endpoint "$LAB_DXN_S3_ENDPOINT" --bucket "$LAB_DXN_S3_BUCKET" --prefix "$matrix_prefix/" || {
           echo "DXN $operation cleanup failed for $matrix_prefix/" >&2
           dxn_cleanup=failed
@@ -83,6 +83,9 @@ cleanup() {
 trap cleanup EXIT
 
 mkdir -p "$runtime_root" "$results_root"
+LAB_S3_ACCESS_KEY="$LAB_DXN_S3_ACCESS_KEY" LAB_S3_SECRET_KEY="$LAB_DXN_S3_SECRET_KEY" \
+  timeout --foreground --kill-after=5s 45s python3 "$repo_root/tests/lab/s3_helper.py" assert-unversioned \
+    --endpoint "$LAB_DXN_S3_ENDPOINT" --bucket "$LAB_DXN_S3_BUCKET"
 cat > "$hdfs_cleanup_config" <<EOF
 [storage.destination.hdfs]
 config_dir = "$LAB_HDFS_CONFIG_DIR"

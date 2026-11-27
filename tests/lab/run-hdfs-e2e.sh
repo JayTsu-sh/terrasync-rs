@@ -11,6 +11,7 @@ repo_root="$(cd "$(dirname "$0")/../.." && pwd)"
 target_root="$(cargo metadata --format-version 1 --no-deps --manifest-path "$repo_root/Cargo.toml" | \
   python3 -c 'import json,sys; print(json.load(sys.stdin)["target_directory"])')"
 binary="${TERRASYNC_BINARY:-$target_root/release/terrasync}"
+matrix_binary="${TERRASYNC_SINGLE_MATRIX_BINARY:-$target_root/release/examples/single_process_matrix}"
 lab_root="/tmp/terrasync-lab/$run_id/hdfs"
 runtime_root="$lab_root/runtime"
 fixture_root="$lab_root/fixture"
@@ -144,16 +145,21 @@ for sensitive_value in \
   fi
 done
 
-printf 'terrasync-hdfs-%s\n' "$run_id" > "$fixture_root/payload.txt"
-expected_hash="$(sha256sum "$fixture_root/payload.txt" | cut -d' ' -f1)"
+# Readback uses the protocol-neutral data path; HDFS names do not map to local numeric ownership.
+env -u LAB_HDFS_KEYTAB -u LAB_CIFS_USERNAME -u LAB_CIFS_PASSWORD \
+  cargo build --release --locked --manifest-path "$repo_root/Cargo.toml" -p app --example single_process_matrix
+printf 'terrasync-hdfs-%s\n' "$run_id" > "$fixture_root/payload.bin"
+expected_hash="$(sha256sum "$fixture_root/payload.bin" | cut -d' ' -f1)"
 
 verify_destination() {
   local mode="$1" destination="$2" readback="$lab_root/readback-$1" actual_hash
   verify_integrity_report run_with_config "$single_config" integrity-check --id "hdfs-$mode-integrity-$run_id" \
     "$hdfs_source" "$destination"
   mkdir -p "$readback"
-  run_with_config "$single_config" sync --resume --id "hdfs-$mode-readback-$run_id" "$destination" "$readback"
-  actual_hash="$(sha256sum "$readback/payload.txt" | cut -d' ' -f1)"
+  LAB_HDFS_ADMIN_USER="$LAB_HDFS_ADMIN_USER" LAB_HDFS_CONFIG_DIR="$LAB_HDFS_CONFIG_DIR" \
+    LAB_HDFS_KEYTAB="$source_keytab" LAB_HDFS_SOURCE_CCACHE="$source_cache" \
+    "$matrix_binary" hdfs source "$destination" local destination "$readback" "hdfs-$mode-readback-$run_id"
+  actual_hash="$(sha256sum "$readback/payload.bin" | cut -d' ' -f1)"
   [[ "$actual_hash" == "$expected_hash" ]] || {
     echo "HDFS $mode destination checksum mismatch" >&2
     return 1
