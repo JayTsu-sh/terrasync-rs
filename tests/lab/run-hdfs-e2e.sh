@@ -41,9 +41,13 @@ run_with_config() {
   (cd "$runtime_root" && "$binary" -c "$config" "$@")
 }
 
-cleanup_resources() {
-  local status=0
+shielded_cleanup() (
   trap '' INT TERM HUP
+  "$@"
+)
+cleanup_resources() {
+  local status=0 cleanup_cancelled=false
+  trap 'cleanup_cancelled=true' INT TERM HUP
   if [[ -n "$receiver_pid" ]]; then
     kill "$receiver_pid" 2>/dev/null || true
     wait "$receiver_pid" 2>/dev/null || true
@@ -51,20 +55,21 @@ cleanup_resources() {
   fi
   if [[ "$hdfs_touched" == true ]]; then
     # The run parent is unique to this invocation and contains both matrix and E2E paths.
-    if ! timeout --foreground --kill-after=5s 45s "$binary" -c "$single_config" rm "${hdfs_root%/hdfs}" >/dev/null 2>&1; then
+    if ! shielded_cleanup timeout --foreground --kill-after=5s 45s "$binary" -c "$single_config" rm "${hdfs_root%/hdfs}" >/dev/null 2>&1; then
       echo 'HDFS certification cleanup failed' >&2
       status=1
     fi
     hdfs_touched=false
   fi
   if [[ "$database_created" == true ]]; then
-    if ! clickhouse_query "DROP DATABASE IF EXISTS $database_name" >/dev/null 2>&1; then
+    if ! shielded_cleanup clickhouse_query "DROP DATABASE IF EXISTS $database_name" >/dev/null 2>&1; then
       echo 'HDFS certification database cleanup failed' >&2
       status=1
     fi
     database_created=false
   fi
   trap - INT TERM HUP
+  [[ "$cleanup_cancelled" == false ]] || return 143
   return "$status"
 }
 cleanup() {
@@ -81,8 +86,8 @@ trap cleanup EXIT
 mkdir -p "$runtime_root" "$fixture_root" "$results_root"
 install -m 0600 "$LAB_HDFS_KEYTAB" "$source_keytab"
 install -m 0600 "$LAB_HDFS_KEYTAB" "$destination_keytab"
-clickhouse_query "CREATE DATABASE IF NOT EXISTS $database_name"
 database_created=true
+clickhouse_query "CREATE DATABASE IF NOT EXISTS $database_name"
 
 write_base_config() {
   local output="$1"
