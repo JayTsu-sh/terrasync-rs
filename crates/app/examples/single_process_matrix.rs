@@ -11,7 +11,7 @@ use std::path::PathBuf;
 use app::error::StorageError;
 use app::local_transfer::{LocalTransferConfig, LocalTransferSink, run_local_transfer};
 use async_trait::async_trait;
-use data_mover::model::{ModelValueError, ObservedEntry, StoragePath};
+use data_mover::model::{FailureClass, ModelValueError, ObservedEntry, StoragePath};
 use data_mover::storage::HdfsConfig;
 use data_mover::storage::{
     BackendConfig, BackendConnectError, CifsBackendConfig, HdfsBackendConfig, LocalBackendConfig, NfsBackendConfig,
@@ -33,7 +33,7 @@ enum MatrixError {
     #[error("matrix profile is not one of the supported lab profiles")]
     UnknownProfile,
     #[error(
-        "usage: single_process_matrix SOURCE_PROFILE SOURCE_ROLE SOURCE_ROOT DESTINATION_PROFILE DESTINATION_ROLE DESTINATION_ROOT JOB_ID"
+        "usage: single_process_matrix SOURCE_PROFILE SOURCE_ROLE SOURCE_ROOT DESTINATION_PROFILE DESTINATION_ROLE DESTINATION_ROOT JOB_ID, or --delete-hdfs-run HDFS_BASE RUN_ID"
     )]
     Usage,
     #[error("matrix transfer did not complete exactly one file without failures")]
@@ -221,6 +221,58 @@ async fn session(
 #[tokio::main]
 async fn main() -> Result<(), MatrixError> {
     let args = env::args().skip(1).collect::<Vec<_>>();
+    if let [command, root, run_id] = args.as_slice() {
+        if command == "--delete-hdfs-run" {
+            let suffix = run_id
+                .strip_prefix("nightly-")
+                .or_else(|| run_id.strip_prefix("release-"));
+            if !suffix.is_some_and(|suffix| {
+                !suffix.is_empty()
+                    && suffix.len() <= 80
+                    && suffix.bytes().all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
+            }) {
+                return Err(MatrixError::Usage);
+            }
+            let mut location = url::Url::parse(root).map_err(|_| MatrixError::Usage)?;
+            if location.scheme() != "hdfs"
+                || location.host().is_none()
+                || location.password().is_some()
+                || location.query().is_some()
+                || location.fragment().is_some()
+            {
+                return Err(MatrixError::Usage);
+            }
+            let base = location.path().trim_matches('/');
+            if base.is_empty()
+                || base.split('/').any(|part| {
+                    part.is_empty()
+                        || part == "."
+                        || part == ".."
+                        || !part.bytes().all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
+                })
+            {
+                return Err(MatrixError::Usage);
+            }
+            let path = StoragePath::new(format!("{base}/{run_id}"))?;
+            location.set_path("/");
+            let storage = connect_backend(BackendConfig::Hdfs(HdfsBackendConfig {
+                location: location.to_string(),
+                client: hdfs_client("destination")?,
+                block_size: None,
+                ensure_dir: false,
+            }))
+            .await?;
+            match storage.namespace()?.delete_subtree(&path, false).await {
+                Ok(()) => return Ok(()),
+                Err(data_mover::storage::StorageRoleFailure::Entry(error))
+                    if error.class() == FailureClass::NotFound =>
+                {
+                    return Ok(());
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+    }
     if args.len() != 7 {
         return Err(MatrixError::Usage);
     }

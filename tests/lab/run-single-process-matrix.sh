@@ -37,12 +37,13 @@ lab_root="/tmp/terrasync-lab/$run_id/single-process-matrix"
 runtime_root="$lab_root/runtime"
 results_root="${RUNNER_TEMP:-/tmp}/terrasync-harness-results/$run_id-single-process"
 aggregate="$results_root/matrix.json"
-hdfs_root="$(hdfs_run_root "$run_id")/single-process-matrix"
+hdfs_scope="${run_id%%-*}-$(printf %s "$run_id" | sha256sum | cut -d' ' -f1)-matrix"
+hdfs_run_root="$(hdfs_run_root "$hdfs_scope")"
+hdfs_base="${hdfs_run_root%/$hdfs_scope/hdfs}"
+hdfs_root="$hdfs_run_root/single-process-matrix"
 matrix_prefix="ci/$run_id/single-process-matrix"
 dxn_touched=false
 hdfs_touched=false
-hdfs_cleanup_config="$runtime_root/hdfs-cleanup.toml"
-cli_binary="${TERRASYNC_BINARY:-$target_root/release/terrasync}"
 
 hdfs_cleanup=not_attempted
 dxn_cleanup=not_attempted
@@ -54,7 +55,7 @@ cleanup_resources() {
   local status=0 cleanup_cancelled=false
   trap 'cleanup_cancelled=true' INT TERM HUP
   if [[ "$hdfs_touched" == true ]]; then
-    if shielded_cleanup timeout --foreground --kill-after=5s 45s "$cli_binary" -c "$hdfs_cleanup_config" rm "$hdfs_root" >/dev/null 2>&1; then
+    if shielded_cleanup timeout --foreground --kill-after=5s 45s "$binary" --delete-hdfs-run "$hdfs_base" "$hdfs_scope" >/dev/null 2>&1; then
       hdfs_cleanup=passed
     else
       echo "HDFS matrix cleanup failed for its run prefix" >&2
@@ -97,14 +98,6 @@ mkdir -p "$runtime_root" "$results_root"
 LAB_S3_ACCESS_KEY="$LAB_DXN_S3_ACCESS_KEY" LAB_S3_SECRET_KEY="$LAB_DXN_S3_SECRET_KEY" \
   timeout --foreground --kill-after=5s 45s python3 "$repo_root/tests/lab/s3_helper.py" assert-unversioned \
     --endpoint "$LAB_DXN_S3_ENDPOINT" --bucket "$LAB_DXN_S3_BUCKET"
-cat > "$hdfs_cleanup_config" <<EOF
-[storage.destination.hdfs]
-config_dir = "$LAB_HDFS_CONFIG_DIR"
-[storage.destination.hdfs.kerberos]
-principal = "$LAB_HDFS_ADMIN_USER"
-keytab = "$LAB_HDFS_KEYTAB"
-cache = "FILE:$runtime_root/cleanup.ccache"
-EOF
 export LAB_HDFS_SOURCE_CCACHE="FILE:$runtime_root/source.ccache"
 export LAB_HDFS_DESTINATION_CCACHE="FILE:$runtime_root/destination.ccache"
 # Evidence is attributed to the current checkout and locked dependency graph. Rebuilding is

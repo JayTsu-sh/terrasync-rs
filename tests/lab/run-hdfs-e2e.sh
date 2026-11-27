@@ -26,7 +26,9 @@ destination_keytab="$runtime_root/destination.keytab"
 source_cache="FILE:$runtime_root/source.ccache"
 destination_cache="FILE:$runtime_root/destination.ccache"
 invalid_keytab="$runtime_root/does-not-exist.keytab"
-hdfs_root="$(hdfs_run_root "$run_id")"
+hdfs_scope="${run_id%%-*}-$(printf %s "$run_id" | sha256sum | cut -d' ' -f1)-e2e"
+hdfs_root="$(hdfs_run_root "$hdfs_scope")"
+hdfs_base="${hdfs_root%/$hdfs_scope/hdfs}"
 hdfs_source="$hdfs_root/source"
 hdfs_single_destination="$hdfs_root/single-destination"
 hdfs_remote_destination="$hdfs_root/remote-destination"
@@ -86,8 +88,10 @@ cleanup_resources() {
     receiver_pid=""
   fi
   if [[ "$hdfs_touched" == true ]]; then
-    # The run parent is unique to this invocation and contains both matrix and E2E paths.
-    if ! shielded_cleanup timeout --foreground --kill-after=5s 45s "$binary" -c "$single_config" rm "${hdfs_root%/hdfs}" >/dev/null 2>&1; then
+    # Delete only this gate's directory relative to the dedicated HDFS base.
+    if ! LAB_HDFS_ADMIN_USER="$LAB_HDFS_ADMIN_USER" LAB_HDFS_CONFIG_DIR="$LAB_HDFS_CONFIG_DIR" \
+      LAB_HDFS_DESTINATION_CCACHE="$destination_cache" LAB_HDFS_KEYTAB="$destination_keytab" \
+      shielded_cleanup timeout --foreground --kill-after=5s 45s "$matrix_binary" --delete-hdfs-run "$hdfs_base" "$hdfs_scope" >/dev/null 2>&1; then
       echo 'HDFS certification cleanup failed' >&2
       status=1
     fi
