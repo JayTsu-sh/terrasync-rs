@@ -19,6 +19,8 @@ PROFILES = (
 )
 DEFERRED_PROFILES = ("cifs_fas2750",)
 SHA = re.compile(r"^[0-9a-f]{40}$")
+DIGEST = re.compile(r"[0-9a-f]{64}")
+RUN_ID = re.compile(r"(nightly|release)-[A-Za-z0-9._-]{1,80}")
 CELL_FIELDS = (
     "gate_id",
     "source_profile",
@@ -32,20 +34,79 @@ CELL_FIELDS = (
 )
 
 
+def validate_operation_evidence(operations, profiles, deferred):
+    if not isinstance(operations, list):
+        raise ValueError("operation evidence must be an array")
+    latest = {}
+    # The producer lists attempts oldest first within each operation.
+    for attempt in operations:
+        if not isinstance(attempt, dict) or not isinstance(attempt.get("operation"), str):
+            raise ValueError("each operation attempt must identify its operation")
+        name = attempt["operation"]
+        if deferred and (name.startswith("cifs.") or "cifs_fas2750" in name.rpartition(".")[0].split("__")):
+            raise ValueError("deferred CIFS must have no operation attempts")
+        latest[name] = attempt
+
+    required = {
+        "hdfs.delete": {"acknowledged"},
+        "dxn.abort": {"acknowledged"},
+        "dxn.delete": {"acknowledged"},
+        "dxn.verify": {"not_indicated"},
+    }
+    if not deferred:
+        required.update({
+            "cifs.prepare.source": {"not_indicated"},
+            "cifs.claim.source": {"acknowledged"},
+            "cifs.verify.destination": {"not_indicated"},
+            # A successful read-only recheck can confirm the same absence as a delete.
+            "cifs.delete.source": {"acknowledged", "not_indicated"},
+            "cifs.delete.destination": {"acknowledged", "not_indicated"},
+        })
+    def confirm(name, outcomes, endpoints=None):
+        attempt = latest.get(name, {})
+        if (
+            attempt.get("status") != "passed"
+            or type(attempt.get("exit_code")) is not int
+            or attempt["exit_code"] != 0
+            or not isinstance(attempt.get("write_outcome"), str)
+            or attempt["write_outcome"] not in outcomes
+            or (endpoints is not None and attempt.get("endpoints") != endpoints)
+        ):
+            raise ValueError(f"latest operation attempt for {name} must confirm success")
+
+    for name, outcomes in required.items():
+        confirm(name, outcomes)
+    for source in profiles:
+        for destination in profiles:
+            cell = f"{source}__{destination}"
+            phases = {
+                "preload": ["local:source", f"{source}:source"],
+                "copy": [f"{source}:source", f"{destination}:destination"],
+                "readback": [f"{destination}:destination", "local:destination"],
+            }
+            for phase, endpoints in phases.items():
+                confirm(f"{cell}.{phase}", {"acknowledged"}, endpoints)
+
+
 def validate_report(report):
-    if report.get("schema_version") != 1:
-        raise ValueError("schema_version must be 1")
+    if report.get("schema_version") != 2:
+        raise ValueError("schema_version must be 2")
     if report.get("repository") != "JayTsu-sh/terrasync-rs":
         raise ValueError("repository must identify terrasync-rs")
     if report.get("mode") != "terrasync_single_process":
         raise ValueError("mode must be terrasync_single_process")
+    if report.get("source_state") != "clean":
+        raise ValueError("exact-commit evidence requires a clean source")
     if not SHA.fullmatch(str(report.get("exact_commit", ""))):
         raise ValueError("terrasync exact commit is required")
     dependency = report.get("dependency_commits", {}).get("data-mover-rs", "")
     if not SHA.fullmatch(str(dependency)):
         raise ValueError("data-mover-rs exact commit is required")
-    if not str(report.get("run_id", "")).strip():
-        raise ValueError("run_id is required")
+    run_id = report.get("run_id")
+    if not isinstance(run_id, str) or not RUN_ID.fullmatch(run_id):
+        raise ValueError("valid run_id is required")
+    if report.get("status") != "completed":
+        raise ValueError("matrix run must be completed")
 
     deferred = tuple(report.get("deferred_profiles", ()))
     profiles = tuple(report.get("profiles", PROFILES))
@@ -58,8 +119,29 @@ def validate_report(report):
     elif profiles != PROFILES:
         raise ValueError("non-default profile set requires an explicit deferred profile")
 
-    if report.get("cleanup") != {"hdfs": "passed", "s3_dxn": "passed"}:
-        raise ValueError("HDFS and DXN cleanup must pass")
+    if report.get("cleanup") != {"hdfs": "passed", "s3_dxn": "passed", "cifs": "not_attempted" if deferred else "passed"}:
+        raise ValueError("HDFS, DXN and active CIFS cleanup must pass")
+
+    cifs = report.get("cifs", {})
+    if not isinstance(cifs, dict):
+        raise ValueError("CIFS evidence must be an object")
+    if deferred:
+        if cifs != {
+            "scope": None,
+            "run_id": None,
+            "setup": "not_attempted",
+            "cleanup": {"source": "not_attempted", "destination": "not_attempted"},
+        }:
+            raise ValueError("deferred CIFS must have no setup or cleanup activity")
+    else:
+        scope = cifs.get("scope")
+        # Scope is opaque to the report reader. The CIFS driver associates it with the run.
+        if cifs.get("run_id") != run_id or not isinstance(scope, str) or not re.fullmatch(r"[a-zA-Z0-9_-]{1,128}", scope):
+            raise ValueError("CIFS scope must identify this matrix run")
+        if cifs.get("setup") != "passed" or cifs.get("cleanup") != {"source": "passed", "destination": "passed"}:
+            raise ValueError("CIFS ownership verification and cleanup on both endpoints must pass")
+
+    validate_operation_evidence(report.get("operations"), profiles, deferred)
 
     cells = report.get("cells")
     expected_count = len(profiles) ** 2
@@ -81,6 +163,9 @@ def validate_report(report):
             raise ValueError(f"cell {index} has invalid gate_id")
         if cell["outcome"] != "passed":
             raise ValueError(f"{expected_gate} did not pass")
+        expected_hash = cell.get("expected_sha256")
+        if not isinstance(expected_hash, str) or not DIGEST.fullmatch(expected_hash) or cell.get("readback_sha256") != expected_hash:
+            raise ValueError(f"{expected_gate} requires matching fixture and readback checksums")
         if not all(str(cell[field]).strip() for field in CELL_FIELDS[4:8]):
             raise ValueError(f"{expected_gate} has blank evidence fields")
         links = cell["artifact_links"]

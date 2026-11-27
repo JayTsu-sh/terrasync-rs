@@ -5,6 +5,7 @@
 
 use std::collections::HashMap;
 use std::env;
+use std::error::Error as StdError;
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
 
@@ -14,13 +15,20 @@ use async_trait::async_trait;
 use data_mover::model::{FailureClass, ModelValueError, ObservedEntry, StoragePath};
 use data_mover::storage::HdfsConfig;
 use data_mover::storage::{
-    BackendConfig, BackendConnectError, CifsBackendConfig, HdfsBackendConfig, LocalBackendConfig, NfsBackendConfig,
-    S3BackendConfig, StorageRoleFailure, connect_backend,
+    BackendConfig, BackendConnectError, HdfsBackendConfig, LocalBackendConfig, NfsBackendConfig, S3BackendConfig,
+    StorageRoleFailure, connect_backend,
 };
-use data_mover::transfer::{TransferFailure, TransferOutcome, TransferPolicy, TransferValueError};
+use data_mover::transfer::{TransferFailure, TransferOutcome, TransferPolicy, TransferSide, TransferValueError};
 use data_mover::traversal::{TraversalCompletion, TraversalItem, TraversalOutcome, TraversalSession};
 use thiserror::Error;
+#[cfg(unix)]
+use tokio::signal::unix::{SignalKind, signal};
 use tokio_util::sync::CancellationToken;
+
+#[path = "single_process_matrix/cifs.rs"]
+mod cifs;
+#[path = "single_process_matrix/diagnostic.rs"]
+mod diagnostic;
 
 const PAYLOAD: &str = "payload.bin";
 
@@ -33,11 +41,15 @@ enum MatrixError {
     #[error("matrix profile is not one of the supported lab profiles")]
     UnknownProfile,
     #[error(
-        "usage: single_process_matrix SOURCE_PROFILE SOURCE_ROLE SOURCE_ROOT DESTINATION_PROFILE DESTINATION_ROLE DESTINATION_ROOT JOB_ID, or --delete-hdfs-run HDFS_BASE RUN_ID"
+        "usage: single_process_matrix SOURCE_PROFILE SOURCE_ROLE SOURCE_ROOT DESTINATION_PROFILE DESTINATION_ROLE DESTINATION_ROOT JOB_ID, --delete-hdfs-run HDFS_BASE RUN_ID, or a CIFS run command with RUN_ID ROLE"
     )]
     Usage,
     #[error("matrix transfer did not complete exactly one file without failures")]
     TransferFailed,
+    #[error("matrix transfer cancelled")]
+    Cancelled,
+    #[error(transparent)]
+    Cifs(#[from] cifs::CifsFailure),
     #[error("non-zero matrix transfer limit is required")]
     InvalidLimit,
     #[error(transparent)]
@@ -55,13 +67,17 @@ enum MatrixError {
     #[error(transparent)]
     Io(#[from] std::io::Error),
     #[error(transparent)]
-    Role(#[from] data_mover::storage::StorageRoleFailure),
+    Role(#[from] StorageRoleFailure),
     #[error(transparent)]
     Capability(#[from] data_mover::storage::CapabilityUnavailable),
 }
 
 struct Sink {
     failures: usize,
+    source_role: String,
+    destination_role: String,
+    source_server: Option<&'static str>,
+    destination_server: Option<&'static str>,
 }
 
 #[async_trait]
@@ -81,13 +97,44 @@ impl LocalTransferSink for Sink {
     }
 
     async fn entry_failed(&mut self, failure: data_mover::model::EntryOperationFailure) -> app::error::Result<()> {
-        eprintln!("{failure}");
+        diagnostic::emit(
+            "observe_source",
+            &self.source_role,
+            self.source_server,
+            diagnostic::Cause::entry(&failure),
+            false,
+        );
         self.failures += 1;
         Ok(())
     }
 
     async fn transfer_failed(&mut self, _entry: ObservedEntry, failure: TransferFailure) -> app::error::Result<()> {
-        eprintln!("{failure}");
+        let (role, server) = match failure.side() {
+            TransferSide::Source => (self.source_role.as_str(), self.source_server),
+            TransferSide::Destination => (self.destination_role.as_str(), self.destination_server),
+            TransferSide::Orchestration => ("orchestration", None),
+        };
+        let cause = failure
+            .source()
+            .and_then(|error| error.downcast_ref::<StorageRoleFailure>())
+            .map_or_else(diagnostic::Cause::unclassified, diagnostic::Cause::role);
+        let outcome = if failure.published_data().is_some() {
+            "published"
+        } else if failure.final_destination_changed() {
+            "changed_or_unknown"
+        } else {
+            "not_indicated"
+        };
+        diagnostic::record(&format!("{:?}", failure.phase()), role, server, cause, outcome);
+        if let Some(error) = failure.cleanup_failure() {
+            diagnostic::emit(
+                "cleanup_stage",
+                &self.destination_role,
+                self.destination_server,
+                diagnostic::Cause::role(error),
+                true,
+            );
+        }
         self.failures += 1;
         Ok(())
     }
@@ -132,7 +179,12 @@ fn hdfs_client(role: &str) -> Result<HdfsConfig, MatrixError> {
     })
 }
 
-async fn connect(profile: &str, role: &str, root: &str) -> Result<data_mover::storage::Storage, MatrixError> {
+async fn connect(
+    profile: &str, role: &str, root: &str, cancel: &CancellationToken,
+) -> Result<data_mover::storage::Storage, MatrixError> {
+    if cancel.is_cancelled() {
+        return Err(MatrixError::Cancelled);
+    }
     let config = match profile {
         "local" => BackendConfig::Local(LocalBackendConfig {
             rename_context: None,
@@ -148,20 +200,7 @@ async fn connect(profile: &str, role: &str, root: &str) -> Result<data_mover::st
             ensure_dir: true,
             transfer_concurrency: None,
         }),
-        "cifs" | "cifs_fas2750" => BackendConfig::Cifs(CifsBackendConfig {
-            server: match role {
-                "source" => required("LAB_CIFS_SOURCE_DATA")?,
-                "destination" => required("LAB_CIFS_DEST_DATA")?,
-                _ => return Err(MatrixError::UnknownEndpointRole),
-            },
-            share: required("LAB_CIFS_SHARE")?,
-            root: Some(root.to_owned()),
-            username: required("LAB_CIFS_USERNAME")?,
-            password: required("LAB_CIFS_PASSWORD")?,
-            ensure_dir: true,
-            signing_policy: Default::default(),
-            guest_policy: Default::default(),
-        }),
+        "cifs_fas2750" => return Ok(cifs::connect_cell(role, root, cancel).await?),
         "s3_standard" => BackendConfig::S3(S3BackendConfig {
             url: format!(
                 "s3://{}:{}@{}.{}:9000/{root}",
@@ -192,7 +231,10 @@ async fn connect(profile: &str, role: &str, root: &str) -> Result<data_mover::st
         }),
         _ => return Err(MatrixError::UnknownProfile),
     };
-    Ok(connect_backend(config).await?)
+    connect_backend(config).await.map_err(|error| {
+        diagnostic::emit("connect", role, None, diagnostic::Cause::connect(&error, false), false);
+        error.into()
+    })
 }
 
 async fn session(
@@ -296,6 +338,11 @@ mod cleanup_scope_tests {
 #[tokio::main]
 async fn main() -> Result<(), MatrixError> {
     let args = env::args().skip(1).collect::<Vec<_>>();
+    if let [command, run_id, role] = args.as_slice()
+        && let Some(action) = cifs::Action::parse(command)
+    {
+        return Ok(action.run(run_id, role).await?);
+    }
     if let [command, root, run_id] = args.as_slice() {
         if command == "--delete-hdfs-run" {
             let (location, path) = hdfs_cleanup_target(
@@ -324,9 +371,7 @@ async fn main() -> Result<(), MatrixError> {
             };
             match storage.namespace()?.delete_subtree(&path, false).await {
                 Ok(()) => return Ok(()),
-                Err(data_mover::storage::StorageRoleFailure::Entry(error))
-                    if error.class() == FailureClass::NotFound =>
-                {
+                Err(StorageRoleFailure::Entry(error)) if error.class() == FailureClass::NotFound => {
                     return Ok(());
                 }
                 Err(error) => {
@@ -345,12 +390,44 @@ async fn main() -> Result<(), MatrixError> {
     }
     let (source_profile, source_role, source_root, destination_profile, destination_role, destination_root, job) =
         (&args[0], &args[1], &args[2], &args[3], &args[4], &args[5], &args[6]);
-    let source = connect(source_profile, source_role, source_root).await?;
-    let destination = connect(destination_profile, destination_role, destination_root).await?;
     let cancel = CancellationToken::new();
-    let mut sink = Sink { failures: 0 };
+    #[cfg(unix)]
+    {
+        let mut terminate = signal(SignalKind::terminate())?;
+        let cancel = cancel.clone();
+        tokio::spawn(async move {
+            terminate.recv().await;
+            cancel.cancel();
+        });
+    }
+    let source = connect(source_profile, source_role, source_root, &cancel).await?;
+    if cancel.is_cancelled() {
+        return Err(MatrixError::Cancelled);
+    }
+    let destination = connect(destination_profile, destination_role, destination_root, &cancel).await?;
+    if cancel.is_cancelled() {
+        return Err(MatrixError::Cancelled);
+    }
+    let mut sink = Sink {
+        failures: 0,
+        source_role: source_role.clone(),
+        destination_role: destination_role.clone(),
+        source_server: cifs::diagnostic_server(source_profile, source_role),
+        destination_server: cifs::diagnostic_server(destination_profile, destination_role),
+    };
+    let traversal = session(&source, cancel.clone()).await.inspect_err(|error| {
+        if let MatrixError::Role(error) = error {
+            diagnostic::emit(
+                "observe_source",
+                source_role,
+                sink.source_server,
+                diagnostic::Cause::role(error),
+                false,
+            );
+        }
+    })?;
     let report = run_local_transfer(
-        session(&source, cancel.clone()).await?,
+        traversal,
         LocalTransferConfig {
             job_identity: job.to_owned(),
             source,
@@ -359,11 +436,14 @@ async fn main() -> Result<(), MatrixError> {
             max_concurrent_files: NonZeroUsize::new(1).ok_or(MatrixError::InvalidLimit)?,
 
             transfer_policy: TransferPolicy::Checkpointed,
-            cancel,
+            cancel: cancel.clone(),
         },
         &mut sink,
     )
     .await?;
+    if report.cancelled || cancel.is_cancelled() {
+        return Err(MatrixError::Cancelled);
+    }
     if report.completed_files != 1 || sink.failures != 0 {
         return Err(MatrixError::TransferFailed);
     }
