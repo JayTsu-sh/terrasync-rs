@@ -99,6 +99,8 @@ def unit_state(run_id):
         "-p",
         "ExecStopPost",
         "-p",
+        "ExecStart",
+        "-p",
         "ControlGroup",
         "-p",
         "InvocationID",
@@ -566,8 +568,19 @@ def run(run_id, output):
         raise RuntimeError(
             "the runner needs terrasync-hdfs-attempt@.service with FD preservation"
         )
-    if str(INSTALL / "hdfs_lab.py") not in observed.get("ExecStopPost", ""):
-        raise RuntimeError("the runner needs the installed HDFS service exit hook")
+    for property_name, operation in (
+        ("ExecStart", "worker"),
+        ("ExecStopPost", "worker-exit"),
+    ):
+        prefix = (
+            "{ path=/usr/bin/python3 ; argv[]=/usr/bin/python3 -E -s -B "
+            f"{INSTALL / 'hdfs_lab.py'} {operation} {run_id} ; ignore_errors=no ; "
+        )
+        configured = observed.get(property_name, "")
+        if not configured.startswith(prefix) or configured.count("{") != 1:
+            raise RuntimeError(
+                f"the runner has an incompatible HDFS {property_name} command"
+            )
     for file in ("hdfs_lab.py", "hdfs_lab_clickhouse.py", "evidence-matrix.json"):
         if (HERE / file).read_bytes() != (INSTALL / file).read_bytes():
             raise RuntimeError(

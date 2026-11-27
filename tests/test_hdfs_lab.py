@@ -45,7 +45,14 @@ class FakeManager:
             "ActiveState": "inactive",
             "LoadState": "loaded",
             "FileDescriptorStorePreserve": "yes",
-            "ExecStopPost": str(LAB / "hdfs_lab.py") + " worker-exit",
+            **{
+                name: "{ path=/usr/bin/python3 ; argv[]=/usr/bin/python3 -E -s -B "
+                f"{LAB / 'hdfs_lab.py'} {operation} {RUN_ID} ; ignore_errors=no ; pid=0 }}"
+                for name, operation in (
+                    ("ExecStart", "worker"),
+                    ("ExecStopPost", "worker-exit"),
+                )
+            },
             "Job": "",
             "NFileDescriptorStore": "0",
             "ControlGroup": "",
@@ -514,6 +521,68 @@ class HdfsLabTest(unittest.TestCase):
         gates = dict.fromkeys(matrix["required_gates"], "pass")
         gates["single_process_hdfs_to_hdfs"] = "failed"
         self.assert_rejects_evidence("gate-report.json", {"gates": gates})
+
+
+class HdfsGateTest(unittest.TestCase):
+    def test_unexpected_negative_check_exit_stops_before_hdfs_writes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            attempt = root / "attempt"
+            attempt.mkdir(mode=0o700)
+            state = root / "state"
+            state.mkdir(mode=0o700)
+            config = root / "config"
+            config.mkdir()
+            for name in ("core-site.xml", "hdfs-site.xml"):
+                (config / name).touch()
+            keytab = root / "fixture.keytab"
+            keytab.touch()
+            log = root / "calls"
+            cli = root / "terrasync"
+            cli.write_text(
+                "#!/bin/sh\n"
+                'echo "$3" >> "$LAB_PROBE_LOG"\n'
+                "echo 'Error: Configuration error: HDFS Source role configuration is required' >&2\n"
+                "exit 124\n",
+                encoding="utf-8",
+            )
+            cli.chmod(0o700)
+            candidate = "a" * 40
+            result = subprocess.run(
+                [str(LAB / "run-hdfs-e2e.sh"), "nightly-negative-timeout"],
+                env=os.environ
+                | {
+                    "LAB_HDFS_MANAGED_DIR": str(attempt),
+                    "LAB_HDFS_STATE_DIR": str(state),
+                    "LAB_HDFS_CONFIG_DIR": str(config),
+                    "LAB_HDFS_KEYTAB": str(keytab),
+                    "LAB_HDFS_LOCATION": "hdfs://lab@hdfs-fixture/",
+                    "LAB_HDFS_ADMIN_USER": "lab",
+                    "LAB_HDFS_BASE_PATH": "/tmp/lab-fixture",
+                    "LAB_HDFS_FINGERPRINT": "fixture",
+                    "LAB_CLICKHOUSE_DSN": "http://127.0.0.1:18123",
+                    "LAB_CLICKHOUSE_USER": "fixture",
+                    "LAB_CLICKHOUSE_PASSWORD": "test-password",
+                    "LAB_PROBE_LOG": str(log),
+                    "TERRASYNC_BINARY": str(cli),
+                    "TERRASYNC_SINGLE_MATRIX_BINARY": str(cli),
+                    "TERRASYNC_CANDIDATE": candidate,
+                    "DATA_MOVER_CANDIDATE": candidate,
+                },
+                capture_output=True,
+                text=True,
+                timeout=5,
+                check=False,
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn(
+                "did not produce the expected rejection (exit 124)", result.stderr
+            )
+            self.assertEqual(log.read_text().splitlines(), ["scan"])
+            self.assertEqual(
+                read_json(state / "hdfs-cleanup.json")["status"], "not_attempted"
+            )
+            self.assertFalse((state / "gate-report.json").exists())
 
 
 if __name__ == "__main__":

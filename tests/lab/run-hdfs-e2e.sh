@@ -297,25 +297,30 @@ keytab = "$invalid_keytab"
 cache = "FILE:$runtime_root/invalid.ccache"
 EOF
 
-missing_log="$attempt_root/hdfs-missing-config.log"
-invalid_log="$attempt_root/hdfs-invalid-credential.log"
-write_evidence gate-phase negative_configuration
-if run_with_config "$missing_config" scan "$hdfs_source" >"$missing_log" 2>&1; then
-  echo "HDFS scan unexpectedly accepted missing source configuration" >&2
-  exit 1
-fi
-if run_with_config "$invalid_config" scan "$hdfs_source" >"$invalid_log" 2>&1; then
-  echo "HDFS scan unexpectedly accepted an invalid keytab" >&2
-  exit 1
-fi
-for sensitive_value in \
-  "$invalid_keytab" "FILE:$runtime_root/invalid.ccache" "$LAB_HDFS_ADMIN_USER" \
-  "$source_keytab" "$destination_keytab" "$source_cache" "$destination_cache"; do
-  if grep -Fq "$sensitive_value" "$invalid_log" || grep -Fq "$sensitive_value" "$missing_log"; then
-    echo "HDFS negative-path error leaked credential details" >&2
-    exit 1
+negative_gate() {
+  local config="$1" expected="$2" log="$attempt_root/$3.log" status=0 sensitive_value
+  run_with_config "$config" scan "$hdfs_source" >"$log" 2>&1 || status=$?
+  for sensitive_value in "$invalid_keytab" "FILE:$runtime_root/invalid.ccache" \
+    "$LAB_HDFS_ADMIN_USER" "$LAB_HDFS_KEYTAB" "$source_keytab" "$destination_keytab" \
+    "$source_cache" "$destination_cache" "$LAB_CLICKHOUSE_PASSWORD"; do
+    if grep -Fq -- "$sensitive_value" "$log"; then
+      echo 'HDFS negative-path error leaked credential details' >&2
+      return 1
+    fi
+  done
+  if [[ "$status" != 1 ]] || ! grep -Fxq -- "$expected" "$log"; then
+    echo "HDFS $3 did not produce the expected rejection (exit $status)" >&2
+    return 1
   fi
-done
+}
+
+write_evidence gate-phase negative_configuration
+negative_gate "$missing_config" 'Error: Configuration error: HDFS Source role configuration is required' \
+  negative_missing_source_config
+write_evidence gate-phase negative_credentials
+negative_gate "$invalid_config" \
+  'Error: failed to connect Hdfs backend: HDFS get storage root failed (Authentication): authentication failed' \
+  negative_invalid_credentials_secret_safe
 
 printf 'terrasync-hdfs-%s\n' "$run_id" > "$fixture_root/payload.bin"
 expected_hash="$(sha256sum "$fixture_root/payload.bin" | cut -d' ' -f1)"
@@ -373,7 +378,7 @@ run_with_config "$sender_config" sync --resume --id "hdfs-remote-$run_id" --enab
   "$hdfs_source" "$hdfs_remote_destination"
 receiver_status=0
 write_evidence gate-phase receiver_exit
-await_receiver 30 || { echo 'HDFS receiver exit timed out' >&2; exit 1; }
+await_receiver 30 || { echo 'HDFS receiver exit timed out' >&2; exit 124; }
 wait "$receiver_pid" || receiver_status=$?
 receiver_pid=""
 (( receiver_status == 0 ))

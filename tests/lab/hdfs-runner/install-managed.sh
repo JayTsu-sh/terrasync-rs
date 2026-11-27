@@ -45,10 +45,13 @@ active_units="$(manager list-units --all --state=active,activating,deactivating 
 for path in /opt /etc/systemd/system /etc/systemd/user; do
   root_owned "$path" || { echo "Unsafe installation destination: $path" >&2; exit 2; }
 done
-install -d -m 0755 /opt/terrasync-hdfs-managed
-root_owned /opt/terrasync-hdfs-managed || {
-  echo 'Managed HDFS install directory must be owned by root' >&2; exit 2;
-}
+if [[ -e /opt/terrasync-hdfs-managed || -L /opt/terrasync-hdfs-managed ]]; then
+  [[ -d /opt/terrasync-hdfs-managed ]] && root_owned /opt/terrasync-hdfs-managed || {
+    echo 'Managed HDFS install directory must be owned by root' >&2; exit 2;
+  }
+else
+  mkdir -m 0755 /opt/terrasync-hdfs-managed
+fi
 install -m 0644 "${modules[@]/#/$source_dir/../}" /opt/terrasync-hdfs-managed/
 pin="$(mktemp /opt/terrasync-hdfs-managed/.pin.XXXXXX)"
 trap 'rm -f -- "$pin"' EXIT
