@@ -429,6 +429,15 @@ the remaining seven profiles, with `cifs_fas2750` recorded in
 `deferred_profiles`; it is not a substitute for the 64-cell acceptance gate.
 Release validation remains on the full matrix.
 
+Nightly sets the DXN S3 endpoint and private test bucket through
+`LAB_DXN_NIGHTLY_ENDPOINT` and `LAB_DXN_NIGHTLY_BUCKET` repository variables.
+The DXN test identity is supplied through `LAB_DXN_NIGHTLY_ACCESS_KEY` and
+`LAB_DXN_NIGHTLY_SECRET_KEY` Actions secrets. Its RGW HTTP endpoint must be
+reachable from the runner. The matrix cleans up objects and unfinished uploads
+under its own DXN prefix and records the configured endpoint in the evidence.
+If a transfer cell fails, the matrix records that failure and continues to
+collect results. The evidence validator still requires every active cell to pass.
+
 `run-source-metadata-guard.py` requires a unique `nightly-source-metadata-guard-*`
 prefix already held by a `prepare-run.sh` / `cleanup-run.sh` lifecycle and
 `LAB_SOURCE_GUARD_RUN_ID`, `LAB_SSH_KEY` plus root fixture control. It connects a
