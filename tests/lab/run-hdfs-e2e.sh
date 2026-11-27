@@ -69,6 +69,14 @@ shielded_cleanup() (
   trap '' INT TERM HUP
   "$@"
 )
+write_initial_evidence() {
+  local cancelled=false status=0
+  trap 'cancelled=true' INT TERM HUP
+  shielded_cleanup write_cleanup_evidence || status=$?
+  trap - INT TERM HUP
+  [[ "$cancelled" == false ]] || return 143
+  return "$status"
+}
 cleanup_resources() {
   local status=0 cleanup_cancelled=false attempts attempt
   trap 'cleanup_cancelled=true' INT TERM HUP
@@ -126,10 +134,10 @@ mkdir -p "$runtime_root" "$fixture_root" "$results_root"
 install -m 0600 "$LAB_HDFS_KEYTAB" "$source_keytab"
 install -m 0600 "$LAB_HDFS_KEYTAB" "$destination_keytab"
 database_created=true
-shielded_cleanup write_cleanup_evidence
+write_initial_evidence
 clickhouse_query "CREATE DATABASE $database_name"
 database_create_confirmed=true
-shielded_cleanup write_cleanup_evidence
+write_initial_evidence
 
 write_base_config() {
   local output="$1"
