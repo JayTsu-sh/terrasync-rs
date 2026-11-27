@@ -97,10 +97,6 @@ def unit_state(run_id):
         "-p",
         "FileDescriptorStorePreserve",
         "-p",
-        "ExecStopPost",
-        "-p",
-        "ExecStart",
-        "-p",
         "ControlGroup",
         "-p",
         "InvocationID",
@@ -108,6 +104,66 @@ def unit_state(run_id):
     return dict(
         line.split("=", 1) for line in result.stdout.splitlines() if "=" in line
     )
+
+
+def service_commands(run_id):
+    bus = ["/usr/bin/busctl", "--user", "--json=short"]
+    service = "org.freedesktop.systemd1"
+    raw_path = subprocess.check_output(
+        [
+            *bus,
+            "call",
+            service,
+            "/org/freedesktop/systemd1",
+            f"{service}.Manager",
+            "LoadUnit",
+            "s",
+            unit(run_id),
+        ],
+        text=True,
+        timeout=8,
+    )
+    (path,) = json.loads(raw_path)["data"]
+    raw_commands = subprocess.check_output(
+        [
+            *bus,
+            "get-property",
+            service,
+            path,
+            f"{service}.Service",
+            "ExecStart",
+            "ExecStopPost",
+        ],
+        text=True,
+        timeout=8,
+    )
+    return [json.loads(line)["data"] for line in raw_commands.splitlines()]
+
+
+def validate_service_commands(run_id):
+    expected = [
+        [
+            [
+                "/usr/bin/python3",
+                [
+                    "/usr/bin/python3",
+                    "-E",
+                    "-s",
+                    "-B",
+                    str(INSTALL / "hdfs_lab.py"),
+                    operation,
+                    run_id,
+                ],
+                False,
+            ]
+        ]
+        for operation in ("worker", "worker-exit")
+    ]
+    actual = [
+        [command[:3] for command in entries] for entries in service_commands(run_id)
+    ]
+    if actual != expected:
+        raise RuntimeError("the runner has incompatible HDFS service commands")
 
 
 def quiescent(state, record):
@@ -568,19 +624,7 @@ def run(run_id, output):
         raise RuntimeError(
             "the runner needs terrasync-hdfs-attempt@.service with FD preservation"
         )
-    for property_name, operation in (
-        ("ExecStart", "worker"),
-        ("ExecStopPost", "worker-exit"),
-    ):
-        prefix = (
-            "{ path=/usr/bin/python3 ; argv[]=/usr/bin/python3 -E -s -B "
-            f"{INSTALL / 'hdfs_lab.py'} {operation} {run_id} ; ignore_errors=no ; "
-        )
-        configured = observed.get(property_name, "")
-        if not configured.startswith(prefix) or configured.count("{") != 1:
-            raise RuntimeError(
-                f"the runner has an incompatible HDFS {property_name} command"
-            )
+    validate_service_commands(run_id)
     for file in ("hdfs_lab.py", "hdfs_lab_clickhouse.py", "evidence-matrix.json"):
         if (HERE / file).read_bytes() != (INSTALL / file).read_bytes():
             raise RuntimeError(

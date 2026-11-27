@@ -45,14 +45,6 @@ class FakeManager:
             "ActiveState": "inactive",
             "LoadState": "loaded",
             "FileDescriptorStorePreserve": "yes",
-            **{
-                name: "{ path=/usr/bin/python3 ; argv[]=/usr/bin/python3 -E -s -B "
-                f"{LAB / 'hdfs_lab.py'} {operation} {RUN_ID} ; ignore_errors=no ; pid=0 }}"
-                for name, operation in (
-                    ("ExecStart", "worker"),
-                    ("ExecStopPost", "worker-exit"),
-                )
-            },
             "Job": "",
             "NFileDescriptorStore": "0",
             "ControlGroup": "",
@@ -139,6 +131,7 @@ class HdfsLabTest(unittest.TestCase):
                 CGROUP=self.cgroup_root,
                 BOOT="current-boot",
                 systemctl=self.manager,
+                service_commands=self.service_commands,
                 time=clock,
             )
         )
@@ -231,6 +224,36 @@ class HdfsLabTest(unittest.TestCase):
         self.assertEqual(diagnostic["certification"], "withheld")
         self.assertFalse(self.certification.exists())
         return diagnostic
+
+    def service_commands(self, run_id):
+        return [
+            [
+                [
+                    "/usr/bin/python3",
+                    [
+                        "/usr/bin/python3",
+                        "-E",
+                        "-s",
+                        "-B",
+                        str(LAB / "hdfs_lab.py"),
+                        operation,
+                        run_id,
+                    ],
+                    False,
+                ]
+            ]
+            for operation in ("worker", "worker-exit")
+        ]
+
+    def test_run_rejects_additional_service_command_before_staging(self):
+        commands = self.service_commands(RUN_ID)
+        commands[1].insert(0, ["/usr/bin/true", ["/usr/bin/true"], False])
+        with (
+            patch.object(self.controller, "service_commands", return_value=commands),
+            self.assertRaisesRegex(RuntimeError, "incompatible"),
+        ):
+            self.controller.run(RUN_ID, self.output)
+        self.assertFalse(self.attempt.exists())
 
     def test_same_run_invokes_once_after_start_response_is_lost(self):
         def start():
