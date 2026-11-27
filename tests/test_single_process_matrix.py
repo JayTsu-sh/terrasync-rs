@@ -319,7 +319,7 @@ class SingleProcessMatrixTest(unittest.TestCase):
             self.assertIn("always()", workflow_text[reconcile:finalize])
             self.assertIn("steps.single_matrix.outputs.reconciled != 'true'", workflow_text[reconcile:finalize])
             self.assertNotIn("--hdfs-tunnel", workflow_text[reconcile:upload])
-            self.assertNotIn("outputs.producer_outcome", workflow_text[reconcile:upload])
+            self.assertIn("job.status == 'cancelled' && 'cancelled' || steps.single_matrix.outputs.producer_outcome || steps.single_matrix.outcome", workflow_text[reconcile:upload])
             self.assertIn("always()", workflow_text[upload:])
             self.assertIn("~/.local/state/terrasync-single-matrix/", workflow_text[upload:])
         for secret in ("LAB_CIFS_NIGHTLY_USERNAME", "LAB_CIFS_NIGHTLY_PASSWORD"):

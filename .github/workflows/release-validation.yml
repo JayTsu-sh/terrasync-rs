@@ -81,7 +81,7 @@ jobs:
         if: ${{ always() && steps.single_matrix.outputs.reconciled != 'true' && steps.single_matrix.outcome != 'skipped' && steps.single_matrix.outcome != '' }}
         timeout-minutes: 9
         env:
-          MATRIX_OUTCOME: ${{ job.status == 'cancelled' && 'cancelled' || steps.single_matrix.outcome }}
+          MATRIX_OUTCOME: ${{ job.status == 'cancelled' && 'cancelled' || steps.single_matrix.outputs.producer_outcome || steps.single_matrix.outcome }}
           LAB_CIFS_NIGHTLY_USERNAME: ${{ secrets.LAB_CIFS_NIGHTLY_USERNAME }}
           LAB_CIFS_NIGHTLY_PASSWORD: ${{ secrets.LAB_CIFS_NIGHTLY_PASSWORD }}
         run: exec flock --no-fork --wait 60 /tmp/terrasync-lab-tests.lock tests/lab/reconcile-single-process-matrix.sh "$RUN_ID" --direct "$MATRIX_OUTCOME"
@@ -92,7 +92,7 @@ jobs:
                                steps.reconcile_matrix.outcome != 'skipped' && steps.reconcile_matrix.outcome != '')) }}
         timeout-minutes: 1
         env:
-          MATRIX_OUTCOME: ${{ job.status == 'cancelled' && 'cancelled' || steps.single_matrix.outcome }}
+          MATRIX_OUTCOME: ${{ job.status == 'cancelled' && 'cancelled' || steps.single_matrix.outputs.producer_outcome || steps.single_matrix.outcome }}
         run: tests/lab/reconcile-single-process-matrix.sh "$RUN_ID" --report-only "$MATRIX_OUTCOME"
       - name: Upload TS-SINGLE matrix evidence
         if: ${{ always() && steps.single_matrix.outcome != 'skipped' && steps.single_matrix.outcome != '' }}
