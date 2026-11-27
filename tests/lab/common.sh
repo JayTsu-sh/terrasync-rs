@@ -142,7 +142,10 @@ parsed = urllib.parse.urlsplit(location)
 if parsed.scheme != "hdfs" or parsed.password is not None or parsed.hostname is None:
     raise SystemExit("LAB_HDFS_LOCATION must be a password-free HDFS URL")
 user = urllib.parse.quote(admin_user, safe="")
-authority = parsed.hostname if parsed.port is None else f"{parsed.hostname}:{parsed.port}"
+# Nameservice IDs are configuration keys, so preserve their original case.
+# Accessing parsed.port also validates a present port before retaining the authority.
+_ = parsed.port
+authority = parsed.netloc.rsplit("@", 1)[-1]
 if not re.fullmatch(r"/[A-Za-z0-9._/-]+", base_path) or any(
     part in ("", ".", "..") for part in base_path[1:].split("/")
 ):

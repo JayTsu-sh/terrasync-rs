@@ -162,6 +162,15 @@ class SingleProcessMatrixTest(unittest.TestCase):
         self.assertTrue(VALIDATOR_PATH.stat().st_mode & 0o111)
         self.assertTrue((ROOT / "tests" / "lab" / "run-single-process-matrix.sh").stat().st_mode & 0o111)
 
+    def test_hdfs_run_root_preserves_nameservice_case(self):
+        command = (
+            'source tests/lab/common.sh; '
+            'LAB_HDFS_LOCATION="hdfs://HdfsCluster/"; '
+            'LAB_HDFS_ADMIN_USER="ci@EXAMPLE"; hdfs_run_root nightly-case'
+        )
+        result = subprocess.run(["bash", "-c", command], cwd=ROOT, capture_output=True, text=True, check=True)
+        self.assertIn("@HdfsCluster/", result.stdout)
+
     def test_hdfs_defaults_use_the_kerberos_ha_nameservice(self):
         common = (ROOT / "tests" / "lab" / "common.sh").read_text(encoding="utf-8")
         self.assertIn(

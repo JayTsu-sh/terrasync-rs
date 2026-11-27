@@ -239,7 +239,7 @@ fn hdfs_cleanup_target(
         || !location
             .host_str()
             .zip(configured.host_str())
-            .is_some_and(|(actual, expected)| actual.eq_ignore_ascii_case(expected))
+            .is_some_and(|(actual, expected)| actual == expected)
         || location.port() != configured.port()
         || location.password().is_some()
         || location.query().is_some()
@@ -275,7 +275,16 @@ mod cleanup_scope_tests {
         let location = "hdfs://hdfscluster/";
         let root = "hdfs://hdfscluster/tmp/terrasync-nightly/ci";
         assert!(hdfs_cleanup_target(root, &scope, base, location).is_ok());
-        assert!(hdfs_cleanup_target(root, &scope, base, "hdfs://HdfsCluster/").is_ok());
+        assert!(hdfs_cleanup_target(root, &scope, base, "hdfs://HdfsCluster/").is_err());
+        assert!(
+            hdfs_cleanup_target(
+                "hdfs://HdfsCluster/tmp/terrasync-nightly/ci",
+                &scope,
+                base,
+                "hdfs://HdfsCluster/"
+            )
+            .is_ok()
+        );
         assert!(hdfs_cleanup_target(root, "nightly-important", base, location).is_err());
         assert!(hdfs_cleanup_target(root, &format!("nightly-{}-other", "a".repeat(64)), base, location).is_err());
         assert!(hdfs_cleanup_target("hdfs://hdfscluster/production", &scope, base, location).is_err());
