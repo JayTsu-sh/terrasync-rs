@@ -44,25 +44,39 @@ hdfs_touched=false
 hdfs_cleanup_config="$runtime_root/hdfs-cleanup.toml"
 cli_binary="${TERRASYNC_BINARY:-$target_root/release/terrasync}"
 
-cleanup() {
-  local status="$?"
-  trap - EXIT
+hdfs_cleanup=not_attempted
+dxn_cleanup=not_attempted
+cleanup_resources() {
+  local status=0
   if [[ "$hdfs_touched" == true ]]; then
-    if ! timeout --kill-after=5s 45s "$cli_binary" -c "$hdfs_cleanup_config" rm "$hdfs_root" >/dev/null 2>&1; then
+    hdfs_touched=false
+    if timeout --kill-after=5s 45s "$cli_binary" -c "$hdfs_cleanup_config" rm "$hdfs_root" >/dev/null 2>&1; then
+      hdfs_cleanup=passed
+    else
       echo "HDFS matrix cleanup failed for its run prefix" >&2
+      hdfs_cleanup=failed
       status=1
     fi
   fi
   if [[ "$dxn_touched" == true ]]; then
+    dxn_touched=false
+    dxn_cleanup=passed
     for operation in abort-multipart-prefix delete-prefix; do
       LAB_S3_ACCESS_KEY="$LAB_DXN_S3_ACCESS_KEY" LAB_S3_SECRET_KEY="$LAB_DXN_S3_SECRET_KEY" \
         timeout --kill-after=5s 45s python3 "$repo_root/tests/lab/s3_helper.py" "$operation" \
           --endpoint "$LAB_DXN_S3_ENDPOINT" --bucket "$LAB_DXN_S3_BUCKET" --prefix "$matrix_prefix/" || {
           echo "DXN $operation cleanup failed for $matrix_prefix/" >&2
+          dxn_cleanup=failed
           status=1
         }
     done
   fi
+  return "$status"
+}
+cleanup() {
+  local status="$?"
+  trap - EXIT
+  cleanup_resources || status=1
   rm -rf -- "$lab_root"
   exit "$status"
 }
@@ -222,14 +236,17 @@ for source in "${profiles[@]}"; do
   done
 done
 
+# Finish cleanup before reporting acceptance. The exit trap handles early failures.
+cleanup_resources || true
+
 # 先保留各存储路径的结果，再由汇总校验判定整个验收。
 terrasync_commit="$(git -C "$repo_root" rev-parse HEAD)"
 data_mover_commit="$(sed -n 's/.*data-mover-rs\.git?rev=\([0-9a-f]*\)#.*/\1/p' "$repo_root/Cargo.lock" | head -1)"
 profiles_csv="$(IFS=,; printf '%s' "${profiles[*]}")"
 deferred_profiles_csv="$(IFS=,; printf '%s' "${deferred_profiles[*]}")"
-python3 - "$aggregate" "$results_root" "$run_id" "$terrasync_commit" "$data_mover_commit" "$profiles_csv" "$deferred_profiles_csv" <<'PY'
+python3 - "$aggregate" "$results_root" "$run_id" "$terrasync_commit" "$data_mover_commit" "$profiles_csv" "$deferred_profiles_csv" "$hdfs_cleanup" "$dxn_cleanup" <<'PY'
 import glob, json, os, sys
-output, root, run_id, terrasync, data_mover, profiles, deferred_profiles = sys.argv[1:]
+output, root, run_id, terrasync, data_mover, profiles, deferred_profiles, hdfs_cleanup, dxn_cleanup = sys.argv[1:]
 cells = []
 for path in sorted(glob.glob(os.path.join(root, "*__*.json"))):
     with open(path, encoding="utf-8") as handle:
@@ -243,6 +260,7 @@ report = {
     "mode": "terrasync_single_process",
     "profiles": profiles.split(",") if profiles else [],
     "deferred_profiles": deferred_profiles.split(",") if deferred_profiles else [],
+    "cleanup": {"hdfs": hdfs_cleanup, "s3_dxn": dxn_cleanup},
     "cells": cells,
 }
 with open(output, "w", encoding="utf-8") as handle:

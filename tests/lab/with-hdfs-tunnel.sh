@@ -16,20 +16,29 @@ done
 rules="$(sudo -n /usr/sbin/nft list table inet terrasync_hdfs)" || {
   echo 'HDFS tunnel firewall cannot be verified' >&2; exit 2;
 }
-for rule in \
-  'ip daddr { 127.0.0.160, 127.0.0.162 } tcp dport 8020 meta skuid != 1000 reject' \
-  'ip daddr { 127.0.0.161, 127.0.0.163, 127.0.0.164 } tcp dport 9866 meta skuid != 1000 reject' \
-  'ip daddr 127.0.0.164 tcp dport 10088 meta skuid != 1000 reject'; do
-  [[ "$rules" == *"$rule"* ]] || { echo 'HDFS tunnel firewall rule missing' >&2; exit 2; }
-done
+normalized_rules="$(printf '%s' "$rules" | python3 -c 'import sys; print(" ".join(sys.stdin.read().split()))')"
+expected_rules='table inet terrasync_hdfs { chain output { type filter hook output priority filter; policy accept; ip daddr { 127.0.0.160, 127.0.0.162 } tcp dport 8020 meta skuid != 1000 reject with icmp port-unreachable ip daddr { 127.0.0.161, 127.0.0.163, 127.0.0.164 } tcp dport 9866 meta skuid != 1000 reject with icmp port-unreachable ip daddr 127.0.0.164 tcp dport 10088 meta skuid != 1000 reject with icmp port-unreachable } }'
+[[ "$normalized_rules" == "$expected_rules" ]] || { echo 'HDFS tunnel firewall configuration differs from the approved rules' >&2; exit 2; }
 runtime="$(mktemp -d "${RUNNER_TEMP:-/tmp}/terrasync-hdfs-tunnel.XXXXXXXX")"
 tunnel_pid=""
 command_pid=""
 terminate_command() {
-  trap - INT TERM HUP
+  trap '' INT TERM HUP
   if [[ -n "$command_pid" ]]; then
     kill -TERM -- "-$command_pid" 2>/dev/null || true
+    # HDFS and DXN cleanup each have bounded deadlines. Prevent a stuck child
+    # from keeping the tunnel and shared lab lock alive indefinitely.
+    python3 -c 'import os, signal, sys, time
+signal.signal(signal.SIGTERM, signal.SIG_DFL)
+time.sleep(160)
+try:
+    os.killpg(int(sys.argv[1]), signal.SIGKILL)
+except ProcessLookupError:
+    pass' "$command_pid" &
+    local watchdog=$!
     wait "$command_pid" 2>/dev/null || true
+    kill "$watchdog" 2>/dev/null || true
+    wait "$watchdog" 2>/dev/null || true
     command_pid=""
   fi
   exit 143

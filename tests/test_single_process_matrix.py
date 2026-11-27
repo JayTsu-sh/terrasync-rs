@@ -45,6 +45,7 @@ class SingleProcessMatrixTest(unittest.TestCase):
             "dependency_commits": {"data-mover-rs": "b" * 40},
             "run_id": "release-matrix-test",
             "mode": "terrasync_single_process",
+            "cleanup": {"hdfs": "passed", "s3_dxn": "passed"},
             "cells": cells,
         }
 
@@ -56,6 +57,12 @@ class SingleProcessMatrixTest(unittest.TestCase):
 
     def test_complete_64_cell_report_passes(self):
         self.validator.validate_report(self.report())
+
+    def test_failed_cleanup_rejects_an_otherwise_passing_matrix(self):
+        report = self.report()
+        report["cleanup"]["hdfs"] = "failed"
+        with self.assertRaisesRegex(ValueError, "cleanup must pass"):
+            self.validator.validate_report(report)
 
     def test_duplicate_pair_is_rejected(self):
         report = self.report()
