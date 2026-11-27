@@ -42,7 +42,7 @@ class AdmissionError(RuntimeError):
         self.reason = reason
 
 
-def atomic_json(path, data):
+def atomic_json(path, data, *, can_commit=lambda: True):
     fd, name = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.")
     temporary = Path(name)
     try:
@@ -51,8 +51,11 @@ def atomic_json(path, data):
             stream.write("\n")
             stream.flush()
             os.fsync(stream.fileno())
+        if not can_commit():
+            return False
         temporary.replace(path)
         sync_directory(path.parent)
+        return True
     finally:
         temporary.unlink(missing_ok=True)
 
@@ -118,7 +121,7 @@ def unit_state(run_id):
     )
 
 
-def service_commands(run_id):
+def service_commands(run_id, check_cancelled):
     bus = ["/usr/bin/busctl", "--user", "--json=short"]
     service = "org.freedesktop.systemd1"
     raw_path = subprocess.check_output(
@@ -135,6 +138,7 @@ def service_commands(run_id):
         text=True,
         timeout=8,
     )
+    check_cancelled()
     (path,) = json.loads(raw_path)["data"]
     raw_commands = subprocess.check_output(
         [
@@ -149,10 +153,11 @@ def service_commands(run_id):
         text=True,
         timeout=8,
     )
+    check_cancelled()
     return [json.loads(line)["data"] for line in raw_commands.splitlines()]
 
 
-def validate_service_commands(run_id):
+def validate_service_commands(run_id, check_cancelled):
     expected = [
         [
             [
@@ -172,7 +177,8 @@ def validate_service_commands(run_id):
         for operation in ("worker", "worker-exit")
     ]
     actual = [
-        [command[:3] for command in entries] for entries in service_commands(run_id)
+        [command[:3] for command in entries]
+        for entries in service_commands(run_id, check_cancelled)
     ]
     if actual != expected:
         raise AdmissionError(
@@ -707,26 +713,30 @@ def publish(run_id, output, *, finalize=False, cancelled=lambda: False):
             gate["cleanup"]["clickhouse"] = "passed"
             atomic_json(certification, gate)
             if record["certification"] == "ready":
-                if cancelled():
-                    certification.unlink()
-                    sync_directory(output)
+                record["certification"] = "published"
+                # The rename commits this result. Honour cancellation after the new
+                # record has been written and before exposing it to other callers.
+                if not atomic_json(
+                    attempt / "state.json", record, can_commit=lambda: not cancelled()
+                ):
                     record.update(
                         test="cancelled",
                         certification="withheld",
                         cancel_requested=True,
                     )
-                else:
-                    record["certification"] = "published"
-                atomic_json(attempt / "state.json", record)
+                    atomic_json(attempt / "state.json", record)
+                    certification.unlink()
+                    sync_directory(output)
         else:
             certification.unlink(missing_ok=True)
         atomic_json(output / f"{run_id}-hdfs-cleanup.json", record)
         return 0 if record["certification"] == "published" else 1
 
 
-def validate_installation(run_id):
+def validate_installation(run_id, check_cancelled):
     # Refuse to stage anything if the installed service and manager are unavailable.
     observed = unit_state(run_id)
+    check_cancelled()
     if (
         observed.get("LoadState") != "loaded"
         or observed.get("FileDescriptorStorePreserve") != "yes"
@@ -735,8 +745,9 @@ def validate_installation(run_id):
             "incompatible_service_unit",
             "the runner needs terrasync-hdfs-attempt@.service with FD preservation",
         )
-    validate_service_commands(run_id)
+    validate_service_commands(run_id, check_cancelled)
     for file in ("hdfs_lab.py", "hdfs_lab_clickhouse.py", "evidence-matrix.json"):
+        check_cancelled()
         if (HERE / file).read_bytes() != (INSTALL / file).read_bytes():
             raise AdmissionError(
                 "installation_mismatch",
@@ -770,15 +781,18 @@ def run(run_id, output):
         nonlocal interrupted
         interrupted = True
 
+    def check_cancelled():
+        if interrupted:
+            raise AdmissionError("cancelled", "HDFS attempt cancelled during admission")
+
     for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
         signal.signal(sig, cancel)
 
     stage = "admission_preflight"
     try:
-        validate_installation(run_id)
-        if interrupted:
-            admission_diagnostic(run_id, output, stage, "cancelled", interrupted=True)
-            return 143
+        check_cancelled()
+        validate_installation(run_id, check_cancelled)
+        check_cancelled()
         stage = "staging"
         _, new = claim(run_id)
     except (
@@ -879,8 +893,17 @@ def main():
             parser.error("run requires --output")
         return run(args.run_id, args.output)
     record = wait_for_recovery(args.run_id, cancel_requested=args.cancel)
-    if args.output and record is not None:
-        publish(args.run_id, args.output)
+    if args.output:
+        if record is not None:
+            publish(args.run_id, args.output)
+        elif not (args.output / f"{args.run_id}-hdfs-cleanup.json").exists():
+            admission_diagnostic(
+                args.run_id,
+                args.output,
+                "admission_preflight",
+                "cancelled" if args.cancel else "attempt_not_admitted",
+                interrupted=args.cancel,
+            )
     return (
         0
         if record

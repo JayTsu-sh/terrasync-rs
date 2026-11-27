@@ -126,7 +126,11 @@ cleanup() {
   # Pending HDFS writes can outlive a cancelled or force-stopped client.
   if [[ "$hdfs_cleanup" == unknown && "$cancelled" == false && -z "$hdfs_cleanup_reason_record" ]]; then
     write_evidence gate-phase hdfs_cleanup || exit 1
-    if LAB_HDFS_DESTINATION_CCACHE="$destination_cache" LAB_HDFS_KEYTAB="$destination_keytab" \
+  fi
+  if [[ "$hdfs_cleanup" == unknown ]]; then
+    if [[ "$cancelled" == true || -n "$hdfs_cleanup_reason_record" ]]; then
+      hdfs_cleanup_reason_record="${hdfs_cleanup_reason_record:-gate_interrupted}"
+    elif LAB_HDFS_DESTINATION_CCACHE="$destination_cache" LAB_HDFS_KEYTAB="$destination_keytab" \
       timeout --foreground --kill-after=5s 45s "$matrix_binary" --delete-hdfs-run "$hdfs_base" "$hdfs_scope" >"$cleanup_log" 2>&1; then
       hdfs_cleanup=passed
     else
@@ -140,9 +144,6 @@ cleanup() {
       status=1
     fi
     write_cleanup_evidence "$hdfs_cleanup" || status=1
-  elif [[ "$hdfs_cleanup" == unknown ]]; then
-    hdfs_cleanup_reason_record="${hdfs_cleanup_reason_record:-gate_interrupted}"
-    write_cleanup_evidence unknown || status=1
   fi
 
   rm -rf -- "$runtime_root" || status=1

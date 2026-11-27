@@ -253,7 +253,8 @@ class HdfsLabTest(unittest.TestCase):
         self.assertFalse(self.certification.exists())
         return diagnostic
 
-    def service_commands(self, run_id):
+    def service_commands(self, run_id, check_cancelled=lambda: None):
+        check_cancelled()
         return [
             [
                 [
@@ -291,18 +292,28 @@ class HdfsLabTest(unittest.TestCase):
         self.assertFalse(self.certification.exists())
 
     def test_cancel_during_preflight_keeps_diagnostic_without_admission(self):
-        def interrupt(run_id):
+        def interrupt(_run_id):
             signal.raise_signal(signal.SIGTERM)
-            return self.service_commands(run_id)
+            return self.manager.state
 
-        with patch.object(self.controller, "service_commands", side_effect=interrupt):
+        with (
+            patch.object(self.controller, "unit_state", side_effect=interrupt),
+            patch.object(self.controller, "service_commands") as commands,
+        ):
             self.assertEqual(self.controller.run(RUN_ID, self.output), 143)
+            commands.assert_not_called()
         self.assertFalse(self.attempt.exists())
         self.assertEqual(self.manager.commands, [])
         diagnostic = read_json(self.diagnostics)
         self.assertEqual(diagnostic["stage"], "admission_preflight")
         self.assertEqual(diagnostic["test"], "cancelled")
         self.assertEqual(diagnostic["hdfs_cleanup"], "not_attempted")
+
+    def test_reconcile_reports_cancelled_launcher_without_attempt_record(self):
+        self.assertEqual(self.reconcile("--cancel"), 1)
+        self.assertEqual(read_json(self.diagnostics)["test"], "cancelled")
+        self.assertEqual(read_json(self.diagnostics)["hdfs_cleanup"], "not_attempted")
+        self.assertFalse(self.attempt.exists())
 
     def test_running_attempt_is_only_observed_by_a_same_id_caller(self):
         self.controller.claim(RUN_ID)
@@ -532,6 +543,24 @@ class HdfsLabTest(unittest.TestCase):
         self.assertEqual((status, self.certification.exists()), (143, False))
         self.assertEqual(self.assert_withheld()["test"], "cancelled")
 
+    def test_signal_during_certification_commit_withholds_result(self):
+        self.manager.on_start = self.finish_worker
+        write_record = self.controller.atomic_json
+
+        def interrupt(path, record, **options):
+            if (
+                path == self.attempt / "state.json"
+                and record["certification"] == "published"
+            ):
+                signal.raise_signal(signal.SIGTERM)
+            return write_record(path, record, **options)
+
+        with patch.object(self.controller, "atomic_json", side_effect=interrupt):
+            self.assertEqual(self.controller.run(RUN_ID, self.output), 143)
+        self.assertEqual(self.record()["certification"], "withheld")
+        self.assertEqual(self.controller.run(RUN_ID, self.output), 1)
+        self.assertEqual(self.assert_withheld()["test"], "cancelled")
+
     def test_unknown_hdfs_cleanup_survives_recovery_without_retry_or_delete(self):
         self.controller.claim(RUN_ID)
         self.worker_state(
@@ -676,7 +705,20 @@ class HdfsLabTest(unittest.TestCase):
 
 
 class HdfsGateTest(unittest.TestCase):
-    def run_gate(self, cli_script, matrix_script=None):
+    negative_checks = """#!/bin/sh
+echo "$3" >> "$LAB_PROBE_LOG"
+if [ "$3" = scan ]; then
+  case "$2" in
+    */missing.toml)
+      echo 'Error: Configuration error: HDFS Source role configuration is required' >&2 ;;
+    */invalid.toml)
+      echo 'Error: failed to connect Hdfs backend: HDFS get storage root failed (Authentication): authentication failed' >&2 ;;
+  esac
+  exit 1
+fi
+"""
+
+    def run_gate(self, cli_script, matrix_script=None, *, cancel_at_cleanup=False):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             attempt = root / "attempt"
@@ -697,9 +739,35 @@ class HdfsGateTest(unittest.TestCase):
             matrix.write_text(matrix_script or cli_script, encoding="utf-8")
             matrix.chmod(0o700)
             candidate = "a" * 40
+            command = [str(LAB / "run-hdfs-e2e.sh"), "nightly-negative-timeout"]
+            env = os.environ.copy()
+            if cancel_at_cleanup:
+                python = root / "python3"
+                python.write_text(
+                    f"#!{sys.executable}\n"
+                    "import os, signal, subprocess, sys\n"
+                    "from pathlib import Path\n"
+                    "args = [sys.executable, *sys.argv[1:]]\n"
+                    'if sys.argv[-2:] == ["gate-phase", "hdfs_cleanup"]:\n'
+                    "    subprocess.run(args, check=True)\n"
+                    '    os.kill(int(Path(os.environ["LAB_PROBE_PID"]).read_text()), signal.SIGTERM)\n'
+                    "else:\n"
+                    "    os.execv(sys.executable, args)\n",
+                    encoding="utf-8",
+                )
+                python.chmod(0o700)
+                env["PATH"] = f"{root}:{env['PATH']}"
+                env["LAB_PROBE_PID"] = str(root / "gate-pid")
+                command = [
+                    "bash",
+                    "-c",
+                    'echo "$$" > "$LAB_PROBE_PID"; exec "$@"',
+                    "bash",
+                    *command,
+                ]
             result = subprocess.run(
-                [str(LAB / "run-hdfs-e2e.sh"), "nightly-negative-timeout"],
-                env=os.environ
+                command,
+                env=env
                 | {
                     "LAB_HDFS_MANAGED_DIR": str(attempt),
                     "LAB_HDFS_STATE_DIR": str(state),
@@ -747,17 +815,8 @@ class HdfsGateTest(unittest.TestCase):
 
     def test_killed_receiver_leaves_hdfs_cleanup_unknown(self):
         result, calls, cleanup, certified = self.run_gate(
-            """#!/bin/sh
-echo "$3" >> "$LAB_PROBE_LOG"
-case "$3" in
-  scan)
-    case "$2" in
-      */missing.toml)
-        echo 'Error: Configuration error: HDFS Source role configuration is required' >&2 ;;
-      */invalid.toml)
-        echo 'Error: failed to connect Hdfs backend: HDFS get storage root failed (Authentication): authentication failed' >&2 ;;
-    esac
-    exit 1 ;;
+            self.negative_checks
+            + """case "$3" in
   sync)
     case " $* " in *" --remote "*) exit 1 ;; esac ;;
   integrity-check) printf 'Checked: 1\\nAll Passed ✓\\n' ;;
@@ -781,6 +840,18 @@ fi
         self.assertNotIn("delete", calls)
         self.assertEqual(cleanup["status"], "unknown")
         self.assertEqual(cleanup["reason"], "receiver_terminated")
+        self.assertFalse(certified)
+
+    def test_cancel_while_entering_hdfs_cleanup_never_dispatches_delete(self):
+        result, calls, cleanup, certified = self.run_gate(
+            self.negative_checks + "exit 1\n",
+            '#!/bin/sh\necho delete >> "$LAB_PROBE_LOG"\n',
+            cancel_at_cleanup=True,
+        )
+        self.assertEqual(result.returncode, 143, result.stderr)
+        self.assertEqual(calls, ["scan", "scan", "sync"])
+        self.assertEqual(cleanup["status"], "unknown")
+        self.assertEqual(cleanup["reason"], "gate_interrupted")
         self.assertFalse(certified)
 
 
