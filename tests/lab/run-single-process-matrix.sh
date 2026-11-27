@@ -137,7 +137,7 @@ profile_fingerprint() {
     cifs_fas2750) printf '%s' 'fas2750/10.128.61.200+10.128.61.201/ontap_lisaauto_cifs' ;;
     s3_standard) printf '%s' 'shared-standard-s3/10.10.1.12-to-10.10.1.13' ;;
     s3_dxn) printf 'shared-real-dxn/%s' "$LAB_DXN_S3_ENDPOINT" ;;
-    hdfs) printf '%s' 'hdfs-ha-kerberos/10.131.9.30+10.131.9.33' ;;
+    hdfs) printf '%s' "${LAB_HDFS_FINGERPRINT:-hdfs-ha-kerberos/10.131.9.30+10.131.9.33}" ;;
     *) echo "unknown matrix profile: $1" >&2; return 2 ;;
   esac
 }

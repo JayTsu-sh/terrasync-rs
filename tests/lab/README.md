@@ -401,6 +401,25 @@ same-backend incremental synchronization and the local filter contract. The
 nightly workflow separately runs the real two-process QUIC tests. Each run uses
 an isolated ClickHouse database that is created and dropped for every run.
 
+Nightly reaches the five-node `hdfscluster` through `with-hdfs-tunnel.sh`:
+NameNodes `10.30.3.160/162`, DataNodes `10.30.3.161/163/164`, and the
+KDC on `.164`. The runner cannot route directly to this data network. The
+wrapper opens loopback-only SSH forwards through `10.128.135.164`, creates
+per-process Kerberos, HDFS and hostname configuration, and removes them and
+the tunnel afterward. Both HDFS gates hold the shared lab lock while the
+forwards are active. The gateway is a single point of failure for the test
+path; NameNode HA does not make the gateway highly available.
+
+The runner-only directory `~/.local/share/terrasync-hdfs-ci` contains
+`tunnel_key`, pinned `known_hosts`, `client.keytab`, and the extracted Ubuntu
+`libnss-wrapper` library under `pkg/usr/lib/x86_64-linux-gnu/`. The dedicated
+`terrasync-fwd` SSH key is restricted to the six required TCP destinations;
+`terrasync-lab-ci@HDFS.INTERNAL` owns only its private test directory under
+`/tmp/terrasync-nightly/terrasync-lab-ci`. Protect these files as credentials.
+No node service keytab or HDFS administrator keytab belongs on the runner.
+The wrapper is Nightly-specific; callers of the underlying scripts can still
+supply their own HDFS environment and `LAB_HDFS_BASE_PATH`.
+
 `run-hdfs-e2e.sh` certifies the pinned `data-mover` revision against the HA,
 Kerberos-protected HDFS cluster. The runner provides `LAB_HDFS_LOCATION`,
 `LAB_HDFS_ADMIN_USER`, `LAB_HDFS_CONFIG_DIR`, and `LAB_HDFS_KEYTAB`. It covers

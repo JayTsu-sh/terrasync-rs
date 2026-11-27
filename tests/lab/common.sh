@@ -119,17 +119,22 @@ require_single_matrix_credentials() {
 hdfs_run_root() {
   local run_id="$1"
   validate_run_id "$run_id"
-  python3 - "$LAB_HDFS_LOCATION" "$LAB_HDFS_ADMIN_USER" "$run_id" <<'PY'
+  python3 - "$LAB_HDFS_LOCATION" "$LAB_HDFS_ADMIN_USER" "$run_id" "${LAB_HDFS_BASE_PATH:-/tmp/terrasync-nightly}" <<'PY'
+import re
 import sys
 import urllib.parse
 
-location, admin_user, run_id = sys.argv[1:]
+location, admin_user, run_id, base_path = sys.argv[1:]
 parsed = urllib.parse.urlsplit(location)
 if parsed.scheme != "hdfs" or parsed.password is not None or parsed.hostname is None:
     raise SystemExit("LAB_HDFS_LOCATION must be a password-free HDFS URL")
 user = urllib.parse.quote(admin_user, safe="")
 authority = parsed.hostname if parsed.port is None else f"{parsed.hostname}:{parsed.port}"
-print(f"hdfs://{user}@{authority}/tmp/terrasync-nightly/{run_id}/hdfs")
+if not re.fullmatch(r"/[A-Za-z0-9._/-]+", base_path) or any(
+    part in ("", ".", "..") for part in base_path[1:].split("/")
+):
+    raise SystemExit("LAB_HDFS_BASE_PATH must be a normalized absolute path")
+print(f"hdfs://{user}@{authority}{base_path}/{run_id}/hdfs")
 PY
 }
 
