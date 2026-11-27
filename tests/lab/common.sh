@@ -15,10 +15,6 @@ LAB_NFS40_DATA="${LAB_NFS40_DATA:-10.131.7.201}"
 LAB_NFS40_EXPORT="${LAB_NFS40_EXPORT:-/jay_nfs}"
 LAB_NFS41_EXPORT="${LAB_NFS41_EXPORT:-/srv/nfs/v4}"
 LAB_S3_BUCKET="${LAB_S3_BUCKET:-terrasync-ci}"
-LAB_CIFS_SOURCE_DATA="${LAB_CIFS_SOURCE_DATA:-10.128.61.200}"
-LAB_CIFS_DEST_DATA="${LAB_CIFS_DEST_DATA:-10.128.61.201}"
-LAB_CIFS_SHARE="${LAB_CIFS_SHARE:-ontap_lisaauto_cifs}"
-LAB_CIFS_WRITABLE_ROOT="${LAB_CIFS_WRITABLE_ROOT:-ci/terrasync-data-mover}"
 LAB_DXN_S3_ENDPOINT="${LAB_DXN_S3_ENDPOINT:-http://10.131.7.201:8184}"
 LAB_DXN_S3_BUCKET="${LAB_DXN_S3_BUCKET:-test-agent-s3-bucket-202608301331}"
 LAB_HDFS_LOCATION="${LAB_HDFS_LOCATION:-hdfs://hdfs%2Fterrasync-runner%40HDFS.LOCAL@hdfs-ha/}"
@@ -36,7 +32,7 @@ LAB_FIXTURE_GID="${LAB_FIXTURE_GID:-1000}"
 # including the bucket-style hostnames constructed by run-e2e.sh.
 LAB_DXN_S3_AUTHORITY="${LAB_DXN_S3_ENDPOINT#*://}"
 LAB_DXN_S3_HOST="${LAB_DXN_S3_AUTHORITY%%:*}"
-LAB_NO_PROXY_HOSTS="${LAB_SOURCE_MGMT},${LAB_DEST_MGMT},${LAB_WORKER_MGMT},${LAB_SOURCE_DATA},${LAB_DEST_DATA},${LAB_WORKER_DATA},${LAB_NFS40_DATA},${LAB_CIFS_SOURCE_DATA},${LAB_CIFS_DEST_DATA},${LAB_S3_BUCKET}.${LAB_SOURCE_DATA},${LAB_S3_BUCKET}.${LAB_DEST_DATA},${LAB_S3_BUCKET}.${LAB_WORKER_DATA},${LAB_DXN_S3_HOST},${LAB_DXN_S3_BUCKET}.${LAB_DXN_S3_HOST}"
+LAB_NO_PROXY_HOSTS="${LAB_SOURCE_MGMT},${LAB_DEST_MGMT},${LAB_WORKER_MGMT},${LAB_SOURCE_DATA},${LAB_DEST_DATA},${LAB_WORKER_DATA},${LAB_NFS40_DATA},10.128.61.200,10.128.61.201,${LAB_S3_BUCKET}.${LAB_SOURCE_DATA},${LAB_S3_BUCKET}.${LAB_DEST_DATA},${LAB_S3_BUCKET}.${LAB_WORKER_DATA},${LAB_DXN_S3_HOST},${LAB_DXN_S3_BUCKET}.${LAB_DXN_S3_HOST}"
 export NO_PROXY="${NO_PROXY:+${NO_PROXY},}${LAB_NO_PROXY_HOSTS}"
 export no_proxy="$NO_PROXY"
 
@@ -104,19 +100,6 @@ report_hdfs_cleanup_failure() {
   echo "HDFS cleanup failed: $reason (exit $status)" >&2
 }
 
-report_cifs_cleanup_failure() {
-  local status="$1" log="$2" reason
-  case "$status" in
-    124|137) reason=timeout ;;
-    130|143) reason=cancelled ;;
-    *)
-      reason="$(sed -nE 's/^CIFS_CLEANUP_FAILURE=(Authentication|PermissionDenied|Connectivity|Timeout|InvalidInput|Unsupported|NotFound|Conflict|Capacity|Corruption|Protocol|Throttled|Cancelled|Internal|connection_unknown)$/\1/p' "$log" | head -1)"
-      reason="${reason:-storage_error}"
-      ;;
-  esac
-  echo "CIFS cleanup failed: $reason (exit $status)" >&2
-}
-
 require_hdfs_credentials() {
   : "${LAB_HDFS_CONFIG_DIR:?LAB_HDFS_CONFIG_DIR is required}"
   : "${LAB_HDFS_KEYTAB:?LAB_HDFS_KEYTAB is required}"
@@ -132,12 +115,12 @@ require_hdfs_credentials() {
 
 require_single_matrix_credentials() {
   local cifs_enabled="${1:-true}"
+  if [[ "$cifs_enabled" == true ]]; then
+    : "${LAB_CIFS_NIGHTLY_USERNAME:?LAB_CIFS_NIGHTLY_USERNAME is required}"
+    : "${LAB_CIFS_NIGHTLY_PASSWORD:?LAB_CIFS_NIGHTLY_PASSWORD is required}"
+  fi
   require_s3_credentials
   require_hdfs_credentials
-  if [[ "$cifs_enabled" == true ]]; then
-    : "${LAB_CIFS_USERNAME:?LAB_CIFS_USERNAME is required}"
-    : "${LAB_CIFS_PASSWORD:?LAB_CIFS_PASSWORD is required}"
-  fi
   : "${LAB_DXN_S3_ACCESS_KEY:?LAB_DXN_S3_ACCESS_KEY is required}"
   : "${LAB_DXN_S3_SECRET_KEY:?LAB_DXN_S3_SECRET_KEY is required}"
 }

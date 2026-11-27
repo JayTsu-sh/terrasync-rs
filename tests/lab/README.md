@@ -385,14 +385,10 @@ HTTP proxy. Rust 1.95.0 with Clippy and rustfmt must be preinstalled; nightly
 sets `RUSTUP_TOOLCHAIN=1.95.0` and verifies it instead of downloading tools at
 runtime.
 
-The `TS-SINGLE` matrix additionally requires CI-only `LAB_CIFS_USERNAME`,
-`LAB_CIFS_PASSWORD`, `LAB_DXN_S3_ACCESS_KEY`, and `LAB_DXN_S3_SECRET_KEY`.
-The FAS2750 share defaults to `ontap_lisaauto_cifs`; all values can be
-overridden by runner-only `LAB_*` settings and must never enter logs or reports.
-Its writable lab root is `ci/terrasync-data-mover` by default
-(`LAB_CIFS_WRITABLE_ROOT`), rather than the share root. This is required because
-the FAS volume uses UNIX security style and the SMB user receives ordinary
-`Change` permissions, not ownership or ACL-administration rights.
+The full `TS-SINGLE` matrix reads the dedicated CIFS identity from
+`LAB_CIFS_NIGHTLY_USERNAME` and `LAB_CIFS_NIGHTLY_PASSWORD`. Nightly and Release
+validation bind these Actions secrets only for the matrix step. The DXN profile
+also requires `LAB_DXN_S3_ACCESS_KEY` and `LAB_DXN_S3_SECRET_KEY`.
 
 `run-e2e.sh` retains the directed 4-by-4 compatibility suite across Local,
 NFSv3, NFSv4.1, and standard S3, verifies every destination by
@@ -443,23 +439,73 @@ paths, ClickHouse databases, copied keytabs, credential caches, and generated
 artifact follows `tests/lab/evidence-matrix.json` and records both exact commit
 identities.
 
-`run-single-process-matrix.sh` is the authoritative `TS-SINGLE` evidence gate.
-It emits 64 independent cell records for Local, NFSv3, NFSv4.0, NFSv4.1,
-FAS2750 CIFS, standard S3, DXN S3, and HDFS. Every cell preloads its source,
-runs the protocol-neutral `Storage + run_local_transfer` single-process path,
-verifies every stream with copy-time BLAKE3, reads the destination back, and
-records the exact terrasync and data-mover commits. Its aggregate also requires
-successful HDFS, CIFS and DXN prefix cleanup; the dedicated DXN test bucket must have
-versioning disabled and its object/multipart prefix is checked afterward. This runner intentionally
-does not route through the legacy URL-dispatching CLI. FAS2750 and DXN
-credentials are CI secrets; reports contain only profile-level environment
-fingerprints.
+`run-single-process-matrix.sh` produces the `TS-SINGLE` cell evidence.
+`reconcile-single-process-matrix.sh` finalizes and validates the gate. The full
+matrix covers 64 ordered pairs of Local, NFSv3, NFSv4.0, NFSv4.1, FAS2750 CIFS,
+standard S3, DXN S3, and HDFS. Each cell preloads its source, uses the
+protocol-neutral `Storage + run_local_transfer` path, verifies the copy with
+BLAKE3 and compares the fixture and destination readback SHA-256 digests.
+The validator requires all 64 cells and confirmed HDFS, CIFS and DXN cleanup.
+`TS_SINGLE_DEFER_CIFS=true` runs the 49 non-CIFS pairs as a diagnostic.
 
-Nightly runs the full 64-cell matrix. For an explicitly degraded diagnostic run,
-`TS_SINGLE_DEFER_CIFS=true` emits the 49-cell product of the remaining seven
-profiles, with `cifs_fas2750` recorded in `deferred_profiles`; this does not
-replace the 64-cell acceptance gate. CIFS cleanup removes only the hashed
-per-run directory under the configured writable root and is required for a pass.
+The producer requires a clean checkout, including untracked files. It captures
+HEAD and the resolved data-mover commit from the lockfile before building, then
+checks the source again after building and before finishing. A dirty source
+report has no exact commit and cannot pass validation.
+
+The CIFS profile pins the `terrasync_nightly` share at source `10.128.61.200`
+and destination `10.128.61.201`. Both LIFs serve the same private namespace.
+Keep the UNIX volume root owned by UID/GID 32001 with mode 0700, restrict the
+share ACL to `LIZYAD\tsnightly`, and keep `unix_symlink` disabled. The client
+requires signed, authenticated sessions. Protect the volume from other writers
+through SMB, alternate exports and local access. Trusted CI uses the shared lab
+lock. Path-based ownership checks depend on this exclusive-writer property.
+
+Before the first CIFS mutation, the driver durably records a receipt with the
+run ID, a random share-relative scope and a private marker token. It records
+the acknowledged exclusive scope create before creating the marker, then
+records the destination's marker verification before allowing any cell write.
+The driver derives each CIFS path from that receipt, the cell ID and the role.
+
+Reconciliation checks each endpoint with a fresh connection. It recursively
+removes only the matrix data subtree, after verifying the receipt and its
+marker, then durably records that the subtree is gone before deleting the
+marker. If the marker deletion reply is lost, this state lets the other
+endpoint finish removing the scope, and fresh checks confirm absence on both
+endpoints. An unconfirmed scope create, collision, denied observation or
+unexpected marker absence leaves the existing scope for inspection. A receipt
+that records finalization cannot authorize recursive deletion of data that
+appears afterward.
+
+The receipt, exact driver and incrementally written evidence live in the
+self-hosted runner account's persistent
+`~/.local/state/terrasync-single-matrix/<run-id>/` directory.
+`TS_SINGLE_STATE_ROOT` overrides the parent directory for manual runs. The
+run's temporary payloads and Kerberos caches are separate. Both workflows
+reconcile in a bounded `always()` step and upload the `evidence/` subdirectory
+on failure and cancellation. It includes operation attempts, interrupted or
+unknown write outcomes, and allowlisted role, phase and cause fields. The
+private receipt and raw backend output stay on the runner. The pinned
+data-mover CIFS connector formats SMB connect errors as text. The report
+identifies known SMB statuses and transport errors with `adapter_diagnostic`
+provenance and leaves other connect causes unclassified.
+
+Claim and peer verification each have a 20-second deadline. Cell operations
+have 120 seconds, with four seconds after TERM before forced exit. CIFS cleanup
+allows 30 seconds per endpoint. When one endpoint confirms absence, the
+reconciler makes one fresh check through the other endpoint if its first check
+was interrupted by a transport failure or timeout. An interrupted matrix
+remains cancelled even if reconciliation succeeds. If Actions force-stops the
+job or the runner goes offline, use the same runner account, run ID, credentials
+and endpoints to rerun reconciliation under the lab lock.
+
+```sh
+flock --no-fork --wait 60 /tmp/terrasync-lab-tests.lock \
+  tests/lab/reconcile-single-process-matrix.sh "$RUN_ID" --hdfs-tunnel
+```
+
+Use `--hdfs-tunnel` for Nightly and `--direct` for Release. Keep the private
+run state across retries and until the cleanup result has been verified.
 
 Nightly sets the DXN S3 endpoint and private test bucket through
 `LAB_DXN_NIGHTLY_ENDPOINT` and `LAB_DXN_NIGHTLY_BUCKET` repository variables.

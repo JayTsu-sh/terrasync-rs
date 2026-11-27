@@ -1,9 +1,14 @@
 import importlib.util
+import os
 import json
 import pathlib
+import shutil
+import signal
 import subprocess
 import sys
 import tempfile
+import time
+import uuid
 import unittest
 
 
@@ -37,13 +42,24 @@ class SingleProcessMatrixTest(unittest.TestCase):
                     "completed_at": "2026-08-31T00:00:01Z",
                     "environment_fingerprint": f"lab/{source}/{destination}",
                     "artifact_links": [f"cell:{source}__{destination}"],
+                    "expected_sha256": "d" * 64,
+                    "readback_sha256": "d" * 64,
                 })
+        run_id = "release-matrix-test"
         return {
-            "schema_version": 1,
+            "schema_version": 2,
+            "source_state": "clean",
             "repository": "JayTsu-sh/terrasync-rs",
             "exact_commit": "a" * 40,
             "dependency_commits": {"data-mover-rs": "b" * 40},
-            "run_id": "release-matrix-test",
+            "run_id": run_id,
+            "status": "completed",
+            "cifs": {
+                "scope": "opaque-cifs-scope",
+                "run_id": run_id,
+                "setup": "passed",
+                "cleanup": {"source": "passed", "destination": "passed"},
+            },
             "mode": "terrasync_single_process",
             "cleanup": {"hdfs": "passed", "s3_dxn": "passed", "cifs": "passed"},
             "cells": cells,
@@ -80,6 +96,36 @@ class SingleProcessMatrixTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "cleanup must pass"):
             self.validator.validate_report(report)
 
+    def test_full_gate_requires_verified_scope_and_both_cleanup_roles(self):
+        for key, value, message in (
+            ("scope", "../peer", "scope must identify this matrix run"),
+            ("setup", "verify_failed", "ownership verification and cleanup"),
+            ("cleanup", {"source": "passed", "destination": "failed"}, "cleanup on both endpoints"),
+        ):
+            with self.subTest(key=key):
+                report = self.report()
+                report["cifs"][key] = value
+                with self.assertRaisesRegex(ValueError, message):
+                    self.validator.validate_report(report)
+
+    def test_dirty_source_cannot_claim_an_exact_commit(self):
+        report = self.report()
+        report["source_state"] = "dirty"
+        with self.assertRaisesRegex(ValueError, "clean source"):
+            self.validator.validate_report(report)
+
+    def test_cancelled_64_cell_report_is_rejected_even_if_cleanup_passes(self):
+        report = self.report()
+        report["status"] = "cancelled"
+        with self.assertRaisesRegex(ValueError, "must be completed"):
+            self.validator.validate_report(report)
+
+    def test_passing_cell_without_matching_readback_is_rejected(self):
+        report = self.report()
+        report["cells"][0]["readback_sha256"] = "e" * 64
+        with self.assertRaisesRegex(ValueError, "matching fixture and readback"):
+            self.validator.validate_report(report)
+
     def test_duplicate_pair_is_rejected(self):
         report = self.report()
         report["cells"][-1] = dict(report["cells"][0])
@@ -98,6 +144,12 @@ class SingleProcessMatrixTest(unittest.TestCase):
         report["profiles"] = active_profiles
         report["deferred_profiles"] = ["cifs_fas2750"]
         report["cleanup"]["cifs"] = "not_attempted"
+        report["cifs"] = {
+            "scope": None,
+            "run_id": None,
+            "setup": "not_attempted",
+            "cleanup": {"source": "not_attempted", "destination": "not_attempted"},
+        }
         report["cells"] = [
             cell
             for cell in report["cells"]
@@ -120,6 +172,12 @@ class SingleProcessMatrixTest(unittest.TestCase):
     def test_validator_cli_reports_explicit_cifs_deferral(self):
         report = self.report()
         report["cleanup"]["cifs"] = "not_attempted"
+        report["cifs"] = {
+            "scope": None,
+            "run_id": None,
+            "setup": "not_attempted",
+            "cleanup": {"source": "not_attempted", "destination": "not_attempted"},
+        }
         active_profiles = [profile for profile in self.profiles if profile != "cifs_fas2750"]
         report["profiles"] = active_profiles
         report["deferred_profiles"] = ["cifs_fas2750"]
@@ -168,6 +226,18 @@ class SingleProcessMatrixTest(unittest.TestCase):
         self.assertIn("deferred_profiles", runner)
         self.assertIn("TS-SINGLE 64-cell matrix", workflow)
         self.assertNotIn('TS_SINGLE_DEFER_CIFS: "true"', workflow)
+        for workflow_text in (workflow, release):
+            matrix = workflow_text.index("id: single_matrix")
+            reconcile = workflow_text.index("id: reconcile_matrix", matrix)
+            finalize = workflow_text.index("--report-only", reconcile)
+            upload = workflow_text.index("Upload TS-SINGLE matrix evidence", finalize)
+            self.assertIn("if: ${{ always() }}", workflow_text[:matrix])
+            self.assertIn("always()", workflow_text[reconcile:finalize])
+            self.assertIn("always()", workflow_text[upload:])
+            self.assertIn("~/.local/state/terrasync-single-matrix/", workflow_text[upload:])
+        for secret in ("LAB_CIFS_NIGHTLY_USERNAME", "LAB_CIFS_NIGHTLY_PASSWORD"):
+            self.assertIn(f"${{{{ secrets.{secret} }}}}", workflow)
+            self.assertIn(f"${{{{ secrets.{secret} }}}}", release)
         self.assertTrue(VALIDATOR_PATH.stat().st_mode & 0o111)
         self.assertTrue((ROOT / "tests" / "lab" / "run-single-process-matrix.sh").stat().st_mode & 0o111)
 
@@ -188,6 +258,414 @@ class SingleProcessMatrixTest(unittest.TestCase):
         )
         self.assertIn("hdfs/terrasync-runner@HDFS.LOCAL", common)
         self.assertNotIn("hdfs://root@10.131.9.30:9000/", common)
+
+
+
+MOCK_CARGO = """
+import json, os, sys
+if sys.argv[1] == "metadata":
+    print(json.dumps({"target_directory": os.environ["MOCK_ROOT"] + "/target"}))
+elif sys.argv[1] == "build":
+    assert "LAB_CIFS_NIGHTLY_PASSWORD" not in os.environ
+    open(os.environ["MOCK_ROOT"] + "/built", "w").close()
+else:
+    raise AssertionError(sys.argv)
+"""
+
+MOCK_PYTHON = """
+import os, sys
+if len(sys.argv) > 1 and sys.argv[1].endswith("/s3_helper.py"):
+    sys.exit(0)
+os.execv(REAL_PYTHON, [REAL_PYTHON, *sys.argv[1:]])
+"""
+
+MOCK_GIT = """
+import os, pathlib, sys
+args = sys.argv[1:]
+mode = os.environ.get("MOCK_MODE", "")
+if args == ["rev-parse", "HEAD"]:
+    print("a" * 40)
+elif args == ["--no-optional-locks", "status", "--porcelain", "--untracked-files=all"]:
+    if mode == "dirty" or (mode == "dirty_build" and (pathlib.Path(os.environ["MOCK_ROOT"]) / "built").exists()):
+        print("?? untracked-source.rs")
+else:
+    raise AssertionError(args)
+"""
+
+MOCK_DRIVER = r"""
+import json, os, pathlib, shutil, signal, sys, time
+root = pathlib.Path(os.environ["MOCK_ROOT"])
+mode = os.environ.get("MOCK_MODE", "")
+args = sys.argv[1:]
+receipt = pathlib.Path(os.environ["TS_SINGLE_CIFS_RECEIPT"])
+run_id = os.environ["TS_SINGLE_MATRIX_RUN_ID"]
+
+def record(event):
+    with (root / "events").open("a") as handle:
+        handle.write(json.dumps(event) + "\n")
+
+def diagnostic(phase, role, cause_class, write_outcome="not_indicated"):
+    print("MATRIX_DIAGNOSTIC=" + json.dumps({
+        "phase": phase, "role": role, "endpoint": "10.128.61.200" if role == "source" else "10.128.61.201",
+        "class": cause_class, "operation": "Namespace", "provenance": "typed", "cause": None, "write_outcome": write_outcome,
+    }), file=sys.stderr)
+    print("MATRIX_DIAGNOSTIC=" + json.dumps({"phase": "redact-this-password"}), file=sys.stderr)
+    print("redact-this-password", file=sys.stderr)
+    sys.exit(1)
+
+def save(state):
+    receipt.write_text(json.dumps(state))
+
+if args[0] == "--delete-hdfs-run":
+    sys.exit(0)
+elif len(args) == 3:
+    action, actual_run, role = args
+    assert actual_run == run_id
+    record(args)
+    if action == "--prepare-cifs-run":
+        assert role == "source"
+        save({"run_id": run_id, "scope": "mock-scope", "phase": "Planned", "token": "b" * 32})
+        sys.exit(0)
+    state = json.loads(receipt.read_text())
+    scope = root / "share" / state["scope"]
+    marker = scope / ".owner"
+    if action == "--claim-cifs-run":
+        assert role == "source" and state["phase"] == "Planned"
+        scope.mkdir(parents=True)
+        if mode == "collision":
+            (scope / "peer-data").write_text("foreign")
+            diagnostic("create_scope", role, "Conflict")
+        state["phase"] = "Created"
+        save(state)
+        marker.mkdir()
+        if mode == "kill_claim":
+            (root / "ready").touch()
+            signal.pause()
+        state["phase"] = "Claimed"
+        save(state)
+    elif action == "--verify-cifs-run":
+        assert role == "destination" and marker.is_dir() and state["phase"] == "Claimed"
+        if mode == "inaccessible":
+            diagnostic("observe_marker", role, "PermissionDenied")
+        state["phase"] = "Ready"
+        save(state)
+    elif action == "--delete-cifs-run":
+        if mode == "cleanup_failure" and role == "source":
+            diagnostic("connect", role, "Connectivity")
+        if not scope.is_dir():
+            sys.exit(0)
+        if state["phase"] == "Planned":
+            diagnostic("check_ownership", role, "Conflict")
+        if marker.exists():
+            assert state["phase"] in ("Created", "Claimed", "Ready", "Finalizing")
+            state["phase"] = "Finalizing"
+            save(state)
+            marker.rmdir()
+            if mode == "kill_cleanup":
+                (root / "ready").touch()
+                signal.pause()
+            if mode == "lost_delete_ack" and role == "source":
+                diagnostic("delete_marker", role, "Connectivity", "unknown")
+        assert state["phase"] == "Finalizing"
+        scope.rmdir()
+    else:
+        raise AssertionError(args)
+else:
+    source, source_role, source_path, destination, destination_role, destination_path, job = args
+    record(args)
+    if "cifs_fas2750" in (source, destination):
+        assert json.loads(receipt.read_text())["phase"] == "Ready"
+        report = json.loads((receipt.parent / "evidence" / "matrix.json").read_text())
+        assert report["cifs"]["setup"] == "passed"
+    if mode == "cancel" and destination == "cifs_fas2750":
+        def stop(*_):
+            record(["transfer-stopped"])
+            sys.exit(1)
+        signal.signal(signal.SIGTERM, stop)
+        (root / "ready").touch()
+        signal.pause()
+    if mode == "transfer_failure" and destination == "cifs_fas2750":
+        diagnostic("Publish", destination_role, "Connectivity", "unknown")
+    def payload(profile, role, path):
+        if profile == "local":
+            return pathlib.Path(path) / "payload.bin"
+        if profile == "cifs_fas2750":
+            return root / "storage" / profile / path / role / "payload.bin"
+        return root / "storage" / f"{profile}-{role}" / path.replace(":", "_").lstrip("/") / "payload.bin"
+    target = payload(destination, destination_role, destination_path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(payload(source, source_role, source_path), target)
+"""
+
+
+@unittest.skipUnless(sys.platform.startswith("linux"), "lab runner uses Linux process and tool semantics")
+class MatrixRunnerTest(unittest.TestCase):
+    def setUp(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        self.root = pathlib.Path(temp.name)
+        self.run_id = f"nightly-cifs-mock-{uuid.uuid4().hex}"
+        self.lab_root = pathlib.Path("/tmp/terrasync-lab") / self.run_id
+        self.addCleanup(shutil.rmtree, self.lab_root, ignore_errors=True)
+        self.state = self.root / "state" / self.run_id
+        self.report_path = self.state / "evidence" / "matrix.json"
+        self.receipt = self.state / "cifs-receipt.json"
+        self.install("bin/git", MOCK_GIT)
+        self.install("bin/cargo", MOCK_CARGO)
+        self.install("bin/python3", f"REAL_PYTHON = {sys.executable!r}\n" + MOCK_PYTHON)
+        self.install("target/release/examples/single_process_matrix", MOCK_DRIVER)
+        for name in ("core-site.xml", "hdfs-site.xml", "test.keytab"):
+            (self.root / name).touch()
+        self.env = {
+            **os.environ,
+            "PATH": f"{self.root / 'bin'}:{os.environ['PATH']}",
+            "RUNNER_TEMP": str(self.root),
+            "TS_SINGLE_STATE_ROOT": str(self.state.parent),
+            "MOCK_ROOT": str(self.root),
+            "TS_SINGLE_DEFER_CIFS": "false",
+            "LAB_HDFS_LOCATION": "hdfs://hdfs-fixture/",
+            "LAB_HDFS_ADMIN_USER": "test",
+            "LAB_HDFS_CONFIG_DIR": str(self.root),
+            "LAB_HDFS_KEYTAB": str(self.root / "test.keytab"),
+            "LAB_HDFS_BASE_PATH": "/tmp/hdfs-fixture",
+            "LAB_S3_ACCESS_KEY": "mock",
+            "LAB_S3_SECRET_KEY": "mock",
+            "LAB_DXN_S3_ENDPOINT": "http://dxn-fixture",
+            "LAB_DXN_S3_BUCKET": "dxn-fixture",
+            "LAB_DXN_S3_ACCESS_KEY": "mock",
+            "LAB_DXN_S3_SECRET_KEY": "mock",
+            "LAB_CIFS_NIGHTLY_USERNAME": r"LIZYAD\tsnightly",
+            "LAB_CIFS_NIGHTLY_PASSWORD": "redact-this-password",
+        }
+
+    def install(self, name, program):
+        path = self.root / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(f"#!{sys.executable}\n" + program)
+        path.chmod(0o700)
+
+    def start(self, mode, *, reconcile=False, workflow_outcome="", reconcile_mode="--direct"):
+        script = "reconcile-single-process-matrix.sh" if reconcile else "run-single-process-matrix.sh"
+        arguments = [str(ROOT / "tests" / "lab" / script), self.run_id]
+        if reconcile:
+            arguments += [reconcile_mode, workflow_outcome]
+        return subprocess.Popen(
+            arguments,
+            cwd=ROOT,
+            env={**self.env, "MOCK_MODE": mode},
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            start_new_session=True,
+        )
+
+    def finish(self, process):
+        try:
+            stdout, stderr = process.communicate(timeout=80)
+        finally:
+            if process.poll() is None:
+                os.killpg(process.pid, signal.SIGKILL)
+        self.assertNotIn("redact-this-password", stdout + stderr)
+        self.assertTrue(self.report_path.exists(), stdout + stderr)
+        report = json.loads(self.report_path.read_text())
+        for path in self.report_path.parent.glob("*.json"):
+            self.assertNotIn("redact-this-password", path.read_text())
+        events_file = self.root / "events"
+        events = [json.loads(line) for line in events_file.read_text().splitlines()] if events_file.exists() else []
+        return report, events, stdout, stderr
+
+    def run_mock(self, mode, *, reconcile=True):
+        with self.start(mode) as producer:
+            report, events, stdout, stderr = self.finish(producer)
+        if not reconcile:
+            return producer, report, events, stdout, stderr
+        with self.start(mode, reconcile=True, workflow_outcome="success" if producer.returncode == 0 else "failure") as process:
+            report, events, reconcile_stdout, reconcile_stderr = self.finish(process)
+        return process, report, events, stdout + reconcile_stdout, stderr + reconcile_stderr
+
+    def test_64_cells_use_owned_paths_derived_from_cell_and_role(self):
+        process, report, events, stdout, stderr = self.run_mock("")
+        self.assertEqual(process.returncode, 0, stderr)
+        self.assertIn("64 independent cells", stdout)
+        load_validator().validate_report(report)
+        self.assertEqual(report["cifs"]["run_id"], self.run_id)
+        self.assertEqual(events[:3], [
+            ["--prepare-cifs-run", self.run_id, "source"],
+            ["--claim-cifs-run", self.run_id, "source"],
+            ["--verify-cifs-run", self.run_id, "destination"],
+        ])
+        self.assertIn([
+            "cifs_fas2750", "source", "cifs_fas2750__cifs_fas2750",
+            "cifs_fas2750", "destination", "cifs_fas2750__cifs_fas2750",
+            "matrix-copy-cifs_fas2750__cifs_fas2750",
+        ], events)
+        self.assertEqual([event[2] for event in events if event[0] == "--delete-cifs-run"], ["source", "destination"])
+        self.assertTrue(self.receipt.exists())
+        self.assertFalse(self.lab_root.exists() and (self.lab_root / "single-process-matrix").exists())
+
+    def test_legacy_credentials_do_not_satisfy_the_full_gate(self):
+        self.env["LAB_CIFS_USERNAME"] = self.env.pop("LAB_CIFS_NIGHTLY_USERNAME")
+        self.env["LAB_CIFS_PASSWORD"] = self.env.pop("LAB_CIFS_NIGHTLY_PASSWORD")
+        process, report, events, _, stderr = self.run_mock("", reconcile=False)
+        self.assertNotEqual(process.returncode, 0)
+        self.assertIn("LAB_CIFS_NIGHTLY_USERNAME is required", stderr)
+        self.assertEqual(report["status"], "incomplete")
+        self.assertEqual(report["cifs"]["setup"], "not_attempted")
+        self.assertEqual(events, [])
+
+    def test_dirty_checkout_is_rejected_before_remote_operations(self):
+        process, report, events, _, stderr = self.run_mock("dirty", reconcile=False)
+        self.assertNotEqual(process.returncode, 0)
+        self.assertIn("clean source checkout", stderr)
+        self.assertEqual(report["source_state"], "dirty")
+        self.assertIsNone(report["exact_commit"])
+        self.assertEqual(events, [])
+
+    def test_source_change_during_build_clears_exact_commit_before_claim(self):
+        process, report, events, _, stderr = self.run_mock("dirty_build", reconcile=False)
+        self.assertNotEqual(process.returncode, 0)
+        self.assertIn("source changed during the build", stderr)
+        self.assertEqual(report["source_state"], "dirty")
+        self.assertIsNone(report["exact_commit"])
+        self.assertEqual(events, [])
+
+    def test_collision_grants_no_delete_authority(self):
+        process, report, events, _, stderr = self.run_mock("collision")
+        self.assertNotEqual(process.returncode, 0)
+        self.assertIn("Conflict", stderr)
+        self.assertEqual(report["status"], "incomplete")
+        self.assertEqual(report["cifs"]["setup"], "failed")
+        self.assertEqual(report["cleanup"]["cifs"], "failed")
+        self.assertEqual((self.root / "share/mock-scope/peer-data").read_text(), "foreign")
+        self.assertEqual([event[0] for event in events], [
+            "--prepare-cifs-run", "--claim-cifs-run", "--delete-cifs-run", "--delete-cifs-run",
+        ])
+
+    def test_inaccessible_second_endpoint_rejects_cells_and_preserves_diagnostic(self):
+        _, report, _, _, stderr = self.run_mock("inaccessible")
+        self.assertIn("PermissionDenied", stderr)
+        self.assertEqual(report["cifs"]["setup"], "failed")
+        self.assertEqual(report["cells"], [])
+        self.assertEqual(report["cifs"]["cleanup"], {"source": "passed", "destination": "passed"})
+        diagnostic = next(op["diagnostics"][0] for op in report["operations"] if op["operation"] == "cifs.verify.destination")
+        self.assertEqual(
+            (diagnostic["endpoint"], diagnostic["phase"], diagnostic["class"], diagnostic["write_outcome"]),
+            ("10.128.61.201", "observe_marker", "PermissionDenied", "not_indicated"),
+        )
+
+    def test_cleanup_failure_is_retained_after_a_successful_reconciliation(self):
+        process, report, _, _, stderr = self.run_mock("cleanup_failure")
+        self.assertNotEqual(process.returncode, 0)
+        self.assertIn("Connectivity", stderr)
+        self.assertEqual(report["cifs"]["cleanup"], {"source": "failed", "destination": "passed"})
+        self.assertEqual(report["status"], "failed")
+        with self.start("", reconcile=True) as retry:
+            report, _, _, stderr = self.finish(retry)
+        self.assertEqual(retry.returncode, 0, stderr)
+        load_validator().validate_report(report)
+        attempts = [op for op in report["operations"] if op["operation"] == "cifs.delete.source"]
+        self.assertEqual([op["status"] for op in attempts], ["failed", "failed", "passed"])
+        self.assertEqual(attempts[0]["write_outcome"], "not_indicated")
+        self.assertTrue(self.receipt.exists())
+
+    def test_missing_receipt_blocks_reconciliation_with_a_claim_in_evidence(self):
+        self.run_mock("inaccessible", reconcile=False)
+        self.receipt.unlink()
+        with self.start("", reconcile=True, workflow_outcome="failure") as process:
+            report, events, _, stderr = self.finish(process)
+        self.assertNotEqual(process.returncode, 0)
+        self.assertIn("requires the private receipt", stderr)
+        self.assertEqual(report["cleanup"]["cifs"], "not_attempted")
+        self.assertNotIn("--delete-cifs-run", [event[0] for event in events])
+
+    def test_peer_cleanup_rechecks_source_after_lost_delete_ack(self):
+        self.run_mock("inaccessible", reconcile=False)
+        with self.start("lost_delete_ack", reconcile=True, workflow_outcome="failure") as process:
+            report, _, _, stderr = self.finish(process)
+        self.assertEqual(process.returncode, 0, stderr)
+        self.assertEqual(report["cleanup"]["cifs"], "passed")
+        source = [op for op in report["operations"] if op["operation"] == "cifs.delete.source"]
+        self.assertEqual([op["status"] for op in source], ["failed", "passed"])
+        self.assertEqual(source[0]["write_outcome"], "unknown")
+
+    def test_failed_transfer_carries_phase_and_unknown_write_to_evidence(self):
+        process, report, _, _, _ = self.run_mock("transfer_failure")
+        self.assertNotEqual(process.returncode, 0)
+        self.assertEqual(report["status"], "failed")
+        operation = next(op for op in report["operations"] if op["operation"] == "local__cifs_fas2750.copy")
+        self.assertEqual(operation["write_outcome"], "unknown")
+        self.assertEqual(operation["diagnostics"][0]["phase"], "Publish")
+        cell = next(item for item in report["cells"] if item["gate_id"] == "TS-SINGLE/local__cifs_fas2750")
+        self.assertEqual(cell["outcome"], "failed")
+        self.assertIsNone(cell["readback_sha256"])
+
+    def stop_when_ready(self, process, sig):
+        deadline = time.monotonic() + 20
+        try:
+            while not (self.root / "ready").exists():
+                self.assertIsNone(process.poll())
+                self.assertLess(time.monotonic(), deadline)
+                time.sleep(0.01)
+            if sig == signal.SIGKILL:
+                os.killpg(process.pid, sig)
+            else:
+                process.send_signal(sig)
+            process.communicate(timeout=10)
+        finally:
+            if process.poll() is None:
+                os.killpg(process.pid, signal.SIGKILL)
+
+    def test_graceful_cancel_reaps_active_transfer_before_reconciliation(self):
+        with self.start("cancel") as producer:
+            self.stop_when_ready(producer, signal.SIGTERM)
+        self.assertEqual(producer.returncode, 143)
+        with self.start("", reconcile=True, workflow_outcome="cancelled") as process:
+            report, events, _, stderr = self.finish(process)
+        self.assertEqual(process.returncode, 0, stderr)
+        self.assertEqual(report["status"], "cancelled")
+        self.assertEqual(report["cleanup"]["cifs"], "passed")
+        self.assertLess(events.index(["transfer-stopped"]), next(i for i, event in enumerate(events) if event[0] == "--delete-cifs-run"))
+
+    def test_kill_during_claim_recovers_from_durable_receipt_after_runtime_loss(self):
+        with self.start("kill_claim") as producer:
+            self.stop_when_ready(producer, signal.SIGKILL)
+        self.assertTrue(self.receipt.exists())
+        shutil.rmtree(self.lab_root)
+        with self.start("", reconcile=True, workflow_outcome="cancelled") as process:
+            report, _, _, stderr = self.finish(process)
+        self.assertEqual(process.returncode, 0, stderr)
+        self.assertEqual(report["status"], "cancelled")
+        self.assertEqual(report["cells"], [])
+        self.assertEqual(report["cifs"]["setup"], "interrupted")
+        self.assertEqual(report["cleanup"]["cifs"], "passed")
+        self.assertFalse((self.root / "share/mock-scope").exists())
+        claim = next(op for op in report["operations"] if op["operation"] == "cifs.claim.source")
+        self.assertEqual(claim["write_outcome"], "unknown")
+
+    def test_report_only_finalizes_interrupted_operations_without_remote_calls(self):
+        with self.start("kill_claim") as producer:
+            self.stop_when_ready(producer, signal.SIGKILL)
+        self.env["RUNNER_TEMP"] = str(self.root / "unavailable-runner-temp")
+        with self.start("", reconcile=True, workflow_outcome="cancelled", reconcile_mode="--report-only") as process:
+            report, events, _, stderr = self.finish(process)
+        self.assertEqual(process.returncode, 0, stderr)
+        self.assertEqual(report["status"], "cancelled")
+        self.assertEqual(report["cifs"]["setup"], "interrupted")
+        self.assertEqual(report["cleanup"]["cifs"], "not_attempted")
+        self.assertEqual([event[0] for event in events], ["--prepare-cifs-run", "--claim-cifs-run"])
+
+    def test_kill_after_marker_delete_preserves_the_interrupted_attempt_and_retries(self):
+        self.run_mock("inaccessible", reconcile=False)
+        with self.start("kill_cleanup", reconcile=True, workflow_outcome="failure") as interrupted:
+            self.stop_when_ready(interrupted, signal.SIGKILL)
+        self.assertEqual(json.loads(self.receipt.read_text())["phase"], "Finalizing")
+        with self.start("", reconcile=True) as process:
+            report, _, _, stderr = self.finish(process)
+        self.assertEqual(process.returncode, 0, stderr)
+        self.assertEqual(report["status"], "incomplete")
+        self.assertEqual(report["cleanup"]["cifs"], "passed")
+        attempts = [op for op in report["operations"] if op["operation"] == "cifs.delete.source"]
+        self.assertEqual([op["status"] for op in attempts], ["interrupted", "passed"])
 
 
 if __name__ == "__main__":
