@@ -147,11 +147,23 @@ done
 printf 'terrasync-hdfs-%s\n' "$run_id" > "$fixture_root/payload.txt"
 expected_hash="$(sha256sum "$fixture_root/payload.txt" | cut -d' ' -f1)"
 
+verify_destination() {
+  local mode="$1" destination="$2" readback="$lab_root/readback-$1" actual_hash
+  verify_integrity_report run_with_config "$single_config" integrity-check --id "hdfs-$mode-integrity-$run_id" \
+    "$hdfs_source" "$destination"
+  mkdir -p "$readback"
+  run_with_config "$single_config" sync --resume --id "hdfs-$mode-readback-$run_id" "$destination" "$readback"
+  actual_hash="$(sha256sum "$readback/payload.txt" | cut -d' ' -f1)"
+  [[ "$actual_hash" == "$expected_hash" ]] || {
+    echo "HDFS $mode destination checksum mismatch" >&2
+    return 1
+  }
+}
+
 run_with_config "$single_config" sync --resume --id "hdfs-preload-$run_id" "$fixture_root" "$hdfs_source"
 run_with_config "$single_config" sync --resume --id "hdfs-single-$run_id" --enable-integrity-check \
   "$hdfs_source" "$hdfs_single_destination"
-run_with_config "$single_config" integrity-check --id "hdfs-single-integrity-$run_id" \
-  "$hdfs_source" "$hdfs_single_destination"
+verify_destination single "$hdfs_single_destination"
 
 receiver_cert="$runtime_root/receiver.der"
 receiver_log="$results_root/$run_id-hdfs-receiver.log"
@@ -173,8 +185,7 @@ run_with_config "$sender_config" sync --resume --id "hdfs-remote-$run_id" --enab
   "$hdfs_source" "$hdfs_remote_destination"
 wait "$receiver_pid"
 receiver_pid=""
-run_with_config "$single_config" integrity-check --id "hdfs-remote-integrity-$run_id" \
-  "$hdfs_source" "$hdfs_remote_destination"
+verify_destination remote "$hdfs_remote_destination"
 
 report="$results_root/$run_id-hdfs.json"
 terrasync_candidate="$(git -C "$repo_root" rev-parse HEAD)"

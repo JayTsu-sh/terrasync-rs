@@ -49,6 +49,18 @@ clickhouse_database_name() {
   printf 'terrasync_ci_%s' "${run_id//[^A-Za-z0-9_]/_}"
 }
 
+verify_integrity_report() {
+  local report status=0
+  report="$("$@")" || status=$?
+  printf '%s\n' "$report"
+  (( status == 0 )) || return "$status"
+  if ! grep -Eq 'Checked:[[:space:]]+[1-9][0-9]*[[:space:]]*$' <<<"$report" ||
+    ! grep -Fq 'All Passed ✓' <<<"$report"; then
+    echo "integrity check must examine at least one entry and report no issues" >&2
+    return 1
+  fi
+}
+
 require_s3_credentials() {
   if [[ -z "${LAB_S3_ACCESS_KEY:-}" || -z "${LAB_S3_SECRET_KEY:-}" ]]; then
     local -a source_credentials destination_credentials

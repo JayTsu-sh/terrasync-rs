@@ -109,9 +109,9 @@ run_terrasync() {
 
 committed_scan() {
   local job="$1" row generation epoch
-  row="$(clickhouse_query "SELECT scan_state,scan_epoch FROM $database_name.state_$job FINAL WHERE id=1 AND baseline_committed FORMAT TSVRaw")"
+  row="$(clickhouse_query "SELECT scan_state,scan_epoch FROM $database_name.state_$job FINAL WHERE id=1 AND baseline_committed FORMAT TSVRaw")" || return
   read -r generation epoch <<<"$row"
-  if [[ ! "$generation" =~ ^[01]$ || ! "$epoch" =~ ^[1-9][0-9]*$ ]]; then
+  if [[ "$row" != "$generation"$'\t'"$epoch" || ! "$generation" =~ ^[01]$ || ! "$epoch" =~ ^[1-9][0-9]*$ ]]; then
     echo "$job has no valid committed scan generation: $row" >&2
     return 1
   fi
@@ -149,10 +149,10 @@ for source_backend in "${backends[@]}"; do
       echo "$case_id checksum mismatch: expected=$expected_hash actual=$actual_hash" >&2
       exit 1
     }
-    run_terrasync integrity-check --id "lab-$case_id-quick" --quick \
+    verify_integrity_report run_terrasync integrity-check --id "lab-$case_id-quick" --quick \
       "$(storage_url source "$source_backend" "$case_id")" \
       "$(storage_url destination "$destination_backend" "$case_id")"
-    run_terrasync integrity-check --id "lab-$case_id-full" \
+    verify_integrity_report run_terrasync integrity-check --id "lab-$case_id-full" \
       "$(storage_url source "$source_backend" "$case_id")" \
       "$(storage_url destination "$destination_backend" "$case_id")"
     echo "$case_id full sync and integrity verified"
@@ -182,8 +182,7 @@ for backend in "${backends[@]}"; do
   echo "$backend incremental sync verified"
 done
 
-# 纯增量扫描 generation 闸门：不完整快照不得推进 generation，
-# 也不得把不可读但仍存活的条目判为删除。
+# 增量扫描中断后不得发布新代次，重试应提交完整基线及本轮变更。
 case_id="incremental-scan-generation"
 scan_job_id="lab_incremental_scan_generation"
 scan_source="$lab_root/$case_id/source"
@@ -196,6 +195,8 @@ printf 'will-be-renamed\n' > "$scan_source/renamed-from.txt"
 
 run_terrasync scan --id "$scan_job_id" "$scan_source"
 baseline_commit="$(committed_scan "$scan_job_id")"
+baseline_query="SELECT relative_path,size,mtime,current_state FROM $database_name.base_$scan_job_id FINAL ORDER BY relative_path"
+baseline_rows="$(clickhouse_query "$baseline_query")"
 
 printf 'changed\n' > "$scan_source/changed.txt"
 fault_log="$lab_root/$case_id/fault.log"
@@ -215,9 +216,9 @@ after_fault="$(committed_scan "$scan_job_id")"
   echo "failed incremental scan changed the committed baseline from [$baseline_commit] to [$after_fault]" >&2
   exit 1
 }
-live_rows="$(clickhouse_query "SELECT count() FROM $database_name.base_$scan_job_id FINAL WHERE relative_path = 'protected/still-live.txt' FORMAT TSVRaw")"
-[[ "$live_rows" == 1 ]] || {
-  echo "failed incremental scan deleted a still-live entry" >&2
+after_fault_rows="$(clickhouse_query "$baseline_query")"
+[[ "$after_fault_rows" == "$baseline_rows" ]] || {
+  echo "failed incremental scan changed the previously committed rows" >&2
   exit 1
 }
 
@@ -233,22 +234,28 @@ wrong_generation_rows="$(clickhouse_query "SELECT count() FROM $database_name.ba
   echo "incremental scan retry left $wrong_generation_rows base rows outside committed generation $retry_generation" >&2
   exit 1
 }
-retry_events="FROM $database_name.incremental_$scan_job_id FINAL WHERE toUnixTimestamp64Nano(create_at) >= $retry_epoch"
-new_events="$(clickhouse_query "SELECT count() $retry_events AND operation_type = 'new' AND relative_path = 'new.txt' FORMAT TSVRaw")"
-changed_events="$(clickhouse_query "SELECT count() $retry_events AND operation_type IN ('data_changed', 'both_changed') AND relative_path = 'changed.txt' FORMAT TSVRaw")"
-deleted_events="$(clickhouse_query "SELECT count() $retry_events AND operation_type = 'deleted' AND relative_path = 'deleted.txt' FORMAT TSVRaw")"
-renamed_new_events="$(clickhouse_query "SELECT count() $retry_events AND operation_type = 'new' AND relative_path = 'renamed-to.txt' FORMAT TSVRaw")"
-renamed_deleted_events="$(clickhouse_query "SELECT count() $retry_events AND operation_type = 'deleted' AND relative_path = 'renamed-from.txt' FORMAT TSVRaw")"
-[[ "$new_events" == 1 ]] || { echo "incremental retry expected one New event, got $new_events" >&2; exit 1; }
-[[ "$changed_events" == 1 ]] || { echo "incremental retry expected one Changed event, got $changed_events" >&2; exit 1; }
-[[ "$deleted_events" == 1 ]] || { echo "incremental retry expected one Deleted event, got $deleted_events" >&2; exit 1; }
-# local 扫描没有稳定 file_handle，重命名按 Deleted+New 表达；NFS 场景在下方验证 Renamed。
-[[ "$renamed_new_events" == 1 && "$renamed_deleted_events" == 1 ]] || {
-  echo "local incremental retry expected one Deleted and one New for rename, got $renamed_deleted_events and $renamed_new_events" >&2
+retry_rows="$(clickhouse_query "SELECT relative_path,size FROM $database_name.base_$scan_job_id FINAL WHERE is_regular_file ORDER BY relative_path")"
+expected_rows="$(
+  for path in changed.txt new.txt protected/still-live.txt renamed-to.txt; do
+    printf '%s\t%s\n' "$path" "$(stat -c '%s' "$scan_source/$path")"
+  done
+)"
+[[ "$retry_rows" == "$expected_rows" ]] || {
+  printf 'incremental retry committed unexpected file rows:\n%s\n' "$retry_rows" >&2
   exit 1
 }
-deleted_base_rows="$(clickhouse_query "SELECT count() FROM $database_name.base_$scan_job_id FINAL WHERE relative_path = 'deleted.txt' FORMAT TSVRaw")"
-[[ "$deleted_base_rows" == 0 ]] || { echo "incremental retry kept deleted base row" >&2; exit 1; }
+
+# local 扫描没有稳定 file_handle，重命名按 Deleted+New 表达；NFS 场景在下方验证 Renamed。
+retry_events="$(clickhouse_query "
+SELECT relative_path, if(operation_type IN ('data_changed','both_changed'), 'changed', operation_type)
+FROM $database_name.incremental_$scan_job_id FINAL
+WHERE toUnixTimestamp64Nano(create_at) >= $retry_epoch
+ORDER BY relative_path, operation_type")"
+expected_events="$(printf '%s\t%s\n' changed.txt changed deleted.txt deleted new.txt new renamed-from.txt deleted renamed-to.txt new)"
+[[ "$retry_events" == "$expected_events" ]] || {
+  printf 'incremental retry emitted unexpected events:\n%s\n' "$retry_events" >&2
+  exit 1
+}
 
 run_terrasync scan --id "$scan_job_id" "$scan_source"
 next_scan_commit "$scan_job_id" "$retry_commit" >/dev/null
