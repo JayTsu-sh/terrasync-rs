@@ -436,7 +436,8 @@ sender/receiver HDFS copies, verifies the results through a data-only
 readback, and checks missing configuration and invalid credentials.
 
 On runner VM 102, stage the reviewed sources under a directory writable only by root.
-Install the managed certification from that staging directory.
+Install the managed certification from that staging directory. Restage and
+reinstall when the checkout changes the managed worker or fixture.
 The existing root-owned `/usr/bin/clickhouse` must match the SHA-256 approved
 for that runner. Run as the host administrator:
 
@@ -445,7 +446,8 @@ tests/lab/hdfs-runner/install-managed.sh github-runner "$APPROVED_CLICKHOUSE_SHA
 ```
 
 The installer enables the runner's lingering systemd user manager, its
-cleanup timer, and a private 2 GiB scratch tmpfs. The Actions step passes the
+cleanup timer, and a private 2 GiB scratch tmpfs. The worker and service exit hook must match
+the checkout used by Nightly. The Actions step passes the
 run ID and locations of the compiled binaries through
 `python3 tests/lab/hdfs_lab.py run "$RUN_ID" --output "$OUTPUT_DIR"`.
 Run it as `github-runner` with `XDG_RUNTIME_DIR=/run/user/1000` and its
@@ -466,7 +468,8 @@ files and any retained lock in place for a later check or operator action.
 
 Persistent records live at
 `~/.local/state/terrasync-hdfs-managed/<run-id>/state.json`. A rerun with the
-same ID returns the recorded outcome. For a fresh attempt use a new run ID.
+same ID reads the recorded outcome. Certification requires the original
+caller to publish it. For a fresh attempt use a new run ID.
 Use `hdfs_lab.py reconcile <run-id> --cancel --output <directory>` to stop
 and inspect an attempt, or omit `--cancel` to observe an active one.
 The recovery command never issues HDFS operations. For an unknown or

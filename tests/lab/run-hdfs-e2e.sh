@@ -55,6 +55,8 @@ if name == "hdfs-cleanup":
         target={"base_path": base_path, "authority": authority, "routing_fingerprint": fingerprint}
         if authority else None,
     )
+elif name == "gate-phase":
+    record["phase"], = values
 else:
     terrasync_sha, data_mover_sha, payload_hash = values
     record.update(
@@ -103,11 +105,23 @@ cleanup() {
   trap 'cancelled=true' INT TERM HUP
   if [[ -n "$receiver_pid" ]]; then
     kill -TERM "$receiver_pid" 2>/dev/null || true
-    wait "$receiver_pid" 2>/dev/null || true
+    if ! await_receiver 5; then
+      kill -KILL "$receiver_pid" 2>/dev/null || true
+      if ! await_receiver 2; then
+        cancelled=true
+      fi
+    fi
+    if [[ "$cancelled" == false ]]; then
+      wait "$receiver_pid" 2>/dev/null || true
+    fi
   fi
 
-  # Only delete this attempt's scope. After cancellation, in-flight HDFS writes may still land.
+  case "$status" in
+    124|129|130|137|143) cancelled=true ;;
+  esac
+  # Only delete this attempt's scope. After cancellation or timeout, in-flight HDFS writes may still land.
   if [[ "$hdfs_cleanup" == unknown && "$cancelled" == false ]]; then
+    write_evidence gate-phase hdfs_cleanup || exit 1
     if LAB_HDFS_DESTINATION_CCACHE="$destination_cache" LAB_HDFS_KEYTAB="$destination_keytab" \
       timeout --foreground --kill-after=5s 45s "$matrix_binary" --delete-hdfs-run "$hdfs_base" "$hdfs_scope" >"$cleanup_log" 2>&1; then
       hdfs_cleanup=passed
@@ -199,9 +213,17 @@ source_cache="FILE:$runtime_root/source.ccache"
 destination_cache="FILE:$runtime_root/destination.ccache"
 invalid_keytab="$runtime_root/does-not-exist.keytab"
 
+await_receiver() {
+  local deadline=$(( SECONDS + $1 ))
+  while kill -0 "$receiver_pid" 2>/dev/null; do
+    (( SECONDS < deadline )) || return 1
+    sleep 0.1
+  done
+}
+
 run_with_config() (
   cd "$runtime_root"
-  exec "$binary" -c "$@"
+  exec timeout --foreground --kill-after=5s 120s "$binary" -c "$@"
 )
 
 mkdir -- "$fixture_root"
@@ -277,6 +299,7 @@ EOF
 
 missing_log="$attempt_root/hdfs-missing-config.log"
 invalid_log="$attempt_root/hdfs-invalid-credential.log"
+write_evidence gate-phase negative_configuration
 if run_with_config "$missing_config" scan "$hdfs_source" >"$missing_log" 2>&1; then
   echo "HDFS scan unexpectedly accepted missing source configuration" >&2
   exit 1
@@ -300,11 +323,13 @@ expected_hash="$(sha256sum "$fixture_root/payload.bin" | cut -d' ' -f1)"
 # Readback uses the protocol-neutral data path without mapping HDFS names to local ownership.
 verify_destination() {
   local mode="$1" destination="$2" readback="$runtime_root/readback-$1" actual_hash
+  write_evidence gate-phase "${mode}_integrity"
   verify_integrity_report run_with_config "$single_config" integrity-check --id "hdfs-$mode-integrity-$run_id" \
     "$hdfs_source" "$destination"
+  write_evidence gate-phase "${mode}_readback"
   mkdir -p "$readback"
   LAB_HDFS_KEYTAB="$source_keytab" LAB_HDFS_SOURCE_CCACHE="$source_cache" \
-    "$matrix_binary" hdfs source "$destination" local destination "$readback" "hdfs-$mode-readback-$run_id"
+    timeout --foreground --kill-after=5s 120s "$matrix_binary" hdfs source "$destination" local destination "$readback" "hdfs-$mode-readback-$run_id"
   actual_hash="$(sha256sum "$readback/payload.bin" | cut -d' ' -f1)"
   [[ "$actual_hash" == "$expected_hash" ]] || {
     echo "HDFS $mode destination checksum mismatch" >&2
@@ -315,11 +340,14 @@ verify_destination() {
 # From this point a failed or interrupted gate may have left HDFS data.
 write_cleanup_evidence unknown
 hdfs_cleanup=unknown
+write_evidence gate-phase preload
 run_with_config "$single_config" sync --resume --id "hdfs-preload-$run_id" "$fixture_root" "$hdfs_source"
+write_evidence gate-phase single_copy
 run_with_config "$single_config" sync --resume --id "hdfs-single-$run_id" --enable-integrity-check \
   "$hdfs_source" "$hdfs_single_destination"
 verify_destination single "$hdfs_single_destination"
 
+write_evidence gate-phase receiver_start
 receiver_cert="$runtime_root/receiver.der"
 receiver_log="$attempt_root/hdfs-receiver.log"
 # Track the actual writer PID before acting on a pending cancellation.
@@ -339,10 +367,13 @@ for _ in $(seq 1 100); do
 done
 [[ -s "$receiver_cert" ]]
 
+write_evidence gate-phase remote_copy
 run_with_config "$sender_config" sync --resume --id "hdfs-remote-$run_id" --enable-integrity-check \
   --remote 127.0.0.1:19876 --tls-server-cert "$receiver_cert" --token "$run_id" \
   "$hdfs_source" "$hdfs_remote_destination"
 receiver_status=0
+write_evidence gate-phase receiver_exit
+await_receiver 30 || { echo 'HDFS receiver exit timed out' >&2; exit 1; }
 wait "$receiver_pid" || receiver_status=$?
 receiver_pid=""
 (( receiver_status == 0 ))

@@ -45,6 +45,7 @@ class FakeManager:
             "ActiveState": "inactive",
             "LoadState": "loaded",
             "FileDescriptorStorePreserve": "yes",
+            "ExecStopPost": str(LAB / "hdfs_lab.py") + " worker-exit",
             "Job": "",
             "NFileDescriptorStore": "0",
             "ControlGroup": "",
@@ -126,6 +127,7 @@ class HdfsLabTest(unittest.TestCase):
                 self.controller,
                 STATE=self.state,
                 SCRATCH=self.scratch_root,
+                INSTALL=LAB,
                 LAB_LOCK=self.lab_lock,
                 CGROUP=self.cgroup_root,
                 BOOT="current-boot",
@@ -399,11 +401,14 @@ class HdfsLabTest(unittest.TestCase):
         self.assertFalse(self.work.exists())
 
     def test_certification_publishes_matching_gate_with_both_cleanups(self):
-        self.controller.claim(RUN_ID)
-        gate = self.finish_worker()
-        self.scratch.mkdir(parents=True)
+        def complete():
+            self.finish_worker()
+            self.scratch.mkdir(parents=True)
+
+        self.manager.on_start = complete
 
         self.assertEqual(self.controller.run(RUN_ID, self.output), 0)
+        gate = read_json(self.attempt / "gate.json")
         self.assertFalse(self.work.exists())
         self.assertFalse(self.scratch.exists())
         self.assertEqual(read_json(self.attempt / "gate.json"), gate)
@@ -433,6 +438,14 @@ class HdfsLabTest(unittest.TestCase):
         status = self.controller.run(RUN_ID, self.output)
         self.assertEqual((status, self.certification.exists()), (1, False))
         self.assert_withheld()
+
+    def test_diagnostics_cannot_finalize_a_lost_caller(self):
+        self.controller.claim(RUN_ID)
+        self.finish_worker()
+        self.assertEqual(self.reconcile(), 0)
+        self.assertFalse(self.certification.exists())
+        self.assertEqual(self.controller.run(RUN_ID, self.output), 1)
+        self.assertFalse(self.certification.exists())
 
     def test_worker_pass_report_cannot_override_failed_service(self):
         self.controller.claim(RUN_ID)

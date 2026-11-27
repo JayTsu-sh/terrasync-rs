@@ -18,6 +18,7 @@ import time
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
+INSTALL = Path("/opt/terrasync-hdfs-managed")
 STATE = Path.home() / ".local/state/terrasync-hdfs-managed"
 LAB_LOCK = Path("/tmp/terrasync-lab-tests.lock")
 CLICKHOUSE = Path("/usr/bin/clickhouse")
@@ -95,6 +96,8 @@ def unit_state(run_id):
         "NFileDescriptorStore",
         "-p",
         "FileDescriptorStorePreserve",
+        "-p",
+        "ExecStopPost",
         "-p",
         "ControlGroup",
         "-p",
@@ -367,6 +370,14 @@ def worker(run_id):
         return 143 if cancelled() else 1
 
 
+def service_passed(record):
+    return record.get("service_exit") == {
+        "service_result": "success",
+        "exit_code": "exited",
+        "exit_status": "0",
+    }
+
+
 def record_service_exit(run_id):
     """Record the service manager's verdict before a stopped unit can be reset."""
     with locked():
@@ -425,13 +436,7 @@ def reconcile(run_id, cancel_requested=False, background=False):
             return record
 
         if record["test"] == "passed" and (
-            observed["ActiveState"] == "failed"
-            or record.get("service_exit")
-            != {
-                "service_result": "success",
-                "exit_code": "exited",
-                "exit_status": "0",
-            }
+            observed["ActiveState"] == "failed" or not service_passed(record)
         ):
             record["test"] = "unknown"
         if record["test"] in {"pending", "running"}:
@@ -459,6 +464,9 @@ def reconcile(run_id, cancel_requested=False, background=False):
                 # The gate must persist intent before issuing any remote write.
                 record["hdfs_cleanup"] = "not_attempted"
             record["hdfs_evidence_ingested"] = True
+        phase = read_optional(work / "gate-phase.json")
+        if phase is not None and phase.get("run_id") == run_id:
+            record["gate_phase"] = phase.get("phase")
         gate = read_optional(work / "gate-report.json") or read_optional(
             attempt / "gate.json"
         )
@@ -506,7 +514,7 @@ def reconcile(run_id, cancel_requested=False, background=False):
         return record
 
 
-def publish(run_id, output, cancelled=lambda: False):
+def publish(run_id, output, *, finalize=False, cancelled=lambda: False):
     with locked():
         attempt = STATE / run_id
         record = read_optional(attempt / "state.json")
@@ -517,9 +525,16 @@ def publish(run_id, output, cancelled=lambda: False):
                 test="cancelled", certification="withheld", cancel_requested=True
             )
             atomic_json(attempt / "state.json", record)
+        if record["certification"] in {"ready", "published"} and not service_passed(
+            record
+        ):
+            record.update(test="unknown", certification="withheld")
+            atomic_json(attempt / "state.json", record)
         output.mkdir(parents=True, exist_ok=True)
         certification = output / f"{run_id}-hdfs.json"
-        if record["certification"] in {"ready", "published"}:
+        if record["certification"] == "published" or (
+            finalize and record["certification"] == "ready"
+        ):
             gate = read_json(attempt / "gate.json")
             gate["cleanup"]["clickhouse"] = "passed"
             atomic_json(certification, gate)
@@ -551,6 +566,13 @@ def run(run_id, output):
         raise RuntimeError(
             "the runner needs terrasync-hdfs-attempt@.service with FD preservation"
         )
+    if str(INSTALL / "hdfs_lab.py") not in observed.get("ExecStopPost", ""):
+        raise RuntimeError("the runner needs the installed HDFS service exit hook")
+    for file in ("hdfs_lab.py", "hdfs_lab_clickhouse.py", "evidence-matrix.json"):
+        if (HERE / file).read_bytes() != (INSTALL / file).read_bytes():
+            raise RuntimeError(
+                "the runner's managed HDFS installation differs from this checkout"
+            )
     record, new = claim(run_id)
     interrupted = False
 
@@ -575,7 +597,9 @@ def run(run_id, output):
             return 143 if interrupted else 1
         record = reconcile(run_id)
         if record["local_cleanup"] == "passed":
-            result = publish(run_id, output, cancelled=lambda: new and interrupted)
+            result = publish(
+                run_id, output, finalize=new, cancelled=lambda: new and interrupted
+            )
             return 143 if result and interrupted else result
         with locked():
             path = STATE / run_id / "state.json"

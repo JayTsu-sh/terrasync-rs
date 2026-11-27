@@ -42,9 +42,20 @@ systemctl start "user@$uid.service"
 active_units="$(manager list-units --all --state=active,activating,deactivating --no-legend 'terrasync-hdfs-attempt@*.service')"
 [[ -z "$active_units" ]] || { echo 'A managed HDFS attempt is active' >&2; exit 1; }
 
-install -d -m 0755 /opt/terrasync-hdfs-managed /etc/systemd/user
+for path in /opt /etc/systemd/system /etc/systemd/user; do
+  root_owned "$path" || { echo "Unsafe installation destination: $path" >&2; exit 2; }
+done
+install -d -m 0755 /opt/terrasync-hdfs-managed
+root_owned /opt/terrasync-hdfs-managed || {
+  echo 'Managed HDFS install directory must be owned by root' >&2; exit 2;
+}
 install -m 0644 "${modules[@]/#/$source_dir/../}" /opt/terrasync-hdfs-managed/
-printf '%s\n' "$2" > /opt/terrasync-hdfs-managed/clickhouse.sha256
+pin="$(mktemp /opt/terrasync-hdfs-managed/.pin.XXXXXX)"
+trap 'rm -f -- "$pin"' EXIT
+printf '%s\n' "$2" > "$pin"
+chmod 0644 "$pin"
+mv -fT -- "$pin" /opt/terrasync-hdfs-managed/clickhouse.sha256
+trap - EXIT
 install -m 0644 "${user_units[@]/#/$source_dir/systemd/}" /etc/systemd/user/
 install -m 0644 "$source_dir/system/$mount_unit" /etc/systemd/system/
 systemctl daemon-reload
