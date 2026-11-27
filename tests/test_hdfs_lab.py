@@ -44,6 +44,7 @@ class FakeManager:
         self.state = {
             "ActiveState": "inactive",
             "LoadState": "loaded",
+            "FileDescriptorStorePreserve": "yes",
             "Job": "",
             "NFileDescriptorStore": "0",
             "ControlGroup": "",
@@ -185,12 +186,20 @@ class HdfsLabTest(unittest.TestCase):
             },
         )
 
-    def finish_worker(self):
+    def finish_worker(self, *, test="passed", hdfs="passed"):
         self.worker_state(
-            populated=False, active="inactive", test="passed", stage="hdfs_gate"
+            populated=False,
+            active="inactive",
+            test=test,
+            stage="hdfs_gate",
+            service_exit={
+                "service_result": "success",
+                "exit_code": "exited",
+                "exit_status": "0",
+            },
         )
         record = self.record()
-        self.write_hdfs_cleanup("passed")
+        self.write_hdfs_cleanup(hdfs)
         matrix = read_json(LAB / "evidence-matrix.json")
         gate = {
             "schema_version": 1,
@@ -408,7 +417,7 @@ class HdfsLabTest(unittest.TestCase):
         diagnostic = read_json(self.diagnostics)
         self.assertEqual(diagnostic["local_cleanup"], "passed")
         self.assertEqual(diagnostic["hdfs_cleanup"], "passed")
-        self.assertEqual(diagnostic["certification"], "ready")
+        self.assertEqual(diagnostic["certification"], "published")
 
     def assert_rejects_evidence(self, filename, changes):
         self.controller.claim(RUN_ID)
@@ -424,6 +433,46 @@ class HdfsLabTest(unittest.TestCase):
         status = self.controller.run(RUN_ID, self.output)
         self.assertEqual((status, self.certification.exists()), (1, False))
         self.assert_withheld()
+
+    def test_worker_pass_report_cannot_override_failed_service(self):
+        self.controller.claim(RUN_ID)
+        self.finish_worker()
+        self.manager.state.update(ActiveState="failed")
+        self.assertEqual(self.reconcile(), 0)
+        self.assertEqual(self.assert_withheld()["test"], "unknown")
+
+    def test_cancel_after_local_recovery_withholds_pending_certification(self):
+        self.controller.claim(RUN_ID)
+        self.finish_worker()
+        self.assertEqual(self.cli("sweep"), 0)
+        self.assertEqual(self.reconcile("--cancel"), 0)
+        self.assertEqual(self.assert_withheld()["test"], "cancelled")
+
+    def test_reaper_removes_unpublished_staging(self):
+        self.work.mkdir(parents=True)
+        (self.work / "terrasync").write_bytes(b"staged only")
+        self.assertEqual(self.cli("sweep"), 0)
+        self.assertFalse(self.attempt.exists())
+        self.assertFalse(self.manager.commands)
+
+    def test_interrupted_work_removal_preserves_hdfs_uncertainty(self):
+        self.controller.claim(RUN_ID)
+        self.finish_worker(test="failed", hdfs="unknown")
+        original = self.controller.shutil.rmtree
+
+        def interrupt(path):
+            if path == self.work:
+                (self.work / "hdfs-cleanup.json").unlink()
+                raise OSError("interrupted removing workspace")
+            return original(path)
+
+        with (
+            patch.object(self.controller.shutil, "rmtree", side_effect=interrupt),
+            self.assertRaises(OSError),
+        ):
+            self.reconcile()
+        self.assertEqual(self.reconcile(), 1)
+        self.assertEqual(self.assert_withheld()["hdfs_cleanup"], "unknown")
 
     def test_certification_requires_gate_report(self):
         self.assert_rejects_evidence("gate-report.json", None)

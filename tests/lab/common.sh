@@ -91,7 +91,7 @@ require_s3_credentials() {
   : "${LAB_S3_SECRET_KEY:?LAB_S3_SECRET_KEY is required}"
 }
 
-report_hdfs_cleanup_failure() {
+hdfs_cleanup_reason() {
   local status="$1" log="$2" reason
   case "$status" in
     124|137) reason=timeout ;;
@@ -101,7 +101,12 @@ report_hdfs_cleanup_failure() {
       reason="${reason:-storage_error}"
       ;;
   esac
-  echo "HDFS cleanup failed: $reason (exit $status)" >&2
+  printf '%s\n' "$reason"
+}
+
+report_hdfs_cleanup_failure() {
+  local status="$1" log="$2"
+  echo "HDFS cleanup failed: $(hdfs_cleanup_reason "$status" "$log") (exit $status)" >&2
 }
 
 require_hdfs_credentials() {

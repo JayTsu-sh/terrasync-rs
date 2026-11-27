@@ -435,7 +435,8 @@ lab's Kerberos HDFS cluster. It exercises single-process and separate QUIC
 sender/receiver HDFS copies, verifies the results through a data-only
 readback, and checks missing configuration and invalid credentials.
 
-On runner VM 102, install the managed certification from a reviewed checkout.
+On runner VM 102, stage the reviewed sources under a directory writable only by root.
+Install the managed certification from that staging directory.
 The existing root-owned `/usr/bin/clickhouse` must match the SHA-256 approved
 for that runner. Run as the host administrator:
 
@@ -473,7 +474,8 @@ failed HDFS cleanup, use the recorded scope and routing details to locate
 the original cluster and verify it independently before manual cleanup.
 A known alias or routing fingerprint alone does not prove cluster identity.
 
-The workflow publishes a diagnostic artifact for failures and cancellations,
+The systemd stop hook records the actual worker exit before cleanup. The
+workflow publishes a diagnostic artifact for failures and cancellations,
 with a separate certification artifact only after the gate, local cleanup,
 HDFS cleanup, and report publication have passed. Other Nightly storage
 and ClickHouse tests continue to exercise their existing database endpoints.

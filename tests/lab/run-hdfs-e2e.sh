@@ -31,6 +31,7 @@ routing_fingerprint=""
 receiver_pid=""
 cancelled=false
 hdfs_cleanup=not_attempted
+hdfs_cleanup_reason_record=""
 
 write_evidence() (
   # The intent must survive interruption between publication and the first write.
@@ -46,9 +47,10 @@ root, run_id, name, *values = sys.argv[1:]
 root = Path(root)
 record = {"schema_version": 1, "run_id": run_id or None}
 if name == "hdfs-cleanup":
-    status, scope, base_path, authority, fingerprint = values
+    status, scope, base_path, authority, fingerprint, reason = values
     record.update(
         status=status,
+        reason=reason or None,
         scope=scope or None,
         target={"base_path": base_path, "authority": authority, "routing_fingerprint": fingerprint}
         if authority else None,
@@ -91,7 +93,8 @@ PY
 )
 
 write_cleanup_evidence() {
-  write_evidence hdfs-cleanup "$1" "$hdfs_scope" "$hdfs_base_path" "$hdfs_authority" "$routing_fingerprint"
+  write_evidence hdfs-cleanup "$1" "$hdfs_scope" "$hdfs_base_path" "$hdfs_authority" \
+    "$routing_fingerprint" "$hdfs_cleanup_reason_record"
 }
 
 cleanup() {
@@ -106,13 +109,14 @@ cleanup() {
   # Only delete this attempt's scope. After cancellation, in-flight HDFS writes may still land.
   if [[ "$hdfs_cleanup" == unknown && "$cancelled" == false ]]; then
     if LAB_HDFS_DESTINATION_CCACHE="$destination_cache" LAB_HDFS_KEYTAB="$destination_keytab" \
-      "$matrix_binary" --delete-hdfs-run "$hdfs_base" "$hdfs_scope" >"$cleanup_log" 2>&1; then
+      timeout --foreground --kill-after=5s 45s "$matrix_binary" --delete-hdfs-run "$hdfs_base" "$hdfs_scope" >"$cleanup_log" 2>&1; then
       hdfs_cleanup=passed
     else
       cleanup_exit=$?
-      case "$cleanup_exit" in
-        124|129|130|137|143) ;;
-        *) [[ "$cancelled" == true ]] || hdfs_cleanup=failed ;;
+      hdfs_cleanup_reason_record="$(hdfs_cleanup_reason "$cleanup_exit" "$cleanup_log")"
+      case "$hdfs_cleanup_reason_record" in
+        Authentication|PermissionDenied|InvalidInput|Unsupported)
+          [[ "$cancelled" == true ]] || hdfs_cleanup=failed ;;
       esac
       report_hdfs_cleanup_failure "$cleanup_exit" "$cleanup_log"
       status=1

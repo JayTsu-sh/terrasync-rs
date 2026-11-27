@@ -94,6 +94,8 @@ def unit_state(run_id):
         "-p",
         "NFileDescriptorStore",
         "-p",
+        "FileDescriptorStorePreserve",
+        "-p",
         "ControlGroup",
         "-p",
         "InvocationID",
@@ -189,6 +191,7 @@ def claim(run_id):
         }
         atomic_json(attempt / "state.json", record)
         sync_directory(STATE)
+        sync_directory(STATE.parent)
         return record, True
 
 
@@ -226,7 +229,11 @@ def receive_lab_lock(run_id, cancelled):
         )
         if stored != 1 or lib.sd_notify_barrier(0, 2_000_000) != 1:
             raise RuntimeError("could not transfer the lab lock to systemd")
-        if unit_state(run_id).get("NFileDescriptorStore") != "1":
+        retained = unit_state(run_id)
+        if (
+            retained.get("FileDescriptorStorePreserve") != "yes"
+            or retained.get("NFileDescriptorStore") != "1"
+        ):
             raise RuntimeError("systemd did not retain the lab lock")
         # Close only this copy. LOCK_UN would unlock the shared description.
         return True
@@ -360,12 +367,39 @@ def worker(run_id):
         return 143 if cancelled() else 1
 
 
+def record_service_exit(run_id):
+    """Record the service manager's verdict before a stopped unit can be reset."""
+    with locked():
+        path = STATE / run_id / "state.json"
+        record = read_optional(path)
+        if record is None or record.get("invocation") != os.environ["INVOCATION_ID"]:
+            return 0
+        fields = ("SERVICE_RESULT", "EXIT_CODE", "EXIT_STATUS")
+        record["service_exit"] = {
+            field.lower(): os.environ.get(field) for field in fields
+        }
+        atomic_json(path, record)
+    return 0
+
+
 def reconcile(run_id, cancel_requested=False, background=False):
     attempt = STATE / run_id
     path = attempt / "state.json"
     with locked():
         record = read_optional(path)
-        if record is None or record["local_cleanup"] == "passed":
+        if record is None:
+            if background and attempt.is_dir():
+                # claim() holds the same registry lock until it publishes state.
+                # An unpublished staging directory cannot have an admitted worker.
+                shutil.rmtree(attempt)
+                sync_directory(STATE)
+            return None
+        if record["local_cleanup"] == "passed":
+            if cancel_requested and record["certification"] == "ready":
+                record.update(
+                    test="cancelled", certification="withheld", cancel_requested=True
+                )
+                atomic_json(path, record)
             return record
         observed = unit_state(run_id)
         expired = (
@@ -390,6 +424,16 @@ def reconcile(run_id, cancel_requested=False, background=False):
                 systemctl("stop", "--no-block", unit(run_id), required=False)
             return record
 
+        if record["test"] == "passed" and (
+            observed["ActiveState"] == "failed"
+            or record.get("service_exit")
+            != {
+                "service_result": "success",
+                "exit_code": "exited",
+                "exit_status": "0",
+            }
+        ):
+            record["test"] = "unknown"
         if record["test"] in {"pending", "running"}:
             record["test"] = (
                 "cancelled" if record.get("cancel_requested") else "unknown"
@@ -398,20 +442,23 @@ def reconcile(run_id, cancel_requested=False, background=False):
             record["test"] = "cancelled"
 
         work = attempt / "work"
-        hdfs = read_optional(work / "hdfs-cleanup.json")
-        if (
-            hdfs is not None
-            and hdfs.get("run_id") == run_id
-            and hdfs.get("status") in TERMINAL | {"not_attempted"}
-        ):
-            record["hdfs_cleanup"] = hdfs["status"]
-            record["hdfs_scope"] = hdfs.get("scope")
-            record["hdfs_target"] = hdfs.get("target")
-        elif hdfs is not None:
-            record["hdfs_cleanup"] = "unknown"
-        elif record["hdfs_cleanup"] == "unknown" and work.exists():
-            # The gate cannot mutate HDFS before publishing its durable intent.
-            record["hdfs_cleanup"] = "not_attempted"
+        if not record.get("hdfs_evidence_ingested"):
+            hdfs = read_optional(work / "hdfs-cleanup.json")
+            if (
+                hdfs is not None
+                and hdfs.get("run_id") == run_id
+                and hdfs.get("status") in TERMINAL | {"not_attempted"}
+            ):
+                record["hdfs_cleanup"] = hdfs["status"]
+                record["hdfs_cleanup_reason"] = hdfs.get("reason")
+                record["hdfs_scope"] = hdfs.get("scope")
+                record["hdfs_target"] = hdfs.get("target")
+            elif hdfs is not None:
+                record["hdfs_cleanup"] = "unknown"
+            elif record["hdfs_cleanup"] == "unknown" and work.exists():
+                # The gate must persist intent before issuing any remote write.
+                record["hdfs_cleanup"] = "not_attempted"
+            record["hdfs_evidence_ingested"] = True
         gate = read_optional(work / "gate-report.json") or read_optional(
             attempt / "gate.json"
         )
@@ -448,7 +495,8 @@ def reconcile(run_id, cancel_requested=False, background=False):
             and gate.get("cleanup") == {"hdfs": "passed"}
             and gate.get("gates") == dict.fromkeys(contract["required_gates"], "pass")
             and gate.get("remote_role_isolation") == contract["required_role_isolation"]
-            and re.fullmatch(r"[0-9a-f]{64}", gate.get("payload_sha256", ""))
+            and gate.get("payload_sha256")
+            == hashlib.sha256(f"terrasync-hdfs-{run_id}\n".encode()).hexdigest()
             and gate.get("terrasync_candidate") == record["terrasync_candidate"]
             and gate.get("data_mover_candidate") == record["data_mover_candidate"]
         )
@@ -458,34 +506,50 @@ def reconcile(run_id, cancel_requested=False, background=False):
         return record
 
 
-def publish(run_id, output, cancel_certification=False):
+def publish(run_id, output, cancelled=lambda: False):
     with locked():
         attempt = STATE / run_id
         record = read_optional(attempt / "state.json")
         if record is None:
             return 1
-        if cancel_certification and record["certification"] == "ready":
+        if cancelled() and record["certification"] == "ready":
             record.update(
                 test="cancelled", certification="withheld", cancel_requested=True
             )
             atomic_json(attempt / "state.json", record)
         output.mkdir(parents=True, exist_ok=True)
         certification = output / f"{run_id}-hdfs.json"
-        if record["certification"] == "ready":
+        if record["certification"] in {"ready", "published"}:
             gate = read_json(attempt / "gate.json")
             gate["cleanup"]["clickhouse"] = "passed"
             atomic_json(certification, gate)
+            if record["certification"] == "ready":
+                if cancelled():
+                    certification.unlink()
+                    sync_directory(output)
+                    record.update(
+                        test="cancelled",
+                        certification="withheld",
+                        cancel_requested=True,
+                    )
+                else:
+                    record["certification"] = "published"
+                atomic_json(attempt / "state.json", record)
         else:
             certification.unlink(missing_ok=True)
         atomic_json(output / f"{run_id}-hdfs-cleanup.json", record)
-        return 0 if record["certification"] == "ready" else 1
+        return 0 if record["certification"] == "published" else 1
 
 
 def run(run_id, output):
     # Refuse to stage anything if the installed service and manager are unavailable.
-    if unit_state(run_id).get("LoadState") != "loaded":
+    observed = unit_state(run_id)
+    if (
+        observed.get("LoadState") != "loaded"
+        or observed.get("FileDescriptorStorePreserve") != "yes"
+    ):
         raise RuntimeError(
-            "the runner's terrasync-hdfs-attempt@.service is not installed"
+            "the runner needs terrasync-hdfs-attempt@.service with FD preservation"
         )
     record, new = claim(run_id)
     interrupted = False
@@ -511,11 +575,8 @@ def run(run_id, output):
             return 143 if interrupted else 1
         record = reconcile(run_id)
         if record["local_cleanup"] == "passed":
-            result = publish(run_id, output, cancel_certification=new and interrupted)
-            if interrupted:
-                publish(run_id, output, cancel_certification=new)
-                return 143
-            return result
+            result = publish(run_id, output, cancelled=lambda: new and interrupted)
+            return 143 if result and interrupted else result
         with locked():
             path = STATE / run_id / "state.json"
             record = read_json(path)
@@ -541,7 +602,9 @@ def wait_for_recovery(run_id, cancel_requested=False):
 def main():
     os.umask(0o077)
     parser = argparse.ArgumentParser()
-    parser.add_argument("command", choices=("run", "worker", "reconcile", "sweep"))
+    parser.add_argument(
+        "command", choices=("run", "worker", "worker-exit", "reconcile", "sweep")
+    )
     parser.add_argument("run_id", nargs="?")
     parser.add_argument("--output", type=Path)
     parser.add_argument("--cancel", action="store_true")
@@ -569,6 +632,8 @@ def main():
         parser.error("invalid run ID")
     if args.command == "worker":
         return worker(args.run_id)
+    if args.command == "worker-exit":
+        return record_service_exit(args.run_id)
     if args.command == "run":
         if args.output is None:
             parser.error("run requires --output")
